@@ -2,7 +2,7 @@
 # SLICEFAST: timed slices of bench cases on a node (inside a devhub lease, from
 # the shipped makepad tree; release build). One JSON line per run, appended to
 # ../bench/out/slicefast.jsonl and printed.
-#   bash apps/commercial/fab/slice/bench/slicefast.sh "CASE..." "THREADS..." [RUNS] [GOLDEN] [OUT]
+#   bash apps/apps/fab/slice/bench/slicefast.sh "CASE..." "THREADS..." [RUNS] [GOLDEN] [OUT]
 # GOLDEN (default local/fabgold, never committed): inputs/presets/ and
 # slices/<case>/ (the vendor reference run). Models are generated into
 # ../bench/models (outside the tree, not in git). With OUT, the G-code of each

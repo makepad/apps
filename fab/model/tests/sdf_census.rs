@@ -223,7 +223,7 @@ fn sdf_census() {
     let mut c = Census::default();
     for (name, source) in &files {
         if name.ends_with(".cad.splash") || name.ends_with(".fab.splash") {
-            c.document(&mut cx, &format!("apps/commercial/fab/app/resources/{name}"), source, &files, name.ends_with(".fab.splash"));
+            c.document(&mut cx, &format!("apps/apps/fab/app/resources/{name}"), source, &files, name.ends_with(".fab.splash"));
         }
     }
     for crate_dir in paths(fab) {
@@ -258,9 +258,9 @@ fn sdf_census() {
     // Runtime-generated plate-list documents: same shape under three names; sources live in
     // app/tests/plates_panel.rs. Actual user plates/AI outputs live outside this repository.
     for name in ["lattice", "figure", "saved"] {
-        c.document(&mut cx, &format!("apps/commercial/fab/app/tests/plates_panel.rs:{name}"), &format!("{}let block = m.box({{size: [10mm 10mm 10mm]}})\nobject(block)\n", fab_model::program::EMPTY), &files, false);
+        c.document(&mut cx, &format!("apps/apps/fab/app/tests/plates_panel.rs:{name}"), &format!("{}let block = m.box({{size: [10mm 10mm 10mm]}})\nobject(block)\n", fab_model::program::EMPTY), &files, false);
     }
-    c.document(&mut cx, "apps/commercial/fab/app/src/demo_part.rs:noise_vase", &format!("{}\n{}", files["vase.cad.splash"], files["noise_paint.splash"]), &files, false);
+    c.document(&mut cx, "apps/apps/fab/app/src/demo_part.rs:noise_vase", &format!("{}\n{}", files["vase.cad.splash"], files["noise_paint.splash"]), &files, false);
     // The other assembled script sources in slice/tests/painted_by_position.rs::cases.
     let painted = std::fs::read_to_string(fab.join("slice/tests/painted_by_position.rs")).unwrap();
     let materials = literals(&painted).into_iter().find(|(_, s)| s.starts_with("let base = Material")).unwrap().1;
@@ -274,7 +274,7 @@ fn sdf_census() {
         ("flood", format!("{materials}m.fill(Flood{{seed: {} angle: 12deg}}, red)\n", belly(23.8, 0.0))),
         ("noise", files["noise_paint.splash"].clone()),
     ] {
-        c.document(&mut cx, &format!("apps/commercial/fab/slice/tests/painted_by_position.rs:{name}"), &format!("{}\n{suffix}", files["vase.cad.splash"]), &files, false);
+        c.document(&mut cx, &format!("apps/apps/fab/slice/tests/painted_by_position.rs:{name}"), &format!("{}\n{suffix}", files["vase.cad.splash"]), &files, false);
     }
     for (name, source) in [("weave.rs:MAIL", sources::WEAVE_MAIL), ("weave.rs:chainmail_scale", sources::WEAVE_LARGE), ("mechanics.rs:sheet", sources::MECHANICS_SHEET)] {
         c.document(&mut cx, &format!("retained app/tests/{name}"), source, &files, false);

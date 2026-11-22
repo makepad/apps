@@ -2,7 +2,7 @@
 # SLICEFAST: perf profile of one bench case (Linux, perf installed): self time
 # by symbol, inclusive time by symbol, and folded stacks for a flame graph
 # (../bench/prof/CASE-tN.folded: "frame;frame;... count" per line).
-#   bash apps/commercial/fab/slice/bench/slicefast_prof.sh CASE [THREADS] [GOLDEN]
+#   bash apps/apps/fab/slice/bench/slicefast_prof.sh CASE [THREADS] [GOLDEN]
 set -eu
 CASE=$1
 T=${2:-1}

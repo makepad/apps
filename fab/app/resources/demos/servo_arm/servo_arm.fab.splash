@@ -1,0 +1,10 @@
+// A servo arm printed in place in two filaments: steel base and upper arm, orange forearm. In
+// Mechanics its two servos are set from the panel's motor rows.
+use mod.fab.*
+
+script("servo_arm.cad.splash")
+
+color("Steel", rgb: #x9aa3ad)
+color("Orange", rgb: #xe8701e)
+
+place("servo_arm", at: [175mm 160mm], name: "Servo arm", color: "Steel")

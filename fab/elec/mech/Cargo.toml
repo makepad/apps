@@ -1,0 +1,34 @@
+[package]
+name = "fab-elec-mech"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab electronics mechanics contract (C8): board and assembly mechanical summaries for cases, fixtures and fit checks"
+
+[package.metadata.makepad.platform-gaps]
+windows = {}
+
+[dependencies]
+makepad-dynamics = { path = "../../../../../libs/dynamics" }
+fab-elec-import = { path = "../import" }
+fab-elec-fixtures = { path = "../fixtures" }
+makepad-csg-cad = { path = "../../../../../libs/csg/csg_cad" }
+fab-elec-core = { path = "../core" }
+fab-elec-parts = { path = "../parts" }
+fab-elec-circuit = { path = "../circuit" }
+fab-elec-board = { path = "../board" }
+fab-elec-design = { path = "../design" }
+fab-materials = { path = "../../materials" }
+makepad-csg-graph = { path = "../../../../../libs/csg/csg_graph" }
+makepad-csg-math = { path = "../../../../../libs/csg/csg_math" }
+makepad-csg-mesh = { path = "../../../../../libs/csg/csg_mesh" }
+makepad-model-script = { path = "../../../engine/model_script" }
+fab-model = { path = "../../model" }
+
+[dev-dependencies]
+fab-elec-lang = { path = "../lang" }
+fab-plate = { path = "../../plate" }
+fab-printability = { path = "../../printability" }
+makepad-fab-slice = { path = "../../slice" }
+makepad-fab-settings = { path = "../../settings" }

@@ -1,0 +1,144 @@
+// ledctl: a USB-C powered LED controller, the golden example every electronics lane starts from.
+// A USB-C receptacle (power only), a 3.3 V LDO, a 20-pin MCU with its SWD header, 8 LED outputs
+// sunk by MCU pins, one button: 30 components on a 2-layer 50 x 30 mm board (ledctl.pcb.splash).
+//
+// Written from blocks: a block is a sub-circuit with typed ports, parameters and placement
+// defaults; one call hooks it up. Its parts are named by the instance (`reg.u`, `reg.c_in`,
+// `lamps[3].r`). Parts are generic and our own; `std` holds the land-pattern and symbol
+// generators (r, c, led, usb_c_receptacle, header, tact_switch, sot23, tssop, ic_symbol). The
+// blocks are defined here so the fixture stands alone; `std` will ship equivalents.
+//
+// Net names: an explicit `e.net` has its name; a bus object makes one net per member named by
+// the member (`SWDIO`), a bus list `<name><i>` (`LED0`); a net made inside a block instance is
+// prefixed with the instance path (`mcu.SWDIO`); a net made implicitly by passing a pin is named
+// by that pin (`usb.j.CC1`).
+use mod.elec.*
+use mod.std.*
+let e = mod.elec
+
+// ---- Generic parts this design defines ----------------------------------------------------------
+
+// The 3.3 V regulator is std's.
+mod.std.ldo_3v3()
+
+// A 20-pin microcontroller in TSSOP-20 (0.65 mm pitch).
+e.define("MCU_20_TSSOP", {
+    kind: @mcu
+    symbol: ic_symbol("MCU_20", {
+        left: [["VDD" @power_in] ["VSS" @power_in] ["NRST" @in] ["BOOT0" @in] ["PA13" @bidi] ["PA14" @bidi]]
+        right: [["PA0" @bidi] ["PA1" @bidi] ["PA2" @bidi] ["PA3" @bidi] ["PA4" @bidi] ["PA5" @bidi]
+                ["PA6" @bidi] ["PA7" @bidi] ["PA8" @bidi] ["PA9" @bidi] ["PA10" @bidi] ["PB6" @bidi]
+                ["PB7" @bidi] ["PC14" @bidi]]
+    })
+    footprint: tssop({pins: 20 pitch: 0.65mm body: [6.5mm 4.4mm] span: 6.4mm lead: [0.3mm 0.6mm]})
+    body: {height: 1.2mm}
+    pads: {PB7: 1 PC14: 2 NRST: 3 VDD: 4 VSS: 5 PA0: 6 PA1: 7 PA2: 8 PA3: 9 PA4: 10
+           PA5: 11 PA6: 12 PA7: 13 PA8: 14 PA9: 15 PA10: 16 BOOT0: 17 PA13: 18 PA14: 19 PB6: 20}
+    limits: {VDD: {volts: [2.0V 3.6V]} io: {volts: [-0.3V 3.6V] current: 15mA}}
+})
+
+// ---- Blocks -------------------------------------------------------------------------------------
+
+// Power in from a USB-C receptacle: 5 V sink, two CC pull-downs.
+let usb_c_power = e.block({
+    name: "USB-C power in"
+    ports: {vbus: e.port(@power_out, {volts: 5V current: 1.5A})  gnd: e.port(@ground)}
+    params: {rd: 5.1kohm}
+    build: fn(p, o) {
+        let j  = e.part(usb_c_receptacle(), {pins: {VBUS: p.vbus GND: p.gnd SHIELD: p.gnd}})
+        let cc = for pin in [j.CC1, j.CC2] { e.r(o.rd, pin, p.gnd, {package: "0402"}) }
+    }
+    sheet: {flow: @right ports: {vbus: @right gnd: @bottom}}
+})
+
+// A fixed regulator with its input and output capacitors.
+let ldo = e.block({
+    name: "LDO"
+    ports: {
+        vin:  e.port(@power_in,  {volts: [2.5V 6V]})
+        vout: e.port(@power_out, {volts: 3.3V current: 600mA})
+        gnd:  e.port(@ground)
+    }
+    params: {part: "LDO_3V3_SOT23-5" c_in: 1uF c_out: 1uF}
+    build: fn(p, o) {
+        let u     = e.part(o.part, {pins: {VIN: p.vin EN: p.vin GND: p.gnd VOUT: p.vout} nc: [@NC]})
+        let c_in  = e.c(o.c_in,  p.vin,  p.gnd, {package: "0603" volts: 10V})
+        let c_out = e.c(o.c_out, p.vout, p.gnd, {package: "0603" volts: 10V})
+        e.near(c_in,  u.VIN,  2mm)
+        e.near(c_out, u.VOUT, 2mm)
+    }
+    sheet: {flow: @right ports: {vin: @left vout: @right gnd: @bottom}}
+})
+
+// The MCU with decoupling, reset capacitor, boot pull-down and the SWD header.
+let mcu_core = e.block({
+    name: "MCU core"
+    ports: {
+        vdd:  e.port(@power_in, {volts: [2.0V 3.6V]})
+        gnd:  e.port(@ground)
+        gpio: e.port(@bidi, {width: 8})                 // PA0..PA7
+        user: e.port(@bidi)                             // PB7
+    }
+    params: {part: "MCU_20_TSSOP" decoupling: [100nF 100nF 4.7uF]}
+    build: fn(p, o) {
+        let swd = e.bus("SWD", [@SWDIO @SWCLK @NRST])
+        let u = e.part(o.part, {pins: {
+            VDD: p.vdd  VSS: p.gnd  PA13: swd.SWDIO  PA14: swd.SWCLK  NRST: swd.NRST  PB7: p.user
+            PA0: p.gpio[0] PA1: p.gpio[1] PA2: p.gpio[2] PA3: p.gpio[3]
+            PA4: p.gpio[4] PA5: p.gpio[5] PA6: p.gpio[6] PA7: p.gpio[7]
+        } nc: [@PA8 @PA9 @PA10 @PB6 @PC14]})
+        let dec    = for v in o.decoupling { let c = e.c(v, p.vdd, p.gnd, {package: "0402"}); e.near(c, u, 3mm); c }
+        let rst_c  = e.c(100nF, swd.NRST, p.gnd, {package: "0402"})
+        let boot_r = e.r(10kohm, u.BOOT0, p.gnd, {package: "0402"})
+        let dbg    = e.part(header({pins: 5 pitch: 1.27mm}), {pins: [p.vdd swd.SWDIO swd.SWCLK swd.NRST p.gnd]})
+        e.side(dbg, @bottom)
+    }
+    sheet: {flow: @right ports: {vdd: @top gnd: @bottom gpio: @right user: @right}}
+})
+
+// One LED sunk by a controller pin. Its resistor drops what the LED (at its drive current) and
+// the sinking pin (its on-resistance) leave of the rail.
+let led_driver = e.block({
+    name: "LED driver"
+    ports: {ctl: e.port(@in)  vdd: e.port(@power_in)}
+    params: {current: 5mA color: @green sink: 25ohm}
+    build: fn(p, o) {
+        let d = e.led({color: o.color package: "0603" current: o.current})
+        let r = e.r(e.series((p.vdd.volts - d.vf) / o.current - o.sink, @E24), p.vdd, d.A, {package: "0402"})
+        e.connect(d.K, p.ctl)
+    }
+    sheet: {flow: @down ports: {vdd: @top ctl: @bottom}}
+})
+
+// A push button to ground (the MCU pin has its pull-up).
+let button = e.block({
+    name: "Button"
+    ports: {out: e.port(@out)  gnd: e.port(@ground)}
+    build: fn(p, o) { let sw = e.part(tact_switch(), {pins: {A: p.out B: p.gnd}}) }
+})
+
+// ---- The design ---------------------------------------------------------------------------------
+
+let led_count = param(8, min: 1, max: 8, label: "LED outputs")
+
+// nets: handles; kind, voltage and class are checked by ERC
+let gnd  = e.net({name: "GND"  kind: @ground})
+let vbus = e.net({name: "VBUS" kind: @power volts: 5V   class: "power"})
+let v33  = e.net({name: "3V3"  kind: @power volts: 3.3V class: "power"})
+let led  = e.bus("LED", 8)                              // LED0..LED7
+let key  = e.net({name: "BTN"})
+
+let power = netclass("power", {track: 0.5mm clearance: 0.2mm via: {drill: 0.4mm pad: 0.8mm}})
+
+// the hookup: one call per block
+let usb   = usb_c_power({vbus: vbus gnd: gnd})
+let reg   = ldo({vin: vbus gnd: gnd vout: v33})
+let mcu   = mcu_core({vdd: v33 gnd: gnd gpio: led user: key})
+let lamps = for i in 0..led_count { led_driver({ctl: led[i] vdd: v33}) }
+let btn   = button({out: key gnd: gnd})
+
+// intent: what the placer, router and the checks must honour
+e.fixed(usb, {edge: @left})
+e.near(reg, usb, 6mm)
+e.width(vbus, 0.5mm)
+e.group("leds", lamps)

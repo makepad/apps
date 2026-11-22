@@ -1,0 +1,49 @@
+// A lamp shade of gyroid lattice in two filaments: a gyroid sheet filling a round wall half a cell
+// deep, between a solid foot ring and a solid rim, its colour fading from one filament at the foot
+// to the other at the rim, dithered. The gyroid is wrapped round the shade, a whole number of cells
+// round, and both faces of the wall sit where the sheet crosses them as unbroken upright wavy
+// stripes: a cut anywhere else leaves cut edges that dip to low points, each starting a new island
+// in mid-air. A gyroid leans no more than a wall prints at, so it needs no supports; an LED light
+// inside shines out through its open channels.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let height = param(96mm, min: 40mm, max: 180mm, step: 1mm, label: "Height", group: "Shade")
+let radius = param(32mm, min: 18mm, max: 70mm, step: 0.5mm, label: "Radius", group: "Shade", kind: "radius")
+let period = param(9mm, min: 4mm, max: 20mm, step: 0.5mm, label: "Cell", group: "Lattice", hint: "one gyroid cell's size; the wall is half a cell deep")
+let sheet = param(1.1mm, min: 0.8mm, max: 2.5mm, step: 0.1mm, label: "Sheet", group: "Lattice", hint: "the gyroid sheet's thickness: two lines or more to print")
+let foot = 5mm
+let rim = 3mm
+let thick = period / 2
+let turn = 6.28319
+// Cells round the middle of the wall, a whole number so the lattice closes on itself.
+let cells = floor(turn * (radius - thick / 2) / period + 0.5)
+
+let shade = m.sdf({
+    bounds: [[0 - radius - 1mm, 0, 0 - radius - 1mm], [radius + 1mm, height, radius + 1mm]]
+    cell: 0.35mm
+    field: fn(p) {
+        let r = length(vec2(p.x, p.z))
+        // the round wall: between the inner and outer radius, from the bed to the top
+        let wall = max(max(r - radius, radius - thick - r), max(0 - p.y, p.y - height))
+        // solid at the foot and the rim, gyroid between
+        let bands = min(p.y - foot, height - rim - p.y)
+        let solid = max(wall, bands)
+        // the gyroid's x runs out from the wall's outer face, its y up and its z round the shade
+        let q = vec3(r - radius, p.y, atan2(p.z, p.x) * cells * period / turn)
+        let lattice = sdf_intersection(sdf_gyroid(q, period, sheet), wall)
+        return sdf_union(lattice, solid)
+    }
+})
+
+object(shade, name: "Gyroid lamp")
+
+// Up the shade, a dithered fade from the first filament to the second, a little noise in it so
+// the fade has no hard steps.
+let ember = Material{albedo: [0.95 0.42 0.12] name: "Ember"}
+let violet = Material{albedo: [0.36 0.2 0.62] name: "Violet"}
+m.fill(m.box({size: [2 * radius + 4mm, height + 2mm, 2 * radius + 4mm] at: [0, height / 2, 0]}), Mix{materials: [ember violet] field: fn(p) {
+    (p.y - foot) / (height - foot - rim) + 0.06 * noise.fbm(p / 7mm, 3, 2)
+}})

@@ -1,0 +1,10 @@
+[package]
+name = "fab-elec-parts"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab electronics part definitions (contract C2): pins and their kinds, symbols on the connection grid, footprints with pad stacks, 3D bodies and ports"
+
+[dependencies]
+fab-elec-core = { path = "../core" }

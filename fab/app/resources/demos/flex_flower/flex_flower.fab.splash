@@ -1,0 +1,20 @@
+// A flower printed open: six pointed tepals in bands from pearl at their edges to berry along their
+// middles round a gold heart of stamens, each tepal fused to a moss TPU ribbon that bends, so the
+// tepals fold up into a cup and spring open again.
+use mod.fab.*
+
+script("flex_flower.cad.splash")
+
+color("Leaf", rgb: #x2e8a3a)
+color("Pearl", rgb: #xf5e6ea)
+color("Blush", rgb: #xf2b8c7)
+color("Pink", rgb: #xe8789b)
+color("Rose", rgb: #xd14270)
+color("Berry", rgb: #x8f1f52)
+color("Amber", rgb: #xe08a1f)
+color("Gold", rgb: #xf2c230)
+color("Moss", rgb: #x407a2e, material: "TPU")
+
+// Gold, the heart's colour, prints at every count. Its first layer prints its paint too: the
+// tepals' bands and the green underside reach the bed.
+place("flex_flower", at: [175mm 160mm], name: "Flex flower", color: "Gold", settings: {fab_paint_first_layer: true})

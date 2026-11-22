@@ -1,0 +1,9 @@
+// A tall vase grown leopard spots: a Turing pattern in two filaments.
+use mod.fab.*
+
+script("leopard_vase.cad.splash")
+
+color("Sand", rgb: #xe6bd73)
+color("Dark", rgb: #x211712)
+
+place("leopard_vase", at: [175mm 160mm], name: "Leopard vase", color: "Sand")

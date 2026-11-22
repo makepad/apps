@@ -1,0 +1,28 @@
+[package]
+name = "fab-elec-host"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab electronics host core: the shared UI driver, engine strand, inbox and passes (ARCHITECTURE 2.2)"
+
+[package.metadata.makepad.platform-gaps]
+windows = {}
+
+[dependencies]
+makepad-widgets-core = { path = "../../../../../widgets/core", version = "2.0.0" }
+fab-elec-core = { path = "../core" }
+fab-elec-circuit = { path = "../circuit" }
+fab-elec-board = { path = "../board" }
+fab-elec-design = { path = "../design" }
+fab-elec-lang = { path = "../lang" }
+fab-elec-explore = { path = "../explore" }
+fab-elec-view = { path = "../view" }
+fab-elec-route = { path = "../route" }
+fab-elec-parts = { path = "../parts" }
+fab-elec-bench = { path = "../bench" }
+fab-elec-cam = { path = "../cam" }
+
+[dev-dependencies]
+fab-elec-route = { path = "../route", features = ["test-hooks"] }
+fab-elec-fixtures = { path = "../fixtures" }

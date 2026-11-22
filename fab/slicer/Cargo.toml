@@ -1,0 +1,11 @@
+[package]
+name = "makepad-fab-slicer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab's slicer geometry: exact integer-grid polygon booleans and offsets, meshes (STL, 3MF), and the contour sources that cut a model into per-layer regions"
+
+[dependencies]
+# 3MF models are zip archives.
+makepad-zip-file = { path = "../../../../libs/zip_file" }

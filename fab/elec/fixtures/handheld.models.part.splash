@@ -1,0 +1,217 @@
+// The handheld's own parts. Pin names are the bus models' PINS, plus supply and ground; bus
+// parameters are stored as text fields. Footprints come from each package drawing where one is
+// pinned; an Assumed land says so and why. Strap and mode terminals that are fixed on this board
+// share a supply or ground pin's pads, and their notes give the setting they make.
+let e = mod.elec
+let f = e.f
+
+// A row of hot-bar contacts at 0.5 mm pitch, 0.3 x 1.5 mm each (Assumed: a common flex-tail land;
+// no module drawing is pinned), numbered 1.. from the left, centred on the origin.
+let tail_contacts = fn(n) {
+    return for i in 0..n { f.smd(f.int(i + 1), [(i - (n - 1) * 0.5) * 0.5mm, 0mm], [0.3mm, 1.5mm], {shape: @rect}) }
+}
+
+e.define("panel", {
+    kind: @ic
+    fields: {sim: "bus" model: "CO5300" "bus.glass_x": "16" "bus.glass_y": "0"
+             "bus.glass_w": "368" "bus.glass_h": "448"}
+    symbol: f.ic_symbol("panel", {
+        left: [["CSX" @in] ["SCLK" @in] ["SIO0" @bidi] ["SIO1" @bidi]
+               ["SIO2" @bidi] ["SIO3" @bidi] ["RESX" @in]]
+        top: [["VDD" @power_in]] bottom: [["GND" @power_in]]
+    })
+    // The AMOLED module lies on the board's front with its driver on glass; its flex tail lands on
+    // 16 contacts below its lower edge. Assumed, with no module drawing pinned: a 1.8 inch panel
+    // (368 x 448 at 0.0789 mm, a 29.0 x 35.3 mm active area centred in the module), a
+    // 33.6 x 41.6 x 1.5 mm module whose lower edge is 2.7 mm above the contact row, and the
+    // contact order. The origin is the contact row's centre.
+    footprint: f.footprint({
+        pads: tail_contacts(16)
+        body: [[-16.8mm, 2.7mm], [16.8mm, 44.3mm]]
+        mount: @smd
+        text: 1mm
+        graphics: [f.dot("F.SilkS", [-4.3mm, -1.2mm], 0.15mm)]
+    })
+    body: {height: 1.5mm package: @display}
+    pads: {GND: [1, 4, 7, 9, 14, 16] VDD: [2, 3, 15] RESX: 5 CSX: 6 SCLK: 8
+           SIO0: 10 SIO1: 11 SIO2: 12 SIO3: 13}
+    prefix: "U"
+})
+e.define("touch", {
+    kind: @ic
+    fields: {sim: "bus" model: "CST820" "bus.addr": "21"} // 0x15
+    symbol: f.ic_symbol("touch", {
+        left: [["SDA" @bidi] ["SCL" @in] ["RST" @in]] right: [["INT" @out]]
+        top: [["VDD" @power_in]] bottom: [["GND" @power_in]]
+    })
+    // The touch layer is laminated on the panel and carries its controller on its own flex tail,
+    // so its sensor lines and filter capacitors stay on the module; the board sees six contacts
+    // below the panel's, clear of the module (Assumed: the tail, its contact order and the stub of
+    // it the board shows).
+    footprint: f.footprint({
+        pads: tail_contacts(6)
+        body: [[-1.8mm, -1.0mm], [1.8mm, 1.0mm]]
+        mount: @smd
+        text: 1mm
+        graphics: [f.dot("F.SilkS", [-1.8mm, -1.2mm], 0.15mm)]
+    })
+    // the tail's stub, 0.3 mm thick (Assumed with the footprint)
+    body: {height: 0.3mm}
+    pads: {VDD: 1 GND: 2 RST: 3 INT: 4 SDA: 5 SCL: 6}
+    prefix: "U"
+})
+e.define("imu", {
+    kind: @ic
+    // Datasheet Rev 0.6 Figure 7 (right-handed, Z out of the top) with pin 1 at the corner the
+    // Figure 4 top view puts upper left: X runs along the three-terminal side away from pin 1's
+    // corner (14 to 12), Y toward pin 1 along the four-terminal side: the footprint's +x and +y.
+    fields: {sim: "bus" model: "QMI8658C" "bus.addr": "107" "motion.x": "+x" "motion.z": "+z"} // 0x6B
+    symbol: f.ic_symbol("imu", {
+        left: [["SDA" @bidi] ["SCL" @in]] right: [["INT1" @out] ["INT2" @out]]
+        top: [["VDD" @power_in]] bottom: [["GND" @power_in]]
+    })
+    // LGA-14, 2.5 x 3.0 x 0.86 mm, datasheet Rev 0.6 section 13.1, Figure 22: 0.25 x 0.475 mm
+    // terminals at 0.5 mm pitch, their outer ends 0.1 mm inside the body; four down each 2.5 mm
+    // side, three along each 3.0 mm side. Lands are the nominal terminals. Top view, pin 1 at upper
+    // left, anticlockwise. The silk dot marks pin 1; the package's own corner mark is not a land.
+    footprint: f.footprint({
+        pads: for i in 0..14 {
+            let at = if i < 4 { [-1.1625mm, (0.75 - i * 0.5) * 1mm] }
+                     elif i < 7 { [(i - 5) * 0.5mm, -0.9125mm] }
+                     elif i < 11 { [1.1625mm, (i - 8.5) * 0.5mm] }
+                     else { [(12 - i) * 0.5mm, 0.9125mm] }
+            let size = if i < 4 || (i >= 7 && i < 11) { [0.475mm, 0.25mm] } else { [0.25mm, 0.475mm] }
+            f.smd(f.int(i + 1), at, size, {shape: @rect})
+        }
+        body: [[-1.5mm, -1.25mm], [1.5mm, 1.25mm]]
+        mount: @smd
+        text: 1mm
+        graphics: [f.dot("F.SilkS", [-1.75mm, 1.45mm], 0.1mm)]
+    })
+    // Table 2: 5 VDDIO and 8 VDD on the rail; 1 SA0 high selects address 0x6B (section 12.2) and
+    // 12 CS high selects I2C; 2 SDx and 3 SCx, unused in the default mode, go to ground with 6
+    // and 7; 10 and 11 are reserved, left open.
+    // section 13.1: 0.86 mm high
+    body: {height: 0.86mm}
+    pads: {VDD: [1, 5, 8, 12] GND: [2, 3, 6, 7] INT1: 4 INT2: 9 SCL: 13 SDA: 14}
+    prefix: "U"
+})
+e.define("expander", {
+    kind: @ic
+    fields: {sim: "bus" model: "TCA9554" "bus.addr": "32"} // 0x20
+    symbol: f.ic_symbol("expander", {
+        left: [["SDA" @bidi] ["SCL" @in]]
+        right: [["P0" @bidi] ["P1" @bidi] ["P2" @bidi] ["P3" @bidi]
+                ["P4" @bidi] ["P5" @bidi] ["P6" @bidi] ["P7" @bidi] ["INT" @out]]
+        top: [["VDD" @power_in]] bottom: [["GND" @power_in]]
+    })
+    // TSSOP-16 (PW0016A): body 5.0 x 4.4 mm, 1.2 mm high at most; lands are TI's example board
+    // layout, 1.5 x 0.45 mm at 0.65 mm pitch with the rows 5.8 mm apart. Pin 1 at upper left.
+    footprint: f.footprint({
+        pads: for i in 0..16 {
+            let at = if i < 8 { [-2.9mm, (3.5 - i) * 0.65mm] } else { [2.9mm, (i - 11.5) * 0.65mm] }
+            f.smd(f.int(i + 1), at, [1.5mm, 0.45mm], {shape: @rect})
+        }
+        body: [[-2.2mm, -2.5mm], [2.2mm, 2.5mm]]
+        mount: @smd
+        text: 1mm
+        graphics: [f.dot("F.SilkS", [-2.9mm, 3.0mm], 0.15mm)]
+    })
+    body: {height: 1.2mm package: @sop}
+    // Pin Functions: A0..A2 (1..3) to ground give address 0x20 (Table 2); 8 GND, 16 VCC.
+    pads: {VDD: 16 GND: [1, 2, 3, 8] P0: 4 P1: 5 P2: 6 P3: 7 P4: 9 P5: 10 P6: 11 P7: 12
+           INT: 13 SCL: 14 SDA: 15}
+    prefix: "U"
+})
+
+// USB-C receptacle for USB 2.0: VBUS, both CC lines and the D+/D- pair. Assumed, with no drawing
+// pinned: a generic 16-pin mid-mount part, twelve lands in one row (ground and VBUS 0.6 mm wide,
+// the eight between them 0.3 mm at 0.5 mm pitch, all 1.1 mm long) on std's USB-C shell, legs and
+// mouth. Each D line has a land in both rows of the plug so either orientation connects; the
+// SBU lands stay open.
+e.define("usb_c_usb2", {
+    kind: @connector
+    symbol: f.ic_symbol("usb_c_usb2", {
+        right: [["VBUS" @power_out] ["CC1" @passive] ["CC2" @passive] ["DP" @passive] ["DN" @passive]]
+        bottom: [["GND" @power_out] ["SHIELD" @passive]]
+    })
+    footprint: f.footprint({
+        pads: [
+            f.smd("A1B12", [-3.2mm, 2.025mm], [0.6mm, 1.1mm], {shape: @rect}),
+            f.smd("A4B9", [-2.4mm, 2.025mm], [0.6mm, 1.1mm], {shape: @rect}),
+            f.smd("B8", [-1.75mm, 2.025mm], [0.3mm, 1.1mm], {shape: @rect}),
+            f.smd("A5", [-1.25mm, 2.025mm], [0.3mm, 1.1mm], {shape: @rect}),
+            f.smd("B7", [-0.75mm, 2.025mm], [0.3mm, 1.1mm], {shape: @rect}),
+            f.smd("A6", [-0.25mm, 2.025mm], [0.3mm, 1.1mm], {shape: @rect}),
+            f.smd("A7", [0.25mm, 2.025mm], [0.3mm, 1.1mm], {shape: @rect}),
+            f.smd("B6", [0.75mm, 2.025mm], [0.3mm, 1.1mm], {shape: @rect}),
+            f.smd("A8", [1.25mm, 2.025mm], [0.3mm, 1.1mm], {shape: @rect}),
+            f.smd("B5", [1.75mm, 2.025mm], [0.3mm, 1.1mm], {shape: @rect}),
+            f.smd("B4A9", [2.4mm, 2.025mm], [0.6mm, 1.1mm], {shape: @rect}),
+            f.smd("B1A12", [3.2mm, 2.025mm], [0.6mm, 1.1mm], {shape: @rect}),
+            f.thru("S1", [-4.32mm, 1.775mm], [1.1mm, 1.9mm], [0.6mm, 1.3mm]),
+            f.thru("S1", [4.32mm, 1.775mm], [1.1mm, 1.9mm], [0.6mm, 1.3mm]),
+            f.thru("S1", [-4.32mm, -2.025mm], [1.1mm, 1.9mm], [0.6mm, 1.3mm]),
+            f.thru("S1", [4.32mm, -2.025mm], [1.1mm, 1.9mm], [0.6mm, 1.3mm])
+        ]
+        body: [[-4.47mm, -4.625mm], [4.47mm, 2.175mm]]
+        mount: @smd
+        text: 1mm
+        graphics: []
+    })
+    body: {height: 3.16mm ports: [{
+        kind: @plug profile: {rect: [[-4.47mm, -1.58mm], [4.47mm, 1.58mm]] r: 1.55mm}
+        at: [0mm, -4.625mm, 1.58mm] dir: [0, -1, 0] reach: 6.6mm margin: 0.3mm
+    }]}
+    pads: {VBUS: ["A4B9", "B4A9"] GND: ["A1B12", "B1A12"] CC1: "A5" CC2: "B5"
+           DP: ["A6", "B6"] DN: ["A7", "B7"] SHIELD: "S1"}
+    limits: {VBUS: {volts: 5V current: 1.5A}}
+    prefix: "J"
+})
+
+// Bus pin capacitances are unknown here; lowering reports that rather than inventing them.
+
+// The 3D models: each part's body is the model of a stock LCSC part whose package, pin pitch and
+// pin 1 match the part's own footprint. A model is fetched only when someone asks for it (Fetch 3D
+// models), into their own part library, where every plate's build finds it; until then, and for a
+// part with no such model, the part keeps its own plain body. Nothing here is shipped with Fab:
+// the paths name the files the import makes.
+//
+// Each override names only the mesh (and, where the supplier draws the package turned, the turn
+// that puts its pin 1 on pad 1): the part keeps its own height and ports. The LCSC numbers choose
+// models, not the parts a BOM orders: one 0402 resistor's model stands for every resistor value.
+//
+// The panel and its touch tail are modules with no stock part behind them, and no stock 16-pin
+// receptacle has this USB-C land (std's shell and legs), so those three keep their own bodies.
+//
+// The MCU: ESP32-S3 in QFN-56, 7 x 7 mm at 0.4 mm; pad 1 at -x, +y and anticlockwise, as the
+// part's.
+e.body("mcu", {mesh: "parts/lcsc/C2913192.glb"})
+// The IMU: QMI8658C in LGA-14, 3.0 x 2.5 mm. The supplier puts pin 1 at +x, -y; the part has it at
+// -x, +y, so the model turns half a turn.
+e.body("imu", {mesh: "parts/lcsc/C2842151.glb" rotation: [0deg, 0deg, 180deg]})
+// The expander: TCA9554PWR in TSSOP-16, pin 1 at -x, +y, as the part's.
+e.body("expander", {mesh: "parts/lcsc/C477924.glb"})
+// The regulator: ME6211C33M5G-N in SOT-23-5, std's LDO pinout (1 VIN, 2 GND, 3 EN, 5 VOUT) and
+// pad order.
+e.body("LDO_3V3_SOT23-5", {mesh: "parts/lcsc/C82942.glb"})
+// The passives: 0402WGF1002TCE for every 0402 resistor, CL05B104KO5NNNC for every 0402
+// capacitor, CL10A105KB8NNNC for the 0603 one and CL21A106KAYNNNE for the 0805 one.
+e.body("R_0402", {mesh: "parts/lcsc/C25744.glb"})
+e.body("C_0402", {mesh: "parts/lcsc/C1525.glb"})
+e.body("C_0603", {mesh: "parts/lcsc/C15849.glb"})
+e.body("C_0805", {mesh: "parts/lcsc/C15850.glb"})
+// The crystal: X322516MLB4SI, 3.2 x 2.5 mm; its pads are numbered as std's.
+e.body("XTAL_3225", {mesh: "parts/lcsc/C13738.glb"})
+// The buttons: TS-1187A-B-A-B, 5.1 x 5.1 x 1.5 mm, std's low-profile switch.
+e.body("SW_TACT_4PAD", {mesh: "parts/lcsc/C318884.glb"})
+// The codec: ES8311 (Everest), LCSC C962342, listed as QFN-20-EP(3x3), the part's package and the
+// pinout of es8311-datasheet.txt:231-248. The amplifier: NS4150B (Nsiway), LCSC C189961, MSOP-8;
+// ns4150b.txt is that LCSC part's own datasheet (PROVENANCE.md), pins 1-8 as the part's. The
+// speaker header: PZ254V-11-02P (XFCN), LCSC C492401, one row of two pins at 2.54 mm, through
+// hole (V is the vertical one; PZ254R is its right-angle twin). Numbers from the LCSC part pages,
+// 11-19. No model is fetched here, so each model's pin 1 position and origin are unchecked: a
+// turn or offset follows once the import shows them.
+e.body("ES8311_QFN20", {mesh: "parts/lcsc/C962342.glb"})
+e.body("NS4150B_MSOP8", {mesh: "parts/lcsc/C189961.glb"})
+e.body("PinHeader_1x2_P2.54mm", {mesh: "parts/lcsc/C492401.glb"})

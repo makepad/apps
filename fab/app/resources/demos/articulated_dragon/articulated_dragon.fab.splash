@@ -1,0 +1,9 @@
+// A print-in-place articulated dragon in two filaments: jade and gold scales, gold wings.
+use mod.fab.*
+
+script("articulated_dragon.cad.splash")
+
+color("Jade", rgb: #x167a4c)
+color("Gold", rgb: #xe0ad2a)
+
+place("articulated_dragon", at: [250mm 160mm], name: "Articulated dragon", color: "Jade")

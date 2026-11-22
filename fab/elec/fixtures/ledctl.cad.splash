@@ -1,0 +1,15 @@
+// The ledctl board in its printed case: the enclosure prelude's base and lid round the board
+// (`board("ledctl")`), and the board with its parts inserted in the base. The insert never
+// prints: it rides in the base, shows in place among the toolpaths in the Sliced view, and the
+// slice is checked against it (no bead enters it). The base prints on its floor, the lid upside
+// down beside it, and the button's press pin beside the lid, standing on its shaft's top.
+use mod.model.*
+use mod.fab.*
+let pcb = board("ledctl")
+let case = enclosure(pcb, {})
+object(case.base, name: "Base")
+object(case.lid, name: "Lid")
+for pin in case.pins {
+    object(pin.pin, name: pin.name)
+}
+insert(board_solid(pcb, board_bodies("ledctl"), case.frame), name: "Board", into: "Base")

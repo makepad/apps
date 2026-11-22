@@ -1,0 +1,62 @@
+// The ATMEGA328P in its 32-lead quad flat package: a 7 x 7 mm body, 9 x 9 mm over its leads, at
+// 0.8 mm pitch. Its port pins keep their own short names: PB0..PB7, PC0..PC6 (PC6 is RESET) and
+// PD0..PD7; PB6 and PB7 are the crystal pins (XTAL1, XTAL2).
+//
+// Pad 1 is at the left of the bottom edge: pads 1..8 run along the bottom, 9..16 up the right side,
+// 17..24 back along the top and 25..32 down the left side, as the package's 3D body is drawn.
+let e = mod.elec
+let f = e.f
+
+let pitch = 0.8mm
+// the pad centres' distance from the package centre, and a pad's land along and across its lead
+let reach = 4.375mm
+let along = [0.45mm, 1.65mm]
+let across = [1.65mm, 0.45mm]
+
+let pads = for i in 0..32 {
+    let k = i % 8
+    let at = if i < 8 {
+        [(k - 3.5) * pitch, -reach]
+    } elif i < 16 {
+        [reach, (k - 3.5) * pitch]
+    } elif i < 24 {
+        [(3.5 - k) * pitch, reach]
+    } else {
+        [-reach, (3.5 - k) * pitch]
+    }
+    let size = if i < 8 || (i >= 16 && i < 24) { along } else { across }
+    f.smd(f.int(i + 1), at, size, {shape: @oval})
+}
+
+e.define("ATMEGA328P_TQFP32", {
+    kind: @mcu
+    fields: {model: "ATMEGA328P"}
+    symbol: f.ic_symbol("ATMEGA328P", {
+        left: [["VCC" @power_in] ["AVCC" @power_in] ["AREF" @passive] ["PC6" @bidi]
+               ["PB6" @bidi] ["PB7" @bidi] ["ADC6" @in] ["ADC7" @in]]
+        right: [["PD0" @bidi] ["PD1" @bidi] ["PD2" @bidi] ["PD3" @bidi] ["PD4" @bidi] ["PD5" @bidi]
+                ["PD6" @bidi] ["PD7" @bidi] ["PB0" @bidi] ["PB1" @bidi] ["PB2" @bidi] ["PB3" @bidi]
+                ["PB4" @bidi] ["PB5" @bidi]]
+        top: [["PC0" @bidi] ["PC1" @bidi] ["PC2" @bidi] ["PC3" @bidi] ["PC4" @bidi] ["PC5" @bidi]]
+        bottom: [["GND" @power_in]]
+    })
+    footprint: f.footprint({
+        pads: pads
+        body: [[-3.5mm, -3.5mm], [3.5mm, 3.5mm]]
+        mount: @smd
+        text: 1mm
+        graphics: [f.dot("F.SilkS", [-3.5mm, -4.9mm], 0.15mm)]
+    })
+    body: {height: 1.2mm}
+    pads: {
+        PD3: 1 PD4: 2 GND: [3, 5, 21] VCC: [4, 6] PB6: 7 PB7: 8
+        PD5: 9 PD6: 10 PD7: 11 PB0: 12 PB1: 13 PB2: 14 PB3: 15 PB4: 16
+        PB5: 17 AVCC: 18 ADC6: 19 AREF: 20 ADC7: 22 PC0: 23 PC1: 24
+        PC2: 25 PC3: 26 PC4: 27 PC5: 28 PC6: 29 PD0: 30 PD1: 31 PD2: 32
+    }
+    limits: {VCC: {volts: [1.8V 5.5V]} AVCC: {volts: [1.8V 5.5V]} io: {volts: [-0.5V 5.5V] current: 20mA}}
+    // The I/O pads at a 5 V supply, typical: driver on resistances, the pull-up, the Schmitt
+    // input's switching points as fractions of the supply, and the pad's leakage.
+    gpio: {r_high: 26ohm r_low: 23.5ohm pull_up: 36kohm vih: 0.524 vil: 0.418 leak: 1uA}
+    prefix: "U"
+})

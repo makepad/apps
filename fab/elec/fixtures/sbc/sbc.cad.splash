@@ -1,0 +1,32 @@
+// The flagship's two-part case: a cutout per port, the header through the lid, both flat
+// cables through slots at the joint, vents over the processor and power controller, and a
+// finger notch at the card slot. The board is inserted in the base: the Sliced view shows it
+// in place, and the slice's beads are checked against its volume.
+//
+// The board and its parts come from design/src/fixture/sbc.rs. The model's origin is under
+// board (42.5, 28): model x = board x - 42.5, model z = 28 - board y. The processor at board
+// (34, 30) gives [-8.5, -2]; the power controller at (17, 20) gives [-25.5, 8].
+// enclosure.splash sets the standoff height to max(3, 1.85 + 1, 3.5 + 1 - 1.6) = 3 mm:
+// the bottom envelope is 1.85 mm and the M2.5 heat-set insert is 3.5 mm long. The board's
+// bottom is at model y = floor 1.6 + standoff 3 = 4.6 mm. The card mouth at board
+// (0.3, 22, -0.925) gives the left notch's [along, y] = [6, 3.675], with a 3.5 mm rim.
+// The two sideways cable ports become joint exits in the prelude; no exits list is needed.
+// Their cables leave 1 mm above the board, so the lid is notched over them too.
+// The screws hold the board at x 3.5 and 61.5; the corners past them carry the USB stack and
+// the network jack, where the default corner rests would press on them. One rest holds the
+// overhang at (70, 26.5) instead, clear of both and of the camera connector.
+use mod.model.*
+use mod.fab.*
+let pcb = board("sbc")
+let case = enclosure(pcb, {
+    standoffs: {screw: @M2_5}
+    vents: [
+        {face: @top at: [-8.5mm, -2mm] size: [14mm 14mm]}
+        {face: @top at: [-25.5mm, 8mm] size: [7mm 7mm]}
+    ]
+    notches: [{face: @left at: [6mm, 3.675mm] r: 3.5mm}]
+    rests: [[70mm, 26.5mm]]
+})
+object(case.base, name: "Base")
+object(case.lid, name: "Lid")
+insert(board_solid(pcb, board_bodies("sbc"), case.frame), name: "Board", into: "Base")

@@ -1,0 +1,9 @@
+// A flared vase with a Lichtenberg figure grown over it, in two filaments.
+use mod.fab.*
+
+script("lichtenberg_vase.cad.splash")
+
+color("Birch", rgb: #xe6cca3)
+color("Char", rgb: #x2b1c14)
+
+place("lichtenberg_vase", at: [175mm 160mm], name: "Lichtenberg vase", color: "Birch")

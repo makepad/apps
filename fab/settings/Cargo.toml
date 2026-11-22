@@ -1,0 +1,12 @@
+[package]
+name = "makepad-fab-settings"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab's settings: the option table, profile import from the user's own slicer installs, the per-extruder job configuration, and the G-code template language (both macro dialects)"
+
+[dependencies]
+makepad-fab-slicer = { path = "../slicer" }
+makepad-strict-json = { path = "../../../../libs/strict_json" }
+makepad-zip-file = { path = "../../../../libs/zip_file" }

@@ -1,0 +1,20 @@
+// drum16's metal voices on their own: the hats gate the metal bank's six square waves, the cymbal
+// its four fastest. The closed hat's envelope falls in about 30 ms; the open hat's in 150 to 370 ms
+// as HAT DECAY turns, and a closed hat chokes it (an NPN on the closed hat's trigger empties the
+// open hat's envelope). The cymbal's falls in about half a second, through a band-pass at 4.3 kHz.
+// All three meet in one inverting stage: the hats through a high-pass at about 7 kHz, which keeps
+// the metal's edges.
+use mod.project.*
+let e = mod.elec
+
+let gnd    = e.net({name: "GND" kind: @ground})
+let va     = e.net({name: "VA" kind: @power volts: 5V})
+let ref    = e.net({name: "VREF"})
+let ctrig  = e.net({name: "CTRIG"})
+let otrig  = e.net({name: "OTRIG"})
+let ytrig  = e.net({name: "CYMTRIG"})
+let oenv   = e.net({name: "OENV"})
+let out    = e.net({name: "OUT"})
+
+let sg     = signal_ground({va: va gnd: gnd ref: ref})
+let hats   = metal_voices({ctrig: ctrig otrig: otrig cym: ytrig out: out oenv: oenv ref: ref va: va gnd: gnd})

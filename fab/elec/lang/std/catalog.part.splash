@@ -1,0 +1,28 @@
+let e = mod.elec
+// What std offers in the Library panel: each element is a part, or a function of a part's ends
+// whose body is one call.
+let catalog = fn() {[
+    // Resistor
+    fn(a, b) { e.r(10kohm, a, b, {package: "0402"}) }
+    // Capacitor
+    fn(a, b) { e.c(100nF, a, b, {package: "0402"}) }
+    // LED
+    fn(a, k) { e.led({color: @green package: "0603"}, a, k) }
+    // Inductor
+    mod.std.chip("L", "0805")
+    // Diode
+    mod.std.diode_part("sod123")
+    // Crystal, 3.2 x 2.5 mm
+    mod.std.crystal_part("3225")
+    // Pin header, 1 x 4, 2.54 mm
+    mod.std.header({pins: 4 pitch: 2.54mm})
+    // USB-C receptacle
+    mod.std.usb_c_receptacle()
+    // Audio jack, 3.5 mm stereo
+    mod.std.jack_3_5mm({})
+    // Tact switch
+    mod.std.tact_switch()
+    // Power flag
+    // Never listed in the Library: the Circuit's Power flyout offers it.
+    mod.std.power_flag()
+]}

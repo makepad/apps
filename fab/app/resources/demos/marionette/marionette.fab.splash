@@ -1,0 +1,17 @@
+// A jester marionette printed in place, lying on its back, beside its control.
+use mod.fab.*
+
+script("studio_marionette.cad.splash")
+
+color("Red", rgb: #xc71419)
+color("Yellow", rgb: #xf5c61f)
+color("Blue", rgb: #x1a40b3)
+color("Green", rgb: #x1f8c47)
+color("Skin", rgb: #xf2c7a3)
+color("White", rgb: #xf0f0eb)
+color("Dark", rgb: #x1a141a)
+color("Pink", rgb: #xed7385)
+color("Gold", rgb: #xd99e26)
+
+place("studio_marionette", object: "Marionette", at: [135mm 160mm], name: "Marionette", color: "Red")
+place("studio_marionette", object: "Control", at: [135mm 160mm], name: "Control", color: "Gold")

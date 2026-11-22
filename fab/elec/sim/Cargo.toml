@@ -1,0 +1,16 @@
+[package]
+name = "fab-elec-sim"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab electronics simulation kernel (E3): modified nodal analysis in charge form, own sparse and dense LU, Newton with junction limiting and the operating-point aids, op/dc/ac/tran with trapezoidal, Gear and backward Euler, the device models, the FFT and live mode. No dependencies."
+
+[package.metadata.makepad.platform-gaps]
+windows = {}
+
+[dependencies]
+
+[[test]]
+name = "proofs"
+path = "tests/proofs/main.rs"

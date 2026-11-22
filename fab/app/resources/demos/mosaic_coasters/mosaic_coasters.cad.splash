@@ -1,0 +1,35 @@
+// A set of four mosaic coasters in two filaments: Voronoi tiles parted by grout lines, each
+// coaster laid with a pattern of its own. The grout is where a point is nearly as close to its
+// second-nearest cell as to its nearest, and it runs down through the top few layers only, so
+// the layers under it print in one filament.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+let size = param(90mm, min: 60mm, max: 120mm, step: 1mm, label: "Size", group: "Coasters")
+let thickness = param(4mm, min: 3mm, max: 8mm, step: 0.2mm, label: "Thickness", group: "Coasters")
+let corner = param(10mm, min: 2mm, max: 30mm, step: 0.5mm, label: "Corner", group: "Coasters", kind: "radius")
+let tile = param(11mm, min: 6mm, max: 25mm, step: 0.5mm, label: "Tile", group: "Mosaic", hint: "the tiles' size")
+let grout = param(1.4mm, min: 0.8mm, max: 3mm, step: 0.1mm, label: "Grout", group: "Mosaic", hint: "the grout lines' width")
+let depth = param(1.2mm, min: 0.4mm, max: 3mm, step: 0.2mm, label: "Grout depth", group: "Mosaic", hint: "how far the grout runs down from the top")
+
+let pitch = size + 10mm
+let spots = for x in [-1, 1] { for z in [-1, 1] { [x * pitch / 2, z * pitch / 2] } }
+let coasters = for s in spots {
+    m.extrude({sketch: Rect{size: [size size] corner: corner} plane: @xz height: thickness at: [s[0], 0, s[1]]})
+}
+
+object(m.union(coasters[0], [coasters[1] coasters[2] coasters[3]]), name: "Mosaic coasters")
+
+// The grout: the gap between the nearest and second-nearest cell, as millimetres from a tile's
+// edge, and a seed of its own for each coaster. The tiles stand straight down: the cells are
+// taken across the plate, never up it.
+let tiles = Material{albedo: [0.12 0.36 0.62] name: "Cobalt"}
+let lines = Material{albedo: [0.92 0.91 0.86] name: "Grout"}
+m.fill(m.union(coasters[0], [coasters[1] coasters[2] coasters[3]]), Mix{materials: [tiles lines] field: fn(p) {
+    let seed = if p.x < 0 { if p.z < 0 { 3 } else { 5 } } else { if p.z < 0 { 8 } else { 13 } }
+    let c = noise.cells(vec3(p.x, 0, p.z) / tile, seed)
+    let edge = (c.y - c.x) * tile / 2
+    let top = p.y - (thickness - depth)
+    0.5 + min(grout / 2 - edge, top) / 1mm
+} sharp: 1})

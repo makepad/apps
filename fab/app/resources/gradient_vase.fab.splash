@@ -1,0 +1,9 @@
+// The bud vase blending from blue at the foot to yellow at the lip, dithered bead by bead.
+use mod.fab.*
+
+script("gradient_vase.cad.splash")
+
+color("Blue")
+color("Yellow")
+
+place("gradient_vase", object: "vase", color: "Blue")

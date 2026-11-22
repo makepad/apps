@@ -1,0 +1,149 @@
+let __qfn_f = mod.elec.f
+
+let __qfn_positive = fn(v) {
+    return v.is_number() && v > 0mm && v - v == 0mm
+}
+
+// Flat no-lead lands: toe 0.30 mm, heel 0 mm, side 0 mm.
+let __qfn_land = fn(span, width, length) {
+    let f = __qfn_f
+    let z = span + 2 * 0.30mm
+    let g = span - 2 * length
+    return {
+        length: f.round((z - g) / 2, 0.01mm)
+        width: f.round(width, 0.01mm)
+        centre: f.round((z + g) / 4, 0.01mm)
+    }
+}
+
+// Flat no-lead footprint, four sides by default or o.sides: 2 for two rows.
+// o: pins (integer), pitch (mm), body [x, y] (mm), lead [width, length] (mm),
+// optional ep [width, height] (mm), centred and numbered pins + 1.
+let qfn = fn(o) {
+    let f = __qfn_f
+    if !o.is_object() { return f.error("qfn: o must be an options object") }
+    let pins = o.pins ?? nil
+    let pitch = o.pitch ?? nil
+    let body = o.body ?? nil
+    let lead = o.lead ?? nil
+    let ep = o.ep ?? nil
+    let sides = o.sides ?? 4
+    if sides != 2 && sides != 4 {
+        return f.error("qfn: sides must be 2 or 4")
+    }
+    if !pins.is_number() || pins < sides || pins % 1 != 0 || pins % sides != 0 {
+        return f.error("qfn: pins must be a positive integer divisible by sides")
+    }
+    if !__qfn_positive(pitch) {
+        return f.error("qfn: pitch must be a positive finite length")
+    }
+    if !body.is_array() || body.len() != 2 {
+        return f.error("qfn: body must be [x, y]")
+    }
+    if !__qfn_positive(body[0]) || !__qfn_positive(body[1]) {
+        return f.error("qfn: body dimensions must be positive finite lengths")
+    }
+    if !lead.is_array() || lead.len() != 2 {
+        return f.error("qfn: lead must be [width, length]")
+    }
+    if !__qfn_positive(lead[0]) || !__qfn_positive(lead[1]) {
+        return f.error("qfn: lead dimensions must be positive finite lengths")
+    }
+    if 2 * lead[1] >= body[0] || (sides == 4 && 2 * lead[1] >= body[1]) {
+        return f.error("qfn: lead length must leave a gap between opposite terminals")
+    }
+
+    let per_side = pins / sides
+    let row_half = (per_side - 1) * pitch / 2
+    let row_span = 2 * row_half + lead[0]
+    if row_span > body[1] || (sides == 4 && row_span > body[0]) {
+        return f.error("qfn: pins, pitch and lead width must fit each body side")
+    }
+    let x_land = __qfn_land(body[0], lead[0], lead[1])
+    let y_land = if sides == 4 {
+        __qfn_land(body[1], lead[0], lead[1])
+    } else { x_land }
+    if x_land.width <= 0mm || x_land.length <= 0mm || y_land.length <= 0mm {
+        return f.error("qfn: lead dimensions must produce positive rounded lands")
+    }
+    if per_side > 1 && (lead[0] >= pitch || x_land.width >= pitch) {
+        return f.error("qfn: pitch must exceed lead and rounded land width")
+    }
+    let inner_x = x_land.centre - x_land.length / 2
+    let inner_y = y_land.centre - y_land.length / 2
+    if inner_x <= 0mm || (sides == 4 && inner_y <= 0mm) {
+        return f.error("qfn: lead length leaves no gap between rounded lands")
+    }
+    let row_edge = row_half + x_land.width / 2
+    if sides == 4 && row_edge >= inner_x && row_edge >= inner_y {
+        return f.error("qfn: pins, pitch and lead dimensions make corner lands touch")
+    }
+
+    let ep_size = if ep != nil {
+        if !ep.is_array() || ep.len() != 2 {
+            return f.error("qfn: ep must be [width, height]")
+        }
+        if !__qfn_positive(ep[0]) || !__qfn_positive(ep[1]) {
+            return f.error("qfn: ep dimensions must be positive finite lengths")
+        }
+        if ep[0] > body[0] || ep[1] > body[1] {
+            return f.error("qfn: ep must fit inside body")
+        }
+        let size = [f.round(ep[0], 0.01mm), f.round(ep[1], 0.01mm)]
+        if size[0] <= 0mm || size[1] <= 0mm {
+            return f.error("qfn: ep dimensions must remain positive after rounding")
+        }
+        if size[0] > body[0] || size[1] > body[1] {
+            return f.error("qfn: rounded ep must fit inside body")
+        }
+        if size[0] >= 2 * inner_x || (sides == 4 && size[1] >= 2 * inner_y) {
+            return f.error("qfn: ep must leave a gap to terminal lands")
+        }
+        size
+    } else { nil }
+
+    let pads = for i in 0..pins {
+        let at = if i < per_side {
+            [-x_land.centre, row_half - i * pitch]
+        } elif sides == 2 {
+            [x_land.centre, -row_half + (i - per_side) * pitch]
+        } elif i < 2 * per_side {
+            [-row_half + (i - per_side) * pitch, -y_land.centre]
+        } elif i < 3 * per_side {
+            [x_land.centre, -row_half + (i - 2 * per_side) * pitch]
+        } else {
+            [row_half - (i - 3 * per_side) * pitch, y_land.centre]
+        }
+        let size = if sides == 2 || i < per_side || (i >= 2 * per_side && i < 3 * per_side) {
+            [x_land.length, x_land.width]
+        } else {
+            [y_land.width, y_land.length]
+        }
+        f.smd(f.int(i + 1), at, size)
+    }
+    if ep_size != nil {
+        pads.push(f.smd(f.int(pins + 1), [0mm, 0mm], ep_size))
+    }
+    return f.footprint({
+        pads: pads
+        body: [[-body[0] / 2, -body[1] / 2], [body[0] / 2, body[1] / 2]]
+        mount: @smd
+        text: 1mm
+        graphics: [f.dot("F.SilkS", [-x_land.centre, row_half + 0.7mm], 0.15mm)]
+    })
+}
+
+// Flat no-lead footprint with two rows: even o.pins, o.pitch (mm),
+// o.body [x, y] (mm), o.lead [width, length] (mm), optional o.ep [width, height] (mm).
+let dfn = fn(o) {
+    let f = __qfn_f
+    if !o.is_object() { return f.error("dfn: o must be an options object") }
+    return qfn({
+        pins: (o.pins ?? nil)
+        pitch: (o.pitch ?? nil)
+        body: (o.body ?? nil)
+        lead: (o.lead ?? nil)
+        ep: (o.ep ?? nil)
+        sides: 2
+    })
+}

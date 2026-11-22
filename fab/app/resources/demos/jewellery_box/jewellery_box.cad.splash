@@ -1,0 +1,71 @@
+// A jewellery box printed open in one go: the box and its lid side by side on the bed, joined by
+// a print-in-place barrel hinge at half the box's height, so the lid swings over and closes on
+// the box. A latch on the lid's front snaps over a ridge on the box. The lid's top is printed
+// face down with an inlay in the second filament: the first layers, so it comes out crisp.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+let box_width = param(64mm, min: 40mm, max: 140mm, step: 1mm, label: "Width", group: "Box")
+let box_depth = param(44mm, min: 30mm, max: 100mm, step: 1mm, label: "Depth", group: "Box")
+let box_height = param(26mm, min: 18mm, max: 60mm, step: 0.5mm, label: "Height", group: "Box")
+let wall = param(2mm, min: 1.2mm, max: 4mm, step: 0.1mm, label: "Wall", group: "Box")
+let lid_thickness = param(3.2mm, min: 2.4mm, max: 6mm, step: 0.2mm, label: "Lid", group: "Lid", hint: "the lid's plate; its first 0.6 mm carry the inlay")
+let inlay_cell = param(7mm, min: 3mm, max: 20mm, step: 0.5mm, label: "Inlay cells", group: "Lid", hint: "the size of the inlay's tiles")
+
+// The hinge's axis runs along X at half of box plus lid, so a half turn lays the lid's inside on the rim.
+let axis_y = (box_height + lid_thickness) / 2
+let knuckle = 4.5mm
+let pin = 2mm
+// The box stands in front of the axis, clear of the lid's knuckle as it turns; the lid lies behind.
+let back = -(knuckle + 1.1mm)
+let front = back - box_depth
+let lid_back = 0.5mm
+
+// The box: walls round a floor, its top open, and a ridge on its front for the latch. The ridge
+// slopes out at 45° from the wall, so it needs no support, and the latch rides off that slope when
+// the lid is pulled open.
+let outer = m.extrude({sketch: Rect{size: [box_width, box_depth] corner: 2mm} height: box_height at: [0, 0, (front + back) / 2]})
+let inner = m.box({size: [box_width - 2 * wall, box_height, box_depth - 2 * wall] radius: 1mm at: [0, box_height / 2 + 1.6mm, (front + back) / 2]})
+let ridge = m.extrude({sketch: Polygon{points: [[front, box_height - 6.4mm] [front - 1.2mm, box_height - 5.2mm] [front - 1.2mm, box_height - 4.6mm] [front, box_height - 3.4mm]]} plane: @yz height: 16mm both: true})
+// Each end of the hinge sits on a web rising up the box's back wall from the bed, flush with the
+// box's side; it meets the knuckle along a 45° tangent, so nothing under it overhangs. Long end plates keep the
+// pin's bridge across the lid's knuckle short.
+let plate_len = box_width * 0.3
+let web_len = plate_len - 0.8mm
+let webs = for x in [-1, 1] {
+    m.extrude({sketch: Polygon{points: [[back, 0] [back, axis_y + knuckle] [0, axis_y + knuckle] [knuckle * 1.414, axis_y] [0, axis_y - knuckle * 1.414]]} plane: @yz height: web_len both: true at: [x * (box_width / 2 - web_len / 2), 0, 0]})
+}
+let box_knuckle = m.cylinder({radius: knuckle height: box_width at: [0, axis_y, 0] rotate: [0, 0, 90°]})
+let base = m.union(m.subtract(outer, inner), [ridge box_knuckle webs[0] webs[1]])
+
+// The lid: a plate behind the axis, a lip that drops inside the box's rim, an arm up to its
+// knuckle in the middle of the hinge, and the latch: a tab standing up off the far edge (it hangs
+// over the box's front once closed) whose hook clicks under the ridge.
+let lip_gap = 0.4mm
+let lip_z = -(back + front) / 2
+let latch_z = -front + 1.6mm
+let lid_depth = latch_z + 1.2mm - lid_back
+let lid_plate = m.extrude({sketch: Rect{size: [box_width, lid_depth] corner: 2mm} height: lid_thickness at: [0, 0, lid_back + lid_depth / 2]})
+let lip_w = box_width - 2 * wall - 2 * lip_gap
+let lip_d = box_depth - 2 * wall - 2 * lip_gap
+let lip = m.subtract(m.box({size: [lip_w, 3mm, lip_d] at: [0, lid_thickness + 1.5mm, lip_z]}), m.box({size: [lip_w - 2.4mm, 5mm, lip_d - 2.4mm] at: [0, lid_thickness + 1.5mm, lip_z]}))
+let eye_len = box_width - 2 * plate_len - 2mm
+let arm = m.extrude({sketch: Polygon{points: [[-knuckle * 0.98, axis_y] [knuckle * 0.7, axis_y] [knuckle + 0.1mm, lid_thickness + 2mm] [knuckle + 2mm, lid_thickness] [lid_back, lid_thickness]]} plane: @yz height: eye_len - 1mm both: true})
+let lid_knuckle = m.cylinder({radius: knuckle height: box_width at: [0, axis_y, 0] rotate: [0, 0, 90°]})
+// The hook is a 45° barb both ways, so it prints without support. Closed (height = box + lid -
+// print height), its upper slope lies 0.4 mm under the ridge's, holding the lid down until a pull
+// rides it off.
+let hook_y = lid_thickness + 5.2mm
+let latch = m.extrude({sketch: Polygon{points: [[latch_z, lid_thickness] [latch_z + 1.2mm, lid_thickness] [latch_z + 1.2mm, lid_thickness + 8.5mm] [latch_z, lid_thickness + 8.5mm] [latch_z, hook_y + 2.6mm] [latch_z - 1.1mm, hook_y + 1.5mm] [latch_z - 1.1mm, hook_y + 1.1mm] [latch_z, hook_y]]} plane: @yz height: 14mm both: true})
+let lid = m.union(lid_plate, [lip arm lid_knuckle latch])
+
+let hinge = m.hinge(base, lid, {at: [0, axis_y, 0] axis: [1, 0, 0] pin: pin plate: plate_len})
+
+object(base, name: "Jewellery box")
+
+// The inlay: tiles of the second filament in the lid's outer face (face down on the bed), a
+// Voronoi mosaic with a plain border.
+let gold = Material{albedo: [0.86 0.66 0.2] name: "Gold"}
+let inlay = m.box({size: [box_width - 6mm, 0.6mm, lid_depth - 6mm] at: [0, 0.3mm, lid_back + lid_depth / 2]})
+m.fill(inlay, Mix{materials: [Material{albedo: [0.12 0.2 0.32] name: "Navy"} gold] field: fn(p) { 1 - noise.edges(p / inlay_cell, 4) * 4 } sharp: 1})

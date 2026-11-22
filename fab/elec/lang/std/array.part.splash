@@ -1,0 +1,240 @@
+let __array_e = mod.elec
+let __array_f = mod.elec.f
+
+let __array_positive = fn(v) {
+    return v.is_number() && v > 0mm && v - v == 0mm
+}
+
+// Round positive dimensions to 0.01 mm; a sub-nanometre bias stabilises half steps.
+let __array_round = fn(v) {
+    return __array_f.round(v + 0.000000001mm, 0.01mm)
+}
+
+// Lands on two horizontal rows: chip toe 0.35 mm or flat no-lead toe 0.30 mm;
+// heel and side are zero. Z = span + 2 * toe; G = span - 2 * terminal length.
+let __array_land = fn(span, terminal, toe) {
+    return {
+        y: __array_round((span - terminal[1] + toe) / 2)
+        size: [__array_round(terminal[0]), __array_round(terminal[1] + toe)]
+    }
+}
+
+// Convex-terminal chip array: o.elements is 2, 4 or 8; o.pitch, o.body [x, y]
+// and o.term [width, length] are in mm. Elements run along x, terminals along y.
+let chip_array = fn(o) {
+    let f = __array_f
+    if !o.is_object() { return f.error("chip_array: o must be an options object") }
+    if (o.elements ?? nil) == nil { return f.error("chip_array: elements is required") }
+    if (o.pitch ?? nil) == nil { return f.error("chip_array: pitch is required") }
+    if (o.body ?? nil) == nil { return f.error("chip_array: body is required") }
+    if (o.term ?? nil) == nil { return f.error("chip_array: term is required") }
+    if !o.elements.is_number() || (o.elements != 2 && o.elements != 4 && o.elements != 8) {
+        return f.error("chip_array: elements must be 2, 4 or 8")
+    }
+    if !__array_positive(o.pitch) || o.pitch <= 0.1mm {
+        return f.error("chip_array: pitch must be a positive finite length greater than 0.1 mm")
+    }
+    if !o.body.is_array() || o.body.len() != 2 {
+        return f.error("chip_array: body must be [x, y]")
+    }
+    if !__array_positive(o.body[0]) || !__array_positive(o.body[1]) {
+        return f.error("chip_array: body dimensions must be positive finite lengths")
+    }
+    if !o.term.is_array() || o.term.len() != 2 {
+        return f.error("chip_array: term must be [width, length]")
+    }
+    if !__array_positive(o.term[0]) || !__array_positive(o.term[1]) {
+        return f.error("chip_array: term dimensions must be positive finite lengths")
+    }
+    if o.term[0] > o.pitch {
+        return f.error("chip_array: term width must not exceed pitch")
+    }
+    if 2 * o.term[1] >= o.body[1] {
+        return f.error("chip_array: term length must leave a gap across body y")
+    }
+    let row_half = (o.elements - 1) * o.pitch / 2
+    if 2 * row_half + o.term[0] > o.body[0] {
+        return f.error("chip_array: body x must contain elements at the given pitch and term width")
+    }
+    let land = __array_land(o.body[1], o.term, 0.35mm)
+    let limit = o.pitch - 0.1mm
+    let candidate = __array_round(if land.size[0] < limit { land.size[0] } else { limit })
+    // If nearest rounding consumed the clearance, take the preceding 0.01 mm step.
+    let width = if candidate > limit + 0.000000001mm {
+        __array_round(candidate - 0.01mm)
+    } else { candidate }
+    if width <= 0mm || land.size[1] <= 0mm {
+        return f.error("chip_array: pitch and term must allow positive rounded lands with 0.1 mm clearance")
+    }
+    if 2 * land.y <= land.size[1] {
+        return f.error("chip_array: body y and term length must separate the rounded land rows")
+    }
+    let pads = for i in 0..(2 * o.elements) {
+        let at = if i < o.elements {
+            [-row_half + i * o.pitch, -land.y]
+        } else {
+            [row_half - (i - o.elements) * o.pitch, land.y]
+        }
+        f.smd(f.int(i + 1), at, [width, land.size[1]])
+    }
+    return f.footprint({
+        pads: pads
+        body: [[-o.body[0] / 2, -o.body[1] / 2], [o.body[0] / 2, o.body[1] / 2]]
+        mount: @smd
+        text: 0.6mm
+        graphics: [f.dot("F.SilkS", [-row_half, -land.y - 0.7mm], 0.15mm)]
+    })
+}
+
+// Four chip elements: pitch 0.5 mm, body 2.0 x 1.0 mm, terminals 0.3 x 0.2 mm.
+let array4_0402 = fn() {
+    return chip_array({elements: 4 pitch: 0.5mm body: [2.0mm, 1.0mm] term: [0.3mm, 0.2mm]})
+}
+
+// Four chip elements: pitch 0.8 mm, body 3.2 x 1.6 mm, terminals 0.5 x 0.3 mm.
+let array4_0603 = fn() {
+    return chip_array({elements: 4 pitch: 0.8mm body: [3.2mm, 1.6mm] term: [0.5mm, 0.3mm]})
+}
+
+// Four-element resistor array; package is "0402" or "0603", with eight passive pins.
+// Optional o.height defaults to the chip's seated height: 0.35 or 0.45 mm respectively.
+let resistor_array_part = fn(package, o = nil) {
+    let e = __array_e
+    let f = __array_f
+    if package != "0402" && package != "0603" {
+        return f.error("resistor_array_part: package must be 0402 or 0603")
+    }
+    if o == nil { o = {} }
+    if !o.is_object() { return f.error("resistor_array_part: o must be an options object") }
+    let default_height = if package == "0402" { 0.35mm } else { 0.45mm }
+    let height = o.height ?? default_height
+    if !__array_positive(height) {
+        return f.error("resistor_array_part: height must be a positive finite length")
+    }
+    let height_suffix = if height == default_height { "" } else { "_H" + f.mm(height) + "mm" }
+    let name = "RN_" + package + height_suffix
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    let footprint = if package == "0402" { array4_0402() }
+    elif package == "0603" { array4_0603() }
+    else { return f.error("resistor_array_part: package must be 0402 or 0603") }
+    if footprint == nil { return nil }
+    let left = for i in 0..4 { [f.int(i + 1), @passive] }
+    let right = for i in 0..4 { [f.int(8 - i), @passive] }
+    let pad_map = for i in 0..8 {
+        let no = f.int(i + 1)
+        [no, no]
+    }
+    return e.define(name, {
+        kind: @resistor
+        symbol: f.ic_symbol(name, {left: left right: right})
+        footprint: footprint
+        body: {height: height}
+        pads: pad_map
+        prefix: "RN"
+    })
+}
+
+// Top-view flat no-lead LED: o.body [x, y], o.pad [width, length] and
+// o.gap [x, y] between nominal terminal edges, all in mm; o.per_side defaults to 2 (or 3).
+let led4 = fn(o) {
+    let f = __array_f
+    if !o.is_object() { return f.error("led4: o must be an options object") }
+    if (o.body ?? nil) == nil { return f.error("led4: body is required") }
+    if (o.pad ?? nil) == nil { return f.error("led4: pad is required") }
+    if (o.gap ?? nil) == nil { return f.error("led4: gap is required") }
+    let per_side = o.per_side ?? 2
+    if !per_side.is_number() || (per_side != 2 && per_side != 3) {
+        return f.error("led4: per_side must be 2 or 3")
+    }
+    if !o.body.is_array() || o.body.len() != 2 {
+        return f.error("led4: body must be [x, y]")
+    }
+    if !__array_positive(o.body[0]) || !__array_positive(o.body[1]) {
+        return f.error("led4: body dimensions must be positive finite lengths")
+    }
+    if !o.pad.is_array() || o.pad.len() != 2 {
+        return f.error("led4: pad must be [width, length]")
+    }
+    if !__array_positive(o.pad[0]) || !__array_positive(o.pad[1]) {
+        return f.error("led4: pad dimensions must be positive finite lengths")
+    }
+    if !o.gap.is_array() || o.gap.len() != 2 {
+        return f.error("led4: gap must be [x, y]")
+    }
+    if !__array_positive(o.gap[0]) || !__array_positive(o.gap[1]) {
+        return f.error("led4: gap dimensions must be positive finite lengths")
+    }
+    let pitch = o.pad[0] + o.gap[0]
+    let row_half = (per_side - 1) * pitch / 2
+    let span = 2 * o.pad[1] + o.gap[1]
+    if 2 * row_half + o.pad[0] > o.body[0] || span > o.body[1] {
+        return f.error("led4: body must contain pad dimensions and gap at the given per_side")
+    }
+    let land = __array_land(span, o.pad, 0.30mm)
+    if land.size[0] <= 0mm || land.size[1] <= 0mm {
+        return f.error("led4: pad dimensions must produce positive rounded lands")
+    }
+    if land.size[0] >= pitch || 2 * land.y <= land.size[1] {
+        return f.error("led4: gap and pad dimensions must separate the rounded lands")
+    }
+    let pads = for i in 0..(2 * per_side) {
+        let at = if i < per_side {
+            [-row_half + i * pitch, -land.y]
+        } else {
+            [row_half - (i - per_side) * pitch, land.y]
+        }
+        f.smd(f.int(i + 1), at, land.size)
+    }
+    let mark_x = -row_half - land.size[0] / 2 - 0.2mm
+    let mark_y = -land.y - land.size[1] / 2 - 0.2mm
+    return f.footprint({
+        pads: pads
+        body: [[-o.body[0] / 2, -o.body[1] / 2], [o.body[0] / 2, o.body[1] / 2]]
+        mount: @smd
+        text: 0.8mm
+        graphics: [f.stroke("F.SilkS", [[mark_x, mark_y + 0.5mm],
+                   [mark_x, mark_y], [mark_x + 0.5mm, mark_y]], 0.12mm)]
+    })
+}
+
+// Six-terminal LED: body 5.0 x 5.0 mm, terminals 1.5 x 0.9 mm, row pitch 1.6 mm.
+let led_rgb_5050 = fn() {
+    return led4({body: [5.0mm, 5.0mm] pad: [1.5mm, 0.9mm] gap: [0.1mm, 3.2mm] per_side: 3})
+}
+
+// Six-terminal RGB LED; separate anodes R/G/B and cathodes RK/GK/BK.
+// Optional o.height defaults to a nominal seated height of 1.6 mm.
+let rgb_led_part = fn(o = nil) {
+    let e = __array_e
+    let f = __array_f
+    if o == nil { o = {} }
+    if !o.is_object() { return f.error("rgb_led_part: o must be an options object") }
+    let default_height = 1.6mm
+    let height = o.height ?? default_height
+    if !__array_positive(height) {
+        return f.error("rgb_led_part: height must be a positive finite length")
+    }
+    let height_suffix = if height == default_height { "" } else { "_H" + f.mm(height) + "mm" }
+    let name = "LED_RGB_5050" + height_suffix
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    let footprint = led_rgb_5050()
+    if footprint == nil { return nil }
+    // Assume one top lens per element on the 1.6 mm terminal pitch, centred at y = 0.
+    let ports = for i in 0..3 {
+        {kind: @light profile: {circle: 0.5mm}
+         at: [(i - 1) * 1.6mm, 0mm, height] dir: [0, 0, 1] reach: 10mm margin: 0.2mm}
+    }
+    return e.define(name, {
+        kind: @led
+        symbol: f.ic_symbol(name, {
+            left: [["R", @passive], ["G", @passive], ["B", @passive]]
+            right: [["RK", @passive], ["GK", @passive], ["BK", @passive]]
+        })
+        footprint: footprint
+        body: {height: height ports: ports}
+        pads: {R: 4 G: 5 B: 6 RK: 3 GK: 2 BK: 1}
+        prefix: "D"
+    })
+}

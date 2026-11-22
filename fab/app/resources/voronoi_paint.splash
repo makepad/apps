@@ -1,0 +1,5 @@
+// Two filaments through the lattice cube by Voronoi cells: each 6 mm cell is blue or yellow
+// by its id, sharp (no blend between cells), through the sheets and the frame alike.
+let blue = Material{albedo: [0.05 0.2 0.85] name: "Blue"}
+let yellow = Material{albedo: [0.9 0.75 0.05] name: "Yellow"}
+m.fill(lattice, Mix{materials: [blue yellow] field: fn(p) { noise.cell_id(p / 6mm, 1) } sharp: 1})

@@ -1,0 +1,130 @@
+// Heat-set inserts: brass inserts with a threaded bore that a soldering iron melts into a printed
+// hole after the print, so a screw bites metal instead of plastic. The print never stops for
+// them: the part prints with their holes, and the job lists them as a step after it.
+//
+//   let a = heat_insert("M3", {at: [8mm, 10mm, 0] dir: [0 1 0]})
+//   let part = heat_seat(body, [a])                  // the hole, and a boss where it needs one
+//   object(part, name: "Bracket")
+//   insert(a.part, name: a.name, into: "Bracket", melt: a)
+//
+// `m.heat_set(size)` gives a size's numbers (M2, M2.5, M3, M4, M5): the thread, the insert's
+// outer (knurl) diameter, length and collar, and the hole it wants: across at the mouth, deep,
+// the wall round it and the floor under it. Makers vary: `heat_insert`'s options change the hole.
+//
+// A person or the AI reads, calls or forks any of this; a fork is this code copied into a script
+// and changed there.
+
+use mod.math.*
+use mod.model.*
+let m = mod.model
+
+// Brass as an insert looks: a warm metal, lightly worn.
+let heat_brass = Material{albedo: [0.80 0.62 0.30] metal: 1 rough: 0.32 name: "Brass"}
+
+// A knurl band round the Y axis from y0 up to y1: `teeth` V ridges with their crests on radius r,
+// `depth` deep, turned by `twist` (radians, its sign the hand) from y0 to y1, so the ridges run
+// diagonally round it. Made as a sweep of the toothed ring, so it is real geometry.
+fn heat_knurl_band(r, depth, teeth, y0, y1, twist) {
+    let ring = []
+    for i in 0..teeth * 2 {
+        let a = i * 3.14159265358979 / teeth
+        let rr = if i - floor(i / 2) * 2 == 0 { r } else { r - depth }
+        ring.push([rr * cos(a), rr * sin(a)])
+    }
+    let steps = 6
+    let path = for k in 0..steps + 1 { [0, y0 + (y1 - y0) * k / steps, 0] }
+    return m.sweep({sketch: Polygon{points: ring} path: path twist: twist})
+}
+
+// A heat-set insert of `size` ("M3", "M2.5" or a thread diameter), its hole's mouth at `opts.at`
+// on a face (default the origin) and `opts.dir` out of that face (default up, [0 1 0]): the insert
+// goes into the part along -dir, its top flush with the face.
+//
+//   hole, depth    the printed hole: across at the mouth and how deep (the size's own by default)
+//   taper 0        how much narrower the hole is at its bottom
+//   lead_in 0.4mm  the 45-degree chamfer round the mouth that starts the insert straight
+//   wall, floor    the part it wants round the hole and under it (the checks warn below these)
+//   boss true      heat_seat adds a boss round the hole where the part is thinner than that
+//   name           what the insert is called, default "M3 insert" (a script names each one once)
+//
+// Gives {part name size at dir hole depth taper lead_in wall floor boss outer length}: part is the
+// brass insert in place, to be inserted into its part (`insert(.., melt: it)`); the rest is what
+// heat_seat cuts and the checks read.
+fn heat_insert(size, opts) {
+    let o = opts ?? {}
+    let s = m.heat_set(size)
+    let at = o.at ?? [0, 0, 0]
+    let dir = o.dir ?? [0, 1, 0]
+    let r = s.outer / 2
+    let k = max(0.15mm, s.outer * 0.05)
+    // ridges about 0.9mm apart round the crests, running 30 degrees off the axis
+    let teeth = max(8, round(s.outer * 3.14159265358979 / 0.9mm))
+    let knurled = s.length - s.collar
+    let mid = 0 - knurled / 2
+    let twist = 0.57735 * (knurled / 2) / r
+    // the bands overlap a hair at the middle, as the collar does the lower band
+    let upper = heat_knurl_band(r, k, teeth, mid - 0.01mm, 0, twist)
+    let lower = heat_knurl_band(r, k, teeth, 0 - knurled, mid + 0.01mm, 0 - twist)
+    let collar = m.cylinder({radius: r - k height: s.collar + 0.01mm at: [0, 0 - knurled - s.collar / 2 + 0.005mm, 0]})
+    let bore = m.thread({diameter: s.diameter length: s.length + 0.4mm internal: true at: [0, 0 - s.length - 0.2mm, 0]})
+    let part = m.subtract(m.union(upper, [lower collar]), bore, {at: at rotate: {to: dir}})
+    m.fill(part, heat_brass)
+    return {
+        part: part name: o.name ?? (s.size + " insert") size: s.size at: at dir: dir
+        hole: o.hole ?? s.hole depth: o.depth ?? s.depth taper: o.taper ?? 0 lead_in: o.lead_in ?? 0.4mm
+        wall: o.wall ?? s.wall floor: o.floor ?? s.floor boss: o.boss ?? true
+        outer: s.outer length: s.length
+    }
+}
+
+// The point `t` along an insert's axis from its mouth (negative: into the part).
+fn heat_on_axis(i, t) {
+    let n = sqrt(i.dir[0] * i.dir[0] + i.dir[1] * i.dir[1] + i.dir[2] * i.dir[2])
+    return [i.at[0] + i.dir[0] / n * t, i.at[1] + i.dir[1] / n * t, i.at[2] + i.dir[2] / n * t]
+}
+
+// An insert's boss: a column round its hole `wall` thick and `floor` deeper than the hole, its top
+// a hair under the face, so it never meets the face edge to edge.
+fn heat_boss(i) {
+    let h = i.depth + i.floor
+    return m.cylinder({radius: i.hole / 2 + i.wall height: h at: heat_on_axis(i, 0 - h / 2 - 0.005mm) rotate: {to: i.dir}})
+}
+
+// What an insert's hole cuts: the hole, tapered, running a millimetre past the face so it cuts the
+// face cleanly, and the lead-in chamfer round its mouth.
+fn heat_cuts(i) {
+    let over = 1mm
+    let bottom = (i.hole - i.taper) / 2
+    let top = i.hole / 2 + i.taper / 2 * over / i.depth
+    let cuts = [m.cylinder({radius: bottom top_radius: top height: i.depth + over at: heat_on_axis(i, (over - i.depth) / 2) rotate: {to: i.dir}})]
+    if i.lead_in > 0 {
+        let h = i.lead_in + over
+        cuts.push(m.cylinder({radius: i.hole / 2 top_radius: i.hole / 2 + h height: h at: heat_on_axis(i, (over - i.lead_in) / 2) rotate: {to: i.dir}}))
+    }
+    return cuts
+}
+
+// `body` seated for `inserts` (heat_insert's): each one's hole cut (heat_cuts) and, where it asks
+// for a boss, its boss (heat_boss) joined to the body first. The boss adds material only where the
+// body has none, so a thick part keeps its shape and a thin panel grows a boss behind its face.
+// Cost: two or three booleans' operands per insert, built on the evaluator's worker.
+fn heat_seat(body, inserts) {
+    let adds = []
+    let cuts = []
+    for i in inserts {
+        if i.boss {
+            adds.push(heat_boss(i))
+        }
+        for c in heat_cuts(i) { cuts.push(c) }
+    }
+    let grown = if adds.len() == 0 { body } else { m.union(body, adds) }
+    return m.subtract(grown, cuts)
+}
+
+let heat_library = {
+    heat_insert: heat_insert
+    heat_seat: heat_seat
+    heat_boss: heat_boss
+    heat_cuts: heat_cuts
+}
+heat_library

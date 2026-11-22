@@ -1,0 +1,29 @@
+// A ball in a cage, printed in place in two filaments: a cube of twelve bars round a ball too big
+// to pass between them. It comes off the bed rattling free and can never come out.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+let cage = param(32mm, min: 20mm, max: 60mm, step: 1mm, label: "Cage", group: "Cage", hint: "the cube's outside edge")
+let bar = param(4mm, min: 2.5mm, max: 6mm, step: 0.25mm, label: "Bar", group: "Cage")
+let play = param(1.2mm, min: 0.6mm, max: 3mm, step: 0.1mm, label: "Play", group: "Ball", hint: "how much wider the ball is than the gap between bars, each side; the ball stays captive")
+
+// The ball's radius: half the gap between two bars, plus `play`. It sits on the bed with a flat
+// cut under it, clear of the bottom bars, its top clear of the top bars.
+let opening = cage - 2 * bar
+let r = opening / 2 + play
+let flat = 1mm
+let centre_y = r - flat
+
+// The cage: a cube with a square tunnel cut through it along each axis, which leaves the twelve
+// bars at its edges. Fields throughout (a carve, a blend), so the bars meet exactly.
+let cube = m.box({size: [cage, cage, cage] at: [0, cage / 2, 0]})
+let tunnels = [m.box({size: [cage + 2mm, opening, opening] at: [0, cage / 2, 0]}) m.box({size: [opening, cage + 2mm, opening] at: [0, cage / 2, 0]}) m.box({size: [opening, opening, cage + 2mm] at: [0, cage / 2, 0]})]
+let frame = m.carve(cube, tunnels, 0)
+let ball = m.carve(m.sphere({radius: r at: [0, centre_y, 0]}), m.box({size: [3 * r, 2 * r, 3 * r] at: [0, -r, 0]}), 0)
+let piece = m.blend([frame ball], 0)
+
+object(piece, name: "Ball in a cage")
+
+let amber = Material{albedo: [0.95 0.6 0.1] name: "Amber"}
+m.fill(ball, amber)

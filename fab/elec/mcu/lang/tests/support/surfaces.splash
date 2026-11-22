@@ -1,0 +1,36 @@
+let screen = display()
+let pad = bytes(1)
+let s = surface(6, 4)
+let alias = image(0, 4, 4)
+var index: i32 = 5
+var from_image: i32 = 0
+var from_alias: i32 = 0
+var copied: i32 = 0
+var clean: i32 = 0
+fn setup() {
+    clean = s[7]
+    for i in 0..24 { s[i] = 0x8000 + i * 0x421 }
+    from_image = tile[index]
+    from_alias = alias[15]
+    copy(s, 12, alias, 4, 4)
+    copied = s[14]
+    fill_rect(screen, 0, 0, display_w, display_h, 0)
+}
+// Allow the real panel's reset and sleep-out delays before the first timer.
+let surface_first = after(ms(1000), fn() {
+    present(screen, s, 1, 1, 2, 2, 0, 0)
+})
+let image_next = after(ms(1100), fn() {
+    present(screen, alias, 1, 1, 2, 2, 2, 0)
+})
+let clipped = after(ms(1200), fn() {
+    present(screen, s, 0, 0, 6, 4, -2, 2)
+})
+let refused = after(ms(1300), fn() {
+    present(screen, s, 5, 0, 2, 2, 0, 0)
+    present(screen, s, -1, 0, 2, 2, 0, 0)
+    present(screen, s, 0, 3, 2, 2, 0, 0)
+    present(screen, s, 0, 0, -2, 2, 0, 0)
+    present(screen, s, 0, 0, 2, 2, 1, 0)
+    present(1, alias, 0, 0, 2, 2, 0, 0)
+})

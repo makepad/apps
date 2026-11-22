@@ -1,0 +1,30 @@
+[package]
+name = "fab-gpuslice"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab's GPU-first slicer core: plain HAL compute with one submission per batch, layers as a grid dimension, GPU-written dispatch sizes and compaction"
+
+[dependencies]
+# the kernels (Splash) and their dispatch on Cx
+makepad-platform = { path = "../../../../platform", version = "2.0.0" }
+# a part's field on the GPU: the shape's program, its spliced kernels and `mod.sdf.Eval`
+fab-sdf-engine = { path = "../sdf_engine" }
+
+[dev-dependencies]
+# the quick benchmark's plate: the demo project evaluated as the app evaluates it, its parts
+# as the slicer takes them, and the exact field each is scored against
+fab-model = { path = "../model" }
+fab-plate = { path = "../plate" }
+makepad-fab-settings = { path = "../settings" }
+makepad-fab-slice = { path = "../slice" }
+makepad-fab-slicer = { path = "../slicer" }
+
+# The quick benchmark (timed, never part of the tests): `cargo bench -p fab-gpuslice --bench quick`.
+[[bench]]
+name = "quick"
+harness = false
+
+[package.metadata.commercial]
+include = ["../app/resources/demo.fab.splash", "../app/resources/bracket.cad.splash", "../app/resources/vase.cad.splash", "../app/resources/lattice_cube.cad.splash"]

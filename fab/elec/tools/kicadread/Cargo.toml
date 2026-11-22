@@ -1,0 +1,15 @@
+[package]
+name = "fab-elec-kicadread"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Stage timings and import reports for KiCad board files"
+
+[dependencies]
+fab-elec-kicad = { path = "../../kicad" }
+fab-elec-lang = { path = "../../lang" }
+fab-elec-board = { path = "../../board" }
+fab-elec-core = { path = "../../core" }
+fab-elec-route = { path = "../../route" }
+makepad-script = { path = "../../../../../../platform/script" }

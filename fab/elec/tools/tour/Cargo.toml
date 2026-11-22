@@ -1,0 +1,12 @@
+[package]
+name = "fab-elec-tour"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Timed Splash tours over a Makepad app's remote protocol"
+
+[dependencies]
+makepad-remote = { path = "../../../../../../libs/remote" }
+makepad-script = { path = "../../../../../../platform/script" }
+makepad-strict-json = { path = "../../../../../../libs/strict_json" }

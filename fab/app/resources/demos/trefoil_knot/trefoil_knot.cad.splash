@@ -1,0 +1,48 @@
+// A trefoil knot in two filaments: a round tube swept once round the knot, its colour fading
+// from one filament to the other and back along its length, dithered. It lies on three flat feet
+// where the tube comes lowest, on supports.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let scale = param(12mm, min: 6mm, max: 30mm, step: 0.5mm, label: "Size", group: "Knot", hint: "the knot's loops are about six times this across")
+let tube = param(4.2mm, min: 2mm, max: 8mm, step: 0.1mm, label: "Tube", group: "Knot", kind: "radius")
+let foot = 0.8mm
+
+// The knot's curve, t once round 0..2 pi: x and z across the bed, its depth up.
+let steps = 360
+let lift = scale + tube - foot
+fn knot(t) { [scale * (sin(t) + 2 * sin(2 * t)), lift - scale * sin(3 * t), scale * (cos(t) - 2 * cos(2 * t))] }
+let curve = for i in 0..steps { knot(i * 2 * 3.14159 / steps) }
+let swept = m.sweep({sketch: Regular{sides: 32 radius: tube} path: curve closed: true})
+// The three lowest stretches, cut flat on the bed.
+let reach = 3 * scale + tube + 2mm
+let below = m.box({size: [2 * reach, 4mm, 2 * reach] at: [0, -2mm, 0]})
+let knotted = m.subtract(swept, below)
+
+object(knotted, name: "Trefoil knot")
+
+// Along the tube: the curve's nearest t to a point. The point's direction round the knot's axis
+// goes round twice as fast as t (2t), so it gives two guesses half a turn apart; a short search
+// round each finds the nearest point of the curve.
+let first = Material{albedo: [0.85 0.2 0.45] name: "Magenta"}
+let second = Material{albedo: [0.15 0.45 0.85] name: "Azure"}
+fn along(p) {
+    let t0 = (atan2(p.z, p.x) + 3.14159 / 2) / 2
+    var best = 1e9
+    var at = t0
+    for branch in 0..2 {
+        for k in 0..17 {
+            let t = t0 + branch * 3.14159 + (k - 8) * 0.05
+            let c = vec3(scale * (sin(t) + 2 * sin(2 * t)), lift - scale * sin(3 * t), scale * (cos(t) - 2 * cos(2 * t)))
+            let d = length(p - c)
+            if d < best {
+                best = d
+                at = t
+            }
+        }
+    }
+    0.5 - 0.5 * cos(at)
+}
+m.fill(m.box({size: [2 * reach, 2 * lift + 2 * tube, 2 * reach] at: [0, lift, 0]}), Mix{materials: [first second] field: fn(p) { along(p) }})

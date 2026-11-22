@@ -1,0 +1,28 @@
+[package]
+name = "fab-elec-mcu-emit-s3"
+version = "1.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+authors = ["Makepad <info@makepad.nl>"]
+description = "Confirmed-slot ESP32-S3 Direct Boot stage and boot records"
+
+[dependencies]
+fab-elec-mcu = { path = "../lang" }
+fab-elec-mcu-emit32 = { path = "../emit32" }
+fab-elec-mcu-emu = { path = "../emu" }
+fab-elec-mcu-island = { path = "../island" }
+fab-elec-mcu-parts = { path = "../parts" }
+fab-elec-mcu-rt = { path = "../rt" }
+fab-elec-mcu-s3 = { path = "../s3" }
+makepad-core-util = { path = "../../../../../../libs/core_util" }
+
+[dev-dependencies]
+fab-elec-mcu-flash = { path = "../flash" }
+fab-elec-mcu-netgw = { path = "../netgw" }
+fab-elec-mcu-xtensa = { path = "../xtensa" }
+makepad-zune-png = { path = "../../../../../../libs/zune/zune-png" }
+
+[[bin]]
+name = "fab-elec-mcu-s3-images"
+path = "src/bin/s3_images.rs"

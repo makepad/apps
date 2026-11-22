@@ -1,0 +1,34 @@
+[package]
+name = "makepad-studio-api"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "The products' typed tool registry and AI service manifests"
+
+[lib]
+name = "makepad_studio_api"
+
+[[bin]]
+name = "makepad-stage-web-grab"
+path = "src/bin/makepad-stage-web-grab.rs"
+
+[dependencies]
+makepad-script = { path = "../../../../platform/script" }
+makepad-strict-json = { path = "../../../../libs/strict_json" }
+# The chat's service wire: the catalogue as per-target AI services (services.rs).
+makepad-ai-services = { path = "../../../../libs/ai/services", default-features = false }
+# The shared gen.* tools' text.
+makepad-gen-tools = { path = "../../../../libs/gen/tools" }
+# The shared score_* tools' text.
+makepad-score-tools = { path = "../../../../libs/score_live/tools" }
+# The shared kernel_* tools' text (compute kernels).
+makepad-kernel-tools = { path = "../../../../libs/render_kernels/tools" }
+
+# Only the native web-grab CLI uses the remote endpoint.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+makepad-remote = { path = "../../../../libs/remote" }
+
+[dev-dependencies]
+# The engine the cards are tested against (a scripted model, no network).
+makepad-ai-services = { path = "../../../../libs/ai/services", default-features = false, features = ["engine"] }

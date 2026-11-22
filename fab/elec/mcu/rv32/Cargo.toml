@@ -1,0 +1,11 @@
+[package]
+name = "fab-elec-mcu-rv32"
+version = "1.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+authors = ["Makepad <info@makepad.nl>"]
+description = "RV32IMC machine-mode instruction-set model (ESP32-C3 core) for microsplash compiler tests"
+
+[dependencies]
+fab-elec-mcu-emu = { path = "../emu" }

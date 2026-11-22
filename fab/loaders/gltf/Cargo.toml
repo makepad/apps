@@ -1,0 +1,12 @@
+[package]
+name = "fab-loader-gltf"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "glTF and GLB loader for the Fab shell"
+publish = false
+
+[dependencies]
+fab = { package = "fab-shell", path = "../../shell", version = "0.1.0" }
+makepad-raytrace = { path = "../../../../../libs/raytrace", version = "0.1.0" }
+makepad-gltf = { path = "../../../../../libs/gltf", version = "1.0.0" }

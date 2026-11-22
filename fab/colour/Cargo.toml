@@ -1,0 +1,12 @@
+[package]
+name = "fab-colour"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab's colour from a few filaments: filament optics, stacks and their palette, the gamut and its report, a dither over any surface's cells under print run rules, the picture tile and the calibration swatch"
+
+[dependencies]
+makepad-zune-png = { path = "../../../../libs/zune/zune-png" }
+# The app's one picture decoder (PNG, JPEG, WebP, GIF, BMP), no platform: what the chat reads, Fab reads.
+makepad-image-decode = { path = "../../../../libs/image_decode" }

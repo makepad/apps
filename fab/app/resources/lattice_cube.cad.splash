@@ -1,0 +1,24 @@
+// A lattice cube: a custom distance kernel (any Splash fn(p)), here a gyroid sheet in a cube
+// with a frame along its edges (the sheet's lowest points at the cube's corners rest on it).
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+let lattice_size = param(24mm, min: 10mm, max: 60mm, step: 0.5mm, label: "Size", group: "Lattice cube")
+let lattice_period = param(8mm, min: 3mm, max: 20mm, step: 0.5mm, label: "Period", group: "Lattice cube")
+let lattice = m.sdf({
+    // the solid's own box (the cube): the box a field part is placed and sliced by
+    bounds: [[-lattice_size / 2, 0, -lattice_size / 2], [lattice_size / 2, lattice_size, lattice_size / 2]]
+    cell: 0.5mm
+    field: fn(p) {
+        let c = p - vec3(0, lattice_size / 2, 0)
+        let cube = sdf_box(c, vec3(lattice_size, lattice_size, lattice_size))
+        let inner = lattice_size - 3mm
+        let open = sdf_union(sdf_union(sdf_box(c, vec3(lattice_size + 2mm, inner, inner)), sdf_box(c, vec3(inner, lattice_size + 2mm, inner))), sdf_box(c, vec3(inner, inner, lattice_size + 2mm)))
+        let frame = sdf_difference(cube, open)
+        return sdf_union(sdf_intersection(sdf_gyroid(p, lattice_period, 1.2mm), cube), frame)
+    }
+})
+handle(lattice_size, Arrow{from: [lattice_size / 2, 0, lattice_size / 2] to: [lattice_size / 2, lattice_size, lattice_size / 2]})
+
+object(lattice)

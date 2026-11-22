@@ -1,0 +1,32 @@
+// A river pebble with a slime mould grown over it from its crown: yellow veins on charcoal,
+// laid by agents that crawl out to the mould's front and home again following each other's
+// trail, so trunks over the top branch into threads that reach round its sides and under it by
+// the last step. Two filaments; the network's mesh and seed are its knobs. Two ellipsoids blended
+// into a lopsided stone, its underside cut flat near its widest so it stands and prints with
+// nothing under it: one distance field, so it renders and edits live.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+let length = param(72mm, min: 30mm, max: 160mm, step: 1mm, label: "Length", group: "Pebble")
+let breadth = param(50mm, min: 20mm, max: 120mm, step: 1mm, label: "Breadth", group: "Pebble")
+let height = param(28mm, min: 10mm, max: 80mm, step: 0.5mm, label: "Height", group: "Pebble")
+let mesh = param(10mm, min: 4mm, max: 30mm, step: 0.5mm, label: "Mesh", group: "Network", hint: "about how far across the finest meshes are: a thread is about a fifth of it, a trunk up to two thirds")
+let seed = param(4, min: 1, max: 999, step: 1, label: "Seed", group: "Network", kind: "seed", hint: "another whole number grows another network")
+
+// the stone: its upright radius set so the cut, a third of it under the middle, is at the floor
+let up = height / 1.3
+let stone = m.ellipsoid({radii: [length / 2, up, breadth / 2] at: [0, up * 0.3, 0]})
+let knuckle = m.ellipsoid({radii: [length * 0.26, up * 0.8, breadth * 0.3] at: [length * 0.2, up * 0.3, breadth * 0.06]})
+let body = m.blend([stone knuckle], 10mm)
+let floor = m.box({size: [2 * length, 40mm, 2 * breadth] at: [0, -20mm, 0]})
+let pebble = m.carve(body, floor, 0, {cell: 0.8mm})
+
+handle(length, Arrow{from: [0 - length / 2, 0, 0] to: [length / 2, 0, 0]})
+handle(height, Arrow{from: [0, 0, 0] to: [0, height, 0]})
+
+object(pebble)
+
+let charcoal = Material{albedo: [0.16 0.16 0.17] name: "Charcoal"}
+let yellow = Material{albedo: [0.95 0.76 0.12] name: "Yellow"}
+m.fill(pebble, Mix{materials: [charcoal yellow] field: Physarum{preset: @network scale: mesh seed: seed} sharp: 1})

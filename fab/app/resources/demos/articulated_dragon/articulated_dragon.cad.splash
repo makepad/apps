@@ -1,0 +1,109 @@
+// An articulated dragon, printed flat and in place: a horned head, a neck, a body and a long
+// tail of domed segments, each turning on a pin through the knuckle it shares with the next,
+// down to a whip-thin tail with a spade at its tip, and two wings that flap on barrel hinges.
+// Its scales are Voronoi cells in two filaments through every segment; the wings are the
+// second filament.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+let size = param(1, min: 1, max: 1.6, step: 0.05, label: "Size", group: "Dragon", kind: "ratio", hint: "scales the dragon; its knuckles, pins and clearances stay the printer's")
+let scale_cell = param(3.5mm, min: 2mm, max: 8mm, step: 0.25mm, label: "Scales", group: "Dragon", hint: "the size of each scale")
+let wing_span = param(46mm, min: 30mm, max: 70mm, step: 1mm, label: "Wing span", group: "Wings", hint: "from the wing's hinge to its tip")
+// The knuckles and pins keep their size whatever the dragon's: a knuckle must stay inside the
+// clearance its hinge cuts round the pin, or the two parts' knuckles would overlap and fuse.
+let knuckle = 3.6mm
+let pin = 1.4mm
+
+// Segments from the neck back: length, half-width and height; joint k sits at joint_x[k] (the
+// head's back is joint 0), along -X. Joints stay 9.5 mm apart or more down the tail: each hinge
+// clears about 4.1 mm round its pin, so two of them leave a segment more than two lines between.
+let seg_len = [12mm 11mm 15mm 16mm 15mm 12mm 11mm 10mm 9.5mm 9.5mm 9.5mm 9.5mm 9.5mm 9.5mm]
+let seg_w = [6mm 6.5mm 10mm 11.5mm 10mm 7.5mm 6.5mm 5.5mm 4.8mm 4.2mm 3.6mm 3mm 2.6mm 2.2mm]
+let seg_h = [8mm 8.5mm 11mm 12mm 11mm 9mm 8mm 7mm 6mm 5.4mm 4.8mm 4.2mm 3.8mm 3.4mm]
+let joint_x = [0, -12mm, -23mm, -38mm, -54mm, -69mm, -81mm, -92mm, -102mm, -111.5mm, -121mm, -130.5mm, -140mm, -149.5mm, -159mm]
+let head_h = 9mm
+let spade_h = 3.4mm
+let floor = m.box({size: [400mm, 40mm, 200mm] at: [0, -20mm, 0]})
+
+// A knuckle column at joint k, as tall as the lower of its two parts: both parts hold one, and the
+// hinge turns it into the fork's plates and pin and the eye between them.
+fn hub(k, h) { m.cylinder({radius: knuckle height: h * size at: [joint_x[k] * size, h * size / 2, 0]}) }
+fn lower(a, b) { if a < b { a } else { b } }
+fn joint_h(k) {
+    if k == 0 { lower(head_h, seg_h[0]) } else { if k == 14 { lower(seg_h[13], spade_h) } else { lower(seg_h[k - 1], seg_h[k]) } }
+}
+
+// The head: a skull and a snout blended, brow ridges, and two horns swept back, out and up. The
+// skull ends at its joint, as a segment does, and the horns pass outside the neck: nothing of the
+// head reaches over the neck outside the clearance its hinge cuts. Each horn rises from its root
+// in the skull, so no tip of it hangs lower than the skull it grows from.
+let skull = m.ellipsoid({radii: [9mm * size, head_h * size, 8mm * size] at: [9mm * size, 0, 0]})
+let snout = m.ellipsoid({radii: [10mm * size, 5mm * size, 5.5mm * size] at: [19mm * size, 0, 0]})
+let brows = for z in [-1, 1] { m.ellipsoid({radii: [5mm * size, 3mm * size, 2.5mm * size] at: [12mm * size, 6.5mm * size, z * 4.5mm * size]}) }
+let horns = for z in [-1, 1] { m.ellipsoid({radii: [8mm * size, 2.2mm * size, 2.2mm * size] at: [2mm * size, 5mm * size, z * 6.5mm * size] rotate: [0, z * 25°, -10°]}) }
+let head_shape = m.carve(m.blend([skull snout brows[0] brows[1] horns[0] horns[1]], 3mm * size), floor, 0)
+let head = m.union(head_shape, hub(0, joint_h(0)))
+
+// The wings hinge on the widest segment (3): a barrel hinge along each flank, its axis just
+// clear of the body. The segment holds the hinge's two end plates on brackets and nothing in
+// between, where the wing's eye turns: the clearance round the eye reaches under the bed, so
+// a ledge there would be cut to a sliver on the bed. Each wing is a membrane on the bed,
+// scalloped between three ribs, inside the segment's length (the hinge spans the wing).
+let wing_x0 = joint_x[4] * size + 2mm * size
+let wing_x1 = joint_x[3] * size - 2mm * size
+let wing_r = 4.1mm
+let wing_plate = 2.4mm
+let wing_z = (seg_w[3] + 0.4mm) * size + wing_r + 0.5mm
+let wing_mid = (wing_x0 + wing_x1) / 2
+fn wing_tube(side) { m.cylinder({radius: wing_r height: wing_x1 - wing_x0 at: [wing_mid, wing_r, side * wing_z] rotate: [0, 0, 90°]}) }
+fn bracket(side, x) { m.box({size: [wing_plate, 6mm * size, wing_z - 5mm * size] at: [x, 3mm * size, side * (5mm * size + (wing_z - 5mm * size) / 2)]}) }
+let shoulders = for side in [-1, 1] {
+    m.union(wing_tube(side), [bracket(side, wing_x0 + wing_plate / 2) bracket(side, wing_x1 - wing_plate / 2)])
+}
+
+// Each segment a dome, cut flat on the bed, holding the knuckles at its two ends.
+let segments = for k in 0..14 {
+    let body = m.carve(m.ellipsoid({radii: [seg_len[k] * size / 2, seg_h[k] * size, seg_w[k] * size] at: [(joint_x[k] + joint_x[k + 1]) * size / 2, 0, 0]}), floor, 0)
+    let held = m.union(body, [hub(k, joint_h(k)) hub(k + 1, joint_h(k + 1))])
+    if k == 3 { m.union(held, shoulders) } else { held }
+}
+// The tail's spade: a flat arrowhead, its point well past the last knuckle.
+let spade_shape = m.extrude({sketch: Polygon{points: [[0, 0] [-6mm * size, 5mm * size] [-16mm * size, 0] [-6mm * size, -5mm * size]]} plane: @xz height: spade_h * size at: [joint_x[14] * size, 0, 0]})
+let spade = m.union(spade_shape, hub(14, joint_h(14)))
+
+let parts = [head segments[0] segments[1] segments[2] segments[3] segments[4] segments[5] segments[6] segments[7] segments[8] segments[9] segments[10] segments[11] segments[12] segments[13] spade]
+let spine = for k in 0..15 { m.hinge(parts[k], parts[k + 1], {at: [joint_x[k] * size, 0, 0] pin: pin}) }
+
+let wings = for side in [-1, 1] {
+    // The outline is sketched on the ground, whose v runs along -Z: from the eye at v0 out to the tip.
+    // It meets the eye between the end plates only: beside a plate, the clearance the hinge cuts
+    // round it reaches under the bed and would leave the membrane a feather edge, so the membrane
+    // starts past it there (`tab` out from the eye's axis).
+    let v0 = -side * wing_z
+    let reach = -side * wing_span
+    let tab = -side * 5mm
+    let xa = wing_x0 + wing_plate + 0.8mm
+    let xb = wing_x1 - wing_plate - 0.8mm
+    let membrane = m.extrude({sketch: Polygon{points: [[wing_x1, v0 + tab] [wing_x1, v0 + reach * 0.6] [wing_x1 - 3mm, v0 + reach] [wing_mid - 1mm, v0 + reach * 0.7] [wing_x0, v0 + reach * 0.78] [wing_mid - 2mm, v0 + reach * 0.45] [wing_x0, v0 + reach * 0.32] [wing_x0, v0 + tab] [xa, v0 + tab] [xa, v0] [xb, v0] [xb, v0 + tab]]} plane: @xz height: 1.6mm})
+    // Ribs: raised strips from the hinge out to the tips, tapering.
+    let ribs = for tip in [[wing_x1 - 3mm, reach] [wing_x0 + 2.5mm, reach * 0.78] [wing_x0 + 2.5mm, reach * 0.32]] {
+        m.extrude({sketch: Polygon{points: [[wing_mid - 1.3mm, v0] [wing_mid + 1.3mm, v0] [tip[0] + 0.4mm, v0 + tip[1] * 0.88] [tip[0] - 0.4mm, v0 + tip[1] * 0.88]]} plane: @xz height: 2.6mm})
+    }
+    m.union(membrane, [wing_tube(side) ribs[0] ribs[1] ribs[2]])
+}
+let wing_hinges = for i in 0..2 { m.hinge(parts[4], wings[i], {at: [wing_mid, wing_r, (i * 2 - 1) * wing_z] axis: [1, 0, 0] pin: 1.6mm plate: wing_plate}) }
+
+object(head, name: "Articulated dragon")
+
+let jade = Material{albedo: [0.08 0.42 0.26] name: "Jade"}
+let gold = Material{albedo: [0.92 0.68 0.12] name: "Gold"}
+// Scales through every segment: Voronoi cells, about one in five gold.
+m.fill(m.box({size: [400mm, 60mm, 60mm] at: [0, 20mm, 0]}), Mix{materials: [jade gold] field: fn(p) { noise.cell_id(p / scale_cell, 3) - 0.3 } sharp: 1})
+m.fill(wings[0], gold)
+m.fill(wings[1], gold)
+// Gold eyes in a ring of jade.
+for z in [-1, 1] {
+    m.fill(m.sphere({radius: 2.6mm * size at: [15mm * size, 5.5mm * size, z * 5.2mm * size]}), jade)
+    m.fill(m.sphere({radius: 1.6mm * size at: [15.5mm * size, 5.8mm * size, z * 5.6mm * size]}), gold)
+}

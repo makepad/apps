@@ -1,0 +1,37 @@
+// One declared bound called with what `fab_sdf_proof` read of a field: per element head (the
+// function, the ball's radius), s (its numbers), v0 and v1 (its vectors, or its operands' bounds).
+// The function numbers are `DECLARED`'s in lib.rs.
+use sdf.bounds.*
+let math = exact32
+let head = input(vec2)
+let s = input(vec4)
+let v0 = input(vec4)
+let v1 = input(vec4)
+let out = output(vec4)
+
+fn declared(op, ball, s, a, b) {
+    let p = vec3(a.x, a.y, a.z)
+    let q = vec3(b.x, b.y, b.z)
+    if op < 0.5 { return sdf_sphere_bound(p, s.x, ball) }
+    if op < 1.5 { return sdf_box_bound(p, q, ball) }
+    if op < 2.5 { return sdf_round_box_bound(p, q, s.x, ball) }
+    if op < 3.5 { return sdf_plane_bound(p, q, s.x, ball) }
+    if op < 4.5 { return sdf_gyroid_bound(p, s.x, s.y, ball) }
+    if op < 5.5 { return sdf_union_bound(s.x, s.y, a, b, ball) }
+    if op < 6.5 { return sdf_intersection_bound(s.x, s.y, a, b, ball) }
+    if op < 7.5 { return sdf_difference_bound(s.x, s.y, a, b, ball) }
+    if op < 8.5 { return smin_bound(s.x, s.y, s.z, a, b, ball) }
+    if op < 9.5 { return smooth_union_bound(s.x, s.y, s.z, a, b, ball) }
+    if op < 10.5 { return smooth_difference_bound(s.x, s.y, s.z, a, b, ball) }
+    if op < 11.5 { return smooth_intersection_bound(s.x, s.y, s.z, a, b, ball) }
+    if op < 12.5 { return sdf_round_bound(s.x, s.y, a, ball) }
+    if op < 13.5 { return sdf_shell_bound(s.x, s.y, a, ball) }
+    if op < 14.5 { return sdf_capsule_bound(p, s.y, s.z, s.x, ball) }
+    if op < 15.5 { return sdf_round_cone_bound(p, s.z, s.w, s.x, s.y, ball) }
+    return sdf_tube_bound(p, s.x, ball)
+}
+
+fn element(i) {
+    let h = head[i]
+    out[i] = declared(h.x, h.y, s[i], v0[i], v1[i])
+}

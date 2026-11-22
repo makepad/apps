@@ -1,0 +1,9 @@
+// A print-in-place gear heart in two filaments: a red heart and sun, gold planets.
+use mod.fab.*
+
+script("gear_heart.cad.splash")
+
+color("Red", rgb: #xc0283a)
+color("Gold", rgb: #xe0ad2a)
+
+place("gear_heart", at: [175mm 160mm], name: "Gear heart", color: "Red")

@@ -1,0 +1,9 @@
+// A river pebble with a slime mould grown over it, in two filaments.
+use mod.fab.*
+
+script("mould_pebble.cad.splash")
+
+color("Charcoal", rgb: #x2a2a2c)
+color("Yellow", rgb: #xf2c21f)
+
+place("mould_pebble", at: [175mm 160mm], name: "Slime mould pebble", color: "Charcoal")

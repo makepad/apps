@@ -1,0 +1,151 @@
+# Import map v2: Espressif radio pack esp32-wifi-lib@ec08f0ce + esp-phy-lib@20f1db05 (ESP-IDF v6.1.1),
+# ESP32-S3, station roots. ROM addresses from ESP-IDF v6.1.1 components/esp_rom/esp32s3/ld (Apache-2.0).
+# Gates enter the kernel in ABI order. The helpers and PHY sequences are windowed island text.
+
+gate 0 free
+gate 1 phy_lock
+gate 2 phy_enter
+gate 3 phy_init_done
+gate 4 phy_leave
+gate 5 puts
+gate 6 net80211_printf
+gate 7 pp_printf
+gate 8 phy_printf
+gate 9 malloc
+gate 10 event_commit
+gate 11 radio_start_failed
+gate 12 osi_task_delay
+
+# Island text
+glue memcpy
+glue memset
+glue memcmp
+glue memmove
+glue strlen
+glue strncmp
+glue strncpy
+glue strnlen
+glue strcpy
+glue hexstr2bin
+glue __divdi3
+glue __moddi3
+glue __udivdi3
+glue __umoddi3
+glue __bswapsi2
+glue __extendsfdf2
+glue __truncdfsf2
+glue __fixdfsi
+glue __floatsidf
+glue __floatunsidf
+glue __floatundisf
+glue __adddf3
+glue __subdf3
+glue __muldf3
+glue __divdf3
+glue __divsf3
+glue sprintf
+glue phy_enable_glue
+glue phy_disable_glue
+glue event_post_glue
+glue radio_start
+glue radio_stand_in_state
+
+# Island data
+glue est_PHY_INIT_FTM_COMP_20_20D_MHZ
+glue est_PHY_INIT_FTM_COMP_20_20D_MHZ_DIS
+glue est_PHY_INIT_FTM_COMP_20_20U_MHZ
+glue est_PHY_INIT_FTM_COMP_20_20U_MHZ_DIS
+glue est_PHY_INIT_FTM_COMP_20_40D_MHZ
+glue est_PHY_INIT_FTM_COMP_20_40D_MHZ_DIS
+glue est_PHY_INIT_FTM_COMP_20_40U_MHZ
+glue est_PHY_INIT_FTM_COMP_20_40U_MHZ_DIS
+glue est_PHY_INIT_FTM_COMP_40_40D_MHZ
+glue est_PHY_INIT_FTM_COMP_40_40D_MHZ_DIS
+glue est_PHY_INIT_FTM_COMP_40_40U_MHZ
+glue est_PHY_INIT_FTM_COMP_40_40U_MHZ_DIS
+glue est_PHY_RESP_FTM_COMP_20_20D_MHZ
+glue est_PHY_RESP_FTM_COMP_20_20D_MHZ_DIS
+glue est_PHY_RESP_FTM_COMP_20_20U_MHZ
+glue est_PHY_RESP_FTM_COMP_20_20U_MHZ_DIS
+glue est_PHY_RESP_FTM_COMP_20_40D_MHZ
+glue est_PHY_RESP_FTM_COMP_20_40D_MHZ_DIS
+glue est_PHY_RESP_FTM_COMP_20_40U_MHZ
+glue est_PHY_RESP_FTM_COMP_20_40U_MHZ_DIS
+glue est_PHY_RESP_FTM_COMP_40_40D_MHZ
+glue est_PHY_RESP_FTM_COMP_40_40D_MHZ_DIS
+glue est_PHY_RESP_FTM_COMP_40_40U_MHZ
+glue est_PHY_RESP_FTM_COMP_40_40U_MHZ_DIS
+glue WIFI_EVENT
+glue wifi_event_base_name
+glue regdomain_table
+glue regulatory_data
+
+# mask ROM: code
+rom esp_net80211_rom_version_get 0x400059b8
+rom esp_pp_rom_version_get 0x40005250
+rom ets_backup_dma_copy 0x40000624
+rom ets_delay_us 0x40000600
+rom phy_get_romfuncs 0x40005c58
+rom rom_phy_param_addr 0x40006324
+rom rom_read_hw_noisefloor 0x40005ec8
+rom roundup2 0x40005b14
+
+# mask ROM: data the ROM-resident MAC and PHY code shares with the libraries
+rom BasicOFDMSched_ptr 0x3fcef8f0
+rom ap_no_lr_ptr 0x3fcef900
+rom g_chm 0x3fcef850
+rom g_config_func 0x3fcef8c0
+rom g_eb_list_desc_ptr 0x3fcef92c
+rom g_esp_mesh_quick_funcs_ptr 0x3fcef8dc
+rom g_hmac_cnt_ptr 0x3fcef848
+rom g_ic_ptr 0x3fcef84c
+rom g_intr_lock_mux 0x3fcef920
+rom g_lmac_cnt_ptr 0x3fcef934
+rom g_mac_sleep_en_ptr 0x3fcef8d4
+rom g_mesh_init_ps_type_ptr 0x3fcef8c8
+rom g_mesh_is_root_ptr 0x3fcef8d0
+rom g_mesh_is_started_ptr 0x3fcef8c4
+rom g_mesh_topology_ptr 0x3fcef8cc
+rom g_net80211_tx_func 0x3fcef8bc
+# IDF v6.1.1 components/esp_rom/esp32s3/ld/esp32s3.rom.ld:1088
+rom g_osi_funcs_p 0x3fcef940
+rom g_per_conn_trc 0x3fcef860
+rom g_pm_cfg_ptr 0x3fcef8e0
+rom g_pm_cnt_ptr 0x3fcef8e8
+rom g_pm_ptr 0x3fcef8e4
+rom g_scan 0x3fcef854
+rom g_timer_func 0x3fcef8b8
+rom g_tx_cacheq_ptr 0x3fcef844
+rom g_tx_done_cb_func 0x3fcef8ac
+rom g_txop_queue_status_ptr 0x3fcef8d8
+rom g_wdev_last_desc_reset_ptr 0x3ff1ee54
+rom g_wifi_global_lock 0x3fcef91c
+rom g_wifi_menuconfig_ptr 0x3fcef908
+rom if_ctrl_ptr 0x3fcef924
+rom lmacConfMib_ptr 0x3fcef950
+rom mesh_rxcb 0x3fcef83c
+rom net80211_funcs 0x3fcef858
+rom our_controls_ptr 0x3ff1ee50
+rom our_instances_ptr 0x3ff1ee58
+rom our_tx_eb 0x3fcef948
+rom our_wait_eb 0x3fcef94c
+rom pTxRx 0x3fcef954
+rom pp_sig_cnt_ptr 0x3fcef930
+rom pp_task_hdl 0x3fcef914
+rom pp_wdev_funcs 0x3fcef944
+rom rc11BSchedTbl_ptr 0x3fcef8fc
+rom rc11NSchedTbl_ptr 0x3fcef8f8
+rom rcLoRaSchedTbl_ptr 0x3fcef8f4
+rom s_encap_amsdu_func 0x3fcef85c
+rom s_fragment_ptr 0x3fcef928
+rom s_michael_mic_failure_cb 0x3fcef8b4
+rom s_netstack_free 0x3fcef840
+rom s_pp_task_create_sem 0x3fcef910
+rom s_pp_task_del_sem 0x3fcef90c
+rom s_wifi_queue 0x3fcef918
+rom sta_rxcb 0x3fcef838
+rom trc_ctl_ptr 0x3fcef8ec
+rom wDevCtrl_ptr 0x3fcef93c
+rom wDevMacSleep_ptr 0x3fcef938
+rom wifi_sta_rx_probe_req 0x3fcef8b0
+rom xphyQueue 0x3fcef904

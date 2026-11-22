@@ -1,0 +1,37 @@
+// The app on its Sand page. Panel initialization takes about 0.41 simulated seconds; then the sand
+// falls for as long as the run goes on (no stop: the bench runs continuously).
+bench("sand", {circuit: "handheld"}, fn(b, c) {
+    b.supply(c.net("VBUS"), {v: 5V})
+    b.firmware(c.mcu, "handheld.fw.splash", {})
+    b.net(c.mcu, 0, {endpoint: "pictures" fake: {files: "photos"}})
+    b.net(c.mcu, 1, {hub: "talk"})
+    b.probe(c.net("SCL"), {label: "I2C clock"})
+})
+
+// The app on its Voice Toy page: speak, or play a WAV into the board mic from the Firmware pane,
+// and the handheld plays the take back through its speaker.
+bench("voice", {circuit: "handheld"}, fn(b, c) {
+    b.supply(c.net("VBUS"), {v: 5V})
+    b.firmware(c.mcu, "handheld.fw.splash", {page: 1})
+    b.net(c.mcu, 0, {endpoint: "pictures" fake: {files: "photos"}})
+    b.net(c.mcu, 1, {hub: "talk"})
+})
+
+// The app on its Talk page. Its voice connection (1) reaches this computer's hub's talk service
+// when the project's network is on. Until then it plays the bench's echo, so a take comes back as
+// the answer's speech. Connection 0 serves the pictures in the project's firmware/photos/ folder.
+bench("talk", {circuit: "handheld"}, fn(b, c) {
+    b.supply(c.net("VBUS"), {v: 5V})
+    b.firmware(c.mcu, "handheld.fw.splash", {page: 2})
+    b.net(c.mcu, 0, {endpoint: "pictures" fake: {files: "photos"}})
+    b.net(c.mcu, 1, {hub: "talk"})
+})
+
+// The app on its Pictures page: the pictures in the project's firmware/photos/ folder, served by
+// the bench's files fake until the project's network is on. A tap on the glass shows the next.
+bench("pictures", {circuit: "handheld"}, fn(b, c) {
+    b.supply(c.net("VBUS"), {v: 5V})
+    b.firmware(c.mcu, "handheld.fw.splash", {page: 3})
+    b.net(c.mcu, 0, {endpoint: "pictures" fake: {files: "photos"}})
+    b.net(c.mcu, 1, {hub: "talk"})
+})

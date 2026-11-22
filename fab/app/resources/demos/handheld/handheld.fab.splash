@@ -1,0 +1,11 @@
+// A handheld sand toy on an ESP32-S3: an AMOLED panel with touch, a 6-axis IMU and USB-C power.
+// Its electronics are the plate's documents: the circuit, the MCU part, the board, the firmware
+// and the bench. Open the Bench workspace and press Play: the firmware runs on the simulated
+// S3, brings the panel up and lets sand fall down it. A touch on the panel pours sand where it
+// lands, and the IMU's tilt steers where it falls. The board (handheld.cad.splash) stands bare,
+// with its parts' bodies; its case comes later.
+use mod.fab.*
+
+script("handheld.cad.splash")
+
+place("handheld", object: "Board", at: [120mm 160mm])

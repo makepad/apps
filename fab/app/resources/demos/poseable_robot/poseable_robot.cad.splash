@@ -1,0 +1,45 @@
+// A poseable robot printed in place on its back, in two filaments: a head, a torso, arms and legs
+// in two pieces each, every joint a hinge on an upright pin, so each piece swings flat on the bed
+// as printed and the robot poses like a figure on a board. The torso and upper limbs are one
+// filament, the head, forearms and shins the other.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+let s = param(1, min: 1, max: 1.6, step: 0.05, label: "Size", group: "Robot", kind: "ratio", hint: "scales the robot; the joints' clearances stay the printer's")
+
+// Each piece is one rounded box lying on the bed, a gap from the next. A joint's pin stands in
+// the gap, and both pieces hold a knuckle column round it; the hinge turns the two columns into
+// one piece's plates and pin and the other's eye between them. Upright pins print best: their
+// knuckles' gaps are whole layers, and no plate hangs from its pin. The knuckles and pins keep
+// their size whatever the robot's: a knuckle stays inside the clearance its hinge cuts.
+let knuckle = 3.6mm
+let pin = 1.4mm
+fn block(w, h, l, x, z) { m.box({size: [w * s, h * s, l * s] radius: 1.5mm at: [x * s, h * s / 2, z * s]}) }
+fn hub(x, z) { m.cylinder({radius: knuckle height: 9mm * s at: [x * s, 9mm * s / 2, z * s]}) }
+
+// From the head (+Z) down to the feet; joints at the neck, shoulders, elbows, hips and knees.
+let neck_z = 14.25mm
+let shoulder = [12mm, 9mm]
+let elbow_z = -6.75mm
+let hip = [6.5mm, -14mm]
+let knee_z = -32mm
+let torso = m.union(block(22mm, 10mm, 26mm, 0, 0), [hub(0, neck_z) hub(-shoulder[0], shoulder[1]) hub(shoulder[0], shoulder[1]) hub(-hip[0], hip[1]) hub(hip[0], hip[1])])
+let head = m.union(block(15mm, 9mm, 13mm, 0, 22mm), hub(0, neck_z))
+let upper_arms = for x in [-1, 1] { m.union(block(8mm, 9mm, 18mm, x * 17mm, 3mm), [hub(x * shoulder[0], shoulder[1]) hub(x * 17mm, elbow_z)]) }
+let fore_arms = for x in [-1, 1] { m.union(block(8mm, 9mm, 13.5mm, x * 17mm, -14.25mm), hub(x * 17mm, elbow_z)) }
+let thighs = for x in [-1, 1] { m.union(block(8.5mm, 9mm, 16mm, x * hip[0], -23mm), [hub(x * hip[0], hip[1]) hub(x * hip[0], knee_z)]) }
+let shins = for x in [-1, 1] { m.union(block(8.5mm, 9mm, 15mm, x * hip[0], -40.5mm), hub(x * hip[0], knee_z)) }
+
+let neck = m.hinge(torso, head, {at: [0, 0, neck_z * s] pin: pin})
+let shoulders = for i in 0..2 { m.hinge(torso, upper_arms[i], {at: [(i * 2 - 1) * shoulder[0] * s, 0, shoulder[1] * s] pin: pin}) }
+let elbows = for i in 0..2 { m.hinge(upper_arms[i], fore_arms[i], {at: [(i * 2 - 1) * 17mm * s, 0, elbow_z * s] pin: pin}) }
+let hips = for i in 0..2 { m.hinge(torso, thighs[i], {at: [(i * 2 - 1) * hip[0] * s, 0, hip[1] * s] pin: pin}) }
+let knees = for i in 0..2 { m.hinge(thighs[i], shins[i], {at: [(i * 2 - 1) * hip[0] * s, 0, knee_z * s] pin: pin}) }
+
+object(torso, name: "Poseable robot")
+
+let orange = Material{albedo: [0.92 0.44 0.12] name: "Orange"}
+m.fill(head, orange)
+for p in fore_arms { m.fill(p, orange) }
+for p in shins { m.fill(p, orange) }

@@ -1,0 +1,20 @@
+// A chain of free interlocking links in two filaments, in stripes of silver and gold: printed
+// flat in one go, already linked, held together by contact alone. Each link is one colour, the
+// one the stripes give at its centre. Its links come off the bed free to move: try it in
+// Mechanics.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+let chain_length = param(160mm, min: 30mm, max: 300mm, step: 5mm, label: "Length", group: "Chain")
+let chain_size = param(6mm, min: 5mm, max: 6.5mm, step: 0.1mm, label: "Link half size", group: "Chain", hint: "from the link's centre to the middle of its bar")
+let chain_bar = param(0.8mm, min: 0.6mm, max: 1mm, step: 0.05mm, label: "Bar radius", group: "Chain")
+let stripe = param(24mm, min: 6mm, max: 80mm, step: 1mm, label: "Stripe", group: "Colours", hint: "how far each colour runs along the chain")
+
+let chain = m.links([[-chain_length / 2 0 0] [chain_length / 2 0 0]], {size: chain_size bar: chain_bar})
+
+object(chain, name: "Chain")
+
+let silver = Material{albedo: [0.75 0.76 0.78] name: "Silver"}
+let gold = Material{albedo: [0.85 0.62 0.12] name: "Gold"}
+m.fill(chain, Mix{materials: [silver gold] field: fn(p) { noise.bands(p.x / (2 * stripe)) } sharp: 1})

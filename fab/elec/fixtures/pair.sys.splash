@@ -1,0 +1,2 @@
+mate(ledctl.mcu.dbg, probe.j)
+mount(probe, {on: ledctl at: [10mm, 0mm, -8mm]})

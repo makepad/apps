@@ -1,0 +1,16 @@
+// A chain of free interlocking links: printed flat in one go, already linked, held together by
+// contact alone. Its links come off the bed free to move: try it in Mechanics.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+let chain_links = param(14, min: 2, max: 60, step: 1, label: "Links", group: "Chain")
+let chain_size = param(6mm, min: 5mm, max: 6.5mm, step: 0.1mm, label: "Link half size", group: "Chain", hint: "from the link's centre to the middle of its bar")
+let chain_bar = param(0.8mm, min: 0.6mm, max: 1mm, step: 0.05mm, label: "Bar radius", group: "Chain")
+
+// Links sit a fixed step apart along the path; the path ends half a step past the last one, so
+// the count holds when a size or the printer's clearances move the step a little.
+let chain_step = (2 * chain_size - (4 * chain_bar + 0.75mm)) * 1.41421
+let chain = m.links([[0 0 0] [(chain_links - 0.5) * chain_step 0 0]], {size: chain_size bar: chain_bar})
+
+object(chain, name: "Chain")

@@ -1,0 +1,111 @@
+// A banded snake that flexes every way: a broad head with its forked tongue out, twenty-four
+// domed beads tapering to the tail, printed fused to one TPU cord that runs from the
+// tongue's tips to the tail. Between each two beads the cord runs free about two and a half
+// millimetres; nearly square, it bends there side to side and up and down alike, so the snake curls,
+// lifts its head and twists, and springs back to the S it printed in. Two to five filaments with
+// the cord, laid in layers so each nozzle holds one at a time: onyx scales, gold bands, eyes and
+// crown, an ivory belly, coral caps.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let s = param(1, min: 1, max: 1.2, step: 0.05, label: "Size", group: "Snake", kind: "ratio", hint: "scales the snake; the cord keeps its section")
+let filaments = param(5, min: 2, max: 5, step: 1, label: "Filaments", group: "Snake", hint: "with the TPU cord: 2 onyx, 3 adds gold bands, eyes and crown, 4 an ivory belly, 5 coral caps")
+let cord = param(2.4mm, min: 2mm, max: 3mm, step: 0.1mm, label: "Cord", group: "Cord", hint: "the TPU cord's width and height: thicker springs back harder")
+
+// The parts' centres on the bed, from the head back, and each part's heading (toward the head):
+// an S that curls at the tail. Consecutive centres sit exactly the back of one, a free run of
+// cord and the front of the next apart; the cord runs straight from centre to centre, so each
+// free run is straight. Then each bead's half length and half width on the bed, and its height: a
+// slim neck, a full body, a long taper to the tail.
+let cx = [0.00mm, -15.90mm, -27.37mm, -37.81mm, -45.31mm, -48.00mm, -44.50mm, -36.82mm, -33.97mm, -37.27mm, -46.19mm, -59.29mm, -74.24mm, -88.35mm, -99.61mm, -108.46mm, -119.77mm, -131.79mm, -142.54mm, -150.70mm, -155.64mm, -157.34mm, -156.27mm, -153.03mm, -148.01mm]
+let cz = [0.00mm, -0.05mm, -2.74mm, -9.73mm, -20.74mm, -34.58mm, -49.03mm, -62.24mm, -77.27mm, -92.21mm, -104.64mm, -112.54mm, -114.65mm, -111.00mm, -102.78mm, -92.85mm, -87.13mm, -86.49mm, -90.28mm, -97.32mm, -106.15mm, -115.44mm, -124.14mm, -131.68mm, -137.91mm]
+let hx = [1.0000, 0.9932, 0.9171, 0.7099, 0.3846, -0.0229, -0.3726, -0.3495, 0.0147, 0.4079, 0.7349, 0.9423, 0.9984, 0.9041, 0.7408, 0.7927, 0.9661, 0.9898, 0.8651, 0.6323, 0.3389, 0.0296, -0.2616, -0.5159, -0.6269]
+let hz = [0.0033, 0.1165, 0.3987, 0.7043, 0.9231, 0.9997, 0.9280, 0.9369, 0.9999, 0.9130, 0.6782, 0.3346, -0.0565, -0.4274, -0.6717, -0.6096, -0.2581, 0.1425, 0.5016, 0.7747, 0.9408, 0.9996, 0.9652, 0.8567, 0.7791]
+let half_l = [4.50mm, 4.89mm, 5.27mm, 5.66mm, 6.04mm, 6.43mm, 6.45mm, 6.45mm, 6.45mm, 6.45mm, 6.45mm, 6.24mm, 5.93mm, 5.61mm, 5.29mm, 4.98mm, 4.66mm, 4.34mm, 4.03mm, 3.69mm, 3.35mm, 3.01mm, 2.80mm, 2.80mm]
+let half_w = [6.00mm, 6.51mm, 7.03mm, 7.54mm, 8.06mm, 8.57mm, 8.60mm, 8.60mm, 8.60mm, 8.60mm, 8.60mm, 8.33mm, 7.90mm, 7.48mm, 7.06mm, 6.64mm, 6.21mm, 5.79mm, 5.37mm, 4.93mm, 4.47mm, 4.01mm, 3.56mm, 3.10mm]
+let tall = [7.20mm, 7.60mm, 7.99mm, 8.39mm, 8.78mm, 9.18mm, 9.20mm, 9.20mm, 9.20mm, 9.20mm, 9.20mm, 8.97mm, 8.63mm, 8.28mm, 7.93mm, 7.58mm, 7.23mm, 6.89mm, 6.54mm, 6.14mm, 5.70mm, 5.27mm, 4.83mm, 4.40mm]
+
+// A point `a` along part k's heading and `w` across it, as a ground sketch's [u v] (v is -Z).
+fn pt(k, a, w) { [(cx[k] + a * hx[k] - w * hz[k]) * s, -(cz[k] + a * hz[k] + w * hx[k]) * s] }
+fn at3(k, a, w, y) { [(cx[k] + a * hx[k] - w * hz[k]) * s, y * s, (cz[k] + a * hz[k] + w * hx[k]) * s] }
+
+// A bead: a full oval on the bed (a superellipse, squarer than an ellipse, so the body reads
+// whole yet each bead turns well clear of the next), domed over the cord like a loaf, full at the
+// flanks and rounding over to a flat crown. Nothing on it overhangs.
+fn full(c) { let r = sqrt(abs(c) * sqrt(abs(c))); if c < 0 { -r } else { r } }
+let around = for i in 0..32 { [full(cos(i * 2 * 3.14159 / 32)), full(sin(i * 2 * 3.14159 / 32))] }
+fn oval(k, f, w) { Polygon{points: for q in around { pt(k, f * q[0], w * q[1]) }} }
+let dome = [[0, 1] [0.35, 0.98] [0.6, 0.92] [0.8, 0.8] [0.93, 0.6] [1, 0.36]]
+fn bead(k) { m.loft({sections: for d in dome { Section{sketch: oval(k, half_l[k - 1] * d[1], half_w[k - 1] * d[1]) at: tall[k - 1] * d[0] * s} }}) }
+
+// The head (part 0): broad at the jaw, a rounded snout, its top sloping down to the nose; two
+// nostrils sunk into the snout.
+let head_out = [[-9mm, 4mm] [-6mm, 8.5mm] [0, 10.5mm] [8mm, 9.5mm] [14mm, 7mm] [19mm, 4.5mm] [21mm, 0] [19mm, -4.5mm] [14mm, -7mm] [8mm, -9.5mm] [0, -10.5mm] [-6mm, -8.5mm] [-9mm, -4mm]]
+fn head_section(sa, sw, a0) { Polygon{points: for p in head_out { pt(0, a0 + sa * (p[0] - a0), sw * p[1]) }} }
+let skull = m.loft({sections: [Section{sketch: head_section(1, 1, 2mm) at: 0} Section{sketch: head_section(0.97, 0.96, 2mm) at: 3.5mm * s} Section{sketch: head_section(0.8, 0.82, 0) at: 6.5mm * s} Section{sketch: head_section(0.52, 0.55, -1mm) at: 8.6mm * s}]})
+let nostrils = for side in [-1, 1] { m.cylinder({radius: 0.7mm * s height: 4.4mm * s at: at3(0, 15.5mm, side * 2.6mm, 5.9mm)}) }
+let head = m.subtract(skull, nostrils)
+
+let beads = for k in 1..25 { bead(k) }
+
+// The cord: one sweep of its section along the snake's line, from the tongue's root through the
+// head's centre and each bead's centre to the tail, straight from centre to centre, lying on the
+// bed. Its section is a house's: upright sides to the eaves, then a roof at 50 degrees to a
+// ridge, so the beads and head printed over it have no flat ceiling anywhere. Nearly as stiff up
+// and down as side to side, it bends both ways alike. Out of the mouth it forks into the tongue.
+let t = cord / s
+let eave = cord * 0.42
+let ridge = eave + cord * 0.6
+let house = Polygon{points: [[0, -cord / 2] [eave, -cord / 2] [ridge, -0.03mm] [ridge, 0.03mm] [eave, cord / 2] [0, cord / 2]]}
+let line = for i in 0..26 { if i == 0 { [(cx[0] + hx[0] * 25mm) * s, 0, (cz[0] + hz[0] * 25mm) * s] } else { [cx[i - 1] * s, 0, cz[i - 1] * s] } }
+let cord_line = m.sweep({sketch: house path: line})
+// the tongue's two tips, spreading from inside the cord's end 4 mm past the snout to 7 mm on,
+// low on the bed
+let w0 = t * 0.4
+let fork = m.extrude({sketch: Polygon{points: [pt(0, 24mm, w0) pt(0, 31.5mm, 3.2mm) pt(0, 32mm, 3.2mm - t * 0.9) pt(0, 26.5mm, 0) pt(0, 32mm, t * 0.9 - 3.2mm) pt(0, 31.5mm, -3.2mm) pt(0, 24mm, -w0)]} height: eave})
+let spine = m.union(cord_line, [fork])
+
+let parts = for k in 0..25 { if k == 0 { head } else { beads[k - 1] } }
+let back = m.bond(spine, parts)
+
+object(head, name: "Flex snake")
+
+let onyx = Material{albedo: [0.07 0.07 0.09] name: "Onyx"}
+let gold = Material{albedo: [0.92 0.68 0.10] name: "Gold"}
+let coral = Material{albedo: [0.86 0.27 0.16] name: "Coral"}
+let ivory = Material{albedo: [0.93 0.89 0.78] name: "Ivory"}
+let ember = Material{albedo: [0.72 0.10 0.08] name: "Ember"}
+// The colours lie in layers, so no layer needs two hard filaments on one nozzle: an ivory belly
+// under everything, below the cord's ridge; over the cord onyx, with gold bands, eyes and crown;
+// and above `top` coral caps on the onyx beads and the head. The TPU cord ends before the gold
+// starts.
+let belly = ridge - 0.8mm
+let over = ridge + 0.4mm
+let top = 7.2mm * s
+// A box over bead k's outline from height `z` up.
+fn band(k, z) { m.extrude({sketch: oval(k, half_l[k - 1] * 1.3, half_w[k - 1] * 1.3) height: 30mm * s at: [0, z, 0]}) }
+let odd = [1 3 5 7 9 11 13 15 17 19 21 23]
+let even = [2 4 6 8 10 12 14 16 18 20 22 24]
+if filaments >= 4 {
+    m.fill(m.box({size: [500mm * s, 2 * belly, 500mm * s] at: [-70mm * s, 0, -65mm * s]}), ivory)
+}
+// Gold bands on every other bead, from just over the cord up.
+if filaments >= 3 {
+    for k in odd { m.fill(band(k, over), gold) }
+}
+if filaments >= 5 {
+    for k in even { if tall[k - 1] * s > top + 0.2mm { m.fill(band(k, top), coral) } }
+    m.fill(m.extrude({sketch: head_section(1.05, 1.05, 2mm) height: 30mm * s at: [0, top, 0]}), coral)
+}
+if filaments >= 3 {
+    // a gold crown: a chevron on the head's top between the eyes, pointing to the nose
+    m.fill(m.extrude({sketch: Polygon{points: [pt(0, 12mm, 0) pt(0, 1mm, 6.2mm) pt(0, -3.5mm, 5.4mm) pt(0, 5.5mm, 0) pt(0, -3.5mm, -5.4mm) pt(0, 1mm, -6.2mm)]} height: 30mm * s at: [0, 7mm * s, 0]}), gold)
+    for side in [-1, 1] { m.fill(m.sphere({radius: 2.3mm * s at: at3(0, 6.5mm, side * 7.9mm, 5.4mm)}), gold) }
+    // each eye's slit pupil
+    for side in [-1, 1] { m.fill(m.box({size: [0.7mm * s 3.2mm * s 8mm * s] at: at3(0, 6.5mm, side * 9.5mm, 5.4mm)}), onyx) }
+}
+// The cord prints in TPU all through: filled whole last, it drops the paint before (the bands
+// colour the beads only, never rigid plastic in the cord).
+m.fill(spine, ember)

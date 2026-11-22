@@ -1,0 +1,65 @@
+[package]
+name = "fab-shell"
+version = "0.1.0"
+authors = ["Makepad <info@makepad.nl>"]
+edition = "2021"
+license = "MIT"
+description = "Fab's shell: the document and scene model, the plate view, navigation, tools, panels and the print preview"
+publish = false
+
+[package.metadata.makepad.platform-gaps]
+windows = {}
+
+[lib]
+name = "fab"
+
+[dependencies]
+makepad-fab-settings = { path = "../settings" }
+fab-plate = { path = "../plate" }
+fab-elec-core = { path = "../elec/core" }
+fab-elec-parts = { path = "../elec/parts" }
+fab-elec-mech = { path = "../elec/mech" }
+fab-elec-view = { path = "../elec/view" }
+fab-elec-bench = { path = "../elec/bench" }
+fab-materials = { path = "../materials" }
+fab-elec-board = { path = "../elec/board" }
+fab-elec-design = { path = "../elec/design" }
+fab-elec-import = { path = "../elec/import" }
+fab-elec-mcu-pack = { path = "../elec/mcu/pack" }
+fab-elec-mcu-rt = { path = "../elec/mcu/rt" }
+makepad-csg-cad = { path = "../../../../libs/csg/csg_cad" }
+makepad-csg-sdf = { path = "../../../../libs/csg/csg_sdf" }
+fab-printability = { path = "../printability" }
+fab-printer-link = { path = "../printer_link" }
+makepad-civil-time = { path = "../../../../libs/civil_time" }
+makepad-ai-hub = { path = "../../../../libs/ai/hub", default-features = false }
+makepad-math = { path = "../../../../libs/math", version = "1.0.0" }
+makepad-widgets-core = { path = "../../../../widgets/core", version = "2.0.0" }
+makepad-widgets-extras = { path = "../../../../widgets/families/extras", version = "2.0.0" }
+makepad-widgets-data = { path = "../../../../widgets/families/data", version = "2.0.0" }
+makepad-render = { path = "../../../../libs/render", version = "0.1.0" }
+makepad-render-graph = { path = "../../../../libs/render_graph" }
+makepad-raytrace = { path = "../../../../libs/raytrace" }
+fab-sdf-engine = { path = "../sdf_engine" }
+fab-sdf-tiles = { path = "../sdf_tiles" }
+fab-paint-field = { path = "../paint_field" }
+makepad-csg-math = { path = "../../../../libs/csg/csg_math" }
+makepad-scene = { path = "../../../../libs/scene", version = "0.1.0" }
+makepad-video = { package = "makepad-platform-video", path = "../../../../platform/video", version = "1.0.0" }
+makepad-code-editor = { path = "../../../../code_editor" }
+makepad-code-values = { path = "../../../../libs/code_values" }
+makepad-edit-values = { path = "../../../../libs/edit_values" }
+makepad-script = { path = "../../../../platform/script" }
+makepad-model-script = { path = "../../engine/model_script" }
+# The studio lighting's environment: the generator's Three-point rig, baked off the UI thread.
+makepad-hdri-engine = { path = "../../engine/hdri" }
+fab_controls = { package = "fab-controls", path = "../controls" }
+makepad-xr-stream = { path = "../../../../libs/xr_stream" }
+# The Force render mode's surface and its ray buckets.
+fab-force = { path = "../force" }
+
+[dev-dependencies]
+fab-elec-fixtures = { path = "../elec/fixtures" }
+makepad-widgets-fab = { path = "../../../../widgets/families/fab", version = "2.0.0" }
+makepad-widgets-pickers = { path = "../../../../widgets/families/pickers", version = "2.0.0" }
+makepad-widgets-rich-text = { path = "../../../../widgets/families/rich_text", version = "2.0.0" }

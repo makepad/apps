@@ -1,0 +1,15 @@
+[package]
+name = "fab-elec-mcu-flash"
+version = "1.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+authors = ["Makepad <info@makepad.nl>"]
+description = "Serial board identification and verified STK500v1 flashing"
+
+[dependencies]
+makepad-serial = { path = "../../../../../../libs/serial" }
+fab-elec-mcu-rt = { path = "../rt" }
+fab-elec-mcu-netgw = { path = "../netgw" }
+makepad-image-decode = { path = "../../../../../../libs/image_decode" }
+makepad-core-util = { path = "../../../../../../libs/core_util" }

@@ -1,0 +1,25 @@
+// NS4150B in MSOP-8 (ns4150b.txt:38-44). The package drawing in section 10.1 is an image
+// (ns4150b.txt:207-212), so the land pattern is the standard one: board check, standard MSOP-8,
+// 3 x 3 mm body, 4.9 mm span, 0.65 mm pitch, lead 0.3 x 0.55 mm, IPC nominal lands, 1.1 mm high;
+// not checked against the drawing.
+use mod.std.*
+let e = mod.elec
+let f = e.f
+
+e.define("NS4150B_MSOP8", {
+    kind: @ic
+    // EN is CTRL, high to enable (ns4150b.txt:44,155-159). Start time is 120 ms
+    // (ns4150b.txt:111-114, facts-audio.md:187-190). The circuit supplies bus.gain_db
+    // for its input resistors.
+    fields: {sim: "bus" model: "AMP" "bus.enable": "1" "bus.start_ms": "120"}
+    symbol: f.ic_symbol("NS4150B", {
+        left: [["EN" @in] ["INP" @in] ["INN" @in] ["BYPASS" @passive]]
+        right: [["VOP" @out] ["VON" @out]]
+        top: [["VCC" @power_in]] bottom: [["GND" @power_in]]
+    })
+    // Pin table, ns4150b.txt:43-51.
+    pads: {EN: 1 BYPASS: 2 INP: 3 INN: 4 VON: 5 VCC: 6 GND: 7 VOP: 8}
+    footprint: soic({pins: 8 pitch: 0.65mm body: [3mm, 3mm] span: 4.9mm lead: [0.3mm, 0.55mm]})
+    body: {height: 1.1mm package: @sop}
+    prefix: "U"
+})

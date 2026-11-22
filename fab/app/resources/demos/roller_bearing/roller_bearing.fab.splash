@@ -1,0 +1,9 @@
+// A print-in-place roller bearing in two filaments: grey rings, orange rollers.
+use mod.fab.*
+
+script("roller_bearing.cad.splash")
+
+color("Grey", rgb: #x7c828a)
+color("Orange", rgb: #xe0702a)
+
+place("roller_bearing", at: [175mm 160mm], name: "Roller bearing", color: "Grey")

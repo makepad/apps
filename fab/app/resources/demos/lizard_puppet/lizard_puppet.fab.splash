@@ -1,0 +1,20 @@
+// A crested lizard, a hand puppet printed in place with its mouth wide open, in up to nine
+// filaments.
+use mod.fab.*
+
+script("lizard_puppet.cad.splash")
+
+// The colours alternate between the nozzles in this order: in four filaments the scales share
+// theirs with the white teeth and eyes, the red mouth with the dark slits and nose (the other
+// way round purges nearly 40% more).
+color("Teal", rgb: #x1a9999)
+color("Red", rgb: #xb30d1f)
+color("White", rgb: #xf2f2eb)
+color("Dark", rgb: #x140f1a)
+color("Blue", rgb: #x1f4dbf)
+color("Yellow", rgb: #xf7cc26)
+color("Pink", rgb: #xf28099)
+color("Orange", rgb: #xf2731a)
+color("Purple", rgb: #x7333a6)
+
+place("lizard_puppet", object: "Lizard puppet", at: [175mm 160mm], rotate: 135°, name: "Lizard puppet", color: "Teal")

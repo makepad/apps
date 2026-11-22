@@ -1,0 +1,35 @@
+// organ8: an eight-voice organ on USB 5 V, eight keys and eight PITCH knobs and one audio jack.
+// Each voice is a tone generator that runs all the time, its key letting it through to the mix
+// (organ8.blocks.splash), tuned a step apart by its timing capacitor: about 450 Hz at 10 nF with
+// its knob at mid travel, up to about 1.7 kHz at 2.7 nF. The voices are mixed by one summer to the
+// line out. The analog supply is the USB rail through 10 ohm and 22 uF. Nothing in it is special to
+// an organ: eight copies of a block into a summer, enough switching to keep one stepper busy.
+use mod.elec.*
+use mod.std.*
+use mod.project.*
+let e = mod.elec
+
+let gnd  = e.net({name: "GND"  kind: @ground})
+let vbus = e.net({name: "VBUS" kind: @power volts: 5V})
+let va   = e.net({name: "VA"   kind: @power volts: 5V})
+let ref  = e.net({name: "VREF"})
+let sum  = e.net({name: "SUM"})
+let line = e.net({name: "LINE"})
+
+let usb  = usb_c_power({vbus: vbus gnd: gnd})
+let rva  = e.r(10ohm, vbus, va, {package: "0603"})
+let cva  = e.c(22uF, va, gnd, {package: "0805"})
+let sg   = signal_ground({va: va gnd: gnd ref: ref})
+
+let v1   = organ_voice({vdd: va gnd: gnd sum: sum c_t: 10nF})
+let v2   = organ_voice({vdd: va gnd: gnd sum: sum c_t: 8.2nF})
+let v3   = organ_voice({vdd: va gnd: gnd sum: sum c_t: 6.8nF})
+let v4   = organ_voice({vdd: va gnd: gnd sum: sum c_t: 5.6nF})
+let v5   = organ_voice({vdd: va gnd: gnd sum: sum c_t: 4.7nF})
+let v6   = organ_voice({vdd: va gnd: gnd sum: sum c_t: 3.9nF})
+let v7   = organ_voice({vdd: va gnd: gnd sum: sum c_t: 3.3nF})
+let v8   = organ_voice({vdd: va gnd: gnd sum: sum c_t: 2.7nF})
+
+let mix  = organ_mix({sum: sum line: line ref: ref va: va gnd: gnd})
+// LINE OUT: the mix on both channels of a stereo jack
+let jack = e.part(jack_3_5mm({}), {pins: {T: line R: line S: gnd}})

@@ -1,0 +1,9 @@
+// A gyroid lattice lamp shade, its colour fading up the height in two filaments, dithered.
+use mod.fab.*
+
+script("gyroid_lamp.cad.splash")
+
+color("Ember", rgb: #xf26b1f)
+color("Violet", rgb: #x5c339e)
+
+place("gyroid_lamp", at: [175mm 160mm], name: "Gyroid lamp", color: "Ember")

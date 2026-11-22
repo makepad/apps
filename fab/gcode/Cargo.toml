@@ -1,0 +1,13 @@
+[package]
+name = "makepad-fab-gcode"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab's G-code: the dual-nozzle printer dialect writer, the in-memory interpreter behind the time model, M73 progress and the per-move preview records"
+
+[dependencies]
+makepad-fab-settings = { path = "../settings" }
+makepad-fab-slicer = { path = "../slicer" }
+makepad-fab-toolpath = { path = "../toolpath" }
+makepad-base64 = { path = "../../../../libs/base64" }

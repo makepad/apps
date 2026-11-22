@@ -1,0 +1,12 @@
+// drum16's whole board, running its sequencer firmware: it plays the built-in pattern at 120 BPM
+// from power-up, in Record live: real time from the start, heard as it is made (Record loop
+// renders the 2 s take at full quality). The scope shows the mix at the line out (listen to it on
+// its lane), then the kick's and the snare's triggers. Click a step key (in 3D, on the board or on
+// the sheet) to toggle that step of the selected voice: its LED follows, and the voice sounds or
+// not on the next pass.
+bench("board", {circuit: "drum16" run: {stop: 2s live: true}}, fn(b, c) {
+    b.firmware(c.mcu.u, "drum16.fw.splash", {autoplay: 1})
+    b.probe(c.net("LINE"), {label: "Mix"})
+    b.probe(c.net("KICK"), {label: "Kick trigger"})
+    b.probe(c.net("SNARE"), {label: "Snare trigger"})
+})

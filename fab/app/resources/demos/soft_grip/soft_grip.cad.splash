@@ -1,0 +1,67 @@
+// A driver handle in two materials, not just two colours: a hard core with a hex socket for a
+// bit at its tip, and a soft grip of flexible filament moulded round it, printed in one go
+// standing up. The grip runs from the core's end knob to the neck below the tip, wavy for the
+// fingers and fluted along its length; under it the core has ribs the soft material wraps round,
+// so the grip cannot turn on the core.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let length = param(112mm, min: 80mm, max: 150mm, step: 1mm, label: "Length", group: "Handle")
+let girth = param(13mm, min: 10mm, max: 18mm, step: 0.5mm, label: "Grip radius", group: "Handle", kind: "radius")
+let socket = param(6.4mm, min: 4mm, max: 10mm, step: 0.1mm, label: "Socket", group: "Handle", hint: "the hex socket across its flats")
+let grip_depth = 2.5mm
+let core = girth - grip_depth
+let knob = 4mm
+let grip_lo = knob + 2mm
+let grip_hi = length - 20mm
+let waves = 4
+
+// The handle's outside, spun round its upright axis: the end knob, the grip's finger waves (each
+// rising and falling gently), the collar and a taper to the tip.
+let wave_steps = 48
+let outline = for i in 0..(wave_steps + 8) {
+    if i == 0 {
+        [0, 0]
+    } else if i == 1 {
+        [girth + 2mm, 0]
+    } else if i == 2 {
+        [girth + 2mm, knob]
+    } else if i < wave_steps + 4 {
+        let f = (i - 3) / wave_steps
+        let y = grip_lo + (grip_hi - grip_lo) * f
+        [girth - 0.4mm + 0.4mm * cos(f * waves * 6.28319), y]
+    } else if i == wave_steps + 4 {
+        [core + 1.5mm, grip_hi + 2mm]
+    } else if i == wave_steps + 5 {
+        [core - 1mm, length - 8mm]
+    } else if i == wave_steps + 6 {
+        [core - 1mm, length]
+    } else {
+        [0, length]
+    }
+}
+let body = m.revolve({sketch: Polygon{points: outline fillet: 0.4mm}})
+// Flutes down the grip, and the socket in the tip.
+let flutes = for i in 0..16 {
+    let a = i * 6.28319 / 16
+    m.cylinder({radius: 1.1mm height: grip_hi - grip_lo - 6mm at: [(girth + 0.5mm) * cos(a), (grip_lo + grip_hi) / 2, (girth + 0.5mm) * sin(a)]})
+}
+let hex = m.extrude({sketch: Regular{sides: 6 radius: socket / sqrt(3)} plane: @xz height: 22mm at: [0, length - 20mm, 0]})
+let handle = m.subtract(body, [flutes hex])
+
+object(handle, name: "Soft-grip handle")
+
+// The core: everything inside the core's radius, and eight ribs standing out of it under the
+// grip; the grip is the rest of the handle between the knob and the collar.
+let ribs = for i in 0..8 {
+    let a = i * 6.28319 / 8
+    m.box({size: [1.6mm, grip_hi - grip_lo - 4mm, 1.6mm] at: [(core + 0.4mm) * cos(a), (grip_lo + grip_hi) / 2, (core + 0.4mm) * sin(a)]})
+}
+let inside = m.union(m.cylinder({radius: core height: length + 2mm at: [0, length / 2, 0]}), ribs)
+let band = m.cylinder({radius: girth + 3mm height: grip_hi - grip_lo at: [0, (grip_lo + grip_hi) / 2, 0]})
+let hard = Material{albedo: [0.12 0.32 0.62] name: "Core"}
+let soft = Material{albedo: [0.16 0.17 0.19] name: "Grip"}
+m.fill(m.box({size: [2 * girth + 8mm, length + 2mm, 2 * girth + 8mm] at: [0, length / 2, 0]}), hard)
+m.fill(m.subtract(band, [inside]), soft)

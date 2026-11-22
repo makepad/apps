@@ -1,0 +1,62 @@
+// A bistable switch, one flat print in two filaments: a shuttle held in a frame by four thin
+// arched beams. Push the shuttle and the beams buckle through and snap it to the other side,
+// where it stays; push it back and it snaps home. The whole switch is one sketch extruded once,
+// the beams the strips left between its gaps.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let span = param(23mm, min: 15mm, max: 35mm, step: 0.5mm, label: "Beam span", group: "Beams", hint: "from the frame to the shuttle, each side")
+let rise = param(2.5mm, min: 1mm, max: 4mm, step: 0.1mm, label: "Arch", group: "Beams", hint: "the beams' bow: the shuttle travels twice this; it holds both sides while the bow is over 2.3 beam widths")
+let beam = param(0.9mm, min: 0.8mm, max: 1.6mm, step: 0.05mm, label: "Beam width", group: "Beams", hint: "two line widths or more; wider snaps harder")
+let height = param(5mm, min: 3mm, max: 10mm, step: 0.5mm, label: "Height", group: "Switch")
+
+// Layout in the sketch: beams along x, the shuttle snapping along y. Two beams run wall to wall
+// through the shuttle, `pair` apart, each a full cosine wave bowed by `rise` in +y with the shuttle
+// on its crest (a pair, clamped together by the shuttle, cannot twist through the wrong way).
+// Pushed, the crest flips to -rise: the shuttle travels twice `rise`.
+let shuttle_w = 10mm
+let shuttle_h = 16mm
+let pair = 10mm
+let wall = 4mm
+let window_w = 2 * (shuttle_w / 2 + span)
+let window_h = 2 * (shuttle_h / 2 + 3 * rise + 2mm)
+let n = 24
+fn bow(s) { rise / 2 * (1 - cos(3.14159 * s / (window_w / 2))) }
+// A beam's edge from the wall to the shuttle on one side (`dir`), `s` the distance from the wall,
+// offset `off` across the beam.
+fn edge(y0, dir, off) {
+    let points = for i in 0..(n + 1) {
+        let s = span * i / n
+        [dir * (window_w / 2 - s), y0 + bow(s) + off]
+    }
+    points
+}
+fn reversed(list) {
+    let back = for i in 0..list.len() { list[list.len() - 1 - i] }
+    back
+}
+// A gap's outline: these runs of points, one after another.
+fn joined(runs) {
+    let points = []
+    for run in runs { for p in run { points.push(p) } }
+    Polygon{points: points}
+}
+
+let half_w = window_w / 2
+let half_h = window_h / 2
+let x_sh = shuttle_w / 2
+let y_sh = shuttle_h / 2
+let t = beam / 2
+let top_gap = joined([[[-half_w, half_h]] edge(pair / 2, -1, t) [[-x_sh, rise + y_sh] [x_sh, rise + y_sh]] reversed(edge(pair / 2, 1, t)) [[half_w, half_h]]])
+let bottom_gap = joined([[[half_w, -half_h]] edge(-pair / 2, 1, -t) [[x_sh, rise - y_sh] [-x_sh, rise - y_sh]] reversed(edge(-pair / 2, -1, -t)) [[-half_w, -half_h]]])
+fn middle_gap(dir) { joined([edge(-pair / 2, dir, t) reversed(edge(pair / 2, dir, -t))]) }
+let frame = Rect{size: [window_w + 2 * wall, window_h + 2 * wall] corner: 3mm}
+let switch = m.extrude({sketch: [frame top_gap bottom_gap middle_gap(-1) middle_gap(1)] plane: @xz height: height})
+
+object(switch, name: "Bistable switch")
+
+// The shuttle in the second filament: a box round it (the sketch's +y is the model's -z).
+let teal = Material{albedo: [0.1 0.55 0.6] name: "Teal"}
+m.fill(m.box({size: [shuttle_w + 0.2mm, height + 2mm, shuttle_h + 0.2mm] at: [0, height / 2, -rise]}), teal)

@@ -1,0 +1,10 @@
+// A driver handle in two materials: a hard core and a soft grip of flexible filament moulded round
+// it, printed standing up.
+use mod.fab.*
+
+script("soft_grip.cad.splash")
+
+color("Core", rgb: #x1f5299)
+color("Grip", rgb: #x2a2b30, material: "TPU")
+
+place("soft_grip", at: [175mm 160mm], name: "Soft-grip handle", color: "Core")

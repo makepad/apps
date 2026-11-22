@@ -1,0 +1,80 @@
+// A motor mount in exact geometry: a hollow housing with rounded corners and top, a turned
+// boss with its own fillets, the joint between them filleted, the bore cut through, a lofted
+// cable duct on the side and chamfered bolt holes in the flange. Y up, +Z to the front.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+let size = param(80mm, min: 60mm, max: 140mm, step: 0.5mm, label: "Housing size", group: "Housing")
+let height = param(30mm, min: 18mm, max: 60mm, step: 0.5mm, label: "Housing height", group: "Housing")
+let corner = param(10mm, min: 4mm, max: 20mm, step: 0.1mm, label: "Corner radius", group: "Housing", kind: "radius")
+let top_fillet = param(4mm, min: 1mm, max: 8mm, step: 0.1mm, label: "Top fillet", group: "Housing", kind: "radius")
+let wall = param(2.4mm, min: 1.2mm, max: 5mm, step: 0.1mm, label: "Wall", group: "Housing")
+let boss_radius = param(20mm, min: 12mm, max: 26mm, step: 0.1mm, label: "Boss radius", group: "Boss", kind: "radius")
+let boss_height = param(26mm, min: 10mm, max: 60mm, step: 0.5mm, label: "Boss height", group: "Boss")
+let boss_taper = param(3mm, min: 0.5mm, max: 8mm, step: 0.1mm, label: "Boss taper", group: "Boss")
+let rim_fillet = param(1.5mm, min: 0.4mm, max: 3mm, step: 0.1mm, label: "Rim fillet", group: "Boss", kind: "radius")
+let joint_fillet = param(3mm, min: 0.6mm, max: 8mm, step: 0.1mm, label: "Joint fillet", group: "Boss", kind: "radius")
+let bore = param(22mm, min: 6mm, max: 40mm, step: 0.1mm, label: "Bore", group: "Boss", kind: "diameter")
+let duct_radius = param(5mm, min: 3mm, max: 9mm, step: 0.1mm, label: "Duct radius", group: "Duct", kind: "radius")
+let bolt = param(5.5mm, min: 2mm, max: 9mm, step: 0.1mm, label: "Bolt hole", group: "Flange", kind: "diameter")
+let bolt_chamfer = param(0.8mm, min: 0.2mm, max: 1.5mm, step: 0.1mm, label: "Hole chamfer", group: "Flange")
+let flange = param(5mm, min: 3mm, max: 10mm, step: 0.1mm, label: "Flange thickness", group: "Flange")
+
+// The housing: a rounded sketch pulled up, its top rounded, hollowed from below.
+let block = m.brep.extrude({sketch: Rect{size: [size size] corner: corner} height: height})
+let rounded = m.brep.fillet(block, top_fillet, {edges: {top: true}})
+let housing = m.brep.shell(rounded, wall, {open: @bottom})
+
+// The flange it stands on.
+let flange_plate = m.brep.extrude({sketch: Rect{size: [size + 40mm size + 40mm] corner: corner + 6mm} height: flange})
+
+// Four bolt holes at its corners' centres, their top rims chamfered.
+let bolt_at = size / 2 + 20mm - corner - 6mm
+let bolts = for x in [-1, 1] {
+    for z in [-1, 1] {
+        m.brep.cylinder({radius: bolt / 2 height: flange * 4 at: [x * bolt_at, flange / 2, z * bolt_at]})
+    }
+}
+let drilled = m.brep.subtract(flange_plate, bolts)
+let rims = for x in [-1, 1] {
+    for z in [-1, 1] {
+        {kind: @circle near: [x * bolt_at, flange, z * bolt_at]}
+    }
+}
+let chamfered = m.brep.chamfer(drilled, bolt_chamfer, {edges: rims})
+let window = m.brep.box({size: [size - wall * 2 - corner, flange * 3, size - wall * 2 - corner] at: [0, flange / 2, 0]})
+// A window through it for the inside.
+let open_flange = m.brep.subtract(chamfered, window)
+let base = m.brep.union(housing, open_flange)
+
+// The boss, a profile turned about Y with a different radius on each edge.
+let top = height + boss_height
+let boss_profile = Path{from: [0, height - wall] segs: [
+    LineTo{to: [boss_radius, height - wall]}
+    LineTo{to: [boss_radius, height + boss_height * 0.5]}
+    LineTo{to: [boss_radius - boss_taper, top]}
+    LineTo{to: [0, top]}
+]}
+let boss = m.brep.revolve({sketch: boss_profile})
+let rimmed = m.brep.fillet(boss, rim_fillet, {edges: {top: true}})
+let joined = m.brep.union(base, rimmed)
+let blended = m.brep.fillet(joined, joint_fillet, {edges: {concave: true kind: @circle y: [height, height]}})
+
+// The bore straight through the boss.
+let through = m.brep.cylinder({radius: bore / 2 height: (top + 10mm) * 2})
+let bored = m.brep.subtract(blended, through)
+
+// A cable duct lofted from round to narrow on the housing's side.
+let duct = m.brep.loft({sections: [
+    Section{sketch: Circle{radius: duct_radius} at: 0}
+    Section{sketch: Circle{radius: duct_radius * 0.7} at: 16mm}
+] plane: @xy at: [0, flange + height * 0.45, size / 2 - wall / 2]})
+let mount = m.brep.union(bored, duct)
+
+handle(boss_height, Arrow{from: [0, height, 0] to: [0, top, 0]})
+handle(boss_radius, Ring{center: [0, height + boss_height * 0.25, 0] radius: boss_radius})
+handle(size, Arrow{from: [0, flange, 0] to: [size / 2, flange, 0]})
+handle(height, Arrow{from: [size / 2, 0, 0] to: [size / 2, height, 0]})
+
+object(mount)

@@ -1,0 +1,9 @@
+// A stained-glass panel: translucent cells in an opaque leading web, in two filaments.
+use mod.fab.*
+
+script("stained_glass.cad.splash")
+
+color("Clear blue", rgb: #x4f95d6)
+color("Lead", rgb: #x1a1b1e)
+
+place("stained_glass", at: [175mm 160mm], name: "Stained-glass panel", color: "Clear blue")

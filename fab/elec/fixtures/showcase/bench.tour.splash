@@ -1,0 +1,18 @@
+// The bench tour on benchview (start it with ELEC_PROBES=1): times are seconds from the start of the play.
+// A probe dropped on LED3 blooms a card, PA0's duty knob turns while the run retunes, D leaves the old run
+// as a ghost, then the run pauses and the strip scrubs back through it.
+// A beat waits for the drag before it, so the grabs sit between the drags; the recording has every frame.
+tour: {
+    app: "fab-elec-benchview"
+    cursor: "app"
+    record: "bench-tour.mp4"
+    beats: [
+        {at: 1.0 drag: {from: "role=button name=probe" to: "role=list_item name=LED3" ms: 1200}}
+        {at: 4.0 drag: {node: "role=slider name=\"PA0 duty\"" dx: 160 ms: 1800}}
+        {at: 7.0 key: "KeyD"}
+        {at: 9.0 press: "role=button name=pause"}
+        {at: 9.5 drag: {node: "role=slider name=time" dx: -400 ms: 2000}}
+        {at: 12.5 press: "role=button name=play"}
+    ]
+    grabs: [2.6 6.0 8.0 11.7 13.5]
+}

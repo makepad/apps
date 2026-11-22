@@ -1,0 +1,30 @@
+# The product shell: what every product window shares (Stage, Story): where
+# the person's state lives, the theme choice, the pump's clock, lazily
+# started components, and the window's one chat (its plumbing; the product supplies the tools and the targets).
+[package]
+name = "makepad-app-shell"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "The product shell shared by the product windows"
+
+[lib]
+name = "makepad_app_shell"
+
+[dependencies]
+makepad-widgets = { path = "../../../../widgets", default-features = false }
+makepad-ai-hub = { path = "../../../../libs/ai/hub", default-features = false }
+makepad-look = { path = "../../../../libs/look" }
+makepad-ai-services = { path = "../../../../libs/ai/services" }
+makepad-app-aichat = { path = "../../../aichat", default-features = false }
+makepad-strict-json = { path = "../../../../libs/strict_json" }
+# The output window's picture (`output_window`).
+makepad-live-frame = { path = "../../../../libs/live_frame" }
+# The AI control API catalogue the tool host checks calls against.
+makepad-studio-api = { path = "../studio_api" }
+# The document tools' tree (`tool_host::Documents`).
+makepad-asset-data = { path = "../../engine/asset/data" }
+
+[dev-dependencies]
+makepad-widgets-sheets = { path = "../../../../widgets/sheets" }

@@ -1,0 +1,125 @@
+[package]
+name = "makepad-fab"
+version = "0.1.0"
+authors = ["Makepad <info@makepad.nl>"]
+edition = "2021"
+license = "MIT"
+description = "Fab: the 3D modeler and slicer for printing"
+publish = false
+
+[package.metadata.makepad.platform-gaps]
+windows = { "test:monitor" = "5 of 5 fail there: the print flow's UI waits (Start print, Start, Stop) time out; Fab on Windows is not a target yet", "test:plate_switch" = "1 of 4 fails there: listing the plates folder is Access is denied (os error 5); Fab on Windows is not a target yet", "test:second_family_print" = "1 of 1 fails there: Stop never shows; Fab on Windows is not a target yet" }
+
+[package.metadata.makepad.macos-tests]
+"test:xr_stream_colour" = "the stream's colour and coverage band through the real encode and the server's own decoder (macOS only); Linux builds the target empty"
+
+[features]
+default = ["tweaker"]
+# The design overlay (Shift+F10 with the dev overlays on). On for development
+# builds; the Runner's releases build without it (--no-default-features).
+tweaker = ["dep:makepad-widgets-tweaker", "makepad-widgets/data", "makepad-widgets/dock", "makepad-widgets/fab"]
+
+[dependencies]
+fab-elec-fixtures = { path = "../elec/fixtures" }
+makepad-core-util = { path = "../../../../libs/core_util" }
+makepad-network = { path = "../../../../platform/network" }
+makepad-widgets = { path = "../../../../widgets", version = "2.0.0", default-features = false, features = ["data", "dock", "fab", "color", "pickers", "rich_text"] }
+makepad-widgets-tweaker = { path = "../../../../widgets/families/tweaker", version = "2.0.0", optional = true }
+fab = { package = "fab-shell", path = "../shell", version = "0.1.0" }
+makepad-fab-loader-gltf = { package = "fab-loader-gltf", path = "../loaders/gltf", version = "0.1.0" }
+makepad-zune-png = { path = "../../../../libs/zune/zune-png", version = "0.5.2" }
+fab-model = { path = "../model" }
+fab-materials = { path = "../materials" }
+# The electronics host (ARCHITECTURE 2.2).
+fab-elec-host = { path = "../elec/host" }
+fab-elec-cam = { path = "../elec/cam" }
+fab-elec-route = { path = "../elec/route" }
+fab-elec-lang = { path = "../elec/lang" }
+fab-elec-import = { path = "../elec/import" }
+fab-elec-design = { path = "../elec/design" }
+fab-elec-view = { path = "../elec/view" }
+fab-elec-core = { path = "../elec/core" }
+fab-elec-board = { path = "../elec/board" }
+fab-elec-mech = { path = "../elec/mech" }
+fab-elec-circuit = { path = "../elec/circuit" }
+fab-elec-simhost = { path = "../elec/simhost" }
+fab-elec-fw = { path = "../elec/fw" }
+fab-elec-mcu = { path = "../elec/mcu/lang" }
+fab-elec-bench = { path = "../elec/bench" }
+fab-elec-parts = { path = "../elec/parts" }
+fab-elec-mcu-cosim = { path = "../elec/mcu/cosim" }
+fab-elec-mcu-parts = { path = "../elec/mcu/parts" }
+fab-elec-mcu-emit-avr = { path = "../elec/mcu/emit_avr" }
+fab-elec-mcu-emit-s3 = { path = "../elec/mcu/emit_s3" }
+fab-elec-mcu-flash = { path = "../elec/mcu/flash" }
+fab-elec-mcu-island = { path = "../elec/mcu/island" }
+fab-elec-mcu-pack = { path = "../elec/mcu/pack" }
+makepad-serial = { path = "../../../../libs/serial" }
+makepad-devhub-conf = { path = "../../../../libs/devhub_conf" }
+makepad-remote = { path = "../../../../libs/remote", version = "0.1.0" }
+fab-elec-sim = { path = "../elec/sim" }
+fab-paint-field = { path = "../paint_field" }
+makepad-csg-mech = { path = "../../../../libs/csg/csg_mech" }
+makepad-dynamics = { path = "../../../../libs/dynamics" }
+makepad-script = { path = "../../../../platform/script" }
+makepad-model-script = { path = "../../engine/model_script" }
+fab-plate = { path = "../plate" }
+fab-printability = { path = "../printability" }
+fab-loose = { path = "../loose" }
+fab-sla = { path = "../sla" }
+fab-ai = { path = "../ai" }
+fab-printer-link = { path = "../printer_link" }
+fab-calibrate = { path = "../calibrate" }
+# Fab Force: the Force render mode's study (stress analysis of a part as it will print), solved
+# on the AI hub (this machine's; the infill floor's batches over the fleet's nodes too).
+fab-force = { path = "../force", features = ["node"] }
+fab-optimise = { path = "../optimise" }
+# Fab Arms (experimental): the Arm workspace's lab, the planner and the virtual cell.
+fab-arm-lab = { path = "../arm_lab" }
+# The Scan workspace: a headset capture kept and shown as it comes.
+makepad-fab-scan = { path = "../scan" }
+makepad-ai-geometry = { path = "../../../../libs/ai/models/geometry" }
+fab-arms = { path = "../arms" }
+fab-cell-sim = { path = "../cell_sim" }
+fab-robot = { path = "../robot" }
+makepad-fab-slice = { path = "../slice" }
+makepad-fab-gcode = { path = "../gcode" }
+makepad-fab-settings = { path = "../settings" }
+makepad-fab-slicer = { path = "../slicer" }
+makepad-fab-toolpath = { path = "../toolpath" }
+makepad-civil-time = { path = "../../../../libs/civil_time" }
+makepad-zip-file = { path = "../../../../libs/zip_file" }
+makepad-strict-json = { path = "../../../../libs/strict_json" }
+makepad-model = { path = "../../../../libs/model" }
+makepad-render = { path = "../../../../libs/render" }
+makepad-scene = { path = "../../../../libs/scene" }
+makepad-gltf = { path = "../../../../libs/gltf" }
+makepad-base64 = { path = "../../../../libs/base64" }
+makepad-ai-services = { path = "../../../../libs/ai/services" }
+# (`speech`: the speech client; whisper itself runs on a voice hub, never in this process)
+makepad-ai-hub = { path = "../../../../libs/ai/hub", default-features = false, features = ["speech"] }
+makepad-compute-program = { path = "../../../../libs/compute_program", version = "1.0.0" }
+makepad-large-alloc = { path = "../../../../libs/large_alloc" }
+# the scan's detail runs compute programs on this app's own GPU (scan.rs); the tests' loopback hub uses it too
+makepad-compute-program-gpu = { path = "../../../../libs/compute_program_gpu", version = "1.0.0" }
+# starting the AI Hub app when no hub answers the Force study
+makepad-app-registry = { path = "../../../../libs/app_registry" }
+makepad-csg-math = { path = "../../../../libs/csg/csg_math" }
+makepad-app-aichat = { path = "../../../aichat", default-features = false, features = ["engine"] }
+makepad-app-shell = { path = "../../libs/app_shell" }
+makepad-desk-link = { path = "../../../../libs/desk_link" }
+makepad-xr-stream = { path = "../../../../libs/xr_stream" }
+makepad-xr-nav = { path = "../../../../libs/xr_nav" }
+makepad-xr-ui = { path = "../../../../libs/xr_ui" }
+
+[lints.rust]
+# Under the JIT (`cfg(relax)`) the live state's owner checks it is entered with no lock held.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(relax)"] }
+
+[dev-dependencies]
+fab-elec-parts = { path = "../elec/parts" }
+makepad-test = { path = "../../../../libs/makepad_test", version = "0.1.0" }
+# a hub on loopback with this machine's GPU device (tests/force_mode.rs, tests/grow_live.rs)
+fab-force = { path = "../force", features = ["node", "loopback"] }
+# counting a demo part's pieces (demo_part.rs)
+makepad-csg-cad = { path = "../../../../libs/csg/csg_cad" }

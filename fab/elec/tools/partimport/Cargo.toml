@@ -1,0 +1,11 @@
+[package]
+name = "fab-elec-partimport"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Part import from the command line: the library's import path with the network, for development imports"
+
+[dependencies]
+fab-elec-import = { path = "../../import" }
+makepad-network = { path = "../../../../../../platform/network" }

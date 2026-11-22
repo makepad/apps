@@ -1,0 +1,17 @@
+// The two toms on one 5 V analog supply and a shared signal ground. The low tom's TOM TUNE
+// turns live; the high tom uses the ringing filter's defaults: 167 Hz, 49.5 ms and a first swing
+// of about 1.35 V from a 3.4 V, 1 ms trigger. Their bench strikes them a quarter second apart.
+use mod.project.*
+let e = mod.elec
+
+let gnd   = e.net({name: "GND" kind: @ground})
+let va    = e.net({name: "VA" kind: @power volts: 5V})
+let ref   = e.net({name: "VREF"})
+let ltrig = e.net({name: "LTRIG"})
+let htrig = e.net({name: "HTRIG"})
+let low   = e.net({name: "LOW"})
+let high  = e.net({name: "HIGH"})
+
+let sg = signal_ground({va: va gnd: gnd ref: ref})
+let lt = tom_ringer({trig: ltrig out: low ref: ref va: va gnd: gnd})
+let ht = ringer({trig: htrig out: high ref: ref va: va gnd: gnd})

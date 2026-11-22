@@ -1,0 +1,46 @@
+// An analog drum machine on one 5 V supply: seven voices, an accent, and a 16-step sequencer on an
+// MCU with 20 low-profile keys and 20 LEDs, all on one board. Its electronics are the plate's
+// documents: the whole board (drum16: its circuit and its placed board), each voice as a circuit of
+// its own, the sequencer firmware, and the benches. It opens on the board's Bench and plays its
+// two-second take: the firmware runs the pattern from power-up, the step LEDs follow it on the
+// Board and in 3D, and the take rests at its end; Listen plays its recording. The voices' own
+// benches (Kick, Snare, Toms, Hats with the cymbal) strike their voices; turn their knobs while
+// they play. The board is routed, both layers. The case prints on two
+// plates, each inside the part of the bed both nozzles reach, so it prints whichever nozzle holds
+// a colour: this one prints the base, with the board riding in it without printing; the lid with
+// its 20 clear light pipes, the 20 keycaps and the eight knobs print on "Analog drum machine: lid
+// and keys". They are shown here without printing, so Mechanics can close the box.
+use mod.fab.*
+
+script("drum16.cad.splash")
+
+// The base is dark, the lid's pipes clear.
+color("Charcoal", rgb: #x2b2d31, material: "PETG")
+color("Graphite", rgb: #x303237, material: "PETG")
+color("Clear", rgb: #xe6ebe6, material: "PETG")
+
+// The shells are 219.8 x 164.8 mm. The base turns a quarter turn about its centre (108, 120), which
+// keeps it 25.6 to 190.4 mm across: inside both nozzles' reach (25 to 325 mm on the 350 mm bed).
+// The board is an insert and follows the base's placement and turn. The lid, shown, sits beside it
+// as its own plate prints it, turned the same; it starts 229.8 mm along the script's X, hence its
+// origin's Y.
+place("drum16", object: "Base", at: [108mm, 120mm], rotate: 90deg, color: "Charcoal")
+place("drum16", object: "Board", at: [108mm, 120mm], rotate: 90deg)
+place("drum16", object: "Lid", at: [276mm, -109.8mm], rotate: 90deg, color: "Graphite", print: false)
+
+let pins = [
+    "Pin keys.keys[0][0].sw" "Pin keys.keys[0][1].sw" "Pin keys.keys[0][2].sw" "Pin keys.keys[0][3].sw"
+    "Pin keys.keys[1][0].sw" "Pin keys.keys[1][1].sw" "Pin keys.keys[1][2].sw" "Pin keys.keys[1][3].sw"
+    "Pin keys.keys[2][0].sw" "Pin keys.keys[2][1].sw" "Pin keys.keys[2][2].sw" "Pin keys.keys[2][3].sw"
+    "Pin keys.keys[3][0].sw" "Pin keys.keys[3][1].sw" "Pin keys.keys[3][2].sw" "Pin keys.keys[3][3].sw"
+    "Pin keys.keys[4][0].sw" "Pin keys.keys[4][1].sw" "Pin keys.keys[4][2].sw" "Pin keys.keys[4][3].sw"
+]
+for row in 0..2 {
+    for col in 0..10 {
+        place("drum16", object: pins[row * 10 + col], at: [35mm + col * 16mm, 245mm + row * 16mm], color: "Charcoal", print: false)
+    }
+}
+let knobs = ["Knob tempo" "Knob shuffle" "Knob drum.decay" "Knob drum.tune" "Knob snare.snap" "Knob lt.tune" "Knob hats.decay" "Knob mix.vol"]
+for i in 0..knobs.len() {
+    place("drum16", object: knobs[i], at: [35mm + i * 25mm, 285mm], color: "Charcoal", print: false)
+}

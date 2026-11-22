@@ -1,0 +1,43 @@
+// A six-piece burr: six notched square sticks that lock together into a three-way cross, printed
+// flat and apart, three in each filament. Put together, no piece slides out on its own: the
+// first comes free only on the sixth move, after two others have shifted to make way for it.
+// Every piece lies on the face that leaves nothing overhanging, so none needs a support.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+let unit = param(8mm, min: 5mm, max: 12mm, step: 0.2mm, label: "Unit", group: "Burr", hint: "each stick is two units square and six long")
+// Every face stands this far in from the cube grid, so the pieces have twice this between them
+// when assembled: room to slide. With the unit a whole number of layers, the tops, the notches'
+// floors and their roofs all lie between layers, never in a layer's middle.
+let gap = 0.2mm
+
+// Each piece's notches, as the unit cubes cut from its stick: [along, up, across], the stick
+// lying along X on the face it prints on.
+let notches = [
+    [[1 1 0] [1 1 1] [2 1 0] [2 1 1] [3 1 0] [3 1 1] [4 1 0] [4 1 1]]
+    [[1 1 0] [1 1 1] [2 1 0] [2 1 1] [3 0 1] [3 1 0] [3 1 1] [4 1 1]]
+    [[1 1 0] [1 1 1] [2 0 1] [2 1 0] [2 1 1] [3 0 1] [3 1 1] [4 1 0] [4 1 1]]
+    [[1 1 0] [2 0 1] [2 1 0] [2 1 1] [3 1 0] [4 1 0] [4 1 1]]
+    [[1 0 1] [1 1 1] [2 0 1] [2 1 1] [3 1 0] [4 0 1] [4 1 1]]
+    [[1 1 0] [1 1 1] [2 1 0] [2 1 1] [3 0 1] [3 1 0] [3 1 1] [4 1 0] [4 1 1]]
+]
+// The stick shrunk by the gap, minus each notch cube grown by it.
+fn piece(cuts, x, z) {
+    let stick = m.box({size: [6 * unit - 2 * gap, 2 * unit - 2 * gap, 2 * unit - 2 * gap] at: [x, unit - gap, z]})
+    let cubes = for c in cuts { m.box({size: [unit + 2 * gap, unit + 2 * gap, unit + 2 * gap] at: [x + (c[0] - 2.5) * unit, (c[1] + 0.5) * unit - gap, z + (c[2] - 0.5) * unit]}) }
+    m.subtract(stick, cubes)
+}
+
+// Two columns of three, a unit apart: the pieces along X, then along Y, then along Z when
+// assembled, one of each pair in each column.
+let pieces = for row in [0, 1, 2] {
+    for col in [0, 1] { piece(notches[row * 2 + col], (col - 0.5) * 7 * unit, (row - 1) * 3 * unit) }
+}
+
+object(m.union(pieces[0], [pieces[1] pieces[2] pieces[3] pieces[4] pieces[5]]), name: "Six-piece burr")
+
+// The second filament: the right-hand column, filled by a box round it reaching halfway across
+// the gap, so its pieces' faces lie well inside the colour, never on its edge.
+let walnut = Material{albedo: [0.42 0.27 0.16] name: "Walnut"}
+m.fill(m.box({size: [7 * unit, 2 * unit + 2mm, 8 * unit + 2mm] at: [3.5 * unit, unit, 0]}), walnut)

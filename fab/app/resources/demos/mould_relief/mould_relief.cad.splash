@@ -1,0 +1,51 @@
+// A shallow round dish with a slime mould's veins standing out of its floor: a yellow tube on
+// each vein of a charcoal dish, trunks round where the mould started branching into fine threads,
+// each tube as wide as its vein and blended into the floor. Only tubes that print without support
+// stand, so none hangs off the wall. Two filaments; the network's mesh and seed are its knobs. The
+// tubes rise once the mould has grown over the dish, a few seconds after a change to it.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let diameter = param(100mm, min: 50mm, max: 200mm, step: 1mm, label: "Diameter", group: "Dish")
+let height = param(20mm, min: 10mm, max: 60mm, step: 0.5mm, label: "Height", group: "Dish")
+let wall = param(2.4mm, min: 1.2mm, max: 5mm, step: 0.1mm, label: "Wall", group: "Dish")
+let fillet = param(8mm, min: 0mm, max: 15mm, step: 0.5mm, label: "Fillet", group: "Dish", hint: "the rounding where the floor meets the wall inside")
+let mesh = param(10mm, min: 4mm, max: 30mm, step: 0.5mm, label: "Mesh", group: "Network", hint: "about how far across the finest meshes are: a thread is about a fifth of it, a trunk up to two thirds")
+let seed = param(3, min: 1, max: 999, step: 1, label: "Seed", group: "Network", kind: "seed", hint: "another whole number grows another network")
+
+let radius = diameter / 2
+let round = min(fillet, min(radius - wall, height - wall) * 0.9)
+// the hollow: from the floor's top up past the rim, its lower corner rounded
+let inside_mid = (wall + height + 10mm) / 2
+let inside_half = (height + 10mm - wall) / 2
+
+let dish = m.sdf({
+    bounds: [[-radius - 1mm, 0mm, -radius - 1mm], [radius + 1mm, height + 1mm, radius + 1mm]]
+    cell: 0.6mm
+    field: fn(p) {
+        let r = length(vec2(p.x, p.z))
+        // the solid cylinder: across and up, outside it the distance to its edge
+        let ox = r - radius
+        let oy = abs(p.y - height / 2) - height / 2
+        let outer = length(vec2(max(ox, 0), max(oy, 0))) + min(max(ox, oy), 0)
+        // the hollow, its corner rounded
+        let ix = r - (radius - wall) + round
+        let iy = abs(p.y - inside_mid) - inside_half + round
+        let hollow = length(vec2(max(ix, 0), max(iy, 0))) + min(max(ix, iy), 0) - round
+        return max(outer, 0 - hollow)
+    }
+})
+
+// the mould's veins as tubes on the dish, blended into it
+let veins = m.veins(dish, Physarum{preset: @trunks scale: mesh seed: seed spread: 0.5})
+let relief = m.blend([dish, veins], 0.4mm, {cell: 0.4mm})
+
+handle(diameter, Ring{center: [0, height, 0] radius: radius})
+handle(height, Arrow{from: [radius, 0, 0] to: [radius, height, 0]})
+
+object(relief)
+
+let yellow = Material{albedo: [0.95 0.76 0.12] name: "Yellow"}
+m.fill(veins, yellow)

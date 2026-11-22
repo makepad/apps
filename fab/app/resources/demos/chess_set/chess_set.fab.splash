@@ -1,0 +1,9 @@
+// A chess set's six pieces in two marbles, pale and dark, standing in two rows.
+use mod.fab.*
+
+script("chess_set.cad.splash")
+
+color("White", rgb: #xede9e0)
+color("Black", rgb: #x1a1a1f)
+
+place("chess_set", at: [175mm 160mm], name: "Chess set", color: "White")

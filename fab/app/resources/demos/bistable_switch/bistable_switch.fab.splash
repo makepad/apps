@@ -1,0 +1,9 @@
+// A bistable switch in two filaments: a slate frame and beams, a teal shuttle that snaps.
+use mod.fab.*
+
+script("bistable_switch.cad.splash")
+
+color("Slate", rgb: #x4a5361)
+color("Teal", rgb: #x1c8c99)
+
+place("bistable_switch", at: [175mm 160mm], name: "Bistable switch", color: "Slate")

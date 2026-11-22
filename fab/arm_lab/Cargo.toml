@@ -1,0 +1,21 @@
+[package]
+name = "fab-arm-lab"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab Arms' lab: the cells, parts and jobs the Arm workspace runs in the virtual cell, the session that steps a job through the planner and the cell, and the end-to-end checks the tests and the workspace both run"
+
+[dependencies]
+fab-robot = { path = "../robot" }
+fab-cell-sim = { path = "../cell_sim" }
+fab-arms = { path = "../arms" }
+# Fab's own slicer plans the plastic layers and the printer's time (read-only reuse).
+makepad-fab-slice = { path = "../slice" }
+makepad-fab-slicer = { path = "../slicer" }
+makepad-fab-toolpath = { path = "../toolpath" }
+makepad-fab-settings = { path = "../settings" }
+
+[lints.rust]
+# Under the JIT (`cfg(relax)`) the real-time path is marked and armed through std::relax.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(relax)"] }

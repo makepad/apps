@@ -1,0 +1,9 @@
+// A shallow dish with a slime mould grown over it, its veins thickened into trunks, in two filaments.
+use mod.fab.*
+
+script("mould_dish.cad.splash")
+
+color("Charcoal", rgb: #x2a2a2c)
+color("Yellow", rgb: #xf2c21f)
+
+place("mould_dish", at: [175mm 160mm], name: "Slime mould dish", color: "Charcoal")

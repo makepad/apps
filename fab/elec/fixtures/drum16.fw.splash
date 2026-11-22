@@ -1,0 +1,344 @@
+// The sequencer: seven drum voices and an accent track on 16 steps, run by the MCU at 5 V and
+// 16 MHz. Each step raises the struck voices' trigger pins for 1 ms (the accent pin first, high on
+// accented steps). The 20 LEDs and the key matrix's four columns hang on a 24-bit
+// shift chain; the five key rows are inputs on the MCU's pull-ups.
+//
+// A step key edits the selected track; INST with steps 1..8 selects it. PLAY starts from step 1
+// or stops; SHIFT with PLAY clears the track. The TEMPO pot sets the tempo, 60 to 240 bpm, and
+// SHUFFLE swings it: every second step comes late, by up to about half a step.
+// The LEDs show that track with the running step inverted, PLAY while playing, and held modifiers.
+// INST with step 7 selects the cymbal. The sync outputs await their hardware. PATTERN is reserved
+// and its LED stays off.
+// Reset selects the kick; setting `autoplay` to 1 starts the pattern without a key press.
+// The pattern is kept in the EEPROM, a byte a step, and comes back at power-up.
+//
+// Size: every call is inlined, so `on_key` has one call site, and the poll's transfer, row read and
+// key pass are each one rolled loop. The bench may override the constants; bpm, the tempo until the
+// pot is first read, must divide 15000000 evenly enough for its step to be whole microseconds.
+let bpm = 120
+let trig_ms = 1
+let autoplay = 0
+let step_us: i32 = 15000000 / bpm
+// The pattern's copy in the EEPROM is `tracks` itself, a byte a word. Byte 128 holds `saved_mark`
+// once all 128 have been written, so a new chip (every byte 255) keeps the built-in pattern.
+let saved_mark: i32 = 165
+
+// Whole-microsecond periods for each integer tempo from 60 through 240 bpm. The read-only table
+// avoids runtime division and uses no state RAM; padding keeps its length a power of two.
+let periods = [
+    int(250000), int(245901), int(241935), int(238095), int(234375), int(230769), int(227272), int(223880),
+    int(220588), int(217391), int(214285), int(211267), int(208333), int(205479), int(202702), int(200000),
+    int(197368), int(194805), int(192307), int(189873), int(187500), int(185185), int(182926), int(180722),
+    int(178571), int(176470), int(174418), int(172413), int(170454), int(168539), int(166666), int(164835),
+    int(163043), int(161290), int(159574), int(157894), int(156250), int(154639), int(153061), int(151515),
+    int(150000), int(148514), int(147058), int(145631), int(144230), int(142857), int(141509), int(140186),
+    int(138888), int(137614), int(136363), int(135135), int(133928), int(132743), int(131578), int(130434),
+    int(129310), int(128205), int(127118), int(126050), int(125000), int(123966), int(122950), int(121951),
+    int(120967), int(120000), int(119047), int(118110), int(117187), int(116279), int(115384), int(114503),
+    int(113636), int(112781), int(111940), int(111111), int(110294), int(109489), int(108695), int(107913),
+    int(107142), int(106382), int(105633), int(104895), int(104166), int(103448), int(102739), int(102040),
+    int(101351), int(100671), int(100000), int(99337), int(98684), int(98039), int(97402), int(96774),
+    int(96153), int(95541), int(94936), int(94339), int(93750), int(93167), int(92592), int(92024),
+    int(91463), int(90909), int(90361), int(89820), int(89285), int(88757), int(88235), int(87719),
+    int(87209), int(86705), int(86206), int(85714), int(85227), int(84745), int(84269), int(83798),
+    int(83333), int(82872), int(82417), int(81967), int(81521), int(81081), int(80645), int(80213),
+    int(79787), int(79365), int(78947), int(78534), int(78125), int(77720), int(77319), int(76923),
+    int(76530), int(76142), int(75757), int(75376), int(75000), int(74626), int(74257), int(73891),
+    int(73529), int(73170), int(72815), int(72463), int(72115), int(71770), int(71428), int(71090),
+    int(70754), int(70422), int(70093), int(69767), int(69444), int(69124), int(68807), int(68493),
+    int(68181), int(67873), int(67567), int(67264), int(66964), int(66666), int(66371), int(66079),
+    int(65789), int(65502), int(65217), int(64935), int(64655), int(64377), int(64102), int(63829),
+    int(63559), int(63291), int(63025), int(62761), int(62500), int(62500), int(62500), int(62500),
+    int(62500), int(62500), int(62500), int(62500), int(62500), int(62500), int(62500), int(62500),
+    int(62500), int(62500), int(62500), int(62500), int(62500), int(62500), int(62500), int(62500),
+    int(62500), int(62500), int(62500), int(62500), int(62500), int(62500), int(62500), int(62500),
+    int(62500), int(62500), int(62500), int(62500), int(62500), int(62500), int(62500), int(62500),
+    int(62500), int(62500), int(62500), int(62500), int(62500), int(62500), int(62500), int(62500),
+    int(62500), int(62500), int(62500), int(62500), int(62500), int(62500), int(62500), int(62500),
+    int(62500), int(62500), int(62500), int(62500), int(62500), int(62500), int(62500), int(62500),
+    int(62500), int(62500), int(62500), int(62500), int(62500), int(62500), int(62500), int(62500),
+    int(62500), int(62500), int(62500), int(62500), int(62500), int(62500), int(62500), int(62500)
+]
+
+let kick = output(PD4)
+let snare = output(PD5)
+let low_tom = output(PD6)
+let high_tom = output(PD7)
+let closed_hat = output(PB0)
+let open_hat = output(PB1)
+let cymbal = output(PC0)
+let accent = output(PC1)
+let latch = output(PB2)
+let data = output(PB3)
+let clock = output(PB5)
+let row0 = input(PC2, pull_up)
+let row1 = input(PC3, pull_up)
+let row2 = input(PC4, pull_up)
+let row3 = input(PC5, pull_up)
+let row4 = input(PB4, pull_up)
+let tempo_pot = analog(ADC7)
+let shuffle_pot = analog(ADC6)
+
+// A track is sixteen 0/1 words; shifting its index by four avoids multiplication. The built-in
+// pattern is the initial data: kick 1 5 9 13, snare 5 13, low tom 11, high tom 12, closed hat on
+// the odd steps but 15, open hat 15, cymbal 1, accent 1 9 (steps counted from 1).
+var tracks = [
+    int(1), int(0), int(0), int(0), int(1), int(0), int(0), int(0),
+    int(1), int(0), int(0), int(0), int(1), int(0), int(0), int(0),
+    int(0), int(0), int(0), int(0), int(1), int(0), int(0), int(0),
+    int(0), int(0), int(0), int(0), int(1), int(0), int(0), int(0),
+    int(0), int(0), int(0), int(0), int(0), int(0), int(0), int(0),
+    int(0), int(0), int(1), int(0), int(0), int(0), int(0), int(0),
+    int(0), int(0), int(0), int(0), int(0), int(0), int(0), int(0),
+    int(0), int(0), int(0), int(1), int(0), int(0), int(0), int(0),
+    int(1), int(0), int(1), int(0), int(1), int(0), int(1), int(0),
+    int(1), int(0), int(1), int(0), int(1), int(0), int(0), int(0),
+    int(0), int(0), int(0), int(0), int(0), int(0), int(0), int(0),
+    int(0), int(0), int(0), int(0), int(0), int(0), int(1), int(0),
+    int(1), int(0), int(0), int(0), int(0), int(0), int(0), int(0),
+    int(0), int(0), int(0), int(0), int(0), int(0), int(0), int(0),
+    int(1), int(0), int(0), int(0), int(0), int(0), int(0), int(0),
+    int(1), int(0), int(0), int(0), int(0), int(0), int(0), int(0)
+]
+var step: i32 = 0
+var lit: i32 = 0
+var inst: i32 = 0
+var tempo: i32 = int(bpm)
+var tick_us: i32 = step_us
+// SHUFFLE's delay of every second step, as last read
+var late: i32 = 0
+var playing = false
+var triggers_high = false
+var next_due: i32 = 0
+var dirty = true
+// Pattern edits while playing wait for the next step's tail; controls can request an earlier
+// image. Both still draw only in the poll, and never partway through a column walk.
+var repaint = true
+// The LEDs' 20 bits of the chain, bit n for output n. Only 20 key words and five row words are
+// used; the emitter indexes arrays of a power-of-two length. `candidate` is each key's last read,
+// `down` its accepted state.
+var leds: i32 = 0
+var candidate = [int(0); 32]
+var down = [int(0); 32]
+var rows = [int(1); 8]
+// Whether `load` is still reading the saved pattern, the next byte it reads, and the next byte the
+// poll compares with the chip's (128: the mark)
+var loading = false
+var load_at: i32 = 0
+var save_at: i32 = 0
+
+// The chain: one `shift_out` sends the LED bits and the four columns' (outputs 20 to 23) bit 23
+// first, and the latch follows, so bit n lands on output n. Columns are active low; changing them
+// never changes the cached LED bits.
+
+fn on_key(k, pressed) {
+    if k == 17 || k == 18 {
+        dirty = true
+        repaint = true
+    }
+    if pressed {
+        if k < 16 {
+            if down[18] == 1 {
+                if k < 8 {
+                    inst = k
+                    dirty = true
+                    repaint = true
+                }
+            } else if down[17] == 0 {
+                let index = (inst << 4) + k
+                tracks[index] = 1 - tracks[index]
+                // this run's save writes it
+                save_at = index
+                dirty = true
+                if !playing { repaint = true }
+            }
+        } else if k == 16 {
+            if down[17] == 1 {
+                for i in 0..16 { tracks[(inst << 4) + i] = 0 }
+                save_at = inst << 4
+            } else {
+                playing = !playing
+                if playing {
+                    step = 0
+                    lit = 0
+                    next_due = now_us() + tick_us
+                    // step 1 to step 2 is a long interval
+                    period(tick, us(tick_us + late))
+                    start(tick)
+                } else {
+                    // The one-shot alone lowers triggers; stopping only disarms the step clock.
+                    stop(tick)
+                }
+            }
+            dirty = true
+            repaint = true
+        }
+    }
+}
+
+fn setup() {
+    stop(trig_off)
+    // a pattern saved before the power went off replaces the built-in one, in `load`
+    loading = eeprom_read(128) == saved_mark
+    if !loading { stop(load) }
+    if autoplay == 1 {
+        playing = true
+        next_due = now_us() + step_us
+    } else {
+        stop(tick)
+    }
+    // the first poll draws the first image
+}
+
+let tick = every(us(step_us), fn() {
+    if playing {
+        // The clock gives the poll a conservative gap estimate (a swung step can come early by
+        // `late`). All eight writes run on every step, including zeros, so each pin keeps a fixed
+        // slot, with accent first.
+        next_due = now_us() + tick_us - late
+        write(accent, tracks[112 + step])
+        write(kick, tracks[step])
+        write(snare, tracks[16 + step])
+        write(low_tom, tracks[32 + step])
+        write(high_tom, tracks[48 + step])
+        write(closed_hat, tracks[64 + step])
+        write(open_hat, tracks[80 + step])
+        write(cymbal, tracks[96 + step])
+        start(trig_off)
+        triggers_high = true
+        lit = step
+        step = (step + 1) & 15
+        dirty = true
+        repaint = true
+        // TEMPO, read once a step after the triggers rise (a read takes about 0.2 ms): 60 bpm at
+        // the bottom of its turn, 3/16 bpm a count up, 240 over its top 6 % so the end of the
+        // travel reaches it (shifts and adds: the MCU has no 32-bit multiply).
+        let a = analog_read(tempo_pot)
+        let turned = 60 + ((a + (a << 1)) >> 4)
+        let set = if turned > 240 { int(240) } else { turned }
+        if set != tempo {
+            tempo = set
+            tick_us = periods[tempo - 60]
+        }
+        // SHUFFLE, read beside it: straight over the bottom 3 % of its turn, then up to 0.48 of a
+        // step at the top. The step after each odd-numbered one (counted from 1) comes that much
+        // late and the next one as much early, so every pair keeps the tempo. The pending tick
+        // keeps its deadline, so this sets the interval after the next step: long after an
+        // odd-numbered step.
+        let swing = analog_read(shuffle_pot) - 32
+        // tick_us * swing / 2048, by shifts and adds
+        let bits = if swing > 0 { swing } else { int(0) }
+        let part = tick_us
+        let product = int(0)
+        for i in 0..10 {
+            if (bits & 1) == 1 { product = product + part }
+            part = part << 1
+            bits = bits >> 1
+        }
+        late = product >> 11
+        period(tick, us(if (step & 1) == 0 { tick_us + late } else { tick_us - late }))
+    }
+})
+
+// At power-up, once `setup` has found the mark, one byte a run: the saved pattern replaces the
+// built-in one, in 6.4 ms, before the first poll or step. Each EEPROM access is charged a whole write
+// time, which allows a handler fewer than 16.
+let load = every(us(50), fn() {
+    tracks[load_at] = eeprom_read(load_at) & 1
+    load_at = load_at + 1
+    if load_at == 128 {
+        stop(load)
+        loading = false
+        dirty = true
+        repaint = true
+    }
+})
+
+// Compensate for the rising writes and the arming before the one-shot starts (about 22 us,
+// measured). The falling writes have the same order as the rising writes, keeping pulse widths
+// equal across voices. The standalone edge test verifies the resulting widths.
+let trig_off = after(us(trig_ms * 1000 - 22), fn() {
+    write(accent, low)
+    write(kick, low)
+    write(snare, low)
+    write(low_tom, low)
+    write(high_tom, low)
+    write(closed_hat, low)
+    write(open_hat, low)
+    write(cymbal, low)
+    triggers_high = false
+})
+
+// Every 10 ms, between steps, with room before the next one for its longest run (twice the about
+// 1 ms measured; a walk is about 0.75 ms of it): read the rows. While a row is low (a key is down),
+// walk the columns: select each in turn on the chain and read the rows, then set them all low
+// again; with no row low every key reads up, without a transfer. A key changes on the second of two
+// reads that agree, 10 ms apart, past any bounce. The LED image goes out here only, in the same
+// transfer: after a step's triggers fall, after an edit while stopped, or when a control changes
+// the displayed state. Each run then saves at most one byte of the pattern.
+let poll = every(ms(10), fn() {
+    if !triggers_high {
+        let room = if playing { next_due - now_us() } else { 1000000 }
+        if room > 2000 {
+            let fresh = dirty && repaint
+            if fresh {
+                leds = 0
+                for i in 0..16 { leds = leds | (tracks[(inst << 4) + i] << i) }
+                if playing { leds = (leds ^ (1 << lit)) | (1 << 16) }
+                leds = leds | (down[17] << 17) | (down[18] << 18)
+                dirty = false
+                repaint = false
+            }
+            let any = false
+            let walk = false
+            // pass 0 reads the rows at rest, passes 1..4 select column c - 1 and read them, pass 5
+            // sets every column low again; more passes than the compiler unrolls keep the loops
+            // rolled, so each transfer, read and `on_key` has one call site
+            for c in 0..9 {
+                if c < 6 {
+                    if (walk && c > 0) || (c == 5 && fresh) {
+                        // pass c < 5 holds column c - 1 low and the others high; pass 5 sets all low
+                        let cols = if c < 5 { 15 ^ (1 << (c - 1)) } else { int(0) }
+                        shift_out(data, clock, leds | (cols << 20), 24)
+                        write(latch, high)
+                        write(latch, low)
+                    }
+                    if c == 0 || (walk && c < 5) {
+                        rows[0] = read(row0)
+                        rows[1] = read(row1)
+                        rows[2] = read(row2)
+                        rows[3] = read(row3)
+                        rows[4] = read(row4)
+                    }
+                    if c == 0 {
+                        any = rows[0] == low || rows[1] == low || rows[2] == low || rows[3] == low || rows[4] == low
+                        // a poll that paints does not walk: the image goes out at once, the walk
+                        // follows on the next poll
+                        walk = any && !fresh
+                    }
+                    if c > 0 && c < 5 && (walk || !any) {
+                        for r in 0..9 {
+                            if r < 5 {
+                                let k = (r << 2) + c - 1
+                                let f = 1 - rows[r]
+                                if f == candidate[k] && f != down[k] {
+                                    down[k] = f
+                                    on_key(k, f == 1)
+                                }
+                                candidate[k] = f
+                            }
+                        }
+                    }
+                }
+            }
+            // one EEPROM byte a run: the pattern's step at `save_at`, or the mark after the last, is
+            // written when it differs from what the chip holds, and `save_at` moves on. An edit points
+            // it at its step, so the run that took the key saves it; an unchanged pattern writes nothing.
+            if !loading {
+                let byte = if save_at < 128 { tracks[save_at] } else { saved_mark }
+                if eeprom_read(save_at) != byte { eeprom_write(save_at, byte) }
+                save_at = if save_at == 128 { int(0) } else { save_at + 1 }
+            }
+        }
+    }
+})

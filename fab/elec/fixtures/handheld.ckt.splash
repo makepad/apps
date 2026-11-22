@@ -1,0 +1,143 @@
+// A handheld sand toy: USB-C power and data in, one 3.3 V regulator, BOOT and RESET buttons, and the
+// board's codec and speaker amplifier. The power manager, RTC and microphone join as their simulation
+// models arrive.
+use mod.elec.*
+use mod.std.*
+let e = mod.elec
+
+let gnd = e.net({name: "GND" kind: @ground})
+let vbus = e.net({name: "VBUS" kind: @power volts: 5V})
+let vdd = e.net({name: "3V3" kind: @power volts: 3.3V})
+let usb_dp = e.net({name: "USB_DP"})
+let usb_dn = e.net({name: "USB_DN"})
+let cc = e.bus("CC", 2)
+let sda = e.net({name: "SDA"})
+let scl = e.net({name: "SCL"})
+let panel_cs = e.net({name: "PANEL_CS"})
+let panel_clock = e.net({name: "PANEL_CLOCK"})
+let panel_data = e.bus("PANEL_DATA", 4)
+let panel_reset = e.net({name: "PANEL_RESET"})
+let touch_reset = e.net({name: "TOUCH_RESET"})
+let touch_int = e.net({name: "TOUCH_INT"})
+let imu_int = e.net({name: "IMU_INT"})
+let imu_int2 = e.net({name: "IMU_INT2"})
+let expander_int = e.net({name: "EXPANDER_INT"})
+let spare = e.bus("SPARE", 5)
+let xtal_p = e.net({name: "XTAL_P"})
+let xtal_n = e.net({name: "XTAL_N"})
+let enable = e.net({name: "ENABLE"})
+let boot = e.net({name: "BOOT"})
+let mclk = e.net({name: "MCLK"})
+let sclk = e.net({name: "SCLK"})
+let lrck = e.net({name: "LRCK"})
+let dsdin = e.net({name: "DSDIN"})
+let asdout = e.net({name: "ASDOUT"})
+let pa_ctrl = e.net({name: "PA_CTRL"})
+
+let mcu = e.part("mcu", {pins: {
+    VDD3P3: vdd VDD3P3_RTC: vdd VDD3P3_CPU: vdd VDD_SPI: vdd VDDA: vdd GND: gnd
+    XTAL_P: xtal_p XTAL_N: xtal_n CHIP_PU: enable GPIO0: boot
+    GPIO15: sda GPIO14: scl GPIO12: panel_cs GPIO11: panel_clock
+    GPIO4: panel_data[0] GPIO5: panel_data[1] GPIO6: panel_data[2] GPIO7: panel_data[3]
+    GPIO21: touch_int GPIO19: usb_dn GPIO20: usb_dp
+    GPIO16: mclk GPIO9: sclk GPIO45: lrck GPIO8: dsdin GPIO10: asdout GPIO46: pa_ctrl
+} nc: [@LNA_IN @GPIO1 @GPIO2 @GPIO3 @GPIO13 @GPIO17
+       @GPIO18 @GPIO26 @GPIO27 @GPIO28 @GPIO29 @GPIO30 @GPIO31 @GPIO32
+       @GPIO33 @GPIO34 @GPIO35 @GPIO36 @GPIO37 @GPIO38 @GPIO39 @GPIO40 @GPIO41 @GPIO42
+       @GPIO43 @GPIO44 @GPIO47 @GPIO48]})
+
+// USB-C: VBUS feeds the regulator; D- and D+ reach GPIO19 and GPIO20, the chip's USB_D-/USB_D+
+// (series datasheet v2.2, Table 2-1). 5.1 kohm on each CC line asks a source for 5 V.
+let usb = e.part("usb_c_usb2", {pins: {VBUS: vbus GND: gnd SHIELD: gnd CC1: cc[0] CC2: cc[1]
+                                       DP: usb_dp DN: usb_dn}})
+let cc_pull = for i in 0..2 { e.r(5.1kohm, cc[i], gnd, {package: "0402"}) }
+let ldo = e.part(ldo_3v3(), {pins: {VIN: vbus EN: vbus GND: gnd VOUT: vdd} nc: [@NC]})
+let ldo_in = e.c(1uF, vbus, gnd, {package: "0603" volts: 10V})
+e.near(ldo_in, ldo.VIN, 2mm)
+// BOOT held through a reset strap GPIO0 low for joint download boot (Table 3-3, GPIO46 held low by
+// the amplifier enable's pull-down below); RESET pulls CHIP_PU low.
+let boot_button = e.part(tact_switch(), {pins: {A: boot B: gnd}})
+let reset_button = e.part(tact_switch(), {pins: {A: enable B: gnd}})
+
+// Board wiring R01/R02/R03: shared bus, panel reset P0, touch reset P2, IMU INT1 P6.
+let panel = e.part("panel", {pins: {
+    VDD: vdd GND: gnd CSX: panel_cs SCLK: panel_clock RESX: panel_reset
+    SIO0: panel_data[0] SIO1: panel_data[1] SIO2: panel_data[2] SIO3: panel_data[3]
+}})
+let touch = e.part("touch", {pins: {VDD: vdd GND: gnd SDA: sda SCL: scl RST: touch_reset INT: touch_int}})
+// The real board's IMU (measured 2026-11-19): at rest face up its Z reads -1.08 g, so Z points into the
+// board, and tilting it by hand put its X toward the panel's top edge (row 0) and its Y along the
+// panel's columns; the part's frame is right-handed (Figure 7), which leaves only this one. This design
+// keeps the IMU on the top face, so the component states those axes in its footprint's frame.
+let imu = e.part("imu", {pins: {VDD: vdd GND: gnd SDA: sda SCL: scl INT1: imu_int INT2: imu_int2}
+    fields: {"motion.x": "+y" "motion.z": "-z"}})
+let expander = e.part("expander", {pins: {
+    VDD: vdd GND: gnd SDA: sda SCL: scl INT: expander_int
+    P0: panel_reset P1: spare[0] P2: touch_reset P3: spare[1] P4: spare[2]
+    P5: spare[3] P6: imu_int P7: spare[4]
+}})
+// Board wiring R04/R05: 2.2 kohm I2C pulls and a 10 kohm touch interrupt pull.
+let pull_sda = e.r(2.2kohm, sda, vdd, {package: "0402"})
+let pull_scl = e.r(2.2kohm, scl, vdd, {package: "0402"})
+let pull_touch_int = e.r(10kohm, touch_int, vdd, {package: "0402"})
+let pull_expander_int = e.r(10kohm, expander_int, vdd, {package: "0402"})
+// Inactive reset/CS at power-on; the current touch runtime leaves P2 as an input.
+let pull_touch_reset = e.r(10kohm, touch_reset, vdd, {package: "0402"})
+let pull_panel_cs = e.r(10kohm, panel_cs, vdd, {package: "0402"})
+let pull_enable = e.r(10kohm, enable, vdd, {package: "0402"})
+let pull_boot = e.r(10kohm, boot, vdd, {package: "0402"})
+
+let crystal = e.part(crystal_part("3225"), {value: 40MHz pins: [xtal_p xtal_n gnd]})
+// Load capacitors are a circuit assumption: the pinned chip datasheet gives no
+// crystal-specific load value. The board cut must match them to its selected crystal.
+let load_p = e.c(12pF, xtal_p, gnd, {package: "0402"})
+let load_n = e.c(12pF, xtal_n, gnd, {package: "0402"})
+// One 100 nF per supply terminal (2, 3, 20, 29, 46, 55, 56), plus bulk storage;
+// circuit choices, not claimed chip datasheet recommendations.
+let decouple = for i in 0..7 { e.c(100nF, vdd, gnd, {package: "0402"}) }
+let bulk = e.c(10uF, vdd, gnd, {package: "0805"})
+let bus_decouple = for i in 0..4 { e.c(100nF, vdd, gnd, {package: "0402"}) }
+e.near(crystal, mcu.XTAL_P, 3mm)
+e.near(load_p, crystal, 2mm)
+e.near(load_n, crystal, 2mm)
+
+// The codec and speaker amplifier as on the board (schematic.txt:598-760): U9 ES8311 on the shared
+// I2C bus with CE low through R32 (address 0x18) and the I2S pins of facts-audio.md:9; U10 NS4150B
+// fed from OUTP/OUTN through C42/C47 (100 nF) and R34/R36 (150 kohm), so AVD = 240K / Rin = 1.6,
+// 4 dB (ns4150b.txt:173-183, the board check of beep.ckt.splash); R39 holds PA_CTRL (GPIO46) low
+// through reset. The speaker is a 2-pin header here. Supply and reference capacitors follow
+// beep.ckt.splash, the guide's values (es8311-user-guide.txt:478-506,536-553).
+let ce = e.net({name: "CE"})
+let vmid = e.net({name: "VMID"})
+let adcvref = e.net({name: "ADCVREF"})
+let dacvref = e.net({name: "DACVREF"})
+let outp = e.net({name: "OUTP"})
+let outn = e.net({name: "OUTN"})
+let codec = e.part("ES8311_QFN20", {pins: {
+    SCL: scl SDA: sda CE: ce MCLK: mclk SCLK: sclk LRCK: lrck DSDIN: dsdin ASDOUT: asdout
+    PVDD: vdd DVDD: vdd AVDD: vdd AGND: gnd DGND: gnd EP: gnd
+    ADCVREF: adcvref DACVREF: dacvref VMID: vmid OUTP: outp OUTN: outn
+} nc: [@MIC1P @MIC1N] fields: {"bus.addr": "24"}})
+let ce_low = e.r(10kohm, ce, gnd, {package: "0402"})
+let codec_bypass = for i in 0..3 { e.c(100nF, vdd, gnd, {package: "0402"}) }
+let vmid_cap = e.c(1uF, vmid, gnd, {package: "0603"})
+let adc_cap = e.c(1uF, adcvref, gnd, {package: "0603"})
+let dac_cap = e.c(1uF, dacvref, gnd, {package: "0603"})
+let acp = e.net({name: "AC_P"})
+let acn = e.net({name: "AC_N"})
+let inp = e.net({name: "INP"})
+let inn = e.net({name: "INN"})
+let cin_p = e.c(100nF, outp, acp, {package: "0402"})
+let rin_p = e.r(150kohm, acp, inp, {package: "0402"})
+let cin_n = e.c(100nF, outn, acn, {package: "0402"})
+let rin_n = e.r(150kohm, acn, inn, {package: "0402"})
+let bypass = e.net({name: "BYPASS"})
+let spk_p = e.net({name: "SPK_P"})
+let spk_n = e.net({name: "SPK_N"})
+let amp = e.part("NS4150B_MSOP8", {pins: {
+    EN: pa_ctrl INP: inp INN: inn BYPASS: bypass VCC: vbus GND: gnd VOP: spk_p VON: spk_n
+} fields: {"bus.gain_db": "4"}})
+let bypass_cap = e.c(1uF, bypass, gnd, {package: "0603"})
+let amp_decouple = e.c(1uF, vbus, gnd, {package: "0603"})
+let pull_ctrl = e.r(10kohm, pa_ctrl, gnd, {package: "0402"})
+let speaker = e.part(header({pins: 2 pitch: 2.54mm}), {pins: {"1": spk_p "2": spk_n}})

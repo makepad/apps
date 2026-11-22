@@ -1,0 +1,44 @@
+// A flared vase with a Lichtenberg figure grown over it: a branching tree of dark char on pale
+// birch, grown by walkers over the vase's own skin from its lowest point, so it spreads over
+// the foot, climbs the wall, rolls over the rim and runs down inside. Two filaments; the
+// figure's preset, spacing, seed and steps are its knobs. The wall is a cone's, flaring out
+// gently from the foot to the rim on a flat floor: one distance field, so it renders and edits
+// live, and it prints with nothing under it.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let height = param(120mm, min: 50mm, max: 220mm, step: 1mm, label: "Height", group: "Vase")
+let foot = param(32mm, min: 15mm, max: 70mm, step: 0.5mm, label: "Foot", group: "Vase", kind: "radius")
+let rim = param(44mm, min: 15mm, max: 90mm, step: 0.5mm, label: "Rim", group: "Vase", kind: "radius", hint: "the rim's radius: wider than the foot flares the wall out, up to 45 degrees")
+let wall = param(2.4mm, min: 1.2mm, max: 5mm, step: 0.1mm, label: "Wall", group: "Vase")
+let spacing = param(6mm, min: 3mm, max: 24mm, step: 0.5mm, label: "Spacing", group: "Figure", hint: "how far apart the branches keep: the widest gaps are about twice it, a twig about a quarter of it")
+let seed = param(5, min: 1, max: 999, step: 1, label: "Seed", group: "Figure", kind: "seed", hint: "another whole number grows another figure")
+
+// the wall leans out by `slope` (mm out per mm up), at most 1 (45 degrees); `across` turns the
+// distance across the cone into a true distance
+let slope = min((rim - foot) / height, 1)
+let across = 1 / sqrt(1 + slope * slope)
+
+let vase = m.sdf({
+    bounds: [[-rim - 1mm, 0mm, -rim - 1mm], [rim + 1mm, height + 1mm, rim + 1mm]]
+    cell: 0.8mm
+    field: fn(p) {
+        let side = (length(vec2(p.x, p.z)) - foot - slope * p.y) * across
+        let outer = max(max(side, 0 - p.y), p.y - height)
+        // the hollow: the wall's thickness in from the side, over a floor as thick, open at the top
+        let hollow = max(side + wall, wall - p.y)
+        return max(outer, 0 - hollow)
+    }
+})
+
+handle(height, Arrow{from: [rim, 0, 0] to: [rim, height, 0]})
+handle(foot, Ring{center: [0, 0, 0] radius: foot})
+handle(rim, Ring{center: [0, height, 0] radius: rim})
+
+object(vase)
+
+let birch = Material{albedo: [0.9 0.8 0.64] name: "Birch"}
+let burnt = Material{albedo: [0.15 0.1 0.08] name: "Char"}
+m.fill(vase, Mix{materials: [birch burnt] field: Lichtenberg{preset: @tree scale: spacing seed: seed} sharp: 1})

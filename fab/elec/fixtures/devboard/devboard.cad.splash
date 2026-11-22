@@ -1,0 +1,21 @@
+// A development board's two-part case, with port openings and mounting posts. Base and Lid
+// print beside each other; Board is inserted into Base for the fit and slice checks.
+// The record at the top is the board as measured, overriding the stock board's defaults.
+// It takes usb.kind (@b, @micro, @c), usb.height, usb.overhang, usb.y, dc.present (true or
+// false), dc.height, dc.overhang, dc.y, mcu (@dip28, @smd), header_height, tallest and
+// pins_below. Every length needs its unit, as in 10.9mm; y is along the board's edge.
+// Editing the record re-cases the board, including its inserted bodies.
+// The four screws leave the corner past the USB receptacle free; one rest holds it there. The
+// default corner rests would also press on the far socket header's end.
+// The DC jack ends 1.7 mm from mount1's centre, short of any lid post: that hole rests on its
+// standoff and takes no screw.
+// The screws tap into their standoffs: a heat-set insert's 8 mm boss would meet the header's and
+// the DC jack's soldered tails beside two of the holes.
+use mod.model.*
+use mod.fab.*
+let measured = {usb: {kind: @b height: 10.9mm overhang: 6.3mm y: 38.1mm} dc: {present: true height: 11mm overhang: 1.9mm y: 7.6mm} mcu: @dip28 header_height: 8.5mm tallest: 6.5mm pins_below: 2mm}
+let pcb = board("devboard", measured)
+let case = enclosure(pcb, {standoffs: {screw: @M3 insert: @self_tap} rests: [[2.5mm, 50.9mm]] holes: [{name: "mount1" post: false}]})
+object(case.base, name: "Base")
+object(case.lid, name: "Lid")
+insert(board_solid(pcb, board_bodies("devboard", measured), case.frame), name: "Board", into: "Base")

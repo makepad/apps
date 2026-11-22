@@ -1,0 +1,29 @@
+[package]
+name = "makepad-model-script"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "The Splash model builder: model_new / character_new record libs/model programs, hash them and post them to the build service's mailbox; no game loop, sim or widgets"
+
+[dependencies]
+# The VM the builder's handles and verbs live in.
+makepad-script = { path = "../../../../platform/script" }
+# The editable model engine: the program the builder records is its
+# operation JSON, and characters are validated with its spec parser.
+makepad-model = { path = "../../../../libs/model" }
+# The vector canvas (vector.rs): real glyph outlines and the coverage
+# rasteriser Makepad's own text uses, for `m.sign_material` and generated signs.
+makepad-font-core = { path = "../../../../libs/font_core" }
+# The model language lowers to the typed solid graph; SDF fields are Splash fns
+# compiled by the kernel compiler (csg_sdf).
+makepad-csg-graph = { path = "../../../../libs/csg/csg_graph" }
+makepad-csg-cad = { path = "../../../../libs/csg/csg_cad" }
+makepad-csg-sdf = { path = "../../../../libs/csg/csg_sdf" }
+makepad-csg-math = { path = "../../../../libs/csg/csg_math" }
+makepad-csg-mech = { path = "../../../../libs/csg/csg_mech" }
+# SVG path data for the SvgPath sketch shape.
+makepad-svg = { path = "../../../../libs/svg" }
+
+[dev-dependencies]
+makepad-gltf = { path = "../../../../libs/gltf" }

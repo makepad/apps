@@ -1,0 +1,237 @@
+// A string marionette printed in place, lying on its back: a jester whose head nods on a ruff
+// and tilts on it, whose shoulders, elbows, hips and knees all swing, every joint a hinge
+// printed through it. Each limb is one field, its ends turned round its pins, so the joints
+// swing far each way without the pieces meeting. Eyelets for the strings go through the hat's
+// bells, the hands, the knees and the back; the control beside it has a leg bar that swivels on
+// its own pin, to walk it. Seven strings tie the two, slack as they print: in Mechanics, Hang lifts
+// the control until the jester hangs upright on them, and a hand carries the control. Its costume is a harlequin's diamonds through the cloth, a hood of
+// them round its painted face, its cheeks blushing (dithered). Under nine materials the colours
+// lie in layers: the motley's two alone up to the costume's top (the gloves and shoes in them
+// too), the face, its eyes and smile and the hat's colour over it.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let materials = param(4, min: 2, max: 9, step: 1, label: "Materials", group: "Costume", kind: "count", hint: "2: the costume in two colours, the face in the second; 4: adds skin and a dark for the eyes and smile; 9: a colour for every patch, white gloves, dark shoes, gold bells and a blush (each colour adds filament changes, and a purge with each)")
+let diamond = param(9mm, min: 5mm, max: 16mm, step: 0.5mm, label: "Diamonds", group: "Costume", hint: "the harlequin diamonds' size")
+
+// Lying on its back: +Z is its head, +Y its front (up off the bed), X across it.
+// The limbs' pins lie along X (the joints swing them forward and back), 3.95 mm over the bed.
+// Each part holds a knuckle column round its pin, as round as the hinge's eye (pin, two nozzle
+// widths, the clearance), standing on the bed: the clearance the hinge cuts round the pin then
+// parts the two columns. The plates stay over the bed.
+let jy = 3.95mm
+let jr = 3.9mm
+let pin = 1.4mm
+// Upright pins (the head's tilt, the leg bar's swivel) have a closer fit: a smaller eye.
+let vr = 3.9mm
+// An upright hinge stands a whole number of layers tall (8 mm, as the control's 7 mm bars): its
+// plates, its eye and the clearance over it then end where layers meet, never on the plane a
+// layer is cut at, where a face sliced flat leaves slivers in mid-air.
+let tilt_h = 8mm
+let ground = m.box({size: [400mm, 20mm, 400mm] at: [0, -10mm, 0]})
+fn column(x0, x1, z) { m.cylinder({radius: jr height: x1 - x0 at: [(x0 + x1) / 2, jy, z] rotate: [0, 0, 90°] segments: 48}) }
+// A limb between two pins: a column at each, a body tapering between them, flat on the bed.
+fn limb(x0, x1, z0, z1, thick) {
+    let mid = m.ellipsoid({radii: [(x1 - x0) / 2, thick, (z0 - z1) / 2 - jr * 0.6] at: [(x0 + x1) / 2, 0, (z0 + z1) / 2]})
+    m.carve(m.blend([column(x0, x1, z0) column(x0, x1, z1) mid], 2mm), ground, 0)
+}
+// A string's hole: straight down through the part at the point the string is tied to.
+fn eyelet(p, h) { m.cylinder({radius: 1.3mm height: h at: [p[0], 0, p[2]]}) }
+
+// The joints' places (z): ruff, head, shoulders, elbows, hips, knees, ankles.
+let neck_z = 52mm
+let head_z = 61mm
+let shoulder_z = 44mm
+let elbow_z = 22mm
+let hip_z = 0
+let knee_z = -36mm
+let ankle_z = -68mm
+// Across (x): the arms beside the chest, the legs under the hips.
+let arm = [13.6mm, 21.6mm]
+let fore = [14mm, 21.2mm]
+let thigh = [3mm, 13mm]
+let shin = [3.5mm, 12.5mm]
+
+// The torso: a chest and a belly blended, a bar across the shoulders and one across the hips
+// for the arms and legs, a knuckle for the ruff; a hole through the upper back for its string.
+// The bars' outer ends, where the hinges put their outer plates, hold on through a slab on the
+// bed behind each joint, under the pins: a limb swinging forward never meets it.
+let chest = m.ellipsoid({radii: [13mm, 10mm, 15mm] at: [0, 6mm, 34mm]})
+let belly = m.ellipsoid({radii: [11.5mm, 9mm, 13mm] at: [0, 5.5mm, 16mm]})
+let body = m.blend([chest belly], 5mm)
+let shoulder_slab = m.box({size: [2 * arm[1], 3.4mm, 9mm] at: [0, 1.7mm, shoulder_z + 4.5mm]})
+let hip_slab = m.box({size: [2 * thigh[1], 3.4mm, 9mm] at: [0, 1.7mm, hip_z + 4.5mm]})
+let back_eye = [0, jy, 38mm]
+let torso_shape = m.carve(m.blend([body column(-arm[1], arm[1], shoulder_z) column(-thigh[1], thigh[1], hip_z) column(-6mm, 6mm, neck_z) shoulder_slab hip_slab], 0), [ground eyelet(back_eye, 60mm)], 0)
+
+// The ruff: a short piece from the torso's knuckle up to the head's pin, which stands upright
+// (the head tilts on it); the ruff's frill is paint.
+let ruff = m.carve(m.blend([column(-6mm, 6mm, neck_z) m.cylinder({radius: vr height: tilt_h at: [0, tilt_h / 2, head_z]}) m.box({size: [8mm, tilt_h, head_z - neck_z] at: [0, tilt_h / 2, (neck_z + head_z) / 2]})], 0), ground, 0)
+
+// The head: a round face with a nose, under a three-pointed hat whose points end in bells. The
+// skull starts at the head's pin, where it holds its own knuckle; the head strings' eyelets go
+// down through the side bells, upright on the plate.
+let skull = m.ellipsoid({radii: [14mm, 13mm, 14mm] at: [0, 12mm, head_z + 14mm]})
+let head_hub = m.cylinder({radius: vr height: tilt_h at: [0, tilt_h / 2, head_z]})
+let nose = m.sphere({radius: 3.2mm at: [0, 24.6mm, head_z + 12mm]})
+let cap = m.ellipsoid({radii: [14.5mm, 10mm, 8mm] at: [0, 10mm, head_z + 25mm]})
+let horns = for s in [-1, 0, 1] {
+    m.ellipsoid({radii: [4mm, 6mm, 13mm] at: [s * 13mm, 6mm, head_z + 33mm - abs(s) * 5mm] rotate: [0, s * 55°, 0]})
+}
+let bell_at = for s in [-1, 0, 1] { [s * 23mm, 3.5mm, head_z + 44mm - abs(s) * 11mm] }
+let bells = for at in bell_at { m.sphere({radius: 4mm at: at}) }
+let head_eyes = [bell_at[0] bell_at[2]]
+let head_shape = m.carve(m.blend([skull head_hub nose cap horns[0] horns[1] horns[2] bells[0] bells[1] bells[2]], 2.5mm), [ground eyelet(head_eyes[0], 20mm) eyelet(head_eyes[1], 20mm)], 0)
+
+// Arms: upper arms; forearms ending in mittens with a hole each for the hand strings.
+let upper_arms = for s in [-1, 1] { limb(s * arm[0], s * arm[1], shoulder_z, elbow_z, 8mm) }
+let hand_eyes = for s in [-1, 1] { [s * (fore[0] + fore[1]) / 2, 3.5mm, 1mm] }
+let fore_arms = for i in 0..2 {
+    let s = i * 2 - 1
+    let hand = m.ellipsoid({radii: [4.6mm, 7mm, 6mm] at: [s * (fore[0] + fore[1]) / 2, 0, 2mm]})
+    let shape = m.carve(m.blend([column(s * fore[0], s * fore[1], elbow_z) m.ellipsoid({radii: [3.6mm, 7.5mm, 9mm] at: [s * (fore[0] + fore[1]) / 2, 0, 12mm]}) hand], 2mm), ground, 0)
+    m.subtract(shape, eyelet(hand_eyes[i], 40mm))
+}
+// Legs: thighs with a hole above the knee for the knee strings; shins ending in curled shoes.
+let knee_eyes = for s in [-1, 1] { [s * 8mm, jy, knee_z + 10mm] }
+let thighs = for i in 0..2 {
+    let s = i * 2 - 1
+    m.subtract(limb(s * thigh[0], s * thigh[1], hip_z, knee_z, 9mm), eyelet(knee_eyes[i], 40mm))
+}
+let shins = for s in [-1, 1] {
+    let leg = m.ellipsoid({radii: [4.5mm, 8mm, 14mm] at: [s * 8mm, 0, (knee_z + ankle_z) / 2]})
+    let shoe = m.ellipsoid({radii: [5.5mm, 13mm, 6mm] at: [s * 8mm, 0, ankle_z - 3mm]})
+    let toe = m.sphere({radius: 2.6mm at: [s * 8mm, 14mm, ankle_z + 2mm]})
+    m.carve(m.blend([column(s * shin[0], s * shin[1], knee_z) leg shoe toe], 2.5mm), ground, 0)
+}
+
+// The joints.
+let nod = m.hinge(torso_shape, ruff, {at: [0, jy, neck_z] axis: [1, 0, 0] pin: pin lower: -35° upper: 35°})
+let tilt = m.hinge(ruff, head_shape, {at: [0, jy, head_z] pin: 1.6mm lower: -25° upper: 25°})
+let shoulders = for i in 0..2 { m.hinge(torso_shape, upper_arms[i], {at: [(i * 2 - 1) * (arm[0] + arm[1]) / 2, jy, shoulder_z] axis: [1, 0, 0] pin: pin}) }
+let elbows = for i in 0..2 { m.hinge(upper_arms[i], fore_arms[i], {at: [(i * 2 - 1) * (fore[0] + fore[1]) / 2, jy, elbow_z] axis: [1, 0, 0] pin: pin}) }
+let hips = for i in 0..2 { m.hinge(torso_shape, thighs[i], {at: [(i * 2 - 1) * (thigh[0] + thigh[1]) / 2, jy, hip_z] axis: [1, 0, 0] pin: pin}) }
+let knees = for i in 0..2 { m.hinge(thighs[i], shins[i], {at: [(i * 2 - 1) * (shin[0] + shin[1]) / 2, jy, knee_z] axis: [1, 0, 0] pin: pin}) }
+
+object(torso_shape, name: "Marionette")
+
+// The control: a bar to hold, a head bar across its front with the head and back strings' holes,
+// a hand bar, and a leg bar that swivels on an upright pin at the bar's end (rock it to walk).
+let cx = 62mm
+let bar_h = 7mm
+let hole_y = bar_h / 2
+let head_bar_z = 44mm
+let hand_bar_z = 14mm
+let main_bar = m.box({size: [8mm, bar_h, 120mm] radius: 1.5mm at: [cx, bar_h / 2, -10mm]})
+let head_bar = m.box({size: [56mm, bar_h, 8mm] radius: 1.5mm at: [cx, bar_h / 2, head_bar_z]})
+let hand_bar = m.box({size: [70mm, bar_h, 8mm] radius: 1.5mm at: [cx, bar_h / 2, hand_bar_z]})
+let swivel = m.cylinder({radius: vr height: bar_h at: [cx, bar_h / 2, -74mm]})
+let control_shape = m.union(main_bar, [head_bar hand_bar swivel])
+// the strings' holes: the head strings' at the head bar's ends, the back string's where it crosses the
+// main bar, the hand strings' at the hand bar's ends (and one more down the bar)
+let head_holes = for s in [-1, 1] { [cx + s * 24mm, hole_y, head_bar_z] }
+let back_hole = [cx, hole_y, head_bar_z]
+let hand_holes = for s in [-1, 1] { [cx + s * 31mm, hole_y, hand_bar_z] }
+let control_holes = for at in [head_holes[0] head_holes[1] back_hole hand_holes[0] hand_holes[1] [cx, hole_y, -64mm]] { eyelet(at, 20mm) }
+let control = m.subtract(control_shape, control_holes)
+let leg_bar_shape = m.union(m.box({size: [60mm, bar_h, 7mm] radius: 1.5mm at: [cx, bar_h / 2, -79mm]}), m.cylinder({radius: vr height: bar_h at: [cx, bar_h / 2, -74mm]}))
+let knee_holes = for s in [-1, 1] { [cx + s * 26mm, hole_y, -80mm] }
+let leg_bar = m.subtract(leg_bar_shape, for at in knee_holes { eyelet(at, 20mm) })
+let leg_swivel = m.hinge(control, leg_bar, {at: [cx, 0, -74mm] pin: 1.6mm lower: -40° upper: 40°})
+// A puppeteer holds it: it stays where it printed until it is lifted or carried, and where it is let go.
+m.anchor(control, {at: [cx, bar_h / 2, -10mm] held: true})
+object(control, name: "Control")
+
+// ---- the strings
+// The back string runs from the control's hole in the middle of the head bar to the torso's; the head strings
+// from the head bar's ends to the side bells, the hand strings from the hand bar's ends to the
+// mittens, the knee strings from the leg bar's ends to the thighs. The back string is String length
+// long. Each other one is as long as it is from its hole in the control to its eyelet with the
+// jester upright under the control, hung straight down from its back string: its head (+Z) up (+Y),
+// its front (+Y) towards the leg bar (-Z). The holes and eyelets are the ones cut above, so the
+// jester hangs upright whatever its proportions.
+let string_len = param(160mm, min: 140mm, max: 300mm, step: 5mm, label: "String length", group: "Strings", hint: "the back string's; the others follow from it, so the jester hangs upright under the control")
+fn upright(p) { [p[0] + back_hole[0] - back_eye[0], p[2] + back_hole[1] - string_len - back_eye[2], back_hole[2] + back_eye[1] - p[1]] }
+fn hung(a, from, b, eye) {
+    let u = upright(eye)
+    let d = [u[0] - from[0], u[1] - from[1], u[2] - from[2]]
+    m.string(a, b, {from: from to: eye length: sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2])})
+}
+let back_string = m.string(control, torso_shape, {from: back_hole to: back_eye length: string_len})
+let head_strings = for i in 0..2 { hung(control, head_holes[i], head_shape, head_eyes[i]) }
+let hand_strings = for i in 0..2 { hung(control, hand_holes[i], fore_arms[i], hand_eyes[i]) }
+let knee_strings = for i in 0..2 { hung(leg_bar, knee_holes[i], thighs[i], knee_eyes[i]) }
+
+// ---- the paint
+let red = Material{albedo: [0.78 0.08 0.1] name: "Red"}
+let yellow = Material{albedo: [0.96 0.78 0.12] name: "Yellow"}
+let blue = Material{albedo: [0.1 0.25 0.7] name: "Blue"}
+let green = Material{albedo: [0.12 0.55 0.28] name: "Green"}
+let skin = Material{albedo: [0.95 0.78 0.64] name: "Skin"}
+let white = Material{albedo: [0.94 0.94 0.92] name: "White"}
+let dark = Material{albedo: [0.1 0.08 0.1] name: "Dark"}
+let pink = Material{albedo: [0.93 0.45 0.52] name: "Pink"}
+let gold = Material{albedo: [0.85 0.62 0.15] metal: 0.6 rough: 0.35 name: "Gold"}
+let c_a = red
+let c_b = yellow
+let c_left = if materials >= 9 { blue } else { c_a }
+let c_right = if materials >= 9 { green } else { c_b }
+let face = if materials >= 4 { skin } else { c_b }
+let ink = if materials >= 4 { dark } else { c_a }
+let frill = if materials >= 9 { white } else { c_b }
+let bell = if materials >= 9 { gold } else { c_b }
+let blush = if materials >= 9 { pink } else { c_a }
+// The costume's top: under it the cloth's two colours print alone (under nine materials a glove
+// or a shoe takes the motley's other colour, not a third that would share all their layers),
+// over it the face.
+let face_y = 16.8mm
+let layered = materials < 9
+
+// The costume: harlequin diamonds through the cloth (sharp, in whole patches).
+m.fill(m.box({size: [100mm, 60mm, 300mm] at: [0, 20mm, 0]}), Mix{materials: [c_a c_b] field: fn(p) {
+    let u = floor((p.x + p.z) / diamond)
+    let v = floor((p.x - p.z) / diamond)
+    return fract((u + v) * 0.5) * 2
+} sharp: 1})
+// Sleeves and stockings, one side of the motley each colour.
+m.fill(fore_arms[0], c_left)
+m.fill(shins[0], c_left)
+m.fill(fore_arms[1], c_right)
+m.fill(shins[1], c_right)
+for i in 0..2 {
+    let s = i * 2 - 1
+    let other = if i == 0 { c_right } else { c_left }
+    m.fill(m.ellipsoid({radii: [6mm, 8mm, 7mm] at: [s * (fore[0] + fore[1]) / 2, 0, 2mm]}), if layered { other } else { white })
+    m.fill(m.ellipsoid({radii: [7mm, 15mm, 8mm] at: [s * 8mm, 0, ankle_z - 3mm]}), if layered { other } else { ink })
+}
+m.fill(ruff, frill)
+// The hat: its points in the motley's colours, gold bells.
+m.fill(m.ellipsoid({radii: [16mm, 12mm, 10mm] at: [0, 10mm, head_z + 25mm]}), c_a)
+m.fill(horns[0], c_left)
+m.fill(horns[1], c_b)
+m.fill(horns[2], c_right)
+for b in bells { m.fill(b, bell) }
+// The face: over the costume's top the head is the hat's colour, then skin under the hat's
+// brim, blushing cheeks, eyes, a red nose and a smile; under it the hood.
+m.fill(m.box({size: [60mm, 40mm, 80mm] at: [0, face_y + 20mm, head_z + 20mm]}), c_a)
+let face_box = m.box({size: [40mm, 40mm, 16mm] at: [0, face_y + 20mm, head_z + 10mm]})
+m.fill(face_box, face)
+m.fill(face_box, Mix{materials: [face blush] field: fn(p) {
+    let q = vec3(abs(p.x) - 7.5mm, p.y - 22mm, p.z - head_z - 8mm)
+    return clamp(1.25 - length(q) / 4mm, 0, 1)
+}})
+for s in [-1, 1] {
+    m.fill(m.sphere({radius: 2.6mm at: [s * 5mm, 24mm, head_z + 16mm]}), if materials >= 9 { white } else { face })
+    // the pupil's centre just over the face, so it paints a dot there
+    m.fill(m.sphere({radius: 1.4mm at: [s * 5mm, 24.2mm, head_z + 16.4mm]}), ink)
+}
+m.fill(nose, c_a)
+m.fill(m.sdf({bounds: [[-8mm, face_y, head_z], [8mm, 27mm, head_z + 9mm]] field: fn(p) {
+    let d = length(vec2(p.x, p.z - head_z - 9.5mm)) - 5.5mm
+    return max(abs(d) - 0.7mm, p.z - head_z - 7mm)
+}}), ink)
+// The control: plain wood with gold string holes.
+m.fill(control, if materials >= 9 { gold } else { c_b })
+m.fill(leg_bar, if materials >= 9 { gold } else { c_b })

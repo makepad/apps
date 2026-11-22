@@ -1,0 +1,14 @@
+// A flexing banded snake: onyx beads with gold bands, an ivory belly and coral caps, fused to a
+// TPU cord that bends between them every way and forks into its tongue.
+use mod.fab.*
+
+script("flex_snake.cad.splash")
+
+color("Onyx", rgb: #x1a1a20)
+color("Gold", rgb: #xe0ad2a)
+color("Coral", rgb: #xd8452b)
+color("Ivory", rgb: #xede3c8)
+color("Ember", rgb: #xb81c14, material: "TPU")
+
+// Its first layer prints its paint too: the ivory belly reaches the bed.
+place("flex_snake", at: [250mm 100mm], name: "Flex snake", color: "Onyx", settings: {fab_paint_first_layer: true})

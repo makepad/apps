@@ -1,0 +1,49 @@
+// An egg covered in scales set as a sunflower sets its seeds: each scale the golden angle round
+// from the one before, climbing the egg, so they run in crossing spirals; green scales outlined
+// in gold, with a share of them gold through. Two filaments; the scales' size, seed and the gilded
+// share are its knobs. The egg stands on a flat cut through its round end, where the skin leans
+// out 40 degrees from upright, so it prints with nothing under it. One distance field (a circle
+// below, two arcs and a rounded tip above, turned round the upright axis): it renders and edits
+// live.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let width = param(52mm, min: 30mm, max: 100mm, step: 0.5mm, label: "Width", group: "Egg")
+let tip = param(10mm, min: 4mm, max: 20mm, step: 0.5mm, label: "Tip", group: "Egg", kind: "radius", hint: "the rounding of the narrow end: smaller points it more")
+let spacing = param(7mm, min: 4mm, max: 16mm, step: 0.5mm, label: "Scale", group: "Scales", hint: "how far from one scale's middle to the next")
+let gilded = param(0.15, min: 0, max: 0.6, step: 0.05, label: "Gilded", group: "Scales", hint: "the share of the scales that are gold through")
+let seed = param(3, min: 1, max: 999, step: 1, label: "Seed", group: "Scales", kind: "seed", hint: "another whole number turns the spiral and picks other gold scales")
+
+// the round end: a circle `round` wide about the centre, `lift` over the bed where its skin leans
+// out 40 degrees; the narrow end: arcs twice as wide from beside the centre up to the tip's circle
+let round = width / 2
+let point = min(tip, round * 0.6)
+let arc = round - point
+let lift = round * 0.6428
+let tall = lift + sqrt(3) * arc + point
+
+let egg = m.sdf({
+    bounds: [[-round - 1mm, 0mm, -round - 1mm], [round + 1mm, tall + 1mm, round + 1mm]]
+    cell: 0.6mm
+    field: fn(p) {
+        let q = vec2(length(vec2(p.x, p.z)), p.y - lift)
+        var d = length(vec2(q.x + arc, q.y)) - 2 * arc
+        if q.y < 0 {
+            d = length(q) - arc
+        }
+        if sqrt(3) * (q.x + arc) < q.y {
+            d = length(vec2(q.x, q.y - sqrt(3) * arc))
+        }
+        return max(d - point, 0 - p.y)
+    }
+})
+
+handle(width, Ring{center: [0, lift, 0] radius: round})
+
+object(egg)
+
+let jade = Material{albedo: [0.18 0.45 0.33] name: "Jade"}
+let gold = Material{albedo: [0.85 0.64 0.25] name: "Gold"}
+m.fill(egg, Mix{materials: [jade gold] field: Scales{preset: @spiral scale: spacing seed: seed fill: gilded} sharp: 1})

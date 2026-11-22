@@ -1,0 +1,22 @@
+// Bring up the evaluated controller: duty is the fraction of each period spent HIGH.
+bench("bringup", {circuit: "ledctl" run: {stop: 20ms}}, fn(b, c) {
+    let duty = [0.0 1.0 0.1 0.25 0.3 0.5 0.75 0.9]
+    let pins = {}
+    for i in 0..8 {
+        pins["PA" + i] = if duty[i] == 0.0 { b.low() }
+                        else if duty[i] == 1.0 { b.high() }
+                        else { b.pwm(1kHz, duty[i]) }
+    }
+    let inputs = {PB7: b.input(@up) NRST: b.input(@up) PA13: b.input(@up)
+                  PA14: b.input(@down) BOOT0: b.input(@none)}
+    for pin in [@PB7 @NRST @PA13 @PA14 @BOOT0] { pins[pin] = inputs[pin] }
+    b.stub(c.mcu.u, pins)
+
+    // The LEDs sink into the controller: the LOW fraction lights them.
+    for i in 0..8 {
+        b.expect("LED" + i, b.mean(b.i(c.lamps[i].d), {window: 1ms after: 5ms}),
+                 {min: (1.0 - duty[i]) * 4.5mA max: (1.0 - duty[i]) * 5.5mA})
+    }
+    b.expect("3V3 up", b.mean(b.v(c.net("3V3")), {window: 1ms after: 5ms}),
+             {min: 3.2V max: 3.4V})
+})

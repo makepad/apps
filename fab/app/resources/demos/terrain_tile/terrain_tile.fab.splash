@@ -1,0 +1,11 @@
+// A made-up landscape tile, coloured by height in four filaments: lake, grass, rock and snow.
+use mod.fab.*
+
+script("terrain_tile.cad.splash")
+
+color("Lake", rgb: #x1f5ca8)
+color("Grass", rgb: #x528c38)
+color("Rock", rgb: #x80786e)
+color("Snow", rgb: #xf2f4f7)
+
+place("terrain_tile", at: [175mm 160mm], name: "Terrain tile", color: "Lake")

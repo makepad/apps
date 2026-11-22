@@ -1,0 +1,536 @@
+// drum16's building blocks: an analog drum machine on one 5 V supply. Every voice is a textbook
+// topology dimensioned here from its formulas; the voices swing round a buffered signal ground at
+// half the supply. A block's own nets have no names: each is named by its binding (`drum.inn`),
+// so one block can be made several times in a unit.
+let e = mod.elec
+
+// The voices' signal ground: half the analog supply, held by a capacitor and buffered by one
+// op-amp section, so every voice can swing both ways on a single supply.
+let signal_ground = e.block({
+    name: "Signal ground"
+    ports: {va: e.port(@power_in) gnd: e.port(@ground) ref: e.port(@power_out)}
+    params: {r: 10kohm c: 10uF}
+    build: fn(p, o) {
+        let mid  = e.net()
+        let top  = e.r(o.r, p.va, mid, {package: "0402"})
+        let bot  = e.r(o.r, mid, p.gnd, {package: "0402"})
+        let hold = e.c(o.c, mid, p.gnd, {package: "0805"})
+        let u    = e.part(mod.std.opamp_sot23(), {pins: {INP: mid INN: p.ref OUT: p.ref VDD: p.va VSS: p.gnd}})
+        let dec  = e.c(100nF, p.va, p.gnd, {package: "0402"})
+        e.near(dec, u, 3mm)
+    }
+    sheet: {flow: @right ports: {va: @top gnd: @bottom ref: @right}}
+})
+
+// A ringing filter: an inverting multiple-feedback band-pass with its + input on the signal ground,
+// which rings when a trigger pulse strikes it (the bridged-T drum). From the textbook formulas,
+// with Rp = r1 || r3:
+//   f0 = 1 / (2 pi c sqrt(r2 Rp)),  Q = pi f0 c r2,  decay time constant r2 c,
+//   peak about v tp / (r1 c) for a pulse of v volts lasting tp, well under a period.
+// So r1 sets the level, r3 the pitch without the decay, and r2 the decay (moving the pitch with
+// it). Its values here are the high tom's: 167 Hz, 50 ms.
+let ringer = e.block({
+    name: "Ringing filter"
+    ports: {
+        trig: e.port(@in)
+        out:  e.port(@out)
+        ref:  e.port(@power_in)
+        va:   e.port(@power_in)
+        gnd:  e.port(@ground)
+    }
+    params: {c: 33nF r1: 68kohm r2: 1.5Mohm r3: 560ohm}
+    build: fn(p, o) {
+        let a   = e.net()
+        let inn = e.net()
+        let r1  = e.r(o.r1, p.trig, a, {package: "0402"})
+        let r3  = e.r(o.r3, a, p.ref, {package: "0402"})
+        let ca  = e.c(o.c, a, inn, {package: "0805"})
+        let cb  = e.c(o.c, a, p.out, {package: "0805"})
+        let r2  = e.r(o.r2, p.out, inn, {package: "0402"})
+        let u   = e.part(mod.std.opamp_sot23(), {pins: {INP: p.ref INN: inn OUT: p.out VDD: p.va VSS: p.gnd}})
+        e.near(ca, u, 4mm)
+        e.near(cb, u, 4mm)
+    }
+    sheet: {flow: @right ports: {trig: @left out: @right ref: @bottom va: @top gnd: @bottom}}
+})
+
+// The kick: a ringing filter tuned low, with two pots on the panel. DECAY is r2's turnable part
+// (r2 = 470 kohm + up to 1 Mohm: 47 to 147 ms, the pitch falling as the decay grows), TUNE is r3's
+// (330 ohm + up to 1 kohm, less as it turns: 41 up to 81 Hz). Each pot is wired as a variable
+// resistor that a clockwise turn (toward B, pin 3) turns up: DECAY its A-W half, its B end on its
+// wiper; TUNE its W-B half, its A end on its wiper. At their starting places r2 is 1.2 Mohm and r3 680 ohm: 56 Hz, Q 21, 120 ms, and
+// a 1 ms trigger of 3.4 V peaks at 1.55 V (5 V, an accent, reaches 2.3 V, near the rails).
+let kick_ringer = e.block({
+    name: "Kick"
+    ports: {
+        trig: e.port(@in)
+        out:  e.port(@out)
+        ref:  e.port(@power_in)
+        va:   e.port(@power_in)
+        gnd:  e.port(@ground)
+    }
+    params: {c: 100nF r1: 22kohm r2: 470kohm decay: 1Mohm r3: 330ohm tune: 1kohm}
+    build: fn(p, o) {
+        let a     = e.net()
+        let inn   = e.net()
+        let d     = e.net()
+        let t     = e.net()
+        let r1    = e.r(o.r1, p.trig, a, {package: "0402"})
+        let r3    = e.r(o.r3, a, t, {package: "0402"})
+        let tune  = e.part(mod.std.pot_9mm(), {value: o.tune pins: {A: p.ref W: p.ref B: t}
+                                                fields: {pos: "0.65" taper: "lin" label: "TUNE"}})
+        let ca    = e.c(o.c, a, inn, {package: "0805"})
+        let cb    = e.c(o.c, a, p.out, {package: "0805"})
+        let r2    = e.r(o.r2, p.out, d, {package: "0402"})
+        let decay = e.part(mod.std.pot_9mm(), {value: o.decay pins: {A: d W: inn B: inn}
+                                                fields: {pos: "0.73" taper: "lin" label: "DECAY"}})
+        let u     = e.part(mod.std.opamp_sot23(), {pins: {INP: p.ref INN: inn OUT: p.out VDD: p.va VSS: p.gnd}})
+        e.near(ca, u, 4mm)
+        e.near(cb, u, 4mm)
+    }
+    sheet: {flow: @right ports: {trig: @left out: @right ref: @bottom va: @top gnd: @bottom}}
+})
+
+// One stage of the noise source: a non-inverting gain of 1 + rf / rg, its rg leg through cg to
+// the signal ground so the gain at DC is 1 and the stage's output sits on that ground.
+let noise_stage = e.block({
+    name: "Noise gain stage"
+    ports: {
+        inp: e.port(@in)
+        out: e.port(@out)
+        ref: e.port(@power_in)
+        va:  e.port(@power_in)
+        gnd: e.port(@ground)
+    }
+    params: {rf: 30kohm rg: 1kohm cg: 10uF}
+    build: fn(p, o) {
+        let fb = e.net()
+        let g  = e.net()
+        let rf = e.r(o.rf, p.out, fb, {package: "0402"})
+        let rg = e.r(o.rg, fb, g, {package: "0402"})
+        let cg = e.c(o.cg, g, p.ref, {package: "0805"})
+        let u  = e.part(mod.std.opamp_sot23(), {pins: {INP: p.inp INN: fb OUT: p.out VDD: p.va VSS: p.gnd}})
+    }
+    sheet: {flow: @right ports: {inp: @left out: @right ref: @bottom va: @top gnd: @bottom}}
+})
+
+// A noise source: the thermal noise of a 1 Mohm resistor on the signal ground (129 nV per root
+// hertz), raised by three stages of 31. Each stage's bandwidth is the op-amp's 1 MHz over 31;
+// three such poles leave a noise bandwidth of 19 kHz, so the output carries about 0.53 V rms. A
+// real build guards the first stage with its own ground pour, far from the digital lines: the
+// gain is 30 000.
+let noise_source = e.block({
+    name: "Noise source"
+    ports: {
+        out: e.port(@out)
+        ref: e.port(@power_in)
+        va:  e.port(@power_in)
+        gnd: e.port(@ground)
+    }
+    params: {r: 1Mohm}
+    build: fn(p, o) {
+        let hiss = e.net()
+        let s1   = e.net()
+        let s2   = e.net()
+        let r    = e.r(o.r, hiss, p.ref, {package: "0402" fields: {noise: "thermal"}})
+        let st1  = noise_stage({inp: hiss out: s1 ref: p.ref va: p.va gnd: p.gnd})
+        let st2  = noise_stage({inp: s1 out: s2 ref: p.ref va: p.va gnd: p.gnd})
+        let st3  = noise_stage({inp: s2 out: p.out ref: p.ref va: p.va gnd: p.gnd})
+    }
+    sheet: {flow: @right ports: {out: @right ref: @bottom va: @top gnd: @bottom}}
+})
+
+// An envelope gate, the noise and metal voices' amplifier. A trigger charges c_env through an NPN
+// follower (its base-emitter junction is the diode); a second NPN, switched by the sound source,
+// chops the envelope at the output through rc: the output is the source's pattern times the
+// envelope. The voice's discharge resistor goes on env. With the chopper on about half the time,
+// the envelope falls with the time constant c_env (2 rc || r_dis). Where the source switches the
+// chopper is set by r_src and r_bias: with the default 100k a source above about 0.7 V does.
+let gate_cell = e.block({
+    name: "Envelope gate"
+    ports: {
+        trig: e.port(@in)
+        src:  e.port(@in)
+        env:  e.port(@out)
+        out:  e.port(@out)
+        va:   e.port(@power_in)
+        gnd:  e.port(@ground)
+    }
+    params: {c_env: 470nF rc: 100kohm rt: 1kohm r_src: 10kohm r_bias: 100kohm}
+    build: fn(p, o) {
+        let tb   = e.net()
+        let cb   = e.net()
+        let rt   = e.r(o.rt, p.trig, tb, {package: "0402"})
+        let q1   = e.part(mod.std.npn_sot23(), {pins: {B: tb C: p.va E: p.env}})
+        let cenv = e.c(o.c_env, p.env, p.gnd, {package: "0805"})
+        let rc   = e.r(o.rc, p.env, p.out, {package: "0402"})
+        let rsrc = e.r(o.r_src, p.src, cb, {package: "0402"})
+        let rb   = e.r(o.r_bias, cb, p.gnd, {package: "0402"})
+        let q2   = e.part(mod.std.npn_sot23(), {pins: {B: cb C: p.out E: p.gnd}})
+    }
+    sheet: {flow: @right ports: {trig: @left src: @left env: @top out: @right va: @top gnd: @bottom}}
+})
+
+// The metal bank: six Schmitt-trigger RC oscillators on one hex inverter, each with its own r and
+// a shared c. With the inverter's thresholds VT+ and VT- on a supply VDD each runs at
+//   f = 1 / (r c ln((VT+ (VDD - VT-)) / (VT- (VDD - VT+))))
+// which is about 1.01 / (r c) at the library's 2.9 V and 1.7 V on 5 V: 307, 423, 507, 634, 845
+// and 1114 Hz, an inharmonic set of our own. Their square waves sum through rm each into rl, so
+// the mix steps about 0.4 V for each oscillator that is high. The four fastest also sum through
+// rm each into a second rl, `hi`, which steps about 0.5 V for each of them that is high.
+let metal_bank = e.block({
+    name: "Metal bank"
+    ports: {
+        mix: e.port(@out)
+        hi:  e.port(@out)
+        va:  e.port(@power_in)
+        gnd: e.port(@ground)
+    }
+    params: {c: 10nF rs: [330kohm 240kohm 200kohm 160kohm 120kohm 91kohm] rm: 100kohm rl: 16kohm}
+    build: fn(p, o) {
+        let a = for i in 0..6 { e.net() }
+        let y = for i in 0..6 { e.net() }
+        let u = e.part(mod.std.schmitt_hex_soic14(), {pins: {
+            A1: a[0] Y1: y[0] A2: a[1] Y2: y[1] A3: a[2] Y3: y[2]
+            A4: a[3] Y4: y[3] A5: a[4] Y5: y[4] A6: a[5] Y6: y[5]
+            VCC: p.va GND: p.gnd
+        }})
+        let rt  = for i in 0..6 { e.r(o.rs[i], y[i], a[i], {package: "0402"}) }
+        let ct  = for i in 0..6 { e.c(o.c, a[i], p.gnd, {package: "0805"}) }
+        let rm  = for i in 0..6 { e.r(o.rm, y[i], p.mix, {package: "0402"}) }
+        let rl  = e.r(o.rl, p.mix, p.gnd, {package: "0402"})
+        let rh  = for i in 2..6 { e.r(o.rm, y[i], p.hi, {package: "0402"}) }
+        let rlh = e.r(o.rl, p.hi, p.gnd, {package: "0402"})
+        let dec = e.c(100nF, p.va, p.gnd, {package: "0402"})
+        e.near(dec, u, 3mm)
+    }
+    sheet: {flow: @right ports: {mix: @right hi: @right va: @top gnd: @bottom}}
+})
+
+// The low tom: an inverting multiple-feedback band-pass ringing filter, its + input on the
+// signal ground. With Rp = r1 || r3, where r3 includes the pot's W-B resistance:
+//   f0 = 1 / (2 pi c sqrt(r2 Rp)), Q = pi f0 c r2, decay time constant r2 c,
+//   ring v tp / (r1 c) for a pulse of v volts lasting tp, well under a period (times
+//   sin(x) / x, x = pi f0 tp, for a longer one).
+// Here c is 47 nF, r1 47 kohm and r2 1.5 Mohm. TOM TUNE adds a 500 ohm linear pot to r3's
+// 470 ohm resistor, its A and W on the signal ground, so pitch turns without changing decay and
+// a clockwise turn (toward B) raises it. The pot keeps 0.005 of its track at each end:
+// W-B = 500 (0.005 + 0.99 (1 - pos)) ohm. For r3 near 680 ohm,
+// pos = 1 - ((680 - 470) / 500 - 0.005) / 0.99 = 0.581 to three decimals.
+// At that place r3 is 679.905 ohm: about 107 Hz, 70.5 ms, and a 1.41 V first swing from a
+// 3.4 V, 1 ms trigger. Turning the pot moves the filter's input bias, so a turn rings it softly.
+let tom_ringer = e.block({
+    name: "Low tom"
+    ports: {
+        trig: e.port(@in)
+        out:  e.port(@out)
+        ref:  e.port(@power_in)
+        va:   e.port(@power_in)
+        gnd:  e.port(@ground)
+    }
+    params: {c: 47nF r1: 47kohm r2: 1.5Mohm r3: 470ohm tune: 500ohm}
+    build: fn(p, o) {
+        let a    = e.net()
+        let inn  = e.net()
+        let t    = e.net()
+        let r1   = e.r(o.r1, p.trig, a, {package: "0402"})
+        let r3   = e.r(o.r3, a, t, {package: "0402"})
+        let tune = e.part(mod.std.pot_9mm(), {value: o.tune pins: {A: p.ref W: p.ref B: t}
+                                               fields: {pos: "0.581" taper: "lin" label: "TOM TUNE"}})
+        let ca   = e.c(o.c, a, inn, {package: "0805"})
+        let cb   = e.c(o.c, a, p.out, {package: "0805"})
+        let r2   = e.r(o.r2, p.out, inn, {package: "0402"})
+        let u    = e.part(mod.std.opamp_sot23(), {pins: {INP: p.ref INN: inn OUT: p.out VDD: p.va VSS: p.gnd}})
+        e.near(ca, u, 4mm)
+        e.near(cb, u, 4mm)
+    }
+    sheet: {flow: @right ports: {trig: @left out: @right ref: @bottom va: @top gnd: @bottom}}
+})
+
+// The snare: a ringing filter for the drum's body and a noise burst for its snares, both struck by
+// one trigger. The body rings at 188 Hz and falls to a third in 33 ms; the noise, chopped by the
+// trigger's envelope, falls in about 40 ms. Both go into a mixer's summing node (`sum`, an
+// inverting summer on the signal ground): the body through r_body, the burst high-passed at about
+// 1.4 kHz on its way through SNAP (its W-B half: turned up, less resistance) and r_snap. `noise` is
+// the burst before its gate, `env` the gate's envelope.
+let snare_voice = e.block({
+    name: "Snare"
+    ports: {
+        trig:  e.port(@in)
+        sum:   e.port(@out)
+        noise: e.port(@out)
+        env:   e.port(@out)
+        ref:   e.port(@power_in)
+        va:    e.port(@power_in)
+        gnd:   e.port(@ground)
+    }
+    params: {r_body: 33kohm r_snap: 10kohm}
+    build: fn(p, o) {
+        let body  = e.net()
+        let chop  = e.net()
+        let hp    = e.net()
+        let sw    = e.net()
+        let drum  = ringer({trig: p.trig out: body ref: p.ref va: p.va gnd: p.gnd c: 22nF r1: 100kohm r2: 1.5Mohm r3: 1kohm})
+        let hiss  = noise_source({out: p.noise ref: p.ref va: p.va gnd: p.gnd})
+        let gate  = gate_cell({trig: p.trig src: p.noise env: p.env out: chop va: p.va gnd: p.gnd c_env: 470nF r_src: 33kohm r_bias: 10kohm})
+        let rdis  = e.r(150kohm, p.env, p.gnd, {package: "0402"})
+        let rbody = e.r(o.r_body, body, p.sum, {package: "0402"})
+        let chp   = e.c(3.3nF, chop, hp, {package: "0402"})
+        let snap  = e.part(mod.std.pot_9mm(), {value: 50kohm pins: {A: hp W: hp B: sw}
+                                               fields: {pos: "0.5" taper: "lin" label: "SNAP"}})
+        let rsnap = e.r(o.r_snap, sw, p.sum, {package: "0402"})
+    }
+    sheet: {flow: @right ports: {trig: @left sum: @right noise: @top env: @top ref: @bottom va: @top gnd: @bottom}}
+})
+
+// The metal voices: the hats and the cymbal, on one metal bank.
+// - The hats gate the bank's six square waves twice. The closed hat's envelope falls in about
+//   30 ms; the open hat's in 150 to 370 ms as HAT DECAY turns, and a closed hat chokes it (an NPN on
+//   the closed hat's trigger empties the open hat's envelope).
+// - The cymbal gates the four fastest with a long envelope, c_env 4.7 uF, into a ringing filter
+//   used as a band-pass (c 2.2 nF, r1 22k, r2 68k, r3 5.1k: 4.3 kHz, Q 2); 100 nF keeps the gate's
+//   DC out of it. Its chopper conducts while two or more of the four are high, about 5/8 of the
+//   time. The envelope falls through 470k always, through rc into the chopper while it conducts
+//   and into the filter's input while it does not: tau about 0.43 s, a little over
+//   c_env (rc || 470k).
+// All three feed one inverting stage on the signal ground: the hats through 2.2 nF into 10k each, a
+// high-pass at about 7 kHz that keeps the metal's edges, and the cymbal through 47k, low enough
+// that a closed hat struck while it rings still stands out above 5 kHz. `out` is its output,
+// `oenv` the open hat's envelope.
+let metal_voices = e.block({
+    name: "Hats and cymbal"
+    ports: {
+        ctrig: e.port(@in)
+        otrig: e.port(@in)
+        cym:   e.port(@in)
+        out:   e.port(@out)
+        oenv:  e.port(@out)
+        ref:   e.port(@power_in)
+        va:    e.port(@power_in)
+        gnd:   e.port(@ground)
+    }
+    build: fn(p, o) {
+        let mix    = e.net()
+        let hi     = e.net()
+        let cenv   = e.net()
+        let cchop  = e.net()
+        let ochop  = e.net()
+        let odis   = e.net()
+        let chokeb = e.net()
+        let chp    = e.net()
+        let ohp    = e.net()
+        let yenv   = e.net()
+        let ychop  = e.net()
+        let yin    = e.net()
+        let yout   = e.net()
+        let sum    = e.net()
+        let metal  = metal_bank({mix: mix hi: hi va: p.va gnd: p.gnd})
+        let closed = gate_cell({trig: p.ctrig src: mix env: cenv out: cchop va: p.va gnd: p.gnd c_env: 220nF})
+        let open   = gate_cell({trig: p.otrig src: mix env: p.oenv out: ochop va: p.va gnd: p.gnd c_env: 2.2uF})
+        let cdis   = e.r(470kohm, cenv, p.gnd, {package: "0402"})
+        // the open hat's discharge: 100k and HAT DECAY's A-W half (turned up, longer)
+        let odr    = e.r(100kohm, p.oenv, odis, {package: "0402"})
+        let decay  = e.part(mod.std.pot_9mm(), {value: 1Mohm pins: {A: odis W: p.gnd B: p.gnd}
+                                                 fields: {pos: "0.5" taper: "lin" label: "HAT DECAY"}})
+        let rchoke = e.r(10kohm, p.ctrig, chokeb, {package: "0402"})
+        let choke  = e.part(mod.std.npn_sot23(), {pins: {B: chokeb C: p.oenv E: p.gnd}})
+        let cymg   = gate_cell({trig: p.cym src: hi env: yenv out: ychop va: p.va gnd: p.gnd c_env: 4.7uF})
+        let ydis   = e.r(470kohm, yenv, p.gnd, {package: "0402"})
+        let yc     = e.c(100nF, ychop, yin, {package: "0402"})
+        let band   = ringer({trig: yin out: yout ref: p.ref va: p.va gnd: p.gnd c: 2.2nF r1: 22kohm r2: 68kohm r3: 5.1kohm})
+        // the output stage
+        let cc     = e.c(2.2nF, cchop, chp, {package: "0402"})
+        let rcc    = e.r(10kohm, chp, sum, {package: "0402"})
+        let co     = e.c(2.2nF, ochop, ohp, {package: "0402"})
+        let rco    = e.r(10kohm, ohp, sum, {package: "0402"})
+        let rcy    = e.r(47kohm, yout, sum, {package: "0402"})
+        let rf     = e.r(6.8kohm, p.out, sum, {package: "0402"})
+        let amp    = e.part(mod.std.opamp_sot23(), {pins: {INP: p.ref INN: sum OUT: p.out VDD: p.va VSS: p.gnd}})
+    }
+    sheet: {flow: @right ports: {ctrig: @left otrig: @left cym: @left out: @right oenv: @top ref: @bottom va: @top gnd: @bottom}}
+})
+
+// ---- The panel: the MCU, the shift chain with its LEDs, the keys, accent and the mix ------------
+
+// The sequencer's MCU on its 16 MHz crystal, with decoupling, the reset pull-up and the six-pin
+// programming header. The crystal part's value is the MCU clock: the bench reads it. Pins:
+// - trig[0..6] PD4 PD5 PD6 PD7 PB0 PB1 PC0: kick, snare, low tom, high tom, closed hat, open hat,
+//   cymbal;
+// - accent PC1; the chain's latch, data and clock PB2, PB3, PB5 (data and clock are also the
+//   header's programming lines: the registers only listen, and the latch stays low meanwhile);
+// - row[0..4] PC2..PC5 and PB4, inputs on the MCU's pull-ups; row 4 goes through 1k, since PB4
+//   is also the header's data-out line;
+// - tempo ADC7 and shuffle ADC6, analog-only inputs: the TEMPO and SHUFFLE pots' wipers, read
+//   against AVCC.
+// The sync jacks' pins (PD2, PD3) wait for their jacks.
+let drum_core = e.block({
+    name: "Sequencer MCU"
+    ports: {
+        vdd:    e.port(@power_in, {volts: [1.8V 5.5V]})
+        gnd:    e.port(@ground)
+        trig:   e.port(@out, {width: 7})
+        accent: e.port(@out)
+        latch:  e.port(@out)
+        data:   e.port(@out)
+        clk:    e.port(@out)
+        row:    e.port(@in, {width: 5})
+        tempo:  e.port(@in)
+        shuffle: e.port(@in)
+    }
+    params: {part: "ATMEGA328P_TQFP32" f_clk: 16MHz c_load: 22pF decoupling: [100nF 100nF 4.7uF]}
+    build: fn(p, o) {
+        let rst   = e.net()
+        let miso  = e.net()
+        let xtal1 = e.net()
+        let xtal2 = e.net()
+        let u = e.part(o.part, {pins: {
+            VCC: p.vdd AVCC: p.vdd GND: p.gnd PC6: rst PB6: xtal1 PB7: xtal2
+            PD4: p.trig[0] PD5: p.trig[1] PD6: p.trig[2] PD7: p.trig[3] PB0: p.trig[4] PB1: p.trig[5] PC0: p.trig[6]
+            PC1: p.accent PB2: p.latch PB3: p.data PB5: p.clk
+            PC2: p.row[0] PC3: p.row[1] PC4: p.row[2] PC5: p.row[3] PB4: miso ADC7: p.tempo ADC6: p.shuffle
+        } nc: [@AREF @PD0 @PD1 @PD2 @PD3]})
+        let r_row4 = e.r(1kohm, miso, p.row[4], {package: "0402"})
+        // the load capacitors are C0G
+        let y      = e.part(mod.std.crystal_part("3225"), {value: o.f_clk pins: [xtal1, xtal2, p.gnd]})
+        let c_x1   = e.c(o.c_load, xtal1, p.gnd, {package: "0402"})
+        let c_x2   = e.c(o.c_load, xtal2, p.gnd, {package: "0402"})
+        let dec    = for v in o.decoupling { let c = e.c(v, p.vdd, p.gnd, {package: "0402"}); e.near(c, u, 3mm); c }
+        let rst_r  = e.r(10kohm, rst, p.vdd, {package: "0402"})
+        // the programming header: data-out, VCC, clock, data-in, reset, GND
+        let isp_j  = e.part(mod.std.header2({pins: 6}), {pins: [miso p.vdd p.clk p.data rst p.gnd]})
+        e.near(y, u.PB6, 3mm)
+        e.near(c_x1, y, 2mm)
+        e.near(c_x2, y, 2mm)
+    }
+    sheet: {flow: @right ports: {vdd: @top gnd: @bottom trig: @right accent: @right latch: @right data: @right clk: @right row: @left tempo: @left shuffle: @left}}
+})
+
+// One LED from a register output to ground through r: 1k at a 5 V output gives about 3 mA, plenty
+// behind a light pipe.
+let chain_led = e.block({
+    name: "Chain LED"
+    ports: {q: e.port(@in)  gnd: e.port(@ground)}
+    params: {r: 1kohm color: @red}
+    build: fn(p, o) {
+        let d = e.led({color: o.color package: "0603"})
+        let r = e.r(o.r, p.q, d.A, {package: "0402"})
+        e.connect(d.K, p.gnd)
+    }
+    sheet: {flow: @down ports: {q: @top gnd: @bottom}}
+})
+
+// The 24-bit chain: three 8-bit shift registers with output latches in series, shifted most
+// significant bit first, so bit n lands on register n / 8's output n % 8 (QA first). Bits 0..15
+// light the 16 step LEDs, 16..19 the PLAY, SHIFT, INST and PATTERN LEDs, and 20..23 drive the key
+// matrix's four columns (low selects one). Its outputs are always enabled and never cleared; the
+// registers run on the digital side beside the MCU, so shifting costs the circuit nothing.
+let step_chain = e.block({
+    name: "Step LEDs and columns"
+    ports: {
+        data:  e.port(@in)
+        clk:   e.port(@in)
+        latch: e.port(@in)
+        col:   e.port(@out, {width: 4})
+        vdd:   e.port(@power_in)
+        gnd:   e.port(@ground)
+    }
+    build: fn(p, o) {
+        let q   = for i in 0..20 { e.net() }
+        let s1  = e.net()
+        let s2  = e.net()
+        let reg = mod.std.shift_latch8_soic16()
+        let u1  = e.part(reg, {pins: {
+            SER: p.data SRCLK: p.clk RCLK: p.latch OE: p.gnd SRCLR: p.vdd VCC: p.vdd GND: p.gnd
+            QA: q[0] QB: q[1] QC: q[2] QD: q[3] QE: q[4] QF: q[5] QG: q[6] QH: q[7] QHS: s1
+        }})
+        let u2  = e.part(reg, {pins: {
+            SER: s1 SRCLK: p.clk RCLK: p.latch OE: p.gnd SRCLR: p.vdd VCC: p.vdd GND: p.gnd
+            QA: q[8] QB: q[9] QC: q[10] QD: q[11] QE: q[12] QF: q[13] QG: q[14] QH: q[15] QHS: s2
+        }})
+        let u3  = e.part(reg, {pins: {
+            SER: s2 SRCLK: p.clk RCLK: p.latch OE: p.gnd SRCLR: p.vdd VCC: p.vdd GND: p.gnd
+            QA: q[16] QB: q[17] QC: q[18] QD: q[19] QE: p.col[0] QF: p.col[1] QG: p.col[2] QH: p.col[3]
+        } nc: [@QHS]})
+        let dec   = for u in [u1 u2 u3] { let c = e.c(100nF, p.vdd, p.gnd, {package: "0402"}); e.near(c, u, 3mm); c }
+        let steps = for i in 0..16 { chain_led({q: q[i] gnd: p.gnd}) }
+        let funcs = for i in 16..20 { chain_led({q: q[i] gnd: p.gnd color: @green}) }
+    }
+    sheet: {flow: @right ports: {data: @left clk: @left latch: @left col: @right vdd: @top gnd: @bottom}}
+})
+
+// One key of the matrix: a low-profile key switch from its row to a diode into its column. A
+// pressed key pulls its row (an input on the MCU's pull-up) low only while its column is low, and
+// the diode keeps a second pressed key in the same row from back-feeding the other columns.
+let key_cell = e.block({
+    name: "Key"
+    ports: {row: e.port(@bidi)  col: e.port(@in)}
+    build: fn(p, o) {
+        let m  = e.net()
+        let sw = e.part(mod.std.key_switch_low(), {pins: {A: p.row B: m}})
+        let d  = e.part(mod.std.diode_part("sod323"), {pins: {A: m K: p.col}})
+        e.near(d, sw, 6mm)
+    }
+    sheet: {flow: @down ports: {row: @top col: @bottom}}
+})
+
+// The 20 keys in five rows of four columns: key k on row k / 4 and column k % 4. Keys 0..15 are
+// the steps, 16..19 PLAY, SHIFT, INST and PATTERN. All columns rest low, so any press shows on its
+// row; the firmware walks the columns only then.
+let key_matrix = e.block({
+    name: "Keys"
+    ports: {row: e.port(@bidi, {width: 5})  col: e.port(@in, {width: 4})}
+    build: fn(p, o) {
+        let keys = for r in 0..5 { for c in 0..4 { key_cell({row: p.row[r] col: p.col[c]}) } }
+    }
+    sheet: {flow: @right ports: {row: @left col: @top}}
+})
+
+// A voice's trigger with accent: the MCU's trigger pin raises the voice's trigger node t through
+// r_pin, and while the accent pin is low it also pulls t down through r_acc and a diode, so an
+// unaccented strike is about 3.6 V; with the accent pin high the diode is off and the strike is
+// the full 5 V. With the trigger pin low t rests at 0 V whatever the accent pin does (the diode
+// keeps one voice's trigger off the others').
+let accent_gate = e.block({
+    name: "Accent gate"
+    ports: {pin: e.port(@in)  accent: e.port(@in)  t: e.port(@out)}
+    params: {r_pin: 1kohm r_acc: 2.2kohm}
+    build: fn(p, o) {
+        let x  = e.net()
+        let rp = e.r(o.r_pin, p.pin, p.t, {package: "0402"})
+        let ra = e.r(o.r_acc, p.t, x, {package: "0402"})
+        let d  = e.part(mod.std.diode_part("sod323"), {pins: {A: x K: p.accent}})
+    }
+    sheet: {flow: @right ports: {pin: @left accent: @bottom t: @right}}
+})
+
+// The mix and the line out: an inverting summer on the signal ground (each voice into `sum`
+// through its own resistor, rf back), VOLUME after it, a unity buffer, then 100 ohm and 10 uF out
+// to `line`, which a 100k bleed holds at 0 V with nothing plugged in. VOLUME is a divider from the
+// signal ground (A, pin 1) to the mix (B, pin 3), as a volume pot is wired: clockwise is louder.
+// Its audio taper starts at 0.883, where the wiper takes 0.59 of the mix.
+let mixer_out = e.block({
+    name: "Mixer and output"
+    ports: {
+        sum:  e.port(@in)
+        line: e.port(@out)
+        ref:  e.port(@power_in)
+        va:   e.port(@power_in)
+        gnd:  e.port(@ground)
+    }
+    params: {rf: 22kohm volume: 10kohm r_out: 100ohm c_out: 10uF r_bleed: 100kohm}
+    build: fn(p, o) {
+        let mix  = e.net()
+        let wv   = e.net()
+        let buf  = e.net()
+        let co   = e.net()
+        let rf   = e.r(o.rf, mix, p.sum, {package: "0402"})
+        let sumr = e.part(mod.std.opamp_sot23(), {pins: {INP: p.ref INN: p.sum OUT: mix VDD: p.va VSS: p.gnd}})
+        let vol  = e.part(mod.std.pot_9mm(), {value: o.volume pins: {A: p.ref W: wv B: mix}
+                                              fields: {pos: "0.883" taper: "log" label: "VOLUME"}})
+        let bufr = e.part(mod.std.opamp_sot23(), {pins: {INP: wv INN: buf OUT: buf VDD: p.va VSS: p.gnd}})
+        let ro   = e.r(o.r_out, buf, co, {package: "0402"})
+        let cout = e.c(o.c_out, co, p.line, {package: "0805"})
+        let rb   = e.r(o.r_bleed, p.line, p.gnd, {package: "0402"})
+    }
+    sheet: {flow: @right ports: {sum: @left line: @right ref: @bottom va: @top gnd: @bottom}}
+})

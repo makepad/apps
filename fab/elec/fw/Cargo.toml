@@ -1,0 +1,43 @@
+[package]
+name = "fab-elec-fw"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab electronics firmware build and co-simulated MCU device for a lowered circuit"
+
+[package.metadata.makepad.platform-gaps]
+windows = {}
+
+[dependencies]
+fab-elec-bench = { path = "../bench" }
+fab-elec-core = { path = "../core" }
+fab-elec-mcu = { path = "../mcu/lang" }
+fab-elec-mcu-avr = { path = "../mcu/avr" }
+fab-elec-mcu-cosim = { path = "../mcu/cosim" }
+fab-elec-mcu-emu = { path = "../mcu/emu" }
+fab-elec-mcu-emit-avr = { path = "../mcu/emit_avr" }
+fab-elec-mcu-emit-s3 = { path = "../mcu/emit_s3" }
+fab-elec-mcu-island = { path = "../mcu/island" }
+fab-elec-mcu-pack = { path = "../mcu/pack" }
+fab-elec-mcu-rt = { path = "../mcu/rt" }
+fab-elec-mcu-parts = { path = "../mcu/parts" }
+fab-elec-mcu-s3 = { path = "../mcu/s3" }
+fab-elec-sim = { path = "../sim" }
+fab-elec-simhost = { path = "../simhost" }
+makepad-fab-settings = { path = "../../settings" }
+makepad-widgets-core = { path = "../../../../../widgets/core", version = "2.0.0" }
+
+[dev-dependencies]
+# the files fake's pictures, written as PNG
+makepad-zune-png = { path = "../../../../../libs/zune/zune-png" }
+# the spoken turn's checker, beside the hub's /talk route
+makepad-ai-hub = { path = "../../../../../libs/ai/hub", default-features = false }
+# the radio island fixture shared with emit_s3's tests (its archive is built from Xtensa words)
+fab-elec-mcu-emit32 = { path = "../mcu/emit32" }
+fab-elec-circuit = { path = "../circuit" }
+fab-elec-parts = { path = "../parts" }
+# the host's own-circuit bench run and the app's Listen tap, for the touch heard where it was made
+fab-elec-design = { path = "../design" }
+fab-elec-lang = { path = "../lang" }
+fab-elec-view = { path = "../view" }

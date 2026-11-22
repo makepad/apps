@@ -1,0 +1,35 @@
+// A hand-launch glider printed flat in two filaments: a thin wing and tailplane on the bed, a keel
+// fuselage with a weighted nose and a fin standing up from its tail, all one blended field so the
+// joints are filleted. The wing's tips and the fin are the second filament. Fly it in the wind
+// tunnel first.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+let span = param(150mm, min: 90mm, max: 220mm, step: 5mm, label: "Wing span", group: "Glider")
+let chord = param(26mm, min: 16mm, max: 40mm, step: 1mm, label: "Wing chord", group: "Glider")
+let skin = param(1.6mm, min: 1.2mm, max: 2.4mm, step: 0.1mm, label: "Wing thickness", group: "Glider", hint: "four layers or more, so the wing stays flat")
+let length = param(150mm, min: 100mm, max: 220mm, step: 5mm, label: "Length", group: "Glider")
+
+// Along X from the nose (+X) to the tail; the wing sits a third of the way back, where the
+// centre of gravity goes, and the nose bulb carries the weight that puts it there.
+let wing_x = length / 2 - length * 0.33
+let tail_x = -length / 2 + 14mm
+let keel_h = 6mm
+let fuselage = m.box({size: [length - 10mm, keel_h, 4mm] radius: 1.8mm at: [0, keel_h / 2, 0]})
+// The nose bulb stands on a flat footprint and the wing tips are rounded in plan but the wing's
+// full thickness to their edge: nothing thins to a feather edge on the bed.
+let nose = m.ellipsoid({radii: [14mm, keel_h * 0.75, 6mm] at: [length / 2 - 12mm, keel_h / 2, 0]})
+let wing = m.box({size: [chord, skin, span - chord] at: [wing_x, skin / 2, 0]})
+let tips = for z in [-1, 1] { m.cylinder({radius: chord / 2 height: skin at: [wing_x, skin / 2, z * (span - chord) / 2]}) }
+let tailplane = m.box({size: [16mm, skin, span * 0.32] radius: 0.6mm at: [tail_x, skin / 2, 0]})
+let fin = m.box({size: [18mm, 20mm, 1.6mm] radius: 0.6mm at: [tail_x - 1mm, 10mm, 0]})
+let floor = m.box({size: [400mm, 20mm, 400mm] at: [0, -10mm, 0]})
+let glider = m.carve(m.blend([fuselage nose wing tips[0] tips[1] tailplane fin], 1.5mm), floor, 0)
+
+object(glider, name: "Glider")
+
+let sky = Material{albedo: [0.2 0.55 0.9] name: "Sky"}
+for z in [-1, 1] { m.fill(m.box({size: [chord + 4mm, 10mm, 24mm] at: [wing_x, 0, z * (span / 2 - 12mm)]}), sky) }
+// The fin above the keel.
+m.fill(m.box({size: [24mm, 16mm, 6mm] at: [tail_x - 1mm, keel_h + 8mm, 0]}), sky)

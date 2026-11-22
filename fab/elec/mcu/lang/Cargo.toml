@@ -1,0 +1,25 @@
+[package]
+name = "fab-elec-mcu"
+version = "1.0.0"
+authors = ["Makepad <info@makepad.nl>"]
+edition = "2021"
+description = "microsplash: firmware written in Splash. The front end (a firmware prelude over the Splash compute core) and the module encoder"
+license = "MIT"
+publish = false
+
+# files outside this crate its build reads: the glyph atlases' font, which the widgets ship
+[package.metadata.commercial]
+include = ["../../../../../../widgets/resources/jetbrains_mono_variable.ttf"]
+
+[package.metadata.makepad.platform-gaps]
+windows = {}
+
+[dependencies]
+makepad-image-decode = { path = "../../../../../../libs/image_decode" }
+makepad-font-core = { path = "../../../../../../libs/font_core", version = "1.0.0" }
+makepad-script-compute = { path = "../../../../../../platform/script/compute", version = "1.0.0" }
+fab-elec-mcu-emu = { path = "../emu" }
+fab-elec-mcu-rt = { path = "../rt" }
+
+[dev-dependencies]
+makepad-zune-png = { path = "../../../../../../libs/zune/zune-png" }

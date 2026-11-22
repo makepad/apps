@@ -1,0 +1,15 @@
+// Surface textures: knurl, hex scales and stone grain displacing the parts' distance fields, and
+// a pot the slicer presses a woven texture into as it prints its outer wall.
+use mod.fab.*
+
+script("surface_textures.cad.splash")
+
+color("Blue", rgb: #x3d7bd9)
+color("Teal", rgb: #x2a9d8f)
+color("Sand", rgb: #xc9b38f)
+color("Orange", rgb: #xe2672b)
+
+place("surface_textures", object: "knurled_handle", at: [80mm 235mm], name: "Knurled handle", color: "Blue")
+place("surface_textures", object: "hex_cup", at: [170mm 175mm], name: "Hex cup", color: "Teal")
+place("surface_textures", object: "stone_coaster", at: [80mm 120mm], name: "Stone coaster", color: "Sand")
+place("surface_textures", object: "woven_pot", at: [265mm 175mm], name: "Woven pot", color: "Orange", settings: {fab_wall_texture: "woven" fuzzy_skin_thickness: 0.4})

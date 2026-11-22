@@ -1,0 +1,9 @@
+// A print-in-place poseable robot in two filaments: steel body, orange head and limbs.
+use mod.fab.*
+
+script("poseable_robot.cad.splash")
+
+color("Steel", rgb: #x9aa3ad)
+color("Orange", rgb: #xe8701e)
+
+place("poseable_robot", at: [175mm 160mm], name: "Poseable robot", color: "Steel")

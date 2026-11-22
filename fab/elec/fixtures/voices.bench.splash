@@ -1,0 +1,45 @@
+// drum16's voices, each on its own bench, struck as the sequencer strikes them: a 1 ms trigger.
+// An unaccented step raises a voice's trigger to 3.4 V, an accented one to 5 V.
+
+// The kick, struck every half second. Its scope shows the decaying sine, about 56 Hz, falling to a
+// third in 120 ms; turn DECAY or TUNE while it plays and the next strike rings with the new values.
+bench("kick", {circuit: "kick" run: {stop: 500ms}}, fn(b, c) {
+    b.supply(c.net("VA"), {v: 5V})
+    b.pulse(c.net("TRIG"), c.net("GND"), {v: 3.4V width: 1ms every: 500ms at: 10ms})
+    b.probe(c.net("OUT"), {label: "Kick"})
+    b.probe(c.net("TRIG"), {label: "Trigger"})
+})
+
+// The snare, struck every half second: the body's 188 Hz ring with the noise burst on top. Turn
+// SNAP while it plays to hear more or less of the burst.
+bench("snare", {circuit: "snare" run: {stop: 500ms}}, fn(b, c) {
+    b.supply(c.net("VA"), {v: 5V})
+    b.pulse(c.net("TRIG"), c.net("GND"), {v: 3.4V width: 1ms every: 500ms at: 10ms})
+    b.probe(c.net("OUT"), {label: "Snare"})
+    b.probe(c.net("TRIG"), {label: "Trigger"})
+})
+
+// The hats and the cymbal: a closed hat every quarter second and an open hat once a second,
+// between the first two closed ones; the second closed hat chokes it. The cymbal once a second,
+// between the second and third closed hats, rings on through them. Turn HAT DECAY to hear the open
+// hat ring longer or shorter before it is choked.
+bench("hats", {circuit: "hats" run: {stop: 1s}}, fn(b, c) {
+    b.supply(c.net("VA"), {v: 5V})
+    b.pulse(c.net("CTRIG"), c.net("GND"), {v: 3.4V width: 1ms every: 250ms at: 10ms})
+    b.pulse(c.net("OTRIG"), c.net("GND"), {v: 3.4V width: 1ms every: 1s at: 135ms})
+    b.pulse(c.net("CYMTRIG"), c.net("GND"), {v: 3.4V width: 1ms every: 1s at: 385ms})
+    b.probe(c.net("OUT"), {label: "Hats and cymbal"})
+    b.probe(c.net("CTRIG"), {label: "Closed"})
+    b.probe(c.net("CYMTRIG"), {label: "Cymbal"})
+})
+
+// The toms, each struck every half second, a quarter second apart: about 107 Hz for the low tom
+// and 167 Hz for the high tom. Turn TOM TUNE while they play to move the low tom's pitch.
+bench("toms", {circuit: "toms" run: {stop: 500ms}}, fn(b, c) {
+    b.supply(c.net("VA"), {v: 5V})
+    b.pulse(c.net("LTRIG"), c.net("GND"), {v: 3.4V width: 1ms every: 500ms at: 10ms})
+    b.pulse(c.net("HTRIG"), c.net("GND"), {v: 3.4V width: 1ms every: 500ms at: 260ms})
+    b.probe(c.net("LOW"), {label: "Low tom"})
+    b.probe(c.net("HIGH"), {label: "High tom"})
+    b.probe(c.net("LTRIG"), {label: "Trigger"})
+})

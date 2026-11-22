@@ -1,0 +1,23 @@
+// A tone box: one key, one knob, one LED and one audio jack on USB 5 V, in its printed case. Its
+// electronics are the plate's documents: the circuit, the board and the bench. Hold the key (in
+// the Bench workspace, or in Mechanics with the box closed) and the LED lights and a tone
+// plays on the jack; Listen hears it, and the PITCH knob tunes it as it plays. The tone is an RC
+// oscillator's: change its resistor, its pot or its capacitor and the note follows. The case
+// (tonebox.cad.splash) prints its base, the lid with the LED's clear pipe, the keycap and the
+// knob; the board rides in the base, off the print.
+use mod.fab.*
+
+script("tonebox.cad.splash")
+
+// A dark case, so the pipe's tip stands out; the pipe prints in clear PETG in the same layers
+// (the second tool).
+color("Charcoal", rgb: #x2b2d31, material: "PETG")
+color("Clear", rgb: #xe6ebe6, material: "PETG")
+
+// Each object stands as the script lays it out from one origin: the lid, the keycap and the
+// knob beside the base. The board is an insert: it rides in the base, on the base's frame.
+place("tonebox", object: "Base", at: [120mm 160mm], color: "Charcoal")
+place("tonebox", object: "Lid", at: [120mm 160mm], color: "Charcoal")
+place("tonebox", object: "Pin key", at: [120mm 160mm], color: "Charcoal")
+place("tonebox", object: "Knob pitch", at: [120mm 160mm], color: "Charcoal")
+place("tonebox", object: "Board", at: [120mm 160mm])

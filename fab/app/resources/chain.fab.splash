@@ -1,0 +1,10 @@
+// A chain of free interlocking links on a plate of its own: printed flat in one go, already
+// linked. Its links come off the bed free to move: try it in Mechanics.
+use mod.fab.*
+
+script("chain.cad.splash")
+
+color("Orange", rgb: #xe2672b)
+
+// the chain runs from its first link along X: placed so it lies across the middle of the bed
+place("chain", at: [90mm 160mm], name: "Chain", color: "Orange")

@@ -1,0 +1,23 @@
+[package]
+name = "fab-elec-mcu-emit-avr"
+version = "1.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+authors = ["Makepad <info@makepad.nl>"]
+
+[package.metadata.makepad.platform-gaps]
+windows = {}
+
+[dependencies]
+fab-elec-mcu = { path = "../lang" }
+fab-elec-mcu-avr = { path = "../avr" }
+fab-elec-mcu-emu = { path = "../emu" }
+fab-elec-mcu-rt = { path = "../rt" }
+
+[dev-dependencies]
+makepad-script-compute = { path = "../../../../../../platform/script/compute", version = "1.0.0" }
+
+[[bin]]
+name = "fab-elec-mcu-avr-images"
+path = "src/bin/avr_images.rs"

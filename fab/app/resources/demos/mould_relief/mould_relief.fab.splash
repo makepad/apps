@@ -1,0 +1,9 @@
+// A shallow dish with a slime mould's veins standing out of its floor as rounded tubes, in two filaments.
+use mod.fab.*
+
+script("mould_relief.cad.splash")
+
+color("Charcoal", rgb: #x2a2a2c)
+color("Yellow", rgb: #xf2c21f)
+
+place("mould_relief", at: [175mm 160mm], name: "Slime mould relief dish", color: "Charcoal")

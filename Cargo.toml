@@ -1,0 +1,109 @@
+# makepad/apps: Makepad's open apps, as members of the enclosing Makepad workspace.
+#
+# `fab/` is Fab: the 3D modeler and slicer (design, mechanics, slicing and printing) and its
+# electronics suite (schematic, board, routing, simulation, firmware and the bench). The app is
+# `makepad-fab` (fab/app). `engine/` and `libs/` hold the shared crates Fab and other apps use:
+# the HDRI and atmosphere engine, the asset data model, the model scripts, the app shell, the
+# explorer's motion kit and the studio registry.
+#
+# This repository has no workspace of its own. It is cloned into a Makepad checkout at
+# `apps/<dir>`, and its crates join Makepad's workspace, so Makepad's crates compile once for them
+# and for every other app, into Makepad's `target/`, with its profiles and patches. Makepad's root
+# lists `apps/*/src/..`, every app directory with a `src/`, so this package is a member when the
+# repository is there; its dependencies below make the crates it names members too, because a
+# path dependency inside the workspace is a member. `cfg(any())` never holds: they are never
+# built, linked or feature-resolved through this package. A new crate is added here.
+#
+# The crates' path dependencies resolve into the surrounding Makepad checkout (`../../` from here).
+[package]
+name = "makepad-apps-members"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[target.'cfg(any())'.dependencies]
+makepad-asset-data    = { path = "engine/asset/data" }
+makepad-hdri-engine   = { path = "engine/hdri" }
+makepad-model-script  = { path = "engine/model_script" }
+fab-ai                = { path = "fab/ai" }
+makepad-fab           = { path = "fab/app" }
+fab-arm-lab           = { path = "fab/arm_lab" }
+fab-arms              = { path = "fab/arms" }
+fab-calibrate         = { path = "fab/calibrate" }
+fab-cell-sim          = { path = "fab/cell_sim" }
+fab-colour            = { path = "fab/colour" }
+fab-controls          = { path = "fab/controls" }
+fab-elec-bench        = { path = "fab/elec/bench" }
+fab-elec-board        = { path = "fab/elec/board" }
+fab-elec-cam          = { path = "fab/elec/cam" }
+fab-elec-circuit      = { path = "fab/elec/circuit" }
+fab-elec-core         = { path = "fab/elec/core" }
+fab-elec-design       = { path = "fab/elec/design" }
+fab-elec-explore      = { path = "fab/elec/explore" }
+fab-elec-fixtures     = { path = "fab/elec/fixtures" }
+fab-elec-fw           = { path = "fab/elec/fw" }
+fab-elec-host         = { path = "fab/elec/host" }
+fab-elec-import       = { path = "fab/elec/import" }
+fab-elec-instr        = { path = "fab/elec/instr" }
+fab-elec-kicad        = { path = "fab/elec/kicad" }
+fab-elec-lang         = { path = "fab/elec/lang" }
+fab-elec-mcu-avr      = { path = "fab/elec/mcu/avr" }
+fab-elec-mcu-cosim    = { path = "fab/elec/mcu/cosim" }
+fab-elec-mcu-emit32   = { path = "fab/elec/mcu/emit32" }
+fab-elec-mcu-emit-avr = { path = "fab/elec/mcu/emit_avr" }
+fab-elec-mcu-emit-s3  = { path = "fab/elec/mcu/emit_s3" }
+fab-elec-mcu-emu      = { path = "fab/elec/mcu/emu" }
+fab-elec-mcu-flash    = { path = "fab/elec/mcu/flash" }
+fab-elec-mcu-island   = { path = "fab/elec/mcu/island" }
+fab-elec-mcu          = { path = "fab/elec/mcu/lang" }
+fab-elec-mcu-netgw    = { path = "fab/elec/mcu/netgw" }
+fab-elec-mcu-pack     = { path = "fab/elec/mcu/pack" }
+fab-elec-mcu-parts    = { path = "fab/elec/mcu/parts" }
+fab-elec-mcu-rt       = { path = "fab/elec/mcu/rt" }
+fab-elec-mcu-rv32     = { path = "fab/elec/mcu/rv32" }
+fab-elec-mcu-s3       = { path = "fab/elec/mcu/s3" }
+fab-elec-mcu-xtensa   = { path = "fab/elec/mcu/xtensa" }
+fab-elec-mech         = { path = "fab/elec/mech" }
+fab-elec-parts        = { path = "fab/elec/parts" }
+fab-elec-route        = { path = "fab/elec/route" }
+fab-elec-sim          = { path = "fab/elec/sim" }
+fab-elec-simhost      = { path = "fab/elec/simhost" }
+fab-elec-simjit       = { path = "fab/elec/simjit" }
+fab-elec-benchview    = { path = "fab/elec/tools/benchview" }
+fab-elec-boardbench   = { path = "fab/elec/tools/boardbench" }
+fab-elec-canvasbar    = { path = "fab/elec/tools/canvasbar" }
+fab-elec-kicadread    = { path = "fab/elec/tools/kicadread" }
+fab-elec-partimport   = { path = "fab/elec/tools/partimport" }
+fab-elec-proofbar     = { path = "fab/elec/tools/proofbar" }
+fab-elec-sheetview    = { path = "fab/elec/tools/sheetview" }
+fab-elec-tour         = { path = "fab/elec/tools/tour" }
+fab-elec-view         = { path = "fab/elec/view" }
+fab-force             = { path = "fab/force" }
+makepad-fab-gcode     = { path = "fab/gcode" }
+fab-gpuslice          = { path = "fab/gpuslice" }
+fab-loader-gltf       = { path = "fab/loaders/gltf" }
+fab-loose             = { path = "fab/loose" }
+fab-materials         = { path = "fab/materials" }
+fab-model             = { path = "fab/model" }
+fab-optimise          = { path = "fab/optimise" }
+makepad-fab-package   = { path = "fab/package" }
+fab-paint-field       = { path = "fab/paint_field" }
+fab-plate             = { path = "fab/plate" }
+fab-printability      = { path = "fab/printability" }
+fab-printer-link      = { path = "fab/printer_link" }
+fab-robot             = { path = "fab/robot" }
+makepad-fab-scan      = { path = "fab/scan" }
+fab-sdf-engine        = { path = "fab/sdf_engine" }
+fab-sdf-proof         = { path = "fab/sdf_proof" }
+fab-sdf-tiles         = { path = "fab/sdf_tiles" }
+makepad-fab-settings  = { path = "fab/settings" }
+fab-shell             = { path = "fab/shell" }
+fab-sla               = { path = "fab/sla" }
+fab-sla-archive       = { path = "fab/sla_archive" }
+makepad-fab-slice     = { path = "fab/slice" }
+makepad-fab-slicer    = { path = "fab/slicer" }
+makepad-fab-toolpath  = { path = "fab/toolpath" }
+makepad-app-shell     = { path = "libs/app_shell" }
+makepad-explore-kit   = { path = "libs/explore_kit" }
+makepad-studio-api    = { path = "libs/studio_api" }

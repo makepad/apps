@@ -1,0 +1,83 @@
+// A fractal in three filaments: a cube with square tunnels cut through it, then tunnels a third
+// that size through what is left, and again (a Menger sponge, three levels deep), on a plinth.
+// Each point takes the colour of the level whose tunnel it lies nearest, an orbit trap of the
+// folding that builds it, so the colours nest as the tunnels do. The tunnels bridge flat, so it
+// prints with no supports.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let size = param(54mm, min: 27mm, max: 108mm, step: 1mm, label: "Size", group: "Sponge", hint: "the cube's side; its smallest tunnels are a 27th of it")
+let plinth = 4mm
+let half = size / 2
+// The cube stands 0.3 mm down in the plinth, so the two overlap rather than touch.
+let centre = plinth + half - 0.3mm
+
+// The sponge's distance at a point, in units of the half side, and the level that set it: the
+// colour's field.
+fn sponge(u) {
+    var d = max(max(abs(u.x), abs(u.y)), abs(u.z)) - 1
+    var s = 1.0
+    var trap = 0
+    for k in 0..3 {
+        let ax = u.x * s - 2 * floor(u.x * s / 2) - 1
+        let ay = u.y * s - 2 * floor(u.y * s / 2) - 1
+        let az = u.z * s - 2 * floor(u.z * s / 2) - 1
+        s = s * 3
+        let rx = abs(1 - 3 * abs(ax))
+        let ry = abs(1 - 3 * abs(ay))
+        let rz = abs(1 - 3 * abs(az))
+        let c = (min(min(max(rx, ry), max(ry, rz)), max(rz, rx)) - 1) / s
+        if c > d {
+            d = c
+            trap = k
+        }
+    }
+    vec2(d, trap)
+}
+// The solid: a sponge is three carpets crossed. A carpet is a square with square holes in it, a
+// hole where both its coordinates fall in a middle third at some level; the sponge keeps the
+// points that every one of its three faces' carpets keeps, so it is the carpet pushed straight
+// through along x, along y and along z, the three intersected. A hole inside a bigger one cuts
+// nothing, so each level keeps the eight of nine that do not lie in one: 1 + 8 + 64 holes.
+// `ring(n)` is the nth of the eight cells round a 3 x 3 grid's centre, as [-1..1, -1..1].
+fn ring(n) {
+    let i = if n >= 4 { n + 1 } else { n }
+    [i - 3 * floor(i / 3) - 1, floor(i / 3) - 1]
+}
+let third = size / 3
+let ninth = size / 9
+fn square(a, b, w) { Polygon{points: [[a - w / 2, b - w / 2] [a + w / 2, b - w / 2] [a + w / 2, b + w / 2] [a - w / 2, b + w / 2]]} }
+// The carpet's outside is a millimetre wider than the cube all round: each face of the cube is the
+// end of one push, and the other two pass it.
+let carpet = for n in 0..74 {
+    if n == 0 {
+        Rect{size: [size + 2mm, size + 2mm]}
+    } else if n == 1 {
+        square(0, 0, third)
+    } else if n < 10 {
+        let c = ring(n - 2)
+        square(c[0] * third, c[1] * third, ninth)
+    } else {
+        let k = n - 10
+        let c = ring(floor(k / 8))
+        let f = ring(k - 8 * floor(k / 8))
+        square(c[0] * third + f[0] * ninth, c[1] * third + f[1] * ninth, size / 27)
+    }
+}
+let along_y = m.extrude({sketch: carpet plane: @xz height: size at: [0, centre - half, 0]})
+let along_z = m.extrude({sketch: carpet plane: @xy height: size at: [0, centre, 0 - half]})
+let along_x = m.extrude({sketch: carpet plane: @yz height: size at: [half, centre, 0]})
+let cube = m.intersect(m.intersect(along_y, along_z), along_x)
+let base = m.box({size: [size + 8mm, plinth, size + 8mm] radius: 1.5mm at: [0, plinth / 2, 0]})
+let fractal = m.union(base, cube)
+
+object(fractal, name: "Fractal sponge")
+
+let gold = Material{albedo: [0.86 0.66 0.2] name: "Gold"}
+let teal = Material{albedo: [0.1 0.55 0.58] name: "Teal"}
+let plum = Material{albedo: [0.45 0.15 0.42] name: "Plum"}
+m.fill(m.box({size: [size + 10mm, size + plinth + 2mm, size + 10mm] at: [0, (size + plinth) / 2, 0]}), Mix{materials: [gold teal plum] field: fn(p) {
+    if p.y < plinth { 0 } else { sponge((p - vec3(0, centre, 0)) / half).y }
+} sharp: 1})

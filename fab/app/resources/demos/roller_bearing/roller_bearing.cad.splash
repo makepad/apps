@@ -1,0 +1,45 @@
+// A roller bearing printed in place, in two filaments: two rings and a crown of double-cone
+// rollers between them, each running in the V track the rings share. Every face leans at 45
+// degrees or less, so it prints without supports, and the rollers come off the bed captive and
+// free: the inner ring turns in the outer.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let outer_d = param(56mm, min: 40mm, max: 90mm, step: 1mm, label: "Outer diameter", group: "Bearing")
+let bore = param(8mm, min: 4mm, max: 20mm, step: 0.5mm, label: "Bore", group: "Bearing", hint: "the axle hole; 8 mm takes a skate axle")
+let height = param(10mm, min: 7mm, max: 14mm, step: 0.5mm, label: "Height", group: "Bearing", hint: "the rollers' height; their waist grows with it")
+let gap = param(0.6mm, min: 0.4mm, max: 0.9mm, step: 0.05mm, label: "Running gap", group: "Fit", hint: "level and plumb across the track; square to its 45 degree faces it is 0.7 of this")
+
+// A roller is two cones base to base, `tip` in radius at its ends and `waist` at its middle,
+// centred on the pitch circle midway across the ring: as many as fit with 1.5 mm between them.
+let tip = 1.5mm
+let waist = tip + height / 2
+let pitch = (outer_d + bore) / 4
+let count = floor(2 * 3.14159 * pitch / (2 * waist + 1.5mm))
+
+// The track: what the rollers sweep round the pitch circle, `gap` wider each side, run out past
+// both faces so no face of a ring lies in a face of the track.
+let t_in = pitch - tip - gap
+let t_out = pitch + tip + gap
+let track = m.revolve({sketch: Polygon{points: [[t_in, -1mm] [t_out, -1mm] [t_out, 0] [t_out + height / 2, height / 2] [t_out, height] [t_out, height + 1mm] [t_in, height + 1mm] [t_in, height] [t_in - height / 2, height / 2] [t_in, 0]]}})
+
+fn disc(r, segs) { m.cylinder({radius: r height: height at: [0, height / 2, 0] segments: segs}) }
+fn hole(r, segs) { m.cylinder({radius: r height: height + 2mm at: [0, height / 2, 0] segments: segs}) }
+// The rings: one disc split by the track, the outer ring its outside and the inner its inside.
+let outer_ring = m.subtract(disc(outer_d / 2, 160), [hole(pitch, 160) track])
+let inner_ring = m.subtract(m.subtract(disc(pitch, 160), hole(bore / 2, 64)), track)
+let rollers = for i in 0..count {
+    let a = i * 360° / count
+    m.revolve({sketch: Polygon{points: [[0, 0] [tip, 0] [waist, height / 2] [tip, height] [0, height]]} at: [pitch * cos(a), 0, pitch * sin(a)]})
+}
+let bearing = m.union(m.union(outer_ring, inner_ring), rollers)
+// In Mechanics a hand holds it by the outer ring, a little over the bed: turning the inner ring then
+// rolls the rollers round between the rings (left on the bed, the bed would carry them).
+m.anchor(bearing, {at: [(outer_d / 2 + t_out + height / 2) / 2, height / 2, 0] held: true})
+
+object(bearing, name: "Roller bearing")
+
+// The rollers in the second filament.
+m.fill(rollers, Material{albedo: [0.88 0.44 0.16] name: "Orange"})

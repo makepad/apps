@@ -1,0 +1,9 @@
+// A print-in-place cup carousel on herringbone gears, in two filaments: red and gold.
+use mod.fab.*
+
+script("cup_carousel.cad.splash")
+
+color("Red", rgb: #xb81f2e)
+color("Gold", rgb: #xedbd47)
+
+place("cup_carousel", at: [175mm 160mm], name: "Cup carousel", color: "Red")

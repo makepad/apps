@@ -1,0 +1,10 @@
+// A fractal sponge three levels deep on a plinth, each level's tunnels in a filament of its own.
+use mod.fab.*
+
+script("fractal_sponge.cad.splash")
+
+color("Gold", rgb: #xdba833)
+color("Teal", rgb: #x1a8c94)
+color("Plum", rgb: #x73266b)
+
+place("fractal_sponge", at: [175mm 160mm], name: "Fractal sponge", color: "Gold")

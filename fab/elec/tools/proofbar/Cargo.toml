@@ -1,0 +1,16 @@
+[package]
+name = "fab-elec-proofbar"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab electronics proof bar: the Fabricate proof pane on the ledctl export, as read back (frames dark and light, layers, drills, placement, a failing check)"
+
+[dependencies]
+fab-elec-fixtures = { path = "../../fixtures" }
+makepad-widgets = { path = "../../../../../../widgets", version = "2.0.0" }
+fab-elec-view = { path = "../../view" }
+fab-elec-cam = { path = "../../cam" }
+fab-elec-board = { path = "../../board" }
+fab-elec-core = { path = "../../core" }
+fab-elec-design = { path = "../../design" }

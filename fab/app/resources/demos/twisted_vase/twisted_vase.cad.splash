@@ -1,0 +1,50 @@
+// A twisted fluted vase in two filaments: its flutes turn as they rise, and a stripe runs up each
+// one, turning with it, narrow at the foot and widening to the rim. One distance field: the vase
+// is a fluted round twisted up its height and hollowed to its wall over a solid floor, and the
+// stripes are cut by the same twist, so they stay on their flutes.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let height = param(110mm, min: 50mm, max: 200mm, step: 1mm, label: "Height", group: "Vase")
+let radius = param(28mm, min: 15mm, max: 50mm, step: 0.5mm, label: "Radius", group: "Vase", kind: "radius", hint: "the round at the foot; the belly swells past it and the neck draws in")
+let twist = param(90°, min: 0°, max: 180°, step: 5°, label: "Twist", group: "Vase", hint: "how far the flutes turn from the foot to the rim")
+let flutes = 8
+let flute = 0.07
+let wall = param(1.6mm, min: 1.2mm, max: 3mm, step: 0.1mm, label: "Wall", group: "Vase")
+let floor_t = 2mm
+let narrow = param(0.2, min: 0.05, max: 0.5, step: 0.01, label: "Stripe at the foot", group: "Stripes", kind: "ratio", hint: "the stripe's share of its flute at the foot")
+let wide = param(0.6, min: 0.2, max: 0.95, step: 0.01, label: "Stripe at the rim", group: "Stripes", kind: "ratio", hint: "the stripe's share of its flute at the rim")
+
+// The round at height y: a belly a little under halfway up, drawn in to a neck at the top.
+fn round_at(y) { radius * (0.85 + 0.25 * sin(3.14159 * 1.2 * min(max(y / height, 0), 1))) }
+// The angle round the axis in the twisted frame: the flutes stand still in it.
+fn turned(p) {
+    let t = twist * p.y / height
+    atan2(p.x * sin(t) + p.z * cos(t), p.x * cos(t) - p.z * sin(t))
+}
+let reach = radius * 1.2
+let vase = m.sdf({
+    bounds: [[0 - reach, 0, 0 - reach], [reach, height + 1mm, reach]]
+    field: fn(p) {
+        let rho = sqrt(p.x * p.x + p.z * p.z)
+        // The flutes and the twist lean the surface, so its distance runs long: scaled back.
+        let d = (rho - round_at(p.y) * (1 + flute * cos(flutes * turned(p)))) * 0.8
+        let shell = abs(d + wall / 2) - wall / 2
+        let base = max(d, p.y - floor_t)
+        return max(min(shell, base), max(0 - p.y, p.y - height))
+    }
+})
+
+object(vase, name: "Twisted vase")
+
+// A stripe up each flute, centred on it: the share of the flute it covers grows up the vase.
+let sea = Material{albedo: [0.1 0.42 0.52] name: "Teal"}
+let sand = Material{albedo: [0.93 0.86 0.7] name: "Sand"}
+m.fill(vase, Mix{materials: [sea sand] field: fn(p) {
+    let k = flutes * turned(p) / (2 * 3.14159) + 0.5
+    let s = abs(k - floor(k) - 0.5)
+    let share = narrow + (wide - narrow) * min(max(p.y / height, 0), 1)
+    0.5 + (share / 2 - s) * 20
+} sharp: 1})

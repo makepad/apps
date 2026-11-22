@@ -1,0 +1,42 @@
+// A made-up planet on a stand, in two filaments: noise continents and oceans through the whole
+// ball, so a cut shows the land running down to the core. The ball and the stand are one print:
+// the stand's cup rises at the steepest lean a wall prints at and meets the ball where its own
+// surface leans that far, so nothing hangs and nothing needs a support.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+let radius = param(30mm, min: 15mm, max: 60mm, step: 0.5mm, label: "Radius", group: "Planet", kind: "radius")
+let land = param(0.45, min: 0.2, max: 0.8, step: 0.01, label: "Land", group: "Planet", kind: "ratio", hint: "roughly how much of the planet is land")
+let feature = param(0.45, min: 0.2, max: 1, step: 0.01, label: "Continent size", group: "Planet", kind: "ratio", hint: "the continents' size over the planet's")
+let seed = param(4, min: 1, max: 99, step: 1, label: "World", group: "Planet", hint: "another whole number makes another world")
+
+// The stand: a foot, a short stem and a cup flaring at 45 degrees to the ball's 45 degree south
+// latitude, where it meets the ball along its tangent.
+let foot_r = radius * 0.75
+let foot_h = 3mm
+let stem_r = radius * 0.25
+let lean = 0.7071
+let meet_r = radius * lean
+// A short stem, then the flare: it climbs as far as it widens, to the latitude it meets.
+let flare_y = foot_h + radius * 0.12
+let meet_y = flare_y + (meet_r - stem_r)
+let centre = meet_y + radius * lean
+let stand = m.revolve({sketch: Polygon{points: [[0, 0] [foot_r, 0] [foot_r, foot_h] [stem_r, foot_h] [stem_r, flare_y] [meet_r, meet_y] [0, meet_y]]}})
+let ball = m.sphere({radius: radius at: [0, centre, 0]})
+
+let globe = m.union(ball, stand)
+
+object(globe, name: "Planet globe")
+
+// Land where 3D noise of the direction from the core rises past the sea level: the coastline is
+// the same at every depth, so the continents run straight down through the ball.
+let ocean = Material{albedo: [0.1 0.3 0.62] name: "Ocean"}
+let earth = Material{albedo: [0.36 0.55 0.24] name: "Land"}
+m.fill(globe, Mix{materials: [ocean earth] field: fn(p) {
+    let q = p - vec3(0, centre, 0)
+    let r = max(length(q), 0.001mm)
+    let n = noise.fbm(q / r / feature, seed, 4)
+    let inside = radius - r
+    if inside < 0 { 0 } else { 0.5 + (n - (0.5 - land) * 0.8) * 12 }
+} sharp: 1})

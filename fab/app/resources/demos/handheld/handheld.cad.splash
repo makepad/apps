@@ -1,0 +1,6 @@
+// The handheld board with its parts' bodies, bare (no case).
+use mod.model.*
+use mod.fab.*
+let pcb = board("handheld")
+let case = enclosure(pcb, {})
+object(board_solid(pcb, board_bodies("handheld"), case.frame), name: "Board")

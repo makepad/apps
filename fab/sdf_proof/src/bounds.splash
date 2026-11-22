@@ -1,0 +1,216 @@
+// A field function's declared bounds: `sdf_x_bound` for a function `sdf_x` of the kernel
+// prelude, over the ball of radius `ball` about its point (in the frame its p is in), vec4(K+,
+// K-, L, e): the field's Hessian within [-K-, K+], its Lipschitz bound L, and how far its f32
+// value can be from the exact one, e (BOUND_NONE: no bound). Its parameters are the field
+// function's, then `<a>_k` for each parameter `a` that is itself a field (that operand's bound),
+// then `ball`; a parameter the bound needs only the size of (a point of the shape, an array of
+// them) comes as its largest magnitude. `fab_sdf_proof::bound` composes them over a field: a call
+// with no declared bound, or arithmetic of the host's own on a distance, proves nothing.
+let BOUND_NONE = 1.0e30
+// The unit roundoff of f32 (round to nearest).
+let F32_U = 0.000000059604645
+
+// How far the kernels' sin and cos (Cephes-style, `math: exact32`) are from the exact ones at
+// an argument within m of 0 (tests/field_bound.rs measures them).
+fn sincos_error(m) { m * 0.00000023841858 + 0.0000003 }
+
+fn sdf_sphere_bound(p, r, ball) {
+    // |p|'s Hessian is (I - n n^T) / |p|: at most 1 / |p| over the ball when it holds no 0
+    let lp = length(p)
+    let e = (lp + ball + abs(r)) * 0.0000005
+    let m = lp - (ball + e)
+    if m > 0.0 { return vec4(1.00001 / m, 0.0, 1.0, e) }
+    vec4(BOUND_NONE, 0.0, 1.0, e)
+}
+fn sdf_box_bound(p, size, ball) {
+    let ax = abs(p.x)
+    let ay = abs(p.y)
+    let az = abs(p.z)
+    let qx = ax - size.x * 0.5
+    let qy = ay - size.y * 0.5
+    let qz = az - size.z * 0.5
+    let e = (max(max(ax, ay), az) + ball + max(max(size.x, size.y), size.z)) * 0.000001
+    let rr = ball + e
+    // a face's region: its axis' term the box's greatest by more than the ball's span, the
+    // others inside, the point off the mirror planes (the field is a plane there)
+    if qx - rr > max(qy, qz) + rr && qy + rr < 0.0 && qz + rr < 0.0 && ax > rr { return vec4(0.0, 0.0, 1.0, e) }
+    if qy - rr > max(qx, qz) + rr && qx + rr < 0.0 && qz + rr < 0.0 && ay > rr { return vec4(0.0, 0.0, 1.0, e) }
+    if qz - rr > max(qx, qy) + rr && qx + rr < 0.0 && qy + rr < 0.0 && az > rr { return vec4(0.0, 0.0, 1.0, e) }
+    // outside: the distance to a convex set, its Hessian at most 1 / the distance; inside
+    // off the faces' regions, the max of the faces' planes (convex creases)
+    let m = sdf_box(p, size) - rr
+    if m > 0.0 { return vec4(1.00001 / m, 0.0, 1.0, e) }
+    vec4(BOUND_NONE, 0.0, 1.0, e)
+}
+fn sdf_round_box_bound(p, size, r, ball) {
+    let b = sdf_box_bound(p, size - vec3(2.0 * r, 2.0 * r, 2.0 * r), ball)
+    vec4(b.x, b.y, b.z, b.w + (abs(sdf_box(p, size)) + ball + abs(r)) * F32_U)
+}
+fn sdf_plane_bound(p, n, d, ball) {
+    let ln = length(n)
+    vec4(0.0, 0.0, ln * 1.00001, ((abs(p.x * n.x) + abs(p.y * n.y) + abs(p.z * n.z)) + ball * ln + abs(d)) * 0.0000003)
+}
+
+// The gyroid's: in u = k p (k = 2 pi / period) it is h - wall k / 2, h = |G| / max(N, 1)
+// with G the gyroid function and N = |grad G|: the smaller of |G| and |f|, f = G / N. Over
+// the ball G moves by its gradient here and its Hessian (GYROID_HG in size), GYROID_LG per
+// unit at most, and N by GYROID_HG per unit. Where N >= 1 the field is |f|, whose gradient
+// gyroid_l8 bounds at its level (GYROID_LMAX at any) and whose Hessian gyroid_k8 does; where
+// N < 1 it is |G| (K+ GYROID_UP, steepness N < 1 <= gyroid_l8), so the level h moves at most
+// gyroid_l8 at the level it is at anywhere. The min's crease between the two is concave: the
+// ball's K+ is the larger of its pieces'. gyroid_proof.rs proves every
+// constant and both step functions (a CI check; change this section and run it again).
+let GYROID_LG = 1.7321
+let GYROID_HG = 2.5
+let GYROID_UP = 1.26
+let GYROID_LMAX = 3.05
+let GYROID_BAND = 0.1
+// per band of |f| (GYROID_BAND wide; none past the last), never falling
+fn gyroid_k8(l) {
+    if l < 0.2 { 1.12 } else if l < 0.3 { 1.14 } else if l < 0.4 { 1.59 } else if l < 0.5 { 2.15 }
+    else if l < 0.6 { 2.94 } else if l < 0.7 { 3.69 } else if l < 0.8 { 4.68 } else if l < 0.9 { 6.02 }
+    else if l < 1.0 { 7.15 } else if l < 1.1 { 9.13 } else if l < 1.2 { 10.63 } else if l < 1.3 { 12.45 }
+    else if l < 1.4 { 14.98 } else if l < 1.5 { 17.61 } else if l < 1.6 { 21.2 } else if l < 1.7 { 22.0 }
+    else if l < 2.0 { 25.0 } else { BOUND_NONE }
+}
+fn gyroid_l8(l) {
+    if l < 0.1 { 1.18 } else if l < 0.2 { 1.23 } else if l < 0.3 { 1.29 } else if l < 0.4 { 1.4 }
+    else if l < 0.5 { 1.53 } else if l < 0.6 { 1.7 } else if l < 0.7 { 1.88 } else if l < 0.8 { 2.1 }
+    else if l < 0.9 { 2.37 } else if l < 1.0 { 2.62 } else if l < 1.1 { 2.96 } else if l < 1.2 { 3.24 }
+    else if l < 1.3 { 3.6 } else if l < 1.4 { 4.0 } else if l < 1.5 { 4.41 } else if l < 1.6 { 4.83 }
+    else if l < 2.0 { 5.19 } else { BOUND_NONE }
+}
+fn sdf_gyroid_bound(p, period, wall, ball) {
+    let k = TAU / period
+    let sx = sin(p.x * k)
+    let cx = cos(p.x * k)
+    let sy = sin(p.y * k)
+    let cy = cos(p.y * k)
+    let sz = sin(p.z * k)
+    let cz = cos(p.z * k)
+    let g = sx * cy + sy * cz + sz * cx
+    let n = length(vec3(cx * cy - sz * sx, cy * cz - sx * sy, cz * cx - sy * sz))
+    // the f32 evaluation: sin and cos within es (their argument's rounding too), G within eg,
+    // N within en; the field's value within e (p units)
+    let m = (max(max(abs(p.x), abs(p.y)), abs(p.z)) + ball) * k
+    let es = sincos_error(m) + m * F32_U
+    let es2 = 2.0 * es + es * es
+    let eg = 3.0 * es2 + 0.0000004
+    let en = 1.7320509 * (2.0 * es2 + 0.0000002) + 0.0000003
+    let e = (eg + 1.5 * en + 0.0000003) / k + wall * F32_U
+    let ru = k * ball
+    let glo = abs(g) - (min(GYROID_LG, n + en + 0.5 * GYROID_HG * ru) * ru * 1.0001 + eg + 0.000001)
+    let nlo = n - (GYROID_HG * ru + en)
+    let nhi = n + (GYROID_HG * ru + en)
+    // h here (within el), then the most it reaches over the ball: from there it climbs a
+    // band at most at that band's gyroid_l8, band by band, for ru (none past the last band;
+    // a band whose start rounds above the level takes no time in the band before)
+    let el = (eg + 1.875 * en) / 0.8 + 0.0000005
+    var lv = abs(g) / max(n, 1.0) + el
+    var t = ru
+    var j = floor(lv / GYROID_BAND)
+    for i in 0..20 {
+        if t <= 0.0 || j >= 19.5 { break }
+        let s = min(gyroid_l8((j + 0.5) * GYROID_BAND), GYROID_LMAX)
+        let top = (j + 1.0) * GYROID_BAND
+        let need = max(top - lv, 0.0) / s * 0.9999
+        if need >= t {
+            lv = lv + t * s
+            t = 0.0
+        } else {
+            lv = max(lv, top)
+            t = t - need
+            j = j + 1.0
+        }
+    }
+    var up = lv * 1.0001 + 0.00001
+    if t > 0.0 { up = BOUND_NONE }
+    var kp = 0.0
+    var l = min(nhi, 1.0)
+    if nlo < 1.0 { kp = GYROID_UP }
+    if nhi > 1.0 {
+        kp = max(kp, gyroid_k8(up))
+        l = max(l, min(gyroid_l8(up), GYROID_LMAX))
+    }
+    // |G| keeps its sign over the ball, else the abs's crease
+    if glo <= 0.0 { kp = BOUND_NONE }
+    vec4(min(kp * k * 1.00001, BOUND_NONE), BOUND_NONE, l * 1.00001, e)
+}
+
+// The operators': where the operands cannot cross over the ball (they differ by more than
+// their L's together over it, and their errors) a min or max is the one operand's, its bounds
+// (the error either's); else a min of fields each with its Hessian at most K+ has it at most
+// the larger K+, with a crease on the other side (a max alike, mirrored). A blend of width k
+// adds (La + Lb)^2 / 2k on that side. The value moves no faster than its operands.
+fn sdf_union_bound(a, b, a_k, b_k, ball) {
+    let e = max(a_k.w, b_k.w)
+    if abs(a - b) - ((a_k.z + b_k.z) * ball + a_k.w + b_k.w) > 0.0 {
+        if a < b { return vec4(a_k.x, a_k.y, a_k.z, e) }
+        return vec4(b_k.x, b_k.y, b_k.z, e)
+    }
+    vec4(max(a_k.x, b_k.x), BOUND_NONE, max(a_k.z, b_k.z), e)
+}
+fn sdf_intersection_bound(a, b, a_k, b_k, ball) {
+    let e = max(a_k.w, b_k.w)
+    if abs(a - b) - ((a_k.z + b_k.z) * ball + a_k.w + b_k.w) > 0.0 {
+        if a > b { return vec4(a_k.x, a_k.y, a_k.z, e) }
+        return vec4(b_k.x, b_k.y, b_k.z, e)
+    }
+    vec4(BOUND_NONE, max(a_k.y, b_k.y), max(a_k.z, b_k.z), e)
+}
+fn sdf_difference_bound(a, b, a_k, b_k, ball) {
+    // max(a, -b): -b's Hessian bounds swap sides
+    sdf_intersection_bound(a, 0.0 - b, a_k, vec4(b_k.y, b_k.x, b_k.z, b_k.w), ball)
+}
+// smin(a, b, k)'s f32 error: its operands' (it moves by no more than they do) and its own
+// arithmetic's over values within (|a| + |b| + k) and their spread over the ball
+fn smin_bound(a, b, k, a_k, b_k, ball) {
+    let lab = a_k.z + b_k.z
+    let e = max(a_k.w, b_k.w) + (abs(a) + abs(b) + lab * ball + k) * 0.0000006
+    // apart by k or more all over the ball: the min itself
+    if abs(a - b) - (lab * ball + a_k.w + b_k.w) > k {
+        if a < b { return vec4(a_k.x, a_k.y, a_k.z, e) }
+        return vec4(b_k.x, b_k.y, b_k.z, e)
+    }
+    var kn = BOUND_NONE
+    if k > 0.0 && lab < BOUND_NONE { kn = min(max(a_k.y, b_k.y) + (lab * lab) / (2.0 * k), BOUND_NONE) }
+    vec4(max(a_k.x, b_k.x), kn, max(a_k.z, b_k.z), e)
+}
+fn smooth_union_bound(a, b, k, a_k, b_k, ball) { smin_bound(a, b, k, a_k, b_k, ball) }
+fn smooth_difference_bound(a, b, k, a_k, b_k, ball) {
+    // -smin(-a, b, k): -a's bounds swap sides, and the result's back
+    let s = smin_bound(0.0 - a, b, k, vec4(a_k.y, a_k.x, a_k.z, a_k.w), b_k, ball)
+    vec4(s.y, s.x, s.z, s.w)
+}
+fn smooth_intersection_bound(a, b, k, a_k, b_k, ball) {
+    let s = smin_bound(0.0 - a, 0.0 - b, k, vec4(a_k.y, a_k.x, a_k.z, a_k.w), vec4(b_k.y, b_k.x, b_k.z, b_k.w), ball)
+    vec4(s.y, s.x, s.z, s.w)
+}
+fn sdf_round_bound(d, r, d_k, ball) {
+    vec4(d_k.x, d_k.y, d_k.z, d_k.w + (abs(d) + abs(r) + d_k.z * ball) * F32_U)
+}
+fn sdf_shell_bound(d, t, d_k, ball) {
+    // |d| keeps d's side over the ball (its sign's bounds) unless d can reach 0 there
+    let e = d_k.w + (abs(d) + abs(t) + d_k.z * ball) * F32_U
+    if d_k.z < BOUND_NONE && abs(d) - d_k.w > d_k.z * ball {
+        if d < 0.0 { return vec4(d_k.y, d_k.x, d_k.z, e) }
+        return vec4(d_k.x, d_k.y, d_k.z, e)
+    }
+    vec4(BOUND_NONE, max(d_k.x, d_k.y), d_k.z, e)
+}
+
+// The capsule, the round cone and the tube are distances to convex sets or unions of them:
+// 1-Lipschitz, no Hessian bound across their creases. Their f32 error: each step's rounding over
+// the values it spans (the point, the ball, the shape's points and radii; a magnitude `m` of a
+// point's largest lane stands for up to sqrt(3) m), a round cone's side normal ill-conditioned by
+// up to 1 / nx (nx >= 0.088, sdf_round_cone's cut-off), and a tube's samples computed from its
+// points (its control points within 8 sqrt(3) m). tests/field_bound.rs measures them.
+fn sdf_capsule_bound(p, a, b, r, ball) {
+    vec4(BOUND_NONE, BOUND_NONE, 1.00001, (length(p) + ball + 1.7321 * (a + b) + abs(r)) * 16.0 * F32_U)
+}
+fn sdf_round_cone_bound(p, a, b, ra, rb, ball) {
+    vec4(BOUND_NONE, BOUND_NONE, 1.00001, (length(p) + ball + 1.7321 * (a + b) + abs(ra) + abs(rb)) * 64.0 * F32_U)
+}
+fn sdf_tube_bound(p, pts, ball) {
+    vec4(BOUND_NONE, BOUND_NONE, 1.00001, (length(p) + ball + 32.0 * pts) * 64.0 * F32_U)
+}

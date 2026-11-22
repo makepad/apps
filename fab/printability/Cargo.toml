@@ -1,0 +1,13 @@
+[package]
+name = "fab-printability"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+fab-plate = { path = "../plate" }
+makepad-fab-slicer = { path = "../slicer" }
+makepad-fab-toolpath = { path = "../toolpath" }
+makepad-fab-gcode = { path = "../gcode" }
+makepad-fab-settings = { path = "../settings" }

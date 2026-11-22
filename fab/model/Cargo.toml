@@ -1,0 +1,39 @@
+[package]
+name = "fab-model"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab's model document: a Splash program of solids on one undo log, built by the typed solid graph into the printable plate"
+
+[package.metadata.makepad.platform-gaps]
+windows = {}
+
+[dependencies]
+fab-plate = { path = "../plate" }
+fab-printability = { path = "../printability" }
+makepad-core-util = { path = "../../../../libs/core_util" }
+makepad-csg-brep-model = { path = "../../../../libs/csg/csg_brep_model" }
+makepad-csg-graph = { path = "../../../../libs/csg/csg_graph" }
+makepad-csg-math = { path = "../../../../libs/csg/csg_math" }
+makepad-csg-mech = { path = "../../../../libs/csg/csg_mech" }
+makepad-csg-mesh = { path = "../../../../libs/csg/csg_mesh" }
+makepad-csg-sdf = { path = "../../../../libs/csg/csg_sdf" }
+makepad-fast-inflate = { path = "../../../../libs/fast_inflate" }
+makepad-jobs = { path = "../../../../libs/jobs" }
+makepad-fab-toolpath = { path = "../toolpath" }
+makepad-fab-gcode = { path = "../gcode" }
+makepad-fab-settings = { path = "../settings" }
+makepad-fab-slicer = { path = "../slicer" }
+makepad-model-script = { path = "../../engine/model_script" }
+fab-paint-field = { path = "../paint_field" }
+fab-colour = { path = "../colour" }
+makepad-script = { path = "../../../../platform/script" }
+
+[dev-dependencies]
+fab-sdf-engine = { path = "../sdf_engine" }
+fab-sdf-tiles = { path = "../sdf_tiles" }
+makepad-fab-slice = { path = "../slice" }
+
+[package.metadata.commercial]
+include = ["../app/resources/knurled_knob.cad.splash", "../app/resources/chain.cad.splash", "../app/resources/voronoi_vase.cad.splash", "../app/resources/bracket.cad.splash", "../app/resources/vase.cad.splash", "../app/resources/lattice_cube.cad.splash", "../app/resources/demo.fab.splash", "../app/resources/motor_mount.cad.splash"]

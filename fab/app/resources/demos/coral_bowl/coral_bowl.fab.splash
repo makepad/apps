@@ -1,0 +1,9 @@
+// A wide bowl with a coral pattern grown over it, in two filaments.
+use mod.fab.*
+
+script("coral_bowl.cad.splash")
+
+color("Cream", rgb: #xf2ead8)
+color("Coral", rgb: #xe8573c)
+
+place("coral_bowl", at: [175mm 160mm], name: "Coral bowl", color: "Cream")

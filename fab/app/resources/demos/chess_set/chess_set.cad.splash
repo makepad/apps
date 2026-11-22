@@ -1,0 +1,94 @@
+// A chess set's six pieces in two marbles: a king, queen, bishop, knight, rook and pawn in pale
+// stone veined dark, and the same six in dark stone veined pale, standing in two rows. Each piece
+// is turned (a profile spun round its upright axis) on a weighted foot; the knight's head is a
+// side profile pushed through and rounded off by an egg shape. The veins run through the whole
+// stone, so a scuffed piece still shows them. Every face leans less than 45 degrees from upright
+// or faces up, so the pieces print without supports.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let king_height = param(60mm, min: 36mm, max: 96mm, step: 1mm, label: "King height", group: "Set", hint: "the tallest piece; the others scale with it")
+let vein = param(6mm, min: 2mm, max: 20mm, step: 0.5mm, label: "Veins", group: "Marble", hint: "the spacing of the veins")
+let u = king_height / 60
+
+// A turned piece: its profile as [radius, height] points in sixtieths of the king's height, from
+// the axis at the foot out and up and back to the axis at the top.
+fn turned(points, x, z) {
+    m.revolve({sketch: Polygon{points: for q in points { [q[0] * u, q[1] * u] } fillet: 0.3mm} at: [x, 0, z]})
+}
+fn ball(r, y, x, z) { m.sphere({radius: r * u at: [x, y * u, z]}) }
+
+fn pawn(x, z) {
+    m.union(turned([[0, 0] [9, 0] [9, 1.8] [8, 3] [8.3, 4] [6.8, 5] [5, 6.5] [3.6, 9] [3, 12.2] [5.4, 15] [5.4, 16] [3.4, 17] [3.4, 18.6] [0, 18.6]], x, z), [ball(4.6, 21.6, x, z)])
+}
+// The rook's top is bored out and cut across twice for its battlements.
+fn rook(x, z) {
+    let body = turned([[0, 0] [10, 0] [10, 2] [9, 3.2] [9.3, 4.2] [7.6, 5.4] [6.6, 7] [6, 12] [5.6, 20] [7.6, 22.4] [7.6, 23.4] [6.8, 24.2] [6.8, 25] [8, 26.4] [8, 34] [0, 34]], x, z)
+    let bore = m.cylinder({radius: 5.4 * u height: 8 * u at: [x, 35 * u, z]})
+    let slots = [m.box({size: [20 * u, 6 * u, 2.6 * u] at: [x, 35 * u, z]}) m.box({size: [2.6 * u, 6 * u, 20 * u] at: [x, 35 * u, z]})]
+    m.subtract(body, [bore slots])
+}
+// The bishop's mitre is an egg cut by a slanting slit, a bud on top.
+fn bishop(x, z) {
+    let stem = turned([[0, 0] [10, 0] [10, 2] [9, 3.2] [9.3, 4.2] [7.6, 5.4] [5.6, 7] [4.4, 10] [3.4, 18] [3.2, 23] [6, 26.4] [6, 27.4] [4, 28.4] [3.8, 30.6] [0, 30.6]], x, z)
+    let mitre = m.ellipsoid({radii: [5.2 * u, 7.4 * u, 5.2 * u] at: [x, 35.4 * u, z]})
+    let bud = turned([[0, 41.6] [1.2, 41.6] [1.8, 43] [1.2, 44.4] [0, 44.8]], x, z)
+    // The slit runs in from the top and stops inside the egg, so the side past it stands on the egg
+    // below rather than starting in mid-air.
+    let slit = m.box({size: [1.2 * u, 10 * u, 14 * u] at: [x + 0.6 * u, 39.7 * u, z] rotate: [0, 0, 30°]})
+    m.union(m.subtract(m.union(stem, [mitre]), [slit]), [bud])
+}
+// The queen's cup flares to a rim set with eight beads, a ball on a short neck above.
+fn queen(x, z) {
+    let body = turned([[0, 0] [11, 0] [11, 2.2] [10, 3.4] [10.3, 4.4] [8.4, 5.6] [6.4, 7.4] [5, 11] [3.8, 22] [3.6, 31] [6.6, 34.6] [6.6, 35.6] [4.6, 36.6] [4.4, 37.8] [5.2, 39] [7.8, 44.4] [7.8, 45.2] [5, 45.2] [4.6, 46] [2.4, 46.6] [2, 47] [0, 47]], x, z)
+    let beads = for i in 0..8 {
+        let a = i * 3.14159 / 4
+        ball(1.4, 45.6, x + 6.4 * u * cos(a), z + 6.4 * u * sin(a))
+    }
+    m.union(body, [beads ball(2.6, 48.6, x, z)])
+}
+// The king's crown is a dome under a cross whose arms slope up from the upright, so they hold
+// themselves as they print.
+fn king(x, z) {
+    let body = turned([[0, 0] [11.4, 0] [11.4, 2.2] [10.4, 3.4] [10.7, 4.4] [8.8, 5.6] [6.8, 7.4] [5.4, 11] [4.2, 24] [4, 34] [7, 37.4] [7, 38.6] [4.8, 39.8] [4.6, 41] [5.4, 42.2] [8, 47.6] [8, 48.6] [6.4, 49.4] [5, 50.6] [3, 51.4] [1.6, 51.8] [0, 51.8]], x, z)
+    let cross = m.extrude({sketch: Polygon{points: for q in [[-1.2, 0] [1.2, 0] [1.2, 2.6] [3, 4.8] [3, 6.6] [1.2, 6.6] [1.2, 8.8] [-1.2, 8.8] [-1.2, 6.6] [-3, 6.6] [-3, 4.8] [-1.2, 2.6]] { [x + q[0] * u, (51 + q[1]) * u] } fillet: 0.2mm} plane: @xy height: 2.4 * u at: [0, 0, z - 1.2 * u]})
+    m.union(body, [cross])
+}
+// The knight: a low turned plinth and a horse's head in side profile (facing `dir`, +1 or -1 along
+// x), pushed through 8 units thick and cut by an egg so it narrows to the muzzle and the crest;
+// two dimples for its eyes.
+fn knight(x, z, dir) {
+    let plinth = turned([[0, 0] [10.4, 0] [10.4, 2] [9.4, 3.2] [9.7, 4.2] [8, 5.4] [6.8, 6.4] [0, 6.4]], x, z)
+    // Chest, throat, the jaw rising to the muzzle (no steeper than 45 degrees under it), the face up
+    // to an ear, and the mane down the back of the neck.
+    let profile = [[-6.5, 5.5] [6, 5.5] [7, 8.5] [7.2, 11] [6.4, 13.6] [5, 15.6] [6.8, 18.2] [9.2, 21] [11.6, 23.8] [12.4, 25.4] [12.2, 27] [10.2, 28.2] [7.8, 29.8] [5.6, 32] [4, 34.6] [2.8, 38.4] [1.6, 36.6] [0.2, 37.2] [-2.2, 36.2] [-4.4, 33.8] [-6.2, 30.4] [-7.4, 25] [-7.8, 18] [-7.6, 11] [-7, 7]]
+    let head = m.extrude({sketch: Polygon{points: for q in profile { [x + dir * q[0] * u, q[1] * u] } fillet: 0.4mm} plane: @xy height: 8 * u at: [0, 0, z - 4 * u]})
+    let rounded = m.intersect(head, m.ellipsoid({radii: [13 * u, 22 * u, 4.6 * u] at: [x + dir * u, 22 * u, z]}))
+    let eyes = for s in [-1, 1] { m.sphere({radius: 0.9 * u at: [x + dir * 4.6 * u, 30 * u, z + s * 3.9 * u]}) }
+    m.union(plinth, [m.subtract(rounded, eyes)])
+}
+
+// Two rows, rook to pawn, the pale row in front; the dark knight faces the other way.
+let pitch = 26 * u
+let row = 16 * u
+fn set(z, dir) {
+    let at = for i in 0..6 { (i - 2.5) * pitch }
+    [rook(at[0], z) knight(at[1], z, dir) bishop(at[2], z) queen(at[3], z) king(at[4], z) pawn(at[5], z)]
+}
+let pale = set(row, 1)
+let dark = set(0 - row, -1)
+let pieces = m.union(pale[0], [pale[1] pale[2] pale[3] pale[4] pale[5] dark[0] dark[1] dark[2] dark[3] dark[4] dark[5]])
+
+object(pieces, name: "Chess set")
+
+// Marble: thin veins along the crests of bands pushed about by 3D noise, through the whole
+// volume, a sixth of the stone or so. The pale set is white stone with dark veins, the dark set
+// black stone with pale veins: the same field, the two stones swapped.
+let white = Material{albedo: [0.93 0.92 0.89] name: "White"}
+let black = Material{albedo: [0.1 0.1 0.12] name: "Black"}
+fn veins(p) { (noise.bands(p.x / vein + 2.5 * noise.fbm(p / (3 * vein), 4, 4)) - 0.78) / 0.12 }
+let span = [6 * pitch, 2 * king_height, 2 * row - 2mm]
+m.fill(m.box({size: span at: [0, king_height, row]}), Mix{materials: [white black] field: fn(p) { veins(p) } sharp: 0.7})
+m.fill(m.box({size: span at: [0, king_height, 0 - row]}), Mix{materials: [black white] field: fn(p) { veins(p) } sharp: 0.7})

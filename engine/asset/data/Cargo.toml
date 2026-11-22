@@ -1,0 +1,14 @@
+[package]
+name = "makepad-asset-data"
+version = "0.1.0"
+edition = "2021"
+description = "Shared canonical content contract for the Makepad Asset Server: IDs, manifests, locks, scene plans, activation and snapshot DTOs"
+license = "MIT"
+
+# No dependencies but one zero-dependency leaf, on purpose: these types are
+# shared by the Asset Server, the client cache, the scene compiler, and the
+# headless World Server, so they must never drag in a UI Cx, GPU, database,
+# or HTTP stack. SHA-256 comes from makepad-core-util, the one implementation
+# the AI hub and the model document use too.
+[dependencies]
+makepad-core-util = { path = "../../../../../libs/core_util" }

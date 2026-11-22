@@ -1,0 +1,11 @@
+[package]
+name = "fab-elec-mcu-avr"
+version = "1.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+authors = ["Makepad <info@makepad.nl>"]
+description = "AVR (ATmega328P) assembler and cycle-exact instruction-set oracle for microsplash"
+
+[dependencies]
+fab-elec-mcu-emu = { path = "../emu" }

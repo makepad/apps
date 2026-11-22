@@ -1,0 +1,10 @@
+// A graded gyroid insole: firm under the heel, soft under the arch, its colour following the
+// density.
+use mod.fab.*
+
+script("lattice_sole.cad.splash")
+
+color("Mint", rgb: #x6bd1b3)
+color("Navy", rgb: #x1a2961)
+
+place("lattice_sole", at: [175mm 160mm], name: "Lattice sole", color: "Mint")

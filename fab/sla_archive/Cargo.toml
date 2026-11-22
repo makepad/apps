@@ -1,0 +1,12 @@
+[package]
+name = "fab-sla-archive"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "The archive a masked resin printer reads from a USB stick: the format's required bytes, and an independent reader that checks a file the way the printer reads it and decodes its layers back to pixels"
+
+[dependencies]
+makepad-core-util = { path = "../../../../libs/core_util" }
+makepad-fast-inflate = { path = "../../../../libs/fast_inflate" }
+makepad-strict-json = { path = "../../../../libs/strict_json" }

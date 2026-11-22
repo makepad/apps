@@ -1,0 +1,18 @@
+// A drifting jellyfish: a domed bell in bands from indigo up to a pearl crown with spots, and six
+// trailing tentacles of beads fused to aqua TPU cords that bend between every two of them.
+use mod.fab.*
+
+script("flex_jellyfish.cad.splash")
+
+color("Indigo", rgb: #x291f6e)
+color("Violet", rgb: #x4a2999)
+color("Purple", rgb: #x7a2eb0)
+color("Magenta", rgb: #xb5309e)
+color("Orchid", rgb: #xd961b8)
+color("Pink", rgb: #xed8fc7)
+color("Blush", rgb: #xf5c2db)
+color("Pearl", rgb: #xf7edf2)
+color("Aqua", rgb: #x33c7cc, material: "TPU")
+
+// Its first layer prints its paint too: the bell's first band reaches the bed.
+place("flex_jellyfish", at: [175mm 160mm], name: "Flex jellyfish", color: "Indigo", settings: {fab_paint_first_layer: true})

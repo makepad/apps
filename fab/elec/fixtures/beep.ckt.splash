@@ -1,0 +1,104 @@
+// Hold the button to play a tone through the codec and the differential speaker amplifier.
+use mod.elec.*
+use mod.std.*
+let e = mod.elec
+
+let gnd = e.net({name: "GND" kind: @ground})
+let vbus = e.net({name: "VBUS" kind: @power volts: 5V})
+let vdd = e.net({name: "3V3" kind: @power volts: 3.3V})
+let usb = usb_c_power({vbus: vbus gnd: gnd})
+// Power-only USB-C with two CC pull-downs (core.blocks.splash:3-14). Regulator pins,
+// input capacitor and bulk output capacitor follow handheld.ckt.splash:43-48,87-90.
+let ldo = e.part(ldo_3v3(), {pins: {VIN: vbus EN: vbus GND: gnd VOUT: vdd} nc: [@NC]})
+let ldo_in = e.c(1uF, vbus, gnd, {package: "0603" volts: 10V})
+let bulk = e.c(10uF, vdd, gnd, {package: "0805"})
+
+let xtal_p = e.net({name: "XTAL_P"})
+let xtal_n = e.net({name: "XTAL_N"})
+let enable = e.net({name: "ENABLE"})
+let boot = e.net({name: "BOOT"})
+let button_n = e.net({name: "BUTTON_N"})
+let sda = e.net({name: "SDA"})
+let scl = e.net({name: "SCL"})
+let mclk = e.net({name: "MCLK"})
+let sclk = e.net({name: "SCLK"})
+let lrck = e.net({name: "LRCK"})
+let dsdin = e.net({name: "DSDIN"})
+let asdout = e.net({name: "ASDOUT"})
+let pa_ctrl = e.net({name: "PA_CTRL"})
+
+// S3 terminals: ESP32S3_QFN56.part.splash:64-72. Supply and crystal connections follow
+// handheld.ckt.splash:30-32. facts-audio.md:9 gives every I2C, I2S and PA_CTRL GPIO.
+// GPIO4 (package pin 9) is the button input on this board.
+let mcu = e.part("mcu", {pins: {
+    VDD3P3: vdd VDD3P3_RTC: vdd VDD3P3_CPU: vdd VDD_SPI: vdd VDDA: vdd GND: gnd
+    XTAL_P: xtal_p XTAL_N: xtal_n CHIP_PU: enable GPIO0: boot GPIO4: button_n
+    GPIO15: sda GPIO14: scl GPIO16: mclk GPIO9: sclk GPIO45: lrck
+    GPIO8: dsdin GPIO10: asdout GPIO46: pa_ctrl
+} nc: [@LNA_IN @GPIO1 @GPIO2 @GPIO3 @GPIO5 @GPIO6 @GPIO7 @GPIO11 @GPIO12 @GPIO13
+       @GPIO17 @GPIO18 @GPIO19 @GPIO20 @GPIO21 @GPIO26 @GPIO27 @GPIO28 @GPIO29 @GPIO30
+       @GPIO31 @GPIO32 @GPIO33 @GPIO34 @GPIO35 @GPIO36 @GPIO37 @GPIO38 @GPIO39 @GPIO40
+       @GPIO41 @GPIO42 @GPIO43 @GPIO44 @GPIO47 @GPIO48]})
+// Crystal loads, seven supply bypass capacitors, strap and bus pulls from
+// handheld.ckt.splash:71-73,79-90. The 12 pF loads are that circuit's choice.
+let crystal = e.part(crystal_part("3225"), {value: 40MHz pins: [xtal_p xtal_n gnd]})
+let load_p = e.c(12pF, xtal_p, gnd, {package: "0402"})
+let load_n = e.c(12pF, xtal_n, gnd, {package: "0402"})
+let decouple = for i in 0..7 { e.c(100nF, vdd, gnd, {package: "0402"}) }
+let pull_enable = e.r(10kohm, enable, vdd, {package: "0402"})
+let pull_boot = e.r(10kohm, boot, vdd, {package: "0402"})
+let pull_sda = e.r(2.2kohm, sda, vdd, {package: "0402"})
+let pull_scl = e.r(2.2kohm, scl, vdd, {package: "0402"})
+let pull_button = e.r(10kohm, button_n, vdd, {package: "0402"})
+// Switch contacts A and B: std.part.splash:411-434.
+let button = e.part(tact_switch(), {pins: {A: button_n B: gnd}})
+
+let ce = e.net({name: "CE"})
+let vmid = e.net({name: "VMID"})
+let adcvref = e.net({name: "ADCVREF"})
+let dacvref = e.net({name: "DACVREF"})
+let outp = e.net({name: "OUTP"})
+let outn = e.net({name: "OUTN"})
+// 3.3 V is in range for all three supplies (es8311-datasheet.txt:494-498).
+// CE low selects 0x18 through 10 kohm (facts-audio.md:10). EP joins audio ground
+// (es8311-user-guide.txt:570). Pin functions: es8311-datasheet.txt:231-248.
+let codec = e.part("ES8311_QFN20", {pins: {
+    SCL: scl SDA: sda CE: ce MCLK: mclk SCLK: sclk LRCK: lrck DSDIN: dsdin ASDOUT: asdout
+    PVDD: vdd DVDD: vdd AVDD: vdd AGND: gnd DGND: gnd EP: gnd
+    ADCVREF: adcvref DACVREF: dacvref VMID: vmid OUTP: outp OUTN: outn
+} nc: [@MIC1P @MIC1N] fields: {"bus.addr": "24"}})
+let ce_low = e.r(10kohm, ce, gnd, {package: "0402"})
+// Typical application values NOT FOUND on the image-only es8311-datasheet.txt:273-279.
+// Use the guide's 100 nF local supply bypasses and 1 uF on each reference
+// (es8311-user-guide.txt:478-489,493-506,536-553).
+let codec_bypass = for i in 0..3 { e.c(100nF, vdd, gnd, {package: "0402"}) }
+let vmid_cap = e.c(1uF, vmid, gnd, {package: "0603"})
+let adc_cap = e.c(1uF, adcvref, gnd, {package: "0603"})
+let dac_cap = e.c(1uF, dacvref, gnd, {package: "0603"})
+
+let acp = e.net({name: "AC_P"})
+let acn = e.net({name: "AC_N"})
+let inp = e.net({name: "INP"})
+let inn = e.net({name: "INN"})
+// Series Cin and Rin on both legs (ns4150b.txt:173-183). Values from the handheld
+// schematic.txt:734-745. Board check: the visible formula in section 9.9 gives
+// AVD = 240K / Rin = 240/150 = 1.6, with no other factor visible. 20 log10(1.6)
+// is 4.08 dB, rounded to 4 dB for the model's integer gain.
+let cin_p = e.c(100nF, outp, acp, {package: "0402"})
+let rin_p = e.r(150kohm, acp, inp, {package: "0402"})
+let cin_n = e.c(100nF, outn, acn, {package: "0402"})
+let rin_n = e.r(150kohm, acn, inn, {package: "0402"})
+let bypass = e.net({name: "BYPASS"})
+let spk_p = e.net({name: "SPK_P"})
+let spk_n = e.net({name: "SPK_N"})
+// 5 V supply, Bypass and local VCC capacitors: ns4150b.txt:43-51,72-75,167-172.
+let amp = e.part("NS4150B_MSOP8", {pins: {
+    EN: pa_ctrl INP: inp INN: inn BYPASS: bypass VCC: vbus GND: gnd VOP: spk_p VON: spk_n
+} fields: {"bus.gain_db": "4"}})
+let bypass_cap = e.c(1uF, bypass, gnd, {package: "0603"})
+let amp_decouple = e.c(1uF, vbus, gnd, {package: "0603"})
+// Hold CTRL low at reset (schematic.txt:715-719,1744-1750,2037).
+let pull_ctrl = e.r(10kohm, pa_ctrl, gnd, {package: "0402"})
+// Header pin 1 is speaker positive, pin 2 negative. The 2.54 mm pitch is a board choice.
+// Numbered contacts and lands: std.part.splash:266-300.
+let speaker = e.part(header({pins: 2 pitch: 2.54mm}), {pins: {"1": spk_p "2": spk_n}})

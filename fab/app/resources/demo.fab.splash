@@ -1,0 +1,14 @@
+// The plate Fab opens with: a shelf bracket, a bud vase and a gyroid lattice cube,
+// each an object script placed on the plate.
+use mod.fab.*
+
+script("bracket.cad.splash")
+script("vase.cad.splash")
+script("lattice_cube.cad.splash")
+
+color("Orange", rgb: #xe2672b)
+color("Teal", rgb: #x2a9d8f)
+
+place("bracket", at: [150mm 165mm], name: "Shelf bracket", color: "Orange")
+place("vase", at: [222mm 165mm], name: "Bud vase", color: "Teal")
+place("lattice_cube", object: "lattice", at: [80mm 165mm], name: "Lattice cube", color: "Orange")

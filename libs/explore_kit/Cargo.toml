@@ -1,0 +1,10 @@
+[package]
+name = "makepad-explore-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "What the explorer maps share (Scope's code map, Fab's circuit explorer): the zoom-and-pan hop path, pan fling, wheel zoom timing"
+
+[dependencies]
+makepad-math = { path = "../../../../libs/math" }

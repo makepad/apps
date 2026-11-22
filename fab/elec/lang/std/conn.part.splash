@@ -1,0 +1,262 @@
+let __conn_e = mod.elec
+let __conn_f = mod.elec.f
+
+let __conn_positive = fn(v) {
+    return v.is_number() && v > 0mm && v - v == 0mm
+}
+
+let __conn_nonnegative = fn(v) {
+    return v.is_number() && v >= 0mm && v - v == 0mm
+}
+
+// Square-post diagonal plus 0.20 mm clearance, drill rounded up to 0.05 mm;
+// 0.30 mm annular ring, land diameter rounded to 0.01 mm.
+let __conn_tht_land = fn(lead) {
+    let f = __conn_f
+    let clearance = f.round(lead * 1.4142135623730951 + 0.2mm, 0.000001mm)
+    let nearest = f.round(clearance, 0.05mm)
+    let drill = if nearest == clearance { nearest } else {
+        f.round(clearance + 0.025mm, 0.05mm)
+    }
+    return {
+        drill: drill
+        diameter: f.round(drill + 2 * 0.3mm, 0.01mm)
+    }
+}
+
+// Nominal surface contacts: toe and heel 0.35 mm, side 0.03 mm.
+// (Z - G) / 2 = foot length + toe + heel; equal toe and heel retain the centre.
+let __conn_smd_land = fn(lead) {
+    return [__conn_f.round(lead[0] + 2 * 0.03mm, 0.01mm),
+            __conn_f.round(lead[1] + 0.35mm + 0.35mm, 0.01mm)]
+}
+
+let __conn_header = fn(o, boxed) {
+    let e = __conn_e
+    let f = __conn_f
+    let gen = if boxed { "box_header" } else { "header2" }
+    if !o.is_object() { return f.error(gen + ": o must be an options object") }
+    let pins = o.pins ?? nil
+    if !pins.is_number() || pins < 4 || pins > 80 || pins % 2 != 0 {
+        return f.error(gen + ": pins must be an even integer from 4 to 80")
+    }
+    let pitch = o.pitch ?? 2.54mm
+    let lead = o.lead ?? 0.64mm
+    // Nominal seated height: the bare header's spacer or the boxed header's shroud.
+    let default_height = if boxed { 8.8mm } else { 2.5mm }
+    let height = o.height ?? default_height
+    if !__conn_positive(height) {
+        return f.error(gen + ": height must be a positive finite length")
+    }
+    if !__conn_positive(pitch) {
+        return f.error(gen + ": pitch must be a positive finite length")
+    }
+    if !__conn_positive(lead) {
+        return f.error(gen + ": lead must be a positive finite square-post width")
+    }
+    let land = __conn_tht_land(lead)
+    if !__conn_positive(land.drill) || !__conn_positive(land.diameter) {
+        return f.error(gen + ": lead must produce positive finite drill and land diameters")
+    }
+    if pitch <= land.diameter {
+        return f.error(gen + ": pitch must exceed the rounded pad diameter for lead")
+    }
+    let rows = pins / 2
+    let size = if boxed {
+        o.shroud ?? [pitch * 2 + 6.1mm, rows * pitch + 7.6mm]
+    } else { [pitch * 2, rows * pitch] }
+    if !size.is_array() || size.len() != 2 {
+        return f.error(gen + ": shroud must be [x, y]")
+    }
+    if !__conn_positive(size[0]) || !__conn_positive(size[1]) {
+        return f.error(gen + ": pitch or shroud must produce positive finite body dimensions")
+    }
+    if boxed && (size[0] <= pitch + land.diameter + 0.4mm
+        || size[1] <= (rows - 1) * pitch + land.diameter + 0.4mm) {
+        return f.error(gen + ": shroud must leave more than 0.20 mm outside the rounded pads")
+    }
+    let prefix = if boxed { "BoxHeader_2x" } else { "PinHeader_2x" }
+    let height_suffix = if height == default_height { "" } else { "_H" + f.mm(height) + "mm" }
+    let name = prefix + f.int(rows) + "_P" + f.mm(pitch) + "mm" + height_suffix
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    // Like the single-row header, pad 1 is the origin and down is negative y.
+    let pads = for i in 0..pins {
+        let col = i % 2
+        let row = (i - col) / 2
+        f.thru(f.int(i + 1), [col * pitch, -row * pitch],
+            land.diameter, land.drill, {square: i == 0})
+    }
+    let cx = pitch / 2
+    let cy = -(rows - 1) * pitch / 2
+    // Mate from above: the pin field's outer post edges plus 0.5 mm on every side.
+    let port_x = (pitch + lead) / 2 + 0.5mm
+    let port_y = ((rows - 1) * pitch + lead) / 2 + 0.5mm
+    let x0 = cx - size[0] / 2
+    let x1 = cx + size[0] / 2
+    let y0 = cy - size[1] / 2
+    let y1 = cy + size[1] / 2
+    let graphics = [f.dot("F.SilkS", [0mm, land.diameter / 2 + 0.7mm], 0.15mm)]
+    if boxed {
+        // Keep the inset key clear of the left column, even for a custom shroud.
+        let room = -land.diameter / 2 - x0 - 0.2mm
+        let depth = if room < 1mm { room } else { 1mm }
+        let half_key = if pitch < size[1] / 4 { pitch } else { size[1] / 4 }
+        let notch = [[x0, cy + half_key], [x0 + depth, cy + half_key],
+                     [x0 + depth, cy - half_key], [x0, cy - half_key]]
+        // The native fab rectangle receives the same key as an extra polyline.
+        graphics.push(f.stroke("F.Fab", notch, 0.1mm))
+        graphics.push(f.stroke("F.SilkS", [
+            [x0, cy + half_key], [x0, y1], [x1, y1], [x1, y0],
+            [x0, y0], [x0, cy - half_key], [x0 + depth, cy - half_key],
+            [x0 + depth, cy + half_key], [x0, cy + half_key]
+        ], 0.12mm))
+    }
+    let left = for i in 0..pins { [f.int(i + 1), @passive] }
+    let pad_map = for i in 0..pins {
+        let no = f.int(i + 1)
+        [no, no]
+    }
+    return e.define(name, {
+        kind: @connector
+        symbol: f.ic_symbol(name, {left: left})
+        footprint: f.footprint({
+            pads: pads
+            body: [[x0, y0], [x1, y1]]
+            mount: @thru
+            text: 1mm
+            graphics: graphics
+        })
+        body: {height: height ports: [{
+            kind: @plug profile: {rect: [[-port_x, -port_y], [port_x, port_y]] r: 0mm}
+            at: [cx, cy, height] dir: [0, 0, 1] reach: 8mm margin: 0.3mm
+        }]}
+        pads: pad_map
+        prefix: "J"
+    })
+}
+
+// Two-row through-hole header; o.pins even 4..80, o.pitch (default 2.54 mm),
+// o.lead square-post width (default 0.64 mm). Row and column spacing equal pitch.
+// Optional o.height defaults to a nominal 2.5 mm seated spacer height.
+let header2 = fn(o) {
+    return __conn_header(o, false)
+}
+
+// Shrouded two-row header; header2 parameters plus o.shroud outer [x, y] in mm
+// (default [2 * pitch + 6.1 mm, pins / 2 * pitch + 7.6 mm]), keyed at left centre.
+// Optional o.height defaults to a nominal 8.8 mm seated shroud height.
+let box_header = fn(o) {
+    return __conn_header(o, true)
+}
+
+// Single-row surface wire header; o.pins 2..20, o.pitch, o.lead nominal contact
+// [width, length], o.tab finished land [w, h], o.tab_gap from outer contact centre
+// to tab inner edge, o.row_gap from contacts at y = 0 to tabs at positive y; mm.
+// Optional o.height defaults to a nominal 4.0 mm seated housing height.
+let wire_smd = fn(o) {
+    let e = __conn_e
+    let f = __conn_f
+    if !o.is_object() { return f.error("wire_smd: o must be an options object") }
+    let pins = o.pins ?? nil
+    let pitch = o.pitch ?? nil
+    let lead = o.lead ?? nil
+    let tab = o.tab ?? nil
+    let tab_gap = o.tab_gap ?? nil
+    let row_gap = o.row_gap ?? nil
+    let default_height = 4.0mm
+    let height = o.height ?? default_height
+    if !__conn_positive(height) {
+        return f.error("wire_smd: height must be a positive finite length")
+    }
+    if !pins.is_number() || pins < 2 || pins > 20 || pins % 1 != 0 {
+        return f.error("wire_smd: pins must be an integer from 2 to 20")
+    }
+    if !__conn_positive(pitch) {
+        return f.error("wire_smd: pitch must be a positive finite length")
+    }
+    if !lead.is_array() || lead.len() != 2 {
+        return f.error("wire_smd: lead must be [width, length]")
+    }
+    if !__conn_positive(lead[0]) || !__conn_positive(lead[1]) {
+        return f.error("wire_smd: lead dimensions must be positive finite lengths")
+    }
+    if !tab.is_array() || tab.len() != 2 {
+        return f.error("wire_smd: tab must be [w, h]")
+    }
+    if !__conn_positive(tab[0]) || !__conn_positive(tab[1]) {
+        return f.error("wire_smd: tab dimensions must be positive finite lengths")
+    }
+    if !__conn_nonnegative(tab_gap) {
+        return f.error("wire_smd: tab_gap must be a nonnegative finite length")
+    }
+    if !__conn_nonnegative(row_gap) {
+        return f.error("wire_smd: row_gap must be a nonnegative finite length")
+    }
+    let size = __conn_smd_land(lead)
+    let tab_size = [f.round(tab[0], 0.01mm), f.round(tab[1], 0.01mm)]
+    if !__conn_positive(size[0]) || !__conn_positive(size[1]) {
+        return f.error("wire_smd: lead must produce positive finite rounded lands")
+    }
+    if !__conn_positive(tab_size[0]) || !__conn_positive(tab_size[1]) {
+        return f.error("wire_smd: tab dimensions must remain positive and finite after rounding")
+    }
+    if pitch <= size[0] {
+        return f.error("wire_smd: pitch must exceed the rounded lead land width")
+    }
+    if tab_gap <= size[0] / 2 && row_gap <= (size[1] + tab_size[1]) / 2 {
+        return f.error("wire_smd: tab_gap and row_gap must separate tab lands from contact lands")
+    }
+    let half_row = (pins - 1) * pitch / 2
+    let tab_x = half_row + tab_gap + tab_size[0] / 2
+    // No housing size is supplied: use the pad envelope with 0.50 mm margin.
+    let contact_x = half_row + size[0] / 2
+    let outer_x = tab_x + tab_size[0] / 2
+    let extent_x = if outer_x > contact_x { outer_x } else { contact_x }
+    let body_x = extent_x + 0.5mm
+    let tab_bottom = row_gap - tab_size[1] / 2
+    let tab_top = row_gap + tab_size[1] / 2
+    let extent_y0 = if tab_bottom < -size[1] / 2 { tab_bottom } else { -size[1] / 2 }
+    let extent_y1 = if tab_top > size[1] / 2 { tab_top } else { size[1] / 2 }
+    let y0 = extent_y0 - 0.5mm
+    let y1 = extent_y1 + 0.5mm
+    if !__conn_positive(body_x) || !__conn_positive(y1 - y0) {
+        return f.error("wire_smd: pitch, lead, tab, tab_gap and row_gap must produce finite body dimensions")
+    }
+    let height_suffix = if height == default_height { "" } else { "_H" + f.mm(height) + "mm" }
+    let name = "WireSMD_1x" + f.int(pins) + "_P" + f.mm(pitch) + "mm" + height_suffix
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    let pads = for i in 0..pins {
+        f.smd(f.int(i + 1), [-half_row + i * pitch, 0mm], size)
+    }
+    pads.push(f.smd("MP", [-tab_x, row_gap], tab_size))
+    pads.push(f.smd("MP", [tab_x, row_gap], tab_size))
+    let left = for i in 0..pins { [f.int(i + 1), @passive] }
+    left.push(["MP", @passive])
+    let pad_map = for i in 0..pins {
+        let no = f.int(i + 1)
+        [no, no]
+    }
+    pad_map.push(["MP", "MP"])
+    // Assume side entry through +y, opposite the contact row. Without mouth dimensions,
+    // use the contact field plus 0.5 mm at each end and the full seated housing height.
+    let mouth_x = half_row + lead[0] / 2 + 0.5mm
+    return e.define(name, {
+        kind: @connector
+        symbol: f.ic_symbol(name, {left: left})
+        footprint: f.footprint({
+            pads: pads
+            body: [[-body_x, y0], [body_x, y1]]
+            mount: @smd
+            text: 1mm
+            graphics: [f.dot("F.SilkS", [-half_row, -size[1] / 2 - 0.7mm], 0.15mm)]
+        })
+        body: {height: height ports: [{
+            kind: @plug profile: {rect: [[-mouth_x, -height / 2], [mouth_x, height / 2]] r: 0mm}
+            at: [0mm, y1, height / 2] dir: [0, 1, 0] reach: 8mm margin: 0.3mm
+        }]}
+        pads: pad_map
+        prefix: "J"
+    })
+}

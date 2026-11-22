@@ -1,0 +1,10 @@
+[package]
+name = "fab-plate"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab's printable plate: parts in printer coordinates (mm, Z up), the machine's volume and nozzle reach, the contour-source trait the slicer reads, and STL and 3MF export"
+
+[dependencies]
+makepad-zip-file = { path = "../../../../libs/zip_file", version = "1.0.0" }

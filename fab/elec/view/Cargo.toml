@@ -1,0 +1,45 @@
+[package]
+name = "fab-elec-view"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab electronics view contract (C6): the design snapshot views read and the actions they emit"
+
+[package.metadata.makepad.platform-gaps]
+windows = {}
+
+[dependencies]
+fab-elec-core = { path = "../core" }
+fab-elec-board = { path = "../board" }
+fab-elec-bench = { path = "../bench" }
+fab-elec-instr = { path = "../instr" }
+fab-elec-circuit = { path = "../circuit" }
+fab-elec-design = { path = "../design" }
+fab-elec-lang = { path = "../lang" }
+fab-elec-parts = { path = "../parts" }
+# Colorimetry (the CIE observer): an LED's colour from its wavelength.
+fab-colour = { path = "../../colour" }
+# the circuit explorer's layout (the self-drawing sheet)
+fab-elec-explore = { path = "../explore" }
+fab-elec-route = { path = "../route" }
+fab-elec-cam = { path = "../cam" }
+# the solver's trace store (C10) the instruments read
+fab-elec-sim = { path = "../sim" }
+# the co-simulated device's state (`FwState`) the Firmware pane's state panel shows
+fab-elec-mcu-cosim = { path = "../mcu/cosim" }
+fab-elec-mcu-emu = { path = "../mcu/emu" }
+# the radio pack's manifest: the Radio row's source and licence come from it, as the licences page's do
+fab-elec-mcu-pack = { path = "../mcu/pack" }
+makepad-widgets-core = { path = "../../../../../widgets/core", version = "2.0.0" }
+# the bar's recording length: a preset or a typed value (`ComboBox` in its typed mode)
+makepad-widgets-pickers = { path = "../../../../../widgets/families/pickers", version = "2.0.0" }
+# the Firmware pane's monitor: the board's watch stream in a following list (Fab builds this family already)
+makepad-widgets-rich-text = { path = "../../../../../widgets/families/rich_text", version = "2.0.0" }
+# the Firmware pane's source: the code editor Fab's code panel uses
+makepad-code-editor = { path = "../../../../../code_editor", version = "2.0.0" }
+# the hop flight, pan fling and wheel glide shared with Scope (canvas navigation)
+makepad-explore-kit = { path = "../../../libs/explore_kit" }
+
+[dev-dependencies]
+fab-elec-fixtures = { path = "../fixtures" }

@@ -1,0 +1,4 @@
+// The exact-geometry demo: a motor mount in the B-rep engine, every value a parameter.
+use mod.fab.*
+
+script("motor_mount.cad.splash")

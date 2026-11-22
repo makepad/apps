@@ -1,0 +1,19 @@
+[package]
+name = "fab-elec-sheetview"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "The self-drawing circuit explorer on the LED controller fixture"
+
+[dependencies]
+fab-elec-fixtures = { path = "../../fixtures" }
+# Fab's desktop theme: the sheet Fab wears standalone, so the panels show Fab's own colours
+fab-controls = { path = "../../../controls" }
+makepad-widgets = { path = "../../../../../../widgets", version = "2.0.0" }
+fab-elec-view = { path = "../../view" }
+fab-elec-design = { path = "../../design" }
+fab-elec-host = { path = "../../host" }
+fab-elec-board = { path = "../../board" }
+fab-elec-bench = { path = "../../bench" }
+fab-elec-simhost = { path = "../../simhost" }

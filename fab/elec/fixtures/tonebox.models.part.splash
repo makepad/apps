@@ -1,0 +1,36 @@
+// tonebox's 3D models: each part's body is the model of a stock LCSC part whose package, pin pitch
+// and pin 1 match the part's own footprint, the same models drum16 names for the same std parts. A
+// model is fetched only when someone asks for it (Fetch 3D models), into their own part library,
+// where every plate's build finds it; until then the part keeps its own plain body. Nothing here
+// is shipped with Fab: the paths name the files the import makes.
+//
+// Each override names only the mesh (and, where the supplier draws the package turned or around
+// another origin, the turn and move that put its pin 1 on pad 1): the part keeps its own height and
+// ports (the LED's light, the key's stem, the pot's shaft). The LCSC numbers choose models, not the
+// parts a BOM orders: one 0402 resistor's model stands for every resistor value.
+let e = mod.elec
+// The LED: KT-0603G, green 0603; its cathode is pad 1 at -x, and its clear dome is the material
+// "lens" the 3D view lights.
+e.body("LED_0603_green", {mesh: "parts/lcsc/C12624.glb"})
+// The passives: 0402WGF1002TCE for every 0402 resistor, CL05B104KO5NNNC for every 0402 capacitor
+// and CL10A105KB8NNNC for every 0603 one.
+e.body("R_0402", {mesh: "parts/lcsc/C25744.glb"})
+e.body("C_0402", {mesh: "parts/lcsc/C1525.glb"})
+e.body("C_0603", {mesh: "parts/lcsc/C15849.glb"})
+// The hold diode: 1N4148WS in SOD-323; its band is the cathode, pad 1 at -x.
+e.body("D_sod323", {mesh: "parts/lcsc/C2128.glb"})
+// The Schmitt inverters: 74HC14D. The supplier draws an SOIC's leads along x with pin 1 at -x, -y;
+// the part has them along y with pin 1 at -x, +y, so the model turns a quarter clockwise.
+e.body("SCHMITT_HEX_SOIC-14", {mesh: "parts/lcsc/C5605.glb" rotation: [0deg, 0deg, -90deg]})
+// The pitch pot: RK09K1130A5R, 9 mm vertical. The supplier's origin is midway between the pins
+// and the legs, so the model moves 3.5 mm back to put its pin 2 on pad 2.
+e.body("POT_9MM_V", {mesh: "parts/lcsc/C209779.glb" offset: [0mm, 3.5mm, 0mm]})
+// The key: CPG135301D02, a low-profile switch with a cross stem. The supplier draws its pins on
+// the -x side around a centre 0.375 mm off its origin, so the model turns a quarter clockwise and
+// moves to put its centre post on the part's origin.
+e.body("SW_KEY_LOWPROFILE", {mesh: "parts/lcsc/C5142796.glb" offset: [0mm, 0.375mm, 0mm] rotation: [0deg, 0deg, -90deg]})
+// The line jack: a right-angle 3.5 mm stereo jack, its model as drawn in the part's own frame.
+e.body("JACK_3.5MM_STEREO", {mesh: "parts/lcsc/C5372850.glb"})
+// The USB-C receptacle: TYPE-C 6P, whose land std's power-only receptacle has; its mouth is the
+// part's -Y edge.
+e.body("USB_C_POWER", {mesh: "parts/lcsc/C456012.glb"})

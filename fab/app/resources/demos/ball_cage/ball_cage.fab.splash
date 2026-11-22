@@ -1,0 +1,9 @@
+// A print-in-place ball in a cage in two filaments: a charcoal cage, an amber ball.
+use mod.fab.*
+
+script("ball_cage.cad.splash")
+
+color("Charcoal", rgb: #x33373d)
+color("Amber", rgb: #xf29a1a)
+
+place("ball_cage", at: [175mm 160mm], name: "Ball in a cage", color: "Charcoal")

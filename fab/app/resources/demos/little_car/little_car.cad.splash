@@ -1,0 +1,96 @@
+// A little print-in-place car: a rounded body with a bubble cabin, four wheels turning on axles
+// printed through them, and a front axle that pivots under the bonnet to steer. Tyres and windows
+// are the second filament. It comes off the bed rolling: try it in Mechanics.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let wheel_radius = param(11mm, min: 8mm, max: 20mm, step: 0.5mm, label: "Wheel radius", group: "Wheels", kind: "radius")
+let wheel_width = param(7mm, min: 5mm, max: 14mm, step: 0.5mm, label: "Wheel width", group: "Wheels")
+let tyre = param(2.4mm, min: 1.2mm, max: 5mm, step: 0.1mm, label: "Tyre", group: "Wheels", hint: "the tyre's depth, in the second filament")
+let wheelbase = param(46mm, min: 30mm, max: 90mm, step: 1mm, label: "Wheelbase", group: "Body", hint: "from the rear axle to the front axle")
+let body_width = param(28mm, min: 20mm, max: 50mm, step: 1mm, label: "Body width", group: "Body")
+let ground = param(5mm, min: 3mm, max: 10mm, step: 0.5mm, label: "Ground clearance", group: "Body")
+let steer = param(15°, min: 5°, max: 18°, step: 1°, label: "Steering", group: "Body", hint: "how far the front axle turns each way; the front wheel arches clear this much")
+
+// Each tyre has a flat this deep where it stands on the bed, so a wheel prints on a footprint, not a line.
+let flat = 0.5mm
+let axle_y = wheel_radius - flat
+let rear_z = -wheelbase / 2
+let front_z = wheelbase / 2
+let side = body_width / 2
+// Each wheel turns a millimetre off the body's side.
+let wheel_x = side + 1mm + wheel_width / 2
+let track = 2 * (side + 1mm + wheel_width)
+let body_length = wheelbase + 2 * wheel_radius + 6mm
+
+// The body: a rounded chassis under a bubble cabin, one smooth field, tall enough at the front
+// to roof the steering slot.
+let chassis = m.box({size: [body_width, 13mm, body_length] radius: 3mm at: [0, ground + 6.5mm, 0]})
+let cabin = m.box({size: [body_width - 4mm, 10mm, body_length * 0.42] radius: 4mm at: [0, ground + 15mm, -body_length * 0.08]})
+let shell = m.blend([chassis cabin], 3mm)
+// The front axle's beam swings in a slot through the chassis, round a kingpin left standing: wider
+// than the slot, so it meets the slot's walls squarely, and inside the hinge's plates, so none of
+// it stands beside them. The slot is what the beam sweeps turning a little past its stops: a bow
+// tie, its straight edges the beam's at either stop, opening smoothly through the chassis' sides.
+// It clears the beam by four layers above and below: its short roof bridge cannot sag onto the
+// beam, and the beam's underside cannot tack to the slot's floor, nor come near where the hinge's
+// lower plate stands on that floor. Its floor and roof, like the beam's faces, lie between layers,
+// never in a layer's middle, where the slicer would find them half there.
+let swing = steer + 4°
+let reach = track / 2 + 4mm
+let half = 3.4mm
+let slot_h = 8.6mm
+let sweep = m.sdf({
+    bounds: [[-reach - 1mm, axle_y - slot_h / 2, front_z - reach * sin(swing) - 5mm], [reach + 1mm, axle_y + slot_h / 2, front_z + reach * sin(swing) + 5mm]]
+    field: fn(p) {
+        let q = p - vec3(0, axle_y, front_z)
+        let c = cos(swing)
+        let s = sin(swing)
+        // the beam at either stop, and every angle between: the wedge between the two
+        let left = sdf_box(vec3(q.x * c + q.z * s, q.y, q.z * c - q.x * s), vec3(2 * reach, slot_h, 2 * half))
+        let right = sdf_box(vec3(q.x * c - q.z * s, q.y, q.z * c + q.x * s), vec3(2 * reach, slot_h, 2 * half))
+        let wedge = sdf_intersection(sdf_box(q, vec3(2 * reach, slot_h, 2 * reach)), abs(q.z) * c - abs(q.x) * s)
+        return sdf_union(sdf_union(left, right), wedge)
+    }
+})
+let kingpin = m.cylinder({radius: 3.6mm height: 20mm at: [0, axle_y, front_z]})
+let slot = m.carve(sweep, kingpin, 0)
+// Arches over the front wheels, deep enough for a wheel's back edge as it steers.
+let arches = for x in [-1, 1] {
+    m.cylinder({radius: wheel_radius + 0.6mm height: 6mm at: [x * (side - 1mm), axle_y, front_z] rotate: [0, 0, 90°]})
+}
+// The rear axle runs through the rear wheels; the joints turn its ends into pins and the plates
+// beside each wheel. The pins are thin enough that the axle and the front beam reach a little past
+// those plates' rims, so no plate hangs below them where nothing would hold it while it prints.
+let wheel_pin = 0.95mm
+let rear_axle = m.cylinder({radius: 3.5mm height: track at: [0, axle_y, rear_z] rotate: [0, 0, 90°] segments: 48})
+// The slot and arches are carved with a 2 mm round, so their openings have soft edges.
+let body = m.union(m.carve(shell, [slot arches[0] arches[1]], 2mm), rear_axle)
+// The beam is round across its depth: nowhere does it reach farther from a wheel's pin than the
+// plates do, so the clearance the hinge cuts round them holds all of it.
+let front_axle = m.box({size: [track, 7mm, 5.8mm] radius: 2.85mm at: [0, axle_y, front_z]})
+
+let wheels = for z in [rear_z, front_z] {
+    for x in [-wheel_x, wheel_x] {
+        m.subtract(m.cylinder({radius: wheel_radius height: wheel_width at: [x, axle_y, z] rotate: [0, 0, 90°] segments: 64}), m.box({size: [wheel_width + 2mm, 2mm, 2 * wheel_radius] at: [x, -1mm, z]}))
+    }
+}
+
+let steering = m.hinge(body, front_axle, {at: [0, axle_y, front_z] lower: -steer upper: steer})
+let rear_left = m.hinge(body, wheels[0], {at: [-wheel_x, axle_y, rear_z] axis: [1, 0, 0] pin: wheel_pin})
+let rear_right = m.hinge(body, wheels[1], {at: [wheel_x, axle_y, rear_z] axis: [1, 0, 0] pin: wheel_pin})
+let front_left = m.hinge(front_axle, wheels[2], {at: [-wheel_x, axle_y, front_z] axis: [1, 0, 0] pin: wheel_pin})
+let front_right = m.hinge(front_axle, wheels[3], {at: [wheel_x, axle_y, front_z] axis: [1, 0, 0] pin: wheel_pin})
+
+object(body, name: "Little car")
+
+// The second filament: a tyre round every wheel, and the cabin's windows.
+let rubber = Material{albedo: [0.1 0.1 0.11] name: "Charcoal"}
+for z in [rear_z, front_z] {
+    for x in [-wheel_x, wheel_x] {
+        m.fill(m.subtract(m.cylinder({radius: wheel_radius + 1mm height: wheel_width + 1mm at: [x, axle_y, z] rotate: [0, 0, 90°]}), m.cylinder({radius: wheel_radius - tyre height: wheel_width + 2mm at: [x, axle_y, z] rotate: [0, 0, 90°]})), rubber)
+    }
+}
+m.fill(m.box({size: [body_width + 2mm, 4.5mm, body_length * 0.36] at: [0, ground + 16.5mm, -body_length * 0.08]}), rubber)

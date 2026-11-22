@@ -1,0 +1,12 @@
+[package]
+name = "fab-arms"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab's arm-cell planner: a live, observation-driven slicer that plans deposits where material is missing and cuts where there is excess, streams joint setpoints through the arms' dynamic models over a receding horizon, and corrects from the cell's observations"
+
+[dependencies]
+fab-robot = { path = "../robot" }
+# Slicing the design and offsetting regions (read-only reuse).
+makepad-fab-slicer = { path = "../slicer" }

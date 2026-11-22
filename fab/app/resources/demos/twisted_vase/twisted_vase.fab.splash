@@ -1,0 +1,9 @@
+// A twisted fluted vase with a stripe up each flute, in two filaments: teal and sand.
+use mod.fab.*
+
+script("twisted_vase.cad.splash")
+
+color("Teal", rgb: #x1b6b84)
+color("Sand", rgb: #xeedbb3)
+
+place("twisted_vase", at: [175mm 160mm], name: "Twisted vase", color: "Teal")

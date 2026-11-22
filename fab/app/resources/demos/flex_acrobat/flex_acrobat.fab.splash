@@ -1,0 +1,13 @@
+// A flexing acrobat in a star jump: ivory pieces in a coral leotard with coral hair, cobalt eyes
+// and gold trim, fused to five TPU cords that bend every way between them.
+use mod.fab.*
+
+script("flex_acrobat.cad.splash")
+
+color("Ivory", rgb: #xede3c8)
+color("Coral", rgb: #xd8452b)
+color("Cobalt", rgb: #x2450b4)
+color("Gold", rgb: #xe0ad2a)
+color("Ink", rgb: #x1a1a20, material: "TPU")
+
+place("flex_acrobat", at: [175mm 160mm], name: "Flex acrobat", color: "Ivory")

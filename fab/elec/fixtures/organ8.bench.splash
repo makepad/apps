@@ -1,0 +1,6 @@
+// The organ on its bench, every key up: the voices run, none is let through, nothing sounds. Hold
+// a key and its voice plays on the line out; hold several for a chord. The scope shows the line
+// out.
+bench("organ", {circuit: "organ8" run: {stop: 500ms}}, fn(b, c) {
+    b.probe(c.net("LINE"), {label: "Line out"})
+})

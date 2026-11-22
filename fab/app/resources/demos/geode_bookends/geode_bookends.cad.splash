@@ -1,0 +1,78 @@
+// A pair of geode bookends in three filaments: two neighbouring slices of one made-up geode, each
+// printed flat on a cut face. A rough rind of ridged noise, agate bands that follow the cavity
+// with a noisy warp, and a cavity through the slice studded with crystal points. Each stands on a
+// flat sawn edge, the cut faces showing the bands; the second slice is the next one along the
+// stone, so the pair matches.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let width = param(80mm, min: 50mm, max: 140mm, step: 1mm, label: "Width", group: "Geode")
+let tall = param(72mm, min: 45mm, max: 130mm, step: 1mm, label: "Height", group: "Geode", hint: "from the sawn edge it stands on to the top of the rind")
+let thick = param(22mm, min: 12mm, max: 40mm, step: 1mm, label: "Thickness", group: "Geode", hint: "each slice's thickness, as printed")
+let band = param(1.6mm, min: 0.8mm, max: 4mm, step: 0.1mm, label: "Band", group: "Agate", hint: "one band's width, light and dark")
+let seed = param(3, min: 1, max: 99, step: 1, label: "Stone", group: "Geode", hint: "another whole number cuts another stone")
+
+let a = width / 2
+let b = tall * 0.6
+// The stone's centre sits above the sawn edge, so the edge cuts its lower part off flat.
+let cy = tall - b
+let cav_a = a * 0.38
+let cav_b = b * 0.34
+let crystal = 2.2mm
+let spacing = width + 12mm
+
+// The stone's surfaces, in the slab's own coordinates: u across, v up from the sawn edge, w
+// through the stone (each slice samples its own stretch of w). Their noise is three times
+// slower through the stone, which is up as it prints, so the rough rind and the crystals lean
+// gently and nothing overhangs.
+fn rind(u, v, w) {
+    let e = length(vec2(u / a, (v - cy) / b)) - 1
+    e * min(a, b) + 4mm * (noise.ridged(vec3(u / 14mm, v / 14mm, w / 42mm), seed, 3) - 0.45)
+}
+fn hollow(u, v, w) {
+    let e = length(vec2(u / cav_a, (v - cy - b * 0.08) / cav_b)) - 1
+    let points = crystal * (1 - min(noise.worley(vec3(u / 2.4mm, v / 2.4mm, w / 6mm), seed + 5) * 1.4, 1))
+    e * min(cav_a, cav_b) + 2.5mm * noise.fbm(vec3(u / 10mm, v / 10mm, w / 30mm), seed + 6, 2) - points
+}
+// A slice lies on the bed: the stone's u along x, its v along z (from z = 0, the sawn edge),
+// and its w along y, from `w0`.
+fn slice(x0, w0) {
+    m.sdf({
+        bounds: [[x0 - a - 4mm, 0, 0], [x0 + a + 4mm, thick, tall + 4mm]]
+        cell: 0.5mm
+        field: fn(p) {
+            let u = p.x - x0
+            let v = p.z
+            let w = p.y + w0
+            let stone = sdf_difference(rind(u, v, w) * 0.7, hollow(u, v, w) * 0.7)
+            // the slab: above the sawn edge, between the two cut faces
+            let slab = max(0 - v, max(0 - p.y, p.y - thick))
+            return sdf_intersection(stone, slab)
+        }
+    })
+}
+let first = slice(0 - spacing / 2, 0)
+let second = slice(spacing / 2, thick + 3mm)
+
+object(m.union(first, second), name: "Geode bookends")
+
+// The colours through the stone: the rind outside, then agate bands that follow the cavity's
+// outline under a slow warp, dark and light, their widths drifting, and white quartz round the
+// crystals.
+let rind_brown = Material{albedo: [0.45 0.36 0.28] name: "Rind"}
+let agate = Material{albedo: [0.2 0.38 0.62] name: "Agate"}
+let quartz = Material{albedo: [0.93 0.94 0.96] name: "Quartz"}
+fn stone_colour(u, v, w) {
+    let skin = rind(u, v, w)
+    let inside = hollow(u, v, w)
+    let t = (inside + 1.6mm * noise.fbm(vec3(u, v, w) / 24mm, seed + 7, 2)) / band
+    let share = 0.5 + 0.3 * noise.fbm(vec3(u, v, w) / 30mm, seed + 8, 2)
+    if skin > 0 - 2.4mm { 0 } else { if inside < 3.2mm { 2 } else { if noise.bands(t * 0.5) > share { 1 } else { 2 } } }
+}
+for k in 0..2 {
+    let x0 = (2 * k - 1) * spacing / 2
+    let w0 = k * (thick + 3mm)
+    m.fill(m.box({size: [width + 12mm, thick + 2mm, tall + 10mm] at: [x0, thick / 2, tall / 2]}), Mix{materials: [rind_brown agate quartz] field: fn(p) { stone_colour(p.x - x0, p.z, p.y + w0) } sharp: 1})
+}

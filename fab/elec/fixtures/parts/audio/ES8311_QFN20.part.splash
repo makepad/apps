@@ -1,0 +1,31 @@
+// ES8311 in QFN-20, 3 x 3 mm (es8311-datasheet.txt:47-49; es8311-user-guide.txt:241). The
+// package drawing is an image (es8311-datasheet.txt:1426-1432), so the land pattern is the
+// standard one: board check, standard QFN-20 3 x 3 mm at 0.4 mm pitch, IPC nominal lands, lead
+// 0.2 x 0.4 mm, exposed pad 1.7 mm square, 0.75 mm high; not checked against the drawing.
+use mod.std.*
+let e = mod.elec
+let f = e.f
+
+e.define("ES8311_QFN20", {
+    kind: @ic
+    // CE is the low address bit (es8311-datasheet.txt:303-307). The circuit can override
+    // bus.addr with "25" for a high strap. SCL and SDA are CCLK and CDATA on the package.
+    fields: {sim: "bus" model: "ES8311" "bus.addr": "24"}
+    symbol: f.ic_symbol("ES8311", {
+        left: [["SCL" @in] ["SDA" @bidi] ["CE" @in] ["MCLK" @in] ["SCLK" @bidi]
+               ["LRCK" @bidi] ["DSDIN" @in] ["ASDOUT" @out]]
+        right: [["MIC1P" @in] ["MIC1N" @in] ["OUTP" @out] ["OUTN" @out]
+                ["ADCVREF" @passive] ["DACVREF" @passive] ["VMID" @passive]]
+        top: [["PVDD" @power_in] ["DVDD" @power_in] ["AVDD" @power_in]]
+        bottom: [["DGND" @power_in] ["AGND" @power_in] ["EP" @power_in]]
+    })
+    // Control, serial audio and analog pins: es8311-datasheet.txt:231-248.
+    // Exposed pad 21 connects to audio ground: schematic.txt:632-635,1744-1750
+    // and es8311-user-guide.txt:570.
+    pads: {SCL: 1 MCLK: 2 PVDD: 3 DVDD: 4 DGND: 5 SCLK: 6 ASDOUT: 7 LRCK: 8 DSDIN: 9
+           AGND: 10 AVDD: 11 OUTP: 12 OUTN: 13 DACVREF: 14 ADCVREF: 15 VMID: 16
+           MIC1N: 17 MIC1P: 18 SDA: 19 CE: 20 EP: 21}
+    footprint: qfn({pins: 20 pitch: 0.4mm body: [3mm, 3mm] lead: [0.2mm, 0.4mm] ep: [1.7mm, 1.7mm]})
+    body: {height: 0.75mm package: @qfn}
+    prefix: "U"
+})

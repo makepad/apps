@@ -1,0 +1,140 @@
+let __flat2_e = mod.elec
+let __flat2_f = mod.elec.f
+
+let __flat2_positive = fn(v) {
+    return v.is_number() && v > 0mm && v - v == 0mm
+}
+
+// Nominal flat-lead lands: toe 0.25 mm, heel 0.05 mm, side 0 mm.
+let __flat2_land = fn(span, lead) {
+    let toe = 0.25mm
+    let heel = 0.05mm
+    let side = 0mm
+    // Z = span + 2 * toe; G = span - 2 * lead[1] - 2 * heel.
+    // The equivalent length avoids subtracting nearly equal spans.
+    return {
+        x: __flat2_f.round((span - lead[1] + toe - heel) / 2, 0.01mm)
+        size: [__flat2_f.round(lead[1] + toe + heel, 0.01mm),
+               __flat2_f.round(lead[0] + 2 * side, 0.01mm)]
+    }
+}
+
+// Two flat leads bent under the body at its x ends; cathode pad 1 on the left.
+// o.body [x, y], o.span tip to tip along x, o.lead [width, foot length]; lengths in mm.
+let flat2 = fn(o) {
+    if !o.is_object() {
+        return __flat2_f.error("flat2: o must be an options object")
+    }
+    if (o.body ?? nil) == nil { return __flat2_f.error("flat2: body is required") }
+    if (o.span ?? nil) == nil { return __flat2_f.error("flat2: span is required") }
+    if (o.lead ?? nil) == nil { return __flat2_f.error("flat2: lead is required") }
+    if !o.body.is_array() || o.body.len() != 2 {
+        return __flat2_f.error("flat2: body must be [x, y]")
+    }
+    if !__flat2_positive(o.body[0]) || !__flat2_positive(o.body[1]) {
+        return __flat2_f.error("flat2: body dimensions must be positive finite lengths")
+    }
+    if !__flat2_positive(o.span) || o.span <= o.body[0] {
+        return __flat2_f.error("flat2: span must be a positive finite length greater than body x")
+    }
+    if !o.lead.is_array() || o.lead.len() != 2 {
+        return __flat2_f.error("flat2: lead must be [width, foot length]")
+    }
+    if !__flat2_positive(o.lead[0]) || !__flat2_positive(o.lead[1]) {
+        return __flat2_f.error("flat2: lead dimensions must be positive finite lengths")
+    }
+    if o.lead[0] > o.body[1] {
+        return __flat2_f.error("flat2: lead width must fit within body y")
+    }
+    // The feet may extend beneath the body, but the two lands must remain separate.
+    let land = __flat2_land(o.span, o.lead)
+    if !__flat2_positive(land.x) || !__flat2_positive(land.size[0]) || !__flat2_positive(land.size[1]) {
+        return __flat2_f.error("flat2: span and lead must produce positive finite rounded land dimensions")
+    }
+    let gap = 2 * land.x - land.size[0]
+    if !__flat2_positive(gap) {
+        return __flat2_f.error("flat2: span and lead foot length must leave space between the lands")
+    }
+    let half_x = o.body[0] / 2
+    let half_y = o.body[1] / 2
+    // the cathode bar clears the body and pad 1 (whose foot reaches past the body), the dot
+    // clears the bar
+    let pad_x = -land.x - land.size[0] / 2
+    let bar_x = (if pad_x < -half_x { pad_x } else { -half_x }) - 0.2mm
+    let dot_x = bar_x - 0.3mm
+    return __flat2_f.footprint({
+        pads: [
+            __flat2_f.smd("1", [-land.x, 0mm], land.size),
+            __flat2_f.smd("2", [land.x, 0mm], land.size)
+        ]
+        body: [[-half_x, -half_y], [half_x, half_y]]
+        mount: @smd
+        text: 0.6mm
+        graphics: [
+            __flat2_f.stroke("F.SilkS", [[bar_x, -half_y], [bar_x, half_y]], 0.12mm),
+            __flat2_f.dot("F.SilkS", [dot_x, 0mm], 0.15mm)
+        ]
+    })
+}
+
+// Two flat leads, body 1.7 x 1.25 mm; no parameters.
+let sod323 = fn() {
+    return flat2({body: [1.7mm, 1.25mm] span: 2.5mm lead: [0.3mm, 0.3mm]})
+}
+
+// Two flat leads, body 2.7 x 1.6 mm; no parameters.
+let sod123 = fn() {
+    return flat2({body: [2.7mm, 1.6mm] span: 3.7mm lead: [0.55mm, 0.5mm]})
+}
+
+// Two flat leads, body 4.3 x 2.6 mm; no parameters.
+let sma = fn() {
+    return flat2({body: [4.3mm, 2.6mm] span: 5.0mm lead: [1.4mm, 1.0mm]})
+}
+
+// Two flat leads, body 4.6 x 3.6 mm; no parameters.
+let smb = fn() {
+    return flat2({body: [4.6mm, 3.6mm] span: 5.4mm lead: [2.0mm, 1.0mm]})
+}
+
+// Two flat leads, body 7.0 x 5.9 mm; no parameters.
+let smc = fn() {
+    return flat2({body: [7.0mm, 5.9mm] span: 7.9mm lead: [3.0mm, 1.0mm]})
+}
+
+// A diode part; package is "sod323", "sod123", "sma", "smb" or "smc".
+// Optional o.height overrides nominal seated heights 1.0, 1.1, 2.2, 2.4, 2.6 mm respectively.
+let diode_part = fn(package, o = nil) {
+    if package != "sod323" && package != "sod123" && package != "sma" && package != "smb" && package != "smc" {
+        return __flat2_f.error("diode_part: package must be sod323, sod123, sma, smb or smc")
+    }
+    if o == nil { o = {} }
+    if !o.is_object() { return __flat2_f.error("diode_part: o must be an options object") }
+    let default_height = if package == "sod323" { 1.0mm }
+    elif package == "sod123" { 1.1mm }
+    elif package == "sma" { 2.2mm }
+    elif package == "smb" { 2.4mm }
+    else { 2.6mm }
+    let height = o.height ?? default_height
+    if !__flat2_positive(height) {
+        return __flat2_f.error("diode_part: height must be a positive finite length")
+    }
+    let height_suffix = if height == default_height { "" } else { "_H" + __flat2_f.mm(height) + "mm" }
+    let name = "D_" + package + height_suffix
+    let existing = __flat2_e.lookup(name)
+    if existing != nil { return existing }
+    let footprint = if package == "sod323" { sod323() }
+    elif package == "sod123" { sod123() }
+    elif package == "sma" { sma() }
+    elif package == "smb" { smb() }
+    else { smc() }
+    if footprint == nil { return nil }
+    return __flat2_e.define(name, {
+        kind: @diode
+        symbol: __flat2_f.two_terminal([["K", @passive], ["A", @passive]])
+        footprint: footprint
+        body: {height: height}
+        pads: {K: 1 A: 2}
+        prefix: "D"
+    })
+}

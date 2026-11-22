@@ -1,0 +1,1606 @@
+// Grow: a part's material where its loads want it, on the GPU (minimum compliance by SIMP with a
+// density filter, a Heaviside projection whose threshold holds the volume, and OC updates).
+//
+// Levels run coarsest first, each continuing from the last one's density and displacement. A
+// level is a box of cells; every kernel takes `first`, so a pass can be cut into jobs of any size
+// and give the same bits. The sums run over a fixed number of walkers with a fixed stride, never
+// over the jobs.
+//
+// Scalars on the device: 0 r.z, 1 alpha, 2 beta, 3 r.r, 4 f.f, 5 iterations, 6 converged,
+// 7 compliance, 8-9 threshold's low and high, 10-11 ln multiplier's low and high, 12 volume.
+
+use mod.pod.*
+use mod.math.*
+use mod.shader
+use mod.kernel.*
+
+// ---- On the CPU: one hex8's matrix, for its size and material --------------------------------
+
+// d N_k / d axis at (xi, eta, zeta) of a unit cell.
+fn dshape(k, axis, xi, eta, zeta) {
+    let sx = float(2 * (k % 2) - 1)
+    let sy = float(2 * ((k / 2) % 2) - 1)
+    let sz = float(2 * (k / 4) - 1)
+    if axis == 0 {
+        0.25 * sx * (1.0 + eta * sy) * (1.0 + zeta * sz)
+    } else if axis == 1 {
+        0.25 * (1.0 + xi * sx) * sy * (1.0 + zeta * sz)
+    } else {
+        0.25 * (1.0 + xi * sx) * (1.0 + eta * sy) * sz
+    }
+}
+
+// Engineering strain component c (xx, yy, zz, xy, yz, zx) of a unit displacement along d of a node
+// with shape gradient (gx, gy, gz).
+fn strain(d, c, gx, gy, gz) {
+    var e = 0.0
+    if d == 0 {
+        if c == 0 { e = gx }
+        if c == 3 { e = gy }
+        if c == 5 { e = gz }
+    } else if d == 1 {
+        if c == 1 { e = gy }
+        if c == 3 { e = gx }
+        if c == 4 { e = gz }
+    } else {
+        if c == 2 { e = gz }
+        if c == 4 { e = gy }
+        if c == 5 { e = gx }
+    }
+    e
+}
+
+let grow_element = {
+    label: "grow element"
+    k0: output(f32)
+    e0: param(1.0)
+    nu: param(0.3, 0.0, 0.49)
+    hx: param(1.0)
+    hy: param(1.0)
+    hz: param(1.0)
+    element: fn(i) {
+        let a = i / 24
+        let b = i % 24
+        let an = a / 3
+        let ad = a % 3
+        let bn = b / 3
+        let bd = b % 3
+        let lam = nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
+        let mu = 1.0 / (2.0 * (1.0 + nu))
+        let g = 0.5773502691896258
+        var acc = 0.0
+        for q in 0..8 {
+            let xi = g * float(2 * (q % 2) - 1)
+            let eta = g * float(2 * ((q / 2) % 2) - 1)
+            let zeta = g * float(2 * (q / 4) - 1)
+            let ax = dshape(an, 0, xi, eta, zeta) / hx
+            let ay = dshape(an, 1, xi, eta, zeta) / hy
+            let az = dshape(an, 2, xi, eta, zeta) / hz
+            let bx = dshape(bn, 0, xi, eta, zeta) / hx
+            let by = dshape(bn, 1, xi, eta, zeta) / hy
+            let bz = dshape(bn, 2, xi, eta, zeta) / hz
+            let b0 = strain(bd, 0, bx, by, bz)
+            let b1 = strain(bd, 1, bx, by, bz)
+            let b2 = strain(bd, 2, bx, by, bz)
+            let tr = lam * (b0 + b1 + b2)
+            acc = acc + strain(ad, 0, ax, ay, az) * (tr + 2.0 * mu * b0)
+            acc = acc + strain(ad, 1, ax, ay, az) * (tr + 2.0 * mu * b1)
+            acc = acc + strain(ad, 2, ax, ay, az) * (tr + 2.0 * mu * b2)
+            acc = acc + strain(ad, 3, ax, ay, az) * mu * strain(bd, 3, bx, by, bz)
+            acc = acc + strain(ad, 4, ax, ay, az) * mu * strain(bd, 4, bx, by, bz)
+            acc = acc + strain(ad, 5, ax, ay, az) * mu * strain(bd, 5, bx, by, bz)
+        }
+        // the Gauss weights are 1, the Jacobian's determinant an eighth of the cell
+        k0[i] = acc * e0 * hx * hy * hz * 0.125
+    }
+}
+
+// ---- The grid ---------------------------------------------------------------------------------
+
+let grow_grid = {
+    nodes: shader.uniform(vec4u)
+    cells_n: shader.uniform(vec4u)
+    first: shader.uniform(u32)
+}
+
+// Each cell's nodal forces f = E K0 x: four cells a group, a thread per row, its 24 displacements
+// shared. K0 takes a rigid move to nothing only as far as its f32 rows sum to zero, and over a soft
+// part's cells what that leaves adds up to more than the part's own stiffness, so a row acts on the
+// displacements relative to the cell's first corner.
+let grow_cells = {
+    ..grow_grid
+    label: "grow cells"
+    workgroup_size: 96
+    k0: shader.buffer(f32)
+    e: shader.buffer(f32)
+    x: shader.buffer(vec4f)
+    cf: shader.buffer_rw(f32)
+    xs: shader.workgroup(f32, 96)
+    main: fn() {
+        let t = local_index()
+        let s = (self.first + group_id().x) * 4u + t / 24u
+        let r = t % 24u
+        let live = s < self.cells_n.w
+        if live {
+            let cx = s % self.cells_n.x
+            let cy = (s / self.cells_n.x) % self.cells_n.y
+            let cz = s / (self.cells_n.x * self.cells_n.y)
+            let corner = r / 3u
+            let n = (cx + corner % 2u) + self.nodes.x * ((cy + (corner / 2u) % 2u) + self.nodes.y * (cz + corner / 4u))
+            let v = self.x[n]
+            let a = r % 3u
+            var xv = v.x
+            if a == 1u { xv = v.y }
+            if a == 2u { xv = v.z }
+            self.xs[t] = xv
+        }
+        barrier()
+        if live {
+            let base = t - r
+            var f = 0.0
+            for c in 0..24u {
+                f += self.k0[r * 24u + c] * (self.xs[base + c] - self.xs[base + c % 3u])
+            }
+            self.cf[s * 24u + r] = f * self.e[s]
+        }
+    }
+}
+
+// A node's share of its (up to) eight cells' forces, and its free axes.
+let grow_gather = {
+    ..grow_grid
+    workgroup_size: 64
+    cf: shader.buffer(f32)
+    held: shader.buffer(u32)
+    node: fn() -> u32 {
+        return (self.first + group_id().x) * 64u + local_index()
+    }
+    sum: fn(n: u32) -> vec3 {
+        let i = n % self.nodes.x
+        let j = (n / self.nodes.x) % self.nodes.y
+        let k = n / (self.nodes.x * self.nodes.y)
+        var y = vec3(0.0)
+        for q in 0..8u {
+            let dx = q % 2u
+            let dy = (q / 2u) % 2u
+            let dz = q / 4u
+            if i < dx || j < dy || k < dz { continue }
+            let ci = i - dx
+            let cj = j - dy
+            let ck = k - dz
+            if ci >= self.cells_n.x || cj >= self.cells_n.y || ck >= self.cells_n.z { continue }
+            let at = (ci + self.cells_n.x * (cj + self.cells_n.y * ck)) * 24u + q * 3u
+            y += vec3(self.cf[at], self.cf[at + 1u], self.cf[at + 2u])
+        }
+        return y
+    }
+    free: fn(n: u32) -> vec3 {
+        let h = self.held[n]
+        return vec3(f32(1u - (h & 1u)), f32(1u - ((h >> 1u) & 1u)), f32(1u - ((h >> 2u) & 1u)))
+    }
+}
+
+// y = A x on the free degrees of freedom.
+let grow_apply = {
+    ..grow_gather
+    label: "grow apply"
+    out: shader.buffer_rw(vec4f)
+    main: fn() {
+        let n = self.node()
+        if n >= self.nodes.w { return }
+        self.out[n] = vec4(self.sum(n) * self.free(n), 0.0)
+    }
+}
+
+// r = b - A x on the free degrees of freedom.
+let grow_residual = {
+    ..grow_gather
+    label: "grow residual"
+    b: shader.buffer(vec4f)
+    out: shader.buffer_rw(vec4f)
+    main: fn() {
+        let n = self.node()
+        if n >= self.nodes.w { return }
+        self.out[n] = vec4((self.b[n].xyz - self.sum(n)) * self.free(n), 0.0)
+    }
+}
+
+// One damped block Jacobi sweep. D^-1 is symmetric: six values a node (00 01 02 11 12 22).
+let grow_smooth = {
+    ..grow_gather
+    label: "grow smooth"
+    dinv: shader.buffer(f32)
+    b: shader.buffer(vec4f)
+    x: shader.buffer_rw(vec4f)
+    omega: shader.uniform(f32)
+    main: fn() {
+        let n = self.node()
+        if n >= self.nodes.w { return }
+        let r = (self.b[n].xyz - self.sum(n)) * self.free(n)
+        let at = n * 6u
+        let d1 = self.dinv[at + 1u]
+        let d2 = self.dinv[at + 2u]
+        let d4 = self.dinv[at + 4u]
+        let d = vec3(dot(vec3(self.dinv[at], d1, d2), r), dot(vec3(d1, self.dinv[at + 3u], d4), r), dot(vec3(d2, d4, self.dinv[at + 5u]), r))
+        self.x[n] = vec4(self.x[n].xyz + d * self.omega, 0.0)
+    }
+}
+
+// The first sweep from rest: x = omega D^-1 b.
+let grow_rest = {
+    label: "grow smooth from rest"
+    workgroup_size: 64
+    count: shader.uniform(u32)
+    first: shader.uniform(u32)
+    dinv: shader.buffer(f32)
+    b: shader.buffer(vec4f)
+    x: shader.buffer_rw(vec4f)
+    omega: shader.uniform(f32)
+    main: fn() {
+        let n = (self.first + group_id().x) * 64u + local_index()
+        if n >= self.count { return }
+        let r = self.b[n].xyz
+        let at = n * 6u
+        let d1 = self.dinv[at + 1u]
+        let d2 = self.dinv[at + 2u]
+        let d4 = self.dinv[at + 4u]
+        let d = vec3(dot(vec3(self.dinv[at], d1, d2), r), dot(vec3(d1, self.dinv[at + 3u], d4), r), dot(vec3(d2, d4, self.dinv[at + 5u]), r))
+        self.x[n] = vec4(d * self.omega, 0.0)
+    }
+}
+
+// A node's inverse block: its cells' E K0 blocks summed, held axes cut to the identity.
+let grow_dinv = {
+    ..grow_grid
+    label: "grow diagonal"
+    workgroup_size: 64
+    k0: shader.buffer(f32)
+    e: shader.buffer(f32)
+    held: shader.buffer(u32)
+    dinv: shader.buffer_rw(f32)
+    main: fn() {
+        let n = (self.first + group_id().x) * 64u + local_index()
+        if n >= self.nodes.w { return }
+        let i = n % self.nodes.x
+        let j = (n / self.nodes.x) % self.nodes.y
+        let k = n / (self.nodes.x * self.nodes.y)
+        var a00 = 0.0
+        var a01 = 0.0
+        var a02 = 0.0
+        var a11 = 0.0
+        var a12 = 0.0
+        var a22 = 0.0
+        for q in 0..8u {
+            let dx = q % 2u
+            let dy = (q / 2u) % 2u
+            let dz = q / 4u
+            if i < dx || j < dy || k < dz { continue }
+            let ci = i - dx
+            let cj = j - dy
+            let ck = k - dz
+            if ci >= self.cells_n.x || cj >= self.cells_n.y || ck >= self.cells_n.z { continue }
+            let e = self.e[ci + self.cells_n.x * (cj + self.cells_n.y * ck)]
+            let at = q * 3u * 24u + q * 3u
+            a00 += e * self.k0[at]
+            a01 += e * self.k0[at + 1u]
+            a02 += e * self.k0[at + 2u]
+            a11 += e * self.k0[at + 25u]
+            a12 += e * self.k0[at + 26u]
+            a22 += e * self.k0[at + 50u]
+        }
+        let h = self.held[n]
+        if (h & 1u) != 0u {
+            a00 = 1.0
+            a01 = 0.0
+            a02 = 0.0
+        }
+        if (h & 2u) != 0u {
+            a11 = 1.0
+            a01 = 0.0
+            a12 = 0.0
+        }
+        if (h & 4u) != 0u {
+            a22 = 1.0
+            a02 = 0.0
+            a12 = 0.0
+        }
+        let c00 = a11 * a22 - a12 * a12
+        let c01 = a02 * a12 - a01 * a22
+        let c02 = a01 * a12 - a02 * a11
+        let id = 1.0 / (a00 * c00 + a01 * c01 + a02 * c02)
+        let at = n * 6u
+        self.dinv[at] = c00 * id
+        self.dinv[at + 1u] = c01 * id
+        self.dinv[at + 2u] = c02 * id
+        self.dinv[at + 3u] = (a00 * a22 - a02 * a02) * id
+        self.dinv[at + 4u] = (a01 * a02 - a00 * a12) * id
+        self.dinv[at + 5u] = (a00 * a11 - a01 * a01) * id
+    }
+}
+
+// ---- Between a level and the next coarser ------------------------------------------------------
+
+let grow_transfer = {
+    workgroup_size: 64
+    fine: shader.uniform(vec4u)
+    coarse: shader.uniform(vec4u)
+    halved: shader.uniform(vec4u)
+    first: shader.uniform(u32)
+    index: fn() -> u32 {
+        return (self.first + group_id().x) * 64u + local_index()
+    }
+}
+
+// A coarse cell's E: its children's, as much of it as they fill (a child past the fine grid is
+// empty).
+let grow_coarsen = {
+    label: "grow coarsen"
+    workgroup_size: 64
+    fine: shader.uniform(vec4u)
+    coarse: shader.uniform(vec4u)
+    halved: shader.uniform(vec4u)
+    first: shader.uniform(u32)
+    ef: shader.buffer(f32)
+    ec: shader.buffer_rw(f32)
+    main: fn() {
+        let c = (self.first + group_id().x) * 64u + local_index()
+        if c >= self.coarse.w { return }
+        let i = c % self.coarse.x
+        let j = (c / self.coarse.x) % self.coarse.y
+        let k = c / (self.coarse.x * self.coarse.y)
+        var sum = 0.0
+        var kids = 0u
+        for q in 0..8u {
+            let dx = q % 2u
+            let dy = (q / 2u) % 2u
+            let dz = q / 4u
+            if dx > self.halved.x || dy > self.halved.y || dz > self.halved.z { continue }
+            kids += 1u
+            let fx = i * (1u + self.halved.x) + dx
+            let fy = j * (1u + self.halved.y) + dy
+            let fz = k * (1u + self.halved.z) + dz
+            if fx >= self.fine.x || fy >= self.fine.y || fz >= self.fine.z { continue }
+            sum += self.ef[fx + self.fine.x * (fy + self.fine.y * fz)]
+        }
+        self.ec[c] = sum / f32(kids)
+    }
+}
+
+// A coarse node's held axes: those of the fine nodes it takes over, the one it sits on and along a
+// halved axis the next. What holds a part stays held on a level whose nodes miss it: without that
+// the level is a free body, and its correction a rigid move that the fine held nodes tear.
+let grow_coarse_held = {
+    ..grow_transfer
+    label: "grow coarse held"
+    hf: shader.buffer(u32)
+    hc: shader.buffer_rw(u32)
+    main: fn() {
+        let n = self.index()
+        if n >= self.coarse.w { return }
+        let i = (n % self.coarse.x) * (1u + self.halved.x)
+        let j = ((n / self.coarse.x) % self.coarse.y) * (1u + self.halved.y)
+        let k = (n / (self.coarse.x * self.coarse.y)) * (1u + self.halved.z)
+        var held = 0u
+        for q in 0..8u {
+            let dx = q % 2u
+            let dy = (q / 2u) % 2u
+            let dz = q / 4u
+            if dx > self.halved.x || dy > self.halved.y || dz > self.halved.z { continue }
+            let x = i + dx
+            let y = j + dy
+            let z = k + dz
+            if x >= self.fine.x || y >= self.fine.y || z >= self.fine.z { continue }
+            held = held | self.hf[x + self.fine.x * (y + self.fine.y * z)]
+        }
+        self.hc[n] = held
+    }
+}
+
+// Coarse = R fine: a coarse node takes its fine node (1) and, along a halved axis, the two beside
+// it (1/2 each). `held` is the coarse level's.
+let grow_restrict = {
+    ..grow_transfer
+    label: "grow restrict"
+    held: shader.buffer(u32)
+    rf: shader.buffer(vec4f)
+    rc: shader.buffer_rw(vec4f)
+    reach: fn(i: u32, d: u32, h: u32, n: u32) -> u32 {
+        if h == 0u {
+            if d == 1u { return i }
+            return n
+        }
+        let f = 2u * i + d
+        if f < 1u { return n }
+        if f - 1u >= n { return n }
+        return f - 1u
+    }
+    weight: fn(d: u32) -> f32 {
+        if d == 1u { return 1.0 }
+        return 0.5
+    }
+    main: fn() {
+        let n = self.index()
+        if n >= self.coarse.w { return }
+        let i = n % self.coarse.x
+        let j = (n / self.coarse.x) % self.coarse.y
+        let k = n / (self.coarse.x * self.coarse.y)
+        var sum = vec3(0.0)
+        for dz in 0..3u {
+            let z = self.reach(k, dz, self.halved.z, self.fine.z)
+            if z >= self.fine.z { continue }
+            for dy in 0..3u {
+                let y = self.reach(j, dy, self.halved.y, self.fine.y)
+                if y >= self.fine.y { continue }
+                for dx in 0..3u {
+                    let x = self.reach(i, dx, self.halved.x, self.fine.x)
+                    if x >= self.fine.x { continue }
+                    let w = self.weight(dx) * self.weight(dy) * self.weight(dz)
+                    sum += self.rf[x + self.fine.x * (y + self.fine.y * z)].xyz * w
+                }
+            }
+        }
+        let h = self.held[n]
+        self.rc[n] = vec4(sum * vec3(f32(1u - (h & 1u)), f32(1u - ((h >> 1u) & 1u)), f32(1u - ((h >> 2u) & 1u))), 0.0)
+    }
+}
+
+// Fine += P coarse: a fine node takes the coarse node it sits on, or the two (four, eight) it sits
+// between, along the halved axes. `held` is the fine level's.
+let grow_prolong = {
+    ..grow_transfer
+    label: "grow prolong"
+    held: shader.buffer(u32)
+    xc: shader.buffer(vec4f)
+    xf: shader.buffer_rw(vec4f)
+    parent: fn(i: u32, p: u32, h: u32, n: u32) -> u32 {
+        if h == 0u {
+            if p == 0u { return i }
+            return n
+        }
+        if i % 2u == 0u {
+            if p == 0u { return i / 2u }
+            return n
+        }
+        if p == 0u { return i / 2u }
+        if i / 2u + 1u >= n { return n }
+        return i / 2u + 1u
+    }
+    weight: fn(i: u32, h: u32) -> f32 {
+        if h == 0u { return 1.0 }
+        if i % 2u == 0u { return 1.0 }
+        return 0.5
+    }
+    main: fn() {
+        let n = self.index()
+        if n >= self.fine.w { return }
+        let i = n % self.fine.x
+        let j = (n / self.fine.x) % self.fine.y
+        let k = n / (self.fine.x * self.fine.y)
+        var sum = vec3(0.0)
+        for pz in 0..2u {
+            let z = self.parent(k, pz, self.halved.z, self.coarse.z)
+            if z >= self.coarse.z { continue }
+            for py in 0..2u {
+                let y = self.parent(j, py, self.halved.y, self.coarse.y)
+                if y >= self.coarse.y { continue }
+                for px in 0..2u {
+                    let x = self.parent(i, px, self.halved.x, self.coarse.x)
+                    if x >= self.coarse.x { continue }
+                    let w = self.weight(i, self.halved.x) * self.weight(j, self.halved.y) * self.weight(k, self.halved.z)
+                    sum += self.xc[x + self.coarse.x * (y + self.coarse.y * z)].xyz * w
+                }
+            }
+        }
+        let h = self.held[n]
+        self.xf[n] = vec4(self.xf[n].xyz + sum * vec3(f32(1u - (h & 1u)), f32(1u - ((h >> 1u) & 1u)), f32(1u - ((h >> 2u) & 1u))), 0.0)
+    }
+}
+
+// ---- Sums -------------------------------------------------------------------------------------
+
+// a.b and a.c per group over every node: `groups` groups of 256 walkers stride the vectors, so
+// each sum's order does not depend on how the groups are cut into jobs.
+let grow_dot = {
+    label: "grow dot"
+    workgroup_size: 256
+    count: shader.uniform(u32)
+    groups: shader.uniform(u32)
+    first: shader.uniform(u32)
+    a: shader.buffer(vec4f)
+    b: shader.buffer(vec4f)
+    c: shader.buffer(vec4f)
+    partials: shader.buffer_rw(vec4f)
+    s1: shader.workgroup(f32, 256)
+    s2: shader.workgroup(f32, 256)
+    main: fn() {
+        let t = local_index()
+        let g = self.first + group_id().x
+        let stride = self.groups * 256u
+        var ab = 0.0
+        var ac = 0.0
+        var n = g * 256u + t
+        while n < self.count {
+            let va = self.a[n].xyz
+            ab += dot(va, self.b[n].xyz)
+            ac += dot(va, self.c[n].xyz)
+            n += stride
+        }
+        self.s1[t] = ab
+        self.s2[t] = ac
+        barrier()
+        var w = 128u
+        while w > 0u {
+            if t < w {
+                self.s1[t] = self.s1[t] + self.s1[t + w]
+                self.s2[t] = self.s2[t] + self.s2[t + w]
+            }
+            barrier()
+            w = w / 2u
+        }
+        if t == 0u { self.partials[g] = vec4(self.s1[0u], self.s2[0u], 0.0, 0.0) }
+    }
+}
+
+// A buffer's sum, per group as in `grow_dot`.
+let grow_sum = {
+    label: "grow sum"
+    workgroup_size: 256
+    count: shader.uniform(u32)
+    groups: shader.uniform(u32)
+    first: shader.uniform(u32)
+    a: shader.buffer(f32)
+    partials: shader.buffer_rw(vec4f)
+    s1: shader.workgroup(f32, 256)
+    main: fn() {
+        let t = local_index()
+        let g = self.first + group_id().x
+        let stride = self.groups * 256u
+        var sum = 0.0
+        var n = g * 256u + t
+        while n < self.count {
+            sum += self.a[n]
+            n += stride
+        }
+        self.s1[t] = sum
+        barrier()
+        var w = 128u
+        while w > 0u {
+            if t < w {
+                self.s1[t] = self.s1[t] + self.s1[t + w]
+            }
+            barrier()
+            w = w / 2u
+        }
+        if t == 0u { self.partials[g] = vec4(self.s1[0u], 0.0, 0.0, 0.0) }
+    }
+}
+
+// CG's scalars from the partials. Stage 0: the start's r.r and r.z, converged where r.r is within
+// the tolerance of f.f. Stage 1: p.q gives alpha. Stage 2: r.r and r.z give beta, the count and
+// convergence. Stage 3: the first sum goes in `slot`.
+let grow_scalars = {
+    label: "grow scalars"
+    workgroup_size: 256
+    groups: shader.uniform(u32)
+    stage: shader.uniform(u32)
+    slot: shader.uniform(u32)
+    tolerance: shader.uniform(f32)
+    limit: shader.uniform(f32)
+    partials: shader.buffer(vec4f)
+    scalars: shader.buffer_rw(f32)
+    s1: shader.workgroup(f32, 256)
+    s2: shader.workgroup(f32, 256)
+    main: fn() {
+        let t = local_index()
+        var v = vec4(0.0)
+        if t < self.groups { v = self.partials[t] }
+        self.s1[t] = v.x
+        self.s2[t] = v.y
+        barrier()
+        var w = 128u
+        while w > 0u {
+            if t < w {
+                self.s1[t] = self.s1[t] + self.s1[t + w]
+                self.s2[t] = self.s2[t] + self.s2[t + w]
+            }
+            barrier()
+            w = w / 2u
+        }
+        if t != 0u { return }
+        let a = self.s1[0u]
+        let b = self.s2[0u]
+        if self.stage == 3u {
+            self.scalars[self.slot] = a
+            return
+        }
+        if self.stage == 0u {
+            self.scalars[0u] = b
+            self.scalars[1u] = 0.0
+            self.scalars[2u] = 0.0
+            self.scalars[3u] = a
+            self.scalars[5u] = 0.0
+            if a > self.tolerance * self.scalars[4u] { self.scalars[6u] = 0.0 } else { self.scalars[6u] = 1.0 }
+            return
+        }
+        let done = self.scalars[6u] != 0.0
+        if self.stage == 1u {
+            if !done && a > 0.0 { self.scalars[1u] = self.scalars[0u] / a } else { self.scalars[1u] = 0.0 }
+            return
+        }
+        if done {
+            self.scalars[2u] = 0.0
+            return
+        }
+        let its = self.scalars[5u] + 1.0
+        self.scalars[5u] = its
+        self.scalars[3u] = a
+        if a <= self.tolerance * self.scalars[4u] || its >= self.limit {
+            self.scalars[6u] = 1.0
+            self.scalars[2u] = 0.0
+        } else {
+            self.scalars[2u] = b / self.scalars[0u]
+            self.scalars[0u] = b
+        }
+    }
+}
+
+// u += alpha p, r -= alpha q.
+let grow_step = {
+    label: "grow step"
+    workgroup_size: 64
+    count: shader.uniform(u32)
+    first: shader.uniform(u32)
+    scalars: shader.buffer(f32)
+    p: shader.buffer(vec4f)
+    q: shader.buffer(vec4f)
+    u: shader.buffer_rw(vec4f)
+    r: shader.buffer_rw(vec4f)
+    main: fn() {
+        let n = (self.first + group_id().x) * 64u + local_index()
+        if n >= self.count { return }
+        let alpha = self.scalars[1u]
+        self.u[n] = vec4(self.u[n].xyz + self.p[n].xyz * alpha, 0.0)
+        self.r[n] = vec4(self.r[n].xyz - self.q[n].xyz * alpha, 0.0)
+    }
+}
+
+// p = z + beta p (p = z where beta is 0: the start, and after convergence).
+let grow_direction = {
+    label: "grow direction"
+    workgroup_size: 64
+    count: shader.uniform(u32)
+    first: shader.uniform(u32)
+    scalars: shader.buffer(f32)
+    z: shader.buffer(vec4f)
+    p: shader.buffer_rw(vec4f)
+    main: fn() {
+        let n = (self.first + group_id().x) * 64u + local_index()
+        if n >= self.count { return }
+        let beta = self.scalars[2u]
+        if beta == 0.0 {
+            self.p[n] = self.z[n]
+        } else {
+            self.p[n] = vec4(self.z[n].xyz + self.p[n].xyz * beta, 0.0)
+        }
+    }
+}
+
+// ---- The density -------------------------------------------------------------------------------
+
+// A window of (2 reach + 1)^3 cells around a cell, with its weights.
+let grow_window = {
+    workgroup_size: 64
+    cells_n: shader.uniform(vec4u)
+    reach: shader.uniform(u32)
+    first: shader.uniform(u32)
+    weights: shader.buffer(f32)
+    v: shader.buffer(f32)
+    out: shader.buffer_rw(f32)
+    cell: fn() -> u32 {
+        return (self.first + group_id().x) * 64u + local_index()
+    }
+}
+
+// Each cell's window sum of v: the filter's weights over the grid (v = 1: its normaliser).
+let grow_filter_sum = {
+    ..grow_window
+    label: "grow filter sum"
+    main: fn() {
+        let s = self.cell()
+        if s >= self.cells_n.w { return }
+        let i = s % self.cells_n.x
+        let j = (s / self.cells_n.x) % self.cells_n.y
+        let k = s / (self.cells_n.x * self.cells_n.y)
+        let side = 2u * self.reach + 1u
+        var sum = 0.0
+        for w in 0..(side * side * side) {
+            let wx = i + w % side
+            let wy = j + (w / side) % side
+            let wz = k + w / (side * side)
+            if wx < self.reach || wy < self.reach || wz < self.reach { continue }
+            let x = wx - self.reach
+            let y = wy - self.reach
+            let z = wz - self.reach
+            if x >= self.cells_n.x || y >= self.cells_n.y || z >= self.cells_n.z { continue }
+            sum += self.weights[w] * self.v[x + self.cells_n.x * (y + self.cells_n.y * z)]
+        }
+        self.out[s] = sum
+    }
+}
+
+// Filtered = W v, W's rows divided by each cell's normaliser.
+let grow_filter = {
+    ..grow_filter_sum
+    label: "grow filter"
+    hs: shader.buffer(f32)
+    main: fn() {
+        let s = self.cell()
+        if s >= self.cells_n.w { return }
+        let i = s % self.cells_n.x
+        let j = (s / self.cells_n.x) % self.cells_n.y
+        let k = s / (self.cells_n.x * self.cells_n.y)
+        let side = 2u * self.reach + 1u
+        var sum = 0.0
+        for w in 0..(side * side * side) {
+            let wx = i + w % side
+            let wy = j + (w / side) % side
+            let wz = k + w / (side * side)
+            if wx < self.reach || wy < self.reach || wz < self.reach { continue }
+            let x = wx - self.reach
+            let y = wy - self.reach
+            let z = wz - self.reach
+            if x >= self.cells_n.x || y >= self.cells_n.y || z >= self.cells_n.z { continue }
+            sum += self.weights[w] * self.v[x + self.cells_n.x * (y + self.cells_n.y * z)]
+        }
+        self.out[s] = sum / self.hs[s]
+    }
+}
+
+// The transpose, W^T v: each neighbour's share of v over its own normaliser.
+let grow_filter_t = {
+    ..grow_filter_sum
+    label: "grow filter transpose"
+    hs: shader.buffer(f32)
+    main: fn() {
+        let s = self.cell()
+        if s >= self.cells_n.w { return }
+        let i = s % self.cells_n.x
+        let j = (s / self.cells_n.x) % self.cells_n.y
+        let k = s / (self.cells_n.x * self.cells_n.y)
+        let side = 2u * self.reach + 1u
+        var sum = 0.0
+        for w in 0..(side * side * side) {
+            let wx = i + w % side
+            let wy = j + (w / side) % side
+            let wz = k + w / (side * side)
+            if wx < self.reach || wy < self.reach || wz < self.reach { continue }
+            let x = wx - self.reach
+            let y = wy - self.reach
+            let z = wz - self.reach
+            if x >= self.cells_n.x || y >= self.cells_n.y || z >= self.cells_n.z { continue }
+            let at = x + self.cells_n.x * (y + self.cells_n.y * z)
+            sum += self.weights[w] * self.v[at] / self.hs[at]
+        }
+        self.out[s] = sum
+    }
+}
+
+// The search's sums, lane by lane: 32 lanes of 8 walkers a group, the walkers striding the cells
+// as `grow_dot`'s do. A lane's value is 1/33 steps across the scalars' [lo, hi].
+let grow_lanes = {
+    workgroup_size: 256
+    count: shader.uniform(u32)
+    groups: shader.uniform(u32)
+    first: shader.uniform(u32)
+    slot: shader.uniform(u32)
+    scalars: shader.buffer(f32)
+    partials: shader.buffer_rw(f32)
+    s1: shader.workgroup(f32, 256)
+    start: fn(t: u32) -> u32 {
+        return (self.first + group_id().x) * 8u + t % 8u
+    }
+    value: fn(t: u32) -> f32 {
+        let lo = self.scalars[self.slot]
+        let hi = self.scalars[self.slot + 1u]
+        return lo + (hi - lo) * f32(t / 8u + 1u) / 33.0
+    }
+    fold: fn(t: u32, sum: f32) {
+        self.s1[t] = sum
+        barrier()
+        var w = 4u
+        while w > 0u {
+            if t % 8u < w {
+                self.s1[t] = self.s1[t] + self.s1[t + w]
+            }
+            barrier()
+            w = w / 2u
+        }
+        if t % 8u == 0u { self.partials[(self.first + group_id().x) * 32u + t / 8u] = self.s1[t] }
+    }
+}
+
+// The projected volume at each lane's threshold.
+let grow_eta_lanes = {
+    ..grow_lanes
+    label: "grow threshold lanes"
+    beta: shader.uniform(f32)
+    xt: shader.buffer(f32)
+    mask: shader.buffer(u32)
+    main: fn() {
+        let t = local_index()
+        let eta = self.value(t)
+        let tb = tanh(self.beta * eta)
+        let id = 1.0 / (tb + tanh(self.beta * (1.0 - eta)))
+        let stride = self.groups * 8u
+        var sum = 0.0
+        var n = self.start(t)
+        while n < self.count {
+            let m = self.mask[n]
+            if m == 0u {
+                sum += (tb + tanh(self.beta * (self.xt[n] - eta))) * id
+            } else {
+                if m == 1u { sum += 1.0 }
+            }
+            n += stride
+        }
+        self.fold(t, sum)
+    }
+}
+
+// The free cells' density after a move at each lane's multiplier (its ln). A move that keeps it at
+// what the volume asks leaves the threshold a value that holds the volume: at 0 the projection gives
+// at least the density it is given, at 1 at most.
+let grow_lambda_lanes = {
+    ..grow_lanes
+    label: "grow multiplier lanes"
+    step: shader.uniform(f32)
+    x: shader.buffer(f32)
+    ratio: shader.buffer(f32)
+    mask: shader.buffer(u32)
+    main: fn() {
+        let t = local_index()
+        let scale = exp(-0.5 * self.value(t))
+        let stride = self.groups * 8u
+        var sum = 0.0
+        var n = self.start(t)
+        while n < self.count {
+            if self.mask[n] == 0u {
+                let x = self.x[n]
+                let r = self.ratio[n]
+                if r >= 0.0 {
+                    sum += clamp(x * r * scale, max(0.0, x - self.step), min(1.0, x + self.step))
+                } else {
+                    sum += x
+                }
+            }
+            n += stride
+        }
+        self.fold(t, sum)
+    }
+}
+
+// The lanes' sums (they fall with the lane) narrow the scalars' [lo, hi] to the two lanes around
+// `target`.
+let grow_pick = {
+    label: "grow pick"
+    workgroup_size: 32
+    groups: shader.uniform(u32)
+    slot: shader.uniform(u32)
+    target: shader.uniform(f32)
+    partials: shader.buffer(f32)
+    scalars: shader.buffer_rw(f32)
+    sums: shader.workgroup(f32, 32)
+    main: fn() {
+        let t = local_index()
+        var sum = 0.0
+        for g in 0..self.groups {
+            sum += self.partials[g * 32u + t]
+        }
+        self.sums[t] = sum
+        barrier()
+        if t != 0u { return }
+        var lane = 32u
+        var i = 32u
+        while i > 0u {
+            i -= 1u
+            if self.sums[i] <= self.target { lane = i }
+        }
+        let lo = self.scalars[self.slot]
+        let hi = self.scalars[self.slot + 1u]
+        let d = (hi - lo) / 33.0
+        self.scalars[self.slot] = lo + d * f32(lane)
+        self.scalars[self.slot + 1u] = lo + d * f32(lane + 1u)
+    }
+}
+
+// Density projected at the threshold found, its slope, and E.
+let grow_project = {
+    label: "grow project"
+    workgroup_size: 64
+    count: shader.uniform(u32)
+    first: shader.uniform(u32)
+    beta: shader.uniform(f32)
+    emin: shader.uniform(f32)
+    scalars: shader.buffer(f32)
+    xt: shader.buffer(f32)
+    mask: shader.buffer(u32)
+    xp: shader.buffer_rw(f32)
+    dh: shader.buffer_rw(f32)
+    e: shader.buffer_rw(f32)
+    main: fn() {
+        let n = (self.first + group_id().x) * 64u + local_index()
+        if n >= self.count { return }
+        let eta = 0.5 * (self.scalars[8u] + self.scalars[9u])
+        let tb = tanh(self.beta * eta)
+        let id = 1.0 / (tb + tanh(self.beta * (1.0 - eta)))
+        let m = self.mask[n]
+        var h = 0.0
+        var slope = 0.0
+        if m == 0u {
+            let a = self.beta * (self.xt[n] - eta)
+            let c = cosh(a)
+            h = (tb + tanh(a)) * id
+            slope = self.beta * id / (c * c)
+        } else {
+            if m == 1u { h = 1.0 }
+        }
+        self.xp[n] = h
+        self.dh[n] = slope
+        self.e[n] = self.emin + h * h * h * (1.0 - self.emin)
+    }
+}
+
+// The compliance's slope in each projected density, from the cells' forces of the solved u, times
+// the projection's slope: dc/dxt.
+let grow_energy = {
+    ..grow_grid
+    label: "grow energy"
+    workgroup_size: 64
+    emin: shader.uniform(f32)
+    u: shader.buffer(vec4f)
+    cf: shader.buffer(f32)
+    e: shader.buffer(f32)
+    xp: shader.buffer(f32)
+    dh: shader.buffer(f32)
+    dc: shader.buffer_rw(f32)
+    main: fn() {
+        let s = (self.first + group_id().x) * 64u + local_index()
+        if s >= self.cells_n.w { return }
+        let cx = s % self.cells_n.x
+        let cy = (s / self.cells_n.x) % self.cells_n.y
+        let cz = s / (self.cells_n.x * self.cells_n.y)
+        var acc = 0.0
+        let first_corner = self.u[cx + self.nodes.x * (cy + self.nodes.y * cz)].xyz
+        for corner in 0..8u {
+            let n = (cx + corner % 2u) + self.nodes.x * ((cy + (corner / 2u) % 2u) + self.nodes.y * (cz + corner / 4u))
+            let at = s * 24u + corner * 3u
+            acc += dot(self.u[n].xyz - first_corner, vec3(self.cf[at], self.cf[at + 1u], self.cf[at + 2u]))
+        }
+        let h = self.xp[s]
+        self.dc[s] = -3.0 * h * h * (1.0 - self.emin) * acc / self.e[s] * self.dh[s]
+    }
+}
+
+// OC's ratio sqrt(-dc / dv), a cell with no volume slope marked (it stays where it is). What nothing
+// stresses has only rounding for a slope, of either sign: `floor` makes all of it alike, so it moves
+// as one and only as something can use it.
+let grow_ratio = {
+    label: "grow ratio"
+    workgroup_size: 64
+    count: shader.uniform(u32)
+    first: shader.uniform(u32)
+    floor: shader.uniform(f32)
+    mask: shader.buffer(u32)
+    dc: shader.buffer(f32)
+    dv: shader.buffer(f32)
+    ratio: shader.buffer_rw(f32)
+    main: fn() {
+        let n = (self.first + group_id().x) * 64u + local_index()
+        if n >= self.count { return }
+        let dv = self.dv[n]
+        if self.mask[n] == 0u && dv > 1e-20 {
+            self.ratio[n] = sqrt(max(self.floor, -self.dc[n] / dv))
+        } else {
+            self.ratio[n] = -1.0
+        }
+    }
+}
+
+// x moves at the multiplier found.
+let grow_update = {
+    label: "grow update"
+    workgroup_size: 64
+    count: shader.uniform(u32)
+    first: shader.uniform(u32)
+    step: shader.uniform(f32)
+    scalars: shader.buffer(f32)
+    ratio: shader.buffer(f32)
+    x: shader.buffer_rw(f32)
+    main: fn() {
+        let n = (self.first + group_id().x) * 64u + local_index()
+        if n >= self.count { return }
+        let r = self.ratio[n]
+        if r < 0.0 { return }
+        let scale = exp(-0.25 * (self.scalars[10u] + self.scalars[11u]))
+        let x = self.x[n]
+        self.x[n] = clamp(x * r * scale, max(0.0, x - self.step), min(1.0, x + self.step))
+    }
+}
+
+// A cell of the next level takes its parent's density.
+let grow_upsample = {
+    label: "grow upsample"
+    workgroup_size: 64
+    fine: shader.uniform(vec4u)
+    coarse: shader.uniform(vec4u)
+    first: shader.uniform(u32)
+    xc: shader.buffer(f32)
+    xf: shader.buffer_rw(f32)
+    main: fn() {
+        let n = (self.first + group_id().x) * 64u + local_index()
+        if n >= self.fine.w { return }
+        let i = (n % self.fine.x) / 2u
+        let j = ((n / self.fine.x) % self.fine.y) / 2u
+        let k = (n / (self.fine.x * self.fine.y)) / 2u
+        self.xf[n] = self.xc[i + self.coarse.x * (j + self.coarse.y * k)]
+    }
+}
+
+// A kept cell is solid and an avoided one empty, whatever it started from: that is what its
+// neighbours' filter reads, and what a cell of the next level takes from it once it is left free.
+let grow_pin = {
+    label: "grow pin"
+    workgroup_size: 64
+    count: shader.uniform(u32)
+    first: shader.uniform(u32)
+    mask: shader.buffer(u32)
+    x: shader.buffer_rw(f32)
+    main: fn() {
+        let n = (self.first + group_id().x) * 64u + local_index()
+        if n >= self.count { return }
+        let m = self.mask[n]
+        if m == 1u {
+            self.x[n] = 1.0
+        } else {
+            if m == 2u { self.x[n] = 0.0 }
+        }
+    }
+}
+
+// ---- The program ---------------------------------------------------------------------------------
+
+// Along one axis: whether a coarser multigrid level halves it, and its cells there.
+let halves = fn(cells) {
+    if cells > 2 {
+        return 1
+    }
+    return 0
+}
+let halved_to = fn(cells) {
+    if cells > 2 {
+        return ceil(cells / 2)
+    }
+    return cells
+}
+
+{run: fn(s, p) {
+    let g = {device: "gpu"}
+    let job = max(p.job, 1)
+    // A pass of `groups` workgroups, cut into jobs.
+    let each = fn(kernel, groups, uniforms, bound) {
+        var at = 0
+        loop {
+            if at >= groups {
+                break
+            }
+            let n = min(min(job, groups - at), 65535)
+            uniforms.first = at
+            s.dispatch(kernel, [n, 1, 1], uniforms, bound)
+            at = at + n
+        }
+    }
+    let up = fn(ty, cpu) {
+        let b = s.buffer(ty, cpu.len, g)
+        s.copy(cpu, b)
+        return b
+    }
+    let groups_of = fn(threads, size) {
+        return max(ceil(threads / size), 1)
+    }
+    let walkers = fn(count) {
+        return clamp(ceil(count / 256), 1, 256)
+    }
+    let scalars = s.buffer(f32, 16, g)
+    s.fill(scalars, 0)
+    let partials = s.buffer(vec4, 256, g)
+    let lane_partials = s.buffer(f32, 32 * 256, g)
+    let tol2 = p.tol * p.tol
+
+    // What a level's buffers come to, and what the device has room for at all: a level that does
+    // not fit is not started, and the one before it is where this grow settles.
+    let device = s.device()
+    let budget = min(device.buffer_bytes, device.gpu.buffer_bytes)
+    let bytes_of = fn(lv) {
+        let cells = lv.n[0] * lv.n[1] * lv.n[2]
+        let nodes = (lv.n[0] + 1) * (lv.n[1] + 1) * (lv.n[2] + 1)
+        // this level's fields: x and its passes, the solve's vectors, its load and mask
+        var total = 40 * cells + 96 * nodes
+        var shape = lv.n
+        loop {
+            let nc = shape[0] * shape[1] * shape[2]
+            let nn = (shape[0] + 1) * (shape[1] + 1) * (shape[2] + 1)
+            total = total + 2304 + 100 * nc + 76 * nn
+            if nn <= p.coarsest_nodes || (shape[0] <= 2 && shape[1] <= 2 && shape[2] <= 2) {
+                break
+            }
+            shape = [halved_to(shape[0]), halved_to(shape[1]), halved_to(shape[2])]
+        }
+        return total
+    }
+    // Over the room: says so and what it wanted, for the one who asked to tell its user.
+    let no_room = fn(index, kept) {
+        // and the scalars the driver holds throughout
+        let wanted = bytes_of(p.levels[index]) + kept + 65536
+        if wanted <= budget {
+            return false
+        }
+        s.value("no_room", {level: index, wanted: wanted, available: budget})
+        return true
+    }
+    if no_room(0, 0) {
+        return nil
+    }
+
+    var previous = nil
+    // what edits said so far
+    let st = {rev: 0, volume: p.volume, load: nil, force: p.force, compliance: 0, fit: 0, fresh: false, started: p.start, solved: false}
+    // how well the shape takes its load, whatever the load's size and the solid's share
+    let fit_now = fn() {
+        return st.compliance * st.volume / (st.force * st.force)
+    }
+    let levels = p.levels
+    var history = []
+    let level_count = levels.len()
+    var dl = 0
+    loop {
+        if dl >= level_count {
+            break
+        }
+        let lv = levels[dl]
+        let n = lv.n
+        let cells = n[0] * n[1] * n[2]
+        let nodes = (n[0] + 1) * (n[1] + 1) * (n[2] + 1)
+
+        // The multigrid: this level's grid, then each one coarser, with a matrix per size.
+        var mg = []
+        var shape = n
+        var halved = [0, 0, 0]
+        var size = [lv.h, lv.h, lv.h]
+        loop {
+            let nc = shape[0] * shape[1] * shape[2]
+            let nn = (shape[0] + 1) * (shape[1] + 1) * (shape[2] + 1)
+            let kc = s.buffer(f32, 576)
+            s.run(grow_element, 576, {e0: p.e0, nu: p.nu, hx: size[0], hy: size[1], hz: size[2]}, {k0: kc})
+            mg.push({
+                n: shape,
+                halved: halved,
+                nodes: [shape[0] + 1, shape[1] + 1, shape[2] + 1, nn],
+                cells: [shape[0], shape[1], shape[2], nc],
+                k0: up(f32, kc),
+                e: s.buffer(f32, nc, g),
+                cf: s.buffer(f32, 24 * nc, g),
+                held: s.buffer(u32, nn, g),
+                dinv: s.buffer(f32, 6 * nn, g),
+                x: s.buffer(vec4, nn, g),
+                b: s.buffer(vec4, nn, g),
+                res: s.buffer(vec4, nn, g)
+            })
+            s.free(kc)
+            if nn <= p.coarsest_nodes || (shape[0] <= 2 && shape[1] <= 2 && shape[2] <= 2) {
+                break
+            }
+            halved = [halves(shape[0]), halves(shape[1]), halves(shape[2])]
+            size = [size[0] * (1 + halved[0]), size[1] * (1 + halved[1]), size[2] * (1 + halved[2])]
+            shape = [halved_to(shape[0]), halved_to(shape[1]), halved_to(shape[2])]
+        }
+        let count = mg.len()
+        let transfer = fn(l) {
+            return {fine: mg[l - 1].nodes, coarse: mg[l].nodes, halved: [mg[l].halved[0], mg[l].halved[1], mg[l].halved[2], 0]}
+        }
+        // the held axes, from this level's down
+        s.copy(s.input("held" + dl), mg[0].held)
+        for l in 1..count {
+            each(grow_coarse_held, groups_of(mg[l].nodes[3], 64), transfer(l), {hf: mg[l - 1].held, hc: mg[l].held})
+        }
+
+        let top = mg[0]
+        let f = up(vec4, s.input("load" + dl))
+        let mask = up(u32, s.input("mask" + dl))
+        let u = s.buffer(vec4, nodes, g)
+        let r = s.buffer(vec4, nodes, g)
+        let pd = s.buffer(vec4, nodes, g)
+        let q = s.buffer(vec4, nodes, g)
+        let z = s.buffer(vec4, nodes, g)
+        let x = s.buffer(f32, cells, g)
+        let xt = s.buffer(f32, cells, g)
+        let xp = s.buffer(f32, cells, g)
+        let dh = s.buffer(f32, cells, g)
+        let dc = s.buffer(f32, cells, g)
+        let dcf = s.buffer(f32, cells, g)
+        let dvf = s.buffer(f32, cells, g)
+        let ratio = s.buffer(f32, cells, g)
+
+        // the density and displacement this level starts from
+        if previous == nil {
+            if st.started {
+                s.copy(s.input("x0"), x)
+            } else {
+                s.fill(x, st.volume)
+            }
+            st.solved = st.started
+            s.fill(u, 0)
+        } else {
+            let pv = previous
+            each(grow_upsample, groups_of(cells, 64), {fine: [n[0], n[1], n[2], cells], coarse: [pv.n[0], pv.n[1], pv.n[2], pv.n[0] * pv.n[1] * pv.n[2]]}, {xc: pv.x, xf: x})
+            s.fill(u, 0)
+            each(grow_prolong, groups_of(nodes, 64), {fine: top.nodes, coarse: [pv.n[0] + 1, pv.n[1] + 1, pv.n[2] + 1, (pv.n[0] + 1) * (pv.n[1] + 1) * (pv.n[2] + 1)], halved: [1, 1, 1, 0]}, {held: top.held, xc: pv.u, xf: u})
+            s.free(pv.x)
+            s.free(pv.u)
+        }
+        each(grow_pin, groups_of(cells, 64), {count: cells}, {mask: mask, x: x})
+
+        // the filter's weights over its window, and its normaliser
+        let reach = ceil(lv.rmin / lv.h)
+        let side = 2 * reach + 1
+        let cube = side * side * side
+        let weight_cpu = s.buffer(f32, cube)
+        var table = []
+        for w in 0..cube {
+            let dx = w % side - reach
+            let dy = (floor(w / side)) % side - reach
+            let dz = floor(w / (side * side)) - reach
+            table.push(max(0, lv.rmin - lv.h * sqrt(dx * dx + dy * dy + dz * dz)))
+        }
+        s.write(weight_cpu, table)
+        let weights = up(f32, weight_cpu)
+        s.free(weight_cpu)
+        let ones = s.buffer(f32, cells, g)
+        s.fill(ones, 1)
+        let hs = s.buffer(f32, cells, g)
+        let window = {cells_n: top.cells, reach: reach}
+        each(grow_filter_sum, groups_of(cells, 64), window, {weights: weights, v: ones, out: hs})
+        s.free(ones)
+
+        let cell_groups = groups_of(cells, 64)
+        let node_groups = groups_of(nodes, 64)
+        let cell_walkers = clamp(ceil(cells / 8), 1, 256)
+        let node_walkers = walkers(nodes)
+        let target_of = fn(volume) {
+            return volume * (cells - lv.kept_cells - lv.avoided_cells) + lv.kept_cells
+        }
+        let density_of = fn(volume) {
+            return volume * (cells - lv.kept_cells - lv.avoided_cells)
+        }
+        let aim = {target: target_of(st.volume), density: density_of(st.volume)}
+
+        let cells_on = fn(lev, xv) {
+            each(grow_cells, groups_of(lev.cells[3], 4), {nodes: lev.nodes, cells_n: lev.cells}, {k0: lev.k0, e: lev.e, x: xv, cf: lev.cf})
+        }
+        let g_apply = fn(lev, xv, out) {
+            cells_on(lev, xv)
+            each(grow_apply, groups_of(lev.nodes[3], 64), {nodes: lev.nodes, cells_n: lev.cells}, {cf: lev.cf, held: lev.held, out: out})
+        }
+        let g_residual = fn(lev, xv, b, out) {
+            cells_on(lev, xv)
+            each(grow_residual, groups_of(lev.nodes[3], 64), {nodes: lev.nodes, cells_n: lev.cells}, {cf: lev.cf, held: lev.held, b: b, out: out})
+        }
+        let g_smooth = fn(lev, xv, b) {
+            cells_on(lev, xv)
+            each(grow_smooth, groups_of(lev.nodes[3], 64), {nodes: lev.nodes, cells_n: lev.cells, omega: p.omega}, {cf: lev.cf, held: lev.held, dinv: lev.dinv, b: b, x: xv})
+        }
+        let g_rest = fn(lev, xv, b) {
+            each(grow_rest, groups_of(lev.nodes[3], 64), {count: lev.nodes[3], omega: p.omega}, {dinv: lev.dinv, b: b, x: xv})
+        }
+        let g_vcycle = fn(b0, x0) {
+            let last = count - 1
+            for l in 0..last {
+                let lev = mg[l]
+                let b = if l == 0 { b0 } else { lev.b }
+                let xv = if l == 0 { x0 } else { lev.x }
+                g_rest(lev, xv, b)
+                for k in 1..p.smooth {
+                    g_smooth(lev, xv, b)
+                }
+                g_residual(lev, xv, b, lev.res)
+                let coarse = mg[l + 1]
+                each(grow_restrict, groups_of(coarse.nodes[3], 64), transfer(l + 1), {held: coarse.held, rf: lev.res, rc: coarse.b})
+            }
+            let lc = mg[last]
+            let bc = if last == 0 { b0 } else { lc.b }
+            let xc = if last == 0 { x0 } else { lc.x }
+            g_rest(lc, xc, bc)
+            for k in 1..p.coarsest_sweeps {
+                g_smooth(lc, xc, bc)
+            }
+            var l = last - 1
+            loop {
+                if l < 0 {
+                    break
+                }
+                let lev = mg[l]
+                let b = if l == 0 { b0 } else { lev.b }
+                let xv = if l == 0 { x0 } else { lev.x }
+                each(grow_prolong, groups_of(lev.nodes[3], 64), transfer(l + 1), {held: lev.held, xc: mg[l + 1].x, xf: xv})
+                for k in 0..p.smooth {
+                    g_smooth(lev, xv, b)
+                }
+                l = l - 1
+            }
+        }
+        let g_dot = fn(a, b, c, stage, slot) {
+            each(grow_dot, node_walkers, {count: nodes, groups: node_walkers}, {a: a, b: b, c: c, partials: partials})
+            s.dispatch(grow_scalars, [1, 1, 1], {groups: node_walkers, stage: stage, slot: slot, tolerance: tol2, limit: p.max_its}, {partials: partials, scalars: scalars})
+        }
+        let g_cell_sum = fn(a, slot) {
+            let w = walkers(cells)
+            each(grow_sum, w, {count: cells, groups: w}, {a: a, partials: partials})
+            s.dispatch(grow_scalars, [1, 1, 1], {groups: w, stage: 3, slot: slot, tolerance: tol2, limit: p.max_its}, {partials: partials, scalars: scalars})
+        }
+        let g_direction = fn() {
+            each(grow_direction, node_groups, {count: nodes}, {scalars: scalars, z: z, p: pd})
+        }
+        let set_range = fn(slot, lo, hi) {
+            s.write(scalars, [lo, hi], slot)
+        }
+        let eta_search = fn(beta) {
+            set_range(8, 0, 1)
+            for round in 0..4 {
+                each(grow_eta_lanes, cell_walkers, {count: cells, groups: cell_walkers, slot: 8, beta: beta}, {scalars: scalars, partials: lane_partials, xt: xt, mask: mask})
+                s.dispatch(grow_pick, [1, 1, 1], {groups: cell_walkers, slot: 8, target: aim.target}, {partials: lane_partials, scalars: scalars})
+            }
+        }
+        let lambda_search = fn(step) {
+            // wide enough for material nothing stresses, whose slope is next to none: it stays
+            // unless something can use it
+            set_range(10, -88, 88)
+            for round in 0..4 {
+                each(grow_lambda_lanes, cell_walkers, {count: cells, groups: cell_walkers, slot: 10, step: step}, {scalars: scalars, partials: lane_partials, x: x, ratio: ratio, mask: mask})
+                s.dispatch(grow_pick, [1, 1, 1], {groups: cell_walkers, slot: 10, target: aim.density}, {partials: lane_partials, scalars: scalars})
+            }
+        }
+
+        // f.f: the solves' tolerance is against it
+        g_dot(f, f, f, 3, 4)
+        // a level's load from an edit: four numbers a loaded node (its index, x, y, z)
+        let set_load = fn(list) {
+            s.fill(f, 0)
+            let m = list.len()
+            var i = 0
+            loop {
+                if i >= m {
+                    break
+                }
+                s.write(f, [list[i + 1], list[i + 2], list[i + 3], 0], list[i])
+                i = i + 4
+            }
+            g_dot(f, f, f, 3, 4)
+        }
+        // an edit holds for this level and the ones still to come
+        let take_edit = fn(rev, edit) {
+            st.rev = rev
+            st.volume = edit.volume
+            st.force = edit.force
+            st.load = edit.load
+            st.solved = false
+            aim.target = target_of(st.volume)
+            aim.density = density_of(st.volume)
+            set_load(st.load[dl])
+        }
+        if st.load != nil {
+            set_load(st.load[dl])
+        }
+
+        // the density, projected to hold the volume
+        let project = fn(beta) {
+            each(grow_filter, cell_groups, window, {weights: weights, v: x, hs: hs, out: xt})
+            eta_search(beta)
+            each(grow_project, cell_groups, {count: cells, beta: beta, emin: p.emin}, {scalars: scalars, xt: xt, mask: mask, xp: xp, dh: dh, e: top.e})
+            g_cell_sum(xp, 12)
+        }
+
+        // One design iteration; false when the program stops.
+        let iterate = fn(it, beta, step) {
+            project(beta)
+            // the shape so far, for the part it grows, once a solve under what is asked moved it
+            if p.hold && st.solved {
+                s.publish("xp" + dl, xp)
+            }
+            // the multigrid's stiffness
+            for l in 1..count {
+                each(grow_coarsen, groups_of(mg[l].cells[3], 64), {fine: mg[l - 1].cells, coarse: mg[l].cells, halved: [mg[l].halved[0], mg[l].halved[1], mg[l].halved[2], 0]}, {ef: mg[l - 1].e, ec: mg[l].e})
+            }
+            for l in 0..count {
+                each(grow_dinv, groups_of(mg[l].nodes[3], 64), {nodes: mg[l].nodes, cells_n: mg[l].cells}, {k0: mg[l].k0, e: mg[l].e, held: mg[l].held, dinv: mg[l].dinv})
+            }
+            // K u = f from the last u
+            g_residual(top, u, f, r)
+            g_vcycle(r, z)
+            g_dot(r, r, z, 0, 0)
+            g_dot(r, r, z, 0, 0)
+            g_direction()
+            s.flush()
+            var sent = 0
+            var ahead = nil
+            loop {
+                var next = nil
+                if sent < p.max_its {
+                    for i in 0..min(p.batch, p.max_its - sent) {
+                        g_apply(top, pd, q)
+                        g_dot(pd, q, q, 1, 0)
+                        each(grow_step, node_groups, {count: nodes}, {scalars: scalars, p: pd, q: q, u: u, r: r})
+                        g_vcycle(r, z)
+                        g_dot(r, r, z, 2, 0)
+                        g_direction()
+                        s.flush()
+                        sent = sent + 1
+                    }
+                    next = s.fetch(scalars, 5, 2)
+                }
+                if ahead != nil {
+                    let now = s.take(ahead)
+                    if now == nil {
+                        return false
+                    }
+                    if now[1] != 0 || next == nil {
+                        if next != nil {
+                            s.take(next)
+                        }
+                        break
+                    }
+                }
+                if next == nil {
+                    break
+                }
+                ahead = next
+            }
+            // the compliance f.u, and each cell's forces at the solved u for its energy
+            g_dot(f, u, u, 3, 7)
+            cells_on(top, u)
+            each(grow_energy, cell_groups, {nodes: top.nodes, cells_n: top.cells, emin: p.emin}, {u: u, cf: top.cf, e: top.e, xp: xp, dh: dh, dc: dc})
+            each(grow_filter_t, cell_groups, window, {weights: weights, v: dc, hs: hs, out: dcf})
+            each(grow_filter_t, cell_groups, window, {weights: weights, v: dh, hs: hs, out: dvf})
+            // a billionth of the energy a solid cell has on average, against the compliance so far
+            each(grow_ratio, cell_groups, {count: cells, floor: 3e-9 * st.compliance / aim.target}, {mask: mask, dc: dcf, dv: dvf, ratio: ratio})
+            lambda_search(step)
+            each(grow_update, cell_groups, {count: cells, step: step}, {scalars: scalars, ratio: ratio, x: x})
+            s.flush()
+            let told = s.fetch(scalars, 0, 16)
+            let sc = s.take(told)
+            if sc == nil {
+                return false
+            }
+            st.compliance = sc[7]
+            let row = {level: dl, it: it, rev: st.rev, pcg: sc[5], compliance: sc[7], volume: sc[12], target: aim.target, eta: 0.5 * (sc[8] + sc[9]), rr: sc[3], ff: sc[4]}
+            st.solved = true
+            if !p.hold {
+                history.push(row)
+            }
+            s.value("iteration", row)
+            return true
+        }
+
+        for it in 0..lv.its {
+            if p.hold {
+                let m = s.inbox({edit: nil})
+                if m.msgs.edit != nil {
+                    take_edit(m.rev, m.msgs.edit)
+                }
+            }
+            let beta = if lv.its > 1 { lv.beta[0] * pow(lv.beta[1] / lv.beta[0], it / (lv.its - 1)) } else { lv.beta[0] }
+            if !iterate(it, beta, p.step) {
+                return nil
+            }
+        }
+
+        var last_level = dl == level_count - 1
+        if !last_level {
+            last_level = no_room(dl + 1, 4 * cells + 16 * nodes)
+        }
+        // Held: the last level waits for edits, each answered from where it stands: its sharpness
+        // kept and its moves small, so a small edit makes a small change. That shape holds its
+        // basin, so an edit it does not fit (by the first look at it under the edit, against how the
+        // shape took its load when it grew) grows again from nothing.
+        if last_level && p.hold {
+            let settle = fn() {
+                project(lv.beta[1])
+                s.publish("xp" + dl, xp)
+                s.publish("x", x)
+                s.value("settled", {rev: st.rev, compliance: st.compliance})
+            }
+            settle()
+            st.fit = fit_now()
+            var warm_it = lv.its
+            var left = 0
+            loop {
+                let m = if left > 0 { s.inbox({edit: nil}) } else { s.wait_inbox({edit: nil}) }
+                let edited = m.msgs.edit != nil
+                if edited {
+                    take_edit(m.rev, m.msgs.edit)
+                    left = p.warm_its
+                }
+                if left > 0 {
+                    if !iterate(warm_it, lv.beta[1], p.warm_step) {
+                        return nil
+                    }
+                    if edited && fit_now() > p.refit * st.fit {
+                        st.fresh = true
+                        break
+                    }
+                    warm_it = warm_it + 1
+                    left = left - 1
+                    if left == 0 {
+                        settle()
+                    }
+                }
+            }
+        }
+        // what the next level starts from, or what the program gives back
+        if st.fresh {
+            s.free(x)
+            s.free(u)
+        } else if last_level {
+            let give = fn(name, buffer, len) {
+                let out = s.buffer(f32, len)
+                s.copy(buffer, out)
+                s.publish(name, out)
+            }
+            give("x", x, cells)
+            give("xp", xp, cells)
+            give("u", u, 4 * nodes)
+            give("e", top.e, cells)
+            s.free(x)
+            s.free(u)
+        } else {
+            previous = {n: n, x: x, u: u}
+        }
+        // the level's buffers
+        for l in 0..count {
+            let m = mg[l]
+            s.free(m.k0)
+            s.free(m.e)
+            s.free(m.cf)
+            s.free(m.held)
+            s.free(m.dinv)
+            s.free(m.x)
+            s.free(m.b)
+            s.free(m.res)
+        }
+        s.free(f)
+        s.free(mask)
+        s.free(r)
+        s.free(pd)
+        s.free(q)
+        s.free(z)
+        s.free(xt)
+        s.free(xp)
+        s.free(dh)
+        s.free(dc)
+        s.free(dcf)
+        s.free(dvf)
+        s.free(ratio)
+        s.free(weights)
+        s.free(hs)
+        if st.fresh {
+            st.fresh = false
+            st.started = false
+            s.fill(scalars, 0)
+            previous = nil
+            dl = 0
+        } else if last_level {
+            dl = level_count
+        } else {
+            dl = dl + 1
+        }
+    }
+    return {history: history, stats: s.stats()}
+}}

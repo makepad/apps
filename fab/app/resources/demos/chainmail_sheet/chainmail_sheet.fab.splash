@@ -1,0 +1,9 @@
+// A two-colour chainmail sheet: steel links with copper diamond rings.
+use mod.fab.*
+
+script("chainmail_sheet.cad.splash")
+
+color("Steel", rgb: #x50555e)
+color("Copper", rgb: #xc4612e)
+
+place("chainmail_sheet", at: [175mm 160mm], name: "Chainmail sheet", color: "Steel")

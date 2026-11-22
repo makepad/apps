@@ -1,0 +1,19 @@
+[package]
+name = "fab-elec-boardbench"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+fab-elec-fixtures = { path = "../../fixtures" }
+makepad-widgets = { path = "../../../../../../widgets", version = "2.0.0", default-features = false }
+fab-elec-board = { path = "../../board" }
+fab-elec-circuit = { path = "../../circuit" }
+fab-elec-core = { path = "../../core" }
+fab-elec-design = { path = "../../design" }
+fab-elec-kicad = { path = "../../kicad" }
+fab-elec-lang = { path = "../../lang" }
+fab-elec-route = { path = "../../route" }
+fab-elec-sim = { path = "../../sim" }
+fab-elec-view = { path = "../../view" }

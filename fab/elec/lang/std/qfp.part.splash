@@ -1,0 +1,154 @@
+let __qfp_f = mod.elec.f
+
+let __qfp_positive = fn(v) {
+    return v.is_number() && v > 0mm && v - v == 0mm
+}
+
+// Nominal gull-wing lands: toe and heel 0.35 mm, side 0.03 mm.
+let __qfp_land = fn(span, lead) {
+    let toe = 0.35mm
+    let heel = 0.35mm
+    let side = 0.03mm
+    // Z = span + 2 * toe; G = span - 2 * lead[1] - 2 * heel.
+    // The equivalent length avoids subtracting nearly equal spans.
+    return {
+        x: __qfp_f.round((span - lead[1] + toe - heel) / 2, 0.01mm)
+        size: [__qfp_f.round(lead[1] + toe + heel, 0.01mm),
+               __qfp_f.round(lead[0] + 2 * side, 0.01mm)]
+    }
+}
+
+// Four sides of gull-wing leads; o.pins divisible by 4, 8..256, o.pitch,
+// o.body [x, y], o.span [x, y] tip to tip, o.lead [width, foot length],
+// optional centred o.ep [width, height], numbered pins + 1; all lengths in mm.
+let qfp = fn(o) {
+    if !o.is_object() {
+        return __qfp_f.error("qfp: o must be an options object")
+    }
+    let pins = o.pins ?? nil
+    let pitch = o.pitch ?? nil
+    let body = o.body ?? nil
+    let span = o.span ?? nil
+    let lead = o.lead ?? nil
+    let ep = o.ep ?? nil
+    if !pins.is_number() || pins < 8 || pins > 256 || pins % 4 != 0 {
+        return __qfp_f.error("qfp: pins must be an integer divisible by 4 from 8 to 256")
+    }
+    if !__qfp_positive(pitch) {
+        return __qfp_f.error("qfp: pitch must be a positive finite length")
+    }
+    if !body.is_array() || body.len() != 2 {
+        return __qfp_f.error("qfp: body must be [x, y]")
+    }
+    if !__qfp_positive(body[0]) || !__qfp_positive(body[1]) {
+        return __qfp_f.error("qfp: body dimensions must be positive finite lengths")
+    }
+    if !span.is_array() || span.len() != 2 {
+        return __qfp_f.error("qfp: span must be [x, y] tip to tip")
+    }
+    if !__qfp_positive(span[0]) || !__qfp_positive(span[1]) {
+        return __qfp_f.error("qfp: span dimensions must be positive finite lengths")
+    }
+    if span[0] <= body[0] || span[1] <= body[1] {
+        return __qfp_f.error("qfp: span must exceed body on both axes")
+    }
+    if !lead.is_array() || lead.len() != 2 {
+        return __qfp_f.error("qfp: lead must be [width, foot length]")
+    }
+    if !__qfp_positive(lead[0]) || !__qfp_positive(lead[1]) {
+        return __qfp_f.error("qfp: lead dimensions must be positive finite lengths")
+    }
+    if 2 * lead[1] > span[0] - body[0] || 2 * lead[1] > span[1] - body[1] {
+        return __qfp_f.error("qfp: lead foot length must fit between body and span on both axes")
+    }
+    let per_side = pins / 4
+    let row_half = (per_side - 1) * pitch / 2
+    let row_span = 2 * row_half + lead[0]
+    if row_span > body[0] || row_span > body[1] {
+        return __qfp_f.error("qfp: body must contain the pins at the specified pitch and lead width on every side")
+    }
+    let x_land = __qfp_land(span[0], lead)
+    let y_land = __qfp_land(span[1], lead)
+    if x_land.size[1] >= pitch {
+        return __qfp_f.error("qfp: pitch must exceed the rounded lead land width")
+    }
+    let inner_x = x_land.x - x_land.size[0] / 2
+    let inner_y = y_land.x - y_land.size[0] / 2
+    if inner_x <= 0mm || inner_y <= 0mm {
+        return __qfp_f.error("qfp: span and lead foot length must leave space between opposite land rows")
+    }
+    // Adjacent corner lands must be separated along at least one axis.
+    let row_edge = row_half + x_land.size[1] / 2
+    if row_edge >= inner_x && row_edge >= inner_y {
+        return __qfp_f.error("qfp: span and pitch make adjacent corner lands touch or overlap")
+    }
+    let ep_size = if ep != nil {
+        if !ep.is_array() || ep.len() != 2 {
+            return __qfp_f.error("qfp: ep must be [width, height]")
+        }
+        if !__qfp_positive(ep[0]) || !__qfp_positive(ep[1]) {
+            return __qfp_f.error("qfp: ep dimensions must be positive finite lengths")
+        }
+        if ep[0] > body[0] || ep[1] > body[1] {
+            return __qfp_f.error("qfp: ep must fit inside body")
+        }
+        let size = [__qfp_f.round(ep[0], 0.01mm), __qfp_f.round(ep[1], 0.01mm)]
+        if size[0] <= 0mm || size[1] <= 0mm {
+            return __qfp_f.error("qfp: ep dimensions must remain positive after rounding")
+        }
+        if size[0] > body[0] || size[1] > body[1] || size[0] >= 2 * inner_x || size[1] >= 2 * inner_y {
+            return __qfp_f.error("qfp: rounded ep must fit inside body and between the lead lands")
+        }
+        size
+    } else { nil }
+    let pads = for i in 0..pins {
+        let at = if i < per_side {
+            [-x_land.x, row_half - i * pitch]
+        } elif i < 2 * per_side {
+            [-row_half + (i - per_side) * pitch, -y_land.x]
+        } elif i < 3 * per_side {
+            [x_land.x, -row_half + (i - 2 * per_side) * pitch]
+        } else {
+            [row_half - (i - 3 * per_side) * pitch, y_land.x]
+        }
+        let size = if i < per_side || (i >= 2 * per_side && i < 3 * per_side) {
+            x_land.size
+        } else {
+            [y_land.size[1], y_land.size[0]]
+        }
+        __qfp_f.smd(__qfp_f.int(i + 1), at, size)
+    }
+    if ep_size != nil {
+        pads.push(__qfp_f.smd(__qfp_f.int(pins + 1), [0mm, 0mm], ep_size))
+    }
+    return __qfp_f.footprint({
+        pads: pads
+        body: [[-body[0] / 2, -body[1] / 2], [body[0] / 2, body[1] / 2]]
+        mount: @smd
+        text: 1mm
+        graphics: [__qfp_f.dot("F.SilkS", [-x_land.x - x_land.size[0] / 2 - 0.7mm, row_half], 0.15mm)]
+    })
+}
+
+// Square four-sided gull-wing outline; pins and body side (mm) select the table.
+let lqfp = fn(pins, body) {
+    let pitch = if pins == 32 && body == 7mm { 0.8mm }
+    elif pins == 44 && body == 10mm { 0.8mm }
+    elif pins == 48 && body == 7mm { 0.5mm }
+    elif pins == 64 && body == 10mm { 0.5mm }
+    elif pins == 80 && body == 12mm { 0.5mm }
+    elif pins == 100 && body == 14mm { 0.5mm }
+    elif pins == 144 && body == 20mm { 0.5mm }
+    elif pins == 176 && body == 24mm { 0.5mm }
+    else {
+        return __qfp_f.error("lqfp: (pins, body, pitch) table: (32, 7mm, 0.8mm), (44, 10mm, 0.8mm), (48, 7mm, 0.5mm), (64, 10mm, 0.5mm), (80, 12mm, 0.5mm), (100, 14mm, 0.5mm), (144, 20mm, 0.5mm), (176, 24mm, 0.5mm)")
+    }
+    let width = if pitch == 0.8mm { 0.37mm } else { 0.22mm }
+    return qfp({
+        pins: pins
+        pitch: pitch
+        body: [body, body]
+        span: [body + 2mm, body + 2mm]
+        lead: [width, 0.6mm]
+    })
+}

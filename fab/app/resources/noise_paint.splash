@@ -1,0 +1,5 @@
+// Procedural paint: two print colours mixed through the wall by 3D gradient noise.
+let blue = Material{albedo: [0.05 0.2 0.85] name: "Blue"}
+let yellow = Material{albedo: [0.9 0.75 0.05] name: "Yellow"}
+m.fill(vase, blue)
+m.fill(m.sdf({field: fn(p) { fbm3(p / 7mm, 3, 2.0, 0.5) * 7mm } bounds: [[-40mm, -10mm, -40mm], [40mm, 90mm, 40mm]]}), yellow)

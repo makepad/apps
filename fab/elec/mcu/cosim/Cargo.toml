@@ -1,0 +1,29 @@
+[package]
+name = "fab-elec-mcu-cosim"
+version = "1.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+authors = ["Makepad <info@makepad.nl>"]
+description = "Any microsplash machine as a co-simulated device in the circuit simulator's live worker"
+
+[dependencies]
+fab-elec-mcu-emu = { path = "../emu" }
+fab-elec-mcu-rt = { path = "../rt" }
+fab-elec-sim = { path = "../../sim" }
+
+[dev-dependencies]
+fab-elec-mcu-avr = { path = "../avr" }
+fab-elec-mcu-rt = { path = "../rt" }
+# the realtime example: ledavr's chase bench, lowered, with its firmware built
+fab-elec-bench = { path = "../../bench" }
+fab-elec-fixtures = { path = "../../fixtures" }
+fab-elec-lang = { path = "../../lang" }
+fab-elec-mcu-emit-avr = { path = "../emit_avr" }
+# the realtime example: its runs on the host's pool, set up by the host's own code, and the host
+# itself on its frames (`host-start`)
+fab-elec-simhost = { path = "../../simhost" }
+fab-elec-view = { path = "../../view" }
+# the air_probe example: compiling circuit work through AIR, against portable math
+makepad-script-compute = { path = "../../../../../../platform/script/compute" }
+makepad-csg-math = { path = "../../../../../../libs/csg/csg_math" }

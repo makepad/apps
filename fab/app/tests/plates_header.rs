@@ -185,8 +185,12 @@ pub fn check(h: &Header) {
 }
 
 pub fn run(dpi: u32, test: &str, body: impl FnOnce(&TestApp, Header)) {
+    // the 1x and 2x tests run at once in one process, and macOS clocks count microseconds: a
+    // counter keeps their homes apart
+    static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let home = std::env::temp_dir().join(format!("fab-plates-header-{}-{nonce}", std::process::id()));
+    let home = std::env::temp_dir().join(format!("fab-plates-header-{}-{nonce}-{run}", std::process::id()));
     std::fs::create_dir(&home).unwrap();
     let mut config = TestConfig::current_package(env!("CARGO_MANIFEST_DIR"), env!("CARGO_PKG_NAME"), test).unwrap();
     config.env.insert("MAKEPAD_TEST_HOME".into(), home.display().to_string());

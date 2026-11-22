@@ -1,0 +1,627 @@
+# The profile format's option keys: type, preset kind, vector axis, default and enum values.
+# key	type	kind	axis	default	enum_values
+accel_to_decel_enable	bool	process		0	
+accel_to_decel_factor	percent	process		50%	
+activate_air_filtration	bools	filament		0	
+additional_cooling_fan_speed	ints	filament		0	
+additional_fan_full_speed_layer	ints	filament		0	
+alternate_extra_wall	bool	process		0	
+ams_filament_load_time_ams	float	machine		0	
+ams_filament_load_time_ams_lite	float	machine		0	
+ams_filament_load_time_n3f_s	float	machine		0	
+ams_filament_unload_time_ams	float	machine		0	
+ams_filament_unload_time_ams_lite	float	machine		0	
+ams_filament_unload_time_n3f_s	float	machine		0	
+apply_scarf_seam_on_circles	bool	process		1	
+auxiliary_fan	bool	machine		0	
+avoid_crossing_wall_includes_support	bool	process		0	
+bed_custom_model	string	machine			
+bed_custom_texture	string	machine			
+bed_exclude_area	points	machine		0x0	
+bed_heat_soak_area	points	machine			
+bed_temperature_formula	enum	machine		by_first_filament	by_first_filament/by_highest_temp
+before_layer_change_gcode	string	machine			
+best_object_pos	point	machine		0.5x0.5	
+bottom_color_penetration_layers	int	process		3	
+bottom_shell_layers	int	process		3	
+bottom_shell_thickness	float	process		0	
+bottom_surface_density	percent	process		100%	
+bottom_surface_pattern	enum	process		zig-zag	concentric/zig-zag/monotonic/monotonicline/alignedrectilinear/hilbertcurve/archimedeanchords/octagramspiral
+bridge_angle	float	process		0	
+bridge_flow	float	process		1	
+bridge_no_support	bool	process		0	
+bridge_speed	floats	process	process-variant	25	
+brim_object_gap	float	process		0	
+brim_type	enum	process		auto_brim	auto_brim/brim_ears/outer_only/inner_only/outer_and_inner/no_brim
+brim_width	float	process		0	
+chamber_temperatures	ints	filament		0	
+change_filament_gcode	string	machine			
+circle_compensation_manual_offset	float	process		0	
+circle_compensation_speed	floats	filament		200	
+close_additional_fan_first_x_layers	ints	filament		1	
+close_fan_the_first_x_layers	ints	filament		1	
+compatible_machine_expression_group	strings	(object/project/none)			
+compatible_printers	strings	process			
+compatible_printers_condition	string	process			
+compatible_prints	strings	filament			
+compatible_prints_condition	string	filament			
+compatible_process_expression_group	strings	(object/project/none)			
+complete_print_exhaust_fan_speed	ints	filament		80	
+conformal_hub_radius	float	process		0	
+conformal_infill	bool	process		0	
+conformal_link_flip_layers	int	process		0	
+conformal_link_keep_layers	int	process		1	
+conformal_pole	enum	process		layer	layer/axis/bezier
+conformal_ray_count	int	process		0	
+conformal_stagger	enum	process		none	none/alternate
+cool_plate_temp	ints	filament		35	
+cool_plate_temp_initial_layer	ints	filament		35	
+cooling_filter_enabled	bool	machine		0	
+cooling_perimeter_transition_distance	floats	filament		10	
+cooling_slowdown_logic	enums	filament		uniform_cooling	uniform_cooling/consistent_surface
+counter_coef_1	floats	filament		0	
+counter_coef_2	floats	filament		0.025	
+counter_coef_3	floats	filament		-0.11	
+counter_limit_max	floats	filament		0.05	
+counter_limit_min	floats	filament		-0.04	
+counterbore_hole_bridging	enum	process		none	none/partiallybridge/sacrificiallayer
+curr_bed_type	enum	(object/project/none)		Cool Plate	Default Plate/Supertack Plate/Cool Plate/Engineering Plate/High Temp Plate/Textured PEI Plate/Textured Cool Plate
+default_acceleration	floats	process	process-variant	500	
+default_ams_type	int	machine		-1	
+default_filament_colour	strings	filament		""	
+default_filament_profile	strings	machine(extruder)	per-extruder		
+default_jerk	float	process		0	
+default_nozzle_volume_type	enums	machine	per-extruder	Standard	Standard/High Flow/Hybrid/TPU High Flow/E3D High Flow
+default_print_profile	string	machine			
+deretraction_speed	floats	machine(extruder)	printer-variant	0	
+detect_floating_vertical_shell	bool	process		1	
+detect_narrow_internal_solid_infill	bool	process		1	
+detect_overhang_wall	bool	process		1	
+detect_thin_wall	bool	process		0	
+diameter_limit	floats	filament		50	
+different_settings_to_system	strings	(object/project/none)			
+display_height	float	(object/project/none)		68	
+display_mirror_x	bool	(object/project/none)		1	
+display_mirror_y	bool	(object/project/none)		0	
+display_orientation	enum	(object/project/none)		portrait	landscape/portrait
+display_pixels_x	int	(object/project/none)		2560	
+display_pixels_y	int	(object/project/none)		1440	
+display_width	float	(object/project/none)		120	
+draft_shield	enum	process		disabled	disabled/limited/enabled
+during_print_exhaust_fan_speed	ints	filament		60	
+elefant_foot_compensation	float	process		0	
+embedding_wall_into_infill	bool	process		0	
+enable_arc_fitting	bool	process		0	
+enable_circle_compensation	bool	process		0	
+enable_filament_dynamic_map	bool	(object/project/none)		0	
+enable_height_slowdown	bools	process	process-variant	0	
+enable_long_retraction_when_cut	int	machine		0	
+enable_mixed_color_sublayer	bool	process		0	
+enable_order_independent_overlap_carving	bool	process		0	
+enable_overhang_bridge_fan	bools	filament		1	
+enable_overhang_speed	bools	process	process-variant	1	
+enable_pre_heating	bool	machine		0	
+enable_pressure_advance	bools	filament		0	
+enable_prime_tower	bool	process		0	
+enable_support	bool	process		0	
+enable_support_ironing	bool	process		0	
+enable_tower_interface_features	bool	process		0	
+enable_wrapping_detection	bool	process		0	
+enforce_support_layers	int	process		0	
+eng_plate_temp	ints	filament		45	
+eng_plate_temp_initial_layer	ints	filament		45	
+ensure_vertical_shell_thickness	enum	process		enabled	disabled/partial/enabled
+exclude_object	bool	process		1	
+extruder	int	(object/project/none)			
+extruder_ams_count	strings	(object/project/none)			
+extruder_clearance_dist_to_rod	float	machine		40	
+extruder_clearance_height_to_lid	float	machine		120	
+extruder_clearance_height_to_rod	float	machine		40	
+extruder_clearance_max_radius	float	machine		68	
+extruder_colour	strings	machine(extruder)	per-extruder	""	
+extruder_max_nozzle_count	ints	machine		1	
+extruder_nozzle_count	ints	(object/project/none)		1	
+extruder_nozzle_stats	strings	(object/project/none)			
+extruder_nozzle_stats_new	strings	(object/project/none)			
+extruder_nozzle_volume_type	enums	(object/project/none)		Standard	Standard/High Flow/Hybrid/TPU High Flow/E3D High Flow
+extruder_offset	points	machine(extruder)	per-extruder	0x0	
+extruder_printable_area	points_groups	machine			
+extruder_printable_height	floats	machine		0	
+extruder_type	enums	machine	per-extruder	Direct Drive	Direct Drive/Bowden
+extruder_variant_list	strings	machine		Direct Drive Standard	
+fan_cooling_layer_time	ints	filament		60	
+fan_direction	enum	machine		undefine	undefine/left/right/both
+fan_max_speed	ints	filament		100	
+fan_min_speed	ints	filament		20	
+farthest_point_timelapse	bool	machine		0	
+fast_tilt_time	float	(object/project/none)		5	
+filament_adaptive_volumetric_speed	bools	filament	filament-variant	0	
+filament_adhesiveness_category	ints	filament		0	
+filament_bridge_speed	floats	filament	filament-variant	nil	
+filament_change_length	floats	filament		10	
+filament_change_length_nc	floats	filament		10	
+filament_colour	strings	(object/project/none)		#00AE42	
+filament_colour_type	strings	(object/project/none)		1	
+filament_cooling_before_tower	floats	filament	filament-variant	10	
+filament_cost	floats	filament		0	
+filament_density	floats	filament		0	
+filament_deretraction_speed	floats	filament	filament-variant	nil	
+filament_dev_ams_drying_ams_limitations	strings	filament		""	
+filament_dev_ams_drying_heat_distortion_temperature	floats	filament		0	
+filament_dev_ams_drying_temperature	floats	filament		0	
+filament_dev_ams_drying_time	floats	filament		0	
+filament_dev_chamber_drying_bed_temperature	floats	filament		0	
+filament_dev_chamber_drying_time	floats	filament		0	
+filament_dev_drying_cooling_temperature	floats	filament		0	
+filament_dev_drying_softening_temperature	floats	filament		0	
+filament_diameter	floats	filament		1.75	
+filament_enable_overhang_speed	bools	filament	filament-variant	nil	
+filament_end_gcode	strings	filament		 	
+filament_extruder_compatibility	ints	filament		0	
+filament_extruder_id	ints	(object/project/none)		1	
+filament_extruder_variant	strings	filament	filament-variant	Direct Drive Standard	
+filament_flow_ratio	floats	filament	filament-variant	1	
+filament_flush_temp	ints	filament	filament-variant	0	
+filament_flush_temp_fast	ints	filament	filament-variant	0	
+filament_flush_volumetric_speed	floats	filament	filament-variant	0	
+filament_ids	strings	(object/project/none)			
+filament_is_mixed	bools	(object/project/none)		0	
+filament_is_support	bools	filament		0	
+filament_long_retractions_when_cut	bools	filament	filament-variant	nil	
+filament_map	ints	(object/project/none)		1	
+filament_map_2	ints	(object/project/none)		1	
+filament_map_mode	enum	(object/project/none)		Auto For Flush	Auto For Flush/Auto For Match/Manual/Nozzle Manual/Default
+filament_max_volumetric_speed	floats	filament	filament-variant	2	
+filament_metal_stickiness	enums	filament		None	None/Low/Medium/High
+filament_minimal_purge_on_wipe_tower	floats	filament		15	
+filament_mixed_components	strings	(object/project/none)		""	
+filament_mixed_gradient	bools	(object/project/none)		0	
+filament_mixed_gradient_curve	strings	(object/project/none)		""	
+filament_mixed_gradient_per_part	bools	(object/project/none)		0	
+filament_mixed_gradient_range	strings	(object/project/none)		""	
+filament_mixed_sublayer_ratios	strings	(object/project/none)		""	
+filament_multi_colour	strings	(object/project/none)		""	
+filament_notes	string	filament			
+filament_nozzle_map	ints	(object/project/none)		1	
+filament_overhang_1_4_speed	floats	filament	filament-variant	nil	
+filament_overhang_2_4_speed	floats	filament	filament-variant	nil	
+filament_overhang_3_4_speed	floats	filament	filament-variant	nil	
+filament_overhang_4_4_speed	floats	filament	filament-variant	nil	
+filament_overhang_totally_speed	floats	filament	filament-variant	nil	
+filament_pre_cooling_temperature	ints	filament	filament-variant	0	
+filament_pre_cooling_temperature_nc	ints	filament	filament-variant	0	
+filament_preheat_temperature_delta	floats	filament	filament-variant	0	
+filament_prime_volume	floats	filament		45	
+filament_prime_volume_nc	floats	filament		60	
+filament_printable	ints	filament		3	
+filament_ramming_travel_time	floats	filament	filament-variant	0	
+filament_ramming_travel_time_nc	floats	filament	filament-variant	0	
+filament_ramming_volumetric_speed	floats	filament	filament-variant	-1	
+filament_ramming_volumetric_speed_nc	floats	filament	filament-variant	-1	
+filament_retract_before_wipe	percents	filament	filament-variant	nil	
+filament_retract_length_nc	floats	filament	filament-variant	10	
+filament_retract_lift_above	floats	(object/project/none)		nil	
+filament_retract_lift_below	floats	(object/project/none)		nil	
+filament_retract_restart_extra	floats	filament	filament-variant	nil	
+filament_retract_when_changing_layer	bools	filament	filament-variant	nil	
+filament_retraction_distances_when_cut	floats	filament	filament-variant	nil	
+filament_retraction_length	floats	filament	filament-variant	nil	
+filament_retraction_minimum_travel	floats	filament	filament-variant	nil	
+filament_retraction_speed	floats	filament	filament-variant	nil	
+filament_scarf_gap	floats_or_percents	filament		0	
+filament_scarf_height	floats_or_percents	filament		10%	
+filament_scarf_length	floats	filament		10	
+filament_scarf_seam_type	enums	filament			none/external/all
+filament_self_index	ints	(object/project/none)		1	
+filament_settings_id	strings	(object/project/none)		""	
+filament_shrink	percents	filament		100%	
+filament_soluble	bools	filament		0	
+filament_start_gcode	strings	filament		 	
+filament_tower_interface_pre_extrusion_dist	floats	filament		10	
+filament_tower_interface_pre_extrusion_length	floats	filament		0	
+filament_tower_interface_print_temp	ints	filament		-1	
+filament_tower_interface_purge_volume	floats	filament		20	
+filament_tower_ironing_area	floats	filament		4	
+filament_type	strings	filament		PLA	PLA/ABS/ASA/ASA-CF/PETG/PCTG/TPU/TPU-AMS/PC/PA/PA-CF/PA-GF/PA6-CF/PLA-CF/PET-CF/PETG-CF/PVA/HIPS/PLA-AERO/PPS/PPS-CF/PPA-CF/PPA-GF/ABS-GF/ASA-AERO/PE/PP/EVA/PHA/BVOH/PE-CF/PP-CF/PP-GF
+filament_velocity_adaptation_factor	floats	filament		1	
+filament_vendor	strings	filament		(Undefined)	
+filament_volume_map	ints	(object/project/none)		0	
+filament_wipe	bools	filament	filament-variant	nil	
+filament_wipe_distance	floats	filament	filament-variant	nil	
+filament_z_hop	floats	filament	filament-variant	nil	
+filament_z_hop_types	enums	filament	filament-variant	nil	Auto Lift/Normal Lift/Slope Lift/Spiral Lift
+filename_format	string	process			
+fill_multiline	int	process		1	
+filter_out_gap_fill	float	process		0	
+first_layer_print_sequence	ints	(object/project/none)		0	
+first_layer_sequence_choice	enum	(object/project/none)		Auto	Auto/Customize
+first_x_layer_fan_speed	floats	filament		0	
+first_x_layer_part_fan_speed	ints	filament		0	
+flush_into_infill	bool	process		0	
+flush_into_objects	bool	process		0	
+flush_into_support	bool	process		1	
+flush_multiplier	floats	(object/project/none)		1	
+flush_multiplier_fast	floats	(object/project/none)		1.2	
+flush_volumes_matrix	floats	(object/project/none)		0,280,280,280,280,0,280,280,280,280,0,280,280,280,280,0	
+flush_volumes_vector	floats	(object/project/none)		140,140,140,140,140,140,140,140	
+full_fan_speed_layer	ints	filament		0	
+fuzzy_skin	enum	process		none	none/external/all/allwalls/disabled_fuzzy
+fuzzy_skin_first_layer	bool	process		0	
+fuzzy_skin_mode	enum	process		displacement	displacement/extrusion/combined
+fuzzy_skin_noise_type	enum	process		classic	classic/perlin/billow/ridgedmulti/voronoi
+fuzzy_skin_octaves	int	process		4	
+fuzzy_skin_persistence	float	process		0.5	
+fuzzy_skin_point_distance	float	process		0.8	
+fuzzy_skin_scale	float	process		1	
+fuzzy_skin_thickness	float	process		0.3	
+gap_infill_speed	floats	process	process-variant	30	
+gcode_add_line_number	bool	process		0	
+gcode_flavor	enum	machine		marlin	marlin/klipper
+grab_length	floats	machine		0	
+group_algo_with_time	bool	machine		0	
+has_filament_switcher	bool	(object/project/none)		0	
+has_scarf_joint_seam	bool	(object/project/none)		0	
+head_wrap_detect_zone	points	machine			
+hole_coef_1	floats	filament		0	
+hole_coef_2	floats	filament		-0.025	
+hole_coef_3	floats	filament		0.28	
+hole_limit_max	floats	filament		0.25	
+hole_limit_min	floats	filament		0.08	
+host_type	enum	machine		octoprint	prusalink/octoprint/duet/flashair/astrobox/repetier/mks
+hot_plate_temp	ints	filament		45	
+hot_plate_temp_initial_layer	ints	filament		45	
+hotend_cooling_rate	floats	machine	printer-variant	2	
+hotend_heating_rate	floats	machine	printer-variant	2	
+impact_strength_z	floats	filament		0	
+independent_support_layer_height	bool	process		1	
+infill_combination	bool	process		0	
+infill_direction	float	process		45	
+infill_instead_top_bottom_surfaces	bool	process		0	
+infill_jerk	float	process		9	
+infill_lock_depth	float	process		1	
+infill_rotate_step	float	process		0	
+infill_shift_step	float	process		0.4	
+infill_wall_overlap	percent	process		15%	
+inherits	string	process			
+inherits_group	strings	(object/project/none)			
+initial_layer_acceleration	floats	process	process-variant	300	
+initial_layer_flow_ratio	float	process		1	
+initial_layer_infill_line_width	float	process		0	
+initial_layer_infill_speed	floats	process	process-variant	60	
+initial_layer_jerk	float	process		9	
+initial_layer_line_width	float	process		0.4	
+initial_layer_print_height	float	process		0.2	
+initial_layer_speed	floats	process	process-variant	30	
+initial_layer_travel_acceleration	floats	process	process-variant	500	
+inner_wall_acceleration	floats	process	process-variant	0	
+inner_wall_jerk	float	process		9	
+inner_wall_line_width	float	process		0.4	
+inner_wall_speed	floats	process	process-variant	60	
+interface_shells	bool	process		0	
+interlocking_beam	bool	process		0	
+interlocking_beam_layer_count	int	process		2	
+interlocking_beam_width	float	process		0.8	
+interlocking_boundary_avoidance	int	process		2	
+interlocking_depth	int	process		2	
+interlocking_orientation	float	process		22.5	
+internal_bridge_support_thickness	float	process		0	
+internal_solid_infill_line_width	float	process		0.4	
+internal_solid_infill_pattern	enum	process		zig-zag	concentric/zig-zag/monotonic/monotonicline/alignedrectilinear/hilbertcurve/archimedeanchords/octagramspiral
+internal_solid_infill_speed	floats	process	process-variant	100	
+ironing_direction	float	process		45	
+ironing_fan_speed	ints	filament		-1	
+ironing_flow	percent	process		10%	
+ironing_inset	float	process		0	
+ironing_pattern	enum	process		zig-zag	concentric/zig-zag/ironingarchimedeanspiral
+ironing_spacing	float	process		0.1	
+ironing_speed	float	process		20	
+ironing_type	enum	process		no ironing	no ironing/top/topmost/solid
+is_infill_first	bool	process		0	
+layer_change_gcode	string	machine			
+layer_height	float	process		0.2	
+line_width	float	process		0.4	
+locked_skeleton_infill_pattern	enum	process		zig-zag	concentric/zig-zag/grid/line/cubic/triangles/tri-hexagon/gyroid/honeycomb/alignedrectilinear/3dhoneycomb/hilbertcurve/archimedeanchords/octagramspiral/crosshatch/zigzag/crosszag
+locked_skin_infill_pattern	enum	process		crosszag	concentric/zig-zag/grid/line/cubic/triangles/tri-hexagon/gyroid/honeycomb/alignedrectilinear/3dhoneycomb/hilbertcurve/archimedeanchords/octagramspiral/crosshatch/zigzag/crosszag
+long_retractions_when_cut	bools	machine	printer-variant	0	
+long_retractions_when_ec	bools	filament	filament-variant	0	
+machine_bed_mass_Y	float	machine(limits)		0	
+machine_end_gcode	string	machine		M104 S0 ; turn off temperature\nG28 X0 ; home X axis\nM84 ; disable motors\n	
+machine_hotend_change_time	float	machine		0	
+machine_load_filament_time	float	machine		0	
+machine_max_acceleration_e	floats	machine(limits)	printer-variant x2(silent)		
+machine_max_acceleration_extruding	floats	machine(limits)	printer-variant x2(silent)	1500,1250	
+machine_max_acceleration_retracting	floats	machine(limits)	printer-variant x2(silent)	1500,1250	
+machine_max_acceleration_travel	floats	machine(limits)	printer-variant x2(silent)	1500,1250	
+machine_max_acceleration_x	floats	machine(limits)	printer-variant x2(silent)		
+machine_max_acceleration_y	floats	machine(limits)	printer-variant x2(silent)		
+machine_max_acceleration_z	floats	machine(limits)	printer-variant x2(silent)		
+machine_max_force_Y	float	machine(limits)		0	
+machine_max_jerk_e	floats	machine(limits)	printer-variant x2(silent)		
+machine_max_jerk_x	floats	machine(limits)	printer-variant x2(silent)		
+machine_max_jerk_y	floats	machine(limits)	printer-variant x2(silent)		
+machine_max_jerk_z	floats	machine(limits)	printer-variant x2(silent)		
+machine_max_printed_mass	float	machine(limits)		0	
+machine_max_speed_e	floats	machine(limits)	printer-variant x2(silent)		
+machine_max_speed_x	floats	machine(limits)	printer-variant x2(silent)		
+machine_max_speed_y	floats	machine(limits)	printer-variant x2(silent)		
+machine_max_speed_z	floats	machine(limits)	printer-variant x2(silent)		
+machine_min_extruding_rate	floats	machine(limits)		0,0	
+machine_min_travel_rate	floats	machine(limits)		0,0	
+machine_pause_gcode	string	machine			
+machine_prepare_compensation_time	float	machine		260	
+machine_start_gcode	string	machine		G28 ; home all axes\nG1 Z5 F5000 ; lift nozzle\n	
+machine_switch_extruder_time	float	machine		5	
+machine_unload_filament_time	float	machine		0	
+master_extruder_id	int	machine		1	
+max_bridge_length	float	process		10	
+max_layer_height	floats	machine(extruder)	per-extruder	0	
+max_travel_detour_distance	float_or_percent	process		0	
+min_bead_width	percent	process		85%	
+min_feature_size	percent	process		25%	
+min_layer_height	floats	machine(extruder)	per-extruder	0.07	
+minimum_sparse_infill_area	float	process		15	
+mmu_segmented_region_interlocking_depth	float	process		0	
+mmu_segmented_region_max_width	float	process		0	
+modifier_ignore_infill	bool	process		0	
+monotonic_travel_into_wall	percent	process		0%	
+no_slow_down_for_cooling_on_outwalls	bools	filament		0	
+nozzle_diameter	floats	machine(extruder)	per-extruder	0.4	
+nozzle_flush_dataset	ints	machine	printer-variant	0	
+nozzle_height	float	machine		4	
+nozzle_temperature	ints	filament	filament-variant	200	
+nozzle_temperature_initial_layer	ints	filament	filament-variant	200	
+nozzle_temperature_range_high	ints	filament		240	
+nozzle_temperature_range_low	ints	filament		190	
+nozzle_volume	floats	machine	printer-variant	0	
+nozzle_volume_type	enums	(object/project/none)		Standard	Standard/High Flow/Hybrid/TPU High Flow/E3D High Flow
+only_one_wall_first_layer	bool	process		0	
+ooze_prevention	bool	process		0	
+other_layers_print_sequence	ints	(object/project/none)		0	
+other_layers_print_sequence_nums	int	(object/project/none)		0	
+other_layers_sequence_choice	enum	(object/project/none)		Auto	Auto/Customize
+outer_wall_acceleration	floats	process	process-variant	500	
+outer_wall_jerk	float	process		9	
+outer_wall_line_width	float	process		0	
+outer_wall_speed	floats	process	process-variant	60	
+overhang_1_4_speed	floats	process	process-variant	0	
+overhang_2_4_speed	floats	process	process-variant	0	
+overhang_3_4_speed	floats	process	process-variant	0	
+overhang_4_4_speed	floats	process	process-variant	0	
+overhang_fan_speed	ints	filament		100	
+overhang_fan_threshold	enums	filament		95%	0%/10%/25%/50%/75%/95%
+overhang_threshold_participating_cooling	enums	filament		95%	0%/10%/25%/50%/75%/95%/100%
+overhang_totally_speed	floats	process	process-variant	10	
+override_filament_scarf_seam_setting	bool	process		0	
+override_process_overhang_speed	bools	filament	filament-variant	0	
+periodic_modifier	bool	process		0	
+periodic_modifier_apply_layers	int	process		1	
+periodic_modifier_skip_layers	int	process		1	
+physical_extruder_map	ints	machine		0	
+post_process	strings	process			
+pre_start_fan_time	floats	filament		0	
+precise_outer_wall	bool	process		0	
+precise_z_height	bool	process		0	
+preset_name	string	(object/project/none)			
+preset_names	strings	(object/project/none)			
+pressure_advance	floats	filament		0.02	
+prime_tower_brim_width	float	process		3	-1
+prime_tower_enable_framework	bool	process		0	
+prime_tower_extra_rib_length	float	process		0	
+prime_tower_fillet_wall	bool	process		1	
+prime_tower_flat_ironing	bool	process		0	
+prime_tower_infill_gap	percent	process		150%	
+prime_tower_lift_height	float	process		-1	
+prime_tower_lift_speed	float	process		90	
+prime_tower_max_speed	float	process		90	
+prime_tower_rib_wall	bool	process		1	
+prime_tower_rib_width	float	process		8	
+prime_tower_skip_points	bool	process		1	
+prime_tower_width	float	process		35	
+prime_volume_mode	enum	(object/project/none)		Default	Default/Saving/Fast
+print_compatible_printers	strings	(object/project/none)			
+print_extruder_id	ints	process	process-variant	1	
+print_extruder_variant	strings	process	process-variant	Direct Drive Standard	
+print_flow_ratio	float	process		1	
+print_host	string	machine			
+print_host_webui	string	machine			
+print_in_clockwise	bool	machine		0	
+print_sequence	enum	process		by layer	by layer/by object
+print_settings_id	string	(object/project/none)			
+printable_area	points	machine		0x0,200x0,200x200,0x200	
+printable_height	float	machine		100	
+printer_extruder_id	ints	machine	printer-variant	1	
+printer_extruder_variant	strings	machine	printer-variant	Direct Drive Standard	
+printer_model	string	machine			
+printer_notes	string	machine			
+printer_settings_id	string	(object/project/none)			
+printer_structure	enum	machine		undefine	undefine/corexy/i3/hbot/delta
+printer_technology	enum	machine		FFF	FFF/SLA
+printer_variant	string	machine			
+printhost_apikey	string	machine			
+printhost_authorization_type	enum	machine		key	key/user
+printhost_cafile	string	machine			
+printhost_password	string	machine			
+printhost_port	string	machine			
+printhost_ssl_ignore_revoke	bool	machine		0	
+printhost_user	string	machine			
+printing_by_object_gcode	string	machine			
+process_notes	string	process			
+raft_contact_distance	float	process		0.1	
+raft_expansion	float	process		1.5	
+raft_first_layer_density	percent	process		90%	
+raft_first_layer_expansion	float	process		-1	
+raft_layers	int	process		0	
+reduce_crossing_wall	bool	process		0	
+reduce_fan_stop_start_freq	bools	filament		0	
+reduce_infill_retraction_mode	enum	process		Auto	Disabled/Auto/Enabled
+required_nozzle_HRC	ints	filament		0	
+resolution	float	process		0.01	
+retract_before_wipe	percents	machine(extruder)	printer-variant	100%	
+retract_length_toolchange	floats	machine(extruder)	printer-variant	10	
+retract_lift_above	floats	machine(extruder)	printer-variant	0	
+retract_lift_below	floats	machine(extruder)	printer-variant	0	
+retract_restart_extra	floats	machine(extruder)	printer-variant	0	
+retract_restart_extra_toolchange	floats	machine(extruder)	printer-variant	0	
+retract_when_changing_layer	bools	machine(extruder)	printer-variant	0	
+retraction_distances_when_cut	floats	machine	printer-variant	18	
+retraction_distances_when_ec	floats	filament	filament-variant	10	
+retraction_length	floats	machine(extruder)	printer-variant	0.8	
+retraction_minimum_travel	floats	machine(extruder)	printer-variant	2	
+retraction_speed	floats	machine(extruder)	printer-variant	30	
+role_base_wipe_speed	bool	process		1	
+scan_first_layer	bool	machine		0	
+scarf_angle_threshold	int	process		155	
+seam_gap	percent	process		15%	
+seam_placement_away_from_overhangs	bool	process		0	
+seam_position	enum	process		aligned	nearest/aligned/back/random
+seam_slope_conditional	bool	process		1	
+seam_slope_entire_loop	bool	process		0	
+seam_slope_gap	float_or_percent	process		0	
+seam_slope_inner_walls	bool	process		1	
+seam_slope_min_length	float	process		10	
+seam_slope_start_height	float_or_percent	process		10%	
+seam_slope_steps	int	process		10	
+seam_slope_type	enum	process		none	none/external/all
+silent_mode	bool	machine		0	
+single_extruder_multi_material	bool	machine		0	
+skeleton_infill_density	percent	process		15%	
+skeleton_infill_line_width	float	process		0.4	
+skin_infill_density	percent	process		15%	
+skin_infill_depth	float	process		2	
+skin_infill_line_width	float	process		0.4	
+skirt_distance	float	process		2	
+skirt_height	int	process		1	
+skirt_loops	int	process		1	
+skirt_per_object	bool	process		1	
+slice_closing_radius	float	process		0.049	
+slicing_mode	enum	process		regular	regular/even_odd/close_holes
+slow_down_for_layer_cooling	bools	filament		1	
+slow_down_layer_time	ints	filament		5	
+slow_down_min_speed	floats	filament	filament-variant	10	
+slow_tilt_time	float	(object/project/none)		8	
+slowdown_end_acc	floats	process	process-variant	100000	
+slowdown_end_height	floats	process	process-variant	400	
+slowdown_end_speed	floats	process	process-variant	1000	
+slowdown_start_acc	floats	process	process-variant	100000	
+slowdown_start_height	floats	process	process-variant	0	
+slowdown_start_speed	floats	process	process-variant	1000	
+small_perimeter_speed	floats_or_percents	process	process-variant	50%	
+small_perimeter_threshold	floats	process	process-variant	0	
+smooth_coefficient	float	process		80	
+smooth_speed_discontinuity_area	bool	process		1	
+solid_infill_filament	int	process		0	
+sparse_infill_acceleration	floats_or_percents	process	process-variant	100%	
+sparse_infill_anchor	float_or_percent	process		400%	0/1/2/5/10/1000
+sparse_infill_anchor_max	float_or_percent	process		20	0/1/2/5/10/1000
+sparse_infill_density	percent	process		20%	
+sparse_infill_filament	int	process		0	
+sparse_infill_lattice_angle_1	float	process		-45	
+sparse_infill_lattice_angle_2	float	process		45	
+sparse_infill_line_width	float	process		0.4	
+sparse_infill_pattern	enum	process		cubic	concentric/zig-zag/grid/line/cubic/triangles/tri-hexagon/gyroid/honeycomb/adaptivecubic/alignedrectilinear/3dhoneycomb/hilbertcurve/archimedeanchords/octagramspiral/supportcubic/lightning/crosshatch/zigzag/crosszag/lockedzag/2dlattice
+sparse_infill_speed	floats	process	process-variant	100	
+spiral_mode	bool	process		0	
+spiral_mode_max_xy_smoothing	float_or_percent	process		200%	
+spiral_mode_smooth	bool	process		0	
+standby_temperature_delta	int	process		-5	
+start_end_points	points	(object/project/none)		30x-3,54x245	
+sub_top_surface_pattern	enum	process		monotonic	concentric/zig-zag/monotonic/monotonicline/alignedrectilinear/hilbertcurve/archimedeanchords/octagramspiral
+supertack_plate_temp	ints	filament		35	
+supertack_plate_temp_initial_layer	ints	filament		35	
+support_air_filtration	bool	machine		0	
+support_angle	float	process		0	
+support_base_pattern	enum	process		default	default/rectilinear/rectilinear-grid/honeycomb/lightning/hollow
+support_base_pattern_spacing	float	process		2.5	
+support_bottom_interface_spacing	float	process		0.5	
+support_bottom_z_distance	float	process		0.2	
+support_chamber_temp_control	bool	machine		0	
+support_cooling_filter	bool	machine		0	
+support_critical_regions_only	bool	process		0	
+support_expansion	float	process		0	
+support_fast_purge_mode	bool	machine		0	
+support_filament	int	process		0	
+support_interface_bottom_layers	int	process		0	-1
+support_interface_filament	int	process		0	
+support_interface_loop_pattern	bool	process		0	
+support_interface_not_for_body	bool	process		1	
+support_interface_pattern	enum	process		auto	auto/rectilinear/concentric/rectilinear_interlaced/grid
+support_interface_spacing	float	process		0.5	
+support_interface_speed	floats	process	process-variant	80	
+support_interface_top_layers	int	process		3	0/1/2/3
+support_ironing_direction	float	process		0	
+support_ironing_flow	percent	process		10%	
+support_ironing_inset	float	process		0	
+support_ironing_pattern	enum	process		zig-zag	concentric/zig-zag
+support_ironing_spacing	float	process		0.1	
+support_ironing_speed	float	process		20	
+support_line_width	float	process		0.4	
+support_object_first_layer_gap	float	process		0.2	
+support_object_skip_flush	bool	machine		0	
+support_object_xy_distance	float	process		0.35	
+support_on_build_plate_only	bool	process		0	
+support_remove_small_overhang	bool	process		1	
+support_speed	floats	process	process-variant	80	
+support_style	enum	process		default	default/grid/snug/tree_slim/tree_strong/tree_hybrid/tree_organic
+support_threshold_angle	int	process		30	
+support_top_z_distance	float	process		0.2	
+support_type	enum	process		normal(auto)	normal(auto)/tree(auto)/normal(manual)/tree(manual)/coral(auto)
+symmetric_infill_y_axis	bool	process		0	
+temperature_vitrification	ints	filament		100	
+template_custom_gcode	string	machine			
+textured_plate_temp	ints	filament		45	
+textured_plate_temp_initial_layer	ints	filament		45	
+thick_bridges	bool	process		0	
+thumbnail_size	points	machine		50x50	
+time_lapse_gcode	string	machine			
+timelapse_type	enum	process		0	0/1
+top_area_threshold	percent	process		200%	
+top_color_penetration_layers	int	process		4	
+top_one_wall_type	enum	process		all top	not apply/all top/topmost
+top_shell_layers	int	process		4	
+top_shell_thickness	float	process		0.6	
+top_solid_infill_flow_ratio	floats	process	process-variant	1	
+top_surface_acceleration	floats	process	process-variant	500	
+top_surface_density	percent	process		100%	
+top_surface_jerk	float	process		9	
+top_surface_line_width	float	process		0.4	
+top_surface_pattern	enum	process		zig-zag	concentric/zig-zag/monotonic/monotonicline/globalmonotonicline/alignedrectilinear/hilbertcurve/archimedeanchords/octagramspiral
+top_surface_speed	floats	process	process-variant	100	
+top_z_overrides_xy_distance	bool	process		0	
+travel_acceleration	floats	process	process-variant	500	
+travel_jerk	float	process		9	
+travel_short_distance_acceleration	floats	process	process-variant	250	
+travel_speed	floats	process	process-variant	120	
+travel_speed_z	floats	process	process-variant	0	
+tree_support_branch_angle	float	process		40	
+tree_support_branch_diameter	float	process		5	
+tree_support_branch_diameter_angle	float	process		5	
+tree_support_branch_distance	float	process		5	
+tree_support_wall_count	int	process		-1	
+upward_compatible_machine	strings	machine			
+use_firmware_retraction	bool	machine		0	
+use_relative_e_distances	bool	machine		1	
+vertical_shell_speed	floats_or_percents	process	process-variant	80%	
+volumetric_speed_coefficients	strings	filament	filament-variant	""	
+wall_distribution_count	int	process		1	
+wall_filament	int	process		0	
+wall_generator	enum	process		arachne	classic/arachne
+wall_loops	int	process		2	
+wall_sequence	enum	process		inner wall/outer wall	inner wall/outer wall/outer wall/inner wall/inner-outer-inner wall
+wall_transition_angle	float	process		10	
+wall_transition_filter_deviation	percent	process		25%	
+wall_transition_length	percent	process		100%	
+wipe	bools	machine(extruder)	printer-variant	0	
+wipe_distance	floats	machine(extruder)	printer-variant	2	
+wipe_speed	percent	process		80%	
+wipe_tower_no_sparse_layers	bool	process		0	
+wipe_tower_rotation_angle	float	(object/project/none)		0	
+wipe_tower_x	floats	(object/project/none)		15	
+wipe_tower_y	floats	(object/project/none)		220	
+wrapping_detection_gcode	string	machine			
+wrapping_detection_layers	int	machine		20	
+wrapping_exclude_area	points	machine			
+xy_contour_compensation	float	process		0	
+xy_hole_compensation	float	process		0	
+z_direction_outwall_speed_continuous	bool	process		0	
+z_hop	floats	machine(extruder)	printer-variant	0.4	
+z_hop_types	enums	machine	printer-variant	Spiral Lift	Auto Lift/Normal Lift/Slope Lift/Spiral Lift

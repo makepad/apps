@@ -1,0 +1,186 @@
+let __module_f = mod.elec.f
+
+let __module_positive = fn(v) {
+    return v.is_number() && v > 0mm && v - v == 0mm
+}
+
+// Module lands keep the pad dimensions, with only 0.1 mm added outwards.
+let __module_land = fn(pad) {
+    return {
+        length: pad[0] + 0.1mm
+        width: pad[1]
+        inset: (pad[0] - 0.1mm) / 2
+    }
+}
+
+let __module_touch = fn(a, b) {
+    return (a.at[0] - a.size[0] / 2 <= b.at[0] + b.size[0] / 2
+        && b.at[0] - b.size[0] / 2 <= a.at[0] + a.size[0] / 2
+        && a.at[1] - a.size[1] / 2 <= b.at[1] + b.size[1] / 2
+        && b.at[1] - b.size[1] / 2 <= a.at[1] + a.size[1] / 2)
+}
+
+// Half-hole edge-pad module; o.body [x, y], o.pitch, o.pad [inward length, width]
+// are lengths in mm. o.left/bottom/right/top are integer counts 0..60, not all zero.
+// Optional o.offset [left, bottom, right, top] (mm) centres each row when omitted;
+// distances start at the top-left, bottom-left, bottom-right and top-right corners.
+// Optional o.ground [width, height] (mm) is centred and numbered after the edge pads.
+// Numbering runs down the left, across the bottom, up the right, then across the top.
+let castellated = fn(o) {
+    let f = __module_f
+    if !o.is_object() {
+        return f.error("castellated: o must be an options object")
+    }
+    let body = o.body ?? nil
+    let pitch = o.pitch ?? nil
+    let pad = o.pad ?? nil
+    let offset = o.offset ?? nil
+    let ground = o.ground ?? nil
+    let counts = [(o.left ?? nil), (o.bottom ?? nil), (o.right ?? nil), (o.top ?? nil)]
+    let names = ["left", "bottom", "right", "top"]
+    for side in 0..4 {
+        let n = counts[side]
+        if !n.is_number() || n < 0 || n > 60 || n % 1 != 0 {
+            return f.error("castellated: " + names[side] + " must be an integer from 0 to 60")
+        }
+    }
+    let pins = counts[0] + counts[1] + counts[2] + counts[3]
+    if pins == 0 {
+        return f.error("castellated: left, bottom, right and top must include at least one pad")
+    }
+    if !__module_positive(pitch) {
+        return f.error("castellated: pitch must be a positive finite length")
+    }
+    if !body.is_array() || body.len() != 2 {
+        return f.error("castellated: body must be [x, y]")
+    }
+    if !__module_positive(body[0]) || !__module_positive(body[1]) {
+        return f.error("castellated: body dimensions must be positive finite lengths")
+    }
+    if !pad.is_array() || pad.len() != 2 {
+        return f.error("castellated: pad must be [inward length, width]")
+    }
+    if !__module_positive(pad[0]) || !__module_positive(pad[1]) {
+        return f.error("castellated: pad dimensions must be positive finite lengths")
+    }
+    if ((counts[0] > 0 || counts[2] > 0) && pad[0] > body[0])
+        || ((counts[1] > 0 || counts[3] > 0) && pad[0] > body[1]) {
+        return f.error("castellated: pad inward length must fit inside body")
+    }
+    if offset != nil && (!offset.is_array() || offset.len() != 4) {
+        return f.error("castellated: offset must be [left, bottom, right, top]")
+    }
+    let spans = [body[1], body[0], body[1], body[0]]
+    for side in 0..4 {
+        if counts[side] > 1 && pad[1] >= pitch {
+            return f.error("castellated: pitch must exceed pad width on " + names[side])
+        }
+        if counts[side] > 0 && (counts[side] - 1) * pitch + pad[1] > spans[side] {
+            return f.error("castellated: " + names[side] + ", pitch and pad width must fit body")
+        }
+    }
+    let offsets = for side in 0..4 {
+        if offset != nil { offset[side] }
+        elif counts[side] > 0 { (spans[side] - (counts[side] - 1) * pitch) / 2 }
+        else { spans[side] / 2 }
+    }
+    for side in 0..4 {
+        let start = offsets[side]
+        if !start.is_number() || start < 0mm || start - start != 0mm {
+            return f.error("castellated: offset for " + names[side] + " must be a non-negative finite length")
+        }
+        if counts[side] > 0 && (start < pad[1] / 2
+            || start + (counts[side] - 1) * pitch + pad[1] / 2 > spans[side]) {
+            return f.error("castellated: offset, pitch and pad width must keep " + names[side] + " pads on body")
+        }
+    }
+
+    let land = __module_land(pad)
+    let x = body[0] / 2 - land.inset
+    let y = body[1] / 2 - land.inset
+    let bottom_end = counts[0] + counts[1]
+    let right_end = bottom_end + counts[2]
+    let lands = for i in 0..pins {
+        let at = if i < counts[0] {
+            [-x, body[1] / 2 - offsets[0] - i * pitch]
+        } elif i < bottom_end {
+            [-body[0] / 2 + offsets[1] + (i - counts[0]) * pitch, -y]
+        } elif i < right_end {
+            [x, -body[1] / 2 + offsets[2] + (i - bottom_end) * pitch]
+        } else {
+            [body[0] / 2 - offsets[3] - (i - right_end) * pitch, y]
+        }
+        let size = if i < counts[0] || (i >= bottom_end && i < right_end) {
+            [land.length, land.width]
+        } else {
+            [land.width, land.length]
+        }
+        {at: at size: size}
+    }
+    // Check individual lands so offset rows can safely pass one another.
+    for i in 0..pins {
+        for j in 0..i {
+            if __module_touch(lands[i], lands[j]) {
+                return f.error("castellated: body, pad, pitch or offset make edge lands "
+                    + f.int(j + 1) + " and " + f.int(i + 1) + " touch or overlap")
+            }
+        }
+    }
+    if ground != nil {
+        if !ground.is_array() || ground.len() != 2 {
+            return f.error("castellated: ground must be [width, height]")
+        }
+        if !__module_positive(ground[0]) || !__module_positive(ground[1]) {
+            return f.error("castellated: ground dimensions must be positive finite lengths")
+        }
+        if ground[0] > body[0] || ground[1] > body[1] {
+            return f.error("castellated: ground must fit inside body")
+        }
+        let centre = {at: [0mm, 0mm] size: ground}
+        for i in 0..pins {
+            if __module_touch(lands[i], centre) {
+                return f.error("castellated: ground must leave a gap to edge land " + f.int(i + 1))
+            }
+        }
+    }
+    let pads = for i in 0..pins {
+        f.smd(f.int(i + 1), lands[i].at, lands[i].size)
+    }
+    if ground != nil {
+        pads.push(f.smd(f.int(pins + 1), [0mm, 0mm], ground))
+    }
+    let pin1 = lands[0].at
+    let dot = if counts[0] > 0 {
+        [pin1[0], pin1[1] + 0.7mm]
+    } elif counts[1] > 0 {
+        [pin1[0] - 0.7mm, pin1[1]]
+    } elif counts[2] > 0 {
+        [pin1[0], pin1[1] - 0.7mm]
+    } else {
+        [pin1[0] + 0.7mm, pin1[1]]
+    }
+    return f.footprint({
+        pads: pads
+        body: [[-body[0] / 2, -body[1] / 2], [body[0] / 2, body[1] / 2]]
+        mount: @smd
+        text: 1mm
+        graphics: [f.dot("F.SilkS", dot, 0.15mm)]
+    })
+}
+
+// Four centred rows of half-hole pads; pins_per_side integer 1..60, pitch (mm),
+// body [x, y] (mm). Uses pads with 1.5 mm inward length and 0.9 mm width.
+let castellated_grid = fn(pins_per_side, pitch, body) {
+    if !pins_per_side.is_number() || pins_per_side < 1 || pins_per_side > 60 || pins_per_side % 1 != 0 {
+        return __module_f.error("castellated_grid: pins_per_side must be an integer from 1 to 60")
+    }
+    return castellated({
+        body: body
+        pitch: pitch
+        pad: [1.5mm, 0.9mm]
+        left: pins_per_side
+        bottom: pins_per_side
+        right: pins_per_side
+        top: pins_per_side
+    })
+}

@@ -1,0 +1,10 @@
+# CI (devhub ci): [ci] is hand-written settings; the other sections are proofs devhub writes.
+
+[ci]
+runs = "--prove-gyroid"
+
+[tests.linux]
+date = "2026-11-05"
+digest = "6849b0da937723c62d13db6f798ea7125ef49e2c06fc7fe601375c8607eb56bf"
+main = "71832f8fa1c5a3f6f589b89749c6a99c189e3e8e"
+work = "5300f14ac2c7b3d5aa16bd89d98d789111fbbeb8"

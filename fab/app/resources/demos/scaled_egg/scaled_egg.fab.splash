@@ -1,0 +1,9 @@
+// An egg covered in spiralling scales, in two filaments.
+use mod.fab.*
+
+script("scaled_egg.cad.splash")
+
+color("Jade", rgb: #x2e7354)
+color("Gold", rgb: #xd9a340)
+
+place("scaled_egg", at: [175mm 160mm], name: "Scaled egg", color: "Jade")

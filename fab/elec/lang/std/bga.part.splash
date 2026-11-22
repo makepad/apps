@@ -1,0 +1,144 @@
+let __bga_f = mod.elec.f
+
+let __bga_positive = fn(v) {
+    return v.is_number() && v > 0mm && v - v == 0mm
+}
+
+// Nominal non-solder-mask-defined land diameter, rounded to 0.01 mm.
+let __bga_land = fn(ball) {
+    return __bga_f.round(0.8 * ball, 0.01mm)
+}
+
+let __bga_letters = ["A", "B", "C", "D", "E", "F", "G", "H", "J", "K",
+                     "L", "M", "N", "P", "R", "T", "U", "V", "W", "Y"]
+
+// Zero-based row index; the supported 40 rows run from A through AY.
+let __bga_row = fn(row) {
+    if row < 20 { return __bga_letters[row] }
+    return "A" + __bga_letters[row - 20]
+}
+
+// Area-array balls: rows and cols (integers 1..40), pitch, ball diameter,
+// body [x, y] in mm; optional depop [ball names] and centre_depop [rows, cols].
+// The centre block must fit symmetrically on the grid; A1 must remain.
+let bga = fn(o) {
+    if !o.is_object() {
+        return __bga_f.error("bga: o must be an options object")
+    }
+    let rows = o.rows ?? nil
+    let cols = o.cols ?? nil
+    let pitch = o.pitch ?? nil
+    let ball = o.ball ?? nil
+    let body = o.body ?? nil
+    let depop = o.depop ?? []
+    let centre_depop = o.centre_depop ?? nil
+    if !rows.is_number() || rows < 1 || rows > 40 || rows % 1 != 0 {
+        return __bga_f.error("bga: rows must be an integer from 1 to 40")
+    }
+    if !cols.is_number() || cols < 1 || cols > 40 || cols % 1 != 0 {
+        return __bga_f.error("bga: cols must be an integer from 1 to 40")
+    }
+    if !__bga_positive(pitch) {
+        return __bga_f.error("bga: pitch must be a positive finite length")
+    }
+    if !__bga_positive(ball) {
+        return __bga_f.error("bga: ball must be a positive finite diameter")
+    }
+    if !body.is_array() || body.len() != 2 {
+        return __bga_f.error("bga: body must be [x, y]")
+    }
+    if !__bga_positive(body[0]) || !__bga_positive(body[1]) {
+        return __bga_f.error("bga: body dimensions must be positive finite lengths")
+    }
+    let d = __bga_land(ball)
+    if !__bga_positive(d) {
+        return __bga_f.error("bga: ball must give a positive finite rounded land diameter")
+    }
+    if (rows > 1 || cols > 1) && (ball >= pitch || d >= pitch) {
+        return __bga_f.error("bga: pitch must exceed ball and rounded land diameters")
+    }
+    let span_x = (cols - 1) * pitch
+    let span_y = (rows - 1) * pitch
+    let envelope = if d > ball { d } else { ball }
+    if span_x + envelope > body[0] || span_y + envelope > body[1] {
+        return __bga_f.error("bga: body must contain the grid at the specified pitch, ball and rounded land diameters")
+    }
+    if !depop.is_array() {
+        return __bga_f.error("bga: depop must be a list of ball names")
+    }
+    let centre = if centre_depop != nil {
+        if !centre_depop.is_array() || centre_depop.len() != 2 {
+            return __bga_f.error("bga: centre_depop must be [rows, cols]")
+        }
+        let n = centre_depop[0]
+        let m = centre_depop[1]
+        if !n.is_number() || n < 1 || n > rows || n % 1 != 0 {
+            return __bga_f.error("bga: centre_depop rows must be an integer from 1 to rows")
+        }
+        if !m.is_number() || m < 1 || m > cols || m % 1 != 0 {
+            return __bga_f.error("bga: centre_depop cols must be an integer from 1 to cols")
+        }
+        if (rows - n) % 2 != 0 || (cols - m) % 2 != 0 {
+            return __bga_f.error("bga: centre_depop must leave equal whole rows and columns on opposite sides")
+        }
+        if n == rows && m == cols {
+            return __bga_f.error("bga: centre_depop must not remove A1")
+        }
+        {row: (rows - n) / 2 col: (cols - m) / 2 rows: n cols: m}
+    } else { nil }
+
+    // Seed valid names before marking explicit omissions; duplicates are harmless.
+    let omitted = {}
+    for r in 0..rows {
+        let row = __bga_row(r)
+        for c in 0..cols {
+            omitted[row + __bga_f.int(c + 1)] = false
+        }
+    }
+    for i in 0..depop.len() {
+        let name = depop[i]
+        if !name.is_string() {
+            return __bga_f.error("bga: depop entries must be ball name strings")
+        }
+        if name == "A1" {
+            return __bga_f.error("bga: depop must not remove A1")
+        }
+        if (omitted[name] ?? nil) == nil {
+            return __bga_f.error("bga: depop name " + name + " is outside rows and cols")
+        }
+        omitted[name] = true
+    }
+
+    let pads = []
+    for r in 0..rows {
+        let row = __bga_row(r)
+        for c in 0..cols {
+            let name = row + __bga_f.int(c + 1)
+            let in_centre_row = centre != nil && r >= centre.row && r < centre.row + centre.rows
+            let in_centre = in_centre_row && c >= centre.col && c < centre.col + centre.cols
+            if !omitted[name] && !in_centre {
+                pads.push(__bga_f.smd(name,
+                    [-span_x / 2 + c * pitch, span_y / 2 - r * pitch], [d, d], {shape: @circle}))
+            }
+        }
+    }
+    let half_x = body[0] / 2
+    let half_y = body[1] / 2
+    let mark_x = -half_x - 0.2mm
+    let mark_y = half_y + 0.2mm
+    return __bga_f.footprint({
+        pads: pads
+        body: [[-half_x, -half_y], [half_x, half_y]]
+        mount: @smd
+        text: 1mm
+        graphics: [
+            __bga_f.stroke("F.SilkS", [[mark_x, mark_y], [mark_x + 1mm, mark_y]], 0.12mm),
+            __bga_f.stroke("F.SilkS", [[mark_x, mark_y], [mark_x, mark_y - 1mm]], 0.12mm)
+        ]
+    })
+}
+
+// Square n x n ball grid; n is 1..40, pitch, ball and body [x, y] in mm.
+let bga_grid = fn(n, pitch, ball, body) {
+    return bga({rows: n cols: n pitch: pitch ball: ball body: body})
+}

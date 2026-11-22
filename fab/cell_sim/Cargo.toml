@@ -1,0 +1,10 @@
+[package]
+name = "fab-cell-sim"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab's virtual arm cell: arms with elastic-joint dynamics and their controllers, laser-wire deposition and laser cutting into a true as-built field, and the sensors (encoders, tracker, IMU, line scanner, melt pool), behind the planner's CellLink"
+
+[dependencies]
+fab-robot = { path = "../robot" }

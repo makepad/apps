@@ -1,0 +1,9 @@
+// A print-in-place collapsible travel cup in two filaments: rings in alternating colours.
+use mod.fab.*
+
+script("travel_cup.cad.splash")
+
+color("Plum", rgb: #x6a3d7a)
+color("Mint", rgb: #x5cc79e)
+
+place("travel_cup", at: [175mm 160mm], name: "Travel cup", color: "Plum")

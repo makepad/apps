@@ -1,0 +1,13 @@
+[package]
+name = "fab-sdf-engine"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Field evaluation and GPU slicing with a bit-exact CPU twin"
+
+[dependencies]
+makepad-draw = { path = "../../../../draw", version = "2.0.0" }
+makepad-csg-math = { path = "../../../../libs/csg/csg_math" }
+makepad-csg-sdf = { path = "../../../../libs/csg/csg_sdf" }
+makepad-script-compute = { path = "../../../../platform/script/compute", version = "1.0.0", features = ["vm"] }

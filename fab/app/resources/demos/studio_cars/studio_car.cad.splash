@@ -1,0 +1,453 @@
+// A family of print-in-place cars that steer like real ones: each front wheel turns on a
+// kingpin of its own, and a tie rod behind the front axle links the two steering arms, angled
+// toward the rear axle so the inner wheel turns tighter than the outer (Ackermann). All four
+// steering joints stand on upright pins; the wheels turn on axles printed through them. Each
+// body is one distance field with the wells and the steering's cavities cut from it, every
+// cavity roofed at 45 degrees and open below: the steering prints on supports from the bed,
+// which come away under the car. The tie rod is an exact solid with chamfered edges; the wheels
+// are fields, the tread pressed into each tyre. Four bodies share the running gear: a rally
+// hatch, a dune buggy under a roll cage, a boat-tailed roadster and a concept coupe.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let style = param(0, min: 0, max: 3, step: 1, label: "Body", group: "Car", kind: "count", hint: "0 rally hatch, 1 dune buggy, 2 boat-tail roadster, 3 concept coupe")
+let materials = param(4, min: 2, max: 9, step: 1, label: "Materials", group: "Livery", kind: "count", hint: "2: the body and its trim; 4: adds the stripes and the glass; 9: a fade of its own, lamps, rims and tyres (each colour adds filament changes, and a purge with each)")
+let scheme = param(0, min: 0, max: 2, step: 1, label: "Colour scheme", group: "Livery", kind: "count", hint: "which of the body's three colour schemes")
+let wheel_r = param(13mm, min: 11mm, max: 16mm, step: 0.5mm, label: "Wheel radius", group: "Wheels", kind: "radius")
+let wheel_w = param(9mm, min: 8mm, max: 12mm, step: 0.5mm, label: "Wheel width", group: "Wheels")
+let tread = param(0.7mm, min: 0.3mm, max: 1.2mm, step: 0.05mm, label: "Tread depth", group: "Wheels")
+let wheelbase = param(84mm, min: 70mm, max: 96mm, step: 1mm, label: "Wheelbase", group: "Car")
+let steer = param(16°, min: 8°, max: 20°, step: 1°, label: "Steering lock", group: "Steering", hint: "how far each front wheel turns either way; the wells and the steering's cavities clear this much")
+
+// ---- the running gear
+// Each tyre has a flat where it stands, so it prints on a footprint, not a line.
+let flat = 0.6mm
+let ay = wheel_r - flat
+let rear_z = -wheelbase / 2
+let front_z = wheelbase / 2
+let floor_y = wheel_r - 8mm
+let half = 22mm
+let wheel_in = half + 1.5mm
+let wheel_out = wheel_in + wheel_w
+let wheel_x = wheel_in + wheel_w / 2
+// The axles are 4.2 mm round and the wheel pins 1.6 mm: a hinge's end plates (pin, two nozzle
+// widths, the clearance) then stay inside the axle, so no plate hangs below it.
+let axle_r = 4.2mm
+// The steering joints' knuckle columns: inside the clearance their hinges cut round the pins.
+let hub = 3.6mm
+let king_x = wheel_in - 5mm
+let arm_len = 12mm
+// Ackermann: each steering arm points from its kingpin at the middle of the rear axle.
+let arm_k = arm_len / sqrt(king_x * king_x + wheelbase * wheelbase)
+let tie_x = king_x - king_x * arm_k
+let tie_z = front_z - wheelbase * arm_k
+let arm_turn = atan2(king_x, wheelbase)
+let rod_h = 5.6mm
+let clear = 0.6mm
+let sweep = steer + 3°
+
+// The tie rod: an exact bar across the car behind the front axle, its edges chamfered, a
+// knuckle column at each end.
+let rod_bar = m.brep.chamfer(m.brep.box({size: [2 * tie_x, rod_h, 5mm] at: [0, ay, tie_z]}), 0.6mm)
+let rod_ends = for s in [-1, 1] { m.brep.chamfer(m.brep.cylinder({radius: hub height: rod_h + 0.4mm at: [s * tie_x, ay, tie_z]}), 0.5mm) }
+let tie_rod = m.brep.union(rod_bar, rod_ends)
+
+// A front knuckle: its kingpin's column, the stub axle out through the wheel, and the steering
+// arm back to the tie rod.
+fn knuckle(s) {
+    let boss = m.cylinder({radius: hub height: 2 * axle_r at: [s * king_x, ay, front_z]})
+    let stub = m.cylinder({radius: axle_r height: wheel_out - 0.3mm - king_x at: [s * (king_x + wheel_out - 0.3mm) / 2, ay, front_z] rotate: [0, 0, 90°] segments: 48})
+    let arm = m.box({size: [5mm, rod_h, arm_len] at: [s * (king_x + tie_x) / 2, ay, (front_z + tie_z) / 2] rotate: [0, s * arm_turn, 0]})
+    let end = m.cylinder({radius: hub height: rod_h + 0.4mm at: [s * tie_x, ay, tie_z]})
+    m.union(boss, [stub arm end])
+}
+let knuckles = [knuckle(-1) knuckle(1)]
+
+// ---- the wheels: a rim inside a treaded tyre, one field each
+let rim_r = wheel_r - 3.2mm
+let ground = m.box({size: [400mm, 20mm, 400mm] at: [0, -10mm, 0]})
+// The treads (c.x round the tyre, c.y across it): the rally car's chevrons, the buggy's
+// staggered blocks, the roadster's fine ribs, the coupe's two slick grooves.
+let chevrons = Pattern{field: fn(c) { return clamp(4 * abs(fract(c.x + abs(c.y - 0.5) * 0.8) - 0.5) - 0.6, 0, 1) } cell: [3mm wheel_w 1mm]}
+let blocks = Pattern{field: fn(c) {
+    let row = floor(c.x * 2)
+    let u = fract(c.y * 3 + row * 0.5)
+    return max(clamp(6 * abs(fract(c.x * 2) - 0.5) - 1.2, 0, 1), clamp(6 * abs(u - 0.5) - 1.2, 0, 1))
+} cell: [6mm wheel_w 1mm]}
+let ribs = Pattern{field: fn(c) { return clamp(10 * abs(fract(c.y * 5) - 0.5) - 0.8, 0, 1) } cell: [4mm wheel_w 1mm]}
+let slicks = Pattern{field: fn(c) { return clamp(8 * min(abs(c.y - 0.33), abs(c.y - 0.67)) - 0.4, 0, 1) } cell: [4mm wheel_w 1mm]}
+let tread_pattern = if style == 1 { blocks } else { if style == 2 { ribs } else { if style == 3 { slicks } else { chevrons } } }
+// The rims' pockets: five round spokes, six beadlock holes, twelve wire-like slots, or a plain
+// aero disc with a ring.
+let pockets = if style == 1 { 6 } else { if style == 2 { 12 } else { if style == 3 { 0 } else { 5 } } }
+let pocket_r = if style == 2 { 0.9mm } else { 1.6mm }
+let spoke = if pockets == 0 { 360° } else { 360° / pockets }
+let ringed = if pockets == 0 { 1 } else { 0 }
+fn wheel(x, z) {
+    let s = x / abs(x)
+    let blank = m.cylinder({radius: wheel_r height: wheel_w at: [x, ay, z] rotate: [0, 0, 90°] segments: 96})
+    let treaded = m.texture(blank, {pattern: tread_pattern map: @cylindrical axis: @x depth: tread top_angle: 60° bottom_angle: 60° cell: 0.25mm})
+    let tyre = m.carve(treaded, [ground m.cylinder({radius: rim_r - 0.2mm height: wheel_w + 2mm at: [x, ay, z] rotate: [0, 0, 90°]})], 0)
+    // The rim: a disc chamfered round both faces, its outer face pocketed or ringed.
+    let rim = m.sdf({
+        bounds: [[x - wheel_w / 2, ay - rim_r, z - rim_r], [x + wheel_w / 2, ay + rim_r, z + rim_r]]
+        cell: 0.25mm
+        field: fn(p) {
+            let q = vec2(p.y - ay, p.z - z)
+            let r = length(q)
+            let h = wheel_w / 2 - 0.6mm
+            let t = abs(p.x - x)
+            let disc = max(max(r - rim_r, t - h), (r - rim_r + t - h + 0.6mm) * 0.7071)
+            let depth = h - 1.5mm - s * (p.x - x)
+            let k = round((atan2(q.x, q.y) - spoke / 2) / spoke) * spoke + spoke / 2
+            let pocket = max(length(q - vec2(rim_r * 0.6 * sin(k), rim_r * 0.6 * cos(k))) - pocket_r, depth)
+            let ring = max(abs(r - rim_r + 1.9mm) - 0.5mm, h - 0.8mm - s * (p.x - x))
+            return max(disc, -(ring * ringed + pocket * (1 - ringed)))
+        }
+    })
+    m.union(tyre, rim)
+}
+let wheels = [wheel(-wheel_x, rear_z) wheel(wheel_x, rear_z) wheel(-wheel_x, front_z) wheel(wheel_x, front_z)]
+
+// ---- the cavities every body's field has cut from it, on the right (+X; the left mirrors
+// them), each roofed at 45 degrees and open down through the floor, so the supports under the
+// steering come out below. The steering's are footprints on the bed, {plan <= 0, y <= hi - plan};
+// the wheel's well is its arch. cavity(p) gives both: x the wells, y the steering's.
+// A wheel's arch, in the wheel's frame (x along its axle, y up from it): the tyre's side and
+// 1 mm, under a roof at 45 degrees from where the circle turns that steep. Swept with the
+// steering, it cuts the body round the tyre's turning edge.
+fn arch(x, z, y) {
+    let r = wheel_r + 1mm
+    let side = min(length(vec2(z, y)) - r, max((abs(z) - y) * 0.7071, (y + abs(z)) * 0.7071 - r))
+    return max(abs(x) - wheel_w / 2 - 1mm, side)
+}
+// A sharp edge across the mesh's cells comes out toothed: the wells are cut from the bodies
+// rounded off this much. The steering's cuts follow, sharp: the skin over them is thin, and
+// rounded it would break into islands.
+let cut_round = 1.5mm
+fn cavity(p) {
+    let q = vec3(abs(p.x), p.y, p.z)
+    // The front wheel's well: the wheel's arch swept about its kingpin to either lock.
+    let k = vec3(q.x - king_x, p.y, p.z - front_z)
+    let ca = cos(sweep)
+    let sa = sin(sweep)
+    let mid = (wheel_in + wheel_out) / 2 - king_x
+    let wl = arch(k.x - mid, k.z, p.y - ay)
+    let wa = arch(k.x * ca - k.z * sa - mid, k.x * sa + k.z * ca, p.y - ay)
+    let wb = arch(k.x * ca + k.z * sa - mid, -k.x * sa + k.z * ca, p.y - ay)
+    let well = min(min(wl, wa), wb)
+    // The knuckle's slot: its column, stub and arm swept to either lock, the clearance round
+    // them; the arm's part roofed from the arm's top, lower than the stub's, under the bonnet.
+    let arm_end = vec3(tie_x - king_x, 0, tie_z - front_z)
+    let ka = vec3(k.x * ca - k.z * sa, 0, k.x * sa + k.z * ca)
+    let kb = vec3(k.x * ca + k.z * sa, 0, -k.x * sa + k.z * ca)
+    let st0 = min(length(vec2(k.x, k.z)) - 4.9mm, sdf_box(vec3(k.x - 6mm, 0, k.z), vec3(12mm, 1m, 2 * axle_r + 2 * clear)))
+    let st1 = min(length(vec2(ka.x, ka.z)) - 4.9mm, sdf_box(vec3(ka.x - 6mm, 0, ka.z), vec3(12mm, 1m, 2 * axle_r + 2 * clear)))
+    let st2 = min(length(vec2(kb.x, kb.z)) - 4.9mm, sdf_box(vec3(kb.x - 6mm, 0, kb.z), vec3(12mm, 1m, 2 * axle_r + 2 * clear)))
+    let ar0 = min(sdf_capsule(vec3(k.x, 0, k.z), vec3(0, 0, 0), arm_end, 2.5mm + clear), length(vec2(k.x - arm_end.x, k.z - arm_end.z)) - 4.7mm)
+    let ar1 = min(sdf_capsule(ka, vec3(0, 0, 0), arm_end, 2.5mm + clear), length(vec2(ka.x - arm_end.x, ka.z - arm_end.z)) - 4.7mm)
+    let ar2 = min(sdf_capsule(kb, vec3(0, 0, 0), arm_end, 2.5mm + clear), length(vec2(kb.x - arm_end.x, kb.z - arm_end.z)) - 4.7mm)
+    let stub_plan = min(min(st0, st1), st2)
+    let arm_plan = min(min(ar0, ar1), ar2)
+    let slot = min(max(stub_plan, (p.y - ay - axle_r - clear + stub_plan) * 0.7071), max(arm_plan, (p.y - ay - rod_h / 2 - 0.2mm - clear + arm_plan) * 0.7071))
+    // The tie rod's tunnel: the bar's travel either way, across the car.
+    let travel = arm_len * sin(sweep) + 5mm
+    let tunnel_plan = sdf_box(vec3(p.x, 0, p.z - tie_z), vec3(2 * (tie_x + travel), 1m, 5mm + 2 * clear + 1.4mm))
+    let tunnel = max(tunnel_plan, (p.y - ay - rod_h / 2 - clear + tunnel_plan) * 0.7071)
+    // The kingpin's column stands through its slot, floor to roof.
+    let column = length(vec2(k.x, k.z)) - hub
+    return vec2(well, sdf_difference(min(slot, tunnel), column))
+}
+
+// ---- the bodies, each one field
+// Rally hatch: a sloping bonnet, a greenhouse with tumblehome, a roof scoop and a ducktail.
+fn rally_body() {
+    let nose = front_z + 22mm
+    let tail = rear_z - 20mm
+    m.sdf({
+        bounds: [[-half - 1mm, floor_y - 1mm, tail - 1mm], [half + 1mm, 46mm, nose + 1mm]]
+        cell: 0.5mm
+        field: fn(p) {
+            let q = vec3(abs(p.x), p.y, p.z)
+            let lower = sdf_round_box(p - vec3(0, floor_y + 9.5mm, (nose + tail) / 2), vec3(2 * half, 19mm, nose - tail), 5mm)
+            let bonnet = (p.y - 24mm + (p.z - 14mm) * 0.11) * 0.994
+            let low = smooth_intersection(lower, bonnet, 3mm)
+            let cab = sdf_round_box(p - vec3(0, 32mm, -18mm), vec3(40mm, 22mm, 64mm), 4mm)
+            let screen = ((p.z - 14mm) * 17 + (p.y - 24mm) * 16) / 23.35
+            let hatch = (-(p.z + 40mm) * 15 + (p.y - 41mm) * 10) / 18.03
+            let sides = (q.x - 19mm + (p.y - 24mm) * 0.176) * 0.985
+            let cabin = smooth_intersection(smooth_intersection(smooth_intersection(sdf_intersection(cab, p.y - 41mm), screen, 3mm), hatch, 3mm), sides, 2mm)
+            let scoop = sdf_round_box(p - vec3(0, 41.5mm, -4mm), vec3(11mm, 4mm, 14mm), 1.5mm)
+            let duck = sdf_round_box(p - vec3(0, 26mm, tail + 4mm), vec3(2 * half - 4mm, 6mm, 6mm), 2mm)
+            let cut = cavity(p)
+            return sdf_difference(smooth_difference(smooth_union(smooth_union(smooth_union(low, cabin, 3mm), scoop, 1.5mm), duck, 2mm), cut.x, cut_round), cut.y)
+        }
+    })
+}
+// Dune buggy: an open tub with a cowl over the steering and a sloping prow, two bucket seats,
+// an engine with cooling fins and twin exhausts at the back, under a cage of two pointed hoops
+// (their sides at 45 degrees or steeper) and a flat-bottomed spine bridged between their peaks.
+fn buggy_body() {
+    let nose = front_z + 18mm
+    let tail = rear_z - 16mm
+    let top = floor_y + 14mm
+    m.sdf({
+        bounds: [[-half - 1mm, floor_y - 1mm, tail - 5mm], [half + 1mm, top + 30mm, nose + 1mm]]
+        cell: 0.5mm
+        field: fn(p) {
+            let q = vec3(abs(p.x), p.y, p.z)
+            let tub = sdf_round_box(p - vec3(0, floor_y + 7mm, (nose + tail) / 2), vec3(2 * half, 14mm, nose - tail), 4mm)
+            let prow = (p.y - top + (p.z - front_z + 6mm) * 0.55) * 0.876
+            let cowl_box = sdf_round_box(p - vec3(0, (floor_y + ay + 12mm) / 2, (tie_z + front_z + 2mm) / 2), vec3(2 * half, ay + 12mm - floor_y, front_z - tie_z + 16mm), 4mm)
+            let cowl = smooth_intersection(cowl_box, (p.y - ay - 12mm + (p.z - front_z - 2mm)) * 0.7071, 2mm)
+            let hull = smooth_union(smooth_intersection(tub, prow, 2mm), cowl, 2mm)
+            // the cockpit, open to the sky between the hoops
+            let pit = sdf_box(p - vec3(0, top + 10mm, -4mm), vec3(2 * half - 5mm, 2 * (top - floor_y - 3mm) + 20mm, 30mm))
+            let seats = min(sdf_round_box(vec3(q.x - 9mm, p.y - floor_y - 6mm, p.z + 9mm), vec3(13mm, 8mm, 10mm), 3mm), sdf_round_box(vec3(q.x - 9mm, p.y - floor_y - 11mm, p.z + 16.5mm), vec3(13mm, 18mm, 3mm), 1.4mm))
+            let open = smooth_union(sdf_difference(hull, pit), seats, 1mm)
+            // the engine, its fins across it, and the exhausts rising from its back
+            let block = sdf_round_box(p - vec3(0, top + 3mm, tail + 11mm), vec3(24mm, 10mm, 16mm), 2mm)
+            let fins = max(abs(fract(p.z / 2.5mm) - 0.5) * 2.5mm - 0.45mm, top + 6.5mm - p.y)
+            let engine = sdf_difference(block, fins)
+            let pipes = sdf_capsule(vec3(q.x - 7mm, p.y, p.z), vec3(0, top + 2mm, tail + 4mm), vec3(0, top + 14mm, tail - 2mm), 1.8mm)
+            let pipe_bores = sdf_capsule(vec3(q.x - 7mm, p.y, p.z), vec3(0, top + 9mm, tail + 0.5mm), vec3(0, top + 16mm, tail - 3mm), 0.9mm)
+            // the cage: two hoops, legs on the tub's sides, peaks bridged by the spine
+            let hoop_a = min(sdf_capsule(vec3(q.x, p.y, p.z + 20mm), vec3(half - 2.5mm, top, 0), vec3(8mm, top + 18mm, 0), 1.6mm), sdf_capsule(vec3(q.x, p.y, p.z + 20mm), vec3(8mm, top + 18mm, 0), vec3(0, top + 26mm, 0), 1.6mm))
+            let hoop_b = min(sdf_capsule(vec3(q.x, p.y, p.z - 13mm), vec3(half - 2.5mm, top - 2mm, 0), vec3(8mm, top + 15mm, 0), 1.6mm), sdf_capsule(vec3(q.x, p.y, p.z - 13mm), vec3(8mm, top + 15mm, 0), vec3(0, top + 23mm, 0), 1.6mm))
+            let spine = sdf_round_box(vec3(p.x, p.y - top - 24.5mm + (p.z + 20mm) * 0.09, p.z + 3.5mm), vec3(3.4mm, 3mm, 33mm), 1mm)
+            let cage = min(min(hoop_a, hoop_b), spine)
+            let cut = cavity(p)
+            return sdf_difference(smooth_difference(sdf_difference(smooth_union(smooth_union(smooth_union(open, engine, 1.5mm), pipes, 1mm), cage, 1.2mm), pipe_bores), cut.x, cut_round), cut.y)
+        }
+    })
+}
+// Boat-tail roadster: a long bonnet with louvres, cycle-lamp bullets either side of the grille,
+// an open two-seat cockpit behind a raked screen, a headrest fairing, and a tail that narrows
+// to a point.
+fn roadster_body() {
+    let nose = front_z + 24mm
+    let tail = rear_z - 30mm
+    let waist = floor_y + 13mm
+    m.sdf({
+        bounds: [[-half - 1mm, floor_y - 1mm, tail - 1mm], [half + 1mm, waist + 20mm, nose + 5mm]]
+        cell: 0.5mm
+        field: fn(p) {
+            let q = vec3(abs(p.x), p.y, p.z)
+            let taper = max(rear_z + 6mm - p.z, 0)
+            let main = sdf_round_box(p - vec3(0, floor_y + 7.5mm, (nose + tail) / 2), vec3(2 * half, 15mm, nose - tail), 6mm)
+            let narrow = (q.x - half + taper * 0.62) * 0.85
+            let fall = (p.y - waist - 5.5mm + taper * 0.22 + max(p.z - front_z, 0) * 0.2) * 0.97
+            let hull = smooth_intersection(smooth_intersection(main, narrow, 3mm), fall, 4mm)
+            // a rounded bonnet hump over the engine, louvres let into it either side
+            let bonnet = smooth_union(hull, sdf_ellipsoid(p - vec3(0, waist + 1mm, 18mm), vec3(13mm, 8mm, 30mm)), 3mm)
+            let louvres = max(max(abs(fract((p.z - 8mm) / 3mm) - 0.5) * 3mm - 0.45mm, abs(p.z - 22mm) - 12mm), max(abs(q.x - 11mm) - 4mm, -bonnet - 1.2mm))
+            let body = sdf_difference(bonnet, louvres)
+            // the cockpit, open, with its two seats and the screen before it
+            let pit = sdf_box(p - vec3(0, waist + 10mm, -18mm), vec3(2 * half - 6mm, 2 * (waist - floor_y - 4mm) + 20mm, 26mm))
+            let seats = sdf_round_box(vec3(q.x - 8.5mm, p.y - floor_y - 7mm, p.z + 23mm), vec3(13mm, 10mm, 11mm), 3mm)
+            let screen = max(max(abs((p.z + 1mm) * 0.866 + (p.y - waist - 5.5mm) * 0.5) - 0.6mm, abs(p.x) - half + 5mm), max(waist + 4mm - p.y, p.y - waist - 11mm))
+            let fairing = sdf_ellipsoid(vec3(p.x + 8.5mm, p.y - waist - 1mm, p.z + 46mm), vec3(5mm, 9mm, 14mm))
+            let lamps = sdf_capsule(vec3(q.x - half + 5mm, p.y - waist + 3mm, p.z), vec3(0, 0, nose - 8mm), vec3(0, 0, nose + 1mm), 3.2mm)
+            let cut = cavity(p)
+            return sdf_difference(smooth_difference(smooth_union(smooth_union(smooth_union(min(sdf_difference(body, pit), seats), screen, 0.8mm), fairing, 3mm), lamps, 2mm), cut.x, cut_round), cut.y)
+        }
+    })
+}
+// Concept coupe: a low teardrop with a bubble canopy, a ridge down its spine, twin fins over
+// the tail and a blade nose.
+fn concept_body() {
+    let nose = front_z + 24mm
+    let tail = rear_z - 22mm
+    m.sdf({
+        bounds: [[-half - 1mm, floor_y - 1mm, tail - 1mm], [half + 1mm, floor_y + 31mm, nose + 1mm]]
+        cell: 0.5mm
+        field: fn(p) {
+            let q = vec3(abs(p.x), p.y, p.z)
+            let main = sdf_round_box(p - vec3(0, floor_y + 9mm, (nose + tail) / 2), vec3(2 * half, 18mm, nose - tail), 6mm)
+            let blade = (p.y - floor_y - 18mm + max(p.z - front_z - 4mm, 0) * 0.6 + max(rear_z - 4mm - p.z, 0) * 0.35) * 0.857
+            let low = smooth_intersection(main, blade, 3mm)
+            let canopy = sdf_ellipsoid(p - vec3(0, floor_y + 16mm, -8mm), vec3(16mm, 12mm, 34mm))
+            let ridge = sdf_capsule(p, vec3(0, floor_y + 18mm, 30mm), vec3(0, floor_y + 28.3mm, -10mm), 1.6mm)
+            let fins = max(max(abs(q.x - 14mm) - 1mm, p.y - floor_y - 18mm - (tail + 23mm - p.z) * 0.35), max(abs(p.z - tail - 12mm) - 11mm, floor_y + 8mm - p.y))
+            let cut = cavity(p)
+            return sdf_difference(smooth_difference(smooth_union(smooth_union(smooth_union(low, canopy, 4mm), ridge, 1.5mm), fins, 2mm), cut.x, cut_round), cut.y)
+        }
+    })
+}
+let body = if style == 1 { buggy_body() } else { if style == 2 { roadster_body() } else { if style == 3 { concept_body() } else { rally_body() } } }
+// The rear axle runs through the body and out through both rear wheels.
+let rear_axle = m.cylinder({radius: axle_r height: 2 * (wheel_out - 0.3mm) at: [0, ay, rear_z] rotate: [0, 0, 90°] segments: 48})
+let chassis = m.union(body, rear_axle)
+
+// ---- the joints
+let kingpins = for i in 0..2 { m.hinge(chassis, knuckles[i], {at: [(i * 2 - 1) * king_x, ay, front_z] pin: 1.6mm lower: -steer upper: steer}) }
+let tie_ends = for i in 0..2 { m.hinge(knuckles[i], tie_rod, {at: [(i * 2 - 1) * tie_x, ay, tie_z] pin: 1.4mm}) }
+let rear_hubs = for i in 0..2 { m.hinge(chassis, wheels[i], {at: [(i * 2 - 1) * wheel_x, ay, rear_z] axis: [1, 0, 0] pin: 1.6mm}) }
+let front_hubs = for i in 0..2 { m.hinge(knuckles[i], wheels[2 + i], {at: [(i * 2 - 1) * wheel_x, ay, front_z] axis: [1, 0, 0] pin: 1.6mm}) }
+
+let title = if style == 1 { "Dune buggy" } else { if style == 2 { "Roadster" } else { if style == 3 { "Concept coupe" } else { "Rally car" } } }
+object(chassis, name: title)
+// Supports only from the bed under the floor and the steering, which comes away down through
+// the open floor: none higher up in the wells or round the wheels' hubs, where they could not
+// come out.
+m.support_block(m.box({size: [2 * wheel_out + 4mm, 50mm, 2 * wheel_r + 26mm] at: [0, ay + axle_r + 1mm + 25mm, front_z - 8mm]}))
+m.support_block(m.box({size: [2 * wheel_out + 4mm, 50mm, 2 * wheel_r + 6mm] at: [0, ay + axle_r + 1mm + 25mm, rear_z]}))
+// Nor under the tyres: the treads' undersides print over their own flats, a few layers each.
+for x in [-wheel_x, wheel_x] {
+    for z in [rear_z, front_z] { m.support_block(m.box({size: [wheel_w + 1mm, 6mm, 2 * wheel_r + 2mm] at: [x, 3mm, z]})) }
+}
+
+// ---- the livery: each body's names are its plate's colours
+let charcoal = Material{albedo: [0.08 0.08 0.09] name: "Charcoal"}
+let glass = Material{albedo: [0.55 0.75 0.85] fade: 0.4 name: "Clear"}
+let amber = Material{albedo: [0.98 0.78 0.1] name: "Yellow"}
+let red = Material{albedo: [0.8 0.06 0.05] name: "Red"}
+let silver = Material{albedo: [0.7 0.72 0.75] metal: 0.8 rough: 0.3 name: "Silver"}
+let rubber = Material{albedo: [0.12 0.12 0.12] rough: 0.9 name: "Tyre"}
+let white = Material{albedo: [0.92 0.92 0.9] name: "White"}
+// (the roadster's nine have no charcoal: its steering is black as its tyres)
+let trim = if style == 2 { rubber } else { charcoal }
+let tyre_col = if materials >= 9 { rubber } else { trim }
+let tail_lamp = if materials >= 9 { red } else { if materials >= 4 { glass } else { charcoal } }
+let window = if materials >= 4 { glass } else { charcoal }
+
+// The steering in its rims' colour, on layers the rims print anyway: a colour of its own would
+// add a filament change to each of them.
+fn steering(c) {
+    m.fill(tie_rod, c)
+    for k in knuckles { m.fill(k, c) }
+}
+if style == 0 {
+    let blue = Material{albedo: [0.06 0.22 0.62] name: "Blue"}
+    let orange = Material{albedo: [0.95 0.42 0.06] name: "Orange"}
+    let nose = front_z + 22mm
+    let tail = rear_z - 20mm
+    let body_col = if scheme == 1 { white } else { if scheme == 2 { orange } else { blue } }
+    let stripe_col = if scheme == 0 { white } else { blue }
+    let fade_col = if scheme == 2 { blue } else { orange }
+    let accent = if materials >= 4 { stripe_col } else { charcoal }
+    let lamp = if materials >= 9 { amber } else { if materials >= 4 { glass } else { charcoal } }
+    let rim_col = if materials >= 9 { silver } else { if materials >= 4 { accent } else { body_col } }
+    // The body's colour, in nine filaments fading to a second toward the tail, low on the
+    // flanks (dithered where they blend).
+    m.fill(chassis, body_col)
+    if materials >= 9 {
+        m.fill(chassis, Mix{materials: [body_col fade_col] field: fn(p) { return clamp((10mm - p.z) / 60mm, 0, 1) * clamp((22mm - p.y) / 8mm, 0, 1) }})
+    }
+    // Twin stripes over the bonnet, the roof and the hatch.
+    m.fill(m.sdf({field: fn(p) { return max(abs(abs(p.x) - 5.5mm) - 2.2mm, 18mm - p.y) } bounds: [[-12mm, 15mm, tail - 2mm], [12mm, 48mm, nose + 2mm]]}), accent)
+    // The windows: a skin of the greenhouse 1.5 mm deep between the beltline and the roof,
+    // less the pillars between the doors.
+    m.fill(m.sdf({bounds: [[-half, 25mm, -52mm], [half, 41mm, 16mm]] field: fn(p) {
+        let q = vec3(abs(p.x), p.y, p.z)
+        let cab = sdf_round_box(p - vec3(0, 32mm, -18mm), vec3(40mm, 22mm, 64mm), 4mm)
+        let screen = ((p.z - 14mm) * 17 + (p.y - 24mm) * 16) / 23.35
+        let hatch = (-(p.z + 40mm) * 15 + (p.y - 41mm) * 10) / 18.03
+        let sides = (q.x - 19mm + (p.y - 24mm) * 0.176) * 0.985
+        let cabin = smooth_intersection(smooth_intersection(smooth_intersection(sdf_intersection(cab, p.y - 41mm), screen, 3mm), hatch, 3mm), sides, 2mm)
+        return max(max(abs(cabin + 0.75mm) - 0.75mm, abs(p.y - 33mm) - 6.2mm), 2.2mm - abs(p.z + 15mm))
+    }}), window)
+    // Inlaid lamps, each colour on as few layers as it can be: four oval spot lamps across
+    // the nose, two slim tail lamps.
+    for x in [-15mm, -6mm, 6mm, 15mm] { m.fill(m.ellipsoid({radii: [3.2mm, 1.6mm, 3mm] at: [x, 16mm, nose]}), lamp) }
+    for x in [-16mm, 16mm] { m.fill(m.box({size: [9mm, 2mm, 4mm] radius: 0.8mm at: [x, 21mm, tail]}), tail_lamp) }
+    // The grille, chrome on the rims' layers, and the scoop's mouth.
+    m.fill(m.box({size: [18mm, 3mm, 4mm] at: [0, 10mm, nose]}), if materials >= 9 { silver } else { trim })
+    m.fill(m.box({size: [9mm, 2.4mm, 3mm] at: [0, 41.5mm, 3mm]}), trim)
+    // Door roundels with the car's number in the body's colour.
+    for s in [-1, 1] {
+        m.fill(m.cylinder({radius: 7mm height: 4mm at: [s * half, 16mm, -12mm] rotate: [0, 0, 90°]}), accent)
+    }
+    m.fill(m.text({text: "27" size: 8mm depth: 4mm align: @center plane: @yz at: [-half + 2mm, 12mm, -12mm]}), body_col)
+    m.fill(m.text({text: "27" size: 8mm depth: 4mm align: @center plane: @yz rotate: [0, 180°, 0] at: [half - 2mm, 12mm, -12mm]}), body_col)
+    for w in wheels { m.fill(w, rim_col) }
+    steering(rim_col)
+}
+if style == 1 {
+    let lime = Material{albedo: [0.45 0.75 0.12] name: "Lime"}
+    let orange = Material{albedo: [0.95 0.42 0.06] name: "Orange"}
+    let sand = Material{albedo: [0.85 0.72 0.5] name: "Sand"}
+    let nose = front_z + 18mm
+    let tail = rear_z - 16mm
+    let top = floor_y + 14mm
+    let body_col = if scheme == 1 { orange } else { if scheme == 2 { sand } else { lime } }
+    let flash_col = if scheme == 0 { orange } else { if scheme == 1 { lime } else { orange } }
+    let cage_col = if materials >= 9 { silver } else { trim }
+    let lamp = if materials >= 9 { amber } else { if materials >= 4 { glass } else { trim } }
+    m.fill(chassis, body_col)
+    // A flash of a second colour sweeping up the prow, dithered along its edge.
+    if materials >= 4 {
+        m.fill(chassis, Mix{materials: [body_col flash_col] field: fn(p) { return clamp((p.z - 6mm - abs(p.x) * 0.6 - (p.y - floor_y) * 0.8) / 8mm, 0, 1) }})
+    }
+    // The cage, the engine and its pipes, the seats.
+    m.fill(m.sdf({bounds: [[-half, top - 3mm, -24mm], [half, top + 32mm, 18mm]] field: fn(p) { return max(top + 1mm - p.y, sdf_box(p - vec3(0, top + 14mm, -3mm), vec3(2 * half, 30mm, 42mm))) }}), cage_col)
+    m.fill(m.box({size: [26mm, 14mm, 20mm] at: [0, top + 3mm, tail + 11mm]}), trim)
+    m.fill(m.sdf({bounds: [[-half, top, tail - 5mm], [half, top + 18mm, tail + 6mm]] field: fn(p) { return sdf_capsule(vec3(abs(p.x) - 7mm, p.y, p.z), vec3(0, top + 2mm, tail + 4mm), vec3(0, top + 14mm, tail - 2mm), 2.4mm) }}), cage_col)
+    m.fill(m.sdf({bounds: [[-half, floor_y, -30mm], [half, top + 10mm, 0]] field: fn(p) { return sdf_round_box(vec3(abs(p.x) - 9mm, p.y - floor_y - 9mm, p.z + 13mm), vec3(14mm, 20mm, 14mm), 2mm) }}), trim)
+    // Lamps across the front hoop's peak, and tail lamps.
+    m.fill(m.box({size: [16mm, 7mm, 5mm] at: [0, top + 21mm, 13mm]}), lamp)
+    for x in [-15mm, 15mm] { m.fill(m.box({size: [5mm, 4mm, 3mm] at: [x, floor_y + 9mm, tail]}), tail_lamp) }
+    // The number on both flanks, ahead of the cage, in the seats' colour (on their layers).
+    m.fill(m.text({text: "7" size: 9mm depth: 4mm align: @center plane: @yz at: [-half + 2mm, floor_y + 7mm, 20mm]}), trim)
+    m.fill(m.text({text: "7" size: 9mm depth: 4mm align: @center plane: @yz rotate: [0, 180°, 0] at: [half - 2mm, floor_y + 7mm, 20mm]}), trim)
+    for w in wheels { m.fill(w, if materials >= 9 { amber } else { body_col }) }
+    steering(if materials >= 9 { amber } else { body_col })
+}
+if style == 2 {
+    let cream = Material{albedo: [0.93 0.88 0.76] name: "Cream"}
+    let burgundy = Material{albedo: [0.45 0.06 0.12] name: "Burgundy"}
+    let tan = Material{albedo: [0.55 0.35 0.18] name: "Tan"}
+    let nose = front_z + 24mm
+    let waist = floor_y + 13mm
+    let upper = if scheme == 1 { burgundy } else { cream }
+    let lower = if scheme == 1 { cream } else { burgundy }
+    let chrome = if materials >= 9 { silver } else { trim }
+    m.fill(chassis, upper)
+    // Two-tone: the lower body in the second colour, the line between them dithered.
+    m.fill(chassis, Mix{materials: [upper lower] field: fn(p) { return clamp((waist - 1mm - p.y) / 3mm, 0, 1) }})
+    // A chrome strip along the waist, the grille, the screen's frame.
+    if materials >= 4 {
+        m.fill(m.sdf({bounds: [[-half - 1mm, waist - 2mm, rear_z - 32mm], [half + 1mm, waist + 1mm, nose + 1mm]] field: fn(p) { return abs(p.y - waist + 0.5mm) - 0.6mm }}), chrome)
+        m.fill(m.sdf({bounds: [[-9mm, floor_y, nose - 4mm], [9mm, waist + 2mm, nose + 1mm]] field: fn(p) { return max(abs(fract(p.x / 2mm) - 0.5) * 2mm - 0.5mm, max(abs(p.x) - 8mm, abs(p.y - floor_y - 7mm) - 4.5mm)) }}), chrome)
+    }
+    m.fill(m.sdf({bounds: [[-half, waist + 4mm, -8mm], [half, waist + 12mm, 2mm]] field: fn(p) { return max(abs((p.z + 1mm) * 0.866 + (p.y - waist - 5.5mm) * 0.5) - 1mm, abs(p.x) - half + 5mm) }}), window)
+    m.fill(m.sdf({bounds: [[-half, floor_y, -36mm], [half, waist + 6mm, -8mm]] field: fn(p) { return sdf_round_box(vec3(abs(p.x) - 8.5mm, p.y - floor_y - 8mm, p.z + 23mm), vec3(14mm, 12mm, 12mm), 3mm) }}), if materials >= 9 { tan } else { lower })
+    for x in [-half + 5mm, half - 5mm] { m.fill(m.sphere({radius: 3.8mm at: [x, waist - 3mm, nose + 1mm]}), if materials >= 9 { amber } else { window }) }
+    // Round tail lamps on the boat tail's flanks, where it is still 21 mm across.
+    for x in [-10mm, 10mm] { m.fill(m.sphere({radius: 2.2mm at: [x, floor_y + 9mm, rear_z - 12mm]}), tail_lamp) }
+    // The rims chrome; whitewalls ringing the tyres' outer faces.
+    for w in wheels { m.fill(w, chrome) }
+    steering(chrome)
+}
+if style == 3 {
+    let indigo = Material{albedo: [0.12 0.08 0.45] name: "Indigo"}
+    let magenta = Material{albedo: [0.8 0.1 0.55] name: "Magenta"}
+    let cyan = Material{albedo: [0.1 0.75 0.85] name: "Cyan"}
+    let nose = front_z + 24mm
+    let tail = rear_z - 22mm
+    let a = if scheme == 1 { magenta } else { indigo }
+    let b = if scheme == 1 { indigo } else { if scheme == 2 { cyan } else { magenta } }
+    let glow = if materials >= 9 { cyan } else { if materials >= 4 { white } else { b } }
+    m.fill(chassis, a)
+    // A gradient nose to tail, dithered all the way.
+    m.fill(chassis, Mix{materials: [a b] field: fn(p) { return clamp((front_z + 10mm - p.z) / (wheelbase + 20mm), 0, 1) }})
+    // The canopy's glass, its ridge left in the body's colour.
+    m.fill(m.sdf({bounds: [[-half, floor_y + 18mm, -44mm], [half, floor_y + 31mm, 28mm]] field: fn(p) { return max(sdf_ellipsoid(p - vec3(0, floor_y + 16mm, -8mm), vec3(17mm, 13mm, 35mm)), max(floor_y + 19mm - p.y, 2.4mm - abs(p.x))) }}), window)
+    // Light blades across the nose and the tail, a glow line along each flank.
+    m.fill(m.box({size: [2 * half - 8mm, 1.6mm, 4mm] at: [0, floor_y + 4mm, nose - 1mm]}), glow)
+    m.fill(m.box({size: [2 * half - 6mm, 2mm, 4mm] at: [0, floor_y + 10mm, tail]}), tail_lamp)
+    m.fill(m.sdf({bounds: [[-half - 1mm, floor_y + 4mm, rear_z], [half + 1mm, floor_y + 7mm, front_z]] field: fn(p) { return max(abs(p.y - floor_y - 5.5mm) - 0.6mm, half - 1.5mm - abs(p.x)) }}), glow)
+    for w in wheels { m.fill(w, if materials >= 9 { silver } else { a }) }
+    steering(if materials >= 9 { silver } else { a })
+}
+// The tyres round the rims; a roadster's carry whitewalls on their outer faces.
+for z in [rear_z, front_z] {
+    for x in [-wheel_x, wheel_x] {
+        m.fill(m.subtract(m.cylinder({radius: wheel_r + 1mm height: wheel_w + 1mm at: [x, ay, z] rotate: [0, 0, 90°]}), m.cylinder({radius: rim_r height: wheel_w + 2mm at: [x, ay, z] rotate: [0, 0, 90°]})), tyre_col)
+        if style == 2 && materials >= 9 {
+            m.fill(m.subtract(m.cylinder({radius: rim_r + 2.2mm height: 1.2mm at: [x + x / abs(x) * (wheel_w / 2 - 0.3mm), ay, z] rotate: [0, 0, 90°]}), m.cylinder({radius: rim_r + 0.6mm height: 2mm at: [x + x / abs(x) * (wheel_w / 2 - 0.3mm), ay, z] rotate: [0, 0, 90°]})), white)
+        }
+    }
+}

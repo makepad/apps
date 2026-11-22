@@ -1,0 +1,11 @@
+[package]
+name = "fab-elec-mcu-island"
+version = "1.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+authors = ["Makepad <info@makepad.nl>"]
+description = "Archive reader, relocation audit and linker for microsplash's Espressif radio island"
+
+[dependencies]
+fab-elec-mcu-xtensa = { path = "../xtensa" }

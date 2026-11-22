@@ -1,0 +1,9 @@
+// A six-piece burr puzzle in two filaments, printed flat and apart: maple and walnut sticks.
+use mod.fab.*
+
+script("burr_puzzle.cad.splash")
+
+color("Maple", rgb: #xe3c58e)
+color("Walnut", rgb: #x6b4528)
+
+place("burr_puzzle", at: [175mm 160mm], name: "Six-piece burr", color: "Maple")

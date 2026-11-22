@@ -1,0 +1,16 @@
+[package]
+name = "fab-elec-mcu-emit32"
+version = "1.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+authors = ["Makepad <info@makepad.nl>"]
+description = "microsplash's 32-bit back end for the ESP32-C3 (RV32IMC) and ESP32-S3 (Xtensa)"
+
+[dependencies]
+fab-elec-mcu-rt = { path = "../rt" }
+
+[dev-dependencies]
+fab-elec-mcu-rv32 = { path = "../rv32" }
+fab-elec-mcu-xtensa = { path = "../xtensa" }
+fab-elec-mcu-emu = { path = "../emu" }

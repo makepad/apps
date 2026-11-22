@@ -1,0 +1,47 @@
+// Pictures over the USB tether: the host (`fab-elec-mcu-flash tether`) streams each picture on the
+// watch link's frame channel, two panel rows per Ethernet frame, and the panel shows each band as it
+// lands. A frame is Ethernet II with EtherType 0x88B5 (IEEE 802 local experimental), then the kind 80
+// ('P'), the picture's serial, its first row (u16, little-endian), two zero bytes, and two rows of 368
+// RGB565 pixels, high byte first: 1492 bytes. Anything else is counted and dropped.
+let screen = display()
+let rx = bytes(1514)
+let band = surface(368, 2)
+var bands: i32 = 0
+var pictures: i32 = 0
+var ignored: i32 = 0
+// The serial of the picture last drawn; 256 is none, as a serial is a byte.
+var picture: i32 = 256
+
+fn setup() {
+    fill_rect(screen, 0, 0, 368, 448, rgb(0, 0, 0))
+}
+
+// Literal loop extents prove every rx and band index is in range; the row is checked before use.
+let network = eth(8, fn() {
+    for slot in 0..8 {
+        let n = eth_recv(rx, 0)
+        if n > 0 {
+            let y = rx[16] + rx[17] * 256
+            if n == 1492 && rx[12] == 136 && rx[13] == 181 && rx[14] == 80 && rx[18] == 0 && rx[19] == 0 && y < 447 && (y & 1) == 0 {
+                for i in 0..736 {
+                    band[i] = rx[20 + 2 * i] * 256 + rx[21 + 2 * i]
+                }
+                present(screen, band, 0, 0, 368, 2, 0, y)
+                bands = bands + 1
+                if rx[15] != picture {
+                    picture = rx[15]
+                    pictures = pictures + 1
+                }
+            } else {
+                ignored = ignored + 1
+            }
+        }
+    }
+})
+
+// A report every second: bands drawn, pictures begun, frames dropped.
+let report = every(ms(1000), fn() {
+    probe(1, bands)
+    probe(2, pictures)
+    probe(3, ignored)
+})

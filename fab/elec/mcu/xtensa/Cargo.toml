@@ -1,0 +1,19 @@
+[package]
+name = "fab-elec-mcu-xtensa"
+version = "1.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+authors = ["Makepad <info@makepad.nl>"]
+description = "Xtensa LX instruction-set model (ESP32-S3 core) for microsplash's compiler tests and board simulator"
+
+[dependencies]
+fab-elec-mcu-emu = { path = "../emu" }
+
+[features]
+# Inline lowering of decoded instructions for native code units (`emu::jit`).
+jit = ["fab-elec-mcu-emu/jit"]
+
+[[test]]
+name = "jit"
+required-features = ["jit"]

@@ -1,0 +1,39 @@
+// The board in its printed case: the base rests it at the corners, and the lid's pressers
+// hold it down. There are no case mounting holes on this board yet. Its ports open the left
+// wall for power, the back wall for the line jack's plug, and the lid for the programming header,
+// key stems and pot shafts.
+// The 20 captive press pins are the keycaps; each rests on its switch stem and follows its
+// travel. The eight knobs grip the shafts above the lid. Both print upside down.
+// Clear pipes carry the 20 LEDs through dark light blocks, flush with the lid's top. They
+// are later bodies of the lid's object, so each prints its channel in clear filament. The
+// knobs' legends, engraved into the lid's top, fill with the same clear filament, so they read
+// light on the dark lid.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+let pcb = board("drum16")
+let case = enclosure(pcb, {pipes: {}})
+object(case.base, name: "Base")
+let clear = Material{albedo: [0.9 0.92 0.9] name: "Clear"}
+let lid = [case.lid]
+for p in case.pipes {
+    m.fill(p.pipe, clear)
+    lid.push(p.pipe)
+}
+for l in case.legends {
+    m.fill(l.legend, clear)
+    lid.push(l.legend)
+}
+object(lid, name: "Lid")
+// The same helpers, with their print origins at zero: the plate can arrange the small parts
+// in rows without depending on where the prelude's strip of pins and knobs ends.
+for p in pcb.ports {
+    let pin = press_pin(p, case.frame, case.shell, [0, 0])
+    if pin != nil { object(pin.pin, name: pin.name) }
+    let knob = shaft_knob(p, case.frame, case.shell, [0, 0], {})
+    if knob != nil { object(knob.knob, name: knob.name) }
+}
+insert(board_solid(pcb, board_bodies("drum16"), case.frame), name: "Board", into: "Base")
+for i in case.inserts {
+    insert(i.part, name: i.name, into: "Base", melt: i)
+}

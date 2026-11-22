@@ -1,0 +1,15 @@
+[package]
+name = "makepad-fab-toolpath"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab's toolpaths: walls, surface classes, shells and infill per layer as extrusion paths"
+
+[dependencies]
+makepad-fab-slicer = { path = "../slicer" }
+makepad-fab-settings = { path = "../settings" }
+
+[dev-dependencies]
+fab-plate = { path = "../plate" }
+fab-sdf-engine = { path = "../sdf_engine" }

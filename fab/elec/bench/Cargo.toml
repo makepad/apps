@@ -1,0 +1,24 @@
+[package]
+name = "fab-elec-bench"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab electronics benches (E3, contract C11): the design's ids onto the live simulation's values and commands, lowering to the simulation kernel, the model-binding table, stubs and expectations"
+
+[package.metadata.makepad.platform-gaps]
+windows = {}
+
+[dependencies]
+fab-elec-core = { path = "../core" }
+fab-elec-sim = { path = "../sim" }
+fab-elec-mcu-cosim = { path = "../mcu/cosim" }
+fab-elec-mcu-emu = { path = "../mcu/emu" }
+fab-elec-mcu-parts = { path = "../mcu/parts" }
+fab-elec-mcu-rt = { path = "../mcu/rt" }
+fab-elec-parts = { path = "../parts" }
+fab-elec-circuit = { path = "../circuit" }
+fab-elec-design = { path = "../design" }
+
+[dev-dependencies]
+fab-elec-fixtures = { path = "../fixtures" }

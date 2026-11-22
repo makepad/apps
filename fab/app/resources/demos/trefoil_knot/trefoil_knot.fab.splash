@@ -1,0 +1,13 @@
+// A trefoil knot, its colour fading from one filament to the other and back along the tube.
+use mod.fab.*
+
+script("trefoil_knot.cad.splash")
+
+color("Magenta", rgb: #xd93373)
+color("Azure", rgb: #x2673d9)
+
+place("trefoil_knot", at: [175mm 160mm], name: "Trefoil knot", color: "Magenta")
+
+// Tree supports hold the tube's undersides: from the bed, and from the tube below where it
+// arches over itself.
+settings({enable_support: true, support_type: "tree(auto)", support_on_build_plate_only: false})

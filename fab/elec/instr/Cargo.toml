@@ -1,0 +1,10 @@
+[package]
+name = "fab-elec-instr"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Source drivers and synthetic signals for Fab electronics instruments"
+
+[dependencies]
+fab-elec-bench = { path = "../bench" }

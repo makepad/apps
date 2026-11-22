@@ -1,0 +1,19 @@
+// A walking beetle: a domed body in bands from teal through green to gold at its crown, with eyes
+// in the crown's colour and an ebony seam and spots, on six ebony legs and two club-ended feelers
+// fused to copper TPU cords that bend between every two parts.
+use mod.fab.*
+
+script("flex_beetle.cad.splash")
+
+color("Ebony", rgb: #x171414)
+color("Teal", rgb: #x0a5466)
+color("Emerald", rgb: #x08734d)
+color("Green", rgb: #x1f8f38)
+color("Lime", rgb: #x6ba829)
+color("Citron", rgb: #xa89e1f)
+color("Gold", rgb: #xcc8f14)
+color("Honey", rgb: #xedb838)
+color("Copper", rgb: #xbf6b33, material: "TPU")
+
+// Its first layer prints its paint too: the ebony underside reaches the bed.
+place("flex_beetle", at: [175mm 160mm], rotate: 180°, name: "Flex beetle", color: "Ebony", settings: {fab_paint_first_layer: true})

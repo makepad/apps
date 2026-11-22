@@ -1,0 +1,13 @@
+// A little print-in-place car in two filaments: the body and wheels in red, tyres and windows in
+// charcoal. Everything turns as printed.
+use mod.fab.*
+
+script("little_car.cad.splash")
+
+color("Red", rgb: #xd03a2f)
+color("Charcoal", rgb: #x2b2b2e)
+
+// Tree supports from the bed hold the chassis floor; nothing stands inside the wheels or the slot.
+settings({enable_support: true, support_type: "tree(auto)", support_on_build_plate_only: true})
+
+place("little_car", at: [175mm 160mm], name: "Little car", color: "Red")

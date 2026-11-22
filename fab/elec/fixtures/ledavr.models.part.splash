@@ -1,0 +1,41 @@
+// ledavr's 3D models: each part's body is the model of a stock LCSC part whose footprint and pinout
+// match the part's own. A model is fetched only when someone asks for it (Fetch 3D models), from
+// the part service, into their own part library, and copied into the project from there; until
+// the project holds a part's model, the part keeps its own plain body. Nothing here is shipped with
+// Fab: the paths name the files the import makes.
+//
+// Each override names only the mesh: the part keeps its own height and its ports (the LED's light,
+// the switch's plunger, the USB-C mouth). The LCSC numbers choose models, not the parts a BOM orders:
+// one 0402 resistor's model stands for every resistor value.
+let e = mod.elec
+
+// The MCU: ATMEGA328P-AU (Microchip) in TQFP-32, 7 x 7 mm at 0.8 mm pitch; the part file's pad map is
+// this footprint's, so pad 1 and the model's pin-1 dimple share the corner at -x, -y.
+e.body("ATMEGA328P_TQFP32", {mesh: "parts/lcsc/C14877.glb"})
+
+// The eight LEDs: KT-0603G (Kento), green 0603. Its cathode is pad 1 at -x, as std's LED's; its
+// clear dome is the material "lens" the 3D view lights.
+e.body("LED_0603_green", {mesh: "parts/lcsc/C12624.glb"})
+
+// Every 0402 resistor: 0402WGF1002TCE (UniOhm), a JLCPCB basic part.
+e.body("R_0402", {mesh: "parts/lcsc/C25744.glb"})
+
+// Every 0402 capacitor: CL05B104KO5NNNC (Samsung) 100 nF, a basic part.
+e.body("C_0402", {mesh: "parts/lcsc/C1525.glb"})
+
+// The 16 MHz crystal: X322516MLB4SI (YXC), 3.2 x 2.5 mm, a basic part; its pads are numbered as
+// std's (1 at -x, -y, counter-clockwise).
+e.body("XTAL_3225", {mesh: "parts/lcsc/C13738.glb"})
+
+// The USB-C receptacle: TYPE-C 6P (Shou Han), whose land std's power-only receptacle has; its
+// mouth is the part's -Y edge, which the board turns to face out of its left edge.
+e.body("USB_C_POWER", {mesh: "parts/lcsc/C456012.glb"})
+
+// The button: TS-1187A-B-A-B (XKB), 5.1 x 5.1 x 1.5 mm, std's low-profile switch, a basic part.
+e.body("SW_TACT_4PAD", {mesh: "parts/lcsc/C318884.glb"})
+
+// The ISP header: a 2 x 3 male header at 2.54 mm (BOOMELE). Its model has pin 1 at (-2.54, -1.27)
+// with the odd pins along +x and the even pins one row up; this part has pin 1 at its origin with
+// the pins running down -y and the even pins to the right, so the model turns a quarter clockwise
+// and moves to put its pin 1 on pad 1.
+e.body("PinHeader_2x03_P2.54mm", {mesh: "parts/lcsc/C65114.glb" offset: [1.27mm, -2.54mm, 0mm] rotation: [0deg, 0deg, -90deg]})

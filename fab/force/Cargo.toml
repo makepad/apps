@@ -1,0 +1,32 @@
+[package]
+name = "fab-force"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab Force: linear elastic stress analysis of a part as it will print, on a voxel grid of its distance field (the printed-part material model, the grid, the multigrid-preconditioned solver, results, the surface the workspace shows and picks on)"
+
+[dependencies]
+# the solve as a compute program (src/program.rs): in-process or on an AI hub node
+makepad-compute-program = { path = "../../../../libs/compute_program", version = "1.0.0" }
+# f64s as the program's words, and back
+bytemuck = { path = "../../../../libs/bytemuck", version = "1.25.0" }
+# solves on the AI hub (src/hub.rs): the program client and the fleet's endpoints
+makepad-ai-hub = { path = "../../../../libs/ai/hub", version = "0.3.0", default-features = false, features = ["program"], optional = true }
+makepad-network = { path = "../../../../platform/network", version = "1.0.0", optional = true }
+# the AI hub's GPU device, for the loopback hub (fab-forceprogram)
+makepad-compute-program-gpu = { path = "../../../../libs/compute_program_gpu", version = "1.0.0", optional = true }
+
+[dev-dependencies]
+# the Force program on a GPU device (tests/gpu.rs)
+makepad-compute-program-gpu = { path = "../../../../libs/compute_program_gpu", version = "1.0.0" }
+
+[features]
+node = ["dep:makepad-ai-hub", "dep:makepad-network"]
+# a hub in this process on loopback, the AI hub's node side: fab-forceprogram's and the hub
+# tests' (never the app's: it reaches the hub the AI hub app runs)
+loopback = ["node", "makepad-ai-hub/kernel", "dep:makepad-compute-program-gpu"]
+
+[[bin]]
+name = "fab-forceprogram"
+required-features = ["loopback"]

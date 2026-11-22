@@ -1,0 +1,142 @@
+let __soic_f = mod.elec.f
+
+let __soic_positive = fn(v) {
+    return v.is_number() && v > 0mm && v - v == 0mm
+}
+
+// Nominal gull-wing lands: toe and heel 0.35 mm, side 0.03 mm.
+let __soic_land = fn(span, lead) {
+    let toe = 0.35mm
+    let heel = 0.35mm
+    let side = 0.03mm
+    // Z = span + 2 * toe; G = span - 2 * lead[1] - 2 * heel.
+    // The equivalent length avoids subtracting nearly equal spans.
+    return {
+        x: __soic_f.round((span - lead[1] + toe - heel) / 2, 0.01mm)
+        size: [__soic_f.round(lead[1] + toe + heel, 0.01mm),
+               __soic_f.round(lead[0] + 2 * side, 0.01mm)]
+    }
+}
+
+// Two rows of gull-wing leads; pins even 4..64, pitch (default 1.27 mm),
+// body [row length, width], span tip to tip, lead [width, foot length],
+// optional centred ep [width, height]; all lengths in mm.
+let soic = fn(o) {
+    if !o.is_object() {
+        return __soic_f.error("soic: o must be an options object")
+    }
+    if (o.pins ?? nil) == nil { return __soic_f.error("soic: pins is required") }
+    if (o.body ?? nil) == nil { return __soic_f.error("soic: body is required") }
+    if (o.span ?? nil) == nil { return __soic_f.error("soic: span is required") }
+    if (o.lead ?? nil) == nil { return __soic_f.error("soic: lead is required") }
+    if !o.pins.is_number() || o.pins < 4 || o.pins > 64 || o.pins % 2 != 0 {
+        return __soic_f.error("soic: pins must be an even integer from 4 to 64")
+    }
+    let pitch = o.pitch ?? 1.27mm
+    if !__soic_positive(pitch) {
+        return __soic_f.error("soic: pitch must be a positive finite length")
+    }
+    if !o.body.is_array() || o.body.len() != 2 {
+        return __soic_f.error("soic: body must be [length along rows, width across rows]")
+    }
+    if !__soic_positive(o.body[0]) || !__soic_positive(o.body[1]) {
+        return __soic_f.error("soic: body dimensions must be positive finite lengths")
+    }
+    if !__soic_positive(o.span) || o.span <= o.body[1] {
+        return __soic_f.error("soic: span must be a positive finite length greater than body width")
+    }
+    if !o.lead.is_array() || o.lead.len() != 2 {
+        return __soic_f.error("soic: lead must be [width, foot length]")
+    }
+    if !__soic_positive(o.lead[0]) || !__soic_positive(o.lead[1]) {
+        return __soic_f.error("soic: lead dimensions must be positive finite lengths")
+    }
+    if 2 * o.lead[1] > o.span - o.body[1] {
+        return __soic_f.error("soic: lead foot length must fit between body and span")
+    }
+    let half = o.pins / 2
+    let top_y = (half - 1) * pitch / 2
+    if 2 * top_y + o.lead[0] > o.body[0] {
+        return __soic_f.error("soic: body length must contain the pins at the specified pitch and lead width")
+    }
+    let land = __soic_land(o.span, o.lead)
+    if land.size[1] >= pitch {
+        return __soic_f.error("soic: pitch must exceed the rounded lead land width")
+    }
+    let gap = 2 * land.x - land.size[0]
+    if gap <= 0mm {
+        return __soic_f.error("soic: span and lead foot length must leave space between the land rows")
+    }
+    let exposed = o.ep ?? nil
+    let ep = if exposed != nil {
+        if !exposed.is_array() || exposed.len() != 2 {
+            return __soic_f.error("soic: ep must be [width, height]")
+        }
+        if !__soic_positive(exposed[0]) || !__soic_positive(exposed[1]) {
+            return __soic_f.error("soic: ep dimensions must be positive finite lengths")
+        }
+        if exposed[0] > o.body[1] || exposed[1] > o.body[0] {
+            return __soic_f.error("soic: ep must fit inside body")
+        }
+        let size = [__soic_f.round(exposed[0], 0.01mm), __soic_f.round(exposed[1], 0.01mm)]
+        if size[0] <= 0mm || size[1] <= 0mm {
+            return __soic_f.error("soic: ep dimensions must remain positive after rounding")
+        }
+        if size[0] > o.body[1] || size[1] > o.body[0] || size[0] >= gap {
+            return __soic_f.error("soic: rounded ep must fit inside body and between the lead lands")
+        }
+        size
+    } else { nil }
+    let pads = for i in 0..o.pins {
+        let at = if i < half {
+            [-land.x, top_y - i * pitch]
+        } else {
+            [land.x, -top_y + (i - half) * pitch]
+        }
+        __soic_f.smd(__soic_f.int(i + 1), at, land.size)
+    }
+    if ep != nil {
+        pads.push(__soic_f.smd(__soic_f.int(o.pins + 1), [0mm, 0mm], ep))
+    }
+    let half_length = o.body[0] / 2
+    let half_width = o.body[1] / 2
+    return __soic_f.footprint({
+        pads: pads
+        body: [[-half_width, -half_length], [half_width, half_length]]
+        mount: @smd
+        text: 1mm
+        graphics: [__soic_f.dot("F.SilkS", [-land.x, top_y + 0.7mm], 0.15mm)]
+    })
+}
+
+// Narrow two-row gull-wing outline; pins 8, 14 or 16, pitch 1.27 mm.
+let soic_narrow = fn(pins) {
+    let length = if pins == 8 { 4.9mm }
+    elif pins == 14 { 8.65mm }
+    elif pins == 16 { 9.9mm }
+    else { return __soic_f.error("soic_narrow: pins must be 8, 14 or 16") }
+    return soic({
+        pins: pins
+        pitch: 1.27mm
+        body: [length, 3.9mm]
+        span: 6.0mm
+        lead: [0.42mm, 0.835mm]
+    })
+}
+
+// Wide two-row gull-wing outline; pins 16, 18, 20, 24 or 28, pitch 1.27 mm.
+let soic_wide = fn(pins) {
+    let length = if pins == 16 { 10.3mm }
+    elif pins == 18 { 11.55mm }
+    elif pins == 20 { 12.8mm }
+    elif pins == 24 { 15.4mm }
+    elif pins == 28 { 17.9mm }
+    else { return __soic_f.error("soic_wide: pins must be 16, 18, 20, 24 or 28") }
+    return soic({
+        pins: pins
+        pitch: 1.27mm
+        body: [length, 7.5mm]
+        span: 10.3mm
+        lead: [0.42mm, 0.835mm]
+    })
+}

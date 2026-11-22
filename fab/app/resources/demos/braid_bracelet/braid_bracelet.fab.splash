@@ -1,0 +1,10 @@
+// A three-strand braid bangle standing on its edge, each strand's cord twisted from two colours.
+use mod.fab.*
+
+script("braid_bracelet.cad.splash")
+
+color("Ivory", rgb: #xe8e0cc)
+color("Rose", rgb: #xd9576b)
+color("Indigo", rgb: #x2c3a8c)
+
+place("braid_bracelet", at: [175mm 160mm], name: "Braid bracelet", color: "Ivory")

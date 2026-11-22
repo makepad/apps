@@ -1,0 +1,163 @@
+// A jellyfish drifting, seen from its side: a domed bell with a scalloped mouth of seven lappets,
+// and six tentacles of beads trailing from between them, fanning out and waving like ribbons in a
+// current, printed lying down fused to six TPU cords flat on the bed under them, from inside the
+// bell out to each last bead. Between each two beads (and between the bell and the first) a cord
+// runs free two and a half to three millimetres, curving from the one bead's axis to the next's;
+// nearly square, it bends there every way alike, so held up by its bell the tentacles hang, sway
+// and curl, and laid down they spring back to the drift. Two to nine filaments with the cords, laid
+// in layers: the bell is a gradient of bands from the bed up that glows lighter toward its crown,
+// one colour a band, the beads' caps in a middle band's colour (orchid from four up) and spots on
+// the crown; under the cords' top only the cords and the first band print.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let s = param(1, min: 0.8, max: 1.2, step: 0.05, label: "Size", group: "Jellyfish", kind: "ratio", hint: "scales the jellyfish; the cords keep their section")
+let materials = param(4, min: 2, max: 9, step: 1, label: "Materials", group: "Jellyfish", kind: "count", hint: "with the TPU cords: 2 a magenta bell; 3 indigo with a pearl crown and caps; 4 adds an orchid band, caps and spots; up to 9 an eight-step gradient from indigo to pearl (each colour is a band of layers: a filament change or two each)")
+let cord = param(2.4mm, min: 2mm, max: 3mm, step: 0.1mm, label: "Cord", group: "Cords", hint: "the TPU cords' width and height: thicker springs back harder")
+
+// On the bed, U across the jellyfish and V up it (a sketch's [u v]); the bell's mouth lies along
+// V = 0 and the tentacles trail down from it.
+
+// The bell: a dome `top` high over a half ellipse `bell_w` across and `bell_h` up, closed below
+// by a shallow one `mouth` deep, scalloped into seven lappets `lappet` deep (both fading into the
+// corners, so the outline turns round them smoothly). Each section of the dome is that outline
+// shrunk toward `core` (a share at each height), so it narrows all the way up: nothing overhangs.
+let bell_w = 38.5mm
+let bell_h = 36mm
+let mouth = 3mm
+let lappet = 2.4mm
+let top = 16mm
+let core = [0, 12mm]
+let bell_prof = [[0, 1] [0.25, 0.97] [0.45, 0.91] [0.62, 0.82] [0.76, 0.7] [0.87, 0.55] [0.95, 0.38] [1, 0.22]]
+let rim = for i in 0..128 {
+    if i < 48 {
+        let a = i * 3.14159 / 48
+        [bell_w * cos(a), bell_h * sin(a)]
+    } else {
+        let a = 3.14159 + (i - 48) * 3.14159 / 80
+        let u = bell_w * cos(a)
+        [u, -abs(sin(a)) * (mouth + lappet * abs(sin((u + bell_w) * 3.14159 / 11mm)))]
+    }
+}
+fn bell_out(f) { Polygon{points: for p in rim { [(core[0] + (p[0] - core[0]) * f) * s, (core[1] + (p[1] - core[1]) * f) * s] }} }
+let bell = m.loft({sections: for d in bell_prof { Section{sketch: bell_out(d[1]) at: top * d[0] * s} }})
+
+// The tentacles, one after the other: each bead's centre and its heading along its cord (laid out
+// so consecutive beads sit their half lengths and a free run of cord apart, the first a free run
+// below the deepest lappet), then each tentacle's first bead's place in the lists and its count. A
+// bead's half length, half width and height go by its place down its tentacle. Each tentacle leaves
+// the bell at its root, a cusp between two lappets; its cord starts well up inside the bell, at
+// `start`, so the plane midway between the bell's centre and the first bead's (where the bend
+// between them is looked for) crosses it even for the outer tentacles.
+let cx = [-28.59mm, -30.86mm, -38.32mm, -42.97mm, -40.98mm, -39.23mm, -43.18mm, -49.82mm, -16.50mm, -20.13mm, -26.04mm, -24.20mm, -20.49mm, -21.75mm, -27.62mm, -32.95mm, -33.64mm, -30.76mm, -5.44mm, -9.27mm, -10.12mm, -5.08mm, -3.53mm, -8.28mm, -13.37mm, -13.96mm, -10.25mm, -6.65mm, -6.43mm, 5.32mm, 3.67mm, 8.16mm, 12.71mm, 10.06mm, 5.44mm, 4.70mm, 9.16mm, 13.92mm, 15.37mm, 12.57mm, 16.47mm, 18.83mm, 25.37mm, 25.97mm, 22.10mm, 20.94mm, 25.82mm, 31.68mm, 34.64mm, 32.70mm, 28.66mm, 34.48mm, 40.03mm, 37.82mm, 36.41mm, 41.36mm, 48.37mm, 53.27mm]
+let cy = [-12.29mm, -23.15mm, -30.82mm, -40.01mm, -49.71mm, -59.05mm, -67.25mm, -72.87mm, -12.40mm, -22.89mm, -31.81mm, -41.95mm, -51.12mm, -60.54mm, -67.49mm, -74.37mm, -82.64mm, -90.00mm, -12.32mm, -22.73mm, -33.40mm, -42.38mm, -52.16mm, -60.39mm, -67.93mm, -76.61mm, -84.03mm, -91.07mm, -98.56mm, -12.32mm, -23.30mm, -33.01mm, -42.25mm, -51.79mm, -60.09mm, -69.16mm, -76.63mm, -83.43mm, -91.19mm, -98.15mm, -12.41mm, -23.25mm, -31.72mm, -42.01mm, -51.12mm, -60.55mm, -68.23mm, -74.65mm, -82.41mm, -90.07mm, -12.26mm, -21.71mm, -30.86mm, -40.92mm, -50.72mm, -58.83mm, -64.64mm, -71.83mm]
+let hx = [-0.0612, -0.4973, -0.7690, -0.0235, 0.2943, -0.0521, -0.6990, -0.7712, -0.0438, -0.5669, -0.3618, 0.3987, 0.2447, -0.5084, -0.6942, -0.4328, 0.2416, 0.4156, -0.1450, -0.4001, 0.4304, 0.4491, -0.2594, -0.6105, -0.4176, 0.2950, 0.5134, 0.3249, -0.2991, -0.1685, 0.0702, 0.6206, 0.1080, -0.4867, -0.3989, 0.3095, 0.6096, 0.4682, -0.1638, -0.4947, -0.0317, 0.5139, 0.5792, -0.3135, -0.3703, 0.2562, 0.6810, 0.6042, 0.0031, -0.3920, 0.2756, 0.6636, 0.0279, -0.2911, 0.1504, 0.7388, 0.7435, 0.2487]
+let hy = [-0.9981, -0.8676, -0.6393, -0.9997, -0.9557, -0.9986, -0.7151, -0.6365, -0.9990, -0.8238, -0.9322, -0.9171, -0.9696, -0.8611, -0.7198, -0.9015, -0.9704, -0.9096, -0.9894, -0.9165, -0.9026, -0.8935, -0.9658, -0.7921, -0.9086, -0.9555, -0.8581, -0.9458, -0.9542, -0.9857, -0.9975, -0.7841, -0.9942, -0.8736, -0.9170, -0.9509, -0.7927, -0.8836, -0.9865, -0.8691, -0.9995, -0.8578, -0.8152, -0.9496, -0.9289, -0.9666, -0.7323, -0.7968, -1.0000, -0.9200, -0.9613, -0.7481, -0.9996, -0.9567, -0.9886, -0.6739, -0.6687, -0.9686]
+let first = [0, 8, 18, 29, 40, 50]
+let counts = [8, 10, 11, 11, 10, 8]
+let roots = [-27.5mm, -16.5mm, -5.5mm, 5.5mm, 16.5mm, 27.5mm]
+let start = 20mm
+let hl = [4.4mm, 4.2mm, 4.0mm, 3.8mm, 3.6mm, 3.4mm, 3.2mm, 3.0mm, 2.8mm, 2.6mm, 2.45mm]
+let hw = [3.3mm, 3.2mm, 3.1mm, 3.0mm, 2.9mm, 2.8mm, 2.7mm, 2.6mm, 2.5mm, 2.45mm, 2.4mm]
+let tall = [6.2mm, 5.9mm, 5.6mm, 5.3mm, 5.0mm, 4.7mm, 4.4mm, 4.2mm, 4.0mm, 3.9mm, 3.8mm]
+fn centre(n) { [cx[n], cy[n]] }
+// A point `a` along bead n's heading and `w` to its left, as a sketch's [u v].
+fn bp(n, a, w) { [(cx[n] + a * hx[n] - w * hy[n]) * s, (cy[n] + a * hy[n] + w * hx[n]) * s] }
+// A bead: a pod (two half circles joined straight) domed like a pebble, full at the bed and
+// rounding over to a flat crown, its ends' radius shrinking up the dome; n its place in the
+// lists, k its place down its tentacle.
+let dome = [[0, 1] [0.35, 0.98] [0.6, 0.92] [0.8, 0.8] [0.93, 0.6] [1, 0.36]]
+fn pod(n, k, f) {
+    let fa = hl[k] - hw[k]
+    Polygon{points: for i in 0..26 {
+        if i < 13 {
+            let t = -1.5708 + i * 0.2618
+            bp(n, fa + hw[k] * f * cos(t), hw[k] * f * sin(t))
+        } else {
+            let t = 1.5708 + (i - 13) * 0.2618
+            bp(n, -fa + hw[k] * f * cos(t), hw[k] * f * sin(t))
+        }
+    }}
+}
+fn bead(n, k) { m.loft({sections: for d in dome { Section{sketch: pod(n, k, d[1]) at: tall[k] * d[0] * s} }}) }
+fn tentacle(j) { return for k in 0..counts[j] { bead(first[j] + k, k) } }
+let beads = for j in 0..6 { tentacle(j) }
+
+// The cords: each one sweep of a house's section (upright sides to the eaves, then a roof at 58
+// degrees to a flat ridge 0.6 mm wide, so the cord's top layer is a whole line and the bell and
+// beads printed over it bridge only that), lying on the bed. Each starts inside the bell over its
+// root, runs straight along each bead's axis, and between two beads curves from the one's axis to
+// the next's, so it leaves every bead square through its end and never thins the bead's wall; it
+// ends inside the last bead.
+let eave = cord * 0.42
+let ridge = eave + cord * 0.6
+// (drawn across and up: each line starts down the bed's V, so the sweep stands its section's
+// second axis upright)
+let house = Polygon{points: [[-cord / 2, 0] [-cord / 2, eave] [-0.3mm, ridge] [0.3mm, ridge] [cord / 2, eave] [cord / 2, 0]]}
+let inset = 1.2mm
+// A point `a` along bead n's axis.
+fn on_axis(n, a) { [cx[n] + a * hx[n], cy[n] + a * hy[n]] }
+// A point `u` of the way along the curve from bead n (k down its tentacle) to the next: a cubic
+// leaving n's axis `inset` inside its end and reaching the next's as far inside its start, each
+// end tangent to its own bead's axis.
+fn bend(n, k, u) {
+    let p0 = on_axis(n, hl[k] - inset)
+    let p3 = on_axis(n + 1, inset - hl[k + 1])
+    let r = sqrt((p3[0] - p0[0]) * (p3[0] - p0[0]) + (p3[1] - p0[1]) * (p3[1] - p0[1])) / 3
+    let p1 = on_axis(n, hl[k] - inset + r)
+    let p2 = on_axis(n + 1, inset - hl[k + 1] - r)
+    let v = 1 - u
+    [v * v * v * p0[0] + 3 * v * v * u * p1[0] + 3 * v * u * u * p2[0] + u * u * u * p3[0], v * v * v * p0[1] + 3 * v * v * u * p1[1] + 3 * v * u * u * p2[1] + u * u * u * p3[1]]
+}
+// The tentacle's line: its root, then five points a bead (where the cord enters it, where it
+// leaves, and three on the curve to the next), the last bead only its entry and centre.
+fn cord_pt(j, i) {
+    let n = first[j]
+    let k = floor((i - 1) / 5)
+    let r = i - 1 - k * 5
+    if i == 0 { [roots[j], start] }
+    else if r == 0 { on_axis(n + k, inset - hl[k]) }
+    else if r == 1 { if k == counts[j] - 1 { centre(n + k) } else { on_axis(n + k, hl[k] - inset) } }
+    else { bend(n + k, k, (r - 1) / 4) }
+}
+fn tentacle_cord(j) {
+    let line = for i in 0..5 * counts[j] - 2 { let p = cord_pt(j, i); [p[0] * s, 0, -p[1] * s] }
+    m.sweep({sketch: house path: line})
+}
+let cords = for j in 0..6 { tentacle_cord(j) }
+
+let tentacles = for j in 0..6 { m.bond(cords[j], for k in 0..counts[j] + 1 { if k == 0 { bell } else { beads[j][k - 1] } }) }
+
+object(bell, name: "Flex jellyfish")
+
+// The colours, from the rim up: eight steps from indigo to pearl, of which a plate with fewer
+// materials takes an even spread (with two, the bell is one colour). The cords are aqua TPU.
+let palette = [Material{albedo: [0.16 0.12 0.43] name: "Indigo"} Material{albedo: [0.29 0.16 0.6] name: "Violet"} Material{albedo: [0.48 0.18 0.69] name: "Purple"} Material{albedo: [0.71 0.19 0.62] name: "Magenta"} Material{albedo: [0.85 0.38 0.72] name: "Orchid"} Material{albedo: [0.93 0.56 0.78] name: "Pink"} Material{albedo: [0.96 0.76 0.86] name: "Blush"} Material{albedo: [0.97 0.93 0.95] name: "Pearl"}]
+let aqua = Material{albedo: [0.2 0.78 0.8] name: "Aqua"}
+let picks = [[3] [0 7] [0 4 7] [0 2 4 7] [0 2 4 5 7] [0 1 3 4 6 7] [0 1 2 4 5 6 7] [0 1 2 3 4 5 6 7]]
+let bands = materials - 1
+let pick = picks[bands - 1]
+// The bands: the first from the bed up, each next from its own height up; they start over the
+// cords' top (`lift`), so under it only the cords and the first band print. Over them the beads'
+// caps take a middle band's colour from `caps` up, and spots on the crown (in the top band) a
+// deeper band's.
+let lift = ridge + 0.3mm
+let caps = 4.6mm * s
+fn band_lo(i) { if i == 0 { 0 } else { lift + i * (top * s - lift) / bands } }
+fn above(z) { m.box({size: [400mm * s, 60mm * s, 400mm * s] at: [0, z + 30mm * s, 0]}) }
+fn dot(u, v, size) { m.extrude({sketch: Polygon{points: for i in 0..20 { [(u + size * cos(i * 0.314159)) * s, (v + size * sin(i * 0.314159)) * s] }} height: 30mm * s at: [0, band_lo(bands - 1), 0]}) }
+m.fill(above(0), palette[pick[0]])
+for i in 1..8 { if i < bands { m.fill(above(band_lo(i)), palette[pick[i]]) } }
+if bands >= 2 {
+    for j in 0..6 { for k in 0..counts[j] { m.fill(m.extrude({sketch: pod(first[j] + k, k, 1.1) height: 30mm * s at: [0, caps, 0]}), palette[pick[floor(bands / 2)]]) } }
+}
+if bands >= 3 {
+    let spot = palette[pick[if bands >= 6 { 3 } else { 1 }]]
+    // an arc of spots over the bell's core, the middle one largest
+    let spots = [[-12.7mm, 15.8mm, 1.5mm] [-6.5mm, 19.8mm, 1.8mm] [0, 21mm, 2.1mm] [6.5mm, 19.8mm, 1.8mm] [12.7mm, 15.8mm, 1.5mm]]
+    for d in spots { m.fill(dot(d[0], d[1], d[2]), spot) }
+}
+// The cords print in TPU all through: filled whole last, each drops the paint before.
+for j in 0..6 { m.fill(cords[j], aqua) }

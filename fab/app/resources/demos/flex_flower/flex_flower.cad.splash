@@ -1,0 +1,128 @@
+// A flower printed open, in place: a domed heart crowned with stamens and six pointed tepals round
+// it, each fused to a flat TPU ribbon that runs from inside the heart into the tepal's base, flat
+// on the bed under them. Between the heart and each tepal the ribbon runs free three and a half
+// millimetres; flat, it bends up and down three and a half times more easily than sideways, so the
+// tepals fold up round the heart into a cup and spring open again when let go. Two to nine
+// filaments with the ribbons, laid in layers: with five or more a green underside (the cup's
+// outside when it folds), the tepals in bands from pale at their edges to deep along their
+// middles, and the heart and its stamens gold over them; never more than two filaments a layer.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let s = param(1, min: 0.8, max: 1.2, step: 0.05, label: "Size", group: "Flower", kind: "ratio", hint: "scales the flower; the ribbons keep their section")
+let materials = param(4, min: 2, max: 9, step: 1, label: "Materials", group: "Flower", kind: "count", hint: "with the TPU ribbons: 2 a gold flower; 3 rose tepals round a gold heart; 4 pink tepals with a berry keel; 5 adds a green underside, the cup's outside; up to 9 tepals in five shades from pearl to berry and an amber heart under gold stamens (each colour is a band of layers: one filament change each)")
+let ribbon = param(1.6mm, min: 1.6mm, max: 2mm, step: 0.1mm, label: "Ribbon", group: "Ribbons", hint: "the TPU ribbons' thickness: thicker springs open harder")
+
+// On the bed, U across the flower and V up it (a sketch's [u v]).
+fn ring(u, v, r) { Polygon{points: for i in 0..48 { [(u + r * cos(i * 0.1309)) * s, (v + r * sin(i * 0.1309)) * s] }} }
+
+// The heart: a round dome lofted over shrinking copies of its rim, so nothing overhangs, with six
+// stamens on a ring between the tepals and a pistil in the middle. Each rises out of the dome on a
+// stalk to an anther, a bulge that closes over flat; the stamens lean out 15 degrees (their
+// anthers' outer sides lean 38 at most), the pistil stands upright.
+let heart_r = 13mm
+let heart_h = 9mm
+let dome = [[0, 1] [0.2, 0.98] [0.4, 0.93] [0.6, 0.83] [0.75, 0.7] [0.87, 0.54] [0.95, 0.36] [1, 0.16]]
+let stamen = [[7mm, 1.1mm] [11.4mm, 0.85mm] [12.2mm, 1.25mm] [13.2mm, 1.25mm] [13.8mm, 0.9mm]]
+let pistil = [[7mm, 1.4mm] [14.2mm, 1mm] [15mm, 1.5mm] [16.2mm, 1.5mm] [16.8mm, 1mm]]
+fn pillar(a, r, lean, rows) { m.loft({sections: for q in rows { Section{sketch: ring((r + (q[0] - 7mm) * lean) * cos(a), (r + (q[0] - 7mm) * lean) * sin(a), q[1]) at: q[0] * s} }}) }
+fn stalk(k) { if k == 6 { pillar(0, 0, 0, pistil) } else { pillar(k * 1.0472, 5.5mm, 0.268, stamen) } }
+let heart = m.union(m.loft({sections: for q in dome { Section{sketch: ring(0, 0, heart_r * q[1]) at: heart_h * q[0] * s} }}), for k in 0..7 { stalk(k) })
+
+// The tepals: six round the heart, one pointing up V, each from its base (a claw over its ribbon,
+// `gap` past the heart's rim) out to a rounded point. The outline widens from the claw to its
+// widest before halfway and narrows to the point; it is lofted over copies of itself narrowed
+// toward its middle line and shortened less, toward a point a third of the way out, so each tepal
+// rises from thin edges to a keel along its middle, and nothing overhangs. Folded up, neighbours
+// meet at about 60 degrees: a cup.
+let gap = 3.5mm
+let base_r = heart_r + gap
+let tl = 37mm
+let tw = 23mm
+let claw = 3.4mm
+let widest = 0.4
+let tip_r = 1.8mm
+let crest = 0.36
+let tepal_h = 4.2mm
+let keel = [[0, 1] [0.2, 0.95] [0.4, 0.85] [0.6, 0.71] [0.8, 0.53] [1, 0.32]]
+// the half width at `u` along the tepal (0 its base, 1 its point)
+fn half(u) { if u <= widest { claw + (tw / 2 - claw) * sin(u / widest * 1.5708) } else { tw / 2 * pow(1 - pow((u - widest) / (1 - widest), 1.6), 0.9) } }
+// where the half width has narrowed to the point's radius: the point is a half circle from there
+let u_end = widest + (1 - widest) * pow(1 - pow(2 * tip_r / tw, 1 / 0.9), 1 / 1.6)
+fn round_pt(j) {
+    let t = -1.5708 + j * 0.392699
+    [u_end * tl + tip_r * cos(t), tip_r * sin(t)]
+}
+// the outline counterclockwise in the tepal's own frame (along it, across it): out along one side,
+// round the point, back along the other
+fn tepal_pt(i) {
+    if i < 24 { [u_end * tl * i / 23, -half(u_end * i / 23)] }
+    else if i < 31 { round_pt(i - 23) }
+    else { [u_end * tl * (54 - i) / 23, half(u_end * (54 - i) / 23)] }
+}
+fn tepal_outline(k, f) {
+    let a = 1.5708 + k * 1.0472
+    let d = [cos(a), sin(a)]
+    Polygon{points: for i in 0..55 {
+        let p = tepal_pt(i)
+        let x = crest * tl + (p[0] - crest * tl) * (1 - (1 - f) * 0.45)
+        let y = p[1] * f
+        [(d[0] * (base_r + x) - d[1] * y) * s, (d[1] * (base_r + x) + d[0] * y) * s]
+    }}
+}
+fn tepal(k) { m.loft({sections: for q in keel { Section{sketch: tepal_outline(k, q[1]) at: tepal_h * q[0] * s} }}) }
+let tepals = for k in 0..6 { tepal(k) }
+
+// The ribbons: each a sweep of a flat section 3 mm wide and `ribbon` thick lying on the bed, from
+// inside the heart 6.5 mm from its middle through the free run to 10 mm inside its tepal's claw.
+// A sweep stands its section by its line's first step: off U, as every ribbon here runs, its
+// section's second axis is up when the step runs down V and down when it runs up V.
+let rib_w = 3mm
+fn flat(d) {
+    if d[1] < 0 { Polygon{points: [[-rib_w / 2, 0] [-rib_w / 2, ribbon] [rib_w / 2, ribbon] [rib_w / 2, 0]]} }
+    else { Polygon{points: [[-rib_w / 2, 0] [rib_w / 2, 0] [rib_w / 2, -ribbon] [-rib_w / 2, -ribbon]]} }
+}
+fn hinge(k) {
+    let a = 1.5708 + k * 1.0472
+    let d = [cos(a), sin(a)]
+    let r1 = base_r + 10mm
+    m.sweep({sketch: flat(d) path: [[d[0] * 6.5mm * s, 0, -d[1] * 6.5mm * s] [d[0] * r1 * s, 0, -d[1] * r1 * s]]})
+}
+let ribbons = for k in 0..6 { hinge(k) }
+let joints = for k in 0..6 { m.bond(ribbons[k], [heart, tepals[k]]) }
+
+object(heart, name: "Flex flower")
+
+// The colours, in layers. With five filaments or more the underside is leaf green up to `under`
+// (four layers): folded, it is the cup's outside. Over it the tepals take bands from pale at
+// their edges to deep along their middles, the bands' floors crowding toward the top (each one's
+// goes as the square root of its share) so on the tepals' keels they come out as stripes of about
+// even width, the last from `top`, 0.6 mm under the tepals' top. The heart takes the same bands as
+// rings round its foot, and from `lift` (over the tepals' top) it is gold; with nine, amber, and
+// gold from `anther` up the stamens. With two the whole flower is gold: gold, the flower's own
+// colour, prints at every count, so the plate never lists a filament it does not print. The
+// ribbons are moss TPU.
+let shades = [Material{albedo: [0.96 0.9 0.92] name: "Pearl"} Material{albedo: [0.95 0.72 0.78] name: "Blush"} Material{albedo: [0.91 0.47 0.61] name: "Pink"} Material{albedo: [0.82 0.26 0.44] name: "Rose"} Material{albedo: [0.56 0.12 0.32] name: "Berry"}]
+let leaf = Material{albedo: [0.18 0.54 0.23] name: "Leaf"}
+let amber = Material{albedo: [0.88 0.54 0.12] name: "Amber"}
+let gold = Material{albedo: [0.95 0.76 0.19] name: "Gold"}
+let moss = Material{albedo: [0.25 0.48 0.18] name: "Moss"}
+let picks = [[3] [3] [2 4] [2 4] [1 3 4] [0 2 3 4] [0 1 2 3 4] [0 1 2 3 4]]
+let pick = picks[materials - 2]
+let bands = if materials >= 8 { 5 } else if materials >= 5 { materials - 3 } else if materials == 4 { 2 } else if materials == 3 { 1 } else { 0 }
+let under = if materials >= 5 { 0.8mm * s } else { 0 }
+let top = (tepal_h - 0.6mm) * s
+fn band_lo(i) { if i == 0 { under } else { under + (top - under) * sqrt(i / (bands - 1)) } }
+let lift = (tepal_h + 0.6mm) * s
+let anther = 11.8mm * s
+let crown = if materials >= 9 { amber } else { gold }
+let crown_lo = if materials >= 3 { lift } else { 0 }
+fn above(z) { m.box({size: [400mm * s, 60mm * s, 400mm * s] at: [0, z + 30mm * s, 0]}) }
+if materials >= 5 { m.fill(above(0), leaf) }
+for i in 0..5 { if i < bands { m.fill(above(band_lo(i)), shades[pick[i]]) } }
+m.fill(above(crown_lo), crown)
+if materials >= 9 { m.fill(above(anther), gold) }
+// The ribbons print in TPU all through: filled whole last, each drops the paint before.
+for r in ribbons { m.fill(r, moss) }

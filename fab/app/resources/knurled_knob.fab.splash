@@ -1,0 +1,9 @@
+// A knob for a 6mm shaft with a diamond-knurled grip: the knurl displaces the knob's distance
+// field, so its pitch and depth drag live in the part's parameters.
+use mod.fab.*
+
+script("knurled_knob.cad.splash")
+
+color("Blue", rgb: #x3d7bd9)
+
+place("knurled_knob", at: [175mm 160mm], name: "Knurled knob", color: "Blue")

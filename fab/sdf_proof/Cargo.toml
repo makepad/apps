@@ -1,0 +1,15 @@
+[package]
+name = "fab-sdf-proof"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "A Splash distance field's slope, curvature and error, proven from its compiled program and the prelude functions' declared bounds."
+
+[dependencies]
+makepad-csg-sdf = { path = "../../../../libs/csg/csg_sdf" }
+makepad-script-compute = { path = "../../../../platform/script/compute", version = "1.0.0", features = ["vm"] }
+makepad-script-compute-sched = { path = "../../../../platform/script/compute_sched" }
+
+[dev-dependencies]
+makepad-script = { path = "../../../../platform/script", version = "1.0.0" }

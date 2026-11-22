@@ -1,0 +1,10 @@
+[package]
+name = "fab-materials"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab's materials, surface finishes and standard colours: what a part is made of, how its faces are finished, and what that means for moulding, printing, fits, drawings, realtime shading and the tracer"
+
+[dependencies]
+fab-colour = { path = "../colour" }

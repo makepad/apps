@@ -1,0 +1,39 @@
+// A servo arm printed in place, lying on the bed: a base held fixed, an upper arm and a forearm,
+// each joint a hinge on an upright pin with a position servo on it. In Mechanics the panel's
+// motor rows set where each servo turns its link; the links swing flat on the bed, each servo
+// pushing with no more than its torque.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+// Each piece is one rounded box lying on the bed, a gap from the next. A joint's pin stands in
+// the gap, and both pieces hold a knuckle column round it; the hinge turns the two columns into
+// one piece's plates and pin and the other's eye between them, and cuts each piece clear of the
+// other over the joint's range.
+let knuckle = 3.6mm
+let pin = 1.4mm
+let height = 9mm
+let gap = 1.5mm
+let upper_length = param(34mm, min: 24mm, max: 60mm, step: 1mm, label: "Upper arm", group: "Arm", hint: "from the shoulder to the elbow")
+let fore_length = param(28mm, min: 20mm, max: 50mm, step: 1mm, label: "Forearm", group: "Arm", hint: "from the elbow to the tip")
+fn block(w, l, z) { m.box({size: [w, height, l] radius: 1.5mm at: [0, height / 2, z + l / 2]}) }
+fn hub(z) { m.cylinder({radius: knuckle height: height at: [0, height / 2, z]}) }
+
+// Along +Z from the base: the shoulder at the base's front, the elbow at the upper arm's end.
+let base_length = 20mm
+let shoulder_z = base_length / 2 + gap / 2
+let elbow_z = shoulder_z + gap / 2 + upper_length + gap / 2
+let base = m.union(block(28mm, base_length, -base_length / 2), hub(shoulder_z))
+let upper_arm = m.union(block(9mm, upper_length, shoulder_z + gap / 2), [hub(shoulder_z) hub(elbow_z)])
+let forearm = m.union(block(8mm, fore_length, elbow_z + gap / 2), hub(elbow_z))
+
+// The base stays where it printed; the servos turn the links (N mm: a micro servo's 150 at the
+// shoulder, less at the elbow).
+m.anchor(base, {at: [0, height / 2, 0] fixed: true})
+let shoulder = m.hinge(base, upper_arm, {at: [0, 0, shoulder_z] pin: pin lower: -90° upper: 90° motor: @position})
+let elbow = m.hinge(upper_arm, forearm, {at: [0, 0, elbow_z] pin: pin lower: -110° upper: 110° motor: @position torque: 100})
+
+object(base, name: "Servo arm")
+
+let orange = Material{albedo: [0.92 0.44 0.12] name: "Orange"}
+m.fill(forearm, orange)

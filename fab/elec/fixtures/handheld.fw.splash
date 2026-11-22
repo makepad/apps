@@ -1,0 +1,1399 @@
+// The handheld app: its pages share the screen, and BOOT steps to the next one.
+//   0 Sand: tilt the board and the grains fall; touch the glass to pour more.
+//   1 Voice Toy: speak, and the handheld plays the take back.
+//   2 Talk: speak, and the voice server's spoken answer plays; what it heard and its reply show
+//     as text.
+//   3 Pictures: the pictures the picture server holds; a tap shows the next.
+// The bench may set `page`, the page shown at power-on.
+let page: i32 = 0
+let pages: i32 = 4
+let screen = display()
+var shown: i32 = 0
+
+// ---- Sand: 92 x 112 cells, four glass pixels per cell. Zero is air; 1..3 is sand.
+let grid = bytes(92 * 112)
+let dirty_rows = bytes(112)
+// Reuse one cell row of RGB565 pixels: 2944 bytes, not a full-panel surface.
+let strip = surface(368, 4)
+let forward: i32 = 1
+var tilt_x: i32 = 0
+var tilt_y: i32 = 0
+var poured: i32 = 0
+
+// Typed so a pixel stays an integer RGB565 word all the way into the strip.
+fn colour(grain: i32) -> i32 {
+    var c: i32 = rgb(192, 124, 40)
+    if grain == 1 { c = rgb(248, 204, 104) }
+    else if grain == 2 { c = rgb(224, 164, 64) }
+    return c
+}
+
+// Paint changed rows, including the air left behind by moving grains; on the other pages, the
+// rows are black. One call paints at most 24 rows (about 14 ms of the panel's SPI), starting after
+// the last row it painted, so no handler outlasts its 20 ms period and a full repaint takes five
+// calls. True when it stopped at that limit. Literal loop extents and the row guard prove every
+// grid, flag and strip index is in range.
+var next_row: i32 = 0
+fn draw_rows() -> bool {
+    let first = next_row
+    var drawn: i32 = 0
+    for k in 0..112 {
+        var row: i32 = first + k
+        if row >= 112 { row = row - 112 }
+        if row >= 0 && row < 112 {
+            if drawn < 24 && dirty_rows[row] != 0 {
+                for col in 0..92 {
+                    let grain = grid[row * 92 + col]
+                    let pixel: i32 = if shown != 0 || grain == 0 { rgb(0, 0, 0) } else { colour(grain) }
+                    for y in 0..4 {
+                        for x in 0..4 {
+                            strip[y * 368 + col * 4 + x] = pixel
+                        }
+                    }
+                }
+                present(screen, strip, 0, 0, 368, 4, 0, row * 4)
+                dirty_rows[row] = 0
+                drawn += 1
+                next_row = if row == 111 { 0 } else { row + 1 }
+            }
+        }
+    }
+    drawn == 24
+}
+
+// Every row changes when a page is shown.
+fn repaint() {
+    for row in 0..112 {
+        dirty_rows[row] = 1
+    }
+}
+
+fn put_grain(x, y, grain) {
+    if x >= 0 && x < 92 && y >= 0 && y < 112 {
+        let i = y * 92 + x
+        if grid[i] == 0 {
+            grid[i] = grain
+            dirty_rows[y] = 1
+        }
+    }
+}
+
+// The caller's source coordinates are in range; the destination guards also
+// prove its linear index is in 0..10304. Mark both changed rows for drawing.
+fn move_grain(x, y, nx, ny, grain) {
+    var moved = false
+    if nx >= 0 && nx < 92 && ny >= 0 && ny < 112 {
+        let target = ny * 92 + nx
+        if grid[target] == 0 {
+            grid[target] = grain
+            grid[y * 92 + x] = 0
+            dirty_rows[y] = 1
+            dirty_rows[ny] = 1
+            moved = true
+        }
+    }
+    moved
+}
+
+fn fall(x, y, dx, dy, left_x, left_y, right_x, right_y) {
+    let grain = grid[y * 92 + x]
+    if grain != 0 {
+        if !move_grain(x, y, x + dx, y + dy, grain) {
+            if !move_grain(x, y, x + left_x, y + left_y, grain) {
+                move_grain(x, y, x + right_x, y + right_y, grain)
+            }
+        }
+    }
+}
+
+// The board's IMU (handheld.ckt.splash) has its X toward the panel's top edge and its Y along the
+// panel's columns. At rest an accelerometer reads +1 g upward, so gravity along the columns is
+// -accel(1) and down the rows is accel(0). Ignore Z; when flat (both in-plane components below
+// 1/8 g), gravity points down the panel.
+let motion_sample = motion(ms(20), fn() {
+    tilt_x = -accel(1)
+    tilt_y = accel(0)
+})
+
+let pour = touch(ms(20), fn() {
+    if shown == 0 && touch_down() != 0 {
+        let cx = touch_x() / 4
+        let cy = touch_y() / 4
+        for row in 0..5 {
+            for col in 0..5 {
+                put_grain(cx + col - 2, cy + row - 2, 1 + (poured + row + col) % 3)
+            }
+        }
+        poured = (poured + 1) % 3
+        draw_rows()
+    }
+})
+
+let step = every(ms(20), fn() {
+    let ax = if tilt_x < 0 { -tilt_x } else { tilt_x }
+    let ay = if tilt_y < 0 { -tilt_y } else { tilt_y }
+    var dx: i32 = 0
+    var dy: i32 = 1
+    if ax >= ACCEL_LSB_PER_G / 8 || ay >= ACCEL_LSB_PER_G / 8 {
+        if ax > ay * 2 {
+            dx = if tilt_x < 0 { -forward } else { forward }
+            dy = 0
+        } else if ay > ax * 2 {
+            dy = if tilt_y < 0 { -forward } else { forward }
+        } else {
+            dx = if tilt_x < 0 { -forward } else { forward }
+            dy = if tilt_y < 0 { -forward } else { forward }
+        }
+    }
+    // The neighbouring directions, 45 degrees to either side of downhill.
+    // For diagonal gravity these are the two cardinal neighbours, so every
+    // candidate advances strictly along gravity and never exceeds one cell.
+    var left_x: i32 = dx
+    var left_y: i32 = dy
+    var right_x: i32 = dx
+    var right_y: i32 = dy
+    if dx == 0 {
+        left_x = -1
+        right_x = 1
+    } else if dy == 0 {
+        left_y = -1
+        right_y = 1
+    } else {
+        left_x = 0
+        right_y = 0
+    }
+    // Horizontal gravity needs columns first: both diagonal slips then land in
+    // an already visited column. Otherwise visit downhill rows first and order
+    // columns downhill for the diagonal direction's same-row slip. A grain can
+    // move only once. Literal loop extents keep source indices provably in range.
+    if dy == 0 {
+        for col in 0..92 {
+            let x = if dx < 0 { col } else { 91 - col }
+            for y in 0..112 {
+                fall(x, y, dx, dy, left_x, left_y, right_x, right_y)
+            }
+        }
+    } else {
+        for row in 0..112 {
+            let y = if dy < 0 { row } else { 111 - row }
+            for col in 0..92 {
+                let x = if dx < 0 { col } else { 91 - col }
+                fall(x, y, dx, dy, left_x, left_y, right_x, right_y)
+            }
+        }
+    }
+    draw_rows()
+})
+
+// ---- Voice Toy. The mic listens in 20 ms blocks at 16 kHz and keeps 640 ms of history. A
+// block's level is its mean absolute sample. Voice is relative to the room: the noise floor is
+// the quietest block of the last 1.6 s (five 320 ms windows), so a steady noise becomes the floor
+// within that time while speech, which drops between syllables, does not. A block is voice when
+// its level reaches voice_margin times the floor (12 dB over it), and at least voice_min, which
+// the mic's own hiss stays far below. Six voice blocks start a take; up to hang_blocks quiet
+// blocks in a row between them (a stop consonant, a breath) keep the count: the hangover. The
+// take begins 200 ms before the first voice block: the history still holds those samples, so a
+// rewind reaches them (at most 6 + 5 x 3 + 10 = 31 of its 32 blocks). Two seconds without voice
+// end the take, and the speaker plays it back. A take holds at most four seconds; a longer one
+// ends there and plays.
+let voice_margin: i32 = 4
+let voice_min: i32 = 32
+let hang_blocks: i32 = 3
+let floor_blocks: i32 = 16
+let floor_mins = samples(5)
+var floor_now: i32 = 32767
+var floor_at: i32 = 0
+var floor_ix: i32 = 0
+var noise_floor: i32 = 0
+var threshold: i32 = 32
+let attack_blocks: i32 = 6
+let pre_roll_blocks: i32 = 10
+let quiet_blocks: i32 = 100
+let chunk = samples(320)
+let take = samples(64000)
+var taken: i32 = 0
+var takes: i32 = 0
+var rewound: i32 = 0
+// The attack: its voice blocks, its blocks since the first of them, and the quiet ones since the last.
+var loud: i32 = 0
+var onset: i32 = 0
+var hang: i32 = 0
+var quiet: i32 = 0
+var taking = false
+var played: i32 = 0
+var playing = false
+
+// The meter, a bar across the middle of the glass. Listening, it shows the block's level against
+// four times the voice threshold, which the tick under the bar marks; red while it takes; while
+// it plays back, how much of the take has played, in green.
+let meter_x: i32 = 24
+let meter_y: i32 = 200
+let meter_w: i32 = 320
+let meter_h: i32 = 48
+var meter_fill: i32 = 0
+var meter_colour: i32 = 0
+// False until the page's rows are black and the tick is drawn.
+var meter_shown = false
+
+// The chunk's mean absolute sample.
+fn level() -> i32 {
+    var sum: i32 = 0
+    for i in 0..320 {
+        let s: i32 = chunk[i]
+        if s < 0 { sum = sum - s } else { sum = sum + s }
+    }
+    return sum / 320
+}
+
+// The floor starts over, every window as loud as can be, so the first block sets it.
+fn floor_reset() {
+    for k in 0..5 { floor_mins[k] = 32767 }
+    floor_now = 32767
+    floor_at = 0
+    floor_ix = 0
+}
+
+// Block level `l` into the floor; sets the level voice must reach. O(windows) per block.
+fn follow_floor(l: i32) {
+    let kept: i32 = if l > 32767 { 32767 } else { l }
+    if kept < floor_now { floor_now = kept }
+    floor_at += 1
+    if floor_at == floor_blocks {
+        floor_mins[floor_ix] = floor_now
+        floor_ix = (floor_ix + 1) % 5
+        floor_now = 32767
+        floor_at = 0
+    }
+    var lowest: i32 = floor_now
+    for k in 0..5 {
+        let m: i32 = floor_mins[k]
+        if m < lowest { lowest = m }
+    }
+    noise_floor = lowest
+    let over: i32 = lowest * voice_margin
+    threshold = if over < voice_min { voice_min } else { over }
+}
+
+// The attack starts over.
+fn attack_reset() {
+    loud = 0
+    onset = 0
+    hang = 0
+}
+
+// Redraw only the part of the bar that changed, in steps of four pixels.
+fn draw_meter(reach: i32, ink: i32) {
+    let w = reach / 4 * 4
+    if ink != meter_colour {
+        if w > 0 { fill_rect(screen, meter_x, meter_y, w, meter_h, ink) }
+        if w < meter_w { fill_rect(screen, meter_x + w, meter_y, meter_w - w, meter_h, rgb(32, 32, 36)) }
+    } else if w > meter_fill {
+        fill_rect(screen, meter_x + meter_fill, meter_y, w - meter_fill, meter_h, ink)
+    } else if w < meter_fill {
+        fill_rect(screen, meter_x + w, meter_y, meter_fill - w, meter_h, rgb(32, 32, 36))
+    }
+    meter_fill = w
+    meter_colour = ink
+}
+
+// ---- Net text. Pictures and Talk send and read text lines: a verb, then decimal arguments. The
+// page shown owns these buffers; a page that leaves closes its connection.
+let tx = bytes(648)
+let rx = bytes(1512)
+let words = bytes(256)
+// The message going up, and how much of it the connection has taken.
+var tx_n: i32 = 0
+var tx_pos: i32 = 0
+var tx_flags: i32 = 0
+// The text line coming down, and where words_number stopped.
+var words_n: i32 = 0
+var parsed_to: i32 = 0
+
+// Writes `n` in decimal at `at` in tx; returns the next free byte.
+fn tx_number(at: i32, n: i32) -> i32 {
+    var digits: i32 = 1
+    var rest: i32 = n / 10
+    for k in 0..9 {
+        if rest > 0 {
+            digits += 1
+            rest = rest / 10
+        }
+    }
+    var v: i32 = n
+    for k in 0..10 {
+        if k < digits {
+            tx[at + digits - 1 - k] = 48 + v % 10
+            v = v / 10
+        }
+    }
+    return at + digits
+}
+
+// The decimal number at `at` in words; parsed_to is the byte after it.
+fn words_number(at: i32) -> i32 {
+    var v: i32 = 0
+    parsed_to = at
+    for k in 0..10 {
+        if parsed_to < words_n {
+            let d: i32 = words[parsed_to]
+            if d >= 48 && d <= 57 {
+                v = v * 10 + d - 48
+                parsed_to += 1
+            }
+        }
+    }
+    return v
+}
+
+// The text line is the verb whose first three letters are a, b, c and whose length is n.
+fn verb_is(a: i32, b: i32, c: i32, n: i32) -> bool {
+    if words_n < n { return false }
+    if words[0] != a || words[1] != b || words[2] != c { return false }
+    return words_n == n || words[n] == 32
+}
+
+// ---- Pictures. Connection 0 serves pictures: the project's files, or a server. `get <index> <w>
+// <h> <row>` asks for picture `index`, fitted to the glass, from row `row` on. A 'P' block
+// answers it: a 16-byte header ('P', version 1, format 1 for RGB565, 0, then little-endian
+// index, w, h, first row, rows and 0), then the rows, each pixel high byte first. `count <n>`
+// says how many pictures there are, and `none <index>` says there is no such picture. The page
+// presents every two rows as they land. A tap on the glass asks for the next picture. After a
+// loss, the page asks again from the first row it has not shown, once the new connection has said
+// its count.
+let pic_hdr = bytes(16)
+let pic_band = surface(368, 2)
+var pic_count: i32 = -1
+// Whether this connection has said its count; nothing is asked before it.
+var pic_counted = false
+var pic_index: i32 = 0
+// The next row of the picture to show, and whether `get` has gone up for it.
+var pic_row: i32 = 0
+var pic_asked = false
+var pic_epoch: i32 = 0
+// The block being read: the bytes read so far, and its picture's width, height and top-left
+// on the glass; pic_take is false while a block of another picture is read and dropped.
+var pic_in_msg = false
+var pic_in_kind: i32 = 0
+var pic_in_pos: i32 = 0
+var pic_take = false
+var pic_w: i32 = 0
+var pic_h: i32 = 0
+var pic_x: i32 = 0
+var pic_y: i32 = 0
+var band_fill: i32 = 0
+var band_odd: i32 = -1
+var tapped = true
+// False until the page is black and its connection is open.
+var pic_open = false
+var pictures_shown: i32 = 0
+var pic_skipped: i32 = 0
+
+// "get <index> 368 448 <row>" into tx, sent whole or in parts by pic_pump.
+fn pic_ask() {
+    tx[0] = 103
+    tx[1] = 101
+    tx[2] = 116
+    tx[3] = 32
+    var at: i32 = tx_number(4, pic_index)
+    tx[at] = 32
+    at = tx_number(at + 1, 368)
+    tx[at] = 32
+    at = tx_number(at + 1, 448)
+    tx[at] = 32
+    tx_n = tx_number(at + 1, pic_row)
+    tx_pos = 0
+    pic_asked = true
+}
+
+fn pic_pump() {
+    if net_state(0) == net_ready {
+        if tx_pos < tx_n {
+            tx_pos += net_send(0, tx, tx_pos, tx_n - tx_pos, 0)
+        }
+        if tx_pos >= tx_n && !pic_asked && pic_counted && pic_count > 0 {
+            pic_ask()
+            tx_pos += net_send(0, tx, tx_pos, tx_n - tx_pos, 0)
+        }
+    }
+}
+
+// A block's header: show its rows when it is the picture asked for, from the row asked for.
+fn pic_header() {
+    let index: i32 = pic_hdr[4] + pic_hdr[5] * 256
+    let w: i32 = pic_hdr[6] + pic_hdr[7] * 256
+    let h: i32 = pic_hdr[8] + pic_hdr[9] * 256
+    let first: i32 = pic_hdr[10] + pic_hdr[11] * 256
+    let kind_ok = pic_hdr[0] == 80 && pic_hdr[1] == 1 && pic_hdr[2] == 1
+    let fits = w > 1 && w <= 368 && h > 1 && h <= 448
+    pic_take = kind_ok && fits && index == pic_index && first == pic_row
+    if pic_take {
+        pic_w = w
+        pic_h = h
+        pic_x = (368 - w) / 4 * 2
+        pic_y = (448 - h) / 4 * 2
+        band_fill = 0
+        band_odd = -1
+    } else {
+        pic_skipped += 1
+    }
+}
+
+// A block's pixel bytes into the band; every two whole rows go to the glass. An odd last column
+// or row stays off it: the panel takes only even windows.
+fn pic_pixels(n: i32) {
+    for i in 0..1512 {
+        if i < n && pic_take {
+            let b: i32 = rx[i]
+            if band_odd < 0 {
+                band_odd = b
+            } else {
+                let px: i32 = band_fill % pic_w
+                let line: i32 = band_fill / pic_w
+                pic_band[line * 368 + px] = band_odd * 256 + b
+                band_odd = -1
+                band_fill += 1
+                if band_fill == 2 * pic_w {
+                    present(screen, pic_band, 0, 0, pic_w / 2 * 2, 2, pic_x, pic_y + pic_row)
+                    pic_row += 2
+                    band_fill = 0
+                    if pic_row + 1 >= pic_h {
+                        pictures_shown += 1
+                        pic_take = false
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn pic_text() {
+    if verb_is(99, 111, 117, 5) {
+        // count <n>, at ready and whenever the set changes. A changed set starts the picture again.
+        let n = words_number(6)
+        if n != pic_count {
+            pic_count = n
+            if pic_index >= n { pic_index = 0 }
+            pic_row = 0
+            pic_take = false
+            pic_asked = false
+        }
+        pic_counted = true
+    } else if !verb_is(110, 111, 110, 4) {
+        pic_skipped += 1
+    }
+}
+
+fn pic_receive() {
+    for k in 0..16 {
+        let left = net_left(0)
+        if left == 0 { break }
+        if !pic_in_msg {
+            pic_in_msg = true
+            pic_in_kind = net_kind(0)
+            pic_in_pos = 0
+            pic_take = false
+            words_n = 0
+        }
+        var n: i32 = 0
+        if pic_in_kind == 0 {
+            if words_n < 256 {
+                n = net_recv(0, words, words_n, 256 - words_n)
+                words_n += n
+            } else {
+                n = net_recv(0, rx, 0, 1512)
+            }
+        } else if pic_in_pos < 16 {
+            n = net_recv(0, pic_hdr, pic_in_pos, 16 - pic_in_pos)
+            if pic_in_pos + n == 16 { pic_header() }
+        } else {
+            n = net_recv(0, rx, 0, 1512)
+            pic_pixels(n)
+        }
+        pic_in_pos += n
+        if n == left {
+            pic_in_msg = false
+            if pic_in_kind == 0 { pic_text() }
+        } else if n == 0 {
+            break
+        }
+    }
+}
+
+fn on_pictures() {
+    if shown == 3 {
+        let epoch = net_epoch(0)
+        if epoch != pic_epoch {
+            // The connection ended: its queues are gone. Ask again from the first row not shown.
+            pic_epoch = epoch
+            pic_asked = false
+            pic_counted = false
+            pic_in_msg = false
+            tx_n = 0
+            tx_pos = 0
+        }
+        pic_receive()
+        pic_pump()
+    }
+}
+
+let photos = net(net_websocket, 4, 256, fn() { on_pictures() })
+
+// A tap asks for the next picture; the new one paints over the last. The rest of the block
+// being read belongs to the last picture, so it is read and dropped.
+fn pic_tap() {
+    let down = touch_down() != 0
+    if down && !tapped && pic_count > 0 {
+        pic_index = (pic_index + 1) % pic_count
+        pic_row = 0
+        pic_take = false
+        pic_asked = false
+        pic_pump()
+    }
+    tapped = down
+}
+
+fn enter_pictures() {
+    pic_epoch = net_epoch(0)
+    pic_asked = false
+    pic_counted = false
+    pic_row = 0
+    pic_in_msg = false
+    tx_n = 0
+    tx_pos = 0
+    tapped = true
+    net_open(0)
+}
+
+// ---- Text. Talk shows what the server heard above the bar and its reply below it, in cells of
+// the glyph atlas: 22 columns of 16 x 28 pixels, five lines above the bar and six below. Text
+// comes as UTF-8. Latin-1 characters draw their glyph; anything else draws one box. A line wraps
+// before the word that runs over it, and a full region scrolls up one line. A cell is drawn again
+// only when its character changes.
+let glyphs = glyph_atlas(16, 28)
+let cells = bytes(22 * 11)
+let cell_dirty = bytes(22 * 11)
+var next_cell: i32 = 0
+// Each region's cursor (0 heard, 1 reply): its line from the region's first, and its column.
+let text_line = bytes(2)
+let text_col = bytes(2)
+// The text line coming down: 0 not known yet, 1 heard, 2 say, 3 another verb; the next byte of
+// words to show; a UTF-8 sequence's bytes still to come and its code so far.
+var text_to: i32 = 0
+var text_at: i32 = 0
+var u8_need: i32 = 0
+var u8_code: i32 = 0
+
+fn cell_put(at: i32, c: i32) {
+    if at >= 0 && at < 242 && cells[at] != c {
+        cells[at] = c
+        cell_dirty[at] = 1
+    }
+}
+
+// Blanks `lines` lines from line `first`.
+fn text_clear(first: i32, lines: i32) {
+    for k in 0..132 {
+        if k < lines * 22 { cell_put(first * 22 + k, 32) }
+    }
+}
+
+// Region `r` empty, its cursor at its start.
+fn text_reset(r: i32) {
+    if r == 0 { text_clear(0, 5) } else { text_clear(5, 6) }
+    text_line[r] = 0
+    text_col[r] = 0
+}
+
+// Every line of `lines` from `first` moves up one; the last is blank.
+fn text_scroll(first: i32, lines: i32) {
+    for k in 0..110 {
+        if k < (lines - 1) * 22 { cell_put(first * 22 + k, cells[first * 22 + k + 22]) }
+    }
+    text_clear(first + lines - 1, 1)
+}
+
+// Region `r`'s cursor to the start of its next line, scrolling at the last.
+fn text_newline(r: i32) {
+    let lines: i32 = if r == 0 { 5 } else { 6 }
+    if text_line[r] >= lines - 1 {
+        if r == 0 { text_scroll(0, 5) } else { text_scroll(5, 6) }
+    } else {
+        text_line[r] = text_line[r] + 1
+    }
+    text_col[r] = 0
+}
+
+// Character `c` at region `r`'s cursor. At a full line, a space only ends it, and the word that
+// runs over moves whole to the next line when a space comes before it.
+fn text_put(r: i32, c: i32) {
+    let first: i32 = if r == 0 { 0 } else { 5 }
+    let lines: i32 = if r == 0 { 5 } else { 6 }
+    var line: i32 = text_line[r]
+    var col: i32 = text_col[r]
+    var keep = true
+    if col >= 22 {
+        var from: i32 = 22
+        var found = c == 32
+        for k in 0..21 {
+            let at = 21 - k
+            if !found && cells[(first + line) * 22 + at] == 32 {
+                from = at + 1
+                found = true
+            }
+        }
+        if line >= lines - 1 {
+            text_scroll(first, lines)
+            line = lines - 2
+        }
+        line += 1
+        col = 0
+        for k in 0..21 {
+            if from + k < 22 {
+                let old = (first + line - 1) * 22 + from + k
+                cell_put((first + line) * 22 + k, cells[old])
+                cell_put(old, 32)
+                col += 1
+            }
+        }
+        keep = c != 32
+    }
+    if keep {
+        cell_put((first + line) * 22 + col, c)
+        col += 1
+    }
+    text_line[r] = line
+    text_col[r] = col
+}
+
+// One byte of UTF-8 text for region `r`: a character in the atlas (32..126, 160..255) draws its
+// glyph; a control character, a sequence beyond Latin-1, or a broken one draws the box (127).
+fn text_byte(r: i32, b: i32) {
+    if u8_need > 0 && b >= 128 && b < 192 {
+        u8_code = u8_code * 64 + (b - 128)
+        u8_need -= 1
+        if u8_need == 0 {
+            let c: i32 = if u8_code >= 160 && u8_code < 256 { u8_code } else { 127 }
+            text_put(r, c)
+        }
+    } else {
+        if u8_need > 0 {
+            u8_need = 0
+            text_put(r, 127)
+        }
+        if b < 128 {
+            let c: i32 = if b >= 32 && b < 127 { b } else { 127 }
+            text_put(r, c)
+        } else if b >= 194 && b < 224 {
+            u8_need = 1
+            u8_code = b - 192
+        } else if b >= 224 && b < 240 {
+            u8_need = 2
+            u8_code = b - 224
+        } else if b >= 240 && b < 245 {
+            u8_need = 3
+            u8_code = b - 240
+        } else {
+            text_put(r, 127)
+        }
+    }
+}
+
+// A text line's end: an unfinished sequence draws the box.
+fn text_done(r: i32) {
+    if u8_need > 0 {
+        u8_need = 0
+        text_put(r, 127)
+    }
+}
+
+// Shows the new bytes of a `heard` or `say` line as they come, so a line of any length shows
+// whole: words keeps the verb, and its rest is reused once full. `heard` starts its region afresh.
+fn text_take() {
+    if text_to == 0 {
+        if words_n > 5 && words[5] == 32 && verb_is(104, 101, 97, 5) {
+            text_to = 1
+            text_at = 6
+            text_reset(0)
+        } else if words_n > 3 && words[3] == 32 && verb_is(115, 97, 121, 3) {
+            text_to = 2
+            text_at = 4
+        } else if words_n > 5 {
+            text_to = 3
+        }
+    }
+    if text_to == 1 || text_to == 2 {
+        for k in 0..256 {
+            if text_at < words_n { text_byte(text_to - 1, words[text_at]) }
+            text_at += 1
+        }
+        if words_n == 256 {
+            let verb_end: i32 = if text_to == 1 { 6 } else { 4 }
+            words_n = verb_end
+        }
+        text_at = words_n
+    }
+}
+
+// Draws up to 48 changed cells from where the last call stopped: about 9 ms of the panel's SPI,
+// so the text regions fill in six calls.
+fn draw_text() {
+    let first = next_cell
+    var drawn: i32 = 0
+    for k in 0..242 {
+        var at: i32 = first + k
+        if at >= 242 { at = at - 242 }
+        if drawn < 48 && cell_dirty[at] != 0 {
+            let c: i32 = cells[at] - 32
+            let line = at / 22
+            let y: i32 = if line < 5 { 8 + line * 28 } else { 272 + (line - 5) * 28 }
+            present(screen, glyphs, c % 16 * 16, c / 16 * 28, 16, 28, 8 + (at - line * 22) * 16, y)
+            cell_dirty[at] = 0
+            drawn += 1
+            next_cell = if at == 241 { 0 } else { at + 1 }
+        }
+    }
+}
+
+// The page is black: every cell blank, none to draw.
+fn text_blank() {
+    for k in 0..242 {
+        cells[k] = 32
+        cell_dirty[k] = 0
+    }
+    text_line[0] = 0
+    text_col[0] = 0
+    text_line[1] = 0
+    text_col[1] = 0
+    next_cell = 0
+}
+
+// ---- Talk. A take goes to the voice server on connection 1, which is the project's setting: the
+// user's own hub, or the bench's fake. The answer comes back as speech. One WebSocket carries text
+// lines and binary blocks. A block has an 8-byte header ('M' up, 'A' down, 0, the turn u16, the
+// offset in samples u32, little-endian), then PCM16 LE at 16 kHz.
+// - A take goes up once it ends: `take <turn>`, its blocks, `end <turn> <samples>`.
+// - A binary block of the current turn is speech, whatever its first byte, so a server that
+//   echoes plays the take back.
+// - Speech plays through a one-second ring. While the ring is full, the program leaves the
+//   server's blocks unread, which holds the server back.
+// - A loss before speech sends the take again under a new turn. A loss during speech ends the
+//   turn. A take while a turn is still open cancels that turn.
+let talk_rate: i32 = 16000
+let hdr = bytes(8)
+let speech = samples(16000)
+var turn: i32 = 0
+// 0 nothing to send, 1 the take is going up, 2 the take is up and no speech has come yet.
+var asking: i32 = 0
+var open_turn = false
+var told_take = false
+var sent: i32 = 0
+var cancel_turn: i32 = -1
+var greeted = false
+var talk_epoch: i32 = 0
+// The message coming down: its kind, the bytes read so far, and the turn its speech is for
+// (-1: read and dropped). A sample split across two reads waits in odd_byte.
+var in_msg = false
+var in_kind: i32 = 0
+var in_pos: i32 = 0
+var in_turn: i32 = -1
+var odd_byte: i32 = -1
+// Speech samples written to the ring and played from it, this turn.
+var sp_w: i32 = 0
+var sp_r: i32 = 0
+var speaking = false
+var dot_state: i32 = -1
+// What came down: the last status (0 ready, 1 waiting, 2 hearing, 3 thinking, 4 speaking,
+// 5 idle), and counts.
+var status_word: i32 = -1
+var heard_texts: i32 = 0
+var said: i32 = 0
+var answered: i32 = 0
+var failed: i32 = 0
+var skipped: i32 = 0
+var lost: i32 = 0
+var repeated: i32 = 0
+
+// "hello 1 16000"
+fn tx_hello() {
+    tx[0] = 104
+    tx[1] = 101
+    tx[2] = 108
+    tx[3] = 108
+    tx[4] = 111
+    tx[5] = 32
+    tx[6] = 49
+    tx[7] = 32
+    tx_n = tx_number(8, talk_rate)
+}
+
+// "take <turn>"
+fn tx_take() {
+    tx[0] = 116
+    tx[1] = 97
+    tx[2] = 107
+    tx[3] = 101
+    tx[4] = 32
+    tx_n = tx_number(5, turn)
+}
+
+// "end <turn> <samples>"
+fn tx_end() {
+    tx[0] = 101
+    tx[1] = 110
+    tx[2] = 100
+    tx[3] = 32
+    let at = tx_number(4, turn)
+    tx[at] = 32
+    tx_n = tx_number(at + 1, taken)
+}
+
+// "cancel <turn>"
+fn tx_cancel(dropped: i32) {
+    tx[0] = 99
+    tx[1] = 97
+    tx[2] = 110
+    tx[3] = 99
+    tx[4] = 101
+    tx[5] = 108
+    tx[6] = 32
+    tx_n = tx_number(7, dropped)
+}
+
+// The take's next block: up to 320 samples from `sent`.
+fn tx_take_block() {
+    var n: i32 = taken - sent
+    if n > 320 { n = 320 }
+    tx[0] = 77
+    tx[1] = 0
+    tx[2] = turn & 255
+    tx[3] = turn >> 8
+    tx[4] = sent & 255
+    tx[5] = (sent >> 8) & 255
+    tx[6] = (sent >> 16) & 255
+    tx[7] = (sent >> 24) & 255
+    for i in 0..320 {
+        if i < n {
+            let s: i32 = take[sent + i]
+            tx[8 + 2 * i] = s & 255
+            tx[9 + 2 * i] = (s >> 8) & 255
+        }
+    }
+    tx_n = 8 + 2 * n
+    sent += n
+}
+
+// The next message due into tx; false when nothing is.
+fn compose() -> bool {
+    tx_pos = 0
+    tx_flags = 0
+    if !greeted {
+        tx_hello()
+        greeted = true
+        return true
+    }
+    if cancel_turn >= 0 {
+        tx_cancel(cancel_turn)
+        cancel_turn = -1
+        return true
+    }
+    if asking == 1 {
+        if !told_take {
+            tx_take()
+            told_take = true
+            return true
+        }
+        if sent < taken {
+            tx_take_block()
+            tx_flags = net_binary
+            return true
+        }
+        tx_end()
+        asking = 2
+        return true
+    }
+    tx_n = 0
+    return false
+}
+
+// Sends what is due until the connection takes no more.
+fn pump() {
+    for k in 0..64 {
+        if net_state(1) != net_ready { break }
+        if tx_pos < tx_n {
+            tx_pos += net_send(1, tx, tx_pos, tx_n - tx_pos, tx_flags)
+            if tx_pos < tx_n { break }
+        }
+        if !compose() { break }
+    }
+}
+
+fn on_text() {
+    if verb_is(115, 116, 97, 6) && words_n > 7 {
+        // status: ready, waiting, hearing, thinking, speaking, idle, by the first letter
+        let w: i32 = words[7]
+        status_word = -1
+        if w == 114 { status_word = 0 }
+        if w == 119 { status_word = 1 }
+        if w == 104 { status_word = 2 }
+        if w == 116 { status_word = 3 }
+        if w == 115 { status_word = 4 }
+        if w == 105 { status_word = 5 }
+    } else if verb_is(104, 101, 97, 5) {
+        heard_texts += 1
+    } else if verb_is(115, 97, 121, 3) {
+        said += 1
+    } else if verb_is(100, 111, 110, 4) || verb_is(101, 114, 114, 5) {
+        // done or error: the turn is over (speech already queued still plays)
+        let first: i32 = words[0]
+        let at: i32 = if first == 100 { 5 } else { 6 }
+        if words_number(at) == turn {
+            if first == 100 { answered += 1 } else { failed += 1 }
+            // An error shows why below the bar, on a line of its own.
+            if first == 101 {
+                if text_col[1] > 0 { text_newline(1) }
+                for k in 0..256 {
+                    if parsed_to + 1 + k < words_n { text_byte(1, words[parsed_to + 1 + k]) }
+                }
+                text_done(1)
+            }
+            open_turn = false
+            if asking == 2 { asking = 0 }
+        }
+    } else {
+        skipped += 1
+    }
+}
+
+// The turn a block's speech is for, from its header: -1 drops it (another turn's, or a repeat).
+fn speech_turn() -> i32 {
+    var kept: i32 = -1
+    let magic: i32 = hdr[0]
+    let t: i32 = hdr[2] + hdr[3] * 256
+    let at: i32 = hdr[4] + hdr[5] * 256 + hdr[6] * 65536 + hdr[7] * 16777216
+    if (magic != 65 && magic != 77) || hdr[1] != 0 {
+        skipped += 1
+    } else if t == turn {
+        if at < sp_w {
+            repeated += 1
+        } else {
+            if at > sp_w { lost += 1 }
+            odd_byte = -1
+            kept = t
+        }
+    }
+    return kept
+}
+
+// A block's PCM16 LE bytes into the speech ring.
+fn to_ring(n: i32) {
+    if in_turn == turn {
+        for i in 0..1512 {
+            if i < n {
+                let b: i32 = rx[i]
+                if odd_byte < 0 {
+                    odd_byte = b
+                } else {
+                    var v: i32 = odd_byte + b * 256
+                    if v >= 32768 { v = v - 65536 }
+                    speech[sp_w % 16000] = v
+                    sp_w += 1
+                    odd_byte = -1
+                }
+            }
+        }
+        if asking == 2 { asking = 0 }
+    }
+}
+
+// Reads what has come down, as far as the speech ring has room. A message is read in parts as
+// it arrives; a read that takes all of net_left ends it.
+fn receive() {
+    for k in 0..32 {
+        let left = net_left(1)
+        if left == 0 { break }
+        if !in_msg {
+            in_msg = true
+            in_kind = net_kind(1)
+            in_pos = 0
+            in_turn = -1
+            words_n = 0
+            text_to = 0
+        }
+        var n: i32 = 0
+        if in_kind == 0 {
+            // A text line keeps its first 256 bytes; the rest of a longer one is read and dropped,
+            // except heard and say text, which goes on to the glass as it comes (text_take).
+            if words_n < 256 {
+                n = net_recv(1, words, words_n, 256 - words_n)
+                words_n += n
+                text_take()
+            } else {
+                n = net_recv(1, rx, 0, 1512)
+            }
+        } else if in_pos < 8 {
+            n = net_recv(1, hdr, in_pos, 8 - in_pos)
+            if in_pos + n == 8 { in_turn = speech_turn() }
+        } else if in_turn != turn {
+            n = net_recv(1, rx, 0, 1512)
+        } else {
+            var room: i32 = (16000 - (sp_w - sp_r)) * 2 - 1
+            if room > 1512 { room = 1512 }
+            if room <= 0 { break }
+            n = net_recv(1, rx, 0, room)
+            to_ring(n)
+        }
+        in_pos += n
+        if n == left {
+            in_msg = false
+            if in_kind == 0 {
+                if text_to == 1 || text_to == 2 { text_done(text_to - 1) }
+                on_text()
+            }
+        } else if n == 0 {
+            break
+        }
+    }
+}
+
+// Queue as much speech as the speaker has room for, in at most two runs around the ring.
+fn feed_speech() {
+    for k in 0..2 {
+        let avail = sp_w - sp_r
+        let room = speaker_free()
+        var n: i32 = if avail < room { avail } else { room }
+        let at = sp_r % 16000
+        if n > 16000 - at { n = 16000 - at }
+        if n > 0 { sp_r += play(speech, at, n) }
+    }
+}
+
+fn stop_speech() {
+    if speaking {
+        speaking = false
+        speaker_on(0)
+    }
+    sp_r = sp_w
+}
+
+// Speech starts once 200 ms of it is in the ring, or all of it when the turn has ended, and stops
+// when the speaker has clocked out everything that came. Speech that comes while the take is still
+// going up (a server that echoes) waits for a full ring: the take's blocks hold back the returned
+// slots, so the speech comes slower than it plays until the take is up.
+fn speak() {
+    let ahead = sp_w - sp_r
+    var due = ahead >= 3200 || (!open_turn && ahead > 0)
+    if asking == 1 { due = ahead >= 16000 - 1600 }
+    if speaking {
+        feed_speech()
+        if sp_r == sp_w && speaker_queued() == 0 {
+            speaking = false
+            speaker_on(0)
+        }
+    } else if due {
+        speaking = true
+        feed_speech()
+        speaker_on(1)
+    }
+}
+
+// The connection ended and its queues are gone: hello again; a take that got no speech goes up
+// again under a new turn; speech that was playing ends the turn.
+fn talk_lost() {
+    greeted = false
+    tx_n = 0
+    tx_pos = 0
+    cancel_turn = -1
+    in_msg = false
+    if sp_w > 0 {
+        stop_speech()
+        open_turn = false
+        asking = 0
+    } else if asking != 0 {
+        turn = (turn + 1) & 65535
+        asking = 1
+        told_take = false
+        sent = 0
+    }
+}
+
+fn on_talk() {
+    if shown == 2 {
+        let epoch = net_epoch(1)
+        if epoch != talk_epoch {
+            talk_epoch = epoch
+            talk_lost()
+        }
+        receive()
+        pump()
+        speak()
+    }
+}
+
+let talk = net(net_websocket, 4, 4096, fn() { on_talk() })
+
+// A take has ended on the Talk page: it goes up as a new turn (the mic handler's on_talk sends
+// it), and an open turn is cancelled.
+fn ask() {
+    if open_turn && told_take { cancel_turn = turn }
+    turn = (turn + 1) & 65535
+    open_turn = true
+    asking = 1
+    told_take = false
+    sent = 0
+    stop_speech()
+    sp_w = 0
+    sp_r = 0
+    text_reset(0)
+    text_reset(1)
+}
+
+fn enter_talk() {
+    text_blank()
+    dot_state = -1
+    talk_epoch = net_epoch(1)
+    net_open(1)
+}
+
+fn leave_talk() {
+    net_close(1)
+    stop_speech()
+    sp_w = 0
+    sp_r = 0
+    asking = 0
+    open_turn = false
+    greeted = false
+    tx_n = 0
+    tx_pos = 0
+    cancel_turn = -1
+    in_msg = false
+}
+
+// The Talk page's dot (the connection: green ready, amber connecting, grey offline) and its bar
+// while a turn is busy: amber while the take goes up and the answer is awaited, green while it
+// speaks. False when the bar is free to show the mic level.
+fn talk_meter() -> bool {
+    let state = net_state(1)
+    if state != dot_state {
+        dot_state = state
+        var ink: i32 = rgb(96, 96, 104)
+        if state == net_ready { ink = rgb(72, 200, 112) }
+        if state == net_connecting { ink = rgb(232, 176, 64) }
+        fill_rect(screen, meter_x, meter_y - 32, 16, 16, ink)
+    }
+    if speaking {
+        draw_meter(meter_w, rgb(72, 200, 112))
+        return true
+    }
+    if asking == 1 {
+        draw_meter(sent * meter_w / taken, rgb(232, 176, 64))
+        return true
+    }
+    if asking == 2 {
+        draw_meter(meter_w, rgb(232, 176, 64))
+        return true
+    }
+    return false
+}
+
+// Queue as much of the take as the speaker has room for.
+fn feed_take() {
+    if playing {
+        let left = taken - played
+        let room = speaker_free()
+        let n = if left < room { left } else { room }
+        played += play(take, played, n)
+    }
+}
+
+fn feed() {
+    if shown == 1 { feed_take() }
+    if shown == 2 && speaking { feed_speech() }
+}
+
+let out = speaker(16000, 40, fn() { feed() })
+
+let input_audio = mic(16000, 640, fn() {
+    if shown == 1 || shown == 2 {
+        var heard: i32 = 0
+        while mic_ready() >= 320 {
+            record(chunk, 0, 320)
+            heard = level()
+            follow_floor(heard)
+            let voiced = heard >= threshold
+            if taking {
+                let room = len(take) - taken
+                let n = if room < 320 { room } else { 320 }
+                copy(take, taken, chunk, 0, n)
+                taken += n
+                if voiced { quiet = 0 } else { quiet += 1 }
+                if quiet >= quiet_blocks || taken == len(take) {
+                    taking = false
+                    takes += 1
+                    if shown == 2 {
+                        ask()
+                    } else {
+                        played = 0
+                        playing = true
+                        feed()
+                        speaker_on(1)
+                    }
+                }
+            } else if !playing && !speaking && asking != 1 {
+                if loud > 0 || voiced { onset += 1 }
+                if voiced {
+                    loud += 1
+                    hang = 0
+                } else if loud > 0 {
+                    hang += 1
+                    if hang > hang_blocks { attack_reset() }
+                }
+                if loud >= attack_blocks {
+                    // Back to the start of the first voice block, then the pre-roll before it.
+                    rewound = mic_rewind((onset + pre_roll_blocks) * 320)
+                    attack_reset()
+                    quiet = 0
+                    taken = 0
+                    taking = true
+                }
+            }
+        }
+        // The handler runs every 20 ms, so it also notices when the playback has clocked out.
+        if playing && played == taken && speaker_queued() == 0 {
+            playing = false
+            speaker_on(0)
+        }
+        // On the Talk page it also reads, sends and speaks.
+        on_talk()
+        if meter_shown {
+            var busy = false
+            if playing {
+                draw_meter(played * meter_w / taken, rgb(72, 200, 112))
+                busy = true
+            }
+            if shown == 2 { busy = talk_meter() }
+            if !busy {
+                let full = threshold * 4
+                let bar = if heard >= full { meter_w } else { heard * meter_w / full }
+                draw_meter(bar, if taking { rgb(232, 72, 64) } else { rgb(96, 120, 160) })
+            }
+        }
+    }
+})
+
+// Read what the mic holds, so a take ends without losing samples and a page shown later starts
+// from what it hears then.
+fn catch_up() {
+    while mic_ready() > 0 {
+        record(chunk, 0, 320)
+    }
+}
+
+// ---- Pages. A page shown after power-on paints over the last one in steps (`draw_rows`).
+fn show_page() {
+    repaint()
+    if shown == 0 {
+        start(step)
+    } else if shown == 3 {
+        pic_open = false
+    } else {
+        meter_shown = false
+        attack_reset()
+        floor_reset()
+        catch_up()
+        if shown == 2 { enter_talk() }
+    }
+}
+
+// The Voice Toy's tick and bar, on a black page. The panel takes only windows that start and end
+// on even pixels, so the tick is two pixels wide, just left of the threshold.
+fn show_meter() {
+    fill_rect(screen, meter_x + meter_w / 4 - 2, meter_y + meter_h + 6, 2, 10, rgb(200, 200, 200))
+    meter_colour = 0
+    meter_fill = 0
+    draw_meter(0, rgb(96, 120, 160))
+    meter_shown = true
+}
+
+fn leave_page() {
+    if shown == 0 {
+        stop(step)
+    } else if shown == 3 {
+        net_close(0)
+        tx_n = 0
+        tx_pos = 0
+    } else {
+        taking = false
+        if playing {
+            playing = false
+            speaker_on(0)
+        }
+        if shown == 2 { leave_talk() }
+        catch_up()
+    }
+}
+
+// BOOT is GPIO0 with the board's pull-up (handheld.ckt.splash), low while pressed. Sampled every
+// 20 ms, longer than the switch bounces, each press steps one page. A press needs a release
+// first, so BOOT still held from power-on turns nothing.
+let boot = input(0, pull_none)
+var boot_held = true
+
+let buttons = every(ms(20), fn() {
+    let pressed = read(boot) == low
+    if pressed && !boot_held {
+        leave_page()
+        shown = (shown + 1) % pages
+        show_page()
+    }
+    boot_held = pressed
+    if (shown == 1 || shown == 2) && !meter_shown {
+        if !draw_rows() { show_meter() }
+    } else if shown == 2 {
+        draw_text()
+    }
+    // Pictures opens its connection once the page is black, so no picture row is painted over.
+    if shown == 3 {
+        if pic_open {
+            on_pictures()
+            pic_tap()
+        } else if !draw_rows() {
+            pic_open = true
+            enter_pictures()
+        }
+    }
+})
+
+fn setup() {
+    shown = if page >= 0 && page < pages { page } else { 0 }
+    floor_reset()
+    // A small triangular heap suspended near the top: visible immediately, with room to fall even
+    // before the person tilts the board or touches the glass.
+    for row in 0..9 {
+        for col in 0..17 {
+            if col >= 8 - row && col <= 8 + row {
+                put_grain(38 + col, 16 + row, 1 + (row + col) % 3)
+            }
+        }
+    }
+    fill_rect(screen, 0, 0, 368, 448, rgb(0, 0, 0))
+    if shown == 0 {
+        draw_rows()
+    } else if shown == 3 {
+        pic_open = true
+        enter_pictures()
+    } else {
+        show_meter()
+    }
+    if shown == 2 { enter_talk() }
+    // `step` and `buttons` keep their grids from the end of device init unless restarted, and this
+    // setup is long: the clear above (about 60 ms on the S3) runs before they can, so they would
+    // report their first periods as missed. They begin once setup is done.
+    stop(step)
+    stop(buttons)
+}
+
+// A late one-shot misses nothing: it runs as soon as setup returns and starts the grids there.
+let begin = after(ms(1), fn() {
+    if shown == 0 { start(step) }
+    start(buttons)
+})

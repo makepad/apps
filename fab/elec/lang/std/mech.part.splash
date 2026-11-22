@@ -1,0 +1,168 @@
+let __mech_e = mod.elec
+let __mech_f = mod.elec.f
+
+let __mech_positive = fn(v) {
+    return v.is_number() && v > 0mm && v - v == 0mm
+}
+
+let __mech_body = fn(d) {
+    return [[-d / 2, -d / 2], [d / 2, d / 2]]
+}
+
+// One surface test point; o.d is the land diameter (default 1.0 mm).
+// A bare copper land has no body above the board and no case port.
+let testpoint = fn(o) {
+    let e = __mech_e
+    let f = __mech_f
+    if !o.is_object() {
+        return f.error("testpoint: o must be an options object")
+    }
+    let d = o.d ?? 1.0mm
+    if !__mech_positive(d) {
+        return f.error("testpoint: d must be a positive finite diameter")
+    }
+    let name = "TP_" + f.mm(d) + "mm"
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    return e.define(name, {
+        kind: @connector
+        symbol: f.ic_symbol(name, {left: [["1", @passive]]})
+        footprint: f.footprint({
+            pads: [f.smd("1", [0mm, 0mm], [d, d], {shape: @circle})]
+            body: __mech_body(d)
+            mount: @smd
+            text: 1mm
+            graphics: []
+        })
+        pads: [["1", "1"]]
+        prefix: "TP"
+    })
+}
+
+// One plated test point; o.drill (default 1.0 mm) and o.d land diameter
+// (default drill + 0.6 mm); all lengths in mm.
+// This is a bare plated hole, without a fitted post: no above-board body or port.
+let testpoint_thru = fn(o) {
+    let e = __mech_e
+    let f = __mech_f
+    if !o.is_object() {
+        return f.error("testpoint_thru: o must be an options object")
+    }
+    let drill = o.drill ?? 1.0mm
+    if !__mech_positive(drill) {
+        return f.error("testpoint_thru: drill must be a positive finite diameter")
+    }
+    let d = o.d ?? (drill + 0.6mm)
+    if !__mech_positive(d) || d <= drill {
+        return f.error("testpoint_thru: d must be a positive finite diameter greater than drill")
+    }
+    let name = "TP_TH_" + f.mm(d) + "mm"
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    return e.define(name, {
+        kind: @connector
+        symbol: f.ic_symbol(name, {left: [["1", @passive]]})
+        footprint: f.footprint({
+            pads: [f.thru("1", [0mm, 0mm], d, drill, {square: false})]
+            body: __mech_body(d)
+            mount: @thru
+            text: 1mm
+            graphics: []
+        })
+        pads: [["1", "1"]]
+        prefix: "TP"
+    })
+}
+
+// One copper fiducial without pins; o.d (default 1.0 mm) and o.clear,
+// the mask opening diameter and body width (default 3 * d); all lengths in mm.
+// The mark lies on the board: no above-board body or case port.
+let fiducial = fn(o) {
+    let e = __mech_e
+    let f = __mech_f
+    if !o.is_object() {
+        return f.error("fiducial: o must be an options object")
+    }
+    let d = o.d ?? 1.0mm
+    if !__mech_positive(d) {
+        return f.error("fiducial: d must be a positive finite diameter")
+    }
+    let clear = o.clear ?? (3 * d)
+    if !__mech_positive(clear) || clear < d {
+        return f.error("fiducial: clear must be a positive finite length at least d")
+    }
+    let name = "Fiducial_" + f.mm(d) + "mm"
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    return e.define(name, {
+        kind: @fiducial
+        symbol: f.ic_symbol(name, {})
+        footprint: f.footprint({
+            pads: [f.smd("", [0mm, 0mm], [d, d], {shape: @circle mask: (clear - d) / 2})]
+            body: __mech_body(clear)
+            mount: @smd
+            text: 1mm
+            graphics: []
+        })
+        pads: {}
+        prefix: "FID"
+    })
+}
+
+// One mounting hole; o.drill is required, o.plated defaults to false,
+// o.pad is the plated land diameter (default drill + 2.4 mm); lengths in mm.
+// Neither plating nor a drill adds a fitted fastener: no above-board body or port.
+let mounting_hole = fn(o) {
+    let e = __mech_e
+    let f = __mech_f
+    if !o.is_object() {
+        return f.error("mounting_hole: o must be an options object")
+    }
+    let drill = o.drill ?? nil
+    if !__mech_positive(drill) {
+        return f.error("mounting_hole: drill must be a positive finite diameter")
+    }
+    let plated = o.plated ?? false
+    if !plated.is_bool() {
+        return f.error("mounting_hole: plated must be true or false")
+    }
+    let pad = if plated { o.pad ?? (drill + 2.4mm) } else { drill }
+    if !__mech_positive(pad) || (plated && pad <= drill) {
+        return f.error("mounting_hole: pad must be a positive finite diameter greater than drill when plated")
+    }
+    let suffix = if plated { "_Pad" } else { "" }
+    let name = "MountingHole_" + f.mm(drill) + "mm" + suffix
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    let sides = if plated { {left: [["1", @passive]]} } else { {} }
+    let no = if plated { "1" } else { "" }
+    let pad_map = if plated { [["1", "1"]] } else { {} }
+    return e.define(name, {
+        kind: @mounting
+        symbol: f.ic_symbol(name, sides)
+        footprint: f.footprint({
+            pads: [f.thru(no, [0mm, 0mm], pad, drill, {square: false plated: plated})]
+            body: __mech_body(pad)
+            mount: @thru
+            text: 1mm
+            graphics: []
+        })
+        pads: pad_map
+        prefix: "H"
+    })
+}
+
+// Unplated mounting hole with a 2.2 mm drill; no parameters.
+let m2_hole = fn() {
+    return mounting_hole({drill: 2.2mm plated: false})
+}
+
+// Unplated mounting hole with a 2.7 mm drill; no parameters.
+let m25_hole = fn() {
+    return mounting_hole({drill: 2.7mm plated: false})
+}
+
+// Unplated mounting hole with a 3.2 mm drill; no parameters.
+let m3_hole = fn() {
+    return mounting_hole({drill: 3.2mm plated: false})
+}

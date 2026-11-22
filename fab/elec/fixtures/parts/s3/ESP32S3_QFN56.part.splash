@@ -1,0 +1,87 @@
+// MCU, QFN56 with ground pad 57. Series datasheet v2.2, Tables 2-1 and 2-4:
+// GPIO names below are the GPIO-matrix functions of the numbered package terminals.
+// GPIO22..25 do not exist. Package aliases: GPIO15/16 = XTAL_32K_P/N;
+// GPIO26..32 = SPICS1/SPIHD/SPIWP/SPICS0/SPICLK/SPIQ/SPID;
+// GPIO47/48 = SPICLK_P/N; GPIO39..42 = MTCK/MTDO/MTDI/MTMS;
+// GPIO43/44 = U0TXD/U0RXD. XTAL_P/N are the separate main crystal terminals.
+let e = mod.elec
+let f = e.f
+
+// Section 7, Figure 7-1, p.77: nominal body 7.000 (6.950..7.050) mm,
+// pitch 0.400 BSC, terminal width 0.200 (0.150..0.250), length 0.400
+// (0.350..0.450), exposed pad 4.000 (3.950..4.050) square, height 0.850
+// (0.800..0.900). A1 is 0..0.050 and A3 is 0.203 reference, all in mm.
+// Lands are the nominal terminals themselves, outer ends at the body edge;
+// the separate recommended land-pattern download is not pinned. S4d-2 may refine them.
+// Top view, pin 1 at upper left, anticlockwise with 14 terminals per side.
+// The package's bottom-view pin-1 ID is a C0.50 chamfer on the exposed pad;
+// the ground land remains a full 4 x 4 square. Silk marks the same corner.
+let pads = for i in 0..56 {
+    let k = i % 14
+    let at = if i < 14 {
+        [-3.3mm, (6.5 - k) * 0.4mm]
+    } elif i < 28 {
+        [(k - 6.5) * 0.4mm, -3.3mm]
+    } elif i < 42 {
+        [3.3mm, (k - 6.5) * 0.4mm]
+    } else {
+        [(6.5 - k) * 0.4mm, 3.3mm]
+    }
+    let size = if i < 14 || (i >= 28 && i < 42) { [0.4mm, 0.2mm] } else { [0.2mm, 0.4mm] }
+    f.smd(f.int(i + 1), at, size, {shape: @rect})
+}
+pads.push(f.smd("57", [0mm, 0mm], [4mm, 4mm], {shape: @rect}))
+
+e.define("mcu", {
+    kind: @mcu
+    // Table 2-4: the GPIOs used here (4..7, 11, 12, 14, 15, 21) use the RTC rail.
+    fields: {model: "ESP32-S3" supply: "VDD3P3_RTC"}
+    symbol: f.ic_symbol("mcu", {
+        left: [["VDD3P3" @power_in] ["VDD3P3_RTC" @power_in] ["VDD3P3_CPU" @power_in]
+               ["VDD_SPI" @power_in] ["VDDA" @power_in] ["CHIP_PU" @in]
+               ["LNA_IN" @passive] ["XTAL_P" @passive] ["XTAL_N" @passive]]
+        right: [["GPIO0" @bidi] ["GPIO1" @bidi] ["GPIO2" @bidi] ["GPIO3" @bidi]
+                ["GPIO4" @bidi] ["GPIO5" @bidi] ["GPIO6" @bidi] ["GPIO7" @bidi]
+                ["GPIO8" @bidi] ["GPIO9" @bidi] ["GPIO10" @bidi] ["GPIO11" @bidi]
+                ["GPIO12" @bidi] ["GPIO13" @bidi] ["GPIO14" @bidi] ["GPIO15" @bidi]
+                ["GPIO16" @bidi] ["GPIO17" @bidi] ["GPIO18" @bidi] ["GPIO19" @bidi]
+                ["GPIO20" @bidi] ["GPIO21" @bidi]]
+        top: [["GPIO26" @bidi] ["GPIO27" @bidi] ["GPIO28" @bidi] ["GPIO29" @bidi]
+              ["GPIO30" @bidi] ["GPIO31" @bidi] ["GPIO32" @bidi] ["GPIO33" @bidi]
+              ["GPIO34" @bidi] ["GPIO35" @bidi] ["GPIO36" @bidi] ["GPIO37" @bidi]
+              ["GPIO38" @bidi] ["GPIO39" @bidi] ["GPIO40" @bidi] ["GPIO41" @bidi]
+              ["GPIO42" @bidi] ["GPIO43" @bidi] ["GPIO44" @bidi] ["GPIO45" @bidi]
+              ["GPIO46" @bidi] ["GPIO47" @bidi] ["GPIO48" @bidi]]
+        bottom: [["GND" @power_in]]
+    })
+    footprint: f.footprint({
+        pads: pads body: [[-3.5mm, -3.5mm], [3.5mm, 3.5mm]] mount: @smd text: 1mm
+        graphics: [f.dot("F.SilkS", [-3.8mm, 3.8mm], 0.15mm)]
+    })
+    body: {height: 0.85mm package: @qfn}
+    // Tables 2-1 and 2-4: pin numbers, with duplicate supply terminals grouped.
+    pads: {
+        LNA_IN: 1 VDD3P3: [2, 3] CHIP_PU: 4
+        GPIO0: 5 GPIO1: 6 GPIO2: 7 GPIO3: 8 GPIO4: 9 GPIO5: 10 GPIO6: 11 GPIO7: 12
+        GPIO8: 13 GPIO9: 14 GPIO10: 15 GPIO11: 16 GPIO12: 17 GPIO13: 18 GPIO14: 19
+        VDD3P3_RTC: 20 GPIO15: 21 GPIO16: 22 GPIO17: 23 GPIO18: 24 GPIO19: 25 GPIO20: 26
+        GPIO21: 27 GPIO26: 28 VDD_SPI: 29 GPIO27: 30 GPIO28: 31 GPIO29: 32 GPIO30: 33
+        GPIO31: 34 GPIO32: 35 GPIO48: 36 GPIO47: 37 GPIO33: 38 GPIO34: 39 GPIO35: 40
+        GPIO36: 41 GPIO37: 42 GPIO38: 43 GPIO39: 44 GPIO40: 45 VDD3P3_CPU: 46
+        GPIO41: 47 GPIO42: 48 GPIO43: 49 GPIO44: 50 GPIO45: 51 GPIO46: 52
+        XTAL_N: 53 XTAL_P: 54 VDDA: [55, 56] GND: 57
+    }
+    // Section 5.2, Table 5-2, recommended input supply voltages (VDD_SPI used as input).
+    limits: {
+        VDD3P3: {volts: [3V 3.6V]} VDD3P3_RTC: {volts: [3V 3.6V]}
+        VDD3P3_CPU: {volts: [3V 3.6V]} VDDA: {volts: [3V 3.6V]}
+        VDD_SPI: {volts: [1.8V 3.6V]}
+    }
+    // Section 5.4, Table 5-4, 3.3 V / 25 C: equivalent driver resistances inferred
+    // from PAD_DRIVER=3 test points, (3.3-2.64)/0.040 = 16.5 ohm high,
+    // 0.495/0.028 = 17.68 ohm low. One fixed card approximates all drive settings.
+    // The same table gives 45 kohm pull-up, VIH >= 0.75 VDD, VIL <= 0.25 VDD,
+    // IIH/IIL <= 50 nA, and typical CIN = 2 pF. No edge time is specified here.
+    gpio: {r_high: 16.5ohm r_low: 17.68ohm pull_up: 45kohm vih: 0.75 vil: 0.25 leak: 50nA c_pin: 2pF}
+    prefix: "U"
+})

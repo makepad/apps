@@ -1,0 +1,22 @@
+// drum16's snare on its own: a ringing filter for the drum's body and a noise burst for its
+// snares, mixed by one op-amp. The trigger strikes both: the body rings at 188 Hz and falls to a
+// third in 33 ms; the noise, chopped by the trigger's envelope, falls in about 40 ms. SNAP sets how
+// much of the burst is heard (turned up, more), high-passed at about 1.4 kHz on its way in.
+use mod.project.*
+let e = mod.elec
+
+let gnd   = e.net({name: "GND" kind: @ground})
+let va    = e.net({name: "VA" kind: @power volts: 5V})
+let ref   = e.net({name: "VREF"})
+let trig  = e.net({name: "TRIG"})
+let noise = e.net({name: "NOISE"})
+let env   = e.net({name: "ENV"})
+let sum   = e.net({name: "SUM"})
+let out   = e.net({name: "OUT"})
+
+let sg    = signal_ground({va: va gnd: gnd ref: ref})
+let drum  = snare_voice({trig: trig sum: sum noise: noise env: env ref: ref va: va gnd: gnd})
+
+// the mix: an inverting summer on the signal ground
+let rf    = e.r(15kohm, out, sum, {package: "0402"})
+let mixer = e.part(mod.std.opamp_sot23(), {pins: {INP: ref INN: sum OUT: out VDD: va VSS: gnd}})

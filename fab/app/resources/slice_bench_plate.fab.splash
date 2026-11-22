@@ -1,0 +1,11 @@
+// The slice benches' plate: the bracket and the bud vase of slice_bench_plate.cad.splash, in
+// two colours.
+use mod.fab.*
+
+script("slice_bench_plate.cad.splash")
+
+color("Orange", rgb: #xe2672b)
+color("Teal", rgb: #x2a9d8f)
+
+place("slice_bench_plate", object: "bracket", at: [150mm 165mm], name: "Shelf bracket", color: "Orange")
+place("slice_bench_plate", object: "vase", at: [241mm 165mm], name: "Bud vase", color: "Teal")

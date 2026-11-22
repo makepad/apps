@@ -1,0 +1,118 @@
+let e = mod.elec
+
+// Power in from a USB-C receptacle: 5 V sink, two CC pull-downs.
+let usb_c_power = e.block({
+    name: "USB-C power in"
+    ports: {vbus: e.port(@power_out, {volts: 5V current: 1.5A})  gnd: e.port(@ground)}
+    params: {rd: 5.1kohm}
+    build: fn(p, o) {
+        let j  = e.part(mod.std.usb_c_receptacle(), {pins: {VBUS: p.vbus GND: p.gnd SHIELD: p.gnd}})
+        let cc = for pin in [j.CC1, j.CC2] { e.r(o.rd, pin, p.gnd, {package: "0402"}) }
+    }
+    sheet: {flow: @right ports: {vbus: @right gnd: @bottom}}
+})
+
+// A fixed regulator with its input and output capacitors.
+let ldo = e.block({
+    name: "LDO"
+    ports: {
+        vin:  e.port(@power_in,  {volts: [2.5V 6V]})
+        vout: e.port(@power_out, {volts: 3.3V current: 600mA})
+        gnd:  e.port(@ground)
+    }
+    params: {part: "LDO_3V3_SOT23-5" c_in: 1uF c_out: 1uF}
+    build: fn(p, o) {
+        // The default names std's regulator, made on first use; another name is a part the
+        // project defines.
+        if o.part == "LDO_3V3_SOT23-5" { mod.std.ldo_3v3() }
+        let u     = e.part(o.part, {pins: {VIN: p.vin EN: p.vin GND: p.gnd VOUT: p.vout} nc: [@NC]})
+        let c_in  = e.c(o.c_in,  p.vin,  p.gnd, {package: "0603" volts: 10V})
+        let c_out = e.c(o.c_out, p.vout, p.gnd, {package: "0603" volts: 10V})
+        e.near(c_in,  u.VIN,  2mm)
+        e.near(c_out, u.VOUT, 2mm)
+    }
+    sheet: {flow: @right ports: {vin: @left vout: @right gnd: @bottom}}
+})
+
+// One LED sunk by a controller pin. Its resistor drops what the LED (at its drive current) and
+// the sinking pin (its on-resistance) leave of the rail.
+let led_driver = e.block({
+    name: "LED driver"
+    ports: {ctl: e.port(@in)  vdd: e.port(@power_in)}
+    params: {current: 5mA color: @green sink: 25ohm}
+    build: fn(p, o) {
+        let d = e.led({color: o.color package: "0603" current: o.current})
+        let r = e.r(e.series((p.vdd.volts - d.vf) / o.current - o.sink, @E24), p.vdd, d.A, {package: "0402"})
+        e.connect(d.K, p.ctl)
+    }
+    sheet: {flow: @down ports: {vdd: @top ctl: @bottom}}
+})
+
+// A push button to ground (the controller pin has its pull-up).
+let button = e.block({
+    name: "Button"
+    ports: {out: e.port(@out)  gnd: e.port(@ground)}
+    build: fn(p, o) { let sw = e.part(mod.std.tact_switch(), {pins: {A: p.out B: p.gnd}}) }
+})
+
+// Parallel supply decoupling, one capacitor per value in the selected package.
+let decoupling = e.block({
+    name: "Decoupling"
+    ports: {vdd: e.port(@power_in)  gnd: e.port(@ground)}
+    params: {values: [100nF, 100nF] package: "0402"}
+    build: fn(p, o) {
+        let caps = for v in o.values { e.c(v, p.vdd, p.gnd, {package: o.package}) }
+    }
+    sheet: {flow: @down ports: {vdd: @top gnd: @bottom}}
+})
+
+// Equal pull-up resistors for the two bidirectional bus lines.
+let i2c_pullups = e.block({
+    name: "I2C pull-ups"
+    ports: {sda: e.port(@bidi)  scl: e.port(@bidi)  vdd: e.port(@power_in)}
+    params: {r: 4.7kohm}
+    build: fn(p, o) {
+        let r_sda = e.r(o.r, p.vdd, p.sda, {package: "0402"})
+        let r_scl = e.r(o.r, p.vdd, p.scl, {package: "0402"})
+    }
+    sheet: {flow: @down ports: {sda: @bottom scl: @bottom vdd: @top}}
+})
+
+// A crystal with two load capacitors to ground, each within 2 mm of the crystal.
+let crystal_load = e.block({
+    name: "Crystal load"
+    ports: {xin: e.port(@passive)  xout: e.port(@passive)  gnd: e.port(@ground)}
+    params: {package: "3225" c_load: 12pF}
+    build: fn(p, o) {
+        let y = e.part(mod.std.crystal_part(o.package), {pins: [p.xin, p.xout, p.gnd]})
+        let c_in = e.c(o.c_load, p.xin, p.gnd, {package: "0402"})
+        let c_out = e.c(o.c_load, p.xout, p.gnd, {package: "0402"})
+        e.near(c_in, y, 2mm)
+        e.near(c_out, y, 2mm)
+    }
+    sheet: {flow: @right ports: {xin: @left xout: @right gnd: @bottom}}
+})
+
+// A voltage divider, with ratio = out / top before E96 resistor rounding.
+let divider = e.block({
+    name: "Divider"
+    ports: {top: e.port(@power_in)  out: e.port(@out)  gnd: e.port(@ground)}
+    params: {ratio: 0.5 r_total: 100kohm}
+    build: fn(p, o) {
+        let r_top = e.r(e.series((1 - o.ratio) * o.r_total, @E96), p.top, p.out, {package: "0402"})
+        let r_bottom = e.r(e.series(o.ratio * o.r_total, @E96), p.out, p.gnd, {package: "0402"})
+    }
+    sheet: {flow: @down ports: {top: @top out: @right gnd: @bottom}}
+})
+
+// An active-low reset pull-up with a capacitor to ground.
+let reset_rc = e.block({
+    name: "Reset RC"
+    ports: {nrst: e.port(@in)  vdd: e.port(@power_in)  gnd: e.port(@ground)}
+    params: {r: 10kohm c: 100nF}
+    build: fn(p, o) {
+        let r = e.r(o.r, p.vdd, p.nrst, {package: "0402"})
+        let c = e.c(o.c, p.nrst, p.gnd, {package: "0402"})
+    }
+    sheet: {flow: @down ports: {nrst: @right vdd: @top gnd: @bottom}}
+})

@@ -1,0 +1,9 @@
+// A made-up planet globe on its stand, continents and oceans through the ball: two filaments.
+use mod.fab.*
+
+script("planet_globe.cad.splash")
+
+color("Ocean", rgb: #x1f4f9e)
+color("Land", rgb: #x5d8f3a)
+
+place("planet_globe", at: [175mm 160mm], name: "Planet globe", color: "Ocean")

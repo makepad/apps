@@ -1,0 +1,217 @@
+// Sand's board check: Sand as it ships, plus a pour every two seconds without a finger and a report
+// every second over the watch link (`probe`), so the board and its emulator twin can be compared
+// frame for frame (fixtures/examples/board_check.rs). Probes: 1 steps, 2 the grid's hash, 3 grains,
+// 4 rows presented, 5..7 the accelerometer's x, y, z, 8 touch polls that found a finger.
+// Sand: 92 x 112 cells, four glass pixels per cell. Zero is air; 1..3 is sand.
+let screen = display()
+let grid = bytes(92 * 112)
+let dirty_rows = bytes(112)
+// Reuse one cell row of RGB565 pixels: 2944 bytes, not a full-panel surface.
+let strip = surface(368, 4)
+let forward: i32 = 1
+var tilt_x: i32 = 0
+var tilt_y: i32 = 0
+var poured: i32 = 0
+var tilt_z: i32 = 0
+var steps: i32 = 0
+var presents: i32 = 0
+var touches: i32 = 0
+
+// Typed so a pixel stays an integer RGB565 word all the way into the strip.
+fn colour(grain: i32) -> i32 {
+    var c: i32 = rgb(192, 124, 40)
+    if grain == 1 { c = rgb(248, 204, 104) }
+    else if grain == 2 { c = rgb(224, 164, 64) }
+    return c
+}
+
+// Redraw each changed row once, including the air left behind by moving grains.
+// Literal loop extents prove every grid, flag and strip index is in range.
+fn draw_rows() {
+    for row in 0..112 {
+        if dirty_rows[row] != 0 {
+            for col in 0..92 {
+                let grain = grid[row * 92 + col]
+                let pixel: i32 = if grain == 0 { rgb(0, 0, 0) } else { colour(grain) }
+                for y in 0..4 {
+                    for x in 0..4 {
+                        strip[y * 368 + col * 4 + x] = pixel
+                    }
+                }
+            }
+            present(screen, strip, 0, 0, 368, 4, 0, row * 4)
+            presents = presents + 1
+            dirty_rows[row] = 0
+        }
+    }
+}
+
+fn put_grain(x, y, grain) {
+    if x >= 0 && x < 92 && y >= 0 && y < 112 {
+        let i = y * 92 + x
+        if grid[i] == 0 {
+            grid[i] = grain
+            dirty_rows[y] = 1
+        }
+    }
+}
+
+// The caller's source coordinates are in range; the destination guards also
+// prove its linear index is in 0..10304. Mark both changed rows for drawing.
+fn move_grain(x, y, nx, ny, grain) {
+    var moved = false
+    if nx >= 0 && nx < 92 && ny >= 0 && ny < 112 {
+        let target = ny * 92 + nx
+        if grid[target] == 0 {
+            grid[target] = grain
+            grid[y * 92 + x] = 0
+            dirty_rows[y] = 1
+            dirty_rows[ny] = 1
+            moved = true
+        }
+    }
+    moved
+}
+
+fn fall(x, y, dx, dy, left_x, left_y, right_x, right_y) {
+    let grain = grid[y * 92 + x]
+    if grain != 0 {
+        if !move_grain(x, y, x + dx, y + dy, grain) {
+            if !move_grain(x, y, x + left_x, y + left_y, grain) {
+                move_grain(x, y, x + right_x, y + right_y, grain)
+            }
+        }
+    }
+}
+
+fn setup() {
+    fill_rect(screen, 0, 0, 368, 448, rgb(0, 0, 0))
+    // A small triangular heap suspended near the top: visible immediately, with
+    // room to fall even before the person tilts the board or touches the glass.
+    for row in 0..9 {
+        for col in 0..17 {
+            if col >= 8 - row && col <= 8 + row {
+                put_grain(38 + col, 16 + row, 1 + (row + col) % 3)
+            }
+        }
+    }
+    draw_rows()
+    // `step` keeps its grid from boot unless restarted, and this board's boot is long: the
+    // panel's power-up (about 0.4 s) and the clear above (about 60 ms on the S3) run before step
+    // can, so it would report its first 20 periods as missed. Steps begin once setup is done.
+    stop(step)
+}
+
+// A late one-shot misses nothing: it runs as soon as setup returns and starts step's grid there.
+let begin = after(ms(1), fn() { start(step) })
+
+// The board's IMU (handheld.ckt.splash) has its X toward the panel's top edge and its Y along the
+// panel's columns. At rest an accelerometer reads +1 g upward, so gravity along the columns is
+// -accel(1) and down the rows is accel(0). Ignore Z; when flat (both in-plane components below
+// 1/8 g), gravity points down the panel.
+let motion_sample = motion(ms(20), fn() {
+    tilt_x = -accel(1)
+    tilt_y = accel(0)
+    tilt_z = accel(2)
+})
+
+let pour = touch(ms(20), fn() {
+    if touch_down() != 0 {
+        touches = touches + 1
+        let cx = touch_x() / 4
+        let cy = touch_y() / 4
+        for row in 0..5 {
+            for col in 0..5 {
+                put_grain(cx + col - 2, cy + row - 2, 1 + (poured + row + col) % 3)
+            }
+        }
+        poured = (poured + 1) % 3
+        draw_rows()
+    }
+})
+
+let step = every(ms(20), fn() {
+    let ax = if tilt_x < 0 { -tilt_x } else { tilt_x }
+    let ay = if tilt_y < 0 { -tilt_y } else { tilt_y }
+    var dx: i32 = 0
+    var dy: i32 = 1
+    if ax >= ACCEL_LSB_PER_G / 8 || ay >= ACCEL_LSB_PER_G / 8 {
+        if ax > ay * 2 {
+            dx = if tilt_x < 0 { -forward } else { forward }
+            dy = 0
+        } else if ay > ax * 2 {
+            dy = if tilt_y < 0 { -forward } else { forward }
+        } else {
+            dx = if tilt_x < 0 { -forward } else { forward }
+            dy = if tilt_y < 0 { -forward } else { forward }
+        }
+    }
+    // The neighbouring directions, 45 degrees to either side of downhill.
+    // For diagonal gravity these are the two cardinal neighbours, so every
+    // candidate advances strictly along gravity and never exceeds one cell.
+    var left_x: i32 = dx
+    var left_y: i32 = dy
+    var right_x: i32 = dx
+    var right_y: i32 = dy
+    if dx == 0 {
+        left_x = -1
+        right_x = 1
+    } else if dy == 0 {
+        left_y = -1
+        right_y = 1
+    } else {
+        left_x = 0
+        right_y = 0
+    }
+    // Horizontal gravity needs columns first: both diagonal slips then land in
+    // an already visited column. Otherwise visit downhill rows first and order
+    // columns downhill for the diagonal direction's same-row slip. A grain can
+    // move only once. Literal loop extents keep source indices provably in range.
+    if dy == 0 {
+        for col in 0..92 {
+            let x = if dx < 0 { col } else { 91 - col }
+            for y in 0..112 {
+                fall(x, y, dx, dy, left_x, left_y, right_x, right_y)
+            }
+        }
+    } else {
+        for row in 0..112 {
+            let y = if dy < 0 { row } else { 111 - row }
+            for col in 0..92 {
+                let x = if dx < 0 { col } else { 91 - col }
+                fall(x, y, dx, dy, left_x, left_y, right_x, right_y)
+            }
+        }
+    }
+    steps = steps + 1
+    // A press's pour near the top centre, every 100 steps, as the touch handler pours: one pour in
+    // flight at a time keeps each step's redraw inside its 20 ms period.
+    if steps % 100 == 0 {
+        for row in 0..5 {
+            for col in 0..5 {
+                put_grain(44 + col, 4 + row, 1 + (poured + row + col) % 3)
+            }
+        }
+        poured = (poured + 1) % 3
+    }
+    draw_rows()
+    if steps % 50 == 0 {
+        var hash: i32 = 0
+        var grains: i32 = 0
+        for row in 0..112 {
+            for col in 0..92 {
+                let grain = grid[row * 92 + col]
+                hash = (hash * 33 + grain) & 65535
+                if grain != 0 { grains = grains + 1 }
+            }
+        }
+        probe(1, steps)
+        probe(2, hash)
+        probe(3, grains)
+        probe(4, presents)
+        probe(5, tilt_x)
+        probe(6, tilt_y)
+        probe(7, tilt_z)
+        probe(8, touches)
+    }
+})

@@ -1,0 +1,38 @@
+// A bud vase: a belly and a neck blended, a flat foot cut, hollowed to its wall, a lip on the
+// rim, open at the top: one distance field of engine nodes, so it renders and edits live.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+let vase_height = param(70mm, min: 30mm, max: 200mm, step: 0.5mm, label: "Height", group: "Bud vase")
+let vase_belly = param(21mm, min: 8mm, max: 60mm, step: 0.5mm, label: "Belly", group: "Bud vase", kind: "radius")
+let vase_neck = param(9.5mm, min: 3mm, max: 30mm, step: 0.5mm, label: "Neck", group: "Bud vase", kind: "radius")
+let vase_wall = param(1.6mm, min: 0.8mm, max: 5mm, step: 0.1mm, label: "Wall", group: "Bud vase", hint: "the wall's true thickness, inside the outer surface")
+let vase_blend = param(9mm, min: 0.5mm, max: 30mm, step: 0.5mm, label: "Blend", group: "Bud vase", kind: "radius")
+
+let belly = m.ellipsoid({radii: [vase_belly, vase_height * 0.36, vase_belly] at: [0, vase_height * 0.34, 0]})
+let neck = m.cylinder({radius: vase_neck height: vase_height * 0.42 at: [0, vase_height * 0.74, 0]})
+let lip = m.torus({radius: vase_neck + 1.2mm tube: 1.8mm at: [0, vase_height * 0.94, 0]})
+let vase_body = m.blend([belly neck], vase_blend)
+let foot = m.box({size: [4 * vase_belly, 20mm, 4 * vase_belly] at: [0, -7mm, 0]})
+let footed = m.carve(vase_body, foot, 0)
+let hollow = m.shell(footed, vase_wall, {open: @closed})
+// The lip goes on after hollowing, a solid rim with a small fillet: hollowed with the body, a
+// wide blend into it leaves a cavity under the rim whose inner edge hangs in the mouth.
+let rimmed = m.blend([hollow lip], 1.5mm)
+// The mouth opens the shell's cap under the neck's top (0.95 of the height, a wall thick) from
+// well below it, at every height, to well above whatever the blend lifts it to; it starts inside
+// the neck's cavity, as wide as it, so it cuts nothing else. A neck no wider than its wall has
+// no cavity: a small bore stands in.
+let mouth_low = vase_height * 0.87 - vase_wall
+let mouth_high = vase_height + 20mm
+let mouth_radius = if vase_neck - vase_wall > 0.5mm { vase_neck - vase_wall } else { 0.5mm }
+let mouth = m.cylinder({radius: mouth_radius height: mouth_high - mouth_low at: [0, (mouth_low + mouth_high) / 2, 0]})
+let vase = m.carve(rimmed, mouth, 0, {cell: 0.9mm})
+
+// Where the vase's parameters are dragged in the view.
+handle(vase_height, Arrow{from: [vase_neck + 1.2mm, 0, 0] to: [vase_neck + 1.2mm, vase_height * 0.94 + 1.8mm, 0]})
+handle(vase_belly, Ring{center: [0, vase_height * 0.34, 0] radius: vase_belly})
+handle(vase_neck, Ring{center: [0, vase_height * 0.74, 0] radius: vase_neck})
+
+object(vase)

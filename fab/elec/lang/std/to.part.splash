@@ -1,0 +1,101 @@
+let __to_f = mod.elec.f
+let __to_math = mod.math
+
+let __to_positive = fn(v) {
+    return v.is_number() && v > 0mm && v - v == 0mm
+}
+
+// Lead envelope plus 0.20 mm clearance, drill rounded up to 0.05 mm;
+// 0.30 mm annular ring, land diameter rounded to 0.01 mm.
+let __to_land = fn(lead) {
+    // Match the native nanometre resolution before checking exact grid points.
+    let clearance = __to_f.round(lead + 0.2mm, 0.000001mm)
+    let nearest = __to_f.round(clearance, 0.05mm)
+    let drill = if nearest == clearance { nearest } else {
+        __to_f.round(clearance + 0.025mm, 0.05mm)
+    }
+    return {
+        drill: drill
+        diameter: __to_f.round(drill + 2 * 0.3mm, 0.01mm)
+    }
+}
+
+// Three round 0.45 mm leads under a flat-sided 4.8 mm circle; o.pitch
+// (default 1.27 mm), o.staggered (default false) moves pad 2 back 1.27 mm.
+let to92 = fn(o) {
+    let f = __to_f
+    if !o.is_object() { return f.error("to92: o must be an options object") }
+    let pitch = o.pitch ?? 1.27mm
+    let staggered = o.staggered ?? false
+    if !__to_positive(pitch) || !__to_positive(2 * pitch) {
+        return f.error("to92: pitch must be a positive finite length with a finite two-pitch span")
+    }
+    if !staggered.is_bool() {
+        return f.error("to92: staggered must be true or false")
+    }
+    let land = __to_land(0.45mm)
+    if !staggered && pitch <= land.diameter {
+        return f.error("to92: pitch must exceed the rounded pad diameter when staggered is false")
+    }
+    if staggered && 2 * pitch <= land.diameter {
+        return f.error("to92: twice pitch must exceed the rounded pad diameter when staggered is true")
+    }
+    // Back is negative y; the stagger keeps pads 1, 2, 3 counter-clockwise.
+    let middle_y = if staggered { -1.27mm } else { 0mm }
+    let pads = [
+        f.thru("1", [-pitch, 0mm], land.diameter, land.drill, {square: true}),
+        f.thru("2", [0mm, middle_y], land.diameter, land.drill, {square: false}),
+        f.thru("3", [pitch, 0mm], land.diameter, land.drill, {square: false})
+    ]
+    // Nine points on the 2.4 mm radius, 30 degrees apart; flat chord at y = 1.2 mm.
+    let r = 2.4mm
+    let a = 0.8660254037844386 * r
+    let arc = [
+        [-a, r / 2], [-r, 0mm], [-a, -r / 2],
+        [-r / 2, -a], [0mm, -r], [r / 2, -a],
+        [a, -r / 2], [r, 0mm], [a, r / 2]
+    ]
+    return f.footprint({
+        pads: pads
+        body: [[-r, -r], [r, r / 2]]
+        mount: @thru
+        text: 1mm
+        graphics: [
+            f.stroke("F.SilkS", arc, 0.12mm),
+            f.stroke("F.SilkS", [[a, r / 2], [-a, r / 2]], 0.12mm)
+        ]
+    })
+}
+
+let __to_upright = fn(o, gen, pitch, lead, body) {
+    let f = __to_f
+    if !o.is_object() { return f.error(gen + ": o must be an options object") }
+    // A rectangular lead must fit through the round drill at its diagonal.
+    let diagonal = __to_math.sqrt(lead[0] * lead[0] + lead[1] * lead[1])
+    let land = __to_land(diagonal)
+    let pads = for i in 0..3 {
+        f.thru(f.int(i + 1), [(i - 1) * pitch, 0mm],
+            land.diameter, land.drill, {square: i == 0})
+    }
+    let half_x = body[0] / 2
+    let half_y = body[1] / 2
+    return f.footprint({
+        pads: pads
+        body: [[-half_x, -half_y], [half_x, half_y]]
+        mount: @thru
+        text: 1mm
+        graphics: [f.stroke("F.SilkS", [[-half_x, -half_y], [half_x, -half_y]], 0.12mm)]
+    })
+}
+
+// Upright tabbed body 10 x 4.5 mm, three 0.8 x 0.5 mm leads at 2.54 mm pitch;
+// o is an options object with no adjustable dimensions. Tab is at negative y.
+let to220 = fn(o) {
+    return __to_upright(o, "to220", 2.54mm, [0.8mm, 0.5mm], [10mm, 4.5mm])
+}
+
+// Upright tabbed body 15.9 x 5.0 mm, three 1.2 x 0.6 mm leads at 5.45 mm pitch;
+// o is an options object with no adjustable dimensions. Tab is at negative y.
+let to247 = fn(o) {
+    return __to_upright(o, "to247", 5.45mm, [1.2mm, 0.6mm], [15.9mm, 5.0mm])
+}

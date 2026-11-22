@@ -1,0 +1,178 @@
+// A beetle walking, printed in place: a domed body of three parts (wing cases, the shield behind
+// the head, and the head), six legs of three segments each and two feelers ending in clubs, all
+// fused to copper TPU cords flat on the bed under them. A spine cord runs from the head through
+// the shield into the wing cases; each leg's cord starts inside the body, runs along each segment
+// and curves from one segment to the next, and each feeler's starts inside the head. Between every
+// two parts a cord runs free two and a half millimetres or more; nearly square, it bends there
+// every way alike, so held by its body the legs and feelers splay, droop and wave, the body flexes
+// at its waist and neck, and laid down it springs back to its stride. Two to nine filaments with
+// the cords, laid in layers: legs, feelers and the body's underside are ebony; over them the shell
+// is a sheen of bands from deep teal through green to gold at its crown, one colour a band, with
+// eyes in the crown's colour and an ebony seam between the wing cases and spots on them; under the
+// cords' top only the cords and the ebony print.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let s = param(1, min: 0.8, max: 1.2, step: 0.05, label: "Size", group: "Beetle", kind: "ratio", hint: "scales the beetle; the cords keep their section")
+let materials = param(4, min: 2, max: 9, step: 1, label: "Materials", group: "Beetle", kind: "count", hint: "with the TPU cords: 2 an emerald beetle; 3 adds ebony legs, feelers, underside, eyes, seam and spots; 4 adds a gold crown and eyes; up to 9 a seven-step sheen from teal through green to gold (each colour is a band of layers: a filament change or two each)")
+let cord = param(2.4mm, min: 2mm, max: 3mm, step: 0.1mm, label: "Cord", group: "Cords", hint: "the TPU cords' width and height: thicker springs back harder")
+
+// On the bed, U across the beetle and V up it toward its head (a sketch's [u v]).
+
+// The body: three domes, each an outline (a superellipse, squarer in front or behind, its width
+// tapering toward the front) lofted over shrinking copies of itself, so it narrows all the way up
+// and nothing overhangs. Each row: centre U and V, half width, half length, squareness in front
+// and behind, taper, height. The wing cases have square shoulders; the shield is square behind,
+// facing them two and a half millimetres across the waist, and narrows to the head.
+let wings_d = [0, -22mm, 24mm, 30mm, 3, 2, 0.06, 15mm]
+let shield_d = [0, 20.5mm, 19mm, 10mm, 2.4, 3, -0.14, 11mm]
+let head_d = [0, 40mm, 10.5mm, 7mm, 2, 2.4, -0.08, 8mm]
+let dome = [[0, 1] [0.2, 0.98] [0.4, 0.93] [0.6, 0.83] [0.75, 0.7] [0.87, 0.54] [0.95, 0.36] [1, 0.16]]
+fn outline(d, f) {
+    Polygon{points: for i in 0..64 {
+        let t = i * 6.28318 / 64
+        let c = cos(t)
+        let n = if sin(t) >= 0 { d[4] } else { d[5] }
+        let x = d[2] * (if c < 0 { -1 } else { 1 }) * pow(abs(c), 2 / n) * (1 + d[6] * sin(t))
+        let y = d[3] * (if sin(t) < 0 { -1 } else { 1 }) * pow(abs(sin(t)), 2 / n)
+        [(d[0] + x * f) * s, (d[1] + y * f) * s]
+    }}
+}
+fn body(d) { m.loft({sections: for q in dome { Section{sketch: outline(d, q[1]) at: d[7] * q[0] * s} }}) }
+let wings = body(wings_d)
+let shield = body(shield_d)
+let head = body(head_d)
+
+// The limbs, left side (the right mirrors it): front, middle and hind legs, then the feelers,
+// three segments each, each segment's centre and heading. Each limb's first segment lies on a ray
+// from its body part's centre, a free run past the part's edge; each next one a free run past the
+// last. A segment's half length, half width and height go by its place along a leg or feeler.
+let cu = [-20.70mm, -31.49mm, -36.32mm, -28.13mm, -42.13mm, -52.01mm, -29.81mm, -40.87mm, -45.93mm, -7.01mm, -10.63mm, -12.31mm]
+let cv = [32.45mm, 42.87mm, 55.47mm, 15.54mm, 10.16mm, 0.96mm, -37.19mm, -47.32mm, -59.84mm, 51.22mm, 59.35mm, 68.90mm]
+let hu = [-0.8660, -0.5299, -0.1736, -0.9848, -0.8480, -0.5878, -0.8910, -0.5299, -0.2079, -0.5299, -0.2756, -0.0698]
+let hv = [0.5000, 0.8480, 0.9848, -0.1736, -0.5299, -0.8090, -0.4540, -0.8480, -0.9781, 0.8480, 0.9613, 0.9976]
+let leg_size = [[6.5mm, 2.8mm, 4.2mm] [6.0mm, 2.6mm, 4.0mm] [5.0mm, 2.5mm, 3.8mm]]
+let feeler_size = [[3.2mm, 2.3mm, 3.6mm] [3.2mm, 2.3mm, 3.6mm] [4.0mm, 2.6mm, 3.9mm]]
+fn size(r, k) { if r == 3 { feeler_size[k] } else { leg_size[k] } }
+// limb r's segment k on side g (1 left, -1 right): its centre, and a point `a` along its heading
+fn centre(r, g, k) { [cu[r * 3 + k] * g, cv[r * 3 + k]] }
+fn on_axis(r, g, k, a) { [cu[r * 3 + k] * g + a * hu[r * 3 + k] * g, cv[r * 3 + k] + a * hv[r * 3 + k]] }
+// A segment: a pod (two half circles joined straight) domed like a pebble, full at the bed and
+// rounding over to a flat top, its ends' radius shrinking up the dome.
+let pebble = [[0, 1] [0.35, 0.98] [0.6, 0.92] [0.8, 0.8] [0.93, 0.6] [1, 0.36]]
+fn pod(r, g, k, f) {
+    let z = size(r, k)
+    let fa = z[0] - z[1]
+    let h = [hu[r * 3 + k] * g, hv[r * 3 + k]]
+    let c = centre(r, g, k)
+    Polygon{points: for i in 0..26 {
+        let t = if i < 13 { -1.5708 + i * 0.2618 } else { 1.5708 + (i - 13) * 0.2618 }
+        let a = (if i < 13 { fa } else { -fa }) + z[1] * f * cos(t)
+        let w = z[1] * f * sin(t)
+        [(c[0] + a * h[0] - w * h[1]) * s, (c[1] + a * h[1] + w * h[0]) * s]
+    }}
+}
+fn segment(r, g, k) { m.loft({sections: for q in pebble { Section{sketch: pod(r, g, k, q[1]) at: size(r, k)[2] * q[0] * s} }}) }
+let left_fore = for k in 0..3 { segment(0, 1, k) }
+let right_fore = for k in 0..3 { segment(0, -1, k) }
+let left_mid = for k in 0..3 { segment(1, 1, k) }
+let right_mid = for k in 0..3 { segment(1, -1, k) }
+let left_hind = for k in 0..3 { segment(2, 1, k) }
+let right_hind = for k in 0..3 { segment(2, -1, k) }
+let left_feeler = for k in 0..3 { segment(3, 1, k) }
+let right_feeler = for k in 0..3 { segment(3, -1, k) }
+
+// The cords: each one sweep of a house's section (upright sides to the eaves, then a roof at 58
+// degrees to a flat ridge 0.6 mm wide, so the cord's top layer is a whole line and the parts
+// printed over it bridge only that), lying on the bed. A sweep stands its section by its line's
+// first step: along U its section's first axis is up; otherwise its second, pointing up when the
+// step runs down V and down when it runs up V.
+let eave = cord * 0.42
+let ridge = eave + cord * 0.6
+fn house(d) {
+    if abs(d[0]) >= 0.9 * sqrt(d[0] * d[0] + d[1] * d[1]) {
+        Polygon{points: [[0, -cord / 2] [eave, -cord / 2] [ridge, -0.3mm] [ridge, 0.3mm] [eave, cord / 2] [0, cord / 2]]}
+    } else if d[1] < 0 {
+        Polygon{points: [[-cord / 2, 0] [-cord / 2, eave] [-0.3mm, ridge] [0.3mm, ridge] [cord / 2, eave] [cord / 2, 0]]}
+    } else {
+        Polygon{points: [[-cord / 2, 0] [cord / 2, 0] [cord / 2, -eave] [0.3mm, -ridge] [-0.3mm, -ridge] [-cord / 2, -eave]]}
+    }
+}
+fn sweep(pts) {
+    let line = for p in pts { [p[0] * s, 0, -p[1] * s] }
+    m.sweep({sketch: house([pts[1][0] - pts[0][0], pts[1][1] - pts[0][1]]) path: line})
+}
+// The spine: down the middle from inside the head through the shield into the wing cases.
+let spine = sweep([[0, 37mm] [0, -30mm]])
+// A limb's cord enters each segment `inset` inside its near end and leaves as far inside its far
+// end, along its axis, and between two segments follows a cubic from the one's axis to the next's,
+// tangent to both, so it leaves every segment square through its end. It starts inside the body a
+// quarter of the way from the body part's centre to the first segment's (so the plane midway
+// between those centres, where the bend between them is looked for, crosses it) and ends at the
+// last segment's centre.
+let inset = 1.2mm
+fn bend(r, g, k, u) {
+    let p0 = on_axis(r, g, k, size(r, k)[0] - inset)
+    let p3 = on_axis(r, g, k + 1, inset - size(r, k + 1)[0])
+    let l = sqrt((p3[0] - p0[0]) * (p3[0] - p0[0]) + (p3[1] - p0[1]) * (p3[1] - p0[1])) / 3
+    let p1 = on_axis(r, g, k, size(r, k)[0] - inset + l)
+    let p2 = on_axis(r, g, k + 1, inset - size(r, k + 1)[0] - l)
+    let v = 1 - u
+    [v * v * v * p0[0] + 3 * v * v * u * p1[0] + 3 * v * u * u * p2[0] + u * u * u * p3[0], v * v * v * p0[1] + 3 * v * v * u * p1[1] + 3 * v * u * u * p2[1] + u * u * u * p3[1]]
+}
+let hubs = [shield_d, shield_d, wings_d, head_d]
+fn limb_pt(r, g, i) {
+    let k = floor((i - 1) / 5)
+    let j = i - 1 - k * 5
+    let c = centre(r, g, 0)
+    let o = [hubs[r][0], hubs[r][1]]
+    if i == 0 { [o[0] + (c[0] - o[0]) / 4, o[1] + (c[1] - o[1]) / 4] }
+    else if j == 0 { on_axis(r, g, k, inset - size(r, k)[0]) }
+    else if j == 1 { if k == 2 { centre(r, g, 2) } else { on_axis(r, g, k, size(r, k)[0] - inset) } }
+    else { bend(r, g, k, (j - 1) / 4) }
+}
+fn limb_cord(r, g) { sweep(for i in 0..13 { limb_pt(r, g, i) }) }
+let cords = for i in 0..8 { limb_cord(floor(i / 2), if i - floor(i / 2) * 2 == 0 { 1 } else { -1 }) }
+
+fn row(hub, segs) { return for k in 0..4 { if k == 0 { hub } else { segs[k - 1] } } }
+let waist = m.bond(spine, [head, shield, wings])
+let joints = [m.bond(cords[0], row(shield, left_fore)) m.bond(cords[1], row(shield, right_fore)) m.bond(cords[2], row(shield, left_mid)) m.bond(cords[3], row(shield, right_mid)) m.bond(cords[4], row(wings, left_hind)) m.bond(cords[5], row(wings, right_hind)) m.bond(cords[6], row(head, left_feeler)) m.bond(cords[7], row(head, right_feeler))]
+
+object(wings, name: "Flex beetle")
+
+// The colours. With three filaments or more the first, ebony, is everything up to `lift` (over
+// the legs' and feelers' tops), and the shell takes bands from there to its crown: from deep teal
+// to gold, of which fewer filaments take an even spread. The bands crowd toward the crown (each
+// one's floor goes as its share to the power 0.4), so on the wing cases' dome they come out as
+// rings of about even width. Then eyes on the head in the crown's colour (ebony there would share
+// the first band's layers with it, one more filament change a layer), and from the middle band up an
+// ebony seam down between the wing cases and three spots on each. The cords are copper TPU.
+let shell = [Material{albedo: [0.04 0.33 0.4] name: "Teal"} Material{albedo: [0.03 0.45 0.3] name: "Emerald"} Material{albedo: [0.12 0.56 0.22] name: "Green"} Material{albedo: [0.42 0.66 0.16] name: "Lime"} Material{albedo: [0.66 0.62 0.12] name: "Citron"} Material{albedo: [0.8 0.56 0.08] name: "Gold"} Material{albedo: [0.93 0.72 0.22] name: "Honey"}]
+let ebony = Material{albedo: [0.09 0.08 0.08] name: "Ebony"}
+let copper = Material{albedo: [0.75 0.42 0.2] name: "Copper"}
+let picks = [[1] [1 5] [0 2 5] [0 1 3 5] [0 1 2 4 5] [0 1 2 3 4 5] [0 1 2 3 4 5 6]]
+let bands = if materials >= 3 { materials - 2 } else { 1 }
+let pick = picks[bands - 1]
+let lift = 4.8mm * s
+let crown = wings_d[7] * s
+fn band_lo(i) { lift + (crown - lift) * pow(i / bands, 0.4) }
+fn above(z) { m.box({size: [400mm * s, 60mm * s, 400mm * s] at: [0, z + 30mm * s, 0]}) }
+fn dot(u, v, size) { m.extrude({sketch: Polygon{points: for i in 0..20 { [(u + size * cos(i * 0.314159)) * s, (v + size * sin(i * 0.314159)) * s] }} height: 30mm * s at: [0, band_lo(floor(bands / 2)), 0]}) }
+if materials >= 3 {
+    m.fill(above(0), ebony)
+    for i in 0..7 { if i < bands { m.fill(above(band_lo(i)), shell[pick[i]]) } }
+    // the eyes: a patch each side of the head's front, from `lift` up, in the crown's colour (ebony
+    // with one band)
+    let eye = if bands > 1 { shell[pick[bands - 1]] } else { ebony }
+    for g in [1, -1] { m.fill(m.extrude({sketch: Polygon{points: for i in 0..20 { [(4.5mm * g + 1.5mm * cos(i * 0.314159)) * s, (42.3mm + 1.5mm * sin(i * 0.314159)) * s] }} height: 30mm * s at: [0, lift, 0]}), eye) }
+    // the seam between the wing cases, two lines wide, and three spots on each
+    m.fill(m.box({size: [0.8mm * s, 30mm * s, 60mm * s] at: [0, band_lo(floor(bands / 2)) + 15mm * s, 22mm * s]}), ebony)
+    for d in [[5mm, -15mm, 1.8mm] [6.5mm, -26mm, 2.1mm] [3.8mm, -36mm, 1.6mm]] { for g in [1, -1] { m.fill(dot(d[0] * g, d[1], d[2]), ebony) } }
+} else {
+    m.fill(above(0), shell[1])
+}
+// The cords print in TPU all through: filled whole last, each drops the paint before.
+m.fill(spine, copper)
+for c in cords { m.fill(c, copper) }

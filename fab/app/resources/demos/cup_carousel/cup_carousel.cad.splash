@@ -1,0 +1,182 @@
+// A cup carousel printed in place, in two filaments: a hub on a sun gear, four planets each
+// carrying a cup with two riders, and a ring gear that is the ride's scalloped base with a fence
+// of lamp posts. The teeth are herringbone, as in the gear heart, so the gears hold one another
+// up and down with no pins and come off the bed already meshed: hold the base, turn the hub, and
+// the cups ride round it, each spinning on its own.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let module = param(1.6mm, min: 1.6mm, max: 2.2mm, step: 0.1mm, label: "Module", group: "Gears", hint: "tooth size: the pitch diameter over the tooth count; the cups and hub keep their size")
+let height = param(10mm, min: 8mm, max: 14mm, step: 0.4mm, label: "Height", group: "Gears")
+let helix = param(30°, min: 15°, max: 40°, step: 1°, label: "Helix", group: "Gears", hint: "the herringbone's angle; steeper holds the gears together harder")
+let backlash = param(0.6mm, min: 0.3mm, max: 0.9mm, step: 0.05mm, label: "Backlash", group: "Fit", hint: "each gear's teeth thinned by this on the pitch circle")
+
+// Tooth counts: the ring has the sun's teeth plus two planets', and (sun + ring) / 4 is whole, so
+// four planets sit evenly round the sun.
+let z_sun = 12
+let z_planet = 12
+let z_ring = z_sun + 2 * z_planet
+let planets_n = 4
+let orbit = module * (z_sun + z_planet) / 2
+let alpha = 20°
+
+// An involute tooth outline, `z` teeth, thinned by `lash` on the pitch circle and shifted `shift`
+// modules outward; `phase` turns it. Each tooth: the root, an arc on the root circle from the last
+// tooth's flank to this one's, then up one flank and down the other. Below the base circle a flank
+// runs straight down to the root, so a mating tip clears the root's corners. A root circle above
+// the base circle takes no corner points: the flank starts on it.
+fn inv(a) { tan(a) - a }
+fn gear_outline(z, lash, shift, phase, cx, cy) {
+    let r = module * z / 2
+    let rb = r * cos(alpha)
+    let ra = r + module * (1 + shift)
+    let rf = r - module * (1.25 - shift)
+    let r0 = if rf > rb { rf } else { rb }
+    let half = (3.14159 / 2 + 2 * shift * tan(alpha)) / z - lash / (2 * r)
+    let foot = half + inv(alpha) - inv(acos(rb / r0))
+    let n = 6
+    let nr = 3
+    let e = if rb > rf { 0 } else { 0.5 }
+    let per = nr + 1 + 2 * n
+    let pitch = 2 * 3.14159 / z
+    Polygon{points: for j in 0..(z * per) {
+        let k = floor(j / per)
+        let i = j - k * per
+        let c = phase + k * pitch
+        if i <= nr {
+            let a = c - pitch + foot + (pitch - 2 * foot) * (i + e) / (nr + 2 * e)
+            [cx + rf * cos(a), cy + rf * sin(a)]
+        } else {
+            let f = i - nr - 1
+            let rho = if f < n { r0 + (ra - r0) * f / (n - 1) } else { ra - (ra - r0) * (f - n) / (n - 1) }
+            let flank = half + inv(alpha) - inv(acos(rb / (if rho > rb { rho } else { rb })))
+            let a = if f < n { c - flank } else { c + flank }
+            [cx + rho * cos(a), cy + rho * sin(a)]
+        }
+    }}
+}
+
+// A herringbone gear: two twisted sweeps, one up the lower half and one back down the upper half,
+// meeting at mid-height. A gear of pitch radius r turns by tan(helix) * y / r at height y, so gears
+// that mesh stay meshed at every height; meshing gears lean opposite ways (`hand`), and a ring
+// leans with its planets. It runs from `lo` to `hi`. A sweep turns its outline about the sketch's
+// origin, so the outline is drawn there and the sweep runs up through the gear's centre.
+fn herringbone(z, hand, lash, shift, phase, cx, cy, lo, hi) {
+    let rate = hand * tan(helix) / (module * z / 2)
+    let mid = height / 2
+    let lower = m.sweep({sketch: gear_outline(z, lash, shift, phase + rate * lo, 0, 0) path: [[cx, lo, 0 - cy] [cx, mid, 0 - cy]] twist: rate * (mid - lo)})
+    let upper = m.sweep({sketch: gear_outline(z, lash, shift, phase + rate * mid, 0, 0) path: [[cx, mid, 0 - cy] [cx, hi, 0 - cy]] twist: 0 - rate * (hi - mid)})
+    m.union(lower, upper)
+}
+
+// The base: the ring gear's teeth cut in a scalloped round by their mating shape, shifted 0.4
+// module outward so the ring's tips and corners clear the planets by a third of a millimetre or
+// more; a wall of `wall` past the deepest tooth, and a fence of lamp posts round its top, clear of
+// the cups' rims.
+let wall = 3.5mm
+let big = module * z_ring / 2 + module * 1.25 + wall
+let scallops = 18
+let rim = Polygon{points: for j in 0..(scallops * 12) {
+    let t = j * 2 * 3.14159 / (scallops * 12)
+    let r = big + 1.4mm * abs(sin(t * scallops / 2))
+    [r * cos(t), r * sin(t)]
+}}
+let blank = m.extrude({sketch: rim plane: @xz height: height})
+let ring = m.subtract(blank, herringbone(z_ring, -1, 0, 0.4, 3.14159 / z_ring, 0, 0, -1mm, height + 1mm))
+// A round-headed peg turned from one profile, from `y0` to the top of its head.
+fn peg(r, y0, y1, x, z) {
+    m.revolve({sketch: Polygon{points: for j in 0..10 {
+        if j == 0 { [0, y0] } else { if j == 1 { [r, y0] } else { if j < 9 { [r * cos((j - 2) * 15°), y1 + r * sin((j - 2) * 15°)] } else { [0, y1 + r] } } }
+    }} at: [x, 0, z]})
+}
+let post_r = big - 1.4mm
+let posts = for k in 0..scallops {
+    let t = (k + 0.5) * 2 * 3.14159 / scallops
+    peg(1.1mm, height - 0.2mm, height + 6.2mm, post_r * cos(t), 0 - post_r * sin(t))
+}
+
+// The hub on the sun: a ribbed column that rises past the cups for the fingers to turn, under
+// a dome. It stands inside the sun's roots, and the cups pass it with room to spare.
+let hub_r = 5.4mm
+let hub_top = height + 22mm
+// The column and its dome are one turned profile; the ribs stop short of the dome and start a
+// little above the column's foot, so no two faces meet in one plane.
+let column = peg(hub_r, height - 0.2mm, hub_top, 0, 0)
+let ribs = for k in 0..10 {
+    let t = k * 2 * 3.14159 / 10
+    m.cylinder({radius: 0.9mm height: hub_top - height - 0.9mm at: [hub_r * cos(t), (height - 0.1mm + hub_top - 1mm) / 2, hub_r * sin(t)]})
+}
+let sun = m.union(herringbone(z_sun, 1, backlash, 0, 0, 0, 0, 0, height), [column ribs])
+// Where the dome is, for its colour: everything over the column's top.
+let dome = m.cylinder({radius: hub_r + 1mm height: hub_r + 2mm at: [0, hub_top + hub_r / 2 + 1mm, 0]})
+
+// Each planet carries a cup on a short stem: the cup flares no faster than a printed wall can
+// lean, so it needs no support, and its underside clears the base and the sun by whole layers
+// where it passes over them. Two riders sit in it, round-headed pegs.
+let stem_r = 5mm
+let cup_y = height + 2mm
+let cup_h = 8mm
+let cup_r = 10mm
+let cup_wall = 1.4mm
+let cup_floor = 1.2mm
+let riders_at = 2.4mm
+let rider_r = 1.6mm
+let rider_h = 7mm
+fn cup_radius(y) { if y < cup_y { stem_r } else { stem_r + (cup_r - stem_r) * min(y - cup_y, cup_h) / cup_h } }
+let cup_profile = Polygon{points: [[0, height - 0.2mm] [stem_r, height - 0.2mm] [stem_r, cup_y] [cup_r, cup_y + cup_h] [cup_r - cup_wall, cup_y + cup_h] [cup_radius(cup_y + cup_floor) - cup_wall, cup_y + cup_floor] [0, cup_y + cup_floor]]}
+let centres = for i in 0..planets_n {
+    let a = i * 2 * 3.14159 / planets_n
+    [orbit * cos(a), orbit * sin(a), a]
+}
+let riders = for c in centres {
+    for s in [-1, 1] {
+        let x = c[0] + s * riders_at * cos(c[2] + 90°)
+        let z = 0 - c[1] - s * riders_at * sin(c[2] + 90°)
+        peg(rider_r, cup_y + 0.8mm, cup_y + 0.8mm + rider_h, x, z)
+    }
+}
+// A planet at angle a has turned a * (1 + z_sun / z_planet) as it rolled there, so a gap faces
+// the sun's tooth.
+let planets = for c in centres {
+    let gear = herringbone(z_planet, -1, backlash, 0, 3.14159 / z_planet + c[2] * (1 + z_sun / z_planet), c[0], c[1], 0, height)
+    m.union(gear, m.revolve({sketch: cup_profile at: [c[0], 0, 0 - c[1]]}))
+}
+let carousel = m.union(m.union(ring, posts), [sun planets riders])
+
+object(carousel, name: "Cup carousel")
+
+// The second filament: the planets and their cups, the hub's dome and the lamps. The planets'
+// colour lies inside the nearest planet's tooth outline (at this height's turn), a little wider,
+// so the colour changes in the air between meshing teeth; above the gears it is the cup's round.
+let gold = Material{albedo: [0.93 0.74 0.28] name: "Gold"}
+let red = Material{albedo: [0.72 0.12 0.18] name: "Red"}
+let r_p = module * z_planet / 2
+let rb_p = r_p * cos(alpha)
+let ra_p = r_p + module
+let rf_p = r_p - 1.25 * module
+let half_p = (3.14159 / 2) / z_planet - backlash / (2 * r_p)
+let margin = 0.15mm
+let step = 2 * 3.14159 / planets_n
+let tooth = 2 * 3.14159 / z_planet
+m.fill(carousel, Mix{materials: [red gold] field: fn(p) {
+    let u = p.x
+    let v = 0 - p.z
+    let c = floor(atan2(v, u) / step + 0.5) * step
+    let qu = u - orbit * cos(c)
+    let qv = v - orbit * sin(c)
+    let rho = sqrt(qu * qu + qv * qv)
+    let turn = 0 - tan(helix) * min(p.y, height - p.y) / r_p
+    let th = atan2(qv, qu) - (3.14159 / z_planet + c * (1 + z_sun / z_planet)) - turn
+    let phi = abs(th - floor(th / tooth + 0.5) * tooth)
+    let a = acos(rb_p / max(rho, rb_p))
+    let half = half_p + tan(alpha) - alpha - (tan(a) - a)
+    let in_root = rf_p + margin - rho
+    let in_tooth = min(ra_p + margin - rho, (half - phi) * rho + margin)
+    let in_cup = cup_radius(p.y) + margin - rho
+    0.5 + (if p.y < height { max(in_root, in_tooth) } else { in_cup }) / 1mm
+} sharp: 1})
+for r in riders { m.fill(r, red) }
+m.fill(dome, gold)
+for p in posts { m.fill(p, gold) }

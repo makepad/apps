@@ -1,0 +1,9 @@
+// A flat-printed hand-launch glider in two filaments: white airframe, blue tips and fin.
+use mod.fab.*
+
+script("glider.cad.splash")
+
+color("White", rgb: #xeef0f2)
+color("Sky", rgb: #x2c8ce6)
+
+place("glider", at: [175mm 160mm], name: "Glider", color: "White")

@@ -1,0 +1,154 @@
+let __tab_f = mod.elec.f
+
+let __tab_positive = fn(v) {
+    return v.is_number() && v > 0mm && v - v == 0mm
+}
+
+// Nominal lands: toe 0.35 mm; gull-wing heel 0.35 mm, side 0.03 mm;
+// the tab has no heel or side extension. Sizes are [width, length in y].
+let __tab_land = fn(span, lead, heel, side) {
+    let toe = 0.35mm
+    // Z = span + 2 * toe; G = span - 2 * lead[1] - 2 * heel.
+    // The equivalent length avoids subtracting nearly equal spans.
+    return {
+        y: __tab_f.round((span - lead[1] + toe - heel) / 2, 0.01mm)
+        size: [__tab_f.round(lead[0] + 2 * side, 0.01mm),
+               __tab_f.round(lead[1] + toe + heel, 0.01mm)]
+    }
+}
+
+let __tab_skipped = fn(skip, no) {
+    for i in 0..skip.len() {
+        if skip[i] == no { return true }
+    }
+    return false
+}
+
+// One bottom row of gull-wing leads and one top heat tab; leads 2..7,
+// pitch, body [x, y], span tip to tip in y, lead and tab [width, foot length]
+// in mm; optional skip [1-based positions], tab_no (default leads + 1).
+let tab_package = fn(o) {
+    if !o.is_object() {
+        return __tab_f.error("tab_package: o must be an options object")
+    }
+    if (o.leads ?? nil) == nil { return __tab_f.error("tab_package: leads is required") }
+    if (o.pitch ?? nil) == nil { return __tab_f.error("tab_package: pitch is required") }
+    if (o.body ?? nil) == nil { return __tab_f.error("tab_package: body is required") }
+    if (o.span ?? nil) == nil { return __tab_f.error("tab_package: span is required") }
+    if (o.lead ?? nil) == nil { return __tab_f.error("tab_package: lead is required") }
+    if (o.tab ?? nil) == nil { return __tab_f.error("tab_package: tab is required") }
+    if !o.leads.is_number() || o.leads < 2 || o.leads > 7 || o.leads % 1 != 0 {
+        return __tab_f.error("tab_package: leads must be an integer from 2 to 7")
+    }
+    if !__tab_positive(o.pitch) {
+        return __tab_f.error("tab_package: pitch must be a positive finite length")
+    }
+    if !o.body.is_array() || o.body.len() != 2 {
+        return __tab_f.error("tab_package: body must be [x, y]")
+    }
+    if !__tab_positive(o.body[0]) || !__tab_positive(o.body[1]) {
+        return __tab_f.error("tab_package: body dimensions must be positive finite lengths")
+    }
+    if !__tab_positive(o.span) || o.span <= o.body[1] {
+        return __tab_f.error("tab_package: span must be a positive finite length greater than body y")
+    }
+    if !o.lead.is_array() || o.lead.len() != 2 {
+        return __tab_f.error("tab_package: lead must be [width, foot length]")
+    }
+    if !__tab_positive(o.lead[0]) || !__tab_positive(o.lead[1]) {
+        return __tab_f.error("tab_package: lead dimensions must be positive finite lengths")
+    }
+    if 2 * o.lead[1] > o.span - o.body[1] {
+        return __tab_f.error("tab_package: lead foot length must fit between body and span")
+    }
+    if !o.tab.is_array() || o.tab.len() != 2 {
+        return __tab_f.error("tab_package: tab must be [width, foot length]")
+    }
+    if !__tab_positive(o.tab[0]) || !__tab_positive(o.tab[1]) {
+        return __tab_f.error("tab_package: tab dimensions must be positive finite lengths")
+    }
+    if o.tab[0] > o.body[0] {
+        return __tab_f.error("tab_package: tab width must fit inside body x")
+    }
+    let half_row = (o.leads - 1) * o.pitch / 2
+    if 2 * half_row + o.lead[0] > o.body[0] {
+        return __tab_f.error("tab_package: body x must contain the lead positions at the specified pitch and lead width")
+    }
+    let skip = o.skip ?? []
+    if !skip.is_array() {
+        return __tab_f.error("tab_package: skip must be a list of 1-based lead positions")
+    }
+    for i in 0..skip.len() {
+        if !skip[i].is_number() || skip[i] < 1 || skip[i] > o.leads || skip[i] % 1 != 0 {
+            return __tab_f.error("tab_package: skip positions must be integers from 1 to leads")
+        }
+    }
+    let tab_no = o.tab_no ?? (o.leads + 1)
+    if !tab_no.is_number() || tab_no <= 0 || tab_no % 1 != 0 {
+        return __tab_f.error("tab_package: tab_no must be a positive integer")
+    }
+    let lead_land = __tab_land(o.span, o.lead, 0.35mm, 0.03mm)
+    let tab_land = __tab_land(o.span, o.tab, 0mm, 0mm)
+    if !__tab_positive(lead_land.size[0]) || !__tab_positive(lead_land.size[1]) {
+        return __tab_f.error("tab_package: lead land dimensions must remain positive and finite after rounding")
+    }
+    if !__tab_positive(tab_land.size[0]) || !__tab_positive(tab_land.size[1]) {
+        return __tab_f.error("tab_package: tab land dimensions must remain positive and finite after rounding")
+    }
+    if lead_land.size[0] >= o.pitch {
+        return __tab_f.error("tab_package: pitch must exceed the rounded lead land width")
+    }
+    // The tab foot may extend beneath the body, but not into the lead row.
+    let gap = lead_land.y + tab_land.y - (lead_land.size[1] + tab_land.size[1]) / 2
+    if gap <= 0mm {
+        return __tab_f.error("tab_package: span, lead and tab foot lengths must leave space between the lands")
+    }
+    let pads = []
+    for i in 0..o.leads {
+        if !__tab_skipped(skip, i + 1) {
+            pads.push(__tab_f.smd(__tab_f.int(i + 1),
+                [-half_row + i * o.pitch, -lead_land.y], lead_land.size))
+        }
+    }
+    if pads.len() == 0 {
+        return __tab_f.error("tab_package: skip must leave at least one lead position")
+    }
+    pads.push(__tab_f.smd(__tab_f.int(tab_no), [0mm, tab_land.y], tab_land.size))
+    let half_x = o.body[0] / 2
+    let half_y = o.body[1] / 2
+    // Keep the position-1 marker even when that lead position is skipped.
+    return __tab_f.footprint({
+        pads: pads
+        body: [[-half_x, -half_y], [half_x, half_y]]
+        mount: @smd
+        text: 1mm
+        graphics: [__tab_f.dot("F.SilkS", [-half_row, -lead_land.y - 0.7mm], 0.15mm)]
+    })
+}
+
+// Three gull-wing leads and a separate wide heat tab; no parameters.
+let sot223 = fn() {
+    return tab_package({
+        leads: 3
+        pitch: 2.3mm
+        body: [6.5mm, 3.5mm]
+        span: 7.0mm
+        lead: [0.7mm, 0.9mm]
+        tab: [3.0mm, 0.9mm]
+        tab_no: 4
+    })
+}
+
+// Two outer gull-wing leads and a broad heat tab numbered 2; no parameters.
+let to252 = fn() {
+    return tab_package({
+        leads: 3
+        skip: [2]
+        pitch: 2.28mm
+        body: [6.5mm, 6.1mm]
+        span: 9.9mm
+        lead: [0.76mm, 1.0mm]
+        tab: [5.3mm, 5.5mm]
+        tab_no: 2
+    })
+}

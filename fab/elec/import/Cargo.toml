@@ -1,0 +1,18 @@
+[package]
+name = "fab-elec-import"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab electronics part import (EPARTS): the part mesh with materials, its .glb, the OBJ/MTL and VRML readers, and the converters from part sources into Splash parts"
+
+[package.metadata.makepad.platform-gaps]
+windows = {}
+
+[dependencies]
+makepad-gltf = { path = "../../../../../libs/gltf" }
+makepad-core-util = { path = "../../../../../libs/core_util" }
+makepad-strict-json = { path = "../../../../../libs/strict_json" }
+
+[dev-dependencies]
+fab-elec-lang = { path = "../lang" }

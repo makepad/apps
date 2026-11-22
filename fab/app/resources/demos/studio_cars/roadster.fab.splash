@@ -1,0 +1,19 @@
+// A boat-tailed roadster in two tones, a strip along its waist: the rally car's steering and
+// running gear under a long bonnet, in four filaments (in nine, the strip and the rims are
+// chrome and the tyres whitewalls).
+use mod.fab.*
+
+script("studio_car.cad.splash", params: {style: 2})
+
+color("Cream", rgb: #xede0c2)
+color("Burgundy", rgb: #x730f1f)
+color("Silver", rgb: #xb3b8bf)
+color("Clear", rgb: #x9fc4d6)
+color("Tan", rgb: #x8c592e)
+color("Yellow", rgb: #xfac81a)
+color("Red", rgb: #xcc100d)
+color("Tyre", rgb: #x1f1f1f)
+color("White", rgb: #xebebe5)
+
+// The floor prints on supports from the bed, which come away between the wheels.
+place("studio_car", object: "Roadster", at: [175mm 160mm], name: "Roadster", color: "Cream", settings: {enable_support: true support_on_build_plate_only: true})

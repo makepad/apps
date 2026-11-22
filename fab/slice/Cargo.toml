@@ -1,0 +1,56 @@
+[package]
+name = "makepad-fab-slice"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "The Fab slicing pipeline (models + printer profile → .gcode.3mf with preview records) and the fab-slice command"
+
+[[bin]]
+name = "fab-slice"
+path = "src/main.rs"
+
+[[bin]]
+name = "fab-parity"
+path = "src/bin/fab-parity.rs"
+
+[[bin]]
+name = "fab-slicebench"
+path = "src/bin/fab-slicebench.rs"
+
+[dependencies]
+makepad-fab-slicer = { path = "../slicer" }
+makepad-fab-toolpath = { path = "../toolpath" }
+makepad-fab-gcode = { path = "../gcode" }
+makepad-fab-package = { path = "../package" }
+makepad-fab-settings = { path = "../settings" }
+makepad-strict-json = { path = "../../../../libs/strict_json" }
+fab-plate = { path = "../plate" }
+fab-printability = { path = "../printability" }
+makepad-zip-file = { path = "../../../../libs/zip_file" }
+makepad-csg-sdf = { path = "../../../../libs/csg/csg_sdf" }
+makepad-csg-math = { path = "../../../../libs/csg/csg_math" }
+makepad-csg-cad = { path = "../../../../libs/csg/csg_cad" }
+# `fab-slice fab` slices a Fab document as Fab builds it.
+fab-model = { path = "../model" }
+fab-colour = { path = "../colour" }
+
+[dev-dependencies]
+fab-sdf-engine = { path = "../sdf_engine" }
+
+[lints.rust]
+# Under the JIT (`cfg(relax)`) a live patch moves the code a slice's results are kept under.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(relax)"] }
+
+# The plate bench (timed, never part of the tests): `cargo bench -p makepad-fab-slice --bench plate`.
+[[bench]]
+name = "plate"
+harness = false
+
+# The material bench (timed): `cargo bench -p makepad-fab-slice --bench material`.
+[[bench]]
+name = "material"
+harness = false
+
+[package.metadata.commercial]
+include = ["../app/resources/demo.fab.splash", "../app/resources/bracket.cad.splash", "../app/resources/vase.cad.splash", "../app/resources/voronoi_vase.cad.splash", "../app/resources/lattice_cube.cad.splash", "../app/resources/motor_mount.cad.splash", "../app/resources/noise_paint.splash", "../app/resources/marble_block.cad.splash", "../app/resources/voronoi_paint.splash", "../app/resources/gradient_paint.splash", "../app/resources/slice_bench_plate.fab.splash", "../app/resources/slice_bench_plate.cad.splash"]

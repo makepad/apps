@@ -1,0 +1,596 @@
+let e = mod.elec
+let f = mod.elec.f
+
+// Shared chip dimensions (mm); package is 0201, 0402, 0603, 0805, 1206, 1210, 2010 or 2512.
+let __chip_layout = fn(package) {
+    if package == "0402" {
+        return {
+            size: [0.56mm, 0.62mm]
+            x: 0.48mm
+            body: [[-0.5mm, -0.25mm], [0.5mm, 0.25mm]]
+        }
+    }
+    if package == "0603" {
+        return {
+            size: [0.9mm, 0.95mm]
+            x: 0.8mm
+            body: [[-0.8mm, -0.4mm], [0.8mm, 0.4mm]]
+        }
+    }
+    // Nominal body length, width and terminal length; heel and side goals are zero.
+    let __lands = fn(length, width, terminal, toe) {
+        let z = length + 2 * toe
+        let g = length - 2 * terminal
+        return {
+            size: [f.round((z - g) / 2, 0.01mm), f.round(width, 0.01mm)]
+            x: f.round((z + g) / 4, 0.01mm)
+            body: [[-length / 2, -width / 2], [length / 2, width / 2]]
+        }
+    }
+    if package == "0201" {
+        return __lands(0.6mm, 0.3mm, 0.15mm, 0.1mm)
+    }
+    if package == "0805" {
+        return __lands(2.0mm, 1.25mm, 0.4mm, 0.35mm)
+    }
+    if package == "1206" {
+        return __lands(3.2mm, 1.6mm, 0.5mm, 0.35mm)
+    }
+    if package == "1210" {
+        return __lands(3.2mm, 2.5mm, 0.5mm, 0.35mm)
+    }
+    if package == "2010" {
+        return __lands(5.0mm, 2.5mm, 0.6mm, 0.35mm)
+    }
+    if package == "2512" {
+        return __lands(6.35mm, 3.2mm, 0.6mm, 0.35mm)
+    }
+    return f.error("chip: package " + package + " is not in the table (0201, 0402, 0603, 0805, 1206, 1210, 2010, 2512)")
+}
+
+// A round port on a body's top face pointing away from the board (a light, a button): radius r
+// round the body's axis at height, clearance margin, reach in front of it.
+let top_port = fn(kind, height, r, margin, reach) {
+    return {kind: kind profile: {circle: r} at: [0mm, 0mm, height] dir: [0, 0, 1] reach: reach margin: margin}
+}
+
+// Nominal chip heights above the board: resistors and fuses are thin films, capacitors and
+// inductors grow with their size.
+let __chip_height = fn(prefix, package) {
+    let thin = prefix == "R" || prefix == "F"
+    let packages = ["0201", "0402", "0603", "0805", "1206", "1210", "2010", "2512"]
+    let heights = if thin {
+        [0.23mm, 0.35mm, 0.45mm, 0.5mm, 0.55mm, 0.55mm, 0.55mm, 0.55mm]
+    } else {
+        [0.3mm, 0.5mm, 0.8mm, 1.25mm, 1.6mm, 2.5mm, 2.5mm, 2.5mm]
+    }
+    for i in 0..packages.len() {
+        if packages[i] == package { return heights[i] }
+    }
+    return 0.55mm
+}
+
+// A schematic marker for an externally supplied net.
+let power_flag = fn() {
+    let name = "PWR_FLAG"
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    return e.define(name, {
+        kind: @power_flag
+        symbol: f.ic_symbol(name, {bottom: [["1" @power_out]]})
+        prefix: "#FLG"
+    })
+}
+
+// A two-terminal chip; prefix is R, C, L or F, package is any shared chip-table entry.
+let chip = fn(prefix, package) {
+    let name = prefix + "_" + package
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    if prefix != "R" && prefix != "C" && prefix != "L" && prefix != "F" {
+        return f.error("chip: prefix must be R, C, L or F")
+    }
+    let layout = __chip_layout(package)
+    if layout == nil { return nil }
+    let kind = if prefix == "R" {
+        @resistor
+    } elif prefix == "C" {
+        @capacitor
+    } elif prefix == "L" {
+        @inductor
+    } else {
+        @fuse
+    }
+    return e.define(name, {
+        kind: kind
+        symbol: f.two_terminal([["1", @passive], ["2", @passive]])
+        footprint: f.footprint({
+            pads: [
+                f.smd("1", [-layout.x, 0mm], layout.size),
+                f.smd("2", [layout.x, 0mm], layout.size)
+            ]
+            body: layout.body
+            mount: @smd
+            text: 0.6mm
+            graphics: []
+        })
+        body: {height: __chip_height(prefix, package) package: @chip}
+        pads: [["1", "1"], ["2", "2"]]
+        prefix: prefix
+    })
+}
+
+// The walls of a chip LED's clear dome as emitting faces beside its top (the light port's face),
+// for a body `body` ([[x0, y0], [x1, y1]], x along the pads) `height` tall.
+// Source: Kingbright APT1608SGC data sheet, DSAD0932 rev V.22B (2023-12-07), a 1.6 x 0.8 x 0.75 mm
+// water-clear 0603 chip LED. Its drawing gives a clear dome 0.5 mm tall on a 0.25 mm substrate, the
+// dome's top 1.1-1.2 mm long over a 1.6 mm base, so its walls lean about 22 degrees off vertical,
+// and it lights all round with nothing below the board. Its stated viewing angle (the full angle
+// at half intensity) is 150 degrees. Its polar plot, read by eye to within 0.05: 1.00 at 0 degrees,
+// .93 at 30, .83 at 45, .70 at 60, .56 at 75, .45 at 85 and .38 at 90.
+// The model: the top and four walls, each a Lambertian face. The walls' normals lean 66 degrees off
+// vertical (the walls 24 degrees, within the drawing's "about 22"). The long walls take 2/3 of the
+// walls' share and the end walls 1/3, by area. The walls' share, 0.646 (the top keeps 0.354), puts
+// the half intensity at the stated 150 degrees, averaged round the axis. The plot's points then fit
+// within 0.08 (the model runs low past 75 degrees).
+// Each package's dome takes the same shape at its own size: two thirds of the height, over the body.
+let __led_walls = fn(body, height) {
+    let length = body[1][0] - body[0][0]
+    let width = body[1][1] - body[0][1]
+    let cx = (body[0][0] + body[1][0]) / 2
+    let cy = (body[0][1] + body[1][1]) / 2
+    let dome = height * 2 / 3
+    // tan 24 and cos 24 for the walls' lean; sin 66 and cos 66 for their normals
+    let inset = dome * 0.445229
+    let slant = dome / 0.913545
+    let out = 0.913545
+    let up = 0.406737
+    let z = height - dome / 2
+    return [
+        {at: [cx + length / 2 - inset / 2, cy, z] dir: [out, 0, up] size: [width - inset, slant] share: 0.108}
+        {at: [cx - length / 2 + inset / 2, cy, z] dir: [-out, 0, up] size: [width - inset, slant] share: 0.108}
+        {at: [cx, cy + width / 2 - inset / 2, z] dir: [0, out, up] size: [length - inset, slant] share: 0.215}
+        {at: [cx, cy - width / 2 + inset / 2, z] dir: [0, -out, up] size: [length - inset, slant] share: 0.215}
+    ]
+}
+
+// A two-terminal LED with a cathode bar; package is any shared chip-table entry, color an LED
+// colour name ("red", "green", ..): the die is part of the part, so each colour is its own part.
+let led_part = fn(package, color) {
+    let name = "LED_" + package + "_" + color
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    let layout = __chip_layout(package)
+    if layout == nil { return nil }
+    let x = -layout.x - layout.size[0] / 2 - 0.2mm
+    return e.define(name, {
+        kind: @led
+        symbol: f.two_terminal([["A", @passive], ["K", @passive]])
+        footprint: f.footprint({
+            pads: [
+                f.smd("1", [-layout.x, 0mm], layout.size),
+                f.smd("2", [layout.x, 0mm], layout.size)
+            ]
+            body: layout.body
+            mount: @smd
+            text: 0.6mm
+            graphics: [f.stroke("F.SilkS", [[x, -0.4mm], [x, 0.4mm]], 0.12mm)]
+        })
+        // the clear dome on top: light leaves up through its top and sideways through its walls
+        body: {height: 0.6mm ports: [top_port(@light, 0.6mm, 0.5mm, 0.2mm, 10mm)]}
+        // about 0.3 lm at 20 mA, in a 150-degree beam: about 60 mcd on its axis
+        emitter: {angle: 120deg light: color flux_per_a: 15 faces: __led_walls(layout.body, 0.6mm)}
+        pads: {A: 2 K: 1}
+        prefix: "D"
+    })
+}
+
+// A fixed 3.3 V low-dropout regulator in a 5-pin SOT-23: VIN 2.5 to 6 V, VOUT 3.3 V at up to
+// 600 mA. The ldo block's default part.
+let ldo_3v3 = fn() {
+    let name = "LDO_3V3_SOT23-5"
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    return e.define(name, {
+        kind: @regulator
+        symbol: ic_symbol("LDO_3V3", {left: [["VIN" @power_in] ["EN" @in]] right: [["VOUT" @power_out]]
+                                      bottom: [["GND" @power_in]] top: [["NC" @no_connect]]})
+        footprint: sot23({pins: 5})
+        body: {height: 1.1mm package: @sop}
+        pads: {VIN: 1 GND: 2 EN: 3 NC: 4 VOUT: 5}
+        limits: {VIN: {volts: [2.5V 6V]} VOUT: {volts: [3.3V 3.3V] current: 600mA}}
+    })
+}
+
+// A small-outline footprint; o.pins is 3, 5 or 6.
+let sot23 = fn(o) {
+    if !o.is_object() { return f.error("sot23: o must be an options object") }
+    if (o.pins ?? nil) == nil { return f.error("sot23: pins is required") }
+    let positions = if o.pins == 3 {
+        [[-0.95mm, -1.1mm], [0.95mm, -1.1mm], [0mm, 1.1mm]]
+    } elif o.pins == 5 {
+        [[-0.95mm, -1.1mm], [0mm, -1.1mm], [0.95mm, -1.1mm],
+         [0.95mm, 1.1mm], [-0.95mm, 1.1mm]]
+    } elif o.pins == 6 {
+        [[-0.95mm, -1.1mm], [0mm, -1.1mm], [0.95mm, -1.1mm],
+         [0.95mm, 1.1mm], [0mm, 1.1mm], [-0.95mm, 1.1mm]]
+    } else {
+        return f.error("sot23: pins must be 3, 5 or 6")
+    }
+    let pads = for i in 0..o.pins {
+        f.smd(f.int(i + 1), positions[i], [0.6mm, 1.1mm])
+    }
+    return f.footprint({
+        pads: pads
+        body: [[-1.45mm, -0.8mm], [1.45mm, 0.8mm]]
+        mount: @smd
+        text: 0.8mm
+        graphics: []
+    })
+}
+
+// A two-column footprint; o has even pins, pitch, body [length, width], span and lead [width, length].
+let tssop = fn(o) {
+    if !o.is_object() { return f.error("tssop: o must be an options object") }
+    if (o.pins ?? nil) == nil { return f.error("tssop: pins is required") }
+    if (o.pitch ?? nil) == nil { return f.error("tssop: pitch is required") }
+    if (o.body ?? nil) == nil { return f.error("tssop: body is required") }
+    if (o.span ?? nil) == nil { return f.error("tssop: span is required") }
+    if (o.lead ?? nil) == nil { return f.error("tssop: lead is required") }
+    if o.pins < 2 || o.pins % 2 != 0 {
+        return f.error("tssop: pins must be a positive even integer")
+    }
+    let half = o.pins / 2
+    let top_y = (half - 1) * o.pitch / 2
+    let x = (o.span - o.lead[1]) / 2
+    let size = [o.lead[1] + 0.9mm, o.lead[0] + 0.1mm]
+    let pads = for i in 0..o.pins {
+        let at = if i < half {
+            [-x, top_y - i * o.pitch]
+        } else {
+            [x, -top_y + (i - half) * o.pitch]
+        }
+        f.smd(f.int(i + 1), at, size)
+    }
+    let half_length = o.body[0] / 2
+    let half_width = o.body[1] / 2
+    return f.footprint({
+        pads: pads
+        body: [[-half_width, -half_length], [half_width, half_length]]
+        mount: @smd
+        text: 1mm
+        graphics: [f.dot("F.SilkS", [-x, top_y + 0.7mm], 0.15mm)]
+    })
+}
+
+// A single-row through-hole header; o.pins is the pin count and o.pitch is the spacing.
+let header = fn(o) {
+    if !o.is_object() { return f.error("header: o must be an options object") }
+    if (o.pins ?? nil) == nil { return f.error("header: pins is required") }
+    if (o.pitch ?? nil) == nil { return f.error("header: pitch is required") }
+    let name = "PinHeader_1x" + f.int(o.pins) + "_P" + f.mm(o.pitch) + "mm"
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    if o.pins < 1 || o.pins % 1 != 0 {
+        return f.error("header: pins must be a positive integer")
+    }
+    let land = f.round(o.pitch * 0.8, 0.01mm)
+    let drill = f.round(o.pitch * 0.5, 0.01mm)
+    let pads = for i in 0..o.pins {
+        f.thru(f.int(i + 1), [0mm, -i * o.pitch], land, drill, {square: i == 0})
+    }
+    let left = for i in 0..o.pins { [f.int(i + 1), @passive] }
+    let pad_map = for i in 0..o.pins {
+        let no = f.int(i + 1)
+        [no, no]
+    }
+    return e.define(name, {
+        kind: @connector
+        symbol: f.ic_symbol(name, {left: left})
+        footprint: f.footprint({
+            pads: pads
+            body: [[-o.pitch / 2, -(o.pins - 1) * o.pitch - o.pitch / 2],
+                   [o.pitch / 2, o.pitch / 2]]
+            mount: @thru
+            text: 1mm
+            graphics: []
+        })
+        body: {height: 2.5mm}
+        pads: pad_map
+        prefix: "J"
+    })
+}
+
+// A power-only USB-C receptacle: six contacts in a row behind the shell (the two ground contacts
+// outermost and wider), held by four slotted shell legs; no parameters.
+let usb_c_receptacle = fn() {
+    let name = "USB_C_POWER"
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    let ground = [0.8mm, 1.2mm]
+    let size = [0.7mm, 1.2mm]
+    // a leg's land and its slot, both longer along the plug's axis
+    let land = [1.1mm, 1.9mm]
+    let slot = [0.6mm, 1.3mm]
+    return e.define(name, {
+        kind: @connector
+        symbol: f.ic_symbol(name, {
+            right: [["VBUS", @power_out], ["CC1", @passive], ["CC2", @passive]]
+            bottom: [["GND", @power_out], ["SHIELD", @passive]]
+        })
+        footprint: f.footprint({
+            pads: [
+                f.smd("B12", [-2.7mm, 2.025mm], ground),
+                f.smd("B9", [-1.5mm, 2.025mm], size),
+                f.smd("A5", [-0.5mm, 2.025mm], size),
+                f.smd("B5", [0.5mm, 2.025mm], size),
+                f.smd("A9", [1.5mm, 2.025mm], size),
+                f.smd("A12", [2.7mm, 2.025mm], ground),
+                f.thru("S1", [-4.32mm, 1.775mm], land, slot),
+                f.thru("S1", [4.32mm, 1.775mm], land, slot),
+                f.thru("S1", [-4.32mm, -2.025mm], land, slot),
+                f.thru("S1", [4.32mm, -2.025mm], land, slot)
+            ]
+            body: [[-4.47mm, -4.625mm], [4.47mm, 2.175mm]]
+            mount: @smd
+            text: 1mm
+            graphics: []
+        })
+        // the mouth on the -Y edge, centred in the 3.16 mm shell: a plug goes in along +Y and its
+        // overmould needs 6.6 mm in front of the mouth
+        body: {height: 3.16mm ports: [{
+            kind: @plug profile: {rect: [[-4.47mm, -1.58mm], [4.47mm, 1.58mm]] r: 1.55mm}
+            at: [0mm, -4.625mm, 1.58mm] dir: [0, -1, 0] reach: 6.6mm margin: 0.3mm
+        }]}
+        pads: {VBUS: ["A9", "B9"] CC1: "A5" CC2: "B5" GND: ["A12", "B12"] SHIELD: "S1"}
+        limits: {VBUS: {volts: 5V current: 1.5A}}
+        prefix: "J"
+    })
+}
+
+// A right-angle 3.5 mm audio jack, through-hole, with three pins and no switch: a 6 x 11.15 mm body
+// 5 mm tall and a 5 mm round nose 3 mm long out of its -Y edge, the plug's axis 2.5 mm over the
+// board. The pins, their slots and the two locating pegs are the stock part's, seen from above
+// with the origin at the body's centre. o.stereo (default true) gives tip, ring and sleeve;
+// false gives tip and sleeve. Its role is an audio output (`fields.audio`): the tip is the left
+// channel (the only one on a mono jack), the ring the right, the sleeve the reference, so a host
+// can hear it by its data alone. The case opens round its mouth for a plug's overmould.
+let jack_3_5mm = fn(o) {
+    let stereo = o.stereo ?? true
+    if stereo != true && stereo != false { return f.error("jack_3_5mm: stereo must be true or false") }
+    let name = if stereo { "JACK_3.5MM_STEREO" } else { "JACK_3.5MM_MONO" }
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    // Each pin is a 0.6 x 1.5 mm slot, long along the plug's axis. The distributor's footprint
+    // draws 1.0 x 1.6 mm oval lands round them, which leave 0.05 mm of copper past a slot's ends,
+    // under the 0.075 mm standard ring; these lands are 1.2 x 2.0 mm, a 0.25 to 0.3 mm ring.
+    let land = [1.2mm, 2.0mm]
+    let slot = [0.6mm, 1.5mm]
+    let pads = [f.thru("S", [2.25mm, -3.425mm], land, slot, {square: true}), f.thru("T", [2.05mm, 3.575mm], land, slot)]
+    let left = [["T", @passive]]
+    if stereo {
+        pads.push(f.thru("R", [-2.25mm, -1.425mm], land, slot))
+        left.push(["R", @passive])
+    } else {
+        // a mono jack leaves its ring pin unsoldered, in an unplated slot
+        pads.push(f.thru("", [-2.25mm, -1.425mm], slot, slot, {plated: false}))
+    }
+    // the body's two locating pegs, in unplated holes
+    pads.push(f.thru("", [0mm, -3.475mm], 1.2mm, 1.2mm, {plated: false}))
+    pads.push(f.thru("", [0mm, 2.525mm], 1.2mm, 1.2mm, {plated: false}))
+    let stereo_map = {T: "T" R: "R" S: "S"}
+    let mono_map = {T: "T" S: "S"}
+    // the bench takes the jack itself as wire: whatever a host plugs in is the load
+    let stereo_role = {audio: "out" audio_left: "T" audio_right: "R" audio_ref: "S" sim: "passive"}
+    let mono_role = {audio: "out" audio_left: "T" audio_ref: "S" sim: "passive"}
+    return e.define(name, {
+        kind: @connector
+        symbol: f.ic_symbol(name, {left: left bottom: [["S", @passive]]})
+        footprint: f.footprint({
+            pads: pads
+            // the body and its nose: the nose rests on the board, so its footprint keeps parts off
+            body: [[-3.0mm, -8.575mm], [3.0mm, 5.575mm]]
+            mount: @thru
+            text: 1mm
+            graphics: []
+        })
+        // the mouth at the nose's tip round the plug's axis; a plug's overmould needs a 6 mm round
+        // opening and 10 mm in front of the mouth
+        body: {height: 5.0mm ports: [{
+            kind: @plug profile: {circle: 3.0mm}
+            at: [0mm, -8.575mm, 2.5mm] dir: [0, -1, 0] reach: 10mm margin: 0.3mm
+        }]}
+        pads: if stereo { stereo_map } else { mono_map }
+        prefix: "J"
+        fields: if stereo { stereo_role } else { mono_role }
+    })
+}
+
+// A low-profile tactile switch, 5.1 mm square and 1.5 mm tall: two terminals, each on the two pads
+// of one row; no parameters.
+let tact_switch = fn() {
+    let name = "SW_TACT_4PAD"
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    let size = [1.0mm, 0.75mm]
+    return e.define(name, {
+        kind: @switch
+        symbol: f.two_terminal([["A", @passive], ["B", @passive]])
+        footprint: f.footprint({
+            pads: [
+                f.smd("1", [-3.0mm, 1.85mm], size),
+                f.smd("2", [3.0mm, 1.85mm], size),
+                f.smd("3", [-3.0mm, -1.85mm], size),
+                f.smd("4", [3.0mm, -1.85mm], size)
+            ]
+            body: [[-2.55mm, -2.55mm], [2.55mm, 2.55mm]]
+            mount: @smd
+            text: 1mm
+            graphics: []
+        })
+        // its plunger on top, 2.5 mm across; a finger or a case's press pin pushes it down 0.25 mm
+        // to switch. It stands 0.3 mm out of the housing, as measured on a supplier's model of a
+        // 5.1 mm low-profile tactile switch (housing top 1.25 mm, plunger top 1.55 mm).
+        body: {height: 1.5mm ports: [{kind: @press profile: {circle: 1.25mm} at: [0mm, 0mm, 1.5mm] dir: [0, 0, 1] reach: 10mm margin: 0.75mm travel: 0.25mm stand: 0.3mm}]}
+        pads: {A: [1, 2] B: [3, 4]}
+        prefix: "SW"
+    })
+}
+
+// A single op-amp in a 5-pin SOT-23, the common single op-amp pinout: 1 OUT, 2 VSS, 3 INP (+),
+// 4 INN (-), 5 VDD. Simulated as the model library's op-amp (rail-to-rail CMOS); no parameters.
+// An analog part: its nets draw as waveforms.
+let opamp_sot23 = fn() {
+    let name = "OPAMP_SOT23-5"
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    return e.define(name, {
+        kind: @analog
+        symbol: f.opamp_symbol([["INP" @in] ["INN" @in] ["OUT" @out] ["VDD" @power_in] ["VSS" @power_in]])
+        footprint: sot23({pins: 5})
+        body: {height: 1.1mm package: @sop}
+        pads: {OUT: 1 VSS: 2 INP: 3 INN: 4 VDD: 5}
+        limits: {VDD: {volts: [1.8V 5.5V]}}
+        prefix: "U"
+    })
+}
+
+// A 9 mm board-mount pot, shaft upright: the track's ends A and B and the wiper W in a row at 2.5 mm
+// on the front edge, two mounting lugs behind them. Its value is the track's resistance; its
+// `pos` field (0 to 1) is where the wiper starts and its `taper` field (`lin`, `log`) its law. Its
+// `label` field (any part's) says what it does: the bench names its knob by it, and the board
+// prints it beside the part as a silkscreen legend.
+// The pads, the housing and the shaft are measured from a stock 9 mm pot's 3D model. The body is
+// the housing (10 x 11 mm, 7.4 mm tall); the shaft above it is the body's @shaft port, not part
+// of its box.
+let pot_9mm = fn() {
+    let name = "POT_9MM_V"
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    return e.define(name, {
+        kind: @potentiometer
+        symbol: f.ic_symbol(name, {left: [["A" @passive] ["B" @passive]] right: [["W" @passive]]})
+        footprint: f.footprint({
+            pads: [
+                f.thru("1", [-2.5mm, 0mm], 1.8mm, 1.0mm, {square: true}),
+                f.thru("2", [0mm, 0mm], 1.8mm, 1.0mm),
+                f.thru("3", [2.5mm, 0mm], 1.8mm, 1.0mm),
+                f.thru("MP", [-4.4mm, 7.0mm], 3.0mm, 2.0mm),
+                f.thru("MP", [4.4mm, 7.0mm], 3.0mm, 2.0mm)
+            ]
+            body: [[-5.0mm, -1.5mm], [5.0mm, 9.5mm]]
+            mount: @thru
+            text: 1mm
+            graphics: []
+        })
+        // a 6.1 mm round shaft standing 12.3 mm out of the 7.4 mm housing, on the mounting lugs'
+        // line: a case opens its lid round it and a knob goes on its tip
+        body: {height: 7.4mm ports: [{kind: @shaft profile: {circle: 3.05mm} at: [0mm, 7mm, 19.7mm] dir: [0, 0, 1] reach: 10mm margin: 0.5mm stand: 12.3mm}]}
+        pads: {A: "1" W: "2" B: "3"}
+        prefix: "RV"
+    })
+}
+
+// A small-signal NPN in SOT-23 (pin 1 base, 2 emitter, 3 collector: the common order), the 200 mA
+// class; it simulates with the signal NPN card.
+let npn_sot23 = fn() {
+    let name = "Q_NPN_SOT23"
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    return e.define(name, {
+        kind: @transistor
+        symbol: f.ic_symbol(name, {left: [["B" @in]] right: [["C" @passive] ["E" @passive]]})
+        footprint: sot23({pins: 3})
+        body: {height: 1.1mm package: @sop}
+        pads: {B: 1 E: 2 C: 3}
+        fields: {model: "Q_NPN_SIGNAL"}
+        prefix: "Q"
+    })
+}
+
+// A hex Schmitt-trigger inverter in SOIC-14, the common pinout: sections 1 to 3 down the left
+// side (A1 in, Y1 out, ..), ground at pin 7, sections 4 to 6 up the right side (Y4 out, A4 in,
+// ..), supply at pin 14. The high-speed CMOS class at 2 to 6 V.
+let schmitt_hex_soic14 = fn() {
+    let name = "SCHMITT_HEX_SOIC-14"
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    return e.define(name, {
+        kind: @ic
+        symbol: f.ic_symbol(name, {
+            left: [["A1" @in] ["A2" @in] ["A3" @in] ["A4" @in] ["A5" @in] ["A6" @in]]
+            right: [["Y1" @out] ["Y2" @out] ["Y3" @out] ["Y4" @out] ["Y5" @out] ["Y6" @out]]
+            top: [["VCC" @power_in]]
+            bottom: [["GND" @power_in]]
+        })
+        footprint: mod.std.soic_narrow(14)
+        body: {height: 1.75mm package: @sop}
+        pads: {A1: 1 Y1: 2 A2: 3 Y2: 4 A3: 5 Y3: 6 GND: 7 Y4: 8 A4: 9 Y5: 10 A5: 11 Y6: 12 A6: 13 VCC: 14}
+        limits: {VCC: {volts: [2V 6V]}}
+        prefix: "U"
+    })
+}
+
+// An 8-bit shift register with output latch in a narrow SOIC-16, in the common pinout of that
+// function: a rising SRCLK shifts SER in, a rising RCLK copies the stages to QA..QH, OE low
+// enables them, SRCLR low clears the stages, QHS carries stage H out to the next register's SER.
+// Simulated on the digital side beside the board's firmware: its inputs on nets that only the MCU
+// drives cost the circuit nothing, and its outputs are pins in the circuit.
+let shift_latch8_soic16 = fn() {
+    let name = "SHIFT_LATCH8_SOIC-16"
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    return e.define(name, {
+        kind: @ic
+        symbol: f.ic_symbol(name, {
+            left: [["SER" @in] ["SRCLK" @in] ["RCLK" @in] ["SRCLR" @in] ["OE" @in]]
+            right: [["QA" @out] ["QB" @out] ["QC" @out] ["QD" @out] ["QE" @out] ["QF" @out] ["QG" @out] ["QH" @out] ["QHS" @out]]
+            top: [["VCC" @power_in]]
+            bottom: [["GND" @power_in]]
+        })
+        footprint: mod.std.soic_narrow(16)
+        body: {height: 1.75mm package: @sop}
+        pads: {QB: 1 QC: 2 QD: 3 QE: 4 QF: 5 QG: 6 QH: 7 GND: 8 QHS: 9 SRCLR: 10 SRCLK: 11 RCLK: 12 OE: 13 SER: 14 QA: 15 VCC: 16}
+        limits: {VCC: {volts: [2V 6V]}}
+        prefix: "U"
+    })
+}
+
+// A low-profile mechanical key switch, soldered: two pins, a centre post and a fixing leg through
+// the board, its housing on top and its round stem pressed to switch; it simulates as a button.
+// Every size is the maker's (Kailh's PG1353 drawing): the pins, the unplated 5.0 mm centre hole and
+// 1.6 mm leg hole, the 15 mm housing 5.4 mm tall, the 6.5 mm stem with its top 8.7 mm over the
+// board, and its 3.2 mm travel. The stem takes a keycap on an MX cross (4.00 mm across, 1.30 mm
+// arms), which the Note records.
+let key_switch_low = fn() {
+    let name = "SW_KEY_LOWPROFILE"
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    return e.define(name, {
+        kind: @switch
+        symbol: f.two_terminal([["A", @passive], ["B", @passive]])
+        footprint: f.footprint({
+            pads: [
+                f.thru("1", [0mm, 5.9mm], 2.0mm, 1.2mm),
+                f.thru("2", [5.0mm, 3.8mm], 2.0mm, 1.2mm),
+                f.thru("", [0mm, 0mm], 5.0mm, 5.0mm, {plated: false}),
+                f.thru("", [-5.0mm, -5.15mm], 1.6mm, 1.6mm, {plated: false})
+            ]
+            body: [[-7.5mm, -7.5mm], [7.5mm, 7.5mm]]
+            mount: @thru
+            text: 1mm
+            graphics: []
+        })
+        // the round stem stands 3.3 mm out of the 5.4 mm housing, its top 8.7 mm over the board
+        // (the press port's `at`); a finger or a keycap pushes it its 3.2 mm
+        body: {height: 8.7mm ports: [{kind: @press profile: {circle: 3.25mm} at: [0mm, 0mm, 8.7mm] dir: [0, 0, 1] reach: 12mm margin: 1mm travel: 3.2mm stand: 3.3mm}]}
+        pads: {A: 1 B: 2}
+        prefix: "SW"
+        fields: {Note: "Per the maker's drawing (Kailh PG1353): pins, unplated 5.0 mm centre and 1.6 mm fixing-leg holes, 15 mm housing 5.4 mm tall, round 6.5 mm stem with its top 8.7 mm over the board, 3.2 mm travel. The stem takes a keycap on an MX cross: 4.00 mm across, 1.30 mm arms"}
+    })
+}
+
+// A box symbol named name; sides holds the left, right, bottom and top pin lists.
+let ic_symbol = fn(name, sides) {
+    return f.ic_symbol(name, sides)
+}

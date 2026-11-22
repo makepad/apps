@@ -1,0 +1,18 @@
+[package]
+name = "fab-elec-kicad"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "KiCad board file lexer, intermediate model and reader for Fab electronics"
+
+[package.metadata.makepad.platform-gaps]
+windows = {}
+
+[dependencies]
+fab-elec-core = { path = "../core" }
+fab-elec-parts = { path = "../parts" }
+fab-elec-circuit = { path = "../circuit" }
+fab-elec-board = { path = "../board" }
+fab-elec-lang = { path = "../lang" }
+fab-elec-import = { path = "../import" }

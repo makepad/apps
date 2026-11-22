@@ -1,0 +1,56 @@
+// A pair of dice in two filaments, the pips inlaid: each pip is a dome of the second colour set
+// into the die under a flat face, a volume rather than paint on the surface, so it wears with
+// the die. One die is ivory with dark pips, the other the reverse. Opposite faces add up to
+// seven; each die prints on its six.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+let size = param(16mm, min: 10mm, max: 30mm, step: 0.2mm, label: "Size", group: "Dice")
+let edge = param(2mm, min: 0.6mm, max: 4mm, step: 0.1mm, label: "Edge rounding", group: "Dice", kind: "radius")
+let pip = param(0.09, min: 0.05, max: 0.12, step: 0.005, label: "Pip size", group: "Dice", kind: "ratio", hint: "the pip's radius over the die's size")
+
+let spacing = size * 0.75
+let half = size / 2
+let d = size * 0.26
+// Each face's pips on a 3 x 3 grid, as [a b] steps of d across it.
+let faces = [
+    [[0 0]]
+    [[-1, -1] [1 1]]
+    [[-1, -1] [0 0] [1 1]]
+    [[-1, -1] [-1, 1] [1, -1] [1 1]]
+    [[-1, -1] [-1, 1] [0 0] [1, -1] [1 1]]
+    [[-1, -1] [-1, 0] [-1, 1] [1, -1] [1 0] [1 1]]
+]
+// Inlay the pips of the die at `cx` in `mat`: each face (1 on top, 6 on the bed, 2 and 5, 3 and 4
+// opposite) by its centre from the die's and the two directions across it.
+fn inlay(cx, mat) {
+    let c = [cx, half, 0]
+    let frames = [
+        [[0, half, 0] [1, 0, 0] [0, 0, 1]]
+        [[half, 0, 0] [0, 1, 0] [0, 0, 1]]
+        [[0, 0, half] [1, 0, 0] [0, 1, 0]]
+        [[0, 0, 0 - half] [1, 0, 0] [0, 1, 0]]
+        [[0 - half, 0, 0] [0, 1, 0] [0, 0, 1]]
+        [[0, 0 - half, 0] [1, 0, 0] [0, 0, 1]]
+    ]
+    for n in 0..6 {
+        let f = frames[n]
+        for g in faces[n] {
+            m.fill(m.sphere({radius: pip * size at: [c[0] + f[0][0] + d * (g[0] * f[1][0] + g[1] * f[2][0]), c[1] + f[0][1] + d * (g[0] * f[1][1] + g[1] * f[2][1]), c[2] + f[0][2] + d * (g[0] * f[1][2] + g[1] * f[2][2])]}), mat)
+        }
+    }
+}
+let dice = for x in [0 - spacing, spacing] { m.box({size: [size, size, size] radius: edge at: [x, half, 0]}) }
+
+object(m.union(dice[0], dice[1]), name: "Dice")
+
+let ivory = Material{albedo: [0.93 0.9 0.82] name: "Ivory"}
+let ink = Material{albedo: [0.08 0.09 0.12] name: "Ink"}
+// Each die's colour fills a box a millimetre larger all round, so it holds the whole die to its
+// surface; the pips fill after it, and the last fill holding a point wins.
+for i in 0..2 {
+    m.fill(m.box({size: [size + 2mm, size + 2mm, size + 2mm] at: [(2 * i - 1) * spacing, half, 0]}), if i == 0 { ivory } else { ink })
+}
+inlay(0 - spacing, ink)
+inlay(spacing, ivory)

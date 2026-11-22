@@ -1,0 +1,73 @@
+// An angle bracket in exact geometry: an L section pulled into a solid, its edges rounded with
+// true circular faces, two gussets in its corner, counterbored screw holes in the base and
+// chamfered ones in the wall. Every face is a plane or a cylinder, so the slicer cuts true
+// circles. Y up, +Z to the front.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+let width = param(56mm, min: 40mm, max: 160mm, step: 0.5mm, label: "Width", group: "Bracket")
+let depth = param(44mm, min: 34mm, max: 120mm, step: 0.5mm, label: "Base depth", group: "Bracket")
+let height = param(48mm, min: 34mm, max: 120mm, step: 0.5mm, label: "Wall height", group: "Bracket")
+let thickness = param(5mm, min: 3mm, max: 10mm, step: 0.1mm, label: "Thickness", group: "Bracket")
+let inside = param(5mm, min: 1mm, max: 10mm, step: 0.1mm, label: "Inside round", group: "Bracket", kind: "radius")
+let edge = param(1mm, min: 0.3mm, max: 1.4mm, step: 0.1mm, label: "Edge round", group: "Bracket", kind: "radius")
+let gusset = param(4mm, min: 2mm, max: 8mm, step: 0.1mm, label: "Gusset thickness", group: "Gussets")
+let reach = param(24mm, min: 10mm, max: 28mm, step: 0.5mm, label: "Gusset reach", group: "Gussets")
+let hole = param(4.5mm, min: 2mm, max: 8mm, step: 0.1mm, label: "Screw hole", group: "Holes", kind: "diameter")
+let counterbore = param(8.5mm, min: 4mm, max: 12mm, step: 0.1mm, label: "Counterbore", group: "Holes", kind: "diameter")
+let counterbore_depth = param(2.5mm, min: 0.5mm, max: 4mm, step: 0.1mm, label: "Counterbore depth", group: "Holes")
+let rim = param(0.6mm, min: 0.2mm, max: 1.2mm, step: 0.1mm, label: "Hole chamfer", group: "Holes")
+
+// The L in the side plane (u = Z, v = Y), the wall at the back, pulled out both ways along X;
+// its long outer edges rounded, then its inside corner.
+let back = -depth / 2
+let front = depth / 2
+let inner = back + thickness
+let section = Path{from: [back, 0] segs: [
+    LineTo{to: [front, 0]}
+    LineTo{to: [front, thickness]}
+    LineTo{to: [inner, thickness]}
+    LineTo{to: [inner, height]}
+    LineTo{to: [back, height]}
+    LineTo{to: [back, 0]}
+]}
+let l = m.brep.extrude({sketch: section plane: @yz height: width both: true})
+let eased = m.brep.fillet(l, edge, {edges: {convex: true dir: @x}})
+let rounded = m.brep.fillet(eased, inside, {edges: {concave: true dir: @x}})
+
+// Two gussets in the corner, set in from the ends.
+let gusset_section = Path{from: [inner, thickness] segs: [
+    LineTo{to: [inner + reach, thickness]}
+    LineTo{to: [inner, thickness + reach]}
+    LineTo{to: [inner, thickness]}
+]}
+let gusset_x = width / 2 - gusset / 2 - 4mm
+let gussets = for x in [-1, 1] {
+    m.brep.extrude({sketch: gusset_section plane: @yz height: gusset both: true at: [x * gusset_x, 0, 0]})
+}
+let braced = m.brep.union(rounded, gussets)
+
+// Two counterbored holes down through the base, between the gussets, and two through the wall.
+let hole_x = width / 4
+let base_z = (inner + inside + front) / 2
+let wall_y = (thickness + inside + height) / 2
+let holes = for x in [-1, 1] {
+    [
+        m.brep.cylinder({radius: hole / 2 height: thickness * 4 at: [x * hole_x, thickness / 2, base_z]})
+        m.brep.cylinder({radius: counterbore / 2 height: counterbore_depth * 2 at: [x * hole_x, thickness, base_z]})
+        m.brep.cylinder({radius: hole / 2 height: thickness * 4 at: [x * hole_x, wall_y, back + thickness / 2] rotate: [90°, 0, 0]})
+    ]
+}
+let drilled = m.brep.subtract(braced, holes)
+// The wall holes' front rims chamfered, so a screw head seats.
+let rims = for x in [-1, 1] {
+    {kind: @circle near: [x * hole_x, wall_y, inner]}
+}
+let bracket = m.brep.chamfer(drilled, rim, {edges: rims})
+
+handle(height, Arrow{from: [width / 2, 0, back] to: [width / 2, height, back]})
+handle(depth, Arrow{from: [width / 2, 0, back] to: [width / 2, 0, front]})
+handle(width, Arrow{from: [0, 0, front] to: [width / 2, 0, front]})
+
+object(bracket)

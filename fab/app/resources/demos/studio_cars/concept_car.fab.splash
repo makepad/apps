@@ -1,0 +1,19 @@
+// A concept coupe under a glass canopy, its paint fading nose to tail and light blades front
+// and back: the rally car's steering and running gear under a wedge, in up to nine filaments.
+use mod.fab.*
+
+// In nine filaments: its fade and light blades cost few changes, the body being one gradient.
+script("studio_car.cad.splash", params: {style: 3 materials: 9})
+
+color("Indigo", rgb: #x1f1473)
+color("Magenta", rgb: #xcc1a8c)
+color("Cyan", rgb: #x1abfd9)
+color("Clear", rgb: #x9fc4d6)
+color("Red", rgb: #xcc100d)
+color("Silver", rgb: #xb3b8bf)
+color("Tyre", rgb: #x1f1f1f)
+color("Charcoal", rgb: #x161618)
+color("White", rgb: #xebebe5)
+
+// The floor prints on supports from the bed, which come away between the wheels.
+place("studio_car", object: "Concept coupe", at: [175mm 160mm], name: "Concept coupe", color: "Indigo", settings: {enable_support: true support_on_build_plate_only: true})

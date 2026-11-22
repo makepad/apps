@@ -1,0 +1,4 @@
+bench("beep", {circuit: "beep"}, fn(b, c) {
+    b.supply(c.net("VBUS"), {v: 5V})
+    b.firmware(c.mcu, "beep.fw.splash", {})
+})

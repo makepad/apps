@@ -1,0 +1,9 @@
+// Four mosaic coasters, Voronoi tiles and grout lines in two filaments: cobalt and grout white.
+use mod.fab.*
+
+script("mosaic_coasters.cad.splash")
+
+color("Cobalt", rgb: #x1f5c9e)
+color("White", rgb: #xebe8dc)
+
+place("mosaic_coasters", at: [175mm 160mm], name: "Mosaic coasters", color: "Cobalt")

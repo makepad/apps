@@ -1,0 +1,20 @@
+[package]
+name = "fab-elec-explore"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab circuit explorer layout (E2.2, E2.5): the self-drawing sheet as a pure function of the design and its hints, the reveal round a focus, the drag solver and label placement; no widgets"
+
+[package.metadata.makepad.platform-gaps]
+windows = {}
+
+[dependencies]
+fab-elec-core = { path = "../core" }
+fab-elec-parts = { path = "../parts" }
+fab-elec-circuit = { path = "../circuit" }
+fab-elec-design = { path = "../design" }
+
+[dev-dependencies]
+fab-elec-fixtures = { path = "../fixtures" }
+fab-elec-lang = { path = "../lang" }

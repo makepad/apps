@@ -1,0 +1,30 @@
+[package]
+name = "fab-elec-simhost"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab electronics simulation host: the live bench's workers, the three live row textures views sample, the segment-row allocator, scope sinks, scrubbing and the direct SetParam path"
+
+[package.metadata.makepad.platform-gaps]
+windows = {}
+
+[dependencies]
+fab-elec-core = { path = "../core" }
+fab-elec-circuit = { path = "../circuit" }
+fab-elec-design = { path = "../design" }
+fab-elec-lang = { path = "../lang" }
+fab-elec-sim = { path = "../sim" }
+fab-elec-bench = { path = "../bench" }
+# the row packing (net_row, FlowPhase, LiveRows), NetTree and net_currents (live::net), the snapshot
+fab-elec-view = { path = "../view" }
+makepad-widgets-core = { path = "../../../../../widgets/core", version = "2.0.0" }
+# behind work's OS class (`set_thread_deferred`: on macOS off the performance cores)
+makepad-cpu-budget = { path = "../../../../../libs/cpu_budget" }
+
+# Fast's compiled sparse LU plans (ESIMRT T9), on the hosts the relax backend emits code for
+[target.'cfg(any(target_arch = "aarch64", target_arch = "x86_64"))'.dependencies]
+fab-elec-simjit = { path = "../simjit" }
+
+[dev-dependencies]
+fab-elec-fixtures = { path = "../fixtures" }

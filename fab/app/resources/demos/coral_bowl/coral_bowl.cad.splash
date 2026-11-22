@@ -1,0 +1,53 @@
+// A wide bowl with a coral's branching pattern grown over it: a Turing pattern (the coral
+// preset) of one colour through another, simulated over the bowl's own skin, inside and out, so
+// the branches run over the rim and down into the well at one size. Two filaments; the
+// pattern's spacing, seed and steps are its knobs. The wall is an arc turned about the bowl's
+// axis, leaning out at most 45 degrees at the foot and upright at the rim, on a flat floor: it
+// prints with nothing under it. One distance field, so it renders and edits live.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+let width = param(150mm, min: 80mm, max: 220mm, step: 1mm, label: "Width", group: "Bowl", hint: "across the rim")
+let height = param(60mm, min: 30mm, max: 110mm, step: 1mm, label: "Height", group: "Bowl")
+let wall = param(2.4mm, min: 1.2mm, max: 5mm, step: 0.1mm, label: "Wall", group: "Bowl")
+let spacing = param(7mm, min: 3mm, max: 20mm, step: 0.5mm, label: "Spacing", group: "Coral", hint: "from one branch to the next")
+let seed = param(11, min: 1, max: 999, step: 1, label: "Seed", group: "Coral", kind: "seed", hint: "another whole number grows another coral")
+
+// The wall's middle in the bowl's half section (u out from the axis, v up): an arc of radius
+// `bend` from the foot, where it leans out 45 degrees, to the rim, where it stands upright. The
+// floor's middle runs from the axis to the foot.
+let half = wall / 2
+let bend = (height - wall) * 1.41421
+let rim_u = width / 2 - half
+let centre_u = rim_u - bend
+let centre_v = height - half
+let foot_u = centre_u + bend * 0.70711
+
+let bowl = m.sdf({
+    bounds: [[-width / 2 - 1mm, 0mm, -width / 2 - 1mm], [width / 2 + 1mm, height + 1mm, width / 2 + 1mm]]
+    cell: 0.6mm
+    field: fn(p) {
+        let q = vec2(length(vec2(p.x, p.z)), p.y)
+        let v = q - vec2(centre_u, centre_v)
+        let a = atan2(v.y, v.x)
+        // the arc: across it where the section's point lies within its angles, else its ends
+        var d = min(length(q - vec2(foot_u, half)), length(q - vec2(rim_u, centre_v)))
+        if a >= -0.7854 && a <= 0 {
+            d = abs(length(v) - bend)
+        }
+        let side = d - half
+        let base = length(q - vec2(clamp(q.x, 0, foot_u), half)) - half
+        // a fillet where the floor meets the wall, the underside cut flat on the bed
+        return max(smooth_union(side, base, 4mm), 0 - p.y)
+    }
+})
+
+handle(width, Ring{center: [0, height, 0] radius: width / 2})
+handle(height, Arrow{from: [width / 2, 0, 0] to: [width / 2, height, 0]})
+
+object(bowl)
+
+let cream = Material{albedo: [0.93 0.88 0.78] name: "Cream"}
+let coral = Material{albedo: [0.9 0.33 0.22] name: "Coral"}
+m.fill(bowl, Mix{materials: [cream coral] field: Turing{preset: @coral scale: spacing seed: seed steps: 3000} sharp: 1})

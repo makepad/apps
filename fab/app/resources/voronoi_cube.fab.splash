@@ -1,0 +1,9 @@
+// The lattice cube in two filaments by Voronoi cells: each cell blue or yellow by its id.
+use mod.fab.*
+
+script("voronoi_cube.cad.splash")
+
+color("Blue")
+color("Yellow")
+
+place("voronoi_cube", object: "lattice", color: "Blue")

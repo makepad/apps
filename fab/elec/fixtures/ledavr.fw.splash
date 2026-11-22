@@ -1,0 +1,88 @@
+// The ledavr demo firmware (ATmega328P, 5 V, 16 MHz): a chaser over the eight LEDs, and a
+// breathe mode that ramps the six PWM LEDs. The button on PD2 (to ground, internal pull-up)
+// switches between them.
+//
+// The bench may set `chase_ms`, the chaser's step, from its `firmware(..)` call.
+let chase_ms = 125
+
+// LED0..LED5 sit on the timers' compare outputs, LED6 and LED7 on plain GPIO.
+// Timer0 is the device clock (fixed fast PWM, clk/8), so LED0 and LED1 run at 7.8125 kHz;
+// Timer1 and Timer2 run phase-correct at clk/64, 490 Hz.
+let led0 = pwm(PD6, hz(7812))
+let led1 = pwm(PD5, hz(7812))
+let led2 = pwm(PB1, hz(490))
+let led3 = pwm(PB2, hz(490))
+let led4 = pwm(PB3, hz(490))
+let led5 = pwm(PD3, hz(490))
+let led6 = output(PD4)
+let led7 = output(PD7)
+let button = input(PD2, pull_up)
+// Each LED is sunk by its pin (std's LED driver): a low pin lights it, a duty d at (255 - d)/255.
+let on_duty: i32 = 0
+let off_duty: i32 = 255
+
+// 0: chaser, 1: breathe.
+var mode: i32 = 0
+// The chaser's lit LED.
+var lit: i32 = 0
+// The breathe ramp's phase, 0..511.
+var phase: i32 = 0
+var was_pressed = false
+
+// LED n to the chaser's on or off level.
+fn set(n, on) {
+    let level = if on { on_duty } else { off_duty }
+    if n == 0 { duty(led0, level) }
+    if n == 1 { duty(led1, level) }
+    if n == 2 { duty(led2, level) }
+    if n == 3 { duty(led3, level) }
+    if n == 4 { duty(led4, level) }
+    if n == 5 { duty(led5, level) }
+    if n == 6 { write(led6, if on { low } else { high }) }
+    if n == 7 { write(led7, if on { low } else { high }) }
+}
+
+fn all_off() {
+    for n in 0..8 { set(n, false) }
+}
+
+// A triangle over 0..511: up 0..255, then down.
+fn ramp(p) {
+    let q = p % 512
+    if q < 256 { q } else { 511 - q }
+}
+
+fn setup() {
+    all_off()
+    set(lit, true)
+}
+
+let chase = every(ms(chase_ms), fn() {
+    if mode == 0 {
+        set(lit, false)
+        lit = (lit + 1) % 8
+        set(lit, true)
+    }
+})
+
+let breathe = every(ms(8), fn() {
+    if mode == 1 {
+        phase = (phase + 4) % 512
+        duty(led0, off_duty - ramp(phase))
+        duty(led1, off_duty - ramp(phase + 85))
+        duty(led2, off_duty - ramp(phase + 171))
+        duty(led3, off_duty - ramp(phase + 256))
+        duty(led4, off_duty - ramp(phase + 341))
+        duty(led5, off_duty - ramp(phase + 427))
+    }
+})
+
+let poll = every(ms(10), fn() {
+    let pressed = read(button) == low
+    if pressed && !was_pressed {
+        mode = 1 - mode
+        all_off()
+        if mode == 0 { set(lit, true) }
+    }
+    was_pressed = pressed
+})

@@ -1,0 +1,139 @@
+// The microsplash prelude: what every firmware program sees without declaring
+// it. A program's own item with the same name wins. Helpers are inlined, so
+// an unused one costs nothing, and a port called inside one names the
+// program's own call of it.
+//
+// Durations are microseconds (i32): `ms(100)` is 100000.
+
+// Pin levels and pulls are i32: a join such as `if on { high } else { low }`
+// is an integer select (untyped literals would join as f32).
+let low: i32 = 0
+let high: i32 = 1
+let pull_none: i32 = 0
+let pull_up: i32 = 1
+let pull_down: i32 = 2
+
+fn us(x) { x }
+fn ms(x) { x * 1000 }
+fn seconds(x) { x * 1000000 }
+
+// Frequencies are millihertz: `hz(490)` is 490000.
+fn hz(x) { x * 1000 }
+
+// Pins (a declared `output(..)` or `input(..)`).
+fn write(pin, level) { pin_write(pin, level) }
+fn read(pin) { pin_read(pin) }
+// shift_out(data, clock, value, bits): declared outputs; low 1..=32 bits, MSB first.
+// Clock starts low; each bit sets data then clocks high/low, ending low with data at bit 0; invalid bits drive nothing.
+// eeprom_read(addr): byte 0..255 last written at addr; a new chip reads 255.
+// eeprom_write(addr, value): stores the low 8 bits, visible to every later read.
+// addr is 0..the chip's EEPROM size. A computed invalid address faults, writes nothing,
+// and reads 0; constant invalid addresses and chips with no EEPROM are refused.
+// A real EEPROM write can take milliseconds (3.4 ms on the ATmega328P); it may return
+// when started, with the next EEPROM access waiting for it to finish.
+// A declared `analog(..)`: its voltage against the chip's reference, sampled during the call;
+// 0..1023 on the ATmega328P (10 bits against AVCC).
+fn analog_read(pin) { adc_read(pin) }
+// A declared `pwm(..)`; level 0..255, saturated.
+fn duty(pin, level) { pwm_duty(pin, level) }
+// A declared `serial(..)`; inside its own handler, the byte that arrived;
+// -1 elsewhere.
+fn byte(link) { serial_byte(link) }
+
+// Channels 0..255, truncated to RGB565; no alpha or blending in v1.
+fn rgb(r, g, b) { ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3) }
+// Whole images use their generated _w/_h constants. Draws reach the panel
+// in call order; the program cannot observe when.
+fn draw_image(d, img, w, h, x, y) { present(d, img, 0, 0, w, h, x, y) }
+// `let glyphs = glyph_atlas(w, h)` declares an image of the Latin-1 characters 32..255 in cells
+// of w x h pixels (even numbers), sixteen to a row, white on black, drawn from JetBrains Mono
+// when the image is built. Character c is the cell at x (c - 32) % 16 * w and
+// y (c - 32) / 16 * h, so `present(d, glyphs, sx, sy, w, h, x, y)` draws it. Character 127's
+// cell is a box, for characters the atlas does not hold.
+
+// The device clock (wrapping i32).
+fn now_us() { clock_us() }
+fn now_ms() { clock_ms() }
+
+// Timers (a declared `every(..)` or `after(..)`).
+// On the S3 their first delays start after device initialization. Time spent in setup counts.
+fn stop(timer) { timer_stop(timer) }
+fn start(timer) { timer_start(timer) }
+fn period(timer, d) { timer_period(timer, d) }
+
+// Networking: `let name = net(kind, slots, send_bytes, fn() { ... })` declares a connection
+// (kind net_websocket or net_tcp; slots >= 2 receive slots of 1512 bytes; send_bytes >= 1 of
+// send queue). What it reaches is the project's or the board's setting, never the program's.
+// On the S3, net messages travel over the tether. Each connection uses 128 bytes of
+// state plus 1516 bytes per receive slot. The send queue reserves send_bytes
+// rounded up to a word and 12 bytes per group of up to 32 send bytes for message boundaries.
+// A shared FIFO keeps granted sends, opens, closes and returned slots in wire order when
+// the tether fills. Its entries cost four bytes each. One connection needs at most ten entries.
+// Senders share one 1524-byte frame buffer with Ethernet when both are present.
+// The connection handler runs on changes to the link, connection state, data or send credit.
+// On the S3 it also wakes when draining the tether restores room after a short send.
+// net_link(): net_none, net_joining or net_up; net_link_error(), net_link_detail(): why not.
+// net_open(c), net_close(c): 1 done, 0 already so; an open connection is reopened after each
+// failure, 1 s doubling to 10 s. net_state(c): net_offline, net_connecting or net_ready.
+// net_epoch(c) steps each time a ready connection ends, which clears its queues.
+// net_error(c), net_detail(c): the code below and its raw number (an HTTP status, a close code).
+// net_send(c, buf, off, n, flags) -> bytes taken (0: full or not ready, try later); flags
+// net_binary and/or net_more (the message goes on in the next send).
+// net_recv(c, buf, off, cap) -> bytes read of the oldest message. net_left(c): its bytes still
+// to read, plus 1 while its last part is on the way; a read that returns all of the net_left
+// read just before it ends the message. net_kind(c): 1 binary, 0 text.
+let net_websocket: i32 = 0
+let net_tcp: i32 = 1
+let net_binary: i32 = 1
+let net_more: i32 = 2
+let net_none: i32 = 0
+let net_joining: i32 = 1
+let net_up: i32 = 2
+let net_offline: i32 = 0
+let net_connecting: i32 = 1
+let net_ready: i32 = 2
+let net_not_configured: i32 = 1
+let net_no_network: i32 = 2
+let net_sign_in_failed: i32 = 3
+let net_link_lost: i32 = 4
+let net_no_address: i32 = 5
+let net_name_not_found: i32 = 6
+let net_refused: i32 = 7
+let net_timed_out: i32 = 8
+let net_rejected: i32 = 9
+let net_reset: i32 = 10
+let net_closed: i32 = 11
+let net_protocol_error: i32 = 12
+
+// A board can have one speaker and one mic. Both use the same supported rate in Hz.
+// let out = speaker(rate_hz, queue_ms, fn() { ... })
+// queue_ms is 20..200 in steps of 5 ms and must exceed the longest handler.
+// The S3 rounds queue_ms up to whole 20 ms steps at 22,050 Hz and 10 ms steps
+// at 44,100 Hz. The build notes give the rounded duration when it changes.
+// The handler refills when the queue falls to half full or less. Overdue refills coalesce.
+// play(buf, off, n) queues as many of the n mono I16 samples as fit and returns that count.
+// speaker_free() gives room in samples. speaker_queued() counts samples still to clock out.
+// The S3 retires samples at descriptor boundaries (5 ms on average) and reserves the descriptor
+// currently playing. If the queue runs dry while a refill handler is still waiting
+// to run, one speaker-lost fault (20) counts silent or stale descriptors in that episode.
+// A refill handler may queue fewer samples or none to let the sound end quietly.
+// Playback starts muted with amps off. speaker_on(1) unmutes, then enables the amps.
+// speaker_on(0) disables the amps, then mutes. The clocks keep running.
+// If codec setup fails, the S3 reports the I2C fault once. play, speaker_free and
+// speaker_queued return zero, and speaker_on leaves the amps off.
+// If TX synchronization or DMA progress times out, the S3 reports fault 21 once
+// per stall and retries. play can return a short count, including zero.
+// let input_audio = mic(rate_hz, history_ms, fn() { ... })
+// history_ms is 20..640 in steps of 20 ms. Each block of rate_hz / 50 mono samples
+// raises a handler event. Overdue blocks coalesce into one event and history keeps the newest samples.
+// The S3 captures at unity PGA and ADC volume. With a speaker, TX supplies the shared clocks.
+// record(buf, off, n) returns the number of oldest unread samples copied into a writable I16
+// buffer and advances the read cursor. mic_ready() counts unread samples.
+// mic_rewind(n) moves the cursor back by up to n samples still held and returns the count moved.
+// A rewind begins a take until record catches up to the newest sample. Outside a take the
+// oldest unread sample follows the history silently. During a take, fault 22 reports how many
+// unread samples were overwritten, once per episode. Reading again makes room for new samples.
+// If codec setup fails, the S3 reports the I2C fault and all three mic ports return zero.
+// If RX synchronization or block progress times out, fault 23 reports the wait once
+// per stall. The S3 keeps the available history and checks again on the next block.
+// All offsets and counts are in samples. A count may be zero. An invalid range moves nothing.

@@ -1,0 +1,60 @@
+# Radio island entry roots, station mode, for the ESP-IDF v6.1.1 pack: the island functions
+# microsplash calls, in entry-table order. Names from the pack's exports.
+esp_wifi_init_internal
+esp_wifi_deinit_internal
+esp_wifi_set_mode
+esp_wifi_get_mode
+esp_wifi_set_config
+esp_wifi_get_config
+esp_wifi_start
+esp_wifi_stop
+esp_wifi_connect_internal
+esp_wifi_disconnect_internal
+esp_wifi_scan_start
+esp_wifi_scan_stop
+esp_wifi_scan_get_ap_num
+esp_wifi_scan_get_ap_records
+esp_wifi_internal_tx
+esp_wifi_internal_reg_rxcb
+esp_wifi_internal_free_rx_buffer
+esp_wifi_get_mac
+esp_wifi_set_ps
+esp_wifi_sta_get_ap_info
+esp_wifi_set_country
+esp_wifi_set_storage
+# supplicant interface (registration, keys, profile queries)
+esp_wifi_register_wpa_cb_internal
+esp_wifi_unregister_wpa_cb_internal
+esp_wifi_set_sta_key_internal
+esp_wifi_get_sta_key_internal
+esp_wifi_del_key_internal
+esp_wifi_set_appie_internal
+esp_wifi_unset_appie_internal
+esp_wifi_get_assoc_bssid_internal
+esp_wifi_get_macaddr_internal
+esp_wifi_sta_prof_is_wpa2_internal
+esp_wifi_sta_prof_is_rsn_internal
+esp_wifi_sta_get_prof_pmk_internal
+esp_wifi_sta_get_prof_ssid_internal
+esp_wifi_sta_get_prof_password_internal
+esp_wifi_sta_get_pairwise_cipher_internal
+esp_wifi_sta_get_group_cipher_internal
+esp_wifi_auth_done_internal
+esp_wifi_wpa_ptk_init_done_internal
+esp_wifi_register_eapol_txdonecb_internal
+# header hash checks the init path calls
+esp_wifi_internal_osi_funcs_md5_check
+esp_wifi_internal_crypto_funcs_md5_check
+esp_wifi_internal_wifi_type_md5_check
+esp_wifi_internal_supplicant_header_md5_check
+# PHY
+register_chipv7_phy
+phy_wakeup_init
+phy_close_rf
+phy_xpd_tsens
+phy_bbpll_en_usb
+phy_get_romfunc_addr
+phy_init_flag
+phy_get_rf_cal_version
+phy_set_wifi_mode_only
+phy_version_print

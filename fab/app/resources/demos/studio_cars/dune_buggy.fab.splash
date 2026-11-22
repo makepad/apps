@@ -1,0 +1,20 @@
+// A dune buggy under a roll cage, on blocky tyres: the rally car's steering and running gear
+// under an open body, in up to nine filaments.
+use mod.fab.*
+
+script("studio_car.cad.splash", params: {style: 1})
+
+// The colours alternate between the nozzles in this order. In four filaments the lime body
+// shares its nozzle with the clear lamps, the charcoal tyres, seats and cage theirs with the
+// orange prow: lime and charcoal, which meet on most layers, never swap on one nozzle.
+color("Lime", rgb: #x73bf1f)
+color("Orange", rgb: #xf2700f)
+color("Clear", rgb: #x9fc4d6)
+color("Charcoal", rgb: #x161618)
+color("Silver", rgb: #xb3b8bf)
+color("Yellow", rgb: #xfac81a)
+color("Red", rgb: #xcc100d)
+color("Tyre", rgb: #x1f1f1f)
+
+// The floor prints on supports from the bed, which come away between the wheels.
+place("studio_car", object: "Dune buggy", at: [175mm 160mm], name: "Dune buggy", color: "Lime", settings: {enable_support: true support_on_build_plate_only: true})

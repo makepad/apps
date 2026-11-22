@@ -1,0 +1,12 @@
+// A flexing serpent dragon: jade armour plates with gold scales, spikes and horns tipped in
+// ivory, fused to a TPU spine that bends between them.
+use mod.fab.*
+
+script("flex_dragon.cad.splash")
+
+color("Jade", rgb: #x13704a)
+color("Gold", rgb: #xe0ad2a)
+color("Ivory", rgb: #xede3c8)
+color("Ember", rgb: #xb81c14, material: "TPU")
+
+place("flex_dragon", at: [243mm 128mm], name: "Flex dragon", color: "Jade")

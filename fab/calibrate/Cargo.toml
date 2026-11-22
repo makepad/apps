@@ -1,0 +1,11 @@
+[package]
+name = "fab-calibrate"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab's calibration: the test parts (fit, friction, flow, temperature, pressure advance), the per printer and filament results, and how they feed the slicer and Mechanics"
+
+[dependencies]
+fab-plate = { path = "../plate" }
+makepad-fab-settings = { path = "../settings" }

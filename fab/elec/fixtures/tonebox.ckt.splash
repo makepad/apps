@@ -1,0 +1,62 @@
+// tonebox: one key, one knob, one LED and one audio jack, on USB 5 V. Holding the key lights the
+// LED and sounds a tone on the jack; the PITCH knob tunes it. Nothing in it is special to this box:
+// the tone is a textbook Schmitt inverter RC oscillator, so its pitch is its parts', 1 / (R c_t
+// ln(Vt+ (VDD - Vt-) / (Vt- (VDD - Vt+)))) with R the timing resistance: r_t in series with the
+// pot's B-W half (its A end tied to its wiper), about 450 Hz with the knob at mid travel, from
+// about 290 Hz turned down to about 1 kHz turned up. Change r_t, the pot or c_t and the note
+// changes with it.
+//
+// One hex Schmitt inverter does the logic: the key (pulled up, low while held) is squared by one
+// section and turned back by a second, so QUIET is high while the key is up. QUIET holds the
+// oscillator's input high through a diode, and sinks the LED, so the LED lights only while the
+// key is held. A fourth section buffers the oscillator into a divider and a coupling capacitor:
+// about 0.9 V peak to peak on both channels of the jack. The spare sections' inputs are grounded
+// and their outputs left open.
+use mod.elec.*
+use mod.std.*
+let e = mod.elec
+
+let gnd    = e.net({name: "GND"  kind: @ground})
+let vbus   = e.net({name: "VBUS" kind: @power volts: 5V class: "power"})
+let key_n  = e.net({name: "KEY"})                       // low while the key is held
+let held   = e.net({name: "HELD"})                      // high while the key is held
+let quiet  = e.net({name: "QUIET"})                     // high while the key is up
+let timing = e.net({name: "TIMING"})                    // the oscillator's capacitor
+let span   = e.net({name: "SPAN"})                      // between r_t and the pitch pot
+let osc    = e.net({name: "OSC"})                       // the oscillator's square wave
+let tone   = e.net({name: "TONE"})                      // the buffered square wave
+let mid    = e.net({name: "MID"})                       // the divided square wave
+let out    = e.net({name: "OUT"})                       // the line out, both channels
+
+let power = netclass("power", {track: 0.5mm clearance: 0.2mm via: {drill: 0.4mm pad: 0.8mm}})
+
+let usb    = usb_c_power({vbus: vbus gnd: gnd})
+let key    = e.part(key_switch_low(), {pins: {A: key_n B: gnd}})
+let r_up   = e.r(10kohm, vbus, key_n, {package: "0402"})
+let u      = e.part(schmitt_hex_soic14(), {pins: {
+    A1: timing Y1: osc A2: key_n Y2: held A3: held Y3: quiet A4: osc Y4: tone
+    A5: gnd A6: gnd VCC: vbus GND: gnd
+} nc: [@Y5 @Y6]})
+let dec    = e.c(100nF, vbus, gnd, {package: "0402"})
+e.near(dec, u, 3mm)
+
+// the oscillator, held still through d_hold while QUIET is high; turned up (toward B), the
+// pitch pot's B-W half shrinks and the note rises
+let r_t    = e.r(100kohm, osc, span, {package: "0402"})
+let pitch  = e.part(pot_9mm(), {value: 250kohm pins: {A: span W: span B: timing}
+                                fields: {pos: "0.5" taper: "lin" label: "PITCH"}})
+let c_t    = e.c(10nF, timing, gnd, {package: "0603"})
+let d_hold = e.part(diode_part("sod323"), {pins: {A: quiet K: timing}})
+
+// the LED, lit while QUIET is low
+let lamp   = led_driver({ctl: quiet vdd: vbus})
+
+// the line out: 5 V square waves divided to about 0.9 V, blocked of their DC
+let r_top  = e.r(39kohm, tone, mid, {package: "0402"})
+let r_bot  = e.r(10kohm, mid, gnd, {package: "0402"})
+let c_out  = e.c(1uF, mid, out, {package: "0603"})
+let r_bleed = e.r(47kohm, out, gnd, {package: "0402"})
+let jack   = e.part(jack_3_5mm({}), {pins: {T: out R: out S: gnd}})
+
+e.fixed(usb, {edge: @left})
+e.width(vbus, 0.5mm)

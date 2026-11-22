@@ -1,0 +1,92 @@
+// organ8's building blocks: an eight-voice organ on one 5 V supply. Every block is a textbook
+// circuit dimensioned here from its formulas; the mix swings round a buffered signal ground at half
+// the supply. A block's own nets have no names: each is named by its binding (`v1.osc`), so one
+// block can be made several times in a unit.
+let e = mod.elec
+
+// The mix's signal ground: half the analog supply, held by a capacitor and buffered by one op-amp
+// section, so the summer can swing both ways on a single supply.
+let signal_ground = e.block({
+    name: "Signal ground"
+    ports: {va: e.port(@power_in) gnd: e.port(@ground) ref: e.port(@power_out)}
+    params: {r: 10kohm c: 10uF}
+    build: fn(p, o) {
+        let mid  = e.net()
+        let top  = e.r(o.r, p.va, mid, {package: "0402"})
+        let bot  = e.r(o.r, mid, p.gnd, {package: "0402"})
+        let hold = e.c(o.c, mid, p.gnd, {package: "0805"})
+        let u    = e.part(mod.std.opamp_sot23(), {pins: {INP: mid INN: p.ref OUT: p.ref VDD: p.va VSS: p.gnd}})
+        let dec  = e.c(100nF, p.va, p.gnd, {package: "0402"})
+        e.near(dec, u, 3mm)
+    }
+    sheet: {flow: @right ports: {va: @top gnd: @bottom ref: @right}}
+})
+
+// One voice: a Schmitt inverter RC oscillator that runs whether or not its key is held, as an
+// organ's tone generators do, its pitch 1 / (R c_t ln(Vt+ (VDD - Vt-) / (Vt- (VDD - Vt+)))) with R
+// the timing resistance: r_t in series with the pitch pot's B-W half (its A end tied to its
+// wiper). Its key (pulled up, low while held) is squared by a second section and turned back by a
+// third into QUIET, high while the key is up, which holds the fourth section's input high through
+// a diode: the voice's output stays low, silent. Held, QUIET falls, the diode lets go, and the
+// fourth section follows the oscillator through r_g (100k, so holding the gate high loads the
+// oscillator's output by a few tens of microamps and leaves its pitch alone): a square wave, blocked of its DC and summed
+// into `sum` through r_mix. The spare sections' inputs are grounded and their outputs left open.
+let organ_voice = e.block({
+    name: "Organ voice"
+    ports: {vdd: e.port(@power_in) gnd: e.port(@ground) sum: e.port(@out)}
+    params: {c_t: 10nF r_t: 100kohm pitch: 250kohm r_mix: 220kohm}
+    build: fn(p, o) {
+        let key_n  = e.net()
+        let held   = e.net()
+        let quiet  = e.net()
+        let timing = e.net()
+        let span   = e.net()
+        let osc    = e.net()
+        let gate   = e.net()
+        let tone   = e.net()
+        let ac     = e.net()
+        let key    = e.part(mod.std.key_switch_low(), {pins: {A: key_n B: p.gnd}})
+        let r_up   = e.r(10kohm, p.vdd, key_n, {package: "0402"})
+        let u      = e.part(mod.std.schmitt_hex_soic14(), {pins: {
+            A1: timing Y1: osc A2: key_n Y2: held A3: held Y3: quiet A4: gate Y4: tone
+            A5: p.gnd A6: p.gnd VCC: p.vdd GND: p.gnd
+        } nc: [@Y5 @Y6]})
+        let dec    = e.c(100nF, p.vdd, p.gnd, {package: "0402"})
+        e.near(dec, u, 3mm)
+        let r_t    = e.r(o.r_t, osc, span, {package: "0402"})
+        let pot    = e.part(mod.std.pot_9mm(), {value: o.pitch pins: {A: span W: span B: timing}
+                                                fields: {pos: "0.5" taper: "lin" label: "PITCH"}})
+        let c_t    = e.c(o.c_t, timing, p.gnd, {package: "0603"})
+        let r_g    = e.r(100kohm, osc, gate, {package: "0402"})
+        let d_gate = e.part(mod.std.diode_part("sod323"), {pins: {A: quiet K: gate}})
+        let c_ac   = e.c(1uF, tone, ac, {package: "0603"})
+        let r_mix  = e.r(o.r_mix, ac, p.sum, {package: "0402"})
+    }
+    sheet: {flow: @right ports: {vdd: @top gnd: @bottom sum: @right}}
+})
+
+// The mix and the line out: an inverting summer on the signal ground (each voice into `sum`
+// through its own resistor, rf back), then 100 ohm and 10 uF out to `line`, which a 100k bleed
+// holds at 0 V with nothing plugged in. A held voice's 5 V square comes out at 5 V rf / r_mix
+// peak to peak, about 0.34 V.
+let organ_mix = e.block({
+    name: "Mixer and output"
+    ports: {
+        sum:  e.port(@in)
+        line: e.port(@out)
+        ref:  e.port(@power_in)
+        va:   e.port(@power_in)
+        gnd:  e.port(@ground)
+    }
+    params: {rf: 15kohm r_out: 100ohm c_out: 10uF r_bleed: 100kohm}
+    build: fn(p, o) {
+        let mix  = e.net()
+        let co   = e.net()
+        let rf   = e.r(o.rf, mix, p.sum, {package: "0402"})
+        let sumr = e.part(mod.std.opamp_sot23(), {pins: {INP: p.ref INN: p.sum OUT: mix VDD: p.va VSS: p.gnd}})
+        let ro   = e.r(o.r_out, mix, co, {package: "0402"})
+        let cout = e.c(o.c_out, co, p.line, {package: "0805"})
+        let rb   = e.r(o.r_bleed, p.line, p.gnd, {package: "0402"})
+    }
+    sheet: {flow: @right ports: {sum: @left line: @right ref: @bottom va: @top gnd: @bottom}}
+})

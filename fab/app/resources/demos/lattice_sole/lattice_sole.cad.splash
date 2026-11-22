@@ -1,0 +1,59 @@
+// A graded lattice insole in two filaments: a gyroid whose sheet is thick and firm under the heel,
+// thin and soft under the arch and firmer again under the ball of the foot, inside a thin rim on a
+// thin floor. Its colour follows the density, dithered from one filament where it is softest to
+// the other where it is firmest, so the grading shows. The lattice meets the rim and the floor
+// all round, so no part of it starts in mid-air; its top is open. Printed in a flexible filament
+// it cushions; in a hard one it is a model of how.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let size = param(1, min: 0.8, max: 1.2, step: 0.01, label: "Size", group: "Sole", kind: "ratio", hint: "the outline's scale: 1 is about 24 cm long")
+let thick = param(6mm, min: 5mm, max: 14mm, step: 0.5mm, label: "Thickness", group: "Sole")
+let period = param(9mm, min: 4mm, max: 12mm, step: 0.5mm, label: "Cell", group: "Lattice")
+let soft = param(0.8mm, min: 0.8mm, max: 2mm, step: 0.1mm, label: "Softest sheet", group: "Lattice", hint: "the sheet under the arch: two lines or more to print")
+let firm = param(2mm, min: 1mm, max: 3mm, step: 0.1mm, label: "Firmest sheet", group: "Lattice", hint: "the sheet under the heel")
+let floor = 1mm
+let rim = 1.2mm
+
+// The outline: heel, arch, ball and toes as four discs, blended smoothly into one (in the bed's
+// x and z, heel at -x).
+fn smin(a, b, k) {
+    let h = max(k - abs(a - b), 0) / k
+    min(a, b) - h * h * k * 0.25
+}
+fn disc(x, z, cx, cz, r) { length(vec2(x - cx * size, z - cz * size)) - r * size }
+fn outline(x, z) {
+    let k = 40mm * size
+    smin(smin(disc(x, z, -88mm, 0, 31mm), disc(x, z, -20mm, 4mm, 29mm), k), smin(disc(x, z, 45mm, 4mm, 44mm), disc(x, z, 92mm, -2mm, 32mm), k), k)
+}
+// The sheet's thickness along the sole, heel (t = 0) to toe (t = 1): firm at the heel, soft at the
+// arch, firmer under the ball.
+fn sheet(x) {
+    let t = (x / size + 119mm) / 243mm
+    let heel = exp(0 - (t - 0.1) * (t - 0.1) / 0.03)
+    let ball = exp(0 - (t - 0.7) * (t - 0.7) / 0.016)
+    soft + (firm - soft) * min(1, heel + 0.6 * ball)
+}
+let reach = 125mm * size
+let sole = m.sdf({
+    bounds: [[0 - reach, 0, -50mm * size], [reach, thick, 50mm * size]]
+    cell: 0.35mm
+    field: fn(p) {
+        let o = outline(p.x, p.z)
+        let slab = max(o, max(0 - p.y, p.y - thick))
+        // the floor and the rim are solid; the gyroid fills the rest of the slab
+        let shell = max(slab, min(p.y - floor, 0 - o - rim))
+        let lattice = max(slab, sdf_gyroid(p, period, sheet(p.x)))
+        return min(shell, lattice)
+    }
+})
+
+object(sole, name: "Lattice sole")
+
+let mint = Material{albedo: [0.42 0.82 0.7] name: "Mint"}
+let navy = Material{albedo: [0.1 0.16 0.38] name: "Navy"}
+m.fill(m.box({size: [2 * reach + 4mm, thick + 2mm, 104mm * size] at: [0, thick / 2, 0]}), Mix{materials: [mint navy] field: fn(p) {
+    (sheet(p.x) - soft) / (firm - soft)
+}})

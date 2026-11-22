@@ -1,0 +1,51 @@
+[
+  {
+    "id": "bracket",
+    "prompt": "Model a printable L-bracket: 40 mm wide, 3 mm thick, a 30 mm base leg lying flat and a 25 mm upright leg, two 4.5 mm holes in each leg (centred across the width, 10 mm apart), a 4 mm radius fillet on the inside corner where the legs meet, and 1 mm rounded outer edges. One part. Keep it parametric with feature ids. Do not save or export.",
+    "parts": 1,
+    "size": [[40, 30, 25]],
+    "size_tol": 1.5,
+    "volume": [[5000, 7500]]
+  },
+  {
+    "id": "enclosure",
+    "prompt": "Model an electronics enclosure as two parts. The box: outer 60 x 40 x 25 mm, 2 mm walls and floor, open top, with four screw bosses (6 mm diameter, 2.5 mm pilot holes, as tall as the walls) in the inside corners. The lid: 60 x 40 x 2 mm plate with a 1.5 mm tall lip underneath that fits inside the box walls with 0.2 mm clearance all round, and four 3.2 mm holes over the bosses. Lay both parts on the plate. Do not save or export.",
+    "parts": 2,
+    "size": [[60, 40, 25], [60, 40, 3.5]],
+    "size_tol": 1.5,
+    "volume": [[14000, 26000], [4000, 8500]]
+  },
+  {
+    "id": "gears",
+    "prompt": "Model two spur gears that mesh: module 1.5, 15 and 30 teeth, 6 mm thick, each with a 5 mm bore, 0.1 mm backlash, laid out side by side at the correct centre distance so the teeth interlock without touching. Do not save or export.",
+    "parts": 2,
+    "size": [[25.5, 25.5, 6], [48, 48, 6]],
+    "size_tol": 1.5,
+    "volume": [[2000, 3300], [8500, 11500]],
+    "gears": true
+  },
+  {
+    "id": "text_plate",
+    "prompt": "Model a name plate: 70 x 25 x 3 mm with 4 mm rounded corners, and the word MAKEPAD raised 1 mm on top in 8 mm tall capital letters, centred. One part. Do not save or export.",
+    "parts": 1,
+    "size": [[70, 25, 4]],
+    "size_tol": 1.5,
+    "volume": [[4900, 5700]]
+  },
+  {
+    "id": "organiser",
+    "prompt": "Model a desk organiser as two parts. Part 1: an 80 x 80 x 8 mm base plate with 6 mm rounded vertical corners and four 3.4 mm through holes 8 mm in from each corner; on it a central pen cup, 30 mm outer diameter, 2 mm wall, 50 mm tall (closed by the base), a ring of 12 vertical fins (1.2 mm thick, 12 mm tall, 10 mm long) around the cup, and an 8 mm diameter, 10 mm tall peg near one corner. Part 2: a spur gear about 24 mm across, 6 mm thick, with a bore that slides onto the peg with 0.3 mm radial clearance, laid next to the base. Do not save or export.",
+    "parts": 2,
+    "size": [[80, 80, 58], [24, 24, 6]],
+    "size_tol": 3.0,
+    "volume": [[52000, 64000], [1500, 3200]]
+  },
+  {
+    "id": "bolt_nut",
+    "prompt": "Model a printable M8 hex bolt with a 25 mm threaded length, and a matching M8 hex nut, as two parts laid out side by side, with a clearance fit that will print and turn. Use standard ISO dimensions. Do not save or export.",
+    "parts": 2,
+    "size": [[15.1, 13, 30.3], [15.1, 13, 6.8]],
+    "size_tol": 1.5,
+    "volume": [[1100, 2200], [500, 1000]]
+  }
+]

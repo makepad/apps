@@ -1,0 +1,109 @@
+// ledavr: ledctl's LED board with an ATMEGA328P at 5 V and 16 MHz, for running real firmware. It
+// keeps ledctl's eight LEDs (colours and currents), its button and its USB-C power in; the MCU runs
+// straight off USB 5 V (no regulator), on a 16 MHz crystal, programmed through a 2x3 ISP header.
+//
+// Pins: six LEDs on the timer outputs (OC0A PD6, OC0B PD5, OC1A PB1, OC1B PB2, OC2A PB3, OC2B PD3),
+// two on PD4 and PD7; the button on PD2 (INT0) with the MCU's own pull-up; PB6/PB7 on the crystal;
+// PD0/PD1 free (the firmware's watch link). PB3 is also the ISP's MOSI.
+//
+// The LED, button and USB-C blocks are std's (the same as ledctl's own); the LED resistors follow
+// the 5 V rail: each driver derives its resistor from its supply and its LED current.
+use mod.elec.*
+use mod.std.*
+let e = mod.elec
+let f = e.f
+
+// ---- Generic parts this design defines ----------------------------------------------------------
+
+// A 2x3 pin header at 2.54 mm (the six-pin ISP connector): odd pins in one column, even in the other.
+e.define("PinHeader_2x03_P2.54mm", {
+    kind: @connector
+    symbol: ic_symbol("ISP", {left: [["1" @passive] ["3" @passive] ["5" @passive]]
+                              right: [["2" @passive] ["4" @passive] ["6" @passive]]})
+    footprint: f.footprint({
+        pads: [
+            f.thru("1", [0mm, 0mm], 1.7mm, 1.0mm, {square: true}),
+            f.thru("2", [2.54mm, 0mm], 1.7mm, 1.0mm),
+            f.thru("3", [0mm, -2.54mm], 1.7mm, 1.0mm),
+            f.thru("4", [2.54mm, -2.54mm], 1.7mm, 1.0mm),
+            f.thru("5", [0mm, -5.08mm], 1.7mm, 1.0mm),
+            f.thru("6", [2.54mm, -5.08mm], 1.7mm, 1.0mm)
+        ]
+        body: [[-1.27mm, -6.35mm], [3.81mm, 1.27mm]]
+        mount: @thru
+        text: 1mm
+        graphics: []
+    })
+    // The insulator (2.5 mm) and the posts over it (6 mm), a stock 2.54 mm header's mating side;
+    // the tails through the board are not part of the body. It is plugged from above, so its
+    // @plug port faces up over its courtyard (the insulator and 0.25 mm round it, room for the
+    // socket that mates with it): a case cuts the lid round it and the header passes through,
+    // and the lid stays as low as the parts it covers.
+    body: {height: 8.5mm ports: [{
+        kind: @plug profile: {rect: [[-2.79mm, -4.06mm], [2.79mm, 4.06mm]] r: 0mm}
+        at: [1.27mm, -2.54mm, 8.5mm] dir: [0, 0, 1] reach: 8mm margin: 0.3mm
+    }]}
+    pads: [["1", "1"], ["2", "2"], ["3", "3"], ["4", "4"], ["5", "5"], ["6", "6"]]
+    prefix: "J"
+})
+
+// ---- Blocks -------------------------------------------------------------------------------------
+
+// The MCU on its 16 MHz crystal, with decoupling, the reset pull-up and the ISP header. The crystal
+// part's value is the MCU clock: the bench reads it, nothing else states it.
+let avr_core = e.block({
+    name: "MCU core"
+    ports: {
+        vdd:  e.port(@power_in, {volts: [1.8V 5.5V]})
+        gnd:  e.port(@ground)
+        gpio: e.port(@bidi, {width: 8})                 // LED0..LED7
+        user: e.port(@bidi)                             // PD2 (INT0)
+    }
+    params: {part: "ATMEGA328P_TQFP32" f_clk: 16MHz c_load: 22pF decoupling: [100nF 100nF 4.7uF]}
+    build: fn(p, o) {
+        let isp = e.bus("ISP", [@MISO @SCK @RST])
+        let xtal1 = e.net({name: "XTAL1"})
+        let xtal2 = e.net({name: "XTAL2"})
+        let u = e.part(o.part, {pins: {
+            VCC: p.vdd  AVCC: p.vdd  GND: p.gnd  PC6: isp.RST  PB6: xtal1  PB7: xtal2  PD2: p.user
+            PD6: p.gpio[0] PD5: p.gpio[1] PB1: p.gpio[2] PB2: p.gpio[3]
+            PB3: p.gpio[4] PD3: p.gpio[5] PD4: p.gpio[6] PD7: p.gpio[7]
+            PB4: isp.MISO  PB5: isp.SCK
+        } nc: [@AREF @ADC6 @ADC7 @PB0 @PC0 @PC1 @PC2 @PC3 @PC4 @PC5 @PD0 @PD1]})
+        // the load capacitors are C0G
+        let y      = e.part(crystal_part("3225"), {value: o.f_clk pins: [xtal1, xtal2, p.gnd]})
+        let c_x1   = e.c(o.c_load, xtal1, p.gnd, {package: "0402"})
+        let c_x2   = e.c(o.c_load, xtal2, p.gnd, {package: "0402"})
+        let dec    = for v in o.decoupling { let c = e.c(v, p.vdd, p.gnd, {package: "0402"}); e.near(c, u, 3mm); c }
+        let rst_r  = e.r(10kohm, isp.RST, p.vdd, {package: "0402"})
+        // PB3 is LED4's pin and the ISP's MOSI at once
+        let isp_j  = e.part("PinHeader_2x03_P2.54mm", {pins: [isp.MISO p.vdd isp.SCK p.gpio[4] isp.RST p.gnd]})
+        e.near(y, u.PB6, 3mm)
+        e.near(c_x1, y, 2mm)
+        e.near(c_x2, y, 2mm)
+    }
+    sheet: {flow: @right ports: {vdd: @top gnd: @bottom gpio: @right user: @right}}
+})
+
+// ---- The design ---------------------------------------------------------------------------------
+
+let led_count = param(8, min: 1, max: 8, label: "LED outputs")
+
+// nets: handles; kind, voltage and class are checked by ERC
+let gnd  = e.net({name: "GND"  kind: @ground})
+let vbus = e.net({name: "VBUS" kind: @power volts: 5V class: "power"})
+let led  = e.bus("LED", 8)                              // LED0..LED7
+let key  = e.net({name: "BTN"})
+
+let power = netclass("power", {track: 0.5mm clearance: 0.2mm via: {drill: 0.4mm pad: 0.8mm}})
+
+// the hookup: one call per block
+let usb   = usb_c_power({vbus: vbus gnd: gnd})
+let mcu   = avr_core({vdd: vbus gnd: gnd gpio: led user: key})
+let lamps = for i in 0..led_count { led_driver({ctl: led[i] vdd: vbus}) }
+let btn   = button({out: key gnd: gnd})
+
+// intent: what the placer, router and the checks must honour
+e.fixed(usb, {edge: @left})
+e.width(vbus, 0.5mm)
+e.group("leds", lamps)

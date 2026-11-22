@@ -1,0 +1,396 @@
+// Surface textures (m.texture): the patterns and the mappings, as kernels.
+//
+// A pattern is fn(c) from a point in cells (c.x and c.y along the surface, c.z the height above
+// it) to 0..1 (0 the untouched surface, 1 the full depth). A mapping takes a pattern and its
+// numbers and gives the texture's kernel fn(p): the pattern at the point p (metres, the source's
+// frame, turned so the mapping's axis is Y). The lowering calls these with the numbers it derived
+// (the seam rule, the cells, the fades); each number a kernel reads from here is a parameter of
+// the compiled kernel, so a new pitch or depth is the same program with other values.
+
+// ---- patterns
+
+// V grooves on whole cells, flat tops between them; d is the distance from a groove's centre line
+// in cells. The V's root is rounded over knurl_e cells and it reaches 0 at the flat's edge
+// (knurl_g is 1 over its height there); it meets the flat top in a rounded crest (a smooth max
+// with 0 over a quarter of the depth), and two crossing sets blend where they meet (a smooth min
+// over a fifth of a cell, never below the root). No corner is sharp at the slicer's grid, so a
+// layer's outline has nothing finer than it to snap to. Never steeper than knurl_g per cell.
+let tex_groove = fn(s) {
+    return abs(fract(s + 0.5) - 0.5)
+}
+let tex_knurl_v = fn(d, knurl_e, knurl_g) {
+    let t = 1.0 - (sqrt(d * d + knurl_e * knurl_e) - knurl_e) * knurl_g
+    let h = clamp(0.5 + 2.0 * t, 0.0, 1.0)
+    return t * h + 0.25 * h * (1.0 - h)
+}
+let tex_knurl_straight = fn(knurl_e, knurl_g) {
+    return fn(c) {
+        return tex_knurl_v(tex_groove(c.x), knurl_e, knurl_g)
+    }
+}
+let tex_knurl_diagonal = fn(knurl_e, knurl_g) {
+    return fn(c) {
+        return tex_knurl_v(tex_groove(c.x + c.y), knurl_e, knurl_g)
+    }
+}
+let tex_knurl_diamond = fn(knurl_e, knurl_g) {
+    return fn(c) {
+        let a = tex_groove(c.x + c.y)
+        let b = tex_groove(c.x - c.y)
+        let h = clamp(0.5 + 2.5 * (b - a), 0.0, 1.0)
+        return tex_knurl_v(max(b + (a - b) * h - 0.2 * h * (1.0 - h), 0.0), knurl_e, knurl_g)
+    }
+}
+
+// Hexagons one cell across the flats along c.x (c.y in cells of sqrt 3): 1 on the edges, 0 past
+// a groove of 1 / hex_gain cells.
+let tex_hex = fn(hex_gain) {
+    return fn(c) {
+        let q = vec2(c.x, c.y * 1.7320508)
+        let k = vec2(1.0, 1.7320508)
+        let a = q - k * floor(q / k + 0.5)
+        let b = q - k * floor((q - k * 0.5) / k + 0.5) - k * 0.5
+        let ha = max(abs(a.x), abs(a.x) * 0.5 + abs(a.y) * 0.8660254)
+        let hb = max(abs(b.x), abs(b.x) * 0.5 + abs(b.y) * 0.8660254)
+        return clamp(1.0 - (0.5 - min(ha, hb)) * hex_gain, 0.0, 1.0)
+    }
+}
+
+let tex_noise = fn() {
+    return fn(c) {
+        return value_noise3(c)
+    }
+}
+
+// ---- mappings
+
+// Round the Y axis through (tex_cx, tex_cz): c.x = tex_nu turns' worth of cells per turn (whole,
+// so the pattern closes on itself) plus tex_tu per metre up, c.y the same with tex_nv and
+// tex_tv; c.z the height above the radius tex_rr in cells of tex_sw. Faded out inside tex_r1
+// down to nothing at tex_r0: only the surface near the radius is textured.
+let tex_cylindrical = fn(tex_pat, tex_cx, tex_cz, tex_nu, tex_nv, tex_tu, tex_tv, tex_ou, tex_ov, tex_rr, tex_sw, tex_r0, tex_r1) {
+    return fn(p) {
+        let x = p.x - tex_cx
+        let z = p.z - tex_cz
+        let r = sqrt(x * x + z * z)
+        let a = atan2(z, x) / TAU
+        let c = vec3(tex_nu * a + tex_tu * p.y + tex_ou, tex_nv * a + tex_tv * p.y + tex_ov, (r - tex_rr) / tex_sw)
+        return clamp((r - tex_r0) / (tex_r1 - tex_r0), 0.0, 1.0) * tex_pat(c)
+    }
+}
+
+// Along Y onto the XZ plane: c.x and c.y from x and z (turned and scaled per metre), c.z = y in
+// cells of tex_sw.
+let tex_planar = fn(tex_pat, tex_ux, tex_uz, tex_vx, tex_vz, tex_ou, tex_ov, tex_sw) {
+    return fn(p) {
+        return tex_pat(vec3(tex_ux * p.x + tex_uz * p.z + tex_ou, tex_vx * p.x + tex_vz * p.z + tex_ov, p.y / tex_sw))
+    }
+}
+
+// ---- voronoi (m.voronoi): cells vor_size wide and vor_stretch times taller along the axis (0 x, 1 y,
+// 2 z; turned onto y here: a swap keeps distances), of seeds the lowering placed over the skin
+// (voronoi.rs: the table after the grid's samples, word 14 its start). q is a point in cells: a
+// lattice-free space where a cell is about 1 across. Points and lengths in metres.
+
+let vor_up = fn(p, vor_axis) {
+    let u = if vor_axis < 0.5 { vec3(p.y, p.x, p.z) } elif vor_axis > 1.5 { vec3(p.x, p.z, p.y) } else { p }
+    return u
+}
+
+// Where the list of seeds near q starts: its count, then x y z and the hole's top per seed. Off the
+// table's grid q reads its edge buckets, which are empty.
+let vor_list = fn(q, t) {
+    let n = vec3(sdf_grid[t + 4], sdf_grid[t + 5], sdf_grid[t + 6])
+    let g = clamp(floor((q - vec3(sdf_grid[t], sdf_grid[t + 1], sdf_grid[t + 2])) * sdf_grid[t + 3]), vec3(0.0, 0.0, 0.0), n - vec3(1.0, 1.0, 1.0))
+    return int(sdf_grid[t + 9 + int(g.x) + int(n.x) * (int(g.y) + int(n.y) * int(g.z))]) * int(sdf_grid[t + 8])
+}
+
+// Struts where the cells' faces cross the skin, vor_strut thick, the holes' corners rounded by
+// vor_round. Each hole ends above in a point: material outside a cone down from its seed's top, so
+// no roof is flatter than vor_tan (the tan of the overhang angle from the vertical); vor_k rounds
+// where the point meets the struts. Solid below vor_low and above vor_high (the bands), the struts
+// merging into them.
+//
+// Inside a convex cell the distance to its boundary is the least distance to its faces' planes. A
+// list holds every seed within the table's reach r, and a seed past it has its faces at least half of
+// what the nearest seed leaves of r away: the field never exceeds that, so it stays a distance bound,
+// and no point sees a seed one list has and another lacks. No seed in reach reads a solid: only far
+// off the skin, which bounds the web there.
+let vor_faces_at = fn(p, vor_size, vor_stretch, vor_strut, vor_round, vor_k, vor_tan, vor_axis, vor_low, vor_high) {
+    let u = vor_up(p, vor_axis)
+    let m = vec3(1.0 / vor_size, 1.0 / (vor_size * vor_stretch), 1.0 / vor_size)
+    let q = u * m
+    let t = int(sdf_grid[14])
+    let l = t + vor_list(q, t)
+    let n = int(sdf_grid[l])
+    let c = vec4(0.0, 0.0, 0.0, 0.0)
+    let aa = 1000000000000.0
+    for i in 0..n {
+        let j = l + 1 + 4 * i
+        let s = vec4(sdf_grid[j], sdf_grid[j + 1], sdf_grid[j + 2], sdf_grid[j + 3])
+        let b = vec3(s.x, s.y, s.z) - q
+        let dd = dot(b, b)
+        if dd < aa {
+            aa = dd
+            c = s
+        }
+    }
+    let cq = vec3(c.x, c.y, c.z)
+    let bound = max(sdf_grid[t + 7] - sqrt(aa), 0.0) * 0.5 * vor_size
+    let face = bound
+    for i in 0..n {
+        let j = l + 1 + 4 * i
+        let s = vec3(sdf_grid[j], sdf_grid[j + 1], sdf_grid[j + 2])
+        let w = s - cq
+        if dot(w, w) > 0.000001 {
+            let b = s - q
+            face = smin(face, (dot(b, b) - aa) * 0.5 / length(w * m), vor_round)
+        }
+    }
+    face = min(face, bound)
+    let web = face - 0.5 * vor_strut
+    let seed = cq / m
+    let ca = 1.0 / sqrt(1.0 + vor_tan * vor_tan)
+    let cone = (length(vec2(u.x - seed.x, u.z - seed.z)) - (c.w - u.y) * vor_tan) * ca
+    // the cone's material within this cell only, so it vanishes at the cell's faces and the
+    // field stays continuous where the nearest seed changes
+    let d = smin(web, max(-face, -cone), vor_k)
+    return smin(smin(d, u.y - vor_low, vor_strut), vor_high - u.y, vor_strut)
+}
+
+let vor_faces = fn(vor_size, vor_stretch, vor_strut, vor_round, vor_tan, vor_axis, vor_low, vor_high) {
+    return fn(p) {
+        return vor_faces_at(p, vor_size, vor_stretch, vor_strut, vor_round, min(vor_round, 0.5 * vor_strut), vor_tan, vor_axis, vor_low, vor_high)
+    }
+}
+
+// What is left of the span lo..hi (x, y) of the line of seeds a, b and c (the points o + t n from
+// a, o the seeds' circumcentre from a, n the line's direction) where a is nearer than a seed w
+// from a. Empty: x above y.
+let vor_clip = fn(span, w, o, n) {
+    let s = 2.0 * dot(n, w)
+    let r = dot(w, w) - 2.0 * dot(o, w)
+    if abs(s) < 0.000001 {
+        return if r < 0.0 { vec2(1.0, 0.0) } else { span }
+    }
+    if s > 0.0 {
+        return vec2(span.x, min(span.y, r / s))
+    }
+    return vec2(max(span.x, r / s), span.y)
+}
+// The distance (ip = 1 / m, in p's units) to the edge of seeds a, b and c given from q: the line
+// of points as far from the three, where none of d, e and f lies nearer. None: a long way.
+let vor_edge = fn(a, b, c, d, e, f, ip) {
+    let ab = b - a
+    let ac = c - a
+    let n = cross(ab, ac)
+    let nn = dot(n, n)
+    if nn < 0.000001 {
+        return 1000000000.0
+    }
+    let o = (cross(n, ab) * dot(ac, ac) + cross(ac, n) * dot(ab, ab)) * (0.5 / nn)
+    let span = vor_clip(vor_clip(vor_clip(vec2(-1000000000.0, 1000000000.0), d - a, o, n), e - a, o, n), f - a, o, n)
+    if span.x > span.y {
+        return 1000000000.0
+    }
+    let x = (a + o) * ip
+    let v = n * ip
+    return length(x + v * clamp(-dot(x, v) / dot(v, v), span.x, span.y))
+}
+
+// The distance to the cells' edges, where three meet: an open-cell foam's struts, vor_strut thick.
+// Each edge of q's 6 nearest seeds' cells, whole, up to `far`: half of how much nearer the nearest
+// seed is than the 7th or the table's reach, over the axis the cells are finest along. An edge within
+// that reach has its three seeds among the 6, and no other seed cuts an edge of the 6 there (a seed
+// nearer the edge than its three lies within f1 + 2 reach of q), so the field is the true distance
+// up to `far` and `far` past it: continuous and a distance bound, and a strut stands only where the
+// cells' edge runs. No node has all its struts rising, so a strut's foot always stands on one going
+// down. Fewer than 6 seeds in the list: the others are the nearest over again, whose edges are none.
+let vor_edges_at = fn(p, vor_size, vor_stretch, vor_strut, vor_axis) {
+    let m = vec3(1.0 / vor_size, 1.0 / (vor_size * vor_stretch), 1.0 / vor_size)
+    let q = vor_up(p, vor_axis) * m
+    let t = int(sdf_grid[14])
+    let l = t + vor_list(q, t)
+    let n = int(sdf_grid[l])
+    let f1 = 1000000.0
+    let f2 = f1
+    let f3 = f1
+    let f4 = f1
+    let f5 = f1
+    let f6 = f1
+    let f7 = f1
+    let s1 = vec3(0.0, 0.0, 0.0)
+    let s2 = s1
+    let s3 = s1
+    let s4 = s1
+    let s5 = s1
+    let s6 = s1
+    for i in 0..n {
+        let j = l + 1 + 4 * i
+        let s = vec3(sdf_grid[j], sdf_grid[j + 1], sdf_grid[j + 2])
+        let d = length(s - q)
+        if d < f7 {
+            if d < f6 {
+                f7 = f6
+                if d < f5 {
+                    f6 = f5
+                    s6 = s5
+                    if d < f4 {
+                        f5 = f4
+                        s5 = s4
+                        if d < f3 {
+                            f4 = f3
+                            s4 = s3
+                            if d < f2 {
+                                f3 = f2
+                                s3 = s2
+                                if d < f1 {
+                                    f2 = f1
+                                    s2 = s1
+                                    f1 = d
+                                    s1 = s
+                                } else {
+                                    f2 = d
+                                    s2 = s
+                                }
+                            } else {
+                                f3 = d
+                                s3 = s
+                            }
+                        } else {
+                            f4 = d
+                            s4 = s
+                        }
+                    } else {
+                        f5 = d
+                        s5 = s
+                    }
+                } else {
+                    f6 = d
+                    s6 = s
+                }
+            } else {
+                f7 = d
+            }
+        }
+    }
+    let far = max(min(f7, sdf_grid[t + 7]) - f1, 0.0) * 0.5 * vor_size
+    let a = s1 - q
+    let b = if f2 < 100000.0 { s2 - q } else { a }
+    let c = if f3 < 100000.0 { s3 - q } else { a }
+    let d = if f4 < 100000.0 { s4 - q } else { a }
+    let e = if f5 < 100000.0 { s5 - q } else { a }
+    let f = if f6 < 100000.0 { s6 - q } else { a }
+    let ip = vec3(vor_size, vor_size * vor_stretch, vor_size)
+    let near = vor_edge(a, b, c, d, e, f, ip)
+    near = min(near, vor_edge(a, b, d, c, e, f, ip))
+    near = min(near, vor_edge(a, b, e, c, d, f, ip))
+    near = min(near, vor_edge(a, b, f, c, d, e, ip))
+    near = min(near, vor_edge(a, c, d, b, e, f, ip))
+    near = min(near, vor_edge(a, c, e, b, d, f, ip))
+    near = min(near, vor_edge(a, c, f, b, d, e, ip))
+    near = min(near, vor_edge(a, d, e, b, c, f, ip))
+    near = min(near, vor_edge(a, d, f, b, c, e, ip))
+    near = min(near, vor_edge(a, e, f, b, c, d, ip))
+    near = min(near, vor_edge(b, c, d, a, e, f, ip))
+    near = min(near, vor_edge(b, c, e, a, d, f, ip))
+    near = min(near, vor_edge(b, c, f, a, d, e, ip))
+    near = min(near, vor_edge(b, d, e, a, c, f, ip))
+    near = min(near, vor_edge(b, d, f, a, c, e, ip))
+    near = min(near, vor_edge(b, e, f, a, c, d, ip))
+    near = min(near, vor_edge(c, d, e, a, b, f, ip))
+    near = min(near, vor_edge(c, d, f, a, b, e, ip))
+    near = min(near, vor_edge(c, e, f, a, b, d, ip))
+    near = min(near, vor_edge(d, e, f, a, b, c, ip))
+    return min(near, far) - 0.5 * vor_strut
+}
+
+let vor_edges = fn(vor_size, vor_stretch, vor_strut, vor_axis) {
+    return fn(p) {
+        return vor_edges_at(p, vor_size, vor_stretch, vor_strut, vor_axis)
+    }
+}
+
+// Graded (adapt: @stress): each strut as thick as the part's grid says at p (sdf_grid3), the
+// distance over vor_lip (1 + half the thickness's steepest slope) so it stays a bound.
+let vor_faces_graded = fn(vor_size, vor_stretch, vor_round, vor_k, vor_tan, vor_axis, vor_low, vor_high, vor_lip) {
+    return fn(p) {
+        return vor_faces_at(p, vor_size, vor_stretch, sdf_grid3(p), vor_round, vor_k, vor_tan, vor_axis, vor_low, vor_high) / vor_lip
+    }
+}
+
+let vor_edges_graded = fn(vor_size, vor_stretch, vor_axis, vor_lip) {
+    return fn(p) {
+        return vor_edges_at(p, vor_size, vor_stretch, sdf_grid3(p), vor_axis) / vor_lip
+    }
+}
+
+// A grown part's shape (m.grow): the distance on its grid.
+let grown = fn() {
+    return fn(p) {
+        return sdf_grid3(p)
+    }
+}
+
+// A slime mould's veins raised as tubes (m.veins): the least distance to the tubes listed near p,
+// each a round cone (the hull of a ball at a and one at b, or the larger where it holds the other)
+// less what is past its cut under the skin; the table's reach where none is near. The table is in
+// the part's units, veins_unit to a metre.
+let veins_at = fn(p, veins_unit) {
+    let q = p * veins_unit
+    let t = int(sdf_grid[14])
+    let l = t + vor_list(q, t)
+    let n = int(sdf_grid[l])
+    let d = sdf_grid[t + 7]
+    for i in 0..n {
+        let j = l + 1 + 12 * i
+        let a = vec3(sdf_grid[j], sdf_grid[j + 1], sdf_grid[j + 2])
+        let ra = sdf_grid[j + 3]
+        let b = vec3(sdf_grid[j + 4], sdf_grid[j + 5], sdf_grid[j + 6])
+        let rb = sdf_grid[j + 7]
+        let cut = vec3(sdf_grid[j + 8], sdf_grid[j + 9], sdf_grid[j + 10])
+        let ab = b - a
+        let len = length(ab)
+        let cone = min(length(q - a) - ra, length(q - b) - rb)
+        if len > abs(ra - rb) {
+            let pa = q - a
+            let y = dot(pa, ab) / len
+            let x = sqrt(max(dot(pa, pa) - y * y, 0.0))
+            let s = (ra - rb) / len
+            let c = sqrt(1.0 - s * s)
+            let k = c * y - s * x
+            if k < 0.0 {
+                cone = sqrt(x * x + y * y) - ra
+            } elif k > c * len {
+                cone = sqrt(x * x + (y - len) * (y - len)) - rb
+            } else {
+                cone = x * c + y * s - ra
+            }
+        }
+        d = min(d, max(cone, sdf_grid[j + 11] - dot(q, cut)))
+    }
+    return d / veins_unit
+}
+
+let veins = fn(veins_unit) {
+    return fn(p) {
+        return veins_at(p, veins_unit)
+    }
+}
+
+let tex_library = {
+    grown: grown
+    veins: veins
+    vor_faces: vor_faces
+    vor_edges: vor_edges
+    vor_faces_graded: vor_faces_graded
+    vor_edges_graded: vor_edges_graded
+    knurl_straight: tex_knurl_straight
+    knurl_diagonal: tex_knurl_diagonal
+    knurl_diamond: tex_knurl_diamond
+    hex: tex_hex
+    noise: tex_noise
+    cylindrical: tex_cylindrical
+    planar: tex_planar
+}
+tex_library

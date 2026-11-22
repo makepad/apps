@@ -1,0 +1,12 @@
+[package]
+name = "fab-elec-mcu-parts"
+version = "1.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+authors = ["Makepad <info@makepad.nl>"]
+description = "Deterministic board nets and rewindable electronic part models"
+
+[dependencies]
+fab-elec-mcu-emu = { path = "../emu" }
+makepad-lock-free = { path = "../../../../../../libs/lock_free" }

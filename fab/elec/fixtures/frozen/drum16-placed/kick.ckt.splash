@@ -1,0 +1,14 @@
+// drum16's kick on its own: the kick's ringing filter on the 5 V analog supply and its signal
+// ground. Its bench strikes it as the sequencer will, with an unaccented trigger every half second;
+// its DECAY and TUNE pots turn live while it plays.
+use mod.project.*
+let e = mod.elec
+
+let gnd  = e.net({name: "GND" kind: @ground})
+let va   = e.net({name: "VA" kind: @power volts: 5V})
+let ref  = e.net({name: "VREF"})
+let trig = e.net({name: "TRIG"})
+let out  = e.net({name: "OUT"})
+
+let sg   = signal_ground({va: va gnd: gnd ref: ref})
+let drum = kick_ringer({trig: trig out: out ref: ref va: va gnd: gnd})

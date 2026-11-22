@@ -1,0 +1,14 @@
+// A marble block: pale veins swirled through dark stone by a band pattern pushed about by 3D
+// noise, through the whole volume, so a worn corner shows them too (and a cut, with Exact
+// paint inside on: else the inside prints them in large blocks).
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+let block_size = param(40mm, min: 10mm, max: 120mm, step: 1mm, label: "Size", group: "Marble block")
+let block_vein = param(5mm, min: 1mm, max: 30mm, step: 0.5mm, label: "Veins", group: "Marble block", hint: "the spacing of the veins")
+let block = m.box({size: [block_size, block_size * 0.5, block_size] at: [0, block_size * 0.25, 0]})
+let stone = Material{albedo: [0.12 0.12 0.14] name: "Black"}
+let veins = Material{albedo: [0.92 0.92 0.9] name: "White"}
+m.fill(block, Mix{materials: [stone veins] field: fn(p) { noise.bands(p.x / block_vein + 2.5 * noise.fbm(p / (3 * block_vein), 4, 4)) - 0.25 } sharp: 0.4})
+object(block)

@@ -1,0 +1,272 @@
+let __can_e = mod.elec
+let __can_f = mod.elec.f
+
+let __can_positive = fn(v) {
+    return v.is_number() && v > 0mm && v - v == 0mm
+}
+
+// Nominal lands: flat leads use toe 0.25 mm, heel 0.05 mm;
+// flat no-lead terminals use toe 0.30 mm, heel 0 mm. Both have side 0 mm.
+let __can_land = fn(span, width, length, toe, heel) {
+    // Z = span + 2 * toe; G = span - 2 * length - 2 * heel.
+    // These equivalent forms avoid subtracting nearly equal spans.
+    return {
+        x: __can_f.round((span - length + toe - heel) / 2, 0.01mm)
+        size: [__can_f.round(length + toe + heel, 0.01mm),
+               __can_f.round(width, 0.01mm)]
+    }
+}
+
+// Keep the portions of segment a..b outside an expanded land rectangle.
+let __can_outside = fn(a, b, lo, hi) {
+    let enter = 0
+    let leave = 1
+    for axis in 0..2 {
+        let delta = b[axis] - a[axis]
+        if delta == 0mm {
+            if a[axis] < lo[axis] || a[axis] > hi[axis] {
+                return [[a, b]]
+            }
+        } else {
+            let near = if delta > 0mm {
+                (lo[axis] - a[axis]) / delta
+            } else {
+                (hi[axis] - a[axis]) / delta
+            }
+            let far = if delta > 0mm {
+                (hi[axis] - a[axis]) / delta
+            } else {
+                (lo[axis] - a[axis]) / delta
+            }
+            if near > enter { enter = near }
+            if far < leave { leave = far }
+            if enter >= leave { return [[a, b]] }
+        }
+    }
+    let pieces = []
+    if enter > 0 {
+        pieces.push([a, [a[0] + enter * (b[0] - a[0]),
+                         a[1] + enter * (b[1] - a[1])]])
+    }
+    if leave < 1 {
+        pieces.push([[a[0] + leave * (b[0] - a[0]),
+                      a[1] + leave * (b[1] - a[1])], b])
+    }
+    return pieces
+}
+
+// A surface-mount aluminium electrolytic can; positive pad 1 is on the left.
+// o.d is can diameter, o.base the square base side, o.lead [width, length],
+// and o.span the lead tip-to-tip distance along x; all lengths in mm.
+let elcap = fn(o) {
+    let f = __can_f
+    if !o.is_object() { return f.error("elcap: o must be an options object") }
+    let d = o.d ?? nil
+    let base = o.base ?? nil
+    let lead = o.lead ?? nil
+    let span = o.span ?? nil
+    if !__can_positive(d) {
+        return f.error("elcap: d must be a positive finite diameter")
+    }
+    if !__can_positive(base) || base < d {
+        return f.error("elcap: base must be a positive finite side at least d")
+    }
+    if !lead.is_array() || lead.len() != 2 {
+        return f.error("elcap: lead must be [width, length]")
+    }
+    if !__can_positive(lead[0]) || !__can_positive(lead[1]) {
+        return f.error("elcap: lead dimensions must be positive finite lengths")
+    }
+    if lead[0] > base {
+        return f.error("elcap: lead width must fit within base")
+    }
+    if !__can_positive(span) || span <= base {
+        return f.error("elcap: span must be a positive finite length greater than base")
+    }
+    let land = __can_land(span, lead[0], lead[1], 0.25mm, 0.05mm)
+    if !__can_positive(land.x) || !__can_positive(land.size[0]) || !__can_positive(land.size[1]) {
+        return f.error("elcap: span and lead must produce positive finite rounded lands")
+    }
+    if !__can_positive(2 * land.x - land.size[0]) {
+        return f.error("elcap: span and lead length must leave space between the rounded lands")
+    }
+    let half = base / 2
+    let chamfer = base / 4
+    let outline = [
+        [-half, -half + chamfer], [-half + chamfer, -half],
+        [half, -half], [half, half],
+        [-half + chamfer, half], [-half, half - chamfer],
+        [-half, -half + chamfer]
+    ]
+    let stroke = 0.12mm
+    // Include half the stroke width so its ink stays 0.3 mm from each land.
+    let clearance = 0.3mm + stroke / 2
+    let graphics = []
+    for i in 0..6 {
+        let pieces = [[outline[i], outline[i + 1]]]
+        for pad in 0..2 {
+            let x = if pad == 0 { -land.x } else { land.x }
+            let lo = [x - land.size[0] / 2 - clearance, -land.size[1] / 2 - clearance]
+            let hi = [x + land.size[0] / 2 + clearance, land.size[1] / 2 + clearance]
+            let kept = []
+            for j in 0..pieces.len() {
+                let outside = __can_outside(pieces[j][0], pieces[j][1], lo, hi)
+                for k in 0..outside.len() { kept.push(outside[k]) }
+            }
+            pieces = kept
+        }
+        for j in 0..pieces.len() {
+            graphics.push(f.stroke("F.SilkS", pieces[j], stroke))
+        }
+    }
+    // Two 1 mm strokes, with the nearest ink 0.3 mm left of pad 1.
+    let plus_x = -land.x - land.size[0] / 2 - clearance - 0.5mm
+    graphics.push(f.stroke("F.SilkS", [[plus_x - 0.5mm, 0mm], [plus_x + 0.5mm, 0mm]], stroke))
+    graphics.push(f.stroke("F.SilkS", [[plus_x, -0.5mm], [plus_x, 0.5mm]], stroke))
+    return f.footprint({
+        pads: [
+            f.smd("1", [-land.x, 0mm], land.size),
+            f.smd("2", [land.x, 0mm], land.size)
+        ]
+        body: [[-half, -half], [half, half]]
+        mount: @smd
+        text: 1mm
+        graphics: graphics
+    })
+}
+
+// A can footprint; d is 4, 5, 6.3, 8 or 10 mm.
+let elcap_size = fn(d) {
+    let dimensions = if d == 4mm {
+        {base: 4.3mm lead: [0.65mm, 1.8mm]}
+    } elif d == 5mm {
+        {base: 5.3mm lead: [0.65mm, 2.2mm]}
+    } elif d == 6.3mm {
+        {base: 6.6mm lead: [0.65mm, 2.2mm]}
+    } elif d == 8mm {
+        {base: 8.3mm lead: [0.9mm, 2.9mm]}
+    } elif d == 10mm {
+        {base: 10.3mm lead: [0.9mm, 3.2mm]}
+    } else {
+        return __can_f.error("elcap_size: d must be 4mm, 5mm, 6.3mm, 8mm or 10mm")
+    }
+    return elcap({d: d base: dimensions.base lead: dimensions.lead span: dimensions.base + 0.8mm})
+}
+
+// A shielded square inductor with two underside terminals at its x ends.
+// o.body is the side, o.term [x, y] the terminal size, o.gap the inner x gap; lengths in mm.
+let power_inductor = fn(o) {
+    let f = __can_f
+    if !o.is_object() { return f.error("power_inductor: o must be an options object") }
+    let body = o.body ?? nil
+    let term = o.term ?? nil
+    let gap = o.gap ?? nil
+    if !__can_positive(body) {
+        return f.error("power_inductor: body must be a positive finite side")
+    }
+    if !term.is_array() || term.len() != 2 {
+        return f.error("power_inductor: term must be [x, y]")
+    }
+    if !__can_positive(term[0]) || !__can_positive(term[1]) {
+        return f.error("power_inductor: term dimensions must be positive finite lengths")
+    }
+    if term[1] > body {
+        return f.error("power_inductor: term y must fit within body")
+    }
+    if !__can_positive(gap) || gap >= body {
+        return f.error("power_inductor: gap must be a positive finite length less than body")
+    }
+    // Terminal tips may project beyond the body; the span comes from term and gap.
+    let span = gap + 2 * term[0]
+    let land = __can_land(span, term[1], term[0], 0.30mm, 0mm)
+    if !__can_positive(span) || !__can_positive(land.x) ||
+       !__can_positive(land.size[0]) || !__can_positive(land.size[1]) {
+        return f.error("power_inductor: term and gap must produce positive finite rounded lands")
+    }
+    if !__can_positive(2 * land.x - land.size[0]) {
+        return f.error("power_inductor: term and gap must leave space between the rounded lands")
+    }
+    let half = body / 2
+    return f.footprint({
+        pads: [
+            f.smd("1", [-land.x, 0mm], land.size),
+            f.smd("2", [land.x, 0mm], land.size)
+        ]
+        body: [[-half, -half], [half, half]]
+        mount: @smd
+        text: 1mm
+        graphics: [f.dot("F.SilkS", [-land.x - land.size[0] / 2 - 0.7mm, 0mm], 0.15mm)]
+    })
+}
+
+// A square power-inductor footprint; side is 3, 4, 5, 6, 8, 10 or 12 mm.
+let inductor_size = fn(side) {
+    let term = if side == 3mm { [0.9mm, 2.5mm] }
+    elif side == 4mm { [1.2mm, 3.4mm] }
+    elif side == 5mm { [1.5mm, 4.2mm] }
+    elif side == 6mm { [1.8mm, 5.0mm] }
+    elif side == 8mm { [2.4mm, 6.8mm] }
+    elif side == 10mm { [3.0mm, 8.5mm] }
+    elif side == 12mm { [3.6mm, 10.2mm] }
+    else { return __can_f.error("inductor_size: side must be 3mm, 4mm, 5mm, 6mm, 8mm, 10mm or 12mm") }
+    return power_inductor({body: side term: term gap: side / 2})
+}
+
+// A polarised capacitor part; d is 4, 5, 6.3, 8 or 10 mm.
+// Optional o.height defaults to a nominal seated can height of 5.4 mm through d = 6.3 mm,
+// or 10.2 mm for the two larger diameters.
+let elcap_part = fn(d, o = nil) {
+    let e = __can_e
+    let f = __can_f
+    if !__can_positive(d) { return f.error("elcap_part: d must be a positive finite diameter") }
+    if o == nil { o = {} }
+    if !o.is_object() { return f.error("elcap_part: o must be an options object") }
+    let default_height = if d <= 6.3mm { 5.4mm } else { 10.2mm }
+    let height = o.height ?? default_height
+    if !__can_positive(height) {
+        return f.error("elcap_part: height must be a positive finite length")
+    }
+    let height_suffix = if height == default_height { "" } else { "_H" + f.mm(height) + "mm" }
+    let name = "CP_" + f.mm(d) + height_suffix
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    let footprint = elcap_size(d)
+    if footprint == nil { return nil }
+    return e.define(name, {
+        kind: @capacitor
+        symbol: f.two_terminal([["+", @passive], ["-", @passive]])
+        footprint: footprint
+        body: {height: height}
+        pads: [["+", "1"], ["-", "2"]]
+        prefix: "C"
+    })
+}
+
+// A power-inductor part; side is 3, 4, 5, 6, 8, 10 or 12 mm.
+// Optional o.height defaults to side / 2, a nominal low-profile seated body height.
+let inductor_part = fn(side, o = nil) {
+    let e = __can_e
+    let f = __can_f
+    if !__can_positive(side) { return f.error("inductor_part: side must be a positive finite length") }
+    if o == nil { o = {} }
+    if !o.is_object() { return f.error("inductor_part: o must be an options object") }
+    let default_height = side / 2
+    let height = o.height ?? default_height
+    if !__can_positive(height) {
+        return f.error("inductor_part: height must be a positive finite length")
+    }
+    let height_suffix = if height == default_height { "" } else { "_H" + f.mm(height) + "mm" }
+    let name = "L_" + f.mm(side) + "mm" + height_suffix
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    let footprint = inductor_size(side)
+    if footprint == nil { return nil }
+    return e.define(name, {
+        kind: @inductor
+        symbol: f.two_terminal([["1", @passive], ["2", @passive]])
+        footprint: footprint
+        body: {height: height}
+        pads: [["1", "1"], ["2", "2"]]
+        prefix: "L"
+    })
+}

@@ -1,0 +1,15 @@
+[package]
+name = "fab-elec-mcu-emu"
+version = "1.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+authors = ["Makepad <info@makepad.nl>"]
+description = "The emulator core of microsplash's virtual MCUs: the bus and memory every CPU model runs on"
+
+[features]
+jit = ["dep:relax-backend", "dep:relax-session"]
+
+[dependencies]
+relax-backend = { path = "../../../../../../libs/relax/backend", optional = true }
+relax-session = { path = "../../../../../../libs/relax/session", optional = true }

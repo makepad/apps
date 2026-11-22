@@ -1,0 +1,16 @@
+[package]
+name = "fab-elec-simjit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Compiled sparse LU plans for the electronics simulator (ESIMRT T9): a plan's refactor and solve as straight-line native code through the relax backend's standalone driver, the same bits as the interpreted plan."
+
+[dependencies]
+fab-elec-sim = { path = "../sim" }
+relax-backend = { workspace = true }
+relax-session = { workspace = true }
+
+[[test]]
+name = "proofs"
+path = "tests/proofs.rs"

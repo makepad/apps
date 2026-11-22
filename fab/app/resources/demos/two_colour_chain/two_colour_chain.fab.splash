@@ -1,0 +1,9 @@
+// A two-colour print-in-place chain: silver and gold links in stripes.
+use mod.fab.*
+
+script("two_colour_chain.cad.splash")
+
+color("Silver", rgb: #xb8bcc2)
+color("Gold", rgb: #xd9a521)
+
+place("two_colour_chain", at: [175mm 160mm], name: "Chain", color: "Silver")

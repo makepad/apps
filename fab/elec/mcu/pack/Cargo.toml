@@ -1,0 +1,12 @@
+[package]
+name = "fab-elec-mcu-pack"
+version = "1.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+authors = ["Makepad <info@makepad.nl>"]
+description = "Fetch, verify and install pinned libraries for Fab's Espressif radio island"
+
+[dependencies]
+makepad-core-util = { path = "../../../../../../libs/core_util" }
+makepad-network = { path = "../../../../../../platform/network" }

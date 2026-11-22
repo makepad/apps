@@ -1,0 +1,54 @@
+// A parametric shelf bracket: an L section with a filleted inside corner and
+// rounded edges, minus four counterbored screw holes. Model frame: Y up, +Z to the front.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+let width = param(64mm, min: 20mm, max: 200mm, step: 0.5mm, label: "Width", group: "Shelf bracket")
+let depth = param(46mm, min: 20mm, max: 150mm, step: 0.5mm, label: "Shelf depth", group: "Shelf bracket")
+let height = param(52mm, min: 15mm, max: 200mm, step: 0.5mm, label: "Wall height", group: "Shelf bracket")
+let thickness = param(6mm, min: 2mm, max: 20mm, step: 0.1mm, label: "Thickness", group: "Shelf bracket")
+let fillet = param(9mm, min: 0.5mm, max: 40mm, step: 0.1mm, label: "Inside fillet", group: "Shelf bracket", kind: "radius")
+let hole = param(4.6mm, min: 1mm, max: 12mm, step: 0.1mm, label: "Screw hole", group: "Shelf bracket", kind: "diameter")
+let counterbore = param(8.6mm, min: 2mm, max: 20mm, step: 0.1mm, label: "Counterbore", group: "Shelf bracket", kind: "diameter")
+let counterbore_depth = param(2.4mm, min: 0mm, max: 10mm, step: 0.1mm, label: "Counterbore depth", group: "Shelf bracket")
+let edge_radius = param(1.2mm, min: 0mm, max: 3mm, step: 0.1mm, label: "Edge rounding", group: "Shelf bracket", kind: "radius")
+
+// The L section in the side plane (u = Z, v = Y): the wall at the back.
+let back = -depth / 2
+let section = Path{from: [0, 0] segs: [
+    LineTo{to: [depth / 2, 0]} RoundCorner{r: edge_radius}
+    LineTo{to: [depth / 2, thickness]} RoundCorner{r: edge_radius}
+    LineTo{to: [back + thickness, thickness]} RoundCorner{r: fillet}
+    LineTo{to: [back + thickness, height]} RoundCorner{r: edge_radius}
+    LineTo{to: [back, height]} RoundCorner{r: edge_radius}
+    LineTo{to: [back, 0]} RoundCorner{r: edge_radius}
+]}
+let body = m.extrude({sketch: section plane: @yz height: width both: true})
+
+// Two screw holes through the shelf (from the top), two through the wall (from the front).
+let shelf_z = back + thickness + fillet + (depth - thickness - fillet) * 0.5
+let wall_y = thickness + fillet + (height - thickness - fillet) * 0.55
+let holes = for x in [-width * 0.27, width * 0.27] {
+    m.cylinder({radius: hole / 2 height: thickness * 3 at: [x, thickness * 0.5, shelf_z]})
+    m.cylinder({radius: hole / 2 height: thickness * 3 at: [x, wall_y, back + thickness * 0.5] rotate: [90°, 0, 0]})
+}
+let bores = for x in [-width * 0.27, width * 0.27] {
+    m.cylinder({radius: counterbore / 2 height: counterbore_depth * 2 at: [x, thickness, shelf_z]})
+    m.cylinder({radius: counterbore / 2 height: counterbore_depth * 2 at: [x, wall_y, back + thickness] rotate: [90°, 0, 0]})
+}
+let bracket = m.subtract(body, [holes bores])
+
+// Where the bracket's parameters are dragged in the view.
+handle(height, Arrow{from: [width * 0.4, 0, back + thickness * 0.5] to: [width * 0.4, height, back + thickness * 0.5]})
+handle(depth, Arrow{from: [width * 0.4, thickness * 0.5, 0] to: [width * 0.4, thickness * 0.5, depth / 2]})
+handle(thickness, Arrow{from: [width * 0.4, 0, depth * 0.3] to: [width * 0.4, thickness, depth * 0.3]})
+handle(hole, Ring{center: [-width * 0.27, thickness, shelf_z] radius: hole / 2})
+handle(counterbore, Ring{center: [width * 0.27, thickness, shelf_z] radius: counterbore / 2})
+
+object(bracket)
+
+// Its force study (Design's Force mode): screwed to the wall through the wall's two holes,
+// 50 N (a 5 kg shelf) pushing the shelf down.
+m.fixed([holes[1], holes[3]])
+m.force(Face{at: [0, thickness, shelf_z]}, [0, -50, 0])

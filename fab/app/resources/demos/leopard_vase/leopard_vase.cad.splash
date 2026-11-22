@@ -1,0 +1,42 @@
+// A tall vase with a leopard's spots grown on it: a Turing pattern of dark spots on sand,
+// simulated over the vase's own skin, so the spots follow it round the belly, over the shoulder
+// and up the neck at one size. Two filaments; the pattern's spacing, seed and steps are its
+// knobs. A belly, a shoulder and a neck blended, a flat foot cut, hollowed to its wall, a rolled
+// lip flared out of the neck: one distance field, so it renders and edits live.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+let height = param(110mm, min: 50mm, max: 220mm, step: 1mm, label: "Height", group: "Vase")
+let belly = param(30mm, min: 12mm, max: 70mm, step: 0.5mm, label: "Belly", group: "Vase", kind: "radius")
+let neck = param(11mm, min: 4mm, max: 30mm, step: 0.5mm, label: "Neck", group: "Vase", kind: "radius")
+let wall = param(1.8mm, min: 1mm, max: 5mm, step: 0.1mm, label: "Wall", group: "Vase", hint: "the wall's true thickness, inside the outer surface")
+let spacing = param(9mm, min: 3mm, max: 24mm, step: 0.5mm, label: "Spacing", group: "Spots", hint: "from one spot to the next")
+let seed = param(4, min: 1, max: 999, step: 1, label: "Seed", group: "Spots", kind: "seed", hint: "another whole number grows another set of spots")
+
+let lower = m.ellipsoid({radii: [belly, height * 0.36, belly] at: [0, height * 0.34, 0]})
+let shoulder = m.ellipsoid({radii: [belly * 0.62, height * 0.2, belly * 0.62] at: [0, height * 0.6, 0]})
+let throat = m.cylinder({radius: neck height: height * 0.4 at: [0, height * 0.76, 0]})
+let lip = m.torus({radius: neck + 1.4mm tube: 2mm at: [0, height * 0.95, 0]})
+let body = m.blend([lower shoulder throat], 12mm)
+let foot = m.box({size: [4 * belly, 20mm, 4 * belly] at: [0, -8mm, 0]})
+let footed = m.carve(body, foot, 0)
+let hollow = m.shell(footed, wall, {open: @closed})
+// the lip flares out of the neck on a wide blend: under it the surface leans at most 41° from
+// upright, so it prints with nothing under it
+let rimmed = m.blend([hollow lip], 8mm)
+// the mouth opens the shell's cap under the neck's top, from inside the neck's cavity
+let mouth_low = height * 0.88 - wall
+let mouth_high = height + 20mm
+let mouth = m.cylinder({radius: neck - wall height: mouth_high - mouth_low at: [0, (mouth_low + mouth_high) / 2, 0]})
+let vase = m.carve(rimmed, mouth, 0, {cell: 0.9mm})
+
+handle(height, Arrow{from: [neck + 1.4mm, 0, 0] to: [neck + 1.4mm, height * 0.95 + 2mm, 0]})
+handle(belly, Ring{center: [0, height * 0.34, 0] radius: belly})
+handle(neck, Ring{center: [0, height * 0.76, 0] radius: neck})
+
+object(vase)
+
+let sand = Material{albedo: [0.9 0.74 0.45] name: "Sand"}
+let dark = Material{albedo: [0.13 0.09 0.07] name: "Dark"}
+m.fill(vase, Mix{materials: [sand dark] field: Turing{preset: @spots scale: spacing seed: seed steps: 3000} sharp: 1})

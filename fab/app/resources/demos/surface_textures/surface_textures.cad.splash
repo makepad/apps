@@ -1,0 +1,56 @@
+// Surface textures: each part's surface displaced by a pattern of the texture library, in its
+// distance field (no extra triangles), so a pitch, a size or a depth drags live and the slicer
+// cuts the texture true. A straight-knurled file handle, a pencil cup in hex scales and a
+// coaster with a stone face; and a pot left plain for the slicer's own wall texture, which
+// the project sets on it.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+// Knurl: a file handle, its grooves along its length, its ends left smooth.
+let handle_radius = param(12mm, min: 8mm, max: 20mm, step: 0.5mm, label: "Radius", group: "Knurled handle", kind: "radius")
+let handle_length = param(70mm, min: 40mm, max: 120mm, step: 1mm, label: "Length", group: "Knurled handle")
+let knurl_pitch = param(1.6mm, min: 0.8mm, max: 4mm, step: 0.1mm, label: "Pitch", group: "Knurled handle", hint: "from one groove to the next, round the grip")
+let knurl_depth = param(0.5mm, min: 0.2mm, max: 1.2mm, step: 0.05mm, label: "Depth", group: "Knurled handle")
+// One cylinder carved by the tang's bore: a texture displaces the field inside the surface too,
+// where a union of solids would show the faces they share.
+let grip = m.cylinder({radius: handle_radius height: handle_length at: [0, handle_length / 2, 0]})
+let tang = m.cylinder({radius: 2.5mm height: handle_length at: [0, handle_length * 0.6, 0]})
+let knurled_handle = m.texture(m.carve(grip, tang, 0), {
+    pattern: Knurl{pitch: knurl_pitch angle: 30° kind: @straight flat: 0.25}
+    map: @cylindrical depth: knurl_depth top_angle: 60° bottom_angle: 60° cell: 0.3mm
+})
+
+// Hex: a pencil cup in scales, its rim and foot smooth, its wall thick enough that the inside
+// stays plain (the texture fades out four depths under the surface).
+let cup_radius = param(26mm, min: 16mm, max: 40mm, step: 0.5mm, label: "Radius", group: "Hex cup", kind: "radius")
+let cup_height = param(64mm, min: 30mm, max: 110mm, step: 1mm, label: "Height", group: "Hex cup")
+let hex_size = param(6mm, min: 3mm, max: 14mm, step: 0.5mm, label: "Scale size", group: "Hex cup")
+let hex_depth = param(0.6mm, min: 0.2mm, max: 0.7mm, step: 0.05mm, label: "Depth", group: "Hex cup")
+let cup_outer = m.cylinder({radius: cup_radius height: cup_height at: [0, cup_height / 2, 0]})
+let cup_inner = m.cylinder({radius: cup_radius - 3mm height: cup_height at: [0, cup_height / 2 + 3mm, 0]})
+let hex_cup = m.texture(m.carve(cup_outer, cup_inner, 0), {
+    pattern: Hex{size: hex_size groove: 0.15}
+    map: @cylindrical depth: hex_depth top_angle: 60° bottom_angle: 60°
+})
+
+// Noise: a coaster with a stone face, its underside flat on the bed.
+let coaster_radius = param(40mm, min: 25mm, max: 60mm, step: 0.5mm, label: "Radius", group: "Stone coaster", kind: "radius")
+let stone_size = param(5mm, min: 2mm, max: 12mm, step: 0.5mm, label: "Grain", group: "Stone coaster")
+let stone_depth = param(0.6mm, min: 0.2mm, max: 1.2mm, step: 0.05mm, label: "Depth", group: "Stone coaster")
+let slab = m.cylinder({radius: coaster_radius height: 6mm at: [0, 3mm, 0]})
+let stone_coaster = m.texture(slab, {pattern: Noise{size: stone_size} depth: stone_depth bottom_angle: 60°})
+
+// A plain pot: the project gives it the slicer's woven wall texture, pressed in as it prints.
+let pot_outer = m.cylinder({radius: 24mm height: 56mm at: [0, 28mm, 0]})
+let pot_inner = m.cylinder({radius: 22mm height: 56mm at: [0, 30mm, 0]})
+let woven_pot = m.carve(pot_outer, pot_inner, 0)
+
+handle(handle_radius, Ring{center: [0, handle_length * 0.5, 0] radius: handle_radius})
+handle(cup_height, Arrow{from: [cup_radius, 0, 0] to: [cup_radius, cup_height, 0]})
+handle(coaster_radius, Ring{center: [0, 6mm, 0] radius: coaster_radius})
+
+object(knurled_handle)
+object(hex_cup)
+object(stone_coaster)
+object(woven_pot)

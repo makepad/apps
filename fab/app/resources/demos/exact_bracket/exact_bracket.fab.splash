@@ -1,0 +1,9 @@
+// An angle bracket in exact geometry: true rounds and chamfers, gussets and counterbored holes,
+// every face a plane or a cylinder, so its holes slice as true circles.
+use mod.fab.*
+
+script("exact_bracket.cad.splash")
+
+color("Slate", rgb: #x5b6f82)
+
+place("exact_bracket", at: [175mm 160mm], name: "Exact bracket", color: "Slate")

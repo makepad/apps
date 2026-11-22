@@ -1,0 +1,11 @@
+[package]
+name = "fab-elec-canvasbar"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab electronics canvas bar: the canvas base's test scene (lines, boxes, arcs in every look and live slot)"
+
+[dependencies]
+makepad-widgets = { path = "../../../../../../widgets", version = "2.0.0" }
+fab-elec-view = { path = "../../view" }

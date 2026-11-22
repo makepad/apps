@@ -1,0 +1,28 @@
+// The tone box in its printed case: the base rests the board at its corners and the lid holds it
+// down. The ports open the left wall for power and the right wall for the jack's plug, and the
+// lid for the key's stem and the pot's shaft. The key's captive press pin is its keycap: it rests
+// on the stem and follows its travel; a printed knob grips the pot's shaft. A clear pipe carries the LED's light through a dark block, flush with the
+// lid's top; it is a later body of the lid's object, so it prints its channel in clear filament.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+let pcb = board("tonebox")
+let case = enclosure(pcb, {pipes: {}})
+object(case.base, name: "Base")
+let clear = Material{albedo: [0.9 0.92 0.9] name: "Clear"}
+let lid = [case.lid]
+for p in case.pipes {
+    m.fill(p.pipe, clear)
+    lid.push(p.pipe)
+}
+object(lid, name: "Lid")
+for pin in case.pins {
+    object(pin.pin, name: pin.name)
+}
+for knob in case.knobs {
+    object(knob.knob, name: knob.name)
+}
+insert(board_solid(pcb, board_bodies("tonebox"), case.frame), name: "Board", into: "Base")
+for i in case.inserts {
+    insert(i.part, name: i.name, into: "Base", melt: i)
+}

@@ -1,0 +1,25 @@
+[package]
+name = "fab-elec-route"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab electronics routing (C4, E6): the routing world, problems and solutions, make_legal and tighten, the autorouter engines and tuners"
+
+[package.metadata.makepad.platform-gaps]
+windows = {}
+
+[dependencies]
+fab-elec-core = { path = "../core" }
+fab-elec-circuit = { path = "../circuit" }
+fab-elec-board = { path = "../board" }
+fab-elec-parts = { path = "../parts" }
+
+[features]
+# Hooks for dependent crates' tests (the host's real-worker tests); no product build enables it.
+test-hooks = []
+
+[dev-dependencies]
+fab-elec-fixtures = { path = "../fixtures" }
+fab-elec-design = { path = "../design" }
+fab-elec-lang = { path = "../lang" }

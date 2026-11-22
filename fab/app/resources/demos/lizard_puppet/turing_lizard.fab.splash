@@ -1,0 +1,21 @@
+// The crested lizard hand puppet with a Turing pattern grown over its skin: red spots on the
+// scales, simulated over the head and the jaw, in up to nine filaments. The part's Pattern knobs
+// regrow it (spots, stripes, a labyrinth; its scale, seed and steps).
+use mod.fab.*
+
+script("lizard_puppet.cad.splash", params: {pattern: 1})
+
+// In four filaments the spots are in the mouth's red, on the other nozzle from the scales: the
+// skin switches heads on every layer but swaps no filament. Spots in the slits' dark would trade
+// nozzles with the red on most layers, more than doubling the purge.
+color("Teal", rgb: #x1a9999)
+color("Red", rgb: #xb30d1f)
+color("White", rgb: #xf2f2eb)
+color("Dark", rgb: #x140f1a)
+color("Blue", rgb: #x1f4dbf)
+color("Yellow", rgb: #xf7cc26)
+color("Pink", rgb: #xf28099)
+color("Orange", rgb: #xf2731a)
+color("Purple", rgb: #x7333a6)
+
+place("lizard_puppet", object: "Lizard puppet", at: [175mm 160mm], rotate: 135°, name: "Turing lizard", color: "Teal")

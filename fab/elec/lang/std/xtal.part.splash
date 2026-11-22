@@ -1,0 +1,138 @@
+let __xtal_e = mod.elec
+let __xtal_f = mod.elec.f
+
+let __xtal_positive = fn(v) {
+    return v.is_number() && v > 0mm && v - v == 0mm
+}
+
+// Flat no-lead corner lands, applied on each axis: toe 0.30 mm, heel 0 mm, side 0 mm.
+let __xtal_land = fn(terminal, gap) {
+    let toe = 0.30mm
+    // L = gap + 2 * terminal; Z = L + 2 * toe; G = gap.
+    // Equivalent size (Z - G) / 2 and centre (Z + G) / 4.
+    return {
+        size: __xtal_f.round(terminal + toe, 0.01mm)
+        centre: __xtal_f.round(gap / 2 + terminal / 2 + toe / 2, 0.01mm)
+    }
+}
+
+// Four corner terminals on a ceramic body; o.body [x, y], o.land nominal
+// terminal size [x, y], o.gap terminal-to-terminal gaps [x, y]; all lengths in mm.
+let ceramic4 = fn(o) {
+    let f = __xtal_f
+    if !o.is_object() {
+        return f.error("ceramic4: o must be an options object")
+    }
+    let body = o.body ?? nil
+    let land = o.land ?? nil
+    let gap = o.gap ?? nil
+    if !body.is_array() || body.len() != 2 {
+        return f.error("ceramic4: body must be [x, y]")
+    }
+    if !__xtal_positive(body[0]) || !__xtal_positive(body[1]) {
+        return f.error("ceramic4: body dimensions must be positive finite lengths")
+    }
+    if !land.is_array() || land.len() != 2 {
+        return f.error("ceramic4: land must be [x, y] nominal terminal size")
+    }
+    if !__xtal_positive(land[0]) || !__xtal_positive(land[1]) {
+        return f.error("ceramic4: land dimensions must be positive finite lengths")
+    }
+    if !gap.is_array() || gap.len() != 2 {
+        return f.error("ceramic4: gap must be [x, y]")
+    }
+    if !__xtal_positive(gap[0]) || !__xtal_positive(gap[1]) {
+        return f.error("ceramic4: gap dimensions must be positive finite lengths")
+    }
+    if gap[0] + 2 * land[0] > body[0] || gap[1] + 2 * land[1] > body[1] {
+        return f.error("ceramic4: land and gap must fit inside body on both axes")
+    }
+    let x = __xtal_land(land[0], gap[0])
+    let y = __xtal_land(land[1], gap[1])
+    if !__xtal_positive(x.size) || !__xtal_positive(y.size)
+        || !__xtal_positive(x.centre) || !__xtal_positive(y.centre) {
+        return f.error("ceramic4: land and gap must produce positive finite rounded lands")
+    }
+    if x.centre - x.size / 2 <= 0mm || y.centre - y.size / 2 <= 0mm {
+        return f.error("ceramic4: gap must leave space between rounded lands on both axes")
+    }
+    let size = [x.size, y.size]
+    return f.footprint({
+        pads: [
+            f.smd("1", [-x.centre, -y.centre], size),
+            f.smd("2", [x.centre, -y.centre], size),
+            f.smd("3", [x.centre, y.centre], size),
+            f.smd("4", [-x.centre, y.centre], size)
+        ]
+        body: [[-body[0] / 2, -body[1] / 2], [body[0] / 2, body[1] / 2]]
+        mount: @smd
+        text: 0.6mm
+        graphics: [f.dot("F.SilkS", [-x.centre - x.size / 2 - 0.5mm, -y.centre], 0.15mm)]
+    })
+}
+
+// Four-land ceramic outline, body 3.2 x 2.5 mm; no parameters.
+let xtal3225 = fn() {
+    return ceramic4({
+        body: [3.2mm, 2.5mm]
+        land: [1.0mm, 0.8mm]
+        gap: [1.2mm, 0.9mm]
+    })
+}
+
+// Four-land ceramic outline, body 2.5 x 2.0 mm; no parameters.
+let xtal2520 = fn() {
+    return ceramic4({
+        body: [2.5mm, 2.0mm]
+        land: [0.8mm, 0.7mm]
+        gap: [0.9mm, 0.6mm]
+    })
+}
+
+// Four-land ceramic outline, body 2.0 x 1.6 mm; no parameters.
+let xtal2016 = fn() {
+    return ceramic4({
+        body: [2.0mm, 1.6mm]
+        land: [0.6mm, 0.5mm]
+        gap: [0.8mm, 0.6mm]
+    })
+}
+
+// Crystal with two signal terminals and a shared ground; package "3225", "2520" or "2016".
+// Optional o.height overrides nominal seated ceramic heights 0.8, 0.6, 0.5 mm respectively.
+let crystal_part = fn(package, o = nil) {
+    let e = __xtal_e
+    let f = __xtal_f
+    if package != "3225" && package != "2520" && package != "2016" {
+        return f.error("crystal_part: package must be 3225, 2520 or 2016")
+    }
+    if o == nil { o = {} }
+    if !o.is_object() { return f.error("crystal_part: o must be an options object") }
+    let default_height = if package == "3225" { 0.8mm }
+    elif package == "2520" { 0.6mm }
+    else { 0.5mm }
+    let height = o.height ?? default_height
+    if !__xtal_positive(height) {
+        return f.error("crystal_part: height must be a positive finite length")
+    }
+    let height_suffix = if height == default_height { "" } else { "_H" + f.mm(height) + "mm" }
+    let name = "XTAL_" + package + height_suffix
+    let existing = e.lookup(name)
+    if existing != nil { return existing }
+    let footprint = if package == "3225" { xtal3225() }
+    elif package == "2520" { xtal2520() }
+    else { xtal2016() }
+    if footprint == nil { return nil }
+    return e.define(name, {
+        kind: @crystal
+        symbol: f.ic_symbol(name, {
+            left: [["1", @passive]]
+            right: [["2", @passive]]
+            bottom: [["GND", @passive]]
+        })
+        footprint: footprint
+        body: {height: height}
+        pads: [["1", "1"], ["2", "3"], ["GND", ["2", "4"]]]
+        prefix: "Y"
+    })
+}

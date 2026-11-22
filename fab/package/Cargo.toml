@@ -1,0 +1,15 @@
+[package]
+name = "makepad-fab-package"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab's sliced-plate package (.gcode.3mf): G-code with MD5, slice info, plate settings and thumbnails"
+
+[dependencies]
+makepad-fab-gcode = { path = "../gcode" }
+makepad-fab-settings = { path = "../settings" }
+makepad-fab-toolpath = { path = "../toolpath" }
+makepad-zip-file = { path = "../../../../libs/zip_file" }
+makepad-fast-inflate = { path = "../../../../libs/fast_inflate" }
+makepad-base64 = { path = "../../../../libs/base64" }

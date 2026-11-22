@@ -1,0 +1,35 @@
+// A collapsible travel cup printed flat in place, in two filaments: a base and nested rings,
+// alternating colours, printed one inside the next. Pull the rim up and each ring slides out of
+// the one inside it until its foot catches that ring's lip: the cup stands at full height.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let rings = param(5, min: 2, max: 8, step: 1, label: "Rings", group: "Cup", hint: "besides the base; more rings, a taller cup")
+let base_r = param(26mm, min: 18mm, max: 40mm, step: 0.5mm, label: "Base radius", group: "Cup")
+let band = param(14mm, min: 8mm, max: 24mm, step: 0.5mm, label: "Ring height", group: "Cup", hint: "each ring adds this less its overlap when pulled out")
+let wall = param(1.2mm, min: 0.9mm, max: 2mm, step: 0.05mm, label: "Wall", group: "Cup", hint: "three line widths makes a firm cup")
+let gap = param(0.45mm, min: 0.3mm, max: 0.8mm, step: 0.05mm, label: "Gap", group: "Fit", hint: "between neighbouring rings; neighbours print from different heads")
+
+// Each ring is one revolved profile: its wall, a lip out at the top (chamfered 45 degrees
+// underneath, so it prints unsupported) and a foot in at the bottom. A ring's foot reaches inside
+// the lip of the ring within, so pulled up they catch.
+let lip = 1.2mm
+let pitch = wall + lip + gap
+let floor_t = 1.6mm
+fn ring_profile(k) {
+    let r_in = base_r + k * pitch
+    let r_out = r_in + wall
+    let foot = if k == 0 { 0 } else { lip }
+    Polygon{points: [[r_in - foot, 0] [r_out, 0] [r_out, band - lip - 1mm] [r_out + lip, band - 1mm] [r_out + lip, band] [r_in, band] [r_in, 1.5mm + foot] [r_in - foot, 1.5mm]]}
+}
+let base = m.revolve({sketch: Polygon{points: [[0, 0] [base_r + wall, 0] [base_r + wall, band - lip - 1mm] [base_r + wall + lip, band - 1mm] [base_r + wall + lip, band] [base_r, band] [base_r, floor_t] [0, floor_t]]}})
+let bands = for k in 1..(rings + 1) { m.revolve({sketch: ring_profile(k)}) }
+let cup = m.union(base, bands)
+
+object(cup, name: "Travel cup")
+
+// Every other ring mint, from the first ring out.
+let mint = Material{albedo: [0.36 0.78 0.62] name: "Mint"}
+for k in 0..floor((rings + 1) / 2) { m.fill(bands[2 * k], mint) }

@@ -1,0 +1,17 @@
+[package]
+name = "fab-elec-benchview"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Live scope cards on the LED controller fixture"
+
+[dependencies]
+fab-elec-fixtures = { path = "../../fixtures" }
+makepad-widgets = { path = "../../../../../../widgets", version = "2.0.0" }
+fab-elec-view = { path = "../../view" }
+fab-elec-design = { path = "../../design" }
+fab-elec-board = { path = "../../board" }
+fab-elec-bench = { path = "../../bench" }
+fab-elec-host = { path = "../../host" }
+fab-elec-simhost = { path = "../../simhost" }

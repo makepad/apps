@@ -1,0 +1,10 @@
+// Procedural paint on the bud vase: blue all over, then yellow wherever a 3D gradient noise is
+// below zero. The vase prints as "Blue", the noise as "Yellow".
+use mod.fab.*
+
+script("noise_vase.cad.splash")
+
+color("Blue")
+color("Yellow")
+
+place("noise_vase", object: "vase", color: "Blue")

@@ -1,0 +1,925 @@
+// Radio objects: serialized, masked, run-to-completion kernel exports.
+// Heap design from Masmano et al., A constant-time dynamic storage allocator
+// for real-time systems (2008), sections 5.1/5.2, doi:10.1007/s11241-008-9052-7.
+// Written from the algorithm description, without implementation source.
+// 8-byte alignment; 32-byte minimum block, including a 16-byte header.
+// First levels cover log2(size) = 5..floor(log2(HEAP_SIZE)), at most 26,
+// with eight second-level lists each. Unused high classes cost no memory.
+// Boundary tags coalesce both neighbours; list insertion/removal and bitmap
+// selection are constant time. This is TLSF's good-fit search policy.
+// heap_init relies on a zeroed heap. The slot clears the radio allocation at boot,
+// clear_spans clears it on restart, and every test fixture supplies a zeroed heap.
+// Any new caller must zero its heap before first use for the kernel to work correctly.
+// Heap checking and its membership bitmap live only in Rust tests.
+let H_MAGIC = 0
+let H_FAILURES = 4
+let H_FREE = 8
+let H_FL = 12
+let H_COUNT = 16
+let H_COOKIE = 20
+let H_NOW = 24
+let H_TIMER_INVALID = 32
+let H_ARMED_COUNT = 36
+let H_TIMER_COUNT = 40
+let H_TIMER_FAILURES = 44
+// Most live timer nodes ever, including disarmed timers.
+let H_TIMER_HIGH = 48
+let H_SLOTS = 52
+let H_SEQ = 56
+let H_TIMER_LOST = 60
+let H_TIMER_UNSET = 64
+// H_TIMER_UNSET is the last header word. H_SL starts the TLSF tables immediately after it.
+let H_TAG = 0x544c5346
+// H_SL, H_FL_COUNT, H_SL_COUNT and H_FIXED come from kernel_consts, so profile checks
+// and the allocator agree on the complete control area for this heap size.
+let H_CLASSES = H_FL_COUNT * H_SL_COUNT
+let H_HEADS = H_SL + H_FL_COUNT * 4
+let H_CONTROL = H_FIXED
+let H_FIRST = HEAP_BASE + H_CONTROL
+let H_END = HEAP_BASE + HEAP_SIZE
+let B_SIZE = 0
+let B_PREV = 4
+let B_REQUEST = 8
+let B_HEADER = 16
+let B_NEXT_FREE = 16
+let B_PREV_FREE = 20
+let B_MIN = 32
+
+fn block_size(b: i32) { load32(b + B_SIZE) & -8 }
+fn class_of(size: i32) {
+    let high: i32 = 31 - clz(size)
+    (high - 5) * H_SL_COUNT + (size >>> (high - 3)) - H_SL_COUNT
+}
+fn first_bit(bits: i32) { 31 - clz(bits & (0 - bits)) }
+fn report_this_failure(offset: i32) {
+    let n: i32 = load32(HEAP_BASE + offset) + 1
+    store32(HEAP_BASE + offset, n)
+    return (n & (n - 1)) == 0
+}
+fn fail_alloc(bytes: i32) {
+    // The requested byte count saturates at UINT32_MAX.
+    if report_this_failure(H_FAILURES) { report(FAULT_KERNEL_HEAP_EXHAUSTED, bytes) }
+    return 0
+}
+fn list_add(b: i32) {
+    let size: i32 = block_size(b)
+    let index: i32 = class_of(size)
+    let fl: i32 = index >>> 3
+    let sl: i32 = index & 7
+    let head: i32 = HEAP_BASE + H_HEADS + index * 4
+    let next: i32 = load32(head)
+    store32(b + B_SIZE, size | 1)
+    store32(b + B_PREV_FREE, 0)
+    store32(b + B_NEXT_FREE, next)
+    if next != 0 { store32(next + B_PREV_FREE, b) }
+    store32(head, b)
+    store32(HEAP_BASE + H_SL + fl * 4, load32(HEAP_BASE + H_SL + fl * 4) | (1 << sl))
+    store32(HEAP_BASE + H_FL, load32(HEAP_BASE + H_FL) | (1 << fl))
+    store32(HEAP_BASE + H_FREE, load32(HEAP_BASE + H_FREE) + size - B_HEADER)
+    store32(HEAP_BASE + H_COUNT, load32(HEAP_BASE + H_COUNT) + 1)
+}
+fn list_remove(b: i32) {
+    let size: i32 = block_size(b)
+    let index: i32 = class_of(size)
+    let fl: i32 = index >>> 3
+    let sl: i32 = index & 7
+    let prev: i32 = load32(b + B_PREV_FREE)
+    let next: i32 = load32(b + B_NEXT_FREE)
+    let head: i32 = HEAP_BASE + H_HEADS + index * 4
+    if prev == 0 { store32(head, next) } else { store32(prev + B_NEXT_FREE, next) }
+    if next != 0 { store32(next + B_PREV_FREE, prev) }
+    if load32(head) == 0 {
+        let bits: i32 = load32(HEAP_BASE + H_SL + fl * 4) & ((1 << sl) ^ -1)
+        store32(HEAP_BASE + H_SL + fl * 4, bits)
+        if bits == 0 { store32(HEAP_BASE + H_FL, load32(HEAP_BASE + H_FL) & ((1 << fl) ^ -1)) }
+    }
+    store32(b + B_SIZE, size)
+    store32(HEAP_BASE + H_FREE, load32(HEAP_BASE + H_FREE) - size + B_HEADER)
+    store32(HEAP_BASE + H_COUNT, load32(HEAP_BASE + H_COUNT) - 1)
+}
+fn heap_init() {
+    if load32(HEAP_BASE + H_MAGIC) == 0 && load32(HEAP_BASE + H_COOKIE) == 0 {
+        store32(HEAP_BASE + H_MAGIC, H_TAG)
+        store32(HEAP_BASE + H_COOKIE, H_TAG ^ -1)
+        if HEAP_SIZE >= H_CONTROL + B_MIN {
+            store32(H_FIRST + B_SIZE, HEAP_SIZE - H_CONTROL)
+            store32(H_FIRST + B_PREV, 0)
+            list_add(H_FIRST)
+        }
+    }
+}
+fn release(b: i32) {
+    let start: i32 = b
+    let size: i32 = block_size(b)
+    let next: i32 = b + size
+    if next < H_END {
+        if (load32(next + B_SIZE) & 1) != 0 {
+            let extra: i32 = block_size(next)
+            list_remove(next)
+            size += extra
+        }
+    }
+    let prev: i32 = load32(b + B_PREV)
+    if prev != 0 {
+        if (load32(prev + B_SIZE) & 1) != 0 {
+            let extra: i32 = block_size(prev)
+            list_remove(prev)
+            start = prev
+            size += extra
+        }
+    }
+    store32(start + B_SIZE, size)
+    if start + size < H_END { store32(start + size + B_PREV, start) }
+    list_add(start)
+}
+fn trim_block(b: i32, need: i32) {
+    let size: i32 = block_size(b)
+    if size - need >= B_MIN {
+        let tail: i32 = b + need
+        store32(b + B_SIZE, need)
+        store32(tail + B_SIZE, size - need)
+        store32(tail + B_PREV, b)
+        if b + size < H_END { store32(b + size + B_PREV, tail) }
+        release(tail)
+    }
+}
+// A split uses the requested block bytes. Taking the entire free block consumes
+// its payload, since H_FREE already excludes that block's header.
+fn free_after_take(block: i32, need: i32) {
+    let cost: i32 = block - B_HEADER
+    if block - need >= B_MIN { cost = need }
+    return load32(HEAP_BASE + H_FREE) - cost
+}
+fn try_allocate(size: i32, floor: i32) {
+    heap_init()
+    if HEAP_SIZE < H_CONTROL + B_MIN { return 0 }
+    if gtu(size, HEAP_SIZE - H_CONTROL - B_HEADER) { return 0 }
+    let need: i32 = max(B_MIN, (size + B_HEADER + 7) & -8)
+    let index: i32 = class_of(need)
+    let b: i32 = load32(HEAP_BASE + H_HEADS + index * 4)
+    // Test the partial class's head too: in particular an otherwise empty
+    // heap serves its entire usable size without rounding away the tail.
+    if b != 0 {
+        if block_size(b) < need { b = 0 }
+    }
+    if b == 0 {
+        let rounded: i32 = need + (1 << (28 - clz(need))) - 1
+        if rounded < 0 { return 0 }
+        index = class_of(rounded)
+        let fl: i32 = index >>> 3
+        if fl >= H_FL_COUNT { return 0 }
+        let sl: i32 = index & 7
+        let bits: i32 = load32(HEAP_BASE + H_SL + fl * 4) & (-1 << sl)
+        if bits == 0 {
+            let higher: i32 = load32(HEAP_BASE + H_FL) & (-1 << (fl + 1))
+            if higher == 0 { return 0 }
+            fl = first_bit(higher)
+            bits = load32(HEAP_BASE + H_SL + fl * 4)
+        }
+        index = fl * H_SL_COUNT + first_bit(bits)
+        b = load32(HEAP_BASE + H_HEADS + index * 4)
+    }
+    if floor != 0 && free_after_take(block_size(b), need) < floor { return 0 }
+    list_remove(b)
+    trim_block(b, need)
+    store32(b + B_REQUEST, size)
+    return b + B_HEADER
+}
+fn allocate(size: i32) {
+    let p: i32 = try_allocate(size, TIMER_FLOOR)
+    if p == 0 { return fail_alloc(size) }
+    return p
+}
+// Count * width + extra in unsigned bytes. Only one high half can contribute
+// to a product that fits, and the low half's carry must fit beside it.
+fn allocation_bytes(count: i32, width: i32, extra: i32) {
+    let a: i32 = count >>> 16
+    let b: i32 = width >>> 16
+    if a != 0 && b != 0 { return -1 }
+    let low: i32 = (count & 65535) * (width & 65535)
+    let high: i32 = a * (width & 65535) + b * (count & 65535)
+    if gtu(high, 65535 - (low >>> 16)) { return -1 }
+    let bytes: i32 = count * width
+    if gtu(bytes, -1 - extra) { return -1 }
+    return bytes + extra
+}
+// C allocation entry meanings follow esp-radio compat/malloc.rs
+// (MIT OR Apache-2.0); a zero-size malloc owns a minimum block here.
+let malloc = export(fn(size) { return allocate(size) })
+let free = export(fn(p) { if p != 0 { release(p - B_HEADER) } })
+let calloc_reserve = export(fn(n, size) {
+    return allocate(allocation_bytes(n, size, 0))
+})
+// The owner reads the requested length before reserve can resize or release p.
+let heap_request_bytes = export(fn(p) { return load32(p - B_HEADER + B_REQUEST) })
+let realloc_reserve = export(fn(p, size) {
+    if p == 0 { return allocate(size) }
+    if size == 0 { release(p - B_HEADER); return 0 }
+    if gtu(size, HEAP_SIZE - H_CONTROL - B_HEADER) { return fail_alloc(size) }
+    let b: i32 = p - B_HEADER
+    let need: i32 = max(B_MIN, (size + B_HEADER + 7) & -8)
+    let old_size: i32 = block_size(b)
+    if need > old_size {
+        let next: i32 = b + old_size
+        if next < H_END {
+            if (load32(next + B_SIZE) & 1) != 0 {
+                let joined: i32 = old_size + block_size(next)
+                if joined >= need {
+                    if TIMER_FLOOR != 0 && free_after_take(joined - old_size, need - old_size) < TIMER_FLOOR {
+                        return fail_alloc(size)
+                    }
+                    list_remove(next)
+                    store32(b + B_SIZE, joined)
+                    if b + joined < H_END { store32(b + joined + B_PREV, b) }
+                }
+            }
+        }
+    }
+    if block_size(b) >= need {
+        trim_block(b, need)
+        store32(b + B_REQUEST, size)
+        return p
+    }
+    // The row owns both blocks until it finishes copying and frees p.
+    return allocate(size)
+})
+// Free bytes counts usable payload, excluding every free block's header.
+let heap_free_bytes = export(fn() { heap_init(); return load32(HEAP_BASE + H_FREE) })
+let heap_failures = export(fn() { heap_init(); return load32(HEAP_BASE + H_FAILURES) })
+
+// Wait semantics (microseconds, 0xffffffff = forever), copy-by-value queues,
+// semaphore counts and recursive ownership follow esp-radio's
+// compat/{queue,semaphore,mutex}.rs (MIT OR Apache-2.0).
+// WAIT_OBJ identifies a word holding the list head. Its low bit records a
+// queue send-front because head words are aligned.
+// WAIT_PREV addresses the head word or predecessor's WAIT_NEXT that holds this TCB.
+// A successor's WAIT_PREV points to this TCB's WAIT_NEXT. Both links are zero off-list.
+// WAIT_ARG is the unmodified caller buffer, which may be byte-aligned.
+// Markers cannot alias an eight-aligned heap object (even with its front bit).
+let SLEEPING = 2
+let ZOMBIE = 4
+fn deadline_after(out: i32, low: i32, high: i32, us: i32) {
+    let end: i32 = low + us * TICKS_PER_US
+    store32(out, end)
+    store32(out + 4, high + (us >>> TICKS_HIGH_SHIFT) + int(ltu(end, low)))
+}
+fn deadline_from_now(out: i32, us: i32) {
+    now64(HEAP_BASE + H_NOW)
+    deadline_after(out, load32(HEAP_BASE + H_NOW), load32(HEAP_BASE + H_NOW + 4), us)
+}
+fn wait_deadline(task: i32, timeout: i32) {
+    store32(task + TCB_DEADLINE, -1)
+    store32(task + TCB_DEADLINE + 4, -1)
+    if timeout != -1 {
+        deadline_from_now(task + TCB_DEADLINE, timeout)
+    }
+}
+fn enqueue_wait(head: i32, arg: i32, timeout: i32, front: i32) {
+    let task: i32 = load32(CURRENT)
+    let priority: i32 = load32(task + TCB_PRIORITY)
+    let link: i32 = head
+    for i in 0..MAX_TASKS {
+        let next: i32 = load32(link)
+        if next == 0 { break }
+        if gtu(priority, load32(next + TCB_PRIORITY)) { break }
+        link = next + TCB_WAIT_NEXT
+    }
+    let next: i32 = load32(link)
+    store32(task + TCB_WAIT_NEXT, next)
+    store32(task + TCB_WAIT_PREV, link)
+    if next != 0 { store32(next + TCB_WAIT_PREV, task + TCB_WAIT_NEXT) }
+    store32(link, task)
+    store32(task + TCB_WAIT_OBJ, head | front)
+    store32(task + TCB_WAIT_ARG, arg)
+    store32(task + TCB_RESULT, 0)
+    wait_deadline(task, timeout)
+    store32(task + TCB_STATE, BLOCKED)
+}
+fn unlink_wait(task: i32) {
+    let link: i32 = load32(task + TCB_WAIT_PREV)
+    if link == 0 { return }
+    let next: i32 = load32(task + TCB_WAIT_NEXT)
+    store32(link, next)
+    if next != 0 { store32(next + TCB_WAIT_PREV, link) }
+    store32(task + TCB_WAIT_NEXT, 0)
+    store32(task + TCB_WAIT_PREV, 0)
+}
+fn pop_wait(head: i32) {
+    let task: i32 = load32(head)
+    if task != 0 { unlink_wait(task) }
+    return task
+}
+fn finish_wait(task: i32, result: i32, isr: i32, woken: i32) {
+    store32(task + TCB_RESULT, result)
+    store32(task + TCB_WAIT_OBJ, 0)
+    store32(task + TCB_WAIT_ARG, 0)
+    store32(task + TCB_STATE, READY)
+    if gtu(load32(task + TCB_PRIORITY), load32(load32(CURRENT) + TCB_PRIORITY)) {
+        if isr != 0 {
+            if woken != 0 { pack_store8(woken, 1) }
+        } else { irq_raise(YIELD_LINE) }
+    }
+}
+fn cancel_waiters(head: i32) {
+    for i in 0..MAX_TASKS {
+        let task: i32 = pop_wait(head)
+        if task == 0 { break }
+        finish_wait(task, 0, 0, 0)
+    }
+}
+fn time_le(al: i32, ah: i32, bl: i32, bh: i32) {
+    ltu(ah, bh) || (ah == bh && leu(al, bl))
+}
+// The dispatcher supplies an eight-byte output block in kernel-owned radio SRAM.
+let kernel_expire = export(fn(out) {
+    now64(HEAP_BASE + H_NOW)
+    let now_low: i32 = load32(HEAP_BASE + H_NOW)
+    let now_high: i32 = load32(HEAP_BASE + H_NOW + 4)
+    let earliest_low: i32 = -1
+    let earliest_high: i32 = -1
+    let count: i32 = load32(TASK_COUNT)
+    for i in 0..MAX_TASKS {
+        if i >= count { break }
+        let task: i32 = load32(TASKS + i * 4)
+        if load32(task + TCB_STATE) == BLOCKED {
+            let obj: i32 = load32(task + TCB_WAIT_OBJ)
+            if obj != 0 && obj != ZOMBIE {
+                let low: i32 = load32(task + TCB_DEADLINE)
+                let high: i32 = load32(task + TCB_DEADLINE + 4)
+                if low != -1 || high != -1 {
+                    if time_le(low, high, now_low, now_high) {
+                        if obj == SLEEPING { finish_wait(task, 1, 0, 0) } else {
+                            unlink_wait(task)
+                            finish_wait(task, 0, 0, 0)
+                        }
+                    } else {
+                        if time_le(low, high, earliest_low, earliest_high) {
+                            earliest_low = low
+                            earliest_high = high
+                        }
+                    }
+                }
+            }
+        }
+    }
+    store32(out, earliest_low)
+    store32(out + 4, earliest_high)
+})
+
+fn heap_task(task: i32) { geu(task, HEAP_BASE) && ltu(task, H_END) }
+fn free_thread_sem(task: i32) {
+    let s: i32 = load32(task + TCB_THREAD_SEM)
+    if s != 0 {
+        store32(task + TCB_THREAD_SEM, 0)
+        delete_semaphore(s)
+    }
+}
+// A zombie's TCB_THREAD_SEM is already zero. Only CURRENT creates a thread semaphore.
+// delete_task frees it before marking ZOMBIE, and task_delete blocks so the zombie never runs again.
+fn remove_task(index: i32, task: i32) {
+    let count: i32 = load32(TASK_COUNT) - 1
+    for i in 0..MAX_TASKS {
+        let at: i32 = index + i
+        if at >= count { break }
+        store32(TASKS + at * 4, load32(TASKS + (at + 1) * 4))
+    }
+    store32(TASKS + count * 4, 0)
+    store32(TASK_COUNT, count)
+    let cursor: i32 = load32(CURSOR)
+    if index < cursor { cursor -= 1 }
+    if cursor >= count { cursor = 0 }
+    store32(CURSOR, cursor)
+    store32(task + TCB_STATE, DEAD)
+    release(load32(task + TCB_STACK_BASE) - B_HEADER)
+    release(task - B_HEADER)
+}
+fn reap_tasks() {
+    let index: i32 = -1
+    let zombie: i32 = 0
+    for i in 0..MAX_TASKS {
+        if i >= load32(TASK_COUNT) { break }
+        let task: i32 = load32(TASKS + i * 4)
+        // Only another task may reclaim the stack a self-deleter ran on.
+        if heap_task(task) && task != load32(CURRENT) {
+            if load32(task + TCB_STATE) == BLOCKED && load32(task + TCB_WAIT_OBJ) == ZOMBIE {
+                index = i
+                zombie = task
+                break
+            }
+        }
+    }
+    // Removal is outside the search loop: its masked bound is charged once.
+    if index == -1 { return 0 }
+    remove_task(index, zombie)
+    return 1
+}
+let task_reap = export(fn() { return reap_tasks() })
+// The image build sets the initial windowed return link once it places task_exit.
+var task_exit_link: i32 = 0
+fn create_task(entry: i32, name: i32, stack_bytes: i32, arg: i32, priority: i32, handle_out: i32) {
+    reap_tasks()
+    if priority == 0 { return 0 }
+    // Match initial_frame's RETW region assertion; refuse before allocation.
+    if (entry >>> 30) != CODE_REGION { return 0 }
+    if gtu(stack_bytes, HEAP_SIZE - 15) {
+        heap_init()
+        let requested: i32 = stack_bytes + 15
+        if gtu(stack_bytes, -16) { requested = -1 }
+        return fail_alloc(requested)
+    }
+    let bytes: i32 = max(stack_bytes, MIN_STACK_BYTES) + 15
+    let task: i32 = allocate(TCB_SIZE)
+    if task == 0 { return 0 }
+    let stack: i32 = allocate(bytes)
+    if stack == 0 { release(task - B_HEADER); return 0 }
+    let count: i32 = load32(TASK_COUNT)
+    if count >= MAX_TASKS {
+        release(stack - B_HEADER)
+        release(task - B_HEADER)
+        return 0
+    }
+    let top: i32 = (stack + bytes) & -16
+    let sp: i32 = top - 64
+    let frame: i32 = sp - CONTEXT_SIZE
+    store32(stack, GUARD)
+    fill_raw(frame, 0, CONTEXT_SIZE, CONTEXT_SIZE)
+    store32(frame + CONTEXT_PC, entry)
+    store32(frame + CONTEXT_PS, WINDOWED_PS)
+    store32(frame + CONTEXT_AR + 4, sp)
+    store32(frame + CONTEXT_AR + 8 * 4, task_exit_link)
+    store32(frame + CONTEXT_AR + 10 * 4, arg)
+    store32(frame + CONTEXT_CPENABLE, 1)
+    store32(frame + CONTEXT_SIZE - 12, top)
+    fill_raw(task, 0, TCB_SIZE, TCB_SIZE)
+    store32(task + TCB_FRAME, frame)
+    store32(task + TCB_STACK_BASE, stack)
+    store32(task + TCB_STACK_TOP, top)
+    store32(task + TCB_STATE, READY)
+    store32(task + TCB_PRIORITY, priority)
+    store32(task + TCB_NAME, name)
+    store32(TASKS + count * 4, task)
+    store32(TASK_COUNT, count + 1)
+    if handle_out != 0 { pack_store32(handle_out, task) }
+    if gtu(priority, load32(load32(CURRENT) + TCB_PRIORITY)) { irq_raise(YIELD_LINE) }
+    return 1
+}
+let task_create = export(fn(entry, name, stack_bytes, arg, priority, handle_out) {
+    return create_task(entry, name, stack_bytes, arg, priority, handle_out)
+})
+fn delete_task(handle: i32) {
+    let task: i32 = handle
+    if task == 0 { task = load32(CURRENT) }
+    if !heap_task(task) { return 0 }
+    let index: i32 = -1
+    for i in 0..MAX_TASKS {
+        if i >= load32(TASK_COUNT) { break }
+        if load32(TASKS + i * 4) == task {
+            index = i
+            break
+        }
+    }
+    if index == -1 { return 0 }
+    if task == load32(CURRENT) {
+        free_thread_sem(task)
+        store32(task + TCB_STATE, BLOCKED)
+        store32(task + TCB_WAIT_OBJ, ZOMBIE)
+        store32(task + TCB_WAIT_NEXT, 0)
+        store32(task + TCB_WAIT_PREV, 0)
+        store32(task + TCB_WAIT_ARG, 0)
+        store32(task + TCB_RESULT, 1)
+        wait_deadline(task, -1)
+    } else {
+        let obj: i32 = load32(task + TCB_WAIT_OBJ)
+        if obj != 0 && obj != SLEEPING && obj != ZOMBIE { unlink_wait(task) }
+        free_thread_sem(task)
+        remove_task(index, task)
+    }
+    return 1
+}
+let task_delete = export(fn(handle) { return delete_task(handle) })
+fn delay_task(us: i32, allow_forever: i32) {
+    if us == 0 { irq_raise(YIELD_LINE); return 1 }
+    let task: i32 = load32(CURRENT)
+    store32(task + TCB_WAIT_OBJ, SLEEPING)
+    store32(task + TCB_WAIT_NEXT, 0)
+    store32(task + TCB_WAIT_PREV, 0)
+    store32(task + TCB_WAIT_ARG, 0)
+    store32(task + TCB_RESULT, 0)
+    if allow_forever != 0 { wait_deadline(task, us) } else {
+        // Preserve R4b's task_delay contract: every nonzero u32 is finite.
+        deadline_from_now(task + TCB_DEADLINE, us)
+    }
+    store32(task + TCB_STATE, BLOCKED)
+    return 1
+}
+let task_delay = export(fn(us) { return delay_task(us, 0) })
+let task_current = export(fn() { return load32(CURRENT) })
+
+// ESP-IDF v6.1.1 components/esp_timer/src/ets_timer_legacy.c keeps the tag in
+// ETSTimer.expire and the handle in ETSTimer.arg.
+let ETS_TAG = 4
+let ETS_FUNC = 12
+let ETS_HANDLE = 16
+let ETS_BYTES = 20
+let ETS_TIMER_TAG = 0x12121212
+let ETS_PENDING_TAG = 0x12121213
+let TIMER_PENDING = -2
+// Deadlines use SYSTIMER ticks; the period retains the unsigned microseconds.
+let T_KEY = 0
+let T_FUNC = 4
+let T_ARG = 8
+let T_DEADLINE = 12
+let T_PERIOD = 20
+let T_INDEX = 24
+let T_SEQ = 28
+let T_TAG = 32
+let T_NODE_TAG = 0x524d4954
+fn find_timer(ets: i32) {
+    heap_init()
+    let tag: i32 = pack_load32(ets + ETS_TAG)
+    if tag == ETS_PENDING_TAG { return TIMER_PENDING }
+    if tag != ETS_TIMER_TAG { return 0 }
+    let node: i32 = pack_load32(ets + ETS_HANDLE)
+    // Compare against the last possible start so a wrapping handle cannot pass.
+    if (node & 7) == 0 && geu(node, H_FIRST + B_HEADER) && leu(node, H_END - T_BYTES) {
+        if load32(node + T_TAG) == T_NODE_TAG && load32(node + T_KEY) == ets { return node }
+    }
+    if report_this_failure(H_TIMER_INVALID) { report(FAULT_KERNEL_TIMER_HANDLE_INVALID, ets) }
+    return -1
+}
+// setfn writes each chunk pointer before increasing H_SLOTS, so slot lookup reads only initialized entries.
+fn timer_chunk_entry(index: i32) { HEAP_BASE + H_DIR + (index >>> 6) * 4 }
+fn timer_slot(index: i32) { load32(timer_chunk_entry(index)) + (index & 63) * 4 }
+fn release_timer_chunk(remaining_slots: i32) {
+    let entry: i32 = timer_chunk_entry(remaining_slots)
+    store32(HEAP_BASE + H_SLOTS, remaining_slots)
+    release(load32(entry) - B_HEADER)
+    store32(entry, 0)
+}
+fn place_timer(index: i32, node: i32) {
+    store32(timer_slot(index), node)
+    store32(node + T_INDEX, index + 1)
+}
+fn timer_sequence(node: i32) {
+    let seq: i32 = load32(HEAP_BASE + H_SEQ)
+    store32(node + T_SEQ, seq)
+    store32(HEAP_BASE + H_SEQ, seq + 1)
+}
+fn timer_before(a: i32, b: i32) {
+    let ah: i32 = load32(a + T_DEADLINE + 4)
+    let bh: i32 = load32(b + T_DEADLINE + 4)
+    if ah != bh { return ltu(ah, bh) }
+    let al: i32 = load32(a + T_DEADLINE)
+    let bl: i32 = load32(b + T_DEADLINE)
+    if al != bl { return ltu(al, bl) }
+    return before(load32(a + T_SEQ), load32(b + T_SEQ))
+}
+fn before_timer_parent(index: i32, node: i32) {
+    index != 0 && timer_before(node, load32(timer_slot((index - 1) >>> 1)))
+}
+fn sift_up(index: i32, node: i32) {
+    let hole: i32 = index
+    for i in 0..TIMER_SIFT_CAP {
+        if hole == 0 { break }
+        let parent: i32 = (hole - 1) >>> 1
+        let other: i32 = load32(timer_slot(parent))
+        if !timer_before(node, other) { break }
+        place_timer(hole, other)
+        hole = parent
+    }
+    place_timer(hole, node)
+}
+fn sift_down(index: i32, node: i32) {
+    let count: i32 = load32(HEAP_BASE + H_ARMED_COUNT)
+    let hole: i32 = index
+    for i in 0..TIMER_SIFT_CAP {
+        let child: i32 = hole * 2 + 1
+        if child >= count { break }
+        let other: i32 = load32(timer_slot(child))
+        if child + 1 < count {
+            let right: i32 = load32(timer_slot(child + 1))
+            if timer_before(right, other) { child += 1; other = right }
+        }
+        if !timer_before(other, node) { break }
+        place_timer(hole, other)
+        hole = child
+    }
+    place_timer(hole, node)
+}
+fn disarm_timer(node: i32) {
+    let index: i32 = load32(node + T_INDEX)
+    if index != 0 {
+        let last: i32 = load32(HEAP_BASE + H_ARMED_COUNT) - 1
+        store32(HEAP_BASE + H_ARMED_COUNT, last)
+        store32(node + T_INDEX, 0)
+        let hole: i32 = index - 1
+        if hole != last {
+            let moved: i32 = load32(timer_slot(last))
+            if before_timer_parent(hole, moved) { sift_up(hole, moved) } else { sift_down(hole, moved) }
+        }
+    }
+}
+fn delete_timer(node: i32) {
+    disarm_timer(node)
+    store32(node + T_TAG, 0)
+    release(node - B_HEADER)
+    let live: i32 = load32(HEAP_BASE + H_TIMER_COUNT) - 1
+    store32(HEAP_BASE + H_TIMER_COUNT, live)
+    // Deletion raises the spare count from at most 127 to at most 128.
+    // One release leaves at most 64 spare. An empty heap can return that last chunk too.
+    for i in 0..2 {
+        let slots: i32 = load32(HEAP_BASE + H_SLOTS)
+        if slots == 0 || (live != 0 && slots - live < 128) { break }
+        release_timer_chunk(slots - 64)
+    }
+}
+fn create_timer(ets: i32, func: i32, arg: i32) {
+    let live: i32 = load32(HEAP_BASE + H_TIMER_COUNT)
+    let slots: i32 = load32(HEAP_BASE + H_SLOTS)
+    if live == slots {
+        if (slots >>> 6) >= TIMER_DIR_WORDS { return 0 }
+        let chunk: i32 = try_allocate(256, 0)
+        if chunk == 0 { return 0 }
+        store32(timer_chunk_entry(slots), chunk)
+        store32(HEAP_BASE + H_SLOTS, slots + 64)
+    }
+    let node: i32 = try_allocate(T_BYTES, 0)
+    if node == 0 {
+        if live == slots { release_timer_chunk(slots) }
+        return 0
+    }
+    fill_raw(node, 0, T_BYTES, T_BYTES)
+    store32(node + T_KEY, ets)
+    store32(node + T_FUNC, func)
+    store32(node + T_ARG, arg)
+    store32(node + T_TAG, T_NODE_TAG)
+    live += 1
+    store32(HEAP_BASE + H_TIMER_COUNT, live)
+    if gtu(live, load32(HEAP_BASE + H_TIMER_HIGH)) { store32(HEAP_BASE + H_TIMER_HIGH, live) }
+    pack_store32(ets + ETS_FUNC, 0)
+    pack_store32(ets + ETS_HANDLE, node)
+    pack_store32(ets + ETS_TAG, ETS_TIMER_TAG)
+    return node
+}
+fn arm_timer(ets: i32, us: i32, repeat: i32) {
+    let node: i32 = find_timer(ets)
+    if node == TIMER_PENDING {
+        node = create_timer(ets, pack_load32(ets + ETS_FUNC), pack_load32(ets + ETS_HANDLE))
+        if node == 0 {
+            if report_this_failure(H_TIMER_LOST) { report(FAULT_KERNEL_TIMER_LOST, ets) }
+            return 0
+        }
+    } else if node == 0 {
+        if report_this_failure(H_TIMER_UNSET) { report(FAULT_KERNEL_TIMER_UNSET, ets) }
+        return 0
+    } else if node < 0 { return 0 }
+    deadline_from_now(node + T_DEADLINE, us)
+    let period: i32 = 0
+    if repeat != 0 { period = us }
+    store32(node + T_PERIOD, period)
+    timer_sequence(node)
+    let index: i32 = load32(node + T_INDEX)
+    let hole: i32 = index - 1
+    if index == 0 {
+        hole = load32(HEAP_BASE + H_ARMED_COUNT)
+        store32(HEAP_BASE + H_ARMED_COUNT, hole + 1)
+    }
+    if index == 0 || before_timer_parent(hole, node) { sift_up(hole, node) } else { sift_down(hole, node) }
+    return 1
+}
+let timer_setfn = export(fn(ets, func, arg) {
+    let old: i32 = find_timer(ets)
+    if old != 0 { return int(old > 0 || old == TIMER_PENDING) }
+    pack_fill(ets, 0, ETS_BYTES, ETS_BYTES)
+    if create_timer(ets, func, arg) != 0 { return 1 }
+    if report_this_failure(H_TIMER_FAILURES) { report(FAULT_KERNEL_TIMER_REFUSED, load32(HEAP_BASE + H_TIMER_COUNT)) }
+    pack_store32(ets + ETS_FUNC, func)
+    pack_store32(ets + ETS_HANDLE, arg)
+    pack_store32(ets + ETS_TAG, ETS_PENDING_TAG)
+    return 0
+})
+// Each outcome has an exact counter and its own doubling report.
+let timer_failures = export(fn() { heap_init(); return load32(HEAP_BASE + H_TIMER_FAILURES) })
+let timer_invalid = export(fn() { heap_init(); return load32(HEAP_BASE + H_TIMER_INVALID) })
+let timer_lost = export(fn() { heap_init(); return load32(HEAP_BASE + H_TIMER_LOST) })
+let timer_unset = export(fn() { heap_init(); return load32(HEAP_BASE + H_TIMER_UNSET) })
+let timer_slots = export(fn() { heap_init(); return load32(HEAP_BASE + H_SLOTS) })
+let timer_high_water = export(fn() { heap_init(); return load32(HEAP_BASE + H_TIMER_HIGH) })
+let timer_arm_us = export(fn(ets, us, repeat) { return arm_timer(ets, us, repeat) })
+let timer_arm = export(fn(ets, ms, repeat) {
+    let us: i32 = -1
+    if leu(ms, 4294967) { us = ms * 1000 }
+    return arm_timer(ets, us, repeat)
+})
+let timer_disarm = export(fn(ets) {
+    let node: i32 = find_timer(ets)
+    if node <= 0 { return 0 }
+    disarm_timer(node)
+    return 1
+})
+let timer_done = export(fn(ets) {
+    let node: i32 = find_timer(ets)
+    if node == TIMER_PENDING {
+        pack_store32(ets + ETS_FUNC, 0)
+    } else if node > 0 { delete_timer(node) } else { return 0 }
+    pack_store32(ets + ETS_TAG, 0)
+    pack_store32(ets + ETS_HANDLE, 0)
+    return 1
+})
+// The timer task supplies a 16-byte output block in kernel-owned radio SRAM.
+let timer_due = export(fn(out) {
+    heap_init()
+    let result: i32 = 0
+    let next_low: i32 = -1
+    let next_high: i32 = -1
+    if HEAP_SIZE >= H_CONTROL + B_MIN {
+        now64(HEAP_BASE + H_NOW)
+        let low: i32 = load32(HEAP_BASE + H_NOW)
+        let high: i32 = load32(HEAP_BASE + H_NOW + 4)
+        if load32(HEAP_BASE + H_ARMED_COUNT) != 0 {
+            let root: i32 = timer_slot(0)
+            let node: i32 = load32(root)
+            if time_le(load32(node + T_DEADLINE), load32(node + T_DEADLINE + 4), low, high) {
+                let period: i32 = load32(node + T_PERIOD)
+                if period != 0 {
+                    deadline_after(node + T_DEADLINE, load32(node + T_DEADLINE), load32(node + T_DEADLINE + 4), period)
+                    if !time_le(low, high, load32(node + T_DEADLINE), load32(node + T_DEADLINE + 4)) {
+                        deadline_after(node + T_DEADLINE, low, high, period)
+                    }
+                    timer_sequence(node)
+                    sift_down(0, node)
+                } else { disarm_timer(node) }
+                store32(out, load32(node + T_FUNC))
+                store32(out + 4, load32(node + T_ARG))
+                result = 1
+            }
+            if load32(HEAP_BASE + H_ARMED_COUNT) != 0 {
+                node = load32(root)
+                next_low = load32(node + T_DEADLINE)
+                next_high = load32(node + T_DEADLINE + 4)
+            }
+        }
+    }
+    store32(out + 8, next_low)
+    store32(out + 12, next_high)
+    return result
+})
+
+let QUEUE_ITEM_MAX = 64
+let Q_RECV = 0
+let Q_SEND = 4
+let Q_LEN = 8
+let Q_ITEM = 12
+let Q_COUNT = 16
+let Q_READ = 20
+let Q_DATA = 24
+fn queue_put(q: i32, item: i32, front: i32) {
+    let len: i32 = load32(q + Q_LEN)
+    let size: i32 = load32(q + Q_ITEM)
+    let head: i32 = load32(q + Q_READ)
+    let count: i32 = load32(q + Q_COUNT)
+    let slot: i32 = head + count
+    if geu(slot, len) { slot -= len }
+    if front != 0 {
+        if head == 0 { head = len }
+        head -= 1
+        slot = head
+        store32(q + Q_READ, head)
+    }
+    pack_copy(q + Q_DATA + slot * size, item, size, QUEUE_ITEM_MAX)
+    store32(q + Q_COUNT, count + 1)
+}
+fn queue_send(q: i32, item: i32, timeout: i32, front: i32, isr: i32, woken: i32) {
+    let receiver: i32 = pop_wait(q + Q_RECV)
+    if receiver != 0 {
+        pack_copy(load32(receiver + TCB_WAIT_ARG), item, load32(q + Q_ITEM), QUEUE_ITEM_MAX)
+        finish_wait(receiver, 1, isr, woken)
+        return 1
+    }
+    if load32(q + Q_COUNT) < load32(q + Q_LEN) { queue_put(q, item, front); return 1 }
+    if timeout != 0 { enqueue_wait(q + Q_SEND, item, timeout, front) }
+    return 0
+}
+fn queue_receive(q: i32, item: i32, timeout: i32, isr: i32, woken: i32) {
+    let count: i32 = load32(q + Q_COUNT)
+    if count != 0 {
+        let head: i32 = load32(q + Q_READ)
+        let size: i32 = load32(q + Q_ITEM)
+        pack_copy(item, q + Q_DATA + head * size, size, QUEUE_ITEM_MAX)
+        head += 1
+        if head == load32(q + Q_LEN) { head = 0 }
+        store32(q + Q_READ, head)
+        store32(q + Q_COUNT, count - 1)
+        let sender: i32 = pop_wait(q + Q_SEND)
+        if sender != 0 {
+            queue_put(q, load32(sender + TCB_WAIT_ARG), load32(sender + TCB_WAIT_OBJ) & 1)
+            finish_wait(sender, 1, isr, woken)
+        }
+        return 1
+    }
+    if timeout != 0 { enqueue_wait(q + Q_RECV, item, timeout, 0) }
+    return 0
+}
+fn create_queue(len: i32, item_size: i32) {
+    if len == 0 || item_size < 1 || item_size > QUEUE_ITEM_MAX { return 0 }
+    let q: i32 = allocate(allocation_bytes(len, item_size, Q_DATA))
+    if q != 0 {
+        fill_raw(q, 0, Q_DATA, Q_DATA)
+        store32(q + Q_LEN, len)
+        store32(q + Q_ITEM, item_size)
+    }
+    return q
+}
+let queue_create = export(fn(len, item_size) { return create_queue(len, item_size) })
+fn delete_queue(q: i32) {
+    if q != 0 { cancel_waiters(q + Q_RECV); cancel_waiters(q + Q_SEND); release(q - B_HEADER) }
+}
+let queue_delete = export(fn(q) { delete_queue(q) })
+let queue_send_back = export(fn(q, item, timeout) { return queue_send(q, item, timeout, 0, 0, 0) })
+let queue_send_front = export(fn(q, item, timeout) { return queue_send(q, item, timeout, 1, 0, 0) })
+let queue_recv = export(fn(q, item, timeout) { return queue_receive(q, item, timeout, 0, 0) })
+// ISR forms never enqueue. A higher-priority wake sets one byte and never
+// raises the software IRQ; lower/equal priority and no wake leave it alone.
+let queue_send_back_isr = export(fn(q, item, woken) { return queue_send(q, item, 0, 0, 1, woken) })
+let queue_send_front_isr = export(fn(q, item, woken) { return queue_send(q, item, 0, 1, 1, woken) })
+let queue_recv_isr = export(fn(q, item, woken) { return queue_receive(q, item, 0, 1, woken) })
+let queue_waiting = export(fn(q) { return load32(q + Q_COUNT) })
+
+let S_WAIT = 0
+let S_MAX = 4
+let S_COUNT = 8
+let S_BYTES = 16
+fn semaphore_take(s: i32, timeout: i32) {
+    let count: i32 = load32(s + S_COUNT)
+    if count != 0 { store32(s + S_COUNT, count - 1); return 1 }
+    if timeout != 0 { enqueue_wait(s + S_WAIT, 0, timeout, 0) }
+    return 0
+}
+fn semaphore_give(s: i32, isr: i32, woken: i32) {
+    let task: i32 = pop_wait(s + S_WAIT)
+    if task != 0 { finish_wait(task, 1, isr, woken); return 1 }
+    let count: i32 = load32(s + S_COUNT)
+    if count == load32(s + S_MAX) { return 0 }
+    store32(s + S_COUNT, count + 1)
+    return 1
+}
+fn create_semaphore(max: i32, initial: i32) {
+    if max == 0 || gtu(initial, max) { return 0 }
+    let s: i32 = allocate(S_BYTES)
+    if s != 0 {
+        fill_raw(s, 0, S_BYTES, S_BYTES)
+        store32(s + S_MAX, max)
+        store32(s + S_COUNT, initial)
+    }
+    return s
+}
+fn delete_semaphore(s: i32) { if s != 0 { cancel_waiters(s + S_WAIT); release(s - B_HEADER) } }
+let sem_create = export(fn(max, initial) { return create_semaphore(max, initial) })
+let sem_delete = export(fn(s) { delete_semaphore(s) })
+let sem_take = export(fn(s, timeout) { return semaphore_take(s, timeout) })
+let sem_give = export(fn(s) { return semaphore_give(s, 0, 0) })
+let sem_take_isr = export(fn(s, woken) { return semaphore_take(s, 0) })
+let sem_give_isr = export(fn(s, woken) { return semaphore_give(s, 1, woken) })
+let sem_count = export(fn(s) { return load32(s + S_COUNT) })
+
+let M_WAIT = 0
+let M_OWNER = 4
+let M_DEPTH = 8
+let M_RECURSIVE = 12
+// M_BYTES is bound by kernel_consts, also sizing the image's fixed PHY slot.
+// There is no priority inheritance yet. The wait list still uses priority
+// order and FIFO among equals; ownership passes before the waiter is READY.
+fn create_mutex(recursive: i32) {
+    let m: i32 = allocate(M_BYTES)
+    if m != 0 { fill_raw(m, 0, M_BYTES, M_BYTES); store32(m + M_RECURSIVE, recursive) }
+    return m
+}
+let mutex_create = export(fn(recursive) { return create_mutex(recursive) })
+let mutex_delete = export(fn(m) { if m != 0 { cancel_waiters(m + M_WAIT); release(m - B_HEADER) } })
+fn lock_mutex(m: i32, timeout: i32) {
+    let task: i32 = load32(CURRENT)
+    let owner: i32 = load32(m + M_OWNER)
+    if owner == 0 { store32(m + M_OWNER, task); store32(m + M_DEPTH, 1); return 1 }
+    if owner == task && load32(m + M_RECURSIVE) != 0 {
+        let depth: i32 = load32(m + M_DEPTH)
+        if depth == -1 { return 0 }
+        store32(m + M_DEPTH, depth + 1)
+        return 1
+    }
+    if timeout != 0 { enqueue_wait(m + M_WAIT, 0, timeout, 0) }
+    return 0
+}
+let mutex_lock = export(fn(m, timeout) { return lock_mutex(m, timeout) })
+fn unlock_mutex(m: i32) {
+    if load32(m + M_OWNER) != load32(CURRENT) { return 0 }
+    let depth: i32 = load32(m + M_DEPTH)
+    if gtu(depth, 1) { store32(m + M_DEPTH, depth - 1); return 1 }
+    let task: i32 = pop_wait(m + M_WAIT)
+    store32(m + M_OWNER, task)
+    if task == 0 { store32(m + M_DEPTH, 0) } else {
+        store32(m + M_DEPTH, 1)
+        finish_wait(task, 1, 0, 0)
+    }
+    return 1
+}
+let mutex_unlock = export(fn(m) { return unlock_mutex(m) })

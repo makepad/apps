@@ -1,0 +1,9 @@
+// A hexagonal pen holder with folded pattern-welded layers in two filaments.
+use mod.fab.*
+
+script("damascus_cup.cad.splash")
+
+color("Dark steel", rgb: #x33363d)
+color("Bright steel", rgb: #xc7ccd6)
+
+place("damascus_cup", at: [175mm 160mm], name: "Damascus pen holder", color: "Dark steel")

@@ -1,0 +1,18 @@
+[package]
+name = "fab-elec-cam"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab electronics manufacturing output contract (C7): plotting a board through a resolved factory profile, and the readers for our own outputs"
+
+[dependencies]
+fab-elec-core = { path = "../core" }
+fab-elec-parts = { path = "../parts" }
+fab-elec-circuit = { path = "../circuit" }
+fab-elec-board = { path = "../board" }
+fab-elec-design = { path = "../design" }
+makepad-zip-file = { path = "../../../../../libs/zip_file" }
+
+[dev-dependencies]
+fab-elec-fixtures = { path = "../fixtures" }

@@ -1,0 +1,65 @@
+// A trinket box with a friction-fit lid in two filaments: growth rings round a made-up log's
+// axis, warped along the grain, and two knots the rings wrap round, through the whole volume, so
+// the corners and edges show the grain the way sawn wood does. The lid prints upside down beside
+// the box, and its lip presses into the box's mouth.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let width = param(64mm, min: 30mm, max: 120mm, step: 1mm, label: "Width", group: "Box")
+let depth = param(44mm, min: 25mm, max: 100mm, step: 1mm, label: "Depth", group: "Box")
+let height = param(32mm, min: 15mm, max: 80mm, step: 1mm, label: "Height", group: "Box")
+let wall = param(2.4mm, min: 1.6mm, max: 4mm, step: 0.1mm, label: "Wall", group: "Box")
+let corner = param(4mm, min: 1mm, max: 10mm, step: 0.5mm, label: "Corner", group: "Box", kind: "radius")
+let fit = param(0.15mm, min: 0.05mm, max: 0.4mm, step: 0.05mm, label: "Lid fit", group: "Lid", hint: "the gap all round the lid's lip: smaller holds tighter")
+let ring = param(2.2mm, min: 1mm, max: 5mm, step: 0.1mm, label: "Ring", group: "Grain", hint: "one growth ring's width")
+let seed = param(5, min: 1, max: 99, step: 1, label: "Log", group: "Grain", hint: "another whole number saws another log")
+
+let floor_t = 2mm
+let lid_t = 3mm
+let lip_h = 5mm
+let lip_wall = 1.6mm
+let spacing = width + 10mm
+let bx = 0 - spacing / 2
+let lx = spacing / 2
+fn rounded(w, d, r, h, x, y) { m.extrude({sketch: Rect{size: [w d] corner: max(r, 0.5mm)} plane: @xz height: h at: [x, y, 0]}) }
+
+let outer = rounded(width, depth, corner, height, bx, 0)
+let cavity = rounded(width - 2 * wall, depth - 2 * wall, corner - wall, height, bx, floor_t)
+let box = m.subtract(outer, cavity)
+// The lid upside down: its top on the bed, the lip standing up from it, a fit's gap inside the
+// box's mouth.
+let lip_w = width - 2 * wall - 2 * fit
+let lip_d = depth - 2 * wall - 2 * fit
+let plate = rounded(width, depth, corner, lid_t, lx, 0)
+let lip = m.subtract(rounded(lip_w, lip_d, corner - wall - fit, lip_h, lx, lid_t - 0.2mm), rounded(lip_w - 2 * lip_wall, lip_d - 2 * lip_wall, corner - wall - fit - lip_wall, lip_h + 2mm, lx, lid_t))
+let lid = m.union(plate, lip)
+
+object(m.union(box, lid), name: "Wood-grain box")
+
+// The grain: rings round a log's axis along x, below and behind the box, so its sides cut the
+// rings into arcs; the rings stretch along the grain under a long, slow warp. Round each knot,
+// where a branch grew out of the log, the rings bend into small rings round the branch, with its
+// dark heart in the middle. The dark latewood is the thinner band.
+let pale = Material{albedo: [0.82 0.64 0.42] name: "Pale wood"}
+let dark = Material{albedo: [0.45 0.28 0.15] name: "Dark wood"}
+let axis_y = -26mm
+let axis_z = 14mm
+// The two knots' branches run front to back, through (x, y): one in the box's side, one in the lid.
+let k0x = bx - width * 0.2
+let k0y = height * 0.55
+let k1x = lx + width * 0.18
+let k1y = lid_t * 0.5
+fn grain(p) {
+    let long = noise.fbm(vec3(p.x / 36mm, p.y / 7mm, p.z / 7mm), seed, 3)
+    let r = length(vec2(p.y - axis_y, p.z - axis_z)) + 2.4mm * long
+    let t = r / ring
+    let k0 = length(vec2(p.x - k0x, p.y - k0y))
+    let k1 = length(vec2(p.x - k1x, p.y - k1y))
+    let k = min(k0, k1)
+    let pull = exp(0 - k * k / (49 * 1mm * 1mm))
+    let bent = t * (1 - pull) + (k / (ring * 0.6)) * pull
+    if k < 1.3mm { 1 } else { if noise.bands(bent) > 0.68 { 1 } else { 0 } }
+}
+m.fill(m.box({size: [2 * spacing + 4mm, height + 4mm, depth + 4mm] at: [0, height / 2, 0]}), Mix{materials: [pale dark] field: fn(p) { grain(p) } sharp: 1})

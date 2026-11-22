@@ -1,0 +1,120 @@
+// A poseable athlete printed in place, lying on its back, that holds whatever pose it is put in:
+// its neck, shoulders, elbows, hips, knees and ankles are hinges with a brake. Each brake is a
+// pair of TPU shoes printed in the hinge's eye either side of the pin, each with a tooth in a
+// groove of the pin: near the angle it printed at the joint turns free; turned on, the pin's
+// round presses the teeth in and the joint holds there by friction. Ivory, with TPU mitts, soles,
+// eyes and headband on the TPU nozzle (and the brakes' shoes); a teal top from three filaments.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let filaments = param(3, min: 2, max: 3, step: 1, label: "Filaments", group: "Athlete", kind: "count", hint: "with the TPU: 2 ivory, 3 adds a teal top (a few layers swap filament)")
+let hold = param(12, min: 4, max: 24, step: 1, label: "Brake hold", group: "Joints", hint: "the torque each joint's brake holds once turned (N mm): higher holds heavier poses, lower turns lighter in the hand")
+
+// Lying on its back: +Z is its head, +Y its front (up off the bed), X across it. Every pin lies
+// along X, 5.55 mm over the bed. Each part holds a knuckle column round its pin, a little less
+// round than the hinge's eye (the pin, a brake's shoes and the eye's wall round them) so the eye
+// and the fork's plates stand on the bed; the clearance the hinge cuts round the pin parts the
+// two columns. A brake's TPU shoe part is a short rod along the eye: the hinge keeps of it only
+// the two shoes it sets in the eye.
+let pin = 2.2mm
+let jy = 5.55mm
+let jr = 5.2mm
+let ground = m.box({size: [400mm, 60mm, 400mm] at: [0, -30mm, 0]})
+fn column(x0, x1, z) { m.cylinder({radius: jr height: x1 - x0 at: [(x0 + x1) / 2, jy, z] rotate: [0, 0, 90°] segments: 48}) }
+fn shoe(x0, x1, z) { m.cylinder({radius: 4.9mm height: abs(x1 - x0) at: [(x0 + x1) / 2, jy, z] rotate: [0, 0, 90°] segments: 48}) }
+// A limb between two pins: a column at each, a body tapering between them, flat on the bed. Its
+// lower pin is a fork: the hinge cuts the column's middle out for the eye, and the plates it
+// leaves at the two sides hold on to the body through a cheek along each side, which stops short
+// of the eye's slot.
+fn limb(x0, x1, z0, z1, thick) {
+    let mid = m.ellipsoid({radii: [(x1 - x0) / 2, thick, (z0 - z1) / 2 - jr * 0.6] at: [(x0 + x1) / 2, 0, (z0 + z1) / 2]})
+    let side = abs(x1 - x0) / 2 - 1mm
+    let cheeks = for s in [-1, 1] { m.box({size: [2mm, 2 * jy, 12mm] radius: 0.8mm at: [(x0 + x1) / 2 + s * side, 0, z1 + 6mm]}) }
+    m.carve(m.blend([column(x0, x1, z0) column(x0, x1, z1) mid cheeks[0] cheeks[1]], 2mm), ground, 0)
+}
+
+// The joints' places (z): neck, shoulders, elbows, hips, knees, ankles.
+let neck_z = 76mm
+let shoulder_z = 63mm
+let elbow_z = 36mm
+let hip_z = 10mm
+let knee_z = -34mm
+let ankle_z = -74mm
+// Across (x): the arms beside the chest, the legs under the hips.
+let arm = [19mm, 30mm]
+let fore = [19.5mm, 29.5mm]
+let thigh = [2.8mm, 14.8mm]
+let shin = [3.3mm, 14.3mm]
+let foot = [3.8mm, 13.8mm]
+
+// The torso: a broad chest over a narrow waist and the hips, a knuckle at the neck on a short
+// neck as wide as the knuckle (its fork's plates stand on it), a bar across the shoulders and one across the hips for the arms and legs. The bars' outer
+// ends, where the hinges put their outer plates, hold on through a slab on the bed behind each
+// joint, under the pins: a limb swinging forward never meets it.
+let chest = m.ellipsoid({radii: [17mm, 10.5mm, 16mm] at: [0, 7mm, 52mm]})
+let waist = m.ellipsoid({radii: [12.5mm, 10mm, 10mm] at: [0, 5mm, 33mm]})
+let pelvis = m.ellipsoid({radii: [15mm, 10mm, 12mm] at: [0, 5mm, 20mm]})
+let neck = m.box({size: [12mm, 9mm, 10mm] radius: 2mm at: [0, 4.5mm, 71mm]})
+let shoulder_slab = m.box({size: [2 * arm[1], 3.4mm, 9mm] at: [0, 1.7mm, shoulder_z + 4.5mm]})
+let hip_slab = m.box({size: [2 * thigh[1], 3.4mm, 9mm] at: [0, 1.7mm, hip_z + 4.5mm]})
+let torso = m.carve(m.blend([m.blend([chest waist pelvis], 5mm) neck column(-arm[1], arm[1], shoulder_z) column(-thigh[1], thigh[1], hip_z) column(-6mm, 6mm, neck_z) shoulder_slab hip_slab], 0), ground, 0)
+
+// The head: an egg of a skull on the neck's knuckle. The head and the torso stand on the bed
+// on a broad flat back, their sides no steeper there than a print holds.
+let skull = m.ellipsoid({radii: [12.5mm, 14.5mm, 14.5mm] at: [0, 8mm, 94mm]})
+let head = m.carve(m.blend([skull column(-6mm, 6mm, neck_z)], 2.5mm), ground, 0)
+
+// Arms: upper arms; forearms ending in mitten hands.
+let upper_arms = for s in [-1, 1] { limb(s * arm[0], s * arm[1], shoulder_z, elbow_z, 9mm) }
+let fore_arms = for s in [-1, 1] {
+    let x = s * (fore[0] + fore[1]) / 2
+    let lower = m.ellipsoid({radii: [4.6mm, 8mm, 10mm] at: [x, 0, 24mm]})
+    let hand = m.ellipsoid({radii: [5mm, 7.5mm, 6.5mm] at: [x, 0, 9mm]})
+    m.carve(m.blend([column(s * fore[0], s * fore[1], elbow_z) lower hand], 2mm), ground, 0)
+}
+// Legs: thighs, shins, and feet standing up off the bed at the ankles, their soles facing away.
+let thighs = for s in [-1, 1] { limb(s * thigh[0], s * thigh[1], hip_z, knee_z, 10mm) }
+let shins = for s in [-1, 1] { limb(s * shin[0], s * shin[1], knee_z, ankle_z, 9mm) }
+let feet = for s in [-1, 1] {
+    let x = s * (foot[0] + foot[1]) / 2
+    let sole = m.ellipsoid({radii: [5mm, 20mm, 6.5mm] at: [x, 0, ankle_z - 7mm]})
+    m.carve(m.blend([column(s * foot[0], s * foot[1], ankle_z) sole], 2mm), ground, 0)
+}
+
+// The joints, each with its brake.
+let neck_shoe = shoe(-6mm, 6mm, neck_z)
+let nod = m.hinge(torso, head, {at: [0, jy, neck_z] axis: [1, 0, 0] pin: pin shoe: neck_shoe hold: hold})
+let shoulder_shoes = for s in [-1, 1] { shoe(s * arm[0], s * arm[1], shoulder_z) }
+let shoulders = for i in 0..2 { m.hinge(torso, upper_arms[i], {at: [(i * 2 - 1) * (arm[0] + arm[1]) / 2, jy, shoulder_z] axis: [1, 0, 0] pin: pin shoe: shoulder_shoes[i] hold: hold}) }
+let elbow_shoes = for s in [-1, 1] { shoe(s * fore[0], s * fore[1], elbow_z) }
+let elbows = for i in 0..2 { m.hinge(upper_arms[i], fore_arms[i], {at: [(i * 2 - 1) * (fore[0] + fore[1]) / 2, jy, elbow_z] axis: [1, 0, 0] pin: pin shoe: elbow_shoes[i] hold: hold}) }
+let hip_shoes = for s in [-1, 1] { shoe(s * thigh[0], s * thigh[1], hip_z) }
+let hips = for i in 0..2 { m.hinge(torso, thighs[i], {at: [(i * 2 - 1) * (thigh[0] + thigh[1]) / 2, jy, hip_z] axis: [1, 0, 0] pin: pin shoe: hip_shoes[i] hold: hold}) }
+let knee_shoes = for s in [-1, 1] { shoe(s * shin[0], s * shin[1], knee_z) }
+let knees = for i in 0..2 { m.hinge(thighs[i], shins[i], {at: [(i * 2 - 1) * (shin[0] + shin[1]) / 2, jy, knee_z] axis: [1, 0, 0] pin: pin shoe: knee_shoes[i] hold: hold}) }
+let ankle_shoes = for s in [-1, 1] { shoe(s * foot[0], s * foot[1], ankle_z) }
+let ankles = for i in 0..2 { m.hinge(shins[i], feet[i], {at: [(i * 2 - 1) * (foot[0] + foot[1]) / 2, jy, ankle_z] axis: [1, 0, 0] pin: pin shoe: ankle_shoes[i] hold: hold}) }
+
+object(torso, name: "Athlete")
+// Held by its chest in the sim, the way a hand holds it to pose it.
+m.anchor(torso, {at: [0, 7mm, 52mm] fixed: true})
+
+// ---- the paint
+let teal = Material{albedo: [0.07 0.53 0.54] name: "Teal"}
+let ink = Material{albedo: [0.07 0.07 0.09] name: "Ink"}
+// A teal top over the torso's crown: the few layers there swap filament.
+if filaments >= 3 {
+    m.fill(m.box({size: [40mm, 20mm, 64mm] at: [0, 23.5mm, 44mm]}), teal)
+}
+// On the TPU nozzle, so they swap no filament: mitts and soles that grip what they hold or stand
+// on, a headband and the eyes.
+m.fill(m.box({size: [30mm, 12mm, 5mm] at: [0, 24mm, 101mm]}), ink)
+for s in [-1, 1] {
+    m.fill(m.ellipsoid({radii: [6mm, 9mm, 7.5mm] at: [s * (fore[0] + fore[1]) / 2, 0, 9mm]}), ink)
+    m.fill(m.box({size: [13mm, 30mm, 3.5mm] at: [s * (foot[0] + foot[1]) / 2, 10mm, ankle_z - 13.5mm]}), ink)
+    m.fill(m.sphere({radius: 1.8mm at: [s * 4.6mm, 22mm, 96mm]}), ink)
+}
+// The brakes' shoes print in TPU all through.
+for s in [neck_shoe shoulder_shoes[0] shoulder_shoes[1] elbow_shoes[0] elbow_shoes[1] hip_shoes[0] hip_shoes[1] knee_shoes[0] knee_shoes[1] ankle_shoes[0] ankle_shoes[1]] { m.fill(s, ink) }

@@ -1,0 +1,6 @@
+// A dithered gradient up the bud vase: blue at the foot turning to yellow at the lip, the line
+// between them wandering by 3D noise. Between the two the slicer dithers bead by bead and layer
+// by layer, so the blend reads smooth from arm's length.
+let blue = Material{albedo: [0.05 0.2 0.85] name: "Blue"}
+let yellow = Material{albedo: [0.9 0.75 0.05] name: "Yellow"}
+m.fill(vase, Mix{materials: [blue yellow] field: fn(p) { (p.y - 8mm) / 52mm + 0.12 * noise.fbm(p / 10mm, 2, 3) }})

@@ -1,0 +1,33 @@
+// A hexagonal pen holder in two filaments with the look of folded pattern-welded steel: thin
+// layers of a dark and a bright steel, folded into waves round the cup and warped by noise, run
+// through the whole wall, so every face and edge shows the layers cut at its own angle.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let height = param(96mm, min: 40mm, max: 150mm, step: 1mm, label: "Height", group: "Holder")
+let radius = param(36mm, min: 20mm, max: 60mm, step: 0.5mm, label: "Radius", group: "Holder", kind: "radius", hint: "to the hexagon's corners")
+let wall = param(3mm, min: 1.6mm, max: 6mm, step: 0.1mm, label: "Wall", group: "Holder")
+let layer = param(1.3mm, min: 0.6mm, max: 4mm, step: 0.1mm, label: "Layer", group: "Pattern", hint: "one steel layer's thickness")
+let folds = param(5, min: 1, max: 12, step: 1, label: "Folds", group: "Pattern", hint: "waves round the cup")
+let seed = param(8, min: 1, max: 99, step: 1, label: "Billet", group: "Pattern", hint: "another whole number forges another billet")
+let floor_t = 3mm
+
+fn hex(r) { Regular{sides: 6 radius: r} }
+let outer = m.extrude({sketch: hex(radius) plane: @xz height: height})
+let inner = m.extrude({sketch: hex(radius - wall / cos(30°)) plane: @xz height: height at: [0, floor_t, 0]})
+let cup = m.subtract(outer, inner)
+
+object(cup, name: "Damascus pen holder")
+
+// The layers: height, folded into waves round the cup that drift as they climb, and warped by a
+// slow noise; each layer one steel, the next the other.
+let dark_steel = Material{albedo: [0.2 0.21 0.24] name: "Dark steel"}
+let bright_steel = Material{albedo: [0.78 0.8 0.84] name: "Bright steel"}
+m.fill(m.box({size: [2 * radius + 4mm, height + 2mm, 2 * radius + 4mm] at: [0, height / 2, 0]}), Mix{materials: [dark_steel bright_steel] field: fn(p) {
+    let a = atan2(p.z, p.x)
+    let wave = 3mm * sin(a * folds + p.y / 11mm)
+    let warp = 4mm * noise.fbm(p / 16mm, seed, 3)
+    noise.bands((p.y + wave + warp) / (2 * layer))
+} sharp: 1})

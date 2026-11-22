@@ -1,0 +1,9 @@
+// A print-in-place jewellery box: a barrel hinge, a snap latch and a lid with an inlaid mosaic.
+use mod.fab.*
+
+script("jewellery_box.cad.splash")
+
+color("Navy", rgb: #x1f3552)
+color("Gold", rgb: #xdba533)
+
+place("jewellery_box", at: [175mm 160mm], name: "Jewellery box", color: "Navy")

@@ -1,0 +1,52 @@
+[package]
+name = "fab-ai"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab's fab.* tool manifest and the headless session behind it: the one tool surface the in-app chat, external agents and Fab's own buttons drive"
+
+[package.metadata.makepad.platform-gaps]
+windows = {}
+
+[dependencies]
+fab-calibrate = { path = "../calibrate" }
+fab-colour = { path = "../colour" }
+fab-elec-design = { path = "../elec/design" }
+fab-elec-mech = { path = "../elec/mech" }
+fab-model = { path = "../model" }
+fab-plate = { path = "../plate" }
+fab-printability = { path = "../printability" }
+fab-force = { path = "../force" }
+makepad-civil-time = { path = "../../../../libs/civil_time" }
+makepad-jobs = { path = "../../../../libs/jobs" }
+makepad-ai-services = { path = "../../../../libs/ai/services", default-features = false }
+makepad-model = { path = "../../../../libs/model" }
+makepad-csg-graph = { path = "../../../../libs/csg/csg_graph" }
+# A preview's check of a newer value runs on a CPU permit of its own.
+makepad-cpu-budget = { path = "../../../../libs/cpu_budget" }
+makepad-script = { path = "../../../../platform/script" }
+makepad-model-script = { path = "../../engine/model_script" }
+fab-paint-field = { path = "../paint_field" }
+makepad-csg-cad = { path = "../../../../libs/csg/csg_cad" }
+makepad-csg-math = { path = "../../../../libs/csg/csg_math" }
+# fab.render's cameras (camera.rs): the math the renderer draws with, and nothing that draws.
+makepad-math = { path = "../../../../libs/math" }
+makepad-csg-mesh = { path = "../../../../libs/csg/csg_mesh" }
+makepad-csg-sdf = { path = "../../../../libs/csg/csg_sdf" }
+makepad-csg-mech = { path = "../../../../libs/csg/csg_mech" }
+makepad-fab-slice = { path = "../slice" }
+makepad-fab-slicer = { path = "../slicer" }
+makepad-fab-settings = { path = "../settings" }
+makepad-error-log = { path = "../../../../libs/error_log" }
+makepad-fab-toolpath = { path = "../toolpath" }
+fab-loose = { path = "../loose" }
+fab-sdf-engine = { path = "../sdf_engine" }
+makepad-gltf = { path = "../../../../libs/gltf" }
+makepad-zip-file = { path = "../../../../libs/zip_file" }
+makepad-strict-json = { path = "../../../../libs/strict_json" }
+
+[dev-dependencies]
+# The tests' pictures in the formats the chat takes, which fab.colour_read reads too.
+makepad-webp = { path = "../../../../libs/webp", features = ["encoder"] }
+makepad-gif = { path = "../../../../libs/gif" }

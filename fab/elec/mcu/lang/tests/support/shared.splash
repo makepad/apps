@@ -1,0 +1,38 @@
+let led = output(P0)
+let button = input(P1, pull_up)
+var total: i32 = 1
+var last: i32 = 0
+var hits: i32 = 0
+
+fn scale(x: i32) -> i32 {
+    let t = [0.0; 4]
+    var i: i32 = 0
+    while i < 4 {
+        t[i] = float(x * i + total)
+        i = i + 1
+    }
+    write(led, int(t[3]))
+    hits = hits + 1
+    return int(t[1] + t[2]) + read(button)
+}
+
+fn twice(x: i32) -> i32 {
+    let keep = [float(x), float(x + 1)]
+    last = scale(int(keep[0])) + scale(int(keep[1]))
+    return last + int(keep[0])
+}
+
+let tick = every(ms(10), fn() {
+    let keep = [5.0, 6.0]
+    total = total + twice(int(keep[0]) + read(button))
+    write(led, int(keep[1]) + total)
+})
+
+let later = after(ms(20), fn() {
+    total = total - scale(hits)
+    write(led, last + hits)
+})
+
+fn setup() {
+    write(led, twice(total))
+}

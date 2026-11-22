@@ -1,0 +1,27 @@
+// A knob for a 6mm shaft: a diamond-knurled grip, the knurl a displacement
+// of the knob's distance field (no extra triangles), so its pitch and depth drag live.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+let knob_radius = param(15mm, min: 8mm, max: 40mm, step: 0.5mm, label: "Radius", group: "Knob", kind: "radius")
+let knob_height = param(18mm, min: 8mm, max: 60mm, step: 0.5mm, label: "Height", group: "Knob")
+let knob_pitch = param(1.2mm, min: 0.6mm, max: 4mm, step: 0.1mm, label: "Pitch", group: "Knurl", hint: "from one groove to the next, round the grip")
+let knob_depth = param(0.5mm, min: 0.1mm, max: 1.5mm, step: 0.05mm, label: "Depth", group: "Knurl")
+
+// One cylinder carved by the bore: a texture displaces the field inside the surface too, where
+// a union of solids would show the faces they share.
+let grip = m.cylinder({radius: knob_radius height: knob_height at: [0, knob_height / 2, 0]})
+let shaft = m.cylinder({radius: 3mm height: knob_height at: [0, knob_height * 0.4, 0]})
+let body = m.carve(grip, shaft, 0)
+// The top and bottom faces stay smooth: at a sharp rim the normal (smoothed over twice the depth)
+// turns over about that far, so the masks take in 60° and the knurl fades out on the side.
+let knob = m.texture(body, {
+    pattern: Knurl{pitch: knob_pitch angle: 30° kind: @diamond flat: 0.2}
+    map: @cylindrical depth: knob_depth top_angle: 60° bottom_angle: 60° cell: 0.3mm
+})
+
+handle(knob_radius, Ring{center: [0, knob_height * 0.5, 0] radius: knob_radius})
+handle(knob_height, Arrow{from: [knob_radius, 0, 0] to: [knob_radius, knob_height, 0]})
+
+object(knob)

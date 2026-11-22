@@ -1,0 +1,11 @@
+[package]
+name = "fab-elec-circuit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab electronics circuit model (contract C2): components, nets, classes, buses, blocks with typed ports, intents, checks and ERC"
+
+[dependencies]
+fab-elec-core = { path = "../core" }
+fab-elec-parts = { path = "../parts" }

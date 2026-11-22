@@ -1,0 +1,3678 @@
+// Fab Force's solve as a compute program: A u = f on the voxel grid Fab analyses
+// (`fab_force::program`), by conjugate gradients preconditioned by one geometric multigrid
+// V-cycle. The same solve as `fab_force::solve`: its hierarchy (the coarse levels built here
+// from the analysed one, Galerkin), smoother, the coarsest level's exact solve (its inverse
+// Cholesky factor in f64, narrowed to f32 for the GPU engine's cycle), transfers and stopping
+// rule; it runs the same in-process and on a node. A node keeps the coarse levels and
+// the factor it built (`s.remember`) for the stream's next session made from the same analysed
+// level and held nodes, so an edit that moves or turns a load solves on them at once.
+//
+// Two engines, the device's pick: with a GPU that holds the solve, `fab_force::gpu`'s (f32 runs
+// of the CG on the GPU, the scalars never leaving it, each run solving the defect of the answer
+// so far, corrected here in f64 with the CPU kernels' operator until the answer meets the
+// tolerance); else all of it in f64 on the CPU.
+//
+// On the CPU a vector is three f64 buffers (x, y, z components), a value a node, and every
+// kernel writes only its own element's values: a cell integrated point by point writes its 24
+// forces, and a node applies its rows of its (up to) eight cells' matrices and adds its share of
+// their forces itself, so each kernel runs on every core and gives the same bits on any of them.
+//
+// Inputs (f64 words low then high), all of them the analysed level's:
+// - held (i32 a node, bit a: axis a held at zero), cell (i32 a cell: its matrix, -1: no
+//   stiffness, nshared and past: integrated point by point) and mats, the shared matrices
+//   packed (300 a matrix: the upper triangle row by row). The program builds the coarser levels
+//   (their held masks, cell indices and matrices, full), each level's inverse diagonal blocks,
+//   and the GPU's layout of it all;
+// - its cells integrated point by point (index >= nshared): pnode (each one's
+//   corner 0 node), pxi (three f64 a cell: its point offset in natural coordinates),
+//   gpd (8 a cell: each Gauss point's material), gpw (8 a cell: each one's weight),
+//   ds (36 a material: its 6x6 stiffness), dn (8 x 8 x 3: the unshifted shape gradients);
+// - the loads (a block of them, solved in turn on the levels set up once) at the nodes they are
+//   not zero at, one load's after another's: fnode (i32 each node), fval (three values each);
+// - with p.guess (a block of one load), guess (three values a node): where the solve starts,
+//   an answer on this grid as `fab_force::solve::guess_on` leaves it (nodes no cell uses at
+//   rest, held axes zero); the loads of a larger block start at rest.
+// p: {n: [cells per axis], h: [cell sizes in mm], gp (Gauss abscissa),
+//     nshared, active (cells with stiffness), points, coarsest_nodes,
+//     loads ([each load's count of nodes in fnode]), parts, tol, max_its, smooth, omega,
+//     guess (0|1), inner (a GPU run's tolerance), max_runs, runs (1: a preconditioner's solves,
+//     one GPU run each, their defect not taken; 0: to tol)}
+// Values `cg` {its, rr, bb} as each load's solve starts and as it goes. Publishes `u0`, `u1`, ...
+// (each load's answer, three f64 a node) and returns {solves: [{its, rr, bb}, a load], stats,
+// gpu, factor}: a residual's share of its load is sqrt(rr / bb); stats is the session's time
+// per kernel; gpu (on the GPU) its runs, reads and iterations sent over the block, and the
+// loads the f64 engine finished past the GPU's f32 floor (finished; floor: rr / bb where the
+// last one took over); factor (where this session factored the coarsest level) its size and
+// pivots dropped.
+use mod.pod.*
+use mod.math.*
+use mod.shader
+use mod.kernel.*
+
+// A packed symmetric matrix in full, row-major (a node at corner q reads its rows 3q..3q+2, 72
+// values in a row): element = matrix * 576 + row * 24 + column.
+let unpack = {
+    label: "unpack"
+    packed: input(@f64)
+    full: output(@f64)
+    element: fn(e) {
+        let m = e / 576
+        let r = (e % 576) / 24
+        let c = e % 24
+        let at = if c < r { c * (47 - c) / 2 + r } else { r * (47 - r) / 2 + c }
+        full[e] = packed[m * 300 + at]
+    }
+}
+
+// The 24 forces (corner by corner, x y z) of x on each cell integrated point by point: at each
+// Gauss point the strain from the cell's displacements, its material's stress times the
+// point's weight, and that stress's traction on each corner. element = point cell; its forces
+// are its own record of `cf` (24 f64), one view a force, so it runs on every core.
+let cell_force = {
+    label: "cell_force"
+    x0: input(@f64)
+    x1: input(@f64)
+    x2: input(@f64)
+    pnode: input(i32)
+    dn: input(@f64)
+    pxi: input(@f64)
+    geometry: input(@f64)
+    gpd: input(i32)
+    gpw: input(@f64)
+    ds: input(@f64)
+    c0: output(@f64, 48, 0, "cf")
+    c1: output(@f64, 48, 2, "cf")
+    c2: output(@f64, 48, 4, "cf")
+    c3: output(@f64, 48, 6, "cf")
+    c4: output(@f64, 48, 8, "cf")
+    c5: output(@f64, 48, 10, "cf")
+    c6: output(@f64, 48, 12, "cf")
+    c7: output(@f64, 48, 14, "cf")
+    c8: output(@f64, 48, 16, "cf")
+    c9: output(@f64, 48, 18, "cf")
+    c10: output(@f64, 48, 20, "cf")
+    c11: output(@f64, 48, 22, "cf")
+    c12: output(@f64, 48, 24, "cf")
+    c13: output(@f64, 48, 26, "cf")
+    c14: output(@f64, 48, 28, "cf")
+    c15: output(@f64, 48, 30, "cf")
+    c16: output(@f64, 48, 32, "cf")
+    c17: output(@f64, 48, 34, "cf")
+    c18: output(@f64, 48, 36, "cf")
+    c19: output(@f64, 48, 38, "cf")
+    c20: output(@f64, 48, 40, "cf")
+    c21: output(@f64, 48, 42, "cf")
+    c22: output(@f64, 48, 44, "cf")
+    c23: output(@f64, 48, 46, "cf")
+    nx: param(1, 1, 16777216)
+    ny: param(1, 1, 16777216)
+    element: fn(c) {
+        let base = pnode[c]
+        let px = int(nx) + 1
+        let py = int(ny) + 1
+        // the corners' displacements, and their forces, a component an array
+        var u0 = [f64(0.0); 8]
+        var u1 = [f64(0.0); 8]
+        var u2 = [f64(0.0); 8]
+        for k in 0..8 {
+            let n = base + k % 2 + px * ((k / 2) % 2 + py * (k / 4))
+            u0[k] = x0[n]
+            u1[k] = x1[n]
+            u2[k] = x2[n]
+        }
+        var f0 = [f64(0.0); 8]
+        var f1 = [f64(0.0); 8]
+        var f2 = [f64(0.0); 8]
+        // the point's shape gradients, corner by corner (evaluated once, used twice)
+        var e0 = [f64(0.0); 8]
+        var e1 = [f64(0.0); 8]
+        var e2 = [f64(0.0); 8]
+        let gp = geometry[3]
+        let ox = pxi[c * 3]
+        let oy = pxi[c * 3 + 1]
+        let oz = pxi[c * 3 + 2]
+        for g in 0..8 {
+            let bx = f64(2 * (g & 1) - 1) * gp
+            let by = f64(2 * ((g >> 1) & 1) - 1) * gp
+            let bz = f64(2 * ((g >> 2) & 1) - 1) * gp
+            var g00 = f64(0.0)
+            var g01 = f64(0.0)
+            var g02 = f64(0.0)
+            var g10 = f64(0.0)
+            var g11 = f64(0.0)
+            var g12 = f64(0.0)
+            var g20 = f64(0.0)
+            var g21 = f64(0.0)
+            var g22 = f64(0.0)
+            for k in 0..8 {
+                // Add the offset terms in the same order as solve::point_grads.
+                let sx = f64(2 * (k & 1) - 1)
+                let sy = f64(2 * ((k >> 1) & 1) - 1)
+                let sz = f64(2 * ((k >> 2) & 1) - 1)
+                let at = (g * 8 + k) * 3
+                let dx = sx * (sy * oy * (f64(1.0) + sz * bz) + sz * oz * (f64(1.0) + sy * by) + sy * sz * oy * oz) / f64(4.0) / geometry[0]
+                let dy = sy * (sx * ox * (f64(1.0) + sz * bz) + sz * oz * (f64(1.0) + sx * bx) + sx * sz * ox * oz) / f64(4.0) / geometry[1]
+                let dz = sz * (sx * ox * (f64(1.0) + sy * by) + sy * oy * (f64(1.0) + sx * bx) + sx * sy * ox * oy) / f64(4.0) / geometry[2]
+                let d0 = dn[at] + dx
+                let d1 = dn[at + 1] + dy
+                let d2 = dn[at + 2] + dz
+                e0[k] = d0
+                e1[k] = d1
+                e2[k] = d2
+                let v0 = u0[k]
+                let v1 = u1[k]
+                let v2 = u2[k]
+                g00 = g00 + v0 * d0
+                g01 = g01 + v0 * d1
+                g02 = g02 + v0 * d2
+                g10 = g10 + v1 * d0
+                g11 = g11 + v1 * d1
+                g12 = g12 + v1 * d2
+                g20 = g20 + v2 * d0
+                g21 = g21 + v2 * d1
+                g22 = g22 + v2 * d2
+            }
+            let e3 = g12 + g21
+            let e4 = g02 + g20
+            let e5 = g01 + g10
+            let point = c * 8 + g
+            let m = gpd[point] * 36
+            let w = gpw[point]
+            let t0 = w * (ds[m] * g00 + ds[m + 1] * g11 + ds[m + 2] * g22 + ds[m + 3] * e3 + ds[m + 4] * e4 + ds[m + 5] * e5)
+            let t1 = w * (ds[m + 6] * g00 + ds[m + 7] * g11 + ds[m + 8] * g22 + ds[m + 9] * e3 + ds[m + 10] * e4 + ds[m + 11] * e5)
+            let t2 = w * (ds[m + 12] * g00 + ds[m + 13] * g11 + ds[m + 14] * g22 + ds[m + 15] * e3 + ds[m + 16] * e4 + ds[m + 17] * e5)
+            let t3 = w * (ds[m + 18] * g00 + ds[m + 19] * g11 + ds[m + 20] * g22 + ds[m + 21] * e3 + ds[m + 22] * e4 + ds[m + 23] * e5)
+            let t4 = w * (ds[m + 24] * g00 + ds[m + 25] * g11 + ds[m + 26] * g22 + ds[m + 27] * e3 + ds[m + 28] * e4 + ds[m + 29] * e5)
+            let t5 = w * (ds[m + 30] * g00 + ds[m + 31] * g11 + ds[m + 32] * g22 + ds[m + 33] * e3 + ds[m + 34] * e4 + ds[m + 35] * e5)
+            for i in 0..8 {
+                let d0 = e0[i]
+                let d1 = e1[i]
+                let d2 = e2[i]
+                f0[i] = f0[i] + (t0 * d0 + t5 * d1 + t4 * d2)
+                f1[i] = f1[i] + (t5 * d0 + t1 * d1 + t3 * d2)
+                f2[i] = f2[i] + (t4 * d0 + t3 * d1 + t2 * d2)
+            }
+        }
+        c0[c] = f0[0]
+        c1[c] = f1[0]
+        c2[c] = f2[0]
+        c3[c] = f0[1]
+        c4[c] = f1[1]
+        c5[c] = f2[1]
+        c6[c] = f0[2]
+        c7[c] = f1[2]
+        c8[c] = f2[2]
+        c9[c] = f0[3]
+        c10[c] = f1[3]
+        c11[c] = f2[3]
+        c12[c] = f0[4]
+        c13[c] = f1[4]
+        c14[c] = f2[4]
+        c15[c] = f0[5]
+        c16[c] = f1[5]
+        c17[c] = f2[5]
+        c18[c] = f0[6]
+        c19[c] = f1[6]
+        c20[c] = f2[6]
+        c21[c] = f0[7]
+        c22[c] = f1[7]
+        c23[c] = f2[7]
+    }
+}
+
+// A node's rows of A x: its share of each of its (up to) eight cells' forces (its three rows of
+// the cell's matrix times the cell's displacements, or its corner's three of the cell's forces
+// from cell_force), its held axes zero; a node held on every axis is zero at once. mode 0:
+// y = A x; 1: y = b - A x.
+let apply = {
+    label: "apply"
+    x0: input(@f64)
+    x1: input(@f64)
+    x2: input(@f64)
+    b0: input(@f64)
+    b1: input(@f64)
+    b2: input(@f64)
+    cell: input(i32)
+    mats: input(@f64)
+    cf: input(@f64)
+    held: input(i32)
+    y0: output(@f64)
+    y1: output(@f64)
+    y2: output(@f64)
+    nx: param(1, 1, 16777216)
+    ny: param(1, 1, 16777216)
+    nz: param(1, 1, 16777216)
+    nshared: param(0, 0, 16777216)
+    mode: param(0, 0, 1)
+    element: fn(n) {
+        let h = held[n]
+        var a0 = f64(0.0)
+        var a1 = f64(0.0)
+        var a2 = f64(0.0)
+        if h != 7 {
+            let ex = int(nx)
+            let ey = int(ny)
+            let ez = int(nz)
+            let px = ex + 1
+            let py = ey + 1
+            let i = n % px
+            let j = (n / px) % py
+            let k = n / (px * py)
+            let ns = int(nshared)
+            for q in 0..8 {
+                // the cell this node is corner q of
+                let ci = i - q % 2
+                let cj = j - (q / 2) % 2
+                let ck = k - q / 4
+                if ci >= 0 && ci < ex && cj >= 0 && cj < ey && ck >= 0 && ck < ez {
+                    let idx = cell[ci + ex * (cj + ey * ck)]
+                    if idx >= 0 {
+                        if idx < ns {
+                            let kb = idx * 576 + q * 72
+                            let base = ci + px * (cj + py * ck)
+                            for cq in 0..8 {
+                                let m = base + cq % 2 + px * ((cq / 2) % 2 + py * (cq / 4))
+                                let v0 = x0[m]
+                                let v1 = x1[m]
+                                let v2 = x2[m]
+                                let o = kb + cq * 3
+                                a0 = a0 + (mats[o] * v0 + mats[o + 1] * v1 + mats[o + 2] * v2)
+                                a1 = a1 + (mats[o + 24] * v0 + mats[o + 25] * v1 + mats[o + 26] * v2)
+                                a2 = a2 + (mats[o + 48] * v0 + mats[o + 49] * v1 + mats[o + 50] * v2)
+                            }
+                        } else {
+                            let o = (idx - ns) * 24 + q * 3
+                            a0 = a0 + cf[o]
+                            a1 = a1 + cf[o + 1]
+                            a2 = a2 + cf[o + 2]
+                        }
+                    }
+                }
+            }
+        }
+        if (h & 1) != 0 {
+            a0 = f64(0.0)
+        }
+        if (h & 2) != 0 {
+            a1 = f64(0.0)
+        }
+        if (h & 4) != 0 {
+            a2 = f64(0.0)
+        }
+        if int(mode) == 0 {
+            y0[n] = a0
+            y1[n] = a1
+            y2[n] = a2
+        } else {
+            y0[n] = b0[n] - a0
+            y1[n] = b1[n] - a1
+            y2[n] = b2[n] - a2
+        }
+    }
+}
+
+// A node's inverse diagonal block (9 values, row-major) of its level: the sum of its (up to)
+// eight cells' blocks between it and itself (a matrix cell's, or a cell integrated point by
+// point summed over its Gauss points), its held axes taken out before the inverse and zero in
+// it; a node held on every axis (or a singular block) the identity. Its own record of `dinv`
+// (9 f64), one view a value.
+let diag = {
+    label: "diag"
+    cell: input(i32)
+    mats: input(@f64)
+    gpd: input(i32)
+    gpw: input(@f64)
+    ds: input(@f64)
+    dn: input(@f64)
+    pxi: input(@f64)
+    geometry: input(@f64)
+    held: input(i32)
+    i0: output(@f64, 18, 0, "dinv")
+    i1: output(@f64, 18, 2, "dinv")
+    i2: output(@f64, 18, 4, "dinv")
+    i3: output(@f64, 18, 6, "dinv")
+    i4: output(@f64, 18, 8, "dinv")
+    i5: output(@f64, 18, 10, "dinv")
+    i6: output(@f64, 18, 12, "dinv")
+    i7: output(@f64, 18, 14, "dinv")
+    i8: output(@f64, 18, 16, "dinv")
+    nx: param(1, 1, 16777216)
+    ny: param(1, 1, 16777216)
+    nz: param(1, 1, 16777216)
+    nshared: param(0, 0, 16777216)
+    element: fn(n) {
+        let h = held[n]
+        var k00 = f64(0.0)
+        var k01 = f64(0.0)
+        var k02 = f64(0.0)
+        var k10 = f64(0.0)
+        var k11 = f64(0.0)
+        var k12 = f64(0.0)
+        var k20 = f64(0.0)
+        var k21 = f64(0.0)
+        var k22 = f64(0.0)
+        if h != 7 {
+            let ex = int(nx)
+            let ey = int(ny)
+            let ez = int(nz)
+            let px = ex + 1
+            let py = ey + 1
+            let i = n % px
+            let j = (n / px) % py
+            let k = n / (px * py)
+            let ns = int(nshared)
+            // the cells in their own order (the one that has this node as corner 7 first)
+            for t in 0..8 {
+                let q = 7 - t
+                let ci = i - q % 2
+                let cj = j - (q / 2) % 2
+                let ck = k - q / 4
+                if ci >= 0 && ci < ex && cj >= 0 && cj < ey && ck >= 0 && ck < ez {
+                    let idx = cell[ci + ex * (cj + ey * ck)]
+                    if idx >= 0 {
+                        if idx < ns {
+                            // rows and columns 3q..3q+2
+                            let o = idx * 576 + q * 75
+                            k00 = k00 + mats[o]
+                            k01 = k01 + mats[o + 1]
+                            k02 = k02 + mats[o + 2]
+                            k10 = k10 + mats[o + 24]
+                            k11 = k11 + mats[o + 25]
+                            k12 = k12 + mats[o + 26]
+                            k20 = k20 + mats[o + 48]
+                            k21 = k21 + mats[o + 49]
+                            k22 = k22 + mats[o + 50]
+                        } else {
+                            let pc = idx - ns
+                            let gp = geometry[3]
+                            let ox = pxi[pc * 3]
+                            let oy = pxi[pc * 3 + 1]
+                            let oz = pxi[pc * 3 + 2]
+                            let sx = f64(2 * (q & 1) - 1)
+                            let sy = f64(2 * ((q >> 1) & 1) - 1)
+                            let sz = f64(2 * ((q >> 2) & 1) - 1)
+                            for g in 0..8 {
+                                let point = pc * 8 + g
+                                let m = gpd[point] * 36
+                                let w = gpw[point]
+                                let bx = f64(2 * (g & 1) - 1) * gp
+                                let by = f64(2 * ((g >> 1) & 1) - 1) * gp
+                                let bz = f64(2 * ((g >> 2) & 1) - 1) * gp
+                                let at = (g * 8 + q) * 3
+                                let dx = sx * (sy * oy * (f64(1.0) + sz * bz) + sz * oz * (f64(1.0) + sy * by) + sy * sz * oy * oz) / f64(4.0) / geometry[0]
+                                let dy = sy * (sx * ox * (f64(1.0) + sz * bz) + sz * oz * (f64(1.0) + sx * bx) + sx * sz * ox * oz) / f64(4.0) / geometry[1]
+                                let dz = sz * (sx * ox * (f64(1.0) + sy * by) + sy * oy * (f64(1.0) + sx * bx) + sx * sy * ox * oy) / f64(4.0) / geometry[2]
+                                let d0 = dn[at] + dx
+                                let d1 = dn[at + 1] + dy
+                                let d2 = dn[at + 2] + dz
+                                // column a: the stress of a unit displacement along a, its traction
+                                for a in 0..3 {
+                                    let x0 = if a == 0 { d0 } else { f64(0.0) }
+                                    let x1 = if a == 1 { d1 } else { f64(0.0) }
+                                    let x2 = if a == 2 { d2 } else { f64(0.0) }
+                                    let x3 = if a == 1 { d2 } else if a == 2 { d1 } else { f64(0.0) }
+                                    let x4 = if a == 0 { d2 } else if a == 2 { d0 } else { f64(0.0) }
+                                    let x5 = if a == 0 { d1 } else if a == 1 { d0 } else { f64(0.0) }
+                                    let s0 = ds[m] * x0 + ds[m + 1] * x1 + ds[m + 2] * x2 + ds[m + 3] * x3 + ds[m + 4] * x4 + ds[m + 5] * x5
+                                    let s1 = ds[m + 6] * x0 + ds[m + 7] * x1 + ds[m + 8] * x2 + ds[m + 9] * x3 + ds[m + 10] * x4 + ds[m + 11] * x5
+                                    let s2 = ds[m + 12] * x0 + ds[m + 13] * x1 + ds[m + 14] * x2 + ds[m + 15] * x3 + ds[m + 16] * x4 + ds[m + 17] * x5
+                                    let s3 = ds[m + 18] * x0 + ds[m + 19] * x1 + ds[m + 20] * x2 + ds[m + 21] * x3 + ds[m + 22] * x4 + ds[m + 23] * x5
+                                    let s4 = ds[m + 24] * x0 + ds[m + 25] * x1 + ds[m + 26] * x2 + ds[m + 27] * x3 + ds[m + 28] * x4 + ds[m + 29] * x5
+                                    let s5 = ds[m + 30] * x0 + ds[m + 31] * x1 + ds[m + 32] * x2 + ds[m + 33] * x3 + ds[m + 34] * x4 + ds[m + 35] * x5
+                                    let f0 = w * (s0 * d0 + s5 * d1 + s4 * d2)
+                                    let f1 = w * (s5 * d0 + s1 * d1 + s3 * d2)
+                                    let f2 = w * (s4 * d0 + s3 * d1 + s2 * d2)
+                                    if a == 0 {
+                                        k00 = k00 + f0
+                                        k10 = k10 + f1
+                                        k20 = k20 + f2
+                                    } else if a == 1 {
+                                        k01 = k01 + f0
+                                        k11 = k11 + f1
+                                        k21 = k21 + f2
+                                    } else {
+                                        k02 = k02 + f0
+                                        k12 = k12 + f1
+                                        k22 = k22 + f2
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // a held axis: its row and column out, one on the diagonal
+        let fx = (h & 1) == 0
+        let fy = (h & 2) == 0
+        let fz = (h & 4) == 0
+        let z = f64(0.0)
+        let m00 = if fx { k00 } else { f64(1.0) }
+        let m01 = if fx && fy { k01 } else { z }
+        let m02 = if fx && fz { k02 } else { z }
+        let m10 = if fy && fx { k10 } else { z }
+        let m11 = if fy { k11 } else { f64(1.0) }
+        let m12 = if fy && fz { k12 } else { z }
+        let m20 = if fz && fx { k20 } else { z }
+        let m21 = if fz && fy { k21 } else { z }
+        let m22 = if fz { k22 } else { f64(1.0) }
+        // the cofactors, c_rk = m[r+1][k+1] m[r+2][k+2] - m[r+1][k+2] m[r+2][k+1]
+        let c00 = m11 * m22 - m12 * m21
+        let c01 = m12 * m20 - m10 * m22
+        let c02 = m10 * m21 - m11 * m20
+        let c10 = m21 * m02 - m22 * m01
+        let c11 = m22 * m00 - m20 * m02
+        let c12 = m20 * m01 - m21 * m00
+        let c20 = m01 * m12 - m02 * m11
+        let c21 = m02 * m10 - m00 * m12
+        let c22 = m00 * m11 - m01 * m10
+        let det = m00 * c00 + m01 * c01 + m02 * c02
+        let tiny = f64(1e-300)
+        let usable = h != 7 && (det > tiny || det < -tiny)
+        let one = f64(1.0)
+        i0[n] = if !usable { one } else if fx { c00 / det } else { z }
+        i1[n] = if !usable { z } else if fx && fy { c10 / det } else { z }
+        i2[n] = if !usable { z } else if fx && fz { c20 / det } else { z }
+        i3[n] = if !usable { z } else if fy && fx { c01 / det } else { z }
+        i4[n] = if !usable { one } else if fy { c11 / det } else { z }
+        i5[n] = if !usable { z } else if fy && fz { c21 / det } else { z }
+        i6[n] = if !usable { z } else if fz && fx { c02 / det } else { z }
+        i7[n] = if !usable { z } else if fz && fy { c12 / det } else { z }
+        i8[n] = if !usable { one } else if fz { c22 / det } else { z }
+    }
+}
+
+// The load at its nodes, in three dense vectors (zero elsewhere): element = a loaded node.
+// Each writes another node's values, so it runs on one thread (a few thousand nodes).
+let load = {
+    label: "load"
+    fnode: input(i32)
+    fval: input(@f64)
+    f0: output(@f64)
+    f1: output(@f64)
+    f2: output(@f64)
+    // the side's first entry (a block's sides one after another)
+    start: param(0, 0, 1073741824)
+    element: fn(k) {
+        let i = k + int(start)
+        let n = fnode[i]
+        f0[n] = fval[i * 3]
+        f1[n] = fval[i * 3 + 1]
+        f2[n] = fval[i * 3 + 2]
+    }
+}
+
+// Damped block Jacobi: x += omega D^-1 r (r = b - A x); from rest (A 0 = 0, r = b): x = omega
+// D^-1 b.
+let jacobi = {
+    label: "jacobi"
+    r0: input(@f64)
+    r1: input(@f64)
+    r2: input(@f64)
+    dinv: input(@f64)
+    knob: input(@f64)
+    x0: output(@f64)
+    x1: output(@f64)
+    x2: output(@f64)
+    rest: param(0, 0, 1)
+    element: fn(n) {
+        let w = knob[0]
+        let d = n * 9
+        let v0 = r0[n]
+        let v1 = r1[n]
+        let v2 = r2[n]
+        let c0 = w * (dinv[d] * v0 + dinv[d + 1] * v1 + dinv[d + 2] * v2)
+        let c1 = w * (dinv[d + 3] * v0 + dinv[d + 4] * v1 + dinv[d + 5] * v2)
+        let c2 = w * (dinv[d + 6] * v0 + dinv[d + 7] * v1 + dinv[d + 8] * v2)
+        if int(rest) == 1 {
+            x0[n] = c0
+            x1[n] = c1
+            x2[n] = c2
+        } else {
+            x0[n] = x0[n] + c0
+            x1[n] = x1[n] + c1
+            x2[n] = x2[n] + c2
+        }
+    }
+}
+
+// Coarse = R fine, full weighting (the transpose of prolong): a coarse node sums the fine
+// nodes it reaches, along a halved axis the one it sits on (1) and its two neighbours (1/2).
+let restrict = {
+    label: "restrict"
+    f0: input(@f64)
+    f1: input(@f64)
+    f2: input(@f64)
+    held: input(i32)
+    c0: output(@f64)
+    c1: output(@f64)
+    c2: output(@f64)
+    fx: param(1, 1, 16777216)
+    fy: param(1, 1, 16777216)
+    fz: param(1, 1, 16777216)
+    cx: param(1, 1, 16777216)
+    cy: param(1, 1, 16777216)
+    hx: param(0, 0, 1)
+    hy: param(0, 0, 1)
+    hz: param(0, 0, 1)
+    element: fn(n) {
+        let px = int(cx)
+        let py = int(cy)
+        let i = n % px
+        let j = (n / px) % py
+        let k = n / (px * py)
+        let h = held[n]
+        var v0 = f64(0.0)
+        var v1 = f64(0.0)
+        var v2 = f64(0.0)
+        if h != 7 {
+            let nfx = int(fx)
+            let nfy = int(fy)
+            let nfz = int(fz)
+            let sx = int(hx)
+            let sy = int(hy)
+            let sz = int(hz)
+            for dz in 0..3 {
+                let oz = dz - 1
+                let z = if sz == 1 { 2 * k + oz } else { k + oz }
+                if (sz == 1 || oz == 0) && z >= 0 && z < nfz {
+                    let wz = if oz == 0 { f64(1.0) } else { f64(0.5) }
+                    for dy in 0..3 {
+                        let oy = dy - 1
+                        let y = if sy == 1 { 2 * j + oy } else { j + oy }
+                        if (sy == 1 || oy == 0) && y >= 0 && y < nfy {
+                            let wy = if oy == 0 { f64(1.0) } else { f64(0.5) }
+                            for dx in 0..3 {
+                                let ox = dx - 1
+                                let x = if sx == 1 { 2 * i + ox } else { i + ox }
+                                if (sx == 1 || ox == 0) && x >= 0 && x < nfx {
+                                    let wx = if ox == 0 { f64(1.0) } else { f64(0.5) }
+                                    let w = wx * wy * wz
+                                    let f = x + nfx * (y + nfy * z)
+                                    v0 = v0 + w * f0[f]
+                                    v1 = v1 + w * f1[f]
+                                    v2 = v2 + w * f2[f]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (h & 1) != 0 {
+            v0 = f64(0.0)
+        }
+        if (h & 2) != 0 {
+            v1 = f64(0.0)
+        }
+        if (h & 4) != 0 {
+            v2 = f64(0.0)
+        }
+        c0[n] = v0
+        c1[n] = v1
+        c2[n] = v2
+    }
+}
+
+// Fine += P coarse (trilinear) on the fine level's free axes: a fine node takes the coarse
+// node it sits on (1), or the two it sits between along a halved axis (1/2 each).
+let prolong = {
+    label: "prolong"
+    c0: input(@f64)
+    c1: input(@f64)
+    c2: input(@f64)
+    held: input(i32)
+    f0: output(@f64)
+    f1: output(@f64)
+    f2: output(@f64)
+    fx: param(1, 1, 16777216)
+    fy: param(1, 1, 16777216)
+    cx: param(1, 1, 16777216)
+    cy: param(1, 1, 16777216)
+    cz: param(1, 1, 16777216)
+    hx: param(0, 0, 1)
+    hy: param(0, 0, 1)
+    hz: param(0, 0, 1)
+    element: fn(n) {
+        let h = held[n]
+        if h != 7 {
+            let px = int(fx)
+            let py = int(fy)
+            let i = n % px
+            let j = (n / px) % py
+            let k = n / (px * py)
+            let ncx = int(cx)
+            let ncy = int(cy)
+            let ncz = int(cz)
+            let sx = int(hx)
+            let sy = int(hy)
+            let sz = int(hz)
+            var v0 = f64(0.0)
+            var v1 = f64(0.0)
+            var v2 = f64(0.0)
+            for tz in 0..2 {
+                let two_z = sz == 1 && k % 2 == 1
+                let z = if sz == 1 { k / 2 + tz } else { k }
+                if (tz == 0 || two_z) && z < ncz {
+                    let wz = if two_z { f64(0.5) } else { f64(1.0) }
+                    for ty in 0..2 {
+                        let two_y = sy == 1 && j % 2 == 1
+                        let y = if sy == 1 { j / 2 + ty } else { j }
+                        if (ty == 0 || two_y) && y < ncy {
+                            let wy = if two_y { f64(0.5) } else { f64(1.0) }
+                            for tx in 0..2 {
+                                let two_x = sx == 1 && i % 2 == 1
+                                let x = if sx == 1 { i / 2 + tx } else { i }
+                                if (tx == 0 || two_x) && x < ncx {
+                                    let wx = if two_x { f64(0.5) } else { f64(1.0) }
+                                    let w = wx * wy * wz
+                                    let c = x + ncx * (y + ncy * z)
+                                    v0 = v0 + w * c0[c]
+                                    v1 = v1 + w * c1[c]
+                                    v2 = v2 + w * c2[c]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (h & 1) == 0 {
+                f0[n] = f0[n] + v0
+            }
+            if (h & 2) == 0 {
+                f1[n] = f1[n] + v1
+            }
+            if (h & 4) == 0 {
+                f2[n] = f2[n] + v2
+            }
+        }
+    }
+}
+
+// The load as a vector, its held axes zero.
+let masked = {
+    label: "masked"
+    f0: input(@f64)
+    f1: input(@f64)
+    f2: input(@f64)
+    held: input(i32)
+    b0: output(@f64)
+    b1: output(@f64)
+    b2: output(@f64)
+    element: fn(n) {
+        let h = held[n]
+        b0[n] = if (h & 1) != 0 { f64(0.0) } else { f0[n] }
+        b1[n] = if (h & 2) != 0 { f64(0.0) } else { f1[n] }
+        b2[n] = if (h & 4) != 0 { f64(0.0) } else { f2[n] }
+    }
+}
+
+let zero = {
+    label: "zero"
+    x0: output(@f64)
+    x1: output(@f64)
+    x2: output(@f64)
+    element: fn(n) {
+        x0[n] = f64(0.0)
+        x1[n] = f64(0.0)
+        x2[n] = f64(0.0)
+    }
+}
+
+// A guess given as three values a node, as a vector.
+let spread = {
+    label: "spread"
+    g: input(@f64)
+    x0: output(@f64)
+    x1: output(@f64)
+    x2: output(@f64)
+    element: fn(n) {
+        x0[n] = g[n * 3]
+        x1[n] = g[n * 3 + 1]
+        x2[n] = g[n * 3 + 2]
+    }
+}
+
+// The start from a guess u (q = A u, sc[5] = u.q, sc[6] = u.b): the multiple s of it nearest the
+// answer in energy and its residual b - s A u; rest when u has no energy.
+let cg_start = {
+    label: "cg_start"
+    sc: input(@f64)
+    q0: input(@f64)
+    q1: input(@f64)
+    q2: input(@f64)
+    b0: input(@f64)
+    b1: input(@f64)
+    b2: input(@f64)
+    u0: output(@f64)
+    u1: output(@f64)
+    u2: output(@f64)
+    r0: output(@f64)
+    r1: output(@f64)
+    r2: output(@f64)
+    element: fn(n) {
+        let energy = sc[5]
+        if energy > f64(0.0) {
+            let s = sc[6] / energy
+            u0[n] = s * u0[n]
+            u1[n] = s * u1[n]
+            u2[n] = s * u2[n]
+            r0[n] = b0[n] - s * q0[n]
+            r1[n] = b1[n] - s * q1[n]
+            r2[n] = b2[n] - s * q2[n]
+        } else {
+            u0[n] = f64(0.0)
+            u1[n] = f64(0.0)
+            u2[n] = f64(0.0)
+            r0[n] = b0[n]
+            r1[n] = b1[n]
+            r2[n] = b2[n]
+        }
+    }
+}
+
+// The answer as three values a node.
+let interleave = {
+    label: "interleave"
+    x0: input(@f64)
+    x1: input(@f64)
+    x2: input(@f64)
+    out: output(@f64)
+    element: fn(i) {
+        let n = i / 3
+        let a = i % 3
+        out[i] = if a == 0 { x0[n] } else if a == 1 { x1[n] } else { x2[n] }
+    }
+}
+
+// A dot product in two passes of a fixed shape (the same sum on any worker count): 4096 nodes
+// a part, then the parts in order into sc[slot] (at most 16384 parts: 67M nodes).
+let dot_part = {
+    label: "dot_part"
+    a0: input(@f64)
+    a1: input(@f64)
+    a2: input(@f64)
+    b0: input(@f64)
+    b1: input(@f64)
+    b2: input(@f64)
+    part: output(@f64)
+    n: param(0, 0, 16777216)
+    element: fn(k) {
+        let len = int(n)
+        let lo = k * 4096
+        var acc = f64(0.0)
+        for j in 0..4096 {
+            let t = lo + j
+            if t < len {
+                acc = acc + (a0[t] * b0[t] + a1[t] * b1[t] + a2[t] * b2[t])
+            }
+        }
+        part[k] = acc
+    }
+}
+
+let dot_finish = {
+    label: "dot_finish"
+    part: input(@f64)
+    sc: output(@f64)
+    m: param(1, 1, 16777216)
+    slot: param(0, 0, 7)
+    element: fn(i) {
+        let len = int(m)
+        var acc = f64(0.0)
+        for k in 0..16384 {
+            if k < len {
+                acc = acc + part[k]
+            }
+        }
+        sc[int(slot)] = acc
+    }
+}
+
+// CG's scalars in sc: 0 r.z, 1 p.q, 2 the new r.z, 3 r.r, 4 b.b.
+let cg_step = {
+    label: "cg_step"
+    sc: input(@f64)
+    p0: input(@f64)
+    p1: input(@f64)
+    p2: input(@f64)
+    q0: input(@f64)
+    q1: input(@f64)
+    q2: input(@f64)
+    u0: output(@f64)
+    u1: output(@f64)
+    u2: output(@f64)
+    r0: output(@f64)
+    r1: output(@f64)
+    r2: output(@f64)
+    element: fn(n) {
+        let alpha = sc[0] / sc[1]
+        u0[n] = u0[n] + alpha * p0[n]
+        u1[n] = u1[n] + alpha * p1[n]
+        u2[n] = u2[n] + alpha * p2[n]
+        r0[n] = r0[n] - alpha * q0[n]
+        r1[n] = r1[n] - alpha * q1[n]
+        r2[n] = r2[n] - alpha * q2[n]
+    }
+}
+
+let cg_direction = {
+    label: "cg_direction"
+    sc: input(@f64)
+    z0: input(@f64)
+    z1: input(@f64)
+    z2: input(@f64)
+    p0: output(@f64)
+    p1: output(@f64)
+    p2: output(@f64)
+    element: fn(n) {
+        let beta = sc[2] / sc[0]
+        p0[n] = z0[n] + beta * p0[n]
+        p1[n] = z1[n] + beta * p1[n]
+        p2[n] = z2[n] + beta * p2[n]
+    }
+}
+
+let cg_shift = {
+    label: "cg_shift"
+    sc: output(@f64)
+    element: fn(i) { sc[0] = sc[2] }
+}
+
+// ---- The coarse levels (`fab_force::solve::Level::coarser`), built from the analysed one ----
+
+// Every cell of the analysed level as a full matrix (576 values, row by row; symmetric, so a
+// row is its column too), what its coarse level is built from: element = matrix * 24 + column
+// c, its 24 values its own record of `k`. Below nshared the shared matrices (`shared`, full);
+// past them the cells integrated point by point: the forces at the 24 corner axes of a unit
+// displacement at c, summed over the Gauss points.
+let cell_k = {
+    label: "cell_k"
+    shared: input(@f64)
+    gpd: input(i32)
+    gpw: input(@f64)
+    ds: input(@f64)
+    dn: input(@f64)
+    pxi: input(@f64)
+    geometry: input(@f64)
+    k0: output(@f64, 48, 0, "k")
+    k1: output(@f64, 48, 2, "k")
+    k2: output(@f64, 48, 4, "k")
+    k3: output(@f64, 48, 6, "k")
+    k4: output(@f64, 48, 8, "k")
+    k5: output(@f64, 48, 10, "k")
+    k6: output(@f64, 48, 12, "k")
+    k7: output(@f64, 48, 14, "k")
+    k8: output(@f64, 48, 16, "k")
+    k9: output(@f64, 48, 18, "k")
+    k10: output(@f64, 48, 20, "k")
+    k11: output(@f64, 48, 22, "k")
+    k12: output(@f64, 48, 24, "k")
+    k13: output(@f64, 48, 26, "k")
+    k14: output(@f64, 48, 28, "k")
+    k15: output(@f64, 48, 30, "k")
+    k16: output(@f64, 48, 32, "k")
+    k17: output(@f64, 48, 34, "k")
+    k18: output(@f64, 48, 36, "k")
+    k19: output(@f64, 48, 38, "k")
+    k20: output(@f64, 48, 40, "k")
+    k21: output(@f64, 48, 42, "k")
+    k22: output(@f64, 48, 44, "k")
+    k23: output(@f64, 48, 46, "k")
+    nshared: param(0, 0, 16777216)
+    element: fn(e) {
+        let m = e / 24
+        let c = e % 24
+        let ns = int(nshared)
+        // the column's values at corner i along x, y, z
+        var f0 = [f64(0.0); 8]
+        var f1 = [f64(0.0); 8]
+        var f2 = [f64(0.0); 8]
+        if m < ns {
+            let o = m * 576 + c * 24
+            for i in 0..8 {
+                f0[i] = shared[o + i * 3]
+                f1[i] = shared[o + i * 3 + 1]
+                f2[i] = shared[o + i * 3 + 2]
+            }
+        } else {
+            let pc = m - ns
+            let j = c / 3
+            let b = c % 3
+            let gp = geometry[3]
+            let ox = pxi[pc * 3]
+            let oy = pxi[pc * 3 + 1]
+            let oz = pxi[pc * 3 + 2]
+            let jsx = f64(2 * (j & 1) - 1)
+            let jsy = f64(2 * ((j >> 1) & 1) - 1)
+            let jsz = f64(2 * ((j >> 2) & 1) - 1)
+            for g in 0..8 {
+                let point = pc * 8 + g
+                let dm = gpd[point] * 36
+                let w = gpw[point]
+                let bx = f64(2 * (g & 1) - 1) * gp
+                let by = f64(2 * ((g >> 1) & 1) - 1) * gp
+                let bz = f64(2 * ((g >> 2) & 1) - 1) * gp
+                let jat = (g * 8 + j) * 3
+                let jdx = jsx * (jsy * oy * (f64(1.0) + jsz * bz) + jsz * oz * (f64(1.0) + jsy * by) + jsy * jsz * oy * oz) / f64(4.0) / geometry[0]
+                let jdy = jsy * (jsx * ox * (f64(1.0) + jsz * bz) + jsz * oz * (f64(1.0) + jsx * bx) + jsx * jsz * ox * oz) / f64(4.0) / geometry[1]
+                let jdz = jsz * (jsx * ox * (f64(1.0) + jsy * by) + jsy * oy * (f64(1.0) + jsx * bx) + jsx * jsy * ox * oy) / f64(4.0) / geometry[2]
+                let d0 = dn[jat] + jdx
+                let d1 = dn[jat + 1] + jdy
+                let d2 = dn[jat + 2] + jdz
+                // the strain of corner j's unit displacement along b, and its stress
+                let x0 = if b == 0 { d0 } else { f64(0.0) }
+                let x1 = if b == 1 { d1 } else { f64(0.0) }
+                let x2 = if b == 2 { d2 } else { f64(0.0) }
+                let x3 = if b == 1 { d2 } else if b == 2 { d1 } else { f64(0.0) }
+                let x4 = if b == 0 { d2 } else if b == 2 { d0 } else { f64(0.0) }
+                let x5 = if b == 0 { d1 } else if b == 1 { d0 } else { f64(0.0) }
+                let s0 = ds[dm] * x0 + ds[dm + 1] * x1 + ds[dm + 2] * x2 + ds[dm + 3] * x3 + ds[dm + 4] * x4 + ds[dm + 5] * x5
+                let s1 = ds[dm + 6] * x0 + ds[dm + 7] * x1 + ds[dm + 8] * x2 + ds[dm + 9] * x3 + ds[dm + 10] * x4 + ds[dm + 11] * x5
+                let s2 = ds[dm + 12] * x0 + ds[dm + 13] * x1 + ds[dm + 14] * x2 + ds[dm + 15] * x3 + ds[dm + 16] * x4 + ds[dm + 17] * x5
+                let s3 = ds[dm + 18] * x0 + ds[dm + 19] * x1 + ds[dm + 20] * x2 + ds[dm + 21] * x3 + ds[dm + 22] * x4 + ds[dm + 23] * x5
+                let s4 = ds[dm + 24] * x0 + ds[dm + 25] * x1 + ds[dm + 26] * x2 + ds[dm + 27] * x3 + ds[dm + 28] * x4 + ds[dm + 29] * x5
+                let s5 = ds[dm + 30] * x0 + ds[dm + 31] * x1 + ds[dm + 32] * x2 + ds[dm + 33] * x3 + ds[dm + 34] * x4 + ds[dm + 35] * x5
+                // its traction on each corner
+                for i in 0..8 {
+                    let sx = f64(2 * (i & 1) - 1)
+                    let sy = f64(2 * ((i >> 1) & 1) - 1)
+                    let sz = f64(2 * ((i >> 2) & 1) - 1)
+                    let at = (g * 8 + i) * 3
+                    let dx = sx * (sy * oy * (f64(1.0) + sz * bz) + sz * oz * (f64(1.0) + sy * by) + sy * sz * oy * oz) / f64(4.0) / geometry[0]
+                    let dy = sy * (sx * ox * (f64(1.0) + sz * bz) + sz * oz * (f64(1.0) + sx * bx) + sx * sz * ox * oz) / f64(4.0) / geometry[1]
+                    let dz = sz * (sx * ox * (f64(1.0) + sy * by) + sy * oy * (f64(1.0) + sx * bx) + sx * sy * ox * oy) / f64(4.0) / geometry[2]
+                    let e0 = dn[at] + dx
+                    let e1 = dn[at + 1] + dy
+                    let e2 = dn[at + 2] + dz
+                    f0[i] = f0[i] + w * (s0 * e0 + s5 * e1 + s4 * e2)
+                    f1[i] = f1[i] + w * (s5 * e0 + s1 * e1 + s3 * e2)
+                    f2[i] = f2[i] + w * (s4 * e0 + s3 * e1 + s2 * e2)
+                }
+            }
+        }
+        k0[e] = f0[0]
+        k1[e] = f1[0]
+        k2[e] = f2[0]
+        k3[e] = f0[1]
+        k4[e] = f1[1]
+        k5[e] = f2[1]
+        k6[e] = f0[2]
+        k7[e] = f1[2]
+        k8[e] = f2[2]
+        k9[e] = f0[3]
+        k10[e] = f1[3]
+        k11[e] = f2[3]
+        k12[e] = f0[4]
+        k13[e] = f1[4]
+        k14[e] = f2[4]
+        k15[e] = f0[5]
+        k16[e] = f1[5]
+        k17[e] = f2[5]
+        k18[e] = f0[6]
+        k19[e] = f1[6]
+        k20[e] = f2[6]
+        k21[e] = f0[7]
+        k22[e] = f1[7]
+        k23[e] = f2[7]
+    }
+}
+
+// A coarse cell: 0 when one of its children (the finer level's cells within it) has stiffness,
+// else -1 (`stiff` and `slotted` make the coarse level's cell indices of it).
+let occupied = {
+    label: "occupied"
+    cell: input(i32)
+    own: output(i32)
+    fx: param(1, 1, 16777216)
+    fy: param(1, 1, 16777216)
+    fz: param(1, 1, 16777216)
+    cx: param(1, 1, 16777216)
+    cy: param(1, 1, 16777216)
+    hx: param(0, 0, 1)
+    hy: param(0, 0, 1)
+    hz: param(0, 0, 1)
+    element: fn(c) {
+        let ex = int(fx)
+        let ey = int(fy)
+        let ez = int(fz)
+        let sx = int(hx)
+        let sy = int(hy)
+        let sz = int(hz)
+        let i = c % int(cx)
+        let j = (c / int(cx)) % int(cy)
+        let k = c / (int(cx) * int(cy))
+        var any = int(-1)
+        for slot in 0..8 {
+            let ox = slot % 2
+            let oy = (slot / 2) % 2
+            let oz = slot / 4
+            let x = if sx == 1 { 2 * i + ox } else { i }
+            let y = if sy == 1 { 2 * j + oy } else { j }
+            let z = if sz == 1 { 2 * k + oz } else { k }
+            if (sx == 1 || ox == 0) && (sy == 1 || oy == 0) && (sz == 1 || oz == 0) && x < ex && y < ey && z < ez {
+                if cell[x + ex * (y + ey * z)] >= 0 {
+                    any = 0
+                }
+            }
+        }
+        own[c] = any
+    }
+}
+
+// A coarse cell's matrix, Galerkin, full (576 values; symmetric): the sum over its children
+// (the finer level's cells within it) of P^T K P, K the child's matrix on its free degrees of
+// freedom and P the trilinear interpolation from the coarse cell's corners to the child's.
+// element = matrix * 24 + column (coarse corner L, axis b), its 24 values its own record of
+// `out`: per child K P's column, then P^T of it. The coarse cells in `list` (i, j, k, matrix);
+// the children's matrices full in `mats`, by the finer level's cell indices.
+let galerkin = {
+    label: "galerkin"
+    list: input(i32)
+    cell: input(i32)
+    held: input(i32)
+    mats: input(@f64)
+    o0: output(@f64, 48, 0, "out")
+    o1: output(@f64, 48, 2, "out")
+    o2: output(@f64, 48, 4, "out")
+    o3: output(@f64, 48, 6, "out")
+    o4: output(@f64, 48, 8, "out")
+    o5: output(@f64, 48, 10, "out")
+    o6: output(@f64, 48, 12, "out")
+    o7: output(@f64, 48, 14, "out")
+    o8: output(@f64, 48, 16, "out")
+    o9: output(@f64, 48, 18, "out")
+    o10: output(@f64, 48, 20, "out")
+    o11: output(@f64, 48, 22, "out")
+    o12: output(@f64, 48, 24, "out")
+    o13: output(@f64, 48, 26, "out")
+    o14: output(@f64, 48, 28, "out")
+    o15: output(@f64, 48, 30, "out")
+    o16: output(@f64, 48, 32, "out")
+    o17: output(@f64, 48, 34, "out")
+    o18: output(@f64, 48, 36, "out")
+    o19: output(@f64, 48, 38, "out")
+    o20: output(@f64, 48, 40, "out")
+    o21: output(@f64, 48, 42, "out")
+    o22: output(@f64, 48, 44, "out")
+    o23: output(@f64, 48, 46, "out")
+    fx: param(1, 1, 16777216)
+    fy: param(1, 1, 16777216)
+    fz: param(1, 1, 16777216)
+    hx: param(0, 0, 1)
+    hy: param(0, 0, 1)
+    hz: param(0, 0, 1)
+    element: fn(e) {
+        let m = e / 24
+        let col = e % 24
+        let big_l = col / 3
+        let b = col % 3
+        let lx = big_l % 2
+        let ly = (big_l / 2) % 2
+        let lz = big_l / 4
+        let ci = list[m * 4]
+        let cj = list[m * 4 + 1]
+        let ck = list[m * 4 + 2]
+        let ex = int(fx)
+        let ey = int(fy)
+        let ez = int(fz)
+        let px = ex + 1
+        let py = ey + 1
+        let sx = int(hx)
+        let sy = int(hy)
+        let sz = int(hz)
+        let bm = 1 << b
+        // the column's values at coarse corner J along x, y, z
+        var a0 = [f64(0.0); 8]
+        var a1 = [f64(0.0); 8]
+        var a2 = [f64(0.0); 8]
+        for slot in 0..8 {
+            let ox = slot % 2
+            let oy = (slot / 2) % 2
+            let oz = slot / 4
+            let x = if sx == 1 { 2 * ci + ox } else { ci }
+            let y = if sy == 1 { 2 * cj + oy } else { cj }
+            let z = if sz == 1 { 2 * ck + oz } else { ck }
+            if (sx == 1 || ox == 0) && (sy == 1 || oy == 0) && (sz == 1 || oz == 0) && x < ex && y < ey && z < ez {
+                let idx = cell[x + ex * (y + ey * z)]
+                if idx >= 0 {
+                    let base = x + px * (y + py * z)
+                    // along each axis the weight a fine corner (bit q) takes from a coarse one
+                    // (bit big), at q * 2 + big: along a halved axis the fine corner sits at
+                    // (o + q) / 2 across the coarse cell, along a kept one it is the coarse corner
+                    var wx = [f64(0.0); 4]
+                    var wy = [f64(0.0); 4]
+                    var wz = [f64(0.0); 4]
+                    for t in 0..4 {
+                        let q = t / 2
+                        let big = t % 2
+                        let tx = f64(0.5) * f64(ox + q)
+                        let ty = f64(0.5) * f64(oy + q)
+                        let tz = f64(0.5) * f64(oz + q)
+                        wx[t] = if sx == 1 { if big == 0 { f64(1.0) - tx } else { tx } } else if q == big { f64(1.0) } else { f64(0.0) }
+                        wy[t] = if sy == 1 { if big == 0 { f64(1.0) - ty } else { ty } } else if q == big { f64(1.0) } else { f64(0.0) }
+                        wz[t] = if sz == 1 { if big == 0 { f64(1.0) - tz } else { tz } } else if q == big { f64(1.0) } else { f64(0.0) }
+                    }
+                    var hq = [int(0); 8]
+                    for q in 0..8 {
+                        hq[q] = held[base + q % 2 + px * ((q / 2) % 2 + py * (q / 4))]
+                    }
+                    // K P's column (L, b) at the child's corners: its rows q b (free) weighted
+                    var v0 = [f64(0.0); 8]
+                    var v1 = [f64(0.0); 8]
+                    var v2 = [f64(0.0); 8]
+                    for q in 0..8 {
+                        let w = wx[(q % 2) * 2 + lx] * wy[((q / 2) % 2) * 2 + ly] * wz[(q / 4) * 2 + lz]
+                        if w != f64(0.0) && (hq[q] & bm) == 0 {
+                            let o = idx * 576 + (q * 3 + b) * 24
+                            for i in 0..8 {
+                                v0[i] = v0[i] + w * mats[o + i * 3]
+                                v1[i] = v1[i] + w * mats[o + i * 3 + 1]
+                                v2[i] = v2[i] + w * mats[o + i * 3 + 2]
+                            }
+                        }
+                    }
+                    // P^T of it on the child's free axes
+                    for i in 0..8 {
+                        let h = hq[i]
+                        let ix = (i % 2) * 2
+                        let iy = ((i / 2) % 2) * 2
+                        let iz = (i / 4) * 2
+                        for big_j in 0..8 {
+                            let w = wx[ix + big_j % 2] * wy[iy + (big_j / 2) % 2] * wz[iz + big_j / 4]
+                            if w != f64(0.0) {
+                                if (h & 1) == 0 {
+                                    a0[big_j] = a0[big_j] + w * v0[i]
+                                }
+                                if (h & 2) == 0 {
+                                    a1[big_j] = a1[big_j] + w * v1[i]
+                                }
+                                if (h & 4) == 0 {
+                                    a2[big_j] = a2[big_j] + w * v2[i]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        o0[e] = a0[0]
+        o1[e] = a1[0]
+        o2[e] = a2[0]
+        o3[e] = a0[1]
+        o4[e] = a1[1]
+        o5[e] = a2[1]
+        o6[e] = a0[2]
+        o7[e] = a1[2]
+        o8[e] = a2[2]
+        o9[e] = a0[3]
+        o10[e] = a1[3]
+        o11[e] = a2[3]
+        o12[e] = a0[4]
+        o13[e] = a1[4]
+        o14[e] = a2[4]
+        o15[e] = a0[5]
+        o16[e] = a1[5]
+        o17[e] = a2[5]
+        o18[e] = a0[6]
+        o19[e] = a1[6]
+        o20[e] = a2[6]
+        o21[e] = a0[7]
+        o22[e] = a1[7]
+        o23[e] = a2[7]
+    }
+}
+
+// A coarse node's held axes: every axis where no cell has it, else the axes its diagonal has
+// no stiffness along (all its children's degrees of freedom there held).
+let coarse_held = {
+    label: "coarse_held"
+    cell: input(i32)
+    mats: input(@f64)
+    held: output(i32)
+    nx: param(1, 1, 16777216)
+    ny: param(1, 1, 16777216)
+    nz: param(1, 1, 16777216)
+    element: fn(n) {
+        let ex = int(nx)
+        let ey = int(ny)
+        let ez = int(nz)
+        let px = ex + 1
+        let py = ey + 1
+        let i = n % px
+        let j = (n / px) % py
+        let k = n / (px * py)
+        var touched = int(0)
+        var k0 = f64(0.0)
+        var k1 = f64(0.0)
+        var k2 = f64(0.0)
+        for q in 0..8 {
+            let ci = i - q % 2
+            let cj = j - (q / 2) % 2
+            let ck = k - q / 4
+            if ci >= 0 && ci < ex && cj >= 0 && cj < ey && ck >= 0 && ck < ez {
+                let idx = cell[ci + ex * (cj + ey * ck)]
+                if idx >= 0 {
+                    touched = 1
+                    // the diagonal at rows 3q..3q+2
+                    let o = idx * 576 + q * 75
+                    k0 = k0 + mats[o]
+                    k1 = k1 + mats[o + 25]
+                    k2 = k2 + mats[o + 50]
+                }
+            }
+        }
+        var h = int(7)
+        if touched == 1 {
+            h = 0
+            if k0 <= f64(0.0) {
+                h = h | 1
+            }
+            if k1 <= f64(0.0) {
+                h = h | 2
+            }
+            if k2 <= f64(0.0) {
+                h = h | 4
+            }
+        }
+        held[n] = h
+    }
+}
+
+// ---- The coarsest level's exact solve (`fab_force::solve::Dense`) -------------------------------
+// Its stiffness on its free degrees of freedom, A = L L' (Cholesky in f64, a panel of 32 columns
+// at a time: its 32 x 32 block on one thread, the panel and the rest of the matrix's update an
+// entry an element), and the factor inverted, R = L^-1 (by blocks of 32 rows, in place of the
+// identity), kept with R's columns mirrored past the diagonal: row i holds R's row i up to the diagonal and R's column i
+// past it. A solve is x = R'(R b), two products of an independent sum a row. Loops reach 8192
+// degrees of freedom: `fab_force::solve::DENSE_NODES` keeps the coarsest level within them.
+
+// A degree of freedom (3 a node) is free where its node's axis is not held and has stiffness
+// (its diagonal, summed over the node's cells, above zero).
+let dense_free = {
+    label: "dense_free"
+    held: input(i32)
+    cell: input(i32)
+    mats: input(@f64)
+    flag: output(i32)
+    nx: param(1, 1, 16777216)
+    ny: param(1, 1, 16777216)
+    nz: param(1, 1, 16777216)
+    element: fn(d) {
+        let node = d / 3
+        let axis = d % 3
+        var diag = f64(0.0)
+        if (held[node] & (1 << axis)) == 0 {
+            let ex = int(nx)
+            let ey = int(ny)
+            let ez = int(nz)
+            let px = ex + 1
+            let py = ey + 1
+            let i = node % px
+            let j = (node / px) % py
+            let k = node / (px * py)
+            for q in 0..8 {
+                let ci = i - q % 2
+                let cj = j - (q / 2) % 2
+                let ck = k - q / 4
+                if ci >= 0 && ci < ex && cj >= 0 && cj < ey && ck >= 0 && ck < ez {
+                    let idx = cell[ci + ex * (cj + ey * ck)]
+                    if idx >= 0 {
+                        diag = diag + mats[idx * 576 + (q * 3 + axis) * 25]
+                    }
+                }
+            }
+        }
+        flag[d] = if diag > f64(0.0) { int(1) } else { int(0) }
+    }
+}
+
+// A degree of freedom's place among the free ones (the scan of the flags), -1 where held.
+let dense_place = {
+    label: "dense_place"
+    flag: input(i32)
+    rank: input(i32)
+    place: output(i32)
+    element: fn(d) {
+        var at = int(-1)
+        if flag[d] == 1 {
+            at = rank[d]
+        }
+        place[d] = at
+    }
+}
+
+// Each place's degree of freedom, and their count last (a kept list says the factor's size).
+// Each writes another element's values, so it runs on one thread.
+let dense_list = {
+    label: "dense_list"
+    place: input(i32)
+    list: output(i32)
+    element: fn(d) {
+        let at = place[d]
+        if at >= 0 {
+            list[at] = d
+        }
+        if d == 0 {
+            list[len(list) - 1] = len(list) - 1
+        }
+    }
+}
+
+// A, an entry an element (row r, column c, row-major; the lower triangle and the diagonal, zero
+// above): the sum over the cells both degrees of freedom's nodes are corners of.
+let dense_entry = {
+    label: "dense_entry"
+    list: input(i32)
+    cell: input(i32)
+    mats: input(@f64)
+    a: output(@f64)
+    n: param(1, 1, 8192)
+    nx: param(1, 1, 16777216)
+    ny: param(1, 1, 16777216)
+    nz: param(1, 1, 16777216)
+    element: fn(e) {
+        let size = int(n)
+        let r = e / size
+        let c = e % size
+        var v = f64(0.0)
+        if c <= r {
+            let ex = int(nx)
+            let ey = int(ny)
+            let ez = int(nz)
+            let px = ex + 1
+            let py = ey + 1
+            let dr = list[r]
+            let dc = list[c]
+            let nr = dr / 3
+            let nc = dc / 3
+            let ri = nr % px
+            let rj = (nr / px) % py
+            let rk = nr / (px * py)
+            let ci = nc % px
+            let cj = (nc / px) % py
+            let ck = nc / (px * py)
+            for q in 0..8 {
+                // the cell row's node is corner q of
+                let x = ri - q % 2
+                let y = rj - (q / 2) % 2
+                let z = rk - q / 4
+                if x >= 0 && x < ex && y >= 0 && y < ey && z >= 0 && z < ez {
+                    let qx = ci - x
+                    let qy = cj - y
+                    let qz = ck - z
+                    if qx >= 0 && qx <= 1 && qy >= 0 && qy <= 1 && qz >= 0 && qz <= 1 {
+                        let idx = cell[x + ex * (y + ey * z)]
+                        if idx >= 0 {
+                            v = v + mats[idx * 576 + (q * 3 + dr % 3) * 24 + (qx + 2 * qy + 4 * qz) * 3 + dc % 3]
+                        }
+                    }
+                }
+            }
+        }
+        a[e] = v
+    }
+}
+
+// A's diagonal as assembled: a pivot that falls to round-off of it drops.
+let dense_diag = {
+    label: "dense_diag"
+    a: input(@f64)
+    d: output(@f64)
+    n: param(1, 1, 8192)
+    element: fn(i) {
+        d[i] = a[i * int(n) + i]
+    }
+}
+
+// One panel's diagonal block (columns j0..j1, at most 32), on one thread: its factor L_pp by rows
+// (Cholesky-Banachiewicz on the block as the panels before left it) into `blk` (32 a row, zero
+// right of the diagonal); `dense_block_inverse` then puts R_pp = L_pp^-1 in the block's 32 x 32
+// place in `rd`. A pivot not above 1e-12 of its diagonal as assembled drops (stiffness that only moves
+// with the degrees of freedom before it): its column of L and its row of R are zero, and its
+// solve too; blk[1024] counts the pivots dropped.
+let dense_block = {
+    label: "dense_block"
+    a: input(@f64)
+    d0: input(@f64)
+    blk: output(@f64)
+    n: param(1, 1, 8192)
+    j0: param(0, 0, 8192)
+    j1: param(0, 0, 8192)
+    element: fn(e) {
+        let size = int(n)
+        let b0 = int(j0)
+        let w = int(j1) - b0
+        var dropped = f64(0.0)
+        for i in 0..32 {
+            if i >= w {
+                break
+            }
+            for j in 0..32 {
+                var v = f64(0.0)
+                if j <= i {
+                    var s = a[(b0 + i) * size + b0 + j]
+                    for k in 0..32 {
+                        if k >= j {
+                            break
+                        }
+                        s = s - blk[i * 32 + k] * blk[j * 32 + k]
+                    }
+                    if j < i {
+                        let piv = blk[j * 32 + j]
+                        if piv > f64(0.0) {
+                            v = s / piv
+                        }
+                    } else if s > f64(1e-12) * d0[b0 + i] {
+                        v = sqrt(s)
+                    } else {
+                        dropped = dropped + f64(1.0)
+                    }
+                }
+                blk[i * 32 + j] = v
+            }
+        }
+        blk[1024] = blk[1024] + dropped
+    }
+}
+
+// The block's inverse, R_pp = L_pp^-1 by rows, into `rd` (on one thread).
+let dense_block_inverse = {
+    label: "dense_block_inverse"
+    blk: input(@f64)
+    rd: output(@f64)
+    j0: param(0, 0, 8192)
+    j1: param(0, 0, 8192)
+    element: fn(e) {
+        let b0 = int(j0)
+        let w = int(j1) - b0
+        let at = (b0 / 32) * 1024
+        for i in 0..32 {
+            if i >= w {
+                break
+            }
+            let piv = blk[i * 32 + i]
+            for j in 0..32 {
+                var x = f64(0.0)
+                if j <= i && piv > f64(0.0) {
+                    var v = if j == i { f64(1.0) } else { f64(0.0) }
+                    for k in 0..32 {
+                        if k >= i {
+                            break
+                        }
+                        if k >= j {
+                            v = v - blk[i * 32 + k] * rd[at + k * 32 + j]
+                        }
+                    }
+                    x = v / piv
+                }
+                rd[at + i * 32 + j] = x
+            }
+        }
+    }
+}
+
+// The panel's columns of L, 32 a row, an entry an element: the block's rows from `blk`, the rows
+// below it L_ip = A_ip R_pp' (A as the panels before left it), zero above it.
+let dense_panel = {
+    label: "dense_panel"
+    a: input(@f64)
+    blk: input(@f64)
+    rd: input(@f64)
+    p: output(@f64)
+    n: param(1, 1, 8192)
+    j0: param(0, 0, 8192)
+    j1: param(0, 0, 8192)
+    element: fn(e) {
+        let size = int(n)
+        let b0 = int(j0)
+        let w = int(j1) - b0
+        let i = e / 32
+        let t = e % 32
+        var v = f64(0.0)
+        if t < w && i >= b0 {
+            if i < b0 + w {
+                v = blk[(i - b0) * 32 + t]
+            } else {
+                let at = (b0 / 32) * 1024 + t * 32
+                for k in 0..32 {
+                    if k > t {
+                        break
+                    }
+                    v = v + a[i * size + b0 + k] * rd[at + k]
+                }
+            }
+        }
+        p[e] = v
+    }
+}
+
+// The panel's columns of L into their place in `a`, and the lower triangle right of the panel
+// less the panel's part, L_p L_p', an entry an element.
+let dense_update = {
+    label: "dense_update"
+    p: input(@f64)
+    a: output(@f64)
+    n: param(1, 1, 8192)
+    j0: param(0, 0, 8192)
+    j1: param(0, 0, 8192)
+    element: fn(e) {
+        let size = int(n)
+        let r = e / size
+        let c = e % size
+        let b0 = int(j0)
+        let b1 = int(j1)
+        if c <= r && c >= b0 {
+            if c < b1 {
+                a[e] = p[r * 32 + c - b0]
+            } else {
+                let w = b1 - b0
+                var s0 = f64(0.0)
+                var s1 = f64(0.0)
+                for t in 0..32 {
+                    if t >= w {
+                        break
+                    }
+                    let x = p[r * 32 + t] * p[c * 32 + t]
+                    if t % 2 == 0 {
+                        s0 = s0 + x
+                    } else {
+                        s1 = s1 + x
+                    }
+                }
+                a[e] = a[e] - (s0 + s1)
+            }
+        }
+    }
+}
+
+// The identity, where R = L^-1 starts (W: the identity less the row blocks done so far).
+let dense_identity = {
+    label: "dense_identity"
+    m: output(@f64)
+    n: param(1, 1, 8192)
+    element: fn(e) {
+        let size = int(n)
+        m[e] = if e / size == e % size { f64(1.0) } else { f64(0.0) }
+    }
+}
+
+// Rows i0..i1 (at most 32) of R, R_b = R_bb W_b (n a row, left of each row's diagonal), an entry
+// an element: W's rows of the block in `m`, R_bb from the factor's block.
+let dense_rows = {
+    label: "dense_rows"
+    rd: input(@f64)
+    m: input(@f64)
+    q: output(@f64)
+    n: param(1, 1, 8192)
+    i0: param(0, 0, 8192)
+    i1: param(0, 0, 8192)
+    element: fn(e) {
+        let size = int(n)
+        let b0 = int(i0)
+        let w = int(i1) - b0
+        let t = e / size
+        let c = e % size
+        var v = f64(0.0)
+        if t < w && c <= b0 + t {
+            let at = (b0 / 32) * 1024 + t * 32
+            for k in 0..32 {
+                if k > t {
+                    break
+                }
+                v = v + rd[at + k] * m[(b0 + k) * size + c]
+            }
+        }
+        q[e] = v
+    }
+}
+
+// The block's rows of R into `m` with their mirror (row j, column i), and W's rows below the
+// block less L's block columns times the block's rows of R, an entry an element.
+let dense_rows_update = {
+    label: "dense_rows_update"
+    a: input(@f64)
+    q: input(@f64)
+    m: output(@f64)
+    n: param(1, 1, 8192)
+    i0: param(0, 0, 8192)
+    i1: param(0, 0, 8192)
+    element: fn(e) {
+        let size = int(n)
+        let r = e / size
+        let c = e % size
+        let b0 = int(i0)
+        let b1 = int(i1)
+        if r >= b0 && r < b1 && c <= r {
+            m[e] = q[(r - b0) * size + c]
+        } else if c >= b0 && c < b1 && r < c {
+            m[e] = q[(c - b0) * size + r]
+        } else if r >= b1 && c < b1 {
+            let w = b1 - b0
+            var s0 = f64(0.0)
+            var s1 = f64(0.0)
+            for t in 0..32 {
+                if t >= w {
+                    break
+                }
+                let x = a[r * size + b0 + t] * q[t * size + c]
+                if t % 2 == 0 {
+                    s0 = s0 + x
+                } else {
+                    s1 = s1 + x
+                }
+            }
+            m[e] = m[e] - (s0 + s1)
+        }
+    }
+}
+
+// The free degrees of freedom's values of a vector, by place.
+let dense_gather = {
+    label: "dense_gather"
+    list: input(i32)
+    b0: input(@f64)
+    b1: input(@f64)
+    b2: input(@f64)
+    g: output(@f64)
+    element: fn(i) {
+        let d = list[i]
+        let node = d / 3
+        let axis = d % 3
+        g[i] = if axis == 0 { b0[node] } else if axis == 1 { b1[node] } else { b2[node] }
+    }
+}
+
+// y = R g: row i's sum up to the diagonal, in four partial sums (as `fab_force::solve` sums).
+let dense_lower = {
+    label: "dense_lower"
+    m: input(@f64)
+    g: input(@f64)
+    y: output(@f64)
+    n: param(1, 1, 8192)
+    element: fn(i) {
+        let row = i * int(n)
+        var s0 = f64(0.0)
+        var s1 = f64(0.0)
+        var s2 = f64(0.0)
+        var s3 = f64(0.0)
+        for t in 0..2048 {
+            let j = t * 4
+            if j > i {
+                break
+            }
+            s0 = s0 + m[row + j] * g[j]
+            if j + 1 <= i {
+                s1 = s1 + m[row + j + 1] * g[j + 1]
+            }
+            if j + 2 <= i {
+                s2 = s2 + m[row + j + 2] * g[j + 2]
+            }
+            if j + 3 <= i {
+                s3 = s3 + m[row + j + 3] * g[j + 3]
+            }
+        }
+        y[i] = (s0 + s1) + (s2 + s3)
+    }
+}
+
+// x = R' y: row i's sum from the diagonal on (R's column i), in four partial sums.
+let dense_upper = {
+    label: "dense_upper"
+    m: input(@f64)
+    y: input(@f64)
+    x: output(@f64)
+    n: param(1, 1, 8192)
+    element: fn(i) {
+        let size = int(n)
+        let row = i * size
+        var s0 = f64(0.0)
+        var s1 = f64(0.0)
+        var s2 = f64(0.0)
+        var s3 = f64(0.0)
+        for t in 0..2048 {
+            let j = i + t * 4
+            if j >= size {
+                break
+            }
+            s0 = s0 + m[row + j] * y[j]
+            if j + 1 < size {
+                s1 = s1 + m[row + j + 1] * y[j + 1]
+            }
+            if j + 2 < size {
+                s2 = s2 + m[row + j + 2] * y[j + 2]
+            }
+            if j + 3 < size {
+                s3 = s3 + m[row + j + 3] * y[j + 3]
+            }
+        }
+        x[i] = (s0 + s1) + (s2 + s3)
+    }
+}
+
+// The solve's values back on the level's nodes (zero where held).
+let dense_scatter = {
+    label: "dense_scatter"
+    place: input(i32)
+    xs: input(@f64)
+    x0: output(@f64)
+    x1: output(@f64)
+    x2: output(@f64)
+    element: fn(nd) {
+        let p0 = place[nd * 3]
+        let p1 = place[nd * 3 + 1]
+        let p2 = place[nd * 3 + 2]
+        x0[nd] = if p0 >= 0 { xs[p0] } else { f64(0.0) }
+        x1[nd] = if p1 >= 0 { xs[p1] } else { f64(0.0) }
+        x2[nd] = if p2 >= 0 { xs[p2] } else { f64(0.0) }
+    }
+}
+
+// ---- The GPU engine (`fab_force::gpu`'s kernels and layout) ---------------------------------
+
+// The GPU's layout of a level, made from the inputs: f64 values as f32.
+let narrow = {
+    label: "narrow"
+    a: input(@f64)
+    b: output(f32)
+    element: fn(i) { b[i] = float(a[i]) }
+}
+
+// A level's full matrices as the GPU keeps them: packed (the upper triangle row by row, 300 a
+// matrix) in f32.
+let narrow_packed = {
+    label: "narrow_packed"
+    full: input(@f64)
+    b: output(f32)
+    element: fn(e) {
+        let m = e / 300
+        let at = e % 300
+        // row t starts at t (49 - t) / 2
+        var r = int(0)
+        for t in 1..24 {
+            if t * (49 - t) / 2 <= at {
+                r = t
+            }
+        }
+        b[e] = float(full[m * 576 + r * 24 + at - r * (47 - r) / 2])
+    }
+}
+
+// A level's cells with stiffness, 1 each (their places in the list are the scan of these).
+let stiff = {
+    label: "stiff"
+    cell: input(i32)
+    flag: output(i32)
+    element: fn(c) {
+        var f = int(0)
+        if cell[c] >= 0 {
+            f = 1
+        }
+        flag[c] = f
+    }
+}
+
+// Each cell's place in the list, -1 (EMPTY) for a cell without stiffness.
+let slotted = {
+    label: "slotted"
+    cell: input(i32)
+    rank: input(i32)
+    slot: output(i32)
+    element: fn(c) {
+        var at = int(-1)
+        if cell[c] >= 0 {
+            at = rank[c]
+        }
+        slot[c] = at
+    }
+}
+
+// The list: each cell with stiffness as (i, j, k, its matrix) at its place. Each writes another
+// element's values, so it runs on one thread.
+let listed = {
+    label: "listed"
+    cell: input(i32)
+    rank: input(i32)
+    list: output(i32)
+    nx: param(1, 1, 16777216)
+    ny: param(1, 1, 16777216)
+    element: fn(c) {
+        let m = cell[c]
+        if m >= 0 {
+            let ex = int(nx)
+            let ey = int(ny)
+            let at = rank[c] * 4
+            list[at] = c % ex
+            list[at + 1] = (c / ex) % ey
+            list[at + 2] = c / (ex * ey)
+            list[at + 3] = m
+        }
+    }
+}
+
+// The axes a level's cell is rigid along (bits 1, 2, 4: its matrix has that axis's translation
+// in its null space): every axis on the analysed level (holds are node masks there; `rigid_of`
+// with no finer level); on a coarser one, an axis rigid in all the cell's children with no node
+// of theirs held on it (a coarse matrix is its children's on their free degrees of freedom).
+// The difference form of `gpu_cells` takes the bits; 0 for a cell without stiffness.
+let rigid_of = {
+    label: "rigid_of"
+    cell: input(i32)
+    fine_cell: input(i32)
+    fine_held: input(i32)
+    fine_rigid: input(i32)
+    rigid: output(i32)
+    nx: param(1, 1, 16777216)
+    ny: param(1, 1, 16777216)
+    fx: param(1, 1, 16777216)
+    fy: param(1, 1, 16777216)
+    fz: param(1, 1, 16777216)
+    hx: param(0, 0, 1)
+    hy: param(0, 0, 1)
+    hz: param(0, 0, 1)
+    finest: param(0, 0, 1)
+    element: fn(c) {
+        var bits = int(0)
+        if cell[c] >= 0 {
+            bits = int(7)
+            if int(finest) == 0 {
+                let ex = int(nx)
+                let ey = int(ny)
+                let gx = int(fx)
+                let gy = int(fy)
+                let gz = int(fz)
+                let ci = c % ex
+                let cj = (c / ex) % ey
+                let ck = c / (ex * ey)
+                for q in 0..8 {
+                    let dx = q % 2
+                    let dy = (q / 2) % 2
+                    let dz = q / 4
+                    // a child along the halved axes only
+                    if (dx == 0 || int(hx) == 1) && (dy == 0 || int(hy) == 1) && (dz == 0 || int(hz) == 1) {
+                        let fi = if int(hx) == 1 { 2 * ci + dx } else { ci }
+                        let fj = if int(hy) == 1 { 2 * cj + dy } else { cj }
+                        let fk = if int(hz) == 1 { 2 * ck + dz } else { ck }
+                        if fi < gx && fj < gy && fk < gz {
+                            let fc = fi + gx * (fj + gy * fk)
+                            if fine_cell[fc] >= 0 {
+                                var b = fine_rigid[fc]
+                                for k in 0..8 {
+                                    let n = (fi + k % 2) + (gx + 1) * ((fj + (k / 2) % 2) + (gy + 1) * (fk + k / 4))
+                                    b = b & (int(7) - (fine_held[n] & int(7)))
+                                }
+                                bits = bits & b
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        rigid[c] = bits
+    }
+}
+
+// `listed` for the GPU engine: each cell's matrix with its rigid axes in bits 28-30.
+let gpu_listed = {
+    label: "gpu_listed"
+    cell: input(i32)
+    rank: input(i32)
+    rigid: input(i32)
+    list: output(i32)
+    nx: param(1, 1, 16777216)
+    ny: param(1, 1, 16777216)
+    element: fn(c) {
+        let m = cell[c]
+        if m >= 0 {
+            let ex = int(nx)
+            let ey = int(ny)
+            let at = rank[c] * 4
+            list[at] = c % ex
+            list[at + 1] = (c / ex) % ey
+            list[at + 2] = c / (ex * ey)
+            list[at + 3] = m + rigid[c] * 268435456
+        }
+    }
+}
+
+// A level's held axes, a byte a node, four to a word (past the last node held on every axis).
+let held_bytes = {
+    label: "held_bytes"
+    held: input(i32)
+    out: output(i32)
+    element: fn(w) {
+        let n = len(held)
+        var v = int(0)
+        for b in 0..4 {
+            let k = w * 4 + b
+            var h = int(7)
+            if k < n {
+                h = held[k]
+            }
+            v = v | (h << (b * 8))
+        }
+        out[w] = v
+    }
+}
+
+// A node's inverse diagonal block as the GPU keeps it: 00 01 02 11 12 22 in f32.
+let dinv6 = {
+    label: "dinv6"
+    dinv: input(@f64)
+    k0: output(f32, 6, 0, "d6")
+    k1: output(f32, 6, 1, "d6")
+    k2: output(f32, 6, 2, "d6")
+    k3: output(f32, 6, 3, "d6")
+    k4: output(f32, 6, 4, "d6")
+    k5: output(f32, 6, 5, "d6")
+    element: fn(n) {
+        let o = n * 9
+        k0[n] = float(dinv[o])
+        k1[n] = float(dinv[o + 1])
+        k2[n] = float(dinv[o + 2])
+        k3[n] = float(dinv[o + 4])
+        k4[n] = float(dinv[o + 5])
+        k5[n] = float(dinv[o + 8])
+    }
+}
+
+// Each material's 6x6 stiffness as the GPU's rows: D's row i as (i0 i1 i2 0) (i3 i4 i5 0).
+let rows = {
+    label: "rows"
+    ds: input(@f64)
+    out: output(f32)
+    element: fn(e) {
+        let m = e / 48
+        let r = (e % 48) / 8
+        let c = e % 8
+        let a = if c < 4 { c } else { c - 1 }
+        out[e] = if c == 3 || c == 7 { 0.0 } else { float(ds[m * 36 + r * 6 + a]) }
+    }
+}
+
+// The Gauss points' shape gradients as the GPU's rows (x y z 0).
+let grads4 = {
+    label: "grads4"
+    dn: input(@f64)
+    out: output(f32)
+    element: fn(e) {
+        let c = e % 4
+        out[e] = if c == 3 { 0.0 } else { float(dn[(e / 4) * 3 + c]) }
+    }
+}
+
+// Each point cell's offset as the GPU's row (x y z 0).
+let offsets4 = {
+    label: "offsets4"
+    pxi: input(@f64)
+    out: output(f32)
+    element: fn(e) {
+        let c = e % 4
+        out[e] = if c == 3 { 0.0 } else { float(pxi[(e / 4) * 3 + c]) }
+    }
+}
+
+// A vector as the GPU's: (x, y, z, 0) in f32 a node.
+let pack4 = {
+    label: "pack4"
+    x0: input(@f64)
+    x1: input(@f64)
+    x2: input(@f64)
+    o0: output(f32, 4, 0, "v4")
+    o1: output(f32, 4, 1, "v4")
+    o2: output(f32, 4, 2, "v4")
+    o3: output(f32, 4, 3, "v4")
+    element: fn(n) {
+        o0[n] = float(x0[n])
+        o1[n] = float(x1[n])
+        o2[n] = float(x2[n])
+        o3[n] = 0.0
+    }
+}
+
+// u += a GPU run's correction ((x, y, z, 0) in f32 a node).
+let add4 = {
+    label: "add4"
+    c: input(f32)
+    u0: output(@f64)
+    u1: output(@f64)
+    u2: output(@f64)
+    c0: output(@f64)
+    c1: output(@f64)
+    c2: output(@f64)
+    element: fn(n) {
+        let a = f64(c[n * 4])
+        let b = f64(c[n * 4 + 1])
+        let d = f64(c[n * 4 + 2])
+        u0[n] = u0[n] + a
+        u1[n] = u1[n] + b
+        u2[n] = u2[n] + d
+        c0[n] = a
+        c1[n] = b
+        c2[n] = d
+    }
+}
+
+// u -= a GPU run's correction as `add4` kept it: a run that did not lower the potential undone.
+let unrun = {
+    label: "unrun"
+    c0: input(@f64)
+    c1: input(@f64)
+    c2: input(@f64)
+    u0: output(@f64)
+    u1: output(@f64)
+    u2: output(@f64)
+    element: fn(n) {
+        u0[n] = u0[n] - c0[n]
+        u1[n] = u1[n] - c1[n]
+        u2[n] = u2[n] - c2[n]
+    }
+}
+
+// One level's grid: node counts per axis and in all, cell counts per axis and the cells with
+// stiffness. A dispatch past 65535 groups runs as rows of them.
+let gpu_grid = {
+    nodes: shader.uniform(vec4u)
+    cells_n: shader.uniform(vec4u)
+    group: fn() -> u32 {
+        return group_id().x + group_id().y * group_count().x
+    }
+}
+
+// Each cell's nodal forces f = K x: four cells a group, a thread per row of its matrix (the
+// upper triangle by rows, 300 values), the cell's 24 displacements shared. In difference form
+// on the axes the cell's matrix is rigid along (FORCE A4 2.1; bits 28-30 of its matrix index,
+// `rigid_axes`): each such axis's mean over the cell's corners taken off x before the product
+// and off f after, so a translation gives exactly zero force however large it is. The same
+// operator as K x (K's null space holds those translations); in f32 it keeps a slender part's
+// soft modes, which the plain product buries under the rounding of K's row sums times the
+// part's translation.
+let gpu_cells = {
+    ..gpu_grid
+    label: "gpu cells"
+    workgroup_size: 96
+    cells: shader.buffer(vec4u)
+    mats: shader.buffer(f32)
+    x: shader.buffer(vec4f)
+    cf: shader.buffer_rw(f32)
+    xs: shader.workgroup(f32, 96)
+    fs: shader.workgroup(f32, 96)
+    means: shader.workgroup(f32, 12)
+    main: fn() {
+        let t = local_index()
+        let s = self.group() * 4u + t / 24u
+        let r = t % 24u
+        let a = r % 3u
+        let live = s < self.cells_n.w
+        var m = 0u
+        var rigid = 0u
+        if live {
+            let c = self.cells[s]
+            m = c.w & 268435455u
+            rigid = c.w >> 28u
+            let corner = r / 3u
+            let n = (c.x + corner % 2u) + self.nodes.x * ((c.y + (corner / 2u) % 2u) + self.nodes.y * (c.z + corner / 4u))
+            let v = self.x[n]
+            var xv = v.x
+            if a == 1u { xv = v.y }
+            if a == 2u { xv = v.z }
+            self.xs[t] = xv
+        }
+        barrier()
+        // the means: thread 3 q + b of the first twelve, cell q's on axis b
+        if t < 12u {
+            let at = (t / 3u) * 24u + t % 3u
+            var sum = 0.0
+            for q in 0..8u {
+                sum += self.xs[at + q * 3u]
+            }
+            self.means[t] = sum * 0.125
+        }
+        barrier()
+        let cell = t / 24u
+        if live && ((rigid >> a) & 1u) == 1u {
+            self.xs[t] = self.xs[t] - self.means[cell * 3u + a]
+        }
+        barrier()
+        var f = 0.0
+        if live {
+            let base = t - r
+            let k = m * 300u
+            for c in 0..24u {
+                var i = 0u
+                if c < r { i = c * (47u - c) / 2u + r } else { i = r * (47u - r) / 2u + c }
+                f += self.mats[k + i] * self.xs[base + c]
+            }
+        }
+        self.fs[t] = f
+        barrier()
+        if t < 12u {
+            let at = (t / 3u) * 24u + t % 3u
+            var sum = 0.0
+            for q in 0..8u {
+                sum += self.fs[at + q * 3u]
+            }
+            self.means[t] = sum * 0.125
+        }
+        barrier()
+        if live {
+            if ((rigid >> a) & 1u) == 1u {
+                f = f - self.means[cell * 3u + a]
+            }
+            self.cf[s * 24u + r] = f
+        }
+    }
+}
+
+// A node's share of its (up to) eight cells' forces, and its free axes.
+let gpu_gather = {
+    ..gpu_grid
+    workgroup_size: 64
+    cf: shader.buffer(f32)
+    slots: shader.buffer(u32)
+    held: shader.buffer(u32)
+    node: fn() -> u32 {
+        return self.group() * 64u + local_index()
+    }
+    sum: fn(n: u32) -> vec3 {
+        let i = n % self.nodes.x
+        let j = (n / self.nodes.x) % self.nodes.y
+        let k = n / (self.nodes.x * self.nodes.y)
+        var y = vec3(0.0)
+        for q in 0..8u {
+            // the cell this node is corner q of
+            let dx = q % 2u
+            let dy = (q / 2u) % 2u
+            let dz = q / 4u
+            if i < dx || j < dy || k < dz { continue }
+            let ci = i - dx
+            let cj = j - dy
+            let ck = k - dz
+            if ci >= self.cells_n.x || cj >= self.cells_n.y || ck >= self.cells_n.z { continue }
+            let s = self.slots[ci + self.cells_n.x * (cj + self.cells_n.y * ck)]
+            if s == 4294967295u { continue }
+            let at = s * 24u + q * 3u
+            y += vec3(self.cf[at], self.cf[at + 1u], self.cf[at + 2u])
+        }
+        return y
+    }
+    // a node's held axes: a byte each, four to a word
+    free: fn(n: u32) -> vec3 {
+        let h = (self.held[n / 4u] >> ((n % 4u) * 8u)) & 7u
+        return vec3(f32(1u - (h & 1u)), f32(1u - ((h >> 1u) & 1u)), f32(1u - ((h >> 2u) & 1u)))
+    }
+}
+
+// y = A x on the free degrees of freedom.
+let gpu_apply = {
+    ..gpu_gather
+    label: "gpu apply"
+    out: shader.buffer_rw(vec4f)
+    main: fn() {
+        let n = self.node()
+        if n >= self.nodes.w { return }
+        self.out[n] = vec4(self.sum(n) * self.free(n), 0.0)
+    }
+}
+
+// r = b - A x on the free degrees of freedom.
+let gpu_residual = {
+    ..gpu_gather
+    label: "gpu residual"
+    b: shader.buffer(vec4f)
+    out: shader.buffer_rw(vec4f)
+    main: fn() {
+        let n = self.node()
+        if n >= self.nodes.w { return }
+        self.out[n] = vec4((self.b[n].xyz - self.sum(n)) * self.free(n), 0.0)
+    }
+}
+
+// One damped block Jacobi sweep, x += omega D^-1 (b - A x) on the free axes (a node held on
+// every axis keeps the identity block, its residual is masked to zero). D^-1 is symmetric: six
+// values a node (00 01 02 11 12 22).
+let gpu_smooth = {
+    ..gpu_gather
+    label: "gpu smooth"
+    dinv: shader.buffer(f32)
+    b: shader.buffer(vec4f)
+    x: shader.buffer_rw(vec4f)
+    omega: shader.uniform(f32)
+    main: fn() {
+        let n = self.node()
+        if n >= self.nodes.w { return }
+        let r = (self.b[n].xyz - self.sum(n)) * self.free(n)
+        let at = n * 6u
+        let d1 = self.dinv[at + 1u]
+        let d2 = self.dinv[at + 2u]
+        let d4 = self.dinv[at + 4u]
+        let d = vec3(dot(vec3(self.dinv[at], d1, d2), r), dot(vec3(d1, self.dinv[at + 3u], d4), r), dot(vec3(d2, d4, self.dinv[at + 5u]), r))
+        self.x[n] = vec4(self.x[n].xyz + d * self.omega, 0.0)
+    }
+}
+
+// The first sweep from rest: x = omega D^-1 b.
+let gpu_rest = {
+    ..gpu_grid
+    label: "gpu smooth from rest"
+    workgroup_size: 64
+    dinv: shader.buffer(f32)
+    b: shader.buffer(vec4f)
+    x: shader.buffer_rw(vec4f)
+    omega: shader.uniform(f32)
+    main: fn() {
+        let n = self.group() * 64u + local_index()
+        if n >= self.nodes.w { return }
+        let r = self.b[n].xyz
+        let at = n * 6u
+        let d1 = self.dinv[at + 1u]
+        let d2 = self.dinv[at + 2u]
+        let d4 = self.dinv[at + 4u]
+        let d = vec3(dot(vec3(self.dinv[at], d1, d2), r), dot(vec3(d1, self.dinv[at + 3u], d4), r), dot(vec3(d2, d4, self.dinv[at + 5u]), r))
+        self.x[n] = vec4(d * self.omega, 0.0)
+    }
+}
+
+// The analysed level's packed matrices on the GPU, a thread per entry: its shared ones as sent
+// (`shared`), then its cells integrated point by point, each one's from its eight Gauss points,
+// the sum of w B^T D B (entry row r, column c >= r: the force along degree of freedom c of a
+// unit displacement along r). count: the cells integrated point by point, the shared matrices.
+// A Gauss point's material is 12 rows (D's row i in 2i, 2i + 1: columns 0..3, 3..6).
+// Each row of grads holds a corner's unshifted gradient at a Gauss point. Each row of offsets
+// moves one cell's points in natural coordinates. geometry holds (hx, hy, hz, gp).
+let gpu_assemble = {
+    label: "gpu assemble"
+    workgroup_size: 64
+    count: shader.uniform(vec4u)
+    geometry: shader.uniform(vec4f)
+    shared: shader.buffer(f32)
+    points: shader.buffer(vec4u)
+    weights: shader.buffer(vec4f)
+    materials: shader.buffer(vec4f)
+    grads: shader.buffer(vec4f)
+    offsets: shader.buffer(vec4f)
+    mats: shader.buffer_rw(f32)
+    signs: fn(k: u32) -> vec3 {
+        return vec3(f32(k & 1u), f32((k >> 1u) & 1u), f32((k >> 2u) & 1u)) * 2.0 - vec3(1.0)
+    }
+    gradient: fn(row: vec3, s: vec3, b: vec3, o: vec3) -> vec3 {
+        let h = self.geometry.xyz
+        let ex = s.x * (s.y * o.y * (1.0 + s.z * b.z) + s.z * o.z * (1.0 + s.y * b.y) + s.y * s.z * o.y * o.z) / 4.0 / h.x
+        let ey = s.y * (s.x * o.x * (1.0 + s.z * b.z) + s.z * o.z * (1.0 + s.x * b.x) + s.x * s.z * o.x * o.z) / 4.0 / h.y
+        let ez = s.z * (s.x * o.x * (1.0 + s.y * b.y) + s.y * o.y * (1.0 + s.x * b.x) + s.x * s.y * o.x * o.y) / 4.0 / h.z
+        return row + vec3(ex, ey, ez)
+    }
+    stress: fn(m: u32, i: u32, en: vec3, es: vec3) -> f32 {
+        let at = m * 12u + i * 2u
+        return dot(self.materials[at].xyz, en) + dot(self.materials[at + 1u].xyz, es)
+    }
+    main: fn() {
+        let t = (group_id().x + group_id().y * group_count().x) * 64u + local_index()
+        let matrix = t / 300u
+        if matrix >= self.count.y + self.count.x { return }
+        if matrix < self.count.y {
+            self.mats[t] = self.shared[t]
+            return
+        }
+        let p = matrix - self.count.y
+        let e = t % 300u
+        // row r starts at r (49 - r) / 2; entry (r, c) is r (47 - r) / 2 + c
+        var r = 0u
+        for k in 1..24u {
+            if k * (49u - k) / 2u <= e { r = k }
+        }
+        let c = e - r * (47u - r) / 2u
+        let node = r / 3u
+        let a = r % 3u
+        let cn = c / 3u
+        let b = c % 3u
+        let offset = self.offsets[p].xyz
+        let row_signs = self.signs(node)
+        let col_signs = self.signs(cn)
+        // the stress components traction b takes: (0 5 4), (5 1 3), (4 3 2)
+        var i0 = 0u
+        var i1 = 5u
+        var i2 = 4u
+        if b == 1u {
+            i0 = 5u
+            i1 = 1u
+            i2 = 3u
+        }
+        if b == 2u {
+            i0 = 4u
+            i1 = 3u
+            i2 = 2u
+        }
+        var k = 0.0
+        for q in 0..8u {
+            let pv = self.points[p * 2u + q / 4u]
+            let wv = self.weights[p * 2u + q / 4u]
+            let lane = q % 4u
+            var m = pv.x
+            var w = wv.x
+            if lane == 1u {
+                m = pv.y
+                w = wv.y
+            }
+            if lane == 2u {
+                m = pv.z
+                w = wv.z
+            }
+            if lane == 3u {
+                m = pv.w
+                w = wv.w
+            }
+            // the strain of a unit displacement along r: normal (xx yy zz), shear (yz xz xy)
+            let point = self.signs(q) * self.geometry.w
+            let d = self.gradient(self.grads[q * 8u + node].xyz, row_signs, point, offset)
+            var en = vec3(d.x, 0.0, 0.0)
+            var es = vec3(0.0, d.z, d.y)
+            if a == 1u {
+                en = vec3(0.0, d.y, 0.0)
+                es = vec3(d.z, 0.0, d.x)
+            }
+            if a == 2u {
+                en = vec3(0.0, 0.0, d.z)
+                es = vec3(d.y, d.x, 0.0)
+            }
+            let g = self.gradient(self.grads[q * 8u + cn].xyz, col_signs, point, offset)
+            k += w * (self.stress(m, i0, en, es) * g.x + self.stress(m, i1, en, es) * g.y + self.stress(m, i2, en, es) * g.z)
+        }
+        self.mats[t] = k
+    }
+}
+
+// Between a level and the next coarser: node counts of both, and the halved axes.
+let gpu_transfer = {
+    workgroup_size: 64
+    fine: shader.uniform(vec4u)
+    coarse: shader.uniform(vec4u)
+    halved: shader.uniform(vec4u)
+    held: shader.buffer(u32)
+    index: fn() -> u32 {
+        return (group_id().x + group_id().y * group_count().x) * 64u + local_index()
+    }
+    free: fn(n: u32) -> vec3 {
+        let h = (self.held[n / 4u] >> ((n % 4u) * 8u)) & 7u
+        return vec3(f32(1u - (h & 1u)), f32(1u - ((h >> 1u) & 1u)), f32(1u - ((h >> 2u) & 1u)))
+    }
+}
+
+// Coarse = R fine: a coarse node takes its fine node (1) and, along a halved axis, the two
+// beside it (1/2 each). `held` is the coarse level's.
+let gpu_restrict = {
+    ..gpu_transfer
+    label: "gpu restrict"
+    rf: shader.buffer(vec4f)
+    rc: shader.buffer_rw(vec4f)
+    reach: fn(i: u32, d: u32, h: u32, n: u32) -> u32 {
+        if h == 0u {
+            if d == 1u { return i }
+            return n
+        }
+        let f = 2u * i + d
+        if f < 1u { return n }
+        if f - 1u >= n { return n }
+        return f - 1u
+    }
+    weight: fn(d: u32) -> f32 {
+        if d == 1u { return 1.0 }
+        return 0.5
+    }
+    main: fn() {
+        let n = self.index()
+        if n >= self.coarse.w { return }
+        let i = n % self.coarse.x
+        let j = (n / self.coarse.x) % self.coarse.y
+        let k = n / (self.coarse.x * self.coarse.y)
+        var sum = vec3(0.0)
+        for dz in 0..3u {
+            let z = self.reach(k, dz, self.halved.z, self.fine.z)
+            if z >= self.fine.z { continue }
+            for dy in 0..3u {
+                let y = self.reach(j, dy, self.halved.y, self.fine.y)
+                if y >= self.fine.y { continue }
+                for dx in 0..3u {
+                    let x = self.reach(i, dx, self.halved.x, self.fine.x)
+                    if x >= self.fine.x { continue }
+                    let w = self.weight(dx) * self.weight(dy) * self.weight(dz)
+                    sum += self.rf[x + self.fine.x * (y + self.fine.y * z)].xyz * w
+                }
+            }
+        }
+        self.rc[n] = vec4(sum * self.free(n), 0.0)
+    }
+}
+
+// Fine += P coarse: a fine node takes the coarse node it sits on, or the two (four, eight) it
+// sits between, along the halved axes. `held` is the fine level's.
+let gpu_prolong = {
+    ..gpu_transfer
+    label: "gpu prolong"
+    xc: shader.buffer(vec4f)
+    xf: shader.buffer_rw(vec4f)
+    parent: fn(i: u32, p: u32, h: u32, n: u32) -> u32 {
+        if h == 0u {
+            if p == 0u { return i }
+            return n
+        }
+        if i % 2u == 0u {
+            if p == 0u { return i / 2u }
+            return n
+        }
+        if p == 0u { return i / 2u }
+        if i / 2u + 1u >= n { return n }
+        return i / 2u + 1u
+    }
+    weight: fn(i: u32, h: u32) -> f32 {
+        if h == 0u { return 1.0 }
+        if i % 2u == 0u { return 1.0 }
+        return 0.5
+    }
+    main: fn() {
+        let n = self.index()
+        if n >= self.fine.w { return }
+        let i = n % self.fine.x
+        let j = (n / self.fine.x) % self.fine.y
+        let k = n / (self.fine.x * self.fine.y)
+        var sum = vec3(0.0)
+        for pz in 0..2u {
+            let z = self.parent(k, pz, self.halved.z, self.coarse.z)
+            if z >= self.coarse.z { continue }
+            for py in 0..2u {
+                let y = self.parent(j, py, self.halved.y, self.coarse.y)
+                if y >= self.coarse.y { continue }
+                for px in 0..2u {
+                    let x = self.parent(i, px, self.halved.x, self.coarse.x)
+                    if x >= self.coarse.x { continue }
+                    let w = self.weight(i, self.halved.x) * self.weight(j, self.halved.y) * self.weight(k, self.halved.z)
+                    sum += self.xc[x + self.coarse.x * (y + self.coarse.y * z)].xyz * w
+                }
+            }
+        }
+        self.xf[n] = vec4(self.xf[n].xyz + sum * self.free(n), 0.0)
+    }
+}
+
+// Partial sums of a.b and a.c per workgroup, over every node (the groups stride the vectors).
+let gpu_dot = {
+    label: "gpu dot"
+    workgroup_size: 256
+    count: shader.uniform(u32)
+    a: shader.buffer(vec4f)
+    b: shader.buffer(vec4f)
+    c: shader.buffer(vec4f)
+    partials: shader.buffer_rw(vec4f)
+    s1: shader.workgroup(f32, 256)
+    s2: shader.workgroup(f32, 256)
+    main: fn() {
+        let t = local_index()
+        let stride = group_count().x * 256u
+        var ab = 0.0
+        var ac = 0.0
+        var n = group_id().x * 256u + t
+        while n < self.count {
+            let va = self.a[n].xyz
+            ab += dot(va, self.b[n].xyz)
+            ac += dot(va, self.c[n].xyz)
+            n += stride
+        }
+        self.s1[t] = ab
+        self.s2[t] = ac
+        barrier()
+        var w = 128u
+        while w > 0u {
+            if t < w {
+                self.s1[t] = self.s1[t] + self.s1[t + w]
+                self.s2[t] = self.s2[t] + self.s2[t + w]
+            }
+            barrier()
+            w = w / 2u
+        }
+        if t == 0u { self.partials[group_id().x] = vec4(self.s1[0u], self.s2[0u], 0.0, 0.0) }
+    }
+}
+
+// CG's scalars from the partials: 0 r.z, 1 alpha, 2 beta, 3 r.r, 4 b.b, 5 iterations, 6
+// converged. Stage 0 (r.r, r.z of the start), 1 (p.q: alpha), 2 (r.r, r.z: beta, the count,
+// convergence at r.r <= tolerance b.b or the iteration limit).
+let gpu_scalars = {
+    label: "gpu scalars"
+    workgroup_size: 256
+    groups: shader.uniform(u32)
+    stage: shader.uniform(u32)
+    tolerance: shader.uniform(f32)
+    limit: shader.uniform(f32)
+    partials: shader.buffer(vec4f)
+    scalars: shader.buffer_rw(f32)
+    s1: shader.workgroup(f32, 256)
+    s2: shader.workgroup(f32, 256)
+    main: fn() {
+        let t = local_index()
+        var v = vec4(0.0)
+        if t < self.groups { v = self.partials[t] }
+        self.s1[t] = v.x
+        self.s2[t] = v.y
+        barrier()
+        var w = 128u
+        while w > 0u {
+            if t < w {
+                self.s1[t] = self.s1[t] + self.s1[t + w]
+                self.s2[t] = self.s2[t] + self.s2[t + w]
+            }
+            barrier()
+            w = w / 2u
+        }
+        if t != 0u { return }
+        let a = self.s1[0u]
+        let b = self.s2[0u]
+        if self.stage == 0u {
+            self.scalars[0u] = b
+            self.scalars[1u] = 0.0
+            self.scalars[2u] = 0.0
+            self.scalars[3u] = a
+            self.scalars[4u] = a
+            self.scalars[5u] = 0.0
+            if a > 0.0 { self.scalars[6u] = 0.0 } else { self.scalars[6u] = 1.0 }
+            return
+        }
+        let done = self.scalars[6u] != 0.0
+        if self.stage == 1u {
+            if !done && a > 0.0 { self.scalars[1u] = self.scalars[0u] / a } else { self.scalars[1u] = 0.0 }
+            return
+        }
+        if done {
+            self.scalars[2u] = 0.0
+            return
+        }
+        let its = self.scalars[5u] + 1.0
+        self.scalars[5u] = its
+        self.scalars[3u] = a
+        if a <= self.tolerance * self.scalars[4u] || its >= self.limit {
+            self.scalars[6u] = 1.0
+            self.scalars[2u] = 0.0
+        } else {
+            self.scalars[2u] = b / self.scalars[0u]
+            self.scalars[0u] = b
+        }
+    }
+}
+
+// u += alpha p, r -= alpha q.
+let gpu_step = {
+    label: "gpu step"
+    workgroup_size: 64
+    count: shader.uniform(u32)
+    scalars: shader.buffer(f32)
+    p: shader.buffer(vec4f)
+    q: shader.buffer(vec4f)
+    u: shader.buffer_rw(vec4f)
+    r: shader.buffer_rw(vec4f)
+    main: fn() {
+        let n = (group_id().x + group_id().y * group_count().x) * 64u + local_index()
+        if n >= self.count { return }
+        let alpha = self.scalars[1u]
+        self.u[n] = vec4(self.u[n].xyz + self.p[n].xyz * alpha, 0.0)
+        self.r[n] = vec4(self.r[n].xyz - self.q[n].xyz * alpha, 0.0)
+    }
+}
+
+// p = z + beta p (p = z where beta is 0: the start, and after convergence).
+let gpu_direction = {
+    label: "gpu direction"
+    workgroup_size: 64
+    count: shader.uniform(u32)
+    scalars: shader.buffer(f32)
+    z: shader.buffer(vec4f)
+    p: shader.buffer_rw(vec4f)
+    main: fn() {
+        let n = (group_id().x + group_id().y * group_count().x) * 64u + local_index()
+        if n >= self.count { return }
+        let beta = self.scalars[2u]
+        if beta == 0.0 {
+            self.p[n] = self.z[n]
+        } else {
+            self.p[n] = vec4(self.z[n].xyz + self.p[n].xyz * beta, 0.0)
+        }
+    }
+}
+
+// The coarsest level's exact solve on the GPU: `dense_gather`, `dense_lower`, `dense_upper` and
+// `dense_scatter` with R in f32 (R'R stays symmetric positive definite however R is rounded).
+let gpu_dense_gather = {
+    label: "gpu dense gather"
+    workgroup_size: 64
+    count: shader.uniform(u32)
+    list: shader.buffer(u32)
+    b: shader.buffer(vec4f)
+    g: shader.buffer_rw(f32)
+    main: fn() {
+        let i = (group_id().x + group_id().y * group_count().x) * 64u + local_index()
+        if i >= self.count { return }
+        let d = self.list[i]
+        let v = self.b[d / 3u]
+        let axis = d % 3u
+        var x = v.x
+        if axis == 1u { x = v.y }
+        if axis == 2u { x = v.z }
+        self.g[i] = x
+    }
+}
+
+let gpu_dense_lower = {
+    label: "gpu dense lower"
+    workgroup_size: 64
+    count: shader.uniform(u32)
+    m: shader.buffer(f32)
+    g: shader.buffer(f32)
+    y: shader.buffer_rw(f32)
+    main: fn() {
+        let i = (group_id().x + group_id().y * group_count().x) * 64u + local_index()
+        if i >= self.count { return }
+        let row = i * self.count
+        var s0 = 0.0
+        var s1 = 0.0
+        var s2 = 0.0
+        var s3 = 0.0
+        var j = 0u
+        while j + 3u <= i {
+            s0 += self.m[row + j] * self.g[j]
+            s1 += self.m[row + j + 1u] * self.g[j + 1u]
+            s2 += self.m[row + j + 2u] * self.g[j + 2u]
+            s3 += self.m[row + j + 3u] * self.g[j + 3u]
+            j += 4u
+        }
+        if j <= i { s0 += self.m[row + j] * self.g[j] }
+        if j + 1u <= i { s1 += self.m[row + j + 1u] * self.g[j + 1u] }
+        if j + 2u <= i { s2 += self.m[row + j + 2u] * self.g[j + 2u] }
+        self.y[i] = (s0 + s1) + (s2 + s3)
+    }
+}
+
+let gpu_dense_upper = {
+    label: "gpu dense upper"
+    workgroup_size: 64
+    count: shader.uniform(u32)
+    m: shader.buffer(f32)
+    y: shader.buffer(f32)
+    x: shader.buffer_rw(f32)
+    main: fn() {
+        let i = (group_id().x + group_id().y * group_count().x) * 64u + local_index()
+        if i >= self.count { return }
+        let row = i * self.count
+        var s0 = 0.0
+        var s1 = 0.0
+        var s2 = 0.0
+        var s3 = 0.0
+        var j = i
+        while j + 3u < self.count {
+            s0 += self.m[row + j] * self.y[j]
+            s1 += self.m[row + j + 1u] * self.y[j + 1u]
+            s2 += self.m[row + j + 2u] * self.y[j + 2u]
+            s3 += self.m[row + j + 3u] * self.y[j + 3u]
+            j += 4u
+        }
+        if j < self.count { s0 += self.m[row + j] * self.y[j] }
+        if j + 1u < self.count { s1 += self.m[row + j + 1u] * self.y[j + 1u] }
+        if j + 2u < self.count { s2 += self.m[row + j + 2u] * self.y[j + 2u] }
+        self.x[i] = (s0 + s1) + (s2 + s3)
+    }
+}
+
+let gpu_dense_scatter = {
+    label: "gpu dense scatter"
+    workgroup_size: 64
+    count: shader.uniform(u32)
+    place: shader.buffer(u32)
+    xs: shader.buffer(f32)
+    out: shader.buffer_rw(vec4f)
+    main: fn() {
+        let n = (group_id().x + group_id().y * group_count().x) * 64u + local_index()
+        if n >= self.count { return }
+        let p0 = self.place[n * 3u]
+        let p1 = self.place[n * 3u + 1u]
+        let p2 = self.place[n * 3u + 2u]
+        var a = 0.0
+        var b = 0.0
+        var c = 0.0
+        if p0 != 4294967295u { a = self.xs[p0] }
+        if p1 != 4294967295u { b = self.xs[p1] }
+        if p2 != 4294967295u { c = self.xs[p2] }
+        self.out[n] = vec4(a, b, c, 0.0)
+    }
+}
+
+// Workgroups for `threads` threads in groups of `size`, as rows past 65535 groups.
+let groups_of = fn(threads, size) {
+    let n = max(ceil(threads / size), 1)
+    if n <= 65535 {
+        return [n, 1, 1]
+    }
+    return [65535, ceil(n / 65535), 1]
+}
+
+// A level's nodes, from its cells per axis.
+let nodes_of = fn(n) {
+    return (n[0] + 1) * (n[1] + 1) * (n[2] + 1)
+}
+
+// Along one axis: whether a coarser level halves it (more than two cells), and its cells there.
+let halves = fn(cells) {
+    if cells > 2 {
+        return 1
+    }
+    return 0
+}
+let halved_to = fn(cells) {
+    if cells > 2 {
+        return ceil(cells / 2)
+    }
+    return cells
+}
+
+// The GPU memory the GPU engine takes (bytes) for the first `count` of `levels` with `points`
+// cells integrated point by point and `materials` materials.
+let gpu_bytes = fn(levels, count, points, materials) {
+    var total = 80 * levels[0].nodes + 4096 + 64
+    for l in 0..count {
+        let d = levels[l]
+        let n = d.nodes
+        let extra = if l == 0 { points } else { 0 }
+        total = total + 16 * d.active + 4 * d.n[0] * d.n[1] * d.n[2] + n + 24 * n + 1200 * (d.nshared + extra) + 96 * d.active + 48 * n
+    }
+    if points > 0 {
+        total = total + 80 * points + 192 * materials + 1024
+    }
+    // the coarsest level's factor (f32), its maps and its three vectors, at most every degree of
+    // freedom factored
+    let dofs = 3 * levels[count - 1].nodes
+    return total + 4 * dofs * dofs + 20 * dofs
+}
+
+// The largest one buffer the GPU engine takes (bytes), of the same: the device binds no buffer
+// past its own limit (Metal's `maxBufferLength`, Vulkan's `maxStorageBufferRange`).
+let gpu_largest = fn(levels, count, points, materials) {
+    let dofs = 3 * levels[count - 1].nodes
+    var largest = max(4 * dofs * dofs, 32 * points + 4)
+    largest = max(largest, 192 * materials + 4)
+    for l in 0..count {
+        let d = levels[l]
+        let extra = if l == 0 { points } else { 0 }
+        largest = max(largest, max(1200 * max(d.nshared + extra, 1), 96 * max(d.active, 1)))
+        largest = max(largest, max(24 * d.nodes, 4 * d.n[0] * d.n[1] * d.n[2] + 4))
+    }
+    return largest
+}
+
+{run: fn(s, p) {
+    let points = p.points
+    let vector = fn(nodes) {
+        return {x: s.buffer(@f64, nodes), y: s.buffer(@f64, nodes), z: s.buffer(@f64, nodes)}
+    }
+    let knob = s.buffer(@f64, 1)
+    s.write(knob, [p.omega])
+    // Kernel params narrow to f32, so the CPU kernels take these four values in an f64 buffer.
+    let h_gp = [p.h[0], p.h[1], p.h[2], p.gp]
+    let geometry = s.buffer(@f64, 4)
+    s.write(geometry, h_gp)
+    let dn = s.input("dn")
+    let pxi = s.input("pxi")
+    let pnode = s.input("pnode")
+    let gpd = s.input("gpd")
+    let gpw = s.input("gpw")
+    let ds = s.input("ds")
+    let cf = s.buffer(@f64, points * 24 + 1)
+    let full = fn(packed, matrices) {
+        let out = s.buffer(@f64, matrices * 576 + 1)
+        if matrices > 0 {
+            s.run(unpack, matrices * 576, {}, {packed: packed, full: out})
+        }
+        return out
+    }
+    // the levels' shapes, finest first (`fab_force::solve::Hierarchy::new`): each coarser one
+    // halves the axes with more than two cells, down to one of at most p.coarsest_nodes nodes
+    var shapes = [{n: p.n, halved: [0, 0, 0]}]
+    var count = 1
+    loop {
+        let n = shapes[count - 1].n
+        if p.active == 0 || nodes_of(n) <= p.coarsest_nodes || (n[0] <= 2 && n[1] <= 2 && n[2] <= 2) {
+            break
+        }
+        shapes.push({n: [halved_to(n[0]), halved_to(n[1]), halved_to(n[2])], halved: [halves(n[0]), halves(n[1]), halves(n[2])]})
+        count = count + 1
+    }
+    // the analysed level as sent (its shared matrices unpacked); each coarser one recalled where
+    // the node kept it for a session made from the same (an edit that left the model and its
+    // held nodes alone, a load moved), else built from the one finer and kept. A level's
+    // matrices are full (576 values a matrix).
+    var levels = [{
+        n: p.n, halved: [0, 0, 0], nodes: nodes_of(p.n), nshared: p.nshared, active: p.active,
+        held: s.input("held"), cell: s.input("cell"), mats: full(s.input("mats"), p.nshared), built: false
+    }]
+    let from = ["held", "cell", "mats", "gpd", "gpw", "ds", "dn", "pxi"]
+    let with = [p.n[0], p.n[1], p.n[2], p.coarsest_nodes, p.h[0], p.h[1], p.h[2], p.gp]
+    // level l's matrices (shape `sh`) by the Galerkin product of the finer level f's: the
+    // children's matrices, the analysed level's every cell (its cells integrated point by point
+    // assembled), else the finer level's. Its slot map made here where `cell` is nil (with the
+    // count of its matrices, read), else the level's own with its `matrices`, as the f64 finish
+    // takes them when it makes a level's matrices again. {cell, mats}; nil where the session
+    // stopped.
+    let galerkin_of = fn(l, f, sh, cell, matrices) {
+        let analysed = l == 1
+        var kids = f.mats
+        if analysed {
+            let all = f.nshared + points
+            kids = s.buffer(@f64, all * 576)
+            s.run(cell_k, all * 24, {nshared: f.nshared}, {shared: f.mats, gpd: gpd, gpw: gpw, ds: ds, dn: dn, pxi: pxi, geometry: geometry, k: kids})
+        }
+        // the coarse cells with children, a matrix each in cell order
+        let nc = sh.n[0] * sh.n[1] * sh.n[2]
+        let own = s.buffer(i32, nc)
+        s.run(occupied, nc, {
+            fx: f.n[0], fy: f.n[1], fz: f.n[2], cx: sh.n[0], cy: sh.n[1], hx: sh.halved[0], hy: sh.halved[1], hz: sh.halved[2]
+        }, {cell: f.cell, own: own})
+        let flags = s.buffer(i32, nc)
+        s.run(stiff, nc, {}, {cell: own, flag: flags})
+        let rank = s.buffer(i32, nc + 1)
+        s.scan(flags, rank)
+        s.free(flags)
+        var slot = cell
+        var made = matrices
+        if slot == nil {
+            let total = s.read(rank, nc, 1)
+            if total == nil {
+                return nil
+            }
+            made = total[0]
+            slot = s.buffer(i32, nc)
+            s.run(slotted, nc, {}, {cell: own, rank: rank, slot: slot})
+        }
+        let list = s.buffer(i32, 4 * made)
+        s.run(listed, nc, {nx: sh.n[0], ny: sh.n[1]}, {cell: slot, rank: rank, list: list})
+        s.free(own)
+        s.free(rank)
+        let mats = s.buffer(@f64, 576 * made)
+        s.run(galerkin, 24 * made, {
+            fx: f.n[0], fy: f.n[1], fz: f.n[2], hx: sh.halved[0], hy: sh.halved[1], hz: sh.halved[2]
+        }, {list: list, cell: f.cell, held: f.held, mats: kids, out: mats})
+        s.free(list)
+        if analysed {
+            s.free(kids)
+        }
+        return {cell: slot, mats: mats}
+    }
+    for l in 1..count {
+        let sh = shapes[l]
+        let nodes = nodes_of(sh.n)
+        var cell = s.recall("cell" + l, i32, from, with)
+        var held = s.recall("held" + l, i32, from, with)
+        var mats = s.recall("mats" + l, @f64, from, with)
+        // kept words are read-only: what the session builds itself it may free
+        let built = cell == nil || held == nil || mats == nil
+        if built {
+            let made = galerkin_of(l, levels[l - 1], sh, nil, 0)
+            if made == nil {
+                return nil
+            }
+            cell = made.cell
+            mats = made.mats
+            held = s.buffer(i32, nodes)
+            s.run(coarse_held, nodes, {nx: sh.n[0], ny: sh.n[1], nz: sh.n[2]}, {cell: cell, mats: mats, held: held})
+            s.remember("cell" + l, cell, from, with)
+            s.remember("held" + l, held, from, with)
+            s.remember("mats" + l, mats, from, with)
+        }
+        let matrices = mats.len / 576
+        levels.push({n: sh.n, halved: sh.halved, nodes: nodes, nshared: matrices, active: matrices, held: held, cell: cell, mats: mats, built: built})
+    }
+    // the engine: the GPU's where the device has a GPU that holds the solve
+    let gpu = s.device().gpu
+    let gpu_need = gpu_bytes(levels, count, points, ds.len / 36)
+    let gpu_one = gpu_largest(levels, count, points, ds.len / 36)
+    // (a hub that does not say its largest buffer is held to its budget alone)
+    let on_gpu = gpu != nil && gpu_need <= gpu.buffer_bytes && (gpu.max_buffer_bytes == nil || gpu_one <= gpu.max_buffer_bytes)
+    // the coarsest level's exact solve (`fab_force::solve::Dense`): its free degrees of freedom
+    // (list: by place, their count last; place: each degree of freedom's, -1 where not free) and
+    // its inverse factor in f64. Recalled where the node kept them with the levels, else factored
+    // here and kept. Both engines' V-cycles take it (the GPU's narrowed to f32), and the GPU
+    // engine's f64 finish past its f32 floor.
+    let coarsest = levels[count - 1]
+    let dofs = 3 * coarsest.nodes
+    var dlist = s.recall("dense list", i32, from, with)
+    var dplace = s.recall("dense place", i32, from, with)
+    var dm = s.recall("dense m", @f64, from, with)
+    let factored = dlist == nil || dplace == nil || dm == nil
+    // what this session factored: {size, dropped}
+    var factor = nil
+    if factored {
+        let geo = {nx: coarsest.n[0], ny: coarsest.n[1], nz: coarsest.n[2]}
+        // the analysed level's cells integrated point by point have no matrix of their own yet
+        var mats = coarsest.mats
+        let assembled = count == 1 && points > 0
+        if assembled {
+            let all = coarsest.nshared + points
+            mats = s.buffer(@f64, all * 576)
+            s.run(cell_k, all * 24, {nshared: coarsest.nshared}, {shared: coarsest.mats, gpd: gpd, gpw: gpw, ds: ds, dn: dn, pxi: pxi, geometry: geometry, k: mats})
+        }
+        let flag = s.buffer(i32, dofs)
+        s.run(dense_free, dofs, geo, {held: coarsest.held, cell: coarsest.cell, mats: mats, flag: flag})
+        let rank = s.buffer(i32, dofs + 1)
+        s.scan(flag, rank)
+        let total = s.read(rank, dofs, 1)
+        if total == nil {
+            return nil
+        }
+        let size = total[0]
+        dplace = s.buffer(i32, dofs)
+        s.run(dense_place, dofs, {}, {flag: flag, rank: rank, place: dplace})
+        s.free(flag)
+        s.free(rank)
+        dlist = s.buffer(i32, size + 1)
+        s.run(dense_list, dofs, {}, {place: dplace, list: dlist})
+        let m = s.buffer(@f64, max(size * size, 1))
+        var dropped = 0
+        if size > 0 {
+            let dim = {n: size}
+            let a = s.buffer(@f64, size * size)
+            s.run(dense_entry, size * size, {n: size, nx: geo.nx, ny: geo.ny, nz: geo.nz}, {list: dlist, cell: coarsest.cell, mats: mats, a: a})
+            let d0 = s.buffer(@f64, size)
+            s.run(dense_diag, size, dim, {a: a, d: d0})
+            let blk = s.buffer(@f64, 1025)
+            let rd = s.buffer(@f64, ceil(size / 32) * 1024)
+            let panel = s.buffer(@f64, size * 32)
+            var j0 = 0
+            loop {
+                if j0 >= size {
+                    break
+                }
+                let at = {n: size, j0: j0, j1: min(j0 + 32, size)}
+                s.run(dense_block, 1, at, {a: a, d0: d0, blk: blk})
+                s.run(dense_block_inverse, 1, {j0: at.j0, j1: at.j1}, {blk: blk, rd: rd})
+                s.run(dense_panel, size * 32, at, {a: a, blk: blk, rd: rd, p: panel})
+                s.run(dense_update, size * size, at, {p: panel, a: a})
+                j0 = at.j1
+            }
+            let drops = s.read(blk, 1024, 1)
+            if drops == nil {
+                return nil
+            }
+            dropped = drops[0]
+            s.free(d0)
+            s.free(blk)
+            s.free(panel)
+            s.run(dense_identity, size * size, dim, {m: m})
+            let block_rows = s.buffer(@f64, 32 * size)
+            var i0 = 0
+            loop {
+                if i0 >= size {
+                    break
+                }
+                let at = {n: size, i0: i0, i1: min(i0 + 32, size)}
+                s.run(dense_rows, 32 * size, at, {rd: rd, m: m, q: block_rows})
+                s.run(dense_rows_update, size * size, at, {a: a, q: block_rows, m: m})
+                i0 = at.i1
+            }
+            s.free(rd)
+            s.free(a)
+            s.free(block_rows)
+        }
+        if assembled {
+            s.free(mats)
+        }
+        dm = m
+        factor = {size: size, dropped: dropped}
+        s.remember("dense list", dlist, from, with)
+        s.remember("dense place", dplace, from, with)
+        s.remember("dense m", dm, from, with)
+    }
+    let dense_size = dlist.len - 1
+    // a level's inverse diagonal blocks
+    let diag_of = fn(d) {
+        let dinv = s.buffer(@f64, d.nodes * 9)
+        s.run(diag, d.nodes, {nx: d.n[0], ny: d.n[1], nz: d.n[2], nshared: d.nshared}, {
+            cell: d.cell, mats: d.mats, gpd: gpd, gpw: gpw, ds: ds, dn: dn, pxi: pxi, geometry: geometry, held: d.held, dinv: dinv
+        })
+        return dinv
+    }
+    // a level for the CPU engine's V-cycle; its smoother's (dinv, b, x, r) with `smoother`: the
+    // CPU engine's from the start, the GPU engine's (whose layout has its own) made when its f64
+    // finish first needs them
+    let cpu_level = fn(d, smoother) {
+        let nodes = d.nodes
+        return {
+            n: d.n, nodes: nodes, nshared: d.nshared, active: d.active, halved: d.halved,
+            held: d.held, cell: d.cell, mats: d.mats, built: d.built,
+            dinv: if smoother { diag_of(d) } else { nil },
+            b: if smoother { vector(nodes) } else { nil },
+            x: if smoother { vector(nodes) } else { nil },
+            r: if smoother { vector(nodes) } else { nil }
+        }
+    }
+    var lv = []
+    for l in 0..count {
+        lv.push(cpu_level(levels[l], !on_gpu))
+    }
+
+    // y = A x (mode 0) or b - A x (mode 1) on level l
+    let apply_on = fn(l, mode, x, b, y) {
+        let v = lv[l]
+        if l == 0 && points > 0 {
+            s.run(cell_force, points, {nx: v.n[0], ny: v.n[1]}, {
+                x0: x.x, x1: x.y, x2: x.z, pnode: pnode, gpd: gpd, gpw: gpw, ds: ds, dn: dn, pxi: pxi, geometry: geometry, cf: cf
+            })
+        }
+        s.run(apply, v.nodes, {nx: v.n[0], ny: v.n[1], nz: v.n[2], nshared: v.nshared, mode: mode}, {
+            x0: x.x, x1: x.y, x2: x.z, b0: b.x, b1: b.y, b2: b.z, cell: v.cell, mats: v.mats,
+            cf: cf, held: v.held, y0: y.x, y1: y.y, y2: y.z
+        })
+    }
+    let jacobi_on = fn(l, r, x, rest) {
+        let v = lv[l]
+        s.run(jacobi, v.nodes, {rest: rest}, {r0: r.x, r1: r.y, r2: r.z, dinv: v.dinv, knob: knob, x0: x.x, x1: x.y, x2: x.z})
+    }
+    // `sweeps` damped Jacobi sweeps from rest
+    let smooth = fn(l, b, x, sweeps) {
+        let v = lv[l]
+        if sweeps == 0 {
+            s.run(zero, v.nodes, {}, {x0: x.x, x1: x.y, x2: x.z})
+        } else {
+            jacobi_on(l, b, x, 1)
+        }
+        for k in 1..sweeps {
+            apply_on(l, 1, x, b, v.r)
+            jacobi_on(l, v.r, x, 0)
+        }
+    }
+    // the coarsest level: x = A^-1 b on its free degrees of freedom (zero elsewhere)
+    let dense_g = s.buffer(@f64, max(dense_size, 1))
+    let dense_y = s.buffer(@f64, max(dense_size, 1))
+    let dense_x = s.buffer(@f64, max(dense_size, 1))
+    let exact = fn(b, x) {
+        if dense_size == 0 {
+            s.run(zero, coarsest.nodes, {}, {x0: x.x, x1: x.y, x2: x.z})
+        } else {
+            let dim = {n: dense_size}
+            s.run(dense_gather, dense_size, {}, {list: dlist, b0: b.x, b1: b.y, b2: b.z, g: dense_g})
+            s.run(dense_lower, dense_size, dim, {m: dm, g: dense_g, y: dense_y})
+            s.run(dense_upper, dense_size, dim, {m: dm, y: dense_y, x: dense_x})
+            s.run(dense_scatter, coarsest.nodes, {}, {place: dplace, xs: dense_x, x0: x.x, x1: x.y, x2: x.z})
+        }
+    }
+    // x approximates A^-1 b by one V-cycle (level 0's b and x are CG's r and z)
+    let vcycle = fn(b0, x0) {
+        let last = count - 1
+        for l in 0..last {
+            let v = lv[l]
+            let b = if l == 0 { b0 } else { v.b }
+            let x = if l == 0 { x0 } else { v.x }
+            smooth(l, b, x, p.smooth)
+            apply_on(l, 1, x, b, v.r)
+            let c = lv[l + 1]
+            s.run(restrict, c.nodes, {fx: v.n[0] + 1, fy: v.n[1] + 1, fz: v.n[2] + 1, cx: c.n[0] + 1, cy: c.n[1] + 1, hx: c.halved[0], hy: c.halved[1], hz: c.halved[2]}, {
+                f0: v.r.x, f1: v.r.y, f2: v.r.z, held: c.held, c0: c.b.x, c1: c.b.y, c2: c.b.z
+            })
+        }
+        let vc = lv[last]
+        exact(if last == 0 { b0 } else { vc.b }, if last == 0 { x0 } else { vc.x })
+        var l = last - 1
+        loop {
+            if l < 0 {
+                break
+            }
+            let v = lv[l]
+            let c = lv[l + 1]
+            let b = if l == 0 { b0 } else { v.b }
+            let x = if l == 0 { x0 } else { v.x }
+            s.run(prolong, v.nodes, {fx: v.n[0] + 1, fy: v.n[1] + 1, cx: c.n[0] + 1, cy: c.n[1] + 1, cz: c.n[2] + 1, hx: c.halved[0], hy: c.halved[1], hz: c.halved[2]}, {
+                c0: c.x.x, c1: c.x.y, c2: c.x.z, held: v.held, f0: x.x, f1: x.y, f2: x.z
+            })
+            for k in 0..p.smooth {
+                apply_on(l, 1, x, b, v.r)
+                jacobi_on(l, v.r, x, 0)
+            }
+            l = l - 1
+        }
+    }
+
+    let v0 = lv[0]
+    let nodes = v0.nodes
+    let f = vector(nodes)
+    let rhs = vector(nodes)
+    let u = vector(nodes)
+    let r = vector(nodes)
+    let q = vector(nodes)
+    let sc = s.buffer(@f64, 8)
+    let part = s.buffer(@f64, p.parts)
+    let dot = fn(a, b, slot) {
+        s.run(dot_part, p.parts, {n: nodes}, {a0: a.x, a1: a.y, a2: a.z, b0: b.x, b1: b.y, b2: b.z, part: part})
+        s.run(dot_finish, 1, {m: p.parts, slot: slot}, {part: part, sc: sc})
+    }
+    let copy = fn(from, to) {
+        s.copy(from.x, to.x)
+        s.copy(from.y, to.y)
+        s.copy(from.z, to.z)
+    }
+    let free_vector = fn(v) {
+        s.free(v.x)
+        s.free(v.y)
+        s.free(v.z)
+    }
+    let out = s.buffer(@f64, nodes * 3)
+    // the CPU engine's preconditioned residual and direction, made for the first side it solves
+    var z = nil
+    var dir = nil
+    // the block's right-hand sides in turn, on the levels (and the GPU engine's copies) set up
+    // once: side k's loaded nodes p.loads[k], one side's after another's in fnode and fval; its
+    // answer published as "u" + k
+    var solves = []
+    var engine = nil
+    // the coarse levels' f64 matrices this session made went once the GPU engine packed its own
+    // (f32): the f64 finish recalls or makes them again ([`galerkin_of`]), the levels it made
+    var freed = false
+    var remade = 0
+    // a GPU run's correction, widened (made with the GPU engine)
+    var cv = nil
+    // the GPU engine's run (`g_run` below), made for the first side it solves with the rest of
+    // its setup
+    var g_run = nil
+    // its buffers freed (`g_free` below), once the last side no longer runs it
+    var g_free = nil
+    var entry = 0
+    let sides = p.loads.len()
+    for side in 0..sides {
+        let loaded = p.loads[side]
+        if side > 0 {
+            s.run(zero, nodes, {}, {x0: f.x, x1: f.y, x2: f.z})
+        }
+        if loaded > 0 {
+            s.run(load, loaded, {start: entry}, {fnode: s.input("fnode"), fval: s.input("fval"), f0: f.x, f1: f.y, f2: f.z})
+        }
+        entry = entry + loaded
+        s.run(masked, nodes, {}, {f0: f.x, f1: f.y, f2: f.z, held: v0.held, b0: rhs.x, b1: rhs.y, b2: rhs.z})
+        if p.guess > 0 {
+            // from the guess as `fab_force::solve::start` starts: sc[5] = u.Au, sc[6] = u.b
+            s.run(spread, nodes, {}, {g: s.input("guess"), x0: u.x, x1: u.y, x2: u.z})
+            apply_on(0, 0, u, rhs, q)
+            dot(u, q, 5)
+            dot(u, rhs, 6)
+            s.run(cg_start, nodes, {}, {sc: sc, q0: q.x, q1: q.y, q2: q.z, b0: rhs.x, b1: rhs.y, b2: rhs.z, u0: u.x, u1: u.y, u2: u.z, r0: r.x, r1: r.y, r2: r.z})
+        } else {
+            s.run(zero, nodes, {}, {x0: u.x, x1: u.y, x2: u.z})
+            copy(rhs, r)
+        }
+        dot(r, r, 3)
+        dot(rhs, rhs, 4)
+        let first = s.read(sc, 3, 2)
+        if first == nil {
+            return nil
+        }
+        let bb = first[1]
+        let stop = p.tol * p.tol * bb
+        var rr = first[0]
+        var its = 0
+        s.value("cg", {its: its, rr: rr, bb: bb})
+        // where the GPU engine reached its f32 floor: rr / bb there
+        var floor = nil
+        if rr > stop && on_gpu {
+            // ---- On the GPU: f32 runs of the CG, each solving the defect r of the answer so far,
+            // corrected here in f64 (`fab_force::gpu::Refine`) ------------------------------------
+            if engine == nil {
+                let g = {device: "gpu"}
+                // iterations a batch: about one of gpu.rs's 8 ms passes on a mid-size study
+                let gpu_batch = 2
+                // a CPU buffer's words on the GPU (the CPU's copy goes, unless the node keeps it)
+                let up = fn(cpu, owned) {
+                    let b = s.buffer(u32, cpu.len, g)
+                    s.copy(cpu, b)
+                    if owned {
+                        s.free(cpu)
+                    }
+                    return b
+                }
+                // each level as `fab_force::gpu::Upload` lays it out: its cells with stiffness listed,
+                // each cell's place in the list, its matrices packed in f32 (the analysed level's shared
+                // ones: its cells integrated point by point are assembled on the GPU), its held axes and
+                // its inverse diagonal blocks. Recalled where the node kept them for a session made from
+                // the same, else made here (from the level's diagonal) and kept.
+                var gl = []
+                // the finer level's rigid axes a cell (`rigid_of`)
+                var rigid_fine = nil
+                for l in 0..count {
+                    let v = lv[l]
+                    let nc = v.n[0] * v.n[1] * v.n[2]
+                    let rigid = s.buffer(i32, nc)
+                    if l == 0 {
+                        s.run(rigid_of, nc, {nx: v.n[0], ny: v.n[1], fx: 1, fy: 1, fz: 1, hx: 0, hy: 0, hz: 0, finest: 1}, {cell: v.cell, fine_cell: v.cell, fine_held: v.held, fine_rigid: v.cell, rigid: rigid})
+                    } else {
+                        let fv = lv[l - 1]
+                        s.run(rigid_of, nc, {nx: v.n[0], ny: v.n[1], fx: fv.n[0], fy: fv.n[1], fz: fv.n[2], hx: v.halved[0], hy: v.halved[1], hz: v.halved[2], finest: 0}, {cell: v.cell, fine_cell: fv.cell, fine_held: fv.held, fine_rigid: rigid_fine, rigid: rigid})
+                        s.free(rigid_fine)
+                    }
+                    rigid_fine = rigid
+                    var list = s.recall("gpu list" + l, i32, from, with)
+                    var slots = s.recall("gpu slots" + l, i32, from, with)
+                    var mats = s.recall("gpu mats" + l, f32, from, with)
+                    var held = s.recall("gpu held" + l, i32, from, with)
+                    var dinv = s.recall("gpu dinv" + l, f32, from, with)
+                    let made = list == nil || slots == nil || mats == nil || held == nil || dinv == nil
+                    if made {
+                        let flags = s.buffer(i32, nc)
+                        s.run(stiff, nc, {}, {cell: v.cell, flag: flags})
+                        let rank = s.buffer(i32, nc + 1)
+                        s.scan(flags, rank)
+                        s.free(flags)
+                        slots = s.buffer(i32, nc)
+                        s.run(slotted, nc, {}, {cell: v.cell, rank: rank, slot: slots})
+                        list = s.buffer(i32, 4 * max(v.active, 1))
+                        s.run(gpu_listed, nc, {nx: v.n[0], ny: v.n[1]}, {cell: v.cell, rank: rank, rigid: rigid, list: list})
+                        s.free(rank)
+                        mats = s.buffer(f32, 300 * max(v.nshared, 1))
+                        if v.nshared > 0 {
+                            s.run(narrow_packed, 300 * v.nshared, {}, {full: v.mats, b: mats})
+                        }
+                        held = s.buffer(i32, ceil(v.nodes / 4))
+                        s.run(held_bytes, held.len, {}, {held: v.held, out: held})
+                        let d = diag_of(v)
+                        dinv = s.buffer(f32, 6 * v.nodes)
+                        s.run(dinv6, v.nodes, {}, {dinv: d, d6: dinv})
+                        s.free(d)
+                        s.remember("gpu list" + l, list, from, with)
+                        s.remember("gpu slots" + l, slots, from, with)
+                        s.remember("gpu mats" + l, mats, from, with)
+                        s.remember("gpu held" + l, held, from, with)
+                        s.remember("gpu dinv" + l, dinv, from, with)
+                    }
+                    let extra = if l == 0 { points } else { 0 }
+                    gl.push({
+                        nodes: [v.n[0] + 1, v.n[1] + 1, v.n[2] + 1, v.nodes],
+                        cells: [v.n[0], v.n[1], v.n[2], v.active],
+                        halved: [v.halved[0], v.halved[1], v.halved[2], 0],
+                        list: up(list, made), slots: up(slots, made), held: up(held, made), dinv: up(dinv, made),
+                        // with cells integrated point by point, their matrices after the shared ones
+                        // (`gpu_assemble` writes them all)
+                        mats: if extra > 0 { s.buffer(f32, 300 * (v.nshared + extra), g) } else { up(mats, made) },
+                        shared: if extra > 0 { up(mats, made) } else { nil },
+                        cf: s.buffer(f32, 24 * max(v.active, 1), g),
+                        x: if l == 0 { nil } else { s.buffer(vec4, v.nodes, g) },
+                        b: if l == 0 { nil } else { s.buffer(vec4, v.nodes, g) },
+                        res: s.buffer(vec4, v.nodes, g)
+                    })
+                }
+                // the coarse levels' f64 matrices: the GPU has its own now, and only the f64
+                // finish past the f32 floor reads them again (it recalls or makes them). What a
+                // node keeps stays kept; recalled words are read-only and stay bound.
+                for l in 1..count {
+                    if levels[l].built {
+                        s.free(levels[l].mats)
+                    }
+                }
+                freed = true
+                // the analysed level's cells integrated point by point: their matrices assembled there
+                if points > 0 {
+                    let at = s.buffer(u32, gpd.len, g)
+                    s.copy(gpd, at)
+                    let weights = s.buffer(f32, 8 * points)
+                    s.run(narrow, 8 * points, {}, {a: gpw, b: weights})
+                    let materials = s.buffer(f32, 48 * (ds.len / 36))
+                    s.run(rows, materials.len, {}, {ds: ds, out: materials})
+                    let grads = s.buffer(f32, 256)
+                    s.run(grads4, 256, {}, {dn: dn, out: grads})
+                    let offsets = s.buffer(f32, 4 * points)
+                    s.run(offsets4, 4 * points, {}, {pxi: pxi, out: offsets})
+                    let bound = {shared: gl[0].shared, points: at, weights: up(weights, true), materials: up(materials, true), grads: up(grads, true), offsets: up(offsets, true), mats: gl[0].mats}
+                    s.dispatch(gpu_assemble, groups_of(300 * (lv[0].nshared + points), 64), {count: [points, lv[0].nshared, 0, 0], geometry: h_gp}, bound)
+                    s.free(bound.shared)
+                    s.free(bound.points)
+                    s.free(bound.weights)
+                    s.free(bound.materials)
+                    s.free(bound.grads)
+                    s.free(bound.offsets)
+                }
+                let gu = s.buffer(vec4, nodes, g)
+                let gr = s.buffer(vec4, nodes, g)
+                let gp = s.buffer(vec4, nodes, g)
+                let gq = s.buffer(vec4, nodes, g)
+                let gz = s.buffer(vec4, nodes, g)
+                let partials = s.buffer(vec4, 256, g)
+                let scalars = s.buffer(f32, 8, g)
+                // a vector on its way to the GPU (the defect) and back (the run's correction)
+                let staged = s.buffer(f32, 4 * nodes)
+
+                // `fab_force::gpu`'s Recorder
+                let cells_on = fn(lev, x) {
+                    s.dispatch(gpu_cells, groups_of(lev.cells[3], 4), {nodes: lev.nodes, cells_n: lev.cells}, {cells: lev.list, mats: lev.mats, x: x, cf: lev.cf})
+                }
+                let node_groups = fn(lev) {
+                    return groups_of(lev.nodes[3], 64)
+                }
+                let g_apply = fn(lev, x, out) {
+                    cells_on(lev, x)
+                    s.dispatch(gpu_apply, node_groups(lev), {nodes: lev.nodes, cells_n: lev.cells}, {cf: lev.cf, slots: lev.slots, held: lev.held, out: out})
+                }
+                let g_residual = fn(lev, x, b, out) {
+                    cells_on(lev, x)
+                    s.dispatch(gpu_residual, node_groups(lev), {nodes: lev.nodes, cells_n: lev.cells}, {cf: lev.cf, slots: lev.slots, held: lev.held, b: b, out: out})
+                }
+                let g_smooth = fn(lev, x, b) {
+                    cells_on(lev, x)
+                    s.dispatch(gpu_smooth, node_groups(lev), {nodes: lev.nodes, cells_n: lev.cells, omega: p.omega}, {cf: lev.cf, slots: lev.slots, held: lev.held, dinv: lev.dinv, b: b, x: x})
+                }
+                let g_rest = fn(lev, x, b) {
+                    s.dispatch(gpu_rest, node_groups(lev), {nodes: lev.nodes, omega: p.omega}, {dinv: lev.dinv, b: b, x: x})
+                }
+                // the coarsest level's exact solve: R narrowed to f32 for the device, its f64 R and
+                // maps kept here for the f64 finish
+                let dm32 = s.buffer(f32, dm.len)
+                s.run(narrow, dm.len, {}, {a: dm, b: dm32})
+                let gd = {
+                    list: up(dlist, false), place: up(dplace, false), m: up(dm32, true),
+                    g: s.buffer(f32, max(dense_size, 1), g), y: s.buffer(f32, max(dense_size, 1), g), x: s.buffer(f32, max(dense_size, 1), g)
+                }
+                let g_exact = fn(b, x) {
+                    if dense_size == 0 {
+                        s.fill(x, 0)
+                    } else {
+                        let dense_groups = groups_of(dense_size, 64)
+                        s.dispatch(gpu_dense_gather, dense_groups, {count: dense_size}, {list: gd.list, b: b, g: gd.g})
+                        s.dispatch(gpu_dense_lower, dense_groups, {count: dense_size}, {m: gd.m, g: gd.g, y: gd.y})
+                        s.dispatch(gpu_dense_upper, dense_groups, {count: dense_size}, {m: gd.m, y: gd.y, x: gd.x})
+                        s.dispatch(gpu_dense_scatter, groups_of(coarsest.nodes, 64), {count: coarsest.nodes}, {place: gd.place, xs: gd.x, out: x})
+                    }
+                }
+                let transfer = fn(fine, coarse) {
+                    return {fine: fine.nodes, coarse: coarse.nodes, halved: coarse.halved}
+                }
+                // one V-cycle: x approximates A^-1 b (x from rest)
+                let g_vcycle = fn(b0, x0) {
+                    let last = count - 1
+                    for l in 0..last {
+                        let lev = gl[l]
+                        let b = if l == 0 { b0 } else { lev.b }
+                        let x = if l == 0 { x0 } else { lev.x }
+                        g_rest(lev, x, b)
+                        for k in 1..p.smooth {
+                            g_smooth(lev, x, b)
+                        }
+                        g_residual(lev, x, b, lev.res)
+                        let coarse = gl[l + 1]
+                        s.dispatch(gpu_restrict, groups_of(coarse.nodes[3], 64), transfer(lev, coarse), {held: coarse.held, rf: lev.res, rc: coarse.b})
+                    }
+                    let lc = gl[last]
+                    let bc = if last == 0 { b0 } else { lc.b }
+                    let xc = if last == 0 { x0 } else { lc.x }
+                    g_exact(bc, xc)
+                    var l = last - 1
+                    loop {
+                        if l < 0 {
+                            break
+                        }
+                        let lev = gl[l]
+                        let coarse = gl[l + 1]
+                        let b = if l == 0 { b0 } else { lev.b }
+                        let x = if l == 0 { x0 } else { lev.x }
+                        s.dispatch(gpu_prolong, node_groups(lev), transfer(lev, coarse), {held: lev.held, xc: coarse.x, xf: x})
+                        for k in 0..p.smooth {
+                            g_smooth(lev, x, b)
+                        }
+                        l = l - 1
+                    }
+                }
+                let dot_groups = clamp(ceil(nodes / 256), 1, 256)
+                let g_dot = fn(a, b, c, stage, limit) {
+                    s.dispatch(gpu_dot, [dot_groups, 1, 1], {count: nodes}, {a: a, b: b, c: c, partials: partials})
+                    s.dispatch(gpu_scalars, [1, 1, 1], {groups: dot_groups, stage: stage, tolerance: p.inner * p.inner, limit: limit}, {partials: partials, scalars: scalars})
+                }
+                let g_direction = fn() {
+                    s.dispatch(gpu_direction, groups_of(nodes, 64), {count: nodes}, {scalars: scalars, z: gz, p: gp})
+                }
+                // A c = r from rest to the run's tolerance in at most `limit` iterations, sent
+                // `gpu_batch` at a time: the program reads the scalars after one batch while the device
+                // runs the next (gpu.rs's two passes in flight), and stops sending once a read says the
+                // run converged (its further iterations change nothing); u += c. Told as `its`
+                // iterations and r.r `rr0` before it. Its iterations, those sent and the scalars'
+                // reads, or nil where the session stopped.
+                g_run = fn(limit, its0, rr0, bb0) {
+                    s.run(pack4, nodes, {}, {x0: r.x, x1: r.y, x2: r.z, v4: staged})
+                    s.copy(staged, gr)
+                    s.fill(gu, 0)
+                    g_vcycle(gr, gz)
+                    g_dot(gr, gr, gz, 0, limit)
+                    g_direction()
+                    var sent = 0
+                    var reads = 0
+                    var done = 0
+                    // r.r over its start, the run's last scalars'
+                    var ratio = 1.0
+                    // the batch on the device whose scalars are read next
+                    var ahead = nil
+                    loop {
+                        // the next batch, and its scalars fetched: 3 r.r, 4 b.b, 5 iterations, 6 converged
+                        var next = nil
+                        if sent < limit {
+                            for i in 0..min(gpu_batch, limit - sent) {
+                                g_apply(gl[0], gp, gq)
+                                g_dot(gp, gq, gq, 1, limit)
+                                s.dispatch(gpu_step, groups_of(nodes, 64), {count: nodes}, {scalars: scalars, p: gp, q: gq, u: gu, r: gr})
+                                g_vcycle(gr, gz)
+                                g_dot(gr, gr, gz, 2, limit)
+                                g_direction()
+                                s.flush()
+                                sent = sent + 1
+                            }
+                            next = s.fetch(scalars, 3, 4)
+                        }
+                        if ahead != nil {
+                            let now = s.take(ahead)
+                            if now == nil {
+                                return nil
+                            }
+                            reads = reads + 1
+                            done = now[2]
+                            ratio = now[0] / now[1]
+                            s.value("cg", {its: its0 + done, rr: rr0 * now[0] / now[1], bb: bb0})
+                            if now[3] != 0 || next == nil {
+                                if next != nil {
+                                    s.take(next)
+                                }
+                                break
+                            }
+                        }
+                        if next == nil {
+                            break
+                        }
+                        ahead = next
+                    }
+                    s.copy(gu, staged)
+                    s.run(add4, nodes, {}, {c: staged, u0: u.x, u1: u.y, u2: u.z, c0: cv.x, c1: cv.y, c2: cv.z})
+                    return {its: done, sent: sent, reads: reads, ratio: ratio}
+                }
+                // a run's correction, widened (the potential's change over the run)
+                cv = vector(nodes)
+                g_free = fn() {
+                    for l in 0..count {
+                        let lev = gl[l]
+                        s.free(lev.list)
+                        s.free(lev.slots)
+                        s.free(lev.held)
+                        s.free(lev.dinv)
+                        s.free(lev.mats)
+                        s.free(lev.cf)
+                        if lev.x != nil {
+                            s.free(lev.x)
+                            s.free(lev.b)
+                        }
+                        s.free(lev.res)
+                    }
+                    s.free(rigid_fine)
+                    s.free(gu)
+                    s.free(gr)
+                    s.free(gp)
+                    s.free(gq)
+                    s.free(gz)
+                    s.free(partials)
+                    s.free(scalars)
+                    s.free(staged)
+                    s.free(gd.list)
+                    s.free(gd.place)
+                    s.free(gd.m)
+                    s.free(gd.g)
+                    s.free(gd.y)
+                    s.free(gd.x)
+                }
+                engine = {runs: 0, reads: 0, sent: 0, finished: 0, floor: 0}
+            }
+            var runs = 0
+            var sent = 0
+            var reads = 0
+            loop {
+                let run = g_run(p.max_its - its, its, rr, bb)
+                if run == nil {
+                    return nil
+                }
+                its = its + run.its
+                runs = runs + 1
+                sent = sent + run.sent
+                reads = reads + run.reads
+                if p.runs == 1 {
+                    // a preconditioner's solve: one run, its defect not taken (the run's own
+                    // estimate stands for it)
+                    rr = rr * run.ratio
+                    s.value("cg", {its: its, rr: rr, bb: bb})
+                    break
+                }
+                // the defect of the answer so far, in f64, and the potential's change over the
+                // run: -c.(r0 + r1)/2, c the run's correction, r0 and r1 the defects before and
+                // after
+                dot(cv, r, 5)
+                apply_on(0, 1, u, rhs, r)
+                dot(r, r, 3)
+                dot(cv, r, 6)
+                let now = s.read(sc, 3, 4)
+                if now == nil {
+                    return nil
+                }
+                rr = now[0]
+                s.value("cg", {its: its, rr: rr, bb: bb})
+                if rr <= stop {
+                    break
+                }
+                // a run that did not lower the potential is undone (its answer was worse), and it
+                // is the f32 floor; so is the last run, or the iterations spent short of the
+                // tolerance: the f64 engine finishes from the answer so far, with iterations of
+                // its own
+                if now[2] + now[3] <= 0 {
+                    s.run(unrun, nodes, {}, {c0: cv.x, c1: cv.y, c2: cv.z, u0: u.x, u1: u.y, u2: u.z})
+                    apply_on(0, 1, u, rhs, r)
+                    dot(r, r, 3)
+                    let back = s.read(sc, 3, 1)
+                    if back == nil {
+                        return nil
+                    }
+                    rr = back[0]
+                    floor = rr / bb
+                    break
+                }
+                if runs >= p.max_runs || its >= p.max_its {
+                    floor = rr / bb
+                    break
+                }
+            }
+            var finished = engine.finished
+            var at_floor = engine.floor
+            if floor != nil {
+                finished = finished + 1
+                at_floor = floor
+            }
+            engine = {runs: engine.runs + runs, reads: engine.reads + reads, sent: engine.sent + sent, finished: finished, floor: at_floor}
+        }
+        // the last side: what it no longer reads goes before its answer is gathered and published,
+        // so the answer's copies on their way out are made with less alive (the GPU engine's
+        // first, before the f64 finish makes its smoothers)
+        let last = (side + 1) == sides
+        if last && g_free != nil {
+            g_free()
+        }
+        if rr > stop && (!on_gpu || floor != nil) {
+            if lv[0].dinv == nil {
+                var smoothed = []
+                for l in 0..count {
+                    var d = levels[l]
+                    if freed && l > 0 && d.built {
+                        // its matrices as the GPU's pack left them: recalled where the node
+                        // keeps them, else made again from the finer level's (just restored)
+                        var mats = s.recall("mats" + l, @f64, from, with)
+                        if mats == nil {
+                            let made = galerkin_of(l, smoothed[l - 1], shapes[l], d.cell, d.nshared)
+                            if made == nil {
+                                return nil
+                            }
+                            mats = made.mats
+                            remade = remade + 1
+                        }
+                        d = {n: d.n, halved: d.halved, nodes: d.nodes, nshared: d.nshared, active: d.active, held: d.held, cell: d.cell, mats: mats, built: d.built}
+                    }
+                    smoothed.push(cpu_level(d, true))
+                }
+                lv = smoothed
+            }
+            if z == nil {
+                z = vector(nodes)
+                dir = vector(nodes)
+            }
+            // its iterations: the GPU's before it count in `its`, not against these
+            let begun = its
+            vcycle(r, z)
+            copy(z, dir)
+            dot(r, z, 0)
+            loop {
+                apply_on(0, 0, dir, rhs, q)
+                dot(dir, q, 1)
+                s.run(cg_step, nodes, {}, {sc: sc, p0: dir.x, p1: dir.y, p2: dir.z, q0: q.x, q1: q.y, q2: q.z, u0: u.x, u1: u.y, u2: u.z, r0: r.x, r1: r.y, r2: r.z})
+                dot(r, r, 3)
+                let now = s.read(sc, 3, 1)
+                if now == nil {
+                    return nil
+                }
+                rr = now[0]
+                its = its + 1
+                s.value("cg", {its: its, rr: rr, bb: bb})
+                if rr <= stop || its - begun >= p.max_its {
+                    break
+                }
+                vcycle(r, z)
+                dot(r, z, 2)
+                s.run(cg_direction, nodes, {}, {sc: sc, z0: z.x, z1: z.y, z2: z.z, p0: dir.x, p1: dir.y, p2: dir.z})
+                s.run(cg_shift, 1, {}, {sc: sc})
+            }
+        }
+        if last {
+            free_vector(f)
+            free_vector(rhs)
+            free_vector(r)
+            free_vector(q)
+            if z != nil {
+                free_vector(z)
+                free_vector(dir)
+            }
+            if cv != nil {
+                free_vector(cv)
+            }
+            for l in 0..count {
+                let v = lv[l]
+                if v.dinv != nil {
+                    s.free(v.dinv)
+                    free_vector(v.b)
+                    free_vector(v.x)
+                    free_vector(v.r)
+                }
+            }
+        }
+        s.run(interleave, nodes * 3, {}, {x0: u.x, x1: u.y, x2: u.z, out: out})
+        if last {
+            free_vector(u)
+        }
+        s.publish("u" + side, out)
+        solves.push({its: its, rr: rr, bb: bb})
+    }
+    return {solves: solves, stats: s.stats(), gpu: engine, gpu_need: gpu_need, gpu_largest: gpu_one, factor: factor, remade: remade}
+}}

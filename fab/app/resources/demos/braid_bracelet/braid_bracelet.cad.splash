@@ -1,0 +1,78 @@
+// A three-strand braid closed into a bangle, in three filaments. Each strand is a round cord
+// that swings up and down the band and over and under the other two, so every strand crosses
+// over one and under the next in turn; the three press together where they cross, so the band
+// prints as one piece, standing on its edge. Each cord is twisted from two plies in two colours,
+// a different pair on each strand, so the colours alternate along it.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let inner = param(64mm, min: 50mm, max: 80mm, step: 1mm, label: "Inside diameter", group: "Bracelet", hint: "across the inside of the band: it slips over the hand")
+let cord = param(1.6mm, min: 1.2mm, max: 2.4mm, step: 0.1mm, label: "Cord", group: "Bracelet", kind: "radius")
+let periods = param(14, min: 8, max: 24, step: 1, label: "Repeats", group: "Bracelet", hint: "how many times the plait repeats round the band; each repeat crosses six times")
+
+// A strand at phase a swings up and down the band by `swing` (sin a) and in and out by `weave`
+// (sin 2a). The three strands are a third of a turn apart: where two pass at the same height one is
+// in and the other out, so they cross over and under. These ratios keep the cords pressed together
+// with no slot between them.
+let swing = 2.19 * cord
+let weave = 1.375 * cord
+let radius = inner / 2 + weave + cord
+// The band's lowest cords sink half a millimetre into the bed and are cut flat there.
+let flat = 0.5mm
+let mid = swing + cord - flat
+let steps = periods * 36
+let turn = 2 * 3.14159
+fn point(k, th) {
+    let a = periods * th + k * turn / 3
+    let r = radius + weave * sin(2 * a)
+    [r * cos(th), mid + swing * sin(a), r * sin(th)]
+}
+let strands = for k in 0..3 {
+    m.sweep({sketch: Regular{sides: 24 radius: cord} path: for i in 0..steps { point(k, i * turn / steps) } closed: true})
+}
+let reach = radius + weave + cord + 2mm
+let below = m.box({size: [2 * reach, 4mm, 2 * reach] at: [0, -2mm, 0]})
+let band = m.subtract(m.union(strands[0], [strands[1] strands[2]]), below)
+
+object(band, name: "Braid bracelet")
+
+// The colour: the strand nearest a point (a short search along each strand from the point's
+// direction round the band), and the angle round that strand's cord, turned along the band: two
+// plies twisted three times a repeat. A strand's plies are its own colour and the next strand's.
+let ivory = Material{albedo: [0.91 0.88 0.8] name: "Ivory"}
+let rose = Material{albedo: [0.85 0.34 0.42] name: "Rose"}
+let indigo = Material{albedo: [0.17 0.23 0.55] name: "Indigo"}
+let twists = 3 * periods
+fn ply(p) {
+    let th0 = atan2(p.z, p.x)
+    let rp = sqrt(p.x * p.x + p.z * p.z)
+    var best = 1e9
+    var strand = 0
+    var th = th0
+    var dr = 0
+    var dy = 0
+    for k in 0..3 {
+        for j in 0..13 {
+            let t = th0 + (j - 6) * 0.012
+            let a = periods * t + k * turn / 3
+            let r = radius + weave * sin(2 * a)
+            let c = vec3(r * cos(t), mid + swing * sin(a), r * sin(t))
+            let d = length(p - c)
+            if d < best {
+                best = d
+                strand = k
+                th = t
+                dr = rp - r
+                dy = p.y - (mid + swing * sin(a))
+            }
+        }
+    }
+    let u = atan2(dy, dr) / turn + twists * th / turn
+    let half = floor(2 * u)
+    let second = half - 2 * floor(half / 2)
+    let k = strand + second
+    k - 3 * floor(k / 3)
+}
+m.fill(m.box({size: [2 * reach, 2 * mid + 2 * cord + 2mm, 2 * reach] at: [0, mid, 0]}), Mix{materials: [ivory rose indigo] field: fn(p) { ply(p) } sharp: 1})

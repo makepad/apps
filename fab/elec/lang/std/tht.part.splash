@@ -1,0 +1,175 @@
+let __tht_f = mod.elec.f
+
+let __tht_positive = fn(v) {
+    return v.is_number() && v > 0mm && v - v == 0mm
+}
+
+// Lead clearance 0.20 mm, drill grid 0.05 mm, annular ring 0.30 mm.
+let __tht_land = fn(lead) {
+    // Match the native nanometre resolution before checking exact grid points.
+    let clearance = __tht_f.round(lead + 0.2mm, 0.000001mm)
+    let nearest = __tht_f.round(clearance, 0.05mm)
+    let drill = if nearest == clearance { nearest } else {
+        __tht_f.round(clearance + 0.025mm, 0.05mm)
+    }
+    return {
+        drill: drill
+        diameter: __tht_f.round(drill + 2 * 0.3mm, 0.01mm)
+    }
+}
+
+// Two rows of through-hole leads; o.pins even 4..64, o.pitch (default 2.54 mm),
+// o.row (default 7.62 mm), o.lead diameter (default 0.5 mm), o.body [x, y]
+// (default [row - 1.27 mm, pins / 2 * pitch]); all lengths in mm.
+let dip = fn(o) {
+    let f = __tht_f
+    if !o.is_object() { return f.error("dip: o must be an options object") }
+    let pins = o.pins ?? nil
+    if !pins.is_number() || pins < 4 || pins > 64 || pins % 2 != 0 {
+        return f.error("dip: pins must be an even integer from 4 to 64")
+    }
+    let pitch = o.pitch ?? 2.54mm
+    let row = o.row ?? 7.62mm
+    let lead = o.lead ?? 0.5mm
+    if !__tht_positive(pitch) {
+        return f.error("dip: pitch must be a positive finite length")
+    }
+    if !__tht_positive(row) {
+        return f.error("dip: row must be a positive finite length")
+    }
+    if !__tht_positive(lead) {
+        return f.error("dip: lead must be a positive finite diameter")
+    }
+    let half = pins / 2
+    let body = o.body ?? [row - 1.27mm, half * pitch]
+    if !body.is_array() || body.len() != 2 {
+        return f.error("dip: body must be [x, y]")
+    }
+    if !__tht_positive(body[0]) || !__tht_positive(body[1]) {
+        return f.error("dip: body dimensions must be positive finite lengths")
+    }
+    if body[0] + lead > row {
+        return f.error("dip: row must fit the body width and lead diameter")
+    }
+    let top_y = (half - 1) * pitch / 2
+    if 2 * top_y + lead > body[1] {
+        return f.error("dip: body length must contain pins at the specified pitch and lead diameter")
+    }
+    let land = __tht_land(lead)
+    if pitch <= land.diameter {
+        return f.error("dip: pitch must exceed the rounded pad diameter")
+    }
+    if row <= land.diameter {
+        return f.error("dip: row must exceed the rounded pad diameter")
+    }
+    let x = row / 2
+    let pads = for i in 0..pins {
+        let at = if i < half {
+            [-x, top_y - i * pitch]
+        } else {
+            [x, -top_y + (i - half) * pitch]
+        }
+        f.thru(f.int(i + 1), at, land.diameter, land.drill, {square: i == 0})
+    }
+    let half_x = body[0] / 2
+    let half_y = body[1] / 2
+    let notch_x = if body[0] / 4 < 0.75mm { body[0] / 4 } else { 0.75mm }
+    let notch = if body[1] / 4 < notch_x { body[1] / 4 } else { notch_x }
+    return f.footprint({
+        pads: pads
+        body: [[-half_x, -half_y], [half_x, half_y]]
+        mount: @thru
+        text: 1mm
+        graphics: [f.stroke("F.SilkS", [
+            [-notch, half_y],
+            [-0.70710678 * notch, half_y - 0.70710678 * notch],
+            [0mm, half_y - notch],
+            [0.70710678 * notch, half_y - 0.70710678 * notch],
+            [notch, half_y]
+        ], 0.12mm)]
+    })
+}
+
+// Axial through-hole leads; o.span between pads on x, o.lead diameter
+// (default 0.6 mm), o.body [length, diameter]; all lengths in mm.
+let axial = fn(o) {
+    let f = __tht_f
+    if !o.is_object() { return f.error("axial: o must be an options object") }
+    let span = o.span ?? nil
+    let lead = o.lead ?? 0.6mm
+    let body = o.body ?? nil
+    if !__tht_positive(span) {
+        return f.error("axial: span must be a positive finite length")
+    }
+    if !__tht_positive(lead) {
+        return f.error("axial: lead must be a positive finite diameter")
+    }
+    if !body.is_array() || body.len() != 2 {
+        return f.error("axial: body must be [length, diameter]")
+    }
+    if !__tht_positive(body[0]) || !__tht_positive(body[1]) {
+        return f.error("axial: body dimensions must be positive finite lengths")
+    }
+    if body[0] + lead > span {
+        return f.error("axial: span must fit the body length and lead diameter")
+    }
+    if lead > body[1] {
+        return f.error("axial: lead diameter must fit the body diameter")
+    }
+    let land = __tht_land(lead)
+    if span <= land.diameter {
+        return f.error("axial: span must exceed the rounded pad diameter")
+    }
+    let x = span / 2
+    return f.footprint({
+        pads: [
+            f.thru("1", [-x, 0mm], land.diameter, land.drill, {square: true}),
+            f.thru("2", [x, 0mm], land.diameter, land.drill, {square: false})
+        ]
+        body: [[-body[0] / 2, -body[1] / 2], [body[0] / 2, body[1] / 2]]
+        mount: @thru
+        text: 1mm
+        graphics: []
+    })
+}
+
+// Radial through-hole leads; o.pitch between pads on x, o.lead diameter
+// (default 0.6 mm), o.d body diameter; all lengths in mm. Pad 1 is positive.
+let radial = fn(o) {
+    let f = __tht_f
+    if !o.is_object() { return f.error("radial: o must be an options object") }
+    let pitch = o.pitch ?? nil
+    let lead = o.lead ?? 0.6mm
+    let d = o.d ?? nil
+    if !__tht_positive(pitch) {
+        return f.error("radial: pitch must be a positive finite length")
+    }
+    if !__tht_positive(lead) {
+        return f.error("radial: lead must be a positive finite diameter")
+    }
+    if !__tht_positive(d) {
+        return f.error("radial: d must be a positive finite body diameter")
+    }
+    if pitch + lead > d {
+        return f.error("radial: d must contain both leads at the specified pitch and lead diameter")
+    }
+    let land = __tht_land(lead)
+    if pitch <= land.diameter {
+        return f.error("radial: pitch must exceed the rounded pad diameter")
+    }
+    let x = pitch / 2
+    let mark_x = -x - land.diameter / 2 - 0.7mm
+    return f.footprint({
+        pads: [
+            f.thru("1", [-x, 0mm], land.diameter, land.drill, {square: true}),
+            f.thru("2", [x, 0mm], land.diameter, land.drill, {square: false})
+        ]
+        body: [[-d / 2, -d / 2], [d / 2, d / 2]]
+        mount: @thru
+        text: 1mm
+        graphics: [
+            f.stroke("F.SilkS", [[mark_x - 0.4mm, 0mm], [mark_x + 0.4mm, 0mm]], 0.12mm),
+            f.stroke("F.SilkS", [[mark_x, -0.4mm], [mark_x, 0.4mm]], 0.12mm)
+        ]
+    })
+}

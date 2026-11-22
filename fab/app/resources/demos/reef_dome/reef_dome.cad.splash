@@ -1,0 +1,40 @@
+// A reef sculpture in two filaments: a dome of made-up brain coral, its surface folded into
+// meandering ridges by ridged noise, coloured by a turbulence mix: coral pink along the ridges,
+// sand in the valleys. The dome's centre lies below the bed, so its sides lean in all the way up
+// and it prints with no supports.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let width = param(76mm, min: 40mm, max: 140mm, step: 1mm, label: "Width", group: "Reef")
+let tall = param(30mm, min: 15mm, max: 70mm, step: 1mm, label: "Height", group: "Reef")
+let meander = param(7mm, min: 3mm, max: 16mm, step: 0.5mm, label: "Meander", group: "Coral", hint: "how far apart the ridges run")
+let depth = param(2.4mm, min: 0.8mm, max: 5mm, step: 0.1mm, label: "Groove", group: "Coral", hint: "how deep the valleys between ridges go")
+let seed = param(11, min: 1, max: 99, step: 1, label: "Colony", group: "Coral", hint: "another whole number grows another colony")
+
+let a = width / 2
+let b = width * 0.42
+let sink = tall * 0.25
+let h = tall + sink
+let dome = m.sdf({
+    bounds: [[0 - a - 2mm, 0, 0 - b - 2mm], [a + 2mm, tall + 1mm, b + 2mm]]
+    cell: 0.35mm
+    field: fn(p) {
+        let q = vec3(p.x / a, (p.y + sink) / h, p.z / b)
+        let e = (length(q) - 1) * min(min(a, b), h)
+        let ridges = noise.ridged(p / meander, seed, 2)
+        let coral = e + depth * (1 - ridges) * 0.8
+        return max(coral * 0.6, 0 - p.y)
+    }
+})
+
+object(dome, name: "Reef dome")
+
+let pink = Material{albedo: [0.93 0.45 0.5] name: "Coral pink"}
+let sand = Material{albedo: [0.93 0.85 0.68] name: "Sand"}
+m.fill(m.box({size: [width + 6mm, tall + 4mm, 2 * b + 6mm] at: [0, tall / 2, 0]}), Mix{materials: [sand pink] field: fn(p) {
+    let ridges = noise.ridged(p / meander, seed, 2)
+    let swirl = noise.turbulence(p / 11mm, seed + 3, 3)
+    0.5 + (ridges - 0.72) * 4 + (swirl - 0.3) * 1.5
+} sharp: 1})

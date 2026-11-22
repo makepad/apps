@@ -1,0 +1,74 @@
+// drum16's 3D models: each part's body is the model of a stock LCSC part whose package, pin pitch and
+// pin 1 match the part's own footprint. A model is fetched only when someone asks for it (Fetch 3D
+// models), from the part service, into their own part library, where every plate's build finds
+// it; until then the part keeps its own plain body. Nothing here is shipped with Fab: the paths name
+// the files the import makes.
+//
+// Each override names only the mesh (and, where the supplier draws the package turned or around
+// another origin, the turn and move that put its pin 1 on pad 1): the part keeps its own height and
+// ports (the LEDs' light, the keys' stems, the pots' shafts). The LCSC numbers choose models, not
+// the parts a BOM orders: one 0402 resistor's model stands for every resistor value.
+let e = mod.elec
+
+// The MCU: ATMEGA328P-AU (Microchip), TQFP-32 at 0.8 mm; pad 1 and the model's pin-1 dimple share the
+// corner at -x, -y.
+e.body("ATMEGA328P_TQFP32", {mesh: "parts/lcsc/C14877.glb"})
+
+// The step LEDs: KT-0603R (Kento), red 0603, and the function LEDs, its green sibling; their
+// cathodes are pad 1 at -x, and their clear domes are the material "lens" the 3D view lights.
+e.body("LED_0603_red", {mesh: "parts/lcsc/C2286.glb"})
+e.body("LED_0603_green", {mesh: "parts/lcsc/C12624.glb"})
+
+// The passives: 0402WGF1002TCE (UniOhm) for every 0402 resistor, 0603WAF1002T5E (UniOhm) for the
+// 0603 one, CL05B104KO5NNNC (Samsung) for every 0402 capacitor and CL21A106KAYNNNE (Samsung) for
+// every 0805 one.
+e.body("R_0402", {mesh: "parts/lcsc/C25744.glb"})
+e.body("R_0603", {mesh: "parts/lcsc/C25804.glb"})
+e.body("C_0402", {mesh: "parts/lcsc/C1525.glb"})
+e.body("C_0805", {mesh: "parts/lcsc/C15850.glb"})
+
+// The key and accent diodes: 1N4148WS (Changjiang) in SOD-323; its band is the cathode, pad 1 at -x.
+e.body("D_sod323", {mesh: "parts/lcsc/C2128.glb"})
+
+// The voices' op-amps: LMV321IDBVR (TI) in SOT-23-5. The supplier draws pins 1 to 3 down its +x side;
+// the part has them along -y from pin 1 at -x, so the model turns a quarter clockwise.
+e.body("OPAMP_SOT23-5", {mesh: "parts/lcsc/C7972.glb" rotation: [0deg, 0deg, -90deg]})
+
+// The voices' transistors: MMBT3904 (Changjiang) in SOT-23. The supplier draws its two leads along
+// +x; the part has them along -y, so the model turns a quarter clockwise.
+e.body("Q_NPN_SOT23", {mesh: "parts/lcsc/C20526.glb" rotation: [0deg, 0deg, -90deg]})
+
+// The noise source's Schmitt inverters, 74HC14D (Nexperia), and the step chain's latches, 74HC595D
+// (Nexperia). The supplier draws an SOIC's leads along x with pin 1 at -x, -y; the parts have them
+// along y with pin 1 at -x, +y, so each model turns a quarter clockwise.
+e.body("SCHMITT_HEX_SOIC-14", {mesh: "parts/lcsc/C5605.glb" rotation: [0deg, 0deg, -90deg]})
+e.body("SHIFT_LATCH8_SOIC-16", {mesh: "parts/lcsc/C5947.glb" rotation: [0deg, 0deg, -90deg]})
+
+// The 16 MHz crystal: X322516MLB4SI (YXC), 3.2 x 2.5 mm; its pads are numbered as the part's.
+e.body("XTAL_3225", {mesh: "parts/lcsc/C13738.glb"})
+
+// The USB-C receptacle: TYPE-C 6P (Shou Han); its mouth is the part's -Y edge, which the board turns
+// to face out of its left edge.
+e.body("USB_C_POWER", {mesh: "parts/lcsc/C456012.glb"})
+
+// The ISP header: a 2 x 3 male header at 2.54 mm (BOOMELE). Its model has pin 1 at (-2.54, -1.27)
+// with the odd pins along +x; this part has pin 1 at its origin with the pins running down -y, so
+// the model turns a quarter clockwise and moves to put its pin 1 on pad 1.
+e.body("PinHeader_2x3_P2.54mm", {mesh: "parts/lcsc/C65114.glb" offset: [1.27mm, -2.54mm, 0mm] rotation: [0deg, 0deg, -90deg]})
+
+// The 9 mm vertical pots: RK09K1130A5R (Alps Alpine), pins at 2.5 mm, mounting legs 8.8 mm apart and
+// 7 mm behind the pins, a 6 mm shaft. The supplier's origin is midway between the pins and the legs,
+// so the model moves 3.5 mm back to put its pin 2 on pad 2.
+e.body("POT_9MM_V", {mesh: "parts/lcsc/C209779.glb" offset: [0mm, 3.5mm, 0mm]})
+
+// The low-profile key switches: CPG135301D02 (Kailh), the soldered PG1353 with a cross stem. The
+// supplier draws its pins on the -x side around a centre 0.375 mm off its origin; the part has them
+// at (0, 5.9) and (5, 3.8) mm around the centre post, so the model turns a quarter clockwise and moves
+// to put its centre post on the part's origin. The supplier's mesh has the supplier's own logo moulded
+// into one side of the housing, which the real switch does not carry; it stays for now.
+e.body("SW_KEY_LOWPROFILE", {mesh: "parts/lcsc/C5142796.glb" offset: [0mm, 0.375mm, 0mm] rotation: [0deg, 0deg, -90deg]})
+
+// The line jack: a right-angle 3.5 mm stereo jack with three pins, two locating pegs and a round
+// nose. Its model is taken as drawn in the part's own frame (the body's centre, the mouth toward
+// -y), as its footprint is; the import shows whether it needs a turn or a move.
+e.body("JACK_3.5MM_STEREO", {mesh: "parts/lcsc/C5372850.glb"})

@@ -1,0 +1,77 @@
+// drum16, the whole board: an analog drum machine with a 16-step sequencer, on USB 5 V. The MCU
+// runs the sequencer firmware: it strikes each voice with a 1 ms trigger (louder on accented
+// steps), lights the step LEDs and reads the 20 keys through a 24-bit shift chain, and polls the
+// key rows. The voices are those of their own circuits (kick, snare, toms, hats and cymbal), mixed
+// by one summer to the line out. The analog supply is the USB rail through 10 ohm and 22 uF, so the
+// digital edges stay out of the voices.
+use mod.elec.*
+use mod.std.*
+use mod.project.*
+let e = mod.elec
+
+let gnd    = e.net({name: "GND"  kind: @ground})
+let vbus   = e.net({name: "VBUS" kind: @power volts: 5V class: "power"})
+let va     = e.net({name: "VA"   kind: @power volts: 5V})
+let ref    = e.net({name: "VREF"})
+let pin    = e.bus("TRIGPIN", 7)                        // the MCU's trigger pins
+let accent = e.net({name: "ACCENT"})
+let latch  = e.net({name: "LATCH"})
+let data   = e.net({name: "DATA"})
+let clk    = e.net({name: "CLK"})
+let row    = e.bus("ROW", 5)
+let tempo_w = e.net({name: "TEMPO"})
+let shuf_w = e.net({name: "SHUFFLE"})
+let col    = e.bus("COL", 4)
+let kick_t = e.net({name: "KICK"})
+let snr_t  = e.net({name: "SNARE"})
+let lt_t   = e.net({name: "LTOM"})
+let ht_t   = e.net({name: "HTOM"})
+let ch_t   = e.net({name: "CHAT"})
+let oh_t   = e.net({name: "OHAT"})
+let cy_t   = e.net({name: "CYM"})
+let kick_o = e.net({name: "KICKOUT"})
+let lt_o   = e.net({name: "LOW"})
+let ht_o   = e.net({name: "HIGH"})
+let hat_o  = e.net({name: "HATS"})
+let noise  = e.net({name: "NOISE"})
+let env    = e.net({name: "ENV"})
+let oenv   = e.net({name: "OENV"})
+let sum    = e.net({name: "SUM"})
+let line   = e.net({name: "LINE"})
+
+let power = netclass("power", {track: 0.5mm clearance: 0.2mm via: {drill: 0.4mm pad: 0.8mm}})
+
+// power, the sequencer and its panel
+let usb    = usb_c_power({vbus: vbus gnd: gnd})
+let rva    = e.r(10ohm, vbus, va, {package: "0603"})
+let cva    = e.c(22uF, va, gnd, {package: "0805"})
+let mcu    = drum_core({vdd: vbus gnd: gnd trig: pin accent: accent latch: latch data: data clk: clk
+                        row: row tempo: tempo_w shuffle: shuf_w})
+// TEMPO: a divider across the MCU's supply, so the ADC reads its turn whatever the rail; turned up
+// (toward B) it plays faster. It starts where the firmware reads 120 BPM.
+let tempo  = e.part(mod.std.pot_9mm(), {value: 10kohm pins: {A: gnd W: tempo_w B: vbus}
+                                        fields: {pos: "0.313" taper: "lin" label: "TEMPO"}})
+// SHUFFLE: the same divider on the next ADC input, turned up for more swing; it starts at the
+// bottom of its turn, playing straight.
+let shuffle = e.part(mod.std.pot_9mm(), {value: 10kohm pins: {A: gnd W: shuf_w B: vbus}
+                                         fields: {pos: "0" taper: "lin" label: "SHUFFLE"}})
+let chain  = step_chain({data: data clk: clk latch: latch col: col vdd: vbus gnd: gnd})
+let keys   = key_matrix({row: row col: col})
+let ts     = [kick_t snr_t lt_t ht_t ch_t oh_t cy_t]
+let gates  = for i in 0..7 { accent_gate({pin: pin[i] accent: accent t: ts[i]}) }
+
+// the voices and the mix
+let sg     = signal_ground({va: va gnd: gnd ref: ref})
+let drum   = kick_ringer({trig: kick_t out: kick_o ref: ref va: va gnd: gnd})
+let snare  = snare_voice({trig: snr_t sum: sum noise: noise env: env ref: ref va: va gnd: gnd})
+let lt     = tom_ringer({trig: lt_t out: lt_o ref: ref va: va gnd: gnd})
+let ht     = ringer({trig: ht_t out: ht_o ref: ref va: va gnd: gnd})
+let hats   = metal_voices({ctrig: ch_t otrig: oh_t cym: cy_t out: hat_o oenv: oenv ref: ref va: va gnd: gnd})
+let r_kick = e.r(33kohm, kick_o, sum, {package: "0402"})
+let r_lt   = e.r(47kohm, lt_o, sum, {package: "0402"})
+let r_ht   = e.r(47kohm, ht_o, sum, {package: "0402"})
+let r_hats = e.r(33kohm, hat_o, sum, {package: "0402"})
+let mix    = mixer_out({sum: sum line: line ref: ref va: va gnd: gnd})
+
+e.fixed(usb, {edge: @left})
+e.width(vbus, 0.5mm)

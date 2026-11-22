@@ -1,0 +1,32 @@
+[package]
+name = "fab-elec-fixtures"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Document-backed electronics fixtures and the stock board catalogue"
+
+[dependencies]
+fab-elec-lang = { path = "../lang" }
+fab-elec-design = { path = "../design" }
+fab-elec-core = { path = "../core" }
+fab-elec-board = { path = "../board" }
+fab-elec-circuit = { path = "../circuit" }
+fab-elec-parts = { path = "../parts" }
+
+[dev-dependencies]
+makepad-zune-png = { path = "../../../../../libs/zune/zune-png" }
+fab-elec-bench = { path = "../bench" }
+fab-elec-sim = { path = "../sim" }
+fab-elec-mcu-emit-avr = { path = "../mcu/emit_avr" }
+fab-elec-mcu-avr = { path = "../mcu/avr" }
+fab-elec-mcu-emu = { path = "../mcu/emu" }
+fab-elec-mcu-cosim = { path = "../mcu/cosim" }
+fab-elec-mcu-rt = { path = "../mcu/rt" }
+fab-elec-fw = { path = "../fw" }
+fab-elec-mcu = { path = "../mcu/lang" }
+fab-elec-mcu-emit-s3 = { path = "../mcu/emit_s3" }
+fab-elec-mcu-s3 = { path = "../mcu/s3" }
+fab-elec-mcu-parts = { path = "../mcu/parts" }
+fab-elec-simhost = { path = "../simhost" }
+fab-elec-simjit = { path = "../simjit" }

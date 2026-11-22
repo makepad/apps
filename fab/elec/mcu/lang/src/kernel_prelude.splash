@@ -1,0 +1,8 @@
+// Kernel-only helpers, inlined at their callers. Hex literals are read as
+// signed i32 bits, including 0x8000_0000. i32 arithmetic wraps; >>> is logical.
+fn ltu(a: i32, b: i32) { (a ^ 0x8000_0000) < (b ^ 0x8000_0000) }
+fn leu(a: i32, b: i32) { (a ^ 0x8000_0000) <= (b ^ 0x8000_0000) }
+fn gtu(a: i32, b: i32) { (a ^ 0x8000_0000) > (b ^ 0x8000_0000) }
+fn geu(a: i32, b: i32) { (a ^ 0x8000_0000) >= (b ^ 0x8000_0000) }
+// Wrapping deadlines compare within a half-range of each other.
+fn before(a: i32, b: i32) { (a - b) < 0 }

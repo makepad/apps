@@ -1,0 +1,20 @@
+[package]
+name = "fab-loose"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab's support removal check: a part's planned supports as loose rigid pieces, whether each can leave the part, and the bodies for the Mechanics sim; and what of a part prints apart, from the same slice"
+
+[dependencies]
+makepad-box3d = { path = "../../../../libs/box3d" }
+makepad-csg-math = { path = "../../../../libs/csg/csg_math" }
+makepad-csg-mech = { path = "../../../../libs/csg/csg_mech" }
+makepad-csg-primitives = { path = "../../../../libs/csg/csg_primitives" }
+makepad-csg-sdf = { path = "../../../../libs/csg/csg_sdf" }
+makepad-fab-slicer = { path = "../slicer" }
+makepad-fab-toolpath = { path = "../toolpath" }
+
+[dev-dependencies]
+fab-model = { path = "../model" }
+fab-plate = { path = "../plate" }

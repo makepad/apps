@@ -1,0 +1,1305 @@
+// Cases round boards (ARCHITECTURE 5.14): `enclosure(board, {..})` and the pieces it is built
+// from (`standoff`, `boss`, `port_cutout`, `board_solid`, `board_mount`, `vent`, `finger_notch`, `cable_exit`,
+// `snap_lip`, `press_pin`, `shaft_knob`, `lid_legends`).
+// A person or the AI reads, calls or forks any of them; a fork is this code copied into a
+// script and changed there.
+//
+// A board is plain data in its own frame: X right and Y up seen from the top, the bottom face at
+// z = 0 and the top face at z = thickness. `board("name")` gives it from the design; a test or a
+// case-first sketch writes it by hand in the same shape:
+//
+//   name:      "ledctl"                        the board's unit name; without it the case
+//                                              reserves no board space (light_block's keepouts)
+//   outline:   [[x y] ...]                     the board's edge, one closed polygon
+//   cutouts:   [[[x y] ...] ...]               holes through the board's shape, each a polygon
+//   thickness: 1.6mm
+//   envelope:  {top bottom covered}            the tallest part off each face; covered the tallest
+//                                              top part a lid covers (one plugged from above
+//                                              passes through its opening and does not count)
+//   holes:     [{name at: [x y] d plated feature}] mounting holes, d the drill
+//   keepouts:  [{area: [[x y] ...] reason}]
+//   ports:     [{ref refdes kind at dir opening profile reach margin travel stand feature}]
+//                refdes  the part's reference designator (D1), what a person calls it
+//                feature (holes and ports) the board feature the cut derives from, a host key;
+//                        absent in a hand-written board
+//                kind    @plug (a connector), @light, @press, @air, @cable or @shaft (a
+//                        knob's, through the lid)
+//                at      [x y z] the middle of the opening's mouth, board frame: a press port's
+//                        plunger top, a shaft's tip
+//                dir     [x y z] out of the part: [-1 0 0] through the left wall, [0 0 1] up
+//                opening the hole the case leaves, margin included: a polygon [[u v] ...] in the
+//                        plane across dir, v along the board's normal made square to dir (board
+//                        +y for a port up or down), u = v x dir
+//                profile the part's own section there, in the same plane, without the margin
+//                        (a shaft's section is what a knob's bore takes)
+//                reach   how far out of the mouth the mating part needs room (a plug's
+//                        insertion depth): the wall's outer face must lie within it
+//                margin  the clearance the opening already includes round the part's profile
+//                travel  a press port's actuation travel: how far its plunger moves down to
+//                        switch (0 where the part states none)
+//                stand   how far a plunger or a shaft stands out of its housing: the housing's
+//                        face is stand behind at (0 where the part states none)
+//                legend  {text aspect} the part's legend (its `label`), absent when it has none:
+//                        aspect its width per unit of its capitals' height in m.text's sans font
+//
+// The parts themselves are a second value, `board_bodies("name")`: [{ref side min max height known mesh}],
+// each with a plan box (side @top or @bottom, min and max its corners [x y], height off its face),
+// known when it declares a body, and mesh its file's content key or nil for a box.
+// A case reads only `board(..)`, so moving a small part does not rebuild it; what shapes round
+// single parts (the board's own volume, a pocket per part) reads the bodies.
+//
+// The case's frame is the model's: Y up, the base's underside on the bed at y = 0, the board's
+// middle over the origin. Board x is model x and board y is model -z, so the printer's X and Y
+// are the board's own and the case prints square to the board.
+// Generated parts over the lid take the panel `m.panel(case.lid_shell, {pose: case.frame cuts:
+// case.lid_ports})`: one whose cut covers a port's opening takes it over, so its hole is the
+// only one there.
+use mod.math.*
+use mod.model.*
+let m = mod.model
+
+// ---- sizes of things a case meets
+
+// Screws come from the shared table (`m.screw`): by size (@M3, "M2.5") or by a drill (the
+// largest screw that passes it). A size gives its clearance hole, its self-tapping pilot and the
+// boss round it, its countersunk head (90 degrees), and its heat-set insert's hole, depth, wall,
+// floor and boss (`heat_set`). A size, a screw from the table or nil (no screw): the screw.
+fn el_screw_of(size) {
+    if size == nil { return nil }
+    if size.is_object() { return size }
+    return m.screw(size)
+}
+
+// A board hole's fixing, from the shared screw table: the screw it takes (`screw`: the hole's own,
+// else the case's, else the largest its drill passes; nil when none does), how the case holds it
+// (`insert`: @heat_set, @self_tap or @none; @none without a screw or with snaps), the standoff's
+// width (`d`: the table's boss for that insert unless told) and its lid post's (`post_d`), and
+// how tall the standoff must stand on a case floor `floor` thick to hold its insert (`height`).
+//   h: the board's hole ({name d}); own: its options ({screw insert d}); so: the case's standoff
+//   options ({screw insert d}); posts: the case's post options ({d}); fasten: @screws or @snaps.
+fn fixing(h, own, so, posts, floor, fasten) {
+    let given = own.screw ?? so.screw ?? nil
+    let s = if given != nil { m.screw(given) } else { m.screw({drill: h.d}) }
+    let insert = if s == nil || fasten == @snaps { @none } else { own.insert ?? so.insert ?? @heat_set }
+    let boss_d = if s == nil { 4mm } else { if insert == @heat_set { s.heat_set.boss } else { s.boss } }
+    let height = if insert == @heat_set { s.heat_set.depth + s.heat_set.floor - floor } else { 0mm }
+    return {name: h.name screw: s insert: insert d: own.d ?? so.d ?? boss_d
+            post_d: posts.d ?? so.d ?? (if s == nil { 4mm } else { s.boss }) height: height}
+}
+
+// ---- the board in the case's frame
+
+// Where the board sits: the middle of its outline's bounds (cx, cy) over the origin, its bottom
+// face at y0; board names it.
+fn el_frame(pcb, y0) {
+    let x0 = pcb.outline[0][0]
+    let x1 = x0
+    let y0b = pcb.outline[0][1]
+    let y1b = y0b
+    for p in pcb.outline {
+        x0 = min(x0, p[0])
+        x1 = max(x1, p[0])
+        y0b = min(y0b, p[1])
+        y1b = max(y1b, p[1])
+    }
+    return {cx: (x0 + x1) / 2 cy: (y0b + y1b) / 2 width: x1 - x0 depth: y1b - y0b y0: y0 thickness: pcb.thickness board: pcb.name}
+}
+
+// A board point [x y] or [x y z] in the case's frame.
+fn el_at(frame, p) {
+    let z = if p.len() > 2 { p[2] } else { 0 }
+    return [p[0] - frame.cx, frame.y0 + z, frame.cy - p[1]]
+}
+
+// The board's frame as a part's host frame (`Frame`) named `name`: the board's origin at
+// el_at(frame, [0 0]), its X along the case's +x, its Y along -z and its Z up. The frame moves
+// with its part, so a part moved `dy` up by its own `at` gives dy to keep the frame in place.
+fn el_named_frame(name, frame, dy) {
+    return Frame{name: name at: [0 - frame.cx, frame.y0 - dy, frame.cy] rotate: [-90deg, 0, 0]}
+}
+
+// A case part's host frame, named `case:<board>:<role>`: the host maps a case part into the
+// board's frame by it (fab_elec_mech::case_solids).
+fn el_case_frame(pcb, frame, role) {
+    return el_named_frame("case:" + (pcb.name ?? "") + ":" + role, frame, 0)
+}
+
+// A loose case part's host frame (a key's pin, a knob), named `case:<board>:<role>` like
+// el_case_frame, for a part built round `origin` (a case-frame point) at its own origin: the
+// host maps the part into the board's frame by it, and so sees where it sits in the closed case
+// however the part is turned and moved to print.
+fn el_part_frame(frame, role, origin) {
+    return Frame{name: "case:" + (frame.board ?? "") + ":" + role at: [0 - frame.cx - origin[0], frame.y0 - origin[1], frame.cy - origin[2]] rotate: [-90deg, 0, 0]}
+}
+
+// A board direction in the case's frame.
+fn el_dir(d) {
+    return [d[0], d[2], 0 - d[1]]
+}
+
+// `solid` tagged with the board feature it derives from (`m.link`), when it has one.
+fn el_link(solid, feature) {
+    return if feature == "" { solid } else { m.link(solid, feature) }
+}
+
+// Whether `list` holds `port` (the same part's port at the same mouth).
+fn el_lists_port(list, port) {
+    let found = false
+    for q in list {
+        if (q.ref ?? "") == (port.ref ?? "") && q.at[0] == port.at[0] && q.at[1] == port.at[1] && q.at[2] == port.at[2] {
+            found = true
+        }
+    }
+    return found
+}
+
+// The case's options for the hole named `name` (an entry of `opts.holes`), or {}.
+fn el_hole_opts(list, name) {
+    let own = {}
+    for o in list {
+        if o.name == name { own = o }
+    }
+    return own
+}
+
+// The tallest part off one face (@top or @bottom).
+fn el_height(pcb, side) {
+    return if side == @top { pcb.envelope.top } else { pcb.envelope.bottom }
+}
+
+// Where the board needs holding beside its holes: each corner of its bounds, `inset` in, that
+// has no hole within `reach`. A part in the way of a rest is the fit check's to report (it reads
+// the bodies); a case names its rests then.
+fn el_rests(pcb, frame, inset, reach) {
+    let x0 = frame.cx - frame.width / 2 + inset
+    let x1 = frame.cx + frame.width / 2 - inset
+    let y0 = frame.cy - frame.depth / 2 + inset
+    let y1 = frame.cy + frame.depth / 2 - inset
+    let out = []
+    for p in [[x0, y0] [x1, y0] [x1, y1] [x0, y1]] {
+        let near = false
+        for h in pcb.holes {
+            let dx = h.at[0] - p[0]
+            let dy = h.at[1] - p[1]
+            if dx * dx + dy * dy < reach * reach { near = true }
+        }
+        if !near { out.push(p) }
+    }
+    return out
+}
+
+// ---- pieces
+
+// The board as a part, in place: its outline (cutouts and holes through it) as a slab, and each
+// body of `bodies` (`board_bodies(..)`, or [] for the bare board) its mesh or a box. It is the volume a
+// script inserts into the case (`insert(..)`), what the bead check and picking read. Linked
+// `board:<board>` with the board's frame of that name: the host draws the real board there.
+// `frame` is a case's (`case.frame`) or a mount on a part of its own (`board_mount`).
+fn board_solid(pcb, bodies, frame) {
+    let key = "board:" + (pcb.name ?? "")
+    let mount = frame.mount ?? nil
+    let shapes = [Polygon{points: for p in pcb.outline { [p[0] - frame.cx, p[1] - frame.cy] }}]
+    for c in pcb.cutouts ?? [] {
+        shapes.push(Polygon{points: for p in c { [p[0] - frame.cx, p[1] - frame.cy] }})
+    }
+    for h in pcb.holes {
+        shapes.push(Circle{radius: h.d / 2 at: [h.at[0] - frame.cx, h.at[1] - frame.cy]})
+    }
+    // A bare board on a mount is the slab alone, placed by its own at and turn.
+    let alone = bodies.len() == 0 && mount != nil
+    let slab = if alone {
+        m.extrude({sketch: Sketch{shapes: shapes} plane: @xz height: frame.thickness at: mount.at rotate: [0, mount.turn, 0] frame: el_named_frame(key, frame, frame.y0)})
+    } else {
+        m.extrude({sketch: Sketch{shapes: shapes} plane: @xz height: frame.thickness at: [0, frame.y0, 0] frame: el_named_frame(key, frame, frame.y0)})
+    }
+    let boxes = for b in bodies {
+        if b.mesh != nil {
+            m.generated("elec_body", {board: pcb.name ref: b.ref cx: frame.cx cy: frame.cy y0: frame.y0 thickness: frame.thickness mesh: b.mesh})
+        } else {
+            let lo = if b.side == @top { frame.thickness } else { 0 - b.height }
+            let c = el_at(frame, [(b.min[0] + b.max[0]) / 2, (b.min[1] + b.max[1]) / 2, lo + b.height / 2])
+            m.box({size: [b.max[0] - b.min[0], b.height, b.max[1] - b.min[1]] at: c})
+        }
+    }
+    if boxes.len() == 0 { return m.link(slab, key) }
+    if mount == nil { return m.link(m.union(slab, boxes, {frame: el_named_frame(key, frame, 0)}), key) }
+    return m.link(m.union(slab, boxes, {frame: el_named_frame(key, frame, 0) at: mount.at rotate: [0, mount.turn, 0]}), key)
+}
+
+// A board's frame on a part of its own (not a case built round it), as Align writes it: the
+// middle of the board's outline at `at` [x y z] in the part's model frame, y its underside's
+// height, turned `turn` about up (+y; the board's own z). board_solid takes it as it takes a
+// case's frame, and an insert of that solid into the part moves with the part.
+//   insert(board_solid(pcb, board_bodies("ledctl"), board_mount(pcb, {at: [0, 6.2mm, 0] turn: 90deg})), name: "Board", into: "Bracket")
+fn board_mount(pcb, spec) {
+    let f = el_frame(pcb, 0)
+    return {cx: f.cx cy: f.cy width: f.width depth: f.depth y0: 0 thickness: f.thickness board: f.board
+            mount: {at: spec.at ?? [0, 0, 0] turn: spec.turn ?? 0}}
+}
+
+// A standoff under a mounting hole: a column from the floor's top at `base` [x y z] up to the
+// board's underside, `height` tall, and the hole its screw takes from the top (`screw`: a size or
+// a screw from `m.screw`; `insert`: @heat_set (default), @self_tap or @none, @none without a
+// screw). `d` across, by default the table's boss for the insert. Gives the column, the hole to cut
+// after the union and, for @heat_set, the brass insert (heat_insert's, named after the hole's
+// `name`) to melt into it after the print, else nil.
+fn standoff(base, spec) {
+    let s = el_screw_of(spec.screw)
+    let insert = if s == nil { @none } else { spec.insert ?? @heat_set }
+    let d = spec.d ?? (if s == nil { 4mm } else { if insert == @heat_set { s.heat_set.boss } else { s.boss } })
+    let top = base[1] + spec.height
+    let column = m.cylinder({radius: d / 2 height: spec.height + 0.01mm at: [base[0], base[1] + spec.height / 2 - 0.005mm, base[2]]})
+    if insert == @heat_set {
+        let name = if spec.name == nil { nil } else { s.heat_set.size + " insert " + spec.name }
+        let i = mod.fab.heat_insert(s.heat_set.size, {at: [base[0], top, base[2]] boss: false name: name})
+        return {add: column cut: mod.fab.heat_cuts(i) insert: i}
+    }
+    let depth = spec.height + spec.floor - 0.6mm
+    let cut = if insert == @none { [] } else {
+        [m.cylinder({radius: s.pilot / 2 height: depth + 1mm at: [base[0], top - depth / 2 + 0.5mm, base[2]]})]
+    }
+    return {add: column cut: cut insert: nil}
+}
+
+// A screw post in a lid: a column from the board's top face at `foot` [x y z] up into the roof
+// at `roof` (its top), `d` across (by default the screw's boss), and its countersunk clearance
+// hole through the roof, the head flush with the lid's top face (`screw`: a size or a screw from
+// `m.screw`; nil leaves a plain presser). The post presses the board onto its standoff.
+fn boss(foot, roof, spec) {
+    let s = el_screw_of(spec.screw)
+    let h = roof - foot[1]
+    let d = spec.d ?? (if s == nil { 4mm } else { s.boss })
+    let column = m.cylinder({radius: d / 2 height: h at: [foot[0], foot[1] + h / 2, foot[2]]})
+    if s == nil { return {add: column cut: []} }
+    let bore = m.cylinder({radius: s.clear / 2 height: h + 2mm at: [foot[0], foot[1] + h / 2, foot[2]]})
+    // the cone starts 0.3mm inside the bore so the two cross, never meet edge to edge
+    let sink = m.cylinder({radius: s.clear / 2 - 0.3mm top_radius: s.head / 2 + 0.2mm height: (s.head - s.clear) / 2 + 0.5mm at: [foot[0], roof - (s.head - s.clear) / 4 - 0.05mm, foot[2]]})
+    return {add: column cut: [bore sink]}
+}
+
+// ---- legends
+
+// Legends on the lid: a part with one (a port's `legend`, the part's `label`) gets its words
+// engraved `depth` into the roof's top face beside its opening, `size` tall (its capitals) and
+// reading along the board's +x. They sit `gap` clear of the opening, or of the knob over it, on
+// the first side of below, above, right and left (the board's -y, +y, +x, -x) that stays `edge`
+// inside the lid's outline and `gap` clear of every other opening, knob, screw head and legend;
+// with no side clear, on the one that overlaps least. Below comes first: the board's -y edge is
+// its front, and a knob hides what stands behind it from a person in front. A part with several
+// ports through the roof gets one legend, by its first.
+//   ports  the case's ports; those facing up through the roof take a legend and bound the others
+//   frame  the case's board frame; shell the case's numbers (wo dd corner top lid_x)
+//   knob   the knobs' spec (shaft_knob's) when the case puts knobs on the shafts, else nil
+//   heads  [{at r}] what else opens in the roof's top, board frame (a screw's head)
+//   spec   {size 2.5mm depth 0.6mm gap 0.5mm edge}: edge by default the outside's corner radius
+// Gives {cut legends}: cut the engravings in place, for the lid; legends [{ref text at legend
+// legend_on}] each legend's fill as it prints (in the lid's print pose, to be emitted as a later
+// body of the lid's object in a filament that stands out from it) and in place, labelled by its
+// part ("Legend RV1"), at its middle [x y] in the board's frame. A text extrusion per legend and
+// O(legends x ports) box tests, on the evaluator's worker.
+fn lid_legends(ports, frame, shell, knob, heads, spec) {
+    let size = spec.size ?? 2.5mm
+    let depth = spec.depth ?? 0.6mm
+    let gap = spec.gap ?? 0.5mm
+    let edge = spec.edge ?? shell.corner
+    // the lid's top face, `edge` in, as a box [x0 y0 x1 y1] in the board's frame
+    let face = [frame.cx - shell.wo / 2 + edge, frame.cy - shell.dd / 2 + edge, frame.cx + shell.wo / 2 - edge, frame.cy + shell.dd / 2 - edge]
+    // what stands in the roof's top: each upward port's opening, or the knob over it
+    let boxes = []
+    let up = []
+    for p in ports {
+        if el_dir(p.dir)[1] > 0.7 {
+            let d = if knob != nil { el_knob_d(p, knob) } else { nil }
+            let b = if d != nil { [p.at[0] - d / 2, p.at[1] - d / 2, p.at[0] + d / 2, p.at[1] + d / 2] } else { el_box(p.opening, p.at) }
+            boxes.push(b)
+            up.push({port: p box: b})
+        }
+    }
+    for h in heads {
+        boxes.push([h.at[0] - h.r, h.at[1] - h.r, h.at[0] + h.r, h.at[1] + h.r])
+    }
+    let cut = []
+    let legends = []
+    let done = []
+    for u in up {
+        let p = u.port
+        let words = (p.legend ?? {}).text ?? ""
+        if words != "" && !el_has(done, p.ref ?? "") {
+            done.push(p.ref ?? "")
+            let w = size * (p.legend.aspect ?? (0.8 * words.len()))
+            let b = u.box
+            let mx = (b[0] + b[2]) / 2
+            let my = (b[1] + b[3]) / 2
+            let best = nil
+            let least = 0
+            for c in [[mx, b[1] - gap - size / 2] [mx, b[3] + gap + size / 2] [b[2] + gap + w / 2, my] [b[0] - gap - w / 2, my]] {
+                // a hair inside its box, so a side that only touches what it clears is clear
+                let t = [c[0] - w / 2 + 0.01mm, c[1] - size / 2 + 0.01mm, c[0] + w / 2 - 0.01mm, c[1] + size / 2 - 0.01mm]
+                let over = (t[2] - t[0]) * (t[3] - t[1]) - el_box_over(t, face)
+                for o in boxes {
+                    over = over + el_box_over(t, [o[0] - gap, o[1] - gap, o[2] + gap, o[3] + gap])
+                }
+                if best == nil || over < least {
+                    best = c
+                    least = over
+                }
+            }
+            boxes.push([best[0] - w / 2, best[1] - size / 2, best[0] + w / 2, best[1] + size / 2])
+            let at = el_at(frame, best)
+            let label = "Legend " + (p.refdes ?? p.ref ?? "")
+            cut.push(m.text({text: words size: size depth: depth + 0.01mm align: @center plane: @xz at: [at[0], shell.top - depth, at[2]]}))
+            // As it prints: the lid's print pose turns (x, y, z) into (x + lid_x, top - y, -z),
+            // so the words lie on the bed, reading right from below.
+            legends.push({
+                ref: p.ref ?? ""
+                text: words
+                at: best
+                legend: m.text({text: words size: size depth: depth align: @center plane: @xz rotate: [180deg, 0, 0] at: [at[0] + shell.lid_x, depth, 0 - at[2]] label: label})
+                legend_on: m.text({text: words size: size depth: depth align: @center plane: @xz at: [at[0], shell.top - depth, at[2]] label: label})
+            })
+        }
+    }
+    return {cut: cut legends: legends}
+}
+
+// The bounds [x0 y0 x1 y1] of `points` [[x y] ...] about `at` [x y ..].
+fn el_box(points, at) {
+    let b = [points[0][0], points[0][1], points[0][0], points[0][1]]
+    for q in points {
+        b = [min(b[0], q[0]), min(b[1], q[1]), max(b[2], q[0]), max(b[3], q[1])]
+    }
+    return [at[0] + b[0], at[1] + b[1], at[0] + b[2], at[1] + b[3]]
+}
+
+// The area two boxes [x0 y0 x1 y1] share.
+fn el_box_over(a, b) {
+    return max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(0, min(a[3], b[3]) - max(a[1], b[1]))
+}
+
+// Whether `list` holds the string `s`.
+fn el_has(list, s) {
+    let found = false
+    for q in list {
+        if q == s { found = true }
+    }
+    return found
+}
+
+// ---- light pipes
+
+// Light pipes from the LEDs facing up to the lid's top face, printed in clear filament into an
+// opaque block that hangs from the roof (a printed clear pipe diffuses: its tip glows as a matte
+// face). Each LED gets a straight channel through the block and the roof, a stadium `along` wide
+// along the row and `across` across it; the pipe fills the channel from `gap` over the LED's top
+// to the roof's outer face, flush. The block's walls round the channels are `wall` thick; LEDs
+// whose blocks would overlap share one block (a row of LEDs gets one block with a channel each),
+// a lone LED gets a block of its own. The lid's walls between two channels are what keeps one
+// LED's light out of its neighbour's pipe: a group whose channels come closer than two 0.4mm
+// lines is refused, with the reason, and its LEDs keep their plain holes.
+//   ports   the board's ports; only @light ports facing up take a pipe
+//   frame   the case's board frame; shell the case's numbers (roof_in, top, lid_x)
+//   spec    {gap: 0.4mm  along: 1.2mm  across: 2mm  wall: 1.2mm  throughput: 0.2  source: @estimate}
+//           throughput the share of the LED's light that leaves the tip, an estimate until a
+//           printed coupon measures it
+// Gives {lid: {add cut} pipes refused keepouts}: add the blocks and cut the channels, in place,
+// for the lid; keepouts the board space each block takes, as m.keepouts records ({board name
+// area z}: its plan in the board's frame, from its underside up to the roof, above the board's
+// top surface), for the lid to keep clear; pipes [{port ref feature pipe pipe_on entry}] each pipe as it prints (in the lid's print
+// pose, to be emitted as a later body of the lid's object, so it prints into the lid in its own
+// filament) and in place, labelled by its LED ("Light pipe D1"), with the LED's feature linked,
+// an `exit` frame on its tip (origin on the tip, Z out of it) and its optics; refused the
+// groups' reasons. A plain extrusion per
+// channel and a box per block: O(LEDs) solids, on the evaluator's worker.
+fn light_block(ports, frame, shell, spec) {
+    let gap = spec.gap ?? 0.4mm
+    let along = spec.along ?? 1.2mm
+    let across = spec.across ?? 2mm
+    let wall = spec.wall ?? 1.2mm
+    let lit = []
+    for p in ports {
+        let d = el_dir(p.dir)
+        if (p.kind ?? @plug) == @light && d[1] > 0.7 {
+            let u0 = p.opening[0][0]
+            let u1 = u0
+            let v0 = p.opening[0][1]
+            let v1 = v0
+            for q in p.opening {
+                u0 = min(u0, q[0])
+                u1 = max(u1, q[0])
+                v0 = min(v0, q[1])
+                v1 = max(v1, q[1])
+            }
+            // the channel's short side along the LED's short side: u is model x, v model -z
+            let on_x = u1 - u0 <= v1 - v0
+            lit.push({port: p mouth: el_at(frame, p.at) hx: if on_x { along / 2 } else { across / 2 } hz: if on_x { across / 2 } else { along / 2 }})
+        }
+    }
+    // LEDs whose blocks meet share one: merge every group the next LED's block meets.
+    let groups = []
+    for a in lit {
+        let merged = [a]
+        let rest = []
+        for g in groups {
+            let meets = false
+            for b in g {
+                if abs(a.mouth[0] - b.mouth[0]) < a.hx + b.hx + 2 * wall && abs(a.mouth[2] - b.mouth[2]) < a.hz + b.hz + 2 * wall {
+                    meets = true
+                }
+            }
+            if meets {
+                for b in g { merged.push(b) }
+            } else {
+                rest.push(g)
+            }
+        }
+        rest.push(merged)
+        groups = rest
+    }
+    let adds = []
+    let cuts = []
+    let pipes = []
+    let refused = []
+    let keepouts = []
+    for g in groups {
+        // A row's channels turn their short side along the row.
+        let x0 = g[0].mouth[0]
+        let x1 = x0
+        let z0 = g[0].mouth[2]
+        let z1 = z0
+        for c in g {
+            x0 = min(x0, c.mouth[0])
+            x1 = max(x1, c.mouth[0])
+            z0 = min(z0, c.mouth[2])
+            z1 = max(z1, c.mouth[2])
+        }
+        let row_x = x1 - x0 >= z1 - z0
+        let chans = []
+        for c in g {
+            let hx = if g.len() < 2 { c.hx } else if row_x { along / 2 } else { across / 2 }
+            let hz = if g.len() < 2 { c.hz } else if row_x { across / 2 } else { along / 2 }
+            chans.push({port: c.port mouth: c.mouth hx: hx hz: hz})
+        }
+        let tight = ""
+        for i in 0..chans.len() {
+            for j in 0..chans.len() {
+                let a = chans[i]
+                let b = chans[j]
+                if i < j {
+                    let gx = abs(a.mouth[0] - b.mouth[0]) - a.hx - b.hx
+                    let gz = abs(a.mouth[2] - b.mouth[2]) - a.hz - b.hz
+                    if max(gx, gz) < 0.8mm - 0.001mm {
+                        tight = (a.port.ref ?? "") + " and " + (b.port.ref ?? "")
+                    }
+                }
+            }
+        }
+        if tight != "" {
+            refused.push("The light pipes of " + tight + " would leave less than two 0.4mm lines of lid between them: give the LEDs more room, or narrow the channels (along).")
+            continue
+        }
+        let bx0 = x0
+        let bx1 = x1
+        let bz0 = z0
+        let bz1 = z1
+        let entry = 0
+        for c in chans {
+            bx0 = min(bx0, c.mouth[0] - c.hx - wall)
+            bx1 = max(bx1, c.mouth[0] + c.hx + wall)
+            bz0 = min(bz0, c.mouth[2] - c.hz - wall)
+            bz1 = max(bz1, c.mouth[2] + c.hz + wall)
+            entry = max(entry, c.mouth[1] + gap)
+        }
+        let hi = shell.roof_in + 0.01mm
+        adds.push(m.box({size: [bx1 - bx0, hi - entry, bz1 - bz0] at: [(bx0 + bx1) / 2, (entry + hi) / 2, (bz0 + bz1) / 2]}))
+        // A part under the block must stay below its underside, as the LEDs do.
+        let surface = frame.y0 + frame.thickness
+        if entry < shell.roof_in && (frame.board ?? "") != "" {
+            let name = "Light pipe block"
+            for c in chans { name = name + " " + (c.port.refdes ?? c.port.ref ?? "") }
+            keepouts.push({
+                board: frame.board
+                name: name
+                area: [[bx0 + frame.cx, frame.cy - bz1], [bx1 + frame.cx, frame.cy - bz1], [bx1 + frame.cx, frame.cy - bz0], [bx0 + frame.cx, frame.cy - bz0]]
+                z: [entry - surface, shell.roof_in - surface]
+            })
+        }
+        for c in chans {
+            let section = Rect{size: [2 * c.hx, 2 * c.hz] corner: min(c.hx, c.hz) - 0.001mm}
+            let feature = c.port.feature ?? ""
+            cuts.push(el_link(m.extrude({sketch: section plane: @xz height: shell.top - entry + 1.01mm at: [c.mouth[0], entry - 0.01mm, c.mouth[2]]}), feature))
+            // As it prints: the lid's print pose turns (x, y, z) into (x + lid_x, top - y, -z),
+            // so the tip lies on the bed and its outward normal points down. A person reads it
+            // by the LED it serves.
+            let label = "Light pipe " + (c.port.refdes ?? c.port.ref ?? "")
+            let pipe = m.extrude({sketch: section plane: @xz height: shell.top - entry at: [c.mouth[0] + shell.lid_x, 0, 0 - c.mouth[2]]
+                frame: Frame{name: "exit" at: [0, 0, 0] rotate: [90deg, 0, 0]} label: label})
+            let pipe_on = m.extrude({sketch: section plane: @xz height: shell.top - entry at: [c.mouth[0], entry, c.mouth[2]]
+                frame: Frame{name: "exit" at: [0, shell.top - entry, 0] rotate: [-90deg, 0, 0]} label: label})
+            let optics = {throughput: spec.throughput ?? 0.2 source: spec.source ?? @estimate}
+            pipes.push({
+                port: c.port
+                ref: c.port.ref ?? ""
+                feature: feature
+                pipe: m.optics(el_link(pipe, feature), optics)
+                pipe_on: m.optics(el_link(pipe_on, feature), optics)
+                entry: entry
+            })
+        }
+    }
+    return {lid: {add: adds cut: cuts} pipes: pipes refused: refused keepouts: keepouts}
+}
+
+// ---- press pins
+
+// The distance from the origin to the nearest edge of the closed polygon `points` round it: the
+// widest circle about the origin that passes through it (a slot's half width, not its corners').
+fn el_inscribed(points) {
+    let r = 1000mm
+    let n = points.len()
+    for i in 0..n {
+        let a = points[i]
+        let b = if i + 1 < n { points[i + 1] } else { points[0] }
+        let ex = b[0] - a[0]
+        let ey = b[1] - a[1]
+        let ll = ex * ex + ey * ey
+        let t = if ll > 0 { min(max((0 - a[0] * ex - a[1] * ey) / ll, 0), 1) } else { 0 }
+        let px = a[0] + t * ex
+        let py = a[1] + t * ey
+        r = min(r, sqrt(px * px + py * py))
+    }
+    return r
+}
+
+// The sizes of the press pin for an upward @press port (see press_pin), or nil for any other
+// port. The roof's hole is the port's opening: the round shaft fills its narrowest width less
+// `fit` all round (a slot's half width) and the flange reaches 0.8mm past its widest, under the
+// roof. The cone between them is 45 degrees, so the pin prints standing on its shaft's top with no
+// support. The foot is the plunger's own width. The switch's housing lies the port's `stand`
+// under the plunger's top, so the foot is the travel the stand does not cover and 0.3mm long:
+// pressed its whole travel, the flange stays 0.3mm over the housing (a keyswitch's stem standing
+// as far out as it travels takes a 0.3mm foot; a part that states no stand, travel + 0.3mm). A
+// part that states no travel gets 0.5mm, more than a tactile switch's.
+fn el_pin_size(port, fit) {
+    let d = el_dir(port.dir)
+    if (port.kind ?? @plug) != @press || d[1] < 0.7 {
+        return nil
+    }
+    let r_in = el_inscribed(port.opening)
+    let r_out = 0
+    for q in port.opening {
+        r_out = max(r_out, sqrt(q[0] * q[0] + q[1] * q[1]))
+    }
+    let stated = port.travel ?? 0
+    let travel = if stated > 0 { stated } else { 0.5mm }
+    let shaft = r_in - fit
+    let flange_r = r_out + 0.8mm
+    let foot = max(travel - (port.stand ?? 0), 0) + 0.3mm
+    let flange = 0.8mm
+    return {
+        shaft: shaft
+        flange_r: flange_r
+        foot_r: min(max(r_in - (port.margin ?? 0), 0.5mm), shaft)
+        foot: foot
+        flange: flange
+        stack: foot + flange + flange_r - shaft
+        travel: travel
+        stated: stated > 0
+        proud: max(1mm, travel + 0.5mm)
+    }
+}
+
+// A button under the roof is out of a finger's reach through its hole, so a printed pin carries
+// the press: it stands on the plunger on its foot, its shaft passes up through the roof's hole
+// and stands `proud` over the roof, and its flange under the roof, wider than the hole, keeps it
+// in the closed case: it rises at most `play` off the plunger before the cone over the flange
+// meets the hole's rim. Pressed the switch's whole travel down, its shaft still stands
+// proud - travel over the roof, and its flange stays foot - travel over the plunger's unpressed
+// top, and foot - travel + stand over the housing.
+//   port      an upward @press port of `board(..)`; any other port gives nil
+//   frame     the case's board frame; shell the case's numbers (fit, roof_in, top)
+//   print_at  [x z] where the pin prints, standing on its shaft's top
+// Gives {name ref pin pin_on travel stated proud play foot flange_r height} or nil: pin as it
+// prints, pin_on in place on its plunger. The printed pin is the placed one turned over about X
+// and carries its place as the frame `case:<board>:pin:<ref>` (el_part_frame). The case makes room
+// for the pin (the roof rises over a button too close under it), so play is at least 0.3mm in an
+// enclosure.
+fn press_pin(port, frame, shell, print_at) {
+    let s = el_pin_size(port, shell.fit)
+    if s == nil {
+        return nil
+    }
+    let mouth = el_at(frame, port.at)
+    let height = shell.top + s.proud - mouth[1]
+    let points = [[0, 0] [s.foot_r, 0] [s.foot_r, s.foot] [s.flange_r, s.foot] [s.flange_r, s.foot + s.flange] [s.shaft, s.stack] [s.shaft, height] [0, height]]
+    return {
+        name: "Pin " + (port.ref ?? "")
+        ref: port.ref ?? ""
+        pin: m.revolve({sketch: Polygon{points: points} rotate: [180deg, 0, 0] at: [print_at[0], height, print_at[1]]
+            frame: el_part_frame(frame, "pin:" + (port.ref ?? ""), mouth)})
+        pin_on: m.revolve({sketch: Polygon{points: points} at: mouth})
+        travel: s.travel
+        stated: s.stated
+        proud: s.proud
+        play: shell.roof_in - mouth[1] - s.stack
+        foot: s.foot
+        flange_r: s.flange_r
+        height: height
+    }
+}
+
+// ---- knobs
+
+// The width of shaft_knob's knob on `port`, or nil where it makes none: spec.d, at least the
+// shaft's width and 4mm.
+fn el_knob_d(port, spec) {
+    let up = el_dir(port.dir)
+    if (port.kind ?? @plug) != @shaft || up[1] < 0.7 || (port.profile ?? []).len() < 3 {
+        return nil
+    }
+    return max(spec.d ?? 12mm, 2 * (el_inscribed(port.opening) - (port.margin ?? 0)) + 4mm)
+}
+
+// A shaft through the roof (a potentiometer's, an encoder's) takes a printed knob: a round body
+// `d` across and `height` tall, its top edge chamfered 0.6mm, and a groove 1mm wide and 0.6mm
+// deep across its top from the middle to the rim along the board's +y, its pointer (turn the
+// shaft to the middle of its travel before pushing the knob on, so it points up there). Its bore is the shaft's own section (`profile`),
+// `height` - 1.2mm deep: a printed hole comes out a little small, so it grips. The knob rides
+// `gap` over the roof, or higher where the shaft would reach past the bore's end (its tip stays
+// 0.3mm short of it). It prints standing on its top, the bore open upward.
+//   port      an upward @shaft port of `board(..)`; any other port gives nil
+//   frame     the case's board frame; shell the case's numbers (top)
+//   print_at  [x z] where the knob prints, standing on its top
+//   spec      {d height gap}: d 12mm (at least the shaft's width and 4mm), height 10mm, gap 0.5mm
+// Gives {name ref knob knob_on d height bottom engage} or nil: knob as it prints, knob_on in place
+// on its shaft, bottom its underside's height in the case, engage how far the shaft reaches into
+// its bore. The printed knob is the placed one turned over about X and carries its place as the
+// frame `case:<board>:knob:<ref>` (el_part_frame). An engage under a third of the bore's depth
+// gives the knob little hold: the shaft stands too short over the roof.
+fn shaft_knob(port, frame, shell, print_at, spec) {
+    let d = el_knob_d(port, spec)
+    if d == nil {
+        return nil
+    }
+    let section = port.profile
+    let r = d / 2
+    let h = spec.height ?? 10mm
+    let depth = h - 1.2mm
+    let tip = el_at(frame, port.at)
+    let bottom = max(shell.top + (spec.gap ?? 0.5mm), tip[1] + 0.3mm - depth)
+    let c = 0.6mm
+    // in place: the body round the shaft's axis from its underside up, the bore from below, the
+    // groove in its top toward the board's +y (model -z)
+    let body = [[0, 0] [r, 0] [r, h - c] [r - c, h] [0, h]]
+    let seat = [tip[0], bottom, tip[2]]
+    // round its own origin (the underside's centre): the body, the bore from below and the groove
+    // across its top toward -z, the board's +y
+    let cuts = fn() {
+        return [
+            m.extrude({sketch: Polygon{points: section} plane: @xz height: depth + 0.02mm both: true at: [0, depth / 2 - 0.01mm, 0]})
+            m.box({size: [1mm, 1.2mm, r + 1mm] at: [0, h, 0 - (r + 1mm) / 2]})
+        ]
+    }
+    let on = m.subtract(m.revolve({sketch: Polygon{points: body}}), cuts(), {at: seat})
+    // as it prints: turned over about x onto its top, the groove on the bed toward +z
+    let printed = m.subtract(m.revolve({sketch: Polygon{points: body}}), cuts(),
+        {rotate: [180deg, 0, 0] at: [print_at[0], h, print_at[1]] frame: el_part_frame(frame, "knob:" + (port.ref ?? ""), seat)})
+    return {
+        name: "Knob " + (port.ref ?? "")
+        ref: port.ref ?? ""
+        knob: printed
+        knob_on: on
+        d: d
+        height: h
+        bottom: bottom
+        engage: tip[1] - bottom
+    }
+}
+
+// The cutter for a port: its opening carried along dir from just behind the mouth to well past
+// the outside, in the case's frame. The opening's axes are the port's (u, v): v the board's
+// normal made square to dir (board +y for a port up or down), u = v x dir. A sideways port's
+// opening stands with v up; a port up or down cuts straight through the lid or the floor. A
+// connector that overhangs the board's edge has its mouth in or past the wall: the cutter then
+// starts 1mm inside the edge instead, so it crosses the whole wall the body passes through.
+fn port_cutout(port, frame) {
+    // A plug facing up (a pin header plugged from above) stands on the board through the lid:
+    // its cut starts at the board's top face, so the roof opens round the whole part. A shaft
+    // facing up passes up through the roof from its housing, its tip over the roof or under it:
+    // its cut starts at the board's top face too.
+    let up = el_dir(port.dir)
+    let mouth = el_at(frame, port.at)
+    let kind = port.kind ?? @plug
+    let rise = if (kind == @plug || kind == @shaft) && up[1] > 0.7 { mouth[1] - (frame.y0 + frame.thickness) } else { 0 }
+    let back = max(max(1mm, el_past_edge(port, frame) + 1mm), rise)
+    let cut = el_port_cut(Polygon{points: port.opening}, el_at(frame, port.at), el_dir(port.dir), back, back + 29mm)
+    return el_link(cut, port.feature ?? "")
+}
+
+// How far a sideways port's mouth lies past the board edge it faces (negative inside it); a port
+// up or down gives -1mm.
+fn el_past_edge(port, frame) {
+    let d = port.dir
+    return if abs(d[2]) > 0.7 { 0 - 1mm } else if abs(d[0]) >= abs(d[1]) {
+        if d[0] > 0 { port.at[0] - (frame.cx + frame.width / 2) } else { frame.cx - frame.width / 2 - port.at[0] }
+    } else {
+        if d[1] > 0 { port.at[1] - (frame.cy + frame.depth / 2) } else { frame.cy - frame.depth / 2 - port.at[1] }
+    }
+}
+
+// `sketch`, drawn in a port's (u, v) plane centred on its mouth, carried along `d` from `back`
+// behind the mouth to `len` past that.
+fn el_port_cut(sketch, mouth, d, back, len) {
+    let mid = [mouth[0] + d[0] * (len / 2 - back), mouth[1] + d[1] * (len / 2 - back), mouth[2] + d[2] * (len / 2 - back)]
+    // @xz draws u along +x and v along -z (board +y): right for a port up; a port down has u
+    // along -x, a half turn about the model's z
+    return if d[1] > 0.7 {
+        m.extrude({sketch: sketch plane: @xz height: len both: true at: mid})
+    } else if d[1] < -0.7 {
+        m.extrude({sketch: sketch plane: @xz height: len both: true at: mid rotate: [0, 0, 180deg]})
+    } else {
+        // @yz draws u along +z and v along +y with its normal along -x; the turn about y takes
+        // -x onto dir, and with it +z onto v x dir
+        m.extrude({sketch: sketch plane: @yz height: len both: true at: mid rotate: [0, atan2(d[2], 0 - d[0]), 0]})
+    }
+}
+
+// A sideways opening whose top lies below the joint's top (a card slot under the board) would
+// leave the base a bridge over it. This notch opens it up through the joint instead, as a cable
+// exit does, cut from the base alone: the lid's rim closes it from above. It rises from the
+// opening's middle to 0.5mm past the step and is 0.3mm wider each side, and it starts 1.5mm
+// behind the mouth, so none of its faces lies on the opening's. Gives [] or [notch]. Openings
+// that lie wholly above the joint, in the lid's wall, print as bridges in the lid.
+fn el_joint_notch(port, frame, shell) {
+    let d = el_dir(port.dir)
+    let mouth = el_at(frame, port.at)
+    let u0 = port.opening[0][0]
+    let u1 = u0
+    let v0 = port.opening[0][1]
+    let v1 = v0
+    for q in port.opening {
+        u0 = min(u0, q[0])
+        u1 = max(u1, q[0])
+        v0 = min(v0, q[1])
+        v1 = max(v1, q[1])
+    }
+    let joint = shell.split + shell.lip
+    if d[1] > 0.7 || d[1] < -0.7 || mouth[1] + v1 >= joint {
+        return []
+    }
+    let lo = (v0 + v1) / 2
+    let hi = joint + 0.5mm - mouth[1]
+    let notch = Polygon{points: [[u0 - 0.3mm, lo] [u1 + 0.3mm, lo] [u1 + 0.3mm, hi] [u0 - 0.3mm, hi]]}
+    return [el_link(el_port_cut(notch, mouth, d, 1.5mm, 30mm), port.feature ?? "")]
+}
+
+// A rounded rectangle in plan, `w` by `d`, from y = `lo` to y = `hi`.
+fn el_slab(w, d, r, lo, hi) {
+    return m.extrude({sketch: Rect{size: [w d] corner: max(r, 0.2mm)} plane: @xz height: hi - lo at: [0, lo, 0]})
+}
+
+// A wall's slot plane, middle and inner face. On left/right, `along` is model z; on
+// front/back it is model x. The cylinder's Y axis turns along that same direction.
+fn el_wall_face(shell, face, along, y) {
+    let side = face == @left || face == @right
+    let sign = if face == @left || face == @back { -1 } else { 1 }
+    let inner = if side { shell.wi / 2 } else { shell.di / 2 }
+    let mid = sign * (inner + shell.wall / 2)
+    return {
+        plane: if side { @yz } else { @xy }
+        at: if side { [mid, y, along] } else { [along, y, mid] }
+        inside: if side { [sign * inner, y, along] } else { [along, y, sign * inner] }
+        rotate: if side { [90deg, 0, 0] } else { [0, 0, 90deg] }
+    }
+}
+
+// Parallel slots through a face: @top uses `at: [x z]`, walls (@left, @right, @front,
+// @back) use `[along y]`. `size: [w h]` is the field, with slots running along h and
+// repeated across w, centred, as many as fit. `slot` defaults to 1.8mm (finger-safe),
+// `pitch` to twice slot and `corner` to slot / 2. Wall slots stand along Y to print.
+// Gives {cut} in the assembled frame, applied to both halves wherever their walls lie.
+fn vent(shell, spec) {
+    let slot = spec.slot ?? 1.8mm
+    let pitch = spec.pitch ?? 2 * slot
+    let corner = spec.corner ?? slot / 2
+    let w = spec.size[0]
+    let h = spec.size[1]
+    let count = max(0, floor((w - slot) / pitch) + 1)
+    let cuts = []
+    for i in 0..count {
+        let along = spec.at[0] + (i - (count - 1) / 2) * pitch
+        let shape = Rect{size: [slot h] corner: corner}
+        if spec.face == @top {
+            cuts.push(m.extrude({sketch: shape plane: @xz height: shell.top - shell.roof_in + 1mm at: [along, shell.roof_in - 0.5mm, spec.at[1]]}))
+        } else {
+            let face = el_wall_face(shell, spec.face, along, spec.at[1])
+            cuts.push(m.extrude({sketch: shape plane: face.plane height: shell.wall + 1mm both: true at: face.at}))
+        }
+    }
+    return {cut: cuts}
+}
+
+// A shallow finger dish in a wall (@left, @right, @front, @back), `at: [along y]` as a
+// vent. Its rim has radius `r` (5mm), its `depth` (1mm) stays less than shell.wall.
+// One sphere outside the outer face cuts the dish; its walls lean at most asin(r / R)
+// from the wall plane, so the defaults print without support.
+// Gives {cut} in the assembled frame, applied to both halves wherever their walls lie.
+fn finger_notch(shell, spec) {
+    let r = spec.r ?? 5mm
+    let depth = spec.depth ?? 1mm
+    let R = (r * r + depth * depth) / (2 * depth)
+    let face = el_wall_face(shell, spec.face, spec.at[0], spec.at[1])
+    let side = spec.face == @left || spec.face == @right
+    let sign = if spec.face == @left || spec.face == @back { -1 } else { 1 }
+    let offset = sign * (shell.wall / 2 + R - depth)
+    let at = if side { [face.at[0] + offset, face.at[1], face.at[2]] } else { [face.at[0], face.at[1], face.at[2] + offset] }
+    return {cut: [m.sphere({radius: R at: at})]}
+}
+
+// A flat cable at the joint (`face`, `at` along the wall, cable `width` and `thick`):
+// a notch with `margin` (0.3mm) all round and a 45 degree inner chamfer `bend` (1mm)
+// deep. It sits at the joint so both halves print open, with no bridge. The outer wall
+// keeps a recess `lip` tall over the cable; the lid's tongue closes it inside, with its
+// rim at split + fit. A cable that leaves its connector above the joint gives `over`, how
+// far its opening (margin included) reaches above split: past the tongue's rim, the lid is
+// notched from its rim up to there, open at the rim as it prints. Gives {base: {add cut}
+// lid: {add cut}}. Sideways cable ports whose openings fit from split - h to split + lip +
+// 0.5mm use this too (h is the opening's height); their opening already includes their margin.
+fn cable_exit(shell, spec) {
+    let margin = spec.margin ?? 0.3mm
+    let bend = spec.bend ?? 1mm
+    let w = spec.width + 2 * margin
+    let h = spec.thick + 2 * margin
+    let side = spec.face == @left || spec.face == @right
+    let lower = shell.split - h
+    let upper = shell.split + shell.lip + 0.5mm
+    let face = el_wall_face(shell, spec.face, spec.at, (lower + upper) / 2)
+    let edge = el_wall_face(shell, spec.face, spec.at, lower)
+    // Cross both wall faces by 0.5mm and extend above the step, leaving the notch open.
+    let notch = m.box({size: if side { [shell.wall + 1mm, upper - lower, w] } else { [w, upper - lower, shell.wall + 1mm] } at: face.at})
+    // The diamond removes a triangle with legs `bend`; its ends stop 0.2mm short of
+    // the notch's sides, so the cuts cross without coincident side faces.
+    let across = bend * sqrt(2)
+    let chamfer = m.box({size: if side { [across, across, w - 0.4mm] } else { [w - 0.4mm, across, across] } at: edge.inside rotate: if side { [0, 0, 45deg] } else { [45deg, 0, 0] }})
+    let over = spec.over ?? 0
+    let rim = el_wall_face(shell, spec.face, spec.at, shell.split + over / 2)
+    let lid_cut = if over <= shell.fit { [] } else {
+        [m.box({size: if side { [shell.wall + 1mm, over, w] } else { [w, over, shell.wall + 1mm] } at: rim.at})]
+    }
+    return {base: {add: [] cut: [notch chamfer]} lid: {add: [] cut: lid_cut}}
+}
+
+// Rounded snaps along the joint: `count: {long: 2 short: 1}` per side, `width: 8mm`,
+// `hook: 0.4mm` proud of the lid's tongue. Cylinders along its outer faces at split +
+// lip / 2 make the bumps; matching grooves, hook + fit / 2 in radius on the same axes,
+// cut the base's step. Centres span each side evenly; every bump and groove ends 1mm
+// before the corner arc starts, never on it.
+// Gives {base: {add cut} lid: {add cut}}, entirely in the assembled frame.
+fn snap_lip(shell, spec) {
+    let count = spec.count ?? {}
+    let width = spec.width ?? 8mm
+    let hook = spec.hook ?? 0.4mm
+    let y = shell.split + shell.lip / 2
+    let bumps = []
+    let grooves = []
+    for side in [@front @back @left @right] {
+        let along_x = side == @front || side == @back
+        let length = if along_x { shell.wo } else { shell.dd }
+        let long_side = if along_x { shell.wo >= shell.dd } else { shell.dd > shell.wo }
+        let n = if long_side { count.long ?? 2 } else { count.short ?? 1 }
+        let reach = length / 2 - shell.corner - width / 2 - 1mm
+        let sign = if side == @back || side == @left { -1 } else { 1 }
+        let face = ((if along_x { shell.di } else { shell.wi }) + shell.wall - shell.fit) / 2
+        let turn = if along_x { [0, 0, 90deg] } else { [90deg, 0, 0] }
+        for i in 0..n {
+            let along = if n == 1 { 0 } else { (2 * i / (n - 1) - 1) * reach }
+            let at = if along_x { [along, y, sign * face] } else { [sign * face, y, along] }
+            bumps.push(m.cylinder({radius: hook height: width at: at rotate: turn}))
+            grooves.push(m.cylinder({radius: hook + shell.fit / 2 height: width at: at rotate: turn}))
+        }
+    }
+    return {base: {add: [] cut: grooves} lid: {add: bumps cut: []}}
+}
+
+// ---- the case
+
+// A two-part case round a board: a base with the board on standoffs and walls up to the board's
+// top face, and a lid over the parts with screw posts that press the board onto the standoffs,
+// joined by a stepped lip (the base's outer half rises into a step of the lid's), with a cutout
+// through the walls or the lid for every port (one in a wall below the joint opens up through
+// it). The lid comes upside down beside the base, as it prints; `lid_pose` turns it back onto
+// the base.
+//
+//   wall 2mm, floor 1.6mm, roof 1.6mm, corner 3mm (the outside's corner radius)
+//   gap 0.4mm      the board's clearance to the walls, all round
+//   top_gap 1mm    over the tallest part on the top face, under the roof
+//   lip 1.2mm      the joint's height (3mm with snaps); fit 0.2mm its clearance
+//   fasten: @screws (default) or @snaps (solid standoffs and pressers, no screw holes)
+//   snaps: {count: {long: 2 short: 1} width: 8mm hook: 0.4mm}
+//   standoffs: {height 3mm d screw insert @heat_set}
+//                  the height grows to clear the bottom side's parts by bottom_gap (1mm);
+//                  screw: one size for every hole (@M2, @M2_5, @M3), else each hole's from
+//                  its drill (the largest screw through it, `m.screw`); a hole no screw
+//                  passes gets a plain standoff and a presser over it;
+//                  insert @heat_set: a heat-set insert's hole in each (case.inserts, melted
+//                  in after the print), the standoff as wide and tall as it wants round and
+//                  under it; @self_tap a pilot hole the screw cuts its own thread in; @none;
+//                  d: by default the table's boss for the screw and its insert
+//   posts: {d}     the lid's screw posts, one over each hole, the screw through the board
+//                  into the standoff; d by default the screw's boss
+//   holes: []      options for single holes, by name: {name post: false} leaves that hole
+//                  without a lid post, where a part beside it leaves no room for one (the
+//                  board rests on the standoff there; no screw goes through it); {name screw
+//                  insert d} gives that hole its own fixing
+//   rests: @auto    pins under the board and pressers over it at the corners no hole holds
+//                  (inset 2.5mm, 4mm across), or a list of board points, or []
+//   ports: @auto (one cutout each) or a list of ports; sideways cable openings within
+//                  the cable_exit span use its base-only cuts, linked to the port
+//   vents: []      vent specs (face, at, size, optional slot, pitch, corner)
+//   notches: []    finger_notch specs (wall face, at: [along y], optional r, depth)
+//   exits: []      cable_exit specs (wall face, at, width, thick, optional margin, bend)
+//   lid_at         where the printed lid's middle sits beside the base, default a wall's width
+//                  past it
+//   pins: true     a press pin (press_pin) through the roof for every button facing up, printed
+//                  beside the lid; the roof rises where one would not fit under it. false leaves
+//                  the bare holes.
+//   knobs: true    a knob (shaft_knob) on every shaft facing up through the roof, printed
+//                  beside the pins; knob: {d height gap} its sizes. false leaves the bare
+//                  shafts through their holes.
+//   pipes: nil     light pipes (light_block) from every LED facing up to the lid's top face,
+//                  printed into the lid: {} for the defaults, or light_block's spec. nil leaves
+//                  the plain light holes.
+//   legends: true  each part's legend engraved in the lid's top beside its opening
+//                  (lid_legends); legend: {size depth gap edge} its sizes. false leaves the roof
+//                  plain.
+//
+// Gives {base lid lid_on base_shell base_ports lid_shell lid_ports pins knobs pipes legends inserts
+// fixings refused board lid_pose frame rests heights size shell}: fixings each hole's (`fixing`: its screw
+// from the table, insert, standoff and post widths); inserts the standoffs' heat-set inserts in place,
+// each named after its hole, to be inserted into the base after the print (insert(i.part, name:
+// i.name, into: "Base", melt: i));
+// pins the press pins and knobs the knobs, each to be emitted as its own
+// object; pipes the light pipes (light_block's), each to be emitted as a later body of the lid's
+// object (object([case.lid] + for p in case.pipes { p.pipe }, ..)), legends the legends' fills
+// (lid_legends'), each to be emitted the same way when the legends should stand out in another
+// filament (without them the words stay engraved), refused why a group of LEDs got no pipes; base and lid as they print, the lid and board in place (the lid and lid_on keep
+// the light blocks' board space clear: light_block's keepouts), and the numbers
+// the checks and the pieces read. Base, lid and lid_on carry the board's frame (el_case_frame),
+// so the host finds them and maps them into the board's frame whatever they are named.
+// base_shell and lid_shell are in place, with those frames and every cut but their ports;
+// base_ports holds the port cutters and joint notches, or a cable port's exit cuts;
+// lid_ports holds the other port cutters and a cable port's lid notch, each linked with its
+// port's feature (a panel's claimable cuts, see the header).
+// Pieces add O(slots) solids: a few dozen booleans on the evaluator's worker, never per frame.
+fn enclosure(pcb, opts) {
+    let wall = opts.wall ?? 2mm
+    let floor = opts.floor ?? 1.6mm
+    let roof = opts.roof ?? 1.6mm
+    let corner = opts.corner ?? 3mm
+    let gap = opts.gap ?? 0.4mm
+    let top_gap = opts.top_gap ?? 1mm
+    let bottom_gap = opts.bottom_gap ?? 1mm
+    let fasten = opts.fasten ?? @screws
+    let lip = opts.lip ?? (if fasten == @snaps { 3mm } else { 1.2mm })
+    let fit = opts.fit ?? 0.2mm
+    let so = opts.standoffs ?? {}
+    // Each hole's fixing from the shared screw table: a board with holes of several sizes gets
+    // each its own screw, insert and standoff.
+    let fixings = []
+    for h in pcb.holes {
+        fixings.push(fixing(h, el_hole_opts(opts.holes ?? [], h.name), so, opts.posts ?? {}, floor, fasten))
+    }
+    // The standoffs carry the board clear of its bottom side's parts and hold their inserts, each
+    // insert's floor under its hole with the case's floor; one height for all (the board is flat).
+    let below = el_height(pcb, @bottom)
+    let so_h = max(so.height ?? 3mm, below + bottom_gap)
+    for f in fixings { so_h = max(so_h, f.height) }
+    let frame = el_frame(pcb, floor + so_h)
+    let board_top = frame.y0 + pcb.thickness
+    let ports = if (opts.ports ?? @auto) == @auto { pcb.ports } else { opts.ports }
+    // A part plugged from above passes through its opening in the lid when the case cuts that
+    // opening: the roof then clears the tallest part it covers, not that part.
+    let all_up_cut = true
+    for p in pcb.ports {
+        let up = el_dir(p.dir)
+        if (p.kind ?? @plug) == @plug && up[1] > 0.7 && !el_lists_port(ports, p) {
+            all_up_cut = false
+        }
+    }
+    let above = if all_up_cut { pcb.envelope.covered ?? el_height(pcb, @top) } else { el_height(pcb, @top) }
+    let pins_on = opts.pins ?? true
+    let knobs_on = opts.knobs ?? true
+    let roof_in = board_top + above + top_gap
+    // A press pin's foot, flange and cone go between its plunger and the roof, with 0.3mm to
+    // rise: the roof goes up over a button too close under it.
+    if pins_on {
+        for p in ports {
+            let size = el_pin_size(p, fit)
+            if size != nil {
+                let mouth = el_at(frame, p.at)
+                roof_in = max(roof_in, mouth[1] + size.stack + 0.3mm)
+            }
+        }
+    }
+    let top = roof_in + roof
+    // Plan: the cavity is the board's bounds and the gap; the step sits at the wall's middle.
+    let wi = frame.width + 2 * gap
+    let di = frame.depth + 2 * gap
+    let wo = wi + 2 * wall
+    let dd = di + 2 * wall
+    // The cavity's corners round no more than the gap, so a square board's corners keep the gap
+    // too: a 1 mm round with a 0.4 mm gap comes within 0.15 mm of them.
+    let ri = min(corner - wall, gap)
+    let rm = corner - wall / 2
+    let split = board_top
+
+    // The base: floor and walls to the board's top face, the outer half of the wall rising
+    // `lip` more as the joint's step, a standoff under every hole.
+    // the printed lid's middle beside the base
+    let lid_x = opts.lid_at ?? wo + 10mm
+    let shell = {wall: wall floor: floor roof: roof corner: corner gap: gap fit: fit lip: lip wi: wi di: di wo: wo dd: dd split: split roof_in: roof_in top: top lid_x: lid_x}
+    let base_walls = m.subtract(el_slab(wo, dd, corner, 0, split), el_slab(wi, di, ri, floor, split + 1mm))
+    let step = m.subtract(el_slab(wo, dd, corner, split - 0.01mm, split + lip), el_slab(wi + wall + fit, di + wall + fit, rm + fit / 2, split - 1mm, split + lip + 1mm))
+    let base_adds = [step]
+    let base_cuts = []
+    let lid_adds = []
+    let lid_cuts = []
+    let base_ports = []
+    let lid_ports = []
+    let lit_cuts = []
+    let pipe_spec = opts.pipes ?? nil
+    let joint_notches = []
+    for p in ports {
+        let d = el_dir(p.dir)
+        if (p.kind ?? @plug) == @cable && abs(d[1]) < 0.3 {
+            let mouth = el_at(frame, p.at)
+            let u0 = p.opening[0][0]
+            let u1 = u0
+            let v0 = p.opening[0][1]
+            let v1 = v0
+            for q in p.opening {
+                u0 = min(u0, q[0])
+                u1 = max(u1, q[0])
+                v0 = min(v0, q[1])
+                v1 = max(v1, q[1])
+            }
+            let h = v1 - v0
+            if mouth[1] + v0 >= split - h && mouth[1] + v1 <= split + lip + 0.5mm {
+                let side = abs(d[0]) >= abs(d[2])
+                let face = if side { if d[0] > 0 { @right } else { @left } } else { if d[2] > 0 { @front } else { @back } }
+                // The opening already includes the margin; cable_exit adds it back once.
+                let margin = p.margin ?? 0.3mm
+                let piece = cable_exit(shell, {face: face at: if side { mouth[2] } else { mouth[0] } width: u1 - u0 - 2 * margin thick: h - 2 * margin margin: margin over: mouth[1] + v1 - split})
+                for c in piece.base.cut { base_ports.push(el_link(c, p.feature ?? "")) }
+                for c in piece.lid.cut { lid_ports.push(el_link(c, p.feature ?? "")) }
+                continue
+            }
+        }
+        let c = port_cutout(p, frame)
+        base_ports.push(c)
+        // an LED facing up under light pipes gets its hole from them (or back, if refused)
+        if pipe_spec != nil && (p.kind ?? @plug) == @light && d[1] > 0.7 {
+            lit_cuts.push({port: p cut: c})
+        } else {
+            lid_ports.push(c)
+        }
+        for c in el_joint_notch(p, frame, shell) { joint_notches.push(c) }
+    }
+    for c in joint_notches { base_ports.push(c) }
+    let inserts = []
+    for k in 0..pcb.holes.len() {
+        let h = pcb.holes[k]
+        let fx = fixings[k]
+        let at = el_at(frame, h.at)
+        let feature = h.feature ?? ""
+        let own = el_hole_opts(opts.holes ?? [], h.name)
+        let foot = standoff([at[0], floor - 0.01mm, at[2]], {height: so_h + 0.01mm d: fx.d screw: fx.screw insert: fx.insert floor: floor name: h.name})
+        base_adds.push(el_link(foot.add, feature))
+        for c in foot.cut { base_cuts.push(el_link(c, feature)) }
+        if foot.insert != nil { inserts.push(foot.insert) }
+        if !(own.post ?? true) {
+            continue
+        }
+        if fasten == @snaps || fx.screw == nil {
+            let post = m.cylinder({radius: fx.post_d / 2 height: top - board_top - 0.01mm at: [at[0], (board_top + top - 0.01mm) / 2, at[2]]})
+            lid_adds.push(el_link(post, feature))
+        } else {
+            let post = boss([at[0], board_top, at[2]], top - 0.01mm, {d: fx.post_d screw: fx.screw})
+            lid_adds.push(el_link(post.add, feature))
+            for c in post.cut { lid_cuts.push(el_link(c, feature)) }
+        }
+    }
+    // The board's corners no screw holds: a pin under each and a presser over it.
+    let rest_d = 4mm
+    let rests = if (opts.rests ?? @auto) == @auto { el_rests(pcb, frame, 2.5mm, 12mm) } else { opts.rests }
+    for p in rests {
+        let at = el_at(frame, p)
+        base_adds.push(m.cylinder({radius: rest_d / 2 height: frame.y0 - floor + 0.02mm at: [at[0], (floor + frame.y0) / 2, at[2]]}))
+        lid_adds.push(m.cylinder({radius: rest_d / 2 height: top - board_top - 0.01mm at: [at[0], (board_top + top) / 2, at[2]]}))
+    }
+    for spec in opts.vents ?? [] {
+        let piece = vent(shell, spec)
+        // The step overlaps the tongue above split: wall openings cut both halves.
+        for c in piece.cut {
+            base_cuts.push(c)
+            lid_cuts.push(c)
+        }
+    }
+    for spec in opts.notches ?? [] {
+        let piece = finger_notch(shell, spec)
+        for c in piece.cut {
+            base_cuts.push(c)
+            lid_cuts.push(c)
+        }
+    }
+    for spec in opts.exits ?? [] {
+        let piece = cable_exit(shell, spec)
+        for a in piece.base.add { base_adds.push(a) }
+        for c in piece.base.cut { base_cuts.push(c) }
+        for a in piece.lid.add { lid_adds.push(a) }
+        for c in piece.lid.cut { lid_cuts.push(c) }
+    }
+    if fasten == @snaps {
+        let snaps = snap_lip(shell, opts.snaps ?? {})
+        for a in snaps.base.add { base_adds.push(a) }
+        for c in snaps.base.cut { base_cuts.push(c) }
+        for a in snaps.lid.add { lid_adds.push(a) }
+        for c in snaps.lid.cut { lid_cuts.push(c) }
+    }
+    let base_shell = if base_cuts.len() == 0 {
+        m.union(base_walls, base_adds, {frame: el_case_frame(pcb, frame, "base")})
+    } else {
+        m.subtract(m.union(base_walls, base_adds), base_cuts, {frame: el_case_frame(pcb, frame, "base")})
+    }
+    let base = if base_ports.len() == 0 { base_shell } else {
+        m.subtract(base_shell, base_ports, {frame: el_case_frame(pcb, frame, "base")})
+    }
+
+    // Light pipes: the blocks and channels go into the lid; an LED whose group was refused keeps
+    // its plain hole.
+    let unpiped = {lid: {add: [] cut: []} pipes: [] refused: [] keepouts: []}
+    let piped = if pipe_spec == nil { unpiped } else { light_block(ports, frame, shell, pipe_spec) }
+    for a in piped.lid.add { lid_adds.push(a) }
+    for c in piped.lid.cut { lid_cuts.push(c) }
+    let piped_ports = for q in piped.pipes { q.port }
+    for l in lit_cuts {
+        if !el_lists_port(piped_ports, l.port) { lid_ports.push(l.cut) }
+    }
+
+    // Legends beside the openings in the roof's top: clear of the knobs when the case puts them on
+    // and of the screws' heads.
+    let heads = []
+    if fasten != @snaps {
+        for k in 0..pcb.holes.len() {
+            if fixings[k].screw != nil && (el_hole_opts(opts.holes ?? [], pcb.holes[k].name).post ?? true) {
+                heads.push({at: pcb.holes[k].at r: fixings[k].screw.head / 2 + 0.2mm})
+            }
+        }
+    }
+    let marked = {cut: [] legends: []}
+    if opts.legends ?? true {
+        marked = lid_legends(ports, frame, shell, if knobs_on { opts.knob ?? {} } else { nil }, heads, opts.legend ?? {})
+    }
+    for c in marked.cut { lid_cuts.push(c) }
+
+    // The lid, made in place over the base: walls from the step down to the roof, and inside
+    // them a tongue of the wall's inner half that drops into the base's step.
+    let cap = m.subtract(el_slab(wo, dd, corner, split + lip, top), el_slab(wi, di, ri, split, roof_in))
+    let tongue = m.subtract(el_slab(wi + wall - fit, di + wall - fit, rm - fit / 2, split + fit, split + lip + 0.01mm), el_slab(wi, di, ri, split, split + lip + 1mm))
+    lid_adds.push(tongue)
+    let lid_shell = if lid_cuts.len() == 0 {
+        m.union(cap, lid_adds, {frame: el_case_frame(pcb, frame, "lid")})
+    } else {
+        m.subtract(m.union(cap, lid_adds), lid_cuts, {frame: el_case_frame(pcb, frame, "lid")})
+    }
+    // As it prints: turned over about X, its top face on the bed, beside the base.
+    let print_pose = {rotate: [180deg, 0, 0] at: [lid_x, top, 0] frame: el_case_frame(pcb, frame, "lid")}
+    let lid = if lid_ports.len() != 0 {
+        m.subtract(lid_shell, lid_ports, print_pose)
+    } else if lid_cuts.len() != 0 {
+        m.subtract(m.union(cap, lid_adds), lid_cuts, print_pose)
+    } else {
+        m.union(cap, lid_adds, print_pose)
+    }
+    // The lid where it sits on the base, for the checks and an assembled view (built only when
+    // a script emits it).
+    let lid_on = if lid_ports.len() == 0 { lid_shell } else {
+        m.subtract(lid_shell, lid_ports, {frame: el_case_frame(pcb, frame, "lid")})
+    }
+    // The lid keeps its light blocks' board space clear, wherever a script emits it: the host
+    // reserves that space on the board, so DRC finds a part placed under a block.
+    if piped.keepouts.len() != 0 {
+        m.keepouts(lid, piped.keepouts)
+        m.keepouts(lid_on, piped.keepouts)
+    }
+    // The press pins print beside the lid, each standing on its shaft's top.
+    let pins = []
+    if pins_on {
+        let x = lid_x + wo / 2 + 10mm
+        for p in ports {
+            let pin = press_pin(p, frame, shell, [x, 0])
+            if pin != nil {
+                pins.push(pin)
+                x = x + 2 * pin.flange_r + 4mm
+            }
+        }
+    }
+    // The knobs print after them, each standing on its top.
+    let knobs = []
+    if knobs_on {
+        let x = lid_x + wo / 2 + 10mm
+        for pin in pins {
+            x = x + 2 * pin.flange_r + 4mm
+        }
+        for p in ports {
+            let d = el_knob_d(p, opts.knob ?? {})
+            if d != nil {
+                knobs.push(shaft_knob(p, frame, shell, [x + d / 2, 0], opts.knob ?? {}))
+                x = x + d + 4mm
+            }
+        }
+    }
+    let pcb_part = board_solid(pcb, [], frame)
+    return {
+        base: base
+        lid: lid
+        lid_on: lid_on
+        base_shell: base_shell
+        base_ports: base_ports
+        lid_shell: lid_shell
+        lid_ports: lid_ports
+        pins: pins
+        knobs: knobs
+        inserts: inserts
+        fixings: fixings
+        pipes: piped.pipes
+        legends: marked.legends
+        refused: piped.refused
+        board: pcb_part
+        lid_pose: {at: [0, top, 0] rotate: [180deg, 0, 0] from: [lid_x, 0, 0]}
+        frame: frame
+        rests: rests
+        heights: {floor: floor standoff: so_h board_bottom: frame.y0 board_top: board_top split: split roof_in: roof_in top: top}
+        size: [wo, top, dd]
+        // the walls' plan and heights, what the pieces added to a case read
+        shell: shell
+    }
+}
+
+let el_library = {
+    enclosure: enclosure
+    standoff: standoff
+    boss: boss
+    port_cutout: port_cutout
+    board_solid: board_solid
+    board_mount: board_mount
+    vent: vent
+    finger_notch: finger_notch
+    cable_exit: cable_exit
+    snap_lip: snap_lip
+    press_pin: press_pin
+    shaft_knob: shaft_knob
+    light_block: light_block
+    lid_legends: lid_legends
+    fixing: fixing
+}
+el_library

@@ -1,0 +1,9 @@
+// A river pebble with flow lines drawn over it, in two filaments.
+use mod.fab.*
+
+script("flow_pebble.cad.splash")
+
+color("Slate", rgb: #x3b4047)
+color("Cream", rgb: #xefe6d2)
+
+place("flow_pebble", at: [175mm 160mm], name: "Flow pebble", color: "Slate")

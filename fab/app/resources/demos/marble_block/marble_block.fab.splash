@@ -1,0 +1,10 @@
+// A block of veined marble: black stone with white veins through its whole volume, printed
+// in two filaments.
+use mod.fab.*
+
+script("marble_block.cad.splash")
+
+color("Black")
+color("White")
+
+place("marble_block", object: "block", color: "Black")

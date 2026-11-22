@@ -1,0 +1,21 @@
+// A sheet of chainmail in two filaments: every link interlocked with its four neighbours,
+// printed flat in one go and held together by contact alone, with a diamond motif of rings in
+// the second colour. It comes off the bed as cloth: drape it in Mechanics.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+let mail_width = param(90mm, min: 30mm, max: 200mm, step: 1mm, label: "Width", group: "Chainmail sheet")
+let mail_depth = param(90mm, min: 30mm, max: 200mm, step: 1mm, label: "Depth", group: "Chainmail sheet")
+let mail_size = param(6mm, min: 5mm, max: 6.5mm, step: 0.1mm, label: "Link half size", group: "Chainmail sheet", hint: "from the link's centre to the middle of its bar")
+let mail_bar = param(0.8mm, min: 0.6mm, max: 1mm, step: 0.05mm, label: "Bar radius", group: "Chainmail sheet")
+let motif = param(26mm, min: 8mm, max: 80mm, step: 1mm, label: "Motif", group: "Pattern", hint: "the width of each diamond ring")
+
+let sheet = m.mail(Rect{size: [mail_width mail_depth]}, {size: mail_size bar: mail_bar})
+
+object(sheet, name: "Chainmail sheet")
+
+// Concentric diamonds from the sheet's centre, alternating colour ring by ring.
+let steel = Material{albedo: [0.32 0.34 0.38] name: "Steel"}
+let copper = Material{albedo: [0.78 0.38 0.18] name: "Copper"}
+m.fill(sheet, Mix{materials: [steel copper] field: fn(p) { noise.bands((abs(p.x) + abs(p.z)) / motif) } sharp: 1})

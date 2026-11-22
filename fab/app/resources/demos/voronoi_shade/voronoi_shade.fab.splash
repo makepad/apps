@@ -1,0 +1,9 @@
+// A Voronoi lamp shade: cells in a translucent filament, the web between them in an opaque one.
+use mod.fab.*
+
+script("voronoi_shade.cad.splash")
+
+color("Ink", rgb: #x1a1a1c)
+color("Glow", rgb: #xf5eedb)
+
+place("voronoi_shade", at: [175mm 160mm], name: "Voronoi shade", color: "Glow")

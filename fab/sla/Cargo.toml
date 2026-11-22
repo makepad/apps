@@ -1,0 +1,23 @@
+[package]
+name = "fab-sla"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab's resin slicer: a masked resin printer's profile, and each layer of the plate as the image its screen shows (the cross-section on the pixel grid, anti-aliased by coverage), from distance fields and meshes alike"
+
+[dependencies]
+fab-plate = { path = "../plate" }
+fab-sdf-tiles = { path = "../sdf_tiles" }
+fab-sla-archive = { path = "../sla_archive" }
+makepad-core-util = { path = "../../../../libs/core_util" }
+makepad-csg-sdf = { path = "../../../../libs/csg/csg_sdf" }
+makepad-fab-settings = { path = "../settings" }
+makepad-fab-slicer = { path = "../slicer" }
+makepad-fast-inflate = { path = "../../../../libs/fast_inflate" }
+makepad-strict-json = { path = "../../../../libs/strict_json" }
+makepad-zip-file = { path = "../../../../libs/zip_file" }
+makepad-zune-png = { path = "../../../../libs/zune/zune-png" }
+
+[dev-dependencies]
+makepad-csg-math = { path = "../../../../libs/csg/csg_math" }

@@ -1,0 +1,20 @@
+// An LED chaser on an ATmega328P at 5 V and 16 MHz, in its printed case. Its electronics are the
+// plate's documents: the circuit, the MCU part, the board, the firmware and the bench. Open the
+// Bench workspace and press Play: the firmware runs on the simulated MCU and the LEDs chase
+// in the sheet. The case (ledavr.cad.splash) prints its base, the lid beside it and the button's
+// press pin; the board rides in the base, off the print, and the 3D view shows it in place.
+use mod.fab.*
+
+script("ledavr.cad.splash")
+
+// A dark case, so the light pipes' tips stand out and no LED's light shows through the lid; the
+// pipes print in clear PETG in the same layers (the second tool).
+color("Charcoal", rgb: #x2b2d31, material: "PETG")
+color("Clear", rgb: #xe6ebe6, material: "PETG")
+
+// Each object stands as the script lays it out from one origin: the lid and the press pin beside
+// the base. The board is an insert: it rides in the base, on the base's frame, wherever it is put.
+place("ledavr", object: "Base", at: [120mm 160mm], color: "Charcoal")
+place("ledavr", object: "Lid", at: [120mm 160mm], color: "Charcoal")
+place("ledavr", object: "Pin btn.sw", at: [120mm 160mm], color: "Charcoal")
+place("ledavr", object: "Board", at: [120mm 160mm])

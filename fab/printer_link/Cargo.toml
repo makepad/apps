@@ -1,0 +1,12 @@
+[package]
+name = "fab-printer-link"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+makepad-fab-settings = { path = "../settings" }
+makepad-network = { path = "../../../../platform/network" }
+makepad-strict-json = { path = "../../../../libs/strict_json" }
+makepad-zip-file = { path = "../../../../libs/zip_file" }

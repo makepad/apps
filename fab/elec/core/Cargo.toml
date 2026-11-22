@@ -1,0 +1,13 @@
+[package]
+name = "fab-elec-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab electronics core (contract C1): integer-nanometre geometry with arcs, shapes, polygon sets over i_overlay, the spatial index, exact clearance, ids and the canonical binary writer"
+
+[dependencies]
+# polygon booleans and offsets behind PolySet (integer core, nm grid)
+i_overlay = { path = "../../../../../libs/i_overlay", version = "7.0.3", default-features = false }
+# the canonical hash (streaming SHA-256)
+makepad-core-util = { path = "../../../../../libs/core_util" }

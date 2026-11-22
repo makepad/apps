@@ -1,0 +1,194 @@
+// An acrobat in a star jump that flexes at every joint: a head with a bun of hair, a chest, hips,
+// and arms and legs of three pieces each, printed lying on its back fused to five TPU cords (one
+// up the spine, one down each arm and leg). Between each two pieces a cord runs free about two
+// and a half millimetres; nearly square, it bends there every way, so the acrobat waves, kicks,
+// sits up and twists, and springs back to the star it printed in. Two to five filaments with the
+// cords: ivory, coral hair, leotard and slippers, cobalt eyes, a gold star, belt and hair tie.
+// Every colour but ivory starts above the cords, the large ones in one colour from there up, and
+// the small ones (cheeks, smile, eyes, star, belt) lie in the top millimetre of the head and body,
+// so a two-nozzle printer swaps filament on few layers.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let s = param(1, min: 0.85, max: 1.15, step: 0.05, label: "Size", group: "Acrobat", kind: "ratio", hint: "scales the acrobat; the cords keep their section")
+let filaments = param(5, min: 2, max: 5, step: 1, label: "Filaments", group: "Acrobat", hint: "with the TPU cords: 2 ivory, 3 adds coral hair, leotard, slippers, cheeks and smile, 4 cobalt eyes, 5 a gold star, belt and hair tie")
+let cord = param(2.4mm, min: 2mm, max: 3mm, step: 0.1mm, label: "Cord", group: "Cords", hint: "the TPU cords' width and height: thicker springs back harder")
+
+// The figure on the bed, X across it and Y up it from the hips (a sketch's [u v]). The head,
+// chest and hips sit on the Y axis. Then the limb pieces, each a pod round its own centre along
+// its heading: the upper arm, forearm and hand of the left arm, of the right, the thigh, shin and
+// foot of the left leg, of the right, then the two thumbs and the neck. Each piece's length and
+// the radius of its back (toward the body) and front end. Consecutive pieces of a limb sit a free
+// run of cord apart, and its cord runs straight from centre to centre.
+let head_c = [0, 66mm]
+let chest_c = [0, 27mm]
+let hips_c = [0, -2.3mm]
+let cx = [-30.49mm, -51.64mm, -67.66mm, 30.49mm, 51.64mm, 67.66mm, -18.21mm, -29.15mm, -36.39mm, 18.21mm, 29.15mm, 36.39mm, -64.96mm, 64.96mm, 0.00mm]
+let cy = [52.57mm, 72.99mm, 90.78mm, 52.57mm, 72.99mm, 90.78mm, -33.71mm, -69.50mm, -98.55mm, -33.71mm, -69.50mm, -98.55mm, 97.17mm, 97.17mm, 56.75mm]
+let hx = [-0.7880, -0.7193, -0.6691, 0.7880, 0.7193, 0.6691, -0.3420, -0.2924, -0.2419, 0.3420, 0.2924, 0.2419, -0.0698, 0.0698, 0.0000]
+let hy = [0.6157, 0.6947, 0.7431, 0.6157, 0.6947, 0.7431, -0.9397, -0.9563, -0.9703, -0.9397, -0.9563, -0.9703, 0.9976, 0.9976, -1.0000]
+let len = [28.00mm, 26.00mm, 17.00mm, 28.00mm, 26.00mm, 17.00mm, 36.00mm, 34.00mm, 21.00mm, 36.00mm, 34.00mm, 21.00mm, 10.00mm, 10.00mm, 18.50mm]
+let rb = [7.00mm, 5.80mm, 5.20mm, 7.00mm, 5.80mm, 5.20mm, 8.40mm, 6.60mm, 5.30mm, 8.40mm, 6.60mm, 5.30mm, 2.70mm, 2.70mm, 5.50mm]
+let rf = [6.00mm, 5.00mm, 6.40mm, 6.00mm, 5.00mm, 6.40mm, 6.80mm, 5.30mm, 4.00mm, 6.80mm, 5.30mm, 4.00mm, 2.30mm, 2.30mm, 5.50mm]
+let arm_start_l = [-8mm, 35mm]
+let arm_start_r = [8mm, 35mm]
+let leg_start_l = [-7.5mm, -4.3mm]
+let leg_start_r = [7.5mm, -4.3mm]
+// The chest and hips outlines about their centres.
+let chest_out = [[-7.00mm, 18.00mm] [-13.00mm, 17.20mm] [-18.00mm, 15.20mm] [-21.00mm, 11.50mm] [-21.80mm, 6.50mm] [-20.60mm, 0.00mm] [-18.40mm, -6.50mm] [-16.50mm, -12.00mm] [-14.50mm, -16.00mm] [-10.00mm, -18.20mm] [0, -18.80mm] [10.00mm, -18.20mm] [14.50mm, -16.00mm] [16.50mm, -12.00mm] [18.40mm, -6.50mm] [20.60mm, 0.00mm] [21.80mm, 6.50mm] [21.00mm, 11.50mm] [18.00mm, 15.20mm] [13.00mm, 17.20mm] [7.00mm, 18.00mm] [0, 18.00mm]]
+let hips_out = [[-8.00mm, 8.00mm] [-14.00mm, 7.20mm] [-17.00mm, 4.50mm] [-18.00mm, 0.00mm] [-17.50mm, -4.50mm] [-15.80mm, -8.50mm] [-11.50mm, -12.00mm] [-6.00mm, -14.50mm] [0, -15.50mm] [6.00mm, -14.50mm] [11.50mm, -12.00mm] [15.80mm, -8.50mm] [17.50mm, -4.50mm] [18.00mm, 0.00mm] [17.00mm, 4.50mm] [14.00mm, 7.20mm] [8.00mm, 8.00mm] [0, 8.00mm]]
+let tall = [11mm, 10mm, 7.5mm, 11mm, 10mm, 7.5mm, 13mm, 11.5mm, 9mm, 13mm, 11.5mm, 9mm, 5.5mm, 5.5mm, 9mm]
+
+// A point `a` along piece k's heading and `w` to its left, as a sketch's [u v]; a point of the
+// figure at height `h` in the model ([x y z], z down the bed's sketch v).
+fn lp(k, a, w) { [(cx[k] + a * hx[k] - w * hy[k]) * s, (cy[k] + a * hy[k] + w * hx[k]) * s] }
+fn at3(p, h) { [p[0] * s, h * s, -p[1] * s] }
+fn plus(c, x, y) { [c[0] + x, c[1] + y] }
+
+// Every piece is domed like a pebble: full at the bed, rounding over to a flat crown, so nothing
+// on it overhangs. A limb piece is a pod, two half circles joined straight, its end radii
+// shrinking up the dome; the others are outlines shrunk about their centre. The head, chest and
+// hips are all `top` high with a broad crown (a mound), where the face and the trim go.
+let dome = [[0, 1] [0.3, 0.99] [0.5, 0.97] [0.65, 0.93] [0.77, 0.87] [0.87, 0.79] [0.94, 0.69] [1, 0.55]]
+let mound = [[0, 1] [0.35, 0.99] [0.6, 0.96] [0.75, 0.92] [0.86, 0.85] [0.93, 0.76] [0.975, 0.67] [1, 0.6]]
+let top = 16mm
+fn pod(k, f) {
+    let fa = len[k] / 2 - rf[k]
+    let ba = rb[k] - len[k] / 2
+    Polygon{points: for i in 0..26 {
+        if i < 13 {
+            let t = -1.5708 + i * 0.2618
+            lp(k, fa + rf[k] * f * cos(t), rf[k] * f * sin(t))
+        } else {
+            let t = 1.5708 + (i - 13) * 0.2618
+            lp(k, ba + rb[k] * f * cos(t), rb[k] * f * sin(t))
+        }
+    }}
+}
+fn limb(k) { m.loft({sections: for d in dome { Section{sketch: pod(k, d[1]) at: tall[k] * d[0] * s} }}) }
+fn shape(c, rim, f) { Polygon{points: for p in rim { [(c[0] + p[0] * f) * s, (c[1] + p[1] * f) * s] }} }
+fn domed(c, rim, h, prof) { m.loft({sections: for d in prof { Section{sketch: shape(c, rim, d[1]) at: h * d[0] * s} }}) }
+let around = for i in 0..40 { [cos(i * 6.28318 / 40), sin(i * 6.28318 / 40)] }
+fn oval(rx, ry) { let o = for q in around { [rx * q[0], ry * q[1]] }; o }
+
+// The head: an oval with a bun of hair at its crown, an ear either side and the neck below; two
+// eyes sunk into the face and a button nose. It lies face up.
+let skull = domed(head_c, oval(15.5mm, 17mm), top, mound)
+let bun = domed(plus(head_c, 0, 19.5mm), oval(6.5mm, 6.5mm), top, mound)
+let ears = for side in [-1, 1] { domed(plus(head_c, side * 15.1mm, 0.5mm), oval(3.2mm, 4.8mm), 8mm, dome) }
+let nose = m.sphere({radius: 2.4mm * s at: at3(plus(head_c, 0, -4.6mm), top - 1.4mm)})
+let eyes = for side in [-1, 1] { m.sphere({radius: 2.2mm * s at: at3(plus(head_c, side * 4.6mm, -0.5mm), top + 1.4mm)}) }
+let head = m.subtract(m.union(skull, [bun ears[0] ears[1] limb(14) nose]), eyes)
+
+// The chest, broad at the shoulders and narrowing to the waist; the hips below it.
+let chest = domed(chest_c, chest_out, top, mound)
+let hips = domed(hips_c, hips_out, top, mound)
+
+// The arms and legs; each hand with its thumb toward the head.
+let upper_arm_l = limb(0)
+let forearm_l = limb(1)
+let hand_l = m.union(limb(2), limb(12))
+let upper_arm_r = limb(3)
+let forearm_r = limb(4)
+let hand_r = m.union(limb(5), limb(13))
+let thigh_l = limb(6)
+let shin_l = limb(7)
+let foot_l = limb(8)
+let thigh_r = limb(9)
+let shin_r = limb(10)
+let foot_r = limb(11)
+
+// The cords: straight from point to point, a cone where one turns (inside a piece), lying on the
+// bed, each section a house's: upright sides to the eaves, then a roof at 50 degrees to a ridge,
+// so the pieces printed over them have no flat ceiling anywhere. Nearly as stiff up and down as
+// side to side, they bend every way alike. The spine runs from the head's centre through the
+// chest to the hips' centre; each arm's cord from inside the chest, each leg's from inside the
+// hips, through every piece of the limb, clear of the spine.
+let t = cord / s
+let eave = cord * 0.42
+let ridge = eave + cord * 0.6
+fn strip(p0, p1, d, w) {
+    let q = [-d[1] * w, d[0] * w]
+    Polygon{points: [[(p0[0] + q[0]) * s, (p0[1] + q[1]) * s] [(p1[0] + q[0]) * s, (p1[1] + q[1]) * s] [(p1[0] - q[0]) * s, (p1[1] - q[1]) * s] [(p0[0] - q[0]) * s, (p0[1] - q[1]) * s]]}
+}
+fn run(p0, p1) {
+    let l = sqrt((p1[0] - p0[0]) * (p1[0] - p0[0]) + (p1[1] - p0[1]) * (p1[1] - p0[1]))
+    let d = [(p1[0] - p0[0]) / l, (p1[1] - p0[1]) / l]
+    let a = [p0[0] - d[0] * t / 2, p0[1] - d[1] * t / 2]
+    let b = [p1[0] + d[0] * t / 2, p1[1] + d[1] * t / 2]
+    m.loft({sections: [Section{sketch: strip(a, b, d, t / 2) at: 0} Section{sketch: strip(a, b, d, t / 2) at: eave} Section{sketch: strip(a, b, d, 0.03mm / s) at: ridge}]})
+}
+fn turn(p) { m.cylinder({radius: cord / 2 top_radius: 0.03mm height: ridge at: [p[0] * s, ridge / 2, -p[1] * s]}) }
+fn centre(k) { [cx[k], cy[k]] }
+fn limb_cord(start, k) { m.union(run(start, centre(k)), [run(centre(k), centre(k + 1)) run(centre(k + 1), centre(k + 2)) turn(centre(k)) turn(centre(k + 1))]) }
+let spine = run(head_c, hips_c)
+let arm_cord_l = limb_cord(arm_start_l, 0)
+let arm_cord_r = limb_cord(arm_start_r, 3)
+let leg_cord_l = limb_cord(leg_start_l, 6)
+let leg_cord_r = limb_cord(leg_start_r, 9)
+
+let torso = m.bond(spine, [head chest hips])
+let arm_l = m.bond(arm_cord_l, [chest upper_arm_l forearm_l hand_l])
+let arm_r = m.bond(arm_cord_r, [chest upper_arm_r forearm_r hand_r])
+let leg_l = m.bond(leg_cord_l, [hips thigh_l shin_l foot_l])
+let leg_r = m.bond(leg_cord_r, [hips thigh_r shin_r foot_r])
+
+object(head, name: "Flex acrobat")
+
+let ivory = Material{albedo: [0.93 0.89 0.78] name: "Ivory"}
+let coral = Material{albedo: [0.86 0.27 0.16] name: "Coral"}
+let cobalt = Material{albedo: [0.12 0.30 0.70] name: "Cobalt"}
+let gold = Material{albedo: [0.92 0.68 0.10] name: "Gold"}
+let ink = Material{albedo: [0.07 0.07 0.09] name: "Ink"}
+// A column over an outline about `c` from height `lo` up; a rise over a sketch, from `lift` up.
+// The leotard, slippers and hair start above the cords (`lift`): below it the pieces stay ivory
+// through and through, so the nozzle that prints the cords changes to them once. The face's
+// trim starts at `crown`, a millimetre under the top.
+fn column(c, rim, lo) { m.extrude({sketch: shape(c, rim, 1) height: 30mm * s at: [0, lo * s, 0]}) }
+let lift = ridge + 0.3mm
+let crown = top - 1mm
+fn rise(sketch) { m.extrude({sketch: sketch height: 30mm * s at: [0, lift, 0]}) }
+// A coral leotard (the chest and hips, a scoop neck of ivory), coral slippers, and coral hair over
+// the head and the bun down to the jaw, round an ivory face and ears; coral cheeks and a smile.
+if filaments >= 3 {
+    m.fill(rise(shape(chest_c, chest_out, 1.03)), coral)
+    m.fill(rise(shape(hips_c, hips_out, 1.03)), coral)
+    m.fill(rise(pod(8, 1.1)), coral)
+    m.fill(rise(pod(11, 1.1)), coral)
+    m.fill(column(plus(chest_c, 0, 18.5mm), oval(8.5mm, 6.5mm), 0), ivory)
+    let hair = for q in around { [18.5mm * q[0], max(4mm + 23mm * q[1], -8mm)] }
+    m.fill(rise(shape(head_c, hair, 1)), coral)
+    m.fill(column(plus(head_c, 0, -4mm), oval(11mm, 10.5mm), 0), ivory)
+    for side in [-1, 1] { m.fill(column(plus(head_c, side * 15.1mm, 0.5mm), oval(3.8mm, 5.4mm), 0), ivory) }
+    for side in [-1, 1] { m.fill(column(plus(head_c, side * 7mm, -5.5mm), oval(1.6mm, 1.4mm), crown), coral) }
+    let smile = for i in 0..18 {
+        if i < 9 {
+            let a = 3.84 + i * 0.218
+            [5mm * cos(a), 5mm * sin(a) - 4.4mm]
+        } else {
+            let a = 5.584 - (i - 9) * 0.218
+            [4mm * cos(a), 4mm * sin(a) - 4.2mm]
+        }
+    }
+    m.fill(column(head_c, smile, crown), coral)
+}
+// Cobalt eyes.
+if filaments >= 4 {
+    for side in [-1, 1] { m.fill(m.sphere({radius: 2.6mm * s at: at3(plus(head_c, side * 4.6mm, -0.5mm), top + 1.4mm)}), cobalt) }
+}
+// A gold star on the chest, a gold belt and a tie across the bun.
+if filaments >= 5 {
+    let tips = [7.5mm 3.1mm 7.5mm 3.1mm 7.5mm 3.1mm 7.5mm 3.1mm 7.5mm 3.1mm]
+    let star = for i in 0..10 { [tips[i] * cos(1.5708 + i * 0.62832), tips[i] * sin(1.5708 + i * 0.62832)] }
+    m.fill(column(plus(chest_c, 0, 2mm), star, crown), gold)
+    m.fill(column(hips_c, [[-20mm, 1.5mm] [20mm, 1.5mm] [20mm, 5.5mm] [-20mm, 5.5mm]], crown), gold)
+    m.fill(column(head_c, [[-8mm, 18.6mm] [8mm, 18.6mm] [8mm, 20.4mm] [-8mm, 20.4mm]], crown), gold)
+}
+// The cords print in TPU all through: filled whole last, each drops the paint before.
+m.fill(spine, ink)
+m.fill(arm_cord_l, ink)
+m.fill(arm_cord_r, ink)
+m.fill(leg_cord_l, ink)
+m.fill(leg_cord_r, ink)

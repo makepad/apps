@@ -1,0 +1,9 @@
+// A trinket box and its friction-fit lid, wood grain through the volume in two browns.
+use mod.fab.*
+
+script("wood_box.cad.splash")
+
+color("Pale wood", rgb: #xd1a36b)
+color("Dark wood", rgb: #x734726)
+
+place("wood_box", at: [175mm 160mm], name: "Wood-grain box", color: "Pale wood")

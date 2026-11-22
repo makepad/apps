@@ -1,0 +1,20 @@
+[package]
+name = "fab-sdf-tiles"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "A distance field shown as real triangles: rays traced on the CPU from the view become tiles, coarse to fine, drawn by the GPU."
+
+[dependencies]
+makepad-draw = { path = "../../../../draw", version = "2.0.0" }
+makepad-csg-math = { path = "../../../../libs/csg/csg_math" }
+makepad-csg-sdf = { path = "../../../../libs/csg/csg_sdf" }
+makepad-render-material = { path = "../../../../libs/render_material" }
+fab-sdf-proof = { path = "../sdf_proof" }
+fab-sdf-engine = { path = "../sdf_engine" }
+makepad-script-compute = { path = "../../../../platform/script/compute", version = "1.0.0", features = ["vm"] }
+makepad-script-compute-sched = { path = "../../../../platform/script/compute_sched" }
+
+[dev-dependencies]
+makepad-script = { path = "../../../../platform/script", version = "1.0.0" }

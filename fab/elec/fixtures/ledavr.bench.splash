@@ -1,0 +1,23 @@
+// Run ledavr's own firmware on the board. The chaser's period is the firmware's `chase_ms`
+// (125 ms in the firmware); the bench sets 20 ms, so one run sees all eight LEDs in turn.
+bench("chase", {circuit: "ledavr" run: {stop: 200ms}}, fn(b, c) {
+    b.firmware(c.mcu.u, "ledavr.fw.splash", {chase_ms: 20})
+
+    // The scope cards: each LED's cathode, then the button. An LED is lit while its cathode is
+    // low, so the chase walks a low step down the eight lanes. LED0..LED5 sit on the timers' PWM
+    // outputs (breathe ramps their duty), LED6 and LED7 on plain outputs; the button pulls BTN low.
+    // The run's 200 ms fill the cards' ten divisions.
+    b.probe(c.lamps[0].d.K, {label: "D1 PD6"})
+    b.probe(c.lamps[1].d.K, {label: "D2 PD5"})
+    b.probe(c.lamps[2].d.K, {label: "D3 PB1"})
+    b.probe(c.lamps[3].d.K, {label: "D4 PB2"})
+    b.probe(c.lamps[4].d.K, {label: "D5 PB3"})
+    b.probe(c.lamps[5].d.K, {label: "D6 PD3"})
+    b.probe(c.lamps[6].d.K, {label: "D7 PD4"})
+    b.probe(c.lamps[7].d.K, {label: "D8 PD7"})
+    b.probe(c.net("BTN"), {label: "Button"})
+
+    // USB 5 V is the MCU's rail: no regulator between them.
+    b.expect("5V up", b.mean(b.v(c.net("VBUS")), {window: 1ms after: 5ms}),
+             {min: 4.75V max: 5.25V})
+})

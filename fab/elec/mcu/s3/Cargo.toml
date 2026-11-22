@@ -1,0 +1,24 @@
+[package]
+name = "fab-elec-mcu-s3"
+version = "1.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+authors = ["Makepad <info@makepad.nl>"]
+description = "ESP32-S3 machine for microsplash's board simulator"
+
+[dependencies]
+fab-elec-mcu-emu = { path = "../emu" }
+fab-elec-mcu-xtensa = { path = "../xtensa" }
+
+[features]
+default = ["jit"]
+# Native page units for `Tier::Native`, through the shared back end (a host without executable
+# memory, such as wasm, keeps the decoded tier).
+jit = ["fab-elec-mcu-emu/jit", "fab-elec-mcu-xtensa/jit"]
+
+[dev-dependencies]
+fab-elec-mcu-emit32 = { path = "../emit32" }
+fab-elec-mcu-parts = { path = "../parts" }
+fab-elec-mcu-cosim = { path = "../cosim" }
+fab-elec-sim = { path = "../../sim" }

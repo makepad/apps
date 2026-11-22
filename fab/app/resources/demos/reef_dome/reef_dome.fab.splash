@@ -1,0 +1,9 @@
+// A made-up brain-coral dome: ridged meanders, coral pink on the ridges and sand in the valleys.
+use mod.fab.*
+
+script("reef_dome.cad.splash")
+
+color("Coral pink", rgb: #xed7380)
+color("Sand", rgb: #xedd9ad)
+
+place("reef_dome", at: [175mm 160mm], name: "Reef dome", color: "Sand")

@@ -1,0 +1,45 @@
+[package]
+name = "makepad-fab-scan"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab's scan: a headset capture session read into posed views, and a reconstruction fitted to its model"
+
+[dependencies]
+makepad-ai-geometry = { path = "../../../../libs/ai/models/geometry" }
+makepad-desk-link = { path = "../../../../libs/desk_link" }
+makepad-compute-program = { path = "../../../../libs/compute_program" }
+# The synthetic session's renders.
+makepad-ai-vision = { path = "../../../../libs/ai/models/vision", optional = true }
+# The detail check's GPU device.
+makepad-compute-program-gpu = { path = "../../../../libs/compute_program_gpu", optional = true }
+
+[features]
+cuda = ["makepad-ai-geometry/cuda"]
+synth = ["dep:makepad-ai-vision"]
+gpu = ["dep:makepad-compute-program-gpu"]
+
+[[bin]]
+name = "scan-session"
+path = "src/bin/scan_session.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "scan-session-synth"
+path = "src/bin/scan_session_synth.rs"
+required-features = ["synth"]
+
+[[bin]]
+name = "scan-detail-check"
+path = "src/bin/scan_detail_check.rs"
+required-features = ["gpu"]
+
+[[bin]]
+name = "scan-step-check"
+path = "src/bin/scan_step_check.rs"
+required-features = ["gpu"]
+
+[[bin]]
+name = "scan-session-facts"
+path = "src/bin/scan_session_facts.rs"

@@ -1,0 +1,32 @@
+[package]
+name = "fab-optimise"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab's Optimise on a part's object script: a stress study's lightening cuts as the builder lines a person writes, and its variants' labels as printed"
+
+[dependencies]
+fab-force = { path = "../force" }
+fab-model = { path = "../model" }
+makepad-compute-program = { path = "../../../../libs/compute_program", version = "1.0.0" }
+makepad-compute-program-gpu = { path = "../../../../libs/compute_program_gpu", version = "1.0.0", optional = true }
+makepad-csg-math = { path = "../../../../libs/csg/csg_math" }
+makepad-model-script = { path = "../../engine/model_script" }
+
+[dev-dependencies]
+fab-plate = { path = "../plate" }
+makepad-csg-sdf = { path = "../../../../libs/csg/csg_sdf" }
+makepad-compute-program-gpu = { path = "../../../../libs/compute_program_gpu", version = "1.0.0" }
+fab-paint-field = { path = "../paint_field" }
+
+[features]
+# fab-growcheck's: Grow on this machine's GPU
+gpu = ["dep:makepad-compute-program-gpu"]
+
+[[bin]]
+name = "fab-growcheck"
+required-features = ["gpu"]
+
+[package.metadata.commercial]
+include = ["../app/resources/bracket.cad.splash"]

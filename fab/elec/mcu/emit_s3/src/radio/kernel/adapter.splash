@@ -1,0 +1,443 @@
+// OSI conversions for the S3 pack. Meanings: IDF v6.1.1 (Apache-2.0),
+// components/esp_wifi/esp32s3/esp_adapter.c; second reading: esp-radio
+// esp-radio/src/wifi/os_adapter/mod.rs (MIT OR Apache-2.0), reference only.
+// Shared helpers in objects.splash keep the R4b exports' ABI intact.
+
+var crit_depth: i32 = 0
+var crit_outer: i32 = 0
+var osi_crit_level: i32 = 0
+var crit_start: i32 = 0
+var crit_start_ra: i32 = 0
+var crit_max_span: i32 = 0
+var crit_max_ra: i32 = 0
+// Unsigned cycle threshold; the image build sets its initial value (the largest masked gate's
+// bound) after the single kernel compile. -1 never reports.
+var crit_span_report: i32 = -1
+// One global section, ignoring mux: esp-radio (MIT OR Apache-2.0),
+// esp-radio/src/wifi/os_adapter/mod.rs:200-226. Nesting, not the token,
+// controls restoration. IDF v6.1.1 components/esp_phy/src/phy_init.c:196-216
+// ignores the PHY token; the Wi-Fi wrapper in unpinned esp_coex is unverified.
+// The thunk supplies entry PS, reconstructed island return address and CCOUNT.
+let osi_wifi_int_disable = export(fn(mux, ps, ra, cc) {
+    let level: i32 = ps & 15
+    if crit_depth == 0 {
+        crit_outer = level
+        // ISR-context sections are already inside the scheduler's ISR span.
+        if level == 0 { crit_start = cc; crit_start_ra = ra }
+    }
+    crit_depth += 1
+    osi_crit_level = level
+    if level < CRIT_MASK { osi_crit_level = CRIT_MASK }
+    return level
+})
+let osi_wifi_int_restore = export(fn(mux, token, ps, ra, cc) {
+    let level: i32 = ps & 15
+    if crit_depth == 0 {
+        report(FAULT_KERNEL_CRIT_MISMATCH, ra)
+        osi_crit_level = level
+        return 0
+    }
+    crit_depth -= 1
+    let expected: i32 = crit_outer
+    if crit_depth != 0 && expected < CRIT_MASK { expected = CRIT_MASK }
+    if token != expected { report(FAULT_KERNEL_CRIT_MISMATCH, ra) }
+    osi_crit_level = level
+    if crit_depth == 0 {
+        osi_crit_level = crit_outer
+        if crit_outer == 0 {
+            // Subtraction wraps; comparisons retain all 32 cycle-counter bits.
+            let span: i32 = cc - crit_start
+            if gtu(span, crit_max_span) {
+                crit_max_span = span
+                crit_max_ra = crit_start_ra
+                if gtu(span, crit_span_report) { report(FAULT_KERNEL_CRIT_SPAN, span) }
+            }
+        }
+    }
+    return 0
+})
+
+fn osi_ticks_us(ticks: i32) {
+    if ticks == -1 { return -1 }
+    // All other unsigned tick counts saturate strictly below forever.
+    // floor(0xfffffffe / BLOB_TICK_US), using positive signed constants.
+    let max_ticks: i32 = (2147483647 / BLOB_TICK_US) * 2 + ((2147483647 % BLOB_TICK_US) * 2) / BLOB_TICK_US
+    if gtu(ticks, max_ticks) { return -2 }
+    return ticks * BLOB_TICK_US
+}
+let osi_spin_lock_create = export(fn() { return create_semaphore(1, 1) })
+let osi_semphr_take = export(fn(s, ticks) { return semaphore_take(s, osi_ticks_us(ticks)) })
+let osi_wifi_thread_semphr_get = export(fn() {
+    let task: i32 = load32(CURRENT)
+    let sem: i32 = load32(task + TCB_THREAD_SEM)
+    if sem == 0 {
+        // IDF: counting semaphore (max=1, initial=0), retained per task.
+        sem = create_semaphore(1, 0)
+        store32(task + TCB_THREAD_SEM, sem)
+    }
+    return sem
+})
+let osi_mutex_create = export(fn() { return create_mutex(0) })
+let osi_recursive_mutex_create = export(fn() { return create_mutex(1) })
+let osi_mutex_lock = export(fn(m) { return lock_mutex(m, -1) })
+let osi_queue_send_to_back = export(fn(q, item, ticks) {
+    return queue_send(q, item, osi_ticks_us(ticks), 0, 0, 0)
+})
+let osi_queue_send_to_front = export(fn(q, item, ticks) {
+    return queue_send(q, item, osi_ticks_us(ticks), 1, 0, 0)
+})
+let osi_queue_recv = export(fn(q, item, ticks) {
+    return queue_receive(q, item, osi_ticks_us(ticks), 0, 0)
+})
+let osi_queue_send_from_isr = export(fn(q, item, hptw) {
+    // IDF passes BaseType_t*, a word. R4b and esp-radio's queue ISR interface
+    // use a byte flag. Preserve a no-wake flag, and publish a full pdTRUE word.
+    let receiver: i32 = load32(q + Q_RECV)
+    let result: i32 = queue_send(q, item, 0, 0, 1, 0)
+    if hptw != 0 && receiver != 0 {
+        if gtu(load32(receiver + TCB_PRIORITY), load32(load32(CURRENT) + TCB_PRIORITY)) {
+            pack_store32(hptw, 1)
+        }
+    }
+    return result
+})
+let osi_wifi_create_queue = export(fn(len, size) {
+    // IDF components/esp_wifi/include/esp_private/wifi.h: {handle, storage}.
+    // Our internal queue owns its storage; the wrapper's second word is NULL.
+    // Unlike esp-radio's one-word Box, retain both IDF struct words.
+    let wrapper: i32 = allocate(8)
+    if wrapper == 0 { return 0 }
+    let q: i32 = create_queue(len, size)
+    if q == 0 { release(wrapper - B_HEADER); return 0 }
+    store32(wrapper, q)
+    store32(wrapper + 4, 0)
+    return wrapper
+})
+let osi_wifi_delete_queue = export(fn(wq) {
+    if wq != 0 {
+        delete_queue(load32(wq))
+        release(wq - B_HEADER)
+    }
+})
+let osi_task_create = export(fn(entry, name, stack_bytes, arg, prio, handle_out) {
+    // IDF Xtensa stack depth is bytes. Pinned create's seventh argument is
+    // core_id on the caller's stack; this single-core scheduler ignores it.
+    // Idle alone is 0; the assumed IDF priorities 0..=24 become 1..=25.
+    // FreeRTOS (prvInitialiseNewTask) clamps a priority at or above
+    // configMAX_PRIORITIES to the top one; it never refuses the task for it.
+    let p: i32 = prio
+    if geu(p, BLOB_MAX_PRIORITY) { p = BLOB_MAX_PRIORITY - 1 }
+    return create_task(entry, name, stack_bytes, arg, p + 1, handle_out)
+})
+let osi_task_delete = export(fn(handle) { delete_task(handle); return 0 })
+let osi_task_delay = export(fn(ticks) { delay_task(osi_ticks_us(ticks), 1); return 0 })
+let osi_task_ms_to_tick = export(fn(ms) {
+    // IDF: ms / portTICK_PERIOD_MS on an unsigned ms, rounding down, so a
+    // short wait the pack converts can be 0 ticks (no wait), as it was tested.
+    // Split the unsigned dividend to keep divisions nonnegative.
+    let period: i32 = BLOB_TICK_US / 1000
+    let half: i32 = (ms >>> 1) / period
+    return half * 2 + (ms - half * 2 * period) / period
+})
+
+var osi_time_high: i32 = 0
+fn osi_now_us() {
+    now64(HEAP_BASE + H_NOW)
+    let low: i32 = load32(HEAP_BASE + H_NOW)
+    let high: i32 = load32(HEAP_BASE + H_NOW + 4)
+    // now64 is SYSTIMER ticks since boot (origin already subtracted).
+    osi_time_high = high >>> (32 - TICKS_HIGH_SHIFT)
+    return (low >>> (32 - TICKS_HIGH_SHIFT)) | (high << TICKS_HIGH_SHIFT)
+}
+let osi_esp_timer_get_time = export(fn() { return osi_now_us() })
+let osi_log_timestamp = export(fn() {
+    let low: i32 = osi_now_us()
+    // Divide the full microsecond value by 1000 in two 16-bit limbs.
+    // Dropping high / 1000 drops whole multiples of 2^32 milliseconds.
+    // Each dividend is at most 65,535,999, so signed division stays exact.
+    let dividend: i32 = (osi_time_high % 1000) * 65536 + (low >>> 16)
+    let ms: i32 = dividend / 1000
+    dividend = (dividend % 1000) * 65536 + (low & 65535)
+    return (ms << 16) + dividend / 1000
+})
+
+// The ports already strip the runtime's protected lines (1, 2 and 7).
+let osi_ints_on = export(fn(mask) { irq_enable(mask) })
+let osi_ints_off = export(fn(mask) { irq_disable(mask) })
+let osi_set_intr = export(fn(cpu_no, source, num, prio) {
+    // esp-radio esp-radio/src/wifi/os_adapter/esp32s3.rs:17-30 (MIT OR Apache-2.0):
+    // force CPU 0. The selected CPU line fixes the level, so prio is ignored.
+    if geu(source, WIFI_SOURCES) { report(FAULT_KERNEL_IRQ_SOURCE_REFUSED, source); return 0 }
+    if geu(num, 32) { report(FAULT_KERNEL_IRQ_LINE_REFUSED, num); return 0 }
+    if (ROUTABLE_LINES & (1 << num)) == 0 { report(FAULT_KERNEL_IRQ_LINE_REFUSED, num); return 0 }
+    dev_store32(INTR_MATRIX + source * 4, num)
+    return 0
+})
+let osi_set_isr = export(fn(n, f, arg) {
+    // R3 emit_s3/src/radio/sched.rs:42-53: {mask, entry, arg}, live count,
+    // and the shim's windowed-call region. The gate serializes every update.
+    if geu(n, 32) { report(FAULT_KERNEL_IRQ_LINE_REFUSED, n); return 0 }
+    let mask: i32 = 1 << n
+    if (ROUTABLE_LINES & mask) == 0 { report(FAULT_KERNEL_IRQ_LINE_REFUSED, n); return 0 }
+    if f != 0 && (f >>> 30) != CODE_REGION { report(FAULT_KERNEL_ISR_ENTRY_REFUSED, f); return 0 }
+    let count: i32 = load32(ISR_COUNT)
+    for i in 0..ISR_CAPACITY {
+        if geu(i, count) { break }
+        let slot: i32 = ISRS + i * ISR_SLOT
+        if load32(slot) == mask {
+            if f != 0 {
+                store32(slot + 4, f)
+                store32(slot + 8, arg)
+            } else {
+                let last: i32 = ISRS + (count - 1) * ISR_SLOT
+                store32(slot, load32(last))
+                store32(slot + 4, load32(last + 4))
+                store32(slot + 8, load32(last + 8))
+                store32(ISR_COUNT, count - 1)
+            }
+            return 0
+        }
+    }
+    if f == 0 { return 0 }
+    if geu(count, ISR_CAPACITY) { report(FAULT_KERNEL_ISR_TABLE_FULL, n); return 0 }
+    let slot: i32 = ISRS + count * ISR_SLOT
+    store32(slot, mask)
+    store32(slot + 4, f)
+    store32(slot + 8, arg)
+    store32(ISR_COUNT, count + 1)
+    return 0
+})
+let osi_wifi_reset_mac = export(fn() {
+    // esp-radio esp-radio/src/radio_clocks/clocks_ll/esp32s3.rs:
+    // reset_wifi_mac pulses MAC reset, preserving every other bit.
+    let v: i32 = dev_load32(SYSCON_WIFI_RST_EN)
+    dev_store32(SYSCON_WIFI_RST_EN, v | WIFIMAC_RST)
+    dev_store32(SYSCON_WIFI_RST_EN, v & (WIFIMAC_RST ^ -1))
+})
+fn copy_efuse_mac(mac: i32, last_offset: i32) {
+    // ESP32-S3 TRM v1.8 §5, registers 5.18/5.19: low 32 and high 16 bits.
+    // P stores reach both osi_read_mac's pack buffer and phy_enter's PHY_CAL_DATA + 4 in radio SRAM.
+    let lo: i32 = dev_load32(EFUSE_MAC_0)
+    let hi: i32 = dev_load32(EFUSE_MAC_1) & 65535
+    pack_store8(mac, hi >>> 8)
+    pack_store8(mac + 1, hi)
+    pack_store8(mac + 2, lo >>> 24)
+    pack_store8(mac + 3, lo >>> 16)
+    pack_store8(mac + 4, lo >>> 8)
+    pack_store8(mac + 5, lo + last_offset)
+}
+let osi_read_mac = export(fn(mac, kind) {
+    // esp-radio esp-radio/src/common_adapter.rs, read_mac: types 0 STA, 1 AP and 2 BT;
+    // any other type fails with -1 and writes nothing.
+    if gtu(kind, 2) { return -1 }
+    // Unverified: IDF's four-universal-address default, from memory (esp_mac.c is not in the
+    // pinned trees): STA = base, AP and BT add 1 and 2 to the last byte, wrapping modulo 256.
+    copy_efuse_mac(mac, kind)
+    return 0
+})
+let osi_slowclk_cal_get = export(fn() {
+    // esp-radio esp-radio/src/wifi/os_adapter/mod.rs, slowclk_cal_get:
+    // STORE1 holds a microsecond period with 19 fractional bits; Wi-Fi uses 12.
+    return dev_load32(RTC_STORE1) >>> 7
+})
+
+var osi_rng_last: i32 = 0
+let osi_random = export(fn() {
+    // IDF esp_random's XOR-fold shape, as specified by the R4c-2b design,
+    // timed by SYSTIMER microseconds instead of CCOUNT. The cap never fails.
+    let r: i32 = 0
+    let now: i32 = 0
+    for i in 0..RNG_POLL_CAP {
+        now = osi_now_us()
+        if geu(now - osi_rng_last, RNG_SPACING_US) { break }
+        r = r ^ dev_load32(RNG_DATA)
+    }
+    r = r ^ dev_load32(RNG_DATA)
+    osi_rng_last = now
+    return r
+})
+
+let osi_get_time = export(fn(t) {
+    let low: i32 = osi_now_us()
+    // Divide the two-word microsecond value by 1,000,000. The high word
+    // after the SYSTIMER shift is nonnegative. Only sec's low word is stored
+    // in IDF os_time's two-word {sec, usec} layout.
+    let remainder: i32 = osi_time_high % 1000000
+    let seconds: i32 = 0
+    for i in 0..32 {
+        remainder = remainder * 2 + (low >>> 31)
+        low = low << 1
+        seconds = seconds << 1
+        if remainder >= 1000000 { remainder -= 1000000; seconds = seconds | 1 }
+    }
+    pack_store32(t, seconds)
+    pack_store32(t + 4, remainder)
+    return 0
+})
+
+// PHY state/decisions stay masked here; island glue performs the libphy calls
+// between enter, init_done and leave. ESP-IDF v6.1.1
+// components/esp_phy/src/phy_init.c:282-425 serializes the sequence with one lock.
+// PHY_MUTEX is a fixed slot zeroed at init; the PHY never allocates at run time.
+// The image build sets the initial pointer to its PHY init-data table in flash.
+var phy_init_data: i32 = 0
+var phy_modem: i32 = 0
+var phy_calibrated: i32 = 0
+var phy_cal_dirty: i32 = 0
+var phy_regs_stored: i32 = 0
+var clk_common_count: i32 = 0
+// Two limbs of microseconds since boot, initially zero, as in ESP-IDF v6.1.1
+// components/esp_phy/src/phy_common.c:59,83-111. No low-word wrap loses elapsed time.
+var phy_track_last_low: i32 = 0
+var phy_track_last_high: i32 = 0
+
+// ESP-IDF v6.1.1 components/esp_phy/src/phy_init.c:243-250,292,421-422;
+// common mask: components/soc/esp32s3/register/soc/syscon_reg.h:180.
+// R4c-3's power domain is a second owner. All exports run at INTLEVEL 15,
+// so each read-modify-write and the ownership count are atomic.
+fn clk_common_hold() {
+    if clk_common_count == 0 {
+        dev_store32(SYSCON_WIFI_CLK_EN, dev_load32(SYSCON_WIFI_CLK_EN) | CLK_COMMON)
+    }
+    clk_common_count += 1
+}
+fn clk_common_release() {
+    if clk_common_count != 0 {
+        clk_common_count -= 1
+        if clk_common_count == 0 {
+            dev_store32(SYSCON_WIFI_CLK_EN, dev_load32(SYSCON_WIFI_CLK_EN) & (CLK_COMMON ^ -1))
+        }
+    }
+}
+fn phy_owned() {
+    if load32(PHY_MUTEX + M_OWNER) != load32(CURRENT) { return 0 }
+    return 1
+}
+let phy_lock = export(fn() {
+    // ESP-IDF v6.1.1 components/esp_phy/src/phy_init.c:284,377. R3 enqueues
+    // here and the blocking thunk waits; all following exports are non-blocking.
+    return lock_mutex(PHY_MUTEX, -1)
+})
+let phy_enter = export(fn(op, out) {
+    if phy_owned() == 0 { return PHY_SKIP }
+    // ESP-IDF v6.1.1 components/esp_phy/include/esp_phy_init.h:47-60 and
+    // components/esp_phy/src/phy_init.c:954-962: no stored calibration yet.
+    pack_store32(out, phy_init_data)
+    pack_store32(out + 4, PHY_CAL_DATA)
+    pack_store32(out + 8, PHY_RF_CAL_FULL)
+    pack_store32(out + 12, PHY_DIG_REGS)
+    // Glue supplies exactly PHY_OP_ENABLE or PHY_OP_DISABLE.
+    if op == PHY_OP_ENABLE {
+        // ESP-IDF v6.1.1 components/esp_phy/src/phy_init.c:285-300.
+        if phy_modem != 0 { return PHY_ON }
+        clk_common_hold()
+        // Unverified phy_module_enable meaning; see CLK_BT_BASEBAND in
+        // kernel/mod.rs. Common clocks must be on before any libphy call.
+        dev_store32(SYSCON_WIFI_CLK_EN, dev_load32(SYSCON_WIFI_CLK_EN) | CLK_BT_BASEBAND | CLK_RNG)
+        if phy_calibrated == 0 {
+            // ESP-IDF v6.1.1 components/esp_phy/src/phy_init.c:960-962;
+            // components/esp_phy/include/esp_phy_init.h:48-49 puts the STA MAC at +4.
+            copy_efuse_mac(PHY_CAL_DATA + 4, 0)
+            return PHY_FIRST
+        }
+        // ESP-IDF v6.1.1 components/esp_phy/src/phy_init.c:262-266,336-340:
+        // restore only a previously stored block.
+        if phy_regs_stored != 0 { return PHY_WAKE_RESTORE }
+        return PHY_WAKE
+    }
+    // ESP-IDF v6.1.1 components/esp_phy/src/phy_init.c:381-383.
+    let saved: i32 = phy_modem
+    phy_modem = phy_modem & (PHY_MODEM_WIFI ^ -1)
+    if saved == PHY_MODEM_WIFI { return PHY_LAST }
+    return PHY_NOT_LAST
+})
+let phy_init_done = export(fn(step, result) {
+    if phy_owned() == 0 { return 0 }
+    if step == PHY_SKIP { return 0 }
+    if step == PHY_FIRST {
+        // ESP-IDF v6.1.1 components/esp_phy/src/phy_init.c:300,954-968:
+        // loading calibration fails until storage exists, so mark it dirty.
+        phy_calibrated = 1
+        phy_cal_dirty = 1
+        if result != 0 && result != ESP_CAL_DATA_CHECK_FAIL {
+            report(FAULT_KERNEL_PHY_INIT_FAILED, result)
+        }
+    }
+    if step == PHY_FIRST || step == PHY_WAKE || step == PHY_WAKE_RESTORE {
+        // ESP-IDF v6.1.1 components/esp_phy/src/phy_init.c:361,421:
+        // unverified phy_module_disable meaning; keep RNG alive for
+        // osi_random, and retain common clocks.
+        dev_store32(SYSCON_WIFI_CLK_EN, dev_load32(SYSCON_WIFI_CLK_EN) & (CLK_BT_BASEBAND ^ -1))
+    }
+    // ESP-IDF v6.1.1 components/esp_phy/src/phy_init.c:363-366 and
+    // components/esp_phy/src/phy_common.c:83-111: strict greater-than, even
+    // on an already-enabled modem. The stamp is the full microsecond clock.
+    phy_modem = phy_modem | PHY_MODEM_WIFI
+    let low: i32 = osi_now_us()
+    let high: i32 = osi_time_high
+    let elapsed_low: i32 = low - phy_track_last_low
+    let elapsed_high: i32 = high - phy_track_last_high
+    if ltu(low, phy_track_last_low) { elapsed_high -= 1 }
+    if elapsed_high != 0 || gtu(elapsed_low, PHY_TRACK_PLL_PERIOD_US) {
+        phy_track_last_low = low
+        phy_track_last_high = high
+        return 1
+    }
+    return 0
+})
+let phy_leave = export(fn(op, step) {
+    if phy_owned() == 0 { return 0 }
+    if op == PHY_OP_DISABLE && step == PHY_LAST {
+        // ESP-IDF v6.1.1 components/esp_phy/src/phy_init.c:254-260,389,422.
+        // The glue has saved the registers and shut down RF before this call.
+        phy_regs_stored = 1
+        clk_common_release()
+    }
+    unlock_mutex(PHY_MUTEX)
+    return 0
+})
+
+// Drop each line until R6 routes it to Fab.
+var dropped_prints: i32 = 0
+fn drop_print() {
+    dropped_prints += 1
+    return 0
+}
+let puts = export(fn(line) { return drop_print() })
+let net80211_printf = export(fn(fmt) { return drop_print() })
+let pp_printf = export(fn(fmt) { return drop_print() })
+let phy_printf = export(fn(fmt) { return drop_print() })
+let print_dropped = export(fn() { return dropped_prints })
+
+// island_start restores both words to zero on every radio restart. The caller
+// has already initialized next, base, id, size and the entire payload.
+var event_head: i32 = 0
+var event_tail: i32 = 0
+
+// The planned station's longest commit/take arms each charge one checked word
+// access (17). Including the ordinary masked thunk (9) and CALL0 wrapper
+// (13/11), their bounds are gate.stack_bytes + emitted longer arm + 38/36.
+// The arm includes CALLX0, already counted in the access. Both costs are
+// independent of payload size and list length.
+let event_commit = export(fn(node) {
+    let tail: i32 = event_tail
+    if tail == 0 { event_head = node } else { store32(tail, node) }
+    event_tail = node
+})
+
+let event_take = export(fn() {
+    let node: i32 = event_head
+    if node != 0 {
+        let next: i32 = load32(node)
+        event_head = next
+        if next == 0 { event_tail = 0 }
+    }
+    return node
+})
+
+// Port 78 publishes this non-stopping code before port 86 takes the shared stop.
+// The two ports charge 32 + 7 instructions including their CALLX0s and ILL.
+let radio_start_failed = export(fn(arg) {
+    report(FAULT_RADIO_START_FAILED, arg)
+    radio_stop(FAULT_RADIO_START_FAILED)
+})

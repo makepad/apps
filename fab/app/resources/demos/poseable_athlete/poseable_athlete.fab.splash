@@ -1,0 +1,11 @@
+// A poseable athlete printed in place, lying on its back: every joint a hinge whose TPU brake
+// holds the pose it is turned to. Ivory, a teal top, TPU mitts, soles, eyes and headband.
+use mod.fab.*
+
+script("poseable_athlete.cad.splash")
+
+color("Ivory", rgb: #xede3c8)
+color("Teal", rgb: #x13878a)
+color("Ink", rgb: #x1a1a20, material: "TPU")
+
+place("poseable_athlete", object: "Athlete", at: [175mm 160mm], name: "Poseable athlete", color: "Ivory")

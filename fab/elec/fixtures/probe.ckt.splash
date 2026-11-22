@@ -1,0 +1,24 @@
+// A five-pin debug probe with a red power indicator.
+use mod.elec.*
+use mod.std.*
+let e = mod.elec
+
+let indicator = e.block({
+    name: "Power indicator"
+    ports: {vdd: e.port(@power_in) gnd: e.port(@ground)}
+    build: fn(p, o) {
+        let a = e.net({name: "led.A"})
+        let r = e.r(1kohm, p.vdd, a, {package: "0402"})
+        let d = e.led({color: @red package: "0603"})
+        e.connect(d.A, a)
+        e.connect(d.K, p.gnd)
+    }
+})
+
+let gnd = e.net({name: "GND" kind: @ground})
+let v33 = e.net({name: "3V3" kind: @power volts: 3.3V})
+let swdio = e.net({name: "SWDIO"})
+let swclk = e.net({name: "SWCLK"})
+let nrst = e.net({name: "NRST"})
+let j = e.part(header({pins: 5 pitch: 1.27mm}), {pins: [v33 swdio swclk nrst gnd]})
+let led = indicator({vdd: v33 gnd: gnd})

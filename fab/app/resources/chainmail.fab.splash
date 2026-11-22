@@ -1,0 +1,9 @@
+// A sheet of chainmail on a plate of its own: every link interlocked with its four neighbours,
+// printed flat in one go. It comes off the bed as cloth: try it in Mechanics.
+use mod.fab.*
+
+script("chainmail.cad.splash")
+
+color("Silver", rgb: #xa7adb5)
+
+place("chainmail", at: [175mm 160mm], name: "Chainmail", color: "Silver")

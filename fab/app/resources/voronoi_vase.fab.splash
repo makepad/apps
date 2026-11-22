@@ -1,0 +1,9 @@
+// A bud vase as a Voronoi web on a plate of its own: one distance field of engine nodes, its wall
+// cut into even cells between a solid foot and a solid collar.
+use mod.fab.*
+
+script("voronoi_vase.cad.splash")
+
+color("Teal", rgb: #x2a9d8f)
+
+place("voronoi_vase", at: [175mm 160mm], name: "Voronoi vase", color: "Teal")

@@ -1,0 +1,10 @@
+// A pair of geode bookends, two slices of one made-up stone: rind, agate bands and quartz crystals.
+use mod.fab.*
+
+script("geode_bookends.cad.splash")
+
+color("Rind", rgb: #x735c47)
+color("Agate", rgb: #x33619e)
+color("Quartz", rgb: #xedf0f5)
+
+place("geode_bookends", at: [175mm 160mm], name: "Geode bookends", color: "Rind")

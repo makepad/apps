@@ -1,0 +1,52 @@
+// A lamp shade in two filaments: a thin bell-shaped shell whose cells are a translucent filament
+// and whose web between them is an opaque one, so with a light inside the cells glow and the web
+// stands out dark. The cells are Voronoi cells of points scattered through space, so the web runs
+// round the shade unevenly, like a leaf's veins. The shell leans in as it rises and closes over a
+// shoulder to a ring that rests on a lamp holder, every face less than 45 degrees from upright, so
+// it prints standing on its wide end with no supports.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let height = param(110mm, min: 60mm, max: 150mm, step: 1mm, label: "Height", group: "Shade", hint: "to the shoulder")
+let base = param(70mm, min: 45mm, max: 100mm, step: 1mm, label: "Base radius", group: "Shade", kind: "radius")
+let hole = param(25.5mm, min: 15mm, max: 40mm, step: 0.5mm, label: "Ring radius", group: "Shade", kind: "radius", hint: "the top ring's outside, which rests on the lamp holder")
+let wall = param(1.4mm, min: 0.8mm, max: 2.4mm, step: 0.1mm, label: "Wall", group: "Shade", hint: "thin enough for the light to come through")
+let cell = param(16mm, min: 6mm, max: 40mm, step: 0.5mm, label: "Cell", group: "Pattern")
+let web = param(1.8mm, min: 0.8mm, max: 5mm, step: 0.1mm, label: "Web", group: "Pattern", hint: "the dark web's width between cells")
+let seed = param(4, min: 1, max: 99, step: 1, label: "Seed", group: "Pattern", hint: "another whole number scatters other cells")
+
+// The outside of the wall, foot to ring: a bell rising from the base radius, steepest at the foot
+// and upright at the shoulder, then the shoulder curving in to the ring at 40 degrees.
+let shoulder = hole + 16.5mm
+let bell = for i in 0..13 {
+    let f = i / 12
+    let g = 1 - f
+    [shoulder + (base - shoulder) * g * sqrt(g), height * f]
+}
+let over = [[shoulder - 1.5mm, height + 5mm] [shoulder - 4.5mm, height + 10.5mm] [shoulder - 8.5mm, height + 15.5mm] [shoulder - 12.5mm, height + 20.3mm] [hole, height + 25.1mm]]
+// The wall: the outside up, then back down the same line moved in by the wall's thickness.
+let profile = for i in 0..36 {
+    if i < 13 {
+        bell[i]
+    } else if i < 18 {
+        over[i - 13]
+    } else if i < 23 {
+        let q = over[22 - i]
+        [q[0] - wall, q[1]]
+    } else {
+        let q = bell[35 - i]
+        [q[0] - wall, q[1]]
+    }
+}
+let shade = m.revolve({sketch: Polygon{points: profile}})
+
+object(shade, name: "Voronoi shade")
+
+let ink = Material{albedo: [0.1 0.1 0.11] name: "Ink"}
+let glow = Material{albedo: [0.96 0.93 0.84] name: "Glow"}
+m.fill(m.box({size: [2 * base + 4mm, height + 30mm, 2 * base + 4mm] at: [0, (height + 25mm) / 2, 0]}), Mix{materials: [ink glow] field: fn(p) {
+    let c = noise.cells(p / cell, seed)
+    if (c.y - c.x) * cell < web { 0 } else { 1 }
+} sharp: 1})

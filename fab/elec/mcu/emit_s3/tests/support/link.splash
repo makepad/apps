@@ -1,0 +1,43 @@
+// An ordinary exchange program: receive whole frames and send an independent
+// deterministic stream. A refused send retains its buffer until a later turn.
+let tx = bytes(1514)
+let rx = bytes(1514)
+var sent: i32 = 0
+var sent_bytes: i32 = 0
+var pending: i32 = 0
+var retries: i32 = 0
+var received: i32 = 0
+var received_bytes: i32 = 0
+
+let network = eth(RX_SLOTS, fn() {
+    for slot in 0..RX_SLOTS {
+        let n = eth_recv(rx, 0)
+        if n > 0 {
+            received = received + 1
+            received_bytes = received_bytes + n
+        }
+    }
+})
+
+let send = every(ms(SEND_PERIOD_MS), fn() {
+    if received > 0 && sent_bytes < TRANSFER_BYTES {
+        if pending == 0 {
+            CHOOSE_LENGTH
+            if sent_bytes + pending > TRANSFER_BYTES {
+                pending = TRANSFER_BYTES - sent_bytes
+            }
+            for i in 0..FILL_BYTES { tx[i] = (i + sent * 37 + 83) & 255 }
+            tx[0] = 2
+            tx[6] = 2
+            tx[12] = 136
+            tx[13] = 181
+        }
+        if eth_send(tx, 0, pending) == 1 {
+            sent = sent + 1
+            sent_bytes = sent_bytes + pending
+            pending = 0
+        } else {
+            retries = retries + 1
+        }
+    }
+})

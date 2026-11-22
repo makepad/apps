@@ -1,0 +1,7 @@
+[package]
+name = "fab-robot"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab's arm cells: arm models (DH chains, link inertias, elastic drives, controllers, tools), kinematics, dynamics, clearance, the as-built field, the planner/cell boundary and the safety types"

@@ -1,0 +1,50 @@
+// A stained-glass panel in two filaments: an arched window of translucent cells held in an
+// opaque leading web, printed flat. The glass is a thin sheet; the leading and the frame round it
+// stand proud of it on top, as came does, and are the opaque filament all through, so light shows
+// the cells and the web stays dark. Hang it in a window.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+
+let width = param(100mm, min: 50mm, max: 200mm, step: 1mm, label: "Width", group: "Panel")
+let height = param(140mm, min: 60mm, max: 260mm, step: 1mm, label: "Height", group: "Panel", hint: "from the sill to the top of the arch")
+let glass = param(1.6mm, min: 0.8mm, max: 3mm, step: 0.2mm, label: "Glass", group: "Panel", hint: "the cells' thickness: thinner lets more light through")
+let lead_h = param(3.2mm, min: 1.6mm, max: 6mm, step: 0.2mm, label: "Leading height", group: "Leading")
+let lead_w = param(1.6mm, min: 0.8mm, max: 3mm, step: 0.1mm, label: "Leading width", group: "Leading")
+let frame = param(5mm, min: 2mm, max: 12mm, step: 0.5mm, label: "Frame", group: "Leading", hint: "the border round the panel")
+let cell = param(16mm, min: 8mm, max: 40mm, step: 0.5mm, label: "Cell", group: "Leading", hint: "the cells' size")
+let seed = param(7, min: 1, max: 99, step: 1, label: "Pattern", group: "Leading", hint: "another whole number lays other cells")
+
+// The window's outline as a distance across the plate (negative inside): a rectangle under a
+// round arch as wide as it, the sill toward -Z.
+let half = width / 2
+let spring = height / 2 - half
+fn window(x, z) {
+    let qx = abs(x) - half
+    let qz = abs(z + half / 2) - (height - half) / 2
+    let body = sqrt(max(qx, 0) * max(qx, 0) + max(qz, 0) * max(qz, 0)) + min(max(qx, qz), 0)
+    let arch = sqrt(x * x + (z - spring) * (z - spring)) - half
+    min(body, if z > spring { arch } else { body })
+}
+// The web: the cells' edges (the gap between the nearest and second-nearest cell, in
+// millimetres) and the frame inside the outline; negative where it is.
+fn web(p) {
+    let c = noise.cells(vec3(p.x, 0, p.z) / cell, seed)
+    let edge = (c.y - c.x) * cell / 2
+    min(edge - lead_w / 2, 0 - window(p.x, p.z) - frame)
+}
+let panel = m.sdf({
+    bounds: [[0 - half - 1mm, 0, 0 - height / 2 - 1mm], [half + 1mm, lead_h + 1mm, height / 2 + 1mm]]
+    field: fn(p) {
+        let w = window(p.x, p.z)
+        let sheet = max(w, max(0 - p.y, p.y - glass))
+        let came = max(max(web(p), w), max(0 - p.y, p.y - lead_h))
+        return min(sheet, came)
+    }
+})
+
+object(panel, name: "Stained-glass panel")
+
+let clear = Material{albedo: [0.25 0.55 0.85] name: "Clear blue"}
+let lead = Material{albedo: [0.1 0.1 0.11] name: "Lead"}
+m.fill(panel, Mix{materials: [clear lead] field: fn(p) { 0.5 - web(p) / 1mm } sharp: 1})

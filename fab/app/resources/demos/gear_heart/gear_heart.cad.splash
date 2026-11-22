@@ -1,0 +1,117 @@
+// A gear heart printed in place, in two filaments: a sun gear, three planets and a ring gear whose
+// outside is a heart. The teeth are herringbone, so the gears hold one another up and down with
+// no pins, and come off the bed already meshed: turn the sun and the planets walk round it.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let module = param(1.4mm, min: 1.2mm, max: 2.5mm, step: 0.1mm, label: "Module", group: "Gears", hint: "tooth size: the pitch diameter over the tooth count")
+let height = param(10mm, min: 6mm, max: 16mm, step: 0.5mm, label: "Height", group: "Gears")
+let helix = param(30°, min: 15°, max: 40°, step: 1°, label: "Helix", group: "Gears", hint: "the herringbone's angle; steeper holds the gears together harder")
+let backlash = param(0.6mm, min: 0.3mm, max: 0.9mm, step: 0.05mm, label: "Backlash", group: "Fit", hint: "each gear's teeth thinned by this on the pitch circle")
+
+// Tooth counts: the ring has the sun's teeth plus two planets', and (sun + ring) / 3 is whole, so
+// three planets sit evenly round the sun.
+let z_sun = 12
+let z_planet = 12
+let z_ring = z_sun + 2 * z_planet
+let orbit = module * (z_sun + z_planet) / 2
+let alpha = 20°
+
+// An involute tooth outline, `z` teeth, thinned by `lash` on the pitch circle and shifted `shift`
+// modules outward; `phase` turns it. Each tooth: the root, an arc on the root circle from the last
+// tooth's flank to this one's, then up one flank and down the other. Below the base circle a flank
+// runs straight down to the root, so a mating tip clears the root's corners. A root circle above
+// the base circle takes no corner points: the flank starts on it.
+fn inv(a) { tan(a) - a }
+fn gear_outline(z, lash, shift, phase, cx, cy) {
+    let r = module * z / 2
+    let rb = r * cos(alpha)
+    let ra = r + module * (1 + shift)
+    let rf = r - module * (1.25 - shift)
+    let r0 = if rf > rb { rf } else { rb }
+    let half = (3.14159 / 2 + 2 * shift * tan(alpha)) / z - lash / (2 * r)
+    let foot = half + inv(alpha) - inv(acos(rb / r0))
+    let n = 6
+    let nr = 3
+    let e = if rb > rf { 0 } else { 0.5 }
+    let per = nr + 1 + 2 * n
+    let pitch = 2 * 3.14159 / z
+    Polygon{points: for j in 0..(z * per) {
+        let k = floor(j / per)
+        let i = j - k * per
+        let c = phase + k * pitch
+        if i <= nr {
+            let a = c - pitch + foot + (pitch - 2 * foot) * (i + e) / (nr + 2 * e)
+            [cx + rf * cos(a), cy + rf * sin(a)]
+        } else {
+            let f = i - nr - 1
+            let rho = if f < n { r0 + (ra - r0) * f / (n - 1) } else { ra - (ra - r0) * (f - n) / (n - 1) }
+            let flank = half + inv(alpha) - inv(acos(rb / (if rho > rb { rho } else { rb })))
+            let a = if f < n { c - flank } else { c + flank }
+            [cx + rho * cos(a), cy + rho * sin(a)]
+        }
+    }}
+}
+
+// A herringbone gear: two twisted sweeps, one up the lower half and one back down the upper half,
+// meeting at mid-height. A gear of pitch radius r turns by tan(helix) * y / r at height y, so gears
+// that mesh stay meshed at every height; meshing gears lean opposite ways (`hand`), and a ring
+// leans with its planets. It runs from `lo` to `hi`. A sweep turns its outline about the sketch's
+// origin, so the outline is drawn there and the sweep runs up through the gear's centre.
+fn herringbone(z, hand, lash, shift, phase, cx, cy, lo, hi) {
+    let rate = hand * tan(helix) / (module * z / 2)
+    let mid = height / 2
+    let lower = m.sweep({sketch: gear_outline(z, lash, shift, phase + rate * lo, 0, 0) path: [[cx, lo, 0 - cy] [cx, mid, 0 - cy]] twist: rate * (mid - lo)})
+    let upper = m.sweep({sketch: gear_outline(z, lash, shift, phase + rate * mid, 0, 0) path: [[cx, mid, 0 - cy] [cx, hi, 0 - cy]] twist: 0 - rate * (hi - mid)})
+    m.union(lower, upper)
+}
+
+// The ring: a heart, the ring's teeth cut in it by their mating shape, shifted 0.4 module outward
+// so the ring's tips and corners clear the planets by a third of a millimetre or more; a wall of
+// `wall` past the deepest tooth.
+let wall = 3.5mm
+let big = module * z_ring / 2 + module * 1.25 + wall
+let heart = Path{from: [0, -1.8 * big] segs: [SplineTo{points: [[1.35 * big, -0.6 * big] [1.55 * big, 0.9 * big] [0.78 * big, 1.55 * big] [0, 1.13 * big]]} SplineTo{points: [[-0.78 * big, 1.55 * big] [-1.55 * big, 0.9 * big] [-1.35 * big, -0.6 * big] [0, -1.8 * big]]}]}
+let blank = m.extrude({sketch: heart plane: @xz height: height})
+let ring = m.subtract(blank, herringbone(z_ring, -1, 0, 0.4, 3.14159 / z_ring, 0, 0, -1mm, height + 1mm))
+
+// The sun, a hex socket through it for a key; three planets round it, each turned so a gap faces
+// the sun's tooth: a planet at angle a has turned a * (1 + z_sun / z_planet) as it rolled there.
+let sun = m.subtract(herringbone(z_sun, 1, backlash, 0, 0, 0, 0, 0, height), m.extrude({sketch: Regular{sides: 6 radius: module * 2.2} plane: @xz height: height + 2mm at: [0, -1mm, 0]}))
+let planets = for i in 0..3 {
+    let a = i * 2 * 3.14159 / 3
+    herringbone(z_planet, -1, backlash, 0, 3.14159 / z_planet + a * (1 + z_sun / z_planet), orbit * cos(a), orbit * sin(a), 0, height)
+}
+let gears = m.union(m.union(ring, sun), planets)
+
+object(gears, name: "Gear heart")
+
+// The planets in the second filament: inside the nearest planet's tooth outline (at this height's
+// turn), a little wider, so the colour changes in the air between meshing teeth.
+let gold = Material{albedo: [0.92 0.68 0.12] name: "Gold"}
+let r_p = module * z_planet / 2
+let rb_p = r_p * cos(alpha)
+let ra_p = r_p + module
+let rf_p = r_p - 1.25 * module
+let half_p = (3.14159 / 2) / z_planet - backlash / (2 * r_p)
+let margin = 0.15mm
+let third = 2 * 3.14159 / 3
+let tooth = 2 * 3.14159 / z_planet
+m.fill(gears, Mix{materials: [Material{albedo: [0.75 0.16 0.23] name: "Red"} gold] field: fn(p) {
+    let u = p.x
+    let v = 0 - p.z
+    let c = floor(atan2(v, u) / third + 0.5) * third
+    let qu = u - orbit * cos(c)
+    let qv = v - orbit * sin(c)
+    let rho = sqrt(qu * qu + qv * qv)
+    let turn = 0 - tan(helix) * min(p.y, height - p.y) / r_p
+    let th = atan2(qv, qu) - (3.14159 / z_planet + c * (1 + z_sun / z_planet)) - turn
+    let phi = abs(th - floor(th / tooth + 0.5) * tooth)
+    let a = acos(rb_p / max(rho, rb_p))
+    let half = half_p + tan(alpha) - alpha - (tan(a) - a)
+    let in_root = rf_p + margin - rho
+    let in_tooth = min(ra_p + margin - rho, (half - phi) * rho + margin)
+    0.5 + max(in_root, in_tooth) / 1mm
+} sharp: 1})

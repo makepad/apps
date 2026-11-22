@@ -1,0 +1,9 @@
+// A shallow dish with a slime mould grown over it, still spreading, its front a fan of lace, in two filaments.
+use mod.fab.*
+
+script("mould_lace.cad.splash")
+
+color("Charcoal", rgb: #x2a2a2c)
+color("Yellow", rgb: #xf2c21f)
+
+place("mould_lace", at: [175mm 160mm], name: "Slime mould lace dish", color: "Charcoal")

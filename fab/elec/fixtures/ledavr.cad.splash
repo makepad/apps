@@ -1,0 +1,36 @@
+// The LED chaser in its printed case: the enclosure prelude's base and lid round the board
+// (`board("ledavr")`), and the board with its parts inserted in the base. The insert never
+// prints: it rides in the base, shows in place among the toolpaths in the Sliced view, and the
+// slice is checked against it (no bead enters it). The base prints on its floor, the lid upside
+// down beside it, and the button's press pin beside the lid, standing on its shaft's top. The
+// USB-C receptacle at the left edge gets its opening through the wall, and the ISP header passes
+// through the lid, so the lid stays low over the LEDs.
+//
+// Light pipes carry each LED's light to the lid's top face: clear PETG printed into the lid's
+// opaque block in the same layers (the lid's object lists the pipes after the lid, so each pipe
+// owns its channel in its own filament), flush with the lid's top. A printed clear pipe diffuses:
+// its tip glows as a matte face, and the dark lid keeps one LED's light out of its neighbours'.
+//
+// The standoffs hold heat-set inserts: brass, threaded, melted into their holes with a soldering
+// iron after the print. They ride in the base like the board; the print never stops for them, and
+// the job lists them as its step after the print. The lid's screws go through the board into them.
+use mod.model.*
+use mod.fab.*
+let m = mod.model
+let pcb = board("ledavr")
+let case = enclosure(pcb, {pipes: {}})
+object(case.base, name: "Base")
+let clear = Material{albedo: [0.9 0.92 0.9] name: "Clear"}
+let lid = [case.lid]
+for p in case.pipes {
+    m.fill(p.pipe, clear)
+    lid.push(p.pipe)
+}
+object(lid, name: "Lid")
+for pin in case.pins {
+    object(pin.pin, name: pin.name)
+}
+insert(board_solid(pcb, board_bodies("ledavr"), case.frame), name: "Board", into: "Base")
+for i in case.inserts {
+    insert(i.part, name: i.name, into: "Base", melt: i)
+}

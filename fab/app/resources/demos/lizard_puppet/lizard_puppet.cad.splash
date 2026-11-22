@@ -1,0 +1,153 @@
+// A crested lizard, a hand puppet printed in place with its mouth wide open: the jaw lies on the
+// bed, the head stands up on the back of its skull, and the two turn on one hinge across the
+// corners of the mouth, its pin printed through it. The fingers go up into the head from
+// behind, the thumb into the jaw: open and shut your hand and it talks. Both are fields,
+// hollowed to a skin with every inner ceiling at 45 degrees, so nothing inside needs support; a
+// crest of spikes runs over the head (their edges at 45 degrees too), eyes bulge on either side
+// of the crown, lower teeth and a tongue sit in the jaw. The scales are speckled through the
+// skin, or grown over it as a Turing pattern (spots, stripes or a labyrinth); the eyes and the
+// mouth are painted.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let materials = param(4, min: 2, max: 9, step: 1, label: "Materials", group: "Colours", kind: "count", hint: "2: the scales and the mouth; 4: adds the eyes' white and their slits; 9: speckled scales, a crest, a pink tongue, white teeth, freckles (each colour adds filament changes, and a purge with each)")
+let scheme = param(0, min: 0, max: 2, step: 1, label: "Colour scheme", group: "Colours", kind: "count", hint: "0 teal, 1 purple, 2 orange scales")
+let pattern = param(0, min: 0, max: 3, step: 1, label: "Skin pattern", group: "Colours", kind: "count", hint: "0 plain scales, 1 spots, 2 stripes, 3 a labyrinth: a Turing pattern grown over the head's and the jaw's skin, in the mouth's red (the flecks' colour in nine)")
+let skin = param(2.6mm, min: 2mm, max: 4mm, step: 0.2mm, label: "Skin", group: "Puppet", hint: "the head's wall round the hand")
+
+// The hinge: across the mouth's back corners, 22 mm over the bed (X across, Z forward). The
+// head is drawn shut in its own frame `c` (c.y up from the mouth's line, c.z forward from the
+// hinge) and stands open a right angle on the plate: c = (x, -z, y - hy).
+let hy = 22mm
+let half = 42mm
+let ground = m.box({size: [400mm, 20mm, 400mm] at: [0, -10mm, 0]})
+
+let head_shape = m.sdf({
+    bounds: [[-half - 1mm, -1mm, -66mm], [half + 1mm, hy + 80mm, 6mm]]
+    cell: 0.6mm
+    field: fn(p) {
+        let c = vec3(p.x, -p.z, p.y - hy)
+        // a box-like lower head (its mouth's line flat, its back flat on the bed) under a dome,
+        // a muzzle bulging at the front
+        let lower = sdf_round_box(c - vec3(0, 13.25mm, 21mm), vec3(2 * half, 25.5mm, 86mm), 3mm)
+        let dome = sdf_ellipsoid(c - vec3(0, 24mm, 14mm), vec3(half, 34mm, 50mm))
+        let muzzle = sdf_ellipsoid(c - vec3(0, 14mm, 60mm), vec3(34mm, 14mm, 18mm))
+        let head0 = smooth_union(smooth_union(lower, dome, 8mm), muzzle, 6mm)
+        let head1 = max(head0, max(0.5mm - c.y, -hy - c.z))
+        // the crest: spikes over the crown, their edges at 45 degrees (a sawtooth along c.z)
+        let tooth = 6mm * (1 - abs(fract((c.z + 22mm) / 12mm) - 0.5) * 2)
+        let crest = max(max(abs(c.x) - 1.6mm, dome - tooth), max(abs(c.z - 14mm) - 30mm, 30mm - c.y))
+        // the eyes: a bulge either side of the crown, toward the front
+        let eyes = length(vec3(abs(c.x), c.y, c.z) - vec3(20mm, 44mm, 44mm)) - 9mm
+        let outer = min(min(head1, crest), eyes)
+        // the hand's room: inside the skin, behind the palate, clear of the hinge, under a 45
+        // degree cone at the top; the way in is through the back of the skull, on the bed
+        let core = max(max(head0 + skin, p.z + 4mm), 9mm - length(vec2(p.y - hy, p.z)))
+        let way_in = max((length(vec2(p.x / 30mm, (p.z + 24mm) / 18mm)) - 1) * 18mm, p.y - skin - 0.5mm)
+        let cap = p.y - hy - 70mm + length(vec2(p.x, p.z + 28mm))
+        return sdf_difference(outer, max(min(core, way_in), cap))
+    }
+})
+let head = m.carve(head_shape, ground, 0)
+
+// The jaw: a rounded slab with a bowl for the mouth, a tongue in it and a row of teeth along the
+// lip; the thumb's tunnel runs in from the back under a 45 degree roof.
+let jaw_shape = m.sdf({
+    bounds: [[-half, -1mm, 0], [half, hy + 6mm, 82mm]]
+    cell: 0.6mm
+    field: fn(p) {
+        let slab = sdf_round_box(p - vec3(0, 9.25mm, 40.75mm), vec3(2 * half - 4mm, 24.5mm, 80.5mm), 5mm)
+        let plan = (length(vec2(p.x / (half - 2mm), (p.z - 28mm) / 52mm)) - 1) * (half - 2mm)
+        let body = smooth_intersection(slab, plan, 4mm)
+        let bowl = sdf_ellipsoid(p - vec3(0, hy + 5mm, 42mm), vec3(32mm, 7mm, 30mm))
+        let tongue = sdf_ellipsoid(p - vec3(0, hy - 1.5mm, 40mm), vec3(12mm, 4mm, 18mm))
+        let a = atan2(p.x, p.z - 40mm)
+        let k = clamp(round(a / 0.28), -3, 3) * 0.28
+        let u = vec3(p.x * cos(k) - (p.z - 40mm) * sin(k), p.y - hy + 1mm, p.x * sin(k) + (p.z - 40mm) * cos(k) - 33mm)
+        let teeth = sdf_cone(u - vec3(0, 2.5mm, 0), 2.6mm, 0.5mm, 5mm)
+        let mouth = smooth_union(smooth_union(sdf_difference(body, bowl), tongue, 2mm), teeth, 0.8mm)
+        let thumb_plan = sdf_box(vec3(p.x, 0, p.z - 20mm), vec3(22mm, 1m, 46mm))
+        let thumb = max(max(thumb_plan, 2.4mm - p.y), (p.y - 4mm + thumb_plan) * 0.7071)
+        return sdf_difference(mouth, thumb)
+    }
+})
+let jaw = m.carve(jaw_shape, ground, 0)
+
+// The hinge: its pin through plates at the mouth's corners (the head's), its eye across the
+// middle (the jaw's). Shut is a quarter turn forward. The pin lies along the bed, so the gap
+// round it is the one between layers: three of them, the jaw loose enough not to tack.
+let talk = m.hinge(head, jaw, {at: [0, hy, 0] axis: [1, 0, 0] pin: 2mm plate: 26mm clearance: 0.6mm lower: -95° upper: 10°})
+object(jaw, name: "Lizard puppet")
+
+// ---- the paint (on the plate, as printed: the head's regions in its own frame)
+let teal = Material{albedo: [0.1 0.6 0.6] name: "Teal"}
+let purple = Material{albedo: [0.45 0.2 0.65] name: "Purple"}
+let orange = Material{albedo: [0.95 0.45 0.1] name: "Orange"}
+let blue = Material{albedo: [0.12 0.3 0.75] name: "Blue"}
+let yellow = Material{albedo: [0.97 0.8 0.15] name: "Yellow"}
+let red = Material{albedo: [0.7 0.05 0.12] name: "Red"}
+let pink = Material{albedo: [0.95 0.5 0.6] name: "Pink"}
+let white = Material{albedo: [0.95 0.95 0.92] name: "White"}
+let dark = Material{albedo: [0.08 0.06 0.1] name: "Dark"}
+let scales = if scheme == 1 { purple } else { if scheme == 2 { orange } else { teal } }
+let fleck = if scheme == 1 { blue } else { if scheme == 2 { yellow } else { blue } }
+let mouth_col = red
+let crest_col = if materials >= 9 { yellow } else { scales }
+let tongue_col = if materials >= 9 { pink } else { mouth_col }
+let tooth_col = if materials >= 4 { white } else { scales }
+let eye_col = if materials >= 4 { white } else { scales }
+let pupil_col = if materials >= 4 { dark } else { mouth_col }
+
+m.fill(head, scales)
+m.fill(jaw, scales)
+if pattern >= 1 {
+    // A Turing pattern grown over the skin: each part's own simulation, at one scale over the
+    // crown, the muzzle and the jaw. Its preset, scale, seed and steps are the part's Pattern
+    // knobs. The marks take the mouth's red, not the slits' dark: the red is on every layer of the
+    // mouth already, so the pattern adds no filament, and the dark (sharing the red's nozzle in
+    // four) only swaps in for the slits.
+    let marks = if materials >= 9 { fleck } else { mouth_col }
+    let grown = if pattern == 2 { Turing{preset: @stripes scale: 7mm seed: 3 steps: 3000} } else { if pattern == 3 { Turing{preset: @labyrinth scale: 6mm seed: 3 steps: 3000} } else { Turing{preset: @spots scale: 8mm seed: 3 steps: 3000} } }
+    m.fill(head, Mix{materials: [scales marks] field: grown sharp: 1})
+    m.fill(jaw, Mix{materials: [scales marks] field: grown sharp: 1})
+} else {
+    // Speckled scales: flecks of a second colour through the skin, dithered.
+    if materials >= 9 {
+        m.fill(head, Mix{materials: [scales fleck] field: fn(p) { return clamp(sin(p.x * 0.9) * sin(p.y * 0.83 + 1.3) * sin(p.z * 0.77 + 0.4) * 3 - 1.6, 0, 1) }})
+        m.fill(jaw, Mix{materials: [scales fleck] field: fn(p) { return clamp(sin(p.x * 0.9) * sin(p.y * 0.83 + 1.3) * sin(p.z * 0.77 + 0.4) * 3 - 1.6, 0, 1) }})
+    }
+}
+// The inside of the mouth: an oval on the palate over the jaw's bowl (shut, they meet), its rim
+// in the scales' colour for lips, and the bowl.
+m.fill(m.sdf({bounds: [[-34mm, hy + 10mm, -3.5mm], [34mm, hy + 74mm, 0.5mm]] field: fn(p) {
+    return max((length(vec2(p.x / 33mm, (p.y - hy - 42mm) / 31mm)) - 1) * 31mm, max(-3mm - p.z, p.z))
+}}), mouth_col)
+m.fill(m.sdf({bounds: [[-half, hy - 4mm, 8mm], [half, hy + 3mm, 74mm]] field: fn(p) { return max(sdf_ellipsoid(p - vec3(0, hy + 5mm, 42mm), vec3(33mm, 8.5mm, 31mm)), hy - 4mm - p.y) }}), mouth_col)
+m.fill(m.sdf({bounds: [[-14mm, hy - 6mm, 20mm], [14mm, hy + 3mm, 60mm]] field: fn(p) { return sdf_ellipsoid(p - vec3(0, hy - 1.5mm, 40mm), vec3(13mm, 4.6mm, 19mm)) }}), tongue_col)
+m.fill(m.sdf({bounds: [[-half, hy - 2mm, 8mm], [half, hy + 6mm, 80mm]] field: fn(p) {
+    let a = atan2(p.x, p.z - 40mm)
+    let k = clamp(round(a / 0.28), -3, 3) * 0.28
+    let u = vec3(p.x * cos(k) - (p.z - 40mm) * sin(k), p.y - hy + 1mm, p.x * sin(k) + (p.z - 40mm) * cos(k) - 33mm)
+    return max(sdf_cone(u - vec3(0, 2.5mm, 0), 3.2mm, 1mm, 6mm), hy - 0.6mm - p.y)
+}}), tooth_col)
+// The crest.
+m.fill(m.sdf({bounds: [[-3mm, hy - 24mm, -66mm], [3mm, hy + 50mm, -26mm]] field: fn(p) { return max(abs(p.x) - 2.4mm, 30mm + p.z) }}), crest_col)
+// The eyes: whites over the bulges, each with an upright slit looking out and forward.
+m.fill(m.sdf({bounds: [[-half, hy + 30mm, -60mm], [half, hy + 60mm, -26mm]] field: fn(p) {
+    let c = vec3(abs(p.x), -p.z, p.y - hy)
+    return length(c - vec3(20mm, 44mm, 44mm)) - 9.6mm
+}}), eye_col)
+m.fill(m.sdf({bounds: [[-half, hy + 40mm, -60mm], [half, hy + 60mm, -36mm]] field: fn(p) {
+    let c = vec3(abs(p.x), -p.z, p.y - hy)
+    return sdf_ellipsoid(c - vec3(24.2mm, 50.5mm, 48.5mm), vec3(1.4mm, 3.2mm, 4mm))
+}}), pupil_col)
+// Freckles across the muzzle, and a dark nose at its tip.
+if materials >= 9 {
+    m.fill(m.sdf({bounds: [[-half, hy + 50mm, -32mm], [half, hy + 80mm, -4mm]] field: fn(p) {
+        let c = vec3(abs(p.x), -p.z, p.y - hy)
+        return min(min(length(c - vec3(18mm, 20mm, 68mm)), length(c - vec3(22mm, 15mm, 66mm))), length(c - vec3(16mm, 13mm, 72mm))) - 1.6mm
+    }}), orange)
+}
+m.fill(m.sdf({bounds: [[-10mm, hy + 66mm, -34mm], [10mm, hy + 80mm, -14mm]] field: fn(p) { return length(vec3(p.x, -p.z, p.y - hy) - vec3(0, 24mm, 74mm)) - 6mm }}), pupil_col)

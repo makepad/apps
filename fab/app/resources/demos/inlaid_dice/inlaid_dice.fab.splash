@@ -1,0 +1,9 @@
+// A pair of dice with inlaid pips, in two filaments: ivory and ink.
+use mod.fab.*
+
+script("inlaid_dice.cad.splash")
+
+color("Ivory", rgb: #xeee6d2)
+color("Ink", rgb: #x15171e)
+
+place("inlaid_dice", at: [175mm 160mm], name: "Dice", color: "Ivory")

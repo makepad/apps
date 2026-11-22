@@ -1,0 +1,8 @@
+// The box on its bench, the key up: nothing sounds. Hold the key (in 3D, on the board, on the
+// sheet or in the closed box) and the LED lights and the tone plays on the line out; listen to
+// it on its lane. The scope shows the line out, the oscillator and the LED's sink (lit while low).
+bench("box", {circuit: "tonebox" run: {stop: 500ms}}, fn(b, c) {
+    b.probe(c.net("OUT"), {label: "Line out"})
+    b.probe(c.net("OSC"), {label: "Oscillator"})
+    b.probe(c.net("QUIET"), {label: "LED sink"})
+})

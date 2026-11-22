@@ -1,0 +1,57 @@
+// A terrain tile in four filaments: a made-up landscape of ridged hills over a flat lake,
+// coloured by height through the volume, so every layer prints only the bands it crosses: water,
+// a dithered shore into grass, rock on the slopes, snow on the peaks. Contour lines can be inlaid
+// in rock every few millimetres of height.
+use mod.model.*
+use mod.fab.*
+use mod.math.*
+let m = mod.model
+
+let size = param(70mm, min: 40mm, max: 120mm, step: 1mm, label: "Size", group: "Terrain")
+let relief = param(14mm, min: 4mm, max: 30mm, step: 0.5mm, label: "Relief", group: "Terrain", hint: "from the lake to the highest peak")
+let feature = param(26mm, min: 10mm, max: 60mm, step: 1mm, label: "Hill size", group: "Terrain")
+let seed = param(7, min: 1, max: 99, step: 1, label: "Land", group: "Terrain", hint: "another whole number makes another landscape")
+let water = param(0.3, min: 0, max: 0.6, step: 0.01, label: "Lake level", group: "Colours", kind: "ratio", hint: "how high the lake stands, over the relief")
+let contours = param(0, min: 0, max: 1, step: 1, label: "Contour lines", group: "Colours", hint: "1 inlays a rock line every contour step")
+let contour_step = param(2mm, min: 1mm, max: 6mm, step: 0.2mm, label: "Contour step", group: "Colours")
+
+let base = 3mm
+let lake = base + water * relief
+// The land's height at (x, z): ridged hills under broad rolling ground, flattened at the lake.
+fn ground(x, z) {
+    let q = vec3(x, 0, z) / feature
+    let hills = noise.ridged(q, seed, 4)
+    let roll = 0.5 + 0.5 * noise.fbm(q * 0.5, seed + 1, 3)
+    max(base + relief * (0.65 * hills * hills + 0.35 * roll) * 1.1, lake)
+}
+let top = base + relief * 1.1
+let tile = m.sdf({
+    bounds: [[0 - size / 2, 0, 0 - size / 2], [size / 2, top + 1mm, size / 2]]
+    cell: 0.4mm
+    field: fn(p) {
+        // the height difference shrunk by the steepest slope it can have, so it stays a distance
+        let land = (p.y - ground(p.x, p.z)) * 0.45
+        return sdf_intersection(land, sdf_box(p - vec3(0, top / 2, 0), vec3(size, top + 4mm, size)))
+    }
+})
+
+object(tile, name: "Terrain tile")
+
+// By height: rock under everything, the lake's top millimetre, a dithered shore a millimetre
+// deep, grass, rock again above half the relief (on a noisy line), snow on the top quarter.
+// Contour lines are rock in the grass.
+let lake_blue = Material{albedo: [0.12 0.36 0.66] name: "Lake"}
+let grass = Material{albedo: [0.32 0.55 0.22] name: "Grass"}
+let rock = Material{albedo: [0.5 0.47 0.43] name: "Rock"}
+let snow = Material{albedo: [0.95 0.96 0.97] name: "Snow"}
+m.fill(m.box({size: [size + 2mm, top + 4mm, size + 2mm] at: [0, top / 2, 0]}), Mix{materials: [lake_blue grass rock snow] field: fn(p) {
+    let h = p.y
+    let wobble = 1.5mm * noise.fbm(vec3(p.x, 0, p.z) / 9mm, seed + 2, 3)
+    let rock_line = base + relief * 0.5 + wobble
+    let snow_line = base + relief * 0.74 + wobble
+    let c = h / contour_step
+    let on_line = contours > 0.5 && abs(c - floor(c + 0.5)) * contour_step < 0.3mm && h > lake + 1mm
+    if h < lake - 1mm { 2 } else { if h < lake + 0.2mm { 0 } else { if h < lake + 1.2mm { (h - lake - 0.2mm) / 1mm } else {
+        if h > snow_line { 3 } else { if h > rock_line || on_line { 2 } else { 1 } }
+    } } }
+}})

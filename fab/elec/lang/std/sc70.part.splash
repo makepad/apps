@@ -1,0 +1,213 @@
+let __sc70_f = mod.elec.f
+
+let __sc70_positive = fn(v) {
+    return v.is_number() && v > 0mm && v - v == 0mm
+}
+
+// Nominal gull-wing lands: toe and heel 0.35 mm, side 0.03 mm.
+let __sc70_land = fn(span, lead) {
+    let toe = 0.35mm
+    let heel = 0.35mm
+    let side = 0.03mm
+    // Z = span + 2 * toe; G = span - 2 * lead[1] - 2 * heel.
+    // The equivalent length avoids subtracting nearly equal spans.
+    return {
+        y: __sc70_f.round((span - lead[1] + toe - heel) / 2, 0.01mm)
+        size: [__sc70_f.round(lead[0] + 2 * side, 0.01mm),
+               __sc70_f.round(lead[1] + toe + heel, 0.01mm)]
+    }
+}
+
+// Two rows of gull-wing leads on the y sides; bottom and top counts 1..4,
+// pitch, body [x, y], span tip to tip in y, lead [width, foot length] in mm.
+// Optional top_at lists x positions in mm, right to left; a single lead is centred.
+// Optional tab [width, foot length] in mm replaces the top row at x = 0;
+// tab_no is a positive integer or nonempty string (default bottom + 1);
+// it may share a lead number.
+let small_outline = fn(o) {
+    if !o.is_object() {
+        return __sc70_f.error("small_outline: o must be an options object")
+    }
+    if (o.bottom ?? nil) == nil { return __sc70_f.error("small_outline: bottom is required") }
+    if (o.top ?? nil) == nil { return __sc70_f.error("small_outline: top is required") }
+    if (o.pitch ?? nil) == nil { return __sc70_f.error("small_outline: pitch is required") }
+    if (o.body ?? nil) == nil { return __sc70_f.error("small_outline: body is required") }
+    if (o.span ?? nil) == nil { return __sc70_f.error("small_outline: span is required") }
+    if (o.lead ?? nil) == nil { return __sc70_f.error("small_outline: lead is required") }
+    if !o.bottom.is_number() || o.bottom < 1 || o.bottom > 4 || o.bottom % 1 != 0 {
+        return __sc70_f.error("small_outline: bottom must be an integer from 1 to 4")
+    }
+    if !o.top.is_number() || o.top < 1 || o.top > 4 || o.top % 1 != 0 {
+        return __sc70_f.error("small_outline: top must be an integer from 1 to 4")
+    }
+    if !__sc70_positive(o.pitch) {
+        return __sc70_f.error("small_outline: pitch must be a positive finite length")
+    }
+    if !o.body.is_array() || o.body.len() != 2 {
+        return __sc70_f.error("small_outline: body must be [x, y]")
+    }
+    if !__sc70_positive(o.body[0]) || !__sc70_positive(o.body[1]) {
+        return __sc70_f.error("small_outline: body dimensions must be positive finite lengths")
+    }
+    if !__sc70_positive(o.span) || o.span <= o.body[1] {
+        return __sc70_f.error("small_outline: span must be a positive finite length greater than body y")
+    }
+    if !o.lead.is_array() || o.lead.len() != 2 {
+        return __sc70_f.error("small_outline: lead must be [width, foot length]")
+    }
+    if !__sc70_positive(o.lead[0]) || !__sc70_positive(o.lead[1]) {
+        return __sc70_f.error("small_outline: lead dimensions must be positive finite lengths")
+    }
+    if 2 * o.lead[1] > o.span - o.body[1] {
+        return __sc70_f.error("small_outline: lead foot length must fit between body and span")
+    }
+    let half_bottom = (o.bottom - 1) * o.pitch / 2
+    if 2 * half_bottom + o.lead[0] > o.body[0] {
+        return __sc70_f.error("small_outline: body x must contain bottom leads at the specified pitch and lead width")
+    }
+    let tab = o.tab ?? nil
+    let top_at = o.top_at ?? nil
+    let requested_tab_no = o.tab_no ?? nil
+    let has_tab = tab != nil
+    if has_tab {
+        if !tab.is_array() || tab.len() != 2 {
+            return __sc70_f.error("small_outline: tab must be [width, foot length]")
+        }
+        if !__sc70_positive(tab[0]) || !__sc70_positive(tab[1]) {
+            return __sc70_f.error("small_outline: tab dimensions must be positive finite lengths")
+        }
+        if tab[0] > o.body[0] {
+            return __sc70_f.error("small_outline: tab width must fit inside body x")
+        }
+        if top_at != nil {
+            return __sc70_f.error("small_outline: top_at cannot be used with tab")
+        }
+    } elif requested_tab_no != nil {
+        return __sc70_f.error("small_outline: tab_no requires tab")
+    }
+    let tab_no = requested_tab_no ?? (o.bottom + 1)
+    if tab_no.is_number() {
+        if tab_no <= 0 || tab_no % 1 != 0 {
+            return __sc70_f.error("small_outline: tab_no must be a positive integer or nonempty string")
+        }
+    } elif !tab_no.is_string() || tab_no == "" {
+        return __sc70_f.error("small_outline: tab_no must be a positive integer or nonempty string")
+    }
+    if !has_tab && top_at != nil {
+        if !top_at.is_array() || top_at.len() != o.top {
+            return __sc70_f.error("small_outline: top_at must contain one x position per top lead")
+        }
+    }
+    let top_positions = if has_tab { [0mm] }
+    elif top_at != nil { top_at }
+    else { [for i in 0..o.top { (o.top - 1) * o.pitch / 2 - i * o.pitch }] }
+    let bottom_land = __sc70_land(o.span, o.lead)
+    let top_lead = if has_tab { tab } else { o.lead }
+    let top_land = __sc70_land(o.span, top_lead)
+    if !__sc70_positive(bottom_land.y) || !__sc70_positive(bottom_land.size[0]) || !__sc70_positive(bottom_land.size[1]) {
+        return __sc70_f.error("small_outline: span and lead must produce positive finite rounded land dimensions")
+    }
+    if !__sc70_positive(top_land.y) || !__sc70_positive(top_land.size[0]) || !__sc70_positive(top_land.size[1]) {
+        return __sc70_f.error("small_outline: span and lead or tab must produce positive finite rounded land dimensions")
+    }
+    if o.bottom > 1 && bottom_land.size[0] >= o.pitch {
+        return __sc70_f.error("small_outline: pitch must exceed the rounded bottom lead land width")
+    }
+    for i in 0..top_positions.len() {
+        let x = top_positions[i]
+        if !x.is_number() || x - x != 0mm {
+            return __sc70_f.error("small_outline: top_at positions must be finite lengths")
+        }
+        if top_positions.len() == 1 && x != 0mm {
+            return __sc70_f.error("small_outline: top_at must centre a single top lead at x = 0")
+        }
+        if x - top_lead[0] / 2 < -o.body[0] / 2 || x + top_lead[0] / 2 > o.body[0] / 2 {
+            return __sc70_f.error("small_outline: body x must contain top leads at the specified pitch or top_at positions and width")
+        }
+        if i > 0 {
+            if top_positions[i - 1] - x <= top_land.size[0] {
+                return __sc70_f.error("small_outline: pitch or top_at must place top lands right to left without touching")
+            }
+        }
+    }
+    // A tab foot may extend beneath the body, but the two land rows must stay separate.
+    let gap = bottom_land.y + top_land.y - (bottom_land.size[1] + top_land.size[1]) / 2
+    if !__sc70_positive(gap) {
+        return __sc70_f.error("small_outline: span, lead and tab foot lengths must leave space between the land rows")
+    }
+    let pads = for i in 0..o.bottom {
+        __sc70_f.smd(__sc70_f.int(i + 1),
+            [-half_bottom + i * o.pitch, -bottom_land.y], bottom_land.size)
+    }
+    for i in 0..top_positions.len() {
+        let no = if !has_tab { __sc70_f.int(o.bottom + i + 1) }
+        elif tab_no.is_number() { __sc70_f.int(tab_no) }
+        else { tab_no }
+        pads.push(__sc70_f.smd(no, [top_positions[i], top_land.y], top_land.size))
+    }
+    let half_x = o.body[0] / 2
+    let half_y = o.body[1] / 2
+    return __sc70_f.footprint({
+        pads: pads
+        body: [[-half_x, -half_y], [half_x, half_y]]
+        mount: @smd
+        text: 0.8mm
+        graphics: [__sc70_f.dot("F.SilkS", [-half_bottom - 0.7mm, -bottom_land.y], 0.15mm)]
+    })
+}
+
+// Three gull-wing leads, two below and one above; no parameters.
+let sot323 = fn() {
+    return small_outline({
+        bottom: 2
+        top: 1
+        pitch: 0.65mm
+        body: [2.0mm, 1.25mm]
+        span: 2.1mm
+        lead: [0.3mm, 0.35mm]
+    })
+}
+
+// Six gull-wing leads, three per row; no parameters.
+let sot363 = fn() {
+    return small_outline({
+        bottom: 3
+        top: 3
+        pitch: 0.65mm
+        body: [2.0mm, 1.25mm]
+        span: 2.1mm
+        lead: [0.3mm, 0.35mm]
+    })
+}
+
+// Five gull-wing leads, three below and two outer leads above; no parameters.
+let sot353 = fn() {
+    return small_outline({
+        bottom: 3
+        top: 2
+        top_at: [0.65mm, -0.65mm]
+        pitch: 0.65mm
+        body: [2.0mm, 1.25mm]
+        span: 2.1mm
+        lead: [0.3mm, 0.35mm]
+    })
+}
+
+// Three bottom leads and a top tab with the same 0.8 mm foot length;
+// optional o.tab_no is a positive integer or nonempty string (default 4).
+let sot89 = fn(o) {
+    if o != nil && !o.is_object() {
+        return __sc70_f.error("sot89: o must be an options object when supplied")
+    }
+    let tab_no = if o == nil { 4 } else { o.tab_no ?? 4 }
+    return small_outline({
+        bottom: 3
+        top: 1
+        pitch: 1.5mm
+        body: [4.5mm, 2.5mm]
+        span: 4.1mm
+        lead: [0.44mm, 0.8mm]
+        tab: [1.7mm, 0.8mm]
+        tab_no: tab_no
+    })
+}

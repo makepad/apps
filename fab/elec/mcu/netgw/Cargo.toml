@@ -1,0 +1,11 @@
+[package]
+name = "fab-elec-mcu-netgw"
+version = "1.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+authors = ["Makepad <info@makepad.nl>"]
+description = "Deterministic Ethernet gateway and WebSocket message peer for microsplash devices"
+
+[dependencies]
+fab-elec-mcu-rt = { path = "../rt" }

@@ -30,10 +30,21 @@ This repository has no Cargo workspace of its own. It builds inside a Makepad ch
 crates join Makepad's workspace and share its `target/`:
 
 ```sh
-git clone https://github.com/makepad/makepad.git
+git clone -b work https://github.com/makepad/makepad.git
 cd makepad
 git clone https://github.com/makepad/apps.git apps/apps
 cargo run --release -p makepad-fab
+```
+
+Makepad's `work` branch carries what Fab needs until the next update of `main`.
+
+If you already have a Makepad clone, bring it up to date first. It must be on `work` (older
+clones followed a `dev` branch that no longer exists):
+
+```sh
+git fetch origin
+git switch work
+git pull
 ```
 
 The crates' path dependencies point into the surrounding checkout (`../../` from this

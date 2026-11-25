@@ -2536,6 +2536,7 @@ impl App {
             tools::measure::install(&mut self.state, measurements);
             if program.is_some() {
                 self.program = program;
+                self.publish_trees();
             }
             // Values set and now built stop being pending; newer ones set meanwhile stay.
             self.state.params.pending.retain(|(key, value)| {
@@ -3033,7 +3034,7 @@ impl App {
     /// The code panel and the feature tree.
     fn source_action(&mut self, cx: &mut Cx, a: &fab::ui::code::SourceAction) {
         use fab::ui::code::SourceAction as S;
-        if matches!(a, S::Edited { .. } | S::Move { .. } | S::Reorder { .. } | S::Rename { .. } | S::Bypass { .. } | S::Remove(_)) {
+        if matches!(a, S::Edited { .. } | S::Move { .. } | S::Reorder { .. } | S::Rename { .. } | S::Bypass { .. } | S::SetRole { .. } | S::Remove(_)) {
             self.startup_monitor_done = true;
         }
         match a {
@@ -3096,6 +3097,7 @@ impl App {
                 });
                 self.param_action(cx, &fab::params::ParamAction::Hover(key));
             }
+            S::Focus(instance) => self.focus_instance(cx, instance),
             S::Fold(id) => {
                 if !self.state.source.collapsed.remove(id) {
                     self.state.source.collapsed.insert(id.clone());
@@ -3103,6 +3105,14 @@ impl App {
                 self.ui.redraw(cx);
             }
             S::Select { id, reveal } => {
+                // no id: the picked feature is let go (a part's row was picked)
+                if id.is_empty() {
+                    if self.state.source.selected.take().is_some() {
+                        self.drop_ghost();
+                        self.ui.redraw(cx);
+                    }
+                    return;
+                }
                 let Some(f) = self.state.source.feature(id).cloned() else { return };
                 let test_print = f.detail == fab::ui::code::TEST_PRINT;
                 if test_print {
@@ -3117,10 +3127,15 @@ impl App {
                     self.drop_ghost();
                 }
                 self.state.source.selected = Some(f.id.clone());
+                // its folds open to show it; a loop is left as it is (a copy picked in the view shows
+                // on the loop's row while it is folded, and a loop's id in `collapsed` means open)
                 let mut parent = f.parent.clone();
                 while let Some(id) = parent {
-                    self.state.source.collapsed.remove(&id);
-                    parent = self.state.source.feature(&id).and_then(|f| f.parent.clone());
+                    let up = self.state.source.feature(&id).map(|f| (f.parent.clone(), f.group && f.op != "call"));
+                    if !up.as_ref().is_some_and(|(_, is_loop)| *is_loop) {
+                        self.state.source.collapsed.remove(&id);
+                    }
+                    parent = up.and_then(|(p, _)| p);
                 }
                 // Its part picked with it, its handles shown, as a pick in the view does: the
                 // plate part of the row's object or of the nearest row above it that is one, else
@@ -3185,6 +3200,31 @@ impl App {
                 }).collect();
                 if let Some(host) = &mut self.host {
                     host.edit(edits);
+                }
+            }
+            S::SetRole { id, role } => {
+                let Some(inst) = self.program.as_ref().and_then(|(p, _)| p.instance(&self.state.source.instance)) else { return };
+                let edits = code_edit::role_changed(&self.state.source, inst, id, role).and_then(|edits| {
+                    // the rewrite must still parse and evaluate before it goes to the plate
+                    for c in &edits {
+                        if let fab_model::Change::Script { edit, .. } = c {
+                            makepad_model_script::lang::edit::apply(&inst.script.program, edit)?;
+                        }
+                    }
+                    Ok(edits)
+                });
+                match edits {
+                    Ok(edits) if edits.is_empty() => {}
+                    Ok(edits) => {
+                        if let Some(host) = &mut self.host {
+                            host.edit(edits);
+                            self.select_after = Some(id.clone());
+                        }
+                    }
+                    Err(message) => {
+                        self.state.ui.notices.say(NoticeView::Plate, message);
+                        self.ui.redraw(cx);
+                    }
                 }
             }
             S::Remove(id) => {
@@ -4275,6 +4315,10 @@ impl App {
     /// Only a changed viewport/list selection resets tab focus. The feature tree keeps
     /// following that selection even while the editor shows the plate or another file.
     fn follow_selection(&mut self, cx: &mut Cx) {
+        // trees missing with a program built (a restart that kept the program): made once
+        if self.state.source.trees.is_empty() && self.program.is_some() {
+            self.publish_trees();
+        }
         let selected = self.selected_objects();
         let changed = selected != self.source_selection;
         self.source_selection = selected;
@@ -4709,6 +4753,29 @@ impl App {
             self.test_place = self.state.ui.test_drag.clone().map(|d| (id, d));
         }
         cx.redraw_all();
+    }
+
+    /// Every placed instance's feature tree, for the Parts outliner: O(solids) per committed
+    /// program, never per frame.
+    fn publish_trees(&mut self) {
+        self.state.source.trees = self.program.as_ref().map_or_else(Default::default, |(p, _)| {
+            p.instances.iter().map(|i| (i.name.clone(), Arc::new(code_edit::rows(i)))).collect()
+        });
+    }
+
+    /// An outliner tree of another part pressed: a part of its instance is selected (unless one
+    /// is), so the tree and the code follow that script before the press's own edit applies.
+    fn focus_instance(&mut self, cx: &mut Cx, instance: &str) {
+        if self.state.source.instance == instance {
+            return;
+        }
+        let ours = |o: &str| fab_model::program::split_id(o).is_some_and(|(i, _)| i == instance);
+        // the tree follows the first selected object: it must be one of this instance
+        if !self.selected_objects().first().is_some_and(|o| ours(o)) {
+            let Some(e) = self.state.plate.parts.iter().find(|p| ours(&p.object)).and_then(|p| p.element) else { return };
+            self.dispatch(cx, &ShellAction::SelectOnly(e));
+        }
+        self.follow_selection(cx);
     }
 
     /// A marked area clicked in the Sliced view: a part of its script is selected (the tree

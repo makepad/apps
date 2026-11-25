@@ -377,6 +377,22 @@ script_mod! {
 
     let EyeIcon = ToolIcon{}
 
+    // A row's fold chevron, the feature tree's: right while folded, down while open. The whole
+    // 18 x 22 slot takes the press; only the small chevron draws (no face on hover or press).
+    let FoldIcon = mod.widgets.FabIconButton{
+        width: 18
+        height: 22
+        icon_walk: Walk{width: 10 height: 10}
+        draw_bg +: {pixel: fn() { return vec4(0.0) }}
+        draw_icon +: {color: fab.color_text_dim}
+    }
+
+    // A Transform number row: its label column only as wide as its longest label ("Position X"),
+    // not the sheet's, so the labels sit at the section's edge.
+    let TransformRow = PropNumberRow{
+        label +: {width: Fill{weight: 0 basis: "42%" max: 56}}
+    }
+
     mod.widgets.FabPartsPanelBase = #(FabPartsPanel::register_widget(vm))
     mod.widgets.FabPartsPanel = set_type_default() do mod.widgets.FabPartsPanelBase{
         width: Fill
@@ -399,12 +415,28 @@ script_mod! {
                     label +: { text: "Add" }
                 }
             }
-            Filler{}
-            FabTip{ text: "Arrange every part on the plate"
-                arrange := ToolIcon{ a11y: {label: "Arrange plate"} draw_icon +: { svg: crate_resource("self://resources/icons/arrange.svg") } }
+            // The picked part's features (what the Features panel's bar held).
+            FabTip{ text: "Add a feature: a primitive, a sketch, a modifier on the picked feature, a pattern, a gear, text"
+                add_feature := mod.widgets.FabDropdownButton{ a11y: {label: "Add feature"}
+                    tag: @fab_add_feature
+                    owner: @fab_add_feature
+                    height: 26
+                    label +: { text: "Feature" }
+                }
             }
-            FabTip{ text: #(keymap::tooltip(Key::FrameAll))
-                frame := ToolIcon{ a11y: {label: "Frame plate"} draw_icon +: { svg: crate_resource("self://resources/icons/fit.svg") } }
+            FabTip{ text: "Cut or join a primitive on the picked node, cut the bottom flat or along a plane"
+                shape := mod.widgets.FabDropdownButton{ a11y: {label: "Shape"}
+                    tag: @fab_shape_edit
+                    owner: @fab_shape_edit
+                    height: 26
+                    label +: { text: "Shape" }
+                }
+            }
+            // narrows the list to the parts whose names hold every word typed
+            filter := mod.widgets.FabSearch{
+                width: Fill{min: 60}
+                margin: Inset{left: 4}
+                row +: { input +: { empty_text: "Filter" a11y: {label: "Filter parts"} } }
             }
         }
         mod.widgets.FabHr{}
@@ -420,6 +452,10 @@ script_mod! {
             height: Fill
             flow: Down
             auto_tail: false
+            // A press picks a row; the list scrolls with the wheel and its bar, never by a drag.
+            drag_scrolling: false
+            // An open part's boolean tree, right under its row (the outliner's features).
+            Features := mod.widgets.FabFeatureTree{ margin: Inset{right: 2} }
             Row := View{
                 width: Fill
                 height: 34
@@ -432,12 +468,13 @@ script_mod! {
                 draw_bg +: {
                     selected: instance(0.0)
                     hover: instance(0.0)
+                    // hover and selection as the feature rows show them: a rounded box inset in the row
                     pixel: fn() {
                         let sdf = Sdf2d.viewport(self.pos * self.rect_size)
                         sdf.rect(0.0, 0.0, self.rect_size.x, self.rect_size.y)
-                        sdf.fill(fab.color_editor.mix(fab.color_row_hover, self.hover * 0.6).mix(fab.color_selection_bg, self.selected))
-                        sdf.rect(0.0, 0.0, 2.0 * self.selected, self.rect_size.y)
-                        sdf.fill(fab.color_accent)
+                        sdf.fill(fab.color_editor)
+                        sdf.box(4.0, 1.0, self.rect_size.x - 8.0, self.rect_size.y - 2.0, 3.0)
+                        sdf.fill(vec4(fab.color_row_hover.xyz, self.hover).mix(fab.color_selection_bg, self.selected))
                         return sdf.result
                     }
                 }
@@ -454,42 +491,65 @@ script_mod! {
                         }
                     }
                 }
-                branch := mod.widgets.FabButton{ width: 22 height: 24 padding: 0 text: "" visible: false a11y: {label: "Toggle tree group"} }
+                // The fold's slot is kept on every row, so the swatches line up.
+                fold := View{
+                    width: 18 height: Fill flow: Overlay align: Align{x: 0.5 y: 0.5}
+                    branch := FoldIcon{ visible: false a11y: {label: "Expand"} draw_icon +: {svg: crate_resource("self://resources/icons/chevron_right.svg")} }
+                    branch_open := FoldIcon{ visible: false a11y: {label: "Collapse"} draw_icon +: {svg: crate_resource("self://resources/icons/chevron_down.svg")} }
+                }
                 linked := View{
                     width: 14 height: 14 visible: false
                     FabIconSmall{ icon_walk: Walk{width: 14 height: 14} draw_icon +: {svg: crate_resource("self://resources/icons/link.svg")} }
                 }
-                // The part's colour, its edges on device pixels, with its nozzle's letter.
-                swatch := View{
-                    width: 18
-                    height: 18
-                    show_bg: true
-                    draw_bg +: {
-                        color: instance(vec4(0.8, 0.5, 0.2, 1.0))
-                        pixel: fn() {
-                            let dpi = self.draw_pass.dpi_factor
-                            let lo = floor(self.rect_pos * dpi + 0.5) / dpi - self.rect_pos
-                            let hi = floor((self.rect_pos + self.rect_size) * dpi + 0.5) / dpi - self.rect_pos
-                            let sdf = Sdf2d.viewport_px(self.pos * self.rect_size, dpi)
-                            sdf.box(lo.x, lo.y, hi.x - lo.x, hi.y - lo.y, fab.radius)
-                            sdf.fill(self.color)
-                            return sdf.result
+                // The part's colour, its edges on device pixels, with its nozzle's letter; its tip
+                // says which nozzle and tray that is (`RowDisplay::tip`).
+                swatch_tip := FabTip{
+                    swatch := View{
+                        width: 18
+                        height: 18
+                        // (a cursor of its own claims the pointer, which the tip around it needs)
+                        cursor: MouseCursor.Hand
+                        show_bg: true
+                        draw_bg +: {
+                            color: instance(vec4(0.8, 0.5, 0.2, 1.0))
+                            pixel: fn() {
+                                let dpi = self.draw_pass.dpi_factor
+                                let lo = floor(self.rect_pos * dpi + 0.5) / dpi - self.rect_pos
+                                let hi = floor((self.rect_pos + self.rect_size) * dpi + 0.5) / dpi - self.rect_pos
+                                let sdf = Sdf2d.viewport_px(self.pos * self.rect_size, dpi)
+                                sdf.box(lo.x, lo.y, hi.x - lo.x, hi.y - lo.y, fab.radius)
+                                sdf.fill(self.color)
+                                return sdf.result
+                            }
                         }
+                        align: Align{x: 0.5 y: 0.5}
+                        slot := mod.widgets.FabLabelSmall{ text: "1" draw_text +: { color: #xffffffd0 } }
                     }
-                    align: Align{x: 0.5 y: 0.5}
-                    slot := mod.widgets.FabLabelSmall{ text: "1" draw_text +: { color: #xffffffd0 } }
                 }
                 text := View{
                     width: Fill
                     height: Fit
                     flow: Down
                     spacing: 2
-                    name := mod.widgets.FabLabel{ width: Fill text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis
-                        draw_text +: { row_alpha: instance(1.0) get_color: fn() { return vec4(self.color.rgb, self.color.a * self.row_alpha) } }
+                    // The name and its rename field share one line of fixed height, the field's
+                    // text where the name's was, so renaming moves nothing in the row.
+                    title := View{
+                        width: Fill
+                        height: 16
+                        flow: Overlay
+                        align: Align{y: 0.5}
+                        name := mod.widgets.FabLabel{ width: Fill text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis
+                            draw_text +: { row_alpha: instance(1.0) get_color: fn() { return vec4(self.color.rgb, self.color.a * self.row_alpha) } }
+                        }
+                        rename := mod.widgets.FabInput{
+                            width: Fill height: Fill visible: false
+                            margin: Inset{left: -4}
+                            padding: Inset{left: 4 right: 4 top: 0 bottom: 0}
+                        }
                     }
-                    rename := mod.widgets.FabInput{ width: Fill height: 24 visible: false }
+                    // the dimensions, quieter than the name
                     size := mod.widgets.FabLabelSmall{ width: Fill text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis
-                        draw_text +: { row_alpha: instance(1.0) get_color: fn() { return vec4(self.color.rgb, self.color.a * self.row_alpha) } }
+                        draw_text +: { color: fab.color_text_muted row_alpha: instance(1.0) get_color: fn() { return vec4(self.color.rgb, self.color.a * self.row_alpha) } }
                     }
                 }
                 eye := EyeIcon{
@@ -581,26 +641,10 @@ script_mod! {
             visible: false
             padding: Inset{left: theme.prop_pad right: theme.prop_pad}
             // The sections draw in lists of their own: a section records again only when what
-            // it shows changed (its setters, or the panel's key of `rest`). The part's shape
-            // parameters are the Parameters editor's: while no area shows it, a button under the
-            // part's name brings it forward.
+            // it shows changed (its setters, or the panel's key of `rest`). The part's name and
+            // size are the parts list's (rename there). Its shape parameters are the Parameters
+            // editor's: while no area shows it, a button at the top brings it forward.
             View{width: Fill height: Fit flow: Down new_batch: true
-                ident := PropSection{
-                    header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/object.svg")}} title +: {text: "Part"}}}
-                    body +: {
-                        PropRow{
-                            label +: {text: "Name"}
-                            value +: {name := PropTextInput{}}
-                        }
-                        PropRow{
-                            label +: {text: "Size"}
-                            value +: {
-                                align: Align{y: 0.5} padding: Inset{left: theme.prop_pad + 2.0}
-                                size := mod.widgets.FabLabelSmall{width: Fill text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis}
-                            }
-                        }
-                    }
-                }
                 params_row := View{
                     visible: false
                     width: Fill height: Fit flow: Right
@@ -617,38 +661,38 @@ script_mod! {
             }
             rest := View{width: Fill height: Fit flow: Down new_batch: true
                 transform := PropSection{
-                    header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/move.svg")}} title +: {text: "Position"}}}
+                    header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/move.svg")}} title +: {text: "Transform"}}}
                     body +: {
                         xy := PropStack{
-                            x := PropNumberRow{
+                            x := TransformRow{
                                 label +: {text: "Position X"}
                                 value +: {num +: {a11y: {label: "X"} min: -50.0 max: 400.0 step: 0.5 snap: 5.0 precision: 1 suffix: " mm"}}
                             }
-                            y := PropNumberRow{
+                            y := TransformRow{
                                 label +: {text: "Y"}
                                 value +: {num +: {a11y: {label: "Y"} min: -50.0 max: 400.0 step: 0.5 snap: 5.0 precision: 1 suffix: " mm"}}
                             }
                         }
                         rs := View{width: Fill height: Fit flow: Down spacing: theme.prop_row_gap
-                            rot := PropNumberRow{
+                            rot := TransformRow{
                                 label +: {text: "Turn"}
                                 value +: {num +: {a11y: {label: "Turn"} min: -360.0 max: 360.0 step: 1.0 snap: 15.0 precision: 0 suffix: "°"}}
                             }
-                            scale := PropNumberRow{
+                            scale := TransformRow{
                                 label +: {text: "Scale X"}
                                 value +: {num +: {a11y: {label: "Scale X"} min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}}
                                 trail +: {width: 26 lock := mod.widgets.FabIconCheck{ a11y: {label: "Keep proportions"} width: 24 height: 22 padding: Inset{left: 4 right: 4 top: 3 bottom: 3} draw_icon +: { svg: crate_resource("self://resources/icons/link.svg") } }}
                             }
-                            scale_y := PropNumberRow{
+                            scale_y := TransformRow{
                                 label +: {text: "Y"}
                                 value +: {num +: {a11y: {label: "Scale Y"} min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}}
                             }
-                            scale_z := PropNumberRow{
+                            scale_z := TransformRow{
                                 label +: {text: "Z"}
                                 value +: {num +: {a11y: {label: "Scale Z"} min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}}
                             }
                         }
-                        // The part's actions as a light strip; Delete keeps to the far end.
+                        // The part's actions as a light strip (duplicate and delete are the parts list's menu).
                         buttons := View{
                             width: Fill height: Fit flow: Right spacing: 2 margin: Inset{top: 4}
                             align: Align{x: 0.0 y: 0.5}
@@ -656,18 +700,6 @@ script_mod! {
                                 drop := mod.widgets.FabActionButton{
                                     a11y: {label: "Drop to plate"}
                                     draw_icon +: {svg: crate_resource("self://resources/icons/drop.svg")}
-                                }
-                            }
-                            FabTip{text: #(keymap::tooltip(Key::DuplicateLinked))
-                                duplicate_linked := mod.widgets.FabActionButton{
-                                    a11y: {label: "Duplicate linked"}
-                                    draw_icon +: {svg: crate_resource("self://resources/icons/duplicate_linked.svg")}
-                                }
-                            }
-                            FabTip{text: #(keymap::tooltip(Key::DuplicateCopy))
-                                duplicate_copy := mod.widgets.FabActionButton{
-                                    a11y: {label: "Duplicate"}
-                                    draw_icon +: {svg: crate_resource("self://resources/icons/duplicate.svg")}
                                 }
                             }
                             FabTip{text: "Frame in view"
@@ -681,13 +713,6 @@ script_mod! {
                                     visible: false
                                     a11y: {label: "Make printable"}
                                     draw_icon +: {svg: crate_resource("self://resources/icons/cube.svg")}
-                                }
-                            }
-                            View{width: Fill height: 1}
-                            FabTip{text: "Delete"
-                                delete := mod.widgets.FabActionButton{
-                                    a11y: {label: "Delete"}
-                                    draw_icon +: {svg: crate_resource("self://resources/icons/trash.svg")}
                                 }
                             }
                         }
@@ -783,6 +808,8 @@ struct RowDisplay {
     eye: Option<bool>,
     color: [f32; 4],
     slot: String,
+    /// The swatch's tooltip: the nozzle and tray its colour prints from.
+    tip: String,
     rect: Option<Rect>,
     /// The row as drawn, which its node stands where it shows ([`Widget::semantics_part_area`]).
     area: Area,
@@ -813,6 +840,32 @@ pub struct FabPartsPanel {
     rows: Vec<RowDisplay>,
     #[rust]
     collapsed: HashSet<u64>,
+    /// An eye or a fold was pressed (it toggles on the press): the click that ends that press is no second
+    /// toggle, whichever row's eye it lands on (a hidden part moves in the list under the
+    /// pointer); a click without a press (a semantic press) toggles.
+    #[rust]
+    eye_pressed: Option<u64>,
+    /// The filter as typed: a row shows when its name, or one of its group's or its children's,
+    /// holds every word (folds are ignored meanwhile, so no match hides).
+    #[rust]
+    filter: String,
+    /// Part rows whose feature tree is open (all start closed).
+    #[rust]
+    open_trees: HashSet<u64>,
+    /// A part's tree opening or closing: how far it is open (0..1) and where it heads; a tree
+    /// still closing keeps its place in the list until it is shut.
+    #[rust]
+    reveal: HashMap<u64, (f64, f64)>,
+    #[rust]
+    reveal_frame: NextFrame,
+    #[rust]
+    reveal_last: Option<f64>,
+    /// Part rows with a feature tree, and the instance it is of (as last drawn).
+    #[rust]
+    tree_of: HashMap<u64, String>,
+    /// The list's items: a row of `tree` (its index), or an open part's feature tree (`true`).
+    #[rust]
+    items: Vec<(usize, bool)>,
     #[rust]
     focused: Option<u64>,
     #[rust]
@@ -862,6 +915,8 @@ impl FabPartsPanel {
             }
         } else { elements };
         cx.action(ShellAction::SelectSet(ids));
+        // the part is the selection now: a feature picked in its tree is let go
+        cx.action(crate::ui::code::SourceAction::Select { id: String::new(), reveal: false });
     }
 
     fn begin_rename(&mut self, cx: &mut Cx, scope: &mut Scope, row: &Row) {
@@ -889,8 +944,28 @@ impl FabPartsPanel {
     }
 
     fn toggle_row(&mut self, cx: &mut Cx, key: u64) {
-        if !self.collapsed.remove(&key) { self.collapsed.insert(key); }
+        if self.tree_of.contains_key(&key) && !row_of(&self.tree, key).is_some_and(Row::is_branch) {
+            let open = !self.open_trees.remove(&key);
+            if open { self.open_trees.insert(key); }
+            // it slides open or shut from where it is now
+            let to = if open { 1.0 } else { 0.0 };
+            self.reveal.entry(key).or_insert((1.0 - to, to)).1 = to;
+            self.reveal_frame = cx.new_next_frame();
+        } else if !self.collapsed.remove(&key) {
+            self.collapsed.insert(key);
+        }
         self.view.redraw(cx);
+    }
+
+    /// Whether `row`'s children (a branch's rows, a part's feature tree) show.
+    fn expanded(&self, row: &Row) -> Option<bool> {
+        if row.is_branch() {
+            Some(!self.collapsed.contains(&row.key))
+        } else if self.tree_of.contains_key(&row.key) {
+            Some(self.open_trees.contains(&row.key))
+        } else {
+            None
+        }
     }
 
     fn open_row_menu(&mut self, cx: &mut Cx, scope: &mut Scope, row: &Row, anchor: Rect) {
@@ -1003,10 +1078,10 @@ impl Widget for FabPartsPanel {
             node.states.set(a11y_tree::States::SELECTED, shown.selected);
             node.states.set(a11y_tree::States::FOCUSED, self.focused == Some(row.key) && cx.keyboard.key_focus() == self.view.area());
             node.states.set(a11y_tree::States::OFFSCREEN, shown.rect.is_none());
-            if row.is_branch() {
+            if let Some(open) = self.expanded(row) {
                 node.actions = node.actions | a11y_tree::Actions::EXPAND | a11y_tree::Actions::COLLAPSE;
-                node.states.set(a11y_tree::States::EXPANDED, !self.collapsed.contains(&row.key));
-                node.states.set(a11y_tree::States::COLLAPSED, self.collapsed.contains(&row.key));
+                node.states.set(a11y_tree::States::EXPANDED, open);
+                node.states.set(a11y_tree::States::COLLAPSED, !open);
             }
             out.push((row.key, row.parent, node));
         }
@@ -1014,7 +1089,7 @@ impl Widget for FabPartsPanel {
 
     fn semantics_part_area(&self, key: u64) -> Area {
         // a drawn row: one the list scrolled past an edge is offscreen
-        self.visible_rows.iter().filter_map(|&pos| self.order.get(pos)).find(|&&i| self.tree[i].key == key).map_or(Area::Empty, |&i| self.rows[i].area)
+        self.visible_rows.iter().filter_map(|&pos| self.items.get(pos)).filter(|(_, tree)| !tree).find(|(i, _)| self.tree[*i].key == key).map_or(Area::Empty, |(i, _)| self.rows[*i].area)
     }
 
     fn handle_action(&mut self, cx: &mut Cx, request: &a11y_tree::ActionRequest, scope: &mut Scope) -> a11y_tree::ActionResult {
@@ -1028,10 +1103,8 @@ impl Widget for FabPartsPanel {
             self.focus_row(cx, scope, key);
         } else if request.action == Actions::SHOW_MENU {
             self.open_row_menu(cx, scope, &row, self.rows[i].rect.unwrap_or_default());
-        } else if row.is_branch() && (request.action == Actions::EXPAND || request.action == Actions::COLLAPSE) {
-            if request.action == Actions::COLLAPSE { self.collapsed.insert(key); }
-            else { self.collapsed.remove(&key); }
-            self.view.redraw(cx);
+        } else if self.expanded(&row).is_some() && (request.action == Actions::EXPAND || request.action == Actions::COLLAPSE) {
+            if self.expanded(&row) != Some(request.action == Actions::EXPAND) { self.toggle_row(cx, key); }
         } else {
             return ActionResult::Unhandled;
         }
@@ -1047,11 +1120,36 @@ impl Widget for FabPartsPanel {
                 }
             }
         }
+        if let Event::NextFrame(ne) = event {
+            if ne.set.contains(&self.reveal_frame) && !self.reveal.is_empty() {
+                let dt = self.reveal_last.map_or(0.0, |t| (ne.time - t).clamp(0.0, 0.05));
+                self.reveal_last = Some(ne.time);
+                let step = dt / crate::ui::code::fold_s();
+                for (now, to) in self.reveal.values_mut() {
+                    *now = if *to > *now { (*now + step).min(*to) } else { (*now - step).max(*to) };
+                }
+                // a tree that got where it was going needs no entry (open_trees says the rest)
+                self.reveal.retain(|_, (now, to)| now != to);
+                if self.reveal.is_empty() { self.reveal_last = None; } else { self.reveal_frame = cx.new_next_frame(); }
+                self.view.redraw(cx);
+            }
+        }
+        // An eye's press-time toggle skips the click that ends that press, and only that one: the
+        // mark lasts through the release's own actions (`RELEASED`), then goes, so a release
+        // that clicks nothing (its button hid as it toggled) leaves no skip behind.
+        const RELEASED: u64 = u64::MAX;
+        match event {
+            Event::Actions(_) => {}
+            Event::MouseUp(_) if self.eye_pressed.is_some() => self.eye_pressed = Some(RELEASED),
+            _ if self.eye_pressed == Some(RELEASED) => self.eye_pressed = None,
+            _ => {}
+        }
         let Event::Actions(actions) = event else { return };
         let list = self.view.portal_list(cx, ids!(list));
         for visible in 0..self.visible_rows.len() {
             let pos = self.visible_rows[visible];
-            let Some(&i) = self.order.get(pos) else { continue };
+            // an open part's tree handles its own events (the list hands them on)
+            let Some(&(i, false)) = self.items.get(pos) else { continue };
             let key = self.tree[i].key;
             if let Some((_, item)) = list.get_item(pos) {
                 let input = item.text_input(cx, ids!(text.rename));
@@ -1075,7 +1173,11 @@ impl Widget for FabPartsPanel {
                         self.view.redraw(cx);
                     }
                 }
-                if item.button(cx, ids!(branch)).clicked(actions) {
+                let fold_pressed = item.button(cx, ids!(branch)).pressed(actions) || item.button(cx, ids!(branch_open)).pressed(actions);
+                let fold_clicked = item.button(cx, ids!(branch)).clicked(actions) || item.button(cx, ids!(branch_open)).clicked(actions);
+                // a fold toggles as it is pressed (its click after is skipped, as an eye's is)
+                if fold_pressed || (fold_clicked && self.eye_pressed.take().is_none()) {
+                    if fold_pressed { self.eye_pressed = Some(key); }
                     self.focus_row(cx, scope, key);
                     self.toggle_row(cx, key);
                 } else if item.button(cx, ids!(delete)).clicked(actions) {
@@ -1084,18 +1186,25 @@ impl Widget for FabPartsPanel {
                         let objects = self.tree[i].parts.iter().filter_map(|i| state.plate.parts.get(*i)).map(|p| p.object.clone()).collect::<Vec<_>>();
                         part_menu_action(cx, state, &objects, live_id!(part_delete));
                     }
-                } else if item.button(cx, ids!(eye)).clicked(actions) || item.button(cx, ids!(eye_off)).clicked(actions) {
+                } else if item.button(cx, ids!(eye)).pressed(actions) || item.button(cx, ids!(eye_off)).pressed(actions)
+                    || ((item.button(cx, ids!(eye)).clicked(actions) || item.button(cx, ids!(eye_off)).clicked(actions)) && self.eye_pressed.take().is_none())
+                {
+                    // the eye toggles as it is pressed
+                    if item.button(cx, ids!(eye)).pressed(actions) || item.button(cx, ids!(eye_off)).pressed(actions) {
+                        self.eye_pressed = Some(key);
+                    }
                     if let Some(state) = scope.data.get::<AppState>() {
                         if !state.slice_blocks_edits() && !state.ui.in_mode(PlateMode::Mechanics) {
                             if let Some(action) = self.tree[i].eye_action(&state.plate) { cx.action(action); }
                         }
                     }
+                } else if let Some(down) = item.as_view().finger_down(actions).filter(|d| d.device.is_primary_hit()) {
+                    // a row is picked as it is pressed
+                    let row = self.tree[i].clone();
+                    self.select_row(cx, scope, &row, down.modifiers.shift || down.modifiers.is_primary());
+                    if down.tap_count == 2 { self.begin_rename(cx, scope, &row); }
                 } else if let Some(up) = item.as_view().finger_up(actions) {
-                    if !up.cancelled && up.is_over && up.device.is_primary_hit() {
-                        let row = self.tree[i].clone();
-                        self.select_row(cx, scope, &row, up.modifiers.shift || up.modifiers.is_primary());
-                        if up.tap_count == 2 { self.begin_rename(cx, scope, &row); }
-                    } else if !up.cancelled && up.is_over && !up.is_sweep
+                    if !up.cancelled && up.is_over && !up.is_sweep
                         && up.device.mouse_button().is_some_and(|b| b.is_secondary())
                         && (up.abs - up.abs_start).length() < crate::nav::DRAG_THRESHOLD_PT
                     {
@@ -1104,6 +1213,9 @@ impl Widget for FabPartsPanel {
                     }
                 }
             }
+        }
+        if self.eye_pressed == Some(RELEASED) {
+            self.eye_pressed = None;
         }
         if let Some(pick) = menu_picked(actions, PART_MENU) {
             if pick == live_id!(part_rename) {
@@ -1168,11 +1280,9 @@ impl Widget for FabPartsPanel {
                 cx.action(ShellAction::OpenDemo("motor_mount".into()));
             }
         }
-        if self.view.button(cx, ids!(tools.arrange)).clicked(actions) {
-            cx.action(PartAction::Arrange);
-        }
-        if self.view.button(cx, ids!(tools.frame)).clicked(actions) {
-            cx.action(ShellAction::FrameAll);
+        if let Some(text) = self.view.text_input(cx, ids!(tools.filter.row.input)).changed(actions) {
+            self.filter = text;
+            self.view.redraw(cx);
         }
     }
 
@@ -1180,7 +1290,38 @@ impl Widget for FabPartsPanel {
         let Some(state) = scope.data.get::<AppState>() else { return self.view.draw_walk(cx, scope, walk) };
         self.sync_tree(state);
         self.order.clear();
-        self.order.extend(self.tree.iter().enumerate().filter(|(_, r)| !folded(&self.tree, &self.collapsed, r)).map(|(i, _)| i));
+        if self.filter.trim().is_empty() {
+            self.order.extend(self.tree.iter().enumerate().filter(|(_, r)| !folded(&self.tree, &self.collapsed, r)).map(|(i, _)| i));
+        } else {
+            // a row that matches keeps its groups above it and its rows under it: O(rows · depth)
+            let words: Vec<String> = self.filter.split_whitespace().map(|w| w.to_lowercase()).collect();
+            let hit = |r: &Row| { let name = r.name.to_lowercase(); words.iter().all(|w| name.contains(w.as_str())) };
+            let mut keep: HashSet<u64> = HashSet::new();
+            for r in self.tree.iter().filter(|r| hit(r)) {
+                keep.insert(r.key);
+                keep.extend(std::iter::successors(r.parent, |&k| row_of(&self.tree, k).and_then(|p| p.parent)));
+            }
+            let under_hit = |r: &Row| std::iter::successors(r.parent, |&k| row_of(&self.tree, k).and_then(|p| p.parent)).any(|k| row_of(&self.tree, k).is_some_and(|p| hit(p)));
+            self.order.extend(self.tree.iter().enumerate().filter(|(_, r)| keep.contains(&r.key) || under_hit(r)).map(|(i, _)| i));
+        }
+        // A part's feature tree: its instance's (an object's bodies are one instance: its row
+        // has none, nor have they), when that instance has rows.
+        self.tree_of.clear();
+        for row in &self.tree {
+            if row.kind != RowKind::Part || row.parent.and_then(|k| row_of(&self.tree, k)).is_some_and(|p| p.kind == RowKind::Object) { continue; }
+            let Some(p) = state.plate.parts.get(row.rename) else { continue };
+            let Some((instance, _)) = p.object.split_once('/') else { continue };
+            let has = if instance == state.source.instance { !state.source.features.is_empty() } else { state.source.trees.get(instance).is_some_and(|t| !t.is_empty()) };
+            if has { self.tree_of.insert(row.key, instance.to_string()); }
+        }
+        self.open_trees.retain(|key| self.tree_of.contains_key(key));
+        self.reveal.retain(|key, _| self.tree_of.contains_key(key));
+        self.items.clear();
+        for &i in &self.order {
+            self.items.push((i, false));
+            let key = self.tree[i].key;
+            if self.open_trees.contains(&key) || self.reveal.get(&key).is_some_and(|(now, _)| *now > 0.0) { self.items.push((i, true)); }
+        }
         let parts = &state.plate.parts;
         let revision = ((state.plate.revision, state.field_loop_marks), state.print.revision);
         if self.display_revision.is_none_or(|r| r.0 != revision.0) {
@@ -1202,6 +1343,7 @@ impl Widget for FabPartsPanel {
                     eye: row.eye_state(&state.plate),
                     color: [r, g, b, 1.0],
                     slot: String::new(),
+                    tip: String::new(),
                     rect: None,
                     area: Area::Empty,
                 }
@@ -1225,11 +1367,21 @@ impl Widget for FabPartsPanel {
                     shown.slot.clear();
                     shown.slot.push_str(&slot);
                 }
+                shown.tip = if slot == "-" {
+                    "Its bodies print in more than one colour: see each in the Part panel's Colours".to_string()
+                } else {
+                    // its colour, then the nozzle and tray it prints from
+                    colour_tip(state, &p.print_color)
+                };
             }
         }
+        // A feature picked in a part's open tree is what is selected: its part's row does not show
+        // it too (folded, the part's row is all that can show it).
+        let feature_picked = state.source.selected.is_some();
         for (row, shown) in self.tree.iter().zip(&mut self.rows) {
             shown.selected = if row.is_part() {
-                row.parts.iter().all(|i| parts[*i].element.is_some_and(|e| state.scene_state.selection.contains(e)))
+                let in_tree = feature_picked && self.open_trees.contains(&row.key) && self.tree_of.get(&row.key).is_some_and(|i| *i == state.source.instance);
+                !in_tree && row.parts.iter().all(|i| parts[*i].element.is_some_and(|e| state.scene_state.selection.contains(e)))
             } else {
                 row.annotation_selected(state)
             };
@@ -1241,11 +1393,23 @@ impl Widget for FabPartsPanel {
         while let Some(step) = self.view.draw_walk(cx, scope, walk).step() {
             let list_ref = step.as_portal_list();
             let Some(mut list) = list_ref.borrow_mut() else { continue };
-            list.set_item_range(cx, 0, self.order.len());
+            list.set_item_range(cx, 0, self.items.len());
             while let Some(pos) = list.next_visible_item(cx) {
-                let Some(&i) = self.order.get(pos) else { continue };
-                let (row, shown) = (&self.tree[i], &mut self.rows[i]);
+                let Some(&(i, tree)) = self.items.get(pos) else { continue };
                 self.visible_rows.push(pos);
+                if tree {
+                    // under its part's text: the row's indent, past the swatch
+                    let indent = 10.0 + 18.0 * depth(&self.tree, &self.tree[i]) as f64 + 14.0;
+                    let item = list.item(cx, pos, live_id!(Features));
+                    let key = self.tree[i].key;
+                    let open = self.reveal.get(&key).map_or(if self.open_trees.contains(&key) { 1.0 } else { 0.0 }, |(now, _)| *now);
+                    if let (Some(instance), Some(mut t)) = (self.tree_of.get(&key), item.borrow_mut::<crate::ui::code::FabFeatureTree>()) {
+                        t.show_instance(instance, indent, open);
+                    }
+                    item.draw_all(cx, scope);
+                    continue;
+                }
+                let (row, shown) = (&self.tree[i], &mut self.rows[i]);
                 let item = list.item(cx, pos, live_id!(Row));
                 let sel = if shown.selected { 1.0 } else { 0.0 };
                 let indent = 10.0 + 18.0 * depth(&self.tree, row) as f64;
@@ -1253,8 +1417,9 @@ impl Widget for FabPartsPanel {
                     view.layout.padding.left = indent;
                     view.draw_bg.set_dyn_instance(cx, live_id!(selected), &[sel]);
                 }
-                item.widget(cx, ids!(branch)).set_visible(cx, row.is_branch());
-                item.button(cx, ids!(branch)).set_text(cx, if self.collapsed.contains(&row.key) { ">" } else { "v" });
+                let open = if row.is_branch() { Some(!self.collapsed.contains(&row.key)) } else if self.tree_of.contains_key(&row.key) { Some(self.open_trees.contains(&row.key)) } else { None };
+                item.widget(cx, ids!(branch)).set_visible(cx, open == Some(false));
+                item.widget(cx, ids!(branch_open)).set_visible(cx, open == Some(true));
                 item.view(cx, ids!(linked)).set_visible(cx, row.is_part() && linked(&self.tree, row));
                 let [r, g, b, _] = shown.color;
                 let sw = item.view(cx, ids!(swatch));
@@ -1263,6 +1428,9 @@ impl Widget for FabPartsPanel {
                     sw.draw_bg.set_dyn_instance(cx, live_id!(color), &[r, g, b, 1.0]);
                 }
                 item.label(cx, ids!(swatch.slot)).set_text(cx, &shown.slot);
+                if let Some(mut tip) = item.widget(cx, ids!(swatch_tip)).borrow_mut::<makepad_widgets_core::tip::Tip>() {
+                    tip.text.clone_from(&shown.tip);
+                }
                 let alpha = if shown.excluded { 0.4 } else { 1.0 };
                 for path in [ids!(text.name), ids!(text.size)] {
                     if let Some(mut label) = item.label(cx, path).borrow_mut() {
@@ -1905,8 +2073,6 @@ impl Widget for FabPatternDial {
 pub struct FabPartPanel {
     #[deref]
     view: View,
-    #[rust]
-    shown: Option<(String, u64)>,
     /// What `rest` shows besides its setters' values, as it last recorded: the part and its
     /// plate (which of its sections and rows show, its painted colours) and the print colours
     /// (the colour row and the trays read them as they draw).
@@ -1944,25 +2110,8 @@ impl Widget for FabPartPanel {
         self.view.handle_event(cx, event, scope);
         let Event::Actions(actions) = event else { return };
         let Some(state) = scope.data.get_mut::<AppState>() else { return };
-        let input = self.view.text_input(cx, ids!(body.ident.name));
-        if input.escaped(actions) {
-            if let Some(p) = self.shown.as_ref().and_then(|(object, _)| state.plate.parts.iter().find(|p| &p.object == object)) {
-                input.set_text(cx, &p.name);
-            }
-        } else if input.returned(actions).is_some() || input.key_focus_lost(actions) {
-            // Commit to the object whose name is in the field, even if selection moved.
-            if let Some(p) = self.shown.as_ref().and_then(|(object, _)| state.plate.parts.iter().find(|p| &p.object == object)) {
-                let name = input.text().trim().to_string();
-                if !name.is_empty() && name != p.name {
-                    cx.action(PartAction::Rename { object: p.object.clone(), name: name.clone() });
-                }
-                if !cx.has_key_focus(input.area()) {
-                    input.set_text(cx, if name.is_empty() { &p.name } else { &name });
-                }
-            }
-        }
         if !state.ui.on_screen(crate::ui::editors::Editor::Part) {
-            // off screen (a name typed above still commits): none of its controls can be pressed
+            // off screen: none of its controls can be pressed
             return;
         }
         if self.view.button(cx, ids!(body.show_params)).clicked(actions) {
@@ -2027,17 +2176,8 @@ impl Widget for FabPartPanel {
         if v.button(cx, ids!(body.transform.buttons.drop)).clicked(actions) {
             cx.action(PartAction::Drop { object: object.clone() });
         }
-        if v.button(cx, ids!(body.transform.buttons.duplicate_linked)).clicked(actions) {
-            duplicate_selected(cx, state, false);
-        }
-        if v.button(cx, ids!(body.transform.buttons.duplicate_copy)).clicked(actions) {
-            duplicate_selected(cx, state, true);
-        }
         if v.button(cx, ids!(body.transform.buttons.frame)).clicked(actions) {
             cx.action(ShellAction::FrameSelected);
-        }
-        if v.button(cx, ids!(body.transform.buttons.delete)).clicked(actions) {
-            delete_selected(cx, state);
         }
     }
 
@@ -2052,21 +2192,8 @@ impl Widget for FabPartPanel {
             self.view.view(cx, ids!(body)).set_visible(cx, part.is_some());
             if let Some(p) = part {
                 let v = &self.view;
-                let key = (p.object.clone(), state.plate.revision);
-                let fresh = self.shown.as_ref() != Some(&key);
-                if fresh {
-                    let input = v.text_input(cx, ids!(body.ident.name));
-                    if !cx.has_key_focus(input.area()) {
-                        input.set_text(cx, &p.name);
-                        self.shown = Some(key);
-                    }
-                }
                 v.widget(cx, ids!(body.params_row)).set_visible(cx, !state.ui.on_screen(crate::ui::editors::Editor::Parameters));
                 v.button(cx, ids!(body.transform.buttons.make_printable)).set_visible(cx, p.imported_mesh);
-                let can_dup = !state.slice_blocks_edits();
-                v.button(cx, ids!(body.transform.buttons.duplicate_linked)).set_enabled(cx, can_dup);
-                v.button(cx, ids!(body.transform.buttons.duplicate_copy)).set_enabled(cx, can_dup);
-                v.label(cx, ids!(body.ident.size)).set_text(cx, &if p.triangles == 0 { format!("{} · SDF", size_text(&p)) } else { format!("{} · {} triangles", size_text(&p), p.triangles) });
                 v.value_input(cx, ids!(body.transform.xy.x.value.num)).set_value(cx, p.origin[0]);
                 v.value_input(cx, ids!(body.transform.xy.y.value.num)).set_value(cx, p.origin[1]);
                 v.value_input(cx, ids!(body.transform.rs.rot.value.num)).set_value(cx, p.rotate);

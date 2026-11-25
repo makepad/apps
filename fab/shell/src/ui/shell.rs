@@ -122,12 +122,10 @@ script_mod! {
         draw_bg +: {
             color: fab.color_area
         }
-        draw_chip: mod.draw.DrawFabChip{ radius: 4.0 fill: fab.color_float ring: fab.color_float_border }
-        draw_chip_text: mod.draw.DrawText{
-            color: fab.color_text
-            text_style: theme.font_regular{ font_size: fab.font_size_ui }
-        }
-        color_chip_text: fab.color_text
+        // a drag's chip looks like the app's tooltips
+        draw_chip: mod.draw.FabTipChip{}
+        draw_chip_text: mod.draw.FabTipText{}
+        color_chip_text: #xdfe6ec
         color_chip_warn: fab.color_warning
         main := View{
             a11y: {role: "group" label: "Workspace"}
@@ -173,7 +171,7 @@ script_mod! {
                 // Every pane edge is a sash: a hairline, lit after a short rest of the pointer.
                 splitter: mod.widgets.Sash{
                     size: fab.splitter_size
-                    // The left column is never narrower than its tabs (Plates, Parts, Features and
+                    // The left column is never narrower than its tabs (Plates, Parts and
                     // the Slice view's): the floor of a side-by-side split's first pane.
                     min_vertical: #(FIRST_PANE_WIDTH)
                     max_vertical: #(SECOND_PANE_FLOOR)

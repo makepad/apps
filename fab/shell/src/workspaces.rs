@@ -113,12 +113,12 @@ impl Origin {
         let plate = || T::area(Editor::Viewport);
         let tree = match self {
             Origin::Design => {
-                // left: the plates, the parts (in front) and the features; right: the part, the
+                // left: the plates and the parts (in front), each part's features in its tree; right: the part, the
                 // slicer, the job, the printer over the part's parameters (in front), the
                 // overrides, strength and test prints; the program beside the plate
                 let (code, width) = code;
                 let centre = if code { T::split(Horizontal, FromB(width.unwrap_or(CODE_START_W)), plate(), T::area(Editor::Code)) } else { plate() };
-                let left = T::stack(&[Editor::Plates, Editor::Parts, Editor::Features], 1);
+                let left = T::stack(&[Editor::Plates, Editor::Parts], 1);
                 let top = T::stack(&[Editor::Part, Editor::Slicer, Editor::Settings, Editor::Printer, Editor::Calibrate], 0);
                 let below = T::stack(&[Editor::Parameters, Editor::Overrides, Editor::Strength, Editor::TestPrints], 0);
                 let right = T::split(Vertical, Weighted(0.5), top, below);

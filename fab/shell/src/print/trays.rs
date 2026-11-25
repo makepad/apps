@@ -70,6 +70,15 @@ script_mod! {
         }
     }
 
+    // The app's tooltip look (the `TipLayer` bubble's fill and corner, its text), for what rides
+    // the pointer as a tip would: a drag's chip (a feature row, a file, a tab). Its ring is its
+    // fill, so the edge is the fill's (a clear ring would lighten it).
+    mod.draw.FabTipChip = mod.draw.DrawFabChip{ radius: 4.0 fill: #x10141bf2 ring: #x10141bf2 }
+    mod.draw.FabTipText = mod.draw.DrawText{
+        color: #xdfe6ec
+        text_style: theme.font_regular{ font_size: 9 }
+    }
+
     mod.widgets.FabTrayGridBase = #(FabTrayGrid::register_widget(vm))
     mod.widgets.FabTrayGrid = set_type_default() do mod.widgets.FabTrayGridBase{
         width: Fill

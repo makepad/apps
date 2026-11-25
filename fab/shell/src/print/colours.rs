@@ -991,8 +991,14 @@ pub fn tray_line(t: &TrayView) -> String {
 }
 
 /// A tray's tooltip: where it is, its material's full name and temperatures, what is left.
+/// A toolhead as a person reads it: "Left nozzle"; a head already called a nozzle as it is
+/// ("Nozzle", never "Nozzle nozzle").
+pub fn nozzle_label(head: &str) -> String {
+    if head.to_ascii_lowercase().ends_with("nozzle") { head.to_string() } else { format!("{head} nozzle") }
+}
+
 pub fn tray_tip(t: &TrayView, layout: &Layout) -> String {
-    let mut lines = vec![format!("{} nozzle · {} · tray {}", layout.heads[t.pos.head], t.unit, t.pos.tray_text())];
+    let mut lines = vec![format!("{} · {} · tray {}", nozzle_label(&layout.heads[t.pos.head]), t.unit, t.pos.tray_text())];
     match t.state {
         TrayState::Empty => lines.push("Empty".into()),
         TrayState::Unknown if !layout.live => lines.push("No printer linked: link it to read its trays, or right-click to set what is loaded".into()),
@@ -1035,7 +1041,7 @@ pub fn tray_item(m: &Mapping, t: &TrayView, current: Option<Position>) -> crate:
 /// A toolhead's named nozzle heading, and where its trays come from when not live.
 pub fn head_row(m: &Mapping, head: usize) -> crate::ui::popover::MenuItem {
     let note = if m.layout.live { "" } else if m.layout.known { "last known" } else { "not linked" };
-    crate::ui::popover::MenuItem::new(makepad_widgets_core::LiveId::from_str(&format!("fab_tray_head:{}", m.layout.heads[head])), &format!("{} nozzle", m.layout.heads[head])).note(note).disabled()
+    crate::ui::popover::MenuItem::new(makepad_widgets_core::LiveId::from_str(&format!("fab_tray_head:{}", m.layout.heads[head])), &nozzle_label(&m.layout.heads[head])).note(note).disabled()
 }
 
 /// The trays to pick from, by nozzle (every tray of its units, then its external spool), with
@@ -1067,7 +1073,7 @@ pub fn tray_edit_menu(t: &TrayView, heads: &[String]) -> Vec<crate::ui::popover:
         })
         .collect();
     vec![
-        MenuItem::new(id("head"), &format!("{} nozzle · tray {}", heads[t.pos.head], t.pos.tray_text())).disabled(),
+        MenuItem::new(id("head"), &format!("{} · tray {}", nozzle_label(&heads[t.pos.head]), t.pos.tray_text())).disabled(),
         MenuItem::new(id("material"), "Material").flyout(materials),
         MenuItem::new(id("colour"), "Colour").flyout(colours),
         MenuItem::sep(),

@@ -52,9 +52,11 @@ const SWATCH: f64 = 14.0;
 const SWATCH_COL: f64 = SWATCH + 8.0;
 /// Gap after the tag column.
 const TAG_GAP: f64 = 8.0;
-/// How long the pointer rests on a row before it takes over from an open flyout's row, or opens
-/// its own flyout (s).
+/// How long the pointer, on its way into an open flyout, rests on a row it crosses before that
+/// row takes over (s).
 const REST: f64 = 0.2;
+/// How long a closed menu takes to fade out (s).
+const FADE_OUT: f64 = 0.12;
 /// The most of a rest one frame counts (s): a longer frame is a hitch.
 const HITCH: f64 = 0.05;
 
@@ -544,6 +546,7 @@ script_mod! {
         swatch: vec4(0.0, 0.0, 0.0, 0.0)
         edge: 0.0
         current: 0.0
+        fade: 1.0
 
         pixel: fn() {
             let sdf = Sdf2d.viewport(self.pos * self.rect_size)
@@ -561,7 +564,7 @@ script_mod! {
                 sdf.line_to(cx, ty + dir * 1.5)
                 sdf.line_to(cx + 3.5, ty - dir * 2.0)
                 sdf.stroke(fab.color_text_dim, 1.3)
-                return sdf.result
+                return sdf.result * self.fade
             }
             sdf.box(0.0, 0.0, self.rect_size.x, self.rect_size.y, fab.radius)
             if self.current > 0.0 {
@@ -598,7 +601,7 @@ script_mod! {
                 sdf.line_to(ax, cy + 3.5)
                 sdf.stroke(fab.color_text_dim, 1.2)
             }
-            return sdf.result
+            return sdf.result * self.fade
         }
     }
 
@@ -607,12 +610,14 @@ script_mod! {
         width: Fill
         height: Fill
         draw_bg +: {
+            // a closing menu's fade (see `FabMenuLayer::fading`)
+            fade: instance(1.0)
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
                 sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, fab.radius_lg)
                 sdf.fill_keep(fab.color_popover)
                 sdf.stroke(fab.color_popover_border, 1.0)
-                return sdf.result
+                return sdf.result * self.fade
             }
         }
         label_color: fab.color_text
@@ -663,6 +668,9 @@ pub struct DrawMenuRow {
     edge: f32,
     #[live]
     current: f32,
+    /// A closing menu's fade: 1 drawn as it is, 0 gone.
+    #[live]
+    fade: f32,
 }
 
 struct PressOpen {
@@ -707,6 +715,16 @@ pub struct FabMenuLayer {
     area: Area,
     #[rust]
     levels: Vec<Level>,
+    /// The menus just closed: drawn fading out for `FADE_OUT`, deaf to input and unseen by the
+    /// semantics, then dropped. Their fade (1 to 0), its start and its frames.
+    #[rust]
+    fading: Vec<Level>,
+    #[rust]
+    fade_alpha: f32,
+    #[rust]
+    fade_from: Option<f64>,
+    #[rust]
+    fade_frame: NextFrame,
     #[live]
     label_color: Vec4f,
     #[live]
@@ -791,7 +809,14 @@ impl FabMenuLayer {
         self.swallow_up |= self.press_open.take().is_some()
             || self.levels.iter().any(|level| level.press.is_some());
         self.cancel_pending();
-        self.levels.clear();
+        // what was up fades out (a menu that was fading already goes)
+        self.fading = std::mem::take(&mut self.levels);
+        for level in &mut self.fading {
+            level.press = None;
+        }
+        self.fade_alpha = 1.0;
+        self.fade_from = None;
+        self.fade_frame = cx.new_next_frame();
         self.last_pointer = None;
         if !self.swallow_up {
             self.unlock_input(cx);
@@ -974,18 +999,21 @@ impl FabMenuLayer {
         }
     }
 
-    /// Keep the current flyout while crossing its aim triangle. Otherwise a row takes over
-    /// after resting on it; a plain row without an open flyout highlights immediately.
+    /// The row under the pointer takes over at once: its highlight, and its flyout opens (or
+    /// the open one closes). Only a move heading into the open flyout, across the rows between
+    /// (its aim triangle), keeps that flyout; the row there takes over if the pointer rests on it.
     fn hover_row(&mut self, cx: &mut Cx, level: usize, row: usize, aiming: bool) {
         let flyout_row = self.levels.get(level + 1).and_then(Level::from_row);
-        let opens = self.levels[level].selectable(row) && !self.levels[level].items[row].submenu.is_empty();
-        if flyout_row.is_none() || flyout_row == Some(row) {
-            self.highlight(cx, level, Some(row));
-        }
-        if flyout_row == Some(row) || (flyout_row.is_none() && !opens) {
+        if flyout_row == Some(row) {
             self.cancel_pending();
-        } else if self.pending_row != Some((level, row)) || aiming {
+            self.highlight(cx, level, Some(row));
+        } else if aiming {
             self.start_rest(cx, level, row);
+        } else {
+            let opens = self.levels[level].selectable(row) && !self.levels[level].items[row].submenu.is_empty();
+            if self.levels[level].hi != Some(row) || flyout_row.is_some() || opens {
+                self.point_at(cx, level, row);
+            }
         }
     }
 
@@ -1160,7 +1188,7 @@ impl Widget for FabMenuLayer {
         let window = cx.turtle().rect();
         cx.end_turtle_with_area(&mut self.area);
         self.window = window;
-        if self.levels.is_empty() {
+        if self.levels.is_empty() && self.fading.is_empty() {
             return DrawStep::done();
         }
 
@@ -1183,7 +1211,17 @@ impl Widget for FabMenuLayer {
         let pass = cx.current_pass_size();
         cx.begin_root_turtle(pass, Layout::flow_down());
 
-        for level in &self.levels {
+        // the closing menus under the open ones, each drawn at its fade
+        let fading = std::mem::take(&mut self.fading);
+        let live = std::mem::take(&mut self.levels);
+        let base_sep = self.draw_sep.color;
+        for (levels, a) in [(&fading, self.fade_alpha), (&live, 1.0)] {
+        let faded = |c: Vec4f| vec4(c.x, c.y, c.z, c.w * a);
+        let (label_on, side_on, disabled) = (faded(label_on), faded(side_on), faded(disabled));
+        self.draw_row.fade = a;
+        self.draw_bg.set_dyn_instance(cx, live_id!(fade), &[a]);
+        self.draw_sep.color = faded(base_sep);
+        for level in levels {
             let rect = level.rect;
             self.draw_bg.draw_abs(cx, rect);
             let max_scroll = level.max_scroll();
@@ -1234,6 +1272,11 @@ impl Widget for FabMenuLayer {
                 }
             }
         }
+        }
+        self.draw_sep.color = base_sep;
+        self.draw_row.fade = 1.0;
+        self.fading = fading;
+        self.levels = live;
 
         cx.end_pass_sized_turtle_with_shift(self.area, dvec2(0.0, 0.0) - window.pos);
         self.draw_list.end(cx);
@@ -1241,6 +1284,22 @@ impl Widget for FabMenuLayer {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
+        if let Event::NextFrame(ne) = event {
+            if ne.set.contains(&self.fade_frame) && !self.fading.is_empty() {
+                let from = *self.fade_from.get_or_insert(ne.time);
+                let t = ((ne.time - from) / FADE_OUT).clamp(0.0, 1.0);
+                if t >= 1.0 {
+                    self.fading.clear();
+                    self.fade_from = None;
+                } else {
+                    // eased: it leaves softly, then quickly
+                    let f = 1.0 - t;
+                    self.fade_alpha = (f * f * (3.0 - 2.0 * f)) as f32;
+                    self.fade_frame = cx.new_next_frame();
+                }
+                self.draw_list.redraw(cx);
+            }
+        }
         if let Event::Actions(actions) = event {
             let mut request = None;
             for a in actions.iter() {

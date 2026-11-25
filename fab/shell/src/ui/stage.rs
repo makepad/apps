@@ -91,6 +91,13 @@ script_mod! {
         height: 24
         padding: Inset{left: 6 right: 6 top: 4 bottom: 4}
     }
+    // A button of the view bar (an action, not a toggle), as big as its toggles.
+    let ViewButton = mod.widgets.FabIconButton{
+        width: 28
+        height: 24
+        padding: Inset{left: 6 right: 6 top: 4 bottom: 4}
+        icon_walk: Walk{width: 16 height: 16}
+    }
     let Sep = mod.widgets.FabToolSep{}
 
     // The primary pane keeps all tools and gizmos, clipped to its own rectangle.
@@ -597,6 +604,13 @@ script_mod! {
                         // the projection, in every mode (on: orthographic)
                         FabTip{ text: #(keymap::tooltip(Key::Ortho))
                             ortho := ViewToggle{ a11y: {label: "Orthographic"} draw_icon +: { svg: crate_resource("self://resources/icons/ortho.svg") } }
+                        }
+                        // the whole plate back in view, in every mode
+                        FabTip{ text: #(keymap::tooltip(Key::FrameAll))
+                            frame_all := ViewButton{ a11y: {label: "Frame plate"} draw_icon +: { svg: crate_resource("self://resources/icons/fit.svg") } }
+                        }
+                        FabTip{ text: "Arrange every part on the plate"
+                            arrange_all := ViewButton{ a11y: {label: "Arrange plate"} draw_icon +: { svg: crate_resource("self://resources/icons/arrange.svg") } }
                         }
                         // Sliced: what the slice shows
                         supports_tip := FabTip{ text: #(keymap::tooltip(Key::ShowSupports))
@@ -1578,6 +1592,12 @@ impl Widget for FabStage {
         if bar.radio_button(cx, ids!(ortho)).clicked(actions) {
             self.draw_keys.view_bar = None;
             cx.action(ShellAction::ToggleOrtho);
+        }
+        if bar.button(cx, ids!(frame_all)).clicked(actions) {
+            cx.action(ShellAction::FrameAll);
+        }
+        if bar.button(cx, ids!(arrange_all)).clicked(actions) {
+            cx.action(PartAction::Arrange);
         }
         if bar.radio_button(cx, ids!(show_supports)).clicked(actions) {
             self.draw_keys.view_bar = None;

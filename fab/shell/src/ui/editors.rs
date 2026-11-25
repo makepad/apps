@@ -93,7 +93,7 @@ pub enum Family {
 /// Experimental's editors are offered only while View › Experimental has their family on.
 pub const MENU: [(&str, &[Editor]); 7] = [
     ("3D views", &[Editor::Viewport, Editor::Device]),
-    ("Plate data", &[Editor::Plates, Editor::Parts, Editor::Part, Editor::Parameters, Editor::Paint, Editor::Features, Editor::Code]),
+    ("Plate data", &[Editor::Plates, Editor::Parts, Editor::Part, Editor::Parameters, Editor::Paint, Editor::Code]),
     ("Print", &[Editor::Slicer, Editor::Overrides, Editor::TestPrints, Editor::Settings, Editor::Printer, Editor::Calibrate, Editor::Camera, Editor::Jobs]),
     ("Analysis", &[Editor::Slice, Editor::Strength, Editor::Force, Editor::Mechanics, Editor::Performance]),
     ("Electronics", &[Editor::Circuit, Editor::Board, Editor::Library, Editor::Checks, Editor::Bench, Editor::BoardControls, Editor::Scope, Editor::Transport, Editor::Firmware]),

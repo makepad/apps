@@ -1,8 +1,8 @@
 //! The user's parts: [`FabPartsPanel`] lists every placed part of the plate
 //! (never the printer's own geometry) with its filament colour, size and a
 //! warning when it cannot print; [`FabPartPanel`] edits the selected part:
-//! name, position, turn, scale, print colour, and the plate tools
-//! (drop to the plate, duplicate, delete).
+//! position, turn, scale, its parameters, print colour, and the plate tools
+//! (drop to the plate, frame it).
 //!
 //! Parts and annotations edit through [`PartAction`]s and [`MeasureAction`]s;
 //! the app makes each edit one undoable model transaction.
@@ -402,15 +402,17 @@ script_mod! {
         draw_bg +: { color: fab.color_editor }
         tools := View{
             width: Fill
-            height: 36
+            height: Fit
             flow: Right
             align: Align{x: 0.0 y: 0.5}
-            padding: Inset{left: 8 right: 8 top: 0 bottom: 0}
+            padding: Inset{left: 8 right: 8 top: 6 bottom: 6}
             spacing: 2
             // narrows the list to the parts whose names hold every word typed (Add, Feature and
             // Shape stand in the 3D view's bar)
             filter := mod.widgets.FabSearch{
                 width: Fill{min: 60}
+                // a roomier field than a property row's (the list's one entry point)
+                height: 28
                 row +: { input +: { empty_text: "Filter" a11y: {label: "Filter parts"} } }
             }
         }
@@ -443,13 +445,14 @@ script_mod! {
                 draw_bg +: {
                     selected: instance(0.0)
                     hover: instance(0.0)
-                    // hover and selection as the feature rows show them: a rounded box inset in the row
+                    // selection as the feature rows show it: a rounded box inset in the row (hover
+                    // lights the name instead, `text.title.name`'s `hot`)
                     pixel: fn() {
                         let sdf = Sdf2d.viewport(self.pos * self.rect_size)
                         sdf.rect(0.0, 0.0, self.rect_size.x, self.rect_size.y)
                         sdf.fill(fab.color_editor)
                         sdf.box(4.0, 1.0, self.rect_size.x - 8.0, self.rect_size.y - 2.0, 3.0)
-                        sdf.fill(vec4(fab.color_row_hover.xyz, self.hover).mix(fab.color_selection_bg, self.selected))
+                        sdf.fill(vec4(fab.color_selection_bg.xyz, 0.0).mix(fab.color_selection_bg, self.selected))
                         return sdf.result
                     }
                 }
@@ -458,11 +461,11 @@ script_mod! {
                         default: @off
                         off: AnimatorState{
                             from: {all: Forward {duration: fab.anim_fast}}
-                            apply: { draw_bg: {hover: 0.0} }
+                            apply: { draw_bg: {hover: 0.0} text: {title: {name: {draw_text: {hot: 0.0}}}} }
                         }
                         on: AnimatorState{
                             from: {all: Snap}
-                            apply: { draw_bg: {hover: 1.0} }
+                            apply: { draw_bg: {hover: 1.0} text: {title: {name: {draw_text: {hot: 1.0}}}} }
                         }
                     }
                 }
@@ -476,8 +479,35 @@ script_mod! {
                     width: 14 height: 14 visible: false
                     FabIconSmall{ icon_walk: Walk{width: 14 height: 14} draw_icon +: {svg: crate_resource("self://resources/icons/link.svg")} }
                 }
-                // The part's colour, its edges on device pixels, with its nozzle's letter; its tip
-                // says which nozzle and tray that is (`RowDisplay::tip`).
+                text := View{
+                    width: Fill
+                    height: Fit
+                    flow: Down
+                    spacing: 2
+                    // The name and its rename field share one line of fixed height, the field's
+                    // text where the name's was, so renaming moves nothing in the row.
+                    title := View{
+                        width: Fill
+                        height: 16
+                        flow: Overlay
+                        align: Align{y: 0.5}
+                        // a part's name in bold: the parts stand apart from the features under them
+                        name := mod.widgets.FabLabel{ width: Fill text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis
+                            draw_text +: { text_style: theme.font_bold{font_size: fab.font_size_ui} row_alpha: instance(1.0) hot: instance(0.0) get_color: fn() { return vec4(mix(self.color.rgb, theme.color_text_hover.rgb, self.hot), self.color.a * self.row_alpha) } }
+                        }
+                        rename := mod.widgets.FabInput{
+                            width: Fill height: Fill visible: false
+                            margin: Inset{left: -4}
+                            padding: Inset{left: 4 right: 4 top: 0 bottom: 0}
+                        }
+                    }
+                    // the dimensions, quieter than the name
+                    size := mod.widgets.FabLabelSmall{ width: Fill text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis
+                        draw_text +: { color: fab.color_text_muted row_alpha: instance(1.0) get_color: fn() { return vec4(self.color.rgb, self.color.a * self.row_alpha) } }
+                    }
+                }
+                // The part's colour, its edges on device pixels, with its nozzle's letter, left of the eye;
+                // its tip says which nozzle and tray that is (`RowDisplay::tip`).
                 swatch_tip := FabTip{
                     swatch := View{
                         width: 18
@@ -501,32 +531,6 @@ script_mod! {
                         slot := mod.widgets.FabLabelSmall{ text: "1" draw_text +: { color: #xffffffd0 } }
                     }
                 }
-                text := View{
-                    width: Fill
-                    height: Fit
-                    flow: Down
-                    spacing: 2
-                    // The name and its rename field share one line of fixed height, the field's
-                    // text where the name's was, so renaming moves nothing in the row.
-                    title := View{
-                        width: Fill
-                        height: 16
-                        flow: Overlay
-                        align: Align{y: 0.5}
-                        name := mod.widgets.FabLabel{ width: Fill text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis
-                            draw_text +: { row_alpha: instance(1.0) get_color: fn() { return vec4(self.color.rgb, self.color.a * self.row_alpha) } }
-                        }
-                        rename := mod.widgets.FabInput{
-                            width: Fill height: Fill visible: false
-                            margin: Inset{left: -4}
-                            padding: Inset{left: 4 right: 4 top: 0 bottom: 0}
-                        }
-                    }
-                    // the dimensions, quieter than the name
-                    size := mod.widgets.FabLabelSmall{ width: Fill text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis
-                        draw_text +: { color: fab.color_text_muted row_alpha: instance(1.0) get_color: fn() { return vec4(self.color.rgb, self.color.a * self.row_alpha) } }
-                    }
-                }
                 eye := EyeIcon{
                     a11y: {label: "Hide part"}
                     draw_icon +: {svg: crate_resource("self://resources/icons/eye.svg")}
@@ -544,10 +548,6 @@ script_mod! {
                         icon_walk: Walk{ width: 14 height: 14 }
                         draw_icon +: { color: fab.color_warning svg: crate_resource("self://resources/icons/warning.svg") }
                     }
-                }
-                delete := ToolIcon{
-                    a11y: {label: "Delete part"}
-                    draw_icon +: {svg: crate_resource("self://resources/icons/trash.svg")}
                 }
             }
         }
@@ -645,7 +645,7 @@ script_mod! {
                                     num_y := ValueInput{width: Fill height: Fill min_height: 0 a11y: {label: "Scale Y"} label: "Y" min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}
                                     num_z := ValueInput{width: Fill height: Fill min_height: 0 a11y: {label: "Scale Z"} label: "Z" min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}
                                 }
-                                trail +: {width: 26 lock := mod.widgets.FabIconCheck{ a11y: {label: "Keep proportions"} width: 24 height: 22 padding: Inset{left: 4 right: 4 top: 3 bottom: 3} draw_icon +: { svg: crate_resource("self://resources/icons/link.svg") } }}
+                                trail +: {width: 30 padding: Inset{left: 4} lock := mod.widgets.FabIconCheck{ a11y: {label: "Keep proportions"} width: Fill height: Fill padding: Inset{left: 4 right: 4 top: 3 bottom: 3} draw_icon +: { svg: crate_resource("self://resources/icons/link.svg") } }}
                             }
                         }
                         // The part's actions as a light strip (duplicate and delete are the parts list's menu).
@@ -1177,12 +1177,6 @@ impl Widget for FabPartsPanel {
                     if fold_pressed { self.eye_pressed = Some(key); }
                     self.focus_row(cx, scope, key);
                     self.toggle_row(cx, key);
-                } else if item.button(cx, ids!(delete)).clicked(actions) {
-                    self.focus_row(cx, scope, key);
-                    if let Some(state) = scope.data.get::<AppState>() {
-                        let objects = self.tree[i].parts.iter().filter_map(|i| state.plate.parts.get(*i)).map(|p| p.object.clone()).collect::<Vec<_>>();
-                        part_menu_action(cx, state, &objects, live_id!(part_delete));
-                    }
                 } else if item.button(cx, ids!(eye)).pressed(actions) || item.button(cx, ids!(eye_off)).pressed(actions)
                     || ((item.button(cx, ids!(eye)).clicked(actions) || item.button(cx, ids!(eye_off)).clicked(actions)) && self.eye_pressed.take().is_none())
                 {
@@ -1393,7 +1387,6 @@ impl Widget for FabPartsPanel {
                 item.view(cx, ids!(warn)).set_visible(cx, shown.issue);
                 item.widget(cx, ids!(eye)).set_visible(cx, shown.eye == Some(true));
                 item.widget(cx, ids!(eye_off)).set_visible(cx, shown.eye == Some(false));
-                item.widget(cx, ids!(delete)).set_visible(cx, row.is_part());
                 let renaming = self.rename.as_ref().is_some_and(|(key, _, _)| *key == row.key);
                 item.widget(cx, ids!(text.name)).set_visible(cx, !renaming);
                 if renaming {
@@ -2058,6 +2051,11 @@ impl Widget for FabPartPanel {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        // the headers first: a press reads the fold it is about to turn
+        if matches!(event, Event::MouseMove(_) | Event::MouseDown(_) | Event::MouseUp(_) | Event::MouseLeave(_) | Event::ClearHover) {
+            let sections = [ids!(none), ids!(transform), ids!(params), ids!(colours), ids!(issues)].map(|path| self.view.widget(cx, path));
+            crate::ui::widgets::section_headers(cx, event, &sections);
+        }
         self.view.handle_event(cx, event, scope);
         let Event::Actions(actions) = event else { return };
         let Some(state) = scope.data.get_mut::<AppState>() else { return };

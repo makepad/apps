@@ -29,11 +29,6 @@ script_mod! {
     mod.widgets.FabWorkspaceTabsBase = #(FabWorkspaceTabs::register_widget(vm))
     mod.widgets.FabWorkspaceTabs = set_type_default() do mod.widgets.FabWorkspaceTabsBase{
         width: Fit height: 26
-        // what the row leaves after it before it scrolls: a gap that drags the window (an outside
-        // edit's cue shows there), then the caption's right side (`trailing` until the caption has
-        // drawn it: then where it starts, `follow`)
-        gap: 180
-        trailing: 170
         draw_face +: {
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
@@ -113,14 +108,6 @@ pub struct FabWorkspaceTabs {
     script_source: ScriptObjectRef,
     #[walk]
     walk: Walk,
-    #[live]
-    gap: f64,
-    #[live]
-    trailing: f64,
-    /// The caption's right side, laid out before the row: the row ends where it starts, so what
-    /// it holds (a job on the strip, the code toggle) takes its room from the row.
-    #[rust]
-    follow: WidgetRef,
     #[live]
     draw_face: DrawColor,
     #[live]
@@ -217,10 +204,6 @@ fn ai_ink(cx: &mut Cx) -> Vec4f {
 
 impl FabWorkspaceTabs {
     /// Sets the caption's right side, where the row ends.
-    pub fn follow(&mut self, right: WidgetRef) {
-        self.follow = right;
-    }
-
     /// The row as the list has it now; a redraw only when it changed. O(tabs).
     pub fn set(&mut self, cx: &mut Cx, tabs: Vec<(WorkspaceId, String)>, current: WorkspaceId, temp: Option<TempTab>) {
         let temp_changed = self.temp != temp;
@@ -390,8 +373,9 @@ impl FabWorkspaceTabs {
         self.glyph(cx, close, "×", self.hover == Some(Part::TempClose));
     }
 
-    /// The cue's words after the row, cut short to its `room`, fading at the end.
-    fn draw_cue(&mut self, cx: &mut Cx2d, at: DVec2, room: f64) {
+    /// The cue's words ending at `right` (the menu sits among the caption's right-hand controls, so
+    /// its cue reads before it), cut short to `room`, fading at the end.
+    fn draw_cue(&mut self, cx: &mut Cx2d, right: f64, y: f64, room: f64) {
         let Some(cue) = &self.cue else { return };
         let Some(alpha) = cue.alpha(Cx::monotonic_now()) else {
             self.cue = None;
@@ -403,11 +387,16 @@ impl FabWorkspaceTabs {
                 EditOrigin::Disk | EditOrigin::Elsewhere => self.color_cue,
             };
             let words = self.note_layout(cx, &cue.words(), room);
+            let width = f64::from(words.size_in_lpxs.width * self.draw_cue.font_scale);
+            let at = dvec2(right - width.min(room), y);
             self.draw_note(cx, at, &words, vec4(color.x, color.y, color.z, color.w * alpha));
         }
         cx.new_next_frame();
     }
 }
+
+/// How wide the cue before the menu may run.
+const CUE_ROOM: f64 = 260.0;
 
 impl Widget for FabWorkspaceTabs {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -434,12 +423,6 @@ impl Widget for FabWorkspaceTabs {
             (title, if self.editing == Some(t.id) { width.max(120.0) } else { width })
         });
         let temp_space = temp.as_ref().map_or(0.0, |(_, width)| width + PAD);
-        // the room from here to the caption's end, less what follows the row
-        let (bar, at) = (cx.turtle().rect(), cx.turtle().pos().x);
-        let ends = self.follow.area().rect(cx);
-        let end = if ends.size.x > 0.0 { ends.pos.x } else { bar.pos.x + bar.size.x - self.trailing };
-        let share = (end - self.gap - at - temp_space).max(0.0);
-        let _ = share;
         // No tabs show: one button names the shown workspace and lists them all (`⌄`'s menu); `+`
         // and a temporary layout's tab follow it. Cmd/Ctrl and a number still switch.
         self.parts.clear();
@@ -550,8 +533,7 @@ impl Widget for FabWorkspaceTabs {
                 self.draw_text.draw_abs(cx, dvec2(chip.pos.x + 12.0, chip.pos.y + 4.5), &name);
             }
         }
-        let cue_at = row.pos.x + row.size.x + 10.0;
-        self.draw_cue(cx, dvec2(cue_at, row.pos.y + 6.5), end - 10.0 - cue_at);
+        self.draw_cue(cx, row.pos.x - 10.0, row.pos.y + 6.5, CUE_ROOM);
         cx.end_turtle();
         DrawStep::done()
     }

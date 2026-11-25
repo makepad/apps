@@ -7,11 +7,9 @@
 //! [`handle_actions`] and [`sync`].
 //!
 //! Left: the cube, the app's menus (File, Edit, View, Help), the document's name and
-//! state and undo / redo, followed by the person's workspace tabs (Cmd+1-9) and the
-//! temporary layout's tab ([`crate::ui::workspace_tabs`]). Right: the job strip, the headset,
-//! the code toggle, the AI column and Print. The right side is laid out first and the row ends where
-//! it starts: a job's line on the strip narrows the row (it scrolls), it never pushes Print off
-//! the window. Cost: one rect read per draw of the row.
+//! state. Right: the job strip, the headset, undo / redo, the workspace menu (it names the shown
+//! workspace and lists them all, Cmd+1-9; [`crate::ui::workspace_tabs`]), the code toggle, the AI
+//! column and Print.
 //!
 //! The slice is a render mode of the plate view (`stage`), not a workspace. Print
 //! only opens the printer panel's confirm row (and shows the slice, which slices
@@ -72,9 +70,8 @@ script_mod! {
         height: Fill
         flow: Overlay
 
-        // The right side first, against the caption's right end: the workspaces' row ends where
-        // it starts (`FabWorkspaceTabs::follow`), so a job on the strip takes its room from the
-        // row, never from the window's edge.
+        // The right side, against the caption's right end: the job strip, XR, undo and redo, the
+        // workspace menu, then the code, the assistant and Print.
         ends := View{
             width: Fill
             height: Fill
@@ -94,6 +91,14 @@ script_mod! {
                 }
                 // Always available: starts the XR server and pairs a device by its PIN.
                 xr_caption := mod.widgets.XrCaptionButton{app: "fab" margin: Inset{left: 0 right: 0}}
+                // history, then the workspace menu (it names the shown one), left of the code
+                FabTip{ text: #(keymap::tooltip(Key::Undo))
+                    undo := CapIcon{ a11y: {label: "Undo"} draw_icon +: { svg: crate_resource("self://resources/icons/undo.svg") } }
+                }
+                FabTip{ text: #(keymap::tooltip(Key::Redo))
+                    redo := CapIcon{ a11y: {label: "Redo"} draw_icon +: { svg: crate_resource("self://resources/icons/redo.svg") } }
+                }
+                workspaces := mod.widgets.FabWorkspaceTabs{}
                 FabTip{ text: "The code beside the view (`)"
                     code_toggle := mod.widgets.FabIconCheck{ a11y: {label: "Code"} width: 28 height: 26 padding: Inset{left: 6 right: 6 top: 5 bottom: 5} draw_icon +: { svg: crate_resource("self://resources/icons/code.svg") } }
                 }
@@ -106,8 +111,7 @@ script_mod! {
             }
         }
 
-        // The document and history, then the workspaces right after them (as in Blender); the
-        // rest up to the right side drags the window.
+        // The menus and the document; the rest up to the right side drags the window.
         starts := View{
             width: Fill
             height: Fill
@@ -150,16 +154,7 @@ script_mod! {
                     }
                     doc_state := mod.widgets.FabLabelSmall{ text: "" }
                 }
-                FabTip{ text: #(keymap::tooltip(Key::Undo))
-                    undo := CapIcon{ a11y: {label: "Undo"} draw_icon +: { svg: crate_resource("self://resources/icons/undo.svg") } }
-                }
-                FabTip{ text: #(keymap::tooltip(Key::Redo))
-                    redo := CapIcon{ a11y: {label: "Redo"} draw_icon +: { svg: crate_resource("self://resources/icons/redo.svg") } }
-                }
             }
-
-            // the workspaces: the person's row, the shown one lit
-            workspaces := mod.widgets.FabWorkspaceTabs{}
         }
     }
 }
@@ -168,10 +163,10 @@ script_mod! {
 /// `FabTopBar` view).
 pub fn handle_actions(cx: &mut Cx, bar: &WidgetRef, actions: &Actions, state: &AppState) {
     workspace_actions(cx, bar, actions, state);
-    if bar.button(cx, ids!(left.undo)).clicked(actions) {
+    if bar.button(cx, ids!(right.undo)).clicked(actions) {
         cx.action(ShellAction::Command("undo".into()));
     }
-    if bar.button(cx, ids!(left.redo)).clicked(actions) {
+    if bar.button(cx, ids!(right.redo)).clicked(actions) {
         cx.action(ShellAction::Command("redo".into()));
     }
     if bar.button(cx, ids!(right.print)).clicked(actions) {
@@ -358,9 +353,7 @@ impl Caption {
 pub fn sync(cx: &mut Cx, bar: &WidgetRef, caption: &Caption) {
     bar.label(cx, ids!(left.title.doc_name)).set_text(cx, &caption.title);
     bar.label(cx, ids!(left.title.doc_state)).set_text(cx, &caption.info);
-    let right = bar.widget(cx, ids!(right));
     if let Some(mut tabs) = bar.widget(cx, ids!(workspaces)).borrow_mut::<FabWorkspaceTabs>() {
-        tabs.follow(right);
         tabs.set(cx, caption.tabs.clone(), caption.current, caption.temp.clone());
     }
     let code = bar.radio_button(cx, ids!(right.code_toggle));

@@ -50,7 +50,10 @@ script_mod! {
             // out over the enclosing section's inset, so its rows start and end where the Part's
             // other rows do (and its title where theirs is)
             margin: Inset{left: 0.0 - theme.prop_pad right: 0.0 - theme.prop_pad}
-            header +: {hdr +: {padding: Inset{left: theme.prop_pad + theme.prop_label_gap + theme.prop_icon_size right: theme.prop_pad}}}
+            // its bar indented a level: it starts under its section's icon (an icon and a gap in from
+            // the rows' start, which is `prop_pad` in from the Group, set out by its margin above),
+            // so its chevron sits below that icon and its title lines up with the section's
+            header +: {hdr +: {margin: Inset{left: theme.prop_pad + theme.prop_icon_size + theme.prop_label_gap} padding: Inset{left: theme.prop_label_gap right: theme.prop_pad}}}
             body: View{
                 width: Fill height: Fit flow: Down
                 padding: Inset{top: 0 bottom: theme.prop_row_gap}
@@ -361,6 +364,18 @@ fn inline_axis(cx: &mut Cx, row: &WidgetRef, axis: Option<&str>) {
             num.redraw(cx);
         }
     }
+}
+
+/// A Num row's field, reached through the row's own children rather than the widget tree (an
+/// [`Axes`] row draws it, so the tree must keep it under its row; this puts it back there too).
+fn row_num(cx: &mut Cx, row: &WidgetRef) -> Option<WidgetRef> {
+    let child = |w: &WidgetRef, name: LiveId| w.borrow::<View>().and_then(|v| v.children.iter().find(|(id, _)| *id == name).map(|(_, c)| c.clone()));
+    let value = child(row, live_id!(value))?;
+    let num = child(&value, live_id!(num))?;
+    if row.widget(cx, ids!(num)).widget_uid() != num.widget_uid() {
+        cx.widget_tree_insert_child(value.widget_uid(), live_id!(num), num.clone());
+    }
+    Some(num)
 }
 
 /// The Mass and balance row's title.
@@ -685,17 +700,16 @@ impl FabParamPanel {
                         for (i, (_, w)) in rows[k..k + n].iter().enumerate() {
                             inline_axis(cx, w, Some(AXES[order[i]]));
                         }
-                        let cells: Vec<(LiveId, WidgetRef)> = rows[k..k + n].iter().map(|(id, w)| (*id, w.widget(cx, ids!(num)))).collect();
+                        // Each field stays its row's in the widget tree (the row's lookups of `num`
+                        // set its value), so it is reached through the row's own children and only
+                        // drawn here.
+                        let cells: Vec<(LiveId, WidgetRef)> = rows[k..k + n].iter().filter_map(|(id, w)| row_num(cx, w).map(|num| (*id, num))).collect();
                         let value = axes.widget(cx, ids!(value));
-                        let uid = value.widget_uid();
                         if let Some(mut view) = value.borrow_mut::<View>() {
                             let same = view.children.len() == cells.len()
                                 && view.children.iter().zip(&cells).all(|((a, x), (b, y))| a == b && x.widget_uid() == y.widget_uid());
                             if !same {
                                 view.children = cells.iter().cloned().collect();
-                                for (id, child) in &view.children {
-                                    cx.widget_tree_insert_child(uid, *id, child.clone());
-                                }
                                 view.redraw(cx);
                             }
                         }
@@ -793,6 +807,7 @@ impl Widget for FabParamPanel {
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         if matches!(event, Event::Draw(_)) { return; }
+        crate::ui::widgets::section_headers(cx, event, self.items.iter().filter(|(_, (_, t))| *t == live_id!(Group)).map(|(_, (w, _))| w));
         let claimed_before = event.pointer_claimed_area();
         let Some(state) = scope.data.get::<AppState>() else { return };
         let outside = match event {

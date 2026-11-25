@@ -955,6 +955,7 @@ impl Widget for FabSlicerRows {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        crate::ui::widgets::section_headers(cx, event, self.items.iter().filter(|(_, (_, t))| *t == live_id!(Head)).map(|(_, (w, _))| w));
         let claimed_before = event.pointer_claimed_area();
         for group in SettingGroup::ALL {
             if let Some((w, _)) = self.items.get(&head_id(group)) {

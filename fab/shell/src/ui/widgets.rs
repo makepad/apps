@@ -976,15 +976,30 @@ script_mod! {
         }
     }
 
-    // The inline labels of the input rows ("Position X", "Layer height"), in the app's dim ink
-    // like every other secondary text. The shared sheet lifts its label ink to its contrast floor
-    // on every ground it knows; on the app's dark panels #9a9a9a reads at about 5.8:1. Defined
-    // again here, after the shared sheet and before every panel, so all of the app's rows take it.
-    mod.widgets.PropRow = mod.widgets.PropRow{ label +: { draw_text +: { color: fab.color_text_dim } } }
-    mod.widgets.PropNumberRow = mod.widgets.PropNumberRow{ label +: { draw_text +: { color: fab.color_text_dim } } }
-    mod.widgets.PropDropDownRow = mod.widgets.PropDropDownRow{ label +: { draw_text +: { color: fab.color_text_dim } } }
-    mod.widgets.PropSegmentedRow = mod.widgets.PropSegmentedRow{ label +: { draw_text +: { color: fab.color_text_dim } } }
-    mod.widgets.PropCheckRow = mod.widgets.PropCheckRow{ label +: { draw_text +: { color: fab.color_text_dim } } }
+    // The input rows' names ("Position", "Layer height", a feature's "Width") in the body ink: a
+    // parameter's name is what the row is, not a caption to it. Defined again here, after the
+    // shared sheet and before every panel, so all of the app's rows take it.
+    mod.widgets.PropRow = mod.widgets.PropRow{ label +: { draw_text +: { color: fab.color_text } } }
+    mod.widgets.PropNumberRow = mod.widgets.PropNumberRow{ label +: { draw_text +: { color: fab.color_text } } }
+    mod.widgets.PropDropDownRow = mod.widgets.PropDropDownRow{ label +: { draw_text +: { color: fab.color_text } } }
+    mod.widgets.PropSegmentedRow = mod.widgets.PropSegmentedRow{ label +: { draw_text +: { color: fab.color_text } } }
+    // A section has no plate: its header alone carries a shade under the panel
+    // (`fab.color_section`), square, no line, and answers the pointer with its title, not a lit
+    // box (lit by `section_headers`). The bar is inset as the rows are (`prop_pad` each side), so
+    // it spans the labels to the fields' end, its chevron a gap in from its start (a nested
+    // section's bar starts further in: `param_panel`'s Group). Its title is bold, so the sections
+    // read apart from their rows; twice the theme's gap below each.
+    mod.widgets.PropSection = mod.widgets.PropSection{
+        margin: Inset{bottom: theme.prop_section_gap * 2.0}
+        draw_bg +: {color: #x00000000}
+        header +: {hdr +: {
+            margin: Inset{left: theme.prop_pad right: theme.prop_pad}
+            padding: Inset{left: theme.prop_label_gap right: theme.prop_pad}
+            draw_bg +: {color: fab.color_section color_hover: fab.color_section radius: 0.0}
+            title +: {draw_text +: {text_style: theme.font_bold{font_size: theme.prop_font_size}}}
+        }}
+    }
+    mod.widgets.PropCheckRow = mod.widgets.PropCheckRow{ label +: { draw_text +: { color: fab.color_text } } }
 
     // Label-left / value-right row.
     mod.widgets.FabPropRow = View{
@@ -1149,4 +1164,99 @@ pub(crate) fn section_rows(cx: &mut Cx, section: &WidgetRef, rows: Vec<(LiveId, 
         view.redraw(cx);
     }
     cx.widget_tree_mark_dirty(uid);
+}
+
+/// The section titles lit now (their widgets' uids), and a fold drag under way: one shared state,
+/// so each panel lights and folds only its own headers, a drag runs on across panels (Transform
+/// into the parameter groups), and nothing needs a field of its own.
+#[derive(Default)]
+struct Headers {
+    lit: Vec<WidgetUid>,
+    drag: Option<FoldDrag>,
+}
+
+/// A press on a section's header, dragged on: every header the pointer then reaches takes the
+/// state the pressed one went to (`open`), once per header per drag, and so does every header
+/// between it and the one set last (`last`), in their order on screen. Folding moves what is below
+/// up (and a scrolled panel back down) between two moves, so a header can pass the pointer without
+/// ever being under it; the order catches it. Only the state is kept, not the pressed section: it
+/// can hold the panel handling the move (Parameters holds its groups), and is busy then.
+struct FoldDrag {
+    open: bool,
+    done: Vec<WidgetUid>,
+    last: WidgetUid,
+}
+
+/// The section headers' pointer behaviour beyond a click, for the PropSections in `sections`
+/// (call from the panel's `handle_event` with every event, before the sections get it: a press
+/// reads the state the section will leave):
+/// - the header under the pointer lights its title in the hover ink (no lit ground);
+/// - a press on a header dragged over others folds or unfolds them all with that one gesture.
+/// O(sections log sections) per mouse event; other events return at once.
+pub(crate) fn section_headers<'a>(cx: &mut Cx, event: &Event, sections: impl IntoIterator<Item = &'a WidgetRef>) {
+    let at = match event {
+        Event::MouseMove(e) => Some(e.abs),
+        Event::MouseDown(e) if e.button.is_primary() => Some(e.abs),
+        Event::MouseUp(_) => {
+            cx.global::<Headers>().drag = None;
+            return;
+        }
+        Event::MouseLeave(_) | Event::ClearHover => None,
+        _ => return,
+    };
+    // the headers shown, in their order down the panel
+    let all: Vec<WidgetRef> = sections.into_iter().cloned().collect();
+    let mut heads: Vec<(WidgetRef, Rect)> = all
+        .iter()
+        .filter_map(|section| {
+            let area = section.widget(cx, ids!(hdr)).area();
+            area.is_valid(cx).then(|| (section.clone(), area.rect(cx)))
+        })
+        .collect();
+    heads.sort_by(|a, b| a.1.pos.y.total_cmp(&b.1.pos.y));
+    let under = at.and_then(|p| heads.iter().position(|(_, r)| r.contains(p)));
+    match (event, under) {
+        // a press starts a drag from this header: the section toggles itself on the press, after
+        // this, so the drag's state is the one it is leaving, turned
+        (Event::MouseDown(_), Some(h)) => {
+            let (section, _) = &heads[h];
+            let open = !section.as_prop_section().is_open(cx);
+            let uid = section.widget_uid();
+            cx.global::<Headers>().drag = Some(FoldDrag { open, done: vec![uid], last: uid });
+        }
+        // dragged onto a header: it and every header between it and the last one set take the
+        // drag's state (the last one may be another panel's: then this one alone)
+        (Event::MouseMove(_), Some(h)) => {
+            if let Some(drag) = &cx.global::<Headers>().drag {
+                let (open, last) = (drag.open, drag.last);
+                let from = heads.iter().position(|(s, _)| s.widget_uid() == last).unwrap_or(h);
+                for i in from.min(h)..=from.max(h) {
+                    let (section, _) = &heads[i];
+                    let uid = section.widget_uid();
+                    let Some(drag) = &mut cx.global::<Headers>().drag else { break };
+                    if drag.done.contains(&uid) { continue; }
+                    drag.done.push(uid);
+                    if section.as_prop_section().is_open(cx) != open {
+                        section.as_prop_section().set_is_open(cx, open, Animate::Yes);
+                        cx.widget_action(uid, if open { FoldHeaderAction::Opening } else { FoldHeaderAction::Closing });
+                    }
+                }
+                if let Some(drag) = &mut cx.global::<Headers>().drag { drag.last = heads[h].0.widget_uid(); }
+            }
+        }
+        _ => {}
+    }
+    // the title under the pointer lit, the others put back (a hidden one too)
+    let hot = under.map(|h| heads[h].0.widget_uid());
+    for section in &all {
+        let want = hot == Some(section.widget_uid());
+        let mut title = section.widget(cx, ids!(hdr.title));
+        let uid = title.widget_uid();
+        let lit = cx.global::<Headers>().lit.contains(&uid);
+        if want == lit { continue; }
+        let lit = &mut cx.global::<Headers>().lit;
+        if want { lit.push(uid); } else { lit.retain(|u| *u != uid); }
+        script_apply_eval!(cx, title, {draw_text +: {color: if #(want) {mod.theme.color_text_hover} else {mod.theme.color_text}}});
+        title.redraw(cx);
+    }
 }

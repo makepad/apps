@@ -114,7 +114,8 @@ script_mod! {
             text_style: theme.font_regular{ font_size: fab.font_size_ui }
         }
         color_selected: fab.color_selection_bg
-        color_hover: fab.color_row_hover
+        // the name's ink under the pointer (the row's ground stays; only the name lights)
+        color_hover: fab.color_text_hover
         color_error: fab.color_error
         // the role marks after the names: a solid disc, its sign in `color_mark_ink`
         color_cut: fab.color_warning
@@ -1426,13 +1427,7 @@ impl Widget for FabFeatureTree {
                 (Some(l), _) => (Some(l), self.color_error),
                 (None, d) => (d, self.color_check),
             };
-            let fill = if on {
-                self.color_selected
-            } else if self.hover == Some(n) {
-                self.color_hover
-            } else {
-                vec4(0.0, 0.0, 0.0, 0.0)
-            };
+            let fill = if on { self.color_selected } else { vec4(0.0, 0.0, 0.0, 0.0) };
             self.draw_row.fill = fill;
             self.draw_row.ring = if bad { self.color_error } else if mark.is_some() { mark_color } else { vec4(0.0, 0.0, 0.0, 0.0) };
             self.draw_row.spool = 0.0;
@@ -1484,7 +1479,8 @@ impl Widget for FabFeatureTree {
             let mut mark_rect = None;
             let at = dvec2(kx, r.pos.y + 5.0);
             let name_rect = Rect { pos: dvec2(at.x, r.pos.y), size: dvec2((text_end - at.x).max(0.0), r.size.y) };
-            self.draw_name.color = if f.editable || f.detail == TEST_PRINT { name_color } else { self.color_readonly };
+            let editable = f.editable || f.detail == TEST_PRINT;
+            self.draw_name.color = if !editable { self.color_readonly } else if self.hover == Some(n) { self.color_hover } else { name_color };
             if f.off { self.draw_name.color.w *= 0.4; }
             if self.rename.as_ref() == Some(&f.id) {
                 rename_rect = Some(name_rect);

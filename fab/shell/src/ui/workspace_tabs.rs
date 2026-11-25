@@ -1,5 +1,6 @@
-//! The caption's workspace tabs (design FABWS, Blender's row): one tab per offered workspace in
-//! the person's order, the shown one lit, the first nine tagged with their Cmd/Ctrl key. A click
+//! The caption's workspace switcher: one button naming the shown workspace, whose `⌄` menu lists
+//! every offered one (the row of tabs, design FABWS, is not shown: its code stays for the
+//! rename, the menus and the drag, which a tab no longer starts). Cmd/Ctrl and a number switch. A click
 //! shows one; a double click renames it in place; a right click (or a hold) opens its menu
 //! (Rename, Duplicate, Reset, Delete); a drag reorders, the tab's chip at the pointer and a line
 //! where it would land. `+` offers a duplicate, a temporary layout and the defaults. Past its
@@ -438,8 +439,19 @@ impl Widget for FabWorkspaceTabs {
         let ends = self.follow.area().rect(cx);
         let end = if ends.size.x > 0.0 { ends.pos.x } else { bar.pos.x + bar.size.x - self.trailing };
         let share = (end - self.gap - at - temp_space).max(0.0);
-        let overflow = natural + 3.0 * PAD + GLYPH_W > share;
-        self.room = if overflow { (share - 3.0 * PAD - 2.0 * GLYPH_W).max(TAB_H) } else { natural };
+        let _ = share;
+        // No tabs show: one button names the shown workspace and lists them all (`⌄`'s menu); `+`
+        // and a temporary layout's tab follow it. Cmd/Ctrl and a number still switch.
+        self.parts.clear();
+        self.room = 0.0;
+        let shown_name = self.tabs.iter().find(|(id, _)| *id == self.current).map(|(_, name)| name.clone())
+            .or_else(|| self.temp.as_ref().filter(|t| t.id == self.current).map(|t| t.title.clone()))
+            .unwrap_or_default();
+        let name_w = {
+            let laid = self.draw_text.layout(cx, 0.0, 0.0, None, false, Align::default(), &shown_name);
+            f64::from(laid.size_in_lpxs.width * self.draw_text.font_scale)
+        };
+        let more_w = (12.0 + name_w + 4.0 + GLYPH_W).ceil();
         let max_scroll = (natural - self.room).max(0.0);
         // the shown tab comes into view when it changes
         if self.temp.as_ref().is_some_and(|t| t.id == self.current) {
@@ -455,17 +467,15 @@ impl Widget for FabWorkspaceTabs {
             }
         }
         self.scroll = self.scroll.clamp(0.0, max_scroll);
-        let width = PAD + self.room + PAD + GLYPH_W + if overflow { GLYPH_W } else { 0.0 } + PAD + temp_space;
+        let width = PAD + more_w + GLYPH_W + PAD + temp_space;
         // Align the caption's controls as one row, including the note and inline input.
         // The cue and drag chip can extend beyond it. Only the scrolling well clips its tabs.
         let layout = Layout { clip_x: false, clip_y: false, ..Layout::flow_overlay() };
         cx.begin_turtle(Walk { width: Size::Fixed(width), ..walk }, layout);
         let row = cx.turtle().rect();
         cx.add_rect_area(&mut self.area, row);
-        self.add = Rect { pos: dvec2(PAD + self.room + PAD, PAD), size: dvec2(GLYPH_W, TAB_H) };
-        self.more = overflow.then(|| Rect { pos: dvec2(self.add.pos.x + GLYPH_W, PAD), size: dvec2(GLYPH_W, TAB_H) });
-        // the well the tabs sit in
-        self.face(cx, Rect { pos: row.pos, size: dvec2(PAD + self.room + PAD, row.size.y) }, self.well);
+        self.more = Some(Rect { pos: dvec2(PAD, PAD), size: dvec2(more_w, TAB_H) });
+        self.add = Rect { pos: dvec2(PAD + more_w, PAD), size: dvec2(GLYPH_W, TAB_H) };
         let clip = Rect { pos: row.pos + dvec2(PAD, 0.0), size: dvec2(self.room, row.size.y) };
         let dragging = self.drag.map(|(from, _, _)| from);
         // the key's number sits on the name's baseline: its top drops by what the name's baseline
@@ -509,7 +519,12 @@ impl Widget for FabWorkspaceTabs {
         self.glyph(cx, add, "+", self.hover == Some(Part::Add));
         if let Some(more) = more {
             cx.add_rect_area(&mut self.more_area, more);
-            self.glyph(cx, more, "⌄", self.hover == Some(Part::More));
+            // the shown workspace's name in its well, then the list's chevron
+            self.face(cx, more, if self.hover == Some(Part::More) { self.hover_face } else { self.well });
+            self.draw_text.color = self.selected_ink;
+            self.draw_text.draw_abs(cx, dvec2(more.pos.x + 12.0, more.pos.y + NAME_Y), &shown_name);
+            let chevron = Rect { pos: dvec2(more.pos.x + more.size.x - GLYPH_W, more.pos.y), size: dvec2(GLYPH_W, TAB_H) };
+            self.glyph(cx, chevron, "⌄", false);
         } else {
             self.more_area = Area::Empty;
         }

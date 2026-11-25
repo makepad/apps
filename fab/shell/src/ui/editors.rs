@@ -56,6 +56,8 @@ pub enum Editor {
     /// What would break first, from the slice, and the fixes that help, as one undo step.
     Strength,
     /// The selected part's shape parameters.
+    /// Retired: the part's parameters are a section of the Part editor. Kept so a saved layout
+    /// that names it still reads; [`Editor::retired`] editors leave a layout as it loads.
     Parameters,
     /// The electronics library: search, pin and place parts (the Schematic's float is its quick
     /// open while no area shows it).
@@ -93,7 +95,7 @@ pub enum Family {
 /// Experimental's editors are offered only while View › Experimental has their family on.
 pub const MENU: [(&str, &[Editor]); 7] = [
     ("3D views", &[Editor::Viewport, Editor::Device]),
-    ("Plate data", &[Editor::Plates, Editor::Parts, Editor::Part, Editor::Parameters, Editor::Paint, Editor::Code]),
+    ("Plate data", &[Editor::Plates, Editor::Parts, Editor::Part, Editor::Paint, Editor::Code]),
     ("Print", &[Editor::Slicer, Editor::Overrides, Editor::TestPrints, Editor::Settings, Editor::Printer, Editor::Calibrate, Editor::Camera, Editor::Jobs]),
     ("Analysis", &[Editor::Slice, Editor::Strength, Editor::Force, Editor::Mechanics, Editor::Performance]),
     ("Electronics", &[Editor::Circuit, Editor::Board, Editor::Library, Editor::Checks, Editor::Bench, Editor::BoardControls, Editor::Scope, Editor::Transport, Editor::Firmware]),
@@ -224,6 +226,11 @@ impl Editor {
             | Editor::Library | Editor::Checks | Editor::BoardControls => Some(Family::Electronics),
             _ => None,
         }
+    }
+
+    /// An editor no area shows any more (it went into another), kept for the layouts that name it.
+    pub fn retired(self) -> bool {
+        matches!(self, Editor::Parameters)
     }
 
     pub fn of_kind(kind: LiveId) -> Option<Editor> {

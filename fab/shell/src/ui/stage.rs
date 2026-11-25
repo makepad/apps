@@ -42,8 +42,13 @@ use makepad_widgets_core::*;
 
 const SPEED_MENU: LiveId = live_id!(fab_stage_speed);
 const CONTEXT_MENU: LiveId = live_id!(fab_stage_context);
-/// The navigation gizmo's row's top inset; Mechanics adds its header strip's height.
+/// The navigation gizmo's row's top inset; Mechanics adds its header strip's height, the other
+/// modes the top toolbar's.
 const NAV_TOP: f64 = 6.0;
+/// The top toolbar row's top padding (`render_row`) and its bar's height (24-point controls in a
+/// card padded 2).
+const RENDER_ROW_TOP: f64 = 10.0;
+const RENDER_ROW_H: f64 = 28.0;
 /// One row of Mechanics' header strip (a tab bar's height), and the gap under the strip before
 /// Mechanics' tools.
 const MECH_STRIP_ROW: f64 = 28.0;
@@ -560,6 +565,30 @@ script_mod! {
                     height: Fit
                     flow: Right
                     align: Align{x: 1.0 y: 0.5}
+                    // What makes and changes parts: Add (a new part) and Modify (the selected part's
+                    // features and shape edits). Handled for the app (`main`).
+                    create_card := Float{
+                        flow: Right
+                        margin: Inset{right: 6}
+                        padding: 2
+                        spacing: 1
+                        FabTip{ text: "Add a shape or import a model"
+                            add := mod.widgets.FabDropdownButton{ a11y: {label: "Add"}
+                                tag: @fab_parts_add
+                                owner: @fab_parts_add
+                                height: 24
+                                label +: { text: "Add" }
+                            }
+                        }
+                        FabTip{ text: "Change the selected part: add a feature, cut away or join a primitive, cut it flat or along a plane, split it"
+                            modify := mod.widgets.FabDropdownButton{ a11y: {label: "Modify"}
+                                tag: @fab_modify
+                                owner: @fab_modify
+                                height: 24
+                                label +: { text: "Modify" }
+                            }
+                        }
+                    }
                     mode_card := Float{
                         flow: Right
                         margin: Inset{right: 6}
@@ -1896,7 +1925,10 @@ impl Widget for FabStage {
             } else {
                 0.0
             };
-            let nav_top = NAV_TOP + strip;
+            // and under the top toolbar while it shows, so the gizmo takes none of its width (its
+            // height is fixed: an area of the last frame reads empty here, mid-draw)
+            let toolbar = if !mechanics && v.view(cx, ids!(render_row)).visible() { RENDER_ROW_TOP + RENDER_ROW_H } else { 0.0 };
+            let nav_top = NAV_TOP + strip + toolbar;
             let nav = v.widget(cx, ids!(primary.nav));
             let moved = nav.borrow_mut::<View>().is_some_and(|mut nav| {
                 let moved = (nav.layout.padding.top - nav_top).abs() > 0.25;
@@ -1933,6 +1965,7 @@ impl Widget for FabStage {
                 // look, the mode stays.
                 v.view(cx, ids!(render_row)).set_visible(cx, !mechanics && lead);
                 v.view(cx, ids!(render_row.render_modes)).set_visible(cx, looks);
+                v.view(cx, ids!(render_row.create_card)).set_visible(cx, looks);
                 v.view(cx, ids!(render_row.view_bar)).set_visible(cx, looks);
                 v.view(cx, ids!(slice_ui)).set_visible(cx, slice && lead);
                 v.view(cx, ids!(slice_ui.resin_ui)).set_visible(cx, resin);

@@ -567,10 +567,31 @@ const SHAPE_EDITS: [(&str, &str, fab::api::ShapeOp); 9] = {
     ]
 };
 
-/// The shape edits on the picked node.
-pub fn shape_menu() -> Vec<fab::ui::popover::MenuItem> {
-    SHAPE_EDITS.iter().map(|(id, label, _)| fab::ui::popover::MenuItem::new(makepad_widgets::LiveId::from_str(id), label)).collect()
+/// The Modify menu (the 3D view's bar): what changes the selected part. A feature of the
+/// vocabulary (the Add menu's groups but its primitives, which are new parts), a primitive cut
+/// away or joined, a flat or a plane cut, a split, a print settings box over it. Off with no part
+/// selected. Its picks are the feature menu's and the shape edits' ids ([`add_pick`],
+/// [`shape_pick`]) and `modify_settings_here`.
+pub fn modify_menu(has_part: bool) -> Vec<fab::ui::popover::MenuItem> {
+    use fab::ui::popover::MenuItem;
+    use makepad_widgets::LiveId;
+    let features: Vec<MenuItem> = add_menu().into_iter().filter(|m| m.id != LiveId::from_str("add_group_primitive")).collect();
+    let prims = |verb: &str| -> Vec<MenuItem> {
+        [("box", "Box"), ("cylinder", "Cylinder"), ("sphere", "Sphere")].iter().map(|(p, label)| MenuItem::new(LiveId::from_str(&format!("shape_{verb}_{p}")), label)).collect()
+    };
+    vec![
+        MenuItem::new(LiveId::from_str("modify_feature"), "Add feature").flyout(features).enabled_if(has_part),
+        MenuItem::new(LiveId::from_str("modify_cut"), "Cut away").flyout(prims("subtract")).enabled_if(has_part),
+        MenuItem::new(LiveId::from_str("modify_join"), "Join").flyout(prims("add")).enabled_if(has_part),
+        MenuItem::sep(),
+        MenuItem::new(LiveId::from_str("shape_cut_bottom"), "Cut bottom flat").enabled_if(has_part),
+        MenuItem::new(LiveId::from_str("shape_cut_plane"), "Cut along a plane").enabled_if(has_part),
+        MenuItem::new(LiveId::from_str("shape_split"), "Split, keep both halves with pins").enabled_if(has_part),
+        MenuItem::sep(),
+        MenuItem::new(LiveId::from_str("modify_settings_here"), fab::ui::code::SETTINGS_HERE).enabled_if(has_part),
+    ]
 }
+
 
 /// The operation of a Shape menu pick.
 pub fn shape_pick(id: makepad_widgets::LiveId) -> Option<fab::api::ShapeOp> {

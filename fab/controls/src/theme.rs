@@ -28,9 +28,10 @@ use makepad_widgets_core::*;
 /// Body text, the second voice (kinds, counts, captions, inactive tabs) and
 /// the quietest one (hints, shortcuts, chevrons, disabled controls), as
 /// `0xRRGGBBAA`: the theme's own inks where they already read, else moved
-/// toward white or black until they do. All three are words somebody reads,
-/// so all three are held to `READABLE` (WCAG AA, 4.5:1) on each ground
-/// below; they stay apart because each starts from its own theme ink.
+/// toward white or black until they do. Body and second inks are held to
+/// `READABLE` (WCAG AA, 4.5:1) on each ground below, the quietest to `QUIET`
+/// (3:1), so it reads as a step back; they stay apart because each starts
+/// from its own theme ink.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Inks {
     pub text: u32,
@@ -65,10 +66,16 @@ impl Inks {
         Self {
             text: ink_reading(grounds, text, READABLE),
             dim: ink_reading(grounds, dim, READABLE),
-            muted: ink_reading(grounds, muted, READABLE),
+            muted: ink_reading(grounds, muted, QUIET),
         }
     }
 }
+
+/// The quietest ink's floor: 3:1 (WCAG's for large text and for the parts of controls), under
+/// the body and second inks' 4.5:1, so the words that only qualify another (a feature's kind, a
+/// part's dimensions, a field's placeholder) stand a step back from the second voice instead of
+/// being lifted to it.
+const QUIET: f64 = 3.0;
 
 /// `ink`, or the nearest step from it toward the plain end (white on a dark
 /// panel, black on a light one) that reads at `need` on every ground.
@@ -160,10 +167,11 @@ pub fn script_mod(vm: &mut ScriptVm) {
             color_button_active: theme.color_ctrl_selected
 
             // ---- text ----
-            // Measured against every ground they are drawn on (`Inks`), all
-            // at 4.5:1. `dim` is the second voice (feature kinds, counts,
-            // captions, inactive tabs); `muted` the quietest (hints,
-            // shortcuts, chevrons, disabled controls).
+            // Measured against every ground they are drawn on (`Inks`): text
+            // and dim at 4.5:1, muted at 3:1. `dim` is the second voice
+            // (labels, counts, captions, inactive tabs); `muted` the quietest
+            // (feature kinds, dimensions, placeholders, hints, shortcuts,
+            // chevrons, disabled controls).
             color_text: #(text)
             color_text_dim: #(dim)
             color_text_muted: #(muted)

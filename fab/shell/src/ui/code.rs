@@ -1478,19 +1478,11 @@ impl Widget for FabFeatureTree {
                 self.draw_settings.draw_abs(cx, Rect { pos: dvec2(kx, r.pos.y + 4.0), size: dvec2(14.0, 14.0) });
                 kx += 18.0;
             }
-            self.draw_op.color = self.color_kind;
-            if f.off { self.draw_op.color.w *= 0.4; }
-            // the kind column is as wide as the kind's own text, capped at 74 and 0.4 of the row
-            let kind_w = self.draw_op.prepare_single_line_run(cx, &f.op).map_or(74.0, |run| run.width_in_lpxs as f64 + 1.0);
-            let op_w = kind_w.min(74.0).min((text_end - kx).max(0.0) * 0.4);
-            cx.begin_turtle(Walk::abs_rect(Rect { pos: dvec2(kx, r.pos.y), size: dvec2(op_w, r.size.y) }), Layout::default().with_clip(true, true));
-            self.draw_op.draw_abs(cx, dvec2(kx, r.pos.y + 6.0), &f.op);
-            cx.end_turtle();
-            self.draw_op.color = dim_color;
+            // The name first, then its kind (quieter), its role disc and its detail; all of it cut
+            // off where the row's icons start.
             let name = f.study.as_ref().map_or_else(|| f.name().to_string(), |s| s.on.clone());
             let mut mark_rect = None;
-            // a gap after the clipped kind, so a long one never runs into the name
-            let at = dvec2(kx + op_w + 6.0, r.pos.y + 5.0);
+            let at = dvec2(kx, r.pos.y + 5.0);
             let name_rect = Rect { pos: dvec2(at.x, r.pos.y), size: dvec2((text_end - at.x).max(0.0), r.size.y) };
             self.draw_name.color = if f.editable || f.detail == TEST_PRINT { name_color } else { self.color_readonly };
             if f.off { self.draw_name.color.w *= 0.4; }
@@ -1499,9 +1491,17 @@ impl Widget for FabFeatureTree {
             } else {
                 cx.begin_turtle(Walk::abs_rect(name_rect), Layout::default().with_clip(true, true));
                 self.draw_name.draw_abs(cx, at, &name);
-                // How it takes part in its parent, in a ring after the name: − cut away (in the
-                // cut colour), + joined, ∩ intersected; the base has none.
                 let mut after = at.x + self.draw_name.prepare_single_line_run(cx, &name).map_or(0.0, |run| run.width_in_lpxs as f64) + 6.0;
+                // its kind ("cylinder"), in the quietest ink
+                if !f.op.is_empty() {
+                    self.draw_op.color = self.color_kind;
+                    if f.off { self.draw_op.color.w *= 0.4; }
+                    self.draw_op.draw_abs(cx, dvec2(after, r.pos.y + 6.0), &f.op);
+                    self.draw_op.color = dim_color;
+                    after += self.draw_op.prepare_single_line_run(cx, &f.op).map_or(0.0, |run| run.width_in_lpxs as f64) + 6.0;
+                }
+                // How it takes part in its parent, in a disc after the kind: − cut away, + joined,
+                // ∩ intersected; the base has none.
                 if !glyph.is_empty() {
                     mark_rect = Some(Rect { pos: dvec2(after - 2.0, r.pos.y), size: dvec2(17.0, r.size.y) });
                     // a solid disc: yellow for a cut, blue for a join, grey for an intersection

@@ -5358,24 +5358,26 @@ impl MatchEvent for App {
         }
         let caption = self.ui.widget(cx, ids!(caption));
         fab::ui::topbar::handle_actions(cx, &caption, actions, &self.state);
-        // The Design workspace's Add menu (the feature tree's bar).
-        let add_menu = live_id!(fab_add_feature);
-        if let Some(anchor) = fab::ui::popover::dropdown_clicked(actions, add_menu) {
-            fab::ui::popover::open_menu(cx, add_menu, code_edit::add_menu(), anchor, fab::ui::popover::MenuPlace::Below);
+        // The plate's Add menu, then the selected part's Modify menu (the 3D view's bar).
+        fab::ui::parts::part_add_menu(cx, actions);
+        // Modify: a feature, a shape edit or a print settings box on the selected part.
+        let modify = live_id!(fab_modify);
+        if let Some(anchor) = fab::ui::popover::dropdown_clicked(actions, modify) {
+            let has_part = fab::ui::parts::active_part(&self.state).is_some();
+            fab::ui::popover::open_menu(cx, modify, code_edit::modify_menu(has_part), anchor, fab::ui::popover::MenuPlace::Below);
         }
-        if let Some(pick) = fab::ui::popover::menu_picked(actions, add_menu).and_then(code_edit::add_pick) {
-            self.add_feature(cx, pick);
-        }
-        let shape_menu = live_id!(fab_shape_edit);
-        if let Some(anchor) = fab::ui::popover::dropdown_clicked(actions, shape_menu) {
-            fab::ui::popover::open_menu(cx, shape_menu, code_edit::shape_menu(), anchor, fab::ui::popover::MenuPlace::Below);
-        }
-        if let Some(op) = fab::ui::popover::menu_picked(actions, shape_menu).and_then(code_edit::shape_pick) {
-            if let Some(object) = fab::ui::parts::active_part(&self.state).map(|i| self.state.plate.parts[i].object.clone()) {
-                self.part_action(cx, &PartAction::Shape { object, op });
-            } else {
-                self.state.ui.notices.say(NoticeView::Plate, "Select a part first".into());
-                self.ui.redraw(cx);
+        if let Some(pick) = fab::ui::popover::menu_picked(actions, modify) {
+            if let Some(feature) = code_edit::add_pick(pick) {
+                self.add_feature(cx, feature);
+            } else if let Some(op) = code_edit::shape_pick(pick) {
+                if let Some(object) = fab::ui::parts::active_part(&self.state).map(|i| self.state.plate.parts[i].object.clone()) {
+                    self.part_action(cx, &PartAction::Shape { object, op });
+                } else {
+                    self.state.ui.notices.say(NoticeView::Plate, "Select a part first".into());
+                    self.ui.redraw(cx);
+                }
+            } else if pick == LiveId::from_str("modify_settings_here") {
+                fab::ui::stage::settings_here(cx, &self.state, None);
             }
         }
         shell_chat::handle_actions(self, cx, actions);

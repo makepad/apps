@@ -114,13 +114,13 @@ impl Origin {
         let tree = match self {
             Origin::Design => {
                 // left: the plates and the parts (in front), each part's features in its tree; right: the part, the
-                // slicer, the job, the printer over the part's parameters (in front), the
+                // slicer, the job, the printer (the part's parameters are a section of the Part) over the
                 // overrides, strength and test prints; the program beside the plate
                 let (code, width) = code;
                 let centre = if code { T::split(Horizontal, FromB(width.unwrap_or(CODE_START_W)), plate(), T::area(Editor::Code)) } else { plate() };
                 let left = T::stack(&[Editor::Plates, Editor::Parts], 1);
                 let top = T::stack(&[Editor::Part, Editor::Slicer, Editor::Settings, Editor::Printer, Editor::Calibrate], 0);
-                let below = T::stack(&[Editor::Parameters, Editor::Overrides, Editor::Strength, Editor::TestPrints], 0);
+                let below = T::stack(&[Editor::Overrides, Editor::Strength, Editor::TestPrints], 0);
                 let right = T::split(Vertical, Weighted(0.5), top, below);
                 T::split(Horizontal, FromA(250.0), left, T::split(Horizontal, FromB(320.0), centre, right))
             }
@@ -852,6 +852,7 @@ impl Workspaces {
                 (None, Some(origin)) => origin.tree().0,
                 (None, None) => return None,
             };
+            let tree = without_retired(tree);
             tree.whole().then_some(WorkspaceDef { id: d.id, name: d.name, mode: d.mode, origin: d.origin, shape: 0, tree, maximized: None })
         }).collect::<Option<_>>()?;
         if list.is_empty() {
@@ -891,4 +892,15 @@ impl Workspaces {
             let _ = std::fs::rename(&fresh, &path);
         }
     }
+}
+
+/// A saved layout without the retired editors' tabs ([`Editor::retired`]: the Parameters editor
+/// is a section of the Part now): each tab goes as Close tab takes it, an area it empties with it.
+fn without_retired(mut tree: AreaTree) -> AreaTree {
+    while let Some((area, instance)) = tree.instances().into_iter().find(|(_, i)| i.editor.retired()) {
+        if tree.apply(WorkspaceOp::CloseTab { area, instance }).is_err() {
+            break;
+        }
+    }
+    tree
 }

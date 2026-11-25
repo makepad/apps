@@ -151,7 +151,6 @@ script_mod! {
         Firmware := Notch{tip +: {text: "Firmware" chip +: {a11y: {label: "Firmware: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/area_firmware.svg")}}}}
         Overrides := Notch{tip +: {text: "Overrides" chip +: {a11y: {label: "Overrides: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/settings_here.svg")}}}}
         TestPrints := Notch{tip +: {text: "Test prints" chip +: {a11y: {label: "Test prints: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/closed_box.svg")}}}}
-        Parameters := Notch{tip +: {text: "Parameters" chip +: {a11y: {label: "Parameters: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/shape.svg")}}}}
         Strength := Notch{tip +: {text: "Strength" chip +: {a11y: {label: "Strength: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/warning.svg")}}}}
         Library := Notch{tip +: {text: "Library" chip +: {a11y: {label: "Library: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/folder_open.svg")}}}}
         Checks := Notch{tip +: {text: "Checks" chip +: {a11y: {label: "Checks: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/check.svg")}}}}

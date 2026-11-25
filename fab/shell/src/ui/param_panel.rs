@@ -21,6 +21,10 @@ use makepad_widgets_core::widget_tree::CxWidgetExt;
 use makepad_widgets_core::*;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+/// The longest a parameter row's label column is (points): the Part panel's Transform rows take
+/// the same, so every field of the panel starts at one line. A longer label ends in an ellipsis.
+pub const LABEL_W: f64 = 96.0;
+
 script_mod! {
     use mod.prelude.fab.*
     use mod.widgets.*
@@ -43,67 +47,67 @@ script_mod! {
         // A group sits on its section's card, its title under the section's title (past the
         // section's icon); its rows and the next group's title follow on the row rhythm.
         Group := PropSection{
-            margin: Inset{}
+            // out over the enclosing section's inset, so its rows start and end where the Part's
+            // other rows do (and its title where theirs is)
+            margin: Inset{left: 0.0 - theme.prop_pad right: 0.0 - theme.prop_pad}
             header +: {hdr +: {padding: Inset{left: theme.prop_pad + theme.prop_label_gap + theme.prop_icon_size right: theme.prop_pad}}}
             body: View{
                 width: Fill height: Fit flow: Down
                 padding: Inset{top: 0 bottom: theme.prop_row_gap}
-                content := View{width: Fill height: Fit flow: Down spacing: theme.prop_row_gap margin: Inset{left: theme.prop_pad right: theme.prop_pad}}
+                // (no inset of its own: its rows line up with the Part's other rows)
+                content := View{width: Fill height: Fit flow: Down spacing: theme.prop_row_gap margin: Inset{}}
             }
         }
-        Num := PropNumberRow{value +: {num +: {min: 0.0 max: 0.0 precision: 1}}}
+        // Every row's label column is `LABEL_W` at most, the Part panel's Transform's too, so the
+        // panel's fields all start at one line.
+        Num := PropNumberRow{label +: {width: Fill{weight: 0 basis: "42%" max: #(LABEL_W)}} value +: {num +: {min: 0.0 max: 0.0 precision: 1}}}
         // A seed: its number, and a button that writes a new one.
         Seed := PropNumberRow{
+            label +: {width: Fill{weight: 0 basis: "42%" max: #(LABEL_W)}}
             value +: {num +: {min: 0.0 max: 0.0 precision: 0}}
             trail +: {width: Fit reseed := mod.widgets.FabFlatButton{text: "Reseed" a11y: {label: "Reseed"}}}
         }
         // A grown pattern's live step counter, with pause and resume while it grows.
         Growth := PropRow{
+            label +: {width: Fill{weight: 0 basis: "42%" max: #(LABEL_W)}}
             value +: {
                 flow: Right align: Align{y: 0.5}
                 text := mod.widgets.FabLabelSmall{width: Fill text: "" max_lines: 1}
                 pause := mod.widgets.FabFlatButton{text: "Pause" a11y: {label: "Pause growth"}}
             }
         }
-        Bool := PropCheckRow{}
-        Choice := PropSegmentedRow{}
-        Pick := PropDropDownRow{}
-        Point := PropStack{
-            x := PropNumberRow{label +: {text: "X"} value +: {num +: {min: 0.0 max: 0.0 precision: 1}}}
-            y := PropNumberRow{label +: {text: "Y"} value +: {num +: {min: 0.0 max: 0.0 precision: 1}}}
-            z := PropNumberRow{label +: {text: "Z"} value +: {num +: {min: 0.0 max: 0.0 precision: 1}}}
+        Bool := PropCheckRow{label +: {width: Fill{weight: 0 basis: "42%" max: #(LABEL_W)}}}
+        Choice := PropSegmentedRow{label +: {width: Fill{weight: 0 basis: "42%" max: #(LABEL_W)}}}
+        Pick := PropDropDownRow{label +: {width: Fill{weight: 0 basis: "42%" max: #(LABEL_W)}}}
+        // A field's axes drawn as one row: its name, then the axes' fields side by side (taken from
+        // their rows, which are not drawn; each axis named inside its field). See `axis_runs`.
+        Axes := PropRow{label +: {width: Fill{weight: 0 basis: "42%" max: #(LABEL_W)}} value +: {flow: Right spacing: 4}}
+        // A point: one row, its axes side by side, each named inside its field (a 2D one hides Z).
+        Point := PropRow{
+            label +: {width: Fill{weight: 0 basis: "42%" max: #(LABEL_W)}}
+            value +: {
+                flow: Right spacing: 4
+                x := ValueInput{width: Fill height: Fill min_height: 0 label: "X" min: 0.0 max: 0.0 precision: 1}
+                y := ValueInput{width: Fill height: Fill min_height: 0 label: "Y" min: 0.0 max: 0.0 precision: 1}
+                z := ValueInput{width: Fill height: Fill min_height: 0 label: "Z" min: 0.0 max: 0.0 precision: 1}
+            }
         }
         Profile := View{
             width: Fill height: Fit flow: Down spacing: 2
             label := mod.widgets.FabLabelDim{
                 width: Fill text: ""
-                margin: Inset{left: theme.prop_label_width + theme.prop_label_gap}
+                margin: Inset{left: #(LABEL_W) + theme.prop_label_gap}
             }
             editor := mod.widgets.FabProfileEditor{}
         }
-        Derived := PropRow{value +: {text := mod.widgets.FabLabelSmall{width: Fill text: ""}}}
+        Derived := PropRow{label +: {width: Fill{weight: 0 basis: "42%" max: #(LABEL_W)}} value +: {text := mod.widgets.FabLabelSmall{width: Fill text: ""}}}
         Hint := View{
             width: Fill height: Fit
-            padding: Inset{left: theme.prop_label_width + theme.prop_label_gap right: theme.prop_pad top: 4 bottom: 6}
+            padding: Inset{left: #(LABEL_W) + theme.prop_label_gap right: theme.prop_pad top: 4 bottom: 6}
             text := mod.widgets.FabLabelSmall{width: Fill text: ""}
         }
     }
 
-    // The Parameters editor: the selected part's shape parameters, scrolled; with no part
-    // selected, a line that says to select one.
-    mod.widgets.FabParametersPanelBase = #(FabParametersPanel::register_widget(vm))
-    mod.widgets.FabParametersPanel = set_type_default() do mod.widgets.FabParametersPanelBase{
-        width: Fill height: Fill flow: Down
-        show_bg: true draw_bg +: { color: fab.color_editor }
-        body := mod.widgets.FabScroll{
-            padding: Inset{left: theme.prop_pad right: theme.prop_pad top: 6 bottom: 6}
-            none := mod.widgets.FabLabelDim{
-                width: Fill text: "Select a part on the plate or in the list to see its parameters."
-                margin: Inset{left: 10 right: 6 top: 4 bottom: 4}
-            }
-            params := mod.widgets.FabParamPanel{}
-        }
-    }
 }
 
 // ===========================================================================
@@ -347,28 +351,21 @@ enum RowKind {
     Mass,
 }
 
+/// A Num row's field as one axis of an [`Axes`] row (`axis` inside it), or in its own row (`None`).
+/// Only what changed is set.
+fn inline_axis(cx: &mut Cx, row: &WidgetRef, axis: Option<&str>) {
+    if let Some(mut num) = row.value_input(cx, ids!(num)).borrow_mut() {
+        let want = axis.unwrap_or("");
+        if num.label != want {
+            num.label = want.to_string();
+            num.redraw(cx);
+        }
+    }
+}
+
 /// The Mass and balance row's title.
 const MASS: &str = "Mass and balance";
 
-/// The Parameters editor. Per draw: whether a part is selected, O(1); the panel draws its rows.
-#[derive(Script, ScriptHook, Widget)]
-pub struct FabParametersPanel {
-    #[deref]
-    view: View,
-}
-
-impl Widget for FabParametersPanel {
-    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        self.view.handle_event(cx, event, scope);
-    }
-
-    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        if let Some(state) = scope.data.get::<AppState>() {
-            self.view.widget(cx, ids!(body.none)).set_visible(cx, active_part(state).is_none());
-        }
-        self.view.draw_walk(cx, scope, walk)
-    }
-}
 
 #[derive(Script, Widget)]
 pub struct FabParamPanel {
@@ -635,15 +632,14 @@ impl FabParamPanel {
             }
             t if t == live_id!(Point) => {
                 let n = match &p.value { ParamValue::Point(c) => c.len(), _ => 3 };
-                for (i, axis) in [ids!(x), ids!(y), ids!(z)].into_iter().enumerate() {
-                    let row = w.widget(cx, axis);
+                w.label(cx, ids!(label)).set_text(cx, &p.label);
+                for (i, axis) in [ids!(value.x), ids!(value.y), ids!(value.z)].into_iter().enumerate() {
+                    let mut num = w.widget(cx, axis);
                     let name = ["X", "Y", "Z"][i];
-                    row.label(cx, ids!(label)).set_text(cx, &if i == 0 { format!("{} X", p.label) } else { name.to_string() });
-                    let mut num = row.widget(cx, ids!(num));
-                    crate::ui::print_settings::name_control(cx, &num, name, "spin_button");
+                    crate::ui::print_settings::name_control(cx, &num, &format!("{} {name}", p.label), "spin_button");
                     let suf = suf.clone();
                     script_apply_eval!(cx, num, {min: #(min) max: #(max) step: #(step) snap: #(1.0) precision: #(prec) suffix: #(suf)});
-                    row.set_visible(cx, i < n);
+                    num.set_visible(cx, i < n);
                 }
             }
             t if t == live_id!(Profile) => {
@@ -654,6 +650,68 @@ impl FabParamPanel {
             }
         }
         self.applied.insert(id, RowConfig::of(p));
+    }
+
+    /// A feature's field of several axes comes as one row per axis ("Rotation X", "Rotation Y",
+    /// "Rotation Z"; a 2D one's "Position X", "Position Z"): a run of two or three Num rows named
+    /// so, their axes in order, with one name before the axis,
+    /// draws as one row of that name with the rows' fields side by side ([`Axes`]), each axis named
+    /// inside its field. Every other row is as it was. O(rows).
+    fn axis_runs(&mut self, cx: &mut Cx, rows: Vec<(LiveId, WidgetRef)>, labels: &[Option<String>]) -> Vec<(LiveId, WidgetRef)> {
+        const AXES: [&str; 3] = ["X", "Y", "Z"];
+        let split = |l: &Option<String>| l.as_deref().and_then(|l| l.rsplit_once(' ')).map(|(base, axis)| (base.to_string(), axis.to_string()));
+        let mut out = Vec::new();
+        let mut k = 0;
+        while k < rows.len() {
+            // a run: two or three of X, Y, Z in that order (a 2D field's X and Z too), the same
+            // name before each
+            let axis_of = |l: &Option<String>| split(l).and_then(|(base, axis)| AXES.iter().position(|a| *a == axis).map(|i| (base, i)));
+            let mut order: Vec<usize> = Vec::new();
+            if let Some((base, first)) = axis_of(&labels[k]) {
+                order.push(first);
+                let mut n = 1;
+                while k + n < rows.len() {
+                    match axis_of(&labels[k + n]) {
+                        Some((b, i)) if b == base && i > *order.last().unwrap() => { order.push(i); n += 1; }
+                        _ => break,
+                    }
+                }
+                if n >= 2 {
+                    let aid = row_id(&RowKind::Param(format!("axes:{}", rows[k].0 .0)));
+                    if let Some(axes) = self.item(cx, aid, live_id!(Axes)) {
+                        axes.label(cx, ids!(label)).set_text(cx, &base);
+                        // the axes' own fields, side by side (each still its row's: its value, drag and
+                        // refusal are the row's; the row itself is not drawn)
+                        for (i, (_, w)) in rows[k..k + n].iter().enumerate() {
+                            inline_axis(cx, w, Some(AXES[order[i]]));
+                        }
+                        let cells: Vec<(LiveId, WidgetRef)> = rows[k..k + n].iter().map(|(id, w)| (*id, w.widget(cx, ids!(num)))).collect();
+                        let value = axes.widget(cx, ids!(value));
+                        let uid = value.widget_uid();
+                        if let Some(mut view) = value.borrow_mut::<View>() {
+                            let same = view.children.len() == cells.len()
+                                && view.children.iter().zip(&cells).all(|((a, x), (b, y))| a == b && x.widget_uid() == y.widget_uid());
+                            if !same {
+                                view.children = cells.iter().cloned().collect();
+                                for (id, child) in &view.children {
+                                    cx.widget_tree_insert_child(uid, *id, child.clone());
+                                }
+                                view.redraw(cx);
+                            }
+                        }
+                        out.push((aid, axes));
+                        k += n;
+                        continue;
+                    }
+                }
+            }
+            if labels[k].is_some() {
+                inline_axis(cx, &rows[k].1, None);
+            }
+            out.push(rows[k].clone());
+            k += 1;
+        }
+        out
     }
 
     fn part<'a>(state: &'a AppState) -> Option<&'a std::sync::Arc<PartParamsView>> {
@@ -870,7 +928,7 @@ impl Widget for FabParamPanel {
                             }
                             ParamKind::Point => {
                                 let ParamValue::Point(c) = &p.value else { continue };
-                                for (i, axis) in [ids!(x.value.num), ids!(y.value.num), ids!(z.value.num)].into_iter().enumerate() {
+                                for (i, axis) in [ids!(value.x), ids!(value.y), ids!(value.z)].into_iter().enumerate() {
                                     let num = w.value_input(cx, axis);
                                     let with = |v: f64| {
                                         let mut c = c.clone();
@@ -926,7 +984,7 @@ impl Widget for FabParamPanel {
             matches!(kind, RowKind::Param(_))
                 && self.items.get(id).is_some_and(|(w, _)| {
                     let live = |num: ValueInputRef| num.borrow().is_some_and(|n| n.is_interacting());
-                    live(w.value_input(cx, ids!(num))) || [ids!(x.value.num), ids!(y.value.num), ids!(z.value.num)].into_iter().any(|axis| live(w.value_input(cx, axis)))
+                    live(w.value_input(cx, ids!(num))) || [ids!(value.x), ids!(value.y), ids!(value.z)].into_iter().any(|axis| live(w.value_input(cx, axis)))
                 })
         });
         Self::set_input_active(cx, scope, active);
@@ -994,6 +1052,8 @@ impl Widget for FabParamPanel {
                 section.as_prop_section().set_is_open(cx, open, Animate::No);
             }
             let mut children = Vec::new();
+            // (each Num row's label, for the axis runs that draw as one row)
+            let mut labels: Vec<Option<String>> = Vec::new();
             let start = self.rows.len();
             self.rows.push((gid, gk, Rect::default()));
             // A closing group keeps its rows until the fold animation has run out, so
@@ -1057,7 +1117,7 @@ impl Widget for FabParamPanel {
                         }
                     }
                     (ParamValue::Point(c), _) => {
-                        for (i, axis) in [ids!(x.value.num), ids!(y.value.num), ids!(z.value.num)].into_iter().enumerate() {
+                        for (i, axis) in [ids!(value.x), ids!(value.y), ids!(value.z)].into_iter().enumerate() {
                             let num = w.value_input(cx, axis);
                             if !num.borrow().is_some_and(|n| n.is_interacting()) {
                                 num.set_value(cx, c.get(i).copied().unwrap_or(0.0));
@@ -1077,7 +1137,7 @@ impl Widget for FabParamPanel {
                                     if cap.flash { num.refuse(cx, value); } else { num.hold(cx, value); }
                                 }
                                 (ParamValue::Point(c), t) if t == live_id!(Point) => {
-                                    for (i, axis) in [ids!(x.value.num), ids!(y.value.num), ids!(z.value.num)].into_iter().enumerate() {
+                                    for (i, axis) in [ids!(value.x), ids!(value.y), ids!(value.z)].into_iter().enumerate() {
                                         if let Some(x) = c.get(i) {
                                             let num = w.value_input(cx, axis);
                                             if cap.flash { num.refuse(cx, *x); } else { num.hold(cx, *x); }
@@ -1090,13 +1150,17 @@ impl Widget for FabParamPanel {
                     }
                 }
                 children.push((id, w.clone()));
+                labels.push((template_for(p) == live_id!(Num)).then(|| p.label.clone()));
                 if open { self.rows.push((id, rk, Rect::default())); }
             }
+            let children = self.axis_runs(cx, children, &labels);
             crate::ui::widgets::section_rows(cx, &section, children);
             section.draw_all(cx, &mut Scope::empty());
             for (id, kind, rect) in &mut self.rows[start..] {
                 if let Some((w, _)) = self.items.get(id) {
                     *rect = if matches!(kind, RowKind::Group(_)) { w.widget(cx, ids!(hdr)).area().rect(cx) }
+                        // an axis of an Axes row: its field is what shows
+                        else if !w.area().is_valid(cx) { w.widget(cx, ids!(num)).area().rect(cx) }
                         else { w.area().rect(cx) };
                 }
             }

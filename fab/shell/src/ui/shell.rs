@@ -216,7 +216,6 @@ script_mod! {
                 Overrides := FabOverridesPanel{}
                 TestPrints := FabTestPrintsPanel{}
                 Strength := FabStrengthPanel{}
-                Parameters := FabParametersPanel{}
                 Library := FabLibraryPanel{}
                 Checks := FabChecksPanel{}
                 BoardControls := FabBoardControlsPanel{}
@@ -2829,20 +2828,19 @@ mod tests {
         let circuit = sheet.showing(Editor::Circuit).expect("the sheet");
         assert!(sheet.parent_split(circuit).map(|(split, ..)| split) == sheet.showing(Editor::Checks).and_then(|a| sheet.parent_split(a)).map(|(split, ..)| split),
             "Checks opens beside the sheet");
-        // Design without its lower stack (an old file's): no area shows Parameters, so the Part
-        // panel offers it; its press (in the Part's area) brings Parameters into the Part's
-        // stack, in front
+        // Design without its lower stack (an old file's): no area shows Overrides; asked for from
+        // the Part's area, it comes into the Part's stack, in front
         show(&mut cx, &mut shell, &mut state, Origin::Design);
-        let below = tree(&shell).showing(Editor::Parameters).expect("Design shows Parameters");
+        let below = tree(&shell).showing(Editor::Overrides).expect("Design shows Overrides");
         run(&mut cx, &mut shell, &mut state, |cx, _, _| cx.action(ShellAction::EditAreas(WorkspaceOp::Close { area: below })));
         shell.publish_screen(&mut cx, &mut state);
-        assert!(!state.ui.on_screen(Editor::Parameters) && state.ui.on_screen(Editor::Part), "no area shows Parameters: the Part panel offers it");
+        assert!(!state.ui.on_screen(Editor::Overrides) && state.ui.on_screen(Editor::Part), "no area shows Overrides");
         let part = tree(&shell).showing(Editor::Part).expect("the Part's area");
         shell.pressed_area = shell.shown.map(|(ws, _)| (ws, part));
-        act(&mut cx, &mut shell, &mut state, vec![Box::new(ShowPanel(Editor::Parameters)) as Box<dyn ActionTrait>]);
+        act(&mut cx, &mut shell, &mut state, vec![Box::new(ShowPanel(Editor::Overrides)) as Box<dyn ActionTrait>]);
         shell.publish_screen(&mut cx, &mut state);
-        assert!(tree(&shell).showing(Editor::Parameters) == Some(part) && front(&tree(&shell), Editor::Part) == Some(Editor::Parameters) && state.ui.on_screen(Editor::Parameters),
-            "the press brings Parameters into the Part's stack, in front");
+        assert!(tree(&shell).showing(Editor::Overrides) == Some(part) && front(&tree(&shell), Editor::Part) == Some(Editor::Overrides) && state.ui.on_screen(Editor::Overrides),
+            "the press brings Overrides into the Part's stack, in front");
 
         // a Plate the dock holds but does not show is published hidden and lets go of the scene
         // host, which the Plate on screen takes with the shared studio work; it stays unparked

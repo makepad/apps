@@ -976,6 +976,16 @@ script_mod! {
         }
     }
 
+    // The inline labels of the input rows ("Position X", "Layer height"), in the app's dim ink
+    // like every other secondary text. The shared sheet lifts its label ink to its contrast floor
+    // on every ground it knows; on the app's dark panels #9a9a9a reads at about 5.8:1. Defined
+    // again here, after the shared sheet and before every panel, so all of the app's rows take it.
+    mod.widgets.PropRow = mod.widgets.PropRow{ label +: { draw_text +: { color: fab.color_text_dim } } }
+    mod.widgets.PropNumberRow = mod.widgets.PropNumberRow{ label +: { draw_text +: { color: fab.color_text_dim } } }
+    mod.widgets.PropDropDownRow = mod.widgets.PropDropDownRow{ label +: { draw_text +: { color: fab.color_text_dim } } }
+    mod.widgets.PropSegmentedRow = mod.widgets.PropSegmentedRow{ label +: { draw_text +: { color: fab.color_text_dim } } }
+    mod.widgets.PropCheckRow = mod.widgets.PropCheckRow{ label +: { draw_text +: { color: fab.color_text_dim } } }
+
     // Label-left / value-right row.
     mod.widgets.FabPropRow = View{
         width: Fill

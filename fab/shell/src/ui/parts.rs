@@ -387,10 +387,10 @@ script_mod! {
         draw_icon +: {color: fab.color_text_dim}
     }
 
-    // A Transform number row: its label column only as wide as its longest label ("Position X"),
-    // not the sheet's, so the labels sit at the section's edge.
+    // A Transform number row: its label column the Parameters rows' (`param_panel::LABEL_W`), so
+    // the Part panel's fields all start at one line.
     let TransformRow = PropNumberRow{
-        label +: {width: Fill{weight: 0 basis: "42%" max: 56}}
+        label +: {width: Fill{weight: 0 basis: "42%" max: #(crate::ui::param_panel::LABEL_W)}}
     }
 
     mod.widgets.FabPartsPanelBase = #(FabPartsPanel::register_widget(vm))
@@ -407,35 +407,10 @@ script_mod! {
             align: Align{x: 0.0 y: 0.5}
             padding: Inset{left: 8 right: 8 top: 0 bottom: 0}
             spacing: 2
-            FabTip{ text: "Add a shape or import a model"
-                add := mod.widgets.FabDropdownButton{ a11y: {label: "Add"}
-                    tag: @fab_parts_add
-                    owner: @fab_parts_add
-                    height: 26
-                    label +: { text: "Add" }
-                }
-            }
-            // The picked part's features (what the Features panel's bar held).
-            FabTip{ text: "Add a feature: a primitive, a sketch, a modifier on the picked feature, a pattern, a gear, text"
-                add_feature := mod.widgets.FabDropdownButton{ a11y: {label: "Add feature"}
-                    tag: @fab_add_feature
-                    owner: @fab_add_feature
-                    height: 26
-                    label +: { text: "Feature" }
-                }
-            }
-            FabTip{ text: "Cut or join a primitive on the picked node, cut the bottom flat or along a plane"
-                shape := mod.widgets.FabDropdownButton{ a11y: {label: "Shape"}
-                    tag: @fab_shape_edit
-                    owner: @fab_shape_edit
-                    height: 26
-                    label +: { text: "Shape" }
-                }
-            }
-            // narrows the list to the parts whose names hold every word typed
+            // narrows the list to the parts whose names hold every word typed (Add, Feature and
+            // Shape stand in the 3D view's bar)
             filter := mod.widgets.FabSearch{
                 width: Fill{min: 60}
-                margin: Inset{left: 4}
                 row +: { input +: { empty_text: "Filter" a11y: {label: "Filter parts"} } }
             }
         }
@@ -642,54 +617,35 @@ script_mod! {
             padding: Inset{left: theme.prop_pad right: theme.prop_pad}
             // The sections draw in lists of their own: a section records again only when what
             // it shows changed (its setters, or the panel's key of `rest`). The part's name and
-            // size are the parts list's (rename there). Its shape parameters are the Parameters
-            // editor's: while no area shows it, a button at the top brings it forward.
-            View{width: Fill height: Fit flow: Down new_batch: true
-                params_row := View{
-                    visible: false
-                    width: Fill height: Fit flow: Right
-                    padding: Inset{left: 10 right: 6 top: 2 bottom: 6}
-                    FabTip{text: "The part's shape parameters, in the Parameters editor"
-                        show_params := mod.widgets.FabButton{
-                            text: "Parameters" a11y: {label: "Parameters"}
-                            height: theme.prop_row_height padding: Inset{left: 6 right: 8} spacing: 4
-                            icon_walk: Walk{width: 14 height: Fill margin: Inset{top: 3 bottom: 3}}
-                            draw_icon +: {svg: crate_resource("self://resources/icons/shape.svg") color: fab.color_text}
-                        }
-                    }
-                }
-            }
+            // size are the parts list's (rename there).
             rest := View{width: Fill height: Fit flow: Down new_batch: true
                 transform := PropSection{
                     header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/move.svg")}} title +: {text: "Transform"}}}
                     body +: {
-                        xy := PropStack{
-                            x := TransformRow{
-                                label +: {text: "Position X"}
-                                value +: {num +: {a11y: {label: "X"} min: -50.0 max: 400.0 step: 0.5 snap: 5.0 precision: 1 suffix: " mm"}}
-                            }
-                            y := TransformRow{
-                                label +: {text: "Y"}
-                                value +: {num +: {a11y: {label: "Y"} min: -50.0 max: 400.0 step: 0.5 snap: 5.0 precision: 1 suffix: " mm"}}
+                        // X and Y side by side, each its axis inside its field
+                        xy := TransformRow{
+                            label +: {text: "Position"}
+                            value +: {
+                                flow: Right spacing: 4
+                                num +: {a11y: {label: "X"} label: "X" min: -50.0 max: 400.0 step: 0.5 snap: 5.0 precision: 1 suffix: " mm"}
+                                num_y := ValueInput{width: Fill height: Fill min_height: 0 a11y: {label: "Y"} label: "Y" min: -50.0 max: 400.0 step: 0.5 snap: 5.0 precision: 1 suffix: " mm"}
                             }
                         }
-                        rs := View{width: Fill height: Fit flow: Down spacing: theme.prop_row_gap
+                        rs := View{width: Fill height: Fit flow: Down spacing: theme.prop_row_gap margin: Inset{top: theme.prop_row_gap}
                             rot := TransformRow{
                                 label +: {text: "Turn"}
                                 value +: {num +: {a11y: {label: "Turn"} min: -360.0 max: 360.0 step: 1.0 snap: 15.0 precision: 0 suffix: "°"}}
                             }
+                            // X, Y and Z side by side, the proportions lock after them
                             scale := TransformRow{
-                                label +: {text: "Scale X"}
-                                value +: {num +: {a11y: {label: "Scale X"} min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}}
+                                label +: {text: "Scale"}
+                                value +: {
+                                    flow: Right spacing: 4
+                                    num +: {a11y: {label: "Scale X"} label: "X" min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}
+                                    num_y := ValueInput{width: Fill height: Fill min_height: 0 a11y: {label: "Scale Y"} label: "Y" min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}
+                                    num_z := ValueInput{width: Fill height: Fill min_height: 0 a11y: {label: "Scale Z"} label: "Z" min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}
+                                }
                                 trail +: {width: 26 lock := mod.widgets.FabIconCheck{ a11y: {label: "Keep proportions"} width: 24 height: 22 padding: Inset{left: 4 right: 4 top: 3 bottom: 3} draw_icon +: { svg: crate_resource("self://resources/icons/link.svg") } }}
-                            }
-                            scale_y := TransformRow{
-                                label +: {text: "Y"}
-                                value +: {num +: {a11y: {label: "Scale Y"} min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}}
-                            }
-                            scale_z := TransformRow{
-                                label +: {text: "Z"}
-                                value +: {num +: {a11y: {label: "Scale Z"} min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}}
                             }
                         }
                         // The part's actions as a light strip (duplicate and delete are the parts list's menu).
@@ -718,6 +674,12 @@ script_mod! {
                         }
                     }
                 }
+                // The part's shape parameters, then each feature's fields, in groups that fold
+                // ([`crate::ui::param_panel::FabParamPanel`], which was the Parameters editor's).
+                params := PropSection{
+                    header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/shape.svg")}} title +: {text: "Parameters"}}}
+                    body +: {panel := mod.widgets.FabParamPanel{}}
+                }
                 colours := PropSection{
                     header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/palette.svg")}} title +: {text: "Colours"}}}
                     body +: {rows := mod.widgets.FabColorRows{}}
@@ -728,6 +690,41 @@ script_mod! {
                     body +: {list := mod.widgets.FabLabel{width: Fill text: "" draw_text +: {color: fab.color_warning}}}
                 }
             }
+        }
+    }
+}
+
+/// The plate's Add menu (its button stands in the 3D view's bar): new parts (the primitives, an
+/// import, from a picture). The demos are the Plates grid's; what changes a part is Modify's. Handled for the
+/// app (`main`), wherever the button is, so a second 3D view raises no second menu.
+pub fn part_add_menu(cx: &mut Cx, actions: &Actions) {
+    if let Some(anchor) = dropdown_clicked(actions, ADD_MENU) {
+        let items = vec![
+            MenuItem::new(live_id!(add_box), "Box"),
+            MenuItem::new(live_id!(add_cylinder), "Cylinder"),
+            MenuItem::new(live_id!(add_sphere), "Sphere"),
+            MenuItem::new(live_id!(add_cone), "Cone"),
+            MenuItem::new(live_id!(add_torus), "Torus"),
+            MenuItem::sep(),
+            MenuItem::new(live_id!(add_import), "Import STL, 3MF or glTF…").key(&keymap::shortcut(Key::Import)),
+            MenuItem::new(live_id!(add_picture), "Colour picture…"),
+            MenuItem::new(live_id!(add_image), "From image… (AI hub)"),
+        ];
+        open_menu(cx, ADD_MENU, items, anchor, MenuPlace::Below);
+    }
+    if let Some(pick) = menu_picked(actions, ADD_MENU) {
+        let shape = [(live_id!(add_box), "box"), (live_id!(add_cylinder), "cylinder"), (live_id!(add_sphere), "sphere"), (live_id!(add_cone), "cone"), (live_id!(add_torus), "torus")]
+            .iter()
+            .find(|(id, _)| *id == pick)
+            .map(|(_, s)| *s);
+        if let Some(shape) = shape {
+            cx.action(PartAction::Add { shape: shape.into() });
+        } else if pick == live_id!(add_import) {
+            cx.action(ShellAction::ImportDialog);
+        } else if pick == live_id!(add_picture) {
+            cx.action(ShellAction::ColourPictureDialog);
+        } else if pick == live_id!(add_image) {
+            cx.action(ShellAction::ImageToPartDialog);
         }
     }
 }
@@ -1232,52 +1229,6 @@ impl Widget for FabPartsPanel {
                 }
             } else if let Some(state) = scope.data.get::<AppState>() {
                 part_menu_action(cx, state, &self.context_objects, pick);
-            }
-        }
-        if let Some(anchor) = dropdown_clicked(actions, ADD_MENU) {
-            let items = vec![
-                MenuItem::new(live_id!(add_box), "Box"),
-                MenuItem::new(live_id!(add_cylinder), "Cylinder"),
-                MenuItem::new(live_id!(add_sphere), "Sphere"),
-                MenuItem::new(live_id!(add_cone), "Cone"),
-                MenuItem::new(live_id!(add_torus), "Torus"),
-                MenuItem::sep(),
-                // a box over the picked part: none picked, off
-                MenuItem::new(live_id!(add_settings_here), crate::ui::code::SETTINGS_HERE)
-                    .enabled_if(scope.data.get::<AppState>().is_some_and(|state| active_part(state).is_some())),
-                MenuItem::sep(),
-                MenuItem::new(live_id!(add_import), "Import STL, 3MF or glTF…").key(&keymap::shortcut(Key::Import)),
-                MenuItem::new(live_id!(add_picture), "Colour picture…"),
-                MenuItem::new(live_id!(add_image), "From image… (AI hub)"),
-                MenuItem::new(live_id!(add_demo), "Demo bracket"),
-                MenuItem::new(live_id!(add_demo_mount), "Demo motor mount (exact B-rep)"),
-                MenuItem::new(live_id!(add_chain), "Demo chain"),
-                MenuItem::new(live_id!(add_chainmail), "Demo chainmail"),
-                MenuItem::new(live_id!(add_knob), "Demo knurled knob"),
-            ];
-            open_menu(cx, ADD_MENU, items, anchor, MenuPlace::Below);
-        }
-        if let Some(pick) = menu_picked(actions, ADD_MENU) {
-            let shape = [(live_id!(add_box), "box"), (live_id!(add_cylinder), "cylinder"), (live_id!(add_sphere), "sphere"), (live_id!(add_cone), "cone"), (live_id!(add_torus), "torus"), (live_id!(add_chain), "chain"), (live_id!(add_chainmail), "chainmail"), (live_id!(add_knob), "knurled_knob")]
-                .iter()
-                .find(|(id, _)| *id == pick)
-                .map(|(_, s)| *s);
-            if let Some(shape) = shape {
-                cx.action(PartAction::Add { shape: shape.into() });
-            } else if pick == live_id!(add_settings_here) {
-                if let Some(state) = scope.data.get::<AppState>() {
-                    crate::ui::stage::settings_here(cx, state, None);
-                }
-            } else if pick == live_id!(add_import) {
-                cx.action(ShellAction::ImportDialog);
-            } else if pick == live_id!(add_picture) {
-                cx.action(ShellAction::ColourPictureDialog);
-            } else if pick == live_id!(add_image) {
-                cx.action(ShellAction::ImageToPartDialog);
-            } else if pick == live_id!(add_demo) {
-                cx.action(ShellAction::OpenDemo("demo".into()));
-            } else if pick == live_id!(add_demo_mount) {
-                cx.action(ShellAction::OpenDemo("motor_mount".into()));
             }
         }
         if let Some(text) = self.view.text_input(cx, ids!(tools.filter.row.input)).changed(actions) {
@@ -2114,9 +2065,6 @@ impl Widget for FabPartPanel {
             // off screen: none of its controls can be pressed
             return;
         }
-        if self.view.button(cx, ids!(body.show_params)).clicked(actions) {
-            cx.action(crate::ui::shell::ShowPanel(crate::ui::editors::Editor::Parameters));
-        }
         let Some(index) = active_part(state) else { return };
         let p = &state.plate.parts[index];
         let object = &p.object;
@@ -2130,12 +2078,12 @@ impl Widget for FabPartPanel {
         }
         // Its Position is its origin (what its `at` places): it turns and scales about that.
         let o = p.origin;
-        let x = v.value_input(cx, ids!(body.transform.xy.x.value.num));
-        let y = v.value_input(cx, ids!(body.transform.xy.y.value.num));
+        let x = v.value_input(cx, ids!(body.transform.xy.value.num));
+        let y = v.value_input(cx, ids!(body.transform.xy.value.num_y));
         let scales = [
             v.value_input(cx, ids!(body.transform.rs.scale.value.num)),
-            v.value_input(cx, ids!(body.transform.rs.scale_y.value.num)),
-            v.value_input(cx, ids!(body.transform.rs.scale_z.value.num)),
+            v.value_input(cx, ids!(body.transform.rs.scale.value.num_y)),
+            v.value_input(cx, ids!(body.transform.rs.scale.value.num_z)),
         ];
         // While a number scrubs, the part follows through the placement preview.
         let about = mm_to_world([o[0], o[1], p.min_mm[2]]);
@@ -2192,14 +2140,13 @@ impl Widget for FabPartPanel {
             self.view.view(cx, ids!(body)).set_visible(cx, part.is_some());
             if let Some(p) = part {
                 let v = &self.view;
-                v.widget(cx, ids!(body.params_row)).set_visible(cx, !state.ui.on_screen(crate::ui::editors::Editor::Parameters));
                 v.button(cx, ids!(body.transform.buttons.make_printable)).set_visible(cx, p.imported_mesh);
-                v.value_input(cx, ids!(body.transform.xy.x.value.num)).set_value(cx, p.origin[0]);
-                v.value_input(cx, ids!(body.transform.xy.y.value.num)).set_value(cx, p.origin[1]);
+                v.value_input(cx, ids!(body.transform.xy.value.num)).set_value(cx, p.origin[0]);
+                v.value_input(cx, ids!(body.transform.xy.value.num_y)).set_value(cx, p.origin[1]);
                 v.value_input(cx, ids!(body.transform.rs.rot.value.num)).set_value(cx, p.rotate);
                 v.value_input(cx, ids!(body.transform.rs.scale.value.num)).set_value(cx, p.scale[0] * 100.0);
-                v.value_input(cx, ids!(body.transform.rs.scale_y.value.num)).set_value(cx, p.scale[1] * 100.0);
-                v.value_input(cx, ids!(body.transform.rs.scale_z.value.num)).set_value(cx, p.scale[2] * 100.0);
+                v.value_input(cx, ids!(body.transform.rs.scale.value.num_y)).set_value(cx, p.scale[1] * 100.0);
+                v.value_input(cx, ids!(body.transform.rs.scale.value.num_z)).set_value(cx, p.scale[2] * 100.0);
                 let lock = v.radio_button(cx, ids!(body.transform.rs.scale.trail.lock));
                 if lock.active(cx) != state.ui.scale_locked {
                     lock.set_active(cx, state.ui.scale_locked, Animate::No);

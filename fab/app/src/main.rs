@@ -5624,6 +5624,22 @@ impl AppMain for App {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
+        // A rebound shortcut (the Keymap reference): its press is handled as the action's own
+        // chord, and the chord it was moved off answers no more. Not while typing, nor while the
+        // reference listens for a new chord.
+        if let Event::KeyDown(ke) | Event::KeyUp(ke) = event {
+            if !cx.key_focus_takes_text() && !fab::ui::keymap::capturing() {
+                match fab::ui::keymap::remap(ke) {
+                    fab::ui::keymap::Remap::Pass => {}
+                    fab::ui::keymap::Remap::Swallow => return,
+                    fab::ui::keymap::Remap::As(as_pressed) => {
+                        let again = if matches!(event, Event::KeyDown(_)) { Event::KeyDown(as_pressed) } else { Event::KeyUp(as_pressed) };
+                        self.handle_event(cx, &again);
+                        return;
+                    }
+                }
+            }
+        }
         self.state.drain_released_panes();
         self.hand.event(event);
         // Stop before widget dispatch: typing may still be an uncommitted draft, and a
@@ -5767,6 +5783,12 @@ impl AppMain for App {
         if let Event::Startup | Event::WindowGotFocus(_) = event {
             fab::theme::follow_host_appearance(cx);
         }
+        // A mouse drag never scrolls a list or a panel (the wheel, the trackpad and the bar do):
+        // a drag in Fab moves a section, folds headers, drags a value or a part. A touch still
+        // scrolls.
+        if let Event::Startup = event {
+            cx.set_mouse_drag_scrolling(false);
+        }
         if !self.started {
             if let Event::Startup | Event::Draw(_) = event {
                 self.started = true;
@@ -5826,8 +5848,9 @@ impl AppMain for App {
             makepad_ai_services::engine::local_model::stop_hub_find();
             makepad_csg_math::shutdown();
         }
+        // (while the Keymap reference listens for a new chord, a press is that chord, not a shortcut)
         if let Event::KeyDown(ke) = event {
-            if self.global_key(cx, ke) {
+            if !fab::ui::keymap::capturing() && self.global_key(cx, ke) {
                 return;
             }
         }

@@ -91,17 +91,10 @@ script_mod! {
         text := mod.widgets.FabLabelSmall{ margin: Inset{left: 6} text: "" draw_text +: { color: fab.color_text } }
     }
 
-    let PrintRow = View{
-        width: Fill
-        height: 24
-        flow: Right
-        align: Align{x: 0.0 y: 0.5}
-        spacing: 8
-        name := mod.widgets.FabLabelDim{ width: 72 text: "" max_lines: 1 }
-    }
+    let PrintRow = mod.widgets.FabFieldRow{}
     let Pick = mod.widgets.FabDropdownButton{
         width: Fill
-        height: 24
+        height: theme.prop_row_height
         label +: { width: Fill max_lines: 1 text_overflow: TextOverflow.Ellipsis text: "—" }
     }
 
@@ -112,41 +105,63 @@ script_mod! {
         flow: Down
         show_bg: true
         draw_bg +: { color: fab.color_editor }
+        // the toolbar: the area's editor selector (and this editor's tools, when it has any)
+        editor_bar := mod.widgets.FabEditorBar{
+            // filters the rows below by name (a section's title shows it whole)
+            search := mod.widgets.FabSearch{width: Fill{min: 80} row +: {input +: {empty_text: "Filter"}}}
+        }
+        // the job's settings as the Part editor's: sections that fold, each a bar with its glyph
         body := mod.widgets.FabScroll{
-            profile := mod.widgets.FabGroup{
-                mod.widgets.FabGroupTitle{ text: "PROFILE" }
-                source_row := PrintRow{ name +: {text: "Profiles"}
-                    source := Pick{ tag: @print_source owner: @print_source }
-                }
-                machine_row := PrintRow{ name +: {text: "Printer"}
-                    machine := Pick{ tag: @print_machine owner: @print_machine }
-                }
-                plate_row := PrintRow{ name +: {text: "Plate"}
-                    plate := Pick{ tag: @print_plate owner: @print_plate }
-                }
-                process_row := PrintRow{ name +: {text: "Process"}
-                    process := Pick{ tag: @print_process owner: @print_process }
-                }
-            }
-            colours := mod.widgets.FabGroup{
-                mod.widgets.FabGroupTitle{ text: "COLOURS" }
-                map := mod.widgets.FabColorMap{}
-                note := mod.widgets.FabLabelSmall{ width: Fill text: "" }
-            }
-            slice := mod.widgets.FabGroup{
-                mod.widgets.FabGroupTitle{ text: "SLICE" }
-                status_row := View{
-                    width: Fill height: Fit flow: Down spacing: 6
-                    progress := mod.widgets.FabProgress{ width: Fill visible: false }
-                    status := mod.widgets.FabLabel{ width: Fill text: "Not sliced yet." }
-                }
-                actions := View{
-                    width: Fill height: Fit flow: Right spacing: 6
-                    FabTip{ text: "Write the sliced plate as a printer package"
-                        export := mod.widgets.FabButton{ text: "Export…" }
+            padding: Inset{left: theme.prop_pad right: theme.prop_pad}
+            // its slot: the box the section moves in when dragged by its grip (`section_reorder`)
+            profile_slot := View{width: Fill height: Fit
+                profile := PropSection{
+                    header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/gear.svg")}} title +: {text: "Profile"}}}
+                    body +: {
+                        source_row := PrintRow{ name +: {text: "Profiles"}
+                            source := Pick{ tag: @print_source owner: @print_source }
+                        }
+                        machine_row := PrintRow{ name +: {text: "Printer"}
+                            machine := Pick{ tag: @print_machine owner: @print_machine }
+                        }
+                        plate_row := PrintRow{ name +: {text: "Plate"}
+                            plate := Pick{ tag: @print_plate owner: @print_plate }
+                        }
+                        process_row := PrintRow{ name +: {text: "Process"}
+                            process := Pick{ tag: @print_process owner: @print_process }
+                        }
                     }
                 }
-                summary := mod.widgets.FabLabelSmall{ width: Fill text: "" }
+            }
+            // its slot: the box the section moves in when dragged by its grip (`section_reorder`)
+            colours_slot := View{width: Fill height: Fit
+                colours := PropSection{
+                    header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/palette.svg")}} title +: {text: "Colours"}}}
+                    body +: {
+                        map := mod.widgets.FabColorMap{}
+                        note := mod.widgets.FabLabelSmall{ width: Fill text: "" }
+                    }
+                }
+            }
+            // its slot: the box the section moves in when dragged by its grip (`section_reorder`)
+            slice_slot := View{width: Fill height: Fit
+                slice := PropSection{
+                    header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/layers.svg")}} title +: {text: "Slice"}}}
+                    body +: {
+                        status_row := View{
+                            width: Fill height: Fit flow: Down spacing: 6
+                            progress := mod.widgets.FabProgress{ width: Fill visible: false }
+                            status := mod.widgets.FabLabel{ width: Fill text: "Not sliced yet." }
+                        }
+                        actions := View{
+                            width: Fill height: Fit flow: Right spacing: 6
+                            FabTip{ text: "Write the sliced plate as a printer package"
+                                export := mod.widgets.FabButton{ text: "Export…" }
+                            }
+                        }
+                        summary := mod.widgets.FabLabelSmall{ width: Fill text: "" }
+                    }
+                }
             }
         }
     }
@@ -158,6 +173,8 @@ script_mod! {
         flow: Down
         show_bg: true
         draw_bg +: { color: fab.color_editor }
+        // the toolbar: the area's editor selector (and this editor's tools, when it has any)
+        editor_bar := mod.widgets.FabEditorBar{}
         body := mod.widgets.FabScroll{
             padding: Inset{left: 10 right: 10 top: 10 bottom: 10}
             spacing: 10
@@ -567,6 +584,23 @@ impl Widget for FabSettingsPanel {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if let Event::Actions(actions) = event {
+            if self.view.text_input(cx, ids!(editor_bar.search.row.input)).changed(actions).is_some() {
+                self.view.redraw(cx);
+            }
+        }
+        // a section held by its grip moves with the pointer, the others sliding aside
+        // (`section_reorder`): first, and with its animation's frames too
+        if matches!(event, Event::MouseDown(_) | Event::MouseMove(_) | Event::MouseUp(_) | Event::NextFrame(_)) {
+            let order: Vec<(LiveId, WidgetRef, WidgetRef)> = [(live_id!(profile_slot), live_id!(profile)), (live_id!(colours_slot), live_id!(colours)), (live_id!(slice_slot), live_id!(slice))]
+                .into_iter().map(|(slot, id)| (slot, self.view.widget(cx, &[id]), self.view.widget(cx, &[slot]))).collect();
+            crate::ui::widgets::section_reorder(cx, event, live_id!(job_sections), &order, self.view.area());
+        }
+        // the sections' headers first (their hover, and a drag across them folding them all)
+        if matches!(event, Event::MouseMove(_) | Event::MouseDown(_) | Event::MouseUp(_) | Event::MouseLeave(_) | Event::ClearHover) {
+            let sections = [ids!(profile), ids!(colours), ids!(slice)].map(|path| self.view.widget(cx, path));
+            crate::ui::widgets::section_headers(cx, event, &sections);
+        }
         self.view.handle_event(cx, event, scope);
         let Event::Actions(actions) = event else { return };
         let Some(state) = scope.data.get::<AppState>() else { return };
@@ -586,9 +620,16 @@ impl Widget for FabSettingsPanel {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        // the sections in the order they were dragged into
+        let body = self.view.widget(cx, ids!(body));
+        crate::ui::widgets::apply_section_order(cx, live_id!(job_sections), &body);
         if let Some(state) = scope.data.get::<AppState>() {
             self.sync(cx, state);
         }
+        // the toolbar's search filters the sections' rows (`filter_sections`)
+        let query = self.view.text_input(cx, ids!(editor_bar.search.row.input)).text();
+        let sections = [ids!(profile), ids!(colours), ids!(slice)].map(|path| self.view.widget(cx, path));
+        crate::ui::widgets::filter_sections(cx, live_id!(job_sections), &query, &sections);
         self.view.draw_walk(cx, scope, walk)
     }
 }

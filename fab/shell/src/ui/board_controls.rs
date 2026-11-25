@@ -14,8 +14,10 @@ script_mod! {
     mod.widgets.FabBoardControlsPanelBase = #(FabBoardControlsPanel::register_widget(vm))
     mod.widgets.FabBoardControlsPanel = set_type_default() do mod.widgets.FabBoardControlsPanelBase{
         width: Fill height: Fill flow: Down
-        padding: Inset{left: theme.prop_pad right: theme.prop_pad top: 6 bottom: 6}
+        padding: Inset{left: theme.prop_pad right: theme.prop_pad top: 0 bottom: 6}
         show_bg: true draw_bg +: { color: fab.color_editor }
+        // the toolbar: the area's editor selector, across the panel's side insets
+        editor_bar := mod.widgets.FabEditorBar{margin: Inset{left: 0.0 - theme.prop_pad right: 0.0 - theme.prop_pad}}
         body := View{
             width: Fill height: Fill flow: Down
             panel := mod.widgets.ControlsPanel{height: Fill radius: fab.radius radius_lg: fab.radius_lg}

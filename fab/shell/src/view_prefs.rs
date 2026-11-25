@@ -175,6 +175,16 @@ pub fn save_scan(on: bool) {
     save("scan", if on { "1" } else { "0" });
 }
 
+/// The keymap's rebindings: each rebound action's name (`ShortcutId`) and its chord, as typed
+/// into the Keymap reference.
+pub fn load_keymap() -> Vec<(String, String)> {
+    load("keymap").and_then(|line| DeJson::deserialize_json_strict(&line).ok()).unwrap_or_default()
+}
+
+pub fn save_keymap(pairs: &[(String, String)]) {
+    save("keymap", &pairs.serialize_json());
+}
+
 /// The workspaces' file beside this one ([`crate::workspaces::Workspaces::load`]); none where
 /// nothing is kept (the web, a lane's test instance, a unit test without its own file).
 pub fn workspaces_path() -> Option<PathBuf> {

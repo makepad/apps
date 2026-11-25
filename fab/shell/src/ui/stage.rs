@@ -45,13 +45,13 @@ const CONTEXT_MENU: LiveId = live_id!(fab_stage_context);
 /// The navigation gizmo's row's top inset; Mechanics adds its header strip's height, the other
 /// modes the top toolbar's.
 const NAV_TOP: f64 = 6.0;
-/// The top toolbar row's top padding (`render_row`) and its bar's height (24-point controls in a
-/// card padded 2).
-const RENDER_ROW_TOP: f64 = 10.0;
-const RENDER_ROW_H: f64 = 28.0;
-/// One row of Mechanics' header strip (a tab bar's height), and the gap under the strip before
+/// The top toolbar's top inset (`render_row`: none, it is the view's toolbar) and its height (an
+/// editor toolbar's).
+const RENDER_ROW_TOP: f64 = 0.0;
+const RENDER_ROW_H: f64 = crate::ui::area_notch::TOOLBAR_H;
+/// One row of Mechanics' header strip (a toolbar's height), and the gap under the strip before
 /// Mechanics' tools.
-const MECH_STRIP_ROW: f64 = 28.0;
+const MECH_STRIP_ROW: f64 = crate::ui::area_notch::TOOLBAR_H;
 const MECH_TOOLS_GAP: f64 = 12.0;
 const PANE_LABEL_LEFT: f64 = 56.0;
 const PANE_LABEL_PAD: f64 = 10.0;
@@ -86,9 +86,27 @@ script_mod! {
         label := mod.widgets.FabLabelSmall{ text: "" }
     }
     let Tool = mod.widgets.FabTool{}
+    // A render mode, styled as the panels' tabs: no face, its name half-lit at rest and lit
+    // under the pointer, the chosen one in the full ink over an accent underline.
     let RenderSegment = mod.widgets.FabSegmentTab{
         height: 24
         padding: Inset{left: 10 right: 10 top: 0 bottom: 0}
+        draw_bg +: {
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                sdf.box(6.0, self.rect_size.y - 2.0, self.rect_size.x - 12.0, 2.0, 0.5)
+                sdf.fill(vec4(fab.color_accent.xyz, fab.color_accent.w * self.active))
+                return sdf.result
+            }
+        }
+        draw_text +: {
+            color: mix(fab.color_text_dim, fab.color_text, 0.5)
+            color_hover: fab.color_text
+            color_down: fab.color_text
+            color_active: fab.color_text_active
+            // (the one just clicked keeps the keyboard: it reads as chosen, not as rest)
+            color_focus: fab.color_text_active
+        }
     }
     // A toggle of the view bar, as tall as the render switch's segments.
     let ViewToggle = mod.widgets.FabIconCheck{
@@ -136,8 +154,8 @@ script_mod! {
                 height: Fill
                 flow: Right
                 spacing: 4
-                // under the area's nub in the corner
-                padding: Inset{left: 10 top: 40}
+                // under the view's toolbar, a gap clear of it
+                padding: Inset{left: 10 top: #(crate::ui::area_notch::TOOLBAR_H + 10.0)}
                 // The rail and the shape bar draw in lists of their own: the view redrawing
                 // (each step of a drag) reuses them. What they show is set as the stage draws.
                 tools := Float{
@@ -461,12 +479,13 @@ script_mod! {
                             width: Fill height: Fit padding: Inset{left: 4 right: 2 bottom: 4}
                             job_bar := mod.widgets.FabJobTimeline{}
                         }
+                        // Two rows: the transport and its scrubber (to the start of the layer,
+                        // play, to its end, the speed, then the scrubber taking the rest), then
+                        // the time and what is printing there.
                         row := View{
                             width: Fill height: Fit flow: Down spacing: 4
-                            // The transport wraps when the view is narrow; the scrubber has its own
-                            // line, so it always keeps the bar's width.
                             transport := View{
-                                width: Fill height: Fit flow: Right{wrap: true} align: Align{y: 0.5} spacing: 4
+                                width: Fill height: Fit flow: Right align: Align{y: 0.5} spacing: 4
                                 FabTip{ text: "Back to the start of the layer"
                                     to_start := mod.widgets.FabIconButton{ a11y: {label: "Start of layer"} width: 28 height: 28 padding: Inset{left: 7 right: 7 top: 7 bottom: 7} draw_icon +: { svg: crate_resource("self://resources/icons/skip_back.svg") } }
                                 }
@@ -482,14 +501,20 @@ script_mod! {
                                 FabTip{ text: "Playback speed"
                                     speed := mod.widgets.FabDropdownButton{ tag: @fab_stage_speed owner: @fab_stage_speed label +: { text: "60×" } }
                                 }
-                                time_label := mod.widgets.FabLabelSmall{ width: Fit margin: Inset{left: 6} text: "" }
+                                time_scrub := mod.widgets.FabMoveSlider{ width: Fill margin: Inset{left: 6 right: 6} }
                             }
-                            time_scrub := mod.widgets.FabMoveSlider{ margin: Inset{left: 6 right: 6} }
-                        }
-                        info := View{
-                            width: Fill height: Fit flow: Right{wrap: true} spacing: 12 padding: Inset{left: 4}
-                            layer_label := mod.widgets.FabLabel{ width: Fill flow: Right{wrap: true} text: "" }
-                            now := mod.widgets.FabLabelSmall{ width: Fit text: "" }
+                            // what prints there (it wraps on a narrow view), then, apart by a rule at
+                            // the right end, the time
+                            meta := View{
+                                width: Fill height: Fit flow: Right align: Align{y: 0.5} spacing: 12 padding: Inset{left: 4 right: 6}
+                                info := View{
+                                    width: Fill height: Fit flow: Right{wrap: true} align: Align{y: 0.5} spacing: 12
+                                    layer_label := mod.widgets.FabLabel{ width: Fit text: "" }
+                                    now := mod.widgets.FabLabelSmall{ width: Fit text: "" }
+                                }
+                                time_rule := mod.widgets.FabVRule{ height: 14 }
+                                time_label := mod.widgets.FabLabelSmall{ width: Fit text: "" }
+                            }
                         }
                     }
                 }
@@ -547,68 +572,29 @@ script_mod! {
             width: Fill
             height: Fit
             flow: Down
-            align: Align{x: 0.5}
-            // clear of the area's nub in the corner (38 wide) on both sides, so the switch stays
-            // centred
-            padding: Inset{top: 10 left: 48 right: 48}
-            // The switch in the middle, the plate's mode left of it and the view bar right of it:
-            // the two sides share the width alike, so the switch stays where it is whatever they
-            // hold. A held job keeps only the mode (it has no other look); Mechanics has its own
-            // bar, which starts with the mode.
-            modes_row := View{
-                width: Fill
-                height: Fit
-                flow: Right
-                align: Align{y: 0.5}
-                mode_side := View{
-                    width: Fill
-                    height: Fit
-                    flow: Right
-                    align: Align{x: 1.0 y: 0.5}
-                    // What makes and changes parts: Add (a new part) and Modify (the selected part's
-                    // features and shape edits). Handled for the app (`main`).
-                    create_card := Float{
-                        flow: Right
-                        margin: Inset{right: 6}
-                        padding: 2
-                        spacing: 1
-                        FabTip{ text: "Add a shape or import a model"
-                            add := mod.widgets.FabDropdownButton{ a11y: {label: "Add"}
-                                tag: @fab_parts_add
-                                owner: @fab_parts_add
-                                height: 24
-                                label +: { text: "Add" }
-                            }
-                        }
-                        FabTip{ text: "Change the selected part: add a feature, cut away or join a primitive, cut it flat or along a plane, split it"
-                            modify := mod.widgets.FabDropdownButton{ a11y: {label: "Modify"}
-                                tag: @fab_modify
-                                owner: @fab_modify
-                                height: 24
-                                label +: { text: "Modify" }
-                            }
-                        }
-                    }
-                    mode_card := Float{
-                        flow: Right
-                        margin: Inset{right: 6}
-                        padding: 2
-                        FabTip{ text: "What the plate is for: Design edits it, Mechanics runs it in a physics sim, Monitor shows the printer's job. It stays as it is across workspaces."
-                            plate_mode := mod.widgets.FabDropdownButton{
-                                height: 24
-                                a11y: {label: "Plate mode"}
-                                tag: @fab_plate_mode
-                                owner: @fab_plate_mode
-                                label +: { text: "Design" }
-                            }
+            // The plate view's toolbar, as every editor's: the area's editor selector (the notch
+            // layer draws it at the bar's left end), then the plate's mode with the render mode
+            // beside it (as tabs), what makes and changes parts, and what the view shows, in
+            // groups apart by rules.
+            // A held job keeps only the mode (it has no other look); Mechanics has its own bar.
+            modes_row := mod.widgets.FabEditorBar{
+                // a solid bar over the view (the toolbar's foot line as every one's)
+                draw_bg +: { color: uniform(fab.color_editor) }
+                mode_card := View{
+                    width: Fit height: Fit flow: Right align: Align{y: 0.5}
+                    FabTip{ text: "What the plate is for: Design edits it, Mechanics runs it in a physics sim, Monitor shows the printer's job. It stays as it is across workspaces."
+                        plate_mode := mod.widgets.FabDropdownButton{
+                            height: 24
+                            a11y: {label: "Plate mode"}
+                            tag: @fab_plate_mode
+                            owner: @fab_plate_mode
+                            label +: { text: "Design" }
                         }
                     }
                 }
-                render_modes := Float{
+                render_modes := View{
                     a11y: {role: "radio_group" label: "Render mode"}
-                    flow: Right
-                    padding: 2
-                    spacing: 1
+                    width: Fit height: Fit flow: Right align: Align{y: 0.5} spacing: 1
                     normal_tip := FabTip{ text: #(format!("The parts, in the look View › Shading sets ({})", keymap::shortcut(Key::SliceView)))
                         rm_normal := RenderSegment{ text: "Normal" }
                     }
@@ -619,42 +605,61 @@ script_mod! {
                         rm_force := RenderSegment{ text: "Force" }
                     }
                 }
-                bar_side := View{
-                    width: Fill
-                    height: Fit
-                    flow: Right
-                    // What the view shows in this mode: the View menu's toggles, with its keys.
-                    view_bar := Float{
-                        a11y: {role: "toolbar" label: "View"}
-                        flow: Right
-                        margin: Inset{left: 6}
-                        padding: 2
-                        spacing: 1
-                        // the projection, in every mode (on: orthographic)
-                        FabTip{ text: #(keymap::tooltip(Key::Ortho))
-                            ortho := ViewToggle{ a11y: {label: "Orthographic"} draw_icon +: { svg: crate_resource("self://resources/icons/ortho.svg") } }
+                create_rule := mod.widgets.FabVRule{}
+                // What makes and changes parts: Add (a new part) and Modify (the selected part's
+                // features and shape edits). Handled for the app (`main`).
+                create_card := View{
+                    width: Fit height: Fit flow: Right align: Align{y: 0.5} spacing: 1
+                    FabTip{ text: "Add a shape or import a model"
+                        add := mod.widgets.FabDropdownButton{ a11y: {label: "Add"}
+                            tag: @fab_parts_add
+                            owner: @fab_parts_add
+                            height: 24
+                            label +: { text: "Add" }
                         }
-                        // the whole plate back in view, in every mode
-                        FabTip{ text: #(keymap::tooltip(Key::FrameAll))
-                            frame_all := ViewButton{ a11y: {label: "Frame plate"} draw_icon +: { svg: crate_resource("self://resources/icons/fit.svg") } }
+                    }
+                    FabTip{ text: "Change the selected part: add a feature, cut away or join a primitive, cut it flat or along a plane, split it"
+                        modify := mod.widgets.FabDropdownButton{ a11y: {label: "Modify"}
+                            tag: @fab_modify
+                            owner: @fab_modify
+                            height: 24
+                            label +: { text: "Modify" }
                         }
-                        FabTip{ text: "Arrange every part on the plate"
-                            arrange_all := ViewButton{ a11y: {label: "Arrange plate"} draw_icon +: { svg: crate_resource("self://resources/icons/arrange.svg") } }
-                        }
-                        // Sliced: what the slice shows
-                        supports_tip := FabTip{ text: #(keymap::tooltip(Key::ShowSupports))
-                            show_supports := ViewToggle{ a11y: {label: "Show supports"} draw_icon +: { svg: crate_resource("self://resources/icons/supports.svg") } }
-                        }
-                        travel_tip := FabTip{ text: "Show travel"
-                            show_travel := ViewToggle{ a11y: {label: "Show travel"} draw_icon +: { svg: crate_resource("self://resources/icons/travel.svg") } }
-                        }
-                        parts_tip := FabTip{ text: "Show parts under the toolpaths"
-                            show_parts := ViewToggle{ a11y: {label: "Show parts"} draw_icon +: { svg: crate_resource("self://resources/icons/cube.svg") } }
-                        }
-                        // a project with a board: the board in place, never printed
-                        board_tip := FabTip{ text: "Show the circuit board in place: it is never printed or sliced"
-                            show_board := ViewToggle{ a11y: {label: "Show board"} draw_icon +: { svg: crate_resource("self://resources/icons/board.svg") } }
-                        }
+                    }
+                }
+                view_rule := mod.widgets.FabVRule{}
+                // What the view shows in this mode: the View menu's toggles, with its keys.
+                view_bar := View{
+                    a11y: {role: "toolbar" label: "View"}
+                    width: Fit height: Fit flow: Right align: Align{y: 0.5} spacing: 1
+                    // the view's tool rails, on or off (its area menu's Tools)
+                    FabTip{ text: "Show the tool rails at the view's left"
+                        show_tools := ViewToggle{ a11y: {label: "Tools"} draw_icon +: { svg: crate_resource("self://resources/icons/select.svg") } }
+                    }
+                    // the projection, in every mode (on: orthographic)
+                    FabTip{ text: #(keymap::tooltip(Key::Ortho))
+                        ortho := ViewToggle{ a11y: {label: "Orthographic"} draw_icon +: { svg: crate_resource("self://resources/icons/ortho.svg") } }
+                    }
+                    // the whole plate back in view, in every mode
+                    FabTip{ text: #(keymap::tooltip(Key::FrameAll))
+                        frame_all := ViewButton{ a11y: {label: "Frame plate"} draw_icon +: { svg: crate_resource("self://resources/icons/fit.svg") } }
+                    }
+                    FabTip{ text: "Arrange every part on the plate"
+                        arrange_all := ViewButton{ a11y: {label: "Arrange plate"} draw_icon +: { svg: crate_resource("self://resources/icons/arrange.svg") } }
+                    }
+                    // Sliced: what the slice shows
+                    supports_tip := FabTip{ text: #(keymap::tooltip(Key::ShowSupports))
+                        show_supports := ViewToggle{ a11y: {label: "Show supports"} draw_icon +: { svg: crate_resource("self://resources/icons/supports.svg") } }
+                    }
+                    travel_tip := FabTip{ text: "Show travel"
+                        show_travel := ViewToggle{ a11y: {label: "Show travel"} draw_icon +: { svg: crate_resource("self://resources/icons/travel.svg") } }
+                    }
+                    parts_tip := FabTip{ text: "Show parts under the toolpaths"
+                        show_parts := ViewToggle{ a11y: {label: "Show parts"} draw_icon +: { svg: crate_resource("self://resources/icons/cube.svg") } }
+                    }
+                    // a project with a board: the board in place, never printed
+                    board_tip := FabTip{ text: "Show the circuit board in place: it is never printed or sliced"
+                        show_board := ViewToggle{ a11y: {label: "Show board"} draw_icon +: { svg: crate_resource("self://resources/icons/board.svg") } }
                     }
                 }
             }
@@ -1079,10 +1084,15 @@ impl FabStage {
         }
     }
 
-    /// The two rail containers keep their visibility as the plate mode switches their parents.
+    /// The two rail containers keep their visibility as the plate mode switches their parents;
+    /// the toolbar's Tools toggle says which.
     pub fn set_tools_shown(&mut self, cx: &mut Cx, shown: bool) {
         self.view.view(cx, ids!(model_ui.left)).set_visible(cx, shown);
         self.view.view(cx, ids!(mechanics_ui.left)).set_visible(cx, shown);
+        let toggle = self.view.radio_button(cx, ids!(render_row.view_bar.show_tools));
+        if toggle.active(cx) != shown {
+            toggle.set_active(cx, shown, Animate::No);
+        }
     }
 
     /// Its Plate left the screen: its panes let go of the scene host, so the Plate on screen
@@ -1967,6 +1977,10 @@ impl Widget for FabStage {
                 v.view(cx, ids!(render_row.render_modes)).set_visible(cx, looks);
                 v.view(cx, ids!(render_row.create_card)).set_visible(cx, looks);
                 v.view(cx, ids!(render_row.view_bar)).set_visible(cx, looks);
+                // a group's rule goes with it (a held job's bar holds only the mode)
+                for rule in [ids!(render_row.create_rule), ids!(render_row.view_rule)] {
+                    v.widget(cx, rule).set_visible(cx, looks);
+                }
                 v.view(cx, ids!(slice_ui)).set_visible(cx, slice && lead);
                 v.view(cx, ids!(slice_ui.resin_ui)).set_visible(cx, resin);
                 // Monitor stopped following the resin job when the layers moved by hand

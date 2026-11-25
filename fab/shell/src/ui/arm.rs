@@ -44,6 +44,8 @@ script_mod! {
         flow: Down
         show_bg: true
         draw_bg +: { color: fab.color_editor }
+        // the toolbar: the area's editor selector (and this editor's tools, when it has any)
+        editor_bar := mod.widgets.FabEditorBar{}
         body := mod.widgets.FabScroll{
             flow: Down padding: 10 spacing: 6
             WrappedDim{ text: "Experimental. Arms build metal and trim it, or print plastic, in a virtual cell whose arms are softer and heavier than their models; the live loop corrects them from the tracker, the melt pool and the scans." }

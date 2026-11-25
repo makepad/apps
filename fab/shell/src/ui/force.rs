@@ -38,6 +38,8 @@ script_mod! {
         flow: Down
         show_bg: true
         draw_bg +: { color: fab.color_editor }
+        // the toolbar: the area's editor selector (and this editor's tools, when it has any)
+        editor_bar := mod.widgets.FabEditorBar{}
         body := mod.widgets.FabScroll{
             flow: Down padding: 10 spacing: 6
             // the part and what it prints in, or why there is none; the link opens the Job tab's

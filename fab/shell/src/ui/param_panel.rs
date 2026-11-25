@@ -47,6 +47,8 @@ script_mod! {
         // A group sits on its section's card, its title under the section's title (past the
         // section's icon); its rows and the next group's title follow on the row rhythm.
         Group := PropSection{
+            // the model's groups, in the model's order: no grip to move them
+            grip: false
             // out over the enclosing section's inset, so its rows start and end where the Part's
             // other rows do (and its title where theirs is)
             margin: Inset{left: 0.0 - theme.prop_pad right: 0.0 - theme.prop_pad}
@@ -56,7 +58,8 @@ script_mod! {
             header +: {hdr +: {margin: Inset{left: theme.prop_pad + theme.prop_icon_size + theme.prop_label_gap} padding: Inset{left: theme.prop_label_gap right: theme.prop_pad}}}
             body: View{
                 width: Fill height: Fit flow: Down
-                padding: Inset{top: 0 bottom: theme.prop_row_gap}
+                // room above and below the rows (a step less than a section's: it is nested)
+                padding: Inset{top: 4 bottom: 6}
                 // (no inset of its own: its rows line up with the Part's other rows)
                 content := View{width: Fill height: Fit flow: Down spacing: theme.prop_row_gap margin: Inset{}}
             }

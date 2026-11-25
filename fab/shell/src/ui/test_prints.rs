@@ -201,9 +201,14 @@ script_mod! {
     }
 
     // The Test prints editor: the list, its "+ Test cube" and the picked one's fields, scrolled.
-    mod.widgets.FabTestPrintsPanel = mod.widgets.FabScroll{
+    mod.widgets.FabTestPrintsPanel = View{
+        width: Fill height: Fill flow: Down
         show_bg: true draw_bg +: { color: fab.color_editor }
-        tests := mod.widgets.FabTestPrints{}
+        // the toolbar: the area's editor selector; the tests scroll under it
+        editor_bar := mod.widgets.FabEditorBar{}
+        body := mod.widgets.FabScroll{
+            tests := mod.widgets.FabTestPrints{}
+        }
     }
 }
 

@@ -18,6 +18,8 @@ script_mod! {
     mod.widgets.FabPaintPanel = set_type_default() do mod.widgets.FabPaintPanelBase{
         width: Fill height: Fill flow: Down
         show_bg: true draw_bg +: { color: fab.color_editor }
+        // the toolbar: the area's editor selector (and this editor's tools, when it has any)
+        editor_bar := mod.widgets.FabEditorBar{}
         body := mod.widgets.FabScroll{
             padding: Inset{left: theme.prop_pad right: theme.prop_pad top: 6 bottom: 6}
             mod.widgets.FabLabel{

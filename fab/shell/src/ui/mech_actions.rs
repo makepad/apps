@@ -25,7 +25,8 @@ script_mod! {
         independent: true
         width: 28 height: 24 padding: Inset{left: 6 right: 6 top: 4 bottom: 4}
     }
-    let Rule = View{ width: 1 height: 16 margin: Inset{left: 4 right: 4} show_bg: true draw_bg +: { color: fab.color_border_light } }
+    // a run's rule: the toolbars' (a plain View's quad draws nothing of itself)
+    let Rule = mod.widgets.FabVRule{ margin: Inset{left: 5 right: 5} }
     // A run of the bar's controls that stays together: a narrow view wraps the bar between runs
     // (`FabMechActions::arrange`), and inside one only when the run alone is wider than the view.
     // Each run after the first leads with a rule, shown unless the run starts a row.
@@ -37,26 +38,26 @@ script_mod! {
         height: Fill
         flow: Down
         align: Align{x: 0.5 y: 0.0}
-        // The header strip: a tab bar's ground and rule across the area's top, its left end the
-        // area's nub (`STRIP_LEFT`), each row as tall as a tab bar.
+        // The header strip: the plate view's toolbar in Mechanics, as every editor's (the
+        // panel's ground, a toolbar's height a row): its left end the area's editor selector
+        // (the notch layer draws it there) and a rule (`STRIP_LEFT`), then the bar.
         strip := View{
-            width: Fill height: Fit flow: Right
+            width: Fill height: Fit flow: Right align: Align{y: 0.5}
             cursor: MouseCursor.Default
-            padding: Inset{left: 44 right: 8}
+            padding: Inset{left: #(crate::ui::area_notch::TOOLBAR_SLOT) right: #(crate::ui::area_notch::TOOLBAR_END)}
+            spacing: 6
             show_bg: true
+            // the panel's ground, and the toolbars' subtle foot line
             draw_bg +: {
                 pixel: fn() {
-                    let sdf = Sdf2d.viewport(self.pos * self.rect_size)
-                    sdf.rect(0.0, 0.0, self.rect_size.x, self.rect_size.y)
-                    sdf.fill(fab.color_header)
-                    sdf.rect(0.0, self.rect_size.y - 1.0, self.rect_size.x, 1.0)
-                    sdf.fill(fab.color_border)
-                    return sdf.result
+                    let foot = step(self.rect_size.y - 1.0, self.pos.y * self.rect_size.y) * 0.15
+                    return vec4(fab.color_editor.xyz * (1.0 - foot), 1.0)
                 }
             }
+            selector_rule := mod.widgets.FabVRule{}
             bar := View{
                 width: Fit height: Fit flow: Right align: Align{y: 0.5}
-                padding: Inset{top: 2 bottom: 2 left: 0 right: 0} spacing: 1
+                padding: Inset{top: 8 bottom: 8 left: 0 right: 0} spacing: 1
                 a11y: {role: "toolbar" label: "Mechanics actions"}
                 // the plate's mode, where the plate's own row has it in the other modes
                 run_mode := Run{
@@ -168,13 +169,14 @@ fn runs() -> [&'static [LiveId]; 4] {
     [ids!(bar.run_mode), ids!(bar.run_parts), ids!(bar.run_scene), ids!(bar.run_play)]
 }
 
-/// What a run's leading rule takes: the rule (1) with its margins (4 + 4) and the run's spacing (1).
-const RULE_W: f64 = 10.0;
+/// What a run's leading rule takes: the rule (1) with its margins (5 + 5) and the run's spacing (1).
+const RULE_W: f64 = 12.0;
 /// The gap between the bar's runs.
 const RUN_GAP: f64 = 1.0;
-/// What the strip keeps clear: the area's nub at its left end, and a margin at its right.
-const STRIP_LEFT: f64 = 44.0;
-const STRIP_RIGHT: f64 = 8.0;
+/// What the strip keeps clear: the area's selector at its left end with its rule and gap, and a
+/// margin at its right.
+const STRIP_LEFT: f64 = crate::ui::area_notch::TOOLBAR_SLOT + 1.0 + 6.0;
+const STRIP_RIGHT: f64 = crate::ui::area_notch::TOOLBAR_END;
 
 /// How runs of `widths` (rules not counted) fill rows of `room` in order, each run after a row's
 /// first adding its rule: which runs start a row, the width a run wider than the room is squeezed

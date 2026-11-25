@@ -13,8 +13,10 @@ script_mod! {
     mod.widgets.FabJobsPanelBase = #(FabJobsPanel::register_widget(vm))
     mod.widgets.FabJobsPanel = set_type_default() do mod.widgets.FabJobsPanelBase{
         width: Fill height: Fill flow: Down
-        padding: Inset{top: 6 bottom: 4}
+        padding: Inset{top: 0 bottom: 4}
         show_bg: true draw_bg +: { color: fab.color_editor }
+        // the toolbar: the area's editor selector (and this editor's tools, when it has any)
+        editor_bar := mod.widgets.FabEditorBar{}
         list := mod.widgets.FabJobList{ fill: true height: Fill }
         empty := mod.widgets.FabLabelDim{
             visible: false width: Fill margin: Inset{left: 10 top: 4}

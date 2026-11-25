@@ -12,8 +12,10 @@ script_mod! {
 
     mod.widgets.FabPerfPanelBase = #(FabPerfPanel::register_widget(vm))
     mod.widgets.FabPerfPanel = set_type_default() do mod.widgets.FabPerfPanelBase{
-        width: Fill height: Fill
+        width: Fill height: Fill flow: Down
         show_bg: true draw_bg +: { color: fab.color_editor }
+        // the toolbar: the area's editor selector (and this editor's tools, when it has any)
+        editor_bar := mod.widgets.FabEditorBar{}
         graph := PerfGraph{ panel_width: 100000.0 panel_height: 100000.0 panel_margin: 6.0 }
     }
 }

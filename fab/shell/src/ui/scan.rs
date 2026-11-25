@@ -140,6 +140,8 @@ script_mod! {
         flow: Down
         show_bg: true
         draw_bg +: { color: fab.color_editor }
+        // the toolbar: the area's editor selector (and this editor's tools, when it has any)
+        editor_bar := mod.widgets.FabEditorBar{}
         body := mod.widgets.FabScroll{
             flow: Down padding: 10 spacing: 6
             WrappedDim{ text: "Put the headset on, link it to Fab and walk slowly round what you scan. Fab keeps a keyframe every few centimetres and builds the surface as you go." }

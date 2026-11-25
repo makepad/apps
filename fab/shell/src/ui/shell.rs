@@ -71,8 +71,8 @@ script_mod! {
         }
     }
 
-    // A dock tab: the panel's name, dim at rest, bright with an accent
-    // underline when it is the shown one.
+    // A dock tab: the panel's name, half-way between the dim and the body ink at rest (a name to
+    // read, not a caption), bright with an accent underline when it is the shown one.
     mod.widgets.FabPanelTab = mod.widgets.TabFlat{
         closeable: false
         height: 28
@@ -80,7 +80,7 @@ script_mod! {
         margin: 0.
         draw_text +: {
             text_style: theme.font_regular{ font_size: fab.font_size_ui }
-            color: fab.color_text_dim
+            color: mix(fab.color_text_dim, fab.color_text, 0.5)
             color_hover: fab.color_text
             color_active: fab.color_text_active
         }
@@ -97,18 +97,17 @@ script_mod! {
         }
     }
 
+    // The dock's tab bar: its ground, and a dark line along its foot, a whole point on device
+    // pixels (the shown tab, drawn over it, stays open to its panel).
     mod.widgets.FabPanelTabBar = mod.widgets.TabBarFlat{
         height: 28
         CloseableTab := mod.widgets.FabPanelTab{closeable: true}
         PermanentTab := mod.widgets.FabPanelTab{closeable: false}
         draw_bg +: {
             pixel: fn() {
-                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
-                sdf.rect(0.0, 0.0, self.rect_size.x, self.rect_size.y)
-                sdf.fill(fab.color_header)
-                sdf.rect(0.0, self.rect_size.y - 1.0, self.rect_size.x, 1.0)
-                sdf.fill(fab.color_border)
-                return sdf.result
+                let y = self.pos.y * self.rect_size.y
+                let line = step(self.rect_size.y - 1.0, y)
+                return vec4(mix(fab.color_header.xyz, fab.color_header.xyz * 0.6, line), 1.0)
             }
         }
     }
@@ -163,8 +162,9 @@ script_mod! {
                 width: Fill
                 height: Fill
                 padding: Inset{left: 0 top: 0 right: 0 bottom: 0}
-                // the bar leaves room at its left end for its area's nub (`FabAreaNotches`)
-                tab_bar: mod.widgets.FabPanelTabBar{ margin: Inset{left: 38} }
+                // the bar holds only the area's tabs: the area's nub is in its editor's toolbar
+                // (`FabEditorBar`) or corner (`FabAreaNotches`)
+                tab_bar: mod.widgets.FabPanelTabBar{}
                 round_corner +: { border_radius: 0. }
                 // one-editor areas show no tab bar and still take a drag's drop
                 drop_on_hidden_tab_bars: true
@@ -1425,13 +1425,16 @@ impl FabShell {
         let dock = self.view.dock(cx, ids!(main.dock));
         // a page over the workspace has Back, not an area's nub
         let layout = if self.page.is_some() { &DockMap::new() } else { &self.layout };
+        // a tab may close where its area has another, or there is another area ("Close tab")
+        let area_count = layout.values().filter(|item| matches!(item, DockItem::Tabs { .. })).count();
         let mut areas: Vec<(LiveId, NotchedArea)> = layout.iter().filter_map(|(set, item)| match item {
             DockItem::Tabs { tabs, selected, hide_tab_bar, .. } => {
                 let tab = *tabs.get(*selected)?;
                 match layout.get(&tab) {
                     Some(DockItem::Tab { kind, .. }) if tab != GHOST_TAB => {
                         let strip = self.plate_strip && *kind == Editor::Viewport.kind();
-                        Some((*set, NotchedArea { tab, kind: *kind, bar: !hide_tab_bar, strip }))
+                        let closable = tabs.len() > 1 || area_count > 1;
+                        Some((*set, NotchedArea { tab, kind: *kind, bar: !hide_tab_bar, strip, closable }))
                     }
                     _ => None,
                 }
@@ -1595,10 +1598,31 @@ impl FabShell {
         if let Some(id) = menu_picked(actions, AREA_MENU) {
             self.area_menu_picked(cx, id, workspaces);
         }
+        // a plate view's toolbar Tools toggle: its tool rails on or off, as its area menu's Tools
+        if let Some(ws) = workspaces {
+            let dock = self.view.dock(cx, ids!(main.dock));
+            let plates = self.areas.as_ref().map(|tree| tree.instances()).unwrap_or_default();
+            for plate in plates.into_iter().map(|(_, i)| i).filter(|i| i.editor == Editor::Viewport) {
+                if dock.item(plate.tab()).radio_button(cx, ids!(render_row.view_bar.show_tools)).clicked(actions) {
+                    cx.action(ShellAction::EditWorkspaces(ListOp::Region {
+                        instance: plate, tools: Some(!ws.instance_state(plate).tools), left: None,
+                    }));
+                }
+            }
+        }
         let nubs = self.view.widget(cx, ids!(area_nubs));
         let pressed = nubs.borrow::<FabAreaNotches>().and_then(|n| n.pressed(cx, actions));
         if let Some((tab, chip)) = pressed {
             self.open_area_menu(cx, tab, chip, workspaces);
+        }
+        // a toolbar's close button: its area's front tab closes, as the area menu's Close tab
+        let closed = nubs.borrow::<FabAreaNotches>().and_then(|n| n.closed(cx, actions));
+        if let Some(tab) = closed {
+            if let Some(area) = self.area_of_shown_tab(tab) {
+                if let Some(instance) = self.areas.as_ref().and_then(|tree| tree.instance(area)) {
+                    cx.action(ShellAction::EditAreas(WorkspaceOp::CloseTab { area, instance }));
+                }
+            }
         }
         let strip = self.view.dock(cx, ids!(main.dock)).item(Editor::Transport.tab()).widget(cx, ids!(controls)).widget_uid();
         if let Some(ControlsStripAction::Pressed) = actions.find_widget_action(strip).map(|a| a.cast()) {
@@ -1636,6 +1660,10 @@ impl FabShell {
     fn drag_area(&mut self, cx: &mut Cx, tab: LiveId) {
         if self.compact {
             return;
+        }
+        // the chip's press opened the area's menu: a drag moves the area instead
+        if let Some(mut layer) = self.view.widget(cx, ids!(menu_layer)).borrow_mut::<crate::ui::menu::FabMenuLayer>() {
+            layer.close(cx);
         }
         let Some(area) = self.area_of_shown_tab(tab) else { return };
         let Some((mut tabs, selected)) = self.areas.as_ref().and_then(|tree| tree.stack_of(area)) else { return };

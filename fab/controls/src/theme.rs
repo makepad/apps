@@ -214,7 +214,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
             color_border_light: theme.color_bevel_outset_1
             color_row_hover: theme.color_outset_hover
             // a foldable section's header: a shade under the panel, never a lift
-            color_section: #x00000030
+            color_section: #x00000020
             color_input: theme.color_inset
             color_input_hover: theme.color_inset_hover
             color_input_active: theme.color_inset_active
@@ -266,7 +266,9 @@ pub fn script_mod(vm: &mut ScriptVm) {
             // ---- chrome extras ----
             // Floating chrome over the view (the tool strip, the cards, chips).
             color_float: theme.color_surface_container
-            color_float_border: theme.color_bevel_outset_2
+            color_float_border: #x333333
+            // the shadow along a scrolled panel's top edge, under its toolbar
+            color_scroll_shade: #x0000004d
             // Checkboxes / toggles, Fab's inset well and its filled state.
             color_toggle_off: theme.color_inset
             color_toggle_on: theme.color_ctrl_selected

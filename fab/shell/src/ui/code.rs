@@ -43,39 +43,36 @@ script_mod! {
         show_bg: true
         draw_bg +: { color: fab.color_editor }
         draw_mark: mod.draw.DrawFabChip{}
+        // the shadow under the toolbar while the code is scrolled down
+        draw_shade: mod.draw.FabScrollShade{}
         draw_mark_text: mod.draw.DrawText{
             color: fab.color_text
             text_style: theme.font_regular{ font_size: fab.font_size_small }
         }
         color_error: fab.color_error
+        // the documents' tabs, on the toolbar: no strip and no faces, the shown one's name lit
         tabs: mod.widgets.TabBarFlat{
             height: 26
+            draw_bg +: { pixel: fn() { return vec4(0.0, 0.0, 0.0, 0.0) } }
             PermanentTab := mod.widgets.TabFlat{
                 closeable: false
                 height: 26
                 padding: Inset{left: 10 right: 10 top: 0 bottom: 0}
+                draw_bg +: { pixel: fn() { return vec4(0.0, 0.0, 0.0, 0.0) } }
                 draw_text +: {
                     text_style: theme.font_regular{font_size: fab.font_size_small}
                     color: fab.color_text_dim
+                    color_hover: fab.color_text_hover
                     color_active: fab.color_text_active
                 }
             }
         }
-        // the file tabs start past the area's nub in the corner (38 wide) and its fillet (8)
-        tab_strip := View{width: Fill height: 26 margin: Inset{left: 46}}
-        head := View{
-            width: Fill
-            height: 30
-            flow: Right
-            align: Align{x: 0.0 y: 0.5}
-            padding: Inset{left: 10 right: 10 top: 0 bottom: 0}
-            spacing: 8
-            show_bg: true
-            draw_bg +: { color: fab.color_header }
-            title := mod.widgets.FabLabel{ text: "Script" draw_text +: { text_style: theme.font_bold{ font_size: fab.font_size_ui } } }
+        // the toolbar, as every editor's: the area's editor selector, then the code's documents
+        // as tabs (drawn into `tab_strip`: `draw_walk`), its build state and the scrub hint
+        editor_bar := mod.widgets.FabEditorBar{
+            tab_strip := View{width: Fill height: 26}
             state := mod.widgets.FabLabelSmall{ text: "" }
-            View{ width: Fill height: 1 }
-            mod.widgets.FabLabelSmall{ text: #(format!("{} a number to scrub it", crate::ui::keymap::shortcut(crate::ui::keymap::ShortcutId::CodeScrub))) }
+            hint := mod.widgets.FabLabelSmall{ text: #(format!("{} a number to scrub it", crate::ui::keymap::shortcut(crate::ui::keymap::ShortcutId::CodeScrub))) }
         }
         code := CodeView{
             editor +: {
@@ -143,12 +140,8 @@ script_mod! {
                 return Pal.premul(self.color)
             }
         }
-        bar := View{
-            width: Fill
-            height: 30
-            flow: Right
-            align: Align{x: 0.0 y: 0.5}
-            padding: Inset{left: 8 right: 6 top: 0 bottom: 0}
+        // the toolbar: the area's editor selector, then Add and the feature tools
+        bar := mod.widgets.FabEditorBar{
             spacing: 2
             FabTip{ text: "Add a feature: a primitive, a sketch, a modifier on the picked feature, a pattern, a gear, text"
                 add := mod.widgets.FabDropdownButton{
@@ -495,6 +488,9 @@ fn parse_hex(s: &str) -> Option<[f32; 4]> {
 pub struct FabCodePanel {
     #[deref]
     view: View,
+    /// The shadow under the toolbar while the code is scrolled down (`widgets::draw_scroll_shade`).
+    #[live]
+    draw_shade: DrawQuad,
     #[live]
     tabs: TabBar,
     #[live]
@@ -749,9 +745,9 @@ impl Widget for FabCodePanel {
             }
             None => (None, None, None, None, String::new()),
         };
-        self.view.label(cx, ids!(head.state)).set_text(cx, &word);
+        self.view.label(cx, ids!(editor_bar.state)).set_text(cx, &word);
+        // the document shown (its tab names it)
         let title = scope.data.get::<AppState>().and_then(|st| st.source.viewed.clone()).unwrap_or_else(|| "Program".to_string());
-        self.view.label(cx, ids!(head.title)).set_text(cx, &title);
         let code = self.view.widget(cx, ids!(code));
         if let Some((rev, text)) = reload {
             if let Some(mut view) = code.borrow_mut::<CodeView>() {
@@ -782,12 +778,18 @@ impl Widget for FabCodePanel {
         while self.view.draw_walk(cx, scope, walk).is_step() {}
         if let Some(state) = scope.data.get::<AppState>() {
             let active = state.source.tabs.iter().position(|t| Some(&t.file) == state.source.viewed.as_ref());
-            let rect = self.view.widget(cx, ids!(tab_strip)).area().rect(cx);
+            let rect = self.view.widget(cx, ids!(editor_bar.tab_strip)).area().rect(cx);
             self.tabs.begin(cx, active, true, Walk::abs_rect(rect));
             for tab in &state.source.tabs {
                 self.tabs.draw_tab(cx, LiveId::from_str(&tab.file), &tab.name, live_id!(PermanentTab));
             }
             self.tabs.end(cx);
+        }
+        // scrolled down, a shadow along the code's top, under the toolbar (as every editor's)
+        if let Some(view) = code.borrow::<CodeView>() {
+            let rect = view.editor.area().rect(cx);
+            let scrolled = view.editor.scroll_pos().y;
+            crate::ui::widgets::draw_scroll_shade(cx, &mut self.draw_shade, rect, 0, -scrolled);
         }
         let Some(view) = code.borrow::<CodeView>() else { return DrawStep::done() };
         let Some(session) = view.session.as_ref() else { return DrawStep::done() };
@@ -905,6 +907,8 @@ struct FeatureHit {
     rect: Rect,
     name: Rect,
     fold: Option<Rect>,
+    /// Whether the row's children are folded away (as drawn), for a fold drag to set it.
+    folded: bool,
     eye: Option<Rect>,
     link: Option<Rect>,
     key: String,
@@ -918,6 +922,41 @@ struct FeatureHit {
     mark: Option<Rect>,
     role: &'static str,
     can_role: bool,
+}
+
+/// A fold drag in the parts tree: a press on a chevron (a part row's or a feature row's), dragged
+/// on, sets every row the pointer reaches to the state the pressed one went to (`open`), and every
+/// row between it and the last one set (`last`), in their order on screen: folding moves the rows
+/// below past the pointer between two moves, and the order catches them. One drag runs across the
+/// part rows and their features (each keeps its rows: `p<key>`, `f<id>`). It ends on release.
+#[derive(Default)]
+pub(crate) struct TreeFold {
+    pub(crate) open: Option<bool>,
+    pub(crate) done: Vec<String>,
+    pub(crate) last: Option<String>,
+}
+
+impl TreeFold {
+    /// A press on `key`'s chevron that turned it to `open`.
+    pub(crate) fn start(cx: &mut Cx, open: bool, key: String) {
+        *cx.global::<TreeFold>() = TreeFold { open: Some(open), done: vec![key.clone()], last: Some(key) };
+    }
+
+    /// The rows (keys, in their order on screen) a move to row `h` sets: `h` and those since the
+    /// last one set, when that is among these rows; each once per drag. Records `h` as the last.
+    pub(crate) fn reach(cx: &mut Cx, keys: &[String], h: usize) -> Vec<usize> {
+        let fold = cx.global::<TreeFold>();
+        let from = fold.last.as_ref().and_then(|l| keys.iter().position(|k| k == l)).unwrap_or(h);
+        let mut out = Vec::new();
+        for i in from.min(h)..=from.max(h) {
+            if !fold.done.contains(&keys[i]) {
+                fold.done.push(keys[i].clone());
+                out.push(i);
+            }
+        }
+        fold.last = Some(keys[h].clone());
+        out
+    }
 }
 
 /// A row held by the pointer and its current sibling destination.
@@ -1037,6 +1076,22 @@ impl FabFeatureTree {
 
     /// A source action of a press in this tree: on another instance's tree, that instance is
     /// focused first, so the action applies to its script.
+    /// A fold drag (`TreeFold`) moved to `p`: the rows it reaches here, with a fold, take its
+    /// state.
+    fn fold_drag(&mut self, cx: &mut Cx, p: DVec2) {
+        let Some(open) = cx.global::<TreeFold>().open else { return };
+        let Some(h) = self.rows.iter().position(|r| r.rect.contains(p)) else { return };
+        let keys: Vec<String> = self.rows.iter().map(|r| format!("f{}", r.id)).collect();
+        for i in TreeFold::reach(cx, &keys, h) {
+            let hit = &self.rows[i];
+            // (folded and to open, or open and to fold: it turns)
+            if hit.fold.is_some() && hit.folded == open {
+                let id = hit.id.clone();
+                self.act(cx, SourceAction::Fold(id));
+            }
+        }
+    }
+
     fn act(&self, cx: &mut Cx, action: SourceAction) {
         if let (false, Some(instance)) = (self.current, &self.instance) {
             cx.action(SourceAction::Focus(instance.clone()));
@@ -1169,6 +1224,11 @@ impl Widget for FabFeatureTree {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        match event {
+            Event::MouseUp(_) => cx.global::<TreeFold>().open = None,
+            Event::MouseMove(e) => self.fold_drag(cx, e.abs),
+            _ => {}
+        }
         if let Event::NextFrame(ne) = event {
             if ne.set.contains(&self.fold_frame) {
                 let dt = self.fold_last.map_or(0.0, |t| (ne.time - t).clamp(0.0, 0.05));
@@ -1255,8 +1315,10 @@ impl Widget for FabFeatureTree {
                         }
                         return;
                     }
-                    // a fold folds as it is pressed
+                    // a fold folds as it is pressed, and a drag on from it folds or unfolds the rows
+                    // it crosses the same way (`TreeFold`)
                     if hit.fold.is_some_and(|r| r.contains(fe.abs)) {
+                        TreeFold::start(cx, hit.folded, format!("f{}", hit.id));
                         self.act(cx, SourceAction::Fold(hit.id));
                         return;
                     }
@@ -1549,7 +1611,7 @@ impl Widget for FabFeatureTree {
                 self.draw_row.draw_abs(cx, Rect { pos: dvec2(x, if *after { r.pos.y + ROW - 2.0 } else { r.pos.y - 2.0 }), size: dvec2((r.pos.x + r.size.x - x).max(0.0), 2.0) });
             }
             if partial { cx.end_turtle(); }
-            self.rows.push(FeatureHit { rect: r, name: name_rect, fold, eye, link, key: f.link.clone(), label: format!("{role} {} {} level {}{}{}{}", f.op, f.name(), f.depth + 1, if f.off { " bypassed" } else { "" }, if f.link.is_empty() { "" } else { " linked" }, mark.as_ref().map(|what| format!(", {what}")).unwrap_or_default()), id: f.id.clone(), parent: f.parent.clone(), editable: f.editable, bypass: f.editable && !f.root && f.op != "call" && !settings, off: f.off, mark: mark_rect, role: f.role, can_role: f.can_role });
+            self.rows.push(FeatureHit { rect: r, name: name_rect, fold, folded: is_folded(f), eye, link, key: f.link.clone(), label: format!("{role} {} {} level {}{}{}{}", f.op, f.name(), f.depth + 1, if f.off { " bypassed" } else { "" }, if f.link.is_empty() { "" } else { " linked" }, mark.as_ref().map(|what| format!(", {what}")).unwrap_or_default()), id: f.id.clone(), parent: f.parent.clone(), editable: f.editable, bypass: f.editable && !f.root && f.op != "call" && !settings, off: f.off, mark: mark_rect, role: f.role, can_role: f.can_role });
         }
         cx.end_turtle();
         self.draw_name.color = name_color;

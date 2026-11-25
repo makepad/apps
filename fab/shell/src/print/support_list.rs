@@ -42,6 +42,10 @@ script_mod! {
 pub struct FabSupportList {
     #[uid]
     uid: WidgetUid,
+    /// In a section titled for it (Overhangs): its heading line says only how much is held, in
+    /// the dim ink, without the OVERHANGS label.
+    #[live]
+    headless: bool,
     #[walk]
     walk: Walk,
     #[redraw]
@@ -231,6 +235,11 @@ fn line_box(line: &OverhangLine) -> crate::Aabb {
         min: vec3(line.min[0] as f32 * 0.001 - 0.003, line.min[1] as f32 * 0.001 - 0.003, line.min[2] as f32 * 0.001 - 0.003),
         max: vec3(line.max[0] as f32 * 0.001 + 0.003, line.max[1] as f32 * 0.001 + 0.003, line.max[2] as f32 * 0.001 + 0.003),
     }
+}
+
+/// Whether the list has any lines (the Slice editor hides its Overhangs section otherwise).
+pub(crate) fn has_lines(state: &PrintState) -> bool {
+    !entries(state).is_empty()
 }
 
 fn entries(state: &PrintState) -> Vec<Entry> {
@@ -446,7 +455,14 @@ impl Widget for FabSupportList {
         for entry in entries {
             match entry {
                 Entry::Head(head) => {
-                    self.draw_head.draw_abs(cx, dvec2(rect.pos.x, y + 3.0), &head);
+                    if self.headless {
+                        let rest = head.strip_prefix("OVERHANGS · ").unwrap_or(&head);
+                        let mut words = rest.chars();
+                        let line: String = words.next().map(|c| c.to_uppercase().chain(words).collect()).unwrap_or_default();
+                        self.draw_dim.draw_abs(cx, dvec2(rect.pos.x, y + 3.0), &line);
+                    } else {
+                        self.draw_head.draw_abs(cx, dvec2(rect.pos.x, y + 3.0), &head);
+                    }
                     self.text.push_str(&head);
                     self.text.push('\n');
                 }

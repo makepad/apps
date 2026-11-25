@@ -6,10 +6,10 @@
 //! custom widget would read as one big control. The app runs it through
 //! [`handle_actions`] and [`sync`].
 //!
-//! Left: the cube, the app's menus (File, Edit, View, Help), the document's name and
+//! Left: the cube and the app's menus (File, Edit, View, Help). Centre: the document's name and
 //! state. Right: the job strip, the headset, undo / redo, the workspace menu (it names the shown
-//! workspace and lists them all, Cmd+1-9; [`crate::ui::workspace_tabs`]), the code toggle, the AI
-//! column and Print.
+//! workspace and lists them all, Cmd+1-9; [`crate::ui::workspace_tabs`]), the AI column and
+//! Print. (The code is an editor like any other: its area's selector, or ` to show it.)
 //!
 //! The slice is a render mode of the plate view (`stage`), not a workspace. Print
 //! only opens the printer panel's confirm row (and shows the slice, which slices
@@ -71,7 +71,7 @@ script_mod! {
         flow: Overlay
 
         // The right side, against the caption's right end: the job strip, XR, undo and redo, the
-        // workspace menu, then the code, the assistant and Print.
+        // workspace menu, then the assistant and Print.
         ends := View{
             width: Fill
             height: Fill
@@ -99,9 +99,6 @@ script_mod! {
                     redo := CapIcon{ a11y: {label: "Redo"} draw_icon +: { svg: crate_resource("self://resources/icons/redo.svg") } }
                 }
                 workspaces := mod.widgets.FabWorkspaceTabs{}
-                FabTip{ text: "The code beside the view (`)"
-                    code_toggle := mod.widgets.FabIconCheck{ a11y: {label: "Code"} width: 28 height: 26 padding: Inset{left: 6 right: 6 top: 5 bottom: 5} draw_icon +: { svg: crate_resource("self://resources/icons/code.svg") } }
-                }
                 FabTip{ text: #(keymap::tooltip(Key::Chat))
                     chat := CapIcon{ a11y: {label: "AI assistant"} draw_icon +: { svg: crate_resource("self://resources/icons/spark.svg") } }
                 }
@@ -111,7 +108,30 @@ script_mod! {
             }
         }
 
-        // The menus and the document; the rest up to the right side drags the window.
+        // The document's name and state at the centre of the window, under the two sides (it
+        // takes no presses: the caption around it still drags the window).
+        middle := View{
+            width: Fill
+            height: Fill
+            align: Align{x: 0.5 y: 0.5}
+            // centred on the window, not the bar: the bar starts 40 in (past the traffic lights'
+            // room), so as much is kept on its right
+            padding: Inset{right: 40}
+            title := View{
+                width: Fit
+                height: Fit
+                flow: Right
+                spacing: 6
+                align: Align{y: 0.5}
+                doc_name := mod.widgets.FabLabel{
+                    text: "Untitled"
+                    draw_text +: { text_style: theme.font_bold{ font_size: fab.font_size_title } }
+                }
+                doc_state := mod.widgets.FabLabelSmall{ text: "" }
+            }
+        }
+
+        // The menus; the rest up to the right side drags the window.
         starts := View{
             width: Fill
             height: Fill
@@ -141,19 +161,6 @@ script_mod! {
                     m_view := mod.widgets.FabMenuButton{ tag: @fab_menu_view owner: @fab_menu_view height: 24 label +: { text: "View" } }
                     m_help := mod.widgets.FabMenuButton{ tag: @fab_menu_help owner: @fab_menu_help height: 24 label +: { text: "Help" } }
                 }
-                title := View{
-                    width: Fit
-                    height: Fit
-                    flow: Right
-                    spacing: 6
-                    align: Align{y: 0.5}
-                    margin: Inset{left: 4 right: 6}
-                    doc_name := mod.widgets.FabLabel{
-                        text: "Untitled"
-                        draw_text +: { text_style: theme.font_bold{ font_size: fab.font_size_title } }
-                    }
-                    doc_state := mod.widgets.FabLabelSmall{ text: "" }
-                }
             }
         }
     }
@@ -177,9 +184,6 @@ pub fn handle_actions(cx: &mut Cx, bar: &WidgetRef, actions: &Actions, state: &A
             cx.action(ShellAction::SetRenderMode(RenderMode::Slice));
         }
         cx.action(PrintAction::AskPrint(true));
-    }
-    if bar.radio_button(cx, ids!(right.code_toggle)).clicked(actions) {
-        cx.action(ShellAction::ShowCode(!state.ui.code_shown()));
     }
     if bar.button(cx, ids!(right.chat)).clicked(actions) {
         cx.action(ShellAction::Command("toggle chat".into()));
@@ -351,15 +355,10 @@ impl Caption {
 
 /// Bring the caption up to date with its model (before a draw).
 pub fn sync(cx: &mut Cx, bar: &WidgetRef, caption: &Caption) {
-    bar.label(cx, ids!(left.title.doc_name)).set_text(cx, &caption.title);
-    bar.label(cx, ids!(left.title.doc_state)).set_text(cx, &caption.info);
+    bar.label(cx, ids!(middle.title.doc_name)).set_text(cx, &caption.title);
+    bar.label(cx, ids!(middle.title.doc_state)).set_text(cx, &caption.info);
     if let Some(mut tabs) = bar.widget(cx, ids!(workspaces)).borrow_mut::<FabWorkspaceTabs>() {
         tabs.set(cx, caption.tabs.clone(), caption.current, caption.temp.clone());
-    }
-    let code = bar.radio_button(cx, ids!(right.code_toggle));
-    code.set_visible(cx, caption.design);
-    if code.active(cx) != caption.code {
-        code.set_active(cx, caption.code, Animate::No);
     }
 }
 

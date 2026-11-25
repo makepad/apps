@@ -953,6 +953,10 @@ impl Widget for FabSliceLegend {
 pub struct FabIssueSummary {
     #[uid]
     uid: WidgetUid,
+    /// In a section titled for it: no PRINTABILITY heading row, only a "Checking n/m" line while
+    /// the checks run.
+    #[live]
+    headless: bool,
     #[walk]
     walk: Walk,
     #[redraw]
@@ -1003,6 +1007,14 @@ struct IssueKind {
 
 /// The report's kinds of issue as the list shows them, each with its issues in the order its
 /// row steps through them: the worst severity first, then as the report lists them.
+/// Whether the issue summary shows anything: something sliced, or something found (the Slice
+/// editor hides its Printability section otherwise).
+pub(crate) fn issues_shown(p: &crate::print::PrintState) -> bool {
+    p.showing().is_some()
+        || !issue_kinds(&p.report()).is_empty()
+        || p.support_pieces.iter().flatten().any(|piece| piece.light == crate::api::MechLight::Red)
+}
+
 fn issue_kinds(report: &fab_printability::Report) -> Vec<IssueKind> {
     let mut out: Vec<(&'static str, IssueKind)> = Vec::new();
     for (i, issue) in report.issues.iter().enumerate() {
@@ -1180,7 +1192,8 @@ impl Widget for FabIssueSummary {
         }
         // Nothing sliced and nothing found: the section has nothing to say.
         let shown = !kinds.is_empty() || p.showing().is_some();
-        let rows = if shown { 1 + kinds.len().max(1) } else { 0 };
+        let head_row = !self.headless || checking.is_some();
+        let rows = if shown { head_row as usize + kinds.len().max(1) } else { 0 };
         let rect = cx.walk_turtle(Walk { height: Size::Fixed(rows as f64 * ISSUE_ROW_H), ..walk });
         self.lines.clear();
         self.text.clear();
@@ -1192,13 +1205,16 @@ impl Widget for FabIssueSummary {
         self.draw_hit.ring = vec4(0.0, 0.0, 0.0, 0.0);
         self.draw_hit.draw_abs(cx, rect);
         self.area = self.draw_hit.area();
-        let mut head = "PRINTABILITY".to_string();
-        if let Some((done, total)) = checking {
-            head.push_str(&format!(" · checking {done}/{total}"));
+        if head_row {
+            let head = match (self.headless, checking) {
+                (true, Some((done, total))) => format!("Checking {done}/{total}"),
+                (_, Some((done, total))) => format!("PRINTABILITY · checking {done}/{total}"),
+                (_, None) => "PRINTABILITY".to_string(),
+            };
+            self.draw_head.draw_abs(cx, dvec2(rect.pos.x, rect.pos.y + 3.0), &head);
         }
-        self.draw_head.draw_abs(cx, dvec2(rect.pos.x, rect.pos.y + 3.0), &head);
         let right = rect.pos.x + rect.size.x;
-        let mut y = rect.pos.y + ISSUE_ROW_H;
+        let mut y = rect.pos.y + if head_row { ISSUE_ROW_H } else { 0.0 };
         if kinds.is_empty() {
             self.draw_dim.draw_abs(cx, dvec2(rect.pos.x + 16.0, y + 3.0), "No issues");
             self.text.push_str("No issues");

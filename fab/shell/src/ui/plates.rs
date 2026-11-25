@@ -237,13 +237,9 @@ script_mod! {
         flow: Down
         show_bg: true
         draw_bg +: { color: fab.color_editor }
-        tools := View{
-            width: Fill
-            height: 36
-            flow: Right
-            align: Align{x: 0.0 y: 0.5}
-            padding: Inset{left: 8 right: 8 top: 0 bottom: 0}
-            spacing: 6
+        draw_shade: mod.draw.FabScrollShade{}
+        // the toolbar: the area's editor selector, then New plate and the search
+        tools := mod.widgets.FabEditorBar{
             new := mod.widgets.FabButtonAccent{ text: "New plate" a11y: {label: "New plate"} }
             search := mod.widgets.FabSearch{
                 width: Fill{min: 60}
@@ -318,6 +314,9 @@ impl Shown {
 pub struct FabPlatesPanel {
     #[deref]
     view: View,
+    /// The shadow under the toolbar while the list is scrolled down.
+    #[live]
+    draw_shade: DrawQuad,
     /// The search, as typed.
     #[rust]
     query: String,
@@ -703,6 +702,10 @@ impl Widget for FabPlatesPanel {
                 }
             }
         }
+        // the list scrolled down: a shadow along its top, under the toolbar
+        let list = self.view.portal_list(cx, ids!(list));
+        let (first_id, first_scroll) = (list.first_id(), list.scroll_position());
+        crate::ui::widgets::draw_scroll_shade(cx, &mut self.draw_shade, list.area().rect(cx), first_id, first_scroll);
         DrawStep::done()
     }
 }

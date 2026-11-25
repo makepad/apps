@@ -18,6 +18,8 @@ script_mod! {
     mod.widgets.FabChecksPanel = set_type_default() do mod.widgets.FabChecksPanelBase{
         width: Fill height: Fill flow: Down
         show_bg: true draw_bg +: { color: fab.color_editor }
+        // the toolbar: the area's editor selector (and this editor's tools, when it has any)
+        editor_bar := mod.widgets.FabEditorBar{}
         circuit := mod.widgets.BoardChecks{ circuit: true title: "Schematic" }
         board := mod.widgets.BoardChecks{ title: "Board" }
     }

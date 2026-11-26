@@ -78,7 +78,7 @@ fn normalize_expr(e: &mut Expr, result: &str) {
         ExprKind::Neg(a) | ExprKind::Not(a) | ExprKind::Field(a, _) => normalize_expr(a, result),
         ExprKind::Call(_, args) | ExprKind::ArrayList(args) => { for a in args { normalize_expr(a, result); } }
         ExprKind::StructLit(_, fields) => { for (_, e) in fields { normalize_expr(e, result); } }
-        ExprKind::Lambda(_) | ExprKind::Num(..) | ExprKind::Bool(_) | ExprKind::Ident(_) | ExprKind::Unreadable(_) => {}
+        ExprKind::Lambda(_) | ExprKind::Num(..) | ExprKind::Bool(_) | ExprKind::Ident(_) | ExprKind::Str(_) | ExprKind::Unreadable(_) => {}
     }
 }
 
@@ -132,7 +132,7 @@ fn returns_value_in(e: &Expr) -> bool {
         ExprKind::Neg(a) | ExprKind::Not(a) | ExprKind::Field(a, _) => returns_value_in(a),
         ExprKind::Call(_, args) | ExprKind::ArrayList(args) => args.iter().any(returns_value_in),
         ExprKind::StructLit(_, fields) => fields.iter().any(|(_, e)| returns_value_in(e)),
-        ExprKind::Lambda(_) | ExprKind::Num(..) | ExprKind::Bool(_) | ExprKind::Ident(_) | ExprKind::Unreadable(_) => false,
+        ExprKind::Lambda(_) | ExprKind::Num(..) | ExprKind::Bool(_) | ExprKind::Ident(_) | ExprKind::Str(_) | ExprKind::Unreadable(_) => false,
     }
 }
 
@@ -250,7 +250,7 @@ pub fn compile_kernel(source: &str, profile: &Profile, lines: &rt::KernelLines, 
             let item = items.iter().find(|i| i.name() == name).unwrap();
             let at = match item {
                 Item::Let { span, .. } | Item::Var { span, .. } | Item::Struct { span, .. }
-                | Item::Use { span, .. } => *span,
+                | Item::Use { span, .. } | Item::Decl { span, .. } => *span,
                 Item::Fn(f) => f.span,
             };
             return Err(vec![ShaderError::new(at.start, at.end,

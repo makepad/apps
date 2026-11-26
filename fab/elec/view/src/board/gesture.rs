@@ -53,6 +53,38 @@ pub(crate) fn classify(board: &Board, pressed: &[Pressed], p: P, tol: Nm, active
     Press::Nothing
 }
 
+/// Only the frontmost hit can start a Tune. In particular a pad or via over
+/// a track owns its press, even if the track would otherwise be eligible.
+pub(crate) fn tune_hit(board: &Board, hits: &[Pressed], p: P) -> Option<(ItemId, OnTrack, usize)> {
+    let Pressed::Copper(hit) = hits.first()? else { return None };
+    if hit.tag.role != Role::Track { return None; }
+    let (ItemKind::Track, i) = board.locate(hit.tag.item)? else { return None };
+    let t = &board.tracks[i];
+    fab_elec_route::meander::uniform_width(t).ok()?;
+    let seg = hit.tag.sub as usize;
+    let Seg::Line(end) = *t.path.segs.get(seg)? else { return None };
+    let start = if seg == 0 { t.path.start } else { t.path.segs[seg - 1].end() };
+    if start == end { return None; }
+    let far = p.dist2(end) < p.dist2(start);
+    Some((t.id, OnTrack { seg: hit.tag.sub, frac: if far { OnTrack::ONE } else { 0 } }, seg + usize::from(far)))
+}
+
+/// The vertex nearest the projection onto the grabbed straight run's infinite line.
+/// A sideways motion alone leaves the projection (and hence the span) fixed.
+fn projected_vertex(path: &Path, seg: usize, p: P) -> Option<usize> {
+    let end = path.segs.get(seg)?.end();
+    let a = if seg == 0 { path.start } else { path.segs[seg - 1].end() };
+    let delta = |p: P| (f64::from(p.x) - f64::from(a.x), f64::from(p.y) - f64::from(a.y));
+    let ((dx, dy), (x, y)) = (delta(end), delta(p));
+    let along = (dx * x + dy * y) / (dx * dx + dy * dy);
+    let distance = |v: P| {
+        let (x, y) = delta(v);
+        (x - dx * along).powi(2) + (y - dy * along).powi(2)
+    };
+    std::iter::once(path.start).chain(path.segs.iter().map(|s| s.end())).enumerate()
+        .min_by(|(_, a), (_, b)| distance(*a).total_cmp(&distance(*b))).map(|(i, _)| i)
+}
+
 /// What a press on copper `hit` starts; `reach` beyond a track's width still takes its end.
 fn copper(board: &Board, hit: &Hit, p: P, reach: Nm, active: LayerId) -> Press {
     match hit.tag.role {
@@ -93,7 +125,14 @@ fn copper(board: &Board, hit: &Hit, p: P, reach: Nm, active: LayerId) -> Press {
 pub(crate) fn snap_target(board: &Board, hits: &[Hit], g: &Gesture) -> Option<(Anchor, P, String)> {
     let net = g.net?;
     for hit in hits {
-        if hit.layer != g.layer || hit.net != Some(net) || !matches!(hit.tag.role, Role::Pad | Role::Via | Role::Track) {
+        if hit.layer != g.layer || !matches!(hit.tag.role, Role::Pad | Role::Via | Role::Track) {
+            continue;
+        }
+        let eligible = match g.kind {
+            GestureKind::RoutePair { mate, .. } => hit.tag.role == Role::Pad && (hit.net == Some(net) || hit.net == Some(mate)),
+            _ => hit.net == Some(net),
+        };
+        if !eligible {
             continue;
         }
         let target = match (hit.tag.role, board.locate(hit.tag.item)) {
@@ -117,7 +156,7 @@ pub(crate) fn snap_target(board: &Board, hits: &[Hit], g: &Gesture) -> Option<(A
             }
             _ => continue,
         };
-        if target.0 != g.start {
+        if target.0 != g.start && !matches!(g.kind, GestureKind::RoutePair { mate_start, .. } if target.0 == mate_start) {
             return Some(target);
         }
     }
@@ -158,6 +197,39 @@ pub(crate) struct Routing {
 }
 
 impl Routing {
+    fn new(g: Gesture, grip: P) -> Self {
+        Self { id: next_gesture_id(), g, seq: 0, answer: None, answered: None, target: None, ending: None, grip }
+    }
+
+    pub(crate) fn pair(board: &Board, rules: &fab_elec_board::RuleMatrix, press: Press) -> Result<Option<Self>, String> {
+        use fab_elec_route::pair::{mate_anchor, Pair};
+        let Press::Route { start: start @ Anchor::Pad { .. }, at, net, layer } = press else { return Ok(None) };
+        let Some((mate, _)) = rules.partner(net) else { return Ok(None) };
+        let mate_start = mate_anchor(board, Pair::resolve(board, rules, net)?, start)?;
+        let mate_start_at = board.anchor_pos(mate_start).ok_or("the mate endpoint has moved")?;
+        let mut g = Gesture::new(GestureKind::RoutePair { mate, mate_start, mate_start_at }, board.unit, board.generation, start, at, layer);
+        g.net = Some(net);
+        Ok(Some(Self::new(g, P::ZERO)))
+    }
+
+    pub(crate) fn tune(board: &Board, hit: (ItemId, OnTrack, usize), circuit: Arc<fab_elec_circuit::Circuit>) -> Option<Self> {
+        let (track, at, from) = hit;
+        let (ItemKind::Track, i) = board.locate(track)? else { return None };
+        let t = &board.tracks[i];
+        let kind = GestureKind::Tune { track, from, to: from, circuit };
+        let mut g = Gesture::new(kind, board.unit, board.generation, Anchor::Track { id: track, at }, t.path.point_on(at), t.layer);
+        g.net = Some(t.net);
+        Some(Self::new(g, P::ZERO))
+    }
+
+    pub(crate) fn set_span_end(&mut self, board: &Board, p: P) {
+        if let (GestureKind::Tune { to, track, .. }, Anchor::Track { at, .. }) = (&mut self.g.kind, self.g.start) {
+            if let Some((ItemKind::Track, i)) = board.locate(*track) {
+                if let Some(end) = projected_vertex(&board.tracks[i].path, at.seg as usize, p) { *to = end; }
+            }
+        }
+    }
+
     /// O(1) with indexed board items, including projection onto a dragged segment.
     pub(crate) fn start(press: &Press, board: &Board, unit: BoardId) -> Option<Routing> {
         let (kind, start, at, net, layer, grip) = match *press {
@@ -171,7 +243,7 @@ impl Routing {
         };
         let mut g = Gesture::new(kind, unit, board.generation, start, at, layer);
         g.net = Some(net);
-        Some(Routing { id: next_gesture_id(), g, seq: 0, answer: None, answered: None, target: None, ending: None, grip })
+        Some(Self::new(g, grip))
     }
 
     /// Amortised O(1) trail update, followed by the sample's gesture copy.
@@ -182,7 +254,9 @@ impl Routing {
         }
         self.g.push_trail(p, tol);
         self.g.target = target.as_ref().map(|t| t.0);
-        self.g.cursor = target.as_ref().map_or(p, |t| t.1);
+        if !matches!(self.g.kind, GestureKind::RoutePair { .. }) {
+            self.g.cursor = target.as_ref().map_or(p, |t| t.1);
+        }
         self.target = target.map(|t| t.2);
         self.sample()
     }
@@ -196,7 +270,7 @@ impl Routing {
             _ => return None,
         };
         let g = Gesture::new(kind, unit, board.generation, Anchor::Free, at, LayerId::F_CU);
-        Some(Routing { id: next_gesture_id(), g, seq: 0, answer: None, answered: None, target: None, ending: None, grip: P::ZERO })
+        Some(Self::new(g, P::ZERO))
     }
 
     /// The held `item` moved by `by` from its committed place, as the next sample. O(1).
@@ -215,7 +289,7 @@ impl Routing {
 
     /// Whether this gesture draws copper (snaps, keeps a trail, takes V, W and /), not drags it.
     pub(crate) fn draws(&self) -> bool {
-        matches!(self.g.kind, GestureKind::Route)
+        matches!(self.g.kind, GestureKind::Route | GestureKind::RoutePair { .. })
     }
 
     /// O(trail since the last leg + fixed leg geometry), copied by `Gesture::clone`.
@@ -408,6 +482,7 @@ mod tests {
 
     fn answer(routing: &Routing, seq: u64, tier: Tier) -> Arc<RouteProposal> {
         Arc::new(RouteProposal {
+            pair: None,
             id: ProposalId(1),
             source: ProposalSource::Gesture { id: routing.id, seq, tier },
             unit: routing.g.unit,
@@ -553,6 +628,35 @@ mod tests {
         g.start = Anchor::Free;
         g.net = None;
         assert_eq!(snap_target(&board, &[track_hit], &g), None, "a gesture without a net cannot snap to copper");
+    }
+
+    #[test]
+    fn tune_picks_a_straight_run_and_projects_onto_its_vertices() {
+        let mut b = fixture();
+        let t = &mut b.tracks[0];
+        t.path = Path::new(P::ZERO).line(P::mm(4., 0.)).line(P::mm(9., 0.));
+        t.locked = false;
+        t.widths = None;
+        let track = Pressed::Copper(hit(t.layer, t.id, 0, Role::Track, Some(t.net)));
+        let press = P::mm(0.6, 0.);
+        let name = t.id;
+        let pad = Pressed::Copper(pad_hits(&b)[0]);
+        let via = &b.vias[0];
+        let via = Pressed::Copper(hit(LayerId::F_CU, via.id, 0, Role::Via, Some(via.net)));
+        assert!(tune_hit(&b, &[pad, track], press).is_none());
+        assert!(tune_hit(&b, &[via, track], press).is_none());
+        let hit = tune_hit(&b, &[track], press).unwrap();
+        assert_eq!((hit.0, hit.2), (name, 0));
+        let circuit = Arc::default();
+        let mut routing = Routing::tune(&b, hit, Arc::clone(&circuit)).unwrap();
+        for (p, end) in [(P::mm(4., 1.), 1), (P::mm(4., 10.), 1), (P::mm(8., -2.), 2)] {
+            routing.set_span_end(&b, p);
+            let sample = routing.moved(p, 0, None);
+            assert!(matches!(sample.gesture.kind, GestureKind::Tune { track, from: 0, to, circuit: held }
+                if track == name && to == end && Arc::ptr_eq(&held, &circuit)));
+        }
+        b.tracks[0].locked = true;
+        assert!(tune_hit(&b, &[track], press).is_none());
     }
 
     #[test]

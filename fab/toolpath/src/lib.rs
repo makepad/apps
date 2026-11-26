@@ -17,6 +17,7 @@ pub mod fill;
 pub mod flow;
 pub mod footing;
 pub mod given;
+pub mod grade;
 pub mod infill;
 pub mod interlock;
 pub mod ironing;
@@ -48,6 +49,8 @@ pub mod support;
 pub mod support_paint;
 pub mod support_rules;
 pub mod texture;
+pub mod tpms;
+pub mod warp;
 pub mod tree;
 pub mod walls;
 pub mod witness;
@@ -985,13 +988,86 @@ pub fn plan_window(ctl: par::Ctl, oi: usize, o: &ObjectInput, job: &Job, heights
     Ok(stages::plan(ctl, oi, o, job, heights, Some((lo, hi)))?.1)
 }
 
-/// Contours read by a model window. Painted sources additionally read the
-/// whole part to discover their region streams; a vase always plans whole.
+fn grade_period(p: &Params) -> f64 {
+    let spacing = flow::spacing(p.w_sparse, p.layer_height);
+    infill::tpms_period(p.sparse_pattern, spacing / p.density).expect("adaptive infill has a TPMS period")
+}
+
+/// The same inputs as the grade stage, with the source's cut key standing for its contours
+/// and non-planar plan. The part's settings and XY compensation are already resolved.
+fn grade_key_for(o: &ObjectInput, p: &Params, xy: XyComp, heights: &[(f64, f64)]) -> Option<u64> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let a = p.sparse_opts.adaptive.as_ref()?;
+    let source = o.source.content_key()?;
+    let mut h = DefaultHasher::new();
+    ("grade from source", source, xy.shift.to_bits(), xy.hole_extra.to_bits(), p.raft_lift.to_bits()).hash(&mut h);
+    (a.interior.to_bits(), a.gradient, a.lobes, p.density.to_bits(), grade_period(p).to_bits()).hash(&mut h);
+    heights.len().hash(&mut h);
+    for &(z, height) in heights {
+        (z.to_bits(), height.to_bits(), cut_z(p, z, height).to_bits()).hash(&mut h);
+    }
+    Some(h.finish())
+}
+
+/// The warp key of an adaptive part whose source has a cut key. `job` is before its overrides.
+pub fn grade_key(o: &ObjectInput, job: &Job, heights: &[(f64, f64)]) -> Option<u64> {
+    let own;
+    let job = if o.overrides.is_empty() { job } else { own = job.with_overrides(&o.overrides); &own };
+    grade_key_for(o, &Params::from_job(job, o.filament), XyComp::of(job, o), heights)
+}
+
+/// The warp a plan with these inputs can use without reading the whole part.
+pub fn held_grade(o: &ObjectInput, job: &Job, heights: &[(f64, f64)]) -> Option<Arc<grade::Graded>> {
+    grade::held(grade_key(o, job, heights)?)
+}
+
+/// Prepare the warp for the part's windows from every layer's raw contours, in height order.
+pub fn solve_grade(ctl: par::Ctl, o: &ObjectInput, job: &Job, heights: &[(f64, f64)], contours: Vec<Vec<ExPolygon>>) -> Result<Option<Arc<grade::Graded>>, par::Cancelled> {
+    let own;
+    let resolved = if o.overrides.is_empty() { job } else { own = job.with_overrides(&o.overrides); &own };
+    let p = Params::from_job(resolved, o.filament);
+    let Some(a) = &p.sparse_opts.adaptive else { return Ok(None) };
+    if ctl.cancelled() { return Err(par::Cancelled); }
+    let key = grade_key_for(o, &p, XyComp::of(resolved, o), heights);
+    if let Some(g) = key.and_then(grade::held) { return Ok(Some(g)); }
+    assert_eq!(heights.len(), contours.len(), "a grade needs one contour set per layer");
+    let outlines = plan_outline(ctl, o, job, heights, contours)?;
+    if ctl.cancelled() { return Err(par::Cancelled); }
+    let layers: Vec<_> = heights.iter().zip(&outlines).map(|(&(z, h), o)| (z, h, o.as_slice())).collect();
+    Ok(Some(grade::graded_shared(key, &layers, a, p.density, grade_period(&p))))
+}
+
+/// Contour dependencies of a model window, including the whole part behind an adaptive warp.
+/// Region paint additionally reads the whole part to discover its streams.
 pub fn plan_reads(p: &Params, lo: usize, hi: usize, n: usize) -> (usize, usize) {
+    if p.sparse_opts.adaptive.is_some() { return (0, n); }
+    plan_reads_held(p, lo, hi, n)
+}
+
+/// A window's contour context once its warp is available. A vase still plans whole. Callers
+/// supplying paint must also cover its region streams or position-paint skin ([`paint_reads`]).
+pub fn plan_reads_held(p: &Params, lo: usize, hi: usize, n: usize) -> (usize, usize) {
     if p.exp.vase.is_some() { return (0, n); }
     let hi = hi.min(n);
     if lo >= hi { return (hi, hi); }
     plan_context(p, lo, hi, n)
+}
+
+/// The layers whose middles lie within `d` (mm) of layer `k`'s middle, below and above.
+pub(crate) fn skin_span(heights: &[(f64, f64)], d: f64, k: usize) -> (usize, usize) {
+    let mid = |j: usize| heights[j].0 - 0.5 * heights[j].1;
+    let z = mid(k);
+    let lo = (0..k).rev().take_while(|&j| mid(j) >= z - d).last().unwrap_or(k);
+    let hi = (k + 1..heights.len()).take_while(|&j| mid(j) <= z + d).last().unwrap_or(k);
+    (lo, hi)
+}
+
+/// The contours a window of a part painted by position reads besides its context: the layers
+/// within the paint's skin of its own, whose outlines bound each layer's inside.
+pub fn paint_reads(p: &Params, heights: &[(f64, f64)], lo: usize, hi: usize) -> (usize, usize) {
+    let hi = hi.min(heights.len());
+    if lo >= hi || p.paint_inside_cell.is_none() { return (lo.min(hi), hi); }
+    (skin_span(heights, p.paint_skin, lo).0, skin_span(heights, p.paint_skin, hi - 1).1 + 1)
 }
 
 /// The outline after XY compensation and non-planar clipping, used by model

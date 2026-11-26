@@ -31,7 +31,8 @@
 //! The job-map mutex covers only inserts, lookups and removals; progress locks cover field reads
 //! or swaps, the basis recipe mutex covers only taking the recipe, and the outbox lock covers
 //! superseding and pushing events. Builds, routes and checks run outside these locks, as does the
-//! UI wake callback. Jobs that need one basis at once wait on its `OnceLock`, on pool threads only.
+//! UI wake callback. Jobs that need one basis at once wait on its `ComputeOnce`, on pool threads
+//! only and without their CPU permit, so the job building it paces like any other.
 //! The UI never waits for work.
 //!
 //! Cost on the thread: a non-global base updates the unit's world in O(delta log n); the first
@@ -49,7 +50,7 @@
 
 use crate::auto::GridRouter;
 use crate::channel::{Publisher, RouteInbox, Work};
-use crate::check::{check, refilled, Basis, State};
+use crate::check::{check, refilled, Basis, Outcome, State};
 use crate::gesture::{GestureKind, GestureSample};
 use crate::head::{self, Answer, GestureState};
 use crate::problem::{problem, scope_nets, Autorouter, RouteProblem};
@@ -57,16 +58,19 @@ use crate::progress::{NetStatus, Progress};
 use crate::proposal::{
     Checked, Explanation, JobId, JobStatus, ProposalId, ProposalSource, RouteEvent, RouteProposal, SampleCause, SampleRefused,
 };
-use crate::request::{Base, Effort, Engine, Method, RouteJob, RouteRequest, RouteScope};
+use crate::place::job::{branches, PlaceOffer, Takes};
+use crate::request::{Base, Effort, Engine, Method, PlaceJob, PlaceMode, RouteJob, RouteRequest, RouteScope};
 use crate::solution::{Reason, RouteMetrics, RouteSolution};
 use crate::solvers;
 use crate::world::RBase;
 use fab_elec_board::drc::drc_indexed;
-use fab_elec_board::{drc, BoardDelta, IndexChange, Origin, PieceIndex, ZoneFill};
-use fab_elec_core::{BoardId, ContentHash, NetId};
+use fab_elec_board::{drc, Board, BoardDelta, BoardOp, IndexChange, OpError, Origin, PieceIndex, ZoneFill};
+use fab_elec_circuit::{CheckKind, Violation};
+use fab_elec_core::{BoardId, ContentHash, ItemId, NetId, Sel};
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, Ordering};
+use makepad_core_util::once::ComputeOnce;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -102,7 +106,7 @@ struct Unit {
 /// needs it, on that job's pool thread, never on the worker's thread.
 struct BasisCell {
     recipe: Mutex<Option<Recipe>>,
-    built: OnceLock<Basis>,
+    built: ComputeOnce<Basis>,
 }
 
 enum Recipe {
@@ -114,14 +118,15 @@ enum Recipe {
 
 impl BasisCell {
     fn new(recipe: Recipe) -> BasisCell {
-        BasisCell { recipe: Mutex::new(Some(recipe)), built: OnceLock::new() }
+        BasisCell { recipe: Mutex::new(Some(recipe)), built: ComputeOnce::new() }
     }
 
     fn get(&self) -> &Basis {
         self.built.get_or_init(|| {
             heavy("basis");
             let recipe = self.recipe.lock().unwrap_or_else(|e| e.into_inner()).take().expect("an unbuilt basis has its recipe");
-            // the recipe's guard is gone before any build, or any wait on the previous basis
+            // the recipe's guard is gone before any build, or any wait on the previous basis; other
+            // route jobs wait for this build off the CPU, so it gives the host's pool its turns
             match recipe {
                 Recipe::Full(base) => {
                     let index = PieceIndex::build(&base.board, &base.fills);
@@ -205,6 +210,42 @@ pub fn replay(base: Base, job: &RouteJob, steps: Vec<u32>) -> Vec<RouteProposal>
     proposals
 }
 
+/// A release can commit any final gesture proposal that carries ops. A track-to-mate
+/// collision already found by the verifier must therefore reach the pane as a refusal.
+/// Intermediate shove and Finish tiers may still clear it before release.
+pub(crate) fn gesture_event(base: &Base, proposal: RouteProposal) -> RouteEvent {
+    if let ProposalSource::Gesture { id, seq, .. } = proposal.source {
+        if let Some(reason) = proposal.metrics.pair_refusal.as_ref().or_else(|| proposal.metrics.tune.as_ref()?.as_ref().err()) {
+            return RouteEvent::Refused(SampleRefused { id, seq, unit: base.unit, cause: SampleCause::Invalid, text: reason.clone() });
+        }
+    }
+    if proposal.last && !proposal.verified && !proposal.collisions.is_empty() && !base.board.pairs.is_empty() {
+        let track_net = |sel: &Sel| {
+            let Sel::Item(unit, id) = sel else { return None };
+            if *unit != base.unit { return None; }
+            for op in &proposal.ops {
+                if let BoardOp::Add(fab_elec_board::Item::Track(t)) | BoardOp::Replace(fab_elec_board::Item::Track(t)) = op {
+                    if t.id == *id { return Some(t.net); }
+                }
+            }
+            let (fab_elec_board::ItemKind::Track, i) = base.board.locate(*id)? else { return None };
+            base.board.tracks.get(i).map(|t| t.net)
+        };
+        if let ProposalSource::Gesture { id, seq, .. } = proposal.source {
+            for hit in &proposal.collisions {
+                if let (Some(a), Some(b)) = (track_net(&hit.a), track_net(&hit.b)) {
+                    if base.rules.partner(a).is_some_and(|(mate, gap)| mate == b && gap > 0) {
+                        return RouteEvent::Refused(SampleRefused { id, seq, unit: base.unit, cause: SampleCause::Invalid,
+                            text: format!("the tracks would violate their pair gap ({:.6} mm, need {:.6} mm)",
+                                f64::from(hit.gap)/1e6, f64::from(hit.need)/1e6) });
+                    }
+                }
+            }
+        }
+    }
+    RouteEvent::Proposal(proposal)
+}
+
 /// The route worker: one long-lived thread owns each unit's newest committed base, takes bases
 /// first and samples in turn with the other commands, and runs jobs on `Spawn` over `Arc` snapshots.
 pub struct RouteWorker {
@@ -286,9 +327,9 @@ impl RouteWorker {
                 Work::Request(RouteRequest::Restyle(job)) => {
                     self.unavailable(job.job, job.unit, "not available yet");
                 }
-                Work::Request(RouteRequest::Place(job)) => {
-                    self.unavailable(job.job, job.unit, "not available yet");
-                }
+                Work::Request(RouteRequest::Tune(job)) => self.tune(job),
+                Work::Request(RouteRequest::Pair(job)) => self.pair(job),
+                Work::Request(RouteRequest::Place(job)) => self.place(job),
             }
         }
     }
@@ -326,7 +367,7 @@ impl RouteWorker {
             Answer::Proposal(proposal) => {
                 let hand = (sample.gesture.finish && matches!(sample.gesture.kind, GestureKind::Route)).then(|| proposal.clone());
                 // The stretch answer goes first: the Finish is published after it.
-                self.publisher.publish(RouteEvent::Proposal(proposal));
+                self.publisher.publish(gesture_event(&unit.base, proposal));
                 if let Some(hand) = hand {
                     let progress = Arc::new(Progress::new());
                     if let Some(old) = live.finishing.replace(progress.clone()) {
@@ -339,7 +380,7 @@ impl RouteWorker {
                         let id = ProposalId(next_proposal.fetch_add(1, Ordering::Relaxed));
                         let finished = head::finish(&base, &world, basis.get(), &sample, &hand, id, &progress);
                         if !progress.cancelled() {
-                            publisher.publish(RouteEvent::Proposal(finished));
+                            publisher.publish(gesture_event(&base, finished));
                         }
                     }));
                 }
@@ -362,7 +403,7 @@ impl RouteWorker {
         let (id, seq, inbox) = (live.sample.id, live.sample.seq, &self.inbox);
         let stale = || inbox.waiting_sample().is_some_and(|(other, newer)| other != id || newer > seq);
         if let Some((full, _)) = head::shove_step_until(&unit.base, &unit.world, &mut live.state, || ProposalId(next.fetch_add(1, Ordering::Relaxed)), &stale) {
-            self.publisher.publish(RouteEvent::Proposal(full));
+            self.publisher.publish(gesture_event(&unit.base, full));
         }
     }
 
@@ -414,21 +455,7 @@ impl RouteWorker {
         });
         #[cfg(not(feature = "test-hooks"))]
         let after = None;
-        let status_publisher = self.publisher.clone();
-        let progress = checker.progress(PARTIAL_EVERY, PARTIAL_FLOOR, after, move |status| {
-            status_publisher.publish(RouteEvent::Status(JobStatus {
-                job: job.job,
-                unit: job.unit,
-                phase: status.phase,
-                current: status.current,
-                routed: status.routed,
-                failed: status.failed,
-                total: status.total,
-                attempt: status.attempt,
-                retry: status.retry,
-                blocked_by: status.blocked_by,
-            }));
-        });
+        let progress = checker.progress(PARTIAL_EVERY, PARTIAL_FLOOR, after, status_sink(self.publisher.clone(), job.job, job.unit));
         self.jobs.lock().unwrap_or_else(|e| e.into_inner()).insert(job.job, progress.clone());
         let jobs = self.jobs.clone();
         self.spawn.spawn(Box::new(move || {
@@ -436,9 +463,108 @@ impl RouteWorker {
             let mut problem = problem_on_pool(&base, world, &job.scope, job.style.unwrap_or_default(), job.effort);
             problem.reroute = job.reroute;
             let (step, solution) = output.solve(&problem, &progress, job.method);
-            checker.offer(step, Arc::new(solution), true);
+            checker.offer(step, Offer::Route(Arc::new(solution)), true);
             let removed = jobs.lock().unwrap_or_else(|e| e.into_inner()).remove(&job.job);
             drop(removed);
+        }));
+    }
+
+    /// `elec.place` with `@place`: off the thread, as a route job runs, with its progress in the job
+    /// map so `Cancel` stops it between seeding rounds. Each seeding kept is checked and published
+    /// as a proposal (`place::job`), the newest waiting offer replacing an older one.
+    fn place(&self, job: PlaceJob) {
+        let Some(unit) = self.units.get(&job.unit) else {
+            self.unavailable(job.job, job.unit, "no committed board for this unit");
+            return;
+        };
+        if job.mode != PlaceMode::Place {
+            self.unavailable(job.job, job.unit, "legalising is an edit (elec.place with mode @legalise), not a job");
+            return;
+        }
+        let base = unit.base.clone();
+        let publisher = self.publisher.clone();
+        let emit: Emit = Arc::new(move |proposal| publisher.publish(RouteEvent::Proposal(proposal)));
+        let output = unit.output(job.job, self.next_proposal.clone(), emit.clone());
+        let checker = Checker::new(output, self.spawn.clone());
+        let progress = Arc::new(Progress::new().with_status(status_sink(self.publisher.clone(), job.job, job.unit)));
+        self.jobs.lock().unwrap_or_else(|e| e.into_inner()).insert(job.job, progress.clone());
+        let (jobs, next_proposal) = (self.jobs.clone(), self.next_proposal.clone());
+        let pool = self.spawn.clone();
+        self.spawn.spawn(Box::new(move || {
+            heavy("place");
+            let job = Arc::new(job);
+            let offer = &mut |step, offer, last| checker.offer(step, Offer::Place(job.clone(), offer), last);
+            if let Err(why) = crate::place::job::run(&base.board, &job, &progress, offer, pool) {
+                let id = ProposalId(next_proposal.fetch_add(1, Ordering::Relaxed));
+                emit(no_proposal(id, job.job, base.unit, (base.board.generation, base.hash), why));
+            }
+            let removed = jobs.lock().unwrap_or_else(|e| e.into_inner()).remove(&job.job);
+            drop(removed);
+        }));
+    }
+
+    fn pair(&self, job: crate::request::PairJob) {
+        let Some(unit) = self.units.get(&job.unit) else {
+            self.unavailable(job.job, job.unit, "no committed board for this unit");
+            return;
+        };
+        let publisher = self.publisher.clone();
+        let emit: Emit = Arc::new(move |p| publisher.publish(RouteEvent::Proposal(p)));
+        let output = unit.output(job.job, self.next_proposal.clone(), emit);
+        let world = unit.world.clone();
+        self.spawn.spawn(Box::new(move || {
+            let base = &output.base;
+            let id = ProposalId(output.next_proposal.fetch_add(1, Ordering::Relaxed));
+            let name = base.board.nets.get(job.route.net.ix()).map_or("pair", |n| n.name.as_str());
+            let mut offer = no_proposal(id, job.job, base.unit, (base.board.generation, base.hash), format!("Route pair {name}"));
+            let request = crate::pair::Request { route: &job.route, connectivity: &base.conn };
+            match crate::pair::plan(&base.board, &base.rules, &crate::World::new(&world), request) {
+                Ok(plan) => {
+                    offer.ops = plan.ops();
+                    // The endpoint at a free station is deliberately open. Skew is reported
+                    // on the resulting pair and can be corrected by tuning the shorter leg.
+                    output.check_into(&mut offer, |v| !matches!(v.kind, CheckKind::Dangling | CheckKind::Skew | CheckKind::Length));
+                    if offer.verified {
+                        offer.pair = Some(plan.report);
+                    } else {
+                        offer.ops.clear();
+                        offer.checked = None;
+                        offer.metrics.pair_refusal = Some(format!("{}: the proposed pair failed board verification", offer.label));
+                    }
+                }
+                Err(reason) => offer.metrics.pair_refusal = Some(reason),
+            }
+            (output.emit)(offer);
+        }));
+    }
+
+    fn tune(&self, job: crate::request::TuneJob) {
+        let Some(unit) = self.units.get(&job.unit) else {
+            self.unavailable(job.job, job.unit, "no committed board for this unit");
+            return;
+        };
+        let publisher = self.publisher.clone();
+        let emit: Emit = Arc::new(move |p| publisher.publish(RouteEvent::Proposal(p)));
+        let output = unit.output(job.job, self.next_proposal.clone(), emit);
+        let world = unit.world.clone();
+        self.spawn.spawn(Box::new(move || {
+            let base = &output.base;
+            let id = ProposalId(output.next_proposal.fetch_add(1, Ordering::Relaxed));
+            let mut proposal = no_proposal(id, job.job, base.unit, (base.board.generation, base.hash), "Tune net".into());
+            let request = crate::meander::Request { tune: &job.tune, circuit: &job.circuit, connectivity: &base.conn };
+            let result = crate::meander::plan(&base.board, &base.rules, &crate::world::World::new(&world), request);
+            drop(world);
+            proposal.metrics.tune = Some(match result {
+                Ok(plan) => {
+                    proposal.label = format!("Tune {}", base.board.nets[job.tune.net.ix()].name);
+                    proposal.ops = plan.ops;
+                    output.check_into(&mut proposal, |v| !matches!(v.kind, CheckKind::Skew | CheckKind::Length));
+                    if proposal.verified { Ok(plan.report) }
+                    else { Err(format!("{}: the proposed folds failed board verification", proposal.label)) }
+                }
+                Err(reason) => Err(reason),
+            });
+            (output.emit)(proposal);
         }));
     }
 
@@ -462,22 +588,49 @@ impl RouteWorker {
     }
 
     fn unavailable(&self, job: JobId, unit: BoardId, label: &str) {
-        self.publisher.publish(RouteEvent::Proposal(RouteProposal {
-            id: ProposalId(self.next_proposal.fetch_add(1, Ordering::Relaxed)),
-            source: ProposalSource::Job { job, step: 0 },
+        let id = ProposalId(self.next_proposal.fetch_add(1, Ordering::Relaxed));
+        let (generation, hash) = self.units.get(&unit).map_or((0, ContentHash::default()), |held| (held.base.board.generation, held.base.hash));
+        self.publisher.publish(RouteEvent::Proposal(no_proposal(id, job, unit, (generation, hash), label.into())));
+    }
+}
+
+/// A job's last proposal when it has none to make: no ops, `label` saying why, against the base
+/// (generation, hash) the worker holds.
+fn no_proposal(id: ProposalId, job: JobId, unit: BoardId, (base_generation, base_hash): (u64, ContentHash), label: String) -> RouteProposal {
+    RouteProposal {
+        pair: None,
+        id,
+        source: ProposalSource::Job { job, step: 0 },
+        unit,
+        base_generation,
+        base_hash,
+        ops: Vec::new(),
+        checked: None,
+        metrics: RouteMetrics::default(),
+        verified: false,
+        collisions: Vec::new(),
+        open: Vec::new(),
+        head: None,
+        solve_us: 0,
+        last: true,
+        label,
+    }
+}
+
+/// A job's status, published as the worker's `RouteEvent::Status`.
+fn status_sink(publisher: Publisher, job: JobId, unit: BoardId) -> impl Fn(NetStatus) + Send + Sync + 'static {
+    move |status| {
+        publisher.publish(RouteEvent::Status(JobStatus {
+            job,
             unit,
-            base_generation: self.units.get(&unit).map_or(0, |unit| unit.base.board.generation),
-            base_hash: self.units.get(&unit).map_or_else(ContentHash::default, |unit| unit.base.hash),
-            ops: Vec::new(),
-            checked: None,
-            metrics: RouteMetrics::default(),
-            verified: false,
-            collisions: Vec::new(),
-            open: Vec::new(),
-            head: None,
-            solve_us: 0,
-            last: true,
-            label: label.into(),
+            phase: status.phase,
+            current: status.current,
+            routed: status.routed,
+            failed: status.failed,
+            total: status.total,
+            attempt: status.attempt,
+            retry: status.retry,
+            blocked_by: status.blocked_by,
         }));
     }
 }
@@ -528,8 +681,14 @@ const PARTIAL_EVERY: Duration = Duration::from_millis(100);
 const PARTIAL_FLOOR: Duration = Duration::from_millis(33);
 
 struct CheckState {
-    waiting: Option<(u32, Arc<RouteSolution>, bool)>,
+    waiting: Option<(u32, Offer, bool)>,
     running: bool,
+}
+
+/// What a job hands its checker: a route's solution, or a place job's proposal.
+enum Offer {
+    Route(Arc<RouteSolution>),
+    Place(Arc<PlaceJob>, Arc<PlaceOffer>),
 }
 
 impl Checker {
@@ -556,7 +715,7 @@ impl Checker {
         let partials = self.clone();
         let progress = Arc::new(
             Progress::with_sink(every, move |step, solution| {
-                partials.offer(step, solution, false);
+                partials.offer(step, Offer::Route(solution), false);
                 if let Some(after) = &after {
                     after(step);
                 }
@@ -569,10 +728,10 @@ impl Checker {
         progress
     }
 
-    fn offer(self: &Arc<Self>, step: u32, solution: Arc<RouteSolution>, last: bool) {
+    fn offer(self: &Arc<Self>, step: u32, offer: Offer, last: bool) {
         let (replaced, start) = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let replaced = state.waiting.replace((step, solution, last));
+            let replaced = state.waiting.replace((step, offer, last));
             let start = !state.running;
             if start {
                 state.running = true;
@@ -596,14 +755,17 @@ impl Checker {
                 }
                 offer
             };
-            let Some((step, solution, last)) = offer else {
+            let Some((step, offer, last)) = offer else {
                 // Idle again: ask for the router's next partial, outside the lock.
                 if let Some(progress) = self.progress.get().and_then(Weak::upgrade) {
                     progress.want_offer();
                 }
                 return;
             };
-            self.output.publish(step, &solution, last);
+            match &offer {
+                Offer::Route(solution) => self.output.publish(step, solution, last),
+                Offer::Place(job, place) => self.output.publish_place(step, job, place, last),
+            }
         }
     }
 }
@@ -631,6 +793,7 @@ impl JobOutput {
 
     fn publish(&self, step: u32, solution: &RouteSolution, last: bool) {
         let mut proposal = RouteProposal {
+            pair: None,
             id: ProposalId(self.next_proposal.fetch_add(1, Ordering::Relaxed)),
             source: ProposalSource::Job { job: self.job, step },
             unit: self.base.unit,
@@ -659,20 +822,38 @@ impl JobOutput {
             }
             .into(),
         };
+        self.check_into(&mut proposal, |_| true);
+        (self.emit)(proposal);
+    }
+
+    /// Apply `proposal`'s ops to a copy of the base and check them there: its `checked`, the new
+    /// findings that `counts`, and whether it is verified (none), or a label saying the ops did not
+    /// apply.
+    fn check_into(&self, proposal: &mut RouteProposal, counts: fn(&Violation) -> bool) {
         let mut board = (*self.base.board).clone();
+        let checked = check(&mut board, &proposal.ops, &self.check_state(&IndexChange::all())).map(|out| (board, out));
+        Self::fill_checked(proposal, checked, counts);
+    }
+
+    /// The committed board state against which every offer and retry is checked.
+    fn check_state<'a>(&'a self, since: &'a IndexChange) -> State<'a> {
         let basis = self.basis.get();
-        let state = State {
+        State {
             rules: &self.base.rules,
             fills: &self.base.fills,
             index: &basis.index,
             conn: &self.base.conn,
             violations: &basis.violations,
-            // the base's connectivity may hold zones over updates this job never saw
-            since: &IndexChange::all(),
-        };
-        match check(&mut board, &proposal.ops, &state) {
-            Ok(out) => {
-                proposal.metrics.new_violations = out.new.len() as u32;
+            since,
+        }
+    }
+
+    /// `proposal`'s `checked`, the new findings that `counts`, and whether it is verified (none),
+    /// or a label saying the ops did not apply.
+    fn fill_checked(proposal: &mut RouteProposal, checked: Result<(Board, Outcome), OpError>, counts: fn(&Violation) -> bool) {
+        match checked {
+            Ok((board, out)) => {
+                proposal.metrics.new_violations = out.new.iter().filter(|&&i| counts(&out.violations[i])).count() as u32;
                 proposal.verified = proposal.metrics.new_violations == 0;
                 proposal.checked = Some(Arc::new(Checked {
                     board: Arc::new(board),
@@ -680,8 +861,46 @@ impl JobOutput {
                     violations: Arc::new(out.violations),
                 }));
             }
-            Err(error) => proposal.label = format!("route application failed: {error}"),
+            Err(error) => proposal.label = format!("{} application failed: {error}", proposal.label),
         }
+    }
+
+    /// A place job's proposal, checked as a route's is: its ops applied to a copy of the base and
+    /// DRC run near them; `verified` means no new finding. The router's copper that a new finding
+    /// names (a part's new spot collides with it, or a via the removals left joining one layer) is
+    /// removed with what hangs on it (`branches`) and the proposal checked again, until no new
+    /// finding names any: the router lays it again. Authored and locked copper stay, and a finding
+    /// on them stays. Each round removes copper, so the rounds end; one check each, and none
+    /// when the first check finds nothing new.
+    fn publish_place(&self, step: u32, job: &PlaceJob, place: &PlaceOffer, last: bool) {
+        let mut proposal = no_proposal(
+            ProposalId(self.next_proposal.fetch_add(1, Ordering::Relaxed)), self.job, self.base.unit,
+            (self.base.board.generation, self.base.hash), if last { "place" } else { "place (partial)" }.into(),
+        );
+        (proposal.source, proposal.last, proposal.ops) = (ProposalSource::Job { job: self.job, step }, last, place.ops.clone());
+        let mut metrics = place.metrics.clone();
+        // Placing makes connections for the router: an unrouted one is the job's purpose, not a fault.
+        let counts: fn(&Violation) -> bool = |v| v.kind != CheckKind::Unconnected;
+        let since = IndexChange::all();
+        let state = self.check_state(&since);
+        let rooms = place.rooms.as_deref().unwrap_or(&job.rooms);
+        let check_ops = |ops: &[BoardOp]| job.check_with_rooms(&self.base.board, ops, &state, rooms);
+        let mut checked = check_ops(&proposal.ops);
+        let mut removed: BTreeSet<ItemId> = proposal.ops.iter().filter_map(|op| match op { BoardOp::Remove(id) => Some(*id), _ => None }).collect();
+        while let Ok((_, out)) = &checked {
+            let seeds: Vec<ItemId> = out.new.iter().map(|&i| &out.violations[i]).filter(|v| counts(v))
+                .flat_map(|v| v.items.iter().filter_map(|s| match s { Sel::Item(_, id) => Some(*id), _ => None }))
+                .collect();
+            let more: Vec<ItemId> = branches(&self.base.board, seeds, Takes::Solved).into_iter().filter(|id| !removed.contains(id)).collect();
+            if more.is_empty() { break }
+            metrics.ripped += more.len() as u32;
+            metrics.fix_rounds += 1;
+            removed.extend(more.iter().copied());
+            proposal.ops.extend(more.into_iter().map(BoardOp::Remove));
+            checked = check_ops(&proposal.ops);
+        }
+        proposal.metrics.place = Some(metrics);
+        Self::fill_checked(&mut proposal, checked, counts);
         (self.emit)(proposal);
     }
 }
@@ -804,7 +1023,7 @@ mod tests {
             method: Method::Interactive,
             engine: Engine::Grid,
             style: None,
-            effort: Effort(1),
+            effort: Effort::Full,
             layers: None,
             reroute: false,
         };
@@ -922,9 +1141,9 @@ mod tests {
         };
 
         let (checker, proposals) = make_checker();
-        checker.offer(1, Arc::new(RouteSolution::default()), false);
-        checker.offer(2, Arc::new(RouteSolution::default()), false);
-        checker.offer(3, Arc::new(RouteSolution::default()), true);
+        checker.offer(1, Offer::Route(Arc::new(RouteSolution::default())), false);
+        checker.offer(2, Offer::Route(Arc::new(RouteSolution::default())), false);
+        checker.offer(3, Offer::Route(Arc::new(RouteSolution::default())), true);
         assert_eq!(queue.0.lock().unwrap_or_else(|e| e.into_inner()).len(), 1, "only one check task is queued");
         queue.run();
         assert_eq!(
@@ -934,9 +1153,9 @@ mod tests {
         );
 
         let (checker, proposals) = make_checker();
-        checker.offer(1, Arc::new(RouteSolution::default()), false);
+        checker.offer(1, Offer::Route(Arc::new(RouteSolution::default())), false);
         queue.run();
-        checker.offer(2, Arc::new(RouteSolution::default()), true);
+        checker.offer(2, Offer::Route(Arc::new(RouteSolution::default())), true);
         queue.run();
         assert_eq!(
             published(&proposals),
@@ -944,7 +1163,7 @@ mod tests {
             "offers checked one at a time are published in order, the final last"
         );
 
-        checker.offer(4, Arc::new(RouteSolution::default()), false);
+        checker.offer(4, Offer::Route(Arc::new(RouteSolution::default())), false);
         assert_eq!(
             queue.0.lock().unwrap_or_else(|e| e.into_inner()).len(),
             1,

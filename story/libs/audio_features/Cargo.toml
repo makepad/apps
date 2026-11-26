@@ -1,0 +1,23 @@
+# Audio as animation data: what a Motion document, the
+# edit's musical time references and the Generate agent read from the
+# music and the voice.
+#
+# Music: BPM, beat and downbeat grid (the one detector, makepad-beat),
+# onsets with strength, a loudness/energy envelope, band energies per frame
+# and sections (intro, build, drop, break, verse, outro). Voice: amplitude
+# envelope, pitch, pauses, syllable nuclei, and per word its loudness,
+# pitch and emphasis. Pure functions of the samples, at a fixed feature
+# rate, with JSON for caching beside the asset and for the tools.
+[package]
+name = "makepad-story-audio-features"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+makepad-beat = { path = "../../../../../libs/beat" }
+makepad-strict-json = { path = "../../../../../libs/strict_json" }
+# The pure timing input Motion documents read (`voice(@id)`, `music(@id)`):
+# this crate's analysis converts into it (`to_motion`).
+makepad-motion = { path = "../../../../apps/engine/motion", default-features = false }

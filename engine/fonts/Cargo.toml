@@ -1,0 +1,22 @@
+# Document fonts: the one table of the font families a document can name,
+# bundled (this crate's resources/fonts, the widget library's) or downloaded
+# (Stage's Resources), and where their files are. No VM, no GPU: Motion's
+# loader, the drawing side, the font picker and the bundlers all read it.
+[package]
+name = "makepad-doc-fonts"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "The document font table: families, their files, aliases and licences, and where the files are"
+
+[lib]
+name = "makepad_doc_fonts"
+
+[features]
+# The widget library's resources at their place in this source tree, for
+# the tests (a host registers where its build keeps them: `register_root`).
+dev-roots = []
+
+[dependencies]
+makepad-asset-data = { path = "../../../apps/engine/asset/data" }

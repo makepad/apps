@@ -1,0 +1,75 @@
+# The edit renderer: an edit evaluated frame by frame on
+# locked time into its own passes, read back and encoded to MP4 with its
+# audio mixed offline; the same compositor gives the EDIT page real preview
+# frames. A library the host drives from its draw, plus `makepad-edit-render`,
+# the standalone renderer (hidden window) that Stage, CI and tests call.
+[package]
+name = "makepad-story-edit-render"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "makepad_story_edit_render"
+
+[[bin]]
+name = "makepad-edit-render"
+path = "src/main.rs"
+required-features = ["store", "export", "models"]
+
+[features]
+default = ["store", "export", "models"]
+# The asset store: `StoreMedia`, render jobs (`job`), publishing a render.
+store = ["dep:makepad-asset-client", "makepad-story-edit-voice/publish"]
+# Files out: MP4 joins (`mux`), JPEG dumps, thumbnails for publishing.
+export = ["dep:makepad-mp4-index", "dep:jpeg-encoder"]
+# Scene3D's modelled props built by Stage's model host (a render waits for
+# them); a player of finished documents draws without it.
+models = ["dep:makepad-stage-model-host", "makepad-stage-motion3d/models", "makepad-motion/models", "makepad-motion-draw/models"]
+
+[dependencies]
+relax-attr = { path = "../../../../../libs/relax/attr" }
+makepad-script-compute-sched = { path = "../../../../../platform/script/compute_sched" }
+# The one loudness meter.
+makepad-audio-dsp = { path = "../../../../../libs/audio_dsp" }
+makepad-widgets = { path = "../../../../../widgets", default-features = false }
+makepad-story-cut = { path = "../cut" }
+# Voice takes' word times (`vj-lyrics` v5) and subtitle sidecars; no models.
+makepad-story-edit-voice = { path = "../edit_voice", default-features = false }
+# Effects and transitions through the packs a host installed (seekable views).
+makepad-content-packs = { path = "../../../../apps/engine/content_packs" }
+# Exact clip frames: `ReadVideo{at}` is the frame at or before `at`; Stage's
+# decoder budget, shared with the VJ decks.
+makepad-stage-asset-stream = { path = "../../../../apps/stage/libs/asset_stream" }
+# Whole-clip PCM for the offline mixdown.
+makepad-stage-audio-media = { path = "../../../../apps/engine/audio_media" }
+# The engine's decks play the preview's sound (a feed) and the export's mix.
+makepad-stage-live-audio = { path = "../../../../apps/stage/libs/live_audio" }
+makepad-asset-data = { path = "../../../../apps/engine/asset/data" }
+# Library media and publishing a render (`publish_render`).
+makepad-asset-client = { path = "../../../../apps/engine/asset/client", optional = true }
+# Motion-graphics effects (`kit/<name>` Fx presets): R2's render kit.
+makepad-stage-render-kit = { path = "../../../../apps/engine/render_kit" }
+# Motion graphics (`Graphic` nodes, titles): documents and their GPU drawing.
+makepad-motion = { path = "../../../../apps/engine/motion", default-features = false, features = ["scene3d"] }
+makepad-motion-draw = { path = "../../../../apps/engine/motion_draw", default-features = false, features = ["scene3d"] }
+# A preview compiles its Scene3D kernels on the pool ahead of the frames.
+makepad-stage-motion3d = { path = "../../../../apps/engine/motion3d", default-features = false }
+# Models a Scene3D places build in Stage's model host: an export waits for them.
+makepad-stage-model-host = { path = "../../../../apps/engine/model_host", optional = true }
+# A song's beats, onsets, energy and bands for the graphics that read it
+# (`music(@clip)`).
+makepad-story-audio-features = { path = "../audio_features" }
+# The song clips' pictures kinetic type and effects read (AudioTrack).
+makepad-audio-reactive = { path = "../../../../../libs/audio_reactive" }
+# The compute pool the preview's document loads fan out on.
+makepad-script-compute = { path = "../../../../../platform/script/compute" }
+# MP4 sample tables for the lossless join (`mux`).
+makepad-mp4-index = { path = "../../../../../libs/mp4_index", optional = true }
+# The render's catalogue thumbnail.
+jpeg-encoder = { path = "../../../../../libs/jpeg-encoder", version = "0.6.1", optional = true }
+
+[dev-dependencies]
+# A real store over loopback for the publish test.
+makepad-asset-store = { path = "../../../../apps/engine/asset/store" }

@@ -39,7 +39,11 @@ fn fixes(c: &JointCheck, layer: f64) -> Vec<String> {
 
 /// The joint checks of one jointed object (`mech`; none: the plate has no joints).
 pub fn check_value(mech: Option<&fab_model::mech::Mech>, checks: &[JointCheck]) -> S {
-    let Some(mech) = mech else { return obj(vec![("joints", arr(Vec::new())), ("note", s("no object has joints: m.hinge, m.ball, m.slider, m.bearing, m.chain"))]) };
+    let Some(mech) = mech else {
+        let mut fields = crate::checks::Check::NotChecked("no object has joints: m.hinge, m.ball, m.slider, m.bearing, m.chain".into()).fields();
+        fields.push(("joints", arr(Vec::new())));
+        return obj(fields);
+    };
     let layer = mech.plan.profile.layer;
     let all_ok = checks.iter().all(|c| c.ok());
     let worst = checks.iter().map(|c| c.risk).max().unwrap_or(Risk::Low);
@@ -51,7 +55,7 @@ pub fn check_value(mech: Option<&fab_model::mech::Mech>, checks: &[JointCheck]) 
         let field = if c.kind == "ball" { c.field } else { (-c.field.0, c.field.1) };
         obj(vec![
             ("joint", s(id)),
-            ("ok", flag(c.ok())),
+            crate::checks::Check::of(c.ok()).fields().remove(0),
             ("kind", s(c.kind)),
             ("parts", arr([s(&mech.names[c.a]), s(&mech.names[c.b])])),
             ("clearance", mm(c.clearance)),
@@ -69,7 +73,7 @@ pub fn check_value(mech: Option<&fab_model::mech::Mech>, checks: &[JointCheck]) 
         ])
     });
     obj(vec![
-        ("ok", flag(all_ok)),
+        crate::checks::Check::of(all_ok).fields().remove(0),
         ("geometry", s("design")),
         ("worst_fuse_risk", s(worst.name())),
         ("profile", obj(vec![("nozzle", mm(mech.plan.profile.nozzle)), ("layer", mm(layer)), ("material", s(&mech.plan.profile.material.name))])),

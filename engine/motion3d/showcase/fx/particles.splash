@@ -1,0 +1,13 @@
+use mod.scene.*; use mod.post
+// Particles family: burst, sparks, a trail along a curve, a text swarm assembling, embers.
+Scene3D{ background: #05060a tone_mapping: @aces
+  camera: Camera{position: vec3(0, 1.5, 11) target: vec3(0, 0.8, 0) focal_length: 35}
+  post: [post.Bloom{strength: 0.8 threshold: 0.7}]
+  lights: [AmbientLight{intensity: 0.4} DirectionalLight{position: vec3(3, 5, 4) intensity: 2}]
+  children: [
+    Fx{preset: @burst position: vec3(-4, 2.5, 0) start: 0.3 count: 500 color: #ffe39a color2: #ff4a2a}
+    Fx{preset: @sparks position: vec3(4, -0.5, 0) count: 300}
+    Fx{preset: @trail position: vec3(0, 3.2, -1) count: 800 color: #7fd6ff color2: #3f7cff}
+    Fx{preset: @text_swarm text: "SPARK" count: 2500 radius: 3 size: 0.05 position: vec3(0, 0.6, 0) start: 0.2 duration: 2.5 color: #ff5a36}
+    Fx{preset: @embers position: vec3(0, -1.2, 0) radius: 3 count: 300}
+  ] }

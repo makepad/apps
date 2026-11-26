@@ -416,7 +416,7 @@ fn run(name: &str, voices: usize, noisy: usize, metal: bool, rate: f64, exact: b
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("partition") {
-        let opts = PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: 1e-3, hub_tol: 0.1, fmin: 10.0, fmax: 48e3, band: f64::INFINITY, per_octave: 4, min_island: 8, control: vec![], supplies: Vec::new(), round: 32.0 / 96e3 };
+        let opts = PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: 1e-3, hub_tol: 0.1, fmin: 10.0, fmax: 48e3, band: f64::INFINITY, per_octave: 4, min_island: 8, control: vec![], supplies: Vec::new(), heard: Vec::new(), round: 32.0 / 96e3 };
         // the stand-in also with an ideal VA rail (what a cut at the rail would give), and at a
         // cut tolerance of 1e-2 (an accuracy trade, shown, not chosen)
         let loose = PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: 1e-2, ..opts.clone() };
@@ -448,7 +448,7 @@ fn main() {
     if args.first().map(String::as_str) == Some("held") {
         // the held step (`analysis::held`) and the round plan it gives (`analysis::round`) on the
         // same boards at their operating points; `held shares` adds each searched node's shares
-        let opts = PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: 1e-3, hub_tol: 0.1, fmin: 10.0, fmax: 48e3, band: f64::INFINITY, per_octave: 4, min_island: 8, control: vec![], supplies: Vec::new(), round: 32.0 / 96e3 };
+        let opts = PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: 1e-3, hub_tol: 0.1, fmin: 10.0, fmax: 48e3, band: f64::INFINITY, per_octave: 4, min_island: 8, control: vec![], supplies: Vec::new(), heard: Vec::new(), round: 32.0 / 96e3 };
         for (name, voices, noisy) in [("6 voices + 2 noise + metal bank", 6, 2), ("12 voices + 4 noise + metal bank", 12, 4), ("drum16 stand-in", 0, 0), ("drum16 stand-in, ideal VA rail", 0, 1)] {
             let circuit = if voices == 0 { edrum::board_with(noisy == 1) } else { board(voices, noisy, true) };
             let mut s = fab_elec_sim::Solver::new(&circuit).expect("the board builds");

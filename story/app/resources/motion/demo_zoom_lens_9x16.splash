@@ -1,0 +1,45 @@
+use mod.motion.*
+// ZOOM LENS, 9:16 — the portrait cut of demo_zoom_lens: the lens opens in
+// the middle of the safe area, 520 px across. Original notes follow.
+// ZOOM LENS — a magnifier for small UI. A ring marks the source area on
+// screen, a connector draws from it to the lens, and the lens springs open
+// showing what lies under the graphic (`@backdrop`), `zoom` times larger
+// around `target`. A solid rim and a soft shadow make the lens an object
+// floating above the recording. Transparent overlay; the lens content is
+// live, so it follows the video under it.
+// Why: showing source and magnification together keeps the viewer
+// oriented — they see where the detail lives, not just the detail.
+Motion{
+    label: "Zoom lens 9:16"
+    brief: "A circular magnifier showing the footage under it, enlarged around a target; portrait."
+    tags: ["demo", "overlay", "zoom", "magnify", "lens", "product", "9:16"]
+    size: vec2(1080, 1920) duration: 4.0
+    inputs: {
+        target: input(@vec2, vec2(950, 56), "What to magnify, px")
+        lens_at: input(@vec2, vec2(520, 700), "Centre of the lens, px")
+        zoom: input(@number, 2.6, "Magnification")
+        size: input(@number, 520, "Lens diameter, px")
+        rim: input(@color, #f4f7fa, "Rim, ring and connector")
+    }
+    layers: [
+        Group{
+            opacity: tween(1, 0, 3.6, 4.0, @ease_in_cubic)
+            layers: [
+                Ellipse{at: in(@target) - vec2(in(@size), in(@size)) * (0.5 / in(@zoom)) size: vec2(in(@size), in(@size)) / in(@zoom)
+                        stroke: in(@rim) width: 3 scale: tween(0, 1, 0.0, 0.4, @ease_out_back)}
+                Path{points: [in(@target), in(@lens_at)] stroke: in(@rim) width: 3 opacity: 0.8
+                     trim_end: tween(0, 1, 0.3, 0.7, @ease_in_out_cubic)}
+                Group{
+                    at: in(@lens_at)
+                    scale: tween(0, 1, 0.55, 1.2, spring(260, 20))
+                    layers: [
+                        Ellipse{at: vec2(in(@size), in(@size)) * -0.5 + vec2(0, 24) size: vec2(in(@size), in(@size)) fill: #00000099 feather: 60}
+                        Image{src: @backdrop zoom: in(@zoom) focus: in(@target)
+                              at: vec2(in(@size), in(@size)) * -0.5 size: vec2(in(@size), in(@size))}
+                        Ellipse{at: vec2(in(@size), in(@size)) * -0.5 size: vec2(in(@size), in(@size)) stroke: in(@rim) width: 8}
+                    ]
+                }
+            ]
+        }
+    ]
+}

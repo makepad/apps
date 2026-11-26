@@ -76,4 +76,5 @@ let mix    = mixer_out({sum: sum line: line ref: ref va: va gnd: gnd})
 let line_j = e.part(jack_3_5mm({}), {pins: {T: line R: line S: gnd}})
 
 e.fixed(usb, {edge: @left})
+e.fixed(line_j, {edge: @top})
 e.width(vbus, 0.5mm)

@@ -72,7 +72,7 @@ keymap! {
     Unhide => ("Alt+H", "Unhide all", "Design / Monitor", Global),
     Solo => ("/", "Solo the selection", "Design / Monitor", Global),
     Xray => ("Alt+Z", "X-ray", "Design / Monitor", Global),
-    Measure => ("M", "Measure (cycle distance, area, angle, edge, radius, faces)", "Design / Monitor", Global),
+    Measure => ("M", "Measure (cycle distance, area, angle, edge, radius, faces, fit)", "Design / Monitor", Global),
     Section => ("C", "Clip: a cross-section through the parts", "Design / Monitor (outside Sculpt)", Global),
     SectionBox => ("Shift+C", "Section box", "Design / Monitor", Global),
     SectionClear => ("Alt+C", "Clear section", "Design / Monitor", Global),
@@ -86,6 +86,8 @@ keymap! {
     MeasurePlace => ("LMB click", "Place point / pick edge or face", "Measure tool", Viewport),
     MeasureClose => ("Enter / RMB click", "Close the area loop", "Measure tool", Viewport),
     MeasureUndo => ("Backspace", "Remove the last point", "Measure tool (parts list / viewport)", ContextFocus),
+    FitTurn => ("R", "Turn 90°", "Measure Fit tool", Global),
+    FitClear => ("Esc", "Clear fit", "Measure Fit tool", Global),
     NoTreesBox => ("LMB drag", "No trees here: a box on the bed", "No-trees tool", Viewport),
     NoTreesDisc => ("Alt+LMB drag", "No trees here: a disc", "No-trees tool", Viewport),
     SettingsHereBox => ("LMB drag", "Print settings here: a box across the model (Sliced: on the shown layer)", "Settings-here tool", Viewport),
@@ -381,7 +383,7 @@ mod tests {
             Tool::Select, Tool::Section,
             Tool::Measure(MeasureKind::Distance), Tool::Measure(MeasureKind::Area),
             Tool::Measure(MeasureKind::Angle), Tool::Measure(MeasureKind::EdgeLength),
-            Tool::Measure(MeasureKind::Radius), Tool::Measure(MeasureKind::FaceDistance),
+            Tool::Measure(MeasureKind::Radius), Tool::Measure(MeasureKind::FaceDistance), Tool::MeasureFit,
         ] {
             let mut state = AppState::default();
             state.tool = tool;

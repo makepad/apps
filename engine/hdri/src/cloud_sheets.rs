@@ -10,12 +10,14 @@
 //!   hairs fade into its streams and their mean over the nearest stretch of that, by one weight its threshold blends by
 //!   too.
 //! - **Horizon.** The alpha is the cover times smoothstep(0, 0.12, sin el): nothing at and below the horizon.
+//! - **Contrails.** A Cirrus' Contrails row lays aircraft trails in its plane (`Trail`), their ice added to its own and
+//!   lit by its law; at Cover 0 the trails cross a clear sky alone.
 
 use makepad_draw::*;
 use crate::cloud_cover::{fingerprint, quantile_set, CoverRemap, MEASURE_SEED};
 use crate::cloud_light::{self, CoverSample, EntryLight, Shape};
 use crate::clouds::deck_opacity;
-use crate::noise::{billow2, fbm2, hash_u32, ridged2, value2};
+use crate::noise::{billow2, fbm2, hash01, hash_u32, ridged2, value2};
 use crate::volumetric::shell_distance;
 use crate::{cloud_layer_seed, CloudGenus, CloudLayerParams};
 
@@ -31,30 +33,10 @@ const DECK_OCTAVES: u32 = 6;
 const DECK_BROAD_OCTAVES: u32 = 3;
 /// The Stratocumulus' fine octaves: one fewer than the deck's, its cells and lumps carry the detail.
 const SC_OCTAVES: u32 = 5;
-/// sqrt(0.6): with Streak length 6.7 the Cirrus' frame is the older veil's 0.3 along and 2.0 across.
-const STREAK_SCALE: f32 = 0.774_596_7;
 /// The Cirrus' edge width: the older veil's band (clouds.rs:277).
 const CIRRUS_EDGE: f32 = 0.2;
-/// Fall streaks' shear along the wind, in the stretched frame's units.
-const FALL_SHEAR: f32 = 2.5;
-/// The Cirrus' streams, where its faint veil lies and its bundles gather: their frequency along and across the wind in
-/// the stretched, bent frame (at the default Size and Streak length a stream is some 20 km long and 3 km wide).
-const TUFT_ALONG: f32 = 2.0;
-const TUFT_ACROSS: f32 = 2.0;
-/// The body from which a patch starts and where it is full: below it the sky is clear.
-const TUFT_FROM: f32 = 0.4;
-const TUFT_TO: f32 = 0.95;
-/// The streams break along their length: a noise BREAK_ALONG cycles along a unit and BREAK_ACROSS across, smoothstepped
-/// from BREAK_FROM to BREAK_TO, scales them from BREAK_FLOOR to all (gaps and denser stretches every few km).
-const BREAK_ALONG: f32 = 8.0;
-const BREAK_ACROSS: f32 = 3.0;
-const BREAK_FROM: f32 = 0.3;
-const BREAK_TO: f32 = 0.7;
-const BREAK_FLOOR: f32 = 0.15;
-/// How much more a Fall streaks of 1 lengthens the bundles.
-const FALL_LENGTH: f32 = 0.6;
-/// The gather: a broad noise (GATHER_FREQ cycles a cell, smoothstepped from GATHER_FROM to GATHER_TO) that gathers the
-/// streams over tens of km, and the share of the noise it keeps where it is lowest (open blue).
+/// The gather: a broad noise (GATHER_FREQ cycles a cell, smoothstepped from GATHER_FROM to GATHER_TO) that gathers a
+/// Cirrus' trails over tens of km, and the share of the noise it keeps where it is lowest (open blue).
 const GATHER_FREQ: f32 = 0.45;
 const GATHER_FROM: f32 = 0.25;
 const GATHER_TO: f32 = 0.75;
@@ -204,120 +186,76 @@ fn clumps_over(f: Vec2f, field: f32, s: &Streams) -> f32 {
     CU_CLUMP_SHARE * clumps + (1.0 - CU_CLUMP_SHARE) * field
 }
 
-/// Where a Cirrus' streams break along their length, at a point `w` of their bent stretched frame: the share of them kept.
-fn stream_breaks(w: Vec2f, s: &Streams) -> f32 {
-    let n = value2(w.x * BREAK_ALONG + 7.3, w.y * BREAK_ACROSS + 2.9, s.0[4] ^ 0x2c1b_3c6d);
-    BREAK_FLOOR + (1.0 - BREAK_FLOOR) * smoothstep(BREAK_FROM, BREAK_TO, n)
-}
-
 // --- Cirrus ---
 
 /// The Earth's radius the sheets' plane is met on (volumetric.rs PLANET_M): a ray's local slope at its hit.
 const EARTH_M: f32 = 6_360_000.0;
 
-/// A Cirrus' bundles (design §4.3's streaks and hooks), sparse over its faint veil: one a cell of a grid in its
-/// streams' bent frame (cells of Size), BUNDLE_EMPTY of the cells holding none, each row of cells shifted along by its
-/// own amount so that no two rows line up. A bundle is a line from its head downwind, at most BUNDLE_LENGTH cells long
-/// (times the root of Streak length over BUNDLE_STREAK, and 1 + FALL_LENGTH x Fall streaks) and so BUNDLE_SPAN of its
-/// cell; its size runs from BUNDLE_LEAST to all, most of them small (the square of a uniform), and it turns off the
-/// wind by up to BUNDLE_TILT.
-const BUNDLE_STREAK: f32 = 7.0;
-const BUNDLE_LENGTH: f32 = 2.0;
-const BUNDLE_SPAN: f32 = 0.75;
-const BUNDLE_EMPTY: f32 = 0.2;
-const BUNDLE_LEAST: f32 = 0.2;
-const BUNDLE_TILT: f32 = 0.03;
-/// Its width: at its largest BUNDLE_WIDTH cells either side of its line (a smaller bundle by the root of its size),
-/// BUNDLE_HEAD of that at its head, fanning out by BUNDLE_FAN of it to its tail's end; a soft bell (1 - x^2)^2 across.
-const BUNDLE_WIDTH: f32 = 0.05;
-const BUNDLE_HEAD: f32 = 0.5;
-const BUNDLE_FAN: f32 = 4.0;
-/// The hook (uncinus): over the first BUNDLE_CURL cells from its head the line swings aside by up to BUNDLE_BEND of that
-/// at Hooks 1, by its own share and to its own side (a cube, so it curls at the head); its tail sweeps BUNDLE_SWEEP of
-/// its length the other way.
-const BUNDLE_CURL: f32 = 0.15;
-const BUNDLE_BEND: f32 = 1.0;
-const BUNDLE_SWEEP: f32 = 0.03;
-/// Its strength along it: a dense knot at the head, BUNDLE_KNOT more BUNDLE_KNOT_AT cells from its head (a bell
-/// BUNDLE_KNOT_SPAN cells wide), falling to BUNDLE_TAIL at its end, fraying out over its last BUNDLE_FRAY; its head's
-/// front is round; its brightness its own, from BUNDLE_DIM to all.
-const BUNDLE_KNOT: f32 = 1.2;
-const BUNDLE_KNOT_AT: f32 = 0.05;
-const BUNDLE_KNOT_SPAN: f32 = 0.06;
-const BUNDLE_TAIL: f32 = 0.35;
-const BUNDLE_FRAY: f32 = 0.35;
-const BUNDLE_DIM: f32 = 0.5;
-/// A row of cells is BUNDLE_ROW cells across; a head lies within BUNDLE_JITTER of a row of its row's middle. A bundle
-/// reaches across several rows (its widest bell, its hook, its sweep and its tilt), and a point looks in as many rows
-/// either side of its own.
-const BUNDLE_ROW: f32 = 0.12;
-const BUNDLE_JITTER: f32 = 0.5;
-/// Where a bundle shows: over the veil's density from 0 to BUNDLE_GATE.
-const BUNDLE_GATE: f32 = 0.5;
-/// Low down, where a ray runs through the layer's depth over BAND_FROM to BAND_TO cells along the view (elevations of
-/// some 22 down to 8 degrees at the defaults), the bundles merge into their mean: a soft band along the horizon.
-const BAND_FROM: f32 = 0.08;
-const BAND_TO: f32 = 0.25;
-
-/// A bundle's fibres: lanes along it in its fanning frame (across in half widths of its fan there, so they spread from
-/// the head; along in cells from its head). A lane is FIBRE_LANE half widths wide (FIBRE_FINE at Fineness 1), a lane
-/// cell FIBRE_CELL of the bundle's length long but FIBRE_CELL_LEAST to FIBRE_CELL_MOST cells (a tuft's fibres run its
-/// tail, a long streak's lie end to end). The lanes wave across by up to FIBRE_WAVE of a lane over FIBRE_WAVE_CELLS
-/// lane cells. Each lane
-/// cell starts one fibre, FIBRE_SPAN_LEAST to all of a cell long, rising over its first FIBRE_RISE and fading over its
-/// last FIBRE_FALL, a soft line (1 - g^2)^3 FIBRE_BELL of its lane wide either side, of its own brightness from
-/// FIBRE_LOW and place across its lane (within FIBRE_JITTER). It is there where the bundle's strength beats its own hash
-/// (within FIBRE_SOFT), so the bundle's edges and tail fray into separate fibres.
-const FIBRE_LANE: f32 = 0.16;
-const FIBRE_FINE: f32 = 0.08;
-const FIBRE_CELL: f32 = 0.3;
-const FIBRE_CELL_LEAST: f32 = 0.08;
-const FIBRE_CELL_MOST: f32 = 0.25;
-const FIBRE_WAVE: f32 = 2.0;
-const FIBRE_WAVE_CELLS: f32 = 1.5;
-const FIBRE_SPAN_LEAST: f32 = 0.6;
-const FIBRE_RISE: f32 = 0.2;
-const FIBRE_FALL: f32 = 0.4;
-const FIBRE_BELL: f32 = 0.8;
-const FIBRE_JITTER: f32 = 0.6;
-const FIBRE_LOW: f32 = 0.5;
-const FIBRE_SOFT: f32 = 0.4;
-/// A bundle's smooth share under its fibres is FIBRE_CORE x (1 - Fineness): at Fineness 1 its fibres alone carry it.
-const FIBRE_CORE: f32 = 0.6;
+/// A fibre's own depth (m): it blurs as the view sees through it, as the layer's depth blurs the tails.
+const FIBRE_DEPTH_M: f32 = 60.0;
 /// A box blur of a width is the bell's widening by BLUR_BELL of it.
 const BLUR_BELL: f32 = 0.5;
 
 /// The Cirrus look's numbers (design §2.3's ice family on a sheet), as the look rounds tune them. `HDRI_CIRRUS_LOOK`
-/// (for example `ca=0,4,0.3,0.6;cb=400,2.5,0.06,4;cc=0.3,60,0,0`, the defaults) overrides them, read once: a look round's
+/// (for example `ca=0,1.2,0.3,0.6;cf=48,6,0.6,0.25`) overrides them, read once: a look round's
 /// knobs, unset in normal runs.
 #[derive(Clone, Copy, Debug)]
 struct CirrusLook {
     /// ca.x: a flat share of the sun on top of the ice lobes (0: the shared law's ice phase alone).
     spread: f32,
-    /// ca.y: the optical depth straight up of a bundle's full strength at Opacity 1; ca.z: the least sine of the ray's
+    /// ca.y: the optical depth straight up of the trails' full strength at Opacity 1; ca.z: the least sine of the ray's
     /// slope through the sheet the slant path reads; ca.w: the share of the slant path taken (alpha = 1 - e^(-tau (1 +
     /// ca.w (1 / mu - 1)))).
     tau: f32,
     mu_min: f32,
     slant: f32,
-    /// cb.x: the layer's depth in metres, which a ray crosses over its depth / tan(elevation) along the view and so blurs
-    /// the bundles across their lines (low cirrus seen through its depth is a soft band); cb.y: the finest fibre kept,
-    /// in footprints of the texel and that blur; cb.z: the veil's optical depth over a bundle's full strength; cb.w:
-    /// Opacity's power in the optical depth (4: Opacity 0.5 is a sixteenth of ca.y, a thin cirrus).
-    depth_m: f32,
-    texels: f32,
+    /// cb.x, cb.y: unused (the bundles' blur by the layer's depth and their fibre lanes, taken out 2026-11-07); cb.z: the
+    /// veil's optical depth over the trails' full strength; cb.w: Opacity's power in the optical depth (4: Opacity 0.5
+    /// is a sixteenth of ca.y, a thin cirrus).
     veil: f32,
     opacity_power: f32,
-    /// cc.x: the plane's mean optical depth over a bundle's full strength, which shades lower layers; cc.y: a fibre's
-    /// own depth in metres, which blurs it as the layer's depth blurs a bundle.
+    /// cc.x: the plane's mean optical depth over the trails' full strength, which shades lower layers; cc.y: unused (the
+    /// fibre lanes' depth, taken out 2026-11-07).
     plane: f32,
-    fibre_depth_m: f32,
+    /// cd and ce.x, ce.y: unused (the combed strands of 2026-11-07's first round); ce.z: the faint veil's share (times
+    /// cb.z).
+    veil_scale: f32,
+    /// cf: the trails (the tufts' tails drawn downwind along a curving flow, as a particle's path from its head): steps
+    /// of the trace upstream, its length (cells) at Streak length 7, the curl's strength (times 0.25 + 1.5 Hooks), the
+    /// flow's potential's cycles a cell.
+    trail_steps: f32,
+    trail_length: f32,
+    trail_bend: f32,
+    trail_flow_freq: f32,
+    /// cg: the heads (the tufts a trail starts at): their noise's cycles a cell and the noise from which a head starts;
+    /// the fibres (dry-brush texture carried along the trace): their cycles a cell across and how much longer along.
+    head_freq: f32,
+    head_from: f32,
+    fibre_freq: f32,
+    fibre_stretch: f32,
+    /// ch: the fibres' share of the trail's depth, and how much of a trail is left at its tail's end.
+    fibre_gain: f32,
+    trail_fade: f32,
+    /// ch.z: how soft a head's edge is (of its noise); ch.w: how much the tail narrows to its end (the head's noise
+    /// threshold rises by it).
+    head_edge: f32,
+    tail_narrow: f32,
+    /// ci: the smudge: how fast the paint runs out along the tail (e^-(x back)), how much the tail dries into separate
+    /// fibres toward its end.
+    tail_decay: f32,
+    tail_dry: f32,
+    /// ci.z: how much the paint laid along a path covers (n = 1 - e^(-x paint)); ci.w: over how much of the trail
+    /// (from its head) its paint comes in, so the tuft it falls from is no hard blob.
+    tail_paint: f32,
+    head_ramp: f32,
+    /// cj.x: how far a trail turns away below its head at Fall streaks 1 (radians at its end).
+    fall_turn: f32,
 }
 
 fn cirrus_look() -> &'static CirrusLook {
     static LOOK: std::sync::OnceLock<CirrusLook> = std::sync::OnceLock::new();
     LOOK.get_or_init(|| {
-        let mut k = [[0.0, 4.0, 0.3, 0.6], [400.0, 2.5, 0.06, 4.0], [0.3, 60.0, 0.0, 0.0]];
+        let mut k = [[0.0, 1.2, 0.3, 0.6], [400.0, 2.5, 0.06, 4.0], [0.3, 60.0, 0.0, 0.0], [60.0, 12.0, 4.0, 1.0], [0.4, 0.7, 0.3, 0.0], [48.0, 6.0, 0.6, 0.25], [2.5, 0.55, 20.0, 200.0], [1.5, 0.0, 0.35, 0.3], [0.8, 1.2, 4.0, 0.06], [1.5, 0.0, 0.0, 0.0]];
         let spec = std::env::var("HDRI_CIRRUS_LOOK").unwrap_or_default();
         for part in spec.split(';') {
             let Some((name, values)) = part.split_once('=') else { continue };
@@ -326,6 +264,13 @@ fn cirrus_look() -> &'static CirrusLook {
                 "ca" => 0,
                 "cb" => 1,
                 "cc" => 2,
+                "cd" => 3,
+                "ce" => 4,
+                "cf" => 5,
+                "cg" => 6,
+                "ch" => 7,
+                "ci" => 8,
+                "cj" => 9,
                 _ => continue,
             };
             if v.len() == 4 {
@@ -340,14 +285,133 @@ fn cirrus_look() -> &'static CirrusLook {
             tau: k[0][1],
             mu_min: k[0][2],
             slant: k[0][3],
-            depth_m: k[1][0],
-            texels: k[1][1],
             veil: k[1][2],
             opacity_power: k[1][3],
             plane: k[2][0],
-            fibre_depth_m: k[2][1],
+            veil_scale: k[4][2],
+            trail_steps: k[5][0],
+            trail_length: k[5][1],
+            trail_bend: k[5][2],
+            trail_flow_freq: k[5][3],
+            head_freq: k[6][0],
+            head_from: k[6][1],
+            fibre_freq: k[6][2],
+            fibre_stretch: k[6][3],
+            fibre_gain: k[7][0],
+            trail_fade: k[7][1],
+            head_edge: k[7][2],
+            tail_narrow: k[7][3],
+            tail_decay: k[8][0],
+            tail_dry: k[8][1],
+            tail_paint: k[8][2],
+            head_ramp: k[8][3],
+            fall_turn: k[9][0],
         }
     })
+}
+
+// --- Contrails (a Cirrus' Contrails row: Cirrus homogenitus; the weather lane, 2026-11-09) ---
+
+/// An airliner's ground speed at cruise (m/s): its trail is a second older every TRAIL_SPEED_M_S metres behind it.
+const TRAIL_SPEED_M_S: f32 = 230.0;
+/// A young trail's width (m): about the wingspan, the spacing of the wake's pair of vortices that wrap the engines'
+/// two trails into one, and how fast the wind's shear spreads it (m/s: 150 m at two minutes, a kilometre in twenty;
+/// contrail cirrus is some kilometres wide after an hour).
+const TRAIL_WIDTH_M: f32 = 60.0;
+const TRAIL_SPREAD_M_S: f32 = 0.75;
+/// A young trail's optical depth straight up: thin ice, 0.1 to 0.5 measured for line-shaped contrails (their mean
+/// some 0.2 to 0.3). It thins as it spreads, as the square root of how much wider it is: its ice grows in the
+/// supersaturated air a persistent trail lives in, so it thins less than its width grows.
+const TRAIL_TAU: f32 = 0.3;
+/// How far from the point overhead a trail's line passes at most (m: down to some 17 degrees up at 9 km), and how far
+/// along its line the aircraft may be, either side of that nearest point (m).
+const TRAIL_REACH_M: f32 = 30_000.0;
+const TRAIL_HEAD_M: f32 = 80_000.0;
+/// The most trails a layer draws (at Contrails 1), and a trail's life (s): a short-lived one a couple of minutes, a
+/// persistent one up to an hour and a half, as the seed picks (most of them short).
+const TRAILS_MOST: usize = 4;
+const TRAIL_LIFE_S: [f32; 2] = [120.0, 5400.0];
+/// A trail lives its life only where the air along its track is supersaturated over ice; such stretches come and go
+/// over some TRAIL_MOIST_M along a flight track (most of them tens of kilometres or less), and where the air is dry
+/// the trail evaporates within TRAIL_DRY_S of forming: a persistent line broken by gaps behind short-lived stubs.
+const TRAIL_MOIST_M: f32 = 12_000.0;
+const TRAIL_DRY_S: f32 = 20.0;
+/// A spread trail is the fall streaks of its ice, sheared along the line: fibres TRAIL_FIBRE of its width apart.
+const TRAIL_FIBRE: f32 = 0.3;
+/// The beads a young trail breaks into (m along it): the Crow instability's wavelength, some eight times the vortex
+/// pair's spacing (about TRAIL_WIDTH_M).
+const TRAIL_BEAD_M: f32 = 450.0;
+
+/// One aircraft trail on a Cirrus' plane (Cirrus homogenitus): a straight line at the layer's height, which the view
+/// sees as a great circle. Behind the aircraft (at `head`, now) the trail is the older the farther back, a second every
+/// TRAIL_SPEED_M_S metres; it forms a few seconds behind it, spreads (TRAIL_WIDTH_M, TRAIL_SPREAD_M_S) and thins as it
+/// ages, frays into puffs and fibres and its line wanders with the wind's eddies, and it is gone after its life, soon
+/// where the air along its track is dry (TRAIL_MOIST_M).
+#[derive(Clone, Copy, Debug)]
+struct Trail {
+    /// The line on the plane (m east and south of the point overhead): its nearest point to that point, and its way.
+    p: Vec2f,
+    u: Vec2f,
+    /// Where the aircraft is along the line (m from `p` along `u`; the trail lies behind it), and how long the trail
+    /// lives (s).
+    head: f32,
+    life: f32,
+    seed: u32,
+}
+
+/// The trails of Contrails `amount` (0..1), seeded by the layer's `stream`: one at a little, TRAILS_MOST at 1.
+fn trails_of(amount: f32, stream: u32) -> Vec<Trail> {
+    if !(amount > 0.0) {
+        return Vec::new();
+    }
+    let count = ((amount * TRAILS_MOST as f32).ceil() as usize).clamp(1, TRAILS_MOST);
+    (0..count)
+        .map(|i| {
+            let h = |k: i32| hash01(i as i32, k, 0, stream ^ 0x6c1e_7a11);
+            let angle = std::f32::consts::TAU * h(0);
+            let u = vec2f(angle.cos(), angle.sin());
+            let off = (2.0 * h(1) - 1.0) * TRAIL_REACH_M;
+            let life = TRAIL_LIFE_S[0] + (TRAIL_LIFE_S[1] - TRAIL_LIFE_S[0]) * h(3) * h(3);
+            Trail { p: vec2f(-u.y, u.x) * off, u, head: (2.0 * h(2) - 1.0) * TRAIL_HEAD_M, life, seed: hash_u32(stream ^ (i as u32 + 1).wrapping_mul(0x9e37_79b9)) }
+        })
+        .collect()
+}
+
+impl Trail {
+    /// Its optical depth straight up at the plane point `q` (m), a texel's footprint `across` metres wide across the
+    /// trail there (0: one exact direction): its cross-section a bell its width wide, widened by the footprint with its
+    /// depth held over it, so a far trail is a fainter, wider line of the same ice, never one that sparkles.
+    fn depth(&self, q: Vec2f, across: f32) -> f32 {
+        let r = q - self.p;
+        let s = r.x * self.u.x + r.y * self.u.y;
+        let age = (self.head - s) / TRAIL_SPEED_M_S;
+        // its life here: all of it where the air along the track is moist, TRAIL_DRY_S where it is dry
+        let moist = smoothstep(0.2, 0.8, value2(s / TRAIL_MOIST_M, 3.1, self.seed ^ 0x2b7e_1516));
+        let life = TRAIL_DRY_S + (self.life - TRAIL_DRY_S).max(0.0) * moist;
+        if !(age > 0.0 && age < life) {
+            return 0.0;
+        }
+        let width = TRAIL_WIDTH_M + TRAIL_SPREAD_M_S * age;
+        let sigma = width / 2.355;
+        let wide = (sigma * sigma + 0.25 * across * across).sqrt();
+        // the line wanders with the wind's eddies as it ages, by up to 0.4 of its width over kilometres
+        let wander = 0.4 * width * smoothstep(300.0, 1800.0, age) * (2.0 * value2(s / 4000.0, 0.5, self.seed) - 1.0);
+        let x = r.x * -self.u.y + r.y * self.u.x - wander;
+        if x.abs() > 5.0 * wide {
+            return 0.0;
+        }
+        // formed a few seconds behind the aircraft, thinning over the last half of its life; beaded within a minute
+        // as the wake's vortices link into rings (the Crow instability, some eight vortex spacings apart: TRAIL_BEAD_M),
+        // then ragged, as it ages
+        let fade = smoothstep(0.0, 4.0, age) * (1.0 - smoothstep(0.5 * life, life, age));
+        let fray = (1.0 + smoothstep(20.0, 200.0, age) * 1.2 * (value2(s / TRAIL_BEAD_M, 7.3, self.seed ^ 0x51ed_270b) - 0.5)).max(0.0);
+        // a spread trail's fall streaks: fibres along the line, as far as the footprint across it resolves them
+        let spacing = TRAIL_FIBRE * width;
+        let fibres = smoothstep(120.0, 900.0, age) * (1.0 - smoothstep(0.5 * spacing, spacing, across));
+        let fibre = 1.0 + fibres * 1.6 * (value2(x / spacing, s / (8.0 * width), self.seed ^ 0x3c6e_f372) - 0.5);
+        let tau = TRAIL_TAU * (TRAIL_WIDTH_M / width).sqrt() * fade * fray * fibre.max(0.0);
+        tau * (sigma / wide) * (-0.5 * (x / wide) * (x / wide)).exp()
+    }
 }
 
 /// A Cirrus' optical depth straight up at a bundle's full strength for its Opacity (ca.y x Opacity^cb.w).
@@ -459,205 +523,6 @@ fn cirrostratus_phase(cos_sun: f32, lining: f32, halo: f32) -> Vec3f {
     vec3f(lobes + k * ring(CS_HALO_EDGE_DEG[0]), lobes + k * ring(CS_HALO_EDGE_DEG[1]), lobes + k * ring(CS_HALO_EDGE_DEG[2]))
 }
 
-/// A Cirrus' streams' frame at `f` (wind frame, cells): Streak length stretches it along the wind, Fall streaks slide
-/// strands downwind by different amounts, and the older veil's warp bends it, so the streams curve and are not
-/// parallel. Its point `w`: x along the streams, y across.
-fn cirrus_frame(f: Vec2f, streak: f32, fall: f32, s: &Streams) -> Vec2f {
-    let root = streak.max(1.0).sqrt();
-    let mut q = vec2f(f.x * STREAK_SCALE / root, f.y * STREAK_SCALE * root);
-    if fall > 0.0 {
-        q.x += fall * FALL_SHEAR * (value2(q.y * 0.6, 0.5, s.0[4]) - 0.5);
-    }
-    let wx = fbm2(q.x * 0.5, q.y * 0.5, 2, s.0[5]) - 0.5;
-    let wy = fbm2(q.x * 0.5 + 5.2, q.y * 0.5 + 1.3, 2, s.0[5]) - 0.5;
-    vec2f(q.x + 1.5 * wx, q.y + 1.5 * wy)
-}
-
-/// A Cirrus' bundles at its rows (cells of its streams' bent frame, unstretched).
-#[derive(Clone, Copy, Debug)]
-struct Bundles {
-    /// The longest bundle and the widest half width, and the hook's swing at Hooks (a share of a bundle's length).
-    length: f32,
-    width: f32,
-    bend: f32,
-    /// A cell along and a row across, the furthest a bundle's bell reaches across its line, and how many rows either
-    /// side of a point's own can hold a bundle that reaches it.
-    cell: f32,
-    row: f32,
-    reach: f32,
-    rows: i32,
-}
-
-/// The strongest bundle at a point: its strength, its length (cells), where the point lies on it (`across`: half widths
-/// of its fan there; `from_head`: cells along it from its head), its own number (its fibres' seed) and its fan's half
-/// width there (cells).
-#[derive(Clone, Copy, Debug, Default)]
-struct BundleAt {
-    strength: f32,
-    length: f32,
-    across: f32,
-    id: u32,
-    half_width: f32,
-    /// How far the point lies from the head along the bundle (cells).
-    from_head: f32,
-}
-
-impl Bundles {
-    fn new(streak: f32, hooks: f32, fall: f32) -> Bundles {
-        let root = (streak.max(1.0) / BUNDLE_STREAK).sqrt();
-        let length = BUNDLE_LENGTH * root * (1.0 + FALL_LENGTH * fall);
-        let width = BUNDLE_WIDTH / root;
-        let bend = BUNDLE_BEND * hooks;
-        // Across its line a bundle reaches its tail's widest bell, its hook's swing, its sweep and its tilt.
-        let reach = width * (BUNDLE_HEAD + BUNDLE_FAN) + bend * BUNDLE_CURL + (BUNDLE_SWEEP + BUNDLE_TILT) * length;
-        let rows = ((reach + 0.5 * BUNDLE_JITTER * BUNDLE_ROW) / BUNDLE_ROW).ceil() as i32;
-        Bundles { length, width, bend, cell: length / BUNDLE_SPAN, row: BUNDLE_ROW, reach, rows }
-    }
-
-    /// The strongest bundle at `g` (cells of the streams' bent frame), its bell widened by `blur` (cells across its line:
-    /// the texel's footprint and the layer's depth seen along the view) and its strength lowered as much as it widens.
-    fn at(&self, g: Vec2f, blur: f32, seed: u32) -> BundleAt {
-        let byte = |h: u32, k: u32| ((h >> (8 * k)) & 0xff) as f32 * (1.0 / 255.0);
-        let mut best = BundleAt::default();
-        let iy = (g.y / self.row).floor() as i32;
-        for row in iy - self.rows..=iy + self.rows {
-            // A row whose bundles' lines all lie further off than their reach holds none that reaches `g`.
-            if (g.y - (row as f32 + 0.5) * self.row).abs() > self.reach + 0.5 * BUNDLE_JITTER * self.row {
-                continue;
-            }
-            let row_hash = hash_u32(seed ^ (row as u32).wrapping_mul(0x9e37_79b9));
-            let shift = (row_hash & 0xffff) as f32 * (1.0 / 65536.0);
-            let column = (g.x / self.cell - shift).floor();
-            let h = hash_u32(row_hash ^ (column as i32 as u32).wrapping_mul(0x85eb_ca6b));
-            let more = hash_u32(h ^ 0x5bd1_e995);
-            if byte(more, 0) < BUNDLE_EMPTY {
-                continue;
-            }
-            let size = BUNDLE_LEAST + (1.0 - BUNDLE_LEAST) * byte(more, 1) * byte(more, 1);
-            let length = self.length * size;
-            let width = self.width * size.sqrt();
-            let head_along = (column + shift + byte(h, 0) * (1.0 - size * BUNDLE_SPAN)) * self.cell;
-            let head_across = (row as f32 + 0.5 + BUNDLE_JITTER * (byte(h, 1) - 0.5)) * self.row;
-            let tilt = BUNDLE_TILT * (2.0 * byte(h, 2) - 1.0);
-            let (rx, ry) = (g.x - head_along, g.y - head_across);
-            let along = rx + tilt * ry;
-            let front = width * BUNDLE_HEAD;
-            if !(along > -front && along < length) {
-                continue;
-            }
-            let t = along / length;
-            let s = t.clamp(0.0, 1.0);
-            // The hook swings the line aside at the head, to the bundle's own side; the tail sweeps back.
-            let side = if byte(h, 3) < 0.5 { -1.0 } else { 1.0 };
-            let curl = (1.0 - along.max(0.0) / BUNDLE_CURL).max(0.0);
-            let hook = self.bend * BUNDLE_CURL * byte(more, 2) * curl * curl * curl;
-            let off = ry - tilt * rx - side * (hook - BUNDLE_SWEEP * length * s * s);
-            let half = width * (BUNDLE_HEAD + BUNDLE_FAN * s);
-            let wide = (half * half + blur * blur).sqrt().min(self.reach);
-            let x = off / wide;
-            if !(x.abs() < 1.0) {
-                continue;
-            }
-            let bell = (1.0 - x * x) * (1.0 - x * x);
-            let round = if along < 0.0 { 1.0 - (along / front) * (along / front) } else { 1.0 };
-            let k = (along - BUNDLE_KNOT_AT) / BUNDLE_KNOT_SPAN;
-            let knot = 1.0 + BUNDLE_KNOT * (-k * k).exp();
-            let tail = BUNDLE_TAIL + (1.0 - BUNDLE_TAIL) * (1.0 - s) * (1.0 - s);
-            let fade = round * tail * knot * smoothstep(1.0, 1.0 - BUNDLE_FRAY, t);
-            let strength = bell * fade * (half / wide) * (BUNDLE_DIM + (1.0 - BUNDLE_DIM) * byte(more, 3));
-            if strength > best.strength {
-                best = BundleAt { strength, length, across: off / half, id: h, half_width: half, from_head: along };
-            }
-        }
-        best
-    }
-}
-
-impl Bundles {
-    /// Its bundles' mean strength over the plane (64 x 64 points of a 32 x 32 cell square at a fixed jitter): what
-    /// they merge into where a ray crosses many of them one behind the other. Once per sheet.
-    fn mean(&self, seed: u32) -> f32 {
-        let jitter = hash_u32(0x3c6e_f372);
-        let mut sum = 0.0f32;
-        for j in 0..64 {
-            for i in 0..64 {
-                let x = (i as f32 + crate::noise::hash01(i, j, 0, jitter)) * 0.5;
-                let y = (j as f32 + crate::noise::hash01(i, j, 1, jitter)) * 0.5;
-                sum += self.at(vec2f(x, y), 0.0, seed).strength;
-            }
-        }
-        sum / 4096.0
-    }
-}
-
-/// One octave of a bundle's fibres at (`along`, `across`) in its lane cells and lanes, for the bundle's `strength`: the
-/// brightest fibre there.
-fn fibre_lane(along: f32, across: f32, strength: f32, seed: u32) -> f32 {
-    let (i, j) = (along.floor() as i32, across.floor() as i32);
-    let mut most = 0.0f32;
-    for dj in -1..=1 {
-        let lane = hash_u32(seed ^ (j + dj) as u32);
-        for di in -1..=0 {
-            let h = hash_u32(lane ^ ((i + di) as u32).wrapping_mul(0x9e37_79b9));
-            let byte = |k: u32| ((h >> (8 * k)) & 0xff) as f32 * (1.0 / 255.0);
-            let threshold = byte(3);
-            let present = smoothstep(threshold - FIBRE_SOFT, threshold + FIBRE_SOFT, strength);
-            if !(present > 0.0) {
-                continue;
-            }
-            let start = (i + di) as f32 + byte(0);
-            let t = (along - start) / (FIBRE_SPAN_LEAST + (1.0 - FIBRE_SPAN_LEAST) * byte(1));
-            if !(t > 0.0 && t < 1.0) {
-                continue;
-            }
-            let g = (across - ((j + dj) as f32 + 0.5 + FIBRE_JITTER * (byte(2) - 0.5))) / FIBRE_BELL;
-            if !(g.abs() < 1.0) {
-                continue;
-            }
-            let q = 1.0 - g * g;
-            let bright = FIBRE_LOW + (1.0 - FIBRE_LOW) * ((hash_u32(h) & 0xff) as f32 * (1.0 / 255.0));
-            let taper = smoothstep(0.0, FIBRE_RISE, t) * smoothstep(1.0, 1.0 - FIBRE_FALL, t);
-            most = most.max(bright * q * q * q * taper * present);
-        }
-    }
-    most
-}
-
-/// One lane octave's mean where every fibre is there (64 x 64 points at a fixed jitter, measured once): what an octave
-/// finer than its blur stands for, so the fibres keep their mean at every size and distance.
-fn fibre_mean() -> f32 {
-    static MEAN: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *MEAN.get_or_init(|| {
-        let jitter = hash_u32(0x3c6e_f372);
-        let mut sum = 0.0f32;
-        for j in 0..64 {
-            for i in 0..64 {
-                let x = (i as f32 + crate::noise::hash01(i, j, 0, jitter)) * 0.37;
-                let y = j as f32 + crate::noise::hash01(i, j, 1, jitter);
-                sum += fibre_lane(x, y, 2.0, 0x51ed_270b);
-            }
-        }
-        sum / 4096.0
-    })
-}
-
-/// A bundle's fibres at `at` (its frame), one octave of lanes `lane` half widths wide, `shown` as far as the texel and
-/// a fibre's depth show it (fractional: finer than that it fades toward its mean): their value over their mean where
-/// they all are, so a bundle's opacity is its strength on the whole and its fibres its texture; where few are there, each
-/// keeps its brightness, and the bundle's edges and tail fray.
-fn bundle_fibres(at: &BundleAt, shown: f32, lane: f32, seed: u32) -> f32 {
-    let show = shown.clamp(0.0, 1.0);
-    if !(show > 0.0) {
-        return 1.0;
-    }
-    let mean = fibre_mean() * at.strength.clamp(1.0e-3, 1.0);
-    let along = at.from_head / (FIBRE_CELL * at.length).clamp(FIBRE_CELL_LEAST, FIBRE_CELL_MOST);
-    // The lanes wave across, slowly along them: where the point lies across moves, no ridge is drawn.
-    let wave = FIBRE_WAVE * (value2(along / FIBRE_WAVE_CELLS, at.across / lane * 0.25, seed ^ 0x6a09_e667) - 0.5);
-    let f = fibre_lane(along, at.across / lane + wave, at.strength, seed);
-    (mean + (f - mean) * show) / mean
-}
-
 /// A smooth wave in [0, 1] of period 1, 1 at the half periods: a smoothstepped triangle, polynomial and hash-free.
 pub fn wave(x: f32) -> f32 {
     let f = x - x.floor();
@@ -676,18 +541,13 @@ pub fn horizon_fade(sin_el: f32) -> f32 {
     smoothstep(0.0, HORIZON_FADE, sin_el)
 }
 
-/// Local copy (as in clouds.rs), so no glob can make the name ambiguous.
-fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
-    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
+use crate::patterns::smooth as smoothstep;
 
 /// A sheet type's recipe and the rows it reads.
 #[derive(Clone, Copy, Debug)]
 pub enum SheetRecipe {
-    /// `bundle_mean`: its bundles' mean strength over the plane (`Bundles::mean`, measured at build); `tau`: its
-    /// optical depth at a bundle's full strength (`cirrus_tau` of its Opacity).
-    Cirrus { streak: f32, fineness: f32, hooks: f32, fall: f32, patch: f32, opacity: f32, bundle_mean: f32, tau: f32 },
+    /// `tau`: its optical depth where its trails are whole (`cirrus_tau` of its Opacity).
+    Cirrus { streak: f32, fineness: f32, hooks: f32, fall: f32, patch: f32, opacity: f32, tau: f32 },
     Stratocumulus { shading: f32, billows: f32, rolls: f32 },
     Cumulus { puffiness: f32, flat_base: f32, towers: f32, clustering: f32, streets: f32, lean: f32 },
     /// `tau`: its optical depth straight up where its veil is whole (before its mottles and fibres).
@@ -741,17 +601,59 @@ impl SheetRecipe {
     /// its faint veil lies and its bundles gather, broken along their length, gathered over tens of km and opened by
     /// Patchiness.
     fn cirrus_field(&self, f: Vec2f, s: &Streams) -> (f32, Vec2f) {
-        let SheetRecipe::Cirrus { streak, fall, patch, .. } = *self else {
+        let SheetRecipe::Cirrus { streak, fineness, hooks, fall, patch, .. } = *self else {
             return (0.0, Vec2f::default());
         };
-        let w = cirrus_frame(f, streak, fall, s);
-        let field = fbm2(w.x * TUFT_ALONG, w.y * TUFT_ACROSS, CIRRUS_BROAD_OCTAVES, s.0[0]);
-        let stream = smoothstep(TUFT_FROM, TUFT_TO, field) * stream_breaks(w, s);
-        // Where the cirrus gathers, over tens of km: its streams, then open blue.
+        let look = cirrus_look();
+        // The trails (a particle's path from a tuft, drawn as its tail; the owner's flow field, 2026-11-07): from the
+        // point the trace runs upstream along the flow, the wind plus the curl of a slow potential (its swirls neither
+        // gather nor thin the trails; where it curls, the extra turn draws the hooks), and the point lies on the tails of
+        // the heads it passes, the paint laid along the path less the further back. The fine noise carried along the same
+        // trace is the tails' fibres: many faint strokes that comb, bend together, fan and taper.
+        // The rows: Streak length the trace's length, Hooks the curl's strength, Fineness the fibres' scale, Fall
+        // streaks how far the trails turn away below their heads.
+        let steps = look.trail_steps.clamp(2.0, 64.0) as u32;
+        let length = look.trail_length * (streak.max(1.0) / 7.0).sqrt();
+        let step = length / steps as f32;
+        let curl = look.trail_bend * (0.25 + 1.5 * hooks);
+        let ff = look.trail_flow_freq.max(0.01);
+        let e = 0.05 / ff;
+        let psi = |x: f32, y: f32| fbm2(x * ff + 5.5, y * ff + 9.9, 2, s.0[5]);
+        let fs = look.fibre_freq * (0.5 + fineness);
+        let (mut q, mut best, mut best_back, mut fib) = (f, 0.0f32, 0.0f32, 0.0f32);
+        for k in 0..steps {
+            let back = k as f32 / steps as f32;
+            // the tail narrows (its head's noise must stand higher the further back) and its paint runs out; it comes
+            // in over the first stretch below the head
+            let from = look.head_from + look.tail_narrow * back;
+            let head = smoothstep(from, from + look.head_edge.max(0.01), fbm2(q.x * look.head_freq * 0.6 + 3.3, q.y * look.head_freq + 1.7, 3, s.0[0]));
+            let fade = (1.0 - (1.0 - look.trail_fade) * back) * (-look.tail_decay * back).exp() * smoothstep(0.0, look.head_ramp.max(1.0e-3), back);
+            // the paint laid along the path (an integral, so no step shows as a bead at the tail's edge), and where it
+            // came from on the whole
+            let paint = head * fade * step;
+            best += paint;
+            best_back += paint * back;
+            fib += value2(q.x * fs / look.fibre_stretch + 2.1, q.y * fs + 8.3, s.0[1])
+                + 0.7 * value2(q.x * 2.1 * fs / look.fibre_stretch + 6.7, q.y * 2.1 * fs + 0.9, s.0[1] ^ 0x51ed_270b)
+                + 0.5 * value2(q.x * 4.3 * fs / look.fibre_stretch + 4.4, q.y * 4.3 * fs + 3.6, s.0[1] ^ 0x2c1b_3c6d);
+            // the flow: the wind (+x) plus the curl of the potential (its gradient turned a quarter, about ff per cell, so
+            // over ff), turned by Fall streaks the further below the head
+            let gx = (psi(q.x + e, q.y) - psi(q.x - e, q.y)) / (2.0 * e);
+            let gy = (psi(q.x, q.y + e) - psi(q.x, q.y - e)) / (2.0 * e);
+            let v = vec2f(1.0 + curl * gy / ff, -curl * gx / ff);
+            let turn = fall * look.fall_turn * back;
+            let (sn, cs) = turn.sin_cos();
+            let v = vec2f(v.x * cs - v.y * sn, v.x * sn + v.y * cs);
+            let len = v.length().max(1.0e-4);
+            q = q - v * (step / len);
+        }
+        let best_back = if best > 0.0 { best_back / best } else { 0.0 };
+        let best = 1.0 - (-look.tail_paint * best).exp();
+        // the fibres' mean over the trace, about 1.1 (three octaves at 1, 0.7, 0.5 of a mean of 0.5), as a texture about 1
+        let fibre = fib / (steps as f32 * 1.1);
         let gather = smoothstep(GATHER_FROM, GATHER_TO, value2(f.x * GATHER_FREQ + 3.7, f.y * GATHER_FREQ + 9.1, s.0[6]));
-        // Patchiness: a broad mask opens holes in the field.
         let slow = if patch > 0.0 { 1.0 - patch + patch * smoothstep(0.3, 0.7, fbm2(f.x * 0.18, f.y * 0.18, 2, s.0[2])) } else { 1.0 };
-        ((stream * (GATHER_FLOOR + (1.0 - GATHER_FLOOR) * gather) * slow).clamp(0.0, 1.0), w)
+        ((best * (GATHER_FLOOR + (1.0 - GATHER_FLOOR) * gather) * slow).clamp(0.0, 1.0), vec2f(fibre, best_back))
     }
 
     /// The noise n in [0, 1] at a point `f` of the wind frame (cells), and with it a heap's slow factor (the masks and
@@ -810,20 +712,12 @@ impl SheetRecipe {
         }
     }
 
-    /// The noise a plane cover reads (the shade on a lower layer, T_above): `octaves` of the body, the rows, and the
-    /// Cirrus' stretch and the warp's broadest octave, so the shade follows the strands that cast it.
+    /// The noise a plane cover reads (the shade on a lower layer, T_above): `octaves` of the body and the rows; a Cirrus'
+    /// own trails.
     fn plane_noise(&self, f: Vec2f, octaves: u32, s: &Streams) -> f32 {
         match *self {
-            SheetRecipe::Cirrus { streak, .. } => {
-                let root = streak.max(1.0).sqrt();
-                let q = vec2f(f.x * STREAK_SCALE / root, f.y * STREAK_SCALE * root);
-                let wx = value2(q.x * 0.5, q.y * 0.5, s.0[5]) - 0.5;
-                let wy = value2(q.x * 0.5 + 5.2, q.y * 0.5 + 1.3, s.0[5]) - 0.5;
-                let w = vec2f(q.x + 1.5 * wx, q.y + 1.5 * wy);
-                let stream = smoothstep(TUFT_FROM, TUFT_TO, fbm2(w.x * TUFT_ALONG, w.y * TUFT_ACROSS, octaves, s.0[0])) * stream_breaks(w, s);
-                let gather = smoothstep(GATHER_FROM, GATHER_TO, value2(f.x * GATHER_FREQ + 3.7, f.y * GATHER_FREQ + 9.1, s.0[6]));
-                stream * (GATHER_FLOOR + (1.0 - GATHER_FLOOR) * gather)
-            }
+            // the trails themselves, so the shade lies under the tails that cast it
+            SheetRecipe::Cirrus { .. } => self.cirrus_field(f, s).0,
             SheetRecipe::Stratocumulus { rolls, .. } => {
                 let n = cells_over(f, fbm2(f.x, f.y, octaves, s.0[0]), s);
                 if rolls > 0.0 { n * (1.0 - rolls * ROLL_DEPTH * (1.0 - wave(f.y * 0.5))) } else { n }
@@ -849,6 +743,8 @@ pub struct Sheet {
     measure: Streams,
     /// One released self-shadow step toward the sun, in cells (a Cumulus' sheared by Lean).
     shadow_step: Vec2f,
+    /// A Cirrus' aircraft trails (its Contrails row, `Trail`); none for the other types.
+    trails: Vec<Trail>,
 }
 
 impl Sheet {
@@ -859,8 +755,7 @@ impl Sheet {
         let (recipe, size_km, w) = match genus {
             CloudGenus::Cirrus => {
                 let b = layer.cirrus_params();
-                let bundle_mean = Bundles::new(b.streak_length, b.hooks, b.fall_streaks).mean(cloud_layer_seed(map_seed, layer.seed, genus));
-                (SheetRecipe::Cirrus { streak: b.streak_length, fineness: b.fineness, hooks: b.hooks, fall: b.fall_streaks, patch: b.patchiness, opacity: b.opacity, bundle_mean, tau: cirrus_tau(b.opacity) }, b.size_km, CIRRUS_EDGE)
+                (SheetRecipe::Cirrus { streak: b.streak_length, fineness: b.fineness, hooks: b.hooks, fall: b.fall_streaks, patch: b.patchiness, opacity: b.opacity, tau: cirrus_tau(b.opacity) }, b.size_km, CIRRUS_EDGE)
             }
             CloudGenus::Stratocumulus => {
                 let b = layer.stratocumulus_params();
@@ -896,7 +791,8 @@ impl Sheet {
         if let SheetRecipe::Cumulus { lean, .. } = recipe {
             shadow_step = shadow_step + downwind * (lean * LEAN_SHEAR);
         }
-        Some(Sheet { recipe, remap, height_m, cell_m, frame: WindFrame::new(downwind, drift_cells), streams: Streams::of(stream), measure: Streams::of(MEASURE_SEED), shadow_step })
+        let trails = if genus == CloudGenus::Cirrus { trails_of(layer.cirrus_params().contrails.unwrap_or(0.0), stream) } else { Vec::new() };
+        Some(Sheet { recipe, remap, height_m, cell_m, frame: WindFrame::new(downwind, drift_cells), streams: Streams::of(stream), measure: Streams::of(MEASURE_SEED), shadow_step, trails })
     }
 
     /// A Cirrus' cover along `d`, where it meets the plane `t` metres off at the slope `mu`, at `w` of its streams'
@@ -904,55 +800,58 @@ impl Sheet {
     /// direction): its optical depth (design §2.3's thin ice), its faint veil and its bundles' fibres, seen along the
     /// slant path through the sheet. The bundles blur across their lines by the texel's footprint there and by the
     /// layer's depth seen along the view, so low cirrus is a soft band; their fibres go as fine as that blur shows.
-    fn cirrus_cover(&self, d: Vec3f, t: f32, mu: f32, w: Vec2f, density: f32, texel: f32) -> f32 {
-        let SheetRecipe::Cirrus { streak, fineness, hooks, fall, bundle_mean, tau, .. } = self.recipe else {
+    /// `trails` is the optical depth straight up its aircraft trails add there (`trails_depth`), seen the same way.
+    fn cirrus_cover(&self, d: Vec3f, t: f32, mu: f32, w: Vec2f, density: f32, texel: f32, trails: f32) -> f32 {
+        let SheetRecipe::Cirrus { fineness, tau, .. } = self.recipe else {
             return 0.0;
         };
         let look = cirrus_look();
         let mu = mu.max(1.0e-3);
-        // How much of the bundles' cross direction (the wind's) and of their own lies along the view.
+        // How much of the trails' cross direction (the wind's) lies along the view.
         let level = (d.x * d.x + d.z * d.z).sqrt();
-        let (c, c_down) = if level > 1.0e-6 {
-            ((d.z * self.frame.down.x - d.x * self.frame.down.y) / level, (d.x * self.frame.down.x + d.z * self.frame.down.y) / level)
-        } else {
-            (0.0, 0.0)
-        };
-        // The texel's footprint across the bundles and along them (stretched by 1 / mu along the view), and how far a ray
-        // runs along the view per metre of depth it crosses.
+        let c = if level > 1.0e-6 { (d.z * self.frame.down.x - d.x * self.frame.down.y) / level } else { 0.0 };
+        // The texel's footprint across the trails (stretched by 1 / mu along the view), and how far a ray runs along the
+        // view per metre of depth it crosses.
         let footprint = t * texel * (c * c / (mu * mu) + 1.0 - c * c).sqrt();
-        let footprint_along = t * texel * (c_down * c_down / (mu * mu) + 1.0 - c_down * c_down).sqrt();
         let run = (1.0 - mu * mu).max(0.0).sqrt() / mu;
-        // The layer's depth seen along the view blurs the bundles across their lines.
-        let smear = look.depth_m * run * c.abs();
-        let blur = (footprint * footprint + smear * smear).sqrt();
-        let root = streak.max(1.0).sqrt();
-        let g = vec2f(w.x * root / STREAK_SCALE, w.y / (STREAK_SCALE * root));
-        let at = Bundles::new(streak, hooks, fall).at(g, BLUR_BELL * blur / self.cell_m, self.streams.0[3]);
-        let mut bundle = 0.0;
-        if at.strength > 0.0 {
-            let lane = FIBRE_LANE + (FIBRE_FINE - FIBRE_LANE) * fineness;
-            // The fibres show as far as their lanes are wider than the texel's footprint and a fibre's own depth seen
-            // along the view, and their cells longer than the footprint along them and the layer's depth seen along the
-            // view: low down, where a ray crosses many fibres one behind the other, they merge into the bundle.
-            let lane_m = lane * at.half_width * self.cell_m;
-            let fibre_smear = look.fibre_depth_m * run * c.abs();
-            let across = (footprint * footprint + fibre_smear * fibre_smear).sqrt();
-            let cell_m = (FIBRE_CELL * at.length).clamp(FIBRE_CELL_LEAST, FIBRE_CELL_MOST) * self.cell_m;
-            let along_smear = look.depth_m * run * c_down.abs();
-            let along = (footprint_along * footprint_along + along_smear * along_smear).sqrt();
-            let show = |size: f32, blur: f32| if blur > 0.0 { 1.0 + (size / (look.texels * blur)).max(1.0e-6).log2() } else { 1.0 };
-            let shown = show(lane_m, across).min(show(cell_m, along));
-            let core = FIBRE_CORE * (1.0 - fineness);
-            let fibres = bundle_fibres(&at, shown, lane, at.id ^ self.streams.0[1]);
-            bundle = at.strength * (core + (1.0 - core) * fibres) * smoothstep(0.0, BUNDLE_GATE, density);
+        // the fibres (w.x, about 1 on average) fade to their mean as the texel's footprint and a fibre's own depth seen
+        // along the view (FIBRE_DEPTH_M: a fibre is far thinner than the layer) grow past their width, so far cirrus is a
+        // soft band
+        let width_m = self.cell_m / (look.fibre_freq * (0.5 + fineness)).max(0.1);
+        let fibre_smear = FIBRE_DEPTH_M * run * c.abs();
+        let fibre_blur = (footprint * footprint + fibre_smear * fibre_smear).sqrt();
+        let show = 1.0 - smoothstep(0.25, 1.0, BLUR_BELL * fibre_blur / width_m);
+        let mut texture = (1.0 + look.fibre_gain * (w.x - 1.0) * 3.0 * show).max(0.0);
+        // toward the tail's end the brush dries: only the fibres standing above a rising level are left
+        let dry = (look.tail_dry * w.y).clamp(0.0, 1.0);
+        if dry > 0.0 {
+            let level = 0.7 + 0.5 * dry;
+            texture *= 1.0 - dry * show * (1.0 - smoothstep(level, level + 0.25, w.x));
         }
-        // Low down a ray runs through the layer's depth over BAND_FROM to BAND_TO cells: the bundles one behind the
-        // other merge into their mean, a soft band (design §4.3).
-        let band = smoothstep(BAND_FROM, BAND_TO, look.depth_m * run / self.cell_m);
-        let bundle = bundle + (bundle_mean * smoothstep(0.0, BUNDLE_GATE, density) - bundle) * band;
-        let tau = tau * (look.veil * density + bundle);
+        let tau = tau * density * (look.veil * look.veil_scale + texture) + trails;
         let slant = 1.0 + (1.0 / mu.max(look.mu_min) - 1.0) * look.slant;
         1.0 - (-tau * slant).exp()
+    }
+
+    /// The optical depth straight up a Cirrus' aircraft trails add along `d`, where it meets the plane `t` metres off at
+    /// the slope `mu` at `hit_m`, for a lookup of a bake whose texels are `texel` radians wide (`Trail::depth`, each
+    /// trail's footprint across it: stretched by 1 / mu along the view). 0 without trails.
+    fn trails_depth(&self, d: Vec3f, t: f32, mu: f32, hit_m: Vec2f, texel: f32) -> f32 {
+        if self.trails.is_empty() {
+            return 0.0;
+        }
+        let level = (d.x * d.x + d.z * d.z).sqrt();
+        let (hx, hz) = if level > 1.0e-6 { (d.x / level, d.z / level) } else { (1.0, 0.0) };
+        let mu = mu.max(1.0e-3);
+        self.trails
+            .iter()
+            .map(|trail| {
+                // how much of the trail's cross direction lies along the view's
+                let c = -trail.u.y * hx + trail.u.x * hz;
+                let across = t * texel * ((c / mu) * (c / mu) + 1.0 - c * c).sqrt();
+                trail.depth(hit_m, across)
+            })
+            .sum()
     }
 
     /// A Cirrostratus' optical depth straight up along `d`, where it meets the plane `t` metres off at the slope `mu`, at
@@ -1002,6 +901,16 @@ impl Sheet {
         }
         let t = shell_distance(d.y, self.height_m);
         let hit_m = vec2f(d.x * t, d.z * t);
+        // a Cirrus' aircraft trails, at any Cover; at Cover 0 they are all it draws (its streams are not worked out)
+        let trails = if self.trails.is_empty() { 0.0 } else { self.trails_depth(d, t, d.y + t * (1.0 - d.y * d.y) / EARTH_M, hit_m, texel) };
+        if !self.trails.is_empty() && !(self.remap.cover() > 0.0) {
+            if !(trails > 0.0) {
+                return Shape { hit_m, height_m: self.height_m, ..Shape::default() };
+            }
+            let mu = d.y + t * (1.0 - d.y * d.y) / EARTH_M;
+            let cover = self.cirrus_cover(d, t, mu, Vec2f::default(), 0.0, texel, trails);
+            return Shape { cover, alpha: cover * horizon_fade(d.y), tau: 0.0, tau_sun: 0.0, hit_m, height_m: self.height_m };
+        }
         let p = vec2f(hit_m.x / self.cell_m, hit_m.y / self.cell_m);
         let (fine, broad) = self.recipe.octaves();
         let lod = Lod { fine, broad, detail: self.recipe.lod_weight(detail_at(p.length())) };
@@ -1018,14 +927,14 @@ impl Sheet {
         };
         let a = self.threshold(lod);
         let density = self.remap.density(n, a, f);
-        if !(density > 0.0) {
+        if !(density > 0.0) && !(trails > 0.0) {
             return Shape { hit_m, height_m: self.height_m, ..Shape::default() };
         }
         let (cover, tau) = match self.recipe {
             SheetRecipe::Cirrus { .. } => {
                 // The ray's slope where it meets the plane, on the curved Earth.
                 let mu = d.y + t * (1.0 - d.y * d.y) / EARTH_M;
-                (self.cirrus_cover(d, t, mu, w, density, texel), 0.0)
+                (self.cirrus_cover(d, t, mu, w, density, texel, trails), 0.0)
             }
             SheetRecipe::Cirrostratus { .. } => {
                 let mu = d.y + t * (1.0 - d.y * d.y) / EARTH_M;

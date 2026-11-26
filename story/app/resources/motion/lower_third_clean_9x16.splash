@@ -1,0 +1,36 @@
+use mod.motion.*
+// CLEAN LOWER THIRD, 9:16 — the portrait cut of lower_third_clean: it sits
+// just above the bottom band the platforms cover (its role line ends
+// above y 1248), on the safe column's left edge. Transparent overlay.
+// Why: in portrait the "lower third" is really the bottom of the safe
+// area — any lower and the caption and buttons cover it.
+Motion{
+    label: "Clean lower third 9:16"
+    brief: "Name and role beside a growing accent bar, above the platform UI; portrait."
+    tags: ["lower-third", "clean", "name", "overlay", "interview", "9:16"]
+    size: vec2(1080, 1920) duration: 6.0
+    inputs: {
+        name: input(@text, "Ada Moreno", "Person's name")
+        role: input(@text, "Head of Product, Lumen", "Role or place")
+        ink: input(@color, #f4f7fa, "Name colour")
+        muted: input(@color, #d6dee6, "Role colour")
+        accent: input(@color, #ff5c39, "Bar colour")
+    }
+    layers: [
+        Ellipse{at: vec2(-500, 900) size: vec2(1400, 620) fill: #000000 feather: 260
+                opacity: keys([0.0, 0], [0.6, 0.55, @ease_out_cubic], [5.4, 0.55], [6.0, 0, @ease_in_cubic])}
+        Rect{at: vec2(100, 1080) size: vec2(8, 132) radius: 4 fill: in(@accent) anchor: vec2(0.5, 0)
+             scale: keys([0.1, vec2(1, 0)], [0.6, vec2(1, 1), @ease_out_expo], [5.45, vec2(1, 1)], [5.8, vec2(1, 0), @ease_in_expo])}
+        Group{
+            mask: Rect{at: vec2(116, 1040) size: vec2(900, 220)}
+            layers: [
+                Text{text: in(@name) font: Font{family: "Inter" weight: 700} size: 64 tracking: -0.015 color: in(@ink) at: vec2(140, 1066)
+                     x: keys([0.3, -60], [1.0, 0, @ease_out_expo], [5.25, 0], [5.65, -60, @ease_in_expo])
+                     opacity: keys([0.3, 0], [0.6, 1, @ease_out_cubic], [5.35, 1], [5.65, 0, @ease_in_cubic])}
+                Text{text: in(@role) font: Font{family: "Inter" weight: 500} size: 36 color: in(@muted) at: vec2(140, 1154)
+                     x: keys([0.4, -60], [1.1, 0, @ease_out_expo], [5.2, 0], [5.6, -60, @ease_in_expo])
+                     opacity: keys([0.4, 0], [0.7, 1, @ease_out_cubic], [5.3, 1], [5.6, 0, @ease_in_cubic])}
+            ]
+        }
+    ]
+}

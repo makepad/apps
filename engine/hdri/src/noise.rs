@@ -11,6 +11,36 @@
 //! hash of `sandbox/libs/rtsmap/src/rng.rs`, and the quintic fade and gradient table
 //! of `libs/model/src/surface_pattern.rs`, rewritten for f32, three
 //! dimensions and a seed.
+//!
+//! What the generator has, so nothing is written twice. Look here and in patterns.rs (the surface patterns: gradient
+//! noise by footprint, wear, water, cloth) before writing a noise; reuse it, or say below why a new one differs.
+//! - Hashes: `hash_u32` (lowbias32; floor.rs's `gpu_hash`, makepad-floor's and the cloud shader's `hu` and
+//!   engine/skyline's `hu` are the same function), `hash3_u32` (a lattice point), `hash01` (its float in 0..1), `unit`
+//!   (a hash's top 24 bits in 0..1), `octave_seed` (an octave's seed).
+//! - Value noise: `value2`, `value3` (the quintic `fade` over `cell`), `value1_d` (with its slope).
+//! - Gradient noise: `perlin3` (16 gradients); 2D: patterns::gn.
+//! - Cellular: `worley3`.
+//! - fbm: `fbm2` (each octave turned by a 3-4-5 triangle, doubled and shifted), `fbm3` (OCTAVE_TURN), `shaped_fbm2`
+//!   (fbm2's walk with a shape per octave) and its `ridged2` (modifier's cloth `folds`) and `billow2` (open_box's
+//!   `soft_folds` is shaped_fbm2 with a rounded crest); fractional octaves: `fbm1_d`, `fbm1_frac_full`, `fbm3_frac`,
+//!   `fbm3_frac_full`, and `octaves_for` (the octaves a texel resolves). `curl2` (a divergence-free flow) has no caller.
+//!
+//! Kept elsewhere on purpose, their formulas differ (merging them would change the pictures):
+//! - patterns.rs `gn`, `gl`, `fbm`: 2D gradient noise faded by the footprint, its fbm not renormalised and unturned (the
+//!   room, the lamps' dirt).
+//! - floor.rs `cell_noise`: its own hash and a cubic fade, at the GPU floor's mottle scale (`fine_texture`, `speckle`).
+//! - cloud_volume_deck.rs `vnoise` (cubic fade), `gnoise` (random cube gradients), `turb` (lacunarity 2.6434, one seed
+//!   for every octave): the twin of the GPU deck's shader, bit for bit.
+//! - volumetric.rs `PerlinTile` (12 cube-edge gradients, tiling) and `WorleyTile` (salts on the seed): tiles built once
+//!   per seed.
+//! - moon_face.rs `fbm` (perlin3, lacunarity 2.03, footprint `keep`) and its craters (worley3's feature point inline);
+//!   milky_way.rs `ridged` (MW_RIDGE_TURN, MW_RIDGE_POW); imperfections.rs `ridged` (each octave weighted by the last)
+//!   and `f_hash`/`f_noise` (a float hash, finish.rs's); pattern.rs `noise1` (a 64-bit hash).
+//! - Integer hashes with other mixes: weather.rs `fork_id`, params.rs `window_rule`, the cumulus and altocumulus cell
+//!   chains, night.rs's streams; engine/skyline's rng (f64, bit-matched to the web page).
+//! - Footprint fades: `octaves_for` (fractional octaves), patterns::lod (a quarter to half a wavelength), moon_face's
+//!   `keep` and floor.rs's `fine_texture` (one to two wavelengths a footprint), floor.rs `band_ratio` (4 to 16),
+//!   cloud_sheets' `detail_at` (4 to 16 cells from the point overhead).
 
 use makepad_draw::*;
 
@@ -49,19 +79,22 @@ fn mix_in(h: u32, coordinate: i32) -> u32 {
 }
 
 /// The top 24 bits as a float in [0, 1): exact in f32, and never 1.
-fn unit(h: u32) -> f32 {
+#[inline]
+pub(crate) fn unit(h: u32) -> f32 {
     (h >> 8) as f32 * (1.0 / 16_777_216.0)
 }
 
 /// Perlin's quintic fade 6t^5 - 15t^4 + 10t^3: zero first and second
 /// derivatives at the lattice, so the noise shows no creases along cell edges.
-fn fade(t: f32) -> f32 {
+#[inline]
+pub(crate) fn fade(t: f32) -> f32 {
     t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 }
 
 /// Lattice cell and position inside it. `floor`, not truncation, so negative
 /// coordinates land in the right cell.
-fn cell(v: f32) -> (i32, f32) {
+#[inline]
+pub(crate) fn cell(v: f32) -> (i32, f32) {
     let floor = v.floor();
     (floor as i32, v - floor)
 }
@@ -69,6 +102,12 @@ fn cell(v: f32) -> (i32, f32) {
 /// A uniform value in [0, 1) for a lattice point and seed.
 pub fn hash01(ix: i32, iy: i32, iz: i32, seed: u32) -> f32 {
     unit(mix_in(mix_in(mix_in(seed_key(seed), ix), iy), iz))
+}
+
+/// The whole hash word of a lattice point and seed (`hash01` is its top 24 bits): a noise that draws several numbers
+/// from one corner (a gradient, a site's offset) takes them from its bits. cloud_gpu's `tbh` computes the same.
+pub fn hash3_u32(ix: i32, iy: i32, iz: i32, seed: u32) -> u32 {
+    mix_in(mix_in(mix_in(seed_key(seed), ix), iy), iz)
 }
 
 /// 2D value noise in [0, 1]: hashed lattice values blended with the quintic
@@ -181,7 +220,8 @@ pub fn worley3(x: f32, y: f32, z: f32, seed: u32) -> f32 {
 
 /// Each octave gets its own seed, so octaves are decorrelated and not
 /// just scaled copies of one another.
-fn octave_seed(seed: u32, octave: u32) -> u32 {
+#[inline]
+pub(crate) fn octave_seed(seed: u32, octave: u32) -> u32 {
     seed.wrapping_add(octave.wrapping_mul(0x9e37_79b9))
 }
 
@@ -214,7 +254,8 @@ pub fn fbm3(x: f32, y: f32, z: f32, octaves: u32, seed: u32) -> f32 {
 /// The octave walk of fbm2, ridged2 and billow2 (the octave seeds, the 3-4-5 turn, the doubling and the shift) over
 /// `shape` of each octave's value noise, normalised by the amplitudes and clamped to [0, 1].
 /// `octaves` is clamped to 1..=12.
-fn shaped_fbm2(x: f32, y: f32, octaves: u32, seed: u32, shape: impl Fn(f32) -> f32) -> f32 {
+#[inline]
+pub(crate) fn shaped_fbm2(x: f32, y: f32, octaves: u32, seed: u32, shape: impl Fn(f32) -> f32) -> f32 {
     let octaves = octaves.clamp(1, FBM_MAX_OCTAVES);
     let (mut px, mut py) = (x, y);
     let (mut amplitude, mut sum, mut total) = (1.0f32, 0.0f32, 0.0f32);

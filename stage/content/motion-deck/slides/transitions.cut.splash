@@ -1,0 +1,29 @@
+use mod.flow.*
+use mod.cut.*
+
+
+Flow{
+    kind: @cut
+    label: "Transitions and camera: five ways in"
+    output: {width: 1920 height: 1080 fps: 60}
+    duration: 15.9
+    // Six cards of one slide (params: card), each joined to the next by the transition it names.
+    let trans_card_0 = Graphic{src: graphic("shared/transition_card") params: {card: 0} span: [0.0, 3.4] fit: @fill track: 0}
+    let trans_card_1 = Graphic{src: graphic("shared/transition_card") params: {card: 1} span: [2.5, 3.4] fit: @fill track: 0}
+    let trans_card_2 = Graphic{src: graphic("shared/transition_card") params: {card: 2} span: [5.0, 3.4] fit: @fill track: 0}
+    let trans_card_3 = Graphic{src: graphic("shared/transition_card") params: {card: 3} span: [7.5, 3.4] fit: @fill track: 0}
+    let trans_card_4 = Graphic{src: graphic("shared/transition_card") params: {card: 4} span: [10.0, 3.4] fit: @fill track: 0}
+    let trans_card_5 = Graphic{src: graphic("shared/transition_card") params: {card: 5} span: [12.5, 3.4] fit: @fill track: 0}
+    let trans_1 = Transition{a: trans_card_0.out(@frame) b: trans_card_1.out(@frame)
+        effect: "105_trans_push" span: [2.5, 0.9] mix: keys([0.0, 0.0], [0.9, 1.0, @ease_in_out])}
+    let trans_2 = Transition{a: trans_1.out(@frame) b: trans_card_2.out(@frame)
+        effect: "521_trans_slide_over" span: [5.0, 0.9] mix: keys([0.0, 0.0], [0.9, 1.0, @ease_in_out])}
+    let trans_3 = Transition{a: trans_2.out(@frame) b: trans_card_3.out(@frame)
+        effect: "557_trans_tangent_motion_blur" span: [7.5, 0.9] mix: keys([0.0, 0.0], [0.9, 1.0, @ease_in_out])}
+    let trans_4 = Transition{a: trans_3.out(@frame) b: trans_card_4.out(@frame)
+        effect: "522_trans_directional_scaled" span: [10.0, 0.9] mix: keys([0.0, 0.0], [0.9, 1.0, @ease_in_out])}
+    let trans_5 = Transition{a: trans_4.out(@frame) b: trans_card_5.out(@frame)
+        effect: "101_trans_dissolve" span: [12.5, 0.9] mix: keys([0.0, 0.0], [0.9, 1.0, @ease_in_out])}
+    let trans_out = CutOutput{frame: trans_5.out(@frame)}
+    trans_card_0, trans_card_1, trans_card_2, trans_card_3, trans_card_4, trans_card_5, trans_1, trans_2, trans_3, trans_4, trans_5, trans_out
+}

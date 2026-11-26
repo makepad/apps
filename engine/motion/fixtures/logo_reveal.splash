@@ -1,0 +1,53 @@
+use mod.motion.*
+// A 4 s logo reveal: a ring draws itself, a tick strokes through it, three
+// squares spring in one after another, and the word mark types on beside.
+let ink = #4cc9f0
+let Square = Rect{size: vec2(56, 56) radius: 10 anchor: vec2(0.5, 0.5)}
+
+Motion{
+    label: "Logo reveal"
+    size: vec2(1080, 1080)
+    duration: 4.0
+    fps: 30
+    background: #101418
+    layers: [
+        Group{
+            name: "mark"
+            at: vec2(540, 420)
+            rotate: tween(-90, 0, 0.0, 1.2, @ease_out_expo)
+            layers: [
+                Path{
+                    name: "ring"
+                    svg: "M 0 -160 A 160 160 0 1 1 -0.01 -160"
+                    stroke: ink width: 16 cap: @round
+                    trim_end: tween(0, 1, 0.0, 1.2, @ease_in_out_cubic)
+                }
+                Path{
+                    name: "tick"
+                    svg: "M -70 0 L -15 55 L 85 -60"
+                    stroke: #ffffff width: 18 cap: @round join: @round
+                    trim_end: tween(0, 1, 1.0, 1.5, @ease_out_cubic)
+                }
+            ]
+        }
+        Group{
+            name: "squares"
+            at: vec2(372, 660)
+            stagger: 0.12
+            layers: [
+                Square{at: vec2(0, 0) fill: #4cc9f0 scale: tween(0, 1, 1.4, 2.2, spring(180, 12))}
+                Square{at: vec2(140, 0) fill: #f72585 scale: tween(0, 1, 1.4, 2.2, spring(180, 12))}
+                Square{at: vec2(280, 0) fill: #ffd166 scale: tween(0, 1, 1.4, 2.2, spring(180, 12))}
+            ]
+        }
+        Text{
+            name: "wordmark"
+            text: "makepad"
+            font: Font{family: "JetBrains Mono" weight: 700} size: 96 tracking: 4
+            at: vec2(540, 780) align: @center
+            by: @letter stagger: 0.06
+            opacity: tween(0, 1, 2.0, 2.1)
+            y: tween(16, 0, 2.0, 2.3, @ease_out_back)
+        }
+    ]
+}

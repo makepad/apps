@@ -814,9 +814,9 @@ impl Session {
             },
         };
         let parts: Vec<usize> = match str_arg(args, "object") {
-            Some(object) => match ev.plate.parts.iter().position(|p| p.object == object) {
-                Some(k) => vec![k],
-                None => return Reply::err(format!("no part '{object}' on the plate")),
+            Some(object) => match crate::printed_part_index(&ev.plate.parts, object) {
+                Ok(k) => vec![k],
+                Err(e) => return Reply::err(e),
             },
             None => (0..ev.plate.parts.len()).collect(),
         };
@@ -919,7 +919,7 @@ impl Session {
             let object = ev.plate.parts[k].object.clone();
             let changes = self.place_changes(&[orient_move(&ev.plate.parts[k], &turn)], false).map_err(|reply| reply.text)?;
             let request_id = str_arg(args, "request_id").map_or_else(|| self.next_request_id(ORIENT_TOOL), str::to_string);
-            return match self.model.apply(&mut self.eval, &request_id, expected, &changes, cancelled) {
+            return match self.commit_changes(&request_id, expected, &changes, cancelled, true) {
                 Ok((applied, built)) => {
                     makepad_error_log::flight::mark_ab("fab.orient.apply", &object, tubes.len() as u64, 0);
                     self.orient_was = Some(OrientWas { tubes: tubes.clone(), turn });

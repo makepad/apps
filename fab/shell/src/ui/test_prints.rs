@@ -116,39 +116,39 @@ script_mod! {
                     label +: {text: "Name"}
                     value +: {name := mod.widgets.FabInput{width: Fill a11y: {label: "Test print name"}}}
                 }
-                x := PropNumberRow{
+                x := FabNumberRow{
                     label +: {text: "Position X"}
                     value +: {num +: {a11y: {label: "Test print X"} min: -1000.0 max: 2000.0 step: 0.5 snap: 5.0 precision: 2 suffix: " mm"}}
                 }
-                y := PropNumberRow{
+                y := FabNumberRow{
                     label +: {text: "Y"}
                     value +: {num +: {a11y: {label: "Test print Y"} min: -1000.0 max: 2000.0 step: 0.5 snap: 5.0 precision: 2 suffix: " mm"}}
                 }
-                z := PropNumberRow{
+                z := FabNumberRow{
                     label +: {text: "Z"}
                     value +: {num +: {a11y: {label: "Test print Z"} min: -1000.0 max: 2000.0 step: 0.5 snap: 5.0 precision: 2 suffix: " mm"}}
                 }
-                sx := PropNumberRow{
+                sx := FabNumberRow{
                     label +: {text: "Size X"}
                     value +: {num +: {a11y: {label: "Test print size X"} min: 0.1 max: 2000.0 step: 0.5 snap: 5.0 precision: 2 suffix: " mm"}}
                 }
-                sy := PropNumberRow{
+                sy := FabNumberRow{
                     label +: {text: "Y"}
                     value +: {num +: {a11y: {label: "Test print size Y"} min: 0.1 max: 2000.0 step: 0.5 snap: 5.0 precision: 2 suffix: " mm"}}
                 }
-                sz := PropNumberRow{
+                sz := FabNumberRow{
                     label +: {text: "Z"}
                     value +: {num +: {a11y: {label: "Test print size Z"} min: 0.1 max: 2000.0 step: 0.5 snap: 5.0 precision: 2 suffix: " mm"}}
                 }
-                tx := PropNumberRow{
+                tx := FabNumberRow{
                     label +: {text: "Turn X"}
                     value +: {num +: {a11y: {label: "Test print turn X"} min: -360.0 max: 360.0 step: 1.0 snap: 15.0 precision: 1 suffix: "°"}}
                 }
-                ty := PropNumberRow{
+                ty := FabNumberRow{
                     label +: {text: "Y"}
                     value +: {num +: {a11y: {label: "Test print turn Y"} min: -360.0 max: 360.0 step: 1.0 snap: 15.0 precision: 1 suffix: "°"}}
                 }
-                tz := PropNumberRow{
+                tz := FabNumberRow{
                     label +: {text: "Z"}
                     value +: {num +: {a11y: {label: "Test print turn Z"} min: -360.0 max: 360.0 step: 1.0 snap: 15.0 precision: 1 suffix: "°"}}
                 }
@@ -171,15 +171,15 @@ script_mod! {
                         }
                     }
                 }
-                px := PropNumberRow{
+                px := FabNumberRow{
                     label +: {text: "Pose X"}
                     value +: {num +: {a11y: {label: "Test print pose X"} min: -360.0 max: 360.0 step: 1.0 snap: 15.0 precision: 1 suffix: "°"}}
                 }
-                py := PropNumberRow{
+                py := FabNumberRow{
                     label +: {text: "Y"}
                     value +: {num +: {a11y: {label: "Test print pose Y"} min: -360.0 max: 360.0 step: 1.0 snap: 15.0 precision: 1 suffix: "°"}}
                 }
-                pz := PropNumberRow{
+                pz := FabNumberRow{
                     label +: {text: "Z"}
                     value +: {num +: {a11y: {label: "Test print pose Z"} min: -360.0 max: 360.0 step: 1.0 snap: 15.0 precision: 1 suffix: "°"}}
                 }

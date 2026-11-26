@@ -17,12 +17,12 @@ use std::{borrow::Cow, path::{Path, PathBuf}, sync::{atomic::{AtomicU32, Orderin
 pub(crate) struct PlayFile {
     pub bed: u64,
     pub file: PathBuf,
-    pub call: Option<u64>,
+    pub call: Option<crate::elec_host::Recipient>,
 }
 
 #[derive(Debug)]
 pub(crate) struct MicAnswer {
-    pub call: u64,
+    pub call: crate::elec_host::Recipient,
     pub result: Result<(), String>,
 }
 

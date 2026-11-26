@@ -21,6 +21,7 @@
 pub mod annotate;
 pub mod areas;
 pub mod fine_drag;
+pub mod fit;
 pub mod force_edit;
 pub mod handles;
 pub mod isolate;
@@ -439,9 +440,9 @@ impl ToolController for ToolSet {
 
                 match state.tool {
                     Tool::Select => {
-                        // A click on the pick kind filter's strip is the strip's: the part
-                        // under it stays picked.
-                        if crate::tools::picks::active(state) && crate::tools::picks::strip(input.rect).iter().any(|(r, _)| r.contains(pos)) {
+                        // A click on the pick kind filter's strip or a command's box is theirs:
+                        // the part under it stays picked.
+                        if crate::tools::picks::active(state) && (state.steps.marker.is_some() || crate::tools::picks::on_strip(picks::strip_view(state, self.pane, input.rect), &state.picks.list, pos)) {
                             return InputResponse::consumed();
                         }
                         if state.ui.lay_flat && !mods.shift {
@@ -514,6 +515,21 @@ impl ToolController for ToolSet {
                         }
                         InputResponse::consumed()
                     }
+                    Tool::MeasureFit => {
+                        if !fit::in_pane(state, self.pane) { return InputResponse::default(); }
+                        if let Some(hit) = input.hit {
+                            if let Some(part) = state.plate.part_of(hit.element) {
+                                let pick = FitPick {
+                                    element: hit.element, part: state.plate.parts[part].object.clone(),
+                                    point: measure::position(hit.point).map(|p| p * 1000.0),
+                                    normal: measure::position(hit.normal),
+                                };
+                                if let Some(action) = session::with(|s| s.fit.pick(pick)) { cx.action(action); }
+                                crate::ui::redraw(cx, &[ids!(tool_overlay)]);
+                            }
+                        }
+                        InputResponse::consumed()
+                    }
                     Tool::Measure(_) => {
                         if let Some(hit) = self.snap_at(state, input, pos) {
                             let proj = ViewProjector::new(*state.view.camera(self.pane), input.rect);
@@ -562,7 +578,16 @@ impl ToolController for ToolSet {
                             return InputResponse::default();
                         }
                     }
+                    KeyCode::Escape if state.tool == Tool::MeasureFit => {
+                        cx.action(ShellAction::ClearFit);
+                        return InputResponse::consumed();
+                    }
                     KeyCode::Escape => {
+                        // a command at a pick (Round) ends first
+                        if state.params.command.is_some() {
+                            cx.action(crate::params::ParamAction::EndCommand);
+                            return InputResponse::consumed();
+                        }
                         if state.ui.lay_flat {
                             state.ui.lay_flat = false;
                             self.down = None;
@@ -611,7 +636,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
 }
 
 /// The tools' action hook, called from `App::dispatch`.
-pub fn apply(_cx: &mut Cx, state: &mut AppState, action: &ShellAction) -> bool {
+pub fn apply(cx: &mut Cx, state: &mut AppState, action: &ShellAction) -> bool {
     match action {
         ShellAction::SelectOnly(_) | ShellAction::SelectToggle(_) | ShellAction::SelectAdd(_)
         | ShellAction::SelectSet(_) | ShellAction::ClearSelection => {
@@ -633,11 +658,26 @@ pub fn apply(_cx: &mut Cx, state: &mut AppState, action: &ShellAction) -> bool {
                 let draft = keep_paint.then(|| std::mem::take(&mut s.paint));
                 let keep_sculpt = matches!(action, ShellAction::SceneUpdated { frame: false, .. }) && sculpt::active(state);
                 let sculpt = keep_sculpt.then(|| std::mem::take(&mut s.sculpt));
+                // A new display tessellation of the same plate can arrive between the picks.
+                // The host clears a fit when the evaluated model changes.
+                let fit = match action {
+                    ShellAction::SceneUpdated { scene, .. } if state.tool == Tool::MeasureFit && s.fit.same_elements(scene) => Some(std::mem::take(&mut s.fit)),
+                    _ => None,
+                };
                 s.reset_for_scene();
+                if let Some(fit) = fit { s.fit = fit; }
                 // the released stroke is in the plate now (its paint bakes and shows it)
                 if let Some(mut draft) = draft { draft.hover = None; draft.pending = None; s.paint = draft; }
                 if let Some(mut draft) = sculpt { draft.hover = None; s.sculpt = draft; }
             });
+            true
+        }
+        ShellAction::ClearFit if state.tool == Tool::MeasureFit => {
+            session::with(|s| s.fit.clear());
+            true
+        }
+        ShellAction::TurnFit if state.tool == Tool::MeasureFit => {
+            if let Some(action) = session::with(|s| s.fit.turn()) { cx.action(action); }
             true
         }
         ShellAction::SetTool(tool) => {
@@ -648,6 +688,7 @@ pub fn apply(_cx: &mut Cx, state: &mut AppState, action: &ShellAction) -> bool {
                 s.measure.clear();
                 s.measure_drag = None;
                 s.section_drag = None;
+                if *tool != Tool::MeasureFit { s.fit.clear(); }
                 if let Tool::Measure(k) = tool {
                     s.measure.kind = *k;
                 }

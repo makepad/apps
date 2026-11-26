@@ -1,0 +1,14 @@
+use mod.scene.*
+// The extruded pattern slab: a truchet tiling on the tops of a 20×20 grid
+// of boxes with striped sides; blocks lift and sink on every beat over a
+// slow wave while the camera orbits; the exit dives into the surface with
+// heavy zoom blur (CameraMove @dive + ZoomBlur). 120 bpm.
+Scene3D{ background: #000000 bpm: 120 tone_mapping: @aces
+  camera: Camera{orbit: true target: vec3(0, 0.3, 0) yaw: tween(30, 60, 0, 3) pitch: 38 distance: 10 fov: 32
+                 moves: [CameraMove{type: @dive start: 2.9 end: 3.5 ease: @ease_in_expo}]}
+  // The dive's whip: a zoom blur from the one render, opening with the dive.
+  post: [ZoomBlur{amount: keys([0, 0], [2.9, 0], [3.5, 0.7, @ease_in_cubic])}]
+  lights: [HemisphereLight{sky_color: #ffffff ground_color: #404040 intensity: 1.2} DirectionalLight{position: vec3(3, 8, 5) intensity: 1.6}]
+  children: [
+    Fx{preset: @pattern_slab from: file("truchet.png") grid: 20 spacing: 0.3 height: 0.8 amount: 0.9 color: #f0ebe0 color2: #2a44c8}
+  ] }

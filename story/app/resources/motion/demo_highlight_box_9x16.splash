@@ -1,0 +1,41 @@
+use mod.motion.*
+// HIGHLIGHT BOX, 9:16 — the portrait cut of demo_highlight_box, framing a
+// wide button at the bottom of a phone screen. The tab hangs above the box
+// (its bottom edge 16 px over the box's top), because below it would sit
+// under the platform's caption band. Original notes: the outline draws
+// clockwise from the top-left, a wash fills in, the box breathes once.
+// Why: drawing the outline gives the eye a path; above-the-box keeps the
+// label in the safe area whatever the control's position.
+Motion{
+    label: "Highlight box 9:16"
+    brief: "An outline that draws around a control, with a wash, a breath and a label tab above it; portrait."
+    tags: ["demo", "overlay", "highlight", "annotation", "product", "9:16"]
+    size: vec2(1080, 1920) duration: 3.5
+    inputs: {
+        target: input(@vec2, vec2(540, 1550), "Centre of the control, px")
+        target_size: input(@vec2, vec2(960, 100), "Size of the control, px")
+        label: input(@text, "Start a new note", "Tab text; \"\" for none")
+        accent: input(@color, #ff5c39, "Outline and tab")
+        wash: input(@color, #ff5c391f, "Fill inside the box")
+        tab_ink: input(@color, #0b0d12, "Tab text")
+    }
+    layers: [
+        Group{
+            at: in(@target)
+            scale: keys([0.75, 1.0], [0.95, 1.04, @ease_out_cubic], [1.35, 1.0, @ease_in_out_cubic])
+            opacity: tween(1, 0, 3.15, 3.5, @ease_in_cubic)
+            layers: [
+                Rect{at: (in(@target_size) + vec2(28, 28)) * -0.5 size: in(@target_size) + vec2(28, 28) radius: 64
+                     fill: in(@wash) opacity: tween(0, 1, 0.5, 0.9, @ease_out_cubic)}
+                Rect{at: (in(@target_size) + vec2(28, 28)) * -0.5 size: in(@target_size) + vec2(28, 28) radius: 64
+                     stroke: in(@accent) width: 5 cap: @round
+                     trim_end: tween(0, 1, 0.1, 0.8, @ease_in_out_cubic)}
+            ]
+        }
+        Text{text: in(@label) font: Font{family: "Inter" weight: 700} size: 32 color: in(@tab_ink)
+             at: in(@target) + in(@target_size) * vec2(-0.5, -0.5) + vec2(2, -88)
+             plate: in(@accent) plate_pad: vec2(18, 10) plate_radius: 10
+             y: tween(10, 0, 0.8, 1.2, @ease_out_back)
+             opacity: keys([0.8, 0], [0.95, 1, @ease_out_cubic], [3.15, 1], [3.45, 0, @ease_in_cubic])}
+    ]
+}

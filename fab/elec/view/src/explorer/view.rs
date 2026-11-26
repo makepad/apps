@@ -2,8 +2,8 @@
 //! (nothing on the sheet moves); a double-click opens the projected view around it (the reveal),
 //! Escape returns; T/A/F for theme, assembly and fit. The pane owns pan, zoom, hover and semantic
 //! presses.
-//! `item` is a SheetRows row; selection comes from the host's item-state texture
-//! (`electronics/shared/item-state.md`), shared by the sheet and its reveal.
+//! `item` is a SheetRows row. The sheet and reveal use the host's item states
+//! (`electronics/shared/item-state.md`) and preview a held marquee in a pane-local texture.
 //! A host feeds it (`set_design`, `update_design`, `set_live`), or it follows the electronics
 //! host's `ElecLive` on its own (`follow`).
 
@@ -39,7 +39,8 @@ use super::tools::{annotate_pressed, apply_strip, bar_presses, check_pressed, co
 use crate::live::segs::{Prepared, TreeOwner};
 use crate::{ElecLive, ElecPanel, ViewAction};
 use crate::library::{library_drag_entry, EntryKey, LibraryAction};
-use crate::snapshot::next_tag;
+use crate::snapshot::{next_tag, Invocation};
+pub use fab_elec_explore::{edit::{Target, Toward}, plan::{plan, Gesture, Planned}};
 use fab_elec_bench::ValueIndex;
 // Hosts can supply sheet rows and inspect view actions without another dependency.
 pub use fab_elec_circuit::{CircuitOp, End};
@@ -48,8 +49,9 @@ pub use fab_elec_explore::rows::{RowIndex, SheetKey, SheetRows};
 use fab_elec_circuit::{Circuit, NetKind, SheetHints};
 use fab_elec_core::{BoardId, CompId, CompRef, NetId, NetRef};
 use fab_elec_design::{BenchOp, Design, DesignOp, Focus, FocusKind, FocusOrigin, ProbeOf, Unit};
-use fab_elec_explore::{edit::Target, legible::legible_labels, plan::{delete, delete_parts, label_net, mirror_part, plan, turn_part, Gesture, Planned}, sheet, KeepBase, Opts, SheetLayout};
+use fab_elec_explore::{legible::legible_labels, plan::{delete, delete_parts, label_net, mirror_part, turn_part}, sheet, KeepBase, Opts, SheetLayout};
 use fab_elec_explore::plan_drop::{Template, TemplateKind};
+pub use fab_elec_explore::plan_drop::plan_drop;
 use fab_elec_explore::plan_paste::{plan_paste, CopiedPart};
 use fab_elec_lang::{CatalogEntry, CatalogKind};
 use fab_elec_parts::PartKind;
@@ -67,12 +69,43 @@ mod paste;
 mod probe_flags;
 use card::{starts_value, Card};
 
+/// A Select press on empty sheet. Once dragged, the band shows the parts its release would
+/// take. Shift adds to the selection at the press, which a cancelled band puts back.
 #[derive(Default)]
 enum Marquee {
     #[default]
     Idle,
     Pressed,
-    Drawing([f64; 4]),
+    Drawing { band: [f64; 4], crossing: bool, before: Vec<(u32, String)>, states: Option<crate::ItemStates> },
+}
+
+impl Marquee {
+    /// Look up the unit's sheet index and build the held band's item states. Per move,
+    /// `sheet_texels` takes O(selected + findings' row work + lit log lit), including net scans
+    /// for findings on nets. The write is O(old lit + new lit), plus any storage growth.
+    fn preview(&mut self, cx: &mut Cx, unit: &Unit, parts: &[(u32, String)]) {
+        let Self::Drawing { states, .. } = self else { return };
+        let Some((index, violations)) = cx.get_global_ref::<ElecLive>().and_then(|live| {
+            let sheet = live.snap.of(&live.snap.sheets, unit.id)?;
+            Some((&sheet.value, &live.snap.violations.value))
+        }) else {
+            if let Some(mut old) = states.take() { old.release(cx); }
+            return;
+        };
+        let selected = parts.iter().map(|(node, _)| Sel::Comp(CompRef { board: unit.id, comp: CompId(*node) })).collect();
+        // The band replaces the old focus and a group publishes no emphasis. Outside-edit flashes
+        // are transient. Circuit findings keep their ordinary rows throughout the drag.
+        let view = crate::ViewState { selected, emphasis: Vec::new() };
+        let rows = crate::states::sheet_texels(unit.id, &unit.circuit, unit.board.as_deref(), &index.rows, violations, &view);
+        states.get_or_insert_with(crate::ItemStates::new).write(index.count as usize, rows);
+    }
+
+    /// End the press, release its local texture and return the selection from before the preview.
+    fn finish(&mut self, cx: &mut Cx) -> Option<Vec<(u32, String)>> {
+        let Self::Drawing { before, states, .. } = std::mem::take(self) else { return None };
+        if let Some(mut states) = states { states.release(cx); }
+        Some(before)
+    }
 }
 
 /// Give pin-line presses an item key even where ordinary scene picking sees empty canvas.
@@ -141,12 +174,15 @@ script_mod! {
             text_style: theme.font_regular{font_size: 11.0}
         }
         draw_marquee +: {
+            dash: uniform(0.0)
             pixel: fn() {
                 let px = 1.0 / self.draw_pass.dpi_factor
-                let sdf = Sdf2d.viewport_px(self.pos * self.rect_size, self.draw_pass.dpi_factor)
+                let p = self.pos * self.rect_size
+                let sdf = Sdf2d.viewport_px(p, self.draw_pass.dpi_factor)
                 sdf.rect(px * 0.5, px * 0.5, max(0.0, self.rect_size.x - px), max(0.0, self.rect_size.y - px))
                 sdf.fill_keep(vec4(self.color.rgb, 0.08))
-                sdf.stroke(self.color, px * 0.5)
+                let dash = if self.dash > 0.5 {step(2.5, mod(p.x + p.y, 7.0))} else {1.0}
+                sdf.stroke(vec4(self.color.rgb, self.color.a * dash), px * 0.5)
                 return sdf.result
             }
         }
@@ -268,7 +304,7 @@ impl WireMeasure {
 }
 
 /// A catalog entry as a drop plan takes it: a passive whose part is a capacitor decouples.
-fn template_of(entry: &CatalogEntry) -> Template {
+pub fn template_of(entry: &CatalogEntry) -> Template {
     let kind = match entry.kind {
         CatalogKind::Passive if entry.part.as_ref().is_some_and(|part| part.kind == PartKind::Capacitor) => TemplateKind::Capacitor,
         CatalogKind::Passive => TemplateKind::Passive,
@@ -281,12 +317,110 @@ fn template_of(entry: &CatalogEntry) -> Template {
     }
 }
 
+/// The semantic Delete and Q presses, including a multi-part selection.
+pub fn key_plan(unit: &Unit, shown: &Unit, gesture: Gesture, parts: &[CompId]) -> (Planned, Option<Invocation>) {
+    let planned = match gesture {
+        Gesture::Delete(_) if parts.len() > 1 => delete_parts(&unit.circuit, parts),
+        Gesture::Delete(target) => delete(&unit.circuit, target, parts.first().copied()),
+        _ => plan(&shown.circuit, &gesture),
+    };
+    let call = sheet_invocation(unit, &gesture, parts, &planned);
+    (planned, call)
+}
+
+/// The reference field's Enter press, including switching a stored reference back to automatic.
+pub fn reference_gesture(unit: &Unit, part: CompId, text: &str) -> Option<(Planned, Option<Invocation>)> {
+    let component = unit.circuit.comps.get(part.ix())?;
+    let field = card::reference_field(unit.id, component);
+    let planned = match field.submission(text) {
+        Some((label, op)) => Planned::Edit(fab_elec_design::Resolved {
+            ops: vec![DesignOp::Circuit { unit: unit.id, op }], place: vec![], label,
+        }),
+        None => Planned::Nothing { chip: "the reference did not change".into() },
+    };
+    let call = Invocation::part(unit, part).map(|part|
+        Invocation::new("elec.part.rename", &unit.name, [("part", part.into()), ("to", text.into())]));
+    Some((planned, call))
+}
+
+fn pin_name(unit: &Unit, target: Target) -> Option<String> {
+    let (Target::Pin { comp, pin, .. } | Target::WireEnd { comp, pin, .. }) = target else { return None };
+    let part = Invocation::part(unit, comp)?;
+    let name = &unit.circuit.comps.get(comp.ix())?.part.pins.get(pin.ix())?.name;
+    Some(format!("{part}.{name}"))
+}
+
+/// Inputs of the sheet gesture, before the planner consumes its selected parts and targets.
+pub fn sheet_invocation(unit: &Unit, gesture: &Gesture, selected: &[CompId], planned: &Planned) -> Option<Invocation> {
+    let pin = |p| pin_name(unit, p);
+    let (name, fields) = match gesture {
+        Gesture::Delete(target) if selected.len() > 1 || pin(*target).is_none() => {
+            let names = selected.iter().map(|&id| Invocation::part(unit, id)).collect::<Option<Vec<_>>>()?;
+            if names.is_empty() { return None }
+            ("elec.part.remove", vec![("parts", names.join(", "))])
+        }
+        Gesture::Delete(target) => ("elec.net.disconnect", vec![("pin", pin(*target)?)]),
+        Gesture::NoConnect(target @ (Target::Pin { comp, pin: ix, .. } | Target::WireEnd { comp, pin: ix, .. })) => {
+            let marked = unit.circuit.comps.get(comp.ix())?.nc.contains(ix);
+            ("elec.pin.nc", vec![("pin", pin(*target)?), ("nc", (!marked).to_string())])
+        }
+        Gesture::NameNet { target, to } => ("elec.net.rename", vec![("net", label_net(&unit.circuit, *target).ok()?.name.clone()), ("to", to.clone())]),
+        Gesture::Wire { from, to } => {
+            if matches!(from, Target::WireEnd { .. }) && matches!(planned, Planned::Edit(r) if matches!(r.ops.as_slice(), [DesignOp::Circuit { op: CircuitOp::Disconnect { .. }, .. }])) {
+                ("elec.net.disconnect", vec![("pin", pin(*from)?)])
+            } else {
+                let to = match to {
+                    Target::Wire { net, .. } | Target::Tag { net, .. } => unit.circuit.nets.get(net.ix())?.name.clone(),
+                    _ => pin(*to)?,
+                };
+                ("elec.net.connect", vec![("pin", pin(*from)?), ("to", to)])
+            }
+        }
+        Gesture::Global { target, name } | Gesture::NameEnd { from: target, name } => {
+            if matches!(planned, Planned::Edit(r) if matches!(r.ops.as_slice(), [DesignOp::Circuit { op: CircuitOp::Rename { .. }, .. }])) {
+                ("elec.net.rename", vec![("net", label_net(&unit.circuit, *target).ok()?.name.clone()), ("to", name.clone())])
+            } else { ("elec.net.connect", vec![("pin", pin(*target)?), ("to", name.clone())]) }
+        }
+        _ => return None,
+    };
+    Some(Invocation::new(name, &unit.name, fields))
+}
+
+/// A Library drop keeps its actual Library key, target and chosen pin idiom. The
+/// strand compares the whole edit, including insertion position and layout hints.
+pub fn library_invocation(unit: &Unit, key: &EntryKey, target: Target, planned: &Planned) -> Option<Invocation> {
+    let mut fields = vec![("part", key.name.clone()), ("lib", key.lib.clone())];
+    let Planned::Edit(edit) = planned else { return None };
+    match edit.ops.as_slice() {
+        [DesignOp::Circuit { op: CircuitOp::InsertSeries { .. }, .. }] => fields.push(("series", pin_name(unit, target)?)),
+        [DesignOp::Circuit { op: CircuitOp::AddPart { ends, hint: None, .. }, .. }] => {
+            let mut words = Vec::new();
+            for (at, end) in ends.iter().enumerate() {
+                let word = match end {
+                    End::Open => "-".into(),
+                    End::Net(net) => {
+                        let pinned = match target { Target::Pin { comp, pin, .. } | Target::WireEnd { comp, pin, .. } =>
+                            at == 0 && unit.circuit.net_of(comp, pin) == Some(*net), _ => false };
+                        if pinned { pin_name(unit, target)? } else { unit.circuit.nets.get(net.ix())?.name.clone() }
+                    }
+                    End::Pin(comp, pin) => pin_name(unit, Target::Pin { comp: *comp, pin: *pin, toward: fab_elec_explore::edit::Toward::Across })?,
+                    End::Shared(_) => return None,
+                };
+                words.push(word);
+            }
+            fields.push(("ends", words.join(", ")));
+        }
+        _ => return None,
+    }
+    Some(Invocation::new("elec.part.add", &unit.name, fields))
+}
+
 /// The current catalog's entry for `key`, carried as a part under its title.
 fn library_template(cx: &mut Cx, key: &EntryKey) -> Option<Carried> {
     if !cx.has_global::<ElecLive>() { return None; }
     let catalog = cx.get_global::<ElecLive>().snap.catalog.clone()?;
     let entry = catalog.entries.iter().find(|entry| entry.lib == key.lib && entry.name == key.name)?;
-    Some(Carried::Part(Arc::new(template_of(entry)), entry.title.clone()))
+    Some(Carried::Part(Arc::new(template_of(entry)), entry.title.clone(), key.clone()))
 }
 
 /// Whether the open Library would take more than two fifths of the sheet.
@@ -309,7 +443,7 @@ fn power_flag_entry(cx: &Cx) -> Option<&CatalogEntry> {
 /// (from the Power flyout) to tie pins to.
 #[derive(Clone)]
 enum Carried {
-    Part(Arc<Template>, String),
+    Part(Arc<Template>, String, EntryKey),
     Rail(NetId, sheet::TagKind, String),
 }
 
@@ -827,6 +961,7 @@ impl ExplorerView {
     /// The holder calls this before dropping the view because Drop has no Cx.
     /// Calling it twice is harmless.
     pub fn release(&mut self, cx: &mut Cx) {
+        let _ = self.marquee.finish(cx);
         if let Some(cmd) = self.live_press.up() { cx.action(SimAction::Cmd(cmd)); }
         if let Some(mut states) = self.press_states.take() { states.release(cx); }
         self.press_from = None;
@@ -865,6 +1000,8 @@ impl ExplorerView {
             self.selected.clear();
             self.card = None;
             self.card_press = None;
+        } else {
+            self.end_marquee(cx);
         }
         // Before the first layout: the layout keeps clear the boxes this font's texts cover.
         super::font_metrics::measure_once(cx, &mut self.draw_text);
@@ -874,6 +1011,34 @@ impl ExplorerView {
         self.rows = Arc::new(rows);
         self.unit = unit;
         self.rebind_selection(cx);
+        self.forget_sheet(cx);
+        let opts = self.layout_opts();
+        self.layout_jobs.request(cx, design, unit, SheetHints::default(), None, None, Keep::default(), self.gen, opts);
+        self.draw_bg.redraw(cx);
+    }
+
+    /// Show the empty sheet: the host's design has no unit with parts (a plate with no circuit),
+    /// so the unit shown before must not stay on the sheet. The selection, the card and the live
+    /// wiring go with it, and a layout still on its way is for that unit and is dropped (`gen`).
+    fn unload(&mut self, cx: &mut Cx) {
+        self.close_value_edit(cx);
+        self.copied = None;
+        self.release(cx);
+        self.selected.clear();
+        self.card = None;
+        self.card_press = None;
+        self.gen += 1;
+        self.design_gen = self.gen;
+        self.design = None;
+        self.followed = None;
+        self.rows = Arc::default();
+        self.unit = 0;
+        self.forget_sheet(cx);
+        self.draw_bg.redraw(cx);
+    }
+
+    /// Forget everything laid out, revealed, hovered or held on the sheet shown before.
+    fn forget_sheet(&mut self, cx: &mut Cx) {
         self.sheet_design = None;
         self.probe_lit = None;
         self.sheet_rows = Arc::default();
@@ -885,7 +1050,6 @@ impl ExplorerView {
         self.pending_reveal = None;
         self.fit_after_home = false;
         self.pane = CanvasPane::with_max_ppu(SHEET_MAX_PPU);
-        self.marquee = Marquee::Idle;
         self.scene = Scene::default();
         self.legible = 1.0;
         self.legible_pending = true;
@@ -917,9 +1081,6 @@ impl ExplorerView {
         self.frame = NextFrame::default();
         self.shift = [0, 0];
         self.refit_after_layout = false;
-        let opts = self.layout_opts();
-        self.layout_jobs.request(cx, design, unit, SheetHints::default(), None, None, Keep::default(), self.gen, opts);
-        self.draw_bg.redraw(cx);
     }
 
     /// Set the bench shown by the host's bench view; new probes go to it.
@@ -1487,11 +1648,18 @@ impl ExplorerView {
             return true;
         }
         let at = edit.at;
-        let planned = plan(&end.circuit, &Gesture::NameEnd { from: edit.target, name: text.into() });
+        let gesture = Gesture::NameEnd { from: edit.target, name: text.into() };
+        let planned = plan(&end.circuit, &gesture);
+        let call = submit.then(|| self.design.as_ref()?.unit(edit.board).and_then(|u| sheet_invocation(u, &gesture, &[], &planned))).flatten();
         if submit && !matches!(planned, Planned::Refused { .. }) {
             self.close_value_edit(cx);
-            if matches!(planned, Planned::Edit(_)) { self.send_sheet_plan(cx, planned, at); }
+            self.send_identified_plan(cx, planned, at, call);
             return true;
+        }
+        if submit {
+            if let (Some(call), Planned::Refused { chip, .. }) = (call, &planned) {
+                Invocation::send(cx, self.uid, call.attach(ViewAction::PlanRefused(chip.clone())));
+            }
         }
         let other = end.circuit.net(text.trim()).map(|net| net.id)
             .filter(|id| !edit.net.as_ref().is_some_and(|(start, _)| start == id));
@@ -1542,9 +1710,15 @@ impl ExplorerView {
         if self.wire_name_text(cx, text, true) { return; }
         let edit = match &self.name_edit {
             Some(NameEdit::Reference(edit)) => {
-                if let Some((label, op)) = edit.submission(text) {
-                    let op = DesignOp::Circuit { unit: edit.part.board, op };
-                    self.send_card_edit(cx, label, op);
+                if let Some(unit) = self.design.as_ref().and_then(|d| d.unit(edit.part.board)) {
+                    if self.name_edit.as_ref().is_some_and(|field| field.matches(&unit.circuit)) {
+                        match reference_gesture(unit, edit.part.comp, text) {
+                            Some((Planned::Edit(r), call)) => self.send_card_plan(cx, r.label, r.ops, call),
+                            Some((Planned::Nothing { chip }, Some(call))) =>
+                                Invocation::send(cx, self.uid, call.attach(ViewAction::PlanRefused(chip))),
+                            _ => {}
+                        }
+                    }
                 }
                 self.close_value_edit(cx);
                 return;
@@ -1554,6 +1728,10 @@ impl ExplorerView {
         };
         let at = edit.at;
         if text.trim().is_empty() {
+            if let Some((unit, (_, name))) = self.design.as_ref().and_then(|d| d.unit(edit.board)).zip(edit.net.as_ref()) {
+                let call = Invocation::new("elec.net.rename", &unit.name, [("net", name.clone()), ("to", text.into())]);
+                Invocation::send(cx, self.uid, call.attach(ViewAction::PlanRefused("enter a net name".into())));
+            }
             self.show_note(cx, "enter a net name".into(), at, true);
             return;
         }
@@ -1564,8 +1742,9 @@ impl ExplorerView {
         };
         if edit.net.is_none() { self.last_global = text.trim().to_string(); }
         let planned = plan(&unit.circuit, &gesture);
+        let call = sheet_invocation(unit, &gesture, &[], &planned);
         self.close_value_edit(cx);
-        self.send_sheet_plan(cx, planned, at);
+        self.send_identified_plan(cx, planned, at, call);
     }
 
     fn close_value_edit(&mut self, cx: &mut Cx) {
@@ -2102,7 +2281,11 @@ impl ExplorerView {
         };
         self.carry_last = Some(carried.clone());
         let mut gesture = match carried {
-            Carried::Part(template, title) => EditGesture::carry(frozen, template, &title, at),
+            Carried::Part(template, title, key) => {
+                let mut gesture = EditGesture::carry(frozen, template, &title, at);
+                gesture.library_key = Some(key);
+                gesture
+            }
             Carried::Rail(net, kind, name) => EditGesture::rail(frozen, net, kind, &name, at),
         };
         self.wire_measure = WireMeasure::default();
@@ -2158,7 +2341,7 @@ impl ExplorerView {
                     actions.iter().rev().find_map(|action| match action.downcast_ref::<StripAction>()? {
                         StripAction::Rail(name) => self.rail(name),
                         StripAction::PowerFlag => power_flag_entry(cx)
-                            .map(|entry| Carried::Part(Arc::new(template_of(entry)), "Power flag".into())),
+                            .map(|entry| Carried::Part(Arc::new(template_of(entry)), "Power flag".into(), EntryKey { name: entry.name.clone(), lib: entry.lib.clone() })),
                         StripAction::PowerMenu { .. } => None,
                     })
                 });
@@ -2235,10 +2418,21 @@ impl ExplorerView {
         cx.widget_action(self.uid, action);
     }
 
+    fn send_wire_landing(&mut self, cx: &mut Cx) {
+        let action = self.gesture.as_ref().and_then(|g| Some(g.invocation()?.attach(ViewAction::Land(g.tag()?))))
+            .unwrap_or(ViewAction::CommitPreview);
+        Invocation::send(cx, self.uid, action);
+    }
+
     /// Send one machine result and retain only useful refusal/no-op notes after it ends.
     fn wire_step(&mut self, cx: &mut Cx, step: Step) {
+        if let Some((call, why)) = step.refused_call {
+            Invocation::send(cx, self.uid, call.attach(ViewAction::PlanRefused(why)));
+        }
         if let Some(action) = step.action {
-            if action != ViewAction::CommitPreview || !self.keep_carry(cx) { self.wire_send(cx, action); }
+            if action == ViewAction::CommitPreview {
+                if !self.keep_carry(cx) { self.send_wire_landing(cx); }
+            } else { self.wire_send(cx, action); }
         }
         if matches!(step.phase, Phase::Idle | Phase::FlyBack) {
             let Some(mut gesture) = self.gesture.take() else { return };
@@ -2356,25 +2550,51 @@ impl ExplorerView {
         ByPath::new(&unit.circuit).find(picked.comp.ix(), self.drawn_path(picked)?).map(|n| n as u32)
     }
 
-    /// Select the visible bodies wholly inside the released band. O(parts), including a
-    /// path index if a newer circuit is waiting for layout. Shift keeps the old pick order.
-    fn finish_marquee(&mut self, cx: &mut Cx, rect: [f64; 4], shift: bool) {
-        if self.dirty { return; }
-        let Some(unit) = self.design.as_ref().and_then(|d| d.units.get(self.unit)) else { return };
+    /// Left to right shows the bodies wholly inside the window. Right to left shows the bodies
+    /// overlapping the crossing band. For either direction each move and the release scan the
+    /// sheet and reveal's parts for visible bodies, plus the starting selection with Shift.
+    /// `ByPath` builds an O(circuit parts) index only on the first index/path mismatch in that scan.
+    /// Only a release whose selection differs from the press publishes it to the other views.
+    fn marquee(&mut self, cx: &mut Cx, rect: [f64; 4], done: bool, shift: bool, crossing: bool) {
+        if matches!(self.marquee, Marquee::Pressed) {
+            self.clear_note();
+            self.marquee = Marquee::Drawing { band: rect, crossing, before: self.selected.clone(), states: None };
+        }
+        let Marquee::Drawing { band, crossing: shown_crossing, before, .. } = &mut self.marquee else { return };
+        *band = rect;
+        *shown_crossing = crossing;
+        let unit = self.design.as_ref().and_then(|d| d.units.get(self.unit));
+        let Some(unit) = unit.filter(|_| !self.dirty) else {
+            if done { self.end_marquee(cx); }
+            return;
+        };
+        let mut selected = if shift { before.clone() } else { Vec::new() };
         let cam = &self.pane.cam;
         let band = cam.rect_to_screen(rect);
         let items = ExplorerItems { sheet: &self.scene, reveal: self.reveal.as_ref(), cam, now: cx.seconds_since_app_start() };
-        let mut selected = if shift { self.selected.clone() } else { Vec::new() };
         let mut seen: std::collections::HashSet<_> = selected.iter().map(|(n, _)| *n).collect();
         let mut paths = ByPath::new(&unit.circuit);
         for item in items.nodes(cam) {
             let Sel::Comp(picked) = item.sel else { continue };
-            if !item.rect.is_inside_of(band) { continue; }
+            let taken = if crossing { item.rect.intersects(band) } else { item.rect.is_inside_of(band) };
+            if !taken { continue; }
             let Some(path) = self.drawn_path(picked) else { continue };
             let Some(n) = paths.find(picked.comp.ix(), path) else { continue };
             if seen.insert(n as u32) { selected.push((n as u32, path.to_owned())); }
         }
-        self.select_parts(cx, selected);
+        if !done && !self.pinned { self.marquee.preview(cx, unit, &selected); }
+        self.set_selection(cx, selected);
+        if done && self.marquee.finish(cx).is_some_and(|before| self.selected != before) {
+            self.publish_selection(cx);
+        }
+    }
+
+    /// A press ended without committing its band. Restore the pick order from the press locally.
+    fn end_marquee(&mut self, cx: &mut Cx) {
+        if let Some(before) = self.marquee.finish(cx) {
+            self.set_selection(cx, before);
+            self.draw_bg.redraw(cx);
+        }
     }
 
     /// Resolve the pointer once per edit. Q arms its tool when the hit misses both pins and wire ends.
@@ -2396,22 +2616,15 @@ impl ExplorerView {
         };
         if shown.id != unit.id { return; }
         let gesture = gesture(target);
-        if matches!(gesture, Gesture::Delete(_)) && self.selected.len() > 1 {
-            let parts: Vec<_> = self.selected.iter().map(|(node, _)| CompId(*node)).collect();
-            let planned = delete_parts(&unit.circuit, &parts);
-            self.send_sheet_plan(cx, planned, pointer.unwrap_or(self.pane.cam.center));
-            return;
-        }
         if let Target::Pin { comp, .. } | Target::WireEnd { comp, .. } = target {
             let Some(current) = unit.circuit.comps.get(comp.ix()) else { return };
             // The visible id must still name the same component in the latest design.
             if !shown.circuit.comps.get(comp.ix()).is_some_and(|shown| shown.path == current.path) { return; }
         }
-        let planned = match gesture {
-            Gesture::Delete(target) => delete(&unit.circuit, target, self.selected_node().map(CompId)),
-            gesture => plan(&shown.circuit, &gesture),
-        };
-        self.send_sheet_plan(cx, planned, pointer.unwrap_or(self.pane.cam.center));
+        let parts: Vec<_> = if self.selected.len() > 1 { self.selected.iter().map(|(node, _)| CompId(*node)).collect() }
+            else { self.selected_node().map(CompId).into_iter().collect() };
+        let (planned, call) = key_plan(unit, shown, gesture, &parts);
+        self.send_identified_plan(cx, planned, pointer.unwrap_or(self.pane.cam.center), call);
     }
 
     /// Copy the selection in pick order. Only a copy press parses its statements and reads
@@ -2523,6 +2736,10 @@ impl ExplorerView {
 
     /// Publish this edit once and remember its click or key position for a host refusal.
     fn send_sheet_plan(&mut self, cx: &mut Cx, planned: Planned, at: [f64; 2]) {
+        self.send_identified_plan(cx, planned, at, None);
+    }
+
+    fn send_identified_plan(&mut self, cx: &mut Cx, planned: Planned, at: [f64; 2], call: Option<Invocation>) {
         if self.note.is_some() {
             self.clear_note();
             self.draw_bg.redraw(cx);
@@ -2537,21 +2754,25 @@ impl ExplorerView {
                     .as_ref().map_or(0, |refusal| refusal.seq)).unwrap_or(0);
                 self.key_sent = Some((r.label.clone(), at, seen));
                 self.own_edit = Some(self.gen);
-                cx.widget_action(self.uid, ViewAction::Ops { ops: r.ops, place: r.place, label: r.label });
+                let action = ViewAction::Ops { ops: r.ops, place: r.place, label: r.label };
+                Invocation::send(cx, self.uid, match call { Some(call) => call.attach(action), None => action });
                 return;
             }
-            Planned::Nothing { chip } if !chip.is_empty() => (chip, false),
+            Planned::Nothing { chip } => (chip, false),
             Planned::Refused { chip, .. } => (chip, true),
-            _ => return,
         };
-        self.show_note(cx, chip, at, refused);
+        if let Some(call) = call {
+            let reason = if chip.is_empty() { "nothing changed".into() } else { chip.clone() };
+            Invocation::send(cx, self.uid, call.attach(ViewAction::PlanRefused(reason)));
+        }
+        if !chip.is_empty() { self.show_note(cx, chip, at, refused); }
     }
 
     /// Arm a tool (or go back to Select); the strip shows it at the next draw.
     fn set_armed(&mut self, cx: &mut Cx, armed: Armed<CircuitTool>) {
         if self.armed.tool != armed.tool || armed.tool == CircuitTool::Select { self.cancel_click(cx); }
         if self.armed != armed {
-            self.marquee = Marquee::Idle;
+            self.end_marquee(cx);
             log!("fab.circuit: tool {:?}{}", armed.tool, if armed.kept { " (kept)" } else { "" });
             self.armed = armed;
             self.draw_bg.redraw(cx);
@@ -3001,15 +3222,8 @@ impl ExplorerView {
                     None => self.drag.release_pinned(now),
                 }
             }
-            CanvasInput::Marquee { rect, done, shift } if !matches!(self.marquee, Marquee::Idle) => {
-                if matches!(self.marquee, Marquee::Pressed) { self.clear_note(); }
-                if done {
-                    self.marquee = Marquee::Idle;
-                    self.finish_marquee(cx, rect, shift);
-                } else {
-                    self.marquee = Marquee::Drawing(rect);
-                }
-            }
+            CanvasInput::Marquee { rect, done, shift, crossing } if !matches!(self.marquee, Marquee::Idle) =>
+                self.marquee(cx, rect, done, shift, crossing),
             CanvasInput::DragStart { key, from, at } => {
                 if self.holding() {
                     if let Some(gesture) = &mut self.gesture { gesture.defer(from); }
@@ -3629,9 +3843,11 @@ impl Widget for ExplorerView {
             None => inputs.iter().any(|input| matches!(input, CanvasInput::Press { key: Sel::Comp(_), down: true })),
         };
         if press {
-            self.marquee = if empty.get() { Marquee::Pressed } else { Marquee::Idle };
+            let pin = items.pin.get();
+            self.end_marquee(cx);
+            if empty.get() { self.marquee = Marquee::Pressed; }
             self.wire_click = original;
-            if let Some(from) = items.pin.get() {
+            if let Some(from) = pin {
                 if matches!(self.armed.tool, CircuitTool::Select | CircuitTool::Wire)
                     && !toggle_part && !self.field_open() && self.carry_armed.is_none() && self.scrub.is_none() {
                     self.begin_wire(cx, from, from);
@@ -3675,8 +3891,7 @@ impl Widget for ExplorerView {
             || matches!(event, Event::KeyDown(key) if key.key_code == KeyCode::Escape)
             || matches!(event, Event::TouchUpdate(e) if e.touches.iter().any(|t| t.state == TouchState::Cancel)));
         if interrupted && !matches!(self.marquee, Marquee::Idle) {
-            self.marquee = Marquee::Idle;
-            self.draw_bg.redraw(cx);
+            self.end_marquee(cx);
             return;
         }
         if interrupted && self.drag.click_to_drop() {
@@ -3695,7 +3910,7 @@ impl Widget for ExplorerView {
             }
             self.input(cx, input);
         }
-        if pressed && !self.pane.pressed() { self.marquee = Marquee::Idle; }
+        if pressed && !self.pane.pressed() { self.end_marquee(cx); }
         // A flying value changes bounds even when its hovered identity is unchanged.
         self.hover_value_box = self.state.hover.and_then(|item| self.value_box(item, now));
         // The pane has set its cursor. Hover resolves once and never previews or lays out (V3).
@@ -3950,7 +4165,10 @@ impl Widget for ExplorerView {
             self.erc_marks.set(1, Vec::new());
         }
         if let Some(items) = self.followed_items(cx) {
-            live.items = items;
+            live.items = match &mut self.marquee {
+                Marquee::Drawing { states: Some(states), .. } => states.texture(cx),
+                _ => items,
+            };
             live.items_on = true;
         }
         let sheet_uniforms = CanvasUniforms {
@@ -4020,9 +4238,10 @@ impl Widget for ExplorerView {
         };
         pin_uniforms.with(tokens, |u| self.drag_pins.draw(cx, &mut self.draw_pin.draw_vars, u, &live));
         self.draw_flag_labels(cx, rect);
-        if let Marquee::Drawing(band) = self.marquee {
+        if let Marquee::Drawing { band, crossing, .. } = self.marquee {
             let [r, g, b, a] = tokens.selection;
             self.draw_marquee.color = vec4(r, g, b, a);
+            self.draw_marquee.draw_vars.set_uniform(cx, id!(dash), &[if crossing { 1.0 } else { 0.0 }]);
             let mut band = self.pane.cam.rect_to_screen(band);
             let px = 1.0 / self.pane.cam.dpi;
             band.size.x = band.size.x.max(px);

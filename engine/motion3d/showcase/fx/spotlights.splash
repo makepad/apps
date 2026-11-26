@@ -1,0 +1,12 @@
+use mod.scene.*; use mod.post
+// Spotlight cones slamming on per hit: additive, soft-edged cones with pools
+// on the floor, swaying; `react: @beat` (render with --music synthetic:120).
+Scene3D{ background: #04050a tone_mapping: @aces bpm: 120
+  camera: Camera{position: vec3(0, 2.2, 9) target: vec3(0, 2, 0) fov: 45}
+  post: [post.Bloom{strength: 0.6 threshold: 1}]
+  lights: [AmbientLight{intensity: 0.15}]
+  children: [
+    Spotlights{count: 6 spread: 8 height: 5.5 angle: 14 color: #fff2d6 color2: #ff4fa3 react: @beat sweep: 22}
+    Mesh{geometry: BoxGeometry{width: 3 height: 0.4 depth: 2} position: vec3(0, 0.2, 0) material: MeshStandardMaterial{color: #20222a roughness: 0.4}}
+    Mesh{geometry: PlaneGeometry{width: 40 height: 40} rotation: vec3(-90, 0, 0) material: MeshStandardMaterial{color: #0e0f14 roughness: 0.6}}
+  ] }

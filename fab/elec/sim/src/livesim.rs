@@ -49,7 +49,7 @@ use crate::cosim::{Bus, CoAudio, CoRun, CoSim, CoSimDevice, StepTo};
 use crate::input::InputSet;
 use crate::live::{GridFrame, Latest, LiveCmd, LiveValues, ValuePlan};
 use crate::newton::{Rescue, SimDiag, Solver};
-use crate::rounds::{Carry, CheckPost, Checks, Helpers, MergeRows, OverWhy, PackCount, Planner, Rounds, Run};
+use crate::rounds::{Before, Carry, CheckPost, Checks, Helpers, MergeRows, OverWhy, PackCount, Planner, Rounds, Run};
 use crate::stamp::UnknownInfo;
 use crate::spill::LogicSpill;
 use crate::budget::RECORD_FINE_BYTES;
@@ -172,7 +172,7 @@ pub struct LiveSpec {
     pub record: f64,
     /// The signals the trace keeps over the whole run, by signal (`LiveCmd::SetWhole`: the views'
     /// probes and lanes): past the front the others' chunks are absent ([`LiveSpec::keep`]).
-    /// Only what is kept follows it; the stepping does not.
+    /// Its net signals are heard for the round plan too.
     pub whole: Arc<[bool]>,
     /// The signals the trace writes points for at all, by signal (`LiveCmd::SetFine`; None, the
     /// default, every signal): a host that must keep up (Realtime) names the rows a view shows,
@@ -580,6 +580,46 @@ pub(crate) struct TapMap {
     nodes: Vec<usize>,
     pin_net: Vec<Option<u32>>,
     part_pins: Vec<(u32, u32)>,
+}
+
+/// The nets the planner judges as heard, by name so a new lowering can keep the user's probes.
+struct HeardNets {
+    /// What the installed design's outputs and bench probes declare, before adding live probes.
+    declared: Vec<String>,
+    /// The net signals the views probe, sorted and deduplicated. Pin signals and ground are omitted.
+    probed: Vec<String>,
+}
+
+impl HeardNets {
+    fn new(circuit: &SimCircuit, probed: Vec<String>) -> Self {
+        let mut declared: Vec<_> = circuit.nodes.iter().skip(1).filter(|n| n.heard).map(|n| n.name.clone()).collect();
+        declared.sort_unstable();
+        Self { declared, probed }
+    }
+
+    fn probed(whole: &[bool], taps: &Taps, solver: &Solver) -> Vec<String> {
+        let mut nets: Vec<_> = whole.iter().zip(&taps.map.nodes).filter_map(|(&on, &u)| {
+            (on && u != 0).then(|| solver.unknowns[u].name.clone())
+        }).collect();
+        nets.sort_unstable();
+        nets.dedup();
+        nets
+    }
+
+    /// Applies the design and probe names to the planner's circuit. A changed flag asks for the
+    /// landings to be judged again behind the sound. A shared circuit is copied only on change.
+    fn apply(&self, circuit: &mut Arc<SimCircuit>) -> bool {
+        let mut changed = false;
+        for i in 0..circuit.nodes.len() {
+            let n = &circuit.nodes[i];
+            let heard = i != 0 && (self.declared.binary_search(&n.name).is_ok() || self.probed.binary_search(&n.name).is_ok());
+            if n.heard != heard {
+                Arc::make_mut(circuit).nodes[i].heard = heard;
+                changed = true;
+            }
+        }
+        changed
+    }
 }
 
 impl Taps {
@@ -1008,6 +1048,8 @@ pub struct LiveSim {
     trace_values: Vec<f64>,
     /// The plan's net names by signal: what an attached process's logic nets are traced as.
     plan_nets: Vec<String>,
+    /// The current design and view probes that weigh the landings, including after a rewind.
+    heard_nets: HeardNets,
     /// The attached process's nets off the circuit, valued from their logic record
     /// (`LiveSim::co_logic_rows`).
     logic_rows: Vec<LogicRow>,
@@ -1222,6 +1264,9 @@ struct Core {
     /// again from them), what the last plan took, and the pads whose first mode change has been
     /// seen.
     replan_due: Option<f64>,
+    /// A change of heard nets asks for the due re-plan on the checkers, behind the sound. A host
+    /// with no checkers makes it on the worker, as it makes every plan.
+    probe_replan: bool,
     /// When a first plan waiting for the attached process to move its pads falls due
     /// (`LiveSim::first_plan`): made on the worker then, and in at once.
     first_due: Option<f64>,
@@ -1300,8 +1345,8 @@ struct PlanInputs {
     /// replaces a plan whose pads have since changed in kind (`Core::kind_due`). An edit in
     /// rounds recalls any other plan.
     through: bool,
-    /// The key's own plan behind a carried start: made on the checkers' helpers whatever the last
-    /// plan cost, as it pays the key's states.
+    /// A plan behind a carried start or a change of heard nets, made on the checkers' helpers
+    /// whatever the last plan cost.
     behind: bool,
 }
 
@@ -1656,7 +1701,7 @@ impl LiveSim {
         }
         let st = Stepper::start_from(&mut s, false, spec.max_step, seed)?;
         let pins = lowered_pins(&circuit);
-        let mut sim = Self::assemble(s, st, circuit, plan, generation, spec, period);
+        let mut sim = Self::assemble(s, st, Arc::new(circuit), plan, generation, spec, period, None);
         sim.start = Start::New;
         sim.core.lowered_pins = pins;
         sim.core.edits = edits;
@@ -1752,9 +1797,14 @@ impl LiveSim {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn assemble(mut s: Solver, mut st: Stepper, ckt: SimCircuit, vplan: ValuePlan, generation: u64, spec: LiveSpec, period: f64) -> LiveSim {
+    fn assemble(mut s: Solver, mut st: Stepper, mut ckt: Arc<SimCircuit>, vplan: ValuePlan, generation: u64, spec: LiveSpec, period: f64, heard: Option<HeardNets>) -> LiveSim {
         Self::settle_stepper(&mut s, &mut st, &spec, period);
         let taps = Taps::new(&s, &vplan);
+        let heard_nets = heard.unwrap_or_else(|| {
+            let nets = HeardNets::new(&ckt, HeardNets::probed(&spec.whole, &taps, &s));
+            nets.apply(&mut ckt);
+            nets
+        });
         let net_v: Vec<f64> = taps.map.nodes.iter().map(|&u| s.x[u]).collect();
         let (pins, parts) = (vplan.pins.len(), vplan.part_pins.len());
         let signals = net_v.len() + if spec.trace && spec.trace_pins { pins } else { 0 };
@@ -1772,11 +1822,12 @@ impl LiveSim {
             write_t: f64::NAN,
             hits: Vec::new(),
             warm: Warm::new(),
-            ckt: Arc::new(ckt),
+            ckt,
             rounds: None,
             planner: None,
             edits: Vec::new(),
             replan_due: None,
+            probe_replan: false,
             first_due: None,
             kind_due: None,
             plan: None,
@@ -1809,6 +1860,7 @@ impl LiveSim {
             net_v,
             trace_values: Vec::with_capacity(signals),
             plan_nets: Vec::new(),
+            heard_nets,
             logic_rows: Vec::new(),
             co_logic: Vec::new(),
             co_audio: CoAudio::default(),
@@ -1905,6 +1957,7 @@ impl LiveSim {
         self.leave_plan_run();
         self.leave_warm();
         (self.core.plan, self.core.replan_due, self.core.first_due, self.core.kind_due) = (None, None, None, None);
+        self.core.probe_replan = false;
         (self.warm_due, self.rounds_asked) = (None, false);
         // what earlier runs of the circuit refused and landed, on the timeline from here; a run made
         // again from its timeline has them there, and both meet them before their first plan
@@ -2169,6 +2222,11 @@ impl LiveSim {
         self.core.rounds.as_ref().map(|r| (r.n, r.round, r.work()))
     }
 
+    /// The round plan in force, including the imports each block lands. None on one stepper.
+    pub fn round_plan(&self) -> Option<&crate::rounds::RoundPlan> {
+        self.core.rounds.as_ref().map(|r| r.cut())
+    }
+
     /// In rounds: the block that solves the net or branch named `name` (its place in
     /// `block_work`); None on one stepper or for no such unknown. O(the plan's unknowns).
     pub fn block_of(&self, name: &str) -> Option<usize> {
@@ -2323,7 +2381,12 @@ impl LiveSim {
             Run::new(s, st, b.own.clone(), taps, pins)
         }).collect();
         let pipeline = self.spec.pipeline && self.spec.res > 0.0;
-        let mut rounds = Rounds::new(&plan, runs, f64::from(self.spec.round.max(1)) * self.period, pipeline, carry)?;
+        // a run stepping whole hands its rates: a boundary draws through a capacitor at them
+        let before = match carry {
+            Some((carry, same)) => Before::Rounds(carry, same),
+            None => Before::Whole(crate::rounds::whole_rates(&self.core.s, &self.core.st)),
+        };
+        let mut rounds = Rounds::new(&plan, runs, f64::from(self.spec.round.max(1)) * self.period, pipeline, before)?;
         if let Some(node) = rounds.reads_late_at(&self.core.refused) {
             return Err(SimDiag::setup(format!("round plan: it reads a value late at {node}, which the run refused (a value read late there left what the circuit can hold)")));
         }
@@ -2379,6 +2442,9 @@ impl LiveSim {
         let t = r.ctl().st.t();
         r.compose(&mut self.core.s);
         self.core.st = Stepper::resume(&mut self.core.s, t, self.spec.max_step);
+        // the rates go with the state: a go-in at this instant draws through a capacitor at them
+        // (`whole_rates`), and the pins' currents published from here include its current
+        r.compose_rates(&mut self.core.st.hist.pts[0].xdot);
         Self::settle_stepper(&mut self.core.s, &mut self.core.st, &self.spec, self.period);
         if !ctl_kept {
             self.after_handover();
@@ -2611,6 +2677,15 @@ impl LiveSim {
         }
     }
 
+    /// A live probe or a rewind can change which nets the running circuit marks heard.
+    /// Coalesce those changes as edits and judge the landings behind the sound.
+    fn apply_heard_nets(&mut self) {
+        if self.heard_nets.apply(&mut self.core.ckt) && (self.core.planner.is_some() || self.core.plan.is_some()) {
+            self.core.probe_replan = true;
+            self.replan_after(self.spec.replan.edit);
+        }
+    }
+
     /// An edit of a device's parameter can move the run off the state its plan's round map proved
     /// the loops at: a key closing a row pad onto a column pad makes the current its block returns
     /// a round late grow without bound. In rounds a plan on its way from before the edit goes
@@ -2814,7 +2889,11 @@ impl LiveSim {
             if edit {
                 self.core.replan_due = None;
             }
-            self.start_plan(kind);
+            if edit && std::mem::take(&mut self.core.probe_replan) {
+                self.start_plan_as(kind, true);
+            } else {
+                self.start_plan(kind);
+            }
         }
         false
     }
@@ -2836,7 +2915,7 @@ impl LiveSim {
         self.start_plan_as(false, true);
     }
 
-    /// `start_plan`, `behind` a carried start or not.
+    /// Starts a plan, with `behind` set for a carried start or a change in the nets heard.
     fn start_plan_as(&mut self, through: bool, behind: bool) {
         let Some(planner) = self.core.planner.take() else { return };
         let in_force = self.core.rounds.as_ref().map(|r| r.cut().clone());
@@ -2925,7 +3004,7 @@ impl LiveSim {
         // plan's proof
         if let (Some(r), Some((plan, solvers))) = (&mut self.core.rounds, &got) {
             if r.runs_cut(plan, solvers) {
-                r.renew_proof(plan.proof.clone());
+                r.renew_proof(plan);
                 // its holder ports as fitted at the run's state now
                 if r.ports_differ(&plan.ports) {
                     self.settle_rounds();
@@ -2941,8 +3020,9 @@ impl LiveSim {
         }
         // a new cut: the blocks it shares with the running one run on, their histories and their
         // couplings' histories whole (A-R3); the others start from the present state with their
-        // histories cut. A kept control block keeps the attached process, its watches and warm
-        // starts: no handover
+        // steppers' histories cut, their exports' histories taken from the old cut's exports of
+        // the same quantity (`Rounds::new`). A kept control block keeps the attached process, its
+        // watches and warm starts: no handover
         self.settle_rounds();
         let same = match (&self.core.rounds, &got) {
             (Some(r), Some((_, solvers))) => r.same_blocks(solvers),
@@ -3284,14 +3364,15 @@ impl LiveSim {
         }
     }
 
-    /// Whether `cmd` needs the stages running behind block 0 caught up to it first: every command
-    /// but a value edit that reaches the control block alone (with the thermal noise source a
-    /// resistance edit sets, `thermal_follows`). The later stages see such an edit only through what
+    /// Whether `cmd` needs the stages running behind block 0 caught up to it first. A view probe
+    /// needs only the tap map. A value edit confined to the control block (including a resistance
+    /// edit's thermal noise source, `thermal_follows`) reaches later stages only through what
     /// block 0 exports from its instant on, so they run on behind it as they were, the same values
     /// on any helpers. A key's press is one: its switch is in block 0.
     fn needs_settle(&self, cmd: &LiveCmd) -> bool {
         let Some(r) = &self.core.rounds else { return true };
         match cmd {
+            LiveCmd::SetWhole(_) => false,
             LiveCmd::SetParam { device, key, .. } => {
                 !(r.reaches_ctl_alone(device) && (!matches!(key.as_str(), "r" | "value") || r.reaches_ctl_alone(&format!("{device}#noise"))))
             }
@@ -3461,7 +3542,11 @@ impl LiveSim {
                     self.plan_failed(d);
                 }
             }
-            LiveCmd::SetWhole(whole) => self.spec.whole = whole,
+            LiveCmd::SetWhole(whole) => {
+                self.spec.whole = whole;
+                self.heard_nets.probed = HeardNets::probed(&self.spec.whole, &self.taps, &self.core.s);
+                self.apply_heard_nets();
+            }
             LiveCmd::SetFine(fine) => {
                 self.store.fine.clone_from(&fine);
                 self.spec.fine = fine;
@@ -3590,14 +3675,18 @@ impl LiveSim {
     /// name, time continues; the trace starts over in the new generation and the subscription
     /// clears. In rounds it goes on on the cut kept for the new circuit when one is, else on its
     /// own plan, made here. A circuit that fails to set up leaves the running one in place.
-    fn replace(&mut self, generation: u64, mut circuit: SimCircuit, plan: &ValuePlan) {
+    fn replace(&mut self, generation: u64, circuit: SimCircuit, plan: &ValuePlan) {
+        let heard = HeardNets::new(&circuit, self.heard_nets.probed.clone());
+        let mut circuit = Arc::new(circuit);
+        heard.apply(&mut circuit);
         self.settle_rounds();
         // in rounds, the blocks' state is the run's
         if let Some(r) = &self.core.rounds {
             r.compose(&mut self.core.s);
         }
-        circuit.opts.reltol = self.spec.reltol_at(self.spec.res);
-        tune_noise(&mut circuit, self.period);
+        let lowering = Arc::make_mut(&mut circuit);
+        lowering.opts.reltol = self.spec.reltol_at(self.spec.res);
+        tune_noise(lowering, self.period);
         let pins = lowered_pins(&circuit);
         let mut ns = match Solver::new(&circuit) {
             Ok(ns) => ns,
@@ -3625,7 +3714,7 @@ impl LiveSim {
         let (taken, stepped_with) = (self.taken, self.stepped_with);
         let (start, parked) = (self.start, self.parked.take());
         let started = self.started;
-        *self = Self::assemble(ns, st, circuit, plan.clone(), generation, self.spec.clone(), self.period);
+        *self = Self::assemble(ns, st, circuit, plan.clone(), generation, self.spec.clone(), self.period, Some(heard));
         match start {
             Start::Preparing { .. } | Start::Planning => self.finish_start(),
             Start::Done { .. } => (self.start, self.started) = (start, started),
@@ -3799,6 +3888,7 @@ impl LiveSim {
         self.carrying = false;
         self.keeping = None;
         self.core = snap.core.clone();
+        self.apply_heard_nets();
         self.delivered = snap.t;
         if matches!(self.start, Start::Planning) {
             // The warm is for the abandoned state. An edit that restores a snapshot starts whole

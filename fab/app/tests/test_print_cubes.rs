@@ -609,7 +609,28 @@ fn viewport_rect(app: &TestApp) -> (usize, usize, usize, usize) {
 
 /// The view's finished picture: width, components, 8-bit samples.
 fn settled_picture(app: &TestApp) -> (usize, usize, Vec<u8>, std::path::PathBuf) {
-    let path = picture::finished_screenshot(app);
+    decoded(picture::finished_screenshot(app))
+}
+
+/// The view's finished picture of a frame cut to the test cube at `at`, `side` wide. A set's
+/// reply and the session's answer come before the view has the cube: until then the view's
+/// finished picture is of the cube before, so the frame's own description must name this one.
+fn picture_cut_to(app: &TestApp, at: [f64; 3], side: f64) -> (usize, usize, Vec<u8>, std::path::PathBuf) {
+    let num = |v: &Value| match v { Value::Int(i) => Some(*i as f64), Value::F64(x) => Some(*x), _ => None };
+    let three = |v: Option<&Value>| -> Option<[f64; 3]> {
+        let a = v?.as_arr()?;
+        Some([num(a.first()?)?, num(a.get(1)?)?, num(a.get(2)?)?])
+    };
+    app.wait_until(|| {
+        let view = picture::view(app);
+        let cut = view.get("test_cut");
+        let this = three(cut.and_then(|c| c.get("at"))).is_some_and(|c| near(c, at, 1e-3)) && three(cut.and_then(|c| c.get("size"))).is_some_and(|s| near(s, [side; 3], 1e-3));
+        (!(this && picture::finished_in(&view))).then(|| format!("waiting for the finished picture cut to the {side} mm cube at {at:?}: the view's frame is cut to {cut:?}"))
+    });
+    decoded(app.screenshot())
+}
+
+fn decoded(path: std::path::PathBuf) -> (usize, usize, Vec<u8>, std::path::PathBuf) {
     let bytes = std::fs::read(&path).expect("the grab");
     let mut dec = PngDecoder::new(ZCursor::new(&bytes));
     let px = dec.decode_raw().expect("png");
@@ -649,7 +670,7 @@ fn a_picked_test_cube_cuts_the_view_to_its_piece_and_leaves_the_bed_whole(app: T
     wait(&app, "the small cube", || listed(&app).first().filter(|t| near(t.size, [6.0; 3], 1e-3)).cloned());
     wait(&app, "its handles", || handle(&app, SIZE_X).then_some(()));
     app.locator(Selector::id("rm_slice")).wait_checked(false);
-    let (_, _, cut, path) = settled_picture(&app);
+    let (_, _, cut, path) = picture_cut_to(&app, corner, 6.0);
     let same = |x0: usize, y0: usize, x1: usize, y1: usize| {
         let at = |x: usize, y: usize| (y * w + x) * n;
         (y0..y1).flat_map(|y| (x0..x1).map(move |x| (x, y))).filter(|&(x, y)| (0..3).all(|k| (cut[at(x, y) + k] as i32 - whole[at(x, y) + k] as i32).abs() <= 8)).count()

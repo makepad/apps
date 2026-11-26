@@ -1,0 +1,48 @@
+use mod.motion.*
+// CALLOUT, 9:16 — the portrait cut of demo_callout: here it points at a
+// control in the top bar and hangs its bubble down-left into the safe area.
+// Original notes follow.
+// CALLOUT — points at one thing on screen and says what it is. A dot
+// lands on the target and pulses, a leader line draws out to the label,
+// and the bubble springs open out of the line's end. The leader works in
+// any direction: `offset` moves the bubble to empty screen, and `left`
+// hangs the bubble to the left of the line's end instead of the right.
+// Transparent overlay for screen recordings and app runs.
+// Why: the dot says "here", the line carries the eye, the bubble says
+// "what" — three beats in 1.4 s, then it holds still to be read.
+Motion{
+    label: "Callout 9:16"
+    brief: "A pulsing target dot, a leader line and a label bubble that springs open; portrait."
+    tags: ["demo", "overlay", "callout", "annotation", "product", "9:16"]
+    size: vec2(1080, 1920) duration: 4.0
+    inputs: {
+        target: input(@vec2, vec2(950, 56), "The point to call out, px")
+        offset: input(@vec2, vec2(-60, 330), "From the target to the line's end, px")
+        left: input(@bool, true, "Hang the bubble left of the line's end")
+        text: input(@text, "Saves as you type", "The callout, one short line")
+        accent: input(@color, #ff5c39, "Dot and ring")
+        ink: input(@color, #f4f7fa, "Text and line")
+        bubble: input(@color, #0b0d12ee, "Bubble fill")
+    }
+    layers: [
+        Group{
+            at: in(@target)
+            opacity: tween(1, 0, 3.6, 4.0, @ease_in_cubic)
+            layers: [
+                Ellipse{at: vec2(-60, -60) size: vec2(120, 120) stroke: in(@accent) width: 4
+                        scale: tween(0.25, 1.0, 0.3, 1.3, @ease_out_expo)
+                        opacity: keys([0.3, 0.0], [0.32, 0.9], [1.3, 0.0, @ease_out_cubic])}
+                Ellipse{at: vec2(-14, -14) size: vec2(28, 28) fill: in(@accent) stroke: in(@ink) width: 4
+                        scale: tween(0, 1, 0.1, 0.6, @ease_out_back)}
+                Path{points: [vec2(0, 0), in(@offset)] stroke: in(@ink) width: 4
+                     trim_end: tween(0, 1, 0.4, 0.9, @ease_in_out_cubic)}
+                Text{text: in(@text) font: Font{family: "Inter" weight: 600} size: 40 color: in(@ink)
+                     at: in(@offset) + vec2(0, -24) wrap: 1000
+                     align: if in(@left) { @right } else { @left }
+                     anchor: vec2(if in(@left) { 1 } else { 0 }, 0.5)
+                     plate: in(@bubble) plate_pad: vec2(32, 22) plate_radius: 22 plate_stroke: #ffffff26 plate_width: 2
+                     scale: tween(0.6, 1.0, 0.8, 1.4, spring(300, 20)) opacity: tween(0, 1, 0.8, 1.0, @ease_out_cubic)}
+            ]
+        }
+    ]
+}

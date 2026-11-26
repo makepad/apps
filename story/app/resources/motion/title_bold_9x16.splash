@@ -1,0 +1,46 @@
+use mod.motion.*
+// BOLD TITLE, 9:16 — the portrait cut of title_bold: the slab drops in
+// from the top (the long axis), and the three condensed lines stack at
+// 230 px inside the safe area; the ink bar sits under them as a rule.
+// Why: a vertical sweep suits a vertical frame; condensed caps are what
+// let a word this big fit an 840 px column.
+Motion{
+    label: "Bold title 9:16"
+    brief: "Condensed all-caps lines rising out of masks on an accent slab that drops in; portrait."
+    tags: ["title", "bold", "loud", "sport", "promo", "9:16"]
+    size: vec2(1080, 1920) duration: 4.5
+    inputs: {
+        line1: input(@text, "BUILT", "Short line, about 8 characters")
+        line2: input(@text, "FOR", "Short line")
+        line3: input(@text, "SPEED", "Short line")
+        slab: input(@color, #ff5c39, "Slab colour")
+        ink: input(@color, #0b0d12, "Type colour")
+        background: input(@color, #0b0d12, "Ground around the slab")
+    }
+    layers: [
+        Rect{size: vec2(1080, 1920) fill: in(@background)}
+        Group{
+            y: tween(0, 2000, 3.95, 4.45, @ease_in_expo)
+            layers: [
+                Rect{at: vec2(0, 240) size: tween(vec2(1080, 0), vec2(1080, 1040), 0.0, 0.55, @ease_in_out_expo) fill: in(@slab)}
+                Group{
+                    mask: Rect{at: vec2(0, 330) size: vec2(1080, 220)}
+                    layers: [Text{text: in(@line1) font: Font{family: "Roboto Flex" weight: 900} size: 240 wdth: 25 color: in(@ink)
+                                  at: vec2(100, 300) y: tween(230, 0, 0.45, 1.15, @ease_out_expo)}]
+                }
+                Group{
+                    mask: Rect{at: vec2(0, 550) size: vec2(1080, 220)}
+                    layers: [Text{text: in(@line2) font: Font{family: "Roboto Flex" weight: 900} size: 240 wdth: 25 color: in(@ink)
+                                  at: vec2(100, 520) y: tween(230, 0, 0.54, 1.24, @ease_out_expo)}]
+                }
+                Group{
+                    mask: Rect{at: vec2(0, 770) size: vec2(1080, 220)}
+                    layers: [Text{text: in(@line3) font: Font{family: "Roboto Flex" weight: 900} size: 240 wdth: 25 color: in(@ink)
+                                  at: vec2(100, 740) y: tween(230, 0, 0.63, 1.33, @ease_out_expo)}]
+                }
+                Rect{at: vec2(100, 1040) size: vec2(560, 20) fill: in(@ink)
+                     anchor: vec2(0, 0.5) scale: tween(vec2(0, 1), vec2(1, 1), 1.1, 1.6, @ease_out_expo)}
+            ]
+        }
+    ]
+}

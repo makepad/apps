@@ -10,9 +10,9 @@
 use crate::elec_host::{merge_files, DocsWrite};
 use crate::plate_scene;
 use crate::review::{self, PreparedReview};
-use fab::api::PlateView;
+use fab::api::{FitGap, FitPick, PlateFit, PlateView};
 use fab::model::Scene;
-use fab_ai::{RenderRequest, Session};
+use fab_ai::{Author, RenderRequest, Session};
 use fab_model::eval::Evaluated;
 use fab_model::params::PValue;
 use fab_model::program::ScriptEnv;
@@ -41,6 +41,7 @@ pub enum Job {
     /// The print colours mapped anew (material colours, job tools): the plate takes them
     /// without a rebuild.
     Mapped(Arc<fab_model::eval::Mapped>),
+    ColourMode(fab_plate::ColourMode, bool),
     /// The plate's grown patterns reached the steps they print at (`fab_paint_field::pattern::live`).
     PatternsGrown,
     /// The bends of the plate (by content) were measured after its build: a bond that could not
@@ -56,7 +57,7 @@ pub enum Job {
     /// A `fab.*` tool call (`tool` is the short name).
     Call { id: u64, tool: String, args: Value },
     /// Open a project (`.fab.splash`), or an object script (`.cad.splash`) as a new project.
-    Open { id: u64, path: PathBuf },
+    Open { id: u64, path: PathBuf, name: Option<String> },
     ImportFile { id: u64, path: PathBuf, new_plate: bool },
     MakeCalibration { step: fab_calibrate::Step, setup: crate::print::CheckSetup, colour: [f32; 4] },
     Calibration { id: u64, coupon: Arc<fab_calibrate::Coupon>, colour: [f32; 4] },
@@ -74,8 +75,7 @@ pub enum Job {
     /// Place object script files on the plate (dropped `.cad.splash` files), arranged, as one
     /// undo step.
     AddScripts { id: u64, paths: Vec<PathBuf> },
-    /// Put a mesh the AI hub made of a picture on the plate, as one undo step (`id`: the
-    /// call it answers; `render`: with a render of it for the caller).
+    /// Put a mesh made from a picture on the plate as one undo step. AI calls get a render.
     ImportMesh { id: u64, made: Box<crate::img2mesh::Made>, render: bool },
     /// Repair an imported mesh on this worker, with one undo step and a status job.
     MakePrintable { id: u64, object: String, opts: Value, render: bool },
@@ -86,7 +86,8 @@ pub enum Job {
     /// Move parts as one undo step (a headset grab, a desktop move).
     Place { id: u64, moves: Vec<fab_ai::PartMove> },
     /// Set a parameter as one undo step (the part panel, a shape handle, the headset).
-    Param { id: u64, key: String, value: PValue, fallback: Option<(PValue, usize)>, asked: std::time::Instant },
+    Param { id: u64, key: String, value: PValue, fallback: Option<(PValue, usize)>, step: Option<String>, asked: std::time::Instant },
+    Link { id: u64, key: String, code: String },
     /// Evaluate a live parameter or source preview, committing nothing. `since` is the count
     /// of `stops` when it was asked: a stop after it ends the build.
     Preview { gen: u64, req: PreviewReq, asked: std::time::Instant, stops: Arc<PreviewStops>, since: u64 },
@@ -96,6 +97,17 @@ pub enum Job {
     /// Commit structured changes of the project and its scripts as one undo step (a direct
     /// plate edit).
     Edit { id: u64, edits: Vec<fab_model::Change> },
+    /// A command's value committed as the changes its template writes. Refused, the nearest value
+    /// toward `good` (one the drag saw build, or `from`, where the model is) that builds is searched
+    /// and committed, as a part's value is: the kernel's own stop. Nothing commits at `from`.
+    Command { id: u64, template: fab_model::params::Template, value: f64, from: f64, good: f64, decimals: usize },
+    /// Pointer input and marker changes from the installed viewport.
+    ViewPick { id: u64, request: fab_ai::picks::ViewPick },
+    /// What a command at the picks (`picks`, none: all) would write, and its handle
+    /// ([`fab_ai::round::Plan`]); answered as [`HostAction::RoundPlan`].
+    RoundPlan { id: u64, picks: Vec<String>, op: fab_ai::round::Op },
+    /// Measure the two clicked seating planes against the current evaluated parts.
+    Fit { id: u64, a: FitPick, b: FitPick, turn: f64 },
     /// Resolve a complete deletion selection against the worker's current head.
     DeleteParts { id: u64, objects: Vec<String>, scripts: bool },
     /// Edits of the test prints, against the plate as it stands: the list's, the fields', the
@@ -114,7 +126,7 @@ pub enum Job {
     Solved(Box<Solved>),
     /// The language's host inputs and libraries (the electronics boards, `board("x")`): set
     /// them and build again; only the scripts reading a moved input recompile.
-    SetEnv { bed: u64, env: ScriptEnv },
+    SetEnv { bed: u64, generation: u64, env: ScriptEnv },
     /// The electronics host's documents for the bed it loaded (`bed` is that
     /// `Session::switched`, `plate` that bed's plate id when it had one), and the electronics
     /// versions they may replace (`bases`). Other bed files stay the model's own.
@@ -133,7 +145,25 @@ pub enum Job {
     /// run, so its save holds what the person sees. A failed save is logged and the copy on disk
     /// stays as it was (nothing is pruned); the answer ([`HostAction::Quit`]) comes either way.
     /// `asked`: when the quit was asked, for the log line that says how long it waited.
-    Quit { id: u64, asked: std::time::Instant },
+    Quit { reply: Arc<QuitReply>, asked: std::time::Instant },
+}
+
+/// Owned by the quit job, including while the electronics barrier holds it.
+/// The submitting thread keeps a reference until the pool fast path or the
+/// strand fallback has taken ownership. Only the last drop answers the UI.
+pub struct QuitReply {
+    id: u64,
+    answered: AtomicBool,
+}
+
+impl Drop for QuitReply {
+    fn drop(&mut self) {
+        Cx::post_action(if self.answered.load(Ordering::Acquire) {
+            HostAction::Quit { id: self.id }
+        } else {
+            HostAction::QuitHostGone { id: self.id }
+        });
+    }
 }
 
 /// Each veins request of a placed part with the printer's up in its source's frame (where the
@@ -207,6 +237,9 @@ pub type ThumbnailSlot = Arc<Mutex<Option<ThumbnailFrame>>>;
 #[derive(Clone, Debug)]
 pub enum PreviewReq {
     Param { key: String, value: PValue },
+    /// A command's batch at a dragged value (a round on a pick), as its commit would make it:
+    /// `key` names the command for the answer.
+    Changes { key: String, value: PValue, changes: Vec<fab_model::Change>, at_step: bool },
     Source { file: String, text: String },
     Drop { paths: Vec<PathBuf> },
 }
@@ -265,6 +298,7 @@ pub type Program = Option<(Arc<fab_model::program::Compiled>, Arc<Vec<fab_model:
 
 /// A finished job, posted to the UI.
 pub struct Done {
+    pub(crate) person: Option<Arc<crate::journal::PersonReply>>,
     pub id: u64,
     pub ok: bool,
     pub text: String,
@@ -301,6 +335,11 @@ pub enum Review {
 /// What the window shows about the document after a job.
 #[derive(Clone, Debug, Default)]
 pub struct Status {
+    pub(crate) journal: Option<crate::journal::Plate>,
+    /// Identity of the frozen board inputs on this bed. Later CAD edits can rebuild
+    /// under the same inputs even after a newer design has reached the UI.
+    pub board_inputs: std::sync::Weak<makepad_model_script::lang::Inputs>,
+    pub case_generation: Option<u64>,
     pub name: String,
     pub head: Option<Head>,
     /// The newest undo step number, for the shared undo order.
@@ -329,13 +368,19 @@ pub struct Status {
     /// What is picked in the view ([`fab_ai::picks`]), and its revision: the view and the chat's
     /// chips follow it, whoever picked (the person, the AI, an outside agent).
     pub picks: (u64, Arc<Vec<fab_ai::picks::Pick>>),
+    /// The model history's undo steps, oldest first, by number with their labels: what the
+    /// person changed since the AI's last turn is read from them ([`crate::since`]).
+    pub steps: crate::since::Steps,
 }
 
 #[derive(Debug)]
 pub enum HostAction {
+    CaseFailed { generation: u64, inputs: std::sync::Weak<makepad_model_script::lang::Inputs>, reason: String },
     Ready,
     /// The quit's save ran ([`Job::Quit`] `id`): the app quits now.
     Quit { id: u64 },
+    /// The save request lost its last owner without an answer.
+    QuitHostGone { id: u64 },
     OverhangList(Box<((u64, u64), fab_printability::OverhangList)>),
     /// What a part's panel says of a grown feature.
     GrowLine(fab::params::GrowLine),
@@ -355,6 +400,7 @@ pub enum HostAction {
     /// The plate with its display meshes as the view shows them (exact parts' detail, the Mesh
     /// look), and its scene: what shows changes, nothing else.
     Shown(Box<(Arc<Evaluated>, Arc<Scene>)>),
+    Colours(Box<(Arc<Evaluated>, Arc<Scene>)>),
     /// A job that changed the shape is over ([`SliceHold`]): when none is left the live slice
     /// goes on, on the plate it made (its `Done` or `Preview` came first), else on the plate as
     /// it was. `built`: it was a job that builds the plate ([`ModelHost::building`]).
@@ -362,7 +408,7 @@ pub enum HostAction {
     /// The review sheets of call `id`: (label, PNG) pairs.
     Sheets { id: u64, result: Result<review::Sheets, String>, made: Option<PathBuf> },
     /// A call's answer, come after its job left the model worker.
-    Answered { id: u64, ok: bool, text: String },
+    Answered { id: u64, ok: bool, text: String, person: Option<Arc<crate::journal::PersonReply>> },
     /// A call answered from what the review drew, off the model worker ([`compare`],
     /// [`crate::variant_sheet::read`]): its text and pictures (label, PNG).
     Pictured { id: u64, result: Result<(String, Vec<(String, Vec<u8>)>), String> },
@@ -373,6 +419,9 @@ pub enum HostAction {
     XrPlate(Mutex<Option<crate::xr::PreparedPlate>>),
     /// A live preview of the code panel's text.
     Preview(Box<PreviewDone>),
+    /// The plan of a round asked with [`ModelHost::round_plan`] (`id`), or why there is none.
+    RoundPlan { id: u64, plan: Box<Result<fab_ai::round::Plan, String>> },
+    Fit { id: u64, result: Result<Arc<PlateFit>, String> },
     /// A field a part asked for was solved: queue it for the model ([`ModelHost::solved`]).
     Solved(Mutex<Option<Box<Solved>>>),
     /// A grown part has a new shape: queue it for the model ([`ModelHost::grown`]).
@@ -401,7 +450,8 @@ impl std::fmt::Debug for Done {
 
 /// A job on its way to the worker, with the job strip's job for it (made when it was
 /// queued, so the wait for the worker shows too and a cancel before it starts is instant).
-type Queued = (Job, Option<JobHandle>);
+/// The author travels with the work even when a tool needs a dedicated job.
+type Queued = (Job, Option<JobHandle>, Author);
 
 pub struct ModelHost {
     /// Numbers come from this shared counter; a reservation takes one early.
@@ -414,14 +464,19 @@ pub struct ModelHost {
     words: Arc<Mutex<WorkerWords>>,
     setup_version: Version,
     overhang_list_version: Version,
+    fit_version: Version,
     /// Jobs a failure can be retried for: what to queue again.
-    retry: HashMap<JobId, Job>,
+    retry: HashMap<JobId, (Job, Author)>,
     /// Tool calls' jobs, by call id (the chat's progress reads them).
     call_jobs: HashMap<u64, JobId>,
     /// The jobs that build the model (open, edit, rebuild, refine), oldest first: the
     /// viewport shows the running one's stage over the part ("Rebuilding… fillets 3/7").
     build_jobs: Vec<JobId>,
     next_id: u64,
+    plate_journal: Option<crate::journal::Plate>,
+    // Background reads can outlive Quit. The job and reply own the token, so a
+    // discarded job also closes immediately while the window is still open.
+    person_calls: Vec<std::sync::Weak<crate::journal::PersonReply>>,
     xr: bool,
     /// Previews queued with an older ticket never start: the newest asked is the one that runs.
     preview_version: Version,
@@ -456,7 +511,7 @@ pub struct ModelHost {
     docs_newest: Arc<Mutex<HashMap<u64, u64>>>,
     docs_seq: u64,
     /// Document replacements waiting for the electronics host's last documents.
-    held: Vec<(Job, Option<String>)>,
+    held: Vec<(Job, Option<String>, Author, Option<crate::journal::Work>)>,
     barrier: bool,
     replacing: Arc<AtomicUsize>,
     switched_now: Arc<AtomicU64>,
@@ -525,11 +580,13 @@ fn status(s: &mut Session) -> Status {
 }
 
 fn status_after_job(previous_switch: u64, s: &mut Session) -> Status {
+    let journal = crate::journal::Plate::opened(s);
     s.picks_follow_build();
     let count = |f: &dyn Fn(&makepad_model_script::lang::Program) -> usize| -> usize {
         s.compiled.as_ref().map_or(0, |c| c.instances.iter().map(|i| f(&i.script.program)).sum())
     };
     Status {
+        journal, board_inputs: Arc::downgrade(&s.model.env().inputs), case_generation: None,
         name: s.model.name.clone(),
         head: Some(s.model.head()),
         undo: s.model.undo_top(),
@@ -550,7 +607,26 @@ fn status_after_job(previous_switch: u64, s: &mut Session) -> Status {
         elec_assets: s.model.elec_assets().clone(),
         elec_memory: s.model.elec_memory().clone(),
         picks: (s.picks.rev, Arc::new(s.picks.list.clone())),
+        steps: undo_steps(&s.model),
     }
+}
+
+thread_local! {
+    /// The steps the last status carried, by the history's length and newest step.
+    static STEPS: std::cell::RefCell<(usize, Option<u64>, crate::since::Steps)> = Default::default();
+}
+
+/// The model's undo steps for a status: built again only when the history moved (O(its steps),
+/// a label is shared, not copied), else the last ones.
+fn undo_steps(model: &fab_model::FabModel) -> crate::since::Steps {
+    let key = (model.undo_steps().len(), model.undo_steps().next_back().map(|(seq, _)| seq));
+    STEPS.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if (cell.0, cell.1) != key {
+            *cell = (key.0, key.1, Arc::new(model.undo_steps().map(|(seq, label)| (seq, label.clone())).collect()));
+        }
+        cell.2.clone()
+    })
 }
 
 /// A grown part's shape, or none: built, and the plate told. Only a level done (`settled`) asks for
@@ -573,7 +649,7 @@ fn show_grown(session: &mut Session, scenes: &mut Scenes, overhangs: bool, file:
         if faded {
             log!("fab: {part} faded in");
         }
-        Cx::post_action(HostAction::Done(Box::new(Done { images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(session, ev, scene)), status: status(session), model_changed: settled, check_slice: None, source_files: None, source_problem: None, capped: None })));
+        Cx::post_action(HostAction::Done(Box::new(Done { person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(session, ev, scene)), status: status(session), model_changed: settled, check_slice: None, source_files: None, source_problem: None, capped: None })));
         Cx::post_action(HostAction::GrownBuilt);
     }
     log!("fab: {part} shape built in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
@@ -770,6 +846,65 @@ fn project_test_prints(session: &Session, ev: &Evaluated) -> Vec<fab::api::TestP
     }).collect()
 }
 
+fn measure_fit(session: &mut Session, a: FitPick, b: FitPick, turn: f64) -> Result<PlateFit, String> {
+    use fab_ai::fit::{measure_planes, PickPlane};
+    use fab_model::eval::affine_mul;
+    use fab_model::params::{xf_dir, xf_point};
+    use makepad_csg_mech::geom::{cross, dot, len, norm, p3, sub, v3};
+
+    if a.part == b.part { return Err(fab::api::FIT_DIFFERENT_PARTS.into()); }
+    let ev = session.last.as_ref().ok_or("No plate is ready to measure")?;
+    let plane = |pick: &FitPick| -> Result<_, String> {
+        let (i, part) = ev.plate.placed_parts().enumerate().find(|(_, p)| p.object == pick.part)
+            .ok_or_else(|| format!("{} is no longer on the plate", pick.part))?;
+        let frame = ev.placed_frame(i).ok_or_else(|| format!("The placement of {} is unavailable", part.name))?;
+        let inverse = crate::paint_edit::inverse(frame).ok_or_else(|| format!("The placement of {} cannot be inverted", part.name))?;
+        let at = v3(xf_point(&inverse, pick.point));
+        // A plate plane pulls back by the transpose of the model-to-plate linear map.
+        let normal = v3(std::array::from_fn(|k| (0..3).map(|r| frame[r][k] * pick.normal[r]).sum()));
+        if !at.is_finite() || !normal.is_finite() || normal.length_sq() == 0.0 {
+            return Err(format!("Pick a face on {} again", part.name));
+        }
+        Ok((PickPlane { part: part.name.as_str(), at, normal }, frame, inverse))
+    };
+    let (a_plane, frame, _) = plane(&a)?;
+    let (b_plane, b_frame, b_inverse) = plane(&b)?;
+    let mesh_b = session.eval.object_mesh(&b.part)?;
+    let fit = measure_planes(&session.eval.object_mesh(&a.part)?, &mesh_b, a_plane, b_plane, turn)?;
+    let rotation = makepad_csg_math::Mat4d::rotation(fit.axis, fit.degrees.to_radians());
+    let pose = std::array::from_fn(|r| [rotation.v[r], rotation.v[4 + r], rotation.v[8 + r], fit.translation.component(r)]);
+    let ghost = affine_mul(&affine_mul(frame, &pose), &b_inverse);
+    let on_plate = |p| xf_point(frame, p3(p));
+    let gaps: [Option<FitGap>; 4] = std::array::from_fn(|i| fit.gaps[i].map(|gap| {
+        let (from, to) = (on_plate(gap.a), on_plate(gap.b));
+        FitGap { from, to, distance_mm: len(sub(to, from)), direction: norm(xf_dir(frame, p3(fit.directions[i]))) }
+    }));
+    let smallest = gaps.iter().enumerate().filter_map(|(i, g)| Some((i, g.as_ref()?.distance_mm)))
+        .min_by(|a, b| a.1.total_cmp(&b.1)).map(|(i, _)| i);
+    let overlap_bounds = fit.overlap_bounds.map(|bounds| std::array::from_fn(|corner| {
+        xf_point(frame, std::array::from_fn(|k| if corner & (1 << k) == 0 { bounds.min.component(k) } else { bounds.max.component(k) }))
+    }));
+    let [x, y, z] = frame.map(|[x, y, z, _]| [x, y, z]);
+    // A field-drawn part may have no display triangles. Its evaluated mesh always describes
+    // the same solid we measured. Pack it once here, including its fitted pose, for the aux pass.
+    let to_plate = affine_mul(&ghost, b_frame);
+    let points: Vec<_> = mesh_b.vertices.iter().map(|&p| v3(xf_point(&to_plate, p3(p)))).collect();
+    let mut batch = fab::model::RenderBatch::default();
+    batch.indices.reserve(mesh_b.triangles.len() * 3);
+    batch.vertices.reserve(mesh_b.triangles.len() * 3 * fab::model::VERTEX_STRIDE);
+    for triangle in &mesh_b.triangles {
+        let [p, q, r] = triangle.map(|i| points[i as usize]);
+        let normal = p3((q - p).cross(r - p).normalize()).map(|v| v as f32);
+        for point in [p, q, r] {
+            batch.indices.push(batch.indices.len() as u32);
+            batch.push_vertex(&fab::model::Vertex { position: p3(point).map(|v| (v * 0.001) as f32),
+                normal, element: b.element.0 as f32, ..Default::default() });
+        }
+    }
+    Ok(PlateFit { part_b: b.part, ghost, ghost_mesh: Mutex::new(Some(batch)), gaps, smallest, seat: fit.seat,
+        overlap_mm3: fit.overlap_mm3 * dot(x, cross(y, z)).abs(), overlap_bounds, turn })
+}
+
 /// The plate scene is Z-up metres, exactly the project's plate axes scaled by 1/1000.
 /// Face rulers keep two extra points: the tips of unit-mm normals at their two anchors.
 /// This retains both a parallel gap and a non-parallel angle using the model's point schema.
@@ -869,6 +1004,7 @@ fn job_words(job: &Job) -> String {
         Job::Painted(_) => "the plates' pictures".to_string(),
         Job::PrintSetup(_) => "the print setup".to_string(),
         Job::Mapped(_) => "the colour mapping".to_string(),
+        Job::ColourMode(mode, _) => mode.label().to_string(),
         Job::PatternsGrown => "the grown patterns".to_string(),
         Job::BendsMeasured(_) => "the bonds' bends".to_string(),
         Job::Overhangs(_) => "the overhang view".to_string(),
@@ -892,6 +1028,23 @@ fn job_words(job: &Job) -> String {
 
 /// What the job strip calls a worker job; none for work that never takes long enough
 /// to show (or shows its own progress elsewhere).
+fn model_author(by: fab_elec_design::By) -> Author {
+    use fab_elec_design::By;
+    match by {
+        By::Agent { .. } => Author::Agent,
+        By::Ai { .. } => Author::Ai,
+        By::Person | By::Disk => Author::Person,
+    }
+}
+
+fn authored_title(title: String, author: Author) -> String {
+    match author {
+        Author::Ai => format!("AI: {title}"),
+        Author::Agent => format!("Agent: {title}"),
+        Author::Person => title,
+    }
+}
+
 fn job_title(job: &Job) -> Option<String> {
     let file = |p: &std::path::Path| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().to_string());
     Some(match job {
@@ -908,14 +1061,14 @@ fn job_title(job: &Job) -> Option<String> {
         Job::Call { tool, .. } => tool_title(tool),
         Job::ImportMesh { made, .. } => format!("Placing {}", made.name),
         Job::MakePrintable { .. } => "Making it printable".to_string(),
-        Job::Param { .. } | Job::Source { .. } | Job::Edit { .. } | Job::DeleteParts { .. } | Job::PaintEdit { .. } | Job::Place { .. } => "Rebuilding the plate".to_string(),
+        Job::Param { .. } | Job::Link { .. } | Job::Source { .. } | Job::Edit { .. } | Job::Command { .. } | Job::DeleteParts { .. } | Job::PaintEdit { .. } | Job::Place { .. } => "Rebuilding the plate".to_string(),
         Job::TestPrints { .. } | Job::LayTest { .. } => "Updating the test prints".to_string(),
         Job::History { undo, .. } => if *undo { "Undoing" } else { "Redoing" }.to_string(),
         Job::Quit { .. } => "Saving the plate before quitting".to_string(),
-        Job::SaveView { .. } => return None,
+        Job::SaveView { .. } | Job::Fit { .. } | Job::ViewPick { .. } => return None,
         Job::MeshFields(true) => "Meshing the field parts".to_string(),
         Job::ExactDetail(_) => "Refining the exact parts".to_string(),
-        Job::MakeCalibration { .. } | Job::MeshFields(false) | Job::Thumbnail(_) | Job::Painted(_) | Job::PrintSetup(_) | Job::Mapped(_) | Job::PatternsGrown | Job::BendsMeasured(_) | Job::Overhangs(_) | Job::TestMode(_) | Job::OverhangList { .. } | Job::EncodeSheets { .. } | Job::ServeXr | Job::Preview { .. } | Job::Solved(_) | Job::SetEnv { .. } | Job::Docs { .. } | Job::Memory { .. } | Job::Grown(_) | Job::GrownSettled(_) => return None,
+        Job::MakeCalibration { .. } | Job::MeshFields(false) | Job::Thumbnail(_) | Job::Painted(_) | Job::PrintSetup(_) | Job::ColourMode(..) | Job::Mapped(_) | Job::PatternsGrown | Job::BendsMeasured(_) | Job::Overhangs(_) | Job::TestMode(_) | Job::OverhangList { .. } | Job::EncodeSheets { .. } | Job::ServeXr | Job::Preview { .. } | Job::Solved(_) | Job::SetEnv { .. } | Job::Docs { .. } | Job::Memory { .. } | Job::Grown(_) | Job::GrownSettled(_) | Job::RoundPlan { .. } => return None,
     })
 }
 
@@ -1111,7 +1264,7 @@ mod load_hold {
 fn builds_model(job: &Job) -> bool {
     match job {
         Job::SetEnv { .. } => true,
-        Job::ImportFile { .. } | Job::Calibration { .. } | Job::Open { .. } | Job::Demo { .. } | Job::Reload { .. } | Job::DeletePlate { .. } | Job::AddScripts { .. } | Job::ImportMesh { .. } | Job::MakePrintable { .. } | Job::Param { .. } | Job::Source { .. } | Job::Edit { .. } | Job::DeleteParts { .. } | Job::PaintEdit { .. } | Job::Place { .. } | Job::History { .. } => true,
+        Job::ImportFile { .. } | Job::Calibration { .. } | Job::Open { .. } | Job::Demo { .. } | Job::Reload { .. } | Job::DeletePlate { .. } | Job::AddScripts { .. } | Job::ImportMesh { .. } | Job::MakePrintable { .. } | Job::Param { .. } | Job::Link { .. } | Job::Source { .. } | Job::Edit { .. } | Job::Command { .. } | Job::DeleteParts { .. } | Job::PaintEdit { .. } | Job::Place { .. } | Job::History { .. } => true,
         Job::Call { tool, .. } => matches!(tool.as_str(), "apply" | "script" | "exact" | "edges" | "weave" | "place" | "lay_flat" | "new" | "plates"),
         _ => false,
     }
@@ -1144,13 +1297,13 @@ fn class_of(job: &Job) -> Class {
 /// plate at the next start.
 fn left_at_quit(job: &Job) -> bool {
     matches!(job, Job::Thumbnail(_) | Job::Painted(_) | Job::MeshFields(false) | Job::ExactDetail(_)
-        | Job::Mapped(_) | Job::BendsMeasured(_) | Job::Overhangs(_) | Job::TestMode(_))
+        | Job::ColourMode(..) | Job::Mapped(_) | Job::BendsMeasured(_) | Job::Overhangs(_) | Job::TestMode(_))
 }
 
 /// Work a quit makes stale by its ticket ([`ModelHost::quit`]): queued, it never starts; it reads
 /// what the view shows and keeps nothing.
 fn stale_at_quit(job: &Job) -> bool {
-    matches!(job, Job::Preview { .. } | Job::PrintSetup(_) | Job::OverhangList { .. })
+    matches!(job, Job::Preview { .. } | Job::PrintSetup(_) | Job::OverhangList { .. } | Job::Fit { .. })
 }
 
 /// One job a quit waits for ([`ModelHost::keeping`]), counted from its queueing until it ends or is
@@ -1216,7 +1369,7 @@ fn tool_job(id: u64, tool: &str, args: Value) -> Job {
 /// `fab.supports {verdicts: true}`: each piece's way out, a search too slow for the model worker. It
 /// runs at low priority, one task a piece, the person sees how far it got and can cancel it, and the
 /// call's answer waits for it.
-fn check_verdicts(pool: &TaskPool, id: u64, check: Arc<fab_ai::supports::VerdictJob>, running: Option<JobHandle>) {
+fn check_verdicts(pool: &TaskPool, id: u64, person: Option<Arc<crate::journal::PersonReply>>, check: Arc<fab_ai::supports::VerdictJob>, running: Option<JobHandle>) {
     let reporter = running.as_ref().map(JobHandle::reporter);
     let cancelled = move || reporter.as_ref().is_some_and(jobs::JobReporter::is_cancelled);
     let end = move |running: Option<JobHandle>, ok: bool, text: String| {
@@ -1229,7 +1382,7 @@ fn check_verdicts(pool: &TaskPool, id: u64, check: Arc<fab_ai::supports::Verdict
                 j.fail(job_reason(&text), false);
             }
         }
-        Cx::post_action(HostAction::Answered { id, ok, text });
+        Cx::post_action(HostAction::Answered { id, ok, text, person: person.clone() });
     };
     let tasks = pool.clone();
     let started = std::time::Instant::now();
@@ -1284,7 +1437,7 @@ fn check_verdicts(pool: &TaskPool, id: u64, check: Arc<fab_ai::supports::Verdict
 
 /// A read of the slice (`fab.weak_spots`, `fab.tubes`), off the model worker at low priority; a new
 /// slice or a shape edit ends it, Cancel too, and the call's answer waits for it.
-fn off_worker(pool: &TaskPool, id: u64, running: Option<JobHandle>, find: impl FnOnce(&(dyn Fn() -> bool + Sync)) -> Result<fab_ai::out::S, String> + Send + 'static) {
+fn off_worker(pool: &TaskPool, id: u64, person: Option<Arc<crate::journal::PersonReply>>, running: Option<JobHandle>, find: impl FnOnce(&(dyn Fn() -> bool + Sync)) -> Result<fab_ai::out::S, String> + Send + 'static) {
     let key = crate::live_slice::latest_toolpaths_key();
     let submitted = pool.submit_internal(Class::Background, move || {
         let reporter = running.as_ref().map(JobHandle::reporter);
@@ -1301,7 +1454,7 @@ fn off_worker(pool: &TaskPool, id: u64, running: Option<JobHandle>, find: impl F
             Ok(answer) => (true, fab_ai::out::text(&answer)),
             Err(e) => (false, format!("{{error: {}}}", fab_ai::out::quote(&e))),
         };
-        Cx::post_action(HostAction::Answered { id, ok, text });
+        Cx::post_action(HostAction::Answered { id, ok, text, person: person.clone() });
     });
     if let Ok(task) = submitted {
         task.detach();
@@ -1363,6 +1516,7 @@ pub fn tool_title(tool: &str) -> String {
         fab_ai::compare::TOOL => "Comparing with the picture".to_string(),
         "simulate" => "Simulating the mechanism".to_string(),
         "joints" => "Sizing the joints".to_string(),
+        fab_ai::interference::TOOL => "Looking for parts that collide".to_string(),
         "check" | "check_mesh" => "Checking the plate".to_string(),
         "make_printable" => "Making it printable".to_string(),
         "overhangs" => "Finding the overhangs".to_string(),
@@ -1378,7 +1532,7 @@ pub fn tool_title(tool: &str) -> String {
 /// The call id a job answers, when it answers one.
 fn job_call_id(job: &Job) -> Option<u64> {
     match job {
-        Job::ImportFile { id, .. } | Job::Calibration { id, .. } | Job::Call { id, .. } | Job::Open { id, .. } | Job::Demo { id, .. } | Job::Reload { id } | Job::DeletePlate { id, .. } | Job::AddScripts { id, .. } | Job::Place { id, .. } | Job::Param { id, .. } | Job::Source { id, .. } | Job::Edit { id, .. } | Job::DeleteParts { id, .. } | Job::TestPrints { id, .. } | Job::LayTest { id, .. } | Job::PaintEdit { id, .. } | Job::History { id, .. } | Job::ImportMesh { id, .. } | Job::MakePrintable { id, .. } => Some(*id),
+        Job::ImportFile { id, .. } | Job::Calibration { id, .. } | Job::Call { id, .. } | Job::Open { id, .. } | Job::Demo { id, .. } | Job::Reload { id } | Job::DeletePlate { id, .. } | Job::AddScripts { id, .. } | Job::Place { id, .. } | Job::Param { id, .. } | Job::Link { id, .. } | Job::Source { id, .. } | Job::Edit { id, .. } | Job::Command { id, .. } | Job::DeleteParts { id, .. } | Job::TestPrints { id, .. } | Job::LayTest { id, .. } | Job::PaintEdit { id, .. } | Job::History { id, .. } | Job::ImportMesh { id, .. } | Job::MakePrintable { id, .. } | Job::ViewPick { id, .. } => Some(*id),
         _ => None,
     }
 }
@@ -1389,7 +1543,7 @@ fn job_call_id(job: &Job) -> Option<u64> {
 fn retry_copy(job: &Job) -> Option<Job> {
     match job {
         Job::Call { tool, args, .. } if tool == "export" || tool == "save" => Some(Job::Call { id: 0, tool: tool.clone(), args: args.clone() }),
-        Job::Open { path, .. } => Some(Job::Open { id: 0, path: path.clone() }),
+        Job::Open { path, name, .. } => Some(Job::Open { id: 0, path: path.clone(), name: name.clone() }),
         Job::ImportFile { path, new_plate, .. } => Some(Job::ImportFile { id: 0, path: path.clone(), new_plate: *new_plate }),
         Job::AddScripts { paths, .. } => Some(Job::AddScripts { id: 0, paths: paths.clone() }),
         _ => None,
@@ -1545,6 +1699,8 @@ fn plate_list(session: &Session, reads: &mut ListReads) -> fab::api::PlateList {
 }
 
 struct HostState {
+    journal: crate::journal::ModelJournal,
+    spawner: makepad_widgets::makepad_platform::thread::ThreadSpawner,
     /// Numbers come from this shared counter; a reservation takes one early.
     steps: Arc<AtomicU64>,
     /// The newest entry logged by either history.
@@ -1599,6 +1755,7 @@ impl HostState {
     fn init(&mut self) {
         let machine = crate::print::CheckSetup::fab_defaults().machine().expect("Fab defaults have a valid machine");
         let mut session = Session::new(machine, documents_dir());
+        session.holds_bodies = true;
         session.model.set_steps(self.steps.clone(), self.logged.clone());
         // The scripts' standard env: a case script reads its board whether or not the
         // Electronics workspace has started (that host replaces the env with its own boards),
@@ -1615,7 +1772,10 @@ impl HostState {
         };
         let persist = self.persist;
         if persist {
-            session.store = Some(plate_store());
+            let store = plate_store();
+            crate::journal::recover_loss_notes(store.clone(), self.spawner.clone(), &self.pool);
+            session.store = Some(store);
+            self.journal.install(&mut session, Some(self.spawner.clone()));
         }
         // What the last run had on the bed (a crash, a quit, a live-patch relaunch) comes back
         // as it was left; else the empty model. The plate list goes first, read from the disk:
@@ -1661,7 +1821,7 @@ impl HostState {
         // The empty model: the bed alone, so the view has something from the start.
         if let Ok(ev) = recovered {
             let scene = self.scenes.of(&session, &ev, self.overhangs);
-            let done = Done { images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status_after_job(previous_switch, &mut session), model_changed: true, check_slice: None, source_files: Some(Arc::new(session.source_files())), source_problem: None, capped: None };
+            let done = Done { person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status_after_job(previous_switch, &mut session), model_changed: true, check_slice: None, source_files: Some(Arc::new(session.source_files())), source_problem: None, capped: None };
             Cx::post_action(HostAction::Done(Box::new(done)));
         }
         self.session = Some(session);
@@ -1746,13 +1906,32 @@ impl HostState {
     }
 
     fn run(&mut self, queued: Queued, ticket: Ticket) {
+        if let Job::ColourMode(mode, linked) = queued.0 {
+            let Some(session) = &mut self.session else { return };
+            let started = std::time::Instant::now();
+            if let Some(ev) = session.set_colour_view(mode, linked) {
+                let scene = self.scenes.of(session, &ev, self.overhangs);
+                if self.xr {
+                    post_xr_plate(&ev, 0);
+                }
+                log!("fab colours: {} for {} parts in {:.2} ms on model worker", mode.label(), ev.part_colors.len(), started.elapsed().as_secs_f64() * 1000.0);
+                Cx::post_action(HostAction::Colours(Box::new((ev, scene))));
+            }
+            return;
+        }
+        if let Job::Fit { id, a, b, turn } = queued.0 {
+            let result = self.session.as_mut().ok_or_else(|| "No plate is ready to measure".to_string())
+                .and_then(|session| measure_fit(session, a, b, turn)).map(Arc::new);
+            Cx::post_action(HostAction::Fit { id, result });
+            return;
+        }
         if let Job::SaveView { plate, view } = queued.0 {
             if let Some(store) = self.session.as_ref().and_then(|s| s.store.as_ref()) {
                 write_view(store, &plate, &view);
             }
             return;
         }
-        if let Job::Quit { id, asked } = queued.0 {
+        if let Job::Quit { reply, asked } = queued.0 {
             // Saved now even when an earlier save failed and its retry waits: this is the last one.
             let persist = self.persist;
             let saved = match self.session.as_mut() {
@@ -1766,7 +1945,7 @@ impl HostState {
             if let Some(j) = queued.1 {
                 j.done();
             }
-            Cx::post_action(HostAction::Quit { id });
+            reply.answered.store(true, Ordering::Release);
             return;
         }
         if let Job::Painted(painted) = queued.0 {
@@ -1788,7 +1967,7 @@ impl HostState {
             return;
         }
         let listed = self.plates_seen;
-        let commit = matches!(queued.0, Job::Param { .. });
+        let commit = matches!(queued.0, Job::Param { .. } | Job::Link { .. });
         self.words.lock().unwrap().set(Some(job_words(&queued.0)), queued.1.as_ref().map(|j| j.id()));
         self.process(queued, ticket);
         self.words.lock().unwrap().set(Some("the stress and growth studies".to_string()), None);
@@ -2041,9 +2220,10 @@ impl HostState {
         }
     }
 
-    fn process(&mut self, (job, mut running): Queued, ticket: Ticket) {
+    fn process(&mut self, (job, mut running, author): Queued, ticket: Ticket) {
         let Self { session, xr, overhangs, scenes, grows, pool, plates_seen, list_reads, docs_newest, .. } = self;
-        let mut session = session.as_mut().expect("model initialized before jobs");
+        let mut authored = session.as_mut().expect("model initialized before jobs").as_author(author);
+        let mut session = &mut *authored;
         Cx::post_action(HostAction::Ready);
         // A job cancelled while it waited never starts.
         if running.as_ref().is_some_and(|j| j.is_cancelled()) {
@@ -2052,7 +2232,7 @@ impl HostState {
             }
             if let Some(id) = job_call_id(&job) {
                 let text = "{error: \"cancelled\"}".to_string();
-                Cx::post_action(HostAction::Done(Box::new(Done { images: Vec::new(), id, ok: false, text, review: Mutex::new(None), update: None, status: status(&mut session), model_changed: false, check_slice: None, source_files: None, source_problem: None, capped: None })));
+                Cx::post_action(HostAction::Done(Box::new(Done { person: self.journal.person(), images: Vec::new(), id, ok: false, text, review: Mutex::new(None), update: None, status: status(&mut session), model_changed: false, check_slice: None, source_files: None, source_problem: None, capped: None })));
             }
             return;
         }
@@ -2071,7 +2251,7 @@ impl HostState {
         let _current = jobs::enter(reporter);
         let can_retry = retry_copy(&job).is_some();
         // A refused parameter commit is reported by its cap line, not by the job strip.
-        let is_param = matches!(job, Job::Param { .. });
+        let is_param = matches!(job, Job::Param { .. } | Job::Link { .. });
         // Rulers and test prints alter the document, but never invalidate its printable geometry.
         let measurement_only = match &job {
             Job::Edit { edits, .. } => !edits.is_empty() && edits.iter().all(|e| matches!(e,
@@ -2094,7 +2274,7 @@ impl HostState {
                 let machine = match setup.machine() {
                     Ok(machine) => machine,
                     Err(e) => {
-                        Cx::post_action(HostAction::Done(Box::new(Done { images: Vec::new(), id: 0, ok: false, text: format!("{{error: {}}}", fab_ai::out::quote(&e)), review: Mutex::new(None), update: None, status: status(&mut session), model_changed: false, check_slice: None, source_files: None, source_problem: None, capped: None })));
+                        Cx::post_action(HostAction::Done(Box::new(Done { person: None, images: Vec::new(), id: 0, ok: false, text: format!("{{error: {}}}", fab_ai::out::quote(&e)), review: Mutex::new(None), update: None, status: status(&mut session), model_changed: false, check_slice: None, source_files: None, source_problem: None, capped: None })));
                         return;
                     }
                 };
@@ -2133,7 +2313,7 @@ impl HostState {
                     }
                     job.finish(&built, false);
                     if let Err(e) = built {
-                        Cx::post_action(HostAction::Done(Box::new(Done { images: Vec::new(), id: 0, ok: false, text: format!("{{error: {}}}", fab_ai::out::quote(&e)), review: Mutex::new(None), update: None, status: status(&mut session), model_changed: false, check_slice: None, source_files: None, source_problem: None, capped: None })));
+                        Cx::post_action(HostAction::Done(Box::new(Done { person: None, images: Vec::new(), id: 0, ok: false, text: format!("{{error: {}}}", fab_ai::out::quote(&e)), review: Mutex::new(None), update: None, status: status(&mut session), model_changed: false, check_slice: None, source_files: None, source_problem: None, capped: None })));
                         return;
                     }
                 }
@@ -2156,7 +2336,7 @@ impl HostState {
                     if *xr && changed {
                         post_xr_plate(&ev, 0);
                     }
-                    Cx::post_action(HostAction::Done(Box::new(Done { images: Vec::new(), id: 0, ok: error.is_none(), text: error.map(|e| format!("{{error: {}}}", fab_ai::out::quote(&e))).unwrap_or_default(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: changed, check_slice: None, source_files: None, source_problem: None, capped: None })));
+                    Cx::post_action(HostAction::Done(Box::new(Done { person: None, images: Vec::new(), id: 0, ok: error.is_none(), text: error.map(|e| format!("{{error: {}}}", fab_ai::out::quote(&e))).unwrap_or_default(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: changed, check_slice: None, source_files: None, source_problem: None, capped: None })));
                 }
                 return;
             }
@@ -2174,7 +2354,7 @@ impl HostState {
                 }
                 if let Some(ev) = session.last.clone() {
                     let scene = scenes.of(session, &ev, *overhangs);
-                    Cx::post_action(HostAction::Done(Box::new(Done { images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: true, check_slice: None, source_files: None, source_problem: None, capped: None })));
+                    Cx::post_action(HostAction::Done(Box::new(Done { person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: true, check_slice: None, source_files: None, source_problem: None, capped: None })));
                 }
                 return;
             }
@@ -2225,26 +2405,31 @@ impl HostState {
                 }
                 return;
             }
-            Job::SetEnv { bed, env } => {
-                if bed != session.switched {
-                    log!("fab: the electronics boards for bed {bed} arrived after the bed changed (now {}); not applied", session.switched);
-                    return;
-                }
-                session.model.set_env(env);
-                if session.last.is_none() {
-                    return;
-                }
-                let doing = "Updating the electronics boards";
-                let job = JobSpec::new(doing).machine(HERE).start();
-                let built = job.enter(|| session.rebuild());
-                job.finish(&built, false);
-                if let Err(e) = built {
-                    log!("fab: {doing}: {e}");
-                    return;
-                }
-                if let Some(ev) = session.last.clone() {
-                    let scene = scenes.of(session, &ev, *overhangs);
-                    Cx::post_action(HostAction::Done(Box::new(Done { images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: true, check_slice: None, source_files: None, source_problem: None, capped: None })));
+            Job::SetEnv { bed, generation, env } => {
+                let inputs = Arc::downgrade(&env.inputs);
+                let built = if bed != session.switched {
+                    Err("the plate changed".into())
+                } else {
+                    session.model.set_env(env);
+                    if session.last.is_none() {
+                        Err("nothing has been evaluated yet".into())
+                    } else {
+                        let job = JobSpec::new("Updating the electronics boards").machine(HERE).start();
+                        let built = job.enter(|| session.rebuild());
+                        job.finish(&built, false);
+                        built
+                    }
+                };
+                match built {
+                    Ok(ev) => {
+                        let scene = scenes.of(session, &ev, *overhangs);
+                        let status = Status { case_generation: Some(generation), ..status(&mut session) };
+                        Cx::post_action(HostAction::Done(Box::new(Done { person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status, model_changed: true, check_slice: None, source_files: None, source_problem: None, capped: None })));
+                    }
+                    Err(reason) => {
+                        log!("fab: updating the electronics boards: {reason}");
+                        Cx::post_action(HostAction::CaseFailed { generation, inputs, reason });
+                    }
                 }
                 return;
             }
@@ -2277,7 +2462,7 @@ impl HostState {
                         post_xr_plate(&ev, 0);
                     }
                     // The parts print with other tools: the slice is out of date.
-                    Cx::post_action(HostAction::Done(Box::new(Done { images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: true, check_slice: None, source_files: None, source_problem: None, capped: None })));
+                    Cx::post_action(HostAction::Done(Box::new(Done { person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: true, check_slice: None, source_files: None, source_problem: None, capped: None })));
                 }
                 return;
             }
@@ -2293,14 +2478,14 @@ impl HostState {
                         post_xr_plate(&ev, 0);
                     }
                     // the paint now prints as it shows: the slice that waited for it goes
-                    Cx::post_action(HostAction::Done(Box::new(Done { images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: true, check_slice: None, source_files: None, source_problem: None, capped: None })));
+                    Cx::post_action(HostAction::Done(Box::new(Done { person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: true, check_slice: None, source_files: None, source_problem: None, capped: None })));
                 }
                 return;
             }
             Job::BendsMeasured(content) => {
                 if let Some(ev) = session.bends_measured(content) {
                     let scene = scenes.of(session, &ev, *overhangs);
-                    Cx::post_action(HostAction::Done(Box::new(Done { images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: false, check_slice: None, source_files: None, source_problem: None, capped: None })));
+                    Cx::post_action(HostAction::Done(Box::new(Done { person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: false, check_slice: None, source_files: None, source_problem: None, capped: None })));
                 }
                 return;
             }
@@ -2328,7 +2513,7 @@ impl HostState {
                 *overhangs = on;
                 if let Some(ev) = session.last.clone() {
                     let scene = scenes.of(session, &ev, *overhangs);
-                    Cx::post_action(HostAction::Done(Box::new(Done { images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: false, check_slice: None, source_files: None, source_problem: None, capped: None })));
+                    Cx::post_action(HostAction::Done(Box::new(Done { person: None, images: Vec::new(), id: 0, ok: true, text: String::new(), review: Mutex::new(None), update: Some(plate_update(&mut session, ev, scene)), status: status(&mut session), model_changed: false, check_slice: None, source_files: None, source_problem: None, capped: None })));
                 }
                 return;
             }
@@ -2374,10 +2559,11 @@ impl HostState {
                 }
                 return;
             }
-            Job::Call { id, tool, args } if tool == "board" => {
+            Job::Call { id, tool, args, .. } if tool == "board" => {
                 let docs = session.model.docs().clone();
                 let assets = session.model.elec_assets().clone();
                 let running = running.take();
+                let person = self.journal.person();
                 let read = move || {
                     let answer = crate::elec_host::board_answer(&docs, &assets,
                         args.get("board").and_then(Value::as_str), args.get("only").and_then(Value::as_str));
@@ -2392,28 +2578,29 @@ impl HostState {
                         Ok(text) => (true, text),
                         Err(e) => (false, format!("{{error: {}}}", fab_ai::out::quote(&e))),
                     };
-                    Cx::post_action(HostAction::Answered { id, ok, text });
+                    Cx::post_action(HostAction::Answered { id, ok, text, person: person.clone() });
                 };
                 if let Err(e) = pool.submit_named(Class::Background, "fab board read", read).map(|task| task.detach()) {
                     let text = format!("{{error: {}}}", fab_ai::out::quote(&format!("the board read could not start: {e}")));
-                    Cx::post_action(HostAction::Answered { id, ok: false, text });
+                    Cx::post_action(HostAction::Answered { id, ok: false, text, person: self.journal.person() });
                 }
                 return;
             }
-            Job::Call { id, tool, args } if tool == "align" => {
+            Job::Call { id, tool, args, .. } if tool == "align" => {
                 // Read only, off this thread: the boss search and the fit run on the pool with the
                 // plate as built and the scripts as they stand.
                 let docs = session.model.docs().clone();
                 let assets = session.model.elec_assets().clone();
                 let Some(ev) = session.last.clone() else {
                     let text = format!("{{error: {}}}", fab_ai::out::quote("the plate has not built yet"));
-                    Cx::post_action(HostAction::Answered { id, ok: false, text });
+                    Cx::post_action(HostAction::Answered { id, ok: false, text, person: self.journal.person() });
                     return;
                 };
                 let scripts: Vec<(String, String, String)> = session.model.project().scripts.iter()
                     .filter_map(|s| Some((s.name.clone(), s.file.clone(), session.model.source(&s.file)?.to_string())))
                     .collect();
                 let running = running.take();
+                let person = self.journal.person();
                 let read = move || {
                     let script_of = |instance: &str| scripts.iter().find(|s| s.0 == instance).map(|s| (s.1.clone(), s.2.clone()));
                     let answer = crate::elec_host::align_answer(&docs, &assets, &ev, &script_of,
@@ -2429,14 +2616,15 @@ impl HostState {
                         Ok(text) => (true, text),
                         Err(e) => (false, format!("{{error: {}}}", fab_ai::out::quote(&e))),
                     };
-                    Cx::post_action(HostAction::Answered { id, ok, text });
+                    Cx::post_action(HostAction::Answered { id, ok, text, person: person.clone() });
                 };
                 if let Err(e) = pool.submit_named(Class::Background, "fab align", read).map(|task| task.detach()) {
                     let text = format!("{{error: {}}}", fab_ai::out::quote(&format!("the align could not start: {e}")));
-                    Cx::post_action(HostAction::Answered { id, ok: false, text });
+                    Cx::post_action(HostAction::Answered { id, ok: false, text, person: self.journal.person() });
                 }
                 return;
             }
+            Job::ViewPick { id, request } => (id, session.view_pick(request)),
             Job::Call { id, tool, args } => (id, session.call(&tool, &args, None)),
             Job::ServeXr => {
                 *xr = true;
@@ -2448,7 +2636,7 @@ impl HostState {
             Job::Preview { gen, req, asked, stops, since } => {
                 let started = std::time::Instant::now();
                 let (key, mut line) = match &req {
-                    PreviewReq::Param { key, .. } => (key.clone(), None),
+                    PreviewReq::Param { key, .. } | PreviewReq::Changes { key, .. } => (key.clone(), None),
                     PreviewReq::Source { .. } => ("source".to_string(), None),
                     PreviewReq::Drop { .. } => (DROP_PREVIEW.to_string(), None),
                 };
@@ -2457,9 +2645,12 @@ impl HostState {
                 // exact body: each newer value is compiled once to know, on this thread as it waits.
                 let building = match &req {
                     PreviewReq::Param { key, value } => Some((key.as_str(), value)),
-                    PreviewReq::Source { .. } | PreviewReq::Drop { .. } => None,
+                    PreviewReq::Source { .. } | PreviewReq::Drop { .. } | PreviewReq::Changes { .. } => None,
                 };
-                let built_value = building.map(|(_, v)| v.clone());
+                let built_value = match &req {
+                    PreviewReq::Changes { value, .. } => Some(value.clone()),
+                    _ => building.map(|(_, v)| v.clone()),
+                };
                 let logged = std::env::var_os("FAB_PARAM_LOG").is_some();
                 if let (Some((key, value)), true) = (building, logged) {
                     log!("fab param building {key} = {value:?} gen {gen}");
@@ -2481,6 +2672,9 @@ impl HostState {
                     }
                     stopped.get()
                 };
+                // The step worker receives the draft program. The Session keeps resolving
+                // names on the committed build, including after a cancelled drag.
+                let inspection = matches!(req, PreviewReq::Changes { at_step: true, .. }).then(|| (session.eval.inspected(), session.draft.clone()));
                 let built = match &req {
                     PreviewReq::Param { key, value } => session.preview_param(key, value, Some(&stop_param)),
                     PreviewReq::Source { file, text } => match session.preview_source(file, text, Some(&stop)) {
@@ -2493,7 +2687,12 @@ impl HostState {
                         }
                     },
                     PreviewReq::Drop { paths } => session.preview_script_files(paths, Some(&stop)),
+                    PreviewReq::Changes { changes, .. } => session.preview_changes(changes, Some(&stop)),
                 };
+                if let Some((inspected, draft)) = inspection {
+                    session.eval.put_back(inspected);
+                    session.draft = draft;
+                }
                 // One that failed once stopped says nothing of its value: the stop may be why, and
                 // what stopped it answers for itself.
                 if built.is_err() && stopped.get() {
@@ -2548,9 +2747,9 @@ impl HostState {
                 source_problem = problem;
                 (id, reply)
             }
-            Job::Param { id, key, value, fallback, asked } => {
+            Job::Param { id, key, value, fallback, step, asked } => {
                 let started = std::time::Instant::now();
-                let mut reply = session.set_param(&key, &value);
+                let mut reply = session.set_param_at_step(&key, &value, step.as_deref());
                 // a lost selector is no cap: its draft shows and a pick names the selector again
                 if !reply.ok && !crate::picks::lost_failure(&reply.text) {
                     if let Some((good, decimals)) = fallback {
@@ -2570,7 +2769,7 @@ impl HostState {
                         } else {
                             good
                         };
-                        let again = session.set_param(&key, &best);
+                        let again = session.set_param_at_step(&key, &best, step.as_deref());
                         if again.ok {
                             capped = Some((best, why));
                             reply = again;
@@ -2584,9 +2783,56 @@ impl HostState {
                 log!("fab: parameter {key}: {} in {:.0} ms (evaluation {eval:.0} ms){}", if reply.ok { "committed" } else { reply.text.as_str() }, started.elapsed().as_secs_f64() * 1000.0, capped.as_ref().map(|(value, _)| format!(" (capped at {value:?})")).unwrap_or_default());
                 (id, reply)
             }
+            Job::Link { id, key, code } => {
+                let started = std::time::Instant::now();
+                let reply = session.link_param(&key, &code);
+                let status = if reply.ok { format!("linked to {code}") } else { reply.text.clone() };
+                let eval = reply.update.as_ref().map_or(0.0, |e| e.1.millis);
+                log!("fab: parameter {key}: {status} in {:.0} ms (evaluation {eval:.0} ms)", started.elapsed().as_secs_f64() * 1000.0);
+                (id, reply)
+            }
+            Job::RoundPlan { id, picks, op } => {
+                let plan = session.command_plan(&picks, op);
+                Cx::post_action(HostAction::RoundPlan { id, plan: Box::new(plan) });
+                return;
+            }
             Job::Edit { id, edits } => {
                 let reply = session.commit("edit", edits);
                 log!("fab: edit: {}", if reply.ok { "committed" } else { reply.text.as_str() });
+                (id, reply)
+            }
+            Job::Command { id, template, value, from, good, decimals } => {
+                let mut reply = session.commit("edit", template.changes(value));
+                if !reply.ok && !crate::picks::lost_failure(&reply.text) {
+                    let mut why = reason(&reply.text);
+                    let inspected = session.eval.inspected();
+                    let draft = session.draft.clone();
+                    let (mut lo, mut hi) = (good, value);
+                    let scale = 10.0_f64.powi(decimals as i32);
+                    for _ in 0..24 {
+                        let mid = (((lo + hi) / 2.0) * scale).round() / scale;
+                        if !((lo < mid && mid < hi) || (hi < mid && mid < lo)) {
+                            break;
+                        }
+                        match session.preview_changes(&template.changes(mid), None) {
+                            Ok(_) => lo = mid,
+                            Err(e) => {
+                                hi = mid;
+                                why = e;
+                            }
+                        }
+                    }
+                    session.eval.put_back(inspected);
+                    session.draft = draft;
+                    if (lo - from).abs() > 1e-9 {
+                        let again = session.commit("edit", template.changes(lo));
+                        if again.ok {
+                            capped = Some((PValue::Num(lo), why));
+                            reply = again;
+                        }
+                    }
+                }
+                log!("fab: command: {}{}", if reply.ok { "committed" } else { reply.text.as_str() }, capped.as_ref().map(|(v, _)| format!(" (held at {v:?})")).unwrap_or_default());
                 (id, reply)
             }
             Job::DeleteParts { id, objects, scripts } => {
@@ -2668,7 +2914,7 @@ impl HostState {
                 return;
             }
             // taken by `run`
-            Job::Painted(_) | Job::SaveView { .. } | Job::Quit { .. } => return,
+            Job::ColourMode(..) | Job::Painted(_) | Job::SaveView { .. } | Job::Quit { .. } | Job::Fit { .. } => return,
             Job::Thumbnail(slot) => {
                 let Some(ThumbnailFrame { width, height, rgba, demo }) = slot.lock().unwrap().take() else { return };
                 match fab_ai::plates::thumbnail_png(width, height, &rgba) {
@@ -2704,7 +2950,12 @@ impl HostState {
             }
             Job::DeletePlate { id, plate } => {
                 let trash_home = makepad_fab_settings::home::user_home();
-                let trash = |path: &std::path::Path| fab_ai::plates::move_to_trash(&trash_home, path);
+                let store_dir = session.store.as_ref().map(|s| s.dir(&plate));
+                let trash = |path: &std::path::Path| {
+                    // this window's presence file sits inside the folder about to move
+                    if store_dir.as_deref() == Some(path) { crate::journal::release_presence(path); }
+                    fab_ai::plates::move_to_trash(&trash_home, path)
+                };
                 (id, match session.delete_plate(&plate, &trash) {
                     Ok(Some(ev)) => {
                         let what = session.model.name.clone();
@@ -2731,8 +2982,13 @@ impl HostState {
                 return;
             }
             Job::Calibration { id, coupon, colour } => (id, session.calibration(&coupon, colour)),
-            Job::Open { id, path } => {
+            Job::Open { id, path, name } => {
                 let put = session.open(&path);
+                if let (Ok(_), Some(name)) = (&put, name) {
+                    // The normal post-job autosave persists the display name, including
+                    // punctuation the store omits from its folder name.
+                    session.model.name = name;
+                }
                 (id, on_bed(&mut session, &path.display().to_string(), put))
             }
         };
@@ -2742,22 +2998,22 @@ impl HostState {
             }
         }
         if let Some(RenderRequest::Verdicts(check)) = &reply.render {
-            check_verdicts(pool, id, check.clone(), running.take());
+            check_verdicts(pool, id, self.journal.person(), check.clone(), running.take());
             return;
         }
         if let Some(RenderRequest::WeakSpots(find)) = &reply.render {
             let find = find.clone();
-            off_worker(pool, id, running.take(), move |stop| find.answer(stop));
+            off_worker(pool, id, self.journal.person(), running.take(), move |stop| find.answer(stop));
             return;
         }
         if let Some(RenderRequest::Tubes(find)) = &reply.render {
             let find = find.clone();
-            off_worker(pool, id, running.take(), move |stop| find.answer(stop));
+            off_worker(pool, id, self.journal.person(), running.take(), move |stop| find.answer(stop));
             return;
         }
         if let Some(RenderRequest::StrengthPlan(find)) = &reply.render {
             let find = find.clone();
-            off_worker(pool, id, running.take(), move |stop| find.answer(stop));
+            off_worker(pool, id, self.journal.person(), running.take(), move |stop| find.answer(stop));
             return;
         }
         let t = std::time::Instant::now();
@@ -2814,7 +3070,7 @@ impl HostState {
                 }
             }
         }
-        let done = Done { images: reply.images, id, ok: reply.ok, text: reply.text, review: Mutex::new(review), update, status: status_after_job(previous_switch, &mut session), model_changed: !measurement_only, check_slice, source_files, source_problem, capped };
+        let done = Done { person: self.journal.person(), images: reply.images, id, ok: reply.ok, text: reply.text, review: Mutex::new(review), update, status: status_after_job(previous_switch, &mut session), model_changed: !measurement_only, check_slice, source_files, source_problem, capped };
         // The list before the answer: what is on the bed now (a switch's plate) is the app's
         // before whoever asked acts on the answer. A click on the plate the switch left found
         // the list still naming it on the bed, and was dropped as a click on that plate.
@@ -2847,6 +3103,7 @@ pub fn builds_in_flight(_: &Cx) -> usize {
 impl Drop for ModelHost {
     /// A host dropped with builds still counted (a new host replaced it) takes them out.
     fn drop(&mut self) {
+        self.cancel_unanswered();
         BUILDS.fetch_sub(self.building, Ordering::AcqRel);
     }
 }
@@ -2867,7 +3124,7 @@ impl ModelHost {
         let docs_newest = Arc::new(Mutex::new(HashMap::new()));
         let replacing = Arc::new(AtomicUsize::new(0));
         let switched_now = Arc::new(AtomicU64::new(0));
-        let state = HostState { steps: steps.clone(), logged: logged.clone(), words: words.clone(), docs_newest: docs_newest.clone(), replacing: replacing.clone(), switched_now: switched_now.clone(), session: None, xr: false, overhangs: false, scenes: Scenes::on(cx.task_pool()), plates_seen: None, list_reads: ListReads::default(),
+        let state = HostState { journal: Default::default(), spawner: cx.thread_spawner(), steps: steps.clone(), logged: logged.clone(), words: words.clone(), docs_newest: docs_newest.clone(), replacing: replacing.clone(), switched_now: switched_now.clone(), session: None, xr: false, overhangs: false, scenes: Scenes::on(cx.task_pool()), plates_seen: None, list_reads: ListReads::default(),
             painting: 0, painting_run: None, paint_seen: Default::default(), paint_again: Default::default(), painting_alone: false, quitting: quitting.clone(), saved: saved.clone(), persist, retry_after: std::time::Instant::now(),
             pool: cx.task_pool(), stress_seen: 0, volumes_seen: std::sync::Weak::new(), veins_seen: 0, veins_asked: Default::default(), grows: grow_runs.clone(), grow_seen: 0, grow_next: 0, hub: Default::default(), recovery };
         let strand = Strand::with_state(&cx.task_pool(), "fab model", state);
@@ -2877,7 +3134,7 @@ impl ModelHost {
             state.words.lock().unwrap().set(None, None);
             state.switched_now.store(state.session.as_ref().map_or(0, |s| s.switched), Ordering::Release);
         }).detach();
-        ModelHost { steps, logged, words, grow_runs, strand, setup_version: Version::new(), overhang_list_version: Version::new(), retry: HashMap::new(), call_jobs: HashMap::new(), build_jobs: Vec::new(), next_id: 1, xr: false, preview_version: Version::new(), preview_stops: Arc::default(), preview_gen: 0, thumbnail: ThumbnailSlot::default(), shape_held: Arc::new(AtomicUsize::new(0)), building: 0, load: None, recovery: recovery_job, quitting,
+        ModelHost { steps, logged, words, grow_runs, strand, setup_version: Version::new(), overhang_list_version: Version::new(), fit_version: Version::new(), retry: HashMap::new(), call_jobs: HashMap::new(), build_jobs: Vec::new(), next_id: 1, plate_journal: None, person_calls: Vec::new(), xr: false, preview_version: Version::new(), preview_stops: Arc::default(), preview_gen: 0, thumbnail: ThumbnailSlot::default(), shape_held: Arc::new(AtomicUsize::new(0)), building: 0, load: None, recovery: recovery_job, quitting,
             keeping: Arc::new(AtomicUsize::new(0)), saved, persist, pool: cx.task_pool(), docs_newest, docs_seq: 0, held: Vec::new(), barrier: false, replacing, switched_now }
     }
 
@@ -2897,6 +3154,34 @@ impl ModelHost {
         *self.preview_stops.newest.lock().unwrap() = Some((self.preview_gen, key.clone(), value.clone()));
         self.queue(Job::Preview { gen: self.preview_gen, req: PreviewReq::Param { key, value }, asked: std::time::Instant::now(), stops: self.preview_stops.clone(), since: self.preview_stops.count.load(Ordering::Acquire) });
         self.preview_gen
+    }
+
+    /// A command's batch at a dragged value, evaluated, not committed: only the newest is.
+    pub fn preview_changes(&mut self, key: String, value: PValue, changes: Vec<fab_model::Change>, at_step: bool) -> u64 {
+        self.preview_gen += 1;
+        *self.preview_stops.newest.lock().unwrap() = None;
+        self.queue(Job::Preview { gen: self.preview_gen, req: PreviewReq::Changes { key, value, changes, at_step }, asked: std::time::Instant::now(), stops: self.preview_stops.clone(), since: self.preview_stops.count.load(Ordering::Acquire) });
+        self.preview_gen
+    }
+
+    pub fn view_pick(&mut self, request: fab_ai::picks::ViewPick) -> u64 {
+        let id = self.reserve_call_id();
+        self.queue(Job::ViewPick { id, request });
+        id
+    }
+
+    /// What command `op` at the picks would write and where its handle sits; the answer comes
+    /// back as [`HostAction::RoundPlan`].
+    pub fn round_plan(&mut self, picks: Vec<String>, op: fab_ai::round::Op) -> u64 {
+        let id = self.reserve_call_id();
+        self.queue(Job::RoundPlan { id, picks, op });
+        id
+    }
+
+    pub fn fit(&mut self, a: FitPick, b: FitPick, turn: f64) -> u64 {
+        let id = self.reserve_call_id();
+        self.queue(Job::Fit { id, a, b, turn });
+        id
     }
 
     /// Live project, script or paint text: only the newest is evaluated.
@@ -2989,19 +3274,22 @@ impl ModelHost {
         self.cancel_preview();
         self.setup_version.bump();
         self.overhang_list_version.bump();
+        self.fit_version.bump();
         let id = self.reserve_call_id();
-        let doing = self.words.lock().unwrap().doing.clone();
+        let reply = Arc::new(QuitReply { id, answered: false.into() });
+        let doing = self.words.lock().ok().and_then(|words| words.doing.clone());
         let keeping = self.keeping.load(Ordering::Acquire);
         if keeping == 0 && self.held.is_empty() && !self.barrier && self.saved.load(Ordering::Acquire) {
             let store = self.persist.then(plate_store);
             let written = view.clone();
+            let fast_reply = reply.clone();
             let leave = move || {
                 if let (Some(store), Some((plate, view))) = (&store, &written) {
                     write_view(store, plate, view);
                 }
                 let left = doing.map_or(String::new(), |doing| format!("; the worker's job ({doing}) keeps nothing and is left"));
                 log!("fab: quitting {:.0} ms after it was asked, the plate's edits saved before it{left}", asked.elapsed().as_secs_f64() * 1e3);
-                Cx::post_action(HostAction::Quit { id });
+                fast_reply.answered.store(true, Ordering::Release);
             };
             match self.pool.submit_named(Class::Interactive, "fab quit", leave) {
                 Ok(task) => {
@@ -3017,7 +3305,7 @@ impl ModelHost {
         if let Some((plate, view)) = view {
             self.queue(Job::SaveView { plate, view });
         }
-        self.queue(Job::Quit { id, asked });
+        self.queue(Job::Quit { reply, asked });
         id
     }
 
@@ -3041,6 +3329,13 @@ impl ModelHost {
     pub fn edit(&mut self, edits: Vec<fab_model::Change>) -> u64 {
         let id = self.reserve_call_id();
         self.queue(Job::Edit { id, edits });
+        id
+    }
+
+    /// A command's `value` committed, or where the kernel stops short of it ([`Job::Command`]).
+    pub fn command(&mut self, template: fab_model::params::Template, value: f64, from: f64, good: f64, decimals: usize) -> u64 {
+        let id = self.reserve_call_id();
+        self.queue(Job::Command { id, template, value, from, good, decimals });
         id
     }
 
@@ -3070,9 +3365,15 @@ impl ModelHost {
     }
 
     /// Set a parameter as one undo step; the answer comes back as `HostAction::Done`.
-    pub fn set_param(&mut self, key: &str, value: PValue, fallback: Option<(PValue, usize)>) -> u64 {
+    pub fn set_param(&mut self, key: &str, value: PValue, fallback: Option<(PValue, usize)>, step: Option<String>) -> u64 {
         let id = self.reserve_call_id();
-        self.queue(Job::Param { id, key: key.to_string(), value, fallback, asked: std::time::Instant::now() });
+        self.queue(Job::Param { id, key: key.to_string(), value, fallback, step, asked: std::time::Instant::now() });
+        id
+    }
+
+    pub fn link_param(&mut self, key: &str, code: String) -> u64 {
+        let id = self.reserve_call_id();
+        self.queue(Job::Link { id, key: key.to_string(), code });
         id
     }
 
@@ -3081,21 +3382,21 @@ impl ModelHost {
     }
 
     fn queue(&mut self, job: Job) {
-        let title = job_title(&job);
-        self.queue_titled(job, title);
+        self.queue_as(job, Author::Person);
     }
 
-    fn queue_titled(&mut self, job: Job, title: Option<String>) {
-        self.queue_inner(job, title, false);
+    fn queue_as(&mut self, job: Job, author: Author) {
+        let title = job_title(&job).map(|title| authored_title(title, author));
+        self.queue_inner(job, title, author, false, None);
     }
 
-    fn queue_inner(&mut self, job: Job, title: Option<String>, counted: bool) {
+    fn queue_inner(&mut self, job: Job, title: Option<String>, author: Author, counted: bool, work: Option<crate::journal::Work>) {
         if replaces_document(&job) {
             if !counted {
                 self.replacing.fetch_add(1, Ordering::AcqRel);
             }
             if self.barrier {
-                self.held.push((job, title));
+                self.held.push((job, title, author, work));
                 return;
             }
         }
@@ -3121,7 +3422,7 @@ impl ModelHost {
         }
         if let Some(h) = &handle {
             if let Some(copy) = retry_copy(&job) {
-                self.retry.insert(h.id(), copy);
+                self.retry.insert(h.id(), (copy, author));
             }
             if let Some(id) = job_call_id(&job) {
                 self.call_jobs.insert(id, h.id());
@@ -3136,10 +3437,10 @@ impl ModelHost {
         self.retry.retain(|id, _| held.contains(id));
         self.call_jobs.retain(|_, id| held.contains(id));
         self.build_jobs.retain(|id| held.contains(id));
-        self.queue_with(job, handle);
+        self.queue_with(job, handle, author, work);
     }
 
-    fn queue_with(&mut self, job: Job, handle: Option<JobHandle>) {
+    fn queue_with(&mut self, job: Job, handle: Option<JobHandle>, author: Author, work: Option<crate::journal::Work>) {
         if let Some(h) = &handle {
             let mut words = self.words.lock().unwrap();
             h.stage(words.waiting(), None, None);
@@ -3154,6 +3455,7 @@ impl ModelHost {
             Job::Preview { .. } => self.preview_version.next(),
             Job::PrintSetup(_) => self.setup_version.next(),
             Job::OverhangList { .. } => self.overhang_list_version.next(),
+            Job::Fit { .. } => self.fit_version.next(),
             _ => Ticket::none(),
         };
         let quitting = left_at_quit(&job).then(|| self.quitting.clone());
@@ -3171,7 +3473,7 @@ impl ModelHost {
                     h.cancelled();
                 }
             } else {
-                state.run((job, handle), ticket);
+                state.journal.clone().during(work, || state.run((job, handle, author), ticket));
             }
             state.switched_now.store(state.session.as_ref().map_or(0, |s| s.switched), Ordering::Release);
             if replacing {
@@ -3185,8 +3487,8 @@ impl ModelHost {
     pub fn hold_document_changes(&mut self, held: bool) {
         self.barrier = held;
         if !held {
-            for (job, title) in std::mem::take(&mut self.held) {
-                self.queue_inner(job, title, true);
+            for (job, title, author, work) in std::mem::take(&mut self.held) {
+                self.queue_inner(job, title, author, true, work);
             }
         }
     }
@@ -3204,16 +3506,16 @@ impl ModelHost {
 
     /// Queue a failed job again (the job strip's Retry). False when it cannot be retried.
     pub fn retry(&mut self, job: JobId) -> bool {
-        let Some(copy) = self.retry.remove(&job) else { return false };
+        let Some((copy, author)) = self.retry.remove(&job) else { return false };
         let id = self.reserve_call_id();
         let copy = match copy {
             Job::Call { tool, args, .. } => Job::Call { id, tool, args },
-            Job::Open { path, .. } => Job::Open { id, path },
+            Job::Open { path, name, .. } => Job::Open { id, path, name },
             Job::ImportFile { path, new_plate, .. } => Job::ImportFile { id, path, new_plate },
             Job::AddScripts { paths, .. } => Job::AddScripts { id, paths },
             other => other,
         };
-        self.queue(copy);
+        self.queue_as(copy, author);
         true
     }
 
@@ -3240,24 +3542,45 @@ impl ModelHost {
         }
     }
 
-    /// A tool call an AI made (the chat, an outside agent): the job strip names it as the AI's.
-    pub fn chat_call(&mut self, tool: &str, args: Value) -> u64 {
-        let id = self.reserve_call_id();
-        self.chat_call_as(id, tool, args);
-        id
+    /// Queue a chat or remote job with its original caller, including after a held gesture.
+    pub fn chat_call_as(&mut self, id: u64, tool: &str, args: Value, work: crate::journal::Work) {
+        let author = model_author(work.by);
+        let title = authored_title(tool_title(tool), author);
+        self.queue_inner(tool_job(id, tool, args), Some(title), author, false, Some(work));
     }
 
-    /// An AI call by the id it was given when it was asked for (it waited for a gesture to end).
-    pub fn chat_call_as(&mut self, id: u64, tool: &str, args: Value) {
-        let title = format!("AI: {}", tool_title(tool));
-        self.queue_titled(tool_job(id, tool, args), Some(title));
-    }
-
-    /// Queue a tool call; its answer comes back as `HostAction::Done` with this id.
+    /// Queue a tool call from the app. Its answer comes back as `HostAction::Done` with this id.
     pub fn call(&mut self, tool: &str, args: Value) -> u64 {
         let id = self.reserve_call_id();
         self.queue(tool_job(id, tool, args));
         id
+    }
+
+    /// A tool invoked from Fab's own panels, such as a fix the person ticked.
+    pub fn call_as_person(&mut self, tool: &str, args: Value) -> u64 {
+        let id = self.reserve_call_id();
+        let work = self.plate_journal.as_ref().map(|plate| crate::journal::PersonReply::begin(plate, tool, args.clone()));
+        if let Some(reply) = work.as_ref().and_then(|work| work.person.as_ref()) {
+            self.person_calls.retain(|pending| pending.strong_count() != 0);
+            self.person_calls.push(Arc::downgrade(reply));
+        }
+        let job = tool_job(id, tool, args);
+        let title = job_title(&job);
+        self.queue_inner(job, title, Author::Person, false, work);
+        id
+    }
+
+    /// The last save has answered. Reads whose results will never be delivered
+    /// close before the app asks its writers whether they can exit.
+    pub(crate) fn cancel_unanswered(&mut self) {
+        for pending in self.person_calls.drain(..).filter_map(|weak| weak.upgrade()) {
+            pending.receive(false, "cancelled");
+        }
+    }
+
+    pub fn receive_done(&mut self, done: &Done) {
+        self.plate_journal.clone_from(&done.status.journal);
+        if let Some(person) = &done.person { person.receive(done.ok, &done.text); }
     }
 
     /// App-owned read tools use the same id space without queuing model work.
@@ -3292,8 +3615,8 @@ impl ModelHost {
     }
 
     /// Set the language's host inputs and libraries and rebuild the scripts that read them.
-    pub fn set_env(&mut self, bed: u64, env: ScriptEnv) {
-        self.queue(Job::SetEnv { bed, env });
+    pub fn set_env(&mut self, bed: u64, generation: u64, env: ScriptEnv) {
+        self.queue(Job::SetEnv { bed, generation, env });
     }
 
     /// One queue push, no wait; queued documents for one bed collapse to the newest.
@@ -3328,6 +3651,10 @@ impl ModelHost {
     /// The print colours' material colours and job tools (the colour mapping changed).
     pub fn mapped(&mut self, mapped: Arc<fab_model::eval::Mapped>) {
         self.queue(Job::Mapped(mapped));
+    }
+
+    pub fn colour_mode(&mut self, mode: fab_plate::ColourMode, linked: bool) {
+        self.queue(Job::ColourMode(mode, linked));
     }
 
     pub fn test_mode(&mut self, on: bool) {
@@ -3371,9 +3698,9 @@ impl ModelHost {
         id
     }
 
-    pub fn open(&mut self, path: PathBuf) -> u64 {
+    pub fn open(&mut self, path: PathBuf, name: Option<String>) -> u64 {
         let id = self.reserve_call_id();
-        self.queue(Job::Open { id, path });
+        self.queue(Job::Open { id, path, name });
         id
     }
 
@@ -3404,7 +3731,7 @@ impl ModelHost {
         if let Some(name) = name {
             args.push(("name".to_string(), Value::Str(name.to_string())));
         }
-        self.call("plates", Value::Obj(args.into_iter().collect()))
+        self.call_as_person("plates", Value::Obj(args.into_iter().collect()))
     }
 
     /// Move plate `plate`'s files and working copy to the trash.
@@ -3428,9 +3755,12 @@ impl ModelHost {
         id
     }
 
-    /// Put a mesh made from a picture on the plate (`id`: a reserved call id).
-    pub fn import_mesh(&mut self, id: u64, made: crate::img2mesh::Made, render: bool) {
-        self.queue(Job::ImportMesh { id, made: Box::new(made), render });
+    /// The completed image request has a chat call id for an agent and none for the Parts panel.
+    pub fn import_mesh(&mut self, id: u64, made: crate::img2mesh::Made, work: Option<crate::journal::Work>) {
+        let author = work.as_ref().map_or(Author::Person, |w| model_author(w.by));
+        let job = Job::ImportMesh { id, made: Box::new(made), render: work.is_some() };
+        let title = job_title(&job).map(|title| authored_title(title, author));
+        self.queue_inner(job, title, author, false, work);
     }
 
     pub fn make_printable(&mut self, object: &str) -> u64 {
@@ -3454,6 +3784,149 @@ mod measurement_tests {
     use fab::api::{MeasureAction, MeasureKind, Units};
     use fab::tools::measure;
     use fab_model::{project, Change, FabModel, HistoryAction};
+
+    #[test]
+    fn fit_job_seats_the_lid_on_the_clicked_plate_planes() {
+        use fab_model::params::{xf_dir, xf_point};
+        use makepad_csg_mech::geom::{len, scale, sub};
+        use std::sync::mpsc::channel;
+
+        let _owner = crate::cx_owned();
+        let (answered, replies) = channel();
+        let mut cx = Cx::new(Box::new(move |_, event| {
+            if let Event::Actions(actions) = event {
+                for action in actions {
+                    if let Some(HostAction::Fit { id, result }) = action.downcast_ref::<HostAction>() {
+                        answered.send((*id, result.clone())).unwrap();
+                    }
+                }
+            }
+        }));
+        let mut host = ModelHost::start(&cx, false);
+        let (built, plate) = channel();
+        let (resume, wait) = channel();
+        host.strand.submit(Class::Interactive, Ticket::none(), move |state| {
+            let session = state.session.as_mut().expect("the host should own the fixture session");
+            let source = r#"use mod.model.*
+use mod.fab.*
+let m = mod.model
+let outer = m.box({size: [20mm 10mm 14mm] at: [0 5mm 0]})
+let cavity = m.box({size: [17.6mm 10mm 11.6mm] at: [0 6.2mm 0]})
+let tray = m.subtract(outer, cavity)
+let plate = m.box({size: [20mm 2mm 14mm] at: [30mm 1mm 0]})
+let lip_outer = m.box({size: [17.2mm 3mm 11.2mm] at: [30mm 2.5mm 0]})
+let lip_inner = m.box({size: [14.8mm 5mm 8.8mm] at: [30mm 2.5mm 0]})
+let lip = m.subtract(lip_outer, lip_inner)
+let lid = m.union(plate, lip)
+let peg = m.cylinder({radius: 2mm height: 2mm segments: 12 at: [50mm 1mm 0]})
+let block = m.sdf({
+    bounds: [[59.375mm, -0.125mm, -0.625mm], [60.625mm, 1.125mm, 0.625mm]]
+    cell: 0.25mm
+    field: fn(p) { return sdf_box(p - vec3(60mm, 0.5mm, 0), vec3(1mm, 1mm, 1mm)) }
+})
+object(tray)
+object(lid)
+object(peg, name: "Locating pin")
+object(block)
+"#;
+            session.model = FabModel::with_script("Case", "case.cad.splash", source);
+            built.send(session.rebuild()).unwrap();
+            // Both initial requests are queued before the strand can take either.
+            let _ = wait.recv();
+        }).detach();
+        let ev = plate.recv().expect("the fixture build should answer").expect("the tray, lid, peg and field box should build");
+        let frame = |part: &str| {
+            let i = ev.plate.placed_parts().position(|p| p.object == part).expect("the fixture part should be placed");
+            ev.placed_frame(i).expect("the fixture part should have a model-to-plate frame")
+        };
+        let pick = |part: &str, point, normal| FitPick {
+            element: fab::model::ElementId(0), part: part.into(), point: xf_point(frame(part), point), normal: xf_dir(frame(part), normal),
+        };
+        let rim = pick("case/tray", [9.4, 10.0, 0.0], [0.0, 1.0, 0.0]);
+        let lid = pick("case/lid", [30.0, 2.0, 6.5], [0.0, 1.0, 0.0]);
+        let mut receive = |host: &ModelHost, id| {
+            let (done, fence) = channel();
+            host.strand.submit(Class::Interactive, Ticket::none(), move |_| done.send(()).unwrap()).detach();
+            fence.recv().expect("the model strand should finish the fit");
+            cx.handle_action_receiver();
+            let (got, result) = replies.try_recv().expect("a finished fit should post its answer");
+            assert_eq!(got, id, "only the newest queued fit should run and answer with its reserved id");
+            result
+        };
+        host.fit(rim.clone(), rim.clone(), 0.0);
+        let id = host.fit(rim.clone(), lid.clone(), 0.0);
+        resume.send(()).expect("the fixture strand should resume with both requests queued");
+        let fitted = receive(&host, id).expect("the lid should fit from its two plate picks");
+        let mut ask = |a, b, turn| {
+            let id = host.fit(a, b, turn);
+            receive(&host, id)
+        };
+        assert!(fitted.seat && fitted.overlap_mm3 == 0.0 && fitted.overlap_bounds.is_none(), "the lid should seat with no interference");
+        assert_eq!(fitted.part_b, "case/lid", "the fitted copy should belong to the lid");
+        let small = fitted.smallest.and_then(|i| fitted.gaps[i]).expect("the seated lip should identify its smallest side");
+        for (i, gap) in fitted.gaps.iter().enumerate() {
+            let gap = gap.expect("the rectangular lip should have witnesses on all four sides");
+            let model_dir = [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, -1.0]][i];
+            let plate_dir = xf_dir(frame("case/tray"), model_dir);
+            assert!((gap.distance_mm - 0.2).abs() < 0.01, "side {i} should have a 0.20 mm gap, got {gap:?}");
+            assert!(len(sub(gap.direction, plate_dir)) < 1e-6 && len(sub(sub(gap.to, gap.from), scale(plate_dir, gap.distance_mm))) < 1e-6,
+                "side {i}'s plate witnesses should span its labelled gap in the seating face's side direction");
+            assert!(small.distance_mm <= gap.distance_mm, "the highlighted side should have the smallest gap");
+        }
+        let corner = xf_point(frame("case/lid"), [40.0, 2.0, 7.0]);
+        let expected = xf_point(frame("case/tray"), [10.0, 10.0, -7.0]);
+        assert!(len(sub(xf_point(&fitted.ghost, corner), expected)) < 1e-6, "the placed lid's underside corner should land on the corresponding rim corner");
+
+        {
+            let mesh = fitted.ghost_mesh.lock().unwrap();
+            let mesh = mesh.as_ref().expect("the view needs a prepared ghost mesh");
+            assert!(mesh.indices.iter().any(|&i| {
+                let p = mesh.position(i);
+                len(sub([p.x, p.y, p.z].map(|m| m as f64 * 1000.0), expected)) < 1e-4
+            }), "the ghost the pass draws must include the fitted corner in plate metres");
+        }
+
+        let turned = ask(rim.clone(), lid.clone(), 90.0).expect("the crosswise fit should report its interference");
+        assert_eq!(turned.turn, 90.0, "the result should identify the quarter turn");
+        assert!(!turned.seat && (turned.overlap_mm3 - 11.52).abs() < 0.01, "the crosswise lid should overlap by 11.52 mm³, got {}", turned.overlap_mm3);
+        let bounds = turned.overlap_bounds.expect("the crossing walls should have interference bounds on the plate");
+        let crossing = xf_point(frame("case/tray"), [5.0, 9.0, 6.4]);
+        assert!((0..3).all(|k| bounds.iter().any(|p| p[k] < crossing[k]) && bounds.iter().any(|p| p[k] > crossing[k])),
+            "the plate-space interference bounds should enclose the crossing of the lip and tray walls");
+        let same = ask(rim.clone(), rim, 0.0).expect_err("the second pick on the tray should be refused");
+        assert!(same.contains("two different parts"), "the refusal should explain how to choose the second part: {same}");
+
+        let edge = [9.999, 10.0, 0.0];
+        let edge_rim = ask(pick("case/tray", edge, [0.0, 1.0, 0.0]), lid.clone(), 0.0).expect("the rim plane should seed the rim beside the edge");
+        assert!(edge_rim.seat && edge_rim.overlap_mm3 == 0.0 && len(sub(xf_point(&edge_rim.ghost, corner), expected)) < 1e-6,
+            "clicking near the rim edge should give the same clean seat and fitted corner as clicking inside the rim");
+        for (i, gap) in edge_rim.gaps.iter().enumerate() {
+            assert!(gap.is_some_and(|g| (g.distance_mm - 0.2).abs() < 0.01), "edge pick should preserve the 0.20 mm gap on side {i}");
+        }
+        let wall = ask(pick("case/tray", edge, [1.0, 0.0, 0.0]), lid.clone(), 0.0).expect("the wall plane at the same point should seed the outer wall");
+        let underside = xf_point(frame("case/lid"), [30.0, 2.0, 0.0]);
+        let wall_center = xf_point(frame("case/tray"), [10.0, 5.0, 0.0]);
+        assert!(len(sub(xf_point(&wall.ghost, underside), wall_center)) < 1e-6, "the wall pick should place the lid's underside centre on the outer wall");
+
+        // At the cylinder's outermost generator its true tangent plane contains neither neighbouring facet.
+        let peg = pick("case/peg", [52.0, 1.0, 0.0], [1.0, 0.0, 0.0]);
+        let curved = ask(peg, lid, 0.0).expect_err("the cylinder's curved side should refuse a flat seat");
+        assert_eq!(curved, "Measure Fit seats flat faces: the surface picked on Locating pin is curved", "the curved-seat refusal should use the displayed part name");
+
+        // The bounds extend half a cell beyond each face. The box's analytic +Y face is
+        // at centre Y + half the height = 1 mm, halfway between adjacent grid planes.
+        let block = pick("case/block", [60.0625, 1.0, -0.03125], [0.0, 1.0, 0.0]);
+        let i = ev.plate.placed_parts().position(|p| p.object == block.part).expect("the field box should be on the plate");
+        assert!(!ev.view.meshes, "the fixture must draw field parts from their distance fields");
+        let distance = ev.placed_field(i).and_then(|f| f.on_plate()).expect("the box must have a distance field on the plate");
+        let [x, y, z] = block.point;
+        assert!(distance(x, y, z).abs() < 1e-6, "the analytic pick must lie on the drawn field's zero surface");
+        let lid_outer_face = pick("case/lid", [30.0, 0.0, 0.0], [0.0, -1.0, 0.0]);
+        let seating = "a field box clicked on its analytic face must seat; if the seed misses, it needs the part's mesher cell as its reach";
+        let field_fit = ask(lid_outer_face, block, 0.0).expect(seating);
+        assert!(field_fit.seat, "{seating}");
+        assert_eq!(field_fit.overlap_mm3, 0.0, "the seated field box must have zero overlap with the lid");
+    }
 
     #[test]
     fn measurement_points_and_kinds_round_trip_in_plate_millimetres() {
@@ -3543,6 +4016,13 @@ mod worker_words_tests {
     use super::*;
 
     #[test]
+    fn a_colour_switch_keeps_the_current_slice() {
+        for mode in [fab_plate::ColourMode::Model, fab_plate::ColourMode::Material] {
+            assert!(!shapes_model(&Job::ColourMode(mode, true)), "the worker would invalidate the live slice");
+        }
+    }
+
+    #[test]
     fn a_queued_job_says_what_it_waits_for() {
         let (a, b) = (JobSpec::new("first").start(), JobSpec::new("second").start());
         let words_of = |h: &JobHandle| jobs::board().get(h.id()).unwrap().stage_words();
@@ -3602,14 +4082,14 @@ mod scene_tests {
             state.docs_newest.lock().unwrap().insert(bed, 2);
             let before = state.session.as_ref().unwrap().model.docs().clone();
             let base = Arc::new(crate::elec_host::electronics(&before));
-            state.process((job(1, texts("older board a\n"), base.clone()), None), Ticket::none());
+            state.process((job(1, texts("older board a\n"), base.clone()), None, Author::Person), Ticket::none());
             assert_eq!(state.session.as_ref().unwrap().model.docs(), &before, "an older queued set is skipped");
             assert_eq!(state.docs_newest.lock().unwrap().get(&bed), Some(&2), "the newest set keeps its turn");
             let current = job(2, docs.clone(), base.clone());
             assert!(job_title(&current).is_none() && !builds_model(&current) && !shapes_model(&current), "documents have no title or rebuild");
             assert!(!left_at_quit(&current) && loads(&current).is_none() && retry_copy(&current).is_none(), "documents must be saved, without a load or retry");
             assert_eq!(class_of(&current), Class::Visible);
-            state.process((current, None), Ticket::none());
+            state.process((current, None, Author::Person), Ticket::none());
             assert!(!state.docs_newest.lock().unwrap().contains_key(&bed), "the newest set consumed its turn");
             let s = state.session.as_mut().unwrap();
             assert_eq!(s.model.docs(), &docs, "documents reach their current bed");
@@ -3624,7 +4104,7 @@ mod scene_tests {
             let before_rejected = state.session.as_ref().unwrap().model.docs().clone();
             let rejected = texts("board a over an unseen change\n");
             state.docs_newest.lock().unwrap().insert(bed, 3);
-            state.process((job(3, rejected.clone(), base), None), Ticket::none());
+            state.process((job(3, rejected.clone(), base), None, Author::Person), Ticket::none());
             let kept = store.kept_aside(&a);
             assert!(Arc::ptr_eq(state.session.as_ref().unwrap().model.docs(), &before_rejected)
                 && kept.len() == 1
@@ -3639,7 +4119,7 @@ mod scene_tests {
             let base = Arc::new(crate::elec_host::electronics(s.model.docs()));
             let moved = texts("board a moved again\n");
             state.docs_newest.lock().unwrap().insert(bed, 4);
-            state.process((job(4, moved.clone(), base), None), Ticket::none());
+            state.process((job(4, moved.clone(), base), None, Author::Person), Ticket::none());
             let s = state.session.as_mut().unwrap();
             assert!(s.model.docs().get("notes.txt").map(|text| text.as_ref()) == Some("the bed's notes\n")
                 && crate::elec_host::same_files(&crate::elec_host::electronics(s.model.docs()), &moved),
@@ -3652,7 +4132,7 @@ mod scene_tests {
             assert_eq!(s.model.docs(), &b_docs, "the other plate has its own board");
             let late = texts("late board a, text intact\n");
             state.docs_newest.lock().unwrap().insert(bed, 5);
-            state.process((job(5, late.clone(), moved), None), Ticket::none());
+            state.process((job(5, late.clone(), moved), None, Author::Person), Ticket::none());
             assert_eq!(state.session.as_ref().unwrap().model.docs(), &b_docs, "late documents never reach the other plate");
             let kept = store.kept_aside(&a);
             assert_eq!(kept.len(), 2, "late documents are kept in their original plate's folder beside the rejected write");
@@ -3996,10 +4476,11 @@ mod person_first {
         vec![
             Job::Place { id: 0, moves: Vec::new() },
             Job::Edit { id: 0, edits: Vec::new() },
-            Job::Param { id: 0, key: "height".into(), value: PValue::Num(1.0), fallback: None, asked: Instant::now() },
+            Job::Param { id: 0, key: "height".into(), value: PValue::Num(1.0), fallback: None, step: None, asked: Instant::now() },
+            Job::Link { id: 0, key: "post.radius".into(), code: "wall * 2".into() },
             Job::Source { id: 0, file: "part.cad.splash".into(), text: String::new(), param: None },
             Job::Call { id: 0, tool: "script".into(), args: Value::Null },
-            Job::Open { id: 0, path: PathBuf::from("plate") },
+            Job::Open { id: 0, path: PathBuf::from("plate"), name: None },
             Job::Reload { id: 0 },
         ]
     }
@@ -4113,6 +4594,40 @@ mod person_first {
         while !slice.is_finished() {
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn quit_without_a_session_answers_and_finishes_its_job() {
+        let _cx = crate::cx_owned();
+        let (send, answers) = std::sync::mpsc::channel();
+        let mut cx = Cx::new(Box::new(move |_, event| {
+            if let Event::Actions(actions) = event {
+                for action in actions {
+                    match action.downcast_ref::<HostAction>() {
+                        Some(HostAction::Quit { id }) => send.send(*id).unwrap(),
+                        Some(HostAction::QuitHostGone { .. }) => panic!("the quit ran on a live model host"),
+                        _ => (),
+                    }
+                }
+            }
+        }));
+        let mut host = ModelHost::start(&cx, false);
+        let id = host.reserve_call_id();
+        let reply = Arc::new(QuitReply { id, answered: false.into() });
+        let handle = JobSpec::new("Saving the plate before quitting").start();
+        let job_id = handle.id();
+        let (done, ran) = std::sync::mpsc::channel();
+        host.strand.submit(Class::Interactive, Ticket::none(), move |state| {
+            state.session = None;
+            let quit = Job::Quit { reply, asked: Instant::now() };
+            state.run((quit, Some(handle), Author::Person), Ticket::none());
+            done.send(()).unwrap();
+        }).detach();
+        ran.recv().unwrap();
+        cx.handle_action_receiver();
+        assert_eq!(answers.try_iter().collect::<Vec<_>>(), [id]);
+        // The job board removes a fleeting success from its history.
+        assert!(jobs::board().get(job_id).is_none_or(|j| matches!(j.end, jobs::JobEnd::Done { next: None })));
     }
 
     /// Why: a quit dropped every edit still queued behind a long job (the pool's close drops a
@@ -4287,3 +4802,7 @@ mod load_hold_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "journal/model_session_test.rs"]
+mod journal_session;

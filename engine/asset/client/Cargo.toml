@@ -1,0 +1,37 @@
+# Asset Server client + verified cache (work package D), registered in the
+# root workspace (the former standalone empty [workspace] table was removed
+# at registration, same as engine/asset/data).
+#
+# Dependencies stay in the repository. Tree edits use the Splash syntax tree
+# to change reference spans; transport data uses the content contract and
+# strict JSON parser, without an external HTTP library or async runtime.
+
+[package]
+name = "makepad-asset-client"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[features]
+default = ["native"]
+native = ["dep:makepad-network", "dep:makepad-live-id"]
+web = ["dep:makepad-network", "dep:makepad-live-id"]
+
+# `web` builds the portable client (the wasm one) on the host: no user turns it on and no other
+# build may hold it, so the tests buckets run its tests as a unit of their own.
+[package.metadata.makepad]
+test-variants = ["web"]
+
+[dependencies]
+makepad-script = { path = "../../../../../platform/script" }
+makepad-asset-data = { path = "../../../../apps/engine/asset/data" }
+# The reuse-address UDP bind the discovery listener (and the AI hub) share.
+makepad-core-util = { path = "../../../../../libs/core_util" }
+makepad-strict-json = { path = "../../../../../libs/strict_json" }
+makepad-network = { path = "../../../../../platform/network", optional = true }
+makepad-live-id = { path = "../../../../../libs/live_id", optional = true }
+makepad-platform = { path = "../../../../../platform" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+makepad-network = { path = "../../../../../platform/network" }
+makepad-live-id = { path = "../../../../../libs/live_id" }

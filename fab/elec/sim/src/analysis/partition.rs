@@ -39,6 +39,9 @@ pub struct PartOpts {
     /// Declared supplies (`NodeInfo::supply`): consumers there may return their current a round
     /// late, under `hub_tol` (`held`). `round::plan_blocks` adds the circuit's own.
     pub supplies: Vec<String>,
+    /// Declared heard nets (`NodeInfo::heard`). `round::plan_blocks` adds the circuit's own.
+    /// A run may add more later.
+    pub heard: Vec<String>,
     /// The round's length, seconds: how late a cut's late value is read. What reading it late gets
     /// wrong grows with it (`held`'s accuracy bar).
     pub round: f64,

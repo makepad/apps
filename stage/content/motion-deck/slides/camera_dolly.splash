@@ -1,0 +1,80 @@
+use mod.motion.*
+use mod.motion.modules.kinetic.*
+use mod.motion.modules.camera2d.*
+use mod.motion.modules.paths
+
+// Transitions & camera 1: one 2D world, one camera. Three stations sit far apart in world
+// units; each beat starts one long eased dolly (dolly_cam, 1.6 s) to the next, and what is
+// there arrives with the calm kinetic kit: glide_text lines, a glide_line route, fade_block
+// cards. The last beat pulls back over the whole world. Between beats the camera only drifts.
+let look = import("shared/motion_deck_look")
+
+let B1 = 3.0
+let B2 = 6.2
+let B3 = 9.4
+let DOLLY = 1.6
+// Station centres in world units.
+let A = vec2(960, 640)
+let B = vec2(3000, 520)
+let C = vec2(2050, 1700)
+let CAMERAS = [
+    {at: B1 camera: {x: B.x y: B.y zoom: 1 rot: 0}},
+    {at: B2 camera: {x: C.x y: C.y zoom: 1 rot: 0}},
+    {at: B3 camera: {x: 2080 y: 1170 zoom: 0.55 rot: 0} dur: 2.2}
+]
+// The route at station B: a calm winding line through five stops, drawn on in 2.4 s.
+let ROUTE = [2380, 640, 2600, 420, 2820, 600, 3040, 380, 3260, 560, 3480, 400, 3620, 520]
+let ROUTE_LENGTHS = paths.lengths(ROUTE)
+let CARDS = [
+    {x: 1620 y: 1520 title: "fade_block" line: "a block arrives as one" at: B2 + 1.2},
+    {x: 2080 y: 1520 title: "glide_text" line: "a line glides 12 px" at: B2 + 1.4},
+    {x: 1620 y: 1760 title: "glide_line" line: "a route draws on" at: B2 + 1.6},
+    {x: 2080 y: 1760 title: "dolly_cam" line: "the camera eases" at: B2 + 1.8}
+]
+
+let station_a = fn(c, t) {
+    glide_text(c, "One world.", A.x - 420, A.y - 40, t, 0.6, {font: look.TITLE px: 120 color: look.BONE dur: 1.4 rise: 16})
+    glide_text(c, "The camera is a value like any other:", A.x - 416, A.y + 50, t, 1.0, {font: look.TEXT px: 34 color: look.ASH dur: 1.4 rise: 12})
+    glide_text(c, "keyed, eased, and never kicked.", A.x - 416, A.y + 100, t, 1.2, {font: look.TEXT px: 34 color: look.ASH dur: 1.4 rise: 12})
+}
+let station_b = fn(c, t) {
+    glide_line(c, ROUTE, t, B1 + 0.8, 2.4, {lengths: ROUTE_LENGTHS color: look.COOL width: 3 alpha: 0.9 head: 4})
+    for i in 0..7 {
+        let k = ease(@ease_in_out_cubic, prog(t, B1 + 0.8 + i * 0.34, B1 + 1.4 + i * 0.34))
+        c.circle(ROUTE[2 * i], ROUTE[2 * i + 1], 9, look.BONE, k)
+    }
+    glide_text(c, "Draw on.", 2380, 840, t, B1 + 0.6, {font: look.TITLE px: 96 color: look.BONE dur: 1.4 rise: 14})
+}
+let station_c = fn(c, t) {
+    for card in CARDS {
+        fade_block(c, t, card.at, {dur: 1.2 rise: 12}, fn(c, alpha) {
+            c.rect(card.x, card.y, 420, 200, look.INK2, 0.9)
+            c.text(card.title, card.x + 28, card.y + 70, {font: look.MONO px: 30 color: look.COOL})
+            c.text(card.line, card.x + 28, card.y + 130, {font: look.TEXT px: 30 color: look.ASH})
+        })
+    }
+}
+
+let draw = fn(c, t, edit) {
+    let ambient = live()
+    look.ground(c, t, ambient)
+    c.save()
+    cam2d_apply(c, dolly_cam(t, CAMERAS, {camera: {x: A.x y: A.y zoom: 1 rot: 0} live: ambient dur: DOLLY drift: 2}))
+    station_a(c, t)
+    station_b(c, t)
+    station_c(c, t)
+    c.restore()
+    look.folio(c, t, "13", "Transitions and camera")
+    look.syntax(c, t, 2.0, "cam2d_apply(c, dolly_cam(t, [{at: 3.0 camera: {x y zoom}}], {dur: 1.6}))")
+}
+
+Motion{
+    label: "One world, one camera"
+    size: vec2(1920, 1080)
+    duration: 12.0
+    fps: 60
+    color: @hdr
+    background: look.INK
+    layers: [Draw2D{name: "world" size: vec2(1920, 1080) draw: draw}]
+    post: look.post_chain(look.POST)
+}

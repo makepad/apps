@@ -91,6 +91,9 @@ pub struct SettingsZone {
 }
 
 pub trait ContourSource {
+    /// A key of what this source cuts: sources with equal keys are cut as one, so a cache may
+    /// give one's contours, or what is made from them, to the other. None when it has none.
+    fn content_key(&self) -> Option<u64> { None }
     /// Object bounds in mm, (min, max).
     fn bounds(&self) -> ([f64; 3], [f64; 3]);
     /// The XY box (min, max) the planner centres the part's patterns on: its infill, seam,

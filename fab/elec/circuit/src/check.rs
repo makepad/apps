@@ -80,6 +80,8 @@ pub enum CheckKind {
     FootprintDrift,
     /// Copper on a layer the board's stackup does not have, such as a track left on a dropped layer.
     MissingLayer,
+    /// A part its circuit fixes to a spot (`e.fixed(part, {at rot})`) standing elsewhere.
+    FixedSpot,
     // mechanical and system (E2.13)
     Mech,
     LinkPinMap,

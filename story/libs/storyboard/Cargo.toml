@@ -1,0 +1,30 @@
+# Storyboards: the 2D board where a person
+# and the AI work out the story of a video before (and while) the edit is
+# made from it. Time runs across, rows (story, visuals, voiceover, music,
+# references) run down; items are text blobs, scene cards and references
+# placed by time. The board is the input, the edit its generated output: a
+# board records which of its revisions and cards produced which parts of
+# the edit, so a changed board updates only what changed.
+#
+# Pure logic: the Splash document (load, source-preserving patches, a
+# canonical writer), the canvas layout math, board diffs, the update plan
+# for an edit built from a board, and the AI control API's storyboard tools.
+[package]
+name = "makepad-story-storyboard"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "makepad_story_storyboard"
+
+[dependencies]
+makepad-splash-syntax = { path = "../../../libs/splash_syntax" }
+makepad-strict-json = { path = "../../../../../libs/strict_json" }
+
+[dev-dependencies]
+# Checks the storyboard tools against the shared registry.
+makepad-studio-api = { path = "../../../../apps/libs/studio_api" }
+# Proves a written board is Splash: it evaluates in the real VM.
+makepad-script = { path = "../../../../../platform/script" }

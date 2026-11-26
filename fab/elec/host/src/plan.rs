@@ -1,10 +1,10 @@
-//! Plans resolved by tool prefixes and route jobs handed to the host.
+//! Plans resolved by tool prefixes, and the jobs (routing, placing) handed to the route worker.
 
 use crate::inbox::Ticket;
 use crate::Docs;
 use fab_elec_core::{BoardId, Diag, NetId};
 use fab_elec_design::{By, Design, Resolved};
-use fab_elec_route::{Base, Effort, Engine, JobId, Method, RouteJob, RouteScope};
+use fab_elec_route::{Base, Effort, Engine, JobId, Method, PlaceJob, RouteJob, RouteRequest, RouteScope};
 use std::collections::HashMap;
 
 /// Resolve against strand-owned state; cost per call is the registered plan function's work.
@@ -15,8 +15,60 @@ pub type Resolver = fn(&Design, Option<&Docs>, &str, &[(String, String)]) -> Res
 pub enum Plan {
     /// Design edits to commit or preview together.
     Edit(Resolved),
+    /// An edit with extra answer fields (key, Splash value text) for its successful commit.
+    Noted { edit: Resolved, notes: Vec<(String, String)> },
     /// A job to hand to the route worker.
+    Job(Job),
+}
+
+/// A job the strand numbers and starts on the unit's committed base, and the route worker runs.
+#[derive(Clone, Debug)]
+pub enum Job {
     Route(RouteJob),
+    /// `elec.place` with `@place`.
+    Place(PlaceJob),
+    Tune(fab_elec_route::request::TuneJob),
+    Pair(fab_elec_route::request::PairJob),
+}
+
+impl Job {
+    pub fn id(&self) -> JobId {
+        match self {
+            Job::Route(job) => job.job,
+            Job::Place(job) => job.job,
+            Job::Tune(job) => job.job,
+            Job::Pair(job) => job.job,
+        }
+    }
+
+    pub fn unit(&self) -> BoardId {
+        match self {
+            Job::Route(job) => job.unit,
+            Job::Place(job) => job.unit,
+            Job::Tune(job) => job.unit,
+            Job::Pair(job) => job.unit,
+        }
+    }
+
+    /// Give the job its number (the strand's job counter).
+    pub fn number(&mut self, id: JobId) {
+        match self {
+            Job::Route(job) => job.job = id,
+            Job::Place(job) => job.job = id,
+            Job::Tune(job) => job.job = id,
+            Job::Pair(job) => job.job = id,
+        }
+    }
+
+    /// The worker's request for it.
+    pub fn request(&self) -> RouteRequest {
+        match self {
+            Job::Route(job) => RouteRequest::Route(job.clone()),
+            Job::Place(job) => RouteRequest::Place(job.clone()),
+            Job::Tune(job) => RouteRequest::Tune(job.clone()),
+            Job::Pair(job) => RouteRequest::Pair(job.clone()),
+        }
+    }
 }
 
 /// A route job the strand resolved, with the exact committed base it runs on (no zone of
@@ -29,8 +81,8 @@ pub struct RouteStart {
     pub ticket: Ticket,
     /// The author supplied by the calling code path.
     pub by: By,
-    /// The routing work to start.
-    pub job: RouteJob,
+    /// The work to start.
+    pub job: Job,
     /// The exact committed board state the job runs on.
     pub base: Base,
 }
@@ -79,19 +131,19 @@ pub fn route_plan(design: &Design, _docs: Option<&Docs>, tool: &str, args: &[(St
         "organic" => Method::Organic,
         value => return Err(Diag::error(format!("unknown route method `{value}`"), vec![])),
     };
-    let effort = match args.get("effort") {
-        Some(value) => Effort(value.replace('_', "").parse::<u32>()
-            .map_err(|_| Diag::error(format!("invalid effort `{value}`: expected a u32"), vec![]))?),
-        None => Effort::default(),
+    let effort = match args.get("effort").map(|e| e.strip_prefix('@').unwrap_or(e)).unwrap_or("full") {
+        "full" => Effort::Full,
+        "fast" => Effort::Fast,
+        value => return Err(Diag::error(format!("unknown route effort `{value}`: full or fast"), vec![])),
     };
     let reroute = match args.get("reroute").copied() {
         None | Some("false") => false,
         Some("true") => true,
         Some(value) => return Err(Diag::error(format!("invalid reroute `{value}`: expected true or false"), vec![])),
     };
-    Ok(Plan::Route(RouteJob {
+    Ok(Plan::Job(Job::Route(RouteJob {
         job: JobId(0), unit: unit.id, scope, method, engine: Engine::Auto, style: None, effort, layers: None, reroute,
-    }))
+    })))
 }
 
 fn scope_names<T: Copy>(names: &str, ids: &HashMap<&str, T>, kind: &str) -> Result<Vec<T>, Diag> {
@@ -116,7 +168,7 @@ mod tests {
     use fab_elec_fixtures::ledctl;
 
     fn route(design: &Design, args: Vec<(String, String)>) -> RouteJob {
-        let Plan::Route(job) = route_plan(design, None, "elec.route", &args).expect("valid route arguments resolve") else {
+        let Plan::Job(Job::Route(job)) = route_plan(design, None, "elec.route", &args).expect("valid route arguments resolve") else {
             panic!("a route tool resolves to a route job");
         };
         job
@@ -145,8 +197,8 @@ mod tests {
         let part = &unit.circuit.comps[0];
         assert_eq!(route(&design, vec![("parts".into(), part.refdes.clone())]).scope, RouteScope::Parts(vec![part.id]),
             "a refdes becomes its circuit part");
-        let job = route(&design, vec![("method".into(), "organic".into()), ("effort".into(), "3".into())]);
-        assert_eq!((job.method, job.effort), (Method::Organic, Effort(3)), "method and effort are typed");
+        let job = route(&design, vec![("method".into(), "organic".into()), ("effort".into(), "fast".into())]);
+        assert_eq!((job.method, job.effort), (Method::Organic, Effort::Fast), "method and effort are typed");
         assert!(route(&design, vec![("reroute".into(), "true".into())]).reroute, "a re-route is asked by name");
 
         let refused = |tool: &str, args: &[(&str, &str)]| {

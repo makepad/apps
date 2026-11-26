@@ -1,0 +1,150 @@
+use mod.motion.*
+// A song's timing as data, and the lookups a lyric film keys on: beats, bars, sections, drum hits, sung lines and words.
+//
+// `s` is the song's timing data (generate it from the song's analysis, e.g. a data module
+// `{beats downbeats sections onsets lines}`; times in song seconds):
+//   beats: [t, …]  downbeats: [t, …]  sections: [{name start end}, …]
+//   onsets: {kick: [{time strength}, …] snare: … hat: … vocal: …}
+//   lines: [{words: [{w start end syl: [{start end}, …] (only over several syllables)}, …]}, …]
+// A line is only its words: line_text, line_start and line_end derive the rest.
+// A plate placed at song second S0 asks at T = t + S0.
+//
+//   use mod.motion.modules.song.*
+//   let S = import(asset("<song data id>", "<rev>"))
+//   let hook = song_line(S, "stitch", 0)                         // the first line containing "stitch"
+//   scale: fn(t) { 1.0 + 0.1 * song_hit(S, "kick", t + S0, 0.12) }
+//   x: fn(t) { 40.0 * song_word_progress(hook.words[2], t + S0) }
+
+// A line's text: its words (as sung, punctuation and quotes too) joined by spaces.
+let line_text = fn(l) {
+    var text = ""
+    for i in 0..l.words.len() {
+        if i > 0 { text = text + " " }
+        text = text + l.words[i].w
+    }
+    return text
+}
+// When a line starts and ends: its first word's start, its last word's end.
+let line_start = fn(l) { return l.words[0].start }
+let line_end = fn(l) { return l.words[l.words.len() - 1].end }
+
+// The continuous beat index at t (0 on the first beat, fractional between, extrapolated outside).
+let song_beat = fn(s, t) {
+    let b = s.beats
+    let n = b.len()
+    if t <= b[0] { return (t - b[0]) / (b[1] - b[0]) }
+    if t >= b[n - 1] { return n - 1 + (t - b[n - 1]) / (b[n - 1] - b[n - 2]) }
+    var lo = 0
+    var hi = n - 1
+    while hi - lo > 1 {
+        let m = floor((lo + hi) / 2)
+        if b[m] <= t { lo = m } else { hi = m }
+    }
+    return lo + (t - b[lo]) / (b[hi] - b[lo])
+}
+// The time of a (fractional) beat index; `song_time_of_beat(S, floor(song_beat(S, t)))` is the last beat.
+let song_time_of_beat = fn(s, i) {
+    let b = s.beats
+    let n = b.len()
+    let period = (b[n - 1] - b[0]) / (n - 1)
+    if i <= 0 { return b[0] + i * period }
+    if i >= n - 1 { return b[n - 1] + (i - (n - 1)) * period }
+    let k = floor(i)
+    return b[k] + (b[k + 1] - b[k]) * (i - k)
+}
+// The time of the beat nearest to t (land a move on the beat a timing falls closest to).
+let song_nearest_beat = fn(s, t) { return song_time_of_beat(s, floor(song_beat(s, t) + 0.5)) }
+// The continuous bar index at t, from the downbeats.
+let song_bar = fn(s, t) {
+    let d = s.downbeats
+    let n = d.len()
+    if t <= d[0] { return (t - d[0]) / (d[1] - d[0]) }
+    if t >= d[n - 1] { return n - 1 + (t - d[n - 1]) / (d[n - 1] - d[n - 2]) }
+    var lo = 0
+    var hi = n - 1
+    while hi - lo > 1 {
+        let m = floor((lo + hi) / 2)
+        if d[m] <= t { lo = m } else { hi = m }
+    }
+    return lo + (t - d[lo]) / (d[hi] - d[lo])
+}
+// The section playing at t ({name start end}), or nil.
+let song_section = fn(s, t) {
+    for x in s.sections { if t >= x.start && t < x.end { return x } }
+    return nil
+}
+// A drum hit's decaying pulse at t: the strongest of the last six onsets of `kind` ("kick", "snare",
+// "hat", "vocal"), each strength halving every `half_life` s (0.06..0.15). 0..1.
+let song_hit = fn(s, kind, t, half_life) {
+    let list = s.onsets[kind]
+    var lo = 0
+    var hi = list.len()
+    while lo < hi {
+        let m = floor((lo + hi) / 2)
+        if list[m].time <= t { lo = m + 1 } else { hi = m }
+    }
+    var v = 0.0
+    var i = lo - 1
+    while i >= 0 && i >= lo - 6 {
+        let dt = t - list[i].time
+        if dt > half_life * 8.0 { break }
+        v = max(v, list[i].strength * pow(0.5, dt / half_life))
+        i = i - 1
+    }
+    return v
+}
+// The `nth` line (from 0) whose text contains `text` (as written, case and quotes too), or nil.
+let song_line = fn(s, text, nth) {
+    var k = 0
+    for l in s.lines {
+        if line_text(l).search(text) >= 0 {
+            if k == nth { return l }
+            k = k + 1
+        }
+    }
+    return nil
+}
+// The word `word` (as written, punctuation too) of the first line containing `line`: {w start end
+// syl}, or nil. `song_word(S, "A red thread", "thread").start` is when "thread" is sung.
+let song_word = fn(s, line, word) {
+    let l = song_line(s, line, 0)
+    if l == nil { return nil }
+    for w in l.words { if w.w == word { return w } }
+    return nil
+}
+// The line being sung at t, or nil in a gap.
+let song_line_at = fn(s, t) {
+    for l in s.lines { if t >= line_start(l) && t < line_end(l) { return l } }
+    return nil
+}
+// How far a word is sung at t: 0 before, 1 after, linear inside, or piecewise over its syllables.
+let song_word_progress = fn(w, t) {
+    if t <= w.start { return 0.0 }
+    if t >= w.end { return 1.0 }
+    let syl = w.syl ?? []
+    let n = syl.len()
+    if n > 1 {
+        for i in 0..n {
+            let a = syl[i].start
+            let b = syl[i].end
+            if t < a { return i / n }
+            if t < b { return (i + (t - a) / max(0.001, b - a)) / n }
+        }
+        return 1.0
+    }
+    return (t - w.start) / max(0.001, w.end - w.start)
+}
+// How many characters of a line are sung at t (0..its length), for per-glyph wipes.
+let song_line_chars = fn(l, t) {
+    var chars = 0.0
+    for w in l.words {
+        let p = song_word_progress(w, t)
+        chars = chars + p * w.w.len()
+        if p < 1.0 { break }
+        chars = chars + 1.0
+    }
+    return min(chars, line_text(l).len())
+}
+
+{line_text: line_text line_start: line_start line_end: line_end song_beat: song_beat song_time_of_beat: song_time_of_beat song_nearest_beat: song_nearest_beat song_bar: song_bar song_section: song_section song_hit: song_hit
+    song_line: song_line song_word: song_word song_line_at: song_line_at song_word_progress: song_word_progress song_line_chars: song_line_chars}

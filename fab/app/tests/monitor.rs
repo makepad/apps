@@ -348,7 +348,8 @@ fn saved_job(home: &Path, name: &str, layers: u32, saved: fab::print::jobs::Save
     let meta = jobs::JobMeta {
         id: jobs::JobMeta::new_id(name, created), name: name.into(), created, planned: 40.0 * 60.0, layers,
         colours: vec![[0.8, 0.4, 0.2, 1.0]], used: vec![0], trays: vec![None], head_offset_x: 26.0, head_lift: 2.0, dual: true,
-        accepted: accepted.to_vec(), ..Default::default()
+        // Saved before jobs named their printer: the model, name and layers find it again.
+        printer_model: simulated_profiles::model(), accepted: accepted.to_vec(), ..Default::default()
     };
     jobs::commit(&home.join(".makepad/fab/jobs"), &meta, &saved, &package, &Default::default()).unwrap();
 }

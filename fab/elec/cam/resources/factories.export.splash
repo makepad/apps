@@ -1,0 +1,37 @@
+profile("standard 2-layer", {
+    layers: [1 2]
+    track: 0.15mm  clearance: 0.15mm  drill: 0.3mm  annular: 0.13mm
+    via_in_pad: false
+    board_min: [5mm 5mm]  board_max: [400mm 500mm]
+    thickness: [0.8mm 1.0mm 1.6mm]  thickness_tol_percent: 5
+})
+
+profile("JLCPCB 2-layer", {
+    tier: "standard"
+    format: "JLCPCB 2-layer"
+    layers: [1 2]
+    track: 0.15mm  clearance: 0.15mm  drill: 0.3mm  annular: 0.13mm
+    via_in_pad: false
+    board_min: [5mm 5mm]  board_max: [400mm 500mm]
+    thickness: [0.8mm 1.0mm 1.6mm]  thickness_tol_percent: 5
+})
+
+// Common generic capabilities, independent of any particular board house.
+
+profile("advanced 4-layer", {
+    tier: "advanced"
+    layers: [4 6]
+    track: 0.1mm  clearance: 0.1mm  drill: 0.2mm  annular: 0.1mm
+    via_in_pad: true
+    board_min: [5mm 5mm]  board_max: [400mm 500mm]
+    thickness: [0.8mm 1.0mm 1.6mm]  thickness_tol_percent: 5
+})
+
+profile("HDI 6-layer", {
+    tier: "HDI"
+    layers: [6 8 10]
+    track: 0.075mm  clearance: 0.075mm  drill: 0.1mm  annular: 0.075mm
+    via_in_pad: true
+    board_min: [5mm 5mm]  board_max: [400mm 500mm]
+    thickness: [0.8mm 1.0mm 1.6mm]  thickness_tol_percent: 5
+})

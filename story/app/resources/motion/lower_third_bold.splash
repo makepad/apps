@@ -1,0 +1,33 @@
+use mod.motion.*
+// BOLD LOWER THIRD — two plates that hug their text: the name in heavy
+// condensed caps on the accent, the role on an ink plate tucked under it.
+// Each plate wipes open from the left and its text punches in from 110%
+// right behind the wipe. Out: plates wipe shut in reverse order, fast.
+// Transparent overlay.
+// Why: plates sized by the text never crop a long name or float around a
+// short one; the 0.25 s offset between plates reads as a one-two beat.
+Motion{
+    label: "Bold lower third"
+    brief: "Name on an accent plate and role on a dark plate, both hugging their text and wiping open."
+    tags: ["lower-third", "bold", "name", "overlay", "sport"]
+    duration: 6.0
+    inputs: {
+        name: input(@text, "ADA MORENO", "Name, set in caps")
+        role: input(@text, "HEAD OF PRODUCT", "Role, set in caps")
+        accent: input(@color, #ff5c39, "Name plate")
+        ink: input(@color, #0b0d12, "Name colour")
+        plate: input(@color, #0b0d12, "Role plate")
+    }
+    layers: [
+        Text{text: in(@name) font: Font{family: "Roboto Flex" weight: 900} size: 84 wdth: 30 color: in(@ink) at: vec2(184, 796)
+             plate: in(@accent) plate_pad: vec2(24, 6) plate_radius: 2
+             plate_reveal: keys([0.0, 0], [0.45, 1, @ease_in_out_expo], [5.4, 1], [5.75, 0, @ease_in_expo])
+             opacity: keys([0.2, 0], [0.3, 1], [5.35, 1], [5.45, 0])
+             anchor: vec2(0, 0.5) scale: tween(1.1, 1.0, 0.2, 0.6, @ease_out_expo)}
+        Text{text: in(@role) font: Font{family: "Inter" weight: 700} size: 30 tracking: 0.16 color: #f4f7fa at: vec2(184, 920)
+             plate: in(@plate) plate_pad: vec2(24, 12) plate_radius: 2
+             plate_reveal: keys([0.25, 0], [0.7, 1, @ease_in_out_expo], [5.25, 1], [5.6, 0, @ease_in_expo])
+             opacity: keys([0.45, 0], [0.6, 1], [5.2, 1], [5.3, 0])
+             x: tween(-20, 0, 0.45, 0.9, @ease_out_expo)}
+    ]
+}

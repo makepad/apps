@@ -1,0 +1,12 @@
+use mod.scene.*; use mod.post
+// Path-built instancing: 300 paperclips (a wire bent along PaperclipCurve,
+// instanced) tumbling in, and a three-strand braided tube drawing on.
+Scene3D{ background: #0c0d10 tone_mapping: @aces
+  camera: Camera{position: vec3(0, 0.4, 8) target: vec3(0, 0, 0) fov: 38}
+  environment: Environment{preset: @studio}
+  post: [post.Bloom{strength: 0.2 threshold: 2}]
+  lights: [LightRig{preset: @product}]
+  children: [
+    Fx{preset: @paperclips position: vec3(-1.8, 0, 0) count: 300 radius: 2.2 size: 0.04 duration: 2 color: #c8ccd4}
+    Fx{preset: @braid position: vec3(2.3, 0, 0) count: 3 radius: 2.2 size: 0.05 duration: 3 color: #ff5a1f color2: #2a44c8}
+  ] }

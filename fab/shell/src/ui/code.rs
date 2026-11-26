@@ -208,6 +208,8 @@ pub const SETTINGS_KIND: &str = "print settings";
 pub struct FeatureRow {
     pub id: String,
     pub op: String,
+    /// The builder verb or group kind shown and spoken for this row.
+    pub verb: String,
     /// The object it makes or changes ("" if none).
     pub object: String,
     /// The solid's host key, empty when it has none.
@@ -241,7 +243,7 @@ pub struct FeatureRow {
 impl FeatureRow {
     /// A test print's row: a feature of its model in the tree, with no code of its own, so no eye.
     pub fn test_print(name: &str, object: &str) -> FeatureRow {
-        FeatureRow { id: format!("{TEST_PRINT_ID}{name}"), op: TEST_PRINT_KIND.to_string(), object: object.to_string(), detail: TEST_PRINT.to_string(), ..Default::default() }
+        FeatureRow { id: format!("{TEST_PRINT_ID}{name}"), op: TEST_PRINT_KIND.to_string(), verb: TEST_PRINT_KIND.to_string(), object: object.to_string(), detail: TEST_PRINT.to_string(), ..Default::default() }
     }
 
     /// What the tree calls it.
@@ -1168,10 +1170,10 @@ impl Widget for FabFeatureTree {
             self.draw_op.color = dim_color;
             if f.off { self.draw_op.color.w *= 0.4; }
             // the kind column is as wide as the kind's own text, capped at 74 and 0.4 of the row
-            let kind_w = self.draw_op.prepare_single_line_run(cx, &f.op).map_or(74.0, |run| run.width_in_lpxs as f64 + 1.0);
+            let kind_w = self.draw_op.prepare_single_line_run(cx, &f.verb).map_or(74.0, |run| run.width_in_lpxs as f64 + 1.0);
             let op_w = kind_w.min(74.0).min((text_end - x - 26.0).max(0.0) * 0.4);
             cx.begin_turtle(Walk::abs_rect(Rect { pos: dvec2(x + 26.0, r.pos.y), size: dvec2(op_w, r.size.y) }), Layout::default().with_clip(true, true));
-            self.draw_op.draw_abs(cx, dvec2(x + 26.0, r.pos.y + 6.0), &f.op);
+            self.draw_op.draw_abs(cx, dvec2(x + 26.0, r.pos.y + 6.0), &f.verb);
             cx.end_turtle();
             let name = f.study.as_ref().map_or_else(|| f.name().to_string(), |s| s.on.clone());
             // a gap after the clipped kind, so a long one never runs into the name
@@ -1200,7 +1202,7 @@ impl Widget for FabFeatureTree {
                 self.draw_row.ring = vec4(0.0, 0.0, 0.0, 0.0);
                 self.draw_row.draw_abs(cx, Rect { pos: dvec2(x, if *after { r.pos.y + ROW - 2.0 } else { r.pos.y - 2.0 }), size: dvec2((r.pos.x + r.size.x - x).max(0.0), 2.0) });
             }
-            self.rows.push(FeatureHit { rect: r, name: name_rect, fold, eye, link, key: f.link.clone(), label: format!("{role} {} {} level {}{}{}{}", f.op, f.name(), f.depth + 1, if f.off { " bypassed" } else { "" }, if f.link.is_empty() { "" } else { " linked" }, mark.as_ref().map(|what| format!(", {what}")).unwrap_or_default()), id: f.id.clone(), parent: f.parent.clone(), editable: f.editable, bypass: f.editable && !f.root && f.op != "call" && !settings, off: f.off });
+            self.rows.push(FeatureHit { rect: r, name: name_rect, fold, eye, link, key: f.link.clone(), label: format!("{role} {} {} level {}{}{}{}", f.verb, f.name(), f.depth + 1, if f.off { " bypassed" } else { "" }, if f.link.is_empty() { "" } else { " linked" }, mark.as_ref().map(|what| format!(", {what}")).unwrap_or_default()), id: f.id.clone(), parent: f.parent.clone(), editable: f.editable, bypass: f.editable && !f.root && f.op != "call" && !settings, off: f.off });
         }
         self.draw_name.color = name_color;
         self.draw_op.color = dim_color;

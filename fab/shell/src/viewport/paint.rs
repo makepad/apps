@@ -22,11 +22,48 @@ use makepad_widgets_core::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 
+/// A live dab or fill belongs to a print colour even when several have the same visible RGB.
+#[derive(Clone, Copy)]
+pub struct LiveSwatch {
+    slot: Option<usize>,
+    rgb: [f32; 3],
+}
+
+impl LiveSwatch {
+    pub fn new(part: &crate::api::PlatePart, target: PaintTarget, name: Option<&str>, rgb: [f32; 3]) -> Self {
+        let slot = match target {
+            PaintTarget::Color => name.and_then(|n| part.paint.as_ref()?.colors.iter().enumerate().skip(1)
+                .find(|(_, c)| c.color.as_deref() == Some(n)).map(|(i, _)| i)),
+            _ => Some(1),
+        };
+        Self { slot, rgb }
+    }
+
+    /// Use the same byte-sized slots as the paint program. A new colour gets the next slot
+    /// even if its RGB currently matches another region. The program folds excess slots into
+    /// its last representable slot, whose baked colour the preview then shares.
+    fn sync_palette(self, base: &[[f32; 3]], cached: &mut Vec<[f32; 3]>) -> (u8, bool) {
+        let index = self.slot.unwrap_or(base.len()).min(base.len());
+        let slot = index.min(usize::from(u8::MAX));
+        let len = base.len().max(slot + 1);
+        let mut changed = cached.len() != len;
+        cached.resize(len, self.rgb);
+        for (i, c) in cached.iter_mut().enumerate() {
+            let rgb = if i == slot && slot == index { self.rgb } else { base[i] };
+            if *c != rgb {
+                *c = rgb;
+                changed = true;
+            }
+        }
+        (slot as u8, changed)
+    }
+}
+
 /// What is being painted now, for [`PaintLayer::set_live`]: a stroke being drawn (printer mm
 /// points, radius mm), or what a fill click would paint (regions in the part's model frame).
 pub enum LivePaint<'a> {
-    Stroke { object: &'a str, points: &'a [[f64; 3]], radius: f64, rgb: [f32; 3], erase: bool },
-    Fill { object: &'a str, regions: Vec<Region>, names: Vec<String>, rgb: [f32; 3] },
+    Stroke { object: &'a str, points: &'a [[f64; 3]], radius: f64, swatch: LiveSwatch, erase: bool },
+    Fill { object: &'a str, regions: Vec<Region>, names: Vec<String>, swatch: LiveSwatch },
 }
 
 impl LivePaint<'_> {
@@ -35,9 +72,9 @@ impl LivePaint<'_> {
             LivePaint::Stroke { object, .. } | LivePaint::Fill { object, .. } => object,
         }
     }
-    fn rgb(&self) -> [f32; 3] {
+    fn swatch(&self) -> LiveSwatch {
         match self {
-            LivePaint::Stroke { rgb, .. } | LivePaint::Fill { rgb, .. } => *rgb,
+            LivePaint::Stroke { swatch, .. } | LivePaint::Fill { swatch, .. } => *swatch,
         }
     }
 }
@@ -56,6 +93,34 @@ struct Live {
     palette: Vec<[f32; 3]>,
     vol: Volume,
     stroke: Option<(Program, String)>,
+}
+
+/// Bind the new dab to its program slot without redirecting any earlier stroke of the same RGB.
+fn live_stroke_op(program: &mut Program, slot: u8, rgb: [f32; 3], erase: bool) -> (String, StrokeOp) {
+    let swatch = StrokeSwatch { rgb, filament: None };
+    if let Some((file, strokes, slots)) = program.layers.iter_mut().find_map(|layer| match &mut layer.region {
+        Region::Strokes { file, strokes, slots } => Some((file, strokes, slots)),
+        _ => None,
+    }) {
+        if erase { return (file.clone(), StrokeOp::Erase); }
+        if let Some(i) = slots.iter().position(|&s| s == slot).and_then(|i| u8::try_from(i).ok()) {
+            return (file.clone(), StrokeOp::Paint { slot: i });
+        }
+        if let Ok(i) = u8::try_from(strokes.palette.len()) {
+            Arc::make_mut(strokes).palette.push(swatch);
+            let slots = Arc::make_mut(slots);
+            slots.resize(usize::from(i) + 1, 0);
+            slots[usize::from(i)] = slot;
+            return (file.clone(), StrokeOp::Paint { slot: i });
+        }
+    }
+    // The first stroke, or a full file with no binding for this colour, gets its own preview log.
+    let mut file = "live.strokes".to_string();
+    while program.strokes_files().any(|(name, _)| name == file) { file.push('~'); }
+    let mut log = Strokes::new();
+    let op = if erase { StrokeOp::Erase } else { StrokeOp::Paint { slot: log.slot_for(swatch) } };
+    *program = program.with_strokes_on_top(&file, Arc::new(log), Arc::new(vec![slot]));
+    (file, op)
 }
 
 /// A field part's shape as a bake reads its surface: its key, and its frame into the paint
@@ -582,12 +647,15 @@ impl PaintLayer {
                 }
                 continue;
             };
-            let (slot, palette) = self.slot_for(&self.parts[k].object, l.rgb());
             let v = &mut self.parts[k];
             let Some((base, of)) = v.vol.as_ref() else { continue };
             let (base, of, f) = (base.clone(), of.clone(), v.view.from_printer);
+            let mut fresh_palette = Vec::new();
+            let palette = v.live.as_mut().map_or(&mut fresh_palette, |live| &mut live.palette);
+            let (slot, recoloured) = l.swatch().sync_palette(&v.view.colors, palette);
+            changed |= recoloured;
             match l {
-                LivePaint::Stroke { points, radius, erase, rgb, .. } => {
+                LivePaint::Stroke { points, radius, erase, swatch, .. } => {
                     let model: Vec<[f64; 3]> = points.iter().map(|p| std::array::from_fn(|r| f[r][0] * p[0] + f[r][1] * p[1] + f[r][2] * p[2] + f[r][3])).collect();
                     let scale = (0..3).map(|k| f[k][0] * f[k][0]).sum::<f64>().sqrt();
                     let r = radius * scale;
@@ -609,26 +677,11 @@ impl PaintLayer {
                             (Arc::make_mut(log).extend(&model[n..]), live)
                         }
                         None => {
-                            // the part's strokes file (a part's first stroke: one on top)
                             let mut program = (*of).clone();
-                            let found = program.strokes_files().next().map(|(file, _)| file.to_string());
-                            let file = match found {
-                                Some(file) => file,
-                                None => {
-                                    let file = "live.strokes".to_string();
-                                    program = program.with_strokes_on_top(&file, Arc::new(Strokes::new()), Arc::new(Vec::new()));
-                                    file
-                                }
-                            };
-                            let log = Arc::make_mut(program.strokes_mut(&file).expect("the strokes layer"));
-                            let op = if *erase { StrokeOp::Erase } else { StrokeOp::Paint { slot: log.slot_for(StrokeSwatch { rgb: *rgb, filament: None }) } };
-                            let swatches = log.palette.len();
+                            let (file, op) = live_stroke_op(&mut program, slot, swatch.rgb, *erase);
+                            let log = Arc::make_mut(program.strokes_mut(&file).expect("the live strokes layer"));
                             let boxes = log.push(op, r, 1.0, &model);
-                            if let StrokeOp::Paint { slot: file_slot } = op {
-                                let slots = Arc::make_mut(program.strokes_slots_mut(&file).expect("the strokes layer"));
-                                slots.resize(swatches, 0);
-                                slots[file_slot as usize] = slot;
-                            }
+                            let palette = v.live.take().map_or(fresh_palette, |live| live.palette);
                             (boxes, Live { key: key.clone(), palette, vol: (*base).clone(), stroke: Some((program, file)) })
                         }
                     };
@@ -671,6 +724,7 @@ impl PaintLayer {
                         vol = (*base).clone();
                         vol.rebake(&program, Channel::Color, whole, &live_fan);
                     }
+                    let palette = v.live.take().map_or(fresh_palette, |live| live.palette);
                     v.live = Some(Live { key, palette, vol, stroke: None });
                     changed = true;
                 }
@@ -1018,6 +1072,81 @@ mod tests {
         let h = header(&pack);
         let drawn = rows(&mul(&from, &PRINTER_FROM_RENDER)).concat();
         assert_eq!(pack.data[h + 12..h + 24], drawn[..], "the paint is drawn where the part now stands");
+    }
+
+    #[test]
+    fn a_colour_switch_reuses_the_live_stroke_and_fill_geometry() {
+        use crate::api::PlatePart;
+        use fab_plate::ColourMode::{Material, Model};
+        let cx = Cx::new(Box::new(|_, _| {}));
+        let mut state = AppState::default();
+        let blue = [0.0, 0.0, 1.0];
+        let green = [0.0, 1.0, 0.0];
+        let red = fab_plate::UNMAPPED_RGB;
+        let named = |name: &str, rgb| fab_plate::paint::PaintColor { color: Some(name.into()), rgb, filament: None, nozzle: None };
+        let from_printer = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
+        let mut strokes = Strokes::new();
+        let local = strokes.slot_for(StrokeSwatch { rgb: blue, filament: None });
+        strokes.push(StrokeOp::Paint { slot: local }, 0.5, 1.0, &[[-0.5; 3]]);
+        let program = Program::default().with_strokes_on_top("part.strokes", Arc::new(strokes), Arc::new(vec![1]));
+        state.plate.parts.push(PlatePart {
+            object: "part".into(), min_mm: [-1.0; 3], max_mm: [1.0; 3], model_from_printer: from_printer,
+            paint: Some(Arc::new(fab_plate::paint::PartPaint {
+                colors: vec![named("Body", blue), named("Ground", green), named("Stripe", blue)], tri: vec![],
+            })),
+            paint_view: Some(PaintView {
+                program: Arc::new(program),
+                colors: vec![blue, green, blue], from_printer, key: 1,
+            }),
+            ..Default::default()
+        });
+        let mut layer = PaintLayer::default();
+        layer.sync(&cx, &state);
+        finish(&mut layer, &cx, &state);
+
+        // Two existing slots become the same red. A new print colour can also match those slots.
+        for (brush, name, slot) in [(true, "Stripe", 2), (false, "New", 3)] {
+            let draw = |layer: &mut PaintLayer, state: &AppState| {
+                let rgb = if state.view.colours == Model { blue } else { red };
+                let swatch = LiveSwatch::new(&state.plate.parts[0], PaintTarget::Color, Some(name), rgb);
+                let live = if brush {
+                    LivePaint::Stroke { object: "part", points: &[[0.0; 3]], radius: 0.5, swatch, erase: false }
+                } else {
+                    LivePaint::Fill { object: "part", regions: vec![Region::All], names: vec![String::new()], swatch }
+                };
+                layer.set_live(state, Some(live));
+            };
+            state.view.colours = Model;
+            draw(&mut layer, &state);
+            let live = layer.parts[0].live.as_ref().unwrap();
+            let key = live.key.clone();
+            let bricks = live.vol.index.as_ptr();
+            let palette = live.palette.as_ptr();
+            if let Some((program, _)) = &live.stroke {
+                let Region::Strokes { slots, .. } = &program.layers[0].region else { panic!("missing strokes") };
+                assert_eq!(slots[0], 1, "an earlier dab sharing the authored RGB kept its own print colour");
+            }
+            assert_eq!(live.palette[slot], blue);
+            for mode in [Material, Model] {
+                state.view.colours = mode;
+                let base = if mode == Model { [blue, green, blue] } else { [red; 3] };
+                state.plate.parts[0].paint_view.as_mut().unwrap().colors.copy_from_slice(&base);
+                assert!(!layer.sync(&cx, &state));
+                let revision = layer.revision();
+                draw(&mut layer, &state);
+                let live = layer.parts[0].live.as_ref().unwrap();
+                assert!(live.key == key, "{name}: the geometry key changed");
+                assert_eq!(live.vol.index.as_ptr(), bricks, "{name}: the live volume was replaced");
+                assert_eq!(live.palette.as_ptr(), palette, "{name}: the palette buffer was replaced");
+                assert_eq!(live.palette[slot], base[2], "{name}: the active paint colour");
+                assert_eq!(live.palette[1], base[1], "{name}: the underlying paint colour");
+                assert!(layer.revision() > revision, "{name}: the new palette must reach the atlas");
+                let revision = layer.revision();
+                draw(&mut layer, &state);
+                assert_eq!(layer.revision(), revision, "{name}: an unchanged frame repacked the atlas");
+            }
+            layer.set_live(&state, None);
+        }
     }
 
     /// Hold the resize job before its bricks run, then land a stroke across the old extent.

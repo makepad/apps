@@ -4,7 +4,7 @@
 //! A board commit applies its ops to the model (the validator: edit rules refuse there), then
 //! splices them into the board document and follows the source map. Undo and redo apply the
 //! logged text step and follow it, so the map's ledger and therefore the item ids return exactly.
-//! System ops stay model-only until the host lowers `.sys.splash` (gap G1); circuit and bench
+//! Factory choices splice into the board header. Other system ops stay model-only until the host lowers `.sys.splash` (gap G1); circuit and bench
 //! ops are spliced and verified on the pool before adoption.
 //!
 //! Cost per board commit: one parse of the edited board document and one pass over the map
@@ -157,6 +157,12 @@ impl Docs {
         Arc::new(self.sources.docs().iter()
             .filter(|d| !(d.kind == DocKind::System && d.text.is_empty()))
             .map(|d| (d.name.clone(), d.text.clone())).collect())
+    }
+
+    /// The unit's board document at its last evaluation, including one since removed.
+    pub(crate) fn board_document(&self, unit: BoardId) -> Option<&fab_elec_lang::Doc> {
+        let id = self.units.iter().find(|u| u.id == unit)?.docs.get(1)?;
+        self.sources.all_docs().get(id.ix()).filter(|d| d.kind == DocKind::Board)
     }
 
     pub fn epoch(&self, unit: BoardId) -> u64 {

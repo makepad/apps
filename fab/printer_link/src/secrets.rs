@@ -81,18 +81,25 @@ pub(crate) fn directory() -> Option<PathBuf> {
 
 /// Lists names only. Call on an existing startup worker; never reads credentials.
 pub fn first_config_name() -> Option<String> {
-    let mut names: Vec<_> = std::fs::read_dir(directory()?).ok()?.filter_map(Result::ok).filter_map(|entry| {
+    config_names().into_iter().next()
+}
+
+/// The names offered by the picker, sorted without opening any configuration.
+pub fn config_names() -> Vec<String> {
+    let Some(entries) = directory().and_then(|dir| std::fs::read_dir(dir).ok()) else { return Vec::new() };
+    let mut names: Vec<_> = entries.filter_map(Result::ok).filter_map(|entry| {
         let path = entry.path();
         if path.extension()?.to_str()? != "conf" { return None; }
         let name = path.file_stem()?.to_str()?;
         valid_name(name).then(|| name.to_string())
     }).collect();
     names.sort();
-    names.into_iter().next()
+    names
 }
 
 impl PrinterConfig {
     pub fn load(name: &str) -> Result<Self, &'static str> {
+        crate::entries::CONFIG_LOAD.enter();
         if !valid_name(name) { return Err("invalid printer configuration name"); }
         Self::load_file(&directory().ok_or("home directory unavailable")?.join(format!("{name}.conf")))
     }
@@ -100,6 +107,7 @@ impl PrinterConfig {
     /// Permissions are checked on the opened file, before reading any bytes. Where they cannot be
     /// checked, no configuration loads: the file holds the printer's access secret.
     pub fn load_file(path: &Path) -> Result<Self, &'static str> {
+        crate::entries::CONFIG_LOAD_FILE.enter();
         #[cfg(not(target_arch = "wasm32"))]
         {
             let buffer = read_private(path)?;
@@ -115,6 +123,7 @@ impl PrinterConfig {
     /// A configuration's entries, the same on every platform that can read one privately.
     #[cfg(not(target_arch = "wasm32"))]
     fn parse(bytes: &[u8]) -> Result<Self, &'static str> {
+        crate::entries::CREDENTIAL.enter();
         let text = std::str::from_utf8(bytes).map_err(|_| "invalid printer configuration encoding")?;
         let (mut host, mut serial, mut model, mut access_code, mut port, mut api_key) = (None, None, None, None, None, None);
         for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
@@ -136,6 +145,7 @@ impl PrinterConfig {
         let model = model.filter(|s| !s.is_empty()).ok_or("missing printer model")?;
         use makepad_fab_settings::family::{of_reported, Link, UNKNOWN_PRINTER};
         let (serial, access) = match of_reported(model).ok_or(UNKNOWN_PRINTER)?.link {
+            Link::Virtual => return Err("a virtual printer needs no configuration file"),
             Link::Mqtt => {
                 if port.is_some() || api_key.is_some() { return Err("unknown printer configuration entry"); }
                 let serial = match serial {

@@ -1,0 +1,32 @@
+use mod.motion.*
+// Click ripples in sync with the run's real presses: a ring expands and
+// fades from every press point, the previous press finishing under the
+// latest.
+let r = run()
+let ring = fn(t, n) {
+    let c = r.click(t, {n: n dur: in(@duration)})
+    let d = in(@size) * (0.25 + 0.75 * c.progress)
+    return {at: [c.at[0] - d * 0.5, c.at[1] - d * 0.5] size: [d, d] opacity: c.presence * (1 - c.progress)}
+}
+let dot = fn(t) {
+    let c = r.click(t, {dur: 0.25})
+    return {at: [c.at[0] - 18, c.at[1] - 18] opacity: c.presence * (1 - c.progress)}
+}
+Motion{
+    label: "Click ripples (from the run)"
+    size: vec2(1080, 1920)
+    duration: 3600.0
+    inputs: {
+        color: input(@color, #ffffff, "Ring colour")
+        size: input(@number, 150, "Largest ring diameter")
+        duration: input(@number, 0.6, "Seconds a ring lasts")
+    }
+    layers: [
+        Ellipse{name: "previous" at: fn(t) { return ring(t, 1).at } size: fn(t) { return ring(t, 1).size }
+            stroke: in(@color) width: 5 opacity: fn(t) { return ring(t, 1).opacity }}
+        Ellipse{name: "ring" at: fn(t) { return ring(t, 0).at } size: fn(t) { return ring(t, 0).size }
+            stroke: in(@color) width: 6 opacity: fn(t) { return ring(t, 0).opacity }}
+        Ellipse{name: "press" at: fn(t) { return dot(t).at } size: vec2(36, 36)
+            fill: in(@color) opacity: fn(t) { return dot(t).opacity * 0.55 }}
+    ]
+}

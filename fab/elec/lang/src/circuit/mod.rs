@@ -111,6 +111,7 @@ pub(crate) struct CompRec {
     pub value: Option<Value>,
     /// The reference written on this call. An omitted reference is numbered during lowering.
     pub refdes: Option<String>,
+    pub dnp: bool,
     pub added: Option<u32>,
     pub conns: Vec<(PinIx, usize)>,
     pub nc: Vec<PinIx>,
@@ -181,7 +182,8 @@ pub(crate) enum IntentRec {
     Side { t: Tgt, side: fab_elec_core::Side },
     Fixed { t: Tgt, edge: Option<fab_elec_circuit::Edge>, at: Option<fab_elec_core::P>, rot: Option<fab_elec_core::Angle> },
     Width { net: usize, w: i32 },
-    Pair { p: usize, n: usize, gap: Option<i32>, z0: Option<f64>, here: Here },
+    Pair { p: usize, n: usize, gap: Option<i32>, z0: Option<f64>, skew: Option<i32>, here: Here },
+    LengthMatch { nets: Vec<usize>, tol: i32, here: Here },
 }
 
 #[derive(Copy, Clone)]
@@ -838,7 +840,7 @@ pub(crate) fn lower(unit: BoardId, name: &str, root: SourceRange, session: &Ctx,
             conns,
             nc: c.nc.clone(),
             block: BlockId(c.inst as u32),
-            dnp: false,
+            dnp: c.dnp,
             fields: c.fields.clone(),
         });
     }
@@ -847,25 +849,45 @@ pub(crate) fn lower(unit: BoardId, name: &str, root: SourceRange, session: &Ctx,
         Tgt::Pin(c, p) => Target::Pin(CompId(c as u32), p),
         Tgt::Inst(b) => Target::Block(BlockId(b as u32)),
     };
-    let intents = build.intents.iter().filter_map(|i| Some(match i {
-        IntentRec::Near { a, b, max } => Intent::Near { a: tgt(a), b: tgt(b), max: *max },
-        IntentRec::Group { name, members } => Intent::Group { name: name.clone(), members: members.iter().map(tgt).collect() },
-        IntentRec::Side { t, side } => Intent::Side { t: tgt(t), side: *side },
-        IntentRec::Fixed { t, edge, at, rot } => Intent::Fixed { t: tgt(t), edge: *edge, at: *at, rot: *rot },
-        IntentRec::Width { net: n, w } => Intent::Width { net: net(*n), w: *w },
-        IntentRec::Pair { p, n, gap, z0, here } => {
-            let (p_net, n_net) = (net(*p), net(*n));
-            if p_net == n_net {
-                let join = build.joining_call(*p, *n);
-                let callee = join.callee.as_deref().unwrap_or("call");
-                let mut diag = located(here.doc, here.span.clone(), format!("e.pair: p and n are one net: {callee} joins them"));
-                diag.sel.push(Sel::Source { doc: join.doc, start: join.span.start, end: join.span.end });
-                errors.push(diag);
-                return None;
+    let mut intents = Vec::with_capacity(build.intents.len());
+    for record in &build.intents {
+        let intent = match record {
+            IntentRec::Near { a, b, max } => Intent::Near { a: tgt(a), b: tgt(b), max: *max },
+            IntentRec::Group { name, members } => Intent::Group { name: name.clone(), members: members.iter().map(tgt).collect() },
+            IntentRec::Side { t, side } => Intent::Side { t: tgt(t), side: *side },
+            IntentRec::Fixed { t, edge, at, rot } => Intent::Fixed { t: tgt(t), edge: *edge, at: *at, rot: *rot },
+            IntentRec::Width { net: n, w } => Intent::Width { net: net(*n), w: *w },
+            IntentRec::Pair { p, n, gap, z0, skew, here } => {
+                let (p_net, n_net) = (net(*p), net(*n));
+                if p_net == n_net {
+                    let join = build.joining_call(*p, *n);
+                    let callee = join.callee.as_deref().unwrap_or("call");
+                    let mut diag = located(here.doc, here.span.clone(), format!("e.pair: p and n are one net: {callee} joins them"));
+                    diag.sel.push(Sel::Source { doc: join.doc, start: join.span.start, end: join.span.end });
+                    errors.push(diag);
+                    continue;
+                }
+                let pair = Intent::Pair { p: p_net, n: n_net, gap: *gap, z0: *z0 };
+                if let Some(tol) = skew {
+                    intents.push(pair);
+                    Intent::LengthMatch { nets: vec![p_net, n_net], tol: *tol }
+                } else {
+                    pair
+                }
             }
-            Intent::Pair { p: p_net, n: n_net, gap: *gap, z0: *z0 }
-        }
-    })).collect();
+            IntentRec::LengthMatch { nets, tol, here } => {
+                // Net records may have been joined by a later call. Keep each distinct final net once.
+                let mut seen = HashSet::new();
+                let nets: Vec<_> = nets.iter().map(|n| net(*n)).filter(|n| seen.insert(*n)).collect();
+                if nets.len() < 2 {
+                    errors.push(located(here.doc, here.span.clone(), "e.match_length: nets must contain at least two distinct nets"));
+                    continue;
+                }
+                Intent::LengthMatch { nets, tol: *tol }
+            }
+        };
+        intents.push(intent);
+    }
     if !errors.is_empty() {
         return Err(errors);
     }

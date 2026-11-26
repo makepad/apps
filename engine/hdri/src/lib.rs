@@ -24,9 +24,6 @@
 //!   do: +90 moves a light at -Z to -X ([`rotate_y`]).
 //! - `ibl` works in `[f32; 3]`; this module works in `Vec3f` and converts at
 //!   the boundary with [`arr`] and [`vec`].
-//!
-//! Design: local/agent_state/hdri/design.md (local notes, not under version
-//! control).
 
 // `!(x > 0.0)` and its kin are written negated on purpose throughout this module and its
 // children: a NaN fails the comparison, so it takes the guard's branch. Clippy would have
@@ -41,14 +38,19 @@ pub mod presets;
 pub mod noise;
 pub mod studio;
 pub mod room;
+mod patterns;
+mod room_material;
+mod room_window;
 pub mod modifier;
 pub mod space;
 pub mod pattern;
 pub mod open_box;
+pub mod reflector;
 pub mod silver_deep;
 pub mod atmosphere;
 pub mod clouds;
 pub mod night;
+pub mod moon_face;
 pub mod image;
 pub mod export;
 pub mod shape;
@@ -75,10 +77,14 @@ pub mod cloud_stack;
 pub mod cloud_sheets;
 pub mod cloud_slabs;
 pub mod weather;
+mod rain_water;
+mod rainbow;
 pub mod cloud_lift;
 pub mod cloud_species;
 pub mod skyline;
 pub mod floor;
+pub mod tri_bvh;
+pub mod light_model;
 pub mod paint;
 pub mod paint_raster;
 mod milky_way;
@@ -94,7 +100,6 @@ pub mod cloud_volume_cumulus;
 pub mod cloud_volume_altocumulus;
 pub mod cloud_volume_nimbostratus;
 pub mod cloud_volume_gpu;
-pub mod cloud_lens;
 pub mod cloud_placed;
 #[cfg(test)]
 mod cloud_baseline;
@@ -119,10 +124,57 @@ const MAX_RADIANCE: f32 = 1.0e30;
 /// the engine's bake width, and the end-to-end key test's.
 pub const CASTER_REFERENCE_WIDTH: usize = 1024;
 
+/// The slot a room standing on the ground (an open floor side) reads the ground's near relief from
+/// (`Env::ground_slot`): empty until the app hands the planes in (`Env::with_floor_par`).
+type GroundSlot = std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<floor::FloorPlanes>>>>;
+
+/// The ground a room with an open floor stands on (room.rs `Ground`), read along the direction from the camera to a
+/// floor point, as the outside sees it from the room's camera height (its floor's `eye_m`): the far model, under the
+/// near relief where the planes in `slot` reach (their albedo under the distant map's shade, blended by their share,
+/// as `floor_ground` composes them); water and ice mirror. Its mean is the far model's 30 degrees down (the
+/// bounce's, as `cloud_floor` reads it).
+fn room_ground(model: floor::FloorModel, slot: GroundSlot) -> room::Ground {
+    let mean = vec(model.mean_albedo(30f32.to_radians()));
+    let rough = model.kinds_recipe().roughness;
+    // a 2048 wide map's texel: the room's own floor detail (its LINE_FOOT)
+    let texel = std::f32::consts::TAU / 2048.0;
+    let at = move |pos: Vec3f| {
+        let len = pos.length();
+        let d = if len > 1.0e-6 { pos / len } else { Vec3f { x: 0.0, y: -1.0, z: 0.0 } };
+        let far = model.sample(d, texel);
+        let near = slot.read().ok().and_then(|planes| planes.as_ref().and_then(|planes| planes.sample(d)));
+        let albedo = match near {
+            Some((t, w)) => far.albedo.mix(vec(t.albedo) * far.shade, w.min(1.0)),
+            None => far.albedo,
+        };
+        let water = (far.water + far.ice).min(1.0);
+        room::GroundAt { albedo, gloss: 0.04 + 0.9 * water, roughness: rough + (0.04 - rough) * water }
+    };
+    room::Ground { at: std::sync::Arc::new(at), mean }
+}
+
 /// Sub-samples per axis for a texel that touches a hot spot.
 const HOT_SAMPLES: usize = 8;
-/// A feature is refined while its radius is under this many texels; a wider one is resolved by the grid itself.
+/// A feature is refined while its radius is under this many texels; a wider one is resolved by the grid itself, unless
+/// it is crossed ([`HotSpot::crossed`]) and takes a lattice ([`crossed_lattice`]).
 const HOT_MAX_TEXELS: f32 = 6.0;
+/// A crossed disc ([`HotSpot::crossed`]) is sampled by at least this many distinct rows (and columns) across its
+/// diameter, whatever the map's width: by a lattice over the texels it touches ([`crossed_lattice`]), or over its own
+/// square where it is too small in a texel for that ([`DiscSquare`]). A cloud deck seen near the horizon is
+/// foreshortened into bands a hundredth of a degree thin: over the Sunset preset's disc an 8 x 8 grid's 14 rows (1024
+/// wide) held 0.97 of the light a fine grid passes and its 28 (2048 wide) 1.05; from about 150 rows on every lattice
+/// measured over the texels from 1024 wide up held it to 0.2 % (Sunset, Stratocumulus low sun).
+const CROSSED_ROWS: f32 = 256.0;
+/// The fewest lattice points a crossed disc's texel takes where the 8 x 8 grid would refine it anyway (a disc under
+/// HOT_MAX_TEXELS texels wide): about the grid's 64 points, in 55 rows and 55 columns against the grid's 8.
+const CROSSED_LEAST: usize = 55;
+/// How far past a crossed disc's outer edge its lattice reaches, in texels: half a texel's diagonal (0.71) and a
+/// little, every texel whose footprint the disc can touch. The rest of the hot spot's reach keeps the 8 x 8 grid.
+const CROSSED_REACH_TEXELS: f32 = 0.75;
+/// A cloud whose pass varies over the sun's disc by at most this share of its mean leaves the disc plain: any sampling
+/// of the disc's light through it is a weighted mean of that pass, within that spread of the true one, so the 8 x 8
+/// grid's map stays as it was, bit for bit.
+const CROSSED_SPREAD: f32 = 0.005;
 
 
 /// The direction helpers, the key light's type and the IBL preparation are
@@ -141,11 +193,16 @@ pub const PROCEDURAL_HDRI_WIDTH: usize = 1024;
 /// so the suffix resolves). Written out so the names read at a glance; a test
 /// holds the two together.
 pub const PRESET_ENVIRONMENTS: &[&str] = &[
-    "hdri_clear_noon", "hdri_golden_hour", "hdri_sunset", "hdri_overcast", "hdri_blue_hour", "hdri_moonlit_night", "hdri_starry_night",
-    "hdri_three_point", "hdri_top_softbox", "hdri_rim_pair", "hdri_overcast_dome", "hdri_ring_light", "hdri_product_table",
-    "hdri_white_cyc", "hdri_small_dark_studio", "hdri_wooden_daylight", "hdri_neon_studio", "hdri_umbrella_cyc",
-    "hdri_car_studio", "hdri_car_showroom", "hdri_hexagon_studio", "hdri_road_tunnel", "hdri_led_portal",
+    "hdri_clear_noon", "hdri_golden_hour", "hdri_sunset", "hdri_overcast", "hdri_blue_hour", "hdri_moonlit_night", "hdri_starry_night", "hdri_stratocumulus_low_sun", "hdri_stratocumulus_high_sun", "hdri_altocumulus", "hdri_cumulus", "hdri_stratus", "hdri_cirrus", "hdri_cirrostratus",
+    "hdri_after_rain", "hdri_overcast_and_wet", "hdri_heavy_rain", "hdri_misty_winter_morning", "hdri_snowy_sunny_day", "hdri_after_the_shower",
+    "hdri_three_point", "hdri_top_softbox", "hdri_rim_pair", "hdri_overcast_dome", "hdri_ring_light", "hdri_product_table", "hdri_white_cyc",
+    "hdri_small_dark_studio", "hdri_wooden_daylight", "hdri_neon_studio", "hdri_umbrella_cyc", "hdri_car_studio",
+    "hdri_car_showroom", "hdri_hexagon_studio", "hdri_road_tunnel", "hdri_bridge", "hdri_bridge_at_night", "hdri_led_portal", "hdri_open_boxes", "hdri_umbrellas", "hdri_open_loft", "hdri_factory_hall",
 ];
+
+/// How far off a room's axis the ground's road may bow at the room's mouth before its bend is moved past the mouth
+/// (metres; the road's lanes are 3.5 m wide).
+pub const ROOM_BEND_SAGITTA_M: f32 = 0.5;
 
 /// One environment, ready to sample: every layer is built once in `new`, so
 /// `radiance` is cheap enough to call per texel from many threads (the struct
@@ -206,8 +263,10 @@ pub struct Env {
     /// between layers. False for released bakes and exports.
     held_clouds: bool,
     /// The dome's light under the clouds, for the rain haze and the fog: the
-    /// dry sky's mean radiance as this map draws it (`dome_light`). Measured
-    /// with `ground_gain`; zero where that is not measured.
+    /// dry sky's mean radiance as this map draws it (`dome_light`; again on the
+    /// GPU's records of its cloud volumes once they are attached,
+    /// `attach_cloud_records_in`). Measured with `ground_gain`; zero where that
+    /// is not measured.
     dome: Vec3f,
     /// What the sky's cover does to the light on the ground, per channel: the
     /// light this map's sky puts on it (the dome as drawn, the sun and the
@@ -218,6 +277,16 @@ pub struct Env {
     /// covers the sky, and 1 where it is not measured (Studio mode, a fair sky
     /// with no clouds, an image that is the whole base).
     ground_gain: Vec3f,
+    /// How the cover relights the air between a viewer at a height of its own and the ground, per part of its light
+    /// (`weather::AirRelight`): measured with `ground_gain`; None without a viewer height, where the gain is not
+    /// measured, and where nothing covers the sky outside a modern cloud stack (`measure_air_relight`), whose ground
+    /// side takes the gain alone, as before.
+    air_relight: Option<weather::AirRelight>,
+    /// The width of the GPU's records of the cloud volumes the light under the clouds was measured on
+    /// (`measure_drawn_light`), whose texel's lookups read them: the skyline's light reads the sky the same way
+    /// (`skyline_light`). None where that light is `Env::new`'s, along exact directions (no records, or records of the CPU
+    /// mode).
+    drawn_light_width: Option<usize>,
     /// The skyline's strip and its turn (degrees), laid over the base in
     /// `base_at`: Some exactly in Sky mode with `params.skyline` on and a band
     /// in the images ([`Self::has_skyline`]).
@@ -243,6 +312,9 @@ pub struct Env {
     /// The floor's planes (plan hdri-8 T2), the near relief the app renders on the graphics card and attaches
     /// ([`Self::with_floor_par`]); None until then, and the far model is then the whole floor.
     floor_planes: Option<std::sync::Arc<floor::FloorPlanes>>,
+    /// A room standing on the ground (an open floor side): the slot its ground reads the near relief from, filled when
+    /// the planes are handed in (`with_floor_par`); None otherwise.
+    ground_slot: Option<GroundSlot>,
     /// The map's light as the planes are composed with it, measured once with the floor (default without one).
     floor_lit: floor::FloorLighting,
     /// How the far ground carries on the planes' lit mean and texture where they hand over (`floor::FloorMatch`),
@@ -255,6 +327,10 @@ pub struct Env {
     /// read from a coarse table instead of looked up along every texel's mirror, the discs' reflections drawn as
     /// glitter. None for a released bake, and again once a strip or planes are attached.
     held_mirror: Option<MirrorSky>,
+    /// A released bake's table of the sky its lake mirrors (`mirrored_sky`), MIRROR_LOBE_W wide: the facets of
+    /// rippled water spread its mirror round the one exact lookup it takes (`floor_waters`). Its rows are made as the
+    /// water first reads them, and made again once a strip or planes are attached.
+    lobe_sky: MirrorSky,
 }
 
 /// What one bake hands each of its lookups: the cloud march it reads, when it
@@ -268,13 +344,13 @@ pub struct Env {
 /// skyline's strip is lit and grounded by and the map then veils once
 /// (`base_at`, `skyline::over_veiled`). Without a weather it changes nothing.
 /// `even_ground` reads a wet ground with its puddles at their mean share
-/// (`Weather::ground_even`): the strip's ground ring and the skirt's hold, a
+/// (`weather::Puddles::Even`): the strip's ground ring and the skirt's hold, a
 /// few looks that would otherwise land on a puddle or between them. The map's
 /// own ground keeps its puddles. A dry ground is unchanged.
-/// `damp_ground` reads a wet ground without its puddles (`Weather::ground_damp`):
+/// `damp_ground` reads a wet ground without its puddles (`weather::Puddles::Dry`):
 /// the strip's own ground, the ground between the puddles. It takes precedence
 /// over `even_ground`.
-/// `water_ground` reads a wet ground all under water (`Weather::ground_water`):
+/// `water_ground` reads a wet ground all under water (`weather::Puddles::Full`):
 /// the floor's puddles where they lie over the strip's floor (`Env::under_band`).
 /// `no_aurora` leaves the aurora out (plan hdri-7 D12: the strip's aurora rings are the sea's rings less the same
 /// rings without it).
@@ -377,6 +453,15 @@ impl Env {
     /// that skips rows (its job overtaken) leaves the map None, or a caster's
     /// softness raster empty: the caller drops a map its token has cancelled.
     pub fn new_for_width_par(params: &HdriParams, images: &ImageSet, width: usize, cancelled: &dyn Fn() -> bool, run: &dyn Fn(usize, &(dyn Fn(usize) + Sync))) -> Option<Env> {
+        Env::new_for_bake_par(params, images, width, false, cancelled, run)
+    }
+
+    /// [`Self::new_for_width_par`] for a bake that is `held` when it says so (a drag's, design §5.7; its caller marks the
+    /// Env `with_held_clouds`): its marched cloud volumes fill only the coarse level of a sun-depth grid that no
+    /// released bake left for their sun, shape and Cover, and read the fine one where one did (cloud volumes design
+    /// §12.1, held shows the same clouds: a light-only drag keeps the released shadows, a sun drag shows the coarse
+    /// level's softer ones until its release). Not held, it is `new_for_width_par`'s Env, bit for bit.
+    pub fn new_for_bake_par(params: &HdriParams, images: &ImageSet, width: usize, held: bool, cancelled: &dyn Fn() -> bool, run: &dyn Fn(usize, &(dyn Fn(usize) + Sync))) -> Option<Env> {
         let mut params = params.clone();
         params.clamp();
         let scale = 2.0f32.powf(params.intensity_ev);
@@ -394,7 +479,10 @@ impl Env {
                 // under the skyline (its block on, from the params alone, so both phases agree) the floor carries the
                 // strip's sea on and a Lake's water runs to the horizon (plan hdri-8 §3.10)
                 let under_skyline = params.skyline.as_ref().is_some_and(|block| block.on);
-                floor::FloorModel::new(floor, snow).with_skyline(under_skyline, images.skyline_sea.clone())
+                let haze = weather::weathered_sky(&params.sky).atmosphere.haze;
+                // the rain on its water: rings by the feet, a sheen beyond (the weather lane, rain_water.rs)
+                let rain = params.sky.weather.as_ref().and_then(weather::rain_on_water);
+                floor::FloorModel::new(floor, snow).with_skyline(under_skyline, images.skyline_sea.clone()).with_haze(haze).with_rain(rain)
             }),
             _ => None,
         };
@@ -414,13 +502,19 @@ impl Env {
                 let sun_dir = atmosphere::sun_direction(&sky.sun);
                 // The light the ground bounces back into the air is the floor's when there is one (its mean albedo
                 // 30 degrees down, as the clouds' bases see it): a lake darkens the low sky over it, snow brightens it.
-                let atmo = match &floor {
-                    Some(floor) => {
-                        let ground = AtmosphereParams { ground_color: floor.mean_albedo(30f32.to_radians()), ..sky.atmosphere.clone() };
-                        atmosphere::Atmosphere::new(sun_dir, &ground, &sky.sun_disc)
-                    }
-                    None => atmosphere::Atmosphere::new(sun_dir, &sky.atmosphere, &sky.sun_disc),
+                let air = match &floor {
+                    Some(floor) => AtmosphereParams { ground_color: floor.mean_albedo(30f32.to_radians()), ..sky.atmosphere.clone() },
+                    None => sky.atmosphere.clone(),
                 };
+                let atmo = atmosphere::Atmosphere::new(sun_dir, &air, &sky.sun_disc);
+                // Twilight is lifted as the night is (the owner's option B, 2026-11-08): the sky and the sun's light,
+                // and through them everything they light (the clouds, the floors, the key, the dome), by the night's own
+                // adaptation, so the night layers keep their real ratio to it. 1 by day: a day's map is as it was.
+                let lift = night::adaptation(atmo.sun_dir());
+                let atmo = atmo.lifted(lift);
+                // A floor's ground runs to level: the sun and the night end there, not at the planet's horizon, which a
+                // viewer height dips below level.
+                let atmo = if floor.is_some() { atmo.with_level_horizon() } else { atmo };
                 // The cloud layers: a sky with a stack draws it instead of the
                 // older deck, cirrus and volume, which stay None; it is built
                 // after the night, below.
@@ -431,18 +525,18 @@ impl Env {
                 // density draws no clouds, and the flat deck does not come back.
                 if !whole_base && !stacked {
                     volumetric = match sky.volumetric.as_ref() {
-                        Some(vol) => volumetric::VolumetricClouds::build(&sky.clouds, vol, params.seed, atmo.sun_dir(), cancelled, run).ok()?,
+                        Some(vol) => volumetric::VolumetricClouds::build(&sky.clouds, vol, params.seed, atmo.disc_dir(), cancelled, run).ok()?,
                         None => None,
                     };
                 }
                 let clouds = if stacked {
                     None
                 } else if sky.volumetric.is_some() {
-                    clouds::CloudLayer::new(&CloudParams { coverage: 0.0, ..sky.clouds.clone() }, params.seed, atmo.sun_dir())
+                    clouds::CloudLayer::new(&CloudParams { coverage: 0.0, ..sky.clouds.clone() }, params.seed, atmo.disc_dir())
                 } else {
-                    clouds::CloudLayer::new(&sky.clouds, params.seed, atmo.sun_dir())
+                    clouds::CloudLayer::new(&sky.clouds, params.seed, atmo.disc_dir())
                 };
-                let night = night::NightSky::new_par(&sky.night, params.seed, atmo.sun_dir(), night::star_hours(&sky.sun), sky.sun.latitude, run)?;
+                let night = night::NightSky::new_par(&sky.night, params.seed, &atmo, &air, night::star_hours(&sky.sun), sky.sun.latitude, run)?;
                 // The clouds are lit by the sun at their own height, above most
                 // of the haze: a low sun is far brighter on the deck than on the
                 // ground, which is what lights a sunset's clouds. The 2D layer
@@ -466,34 +560,46 @@ impl Env {
                     };
                     let sun_at = |height_m: f32| atmo.sun_irradiance_at(height_m);
                     let sky_at = |d: Vec3f| atmo.sky(d);
-                    let inputs = cloud_light::LightInputs { sun_dir: atmo.sun_dir(), a_top: cloud_ambient, ground_albedo, sun_at: &sun_at, sky_at: Some(&sky_at) };
-                    cloud_stack = cloud_stack::CloudStack::build(sky, params.seed, &inputs, cancelled, run).ok()?;
+                    let inputs = cloud_light::LightInputs { sun_dir: atmo.disc_dir(), a_top: cloud_ambient, ground_albedo, sun_at: &sun_at, sky_at: Some(&sky_at) };
+                    // (with its showers' rainbows under this sky's sun, rainbow.rs, their rain's light tabled at this map's
+                    // texels, which radiance_with turns by its Rotation)
+                    cloud_stack = cloud_stack::CloudStack::build(sky, params.seed, &inputs, held, cancelled, run).ok()?.map(|stack| stack.with_bows(&atmo, params.rotation_deg));
                 }
-                // What a built cloud stack passes toward the discs, measured once (design §2.4: the key is a cone
-                // mean over each disc; a classic-only stack's is its centre sample, with the older map's arithmetic,
-                // as its compositor's Tu).
-                disc_covers = cloud_stack.as_ref().map(|stack| {
-                    let disc = |dir: Vec3f, radius: f32, softness: f32| {
-                        if stack.all_classic() {
-                            stack.classic_transmittance_toward(dir)
-                        } else {
-                            stack.disc_transmittance(dir, radius, softness)
-                        }
-                    };
-                    DiscCovers {
-                        sun: disc(atmo.sun_dir(), atmo.sun_outer_radius(), sky.sun_disc.softness),
-                        moon: night.moon_disc().map_or(1.0, |(dir, radius)| disc(dir, radius, 0.0)),
+                // What the clouds pass toward the discs, measured once (design §2.4: the key is a cone mean over
+                // each disc). The sun's is the mean over its disc as the map draws it (`Atmosphere::disc_mean`), so
+                // the key carries what of the drawn disc shows even where a cloud's edge crosses it: through a modern
+                // stack, a classic-only one (with the older map's arithmetic, as its compositor's Tu) or the older
+                // deck and volume. The moon's is the modern stack's cone mean, else its centre sample, as before.
+                // Where the pass varies over the sun's disc, the bake samples its texels on a lattice
+                // (`HotSpot::crossed`).
+                let classic = |stack: &cloud_stack::CloudStack, d: Vec3f| if stack.all_classic() { stack.classic_transmittance_toward(d) } else { stack.transmittance_toward(d) };
+                let older = |d: Vec3f| {
+                    clouds.as_ref().map_or(1.0, |layer| 1.0 - layer.cover_toward(d)) * volumetric.as_ref().map_or(1.0, |volume: &volumetric::VolumetricClouds| volume.transmittance_toward(d))
+                };
+                disc_covers = match cloud_stack.as_ref() {
+                    Some(stack) => {
+                        let (sun, sun_crossed) = sun_disc_cover(&atmo, &|d| classic(stack, d));
+                        let moon = night.moon_disc().map_or(1.0, |(dir, radius)| {
+                            if stack.all_classic() { stack.classic_transmittance_toward(dir) } else { stack.disc_transmittance(dir, radius, 0.0) }
+                        });
+                        Some(DiscCovers { sun, sun_crossed, moon })
                     }
-                });
+                    None if clouds.is_some() || volumetric.is_some() => {
+                        let (sun, sun_crossed) = sun_disc_cover(&atmo, &older);
+                        let moon = night.moon_disc().map_or(1.0, |(dir, _)| older(dir));
+                        Some(DiscCovers { sun, sun_crossed, moon })
+                    }
+                    None => None,
+                };
                 // The weather itself works its floors out from the user's block. Over a cloud stack, its layers
                 // give the weather the rain's height, the fog's grey and the virga's share (design §2.5).
                 if !whole_base {
                     weather = match &params.sky.cloud_stack {
                         Some(layers) => {
                             let facts = cloud_facts::CloudFacts::of(layers, cloud_stack.as_ref());
-                            weather::Weather::new_on_stack(&params.sky, atmo.sun_dir(), &params.lights, &facts)
+                            weather::Weather::new_on_stack(&params.sky, atmo.disc_dir(), &params.lights, &facts)
                         }
-                        None => weather::Weather::new_with(&params.sky, atmo.sun_dir(), &params.lights),
+                        None => weather::Weather::new_with(&params.sky, atmo.disc_dir(), &params.lights),
                     };
                     if weather.is_none() {
                         lone_bolts = weather::Bolts::of_layers(&params.lights);
@@ -512,6 +618,8 @@ impl Env {
                         weather = weather.map(|w| w.with_flash_cover(&cover));
                         lone_bolts = lone_bolts.map(|bolts| bolts.with_flash_cover(&cover));
                     }
+                    // The fog's bow under this sky's sun (rainbow.rs).
+                    weather = weather.map(|w| w.with_bows(&atmo));
                 }
                 // The sun under the clouds, as the key is dimmed in `sun`: the 2D
                 // layer's UNFADED cover (1a's fix round; a 2 degree sun behind a
@@ -519,10 +627,7 @@ impl Env {
                 // built stack's cone mean over the disc.
                 let sun_cover = match &disc_covers {
                     Some(covers) => covers.sun,
-                    None => {
-                        clouds.as_ref().map_or(1.0, |layer| 1.0 - layer.cover_toward(atmo.sun_dir()))
-                            * volumetric.as_ref().map_or(1.0, |volume| volume.transmittance_toward(atmo.sun_dir()))
-                    }
+                    None => Vec3f::all(older(atmo.disc_dir())),
                 };
                 weather_sun = atmo.sun_irradiance() * sun_cover;
                 (Some(atmo), clouds, Some(night), cloud_sun, volume_sun, cloud_ambient)
@@ -535,21 +640,53 @@ impl Env {
         // room has an open wall (plan P3: a tunnel's mouth looks out at it
         // too). Its lights are cleared, so it never nests further, and it is
         // made from the parameters alone: new_with stays pure.
-        let room_opens = params.mode() == Mode::Studio && params.studio.room.as_ref().is_some_and(|room| room.open().contains(&true));
+        // A hybrid studio (an open wall or floor, a real window) looks out at
+        // the scene's outdoor one; so does a fake window's glass filled with sky.
+        let hybrid = params.is_hybrid();
         let window_sky = if params.mode() == Mode::Studio
-            && (room_opens || params.lights.iter().any(|l| l.enabled && !l.is_caster() && l.blend() == Blend::Add && l.gobo.as_ref().is_some_and(|g| g.fill_sky)))
+            && (hybrid || params.lights.iter().any(|l| l.enabled && !l.is_caster() && l.blend() == Blend::Add && l.gobo.as_ref().is_some_and(|g| g.fill_sky)))
         {
             let mut outside = params.clone();
             outside.mode = "sky".to_string();
             outside.lights.clear();
             outside.intensity_ev = 0.0;
             outside.rotation_deg = 0.0;
-            // The window looks out at the generated sky, not at a base image,
-            // and a studio draws no skyline.
+            // The window looks out at the generated sky, not at a base image.
             outside.base_image = None;
-            outside.skyline = None;
-            // nor a floor (floors are Sky mode's alone, plan hdri-8)
-            outside.floor = None;
+            // A hybrid's outside is the whole outdoor scene: its skyline and its
+            // ground stand out there too, the ground seen from the room's
+            // camera height. A fake window's sky keeps neither (as before).
+            if hybrid {
+                if let (Some(floor), Some(room)) = (outside.floor.as_mut(), params.studio.room.as_ref()) {
+                    let room = room.clamped();
+                    floor.eye_m = room.camera_height_m;
+                    // A room standing on the ground's road (a tunnel, a bridge) runs it between its open walls, so the
+                    // road runs on out of both mouths (a bridge is often wider than long); with neither pair open, or
+                    // both, along its long side. Beside it the room's own floor where the road asks for the room's.
+                    if room.open_floor() && floor.kind() == FloorKind::Road {
+                        let [north, south, east, west] = room.open();
+                        let (along_z, along_x) = (north || south, east || west);
+                        let north_south = if along_z != along_x { along_z } else { room.depth_m >= room.width_m };
+                        floor.heading_deg = if north_south { 0.0 } else { 90.0 };
+                        if floor.beside() == RoadBeside::Room {
+                            floor.beside_color = Some(room.floor);
+                        }
+                        // The room is a box, so the road runs straight between its mouths: a bend that would
+                        // leave the road's centre line more than ROOM_BEND_SAGITTA_M off the box's axis at a
+                        // mouth (a bend of radius r over a room 2 m long bows m^2 / 2 r) starts past the farther
+                        // mouth (the camera may stand off the room's middle); a gentler one, or a short room (a
+                        // bridge over a sweeping bend), keeps the bend where it was asked, the viewer on it too.
+                        // The room's own lights light the road under its deck.
+                        let mouth = if north_south { 0.5 * room.depth_m + (room.offset_z * room.depth_m).abs() } else { 0.5 * room.width_m + (room.offset_x * room.width_m).abs() };
+                        if floor.curve() != RoadCurve::Straight && mouth * mouth / (2.0 * floor.curve_radius()) > ROOM_BEND_SAGITTA_M {
+                            floor.curve_start_m = Some(floor.curve_start().max(mouth + 1.0));
+                        }
+                    }
+                }
+            } else {
+                outside.skyline = None;
+                outside.floor = None;
+            }
             Some(Box::new(Env::new_cancellable(&outside, images, cancelled)?))
         } else {
             None
@@ -559,12 +696,22 @@ impl Env {
         // light's own pool with its gobo, so no gobo is cast onto it as onto
         // the gradient.
         let room = if params.mode() == Mode::Studio { params.studio.room.clone() } else { None };
+        // A hybrid room's ground: the outside's far model now, and the near relief once the app hands it in
+        // (`with_floor_par` fills the slot it reads). The floor where its floor side is open; past its openings what
+        // its lights fall on out there.
+        let mut ground_slot = None;
         if let Some(room) = &room {
             let outside = window_sky.as_deref();
             let sky = |w: Vec3f| outside.map_or(Vec3f::default(), |sky| sky.radiance_with(w, None, Sampling::bake(studio::ROOM_SKY_WIDTH, None)));
             // The discs out there (the sun, the moon) shine in through the open walls on their own.
-            let hot = outside.map_or(Vec::new(), |sky| sky.hot_spots());
-            if !studio.build_room(room, &sky, &hot, cancelled, run) {
+            let hot: Vec<(Vec3f, f32)> =
+                outside.map_or(Vec::new(), |sky| sky.hot_spots().iter().map(|spot| (spot.dir, spot.radius)).collect());
+            let ground = outside.and_then(|o| o.floor.clone()).map(|model| {
+                let slot: GroundSlot = std::sync::Arc::new(std::sync::RwLock::new(None));
+                ground_slot = Some(slot.clone());
+                room_ground(model, slot)
+            });
+            if !studio.build_room(room, &sky, &hot, ground, cancelled, run) {
                 return None;
             }
         }
@@ -593,6 +740,8 @@ impl Env {
             held_clouds: false,
             dome: Vec3f::default(),
             ground_gain: Vec3f::all(1.0),
+            air_relight: None,
+            drawn_light_width: None,
             base_image: None,
             city_peaks: skyline.as_ref().map(|(band, _)| band.peaks()),
             // built once the ground it is held to is (`skirt_for`, below)
@@ -602,10 +751,12 @@ impl Env {
             measured_key: OnceLock::new(),
             floor,
             floor_planes: None,
+            ground_slot,
             floor_lit: floor::FloorLighting::default(),
             floor_match: None,
             glints: Vec::new(),
             held_mirror: None,
+            lobe_sky: MirrorSky::lazy(MIRROR_LOBE_W),
         };
         // The weather's veil and the ground are lit by the dome as this map
         // draws it, so the dome is measured once its layers are in place (and
@@ -614,16 +765,18 @@ impl Env {
         // (D7). That is a weather, the older clouds or volume, or a built cloud
         // stack (design §2.7). Under an image that is the whole base no ground
         // is drawn.
+        // (A map whose cloud volumes the GPU draws in the export mode measures this again on their records,
+        // `attach_cloud_records_in`.)
         let covered = env.weather.is_some() || env.clouds.is_some() || env.volumetric.is_some() || env.cloud_stack.is_some();
         let mut moments = None;
         if covered && !whole_base {
-            let dome = env.dome_light();
-            env.dome = dome.mean;
-            env.ground_gain = env.measure_ground_gain(&dome);
-            moments = Some(dome.moments);
+            moments = Some(env.measure_cover_light(Sampling { bare: true, ..Sampling::default() }));
         }
-        // The floor's light (plan hdri-8 T2): the sky as drawn as L1 moments, the dome's when it was measured.
-        if env.floor.is_some() {
+        // The floor's light (plan hdri-8 T2): the sky as drawn as L1 moments, the dome's when it was measured. (Also
+        // without a floor on a wet ground: the sun and the moon glare on its damp ground, `damp_sheen`, and glitter on
+        // the puddles where rain roughens them, `rain_puddle`.)
+        // (and the candle lights' models outdoors: the floor's light lights them too)
+        if env.floor.is_some() || env.weather.as_ref().is_some_and(|weather| weather.mirrors()) || (env.atmo.is_some() && env.studio.has_candles()) {
             let moments = moments.unwrap_or_else(|| env.dome_light().moments);
             env.measure_floor_light(moments);
         }
@@ -636,6 +789,12 @@ impl Env {
         }
         if let Some((band, turn)) = env.skyline.clone() {
             env.city_skirt = Some(env.skirt_for(&band, turn));
+            // the mirror table's rows the measurements above made, the strip's skirt not built yet, lack the city
+            // (a rained puddle and the damp ground read them, `rain_puddle`, `damp_sheen`; the skirt's own even looks
+            // make none on a damp ground): on a wet ground they are made again as the ground first reads them
+            if env.weather.as_ref().is_some_and(|weather| weather.mirrors()) {
+                env.lobe_sky = MirrorSky::lazy(MIRROR_LOBE_W);
+            }
         }
         // A caster's bloom reads the finished layers behind it, so it comes
         // last; a newer request stops it as it stops the cloud noise (R5).
@@ -759,7 +918,7 @@ impl Env {
     /// the weather's veil: the skirt is veiled with the band (`base_at`), and the veil is affine and
     /// grey (one transmittance for all channels), so a skirt no brighter than the unveiled ground is,
     /// veiled, no brighter than the ground the map draws. A wet ground is held to its mean
-    /// (`Weather::ground_even`), which is smooth where the puddles change finer than these looks.
+    /// (`weather::Puddles::Even`), which is smooth where the puddles change finer than these looks.
     /// Over a floor (plan hdri-8 T7) there is no skirt: the strip leaves its flat ground to the floor, and its sea runs
     /// into the floor's water below it (D2), so the band's lowest FADE_DEG fade into the floor itself.
     fn skirt_for(&self, band: &skyline::SkylineBand, turn: f32) -> skyline::BandSkirt {
@@ -817,14 +976,21 @@ impl Env {
     /// (as [`Self::new_for_width_par`]), polling `cancelled`: None when it
     /// stopped (or the runner skipped a row), and the map is then dropped.
     pub fn with_skyline_par(mut self, band: std::sync::Arc<skyline::SkylineBand>, cancelled: &dyn Fn() -> bool, run: &dyn Fn(usize, &(dyn Fn(usize) + Sync))) -> Option<Env> {
+        // a hybrid studio's skyline stands in its outside
+        if self.params.is_hybrid() {
+            if let Some(outside) = self.window_sky.take() {
+                self.window_sky = Some(Box::new((*outside).with_skyline_par(band.clone(), cancelled, run)?));
+            }
+        }
         let Some(skyline) = Env::skyline_of(&self.params, &band) else {
             return Some(self);
         };
         self.city_peaks = Some(skyline.0.peaks());
         self.city_skirt = Some(self.skirt_for(&skyline.0, skyline.1));
         self.skyline = Some(skyline);
-        // a held lake's mirror table was made without the city
+        // a held lake's mirror table was made without the city, and so were a released one's rows
         self.held_mirror = None;
+        self.lobe_sky = MirrorSky::lazy(MIRROR_LOBE_W);
         // The bloom read the base without the city: it is rastered again from
         // nothing, in list order, as the build rastered it.
         self.studio.clear_caster_blooms();
@@ -850,12 +1016,12 @@ impl Env {
     ///   the ring is, veiled once, the map's own horizon (`sea_low`,
     ///   `sea_high`: the sky the strip's sea mirrors, as the map shows it,
     ///   through its weather; without one the rings). A wet ground is read
-    ///   with its puddles at their mean share (`Weather::ground_even`, the
+    ///   with its puddles at their mean share (`weather::Puddles::Even`, the
     ///   owner's ruling): the ground ring's 64 looks would otherwise land on a
     ///   puddle or between them, and the strip's near ground would be striped.
     /// - `wet` and `ground_damp`: the puddles' mean share of the map's ground
     ///   (`Weather::puddle_share`, 0 on a dry ground or without a sky) and the
-    ///   ground ring read with no puddles (`Weather::ground_damp`; the ground
+    ///   ground ring read with no puddles (`weather::Puddles::Dry`; the ground
     ///   ring itself when `wet` is 0): under a wet ground the strip keeps its
     ///   own ground, the damp ring (its near rise, its land, its lakes'
     ///   bottoms), and below the horizon, its flat ground at every depression,
@@ -875,11 +1041,30 @@ impl Env {
     /// In Studio mode the rings are the backdrop and the sun and the ambient
     /// are 0; under an image that is the whole base the rings are the image
     /// and the sun and the ambient the generated sky's (the image is not metered).
+    /// Each look is along its exact direction; once the light under the clouds
+    /// was measured on the GPU's records of the cloud volumes
+    /// (`attach_cloud_records_in`) the looks over the horizon are a bake's of
+    /// their width, so the rings read the clouds the map draws, as the ground's
+    /// gain and the dome do: along an exact direction a volume is marched on the
+    /// CPU, another look (under a closed Nimbostratus, sun 30 degrees up, its
+    /// ring at 1 degree was the clear sky's, 19 times the drawn horizon). So a
+    /// host asks for the strip after the records are attached.
     pub fn skyline_light(&self) -> skyline::SkylineLight {
+        // a hybrid studio's skyline stands under its outside's sky
+        if self.params.is_hybrid() {
+            if let Some(outside) = &self.window_sky {
+                return outside.skyline_light();
+            }
+        }
         use skyline::RING;
         let turn = self.params.skyline.as_ref().map_or(0.0, |block| block.turn_deg);
+        // The sky's looks read the clouds as the map draws them: as a bake of the width of the GPU's records the light
+        // under them was measured on looks (`drawn_light_width`: its texel's lookups read them); else, as the ground's
+        // looks always are, along exact directions.
+        let sky_texel = self.drawn_light_width.map_or(0.0, |width| std::f32::consts::TAU / width.max(2) as f32);
         // (over a floor its water is read as its bed: the strip's sea shows that bottom through its own water, D2)
         let at = Sampling { bare: true, unveiled: true, even_ground: true, floor_bed: self.floor.is_some(), ..Sampling::default() };
+        let sky_at = Sampling { texel: sky_texel, ..at };
         let ring_seen = |el_deg: f32, at: Sampling| -> [[f32; 3]; RING] {
             let mut ring = [[0.0; 3]; RING];
             for (i, entry) in ring.iter_mut().enumerate() {
@@ -889,13 +1074,12 @@ impl Env {
             }
             ring
         };
-        let ring = |el_deg: f32| ring_seen(el_deg, at);
-        let (ring_low, ring_high, ground_ring) = (ring(skyline::RING_LOW_DEG), ring(skyline::RING_HIGH_DEG), ring(-skyline::GROUND_RING_DEG));
+        let (ring_low, ring_high, ground_ring) = (ring_seen(skyline::RING_LOW_DEG, sky_at), ring_seen(skyline::RING_HIGH_DEG, sky_at), ring_seen(-skyline::GROUND_RING_DEG, at));
         // The sky the strip's sea mirrors: as the map shows it, through its weather (the light a far sea mirrors has
         // come through the rain and fog to the water); without a weather the rings themselves.
         let (sea_low, sea_high) = match self.weather {
             Some(_) => {
-                let seen = Sampling { bare: true, ..Sampling::default() };
+                let seen = Sampling { bare: true, texel: sky_texel, ..Sampling::default() };
                 (ring_seen(skyline::RING_LOW_DEG, seen), ring_seen(skyline::RING_HIGH_DEG, seen))
             }
             None => (ring_low, ring_high),
@@ -906,8 +1090,8 @@ impl Env {
         // The aurora as the map shows it at the sea's two rings, for the strip's water to mirror at night (plan
         // hdri-7 D12): the sea's rings less the same rings without it, so the cover and the veil in front are the map's.
         let sea_at = match self.weather {
-            Some(_) => Sampling { bare: true, ..Sampling::default() },
-            None => at,
+            Some(_) => Sampling { bare: true, texel: sky_texel, ..Sampling::default() },
+            None => sky_at,
         };
         let aurora = self.night.as_ref().filter(|night| night.has_aurora()).map(|_| {
             let without = Sampling { no_aurora: true, ..sea_at };
@@ -921,10 +1105,12 @@ impl Env {
             return skyline::SkylineLight { sun_u: 0.0, sun_el_deg: -90.0, sun_rgb: [0.0; 3], ambient_rgb: [0.0; 3], ring_low, ring_high, ground_ring, sea_low, sea_high, wet, ground_damp, aurora, floor: false };
         };
         let pi = std::f32::consts::PI;
-        let sun = atmo.sun_dir();
+        // (the sun where its light arrives from, the drawn disc's centre, and up while that disc is over the drawn
+        // horizon: as the key)
+        let sun = atmo.disc_dir();
         let elevation = sun.y.clamp(-1.0, 1.0).asin();
         let outer = atmo.sun_outer_radius();
-        let visible = smoothstep(-outer, outer, elevation);
+        let visible = smoothstep(-outer, outer, elevation + atmo.horizon_dip());
         let sun_rgb = if visible > 0.0 { atmo.sun_irradiance() * (self.cover_toward_disc(sun, Disc::Sun) * visible / pi) } else { Vec3f::default() };
         // The white ground as the map lights it: the atmosphere's (the sky and
         // the sun over a level surface) and the night's, times the ground gain.
@@ -1025,7 +1211,7 @@ impl Env {
             Some(weather) => {
                 // (what the strip's water mirrors is veiled up the mirror, `mirrored`)
                 let m = self.mirrored(d, far);
-                let veil = |x| self.strip_veil(weather, d, far, m, x);
+                let veil = |x| self.strip_veil(weather, d, far, m, x, at.texel);
                 match self.city_lit(weather, d, m, s, light) {
                     None => skyline::over_veiled(s, c, &veil),
                     Some((surface, lit)) => skyline::over_veiled(surface, c, &veil) + lit,
@@ -1050,15 +1236,15 @@ impl Env {
     /// `city_veil` for a strip texel along `d`, `m` of it what the strip's water mirrors (`mirrored`): that share veiled
     /// up the mirror, (d.x, -d.y, d.z), over `far`, the rest along `d`. Both are affine in `x`, and so is the blend. At
     /// m 0, `city_veil` along `d` itself.
-    fn strip_veil(&self, weather: &weather::Weather, d: Vec3f, far: Option<f32>, m: f32, x: Vec3f) -> Vec3f {
+    fn strip_veil(&self, weather: &weather::Weather, d: Vec3f, far: Option<f32>, m: f32, x: Vec3f, texel: f32) -> Vec3f {
         if !(m > 0.0) {
-            return self.city_veil(weather, d, far, x);
+            return self.city_veil(weather, d, far, x, texel);
         }
-        let up = self.city_veil(weather, vec3f(d.x, -d.y, d.z), far, x);
+        let up = self.city_veil(weather, vec3f(d.x, -d.y, d.z), far, x, texel);
         if m >= 1.0 {
             return up;
         }
-        let down = self.city_veil(weather, d, far, x);
+        let down = self.city_veil(weather, d, far, x, texel);
         down + (up - down) * m
     }
 
@@ -1072,12 +1258,13 @@ impl Env {
     /// coverage (the glow, a lamp over the sky) with a = 0, so it is veiled once, over the distance it burns at.
     /// The strip is seen only through `city_at`, which is None until the skirt is built, so the dome, the ground gain and
     /// the skirt's hold never see the mirrored city, and a map built with the band and one it is attached to agree.
-    /// Without a weather (`weather` None: a floor's lake or sea under a clear sky, plan hdri-8 T7) nothing veils it.
-    fn over_city(&self, v: Vec3f, seen: Vec3f, weather: Option<&weather::Weather>, own: &Cell<Option<(Vec3f, f32)>>) -> Vec3f {
+    /// Without a weather (`weather` None: a floor's lake or sea under a clear sky, plan hdri-8 T7) nothing veils it. The
+    /// veil's bows are averaged over the bake's texel `texel` (`city_veil`).
+    fn over_city(&self, v: Vec3f, seen: Vec3f, weather: Option<&weather::Weather>, own: &Cell<Option<(Vec3f, f32)>>, texel: f32) -> Vec3f {
         match self.city_far_at(v) {
             Some((s, far, light)) if s != [0.0; 4] => {
                 let veil = |x| match weather {
-                    Some(weather) => self.city_veil(weather, v, far, x),
+                    Some(weather) => self.city_veil(weather, v, far, x, texel),
                     None => x,
                 };
                 // the texel's surface, and its light as the weather shows it on top (none: the texel all surface, + 0 exactly)
@@ -1117,12 +1304,11 @@ impl Env {
     /// ranges veiled more; never more than the whole path, `Weather::veil_within`), and not the rain's shafts, which hang
     /// far off behind the city (§5b). A texel without a distance (None: no coverage, the glow; a band without the
     /// plane) is veiled over the whole path, as before. The base behind the strip keeps the whole veil and its shafts
-    /// (`over_veiled` lays the strip over the base as the map veils it), and so does the key's cover.
-    fn city_veil(&self, weather: &weather::Weather, d: Vec3f, far: Option<f32>, x: Vec3f) -> Vec3f {
-        match far {
-            Some(far) => weather.veil_within(d, x, self.weather_sun, self.dome, far),
-            None => weather.veil_without_virga(d, x, self.weather_sun, self.dome),
-        }
+    /// (`over_veiled` lays the strip over the base as the map veils it), and so does the key's cover. The bows in it are
+    /// averaged over the bake's texel `texel` (radians), as the sky beside the strip has them (`Weather::veil_within_at`).
+    fn city_veil(&self, weather: &weather::Weather, d: Vec3f, far: Option<f32>, x: Vec3f, texel: f32) -> Vec3f {
+        // (no distance: the whole path, `veil_without_virga`)
+        weather.veil_within_at(d, x, self.weather_sun, self.dome, far.unwrap_or(f32::INFINITY), texel)
     }
 
     /// [`Self::base_at`] without the skyline.
@@ -1138,7 +1324,7 @@ impl Env {
                 let sky = self.base_layer(d, without, at);
                 match &self.weather {
                     // (unveiled, the sky is too: the veil is affine, so veiling the mix later is mixing the veiled two)
-                    Some(weather) if !at.unveiled => image.compose_veiled(d, sky, &|photo| weather.veil(d, photo, self.weather_sun, self.dome)),
+                    Some(weather) if !at.unveiled => image.compose_veiled(d, sky, &|photo| weather.veil_at(d, photo, self.weather_sun, self.dome, at.texel)),
                     _ => image.compose(d, sky),
                 }
             }
@@ -1190,7 +1376,7 @@ impl Env {
         let hot: Vec<(Vec3f, f32)> = self
             .hot_spots()
             .into_iter()
-            .map(|(dir, radius)| (rotate_y(dir, -self.params.rotation_deg), radius))
+            .map(|spot| (rotate_y(spot.dir, -self.params.rotation_deg), spot.radius))
             .collect();
         let at = Sampling::bake(width, None);
         // M5: the casters share one budget of samples (`caster::BLOOM_CELL_BUDGET`), so many
@@ -1302,7 +1488,7 @@ impl Env {
                     let here = self.floor_at(d, at);
                     // (the lightning layers' bolts in the sky: their foot stands just over the horizon, the ground
                     // in front of it)
-                    let c = weather::relit_ground(d, self.under_clouds(d, self.sky_layers_on(d, atmo, without, at, here.as_ref()), atmo, at), self.ground_gain)
+                    let c = weather::relit_ground(d, self.under_clouds(d, self.sky_layers_on(d, atmo, without, at, here.as_ref()), atmo, at, here.as_ref()), self.ground_gain)
                         + self.lone_bolts_light(d, at.texel);
                     match here {
                         // the floor's lake mirrors the sky as a puddle does, through no veil
@@ -1311,7 +1497,7 @@ impl Env {
                             // mirror run on under the strip), and the bolts
                             let seen = |v: Vec3f, discs: bool| {
                                 let sky = self.sky_layers(v, atmo, if discs { None } else { Some(KeyTerm::Discs) }, at) + self.lone_bolts_light(v, at.texel);
-                                self.over_city(v, sky, None, &Cell::new(None))
+                                self.over_city(v, sky, None, &Cell::new(None), at.texel)
                             };
                             self.floor_waters(d, c, c, &here, at, &seen)
                         }
@@ -1320,7 +1506,7 @@ impl Env {
                 }
                 Some(weather) => {
                     let here = self.floor_at(d, at);
-                    let dry_d = self.under_clouds(d, self.sky_layers_on(d, atmo, without, at, here.as_ref()), atmo, at);
+                    let dry_d = self.under_clouds(d, self.sky_layers_on(d, atmo, without, at, here.as_ref()), atmo, at, here.as_ref());
                     // Below the horizon: the ground lit by this map's own sky (D7),
                     // and the wet ground's mirror of the sky above it.
                     // The mirror shows the sky as the weather shows it: through the
@@ -1332,11 +1518,11 @@ impl Env {
                     // The strip's own light in the mirror and its coverage, where it has a distance (`over_city`).
                     let city = Cell::new(None);
                     let seen_with = |v: Vec3f, discs: bool| {
-                        let sky = weather.veil(v, self.sky_layers(v, atmo, if discs { None } else { Some(KeyTerm::Discs) }, at), self.weather_sun, self.dome)
+                        let sky = weather.veil_at(v, self.sky_layers(v, atmo, if discs { None } else { Some(KeyTerm::Discs) }, at), self.weather_sun, self.dome, at.texel)
                             + weather.lightning(v, at.texel);
                         // The skyline stands over the sky it mirrors: a puddle shows the city where it stands above the
                         // horizon, veiled as the map veils it there (plan hdri-6 §5).
-                        self.over_city(v, sky, Some(weather), &city)
+                        self.over_city(v, sky, Some(weather), &city, at.texel)
                     };
                     let seen = |v: Vec3f| seen_with(v, true);
                     let puddles = if at.damp_ground {
@@ -1355,17 +1541,26 @@ impl Env {
                     let covered = wets.is_some_and(|here| here.water() >= 1.0 || here.ice() >= 1.0);
                     // Over a floor the puddles lie by its kind, in its own hollows (plan hdri-8 T2).
                     let cover = here.as_ref().map(|here| self.floor_puddles(weather, d, here, puddles));
+                    // (the puddles' share as the floor lays them, else as the field or the strip's lookups read it)
+                    let cover = cover.unwrap_or_else(|| weather.puddle_cover(d, puddles));
+                    // Under rain the puddles mirror through the rain's slopes (the weather lane): its young rings by
+                    // the feet, a sheen beyond (`rain_puddle`); their share as the field or the floor lays them.
+                    let rained = match weather.rain_water() {
+                        Some(rain) if weather.rains_on_puddles() && !covered => Some(rain),
+                        _ => None,
+                    };
+                    // Between the puddles the damp ground's film mirrors the sky through its rough facets, a blurred
+                    // sheen (`damp_sheen`); only their standing water mirrors it sharply.
+                    let sheen = || self.damp_sheen(d, at);
                     let c = if covered {
                         Vec3f::default()
-                    } else if let Some(cover) = cover {
-                        weather.ground_covered(d, dry_d, self.ground_gain, &seen, cover)
+                    } else if let Some(rain) = rained {
+                        let eye = self.floor.as_ref().map_or(weather::EYE_M, |floor| floor.eye_m());
+                        // (the strip's even lookups read the rain's mean slopes, not the rings where they land)
+                        let rings = puddles != weather::Puddles::Even;
+                        weather.ground_sheened(d, dry_d, self.ground_gain, &seen, cover, Some(&|bed| self.rain_puddle(rain, d, bed, eye, rings, at)), &sheen)
                     } else {
-                        match puddles {
-                            weather::Puddles::Dry => weather.ground_damp(d, dry_d, self.ground_gain, &seen),
-                            weather::Puddles::Even => weather.ground_even(d, dry_d, self.ground_gain, &seen),
-                            weather::Puddles::Full => weather.ground_water(d, dry_d, self.ground_gain, &seen),
-                            weather::Puddles::Field => weather.ground(d, dry_d, self.ground_gain, &seen),
-                        }
+                        weather.ground_sheened(d, dry_d, self.ground_gain, &seen, cover, None, &sheen)
                     };
                     let c = match &wets {
                         Some(here) => self.floor_waters(d, c, weather::relit_ground(d, dry_d, self.ground_gain), here, at, &seen_with),
@@ -1380,24 +1575,21 @@ impl Env {
                     // inside the rain.
                     let veiled = match city.get().filter(|_| weather.veils()) {
                         // (a weather that veils nothing passes `c` itself, bit for bit)
-                        None => weather.veil(d, c, self.weather_sun, self.dome),
+                        None => weather.veil_at(d, c, self.weather_sun, self.dome, at.texel),
                         // The mirror shows the strip, veiled over its distance (plan hdri-6 R1: the light runs city ->
                         // puddle -> eye, about the city's distance, and is veiled once). The share of the view the mirror
-                        // takes there (`mirror_share`, k, of it the strip's coverage a) runs to the strip, not along the
+                        // takes there (`mirror_share_sheened`, k, of it the strip's coverage a) runs to the strip, not along the
                         // floor: its light `own` is not veiled again, and the floor's in-scatter is left off that share.
                         // The rest of the texel (the puddle's bottom, the damp ground, the sky beside the strip's
                         // coverage) keeps the floor's veil. Where the floor's veil is thin this is the old sum.
                         Some((own, a)) => {
-                            let k = match cover {
-                                Some(cover) => weather.mirror_share_covered(d, cover),
-                                None => weather.mirror_share(d, puddles),
-                            };
+                            let k = weather.mirror_share_sheened(d, cover, rained.is_some());
                             let k = match &wets {
-                                Some(here) => k * (1.0 - here.water() - here.ice()) + floor_mirror_share(d, here.water(), here.ice()),
+                                Some(here) => k * (1.0 - here.water() - here.ice()) + floor_mirror_share(d, here.far.normal, self.mirror_kept(d, &here.far), here.water(), here.ice()),
                                 None => k,
                             };
-                            weather.veil(d, c - own * k, self.weather_sun, self.dome) + own * k
-                                - weather.veil(d, Vec3f::default(), self.weather_sun, self.dome) * (a * k)
+                            weather.veil_at(d, c - own * k, self.weather_sun, self.dome, at.texel) + own * k
+                                - weather.veil_at(d, Vec3f::default(), self.weather_sun, self.dome, at.texel) * (a * k)
                         }
                     };
                     veiled + weather.lightning(d, at.texel)
@@ -1434,22 +1626,38 @@ impl Env {
     }
 
     /// The floor's ground along `d` (plan hdri-8): the day's radiance before the haze blend, how much of that blend
-    /// it keeps, and the night's radiance (`NightSky::ground` for the far model). The far model is lit as the flat
-    /// ground was; the planes, where they reach, by the key's term and the sky's light on their tilted faces
-    /// (`floor::FloorLighting`), their albedo under the distant map's shade, blended in by their share.
+    /// it keeps, and the night's radiance. The far model is lit as the flat ground was (by the night's irradiance on
+    /// level ground, `NightSky::ground_irradiance`); the planes, where they reach, by the key's
+    /// term and the sky's light on their tilted faces (`floor::FloorLighting`), their albedo under the distant map's
+    /// shade, blended in by their share. By night both run on to the horizon through the night air
+    /// (`floor::FloorModel::night_keep`), where they meet the night's glow (`NightSky::glow_at_horizon`): the glow's
+    /// own fade into a flat ground would turn a lit road black a few degrees down, so under a floor `sky_layers_on`
+    /// leaves the glow below the horizon to this.
     fn floor_ground(&self, d: Vec3f, atmo: &atmosphere::Atmosphere, here: &floor::FloorHere, at: Sampling) -> (Vec3f, f32, Vec3f) {
         let kind = self.floor.as_ref().map_or(FloorKind::Grass, |floor| floor.kind());
         let far = &here.far;
         let keep = here.keep(kind);
-        let far_ground = || (atmo.ground_radiance(far.albedo), self.night.as_ref().map_or(Vec3f::default(), |night| night.ground(d, far.albedo)));
+        // the night: a ground whose albedo times irradiance is `lit`, seen through the night air
+        let night_over = |lit: Vec3f| -> Vec3f {
+            let (Some(night), Some(floor)) = (&self.night, &self.floor) else { return Vec3f::default() };
+            if !(d.y < 0.0) {
+                return Vec3f::default();
+            }
+            let keep = floor.night_keep(d);
+            lit * (keep / std::f32::consts::PI) + night.glow_at_horizon(d) * (1.0 - keep)
+        };
+        let night_irradiance = self.night.as_ref().map_or(Vec3f::default(), |night| night.ground_irradiance());
+        let far_ground = || (atmo.ground_radiance(far.albedo), night_over(far.albedo * night_irradiance));
         let Some((t, w)) = &here.near else {
             let (day, night) = far_ground();
             return (day + self.floor_carry(d, at, far), keep, night);
         };
         let albedo = vec(t.albedo) * far.shade;
         let lit = &self.floor_lit;
-        let near_day = albedo * lit.day(t.normal, t.key) * (1.0 / std::f32::consts::PI);
-        let near_night = self.night.as_ref().map_or(Vec3f::default(), |night| night.ground_lit(d, albedo * lit.night(t.normal, t.key)));
+        // (and the light the ground round a tilted face bounces onto it: the far model's ground there, its water none)
+        let (bounce_day, bounce_night) = lit.bounce(t.normal, far.albedo * (1.0 - far.water));
+        let near_day = albedo * (lit.day(t.normal, t.key) + bounce_day) * (1.0 / std::f32::consts::PI);
+        let near_night = night_over(albedo * (lit.night(t.normal, t.key) + bounce_night));
         if *w >= 1.0 {
             (near_day + self.floor_carry(d, at, far), keep, near_night)
         } else {
@@ -1479,7 +1687,7 @@ impl Env {
         let (tex, sd) = floor.fine_texture(x, z, foot);
         let c = fm.contrast_at(d);
         let residual = if c > 0.0 { ((c * c - sd * sd).max(0.0)).sqrt() / c } else { 0.0 };
-        let (gain, share) = fm.at(d, r, at.texel, residual);
+        let (gain, share) = fm.at(d, r, at.texel, residual, floor.road_share(d, at.texel));
         if !(share > 0.0) {
             return Vec3f::default();
         }
@@ -1490,16 +1698,65 @@ impl Env {
     /// item 2): the clear ground side's haze takes the stack's light just above the horizon along `d`'s azimuth
     /// (`horizon_ratio` over the clear sky's luminance there), so it is continuous with the sky there, under a closed
     /// deck as under a gap, and its ground the light under the clouds (`ground_gain`), as `relit_ground` blends
-    /// (`weather::haze_relit`). Classic stacks and maps without a stack keep it as it was, bit for bit.
-    fn under_clouds(&self, d: Vec3f, c: Vec3f, atmo: &atmosphere::Atmosphere, at: Sampling) -> Vec3f {
-        match &self.cloud_stack {
-            Some(stack) if d.y < 0.0 && !stack.all_classic() => weather::haze_relit(d, c, self.ground_gain, &|| weather::HazeFrame {
-                ring: self.horizon_ratio(d, stack, atmo, at),
-                haze: atmo.sky(vec3f(d.x, 0.0, d.z)),
-                ground: atmo.sky(vec3f(0.0, -1.0, 0.0)),
-                clear: atmo.sky(d),
-            }),
-            _ => c,
+    /// (`weather::haze_relit`). From a viewer height, under any cover (a classic stack, the older deck, the volume and
+    /// the weather's deck too), the clear ground side is the air's light in front of the ground and the ground's light
+    /// through it at every depression, and each of those parts takes its own light (`weather::aerial_relit`, by
+    /// `air_relight`): the air's sunlit part the sun's cover, its diffuse part the light round it, the ground the gain.
+    /// Without a viewer height classic stacks and maps without a stack keep it as it was, bit for bit. From a height a
+    /// sky nothing covers is left as it is, bit for bit, unless a modern stack is drawn: its band still takes the
+    /// stack's horizon light (`measure_air_relight` gives it factors of 1), and past the band it is `c` to within
+    /// rounding.
+    fn under_clouds(&self, d: Vec3f, c: Vec3f, atmo: &atmosphere::Atmosphere, at: Sampling, here: Option<&floor::FloorHere>) -> Vec3f {
+        if !(d.y < 0.0) {
+            return c;
+        }
+        // The modern stack's horizon light, which the ground side's band takes at level.
+        let modern = self.cloud_stack.as_ref().filter(|stack| !stack.all_classic());
+        match &self.air_relight {
+            // From a viewer height, under any cover (`weather::aerial_relit`). (A ground stands behind the air under the
+            // drawn horizon: a floor's anywhere below level, the planet's under the grazing ray; the air is in front of
+            // the ground `c` shows, a floor's at its texel's distance as `sky_layers_on` sees it, else the planet's.)
+            Some(relight) => {
+                let grounded = d.y < -atmo.horizon_dip().sin() * d.length();
+                let air = || atmo.air_light(d, here.map(|here| here.dist())).unwrap_or_default();
+                let horizon = modern.map(|stack| {
+                    move || weather::AirFrame {
+                        ring: self.horizon_ratio(d, stack, atmo, at),
+                        haze: atmo.sky(vec3f(d.x, 0.0, d.z)),
+                        night: self.night_ground_side(d, atmo, at, here),
+                    }
+                });
+                weather::aerial_relit(d, c, self.ground_gain, relight, grounded, &air, horizon.as_ref().map(|f| f as &dyn Fn() -> weather::AirFrame))
+            }
+            // (without a viewer height: from one a modern stack always has a relight)
+            None => match modern {
+                Some(stack) => weather::haze_relit(d, c, self.ground_gain, &|| weather::HazeFrame {
+                    ring: self.horizon_ratio(d, stack, atmo, at),
+                    haze: atmo.sky(vec3f(d.x, 0.0, d.z)),
+                    ground: atmo.sky(vec3f(0.0, -1.0, 0.0)),
+                    clear: atmo.sky(d),
+                    night: self.night_ground_side(d, atmo, at, here),
+                }),
+                None => c,
+            },
+        }
+    }
+
+    /// The night's part of the ground side along `d` (below the horizon), as `sky_layers_on` adds it: the floor's
+    /// night ground (`floor_ground`, the night sky's light through the night air) or, without a floor,
+    /// the night sky's ground and its glow's fade into it. Nothing above the horizon or without a night sky. What a
+    /// cloud stack's relighting of the ground side leaves alone (`weather::haze_relit`).
+    fn night_ground_side(&self, d: Vec3f, atmo: &atmosphere::Atmosphere, at: Sampling, here: Option<&floor::FloorHere>) -> Vec3f {
+        let Some(night) = &self.night else { return Vec3f::default() };
+        if !(d.y < 0.0) {
+            return Vec3f::default();
+        }
+        match here {
+            Some(here) => self.floor_ground(d, atmo, here, at).2,
+            None => {
+                let g = self.weather.as_ref().map_or(self.params.sky.atmosphere.ground_color, |weather| weather.ground_color());
+                night.glow(d) + night.ground(d, vec3f(g[0], g[1], g[2]))
+            }
         }
     }
 
@@ -1556,9 +1813,10 @@ impl Env {
             .map_or(self.params.sky.atmosphere.ground_color, |weather| weather.ground_color());
         let ground_color = vec3f(g[0], g[1], g[2]);
         let floor = here.map(|here| self.floor_ground(d, atmo, here, at));
-        let mut c = match &floor {
-            Some((day, keep, _)) => atmo.sky_over(d, *day, *keep),
-            None => atmo.sky(d),
+        let mut c = match (&floor, here) {
+            // (with a viewer height the ground is seen through the air over its own distance, `sky_over_at`)
+            (Some((day, keep, _)), Some(here)) => atmo.sky_over_at(d, *day, *keep, here.dist()),
+            _ => atmo.sky(d),
         };
         // The sun's and the moon's discs are blocked by the unfaded
         // cover, like their keys in `sun`; the rest of the sky by the
@@ -1571,7 +1829,8 @@ impl Env {
         };
         if let Some(night) = &self.night {
             let stars = if points { night.deep_sky(d, at.texel) } else { Vec3f::default() };
-            c += stars + night.glow(d) + floor.map_or_else(|| night.ground(d, ground_color), |(_, _, ground)| ground);
+            // under a floor its ground carries the night air below the horizon (`floor_ground`)
+            c += stars + floor.map_or_else(|| night.glow(d) + night.ground(d, ground_color), |(_, _, ground)| if d.y < 0.0 { ground } else { night.glow(d) });
             // The aurora (plan hdri-7 §4): diffuse light behind the clouds, outside the points, so it lights the dome
             // and the strip's rings; band-limited to the lookup's texel, or to the rings' spacing for a bare lookup.
             if night.has_aurora() && !at.no_aurora {
@@ -1579,9 +1838,9 @@ impl Env {
             }
             if points {
                 discs += match without {
-                    Some(KeyTerm::Moon(share)) => night.moon(d) * (1.0 - share),
+                    Some(KeyTerm::Moon(share)) => night.moon_at(d, at.texel) * (1.0 - share),
                     Some(KeyTerm::Discs | KeyTerm::DiscProbe) => Vec3f::default(),
-                    _ => night.moon(d),
+                    _ => night.moon_at(d, at.texel),
                 };
             }
         }
@@ -1699,23 +1958,64 @@ impl Env {
     /// Rippled water (`FloorModel::rippled`) mirrors the sky without its discs, and the sun and the moon glitter on
     /// it instead (`floor::glitter`, analytic, band-limited to the lookup's texel `at.texel`). `seen(v, discs)` is the
     /// sky along `v`, its discs in or out.
+    /// Where the texel leaves ripples unresolved (`far.rough`) its water mirrors the sky through all the facets it sees
+    /// (`floor::mirror_lobe`), from the horizon to some 20 degrees up on the far water at the default Ripples: each
+    /// facet's sky read from a table of it (MirrorSky) by its own Fresnel. A held bake's mirror is that alone (its own
+    /// table); a released one reads its own (`lobe_sky`) and adds the exact lookup's detail along the facets' mean
+    /// (`far.normal`: a cloud's edge, the strip's, finer than the table's rows) as far as the facets' spread leaves it
+    /// (`mirror_kept`): all of it on near and glassy water, none where they spread the mirror over several rows. So the
+    /// low sky the far water's facets see in part (a skyline's city, the horizon's haze, a sunset's glow) stays in it,
+    /// and the far lake's light is the same held and released.
     fn floor_waters(&self, d: Vec3f, field: Vec3f, bed: Vec3f, here: &floor::FloorHere, at: Sampling, seen: &dyn Fn(Vec3f, bool) -> Vec3f) -> Vec3f {
         let down = (-d.y).min(1.0);
         let far = &here.far;
         let (water_share, ice_share) = (here.water(), here.ice());
         let n = far.normal;
-        let m = d - n * (2.0 * d.dot(n));
-        // a ripple that would mirror the ground mirrors the horizon's sky instead
-        let m = if m.y > 0.0 { m } else { vec3f(m.x, 1.0e-4, m.z).normalize() };
+        // (a ripple that would mirror the ground mirrors the horizon's sky instead)
+        let m = floor::mirror_of(d, n);
         let held = self.held_mirror.as_ref().filter(|_| water_share > 0.0 || ice_share > 0.0);
         let rippled = (self.floor.as_ref().is_some_and(|floor| floor.rippled()) || held.is_some()) && water_share > 0.0;
-        let mirror = match held {
-            Some(table) => table.sample(m),
-            None => seen(m, !rippled),
+        // (a released table's row not made yet is made from the sky the lake mirrors, its clouds read as this lookup's
+        // texel reads them: from the bake's cache or records, at no more than its own cost)
+        let table_at = Sampling { texel: at.texel, cache: at.cache, gpu: at.gpu, horizon: at.horizon, ..Sampling::default() };
+        let table_sky = |v: Vec3f| self.mirrored_sky(v, table_at);
+        // the facets' spread, and how much of the exact lookup along their mean the texel keeps (none of it needs the
+        // lookup at all: the ice, which mirrors one direction, always does)
+        let lobe = water_share > 0.0 && far.rough > 0.0;
+        let spread = floor::mirror_spread(d, far.rough);
+        let kept = self.mirror_kept(d, far);
+        let mirror = if lobe && !(kept > 0.0) && !(ice_share > 0.0) {
+            Vec3f::default()
+        } else {
+            match held {
+                Some(table) => table.sample(m, &table_sky),
+                None => seen(m, !rippled),
+            }
         };
         let mut out = field;
         if water_share > 0.0 {
-            let mut water = weather::water_surface(bed, mirror, weather::water_fresnel(down));
+            // (water's Fresnel at the facet it mirrors by: the ripples' normal, turned toward the eye by the slopes the
+            // texel leaves unresolved, `floor::visible_tilt`; a flat lake's, bit for bit, at the look's own angle)
+            let fresnel = weather::water_fresnel((-d.dot(n)).clamp(0.0, 1.0));
+            let mut water = if lobe {
+                let table = held.unwrap_or(&self.lobe_sky);
+                let (mut facets, mut through) = (Vec3f::default(), 0.0f32);
+                floor::mirror_lobe(d, n, far.rough, MirrorSky::lobe_step(m, spread), &mut |v, c, w| {
+                    let f = weather::water_fresnel(c) * w;
+                    facets += table.sample(v, &table_sky) * f;
+                    through += f;
+                });
+                // the exact lookup's detail the table cannot hold, as far as the facets' spread leaves it
+                let mirrored = if kept > 0.0 {
+                    let c = facets + (mirror - table.sample(m, &table_sky)) * (kept * fresnel);
+                    vec3f(c.x.max(0.0), c.y.max(0.0), c.z.max(0.0))
+                } else {
+                    facets
+                };
+                weather::water_surface(bed, Vec3f::default(), through) + mirrored
+            } else {
+                weather::water_surface(bed, mirror, fresnel)
+            };
             if rippled {
                 let v = vec3f(-d.x, -d.y, -d.z);
                 for &(l, irradiance, radius) in &self.glints {
@@ -1734,13 +2034,122 @@ impl Env {
         out
     }
 
+    /// How much of the light the floor's water and ice mirror along their one exact lookup (`far.normal`) a texel along
+    /// `d` keeps (`floor_waters`): none in a held bake (its mirror is its table), all of it where the water mirrors one
+    /// direction, and where the facets spread the mirror (`far.rough`) the detail finer than the table's rows that their
+    /// spread leaves (`MirrorSky::detail_kept`).
+    fn mirror_kept(&self, d: Vec3f, far: &floor::FloorFar) -> f32 {
+        if self.held_mirror.is_some() {
+            0.0
+        } else if far.rough > 0.0 {
+            MirrorSky::detail_kept(floor::mirror_of(d, far.normal), floor::mirror_spread(d, far.rough))
+        } else {
+            1.0
+        }
+    }
+
+    /// A puddle's water along `d` under rain (the weather lane, 2026-11-09), over its bed `bed` (the ground as lit): the
+    /// rain's slopes at its ground point, `eye` metres under the eye (`RainOnWater::at`), turn its mirror by the young
+    /// rings the texel resolves and spread it by the rest, as the Lake's facets spread its own (`floor::mirror_lobe`:
+    /// each facet's sky read from the table they read, by its own Fresnel, with the exact lookup's detail as far as the
+    /// spread leaves it, as `floor_waters` does); its bottom shows through what the facets do not mirror
+    /// (`weather::water_surface`), and the sun and the moon glitter on it (`floor::glitter`). Without `rings` all the
+    /// rain's slopes are its mean sheen (`RainOnWater::all`), the same at every ground point.
+    fn rain_puddle(&self, rain: &rain_water::RainOnWater, d: Vec3f, bed: Vec3f, eye: f32, rings: bool, at: Sampling) -> Vec3f {
+        let s = (-d.y).min(1.0);
+        let h = (d.x * d.x + d.z * d.z).sqrt();
+        if !(s > 0.0 && h > 0.0) {
+            return weather::water_surface(bed, self.mirrored_sky(vec3f(d.x, -d.y, d.z), at), weather::water_fresnel(s));
+        }
+        // the ground point, and a texel's footprint there along the look and across it
+        let to_ground = eye / s;
+        let (x, z) = (d.x * to_ground, d.z * to_ground);
+        let foot = if at.texel > 0.0 { eye * at.texel / (s * s).max(1.0e-30) } else { 0.0 };
+        let side = h * to_ground * at.texel;
+        let (gx, gz, rough) = if rings { rain.at(x, z, foot, side) } else { (0.0, 0.0, rain.all()) };
+        let rings = vec3f(-gx, 1.0, -gz).normalize();
+        let n = floor::visible_tilt(rings, rough, x, z, s);
+        let (mirrored, through) = self.facets_mirror(d, n, rough, at);
+        let mut water = weather::water_surface(bed, Vec3f::default(), through) + mirrored;
+        let v = vec3f(-d.x, -d.y, -d.z);
+        for &(l, irradiance, radius) in &self.glints {
+            water += floor::glitter(v, l, rings, irradiance, radius, rough, rough.max(rain.all()), at.texel, weather::WATER_F0);
+        }
+        water
+    }
+
+    /// What water seen along `d` mirrors through the facets of its slopes left unresolved, `rough` per axis round their
+    /// visible mean normal `n` (`floor::mirror_lobe`): each facet's sky read from the table (MirrorSky, the held one in
+    /// a held bake) by its own Fresnel, with the exact lookup's detail along `n`'s mirror as far as the facets' spread
+    /// leaves it, where that is worth a whole sky lookup (over RAIN_DETAIL_LEAST, `MirrorSky::detail_kept`); and their
+    /// Fresnel's mean, the share of the light mirrored (what shows of the bottom or the ground is the rest). The rained
+    /// puddles' (`rain_puddle`) and the damp ground's (`damp_sheen`).
+    fn facets_mirror(&self, d: Vec3f, n: Vec3f, rough: f32, at: Sampling) -> (Vec3f, f32) {
+        let m = floor::mirror_of(d, n);
+        let spread = floor::mirror_spread(d, rough);
+        // (the exact lookup only where its detail is worth a whole sky lookup: the share kept over RAIN_DETAIL_LEAST,
+        // taken continuously from there)
+        let kept = if self.held_mirror.is_some() { 0.0 } else { ((MirrorSky::detail_kept(m, spread) - RAIN_DETAIL_LEAST) / (1.0 - RAIN_DETAIL_LEAST)).max(0.0) };
+        let table_at = Sampling { texel: at.texel, cache: at.cache, gpu: at.gpu, horizon: at.horizon, ..Sampling::default() };
+        let table_sky = |v: Vec3f| self.mirrored_sky(v, table_at);
+        let table = self.held_mirror.as_ref().unwrap_or(&self.lobe_sky);
+        let (mut facets, mut through) = (Vec3f::default(), 0.0f32);
+        floor::mirror_lobe(d, n, rough, MirrorSky::lobe_step(m, spread), &mut |v, c, w| {
+            let f = weather::water_fresnel(c) * w;
+            facets += table.sample(v, &table_sky) * f;
+            through += f;
+        });
+        let mirrored = if kept > 0.0 {
+            let fresnel = weather::water_fresnel((-d.dot(n)).clamp(0.0, 1.0));
+            let c = facets + (self.mirrored_sky(m, at) - table.sample(m, &table_sky)) * (kept * fresnel);
+            vec3f(c.x.max(0.0), c.y.max(0.0), c.z.max(0.0))
+        } else {
+            facets
+        };
+        (mirrored, through)
+    }
+
+    /// The sheen of the damp ground between the puddles along `d` (below the horizon), before the wetness's share of
+    /// it (`Weather::ground_sheened`): its film of water mirrors the sky through rough facets (`floor::damp_slopes`, by
+    /// what the ground there is, `FloorModel::damp_slopes_at`: paved, granular, stony or grass), round their visible
+    /// mean (`floor::visible_tilt`), a blurred sheen drawn out toward the eye (`facets_mirror`),
+    /// and the sun and the moon make a broad glare on it (`floor::glitter`, the same facets; not in a bare lookup,
+    /// which leaves out their discs). Standing water alone mirrors the sky sharply.
+    /// The few even looks (`Sampling::even_ground`: the strip's ground rings, the skirt's hold) read the sky once, along
+    /// the facets' mean mirror, by their Fresnel's mean: the mirror table's rows they would make are made before the
+    /// strip's city stands in them and are made again (`Env::new`, `with_skyline_par`), some 14 rows of 256 sky lookups
+    /// for the skirt's 384 looks.
+    fn damp_sheen(&self, d: Vec3f, at: Sampling) -> Vec3f {
+        let s = (-d.y).min(1.0);
+        let up = vec3f(0.0, 1.0, 0.0);
+        let rough = self.floor.as_ref().map_or(floor::damp_slopes(None), |floor| floor.damp_slopes_at(d, at.texel));
+        let n = floor::visible_tilt(up, rough, d.x, d.z, s);
+        if at.even_ground {
+            let m = floor::mirror_of(d, n);
+            let mut through = 0.0f32;
+            floor::mirror_lobe(d, n, rough, MirrorSky::lobe_step(m, floor::mirror_spread(d, rough)), &mut |_, c, w| through += weather::water_fresnel(c) * w);
+            return self.mirrored_sky(m, at) * through;
+        }
+        let (mut sheen, _) = self.facets_mirror(d, n, rough, at);
+        // (a bare lookup leaves out the discs, and so their glare: the flat sheen's mirror read them from the sky)
+        if at.bare {
+            return sheen;
+        }
+        let v = vec3f(-d.x, -d.y, -d.z);
+        for &(l, irradiance, radius) in &self.glints {
+            sheen += floor::glitter(v, l, up, irradiance, radius, rough, rough, at.texel, weather::WATER_F0);
+        }
+        sheen
+    }
+
     /// The floor's light, measured once in the first phase (plan hdri-8 T2): `floor_lit` from the sky's L1 moments
     /// as drawn (`moments`, the dome's) and the key by `floor_light`'s rule, and the lights a rippled lake glitters
     /// with.
     fn measure_floor_light(&mut self, moments: [Vec3f; 4]) {
         let Some(atmo) = &self.atmo else { return };
         let key = self.floor_light().and_then(|light| light.key_dir);
-        let sun = atmo.sun_dir();
+        // (the sun where its light arrives from, as the key)
+        let sun = atmo.disc_dir();
         let sun_key = key.is_some_and(|k| vec(k) == sun);
         let moon = self.night.as_ref().and_then(|night| night.moon_key()).filter(|moon| !sun_key && key.is_some_and(|k| vec(k) == moon.dir));
         let (night_light, moon_light) = self.night.as_ref().map_or((Vec3f::default(), Vec3f::default()), |night| (night.ground_irradiance(), night.moon_ground_irradiance()));
@@ -1754,7 +2163,14 @@ impl Env {
             moon_key: moon.filter(|moon| moon.dir.y > 0.0).map(|moon| moon_light * (1.0 / moon.dir.y)),
             sh: moments,
         };
-        if self.floor.as_ref().is_some_and(|floor| floor.mirrors() && !floor.frozen()) {
+        // a candle light's model outdoors takes this light too (its key's direction, the ground's albedo round it)
+        if self.studio.has_candles() {
+            let ground = self.params.floor.as_ref().filter(|f| f.on).map_or(Vec3f::all(0.2), |_| Vec3f::all(0.2));
+            self.studio.light_candles_outdoors(self.floor_lit, key.map(vec), ground);
+        }
+        // (and on a wet ground: its damp ground's glare, `damp_sheen`, and the puddles a rain roughens, `rain_puddle`)
+        let wet = self.weather.as_ref().is_some_and(|weather| weather.mirrors());
+        if self.floor.as_ref().is_some_and(|floor| floor.mirrors() && !floor.frozen()) || wet {
             let mut glints = Vec::new();
             let elevation = sun.y.clamp(-1.0, 1.0).asin();
             let outer = atmo.sun_outer_radius();
@@ -1764,7 +2180,7 @@ impl Env {
             }
             if let Some(moon) = self.night.as_ref().and_then(|night| night.moon_key()) {
                 let solid = std::f32::consts::TAU * (1.0 - moon.cos_radius);
-                glints.push((moon.dir, moon.radiance * (solid * self.cover_toward_disc(moon.dir, Disc::Moon)), moon.cos_radius.clamp(-1.0, 1.0).acos()));
+                glints.push((moon.dir, moon.radiance * (self.cover_toward_disc(moon.dir, Disc::Moon) * solid), moon.cos_radius.clamp(-1.0, 1.0).acos()));
             }
             self.glints = glints;
         }
@@ -1776,17 +2192,21 @@ impl Env {
     /// lake. None without a floor. It reads no planes and no strip, so it is the same in either phase and is asked for
     /// with the strip's light before either is rendered.
     pub fn floor_light(&self) -> Option<floor::FloorLight> {
-        let floor = self.floor.as_ref()?;
+        // a hybrid studio's ground stands outside: the planes are rendered for its outside
+        let Some(floor) = self.floor.as_ref() else {
+            return self.window_sky.as_ref().filter(|_| self.params.is_hybrid()).and_then(|outside| outside.floor_light());
+        };
         let snow = self.params.sky.weather.as_ref().is_some_and(|w| weather::effects(w).snow);
         let key_dir = self.atmo.as_ref().and_then(|atmo| {
-            let sun = atmo.sun_dir();
+            // (the sun where its light arrives from, as the key; the moon's turn by the sun's true depth)
+            let sun = atmo.disc_dir();
             let outer = atmo.sun_outer_radius();
             if smoothstep(-outer, outer, sun.y.clamp(-1.0, 1.0).asin()) > 0.0 {
                 return Some(arr(sun));
             }
             let night = self.night.as_ref()?;
             let moon = night.moon_key()?;
-            let arrived = smoothstep(6.0, 8.0, -sun.y.clamp(-1.0, 1.0).asin().to_degrees());
+            let arrived = smoothstep(6.0, 8.0, -atmo.sun_dir().y.clamp(-1.0, 1.0).asin().to_degrees());
             (arrived > 0.0).then(|| arr(moon.dir))
         });
         Some(floor::FloorLight { key_dir, snow, frozen: floor.frozen() })
@@ -1811,30 +2231,37 @@ impl Env {
     }
 
     /// This map for a held bake's clouds (design §5.7): a heap's self-shadow takes 2 steps and the shadows between
-    /// layers 2 octaves. It is set after the build, as [`Self::with_held_floor_par`] is. The dome, the ground gain, the
-    /// disc covers and the key were measured as released. Released bakes and exports never call it. A map without a
-    /// built cloud stack draws the same with it.
+    /// layers 2 octaves. It is set after the build, as [`Self::with_held_floor_par`] is, so the dome, the ground gain,
+    /// the disc covers and the key were measured with the released march. Where a held build
+    /// ([`Self::new_for_bake_par`]) found no fine sun-depth level a released bake left, they read a marched volume's
+    /// coarse level alone (cloud volumes design §12.1). Released bakes and exports never call it. A map without a built
+    /// cloud stack draws the same with it.
     pub fn with_held_clouds(mut self) -> Env {
         self.held_clouds = true;
         self
     }
 
-    /// The sky a lake mirrors (MirrorSky's texels): the dry sky without its discs, and under a weather as the weather
-    /// shows it (its veil, its bolt), the strip over it, as `base_layer`'s mirror sees it. None when the runner
-    /// skipped a row.
+    /// A held bake's table of the sky a lake mirrors (`mirrored_sky`), MIRROR_SKY_W wide. None when the runner skipped a
+    /// row.
     fn mirror_sky(&self, run: &dyn Fn(usize, &(dyn Fn(usize) + Sync))) -> Option<MirrorSky> {
-        let atmo = self.atmo.as_ref()?;
+        self.atmo.as_ref()?;
         let at = Sampling { texel: std::f32::consts::TAU / MIRROR_SKY_W as f32, ..Sampling::default() };
-        MirrorSky::new(run, &|v| {
-            let sky = self.sky_layers(v, atmo, Some(KeyTerm::Discs), at);
-            match &self.weather {
-                Some(weather) => {
-                    let seen = weather.veil(v, sky, self.weather_sun, self.dome) + weather.lightning(v, at.texel);
-                    self.over_city(v, seen, Some(weather), &Cell::new(None))
-                }
-                None => self.over_city(v, sky, None, &Cell::new(None)),
+        MirrorSky::new(MIRROR_SKY_W, run, &|v| self.mirrored_sky(v, at))
+    }
+
+    /// The sky a lake mirrors along `v` (MirrorSky's texels), looked up as `at` asks: the dry sky without its discs, and
+    /// under a weather as the weather shows it (its veil, its bolt), the strip over it, as `base_layer`'s mirror sees
+    /// it. Nothing without an atmosphere.
+    fn mirrored_sky(&self, v: Vec3f, at: Sampling) -> Vec3f {
+        let Some(atmo) = &self.atmo else { return Vec3f::default() };
+        let sky = self.sky_layers(v, atmo, Some(KeyTerm::Discs), at);
+        match &self.weather {
+            Some(weather) => {
+                let seen = weather.veil_at(v, sky, self.weather_sun, self.dome, at.texel) + weather.lightning(v, at.texel);
+                self.over_city(v, seen, Some(weather), &Cell::new(None), at.texel)
             }
-        })
+            None => self.over_city(v, sky, None, &Cell::new(None), at.texel),
+        }
     }
 
     /// What an export `width` texels wide asks of the GPU for its cloud volumes (design §12.3, §12.11 item 4), in
@@ -1910,11 +2337,45 @@ impl Env {
         self.attach_cloud_records_in(width, cloud_volume_gpu::EXPORT_MODE, records)
     }
 
-    /// [`Self::attach_cloud_records`] of records marched in `mode` (the preview's, `Env::cloud_ask_in`).
+    /// [`Self::attach_cloud_records`] of records marched in `mode` (the preview's, `Env::cloud_ask_in`). Records of the
+    /// export mode's march draw the GPU's own look (design §12.12 item 2), which the CPU's march, on which `Env::new`
+    /// measured the light the clouds let down, is not: the same cloud (the dome's looks' mean opacity by band of
+    /// elevation within 0.08, what the sun's disc passes within 0.03) lit by another law (the export shaders' sun, dome,
+    /// open side and bounce), so that light is measured again on them (`measure_drawn_light`).
+    /// Under a closed Nimbostratus, sun 30 degrees up, the CPU's deck lit by its open side and its far haze put 1.6 times
+    /// the drawn irradiance on the ground, b/r 1.30 against 0.99. Records of the CPU mode are the CPU's own march, which
+    /// `Env::new` measured: nothing is measured again.
     pub fn attach_cloud_records_in(&mut self, width: usize, mode: cloud_volume_gpu::GpuMode, records: &[std::sync::Arc<cloud_volume_gpu::GpuRecord>]) -> Result<(), String> {
         match self.cloud_stack.as_mut() {
-            Some(stack) => stack.attach_gpu_records(width, mode, records),
-            None => Err("the map has no cloud stack".to_string()),
+            Some(stack) => stack.attach_gpu_records(width, mode, records)?,
+            None => return Err("the map has no cloud stack".to_string()),
+        }
+        if mode != cloud_volume_gpu::GpuMode::Cpu {
+            self.measure_drawn_light(width);
+        }
+        Ok(())
+    }
+
+    /// The light under the clouds measured again as a bake `width` wide draws the sky (its texel's lookups read the
+    /// records attached at that width), and what was built on it: the floor's light and, with planes attached, their
+    /// hand-over (`measure_floor_match`); with a skyline, the skirt held to the ground the gain lights. The sun's and
+    /// the moon's covers stay the drawn discs' (`disc_covers`: the map draws a disc through the volume's own opacity,
+    /// as the key takes it). 256 lookups that read the records, and the skirt's 384 of the ground with a skyline.
+    /// The skyline's light is read from then on as the map draws the sky too (`skyline_light`, `drawn_light_width`).
+    fn measure_drawn_light(&mut self, width: usize) {
+        if self.atmo.is_none() {
+            return;
+        }
+        self.drawn_light_width = Some(width);
+        let moments = self.measure_cover_light(Sampling { bare: true, texel: std::f32::consts::TAU / width.max(2) as f32, ..Sampling::default() });
+        if self.floor.is_some() {
+            self.measure_floor_light(moments);
+            if let Some(planes) = self.floor_planes.clone() {
+                self.floor_match = self.measure_floor_match(&planes);
+            }
+        }
+        if let Some((band, turn)) = self.skyline.clone() {
+            self.city_skirt = Some(self.skirt_for(&band, turn));
         }
     }
 
@@ -1929,15 +2390,23 @@ impl Env {
         self.cloud_stack.as_ref().is_some_and(|stack| stack.has_gpu_records())
     }
 
+    /// The width of the GPU's records the light under the clouds was measured on (`attach_cloud_records_in`), which
+    /// `skyline_light` then reads the sky at: that light is that width's alone. None where the light is `Env::new`'s.
+    pub fn drawn_light_width(&self) -> Option<usize> {
+        self.drawn_light_width
+    }
+
     /// The floor's far model (None without a floor): its kind's recipe and its mean material for the GPU's ask
     /// (`FloorModel::recipe`, `FloorModel::mean_albedo`), its eye and its reach.
     pub fn floor_model(&self) -> Option<&floor::FloorModel> {
-        self.floor.as_ref()
+        // a hybrid studio's ground is its outside's (seen from the room's camera height)
+        self.floor.as_ref().or_else(|| self.window_sky.as_ref().filter(|_| self.params.is_hybrid()).and_then(|outside| outside.floor.as_ref()))
     }
 
-    /// True when this map draws a floor (Sky mode, its block on, no image the whole base).
+    /// True when this map draws a floor (Sky mode, its block on, no image the whole base; or a hybrid studio's
+    /// outside, its ground).
     pub fn has_floor(&self) -> bool {
-        self.floor.is_some()
+        self.floor_model().is_some()
     }
 
     /// This map with the floor's planes attached (plan hdri-8 §4.3), as the app hands them over after rendering
@@ -1947,12 +2416,21 @@ impl Env {
     /// map without a floor is returned unchanged. The order of this and `with_skyline_par` does not matter. The
     /// casters' rows are spread by `run`, polling `cancelled`: None when it stopped.
     pub fn with_floor_par(mut self, planes: std::sync::Arc<floor::FloorPlanes>, cancelled: &dyn Fn() -> bool, run: &dyn Fn(usize, &(dyn Fn(usize) + Sync))) -> Option<Env> {
+        // A hybrid studio's ground is its outside's: the outside composes them, and a room standing on the ground
+        // reads them through its slot.
+        if let Some(slot) = &self.ground_slot {
+            *slot.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(planes.clone());
+        }
+        if let Some(outside) = self.window_sky.take() {
+            self.window_sky = Some(Box::new((*outside).with_floor_par(planes.clone(), cancelled, run)?));
+        }
         if self.floor.is_none() {
             return Some(self);
         }
         self.floor_match = self.measure_floor_match(&planes);
         self.floor_planes = Some(planes);
         self.held_mirror = None;
+        self.lobe_sky = MirrorSky::lazy(MIRROR_LOBE_W);
         if !self.studio.bloom_casters().is_empty() {
             self.studio.clear_caster_blooms();
             if !self.build_caster_bloom(self.bloom_width, cancelled, run) {
@@ -1964,15 +2442,27 @@ impl Env {
     }
 
     /// The far ground's hand-over from `planes` (`floor::FloorMatch`): the planes' lit ground (day, as `floor_ground`
-    /// composes it) against the far model's just inside their reach (theirs, else the floor's).
+    /// composes it) against the far model's just inside their reach (theirs, else the floor's). None for a floor whose
+    /// planes meet its far model elsewhere (a Mountain's and Sand's at the coarse reach) or whose ground there is not
+    /// its far ground (a Lake's beach): `FloorModel::hands_over_at_reach`.
     fn measure_floor_match(&self, planes: &floor::FloorPlanes) -> Option<floor::FloorMatch> {
         let (floor, atmo) = (self.floor.as_ref()?, self.atmo.as_ref()?);
+        if !floor.hands_over_at_reach() {
+            return None;
+        }
         let reach = if planes.reach() > 0.0 { planes.reach() } else { floor.reach_m() };
         let texel = std::f32::consts::TAU / planes.width() as f32;
         let lit = &self.floor_lit;
-        let near = |_: Vec3f, t: &floor::FloorTexel| vec(t.albedo) * lit.day(t.normal, t.key) * (1.0 / std::f32::consts::PI);
+        let near = |d: Vec3f, t: &floor::FloorTexel| {
+            let ground = floor.sample(d, texel);
+            let (bounce, _) = lit.bounce(t.normal, ground.albedo * (1.0 - ground.water));
+            vec(t.albedo) * (lit.day(t.normal, t.key) + bounce) * (1.0 / std::f32::consts::PI)
+        };
         let far = |d: Vec3f| atmo.ground_radiance(floor.sample(d, texel).albedo);
-        floor::FloorMatch::measure(planes, reach, floor.seed(), &near, &far)
+        // a road's asphalt takes its own ratio over the whole turn (the road bends away from its azimuths at R)
+        let road = |d: Vec3f| floor.road_share(d, texel);
+        let material: Option<&dyn Fn(Vec3f) -> f32> = if floor.kind() == FloorKind::Road { Some(&road) } else { None };
+        floor::FloorMatch::measure(planes, reach, floor.seed(), &near, &far, material)
     }
 
     /// [`Self::with_floor_par`] on this thread.
@@ -1994,6 +2484,23 @@ impl Env {
     /// and the light the open sky put there (its clouds left out), so the two
     /// differ by the cover alone.
     fn dome_light(&self) -> Dome {
+        self.dome_light_at(Sampling { bare: true, ..Sampling::default() })
+    }
+
+    /// The light the cover lets down, measured on the dome as the lookups `at` draw it (`dome_light_at`): the weather's
+    /// veil's (`dome`), the ground's gain (`measure_ground_gain`) and, from a viewer height, how the air below is relit
+    /// (`measure_air_relight`). Returns the dome's moments, which light the floor (`measure_floor_light`).
+    fn measure_cover_light(&mut self, at: Sampling) -> [Vec3f; 4] {
+        let dome = self.dome_light_at(at);
+        self.dome = dome.mean;
+        self.ground_gain = self.measure_ground_gain(&dome);
+        self.air_relight = self.measure_air_relight(&dome);
+        dome.moments
+    }
+
+    /// [`Self::dome_light`] with the lookups `at` (`bare`): `Env::new`'s look along each exact direction (a cloud volume
+    /// marched on the CPU), or a bake's texel, whose lookups read the GPU's records attached at its width.
+    fn dome_light_at(&self, at: Sampling) -> Dome {
         const ROWS: usize = DOME_ROWS;
         const COLUMNS: usize = DOME_COLUMNS;
         let Some(atmo) = &self.atmo else {
@@ -2005,7 +2512,7 @@ impl Env {
         for j in 0..ROWS {
             for i in 0..COLUMNS {
                 let (d, sine) = dome_look(j, i);
-                let drawn = self.sky_layers(d, atmo, None, Sampling { bare: true, ..Sampling::default() });
+                let drawn = self.sky_layers(d, atmo, None, at);
                 // What sky_layers draws with no clouds, and without the points.
                 let open = atmo.sky(d) + self.night.as_ref().map_or(Vec3f::default(), |night| night.glow(d));
                 // The aurora is in what the open sky puts on the ground too, so the cover's gain stays a cover ratio
@@ -2015,6 +2522,7 @@ impl Env {
                     _ => open,
                 };
                 dome.mean += drawn;
+                dome.open_mean += open;
                 dome.irradiance += drawn * (sine * share);
                 dome.open += open * (sine * share);
                 dome.moments[0] += drawn * share;
@@ -2024,6 +2532,7 @@ impl Env {
             }
         }
         dome.mean *= 1.0 / (ROWS * COLUMNS) as f32;
+        dome.open_mean *= 1.0 / (ROWS * COLUMNS) as f32;
         dome
     }
 
@@ -2035,10 +2544,20 @@ impl Env {
     /// and a sky nothing covers leaves it exactly as it was. Per channel; 1
     /// where the clear sky put no light.
     fn measure_ground_gain(&self, dome: &Dome) -> Vec3f {
-        let Some(atmo) = &self.atmo else {
+        let Some((lit, open)) = self.ground_light_under(dome) else {
             return Vec3f::all(1.0);
         };
-        let rise = atmo.sun_dir().y.max(0.0);
+        let gain = |lit: f32, open: f32| if open > 0.0 && lit.is_finite() { lit / open } else { 1.0 };
+        vec3f(gain(lit.x, open.x), gain(lit.y, open.y), gain(lit.z, open.z))
+    }
+
+    /// The light on a level ground under this map's sky and under the clear sky (D7), whose ratio is the ground's gain
+    /// (`measure_ground_gain`): the dome as drawn and the open one (`dome_light`), and the sun and the moon through the
+    /// clouds and without them. None without an atmosphere.
+    fn ground_light_under(&self, dome: &Dome) -> Option<(Vec3f, Vec3f)> {
+        let atmo = self.atmo.as_ref()?;
+        // (the sun's light arrives from where it is seen, as `Atmosphere::ground_light` takes it)
+        let rise = atmo.disc_dir().y.max(0.0);
         let (moon, moon_through) = match &self.night {
             Some(night) => {
                 // (over a built cloud stack, its cone mean over the moon's disc, measured at build)
@@ -2055,8 +2574,46 @@ impl Env {
         };
         let open = dome.open + atmo.sun_irradiance() * rise + moon;
         let lit = dome.irradiance + self.weather_sun * rise + moon * moon_through;
-        let gain = |lit: f32, open: f32| if open > 0.0 && lit.is_finite() { lit / open } else { 1.0 };
-        vec3f(gain(lit.x, open.x), gain(lit.y, open.y), gain(lit.z, open.z))
+        Some((lit, open))
+    }
+
+    /// How the cover relights the air a viewer at a height of its own sees below the horizon, per part of its light
+    /// (`weather::AirRelight`). The sun's light that reaches it is the clouds' cover along the sun's disc, as the key
+    /// and `weather_sun` take it. The multiple scattering is a scattering of the light round the air, the sky's from
+    /// above and the lit ground's from below (Hillaire's isotropic source holds both: the sunlit ground's bounce is a
+    /// third of it from 2000 m with the sun 30 degrees up), so it takes that light under the clouds over the clear
+    /// sky's: the dome's mean radiance as drawn and the ground's radiance under the clouds (its albedo, the
+    /// atmosphere's ground, times `ground_light_under`'s light over pi), over the open dome's mean on the same looks
+    /// and the clear ground's. The dome's irradiance ratio alone (the deck's light on a level surface over the clear
+    /// sky's, without the sun) relit it as if the clear air were lit by the blue sky only: 0.73 of the clear multiple
+    /// scattering under a closed Nimbostratus from 2000 m where this is 0.34, reddened to half the blue. None without a
+    /// viewer height, and where nothing covers the sky (every ratio exactly 1) and no cloud stack with a modern entry
+    /// is drawn: that ground side stays as it was, bit for bit (`under_clouds` returns it). Under such a stack the
+    /// ground side's band still takes the stack's light just above the horizon, which a cloud no look of the dome and
+    /// no sample of the sun's disc meets can hold (a storm 100 km out, between the looks), so its ratios of exactly 1
+    /// stay a relight: None sent it to `weather::haze_relit`, the ground side without a height, whose blend ran down
+    /// toward the ground straight below and handed over to `c` 3 degrees down (from 2000 m, 0.58 of the clear ground
+    /// side 2.9 degrees down across the sun, 0.21 toward it, then 1).
+    fn measure_air_relight(&self, dome: &Dome) -> Option<weather::AirRelight> {
+        let atmo = self.atmo.as_ref()?;
+        atmo.viewer_height()?;
+        let (lit, open) = self.ground_light_under(dome)?;
+        let sunlit = self.disc_covers.as_ref().map_or(Vec3f::all(1.0), |covers| covers.sun);
+        // the atmosphere's ground: the floor's mean albedo, else the ground colour the weather leaves (`Env::new`)
+        let albedo = match &self.floor {
+            Some(floor) => vec(floor.mean_albedo(30f32.to_radians())),
+            None => vec(self.weather.as_ref().map_or(self.params.sky.atmosphere.ground_color, |weather| weather.ground_color())),
+        };
+        let round = |sky: Vec3f, ground: Vec3f| sky + albedo * ground * (1.0 / std::f32::consts::PI);
+        let (under, clear) = (round(dome.mean, lit), round(dome.open_mean, open));
+        let ratio = |a: f32, b: f32| if b > 0.0 && a.is_finite() { a / b } else { 1.0 };
+        let diffuse = vec3f(ratio(under.x, clear.x), ratio(under.y, clear.y), ratio(under.z, clear.z));
+        let one = Vec3f::all(1.0);
+        let modern = self.cloud_stack.as_ref().is_some_and(|stack| !stack.all_classic());
+        if sunlit == one && diffuse == one && self.ground_gain == one && !modern {
+            return None;
+        }
+        Some(weather::AirRelight { sunlit, diffuse })
     }
 
     /// The luminance a level surface receives from the mode's own base (its
@@ -2068,10 +2625,10 @@ impl Env {
         let layer = |d: Vec3f| if d.y > 0.0 { self.base_layer(d, None, at) } else { Vec3f::default() };
         let mut map = bake_with(composite::SKY_METER_WIDTH, &layer);
         // hot_spots() are in world space; the base layer lives in the map's own frame.
-        let hot: Vec<(Vec3f, f32)> = self
+        let hot: Vec<HotSpot> = self
             .hot_spots()
             .into_iter()
-            .map(|(dir, radius)| (rotate_y(dir, -self.params.rotation_deg), radius))
+            .map(|spot| HotSpot { dir: rotate_y(spot.dir, -self.params.rotation_deg), ..spot })
             .collect();
         refine_hot_spots(&mut map, &layer, &hot);
         composite::irradiance_above(&map, 0.0)
@@ -2151,10 +2708,13 @@ impl Env {
         // stands in front of the disc after that, the lights and a base
         // image's mask, is `disc_share`.
         let cover = |dir: Vec3f, disc: Disc| self.cover_toward_disc(dir, disc);
-        let sun = atmo.sun_dir();
+        // The key comes from where the sun's light arrives: the drawn disc's centre, lifted by the refraction
+        // (`Atmosphere::disc_dir`), and it goes when that disc goes under the horizon (from a viewer height over the
+        // planet's ground, below level: `Atmosphere::horizon_dip`).
+        let sun = atmo.disc_dir();
         let elevation = sun.y.clamp(-1.0, 1.0).asin();
         let outer = atmo.sun_outer_radius();
-        let visible = smoothstep(-outer, outer, elevation);
+        let visible = smoothstep(-outer, outer, elevation + atmo.horizon_dip());
         if visible > 0.0 {
             // The cone's mean radiance, so radiance x cone solid angle is the
             // sun's irradiance at the ground whatever the disc's size and limb.
@@ -2173,10 +2733,10 @@ impl Env {
             let radiance = key.radiance * self.disc_share(&key, &|d| atmo.sun_disc(d));
             return Some((KeyTerm::Sun, self.key_to_world(EnvSun { radiance, ..key })));
         }
-        // After dark the risen moon takes over, once the sun is 6 degrees down.
+        // After dark the risen moon takes over, once the sun is 6 degrees down (truly: refraction is not seen there).
         let night = self.night.as_ref()?;
         let moon = night.moon_key()?;
-        let arrived = smoothstep(6.0, 8.0, -elevation.to_degrees());
+        let arrived = smoothstep(6.0, 8.0, -atmo.sun_dir().y.clamp(-1.0, 1.0).asin().to_degrees());
         if !(arrived > 0.0) {
             return None;
         }
@@ -2194,30 +2754,49 @@ impl Env {
     /// times the weather's rain, its shafts and fog. The clouds baseline reads
     /// it. The key and the lights it dims read [`Self::cover_toward_disc`].
     fn cover_toward(&self, dir: Vec3f) -> f32 {
-        let clouds = match &self.cloud_stack {
+        self.clouds_toward(dir) * self.weather.as_ref().map_or(1.0, |weather| weather.transmittance_toward(dir))
+    }
+
+    /// [`Self::cover_toward`]'s clouds alone, without the weather.
+    fn clouds_toward(&self, dir: Vec3f) -> f32 {
+        match &self.cloud_stack {
             Some(stack) if stack.all_classic() => stack.classic_transmittance_toward(dir),
             Some(stack) => stack.transmittance_toward(dir),
             None => {
                 self.clouds.as_ref().map_or(1.0, |layer| 1.0 - layer.cover_toward(dir))
                     * self.volumetric.as_ref().map_or(1.0, |volume| volume.transmittance_toward(dir))
             }
-        };
-        clouds * self.weather.as_ref().map_or(1.0, |weather| weather.transmittance_toward(dir))
+        }
     }
 
     /// [`Self::cover_toward`] for the sun's disc or the moon's at `dir`, as the key, weather_sun, the glints and the
-    /// strip's sun are dimmed. Over a built cloud stack it is the cone mean over the disc, measured once at build
-    /// (`disc_covers`), times the weather's centre transmittance. Elsewhere it is the centre sample, as before.
-    fn cover_toward_disc(&self, dir: Vec3f, disc: Disc) -> f32 {
+    /// strip's sun are dimmed: the clouds' mean over the disc, measured once at build (`disc_covers`: the sun's over its
+    /// drawn disc, the moon's over a modern stack's cone, else its centre), times the weather's centre transmittance.
+    /// With no clouds at all it is the centre sample.
+    ///
+    /// Under a weather that veils (rain, fog) the sun's is the weather's mean over the drawn disc too: the map veils
+    /// the disc point by point (`Weather::veil`), and low down the fog's and the rain's depth fall steeply up the
+    /// disc, so its upper limb shows through more than its centre (a 3 degree sun in the Misty winter morning's fog:
+    /// 6.7-8.0 % more of the disc than the centre passes). The key so carries the disc as drawn and no more; the
+    /// fog's glow round it, which the veil adds whether or not the disc is drawn, stays the map's own light (the
+    /// owner's ruling, 2026-11-09). A weather that veils nothing, and the moon, keep the centre sample.
+    fn cover_toward_disc(&self, dir: Vec3f, disc: Disc) -> Vec3f {
+        if let (Disc::Sun, Some(atmo), Some(weather)) = (disc, &self.atmo, self.weather.as_ref().filter(|weather| weather.veils())) {
+            let clouds = match &self.disc_covers {
+                Some(covers) => covers.sun,
+                None => Vec3f::all(self.clouds_toward(dir)),
+            };
+            return clouds * atmo.disc_mean(&|d| weather.transmittance_toward(d));
+        }
         match &self.disc_covers {
             Some(covers) => {
                 let clouds = match disc {
                     Disc::Sun => covers.sun,
-                    Disc::Moon => covers.moon,
+                    Disc::Moon => Vec3f::all(covers.moon),
                 };
                 clouds * self.weather.as_ref().map_or(1.0, |weather| weather.transmittance_toward(dir))
             }
-            None => self.cover_toward(dir),
+            None => Vec3f::all(self.cover_toward(dir)),
         }
     }
 
@@ -2235,7 +2814,7 @@ impl Env {
         let hot: Vec<(Vec3f, f32)> = self
             .hot_spots()
             .into_iter()
-            .map(|(dir, radius)| (rotate_y(dir, -self.params.rotation_deg), radius))
+            .map(|spot| (rotate_y(spot.dir, -self.params.rotation_deg), spot.radius))
             .collect();
         let fine_texels = Sampling { texel: weather::CHANNEL_FOOTPRINT, ..Sampling::default() };
         let sky = |d: Vec3f| self.window_sky_at(d, self.base_at(d, None, fine_texels), fine_texels);
@@ -2331,27 +2910,48 @@ impl Env {
     /// refinement: below 4K both are smaller than or comparable to a texel, so
     /// their texels are area-averaged (A1's `refine_hot_spots`).
     /// In Studio mode the discs of the sky behind the windows count too, and
-    /// over wet ground the discs' reflections. A base image's own sun, where
-    /// the map draws it, is as small (D6); under an image that is the whole
-    /// base the generated discs are not drawn, so they are not refined.
-    fn hot_spots(&self) -> Vec<(Vec3f, f32)> {
+    /// the open boxes' bare tubes, and over wet ground the discs' reflections.
+    /// A base image's own sun, where the map draws it, is as small (D6);
+    /// under an image that is the whole base the generated discs are not
+    /// drawn, so they are not refined.
+    /// The sun's disc is crossed ([`HotSpot::crossed`]) where the clouds' pass
+    /// varies over it (`DiscCovers::sun_crossed`), and so is its reflection.
+    /// The moon's always is: its limb is crisp (`night::MOON_LIMB`, under a
+    /// twentieth of a texel at 1024 wide) and its terminator crosses its face,
+    /// which the 8 x 8 grid cannot follow either. At 1024 wide the grid drew
+    /// Moonlit night's moon 1.1 % short of a 64 x 64 grid a texel, and 1.9 %
+    /// short behind a soft leaves caster whose edge crosses it (the case "4:
+    /// moon behind a caster" of `a_generated_keys_light_reaches_the_engine_once`),
+    /// which weighs its limb; the lattice holds both to 0.2 %. Always, not only
+    /// where something stands in front of it: a light's pattern over the disc
+    /// must not change how the disc is sampled, or a caster could add light
+    /// to a texel (`studio`'s `a_caster_never_adds_light`).
+    fn hot_spots(&self) -> Vec<HotSpot> {
         let mut hot = Vec::new();
         let whole = self.base_image.as_ref().is_some_and(|image| !image.replaces_sky());
         if let Some(atmo) = self.atmo.as_ref().filter(|_| !whole) {
-            if self.params.sky.sun_disc.visible && atmo.sun_dir().y > -0.1 {
-                hot.push((rotate_y(atmo.sun_dir(), self.params.rotation_deg), atmo.sun_outer_radius()));
+            if self.params.sky.sun_disc.visible && atmo.disc_dir().y > -0.1 {
+                // (where the disc is seen: lifted by the refraction, `Atmosphere::disc_dir`)
+                let crossed = self.disc_covers.is_some_and(|covers| covers.sun_crossed);
+                let dir = rotate_y(atmo.disc_dir(), self.params.rotation_deg);
+                hot.push(HotSpot { dir, radius: atmo.sun_outer_radius(), crossed });
             }
         }
         if let Some((dir, radius)) = self.night.as_ref().filter(|_| !whole).and_then(|night| night.moon_disc()) {
             if dir.y > -0.1 {
-                hot.push((rotate_y(dir, self.params.rotation_deg), radius));
+                hot.push(HotSpot { dir: rotate_y(dir, self.params.rotation_deg), radius, crossed: true });
             }
         }
         if let Some(outside) = &self.window_sky {
             // The copy has no rotation, so its world frame is this map's own frame.
-            for (dir, radius) in outside.hot_spots() {
-                hot.push((rotate_y(dir, self.params.rotation_deg), radius));
+            for spot in outside.hot_spots() {
+                hot.push(HotSpot { dir: rotate_y(spot.dir, self.params.rotation_deg), ..spot });
             }
+        }
+        // An open box's bare tube is a crisp disc a few texels across too
+        // (`Studio::hot_cores`, in the map's own frame).
+        for (dir, radius) in self.studio.hot_cores() {
+            hot.push(HotSpot::plain(rotate_y(dir, self.params.rotation_deg), radius));
         }
         // Wet ground mirrors the discs: their reflections are as small as they
         // are, so their texels are area-averaged too. (Mirroring in the ground
@@ -2360,11 +2960,12 @@ impl Env {
         // or held lake draws them as glitter, smooth over a texel, `floor_waters`)
         let lake_mirrors_discs = self.floor.as_ref().is_some_and(|floor| floor.mirrors() && !floor.rippled()) && self.held_mirror.is_none();
         if self.weather.as_ref().is_some_and(|weather| weather.mirrors()) || lake_mirrors_discs {
-            let mirrored: Vec<(Vec3f, f32)> = hot.iter().map(|&(dir, radius)| (vec3f(dir.x, -dir.y, dir.z), radius)).collect();
+            let mirrored: Vec<HotSpot> =
+                hot.iter().map(|spot| HotSpot { dir: vec3f(spot.dir.x, -spot.dir.y, spot.dir.z), ..*spot }).collect();
             hot.extend(mirrored);
         }
         if let Some((dir, radius)) = self.base_image.as_ref().and_then(|image| image.drawn_sun()) {
-            hot.push((rotate_y(dir, self.params.rotation_deg), radius));
+            hot.push(HotSpot::plain(rotate_y(dir, self.params.rotation_deg), radius));
         }
         hot
     }
@@ -2424,7 +3025,7 @@ impl Env {
         let ring = self.horizon_ring(at);
         let at = Sampling { horizon: ring.as_deref(), ..at };
         let radiance = |d: Vec3f| self.radiance_with(d, None, at);
-        // bake_par_with's size rounding.
+        // bake_par_hot's size rounding.
         let width = width.max(2);
         let height = (width / 2).max(1);
         let hot = hot_reaches(&self.hot_spots(), width, height);
@@ -2433,13 +3034,13 @@ impl Env {
             if y >= height {
                 return;
             }
-            // bake_par_with's texel-centre arithmetic plus the jitter (x + 0.5 + 0 is x + 0.5 exactly), through the
+            // bake_par_hot's texel-centre arithmetic plus the jitter (x + 0.5 + 0 is x + 0.5 exactly), through the
             // same functions, so an unjittered row matches the bake's bits.
             let v = (y as f32 + 0.5 + jy) / height as f32;
             let row: Vec<[f32; 4]> = (0..width)
                 .map(|x| {
-                    if hot.iter().any(|spot| spot.covers(x, y, width, height)) {
-                        return hot_texel(&radiance, x, y, width, height);
+                    if let Some(pattern) = hot_pattern(&hot, x, y, width, height) {
+                        return hot_texel(&radiance, x, y, width, height, pattern);
                     }
                     let d = ibl::equirect_uv_to_dir([(x as f32 + 0.5 + jx) / width as f32, v]);
                     let c = texel(radiance(vec(d)));
@@ -2480,7 +3081,11 @@ impl Env {
     /// `bake_par` with the march's width cap as a parameter. The cache's rows
     /// are marched by whichever baking thread first needs them, each exactly
     /// once and by the same function, so the result still equals the serial
-    /// bake bit for bit.
+    /// bake bit for bit. The discs' texels are refined in their own rows'
+    /// calls (`bake_par_hot`), spread over the rows as the rest: a marched
+    /// cloud's disc samples each march the disc's own pass (2 to 5 ms a sample
+    /// from 2048 wide), which the serial pass after the bake paid on one thread.
+    /// A cancelled bake keeps its skipped rows black and gets no refinement.
     fn bake_par_marched(
         &self,
         width: usize,
@@ -2492,19 +3097,7 @@ impl Env {
         let ring = self.horizon_ring(at);
         let at = Sampling { horizon: ring.as_deref(), ..at };
         let radiance = |d: Vec3f| self.radiance_with(d, None, at);
-        // Count the rows the runner really baked: a cancelled bake keeps its
-        // skipped rows black, so it gets no refinement either.
-        let baked = AtomicUsize::new(0);
-        let mut map = bake_par_with(width, &radiance, |rows, row| {
-            run(rows, &|y: usize| {
-                row(y);
-                baked.fetch_add(1, Ordering::Relaxed);
-            })
-        });
-        if baked.load(Ordering::Relaxed) >= map.height {
-            refine_hot_spots(&mut map, &radiance, &self.hot_spots());
-        }
-        map
+        bake_par_hot(width, &radiance, &self.hot_spots(), run)
     }
 
     /// The map without exactly its key's own light (N3), from `map`, this
@@ -2522,9 +3115,9 @@ impl Env {
     /// else: a bake through the lookup without the key whose texels on and
     /// around the discs (the key's own included) are area-averaged as the
     /// map's are. Only the texels the key can reach are evaluated again (its
-    /// covering cone, plus the refinement's reach around a disc), the rows
-    /// spread by `run` as for [`Self::bake_par`], then the discs' texels are
-    /// refined again; outside the cone the key draws nothing, so the map's
+    /// covering cone, plus the refinement's reach around a disc), and the
+    /// discs' texels are refined again, the rows spread by `run` as for
+    /// [`Self::bake_par`]; outside the cone the key draws nothing, so the map's
     /// texels are the answer there. A cancelled `run` skips rows, as a
     /// cancelled bake does; the caller drops the copy with the bake. A
     /// volumetric sky reads the same cloud march as the map's bake
@@ -2545,7 +3138,7 @@ impl Env {
         let turn = |v: Vec3f| rotate_y(v, self.params.rotation_deg);
         let sun = self.atmo.as_ref().and_then(|atmo| atmo.disc_look()).map(|look| atmosphere::SunDiscLook {
             dir: turn(look.dir),
-            radiance: look.radiance * self.scale,
+            rows: look.rows.map(|row| row * self.scale),
             ..look
         });
         let moon = self.night.as_ref().and_then(|night| night.moon_look()).map(|look| night::MoonDiscLook {
@@ -2557,7 +3150,7 @@ impl Env {
             earthshine: look.earthshine * self.scale,
             ..look
         });
-        SkyDiscs { sun, moon }
+        SkyDiscs { sun, moon, horizon_dip: self.atmo.as_ref().map_or(0.0, |atmo| atmo.horizon_dip()) }
     }
 
     /// Splits this env's bake `width` wide (`texels`, a whole map: [`Self::bake_par`]'s data, or an antialiased mean
@@ -2665,8 +3258,9 @@ impl Env {
     /// `bake_keyless_par` with the march's width cap as a parameter: the
     /// texels the key can reach are evaluated again through the lookup without
     /// it, reading a cloud cache built as the map's bake built it (the same
-    /// rows, marched by the same function), then the discs' texels are refined
-    /// as the map's are; outside the key's reach the map's texels are the answer.
+    /// rows, marched by the same function), and the discs' texels are refined
+    /// as the map's are, in the same pass (`rebake_cone`); outside the key's
+    /// reach the map's texels are the answer.
     fn bake_keyless_marched(&self, map: &EnvMap, march_max: usize, run: impl FnOnce(usize, &(dyn Fn(usize) + Sync))) -> Option<EnvMap> {
         let (term, key) = self.key()?;
         // A base image's sun is a file's sun: what lies behind it in the
@@ -2691,8 +3285,7 @@ impl Env {
         let cone = key.cos_cover.min(key.cos_radius).clamp(-1.0, 1.0).acos();
         let reach = (cone + 2.0 * step).min(std::f32::consts::PI);
         let mut keyless = map.clone();
-        rebake_cone(&mut keyless, key.dir.normalize(), reach, &radiance, run);
-        refine_hot_spots(&mut keyless, &radiance, &self.hot_spots());
+        rebake_cone(&mut keyless, key.dir.normalize(), reach, &self.hot_spots(), &radiance, run);
         Some(keyless)
     }
 }
@@ -2717,57 +3310,99 @@ impl Env {
     }
 }
 
+/// A rained puddle (`Env::rain_puddle`) takes the exact lookup along its facets' mean only where the table's rows lose
+/// more than this share of its detail (`MirrorSky::detail_kept`), the share past it scaled back to 0..1: under a
+/// moderate rain the facets spread the mirror over the rows almost everywhere, and the lookup (a whole sky's) is skipped.
+const RAIN_DETAIL_LEAST: f32 = 0.02;
+
 /// MirrorSky's size: columns round the turn, evenly spaced in a pseudo-angle (`turn_of`, no trigonometry to read), and
 /// rows from the horizon to the zenith, their sines growing as the square of their index ((j / (h - 1))^2: fine by
 /// the horizon, which a lake mirrors most of).
 const MIRROR_SKY_W: usize = 96;
 const MIRROR_SKY_H: usize = 24;
+/// The released bakes' table of the sky the lake's facets mirror (`Env::lobe_sky`): MIRROR_SKY_H rows as the held
+/// one, MIRROR_LOBE_W columns (1.4 degrees), each row made the first time the water reads it.
+const MIRROR_LOBE_W: usize = 256;
 
-/// A coarse table of the sky a held bake's lake mirrors (`Env::with_held_floor_par`), read bilinearly.
+/// A coarse table of the sky a lake mirrors, read bilinearly: a held bake's whole mirror (`Env::with_held_floor_par`),
+/// and the spread of the facets of rippled water round the one exact lookup a released bake takes (`Env::lobe_sky`,
+/// `floor::mirror_lobe`).
 struct MirrorSky {
-    texels: Vec<Vec3f>,
+    width: usize,
+    rows: Vec<OnceLock<Vec<Vec3f>>>,
 }
 
 impl MirrorSky {
-    /// The table of `sky`, its rows spread by `run`; None when the runner skipped one.
-    fn new(run: &dyn Fn(usize, &(dyn Fn(usize) + Sync)), sky: &(dyn Fn(Vec3f) -> Vec3f + Sync)) -> Option<MirrorSky> {
-        let rows: Vec<OnceLock<Vec<Vec3f>>> = (0..MIRROR_SKY_H).map(|_| OnceLock::new()).collect();
-        run(MIRROR_SKY_H, &|j| {
-            let t = j as f32 / (MIRROR_SKY_H - 1) as f32;
-            let y = t * t;
-            let across = (1.0 - y * y).max(0.0).sqrt();
-            let row = (0..MIRROR_SKY_W)
-                .map(|i| {
-                    let (x, z) = turn_at(i as f32 * 4.0 / MIRROR_SKY_W as f32);
-                    sky(vec3f(x * across, y, z * across))
-                })
-                .collect();
-            let _ = rows[j].set(row);
-        });
-        let mut texels = Vec::with_capacity(MIRROR_SKY_W * MIRROR_SKY_H);
-        for row in rows {
-            texels.extend(row.into_inner()?);
-        }
-        Some(MirrorSky { texels })
+    /// A table `width` wide whose rows are made from the sky as they are first read (`sample`).
+    fn lazy(width: usize) -> MirrorSky {
+        MirrorSky { width: width.max(1), rows: (0..MIRROR_SKY_H).map(|_| OnceLock::new()).collect() }
     }
 
-    /// The sky along `v` (above the horizon; below it, the horizon's).
-    fn sample(&self, v: Vec3f) -> Vec3f {
-        if self.texels.is_empty() {
-            return Vec3f::default();
-        }
+    /// The table of `sky` `width` wide, its rows spread by `run`; None when the runner skipped one.
+    fn new(width: usize, run: &dyn Fn(usize, &(dyn Fn(usize) + Sync)), sky: &(dyn Fn(Vec3f) -> Vec3f + Sync)) -> Option<MirrorSky> {
+        let table = MirrorSky::lazy(width);
+        run(MIRROR_SKY_H, &|j| {
+            let _ = table.rows[j].set(table.make_row(j, sky));
+        });
+        table.rows.iter().all(|row| row.get().is_some()).then_some(table)
+    }
+
+    /// Row `j` of the sky `sky`.
+    fn make_row(&self, j: usize, sky: &dyn Fn(Vec3f) -> Vec3f) -> Vec<Vec3f> {
+        let t = j as f32 / (MIRROR_SKY_H - 1) as f32;
+        let y = t * t;
+        let across = (1.0 - y * y).max(0.0).sqrt();
+        (0..self.width)
+            .map(|i| {
+                let (x, z) = turn_at(i as f32 * 4.0 / self.width as f32);
+                sky(vec3f(x * across, y, z * across))
+            })
+            .collect()
+    }
+
+    /// The sky along `v` (above the horizon; below it, the horizon's); a row not made yet is made from `sky`.
+    fn sample(&self, v: Vec3f, sky: &dyn Fn(Vec3f) -> Vec3f) -> Vec3f {
         let fy = (v.y.clamp(0.0, 1.0).sqrt() * (MIRROR_SKY_H - 1) as f32).min((MIRROR_SKY_H - 1) as f32);
-        let fx = turn_of(v.x, v.z) * (MIRROR_SKY_W as f32 / 4.0);
+        let fx = turn_of(v.x, v.z) * (self.width as f32 / 4.0);
         let (x0, y0) = (fx.floor(), fy.floor());
         let (tx, ty) = (fx - x0, fy - y0);
-        let x0 = (x0 as i64).rem_euclid(MIRROR_SKY_W as i64) as usize;
-        let x1 = (x0 + 1) % MIRROR_SKY_W;
+        let x0 = (x0 as i64).rem_euclid(self.width as i64) as usize;
+        let x1 = (x0 + 1) % self.width;
         let y0 = (y0 as usize).min(MIRROR_SKY_H - 1);
         let y1 = (y0 + 1).min(MIRROR_SKY_H - 1);
-        let at = |x: usize, y: usize| self.texels[y * MIRROR_SKY_W + x];
-        let a = at(x0, y0).mix(at(x1, y0), tx);
-        let b = at(x0, y1).mix(at(x1, y1), tx);
+        let row = |y: usize| self.rows[y].get_or_init(|| self.make_row(y, sky));
+        let (r0, r1) = (row(y0), row(y1));
+        let a = r0[x0].mix(r0[x1], tx);
+        let b = r1[x0].mix(r1[x1], tx);
         a.mix(b, ty)
+    }
+
+    /// How much of the detail along `m` that a table's rows cannot hold (finer than their spacing there) survives a
+    /// mirror whose facets spread its elevation by `spread` (radians, standard deviation, `floor::mirror_spread`): their
+    /// blur's response at the rows' Nyquist frequency there, exp(-(pi spread / row)^2 / 2). 1 for a mirror of one
+    /// direction. (Across, the facets hardly spread the mirror; the table's columns are as fine as MIRROR_LOBE_W.)
+    fn detail_kept(m: Vec3f, spread: f32) -> f32 {
+        if !(spread > 0.0) {
+            return 1.0;
+        }
+        let x = std::f32::consts::PI * spread / MirrorSky::row_at(m.y);
+        (-0.5 * x * x).exp()
+    }
+
+    /// The elevation a table's row spans at the elevation of sine `y` (radians): their sines are (j / (h - 1))^2, so a
+    /// row spans 2 sqrt(y) / ((h - 1) cos) there, the first row's own at least.
+    fn row_at(y: f32) -> f32 {
+        let rows = (MIRROR_SKY_H - 1) as f32;
+        let y = y.clamp(0.0, 1.0);
+        (2.0 * y.sqrt() / (rows * (1.0 - y * y).max(1.0e-6).sqrt())).max(1.0 / (rows * rows))
+    }
+
+    /// The step the facets' grid takes when read from a table (`floor::mirror_lobe`'s `step`): the rows' spacing a
+    /// deviation of the facets' spread `spread` (radians) below their mean mirror `m`, where most of their light comes
+    /// from the finer rows nearer the horizon.
+    fn lobe_step(m: Vec3f, spread: f32) -> f32 {
+        let low = (m.y.clamp(0.0, 1.0).asin() - spread).max(0.0);
+        MirrorSky::row_at(low.sin())
     }
 }
 
@@ -2795,8 +3430,29 @@ fn turn_at(t: f32) -> (f32, f32) {
 /// weather_sun, the glints, the strip's sun and the ground gain's moon read it. 1 for a disc that is not there.
 #[derive(Clone, Copy, Debug)]
 struct DiscCovers {
-    sun: f32,
+    /// Per channel: the drawn disc is redder at the bottom, so where a cloud's edge crosses it each channel passes
+    /// its own share (`Atmosphere::disc_mean`).
+    sun: Vec3f,
+    /// The clouds' pass varies over the sun's disc by more than CROSSED_SPREAD of its mean (`sun_disc_cover`): the bake
+    /// samples the disc's texels on a lattice (`HotSpot::crossed`).
+    sun_crossed: bool,
     moon: f32,
+}
+
+/// What the clouds pass toward the sun's disc, `pass` along a direction, as the key takes it: its mean over the drawn
+/// disc ([`atmosphere::Atmosphere::disc_mean`]), and whether the disc is crossed, `pass` varying over the mean's points
+/// by more than CROSSED_SPREAD of the mean (a cloud's edge over the disc, or a cloud thicker on one side of it).
+fn sun_disc_cover(atmo: &atmosphere::Atmosphere, pass: &dyn Fn(Vec3f) -> f32) -> (Vec3f, bool) {
+    let (least, most) = (Cell::new(f32::INFINITY), Cell::new(f32::NEG_INFINITY));
+    let mean = atmo.disc_mean(&|d| {
+        let p = pass(d);
+        least.set(least.get().min(p));
+        most.set(most.get().max(p));
+        p
+    });
+    // (written so a NaN spread counts as plain)
+    let crossed = most.get() - least.get() > CROSSED_SPREAD * mean.max_elem();
+    (mean, crossed)
 }
 
 /// The disc a cover is asked for ([`Env::cover_toward_disc`]).
@@ -2812,6 +3468,9 @@ struct Dome {
     /// The dry sky's mean radiance over the upper hemisphere: what lights the
     /// weather's veil.
     mean: Vec3f,
+    /// The open sky's (its clouds left out) on the same looks: what lit the clear air from above
+    /// (`Env::measure_air_relight`).
+    open_mean: Vec3f,
     /// The light it puts on a level surface.
     irradiance: Vec3f,
     /// The light the open sky (its clouds left out) put there.
@@ -2849,6 +3508,9 @@ enum KeyTerm {
 pub struct SkyDiscs {
     pub sun: Option<atmosphere::SunDiscLook>,
     pub moon: Option<night::MoonDiscLook>,
+    /// How far below level both discs are cut, radians (`Atmosphere::horizon_dip`): 0 but from a viewer height over the
+    /// planet's own ground, whose horizon dips below level.
+    pub horizon_dip: f32,
 }
 
 /// The dome's looks (`Env::dome_light`): DOME_ROWS rows equally spaced in the
@@ -2874,13 +3536,15 @@ fn ice_fresnel(down: f32) -> f32 {
     floor::ICE_F0 + (1.0 - floor::ICE_F0) * (1.0 - down).powi(5)
 }
 
-/// How much of what the floor's lake mirrors `Env::floor_waters` lets through along `d`: water's Fresnel over its open
-/// water, ice's (its snow's share left out, its blur's share too) over its ice. What the veil leaves to the strip's
-/// own veil where the lake mirrors it (`Env::base_layer`, as `Weather::mirror_share`).
-fn floor_mirror_share(d: Vec3f, water: f32, ice: f32) -> f32 {
+/// How much of what the floor's lake mirrors along its mirror's one exact lookup `Env::floor_waters` lets through along
+/// `d`: water's Fresnel at the facet `normal` it looks up by (`FloorFar::normal`) over its open water, ice's (its snow's
+/// share left out, its blur's share too) over its ice, of which the texel keeps `kept` (`Env::mirror_kept`). What the
+/// veil leaves to the strip's own veil where the lake mirrors it (`Env::base_layer`, as `Weather::mirror_share_sheened`): the
+/// strip's light that lookup finds.
+fn floor_mirror_share(d: Vec3f, normal: Vec3f, kept: f32, water: f32, ice: f32) -> f32 {
     let down = (-d.y).min(1.0);
     let frozen = ice_fresnel(down) * (1.0 - floor::ICE_SNOW_SHARE) * (1.0 - floor::ICE_ROUGHNESS);
-    weather::water_fresnel(down) * water + frozen * ice
+    kept * (weather::water_fresnel((-d.dot(normal)).clamp(0.0, 1.0)) * water + frozen * ice)
 }
 
 /// One baked channel made safe for every consumer: NaN becomes 0, a negative
@@ -2905,24 +3569,44 @@ fn bake_with(width: usize, radiance: &dyn Fn(Vec3f) -> Vec3f) -> EnvMap {
     EnvMap::from_fn(width, |d| texel(radiance(vec(d))))
 }
 
-/// The parallel bake behind `Env::bake_par`, over any radiance function.
+/// The parallel bake behind `Env::bake_par` ([`bake_par_hot`]) without hot spots, over any radiance function.
+#[cfg(test)]
 fn bake_par_with(
     width: usize,
     radiance: &(dyn Fn(Vec3f) -> Vec3f + Sync),
     run: impl FnOnce(usize, &(dyn Fn(usize) + Sync)),
 ) -> EnvMap {
+    bake_par_hot(width, radiance, &[], run)
+}
+
+/// The parallel bake behind `Env::bake_par`, over any radiance function, whose texels on the hot spots `hot` are
+/// refined as `refine_hot_spots` refines them after a serial bake (`hot_texel`, by `hot_pattern`), each in its own
+/// row's call: the serial bake and refinement, bit for bit, spread over the rows. A row keeps its refined texels aside
+/// until every row has run: a bake cut short (a cancelled job) gets no refinement, as before, only the texel-centre
+/// bake of the rows it ran.
+fn bake_par_hot(
+    width: usize,
+    radiance: &(dyn Fn(Vec3f) -> Vec3f + Sync),
+    hot: &[HotSpot],
+    run: impl FnOnce(usize, &(dyn Fn(usize) + Sync)),
+) -> EnvMap {
     // from_fn's size rounding, so the two bakes agree on every request.
     let width = width.max(2);
     let height = (width / 2).max(1);
+    let spots = hot_reaches(hot, width, height);
     // Rows a cancelled run never reaches stay black, with the alpha every
     // texel carries.
     let mut data = vec![[0.0, 0.0, 0.0, 1.0]; width * height];
+    // Each row's refined texels (column, texel), and how many rows ran.
+    let refined: Vec<Mutex<Vec<(usize, [f32; 4])>>> = (0..height).map(|_| Mutex::new(Vec::new())).collect();
+    let baked = AtomicUsize::new(0);
     {
         // One lock per row. Each row is written by one call, so the locks
         // never contend; they only let disjoint rows cross threads safely.
         let rows: Vec<Mutex<&mut [[f32; 4]]>> = data.chunks_exact_mut(width).map(Mutex::new).collect();
         let bake_row = |y: usize| {
-            if let Some(Ok(mut row)) = rows.get(y).map(|row| row.lock()) {
+            let (row, aside) = (rows.get(y).map(|row| row.lock()), refined.get(y).map(|aside| aside.lock()));
+            if let (Some(Ok(mut row)), Some(Ok(mut aside))) = (row, aside) {
                 // The same texel-centre arithmetic as EnvMap::from_fn, through
                 // the same function, so the bits match.
                 let v = (y as f32 + 0.5) / height as f32;
@@ -2930,37 +3614,65 @@ fn bake_par_with(
                     let d = ibl::equirect_uv_to_dir([(x as f32 + 0.5) / width as f32, v]);
                     let c = texel(radiance(vec(d)));
                     *out = [c[0], c[1], c[2], 1.0];
+                    if let Some(pattern) = hot_pattern(&spots, x, y, width, height) {
+                        aside.push((x, hot_texel(radiance, x, y, width, height, pattern)));
+                    }
                 }
+                baked.fetch_add(1, Ordering::Relaxed);
             }
         };
         run(height, &bake_row);
+    }
+    if baked.load(Ordering::Relaxed) >= height {
+        for (y, aside) in refined.into_iter().enumerate() {
+            for (x, t) in aside.into_inner().unwrap_or_default() {
+                data[y * width + x] = t;
+            }
+        }
     }
     EnvMap { width, height, data }
 }
 
 /// Evaluates again, through `radiance`, every texel of `map` whose centre lies
-/// within `reach` (radians) of `centre`, with the arithmetic of the bakes
-/// (texel centres, `texel`'s clean-up), so a texel comes out as a bake through
-/// `radiance` would make it. The rows the cone touches are spread by `run` as
-/// for [`bake_par_with`]; a row it skips keeps the map's texels.
+/// within `reach` (radians) of `centre`, and every texel on the hot spots `hot`
+/// as `refine_hot_spots` refines it, with the arithmetic of the bakes (texel
+/// centres, `texel`'s clean-up), so a texel comes out as a bake through
+/// `radiance` and its refinement would make it. The rows the cone and the spots
+/// touch are spread by `run` as for [`bake_par_hot`]; a row it skips keeps the
+/// map's texels.
 fn rebake_cone(
     map: &mut EnvMap,
     centre: Vec3f,
     reach: f32,
+    hot: &[HotSpot],
     radiance: &(dyn Fn(Vec3f) -> Vec3f + Sync),
     run: impl FnOnce(usize, &(dyn Fn(usize) + Sync)),
 ) {
     let (width, height) = (map.width, map.height);
     let cos_reach = reach.cos();
-    let near = envmap::rows_near(centre, reach, height);
-    let first = near.start;
-    let rows: Vec<Mutex<&mut [[f32; 4]]>> = map.data.chunks_exact_mut(width).skip(first).take(near.len()).map(Mutex::new).collect();
+    let spots = hot_reaches(hot, width, height);
+    let mut ys: Vec<usize> = envmap::rows_near(centre, reach, height).collect();
+    ys.extend(spots.iter().flat_map(|spot| spot.rows.clone()));
+    ys.retain(|&y| y < height);
+    ys.sort_unstable();
+    ys.dedup();
+    let rows: Vec<Mutex<&mut [[f32; 4]]>> = map
+        .data
+        .chunks_exact_mut(width)
+        .enumerate()
+        .filter(|(y, _)| ys.binary_search(y).is_ok())
+        .map(|(_, row)| Mutex::new(row))
+        .collect();
     let bake_row = |i: usize| {
-        if let Some(Ok(mut row)) = rows.get(i).map(|row| row.lock()) {
-            // bake_par_with's texel-centre arithmetic, through the same
+        if let (Some(&y), Some(Ok(mut row))) = (ys.get(i), rows.get(i).map(|row| row.lock())) {
+            // bake_par_hot's texel-centre arithmetic, through the same
             // functions, so the bits match a bake's.
-            let v = ((first + i) as f32 + 0.5) / height as f32;
+            let v = (y as f32 + 0.5) / height as f32;
             for (x, out) in row.iter_mut().enumerate() {
+                if let Some(pattern) = hot_pattern(&spots, x, y, width, height) {
+                    *out = hot_texel(radiance, x, y, width, height, pattern);
+                    continue;
+                }
                 let d = ibl::equirect_uv_to_dir([(x as f32 + 0.5) / width as f32, v]);
                 if vec(d).dot(centre) >= cos_reach {
                     let c = texel(radiance(vec(d)));
@@ -2976,86 +3688,341 @@ fn rebake_cone(
 /// HOT_SAMPLES x HOT_SAMPLES sub-samples spread over the texel. A 0.5 degree
 /// sun is smaller than a texel below 1K: at texel centres alone it lands on
 /// one texel or none, and the map's sun energy swings from 0 to 2.5 times.
-/// Both bakes run this same serial pass, so they still agree bit for bit.
-fn refine_hot_spots(map: &mut EnvMap, radiance: &dyn Fn(Vec3f) -> Vec3f, hot: &[(Vec3f, f32)]) {
+/// The texels a crossed disc can touch take its lattice instead
+/// ([`hot_pattern`]), at every width until its texel centres alone give it
+/// CROSSED_ROWS rows. Both bakes run this same serial pass, so they still
+/// agree bit for bit.
+fn refine_hot_spots(map: &mut EnvMap, radiance: &dyn Fn(Vec3f) -> Vec3f, hot: &[HotSpot]) {
     let (w, h) = (map.width, map.height);
     if w == 0 || h == 0 || map.data.len() != w * h {
         return;
     }
-    for spot in hot_reaches(hot, w, h) {
+    let reaches = hot_reaches(hot, w, h);
+    for spot in &reaches {
         for y in spot.rows.clone() {
             for x in 0..w {
                 if spot.covers(x, y, w, h) {
-                    map.data[y * w + x] = hot_texel(radiance, x, y, w, h);
+                    // (a texel two spots reach takes the same pattern from either: `hot_pattern` reads them all)
+                    let pattern = hot_pattern(&reaches, x, y, w, h).unwrap_or(HotPattern::Grid);
+                    map.data[y * w + x] = hot_texel(radiance, x, y, w, h, pattern);
                 }
             }
         }
     }
 }
 
+/// A small bright feature the bake refines ([`refine_hot_spots`]): its centre, in the frame of the map it is refined
+/// in, and its angular radius (radians). It is crossed when what stands in front of it varies over it more finely
+/// than the 8 x 8 grid can follow (a cloud's edge over the sun's disc, `DiscCovers::sun_crossed`): the texels it can
+/// touch then take a lattice with CROSSED_ROWS rows across it ([`crossed_lattice`], [`DiscSquare`]), at every width
+/// until its texel centres alone give it those rows. The moon's disc always is ([`Env::hot_spots`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HotSpot {
+    dir: Vec3f,
+    radius: f32,
+    crossed: bool,
+}
+
+impl HotSpot {
+    /// A spot whose texels take the 8 x 8 grid.
+    fn plain(dir: Vec3f, radius: f32) -> HotSpot {
+        HotSpot { dir, radius, crossed: false }
+    }
+}
+
+/// How a hot spot's texel is sampled ([`hot_texel`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum HotPattern {
+    /// HOT_SAMPLES x HOT_SAMPLES sub-samples on a grid.
+    Grid,
+    /// A Fibonacci lattice of `points` sub-samples, the k-th in column k and in row k x `stride` (mod `points`),
+    /// `stride` the Fibonacci number before `points`: every sub-sample has a row and a column of its own, and they
+    /// spread evenly over the texel, so a band across it, however thin, is met as often as its share of the texel.
+    Lattice { points: usize, stride: usize },
+    /// Where the squares of crossed discs too small for the texel's lattice touch it ([`DiscSquare`]): that lattice
+    /// over `piece`, the part of the texel their squares cover (as fractions of the texel, u from `piece[0]` to
+    /// `piece[1]` and v from `piece[2]` to `piece[3]`), and the grid's sub-samples outside it for the rest of the
+    /// texel, each part weighted by its share.
+    Piece { points: usize, stride: usize, piece: [f32; 4] },
+}
+
+/// The fewest Fibonacci points, at least `want` (one for a NaN), and the Fibonacci number before it: a lattice's
+/// `points` and `stride` ([`HotPattern::Lattice`]).
+fn fibonacci_points(want: f32) -> (usize, usize) {
+    let (mut stride, mut points) = (1usize, 1usize);
+    while (points as f32) < want {
+        let Some(next) = stride.checked_add(points) else { break };
+        (stride, points) = (points, next);
+    }
+    (points, stride)
+}
+
+/// The lattice a crossed disc of angular radius `radius` takes over a whole texel `step` radians high: the fewest
+/// Fibonacci points with CROSSED_ROWS rows across the disc's diameter, and at least CROSSED_LEAST where the 8 x 8 grid
+/// would refine the disc anyway (it is under HOT_MAX_TEXELS texels wide). A disc under a texel tall takes CROSSED_ROWS
+/// rows over the texel (377 points); where those put fewer than CROSSED_ROWS rows across it (under about 0.68 of a
+/// texel tall) it is sampled over its own square instead ([`DiscSquare`]): spread over the whole texel, the points
+/// that put CROSSED_ROWS rows across such a disc land nearly all beside it, the more the smaller it is in the texel
+/// (64 wide, the sky meter's width, a 0.6 degree sun took 2584 points in each of its two texels, 24 of them on the
+/// disc). None where the texel centres alone put CROSSED_ROWS rows across the disc (128 texels or more in radius):
+/// one point would be the texel's centre, evaluated again. A 0.6 degree sun takes 377 points at 512 wide, 233 at
+/// 1024, 89 at 2048, 55 at 4096, 21 at 8192 and 13 at 16384, and its square below 512.
+fn crossed_lattice(radius: f32, step: f32) -> Option<HotPattern> {
+    let across = 2.0 * radius;
+    // (written so a NaN radius wants one point: no lattice)
+    let rows = if across < step { CROSSED_ROWS } else { CROSSED_ROWS * step / across };
+    let least = if radius < HOT_MAX_TEXELS * step { CROSSED_LEAST as f32 } else { 1.0 };
+    let (points, stride) = fibonacci_points(rows.max(least));
+    (points > 1).then_some(HotPattern::Lattice { points, stride })
+}
+
+/// A crossed disc too small in its texels for their lattice to put CROSSED_ROWS rows across it ([`crossed_lattice`]),
+/// sampled where it is ([`HotPattern::Piece`]): the bounds of its outer edge in the map's u (round its centre's, so
+/// they may pass 0 or 1; None where the disc holds a pole: the whole turn) and v, and the lattice rows a texel's height
+/// of it takes, CROSSED_ROWS over the disc's diameter in texels. Each texel the square touches takes a lattice over
+/// its part of the square, so the CROSSED_ROWS rows across the disc land on the disc, and the grid's sub-samples
+/// outside the square stand for the rest of the texel. A lattice over the whole texel puts nearly all its points
+/// beside such a disc, the more the narrower the map: 64 wide (the sky meter's width) Sunset's sun took 5552 samples
+/// over its texels, 24 of them on the disc, and takes 888, 298 on the disc. From 64 to 384 wide (to 2048 for a 0.1
+/// degree sun) the disc's light holds to about 0.5 % of a dense lattice's on Sunset's low suns, 1.2 % where Sunset's
+/// own disc falls in two texels at 256 wide (the whole texel's lattice: 2.6 %).
+#[derive(Clone, Copy, Debug)]
+struct DiscSquare {
+    u: Option<[f32; 2]>,
+    v: [f32; 2],
+    rows: f32,
+}
+
+impl DiscSquare {
+    /// The square of the disc of angular radius `radius` round the unit `centre`, in a map whose texels are `step`
+    /// radians high.
+    fn new(centre: Vec3f, radius: f32, step: f32) -> DiscSquare {
+        let [cu, cv] = ibl::dir_to_equirect_uv(arr(centre));
+        // The disc reaches sin(dλ) = sin(radius) / cos(elevation) round its centre's azimuth, all the way round where
+        // it holds a pole.
+        let ring = (1.0 - centre.y * centre.y).max(0.0).sqrt();
+        let reach = radius.sin();
+        let u = (reach < ring).then(|| {
+            let half = (reach / ring).asin() / std::f32::consts::TAU;
+            [cu - half, cu + half]
+        });
+        let half = radius / std::f32::consts::PI;
+        DiscSquare { u, v: [cv - half, cv + half], rows: CROSSED_ROWS * step / (2.0 * radius) }
+    }
+
+    /// The square's part of the texel (x, y) of a `w` x `h` map, as fractions of the texel `[u0, u1, v0, v1]` (the
+    /// copy of the square within half a turn of the texel); None where it does not touch the texel.
+    fn piece(&self, x: usize, y: usize, w: usize, h: usize) -> Option<[f32; 4]> {
+        let (a0, a1) = match self.u {
+            Some([u0, u1]) => {
+                let turns = (0.5 * (u0 + u1) - (x as f32 + 0.5) / w as f32 + 0.5).floor();
+                let at = |u: f32| ((u - turns) * w as f32 - x as f32).clamp(0.0, 1.0);
+                (at(u0), at(u1))
+            }
+            None => (0.0, 1.0),
+        };
+        let at = |v: f32| (v * h as f32 - y as f32).clamp(0.0, 1.0);
+        let (b0, b1) = (at(self.v[0]), at(self.v[1]));
+        (a1 > a0 && b1 > b0).then_some([a0, a1, b0, b1])
+    }
+}
+
+/// Grid sub-sample (i, j) of a texel lies in `piece` ([`HotPattern::Piece`]).
+fn piece_holds(piece: [f32; 4], i: usize, j: usize) -> bool {
+    let (fu, fv) = ((i as f32 + 0.5) / HOT_SAMPLES as f32, (j as f32 + 0.5) / HOT_SAMPLES as f32);
+    fu >= piece[0] && fu < piece[1] && fv >= piece[2] && fv < piece[3]
+}
+
 /// A hot spot as the refinement reaches it in a `w` x `h` map (`hot_reaches`): the feature plus a texel's diagonal,
-/// every texel it can touch.
+/// every texel it can touch. A crossed disc's lattice holds within its outer edge plus CROSSED_REACH_TEXELS
+/// (`lattice`: the whole texel's pattern and that reach's cosine), over its square there where it is too small for
+/// that pattern (`square`); the rest of the reach keeps the grid. A crossed disc the grid resolves (HOT_MAX_TEXELS
+/// texels or wider) reaches only as far as its lattice.
 struct HotReach {
     centre: Vec3f,
     cos_reach: f32,
     rows: std::ops::Range<usize>,
+    lattice: Option<(HotPattern, f32)>,
+    square: Option<DiscSquare>,
 }
 
 impl HotReach {
     /// The texel (x, y)'s centre lies within the reach.
     fn covers(&self, x: usize, y: usize, w: usize, h: usize) -> bool {
-        if !self.rows.contains(&y) {
-            return false;
-        }
-        let (u, v) = ((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32);
-        // (spelled as the refinement always tested it, so a NaN counts as within)
-        !(vec(ibl::equirect_uv_to_dir([u, v])).dot(self.centre) < self.cos_reach)
+        self.rows.contains(&y) && Self::within(texel_dir(x, y, w, h), self.centre, self.cos_reach)
+    }
+
+    /// `d` lies within the cone of cosine `cos` round `centre` (spelled as the refinement always tested it, so a NaN
+    /// counts as within).
+    fn within(d: Vec3f, centre: Vec3f, cos: f32) -> bool {
+        !(d.dot(centre) < cos)
     }
 }
 
+/// The direction of the texel (x, y)'s centre in a `w` x `h` map, as the bakes evaluate it.
+fn texel_dir(x: usize, y: usize, w: usize, h: usize) -> Vec3f {
+    let (u, v) = ((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32);
+    vec(ibl::equirect_uv_to_dir([u, v]))
+}
+
+/// How the texel (x, y) of a `w` x `h` map is refined among the hot spots' `reaches`: None when none reaches it; the
+/// whole texel's lattice with the most points among the crossed discs whose lattice reaches it; else, where squares
+/// of crossed discs touch it ([`DiscSquare`]), the lattice over their part of it (the box round their pieces, at the
+/// most rows a texel's height any of them takes), or the whole texel's lattice where that part holds every grid
+/// sub-sample; else the grid.
+fn hot_pattern(reaches: &[HotReach], x: usize, y: usize, w: usize, h: usize) -> Option<HotPattern> {
+    let (mut reached, mut whole) = (false, None);
+    // The squares' part of the texel and the most rows a texel's height any of them takes; the whole texel's lattice
+    // with the most points among their discs, where the part holds every grid sub-sample.
+    let mut pieces: Option<([f32; 4], f32)> = None;
+    let mut whole_of_pieces = None;
+    let most = |a: Option<HotPattern>, b: HotPattern| match (a, b) {
+        (Some(HotPattern::Lattice { points, .. }), HotPattern::Lattice { points: more, .. }) if more <= points => a,
+        _ => Some(b),
+    };
+    let mut d = None;
+    for spot in reaches.iter().filter(|spot| spot.rows.contains(&y)) {
+        let d = *d.get_or_insert_with(|| texel_dir(x, y, w, h));
+        if !HotReach::within(d, spot.centre, spot.cos_reach) {
+            continue;
+        }
+        reached = true;
+        let Some((lattice, _)) = spot.lattice.filter(|&(_, cos)| HotReach::within(d, spot.centre, cos)) else {
+            continue;
+        };
+        let Some(square) = spot.square else {
+            whole = most(whole, lattice);
+            continue;
+        };
+        // (a square that does not touch the texel leaves it to the grid: its disc lies inside it)
+        if let Some(piece) = square.piece(x, y, w, h) {
+            pieces = Some(match pieces {
+                Some(([a0, a1, b0, b1], rows)) => {
+                    ([piece[0].min(a0), piece[1].max(a1), piece[2].min(b0), piece[3].max(b1)], square.rows.max(rows))
+                }
+                None => (piece, square.rows),
+            });
+            whole_of_pieces = most(whole_of_pieces, lattice);
+        }
+    }
+    if whole.is_some() {
+        return whole;
+    }
+    if let Some((piece, rows)) = pieces {
+        let outside = |k: &usize| !piece_holds(piece, k % HOT_SAMPLES, k / HOT_SAMPLES);
+        if !(0..HOT_SAMPLES * HOT_SAMPLES).any(|k| outside(&k)) {
+            return whole_of_pieces;
+        }
+        let (points, stride) = fibonacci_points(rows * (piece[3] - piece[2]));
+        return Some(HotPattern::Piece { points, stride, piece });
+    }
+    reached.then_some(HotPattern::Grid)
+}
+
 /// The hot spots `refine_hot_spots` refines in a `w` x `h` map, with their reach; a feature as wide as
-/// HOT_MAX_TEXELS texels or wider is resolved by the grid itself and left out.
-fn hot_reaches(hot: &[(Vec3f, f32)], w: usize, h: usize) -> Vec<HotReach> {
+/// HOT_MAX_TEXELS texels or wider is resolved by the grid itself and left out, unless it is crossed and takes a
+/// lattice ([`crossed_lattice`]).
+fn hot_reaches(hot: &[HotSpot], w: usize, h: usize) -> Vec<HotReach> {
     if w == 0 || h == 0 {
         return Vec::new();
     }
     // One texel of latitude, in radians.
     let step = std::f32::consts::PI / h as f32;
     let mut reaches = Vec::new();
-    for &(centre, radius) in hot {
+    for spot in hot {
+        let (centre, radius) = (spot.dir, spot.radius);
         // The negated comparison also skips a NaN radius.
-        if !centre.is_finite() || !(radius > 0.0) || radius >= HOT_MAX_TEXELS * step {
+        if !centre.is_finite() || !(radius > 0.0) {
+            continue;
+        }
+        let lattice = if spot.crossed { crossed_lattice(radius, step) } else { None };
+        let wide = radius >= HOT_MAX_TEXELS * step;
+        if wide && lattice.is_none() {
             continue;
         }
         let centre = centre.normalize();
+        let lattice_reach = (radius + CROSSED_REACH_TEXELS * step).min(std::f32::consts::PI);
+        let lattice = lattice.map(|pattern| (pattern, lattice_reach.cos()));
+        // A disc the whole texel's lattice cannot put CROSSED_ROWS rows across (under about 0.68 of a texel tall) is
+        // sampled over its own square.
+        let square = match lattice {
+            Some((HotPattern::Lattice { points, .. }, _)) if points as f32 * 2.0 * radius < CROSSED_ROWS * step => {
+                Some(DiscSquare::new(centre, radius, step))
+            }
+            _ => None,
+        };
         // The feature plus a texel's diagonal: every texel it can touch.
-        let reach = radius + 1.5 * step;
+        let reach = if wide { lattice_reach } else { radius + 1.5 * step };
         let cos_reach = reach.min(std::f32::consts::PI).cos();
         let row = ibl::dir_to_equirect_uv(arr(centre))[1] * h as f32;
         let rows = reach / step;
         let y0 = (row - rows).floor().max(0.0) as usize;
         let y1 = ((row + rows).ceil().max(0.0) as usize).min(h);
-        reaches.push(HotReach { centre, cos_reach, rows: y0..y1 });
+        reaches.push(HotReach { centre, cos_reach, rows: y0..y1, lattice, square });
     }
     reaches
 }
 
-/// The texel (x, y) of a `w` x `h` map on a hot spot: the mean of HOT_SAMPLES x HOT_SAMPLES sub-samples spread over
-/// it (a sample that is not finite counts as black), through `texel`'s clean-up.
-fn hot_texel(radiance: &dyn Fn(Vec3f) -> Vec3f, x: usize, y: usize, w: usize, h: usize) -> [f32; 4] {
+/// The texel (x, y) of a `w` x `h` map on a hot spot: the mean of the sub-samples `pattern` spreads over it (a sample
+/// that is not finite counts as black), through `texel`'s clean-up.
+fn hot_texel(
+    radiance: &dyn Fn(Vec3f) -> Vec3f,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    pattern: HotPattern,
+) -> [f32; 4] {
     let (u, v) = ((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32);
     let mut sum = Vec3f::default();
-    for j in 0..HOT_SAMPLES {
-        let sv = v + ((j as f32 + 0.5) / HOT_SAMPLES as f32 - 0.5) / h as f32;
-        for i in 0..HOT_SAMPLES {
-            let su = u + ((i as f32 + 0.5) / HOT_SAMPLES as f32 - 0.5) / w as f32;
-            let s = radiance(vec(ibl::equirect_uv_to_dir([su, sv])));
-            if s.is_finite() {
-                sum += s;
-            }
+    let add = |into: &mut Vec3f, su: f32, sv: f32| {
+        let s = radiance(vec(ibl::equirect_uv_to_dir([su, sv])));
+        if s.is_finite() {
+            *into += s;
         }
-    }
-    let c = texel(sum * (1.0 / (HOT_SAMPLES * HOT_SAMPLES) as f32));
+    };
+    let grid = |i: usize, j: usize| {
+        let at = |k: usize, n: usize| ((k as f32 + 0.5) / HOT_SAMPLES as f32 - 0.5) / n as f32;
+        (u + at(i, w), v + at(j, h))
+    };
+    let mean = match pattern {
+        HotPattern::Grid => {
+            for j in 0..HOT_SAMPLES {
+                for i in 0..HOT_SAMPLES {
+                    let (su, sv) = grid(i, j);
+                    add(&mut sum, su, sv);
+                }
+            }
+            sum * (1.0 / (HOT_SAMPLES * HOT_SAMPLES) as f32)
+        }
+        HotPattern::Lattice { points, stride } => {
+            for k in 0..points {
+                let row = (k * stride) % points;
+                let su = u + ((k as f32 + 0.5) / points as f32 - 0.5) / w as f32;
+                add(&mut sum, su, v + ((row as f32 + 0.5) / points as f32 - 0.5) / h as f32);
+            }
+            sum * (1.0 / points as f32)
+        }
+        HotPattern::Piece { points, stride, piece: [a0, a1, b0, b1] } => {
+            for k in 0..points {
+                let row = (k * stride) % points;
+                let fu = a0 + (a1 - a0) * ((k as f32 + 0.5) / points as f32);
+                let fv = b0 + (b1 - b0) * ((row as f32 + 0.5) / points as f32);
+                add(&mut sum, u + (fu - 0.5) / w as f32, v + (fv - 0.5) / h as f32);
+            }
+            let (mut rest, mut outside) = (Vec3f::default(), 0usize);
+            for j in 0..HOT_SAMPLES {
+                for i in (0..HOT_SAMPLES).filter(|&i| !piece_holds([a0, a1, b0, b1], i, j)) {
+                    let (su, sv) = grid(i, j);
+                    add(&mut rest, su, sv);
+                    outside += 1;
+                }
+            }
+            let share = (a1 - a0) * (b1 - b0);
+            sum * (share / points as f32) + rest * ((1.0 - share) / outside.max(1) as f32)
+        }
+    };
+    let c = texel(mean);
     [c[0], c[1], c[2], 1.0]
 }
 
@@ -3523,7 +4490,7 @@ mod tests {
             let centre = dir_from_az_el(az, 35.0);
             let disc = move |d: Vec3f| if d.dot(centre) >= radius.cos() { Vec3f::all(1.0) } else { Vec3f::default() };
             let mut map = bake_with(64, &disc);
-            refine_hot_spots(&mut map, &disc, &[(centre, radius)]);
+            refine_hot_spots(&mut map, &disc, &[HotSpot::plain(centre, radius)]);
             let energy: f32 = map.data.iter().enumerate().map(|(i, t)| {
                 let theta = ((i / map.width) as f32 + 0.5) / map.height as f32 * std::f32::consts::PI;
                 t[0] * (std::f32::consts::TAU / map.width as f32) * (std::f32::consts::PI / map.height as f32) * theta.sin()
@@ -3535,7 +4502,7 @@ mod tests {
         let plain = bake_with(64, &coded);
         let mut same = plain.clone();
         refine_hot_spots(&mut same, &coded, &[]);
-        refine_hot_spots(&mut same, &coded, &[(vec3f(0.0, 1.0, 0.0), 1.0)]);
+        refine_hot_spots(&mut same, &coded, &[HotSpot::plain(vec3f(0.0, 1.0, 0.0), 1.0)]);
         assert_eq!(same, plain);
     }
 
@@ -3608,9 +4575,13 @@ mod tests {
     }
 
     /// What the sun's key would be with nothing fading it (a clear sky): the
-    /// atmosphere's cone radiance, and the disc's outer limb in radians.
+    /// atmosphere's cone radiance, lifted as the Env lifts its sky once the true
+    /// sun is under the horizon (`night::adaptation`), and the disc's outer limb in
+    /// radians.
     fn unfaded_sun(p: &HdriParams) -> (Vec3f, f32) {
         let atmo = atmosphere::Atmosphere::new(atmosphere::sun_direction(&p.sky.sun), &p.sky.atmosphere, &p.sky.sun_disc);
+        let lift = night::adaptation(atmo.sun_dir());
+        let atmo = atmo.lifted(lift);
         (atmo.sun_cone_radiance(), atmo.sun_outer_radius())
     }
 
@@ -3624,11 +4595,13 @@ mod tests {
     fn the_suns_key_fades_out_with_the_visible_part_of_its_disc() {
         // The default disc is 0.53 degrees across with a 0.2 soft limb: its outer limb
         // is 0.29 degrees from its centre, so the key is full 0.29 degrees up, half
-        // on the horizon and gone 0.29 degrees down, along a smoothstep.
+        // on the horizon and gone 0.29 degrees down, along a smoothstep. `e` is where
+        // the disc is seen (the key's own elevation): the true sun is lower by the
+        // refraction there.
         let reference = lum(unfaded_sun(&sun_at(0.0)).0);
         let samples = sweep(91, |i| {
             let e = 0.45 - 0.01 * i as f32;
-            let p = sun_at(e);
+            let p = sun_at(e - atmosphere::refraction(e.to_radians()).to_degrees());
             let (full, outer) = unfaded_sun(&p);
             (e, outer.to_degrees(), lum(full), Env::new(&p).sun())
         });
@@ -3722,7 +4695,9 @@ mod tests {
             let (full, outer) = unfaded_sun(&p);
             let sun = atmosphere::sun_direction(&p.sky.sun);
             let e = sun.y.asin();
-            (p.sky.sun.hour, e.to_degrees(), lum(full), smoothstep(-outer, outer, e), unfaded_moon(&p), Env::new(&p).sun())
+            // (the sun's key goes with the disc as it is seen, lifted by the refraction; the moon's by the true depth)
+            let seen = atmosphere::apparent_elevation(e);
+            (p.sky.sun.hour, e.to_degrees(), lum(full), smoothstep(-outer, outer, seen), unfaded_moon(&p), Env::new(&p).sun())
         });
         let peak = samples.iter().map(|s| lum(s.5.map_or(Vec3f::default(), |k| k.radiance))).fold(0.0, f32::max);
         let mut state = 0; // 0 sun, 1 dark, 2 moon
@@ -3787,7 +4762,12 @@ mod tests {
     /// is a whole bake through that lookup.
     #[test]
     fn a_moon_on_its_way_in_leaves_the_share_its_key_carries() {
-        let env = Env::new(&sun_at(-7.0));
+        // A moon opposite the sun, nearly full, so its disc outshines the twilight behind it: the twilight is lifted as
+        // the night is, and a crescent's middle (the default moon's from this sun) is its earthshine, under the
+        // twilight at -7 degrees as in a real sky.
+        let mut p = sun_at(-7.0);
+        p.sky.night.moon_azimuth_deg = 20.0;
+        let env = Env::new(&p);
         let (term, key) = env.key().expect("the moon is arriving");
         let KeyTerm::Moon(share) = term else { panic!("the moon is the key: {term:?}") };
         assert!((share - smoothstep(6.0, 8.0, 7.0)).abs() < 1.0e-3, "half way in: {share}");
@@ -4475,4 +5455,163 @@ mod tests {
         assert!(lum(below) >= 0.15 * lum(above), "a mirror by Fresnel: {} against {} above", lum(below), lum(above));
     }
 
+}
+/// Hybrid studios (2026-11-05): a room standing on the ground sees it from its camera, its road between its mouths.
+#[cfg(test)]
+mod hybrid_ground_tests {
+    use super::*;
+    use crate::params::RoomSides;
+
+    #[test]
+    fn a_tunnel_stands_on_the_ground_its_outside_sees() {
+        let p = presets::preset("Road tunnel").unwrap();
+        let env = Env::new_cancellable(&p, &ImageSet::default(), &|| false).unwrap();
+        assert!(env.floor.is_none(), "the studio itself draws no floor");
+        let model = env.floor_model().expect("the outside's ground");
+        assert_eq!(model.eye_m(), 1.2, "seen from the room's camera height");
+        let numbers = model.ask_numbers();
+        // lanes, heading (the room's long side: north to south), wear, lane width, beside (Room)
+        assert_eq!((numbers[0], numbers[1], numbers[3], numbers[4]), (2.0, 0.0, 3.75, RoadBeside::Room as usize as f32));
+        assert_eq!(model.field_albedo(), p.studio.room.as_ref().unwrap().floor, "beside the road: the tunnel's floor");
+        assert!(env.ground_slot.is_some(), "the room reads the ground's near relief once it is handed in");
+        assert!(env.floor_light().is_some(), "the app is asked for the ground's planes");
+        // a bridge: grass beside, its verge
+        let bridge = Env::new_cancellable(&presets::preset("Bridge").unwrap(), &ImageSet::default(), &|| false).unwrap();
+        let numbers = bridge.floor_model().unwrap().ask_numbers();
+        assert_eq!((numbers[1], numbers[4]), (0.0, RoadBeside::Grass as usize as f32), "16 m wide, 12 deep, open north and south: the road runs between its mouths");
+        // a room open east and west runs it east to west, however long
+        let mut p = presets::preset("Road tunnel").unwrap();
+        p.studio.room.as_mut().unwrap().sides = Some(RoomSides { east: true, west: true, floor: true, ..RoomSides::default() });
+        let numbers = Env::new_cancellable(&p, &ImageSet::default(), &|| false).unwrap().floor_model().unwrap().ask_numbers();
+        assert_eq!(numbers[1], 90.0, "the road runs between the open walls");
+    }
+
+    #[test]
+    fn a_bridges_lamps_light_the_road_out_of_its_mouths() {
+        // the Bridge at night: 12 m deep, the camera 1.2 m up in its middle, the north mouth 6 m ahead; the ground's
+        // points straight ahead at `r` metres along the road
+        let mut p = presets::preset("Bridge").unwrap();
+        p.sky.sun.mode = "manual".to_string();
+        p.sky.sun.elevation_deg = -25.0;
+        let ahead = |p: &HdriParams, r: f32| {
+            let env = Env::new_cancellable(p, &ImageSet::default(), &|| false).unwrap();
+            let e = env.radiance(dir_from_az_el(0.0, -(1.2f32 / r).atan().to_degrees()));
+            e.x + e.y + e.z
+        };
+        let (inside, outside, far) = (ahead(&p, 5.5), ahead(&p, 6.5), ahead(&p, 40.0));
+        let mut dark = p.clone();
+        dark.lights.clear();
+        let unlit = ahead(&dark, 6.5);
+        assert!(outside > 4.0 * unlit, "the lamps light the road past the mouth: {outside} against {unlit} unlit");
+        assert!(outside > 0.4 * inside, "no step at the mouth: {inside} inside, {outside} outside");
+        assert!(far < 0.2 * outside, "and fade with the distance: {far} at 40 m");
+    }
+
+    #[test]
+    fn a_road_runs_on_to_the_horizon_by_night() {
+        // a moonless night over a straight road (the Bridge at night's road, no bend, no bridge): by starlight the
+        // road 300 m ahead is as lit as 30 m ahead (the night air is clear: `floor::FloorModel::night_keep`), where
+        // the glow's fade into a flat ground used to black it out from a few degrees under the horizon; 5 km ahead it
+        // is mostly still the road, the rest the night's glow it meets at the horizon
+        let mut p = presets::preset("Starry night").unwrap();
+        let mut floor = presets::preset("Bridge at night").unwrap().floor.unwrap();
+        floor.curve = Some("straight".to_string());
+        p.floor = Some(floor);
+        let env = Env::new_cancellable(&p, &ImageSet::default(), &|| false).unwrap();
+        let eye = env.floor_model().unwrap().eye_m();
+        let road = |r: f32| env.radiance(vec3f(1.0, -eye, -r).normalize()).y;
+        let (near, far, farther) = (road(30.0), road(300.0), road(5000.0));
+        assert!(near > 0.0 && far > 0.6 * near && far < 1.5 * near, "the road by starlight, near {near} and 300 m on {far}");
+        assert!(farther > 0.5 * far, "5 km on it is still mostly the road: {farther} against {far}");
+        // the ground just under the horizon is the night's glow, as the sky just over it
+        let under = env.radiance(vec3f(0.3, -1.0e-5, -1.0).normalize());
+        let over = env.radiance(vec3f(0.3, 1.0e-5, -1.0).normalize());
+        assert!(under.y > 0.0 && (under.y - over.y).abs() < 0.35 * over.y.max(under.y), "the horizon meets: {under:?} under, {over:?} over");
+    }
+
+    #[test]
+    fn the_far_road_bends_on_past_the_planes() {
+        // by day, a road bending right from 40 m with planes attached (a flat stand-in of the planes' own texels):
+        // the far ground beyond them is darkest where the bent road runs (6 degrees right at 86 m) and grass-bright
+        // straight ahead, where the hand-over's ratio used to paint the asphalt's azimuths out to the horizon
+        let mut p = presets::preset("Clear noon").unwrap();
+        let mut floor = presets::preset("Bridge at night").unwrap().floor.unwrap();
+        (floor.curve, floor.curve_radius_m, floor.curve_start_m) = (Some("right".to_string()), Some(120.0), Some(40.0));
+        p.floor = Some(floor);
+        let env = Env::new_for_width_par(&p, &ImageSet::default(), 2048, &|| false, &caster::serial_rows).unwrap();
+        let fl = env.floor.as_ref().unwrap();
+        let far_deg = (fl.eye_m() / (2.0 * fl.reach_m())).atan().to_degrees();
+        let (h, top) = floor::FloorPlanes::rows_for(2048, far_deg);
+        let eye = fl.eye_m();
+        let texel = |d: Vec3f| {
+            // the planes' texel: the far model's own albedo there, lit level (as the GPU would draw a flat ground), its
+            // asphalt darker than the far model's as the relief's rough, self-shadowed asphalt is
+            let albedo = fl.sample(d, 0.0).albedo * if fl.road_share(d, 0.0) > 0.5 { 0.6 } else { 1.0 };
+            floor::FloorTexel { albedo: [albedo.x, albedo.y, albedo.z], key: 1.0, normal: [0.0, 1.0, 0.0], dist: eye / (-d.y).max(1.0e-3), ..floor::FloorTexel::default() }
+        };
+        let planes = std::sync::Arc::new(floor::FloorPlanes::from_fn(2048, h, top, eye, texel));
+        // (1 degree down, about 100 m on: the road's centre where the path puts it, some 8 degrees right, the grass
+        // 12 degrees either side of it; the haze takes two thirds of the ground there, so the asphalt reads a few per
+        // cent darker than the grass)
+        let r = eye / 1.0f32.to_radians().tan();
+        let road = env.floor_model().unwrap().road();
+        let u = (0..600).map(|k| k as f32 * 0.5).min_by(|&a, &b| { let d = |u: f32| { let (p, _) = road.point(u); (p[0] * p[0] + p[1] * p[1]).sqrt() - r }; d(a).abs().partial_cmp(&d(b).abs()).unwrap() }).unwrap();
+        let (centre, _) = road.point(u);
+        let az = centre[0].atan2(-centre[1]).to_degrees();
+        assert!(az > 5.0 && az < 12.0, "the road's centre {u} m along, {r} m off, lies {az} degrees right");
+        let plain_left = env.radiance(dir_from_az_el(az - 12.0, -1.0)).y;
+        let env = env.with_floor(planes);
+        let look = |az: f32| env.radiance(dir_from_az_el(az, -1.0)).y;
+        let (left, on_bend, right) = (look(az - 12.0), look(az), look(az + 12.0));
+        assert!(on_bend < 0.96 * left && on_bend < 0.96 * right, "100 m on: the road at {az} degrees {on_bend}, grass left {left} and right {right}");
+        assert!((left - right).abs() < 0.05 * left, "the grass left {left} is the grass right {right}");
+        // straight ahead, where the road ran at the hand-over, the grass keeps its own light (the asphalt's darker
+        // ratio no longer paints it): as without the planes, to the speckle
+        assert!(left > 0.96 * plain_left && left < 1.04 * plain_left, "the grass ahead with the planes {left}, without {plain_left}");
+    }
+
+    #[test]
+    fn a_cloud_deck_leaves_the_night_road_its_light() {
+        // Under a Stratocumulus layer the stack relights the ground with daylight over the lowest three degrees
+        // (`weather::haze_relit`). The moonless road ahead keeps its starlight.
+        let mut p = presets::preset("Starry night").unwrap();
+        let mut floor = presets::preset("Bridge at night").unwrap().floor.unwrap();
+        floor.curve = Some("straight".to_string());
+        p.floor = Some(floor);
+        let clear = Env::new_cancellable(&p, &ImageSet::default(), &|| false).unwrap();
+        let mut under = p.clone();
+        under.sky.cloud_stack = Some(CloudStackParams { layers: vec![CloudLayerParams::new(CloudGenus::Stratocumulus, &[], p.seed)], ..CloudStackParams::default() });
+        let decked = Env::new_cancellable(&under, &ImageSet::default(), &|| false).unwrap();
+        assert!(decked.cloud_stack.is_some());
+        let eye = clear.floor_model().unwrap().eye_m();
+        let road = |env: &Env, r: f32| env.radiance(vec3f(0.0, -eye, -r).normalize()).y;
+        for r in [45.0f32, 105.0, 165.0] {
+            let (a, b) = (road(&clear, r), road(&decked, r));
+            assert!(b > 0.5 * a && b < 2.0 * a, "under the deck the starlit road {r} m on is {b}, in the clear {a}");
+        }
+    }
+
+    #[test]
+    fn a_sharp_road_bend_starts_past_the_bridge_or_tunnel_mouth() {
+        let p = presets::preset("Bridge at night").unwrap();
+        let env = Env::new_cancellable(&p, &ImageSet::default(), &|| false).unwrap();
+        let model = env.floor_model().expect("the outside's ground");
+        let numbers = model.ask_numbers();
+        assert_eq!((numbers[5], numbers[6]), (120.0, 40.0), "bending right from 40 m");
+        // the viewer on the bend: the 12 m bridge bows 0.15 m off a 120 m bend at its mouth, so the bend stays where it
+        // was asked; a sharp one (40 m: 0.45 m... 30 m: 0.6 m) starts a metre past the north mouth (6 m), and so does any
+        // under the 60 m tunnel (3.75 m off at 120 m)
+        let mut near = p.clone();
+        near.floor.as_mut().unwrap().curve_start_m = Some(-100.0);
+        let near_env = Env::new_cancellable(&near, &ImageSet::default(), &|| false).unwrap();
+        assert_eq!(near_env.floor_model().unwrap().ask_numbers()[6], -100.0, "a gentle bend runs under the bridge");
+        near.floor.as_mut().unwrap().curve_radius_m = Some(30.0);
+        let near_env = Env::new_cancellable(&near, &ImageSet::default(), &|| false).unwrap();
+        assert_eq!(near_env.floor_model().unwrap().ask_numbers()[6], 7.0, "a sharp bend starts a metre past the north mouth (6 m)");
+        let mut tunnel = presets::preset("Road tunnel").unwrap();
+        let ground = tunnel.floor.as_mut().unwrap();
+        (ground.curve, ground.curve_radius_m, ground.curve_start_m) = (Some("left".to_string()), Some(120.0), Some(10.0));
+        let tunnel_env = Env::new_cancellable(&tunnel, &ImageSet::default(), &|| false).unwrap();
+        assert_eq!(tunnel_env.floor_model().unwrap().ask_numbers()[5..7], [-120.0, 31.0], "the tunnel's bend starts past its 30 m mouth");
+    }
 }

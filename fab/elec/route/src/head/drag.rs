@@ -314,6 +314,7 @@ pub(super) fn proposal(
     last: bool,
 ) -> RouteProposal {
     RouteProposal {
+        pair: None,
         id, source, unit: base.unit, base_generation: base.board.generation, base_hash: base.hash,
         metrics: RouteMetrics { length: head.length as i64, ..RouteMetrics::default() },
         ops, checked: None, verified: collisions.is_empty(), collisions, open: Vec::new(), head: Some(head),

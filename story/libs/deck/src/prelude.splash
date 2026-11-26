@@ -1,0 +1,29 @@
+// mod.deck: the deck vocabulary. Every constructor returns a
+// record; DeckDoc::load reads the records, nothing here runs a slide.
+mod.deck = {}
+mod.deck.Deck = {record: @deck}
+mod.deck.Slide = {record: @slide}
+mod.deck.graphic = mod.cut.graphic
+/** A live app: registry id, size in points, audio, args and env. Optional setup/demo lists belong to this app: setup runs on launch, D drives the active AppView's demo. Hidden spans park host ticks after setup. */
+mod.deck.App = {record: @app}
+/** A transition between slides: its length in seconds, the VJ transition preset and its dials (`{p1: 0.3}`). */
+mod.deck.transition = fn(seconds, effect, dials = nil) { {record: @transition seconds: seconds effect: effect dials: dials} }
+
+// Demo steps: the names, options and defaults of an app run's script calls.
+// `opts` is the call's options object; DeckDoc::load reads the record
+// through app_run's `call_from_sv`, so the checks are the script's own.
+mod.deck.click = fn(target, opts = nil) { {record: @step call: @click target: target opts: opts} }
+mod.deck.type = fn(target, text, opts = nil) { {record: @step call: @type target: target text: text opts: opts} }
+mod.deck.key = fn(code, opts = nil) { {record: @step call: @key code: code opts: opts} }
+mod.deck.drag = fn(from, to, opts = nil) { {record: @step call: @drag from: from to: to opts: opts} }
+mod.deck.scroll = fn(target, dx = 0.0, dy = 0.0, opts = nil) { {record: @step call: @scroll target: target dx: dx dy: dy opts: opts} }
+mod.deck.wait_visible = fn(target, opts = nil) { {record: @step call: @wait_visible target: target opts: opts} }
+mod.deck.wait_text = fn(target, text, opts = nil) { {record: @step call: @wait_text target: target text: text opts: opts} }
+mod.deck.wait_settled = fn(opts = nil) { {record: @step call: @wait_settled opts: opts} }
+mod.deck.wait_state = fn(target, opts = nil) { {record: @step call: @wait_state target: target opts: opts} }
+/** Pacing for the audience only, never a substitute for a wait. */
+mod.deck.hold = fn(seconds) { {record: @step call: @hold seconds: seconds} }
+/** Stops the demo until the presenter resumes it. */
+mod.deck.pause = fn() { {record: @step call: @pause} }
+mod.deck.mark = fn(name) { {record: @step call: @mark name: name} }
+nil

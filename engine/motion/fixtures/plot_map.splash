@@ -1,0 +1,23 @@
+use mod.motion.*
+Motion{size: vec2(1920, 1080) duration: 6 background: #121820
+    layers: [
+        Text{text: "A matrix moves the plane" size: 38 color: #f2efe6 at: vec2(130, 72)}
+        Text{text: "The complex square" size: 32 color: #f2efe6 at: vec2(1330, 72)}
+        Plot{name: "shear" x: [-3, 3, 1] y: [-3, 3, 1] grid: @plane
+            at: vec2(320, 340) size: vec2(420, 420)
+            map: [[1, 1], [0, 1]] map_at: tween(0, 1, 1, 3, @ease_in_out_cubic)
+            layers: [
+                Graph{name: "wave" f: fn(x) { 0.8 * sin(x) } color: #ff7a1a width: 4}
+                Dot{name: "point" at: vec2(0, 1) radius: 8 color: #64dcbd}
+            ]}
+        Math{tex: "\\begin{pmatrix}1 & 1 \\\\ 0 & 1\\end{pmatrix}" size: 38 color: #64dcbd at: vec2(1050, 470) align: @center}
+        Math{tex: "(x,y) \\mapsto (x+y,y)" size: 32 color: #f2efe6 at: vec2(530, 860) align: @center}
+        Plot{name: "square" x: [-1.5, 1.5, 0.5] y: [-1.5, 1.5, 0.5] grid: @plane
+            at: vec2(1440, 440) size: vec2(260, 260)
+            map: fn(z) { cmul(z, z) } map_at: tween(0, 1, 2, 5)
+            layers: [
+                Implicit{name: "unit circle" f: fn(x, y) { x * x + y * y - 1 } color: #ff7a1a width: 4}
+            ]}
+        Math{tex: "z \\mapsto z^2" size: 32 color: #ff7a1a at: vec2(1570, 992) align: @center}
+    ]
+}

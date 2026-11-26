@@ -74,7 +74,7 @@ fn wait_until(app: &TestApp, what: &str, mut ready: impl FnMut() -> bool) {
 }
 
 fn log(app: &TestApp, from: u64) -> Vec<String> {
-    app.log_since(from).map(|t| t.lines).unwrap_or_default()
+    app.log_since(from).expect("the app's log").lines
 }
 
 fn seq(app: &TestApp) -> u64 {

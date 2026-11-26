@@ -4,6 +4,12 @@
 //! point's transmission is the product of (1 - coverage) over them, so
 //! overlapping soft edges darken each other the way two half-shadows do.
 //!
+//! Leaves hang on a tree (`Tree`): limbs reaching in from past the light's
+//! edge fork into branches and twigs, the twigs carry the leaves in clumps,
+//! and sky shows between the clumps, as in every tree gobo of the add-on
+//! libraries and every filmed tree (lighting survey, 2026-11-09). Leaves
+//! scattered evenly at random read as confetti.
+//!
 //! A leaf is a lens: the shape between two circular arcs that meet in a tip
 //! at each end. Its signed distance is exact (the idea of iq's vesica,
 //! reimplemented). The lens is laid along a midrib that sags sideways as a
@@ -25,11 +31,12 @@ use makepad_draw::*;
 use super::noise::hash_u32;
 use makepad_tween::path::MotionPath;
 
-/// The most leaves one gobo scatters, about as many primitives as stay local
-/// in the bins (MAX_BINS): the smallest leaves at density 1 on a 60 x 45
-/// degree light ask for twice as many. Past the cap the leaves grow instead,
-/// so the canopy still covers what density asks (D9, L:148: at 900 leaves,
-/// density 0.5 and 1 gave the same canopy from leaf size 0.5 down).
+/// The most primitives one leaves gobo holds (its leaves and the branches
+/// carrying them), about as many as stay local in the bins (MAX_BINS): the
+/// smallest leaves at density 1 on a 60 x 45 degree light ask for several
+/// times as many. Past the cap the tree grows instead, so the canopy still
+/// covers what density asks (D9, L:148: at 900 leaves, density 0.5 and 1
+/// gave the same canopy from leaf size 0.5 down).
 pub const MAX_LEAVES: usize = 40_000;
 /// The most fronds one fern gobo grows, about as many primitives as
 /// MAX_LEAVES (a frond is about 450). Past it the fronds grow instead.
@@ -45,9 +52,14 @@ const MAX_BINS: f32 = 160.0;
 /// Pinna pairs along a fern frond, and pinnule pairs along each pinna.
 pub const PAIRS: usize = 14;
 pub const LOBES: usize = 7;
+/// A pinnule's length over its frond's, about (`pinna_envelope` at its
+/// widest, 0.26 of its pinna): how fine a fern is (`gobo`'s raster reads it).
+pub const FERN_PINNULE: f32 = 0.05;
 
-/// Leaves per leaf-length squared at density 1. A leaf covers about 0.3 of
-/// its length squared, so 8 of them leave about e^-2.4, 9 %, open.
+/// Leaves per leaf-length squared that density 1 stands for: scattered at
+/// random, 8 of them (each about 0.32 of its length squared, LEAF_AREA)
+/// leave about e^-2.56, 8 %, open. A tree's leaves leave that much sky open
+/// between them, its branches a little less.
 const LEAVES_PER_AREA: f32 = 8.0;
 /// A leaf's stalk: how far it runs back from the base, and its radius, in leaf lengths.
 const STALK: f32 = 0.22;
@@ -198,7 +210,7 @@ fn strip(x: f32, h: f32, w: f32) -> f32 {
     if !(h > 0.0) {
         return 0.0;
     }
-    ((h.min(x + w) - (-h).max(x - w)).max(0.0) / (2.0 * w)).min(1.0)
+    crate::patterns::band_covers(x, -h, h, w)
 }
 
 /// How much of `a..b` lies in `lo..hi`.
@@ -336,6 +348,414 @@ fn pinna_envelope(u: f32) -> f32 {
     smoothstep(0.0, 0.3, u) * (1.0 - u).max(0.0).powf(0.8)
 }
 
+/// Stem primitives a tree grows for each leaf (its twigs, branches and
+/// limbs), about: what `Foliage::leaves` budgets for MAX_LEAVES.
+const TREE_STEMS_PER_LEAF: f32 = 0.46;
+/// How many more leaves a tree grows than leaves scattered at random over
+/// the binned rectangle leaving the same share of sky open, about (they
+/// overlap within their clumps, and the clumps round the rectangle's border
+/// hang partly past it): what `Foliage::leaves` budgets for MAX_LEAVES.
+const TREE_LEAF_GAIN: f32 = 2.6;
+/// A leaf's area over its length squared, about (a lens of half-width 0.17 to
+/// 0.28 of its length, teeth and stalk in): LEAVES_PER_AREA of them a length
+/// squared, scattered at random, leave e^-(LEAVES_PER_AREA x LEAF_AREA) open.
+const LEAF_AREA: f32 = 0.32;
+/// The branch a clump of leaves hangs from, in leaf lengths: a spray of twigs.
+const CLUMP: f32 = 5.0;
+/// Where a clump's leaves gather on the whole, in its branch's lengths from
+/// its base: its side twigs over the outer two thirds lean on, and the fork
+/// at its end reaches on past it (`Tree::branch`).
+const CLUMP_REACH: f32 = 0.95;
+/// Coverage cells a leaf length (`Tree::cover`), and at most this many cells.
+const COVER_CELLS_PER_LEAF: f32 = 3.0;
+const COVER_CELLS_MAX: f32 = 160_000.0;
+/// A branch shorter than this many leaf lengths is a twig: it carries leaves, not branches.
+const TWIG: f32 = 2.3;
+/// A twig's radius at its tip, in leaf lengths; the pipe model thickens every branch from it.
+const TIP_RADIUS: f32 = 0.016;
+/// The pipe model's exponent: a branch's radius to this power is the sum of its children's
+/// (da Vinci's rule is 2; measured trees run from 2 to 3).
+const PIPE: f32 = 2.3;
+/// The R2 sequence's steps (1 / g and 1 / g², g the plastic number): clump targets that fill
+/// the rectangle evenly in any number, each new one where the others left room.
+const R2_STEP: [f64; 2] = [0.754_877_666_246_692_8, 0.569_840_290_998_053_3];
+/// No parent: a limb's root, outside the light.
+const ROOT: u32 = u32::MAX;
+
+/// A point of a tree's skeleton, joined to the one it grew from.
+#[derive(Clone, Copy, Debug)]
+struct TreeNode {
+    pos: Vec2f,
+    parent: u32,
+}
+
+/// A tree grown into the light's rectangle and its glow, clump by clump.
+/// Each clump of leaves has a target, the next point of a low-discrepancy
+/// sequence, so the clumps spread over the rectangle as evenly as their
+/// number allows, with sky between them. A clump hangs from a branch about
+/// CLUMP leaf lengths long, which forks into twigs (`branch`); the branch
+/// grows from the nearest limb or branch already there, or, when the edge is
+/// nearer, from a new limb reaching in from past it (`limb`). Twigs carry
+/// leaves along them and a cluster at their end. Clumps are added until
+/// their leaves leave the sky open that density asks (`grow`). The skeleton
+/// is grown first and thickened afterwards by the pipe model, so a limb is
+/// as thick as all it carries (`into_prims`).
+struct Tree {
+    /// The binned rectangle's half extents (the light's and its glow): the
+    /// coverage is kept over all of it, so a soft light's glow shows as thick
+    /// a canopy as the light (D9, L:147).
+    reach: Vec2f,
+    /// How far past it the clumps' targets spread: three quarters of a
+    /// clump, so the rectangle's border gets clumps from both sides, as its
+    /// middle does.
+    margin: f32,
+    /// A leaf's length, s-units: every other size is measured in it.
+    len: f32,
+    rng: Rng,
+    shift: [f64; 2],
+    nodes: Vec<TreeNode>,
+    /// Nodes a later clump may grow from, by grid cell: along the limbs and
+    /// the larger branches, never the twigs.
+    joints: Vec<Vec<u32>>,
+    cells: [usize; 2],
+    cell: f32,
+    leaves: Vec<LeafPrim>,
+    /// A clump's branch, s-units, before its own spread: CLUMP leaf lengths,
+    /// held to half the rectangle's smaller half extent, so a large leaf still
+    /// hangs several clumps in the light instead of one that mostly misses it.
+    clump: f32,
+    /// Which cells of a grid over the rectangle a leaf covers at its middle:
+    /// how much sky the canopy leaves open so far (`open`).
+    cover: Vec<bool>,
+    cover_n: [usize; 2],
+    cover_cell: f32,
+    covered: usize,
+}
+
+impl Tree {
+    fn new(reach: Vec2f, len: f32, seed: u32) -> Tree {
+        let mut rng = Rng::new(seed, 0x7ee5);
+        let shift = [rng.f() as f64, rng.f() as f64];
+        let clump = (CLUMP * len).min(0.5 * reach.x.min(reach.y)).max(TWIG * len);
+        let margin = 0.75 * clump;
+        // About a clump's size a cell, so a search looks at a few cells, over
+        // the rectangle the targets spread over.
+        let spread = reach + Vec2f::all(margin);
+        let cell = (2.0 * CLUMP * len).max(2.0 * spread.x.max(spread.y) / 64.0);
+        let cells = [((2.0 * spread.x / cell).ceil() as usize).max(1), ((2.0 * spread.y / cell).ceil() as usize).max(1)];
+        let cover_cell = (len / COVER_CELLS_PER_LEAF).max((4.0 * reach.x * reach.y / COVER_CELLS_MAX).sqrt());
+        let cover_n = [((2.0 * reach.x / cover_cell).ceil() as usize).max(1), ((2.0 * reach.y / cover_cell).ceil() as usize).max(1)];
+        Tree {
+            reach,
+            margin,
+            len,
+            rng,
+            shift,
+            nodes: Vec::new(),
+            joints: vec![Vec::new(); cells[0] * cells[1]],
+            cells,
+            cell,
+            leaves: Vec::new(),
+            clump,
+            cover: vec![false; cover_n[0] * cover_n[1]],
+            cover_n,
+            cover_cell,
+            covered: 0,
+        }
+    }
+
+    /// The share of the rectangle no leaf covers yet.
+    fn open(&self) -> f32 {
+        1.0 - self.covered as f32 / self.cover.len() as f32
+    }
+
+    /// Clumps in order until the leaves leave no more than `open` of the
+    /// rectangle open, its primitives staying under MAX_LEAVES.
+    fn grow(&mut self, open: f32) {
+        let mut k = 0u32;
+        while self.open() > open && self.nodes.len() + self.leaves.len() < MAX_LEAVES && k < MAX_LEAVES as u32 {
+            self.clump(k);
+            k += 1;
+        }
+        self.leaves.truncate(MAX_LEAVES.saturating_sub(self.nodes.len()));
+    }
+
+    /// Marks the coverage cells whose middle `leaf` covers.
+    fn cover_leaf(&mut self, leaf: &LeafPrim) {
+        let (c, r) = Prim::Leaf(*leaf).bounds();
+        let (h, n, cell) = (self.reach, self.cover_n, self.cover_cell);
+        let x0 = ((c.x - r + h.x) / cell).floor().max(0.0) as usize;
+        let y0 = ((c.y - r + h.y) / cell).floor().max(0.0) as usize;
+        let x1 = ((c.x + r + h.x) / cell).floor();
+        let y1 = ((c.y + r + h.y) / cell).floor();
+        if !(x1 >= 0.0 && y1 >= 0.0) {
+            return;
+        }
+        let (x1, y1) = ((x1 as usize).min(n[0] - 1), (y1 as usize).min(n[1] - 1));
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let k = y * n[0] + x;
+                if self.cover[k] {
+                    continue;
+                }
+                let p = vec2f(-h.x + (x as f32 + 0.5) * cell, -h.y + (y as f32 + 0.5) * cell);
+                if leaf_sdf(leaf, p) <= 0.0 {
+                    self.cover[k] = true;
+                    self.covered += 1;
+                }
+            }
+        }
+    }
+
+    fn cell_of(&self, p: Vec2f) -> (usize, usize) {
+        let x = ((p.x + self.reach.x + self.margin) / self.cell).floor().max(0.0) as usize;
+        let y = ((p.y + self.reach.y + self.margin) / self.cell).floor().max(0.0) as usize;
+        (x.min(self.cells[0] - 1), y.min(self.cells[1] - 1))
+    }
+
+    fn add_node(&mut self, pos: Vec2f, parent: u32, joint: bool) -> u32 {
+        let i = self.nodes.len() as u32;
+        self.nodes.push(TreeNode { pos, parent });
+        if joint {
+            let (x, y) = self.cell_of(pos);
+            self.joints[y * self.cells[0] + x].push(i);
+        }
+        i
+    }
+
+    /// The joint nearest `p` no nearer than `near` and within `limit`,
+    /// searching the grid outward ring by ring until no nearer one can be left.
+    fn nearest_joint(&self, p: Vec2f, near: f32, limit: f32) -> Option<(u32, f32)> {
+        let (cx, cy) = self.cell_of(p);
+        let mut best: Option<(u32, f32)> = None;
+        let rings = self.cells[0].max(self.cells[1]);
+        for ring in 0..=rings {
+            // Every point of this ring's cells is at least (ring - 1) cells from p.
+            let inner = (ring as f32 - 1.0).max(0.0) * self.cell;
+            if inner > best.map_or(limit, |b| b.1.min(limit)) {
+                break;
+            }
+            let (x0, x1) = (cx as i64 - ring as i64, cx as i64 + ring as i64);
+            let (y0, y1) = (cy as i64 - ring as i64, cy as i64 + ring as i64);
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let on_ring = x == x0 || x == x1 || y == y0 || y == y1;
+                    if !on_ring || x < 0 || y < 0 || x >= self.cells[0] as i64 || y >= self.cells[1] as i64 {
+                        continue;
+                    }
+                    for &j in &self.joints[y as usize * self.cells[0] + x as usize] {
+                        let d = (self.nodes[j as usize].pos - p).length();
+                        if d >= near && d < limit && best.map_or(true, |b| d < b.1) {
+                            best = Some((j, d));
+                        }
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Clump `k`: its target, the limb or branch it grows from, and the
+    /// branch its leaves hang from.
+    fn clump(&mut self, k: u32) {
+        let t = [(self.shift[0] + R2_STEP[0] * k as f64).fract() as f32, (self.shift[1] + R2_STEP[1] * k as f64).fract() as f32];
+        let spread = self.reach + Vec2f::all(self.margin);
+        let target = vec2f(spread.x * (2.0 * t[0] - 1.0), spread.y * (2.0 * t[1] - 1.0));
+        let size = self.clump * self.rng.range(0.75, 1.3);
+        // Its branch starts CLUMP_REACH of its length short of the target, so
+        // its leaves gather round the target: what it grows from lies at least
+        // that far off.
+        let reach = CLUMP_REACH * size;
+        // The nearest edge of the rectangle the targets spread over, and a
+        // root a leaf past it, or as far out as the branch needs.
+        let edges = [target.x + spread.x, spread.x - target.x, target.y + spread.y, spread.y - target.y];
+        let e = (0..4).min_by(|&a, &b| edges[a].total_cmp(&edges[b])).unwrap_or(0);
+        let along = self.rng.range(-0.5, 0.5) * edges[e].max(size);
+        let out = (edges[e] + self.len).max(reach);
+        let entry = match e {
+            0 => vec2f(target.x - out, target.y + along),
+            1 => vec2f(target.x + out, target.y + along),
+            2 => vec2f(target.x + along, target.y - out),
+            _ => vec2f(target.x + along, target.y + out),
+        };
+        // From a branch already there when one is nearer than the edge.
+        let (from, start) = match self.nearest_joint(target, reach, (entry - target).length()) {
+            Some((j, _)) => (j, self.nodes[j as usize].pos),
+            None => (self.add_node(entry, ROOT, false), entry),
+        };
+        let to = target - start;
+        let dist = to.length();
+        let dir = if dist > 1.0e-6 { to * (1.0 / dist) } else { vec2f(1.0, 0.0) };
+        let base = target - dir * reach.min(dist);
+        let (node, heading) = self.limb(from, start, base);
+        self.branch(node, heading, size, false);
+    }
+
+    /// A limb from node `from` at `start` to `end`: a gently bowed curve,
+    /// every node of it a joint later clumps may branch from. Returns its
+    /// last node and its heading there.
+    fn limb(&mut self, from: u32, start: Vec2f, end: Vec2f) -> (u32, f32) {
+        let span = end - start;
+        let dist = span.length();
+        let straight = span.y.atan2(span.x);
+        if dist < self.len {
+            return (from, straight + self.rng.range(-0.3, 0.3));
+        }
+        // A quadratic curve, its middle pushed sideways by up to a fifth of its length.
+        let side = vec2f(-span.y, span.x) * self.rng.range(-0.2, 0.2);
+        let mid = (start + end) * 0.5 + side;
+        let steps = (dist / self.len.max(dist / 40.0)).ceil().max(2.0) as usize;
+        let mut node = from;
+        let mut prev = start;
+        for i in 1..=steps {
+            let u = i as f32 / steps as f32;
+            let p = start * ((1.0 - u) * (1.0 - u)) + mid * (2.0 * u * (1.0 - u)) + end * (u * u);
+            // A little waver, none at the ends.
+            let tangent = (p - prev).normalize();
+            let p = p + vec2f(-tangent.y, tangent.x) * (self.rng.range(-0.06, 0.06) * self.len * (4.0 * u * (1.0 - u)));
+            node = self.add_node(p, node, true);
+            prev = p;
+        }
+        let tangent = end - mid;
+        (node, tangent.y.atan2(tangent.x))
+    }
+
+    /// A branch from node `from`, `length` long, setting off at `heading`
+    /// (radians). Longer than TWIG leaf lengths, it bends a little, sends
+    /// side branches off its outer two thirds, alternating, and forks at its
+    /// end; a twig carries leaves along its outer part and a cluster at its
+    /// end. `flip` turns the side its first side branch takes.
+    fn branch(&mut self, from: u32, heading: f32, length: f32, flip: bool) {
+        let len = self.len;
+        let twig = length < TWIG * len;
+        let step = if twig { (0.7 * len).max(length / 3.0) } else { (0.6 * len).max(length / 16.0) };
+        let steps = (length / step).ceil().max(2.0) as usize;
+        let step = length / steps as f32;
+        let turn = self.rng.range(-0.45, 0.45) / steps as f32;
+        let laterals = if twig { 0 } else { 3 + (self.rng.f() * 2.99) as usize };
+        let joint = length >= 2.0 * TWIG * len;
+        let mut side = if flip ^ (self.rng.f() < 0.5) { 1.0 } else { -1.0 };
+        let mut heading = heading;
+        let mut node = from;
+        let mut pos = self.nodes[from as usize].pos;
+        let mut next_lateral = 0;
+        // Leaves along a twig: from a quarter of the way out, about every 0.45 leaf lengths.
+        let mut next_leaf = 0.25 * length + self.rng.range(0.0, 0.2) * len;
+        let mut travelled = 0.0;
+        for i in 0..steps {
+            heading += turn + self.rng.range(-0.07, 0.07);
+            let dir = vec2f(heading.cos(), heading.sin());
+            let next = pos + dir * step;
+            node = self.add_node(next, node, joint);
+            let u = (i + 1) as f32 / steps as f32;
+            // Side branches spread over the outer two thirds.
+            while next_lateral < laterals && 0.32 + 0.6 * (next_lateral as f32 + 0.5) / laterals as f32 <= u {
+                let at = 0.32 + 0.6 * (next_lateral as f32 + 0.5) / laterals as f32;
+                let angle = heading + side * self.rng.range(0.55, 1.05);
+                let child = length * (0.62 - 0.3 * at) * self.rng.range(0.8, 1.2);
+                self.branch(node, angle, child, side < 0.0);
+                side = -side;
+                next_lateral += 1;
+            }
+            if twig {
+                while next_leaf <= travelled + step {
+                    let p = pos + dir * (next_leaf - travelled);
+                    let axis = heading + side * self.rng.range(0.6, 1.0);
+                    let size = self.rng.range(0.7, 1.1);
+                    self.leaf(p, axis, size);
+                    side = -side;
+                    next_leaf += 0.45 * len * self.rng.range(0.8, 1.2);
+                }
+            }
+            travelled += step;
+            pos = next;
+        }
+        if twig {
+            // The cluster at the twig's end, fanned about its heading.
+            let n = 4 + (self.rng.f() * 2.99) as usize;
+            let fan = self.rng.range(1.0, 1.5);
+            for j in 0..n {
+                let spread = fan * (2.0 * j as f32 / (n - 1) as f32 - 1.0) + self.rng.range(-0.12, 0.12);
+                let back = self.rng.range(0.0, 0.35) * len;
+                let p = pos - vec2f(heading.cos(), heading.sin()) * back;
+                let size = self.rng.range(0.75, 1.2);
+                self.leaf(p, heading + spread, size);
+            }
+        } else {
+            // The fork its end splits into.
+            let open = self.rng.range(0.25, 0.5);
+            for s in [-1.0f32, 1.0] {
+                let child = length * 0.45 * self.rng.range(0.85, 1.15);
+                self.branch(node, heading + s * open, child, s > 0.0);
+            }
+        }
+    }
+
+    /// A leaf on a twig at `p`, pointing along `angle`, `size` leaf lengths
+    /// long: its stalk reaches back to the twig.
+    fn leaf(&mut self, p: Vec2f, angle: f32, size: f32) {
+        let len = self.len * size;
+        let axis = vec2f(angle.cos(), angle.sin());
+        let leaf = LeafPrim {
+            origin: p + axis * (0.2 * len),
+            axis,
+            len,
+            width: self.rng.range(0.17, 0.28),
+            bend: self.rng.range(-0.12, 0.12),
+            serration: self.rng.range(0.0, 0.35),
+        };
+        self.cover_leaf(&leaf);
+        self.leaves.push(leaf);
+    }
+
+    /// The tree as primitives: every skeleton segment a stem as thick as the
+    /// pipe model makes it (a branch's radius^PIPE is the sum of its
+    /// children's, TIP_RADIUS leaf lengths at each tip), then the leaves.
+    /// What lies wholly past the binned rectangle (and its penumbra) is left
+    /// out: no light there is ever asked for it.
+    fn into_prims(self, soft: f32) -> Vec<Prim> {
+        let n = self.nodes.len();
+        // Children come after their parents, so one pass from the end sums each subtree.
+        let mut sum = vec![0.0f32; n];
+        let mut radius = vec![0.0f32; n];
+        let tip = (TIP_RADIUS * self.len).powf(PIPE);
+        for i in (0..n).rev() {
+            let s = if sum[i] > 0.0 { sum[i] } else { tip };
+            radius[i] = s.powf(1.0 / PIPE);
+            let parent = self.nodes[i].parent;
+            if parent != ROOT {
+                sum[parent as usize] += s;
+            }
+        }
+        let reach = self.reach;
+        let keep = |prim: &Prim| {
+            let (c, r) = prim.bounds();
+            let r = r + prim.pad() * soft;
+            let dx = (c.x.abs() - reach.x).max(0.0);
+            let dy = (c.y.abs() - reach.y).max(0.0);
+            dx * dx + dy * dy <= r * r
+        };
+        // Leaves first: a point under a leaf is dark before the thin stems in
+        // its bin are looked at (`Foliage::through` stops at black).
+        let mut prims = Vec::with_capacity(n + self.leaves.len());
+        for leaf in self.leaves {
+            let leaf = Prim::Leaf(leaf);
+            if keep(&leaf) {
+                prims.push(leaf);
+            }
+        }
+        for (i, node) in self.nodes.iter().enumerate() {
+            if node.parent != ROOT {
+                let stem = Prim::Stem(StemPrim { a: self.nodes[node.parent as usize].pos, b: node.pos, radius: radius[i] });
+                if keep(&stem) {
+                    prims.push(stem);
+                }
+            }
+        }
+        prims
+    }
+}
+
 /// Primitives binned over the light's rectangle.
 #[derive(Clone, Debug)]
 pub struct Foliage {
@@ -349,45 +769,59 @@ pub struct Foliage {
 }
 
 impl Foliage {
-    /// Leaves scattered over the light's rectangle `half` (s-units) and its
-    /// glow (GLOW past it).
-    /// - `density` 0..=1 sets how many: 8 per leaf-length squared at 1,
-    ///   which leaves about a tenth open.
-    /// - `scale` sets their size: a leaf is 0.35·scale long.
-    /// - `seed` sets where they fall and how they turn.
+    /// A tree's leaves over the light's rectangle `half` (s-units) and its
+    /// glow (GLOW past it): limbs reaching in from past the light's edge,
+    /// forking into branches and twigs that carry the leaves, with sky
+    /// between the clumps (`Tree`).
+    /// - `density` 0..=1 sets how much sky the leaves leave open: what as
+    ///   many leaves scattered at random would, 8 per leaf-length squared at 1
+    ///   (a closed canopy, LEAVES_PER_AREA).
+    /// - `scale` sets their size: a leaf is 0.35·scale long, and the twigs,
+    ///   clumps and limbs are measured in leaf lengths.
+    /// - `seed` sets where the clumps hang and how the branches turn.
     /// - `soft` is the penumbra half-width.
     ///
-    /// Leaves are drawn in a fixed order, so for one seed a higher density
-    /// only adds leaves, up to MAX_LEAVES; past it the same leaves grow so
-    /// that they cover what density asks.
+    /// Clumps grow in a fixed order, so for one seed a higher density only
+    /// adds clumps (and thickens the branches that carry them), up to
+    /// MAX_LEAVES primitives; past it the same tree grows so that it covers
+    /// what density asks.
     pub fn leaves(half: Vec2f, density: f32, scale: f32, seed: u32, soft: f32) -> Foliage {
         let reach = vec2f(half.x + GLOW, half.y + GLOW);
-        let mut len0 = 0.35 * scale.max(0.1).min(10.0);
-        // Scatter a leaf length past the glow too, so leaves cross its edge.
+        let len0 = Foliage::leaf_length(half, density, scale);
+        let density = density.max(0.0).min(1.0);
+        let mut tree = Tree::new(reach, len0, seed);
+        // It leaves the sky open that as many leaves scattered at random would.
+        tree.grow((-LEAVES_PER_AREA * LEAF_AREA * density).exp());
+        Foliage::from_prims(tree.into_prims(soft), reach, soft)
+    }
+
+    /// The length of `leaves`' leaves, s-units: 0.35·scale, or longer where
+    /// the tree would pass MAX_LEAVES primitives: TREE_LEAF_GAIN times the
+    /// leaves a random scatter needs (a leaf length past the glow too), and
+    /// the branches carrying them.
+    pub fn leaf_length(half: Vec2f, density: f32, scale: f32) -> f32 {
+        let reach = vec2f(half.x + GLOW, half.y + GLOW);
+        let len0 = 0.35 * scale.max(0.1).min(10.0);
         let wanted = density.max(0.0).min(1.0) * LEAVES_PER_AREA * 4.0 * (reach.x + len0) * (reach.y + len0) / (len0 * len0);
-        let n = if wanted > MAX_LEAVES as f32 {
-            len0 *= (wanted / MAX_LEAVES as f32).sqrt();
-            MAX_LEAVES
+        let prims = wanted * TREE_LEAF_GAIN * (1.0 + TREE_STEMS_PER_LEAF);
+        if prims > MAX_LEAVES as f32 {
+            len0 * (prims / MAX_LEAVES as f32).sqrt()
         } else {
-            wanted.round() as usize
-        };
-        let ex = reach.x + len0;
-        let ey = reach.y + len0;
-        let mut rng = Rng::new(seed, 0x1ea5);
-        let mut prims = Vec::with_capacity(n);
-        for _ in 0..n {
-            let origin = vec2f(rng.range(-ex, ex), rng.range(-ey, ey));
-            let angle = rng.range(0.0, std::f32::consts::TAU);
-            prims.push(Prim::Leaf(LeafPrim {
-                origin,
-                axis: vec2f(angle.cos(), angle.sin()),
-                len: len0 * rng.range(0.7, 1.3),
-                width: rng.range(0.17, 0.28),
-                bend: rng.range(-0.12, 0.12),
-                serration: rng.range(0.0, 0.35),
-            }));
+            len0
         }
-        Foliage::from_prims(prims, reach, soft)
+    }
+
+    /// The length of a fern frond (`fern`), s-units: 1.6·scale, or longer
+    /// where the fronds would pass MAX_FRONDS.
+    pub fn frond_length(half: Vec2f, density: f32, scale: f32) -> f32 {
+        let len = 1.6 * scale.max(0.1).min(10.0);
+        let fit = ((2.0 * half.x) * (2.0 * half.y) / (len * len)).max(1.0);
+        let wanted = (1.0 + density.max(0.0).min(1.0) * 4.0) * fit;
+        if wanted > MAX_FRONDS as f32 {
+            len * (wanted / MAX_FRONDS as f32).sqrt()
+        } else {
+            len
+        }
     }
 
     /// Fern fronds rising from below the light and arching over it.
@@ -507,6 +941,12 @@ impl Foliage {
         }
         Foliage { prims, bins, nx, ny, min, cell, soft }
     }
+
+    /// The half extents of the rectangle the primitives are binned over, s-units.
+    pub fn binned_half(&self) -> Vec2f {
+        vec2f(-self.min.x, -self.min.y)
+    }
+
 
     /// Coverage 0..=1 of one primitive at `p` (`Prim::coverage`): exactly 0
     /// once `p` is `Prim::pad` penumbrae outside it.

@@ -64,7 +64,7 @@ fn wrist_menu(app: TestApp) {
     // the script's marks, as the app logs them
     let (mut seq, mut log) = (0, Vec::<String>::new());
     let rest = wait_poll(&app, || {
-        if let Ok(t) = app.log_since(seq) {
+        { let t = app.log_since(seq).expect("the app's log");
             seq = t.last_seq;
             log.extend(t.lines);
         }
@@ -101,7 +101,7 @@ fn two_hands(app: TestApp) {
 
     let (mut seq, mut log) = (0, Vec::<String>::new());
     let line = wait_poll(&app, || {
-        if let Ok(t) = app.log_since(seq) {
+        { let t = app.log_since(seq).expect("the app's log");
             seq = t.last_seq;
             log.extend(t.lines);
         }

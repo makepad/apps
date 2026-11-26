@@ -1,0 +1,12 @@
+# A film pack: the files a web-exported film carries inside its wasm (its
+# documents, subset fonts, small pictures, the precompiled shader table and
+# kernel module), as one byte string read in place. Written by the web
+# export (makepad-story-web-export), read by the player.
+[package]
+name = "makepad-story-film-pack"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]

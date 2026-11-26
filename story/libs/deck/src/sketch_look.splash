@@ -1,0 +1,16 @@
+use mod.motion.*
+
+// The look a sketch slide takes in a deck that names none (`Deck{look: ...}`): a dark neutral
+// ground, warm white type, one soft blue accent. The same names a deck's own look module
+// exports, so the sketch layout reads either the same way.
+let INK = #101216
+let INK2 = #181b21
+let BONE = #f1eee7
+let ASH = #9a9ea8
+let COOL = #7cc8e6
+let HOT = #f0a27a
+let TITLE = Font{family: "Roboto Flex" weight: 600}
+let TEXT = Font{family: "Roboto Flex" weight: 420}
+let MONO = Font{family: "JetBrains Mono" weight: 400}
+
+{INK: INK INK2: INK2 BONE: BONE ASH: ASH COOL: COOL HOT: HOT TITLE: TITLE TEXT: TEXT MONO: MONO}

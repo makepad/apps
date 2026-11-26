@@ -267,7 +267,7 @@ pub fn key(ckt: &SimCircuit, whole: &Solver, o: &PartOpts) -> u64 {
 /// The key a plan's cut is carried by (`StateCache::carry`, `round::build_carried`): the circuit's
 /// structure without its part values. Its unknowns by name and kind; each instance by kind and
 /// name with the unknowns it reads and the matrix entries it stamps; its nodes by name and whether
-/// each is a declared supply; its options, the plan's options as `key` takes them, and the pads'
+/// each is a declared supply or heard net; its options, the plan's options as `key` takes them, and the pads'
 /// kinds. Not the devices' values, their models or the temperature: a cut carried across those is
 /// proved again where it is built. O(the circuit's size).
 pub fn circuit_key(ckt: &SimCircuit, whole: &Solver, o: &PartOpts) -> u64 {
@@ -291,7 +291,7 @@ pub fn circuit_key(ckt: &SimCircuit, whole: &Solver, o: &PartOpts) -> u64 {
         }
     }
     for n in &ckt.nodes {
-        let _ = write!(h, "{} {}|", n.name, n.supply);
+        let _ = write!(h, "{} {} {}|", n.name, n.supply, n.heard);
     }
     let _ = write!(h, "{:?}|{o:?}", ckt.opts);
     write_pads(&mut h, whole);

@@ -9,6 +9,21 @@ use super::{Arg, Program, Root, Solid};
 use makepad_script::syntax::{self, At, Kind, Loc, Node, Syntax};
 use std::ops::Range;
 
+/// Where to insert an added top-level statement.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Anchor {
+    /// Place the statement with its imports, before its first reader, or before the first root call.
+    Auto,
+    /// Place an addition before the named definition (imports still join the other imports).
+    Before(String),
+    /// Place additions in order after the named definition.
+    After {
+        name: String,
+        /// Additions since this anchor, from zero. Removing or moving intervening statements shifts where the rest go.
+        nth: usize,
+    },
+}
+
 /// One edit of a program.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Edit {
@@ -20,9 +35,8 @@ pub enum Edit {
     Field { solid: String, field: String, code: String },
     /// Remove one field of a solid's object.
     Unset { solid: String, field: String },
-    /// Insert a statement (`let lid = m.box({..})`) before a named solid's statement,
-    /// or before the first root call.
-    Add { code: String, before: Option<String> },
+    /// Insert a top-level statement at its anchor.
+    Add { code: String, at: Anchor },
     /// Replace a solid's code (its node) with other code; for a top-level `let` that names a
     /// value and no solid, its expression (`replace(width, param(30mm, ..))`).
     Replace { solid: String, code: String },
@@ -33,8 +47,17 @@ pub enum Edit {
     /// Remove a solid and its uses: a named one's statement, an inline one's written code, and
     /// every place it is used (see [`remove`]); a numbered statement (`fill#2`).
     Remove { solid: String },
-    /// Rename a named solid's `let` and every use of the name.
+    /// Rename a named solid's `let` and every use of the name. Hoist an inline solid into
+    /// `let to = <its code>` just before its top-level statement, so the enclosing call reads `to`.
     Rename { solid: String, to: String },
+    /// End a part's first-input spine at an earlier step, keeping the part's name.
+    Truncate { solid: String, to: String },
+    /// `code`, written on `solid`, becomes `solid`: `let solid = code` goes right after the
+    /// top-level `let` that bound it, so the part, its placement and every later plain read keep
+    /// the name and read the new solid. What `solid` was takes a free name after its kind
+    /// (`body_union`, `body_fillet2`), read by the new code and by every later dotted read (`body.top`
+    /// names a face of what it was). See [`after`].
+    After { solid: String, code: String },
     /// Move a solid to a sibling's slot (an operand list or top-level statements), or a numbered
     /// statement to another's (`fill#3` to `fill#1`'s).
     Move { solid: String, to: String },
@@ -224,18 +247,21 @@ pub fn defines(code: &str) -> Option<String> {
 
 /// `source` with the statement `code` added where it can work, read from the syntax alone (no
 /// evaluation: what it is added for may not evaluate without it): a `use` after the file's other
-/// `use`s (first when it has none); with `before`, before the statement that defines that name;
+/// `use`s (first when it has none); an explicit after-anchor counts from its definition,
+/// and a before-anchor puts other statements before its definition;
 /// a `let` or `fn` before the first statement that reads its name; else before the first root
 /// call (`roots`: their names), else at the end.
-pub fn add(source: &str, code: &str, before: Option<&str>, roots: &[&str]) -> Result<String, String> {
+pub fn add(source: &str, code: &str, at: &Anchor, roots: &[&str]) -> Result<String, String> {
     let syn = syntax::parse(source).map_err(|x| x.message)?;
     let added = syntax::parse(code).map_err(|x| format!("`{}` does not parse: {}", code.trim(), x.message))?;
     let statements = syn.statements();
     let first_root = || statements.iter().position(|s| s.as_call().is_some_and(|(callee, _)| roots.contains(&callee)));
-    let index = match (before, added.statements().first().map(|s| (&s.kind, defined(s)))) {
+    let definition = |name: &str| def_stmt(&syn, name).ok_or_else(|| e(format!("no statement `let {name}` or `fn {name}`")));
+    let index = match (at, added.statements().first().map(|s| (&s.kind, defined(s)))) {
+        (Anchor::After { name, nth }, _) => (definition(name)? + 1).saturating_add(*nth),
         (_, Some((Kind::Use { .. }, _))) => statements.iter().rposition(|s| matches!(s.kind, Kind::Use { .. })).map_or(0, |i| i + 1),
-        (Some(name), _) => def_stmt(&syn, name).ok_or_else(|| e(format!("no statement `let {name}` or `fn {name}`")))?,
-        (None, Some((_, Some(name)))) => first_reader(&syn, name).or_else(first_root).unwrap_or(statements.len()),
+        (Anchor::Before(name), _) => definition(name)?,
+        (Anchor::Auto, Some((_, Some(name)))) => first_reader(&syn, name).or_else(first_root).unwrap_or(statements.len()),
         _ => first_root().unwrap_or(statements.len()),
     };
     let at = if index >= statements.len() { At::End } else { At::Before(index) };
@@ -651,7 +677,12 @@ pub fn selector_site(p: &Program, id: &str, index: usize) -> Result<SelectorSite
             found.ok_or_else(gone)?
         }
         Some(None) => {
-            let field = if s.proto == "BrepShell" { "open" } else { "edges" };
+            let field = match s.proto {
+                "BrepShell" => "open",
+                "BrepPull" => "face",
+                "BrepHole" => "on",
+                _ => "edges",
+            };
             let mut list = field_at(p, s, field)?.ok_or_else(gone)?.loc().clone();
             // a name: the list its top-level `let` binds (a fn's own name is its own)
             if let Some(Kind::Ident(name)) = syn.node(&list).map(|n| &n.kind).filter(|k| matches!(k, Kind::Ident(n) if !n.contains('.'))) {
@@ -942,6 +973,91 @@ fn edit_err(x: syntax::EditError) -> String {
     x.message
 }
 
+/// Replace the target's statement with the shortened part. Reads inside the target's value
+/// survive even when its enclosing statement (an inline step's holder) is removed.
+fn truncate(p: &Program, id: &str, to: &str) -> Result<String, String> {
+    let syn = &p.names.syntax;
+    let last = solid(p, id)?;
+    let target = solid(p, to)?;
+    if let_stmt(syn, id).is_none() || !(last.named || is_call_value(last)) {
+        return Err(e("the part's last step has no `let`: name it first"));
+    }
+    if id == to {
+        return Err(format!("{id} already ends at {to}: nothing to roll back"));
+    }
+    let spine: Vec<_> = std::iter::successors(Some(last), |s| s.inputs.first().map(|&i| &p.solids[i])).collect();
+    let Some(end) = spine.iter().position(|&s| std::ptr::eq(s, target)) else {
+        let ids: Vec<_> = spine.iter().rev().map(|s| s.id.as_str()).collect();
+        return Err(format!("{to} is not on {id}'s spine: {}", ids.join(", ")));
+    };
+    let mut removed = vec![false; syn.statements().len()];
+    let value_loc = |s: &Solid| {
+        if s.call.is_some() {
+            return Err(fn_made(p, s));
+        }
+        if s.named {
+            let_value(syn, &s.id)
+        } else {
+            s.span.as_ref().and_then(|span| loc_at(syn, span))
+        }.ok_or_else(|| format!("'{}' has no written value", s.id))
+    };
+    for step in &spine[..end] {
+        removed[value_loc(step)?.0[0]] = true;
+    }
+    let at = value_loc(target)?;
+    let holder = at.0[0];
+    let value = syn.node(&at).unwrap();
+    removed[holder] = true;
+
+    // Index identifier reads once, including paths through a binding (body.top).
+    let mut readers = std::collections::HashMap::<&str, Vec<(usize, usize)>>::new();
+    syn.walk(&mut |loc, node| {
+        if let Some(name) = node.ident() {
+            readers.entry(name.split('.').next().unwrap()).or_default().push((loc.0[0], node.span.start));
+        }
+    });
+    let kept_reader = |name: &str, removed: &[bool]| {
+        readers.get(name)?.iter().find_map(|&(i, offset)| (!removed[i] || value.span.contains(&offset)).then_some(offset))
+    };
+    for (i, stmt) in syn.statements().iter().enumerate().filter(|(i, _)| removed[*i]) {
+        let Kind::Let { names, .. } = &stmt.kind else { continue };
+        for name in names.iter().filter(|name| name.as_str() != id) {
+            if let Some(offset) = kept_reader(name, &removed) {
+                let line = p.names.line_col(offset).0;
+                return Err(if i == holder && target.named {
+                    format!("{name} is also read on line {line}: roll back would rename it")
+                } else {
+                    format!("line {line} reads {name}: roll back would leave it unbound")
+                });
+            }
+        }
+    }
+    // Prune dependencies of discarded code, including a chain of operand/value lets.
+    // Unused declarations elsewhere in the script have no reader in the removed set.
+    loop {
+        let mut changed = false;
+        for (i, stmt) in syn.statements().iter().enumerate().rev() {
+            let Kind::Let { names, value: Some(rhs), .. } = &stmt.kind else { continue };
+            if removed[i] || rhs.callee_path().is_some_and(|p| p.rsplit('.').next() == Some("param")) {
+                continue;
+            }
+            if names.iter().any(|n| readers.contains_key(n.as_str())) && names.iter().all(|n| kept_reader(n, &removed).is_none()) {
+                removed[i] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let binding = format!("let {id} = {}", value.text(syn.source()));
+    let mut result = syn.apply(&[syntax::edit::Replace::new(syn.statements()[holder].span.clone(), binding)]).map_err(edit_err)?;
+    for (i, _) in removed.iter().enumerate().rev().filter(|&(i, r)| *r && i != holder) {
+        result = result.delete_statement(&Loc(vec![i])).map_err(edit_err)?.syntax;
+    }
+    Ok(result.source().to_string())
+}
+
 /// The first use of a name of `gone`, outside their own statements.
 fn first_use(syn: &Syntax, gone: &[String]) -> Result<Option<Loc>, String> {
     for (i, stmt) in syn.statements().iter().enumerate() {
@@ -1165,6 +1281,136 @@ fn collapse(syn: Syntax, call: &Loc, keep: &Loc, gone: &[String]) -> Result<Synt
     Ok(syn)
 }
 
+/// Visit reads while the outer `name` is visible. A local binding's initializer can still
+/// read it. The binding hides it for the rest of that statement list only.
+fn walk_after_reads<'a>(statements: impl IntoIterator<Item = &'a Node>, name: &str, read: &mut dyn FnMut(&Node)) {
+    fn visit(node: &Node, name: &str, read: &mut dyn FnMut(&Node)) {
+        match &node.kind {
+            Kind::Fn { params, .. } if params.iter().any(|p| p.name == name) => {}
+            Kind::Block(block) => walk_after_reads(&block.stmts, name, read),
+            Kind::Object { fields, .. } => walk_after_reads(fields.iter().map(|field| &field.value), name, read),
+            Kind::Ident(_) => read(node),
+            _ => node.for_each_child(&mut |child| visit(child, name, read)),
+        }
+    }
+    for stmt in statements {
+        visit(stmt, name, read);
+        if matches!(&stmt.kind, Kind::Let { names, .. } if names.iter().any(|n| n == name)) {
+            break;
+        }
+    }
+}
+
+/// `code` becomes `id` ([`Edit::After`]): its `let` goes right after `id`'s, which takes
+/// [`after_base`]'s name; the new code and the later dotted reads read that (a face of what `id`
+/// was keeps its name with it), later plain reads go on reading `id`, now the new solid, so the
+/// part keeps its id, its placement and what is set on it. Later reads stop at a `let` binding
+/// `id` again.
+fn after(p: &Program, id: &str, code: &str) -> Result<String, String> {
+    let syn = &p.names.syntax;
+    let i = let_stmt(syn, id).ok_or_else(|| {
+        if let Some(s) = p.solid(id).filter(|s| s.call.is_some()) {
+            let f = maker(p, s);
+            return e(format!("'{id}' is made inside fn {f}: it has no statement of its own to build on; change {f}, or build on what it returns"));
+        }
+        e(format!("'{id}' has no `let` of its own at the top level: name it first in the same batch: rename({id}, <name>) then after(<name>) and `let <name> = ...`"))
+    })?;
+    if p.solid(id).is_none() {
+        return Err(e(format!("'{id}' is no solid")));
+    }
+    let new = syntax::parse(code).map_err(|x| format!("`{}` does not parse: {}", code.trim(), x.message))?;
+    let was = after_base(syn, id);
+    // A read of `id` (`all`) or a path through it (`id.top`): its `id` reads `was`.
+    let reads_was = |node: &Node, src: &str, all: bool, out: &mut Vec<syntax::edit::Replace>| {
+        let Some(rest) = node.ident().and_then(|n| n.strip_prefix(id)) else { return };
+        if (rest.starts_with('.') || (all && rest.is_empty())) && src.get(node.span.clone()).is_some_and(|t| t.starts_with(id)) {
+            out.push(syntax::edit::Replace::new(node.span.start..node.span.start + id.len(), was.clone()));
+        }
+    };
+    let Kind::Let { pattern_span, .. } = &syn.statements()[i].kind else { unreachable!() };
+    let mut edits = vec![syntax::edit::Replace::new(pattern_span.clone(), was.clone())];
+    walk_after_reads(&syn.statements()[i + 1..], id, &mut |node| reads_was(node, syn.source(), false, &mut edits));
+    let mut own = Vec::new();
+    walk_after_reads(new.statements(), id, &mut |node| reads_was(node, new.source(), true, &mut own));
+    let code = new.apply(&own).map_err(edit_err)?.source().trim().to_string();
+    let renamed = syn.apply(&edits).map_err(edit_err)?;
+    let at = if i + 1 == renamed.statements().len() { At::End } else { At::Before(i + 1) };
+    renamed.insert_statement(&Loc::default(), at, &format!("let {id} = {code}")).map(|x| x.syntax.source().to_string()).map_err(edit_err)
+}
+
+/// The free name what `id` was takes in [`after`]: `id` and its kind (`body_union`), numbered
+/// when taken (`body_fillet2`); `id_base` when its value is no call.
+fn after_base(syn: &Syntax, id: &str) -> String {
+    let kind = let_value(syn, id)
+        .and_then(|at| match &syn.node(&at)?.kind {
+            Kind::Call { callee, .. } => callee.ident()?.rsplit('.').next().map(str::to_string),
+            _ => None,
+        })
+        .filter(|k| valid_name(&format!("{id}_{k}")))
+        .unwrap_or_else(|| "base".into());
+    let suffix = format!("_{kind}");
+    let base = match id.rsplit_once(&suffix) {
+        Some((stem, number)) if number.bytes().all(|b| b.is_ascii_digit()) => format!("{stem}{suffix}"),
+        _ => format!("{id}{suffix}"),
+    };
+    free_name(syn, base, &[])
+}
+
+fn free_name(syn: &Syntax, base: String, taken: &[&str]) -> String {
+    let free = |n: &str| !taken.contains(&n) && name_is_free(syn, n);
+    std::iter::once(base.clone()).chain((2..).map(|k| format!("{base}{k}"))).find(|n| free(n)).unwrap()
+}
+
+fn name_is_free(syn: &Syntax, name: &str) -> bool {
+    valid_name(name) && !syn.statements().iter().any(|s| match &s.kind {
+        Kind::Let { names, .. } => names.iter().any(|n| n == name),
+        _ => defined(s) == Some(name),
+    })
+}
+
+/// A free name for an inline solid, from its first positional input and its builder's name.
+/// Names already chosen for the same batch count as taken.
+pub fn hoist_name(p: &Program, id: &str, taken: &[&str]) -> Option<String> {
+    let s = p.solid(id).filter(|s| !s.named && s.call.is_none())?;
+    let syn = &p.names.syntax;
+    let loc = loc_at(syn, s.span.as_ref()?)?;
+    let (path, args) = syn.node(&loc)?.as_call()?;
+    let kind = path.rsplit('.').next()?;
+    let input = args.iter().find(|a| !matches!(a.kind, Kind::Entry { .. })).and_then(Node::ident).filter(|n| !n.contains('.'));
+    let base = input.map_or_else(|| kind.to_string(), |name| format!("{name}_{kind}"));
+    valid_name(&base).then(|| free_name(syn, base, taken))
+}
+
+/// Give an inline solid its own top-level binding at the statement that uses it.
+fn hoist(p: &Program, s: &Solid, to: &str) -> Result<String, String> {
+    let id = &s.id;
+    if s.call.is_some() {
+        return Err(fn_made(p, s));
+    }
+    let span = s.span.as_ref().ok_or_else(|| e(format!("'{id}' is made by code: edit that code")))?;
+    let syn = &p.names.syntax;
+    if !name_is_free(syn, to) {
+        return Err(e(format!("'{to}' is not a free name")));
+    }
+    let loc = loc_at(syn, span).ok_or_else(|| e(format!("'{id}' has no node")))?;
+    let index = loc.0[0];
+    let mut node = &syn.statements()[index];
+    for (depth, &child) in loc.0[1..].iter().enumerate() {
+        match node.kind {
+            Kind::Call { .. } => {}
+            Kind::Let { .. } if depth == 0 => {}
+            Kind::Entry { .. } | Kind::Array { .. } | Kind::Object { .. } | Kind::Paren { .. } if depth > 0 => {}
+            _ if in_loop(syn, &loc) => return Err(e(format!("'{id}' is written inside a loop, which makes one each pass: name it in the loop's code"))),
+            _ => return Err(e(format!("'{id}' is written inside other code: only a call at the top level can take a `let` of its own"))),
+        }
+        node = node.child(child).unwrap();
+    }
+    let binding = format!("let {to} = {}", node.text(syn.source()));
+    let replaced = syn.replace(&loc, to).map_err(edit_err)?;
+    debug_assert_eq!(replaced.loc.0[0], index);
+    replaced.syntax.insert_statement(&Loc::default(), At::Before(index), &binding).map(|x| x.syntax.source().to_string()).map_err(edit_err)
+}
+
 /// Apply one edit to an evaluated program: the new source.
 pub fn apply(p: &Program, edit: &Edit) -> Result<String, String> {
     let syn = &p.names.syntax;
@@ -1172,6 +1418,7 @@ pub fn apply(p: &Program, edit: &Edit) -> Result<String, String> {
     match edit {
         Edit::Program { source } => Ok(source.clone()),
         Edit::Move { solid, to } => move_solid(p, solid, to),
+        Edit::Truncate { solid, to } => truncate(p, solid, to),
         Edit::Splice { range, text } => {
             let s = p.source();
             if range.start > range.end || range.end > s.len() || !s.is_char_boundary(range.start) || !s.is_char_boundary(range.end) {
@@ -1257,11 +1504,11 @@ pub fn apply(p: &Program, edit: &Edit) -> Result<String, String> {
                 None => Err(e(format!("'{id}' has no written operands"))),
             }
         }
-        Edit::Add { code, before } => add(p.source(), code, before.as_deref(), &p.roots.iter().map(|r| r.kind).collect::<Vec<_>>()),
+        Edit::Add { code, at } => add(p.source(), code, at, &p.roots.iter().map(|r| r.kind).collect::<Vec<_>>()),
         Edit::Remove { solid: id } => remove(p, id),
         Edit::Rename { solid: id, to } => {
             if let Some(s) = p.solid(id).filter(|s| !s.named && !is_call_value(s)) {
-                return Err(e(format!("'{}' has no name of its own to rename", s.id)));
+                return hoist(p, s, to);
             }
             if !valid_name(to) || let_stmt(syn, to).is_some() {
                 return Err(e(format!("'{to}' is not a free name")));
@@ -1276,6 +1523,7 @@ pub fn apply(p: &Program, edit: &Edit) -> Result<String, String> {
             });
             syn.apply(&edits).map(|x| x.source().to_string()).map_err(|x| x.message)
         }
+        Edit::After { solid: id, code } => after(p, id, code),
         Edit::RootArg { kind, solid: id, name, code } => {
             let s = solid(p, id)?;
             let index = p.solids.iter().position(|x| std::ptr::eq(x, s)).unwrap();

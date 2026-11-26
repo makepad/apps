@@ -36,6 +36,7 @@ enum GhostMode {
 #[derive(Clone, Copy)]
 enum Case {
     Grade,
+    Waterfall,
     Twin { enabled: bool },
     Wedge,
     Sweep,
@@ -46,6 +47,7 @@ impl Case {
     fn frames(self) -> u32 {
         match self {
             Self::Grade => 1,
+            Self::Waterfall => 6,
             Self::Twin { .. } => 4,
             Self::Wedge => WEDGE_FRAMES,
             Self::Sweep => SWEEP_FRAMES,
@@ -57,7 +59,7 @@ impl Case {
     fn look(self) -> PhosphorLook {
         PhosphorLook {
             tau: match self {
-                Self::Grade | Self::Twin { .. } => DT / std::f64::consts::LN_2,
+                Self::Grade | Self::Waterfall | Self::Twin { .. } => DT / std::f64::consts::LN_2,
                 Self::Wedge => 10.0,
                 Self::Sweep => 0.5,
                 Self::Ghost { .. } => f64::INFINITY,
@@ -80,6 +82,16 @@ impl Case {
         hits.reset(WIDTH as u32, HEIGHT as u32);
         hits.waveforms = 100;
         match self {
+            Self::Waterfall => {
+                // Two old rows, an off frame, an idle frame to clear on re-enable, then two new rows.
+                if frame == 3 {
+                    hits.waveforms = 0;
+                } else {
+                    let col = if frame < 4 { 2 } else { frame as usize };
+                    hits.data[col * HEIGHT] = 100.0;
+                    hits.mark(col as u32, col as u32 + 1, 0, 1);
+                }
+            }
             Self::Grade | Self::Twin { .. } => {
                 hits.data[10 * HEIGHT + 5] = 100.0;
                 for row in 0..HEIGHT {
@@ -233,6 +245,16 @@ fn hits_accumulate_and_grade_on_the_gpu() {
         check_ghost(light);
     }
     check_live_twin();
+    let (width, waterfall, _) = run(Case::Waterfall);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let pixel = (y * width + WIDTH + x) * 4;
+            let lit = waterfall[pixel..pixel + 3].iter().any(|&v| v != 0);
+            // The ring is half the plot height and is graded newest first.
+            let expected = (y / 2 == 0 && x == 5) || (y / 2 == 1 && x == 4);
+            assert_eq!(lit, expected, "only the two fresh waterfall rows may show at ({x}, {y})");
+        }
+    }
 }
 
 /// The worst relative error of `case`'s float picture against the CPU model, every texel lit.
@@ -413,6 +435,7 @@ fn run(case: Case) -> (usize, Vec<u8>, Vec<f64>) {
             let screen = case.screen();
             view.screen = vec4(screen[0], screen[1], screen[2], 1.0);
             view.set_look(cx, case.look());
+            view.set_waterfall(matches!(case, Case::Waterfall));
             view.set_frame_interval(Some(DT));
             let mut window = WindowHandle::new(cx);
             window.configure_window(cx, dvec2(WINDOW_WIDTH as f64, HEIGHT as f64), dvec2(0.0, 0.0), false, "Phosphor pixels".into());
@@ -442,15 +465,16 @@ fn run(case: Case) -> (usize, Vec<u8>, Vec<f64>) {
         }
         if let Event::Draw(event) = event {
             let s = state.as_mut().unwrap();
-            let ready = [&s.view.draw_accumulate.draw_vars, &s.view.draw_grade.draw_vars, &s.read.draw_vars]
-                .iter()
-                .all(|vars| vars.draw_shader_id.is_some_and(|id| cx.draw_shader_ready(id, false)));
+            let pending = cx.pipelines_pending();
+            // The first-frame gate can request another Draw before it submits the first one.
+            let waiting_for_start = s.warmup == 0 && (cx.frame_submission_serial() == 0 || pending != 0);
+            if !waiting_for_start {
+                assert_eq!(pending, 0, "no pipeline compiles during the measured frames, so no frame is held");
+            }
             let mut blended = None;
             let mut finished = false;
             let mut freezing = false;
-            if !ready {
-                assert_eq!(s.frames, 0, "pipelines must remain ready throughout the measured frames");
-                s.warmup = 0;
+            if waiting_for_start {
                 s.view.clear(cx);
             } else if s.warmup < 5 {
                 match s.warmup {
@@ -514,6 +538,7 @@ fn run(case: Case) -> (usize, Vec<u8>, Vec<f64>) {
                 s.frozen = true;
                 freezing = true;
             } else if s.frames < case.frames() {
+                if matches!(case, Case::Waterfall) { s.view.set_waterfall(s.frames != 2); }
                 if matches!(case, Case::Twin { enabled: true }) { upload_twin(cx, &mut s.view, s.frames); }
                 let mut hits = s.buffer();
                 case.fill(&mut hits, s.frames);
@@ -606,7 +631,8 @@ fn run(case: Case) -> (usize, Vec<u8>, Vec<f64>) {
                 assert_eq!(
                     before != Some(picture.texture_id()),
                     blended,
-                    "only a waveform frame swaps pictures, even when its dirty rectangle is empty"
+                    "only a waveform frame swaps pictures, even when its dirty rectangle is empty (no step: {:?})",
+                    s.view.why_no_step()
                 );
             }
             s.read.draw_vars.set_texture(0, picture);
@@ -617,6 +643,24 @@ fn run(case: Case) -> (usize, Vec<u8>, Vec<f64>) {
                     size: dvec2((WIDTH * 2) as f64 / dpi, HEIGHT as f64 / dpi),
                 },
             );
+            if matches!(case, Case::Grade | Case::Waterfall) {
+                s.view.draw_waterfall(&mut cx, Rect {
+                    pos: dvec2(WIDTH as f64 / dpi, 0.0),
+                    size: dvec2(WIDTH as f64 / dpi, HEIGHT as f64 / dpi),
+                });
+                let pass = &cx.passes[s.view.waterfall_pass().unwrap()];
+                if matches!(case, Case::Grade) {
+                    assert!(s.view.draw_waterfall_row.draw_vars.area.is_empty(), "a disabled waterfall clear records no row draw item");
+                    assert!(s.view.draw_waterfall_grade.draw_vars.area.is_empty(), "a disabled waterfall records no grading draw item");
+                    assert_eq!(pass.painted_serial, 0, "the disabled waterfall pass never paints");
+                    assert!(pass.main_draw_list_id.is_none(), "the disabled waterfall has no pass to paint this frame");
+                } else if s.frames == 3 {
+                    assert!(pass.main_draw_list_id.is_none(), "turning the waterfall off withdraws its previous pass");
+                } else if s.frames == 4 {
+                    assert!(pass.main_draw_list_id.is_some(), "re-enabling the waterfall records its pending clear");
+                    assert_eq!(s.view.draw_waterfall_row.rect_size, vec2f(WIDTH as f32, (HEIGHT / 2) as f32), "the clear covers the whole ring before the new rows");
+                }
+            }
             cx.end_pass_sized_turtle();
             s.list.end(&mut cx);
             cx.end_pass(&s.pass);

@@ -285,7 +285,7 @@ impl Mech {
     }
 
     /// The final parts (jointed meshes, their fields from the original parts) for `f`.
-    fn with_parts<R>(&self, f: impl FnOnce(&[FinalPart]) -> R) -> R {
+    pub fn with_parts<R>(&self, f: impl FnOnce(&[FinalPart]) -> R) -> R {
         let originals = self.originals_fields();
         let fields: Vec<SolidField> = self.plan.solids.iter().map(|s| SolidField { solid: s, parts: originals.iter().map(|f| f as &(dyn makepad_csg_sdf::Sdf3 + Sync)).collect() }).collect();
         let vs: Vec<Vec<P3>> = self.finals.iter().map(|m| verts(m)).collect();

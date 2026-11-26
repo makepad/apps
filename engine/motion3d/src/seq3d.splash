@@ -1,0 +1,387 @@
+use mod.scene.*; use mod.post
+// Seq3D templates: whole ready-made 3D sequences (5-10 s) in one line, each a Scene3D built from the
+// effects library (Fx), the kits and 3D type (Text3D).
+//
+//   Seq3D{template: @logo_sting text: "YOUR BRAND" accent: #ff5a36 bpm: 120}
+//
+// seq3d_scene(s) builds the Scene3D for `s`, the Seq3D as read (seq3d.rs): template, text,
+// subtitle, color, accent, has_bg + background, logo {kind: "path" | "svg" | "src", text, media},
+// image, video, phone_image, phone_video, product (media: {kind: "texture" | "file" | "asset",
+// name, path, id, rev}), fit, crop / phone_crop (lists of [t, [x, y, w, h], ease]), phone_aspect,
+// font, bpm (0: none), len (the sequence's seconds), seed, from, to, points ([lat, lon] list).
+// Times are seconds, or beats (`beat(n)`, quarter beats) when there is a bpm, so the key
+// moments land on the beat grid. Each template is a function of s; copy one to change it.
+
+let SQ_DEFAULT_LOGO = "M 0 0 L 60 0 L 60 60 L 30 90 L 0 60 Z M 18 18 L 42 18 L 42 52 L 30 66 L 18 52 Z"
+let SQ_PI = 3.141592653589793
+
+// A time in seconds, snapped to quarter beats when there is a bpm.
+let sq_time = fn(s, sec) {
+    if s.bpm > 0.0 { return beat(round(sec * s.bpm / 60.0 * 4.0) / 4.0) }
+    return sec
+}
+// A moment `frac` of the way through.
+let sq_at = fn(s, frac) { sq_time(s, frac * s.len) }
+// A colour `t` of the way from `a` to `b`.
+let sq_mix = fn(a, b, t) { rgb(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t) }
+// A picture or clip as a node takes it.
+let sq_media = fn(m) {
+    if m.kind == "file" { return file(m.path) }
+    if m.kind == "asset" { return asset(m.id, m.rev) }
+    return m.name
+}
+// Crop keys in a clip's pixels: one [x, y, w, h], or keys of them.
+let sq_crop = fn(keys_list) {
+    if keys_list.len() == 1 { return keys_list[0][1] }
+    let points = []
+    for k in keys_list {
+        if k[2] == "linear" { points.push([k[0], k[1]]) } else { points.push([k[0], k[1], k[2]]) }
+    }
+    return keys(points)
+}
+// The logo mark as geometry.
+let sq_logo = fn(s, size, depth) {
+    let g = SvgGeometry{size: size depth: depth bevel_size: 0.03 bevel_thickness: 0.03 bevel_segments: 3}
+    let logo = s.logo ?? nil
+    if logo == nil { g.path = SQ_DEFAULT_LOGO }
+    else if logo.kind == "path" { g.path = logo.text }
+    else if logo.kind == "svg" { g.svg = logo.text }
+    else { g.src = sq_media(logo.media) }
+    return g
+}
+// A line of 3D type rising in from `start` seconds.
+let sq_rise = fn(s, start) {
+    {position: tween(vec3(0, -0.5, 0), vec3(0, 0, 0), sq_time(s, start), sq_time(s, start + 0.9), @ease_out_back) opacity: tween(0, 1, sq_time(s, start), sq_time(s, start + 0.45))}
+}
+let sq_text3d = fn(s, text, size, pos, material, each, by) {
+    Text3D{text: text font: s.font size: size depth: size * 0.25 bevel: size * 0.03 position: pos by: by stagger: 0.05 order: @center each: each material: material}
+}
+// The scene round the template's children.
+let sq_scene = fn(s, scene) {
+    if s.bpm > 0.0 { scene.bpm = s.bpm }
+    if s.has_bg { scene.background = s.background }
+    scene.tone_mapping = @aces
+    return scene
+}
+
+let seq3d_templates = {
+    logo_sting: {len: fn(s) { 6.0 } color: #xe9e9ee accent: #xff5a36 background: #x040507
+        about: "a logo (SVG) shatters in and assembles in chrome, a ring sweeps, sparks burst, the name rises under it"
+        build: fn(s) {
+            let kids = [
+                // The mark shatters in and assembles, turning to face the camera.
+                Mesh{name: "logo" geometry: sq_logo(s, 1.7, 0.3) position: vec3(0, 1.45, 0)
+                    explode: tween(3.5, 0, sq_at(s, 0.03), sq_at(s, 0.33), @ease_out_expo) rotation: tween(vec3(0, -140, 0), vec3(0, 0, 0), sq_at(s, 0.03), sq_at(s, 0.4), @ease_out_cubic)
+                    material: MeshPhysicalMaterial{preset: @chrome color: s.color}}
+                // A hot ring sweeps through as it lands, and sparks burst.
+                Mesh{geometry: TorusGeometry{radius: 2.6 tube: 0.018 tubular_segments: 200} position: vec3(0, 1.45, 0) cast_shadow: false
+                    rotation: tween(vec3(80, 0, 0), vec3(100, 0, 0), sq_at(s, 0.25), sq_at(s, 0.8), @ease_in_out_quint) scale: tween(0.2, 1.1, sq_at(s, 0.25), sq_at(s, 0.4), @ease_out_expo)
+                    opacity: keys([sq_at(s, 0.25), 0], [sq_at(s, 0.3), 1], [sq_at(s, 0.45), 1], [sq_at(s, 0.6), 0])
+                    material: MeshBasicMaterial{color: #000000 emissive: s.accent emissive_intensity: 7 transparent: true}}
+                Fx{preset: @burst position: vec3(0, 1.45, 0.2) start: sq_at(s, 0.33) count: 500 size: 0.05 color: #fff2c0 color2: s.accent}
+                sq_text3d(s, s.text ?? "YOUR BRAND", 0.42, vec3(0, 0, 0.3), MeshPhysicalMaterial{preset: @brushed_metal color: #f4f4f6}, sq_rise(s, 0.45 * s.len), @letter)
+            ]
+            if (s.subtitle ?? nil) != nil { kids.push(sq_text3d(s, s.subtitle, 0.18, vec3(0, -0.45, 0.3), MeshBasicMaterial{color: s.accent}, sq_rise(s, 0.6 * s.len), @word)) }
+            kids.push(Ground{y: -0.75 radius: 40 fade: vec2(3, 12) color: #050507 roughness: 0.4 reflectivity: 0.45 reflection_blur: 0.15})
+            sq_scene(s, Scene3D{exposure: 1.05 temporal_aa: 3
+                environment: Environment{preset: @studio intensity: 1.3 rotation: 30}
+                camera: Camera{position: tween(vec3(0.8, 1.2, 11.5), vec3(0, 0.9, 8.6), 0, sq_at(s, 1.0), @ease_out_cubic) target: vec3(0, 0.85, 0) focal_length: 50}
+                post: [ContactShadows{opacity: 0.7} post.Bloom{strength: 0.55 threshold: 1.4} post.Vignette{amount: 0.35}]
+                lights: [LightRig{preset: @dramatic target: vec3(0, 0.6, 0)}]
+                children: kids})
+        }
+    }
+    product_reveal: {len: fn(s) { 7.0 } color: #xff5a36 accent: #xf2c14e background: #x0c0d10
+        about: "a product (GLB, or a stylised bottle) on a turntable in a studio, rings draw on, the name and a line come in"
+        build: fn(s) {
+            let product = if (s.product ?? nil) != nil {
+                Model{src: sq_media(s.product) fit: 1.8 ground: true}
+            } else {
+                // A stylised bottle: lathed body, a cap, and the image as a label when given.
+                let parts = [
+                    Mesh{geometry: LatheGeometry{points: [vec2(0, 0), vec2(0.55, 0), vec2(0.6, 0.12), vec2(0.6, 1.3), vec2(0.45, 1.6), vec2(0.2, 1.75), vec2(0.2, 1.9)] segments: 96} material: MeshPhysicalMaterial{preset: @car_paint color: s.color}}
+                    Mesh{geometry: CylinderGeometry{radius: 0.23 height: 0.35 radial_segments: 48} position: vec3(0, 2.05, 0) material: MeshPhysicalMaterial{preset: @brushed_metal color: s.accent}}
+                ]
+                if (s.image ?? nil) != nil {
+                    let label = MeshStandardMaterial{roughness: 0.5}
+                    if s.image.kind == "texture" { label.texture = sq_media(s.image) } else { label.map = sq_media(s.image) }
+                    parts.push(Mesh{geometry: CylinderGeometry{radius: 0.605 height: 0.7 radial_segments: 64 open_ended: true} position: vec3(0, 0.75, 0) material: label})
+                }
+                Group3D{children: parts}
+            }
+            let kids = [Turntable{speed: 18 plinth_radius: 1.4 plinth_material: MeshPhysicalMaterial{preset: @ceramic color: #1a1b1f} children: [product] scale: tween(0.85, 1, 0, sq_at(s, 0.4), @ease_out_cubic)}]
+            var i = 0
+            for r in [1.9, 2.3, 2.7] {
+                let s0 = 0.18 + i * 0.08
+                kids.push(Line3D{curve: CircleCurve{radius: r} position: vec3(0, 0.14, 0) width: 2 color: s.accent trim_end: tween(0, 1, sq_at(s, s0), sq_at(s, s0 + 0.3), @ease_in_out_cubic) blending: @additive})
+                i = i + 1
+            }
+            kids.push(sq_text3d(s, s.text ?? "NEW", 0.5, vec3(0, 2.8, -0.8), MeshPhysicalMaterial{preset: @chrome color: s.color}, sq_rise(s, 0.5 * s.len), @letter))
+            if (s.subtitle ?? nil) != nil { kids.push(sq_text3d(s, s.subtitle, 0.2, vec3(0, 3.35, -0.8), MeshBasicMaterial{color: s.accent}, sq_rise(s, 0.62 * s.len), @word)) }
+            kids.push(Ground{radius: 30 fade: vec2(3.5, 11) color: #0e0f12 roughness: 0.3 reflectivity: 0.4 reflection_blur: 0.25})
+            let all = sq_at(s, 1.0)
+            sq_scene(s, Scene3D{exposure: 1.1 temporal_aa: 3
+                environment: Environment{preset: @softbox intensity: tween(0.2, 1.3, 0, sq_at(s, 0.3)) rotation: tween(10, 70, 0, all)}
+                camera: Camera{orbit: true target: vec3(0, 1.35, 0) yaw: tween(-55, 20, 0, all, @ease_in_out_sine) pitch: tween(8, 12, 0, all, @ease_in_out_sine) distance: tween(9, 7.6, 0, all, @ease_in_out_cubic) focal_length: 40}
+                post: [ContactShadows{opacity: 0.85} post.Bloom{strength: 0.3 threshold: 2} post.DepthOfField{focus: tween(9, 7.6, 0, all, @ease_in_out_cubic) f_stop: 3.5} post.Vignette{amount: 0.35}]
+                lights: [LightRig{preset: @product target: vec3(0, 0.8, 0)}]
+                children: kids})
+        }
+    }
+    data_globe: {len: fn(s) { 8.0 } color: #x7fd6ff accent: #xff5a36 background: #x03060d
+        about: "a dotted globe turning with glowing arcs between map points and pulsing markers"
+        build: fn(s) {
+            let r = 2.0
+            let pts = if s.points.len() >= 2 { s.points } else { [[40.7, -74.0], [51.5, -0.1], [1.35, 103.8], [35.7, 139.7], [-33.9, 151.2], [37.8, -122.4], [-23.5, -46.6], [-1.3, 36.8]] }
+            // A point on the unit sphere from latitude/longitude (degrees).
+            let on = fn(p) {
+                let la = p[0] * SQ_PI / 180.0
+                let lo = p[1] * SQ_PI / 180.0
+                [cos(la) * sin(lo), sin(la), cos(la) * cos(lo)]
+            }
+            let n = pts.len()
+            let globe = [
+                Mesh{geometry: SphereGeometry{radius: r * 0.995} material: MeshStandardMaterial{color: sq_mix(#000000, s.color, 0.12) roughness: 0.7 rim_color: s.color rim_power: 3}}
+                // The dots of the globe, and a thin atmosphere.
+                Instances{geometry: SphereGeometry{radius: 0.016 width_segments: 6 height_segments: 4} layout: SphereLayout{count: 3200 radius: r} order: @random stagger: 0.25 * s.len / 3200.0 each: {scale: tween(0, 1, 0, 0.3)} material: MeshBasicMaterial{color: s.color}}
+                Mesh{geometry: SphereGeometry{radius: r * 1.08} cast_shadow: false material: MeshBasicMaterial{color: #000000 rim_color: s.color rim_power: 4 blending: @additive transparent: true side: @back}}
+            ]
+            for i in 0..n {
+                let v = on(pts[i])
+                let pos = vec3(v[0] * r * 1.01, v[1] * r * 1.01, v[2] * r * 1.01)
+                let t0 = 0.12 + 0.6 * i / n
+                globe.push(Mesh{geometry: SphereGeometry{radius: 0.045} position: pos scale: tween(0, 1, sq_at(s, t0), sq_at(s, t0 + 0.05), @ease_out_back) material: MeshBasicMaterial{color: s.accent emissive: s.accent emissive_intensity: 3}})
+                globe.push(Mesh{geometry: RingGeometry{inner_radius: 0.07 outer_radius: 0.1 theta_segments: 32} position: pos look_at: vec3(v[0] * r * 3.0, v[1] * r * 3.0, v[2] * r * 3.0)
+                    scale: delay(repeat(tween(0.5, 2.4, 0, 1.2, @ease_out_cubic), 1.2), t0 * s.len) opacity: delay(repeat(tween(1, 0, 0, 1.2), 1.2), t0 * s.len) cast_shadow: false
+                    material: MeshBasicMaterial{color: s.accent transparent: true side: @double blending: @additive}})
+            }
+            // Arcs: great circles lifted by their length, drawn on in turn.
+            for i in 0..max(n - 1, 0) {
+                let a = on(pts[i])
+                let b = on(pts[i + 1])
+                let ang = acos(clamp(a[0] * b[0] + a[1] * b[1] + a[2] * b[2], -1.0, 1.0))
+                let ps = []
+                for k in 0..17 {
+                    let t = k / 16.0
+                    let sa = if ang < 0.0001 { 1.0 - t } else { sin((1.0 - t) * ang) / sin(ang) }
+                    let sb = if ang < 0.0001 { t } else { sin(t * ang) / sin(ang) }
+                    let lift = 1.0 + 0.16 * ang * sin(SQ_PI * t)
+                    ps.push(vec3((a[0] * sa + b[0] * sb) * r * lift, (a[1] * sa + b[1] * sb) * r * lift, (a[2] * sa + b[2] * sb) * r * lift))
+                }
+                let t0 = 0.15 + 0.6 * (i + 0.5) / n
+                globe.push(Line3D{curve: CatmullRomCurve3{points: ps} segments: 64 width: 3 color: s.accent color_end: s.color blending: @additive
+                    trim_end: tween(0, 1, sq_at(s, t0), sq_at(s, t0 + 0.12), @ease_in_out_cubic) trim_start: tween(0, 0.85, sq_at(s, t0 + 0.3), sq_at(s, min(t0 + 0.55, 1.0)), @ease_in_cubic)})
+            }
+            // Face the first point toward the camera at the start.
+            let kids = [Group3D{name: "globe" position: vec3(0, 0.35, 0) rotation: vec3(18, 0, 0) children: [Group3D{rotation: spin(vec3(0, 0.0 - pts[0][1], 0), vec3(0, 9, 0)) children: globe}]}]
+            if (s.text ?? nil) != nil { kids.push(sq_text3d(s, s.text, 0.34, vec3(0, -2.25, 0.4), MeshBasicMaterial{color: #ffffff}, sq_rise(s, 0.35 * s.len), @letter)) }
+            if (s.subtitle ?? nil) != nil { kids.push(sq_text3d(s, s.subtitle, 0.16, vec3(0, -2.7, 0.4), MeshBasicMaterial{color: s.accent}, sq_rise(s, 0.45 * s.len), @word)) }
+            sq_scene(s, Scene3D{
+                camera: Camera{position: tween(vec3(0, 0.3, 9.5), vec3(0, 0.1, 8.4), 0, sq_at(s, 1.0), @ease_in_out_cubic) target: vec3(0, -0.1, 0) fov: 40}
+                post: [post.Bloom{strength: 0.8 threshold: 0.8} post.Vignette{amount: 0.4}]
+                lights: [AmbientLight{intensity: 0.5} DirectionalLight{position: vec3(-4, 3, 5) intensity: 2}]
+                children: kids})
+        }
+    }
+    city_flyover: {len: fn(s) { 8.0 } color: #xdfe4ee accent: #x3f7cff background: #x0d1018
+        about: "an isometric city rising block by block with light trails along the streets as the camera glides over"
+        build: fn(s) {
+            // A 16 x 16 block grid with streets every fourth row and column; heights from a
+            // seeded hash, taller toward the centre.
+            let n = 16
+            let pitch = 0.62
+            let heights = [0.35, 0.7, 1.2, 2.0, 3.2]
+            let classes = [[], [], [], [], []]
+            for z in 0..n {
+                for x in 0..n {
+                    if x % 4 != 3 && z % 4 != 3 {
+                        let fx = (x - n / 2.0 + 0.5) * pitch
+                        let fz = (z - n / 2.0 + 0.5) * pitch
+                        let centre = 1.0 - min(sqrt(fx * fx + fz * fz) / (n * pitch * 0.6), 1.0)
+                        let k = clamp(floor((hashn(z * n + x, s.seed) * 0.7 + centre * 0.6) * 5.0), 0, 4)
+                        classes[k].push(vec3(fx, heights[k] * 0.5, fz))
+                    }
+                }
+            }
+            let kids = []
+            for k in 0..5 {
+                let pts = classes[k]
+                if pts.len() > 0 {
+                    let h = heights[k]
+                    let mat = if k == 4 {
+                        MeshStandardMaterial{color: sq_mix(s.color, s.accent, 0.35) roughness: 0.35 metalness: 0.3 emissive: s.accent emissive_intensity: 0.25}
+                    } else {
+                        MeshStandardMaterial{color: s.color roughness: 0.55}
+                    }
+                    kids.push(Instances{geometry: BoxGeometry{width: 0.5 height: h depth: 0.5 radius: 0.02 radius_segments: 2} layout: PointsLayout{points: pts}
+                        order: @distance stagger: 0.35 * s.len / pts.len() * (k + 1.0) / 3.0 each: {position: tween(vec3(0, -h - 0.05, 0), vec3(0, 0, 0), 0, 0.7, @ease_out_cubic)} color_jitter: 0.08 material: mat})
+                }
+            }
+            // Light trails along the streets.
+            let half = n * pitch / 2.0
+            for st in 0..3 {
+                let p = (4 * st + 3 - n / 2.0 + 0.5) * pitch
+                var i = 0
+                for ends in [[vec3(-half, 0.03, p), vec3(half, 0.03, p)], [vec3(p, 0.03, half), vec3(p, 0.03, -half)]] {
+                    let t0 = 0.3 + 0.08 * (st * 2 + i)
+                    kids.push(Line3D{points: ends width: 3 color: s.accent color_end: #ffffff blending: @additive dash: 0.4 gap: 0.25 dash_offset: spin(0, -1.5) trim_end: tween(0, 1, sq_at(s, t0), sq_at(s, t0 + 0.25), @ease_in_out_cubic)})
+                    i = i + 1
+                }
+            }
+            if (s.text ?? nil) != nil {
+                // Turned to face the isometric camera, above the towers.
+                kids.push(Group3D{rotation: vec3(0, 45, 0) children: [sq_text3d(s, s.text, 0.7, vec3(0, 4.4, 0), MeshPhysicalMaterial{color: #ffffff emissive: s.accent emissive_intensity: 0.3}, sq_rise(s, 0.55 * s.len), @letter)]})
+            }
+            kids.push(Mesh{geometry: PlaneGeometry{width: 40 height: 40} rotation: vec3(-90, 0, 0) material: MeshStandardMaterial{color: sq_mix(s.color, #000000, 0.82) roughness: 0.9}})
+            sq_scene(s, Scene3D{
+                environment: Environment{preset: @overcast intensity: 0.9}
+                camera: Camera{preset: @isometric target: tween(vec3(-0.9, 0.8, 0.9), vec3(0.9, 1.2, -0.9), 0, sq_at(s, 1.0), @ease_in_out_sine) height: tween(11, 8.5, 0, sq_at(s, 1.0), @ease_in_out_cubic)}
+                post: [ContactShadows{opacity: 0.6} SSAO{radius: 0.3 intensity: 1} post.Bloom{strength: 0.5 threshold: 1.2}]
+                lights: [AmbientLight{intensity: 0.5} DirectionalLight{position: vec3(-5, 9, 4) intensity: 2.4 cast_shadow: true}]
+                children: kids})
+        }
+    }
+    device_showcase: {len: fn(s) { 8.0 } color: #xf2f0ea accent: #x7a5cff background: #x0d1020
+        about: "a laptop opening and a phone rising with your footage or image on their screens, the camera orbiting"
+        build: fn(s) {
+            let screen = if (s.video ?? nil) != nil { sq_media(s.video) } else if (s.image ?? nil) != nil { sq_media(s.image) } else { @demo }
+            let phone_screen = if (s.phone_video ?? nil) != nil { sq_media(s.phone_video) } else if (s.phone_image ?? nil) != nil { sq_media(s.phone_image) } else { screen }
+            // Screens crop to their own shape (never stretch), following the action when crop
+            // keys are given.
+            let laptop = Device{kind: @laptop position: vec3(1.2, 0, 0) rotation: vec3(0, -24, 0) open: tween(0, 106, sq_at(s, 0.05), sq_at(s, 0.3), @ease_out_back) screen: screen fit: s.fit}
+            if s.crop.len() > 0 { laptop.crop = sq_crop(s.crop) }
+            let phone = Device{kind: @phone position: tween(vec3(-1.1, -2.2, 0.8), vec3(-1.1, 0.85, 0.8), sq_at(s, 0.2), sq_at(s, 0.4), @ease_out_cubic) rotation: tween(vec3(0, 60, -8), vec3(0, 20, -4), sq_at(s, 0.2), sq_at(s, 0.45), @ease_out_cubic) screen: phone_screen fit: s.fit}
+            let phone_crop = if s.phone_crop.len() > 0 { s.phone_crop } else if (s.phone_video ?? nil) == nil && (s.phone_image ?? nil) == nil { s.crop } else { [] }
+            if phone_crop.len() > 0 { phone.crop = sq_crop(phone_crop) }
+            if s.phone_aspect > 0.0 { phone.aspect = s.phone_aspect }
+            let kids = [laptop phone
+                ShapeSet{preset: @floating position: vec3(0.2, 0.9, -3.6) spread: 0.9 start: sq_at(s, 0.3) color: s.accent color2: s.color color3: sq_mix(s.accent, #ffffff, 0.5)}]
+            if (s.text ?? nil) != nil { kids.push(sq_text3d(s, s.text, 0.42, vec3(0.2, 2.3, -1.6), MeshPhysicalMaterial{color: #ffffff clearcoat: 1 roughness: 0.3}, sq_rise(s, 0.45 * s.len), @letter)) }
+            if (s.subtitle ?? nil) != nil { kids.push(sq_text3d(s, s.subtitle, 0.18, vec3(0.2, 1.88, -1.6), MeshBasicMaterial{color: s.accent}, sq_rise(s, 0.55 * s.len), @word)) }
+            kids.push(Ground{radius: 30 fade: vec2(4, 12) color: sq_mix(#07080f, s.accent, 0.06) roughness: 0.45 reflectivity: 0.2 reflection_blur: 0.35})
+            sq_scene(s, Scene3D{
+                environment: Environment{preset: @softbox intensity: 1.1}
+                camera: Camera{preset: @hero target: vec3(0.3, 0.8, 0) distance: 7.8 focal_length: 45
+                    moves: [CameraMove{type: @orbit_right start: 0 end: sq_at(s, 0.75) amount: 30} CameraMove{type: @push_in start: sq_at(s, 0.6) end: sq_at(s, 1.0) amount: 0.15}]}
+                post: [ContactShadows{opacity: 0.8} post.DepthOfField{focus: 7.4 f_stop: 4} post.Bloom{strength: 0.3 threshold: 1.6} ColorGrade{contrast: 1.08 saturation: 1.1}]
+                lights: [LightRig{preset: @product target: vec3(0.3, 0.6, 0)}]
+                children: kids})
+        }
+    }
+    abstract_loop: {len: fn(s) {
+            // A loop bed lasts whole bars, so it repeats on the downbeat.
+            if s.bpm > 0.0 {
+                let bar = 240.0 / s.bpm
+                return max(round(8.0 / bar), 1.0) * bar
+            }
+            8.0
+        }
+        color: #x3f7cff accent: #xff4fa3 background: #x05060c
+        about: "a seamless loop bed: a sphere of cubes, orbiting rings and a breathing wave floor (period = duration)"
+        build: fn(s) {
+            // Every motion repeats with the period (or a divisor of it): the last frame runs into
+            // the first.
+            let d = s.len
+            let kids = [Group3D{position: vec3(0, 1.2, 0) rotation: repeat(tween(vec3(0, 0, 0), vec3(0, 360, 0), 0, d), d) children: [
+                Instances{geometry: BoxGeometry{width: 0.09 height: 0.09 depth: 0.3} layout: SphereLayout{count: 900 radius: 1.1} align: true order: @random stagger: d / 4.0 / 900.0
+                    each: {scale: add(vec3(1, 1, 0.4), mul(pingpong(tween(0, 1, 0, d / 4.0, @ease_in_out_sine), d / 4.0), vec3(0, 0, 2.2)))} color_jitter: 0.25
+                    material: MeshStandardMaterial{color: s.color metalness: 0.6 roughness: 0.25 emissive: s.accent emissive_intensity: 0.15}}
+            ]}]
+            var i = 0
+            for ring in [[2.0, 70.0, 1.0], [2.5, 110.0, -1.0], [3.0, 90.0, 2.0]] {
+                kids.push(Mesh{geometry: TorusGeometry{radius: ring[0] tube: 0.02 tubular_segments: 200} position: vec3(0, 1.2, 0)
+                    rotation: repeat(tween(vec3(ring[1], 0, i * 30.0), vec3(ring[1], 360.0 * ring[2], i * 30.0), 0, d), d) cast_shadow: false
+                    material: MeshBasicMaterial{color: #000000 emissive: if i == 1 { s.color } else { s.accent } emissive_intensity: if i == 1 { 3 } else { 5 }}})
+                i = i + 1
+            }
+            kids.push(Instances{geometry: BoxGeometry{width: 0.22 height: 0.12 depth: 0.22 radius: 0.02 radius_segments: 2} layout: GridLayout{count: vec3(34, 1, 34) spacing: vec3(0.26, 1, 0.26)} position: vec3(0, -0.4, 0)
+                order: @distance stagger: d / 4.0 / 17.0 * 0.5 each: {position: pingpong(tween(vec3(0, 0, 0), vec3(0, 0.45, 0), 0, d / 4.0, @ease_in_out_sine), d / 4.0)} color_jitter: 0.1
+                material: MeshStandardMaterial{color: sq_mix(s.color, rgb(0.05, 0.05, 0.08), 0.6) metalness: 0.4 roughness: 0.35}})
+            if (s.text ?? nil) != nil {
+                kids.push(Text3D{text: s.text font: s.font size: 0.5 depth: 0.12 position: vec3(0, 1.2, 2.2) rotation: pingpong(tween(vec3(0, -8, 0), vec3(0, 8, 0), 0, d / 2.0, @ease_in_out_sine), d / 2.0) material: MeshPhysicalMaterial{preset: @chrome color: #ffffff}})
+            }
+            sq_scene(s, Scene3D{temporal_aa: 2
+                environment: Environment{preset: @night intensity: 0.8}
+                camera: Camera{orbit: true target: vec3(0, 1.1, 0) yaw: pingpong(tween(-25, 25, 0, d / 2.0, @ease_in_out_sine), d / 2.0) pitch: 12 distance: 9 focal_length: 40}
+                post: [post.Bloom{strength: 0.9 threshold: 0.9} post.Vignette{amount: 0.4}]
+                lights: [AmbientLight{intensity: 0.3} PointLight{position: vec3(0, 1.2, 0) color: s.accent intensity: 30} DirectionalLight{position: vec3(3, 6, 4) intensity: 1.2}]
+                children: kids})
+        }
+    }
+    countdown: {len: fn(s) { (abs(s.from - s.to) + 1) * s.step + 1.5 }
+        color: #xf2f0ea accent: #xff5a36 background: #x05060a
+        about: "numbers from `from` to `to` punch in on each step (a beat grid when bpm is set) with rings, then `text` bursts in"
+        build: fn(s) {
+            let count = abs(s.from - s.to) + 1
+            let step = if s.duration > 0.0 { s.duration / (count + 1.0) } else { s.step }
+            let dir = if s.to <= s.from { -1 } else { 1 }
+            let kids = []
+            for i in 0..count {
+                let n = s.from + dir * i
+                let t0 = i * step
+                let s0 = sq_time(s, t0)
+                let s1 = sq_time(s, t0 + step * 0.3)
+                let s2 = sq_time(s, t0 + step)
+                kids.push(Group3D{span: vec2(t0, step) children: [
+                    Text3D{text: n.to_string() font: s.font size: 2.2 depth: 0.45 bevel: 0.05 by: @whole position: vec3(0, 0, 0)
+                        scale: tween(1.5, 1, s0, s1, @ease_out_back) rotation: tween(vec3(0, -35, 0), vec3(0, 8, 0), s0, s2, @ease_out_cubic)
+                        opacity: keys([s0, 0], [sq_time(s, t0 + step * 0.1), 1])
+                        material: MeshPhysicalMaterial{preset: @chrome color: s.color}}
+                    Mesh{geometry: TorusGeometry{radius: 1.7 tube: 0.03 tubular_segments: 160} scale: tween(0.6, 1.5, s0, s2, @ease_out_expo) opacity: tween(1, 0, s0, s2) cast_shadow: false
+                        material: MeshBasicMaterial{color: #000000 emissive: s.accent emissive_intensity: 6 transparent: true}}
+                ]})
+            }
+            let t_end = count * step
+            if (s.text ?? nil) != nil {
+                let a = sq_time(s, t_end)
+                let b = sq_time(s, t_end + 0.45)
+                kids.push(sq_text3d(s, s.text, 1.5, vec3(0, 0, 0), MeshPhysicalMaterial{preset: @chrome color: s.accent}, {scale: tween(vec3(0, 0, 0), vec3(1, 1, 1), a, b, @ease_out_back) opacity: tween(0, 1, a, b)}, @letter))
+            }
+            kids.push(Fx{preset: @burst start: sq_time(s, t_end) count: 600 size: 0.06 color: #fff2c0 color2: s.accent})
+            sq_scene(s, Scene3D{
+                environment: Environment{preset: @studio intensity: 1.2}
+                camera: Camera{position: vec3(0, 0, 7) target: vec3(0, 0, 0) fov: 40 shake: 0.02}
+                post: [post.Bloom{strength: 0.7 threshold: 1.2} post.MotionBlur{shutter: 180 samples: 4} post.Vignette{amount: 0.45}]
+                lights: [LightRig{preset: @dramatic target: vec3(0, 0, 0)}]
+                children: kids})
+        }
+    }
+    number_reveal: {len: fn(s) { 5.0 } color: #xf2f0ea accent: #x2fd6a0 background: #x06080c
+        about: "a big figure flips in digit by digit with a line and sparks, a label under it"
+        build: fn(s) {
+            let kids = [
+                Text3D{text: s.text ?? "1,000,000" font: s.font size: 1.0 depth: 0.3 bevel: 0.03 position: vec3(0, 0.3, 0) by: @letter stagger: 0.07 order: @forward
+                    each: {rotation: tween(vec3(-90, 0, 0), vec3(0, 0, 0), sq_at(s, 0.05), sq_at(s, 0.2), @ease_out_back) opacity: tween(0, 1, sq_at(s, 0.05), sq_at(s, 0.1))}
+                    material: MeshPhysicalMaterial{preset: @chrome color: s.color}}
+                Line3D{points: [vec3(-3, -0.45, 0.2), vec3(3, -0.45, 0.2)] width: 4 color: s.accent color_end: #ffffff blending: @additive trim_start: tween(0.5, 0, sq_at(s, 0.3), sq_at(s, 0.45), @ease_out_cubic) trim_end: tween(0.5, 1, sq_at(s, 0.3), sq_at(s, 0.45), @ease_out_cubic)}
+                Fx{preset: @sparks position: vec3(0, -0.45, 0.2) start: sq_at(s, 0.3) count: 200 size: 0.04 color: #ffffff color2: s.accent span: vec2(0.3 * s.len, 0.25 * s.len)}
+            ]
+            if (s.subtitle ?? nil) != nil { kids.push(sq_text3d(s, s.subtitle, 0.26, vec3(0, -0.95, 0.2), MeshBasicMaterial{color: s.accent}, sq_rise(s, 0.42 * s.len), @word)) }
+            kids.push(Ground{y: -1.4 radius: 30 fade: vec2(3, 10) color: #07080b roughness: 0.4 reflectivity: 0.4 reflection_blur: 0.2})
+            sq_scene(s, Scene3D{
+                environment: Environment{preset: @studio intensity: 1.2}
+                camera: Camera{position: tween(vec3(0, 0.3, 8.5), vec3(0, 0.2, 7.2), 0, sq_at(s, 1.0), @ease_out_cubic) target: vec3(0, 0.1, 0) fov: 40}
+                post: [ContactShadows{opacity: 0.6} post.Bloom{strength: 0.5 threshold: 1.3} post.Vignette{amount: 0.4}]
+                lights: [LightRig{preset: @dramatic target: vec3(0, 0.3, 0)}]
+                children: kids})
+        }
+    }
+}
+
+// The Scene3D of the Seq3D `s` (read by seq3d.rs; what it leaves out is the template's).
+let seq3d_scene = fn(s) {
+    var t = nil
+    for name, tt in seq3d_templates {
+        if name.to_string() == s.template { t = tt }
+    }
+    // A countdown step: one second, or the whole beats nearest a second.
+    s.step = if s.bpm > 0.0 { max(round(s.bpm / 60.0), 1.0) * 60.0 / s.bpm } else { 1.0 }
+    s.len = if s.duration > 0.0 { s.duration } else { t.len(s) }
+    s.color = s.color ?? t.color
+    s.accent = s.accent ?? t.accent
+    s.has_bg = !s.transparent
+    s.background = s.background ?? t.background
+    t.build(s)
+}
+
+{seq3d_templates: seq3d_templates seq3d_scene: seq3d_scene}

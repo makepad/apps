@@ -1,0 +1,23 @@
+// A generative segment: a clip with an effect, piped through a video generator
+// over part of its span; the take plays stretched over the segment.
+use mod.flow.*
+use mod.cut.*
+
+let hands  = Clip{src: asset("ast_yqzlg4xa4mbgpzs6e2qsuqwhsu", "arev_5ab3f998fd4a7b6860a9337b9924be40ad341d12276e341079ce2093539c715f") in: 2.0 span: [0.0, 10.0] fit: @fill}
+let glow   = Fx{input: hands.out(@frame) effect: "kit/bloom" p1: keys([0.0, 0.2], [3.0, 0.8, @ease_out]) span: [0.0, 10.0]}
+let dream  = Generate{input: glow.out(@frame) span: [4.0, 4.0] flow: preset("bundled:image-to-video")
+    prompt: "the hands become birds" negative: "text" seed: 7 params: {frames: 124 steps: 30}
+    takes: [take(asset("ast_qdyytgcolstqfb6rgnbpnwva3m", "arev_b07daf865cbe8c601af1644e4b1168662f5faad1224b8806370e61e13b2270c2"), 7, KEY, 5.0, "minimax-h3-q4-24g"),
+            take(asset("ast_fklvc3bvjnuijdg33d2uuitkbi", "arev_e2e0b2ddc168547400e68147bf9e0161866f9cad405c9f94a2a47a5dcfe955ac"), 8, nil, nil, "minimax-h3-q4-24g")]
+    take: 0 track: 0}
+let title  = Title{text: "Birds" span: [1.0, 2.0]}
+let top    = Stack{layers: [dream.out(@frame), title.out(@frame)]}
+let out    = CutOutput{frame: top.out(@frame)}
+
+Flow{
+    kind: @cut
+    label: "Generative hands"
+    output: {width: 1280 height: 720 fps: 25}
+    duration: 10.0
+    hands, glow, dream, title, top, out
+}

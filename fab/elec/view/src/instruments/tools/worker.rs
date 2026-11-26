@@ -164,16 +164,18 @@ impl Worker {
         }
         self.start_next();
     }
+    /// Ask the host and wait for its answer, however long a busy machine keeps it: the wait ends
+    /// on the answer, on the host going away (a host that drops the request, or its whole queue,
+    /// drops the reply sender with it) or on the tools stopping. No clock bounds it: a slow host
+    /// is no failed call. The host answers every request it takes, refusals included.
     fn host<T>(&self, request: impl FnOnce(Sender<Result<T, String>>) -> HostRequest) -> Result<T, String> {
         let (reply, response) = channel();
         self.host.send(request(reply)).map_err(|_| "host: disconnected")?;
-        let deadline = (self.now)() + Duration::from_secs(10);
         loop {
             if self.stop.load(Ordering::Acquire) { return Err("host: tools stopped".into()); }
-            match response.recv_timeout(TICK.min(deadline.saturating_duration_since((self.now)()))) {
+            match response.recv_timeout(TICK) {
                 Ok(answer) => return answer,
                 Err(RecvTimeoutError::Disconnected) => return Err("host: reply sender disconnected".into()),
-                Err(RecvTimeoutError::Timeout) if (self.now)() >= deadline => return Err("host: no reply within 10s".into()),
                 Err(RecvTimeoutError::Timeout) => (),
             }
         }

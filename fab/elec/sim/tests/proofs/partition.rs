@@ -6,12 +6,12 @@
 use fab_elec_sim::analysis::held::held;
 use fab_elec_sim::analysis::op::operating_point;
 use fab_elec_sim::analysis::partition::{partition, PartOpts};
-use fab_elec_sim::analysis::round::{circuit_opts, plan_blocks, BlockPlanner};
+use fab_elec_sim::analysis::round::{band_figure, circuit_opts, echo_bar, plan_blocks, screen_echoes, BlockPlanner, CUT_TOL};
 use fab_elec_sim::live::{LiveCmd, ValuePlan};
 use fab_elec_sim::livesim::{LiveSim, LiveSpec, Replan};
 use fab_elec_sim::rounds::{Lag, Planner, RoundPlan};
 use fab_elec_sim::stamp::UnkKind;
-use fab_elec_sim::{CtlKind, ModelKind, Record, SimCircuit, SimDiag, Sink, Solver, Source, Wave};
+use fab_elec_sim::{CtlKind, GpioParams, ModelKind, PinMode, Record, SimCircuit, SimDiag, Sink, Solver, Source, Wave};
 use std::sync::{Arc, Mutex};
 
 fn two_voices() -> SimCircuit {
@@ -54,7 +54,7 @@ fn two_voices() -> SimCircuit {
 #[test]
 fn two_voice_partition() {
     let c = two_voices();
-    let opts = PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: 1e-3, hub_tol: 0.1, fmin: 10.0, fmax: 48e3, band: f64::INFINITY, per_octave: 4, min_island: 8, control: vec![], supplies: Vec::new(), round: 32.0 / 96e3 };
+    let opts = PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: 1e-3, hub_tol: 0.1, fmin: 10.0, fmax: 48e3, band: f64::INFINITY, per_octave: 4, min_island: 8, control: vec![], supplies: Vec::new(), heard: Vec::new(), round: 32.0 / 96e3 };
     let p = partition(&c, &opts).unwrap_or_else(|d| panic!("two-voice partition must succeed: {d}"));
     let again = partition(&c, &opts).unwrap_or_else(|d| panic!("repeated two-voice partition must succeed: {d}"));
     assert_eq!(p.report("two voices"), again.report("two voices"), "partition reports must be deterministic");
@@ -89,7 +89,7 @@ fn two_voice_partition() {
 #[test]
 fn two_voice_blocks() {
     let c = two_voices();
-    let opts = PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: 1e-3, hub_tol: 0.1, fmin: 10.0, fmax: 48e3, band: f64::INFINITY, per_octave: 4, min_island: 8, control: vec![], supplies: Vec::new(), round: 32.0 / 96e3 };
+    let opts = PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: 1e-3, hub_tol: 0.1, fmin: 10.0, fmax: 48e3, band: f64::INFINITY, per_octave: 4, min_island: 8, control: vec![], supplies: Vec::new(), heard: Vec::new(), round: 32.0 / 96e3 };
     let mut whole = Solver::new(&c).expect("the two voices build");
     operating_point(&mut whole, false).expect("the two voices have an operating point");
     let plan = plan_blocks(&c, &whole, 0.0, &opts).expect("the two voices plan").expect("the two voices split");
@@ -141,7 +141,7 @@ fn two_voice_blocks() {
 }
 
 /// The two voices' options: each voice and the summer a block (`two_voice_blocks`).
-const VOICE_OPTS: PartOpts = PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: 1e-3, hub_tol: 0.1, fmin: 10.0, fmax: 48e3, band: f64::INFINITY, per_octave: 4, min_island: 8, control: Vec::new(), supplies: Vec::new(), round: 32.0 / 96e3 };
+const VOICE_OPTS: PartOpts = PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: 1e-3, hub_tol: 0.1, fmin: 10.0, fmax: 48e3, band: f64::INFINITY, per_octave: 4, min_island: 8, control: Vec::new(), supplies: Vec::new(), heard: Vec::new(), round: 32.0 / 96e3 };
 
 /// The host's planner (`BlockPlanner`) with the two voices' options, keeping where each plan it
 /// makes holds `rsum0`'s ghost.
@@ -277,7 +277,7 @@ fn pad_voices(listeners: usize) -> SimCircuit {
 /// The bars of the live runs; an island of one unknown joins its single reader (a voice's RC its
 /// amplifier).
 fn pad_opts() -> PartOpts {
-    PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: 1e-3, hub_tol: 0.1, fmin: 10.0, fmax: 48e3, band: f64::INFINITY, per_octave: 4, min_island: 2, control: vec!["pad".into()], supplies: Vec::new(), round: 32.0 / 96e3 }
+    PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: 1e-3, hub_tol: 0.1, fmin: 10.0, fmax: 48e3, band: f64::INFINITY, per_octave: 4, min_island: 2, control: vec!["pad".into()], supplies: Vec::new(), heard: Vec::new(), round: 32.0 / 96e3 }
 }
 
 /// The block planner with the pad as the control set.
@@ -321,8 +321,10 @@ fn lerp(at: &[f64], v: &[f64], t: f64) -> f64 {
 ///   times in Exact, three in Fast) and twice the voice's rho of its swing, the pad's late load;
 ///   read a round late it would be off by most of the swing.
 /// - With seven listeners each passes its share and the pad's test, but together their loops return
-///   a third of the pad's swing: the round map merges listeners into block 0 (which then reads
-///   voice 0 in the same round and takes it) until the rest pass; voice 1 stays apart.
+///   a third of the pad's swing. A listener's loop reaches it through voice 0's output, read in the
+///   same round, where no port at the pad carries it: the round map merges listeners into voice
+///   0's block, whose port then carries their loops, until the rest pass. The pad stays alone in
+///   block 0; voice 1 stays apart.
 #[test]
 fn a_pads_consumers_read_it_in_the_same_round_and_the_round_map_merges_a_loop() {
     let mut whole = Solver::new(&pad_voices(0)).expect("the pad's circuit builds");
@@ -388,9 +390,13 @@ fn a_pads_consumers_read_it_in_the_same_round_and_the_round_map_merges_a_loop() 
     assert!(g * g <= 0.1 && go * go <= 1e-3, "the plan that runs passes the round map: loop gains {g:.2e} and {go:.2e} a round: {report}");
     let block_of = |name: &str| plan.plan.blocks.iter().position(|b| b.own.iter().any(|&(_, g)| whole.unknowns[g as usize].name == name))
         .unwrap_or_else(|| panic!("a block solves {name}: {report}"));
-    let joined = (0..7).filter(|k| block_of(&format!("l{k}")) == 0).count();
-    assert!(block_of("pad") == 0 && block_of("out0") == 0 && (1..7).contains(&joined) && block_of("out1") != 0,
-        "listeners join block 0 until the rest pass, which then holds voice 0; voice 1 stays apart: {report}");
+    let voice = block_of("out0");
+    let listeners: Vec<usize> = (0..7).map(|k| block_of(&format!("l{k}"))).collect();
+    let joined = listeners.iter().filter(|&&b| b == voice).count();
+    assert!(block_of("pad") == 0 && voice != 0 && block_of("out1") != voice && !listeners.contains(&0) && joined >= 1,
+        "listeners join voice 0's block, the pad alone in block 0 and voice 1 apart: {report}");
+    let carried = report.lines().filter(|l| l.starts_with("  the islands of ") && l.ends_with("read in the same round: the two blocks merge")).count();
+    assert_eq!(carried, joined, "each listener that joins voice 0 does so for the loop its output carries: {report}");
 }
 
 /// A pad behind its driver's 25 ohm, loaded through 10 ohm at `mid` by 50 ohm, so heavily that
@@ -533,7 +539,7 @@ fn coupled_load(reversed: bool) -> SimCircuit {
 ///   together it passes.
 #[test]
 fn a_test_made_stale_in_its_own_pass_is_judged_again_on_its_consumer_as_grown() {
-    let opts = PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: 1e-3, hub_tol: 0.1, fmin: 10.0, fmax: 24e3, band: f64::INFINITY, per_octave: 4, min_island: 1, control: Vec::new(), supplies: Vec::new(), round: 32.0 / 48e3 };
+    let opts = PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: 1e-3, hub_tol: 0.1, fmin: 10.0, fmax: 24e3, band: f64::INFINITY, per_octave: 4, min_island: 1, control: Vec::new(), supplies: Vec::new(), heard: Vec::new(), round: 32.0 / 48e3 };
     let islands = |reversed: bool| -> (Vec<Vec<String>>, bool, String) {
         let c = coupled_load(reversed);
         let mut whole = Solver::new(&c).expect("the load builds");
@@ -555,4 +561,105 @@ fn a_test_made_stale_in_its_own_pass_is_judged_again_on_its_consumer_as_grown() 
     assert!(island("a") == island("b"), "b joins a, whose cut it fails: {report}");
     assert!(island("rail") != island("a"), "tested again on a and b together, the supply passes and keeps its own island: {report}");
     assert!(report.contains("the cut at rail fails") && report.contains("tested again"), "the supply's test on a alone fails and waits: {report}");
+}
+
+/// The echo screen on drum16's figures, as its 24 kHz plan measured them (`screen_echoes`, each
+/// echo's size the half range of its gain over the plan's states times its reader's response):
+/// - at an oscillator, a reader with switches of its own, the hats' `mix` and `hi` echoes (gains
+///   3.18e-2..7.21e-2 and 5.02e-2..9.04e-2, read through 5.14e-4) stay exported. At the old
+///   pitch bar, `CUT_TOL / 100`, both went static, and their mid-range gains put the hats about
+///   0.03 c off;
+/// - the cymbal's `hats.sum` echo (-3.38e-3..-2.63e-3 through 2.02e-5, a reader with no switch)
+///   and the mixer's `SUM` echo at a voice with a switch (-7.78e-3..-7.72e-3 through 7.15e-5) are
+///   static, as is a gain that never moves.
+///
+/// At 96 kHz the 24 kHz band figure prices a split at SNARE using its transfer of 0.735 to
+/// `mix.mix`. HATS lands at its born amplitude of 1. The kick's trigger reaches KICKOUT
+/// through KICK at 2.54e-3, small enough for SNARE to split it.
+#[test]
+fn the_cut_rules_judge_drum16s_plan_figures() {
+    let size = |lo: f64, hi: f64, sense: f64| 0.5 * (hi - lo) * sense;
+    let (osc, cym, chat) = (echo_bar(CUT_TOL, true), echo_bar(CUT_TOL, false), echo_bar(CUT_TOL, true));
+    let echoes = [
+        ("hats.mix", (5, osc, size(3.181e-2, 7.209e-2, 5.143e-4)), false),
+        ("hats.hi", (5, osc, size(5.021e-2, 9.044e-2, 5.143e-4)), false),
+        ("hats.sum", (9, cym, size(-3.379e-3, -2.626e-3, 2.016e-5)), true),
+        ("SUM", (10, chat, size(-7.777e-3, -7.722e-3, 7.154e-5)), true),
+        ("mix.wv", (11, cym, size(5.920e-1, 5.920e-1, 6.473e-4)), true),
+    ];
+    let sizes: Vec<(u32, f64, f64)> = echoes.iter().map(|e| e.1).collect();
+    for ((name, _, want), got) in echoes.iter().zip(screen_echoes(&sizes)) {
+        assert_eq!(got, *want, "{name}: static {got}, want {want} ({sizes:?})");
+    }
+
+    let h = 1.0 / 96000.0;
+    let factor = band_figure(1.0, 24e3, h);
+    assert!((factor - 0.308).abs() < 1e-3, "the 24 kHz band factor at a 96 kHz sample rate should be 0.308, got {factor}");
+    let snare = band_figure(0.735, 24e3, h) / CUT_TOL;
+    assert!(snare > 1.0, "HATS into SNARE should land at its born amplitude, got {snare} times the bar");
+    let kickout = 2.54e-3 * snare;
+    assert!(kickout < 1.0, "KICKOUT into SNARE should stay split at the kick's relayed amplitude, got {kickout} times the bar");
+}
+
+/// A Schmitt-trigger RC oscillator (timing node `i`, 390 k onto 10 nF) whose output `o` drives an
+/// RC ladder through 100 k at `m0`: `LADDER` sections of 1 k and 10 nF, read at its far end by a
+/// listener `out`. A transistor whose base a pad drives through 100 k loads `m0` through 10 k, so
+/// the pad's level sets how much of `o` reaches `m0`.
+fn pitch_ladder() -> SimCircuit {
+    let mut c = SimCircuit::new();
+    c.model("lo", ModelKind::Sw, &[("vt", 2.35), ("vh", 0.5), ("ron", 50.0), ("roff", 1e9)]);
+    c.model("hi", ModelKind::Sw, &[("vt", -2.35), ("vh", 0.5), ("ron", 50.0), ("roff", 1e9)]);
+    c.model("qn", ModelKind::Npn, &[("is", 1e-14), ("bf", 200.0)]);
+    c.v("vs", "v0", "0", Source::dc(5.0));
+    c.sw("slo", "o", "0", "i", "0", "lo", false);
+    c.sw("shi", "v0", "o", "0", "i", "hi", true);
+    c.r("rf", "o", "i", 390e3);
+    c.c("ct", "i", "0", 10e-9);
+    c.c("co", "o", "0", 10e-12);
+    c.r("rm", "o", "m0", 100e3);
+    c.c("cm", "m0", "0", 1e-9);
+    for k in 0..LADDER {
+        c.r(&format!("rl{k}"), &format!("m{k}"), &format!("m{}", k + 1), 1e3);
+        c.c(&format!("cl{k}"), &format!("m{}", k + 1), "0", 10e-9);
+    }
+    c.v("vdd", "vdd", "0", Source::dc(3.3));
+    let pad = GpioParams { r_on_h: 25.0, r_on_l: 25.0, r_pull: 40e3, r_leak: 1e12, t_edge: 5e-9, vih: 0.55, vil: 0.45 };
+    c.gpio("pa0", "pad", "vdd", "0", pad, PinMode::OutLow);
+    c.r("rb", "pad", "b", 100e3);
+    c.q("qg", "g", "b", "0", "qn");
+    c.r("rg", "m0", "g", 10e3);
+    c.vctl("gout", CtlKind::Vccs, "0", "out", &format!("m{LADDER}"), "0", 1e-4);
+    c.r("rout", "out", "0", 10e3);
+    c.c("cout", "out", "0", 1e-9);
+    c
+}
+
+/// `pitch_ladder`'s sections: enough that its block's refactor and solve take the plan's most
+/// multiply-subtracts.
+const LADDER: usize = 40;
+
+/// The pitch rule (`merge_pitch_cuts`) on `pitch_ladder`: the cut at `o` puts the oscillator
+/// before the ladder, which reads `o` in the same round while the oscillator reads `m0` late,
+/// corrected by an echo through `rm`'s ghost in its block. The pad's level moves the echo's gain by
+/// more than a reader with switches of its own may keep static, so the size screen would export
+/// it, and the oscillator's and the ladder's islands merge: one block solves `i`, `o` and `m0`.
+/// The ladder's block is the plan's longest (a refactor and a solve 140 multiply-subtracts, the
+/// oscillator's 108), where the rule once kept the cut: the echo corrects the oscillator's late
+/// copy of `m0` for its own moves only, and an event of the ladder's block would reach its
+/// crossings late.
+#[test]
+fn a_pitch_readers_cut_merges_where_its_far_block_is_the_longest() {
+    let c = pitch_ladder();
+    let opts = PartOpts { min_island: 2, ..VOICE_OPTS };
+    let mut whole = Solver::new(&c).expect("the ladder builds");
+    operating_point(&mut whole, false).expect("the ladder has an operating point");
+    let plan = plan_blocks(&c, &whole, 0.0, &opts).expect("the ladder plans").expect("the ladder splits");
+    let rule = plan.report.lines().find(|l| l.contains("(whose crossings set a pitch)"));
+    assert!(rule.is_some_and(|l| l.contains(" at o ") && l.contains("following m0") && l.contains(": merged")), "the oscillator's echo of m0 merges its cut: {}", plan.report);
+    let block = |name: &str| plan.plan.blocks.iter().position(|b| b.own.iter().any(|&(_, g)| whole.unknowns[g as usize].name == name))
+        .unwrap_or_else(|| panic!("a block solves {name}: {}", plan.report));
+    let merged = block("o");
+    assert!(block("i") == merged && block("m0") == merged && block(&format!("m{LADDER}")) == merged, "one block solves the oscillator and the ladder: {}", plan.report);
+    let solves = |k: usize| plan.plan.blocks[k].own.len();
+    assert!((0..plan.plan.blocks.len()).all(|k| k == merged || solves(k) < solves(merged)), "the merged block is the plan's longest: {}", plan.report);
 }

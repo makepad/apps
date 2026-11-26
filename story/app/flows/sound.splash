@@ -1,0 +1,6 @@
+// Makepad Story's sound: one deck playing the preview feed (the CUT
+// viewer's, the graphic desk's and DECK's cut sound) into the device.
+use mod.flow.*
+let deck = AudioDeck{ play: 1 speed: 1 }
+let out = AudioOutput{ enabled: 1 audio: deck.out(@audio) }
+Flow{ label: "Story sound" deck, out }

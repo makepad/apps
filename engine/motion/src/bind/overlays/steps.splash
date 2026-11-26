@@ -1,0 +1,24 @@
+use mod.motion.*
+// A step counter at the run's marks: "2 / 5" in a badge that pops when a
+// new step (mark) is reached.
+let r = run()
+Motion{
+    label: "Step counter (at the run's marks)"
+    size: vec2(1080, 1920)
+    duration: 3600.0
+    inputs: {
+        at: input(@vec2, vec2(120, 260), "Where the badge is centred")
+        fill: input(@color, #ffc933, "Badge colour")
+        color: input(@color, #11151c, "Text colour")
+    }
+    layers: [
+        Rect{name: "badge"
+            at: fn(t) { let p = in(@at) return [p.x - 95, p.y - 46] } size: vec2(190, 92) radius: 46 fill: in(@fill)
+            scale: fn(t) { let s = r.step(t) if s.age < 0.25 { return 1.0 + (0.25 - s.age) } return 1.0 }
+            opacity: fn(t) { return r.step(t).presence }}
+        Text{name: "count"
+            source: r.steps() show: @active
+            font: Font{family: "Inter" weight: 800} size: 48 color: in(@color) align: @center
+            at: fn(t) { let p = in(@at) return [p.x, p.y - 30] }}
+    ]
+}

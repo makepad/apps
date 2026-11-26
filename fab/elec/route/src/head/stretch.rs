@@ -273,6 +273,7 @@ pub(super) fn answer(
         ).with_cut(board, cut_for_good.into_iter().map(|(track, _, kept, why)| (track.clone(), kept, why)))));
     }
     Ok(RouteProposal {
+        pair: None,
         id, source: ProposalSource::Gesture { id: sample.id, seq: sample.seq, tier: Tier::Stretch },
         unit: base.unit, base_generation: board.generation, base_hash: base.hash,
         metrics: RouteMetrics::default(), ops, checked: None, verified: collisions.is_empty(), collisions,

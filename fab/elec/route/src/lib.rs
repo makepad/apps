@@ -18,7 +18,7 @@
 //! - `verify`: the verifier every engine runs on what it adds;
 //! - `check`: the check of a change against a checked board state (the worker's proposal check,
 //!   the organic judge's);
-//! - `problem`: `RouteProblem`, `RNet`, the plan order, the `Autorouter` and `Legaliser` traits;
+//! - `problem`: `RouteProblem`, `RNet`, the plan order, the `Autorouter` trait;
 //! - `grid`: the tiled occupancy grid, its A* and blockers searches, and `lift` to geometry;
 //! - `embed`: the band embedder (E6 2): a drawn reference made legal on its own side of each
 //!   obstacle (`make_legal`) and pulled taut (`tighten`), with octagonal hulls (`Octi`);
@@ -41,7 +41,10 @@ pub mod embed;
 pub mod gesture;
 pub mod grid;
 pub mod head;
+pub mod meander;
 pub mod organic;
+pub mod pair;
+pub mod place;
 pub mod problem;
 pub mod progress;
 pub mod proposal;
@@ -54,14 +57,14 @@ pub mod world;
 
 pub use channel::{route_channel, RouteHandle, RouteInbox, Work, QUEUE_DEPTH};
 pub use gesture::{Gesture, GestureId, GestureKind, GestureSample, Leg, Mode, Posture, Style, WidthRule, Xform};
-pub use problem::{problem, scope_nets, Autorouter, End, Legaliser, RNet, RStack, RouteProblem, Terminal};
+pub use problem::{problem, scope_nets, Autorouter, End, RNet, RStack, RouteProblem, Terminal};
 pub use progress::{JobPhase, NetStatus, Progress, RetryWhy};
 pub use proposal::{
     BlockCause, Blocked, Checked, Collision, Explanation, HeadAnswer, JobId, JobStatus, ProposalId, ProposalSource, RouteEvent,
     RouteProposal, SampleCause, SampleRefused, Tier,
 };
-pub use request::{Base, Effort, Engine, Method, PlaceJob, PlaceMode, RestyleJob, RouteJob, RouteRequest, RouteScope};
-pub use solution::{Kept, NetCopper, Reason, RouteMetrics, RouteSolution, WorkCounts};
+pub use request::{Base, Effort, Engine, Method, PlaceJob, PlaceMode, PlacePlan, PlacePlanner, PlanReport, PlanVerdict, RestyleJob, RouteJob, RouteRequest, RouteScope};
+pub use solution::{Conformed, HandCopper, Kept, NetCopper, PlaceMetrics, Reason, RouteMetrics, RouteSolution, WorkCounts};
 pub use source::{probe_copper, WorldSource};
 pub use verify::{new_pieces, verify};
 pub use worker::{replay, RouteWorker, Spawn};

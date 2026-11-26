@@ -479,13 +479,16 @@ impl Solver {
     }
 
     /// Feeds a named boundary source between solves; false if absent or not a boundary.
-    /// Only replaces the points it reads: no value edit or integration restart.
+    /// Only replaces the points it reads: no value edit or integration restart. A fold's `Timed`
+    /// part read at its last instant goes (`TierPlan::forget_instant`): a load at that instant
+    /// again reads the new points.
     /// A running stepper re-reads its pending event with `Stepper::breaks_changed` after a feed.
     pub fn feed(&mut self, name: &str, table: std::sync::Arc<crate::dev::boundary::Table>, delay: f64) -> bool {
-        match self.find_device(name) {
-            Some((b, i)) => self.banks[b].feed(i, table, delay),
-            None => false,
+        let Some((b, i)) = self.find_device(name) else { return false };
+        if let Some(plan) = &mut self.tiers {
+            plan.forget_instant();
         }
+        self.banks[b].feed(i, table, delay)
     }
 
     /// Writes a GPIO by its bank and instance handle between solves.
@@ -959,6 +962,18 @@ impl Solver {
             None => (&[][..], 1..self.c.len()),
         };
         list.iter().map(|&s| s as usize).chain(all)
+    }
+
+    /// Row `node` of the inverse of the last solved matrix, in ground-indexed scratch: one
+    /// transposed solve. A voltage import's branch entry gives the response to raising its
+    /// boundary value.
+    pub fn gain_row(&mut self, node: u32, z: &mut [f64]) {
+        debug_assert_eq!(z.len(), self.n + 1);
+        z.fill(0.0);
+        if node != 0 {
+            z[node as usize] = 1.0;
+            self.lu.solve_transposed(&mut z[1..]);
+        }
     }
 
     /// Applies the stiff error filter `C (G + a0 C)^-1 a0` to a charge error. `a0 e` is

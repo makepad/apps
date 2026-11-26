@@ -21,7 +21,7 @@
 
 use crate::proposal::Collision;
 use crate::world::{RBase, RId, RItem, RPiece, WRef, World};
-use fab_elec_board::drc::sel_of;
+use fab_elec_board::drc::{check_pair_gap, sel_of};
 use fab_elec_board::{check_drills, check_to, check_via_in_pad, Board, ConnItem, Copper, Item, Obstacle, PairFault, RuleMatrix, RuleRef, Track};
 use fab_elec_core::{BBox, ClassId, FeatureRef, ItemId, LayerId, LayerSet, Nm, PadIx, Seg, Sel, P};
 use std::ops::ControlFlow;
@@ -206,6 +206,10 @@ pub fn reach_of(rules: &RuleMatrix, board: &Board, base: &RBase, n: &RItem) -> N
 /// `reach_of` a piece that is not a via drill.
 fn copper_reach(rules: &RuleMatrix, board: &Board, n: &RItem) -> Nm {
     match &n.piece {
+        RPiece::Copper(Copper { item: ConnItem::Track { .. }, net: Some(net), .. }) => {
+            let radius = reach(rules);
+            rules.partner(*net).map_or(radius, |(_, gap)| radius.max(gap))
+        }
         RPiece::Copper(Copper { item: ConnItem::Pad { placed, pad }, .. }) => reach(rules).max(rules.via_drill_to_board_pad(board, *placed, *pad)),
         _ => reach(rules),
     }
@@ -343,6 +347,13 @@ fn fault(rules: &RuleMatrix, board: &Board, n: &RItem, it: &RItem, layer: LayerI
         return None;
     }
     match (&n.piece, &it.piece) {
+        (RPiece::Copper(a), RPiece::Copper(b)) if matches!(a.item, ConnItem::Track { .. })
+            && matches!(b.item, ConnItem::Track { .. }) && a.layer == b.layer
+            && a.net.and_then(|net| rules.partner(net)).is_some_and(|(mate, gap)| Some(mate) == b.net && gap > 0) => {
+            // For partner tracks ordinary clearance is capped at the pair gap. The board's
+            // pair-gap check therefore covers both requirements with one distance measurement.
+            check_pair_gap(rules, a, b)
+        }
         (RPiece::Copper(c), RPiece::Drill { item: ConnItem::Via(_), net, shape }) => {
             check_to(rules, c, &it.obstacle(), layer).or_else(|| check_via_in_pad(board, rules, *net, shape, c))
         }

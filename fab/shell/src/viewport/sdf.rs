@@ -75,7 +75,7 @@ fn tint_of(state: &AppState, object: &str) -> Vec<(u32, f32)> {
     for p in picks.list.iter().filter(|p| p.object == object) {
         add(&p.tint, if picks.lit.as_deref() == Some(p.id.as_str()) { TINT_LIT } else { TINT_PICKED });
     }
-    if let Some(u) = picks.under.as_ref().filter(|u| u.object == object && picks.other.is_none()) {
+    if let Some(u) = picks.under.as_ref().filter(|u| u.object == object && picks.other.is_none() && picks.menu.is_none()) {
         add(&u.tint, TINT_UNDER);
     }
     out
@@ -101,7 +101,7 @@ pub(super) fn tint_key(state: &AppState) -> u64 {
     for p in picks.list.iter() {
         add(&p.object, &p.tint, if picks.lit.as_deref() == Some(p.id.as_str()) { TINT_LIT } else { TINT_PICKED });
     }
-    if let Some(u) = picks.under.as_ref().filter(|_| picks.other.is_none()) {
+    if let Some(u) = picks.under.as_ref().filter(|_| picks.other.is_none() && picks.menu.is_none()) {
         add(&u.object, &u.tint, TINT_UNDER);
     }
     h.finish()
@@ -148,7 +148,8 @@ struct PartView {
     /// The shape whose field's stopped loop the part has been told of.
     loop_stop: Option<[u8; 32]>,
     materials: Option<Texture>,
-    materials_key: Option<[u8; 32]>,
+    materials_key: Option<([u8; 32], fab_plate::ColourMode, [f32; 4])>,
+    colours: fab_plate::ColourMode,
     /// The field can be traced: its mesh is hidden.
     ready: bool,
     element: Option<ElementId>,
@@ -280,13 +281,30 @@ impl Default for SdfLayer {
     }
 }
 
-/// How a field part shades: one material's values, or several's `table` ([`material_texture`]
-/// of `materials`). A part without materials of its own prints in its filament, `color`.
-pub fn tile_look<'a>(materials: &[fab_sdf_engine::makepad_csg_sdf::SdfMaterial], color: [f32; 4], table: Option<&'a Texture>) -> TileLook<'a> {
-    match materials {
-        [m] => TileLook { table: None, albedo: m.albedo, rough: m.rough, metal: m.metal, unlit: m.unlit, emit: m.emissive_color.map(|c| c * m.emissive), matte: false, highlight: None },
-        [] => TileLook { table: None, albedo: [color[0], color[1], color[2]], rough: crate::api::FILAMENT_ROUGHNESS, metal: 0.0, unlit: false, emit: [0.0; 3], matte: false, highlight: None },
-        [m, ..] => TileLook { table, albedo: m.albedo, rough: m.rough, metal: m.metal, unlit: m.unlit, emit: [0.0; 3], matte: false, highlight: None },
+/// The slicer currently does not read a native slot's own filament number. If it starts
+/// doing so, Material colours must follow that assignment. Named paint is applied over this base.
+fn slot_albedo(native: [f32; 3], owner: [f32; 4], mode: fab_plate::ColourMode) -> [f32; 3] {
+    match mode {
+        fab_plate::ColourMode::Model => native,
+        fab_plate::ColourMode::Material => [owner[0], owner[1], owner[2]],
+    }
+}
+
+pub fn tile_materials(cx: &mut Cx, materials: &[fab_sdf_engine::makepad_csg_sdf::SdfMaterial], color: [f32; 4], mode: fab_plate::ColourMode) -> Texture {
+    if mode == fab_plate::ColourMode::Model {
+        return material_texture(cx, materials);
+    }
+    let mut shown = materials.to_vec();
+    for m in &mut shown {
+        m.albedo = slot_albedo(m.albedo, color, mode);
+    }
+    material_texture(cx, &shown)
+}
+
+pub fn tile_look<'a>(materials: &[fab_sdf_engine::makepad_csg_sdf::SdfMaterial], color: [f32; 4], mode: fab_plate::ColourMode, table: Option<&'a Texture>) -> TileLook<'a> {
+    match materials.first() {
+        Some(m) => TileLook { table: table.filter(|_| materials.len() > 1), albedo: slot_albedo(m.albedo, color, mode), rough: m.rough, metal: m.metal, unlit: m.unlit, emit: m.emissive_color.map(|c| c * m.emissive), matte: false, highlight: None },
+        None => TileLook { table: None, albedo: [color[0], color[1], color[2]], rough: crate::api::FILAMENT_ROUGHNESS, metal: 0.0, unlit: false, emit: [0.0; 3], matte: false, highlight: None },
     }
 }
 
@@ -436,14 +454,15 @@ impl PartView {
     /// The table of a field of several materials.
     fn sync_tile_table(&mut self, cx: &mut Cx) {
         let Some(sdf) = self.newest.as_ref().filter(|s| s.shape.materials.len() > 1) else { return };
-        if self.materials_key != Some(sdf.key) {
-            self.materials = Some(material_texture(cx, &sdf.shape.materials));
-            self.materials_key = Some(sdf.key);
+        let key = (sdf.key, self.colours, self.color);
+        if self.materials_key != Some(key) {
+            self.materials = Some(tile_materials(cx, &sdf.shape.materials, self.color, self.colours));
+            self.materials_key = Some(key);
         }
     }
 
     fn tile_look(&self) -> TileLook<'_> {
-        tile_look(self.newest.as_ref().map_or(&[][..], |s| &s.shape.materials[..]), self.color, self.materials.as_ref())
+        tile_look(self.newest.as_ref().map_or(&[][..], |s| &s.shape.materials[..]), self.color, self.colours, self.materials.as_ref())
     }
 
 }
@@ -611,6 +630,7 @@ impl SdfLayer {
                         loop_stop: None,
                         materials: None,
                         materials_key: None,
+                        colours: state.view.colours,
                         ready: false,
                         element: None,
                         color,
@@ -631,7 +651,11 @@ impl SdfLayer {
                 v.element = element;
                 changed = true;
             }
-            v.color = color;
+            if v.color != color || v.colours != state.view.colours {
+                v.color = color;
+                v.colours = state.view.colours;
+                changed = true;
+            }
             if v.sdf.key == sdf.key {
                 // A move preserves the shape.
                 v.sdf.to_printer = sdf.to_printer;
@@ -1120,6 +1144,19 @@ mod tests {
     use fab_sdf_tiles::trace::under_section;
     use makepad_csg_math::Vec3d;
 
+    #[test]
+    fn field_colours_preserve_the_native_finish() {
+        use fab_plate::ColourMode::{Material, Model};
+        use fab_sdf_engine::makepad_csg_sdf::SdfMaterial;
+        let native = SdfMaterial { albedo: [0.1, 0.2, 0.3], rough: 0.75, metal: 0.4, emissive: 2.0, ..Default::default() };
+        let owner = [0.8, 0.2, 0.7, 1.0];
+        for (mode, albedo) in [(Model, native.albedo), (Material, [0.8, 0.2, 0.7])] {
+            let look = tile_look(std::slice::from_ref(&native), owner, mode, None);
+            assert_eq!((look.albedo, look.rough, look.metal, look.emit), (albedo, native.rough, native.metal, [2.0; 3]));
+            assert_eq!(tile_look(&[], owner, mode, None).albedo, [0.8, 0.2, 0.7]);
+        }
+    }
+
     /// The field a cut leaves is the part's and the planes' true distances, whatever way a plane
     /// faces: what the rays walk and what proves emptiness stand on that. A plane past the part
     /// leaves it alone, and one with the part behind it leaves nothing.
@@ -1167,7 +1204,7 @@ mod tests {
         layer.parts.push(PartView {
             object: "body".into(), sdf, ready: true, color: [1.0; 4], element: None,
             panes: vec![PaneTiles { tiles: Some(Tiles::new()), ..Default::default() }],
-            failed: None, loop_stop: None, materials: None, materials_key: None, newest: None,
+            failed: None, loop_stop: None, materials: None, materials_key: None, colours: Default::default(), newest: None,
             tile_shape: None, cut_away: false, cut: None, tiles_shown: false, live_shape: None, live_asked: Vec::new(),
         });
         let caster = || Caster { part: 0, pane: XR_PANE, world_from_obj: Mat4f::identity(), lo: Vec3f::default(), hi: Vec3f::default() };

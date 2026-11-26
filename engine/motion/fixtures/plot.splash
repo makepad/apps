@@ -1,0 +1,30 @@
+use mod.motion.*
+Motion{size: vec2(1920, 1080) duration: 8 background: #121820
+    layers: [
+        Text{text: "A slope at every point" size: 48 color: #f2efe6 at: vec2(140, 64)}
+        Math{tex: "f(x)=x^2 \\qquad f'(x)=2x" size: 34 color: #f2efe6 at: vec2(140, 154)}
+        Plot{name: "derivative" x: [-3, 3, 1] y: [0, 9, 1]
+            at: vec2(140, 260) size: vec2(1080, 660) x_label: "x" y_label: "y"
+            label_size: 20 reveal: [0, 0.6]
+            layers: [
+                Area{f: fn(x) { x * x } from: 0 to: 2 fill: #ff7a1a22 stroke: #ff7a1a00 span: [6, 2]}
+                Riemann{name: "rectangles" f: fn(x) { x * x } from: 0 to: 2 n: 8 side: @mid
+                    fill: #3fa9f544 stroke: #3fa9f5 width: 1.5 span: [6, 2] opacity: tween(0, 1, 0, 0.4)}
+                Graph{name: "parabola" f: fn(x) { x * x } from: -2.8 to: 2.8 color: #ff7a1a width: 4
+                    trim_end: tween(0, 1, 0.6, 1.4)}
+                Tangent{name: "slope" f: fn(x) { x * x } x: tween(-2, 2, 1, 6) length: 1.8 color: #64dcbd width: 3}
+                Dot{name: "point" at: fn(t) { let x = -2 + 4 * clamp((t - 1) / 5, 0, 1) return vec2(x, x * x) }
+                    radius: 8 color: #f2efe6}
+            ]}
+        Text{text: "Level sets and flow" size: 25 color: #f2efe6 at: vec2(1390, 260)}
+        Plot{name: "plane" x: [-3, 3, 1] y: [-3, 3, 1] grid: @plane labels: false
+            at: vec2(1390, 360) size: vec2(380, 380) x_label: "x" y_label: "y"
+            layers: [
+                VectorField{f: fn(x, y) { vec2(-y, x) } step: 0.75 scale: 0.25 color: #879fb2 width: 1.5}
+                Implicit{f: fn(x, y) { x * x + y * y - 4 } cells: 100 color: #64dcbd width: 3}
+                Parametric{f: fn(s) { vec2(1.3 * cos(s), 0.7 * sin(s)) } from: 0 to: 6.283185307
+                    color: #ff7a1a width: 2 trim_end: tween(0, 1, 1, 2)}
+            ]}
+        Math{tex: "x^2+y^2=4" size: 25 color: #64dcbd at: vec2(1430, 800)}
+    ]
+}

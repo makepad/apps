@@ -32,7 +32,7 @@ use crate::AltocumulusParams;
 /// The deck's depth over its cell: the photos' cloudlets are flat, a quarter to a third as tall as wide (at 0.8 they
 /// stood as tall as wide, small heaped cumulus puffs), never under DEPTH_LEAST_M; Turrets raises the shell's top by up
 /// to TURRET_RISE of that (castellanus' towers stand several times their cell's height; at 2 they read as bumps).
-pub const DEPTH_PER_CELL: f32 = 0.3;
+pub const DEPTH_PER_CELL: f32 = 0.625;
 pub const DEPTH_LEAST_M: f32 = 60.0;
 /// How far the far deck is marched (metres along the ground, the march's range for an Altocumulus): past the
 /// footprint grid's 34 km the deck carries on at its mean, so it meets the horizon's haze instead of ending at el 6.
@@ -153,6 +153,56 @@ const COLUMN_FLOOR: f32 = 0.3;
 const CELL_OFFSET: i32 = 1 << 20;
 /// The recipe's id in the footprint grid's key (the Cumulus' is 3).
 pub const RECIPE_ID: f32 = 11.0;
+
+/// The Altocumulus as the deck (cloud_volume_deck.rs; the look runner's ac2, the owner's pick of 2026-11-05 beside his
+/// photos ph-ac3/ph-ac4): the turbulence deck at an altocumulus' numbers, small separate cloudlets in rows with blue
+/// between, gathered into fields by strong masses, no veil, no edge toward the sun. Its Base and Cell the shell and the
+/// cells (2.2 cycles a km at the default 400 m, the masses 0.25), Rows the cells drawn out along the wind, a thin extinction (0.025 /m). Turrets (the
+/// inspector's Thickness) raises the shell's top (`shell_m`: its depth times up to 1 + TURRET_RISE), so every cloudlet grows
+/// thicker; the deck raises no towers of its own. Regularity and Softness are not read by this deck (the lattice above,
+/// `lattice` and `AltocumulusRecipe`, is the older look's, kept for its tests).
+pub(crate) fn build(spec: &crate::cloud_volume_cumulus::VolumeSpec, cancelled: &dyn Fn() -> bool, run: crate::caster::RowRunner) -> Result<Option<crate::cloud_volume_cumulus::VolumeShape>, crate::volumetric::Cancelled> {
+    use crate::cloud_volume_cumulus::deck::{self, DeckKind, DeckLook};
+    let b = spec.layer.altocumulus_params();
+    let (base_m, top_m) = shell_m(&b);
+    let cell_km = b.cell_m * 1.0e-3;
+    // the masses gather the cloudlets into fields with open sky between (a real deck comes in patches, the owner
+    // 2026-11-07: ac2's weak masses, 0.15 at 12.5 km, filled the sky evenly): strong (0.6), one every ten cloudlets (4
+    // km at the default 400 m)
+    let look = DeckLook {
+        kind: DeckKind::Turbulence,
+        cells_per_km: 0.88 / cell_km,
+        mass_per_km: 0.1 / cell_km,
+        mass: 0.6,
+        cut_edge: 0.025,
+        ramp: 0.1,
+        squash: 0.5,
+        profile: 0.25,
+        base_rise: 0.12,
+        top_fall: 0.35,
+        sun_rise: 0.0,
+        sun_km: 6.0,
+        veil: 0.0,
+        veil_band: 0.07,
+        veil_per_km: 3.0,
+        veil_share: 0.6,
+        water_base: 0.2,
+        water_full: 0.6,
+        stretch: 1.0 + 2.0 * b.rows.clamp(0.0, 1.0),
+        texture: 0.6,
+        far_from_m: 12_000.0,
+        far_to_m: 35_000.0,
+        fold: 2.0,
+        erosion: 0.0,
+        inside: 0.0,
+        lift: 0.0,
+        sigma: 0.025,
+        forward_g: 0.75,
+    };
+    // the frame's cell five cloudlets wide: Cover's quantile tables measure 64 cells, and at one cloudlet a cell that
+    // square held two of the masses, so the tail a tiny Cover reads was off by half
+    deck::build(spec, look, 1.0, base_m, top_m, 5.0 * cell_km, RECIPE_ID, cancelled, run)
+}
 
 /// The Altocumulus shell (base, top), metres.
 pub fn shell_m(b: &AltocumulusParams) -> (f32, f32) {
@@ -382,10 +432,7 @@ pub fn horizon_fade(sin_el: f32) -> f32 {
 
 const HORIZON_LINE: f32 = 0.002;
 
-fn smooth(a: f32, b: f32, x: f32) -> f32 {
-    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
+use crate::patterns::smooth;
 
 /// The Altocumulus look's numbers on the GPU (the shader's `// --- Altocumulus ---` section), as the look rounds tune
 /// them: the `ac*` uniforms. `share` is the share of plane the footprint covers (the Cover solve's): the far blend's.

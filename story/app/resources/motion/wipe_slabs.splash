@@ -1,0 +1,30 @@
+use mod.motion.*
+// SLAB WIPE — a transition drawn as a graphic. An accent band leads a wide
+// ink slab across the frame on a lean; ease_in_out_cubic brings them in
+// and parks the ink over the whole frame from about 0.47 s to 0.9 s — cut
+// the footage underneath at 0.6 s — then ease_in_cubic throws them off to
+// the right, uncovering the next shot. Put it on a track above the cut,
+// starting 0.6 s before it.
+// Why: the lean and the leading colour band give direction and energy; the
+// covered hold hides the cut completely.
+Motion{
+    label: "Slab wipe"
+    brief: "A leaning accent band and ink slab sweep across, covering the cut at 0.6 s."
+    tags: ["transition", "wipe", "shape", "bold"]
+    duration: 1.2
+    inputs: {
+        lead: input(@color, #ff5c39, "Leading band")
+        slab: input(@color, #0b0d12, "The slab that covers the cut")
+        lean: input(@number, 15, "Lean in degrees")
+    }
+    layers: [
+        Group{
+            at: vec2(960, 540) rotate: in(@lean)
+            x: keys([0.0, -1150], [0.55, 1750, @ease_in_out_cubic], [0.62, 1780], [1.2, 4100, @ease_in_cubic])
+            layers: [
+                Rect{at: vec2(-600, -2000) size: vec2(600, 4000) fill: in(@lead)}
+                Rect{at: vec2(-3000, -2000) size: vec2(2400, 4000) fill: in(@slab)}
+            ]
+        }
+    ]
+}

@@ -626,8 +626,8 @@ enum Row {
 }
 
 /// A job tool's colours and the loaded spool, with the same mapping text as the colour rows.
-fn material_row(p: &PrintState, tool: usize, color: Option<[f32; 4]>, cols: [String; 3]) -> Row {
-    let pos = p.colors.tools.get(tool);
+fn material_row(mode: fab_plate::ColourMode, p: &PrintState, tool: usize, color: Option<[f32; 4]>, cols: [String; 3]) -> Row {
+    let pos = if p.monitor_holds() { None } else { p.colors.tools.get(tool) };
     let mapped: Vec<_> = p.colors.rows.iter().filter(|r| r.used && !r.unassigned() && r.pos.as_ref() == pos).collect();
     let names = mapped.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ");
     let first = mapped.first();
@@ -643,13 +643,13 @@ fn material_row(p: &PrintState, tool: usize, color: Option<[f32; 4]>, cols: [Str
         if !kind.is_empty() && kind != "?" {
             what.push(kind);
         }
-        if let Some([r, g, b, _]) = color.filter(|_| row.spool().is_some()) {
+        if let Some([r, g, b, _]) = row.spool().filter(|_| p.target_printer().is_some()) {
             what.push(format!("{} spool", colour_word([r, g, b])));
         } else {
             what.push("spool colour not reported".into());
         }
         let place = row.pos.map(|pos| pos.label(&p.colors.layout.heads)).unwrap_or_default();
-        let view = if row.spool().is_some() { "The slice shows the spool's colour; Normal shows the design colour." } else { "With no reported spool colour, the slice shows the print colour's own colour." };
+        let view = missing_spool_text(mode);
         format!("{designs} prints on tray {place}: {}. {view}", what.join(", "))
     } else {
         color.map(|[r, g, b, _]| format!("{name}: drawn in {} ({}).", colour_word([r, g, b]), hex([r, g, b]))).unwrap_or_else(|| name.clone())
@@ -657,16 +657,28 @@ fn material_row(p: &PrintState, tool: usize, color: Option<[f32; 4]>, cols: [Str
     Row::Material { color, name, detail, cols, mismatch, unassigned: false, tip }
 }
 
-fn unassigned_rows(p: &PrintState, out: &mut Vec<Row>) {
-    for row in p.colors.rows.iter().filter(|r| r.used && r.unassigned()) {
-        out.push(Row::Material { color: Some(row.shown), name: row.name.clone(), detail: "No tray: pick one".into(), cols: Default::default(), mismatch: false, unassigned: true, tip: UNASSIGNED_TIP.into() });
+fn missing_spool_text(mode: fab_plate::ColourMode) -> &'static str {
+    match mode {
+        fab_plate::ColourMode::Model => "A tool with no spool colour shows its model colour.",
+        fab_plate::ColourMode::Material => "A tool with no spool colour shows red.",
     }
 }
 
-fn spool_note(p: &PrintState, tools: impl Iterator<Item = usize>, out: &mut Vec<Row>) {
-    if tools.filter_map(|i| p.colors.tools.get(i)).any(|pos| p.colors.rows.iter().any(|r| r.used && r.pos == Some(*pos) && r.mismatch.is_some())) {
-        out.push(Row::Line("Drawn in the loaded spools' colours".into(), String::new()));
+fn unassigned_rows(mode: fab_plate::ColourMode, p: &PrintState, out: &mut Vec<Row>) {
+    for row in p.colors.rows.iter().filter(|r| r.used && r.unassigned()) {
+        let [r, g, b] = match mode {
+            fab_plate::ColourMode::Model => row.design,
+            fab_plate::ColourMode::Material => fab_plate::UNMAPPED_RGB,
+        };
+        out.push(Row::Material { color: Some([r, g, b, 1.0]), name: row.name.clone(), detail: format!("No tray · {}", missing_spool_text(mode)), cols: Default::default(), mismatch: false, unassigned: true, tip: format!("{UNASSIGNED_TIP} {}", missing_spool_text(mode)) });
     }
+}
+
+fn palette_caption(mode: fab_plate::ColourMode) -> Row {
+    Row::Line(match mode {
+        fab_plate::ColourMode::Model => "Drawn in the model colours",
+        fab_plate::ColourMode::Material => "Drawn in the loaded spools' colours",
+    }.into(), String::new())
 }
 
 fn metres(mm: f64) -> String {
@@ -688,6 +700,10 @@ fn legend_rows(s: &AppState) -> Vec<Row> {
         return out;
     }
     let Some(pv) = p.showing() else { return out };
+    // The held job has its own tool order and can predate the model palette.
+    let held = p.monitor_holds();
+    let mode = if held && pv.colours.model.is_empty() { fab_plate::ColourMode::Material } else { s.view.colours };
+    let palette = pv.colours.shown(mode);
     match p.play.color {
         ColorBy::Feature => {
             out.push(Row::Head("FEATURE".into(), "TIME      SHARE     LENGTH".into()));
@@ -714,11 +730,11 @@ fn legend_rows(s: &AppState) -> Vec<Row> {
         }
         ColorBy::Filament => {
             out.push(Row::Head("FILAMENT".into(), String::new()));
-            for (i, c) in pv.filament_colors.iter().enumerate() {
-                out.push(material_row(p, pv.job_tool(i), Some(*c), Default::default()));
+            for (i, c) in palette.iter().enumerate() {
+                out.push(material_row(mode, p, pv.job_tool(i), Some(*c), Default::default()));
             }
-            unassigned_rows(p, &mut out);
-            spool_note(p, (0..pv.filament_colors.len()).map(|i| pv.job_tool(i)), &mut out);
+            if !held { unassigned_rows(mode, p, &mut out); }
+            out.push(palette_caption(mode));
         }
         ColorBy::Mode => {
             out.push(Row::Head("MODE".into(), "TIME      LENGTH    MAX Z".into()));
@@ -762,7 +778,7 @@ fn legend_rows(s: &AppState) -> Vec<Row> {
     }
     let (mut purge_grams, mut purge_cost) = (0.0, None::<f64>);
     for u in &pv.filament_use {
-        let color = pv.filament_colors.get(u.slot).copied();
+        let color = palette.get(u.slot).copied();
         let printed = (u.grams - u.purge_grams).max(0.0);
         let share = if u.grams > 0.0 { printed / u.grams } else { 1.0 };
         let cost = cost_of(u.slot);
@@ -770,7 +786,7 @@ fn legend_rows(s: &AppState) -> Vec<Row> {
             *purge_cost.get_or_insert(0.0) += c * (1.0 - share);
         }
         purge_grams += u.purge_grams;
-        let mut row = material_row(p, pv.job_tool(u.slot), color, [format!("{printed:.1} g"), format_time(u.seconds), cost.map(|c| format!("{:.2}", c * share)).unwrap_or_default()]);
+        let mut row = material_row(mode, p, pv.job_tool(u.slot), color, [format!("{printed:.1} g"), format_time(u.seconds), cost.map(|c| format!("{:.2}", c * share)).unwrap_or_default()]);
         if let Row::Material { tip, .. } = &mut row {
             tip.push_str(&format!(" It feeds {:.1} g ({:.2} m) of filament", u.grams, u.metres));
             tip.push_str(&if u.purge_grams > 0.0 { format!(", {:.1} g of it purged at its changes.", u.purge_grams) } else { ".".into() });
@@ -785,8 +801,8 @@ fn legend_rows(s: &AppState) -> Vec<Row> {
             cols: [format!("{purge_grams:.1} g"), format_time(pv.purge_seconds), purge_cost.map(|c| format!("{c:.2}")).unwrap_or_default()],
         });
     }
-    unassigned_rows(p, &mut out);
-    spool_note(p, pv.filament_use.iter().map(|u| pv.job_tool(u.slot)), &mut out);
+    if !held && p.play.color != ColorBy::Filament { unassigned_rows(mode, p, &mut out); }
+    if !pv.filament_use.is_empty() && p.play.color != ColorBy::Filament { out.push(palette_caption(mode)); }
     // (from +0: an empty sum of floats is -0, which prints "-0.0")
     let grams = pv.filament_use.iter().fold(0.0, |a, u| a + u.grams);
     let mut total = match ahead {

@@ -120,6 +120,12 @@ pub struct FabWorkspaceTabs {
     /// it holds (a job on the strip, the code toggle) takes its room from the row.
     #[rust]
     follow: WidgetRef,
+    #[rust]
+    end: Option<f64>,
+    #[rust]
+    temp_layout: Option<(Rc<LaidoutText>, f64)>,
+    #[rust]
+    temp_icon_only: bool,
     #[live]
     draw_face: DrawColor,
     #[live]
@@ -220,6 +226,29 @@ impl FabWorkspaceTabs {
         self.follow = right;
     }
 
+    pub(super) fn trailing_start(&self, cx: &Cx, bar: Rect) -> f64 {
+        let ends = self.follow.area().rect(cx);
+        if ends.size.x > 0.0 { ends.pos.x } else { bar.pos.x + bar.size.x - self.trailing }
+    }
+
+    /// Minimum scrolling row, then the temporary tab at its natural and icon widths.
+    pub(super) fn prepare_widths(&mut self, cx: &mut Cx2d) -> (f64, f64, f64) {
+        self.temp_layout = self.temp.as_ref().map(|t| {
+            let title = self.note_layout(cx, &t.title, TEMP_TITLE_MAX);
+            let text_width = f64::from(title.size_in_lpxs.width * self.draw_cue.font_scale);
+            let width = 8.0 + TEMP_ICON + 6.0 + text_width + 8.0 + TEMP_CLOSE + 4.0;
+            (title, if self.editing == Some(t.id) { width.max(120.0) } else { width })
+        });
+        let minimum = 3.0 * PAD + if self.tabs.is_empty() { GLYPH_W } else { 2.0 * GLYPH_W + TAB_H };
+        let (temp, icon) = self.temp_layout.as_ref().map_or((0.0, 0.0), |(_, w)| (w + PAD, GLYPH_W + PAD));
+        (minimum, temp, icon)
+    }
+
+    pub(super) fn fit(&mut self, end: f64, icon_only: bool) {
+        self.end = Some(end);
+        self.temp_icon_only = icon_only;
+    }
+
     /// The row as the list has it now; a redraw only when it changed. O(tabs).
     pub fn set(&mut self, cx: &mut Cx, tabs: Vec<(WorkspaceId, String)>, current: WorkspaceId, temp: Option<TempTab>) {
         let temp_changed = self.temp != temp;
@@ -274,7 +303,7 @@ impl FabWorkspaceTabs {
         let o = self.origin(cx);
         let local = abs - o;
         if self.temp.is_some() && self.temp_rect.contains(local) {
-            return Some(if self.temp_close.contains(local) { Part::TempClose } else { Part::Temp });
+            return Some(if !self.temp_icon_only && self.temp_close.contains(local) { Part::TempClose } else { Part::Temp });
         }
         if self.more.is_some_and(|r| r.contains(local)) {
             return Some(Part::More);
@@ -370,7 +399,11 @@ impl FabWorkspaceTabs {
         };
         let (tab, close) = (self.on_screen(cx, rect), self.on_screen(cx, self.temp_close));
         cx.add_rect_area(&mut self.temp_area, tab);
-        cx.add_rect_area(&mut self.temp_close_area, close);
+        if self.temp_icon_only {
+            self.temp_close_area = Area::Empty;
+        } else {
+            cx.add_rect_area(&mut self.temp_close_area, close);
+        }
         if self.editing == Some(id) {
             self.draw_rename(cx, scope, tab);
             return;
@@ -381,9 +414,10 @@ impl FabWorkspaceTabs {
         self.face(cx, tab, vec4(ai.x, ai.y, ai.z, alpha));
         self.draw_icon.color = if by_ai { ai } else { self.ink };
         self.draw_icon.draw_abs(cx, Rect {
-            pos: tab.pos + dvec2(8.0, (TAB_H - TEMP_ICON) * 0.5),
+            pos: tab.pos + dvec2(if self.temp_icon_only { (tab.size.x - TEMP_ICON) * 0.5 } else { 8.0 }, (TAB_H - TEMP_ICON) * 0.5),
             size: dvec2(TEMP_ICON, TEMP_ICON),
         });
+        if self.temp_icon_only { return }
         let at = tab.pos + dvec2(8.0 + TEMP_ICON + 6.0, NAME_Y);
         self.draw_note(cx, at, title, if selected { self.selected_ink } else { self.ink });
         self.glyph(cx, close, "×", self.hover == Some(Part::TempClose));
@@ -398,7 +432,7 @@ impl FabWorkspaceTabs {
         };
         if room >= 24.0 {
             let color = match cue.origin {
-                EditOrigin::Ai => ai_ink(cx),
+                EditOrigin::Ai | EditOrigin::Agent => ai_ink(cx),
                 EditOrigin::Disk | EditOrigin::Elsewhere => self.color_cue,
             };
             let words = self.note_layout(cx, &cue.words(), room);
@@ -426,17 +460,10 @@ impl Widget for FabWorkspaceTabs {
             x += w + PAD;
         }
         let natural = x;
-        let temp = self.temp.as_ref().map(|t| {
-            let title = self.note_layout(cx, &t.title, TEMP_TITLE_MAX);
-            let text_width = f64::from(title.size_in_lpxs.width * self.draw_cue.font_scale);
-            let width = 8.0 + TEMP_ICON + 6.0 + text_width + 8.0 + TEMP_CLOSE + 4.0;
-            (title, if self.editing == Some(t.id) { width.max(120.0) } else { width })
-        });
+        let temp = self.temp_layout.take().map(|(title, width)| (title, if self.temp_icon_only { GLYPH_W } else { width }));
         let temp_space = temp.as_ref().map_or(0.0, |(_, width)| width + PAD);
-        // the room from here to the caption's end, less what follows the row
-        let (bar, at) = (cx.turtle().rect(), cx.turtle().pos().x);
-        let ends = self.follow.area().rect(cx);
-        let end = if ends.size.x > 0.0 { ends.pos.x } else { bar.pos.x + bar.size.x - self.trailing };
+        let at = cx.turtle().pos().x;
+        let end = self.end.unwrap_or_else(|| self.trailing_start(cx, cx.turtle().rect()));
         let share = (end - self.gap - at - temp_space).max(0.0);
         let overflow = natural + 3.0 * PAD + GLYPH_W > share;
         self.room = if overflow { (share - 3.0 * PAD - 2.0 * GLYPH_W).max(TAB_H) } else { natural };
@@ -557,11 +584,23 @@ impl Widget for FabWorkspaceTabs {
                 let over = self.part_at(cx, e.abs);
                 cx.set_cursor(if over.is_some() { MouseCursor::Hand } else { MouseCursor::Default });
                 if over != self.hover {
+                    if self.temp_icon_only {
+                        if over == Some(Part::Temp) {
+                            if let Some(temp) = &self.temp {
+                                cx.widget_action(self.uid, tip::TipAction::HoverIn(temp.title.clone(), self.temp_area.rect(cx)));
+                            }
+                        } else if self.hover == Some(Part::Temp) {
+                            cx.widget_action(self.uid, tip::TipAction::HoverOut);
+                        }
+                    }
                     self.hover = over;
                     self.area.redraw(cx);
                 }
             }
             Hit::FingerHoverOut(_) => {
+                if self.temp_icon_only && self.hover == Some(Part::Temp) {
+                    cx.widget_action(self.uid, tip::TipAction::HoverOut);
+                }
                 if self.hover.take().is_some() {
                     self.area.redraw(cx);
                 }
@@ -676,7 +715,9 @@ impl Widget for FabWorkspaceTabs {
         }
         if let Some(temp) = &self.temp {
             button(live_id!(fab_workspace_temp).0, self.on_screen(cx, self.temp_rect), format!("Temporary layout: {}", temp.title), self.current == temp.id);
-            button(live_id!(fab_workspace_temp_close).0, self.on_screen(cx, self.temp_close), "Back".into(), false);
+            if !self.temp_icon_only {
+                button(live_id!(fab_workspace_temp_close).0, self.on_screen(cx, self.temp_close), "Back".into(), false);
+            }
         }
     }
 
@@ -707,7 +748,7 @@ impl Widget for FabWorkspaceTabs {
             cx.action(WorkspaceTabAction::All(self.on_screen(cx, more)));
         } else if let (true, Some(temp)) = (key == live_id!(fab_workspace_temp).0, &self.temp) {
             cx.action(WorkspaceTabAction::Pick(temp.id));
-        } else if key == live_id!(fab_workspace_temp_close).0 && self.temp.is_some() {
+        } else if key == live_id!(fab_workspace_temp_close).0 && self.temp.is_some() && !self.temp_icon_only {
             cx.action(WorkspaceTabAction::Dismiss);
         } else if let Some((id, _)) = self.tabs.iter().find(|(id, _)| tab_key(*id) == key) {
             cx.action(WorkspaceTabAction::Pick(*id));

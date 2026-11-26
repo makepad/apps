@@ -1,0 +1,106 @@
+// mod.cut: the cut vocabulary. The node prototypes are the
+// registered providers in mod.flow.
+mod.cut = {}
+mod.cut.Clip = mod.flow.Clip
+mod.cut.Still = mod.flow.Still
+mod.cut.Title = mod.flow.Title
+mod.cut.Fx = mod.flow.Fx
+mod.cut.Transition = mod.flow.Transition
+mod.cut.Stack = mod.flow.Stack
+mod.cut.Reframe = mod.flow.Reframe
+mod.cut.AudioClip = mod.flow.AudioClip
+mod.cut.VoiceOver = mod.flow.VoiceOver
+mod.cut.Subtitles = mod.flow.Subtitles
+mod.cut.CutOutput = mod.flow.CutOutput
+mod.cut.Generate = mod.flow.Generate
+mod.cut.Graphic = mod.flow.Graphic
+mod.cut.AppView = mod.flow.AppView
+mod.cut.Camera = mod.flow.Camera
+mod.cut.Code = mod.flow.Code
+
+/** An exact library revision. */
+mod.cut.graphic = fn(path) { {ref: @graphic path: path} }
+mod.cut.asset = fn(id, rev) { {ref: @asset id: id rev: rev} }
+/** An app run script revision and the render (Video asset and revision) the cut pins. */
+mod.cut.run = fn(id, rev, render_id, render_rev) { {ref: @run id: id rev: rev render_id: render_id render: render_rev} }
+/** Another cut as a Clip's source (a compound clip): its exact revision. */
+mod.cut.cut = fn(id, rev) { {ref: @cut id: id rev: rev} }
+/** A cut point of the app run a clip plays, in seconds from the mark. */
+mod.cut.marker = fn(name, offset = 0.0) { {marker: name offset: offset} }
+/** A voiceover line: its text, when it starts (seconds or `marker()`), its pinned take and the key the take was made under. */
+mod.cut.line = fn(text, at = 0.0, take = nil, key = nil) { {line: text at: at take: take key: key} }
+/** A FLOW preset by key, for a Generate's `flow`. */
+mod.cut.preset = fn(key) { {preset: key} }
+/** A generated take a Generate pins: its Video revision, the seed and key it was made with, its length and the model. */
+mod.cut.take = fn(video, seed = 0, key = nil, seconds = nil, model = "") { {take: video seed: seed key: key seconds: seconds model: model} }
+/** `keys([t, v], [t, v, @ease], [t, v, @ease, @pin], ...)`: times from the node's span start; `@pin` marks a key placed by hand. */
+mod.cut.keys = fn() {
+    let args = scope
+    let points = []
+    for i in 0..args.vec_len() { points.push(args[i]) }
+    points
+}
+/** Musical and spoken time, counting from 0; offsets in seconds. */
+mod.cut.beat = fn(n, offset = 0.0) { {time: @beat n: n offset: offset} }
+mod.cut.bar = fn(n, beat = 0.0, offset = 0.0) { {time: @bar n: n beat: beat offset: offset} }
+mod.cut.downbeat = fn(n, offset = 0.0) { {time: @downbeat n: n offset: offset} }
+mod.cut.onset = fn(n, offset = 0.0) { {time: @onset n: n offset: offset} }
+mod.cut.section = fn(name, offset = 0.0, nth = 0) { {time: @section name: name offset: offset nth: nth} }
+mod.cut.word = fn(voice, index, offset = 0.0, nth = 0) { {time: @word voice: voice index: index offset: offset nth: nth} }
+/** A length in beats: `beats(4)`. */
+mod.cut.beats = fn(n) { {time: @beats n: n} }
+mod.cut.linear = @linear
+mod.cut.ease_in = @ease_in
+mod.cut.ease_out = @ease_out
+mod.cut.ease_in_out = @ease_in_out
+mod.cut.hold = @hold
+mod.cut.pin = @pin
+
+// The loader wraps a cut's final `Flow{...}` in this call. The header
+// fields the flow grammar has no place for (output, duration, bpm) move
+// into one CutMetadata carrier node that CutDoc::load removes again.
+// Plain Stack layers get entry ids above the Stack's authored ones, recorded
+// in the carrier's `synthetic` as [node, id] so the loader can report them.
+// The flow's own header fields pass through untouched: `tools` is an object
+// without `type_name`.
+mod.cut.finish = fn(flow) {
+    let edit = mod.flow.Flow{}
+    let metadata = mod.flow.CutMetadata{}
+    let synthetic = []
+    for name, value in flow {
+        if name == @output || name == @duration || name == @bpm {
+            metadata[name] = value
+        } else if name == @kind {
+            metadata.cut_kind = value
+            edit.kind = value
+        } else if name == @label || name == @brief || name == @trigger || name == @concurrency || name == @autostart || name == @tools || name == @ui {
+            edit[name] = value
+        } else {
+            if value.is_object() {
+                if value.type_name == "Stack" {
+                    // `conn(id, port)` entries (three fields) keep their ids.
+                    let next = 0
+                    for i, layer in value.layers {
+                        if layer.map_len() == 3 && layer.conn > next { next = layer.conn }
+                    }
+                    let layers = []
+                    for i, layer in value.layers {
+                        if layer.map_len() == 2 {
+                            next = next + 1
+                            layers.push(mod.flow.conn(next, layer))
+                            synthetic.push([name, next])
+                        } else {
+                            layers.push(layer)
+                        }
+                    }
+                    value.layers = layers
+                }
+            }
+            edit[name] = value
+        }
+    }
+    metadata.synthetic = synthetic
+    edit.__cut_metadata = metadata
+    edit
+}
+nil

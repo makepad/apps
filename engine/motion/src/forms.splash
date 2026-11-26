@@ -1,0 +1,45 @@
+// mod.forms: the animation forms a Motion document and its 3D scenes share, one implementation (mod.motion and mod.scene re-export these same functions). Their records (Tween{}, Keys{}, ...) are the prototypes in the module; both readers read a form by its prototype.
+/** A colour from its channels, `color(r, g, b)` or `color(r, g, b, a)`: what `#hex` cannot hold, linear light over 1 (HDR: `color(4.0, 1.2, 0.3)` glows under bloom). The list [r, g, b, a] every colour field takes. Name a colour with a doc comment just before it (a comment holding only `ember` before `color(4.0, 1.2, 0.3)`, or `signal` before `#ff4d12`): editors group every colour of that name (the name never reaches the running document). */
+mod.forms.color = fn(r, g, b, a = 1.0) { [r, g, b, a] }
+/** An exact library revision. */
+mod.forms.asset = fn(id, rev) { mod.forms.Asset{id: id rev: rev} }
+/** `from` at `start`, eased to `to` at `end` (seconds, or time references). */
+mod.forms.tween = fn(from, to, start, end, ease = @linear) { mod.forms.Tween{from: from to: to start: start end: end ease: ease} }
+/** `keys([t, v], [t, v, @ease], ...)`: times strictly increasing. */
+mod.forms.keys = fn() {
+    let args = scope
+    let points = []
+    for i in 0..args.vec_len() { points.push(args[i]) }
+    mod.forms.Keys{points: points}
+}
+/** `sequence([[v0, 0], [v1, dur, @ease], ...], start = 0)`: each step's value after its duration. */
+mod.forms.sequence = fn(steps, start = 0.0) { mod.forms.Sequence{steps: steps start: start} }
+/** Mix `[a, b, c]` evenly over 0..1, or `{at: [0, 0.3, 1] values: [a, b, c]}` at explicit stops. `at` must be nonempty, strictly increasing and as long as `values`. `x` and values are keyable; outside the stops the nearest value holds. For live inputs use `fn(t) { in(@name) }`; a direct `in(@name)` is a load-time constant. */
+mod.forms.blend = fn(x, stops, ease = @linear) { mod.forms.Blend{x: x stops: stops ease: ease} }
+/** A bilinear grid: `{cols: [0, 1] rows: [0, 1] values: [[a, b], [c, d]]}`. Rows follow y, columns x; both axes clamp. For pointer/live controls wrap each input in `fn(t) { in(@name) }`. */
+mod.forms.blend2 = fn(x, y, grid, ease = @linear) { mod.forms.Blend2{x: x y: y grid: grid ease: ease} }
+/** `repeat(anim, period = nil, @restart | @pingpong, count = nil)`: loops `anim` (`loop` is a Splash keyword). */
+mod.forms.repeat = fn(anim, period = nil, mode = @restart, count = nil) { mod.forms.Loop{inner: anim period: period mode: mode count: count} }
+/** A damped spring ease: stiffness `k`, damping `d`. */
+mod.forms.spring = fn(k = 170.0, d = 26.0) { mod.forms.Spring{k: k d: d} }
+/** A CSS cubic-bezier ease: `bezier(0.7, 0, 0.3, 1)` (x values 0..1, y may overshoot). */
+mod.forms.bezier = fn(x1, y1, x2, y2) { mod.forms.Bezier{x1: x1 y1: y1 x2: x2 y2: y2} }
+/** Rate shapers: each reshapes the ease `of` (a name like `@ease_out`, `spring(..)`, `bezier(..)`). `@wiggle` is the shaper over `@linear` with its defaults; over another ease or with parameters, call it: `squish(@ease_out)`. */
+/** Up the first half, back down the second: ends where it began. */
+mod.forms.there_and_back = fn(of = @linear) { mod.forms.Rate{shape: @there_and_back of: of} }
+/** Up, held at the top for `pause` of the segment (0.33), back down. */
+mod.forms.there_and_back_with_pause = fn(of = @linear, pause = nil) { mod.forms.Rate{shape: @there_and_back_with_pause of: of a: pause} }
+/** Pulls back by `pull` (-0.5) before running on to the end. */
+mod.forms.running_start = fn(of = @linear, pull = nil) { mod.forms.Rate{shape: @running_start of: of a: pull} }
+/** `count` (2) swings of a sine under a there-and-back envelope; 0 at both ends. */
+mod.forms.wiggle = fn(of = @linear, count = nil) { mod.forms.Rate{shape: @wiggle of: of a: count} }
+/** The ease runs only between `from` (0.25) and `to` (0.75) of the segment: still before, done after. */
+mod.forms.squish = fn(of = @linear, from = nil, to = nil) { mod.forms.Rate{shape: @squish of: of a: from b: to} }
+/** Gets only `proportion` (0.7) of the way. */
+mod.forms.not_quite_there = fn(of = @linear, proportion = nil) { mod.forms.Rate{shape: @not_quite_there of: of a: proportion} }
+/** Has arrived when the ease reaches `until` (0.8), then lingers. */
+mod.forms.lingering = fn(of = @linear, until = nil) { mod.forms.Rate{shape: @lingering of: of a: until} }
+/** Fast then asymptotic, halving the distance left every `half_life` (0.1) of the segment; lands exactly. */
+mod.forms.exponential_decay = fn(of = @linear, half_life = nil) { mod.forms.Rate{shape: @exponential_decay of: of a: half_life} }
+/** Two smooth steps in succession, resting at the halfway value between. */
+mod.forms.double_smooth = fn(of = @linear) { mod.forms.Rate{shape: @double_smooth of: of} }

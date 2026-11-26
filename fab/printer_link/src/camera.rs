@@ -365,6 +365,8 @@ impl<S: io::Read + io::Write> Rtsp<S> {
 /// Opens the printer's camera over TLS, checking the leaf against the printer's pin.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn open(conf_name: &str) -> Result<Rtsp<makepad_network::SocketStream>, CameraError> {
+    crate::entries::CAMERA_OPEN.enter();
+    crate::entries::RTSP_TLS.enter();
     let config = crate::secrets::PrinterConfig::load(conf_name).map_err(CameraError::Connect)?;
     let crate::secrets::Access::Code(code) = &config.access else { return Err(CameraError::Connect("this printer's camera is not supported")) };
     let pin = crate::tls::pinned_leaf(conf_name).ok_or(CameraError::Connect("the printer's certificate is not pinned yet (connect first)"))?;

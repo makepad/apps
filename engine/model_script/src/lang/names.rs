@@ -216,5 +216,6 @@ fn binds_of(syntax: &Syntax, loc: &Loc) -> (Vec<Bind>, bool) {
 
 /// Parse a program for its names.
 pub fn parse(source: &str) -> Result<Names, syntax::SyntaxError> {
+    super::count_work(0, 1);
     Ok(Names::new(syntax::parse(source)?))
 }

@@ -41,7 +41,7 @@ use crate::caster::RowRunner;
 use crate::cloud_cover::{cover_density, fingerprint, quantile_set, CoverRemap, MEASURE_SEED};
 use crate::cloud_light::{CoverSample, LightFamily};
 use crate::cloud_sheets::{wave, Streams, WindFrame};
-use crate::cloud_volume::{blue_jitter, footprint_grid_key, shared_by_key, shared_footprint_grid, FootprintGrid, GridCache, Node, SkipMargin};
+use crate::cloud_volume::{blue_jitter, footprint_grid_key, kept_by_key, rows_by, shared_by_bytes, shared_by_key, shared_footprint_grid, FootprintGrid, GridCache, Node, SkipMargin};
 use crate::cloud_volume_light::{step, RayLight, VolumeMarch, POWDER_REACH_M};
 use crate::cloud_volume_sun::{SunDepthGrid, SunGridSpec, TauUpGrid, COARSE_RADIUS_M, SUN_CELL_M};
 use crate::noise::{fbm2, hash_u32};
@@ -57,6 +57,8 @@ pub(crate) use stratus::horizon_fade as stratus_horizon_fade;
 /// The Stratocumulus' deck (design §2.2's table): its own footprint and density on this renderer.
 #[path = "cloud_volume_stratocumulus.rs"]
 mod stratocumulus;
+#[path = "cloud_volume_deck.rs"]
+pub(crate) mod deck;
 
 /// A Cumulus' extinction per metre at Density 1 (design §2.2's table): a mean free path of about 17 m.
 pub const CUMULUS_SIGMA: f32 = 0.06;
@@ -239,6 +241,30 @@ const COVER_VIEWS: usize = 512;
 const COVER_REACH_M: f32 = 12_000.0;
 const COVER_FROM_DEG: f32 = 20.0;
 const COVER_STEP_M: f32 = 40.0;
+/// The views a row of the runner takes in Cover's solve (`sky_opacity`): 64 rows of 512 views.
+const VIEWS_PER_ROW: usize = 8;
+const _: () = assert!(COVER_VIEWS % VIEWS_PER_ROW == 0);
+/// The solve's part in its key (the footprint grid's key function, its span field).
+const SOLVE_KEY_PART: f32 = 31.0;
+/// The bytes of solved shares their cache keeps, the newest ones (`SolvedShare::bytes` each: some 7000 shapes, Covers
+/// and suns).
+const SOLVE_BUDGET: usize = 256_000;
+
+/// Cover's solve for one shape and Cover (`VolumeShape::solve_share`): the footprint's share it gave.
+struct SolvedShare {
+    share: f32,
+}
+
+impl SolvedShare {
+    /// What one kept in SOLVES takes: its slot in the list and its Arc's block.
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<(u64, Arc<SolvedShare>)>() + 2 * std::mem::size_of::<usize>() + std::mem::size_of::<SolvedShare>()
+    }
+}
+
+/// The shares Cover's solve gave, oldest first (`VolumeShape::solve_share`).
+static SOLVES: GridCache<SolvedShare> = Mutex::new(Vec::new());
+
 /// In cloud, a sample with no density and no cheap density either moves on PROBE_PATHS mean free paths (at full
 /// density, over the footprint there) or the texel's footprint, whichever is longer; after EMPTY_TO_AIR of them the
 /// march is back in air. One with cheap density but none left after the detail moves SKIN_STEP of a mean free path
@@ -479,12 +505,7 @@ struct Ground {
     strength: f32,
 }
 
-/// smoothstep, local (as in the other cloud modules).
-#[inline]
-fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
-    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
+use crate::patterns::smooth as smoothstep;
 
 /// Where a march spent its steps (`VolumeShape::walk`): lattice points read in air, moves over empty pyramid cells,
 /// steps back on entering cloud, samples in cloud with no density, and samples with density (lit in a lit march).
@@ -599,9 +620,49 @@ pub struct VolumeShape {
     genus: CloudGenus,
     stratus: Option<stratus::StratusShape>,
     /// A Stratocumulus' own numbers (its density reads them instead of the Cumulus' carve).
-    sc: Option<stratocumulus::ScShape>,
+    /// A deck type's (the Stratocumulus', the Altocumulus', the Cumulus': cloud_volume_deck.rs).
+    deck: Option<deck::DeckShape>,
     /// A Nimbostratus' deck (cloud_volume_nimbostratus.rs); None for a Cumulus.
     ns: Option<NsShape>,
+}
+
+/// The Cumulus as a deck (the look runner's cu3, the owner's pick of 2026-11-05: the turbulence deck at a cumulus' numbers,
+/// fair-weather puffs a Size apart with grey undersides, no veil, no rolls, no edge toward the sun): its Base and Tops
+/// the shell, its Size the cells (0.5 cycles a km at the default 1.5 km, the masses 0.08), its Density the extinction
+/// (0.05 /m at 1). Puffiness, Flat base, Towers, Clustering, Streets, Lean and Softness are not read by this deck.
+fn build_cumulus_deck(spec: &VolumeSpec, cancelled: &dyn Fn() -> bool, run: RowRunner) -> Result<Option<VolumeShape>, Cancelled> {
+    let b = spec.layer.cumulus_params();
+    let look = deck::DeckLook {
+        kind: deck::DeckKind::Turbulence,
+        cells_per_km: 0.75 / b.size_km,
+        mass_per_km: 0.12 / b.size_km,
+        mass: 0.15,
+        cut_edge: 0.025,
+        ramp: 0.1,
+        squash: 1.0,
+        profile: 0.25,
+        base_rise: 0.12,
+        top_fall: 0.35,
+        sun_rise: 0.0,
+        sun_km: 6.0,
+        veil: 0.0,
+        veil_band: 0.07,
+        veil_per_km: 3.0,
+        veil_share: 0.6,
+        water_base: 0.2,
+        water_full: 0.6,
+        stretch: 1.0,
+        texture: 0.6,
+        far_from_m: 12_000.0,
+        far_to_m: 35_000.0,
+        fold: 2.0,
+        erosion: 0.0,
+        inside: 0.0,
+        lift: 0.0,
+        sigma: 0.05,
+        forward_g: 0.75,
+    };
+    deck::build(spec, look, b.density, b.base_m, b.tops_m, b.size_km, CUMULUS_RECIPE, cancelled, run)
 }
 
 impl VolumeShape {
@@ -614,6 +675,12 @@ impl VolumeShape {
         }
         if spec.genus == CloudGenus::Stratocumulus {
             return stratocumulus::build(spec, cancelled, run);
+        }
+        if spec.genus == CloudGenus::Altocumulus {
+            return crate::cloud_volume_altocumulus::build(spec, cancelled, run);
+        }
+        if spec.genus == CloudGenus::Cumulus {
+            return build_cumulus_deck(spec, cancelled, run);
         }
         if spec.genus == CloudGenus::Stratus {
             return Self::build_stratus(spec, cancelled, run);
@@ -715,7 +782,7 @@ impl VolumeShape {
             key,
             genus: spec.genus,
             stratus: None,
-            sc: None,
+            deck: None,
             ns: None,
         };
         // Cover (design §3): the footprint's share c / k, k what the upper sky's views hide per unit of footprint share,
@@ -727,7 +794,7 @@ impl VolumeShape {
         // the Cover's own threshold a point's density fell as Cover rose, where a cloud's balls changed scale).
         let at = shape.rise_threshold;
         shape.levels = (0..=LEVEL_ROWS).map(|row| level_at(row as f32 / LEVEL_ROWS as f32, at)).collect();
-        shape.solve_share(c, &set, &n);
+        shape.solve_share(c, &set, &n, cancelled, run)?;
         // The solve reads the views with detail, so Puffiness (and any row the views see) moves the threshold the
         // extinction reads: the light grids' key carries what the solve gave, not the rows that led to it.
         shape.key = footprint_grid_key(&[bits(key as u32), bits((key >> 32) as u32), shape.threshold, shape.share, shape.gated as u32 as f32], stream, TOP_COLS, base_sharpness);
@@ -738,15 +805,29 @@ impl VolumeShape {
     /// the footprint's share from 0 at 0 (steeply: a cloud's middle is taller than its edge), so a secant between a
     /// share that hides too little and one that hides too much, from c and the share c / k its first view gives, up to
     /// SOLVE_PASSES views; the share that came nearest is kept. The views are the same at every Cover, so the share
-    /// follows Cover smoothly.
-    fn solve_share(&mut self, c: f32, set: &Arc<crate::cloud_cover::QuantileSet>, n: &dyn Fn(u32, f32, f32) -> f32) {
+    /// follows Cover smoothly. The share solved is kept process-wide (SOLVES) under the key of all the solve reads: the
+    /// shape's key before it (every field its density reads but Cover, its stream and a deck's sun among them), Cover
+    /// and the type, so a bake of the same clouds (a drag of a light row, the Intensity, the haze) solves nothing. A
+    /// solve's views are spread by `run` (`cancelled` polled) and summed in their order. Err(Cancelled) leaves the shape
+    /// half solved and keeps nothing.
+    fn solve_share(&mut self, c: f32, set: &Arc<crate::cloud_cover::QuantileSet>, n: &dyn Fn(u32, f32, f32) -> f32, cancelled: &dyn Fn() -> bool, run: RowRunner) -> Result<(), Cancelled> {
         let c = c.min(1.0);
+        let bits = f32::from_bits;
+        let key = footprint_grid_key(&[bits(self.key as u32), bits((self.key >> 32) as u32), c, bits(self.genus as u32)], self.stream, COVER_VIEWS, SOLVE_KEY_PART);
+        if let Some(solved) = kept_by_key(&SOLVES, key) {
+            self.set_share(solved.share, set, n);
+            self.k = if solved.share > 0.0 { c / solved.share } else { 1.0 };
+            return Ok(());
+        }
+        let start = std::time::Instant::now();
         let (mut low, mut high) = ((0.0f32, 0.0f32), (1.0f32, 1.0f32));
         let mut best = (f32::INFINITY, c);
         let mut share = c;
+        let mut passes = 0usize;
         for _ in 0..SOLVE_PASSES {
             self.set_share(share, set, n);
-            let hidden = self.sky_opacity();
+            let hidden = self.sky_opacity(cancelled, run)?;
+            passes += 1;
             if (hidden - c).abs() < best.0 {
                 best = ((hidden - c).abs(), share);
             }
@@ -765,6 +846,10 @@ impl VolumeShape {
         }
         self.set_share(best.1, set, n);
         self.k = if best.1 > 0.0 { c / best.1 } else { 1.0 };
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        let genus = self.genus;
+        shared_by_bytes(&SOLVES, key, &|| Ok(SolvedShare { share: best.1 }), "cover solve", &|solved, _| format!("of {genus:?} at Cover {c}: share {} in {ms:.0} ms ({passes} x {COVER_VIEWS} views)", solved.share), SOLVE_BUDGET, SolvedShare::bytes)?;
+        Ok(())
     }
 
     /// Solves the footprint's threshold for the share `share` of the plane.
@@ -779,11 +864,13 @@ impl VolumeShape {
     /// share), counted softly (smoothstep from 0.3 to 0.7 of each view's opacity) so it is continuous in Cover: from
     /// points within COVER_REACH_M of the viewer, along directions spread over the solid angle above COVER_FROM_DEG,
     /// each integrated through the shell (flat: the curvature is nothing this high) in steps of about COVER_STEP_M,
-    /// with detail, at the footprint grid's finest level. The views are the same at every Cover.
-    fn sky_opacity(&self) -> f32 {
+    /// with detail, at the footprint grid's finest level. The views are the same at every Cover. They are spread by `run`
+    /// (VIEWS_PER_ROW a row, `cancelled` polled) and summed in their order after, so the share is the one a loop over
+    /// them gives, bit for bit, whatever the runner.
+    fn sky_opacity(&self, cancelled: &dyn Fn() -> bool, run: RowRunner) -> Result<f32, Cancelled> {
         let low = COVER_FROM_DEG.to_radians().sin();
-        let mut sum = 0.0f32;
-        for i in 0..COVER_VIEWS as u32 {
+        // A view's soft count.
+        let view = |i: u32| -> f32 {
             let unit = |salt: u32| (hash_u32(hash_u32(i ^ 0x2f6b_8a1d) ^ salt) >> 8) as f32 * (1.0 / 16_777_216.0);
             let (x, z) = ((2.0 * unit(1) - 1.0) * COVER_REACH_M, (2.0 * unit(2) - 1.0) * COVER_REACH_M);
             let y = low + (1.0 - low) * unit(3);
@@ -815,9 +902,14 @@ impl VolumeShape {
                 }
             }
             // A soft count of the views over half opaque (what Cover counts), continuous in the opacity.
-            sum += smoothstep(0.3, 0.7, 1.0 - (-tau).exp());
+            smoothstep(0.3, 0.7, 1.0 - (-tau).exp())
+        };
+        let rows = rows_by(COVER_VIEWS / VIEWS_PER_ROW, cancelled, run, &|row| (row * VIEWS_PER_ROW..(row + 1) * VIEWS_PER_ROW).map(|i| view(i as u32)).collect())?;
+        let mut sum = 0.0f32;
+        for counted in rows.iter().flatten() {
+            sum += counted;
         }
-        sum / COVER_VIEWS as f32
+        Ok(sum / COVER_VIEWS as f32)
     }
 
     /// What the footprint grid gives under a point at `h01` ([`Ground`]), read at the mip level of `footprint_m`,
@@ -900,8 +992,8 @@ impl VolumeShape {
         if let Some(ns) = &self.ns {
             return self.ns_cheap(ns, p, footprint_m);
         }
-        if let Some(sc) = &self.sc {
-            return sc.cheap(self, p, footprint_m);
+        if let Some(deck) = &self.deck {
+            return deck.cheap(self, p, footprint_m);
         }
         if let Some(st) = &self.stratus {
             return self.stratus_cheap(st, p, footprint_m);
@@ -975,8 +1067,8 @@ impl VolumeShape {
     /// steps read (design §12.1 item 5). 0 outside the shell.
     #[inline]
     pub fn extinction(&self, p: Vec3f) -> f32 {
-        if let Some(sc) = &self.sc {
-            return sc.sun_field(self, p) * self.sigma;
+        if let Some(deck) = &self.deck {
+            return deck.sun_field(self, p) * self.sigma;
         }
         self.cheap(p, 0.0).sun * self.sigma
     }
@@ -1275,6 +1367,11 @@ impl VolumeShape {
         (self.base_m, self.top_m)
     }
 
+    /// The footprint's solved threshold: for a deck, the cut on its field (the look runner's cut, in its units).
+    pub fn threshold(&self) -> f32 {
+        self.threshold
+    }
+
     /// The footprint's solved share of the plane (c / k) and k (design §3).
     pub fn cover_share(&self) -> (f32, f32) {
         (self.share, self.k)
@@ -1299,14 +1396,20 @@ impl VolumeShape {
         (self.key, self.cover, self.stream)
     }
 
+    /// Whether it is drawn as the deck (cloud_volume_deck.rs: its grid bounds its field, its recipe has no strength).
+    #[cfg(test)]
+    pub(crate) fn is_deck(&self) -> bool {
+        self.deck.is_some()
+    }
+
     /// Its footprint recipe at a ground point (metres east and south), not through the grid: (noise, column, the
     /// domain warp east and south in metres, and its cloud's strength).
     pub fn footprint_recipe(&self, x_m: f32, z_m: f32) -> Node {
         if self.ns.is_some() {
             return nimbostratus::recipe_m(&self.frame, &self.streams, self.cell_m, x_m, z_m);
         }
-        if let Some(sc) = &self.sc {
-            return sc.recipe_m(self, x_m, z_m);
+        if let Some(deck) = &self.deck {
+            return deck.at(self.frame.of(vec2f(x_m / self.cell_m, z_m / self.cell_m)), self.cell_m, self.thickness);
         }
         if let Some(st) = &self.stratus {
             return st.recipe_m(&self.frame, &self.streams, self.cell_m, x_m, z_m);
@@ -1322,6 +1425,10 @@ impl VolumeShape {
     /// The footprint after the cover remap at a ground point (metres east and south), from its recipe, not through the
     /// grid (so anywhere on the plane): where it is above 0 a column holds cloud (design §3.1's share of the plane).
     pub fn footprint_at(&self, x_m: f32, z_m: f32) -> f32 {
+        // a deck's grid only bounds its field: its footprint is its column's own cloud
+        if let Some(deck) = &self.deck {
+            return deck.footprint(self, x_m, z_m);
+        }
         let q = vec2f(x_m, z_m);
         let n = self.footprint_recipe(x_m, z_m)[0];
         if !(n > self.threshold) {
@@ -1442,10 +1549,10 @@ impl VolumeShape {
             key,
             genus: spec.genus,
             stratus: None,
-            sc: None,
+            deck: None,
             ns: Some(ns),
         };
-        shape.solve_share(c, &set, &n);
+        shape.solve_share(c, &set, &n, cancelled, run)?;
         shape.key = footprint_grid_key(&[bits(key as u32), bits((key >> 32) as u32), shape.threshold, shape.share, shape.gated as u32 as f32], stream, TOP_COLS, NS_KEY_PART);
         Ok(Some(shape))
     }
@@ -1609,9 +1716,10 @@ impl CloudVolume {
         let l = self.sun.light_dir();
         // A deck's light is the slab family's (its base lit by the sun that diffuses through it, design §2.3), through the
         // column over each point (a broken deck: `RayLight::diffuse_through_column`); a heap's the heap family's.
-        let light = match self.shape.sc {
-            Some(_) => RayLight { diffuse_through_column: true, ..RayLight::new(d.dot(l), l.y, self.lining, LightFamily::Slab) },
-            None => RayLight::new(d.dot(l), l.y, self.lining, LightFamily::Heap),
+        // (a Cumulus is a heap however its density is drawn: its sunlit faces bright, its far faces dark)
+        let light = match self.shape.deck {
+            Some(_) if self.shape.genus != CloudGenus::Cumulus => RayLight { diffuse_through_column: true, ..RayLight::new(d.dot(l), l.y, self.lining, LightFamily::Slab) },
+            _ => RayLight::new(d.dot(l), l.y, self.lining, LightFamily::Heap),
         }
         .seen_from(d.y);
         let shape = &self.shape;
@@ -1891,8 +1999,8 @@ impl CloudVolume {
         if let VolumeRecipe::Altocumulus(recipe) = &s.recipe {
             crate::cloud_volume_altocumulus::gpu_layout(&mut out, recipe, &s.streams, s.share);
         }
-        if let Some(sc) = &s.sc {
-            sc.gpu_layout(s, self.sun.light_dir().y, &mut out);
+        if let Some(deck) = &s.deck {
+            deck.gpu_layout(s, self.sun.light_dir().y, &mut out);
         }
         if let Some(ns) = &s.ns {
             ns.gpu_layout(&mut out, s.cover, s.threshold);
@@ -2176,7 +2284,9 @@ mod tests {
         let median = ratios[ratios.len() / 2];
         println!("proportions at the defaults: {} clouds, width over height {:.2} (median), {:.2} to {:.2} (quartiles)", ratios.len(), median, ratios[ratios.len() / 4], ratios[3 * ratios.len() / 4]);
         assert!(ratios.len() >= 10, "{} clouds", ratios.len());
-        assert!((1.2..=2.0).contains(&median), "a Cumulus at its defaults is {median} times as wide as tall");
+        // (0.8 to 1.2 since the owner kept the look runner's cu3, 2026-11-05: its puffs stand about as wide as tall,
+        // 0.93 at the defaults; the old Cumulus' heaps were 1.2 to 2)
+        assert!((0.8..=1.2).contains(&median), "a Cumulus at its defaults is {median} times as wide as tall");
     }
 
     /// The light the light pass gives `layer` under the sun `elevation` up at azimuth 200 (its sun, dome and ground; the
@@ -2265,7 +2375,9 @@ mod tests {
         assert!(n >= 50, "{n} crossings");
         let ratio = ratios[n / 2];
         println!("base-to-top over {n} crossings: {ratio:.3} (median; quartiles {:.3} to {:.3}); the reference's 0.70", ratios[n / 4], ratios[3 * n / 4]);
-        assert!((0.49..=0.91).contains(&ratio), "a Cumulus' base shows {ratio} of its top (the reference's 0.70, held within 30 %)");
+        // (up to 0.97 since the owner kept the look runner's cu3, 2026-11-05: its soft puffs have no flat dark base, 0.92;
+        // the reference's 0.70 was held within 30 %)
+        assert!((0.49..=0.97).contains(&ratio), "a Cumulus' base shows {ratio} of its top (the reference's 0.70; cu3's 0.92)");
         // A Stratocumulus' row (plan): its underside is darker than its edges lit through its gaps. The sun 30 degrees
         // up, the deck (Cover 0.7) seen from the ground 50 to 85 degrees up, every 2 degrees of azimuth, 0.05 degrees a
         // row; each crossing of the deck at least 2 degrees long between two gaps: its edges (the two rows beside either
@@ -2378,7 +2490,9 @@ mod tests {
         }
         let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len().max(1) as f32;
         println!("the sun on the sunward halves against the far halves: {:.2}; looking toward the sun {:.3} ({} texels), away {:.3} ({} texels): {:.2}", near / far, mean(&toward), toward.len(), mean(&away), away.len(), mean(&toward) / mean(&away));
-        assert!(far > 0.0 && near >= 1.3 * far, "the sunward halves get {near}, the far halves {far}");
+        // (1.15 since the owner kept the look runner's cu3, 2026-11-05: its puffs are thinner and lit through more evenly,
+        // 1.25; the old Cumulus' heaps 1.3)
+        assert!(far > 0.0 && near >= 1.15 * far, "the sunward halves get {near}, the far halves {far}");
     }
 
     /// Design §12.4: the march that crosses empty pyramid cells in one move sees what the plain march sees: its opacity
@@ -2386,8 +2500,9 @@ mod tests {
     /// reads fewer lattice points. Grown with: `cover_toward` is the lit march's alpha bit for bit (300 rays).
     #[test]
     fn the_skipped_march_equals_the_plain_march() {
-        let layer = cumulus(0.35, 41);
-        let shape = VolumeShape::build(&spec(&layer, 0.35, 30.0), &|| false, &four_threads).unwrap().unwrap();
+        // (Cover 0.2: the Cumulus deck fills most of the coarse pyramid cells at 0.35, so the skip found none to cross)
+        let layer = cumulus(0.2, 41);
+        let shape = VolumeShape::build(&spec(&layer, 0.2, 30.0), &|| false, &four_threads).unwrap().unwrap();
         let (mut worst, mut equal) = (0.0f32, 0usize);
         let (mut skipped, mut plain) = (WalkCounts::default(), WalkCounts::default());
         for k in 0..1000 {
@@ -2414,7 +2529,7 @@ mod tests {
         // each record seen through the ones in front of it): the transmittances multiply to the uncut one's and the
         // light sums to it within 1e-5, and the records past the one the ray stopped in stay clear. The uncut march's
         // alpha is `cover_toward`'s bit for bit.
-        let volume = CloudVolume::build(&spec(&layer, 0.35, 30.0), false, &|| false, &four_threads).unwrap().unwrap();
+        let volume = CloudVolume::build(&spec(&layer, 0.2, 30.0), false, &|| false, &four_threads).unwrap().unwrap();
         let (base, top) = shape.shell_m();
         let cuts = [base + 0.3 * (top - base), base + 0.6 * (top - base)];
         let (mut cut_worst, mut stopped_early) = (0.0f32, 0usize);
@@ -2445,11 +2560,12 @@ mod tests {
         }
         println!("cut in three: off the uncut march by {cut_worst:e} at most; {stopped_early} rays stopped before the last record");
         assert!(cut_worst <= 1.0e-5, "a cut march is off the uncut one by {cut_worst}");
-        // A Puffiness drag moves the solved threshold the extinction reads, so the light grids' key moves with it.
-        let mut puffier = layer.clone();
+        // A Density drag moves the solved threshold the extinction reads (the Cover views see a denser deck), so the
+        // light grids' key moves with it. (Puffiness until the Cumulus became the deck, which does not read it.)
+        let mut denser = layer.clone();
         let block = layer.cumulus_params();
-        puffier.cumulus = Some(crate::CumulusParams { puffiness: if block.puffiness > 0.5 { block.puffiness - 0.4 } else { block.puffiness + 0.4 }, ..block });
-        let other = VolumeShape::build(&spec(&puffier, 0.35, 30.0), &|| false, &four_threads).unwrap().unwrap();
-        assert!(other.threshold != shape.threshold && other.light_key().0 != shape.light_key().0, "a Puffiness drag keeps the light grids' key");
+        denser.cumulus = Some(crate::CumulusParams { density: block.density * 1.5, ..block });
+        let other = VolumeShape::build(&spec(&denser, 0.2, 30.0), &|| false, &four_threads).unwrap().unwrap();
+        assert!(other.threshold != shape.threshold && other.light_key().0 != shape.light_key().0, "a Density drag keeps the light grids' key");
     }
 }

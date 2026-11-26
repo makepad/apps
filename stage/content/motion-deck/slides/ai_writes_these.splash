@@ -1,0 +1,65 @@
+use mod.motion.*
+
+// AI writes these. Three documents a local 27B model wrote from a one-sentence brief each (the
+// brief is under its panel), placed here exactly as written (ai/local_model_examples.splash) and
+// replayed in their own time: copies of each start back to back from LOOP_FROM, so the deck's
+// play: [2, 14] loop (12 s, a multiple of 4, 3 and 2 s) is seamless.
+let look = import("shared/motion_deck_look")
+let ex = import("ai/local_model_examples")
+
+let LOOP_FROM = 2.0
+let LOOP_TO = 14.0
+let PANEL_W = 520.0
+let PANEL_Y = 340.0
+let PANELS = [
+    {x: 136.0 example: ex.ranges label: "text ranges"},
+    {x: 700.0 example: ex.bones label: "bones, two-bone IK"},
+    {x: 1264.0 example: ex.glow label: "feather_side: @outer"}
+]
+let enter = fn(at) { return tween(0, 1, at, at + 1.2, @ease_in_out_cubic) }
+
+let panel_layers = fn(p, i) {
+    let e = p.example
+    let k = PANEL_W / e.size.x
+    let h = e.size.y * k
+    let list = [Rect{name: "panel " + p.label at: vec2(p.x, PANEL_Y) size: vec2(PANEL_W, h) radius: 10 fill: e.background
+        opacity: enter(0.6 + 0.1 * i)}]
+    // The document, replayed back to back on its own clock, clipped to its frame.
+    var start = LOOP_FROM
+    while start < LOOP_TO - 0.001 {
+        list.push(Group{name: "run " + p.label + " " + fixed(start, 1) at: vec2(p.x, PANEL_Y) size: e.size scale: k anchor: vec2(0, 0)
+            span: [start, e.duration] mask: Rect{size: e.size radius: 10 / k fill: #fff} layers: e.layers})
+        start = start + e.duration
+    }
+    list.push(Text{name: "brief " + p.label text: e.brief font: look.TEXT size: 17 color: look.ASH wrap: PANEL_W line_height: 1.3
+        at: vec2(p.x, PANEL_Y + h + 70) opacity: enter(1.0 + 0.1 * i)})
+    return list
+}
+
+let build_layers = fn() {
+    let layers = [Draw2D{name: "ground" size: vec2(1920, 1080) draw: fn(c, t, edit) { look.ground(c, t, live()) }}]
+    for i in 0..PANELS.len() {
+        for l in panel_layers(PANELS[i], i) { layers.push(l) }
+    }
+    layers.push(Draw2D{name: "chrome" size: vec2(1920, 1080) draw: fn(c, t, edit) {
+        look.folio(c, t, "15", "AI writes these")
+        look.heading(c, t, "AI writes these.", "A 27B model on our own network wrote each one from a single sentence. Shown here as written.")
+        for i in 0..PANELS.len() {
+            look.label(c, t, 0.8 + 0.1 * i, PANELS[i].label, PANELS[i].x, PANEL_Y - 18, {font: look.MONO px: 20 color: look.COOL})
+            look.label(c, t, 0.9 + 0.1 * i, "the brief", PANELS[i].x, PANEL_Y + PANEL_W * PANELS[i].example.size.y / PANELS[i].example.size.x + 46, {px: 20})
+        }
+        look.syntax(c, t, 2.0, "brief  ->  Splash  ->  inspect  ->  frame")
+    }})
+    return layers
+}
+
+Motion{
+    label: "AI writes these"
+    size: vec2(1920, 1080)
+    duration: LOOP_TO
+    fps: 60
+    color: @hdr
+    background: look.INK
+    layers: build_layers()
+    post: look.post_chain(look.POST)
+}

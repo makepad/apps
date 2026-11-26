@@ -1,0 +1,12 @@
+use mod.motion.*
+Motion{size: vec2(640, 480) duration: 2.0 fps: 20 layers: [
+    Math{name: "formula" tex: "x^2 + y^2" size: 36 at: vec2(80, 60)}
+    Path{name: "through formula" svg: "M 60 85 L 400 85" stroke: #fff width: 3}
+    Draw2D{name: "stem" size: vec2(640, 480) draw: fn(c, t, edit) {
+        c.seg_rgb(120, 40, 120, 140, 4, 1, 1, 1, 1)
+        c.seg_rgb(500, 300, 600, 300, 4, 1, 1, 1, 1)
+        c.text("label", 480, 420, {px: 32})
+    }}
+    Text{name: "beside label" text: "abc" size: 24 at: vec2(560, 380)}
+    Path{name: "under label" svg: "M 470 410 L 620 410" stroke: #fff width: 3}
+]}

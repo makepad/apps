@@ -1,0 +1,53 @@
+use mod.motion.*
+// STEP COUNTER, 9:16 — the portrait cut of demo_step_counter: the card is
+// the width of the safe column and sits at its top. Original notes follow.
+// STEP COUNTER — "where are we in the walkthrough". A compact card: the
+// previous step number rolls up and out while the new one rolls in from
+// below (both masked, same ease, so the swap is one motion), the progress
+// track fills from the previous step to this one, and the step title
+// slides in. Reuse it per step: set `step`. Transparent overlay, top left
+// inside title safe.
+// Why: the roll shows progress as movement forward; the track shows how
+// much is left, which is what a viewer of a tutorial wants to know.
+Motion{
+    label: "Step counter 9:16"
+    brief: "A card that rolls the step number forward, fills a progress track and names the step; portrait."
+    tags: ["demo", "overlay", "steps", "tutorial", "progress", "product", "9:16"]
+    size: vec2(1080, 1920) duration: 4.0
+    inputs: {
+        step: input(@number, 2, "This step, from 1")
+        total: input(@number, 4, "Number of steps")
+        title: input(@text, "Connect your calendar", "What this step does")
+        accent: input(@color, #ff5c39, "Number and track")
+        ink: input(@color, #f4f7fa, "Title")
+        muted: input(@color, #8e9aa7, "STEP label and total")
+        card: input(@color, #0b0d12e6, "Card fill")
+    }
+    layers: [
+        Group{
+            at: vec2(100, 290)
+            x: keys([0.0, -40], [0.6, 0, @ease_out_expo], [3.6, 0], [4.0, -40, @ease_in_cubic])
+            opacity: keys([0.0, 0], [0.3, 1, @ease_out_cubic], [3.6, 1], [3.95, 0, @ease_in_cubic])
+            layers: [
+                Rect{size: vec2(840, 168) radius: 24 fill: in(@card) stroke: #ffffff1a width: 2}
+                Text{text: "STEP" font: Font{family: "Inter" weight: 700} size: 22 tracking: 0.2 color: in(@muted) at: vec2(36, 28)}
+                // the number: old rolls up and out, new rolls in, inside a one-row mask
+                Group{
+                    mask: Rect{at: vec2(30, 60) size: vec2(110, 84)}
+                    layers: [
+                        Text{text: "0" + (in(@step) - 1) font: Font{family: "Inter" weight: 800} size: 72 tracking: -0.03 color: in(@ink)
+                             at: vec2(34, 58) y: tween(0, -90, 0.5, 0.95, @ease_in_out_cubic)}
+                        Text{text: "0" + in(@step) font: Font{family: "Inter" weight: 800} size: 72 tracking: -0.03 color: in(@accent)
+                             at: vec2(34, 58) y: tween(90, 0, 0.5, 0.95, @ease_in_out_cubic)}
+                    ]
+                }
+                Text{text: "/ 0" + in(@total) font: Font{family: "Inter" weight: 600} size: 32 color: in(@muted) at: vec2(146, 92)}
+                Text{text: in(@title) font: Font{family: "Inter" weight: 600} size: 40 color: in(@ink) at: vec2(250, 40)
+                     x: tween(24, 0, 0.8, 1.5, @ease_out_quint) opacity: tween(0, 1, 0.8, 1.2, @ease_out_cubic)}
+                Rect{at: vec2(250, 116) size: vec2(550, 8) radius: 4 fill: #ffffff1a}
+                Rect{at: vec2(250, 116) radius: 4 fill: in(@accent)
+                     size: tween(vec2((in(@step) - 1) / in(@total) * 550, 8), vec2(in(@step) / in(@total) * 550, 8), 0.6, 1.3, @ease_in_out_cubic)}
+            ]
+        }
+    ]
+}

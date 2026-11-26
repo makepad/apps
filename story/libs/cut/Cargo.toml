@@ -1,0 +1,22 @@
+# Stage's edit model: the `mod.cut` node set, typed edit documents, their
+# evaluation as plans of time, and the reframing solver. Pure logic.
+[package]
+name = "makepad-story-cut"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+relax-attr = { path = "../../../../../libs/relax/attr" }
+makepad-script = { path = "../../../../../platform/script" }
+makepad-flow = { path = "../../../../../libs/flow", default-features = false, features = ["runtime"] }
+# Canonical asset and revision id spellings, for exact references.
+makepad-asset-data = { path = "../../../../apps/engine/asset/data" }
+# Motion documents (Graphic nodes, the built-in title) and musical time;
+# the pure core only.
+makepad-motion = { path = "../../../../apps/engine/motion", default-features = false }
+# The mix (`mix`): decoded clips, and the one loudness meter.
+makepad-stage-audio-media = { path = "../../../../apps/engine/audio_media" }
+makepad-audio-dsp = { path = "../../../../../libs/audio_dsp" }
+

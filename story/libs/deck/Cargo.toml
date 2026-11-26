@@ -1,0 +1,27 @@
+# Stage's DECK model: a deck is a Splash document of slides, each
+# a looping cut with its own transitions, live apps and demo steps. Pure
+# logic like the cut crate: loading, checking, loop clocks. No GPU, no UI.
+[package]
+name = "makepad-story-deck"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+makepad-app-registry = { path = "../../../../../libs/app_registry" }
+makepad-script = { path = "../../../../../platform/script" }
+makepad-flow = { path = "../../../../../libs/flow", default-features = false, features = ["runtime"] }
+makepad-story-cut = { path = "../cut" }
+# The sketch layout is a Motion document, loaded when a sketch slide loads.
+makepad-motion = { path = "../../../../apps/engine/motion", default-features = false }
+# The script value reader and the `@a.b` path ids, shared with app runs.
+makepad-story-app-run = { path = "../app_run", default-features = false }
+
+makepad-asset-data = { path = "../../../../apps/engine/asset/data" }
+
+[dev-dependencies]
+# The fonts at their place in the source tree: the sketch layout measures its words.
+# scene3d: the makepad deck's opening slide draws its sparks as a Kernel{}, which a
+# document compiles only with Scene3D's kernel runtime (Stage builds Motion with it).
+makepad-motion = { path = "../../../../apps/engine/motion", default-features = false, features = ["dev-roots", "scene3d"] }

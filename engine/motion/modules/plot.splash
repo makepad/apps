@@ -1,0 +1,199 @@
+use mod.motion.*
+// Pen-plot scenes as a build program: a construction drawing, its notes, a lyric column and a camera
+// path, each placed by one call with one record of named fields, timed on the music. The calls run once,
+// at load, and collect what they place; the document's Draw2D layers draw the collection every frame.
+// The convention (stage-motion plot.md): times are anchors plus a literal, points are pt(x, y) in the
+// sheet's units (y up), paths are shape calls (the paths module), looks are names.
+//
+//   use mod.motion.modules.paths.*
+//   use mod.motion.modules.plot.*
+//   /// The pen strikes on the first downbeat.
+//   let IGNITION = beat(0)
+//   stroke({path: segment(pt(0, 0), pt(15, 0)) at: IGNITION dur: 0.55 kind: @axis ease: @ease_out_expo group: @axes})
+//   note({text: "x" pos: pt(14.55, 0.16) at: IGNITION + 0.4 em: 0.2 group: @axes})
+//   dimension({from: pt(-2, 1.3) to: pt(2, 1.3) label: "4.00" at: beat(2) + 0.14 group: @dims})
+//   plot_text({text: "r = 0.08" pos: pt(3.3, 1.3) em: 0.155 at: beat(9) until: beat(9) + 0.24 group: @eye})
+//   lyric_row({words: [W.I, W.see] pos: pt(4.3, 5.3) em: 0.87 group: @l1})
+//   camera_key({at: beat(4) look: pt(3.2, 1.62) zoom: 112 roll: 0.02 ease: @ease_out_expo})
+//   // then: plot_strokes(), plot_notes(), plot_lyrics(), plot_camera() — what the program placed
+//
+// stroke({path at dur|until kind pen ease alpha width dash group color}): a line laid down from `at` to
+//   `at + dur` (or `until`), drawn on along its length with `ease`. Returns its record
+//   {pts L tot t0 t1 kind pen ease alpha width dash group tD index}: `tD` is when the head reaches each
+//   point (the ease inverted), `L` the lengths along it (single precision, as the drawing is timed).
+//   `color` overrides the colour the document gives its kind.
+//   kind: @axis @cons (construction) @prim (the drawing) @dim @hatch @plot (pen lines and lettering)
+//   @eye @ghost (a pen move, not drawn) @ring (a shockwave). `pen`: the pen draws it (the spark rides it).
+// waypoint({pos at hold}): the pen is at `pos` at `at` (it travels there before), and stays `hold` s.
+// note({text pos at em col a align dur group max_px hot}): mono type at `pos` (`em` in sheet units),
+//   typed on from `at` over `dur` (default by its length). col: a colour (nil: the document's note colour); align: @left @center
+//   @right; `max_px` fades it out when the camera makes it larger; `hot` how long it glows once typed.
+// dimension({from to label at group em color col width}): an engineering dimension: the line,
+//   arrowheads, extension ticks (`color`, `width`), the label centred, beside it when vertical (`col`).
+// plot_text({text pos em at until group font width color}): lettering the pen writes stroke by stroke at
+//   an even speed, in a single-stroke font (EMS Tech, kerned where a pair leaves a hole); `pos` its baseline
+//   start, `width` the pen's line (1.4).
+// lyric_row({words pos em group lead_in}): sung words ({text start end syl}) set left to right in the
+//   lyric face from `pos` (baseline start); each anticipates its start by `lead_in` (0.3 s).
+// camera_key({at look zoom roll ease}): at `at` the camera looks at `look` with `zoom` px per unit,
+//   rolled `roll` radians; `ease` shapes the move from the key before (@ease_in_out_cubic).
+// fit_em(text, width, max_em): the em that sets `text` exactly `width` wide, at most `max_em`.
+// glyph_box(row_word, i): the sheet box of glyph i of a set word, from the font's outline.
+
+use mod.motion.modules.paths.*
+
+// the length of one of the scene's units in the document's (virtual pixels): plot_units(64) for a
+// sheet drawn in units 64 px apart; the calls' own small lengths (a dimension's arrowheads, a
+// waypoint's nudge) scale with it
+let PLOT_UNIT = [1.0]
+let plot_units = fn(u) { PLOT_UNIT[0] = u }
+let PLOT_STROKES = []
+let PLOT_NOTES = []
+let PLOT_LYRICS = []
+let PLOT_CAMERA = []
+
+let stroke = fn(s) {
+    let pts = s.path
+    let t0 = s.at
+    let dur = s.dur ?? -1.0
+    let t1 = if dur >= 0.0 { s.at + dur } else { s.until }
+    let ez = s.ease ?? @linear
+    let L = lengths32(pts)
+    let n = L.len()
+    let tot = L[n - 1]
+    // when the head reaches each point: the ease inverted (bisection, as the reference did)
+    let tD = []
+    for i in 0..n {
+        let target = if tot > 0.0 { L[i] / tot } else { 1.0 }
+        var lo = 0.0
+        var hi = 1.0
+        for k in 0..18 {
+            let m = (lo + hi) / 2.0
+            if ease(ez, m) < target { lo = m } else { hi = m }
+        }
+        tD.push(vec2(t0 + (t1 - t0) * hi, 0.0).x)   // single precision, as the drawing was timed
+    }
+    let r = {pts: pts L: L tot: tot t0: t0 t1: t1 kind: s.kind pen: s.pen ?? false ease: ez alpha: s.alpha ?? 1.0
+        width: s.width ?? 1.2 dash: s.dash ?? 0.0 group: s.group ?? @main color: s.color ?? nil tD: tD index: PLOT_STROKES.len()}
+    PLOT_STROKES.push(r)
+    return r
+}
+
+let waypoint = fn(w) {
+    let hold = w.hold ?? 0.0
+    stroke({path: [w.pos.x, w.pos.y, w.pos.x + 0.0001 * PLOT_UNIT[0], w.pos.y] at: w.at until: w.at + max(0.001, hold) kind: @ghost pen: true alpha: 0.0})
+}
+
+let note = fn(o) {
+    let text = o.text
+    let len = text.to_chars().len()
+    let r = {text: text len: len x: o.pos.x y: o.pos.y em: o.em ?? 0.2 * PLOT_UNIT[0] t0: o.at dur: o.dur ?? min(0.4, 0.01 * len + 0.05)
+        col: o.col ?? nil a: o.a ?? 0.9 align: o.align ?? @left group: o.group ?? @main max_px: o.max_px ?? 30.0 hot: o.hot ?? 0.0}
+    PLOT_NOTES.push(r)
+    return r
+}
+
+let dimension = fn(d) {
+    let a = d.from
+    let b = d.to
+    let t0 = d.at
+    let em = d.em ?? 0.16 * PLOT_UNIT[0]
+    let dx = b.x - a.x
+    let dy = b.y - a.y
+    let l = sqrt(dx * dx + dy * dy)
+    let ux = dx / l
+    let uy = dy / l
+    let nx = 0.0 - uy
+    let ny = ux
+    let dim = fn(pts, ta, tb) { stroke({path: pts at: ta until: tb kind: @dim alpha: 0.75 width: d.width ?? 1.0 group: d.group color: d.color ?? nil}) }
+    dim(segment(a, b), t0, t0 + 0.12)
+    let u = PLOT_UNIT[0]
+    let ar = 0.1 * u
+    for e in [[a, 1.0], [b, -1.0]] {
+        let p = e[0]
+        let s = e[1]
+        dim(path([pt(p.x + s * ux * ar + nx * ar * 0.33, p.y + s * uy * ar + ny * ar * 0.33), p, pt(p.x + s * ux * ar - nx * ar * 0.33, p.y + s * uy * ar - ny * ar * 0.33)]), t0 + 0.08, t0 + 0.12)
+        dim(segment(pt(p.x - nx * (0.1 * u), p.y - ny * (0.1 * u)), pt(p.x + nx * (0.1 * u), p.y + ny * (0.1 * u))), t0, t0 + 0.05)
+    }
+    let m = pt((a.x + b.x) / 2.0, (a.y + b.y) / 2.0)
+    let vert = abs(dy) > abs(dx)
+    note({text: d.label pos: pt(m.x + (if vert { -0.07 * u } else { 0.0 }), m.y + (if vert { 0.0 - em * 0.32 } else { 0.06 * u })) at: t0 + 0.1
+        em: em align: if vert { @right } else { @center } col: d.col ?? nil group: d.group dur: 0.08})
+}
+
+let PLOT_FONT = Font{family: "ems_tech"}
+let plot_text = fn(p) {
+    let strokes = stroke_text(p.text, 75, p.font ?? PLOT_FONT, @holes).strokes
+    let k = p.em / 100.0
+    let lens = []
+    var total = 0.0
+    for s in strokes { let L = lengths32(s) let l = L[L.len() - 1] lens.push(l) total = total + l }
+    var done = 0.0
+    for i in 0..strokes.len() {
+        let s = strokes[i]
+        let a = p.at + (p.until - p.at) * (done / total)
+        let b = p.at + (p.until - p.at) * ((done + lens[i]) / total)
+        done = done + lens[i]
+        if s.len() >= 4 {
+            let pts = []
+            for j in 0..(s.len() / 2) { pts.push(p.pos.x + s[2 * j] * k) pts.push(p.pos.y - s[2 * j + 1] * k) }
+            stroke({path: pts at: a until: b kind: @plot pen: true width: p.width ?? 1.4 color: p.color ?? nil group: p.group})
+        }
+    }
+}
+
+// the lyric face: Archivo 700 at width 100, measured at 1000 units to the em (its own units)
+let LYRIC_FONT = Font{family: "Archivo" weight: 700 axes: {wdth: 100}}
+let measure = fn(text) { text_layout(text, LYRIC_FONT, 750).width / 10.0 }
+let text_chars = fn(text) { let parts = text.split("") let out = [] for i in 1..(parts.len() - 1) { out.push(parts[i]) } return out }
+let lyric_row = fn(r) {
+    var cx = r.pos.x
+    let sp = (measure(" ") / 100.0) * r.em
+    for w in r.words {
+        let chars = text_chars(w.text)
+        let gx = []
+        let gw = []
+        var prefix = ""
+        for ch in chars {
+            prefix = prefix + ch
+            let cw = measure(ch)
+            gx.push(measure(prefix) - cw)
+            gw.push(cw)
+        }
+        PLOT_LYRICS.push({word: w text: w.text x: cx y: r.pos.y em: r.em group: r.group ?? @main t_ant: w.start - (r.lead_in ?? 0.3)
+            chars: chars gx: gx gw: gw})
+        cx = cx + (measure(w.text) / 100.0) * r.em + sp
+    }
+}
+let fit_em = fn(text, width, max_em) { min(max_em, width / (measure(text) / 100.0)) }
+// in whole font units, as the face's 700 instance has its outlines
+let glyph_box = fn(lw, gi) {
+    let l = text_layout(lw.chars[gi], LYRIC_FONT, 750)
+    let o = text_outline(lw.chars[gi], LYRIC_FONT, 750)
+    var x0 = 100000.0
+    var x1 = -100000.0
+    var y0 = 100000.0
+    var y1 = -100000.0
+    for c in o { for q in c.points {
+        x0 = min(x0, floor(q[0] + 0.5)) x1 = max(x1, floor(q[0] + 0.5))
+        y0 = min(y0, floor(l.ascent - q[1] + 0.5)) y1 = max(y1, floor(l.ascent - q[1] + 0.5))
+    } }
+    let k = lw.em / 100.0
+    let g = lw.gx[gi]
+    return {x0: lw.x + (g + x0 / 10.0) * k x1: lw.x + (g + x1 / 10.0) * k y0: lw.y + (y0 / 10.0) * k y1: lw.y + (y1 / 10.0) * k}
+}
+
+let camera_key = fn(k) {
+    let r = {t: k.at x: k.look.x y: k.look.y zoom: k.zoom roll: k.roll ease: k.ease ?? @ease_in_out_cubic}
+    PLOT_CAMERA.push(r)
+    return r
+}
+
+let plot_strokes = fn() { PLOT_STROKES }
+let plot_notes = fn() { PLOT_NOTES }
+let plot_lyrics = fn() { PLOT_LYRICS }
+let plot_camera = fn() { PLOT_CAMERA }
+
+{plot_units: plot_units stroke: stroke waypoint: waypoint note: note dimension: dimension plot_text: plot_text lyric_row: lyric_row fit_em: fit_em
+    glyph_box: glyph_box measure: measure camera_key: camera_key plot_strokes: plot_strokes plot_notes: plot_notes
+    plot_lyrics: plot_lyrics plot_camera: plot_camera}

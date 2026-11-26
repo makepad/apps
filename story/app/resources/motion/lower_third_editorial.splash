@@ -1,0 +1,31 @@
+use mod.motion.*
+// EDITORIAL LOWER THIRD — understated: a hairline draws from the left, the
+// name sits on it in a large italic, the role hangs below in small tracked
+// caps. Only opacity and a 12 px drift, nothing bounces. Transparent.
+// Why: for interviews and documentary footage the graphic must not compete
+// with a face; slow fades and a thin rule stay out of the way.
+Motion{
+    label: "Editorial lower third"
+    brief: "An italic name on a hairline rule with a small-caps role; understated, for interviews."
+    tags: ["lower-third", "editorial", "name", "overlay", "documentary"]
+    duration: 6.0
+    inputs: {
+        name: input(@text, "Ada Moreno", "Person's name")
+        role: input(@text, "HEAD OF PRODUCT, LUMEN", "Role, set in caps")
+        ink: input(@color, #f4f7fa, "Name colour")
+        muted: input(@color, #d6dee6, "Role colour")
+        rule: input(@color, #f4f7face, "Hairline colour")
+    }
+    layers: [
+        Ellipse{at: vec2(-340, 740) size: vec2(1400, 520) fill: #000000 feather: 240
+                opacity: keys([0.0, 0], [0.8, 0.45, @ease_out_cubic], [5.2, 0.45], [6.0, 0, @ease_in_cubic])}
+        Rect{at: vec2(160, 880) size: keys([0.0, vec2(0, 2)], [1.0, vec2(520, 2), @ease_in_out_quint], [5.2, vec2(520, 2)], [5.9, vec2(0, 2), @ease_in_out_quint])
+             fill: in(@rule)}
+        Text{text: in(@name) font: Font{family: "IBM Plex Sans" italic: true} size: 72 color: in(@ink) at: vec2(160, 780)
+             opacity: keys([0.5, 0], [1.2, 1, @ease_out_cubic], [5.0, 1], [5.5, 0, @ease_in_cubic])
+             y: tween(12, 0, 0.5, 1.4, @ease_out_quint)}
+        Text{text: in(@role) font: Font{family: "Inter" weight: 600} size: 24 tracking: 0.24 color: in(@muted) at: vec2(160, 900)
+             opacity: keys([0.8, 0], [1.4, 1, @ease_out_cubic], [4.9, 1], [5.4, 0, @ease_in_cubic])
+             y: tween(-8, 0, 0.8, 1.6, @ease_out_quint)}
+    ]
+}

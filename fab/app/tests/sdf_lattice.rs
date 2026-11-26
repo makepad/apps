@@ -52,7 +52,7 @@ fn wait_until(app: &TestApp, what: &str, mut ok: impl FnMut() -> bool) {
 }
 
 fn lines(app: &TestApp, from: u64, needle: &str) -> Vec<String> {
-    app.log_since(from).map(|t| t.lines.into_iter().filter(|l| l.contains(needle)).collect()).unwrap_or_default()
+    app.log_since(from).expect("the app's log").lines.into_iter().filter(|l| l.contains(needle)).collect()
 }
 
 fn seq(app: &TestApp) -> u64 {

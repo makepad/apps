@@ -1,0 +1,152 @@
+use mod.motion.*; use mod.kernel
+// Sparks for Draw2D layers: a hot spark head, and sparks thrown off a moving head (a fuse, a pen, a caret).
+//
+// Colours are linear light `[r, g, b]` (values over 1 glow in a `color: @hdr` document; draw
+// them on an additive layer, `c.blend(@add)` is the Draw2D default). Defaults are an ember orange.
+//
+//   use mod.motion.modules.sparks.*
+//   Draw2D{draw: fn(c, t, edit) {
+//       let head = fn(tb) { vec2(200 + tb * 400, 540) }     // where the head was at time tb
+//       spark_particles(c, t, head, {rate: 90 seed: 1})
+//       let p = head(t)
+//       spark_head(c, p.x, p.y, t, {scale: 1 heat: 1})
+//   }}
+
+// The head: a white-hot core in a glow and a halo, flickering, four short rays turning.
+// `scale` size (1: 26 px halo), `heat` light (0..~3; 1 = core at 6x white), `halo`, `glow` colours.
+let spark_head = fn(c, x, y, t, o) {
+    let scale = o.scale ?? 1.0
+    let k = (o.heat ?? 1.0) * (0.85 + 0.15 * sin(t * 91.7) * sin(t * 57.3))
+    let h = o.halo ?? [1.0, 0.074214, 0.006049]
+    let g = o.glow ?? [1.0, 0.254152, 0.046665]
+    c.seg_rgb(x, y, x + 0.01, y, 26.0 * scale, h[0] * 0.5 * k, h[1] * 0.5 * k, h[2] * 0.5 * k, 0.35)
+    c.seg_rgb(x, y, x + 0.01, y, 12.0 * scale, g[0] * 2.5 * k, g[1] * 2.5 * k, g[2] * 2.5 * k, 0.8)
+    c.seg_rgb(x, y, x + 0.01, y, 5.0 * scale, 6.0 * k, 5.0 * k, 4.0 * k, 1.0)
+    for i in 0..4 {
+        let a = i * (6.283185307179586 / 4.0) + t * 3.0 + 0.4
+        let r = (9.0 + 5.0 * hashn(floor(t * 30.0), i)) * scale
+        c.seg_rgb(x, y, x + cos(a) * r, y + sin(a) * r, 1.2 * scale, 3.0 * k, 1.2 * k, 0.4 * k, 0.8)
+    }
+}
+// Sparks born `rate` a second (0..~200) where `head_at(tb)` (a vec2, or nil: none) was, flying
+// out at up to `speed` px/s, falling under `gravity` px/s², cooling from white to `color` over
+// up to `life` s, drawn as short streaks `width` px. `rate: fn(tb) {…}` with `rate_max` thins
+// births over time; `born: [t0, t1]` throws only sparks born in that window (a burst: the loop
+// visits just its births); `seed` picks another shower; `heat` scales the light.
+let spark_particles = fn(c, t, head_at, o) {
+    let life = o.life ?? 0.45
+    let speed = o.speed ?? 260.0
+    let g = o.gravity ?? 520.0
+    let heat = o.heat ?? 1.0
+    let seed = o.seed ?? 1.0
+    let col = o.color ?? [1.0, 0.074214, 0.006049]
+    let width = o.width ?? 1.6
+    let given = o.rate ?? 90.0
+    let rate_fn = if given.is_number() { nil } else { given }
+    let rate = if rate_fn == nil { given } else { o.rate_max }
+    if !(rate > 0.0) { return }
+    var n0 = floor((t - life) * rate)
+    var n1 = floor(t * rate) + 1.0
+    let born = o.born ?? nil
+    if born != nil {
+        n0 = max(n0, ceil(born[0] * rate))
+        n1 = min(n1, ceil(born[1] * rate))
+        if n1 <= n0 { return }
+    }
+    for n in n0..n1 {
+        let tb = n / rate
+        let age = t - tb
+        let lf = life * (0.35 + 0.65 * hashn(n, seed + 2.0))
+        let thin = rate_fn != nil && hashn(n, seed + 3.0) * rate >= rate_fn(tb)
+        let h = if age < 0.0 || age > lf || thin { nil } else { head_at(tb) }
+        if h != nil {
+            let a = hashn(n, seed) * 6.283185307179586
+            let hh = hashn(n, seed + 1.0)
+            let sp = speed * (0.25 + hh * hh * 1.2)
+            let vx = cos(a) * sp
+            let vy = sin(a) * sp - speed * 0.3
+            let a0 = max(0.0, age - 0.018)
+            let k = 1.0 - age / lf
+            let w = k * k
+            c.seg_rgb(h.x + vx * a0, h.y + vy * a0 + 0.5 * g * a0 * a0, h.x + vx * age, h.y + vy * age + 0.5 * g * age * age, width * (0.5 + k * 0.7),
+                (col[0] + (1.0 - col[0]) * w) * 2.2 * heat, (col[1] + (0.8 - col[1]) * w) * 2.2 * heat, (col[2] + (0.5 - col[2]) * w) * 2.2 * heat, min(1.0, k * 1.4))
+        }
+    }
+}
+
+// The same shower as a kernel, for a head that throws hundreds of sparks a frame: the head's path
+// is data, sampled once at the birth clock (birth n at n / rate s). Build it at load with
+// `spark_shower_data(head_at, rate_at, t0, t1, rate)` (`head_at(tb)`: the head in world units, or
+// nil; `rate_at(tb)`: births a second then, at most `rate`), then each frame
+// `draw_spark_shower(c, SHOWER, {clock camera life speed gravity heat seed color width})`:
+// `clock` is added to the layer's time (a path timed in song seconds), `camera` {x y zoom rot}
+// maps the world to the frame (world y up, centre 960 x 540); the rest as spark_particles.
+let spark_shower_kernel = Kernel{
+    count: 1
+    heads: kernel.input(vec2, [])        // per birth (from `first`): the head, world units
+    rates: kernel.input(f32, [])         // per birth: births a second then (0: none)
+    color: kernel.input(vec4, [])        // the cooled colour (linear)
+    rate: kernel.param(90.0)
+    first: kernel.param(0.0)
+    clock: kernel.param(0.0)
+    life: kernel.param(0.45)
+    speed: kernel.param(260.0)
+    gravity: kernel.param(520.0)
+    heat: kernel.param(1.0)
+    seed: kernel.param(1.0)
+    width: kernel.param(1.6)
+    cam_x: kernel.param(0.0)
+    cam_y: kernel.param(0.0)
+    cam_zoom: kernel.param(1.0)
+    cam_rot: kernel.param(0.0)
+    out: kernel.emit_buffer(kernel.Segment, 1)
+    element: fn(i) {
+        let now = time + clock
+        let n = floor((now - life) * rate) + float(i)
+        let k = int(n - first)
+        if k < 0 || k >= len(rates) { return }
+        let tb = n / rate
+        let age = now - tb
+        let lf = life * (0.35 + 0.65 * hashn2(n, seed + 2.0))
+        if age < 0.0 || age > lf || hashn2(n, seed + 3.0) * rate >= rates[k] { return }
+        let w = heads[k]
+        let dx = (w.x - cam_x) * cam_zoom
+        let dy = (cam_y - w.y) * cam_zoom
+        let h = vec2(960.0 + cos(cam_rot) * dx - sin(cam_rot) * dy, 540.0 + sin(cam_rot) * dx + cos(cam_rot) * dy)
+        let a = hashn2(n, seed) * 6.283185307179586
+        let hh = hashn2(n, seed + 1.0)
+        let sp = speed * (0.25 + hh * hh * 1.2)
+        let vx = cos(a) * sp
+        let vy = sin(a) * sp - speed * 0.3
+        let a0 = max(0.0, age - 0.018)
+        let cool = 1.0 - age / lf
+        let wh = cool * cool
+        let col = color[0]
+        let rgb = vec3(col.x + (1.0 - col.x) * wh, col.y + (0.8 - col.y) * wh, col.z + (0.5 - col.z) * wh) * (2.2 * heat)
+        emit(out, Segment{a: vec3(h.x + vx * a0, h.y + vy * a0 + 0.5 * gravity * a0 * a0, 0.0) b: vec3(h.x + vx * age, h.y + vy * age + 0.5 * gravity * age * age, 0.0)
+            color: vec4(rgb, min(1.0, cool * 1.4)) width: width * (0.5 + cool * 0.7)})
+    }
+}
+// The head's path and the birth rate at every birth from t0 to t1 (once, at load).
+let spark_shower_data = fn(head_at, rate_at, t0, t1, rate) {
+    let first = ceil(t0 * rate)
+    let heads = []
+    let rates = []
+    for n in first..(floor(t1 * rate) + 1.0) {
+        let tb = n / rate
+        let h = head_at(tb)
+        heads.push(if h == nil { vec2(0.0, 0.0) } else { h })
+        rates.push(if h == nil { 0.0 } else { rate_at(tb) })
+    }
+    {heads: heads.freeze() rates: rates.freeze() first: first rate: rate}
+}
+let draw_spark_shower = fn(c, data, o) {
+    let cam = o.camera ?? {x: 0.0 y: 0.0 zoom: 1.0 rot: 0.0}
+    let life = o.life ?? 0.45
+    let col = o.color ?? [1.0, 0.074214, 0.006049]
+    c.segs(spark_shower_kernel.out, {with: {count: ceil(life * data.rate) + 2.0 heads: data.heads rates: data.rates color: [vec4(col[0], col[1], col[2], 1.0)]
+        rate: data.rate first: data.first clock: o.clock ?? 0.0 life: life speed: o.speed ?? 260.0 gravity: o.gravity ?? 520.0 heat: o.heat ?? 1.0
+        seed: o.seed ?? 1.0 width: o.width ?? 1.6 cam_x: cam.x cam_y: cam.y cam_zoom: cam.zoom cam_rot: cam.rot ?? 0.0}})
+}
+
+{spark_head: spark_head spark_particles: spark_particles spark_shower_data: spark_shower_data draw_spark_shower: draw_spark_shower spark_shower_kernel: spark_shower_kernel}

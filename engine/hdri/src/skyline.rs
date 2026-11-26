@@ -658,7 +658,7 @@ pub struct SkylineLight {
     /// (makepad_skyline's `SkyLight::floor_share`, over the map's ground), where the map lays its own puddles, their
     /// water and what they mirror, as its field lays them, the strip's ground between them (`Env::under_band`).
     pub wet: f32,
-    /// The map's ground ring as `ground_ring`, read with no puddles (`Weather::ground_damp`): the strip's own ground
+    /// The map's ground ring as `ground_ring`, read with no puddles (`Puddles::Dry`): the strip's own ground
     /// under a wet ground, the ground between the puddles (its near rise, its floor between the puddles, its lakes'
     /// bottoms). `ground_ring` exactly when the ground is dry.
     pub ground_damp: [[f32; 3]; RING],
@@ -1137,11 +1137,13 @@ mod tests {
 
     #[test]
     fn a_half_covered_sun_keeps_about_half_its_key() {
-        // The band's top exactly at the sun's centre: the disc is symmetric, so half of it shows.
+        // The band's top exactly at the sun's centre as it is drawn (lifted by the refraction): the disc is close to
+        // symmetric, so about half of it shows.
         let mut p = HdriParams::default();
         sun_at(&mut p, 3.0, 0.0);
         let open = Env::new(&p).sun().expect("the sun is up").radiance;
-        let (q, images) = with_band(&p, band(3.0, -5.0, [0.0, 0.0, 0.0, 1.0]));
+        let seen = Env::new(&p).sky_discs().sun.expect("the disc is drawn").dir.y.asin().to_degrees();
+        let (q, images) = with_band(&p, band(seen, -5.0, [0.0, 0.0, 0.0, 1.0]));
         let half = Env::new_with(&q, &images).sun().expect("half the sun shows").radiance;
         for (k, (h, o)) in [(half.x, open.x), (half.y, open.y), (half.z, open.z)].into_iter().enumerate() {
             assert!((h / o - 0.5).abs() <= 0.1, "channel {k}: {h} of {o} is {}", h / o);
@@ -1566,11 +1568,12 @@ mod tests {
     /// by the water's Fresnel term, through the veil along its own direction once more. So where the rain hides the city
     /// the puddles hide it too; over a host's wet ground they are the only water below the band's sea and lakes (the strip
     /// gives way to them by their share of its land, makepad_skyline's `SkyLight::floor_share`).
+    /// The water is calm (`rain_on_water` false): falling rain breaks the mirror by default.
     #[test]
     fn under_rain_a_puddle_mirrors_the_city_as_the_rain_shows_it() {
         let mut p = HdriParams { lights: vec![], ..HdriParams::default() };
         sun_at(&mut p, -20.0, 0.0);
-        p.sky.weather = Some(WeatherParams { kind: "rain".to_string(), wet_ground: 1.0, ..WeatherParams::default() });
+        p.sky.weather = Some(WeatherParams { kind: "rain".to_string(), wet_ground: 1.0, rain_on_water: Some(false), ..WeatherParams::default() });
         let (w, h, top, bottom) = (360usize, 24usize, 20.0f32, -4.0f32);
         let row = ((top - 12.0) / (top - bottom) * h as f32 - 0.5).round() as usize;
         let el = top - (row as f32 + 0.5) * (top - bottom) / h as f32;
@@ -1645,7 +1648,8 @@ mod tests {
                 continue;
             }
             assert!(l.wet > 0.0 && l.wet == env.weather.as_ref().unwrap().puddle_share(), "{name}: {}", l.wet);
-            let damp = Sampling { bare: true, unveiled: true, damp_ground: true, ..Sampling::default() };
+            // (the ring's own looks: its puddles left out, and read as the strip's few even looks are, `Env::damp_sheen`)
+            let damp = Sampling { bare: true, unveiled: true, even_ground: true, damp_ground: true, ..Sampling::default() };
             let turn = p.skyline.as_ref().map_or(0.0, |b| b.turn_deg);
             for i in 0..RING {
                 let u = ((i as f32 + 0.5) / RING as f32 + turn / 360.0).rem_euclid(1.0);
@@ -1672,7 +1676,7 @@ mod tests {
     fn the_band_under_weather_is_the_maps_own(name: &str, weather: WeatherParams, dry: bool) {
         const GROUND_STEP: f32 = 0.02;
         // (a wet ground only) round the turn, the band's ground against the map's own wet ground looked up 256 times
-        // over each ring entry's span: the puddles' share is the fbm's mean taken as normal (`Weather::ground_even`),
+        // over each ring entry's span: the puddles' share is the fbm's mean taken as normal (`Puddles::Even`),
         // a few per cent off the field's own (measured: fog 4.7 %, rain 2.2 %); one entry's span holds only a few
         // puddles, so entry by entry the look-ups scatter (up to 18 %) and only the turn's mean is held
         const MEAN_TOL: f32 = 0.06;
@@ -1774,7 +1778,8 @@ mod tests {
 
     #[test]
     fn under_rain_the_band_is_the_maps_own() {
-        the_band_under_weather_is_the_maps_own("rain", WeatherParams { kind: "rain".to_string(), ..WeatherParams::default() }, false);
+        // calm water: falling rain breaks the puddles' mirror by default
+        the_band_under_weather_is_the_maps_own("rain", WeatherParams { kind: "rain".to_string(), rain_on_water: Some(false), ..WeatherParams::default() }, false);
         the_band_under_weather_is_the_maps_own("dry rain", WeatherParams { rain: 0.6, fog: 0.1, ..WeatherParams::default() }, true);
     }
 
@@ -1786,7 +1791,8 @@ mod tests {
     fn the_rain_shafts_hang_behind_the_skyline() {
         let mut p = HdriParams { lights: vec![], ..HdriParams::default() };
         sun_at(&mut p, 25.0, 180.0);
-        p.sky.weather = Some(WeatherParams { kind: "rain".to_string(), ..WeatherParams::default() });
+        // calm water: falling rain breaks the puddles' mirror by default
+        p.sky.weather = Some(WeatherParams { kind: "rain".to_string(), rain_on_water: Some(false), ..WeatherParams::default() });
         let (a, b) = ([0.30, 0.30, 0.30, 1.0], [0.10, 0.10, 0.10, 1.0]);
         let env = |p: &HdriParams, s: [f32; 4]| { let (q, images) = with_band(p, band(20.0, -5.0, s)); Env::new_with(&q, &images) };
         let (ea, eb) = (env(&p, a), env(&p, b));
@@ -1801,8 +1807,8 @@ mod tests {
         }
         // the premise: shafts hang at 8 degrees (they darken the sky behind)
         assert!((0..72).any(|i| rain.virga(dir(i as f32 * 5.0, 8.0)) > 0.05));
-        // and the wet ground's mirror of the city has no shafts in front of it either (rain with a full water floor)
-        p.sky.weather = Some(WeatherParams { kind: "rain".to_string(), wet_ground: 1.0, ..WeatherParams::default() });
+        // and the wet ground's mirror of the city has no shafts in front of it either (rain with a full water floor, calm)
+        p.sky.weather = Some(WeatherParams { kind: "rain".to_string(), wet_ground: 1.0, rain_on_water: Some(false), ..WeatherParams::default() });
         let (ea, eb) = (env(&p, a), env(&p, b));
         let mirrored: Vec<f32> = (0..72).map(|i| { let d = dir(i as f32 * 5.0, -12.0); (ea.radiance(d) - eb.radiance(d)).x }).collect();
         let (lo, hi) = mirrored.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &x| (lo.min(x), hi.max(x)));
@@ -1813,8 +1819,10 @@ mod tests {
     fn the_ring_leaves_out_the_sun_sitting_on_it() {
         // The sun's disc on a ring direction (u = 0.5/64 at 1 degree) is the sun's light, which
         // the strip takes as sun_rgb: the ring there is the sky round it.
+        // (the sun 1 degree up as it is seen: its true place is lower by the refraction there)
         let mut p = HdriParams::default();
-        sun_at(&mut p, 1.0, (0.5 / RING as f32 - 0.5) * 360.0 + 360.0);
+        let true_el = 1.0 - crate::atmosphere::refraction(1.0f32.to_radians()).to_degrees();
+        sun_at(&mut p, true_el, (0.5 / RING as f32 - 0.5) * 360.0 + 360.0);
         let env = Env::new(&p);
         let l = env.skyline_light();
         assert!(env.radiance(dir_at_u(0.5 / RING as f32, 1.0)).max_elem() > 100.0 * vec(l.ring_low[0]).max_elem(), "the premise: the disc is there");
@@ -1832,7 +1840,9 @@ mod tests {
         let a = Env::new(&p).skyline_light();
         p.skyline = Some(SkylineParams { turn_deg: 90.0, ..skyline_on() });
         let b = Env::new(&p).skyline_light();
-        assert!((a.sun_el_deg - 20.0).abs() < 0.01, "{}", a.sun_el_deg);
+        // (the sun where it is seen: 20 deg lifted by the refraction, 2.6')
+        let seen = Env::new(&p).sky_discs().sun.expect("the disc is drawn").dir.y.asin().to_degrees();
+        assert!((a.sun_el_deg - seen).abs() < 0.01 && (a.sun_el_deg - 20.0).abs() < 0.1, "{}", a.sun_el_deg);
         // Compass azimuth 0 is the map's u = 0.5; a turn of 90 moves the city a quarter toward
         // a larger u, so in the strip's frame the sun stands a quarter back.
         assert!((a.sun_u - 0.5).abs() < 1e-4, "{}", a.sun_u);
@@ -1943,7 +1953,9 @@ mod tests {
             let down = dir(0.0, -90.0);
             let seen = env.radiance(down) / env.scale();
             let ground = env.base_under_skyline(down, None, Sampling { bare: true, unveiled: true, ..Sampling::default() });
-            let rise = el.to_radians().sin().max(0.0);
+            // (the strip's own sun, where it is seen: `el` lifted by the refraction)
+            assert!((l.sun_el_deg - el).abs() < 0.1 || el < 0.0, "{name}: the strip's sun at {}", l.sun_el_deg);
+            let rise = l.sun_el_deg.to_radians().sin().max(0.0);
             let lit = vec(l.sun_rgb) * rise + vec(l.ambient_rgb);
             println!("{name}: sun {:?} ambient {:?}, the ground {ground:?} ({seen:?} veiled), gain {:?}", l.sun_rgb, l.ambient_rgb, env.ground_gain);
             assert!(env.weather.is_some() || ground == seen, "{name}: without a weather the unveiled ground is the map's");
@@ -2248,7 +2260,14 @@ mod tests {
     /// mirrored beside the block is unchanged.
     #[test]
     fn a_puddle_mirrors_the_city_through_its_distance() {
-        let (night, day) = (rain_kind(-20.0, Some(1.0)), rain_kind(25.0, Some(1.0)));
+        // calm water: falling rain breaks the puddles' mirror by default
+        let calm = |mut p: HdriParams| {
+            if let Some(w) = p.sky.weather.as_mut() {
+                w.rain_on_water = Some(false);
+            }
+            p
+        };
+        let (night, day) = (calm(rain_kind(-20.0, Some(1.0))), calm(rain_kind(25.0, Some(1.0))));
         let lit = [40.0, 30.0, 20.0, 1.0];
         for (p, el, s) in [(&night, 2.0f32, lit), (&night, 12.0, lit), (&night, 2.0, [20.0, 15.0, 10.0, 0.5]), (&day, 2.0, lit), (&day, 2.0, [0.02, 0.015, 0.01, 1.0])] {
             let (b, u) = block_band(s, el, Some(2000.0));
@@ -2385,10 +2404,14 @@ mod tests {
     /// its view the mirror takes (Fresnel on a full water floor), veiled once: a light keeps exp(-(1 - F) tau) over its
     /// distance, its surface Task 9's veil. The rain kind at night on Wet ground 1.00, 2 km off: an opaque block all
     /// light 2 and 12 degrees up, one half light, and a light over the sky (no coverage, the puddle shows it over the
-    /// sky it mirrors). The sky mirrored beside the block is unchanged.
+    /// sky it mirrors). The sky mirrored beside the block is unchanged. The water is calm (`rain_on_water` false):
+    /// falling rain breaks the mirror by default.
     #[test]
     fn a_puddle_mirrors_the_lights_as_the_weather_shows_them() {
-        let p = rain_kind(-20.0, Some(1.0));
+        let mut p = rain_kind(-20.0, Some(1.0));
+        if let Some(w) = p.sky.weather.as_mut() {
+            w.rain_on_water = Some(false);
+        }
         for (el, s, share) in [(2.0f32, [40.0, 30.0, 20.0, 1.0], 1.0f32), (12.0, [40.0, 30.0, 20.0, 1.0], 1.0), (2.0, [40.0, 30.0, 20.0, 1.0], 0.5), (2.0, [20.0, 15.0, 10.0, 0.0], 1.0)] {
             let (b, u) = block_band(s, el, Some(2000.0));
             let (q, images) = with_band(&p, lit(b, share, 2000.0));
@@ -2455,15 +2478,20 @@ mod tests {
     }
 
     /// Plan hdri-6 fix wave 2 (F5, the final review's M4): at the rain kind's own wetness the puddles lie in a field, and
-    /// where the mirror shows the strip the share of the floor's view it takes is the field's (`Weather::mirror_share`,
-    /// `Puddles::Field`): Fresnel's term inside a puddle, the damp ground's dull sheen between them, not the puddles'
+    /// where the mirror shows the strip the share of the floor's view it takes is the field's (`Weather::mirror_share_sheened`,
+    /// `Puddles::Field`): Fresnel's term inside a puddle, none between them (the damp ground's sheen shows it blurred,
+    /// `Env::damp_sheen`), not the puddles'
     /// mean share (`Puddles::Even`). Under the rain kind at night an opaque lit block 2 km off, 6 to 18 degrees up and
     /// 120 degrees round: the floor 12 degrees down mirrors it, veiled once over its 2 km, by the field's share, inside a
     /// puddle and between two, where the mean share would be off by more than the tolerance.
     #[test]
     fn at_the_rain_kinds_own_wetness_the_puddles_mirror_the_city_by_their_field() {
         use crate::weather::Puddles;
-        let p = rain_kind(-20.0, None);
+        // calm water: falling rain breaks the puddles' mirror by default
+        let mut p = rain_kind(-20.0, None);
+        if let Some(w) = p.sky.weather.as_mut() {
+            w.rain_on_water = Some(false);
+        }
         let s = [40.0, 30.0, 20.0, 1.0];
         let (w, h, top) = (360usize, 24usize, 20.5f32);
         let in_block = |i: usize| (2..=14).contains(&(i / w)) && (30..150).contains(&(i % w));
@@ -2485,8 +2513,13 @@ mod tests {
             let own = rain.veil_within(up, rgb(s), city.weather_sun, city.dome, 2000.0) * k;
             let sky_seen = veil_of(&city, down, plain.radiance(up) * (1.0 / k)) * k;
             let mirrored = city.radiance(down) - plain.radiance(down);
-            let (field, even) = (rain.mirror_share(down, Puddles::Field), rain.mirror_share(down, Puddles::Even));
-            let (want, mean) = ((own - sky_seen) * field, (own - sky_seen) * even);
+            let (field, even) = (rain.mirror_share_sheened(down, cover(u), false), rain.mirror_share_sheened(down, rain.puddle_cover(down, Puddles::Even), false));
+            // (and between them the damp ground's sheen, which shows the city blurred through its film's facets,
+            // `Env::damp_sheen`, by the film's share of what the puddles leave, under the floor's veil)
+            let film = |e: &Env| e.damp_sheen(down, Sampling::default());
+            let damp = (film(&city) - film(&plain)) * (rain.film_share() * (1.0 - cover(u)));
+            let blurred = (veil_of(&city, down, damp) - veil_of(&city, down, Vec3f::default())) * k;
+            let (want, mean) = ((own - sky_seen) * field + blurred, (own - sky_seen) * even + blurred);
             println!("{name} (cover {:.3}): the floor mirrors {:.4}, by the field's share {field:.4} {:.4}, by the mean share {even:.4} {:.4}", cover(u), mirrored.x, want.x, mean.x);
             assert!(close3(mirrored, want, 1e-4), "{name}: the floor mirrors {mirrored:?}, the city veiled once by the field's share {want:?}");
             assert!(!close3(mean, want, 1e-2), "the premise, {name}: the mean share's {mean:?} is the field's {want:?}");

@@ -1,0 +1,29 @@
+use mod.scene.*; use mod.post
+// One continuous flight through three set-ups (a camera path with roll,
+// holding at each): a contour world with a callout anchored in 3D, a
+// planet with type on an arc around it and type wrapped on its band, and
+// the gravity well; depth of field and light shafts from the sun.
+Scene3D{ background: #04060c tone_mapping: @aces bpm: 120
+  camera: Camera{fov: 40 shots: [
+      CameraShot{at: 0 hold: 0.8 position: vec3(-8, 3, 6) target: vec3(-8, 0.4, 0) roll: 0}
+      CameraShot{at: 2.4 hold: 0.8 position: vec3(0, 1.2, 5) target: vec3(0, 1, 0) roll: -8}
+      CameraShot{at: 4.8 hold: 1 position: vec3(8, 3.5, 6) target: vec3(8, 0, 0) roll: 4 fov: 34}
+  ]}
+  post: [post.DepthOfField{focus: 6 f_stop: 2.8} post.Bloom{strength: 0.7 threshold: 0.9} LightShafts{node: "sun" strength: 1.0 color: #ffd9a0 decay: 0.95 threshold: 0.7}]
+  lights: [AmbientLight{intensity: 0.4} DirectionalLight{position: vec3(2, 5, 4) intensity: 1.6}]
+  children: [
+    Group3D{position: vec3(-8, 0, 0) children: [
+      Fx{preset: @contour_terrain radius: 4 amount: 0.8 spacing: 0.1 color: #10131c color2: #6fd0ff}
+      Mesh{name: "peak" geometry: SphereGeometry{radius: 0.08} position: vec3(0.5, 0.9, 0.3) material: MeshBasicMaterial{color: #ff5a1f}}
+      Callout{target: vec3(0.5, 0.9, 0.3) offset: vec3(0.8, 0.9, 0) text: "SHARP MINIMUM" start: 0.4}
+    ]}
+    Group3D{position: vec3(0, 1, 0) children: [
+      Mesh{geometry: SphereGeometry{radius: 1 width_segments: 96 height_segments: 64} rotation: spin(vec3(0, 12, 0)) material: EngraveMaterial{color: #d8c9a8}}
+      Text3D{text: "PREDICT THE NEXT TOKEN" font: @bold size: 0.18 depth: 0.02 layout: @arc layout_radius: 1.45 rotation: spin(vec3(0, 0, -14)) material: MeshBasicMaterial{color: #ff5a1f}}
+      Text3D{text: "ATTENTION" font: @bold size: 0.28 depth: 0.02 position: vec3(0, 0, 1.01) wrap_radius: 1.01 material: MeshBasicMaterial{color: #1a1a1a}}
+      Mesh{name: "sun" geometry: SphereGeometry{radius: 0.35} position: vec3(2.8, 1.8, -3) material: MeshBasicMaterial{color: #fff2c0 emissive: #ffd9a0 emissive_intensity: 6}}
+    ]}
+    Group3D{position: vec3(8, 0, 0) children: [
+      Fx{preset: @gravity_well radius: 4 amount: 1.2 spacing: 0.3 start: 4.2 duration: 1.5 color: #6fd0ff color2: #ff5a1f}
+    ]}
+  ] }

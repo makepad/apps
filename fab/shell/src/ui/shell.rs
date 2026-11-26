@@ -17,13 +17,13 @@ use crate::print::trays::DrawFabChip;
 use crate::ui::device3d::FabDevice3d;
 use crate::ui::keymap::{self, ShortcutId as Key};
 use crate::ui::popover::{menu_picked, open_menu, MenuItem, MenuPlace};
-use fab_elec_view::board::tools::BoardStripAction;
+use fab_elec_view::board::tools::{BoardStripAction, ARRANGEMENTS};
 use fab_elec_view::explorer::tools::StripAction;
 use fab_elec_view::board::BoardPane;
 use fab_elec_view::explorer::view::ExplorerView;
 use fab_elec_view::instruments::logic_view::LogicScope;
 use fab_elec_view::live::controls_strip::{ControlsStripAction, ElecControlsStrip};
-use fab_elec_view::live::views::{ElecEditor, ElecOutsideEdit};
+use fab_elec_view::live::views::{EditOrigin, ElecEditor, ElecOutsideEdit};
 use crate::workspaces::{ListOp, ShownBy, WorkspaceDef, WorkspaceId, Workspaces};
 use crate::ui::areas::{present, AreaId, AreaTree, DockMap, DropAt, Instance, Moving, Present, Side, WorkspaceOp, GHOST_TAB};
 use crate::ui::editors::{Editor, MENU};
@@ -41,6 +41,22 @@ script_mod! {
         width: 32
         height: 32
         padding: Inset{left: 8 right: 8 top: 8 bottom: 8}
+    }
+    let BoardSettingRow = View{
+        width: Fill height: Fit flow: Down spacing: 2
+        line := View{
+            width: Fill height: 25 flow: Right spacing: 6 align: Align{y: 0.5}
+            caption := mod.widgets.FabLabelDim{width: 87}
+            value := mod.widgets.FabInput{width: Fill height: 24}
+            swatch := mod.widgets.ColorSwatch{visible: false width: 20 height: 20}
+            limit := mod.widgets.FabLabelSmall{visible: false}
+            raised := mod.widgets.FabLabelSmall{visible: false draw_text +: {color: fab.color_warning}}
+        }
+        refusal := RoundedView{
+            visible: false width: Fill height: Fit padding: Inset{left: 5 right: 5 top: 2 bottom: 2}
+            draw_bg +: {color: fab.color_panel border_color: fab.color_error border_size: 1.0 border_radius: fab.radius}
+            reason := mod.widgets.FabLabelSmall{width: Fill draw_text +: {color: fab.color_error}}
+        }
     }
     // A button on a canvas's status bar (zoom).
     let BarAct = mod.widgets.FabIconButton{ width: 24 height: 22 padding: Inset{left: 6 right: 6 top: 5 bottom: 5} }
@@ -212,6 +228,7 @@ script_mod! {
                 Viewport := FabStage{}
                 Device := FabDevice3d{}
                 Plates := FabPlatesPanel{}
+                Journal := FabJournalPanel{}
                 Parts := FabPartsPanel{}
                 Part := FabPartPanel{}
                 Slicer := FabSlicerPanel{}
@@ -221,6 +238,8 @@ script_mod! {
                 Parameters := FabParametersPanel{}
                 Library := FabLibraryPanel{}
                 Checks := FabChecksPanel{}
+                Requirements := FabRequirementsPanel{}
+                Bom := FabBomPanel{}
                 BoardControls := FabBoardControlsPanel{}
                 Paint := FabPaintPanel{}
                 Jobs := FabJobsPanel{}
@@ -232,6 +251,7 @@ script_mod! {
                 Camera := FabCameraPanel{}
                 Mechanics := FabMechanicsPanel{}
                 Features := FabFeaturesPanel{}
+                Steps := FabStepsPanel{}
                 Code := FabCodePanel{}
                 Slice := FabSlicePanel{}
                 Arm := FabArmPanel{}
@@ -267,17 +287,32 @@ script_mod! {
                                 flow: Down
                                 spacing: 1
                                 a11y: {role: "radio_group" label: "Board modes"}
-                                FabTip{ place: TipPlace.Right text: "Select (V, Esc): pick, and drag to move, a part by its pads too"
+                                FabTip{ place: TipPlace.Right text: "Select (V, Esc): click a part, Shift-click to add or remove a part, or drag to move"
                                     t_select := mod.widgets.FabTool{ a11y: {label: "Select"} draw_icon +: { svg: crate_resource("self://resources/icons/select.svg") } }
                                 }
                                 FabTip{ place: TipPlace.Right text: "Route a track (X): drag copper from a pad or a track's end, once. Double-click (or X twice) keeps it"
                                     t_route := mod.widgets.FabTool{ a11y: {label: "Route a track"} draw_icon +: { svg: crate_resource("self://resources/icons/route.svg") } }
+                                }
+                                FabTip{ place: TipPlace.Right text: "Route pair (Shift+X). Drag from either pad of a differential pair to draw both tracks"
+                                    t_pair := mod.widgets.FabTool{ a11y: {label: "Route pair"} draw_icon +: { svg: crate_resource("self://resources/icons/route_pair.svg") } }
+                                }
+                                FabTip{ place: TipPlace.Right text: "Tune length (T). Drag along a track to select its span and sideways to set the fold height"
+                                    t_tune := mod.widgets.FabTool{ a11y: {label: "Tune net length"} draw_icon +: { svg: crate_resource("self://resources/icons/tune.svg") } }
                                 }
                                 FabTip{ place: TipPlace.Right text: "Place a via: click where it goes; it takes the net of the copper there"
                                     t_via := mod.widgets.FabTool{ a11y: {label: "Place a via"} draw_icon +: { svg: crate_resource("self://resources/icons/via.svg") } }
                                 }
                                 FabTip{ place: TipPlace.Right text: "Draw a copper zone: drag its rectangle on the active copper layer; it fills with the net of the copper where the drag starts, else ground"
                                     t_zone := mod.widgets.FabTool{ a11y: {label: "Draw a copper zone"} draw_icon +: { svg: crate_resource("self://resources/icons/zone.svg") } }
+                                }
+                                FabTip{ place: TipPlace.Right text: "Drag a rectangle to replace the outer board outline"
+                                    t_outline := mod.widgets.FabTool{ a11y: {label: "Outline"} draw_icon +: { svg: crate_resource("self://resources/icons/shape.svg") } }
+                                }
+                                FabTip{ place: TipPlace.Right text: "Drag a keepout for copper and parts on the active layer"
+                                    t_keepout := mod.widgets.FabTool{ a11y: {label: "Keepout"} draw_icon +: { svg: crate_resource("self://resources/icons/no_connect.svg") } }
+                                }
+                                FabTip{ place: TipPlace.Right text: "Drag a rectangular cutout through the board"
+                                    t_cutout := mod.widgets.FabTool{ a11y: {label: "Cutout"} draw_icon +: { svg: crate_resource("self://resources/icons/cut_box.svg") } }
                                 }
                                 FabTip{ place: TipPlace.Right text: "Measure a distance: drag from one point to another"
                                     t_measure := mod.widgets.FabTool{ a11y: {label: "Measure a distance"} draw_icon +: { svg: crate_resource("self://resources/icons/measure.svg") } }
@@ -306,8 +341,43 @@ script_mod! {
                             height: Fit
                             flow: Down
                             spacing: 1
+                            selection := View{
+                                width: Fit
+                                height: Fit
+                                flow: Down
+                                spacing: 1
+                                a11y: {role: "group" label: "Selection"}
+                                FabTip{ place: TipPlace.Right text: "Rotate 90° counter-clockwise (R). Shift+R turns clockwise."
+                                    a_rotate := StripAct{ a11y: {label: "Rotate parts"} draw_icon +: { svg: crate_resource("self://resources/icons/rotate.svg") } }
+                                }
+                                FabTip{ place: TipPlace.Right text: "Flip to the other side of the board (B)"
+                                    a_flip := StripAct{ a11y: {label: "Flip parts"} draw_icon +: { svg: crate_resource("self://resources/icons/drag_x.svg") } }
+                                }
+                                FabTip{ place: TipPlace.Right text: "Align or distribute selected parts by their courtyards"
+                                    a_arrange := StripAct{ a11y: {label: "Arrange parts"} draw_icon +: { svg: crate_resource("self://resources/icons/arrange.svg") } }
+                                }
+                            }
+                            mod.widgets.FabToolSep{ width: Fill margin: Inset{top: 3 bottom: 3} }
+                            FabTip{ place: TipPlace.Right text: "Place: the placer puts the selected parts on again where their nets pull them; with none selected, the parts not on the board yet. Stop or Discard on the route line."
+                                a_place := StripAct{ a11y: {label: "Place parts"} draw_icon +: { svg: crate_resource("self://resources/icons/place_parts.svg") } }
+                            }
+                            FabTip{ place: TipPlace.Right text: "Move selected parts to legal spots. With no parts selected, tidy the whole board."
+                                a_tidy := StripAct{ a11y: {label: "Tidy: move parts to legal spots"} draw_icon +: { svg: crate_resource("self://resources/icons/place_plate.svg") } }
+                            }
                             FabTip{ place: TipPlace.Right text: "Fill: pour the ground net over the board on the active copper layer (F pours the net under the pointer)"
                                 a_fill := StripAct{ a11y: {label: "Fill"} draw_icon +: { svg: crate_resource("self://resources/icons/pour.svg") } }
+                            }
+                            stitch_options := View{
+                                visible: false width: Fit height: Fit flow: Down spacing: 1
+                                FabTip{ place: TipPlace.Right text: "Stitch the selected pour or the net under the pointer with through vias"
+                                    a_stitch := mod.widgets.FabFlatButton{width: 42 height: 25 padding: 0 text: "Stitch" a11y: {label: "Stitch pours"}}
+                                }
+                                FabTip{ place: TipPlace.Right text: "Stitch grid pitch in millimetres"
+                                    stitch_pitch := mod.widgets.FabInput{width: 42 height: 22 text: "5 mm" a11y: {label: "Stitch pitch in millimetres"}}
+                                }
+                            }
+                            FabTip{ place: TipPlace.Right text: "Board stackup and base rules"
+                                a_board := mod.widgets.FabFlatButton{width: 42 height: 25 padding: 0 text: "Board" a11y: {label: "Board settings"}}
                             }
                             FabTip{ place: TipPlace.Right text: "Check rules: the board's findings against its design rules"
                                 a_check := StripAct{ a11y: {label: "Check rules"} draw_icon +: { svg: crate_resource("self://resources/icons/check.svg") } }
@@ -320,6 +390,53 @@ script_mod! {
                             }
                             }
                         }
+                    }
+                    settings: mod.widgets.FabFloat{
+                        visible: false width: 320 height: Fit flow: Down padding: 11 spacing: 4
+                        a11y: {role: "group" label: "Board settings"}
+                        factory := BoardSettingRow{line +: {
+                            caption +: {text: "Factory"}
+                            value +: {visible: false}
+                            picker := PropDropDown{width: Fill height: 24 a11y: {label: "Board factory"}}
+                        }}
+                        mod.widgets.FabHeaderLabel{text: "Stackup"}
+                        thickness := BoardSettingRow{line +: {
+                            caption +: {text: "Thickness (mm)"}
+                            value +: {a11y: {label: "Board thickness in millimetres"}}
+                        }}
+                        finish := BoardSettingRow{line +: {
+                            caption +: {text: "Finish"}
+                            value +: {visible: false}
+                            picker := PropDropDown{width: Fill height: 24 a11y: {label: "Surface finish"}}
+                        }}
+                        mask := BoardSettingRow{line +: {
+                            caption +: {text: "Mask colour"}
+                            value +: {a11y: {label: "Solder mask colour"}}
+                            swatch +: {visible: true}
+                        }}
+                        silk := BoardSettingRow{line +: {
+                            caption +: {text: "Silk colour"}
+                            value +: {a11y: {label: "Silkscreen colour"}}
+                            swatch +: {visible: true}
+                        }}
+                        mod.widgets.FabToolSep{width: Fill}
+                        mod.widgets.FabHeaderLabel{text: "Base rules (mm)"}
+                        track := BoardSettingRow{line +: {
+                            caption +: {text: "Track"}
+                            value +: {empty_text: "Inherited" a11y: {label: "Minimum track width in millimetres"}}
+                        }}
+                        clearance := BoardSettingRow{line +: {
+                            caption +: {text: "Clearance"}
+                            value +: {empty_text: "Inherited" a11y: {label: "Minimum clearance in millimetres"}}
+                        }}
+                        drill := BoardSettingRow{line +: {
+                            caption +: {text: "Drill"}
+                            value +: {empty_text: "Inherited" a11y: {label: "Minimum drill in millimetres"}}
+                        }}
+                        annular := BoardSettingRow{line +: {
+                            caption +: {text: "Annular ring"}
+                            value +: {empty_text: "Inherited" a11y: {label: "Minimum annular ring in millimetres"}}
+                        }}
                     }
                     status: View{
                         visible: true
@@ -700,6 +817,9 @@ pub struct FabShell {
     /// The dock can resume a draw after a child yields.
     #[rust]
     cameras_frame: Option<u64>,
+    /// The Board pane and unit that opened the Arrange menu.
+    #[rust]
+    arrange_from: Option<(WidgetUid, fab_elec_core::BoardId)>,
     /// Whether the shell has enabled the frame monitor for the Performance editor.
     #[rust]
     perf_shown: bool,
@@ -929,20 +1049,35 @@ impl FabShell {
         }
     }
 
-    /// The Board's route method flyout: the pane asks with the method in use and the button's
-    /// rectangle, the menu opens to the button's right, and the method picked goes back to the pane.
-    fn method_flyout(&mut self, cx: &mut Cx, actions: &Actions) {
+    /// The Board opens its flyouts beside their buttons. An Arrange pick returns only
+    /// to the pane and board that requested it, even when a second Board view is open.
+    fn board_flyouts(&mut self, cx: &mut Cx, actions: &Actions) {
         for action in actions.iter().filter_map(|a| a.downcast_ref::<BoardStripAction>()) {
-            if let BoardStripAction::MethodMenu { rows, anchor } = action {
-                let items = rows.iter().enumerate()
-                    .map(|(i, (name, on))| MenuItem::new(LiveId(i as u64 + 1), *name).radio(*on)).collect();
-                let at = Rect { pos: dvec2(anchor.pos.x + anchor.size.x + 4.0, anchor.pos.y), size: dvec2(0.0, 0.0) };
-                open_menu(cx, live_id!(board_route_method), items, at, MenuPlace::At);
-            }
+            let (owner, items, anchor) = match action {
+                BoardStripAction::MethodMenu { rows, anchor } => {
+                    let items = rows.iter().enumerate()
+                        .map(|(i, (name, on))| MenuItem::new(LiveId(i as u64 + 1), *name).radio(*on)).collect();
+                    (live_id!(board_route_method), items, anchor)
+                }
+                BoardStripAction::ArrangeMenu { pane, unit, enabled, anchor } => {
+                    self.arrange_from = Some((*pane, *unit));
+                    let items = ARRANGEMENTS.iter().enumerate()
+                        .map(|(i, (name, _))| MenuItem::new(LiveId(i as u64 + 1), *name).enabled_if(enabled[i])).collect();
+                    (live_id!(board_arrange), items, anchor)
+                }
+                _ => continue,
+            };
+            let at = Rect { pos: dvec2(anchor.pos.x + anchor.size.x + 4.0, anchor.pos.y), size: dvec2(0.0, 0.0) };
+            open_menu(cx, owner, items, at, MenuPlace::At);
         }
         if let Some(LiveId(row)) = menu_picked(actions, live_id!(board_route_method)) {
             if let Some(i) = (row as usize).checked_sub(1) {
                 cx.action(BoardStripAction::Method(i));
+            }
+        }
+        if let Some(LiveId(row)) = menu_picked(actions, live_id!(board_arrange)) {
+            if let (Some((pane, unit)), Some((_, command))) = (self.arrange_from.take(), (row as usize).checked_sub(1).and_then(|i| ARRANGEMENTS.get(i))) {
+                cx.action(BoardStripAction::Arrange { pane, unit, command: *command });
             }
         }
     }
@@ -960,6 +1095,17 @@ impl FabShell {
             _ => None,
         };
         pane.set_lit_net(cx, net);
+    }
+
+    /// Another view selected a group of parts (the schematic's box or its shift-clicks): the board
+    /// pane selects the same parts, so its Place and arrange tools take them. O(selected).
+    fn answer_board_group(&mut self, cx: &mut Cx, selected: &[fab_elec_core::Sel]) {
+        let dock = self.view.dock(cx, ids!(main.dock));
+        let tab = Editor::Board.tab();
+        let body = dock.borrow_mut().and_then(|mut dock| dock.items().get(&tab).map(|(_, body)| body.clone()));
+        let Some(body) = body else { return };
+        let Some(mut pane) = body.borrow_mut::<fab_elec_view::board::BoardPane>() else { return };
+        pane.set_selection(cx, selected);
     }
 
     /// A view cleared the selection: the board pane clears its own and its lit net.
@@ -1385,7 +1531,7 @@ impl FabShell {
     fn outline_edited(&mut self, cx: &mut Cx, edit: &ElecOutsideEdit) {
         let kinds: Vec<LiveId> = edit.editors.iter().map(|e| elec_editor(*e).kind()).collect();
         if let Some(mut nubs) = self.view.widget(cx, ids!(area_nubs)).borrow_mut::<FabAreaNotches>() {
-            nubs.light(cx, &kinds, edit.origin == fab_elec_view::live::views::EditOrigin::Ai);
+            nubs.light(cx, &kinds, matches!(edit.origin, EditOrigin::Ai | EditOrigin::Agent));
         }
     }
 
@@ -2133,7 +2279,7 @@ impl Widget for FabShell {
                 self.circuit_strip_actions(cx, actions);
                 self.library_prefs(cx, actions, workspaces);
                 self.power_flyout(cx, actions);
-                self.method_flyout(cx, actions);
+                self.board_flyouts(cx, actions);
             }
             // A probe's card, or a wire clicked, on the sheet or the board shows its lane in the Scope.
             for a in actions.iter().filter_map(|a| a.downcast_ref::<fab_elec_view::live::flags::OpenInScope>()) {
@@ -2179,6 +2325,9 @@ impl Widget for FabShell {
                         self.scope_follows(cx, None);
                     }
                     _ => {}
+                }
+                if let Some(group) = a.as_widget_action().and_then(|w| w.action.downcast_ref::<fab_elec_view::ViewState>()) {
+                    self.answer_board_group(cx, &group.selected);
                 }
             }
         }

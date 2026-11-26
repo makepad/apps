@@ -204,7 +204,16 @@ fn op_name(op: &BoardOp) -> &'static str {
 /// last statement; a header edit, a touched tuning or an insertion anchored at the headers also
 /// parses the document (20 ms at 10k statements, 550 KB).
 pub fn splice_board(sources: &Sources, map: &SourceMap, before: &Board, circuit: &Circuit, ops: &[BoardOp], factory: Option<Option<String>>) -> Result<SpanEdit, Diag> {
-    let unit = map.locate(&Sel::Unit(before.unit)).ok_or_else(|| Diag::error("the board has no document", vec![Sel::Unit(before.unit)]))?;
+    let mut unit = map.locate(&Sel::Unit(before.unit)).ok_or_else(|| Diag::error("the board has no document", vec![Sel::Unit(before.unit)]))?;
+    // board(..) is optional. Without it the unit selection points at its circuit.
+    if factory.is_some() {
+        if let Some(circuit) = sources.doc(unit.doc).filter(|d| d.kind == DocKind::Circuit) {
+            let stem = circuit.name.strip_suffix(DocKind::Circuit.suffix()).unwrap();
+            if let Some(doc) = sources.find(&format!("{stem}.pcb.splash")) {
+                unit = SourceRange { doc, span: 0..0 };
+            }
+        }
+    }
     let error = |message: String| located(unit.doc, unit.span.clone(), message);
     if unit.doc.0 & LIB_DOC != 0 { return Err(error("library board documents are read-only".into())); }
     let source = sources.doc(unit.doc).ok_or_else(|| error("the board document is missing".into()))?;
@@ -283,6 +292,7 @@ pub fn splice_board(sources: &Sources, map: &SourceMap, before: &Board, circuit:
             }
         }
     }
+    let old_names = names.clone();
     let mut bindings = Vec::new();
     let mut next_name = 0;
     for tuning in after.tunings.iter().filter(|t| touched.contains(&t.id) && t.origin.has_statement()) {
@@ -315,6 +325,11 @@ pub fn splice_board(sources: &Sources, map: &SourceMap, before: &Board, circuit:
             if authored_after(id) && !reinserted.contains(&id) {
                 let statement = board_doc::item_statement(&after, circuit, id, &names)
                     .ok_or_else(|| error("a changed board statement is missing".into()))?;
+                // Some model changes, such as a junction's segment index, have no written field.
+                // Compare both model renderings so the person's original spelling survives.
+                if board_doc::item_statement(before, circuit, id, &old_names).as_ref() == Some(&statement) {
+                    continue;
+                }
                 if let Some(patch) = replacement(text, span, statement, Some(sel)) { patches.push(patch); }
             } else {
                 patches.push(deletion(text, span));
@@ -379,6 +394,19 @@ pub fn splice_board(sources: &Sources, map: &SourceMap, before: &Board, circuit:
         let set_stack = ops.iter().any(|op| matches!(op, BoardOp::SetStackup(_)));
         let set_outline = ops.iter().any(|op| matches!(op, BoardOp::SetOutline(_)));
         let set_rules = ops.iter().any(|op| matches!(op, BoardOp::SetRules(_)));
+        // A base-only edit owns just rules(..). Deferred rule/check functions may have
+        // source statements even when the evaluated board carries no corresponding code.
+        let base_only = set_rules && before.rules.base != after.rules.base
+            && before.rules.custom == after.rules.custom && before.rules.checks == after.rules.checks
+            && before.rules.waivers == after.rules.waivers;
+        let selected = |kind| match kind {
+            HeaderKind::Board => false,
+            HeaderKind::Factory => set_factory,
+            HeaderKind::Stackup => set_stack,
+            HeaderKind::Outline => set_outline,
+            HeaderKind::Rules => set_rules,
+            HeaderKind::Rule | HeaderKind::Check | HeaderKind::Waive => set_rules && !base_only,
+        };
         let wanted = board_doc::header_statements(&after, circuit, profile, &|_| None);
         let mut waivers = after.rules.waivers.iter();
         let mut rules = after.rules.custom.iter();
@@ -391,17 +419,10 @@ pub fn splice_board(sources: &Sources, map: &SourceMap, before: &Board, circuit:
                 HeaderKind::Check => checks.next().map(|c| (c.name.clone(), String::new())),
                 _ => None,
             };
-            let selected = match kind {
-                HeaderKind::Board => false,
-                HeaderKind::Factory => set_factory,
-                HeaderKind::Stackup => set_stack,
-                HeaderKind::Outline => set_outline,
-                _ => set_rules,
-            };
-            if selected { desired.push((kind, key, statement)); }
+            if selected(kind) { desired.push((kind, key, statement)); }
         }
         for kind in [HeaderKind::Factory, HeaderKind::Stackup, HeaderKind::Outline, HeaderKind::Rules, HeaderKind::Waive, HeaderKind::Rule, HeaderKind::Check] {
-            if !match kind { HeaderKind::Factory => set_factory, HeaderKind::Stackup => set_stack, HeaderKind::Outline => set_outline, _ => set_rules } { continue; }
+            if !selected(kind) { continue; }
             let existing: Vec<_> = headers.iter().filter(|h| h.kind == kind).collect();
             let wanted: Vec<_> = desired.iter().enumerate().filter(|(_, (k, _, _))| *k == kind).collect();
             if matches!(kind, HeaderKind::Factory | HeaderKind::Stackup | HeaderKind::Outline | HeaderKind::Rules) {

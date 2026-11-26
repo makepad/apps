@@ -9,7 +9,7 @@
 
 use crate::api::*;
 use crate::ui::keymap::{self, ShortcutId as Key};
-use crate::model::state::{part_axes, pose_stretch_about, pose_turn_shift};
+use crate::model::state::{part_axes, pose_stretch_about, pose_turn_shift, Pose};
 use crate::print::colour_map::{FabColorLink, PartPick};
 use crate::print::trays::DrawFabChip;
 use crate::tools::transform::{mm_to_world, shown_part};
@@ -20,6 +20,7 @@ use makepad_widgets_core::widget_tree::CxWidgetExt;
 
 const ADD_MENU: LiveId = live_id!(fab_parts_add);
 const PART_MENU: LiveId = live_id!(fab_parts_context);
+const ORIGIN_FIELD_MAX: f64 = 400.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowKind {
@@ -386,25 +387,32 @@ script_mod! {
         draw_bg +: { color: fab.color_editor }
         tools := View{
             width: Fill
-            height: 36
-            flow: Right
-            align: Align{x: 0.0 y: 0.5}
-            padding: Inset{left: 8 right: 8 top: 0 bottom: 0}
+            height: Fit
+            flow: Down
+            padding: Inset{left: 8 right: 8 top: 4 bottom: 4}
             spacing: 2
-            FabTip{ text: "Add a shape or import a model"
-                add := mod.widgets.FabDropdownButton{ a11y: {label: "Add"}
-                    tag: @fab_parts_add
-                    owner: @fab_parts_add
-                    height: 26
-                    label +: { text: "Add" }
+            View{width: Fill height: Fit flow: Right{wrap: true} spacing: 2 align: Align{y: 0.5}
+                FabTip{ text: "Add a shape or import a model"
+                    add := mod.widgets.FabDropdownButton{ a11y: {label: "Add"}
+                        tag: @fab_parts_add
+                        owner: @fab_parts_add
+                        height: 26
+                        label +: { text: "Add" }
+                    }
+                }
+                FabTip{ text: #(keymap::tooltip(Key::FrameAll))
+                    frame := ToolIcon{ a11y: {label: "Frame plate"} draw_icon +: { svg: crate_resource("self://resources/icons/fit.svg") } }
                 }
             }
-            Filler{}
-            FabTip{ text: "Arrange every part on the plate"
-                arrange := ToolIcon{ a11y: {label: "Arrange plate"} draw_icon +: { svg: crate_resource("self://resources/icons/arrange.svg") } }
-            }
-            FabTip{ text: #(keymap::tooltip(Key::FrameAll))
-                frame := ToolIcon{ a11y: {label: "Frame plate"} draw_icon +: { svg: crate_resource("self://resources/icons/fit.svg") } }
+            pack_gap := FabNumberRow{
+                height: 24
+                label +: {text: "Gap"}
+                value +: {num +: {a11y: {label: "Arrange gap"} min: 0.0 max: 0.0 step: 0.5 precision: 1 suffix: " mm"}}
+                trail +: {width: 26
+                    FabTip{ text: "Arrange every part on the plate"
+                        arrange := ToolIcon{ a11y: {label: "Arrange plate"} draw_icon +: { svg: crate_resource("self://resources/icons/arrange.svg") } }
+                    }
+                }
             }
         }
         mod.widgets.FabHr{}
@@ -619,71 +627,83 @@ script_mod! {
                 transform := PropSection{
                     header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/move.svg")}} title +: {text: "Position"}}}
                     body +: {
+                        anchor_row := PropRow{
+                            label +: {text: "Anchor"}
+                            value +: {anchor := PropDropDown{width: Fill labels: ["Origin" "Centre" "Corner"] a11y: {label: "Position anchor"}}}
+                        }
                         xy := PropStack{
-                            x := PropNumberRow{
+                            x := FabNumberRow{
                                 label +: {text: "Position X"}
-                                value +: {num +: {a11y: {label: "X"} min: -50.0 max: 400.0 step: 0.5 snap: 5.0 precision: 1 suffix: " mm"}}
+                                value +: {num +: {a11y: {label: "X"} min: -50.0 max: #(ORIGIN_FIELD_MAX) step: 0.5 snap: 5.0 precision: 1 suffix: " mm"}}
                             }
-                            y := PropNumberRow{
+                            y := FabNumberRow{
                                 label +: {text: "Y"}
-                                value +: {num +: {a11y: {label: "Y"} min: -50.0 max: 400.0 step: 0.5 snap: 5.0 precision: 1 suffix: " mm"}}
+                                value +: {num +: {a11y: {label: "Y"} min: -50.0 max: #(ORIGIN_FIELD_MAX) step: 0.5 snap: 5.0 precision: 1 suffix: " mm"}}
                             }
                         }
                         rs := View{width: Fill height: Fit flow: Down spacing: theme.prop_row_gap
-                            rot := PropNumberRow{
+                            rot := FabNumberRow{
                                 label +: {text: "Turn"}
                                 value +: {num +: {a11y: {label: "Turn"} min: -360.0 max: 360.0 step: 1.0 snap: 15.0 precision: 0 suffix: "°"}}
                             }
-                            scale := PropNumberRow{
-                                label +: {text: "Scale X"}
-                                value +: {num +: {a11y: {label: "Scale X"} min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}}
-                                trail +: {width: 26 lock := mod.widgets.FabIconCheck{ a11y: {label: "Keep proportions"} width: 24 height: 22 padding: Inset{left: 4 right: 4 top: 3 bottom: 3} draw_icon +: { svg: crate_resource("self://resources/icons/link.svg") } }}
-                            }
-                            scale_y := PropNumberRow{
-                                label +: {text: "Y"}
-                                value +: {num +: {a11y: {label: "Scale Y"} min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}}
-                            }
-                            scale_z := PropNumberRow{
-                                label +: {text: "Z"}
-                                value +: {num +: {a11y: {label: "Scale Z"} min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}}
+                            // One block, like Position's: the three fields share the lock's column and
+                            // move under their labels together.
+                            sxyz := PropStack{
+                                scale := FabNumberRow{
+                                    label +: {text: "Scale X"}
+                                    value +: {num +: {a11y: {label: "Scale X"} min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}}
+                                    trail +: {width: 26 lock := mod.widgets.FabIconCheck{ a11y: {label: "Keep proportions"} width: 24 height: 22 padding: Inset{left: 4 right: 4 top: 3 bottom: 3} draw_icon +: { svg: crate_resource("self://resources/icons/link.svg") } }}
+                                }
+                                scale_y := FabNumberRow{
+                                    label +: {text: "Y"}
+                                    value +: {num +: {a11y: {label: "Scale Y"} min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}}
+                                    trail +: {width: 26}
+                                }
+                                scale_z := FabNumberRow{
+                                    label +: {text: "Z"}
+                                    value +: {num +: {a11y: {label: "Scale Z"} min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}}
+                                    trail +: {width: 26}
+                                }
                             }
                         }
-                        // The part's actions as a light strip; Delete keeps to the far end.
+                        // The part's actions as a light strip; Delete keeps to the far end. The other
+                        // actions wrap onto more lines when the panel narrows, so none drops off.
                         buttons := View{
                             width: Fill height: Fit flow: Right spacing: 2 margin: Inset{top: 4}
-                            align: Align{x: 0.0 y: 0.5}
-                            FabTip{text: "Drop to plate"
-                                drop := mod.widgets.FabActionButton{
-                                    a11y: {label: "Drop to plate"}
-                                    draw_icon +: {svg: crate_resource("self://resources/icons/drop.svg")}
+                            align: Align{x: 0.0 y: 0.0}
+                            View{width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 2
+                                FabTip{text: "Drop to plate"
+                                    drop := mod.widgets.FabActionButton{
+                                        a11y: {label: "Drop to plate"}
+                                        draw_icon +: {svg: crate_resource("self://resources/icons/drop.svg")}
+                                    }
+                                }
+                                FabTip{text: #(keymap::tooltip(Key::DuplicateLinked))
+                                    duplicate_linked := mod.widgets.FabActionButton{
+                                        a11y: {label: "Duplicate linked"}
+                                        draw_icon +: {svg: crate_resource("self://resources/icons/duplicate_linked.svg")}
+                                    }
+                                }
+                                FabTip{text: #(keymap::tooltip(Key::DuplicateCopy))
+                                    duplicate_copy := mod.widgets.FabActionButton{
+                                        a11y: {label: "Duplicate"}
+                                        draw_icon +: {svg: crate_resource("self://resources/icons/duplicate.svg")}
+                                    }
+                                }
+                                FabTip{text: "Frame in view"
+                                    frame := mod.widgets.FabActionButton{
+                                        a11y: {label: "Frame in view"}
+                                        draw_icon +: {svg: crate_resource("self://resources/icons/fit.svg")}
+                                    }
+                                }
+                                FabTip{text: "Make printable"
+                                    make_printable := mod.widgets.FabActionButton{
+                                        visible: false
+                                        a11y: {label: "Make printable"}
+                                        draw_icon +: {svg: crate_resource("self://resources/icons/cube.svg")}
+                                    }
                                 }
                             }
-                            FabTip{text: #(keymap::tooltip(Key::DuplicateLinked))
-                                duplicate_linked := mod.widgets.FabActionButton{
-                                    a11y: {label: "Duplicate linked"}
-                                    draw_icon +: {svg: crate_resource("self://resources/icons/duplicate_linked.svg")}
-                                }
-                            }
-                            FabTip{text: #(keymap::tooltip(Key::DuplicateCopy))
-                                duplicate_copy := mod.widgets.FabActionButton{
-                                    a11y: {label: "Duplicate"}
-                                    draw_icon +: {svg: crate_resource("self://resources/icons/duplicate.svg")}
-                                }
-                            }
-                            FabTip{text: "Frame in view"
-                                frame := mod.widgets.FabActionButton{
-                                    a11y: {label: "Frame in view"}
-                                    draw_icon +: {svg: crate_resource("self://resources/icons/fit.svg")}
-                                }
-                            }
-                            FabTip{text: "Make printable"
-                                make_printable := mod.widgets.FabActionButton{
-                                    visible: false
-                                    a11y: {label: "Make printable"}
-                                    draw_icon +: {svg: crate_resource("self://resources/icons/cube.svg")}
-                                }
-                            }
-                            View{width: Fill height: 1}
                             FabTip{text: "Delete"
                                 delete := mod.widgets.FabActionButton{
                                     a11y: {label: "Delete"}
@@ -1168,6 +1188,9 @@ impl Widget for FabPartsPanel {
                 cx.action(ShellAction::OpenDemo("motor_mount".into()));
             }
         }
+        if let Some(gap) = self.view.value_input(cx, ids!(tools.pack_gap.value.num)).ended(actions) {
+            cx.action(PartAction::SetArrangeGap(gap));
+        }
         if self.view.button(cx, ids!(tools.arrange)).clicked(actions) {
             cx.action(PartAction::Arrange);
         }
@@ -1178,6 +1201,7 @@ impl Widget for FabPartsPanel {
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         let Some(state) = scope.data.get::<AppState>() else { return self.view.draw_walk(cx, scope, walk) };
+        self.view.value_input(cx, ids!(tools.pack_gap.value.num)).set_value(cx, state.plate.arrange_gap.unwrap_or(8.0));
         self.sync_tree(state);
         self.order.clear();
         self.order.extend(self.tree.iter().enumerate().filter(|(_, r)| !folded(&self.tree, &self.collapsed, r)).map(|(i, _)| i));
@@ -1907,6 +1931,12 @@ pub struct FabPartPanel {
     view: View,
     #[rust]
     shown: Option<(String, u64)>,
+    #[rust]
+    anchor: PositionAnchor,
+    #[rust]
+    position_shown: Option<(usize, u64, PositionAnchor, Pose)>,
+    #[rust]
+    shown_xy: [f64; 2],
     /// What `rest` shows besides its setters' values, as it last recorded: the part and its
     /// plate (which of its sections and rows show, its painted colours) and the print colours
     /// (the colour row and the trays read them as they draw).
@@ -1914,9 +1944,29 @@ pub struct FabPartPanel {
     rest_shown: Option<(String, u64, crate::print::colours::Mapping)>,
 }
 
-impl FabPartPanel {
-    fn part<'a>(state: &'a AppState) -> Option<&'a PlatePart> {
-        active_part(state).and_then(|i| state.plate.parts.get(i))
+#[derive(Clone, Copy, Default, PartialEq)]
+pub enum PositionAnchor {
+    #[default]
+    Origin,
+    Centre,
+    Corner,
+}
+
+impl PositionAnchor {
+    fn xy(self, part: &PlatePart) -> [f64; 2] {
+        let [x, y, _] = match self {
+            Self::Origin => part.origin,
+            Self::Centre => part.center(),
+            Self::Corner => part.min_mm,
+        };
+        [x, y]
+    }
+
+    /// The origin move for an edit to one of the panel's two position fields.
+    pub fn place_field(self, part: &PlatePart, axis: usize, value: f64) -> PartAction {
+        let mut at = [part.origin[0], part.origin[1]];
+        at[axis] = value + (at[axis] - self.xy(part)[axis]);
+        PartAction::Place { object: part.object.clone(), at, rotate: part.rotate }
     }
 }
 
@@ -1972,29 +2022,32 @@ impl Widget for FabPartPanel {
         let p = &state.plate.parts[index];
         let object = &p.object;
         let v = &self.view;
-        if v.radio_button(cx, ids!(body.transform.rs.scale.trail.lock)).clicked(actions) {
+        if v.button(cx, ids!(body.transform.buttons.frame)).clicked(actions) {
+            cx.action(ShellAction::FrameSelected);
+        }
+        if state.slice_blocks_edits() { return; }
+        if v.radio_button(cx, ids!(body.transform.rs.sxyz.scale.trail.lock)).clicked(actions) {
             state.ui.scale_locked = !state.ui.scale_locked;
             crate::ui::redraw(cx, &[ids!(tab_part)]);
         }
         if p.imported_mesh && v.button(cx, ids!(body.transform.buttons.make_printable)).clicked(actions) {
             cx.action(PartAction::MakePrintable { object: object.clone() });
         }
-        // Its Position is its origin (what its `at` places): it turns and scales about that.
         let o = p.origin;
         let x = v.value_input(cx, ids!(body.transform.xy.x.value.num));
         let y = v.value_input(cx, ids!(body.transform.xy.y.value.num));
         let scales = [
-            v.value_input(cx, ids!(body.transform.rs.scale.value.num)),
-            v.value_input(cx, ids!(body.transform.rs.scale_y.value.num)),
-            v.value_input(cx, ids!(body.transform.rs.scale_z.value.num)),
+            v.value_input(cx, ids!(body.transform.rs.sxyz.scale.value.num)),
+            v.value_input(cx, ids!(body.transform.rs.sxyz.scale_y.value.num)),
+            v.value_input(cx, ids!(body.transform.rs.sxyz.scale_z.value.num)),
         ];
         // While a number scrubs, the part follows through the placement preview.
         let about = mm_to_world([o[0], o[1], p.min_mm[2]]);
         let zero = vec3(0.0, 0.0, 0.0);
         let pose = if let Some(nx) = x.changed(actions) {
-            Some(pose_turn_shift(zero, 0.0, mm_to_world([nx - o[0], 0.0, 0.0])))
+            Some(pose_turn_shift(zero, 0.0, mm_to_world([nx - self.anchor.xy(p)[0], 0.0, 0.0])))
         } else if let Some(ny) = y.changed(actions) {
-            Some(pose_turn_shift(zero, 0.0, mm_to_world([0.0, ny - o[1], 0.0])))
+            Some(pose_turn_shift(zero, 0.0, mm_to_world([0.0, ny - self.anchor.xy(p)[1], 0.0])))
         } else if let Some(r) = v.value_input(cx, ids!(body.transform.rs.rot.value.num)).changed(actions) {
             Some(pose_turn_shift(about, (r - p.rotate) as f32, zero))
         } else {
@@ -2011,10 +2064,21 @@ impl Widget for FabPartPanel {
         }
         let p = &state.plate.parts[index];
         if let Some(nx) = x.ended(actions) {
-            cx.action(PartAction::Place { object: object.clone(), at: [nx, o[1]], rotate: p.rotate });
+            cx.action(self.anchor.place_field(p, 0, nx));
         }
         if let Some(ny) = y.ended(actions) {
-            cx.action(PartAction::Place { object: object.clone(), at: [o[0], ny], rotate: p.rotate });
+            cx.action(self.anchor.place_field(p, 1, ny));
+        }
+        if let Some(choice) = v.drop_down(cx, ids!(body.transform.anchor)).changed(actions) {
+            self.anchor = match choice { 1 => PositionAnchor::Centre, 2 => PositionAnchor::Corner, _ => PositionAnchor::Origin };
+            // A footprint may extend beyond the origin field's range. Equal limits give
+            // ValueInput an unbounded coordinate with the same scrub step and snap.
+            for field in [x, y] {
+                if let Some(mut f) = field.borrow_mut() {
+                    f.max = if self.anchor == PositionAnchor::Origin { ORIGIN_FIELD_MAX } else { f.min };
+                }
+            }
+            crate::ui::redraw(cx, &[ids!(tab_part)]);
         }
         if let Some(r) = v.value_input(cx, ids!(body.transform.rs.rot.value.num)).ended(actions) {
             cx.action(PartAction::Place { object: object.clone(), at: [o[0], o[1]], rotate: r });
@@ -2033,9 +2097,6 @@ impl Widget for FabPartPanel {
         if v.button(cx, ids!(body.transform.buttons.duplicate_copy)).clicked(actions) {
             duplicate_selected(cx, state, true);
         }
-        if v.button(cx, ids!(body.transform.buttons.frame)).clicked(actions) {
-            cx.action(ShellAction::FrameSelected);
-        }
         if v.button(cx, ids!(body.transform.buttons.delete)).clicked(actions) {
             delete_selected(cx, state);
         }
@@ -2044,13 +2105,13 @@ impl Widget for FabPartPanel {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         if let Some(state) = scope.data.get::<AppState>() {
             // As it shows now: a part being placed reads where it is, not where it was.
-            let part = Self::part(state).map(|p| shown_part(state, p));
+            let part = active_part(state).map(|i| (i, shown_part(state, &state.plate.parts[i])));
             self.view.widget(cx, ids!(none)).set_visible(cx, part.is_none());
             if part.is_none() {
                 self.view.label(cx, ids!(none.plate_summary)).set_text(cx, &plate_summary(state));
             }
             self.view.view(cx, ids!(body)).set_visible(cx, part.is_some());
-            if let Some(p) = part {
+            if let Some((index, p)) = part {
                 let v = &self.view;
                 let key = (p.object.clone(), state.plate.revision);
                 let fresh = self.shown.as_ref() != Some(&key);
@@ -2064,16 +2125,27 @@ impl Widget for FabPartPanel {
                 v.widget(cx, ids!(body.params_row)).set_visible(cx, !state.ui.on_screen(crate::ui::editors::Editor::Parameters));
                 v.button(cx, ids!(body.transform.buttons.make_printable)).set_visible(cx, p.imported_mesh);
                 let can_dup = !state.slice_blocks_edits();
+                for id in [ids!(body.transform.xy), ids!(body.transform.rs), ids!(body.transform.anchor_row)] {
+                    v.widget(cx, id).set_visible(cx, can_dup);
+                }
+                v.button(cx, ids!(body.transform.buttons.drop)).set_enabled(cx, can_dup);
+                v.button(cx, ids!(body.transform.buttons.delete)).set_enabled(cx, can_dup);
                 v.button(cx, ids!(body.transform.buttons.duplicate_linked)).set_enabled(cx, can_dup);
                 v.button(cx, ids!(body.transform.buttons.duplicate_copy)).set_enabled(cx, can_dup);
                 v.label(cx, ids!(body.ident.size)).set_text(cx, &if p.triangles == 0 { format!("{} · SDF", size_text(&p)) } else { format!("{} · {} triangles", size_text(&p), p.triangles) });
-                v.value_input(cx, ids!(body.transform.xy.x.value.num)).set_value(cx, p.origin[0]);
-                v.value_input(cx, ids!(body.transform.xy.y.value.num)).set_value(cx, p.origin[1]);
+                let position = (index, state.plate.revision, self.anchor, state.scene_state.nudge_of(p.element));
+                if self.position_shown != Some(position) {
+                    self.shown_xy = self.anchor.xy(&p);
+                    self.position_shown = Some(position);
+                }
+                // Each setter leaves a field being edited alone and takes the value on release.
+                v.value_input(cx, ids!(body.transform.xy.x.value.num)).set_value(cx, self.shown_xy[0]);
+                v.value_input(cx, ids!(body.transform.xy.y.value.num)).set_value(cx, self.shown_xy[1]);
                 v.value_input(cx, ids!(body.transform.rs.rot.value.num)).set_value(cx, p.rotate);
-                v.value_input(cx, ids!(body.transform.rs.scale.value.num)).set_value(cx, p.scale[0] * 100.0);
-                v.value_input(cx, ids!(body.transform.rs.scale_y.value.num)).set_value(cx, p.scale[1] * 100.0);
-                v.value_input(cx, ids!(body.transform.rs.scale_z.value.num)).set_value(cx, p.scale[2] * 100.0);
-                let lock = v.radio_button(cx, ids!(body.transform.rs.scale.trail.lock));
+                v.value_input(cx, ids!(body.transform.rs.sxyz.scale.value.num)).set_value(cx, p.scale[0] * 100.0);
+                v.value_input(cx, ids!(body.transform.rs.sxyz.scale_y.value.num)).set_value(cx, p.scale[1] * 100.0);
+                v.value_input(cx, ids!(body.transform.rs.sxyz.scale_z.value.num)).set_value(cx, p.scale[2] * 100.0);
+                let lock = v.radio_button(cx, ids!(body.transform.rs.sxyz.scale.trail.lock));
                 if lock.active(cx) != state.ui.scale_locked {
                     lock.set_active(cx, state.ui.scale_locked, Animate::No);
                 }

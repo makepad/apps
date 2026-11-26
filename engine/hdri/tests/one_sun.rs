@@ -229,14 +229,17 @@ fn env_world(sun: Option<makepad_scene::EnvSun>, rotation_deg: f32) -> World {
 
 /// Phase 2's pinned contract: the sun the environment map carries is the
 /// direction the light shades with — at every azimuth, elevation and map
-/// rotation — and a sky lights from above.
+/// rotation — and a sky lights from above. The map draws the sun where it is
+/// seen, lifted by the air's refraction (0.09 degrees at 10 degrees up), so
+/// that is where the bake reports it.
 #[test]
 fn the_environments_sun_equals_the_resolved_light_direction() {
     for (az, el) in [(135.0f32, 40.0f32), (20.0, 10.0), (300.0, 65.0)] {
         let (map, sun) = bake_env_map(&manual_sky(az, el), 64, serial);
         let sun = sun.expect("a sky with the sun up reports its sun");
+        let seen = hdri::dir_from_az_el(az, hdri::atmosphere::apparent_elevation(el.to_radians()).to_degrees());
         // 0.05 degrees: this file's f32 acos cannot resolve less than 0.02.
-        assert!(angle_deg(sun.dir, hdri::dir_from_az_el(az, el)) < 0.05, "the bake reports where it drew the sun");
+        assert!(angle_deg(sun.dir, seen) < 0.05, "the bake reports where it drew the sun: {:?} vs {seen:?}", sun.dir);
         // The renderer lights with the map's lighting copy: the sun's cone
         // filled with the sky around it, because the directional light
         // carries the sun (renderer/ibl.rs).
@@ -245,7 +248,7 @@ fn the_environments_sun_equals_the_resolved_light_direction() {
         let lighting = lighting_of(&lit);
         for rotation in [0.0f32, 90.0, -45.0] {
             let world = env_world(Some(sun), rotation);
-            let want = hdri::rotate_y(hdri::dir_from_az_el(az, el), rotation);
+            let want = hdri::rotate_y(seen, rotation);
             let dir = env_sun_dir(&world).expect("the environment places the sun");
             assert!(angle_deg(dir, want) < 0.05, "az {az} el {el} rot {rotation}: {dir:?} vs {want:?}");
             let rig = env_sun_rig(&world, Some(&lighting), resolve_sun(&world.sun).to_hdr(), true);

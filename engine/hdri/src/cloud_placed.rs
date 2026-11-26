@@ -1,7 +1,5 @@
 //! A placed cloud volume (design §2.1's placed class, §4.3): a Cumulonimbus standing at (azimuth, distance), marched
-//! only where a ray meets its bounds, with no 32 km limit. A Lenticular is one too, its shape the plates of
-//! `cloud_lens::Lens` in place of the storm's envelope; the march, its light and its upload are the same. It does not
-//! stand on the field types' grids (the footprint, sun-depth and tau_up grids are built round the viewer out to 34 km,
+//! only where a ray meets its bounds, with no 32 km limit. It does not stand on the field types' grids (the footprint, sun-depth and tau_up grids are built round the viewer out to 34 km,
 //! and a storm stands 5 to 120 km out): its shape is closed-form, an envelope of distances in metres covered with the
 //! billow tile's cauliflower, and its marches read it directly.
 //!
@@ -10,12 +8,12 @@
 //!   its foot than under its domed cap, bulging with PUFFS puffs, joined smoothly; a base, flat as a whole and ragged at
 //!   its edge; an anvil at the top, a plate thick at the tower and thinning downwind to a frayed edge that curls down,
 //!   flaring into the tower; an overshooting dome over the updraft; a rain shaft under the base, slanting downwind as it
-//!   falls and thinning to the ground. Cover erodes all of it from its edges in, the thin anvil first, down to nothing
+//!   falls, to the ground. Cover erodes all of it from its edges in, the thin anvil first, down to nothing
 //!   (design §4.3).
 //! - **The density**: the envelope's distance pushed out (never in) by the cauliflower, big domes of many sizes carrying
 //!   small ones on their crowns (lumps in metres after lane b's, their tile scaled to the turret: the updraft's on the
-//!   updraft and its masses, half that on the flanking line, and a sixteenth of it where a texel resolves it), then a
-//!   skin a few tens of metres deep; on the anvil the shape tile stretched along the wind (fibres fanning out with it)
+//!   updraft and its masses, half that on the flanking line, and a sixteenth of it where a texel resolves it), then
+//!   cumulus cells in its outer 800 m (the billow and shape tiles over a profile, cut softly) and a solid core; on the anvil the shape tile stretched along the wind (fibres fanning out with it)
 //!   moves a soft skin and frays its far end into strands, and its underside sags in slow lobes; the rain's curtains are
 //!   the detail tile stretched upright. The GPU export's `cb_dens` (makepad-cloud-gpu, export/cumulonimbus.rs) is the
 //!   same function; [`PlacedVolume::gpu_upload`] hands it these numbers.
@@ -28,16 +26,18 @@
 use makepad_draw::*;
 use makepad_render_material::ibl;
 use crate::caster::RowRunner;
-use crate::cloud_lens::Lens;
 use crate::cloud_light::{CoverSample, LightFamily};
 use crate::cloud_volume::{blue_jitter, footprint_grid_key};
 use crate::cloud_volume_cumulus::CUMULUS_SIGMA;
 use crate::cloud_volume_gpu::{GpuMode, VolumeUpload};
 use crate::cloud_volume_light::{step, RayLight, VolumeMarch, POWDER_REACH_M};
+use crate::atmosphere::SunBands;
+use crate::rainbow::{Bow, Drops, BOW_PASS};
 use crate::noise::hash_u32;
 use crate::volumetric::{height_at, noise_for, shell_distance, Cancelled, NoiseVolume, Tile3, MIN_TRANSMITTANCE};
 use crate::{arr, cloud_layer_seed, CloudGenus, CloudLayerParams};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 
 /// The tower's turrets: the updraft (the anvil's foot), three masses on its flanks and a flanking line of three.
 pub const TURRETS: usize = 7;
@@ -102,16 +102,30 @@ const PLATE_DOMES_OFF: f32 = 0.6;
 /// Toward the base the domes fade out over BASE_DOMES_M (bulging past the base's footprint, each dome's underside was
 /// cut flat at the ragged base's height: terraced shelves seen from below, scallops along the base's edge).
 const BASE_DOMES_M: f32 = 500.0;
-/// The skins: the density ramps in from a quarter skin outside the surface to full a skin inside it, never under 1.5
-/// texel footprints. The tower's is lane b's eroded, fading skin at the storm's scale (round 5): TOWER_SKIN_M deep, the
-/// detail tile (ERODE_TILE_M a period: Worley cells of a sixth, a twelfth and a 24th of it) eating up to ERODE of it
-/// while a texel resolves its cells (fading out from ERODE_FADE_M to four times that), so a dome's limb is thin and
-/// see-through and the law's forward lobe lights it toward the sun (round 4's 40 m hard skin drew plaster). The anvil's
-/// is ANVIL_SKIN_M.
+/// The tower is cumulus cells (round 7, the Cumulus deck's recipe at the storm's scale): the billow tile's balls at the
+/// cauliflower's tile blended CELL_MIX with the shape tile's soft billows (CELL_SOFT_TILE of that tile), over a profile
+/// falling from CELL_IN_M inside the domed surface to CELL_OUT_M outside it, cut softly at CELL_CUT over CELL_RAMP, and
+/// faded in over CELL_BASE_M above the ragged base. Round 5's skin (TOWER_SKIN_M deep over the envelope, eroded by the
+/// detail tile's Worley cells) was one opaque wall, so lit from the front every point of it had the same short sun
+/// depth: flat white plaster, its pits the only detail (the owner's "grey broccoli", "not like a cloud at all").
+/// TOWER_SKIN_M still bounds the empty-space moves. The anvil's skin is ANVIL_SKIN_M.
 const TOWER_SKIN_M: f32 = 150.0;
-const ERODE_TILE_M: f32 = 600.0;
-const ERODE: f32 = 0.6;
-const ERODE_FADE_M: f32 = 60.0;
+const CELL_SOFT_TILE: f32 = 0.3;
+const CELL_IN_M: f32 = 1200.0;
+const CELL_OUT_M: f32 = 500.0;
+const CELL_MIX: f32 = 0.5;
+const CELL_CUT: f32 = 0.15;
+const CELL_RAMP: f32 = 0.4;
+const CELL_BASE_M: f32 = 120.0;
+/// The fluffy outside (round 8; the owner: "too solid", "a wide brick of concrete"): toward the outside the cells fall
+/// CELL_FALL under the cut, fray (eaten by up to FRAY of two octaves of the soft tile, FRAY_TILE of the cells' and a third
+/// of that) and thin to CELL_THIN of the density (growing as the profile squared), fading to nothing at the band's outer
+/// edge. At a quarter of full density 300 m of storm cloud was still opaque (sigma 0.078 a metre), so the edge stayed
+/// hard.
+const CELL_FALL: f32 = 0.6;
+const CELL_THIN: f32 = 0.05;
+const FRAY: f32 = 0.7;
+const FRAY_TILE: f32 = 0.2;
 /// The overshoot is a cauliflower head where it is the nearest body: its domes at HEAD_TILE of the updraft's tile and at
 /// full height (the plate's flattening off: it stood as a smooth low bump).
 const HEAD_TILE: f32 = 0.5;
@@ -191,12 +205,36 @@ const BASE_RAG_TILE2_M: f32 = 1100.0;
 /// upright, so a ray across the shaft meets a few and the shaft shows streaks; at 500 m they averaged out into a box),
 /// streaked by the tile RAIN_STREAK times finer; its density a RAIN_SHARE of the cloud's at Rain shaft 1 (with straight
 /// sides and a hard foot that drew an opaque box), soft across its whole radius, which the cores make ragged by up to a
-/// quarter more, thinning to RAIN_GROUND of it at the ground, falling RAIN_SLANT metres downwind a metre down.
+/// quarter more, RAIN_GROUND of it at the ground, falling RAIN_SLANT metres downwind a metre down. Rain reaches the ground
+/// at the rate it leaves the base (a 1 mm drop loses a few per cent of itself a kilometre to evaporation): at 0.1 the
+/// shaft held a fifth of its rain 300 m up, and a rainbow in it faded out toward its feet, where the look runs longest
+/// through sunlit rain and photos show it brightest (the rainbow lane, round 3: the bow over Alexander's band beside it
+/// 0.8-1.0 within 8 degrees of the horizon at 0.1, 1.4-2.2 at 1).
 const RAIN_TILE_M: [f32; 3] = [2500.0, 20_000.0, 2500.0];
 const RAIN_STREAK: f32 = 4.0;
 const RAIN_SHARE: f32 = 0.12;
-const RAIN_GROUND: f32 = 0.1;
+const RAIN_GROUND: f32 = 1.0;
 const RAIN_SLANT: f32 = 0.25;
+/// The rain is uneven and partly see-through (round 8; the owner: the shaft read as a wide brick of concrete, an even
+/// grey column from the base to the ground): it parts into separate shafts (the soft shape tile RAIN_SHAFT_M across,
+/// stretched four times upright, cut at RAIN_SHAFT_CUT over 0.2), some of them end above the ground (up to RAIN_END of
+/// the base's height, by a second read RAIN_END_TILE times coarser, faded in over RAIN_END_FADE_M), the cores make its
+/// sides ragged by up to 0.3 of its radius either way, and it holds RAIN_THIN of round 3's density.
+const RAIN_SHAFT_M: f32 = 1500.0;
+const RAIN_SHAFT_CUT: f32 = 0.3;
+const RAIN_END: f32 = 0.4;
+/// Only shafts whose ends read is over RAIN_END_FROM end in the air, as virga here and there (round 8b: from 0.45 most
+/// did, and the bow lost its feet, where photos show it brightest; at 0.6 the ends of a near shower lined up over the
+/// horizon as a bright band under the curtain).
+const RAIN_END_FROM: f32 = 0.8;
+const RAIN_END_TILE: f32 = 1.7;
+const RAIN_END_FADE_M: f32 = 400.0;
+/// Round 3's rain (RAIN_SHARE of the cloud's extinction, about 0.0094 a metre at Rain shaft 1) was some five times
+/// heavier rain than real downpours (heavy rain lets one see 1-3 km, about 0.001-0.003 a metre), so a look inside the bow
+/// met nothing but sunlit drops and the bow's inside stood 4.6 times Alexander's band, where photos of showers show
+/// 1.2-1.9 times (the background and the light scattered between drops fill the band). At RAIN_THIN 0.15 (about 0.0014 a
+/// metre) a near shower measures 1.1 and the curtain still reads grey.
+const RAIN_THIN: f32 = 0.15;
 /// Right under the base the rain is denser, up to 1 + VIRGA times, fading over VIRGA_M down (the base's dark underside
 /// ended in a hard line over the paler shaft).
 const VIRGA: f32 = 2.0;
@@ -253,15 +291,34 @@ const BOUNDS_MARGIN_M: f32 = 300.0;
 /// Inside the rain shaft a march moves at most this far without a read (the curtains have gaps the cloud's free
 /// distance would jump).
 const RAIN_STEP_M: f32 = 60.0;
+/// The rain's sunlight is marched once a texel of a table and read from it (`RainTable`): up to this wide the table is
+/// the bake's own texels, a wider bake (4K, 8K) reads one half as wide, upsampled bilinearly: a quarter of the marches.
+const RAIN_FULL_WIDTH: usize = 2048;
+/// How many tables (bake width and march segment) a placed volume keeps; past them a look marches the cells it reads
+/// itself, unkept: the marches a table would hold, so the map is the same.
+const RAIN_TABLES: usize = 16;
+/// A table's cell not marched yet (a NaN no march returns).
+const RAIN_UNMARCHED: u32 = u32::MAX;
+/// A look this close to a table cell's centre, in cells, reads that cell alone: a bake as wide as the table reads
+/// exactly the marches of its own texels. The uv's round trip moves a centre by up to about 3.3e-3 of a cell, in the
+/// rows by the zenith at 2048 wide (its acos is ill-conditioned there); an antialiasing jitter and a wider bake's
+/// half-wide read lie 0.125 of a cell or more off a centre.
+const RAIN_SNAP: f32 = 1.0e-2;
 /// The rain's sun: the storm's shadow read where the sun's ray from a rain point meets the base (RAIN_SHADE_M over
 /// it), lit across RAIN_SHADE_EDGE_M of the envelope's distance there, and RAIN_SHADOW_TAU deep where it is shadowed.
 const RAIN_SHADE_M: f32 = 60.0;
 const RAIN_SHADE_EDGE_M: f32 = 300.0;
 const RAIN_SHADOW_TAU: f32 = 40.0;
+/// The storm's shadow on its rain is tabled for the rain's sunlight in cells this wide (`ShadeGrid`): a quarter of the
+/// shadow's soft edge, so the table's bilinear reads hold it within a few per cent of the light.
+const SHADE_CELL_M: f32 = 0.25 * RAIN_SHADE_EDGE_M;
 /// The CPU march: its sun march's steps and growth, its up march's steps from UP_FIRST_M doubling, the longest step in
 /// thin cloud (rain), and its steps a mean free path of the body it is in long times this.
 const CPU_SUN_STEPS: usize = 6;
 const CPU_SUN_GROWTH: f32 = 2.2;
+/// The CPU sun march's steps from this one on read the cells' smooth profile (Lod::Soft), as the GPU's far steps (lod 0,
+/// past SUN_DOME_STEPS of its fourteen: about a tenth of the way out; the CPU's fourth step starts at 9 % of it).
+const SUN_SOFT_FROM: usize = 3;
 const CPU_UP_STEPS: usize = 5;
 const UP_FIRST_M: f32 = 80.0;
 /// A storm's up marches read no finer than UP_SOFT_M a footprint (both marches; the GPU's cb_aa.x): read as fine as
@@ -296,17 +353,14 @@ fn smin(a: f32, b: f32, k: f32) -> f32 {
     b + (a - b) * h - k * h * (1.0 - h)
 }
 
-/// smoothstep, local (as in the other cloud modules).
-#[inline]
-pub(crate) fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
-    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
+pub(crate) use crate::patterns::smooth as smoothstep;
 
-/// What a density read takes: the light march's far steps (the turrets alone), its near steps (with the cauliflower),
-/// the view's (everything).
+/// What a density read takes: the light marches' far reads (the turrets alone, the tower's cells as their smooth
+/// profile: the GPU's lod 0), the CPU's cheap reads (the turrets alone with the cells: the sun march's near steps, the
+/// opacity, the bow's column), the light march's near steps (with the cauliflower), the view's (everything).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Lod {
+    Soft,
     Far,
     Near,
     View,
@@ -358,7 +412,9 @@ struct Envelope {
 /// What the density gives at a point: the density (0..1 of sigma), the height through the storm (0 at its base, 1 at its
 /// top), a distance (metres) a march may move without missing cloud (0 near it), whether that distance is the
 /// envelope's (safe), not the cauliflower's (which overstates the way to the next lump), and in cloud the density deep
-/// in the body it is in (the tower's 1, the anvil's ice, the rain's: the march's step rule).
+/// in the body it is in (the tower's 1, the anvil's ice, the rain's: the march's step rule); and the rain's density where
+/// the rain is the body drawn (under the ragged base, at least as dense as the cloud there; else 0): the sun lights it
+/// by the drops' phase (`PlacedVolume::rain_light`), not by the light law's lobes.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Read {
     pub(crate) density: f32,
@@ -366,6 +422,7 @@ pub(crate) struct Read {
     pub(crate) free_m: f32,
     pub(crate) safe: bool,
     pub(crate) full: f32,
+    pub(crate) rain: f32,
 }
 
 /// The noise tiles the density reads.
@@ -462,9 +519,9 @@ impl Envelope {
         self.top + self.over[1] + BOUNDS_MARGIN_M
     }
 
-    /// How far the noise can push the surface out, metres.
+    /// How far the noise can push the surface out, metres (and the cells' fluffy band past it).
     fn reach(&self) -> f32 {
-        self.lump_most + FIBRE_M * (1.0 + FIBRE_FRAY) + (UNDER_SAG + ANVIL_TOP_WAVE) * self.anvil[2] + 0.25 * self.anvil_join + STRIATION_M
+        self.lump_most + CELL_OUT_M + FIBRE_M * (1.0 + FIBRE_FRAY) + (UNDER_SAG + ANVIL_TOP_WAVE) * self.anvil[2] + 0.25 * self.anvil_join + STRIATION_M
     }
 
     /// The two upright cylinders that hold it (x, z, radius): the tower with its rain, from the ground to the ceiling;
@@ -617,7 +674,7 @@ impl Envelope {
             near = near.min((rr - 1.25 * self.rain[0]).max(y - base - BASE_RAG_M * (1.0 + BASE_RAG2)));
         }
         if near > 0.0 {
-            return Read { density: 0.0, h01, free_m: near, safe: true, full: 0.0 };
+            return Read { density: 0.0, h01, free_m: near, safe: true, full: 0.0, rain: 0.0 };
         }
         let wa = ((dt - da) / 600.0 + 0.5).clamp(0.0, 1.0);
         // The anvil is the tower's outflow near it (dense, crisp and lumpy as the tower) and ice downwind.
@@ -675,24 +732,36 @@ impl Envelope {
             let wave = tiles.noise.shape.sample(ut / ANVIL_TOP_TILE_M[0] + pu.y, 0.71 + pu.z, vt / ANVIL_TOP_TILE_M[1] + pu.x);
             surf -= ANVIL_TOP_WAVE * anvil_th * (2.0 * wave - 1.0) * high;
         }
-        // The base, flat as a whole and ragged at its edge: the noise never pushes cloud under it (read only near the
-        // base: higher, the base's term is under any cloud's and the density is full there).
-        let mut base_y = base - BASE_RAG_M * (1.0 + BASE_RAG2);
-        if y < base + 4.0 * BASE_RAG_M {
-            let pb = self.place[2];
-            let rag = tiles.noise.shape.sample(u / BASE_RAG_TILE_M + pb.x, pb.y, v / BASE_RAG_TILE_M + pb.z);
-            let torn = tiles.noise.shape.sample(u / BASE_RAG_TILE2_M + pb.z, y / BASE_RAG_TILE2_M + pb.x, v / BASE_RAG_TILE2_M + pb.y);
-            base_y = base + BASE_RAG_M * ((2.0 * rag - 1.0) + BASE_RAG2 * (2.0 * torn - 1.0));
-        }
+        let base_y = self.base_at(tiles, u, y, v);
         let surface = surf.max((base_y - y) * BASE_SOFT);
-        // Lane b's skin on the tower, a soft one on the anvil.
-        let mut tower = (0.25 - surface / skin_t).clamp(0.0, 1.0);
-        if lod >= Lod::Near && tower > 0.0 && tower < 0.999 {
-            let pe = self.place[1];
-            let er = tiles.noise.detail.sample(u / ERODE_TILE_M + pe.y + 0.23, y / ERODE_TILE_M + pe.z + 0.61, v / ERODE_TILE_M + pe.x + 0.37);
-            let ek = ERODE * er * (1.0 - smoothstep(ERODE_FADE_M, 4.0 * ERODE_FADE_M, footprint_m));
-            tower = ((tower - ek) / (1.0 - ek).max(0.05)).clamp(0.0, 1.0);
-        }
+        // The tower as cumulus cells over the domed surface (the GPU's den_t), a soft skin on the anvil. The light
+        // marches' far reads see the profile squared alone, smooth across the band (one read a long step of the cells'
+        // own field fell in a cell or a gap by the texel: salt and pepper on the shaded and backlit sides, the VDB study
+        // 2026-11-11).
+        let pc = self.place[1];
+        let cs = CELL_SOFT_TILE * self.lump_tile;
+        let prof = smoothstep(CELL_OUT_M, -CELL_IN_M, surf);
+        let tower = if lod == Lod::Soft {
+            prof * prof * smoothstep(0.0, CELL_BASE_M, y - base_y)
+        } else {
+            let wb = tiles.billow.sample(u / self.lump_tile + pc.z, y / self.lump_tile + pc.x, v / self.lump_tile + pc.y);
+            let ws = tiles.noise.shape.sample(u / cs + pc.y + 0.31, y / cs + pc.z + 0.17, v / cs + pc.x + 0.53);
+            let field = (wb + (ws - wb) * CELL_MIX) - CELL_FALL * (1.0 - prof);
+            let mut cells = ((field - CELL_CUT) / CELL_RAMP).clamp(0.0, 1.0);
+            if lod >= Lod::Near && cells > 0.0 && prof < 0.97 {
+                let ce = FRAY_TILE * cs;
+                let we = tiles.noise.shape.sample(u / ce + pc.x + 0.71, y / ce + pc.y + 0.29, v / ce + pc.z + 0.47);
+                let ce2 = 0.33 * ce;
+                let we2 = tiles.noise.shape.sample(u / ce2 + pc.z + 0.13, y / ce2 + pc.x + 0.83, v / ce2 + pc.y + 0.61);
+                let wm = 0.6 * we + 0.4 * (we2 + (we - we2) * smoothstep(0.05 * ce2, 0.2 * ce2, footprint_m));
+                let ek = FRAY * (1.0 - prof * prof) * (1.0 - wm) * (1.0 - smoothstep(0.05 * ce, 0.2 * ce, footprint_m));
+                cells = ((cells - ek) / (1.0 - ek).max(0.05)).clamp(0.0, 1.0);
+            }
+            cells *= (CELL_THIN + (1.0 - CELL_THIN) * prof * prof) * smoothstep(CELL_OUT_M, 0.3 * CELL_OUT_M, surf);
+            // (deeper than the cells the core is solid: their gaps showed a grey haze inside the tower)
+            let core = smoothstep(-CELL_IN_M, -2.0 * CELL_IN_M, surf);
+            cells.max(core) * smoothstep(0.0, CELL_BASE_M, y - base_y)
+        };
         let anvil = (0.25 - surface / ANVIL_SKIN_M.max(1.5 * footprint_m)).clamp(0.0, 1.0);
         let mut density = tower + (anvil - tower) * ice;
         // The anvil's far end frays into the fibres' strands; its ice thins downwind and at its rims.
@@ -708,29 +777,86 @@ impl Envelope {
         let mix = 1.0 + (body * strands - 1.0) * ice;
         density *= mix;
         let mut full = if y < base_y { 0.0 } else { mix };
-        // The rain: soft streaks under the base, its sides ragged, thinning toward the ground.
+        // The rain: soft streaks under the base, its sides ragged, down to the ground.
+        let mut rain_drawn = 0.0;
         if self.rain[1] > 0.0 && y < base + 200.0 {
-            let o = self.place[4];
-            let cores = tiles.noise.detail.sample(ur / RAIN_TILE_M[0] + o.x, y / RAIN_TILE_M[1] + o.y, v / RAIN_TILE_M[2] + o.z);
-            let streaks = tiles.noise.detail.sample(RAIN_STREAK * ur / RAIN_TILE_M[0] + o.y, y / RAIN_TILE_M[1] + o.z, RAIN_STREAK * v / RAIN_TILE_M[2] + o.x);
-            let curtain = 0.6 * cores + 0.4 * streaks;
-            let across = 1.0 - smoothstep(0.1 * self.rain[0], self.rain[0], rr * (0.8 + 0.4 * cores));
-            let fall = smoothstep(-150.0, 100.0, base - y) * (RAIN_GROUND + (1.0 - RAIN_GROUND) * smoothstep(0.0, base, y));
-            let virga = 1.0 + VIRGA * (1.0 - smoothstep(0.0, VIRGA_M, base_y - y));
-            let rain = RAIN_SHARE * self.rain[1] * across * fall * virga;
-            density = density.max(rain * smoothstep(0.25, 0.75, curtain));
+            let (rain, drawn) = self.rain_at(tiles, ur, rr, y, v, base_y);
             if y < base_y {
                 full = rain;
+                if drawn >= density {
+                    rain_drawn = drawn;
+                }
             }
+            density = density.max(drawn);
         }
         if density > 0.0 {
-            return Read { density, h01, free_m: 0.0, safe: false, full: full.max(density) };
+            return Read { density, h01, free_m: 0.0, safe: false, full: full.max(density), rain: rain_drawn };
         }
         let mut free_m = 0.5 * (surf - 0.25 * skin_t).max(base_y - y).max(0.0);
         if self.rain[1] > 0.0 && rr < 1.25 * self.rain[0] && y < base + BASE_RAG_M * (1.0 + BASE_RAG2) {
             free_m = free_m.min(RAIN_STEP_M);
         }
-        Read { density, h01, free_m, safe: false, full: 0.0 }
+        Read { density, h01, free_m, safe: false, full: 0.0, rain: 0.0 }
+    }
+
+    /// The ragged base's height over (u, v), in the storm's frame, for a point `y` high: flat as a whole and ragged at its
+    /// edge, the noise never pushing cloud under it (read only near the base: higher, the base's term is under any
+    /// cloud's and the density is full there; elsewhere its lowest point).
+    #[inline]
+    fn base_at(&self, tiles: &Tiles, u: f32, y: f32, v: f32) -> f32 {
+        if y < self.base + 4.0 * BASE_RAG_M {
+            let pb = self.place[2];
+            let rag = tiles.noise.shape.sample(u / BASE_RAG_TILE_M + pb.x, pb.y, v / BASE_RAG_TILE_M + pb.z);
+            let torn = tiles.noise.shape.sample(u / BASE_RAG_TILE2_M + pb.z, y / BASE_RAG_TILE2_M + pb.x, v / BASE_RAG_TILE2_M + pb.y);
+            return self.base + BASE_RAG_M * ((2.0 * rag - 1.0) + BASE_RAG2 * (2.0 * torn - 1.0));
+        }
+        self.base - BASE_RAG_M * (1.0 + BASE_RAG2)
+    }
+
+    /// The rain at (`ur` along its slanted axis, `y` up, `v` across), `rr` from its axis, under the ragged base `base_y`:
+    /// its density deep in it (the march's step rule) and as drawn through its curtains. Soft streaks under the base,
+    /// its sides ragged, down to the ground.
+    #[inline]
+    fn rain_at(&self, tiles: &Tiles, ur: f32, rr: f32, y: f32, v: f32, base_y: f32) -> (f32, f32) {
+        let o = self.place[4];
+        let cores = tiles.noise.detail.sample(ur / RAIN_TILE_M[0] + o.x, y / RAIN_TILE_M[1] + o.y, v / RAIN_TILE_M[2] + o.z);
+        let streaks = tiles.noise.detail.sample(RAIN_STREAK * ur / RAIN_TILE_M[0] + o.y, y / RAIN_TILE_M[1] + o.z, RAIN_STREAK * v / RAIN_TILE_M[2] + o.x);
+        let curtain = 0.6 * cores + 0.4 * streaks;
+        // separate shafts, some ending above the ground (the GPU's cb_an, cb_ao)
+        let sh = tiles.noise.shape.sample(ur / RAIN_SHAFT_M + o.y + 0.53, y / (4.0 * RAIN_SHAFT_M) + o.x, v / RAIN_SHAFT_M + o.z + 0.29);
+        let shafts = smoothstep(RAIN_SHAFT_CUT, RAIN_SHAFT_CUT + 0.2, sh);
+        let ce = RAIN_END_TILE * RAIN_SHAFT_M;
+        let en = tiles.noise.shape.sample(ur / ce + o.z + 0.83, 0.47, v / ce + o.y + 0.11);
+        let end_y = RAIN_END * self.base * smoothstep(RAIN_END_FROM, RAIN_END_FROM + 0.15, en);
+        // (faded in under its end, so a shaft that reaches the ground is full there: fading in over the lowest 400 m, every
+        // shaft thinned to nothing at the ground and the horizon shone through under the curtain as a white band)
+        let ends = smoothstep(end_y - RAIN_END_FADE_M, end_y, y);
+        let across = 1.0 - smoothstep(0.1 * self.rain[0], self.rain[0], rr * (0.7 + 0.6 * cores));
+        let fall = smoothstep(-150.0, 100.0, self.base - y) * (RAIN_GROUND + (1.0 - RAIN_GROUND) * smoothstep(0.0, self.base, y));
+        let virga = 1.0 + VIRGA * (1.0 - smoothstep(0.0, VIRGA_M, base_y - y));
+        let rain = RAIN_THIN * RAIN_SHARE * self.rain[1] * across * fall * virga * shafts * ends;
+        (rain, rain * smoothstep(0.25, 0.75, curtain))
+    }
+
+    /// `read`'s density and rain at `p` (a texel `footprint_m` wide) where no cloud can be: under the ragged base's
+    /// lowest point by more than the skins (its distance's base term then holds the tower's and the anvil's density at 0,
+    /// and the rain is the body), the rain alone, without the tower's, the anvil's and the base's reads; deeper than
+    /// VIRGA_M under that point, without the base's either (the virga is gone there whatever its height). None
+    /// elsewhere: read it there.
+    fn rain_only(&self, tiles: &Tiles, p: Vec3f, footprint_m: f32) -> Option<f32> {
+        let (u, y, v) = self.local(p);
+        let lowest = self.base - BASE_RAG_M * (1.0 + BASE_RAG2);
+        if !(y < lowest - TOWER_SKIN_M.max(ANVIL_SKIN_M).max(1.5 * footprint_m)) {
+            return None;
+        }
+        let ur = u - self.rain[3] - self.rain[2] * (self.base - y).max(0.0);
+        let rr = (ur * ur + v * v).sqrt();
+        // (past 1.25 of its radius even its ragged side holds none)
+        if !(self.rain[1] > 0.0) || !(rr < 1.25 * self.rain[0]) {
+            return Some(0.0);
+        }
+        let base_y = if y < lowest - VIRGA_M { lowest } else { self.base_at(tiles, u, y, v) };
+        Some(self.rain_at(tiles, ur, rr, y, v, base_y).1)
     }
 
     /// The tower's distance at `p` without the noise (the rain's shade reads it where its sun ray meets the base).
@@ -746,35 +872,15 @@ impl Envelope {
     fn span(&self, d: Vec3f) -> Option<(f32, f32)> {
         let (tower, anvil, anvil_floor) = self.bounds();
         let ceiling = self.ceiling();
-        let cylinder = |c: [f32; 3], floor: f32| -> Option<(f32, f32)> {
-            let a = d.x * d.x + d.z * d.z;
-            let b = d.x * c[0] + d.z * c[1];
-            let cc = c[0] * c[0] + c[1] * c[1] - c[2] * c[2];
-            let (t0, t1) = if a > 1.0e-9 {
-                let disc = b * b - a * cc;
-                if disc < 0.0 {
-                    return None;
-                }
-                let s = disc.sqrt();
-                ((b - s) / a, (b + s) / a)
-            } else if cc > 0.0 {
-                return None;
-            } else {
-                (0.0, f32::INFINITY)
-            };
-            let lo = if floor > 2.5 { shell_distance(d.y, floor) } else { 0.0 };
-            let hi = shell_distance(d.y, ceiling);
-            let (near, far) = (t0.max(lo).max(0.0), t1.min(hi));
-            (far > near).then_some((near, far))
-        };
-        match (cylinder(tower, 0.0), cylinder(anvil, anvil_floor)) {
+        match (upright_span(d, tower, 0.0, ceiling), upright_span(d, anvil, anvil_floor, ceiling)) {
             (Some(a), Some(b)) => Some((a.0.min(b.0), a.1.max(b.1))),
             (a, b) => a.or(b),
         }
     }
 
     /// The upload's uniforms (the Cumulonimbus export shader's section reads them by these names).
-    fn uniforms(&self, out: &mut crate::cloud_volume_gpu::UploadBuilder) {
+    /// `drops`: its rain takes the sun's light by the drops' phase, beside the march (cb_ai.w).
+    fn uniforms(&self, out: &mut crate::cloud_volume_gpu::UploadBuilder, drops: bool) {
         let (tower, anvil, anvil_floor) = self.bounds();
         out.uniform("cb_a", [self.centre.x, self.centre.y, self.base, self.top]);
         out.uniform("cb_b", [self.wind.x, self.wind.y, self.radius, self.lean]);
@@ -793,7 +899,7 @@ impl Envelope {
         out.uniform("cb_q", [PUFF_JOIN, BASE_RAG_M, BASE_RAG_TILE_M, RAIN_SHADE_EDGE_M]);
         out.uniform("cb_r", [0.0, FIBRE_FRAY, ANVIL_DENSITY, ANVIL_THIN]);
         out.uniform("cb_ac", [ANVIL_DENSE, STORM_DIFFUSION, RIM, self.dark]);
-        out.uniform("cb_ai", [RIM_SHADOW, RIM_FROM, RIM_TO, 0.0]);
+        out.uniform("cb_ai", [RIM_SHADOW, RIM_FROM, RIM_TO, if drops { 1.0 } else { 0.0 }]);
         out.uniform("cb_ad", [ANVIL_DECAY, ANVIL_DROOP, ANVIL_TOP_WAVE, ANVIL_FALL]);
         out.uniform("cb_af", [BASE_RAG2, BASE_RAG_TILE2_M, VIRGA, VIRGA_M]);
         out.uniform("cb_ag", [STRIATION_M, STRIATION_TILE_M[0], STRIATION_TILE_M[1], self.smooth_top]);
@@ -801,7 +907,11 @@ impl Envelope {
         out.uniform("cb_y", [CAULI_CAP1, CAULI_CAP2, CAULI_RIDE, self.dome_height]);
         out.uniform("cb_z", [CAULI_HEIGHT2, CREVICE_SHADE, RAIN_OPEN, FIBRE_FINE]);
         out.uniform("cb_s", [CAULI_SOFT, TOWER_SKIN_M, UNDER_SAG, PLATE_DOMES_OFF]);
-        out.uniform("cb_ae", [ERODE_TILE_M, ERODE, ERODE_FADE_M, SUN_DOME_STEPS]);
+        out.uniform("cb_ae", [CELL_SOFT_TILE, CELL_IN_M, CELL_OUT_M, SUN_DOME_STEPS]);
+        out.uniform("cb_al", [CELL_MIX, CELL_CUT, CELL_RAMP, CELL_BASE_M]);
+        out.uniform("cb_am", [CELL_FALL, CELL_THIN, FRAY, FRAY_TILE]);
+        out.uniform("cb_an", [RAIN_SHAFT_M, RAIN_SHAFT_CUT, RAIN_END, RAIN_THIN]);
+        out.uniform("cb_ao", [RAIN_END_TILE, RAIN_END_FADE_M, RAIN_END_FROM, 0.0]);
         out.uniform("cb_aj", [HEAD_TILE, 0.0, GAP_TILE_M[0], GAP_TILE_M[1]]);
         out.uniform("cb_ak", [GAPS, UP_AGAIN_M, PAIRS_TO, 0.0]);
         out.uniform("cb_aa", [UP_SOFT_M, TWO_MARCHES, UP_DEPTH, UP_TILT]);
@@ -841,24 +951,45 @@ impl Envelope {
     }
 }
 
-/// A placed volume's shape: a storm's envelope or a lens' plates.
+/// Where the unit direction `d` (d.y > 0) from the eye is inside the upright cylinder `c` (x, z, radius) between the
+/// heights `floor` and `ceiling`: (near, far) metres, None where it misses it.
+fn upright_span(d: Vec3f, c: [f32; 3], floor: f32, ceiling: f32) -> Option<(f32, f32)> {
+    let a = d.x * d.x + d.z * d.z;
+    let b = d.x * c[0] + d.z * c[1];
+    let cc = c[0] * c[0] + c[1] * c[1] - c[2] * c[2];
+    let (t0, t1) = if a > 1.0e-9 {
+        let disc = b * b - a * cc;
+        if disc < 0.0 {
+            return None;
+        }
+        let s = disc.sqrt();
+        ((b - s) / a, (b + s) / a)
+    } else if cc > 0.0 {
+        return None;
+    } else {
+        (0.0, f32::INFINITY)
+    };
+    let lo = if floor > 2.5 { shell_distance(d.y, floor) } else { 0.0 };
+    let hi = shell_distance(d.y, ceiling);
+    let (near, far) = (t0.max(lo).max(0.0), t1.min(hi));
+    (far > near).then_some((near, far))
+}
+
+/// A placed volume's shape: a storm's envelope.
 enum Shape {
     Storm(Envelope),
-    Lens(Lens),
 }
 
 impl Shape {
     fn read(&self, tiles: &Tiles, p: Vec3f, footprint_m: f32, lod: Lod) -> Read {
         match self {
             Shape::Storm(e) => e.read(tiles, p, footprint_m, lod),
-            Shape::Lens(l) => l.read(tiles, p, footprint_m, lod),
         }
     }
 
     fn span(&self, d: Vec3f) -> Option<(f32, f32)> {
         match self {
             Shape::Storm(e) => e.span(d),
-            Shape::Lens(l) => l.span(d),
         }
     }
 
@@ -866,7 +997,6 @@ impl Shape {
     fn sigma(&self) -> f32 {
         match self {
             Shape::Storm(e) => e.sigma,
-            Shape::Lens(l) => l.sigma,
         }
     }
 
@@ -874,7 +1004,6 @@ impl Shape {
     fn base_top(&self) -> (f32, f32) {
         match self {
             Shape::Storm(e) => (e.base, e.top),
-            Shape::Lens(l) => (l.base, l.top),
         }
     }
 
@@ -882,33 +1011,29 @@ impl Shape {
     fn floor_ceiling(&self) -> (f32, f32) {
         match self {
             Shape::Storm(e) => (0.0, e.ceiling()),
-            Shape::Lens(l) => (l.floor(), l.ceiling()),
         }
     }
 
     /// The upright cylinders that hold it, each (x, z, radius) with its floor: a storm's tower (from the ground) and
-    /// anvil, a lens' one.
+    /// anvil.
     fn cylinders(&self) -> Vec<([f32; 3], f32)> {
         match self {
             Shape::Storm(e) => {
                 let (tower, anvil, anvil_floor) = e.bounds();
                 vec![(tower, 0.0), (anvil, anvil_floor)]
             }
-            Shape::Lens(l) => vec![(l.bounds(), l.floor())],
         }
     }
 
     fn fields(&self) -> Vec<f32> {
         match self {
             Shape::Storm(e) => e.fields(),
-            Shape::Lens(l) => l.fields(),
         }
     }
 
-    fn uniforms(&self, out: &mut crate::cloud_volume_gpu::UploadBuilder) {
+    fn uniforms(&self, out: &mut crate::cloud_volume_gpu::UploadBuilder, drops: bool) {
         match self {
-            Shape::Storm(e) => e.uniforms(out),
-            Shape::Lens(l) => l.uniforms(out),
+            Shape::Storm(e) => e.uniforms(out, drops),
         }
     }
 
@@ -916,12 +1041,11 @@ impl Shape {
     fn genus(&self) -> CloudGenus {
         match self {
             Shape::Storm(_) => CloudGenus::Cumulonimbus,
-            Shape::Lens(_) => CloudGenus::Lenticular,
         }
     }
 }
 
-/// A placed cloud volume, ready to march (design §2.1's placed and lens classes): a Cumulonimbus or a Lenticular.
+/// A placed cloud volume, ready to march (design §2.1's placed class): a Cumulonimbus.
 pub struct PlacedVolume {
     shape: Shape,
     tiles: Tiles,
@@ -929,6 +1053,96 @@ pub struct PlacedVolume {
     lining: f32,
     stream: u32,
     key: u64,
+    /// Its rain's phase under the map's sun (`add_bow`): None sends no sunlight from the rain.
+    bow: Option<Box<Bow>>,
+    /// The storm's shadow on its rain over the base plane, for the rain's sunlight (`add_bow`).
+    shade: Option<ShadeGrid>,
+    /// The map's Rotation (its rotation_deg, `add_bow`): a bake's look along its texel centre reaches the layers turned
+    /// back by it (lib.rs `radiance_with`), so the rain's tables are laid out at the texel centres turned so.
+    turn_deg: f32,
+    /// The rain's sunlight marched at the texels of the bake widths and segments looked up so far (`rain_seen`).
+    rain: [OnceLock<RainTable>; RAIN_TABLES],
+    /// Whether the tables ran out (logged once).
+    rain_full: AtomicBool,
+}
+
+/// The sunlit rain (`PlacedVolume::rain_column`) of march segment `k` at the texel centres of a map `width` texels wide
+/// (turned back by the map's Rotation as its looks are, `turn_deg`), each cell marched the first time a look reads it
+/// and kept (its f32 bits; RAIN_UNMARCHED until then): a bake's looks,
+/// its antialiasing passes' jittered looks and the puddles' mirrored looks read the same marches instead of marching
+/// the shaft each. A row is made when a look first reaches it (the rows the storm stands in). A cell is its texel's
+/// march whichever thread makes it, so the maps stay byte-repeatable.
+struct RainTable {
+    width: usize,
+    height: usize,
+    k: usize,
+    cuts: Vec<f32>,
+    rows: Box<[OnceLock<Box<[AtomicU32]>>]>,
+}
+
+impl RainTable {
+    fn new(width: usize, k: usize, cuts: &[f32]) -> RainTable {
+        let height = (width / 2).max(1);
+        RainTable { width, height, k, cuts: cuts.to_vec(), rows: (0..height).map(|_| OnceLock::new()).collect() }
+    }
+
+    fn holds(&self, width: usize, k: usize, cuts: &[f32]) -> bool {
+        self.width == width && self.k == k && self.cuts[..] == *cuts
+    }
+}
+
+/// A table coordinate (cells, a cell's centre at a whole number) as its cell and the share of the next one: within
+/// RAIN_SNAP of a centre that cell alone.
+fn rain_texel(f: f32) -> (i64, f32) {
+    let i = f.floor();
+    match f - i {
+        t if t < RAIN_SNAP => (i as i64, 0.0),
+        t if t > 1.0 - RAIN_SNAP => (i as i64 + 1, 0.0),
+        t => (i as i64, t),
+    }
+}
+
+/// The storm's shadow on its rain as `sun_depth` reads it under the lowest base (the envelope's distance where the sun's
+/// ray meets the base, lit across RAIN_SHADE_EDGE_M), tabled over the base plane in SHADE_CELL_M cells across the
+/// tower's bounds and read bilinearly: the rain's sunlight reads it at every step of every look into the rain
+/// (`rain_column`), where reading the envelope (its turrets and their puffs) each time doubled a map's bake. Lit outside
+/// the bounds, where the distance is past the edge.
+struct ShadeGrid {
+    x0: f32,
+    z0: f32,
+    n: usize,
+    lit: Vec<f32>,
+}
+
+impl ShadeGrid {
+    fn of(e: &Envelope) -> ShadeGrid {
+        let (tower, _, _) = e.bounds();
+        let n = (2.0 * tower[2] / SHADE_CELL_M).ceil() as usize + 2;
+        let (x0, z0) = (tower[0] - tower[2], tower[1] - tower[2]);
+        let y = e.base + RAIN_SHADE_M;
+        let lit = (0..n * n)
+            .map(|k| {
+                let at = vec3f(x0 + (k % n) as f32 * SHADE_CELL_M, y, z0 + (k / n) as f32 * SHADE_CELL_M);
+                smoothstep(-RAIN_SHADE_EDGE_M, RAIN_SHADE_EDGE_M, e.envelope_distance(at))
+            })
+            .collect();
+        ShadeGrid { x0, z0, n, lit }
+    }
+
+    /// How lit the base plane is at (x, z).
+    fn lit_at(&self, x: f32, z: f32) -> f32 {
+        let (fx, fz) = ((x - self.x0) / SHADE_CELL_M, (z - self.z0) / SHADE_CELL_M);
+        let last = (self.n - 1) as f32;
+        if !(fx >= 0.0 && fz >= 0.0 && fx < last && fz < last) {
+            return 1.0;
+        }
+        let (i, j) = (fx as usize, fz as usize);
+        let (tx, tz) = (fx - i as f32, fz - j as f32);
+        let at = |i: usize, j: usize| self.lit[j * self.n + i];
+        let a = at(i, j) + (at(i + 1, j) - at(i, j)) * tx;
+        let b = at(i, j + 1) + (at(i + 1, j + 1) - at(i, j + 1)) * tx;
+        a + (b - a) * tz
+    }
 }
 
 /// What a placed volume is built from (the field volumes' `VolumeSpec`'s fields it reads).
@@ -948,7 +1162,6 @@ impl PlacedVolume {
     pub fn build(spec: &PlacedSpec, cancelled: &dyn Fn() -> bool, run: RowRunner) -> Result<Option<PlacedVolume>, Cancelled> {
         let density = match spec.genus {
             CloudGenus::Cumulonimbus => spec.layer.cumulonimbus_params().density,
-            CloudGenus::Lenticular => spec.layer.lenticular_params().density,
             _ => return Ok(None),
         };
         if !(spec.cover > 0.0) || !(density > 0.0) {
@@ -956,10 +1169,7 @@ impl PlacedVolume {
         }
         let stream = cloud_layer_seed(spec.map_seed, spec.layer.seed, spec.genus);
         let wind = if spec.downwind.length() > 0.5 { spec.downwind.normalize() } else { vec2f(1.0, 0.0) };
-        let shape = match spec.genus {
-            CloudGenus::Cumulonimbus => Shape::Storm(Envelope::of(spec.layer, spec.cover, stream, wind)),
-            _ => Shape::Lens(Lens::of(spec.layer, spec.cover, stream, wind)),
-        };
+        let shape = Shape::Storm(Envelope::of(spec.layer, spec.cover, stream, wind));
         let noise = noise_for(spec.map_seed, cancelled, run)?;
         let billow = noise.billow(cancelled, run)?;
         let sun = spec.sun_dir.normalize();
@@ -969,11 +1179,22 @@ impl PlacedVolume {
         let mut fields = shape.fields();
         fields.extend_from_slice(&[sun.x, sun.y, sun.z, bits(spec.map_seed), spec.genus as u32 as f32]);
         let key = footprint_grid_key(&fields, stream, TURRETS, GPU_KEY_PART);
-        Ok(Some(PlacedVolume { shape, tiles: Tiles { noise, billow }, sun, lining, stream, key }))
+        Ok(Some(PlacedVolume {
+            shape,
+            tiles: Tiles { noise, billow },
+            sun,
+            lining,
+            stream,
+            key,
+            bow: None,
+            shade: None,
+            turn_deg: 0.0,
+            rain: std::array::from_fn(|_| OnceLock::new()),
+            rain_full: AtomicBool::new(false),
+        }))
     }
 
-    /// The heights a march of it spans, metres: a storm's from the ground (its rain) to its ceiling, a lens' round its
-    /// plates. The walk places it by these and cuts it at the flat entries between.
+    /// The heights a march of it spans, metres: a storm's from the ground (its rain) to its ceiling. The walk places it by these and cuts it at the flat entries between.
     pub fn shell_m(&self) -> (f32, f32) {
         self.shape.floor_ceiling()
     }
@@ -1035,6 +1256,11 @@ impl PlacedVolume {
         let cuts = &cuts[..cuts.len().min(out.len() - 1)];
         let angle = std::f32::consts::TAU / width.max(LAW_WIDTH_LEAST) as f32;
         let light = RayLight::new(d.dot(self.sun), self.sun.y, self.lining, LightFamily::Heap).seen_from(d.y);
+        // The rain under the base takes the sun's light by the drops' phase (`rain_light`, beside the march) once it has
+        // them (`add_bow`): here only the dome's, the open side's and the ground's.
+        let drops = self.bow.is_some();
+        let mut rain_lit = light;
+        (rain_lit.forward, rain_lit.back, rain_lit.diffusion, rain_lit.diffuse) = (Default::default(), Default::default(), Default::default(), 0.0);
         let width = width.max(2);
         let uv = ibl::dir_to_equirect_uv(arr(d));
         let jitter = blue_jitter((uv[0] * width as f32) as u32, (uv[1] * (width / 2) as f32) as u32);
@@ -1044,7 +1270,6 @@ impl PlacedVolume {
         let sigma = self.shape.sigma();
         let rain_under = match &self.shape {
             Shape::Storm(e) => e.base,
-            Shape::Lens(_) => f32::NEG_INFINITY,
         };
         while t < far {
             let p = vec3f(d.x * t, height_at(t, d.y), d.z * t);
@@ -1065,9 +1290,10 @@ impl PlacedVolume {
             // skin stepped deep into the dark core), at most RAIN_STEP_M in the rain
             let most = if p.y < rain_under { RAIN_STEP_M } else { CPU_STEP_MOST_M };
             let ds = (CPU_STEP_PATHS / (r.full * sigma)).clamp((0.5 * footprint).max(4.0), most.max((0.5 * footprint).max(4.0))).min(far - t).max(0.5);
-            let (tau_sun, local) = self.sun_depth(p, footprint);
+            let rain = drops && r.rain > 0.0;
+            let (tau_sun, local) = if rain { (0.0, 0.0) } else { self.sun_depth(p, footprint) };
             let tau_up = self.up_depth(p, footprint);
-            step(&mut out[seg], &light, sig, ds, tau_sun, 0.0, tau_up, local, r.h01, t, front);
+            step(&mut out[seg], if rain { &rain_lit } else { &light }, sig, ds, tau_sun, 0.0, tau_up, local, r.h01, t, front);
             if out[seg].stops(front) {
                 out[seg].close();
                 return;
@@ -1076,18 +1302,199 @@ impl PlacedVolume {
         }
     }
 
+    /// Gives its rain the drops' phase (rainbow.rs) under the sun whose light at the ground is `sun`: the drops by
+    /// Marshall and Palmer at the shaft's rate (its Rain shaft as the weather's Rain, rain_water.rs), none without a
+    /// shaft or with the sun down (the rain then has no sunlight, as under a storm's shadow). The sunlight its rain sends
+    /// is `rain_light`, beside the march and its GPU record, read from tables laid out at the texel centres of a map
+    /// turned by `turn_deg`, the map's Rotation.
+    pub(crate) fn add_bow(&mut self, sun: &SunBands, turn_deg: f32) {
+        self.turn_deg = turn_deg;
+        let Shape::Storm(e) = &self.shape;
+        if e.rain[1] > 0.0 && self.sun.y > 0.0 {
+            self.bow = Some(Box::new(Bow::new(Drops::rain(crate::rain_water::rate_mm_h(e.rain[1])), sun)));
+            self.shade = Some(ShadeGrid::of(e));
+        }
+    }
+
+    /// The sunlight its rain shaft sends along the unit `d` in segment `k` of a march cut at the heights `cuts`, for a
+    /// bake `width` wide whose texels are `texel` radians across, as the sun's light at the ground shows it, before what
+    /// stands over the storm and the haze in front (the stack applies those as to the storm's own light): the drops'
+    /// single scattering by their own phase (`Bow::scattered`: the rainbow and its secondary, averaged over the texel,
+    /// and the light reflected off the drops and refracted through them), not the light law's cloud lobes, which sent
+    /// the rain 0.08-0.1 a steradian backward where drops send 0.0008 outside their bows (a pale sunlit curtain
+    /// opposite the sun, the bow a +10 % ripple on it). Rain a few optical depths deep turns little of its light round:
+    /// its drops send 44 % of what they take forward within 83 degrees and half stays in the beam. The phase at the
+    /// look's angle from the sun holds all along the look, so this is that phase times the sunlit rain the look sees
+    /// (`rain_column`, read from its table: `rain_seen`): the bow brightest where the look runs long through sunlit rain
+    /// (low in the shaft, the storm's shadow on its upper part), fading where the shaft thins or ends, and nothing under
+    /// the horizon, where the shaft stands on the ground at its distance.
+    pub(crate) fn rain_light(&self, d: Vec3f, width: usize, cuts: &[f32], k: usize, texel: f32) -> Vec3f {
+        let Some(bow) = self.bow.as_deref() else {
+            return Vec3f::default();
+        };
+        let column = self.rain_seen(d, width, cuts, k);
+        if !(column > 0.0) {
+            return Vec3f::default();
+        }
+        bow.scattered(d.dot(self.sun), texel) * column
+    }
+
+    /// The sunlit rain along the unit `d` in segment `k` for a bake `width` wide (`rain_column`), read bilinearly from
+    /// the table as wide (half as wide past RAIN_FULL_WIDTH) between the texel centres its cells were marched at, each
+    /// from its own blue-noise offset: a look at a cell's centre reads exactly that march (an unjittered bake as wide as
+    /// the table reads its texels' marches as before, at any Rotation: the look is turned back to the bake's texels),
+    /// a jittered or mirrored look the four round it. A look just over the horizon reads the last row over it (the rows
+    /// under it hold no rain). Where every table is taken, the look marches the cells it reads itself, unkept.
+    fn rain_seen(&self, d: Vec3f, width: usize, cuts: &[f32], k: usize) -> f32 {
+        if self.rain_span(d, cuts, k).is_none() {
+            return 0.0;
+        }
+        let width = width.max(2);
+        let w = if width <= RAIN_FULL_WIDTH { width } else { width / 2 };
+        let table = self.rain_table(w, k, cuts);
+        let h = (w / 2).max(1);
+        let last = (h / 2).max(1) - 1;
+        // where the look lies among the bake's texels: the map's Rotation turned back (the elevation stays)
+        let at = if self.turn_deg == 0.0 { d } else { crate::rotate_y(d, self.turn_deg) };
+        let uv = ibl::dir_to_equirect_uv(arr(at));
+        let (x, tx) = rain_texel(uv[0] * w as f32 - 0.5);
+        let (y, ty) = rain_texel((uv[1] * h as f32 - 0.5).clamp(0.0, last as f32));
+        let mut column = 0.0f32;
+        for (j, wy) in [(y, 1.0 - ty), (y + 1, ty)] {
+            for (i, wx) in [(x, 1.0 - tx), (x + 1, tx)] {
+                if wy * wx != 0.0 {
+                    let j = (j.max(0) as usize).min(last);
+                    let i = i.rem_euclid(w as i64) as usize;
+                    column += wy * wx * match table {
+                        Some(table) => self.rain_cell(table, i, j),
+                        None => self.rain_march(w, h, cuts, k, i, j),
+                    };
+                }
+            }
+        }
+        column
+    }
+
+    /// The table for bakes `width` wide in segment `k` of a march cut at `cuts`, made in a free slot the first time; None
+    /// when all RAIN_TABLES hold others (logged once).
+    fn rain_table(&self, width: usize, k: usize, cuts: &[f32]) -> Option<&RainTable> {
+        for slot in &self.rain {
+            let table = slot.get_or_init(|| RainTable::new(width, k, cuts));
+            if table.holds(width, k, cuts) {
+                return Some(table);
+            }
+        }
+        if !self.rain_full.swap(true, Ordering::Relaxed) {
+            log!("hdri clouds: a storm's rain keeps {RAIN_TABLES} tables of its sunlight; the looks past them march their cells unkept");
+        }
+        None
+    }
+
+    /// The table's cell (`i`, `j`): the march of texel (i, j) of a bake the table's width wide, along that bake's look at
+    /// its texel centre (`bake_par_hot`'s arithmetic, turned by the map's Rotation as `radiance_with` turns it, so the
+    /// same look bit for bit), marched the first time a look reads it.
+    fn rain_cell(&self, table: &RainTable, i: usize, j: usize) -> f32 {
+        let row = table.rows[j].get_or_init(|| (0..table.width).map(|_| AtomicU32::new(RAIN_UNMARCHED)).collect());
+        let bits = row[i].load(Ordering::Relaxed);
+        if bits != RAIN_UNMARCHED {
+            return f32::from_bits(bits);
+        }
+        let column = self.rain_march(table.width, table.height, &table.cuts, table.k, i, j);
+        row[i].store(column.to_bits(), Ordering::Relaxed);
+        column
+    }
+
+    /// The march of texel (`i`, `j`) of a bake `width` x `height` (a table's cell, `rain_cell`, or one past the tables):
+    /// along that bake's look at its texel centre, turned by the map's Rotation as `radiance_with` turns it.
+    fn rain_march(&self, width: usize, height: usize, cuts: &[f32], k: usize, i: usize, j: usize) -> f32 {
+        let uv = [(i as f32 + 0.5) / width as f32, (j as f32 + 0.5) / height as f32];
+        let look = crate::rotate_y(crate::vec(ibl::equirect_uv_to_dir(uv)), -self.turn_deg);
+        self.rain_column(look, width, cuts, k)
+    }
+
+    /// Where the unit `d` runs through the shaft's upright cylinder under its highest ragged base within segment `k` of a
+    /// march cut at `cuts`: (near, far) metres; None without a shaft, at and under the horizon and where it misses.
+    fn rain_span(&self, d: Vec3f, cuts: &[f32], k: usize) -> Option<(f32, f32)> {
+        let Shape::Storm(e) = &self.shape;
+        if !(e.rain[1] > 0.0) || !(d.y > 0.0) {
+            return None;
+        }
+        // the shaft's axis slants downwind RAIN_SLANT a metre down from under its foot: the cylinder round its middle
+        let top = e.base + BASE_RAG_M * (1.0 + BASE_RAG2);
+        let mid = e.rain[3] + 0.5 * e.rain[2] * top;
+        let c = [e.centre.x + e.wind.x * mid, e.centre.y + e.wind.y * mid, 1.25 * e.rain[0] + 0.5 * e.rain[2] * top];
+        let (near, far) = upright_span(d, c, 0.0, top)?;
+        let from = if k == 0 { 0.0 } else { cuts.get(k - 1).map_or(f32::INFINITY, |&h| shell_distance(d.y, h)) };
+        let to = cuts.get(k).map_or(f32::INFINITY, |&h| shell_distance(d.y, h));
+        let (near, far) = (near.max(from), far.min(to));
+        (far > near).then_some((near, far))
+    }
+
+    /// The sunlit rain seen along the unit `d` in segment `k` (`rain_light`): the integral over the look of the rain's
+    /// extinction (its density as the march reads it, `Read::rain`), times the sun that reaches it as the shaft's light
+    /// takes it (`sun_depth`: the storm's shadow on the rain), seen through what of the segment lies in front of it, the
+    /// rain at BOW_PASS (its diffraction stays in the bow's light) and cloud whole. Marched through the shaft's upright
+    /// cylinder under its highest ragged base (`rain_span`) in RAIN_STEP_M steps from the texel's blue-noise offset (the
+    /// march's jitter), stopping where the segment passes too little to see.
+    fn rain_column(&self, d: Vec3f, width: usize, cuts: &[f32], k: usize) -> f32 {
+        let Some((near, far)) = self.rain_span(d, cuts, k) else {
+            return 0.0;
+        };
+        let Shape::Storm(e) = &self.shape;
+        let angle = std::f32::consts::TAU / width.max(LAW_WIDTH_LEAST) as f32;
+        let width = width.max(2);
+        let uv = ibl::dir_to_equirect_uv(arr(d));
+        let jitter = blue_jitter((uv[0] * width as f32) as u32, (uv[1] * (width / 2) as f32) as u32);
+        let sigma = e.sigma;
+        let ds = RAIN_STEP_M;
+        let (l, shadowed) = (self.sun, e.base - BASE_RAG_M * (1.0 + BASE_RAG2) - 100.0);
+        let (mut t, mut tau, mut column) = (near + jitter * ds, 0.0f32, 0.0f32);
+        while t < far {
+            let p = vec3f(d.x * t, height_at(t, d.y), d.z * t);
+            let footprint = t * angle;
+            // under the base's skins the rain alone (`read`'s there)
+            let (density, rain) = match e.rain_only(&self.tiles, p, footprint) {
+                Some(rain) => (rain, rain),
+                None => {
+                    let r = self.shape.read(&self.tiles, p, footprint, Lod::Far);
+                    (r.density, r.rain)
+                }
+            };
+            if density > 0.0 {
+                let rain = rain * sigma;
+                let dtau = (density * sigma - (1.0 - BOW_PASS) * rain) * ds;
+                if rain > 0.0 {
+                    // `sun_depth`, the storm's shadow under the lowest base from its table
+                    let tau_sun = match &self.shade {
+                        Some(shade) if p.y < shadowed && l.y >= 0.03 => {
+                            let at = p + l * ((e.base + RAIN_SHADE_M - p.y) / l.y);
+                            RAIN_SHADOW_TAU * (1.0 - shade.lit_at(at.x, at.z))
+                        }
+                        _ => self.sun_depth(p, footprint).0,
+                    };
+                    column += rain * ds * (-(tau + 0.5 * dtau) - tau_sun).exp();
+                }
+                tau += dtau;
+                if (-tau).exp() <= MIN_TRANSMITTANCE {
+                    break;
+                }
+            }
+            t += ds;
+        }
+        column
+    }
+
     /// The sun's depth from `p` and the powder's (the first two steps, over POWDER_REACH_M): under the lowest base, the
     /// storm's shadow read once where the sun's ray meets the base (the GPU's rule: a march's steps through the base's
     /// edge were all in or all out, speckles); else CPU_SUN_STEPS steps growing CPU_SUN_GROWTH times to where the sun's
     /// ray leaves the ceiling, on the turrets alone.
     fn sun_depth(&self, p: Vec3f, footprint_m: f32) -> (f32, f32) {
         let l = self.sun;
-        if let Shape::Storm(e) = &self.shape {
-            if p.y < e.base - BASE_RAG_M * (1.0 + BASE_RAG2) - 100.0 {
-                let at = p + l * ((e.base + RAIN_SHADE_M - p.y) / l.y.max(0.03));
-                let lit = smoothstep(-RAIN_SHADE_EDGE_M, RAIN_SHADE_EDGE_M, e.envelope_distance(at));
-                return (RAIN_SHADOW_TAU * (1.0 - lit), 0.0);
-            }
+        let Shape::Storm(e) = &self.shape;
+        if p.y < e.base - BASE_RAG_M * (1.0 + BASE_RAG2) - 100.0 {
+            let at = p + l * ((e.base + RAIN_SHADE_M - p.y) / l.y.max(0.03));
+            let lit = smoothstep(-RAIN_SHADE_EDGE_M, RAIN_SHADE_EDGE_M, e.envelope_distance(at));
+            return (RAIN_SHADOW_TAU * (1.0 - lit), 0.0);
         }
         let exit = ((self.shape.floor_ceiling().1 - p.y) / l.y.max(0.03)).clamp(200.0, 40_000.0);
         let total = (CPU_SUN_GROWTH.powi(CPU_SUN_STEPS as i32) - 1.0) / (CPU_SUN_GROWTH - 1.0);
@@ -1096,7 +1503,8 @@ impl PlacedVolume {
         for k in 0..CPU_SUN_STEPS {
             let b1 = b0 + length;
             let x = p + l * (0.5 * (b0 + b1));
-            tau += self.shape.read(&self.tiles, x, footprint_m.max(0.25 * length), Lod::Far).density * self.shape.sigma() * length;
+            let lod = if k < SUN_SOFT_FROM { Lod::Far } else { Lod::Soft };
+            tau += self.shape.read(&self.tiles, x, footprint_m.max(0.25 * length), lod).density * self.shape.sigma() * length;
             if k < 2 {
                 (local, first) = (tau, b1);
             }
@@ -1107,7 +1515,7 @@ impl PlacedVolume {
     }
 
     /// The depth over `p` the dome's light comes through: a storm's two marches tilted UP_TILT to either side of the
-    /// zenith, averaged, read no finer than UP_SOFT_M, at UP_DEPTH of it (the GPU's rule); a lens' straight up.
+    /// zenith, averaged, read no finer than UP_SOFT_M, at UP_DEPTH of it (the GPU's rule).
     fn up_depth(&self, p: Vec3f, footprint_m: f32) -> f32 {
         match &self.shape {
             Shape::Storm(_) => {
@@ -1119,17 +1527,17 @@ impl PlacedVolume {
                 let north = self.up_march(p, vec3f(0.0, rise, -UP_TILT), f);
                 0.25 * (east + west + south + north) * UP_DEPTH
             }
-            Shape::Lens(_) => self.up_march(p, vec3f(0.0, 1.0, 0.0), footprint_m),
         }
     }
 
-    /// The depth from `p` along the unit `dir`: CPU_UP_STEPS steps doubling from UP_FIRST_M.
+    /// The depth from `p` along the unit `dir`: CPU_UP_STEPS steps doubling from UP_FIRST_M, each read at its middle no
+    /// finer than half its length on the cells' smooth profile (the GPU's cb_up).
     fn up_march(&self, p: Vec3f, dir: Vec3f, footprint_m: f32) -> f32 {
         let (mut tau, mut b0, mut length) = (0.0f32, 0.0f32, UP_FIRST_M);
         for _ in 0..CPU_UP_STEPS {
             let b1 = b0 + length;
             let x = p + dir * (0.5 * (b0 + b1));
-            tau += self.shape.read(&self.tiles, x, footprint_m.max(0.25 * length), Lod::Far).density * self.shape.sigma() * length;
+            tau += self.shape.read(&self.tiles, x, footprint_m.max(0.5 * length), Lod::Soft).density * self.shape.sigma() * length;
             b0 = b1;
             length *= 2.0;
         }
@@ -1186,7 +1594,8 @@ impl PlacedVolume {
     /// marches in the export mode's either way), its texels' directions moved by `jitter` texels.
     pub fn gpu_key(&self, width: usize, cuts: &[f32], lining: f32, mode: GpuMode, jitter: [f32; 2]) -> u64 {
         let bits = f32::from_bits;
-        let mut fields = vec![bits(self.key as u32), bits((self.key >> 32) as u32), lining, bits(mode as u32), jitter[0], jitter[1]];
+        // (whether its rain takes the sun's light by the drops' phase changes what the GPU records)
+        let mut fields = vec![bits(self.key as u32), bits((self.key >> 32) as u32), lining, bits(mode as u32), jitter[0], jitter[1], if self.bow.is_some() { 1.0 } else { 0.0 }];
         fields.extend_from_slice(cuts);
         footprint_grid_key(&fields, self.stream, width, GPU_KEY_PART)
     }
@@ -1231,7 +1640,7 @@ impl PlacedVolume {
         out.uniform("sun_l", [l.x, l.y, l.z, l.y]);
         out.uniform("shell", [base, top, top - base, self.shape.sigma()]);
         out.uniform("k_walk2", [0.1, 5.0, LAW_WIDTH_LEAST as f32, 0.0]);
-        self.shape.uniforms(&mut out);
+        self.shape.uniforms(&mut out, self.bow.is_some());
         let cut = |k: usize| cuts.get(k).copied().unwrap_or(f32::INFINITY).min(1.0e30);
         debug_assert!(cuts.len() < PASS_SEGMENTS);
         out.uniform("cuts", [cut(0), cut(1), cut(2), cuts.len().min(PASS_SEGMENTS - 1) as f32]);

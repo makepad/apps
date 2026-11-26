@@ -1,9 +1,16 @@
 //! The stream keeps the headset's colour and its coverage band through the real encode and
 //! decode: a painted part in the synthetic headset, the server's own decoder (macOS,
-//! `MAKEPAD_XR_REMOTE_SELFTEST_DECODE=1`) decodes the stream and measures the 300th picture as the
-//! host's dump measures the packed one; the decoded picture's chroma and coverage band match the
-//! packed one's, the ground plate's half cover (about 0.5 in the band) included: the test turns
-//! the stream's "Ground plate" switch on, which is off by default.
+//! `MAKEPAD_XR_REMOTE_SELFTEST_DECODE=1`) decodes the stream and measures the picture the host's
+//! dump measures packed; the decoded picture's chroma and coverage band match the packed one's,
+//! the ground plate's half cover (about 0.5 in the band) included: the test turns the stream's
+//! "Ground plate" switch on, which is off by default.
+//!
+//! The dumped picture is the first one packed after the XR pass has drawn the painted part: the
+//! test asks for it then (`MAKEPAD_XR_REMOTE_DUMP_AT=asked`, a `dump-request` file in the dump
+//! folder), counted in pictures. A fixed 300th picture came before the scene had drawn on a box
+//! with two cores, and its blank band failed the half-cover check (11-22). The decoder measures
+//! that very picture (its pts, in the left eye's stream alone), so a scene still settling compares
+//! like with like.
 //!
 //! The test sets the variables itself and starts its own synthetic headset on the native GPU.
 
@@ -50,8 +57,9 @@ object(a)
 m.fill(m.box({size: [100mm 100mm 100mm]}), Material{albedo: [0.95 0.05 0.05] name: "Red"})
 "##;
 
-/// The coloured pixels the XR pass shows in the left eye, at most, over the run.
-fn coloured(app: TestApp) {
+/// The coloured pixels the XR pass shows in the left eye, at most, over the run; once they show,
+/// the dump is asked for (`request`), and the packed and decoded numbers of that picture compared.
+fn coloured(app: TestApp, request: &std::path::Path) {
     app.locator(Selector::role(Role::Window)).wait_visible();
     let line = wait_poll(&app, || call(&app, "inspect", "{}"));
     let head = head_of(&text(&line));
@@ -60,22 +68,30 @@ fn coloured(app: TestApp) {
     let edits = Value::Str(r#"place("red", at: [175mm 160mm])"#.to_string()).to_json();
     let reply = text(&call(&app, "place", &format!(r#"{{"request_id":"paint-place","expected":{head:?},"edits":{edits}}}"#)).expect("place"));
     assert!(reply.contains("red/"), "the part is placed: {reply}");
-    let (mut seq, mut best, mut log_seen) = (0, 0usize, Vec::<String>::new());
+    let (mut seq, mut best, mut asked, mut log_seen) = (0, 0usize, false, Vec::<String>::new());
     wait_poll(&app, || {
-        if let Ok(t) = app.log_since(seq) {
+        { let t = app.log_since(seq).expect("the app's log");
             seq = t.last_seq;
-            log_seen.extend(t.lines.iter().filter(|l| l.contains("xr selftest: decoded") || l.contains("xr host: dumped") || l.contains("tile")).cloned());
+            log_seen.extend(t.lines.iter().filter(|l| l.contains("xr selftest: ") || l.contains("xr host: dump") || l.contains("tile")).cloned());
             for l in &t.lines {
                 if let Some(n) = l.split("fab xr pass: left eye ").nth(1).and_then(|r| r.split(" solid px, ").nth(1)).and_then(|r| r.split(' ').next()).and_then(|n| n.parse::<usize>().ok()) {
                     best = best.max(n);
                 }
             }
         }
-        if best >= 50 && log_seen.iter().any(|l| l.contains("xr selftest: decoded")) && log_seen.iter().any(|l| l.contains("xr host: dumped")) {
+        // the scene has drawn: the next picture packed is the one to measure
+        if best >= 50 && !asked {
+            std::fs::write(request, b"").expect("the dump request is written");
+            asked = true;
+        }
+        if let Some(l) = log_seen.iter().find(|l| l.contains("the dumped picture was not decoded") || l.contains("xr host: dump: ")) {
+            panic!("the dumped picture was not measured: {l}");
+        }
+        if asked && log_seen.iter().any(|l| l.contains("xr selftest: decoded")) && log_seen.iter().any(|l| l.contains("xr host: dumped")) {
             let find = |what: &str| log_seen.iter().find(|l| l.contains(what)).cloned().unwrap_or_default();
             compare(&find("xr host: dumped"), &find("xr selftest: decoded"));
             Ok(())
-        } else { Err(format!("not yet: {best} coloured px, {} dump/decode lines", log_seen.len())) }
+        } else { Err(format!("not yet: {best} coloured px, dump asked: {asked}, {} dump/decode lines", log_seen.len())) }
     });
 }
 
@@ -115,6 +131,7 @@ fn run(name: &str) {
         ("MAKEPAD_LAN", "1"),
         ("FAB_XR_PASS_STATS", "1"),
         ("MAKEPAD_XR_REMOTE_SELFTEST_DECODE", "1"),
+        ("MAKEPAD_XR_REMOTE_DUMP_AT", "asked"),
     ] {
         config.env.insert(k.into(), v.into());
     }
@@ -128,7 +145,8 @@ fn run(name: &str) {
     std::fs::write(data.join("xr-stream"), "ground=on\n").unwrap();
     config.env.insert("MAKEPAD_TEST_HOME".into(), home.display().to_string());
     config.env.insert("MAKEPAD_XR_REMOTE_DUMP".into(), dir.display().to_string());
-    let r = run_with_config(config, coloured);
+    let request = dir.join("dump-request");
+    let r = run_with_config(config, |app| coloured(app, &request));
     let _ = std::fs::remove_dir_all(&dir);
     if let Err(e) = r {
         panic!("{}", e.message());

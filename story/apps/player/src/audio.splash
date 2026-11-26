@@ -1,0 +1,13 @@
+use mod.flow.*
+
+/** The film's song on a deck: played, braked and scratched by a finger on
+ * the picture, flung back into play either way. The player loads the clip
+ * and writes the deck's controls; the device plays `out`. */
+let deck = AudioDeck{ play: 0 speed: 1 }
+let out = AudioOutput{ enabled: 1 audio: deck.out(@audio) }
+
+Flow{
+    label: "Film audio"
+    brief: "The film's song on one deck, into the device."
+    deck, out
+}

@@ -27,6 +27,7 @@
 //! - `@writes-fail`: this connection's writes fail while its reads go on.
 //! - `@read-wait <ms>`: how long a read waits when there is nothing to read. It starts at the real
 //!   connection's read timeout, and a longer one lets what is pressed gather into one batch.
+//! - `@capture-upload`: keep a successful upload beside the report file for byte comparisons in tests.
 //! - `@upload <ms>`: how long an upload takes, and how long a cancelled one takes to close.
 
 use crate::link::{spawn_transfer, Storage, Transfer};
@@ -104,11 +105,12 @@ pub(crate) struct SimPrinter {
     down: bool,
     read_wait: Duration,
     upload: Duration,
+    capture_upload: bool,
 }
 
 impl SimPrinter {
     pub(crate) fn new(path: PathBuf) -> Self {
-        Self { feed: SimFeed::new(path.clone()), path, reports: Reports::default(), answer: Answer::Success, down: false, read_wait: READ_WAIT, upload: SIM_UPLOAD }
+        Self { feed: SimFeed::new(path.clone()), path, reports: Reports::default(), answer: Answer::Success, down: false, read_wait: READ_WAIT, upload: SIM_UPLOAD, capture_upload: false }
     }
 
     /// What the file says next. A subscribed connection hears the reports; without one they only
@@ -143,6 +145,7 @@ impl SimPrinter {
             ("up", _) => self.down = false,
             ("writes-fail", _) => if let Some(connection) = connection { connection.break_writes(); },
             ("read-wait", _) if millis.is_some() => self.read_wait = millis.unwrap_or(READ_WAIT),
+            ("capture-upload", _) => self.capture_upload = true,
             ("upload", _) if millis.is_some() => self.upload = millis.unwrap_or(SIM_UPLOAD),
             _ => eprintln!("fab: simulated printer: no such order: @{order}"),
         }
@@ -237,7 +240,9 @@ pub(crate) struct SimStorage(pub(crate) Rc<RefCell<SimPrinter>>);
 
 impl Storage for SimStorage {
     fn upload(&self, _file: String, job: crate::safety::ValidatedJob) -> Option<Arc<Transfer>> {
-        let takes = self.0.borrow().upload;
+        let printer = self.0.borrow();
+        let takes = printer.upload;
+        let capture = printer.capture_upload.then(|| printer.path.with_extension("uploaded"));
         spawn_transfer("simulated", move |_, transfer| {
             let started = Instant::now();
             let total = job.bytes().len() as f64;
@@ -247,7 +252,9 @@ impl Storage for SimStorage {
                     break Err("upload cancelled".to_string());
                 }
                 let done = started.elapsed().as_secs_f64() / takes.as_secs_f64().max(f64::MIN_POSITIVE);
-                if done >= 1.0 { break Ok(()); }
+                if done >= 1.0 {
+                    break capture.as_ref().map_or(Ok(()), |path| std::fs::write(path, job.bytes()).map_err(|e| e.to_string()));
+                }
                 transfer.sent.store((total * done) as u64, Ordering::Relaxed);
                 std::thread::sleep(Duration::from_millis(20));
             };

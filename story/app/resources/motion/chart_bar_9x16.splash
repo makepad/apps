@@ -1,0 +1,72 @@
+use mod.motion.*
+// BAR CHART, 9:16 — the portrait cut of chart_bar: the plot fills the safe
+// column (x 110–930, baseline y 1120), title above. Original notes follow.
+// BAR CHART — five bars rise from a baseline that draws first, 80 ms
+// apart, on ease_out_expo (fast growth, long settle: the eye reads the
+// final heights, not the travel). Each value rides the top of its bar and
+// counts up on the same curve. The last bar takes the accent; the rest
+// stay neutral, so the story is one bar, not five colours.
+// Why: identical timing for bar and number keeps them locked together,
+// and the stagger reads left to right like the data.
+// The plot is 520 px tall for 0–100: height = value × 5.2.
+let values = [in(@a), in(@b), in(@c), in(@d), in(@e)]
+let labels = [in(@la), in(@lb), in(@lc), in(@ld), in(@le)]
+let bars = []
+for i in 0..5 {
+    let x = 110 + i * 170
+    let h = values[i] * 5.2
+    let t0 = 0.6 + i * 0.08
+    let last = i == 4
+    bars.push(Rect{at: vec2(x, 1118) size: tween(vec2(120, 0), vec2(120, h), t0, t0 + 1.2, @ease_out_expo)
+                   y: tween(0, 0 - h, t0, t0 + 1.2, @ease_out_expo) radius: 6
+                   fill: if last { in(@accent) } else { in(@bar) }})
+    bars.push(Text{number: tween(0, values[i], t0, t0 + 1.2, @ease_out_expo) suffix: in(@suffix) tabular: true
+                   font: Font{family: "Inter" weight: if last { 800 } else { 600 }} size: if last { 48 } else { 40 }
+                   color: if last { in(@accent) } else { in(@muted) }
+                   at: vec2(x + 60, if last { 1050 } else { 1060 }) wrap: 200 align: @center
+                   y: tween(0, 0 - h, t0, t0 + 1.2, @ease_out_expo) opacity: tween(0, 1, t0, t0 + 0.3, @ease_out_cubic)})
+    bars.push(Text{text: labels[i] font: Font{family: "Inter" weight: if last { 700 } else { 500 }} size: 32
+                   color: if last { in(@ink) } else { in(@muted) }
+                   at: vec2(x + 60, 1144) wrap: 200 align: @center opacity: tween(0, 1, 0.5, 1.0, @ease_out_cubic)})
+}
+Motion{
+    label: "Bar chart 9:16"
+    brief: "Five bars rising in sequence with counting values; the last bar highlighted; portrait."
+    tags: ["chart", "data", "bar", "infographic", "9:16"]
+    size: vec2(1080, 1920) duration: 6.0
+    inputs: {
+        title: input(@text, "Weekly active teams", "Chart title")
+        note: input(@text, "Thousands, last five quarters", "Units and period")
+        a: input(@number, 34, "Bar 1, 0–100") b: input(@number, 46, "Bar 2") c: input(@number, 52, "Bar 3")
+        d: input(@number, 68, "Bar 4") e: input(@number, 91, "Bar 5 (highlighted)")
+        la: input(@text, "Q1") lb: input(@text, "Q2") lc: input(@text, "Q3") ld: input(@text, "Q4") le: input(@text, "Q1 '27")
+        suffix: input(@text, "k", "After each value")
+        accent: input(@color, #ff5c39, "Highlighted bar")
+        bar: input(@color, #3a4250, "Other bars")
+        ink: input(@color, #f4f7fa, "Title")
+        muted: input(@color, #8e9aa7, "Values, labels, baseline")
+        grid: input(@color, #ffffff14, "Gridlines")
+        background: input(@color, #0b0d12, "Ground")
+    }
+    layers: [
+        Rect{size: vec2(1080, 1920) fill: in(@background)}
+        Group{
+            opacity: tween(1, 0, 5.55, 6.0, @ease_in_cubic)
+            layers: [
+                Text{text: in(@title) font: Font{family: "Inter" weight: 700} size: 64 tracking: -0.02 color: in(@ink) at: vec2(100, 300) wrap: 840
+                     opacity: tween(0, 1, 0.0, 0.5, @ease_out_cubic) y: tween(20, 0, 0.0, 0.8, @ease_out_quint)}
+                Text{text: in(@note) font: Font{family: "Inter"} size: 32 color: in(@muted) at: vec2(100, 440) wrap: 840
+                     opacity: tween(0, 1, 0.15, 0.65, @ease_out_cubic) y: tween(20, 0, 0.15, 0.95, @ease_out_quint)}
+                // gridlines at 25 / 50 / 75 / 100, then the baseline
+                Group{stagger: 0.05 layers: [
+                    Rect{at: vec2(100, 989) size: tween(vec2(0, 2), vec2(840, 2), 0.2, 1.0, @ease_in_out_quint) fill: in(@grid)}
+                    Rect{at: vec2(100, 859) size: tween(vec2(0, 2), vec2(840, 2), 0.2, 1.0, @ease_in_out_quint) fill: in(@grid)}
+                    Rect{at: vec2(100, 729) size: tween(vec2(0, 2), vec2(840, 2), 0.2, 1.0, @ease_in_out_quint) fill: in(@grid)}
+                    Rect{at: vec2(100, 599) size: tween(vec2(0, 2), vec2(840, 2), 0.2, 1.0, @ease_in_out_quint) fill: in(@grid)}
+                ]}
+                Group{layers: bars}
+                Rect{at: vec2(100, 1116) size: tween(vec2(0, 4), vec2(840, 4), 0.1, 0.9, @ease_in_out_quint) fill: in(@muted)}
+            ]
+        }
+    ]
+}

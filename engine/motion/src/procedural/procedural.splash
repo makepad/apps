@@ -1,0 +1,409 @@
+// The procedural looks' shaders (`crate::procedural`): each a pixel function
+// of a Shader layer over its box, its dials as the layer's params.
+
+/** `GridFloor`: grid lines running to a vanishing point on a glowing horizon,
+ *  scrolling toward the viewer, fading to dark near the horizon. */
+let grid_floor = fn() {
+    let uv = self.pos
+    let asp = self.size.x / max(self.size.y, 1.0)
+    let px = 1.0 / max(self.size.y, 1.0)
+    let dy = uv.y - self.gf_horizon
+    let line = exp(0.0 - abs(dy) / (px * 1.5 * self.gf_width))
+    let haze = exp(0.0 - abs(dy) * 8.0 / max(self.gf_glow, 0.001)) * self.gf_glow * 0.8
+    let mut a = line + haze * mix(self.gf_sky, 0.6, step(0.0, dy))
+    if dy > 0.0 {
+        let z = 1.0 / dy
+        let n = self.gf_cells * 0.25
+        let gx = (uv.x - 0.5) * asp * z * n
+        let gz = (z + self.time * self.gf_speed / n) * n
+        // A pixel's footprint in grid units (across x, and down the slant).
+        let wx = n * z * px + abs(uv.x - 0.5) * asp * n * px / (dy * dy)
+        let wz = n * px / (dy * dy)
+        let dx = abs(fract(gx + 0.5) - 0.5)
+        let dz = abs(fract(gz + 0.5) - 0.5)
+        let lx = (1.0 - smoothstep(wx * self.gf_width * 0.5, wx * (self.gf_width * 0.5 + 1.0), dx)) * (1.0 - smoothstep(0.05, 0.2, wx))
+        let lz = (1.0 - smoothstep(wz * self.gf_width * 0.5, wz * (self.gf_width * 0.5 + 1.0), dz)) * (1.0 - smoothstep(0.05, 0.2, wz))
+        a = a + max(lx, lz) * smoothstep(0.0, self.gf_fade, dy)
+    }
+    let col = vec3(self.gf_r, self.gf_g, self.gf_b)
+    let hot = clamp(a - 1.0, 0.0, 1.0)
+    return vec4(mix(col, vec3(1.0, 0.95, 0.85), hot * 0.6) * min(a, 1.0), min(a, 1.0))
+}
+
+/** `Rays`: light rays streaming out of a point, slowly turning, with a hot core. */
+let rays = fn() {
+    let asp = self.size.x / max(self.size.y, 1.0)
+    let v = (self.pos - vec2(self.ry_cx, self.ry_cy)) * vec2(asp, 1.0)
+    let r = length(v)
+    let a = atan2(v.y, v.x)
+    let n1 = 0.5 + 0.5 * sin(a * self.ry_count + self.time * self.ry_speed)
+    let n2 = 0.5 + 0.5 * sin(a * self.ry_count * 1.618 - self.time * self.ry_speed * 0.7 + 1.3)
+    let ray = smoothstep(1.0 - self.ry_spread, 1.0, n1) * (0.55 + 0.45 * n2)
+    let reach = smoothstep(self.ry_reach, self.ry_reach * 0.55, r)
+    let core = exp(0.0 - r * 14.0) * 1.6 * min(self.ry_reach * 4.0, 1.0)
+    let a1 = ray * exp(0.0 - r * 1.3) * reach * self.ry_intensity + core
+    let hot = clamp(a1 - 1.0, 0.0, 1.0)
+    let col = mix(vec3(self.ry_r, self.ry_g, self.ry_b), vec3(1.0, 0.96, 0.88), hot * 0.7 + core * 0.3)
+    return vec4(col * min(a1, 1.0), min(a1, 1.0))
+}
+
+/** `GridWarp`: a grid bent by a point mass: pulled into a black hole with an
+ *  accretion ring (`gw_ripple` 0), or rippled outward (`gw_ripple` 1). */
+let grid_warp = fn() {
+    let asp = self.size.x / max(self.size.y, 1.0)
+    let px = 1.0 / max(self.size.y, 1.0)
+    let pp = vec2(self.pos.x * asp, self.pos.y)
+    let d = pp - vec2(self.gw_cx * asp, self.gw_cy)
+    let r = length(d)
+    let dn = d / max(r, 0.00001)
+    let q_well = pp - dn * self.gw_mass * 0.1 / (r + 0.1)
+    let s_well = 1.0 + self.gw_mass * 0.1 / ((r + 0.1) * (r + 0.1))
+    let q_ripple = pp + dn * sin(r * 40.0 - self.time * 6.0) * self.gw_mass * 0.012 * exp(0.0 - r * 2.0)
+    let s_ripple = 1.0 + self.gw_mass * 0.5
+    let q = mix(q_well, q_ripple, self.gw_ripple)
+    let stretch = mix(s_well, s_ripple, self.gw_ripple)
+    let g = q * self.gw_cells
+    let fw = self.gw_cells * px * stretch
+    let lx = abs(fract(g.x + 0.5) - 0.5)
+    let ly = abs(fract(g.y + 0.5) - 0.5)
+    let lw = fw * self.gw_width * 0.5
+    let line = max(1.0 - smoothstep(lw, lw + fw, lx), 1.0 - smoothstep(lw, lw + fw, ly)) * (1.0 - smoothstep(0.15, 0.45, fw))
+    let rh = (0.04 + 0.05 * self.gw_mass) * self.gw_ring
+    let hole = smoothstep(rh + px, rh - px, r)
+    let swirl = 0.65 + 0.35 * sin(atan2(d.y, d.x) * 5.0 - self.time * 3.0 - r * 30.0)
+    let disk = exp(0.0 - abs(r - rh * 1.7) / max(rh * 0.28, 0.0001)) * swirl * self.gw_ring
+    let glow = line * 0.85 * (1.0 - hole) + disk * 1.4
+    let a = clamp(max(glow, hole), 0.0, 1.0)
+    let col = mix(vec3(self.gw_r, self.gw_g, self.gw_b), vec3(1.0, 0.95, 0.85), clamp(disk - 0.8, 0.0, 1.0))
+    return vec4(col * min(glow, 1.0) * (1.0 - hole), a)
+}
+
+/** `Metaballs`: a glossy ray-marched blob whose satellites orbit and melt into
+ *  it by a smooth minimum. */
+let metaballs = fn() {
+    let asp = self.size.x / max(self.size.y, 1.0)
+    let p = vec2((self.pos.x - 0.5) * asp, 0.5 - self.pos.y)
+    let eye = vec3(0.0, 0.0, 2.4)
+    let rd = normalize(vec3(p.x, p.y, 0.0 - 1.9))
+    let mut t = 1.2
+    let mut hit = 0.0
+    let mut near = 10.0
+    let mut i = 0.0
+    loop {
+        if i > 63.5 {
+            break
+        }
+        let d = self.mb_map(eye + rd * t).x
+        near = min(near, d)
+        if d < 0.0015 {
+            hit = 1.0
+            break
+        }
+        t = t + d * 0.9
+        if t > 3.8 {
+            break
+        }
+        i = i + 1.0
+    }
+    let px = 2.4 / (1.9 * max(self.size.y, 1.0))
+    if hit < 0.5 {
+        let edge = (1.0 - smoothstep(0.0, px * 1.5, near)) * 0.8
+        return vec4(vec3(self.mb_r, self.mb_g, self.mb_b) * 0.5 * edge, edge)
+    }
+    let hp = eye + rd * t
+    let m = self.mb_map(hp)
+    let e = 0.002
+    let n = normalize(vec3(
+        self.mb_map(hp + vec3(e, 0.0, 0.0)).x - self.mb_map(hp - vec3(e, 0.0, 0.0)).x,
+        self.mb_map(hp + vec3(0.0, e, 0.0)).x - self.mb_map(hp - vec3(0.0, e, 0.0)).x,
+        self.mb_map(hp + vec3(0.0, 0.0, e)).x - self.mb_map(hp - vec3(0.0, 0.0, e)).x
+    ))
+    let l = normalize(vec3(-0.5, 0.7, 0.6))
+    let diff = clamp(dot(n, l), 0.0, 1.0)
+    let hv = normalize(l - rd)
+    let spec = pow(clamp(dot(n, hv), 0.0, 1.0), 56.0)
+    let fres = pow(1.0 - clamp(dot(n, vec3(0.0, 0.0, 0.0) - rd), 0.0, 1.0), 3.0)
+    let base = m.yzw
+    let col = base * (0.22 + 0.85 * diff) + vec3(1.0, 1.0, 1.0) * spec * 0.95 + (base * 0.4 + vec3(0.25, 0.35, 0.9) * 0.3) * fres
+    return vec4(col, 1.0)
+}
+
+/** The metaballs' distance field: the blob, and `mb_n` (up to four)
+ *  satellites on their orbits, smooth-min merged; xyz of the result is the
+ *  colour where it is nearest. */
+let metaballs_map = fn(p: vec3) -> vec4 {
+    let w = self.mb_wobble * 0.06 * sin(p.x * 5.0 + self.time * 2.1) * sin(p.y * 4.0 + self.time * 1.7) * sin(p.z * 3.0 + self.time * 1.3)
+    let mut m = vec4(length(p) - self.mb_radius * (1.0 + w), self.mb_r, self.mb_g, self.mb_b)
+    let mut i = 0.0
+    loop {
+        if i > 3.5 {
+            break
+        }
+        if i < self.mb_n - 0.5 {
+            let a = self.time * self.mb_speed * (0.9 + 0.35 * i) + i * 6.2831853 / max(self.mb_n, 1.0)
+            let o = self.mb_orbit * (0.62 + 0.38 * cos(self.time * self.mb_speed * 0.8 + 1.7 * i))
+            let q = vec3(cos(a) * o, sin(a) * o * 0.45 + 0.08 * sin(i * 2.1), sin(a) * o * 0.6)
+            let d = length(p - q) - (0.12 + 0.025 * modf(i, 3.0))
+            let h = clamp(0.5 + 0.5 * (d - m.x) / self.mb_k, 0.0, 1.0)
+            let c = clamp(0.5 + 0.5 * (d - m.x) / (self.mb_k * 0.35), 0.0, 1.0)
+            let c01 = mix(vec3(self.mb_s0r, self.mb_s0g, self.mb_s0b), vec3(self.mb_s1r, self.mb_s1g, self.mb_s1b), step(0.5, i))
+            let c23 = mix(vec3(self.mb_s2r, self.mb_s2g, self.mb_s2b), vec3(self.mb_s3r, self.mb_s3g, self.mb_s3b), step(2.5, i))
+            let col = mix(c01, c23, step(1.5, i))
+            m = vec4(mix(d, m.x, h) - self.mb_k * h * (1.0 - h), mix(col, m.yzw, c))
+        }
+        i = i + 1.0
+    }
+    return m
+}
+
+
+/** `Pattern`: a tiling of its box, `color` (`a*`) over `color2` (`b*`) by
+ *  the kind's coverage (`pattern_cover`), cells of `cell` (of the box's
+ *  height) turned by `angle`, drifting with `time`. */
+let pattern = fn() {
+    let c = cos(self.angle)
+    let s = sin(self.angle)
+    let p = vec2(self.pos.x * self.aspect, self.pos.y) / max(self.cell, 0.0001)
+    let q = vec2(c * p.x + s * p.y + self.time, 0.0 - s * p.x + c * p.y)
+    let aa = 1.0 / max(self.size.y * self.cell, 1.0)
+    let f = self.pattern_cover(p, q, aa, self.weight)
+    let ca = vec4(self.ar, self.ag, self.ab, 1.0) * self.aa
+    let cb = vec4(self.br, self.bg, self.bb, 1.0) * self.ba
+    return mix(cb, ca, clamp(f, 0.0, 1.0))
+}
+
+// A Pattern kind's coverage of `color` at `q` (cell units, turned and
+// drifting; `p` still), `aa` a pixel in cell units, `w` the weight (line or
+// dot size, 0..1 of a cell). The seeded kinds hash with `self.seed`.
+
+let pattern_stripes = fn(p: vec2, q: vec2, aa: float, w: float) -> float {
+    return smoothstep(0.0 - aa, aa, w * 0.5 - abs(fract(q.x) - 0.5))
+}
+
+let pattern_dots = fn(p: vec2, q: vec2, aa: float, w: float) -> float {
+    return smoothstep(aa, 0.0 - aa, length(fract(q) - vec2(0.5, 0.5)) - w * 0.5)
+}
+
+let pattern_checker = fn(p: vec2, q: vec2, aa: float, w: float) -> float {
+    return abs(modf(floor(q.x) + floor(q.y), 2.0))
+}
+
+let pattern_grid = fn(p: vec2, q: vec2, aa: float, w: float) -> float {
+    return smoothstep(aa, 0.0 - aa, min(min(fract(q.x), 1.0 - fract(q.x)), min(fract(q.y), 1.0 - fract(q.y))) - w * 0.25)
+}
+
+let pattern_hatch = fn(p: vec2, q: vec2, aa: float, w: float) -> float {
+    return max(smoothstep(0.0 - aa, aa, w * 0.25 - abs(fract(q.x + q.y) - 0.5)), smoothstep(0.0 - aa, aa, w * 0.25 - abs(fract(q.x - q.y) - 0.5)))
+}
+
+let pattern_waves = fn(p: vec2, q: vec2, aa: float, w: float) -> float {
+    return smoothstep(0.0 - aa, aa, w * 0.5 - abs(fract(q.y + 0.25 * sin(q.x * 6.2831853)) - 0.5))
+}
+
+let pattern_noise = fn(p: vec2, q: vec2, aa: float, w: float) -> float {
+    return smoothstep(1.0 - w, 1.0, fract(sin(dot(floor(q), vec2(12.9898, 78.233))) * 43758.5453))
+}
+
+/** `@truchet`: quarter-circle arcs, each tile one of two turns (seeded). */
+let pattern_truchet = fn(p: vec2, q: vec2, aa: float, w: float) -> float {
+    let id = floor(q)
+    let g0 = fract(q)
+    let h = fract(sin(dot(id, vec2(12.9898, 78.233)) + self.seed) * 43758.5453)
+    let g = mix(g0, vec2(1.0 - g0.x, g0.y), step(0.5, h))
+    let d = min(abs(length(g) - 0.5), abs(length(g - vec2(1.0, 1.0)) - 0.5))
+    return smoothstep(aa, 0.0 - aa, d - w * 0.25)
+}
+
+/** `@truchet_fill`: the same tiles filled two-tone, a maze of blobs and bands. */
+let pattern_truchet_fill = fn(p: vec2, q: vec2, aa: float, w: float) -> float {
+    let id = floor(q)
+    let g0 = fract(q)
+    let h = fract(sin(dot(id, vec2(12.9898, 78.233)) + self.seed) * 43758.5453)
+    let g = mix(g0, vec2(1.0 - g0.x, g0.y), step(0.5, h))
+    let r = min(length(g), length(g - vec2(1.0, 1.0)))
+    let ins = smoothstep(aa, 0.0 - aa, r - 0.5)
+    let flip = abs(abs(modf(id.x + id.y, 2.0)) - step(0.5, h))
+    return mix(ins, 1.0 - ins, flip)
+}
+
+/** `@truchet_diag`: one diagonal per tile, either way. */
+let pattern_truchet_diag = fn(p: vec2, q: vec2, aa: float, w: float) -> float {
+    let id = floor(q)
+    let g0 = fract(q)
+    let h = fract(sin(dot(id, vec2(12.9898, 78.233)) + self.seed) * 43758.5453)
+    let g = mix(g0, vec2(1.0 - g0.x, g0.y), step(0.5, h))
+    let d = abs(g.x - g.y) * 0.70710678
+    return smoothstep(aa, 0.0 - aa, d - w * 0.125)
+}
+
+/** `@truchet_hex`: hexagons with three arcs each, turned by 0 or 60 degrees. */
+let pattern_truchet_hex = fn(p: vec2, q: vec2, aa: float, w: float) -> float {
+    let r = vec2(1.0, 1.7320508)
+    let hh = r * 0.5
+    let a = q - r * floor(q / r) - hh
+    let b0 = q - hh
+    let b = b0 - r * floor(b0 / r) - hh
+    let gv = mix(b, a, step(dot(a, a), dot(b, b)))
+    let id = floor((q - gv) * 2.0 + vec2(0.5, 0.5))
+    let h = fract(sin(dot(id, vec2(12.9898, 78.233)) + self.seed) * 43758.5453)
+    let v0 = 0.5235988 + step(0.5, h) * 1.0471976
+    let d0 = abs(length(gv - vec2(cos(v0), sin(v0)) * 0.57735) - 0.288675)
+    let d1 = abs(length(gv - vec2(cos(v0 + 2.0943951), sin(v0 + 2.0943951)) * 0.57735) - 0.288675)
+    let d2 = abs(length(gv - vec2(cos(v0 + 4.1887902), sin(v0 + 4.1887902)) * 0.57735) - 0.288675)
+    let d = min(d0, min(d1, d2))
+    return smoothstep(aa, 0.0 - aa, d - w * 0.1)
+}
+
+/** The seeded 2D hash of a cell id (0..1 each). */
+let pattern_hash2 = fn(id: vec2) -> vec2 {
+    return fract(sin(vec2(dot(id, vec2(127.1, 311.7)) + self.seed, dot(id, vec2(269.5, 183.3)) + self.seed)) * 43758.5453)
+}
+
+/** The two nearest feature points of a jittered grid around `q` (a 3x3
+ *  search): their distances and the nearest cell's hash. */
+let pattern_cells = fn(q: vec2) -> vec3 {
+    let id = floor(q)
+    let fq = fract(q)
+    let mut d1 = 8.0
+    let mut d2 = 8.0
+    let mut hh = 0.0
+    let mut j = 0.0 - 1.0
+    loop {
+        if j > 1.5 {
+            break
+        }
+        let mut i = 0.0 - 1.0
+        loop {
+            if i > 1.5 {
+                break
+            }
+            let ch = self.pattern_hash2(id + vec2(i, j))
+            let cd = length(vec2(i, j) + ch * 0.85 + vec2(0.075, 0.075) - fq)
+            let cn = step(cd, d1)
+            d2 = mix(min(d2, cd), d1, cn)
+            hh = mix(hh, ch.x, cn)
+            d1 = min(d1, cd)
+            i = i + 1.0
+        }
+        j = j + 1.0
+    }
+    return vec3(d1, d2, hh)
+}
+
+/** `@voronoi`: the edges of seeded Voronoi cells (`weight` their width). */
+let pattern_voronoi = fn(p: vec2, q: vec2, aa: float, w: float) -> float {
+    let n = self.pattern_cells(q)
+    return smoothstep(aa * 2.0, 0.0 - aa * 2.0, (n.y - n.x) - w * 0.12)
+}
+
+/** `@scales`: reptile skin, each cell a domed scale shaded by its own tone. */
+let pattern_scales = fn(p: vec2, q: vec2, aa: float, w: float) -> float {
+    let n = self.pattern_cells(q)
+    let dome = 1.0 - smoothstep(0.0, 0.85, n.x)
+    let crack = smoothstep(0.0, 0.05 + w * 0.12, n.y - n.x)
+    return crack * (0.35 + 0.65 * dome) * (0.7 + 0.3 * n.z)
+}
+
+/** `@guilloche`: a banknote rosette, 24 interlaced sine loops round the
+ *  box's centre (`cell` its radius). */
+let pattern_guilloche = fn(p: vec2, q: vec2, aa: float, w: float) -> float {
+    let pa = vec2(self.pos.x * self.aspect - 0.5 * self.aspect, self.pos.y - 0.5) / max(self.cell, 0.0001)
+    let r = length(pa)
+    let th = atan2(pa.y, pa.x) + self.angle + self.time * 0.1
+    let lw = w * 0.012 + aa
+    let mut dmin = 8.0
+    let mut i = 0.0
+    loop {
+        if i > 23.5 {
+            break
+        }
+        let ph = i * 0.2617994
+        let rr = 0.78 + 0.16 * sin(th * 12.0 + ph) + 0.05 * sin(th * 5.0 - ph * 2.0)
+        dmin = min(dmin, abs(r - rr))
+        i = i + 1.0
+    }
+    return smoothstep(lw, lw - aa * 1.5, dmin)
+}
+
+/** `@guilloche_band`: interlaced sine ropes along the box (`cell` its height). */
+let pattern_guilloche_band = fn(p: vec2, q: vec2, aa: float, w: float) -> float {
+    let bx = self.pos.x * self.aspect / max(self.cell, 0.0001) * 6.2831853 + self.time
+    let by = (self.pos.y - 0.5) / max(self.cell, 0.0001)
+    let lw = w * 0.012 + aa
+    let mut dmin = 8.0
+    let mut i = 0.0
+    loop {
+        if i > 11.5 {
+            break
+        }
+        let ph = i * 0.5235988
+        let yy = 0.3 * sin(bx + ph) * cos(bx * 0.5 - ph * 0.7)
+        dmin = min(dmin, abs(by - yy))
+        i = i + 1.0
+    }
+    return smoothstep(lw, lw - aa * 1.5, dmin) * step(abs(by), 0.5)
+}
+
+/** `@leds`: a wall of round LEDs, each on or off by a seeded flicker that
+ *  changes once a second of `time` (`weight` the LED size). */
+let pattern_leds = fn(p: vec2, q: vec2, aa: float, w: float) -> float {
+    let lid = floor(p)
+    let lg = fract(p) - vec2(0.5, 0.5)
+    let tick = floor(self.time)
+    let on = step(0.38, self.pattern_hash2(lid + vec2(tick * 3.7, tick * 1.3)).x) * (0.55 + 0.45 * self.pattern_hash2(lid).y)
+    let dot = smoothstep(aa, 0.0 - aa, length(lg) - w * 0.4)
+    let halo = (1.0 - smoothstep(0.0, 0.5, length(lg))) * 0.35
+    return dot * (0.1 + 0.9 * on) + halo * on
+}
+
+/** `Pattern{kind: @wash}`: watercolour, four octaves of value noise pooled
+ *  above `weight`, darker at the pigment's edge, `color` on `color2` (the
+ *  paper), drifting with `time`. */
+let pattern_wash = fn() {
+    let mut q = vec2(self.pos.x * self.aspect, self.pos.y) / max(self.cell, 0.0001) + vec2(self.time * 0.05, 0.0)
+    let mut n = 0.0
+    let mut amp = 0.5
+    let mut i = 0.0
+    loop {
+        if i > 3.5 {
+            break
+        }
+        let fl = floor(q)
+        let fr = fract(q)
+        let u = fr * fr * (vec2(3.0, 3.0) - 2.0 * fr)
+        let a = fract(sin(dot(fl, vec2(12.9898, 78.233))) * 43758.5453)
+        let b = fract(sin(dot(fl + vec2(1.0, 0.0), vec2(12.9898, 78.233))) * 43758.5453)
+        let c = fract(sin(dot(fl + vec2(0.0, 1.0), vec2(12.9898, 78.233))) * 43758.5453)
+        let d = fract(sin(dot(fl + vec2(1.0, 1.0), vec2(12.9898, 78.233))) * 43758.5453)
+        n = n + amp * mix(mix(a, b, u.x), mix(c, d, u.x), u.y)
+        q = q * 2.03 + vec2(1.7, 9.2)
+        amp = amp * 0.5
+        i = i + 1.0
+    }
+    let t = self.weight
+    let body = smoothstep(t - 0.12, t + 0.05, n)
+    let edge = smoothstep(t - 0.02, t + 0.01, n) * (1.0 - smoothstep(t + 0.01, t + 0.07, n))
+    let pigment = clamp(body * (0.55 + 0.45 * n) + edge * 0.5, 0.0, 1.0)
+    let ca = vec4(self.ar, self.ag, self.ab, 1.0) * self.aa
+    let cb = vec4(self.br, self.bg, self.bb, 1.0) * self.ba
+    return mix(cb, ca, pigment)
+}
+
+/** `Pattern{kind: @halftone}`: the frame under it as dots on `color2` (the
+ *  paper), each dot the colour under it, sized by how far that is from the
+ *  paper; `weight` 1 closes the dots into solid ink. */
+let pattern_halftone = fn() {
+    let p = vec2(self.pos.x * self.aspect, self.pos.y) / max(self.cell, 0.0001)
+    let q = vec2(p.x * 0.7071 + p.y * 0.7071, p.y * 0.7071 - p.x * 0.7071)
+    let aa = 1.0 / max(self.size.y * self.cell, 1.0)
+    let b = self.below.sample(self.pos)
+    let paper = vec3(self.br, self.bg, self.bb)
+    let ink = b.xyz / max(b.w, 0.0001)
+    let d = clamp(length(ink - paper) * 1.2, 0.0, 1.0) * b.w
+    let r = self.weight * 0.7071 * sqrt(d)
+    let f = smoothstep(aa, 0.0 - aa, length(fract(q) - vec2(0.5, 0.5)) - r)
+    return vec4(mix(paper, ink, f), 1.0) * self.ba
+}
+
+{grid_floor: grid_floor rays: rays grid_warp: grid_warp metaballs: metaballs metaballs_map: metaballs_map
+ pattern: pattern pattern_stripes: pattern_stripes pattern_dots: pattern_dots pattern_checker: pattern_checker pattern_grid: pattern_grid pattern_hatch: pattern_hatch pattern_waves: pattern_waves pattern_noise: pattern_noise pattern_truchet: pattern_truchet pattern_truchet_fill: pattern_truchet_fill pattern_truchet_diag: pattern_truchet_diag pattern_truchet_hex: pattern_truchet_hex pattern_hash2: pattern_hash2 pattern_cells: pattern_cells pattern_voronoi: pattern_voronoi pattern_scales: pattern_scales pattern_guilloche: pattern_guilloche pattern_guilloche_band: pattern_guilloche_band pattern_leds: pattern_leds pattern_wash: pattern_wash pattern_halftone: pattern_halftone}

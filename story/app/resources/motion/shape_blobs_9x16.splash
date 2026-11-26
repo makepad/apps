@@ -1,0 +1,56 @@
+use mod.motion.*
+// MORPHING BLOBS, 9:16 — the portrait cut of shape_blobs: the same three
+// blobs stacked down the tall frame. Original notes follow.
+// MORPHING BLOBS — three soft colour fields that breathe and drift, for a
+// background behind type. Each blob morphs through three shapes (the same
+// command sequence, so they interpolate) and returns to its first shape;
+// positions and turns return too, so the 8 s loops seamlessly.
+// Why: heavy blur plus screen blending turns hard shapes into light, and
+// three blobs on one shared period never quite repeat their overlaps.
+let A = [
+    "M 345 0 C 345 124 321 151 236 236 C 151 321 104 290 0 290 C -104 290 -121 258 -190 190 C -258 121 -301 109 -301 0 C -301 -109 -276 -130 -203 -203 C -130 -276 -121 -337 -0 -337 C 121 -337 124 -264 194 -194 C 264 -124 345 -124 345 0 Z",
+    "M 252 0 C 252 91 333 157 245 245 C 157 333 121 335 0 335 C -121 335 -121 257 -189 189 C -257 121 -299 108 -299 0 C -299 -108 -282 -133 -207 -207 C -133 -282 -115 -320 -0 -320 C 115 -320 153 -325 239 -239 C 325 -153 252 -91 252 0 Z",
+    "M 360 0 C 360 130 345 163 254 254 C 163 345 87 241 0 241 C -87 241 -111 236 -173 173 C -236 111 -344 124 -344 0 C -344 -124 -318 -150 -234 -234 C -150 -318 -116 -322 -0 -322 C 116 -322 124 -264 194 -194 C 264 -124 360 -130 360 0 Z"
+]
+let B = [
+    "M 309 0 C 309 111 279 132 205 205 C 132 279 112 310 0 310 C -112 310 -118 251 -185 185 C -251 118 -341 123 -341 0 C -341 -123 -330 -155 -242 -242 C -155 -330 -115 -320 -0 -320 C 115 -320 115 -245 180 -180 C 245 -115 309 -111 309 0 Z",
+    "M 294 0 C 294 106 296 139 218 218 C 139 296 128 356 0 356 C -128 356 -134 284 -209 209 C -284 134 -301 108 -301 0 C -301 -108 -300 -141 -220 -220 C -141 -300 -93 -258 -0 -258 C 93 -258 136 -290 213 -213 C 290 -136 294 -106 294 0 Z",
+    "M 297 0 C 297 107 308 145 227 227 C 145 308 116 322 0 322 C -116 322 -114 243 -179 179 C -243 114 -235 85 -235 0 C -235 -85 -273 -128 -200 -200 C -128 -273 -97 -270 -0 -270 C 97 -270 154 -328 241 -241 C 328 -154 297 -107 297 0 Z"
+]
+let C = [
+    "M 354 0 C 354 127 312 147 230 230 C 147 312 121 335 0 335 C -121 335 -160 340 -250 250 C -340 160 -268 97 -268 0 C -268 -97 -306 -144 -225 -225 C -144 -306 -127 -353 -0 -353 C 127 -353 158 -336 247 -247 C 336 -158 354 -127 354 0 Z",
+    "M 256 0 C 256 92 313 147 230 230 C 147 313 114 318 0 318 C -114 318 -135 286 -210 210 C -286 135 -263 95 -263 0 C -263 -95 -326 -153 -239 -239 C -153 -326 -123 -341 -0 -341 C 123 -341 137 -290 213 -213 C 290 -137 256 -92 256 0 Z",
+    "M 360 0 C 360 130 243 114 179 179 C 114 243 85 237 0 237 C -85 237 -166 352 -259 259 C -352 166 -258 93 -258 0 C -258 -93 -240 -113 -177 -177 C -113 -240 -115 -320 -0 -320 C 115 -320 127 -269 198 -198 C 269 -127 360 -130 360 0 Z"
+]
+let blob = fn(shapes, from, to, turn, colour, grow) {
+    Path{
+        at: repeat(keys([0, from], [4, to, @ease_in_out_sine], [8, from, @ease_in_out_sine]), 8)
+        anchor: vec2(0, 0) scale: grow blend: @screen fill: colour
+        rotate: repeat(keys([0, 0], [4, turn, @ease_in_out_sine], [8, 0, @ease_in_out_sine]), 8)
+        svg: repeat(keys([0.0, shapes[0]], [2.7, shapes[1], @ease_in_out_sine], [5.3, shapes[2], @ease_in_out_sine], [8.0, shapes[0], @ease_in_out_sine]), 8)
+    }
+}
+Motion{
+    label: "Morphing blobs 9:16"
+    brief: "A seamless 8 s loop of three blurred, morphing colour blobs; a background for type; portrait."
+    tags: ["background", "loop", "gradient", "abstract", "shape", "9:16"]
+    size: vec2(1080, 1920) duration: 8.0
+    inputs: {
+        c1: input(@color, #ff5c39, "First blob")
+        c2: input(@color, #7c83f5, "Second blob")
+        c3: input(@color, #2fb894, "Third blob")
+        background: input(@color, #0b0d12, "Ground")
+    }
+    layers: [
+        Rect{size: vec2(1080, 1920) fill: in(@background)}
+        Group{
+            blur: 120 opacity: 0.6
+            layers: [
+                blob(A, vec2(340, 520), vec2(560, 760), 40, in(@c1), 1.6)
+                blob(B, vec2(780, 1180), vec2(620, 980), -50, in(@c2), 1.7)
+                blob(C, vec2(420, 1580), vec2(640, 1420), 30, in(@c3), 1.5)
+            ]
+        }
+        Shader{effect: "kit/grain" opacity: 0.06}
+    ]
+}

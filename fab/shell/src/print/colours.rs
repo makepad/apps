@@ -43,7 +43,10 @@ impl Position {
     /// external spools 254 and 255; further toolheads' spools are told apart by their head.
     pub fn parse(heads: &[String], word: &str, tray: &str) -> Option<Position> {
         let word = nozzle_word(word);
-        let head = heads.iter().position(|name| nozzle_word(name) == word)?;
+        // A numbered tool names its index. A large toolchanger need not scan all earlier heads.
+        let numbered = word.strip_prefix("tool_").and_then(|n| n.parse::<usize>().ok())
+            .and_then(|n| n.checked_sub(1)).filter(|&i| heads.get(i).is_some_and(|name| nozzle_word(name) == word));
+        let head = numbered.or_else(|| heads.iter().position(|name| nozzle_word(name) == word))?;
         let t = tray.trim();
         let tray = if t.eq_ignore_ascii_case("ext") {
             let id = if head == 1 { 255 } else { 254 };
@@ -293,14 +296,9 @@ fn slot_position(s: &Slot, heads: &[String]) -> Option<Position> {
     Position::parse(heads, heads.get(s.nozzle)?, &s.tray)
 }
 
-/// How the filament in the tray at `pos` reaches the nozzle: as the profile's slot there says,
-/// else an external spool's own path, else through its unit.
-fn path_at(pos: Position, slots: &[Slot], heads: &[String]) -> SlotPath {
-    match slots.iter().find(|s| slot_position(s, heads) == Some(pos)) {
-        Some(s) => s.path,
-        None if matches!(pos.tray.ams, 254 | 255) => SlotPath::Own,
-        None => SlotPath::Shared,
-    }
+/// A reported spool missing from the profile has the path its tray id implies.
+fn default_path(pos: Position) -> SlotPath {
+    if matches!(pos.tray.ams, 254 | 255) { SlotPath::Own } else { SlotPath::Shared }
 }
 
 /// A unit's name as the mapping shows it: "AMS A", "AMS HT1", "External".
@@ -329,8 +327,12 @@ impl Layout {
 /// material name from its profile id.
 pub fn layout(printer: Option<(&str, &PrinterState)>, known: Option<&Layout>, offline: &Offline, name_of: &dyn Fn(&str) -> Option<String>) -> Layout {
     let mut l = trays_of(printer, known, offline, name_of);
+    let key = |p: Position| (p.head, p.tray.ams, p.tray.slot);
+    let paths: std::collections::HashMap<_, _> = offline.slots.iter().filter_map(|slot| {
+        Some((key(slot_position(slot, &offline.heads)?), slot.path))
+    }).collect();
     for t in &mut l.trays {
-        t.path = path_at(t.pos, &offline.slots, &offline.heads);
+        t.path = paths.get(&key(t.pos)).copied().unwrap_or_else(|| default_path(t.pos));
     }
     l
 }
@@ -454,7 +456,7 @@ pub struct Row {
     pub name: String,
     /// Printed parts or paint print in it.
     pub used: bool,
-    /// What it shows (linear RGBA): its override, else its material's colour, else its default.
+    /// The editable model swatch (linear RGBA). Clearing the override restores the design colour.
     pub shown: [f32; 4],
     /// What the design asks for: its override, imported design colour, else palette colour.
     pub design: [f32; 3],
@@ -630,9 +632,9 @@ pub fn mapping_tip(row: &Row, heads: &[String]) -> String {
     if row.used && row.unassigned() {
         return UNASSIGNED_TIP.into();
     }
-    let design = format!("Design colour {}.", hex(row.design));
+    let design = format!("Model colour {}.", hex(row.design));
     if let Some([r, g, b, _]) = row.mismatch {
-        return format!("{design} It prints on a {} spool ({}): the slice and the print show the spool's colour; Normal shows the design colour.", colour_word([r, g, b]), hex([r, g, b]));
+        return format!("{design} It prints on a {} spool ({}).", colour_word([r, g, b]), hex([r, g, b]));
     }
     match (&row.pos, &row.tray) {
         (Some(pos), Some(t)) => {
@@ -731,11 +733,7 @@ pub fn resolve(colors: &[PrintColor], used: &[String], layout: Layout, want: &st
             }
         }
         let material = tray.as_ref().and_then(|t| t.colour);
-        let shown = match (c.rgb, material) {
-            (Some(o), _) => [o[0], o[1], o[2], 1.0],
-            (None, Some(m)) => m,
-            (None, None) => [c.fallback[0], c.fallback[1], c.fallback[2], 1.0],
-        };
+        let shown = [design[0], design[1], design[2], 1.0];
         let mismatch = match (c.rgb.or(c.design), material) {
             (Some(o), Some(m)) if dist(o, [m[0], m[1], m[2]]) > VISIBLE_DIFF => Some(m),
             _ => None,
@@ -1067,7 +1065,7 @@ pub fn tray_edit_menu(t: &TrayView, heads: &[String]) -> Vec<crate::ui::popover:
         })
         .collect();
     vec![
-        MenuItem::new(id("head"), &format!("{} nozzle · tray {}", heads[t.pos.head], t.pos.tray_text())).disabled(),
+        MenuItem::new(id("head"), &format!("{} · tray {}", heads[t.pos.head], t.pos.tray_text())).disabled(),
         MenuItem::new(id("material"), "Material").flyout(materials),
         MenuItem::new(id("colour"), "Colour").flyout(colours),
         MenuItem::sep(),
@@ -1130,7 +1128,7 @@ mod tests {
 
     fn tray(head: usize, ams: u8, slot: u8, material: &str, colour: [f32; 4]) -> TrayView {
         let pos = Position { head, tray: TrayId { ams, slot } };
-        TrayView { pos, unit: "AMS".into(), material: Some(material.into()), name: None, colour: Some(colour), state: TrayState::Loaded, remain: None, temps: None, path: path_at(pos, &[], &[]) }
+        TrayView { pos, unit: "AMS".into(), material: Some(material.into()), name: None, colour: Some(colour), state: TrayState::Loaded, remain: None, temps: None, path: default_path(pos) }
     }
 
     fn known(trays: Vec<TrayView>) -> Layout {

@@ -1,0 +1,102 @@
+use mod.motion.*
+
+// A sketch slide's picture when it has no graphic of its own: the sketch's first line as the
+// title, the lines after it as bullets, in the deck's look. DECK gives the text as inputs, and
+// `.stage/look` is the deck's look module (`Deck{look: "shared/..."}`) or, when the deck names
+// none, the neutral one bundled beside this file. Nothing moves: the slide reads at once and
+// holds, whichever way the deck plays it.
+let look = import(".stage/look")
+
+let FRAME = in(@frame, vec2(1920, 1080))
+let W = FRAME.x
+let H = FRAME.y
+// Everything is laid out for a 1080-line picture and scaled to the deck's own height.
+let U = H / 1080.0
+
+let GROUND = look.INK ?? #101216
+let RAISED = look.INK2 ?? #181b21
+let INK = look.BONE ?? #f1eee7
+let MUTED = look.ASH ?? #9a9ea8
+let ACCENT = look.COOL ?? #7cc8e6
+let TITLE_FONT = look.TITLE ?? Font{family: "Roboto Flex" weight: 600}
+let TEXT_FONT = look.TEXT ?? Font{family: "Roboto Flex" weight: 420}
+
+let TITLE = in(@title, "")
+let LINES = in(@lines, [])
+
+let LEFT = 150.0 * U
+let RIGHT = W - 150.0 * U
+let TOP = 170.0 * U
+
+// More lines, smaller type: up to five bullets at full size, then down to a floor.
+let COUNT = LINES.len()
+let BODY_PX = U * max(34.0, 50.0 - 3.0 * max(0, COUNT - 5))
+let TITLE_PX = U * (if TITLE.len() > 40 { 76.0 } else { 96.0 })
+let MARK = BODY_PX * 1.2
+
+// Words into lines no wider than `width` at `style`.
+let wrap = fn(c, text, width, style) {
+    let rows = []
+    let row = ""
+    for word in text.split(" ") {
+        if word != "" {
+            let tried = if row == "" { word } else { row + " " + word }
+            if row != "" && c.measure(tried, style) > width {
+                rows.push(row)
+                row = word
+            } else {
+                row = tried
+            }
+        }
+    }
+    if row != "" { rows.push(row) }
+    return rows
+}
+
+let draw = fn(c, t, edit) {
+    c.rect(0, 0, W, H, GROUND, 1)
+    c.gradient([[0, 0], [W, 0], [W, H], [0, H]],
+        {radial: [W * 0.3, H * 0.25, 40 * U, H * 1.1] stops: [[0, RAISED], [1, GROUND]]}, 0.9)
+
+    let title_style = {font: TITLE_FONT px: TITLE_PX color: INK}
+    let y = TOP
+    for row in wrap(c, TITLE, RIGHT - LEFT, title_style) {
+        y = y + TITLE_PX
+        c.text(row, LEFT, y, title_style)
+        y = y + TITLE_PX * 0.18
+    }
+    // One quiet rule in the accent under the title.
+    y = y + 34.0 * U
+    c.rect(LEFT, y, 120.0 * U, 4.0 * U, ACCENT, 0.9)
+    y = y + 70.0 * U
+
+    let body_style = {font: TEXT_FONT px: BODY_PX color: INK}
+    for line in LINES {
+        let rows = wrap(c, line, RIGHT - LEFT - MARK, body_style)
+        let first = true
+        for row in rows {
+            y = y + BODY_PX
+            if first {
+                c.circle(LEFT + BODY_PX * 0.28, y - BODY_PX * 0.33, BODY_PX * 0.13, ACCENT, 1)
+                first = false
+            }
+            c.text(row, LEFT + MARK, y, body_style)
+            y = y + BODY_PX * 0.32
+        }
+        y = y + BODY_PX * 0.5
+    }
+}
+
+Motion{
+    label: if TITLE == "" { "Sketch" } else { TITLE }
+    size: FRAME
+    duration: 4.0
+    fps: 30
+    background: GROUND
+    inputs: {
+        title: input(@text, "", "The sketch's first line")
+        lines: input(@list, [], "The sketch's other lines, one bullet each")
+        frame: input(@vec2, vec2(1920, 1080), "The deck's output size in pixels")
+    }
+    layers: [Draw2D{name: "sketch" size: FRAME draw: draw}]
+}

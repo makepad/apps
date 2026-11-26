@@ -29,10 +29,11 @@
 //! (`ShapedLight::stroke_path`).
 //!
 //! A scrim is a rect in the light's box (A3's rounding and soft edge) of
-//! diffusion cloth lit from behind: it glows with a Gaussian from its middle,
-//! which stands in for the hotspot, and it is the one Add light that hides
-//! what is behind it (`acc × (1 − mask) + colour × glow`). With Multiply it is
-//! a flag of its shape, by the rule above.
+//! diffusion cloth lit from behind: it glows with the irradiance the lamp
+//! behind it gives the cloth (`ScrimLight::sample`), which stands in for the
+//! hotspot, and it is the one Add light that hides what is behind it
+//! (`acc × (1 − mask) + colour × glow`). With Multiply it is a flag of its
+//! shape, by the rule above.
 
 use super::*;
 use super::shape::*;
@@ -310,9 +311,19 @@ impl ShapedLight {
         }
     }
 
+    /// How far from a stroke's centre line its band draws, soft edge
+    /// included, without its glow: how finely the key's integral samples it.
+    /// None for the other shapes.
+    pub fn stroke_band_reach(&self) -> Option<f32> {
+        match &self.kind {
+            ShapedKind::Stroke(stroke) => Some(stroke.band_reach),
+            _ => None,
+        }
+    }
+
     /// A stroke's centre line, with its reach (how far from the line it
-    /// draws, soft edge included): what tells the key's integral where along
-    /// its cone the stroke is. None for the other shapes.
+    /// draws, soft edge and glow included): what tells the key's integral
+    /// where along its cone the stroke is. None for the other shapes.
     pub fn stroke_path(&self) -> Option<&ArcPath> {
         match &self.kind {
             ShapedKind::Fill(_) | ShapedKind::Scrim(_) | ShapedKind::Paint(_) | ShapedKind::Pattern(_) => None,
@@ -443,7 +454,17 @@ struct StrokeLight {
     /// D2: the share of a thin line along the centre line that a surface
     /// facing the key's axis receives, ∫ cosθ dℓ / ∫ dℓ with θ from the axis.
     line_facing: f32,
+    /// The halo round the band (`LightParams::glow`): its strength (its light
+    /// as a share of the band's) and its reach (radians). None: no glow.
+    glow: Option<(f32, f32)>,
+    /// How far from the line the band itself draws, soft edge included: the
+    /// path's reach without the halo (what the key's integral samples finely).
+    band_reach: f32,
 }
+
+/// How far out a glow reaches, in its own reach: e^-6 (a quarter percent)
+/// there, and faded to nothing over the last third.
+const GLOW_CUT: f32 = 6.0;
 
 /// What places a stroke and how far from its centre line it draws: shared by
 /// its drawing (`StrokeLight`) and the box its extras are laid in
@@ -457,8 +478,10 @@ struct StrokeLine {
     profile: Vec<f32>,
     /// The widest half width along it (the profile's widest), radians.
     widest_half: f32,
-    /// How far from the line it draws, soft edge included.
+    /// How far from the line it draws, soft edge and glow included.
     reach: f32,
+    /// How far from the line the band draws, soft edge included.
+    band_reach: f32,
 }
 
 impl StrokeLine {
@@ -466,7 +489,7 @@ impl StrokeLine {
     /// (its softness is read as it is), and `stroke` is the light's stroke as
     /// `stroke_of` gives it, held to its ranges by clamp()'s rule: its width,
     /// curviness and profile are read as they are.
-    fn new(softness: f32, stroke: &StrokeParams) -> Option<StrokeLine> {
+    fn new(softness: f32, stroke: &StrokeParams, glow_reach: f32) -> Option<StrokeLine> {
         let line = stroke_centre_line(stroke);
         if line.len() < 2 {
             return None;
@@ -475,9 +498,11 @@ impl StrokeLine {
         let profile = stroke.profile.clone();
         let widest = if profile.is_empty() { 1.0 } else { profile.iter().fold(0.0f32, |m, v| m.max(*v)) };
         let widest_half = half_width * widest;
-        // Past the widest half width plus half its soft band nothing is lit.
-        let reach = widest_half + 0.5 * (softness * widest_half).max(EDGE_MIN) + 1.0e-6;
-        Some(StrokeLine { line, half_width, softness, profile, widest_half, reach })
+        // Past the widest half width plus half its soft band nothing of the
+        // band is lit, and past GLOW_CUT x its reach beyond that, none of its glow.
+        let band_reach = widest_half + 0.5 * (softness * widest_half).max(EDGE_MIN) + 1.0e-6;
+        let reach = band_reach.max(widest_half + GLOW_CUT * glow_reach.max(0.0));
+        Some(StrokeLine { line, half_width, softness, profile, widest_half, reach, band_reach })
     }
 
     /// The key's cones round the line, `(axis, cos_radius, cos_cover)`: the
@@ -524,11 +549,19 @@ pub fn stroke_box(light: &LightParams) -> Option<(LightFrame, Vec2f)> {
     if light.shape() != LightShape::Stroke {
         return None;
     }
-    let (axis, _, cos_cover) = StrokeLine::new(light.softness, &stroke_of(light))?.cones();
+    let (axis, _, cos_cover) = StrokeLine::new(light.softness, &stroke_of(light), stroke_glow(light).map_or(0.0, |g| g.1))?.cones();
     let c = cos_cover.max(super::studio::PROJECT_MIN_COS);
     let half = (1.0 - c * c).max(0.0).sqrt() / c;
     let (azimuth_deg, elevation_deg) = az_el_from_dir(axis);
     Some((light_frame(azimuth_deg, elevation_deg, light.roll_deg), vec2f(half, half)))
+}
+
+/// A stroke light's glow (`LightParams::glow`) as its drawing reads it:
+/// (strength, reach in radians), for a stroke lit with Add whose glow has a
+/// strength; None otherwise (a flag stroke has no glow).
+fn stroke_glow(light: &LightParams) -> Option<(f32, f32)> {
+    let glow = light.glow.as_ref().filter(|g| g.strength > 0.0 && light.blend() == Blend::Add)?.clamped();
+    Some((glow.strength, glow.reach_deg.to_radians()))
 }
 
 impl StrokeLight {
@@ -536,14 +569,15 @@ impl StrokeLight {
     fn new(light: &LightParams) -> Option<StrokeLight> {
         let stroke = stroke_of(light);
         let ramp = stroke_ramp(light, &stroke);
-        StrokeLight::build(&stroke, light.softness, light.hotspot, ramp)
+        StrokeLight::build(&stroke, light.softness, light.hotspot, ramp, stroke_glow(light))
     }
 
     /// A stroke along `stroke`'s centre line at its width, its soft edge
     /// `softness`, its hotspot `hotspot` (0..1), coloured along its length by
     /// `ramp` (None: the colour it is handed). The stroke is read as it is.
-    fn build(stroke: &StrokeParams, softness: f32, hotspot: f32, ramp: Option<Vec<Vec3f>>) -> Option<StrokeLight> {
-        let geometry = StrokeLine::new(softness, stroke)?;
+    /// `glow` is its halo, (strength, reach in radians), None for none.
+    fn build(stroke: &StrokeParams, softness: f32, hotspot: f32, ramp: Option<Vec<Vec3f>>, glow: Option<(f32, f32)>) -> Option<StrokeLight> {
+        let geometry = StrokeLine::new(softness, stroke, glow.map_or(0.0, |g| g.1))?;
         let path = ArcPath::new(&geometry.line, false, geometry.reach);
         if path.is_empty() {
             return None;
@@ -564,8 +598,8 @@ impl StrokeLight {
             length += len;
         }
         let line_facing = if length > 0.0 { (along.dot(axis) / length).max(0.0).min(1.0) } else { 1.0 };
-        let StrokeLine { half_width, softness, profile, .. } = geometry;
-        Some(StrokeLight { path, half_width, softness, hotspot, profile, ramp, key: (axis, key_cos), key_cos_cover, line_facing })
+        let StrokeLine { half_width, softness, profile, band_reach, .. } = geometry;
+        Some(StrokeLight { path, half_width, softness, hotspot, profile, ramp, key: (axis, key_cos), key_cos_cover, line_facing, glow, band_reach })
     }
 
     /// Mask and emission at `dir`, and how far along the stroke the nearest
@@ -582,8 +616,20 @@ impl StrokeLight {
         // As a ring's edge: the band is softness x the half width, centred on the edge.
         let edge = 0.5 * (self.softness * hw).max(EDGE_MIN);
         let mask = 1.0 - smoothstep(hw - edge - inset * hw, hw + edge, hit.dist);
+        // The halo: flat over the band, e^(-x / reach) out from its edge,
+        // faded out by GLOW_CUT reaches; its light across the line,
+        // level (2 hw + 2 reach), is `strength` x the band's (2 hw). It
+        // covers nothing: what is behind shows through it.
+        let halo = match self.glow {
+            Some((strength, reach)) => {
+                let x = (hit.dist - hw).max(0.0);
+                let fade = 1.0 - smoothstep(0.67 * GLOW_CUT * reach, GLOW_CUT * reach, x);
+                strength * hw / (hw + reach).max(EDGE_MIN) * (-x / reach).exp() * fade * w.min(1.0)
+            }
+            None => 0.0,
+        };
         if !(mask > 0.0) {
-            return (ShapeSample::default(), hit.t);
+            return (ShapeSample { mask: 0.0, emit: halo }, hit.t);
         }
         // A tapering stroke also fades, so a zero-width tip leaves no bright dot.
         let mut emit = mask * w.min(1.0);
@@ -591,7 +637,7 @@ impl StrokeLight {
             let across = hit.dist / hw.max(EDGE_MIN);
             emit *= (-self.hotspot * across * across).exp();
         }
-        (ShapeSample { mask, emit }, hit.t)
+        (ShapeSample { mask, emit: emit + halo }, hit.t)
     }
 
     /// The stroke's colour at `t`: the ramp's, or `color` (the light's one
@@ -664,7 +710,7 @@ impl PaintLight {
         let mut axes = Vec::with_capacity(strokes.len());
         let (mut margin, mut depth) = (0.0f32, 0.0f32);
         for paint in strokes {
-            let Some(stroke) = StrokeLight::build(&paint.stroke, paint.softness, light.hotspot, None) else {
+            let Some(stroke) = StrokeLight::build(&paint.stroke, paint.softness, light.hotspot, None, None) else {
                 continue;
             };
             let cull = CullCone::new(stroke.key.0, stroke.key_cos_cover.clamp(-1.0, 1.0).acos());
@@ -884,8 +930,17 @@ fn stroke_centre_line(s: &StrokeParams) -> Vec<Vec3f> {
     out
 }
 
-/// A scrim: a rounded rect of cloth, glowing where the source behind it
-/// shines through, with an optional dark frame.
+/// How far behind a scrim's cloth its lamp stands, in the cloth's half sizes
+/// per unit of `ScrimParams::source_size`: the lamp's pool then falls to half
+/// where the Gaussian of sigma `source_size` the scrim glowed with before did
+/// (1.1774 sigma: sqrt(2 ln 2) / sqrt(2^(2/3) - 1)), so a scrim keeps its
+/// spread. At the default 0.5 the lamp is 0.768 half sizes back; a
+/// photographed backlit scrim's falloff puts it 0.78 back (the lighting
+/// survey, sheet 01), and the two profiles differ by under 0.009 of the peak.
+const LAMP_DISTANCE: f32 = 1.536_245;
+
+/// A scrim: a rounded rect of cloth, glowing where the lamp behind it shines
+/// through, with an optional dark frame.
 #[derive(Clone, Debug)]
 struct ScrimLight {
     frame: LightFrame,
@@ -902,8 +957,9 @@ struct ScrimLight {
     frame_w: f32,
     /// Half the band of the frame's inner edge, where the cloth starts.
     inner_edge: f32,
-    /// 1 / (2 sigma²), sigma = source_size in unit-box units.
-    inv_two_sigma2: f32,
+    /// 1 / d², d the lamp's distance behind the cloth in unit-box units
+    /// (LAMP_DISTANCE × source_size).
+    inv_lamp2: f32,
 }
 
 impl ScrimLight {
@@ -913,9 +969,9 @@ impl ScrimLight {
         let scrim = light.scrim.clone().unwrap_or_default();
         let (hx, hy) = half_extents(light);
         let short = hx.min(hy);
-        let sigma = scrim.source_size;
+        let lamp = LAMP_DISTANCE * scrim.source_size;
         let frame_w = scrim.frame * short;
-        let inv_two_sigma2 = 1.0 / (2.0 * sigma * sigma);
+        let inv_lamp2 = 1.0 / (lamp * lamp);
         // A rect's inside depth is its shorter half extent, as in studio.rs.
         let edge = 0.5 * (light.softness * short).max(EDGE_MIN);
         // D9 (L:70): the cloth meets a rigid frame, so the frame's inner edge
@@ -935,7 +991,7 @@ impl ScrimLight {
             edge,
             frame_w,
             inner_edge,
-            inv_two_sigma2,
+            inv_lamp2,
         }
     }
 
@@ -964,9 +1020,18 @@ impl ScrimLight {
         }
         // The cloth inside the frame glows; the frame itself is dark.
         let cloth = 1.0 - smoothstep(-self.inner_edge - inset, self.inner_edge, d + self.frame_w);
+        // A diffusing cloth is as bright as the light falling on it: the
+        // irradiance of the lamp d behind it, I cos θ / r² = (I / d²)(1 +
+        // (r/d)²)^-1.5 at r from the point in front of the lamp, 1 there. It
+        // falls off as a photographed backlit scrim does, with no floor, where
+        // a Gaussian of the same spread left its edge at 0.14 of the middle
+        // and the photo's is at 0.23 (sheet 01). Measured in the light's unit
+        // box, as the Gaussian was, so a long scrim's pool stays as long as
+        // its cloth.
         let ux = t.x / self.half.x;
         let uy = t.y / self.half.y;
-        let glow = (-(ux * ux + uy * uy) * self.inv_two_sigma2).exp();
+        let k = 1.0 + (ux * ux + uy * uy) * self.inv_lamp2;
+        let glow = 1.0 / (k * k.sqrt());
         ShapeSample { mask, emit: cloth * glow }
     }
 }
@@ -1420,6 +1485,34 @@ mod tests {
         assert!((lit - light_color(&light)).length() < 1.0e-4 * lit.length(), "the core is the light's colour: {lit:?}");
     }
 
+    /// Owner 2026-11-07, "a bit of glow in neon": a stroke's glow is a halo of
+    /// its own light round its band, e^-1 a reach out, gone past six, its light
+    /// across the line `strength` x the band's, covering nothing. At strength
+    /// 0, without the block or on a flag stroke the stroke draws as it did.
+    #[test]
+    fn a_strokes_glow_is_a_halo_of_its_own_light_round_it() {
+        let bare = stroke_light(vec![[60.0, 0.0], [120.0, 0.0]]);
+        let with = |strength: f32, blend: &str| LightParams {
+            glow: Some(GlowParams { strength, reach_deg: 1.0 }),
+            blend: blend.to_string(),
+            ..bare.clone()
+        };
+        let glowing = with(0.5, "add");
+        let across = |light: &LightParams| (0..2000).map(|i| stroke_at(light, 90.0, -10.0 + (i as f32 + 0.5) * 0.01).emit as f64 * 0.01).sum::<f64>();
+        let (band, lit) = (across(&bare), across(&glowing));
+        assert!((band - 4.0).abs() < 0.01, "the bare band, 4 degrees across: {band}");
+        assert!(((lit - band) / band - 0.5).abs() < 0.02, "the halo carries half the band's light: {lit} against {band}");
+        let (near, far) = (stroke_at(&glowing, 90.0, 2.5).emit, stroke_at(&glowing, 90.0, 3.5).emit);
+        assert!((far / near - (-1.0f32).exp()).abs() < 0.01, "e^-1 a reach further out: {near} {far}");
+        assert_eq!(stroke_at(&glowing, 90.0, 8.5).emit, 0.0, "nothing six reaches past the edge");
+        let flag_bare = LightParams { blend: "multiply".to_string(), ..bare.clone() };
+        for elevation in [0.0f32, 1.5, 2.0, 2.5, 4.0, 7.0] {
+            assert_eq!(stroke_at(&glowing, 90.0, elevation).mask, stroke_at(&bare, 90.0, elevation).mask, "the halo covers nothing");
+            assert_eq!(stroke_at(&with(0.0, "add"), 90.0, elevation), stroke_at(&bare, 90.0, elevation), "strength 0 is no glow");
+            assert_eq!(stroke_at(&with(0.5, "multiply"), 90.0, elevation), stroke_at(&flag_bare, 90.0, elevation), "a flag stroke has none");
+        }
+    }
+
     #[test]
     fn a_stroke_across_north_takes_the_short_way_and_stays_continuous() {
         let mut light = stroke_light(vec![[350.0, 20.0], [10.0, 20.0]]);
@@ -1643,7 +1736,10 @@ mod tests {
         let centre = env.radiance(unit_to_dir(&light, [0.0, 0.0]));
         assert!((centre - color).length() < 1.0e-3 * color.length(), "the cloth hides the backdrop and peaks at the colour: {centre:?}");
         let edge = env.radiance(unit_to_dir(&light, [0.8, 0.0]));
-        assert!(edge.x < 0.1 * centre.x, "a small source leaves the edge dim: {edge:?}");
+        // A lamp close behind the cloth (0.46 of its half size) leaves the
+        // edge dim: the lamp's irradiance there, 0.124 of the middle.
+        let lamp = (1.0 + (0.8 / (LAMP_DISTANCE * 0.3)).powi(2)).powf(-1.5);
+        assert!((edge.x / centre.x - lamp).abs() < 1.0e-3 && lamp < 0.13, "a small source leaves the edge dim: {edge:?}");
         let frame = env.radiance(unit_to_dir(&light, [0.97, 0.0]));
         assert!(frame.length() < 1.0e-4, "the frame is dark and hides the backdrop: {frame:?}");
         let outside = env.radiance(unit_to_dir(&light, [1.3, 0.0]));
@@ -1658,10 +1754,11 @@ mod tests {
     #[test]
     fn a_thin_scrim_frame_reads_as_a_frame() {
         let with_frame = |frame: f32| LightParams { softness: 0.2, scrim: Some(ScrimParams { source_size: 1.0, frame }), ..scrim_light() };
-        // How much of the glow shows at unit-box x (y = 0): the cloth, emit over glow.
+        // How much of the glow shows at unit-box x (y = 0): the cloth, emit
+        // over the glow (the lamp's irradiance, the lamp LAMP_DISTANCE back).
         let cloth = |light: &LightParams, x: f32| {
             let s = ShapedLight::new(light).unwrap().sample(unit_to_dir(light, [x, 0.0]));
-            s.emit / (-0.5 * x * x).exp()
+            s.emit / (1.0 + (x / LAMP_DISTANCE).powi(2)).powf(-1.5)
         };
         for frame in [0.05f32, 0.1] {
             let light = with_frame(frame);
@@ -1688,8 +1785,12 @@ mod tests {
         let mut broad = tight.clone();
         broad.scrim = Some(ScrimParams { source_size: 1.0, frame: 0.0 });
         let at = |l: &LightParams| ShapedLight::new(l).unwrap().sample(unit_to_dir(l, [0.6, 0.0])).emit;
-        assert!(at(&tight) < 1.0e-6, "{}", at(&tight));
-        assert!((at(&broad) - (-0.18f32).exp()).abs() < 1.0e-3, "{}", at(&broad));
+        // The irradiance of a lamp LAMP_DISTANCE x the source size behind the
+        // cloth, at 0.6 of its half size: 0.0153 for the tight source, 0.808
+        // for the broad one.
+        let lamp = |size: f32| (1.0 + (0.6 / (LAMP_DISTANCE * size)).powi(2)).powf(-1.5);
+        assert!((at(&tight) - lamp(0.1)).abs() < 1.0e-4 && at(&tight) < 0.02, "{}", at(&tight));
+        assert!((at(&broad) - lamp(1.0)).abs() < 1.0e-3 && at(&broad) > 0.8, "{}", at(&broad));
     }
 
     #[test]
@@ -1707,14 +1808,15 @@ mod tests {
         assert!((even.dir - dir_from_az_el(90.0, 0.0)).length() < 1.0e-5, "{:?}", even.dir);
         assert!((even.cos_radius - 20.0f32.to_radians().cos()).abs() < 1.0e-6, "a rect's cone: {}", even.cos_radius);
         // EnvSun's meaning: radiance x the cone's solid angle is the cloth's whole
-        // glow. exp(-(u² + v²) / 2) over the 40° square, with u, v = x, y / tan 20°
-        // and dΩ = dx dy / (1 + x² + y²)^(3/2), is 0.3485 sr (a 1000 x 1000 midpoint
-        // sum); the 20° cone is 2π(1 - cos 20°) = 0.3789 sr; so 0.920 of the colour.
+        // glow. The lamp's irradiance (1 + (u² + v²) / d²)^-1.5 over the 40°
+        // square, with u, v = x, y / tan 20°, d = LAMP_DISTANCE and dΩ = dx dy /
+        // (1 + x² + y²)^(3/2), is 0.3395 sr (a 1000 x 1000 midpoint sum); the 20°
+        // cone is 2π(1 - cos 20°) = 0.3789 sr; so 0.896 of the colour.
         let fill = crate::sky::luminance(even.radiance) / level;
-        assert!((fill - 0.920).abs() < 0.01, "{fill}");
-        // A tight source glows over far less of the cloth (0.0219 of the colour by
+        assert!((fill - 0.896).abs() < 0.01, "{fill}");
+        // A tight source glows over far less of the cloth (0.0435 of the colour by
         // the same sum).
         let (tight, level) = key_of(0.1);
-        assert!(crate::sky::luminance(tight.radiance) < 0.03 * level);
+        assert!(crate::sky::luminance(tight.radiance) < 0.05 * level);
     }
 }

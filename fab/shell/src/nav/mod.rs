@@ -453,6 +453,12 @@ impl Navigator {
         input: &ViewportInput,
         state: &mut AppState,
     ) -> InputResponse {
+        if state.picks.menu.is_some() {
+            self.pending = None;
+            if matches!(input.kind, ViewportInputKind::PointerDown { .. } | ViewportInputKind::PointerMove { .. } | ViewportInputKind::PointerUp { .. }) {
+                return InputResponse { consumed: true, ..Default::default() };
+            }
+        }
         match input.kind {
             ViewportInputKind::PointerDown {
                 button,

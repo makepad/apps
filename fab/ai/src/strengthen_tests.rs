@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// A figure built of named features.
-const FIGURE: &str = "let m = mod.model
+pub(crate) const FIGURE: &str = "let m = mod.model
 let torso = m.box({size: [30mm 50mm 20mm] at: [0 60mm 0]})
 let head = m.sphere({radius: 11mm at: [0 102mm 0]})
 let neck = m.cylinder({radius: 4mm height: 14mm at: [0 88mm 0]})
@@ -30,7 +30,7 @@ const NAMELESS: &str = "let m = mod.model
 object(m.blend([m.box({size: [40mm 80mm 24mm] at: [0 40mm 0]}) m.capsule({a: [15mm 50mm 0] b: [60mm 80mm 0] radius: 5mm})], 1mm), name: \"figure\")
 ";
 
-fn plate(script: &str) -> (Session, Arc<EngineSlices>) {
+pub(crate) fn plate(script: &str) -> (Session, Arc<EngineSlices>) {
     let mut session = Session::new(Machine::dual_nozzle_350(), std::env::temp_dir());
     let scripts = BTreeMap::from([("shape.cad.splash".to_string(), format!("use mod.model.*\nuse mod.fab.*\n{script}"))]);
     let project = "use mod.fab.*\nsettings({layer_height: \"0.2\"})\nscript(\"shape.cad.splash\")\nplace(\"shape\", at: [150mm 150mm])\n";
@@ -41,7 +41,7 @@ fn plate(script: &str) -> (Session, Arc<EngineSlices>) {
     (session, engine)
 }
 
-fn slice(s: &Session, engine: &EngineSlices) {
+pub(crate) fn slice(s: &Session, engine: &EngineSlices) {
     let (input, _) = engine.input(s.last.as_ref().unwrap()).unwrap();
     engine.sliced(&input, None).unwrap();
 }
@@ -52,7 +52,7 @@ fn gcode(s: &Session, engine: &EngineSlices) -> String {
 }
 
 /// The find as a host runs it: off the worker, then the answer.
-fn find(s: &mut Session, args: &str) -> Node {
+pub(crate) fn find(s: &mut Session, args: &str) -> Node {
     let reply = s.call(super::FIND_TOOL, &json::parse(args.as_bytes()).unwrap(), None);
     assert!(reply.ok, "{}", reply.text);
     let text = match reply.render {
@@ -62,7 +62,7 @@ fn find(s: &mut Session, args: &str) -> Node {
     parse_value(&text).unwrap_or_else(|e| panic!("{e:?}: {text}"))
 }
 
-fn text_of<'a>(n: &'a Node, key: &str) -> &'a str {
+pub(crate) fn text_of<'a>(n: &'a Node, key: &str) -> &'a str {
     n.field(key).and_then(|f| f.value.string()).unwrap_or_else(|| panic!("no {key} in {n:?}"))
 }
 
@@ -70,7 +70,7 @@ fn number_of(n: &Node, key: &str) -> f64 {
     n.field(key).and_then(|f| f.value.number()).unwrap_or_else(|| panic!("no {key} in {n:?}"))
 }
 
-fn spots(answer: &Node) -> Vec<Node> {
+pub(crate) fn spots(answer: &Node) -> Vec<Node> {
     answer.field("spots").and_then(|f| f.value.items()).unwrap_or_else(|| panic!("no spots: {answer:?}")).to_vec()
 }
 
@@ -86,7 +86,7 @@ fn source(s: &Session) -> String {
     s.source("shape.cad.splash").unwrap_or_default().to_string()
 }
 
-fn strengthen(s: &mut Session, fixes: &str) -> crate::Reply {
+pub(crate) fn strengthen(s: &mut Session, fixes: &str) -> crate::Reply {
     let args = format!(r#"{{"expected":"{}","fixes":{fixes}}}"#, head(s));
     s.call(super::TOOL, &json::parse(args.as_bytes()).unwrap(), None)
 }

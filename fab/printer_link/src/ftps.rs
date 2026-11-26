@@ -95,6 +95,7 @@ fn reply_code(line: &[u8]) -> Option<u16> {
 impl<D: Dialer> Ftps<D> {
     /// Connects, reads the greeting and logs in as `bblp`; protects the data channel.
     pub fn login(mut dialer: D, code: &Secret) -> Result<Self, FtpError> {
+        crate::entries::FTPS_LOGIN.enter();
         let control = dialer.control()?;
         let mut ftp = Self { dialer, control, buffer: Vec::new(), redact: Some(Secret::new(code.bytes().to_vec())) };
         ftp.expect_reply("connect", &[220])?;
@@ -344,6 +345,7 @@ impl Dialer for PrinterDialer {
     type Stream = makepad_network::SocketStream;
 
     fn control(&mut self) -> Result<Self::Stream, FtpError> {
+        crate::entries::FTPS_CONTROL_TLS.enter();
         let (mut stream, leaf) = makepad_network::SocketStream::connect_capture(&self.host, "990")
             .map_err(|_| FtpError::Connect("printer storage (FTPS) connection failed"))?;
         if makepad_network::tls::fingerprint(&leaf) != self.leaf_pin {
@@ -355,6 +357,7 @@ impl Dialer for PrinterDialer {
     }
 
     fn data(&mut self, control: &Self::Stream, port: u16) -> Result<Self::Stream, FtpError> {
+        crate::entries::FTPS_DATA_TLS.enter();
         let (mut stream, leaf) = makepad_network::SocketStream::connect_capture_resuming(&self.host, &port.to_string(), control)
             .map_err(|e| if e.kind() == io::ErrorKind::Unsupported { FtpError::ResumeUnsupported } else { FtpError::Connect("printer storage data channel failed") })?;
         if makepad_network::tls::fingerprint(&leaf) != self.leaf_pin {

@@ -65,6 +65,11 @@ pub struct Pending {
     /// absorbed): the copper a pending zone's polygons test again when its fill merges, since they
     /// joined it by recorded joins while held. Default when `zones` is empty.
     pub changes: IndexChange,
+    /// The results started from nothing (a load, a new unit) and owe their whole board: no
+    /// connectivity or DRC has run with a fill. Merges only swap fills in and edits join the
+    /// record; once no fill is owed, the whole-board checks are (`owed_checks`), and their merge
+    /// (`merge_checks`, or `rebase_checks` when edits landed while they ran) ends the record.
+    pub whole: bool,
 }
 
 /// Every engine result of a design.
@@ -157,7 +162,8 @@ pub fn update_copper(prev: Option<&BoardResults>, unit: &Unit, board: &Board, de
     }
     ext.changed.sort();
     ext.changed.dedup();
-    let mut debt = prev.map_or_else(BoardDelta::default, |prev| prev.pending.debt.clone());
+    // A unit without results owes its whole board: every zone fills from nothing.
+    let mut debt = prev.map_or_else(|| whole_board(board), |prev| prev.pending.debt.clone());
     merge_delta(&mut debt, &ext);
     let stale: Vec<_> = pending.zones.iter().map(|(id, _)| *id).collect();
     let fills = Arc::new(fills);
@@ -168,8 +174,15 @@ pub fn update_copper(prev: Option<&BoardResults>, unit: &Unit, board: &Board, de
         Some(prev) => {
             let mut index = (*prev.index.0).clone();
             let change = index.update(board, &fills, &ext, &refilled(&prev.fills, &fills));
-            let conn = connect_indexed(&prev.conn, &index, board, &ext, &change, &stale, &prev.pending.changes);
-            let drc = drc_indexed(&prev.drc, &index, board, &conn, &rules, region, &stale);
+            // Results that owe their whole board keep the checks they had: an edit joins the record,
+            // and the whole-board checks run once no fill is owed (`owed_checks`).
+            let (conn, drc) = if prev.pending.whole {
+                (prev.conn.clone(), prev.drc.clone())
+            } else {
+                let conn = connect_indexed(&prev.conn, &index, board, &ext, &change, &stale, &prev.pending.changes);
+                let drc = drc_indexed(&prev.drc, &index, board, &conn, &rules, region, &stale);
+                (Arc::new(conn), Arc::new(drc))
+            };
             let mut changes = prev.pending.changes.clone();
             changes.absorb(&change);
             (index, conn, drc, changes)
@@ -178,14 +191,15 @@ pub fn update_copper(prev: Option<&BoardResults>, unit: &Unit, board: &Board, de
             let index = PieceIndex::build(board, &fills);
             let conn = connect(board, &fills);
             let drc = drc_indexed(&[], &index, board, &conn, &rules, &BoardDelta { global: true, ..Default::default() }, &stale);
-            (index, conn, drc, IndexChange::all())
+            (index, Arc::new(conn), Arc::new(drc), IndexChange::all())
         }
     };
-    let conn = Arc::new(conn);
-    let drc = Arc::new(drc);
-    if !stale.is_empty() {
+    // A unit without results and without zones is exact at once.
+    let whole = prev.map_or(!stale.is_empty(), |prev| prev.pending.whole);
+    if !stale.is_empty() || whole {
         pending.debt = debt;
         pending.changes = changes;
+        pending.whole = whole;
     }
     BoardResults { unit: unit.id, generation: board.generation, rules, fills, index: Pieces(Arc::new(index)), conn, drc, pending }
 }
@@ -204,6 +218,14 @@ pub fn update_held(prev: &DesignResults, d: &Design, deltas: &[(BoardId, BoardDe
             },
         }
     })
+}
+
+/// The results of a design being loaded, board first: each unit's copper, connectivity and DRC
+/// without any fill, every zone owed against a whole-board record (`Pending::whole`).
+/// Connectivity and DRC with the fills run once, after the last owed fill (`owed_checks`).
+/// Cost: per board, the piece index built, connectivity and DRC of the unfilled copper.
+pub fn load_held(d: &Design, factories: &Factories) -> DesignResults {
+    design_results(d, |unit, board| update_copper(None, unit, board, &BoardDelta::default(), factories))
 }
 
 /// One fill a unit's results owe, for a pool task.
@@ -272,12 +294,114 @@ pub fn merge_fill(
     let remaining: Vec<_> = next.pending.zones.iter().map(|(id, _)| *id).collect();
     let mut index = (*prev_unit.index.0).clone();
     let change = index.update(board, &next.fills, &delta, &[zone]);
-    next.conn = Arc::new(connect_indexed(&prev_unit.conn, &index, board, &delta, &change, &remaining, &prev_unit.pending.changes));
+    // Results that owe their whole board: a merge swaps the fill in and updates the index; the
+    // whole-board checks follow the last owed fill (`owed_checks`).
+    if !next.pending.whole {
+        next.conn = Arc::new(connect_indexed(&prev_unit.conn, &index, board, &delta, &change, &remaining, &prev_unit.pending.changes));
+        next.drc = Arc::new(drc_indexed(&prev_unit.drc, &index, board, &next.conn, &next.rules, &next.pending.debt, &remaining));
+    }
     next.pending.changes.absorb(&change);
-    next.drc = Arc::new(drc_indexed(&prev_unit.drc, &index, board, &next.conn, &next.rules, &next.pending.debt, &remaining));
     next.index = Pieces(Arc::new(index));
-    if remaining.is_empty() {
+    if remaining.is_empty() && !next.pending.whole {
         next.pending = Pending::default();
+    }
+    Some(out)
+}
+
+/// The whole-board checks a unit's results owe: results that owe their whole board
+/// (`Pending::whole`) once no fill is. `generation` is the results' board generation.
+#[derive(Clone, PartialEq, Debug)]
+pub struct CheckTask {
+    pub unit: BoardId,
+    pub generation: u64,
+}
+
+/// Every whole-board check the results owe, in unit order. Cost: O(units).
+pub fn owed_checks(r: &DesignResults) -> Vec<CheckTask> {
+    r.boards.iter()
+        .filter(|b| b.pending.whole && b.pending.zones.is_empty())
+        .map(|b| CheckTask { unit: b.unit, generation: b.generation })
+        .collect()
+}
+
+/// Merge the whole-board checks (`whole_board_checks`) a pool task ran over the unit's board at
+/// generation `at` with `rules` and `fills`. `None` unless the unit still owes them over exactly
+/// those inputs: the same generation, and the same rules and fills by `Arc` identity (an edit, a
+/// fill or a factory change since makes them stale). The results become exact. Cost: O(1) besides
+/// the results' clone.
+pub fn merge_checks(
+    prev: &DesignResults,
+    unit: BoardId,
+    at: u64,
+    rules: &Arc<RuleMatrix>,
+    fills: &Arc<Vec<ZoneFill>>,
+    conn: Arc<Connectivity>,
+    drc: Arc<Vec<Violation>>,
+) -> Option<DesignResults> {
+    let i = prev.boards.iter().position(|b| b.unit == unit)?;
+    let b = &prev.boards[i];
+    if !b.pending.whole || !b.pending.zones.is_empty() || b.generation != at
+        || !Arc::ptr_eq(rules, &b.rules) || !Arc::ptr_eq(fills, &b.fills) {
+        return None;
+    }
+    let mut out = prev.clone();
+    let next = &mut out.boards[i];
+    next.conn = conn;
+    next.drc = drc;
+    next.pending = Pending::default();
+    Some(out)
+}
+
+/// Merge whole-board checks an edit overtook: `conn` and `drc` were computed over `base_board`
+/// with the fills and rules of `base`, the unit's results when the checks started (owing their
+/// whole board, no fill owed). Those results with the checks are exact for `base_board`; the
+/// board's changes since (`BoardDelta::between`) then go through the incremental path an edit
+/// after a load takes (`update_copper`, pass A), and each zone they reach takes the fill `prev`
+/// holds for it: merged at once when that fill is exact (`merge_fill`, pass B), still owed at
+/// `prev`'s generation when its refill runs. The unit then owes no whole-board checks again,
+/// however many edits landed while they ran. `None` when `prev` no longer owes them, or its rules
+/// are not `base`'s or the changes are global (a factory, rules, stackup, outline or net change):
+/// the checks run again.
+/// Cost: O(items) for the delta, pass A over it, pass B per reached zone; no full pass.
+pub fn rebase_checks(
+    prev: &DesignResults,
+    d: &Design,
+    base: &BoardResults,
+    base_board: &Board,
+    conn: Arc<Connectivity>,
+    drc: Arc<Vec<Violation>>,
+    factories: &Factories,
+) -> Option<DesignResults> {
+    let i = prev.boards.iter().position(|b| b.unit == base.unit)?;
+    let current = &prev.boards[i];
+    if !current.pending.whole || !base.pending.whole || !base.pending.zones.is_empty()
+        || base.generation != base_board.generation || !Arc::ptr_eq(&current.rules, &base.rules) {
+        return None;
+    }
+    let unit = d.unit(base.unit)?;
+    let board = unit.board.as_ref()?;
+    let since = BoardDelta::between(base_board, board);
+    if since.global {
+        return None;
+    }
+    let exact = BoardResults { conn, drc, pending: Pending::default(), ..base.clone() };
+    let mut next = update_copper(Some(&exact), unit, board, &since, factories);
+    // A reached zone whose refill is still running stays owed from where `prev` owes it, so that
+    // fill still merges.
+    let mut ready = Vec::new();
+    for (zone, generation) in &mut next.pending.zones {
+        match current.pending.zones.binary_search_by_key(&*zone, |(id, _)| *id) {
+            Ok(at) => *generation = current.pending.zones[at].1,
+            Err(_) => ready.extend(current.fills.binary_search_by_key(&*zone, |f| f.zone).ok().map(|at| current.fills[at].clone())),
+        }
+    }
+    let mut out = prev.clone();
+    out.boards[i] = next;
+    for fill in ready {
+        let (zone, rules) = (fill.zone, out.boards[i].rules.clone());
+        if let Some(merged) = merge_fill(&out, d, base.unit, zone, board.generation, &rules, fill) {
+            out = merged;
+        }
     }
     Some(out)
 }
@@ -312,9 +436,12 @@ pub fn merge_delta(into: &mut BoardDelta, next: &BoardDelta) {
 }
 
 /// Every finding of the results (DRC of each board, ERC, system ERC), sorted by id, duplicates
-/// by id removed: what the Checks list shows.
+/// by id removed: what the Checks list shows. A board that owes its whole-board checks
+/// (`Pending::whole`) has no DRC findings yet: what it holds was found on copper without its
+/// pours, and the checks replace it.
 pub fn violations(r: &DesignResults) -> Vec<Violation> {
-    let mut out: Vec<_> = r.boards.iter().flat_map(|b| b.drc.iter()).chain(r.erc.iter()).chain(r.system.iter()).cloned().collect();
+    let checked = r.boards.iter().filter(|b| !b.pending.whole);
+    let mut out: Vec<_> = checked.flat_map(|b| b.drc.iter()).chain(r.erc.iter()).chain(r.system.iter()).cloned().collect();
     out.sort_by_key(|v| v.id);
     out.dedup_by_key(|v| v.id);
     out
@@ -347,6 +474,19 @@ fn full_board(unit: &Unit, board: &Board, factories: &Factories) -> BoardResults
     let conn = Arc::new(connect(board, &fills));
     let drc = Arc::new(drc(board, &conn, &rules, &fills, None).violations);
     BoardResults { unit: unit.id, generation: board.generation, rules, fills, index: Pieces(Arc::new(index)), conn, drc, pending: Pending::default() }
+}
+
+/// A delta over the whole board: what a unit owes when its results start from nothing.
+fn whole_board(board: &Board) -> BoardDelta {
+    BoardDelta { global: true, bbox: board.outline_bbox(), ..Default::default() }
+}
+
+/// Connectivity and DRC over the whole board with every fill exact, as `full_board` runs them:
+/// the checks a unit owes after a board-first load (`owed_checks`), run on a pool task.
+pub fn whole_board_checks(board: &Board, rules: &RuleMatrix, fills: &[ZoneFill]) -> (Arc<Connectivity>, Arc<Vec<Violation>>) {
+    let conn = connect(board, fills);
+    let drc = drc(board, &conn, rules, fills, None).violations;
+    (Arc::new(conn), Arc::new(drc))
 }
 
 /// Update fixed pieces before filling and fill pieces afterward, sharing one index across zones.

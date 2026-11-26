@@ -469,7 +469,7 @@ impl Session {
         let request_id = str_arg(args, "request_id").map_or_else(|| self.next_request_id(TOOL), str::to_string);
         // the slice before it, while it's still the plate's: what the volumes' reads compare with
         let before = self.last.clone().and_then(|ev| Some(Arc::new(VolumeBase::of(self.slices.as_ref()?.made(&ev)?, &ev))));
-        match self.model.apply(&mut self.eval, &request_id, expected, &changes, cancelled) {
+        match self.commit_changes(&request_id, expected, &changes, cancelled, true) {
             Ok((applied, built)) => {
                 makepad_error_log::flight::mark_ab("fab.volume", &done, solids.len() as u64, 0);
                 if let Some(base) = before {

@@ -1,10 +1,12 @@
 //! An explorer no host feeds follows the electronics host (`ElecLive`), as the board pane does,
 //! and samples the followed unit's schematic item states (selection, findings, emphasis) from the
 //! host. A host that calls `set_design` pins the view and feeds it itself. The unpinned sheet
-//! follows the live bench's unit when it has a sheet. A unit is the one shown before by its id
-//! and its name: ids count from 0 in every plate's evaluation, so another plate's first unit has
-//! the id of this one's. A unit that is not the one shown before is shown fresh, its camera fitted
-//! to its sheet; the one shown before keeps the person's camera through its edits.
+//! follows the live bench's unit when it has a sheet; a design with no unit with parts (a plate
+//! with no circuit) empties it, as the board pane then shows no board. A unit is the one shown
+//! before by its id and its name: ids count from 0 in every plate's evaluation, so another
+//! plate's first unit has the id of this one's. A unit that is not the one shown before is shown
+//! fresh, its camera fitted to its sheet; the one shown before keeps the person's camera through
+//! its edits.
 //!
 //! The view shows the live design with the rows the host published for it, including a circuit
 //! preview's own index (`StateOf::Preview`). While an edit this view committed is landing it
@@ -72,8 +74,14 @@ impl ExplorerView {
             return;
         }
         let host = cx.get_global::<ElecLive>();
-        let Some(unit) = host.sheet_unit(self.followed.as_ref().map(|f| (f.unit, f.name.as_str()))) else { return };
+        let unit = host.sheet_unit(self.followed.as_ref().map(|f| (f.unit, f.name.as_str())));
         let snap = host.snap.clone();
+        let Some(unit) = unit else {
+            // No unit with parts (a plate with no circuit): the sheet empties, never keeping the
+            // circuit of the plate before.
+            if self.design.is_some() { self.unload(cx); }
+            return;
+        };
         let live = snap.live();
         let id = live.units[unit].id;
         let Some((design, sheet)) = shown(&snap, id) else { return };

@@ -19,6 +19,7 @@ pub(crate) enum ConnectError {
 }
 
 pub(crate) fn connect(name: &str, config: &PrinterConfig) -> Result<(SocketStream, String), ConnectError> {
+    crate::entries::MQTT_TLS.enter();
     let (mut stream, chain) = SocketStream::connect_capture_chain(&config.host, "8883")
         .map_err(|_| ConnectError::Offline("printer TLS connection failed"))?;
     let checked = (|| {
@@ -39,6 +40,7 @@ pub(crate) fn connect(name: &str, config: &PrinterConfig) -> Result<(SocketStrea
 
 /// The printer's pinned leaf (set and CA-checked by the MQTT connection), for FTPS and RTSPS.
 pub(crate) fn pinned_leaf(name: &str) -> Option<[u8; 32]> {
+    crate::entries::PINNED_LEAF.enter();
     let path = directory()?.join(format!("{name}.known-hosts"));
     KnownHosts::new(path).get("printer")
 }

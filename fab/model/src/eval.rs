@@ -311,8 +311,7 @@ fn paint_tools(p: &mut Option<Arc<PartPaint>>, tools: &HashMap<String, (u32, usi
     }
 }
 
-/// The colour a print colour shows: its material's (`inks`), unless it has an override, else
-/// its own default.
+/// The colour a print colour prints with as far as Fab knows. Pictures and print metadata use it.
 pub fn shown_color(colors: &[fab_plate::PrintColor], inks: &HashMap<String, [f32; 3]>, name: &str) -> [f32; 3] {
     match colors.iter().find(|c| c.name == name) {
         Some(c) => c.rgb.or_else(|| inks.get(name).copied()).unwrap_or(c.fallback),
@@ -320,12 +319,19 @@ pub fn shown_color(colors: &[fab_plate::PrintColor], inks: &HashMap<String, [f32
     }
 }
 
-/// The colour a print colour asks for in the design: its override, else its design colour, else
-/// its own default; what a render shows unless it is asked for the trays' colours.
+/// The model colour the person picked, falling back to the design colour and then its default.
 pub fn design_color(colors: &[fab_plate::PrintColor], name: &str) -> [f32; 3] {
     match colors.iter().find(|c| c.name == name) {
         Some(c) => c.rgb.or(c.design).unwrap_or(c.fallback),
         None => [0.8, 0.8, 0.78],
+    }
+}
+
+/// The colour the whole plate's selected view gives a print colour.
+pub fn display_color(colors: &[fab_plate::PrintColor], inks: &HashMap<String, [f32; 3]>, mode: fab_plate::ColourMode, name: &str) -> [f32; 3] {
+    match mode {
+        fab_plate::ColourMode::Model => design_color(colors, name),
+        fab_plate::ColourMode::Material => inks.get(name).copied().unwrap_or(fab_plate::UNMAPPED_RGB),
     }
 }
 
@@ -373,9 +379,17 @@ pub struct ExactBody {
     pub measure: makepad_csg_graph::BrepMeasure,
     pub edges: Vec<makepad_csg_graph::BrepEntity>,
     pub faces: Vec<makepad_csg_graph::BrepEntity>,
-    /// The script's name of each part a face name comes from, by its step's key: `b` of
-    /// `b.top`.
+    /// The script's name of each part a face name comes from, by the part's own step's key: `b`
+    /// of `b.top`. Only the steps the script's names resolve to: a part's builder under its
+    /// placement is no part's (two copies of one box share it).
     pub parts: HashMap<makepad_csg_graph::Key, String>,
+    /// Side selectors the script can write for each generator, e.g. `section.base` at side 0.
+    pub sides: HashMap<makepad_csg_graph::Key, Vec<Option<String>>>,
+    /// The keys of `parts` from the object down: the outermost part first.
+    pub order: Vec<makepad_csg_graph::Key>,
+    /// The steps the body holds more than once (the same box twice, each placed): their faces
+    /// share names, so a name of theirs picks every copy.
+    pub repeated: Vec<makepad_csg_graph::Key>,
 }
 
 /// One solid of the program after evaluation.
@@ -399,9 +413,38 @@ pub struct ObjectInfo {
     pub frame: Option<(String, [[f64; 4]; 3])>,
 }
 
+/// The plate's records of a solid's keepouts (kernel units, the board's frame), one for one.
+pub fn plate_keepouts(keepouts: &[makepad_model_script::lang::Keepout]) -> Vec<fab_plate::Keepout> {
+    keepouts.iter().map(|k| fab_plate::Keepout {
+        board: k.board.clone(),
+        name: k.name.clone(),
+        feature: k.feature.clone(),
+        room: k.room,
+        area: k.area.clone(),
+        side: match k.side {
+            makepad_model_script::lang::KeepoutSide::Top => fab_plate::KeepoutSide::Top,
+            makepad_model_script::lang::KeepoutSide::Bottom => fab_plate::KeepoutSide::Bottom,
+        },
+        z: k.z,
+    }).collect()
+}
+
+/// A library call the evaluation leaves for its host to make again with arguments of its own.
+#[derive(Clone, Debug)]
+pub struct LibraryCall {
+    /// The unit the call is about (a `Keepout`'s `board`).
+    pub board: String,
+    /// The name the library exports the function under.
+    pub function: String,
+    /// The arguments the script called it with, by parameter name: plain values.
+    pub args: Vec<(String, makepad_model_script::lang::V)>,
+}
+
 /// The evaluated model: the plate, its render meshes and the bed check.
 #[derive(Clone, Debug)]
 pub struct Evaluated {
+    /// The requested project gap in mm, before any object-by-object clearance.
+    pub arrange_gap: Option<f64>,
     /// One per plate part, same order: how its `place(...)` call reads.
     pub handles: Vec<PartHandles>,
     pub printability: Arc<fab_printability::Report>,
@@ -452,16 +495,24 @@ pub struct Evaluated {
     pub hands: Vec<Vec<[f64; 3]>>,
     /// Each instance's joints applied: its jointed parts, for the joint checks and the sim.
     pub mech: Vec<Arc<crate::mech::Mech>>,
+    /// Each instance's `m.expect` statements judged against what it built ([`crate::expect`]), in
+    /// instance and script order.
+    pub expects: Vec<crate::expect::Judged>,
     /// The plate parts made of separate links (chains, chainmail), for their checks, the sim and the view.
     pub weaves: Vec<crate::weave::WeavePart>,
     /// The print profile it was built for (joints and links are sized from it).
     pub profile: makepad_csg_mech::Profile,
+    /// The library calls the evaluation leaves for its host to make again, by instance and script order.
+    pub calls: Vec<LibraryCall>,
     /// The print colours: the project's, then implicit ones (a design colour no colour names).
     pub colors: Vec<fab_plate::PrintColor>,
     /// Per placed part (printed, then excluded): the print colour it prints as.
     pub part_colors: Vec<String>,
     /// The material colours and job tools it was mapped with (`Evaluator::mapped`).
     pub mapped: Arc<Mapped>,
+    pub colour_mode: fab_plate::ColourMode,
+    /// An unlinked viewport can still have a saved loadout for print calculations.
+    pub printer_linked: bool,
     /// How its parts' display meshes show ([`View`]).
     pub view: View,
     /// Per placed part (printed, then excluded): the body its display mesh follows the view
@@ -510,6 +561,8 @@ pub fn lost_words(proto: &str) -> (&'static str, &'static str, &'static str) {
     match proto {
         "BrepChamfer" => ("chamfer", "edge", "bevel"),
         "BrepShell" => ("shell", "face", "leave open"),
+        "BrepPull" => ("pull", "face", "pull"),
+        "BrepHole" => ("hole", "face", "drill"),
         _ => ("fillet", "edge", "round"),
     }
 }
@@ -680,7 +733,7 @@ impl PartPaint {
         if cut.is_empty() {
             return 0;
         }
-        let colors: Vec<(&[f32; 3], &Option<String>)> = self.colors.iter().map(|c| (&c.rgb, &c.color)).collect();
+        let colors: Vec<_> = self.colors.iter().map(|c| &c.color).collect();
         let text = format!("{:?}|{:?}|{:?}|{:?}", cut, colors, self.settings, self.to_printer);
         text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3)) | 1
     }
@@ -732,7 +785,10 @@ impl PartPaint {
         use fab_paint_field::strokes::BRICK;
         use fab_paint_field::Changes;
         let same_frame = (0..3).all(|r| (0..4).all(|c| self.to_printer[r][c].to_bits() == old.to_printer[r][c].to_bits()));
-        if !same_frame || self.colors != old.colors || self.settings != old.settings {
+        fn assignments(c: &fab_plate::paint::PaintColor) -> (Option<&str>, Option<u32>, Option<usize>) {
+            (c.color.as_deref(), c.filament, c.nozzle)
+        }
+        if !same_frame || !self.colors.iter().map(assignments).eq(old.colors.iter().map(assignments)) || self.settings != old.settings {
             return None;
         }
         let (now, was) = (&self.program, &old.program);
@@ -1211,65 +1267,73 @@ impl Evaluated {
         analyse_plate(&self.machine, &self.plate, &self.fields, materials)
     }
 
-    /// Map the print colours anew (`Evaluator::mapped`): parts and paint show their material
-    /// colours where a colour has no override, and print with their tools. Nothing is rebuilt.
+    /// Update the printer mapping, including the tools that slice each named colour.
     pub fn set_mapped(&mut self, mapped: Arc<Mapped>) {
-        self.mapped = mapped.clone();
-        let colors = self.colors.clone();
-        self.recolor(&|name| shown_color(&colors, &mapped.inks, name));
+        self.mapped = mapped;
+        let tools = job_tools(&self.mapped, &self.colors, &self.plate.parts, &self.part_colors);
+        self.plate.map_colors(&self.part_colors, &|n| tools.get(n).copied());
+        for paint in self.paint.iter_mut().chain(&mut self.excluded_paint).flatten() {
+            for c in &mut Arc::make_mut(paint).colors {
+                c.map(&|n| tools.get(n).copied());
+            }
+        }
+        for p in self.plate.excluded.iter_mut().filter_map(|e| e.paint.as_mut()) {
+            for c in &mut Arc::make_mut(p).colors {
+                c.map(&|n| tools.get(n).copied());
+            }
+        }
+        self.recolor();
     }
 
-    /// The plate in its design colours ([`design_color`]), not the trays': what a render shows of
-    /// the paint and the parts. Their tools stay as mapped.
-    pub fn in_design_colors(&self) -> Evaluated {
+    pub fn set_colour_mode(&mut self, mode: fab_plate::ColourMode) {
+        self.set_colour_view(mode, self.printer_linked);
+    }
+
+    pub fn set_colour_view(&mut self, mode: fab_plate::ColourMode, linked: bool) {
+        if self.colour_mode != mode || self.printer_linked != linked {
+            self.colour_mode = mode;
+            self.printer_linked = linked;
+            self.recolor();
+        }
+    }
+
+    pub fn in_colours(&self, mode: fab_plate::ColourMode) -> Self {
         let mut ev = self.clone();
-        let colors = self.colors.clone();
-        ev.recolor(&|name| design_color(&colors, name));
+        ev.set_colour_mode(mode);
         ev
     }
 
-    /// Parts and paint shown in `shown`'s colour for each print colour, printed with the tools
-    /// of the mapping.
-    fn recolor(&mut self, shown: &dyn Fn(&str) -> [f32; 3]) {
-        let tools = job_tools(&self.mapped, &self.colors, &self.plate.parts, &self.part_colors);
-        let n = self.plate.parts.len();
-        for i in 0..n + self.plate.excluded.len() {
-            let Some(name) = self.part_colors.get(i) else { break };
+    fn recolor(&mut self) {
+        let empty = HashMap::new();
+        let inks = if self.printer_linked { &self.mapped.inks } else { &empty };
+        let shown = |name: &str| display_color(&self.colors, inks, self.colour_mode, name);
+        let parts = self.plate.parts.iter_mut().map(|p| (p, None))
+            .chain(self.plate.excluded.iter_mut().map(|e| (&mut e.part, e.paint.as_mut())));
+        let paints = self.paint.iter_mut().chain(&mut self.excluded_paint);
+        for (((part, excluded), paint), name) in parts.zip(paints).zip(&self.part_colors) {
             let own = shown(name);
-            let recolor = |colors: &mut Vec<fab_plate::paint::PaintColor>| {
-                for (k, c) in colors.iter_mut().enumerate() {
-                    c.rgb = if k == 0 { own } else { c.color.as_deref().map_or(own, shown) };
-                    c.map(&|n| tools.get(n).copied());
+            part.color[..3].copy_from_slice(&own);
+            let recolor = |colors: &mut [fab_plate::paint::PaintColor]| {
+                for c in colors {
+                    c.rgb = c.color.as_deref().map_or(own, &shown);
                 }
             };
-            if i < n {
-                let part = &mut self.plate.parts[i];
-                part.color = [own[0], own[1], own[2], 1.0];
-                if let Some(Some(p)) = self.paint.get_mut(i) {
-                    let mut q = (**p).clone();
-                    recolor(&mut q.colors);
-                    if let Some(sp) = &mut part.paint {
-                        sp.colors = q.colors.clone();
-                        sp.key = q.key();
+            if let Some(p) = paint {
+                let p = Arc::make_mut(p);
+                recolor(&mut p.colors);
+                if let Some((_, palette)) = &mut p.seen {
+                    for (entry, c) in palette.iter_mut().zip(&p.colors) {
+                        *entry = c.rgb;
                     }
-                    *p = Arc::new(q);
-                }
-            } else {
-                let ex = &mut self.plate.excluded[i - n];
-                ex.part.color = [own[0], own[1], own[2], 1.0];
-                if let Some(p) = &mut ex.paint {
-                    let mut q = (**p).clone();
-                    recolor(&mut q.colors);
-                    *p = Arc::new(q);
-                }
-                if let Some(Some(p)) = self.excluded_paint.get_mut(i - n) {
-                    let mut q = (**p).clone();
-                    recolor(&mut q.colors);
-                    *p = Arc::new(q);
                 }
             }
+            if let Some(sp) = &mut part.paint {
+                recolor(&mut sp.colors);
+            }
+            if let Some(p) = excluded {
+                recolor(&mut Arc::make_mut(p).colors);
+            }
         }
-        self.plate.map_colors(&self.part_colors, &|n| tools.get(n).copied());
     }
 
     /// The print colour of a placed part (printed, then excluded).
@@ -1506,6 +1570,43 @@ struct Last {
     solids: Vec<String>,
     /// Per solid: its name in the script (`solid`).
     ids: Vec<String>,
+    /// Writable segment references for direct Path profiles, by solid index.
+    sides: HashMap<usize, Vec<Option<String>>>,
+}
+
+/// Qualify direct Path children with the identifier written in the builder's sketch field.
+fn written_sides(p: &Program) -> HashMap<usize, Vec<Option<String>>> {
+    use makepad_model_script::lang::{edit, protos};
+    use makepad_script::syntax::Kind;
+    let syn = &p.names.syntax;
+    p.solids.iter().enumerate().filter_map(|(index, solid)| {
+        if !solid.sides.iter().any(Option::is_some) {
+            return None;
+        }
+        let call = edit::part_call(p, solid).ok()?;
+        let at = edit::call_fields(syn, &call, protos::proto(solid.proto)?).into_iter().find(|(k, _)| k == "sketch")?.1;
+        let value = syn.node(at.loc())?;
+        let profile = value.ident().filter(|id| !id.contains('.'))?;
+        // A pick is written at the document level. A fn may read a document Path,
+        // or a parameter with that same name supplied by a different caller.
+        let mut loc = call;
+        while let Some(parent) = loc.parent().filter(|l| !l.0.is_empty()) {
+            let local = match &syn.node(&parent)?.kind {
+                Kind::Fn { params, .. } => params.iter().any(|q| q.name == profile),
+                Kind::For { binding, .. } => p.source()[binding.clone()].split(|c: char| !c.is_alphanumeric() && c != '_').any(|n| n == profile),
+                Kind::Block(block) => block.stmts[..*loc.0.last()?].iter().any(|stmt| {
+                    matches!(&stmt.kind, Kind::Let { names, .. } if names.iter().any(|n| n == profile))
+                }),
+                _ => false,
+            };
+            if local {
+                return None;
+            }
+            loc = parent;
+        }
+        let names = (0..solid.sides.len()).map(|i| solid.side_name(i).map(|name| format!("{profile}.{name}"))).collect();
+        Some((index, names))
+    }).collect()
 }
 
 /// An [`Evaluator`]'s last build as its inspection tools see it ([`Evaluator::inspected`]).
@@ -1525,6 +1626,9 @@ pub struct Evaluator {
     /// The print colours on the printer (material colours, job tools), from the app's
     /// colour mapping.
     pub mapped: Arc<Mapped>,
+    pub colour_mode: fab_plate::ColourMode,
+    /// An unlinked viewport can still have a saved loadout for print calculations.
+    pub printer_linked: bool,
     /// The calibrated filament sets kept ([`crate::colour_sets`]): what pictures print with.
     pub calibrated: Arc<crate::colour_sets::Sets>,
     /// A live drag's draft: that instance's SDF fields and shell cavities mesh at this many
@@ -1948,6 +2052,22 @@ pub fn exact_keys(c: &Compiled, head: &Compiled) -> Option<Vec<makepad_csg_graph
     (!keys.is_empty()).then_some(keys)
 }
 
+/// Give the worker the exact steps of the build on the bed. An empty bed releases its keys.
+pub fn keep_exact_bodies(compiled: Option<&Compiled>) {
+    let mut keys = std::collections::HashSet::new();
+    for inst in compiled.into_iter().flat_map(|c| &c.instances) {
+        let p = &inst.script.program;
+        // Visit the results first. Their recipes already include the solids they were made from.
+        for s in p.solids.iter().rev() {
+            let node = p.graph.node(s.node);
+            if matches!(node.op, makepad_csg_graph::Op::Brep { .. }) && !keys.contains(&node.key) {
+                keys.extend(makepad_csg_graph::eval::brep_steps(&p.graph, s.node).into_iter().map(|step| step.key));
+            }
+        }
+    }
+    makepad_csg_brep_model::engine().keep(keys.into_iter().collect());
+}
+
 /// An exact part's slicer mesh at `chord` (mm), cut from the engine's body of the part when a
 /// slice asks.
 fn print_mesh(steps: Vec<makepad_csg_graph::BrepStep>, m: [[f64; 4]; 3], chord: f64) -> fab_plate::PrintMesh {
@@ -1966,7 +2086,7 @@ const IDENTITY3: [[f64; 4]; 3] = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0
 impl Evaluator {
     pub fn new(machine: Machine) -> Evaluator {
         let graph = makepad_csg_graph::Evaluator::with_brep(makepad_csg_brep_model::engine());
-        Evaluator { memory_guard: None, machine, profile: Default::default(), materials: Default::default(), mapped: Default::default(), calibrated: Default::default(), draft: None, mesh_fields: false, picture: false, patterns_wait: true, evaluations: 0, gate: None, print_chord: default_print_chord(), rim: Rim::default(), view: View { chord: graph.brep_chord, meshes: false }, graph, last: None, last_parts: Vec::new(), generated: Default::default(), complete: false, evaluated: None }
+        Evaluator { memory_guard: None, machine, profile: Default::default(), materials: Default::default(), mapped: Default::default(), colour_mode: Default::default(), printer_linked: true, calibrated: Default::default(), draft: None, mesh_fields: false, picture: false, patterns_wait: true, evaluations: 0, gate: None, print_chord: default_print_chord(), rim: Rim::default(), view: View { chord: graph.brep_chord, meshes: false }, graph, last: None, last_parts: Vec::new(), generated: Default::default(), complete: false, evaluated: None }
     }
 
     /// A solid of the last evaluated project (`instance/solid`) as a model-frame mesh.
@@ -2061,26 +2181,54 @@ impl Evaluator {
         let Some(measure) = self.graph.brep_measure(graph, node) else { return Ok(None) };
         let measure = measure.map_err(|f| f.message)?;
         let (edges, faces) = self.graph.brep_entities(graph, node).ok_or("not an exact body")?.map_err(|f| f.message)?;
-        // Each part's own steps: its builder's and its placement's (a placed body keeps its faces'
-        // names).
-        let mut parts = HashMap::new();
-        for (&solid, id) in last[g].nodes.iter().zip(&last[g].ids) {
+        // Each part's own step (under its tags, its placement: every exact part has one), the
+        // step its face names resolve to, named from the object down: a step two parts share
+        // (two equal unplaced boxes) is named by the part this object reaches it through first.
+        let mut by_node = HashMap::new();
+        for (i, &solid) in last[g].nodes.iter().enumerate() {
             let mut at = solid;
-            loop {
-                match &graph.node(at).op {
-                    makepad_csg_graph::Op::Tag { source, .. } => at = *source,
-                    makepad_csg_graph::Op::Brep { op, inputs } => {
-                        parts.entry(graph.node(at).key).or_insert_with(|| id.clone());
-                        match (op, inputs.first()) {
-                            (makepad_csg_graph::BrepOp::Place { .. }, Some(input)) => at = *input,
-                            _ => break,
-                        }
+            while let makepad_csg_graph::Op::Tag { source, .. } = &graph.node(at).op {
+                at = *source;
+            }
+            by_node.entry(at).or_insert(i);
+        }
+        let mut parts = HashMap::new();
+        let mut sides = HashMap::new();
+        let mut outer = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::from([node]);
+        while let Some(at) = queue.pop_front() {
+            if !seen.insert(at) {
+                continue;
+            }
+            queue.extend(graph.node(at).op.inputs());
+            if let (Some(&i), makepad_csg_graph::Op::Brep { .. }) = (by_node.get(&at), &graph.node(at).op) {
+                let key = graph.node(at).key;
+                if !parts.contains_key(&key) {
+                    parts.insert(key, last[g].ids[i].clone());
+                    if let Some(names) = last[g].sides.get(&i) {
+                        sides.insert(key, names.clone());
                     }
-                    _ => break,
+                    outer.push(key);
                 }
             }
         }
-        Ok(Some(ExactBody { measure, edges, faces, parts }))
+        // How often the body holds each step: its paths from the object, summed by key (a node's
+        // inputs come before it, so from the object down is by falling index).
+        let mut paths: HashMap<makepad_csg_graph::NodeId, u64> = HashMap::from([(node, 1)]);
+        let mut order: Vec<makepad_csg_graph::NodeId> = seen.into_iter().collect();
+        order.sort_unstable_by(|a, b| b.cmp(a));
+        let mut times: HashMap<makepad_csg_graph::Key, u64> = HashMap::new();
+        for n in order {
+            let here = paths.get(&n).copied().unwrap_or(0);
+            *times.entry(graph.node(n).key).or_default() += here;
+            for i in graph.node(n).op.inputs() {
+                *paths.entry(i).or_default() += here;
+            }
+        }
+        let mut repeated: Vec<_> = times.into_iter().filter(|(_, t)| *t > 1).map(|(k, _)| k).collect();
+        repeated.sort_unstable();
+        Ok(Some(ExactBody { measure, edges, faces, parts, sides, order: outer, repeated }))
     }
 
     /// Solids `names` of a compiled script as model-frame meshes (positions, triangles),
@@ -2097,6 +2245,18 @@ impl Evaluator {
         Ok(out)
     }
 
+    /// Solid `solid` of a compiled script as the plate shows a part: its display mesh placed by
+    /// `frame` (the part's model to plate frame), meshed on this evaluator's cache. An earlier
+    /// step of a part whose later steps were built is mostly cached already. `cancelled`
+    /// ends the build at its next check.
+    pub fn step_render(&mut self, script: &crate::program::Script, solid: usize, frame: &[[f64; 4]; 3], cancelled: Option<&dyn Fn() -> bool>) -> Result<RenderMesh, String> {
+        let s = script.program.solids.get(solid).ok_or_else(|| format!("no solid {solid}"))?;
+        self.graph.draft = 1.0;
+        self.graph.begin();
+        let mesh = self.graph.mesh(&script.program.graph, s.node, cancelled).map_err(|f| f.to_string())?;
+        Ok(placed_render(&mesh, frame))
+    }
+
     /// The last project's solids (`instance/solid`).
     pub fn object_names(&self) -> Vec<String> {
         self.last.as_ref().map(|l| l.iter().flat_map(|l| l.solids.iter().cloned()).collect()).unwrap_or_default()
@@ -2106,6 +2266,12 @@ impl Evaluator {
     /// a build after it does not come on the bed (its job was cancelled once it was built).
     pub fn inspected(&self) -> Inspected {
         Inspected(self.last.clone())
+    }
+
+    /// Keep the meshes of `compiled`, the build the person has, in this evaluator's cache however
+    /// long a drag's drafts run, so letting go where it started shows it again at once.
+    pub fn keep_meshes(&mut self, compiled: Option<&Compiled>) {
+        self.graph.keep(compiled.into_iter().flat_map(|c| &c.instances).flat_map(|i| i.script.program.graph.nodes.iter().map(|n| n.key)));
     }
 
     pub fn put_back(&mut self, was: Inspected) {
@@ -2130,14 +2296,22 @@ impl Evaluator {
             .collect()
     }
 
-    /// Evaluate a compiled project: every instance's placed objects, laid out on one plate.
-    ///
+    /// Lay out compiled scripts with the default pack. A project build uses its saved gap
+    /// through [`crate::FabModel::evaluate`].
+    pub fn evaluate(&mut self, c: &Compiled, cancelled: Option<&dyn Fn() -> bool>) -> Result<Evaluated, Failure> {
+        self.evaluate_with_gap(c, None, cancelled)
+    }
+
+    /// Evaluate with the spacing in bed mm from the project whose scripts were compiled.
     /// The job this thread works for (`makepad_jobs::current`) stops it too: a person's cancel
     /// in the status bar ends the build at its next check, and its steps report on that job.
-    pub fn evaluate(&mut self, c: &Compiled, cancelled: Option<&dyn Fn() -> bool>) -> Result<Evaluated, Failure> {
+    pub fn evaluate_with_gap(&mut self, c: &Compiled, arrange_gap: Option<f64>, cancelled: Option<&dyn Fn() -> bool>) -> Result<Evaluated, Failure> {
+        if let Some(mm) = arrange_gap {
+            crate::project::checked_arrange_gap(mm).map_err(|message| Failure::program(&makepad_model_script::lang::Diag { line: 1, col: 1, message }))?;
+        }
         let job = makepad_jobs::current();
         let asked = || cancelled.is_some_and(|c| c()) || job.as_ref().is_some_and(|j| j.is_cancelled());
-        let Some(guard) = self.memory_guard.clone() else { return self.evaluate_unguarded(c, Some(&asked)) };
+        let Some(guard) = self.memory_guard.clone() else { return self.evaluate_unguarded(c, arrange_gap, Some(&asked)) };
         let over: std::cell::RefCell<Option<String>> = Default::default();
         let last = std::cell::Cell::new(std::time::Instant::now());
         let stop = || {
@@ -2152,7 +2326,7 @@ impl Evaluator {
             *over.borrow_mut() = guard();
             over.borrow().is_some()
         };
-        self.evaluate_unguarded(c, Some(&stop)).map_err(|mut f| {
+        self.evaluate_unguarded(c, arrange_gap, Some(&stop)).map_err(|mut f| {
             if let Some(why) = over.borrow().clone() {
                 f.message = why;
             }
@@ -2162,19 +2336,19 @@ impl Evaluator {
 
     /// Keep the compiled scripts paired with the generated meshes for callers that
     /// publish both. Bare `evaluate` also resolves requests, for mesh-only callers.
-    pub(crate) fn evaluate_compiled(&mut self, c: Compiled, cancelled: Option<&dyn Fn() -> bool>) -> Result<(Compiled, Evaluated), Failure> {
-        let ev = self.evaluate(&c, cancelled)?;
+    pub(crate) fn evaluate_compiled(&mut self, c: Compiled, arrange_gap: Option<f64>, cancelled: Option<&dyn Fn() -> bool>) -> Result<(Compiled, Evaluated), Failure> {
+        let ev = self.evaluate_with_gap(&c, arrange_gap, cancelled)?;
         Ok((self.evaluated.take().unwrap_or(c), ev))
     }
 
-    fn evaluate_unguarded(&mut self, c: &Compiled, cancelled: Option<&dyn Fn() -> bool>) -> Result<Evaluated, Failure> {
+    fn evaluate_unguarded(&mut self, c: &Compiled, arrange_gap: Option<f64>, cancelled: Option<&dyn Fn() -> bool>) -> Result<Evaluated, Failure> {
         let started = std::time::Instant::now();
         self.evaluations += 1;
         self.evaluated = None;
         self.graph.begin();
         self.generated.begin();
         if c.instances.iter().all(|i| i.script.program.gen_requests.is_empty()) {
-            let ev = self.evaluate_meshes(c, cancelled)?;
+            let ev = self.evaluate_meshes(c, arrange_gap, cancelled)?;
             self.complete = true;
             return Ok(ev);
         }
@@ -2191,12 +2365,12 @@ impl Evaluator {
         // result yet, keep a first-pass image ready if resolution fails or is cancelled.
         // Some operations cannot mesh an empty operand; that does not prevent the
         // completed program from building once its generators have answered.
-        let fallback = if pending && !self.complete { self.evaluate_meshes(c, cancelled).ok() } else { None };
+        let fallback = if pending && !self.complete { self.evaluate_meshes(c, arrange_gap, cancelled).ok() } else { None };
         let inspected = self.last.clone();
         let last_parts = self.last_parts.clone();
         self.graph.draft = 1.0;
         let result = self.generated.resolve(c, &mut self.graph, cancelled).and_then(|resolved| {
-            let ev = self.evaluate_meshes(&resolved, cancelled)?;
+            let ev = self.evaluate_meshes(&resolved, arrange_gap, cancelled)?;
             if cancelled.is_some_and(|stop| stop()) {
                 if let Some((script, request)) = resolved.instances.iter().find_map(|i| i.script.program.gen_requests.first().map(|r| (&i.script, r))) {
                     return Err(crate::generated::failure(script, request, "cancelled".into()));
@@ -2229,7 +2403,7 @@ impl Evaluator {
         }
     }
 
-    fn evaluate_meshes(&mut self, c: &Compiled, cancelled: Option<&dyn Fn() -> bool>) -> Result<Evaluated, Failure> {
+    fn evaluate_meshes(&mut self, c: &Compiled, arrange_gap: Option<f64>, cancelled: Option<&dyn Fn() -> bool>) -> Result<Evaluated, Failure> {
         let started = std::time::Instant::now();
         let mut objects: Vec<ObjectInfo> = Vec::new();
         let mut parts: Vec<Part> = Vec::new();
@@ -2258,11 +2432,14 @@ impl Evaluator {
         let mut warnings = Vec::new();
         let mut built: Vec<Last> = Vec::with_capacity(c.instances.len());
         let mut mechs: Vec<Mech> = Vec::new();
+        let mut expects: Vec<crate::expect::Judged> = Vec::new();
         // The print colours: the project's, and an implicit one for what names none.
         let mut colors = c.colors.clone();
         let mut part_colors: Vec<String> = Vec::new();
         let mapped = self.mapped.clone();
         let inks = &mapped.inks;
+        let empty = HashMap::new();
+        let view_inks = if self.printer_linked { inks } else { &empty };
         // The build's steps on the job it works for ([`Steps`]); deep code (the B-rep kernel)
         // reports inside the step it runs in.
         let mut steps = Steps::new(c, self.gate.take(), cancelled);
@@ -2401,7 +2578,7 @@ impl Evaluator {
                         FIRST_COLOUR.into()
                     }
                 };
-                let (mut part, rm) = self.part(&id, &label, placed, shown_color(&colors, inks, &color), m.as_deref(), printer_box, &mut warnings);
+                let (mut part, rm) = self.part(&id, &label, placed, display_color(&colors, view_inks, self.colour_mode, &color), m.as_deref(), printer_box, &mut warnings);
                 // Reading optics costs O(1) per solid. Each emitted body carries its own record,
                 // including an insert; an object list does not share its first body's optics.
                 part.optics = p.solids[placed.solid].optics.map(|o| fab_plate::Optics {
@@ -2415,12 +2592,7 @@ impl Evaluator {
                 part.link = p.solids[placed.solid].link.clone();
                 // Reading keepouts costs O(points) per solid. Each emitted body or insert carries
                 // its own records in the board's frame; a boolean does not inherit its operands'.
-                part.keepouts = p.solids[placed.solid].keepouts.iter().map(|k| fab_plate::Keepout {
-                    board: k.board.clone(),
-                    name: k.name.clone(),
-                    area: k.area.clone(),
-                    z: k.z,
-                }).collect();
+                part.keepouts = plate_keepouts(&p.solids[placed.solid].keepouts);
                 // The bodies an object lists print as one: its placement's id glues them.
                 if inst.script.object(&placed.object).is_some_and(|o| o.glued.contains(&placed.solid)) {
                     part.body_of = Some(group.clone());
@@ -2548,7 +2720,12 @@ impl Evaluator {
                 }
             }
             warnings.splice(notes_end..notes_end, pinless);
-            built.push(Last { graph, nodes, solids: p.solids.iter().map(|s| part_id(&inst.name, &s.id)).collect(), ids: p.solids.iter().map(|s| s.id.clone()).collect() });
+            // the person's numbers, judged on what was just built; a failing one is also a warning
+            // at its line (a person's edit commits with it, an AI edit is refused by its caller)
+            let judged = judge_expects(&mut self.graph, &graph, &nodes, inst, cancelled);
+            warnings.extend(judged.iter().filter(|j| j.verdict() == crate::expect::Verdict::Fail).map(|j| j.says()));
+            expects.extend(judged);
+            built.push(Last { graph, nodes, solids: p.solids.iter().map(|s| part_id(&inst.name, &s.id)).collect(), ids: p.solids.iter().map(|s| s.id.clone()).collect(), sides: written_sides(p) });
         }
         if parts.is_empty() && c.instances.iter().any(|i| !i.script.program.solids.is_empty()) {
             warnings.push("nothing is on the plate: a script emits its objects with object(name)".into());
@@ -2569,6 +2746,11 @@ impl Evaluator {
             })
             .collect();
         let by_object = c.settings.iter().rev().find(|(k, _)| k == "print_sequence").is_some_and(|(_, v)| v == "by object");
+        let requested = arrange_gap.unwrap_or(DEFAULT_ARRANGE_GAP);
+        let gap = shelf_gap(&self.machine, by_object, requested);
+        if gap > requested {
+            warnings.push(format!("Object-by-object printing raised the arrange gap from {requested} mm to {gap} mm for toolhead clearance."));
+        }
         // A grown pattern grows on its part's own shape in the model frame: a mesh part's before
         // the layout turns and moves it (exactly the model's, under TO_PRINTER), so where it
         // stands never changes the pattern.
@@ -2583,7 +2765,7 @@ impl Evaluator {
             .collect();
         // What each part's paint prints with, before the layout places it.
         let mut picture_errors = Vec::new();
-        let plans: Vec<Option<PaintPlan>> = parts
+        let mut plans: Vec<Option<PaintPlan>> = parts
             .iter()
             .zip(&part_src)
             .map(|(part, (ii, s))| {
@@ -2634,15 +2816,23 @@ impl Evaluator {
                 let colors: Vec<fab_plate::paint::PaintColor> = std::iter::once(own)
                     .chain(op.palette.iter().map(|w| {
                         let name = swatch_color(&placed.paint, w, &mut colors);
-                        fab_plate::paint::PaintColor { rgb: shown_color(&colors, inks, &name), color: Some(name), filament: None, nozzle: None }
+                        fab_plate::paint::PaintColor { rgb: display_color(&colors, view_inks, self.colour_mode, &name), color: Some(name), filament: None, nozzle: None }
                     }))
                     .collect();
                 Some(PaintPlan { op, pictures, colors })
             })
             .collect();
+        // All swatches are known now, including a design colour first supplied by another part.
+        for ((part, name), plan) in parts.iter_mut().zip(&part_colors).zip(&mut plans) {
+            let own = display_color(&colors, view_inks, self.colour_mode, name);
+            part.color[..3].copy_from_slice(&own);
+            if let Some(plan) = plan {
+                plan.colors[0].rgb = own;
+            }
+        }
         // Each object stands where every nozzle its colours print with reaches.
         let nozzles = object_nozzles(&plans, &part_colors, &printed, &attached, &part_group, &colors, &mapped);
-        let (model_to_plate, frames, in_part, rest_gaps, unplaced) = layout(&self.machine, &self.rim, by_object, &mut parts, &mut render, &placements, &part_group, &nozzles, &part_fields, &part_rests, &part_solids, &attached, layer_height(&c.settings), &mut |shape, key, m| extent_of(shape, key, m));
+        let (model_to_plate, frames, in_part, rest_gaps, unplaced) = layout(&self.machine, &self.rim, by_object, gap, &mut parts, &mut render, &placements, &part_group, &nozzles, &part_fields, &part_rests, &part_solids, &attached, layer_height(&c.settings), &mut |shape, key, m| extent_of(shape, key, m));
         halt()?;
         warnings.extend(unplaced.into_iter().map(|(g, size)| no_room(&self.machine, &g, size, &nozzles[&g])));
         for ((part, steps), m) in parts.iter_mut().zip(print_steps).zip(&model_to_plate) {
@@ -2915,6 +3105,11 @@ impl Evaluator {
         content.update(&self.print_chord.to_bits().to_le_bytes());
         // What the job prints round the parts: where the layout puts them.
         content.update(format!("{:?}", self.rim).as_bytes());
+        if gap != DEFAULT_ARRANGE_GAP || by_object {
+            content.update(b"arrange");
+            content.update(&[by_object as u8]);
+            content.update(&gap.to_bits().to_le_bytes());
+        }
         let built_count = self.graph.built;
         halt()?;
         if let Some(step) = &plate_step {
@@ -2939,6 +3134,7 @@ impl Evaluator {
         self.last_parts = last_parts;
         self.last = Some(built);
         let mut ev = Evaluated {
+            arrange_gap,
             view: View { chord: self.graph.brep_chord, meshes: self.mesh_fields },
             viewed: vec![false; kept_shapes.len() + excluded_shapes.len()],
             shapes: kept_shapes.into_iter().chain(excluded_shapes).collect(),
@@ -2968,11 +3164,15 @@ impl Evaluator {
             excluded_studies,
             hands,
             mech: mechs.into_iter().map(Arc::new).collect(),
+            expects,
             weaves,
+            calls: c.instances.iter().flat_map(|i| &i.script.program.host_calls).map(|h| LibraryCall { board: h.board.clone(), function: h.function.clone(), args: h.args.clone() }).collect(),
             profile: self.profile.clone(),
             colors,
             part_colors,
             mapped: self.mapped.clone(),
+            colour_mode: self.colour_mode,
+            printer_linked: self.printer_linked,
             taken: self.taken(c),
             drifted: Vec::new(),
             lost: Vec::new(),
@@ -3002,7 +3202,7 @@ impl Evaluator {
                 };
                 let names = match &p.graph.node(node).op {
                     Op::Brep { op: BrepOp::Fillet { edges, .. } | BrepOp::Chamfer { edges, .. }, .. } => !edges.named.is_empty(),
-                    Op::Brep { op: BrepOp::Shell { open: Open::Faces(_), .. }, .. } => true,
+                    Op::Brep { op: BrepOp::Shell { open: Open::Faces(_), .. } | BrepOp::Pull { .. } | BrepOp::Hole { on: Some(_), .. }, .. } => true,
                     _ => false,
                 };
                 if !names || seen.contains(&node) {
@@ -3311,6 +3511,100 @@ pub fn tagged_field(n: &makepad_csg_graph::SdfNode, id: u32) -> Option<makepad_c
     }
 }
 
+/// Instance `inst`'s `m.expect` statements judged on its build: each named solid read from its
+/// mesh as the build made it (model frame, mm; an operand's mesh is in the build's cache), a field
+/// solid's size from its proven extent (the proof the layout makes for a part, shared with it). A
+/// field's volume and wall are not read here (its volume is baked in the background, `fab.measure`
+/// reads its wall), and a draft (a drag's, a picture's) is judged when it is built in full: those
+/// answer not checked, with why. O(expects) lookups, and for `wall` one ray per expect.
+fn judge_expects(mesher: &mut makepad_csg_graph::Evaluator, graph: &Graph, nodes: &[NodeId], inst: &crate::program::Instance, cancelled: Option<&dyn Fn() -> bool>) -> Vec<crate::expect::Judged> {
+    use crate::expect::{judge, Judged, Measure};
+    use makepad_csg_math::Vec3d;
+    let p = &inst.script.program;
+    let draft = mesher.draft != 1.0;
+    let mut out = Vec::new();
+    for e in &inst.script.expects {
+        // each named solid: its mesh, or a field's proven box (model frame)
+        let mut meshes: Option<Result<Vec<(String, Result<Arc<TriMesh>, Bounds>)>, String>> = None;
+        let mut seen = Vec::new();
+        for w in &e.wants {
+            let read = match &w.measure {
+                Measure::Count => Ok(e.solids.len() as f64),
+                _ if draft => Err("a draft (a drag or a picture): judged when it is built in full".to_string()),
+                m => {
+                    let ms = meshes.get_or_insert_with(|| {
+                        e.solids.iter().map(|&k| {
+                            let id = &p.solids[k].id;
+                            let node = *nodes.get(k).ok_or_else(|| format!("`{id}` was not built"))?;
+                            if let Some((_, shape)) = field_of(graph, node, id) {
+                                const MODEL: [[f64; 4]; 3] = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
+                                let key = shape.key();
+                                return field_extent(&shape, key, &MODEL).map(|b| (id.clone(), Err(b))).ok_or_else(|| format!("`{id}` is empty"));
+                            }
+                            let mesh = mesher.mesh(graph, node, cancelled).map_err(|f| format!("`{id}` did not mesh: {}", f.message))?;
+                            if mesh.triangles.is_empty() {
+                                return Err(format!("`{id}` is empty"));
+                            }
+                            Ok((id.clone(), Ok(mesh)))
+                        }).collect()
+                    });
+                    match ms {
+                        Err(why) => Err(why.clone()),
+                        Ok(ms) => match m {
+                            Measure::X | Measure::Y | Measure::Z => {
+                                let k = match m { Measure::X => 0, Measure::Y => 1, _ => 2 };
+                                let span = |r: &Result<Arc<TriMesh>, Bounds>| match r {
+                                    Ok(m) => {
+                                        let b = m.bounding_box();
+                                        ([b.min.x, b.min.y, b.min.z][k], [b.max.x, b.max.y, b.max.z][k])
+                                    }
+                                    Err(b) => (b.min[k], b.max[k]),
+                                };
+                                let (lo, hi) = ms.iter().map(|(_, r)| span(r)).fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), (a, b)| (lo.min(a), hi.max(b)));
+                                Ok(hi - lo)
+                            }
+                            _ if ms.iter().any(|(_, r)| r.is_err()) => {
+                                let id = ms.iter().find(|(_, r)| r.is_err()).map_or("", |(id, _)| id.as_str());
+                                Err(match m {
+                                    Measure::VolumeMm3 => format!("`{id}` is a field: its volume is baked in the background once the build is in (fab.inspect has it then)"),
+                                    _ => format!("`{id}` is a field: its wall is read with fab.measure {{what: \"wall\"}}"),
+                                })
+                            }
+                            // signed: an inside-out mesh would read negative, and fail plainly
+                            Measure::VolumeMm3 => Ok(ms.iter().filter_map(|(_, r)| r.as_ref().ok()).map(|m| m.triangles.iter().map(|t| {
+                                let (a, b, c) = (m.vertices[t[0] as usize], m.vertices[t[1] as usize], m.vertices[t[2] as usize]);
+                                a.dot(b.cross(c))
+                            }).sum::<f64>() / 6.0).sum()),
+                            // straight in from the surface point nearest `at`, on the nearest solid
+                            Measure::Wall { at } => {
+                                let at = Vec3d { x: at[0], y: at[1], z: at[2] };
+                                let near = ms.iter().filter_map(|(_, r)| r.as_ref().ok()).filter_map(|m| {
+                                    let bvh = makepad_csg_mesh::bvh::Bvh::build(m);
+                                    let (d, q, tri) = bvh.closest(at)?;
+                                    Some((d, q, tri, bvh, m))
+                                }).min_by(|a, b| a.0.total_cmp(&b.0));
+                                match near {
+                                    None => Err("no surface to measure from".into()),
+                                    Some((d, _, _, _, _)) if d > 1.0 => Err(format!("`at` is {d:.2} mm off the surface: give a point on it")),
+                                    Some((_, q, tri, bvh, m)) => {
+                                        let n = m.triangle_normal(tri as usize);
+                                        bvh.ray(q - n * 1e-6, n * -1.0, 1e4, Some(tri)).map(|(t, _)| t).ok_or_else(|| "the ray found no far side (is the solid closed?)".to_string())
+                                    }
+                                }
+                            }
+                            Measure::Count => unreachable!("counted above"),
+                        },
+                    }
+                }
+            };
+            seen.push(read);
+        }
+        let verdicts = e.wants.iter().zip(&seen).map(|(w, s)| judge(w, s.clone())).collect();
+        out.push(Judged { instance: inst.name.clone(), file: inst.script.file.clone(), expect: e.clone(), seen, verdicts });
+    }
+    out
+}
+
 /// A node's distance field under rigid moves and uniform scales (in the model frame).
 fn field_of(g: &Graph, id: NodeId, solid_id: &str) -> Option<(NodeId, makepad_csg_graph::SdfShape)> {
     use makepad_csg_graph::{Op, SdfNode, SdfShape};
@@ -3379,6 +3673,7 @@ fn layout(
     machine: &Machine,
     rim: &Rim,
     by_object: bool,
+    gap: f64,
     parts: &mut [Part],
     render: &mut [RenderMesh],
     placements: &BTreeMap<String, Placement>,
@@ -3397,16 +3692,16 @@ fn layout(
     let mut in_part = Vec::with_capacity(parts.len());
     // Model (x, y, z) to printer (x, -z, y), then each step below on the left.
     let mut frames = vec![TO_PRINTER; parts.len()];
-    let bounds_of = |parts: &[Part]| -> BTreeMap<&str, Bounds> {
+    let bounds_of = |parts: &[Part]| -> BTreeMap<String, Bounds> {
         let mut out: BTreeMap<&str, Bounds> = BTreeMap::new();
         for (i, (part, g)) in parts.iter().zip(group).enumerate() {
             if attached.get(i) == Some(&true) { continue; }
             let b = out.entry(g.as_str()).or_insert(Bounds::EMPTY);
             *b = b.union(&part.bounds());
         }
-        out
+        out.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
     };
-    let before: BTreeMap<String, Bounds> = bounds_of(parts).into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+    let before = bounds_of(parts);
     for ((((part, rm), frame), g), field) in parts.iter_mut().zip(render.iter_mut()).zip(frames.iter_mut()).zip(group).zip(fields) {
         let Some(p) = placements.get(g) else { continue };
         if p.rotate == [0.0; 3] && p.scale == [1.0; 3] {
@@ -3454,7 +3749,7 @@ fn layout(
             }
         }
     }
-    let after: BTreeMap<String, Bounds> = bounds_of(parts).into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+    let after = bounds_of(parts);
     // Each part's lowest found solid point (printer z, as turned): its floor. What each object
     // rests on: its parts' lowest floor (the plate check tests the same). A field part's floor
     // comes with its box's proof. A part resting by a field alone (an assembly part's rest shape)
@@ -3512,7 +3807,7 @@ fn layout(
     // another).
     let mut slot: BTreeMap<&str, [f64; 2]> = BTreeMap::new();
     // Slots are sized by the objects as built (before their turns and scales), so turning or
-    // scaling one never moves another either.
+    // scaling one never moves another. The gap is the space between those slots.
     // A slot keeps what the job prints round the object (its brim and the skirt) where the
     // object's nozzles reach, and as far off the bed's edges.
     let reach = |g: &str, size: [f64; 2], height: f64| inset_on(machine.reach(nozzles.get(g).map_or(&[][..], Vec::as_slice)), machine.bed, rim.past(size, height));
@@ -3520,12 +3815,15 @@ fn layout(
         let (size, height) = ([b.max[0] - b.min[0], b.max[1] - b.min[1]], b.max[2] - b.min[2]);
         (g.as_str(), size, height, reach(g, size, height))
     }).collect();
-    let (slots, no_slot) = arrange(machine, &mut all, by_object);
+    let (slots, no_slot) = shelf_pack(machine, &mut all, by_object, gap);
     for (g, at) in slots {
         slot.insert(g, at);
     }
     // A placed object stands where it was put.
-    let unplaced: Vec<(String, [f64; 2])> = no_slot.into_iter().filter(|g| placements.get(*g).is_none_or(|p| p.at.is_none())).map(|g| (g.to_string(), [before[g].max[0] - before[g].min[0], before[g].max[1] - before[g].min[1]])).collect();
+    let unplaced = no_slot.into_iter().filter(|g| placements.get(*g).is_none_or(|p| p.at.is_none())).map(|g| {
+        let [w, d, _] = before[g].size();
+        (g.to_string(), [w, d])
+    }).collect();
     for (i, (part, rm)) in parts.iter_mut().zip(render.iter_mut()).enumerate() {
         let g = group[i].as_str();
         let xy = match (placements.get(g).and_then(|p| p.at), slot.get(g)) {
@@ -3694,9 +3992,17 @@ impl fab_plate::Held for PartHeld {
 /// allow. Returns each footprint's centre, and the objects whose region has no room for theirs
 /// (they stand where the bed alone puts them).
 pub fn arrange<'a>(machine: &Machine, items: &mut [(&'a str, [f64; 2], f64, Rect)], by_object: bool) -> (Vec<(&'a str, [f64; 2])>, Vec<&'a str>) {
-    // By object: the toolhead's clearance diameter, plus room for a brim or skirt on both
-    // sides and the spiral lift's sweep (the slice check measures between extrusion hulls).
-    let gap = if by_object { machine.clearance.max_radius + 24.0 } else { 8.0 };
+    shelf_pack(machine, items, by_object, shelf_gap(machine, by_object, DEFAULT_ARRANGE_GAP))
+}
+
+const DEFAULT_ARRANGE_GAP: f64 = 8.0;
+
+fn shelf_gap(machine: &Machine, by_object: bool, requested: f64) -> f64 {
+    // Keep the toolhead, brim or skirt, and spiral lift clear in sequential printing.
+    if by_object { requested.max(machine.clearance.max_radius + 24.0) } else { requested }
+}
+
+fn shelf_pack<'a>(machine: &Machine, items: &mut [(&'a str, [f64; 2], f64, Rect)], by_object: bool, gap: f64) -> (Vec<(&'a str, [f64; 2])>, Vec<&'a str>) {
     let bed = &machine.bed;
     let (bw, bd) = (bed.max[0] - bed.min[0], bed.max[1] - bed.min[1]);
     // Where a footprint may go as the rows are packed: its region, 5 mm inside the bed's edges.
@@ -3968,7 +4274,7 @@ mod extent_tests {
             let mut render = vec![RenderMesh::default(); parts.len()];
             let rests: Vec<_> = shapes.iter().map(|s| Some(s.clone())).collect();
             let (n, layer) = (parts.len(), 0.2);
-            layout(&machine, &Rim::default(), false, &mut parts, &mut render, &BTreeMap::new(), &vec!["stack".to_string(); n], &BTreeMap::new(), &vec![None; n], &rests, &rests.iter().map(|r| r.as_ref().map(|(s, _)| s.clone())).collect::<Vec<_>>(), &[], layer, &mut |shape, key, m| extent_of(shape, key, m));
+            layout(&machine, &Rim::default(), false, DEFAULT_ARRANGE_GAP, &mut parts, &mut render, &BTreeMap::new(), &vec!["stack".to_string(); n], &BTreeMap::new(), &vec![None; n], &rests, &rests.iter().map(|r| r.as_ref().map(|(s, _)| s.clone())).collect::<Vec<_>>(), &[], layer, &mut |shape, key, m| extent_of(shape, key, m));
             for (k, part) in parts.iter().enumerate().skip(1) {
                 assert!(machine::check_part(&machine, part).is_empty(), "no verdict before its proof");
                 part.prove_floor();
@@ -4008,7 +4314,7 @@ mod extent_tests {
             let group = vec!["assembly".to_string(); 2];
             let fields = vec![None, None];
             let rests: Vec<_> = shapes.iter().map(|s| Some((*s).clone())).collect();
-            let (_, _, _, gaps, _) = layout(&machine, &Rim::default(), false, &mut parts, &mut render, &BTreeMap::new(), &group, &BTreeMap::new(), &fields, &rests, &rests.iter().map(|r| r.as_ref().map(|(s, _)| s.clone())).collect::<Vec<_>>(), &[], 0.2, &mut |shape, key, m| extent_of(shape, key, m));
+            let (_, _, _, gaps, _) = layout(&machine, &Rim::default(), false, DEFAULT_ARRANGE_GAP, &mut parts, &mut render, &BTreeMap::new(), &group, &BTreeMap::new(), &fields, &rests, &rests.iter().map(|r| r.as_ref().map(|(s, _)| s.clone())).collect::<Vec<_>>(), &[], 0.2, &mut |shape, key, m| extent_of(shape, key, m));
             assert!(gaps.is_empty(), "a block's bottom closes: {gaps:?}");
             let (setter, other) = (rests_on, 1 - rests_on);
             assert_eq!(parts[setter].known_floor(), Some(0.0), "the lowest part is proven and rests on the bed");
@@ -4062,7 +4368,7 @@ mod extent_tests {
             }).collect();
             let mut render = vec![RenderMesh::default(); 2];
             let rests: Vec<_> = shapes.iter().map(|s| Some(s.clone())).collect();
-            let (_, _, _, gaps, _) = layout(&machine, &Rim::default(), false, &mut parts, &mut render, &BTreeMap::new(), &vec!["assembly".to_string(); 2], &BTreeMap::new(), &[None, None], &rests, &rests.iter().map(|r| r.as_ref().map(|(s, _)| s.clone())).collect::<Vec<_>>(), &[], 0.2, &mut |shape, key, m| extent_of(shape, key, m));
+            let (_, _, _, gaps, _) = layout(&machine, &Rim::default(), false, DEFAULT_ARRANGE_GAP, &mut parts, &mut render, &BTreeMap::new(), &vec!["assembly".to_string(); 2], &BTreeMap::new(), &[None, None], &rests, &rests.iter().map(|r| r.as_ref().map(|(s, _)| s.clone())).collect::<Vec<_>>(), &[], 0.2, &mut |shape, key, m| extent_of(shape, key, m));
             if sets {
                 let witness = |(shape, key): &(Arc<SdfShape>, [u8; 32])| bottom_of(shape, *key, &TO_PRINTER).unwrap();
                 let (b, block) = (witness(&shapes[0]), witness(&shapes[1]));
@@ -4198,7 +4504,7 @@ mod paint_change_tests {
     /// A paint stroke drawn on a strokes layer changes the paint only near it: outside the
     /// heights [`PartPaint::changed_since`] gives, every sample (slot and distance) is the old
     /// paint's.
-    /// A recoloured slot changes it anywhere.
+    /// A display recolour preserves the sliced regions.
     #[test]
     fn a_paint_stroke_changes_the_paint_near_it_only() {
         let mut log = Strokes::new();
@@ -4228,7 +4534,7 @@ mod paint_change_tests {
             }
         }
         assert!(outside > 10_000, "{outside} samples outside the change");
-        assert!(paint(&log, 0.5).changed_since(&new).is_none(), "a recoloured slot repaints anywhere");
+        assert_eq!(paint(&log, 0.5).changed_since(&new), Some(Vec::new()), "display RGB changes no printed region");
     }
 
     /// A pattern grown anew in a boxed region (another seed) changes the paint only in that box:
@@ -4380,6 +4686,20 @@ pub struct ShownPiece {
 }
 
 impl Evaluated {
+    /// This plate with placed part `part` drawn as `render`, a step of its build, as a mesh:
+    /// its field and paint are cleared so no view draws the whole part over it. For the view
+    /// only; it is never sliced or edited. Everything else is as it was, its `place` call too:
+    /// the panels read the part's turn, scale and eye from it.
+    pub fn with_step(&self, part: usize, render: RenderMesh) -> Evaluated {
+        let mut shown = self.clone();
+        if part < shown.render.len() {
+            shown.render[part] = render;
+            shown.fields[part] = None;
+            shown.paint[part] = None;
+        }
+        shown
+    }
+
     /// The plate of these pieces, for the views and the checks: what they show of each is its
     /// part's, nothing is built, and none of it is ever edited or sliced.
     pub fn of_pieces(&self, pieces: Vec<ShownPiece>) -> Evaluated {
@@ -4417,6 +4737,7 @@ impl Evaluated {
             render.push(shown);
         }
         Evaluated {
+            arrange_gap: self.arrange_gap,
             handles: vec![PartHandles::default(); n],
             printability: Arc::new(fab_printability::Report::default()),
             content: self.content,
@@ -4443,11 +4764,15 @@ impl Evaluated {
             excluded_studies: Vec::new(),
             hands: vec![Vec::new(); n],
             mech: Vec::new(),
+            expects: Vec::new(),
             weaves: Vec::new(),
+            calls: Vec::new(),
             profile: self.profile.clone(),
             colors: self.colors.clone(),
             part_colors,
             mapped: self.mapped.clone(),
+            colour_mode: self.colour_mode,
+            printer_linked: self.printer_linked,
             view: self.view,
             shapes: vec![None; n],
             viewed: vec![false; n],

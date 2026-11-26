@@ -1,0 +1,23 @@
+[package]
+name = "makepad-model-build"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "The model build service: compiles posted model programs on the warm pool (3 at once, cancellable), adds automatic LODs, impostors and load-ready textures, and caches the built GLB in the app's asset store by program hash; hosted by Sandbox and Stage"
+
+[dependencies]
+# The mailbox the builder posts programs to, and the model states it answers.
+makepad-model-script = { path = "../../../apps/engine/model_script" }
+makepad-model = { path = "../../../../libs/model" }
+# Impostor bake, load-ready (UASTC KTX2) textures and the prepared-texture
+# store: the public render core, no game shell.
+makepad-render = { path = "../../../../libs/render" }
+makepad-gltf = { path = "../../../../libs/gltf" }
+# The warm pool (TaskPool lanes) and logging.
+makepad-platform = { path = "../../../../platform" }
+# The store the cache lives in: one client per session.
+makepad-asset-client = { path = "../asset/client" }
+makepad-asset-data = { path = "../../../apps/engine/asset/data" }
+# The cache rows' neutral thumbnail card (PNG encode).
+makepad-asset-importer = { path = "../asset/importer" }

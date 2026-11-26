@@ -1,0 +1,53 @@
+use mod.motion.*
+// ICON BURST, 9:16 — the portrait cut of shape_icon_burst: centred on the
+// safe area (520, 700), label under it. Original notes follow.
+// ICON BURST — a reaction beat. The icon overshoots in on a stiff spring
+// while a ring shoots out and thins away, and eight rays flick out (each
+// ray's tail chases its head, so they read as sparks, not lines). Dots on
+// the diagonals land a beat later for a second, smaller pop.
+// Why: three layers of motion at three speeds (ring fastest, rays, then
+// dots) make a 0.7 s burst feel rich without lasting long.
+let rays = []
+let sparks = []
+for i in 0..8 {
+    rays.push(Path{svg: "M 0 -130 L 0 -210" anchor: vec2(0, 0) rotate: i * 45 stroke: in(@accent) width: 10
+                   trim_end: tween(0, 1, 0.15, 0.45, @ease_out_cubic)
+                   trim_start: tween(0, 1, 0.3, 0.7, @ease_out_cubic)})
+    sparks.push(Group{rotate: i * 45 + 22.5 layers: [
+        Ellipse{at: vec2(-7, -177) size: vec2(14, 14) fill: in(@ink)
+                scale: keys([0.3, 0.0], [0.5, 1.0, @ease_out_back], [0.9, 0.0, @ease_in_cubic])}
+    ]})
+}
+Motion{
+    label: "Icon burst 9:16"
+    brief: "An icon that pops in with a ring and a burst of sparks; a like or success beat; portrait."
+    tags: ["icon", "burst", "reaction", "success", "shape", "9:16"]
+    size: vec2(1080, 1920) duration: 2.5
+    inputs: {
+        icon: input(@text, "M 0 36 C -70 -8 -58 -66 -24 -66 C -8 -66 0 -52 0 -44 C 0 -52 8 -66 24 -66 C 58 -66 70 -8 0 36 Z", "SVG path data, filled, about 120 px across, centred on 0,0")
+        label: input(@text, "Saved to favourites", "Line under the icon; \"\" for none")
+        accent: input(@color, #ff5c39, "Icon, ring and rays")
+        ink: input(@color, #f4f7fa, "Sparks and label")
+        background: input(@color, #0b0d12, "Ground")
+    }
+    layers: [
+        Rect{size: vec2(1080, 1920) fill: in(@background)}
+        Group{
+            at: vec2(520, 700)
+            opacity: tween(1, 0, 2.15, 2.5, @ease_in_cubic)
+            layers: [
+                Group{layers: [Ellipse{at: vec2(-210, -210) size: vec2(420, 420) stroke: in(@accent)
+                                       width: tween(60, 0, 0.1, 0.7, @ease_out_cubic)
+                                       scale: tween(0.2, 1.0, 0.1, 0.7, @ease_out_expo)}]}
+                Group{layers: rays}
+                Group{layers: sparks}
+                Path{svg: in(@icon) fill: in(@accent) anchor: vec2(0, 0)
+                     scale: keys([0.1, 0.0], [0.7, 2.0, spring(320, 14)])}
+            ]
+        }
+        Text{text: in(@label) font: Font{family: "Inter" weight: 600} size: 44 color: in(@ink)
+             at: vec2(520, 934) wrap: 840 align: @center
+             y: keys([0.5, 20], [1.1, 0, @ease_out_quint], [2.15, 0], [2.5, 10, @ease_in_cubic])
+             opacity: keys([0.5, 0], [0.8, 1, @ease_out_cubic], [2.15, 1], [2.45, 0, @ease_in_cubic])}
+    ]
+}

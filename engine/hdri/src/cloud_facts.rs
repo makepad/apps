@@ -229,11 +229,7 @@ fn unit(x: f32) -> f32 {
     if x > 0.0 { x.min(1.0) } else { 0.0 }
 }
 
-/// smoothstep under its own name, so no glob can make it ambiguous (volumetric.rs `smooth`).
-fn smooth(a: f32, b: f32, x: f32) -> f32 {
-    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
+use crate::patterns::smooth;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -471,7 +467,8 @@ pub(crate) mod tests {
         let plain = ImageSet::default();
         let busy = busy_stack();
         let mut skies: Vec<(String, HdriParams, ImageSet)> = Vec::new();
-        for name in PRESET_NAMES {
+        // (the presets without layers: the cloud-type skies are made with one)
+        for name in PRESET_NAMES.iter().filter(|name| preset(name).unwrap().sky.cloud_stack.is_none()) {
             let mut p = preset(name).unwrap();
             assert!(p.lift_clouds(), "{name}: a None map lifts");
             skies.push((name.to_string(), p, plain.clone()));
@@ -541,6 +538,7 @@ pub(crate) mod tests {
     fn every_layer_at_cover_zero_is_cover_zero() {
         let mut maps: Vec<(String, HdriParams)> = PRESET_NAMES
             .iter()
+            .filter(|name| preset(name).unwrap().sky.cloud_stack.is_none())
             .map(|name| {
                 let mut p = preset(name).unwrap();
                 assert!(p.lift_clouds());
@@ -586,7 +584,7 @@ pub(crate) mod tests {
     ///   lies in 0.1..0.9. The sheets are searched from 35 to 60 degrees up. The two slabs are searched from 5 degrees
     ///   up: they are low, so above 35 degrees a Nimbostratus at 1000 m is seen within 1.4 km and a Stratus at 400 m
     ///   within 0.6 km, less than one of their cells, and no edge can pass the sun there. A placed type (a Cumulonimbus
-    ///   25 km out, a Lenticular 15 km out) stands in a few degrees of sky under about 25 degrees: its edge is searched
+    ///   25 km out) stands in a few degrees of sky under about 25 degrees: its edge is searched
     ///   along the middle of its sky box (`PlacedVolume::sky_box`), a twentieth of a degree a step.
     /// - A lifted cloud volume with the sun at its edge: prepare_tests' 1b case, which keys by its centre sample.
     #[test]

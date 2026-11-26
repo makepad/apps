@@ -1,0 +1,42 @@
+use mod.motion.*
+// WORD PUNCH, 9:16 — the portrait cut of type_word_punch: the lead words
+// stack one per line so each can be large, and the whole block sits in the
+// middle of the Reels/TikTok/Shorts safe area (x 100–940, y 280–1240).
+// Why: in portrait, height is cheap and width is not — stacking keeps the
+// type at 150 px on a 1080-wide frame.
+Motion{
+    label: "Word punch 9:16"
+    brief: "A headline that lands word by word, ending on one word slammed onto an accent block; portrait."
+    tags: ["kinetic-type", "headline", "bold", "punch", "9:16"]
+    size: vec2(1080, 1920) duration: 4.0
+    inputs: {
+        lead: input(@text, "Ship it", "Two to four short words, stacked one per line")
+        punch: input(@text, "today.", "One word that lands on the accent block")
+        ink: input(@color, #f4f7fa, "Type colour")
+        accent: input(@color, #ff5c39, "Block colour")
+        background: input(@color, #0b0d12, "Ground; use #00000000 to overlay footage")
+    }
+    layers: [
+        Rect{size: vec2(1080, 1920) fill: in(@background)}
+        Group{
+            y: tween(0, -60, 3.55, 4.0, @ease_in_cubic)
+            opacity: tween(1, 0, 3.6, 4.0, @ease_in_cubic)
+            layers: [
+                Text{text: in(@lead) font: Font{family: "Inter" weight: 800} size: 150 tracking: -0.035 color: in(@ink)
+                     at: vec2(520, 480) wrap: 360 align: @center line_height: 1.05
+                     by: @word stagger: 0.2
+                     scale: tween(1.35, 1.0, 0.15, 0.55, @ease_out_expo)
+                     blur: tween(14, 0, 0.15, 0.45, @ease_out_cubic)
+                     opacity: tween(0, 1, 0.15, 0.3, @ease_out_cubic)}
+                Text{text: in(@punch) font: Font{family: "Inter" weight: 800} size: 150 tracking: -0.035 color: in(@background)
+                     at: vec2(520, 880) wrap: 840 align: @center
+                     plate: in(@accent) plate_pad: vec2(32, 6) plate_radius: 6
+                     plate_reveal: tween(0, 1, 0.62, 0.95, @ease_in_out_expo)
+                     by: @word
+                     scale: tween(1.6, 1.0, 0.82, 1.22, @ease_out_expo)
+                     blur: tween(20, 0, 0.82, 1.1, @ease_out_cubic)
+                     opacity: tween(0, 1, 0.82, 0.95, @ease_out_cubic)}
+            ]
+        }
+    ]
+}

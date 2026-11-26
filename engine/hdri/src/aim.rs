@@ -19,6 +19,7 @@
 //! `n` (its normal, the way it shines).
 
 use super::*;
+use crate::noise::{fbm2, hash01};
 
 /// Honeycomb cells across the light's smaller side.
 pub const GRID_CELLS: f32 = 12.0;
@@ -36,6 +37,85 @@ const GRID_EDGE: f32 = 0.04;
 /// to the centre, over which it fades out: the last 4.6 degrees before 90.
 const EDGE_ON_FADE: f32 = 0.08;
 const SQRT_3: f32 = 1.732_050_8;
+
+/// A soft light's grid is sewn fabric, not a honeycomb: square cells of
+/// black cloth strips that let `FABRIC_WALL_LIGHT` of the face through.
+/// Which egg-crate it is (`FabricGrid`) sets its cells and strips
+/// (`FabricLook`); the strip's (RLS020) has `FABRIC_CELLS` across the face's
+/// smaller side.
+pub const FABRIC_CELLS: f32 = 7.0;
+const FABRIC_WALL_LIGHT: f32 = 0.05;
+/// The softening of a strip's edge, in cell widths (the fabric grid's only
+/// anti-aliasing, as `GRID_EDGE` the honeycomb's).
+const FABRIC_EDGE: f32 = 0.02;
+
+/// Which sewn egg-crate hangs on a soft light (`Aim::fabric_grid`): a
+/// strip's, a softbox's or an octabox's, or a round one on an umbrella or a
+/// parabolic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FabricGrid {
+    Strip,
+    Box,
+    Round,
+}
+
+/// A sewn egg-crate's cells and strips, the strips in cell widths. The
+/// upright strips hang straight: `upright` is half their thickness seen
+/// edge-on, `twist` more where a strip twists a little and shows its face,
+/// `bow` a little bow sideways; both change from row to row. The crossing
+/// strips are limp: each droops between two uprights, its front edge `sag`
+/// below its back one (`across` is half its thickness edge-on), as a
+/// crescent over the cell under it (`wedge` false: most at the middle) or
+/// twisted at the tabs (`wedge` true: each crossing holds it at its own
+/// droop, so a strip runs as a wedge from one tab to the next). Where the
+/// strips cross, a stitched tab hangs `tab` down, `tab_wide` wide at the
+/// strip. `border` is half the grid's outer strip round the face (0: as an
+/// upright). `turn` turns the cells on the face (radians), and `dome` is how
+/// far a round grid's front bulges (its height at the middle over the
+/// radius): its strips stand square to the dome, so off the middle they lean
+/// out and show their faces, more toward the rim. `warp` is how far the
+/// cloth lattice wanders off true (cell widths, over a few cells): sewn by
+/// hand and hung limp, its rows and columns wave. `face_light` is what a
+/// strip lets through where its face shows (the droop, the twist, a lean),
+/// a sheen on the black cloth lit by the face behind it; edge-on it lets
+/// through `FABRIC_WALL_LIGHT`.
+struct FabricLook {
+    cells: f32,
+    upright: f32,
+    twist: f32,
+    bow: f32,
+    across: f32,
+    sag: f32,
+    wedge: bool,
+    tab: f32,
+    tab_wide: f32,
+    border: f32,
+    turn: f32,
+    dome: f32,
+    warp: f32,
+    face_light: f32,
+}
+
+/// The strip's egg-crate (RLS020): 7 cells across its 30 cm, 4.3 cm each.
+const FABRIC_STRIP: FabricLook = FabricLook { cells: FABRIC_CELLS, upright: 0.045, twist: 0.05, bow: 0.04, across: 0.025, sag: 0.15, wedge: false, tab: 0.12, tab_wide: 0.07, border: 0.0, turn: 0.0, dome: 0.0, warp: 0.0, face_light: FABRIC_WALL_LIGHT };
+/// A softbox's (RLS016): 10 cells across its 60 cm, 6 cm each, sewn of the
+/// same strips; its crossing strips taut, twisted at the tabs rather than
+/// drooping, and its outer strip a dark band round the face.
+const FABRIC_BOX: FabricLook = FabricLook { cells: 10.0, upright: 0.04, twist: 0.05, bow: 0.03, across: 0.035, sag: 0.12, wedge: true, tab: 0.085, tab_wide: 0.05, border: 0.55, turn: 0.0, dome: 0.0, warp: 0.06, face_light: 0.15 };
+/// A round one (RLS029, a 115 cm parabolic's): 27 cells across, 4.3 cm as
+/// the strip's, turned on the face as it was hung, the strips alike both
+/// ways and barely drooping, on a front that bulges a tenth of the radius.
+const FABRIC_ROUND: FabricLook = FabricLook { cells: 27.0, upright: 0.03, twist: 0.025, bow: 0.05, across: 0.03, sag: 0.04, wedge: true, tab: 0.05, tab_wide: 0.03, border: 0.0, turn: 0.6, dome: 0.08, warp: 0.18, face_light: 0.15 };
+
+impl FabricGrid {
+    fn look(self) -> &'static FabricLook {
+        match self {
+            FabricGrid::Strip => &FABRIC_STRIP,
+            FabricGrid::Box => &FABRIC_BOX,
+            FabricGrid::Round => &FABRIC_ROUND,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Aim {
@@ -56,6 +136,8 @@ pub struct Aim {
     /// What of the face the centre sees as it turns toward edge-on, 0..=1,
     /// the same all over it.
     fade: f32,
+    /// The grid is a soft light's sewn fabric egg-crate (`fabric_grid`), not a honeycomb.
+    fabric: Option<FabricGrid>,
     /// Each door's flap angle from lying flat outward, radians: top, right, bottom, left.
     flaps: [f32; 4],
     /// The soft edge of a door's shadow on each axis, tangent units.
@@ -104,6 +186,7 @@ impl Aim {
             // (cos yaw x cos pitch), fades the whole face: per ray, a line swept
             // across a wide face from yaw 70 on and left its near half lit at 90.
             fade: smoothstep(0.0, EDGE_ON_FADE, n.dot(n0)),
+            fabric: None,
             flaps: doors.map(|d| (2.0 * d).to_radians()),
             soft: vec2f(edge * half.x, edge * half.y),
         })
@@ -124,6 +207,12 @@ impl Aim {
             return open.transmission(dir, Vec2f::default());
         }
         self.transmission(dir, Vec2f::default()) / self.fade
+    }
+
+    /// The same aim with its grid sewn of fabric (a strip's, a softbox's or
+    /// an octabox's, an umbrella's) instead of a honeycomb.
+    pub fn fabric_grid(self, kind: FabricGrid) -> Aim {
+        Aim { fabric: Some(kind), ..self }
     }
 
     /// A honeycomb hangs on the face.
@@ -168,11 +257,107 @@ impl Aim {
     /// along the axis sees the whole cell less its walls. A shallow grid
     /// casts only part of that shadow (`grid_contrast`).
     fn grid(&self, q: Vec2f, tx: f32, ty: f32) -> f32 {
+        if let Some(kind) = self.fabric {
+            return self.fabric(q, tx, ty, kind.look());
+        }
         let at = hex_cell(q / self.cell);
         let out = vec2f(at.x + tx * self.grid_depth, at.y + ty * self.grid_depth);
         let worst = hex_dist(at).max(hex_dist(out));
         let open = 0.5 - self.grid_wall;
         1.0 - self.grid_contrast * smoothstep(open - GRID_EDGE, open + GRID_EDGE, worst)
+    }
+
+    /// The fabric egg-crate (`FABRIC_CELLS`): square cells laid edge to edge
+    /// over the face, as many as fit, its strips `grid_depth` cell widths
+    /// deep. As with the honeycomb, the ray leaving the face at `q` comes out
+    /// of the grid's front displaced by depth x slope: the strips' back edges
+    /// are measured where it leaves the face, their front edges (the droop
+    /// and the tabs) where it comes out, both against the cell it started in.
+    ///
+    /// The face is drawn as its photo shows it, from far off: every cell is
+    /// seen along the one slope its middle is seen along, so the strips keep
+    /// their width from end to end (the centre, close to a wide face, would
+    /// see its far cells closed to slits by the depth, which no plate shows).
+    /// A ray from the face's middle (`beam`'s, q = 0) is as before. The slope
+    /// from the face's middle is the ray's less `q`'s own share (a face one
+    /// tangent unit off sees a point `q` along its slopes as -q). A domed
+    /// grid's strips lean out with the dome, which adds its slope.
+    fn fabric(&self, q: Vec2f, tx: f32, ty: f32, g: &FabricLook) -> f32 {
+        let (mut q, mut tx, mut ty) = (q, tx + q.x, ty + q.y);
+        if g.dome > 0.0 {
+            // The dome's slope at q, its height dome R (1 - (q / R)^2): the
+            // strips stand square to it, so the way out of a cell leans as much.
+            let k = 2.0 * g.dome / self.half.x.min(self.half.y);
+            tx -= k * q.x;
+            ty -= k * q.y;
+        }
+        if g.turn != 0.0 {
+            let (s, c) = g.turn.sin_cos();
+            q = vec2f(c * q.x + s * q.y, c * q.y - s * q.x);
+            (tx, ty) = (c * tx + s * ty, c * ty - s * tx);
+        }
+        let w = 2.0 * self.half.x.min(self.half.y) / g.cells;
+        if g.warp > 0.0 {
+            // The lattice wanders: a low noise over about four cells moves it.
+            let (a, b) = (q.x / (4.0 * w), q.y / (4.0 * w));
+            q = vec2f(q.x + g.warp * w * (2.0 * fbm2(a + 3.7, b + 1.3, 2, 0x51ab) - 1.0), q.y + g.warp * w * (2.0 * fbm2(a + 8.1, b + 5.9, 2, 0x52cd) - 1.0));
+        }
+        let nx = (2.0 * self.half.x / w).round().max(1.0);
+        let ny = (2.0 * self.half.y / w).round().max(1.0);
+        let (wx, wy) = (2.0 * self.half.x / nx, 2.0 * self.half.y / ny);
+        let p = vec2f((q.x + self.half.x) / wx, (q.y + self.half.y) / wy);
+        let (i, j) = (p.x.floor(), p.y.floor());
+        let back = vec2f(p.x - i - 0.5, p.y - j - 0.5);
+        let depth = self.grid_depth * w;
+        let front = vec2f(back.x + tx * depth / wx, back.y + ty * depth / wy);
+        let (ii, jj) = (i as i32, j as i32);
+        let h = |a: i32, b: i32, k: u32| hash01(a, b, 0, 0x6a1d_5eed ^ k);
+        // 1 clear past a strip's edge `d` (cell widths), 0 on it.
+        let clear = |d: f32| smoothstep(-FABRIC_EDGE, FABRIC_EDGE, d);
+        // The grid's outer strip, at the face's edges, where it has one.
+        let outer = |k: i32, last: f32| g.border > 0.0 && (k == 0 || k == last as i32);
+        // The upright strips at the cell's left (i) and right (i + 1): their
+        // half width and bow from row to row, eased along the cell's height.
+        let along = smoothstep(0.0, 1.0, back.y + 0.5);
+        let upright = |k: i32| {
+            if outer(k, nx) {
+                return (g.border, 0.0);
+            }
+            let lerp = |a: f32, b: f32| a + (b - a) * along;
+            let t = lerp(h(k, jj, 1), h(k, jj + 1, 1));
+            let b = lerp(h(k, jj, 2), h(k, jj + 1, 2)) * 2.0 - 1.0;
+            (g.upright + g.twist * t * t, g.bow * b)
+        };
+        let (left, right) = (upright(ii), upright(ii + 1));
+        let uprights = |v: Vec2f| clear(v.x + 0.5 - left.1 - left.0) * clear(0.5 - v.x + right.1 - right.0);
+        // The crossing strips under the cell (j) and over it (j + 1), half
+        // their thickness edge-on.
+        let under = if outer(jj, ny) { g.border } else { g.across };
+        let over = if outer(jj + 1, ny) { g.border } else { g.across };
+        // The crossing strip over the cell (j + 1) droops into it at its
+        // front; the one under it (j) is seen edge-on.
+        let s = (front.x + 0.5).clamp(0.0, 1.0);
+        let sag = if g.wedge {
+            // Twisted at the tabs: each crossing holds the strip at its own
+            // droop, a little more between them.
+            let (a, b) = (h(ii, jj + 1, 3), h(ii + 1, jj + 1, 3));
+            g.sag * (a + (b - a) * s) * (1.0 + 2.4 * s * (1.0 - s))
+        } else {
+            g.sag * (0.5 + h(ii, jj + 1, 3)) * 4.0 * s * (1.0 - s)
+        };
+        // The tab under the crossing at the cell's nearer top corner.
+        let reach = g.tab * (0.6 + 0.8 * h(ii + (front.x > 0.0) as i32, jj + 1, 4));
+        let down = 0.5 - over - front.y;
+        let tab = clear(0.5 - front.x.abs() - g.tab_wide * (1.0 - down / reach).max(0.0));
+        let open_back = uprights(back) * clear(back.y + 0.5 - under) * clear(0.5 - back.y - over);
+        let open_front = uprights(front) * clear(down - sag) * clear(front.y + 0.5 - under) * tab;
+        if g.face_light == FABRIC_WALL_LIGHT {
+            let open = open_back * open_front;
+            return 1.0 - self.grid_contrast * (1.0 - FABRIC_WALL_LIGHT) * (1.0 - open);
+        }
+        // Edge-on where the strips meet the face, their faces past it.
+        let blocked = (1.0 - FABRIC_WALL_LIGHT) * (1.0 - open_back) + (1.0 - g.face_light) * open_back * (1.0 - open_front);
+        1.0 - self.grid_contrast * blocked
     }
 }
 

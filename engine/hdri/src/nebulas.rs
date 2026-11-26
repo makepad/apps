@@ -1,17 +1,32 @@
 //! Nebulas (plan hdri-7 §3, Task 3b), written from general techniques: a seed's twelve candidate clouds placed along
 //! the Milky Way's plane, densest toward its centre (anywhere when it is off), each a sprite on its own tangent plane
-//! whose structure (domain-warped noise, an outline the warp's low noise moves round the centre, ridged filaments and
-//! wisps, a bright star's blue glow, cellular knots, dust lanes and silhouettes) is built once
-//! per seed and kept, its look composed per texel: Amount, Size, Brightness and Realism change no sprite, so only a
-//! typed seed builds anything (D2). With the band drawn, many small knots (H II regions, a few blue) are strewn along
-//! it besides, densest toward the core: four offset grids in galactic longitude and sin b, a knot a cell's hash,
-//! filtered by the lookup's texel in closed form, nothing kept.
+//! whose structure is built once per seed and kept, its look composed per texel: Amount, Size, Brightness and Realism
+//! change no sprite, so only a typed seed builds anything (D2). With the band drawn, many small knots (H II regions, a
+//! few blue) are strewn along it besides, densest toward the core: four offset grids in galactic longitude and sin b, a
+//! knot a cell's hash, filtered by the lookup's texel in closed form, nothing kept.
 //!
 //! The kinds (Task L1, the owner's Horsehead and Flame photos: "no specific purple donuts"): an emission sheet along
-//! the band (broad, soft, patchy hydrogen-alpha, brightest toward one side, dark dust silhouetted in front of its
-//! other side with a brighter rim of gas along the dust's edge); a complex near the core (red on one side, a bright
-//! star's blue glow in the middle, yellow-orange dust lit by it on the other); a reflection glow round a bright star,
-//! near the band; and a dark cloud. No blisters or shells: their rims read as rings and donuts.
+//! the band (broad, soft, patchy hydrogen-alpha lit from one side by its own bright star, dark dust silhouetted in
+//! front of its other side with a brighter rim of gas along the dust's edge); a complex near the core (red on one
+//! side, a bright star's blue glow in the middle, yellow-orange dust lit by it on the other); a reflection glow round a
+//! bright star, near the band; and a dark cloud. No blisters or shells: their rims read as rings and donuts.
+//!
+//! **One field** (the nebula assessment, 2026-11-08). A sprite's gas and dust are one domain-warped fbm: its low
+//! octaves and a ramp that rises away from the sprite's star (the dark side), and fine octaves whose share, and a fine
+//! warp's strength, a slow noise sets, so broad smooth glow lies beside finely detailed edges; the fine octaves are
+//! read two and a half times longer along the light (streamers toward the star). The dust is the field's densest
+//! part, no thinner than the front's course (the first octave and the ramp) a little past it and none well short of
+//! it: a crisp edge where it meets the gas, thinning out softly deeper in, so it stays on the dark side, attached to
+//! the sheet. The gas's light grows as the exponential of the field toward the dust (a turbulent gas's log-normal
+//! density), fades past the front's course and where a wide soft limit, its reach moved round the middle by a low
+//! octave, draws the field down, so the brightest gas lies just outside the dust. Steps toward the star decide the
+//! light at the dust's edge: a rim hugs it only where it faces the star (the field falls there and is no dust), and
+//! the gas behind dust is in its shadow, on an emission sheet back to the sheet's own dust and keeping some dust (the
+//! star's light never reaches it), so a clump of dust out in front of the sheet is lit as a crescent on its star's side
+//! and joined to the sheet's dust by a thin tail, as a pillar is: never an eye in a ring. The star's light on the
+//! sheet falls with distance (Z0² / (d² + Z0²)), and that star is one of the cloud's embedded stars. Written from the
+//! Nebula Generator's techniques (a dense core from the same field, a scale that varies, a star that lights the gas),
+//! none of its code or values.
 //!
 //! **Realism** blends two looks of one layout (D8): at 0 astrophotography's colours (hydrogen-alpha red-magenta,
 //! oxygen-III's teal only mixed into a cavity's pale glow, reflection blue, yellow-orange lit dust, dark dust; peaks
@@ -54,12 +69,23 @@ const REFLECTION_RGB: Vec3f = vec3f(0.25, 0.45, 1.0);
 /// A red giant's light scattered by dust: yellow-orange.
 const DUST_LIT_RGB: Vec3f = vec3f(1.0, 0.62, 0.22);
 const REAL_RGB: Vec3f = vec3f(0.95, 0.99, 1.05);
-/// A sheet is ACROSS times narrower across the band than along it (Task L1).
-const ACROSS: f32 = 2.4;
-/// The dust silhouetted in front of a sheet: where the lanes' noise passes SILHOUETTE.0, fully dark by SILHOUETTE.1 (a
-/// crisp edge), and how much of a cloud's own light lies behind its dust (the rest in front of it).
-const SILHOUETTE: (f32, f32) = (0.6, 0.64);
+/// How much of a cloud's own light lies behind its dust (the rest in front of it).
 const BEHIND_DUST: f32 = 0.85;
+/// A sprite's field: the dust from where it passes DUST; the gas's light grows as exp(GROW (field - DUST)) toward it
+/// and falls as exp(-PAST (course - DUST)) past the front's course; a rim RIM wide in the field hugs the dust's lit
+/// edge, its test (and the shadow's) stepping RIM_STEP (sprite units) toward the star, the shadow's SHADOW_STEPS
+/// times; the gas in a dust's shadow keeps some dust, none SHIELD under DUST.
+const DUST: f32 = 0.66;
+const GROW: f32 = 4.5;
+const PAST: f32 = 8.0;
+const RIM: f32 = 0.05;
+const RIM_STEP: f32 = 0.08;
+const SHADOW_STEPS: usize = 4;
+const SHIELD: f32 = 0.08;
+/// A sheet's star lights it as Z0² / (d² + Z0²) at a distance d on the sprite (a sheet Z0 in front of or behind
+/// it); a reflection glow's dust, nearer its star, as REFLECTION_Z0.
+const Z0: f32 = 1.0;
+const REFLECTION_Z0: f32 = 0.3;
 /// How far (radians) a sheet's long axis turns off the band's direction, at most.
 const TURN_OFF_BAND: f32 = 0.45;
 /// The knots' grids in galactic longitude and sin b: KNOT_GRIDS of them, each a quarter of a cell off the last, cells of
@@ -155,13 +181,77 @@ fn place(c: &Candidate, axes: Option<[Vec3f; 3]>) -> Vec3f {
     }
 }
 
-/// What a sprite is: its kind, its noise's slice and seed, and the unit direction its features lean toward.
+/// What a sprite is: its kind, its noise's slice and seed, the unit direction its light comes from (its bright side;
+/// its field rises the other way) and where its lighting star sits on it.
 #[derive(Clone, Copy, Debug)]
 struct SpriteDef {
     kind: NebulaKind,
     z: f32,
     seed: u32,
     lean: (f32, f32),
+    star: (f32, f32),
+    /// How far past the middle, on the dark side, the dust's front lies (sprite units).
+    front: f32,
+    /// What the star's light is multiplied by: an emission sheet's and a complex's gas is as bright at its brightest
+    /// (along the light's axis, its noise at its mean) whatever its front's distance from the star and the middle.
+    gain: f32,
+}
+
+impl SpriteDef {
+    /// Candidate `i` of `seed`'s sprite. An emission sheet's and a complex's light comes from across the band (within
+    /// 46 degrees of square to it), so their dust's front runs along it, 0.05 to 0.4 of the radius past the middle; a
+    /// reflection glow's and a dark cloud's any way. An emission sheet's star stands on its bright side, 0.55 to 0.8 of
+    /// the radius before its front; a complex's and a reflection glow's in the middle.
+    fn new(seed: u32, i: usize) -> SpriteDef {
+        let kind = candidate(seed, i).kind;
+        let (z, own) = (17.0 * i as f32 + 3.1, hash_u32(seed ^ (i as u32 + 1).wrapping_mul(0x9e37_79b9)));
+        let u = hash01(i as i32, 7, 1, seed);
+        let angle = match kind {
+            NebulaKind::Emission | NebulaKind::Complex => (if u < 0.5 { FRAC_PI_2 } else { -FRAC_PI_2 }) + 0.8 * (2.0 * (2.0 * u).fract() - 1.0),
+            _ => TAU * u,
+        };
+        let lean = (angle.cos(), angle.sin());
+        let front = 0.05 + 0.35 * hash01(i as i32, 7, 3, seed);
+        let out = if kind == NebulaKind::Emission { 0.55 + 0.25 * hash01(i as i32, 7, 2, seed) - front } else { 0.0 };
+        let star = (lean.0 * out, lean.1 * out);
+        let mut def = SpriteDef { kind, z, seed: own, lean, star, front, gain: 1.0 };
+        // the gas's expected light along the light's axis, from the sprite's edge on the star's side to the front (the
+        // field's noise at its mean): its brightest divided out
+        if matches!(kind, NebulaKind::Emission | NebulaKind::Complex) {
+            let ramp = shape(kind).0;
+            let peak = (0..=24)
+                .map(|k| {
+                    let t = -0.95 + (front + 0.95) * k as f32 / 24.0;
+                    let (x, y) = (-lean.0 * t, -lean.1 * t);
+                    let d2 = (x - star.0) * (x - star.0) + (y - star.1) * (y - star.1);
+                    Z0 * Z0 / (d2 + Z0 * Z0) * (GROW * (ramp * (t - front) + def.limit(x, y))).exp()
+                })
+                .fold(0.0f32, f32::max);
+            def.gain = 1.0 / peak;
+        }
+        def
+    }
+
+    /// The gas's limit at sprite point (x, y): wide and soft, drawing the field down toward the sprite's edge, its
+    /// reach moved round the middle by a single low octave (the same at every level), so the gas's outline is the
+    /// field's inside a ragged ellipse, never a hole in it.
+    fn limit(&self, x: f32, y: f32) -> f32 {
+        let across = shape(self.kind).1;
+        let m = fbm3_frac_full(x * 1.2 + 3.3, y * 1.2, self.z + 5.5, 1.0, 1.0, self.seed ^ 9);
+        -0.75 * smoothstep(0.15, 1.05, (x * x + across * across * y * y).sqrt() * (0.75 + 0.5 * m))
+    }
+}
+
+/// How steeply a kind's field rises toward its dark side, how much longer its gas's limit is along the band than across
+/// it, and how much of the swing of its first low octave and of the next two the field keeps (less of the first: a
+/// straighter front, its dust a wall on one side rather than a bulge the gas wraps round).
+fn shape(kind: NebulaKind) -> (f32, f32, f32, f32) {
+    match kind {
+        NebulaKind::Emission => (0.55, 1.6, 0.35, 0.75),
+        NebulaKind::Complex => (0.45, 1.3, 0.45, 0.8),
+        NebulaKind::Reflection => (0.1, 1.05, 1.0, 1.0),
+        NebulaKind::Dark => (0.3, 1.4, 0.5, 1.0),
+    }
 }
 
 /// A seed's twelve sprites, each six `LazyGrid`s (H-alpha, O III, reflection, dust depth, lit dust), filled as bakes
@@ -176,10 +266,7 @@ impl Sprites {
     fn new(seed: u32) -> Sprites {
         #[cfg(test)]
         super::probe::count(super::probe::Work::NebulaSprites);
-        let defs = std::array::from_fn(|i| {
-            let lean = TAU * hash01(i as i32, 7, 1, seed);
-            SpriteDef { kind: candidate(seed, i).kind, z: 17.0 * i as f32 + 3.1, seed: hash_u32(seed ^ (i as u32 + 1).wrapping_mul(0x9e37_79b9)), lean: (lean.cos(), lean.sin()) }
-        });
+        let defs = std::array::from_fn(|i| SpriteDef::new(seed, i));
         let grids = (0..NEBULA_MAX).map(|_| std::array::from_fn(|l| LazyGrid::new(SPRITE_LEVELS[l], SPRITE_LEVELS[l], false))).collect();
         Sprites { defs, grids }
     }
@@ -217,9 +304,11 @@ fn sprites_for(seed: u32) -> Arc<Sprites> {
 }
 
 /// What a sprite holds at its tangent-plane point (px, py) at a level `size` texels across: H-alpha, O III and
-/// reflection emission (shapes, 0 to about 1.3), the dust's optical depth and the lit dust's yellow-orange. A function of
-/// (def, size, p) alone, its octaves cut at the level's Nyquist (each keeping its weight in the full count,
-/// `fbm3_frac_full`) and its knots widened to two texels with their light kept.
+/// reflection emission (shapes, 0 to about 2 at the brightest rims and a few specks more, which the lookup holds at 1),
+/// the dust's optical depth and the lit dust's yellow-orange, all from one field (the header's **One field**). A
+/// function of (def, size, p) alone, its octaves cut at the level's Nyquist (each keeping its weight in the full count,
+/// `fbm3_frac_full`), a set of them fading out as its first wavelength nears two texels, and its knots widened to two
+/// texels with their light kept.
 fn sprite_texel(def: &SpriteDef, size: usize, px: f32, py: f32) -> [f32; 5] {
     let r = (px * px + py * py).sqrt();
     if !(r < 1.0) {
@@ -227,63 +316,149 @@ fn sprite_texel(def: &SpriteDef, size: usize, px: f32, py: f32) -> [f32; 5] {
     }
     let texel = 2.0 / size as f32;
     let oct = |wavelength: f32, most: f32| octaves_for(wavelength, texel, most);
-    let (z, s) = (def.z, def.seed);
+    // a set of octaves whose first wavelength nears the level's limit fades out: whole from four texels, gone at two
+    let fade = |wavelength: f32| (octaves_for(2.0 * wavelength, texel, 12.0) - 1.0).min(1.0);
+    let (z, s, kind) = (def.z, def.seed, def.kind);
+    let (ax, ay) = def.lean;
+    let (ramp, _, first, next) = shape(kind);
+    // the field's lift: an emission sheet's and a complex's dust front `front` past the middle; a reflection glow's
+    // dust only in its densest patches
+    let lift = match kind {
+        NebulaKind::Emission | NebulaKind::Complex => DUST - 0.5 - def.front * ramp,
+        NebulaKind::Reflection => -0.15,
+        NebulaKind::Dark => 0.0,
+    };
     let wx = fbm3_frac_full(px * 1.5, py * 1.5, z, oct(0.67, 3.0), 3.0, s) - 0.5;
     let wy = fbm3_frac_full(px * 1.5 + 5.2, py * 1.5 + 1.3, z, oct(0.67, 3.0), 3.0, s ^ 1) - 0.5;
-    // an outline a single low octave moves round the centre, from 0.45 of the radius to the whole of it: the same at
-    // every level (a clamp of finer noise would grow or shrink the cloud's mean area with the level's octaves)
-    let m = (0.5 + 2.5 * (fbm3_frac_full(px * 1.2 + 3.3, py * 1.2, z + 5.5, 1.0, 1.0, s ^ 6) - 0.5)).clamp(0.0, 1.0);
-    // Task L1: a sheet along the band (the sprite's x runs along it), ACROSS times narrower across it; a reflection
-    // glow round its star nearly round. The edge falls softly from a third of the way out.
-    let across = if def.kind == NebulaKind::Reflection { 1.2 } else { ACROSS };
-    let re = (px * px + across * across * py * py).sqrt() / (0.7 + 0.3 * m);
-    let envelope = 1.0 - smoothstep(0.3, 1.0, re);
-    let (qx, qy) = (px + 0.9 * wx, py + 0.9 * wy);
-    let body = fbm3_frac_full(qx * 2.0, qy * 2.0, z + 3.7, oct(0.5, 5.0), 5.0, s ^ 2);
-    let ridge = 1.0 - (2.0 * fbm3_frac_full(qx * 3.0, qy * 3.0, z + 7.1, oct(0.33, 6.0), 6.0, s ^ 3) - 1.0).abs();
-    let wisps = ridge * ridge * ridge;
-    // knots: within w of a cellular point (cells a quarter of the sprite), w at least two texels, the light kept
-    let w = (8.0 * texel).max(0.3);
-    let knot = (1.0 - smoothstep(0.0, w, worley3(qx * 4.0, qy * 4.0, z, s ^ 4))) * (0.3 / w) * (0.3 / w);
-    let dn = fbm3_frac_full(qx * 2.5 + 9.1, qy * 2.5, z + 1.9, oct(0.4, 5.0), 5.0, s ^ 5);
-    let lanes = smoothstep(0.55, 0.75, dn) * envelope;
-    // Task L1: the broad glowing sheet (the warped body's high patches, soft-edged, more of it toward the middle), the dust silhouetted in front of it
-    // (the lanes' noise's highest clumps, crisp-edged: SILHOUETTE wide in the noise) and a brighter rim of gas hugging
-    // the dust's edge, as the Horsehead's ionisation front does
-    let sheet = smoothstep(0.34 - 0.16 * envelope, 0.7 - 0.12 * envelope, body);
-    // how far along the lean a point lies, -1 to 1
-    let lean = (qx * def.lean.0 + qy * def.lean.1).clamp(-1.0, 1.0);
-    // the dust stands on the side away from the lean (the gas's bright side), reaching a little past the gas: it bites
-    // into the sheet's edge, never a hole in its middle
-    let silhouette = smoothstep(SILHOUETTE.0, SILHOUETTE.1, dn) * smoothstep(-0.1, 0.5, -lean) * (1.0 - smoothstep(0.5, 1.0, 0.85 * re));
-    let rim = smoothstep(SILHOUETTE.0 - 0.1, SILHOUETTE.0, dn) * (1.0 - smoothstep(SILHOUETTE.0, SILHOUETTE.1, dn));
+    let (qx, qy) = (px + 0.35 * wx, py + 0.35 * wy);
+    // the detail: a slow noise sets the fine octaves' share and a fine warp's strength (broad smooth glow beside finely
+    // detailed edges)
+    let detail = smoothstep(0.38, 0.62, fbm3_frac_full(px * 1.3 + 3.3, py * 1.3, z + 5.5, oct(0.77, 2.0), 2.0, s ^ 6));
+    let fw = 0.06 * detail * fade(0.2);
+    let (gx, gy) = if fw > 0.0 {
+        let fx = fbm3_frac_full(qx * 5.0 + 1.7, qy * 5.0, z + 2.3, oct(0.2, 2.0), 2.0, s ^ 7) - 0.5;
+        let fy = fbm3_frac_full(qx * 5.0, qy * 5.0 + 4.1, z + 2.3, oct(0.2, 2.0), 2.0, s ^ 8) - 0.5;
+        (qx + fw * fx, qy + fw * fy)
+    } else {
+        (qx, qy)
+    };
+    let fine_share = (0.06 + 0.4 * detail) * fade(0.2);
+    // the field: the front's course (its first low octave and the ramp toward the dark side), its next two low octaves,
+    // and its fine octaves, read two and a half times longer along the light (streamers toward the star)
+    let low = |x: f32, y: f32| {
+        let (n, n1) = (fbm3_frac_full(x * 1.25, y * 1.25, z + 3.7, oct(0.8, 3.0), 3.0, s ^ 2), fbm3_frac_full(x * 1.25, y * 1.25, z + 3.7, 1.0, 3.0, s ^ 2));
+        let course = 0.5 + first * (n1 - 0.5) + lift - ramp * (x * ax + y * ay);
+        (course + next * (n - n1), course, n)
+    };
+    let fine = |x: f32, y: f32| {
+        if fine_share > 0.0 {
+            fine_share * (fbm3_frac_full(2.0 * (x * ax + y * ay), 5.0 * (y * ax - x * ay), z + 7.1, oct(0.2, 4.0), 4.0, s ^ 3) - 0.5)
+        } else {
+            0.0
+        }
+    };
+    let (fc, c, n) = low(gx, gy);
+    let fd = fine(gx, gy);
+    let f = fc + fd;
+    let lim = def.limit(px, py);
+    if kind == NebulaKind::Dark {
+        // dust alone: thick where the field is (densest toward its ramp's side), thinning out with it toward the limit;
+        // its first octave's swing halved, so every dark cloud has a core
+        let thick = smoothstep(0.35, 0.75, f + 0.8 * lim + 0.15);
+        return [0.0, 0.0, 0.0, 1.6 * thick * thick.sqrt() * (1.0 - smoothstep(0.85, 0.98, r)), 0.0];
+    }
+    // the dust's field: an emission sheet's and a complex's no thinner than the front's course a little past it, so the
+    // dark side is whole, its edge toward the gas the field's own; and drawn down where the course is well short of the
+    // front, so the dust stays on the dark side, attached to the sheet (no dust and no rim out in the gas)
+    let solid = |f: f32, course: f32| match kind {
+        NebulaKind::Reflection => f,
+        _ => f.max(course - 0.06) - 0.3 * (1.0 - smoothstep(DUST - 0.16, DUST - 0.06, course)),
+    };
+    let fs = solid(f, c);
+    // the star's light on the gas, falling with distance
+    let (dx, dy) = (px - def.star.0, py - def.star.1);
+    let d2 = dx * dx + dy * dy;
+    let toward = 1.0 / d2.sqrt().max(1.0e-4);
+    let z0 = if kind == NebulaKind::Reflection { REFLECTION_Z0 } else { Z0 };
+    let light = def.gain * z0 * z0 / (d2 + z0 * z0);
+    // steps toward the star: where the field is dust a step away, the gas here is in the dust's shadow; where it falls
+    // (steeply where the dust's edge faces the star squarely) and is no dust, the edge here is lit, the rim showing
+    // there only. An emission sheet's star stands clear of its dust, and its shadow reaches back SHADOW_STEPS steps
+    // (none past the star); a complex's star stands among its dust, lighting it from all round, so its shadow stays a
+    // step long. Far from the dust (the field under DUST - 5 RIM) no step is taken, and the steps' share fades out
+    // toward there, so the light is continuous across it
+    let near = smoothstep(DUST - 5.0 * RIM, DUST - 4.0 * RIM, fs);
+    let (lit, shadow) = if kind != NebulaKind::Reflection && near > 0.0 {
+        let step = |s: f32| {
+            let k = s * toward;
+            let (bx, by) = (gx - k * dx, gy - k * dy);
+            let (bf, bc, _) = low(bx, by);
+            solid(bf + fine(bx, by), bc)
+        };
+        let back = step(RIM_STEP);
+        let mut shadow = smoothstep(DUST - 0.03, DUST + 0.02, back);
+        if kind == NebulaKind::Emission {
+            // the farther steps only where the field is dust (the first step's softer start is its penumbra; gas just
+            // short of the dust casts nothing far)
+            let star = d2.sqrt();
+            for j in 2..=SHADOW_STEPS {
+                if !(shadow < 1.0) {
+                    break;
+                }
+                shadow = shadow.max(smoothstep(DUST, DUST + 0.02, step((j as f32 * RIM_STEP).min(star))));
+            }
+        }
+        (near * smoothstep(0.02, 0.07, fs - back) * (1.0 - shadow), near * shadow)
+    } else {
+        (0.0, 0.0)
+    };
+    let shade = 1.0 - 0.85 * shadow;
+    // the dust: the field's densest part, crisp where it meets the gas, thinning out softly deeper in (the course
+    // DUST + 0.25 to DUST + 0.55) and toward the sprite's edge (its ends), ragged by the field's low octaves. On an
+    // emission sheet the gas in a dust's shadow keeps some dust (the star's light never reaches it), thinning out
+    // softly with the field to none SHIELD under DUST, so a clump of dust out in front of the sheet's dust joins it by
+    // a thin tail, as a pillar does, its star's side lit as a crescent: never an eye in a ring
+    let ends = (1.0 - smoothstep(0.6, 0.88, r + 0.5 * (n - 0.5))) * (1.0 - smoothstep(0.9, 0.99, r));
+    let reach = (1.0 - smoothstep(DUST + 0.25, DUST + 0.55, c)) * ends;
+    let front = smoothstep(DUST, DUST + 0.02, fs);
+    let dust = front * reach;
+    let kept = if kind == NebulaKind::Emission { shadow * smoothstep(DUST - SHIELD, DUST, fs) } else { 0.0 };
+    let depth = (0.6 * front.max(kept) + 1.4 * smoothstep(DUST + 0.02, DUST + 0.4, fs)) * reach;
+    // the gas fades out before the sprite's edge
+    let edge = 1.0 - smoothstep(0.75, 0.98, r);
     // a bright star's glow: a Gaussian of `sigma` widened by the level's texel, its light kept
     let glow = |peak: f32, sigma: f32| {
         let wide = sigma * sigma + 0.25 * texel * texel;
         peak * (sigma * sigma / wide) * (-0.5 * r * r / wide).exp()
     };
-    match def.kind {
-        NebulaKind::Emission => {
-            let ha = envelope * (0.85 + 0.3 * lean) * (sheet * (0.65 + 0.4 * wisps + 0.6 * rim) + (0.3 + 0.7 * sheet) * knot);
-            [ha, 0.08 * ha, 0.0, 0.2 * lanes + 2.0 * silhouette, 0.0]
-        }
-        NebulaKind::Complex => {
-            let red = smoothstep(-0.3, 0.5, lean);
-            let glow = glow(0.6, 0.1) + glow(0.35, 0.3);
-            [
-                envelope * red * sheet * (0.35 + 0.35 * wisps + 0.6 * knot + 0.5 * rim),
-                0.0,
-                envelope * glow * (0.7 + 0.3 * body),
-                0.8 * lanes + 1.5 * silhouette,
-                envelope * (1.0 - red) * smoothstep(0.15, 0.4, r) * (0.2 + 0.6 * body * body),
-            ]
-        }
-        NebulaKind::Reflection => {
-            let glow = glow(0.5, 0.1) + glow(0.3, 0.3);
-            [0.0, 0.0, envelope * (glow + 0.2 * body + 0.25 * wisps), 0.6 * lanes + silhouette, 0.0]
-        }
-        NebulaKind::Dark => [0.0, 0.0, 0.0, envelope * (0.6 + 0.6 * body) + 1.5 * silhouette, 0.0],
+    if kind == NebulaKind::Reflection {
+        // the star's light scattered by the dust round it: brightest near it, patchy with the field, crossed by lanes
+        let wisps = (3.0 * ((fc + lim).min(DUST) - DUST) + 8.0 * fd).exp() * (1.0 - smoothstep(DUST + 0.04, DUST + 0.16, fs)) * edge;
+        return [0.0, 0.0, glow(0.5, 0.08) + 1.8 * light * wisps, 0.5 * depth, 0.0];
     }
+    // the gas's light grows with the field's low octaves toward the dust, fading out as the limit draws the field down,
+    // and past the front's course into the dark cloud (a dense clump out in the gas is as bright as the front, never a
+    // hole), its fine octaves its texture; the rim hugs the dust's lit edge
+    let gas_f = (GROW * ((fc + lim).min(DUST) - DUST) - PAST * (c - DUST).max(0.0) + 8.0 * fd).exp();
+    let rim = (-(DUST - fs).abs() / RIM).exp() * (1.0 - dust) * lit * ends * (GROW * lim).exp();
+    let gas = (gas_f * shade + 1.4 * rim) * edge;
+    // knots: within w of a cellular point (cells a quarter of the sprite), w at least two texels, the light kept
+    let w = (8.0 * texel).max(0.3);
+    let knot = (1.0 - smoothstep(0.0, w, worley3(qx * 4.0, qy * 4.0, z, s ^ 4))) * (0.3 / w) * (0.3 / w) * gas_f.sqrt() * edge * (1.0 - dust);
+    if kind == NebulaKind::Emission {
+        let ha = 0.7 * light * (gas + 0.4 * knot);
+        return [ha, 0.08 * ha, 0.0, depth, 0.0];
+    }
+    // a complex: red on its bright side, a bright star's blue glow in the middle, the dust lit yellow-orange on the
+    // other, brightest along its lit faces and fading out into the gas
+    let red = smoothstep(-0.3, 0.5, (qx * ax + qy * ay).clamp(-1.0, 1.0));
+    [
+        0.65 * light * red * (gas + 0.4 * knot),
+        0.0,
+        (glow(0.5, 0.1) + glow(0.25, 0.3)) * (0.7 + 0.3 * gas_f.min(1.0)) + 0.2 * light * gas,
+        0.75 * depth,
+        0.9 * light * (1.0 - red) * gas * (0.3 + 0.5 * lit * smoothstep(DUST - 5.0 * RIM, DUST, fs)),
+    ]
 }
 
 /// The sprite level a lookup of `texel` radians reads for a cloud of angular `radius`: the finest whose texel
@@ -394,17 +569,20 @@ impl Nebulas {
             let (e1, e2) = (t1 * ca + t2 * sa, t2 * ca - t1 * sa);
             let cos_reach = (1.05 * radius).cos();
             let holds_stars = c.kind != NebulaKind::Dark && star_gain > 0.0 && !star_colors.is_empty();
-            let cos_star_reach = if holds_stars { (0.6 * radius + STAR_REACH2.sqrt().asin()).min(PI).cos() } else { cos_reach };
+            // the bright star that lights a glowing cloud is its first embedded star: in the middle of a complex and a
+            // reflection glow, on an emission sheet's bright side (where its sprite's light comes from)
+            let star = sprites.defs[i].star;
+            let lighting = (centre + (e1 * star.0 + e2 * star.1) * radius.tan()).normalize();
+            let lighting_off = ((star.0 * star.0 + star.1 * star.1).sqrt() * radius.tan()).atan();
+            let cos_star_reach = if holds_stars { ((0.6 * radius).max(lighting_off) + STAR_REACH2.sqrt().asin()).min(PI).cos() } else { cos_reach };
             placed.push(Placed { index: i, centre, e1, e2, radius, tan_radius: radius.tan(), cos_reach, cos_star_reach, weight });
             if holds_stars {
                 let count = 3 + (hash01(i as i32, 6, 0, seed) * 6.0) as usize;
-                // a reflection glow and a complex are lit by a bright star in their middle
-                let lit = matches!(c.kind, NebulaKind::Reflection | NebulaKind::Complex);
                 for k in 0..count {
                     let h = |m: i32| hash01(i as i32, 10 + 4 * k as i32 + m, 0, seed);
-                    let (a, off) = (TAU * h(0), if lit && k == 0 { 0.0 } else { 0.6 * radius * h(1).sqrt() });
-                    let dir = (centre * off.cos() + (e1 * a.cos() + e2 * a.sin()) * off.sin()).normalize();
-                    let magnitude = if lit && k == 0 { 3.0 + 0.5 * h(2) } else { 3.0 + 3.0 * h(2) };
+                    let (a, off) = (TAU * h(0), 0.6 * radius * h(1).sqrt());
+                    let dir = if k == 0 { lighting } else { (centre * off.cos() + (e1 * a.cos() + e2 * a.sin()) * off.sin()).normalize() };
+                    let magnitude = if k == 0 { 3.0 + 0.5 * h(2) } else { 3.0 + 3.0 * h(2) };
                     let colour = star_colors[((h(3) * star_colors.len() as f32) as usize).min(star_colors.len() - 1)];
                     stars.push(Embedded { cloud: placed.len() - 1, dir, flux: star_gain * 10.0f32.powf(0.4 * (STAR_MAG_LIMIT - magnitude)) * weight, colour });
                 }

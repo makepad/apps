@@ -73,7 +73,7 @@ fn seq(app: &TestApp) -> u64 {
 /// (`fab live work`, logged once a complete slice's toolpaths are in). A slice that traced
 /// nothing is the settings-only input: an edit's input of the re-evaluated plate follows it.
 fn resliced(app: &TestApp, from: u64) -> bool {
-    let lines = app.log_since(from).map(|t| t.lines).unwrap_or_default();
+    let lines = app.log_since(from).expect("the app's log").lines;
     lines.iter().rposition(|l| l.contains("fab live edit:")).is_some_and(|edit| lines[edit..].iter().any(|l| l.contains("fab live work:") && !l.contains("traced 0 planned 0")))
 }
 
@@ -283,7 +283,7 @@ fn slicing_is_on_demand_and_the_camera_and_the_colours_stay(app: TestApp) {
         assert_eq!(slice_state(&app, false), "Off", "the state must stay Off after an edit in Normal");
         std::thread::sleep(Duration::from_millis(50));
     }
-    let sent: Vec<String> = app.log_since(from).map(|t| t.lines).unwrap_or_default().into_iter().filter(|l| l.contains("fab live edit:")).collect();
+    let sent: Vec<String> = app.log_since(from).expect("the app's log").lines.into_iter().filter(|l| l.contains("fab live edit:")).collect();
     assert!(sent.is_empty(), "an edit in Normal sent a slice input: {sent:?}");
     let normal = capture(&app);
     let normal_widgets = app.widget_snapshot();

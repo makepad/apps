@@ -1,0 +1,156 @@
+use mod.math.*
+use mod.pod.*
+/** The pure timing and lyric helpers (`mod.forms`): `mod.motion` and `mod.scene` both
+ *  re-export them. Plain Splash of the math and pod modules only, nothing
+ *  Motion-specific (makepad-motion3d reads this file too). */
+/** A seeded hash in 0..1 (flicker per frame: `hash01(floor(t * 60), i)`). */
+mod.forms.hash01 = fn(a, b) { return fract(sin(a * 12.9898 + b * 78.233) * 43758.5453) }
+/** The words ({text start end line}) of the `nth` sung line containing the word
+ *  `word` as sung: `let L = lyric_line(voice(@song), "harbor", 0)`, then `L[3].start`
+ *  (the document's own seconds, the clock its `t` is on). With `after`, the nth such
+ *  line at or after that second: `lyric_line(voice(@song), "harbor", 0, 0.0)` is the
+ *  first one from this plate's own start. */
+mod.forms.lyric_line = fn(voice, word, nth = 0, after = nil) {
+    var k = 0
+    for w in voice.words {
+        if w.text == word && (after == nil || w.start >= after) {
+            if k == nth {
+                let out = []
+                for v in voice.words { if v.line == w.line { out.push(v) } }
+                return out
+            }
+            k = k + 1
+        }
+    }
+    return [{text: word start: 0.0 end: 0.5 line: -1}]
+}
+/** The `nth` sung word whose text is `text` ({text start end line}); with
+ *  `after`, the nth at or after that second: `lyric_word(voice(@song), "drop", 0, 0.0)`. */
+mod.forms.lyric_word = fn(voice, text, nth = 0, after = nil) {
+    var k = 0
+    for w in voice.words {
+        if w.text == text && (after == nil || w.start >= after) {
+            if k == nth { return w }
+            k = k + 1
+        }
+    }
+    return {text: text start: 0.0 end: 0.5 line: -1}
+}
+/** The words of the first sung line that starts at or after second `t` (`nth` more
+ *  lines on): `lyric_line_after(voice(@song), 0.0)` is the first line of this plate. */
+mod.forms.lyric_line_after = fn(voice, t, nth = 0) {
+    var k = 0
+    var last = -1
+    for w in voice.words {
+        if w.line != last {
+            last = w.line
+            if w.start >= t {
+                if k == nth {
+                    let out = []
+                    for v in voice.words { if v.line == w.line { out.push(v) } }
+                    return out
+                }
+                k = k + 1
+            }
+        }
+    }
+    return [{text: "" start: t end: t + 0.5 line: -1}]
+}
+/** An odometer wheel's position (0..10) for the digit 10^k of a continuous count:
+ *  the units wheel rests on the rounded digit (a detent) and rolls between; a
+ *  higher wheel turns only while the one below carries. */
+let wrap10 = fn(x) { return x - 10.0 * floor(x / 10.0) }
+mod.forms.wrap10 = wrap10
+mod.forms.drum_pos = fn(count, k) {
+    if k == 0 {
+        let r = floor(count + 0.5)
+        let f = count - r
+        return wrap10(r + sign(f) * 0.5 * smoothstep(0.38, 0.5, abs(f)))
+    }
+    let p = pow(10.0, k)
+    let q = floor(count / p)
+    return wrap10(q + clamp(count - q * p - (p - 0.5), 0.0, 1.0))
+}
+/** Pass helpers for engraving and hairlines (the reference's glsl/common.ts line
+ *  idioms, as Splash shader functions): `helpers: engrave_helpers` in a `Pass{}`, or
+ *  `helpers: engrave_helpers{mine: fn(x: float) -> float {..}}` with helpers of your own. `px` is physical pixels per output pixel (a Scene3D's `antialias`): lines
+ *  keep their 1x ink at any supersampling. `hatch(u, darkness, px)` engraving lines at
+ *  integer u, `eline_lod(u, w, spacing, px)` lines that keep `spacing` output px on
+ *  screen at any distance (new lines fade in between old ones, like mips),
+ *  `px_line(d, a, b, px)` the `1 - smoothstep(a, b, d)` hairline, `ramp_line`. */
+mod.forms.engrave_helpers = {
+    lk_sat: fn(x: float) -> float { return clamp(x, 0.0, 1.0) }
+    lk_fw: fn(x: float) -> float { return abs(dFdx(x)) + abs(dFdy(x)) }
+    lk_ss3: fn(t: float) -> float { return t * t * t * (1.0 - 0.5 * t) }
+    ink_half_width: fn(l: float, r: float, xm: float) -> float {
+        let k = max(r - l, 0.000001)
+        let x = min(xm, r)
+        return x - k * (self.lk_ss3(self.lk_sat((x - l) / k)) - self.lk_ss3(self.lk_sat((0.0 - l) / k)))
+    }
+    box_line: fn(x: float, m: float, r0: float) -> float { let r = max(r0, 0.000001) return self.lk_sat((min(x + r, m) - max(x - r, 0.0 - m)) / (2.0 * r)) }
+    px_line: fn(d: float, a: float, b: float, px: float) -> float {
+        if px <= 1.0 { return 1.0 - smoothstep(a, b, d) }
+        return self.box_line(d, self.ink_half_width(a, b, 1000000000.0) * px, 0.5 * (b - a))
+    }
+    ramp_line: fn(d: float, hw: float, aa: float, px: float) -> float {
+        if px <= 1.0 { return self.lk_sat((hw - d) / aa + 0.5) }
+        let al = aa * px
+        let e = max(hw + 0.5 * al, 0.0)
+        return self.box_line(d, if hw >= 0.5 * al { hw } else { e * e / (2.0 * al) }, 0.5 * aa)
+    }
+    hatch: fn(u: float, darkness: float, px: float) -> float {
+        let f = abs(fract(u) - 0.5)
+        let half_w = 0.5 * self.lk_sat(darkness)
+        let aa = max(self.lk_fw(u), 0.0001)
+        if px <= 1.0 { return 1.0 - smoothstep(half_w - aa, half_w + aa, 0.5 - f) }
+        let aal = aa * px
+        let x = 0.5 - f
+        let m = self.ink_half_width(half_w - aal, half_w + aal, 0.5)
+        return min(self.box_line(x, m, aa) + self.box_line(1.0 - x, m, aa), 1.0)
+    }
+    eline: fn(u: float, w: float, px: float) -> float {
+        let d = abs(u - floor(u + 0.5))
+        let aa = max(self.lk_fw(u), 0.0001) * 0.7
+        return self.ramp_line(d, w * 0.5, aa, px) * smoothstep(0.0, 0.05, w)
+    }
+    eline_lod: fn(u: float, w: float, spacing: float, px: float) -> float {
+        let fu = max(self.lk_fw(u), 0.00001) * px
+        let k = clamp(0.0 - log2(fu * spacing), -1.0, 3.0)
+        let kf = floor(k)
+        let kr = k - kf
+        return mix(self.eline(u * exp2(kf), w, px), self.eline(u * exp2(kf + 1.0), w, px), smoothstep(0.0, 1.0, kr))
+    }
+}
+/** The reference film's timing toolbox (PDOOM-PARITY, LK1's shoggoth trace; its licence is in
+ *  CREDITS.md); `spring_step`, `prog` and `pulse` are the shared stdlib's. */
+/** 0 before `a`, up over `fade_in`, held, down over `fade_out` ending at `b`. */
+mod.forms.window01 = fn(x, a, b, fade_in, fade_out) {
+    return min(clamp((x - a) / fade_in, 0.0, 1.0), 1.0 - clamp((x - (b - fade_out)) / fade_out, 0.0, 1.0))
+}
+/** The 60 fps frame a time belongs to, constant over the frame's motion-blur shutter:
+ *  key per-frame flicker on it (`hash01(frame_idx(t), i)`), never on `floor(t * 60)`,
+ *  which double-exposes two states in every blurred frame. */
+mod.forms.frame_idx = fn(t) { return floor(t * 60.0 + 0.5) }
+/** The beat grid as a continuous index over analysed beat times (`music(@m).beats`):
+ *  0 at the first beat, fractional between, extrapolated at the ends. */
+mod.forms.beat_at = fn(beats, t) {
+    let n = beats.len()
+    if n < 2 { return 0.0 }
+    if t <= beats[0] { return (t - beats[0]) / (beats[1] - beats[0]) }
+    if t >= beats[n - 1] { return (n - 1) + (t - beats[n - 1]) / (beats[n - 1] - beats[n - 2]) }
+    var lo = 0
+    var hi = n - 1
+    for k in 0..40 { if hi - lo > 1 { let m = floor((lo + hi) / 2) if beats[m] <= t { lo = m } else { hi = m } } }
+    return lo + (t - beats[lo]) / (beats[hi] - beats[lo])
+}
+/** The time of a (fractional) beat index: `time_of_beat(b, floor(beat_at(b, t)))` is
+ *  the beat just passed; `ceil(beat_at(b, t) * 2.0) / 2.0` snaps to the next eighth. */
+mod.forms.time_of_beat = fn(beats, i) {
+    let n = beats.len()
+    if n < 2 { return 0.0 }
+    let period = (beats[n - 1] - beats[0]) / (n - 1)
+    if i <= 0.0 { return beats[0] + i * period }
+    if i >= n - 1 { return beats[n - 1] + (i - (n - 1)) * period }
+    let k = floor(i)
+    return beats[k] + (beats[k + 1] - beats[k]) * (i - k)
+}

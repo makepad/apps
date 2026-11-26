@@ -23,6 +23,9 @@ pub struct LiveRequest {
     pub ev: Arc<fab_model::eval::Evaluated>,
     pub key: String,
     pub value: PValue,
+    /// The change that writes the value when no parameter of the model holds it (a command's at a
+    /// pick: a round); none: `key`'s own.
+    pub change: Option<fab_model::Change>,
     /// The plate's distance-field parts: (object, its model's whole placement on the printer).
     pub parts: Vec<(String, [[f64; 4]; 3])>,
     pub asked: Instant,
@@ -74,8 +77,11 @@ impl LiveWorker {
 
 #[allow(clippy::type_complexity)]
 fn build(req: &LiveRequest) -> Result<(Vec<(String, PartSdf)>, Vec<Arc<fab::params::PartParamsView>>), String> {
-    let live = Arc::new(params::with_value(&req.program, &req.model, &req.key, &req.value)?);
     let inst = fab_model::program::split_id(&req.key).and_then(|(name, _)| req.program.instance(name)).ok_or_else(|| format!("no instance for '{}'", req.key))?;
+    let live = Arc::new(match &req.change {
+        Some(change) => params::with_change(inst, change)?,
+        None => params::with_value(&req.program, &req.model, &req.key, &req.value)?,
+    });
     drag_grown(req, inst, &live);
     let fields = fab_model::eval::part_fields(inst, &live, &req.program.strokes);
     let model = params::model_with(&req.program, &req.ev, &req.model, &inst.name, &live);

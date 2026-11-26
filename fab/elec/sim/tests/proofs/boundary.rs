@@ -36,6 +36,7 @@ fn boundary_sources_follow_tables_across_rounds() {
     let load = circuit.node("load");
     // Put the current first to exercise both kinds in a single bank, with no branch for it.
     circuit.devices.boundary.push(Boundary { name: "ib".into(), node: load, kind: BoundaryKind::Current, v0: 2e-3 });
+    let voltage = circuit.devices.boundary.len() as u32;
     circuit.devices.boundary.push(Boundary { name: "vb".into(), node: input, kind: BoundaryKind::Voltage, v0: 0.75 });
     circuit.r("load_r", "load", "0", 500.0);
     circuit.r("r", "in", "out", 1e3);
@@ -131,4 +132,51 @@ fn boundary_sources_follow_tables_across_rounds() {
         assert_eq!(whole.at.last(), Some(&stop), "{mode}: the whole-table run finishes");
         assert_eq!(rounds.at.last(), Some(&stop), "{mode}: the two-round run finishes");
     }
+
+    // A ghost resistor between the local load and the late voltage makes the local voltage
+    // move in the same solve as the echo. Sample its boundary row across successive feeds.
+    circuit.r("ghost", "load", "in", 500.0);
+    let echo = circuit.devices.boundary.len() as u32;
+    circuit.devices.boundary.extend([
+        Boundary { name: "echo".into(), node: load, kind: BoundaryKind::Echo { of: voltage }, v0: 0.0 },
+        Boundary { name: "echo#gain".into(), node: 0, kind: BoundaryKind::EchoGain { echo }, v0: 0.0 },
+    ]);
+    let knots = vec![0.0, 2.0 * delay];
+    let history = Arc::new(Table { t: knots.clone(), v: vec![0.0, 0.5], events: vec![1], edges: vec![] });
+    let gains = Arc::new(Table { t: knots, v: vec![-1.0, 1.0], events: vec![0], edges: vec![0] });
+    let mut solver = Solver::new(&circuit).expect("the ghost and its echo build");
+    let (bank, _) = solver.find_device("vb").unwrap();
+    let check_voltage = |solver: &mut Solver, t: f64, g: f64| {
+        let mut cx = solver.base_cx();
+        cx.tran = true;
+        cx.bypass = true;
+        cx.t = t;
+        solver.newton(&cx, false, None, &Default::default(), solver.opts.itl4).expect("the boundary row solves");
+        let expected = table.value(t - delay) + g * (solver.x[load as usize] - history.value(t - delay));
+        let actual = solver.x[input as usize];
+        assert!((actual - expected).abs() < ROUNDING, "at {t:e} with g {g}, the corrected voltage is {actual}, expected {expected}");
+    };
+    let static_g = 0.375;
+    assert!(solver.set_param("echo", "g", static_g));
+    assert!(solver.feed("vb", table.clone(), delay));
+    assert!(solver.feed("echo", history.clone(), delay));
+    check_voltage(&mut solver, delay, static_g);
+
+    assert!(solver.feed("echo#gain", gains.clone(), delay));
+    assert_eq!(solver.banks[bank].next_break(0.0), table.t[64] + delay, "only the voltage table adds a step break");
+    assert!(!solver.banks[bank].plain_break_at(3.0 * delay), "the echo history's event is only data");
+    assert!(!solver.banks[bank].edge_break_at(delay), "the gain's edge is only data");
+    check_voltage(&mut solver, 1.5 * delay, -0.5);
+    check_voltage(&mut solver, 2.5 * delay, 0.5);
+
+    let gap = Arc::new(Table { t: vec![], v: vec![], events: vec![], edges: vec![] });
+    assert!(solver.feed("echo#gain", gap, delay));
+    check_voltage(&mut solver, 2.75 * delay, 0.0);
+    assert!(solver.feed("echo#gain", gains.clone(), delay));
+    check_voltage(&mut solver, 3.0 * delay, 1.0);
+
+    // A static echo (the plan's screen) keeps its static g, whatever a gain table says.
+    assert!(solver.set_param("echo", "exported", 0.0));
+    assert!(solver.feed("echo#gain", gains, delay));
+    check_voltage(&mut solver, 3.0 * delay, static_g);
 }

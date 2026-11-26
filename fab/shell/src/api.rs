@@ -559,6 +559,7 @@ pub enum Tool {
     #[default]
     Select,
     Measure(MeasureKind),
+    MeasureFit,
     Section,
     /// The Sliced view's bed tool: a drag on the bed draws an area no tree may stand or grow
     /// in (a rectangle; with Alt a disc), `m.no_trees` in the nearest object's script.
@@ -579,6 +580,7 @@ impl Tool {
             Tool::Measure(MeasureKind::EdgeLength) => "Measure Edge",
             Tool::Measure(MeasureKind::Radius) => "Measure Radius",
             Tool::Measure(MeasureKind::FaceDistance) => "Measure Faces",
+            Tool::MeasureFit => "Measure Fit",
             Tool::Section => "Section",
             Tool::NoTrees => "No trees here",
             Tool::SettingsHere => "Print settings here",
@@ -601,6 +603,9 @@ pub struct ViewportState {
     pub orbit_style: OrbitStyle,
     /// How parts are lit and drawn: the person's choice, saved on this machine.
     pub shading: Shading,
+    pub colours: fab_plate::ColourMode,
+    /// Used rows missing a spool RGB, updated when the printer mapping changes.
+    pub missing_spool_colours: usize,
     /// The parts' look: the person's choice, kept for the next session.
     pub look: PartLook,
     /// View > Drag Detail: how fine each version under the hand is, for every part.
@@ -646,6 +651,8 @@ impl Default for ViewportState {
             mirror_plane: [0.0, 0.0, 1.0, 0.0],
             orbit_style: OrbitStyle::Turntable,
             shading: Shading::Realtime,
+            colours: Default::default(),
+            missing_spool_colours: 0,
             look: crate::view_prefs::default_look(),
             drag_detail: crate::view_prefs::load_drag_detail(),
             sliced_detail: crate::view_prefs::load_sliced_detail(),
@@ -1441,6 +1448,8 @@ pub struct UiState {
     /// The open document's name and a short line about it (parts, build).
     pub document_name: String,
     pub document_info: String,
+    /// The plate is also open in another Fab window (the caption's icon).
+    pub also_open: bool,
     /// The nozzle-zone overlay on the plate (each nozzle's reach, keep-outs,
     /// ceilings): off by default, on while its chip is toggled.
     pub show_zones: bool,
@@ -1625,6 +1634,7 @@ impl Default for UiState {
             page: None,
             document_name: String::new(),
             document_info: String::new(),
+            also_open: false,
             show_zones: false,
             camera_pip: false,
             gizmo: GizmoMode::Off,
@@ -2021,6 +2031,8 @@ impl PlatePart {
 pub struct PlateInfo {
     /// Printed parts first (slicer indices), followed by excluded placements.
     pub parts: Vec<PlatePart>,
+    /// The project's requested shelf-pack gap in mm, before any sequential-print clearance.
+    pub arrange_gap: Option<f64>,
     pub nozzles: Vec<String>,
     /// The print colours (the project's, then implicit ones); where each prints is the
     /// printer mapping's (`PrintState::colors`).
@@ -2173,6 +2185,8 @@ pub enum PartAction {
     Drop { object: String },
     /// Spread every part over the plate.
     Arrange,
+    /// Change the spacing of the free parts, keeping explicit placements.
+    SetArrangeGap(f64),
     DuplicateLinked { object: String },
     DuplicateCopy { object: String },
     Delete { object: String },
@@ -2388,6 +2402,44 @@ pub enum ShapeOp {
     Split,
 }
 
+pub const FIT_DIFFERENT_PARTS: &str = "Measure Fit needs two different parts. Pick the seating face on the other part.";
+
+/// A placed part and the plane clicked on it, in plate coordinates (point in mm).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FitPick {
+    /// The display element supplies the ghost copy's colour in this scene.
+    pub element: ElementId,
+    pub part: String,
+    pub point: [f64; 3],
+    pub normal: [f64; 3],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FitGap {
+    pub from: [f64; 3],
+    pub to: [f64; 3],
+    pub distance_mm: f64,
+    pub direction: [f64; 3],
+}
+
+/// A transient fit, expressed in plate mm for the view.
+#[derive(Debug)]
+pub struct PlateFit {
+    pub part_b: String,
+    /// Row-major affine from B's placed mesh to its fitted pose, both in plate mm.
+    pub ghost: [[f64; 4]; 3],
+    /// Upload-ready fitted geometry, taken once on the UI thread and shared by the plate panes.
+    pub ghost_mesh: std::sync::Mutex<Option<RenderBatch>>,
+    /// In the seating face's +u, -u, +v, -v order.
+    pub gaps: [Option<FitGap>; 4],
+    pub smallest: Option<usize>,
+    pub seat: bool,
+    pub overlap_mm3: f64,
+    /// The eight corners of the interference box. Bits 0, 1, 2 select high model X, Y, Z.
+    pub overlap_bounds: Option<[[f64; 3]; 8]>,
+    pub turn: f64,
+}
+
 /// A finished measurement.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Measurement {
@@ -2482,6 +2534,7 @@ pub struct AppState {
     pub progress_card: Option<ProgressCard>,
     /// The plates and the demos (File > Open Recent shows the newest plates).
     pub plates: PlateList,
+    pub journal: crate::ui::journal_panel::JournalPage,
     pub ui: UiState,
     pub tool: Tool,
     pub snap: SnapOptions,
@@ -2504,6 +2557,12 @@ pub struct AppState {
     pub params: crate::params::ParamState,
     /// The program as text and its features (the Design workspace's code and tree).
     pub source: crate::ui::code::SourceState,
+    /// The selected part's build steps, and the step the view shows ([`crate::ui::steps`]).
+    pub steps: crate::ui::steps::StepsState,
+    /// Elements drawn see-through in the plate view's ghost pass besides the parts, with their
+    /// colours: a step view's whole part ([`crate::ui::steps`]). A joint check keeps its own turns
+    /// in `mech.check.ghosts`; [`AppState::extra_ghosts`] reads both.
+    pub ghost_copies: Vec<(ElementId, [f32; 4])>,
     /// The Mechanics workspace: the live sim's state as the panel shows it.
     pub mech: MechView,
     /// The Arm workspace (experimental): the arm cell's run as the panel and the cell view show it.
@@ -3643,6 +3702,7 @@ impl Default for AppState {
             load: LoadStatus::Idle,
             progress_card: None,
             plates: PlateList::default(),
+            journal: Default::default(),
             ui: UiState::default(),
             tool: Tool::Select,
             snap: SnapOptions::default(),
@@ -3660,6 +3720,8 @@ impl Default for AppState {
             glass_parts: GlassParts::default(),
             params: Default::default(),
             source: Default::default(),
+            steps: Default::default(),
+            ghost_copies: Vec::new(),
             mech: Default::default(),
             arm: ArmView::default(),
             scan: ScanView::default(),
@@ -3922,6 +3984,9 @@ impl AppState {
         if let Some(lighting) = crate::view_prefs::load_board_lighting() {
             self.view.board_lighting = lighting;
         }
+        if let Some(mode) = crate::view_prefs::load_colours() {
+            self.view.colours = mode;
+        }
         if let Some(shading) = crate::view_prefs::load_shading() {
             self.view.shading = shading;
         }
@@ -3962,6 +4027,50 @@ impl AppState {
         }
     }
 
+    /// The palette facts the badge depends on, including a switch between two held jobs.
+    pub fn colour_notice_tools(&self) -> (usize, bool) {
+        if self.print.monitor_holds() {
+            return self.print.follow.shown().map_or((0, false), |job|
+                (job.meta.shared_colour_tools.len(), job.meta.model_colours.is_empty()));
+        }
+        (self.print.showing().map_or(0, |p| p.colours.shared_tools.len()), false)
+    }
+
+    /// The explanation shown under the viewport colour switch and returned by fab.colour_mode.
+    pub fn colour_notice(&self) -> Option<String> {
+        let held = self.print.monitor_holds();
+        let sliced = self.print.play.active || held;
+        let diagnostic = (sliced && (held || !self.print.finish) && self.print.play.color != crate::print::ColorBy::Filament)
+            .then(|| format!("Colouring by {}, not by colour", self.print.play.color.label().to_lowercase()));
+        if sliced && self.view.colours == fab_plate::ColourMode::Model {
+            let (shared, legacy) = self.colour_notice_tools();
+            let palette = match (legacy, shared) {
+                (true, _) => Some("This job was saved before model colours were kept: it shows its spool colours".to_string()),
+                (_, 0) => None,
+                (_, 1) => Some("1 tool prints several model colours; each shows its first".to_string()),
+                (_, n) => Some(format!("{n} tools print several model colours; each shows its first")),
+            };
+            return match (diagnostic, palette) {
+                (Some(by), Some(why)) => Some(format!("{by}. {why}")),
+                (by, why) => by.or(why),
+            };
+        }
+        if diagnostic.is_some() { return diagnostic; }
+        // A held job uses the palettes at send time, including after a different printer links.
+        if held { return None; }
+        if self.view.colours == fab_plate::ColourMode::Material {
+            if self.print.target_printer().is_none() {
+                return Some("No printer linked: every colour shows red until one is (pick a virtual printer in the Printer panel)".into());
+            }
+            match self.view.missing_spool_colours {
+                0 => {}
+                1 => return Some("1 colour has no spool colour (red)".into()),
+                n => return Some(format!("{n} colours have no spool colour (red)")),
+            }
+        }
+        None
+    }
+
     /// The plate view's render mode.
     pub fn render_mode(&self) -> RenderMode {
         if self.force_shown() {
@@ -3979,7 +4088,25 @@ impl AppState {
     /// The slice view shows the print and parts cannot be edited under it: only the printer's
     /// Monitor. In Design the plate stays editable under the slice.
     pub fn slice_blocks_edits(&self) -> bool {
-        (self.print.play.active && !self.ui.in_mode(PlateMode::Design)) || self.print.monitor_holds() || self.plate.whole.is_some()
+        (self.print.play.active && !self.ui.in_mode(PlateMode::Design)) || self.print.monitor_holds() || self.plate.whole.is_some() || self.steps.busy.is_some()
+    }
+
+    /// Whether commands can use picks on the surface the person currently sees.
+    pub fn pick_tool_block_reason(&self) -> Option<String> {
+        if let Some(i) = self.steps.marker {
+            if let Some(f) = self.steps.chips.get(i).and_then(|c| c.made_in.as_ref()) {
+                return Some(crate::ui::steps::fn_tool_reason(f));
+            }
+            if self.steps.preview_off.is_some() || self.steps.busy.is_some() || self.steps.shown != Some(i) || self.steps.installed != Some(self.scene_revision) {
+                return Some("Wait for the committed step to show in Design.".into());
+            }
+        } else if self.plate.whole.is_some() {
+            return Some("Return to the whole part to use a pick tool.".into());
+        }
+        if !self.ui.in_mode(PlateMode::Design) || self.print.monitor_holds() || (self.steps.marker.is_some() && self.print.play.active) {
+            return Some("Use the model view in Design for pick tools.".into());
+        }
+        None
     }
 
     /// The Program beside the plate or gone (the code toggle): a split of the area holding the
@@ -4177,7 +4304,7 @@ impl AppState {
             return false;
         }
         !self.plate.parts[part].arriving
-            && !self.mech.check.ghosts.iter().any(|(e, _)| *e == id)
+            && !self.extra_ghosts().any(|(e, _)| *e == id)
             && !(self.force_deforms() && self.heatmap_part() == Some(part))
             && !self.view.see.drawn.contains(&id)
             && !self.part_unposed(part)
@@ -4200,7 +4327,7 @@ impl AppState {
     pub fn is_ghost_under(&self, poses: PanePoses, id: ElementId) -> bool {
         let part = self.glass_parts.elements.get(&id).map(|&(part, _)| part).or_else(|| self.plate.part_of(id));
         part.is_some_and(|i| self.plate.parts[i].arriving || (!self.plate.parts[i].printed && !self.plate.parts[i].insert && !self.assembled_under(poses, id)))
-            || self.mech.check.ghosts.iter().any(|(e, _)| *e == id)
+            || self.extra_ghosts().any(|(e, _)| *e == id)
     }
 
     /// Whether `poses` includes this part in an assembly, even if it prints on another plate.
@@ -4211,17 +4338,23 @@ impl AppState {
         }
     }
 
-    /// The colour a ghost is drawn in: its part's, or a joint check's ghost's own.
+    /// The elements drawn as ghosts that are not parts: a joint check's turns and a step view's
+    /// whole part.
+    pub fn extra_ghosts(&self) -> impl Iterator<Item = &(ElementId, [f32; 4])> {
+        self.mech.check.ghosts.iter().chain(self.ghost_copies.iter())
+    }
+
+    /// The colour a ghost is drawn in: its part's, or a joint check's or a step view's own.
     pub fn ghost_color(&self, id: ElementId) -> Option<[f32; 4]> {
         match self.plate.part_of(id) {
             Some(i) => Some(self.plate.parts[i].color),
-            None => self.mech.check.ghosts.iter().find(|(e, _)| *e == id).map(|(_, c)| *c),
+            None => self.extra_ghosts().find(|(e, _)| *e == id).map(|(_, c)| *c),
         }
     }
 
     /// Whether the plate view needs its ghost pass under `poses`.
     pub fn ghosts_drawn_under(&self, poses: PanePoses) -> bool {
-        self.test_cut_shown() || self.plate.parts.iter().any(|p| p.element.is_some_and(|e| self.is_ghost_drawn_under(poses, e))) || self.mech.check.ghosts.iter().any(|(e, _)| self.is_ghost_drawn_under(poses, *e))
+        self.test_cut_shown() || self.plate.parts.iter().any(|p| p.element.is_some_and(|e| self.is_ghost_drawn_under(poses, e))) || self.extra_ghosts().any(|(e, _)| self.is_ghost_drawn_under(poses, *e))
     }
 
     /// Whether this element draws in the plate view's ghost pass under `poses`.
@@ -4623,6 +4756,12 @@ impl AppState {
                     self.scene_gpu.borrow_mut().product_scene = None;
                 }
                 self.keep_plate_view(id);
+                true
+            }
+            SetColourMode(mode) => {
+                if self.view.colours == *mode { return false; }
+                self.view.colours = *mode;
+                crate::view_prefs::save_colours(*mode);
                 true
             }
             SetShading(shading) => {
@@ -5254,6 +5393,9 @@ pub enum ShellAction {
 
     // ---- tools ----
     SetTool(Tool),
+    TurnFit,
+    ClearFit,
+    MeasureFit { a: FitPick, b: FitPick, turn: f64 },
     SetSection(SectionState),
     AddMeasurement(Measurement),
     /// A finished endpoint drag: one document transaction on release.
@@ -5271,6 +5413,7 @@ pub enum ShellAction {
     SetPaneLink { pane: PaneId, link: PaneLink },
     SetPaneMode { pane: PaneId, mode: PaneMode },
     SetShading(Shading),
+    SetColourMode(fab_plate::ColourMode),
     SetPartLook(PartLook),
     SetDragDetail(fab_sdf_tiles::trace::DragDetail),
     SetSlicedDetail(SlicedDetail),
@@ -5362,7 +5505,7 @@ pub enum ShellAction {
     /// Turn a 3D model source on or off. EasyEDA on shows its warning instead; it turns on only
     /// with [`ShellAction::AcceptEasyEda`], the person's press on the warning.
     SetModelSource(crate::model_sources::ModelSource, bool),
-    /// The plate's mode, set where it is (the plate's own row): the workspace stays.
+    /// The plate's mode, set in the workspace shown (the workspace tool's `mode`): the workspace stays.
     SetPlateMode(PlateMode),
     /// The person accepted EasyEDA's warning: EasyEDA's models are on, and the time is kept.
     AcceptEasyEda,
@@ -5824,6 +5967,40 @@ mod tests {
         assert!(!state.slice_blocks_edits());
     }
 
+
+    #[test]
+    fn marked_step_blocks_plate_edits_and_admits_tools_only_on_its_installed_scene() {
+        let mut state = AppState::default();
+        assert!(!state.slice_blocks_edits() && state.pick_tool_block_reason().is_none(), "ordinary Design admits placement and modelling");
+        state.steps.chips.push(Default::default());
+        state.steps.marker = Some(0);
+        state.steps.busy = Some(0);
+        assert!(state.slice_blocks_edits(), "the first step request already blocks placement");
+        assert!(state.pick_tool_block_reason().is_some(), "a busy step cannot take a command");
+        state.plate.whole = Some(Default::default());
+        state.steps.shown = Some(0);
+        state.steps.busy = None;
+        assert!(state.pick_tool_block_reason().is_some(), "shown before scene installation is still busy for picking");
+        state.steps.installed = Some(state.scene_revision);
+        assert!(state.slice_blocks_edits(), "a displayed step still blocks plate edits");
+        assert!(state.pick_tool_block_reason().is_none(), "the installed step admits modelling commands");
+        state.steps.shown = None;
+        assert!(state.pick_tool_block_reason().is_some(), "a marker cannot use a different shown solid");
+        state.steps.shown = Some(0);
+        state.scene_revision += 1;
+        assert!(state.pick_tool_block_reason().is_some(), "another scene invalidates the installed step");
+        state.steps.installed = Some(state.scene_revision);
+        state.steps.chips[0].made_in = Some("leg".into());
+        assert_eq!(state.pick_tool_block_reason().as_deref(), Some("This step is made inside fn `leg` and has no statement of its own. Change `leg`, or build on what it returns."), "a function-made step explains how to edit it");
+        state.steps.chips[0].made_in = None;
+        state.ui.enter(Workspace::Monitor);
+        assert!(state.pick_tool_block_reason().is_some(), "Monitor cannot issue a modelling command");
+        state.ui.enter(Workspace::Design);
+        state.steps = Default::default();
+        assert!(state.slice_blocks_edits() && state.pick_tool_block_reason().is_some(), "Test prints pieces have a whole plate and no marked step");
+        state.plate.whole = None;
+        assert!(!state.slice_blocks_edits() && state.pick_tool_block_reason().is_none(), "returning to the whole design restores both kinds of edits");
+    }
 
     /// Framing ignores a stray decode-artifact mesh: a few hundred vertices
     /// far below the plate must not widen the box the camera frames.

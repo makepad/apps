@@ -1,0 +1,23 @@
+use mod.motion.*; use mod.scene
+// A phone-size app run (1080×1920) on 9:19.5 phones. Left: cover, centred.
+// Right: cover following the run's focus track — crop keys from
+// `makepad-edit-tools screen-crop run.json --aspect 9:19.5 --zoom 640`.
+Motion{
+    size: vec2(1920, 1080)
+    duration: 6.0
+    layers: [
+        Scene3D{
+            size: vec2(1920, 1080)
+            videos: {notes: asset("ast_rdevicephoneclipaaaaaaaaaa", "arev_0000000000000000000000000000000000000000000000000000000000000002")}
+            background: #0d1020
+            environment: scene.Environment{preset: @softbox intensity: 1.1}
+            camera: Camera{position: vec3(0, 0.1, 4.2) target: vec3(0, 0, 0) fov: 35}
+            lights: [scene.LightRig{preset: @product}]
+            children: [
+                scene.Device{kind: @phone screen: "notes" position: vec3(-0.75, 0, 0) rotation: vec3(0, 12, 0)}
+                scene.Device{kind: @phone screen: "notes" position: vec3(0.75, 0, 0) rotation: vec3(0, -12, 0)
+                       crop: keys([0.0, [97, 0, 887, 1922]], [5.3, [97, 0, 887, 1922]], [5.316667, [106, 0, 880, 1907]], [5.333333, [126, 0, 865, 1874]], [5.35, [154, 0, 846, 1833]], [5.383333, [215, 0, 802, 1738]], [5.4, [244, 0, 781, 1692]], [5.416667, [271, 0, 762, 1651]], [5.433333, [295, 0, 744, 1612]], [5.45, [317, 0, 729, 1580]], [5.466667, [336, 0, 715, 1549]], [5.483333, [353, 0, 703, 1523]], [5.5, [367, 0, 693, 1501]], [5.516667, [379, 0, 684, 1482]], [5.533333, [390, 0, 677, 1467]], [5.55, [398, 0, 670, 1452]], [5.566667, [406, 0, 665, 1441]], [5.6, [417, 0, 657, 1424]], [5.633333, [424, 0, 652, 1413]], [5.666667, [430, 0, 648, 1404]], [5.7, [433, 0, 645, 1398]], [5.75, [436, 0, 643, 1393]], [5.8, [438, 0, 642, 1391]])}
+            ]
+        }
+    ]
+}

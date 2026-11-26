@@ -242,6 +242,7 @@ mod tests {
     }
     fn proposal(source: ProposalSource) -> RouteEvent {
         RouteEvent::Proposal(RouteProposal {
+            pair: None,
             id: ProposalId(0),
             source,
             unit: BoardId(0),
@@ -412,7 +413,7 @@ mod tests {
             method: Method::Interactive,
             engine: Engine::Grid,
             style: None,
-            effort: Effort(1),
+            effort: Effort::Full,
             layers: None,
             reroute: false,
         });

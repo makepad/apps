@@ -1,0 +1,43 @@
+use mod.motion.*
+// PROGRESS BAR, 9:16 — the portrait cut of shape_progress_bar: the label
+// sits above a bar the width of the safe column, the percentage is large
+// and centred above it (the number is what a phone viewer reads).
+// Why: in a narrow frame the percentage gets the emphasis the bar's
+// length can't.
+let ticks = []
+for i in 0..5 {
+    ticks.push(Rect{at: vec2(99 + i * 210, 820) size: vec2(2, 14) fill: in(@muted)
+                    opacity: tween(0, 0.6, 0.3 + i * 0.05, 0.7 + i * 0.05, @ease_out_cubic)})
+}
+Motion{
+    label: "Progress bar 9:16"
+    brief: "A labelled progress bar filling to a value with a synced percentage; portrait."
+    tags: ["progress", "data", "bar", "ui", "shape", "9:16"]
+    size: vec2(1080, 1920) duration: 4.0
+    inputs: {
+        value: input(@number, 72, "Percent, 0–100")
+        label: input(@text, "Rendering your video", "What is progressing")
+        accent: input(@color, #ff5c39, "Fill and percentage")
+        ink: input(@color, #f4f7fa, "Label")
+        muted: input(@color, #8e9aa7, "Ticks")
+        track: input(@color, #ffffff1a, "Empty track")
+        background: input(@color, #0b0d12, "Ground")
+    }
+    layers: [
+        Rect{size: vec2(1080, 1920) fill: in(@background)}
+        Group{
+            y: keys([0.0, 30], [0.6, 0, @ease_out_expo], [3.6, 0], [4.0, -20, @ease_in_cubic])
+            opacity: keys([0.0, 0], [0.35, 1, @ease_out_cubic], [3.6, 1], [4.0, 0, @ease_in_cubic])
+            layers: [
+                Text{number: tween(0, in(@value), 0.4, 2.4, @ease_in_out_cubic) suffix: "%" tabular: true
+                     font: Font{family: "Inter" weight: 800} size: 160 tracking: -0.04 color: in(@accent) at: vec2(520, 520) wrap: 840 align: @center}
+                Text{text: in(@label) font: Font{family: "Inter" weight: 600} size: 44 color: in(@ink) at: vec2(520, 700) wrap: 840 align: @center}
+                Rect{at: vec2(100, 780) size: vec2(840, 16) radius: 8 fill: in(@track)}
+                Rect{at: vec2(100, 780) size: tween(vec2(16, 16), vec2(in(@value) * 8.4, 16), 0.4, 2.4, @ease_in_out_cubic) radius: 8 fill: in(@accent)}
+                Ellipse{at: tween(vec2(86, 766), vec2(78 + in(@value) * 8.4, 766), 0.4, 2.4, @ease_in_out_cubic) size: vec2(44, 44)
+                        fill: in(@accent) feather: 24 opacity: keys([0.0, 0.0], [0.4, 0.9], [2.4, 0.9], [2.9, 0.0, @ease_out_cubic])}
+                Group{layers: ticks}
+            ]
+        }
+    ]
+}

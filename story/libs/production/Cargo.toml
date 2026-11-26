@@ -1,0 +1,19 @@
+# A new video from one ask: the production record and its steps (lyrics,
+# music, timing, storyboard, scenes, edit), the lyric writer's and the
+# storyboard's briefs and answers, the song timing module and the edit's
+# source. Pure: Stage runs the steps.
+[package]
+name = "makepad-story-production"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+makepad-strict-json = { path = "../../../../../libs/strict_json" }
+# The storyboard the Storyboard step writes.
+makepad-story-storyboard = { path = "../../../../apps/story/libs/storyboard" }
+
+[dev-dependencies]
+# Proves the edit source loads as an edit.
+makepad-story-cut = { path = "../cut" }

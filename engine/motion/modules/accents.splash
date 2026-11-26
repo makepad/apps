@@ -1,0 +1,451 @@
+// Shape accents for Draw2D layers: bursts, confetti, ring pulses, running arcs, swooshes and arrows, speed lines, a target, and four loaders.
+//
+// The one-shots take `u`, their progress 0..1 (`prog(t, start, end)`): they are empty at 0 and at 1,
+// so an accent needs no span of its own and can be scrubbed. The loaders take seconds and loop.
+// Sizes are layer units, angles degrees clockwise from 3 o'clock (y is down), colours are colours
+// as elsewhere in Motion. Every accent draws in `color`; where it has more than one part the
+// second and third take `color2` and `color3` (defaults: warm white, signal orange, cyan).
+//
+//   use mod.motion.modules.accents.*
+//   Draw2D{draw: fn(c, t, edit) {
+//       accent_burst(c, 960, 540, prog(t, 0.2, 0.9), {count: 12 radius: 220})
+//       accent_ring(c, 960, 540, prog(t, 0.25, 1.1), {radius: 260 sides: 4})
+//       accent_confetti(c, 960, 540, prog(t, 0.2, 1.4), {count: 16 radius: 320})
+//   }}
+
+let acc_tau = 6.283185307179586
+let acc_rad = 0.017453292519943295
+// The palette of an accent: its three colours.
+let acc_cols = fn(o) { return [o.color ?? #f2efe8, o.color2 ?? #ff5a1f, o.color3 ?? #2fd6e0] }
+// Where a stroke's head and tail are along its path at progress u: the head runs first, the
+// tail starts `lag` (0..0.9) of the move later, both eased in and out.
+let acc_head = fn(u, lag) { return ease_in_out_cubic(clamp(u / (1.0 - lag), 0.0, 1.0)) }
+let acc_tail = fn(u, lag) { return ease_in_out_cubic(clamp((u - lag) / (1.0 - lag), 0.0, 1.0)) }
+// The path f(s) -> [x, y] from s = a to b as n + 1 points.
+let acc_sample = fn(f, a, b, n) {
+    let pts = []
+    for i in 0..(n + 1) { pts.push(f(a + (b - a) * i / n)) }
+    return pts
+}
+// A regular polygon or star around (x, y): `sides` corners at radius r, turned `rot` radians;
+// `star` (0..1) pulls a point between every two corners in to r * star.
+let acc_polygon = fn(x, y, r, sides, rot, star) {
+    let pts = []
+    let n = if star > 0.0 { sides * 2.0 } else { sides }
+    for i in 0..n {
+        let a = rot + acc_tau * i / n
+        let k = if star > 0.0 && mod(i, 2.0) > 0.5 { star } else { 1.0 }
+        pts.push([x + cos(a) * r * k, y + sin(a) * r * k])
+    }
+    return pts
+}
+
+// Rays shot out of a point: each is drawn on from the centre outward and wiped the same way, so
+// it reads as a short stroke flying out.
+// `count` rays (1..64), out to `radius`, from `inner` of it (0..0.9); `width` px; `lag` 0.1..0.8
+// how long a ray is (the tail's delay); `twist` degrees a ray turns along its length (a swirl),
+// `wave` px of wobble and `waves` how many; `sweep` degrees of the circle used and `turn` its
+// middle (sweep 140 turn -90 is a fan upward); `alt` 0..1 the length of every other ray, which
+// takes `color2`; `jitter` 0..1 unequal lengths, `seed`.
+//   accent_burst(c, 960, 540, prog(t, 0.0, 0.7), {count: 10 radius: 180 twist: 50})
+let accent_burst = fn(c, x, y, u, o) {
+    if u <= 0.0 || u >= 1.0 { return }
+    let cols = acc_cols(o)
+    let n = o.count ?? 8.0
+    let radius = o.radius ?? 160.0
+    let inner = o.inner ?? 0.12
+    let lag = o.lag ?? 0.4
+    let twist = (o.twist ?? 0.0) * acc_rad
+    let wave = o.wave ?? 0.0
+    let waves = o.waves ?? 2.0
+    let sweep = (o.sweep ?? 360.0) * acc_rad
+    let mid = (o.turn ?? -90.0) * acc_rad
+    let alt = o.alt ?? 1.0
+    let jitter = o.jitter ?? 0.0
+    let seed = o.seed ?? 1.0
+    let full = sweep > acc_tau - 0.001
+    let head = acc_head(u, lag)
+    let tail = acc_tail(u, lag)
+    if head - tail < 0.002 { return }
+    let steps = if twist != 0.0 || wave != 0.0 { 12.0 } else { 1.0 }
+    for i in 0..n {
+        let a0 = if full { mid + acc_tau * i / n } else { mid - sweep / 2.0 + sweep * (i + 0.5) / n }
+        let odd = mod(i, 2.0) > 0.5
+        let reach = radius * (if odd { alt } else { 1.0 }) * (1.0 - jitter * hashn(i, seed))
+        let ray = fn(s) {
+            let a = a0 + twist * s
+            let r = reach * (inner + (1.0 - inner) * s)
+            let w = wave * sin(s * waves * acc_tau) * s
+            return [x + cos(a) * r - sin(a) * w, y + sin(a) * r + cos(a) * w]
+        }
+        c.stroke(acc_sample(ray, tail, head, steps), o.width ?? 4.0, if odd && alt < 1.0 { cols[1] } else { cols[0] }, 1.0, {cap: @round})
+    }
+}
+
+// Small shapes thrown out of a point: they fly out fast and slow down, turning, and shrink away.
+// `count` pieces (1..80) to `radius` (each a seeded share of it), `size` px; `kind` @mix
+// (default: dots, rings, squares, triangles and crosses in turn), @dot, @ring, @square,
+// @triangle or @cross; `width` px of the outlined kinds; `sweep` and `turn` as accent_burst;
+// `fall` px the pieces drop by the end (gravity); `spin` turns; `seed`. Colours in turn.
+//   accent_confetti(c, 960, 540, prog(t, 0.0, 1.2), {count: 18 radius: 300 kind: @mix})
+let accent_confetti = fn(c, x, y, u, o) {
+    if u <= 0.0 || u >= 1.0 { return }
+    let cols = acc_cols(o)
+    let n = o.count ?? 12.0
+    let radius = o.radius ?? 220.0
+    let size = o.size ?? 14.0
+    let kind = o.kind ?? @mix
+    let width = o.width ?? 2.5
+    let sweep = (o.sweep ?? 360.0) * acc_rad
+    let mid = (o.turn ?? -90.0) * acc_rad
+    let fall = o.fall ?? 0.0
+    let spin = o.spin ?? 0.5
+    let seed = o.seed ?? 1.0
+    let out = ease_out_expo(u)
+    // Pops in over the first tenth, shrinks away over the last four tenths.
+    let grow = min(u / 0.1, 1.0) * (1.0 - ease_in_cubic(clamp((u - 0.6) / 0.4, 0.0, 1.0)))
+    for i in 0..n {
+        let a = mid - sweep / 2.0 + sweep * (i + hashn(i, seed, 1.0)) / n
+        let d = radius * (0.35 + 0.65 * hashn(i, seed, 2.0)) * out
+        let px = x + cos(a) * d
+        let py = y + sin(a) * d + fall * u * u
+        let s = size * (0.6 + 0.8 * hashn(i, seed, 3.0)) * grow
+        let col = cols[int(mod(i, 3.0))]
+        let rot = (hashn(i, seed, 4.0) + spin * u * (if mod(i, 2.0) > 0.5 { 1.0 } else { -1.0 })) * acc_tau
+        // Which shape a mixed piece is: 0 dot, 1 ring, 2 square, 3 triangle, 4 cross.
+        let k = if kind == @mix { floor(mod(i, 5.0) + 0.5) } else { -1.0 }
+        if s > 0.3 {
+            if kind == @dot || abs(k) < 0.5 {
+                c.circle(px, py, s * 0.45, col, 1.0)
+            } else if kind == @ring || abs(k - 1.0) < 0.5 {
+                c.stroke(acc_polygon(px, py, s * 0.55, 20.0, 0.0, 0.0), width, col, 1.0, {closed: true})
+            } else if kind == @square || abs(k - 2.0) < 0.5 {
+                c.stroke(acc_polygon(px, py, s * 0.65, 4.0, rot, 0.0), width, col, 1.0, {closed: true})
+            } else if kind == @triangle || abs(k - 3.0) < 0.5 {
+                c.stroke(acc_polygon(px, py, s * 0.7, 3.0, rot, 0.0), width, col, 1.0, {closed: true})
+            } else {
+                let dx = cos(rot) * s * 0.6
+                let dy = sin(rot) * s * 0.6
+                c.stroke([[px - dx, py - dy], [px + dx, py + dy]], width, col, 1.0, {cap: @round})
+                c.stroke([[px + dy, py - dx], [px - dy, py + dx]], width, col, 1.0, {cap: @round})
+            }
+        }
+    }
+}
+
+// A ring that bursts open: it grows fast and slows while its line thins to nothing.
+// To `radius`, line from `width` px; `sides` 0 a circle, 3.. a polygon; `star` 0..1 makes the
+// polygon a star with points pulled in to that share; `rotate` degrees and `spin` degrees turned
+// during the move; `sweep` degrees of the ring drawn around `turn` (180 and -90: a half ring
+// rising from a floor); `fill: true` a solid shape that pops and fades instead of a line;
+// `echo` 0..1: a second, thinner ring in `color2` that much behind.
+//   accent_ring(c, 960, 540, prog(t, 0.0, 0.8), {radius: 240 sides: 6 echo: 0.25})
+let accent_ring = fn(c, x, y, u, o) {
+    if u <= 0.0 || u >= 1.0 { return }
+    let cols = acc_cols(o)
+    let radius = o.radius ?? 200.0
+    let width = o.width ?? 14.0
+    let sides = o.sides ?? 0.0
+    let star = o.star ?? 0.0
+    let sweep = o.sweep ?? 360.0
+    let mid = (o.turn ?? -90.0) * acc_rad
+    let echo = o.echo ?? 0.0
+    let one = fn(v, col, wide) {
+        if v <= 0.0 || v >= 1.0 { return }
+        let r = radius * ease_out_expo(v)
+        let rot = ((o.rotate ?? -90.0) + (o.spin ?? 0.0) * ease_out_cubic(v)) * acc_rad
+        if o.fill ?? false {
+            let a = 1.0 - ease_in_cubic(v)
+            if sides < 3.0 { c.circle(x, y, r, col, a) } else { c.poly(acc_polygon(x, y, r, sides, rot, star), col, a) }
+            return
+        }
+        let w = wide * (1.0 - v) * (1.0 - v)
+        if w < 0.2 { return }
+        if sides >= 3.0 {
+            c.stroke(acc_polygon(x, y, r, sides, rot, star), w, col, 1.0, {closed: true})
+        } else if sweep >= 359.9 {
+            c.stroke(acc_polygon(x, y, r, 64.0, 0.0, 0.0), w, col, 1.0, {closed: true})
+        } else {
+            let arc = fn(s) { let a = mid + (s - 0.5) * sweep * acc_rad return [x + cos(a) * r, y + sin(a) * r] }
+            c.stroke(acc_sample(arc, 0.0, 1.0, 48.0), w, col, 1.0, {cap: @butt})
+        }
+    }
+    one(u, cols[0], width)
+    if echo > 0.0 { one((u - echo) / (1.0 - echo), cols[1], width * 0.5) }
+}
+
+// A stroke that runs round a circle or an ellipse: drawn on from one end and wiped from the
+// same end, so a short arc chases round its orbit and is gone.
+// `radius`; `from` degrees where it starts and `turns` how far it runs (0.1..3, negative runs
+// anticlockwise); `lag` 0.1..0.8 how long the arc is; `squash` 0..1 flattens the circle into an
+// ellipse (an orbit seen from the side) and `tilt` degrees turns it; `width` px; `echoes` 0..2
+// more arcs in `color2` and `color3`, each thinner, a little larger and later; `dash` px dashes.
+//   accent_arc(c, 960, 540, prog(t, 0.0, 1.0), {radius: 200 turns: 1.25 echoes: 2})
+let accent_arc = fn(c, x, y, u, o) {
+    if u <= 0.0 || u >= 1.0 { return }
+    let cols = acc_cols(o)
+    let radius = o.radius ?? 160.0
+    let from = (o.from ?? -90.0) * acc_rad
+    let turns = o.turns ?? 0.75
+    let lag = o.lag ?? 0.35
+    let squash = o.squash ?? 1.0
+    let tilt = (o.tilt ?? 0.0) * acc_rad
+    let width = o.width ?? 5.0
+    let echoes = o.echoes ?? 0.0
+    let ct = cos(tilt)
+    let st = sin(tilt)
+    for e in 0..(echoes + 1.0) {
+        let v = (u - e * 0.08) / (1.0 - echoes * 0.08)
+        let head = acc_head(v, lag)
+        let tail = acc_tail(v, lag)
+        if v > 0.0 && head - tail > 0.002 {
+            let r = radius * (1.0 + e * 0.1)
+            let orbit = fn(s) {
+                let a = from + s * turns * acc_tau + e * 0.5
+                let px = cos(a) * r
+                let py = sin(a) * r * squash
+                return [x + px * ct - py * st, y + px * st + py * ct]
+            }
+            let steps = max(6.0, ceil(abs(turns) * (head - tail) * 64.0))
+            let w = width / (1.0 + e * 0.8)
+            if (o.dash ?? 0.0) > 0.0 {
+                c.stroke(acc_sample(orbit, tail, head, steps), w, cols[int(mod(e, 3.0))], 1.0, {dash: o.dash gap: o.dash})
+            } else {
+                c.stroke(acc_sample(orbit, tail, head, steps), w, cols[int(mod(e, 3.0))], 1.0, {cap: @round})
+            }
+        }
+    }
+}
+
+// A stroke that runs along a path of your own, with an arrow head if you want one.
+// `path` is a cubic Bézier `[x0, y0, x1, y1, x2, y2, x3, y3]` or a list of points `[[x, y], …]`
+// (a zigzag, a step); the stroke is drawn on from its start and wiped from its start.
+// `lag` 0.1..0.8 how long the stroke is; `keep: true` leaves the whole line once drawn (a pointer
+// that stays; hide it yourself); `arrow` px size of a head at the leading end (0: none);
+// `width` px; `echo: true` a thinner second stroke in `color2` just behind.
+//   accent_swoosh(c, [200, 700, 500, 300, 900, 900, 1300, 500], prog(t, 0.0, 0.9), {arrow: 26 width: 5})
+let accent_swoosh = fn(c, path, u, o) {
+    if u <= 0.0 { return }
+    let keep = o.keep ?? false
+    if u >= 1.0 && !keep { return }
+    let cols = acc_cols(o)
+    let lag = o.lag ?? 0.4
+    let width = o.width ?? 5.0
+    let arrow = o.arrow ?? 0.0
+    // The path as a function of 0..1: the curve itself, or the points by their length.
+    let cubic = path[0].is_number()
+    let lens = [0.0]
+    if !cubic { for i in 1..path.len() { lens.push(lens[i - 1] + length(vec2(path[i][0] - path[i - 1][0], path[i][1] - path[i - 1][1]))) } }
+    let at = fn(s) {
+        if cubic {
+            let k = 1.0 - s
+            let b0 = k * k * k
+            let b1 = 3.0 * k * k * s
+            let b2 = 3.0 * k * s * s
+            let b3 = s * s * s
+            return [b0 * path[0] + b1 * path[2] + b2 * path[4] + b3 * path[6], b0 * path[1] + b1 * path[3] + b2 * path[5] + b3 * path[7]]
+        }
+        let want = s * lens[path.len() - 1]
+        for i in 1..path.len() {
+            if want <= lens[i] || i == path.len() - 1 {
+                let f = clamp((want - lens[i - 1]) / max(lens[i] - lens[i - 1], 0.0001), 0.0, 1.0)
+                return [mix(path[i - 1][0], path[i][0], f), mix(path[i - 1][1], path[i][1], f)]
+            }
+        }
+        return path[0]
+    }
+    // A run of the path as points: a curve is sampled, a point list keeps its corners.
+    let run = fn(a, b) {
+        if cubic { return acc_sample(at, a, b, max(4.0, ceil((b - a) * 40.0))) }
+        let pts = [at(a)]
+        let total = lens[path.len() - 1]
+        for i in 1..(path.len() - 1) { if lens[i] > a * total && lens[i] < b * total { pts.push(path[i]) } }
+        pts.push(at(b))
+        return pts
+    }
+    let one = fn(v, col, w, with_head) {
+        let head = acc_head(v, lag)
+        let tail = if keep { 0.0 } else { acc_tail(v, lag) }
+        if v <= 0.0 || head - tail < 0.002 { return }
+        c.stroke(run(tail, head), w, col, 1.0, {cap: @round})
+        if with_head && arrow > 0.0 {
+            let p = at(head)
+            let q = at(max(head - 0.02, 0.0))
+            let d = normalize(vec2(p[0] - q[0], p[1] - q[1]))
+            // The head shrinks with the stroke as the tail catches it up.
+            let s = arrow * min((head - tail) * 6.0, 1.0)
+            c.poly([[p[0] + d.x * s * 0.6, p[1] + d.y * s * 0.6], [p[0] - d.x * s * 0.5 - d.y * s * 0.5, p[1] - d.y * s * 0.5 + d.x * s * 0.5],
+                [p[0] - d.x * s * 0.5 + d.y * s * 0.5, p[1] - d.y * s * 0.5 - d.x * s * 0.5]], col, 1.0)
+        }
+    }
+    if o.echo ?? false { one((u - 0.1) / 0.9, cols[1], width * 0.5, false) }
+    one(u, cols[0], width, true)
+}
+
+// Speed lines: parallel strokes of unequal length that streak across a box one after another.
+// The box is `w` x `h` around (x, y), the lines run along `angle` degrees; `count` lines
+// (1..40), `width` px (each a seeded share of it); `lag` 0.1..0.8 how long a line is; `stagger`
+// 0..0.8 how far apart in time the first and last start; `seed`. Colours in turn.
+//   accent_lines(c, 960, 540, prog(t, 0.0, 0.8), {count: 7 w: 900 h: 160})
+let accent_lines = fn(c, x, y, u, o) {
+    if u <= 0.0 || u >= 1.0 { return }
+    let cols = acc_cols(o)
+    let n = o.count ?? 5.0
+    let w = o.w ?? 600.0
+    let h = o.h ?? 120.0
+    let lag = o.lag ?? 0.35
+    let stagger = o.stagger ?? 0.4
+    let seed = o.seed ?? 1.0
+    let a = (o.angle ?? 0.0) * acc_rad
+    let dx = cos(a)
+    let dy = sin(a)
+    for i in 0..n {
+        let late = hashn(i, seed, 1.0) * stagger
+        let v = (u - late) / (1.0 - stagger)
+        let head = acc_head(v, lag)
+        let tail = acc_tail(v, lag)
+        if v > 0.0 && head - tail > 0.002 {
+            // Each line covers a seeded part of the box's length.
+            let from = hashn(i, seed, 2.0) * 0.35
+            let to = 1.0 - hashn(i, seed, 3.0) * 0.35
+            let off = (if n > 1.0 { i / (n - 1.0) - 0.5 } else { 0.0 }) * h
+            let p0 = (mix(from, to, tail) - 0.5) * w
+            let p1 = (mix(from, to, head) - 0.5) * w
+            c.stroke([[x + dx * p0 - dy * off, y + dy * p0 + dx * off], [x + dx * p1 - dy * off, y + dy * p1 + dx * off]],
+                (o.width ?? 4.0) * (0.4 + 0.6 * hashn(i, seed, 4.0)), cols[int(mod(i, 3.0))], 1.0, {cap: @round})
+        }
+    }
+}
+
+// A target locking on: a solid dot pops, a ring bursts open round it, four ticks shoot out along
+// the axes, and a circle of dots follows them.
+// To `radius`; `sides` of the ring (0 a circle, 4 a diamond); `ticks` (0..16) and `dots` (0..40)
+// how many; `width` px of the ring's line.
+//   accent_target(c, 960, 540, prog(t, 0.0, 1.0), {radius: 220 sides: 4})
+let accent_target = fn(c, x, y, u, o) {
+    if u <= 0.0 || u >= 1.0 { return }
+    let cols = acc_cols(o)
+    let radius = o.radius ?? 200.0
+    accent_ring(c, x, y, u / 0.35, {radius: radius * 0.22 fill: true color: cols[0]})
+    accent_ring(c, x, y, (u - 0.05) / 0.75, {radius: radius * 0.7 width: o.width ?? 12.0 sides: o.sides ?? 0.0 rotate: 0.0 echo: 0.2 color: cols[0] color2: cols[2]})
+    if (o.ticks ?? 4.0) > 0.0 {
+        accent_burst(c, x, y, (u - 0.1) / 0.7, {count: o.ticks ?? 4.0 radius: radius inner: 0.3 turn: 0.0 width: 3.0 color: cols[1]})
+    }
+    if (o.dots ?? 12.0) > 0.0 {
+        let v = (u - 0.25) / 0.75
+        if v > 0.0 && v < 1.0 {
+            let n = o.dots ?? 12.0
+            let r = radius * (0.55 + 0.4 * ease_out_expo(v))
+            let s = 4.0 * min(v / 0.15, 1.0) * (1.0 - ease_in_cubic(v))
+            for i in 0..n {
+                let a = acc_tau * (i + 0.5) / n
+                c.circle(x + cos(a) * r, y + sin(a) * r, s, cols[2], 1.0)
+            }
+        }
+    }
+}
+
+// A loader: marks round a circle with a bright spot running round them.
+// `t` seconds; `count` marks (3..40) on `radius`; `kind` @bar (default), @dot or @tri; `size` px;
+// `speed` turns a second (negative: anticlockwise); `trail` 0..1 how much of the circle the
+// fading tail covers; `dim` 0..1 the brightness of the unlit marks.
+//   accent_spinner(c, 960, 540, t, {count: 12 radius: 44 kind: @bar})
+let accent_spinner = fn(c, x, y, t, o) {
+    let cols = acc_cols(o)
+    let n = o.count ?? 12.0
+    let radius = o.radius ?? 44.0
+    let kind = o.kind ?? @bar
+    let size = o.size ?? 14.0
+    let trail = o.trail ?? 0.7
+    let dim = o.dim ?? 0.15
+    let turn = t * (o.speed ?? 1.0)
+    for i in 0..n {
+        let a = acc_tau * i / n - acc_tau / 4.0
+        // How long ago the spot passed this mark, in turns.
+        let age = mod(turn - i / n, 1.0)
+        let lit = dim + (1.0 - dim) * max(1.0 - age / max(trail, 0.01), 0.0)
+        let cx = cos(a)
+        let cy = sin(a)
+        if kind == @dot {
+            c.circle(x + cx * radius, y + cy * radius, size * 0.4, cols[0], lit)
+        } else if kind == @tri {
+            c.poly(acc_polygon(x + cx * radius, y + cy * radius, size * 0.5, 3.0, a + acc_tau / 4.0, 0.0), cols[0], lit)
+        } else {
+            c.stroke([[x + cx * (radius - size * 0.5), y + cy * (radius - size * 0.5)], [x + cx * (radius + size * 0.5), y + cy * (radius + size * 0.5)]],
+                o.width ?? 5.0, cols[0], lit, {cap: @round})
+        }
+    }
+}
+
+// A loader: an arc turning round a circle, with thinner arcs turning against it if you want.
+// `t` seconds; `radius`; `sweep` degrees of the arc (10..350); `speed` turns a second; `width`
+// px; `echoes` 0..2 more arcs, each smaller, in `color2` and `color3`, turning the other way;
+// `dash` px dashes (a dashed circle marching when `sweep` is 350).
+//   accent_orbit(c, 960, 540, t, {radius: 48 sweep: 250 echoes: 1})
+let accent_orbit = fn(c, x, y, t, o) {
+    let cols = acc_cols(o)
+    let radius = o.radius ?? 48.0
+    let sweep = (o.sweep ?? 250.0) * acc_rad
+    let width = o.width ?? 5.0
+    for e in 0..((o.echoes ?? 0.0) + 1.0) {
+        let dir = if mod(e, 2.0) > 0.5 { -1.3 } else { 1.0 }
+        let r = radius * (1.0 - e * 0.24)
+        let start = t * (o.speed ?? 0.8) * acc_tau * dir + e * 2.1
+        let arc = fn(s) { let a = start + s * sweep return [x + cos(a) * r, y + sin(a) * r] }
+        let pts = acc_sample(arc, 0.0, 1.0, max(8.0, ceil(sweep * 10.0)))
+        if (o.dash ?? 0.0) > 0.0 {
+            c.stroke(pts, width / (1.0 + e * 0.6), cols[int(mod(e, 3.0))], 1.0, {dash: o.dash gap: o.dash})
+        } else {
+            c.stroke(pts, width / (1.0 + e * 0.6), cols[int(mod(e, 3.0))], 1.0, {cap: @round})
+        }
+    }
+}
+
+// A loader: chevrons marching the way they point, each lighting up as the march passes it.
+// `t` seconds; `count` chevrons (1..8) of `size` px, `gap` px apart, pointing along `angle`
+// degrees; `speed` passes a second; `width` px; `dim` 0..1 the brightness of the unlit ones.
+//   accent_chevrons(c, 960, 540, t, {count: 3 size: 28 angle: 0})
+let accent_chevrons = fn(c, x, y, t, o) {
+    let cols = acc_cols(o)
+    let n = o.count ?? 3.0
+    let size = o.size ?? 28.0
+    let gap = o.gap ?? 22.0
+    let a = (o.angle ?? 0.0) * acc_rad
+    let dim = o.dim ?? 0.2
+    let dx = cos(a)
+    let dy = sin(a)
+    for i in 0..n {
+        let along = (i - (n - 1.0) / 2.0) * gap
+        let age = mod(t * (o.speed ?? 1.2) - i / n, 1.0)
+        let lit = dim + (1.0 - dim) * max(1.0 - age * 2.0, 0.0)
+        let px = x + dx * along
+        let py = y + dy * along
+        let h = size * 0.5
+        c.stroke([[px - dx * h * 0.5 - dy * h, py - dy * h * 0.5 + dx * h], [px + dx * h * 0.5, py + dy * h * 0.5], [px - dx * h * 0.5 + dy * h, py - dy * h * 0.5 - dx * h]],
+            o.width ?? 6.0, cols[0], lit, {cap: @round})
+    }
+}
+
+// A loader: a wave running along a line.
+// `t` seconds; `w` px long around (x, y) along `angle` degrees; `amp` px high, `waves` crests
+// over the length; `speed` crests a second; `width` px; the ends taper to nothing.
+//   accent_wave(c, 960, 540, t, {w: 240 amp: 16 waves: 2.5})
+let accent_wave = fn(c, x, y, t, o) {
+    let cols = acc_cols(o)
+    let w = o.w ?? 240.0
+    let amp = o.amp ?? 16.0
+    let waves = o.waves ?? 2.5
+    let a = (o.angle ?? 0.0) * acc_rad
+    let dx = cos(a)
+    let dy = sin(a)
+    let line = fn(s) {
+        let along = (s - 0.5) * w
+        let up = amp * sin((s * waves - t * (o.speed ?? 1.0)) * acc_tau) * sin(s * acc_tau / 2.0)
+        return [x + dx * along - dy * up, y + dy * along + dx * up]
+    }
+    c.stroke(acc_sample(line, 0.0, 1.0, max(16.0, ceil(waves * 16.0))), o.width ?? 6.0, cols[0], 1.0, {cap: @round})
+}
+
+{accent_burst: accent_burst accent_confetti: accent_confetti accent_ring: accent_ring accent_arc: accent_arc accent_swoosh: accent_swoosh
+    accent_lines: accent_lines accent_target: accent_target accent_spinner: accent_spinner accent_orbit: accent_orbit accent_chevrons: accent_chevrons
+    accent_wave: accent_wave}

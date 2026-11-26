@@ -3,6 +3,9 @@
 accel_to_decel_enable	bool	process		0	
 accel_to_decel_factor	percent	process		50%	
 activate_air_filtration	bools	filament		0	
+adaptive_infill_gradient	enum	process		linear	linear/quadratic/exponential
+adaptive_infill_interior_density	percent	process		10%	
+adaptive_infill_mode	enum	process		disabled	disabled/distance_warp/smooth_blend/stepped_shells/lobes/normal_z/normal_y/normal_x
 additional_cooling_fan_speed	ints	filament		0	
 additional_fan_full_speed_layer	ints	filament		0	
 alternate_extra_wall	bool	process		0	
@@ -518,7 +521,7 @@ sparse_infill_filament	int	process		0
 sparse_infill_lattice_angle_1	float	process		-45	
 sparse_infill_lattice_angle_2	float	process		45	
 sparse_infill_line_width	float	process		0.4	
-sparse_infill_pattern	enum	process		cubic	concentric/zig-zag/grid/line/cubic/triangles/tri-hexagon/gyroid/honeycomb/adaptivecubic/alignedrectilinear/3dhoneycomb/hilbertcurve/archimedeanchords/octagramspiral/supportcubic/lightning/crosshatch/zigzag/crosszag/lockedzag/2dlattice
+sparse_infill_pattern	enum	process		cubic	concentric/zig-zag/grid/line/cubic/triangles/tri-hexagon/gyroid/honeycomb/adaptivecubic/alignedrectilinear/3dhoneycomb/hilbertcurve/archimedeanchords/octagramspiral/supportcubic/lightning/crosshatch/zigzag/crosszag/lockedzag/2dlattice/tpmsd/tpmsfk
 sparse_infill_speed	floats	process	process-variant	100	
 spiral_mode	bool	process		0	
 spiral_mode_max_xy_smoothing	float_or_percent	process		200%	

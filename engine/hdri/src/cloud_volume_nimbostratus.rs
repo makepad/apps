@@ -345,9 +345,4 @@ pub(crate) fn far_look(cover: f32, cells: f32) -> CoverSample {
     CoverSample { cover, tau: -(1.0 - cover.min(NS_FAR_COVER_MAX)).ln() }
 }
 
-/// smoothstep, local (as in the other cloud modules).
-#[inline]
-fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
-    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
+use crate::patterns::smooth as smoothstep;

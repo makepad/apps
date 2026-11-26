@@ -481,6 +481,20 @@ const BLOOM_LIGHT_SAMPLES_MAX: usize = 16;
 /// pre-pass to 65 % of the bake (hdri_perf's M5; about 22 % so held). The discs' cells and grids
 /// are not counted.
 const BLOOM_CELL_BUDGET: usize = 1 << 13;
+/// A light's cell the budget left fewer samples than the light asks for takes the light behind
+/// at a point of each sample's own part of the cell that the cell and the sample fix, not at its
+/// middle (`CasterBloom::build`'s `sampled`): there the light's detail is finer than the
+/// samples, and on a grid every cell met a band along the raster (a blind's gap between its
+/// slats, a ladder's string) at the same offset, so a whole row or column of cells held it all
+/// or none of it. The 60 x 40 degree panel with blinds behind a blooming leaves caster of
+/// `a_detailed_light_past_the_budget_blooms_the_light_it_has`, moved 0.1 degrees at a time over
+/// 2 degrees: its bright light was off by up to 13 % moving sideways and 18 % moving up, and is
+/// off by up to 5.5 %; its share over the caster, rms 0.125 off the brute force's blur, by
+/// 0.050. A window's or leaves' bright light holds within 1 % either way, and the cell takes
+/// no more samples.
+const BLOOM_SCATTER_SEED: u32 = 0x5ca7_7e12;
+/// The salt that keeps a scattered point's height apart from its offset across.
+const BLOOM_SCATTER_Y: u32 = 0x9e37_79b9;
 /// A light whose reach in the caster's plane is at most this many cells each way from its
 /// middle is sampled as a disc is, on a grid of its own square kept as points (`BloomPoint`),
 /// so the kernel blurs it from where it is, not from the cells it falls in.
@@ -690,8 +704,9 @@ enum Plan {
     /// `want` x `want` samples, for a light that reaches it, or where its corners are not alike
     /// or its centre is off them. BLOOM_CELL_BUDGET never scales it under `keep` a side: what
     /// its corners may miss of the base (fix round 4 of S3's review), `fine` its detail
-    /// (`peak`).
-    Samples { want: usize, keep: usize, fine: bool },
+    /// (`peak`). `scattered` where the budget left a light's cell fewer samples than the light
+    /// asks for (BLOOM_SCATTER_SEED).
+    Samples { want: usize, keep: usize, fine: bool, scattered: bool },
     /// n x n samples, for the base's detail alone.
     Fine(usize),
 }
@@ -944,8 +959,10 @@ impl CasterBloom {
         // (`CellLight`): the light behind at `n` x `n` samples (those outside the squares), each
         // times what shows over its own part of the cell at enough looks a side for `looks` over
         // the cell (none taken behind where nothing shows), times the share of the cell outside
-        // the squares.
-        let sampled = |x: f32, y: f32, n: usize| -> CellLight {
+        // the squares. A `scattered` cell (i, j) takes the light behind at a point of each
+        // sample's own part of the cell that the cell and the sample fix (BLOOM_SCATTER_SEED),
+        // not at its middle.
+        let sampled = |x: f32, y: f32, n: usize, scattered: Option<(usize, usize)>| -> CellLight {
             let k = looks.div_ceil(n).max(1);
             let step = cell / n as f32;
             let (mut light, mut outside) = (CellLight::default(), 0usize);
@@ -970,7 +987,15 @@ impl CasterBloom {
                         open / (k * k) as f32
                     });
                     if open > 0.0 {
-                        light.add(open * ev_behind(at(sx, sy)), fx, fy);
+                        let (fx, fy) = match scattered {
+                            Some((i, j)) => {
+                                let (i, j, s) = (i as i32, j as i32, (sj * n + si) as i32);
+                                let off = |seed: u32| (hash01(i, j, s, seed) - 0.5) / n as f32;
+                                (fx + off(BLOOM_SCATTER_SEED), fy + off(BLOOM_SCATTER_SEED ^ BLOOM_SCATTER_Y))
+                            }
+                            None => (fx, fy),
+                        };
+                        light.add(open * ev_behind(at(x + fx * cell, y + fy * cell)), fx, fy);
                     }
                 }
             }
@@ -1038,7 +1063,7 @@ impl CasterBloom {
                     // bright ones, which then read their corners: a panel with blinds bloomed a
                     // quarter more light than it has).
                     if light > 0 {
-                        return Plan::Samples { want: light.max(fine), keep: fine, fine: fine > 0 };
+                        return Plan::Samples { want: light.max(fine), keep: fine, fine: fine > 0, scattered: false };
                     }
                     if fine > 0 {
                         return Plan::Fine(fine);
@@ -1046,7 +1071,7 @@ impl CasterBloom {
                     if !(hi > -BLOOM_NEAR_EV) {
                         return Plan::Dark;
                     }
-                    let own = Plan::Samples { want: samples, keep: samples, fine: false };
+                    let own = Plan::Samples { want: samples, keep: samples, fine: false, scattered: false };
                     if !smooth {
                         return own;
                     }
@@ -1062,7 +1087,8 @@ impl CasterBloom {
         // while few cells have any (BLOOM_FINE_POINTS_MAX), else its cell's own samples; a cell
         // no light reaches that is near the threshold or whose centre is off its corners, its own
         // samples. A light's cell left under two a side reads its corners, which hold its light
-        // already.
+        // already; one left fewer than its light asks for reads the light behind at scattered
+        // points (BLOOM_SCATTER_SEED).
         let budget = BLOOM_CELL_BUDGET * (width / CASTER_REFERENCE_WIDTH).pow(2) / casters.max(1);
         let few = plans.iter().filter(|plan| matches!(plan, Plan::Fine(_) | Plan::Samples { fine: true, .. })).count() <= BLOOM_FINE_POINTS_MAX;
         let keep_of = |plan: &Plan| match *plan {
@@ -1080,7 +1106,7 @@ impl CasterBloom {
                     Plan::Samples { want, fine, .. } => {
                         let n = ((want as f32 * scale) as usize).max(keep);
                         // A single sample is about what the corners hold already: they are read.
-                        if n < 2 && keep == 0 { Plan::Corners } else { Plan::Samples { want: n, keep: n, fine } }
+                        if n < 2 && keep == 0 { Plan::Corners } else { Plan::Samples { want: n, keep: n, fine, scattered: n < want } }
                     }
                     Plan::Fine(n) => Plan::Fine(((n as f32 * scale) as usize).max(keep)),
                     other => other,
@@ -1102,7 +1128,8 @@ impl CasterBloom {
                     match plans[j * cols + i] {
                         Plan::Dark => return CellLight::default(),
                         Plan::Fine(_) if as_points => return CellLight::default(),
-                        Plan::Disc(n) | Plan::Samples { want: n, .. } | Plan::Fine(n) => return sampled(c.x, c.y, n),
+                        Plan::Samples { want: n, scattered, .. } => return sampled(c.x, c.y, n, scattered.then_some((i, j))),
+                        Plan::Disc(n) | Plan::Fine(n) => return sampled(c.x, c.y, n, None),
                         Plan::Corners => {}
                     }
                     // The light behind bilinearly between the corners (none at those under the

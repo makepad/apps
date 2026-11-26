@@ -114,6 +114,13 @@ fn reference_editable(cx: &Cx, part: CompRef, kind: RefKind) -> bool {
     }
 }
 
+pub(super) fn reference_field(board: BoardId, comp: &Component) -> ReferenceEdit {
+    ReferenceEdit {
+        part: CompRef { board, comp: comp.id }, path: comp.path.clone(),
+        reference: comp.refdes.clone(), kind: comp.ref_kind,
+    }
+}
+
 impl ExplorerView {
     /// The first selected part in pick order. O(1).
     pub(super) fn selected_node(&self) -> Option<u32> {
@@ -133,11 +140,16 @@ impl ExplorerView {
         true
     }
 
-    /// Publish one selection change to the host, in O(selected).
-    fn publish_selection(&self, cx: &mut Cx) {
+    /// Publish the committed selection. During a band a source edit can rebind the selection
+    /// from its press, while the preview stays local. O(selected).
+    pub(super) fn publish_selection(&self, cx: &mut Cx) {
         let Some(unit) = self.design.as_ref().and_then(|design| design.units.get(self.unit)) else { return };
         let sel = |node| Sel::Comp(CompRef { board: unit.id, comp: CompId(node) });
-        match self.selected.as_slice() {
+        let parts = match &self.marquee {
+            Marquee::Drawing { before, .. } => before,
+            _ => &self.selected,
+        };
+        match parts.as_slice() {
             [] => cx.widget_action(self.uid, ViewAction::Unfocus),
             [(node, _)] => cx.widget_action(self.uid, ViewAction::Focus(Focus {
                 kind: FocusKind::Part, sel: sel(*node), origin: FocusOrigin::Explorer,
@@ -150,25 +162,38 @@ impl ExplorerView {
 
     /// Rebind paths once when the source changes. O(selected), plus O(parts) if indices moved.
     pub(super) fn rebind_selection(&mut self, cx: &mut Cx) {
-        if self.selected.is_empty() { return; }
+        let band_empty = match &self.marquee {
+            Marquee::Drawing { before, .. } => before.is_empty(),
+            _ => true,
+        };
+        if self.selected.is_empty() && band_empty { return; }
         let Some(unit) = self.design.as_ref().and_then(|design| design.units.get(self.unit)) else { return };
         let mut paths = ByPath::new(&unit.circuit);
-        let mut changed = false;
-        self.selected.retain_mut(|(node, path)| {
-            let next = paths.find(*node as usize, path).map(|n| n as u32);
-            changed |= next != Some(*node);
-            if let Some(next) = next { *node = next; }
-            next.is_some()
-        });
+        let mut rebind = |parts: &mut Vec<(u32, String)>| {
+            let mut changed = false;
+            parts.retain_mut(|(node, path)| {
+                let next = paths.find(*node as usize, path).map(|n| n as u32);
+                changed |= next != Some(*node);
+                if let Some(next) = next { *node = next; }
+                next.is_some()
+            });
+            changed
+        };
+        let changed = rebind(&mut self.selected);
         if changed {
             self.card = None;
             self.card_press = None;
-            self.publish_selection(cx);
         }
+        let committed_changed = match &mut self.marquee {
+            Marquee::Drawing { before, .. } => rebind(before),
+            _ => changed,
+        };
+        if committed_changed { self.publish_selection(cx); }
     }
 
-    /// Commit one sheet pick or finished marquee. O(selected).
+    /// Commit one sheet pick. O(selected).
     pub(super) fn select_parts(&mut self, cx: &mut Cx, selected: Vec<(u32, String)>) {
+        self.end_marquee(cx);
         if self.set_selection(cx, selected) { self.publish_selection(cx); }
     }
 
@@ -210,6 +235,7 @@ impl ExplorerView {
                 let part = unit.filter(|unit| unit.id == comp.board)?.circuit.comps.get(comp.comp.ix())?;
                 Some((comp.comp.0, part.path.clone()))
             }).collect();
+            self.end_marquee(cx);
             self.set_selection(cx, parts);
             return;
         }
@@ -233,9 +259,7 @@ impl ExplorerView {
         let part = CompRef { board, comp: comp.id };
         if !self.card.as_ref().is_some_and(|card| card.reference_editable && card.text.reference == comp.refdes)
             || !reference_editable(cx, part, comp.ref_kind) { return; }
-        let edit = ReferenceEdit {
-            part, path: comp.path.clone(), reference: comp.refdes.clone(), kind: comp.ref_kind,
-        };
+        let edit = reference_field(board, comp);
         self.focus_name_field(cx, &edit.reference);
         self.name_edit = Some(NameEdit::Reference(edit));
     }
@@ -660,12 +684,17 @@ impl ExplorerView {
 
     /// Send one commit of `ops` as [`Self::send_card_edit`] does.
     pub(super) fn send_card_ops(&mut self, cx: &mut Cx, label: String, ops: Vec<DesignOp>) {
+        self.send_card_plan(cx, label, ops, None);
+    }
+
+    pub(super) fn send_card_plan(&mut self, cx: &mut Cx, label: String, ops: Vec<DesignOp>, call: Option<super::Invocation>) {
         if let Some(card) = &mut self.card {
             let seen = cx.get_global_ref::<ElecLive>().and_then(|live| live.snap.last_refusal.as_ref()).map_or(0, |r| r.seq);
             card.sent = Some((label.clone(), seen));
             card.note = None;
         }
-        cx.widget_action(self.uid, ViewAction::Ops { place: vec![], label, ops });
+        let action = ViewAction::Ops { place: vec![], label, ops };
+        super::Invocation::send(cx, self.uid, match call { Some(call) => call.attach(action), None => action });
     }
 
     /// This computer's choice of where it gets the card's KiCad model, the same call as

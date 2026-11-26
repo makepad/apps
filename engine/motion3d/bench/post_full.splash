@@ -1,0 +1,11 @@
+use mod.scene.*; use mod.post
+// The full post chain on a mid-size scene: bloom, SSAO, depth of field,
+// outline, vignette, grain.
+Scene3D{ background: #101218 environment: Environment{preset: @sunset} camera: Camera{position: vec3(0, 3, 9) target: vec3(0, 0.5, 0) fov: 40}
+  post: [post.Bloom{strength: 0.7} SSAO{radius: 0.5 intensity: 1.2} post.DepthOfField{focus: 9 aperture: 12} post.Outline{color: #ffcc00 thickness: 2} post.Vignette{amount: 0.3} FilmGrain{amount: 0.03}]
+  lights: [DirectionalLight{position: vec3(4, 8, 3) intensity: 2 cast_shadow: true}]
+  children: [
+    Mesh{outline: true geometry: TorusKnotGeometry{radius: 1 tube: 0.3 tubular_segments: 256 radial_segments: 32} position: vec3(0, 1.5, 0) rotation: spin(vec3(10, 45, 0)) material: MeshPhysicalMaterial{color: #ff5a36 clearcoat: 1 roughness: 0.3}}
+    Instances{geometry: SphereGeometry{radius: 0.25} layout: CircleLayout{count: 24 radius: 3.5} material: MeshStandardMaterial{color: #ffffff emissive: #ffb347 emissive_intensity: 3}}
+    Mesh{geometry: PlaneGeometry{width: 40 height: 40} rotation: vec3(-90, 0, 0) material: MeshStandardMaterial{color: #505860}}
+  ] }

@@ -1,0 +1,110 @@
+use mod.motion.*
+
+// Characters 1: bones. Three rigs, one per kind of constraint, each skinning plain vector
+// shapes (the weights come from the rest pose; nothing is painted):
+//   forward bones: three stems sway, each bone a little later than its parent;
+//   follow a path: every bone of a ribbon rides one circle, so the body bends along it;
+//   two-bone IK: an arm reaches for a point drifting on a slow figure.
+// Everything ambient runs on live(), so the held slide keeps moving.
+let look = import("shared/motion_deck_look")
+
+let GROUND_Y = 900.0
+let enter = fn(at) { return tween(0, 1, at, at + 1.4, @ease_in_out_cubic) }
+let rise = fn(at) { return tween(16, 0, at, at + 1.4, @ease_in_out_cubic) }
+// Sway grows in over the first 1.5 s of live time, so every rig rests straight at load.
+let calm_in = fn() { return smoothstep(0.0, 1.5, live()) }
+
+// ---- forward bones: a stem of five bones standing up from its root ----
+let STEM_BONES = 5
+// One skin for every stem (330 tall at rest), placed and scaled per stem.
+let STEM_LEN = 330.0
+let STEM_SKIN = "M -24 0 C -24 -150 -8 -280 0 -330 C 8 -280 24 -150 24 0 Z"
+let stem = fn(name, x, size, phase, fill, at) {
+    let bones = []
+    for k in 0..STEM_BONES {
+        let base = if k == 0 { -90.0 } else { 0.0 }
+        bones.push(Bone{name: name + "_" + k length: STEM_LEN / STEM_BONES
+            rotate: fn(t) { base + (4.0 + 3.0 * k) * sin(live() * 0.9 + phase - k * 0.55) * calm_in() }})
+    }
+    return Bones{name: name at: vec2(x, GROUND_Y) scale: size anchor: vec2(0, 0) opacity: enter(at) y: rise(at)
+        bones: bones
+        layers: [Path{name: name + " skin" fill: fill svg: STEM_SKIN}]}
+}
+
+// ---- follow a path: a ribbon of six bones, each riding the same circle ----
+let LOOP_R = 150.0
+let LOOP_LEN = 2.0 * 3.14159265 * LOOP_R
+let LOOP = "M -150 0 A 150 150 0 1 1 150 0 A 150 150 0 1 1 -150 0"
+let RIBBON_BONES = 6
+let RIBBON_BONE = 44.0
+let ribbon_follow = fn() {
+    let list = []
+    for k in 0..RIBBON_BONES {
+        list.push(Follow{bone: "r_" + k path: LOOP orient: true
+            along: fn(t) { fract(live() / 11.0 + 0.25 - (RIBBON_BONES - 1 - k) * RIBBON_BONE / LOOP_LEN) }})
+    }
+    return list
+}
+let ribbon_bones = fn() {
+    let list = []
+    for k in 0..RIBBON_BONES { list.push(Bone{name: "r_" + k length: RIBBON_BONE}) }
+    return list
+}
+let RIBBON_LEN = RIBBON_BONES * RIBBON_BONE
+
+// ---- two-bone IK: an arm reaching for a drifting point ----
+let SHOULDER = vec2(1330, 640)
+let reach = fn(t) {
+    let a = live() * 0.42
+    return vec2(205 + 70 * sin(a), -40 + 120 * sin(a * 2.0 + 0.6)) * (0.6 + 0.4 * calm_in()) + vec2(80, 0) * (1.0 - calm_in())
+}
+
+Motion{
+    label: "Bones bend shapes"
+    size: vec2(1920, 1080)
+    duration: 600.0
+    fps: 60
+    color: @hdr
+    background: look.INK
+    layers: [
+        Draw2D{name: "ground" size: vec2(1920, 1080) draw: fn(c, t, edit) {
+            look.ground(c, t, live())
+            // The hairline the stems stand on and the circle the ribbon rides, faint.
+            let k = ease(@ease_in_out_cubic, prog(t, 0.8, 2.2))
+            c.stroke([[150, GROUND_Y], [650, GROUND_Y]], 1, look.BONE, 0.18 * k)
+            let ring = []
+            for i in 0..96 { ring.push([960 + LOOP_R * cos(i * 6.2831853 / 96), 620 + LOOP_R * sin(i * 6.2831853 / 96)]) }
+            c.stroke(ring, 1, look.COOL, 0.18 * k, {closed: true})
+        }}
+        // forward bones
+        stem("stem a", 280, 0.9, 0.0, look.SEA, 0.9)
+        stem("stem b", 400, 1.2, 1.1, look.COOL, 1.0)
+        stem("stem c", 520, 0.8, 2.3, look.SEA, 1.1)
+        // follow a path
+        Bones{name: "ribbon" at: vec2(960, 620) opacity: enter(1.2)
+            bones: ribbon_bones()
+            follow: ribbon_follow()
+            layers: [Path{name: "ribbon skin" fill: look.BONE
+                svg: "M 0 -6 L 238 -18 C 256 -18 264 -10 264 0 C 264 10 256 18 238 18 L 0 6 Z"}]}
+        // two-bone IK
+        Ellipse{name: "target" size: vec2(28, 28) stroke: look.COOL width: 2 fill: #0000 anchor: vec2(0.5, 0.5)
+            at: fn(t) { SHOULDER + reach(t) - vec2(14, 14) } opacity: enter(1.5)}
+        Bones{name: "arm" at: SHOULDER opacity: enter(1.4) y: rise(1.4)
+            bones: [Bone{name: "upper" length: 150} Bone{name: "lower" length: 130}]
+            ik: [IK{end: "lower" target: reach bend: @cw}]
+            layers: [
+                Path{name: "arm skin" fill: look.BONE svg: "M 0 -20 C 70 -22 150 -16 280 -8 L 280 8 C 150 16 70 22 0 20 Z"}
+                Ellipse{name: "hand" at: vec2(266, -14) size: vec2(28, 28) fill: look.BONE}
+            ]}
+        Ellipse{name: "shoulder" at: SHOULDER - vec2(26, 26) size: vec2(52, 52) fill: look.INK2 stroke: look.BONE width: 2 opacity: enter(1.4)}
+        Draw2D{name: "chrome" size: vec2(1920, 1080) draw: fn(c, t, edit) {
+            look.folio(c, t, "06", "Characters and bones")
+            look.heading(c, t, "Bones bend shapes.", "Skin any path, shape or image to a rig. Weights come from the rest pose; nothing is painted.")
+            look.label(c, t, 1.6, "forward bones", 400, 960, {align: @center})
+            look.label(c, t, 1.7, "follow a path", 960, 960, {align: @center})
+            look.label(c, t, 1.8, "two-bone IK", 1460, 960, {align: @center})
+            look.syntax(c, t, 2.0, "Bones{bones: [Bone{...}]  ik: [IK{end target}]  follow: [Follow{bone path along}]}")
+        }}
+    ]
+    post: look.post_chain(look.POST)
+}

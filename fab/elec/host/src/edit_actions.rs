@@ -1,15 +1,15 @@
 //! Schematic and board actions shared by Fab's action catalog and engine.
 
-use crate::{Docs, Plan};
+use crate::{legal_plan::{legal_plan, PlacementEdit, LEGALISE}, Docs, Plan};
 use fab_elec_board::{BoardOp, ItemKind};
 use fab_elec_circuit::{CheckKind, CircuitOp, Component, Measure, QtyUnit, Violation};
 use fab_elec_core::{Angle, CompRef, Diag, FeatureRef, NetRef, PinIx, PinRef, Sel, Severity, Side, P};
 use fab_elec_design::action::{ActionDef, FieldDef, FieldKind, Risk};
 use fab_elec_design::{Design, DesignOp, LinkKind, PartRef, Place, Resolved, SysOp, Unit};
 use fab_elec_lang::{board_doc::read_point_mm, map::site_text, units::parse_value};
-use fab_elec_view::board::{plan::label_ops, tray::placement_op};
+use fab_elec_view::board::tray::placement_op;
 use fab_elec_view::{DesignSnapshot, StageFlags};
-use makepad_widgets_core::makepad_script::syntax::write::quote;
+use makepad_widgets_core::makepad_script::syntax::write::{list, quote};
 use std::collections::HashSet;
 use std::fmt::Write;
 
@@ -45,8 +45,13 @@ pub const PART_PLACE: ActionDef = ActionDef {
     name: "elec.part.place",
     label: "Place or move part",
     group: "Board",
-    help: "Place an unplaced part as dropping it from the tray does, or move a placed part as dragging it does. Rotation and side apply on first placement. A placed part keeps its rotation and side. Its answer's checks name a track the move left short as a new Dangling finding and a connection it broke as a new Unconnected one, as the board marks them.",
-    returns: EDIT_RETURNS,
+    help: "Place an unplaced part as dropping it from the tray does, or move a placed part as dragging it does. Rotation and side apply on first placement. A placed part keeps its rotation and side. Pad-anchored track ends follow the move. Its answer's checks name a track end it left off copper as a new Dangling finding and a connection it broke as a new Unconnected one, as the board marks them.",
+    returns: "seq: int  the step it committed
+label: text  its name in the undo history
+legalised: [{..}]  parts shifted from their requested spots, when any
+  part: text  the part reference
+  moved_mm: num  distance from the requested spot in millimetres
+no_room: [text]  parts left where asked because there was no legal spot, when any",
     fields: &[
         FieldDef {
             name: "part", kind: FieldKind::Text, required: true, default: "",
@@ -64,7 +69,7 @@ pub const PART_PLACE: ActionDef = ActionDef {
             name: "side", kind: FieldKind::Choice(&["top", "bottom"]), required: false, default: "",
             help: "Board side for a new placement. Omit for the tray's default.",
         },
-        UNIT,
+        LEGALISE, UNIT,
     ],
     inputs: &[], risk: Risk::Edit, keys: "",
 };
@@ -124,8 +129,8 @@ route: {..}
             help: "interactive: straight copper at 45 degrees, as the board's router lays it; organic: smooth curved copper with teardrops.",
         },
         FieldDef {
-            name: "effort", kind: FieldKind::Int { min: 0, max: 1_000 }, required: false, default: "4",
-            help: "How hard the router tries: candidate paths per open net and via-reduction passes. More is slower and leaves fewer nets open.",
+            name: "effort", kind: FieldKind::Choice(&["full", "fast"]), required: false, default: "full",
+            help: "full: the router rips up and reroutes until a whole pass leaves no fewer nets open; fast: one pass, no rip-up, in seconds, naming each net it leaves open and what blocks it (for checking a placement).",
         },
         FieldDef {
             name: "reroute", kind: FieldKind::Bool, required: false, default: "false",
@@ -184,10 +189,14 @@ pub static ACTIONS: &[ActionDef] = &[VALUE_SET, PART_PLACE, DESIGN_READ, ROUTE, 
 
 pub fn register_actions() {
     fab_elec_design::action::register(ACTIONS);
+    fab_elec_design::action::register(crate::board_actions::ACTIONS);
     fab_elec_design::action::register(crate::model_actions::ACTIONS);
     fab_elec_design::action::register(crate::doc_actions::ACTIONS);
     fab_elec_design::action::register(crate::sheet_actions::ACTIONS);
     fab_elec_design::action::register(crate::bench_actions::ACTIONS);
+    fab_elec_design::action::register(crate::req_actions::ACTIONS);
+    fab_elec_design::action::register(crate::bom_actions::ACTIONS);
+    fab_elec_design::action::register(crate::board_settings::ACTIONS);
     fab_elec_lang::sys_actions::register_actions();
 }
 
@@ -304,19 +313,17 @@ pub fn board_unit<'a>(design: &'a Design, field: &str, name: Option<&str>) -> Re
     }
 }
 
-/// `elec.factory.set`: a built-in factory profile for a board, written as its document's
+/// `elec.factory.set`: a factory profile for a board, written as its document's
 /// `factory(..)` line (the person's path: typing that line). Its capabilities then raise the
 /// board's effective rules. O(units + profiles).
-pub fn factory_set(design: &Design, _docs: Option<&Docs>, tool: &str, args: &[(String, String)]) -> Result<Plan, Diag> {
+pub fn factory_set(design: &Design, profiles: &[fab_elec_cam::profile_doc::ProfileDef], tool: &str, args: &[(String, String)]) -> Result<Plan, Diag> {
     let def = fab_elec_cam::actions::ACTIONS.iter().find(|def| def.name == tool)
         .ok_or_else(|| error("tool", format_args!("unknown {tool}")))?;
     check_tool(tool, def, args)?;
     let unit = board_unit(design, "board", arg(args, "board"))?;
     let asked = arg(args, "profile").expect("required field checked").trim();
-    let profile = fab_elec_cam::PROFILES.iter().find(|name| name.eq_ignore_ascii_case(asked)).ok_or_else(|| {
-        error("profile", format_args!("no factory profile {asked}; the built-in ones are {}", fab_elec_cam::PROFILES.join(", ")))
-    })?;
-    if unit.factory.as_deref() == Some(*profile) {
+    let profile = &fab_elec_cam::profile_doc::lookup(profiles, asked).map_err(|why| error("profile", why))?.name;
+    if unit.factory.as_deref() == Some(profile.as_str()) {
         return Err(error("profile", format_args!("{} is made by {profile} already", unit.name)));
     }
     Ok(Plan::Edit(Resolved {
@@ -387,21 +394,22 @@ pub fn part_place(design: &Design, _docs: Option<&Docs>, tool: &str, args: &[(St
         if side.is_some_and(|s| s != placed.side) {
             return Err(error("side", format_args!("{refdes} is placed and keeps its side; only at moves it")));
         }
-        if at == placed.at { return Err(error("at", format_args!("{refdes} is there already"))); }
         let delta = |a: i32, b| a.checked_sub(b).ok_or_else(|| error("at", "move is outside the board coordinate range"));
         let by = P::new(delta(at.x, placed.at.x)?, delta(at.y, placed.at.y)?);
-        let mut ops = vec![DesignOp::Board { unit: unit.id, op: BoardOp::Move { item: placed.id, by } }];
-        ops.extend(label_ops(unit.id, board, &ops, &[placed.id]));
-        return Ok(Plan::Edit(Resolved { ops, place: vec![], label: format!("Move {refdes}") }));
+        let ops = vec![DesignOp::Board { unit: unit.id, op: BoardOp::Move { item: placed.id, by } }];
+        let plan = legal_plan(unit, args, Resolved { ops, place: vec![], label: format!("Move {refdes}") }, PlacementEdit::Move(placed.id))?;
+        if at == placed.at && matches!(plan, Plan::Edit(_)) {
+            return Err(error("at", format_args!("{refdes} is there already")));
+        }
+        return Ok(plan);
     }
-    if placement_op(design, unit.id, comp.id, at, rot.unwrap_or(Angle::ZERO), side.unwrap_or(Side::Top)).is_none() {
-        return Err(error("part", format_args!("{refdes} has no footprint to place")));
-    }
-    Ok(Plan::Edit(Resolved {
+    let drop = placement_op(design, unit.id, comp.id, at, rot.unwrap_or(Angle::ZERO), side.unwrap_or(Side::Top))
+        .ok_or_else(|| error("part", format_args!("{refdes} has no footprint to place")))?;
+    legal_plan(unit, args, Resolved {
         ops: vec![],
         place: vec![Place { unit: unit.id, part: PartRef::Path(comp.path.clone()), at, rot, side }],
         label: format!("Place {refdes}"),
-    }))
+    }, PlacementEdit::Tray(&drop))
 }
 
 /// Read in circuit order. Each included unit indexes its placements and pins once. Part and prefix
@@ -479,7 +487,7 @@ pub fn design_read(design: &Design, args: &[(String, String)]) -> Result<String,
 const CHECK_PAGE: usize = 40;
 
 /// The family a check belongs to, as `elec.check.list` names it.
-fn check_family(kind: &CheckKind) -> &'static str {
+pub(crate) fn check_family(kind: &CheckKind) -> &'static str {
     use CheckKind::*;
     match kind {
         PinConflict | UndrivenInput | PowerNotDriven | UnconnectedPin | SinglePinNet | DuplicateRefdes
@@ -580,7 +588,7 @@ fn sel_text(design: &Design, sel: &Sel) -> String {
 }
 
 /// The stages still running on the shown design, by name; empty when every check is current.
-fn pending_checks(stale: StageFlags) -> Vec<&'static str> {
+pub(crate) fn pending_checks(stale: StageFlags) -> Vec<&'static str> {
     [
         (StageFlags::EVAL, "evaluation"), (StageFlags::ENGINE, "engine"), (StageFlags::CONNECT, "connectivity"),
         (StageFlags::FILLS, "fills"), (StageFlags::DRC, "drc"), (StageFlags::MECH, "mechanical"),
@@ -675,7 +683,7 @@ pub fn finding_text(design: &Design, v: &Violation) -> String {
         write!(out, " fix: {}", quote(&v.fix_hint)).unwrap();
     }
     if let Some(at) = v.at {
-        write!(out, " at: [{} {}]", mm_text(at.x.into()), mm_text(at.y.into())).unwrap();
+        write!(out, " at: {}", list([mm_text(at.x.into()), mm_text(at.y.into())])).unwrap();
     }
     out.push_str(" items: [");
     for sel in &v.items {

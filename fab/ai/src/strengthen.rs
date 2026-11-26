@@ -604,7 +604,7 @@ impl Session {
         }
         let request_id = str_arg(args, "request_id").map_or_else(|| self.next_request_id(TOOL), str::to_string);
         let base = self.slices.as_ref().and_then(|src| src.made(&ev)).map(|paths| Arc::new(crate::volumes::VolumeBase::of(paths, &ev)));
-        match self.model.apply(&mut self.eval, &request_id, expected, &changes, cancelled) {
+        match self.commit_changes(&request_id, expected, &changes, cancelled, true) {
             Ok((applied, built)) => {
                 makepad_error_log::flight::mark_ab("fab.strength.apply", &words, done.len() as u64, 0);
                 if let Some(base) = base {
@@ -663,4 +663,4 @@ fn spot_target(spot: &Spot, line: Option<([f64; 3], [f64; 3])>) -> Result<Value,
 
 #[cfg(test)]
 #[path = "strengthen_tests.rs"]
-mod tests;
+pub(crate) mod tests;

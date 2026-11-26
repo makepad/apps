@@ -25,7 +25,9 @@
 //! names a body for a person where its object lists several.
 //! A solid reserves board space with `keepouts: [..]` or
 //! `m.keepouts(part, [..])`. These records stay on that solid; their outlines use the
-//! board's own coordinates and their height bands are measured up from its top surface.
+//! board's own coordinates. The height band is measured outward from the surface named
+//! by `side: @top | @bottom`, defaulting to `@top`. An optional `feature` key ties the
+//! record to its port's part. A record with `room: true` reserves space only against other rooms.
 //!
 //! Units: the VM holds lengths in metres and angles in radians (`150mm`,
 //! `90°`); `Options::unit` scales lengths into the kernel's (1000 for a
@@ -55,11 +57,13 @@ pub mod screw;
 pub use generated::{GenPart, GenRequest, GenSolid, PanelReq};
 pub mod names;
 pub mod protos;
+mod isolate;
 mod texture;
 mod veins;
 mod vm;
 mod voronoi;
 
+pub use isolate::ModuleIsolate;
 pub use vm::{Obj, ParamCall, Reader, V};
 pub use makepad_csg_sdf as csg_sdf;
 pub use makepad_csg_graph as csg_graph;
@@ -69,7 +73,7 @@ use makepad_csg_graph::{Align, BoolMode, BrepOp, SplitPiece, SplitPins, Font, Sd
 use makepad_csg_mech::weave::{self, Frame, SquareLink, Weave, WeaveProfile};
 use names::Names;
 use protos::{Kind, Proto};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -81,9 +85,42 @@ pub struct Diag {
     pub message: String,
 }
 
+impl Diag {
+    fn is_array_minus_warning(&self) -> bool {
+        self.message.starts_with('`') && self.message.contains("` inside [ ] reads as one value, ")
+    }
+
+    fn is_list_size_mismatch(&self) -> bool {
+        let Some((_, sizes)) = self.message.split_once("' must be ") else { return false };
+        let Some((expected, actual)) = sizes.split_once(" numbers [..], not a list of ") else { return false };
+        expected.parse::<usize>().is_ok() && actual.parse::<usize>().is_ok()
+    }
+}
+
 impl std::fmt::Display for Diag {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{}:{}: {}", self.line, self.col, self.message)
+    }
+}
+
+/// Which source produced the diagnostics when a document inherits imports.
+#[derive(Debug)]
+pub enum EvalError {
+    Imports(Vec<Diag>),
+    Document(Vec<Diag>),
+}
+
+impl EvalError {
+    pub fn diagnostics(self) -> Vec<Diag> {
+        match self {
+            Self::Imports(d) | Self::Document(d) => d,
+        }
+    }
+}
+
+impl From<Vec<Diag>> for EvalError {
+    fn from(d: Vec<Diag>) -> Self {
+        Self::Document(d)
     }
 }
 
@@ -371,6 +408,13 @@ pub enum OpticsSource {
     Measured,
 }
 
+/// The board surface from which a keepout's height band is measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeepoutSide {
+    Top,
+    Bottom,
+}
+
 /// This records space on a board that this solid keeps clear of other parts.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Keepout {
@@ -378,11 +422,17 @@ pub struct Keepout {
     pub board: String,
     /// This names the thing keeping the space clear, with one record per thing.
     pub name: String,
+    /// The host key of the port whose part carries this record, if any.
+    pub feature: Option<String>,
+    /// A room reserves its outline only against other rooms.
+    pub room: bool,
     /// This is the outline in the board's own frame, in kernel units, with the board's
     /// x and y coordinates.
     pub area: Vec<[f64; 2]>,
-    /// This is the occupied band `[low, high]`, in kernel units, measured up from the
-    /// board's top surface.
+    /// The board surface the band is measured from (`@top` unless the record says `@bottom`).
+    pub side: KeepoutSide,
+    /// This is the occupied band `[low, high]`, in kernel units, measured outward from the
+    /// board's surface on `side`.
     pub z: [f64; 2],
 }
 
@@ -401,7 +451,15 @@ pub struct Solid {
     /// Made inside a fn of the script: the call at the top level it came from.
     pub call: Option<FnCall>,
     pub parent: Option<usize>,
+    /// The feature tree puts each solid under its first user.
     pub children: Vec<usize>,
+    /// The solids this step reads, in argument order, including repeated, shared and
+    /// bypassed operands. A value that never lowered to a solid has no entry.
+    pub inputs: Vec<usize>,
+    /// The segment names of an exact generator's direct Path, indexed by its side faces.
+    pub sides: Vec<Option<String>>,
+    /// Named children whose name or segment object occurs twice, in ascending side order.
+    ambiguous_sides: Vec<usize>,
     /// Named by a `let`.
     pub named: bool,
     /// Bypassed when used as a boolean operand.
@@ -425,6 +483,14 @@ pub struct Solid {
     /// column of `m.edge(..)` or `b.top`), in the order the step takes them: a lost one's text
     /// is replaced there. `None`: made where no line of the script shows it.
     pub selectors: Vec<Option<(u32, u32)>>,
+}
+
+impl Solid {
+    /// A child name that selects this side unambiguously when written back to the sketch.
+    pub fn side_name(&self, index: usize) -> Option<&str> {
+        let name = self.sides.get(index)?.as_deref()?;
+        self.ambiguous_sides.binary_search(&index).is_err().then_some(name)
+    }
 }
 
 /// A flat part printed in full colour from the loaded filaments (`m.picture`), or the swatch
@@ -568,6 +634,33 @@ pub struct Program {
     pub veins_requests: Vec<VeinsRequest>,
     /// The instructions the script ran, of its budget [`EVAL_LIMIT`].
     pub instructions: u64,
+    /// The calls the script left for its host (`m.host_call`), in the order they were made.
+    pub host_calls: Vec<HostCall>,
+}
+
+/// The keepout records in `list` (the list a solid's `keepouts` field takes, read from a
+/// [`ModuleIsolate`] call's result for one), as a solid's own are read: lengths in `unit` per metre,
+/// the same validation and the same errors.
+pub fn read_keepouts(list: &V, unit: f64) -> Result<Vec<Keepout>, Diag> {
+    let holder = Obj { ident: 0, part: None, proto: None, fields: vec![("keepouts".to_string(), list.clone())], items: Vec::new(), children: Vec::new(), loc: None };
+    let proto = &protos::PROTOS[0];
+    Fields { obj: &holder, proto, unit }.keepouts().map_err(|mut d| {
+        d.message = d.message.strip_prefix(&format!("{}: ", proto.name)).map(str::to_string).unwrap_or(d.message);
+        d
+    })
+}
+
+/// A library fn the script left for its host to call again (`m.host_call(light_plan, {..},
+/// board: "unit")`), with the arguments the script called it with: plain values, by the fn's
+/// parameter names. The host adds the arguments it owns and calls it in a [`ModuleIsolate`].
+#[derive(Clone, Debug)]
+pub struct HostCall {
+    /// The unit the call is about.
+    pub board: String,
+    /// The name the library exports the fn under.
+    pub function: String,
+    pub args: Vec<(String, V)>,
+    pub loc: Option<(u32, u32)>,
 }
 
 pub use vm::EVAL_LIMIT;
@@ -579,6 +672,25 @@ impl Program {
     pub fn source(&self) -> &str {
         self.names.syntax.source()
     }
+}
+
+thread_local! {
+    /// [`work_done`]'s counts on this thread.
+    static WORK: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// How many program evaluations and syntax parses of a program's names this thread has run so
+/// far. A test reads it before and after a path to check how much work the path does by count,
+/// not by timing.
+pub fn work_done() -> (u64, u64) {
+    WORK.with(|w| w.get())
+}
+
+fn count_work(evaluations: u64, parses: u64) {
+    WORK.with(|w| {
+        let (e, p) = w.get();
+        w.set((e + evaluations, p + parses));
+    });
 }
 
 /// A program's creation sites, from its syntax alone.
@@ -604,14 +716,23 @@ pub fn evaluate_with_names(source: &str, opts: &Options, prior: Option<Arc<Names
 /// draft whose statement lost its selector builds as if that statement were not there; the
 /// solid keeps its id, line and selectors).
 pub fn evaluate_skipping(source: &str, opts: &Options, prior: Option<Arc<Names>>, skip: &[String]) -> Result<Program, Vec<Diag>> {
-    let names = match prior.filter(|names| names.syntax.source() == source) {
-        Some(names) => names,
-        None => names_of(source)?,
-    };
-    let mut ev = vm::evaluate(source, opts.extension, opts.roots, opts.overrides.clone(), opts.libraries, opts.inputs);
-    if !ev.errors.is_empty() {
-        return Err(ev.errors.clone());
+    opts.evaluate_with_imports(source, &[], prior, skip).map_err(EvalError::diagnostics)
+}
+
+impl Options<'_> {
+    /// Evaluate with the enclosing document's ordered `use` statements in a parent scope.
+    pub fn evaluate_with_imports(&self, source: &str, imports: &[String], prior: Option<Arc<Names>>, skip: &[String]) -> Result<Program, EvalError> {
+        let names = match prior.filter(|names| names.syntax.source() == source) {
+            Some(names) => names,
+            None => names_of(source)?,
+        };
+        count_work(1, 0);
+        let ev = vm::evaluate(source, self, imports)?;
+        lower_program(ev, self, names, skip).map_err(EvalError::Document)
     }
+}
+
+fn lower_program(mut ev: vm::Evaluated, opts: &Options, names: Arc<Names>, skip: &[String]) -> Result<Program, Vec<Diag>> {
     let ctx = ev.ctx.clone();
     let instructions = ev.instructions;
     let mut part_names = part_names(&names, &ctx.borrow().parts);
@@ -632,7 +753,7 @@ pub fn evaluate_skipping(source: &str, opts: &Options, prior: Option<Arc<Names>>
         }
         let named_lines = part_names.iter().filter(|n| n.contains('@')).cloned().collect();
         let fn_calls = fn_calls(&names, &ctx.parts, &part_names);
-        let mut l = Lower { reader, graph: Graph::new(), solids: Vec::new(), notes: Vec::new(), memo: HashMap::new(), bodies: HashMap::new(), lowering: Vec::new(), roots: std::collections::HashSet::new(), names: &names, part_names: &part_names, pieces: ctx.parts.iter().map(|p| p.piece).collect(), fn_calls: &fn_calls, named_lines, unit: opts.unit, assets: opts.assets, images: opts.images, materials: Vec::new(), material_filaments: HashMap::new(), weave: opts.weave, texture_lib: ctx.texture.as_ref().map(|r| r.as_object()), solved: &opts.solved, stress_requests: Vec::new(), grow_requests: Vec::new(), veins_requests: Vec::new(), generated: opts.generated, panels: Vec::new(), gen_requests: Vec::new(), gen_ids: HashMap::new(), skip };
+        let mut l = Lower { reader, graph: Graph::new(), solids: Vec::new(), notes: Vec::new(), memo: HashMap::new(), path_segments: HashMap::new(), profile_paths: HashMap::new(), scaled_holes: HashMap::new(), bodies: HashMap::new(), lowering: Vec::new(), roots: std::collections::HashSet::new(), names: &names, part_names: &part_names, pieces: ctx.parts.iter().map(|p| p.piece).collect(), fn_calls: &fn_calls, named_lines, unit: opts.unit, assets: opts.assets, images: opts.images, materials: Vec::new(), material_filaments: HashMap::new(), weave: opts.weave, texture_lib: ctx.texture.as_ref().map(|r| r.as_object()), solved: &opts.solved, stress_requests: Vec::new(), grow_requests: Vec::new(), veins_requests: Vec::new(), generated: opts.generated, panels: Vec::new(), gen_requests: Vec::new(), gen_ids: HashMap::new(), skip };
         for call in &ctx.roots {
             for (_, value) in &call.args {
                 let v = l.reader.read(*value);
@@ -696,8 +817,47 @@ pub fn evaluate_skipping(source: &str, opts: &Options, prior: Option<Arc<Names>>
             return Err(errors);
         }
         Ok((l.graph, l.material_filaments, l.solids, roots, joints, l.notes, l.stress_requests, l.grow_requests, l.veins_requests, l.panels, l.gen_requests))
+    }).map_err(|mut errors| {
+        ev.warnings.retain(Diag::is_array_minus_warning);
+        if ev.warnings.is_empty() {
+            return errors;
+        }
+        for error in errors.iter_mut().filter(|e| e.is_list_size_mismatch()) {
+            // Fields::nums reports the builder's creation site. Its syntax span also
+            // covers arguments on later lines, up to the end of this particular call.
+            let Some(site) = names.site(Some((error.line, error.col))) else { continue };
+            let span = names.line_col(site.span.start)..names.line_col(site.span.end);
+            for warning in ev.warnings.iter().filter(|w| span.contains(&(w.line, w.col))) {
+                error.message.push_str(&format!(". Array warning at {warning}"));
+            }
+        }
+        errors.append(&mut ev.warnings);
+        errors
     })?;
     let (graph, material_filaments, solids, roots, joints, mut notes, stress_requests, grow_requests, veins_requests, panels, gen_requests) = out;
+    let recorded: Vec<_> = ctx.borrow().host_calls.iter().map(|c| (c.board.clone(), c.function.clone(), c.args, c.loc)).collect();
+    let mut host_calls = Vec::with_capacity(recorded.len());
+    let mut call_errors = Vec::new();
+    ev.with_vm(|vm| {
+        let mut reader = Reader::new(vm, Vec::new());
+        for (board, function, args, loc) in recorded {
+            let at = loc.unwrap_or((1, 1));
+            let args = match reader.read(args) {
+                V::Obj(o) if o.proto.is_none() && o.items.is_empty() => o.fields.clone(),
+                _ => {
+                    call_errors.push(Diag { line: at.0, col: at.1, message: "m.host_call's arguments are a record of plain values".into() });
+                    continue;
+                }
+            };
+            match args.iter().try_for_each(|(k, v)| isolate::plain(v).map_err(|why| format!("m.host_call argument '{k}' {why}"))) {
+                Ok(()) => host_calls.push(HostCall { board, function, args, loc }),
+                Err(message) => call_errors.push(Diag { line: at.0, col: at.1, message }),
+            }
+        }
+    });
+    if !call_errors.is_empty() {
+        return Err(call_errors);
+    }
     notes.splice(0..0, ev.warnings);
     let params = ctx.borrow().params.iter().map(|call| {
         let site = names.site(call.loc);
@@ -705,7 +865,7 @@ pub fn evaluate_skipping(source: &str, opts: &Options, prior: Option<Arc<Names>>
         Param { name: site.and_then(|s| s.name.clone()), call: call.clone(), value_span }
     }).collect();
     let inputs_read = ctx.borrow().inputs_read.clone();
-    Ok(Program { graph, material_filaments, solids, joints, params, roots, names, notes, stress_requests, grow_requests, veins_requests, panels, gen_requests, instructions, inputs_read })
+    Ok(Program { graph, material_filaments, solids, joints, params, roots, names, notes, stress_requests, grow_requests, veins_requests, panels, gen_requests, instructions, inputs_read, host_calls })
 }
 
 /// Each part made inside a script fn: the call at the top level it came from, and whether the
@@ -789,6 +949,12 @@ struct Lower<'a, 'v, 'b> {
     graph: Graph,
     solids: Vec<Solid>,
     memo: HashMap<usize, usize>,
+    /// Local side indices by Path and segment heap identity. A list can reuse an object.
+    path_segments: HashMap<usize, HashMap<usize, Vec<usize>>>,
+    /// Each exact generator's Paths and their starting side indices in the flattened sketch.
+    profile_paths: HashMap<usize, Vec<(usize, Option<usize>)>>,
+    /// Hole steps drilled under a scaled placement, by the placement key they bypassed.
+    scaled_holes: HashMap<csg_graph::Key, HashSet<NodeId>>,
     /// Each part's distance field before its placement, by part: lowered once, however many
     /// blends take it.
     bodies: HashMap<usize, (SdfNode, ([f64; 3], [f64; 3]))>,
@@ -952,8 +1118,8 @@ impl<'o> Fields<'o> {
                 _ => return self.err("'keepouts' must contain {board name area z} records"),
             };
             for (key, _) in &obj.fields {
-                if !matches!(key.as_str(), "board" | "name" | "area" | "z") {
-                    return self.err(format!("'keepouts.{key}' is not a field (fields: board, name, area, z)"));
+                if !matches!(key.as_str(), "board" | "name" | "area" | "side" | "z" | "feature" | "room") {
+                    return self.err(format!("'keepouts.{key}' is not a field (fields: board, name, area, side, z, feature, room)"));
                 }
             }
             let text = |key: &str| -> Res<String> {
@@ -964,6 +1130,18 @@ impl<'o> Fields<'o> {
             };
             let board = text("board")?;
             let name = text("name")?;
+            let feature = obj.get("feature").map(|_| text("feature")).transpose()?;
+            let room = match obj.get("room") {
+                None => false,
+                Some(V::Bool(b)) => *b,
+                Some(_) => return self.err("'keepouts.room' must be true or false"),
+            };
+            let side = match obj.get("side") {
+                None => KeepoutSide::Top,
+                Some(V::Id(s)) if s == "top" => KeepoutSide::Top,
+                Some(V::Id(s)) if s == "bottom" => KeepoutSide::Bottom,
+                Some(_) => return self.err("'keepouts.side' must be @top or @bottom"),
+            };
             let area = match obj.get("area") {
                 Some(V::Arr(points)) if points.len() >= 3 => points.iter().map(|point| {
                     let p = self.p2_of("keepouts.area", point)?;
@@ -981,7 +1159,7 @@ impl<'o> Fields<'o> {
             if !z.iter().all(|n| n.is_finite()) || z[0] >= z[1] {
                 return self.err("'keepouts.z' must be two finite numbers [low, high] with low < high in kernel units");
             }
-            Ok(Keepout { board, name, area, z })
+            Ok(Keepout { board, name, feature, room, area, side, z })
         }).collect()
     }
     /// A `rotate` in degrees about X, then Y, then Z: three angles, or `{to: [x y z]}`, the
@@ -1073,8 +1251,22 @@ impl<'o> Fields<'o> {
         }
     }
     fn check(&self) -> Res<()> {
+        let mut child_names = HashSet::new();
+        if self.proto.name == "Path" {
+            for (name, child) in &self.obj.children {
+                let Some(name) = name.as_deref() else { continue };
+                if matches!(name, "start" | "from" | "segs" | "at") {
+                    let (line, col) = child.obj().and_then(|o| o.loc).or(self.obj.loc).unwrap_or((1, 1));
+                    return Err(Diag { line, col, message: format!("a segment can't be named `{name}`: the Path uses that name; call it base, lip, ...") });
+                }
+                child_names.insert(name);
+            }
+            if !self.obj.children.is_empty() && self.obj.get("segs").is_some() {
+                return self.err("a Path takes its segments as children or as segs: [..], not both");
+            }
+        }
         for (k, _) in &self.obj.fields {
-            if self.proto.field(k).is_none() {
+            if self.proto.field(k).is_none() && !child_names.contains(k.as_str()) {
                 let mut known: Vec<&str> = self.proto.fields.iter().map(|f| f.key).collect();
                 if self.proto.is_solid() {
                     known.extend(protos::PLACEMENT.iter().map(|f| f.key));
@@ -1088,6 +1280,78 @@ impl<'o> Fields<'o> {
             }
         }
         Ok(())
+    }
+}
+
+/// A Path has one side per segment and one more if the last piece leaves a closing line.
+fn path_side_count(start: [f64; 2], segs: &[Seg]) -> usize {
+    let mut at = start;
+    let mut prev = start;
+    for seg in segs {
+        let to = match seg {
+            Seg::Line(to) | Seg::ArcThrough { to, .. } | Seg::ArcRadius { to, .. } | Seg::Tangent(to) => *to,
+            Seg::Spline(points) => points.last().copied().unwrap_or(at),
+            Seg::Rel(d) => [at[0] + d[0], at[1] + d[1]],
+            Seg::H(dx) => [at[0] + dx, at[1]],
+            Seg::V(dy) => [at[0], at[1] + dy],
+            Seg::Polar { len, deg } => [at[0] + len * deg.to_radians().cos(), at[1] + len * deg.to_radians().sin()],
+            Seg::Fillet(_) | Seg::Chamfer(_) => continue,
+        };
+        prev = at;
+        at = to;
+    }
+    let out = [start[0] - at[0], start[1] - at[1]];
+    let closing = out[0].hypot(out[1]);
+    // A final corner can trim the whole closing line. Its incoming and outgoing
+    // directions are those of the untrimmed lines, even after an earlier corner.
+    let trimmed = match segs.last() {
+        Some(Seg::Chamfer(d)) => *d,
+        Some(Seg::Fillet(r)) if closing > 0.0 => {
+            let inc = [at[0] - prev[0], at[1] - prev[1]];
+            let cos = (inc[0] * out[0] + inc[1] * out[1]) / (inc[0].hypot(inc[1]) * closing);
+            r * ((1.0 - cos).max(0.0) / (1.0 + cos).max(1e-12)).sqrt()
+        }
+        _ => 0.0,
+    };
+    segs.len() + usize::from((closing - trimmed).abs() > 1e-9)
+}
+
+/// Number of exact profile pieces preceding a later Path, for a repeated segment's diagnostic.
+fn shape_side_count(shape: &Shape) -> Option<usize> {
+    Some(match shape {
+        Shape::Path { start, segs } => path_side_count(*start, segs),
+        Shape::Rect { corner, chamfer, .. } => if corner.max(*chamfer) > 0.0 { 8 } else { 4 },
+        Shape::Circle { .. } => 1,
+        Shape::Slot { a, b, .. } => if (a[0] - b[0]).hypot(a[1] - b[1]) < 1e-12 { 1 } else { 4 },
+        Shape::Regular { sides, .. } => *sides,
+        Shape::Polygon { points, fillet } => if *fillet > 0.0 { points.len().saturating_mul(2).saturating_sub(1) } else { points.len() },
+        Shape::Offset { of, d } => return shape_side_count(&makepad_csg_cad::sketch::offset_shape(of, *d)?.ok()?),
+        Shape::Ellipse { .. } | Shape::Gear { .. } => return None,
+    })
+}
+
+/// Express a selector on a placed body in the names its input carries before placement.
+fn face_before_place(name: &mut FaceName, placed: &csg_graph::Key, input: &csg_graph::Key) {
+    if name.origin == *placed {
+        name.origin = *input;
+    }
+    match &mut name.role {
+        Role::Blend(a, b) => {
+            face_before_place(a, placed, input);
+            face_before_place(b, placed, input);
+            if a > b {
+                std::mem::swap(a, b);
+            }
+        }
+        Role::Corner(faces) => {
+            for face in faces.iter_mut() {
+                face_before_place(face, placed, input);
+            }
+            faces.sort();
+            faces.dedup();
+        }
+        Role::Inner(Some(face)) => face_before_place(face, placed, input),
+        Role::Named(_) | Role::Side(_) | Role::Inner(None) => {}
     }
 }
 
@@ -1164,12 +1428,33 @@ impl<'a, 'v, 'b> Lower<'a, 'v, 'b> {
             }
             Some(_) => return self.fields(&obj)?.err("'frame' must be Frame{name at rotate}"),
         };
-        self.solids.push(Solid { id: id.clone(), proto: proto.name, asset: None, node: NodeId(0), loc: obj.loc, span: site.map(|s| s.span), call: self.fn_calls[part].clone(), parent: None, children: Vec::new(), named, off, link, label, optics, keepouts, frame, picture: None, selectors: Vec::new() });
+        self.solids.push(Solid { id: id.clone(), proto: proto.name, asset: None, node: NodeId(0), loc: obj.loc, span: site.map(|s| s.span), call: self.fn_calls[part].clone(), parent: None, children: Vec::new(), inputs: Vec::new(), sides: Vec::new(), ambiguous_sides: Vec::new(), named, off, link, label, optics, keepouts, frame, picture: None, selectors: Vec::new() });
         self.memo.insert(part, index);
         self.lowering.push(index);
         let node = self.solid_op(&obj, &id, index);
         self.lowering.pop();
         self.solids[index].node = node?;
+        // The resolved arguments still include everything the geometry bypassed. Read
+        // each field once, with the positional fields first (including a panel's base).
+        fn collect(value: &V, memo: &HashMap<usize, usize>, index: usize, inputs: &mut Vec<usize>) {
+            match value {
+                V::Arr(items) => {
+                    for item in items {
+                        collect(item, memo, index, inputs);
+                    }
+                }
+                V::Obj(o) => {
+                    if let Some(&i) = o.part.and_then(|p| memo.get(&p)).filter(|&&i| i != index) {
+                        inputs.push(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let options = proto.fields.iter().map(|f| f.key).filter(|k| !proto.args.contains(k));
+        for value in proto.args.iter().copied().chain(options).filter_map(|key| obj.get(key)) {
+            collect(value, &self.memo, index, &mut self.solids[index].inputs);
+        }
         Ok(index)
     }
 
@@ -1422,20 +1707,20 @@ impl<'a, 'v, 'b> Lower<'a, 'v, 'b> {
             }
             "BrepFillet" => {
                 let source = brep_child(self, "source", f.need("source")?)?;
-                let op = BrepOp::Fillet { radius: f.len("radius")?, edges: self.edges(&f)? };
+                let op = BrepOp::Fillet { radius: f.len("radius")?, edges: self.edges(&f, source)? };
                 self.skipped(id, op, source)
             }
             "BrepChamfer" => {
                 let source = brep_child(self, "source", f.need("source")?)?;
-                let op = BrepOp::Chamfer { size: f.len("size")?, edges: self.edges(&f)? };
+                let op = BrepOp::Chamfer { size: f.len("size")?, edges: self.edges(&f, source)? };
                 self.skipped(id, op, source)
             }
             "BrepShell" => {
                 let source = brep_child(self, "source", f.need("source")?)?;
                 let is_face = |v: &V| matches!(v, V::Obj(o) if o.proto.as_deref() == Some("Face"));
                 let open = match f.get("open") {
-                    Some(v) if is_face(v) => Open::Faces(vec![self.selector_face(&f, "open", v)?]),
-                    Some(V::Arr(list)) if !list.is_empty() && list.iter().all(is_face) => Open::Faces(list.iter().map(|v| self.selector_face(&f, "open", v)).collect::<Res<_>>()?),
+                    Some(v) if is_face(v) => Open::Faces(vec![self.selector_face(&f, "open", v, source)?]),
+                    Some(V::Arr(list)) if !list.is_empty() && list.iter().all(is_face) => Open::Faces(list.iter().map(|v| self.selector_face(&f, "open", v, source)).collect::<Res<_>>()?),
                     _ => match f.choice("open", "top")? {
                         "bottom" => Open::Bottom,
                         "closed" => Open::Closed,
@@ -1443,6 +1728,16 @@ impl<'a, 'v, 'b> Lower<'a, 'v, 'b> {
                     },
                 };
                 self.skipped(id, BrepOp::Shell { thickness: f.len("thickness")?, open }, source)
+            }
+            "BrepPull" => {
+                let source = brep_child(self, "source", f.need("source")?)?;
+                let face = self.selector_face(&f, "face", f.need("face")?, source)?;
+                let by = f.len("by")?;
+                // (a pull by nothing leaves the body as it is: a drag passing 0)
+                if by == 0.0 {
+                    return self.placed(&f, source);
+                }
+                self.skipped(id, BrepOp::Pull { face, by }, source)
             }
             "BrepOffset" => {
                 let source = brep_child(self, "source", f.need("source")?)?;
@@ -1578,28 +1873,61 @@ impl<'a, 'v, 'b> Lower<'a, 'v, 'b> {
             "Thread" => Op::Thread { diameter: f.len("diameter")?, pitch: f.opt_len("pitch")?, length: f.len("length")?, clearance: f.opt_len("clearance")?.unwrap_or(0.0), left: f.flag("left", false)?, runout: f.opt_len("runout")?, internal: f.flag("internal", false)? },
             "Fillet" => {
                 let source = field_child(self, "source")?;
-                Op::Fillet { source, radius: f.len("radius")?, edges: self.edges(&f)? }
+                Op::Fillet { source, radius: f.len("radius")?, edges: self.edges(&f, source)? }
             }
             "Chamfer" => {
                 let source = field_child(self, "source")?;
-                Op::Chamfer { source, size: f.len("size")?, edges: self.edges(&f)? }
+                Op::Chamfer { source, size: f.len("size")?, edges: self.edges(&f, source)? }
             }
-            "Hole" => {
-                let source = field_child(self, "source")?;
+            "Hole" | "BrepHole" => {
+                let exact = f.proto.name == "BrepHole";
+                let source = if exact { brep_child(self, "source", f.need("source")?)? } else { field_child(self, "source")? };
                 let kind = match f.choice("kind", "simple")? {
                     "counterbore" => HoleKind::Counterbore { bore_diameter: f.len("bore_diameter")?, bore_depth: f.len("bore_depth")? },
                     "countersink" => HoleKind::Countersink { sink_diameter: f.len("sink_diameter")?, angle: f.opt_angle("angle")?.unwrap_or(90.0) },
                     "tapped" => HoleKind::Tapped { pitch: f.opt_len("pitch")?, clearance: f.opt_len("clearance")?.unwrap_or(0.15 * self.unit / 1000.0) },
                     _ => HoleKind::Simple,
                 };
-                let dir = match f.get("dir") {
-                    Some(v) => {
-                        let a = f.nums("dir", v, 3)?;
-                        [a[0], a[1], a[2]]
+                let dir = f.get("dir").map(|v| f.nums("dir", v, 3).map(|a| [a[0], a[1], a[2]])).transpose()?;
+                let diameter = f.len("diameter")?;
+                let depth = f.opt_len("depth")?;
+                let at = f.points3("at")?;
+                if exact {
+                    let mut on = f.get("on").map(|v| self.selector_face(&f, "on", v, source)).transpose()?;
+                    let hole = |at, dir, on| BrepOp::Hole { kind, diameter, depth, at, dir, on };
+                    // A scaled cut is always re-placed, so its scale is explicit on the outer
+                    // node. Use the written factors to distinguish even a near-unit scale.
+                    match &self.graph.node(source).op {
+                        Op::Brep { op: BrepOp::Place { at: moved, rotate, scale }, inputs } if *scale != [1.0; 3] && inputs.len() == 1 => {
+                            let (placed, inner) = (BrepOp::Place { at: *moved, rotate: *rotate, scale: *scale }, inputs[0]);
+                            let origin = self.graph.node(source).key;
+                            if let Some(face) = &mut on {
+                                face_before_place(face, &origin, &self.graph.node(inner).key);
+                            }
+                            let drilled = self.skipped(id, hole(at, dir, on), inner);
+                            let drilled = self.push(&f, drilled)?;
+                            // Known residual: scaling the drill with the body bypasses the
+                            // source's placement names. Diagnose their later use at the selector.
+                            if matches!(self.graph.node(drilled).op, Op::Brep { op: BrepOp::Hole { .. }, .. }) {
+                                self.scaled_holes.entry(origin).or_default().insert(drilled);
+                            }
+                            Op::Brep { op: placed, inputs: vec![drilled] }
+                        }
+                        _ => {
+                            let frame = csg_graph::eval::drill_frame(&self.graph, source);
+                            let rotate = |v: P3| frame.map(|r| r[0] * v[0] + r[1] * v[1] + r[2] * v[2]);
+                            let mut points = at;
+                            for p in &mut points {
+                                let v = rotate(*p);
+                                *p = std::array::from_fn(|i| v[i] + frame[i][3]);
+                            }
+                            let dir = dir.or_else(|| on.is_none().then_some([0.0, -1.0, 0.0])).map(rotate);
+                            self.skipped(id, hole(points, dir, on), source)
+                        }
                     }
-                    None => [0.0, -1.0, 0.0],
-                };
-                Op::Hole { source, kind, diameter: f.len("diameter")?, depth: f.opt_len("depth")?, at: f.points3("at")?, dir }
+                } else {
+                    Op::Hole { source, kind, diameter, depth, at, dir: dir.unwrap_or([0.0, -1.0, 0.0]) }
+                }
             }
             "HoleRow" => {
                 let from = f.p3("from")?;
@@ -1907,7 +2235,8 @@ impl<'a, 'v, 'b> Lower<'a, 'v, 'b> {
     /// Placement also applies when a boolean passes a single operand through.
     fn placed(&mut self, f: &Fields, node: NodeId) -> Res<NodeId> {
         // Placement: scale, then rotate, then move.
-        let at = f.opt_p3("at")?;
+        // An exact hole's `at` places the cutters on its source.
+        let at = if f.proto.name == "BrepHole" { None } else { f.opt_p3("at")? };
         let rotate = f.rotation("rotate")?;
         // A part with a scale of its own (a sweep's sizes along the way) takes no placement scale.
         let scale = match f.get("scale") {
@@ -1919,12 +2248,16 @@ impl<'a, 'v, 'b> Lower<'a, 'v, 'b> {
             }
             None => None,
         };
-        if at.is_none() && rotate.is_none() && scale.is_none() {
+        let exact = matches!(self.graph.node(node).op, Op::Brep { .. });
+        // Each exact solid names its faces at its own placement. A hole drilled under
+        // scale or a skipped step already ends in one.
+        if at.is_none() && rotate.is_none() && scale.is_none()
+            && (!exact || matches!(self.graph.node(node).op, Op::Brep { op: BrepOp::Place { .. }, .. })) {
             return Ok(node);
         }
         let (at, rotate, scale) = (at.unwrap_or([0.0; 3]), rotate.unwrap_or([0.0; 3]), scale.unwrap_or([1.0; 3]));
         // A placed body stays a body: the exact ops that follow can still read it.
-        if matches!(self.graph.node(node).op, Op::Brep { .. }) {
+        if exact {
             return self.push(&f, Op::Brep { op: BrepOp::Place { at, rotate, scale }, inputs: vec![node] });
         }
         self.push(&f, Op::Transform { source: node, at, rotate, scale })
@@ -2568,11 +2901,36 @@ impl<'a, 'v, 'b> Lower<'a, 'v, 'b> {
             return f.err(format!("'{key}' has no shapes"));
         }
         let mut shapes = Vec::new();
+        let owner = self.lowering.last().copied().filter(|_| matches!(f.proto.name, "BrepExtrude" | "BrepRevolve"));
+        let mut counted = 0;
+        let mut offset = Some(0);
         for s in list {
+            if let (Some(i), Some(path)) = (owner, s.obj().filter(|o| o.proto.as_deref() == Some("Path"))) {
+                for shape in &shapes[counted..] {
+                    offset = offset.zip(shape_side_count(shape)).map(|(n, count)| n + count);
+                }
+                counted = shapes.len();
+                self.profile_paths.entry(i).or_default().push((path.ident, offset));
+            }
             // SVG path data is as many outlines as it has closed subpaths.
             match s.obj().filter(|o| o.proto.as_deref() == Some("SvgPath")) {
                 Some(o) => shapes.extend(self.svg_path(&self.fields(o)?)?),
                 None => shapes.push(self.shape(s)?),
+            }
+        }
+        if let (Some(i), Some(path), [Shape::Path { start, segs }]) = (owner, v.obj(), shapes.as_slice()) {
+            if path.proto.as_deref() == Some("Path") {
+                let solid = &mut self.solids[i];
+                let indices = &self.path_segments[&path.ident];
+                let mut seen = HashSet::new();
+                let repeated: HashSet<_> = path.children.iter().filter_map(|(name, _)| name.as_deref()).filter(|name| !seen.insert(*name)).collect();
+                for (k, (name, child)) in path.children.iter().enumerate() {
+                    if name.as_deref().is_some_and(|n| repeated.contains(n) || child.obj().is_some_and(|o| indices[&o.ident].len() > 1)) {
+                        solid.ambiguous_sides.push(k);
+                    }
+                    solid.sides.push(name.clone());
+                }
+                solid.sides.resize(path_side_count(*start, segs), None);
             }
         }
         Ok(Sketch::new(shapes))
@@ -2699,10 +3057,33 @@ impl<'a, 'v, 'b> Lower<'a, 'v, 'b> {
             }
             "Path" => {
                 let start = off(s.opt_p2("from")?);
-                let V::Arr(list) = s.need("segs")? else { return s.err("'segs' is a list of segments") };
-                let mut segs = Vec::new();
-                for g in list {
-                    let Some(go) = g.obj() else { return s.err(format!("a segment is LineTo, ArcTo, ... not {}", g.describe())) };
+                let list: Vec<_> = if o.children.is_empty() {
+                    let V::Arr(list) = s.need("segs")? else { return s.err("'segs' is a list of segments") };
+                    list.iter().collect()
+                } else {
+                    o.children.iter().map(|(_, v)| v).collect()
+                };
+                let mut ids: HashMap<usize, Vec<usize>> = HashMap::new();
+                let mut segs = Vec::with_capacity(list.len());
+                for (i, g) in list.into_iter().enumerate() {
+                    let Some(go) = g.obj() else {
+                        if o.children.is_empty() {
+                            return s.err(format!("a segment is LineTo, ArcTo, ... not {}", g.describe()));
+                        }
+                        let syn = &self.names.syntax;
+                        let loc = self.names.site(o.loc).and_then(|site| edit::loc_at(syn, &site.span))
+                            .and_then(|loc| syn.node(&loc)?.object())
+                            .and_then(|(_, fields)| fields.iter().filter(|f| f.op == ":=" || f.name.is_none()).nth(i))
+                            .map(|field| self.names.line_col(field.value.span.start));
+                        let (line, col) = loc.or(o.loc).unwrap_or((1, 1));
+                        return Err(Diag { line, col, message: format!("'{}' is not a path segment", g.describe()) });
+                    };
+                    let tag = go.proto.as_deref().unwrap_or("object");
+                    if !protos::proto(tag).is_some_and(|p| p.group == protos::Group::Segment) {
+                        let (line, col) = go.loc.or(o.loc).unwrap_or((1, 1));
+                        return Err(Diag { line, col, message: format!("'{tag}' is not a path segment") });
+                    }
+                    ids.entry(go.ident).or_default().push(segs.len());
                     let gf = self.fields(go)?;
                     segs.push(match gf.proto.name {
                         "LineTo" => Seg::Line(off(gf.p2("to")?)),
@@ -2721,15 +3102,13 @@ impl<'a, 'v, 'b> Lower<'a, 'v, 'b> {
                         other => return gf.err(format!("'{other}' is not a path segment")),
                     });
                 }
+                self.path_segments.insert(o.ident, ids);
                 Shape::Path { start, segs }
             }
             other => return s.err(format!("'{other}' is not a sketch shape")),
         })
     }
 
-    /// A face named in the script (`b.top`, `r.face(m.edge(b.top, b.front))`, `s.inner()`) as the
-    /// exact engine names it: the step of the part it is of (its builder's, through a placement)
-    /// and its role there.
     /// A B-rep step's op, or (its solid skipped, [`evaluate_skipping`]) its input as it is.
     fn skipped(&self, id: &str, op: BrepOp, source: NodeId) -> Op {
         let op = if self.skip.iter().any(|s| s == id) { BrepOp::Place { at: [0.0; 3], rotate: [0.0; 3], scale: [1.0; 3] } } else { op };
@@ -2744,8 +3123,8 @@ impl<'a, 'v, 'b> Lower<'a, 'v, 'b> {
     }
 
     /// A face a B-rep step selects by, its place recorded ([`Solid::selectors`]).
-    fn selector_face(&mut self, f: &Fields, key: &str, v: &V) -> Res<FaceName> {
-        let name = self.face_name(f, key, v)?;
+    fn selector_face(&mut self, f: &Fields, key: &str, v: &V, input: NodeId) -> Res<FaceName> {
+        let name = self.face_name(f, key, v, input)?;
         // A face its part names (`b.top`) was made with the part, at the part's call: no site
         // of its own ([`edit::selector_site`] finds it in the field).
         let made = v.obj().and_then(|o| o.loc);
@@ -2754,7 +3133,65 @@ impl<'a, 'v, 'b> Lower<'a, 'v, 'b> {
         Ok(name)
     }
 
-    fn face_name(&mut self, f: &Fields, key: &str, v: &V) -> Res<FaceName> {
+    /// Whether a drill under scale bypassed this origin on the way to the selector's input.
+    /// A union can also bring the original placement back through another operand.
+    fn lost_to_scaled_hole(&self, input: NodeId, origin: &csg_graph::Key) -> bool {
+        let Some(holes) = self.scaled_holes.get(origin) else { return false };
+        let mut pending = vec![input];
+        let mut seen = HashSet::new();
+        let mut drilled = false;
+        while let Some(node) = pending.pop() {
+            if !seen.insert(node) {
+                continue;
+            }
+            let step = self.graph.node(node);
+            if &step.key == origin {
+                return false;
+            }
+            drilled |= holes.contains(&node);
+            pending.extend(step.op.inputs());
+        }
+        drilled
+    }
+
+    /// Resolve a segment on the generator whose sketch contains it. The source spelling is
+    /// needed only for a diagnostic; identity decides which side the expression denotes.
+    fn segment_side(&self, f: &Fields, face: &Obj, owner: usize, segment: &Obj) -> Res<Role> {
+        let indices = |path: &usize| self.path_segments.get(path).and_then(|ids| ids.get(&segment.ident));
+        let mut matches = Vec::new();
+        for (path, offset) in self.profile_paths.get(&owner).into_iter().flatten() {
+            if let Some(sides) = indices(path) {
+                matches.extend(sides.iter().map(|&i| (*offset, i)));
+            }
+        }
+        if let [(Some(0), i)] = matches.as_slice() {
+            return Ok(Role::Side(*i as u32));
+        }
+        let syn = &self.names.syntax;
+        let arg = face.loc.and_then(|loc| self.names.call_site(loc)).and_then(|site| edit::loc_at(syn, &site.span))
+            .and_then(|call| syn.node(&call.child(1))).map(|n| &syn.source()[n.span.clone()]).unwrap_or("segment");
+        let path = arg.split_once('.').map_or("its Path", |(p, _)| p);
+        match matches.as_slice() {
+            [] => {
+                let generator = self.solids.iter().enumerate().find(|(i, _)| {
+                    self.profile_paths.get(i).is_some_and(|paths| paths.iter().any(|(p, offset)| *offset == Some(0) && indices(p).is_some()))
+                });
+                let (op, id) = generator.map_or(("extrude", "body"), |(_, s)| (if s.proto == "BrepRevolve" { "revolve" } else { "extrude" }, s.id.as_str()));
+                f.err(format!("side({arg}) names a side of the {op} that drew {path}: write it on that part, e.g. {id}.side({arg})"))
+            }
+            [_] => f.err(format!("side({arg}): put {path} first in its sketch, or name the side by number")),
+            _ => {
+                let Some(sides) = matches.iter().map(|(off, i)| off.map(|o| (o + i).to_string())).collect::<Option<Vec<_>>>() else {
+                    return f.err(format!("{arg} occurs more than once in this profile: name the side by number"));
+                };
+                let (last, others) = sides.split_last().unwrap();
+                f.err(format!("{arg} makes sides {} and {last}: name the side by number, e.g. {}.side({})", others.join(", "), self.solids[owner].id, sides[0]))
+            }
+        }
+    }
+
+    /// A script face takes its role and the key of its solid's own exact step, through tags.
+    fn face_name(&mut self, f: &Fields, key: &str, v: &V, input: NodeId) -> Res<FaceName> {
         let o = match v {
             V::Obj(o) if o.proto.as_deref() == Some("Face") => o.clone(),
             other => return f.err(format!("'{key}' takes faces of exact parts (b.top, r.face(m.edge(b.top, b.front))), not {}", other.describe())),
@@ -2763,40 +3200,44 @@ impl<'a, 'v, 'b> Lower<'a, 'v, 'b> {
         if self.lowering.contains(&index) {
             return f.err(format!("'{key}': {} cannot name its own faces", self.solids[index].id));
         }
+        let segment_side = o.get("seg").and_then(V::obj).map(|seg| self.segment_side(f, &o, index, seg)).transpose()?;
         let mut node = self.solids[index].node;
         loop {
             match &self.graph.node(node).op {
                 Op::Tag { source, .. } => node = *source,
-                Op::Brep { op: BrepOp::Place { .. }, inputs } if inputs.len() == 1 => node = inputs[0],
                 Op::Brep { .. } => break,
                 _ => return f.err(format!("'{key}': {} is not an exact part; faces by name are on m.brep parts", self.solids[index].id)),
             }
         }
         let origin = self.graph.node(node).key;
+        if self.lost_to_scaled_hole(input, &origin) {
+            return f.err("a hole on a scaled placement takes the body's own face names with it; select the face before the hole, or place without scale");
+        }
         let role = match o.get("role") {
             Some(V::Id(r)) => r.clone(),
             _ => return f.err(format!("'{key}': a face without its role")),
         };
         let role = match role.as_str() {
-            "side" => match o.get("index") {
-                Some(V::Num(i)) => Role::Side(*i as u32),
-                _ => return f.err(format!("'{key}': a side is e.side(i)")),
+            "side" => match (segment_side, o.get("index")) {
+                (Some(role), _) => role,
+                (_, Some(V::Num(i))) => Role::Side(*i as u32),
+                _ => return f.err(format!("'{key}': a side is e.side(2) or e.side(section.base)")),
             },
             "blend" => {
-                let a = self.face_name(f, key, o.get("a").unwrap_or(&V::Nil))?;
-                let b = self.face_name(f, key, o.get("b").unwrap_or(&V::Nil))?;
+                let a = self.face_name(f, key, o.get("a").unwrap_or(&V::Nil), input)?;
+                let b = self.face_name(f, key, o.get("b").unwrap_or(&V::Nil), input)?;
                 let (a, b) = if a <= b { (a, b) } else { (b, a) };
                 Role::Blend(Box::new(a), Box::new(b))
             }
             "corner" => {
                 let Some(V::Arr(list)) = o.get("round") else { return f.err(format!("'{key}': a corner is r.corner(a, b, c)")) };
-                let mut round = list.iter().map(|v| self.face_name(f, key, v)).collect::<Res<Vec<_>>>()?;
+                let mut round = list.iter().map(|v| self.face_name(f, key, v, input)).collect::<Res<Vec<_>>>()?;
                 round.sort();
                 round.dedup();
                 Role::Corner(round)
             }
             "inner" => Role::Inner(match o.get("outer") {
-                Some(v) => Some(Box::new(self.face_name(f, key, v)?)),
+                Some(v) => Some(Box::new(self.face_name(f, key, v, input)?)),
                 None => None,
             }),
             r => match FaceRole::from_name(r) {
@@ -2807,7 +3248,7 @@ impl<'a, 'v, 'b> Lower<'a, 'v, 'b> {
         Ok(FaceName { origin, role })
     }
 
-    fn edges(&mut self, f: &Fields) -> Res<EdgeSel> {
+    fn edges(&mut self, f: &Fields, input: NodeId) -> Res<EdgeSel> {
         let unit = self.unit;
         let one = |v: &V| -> Res<EdgeFilter> {
             let V::Obj(o) = v else { return f.err(format!("an edge selector is @all or {{top: true ...}}, not {}", v.describe())) };
@@ -2870,8 +3311,8 @@ impl<'a, 'v, 'b> Lower<'a, 'v, 'b> {
             match v {
                 // `m.edge(a, b, {near chain})`: an exact edge by its two faces.
                 V::Obj(o) if o.proto.as_deref() == Some("Edge") => {
-                    let a = self.face_name(f, "edges", o.get("a").unwrap_or(&V::Nil))?;
-                    let b = self.face_name(f, "edges", o.get("b").unwrap_or(&V::Nil))?;
+                    let a = self.face_name(f, "edges", o.get("a").unwrap_or(&V::Nil), input)?;
+                    let b = self.face_name(f, "edges", o.get("b").unwrap_or(&V::Nil), input)?;
                     let near = match o.get("near") {
                         Some(p) => Some(f.p3_of("m.edge near", p)?),
                         None => None,

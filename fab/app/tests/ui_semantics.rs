@@ -8,7 +8,8 @@
 //!   two placements of one script: the code panel does not change there, so nothing but the
 //!   selection asks for a redraw (the row used to stay unselected until some other input
 //!   redrew the panel);
-//! - the workspace switch is selected by name, the Slice render mode by its switch;
+//! - the workspace switch is selected by name (the plate view's header has no Plate mode control
+//!   of its own: the tabs set the mode), the Slice render mode by its switch;
 //! - a checkbox (Supports) toggles through the
 //!   action path and read back;
 //! - the Slice render mode slices the plate, and the layer slider takes a value: the
@@ -186,9 +187,13 @@ object(block)
     assert_eq!(app.locator(Selector::role(Role::TreeItem).name("Renamed placement")).wait_visible().snapshot().node.id, linked.id, "F2 on a part renames that placement");
 
     // ---- the workspace switch, then the Slice render mode ----
-    workspace_row::press(&app, "Monitor");
-    workspace_row::wait_shown(&app, "Monitor");
-    workspace_row::press(&app, "Design");
+    // The workspace tabs set the plate's mode: the plate view's header, drawn with its render
+    // switch, has no Plate mode control of its own beside it (it once doubled the tabs).
+    for ws in ["Monitor", "Design"] {
+        workspace_row::press(&app, ws);
+        app.locator(Selector::id("rm_slice")).wait_visible();
+        assert_eq!(app.locator(Selector::all().name("Plate mode")).count(), 0, "the plate view's header in {ws} has no Plate mode control");
+    }
     app.locator(Selector::id("rm_slice")).click();
     app.locator(Selector::id("rm_slice")).wait_checked(true);
     // Sliced brings the Slice panel forward beside the parts.

@@ -1,0 +1,9 @@
+use mod.motion.*
+Motion{size: vec2(640, 480) duration: 2.0 fps: 20 layers: [
+    Text{name: "small" text: "H" size: 6 at: vec2(100, 60)}
+    Text{name: "readable" text: "H" size: 24 at: vec2(100, 120)}
+    Text{name: "fitted small" text: "HHHHHHHHHH" size: 48 fit: 40 at: vec2(100, 180)}
+    Group{at: vec2(100, 240) scale: 0.25 layers: [Text{name: "parent scale" text: "H" size: 24}]}
+    Text{name: "unit scale" text: "H" size: 24 at: vec2(100, 300) by: @letter scale: 0.25}
+    Text{name: "exact minimum" text: "H" size: 12 at: vec2(100, 360)}
+]}

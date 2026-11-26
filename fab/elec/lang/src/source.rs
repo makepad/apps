@@ -49,10 +49,13 @@ pub enum DocKind {
     /// `*.fw.splash`: an MCU's firmware. The firmware language compiles it; circuit evaluation never
     /// reads it, so its edits leave the design as it is.
     Firmware,
+    /// `*.req.splash`: the project's requirements (`fab_elec_req`), judged against what the checks,
+    /// the bench and the slice measure. Circuit evaluation never reads it.
+    Requirements,
 }
 
 impl DocKind {
-    const SUFFIXES: [(&'static str, DocKind); 11] = [
+    const SUFFIXES: [(&'static str, DocKind); 12] = [
         (".ckt.splash", DocKind::Circuit),
         (".pcb.splash", DocKind::Board),
         (".sch.splash", DocKind::Sheets),
@@ -64,6 +67,7 @@ impl DocKind {
         (".export.splash", DocKind::Profile),
         (".view.splash", DocKind::View),
         (".fw.splash", DocKind::Firmware),
+        (".req.splash", DocKind::Requirements),
     ];
 
     /// The kind a file name says, if it is an electronics document.
@@ -71,10 +75,11 @@ impl DocKind {
         Self::SUFFIXES.iter().find(|(s, _)| name.ends_with(s)).map(|(_, k)| *k)
     }
 
-    /// Whether typed text of this kind brings the design up to date by an evaluation. Firmware is
-    /// never evaluated; typed system text stays text-only until the system lowering reads it (G1).
+    /// Whether typed text of this kind brings the design up to date by an evaluation. Firmware and
+    /// requirements are separate from design evaluation. Profiles are never evaluated into the design:
+    /// the cam reader reads them into the engine's profile set. System text stays text-only here.
     pub fn edit_reevaluates(self) -> bool {
-        !matches!(self, DocKind::System | DocKind::Firmware)
+        !matches!(self, DocKind::System | DocKind::Firmware | DocKind::Requirements | DocKind::Profile)
     }
 
     /// The file name suffix of the kind (`.ckt.splash`).

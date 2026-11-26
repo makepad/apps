@@ -259,6 +259,30 @@ pub struct ChatPicture {
     pub label: String,
 }
 
+/// The conversation turn making a tool call, or a caller outside the conversation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChatCaller {
+    Turn(u64),
+    #[default]
+    Outside,
+}
+
+impl ChatCaller {
+    pub fn from_origin(origin: CallOrigin, turn: u64) -> Self {
+        match origin {
+            CallOrigin::Conversation => Self::Turn(turn),
+            CallOrigin::Remote => Self::Outside,
+        }
+    }
+
+    pub fn turn(self) -> Option<u64> {
+        match self {
+            Self::Turn(turn) => Some(turn),
+            Self::Outside => None,
+        }
+    }
+}
+
 /// What the product tells the chat.
 pub trait ChatHost {
     /// The chat's state, kept by the product.
@@ -269,12 +293,14 @@ pub trait ChatHost {
     fn chat_services(&mut self) -> Vec<ServiceManifest>;
     /// Run a tool for the chat; the id its answer comes back under.
     fn chat_call(&mut self, cx: &mut Cx, tool: &str, args: Value) -> u64;
-    /// Run a tool for the chat. The person's first line starts turn 1 and each new line starts
-    /// the next turn. Calls with [`CallOrigin::Remote`] have turn 0. A product that groups a
-    /// turn's work for undo keeps it here. By default the call runs as [`ChatHost::chat_call`].
-    fn chat_turn_call(&mut self, cx: &mut Cx, tool: &str, args: Value, _turn: u64) -> u64 {
+    /// Run a tool for its caller. The person's first line starts turn 1. Each new line starts
+    /// the next turn. Remote calls arrive as [`ChatCaller::Outside`]. A product can use the
+    /// turn to group work for undo. By default the call runs as [`ChatHost::chat_call`].
+    fn chat_turn_call(&mut self, cx: &mut Cx, tool: &str, args: Value, _caller: ChatCaller) -> u64 {
         self.chat_call(cx, tool, args)
     }
+    /// A call refused before dispatch. The argument text is private and may be malformed.
+    fn chat_refused(&mut self, _cx: &mut Cx, _tool: &str, _call_id: &str, _raw_args: &str, _reason: &str, _caller: ChatCaller) {}
     /// The person sent a line: their turn `turn` starts (whether the model takes it now or at the
     /// end of the turn it is in). A product ends here what showed for their last turn.
     fn chat_turn_started(&mut self, _cx: &mut Cx, _turn: u64) {}
@@ -623,43 +649,41 @@ fn link<H: ChatHost>(host: &mut H, cx: &mut Cx) {
 /// of the ones that finished, back.
 fn run_calls<H: ChatHost>(host: &mut H, cx: &mut Cx) {
     let now = cx.seconds_since_app_start();
-    let mut calls = Vec::new();
-    let mut cancelled = Vec::new();
-    let dock = host.chat_dock();
-    for (index, port) in dock.ports.iter_mut().enumerate() {
-        for event in port.handle_event(cx, &Event::Signal) {
-            match event {
-                PortEvent::Call(call) => calls.push((index, call)),
-                PortEvent::Cancel { call_id } => dock.inflight.retain(|flight| {
-                    if flight.call_id == call_id {
-                        cancelled.push(flight.id);
-                    }
-                    flight.call_id != call_id
-                }),
-                _ => {}
-            }
-        }
-    }
-    for id in cancelled {
-        host.chat_cancel(cx, id);
-    }
     let turn = host.chat_dock().turn.max(1);
-    for (index, call) in calls {
-        match makepad_strict_json::parse(call.args.as_bytes()) {
-            Ok(args) => {
-                // Calls from outside the conversation have no turn, with or without a token.
-                let turn = if call.origin == CallOrigin::Remote { 0 } else { turn };
-                let dock = host.chat_dock();
-                if turn > 0 && !dock.has_turn(turn) {
-                    dock.turn_calls.push((turn, call.call_id.clone()));
-                    if dock.turn_actions.binary_search_by_key(&turn, |(turn, _)| *turn).is_ok() {
-                        dock.turn_actions_changed = true;
+    for index in 0..host.chat_dock().ports.len() {
+        let events = host.chat_dock().ports[index].handle_event(cx, &Event::Signal);
+        for event in events {
+            let call = match event {
+                PortEvent::Call(call) => call,
+                PortEvent::Cancel { call_id } => {
+                    let flights = &mut host.chat_dock().inflight;
+                    if let Some(i) = flights.iter().position(|f| f.port == index && f.call_id == call_id) {
+                        let id = flights.remove(i).id;
+                        host.chat_cancel(cx, id);
                     }
+                    continue;
                 }
-                let id = host.chat_turn_call(cx, &call.tool, args, turn);
-                host.chat_dock().inflight.push(Inflight { port: index, call_id: call.call_id, id, last_alive: now, last_sent: None });
+                _ => continue,
+            };
+            let caller = ChatCaller::from_origin(call.origin, turn);
+            match makepad_strict_json::parse(call.args.as_bytes()) {
+                Ok(args) => {
+                    let dock = host.chat_dock();
+                    if caller == ChatCaller::Turn(turn) && !dock.has_turn(turn) {
+                        dock.turn_calls.push((turn, call.call_id.clone()));
+                        if dock.turn_actions.binary_search_by_key(&turn, |(turn, _)| *turn).is_ok() {
+                            dock.turn_actions_changed = true;
+                        }
+                    }
+                    let id = host.chat_turn_call(cx, &call.tool, args, caller);
+                    host.chat_dock().inflight.push(Inflight { port: index, call_id: call.call_id, id, last_alive: now, last_sent: None });
+                }
+                Err(error) => {
+                    let reason = format!("the arguments do not parse: {error}");
+                    host.chat_refused(cx, &call.tool, &call.call_id, &call.args, &reason, caller);
+                    host.chat_dock().ports[index].reply(ToolResult::refused(&call.call_id, reason));
+                }
             }
-            Err(error) => host.chat_dock().ports[index].reply(ToolResult::refused(&call.call_id, format!("the arguments do not parse: {error}"))),
         }
     }
     if host.chat_dock().inflight.is_empty() {
@@ -827,6 +851,49 @@ fn pump_look<H: ChatHost>(host: &mut H, cx: &mut Cx, panel: &WidgetRef) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cancel_in_the_same_drain_reaches_the_admitted_call() {
+        use makepad_ai_services::wire::{Risk, ServiceCall, ServiceDown, ToolDef};
+        use makepad_ai_services::ServiceRegistry;
+
+        #[derive(Default)]
+        struct Host {
+            dock: ChatDock,
+            events: Vec<(&'static str, u64)>,
+        }
+        impl ChatHost for Host {
+            fn chat_dock(&mut self) -> &mut ChatDock { &mut self.dock }
+            fn chat_call(&mut self, _: &mut Cx, _: &str, _: Value) -> u64 {
+                let id = 17;
+                self.events.push(("admit", id));
+                id
+            }
+            fn chat_cancel(&mut self, _: &mut Cx, id: u64) { self.events.push(("cancel", id)); }
+            fn chat_answer(&mut self, _: &str, _: u64) -> Option<ToolResult> { panic!("the cancelled call is still being polled") }
+            fn chat_progress(&self, _: u64) -> Option<(String, u16)> { unreachable!() }
+            fn chat_target(&mut self, _: &mut Cx) -> (Target, Vec<Suggestion>) { unreachable!() }
+            fn chat_services(&mut self) -> Vec<ServiceManifest> { unreachable!() }
+            fn chat_window(&self) -> WidgetRef { unreachable!() }
+        }
+
+        let mut host = Host::default();
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let registry = ServiceRegistry::new();
+        let manifest = ServiceManifest::new("files", "Files", "Read a file.")
+            .with_tool(ToolDef::new("read", "Read a file.", r#"{"type":"object","properties":{}}"#, Risk::Read));
+        let (port, link) = AiServicePort::in_process(manifest).unwrap();
+        let endpoint = registry.register(link, "this window", None).unwrap();
+        host.dock.ports.push(port);
+        registry.pump();
+        let call = ServiceCall { call_id: "first".into(), tool: "read".into(), args: "{}".into(), caller: None, origin: CallOrigin::Conversation };
+        assert!(registry.send(&endpoint, ServiceDown::Call(call)));
+        assert!(registry.send(&endpoint, ServiceDown::Cancel { call_id: "first".into() }));
+
+        run_calls(&mut host, &mut cx);
+        assert_eq!(host.events, [("admit", 17), ("cancel", 17)], "the same drain cancels the ID the host just admitted");
+        assert!(host.dock.inflight.is_empty(), "the cancelled call is gone before reply polling");
+    }
 
     /// What a page asks goes to the dock in order, and the page's outbox is
     /// empty after.

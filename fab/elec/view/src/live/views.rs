@@ -14,7 +14,7 @@ impl ElecEditor {
     /// The editor that shows a design document, by its name's kind: a circuit or its sheets in the
     /// Schematic, a board's layout on the Board, firmware in the Firmware, a bench in the Bench.
     /// None for the documents no one editor shows (parts, blocks, system links, cables, export
-    /// profiles, custom views).
+    /// profiles, custom views, requirements: those have their own panel, not an editor of the design).
     pub fn of_doc(name: &str) -> Option<Self> {
         use fab_elec_lang::DocKind as K;
         match K::of_name(name)? {
@@ -22,7 +22,7 @@ impl ElecEditor {
             K::Board => Some(Self::Board),
             K::Firmware => Some(Self::Firmware),
             K::Bench => Some(Self::Bench),
-            K::System | K::Cable | K::Part | K::Blocks | K::Profile | K::View => None,
+            K::System | K::Cable | K::Part | K::Blocks | K::Profile | K::View | K::Requirements => None,
         }
     }
 }
@@ -36,13 +36,26 @@ pub enum EditOrigin {
     Elsewhere,
     /// An AI tool's commit (the engine's `By::Ai`).
     Ai,
+    /// A tool call from outside the conversation.
+    Agent,
 }
 
 impl EditOrigin {
+    /// Caller shown in the pane for an electronics tool's edit or flash request.
+    pub fn tool(by: fab_elec_design::By) -> Option<Self> {
+        use fab_elec_design::By;
+        match by {
+            By::Ai { .. } => Some(Self::Ai),
+            By::Agent { .. } => Some(Self::Agent),
+            By::Person | By::Disk => None,
+        }
+    }
+
     /// The cue's words for an edit labelled `label`: the origin, as far as it is known, before it.
     pub fn cue(self, label: &str) -> String {
         match self {
             EditOrigin::Ai => format!("✦ AI: {label}"),
+            EditOrigin::Agent => format!("Agent: {label}"),
             EditOrigin::Disk => format!("Changed on disk: {label}"),
             EditOrigin::Elsewhere => format!("Changed elsewhere: {label}"),
         }

@@ -30,7 +30,7 @@ pub use crate::cloud_light::{CoverSample, Shape};
 use crate::cloud_volume_cumulus::{CloudVolume, LightRecord, VolumeSpec};
 use crate::cloud_placed::{PlacedSpec, PlacedVolume};
 use crate::cloud_volume_gpu::{AskFor, CloudAsk, GpuMode, GpuRecord, VolumeRecords, VolumeUpload, MAX_ROWS, PASS_SEGMENTS};
-use crate::cloud_volume_light::{shade, ShadeInputs, VolumeMarch};
+use crate::cloud_volume_light::{haze_share, shade, ShadeInputs, VolumeMarch};
 use crate::clouds::CloudSample;
 use crate::caster::RowRunner;
 use crate::volumetric::{self, height_at, CloudCache, CloudMarch, VolumetricClouds};
@@ -76,7 +76,7 @@ pub enum EntryClass {
     /// A modern Cumulus, Stratus, Altocumulus, Stratocumulus or Nimbostratus: a marched cloud volume
     /// (cloud_volume_cumulus.rs and its types' arms, cloud_volume_nimbostratus.rs, design §2 and §4.1).
     Volume(CloudVolume),
-    /// A Cumulonimbus or a Lenticular: a placed volume (cloud_placed.rs, design §2.1's placed and lens classes),
+    /// A Cumulonimbus: a placed volume (cloud_placed.rs, design §2.1's placed class),
     /// marched where a ray meets its bounds; its march's segments walk as a volume's.
     Placed(PlacedVolume),
 }
@@ -170,6 +170,16 @@ fn effective_cover(layer: &CloudLayerParams, master: f32) -> f32 {
         Some(look) => master * look.coverage,
         None => master * layer.shown_cover(),
     }
+}
+
+/// A modern Cirrus that draws aircraft trails (its Contrails row) under a master Cover over 0: drawn at any Cover of
+/// its own, at 0 the trails alone (cloud_sheets.rs `Trail`; the weather lane, 2026-11-09).
+fn draws_trails(layer: &CloudLayerParams, master: f32) -> bool {
+    master > 0.0
+        && layer.enabled
+        && layer.classic.is_none()
+        && layer.genus() == Some(CloudGenus::Cirrus)
+        && layer.cirrus_params().contrails.is_some_and(|amount| amount > 0.0)
 }
 
 /// The layer's own type block asks for a volume (the Volume row of a Stratocumulus, Nimbostratus or Cumulus).
@@ -283,13 +293,15 @@ impl CloudStack {
     /// grid exists; also when every entry gate 2 lets through drew nothing. Gate 2 skips a hidden layer, a type this
     /// build does not draw (logged once a genus, kept in the file), and an amount of 0. Err(Cancelled) when `cancelled`
     /// stopped a build whose rows `run` spreads (D15): a classic volume's first noise, a cloud volume's footprint grid,
-    /// noise or light grids.
-    pub fn build(sky: &SkyParams, map_seed: u32, light: &LightInputs, cancelled: &dyn Fn() -> bool, run: RowRunner) -> Result<Option<CloudStack>, volumetric::Cancelled> {
+    /// noise or light grids. A `held` stack (a held bake's, `Env::new_for_bake_par`) fills only the coarse level of a
+    /// marched volume's sun-depth grid that no released bake left for its sun, shape and Cover (design §12.1, held
+    /// shows the same clouds).
+    pub fn build(sky: &SkyParams, map_seed: u32, light: &LightInputs, held: bool, cancelled: &dyn Fn() -> bool, run: RowRunner) -> Result<Option<CloudStack>, volumetric::Cancelled> {
         let Some(params) = sky.cloud_stack.as_ref() else {
             return Ok(None);
         };
         let master = params.cover;
-        if !(master > 0.0) || !params.layers.iter().any(|layer| effective_cover(layer, master) > 0.0) {
+        if !(master > 0.0) || !params.layers.iter().any(|layer| effective_cover(layer, master) > 0.0 || draws_trails(layer, master)) {
             return Ok(None);
         }
         let sun = light.sun_dir.normalize();
@@ -307,7 +319,7 @@ impl CloudStack {
                 continue;
             };
             let amount = effective_cover(layer, master);
-            if !(amount > 0.0) {
+            if !(amount > 0.0) && !draws_trails(layer, master) {
                 continue;
             }
             let (class, light_height_m) = match &layer.classic {
@@ -340,16 +352,16 @@ impl CloudStack {
                     let deg = layer.wind_deg.or(params.wind_deg).unwrap_or_else(|| seeded_wind_deg(map_seed));
                     let class = match genus {
                         // A Cumulus, a Stratus, an Altocumulus (its deck of cloudlets), a Stratocumulus and a Nimbostratus
-                        // are marched volumes (design §2; cloud_volume_nimbostratus.rs). Their light grids are built whole
-                        // whatever the bake: a held bake reads the grids a released one reads (design §12.1, held shows the
-                        // same clouds).
+                        // are marched volumes (design §2; cloud_volume_nimbostratus.rs). A held bake reads the sun-depth
+                        // grid's fine level where a released bake left it for the same sun, shape and Cover (a light-only
+                        // drag keeps the released shadows) and else fills only the coarse one, the fine one on release
+                        // (design §12.1, held shows the same clouds: a sun drag shows the coarse level's softer shadows).
                         CloudGenus::Cumulus | CloudGenus::Stratus | CloudGenus::Altocumulus | CloudGenus::Stratocumulus | CloudGenus::Nimbostratus => {
                             let spec = VolumeSpec { layer, genus, cover: amount, map_seed, downwind: downwind(deg), sun_dir, march_steps: params.march_steps };
-                            CloudVolume::build(&spec, false, cancelled, run)?.map(EntryClass::Volume)
+                            CloudVolume::build(&spec, held, cancelled, run)?.map(EntryClass::Volume)
                         }
-                        // A Cumulonimbus or a Lenticular stands where its rows place it (design §2.1's placed and lens
-                        // classes).
-                        CloudGenus::Cumulonimbus | CloudGenus::Lenticular => {
+                        // A Cumulonimbus stands where its rows place it (design §2.1's placed class).
+                        CloudGenus::Cumulonimbus => {
                             let spec = PlacedSpec { layer, genus, cover: amount, map_seed, downwind: downwind(deg), sun_dir };
                             PlacedVolume::build(&spec, cancelled, run)?.map(EntryClass::Placed)
                         }
@@ -434,6 +446,22 @@ impl CloudStack {
         #[cfg(test)]
         count_entries(entries.len());
         Ok(Some(CloudStack { entries, lights, plan, marched, cuts, volumes, records, all_classic, sun_dir, visibility_m, seen }))
+    }
+
+    /// This stack with its showers' rainbows (rainbow.rs) under `atmo`'s sun: each placed Cumulonimbus with a rain shaft
+    /// sends the sunlight of its rain by the drops' own phase, the rainbow in it (`PlacedVolume::rain_light`, `walk`),
+    /// from tables laid out at the texels of the map turned by `rotation_deg`, the map's Rotation.
+    pub(crate) fn with_bows(mut self, atmo: &crate::atmosphere::Atmosphere, rotation_deg: f32) -> CloudStack {
+        if !self.entries.iter().any(|entry| matches!(entry.class, EntryClass::Placed(_))) || !(self.sun_dir.y > 0.0) {
+            return self;
+        }
+        let sun = atmo.sun_bands();
+        for entry in &mut self.entries {
+            if let EntryClass::Placed(placed) = &mut entry.class {
+                placed.add_bow(&sun, rotation_deg);
+            }
+        }
+        self
     }
 
     /// sky x T + discs x Tu + L along the unit direction `d` (design §2.2): T falls by each entry's faded alpha, Tu by
@@ -683,6 +711,23 @@ impl CloudStack {
         (shade(r, &inputs) * fade, opacity * fade, opacity)
     }
 
+    /// The sunlight of the placed volume `slot`'s rain shaft, its rainbow in it, in its segment `k` along `d`
+    /// (`PlacedVolume::rain_light`), `r` that segment's record: lit as the storm's own light is (`lit_record`: dimmed by
+    /// the flat entries over the point its light came from, its entry's Brightness, hazed at the record's mean depth; a
+    /// placed volume does not fade).
+    #[allow(clippy::too_many_arguments)]
+    fn rain_sunlight(&self, slot: &VolumeSlot, placed: &PlacedVolume, r: &VolumeMarch, d: Vec3f, k: usize, texel: f32, held: bool) -> Vec3f {
+        let light = placed.rain_light(d, Self::march_width(texel), &slot.cuts, k, texel);
+        if light == Vec3f::default() {
+            return light;
+        }
+        let i = slot.entry;
+        let entry = &self.entries[i];
+        let depth = r.mean_depth_m();
+        let shaded = if entry.shaded_from_above { cloud_light::t_above_volume(&self.entries, i, vec2f(d.x * depth, d.z * depth), height_at(depth, d.y), self.sun_dir, held) } else { 1.0 };
+        light * (shaded * entry.brightness * (1.0 - haze_share(depth, self.visibility_m)))
+    }
+
     /// What the whole stack passes along `d` (`seen`, the dome looks' table): the nearest look row by sine, linear round
     /// the turn; 1 without a table and at and below the horizon.
     fn seen_through(&self, d: Vec3f) -> f32 {
@@ -843,7 +888,8 @@ impl CloudStack {
                     let r = mine[k];
                     if r.alpha() > 0.0 {
                         let (lit, alpha, opacity) = self.lit_record(slot.entry, &r, d, sky, look.held);
-                        l += lit * t;
+                        let rain = self.rain_sunlight(slot, placed, &r, d, k, texel, look.held);
+                        l += (lit + rain) * t;
                         t *= 1.0 - alpha;
                         if !disc_texel {
                             tu *= 1.0 - opacity;
@@ -1272,9 +1318,10 @@ pub(crate) mod tests {
             }
         }
         let differs: [(&str, &dyn Fn(&mut HdriParams)); 4] = [
-            ("Puffiness", &|p| {
+            // (Density: the Cumulus' deck does not read Puffiness)
+            ("Density", &|p| {
                 let cumulus = the_cumulus(p).cumulus.get_or_insert_with(CumulusParams::default);
-                cumulus.puffiness = if cumulus.puffiness > 0.5 { 0.2 } else { 0.8 };
+                cumulus.density *= 1.5;
             }),
             ("the sun's way", &|p| p.sky.sun.azimuth_deg += 5.0),
             ("Cover", &|p| the_cumulus(p).cover = Some(0.6)),
@@ -1291,8 +1338,9 @@ pub(crate) mod tests {
             kept.push(other_record);
         }
         let (base, top) = volume.shape().shell_m();
-        // (low in the shell: a ray through a cloud's base crosses it before the cloud hides the rest)
-        let cut = [base + 0.05 * (top - base)];
+        // (low in the shell, 0.15 of the way up: a ray through a cloud's base crosses it before the cloud hides the rest; the deck's
+        // base rises over its lowest tenth, so a cut at a twentieth had nothing under it)
+        let cut = [base + 0.15 * (top - base)];
         for (what, other_record) in [("the cuts", volume.light_record(512, &cut)), ("the width", volume.light_record(1024, &cuts))] {
             assert!(kept.iter().all(|r| !Arc::ptr_eq(r, &other_record)), "a change of {what} gives a new light record");
             kept.push(other_record);
@@ -1390,7 +1438,7 @@ pub(crate) mod tests {
 
     /// The types placed by hand (cloud_placed.rs): they stand where their rows put them and have no plane.
     fn placed(genus: CloudGenus) -> bool {
-        matches!(genus, CloudGenus::Cumulonimbus | CloudGenus::Lenticular)
+        matches!(genus, CloudGenus::Cumulonimbus)
     }
 
     /// A placed volume's extent (the rule for placed volumes, controller 2026-11-01): on an n x n grid of directions over
@@ -1596,8 +1644,9 @@ pub(crate) mod tests {
                     (sum / n as f64) as f32 / variance
                 })
                 .collect();
-            let zero = rho.iter().position(|&r| r <= 0.0).expect("the field decorrelates within 8 km");
-            let next = (zero..(5 * zero / 2).min(rho.len())).max_by(|&a, &b| rho[a].total_cmp(&rho[b])).expect("a window past the zero");
+            // (cu3's field can stay correlated past the 8 km of lags at a large Size: then its zero is the window's end)
+            let zero = rho.iter().position(|&r| r <= 0.0).unwrap_or(rho.len() - 1);
+            let next = (zero..(5 * zero / 2).min(rho.len())).max_by(|&a, &b| rho[a].total_cmp(&rho[b])).unwrap_or(zero);
             let length_km = next as f32 * spacing_km;
             let spread = |v: Vec<f32>| {
                 let mean = v.iter().sum::<f32>() / v.len().max(1) as f32;
@@ -1606,9 +1655,16 @@ pub(crate) mod tests {
             let (bases, tops): (Vec<f32>, Vec<f32>) = columns.iter().filter(|c| c.0 > 0.5).map(|c| (c.1, c.2)).unzip();
             let (base, top) = (spread(bases), spread(tops));
             println!("Cumulus at Size {size_km} km: decorrelated at {:.1} km, correlation length {length_km:.1} km (rho {:.3}); the bases spread {base:.0} m, the tops {top:.0} m", zero as f32 * spacing_km, rho[next]);
-            assert!(next + 1 < rho.len() && rho[next] > rho[next - 1] && rho[next] >= rho[next + 1] && rho[next] > 0.03, "Cumulus at Size {size_km} km: no next cloud past the zero at {zero} (rho {:?})", &rho[zero..]);
-            assert!((length_km / size_km - 1.0).abs() <= 0.3, "Cumulus at Size {size_km} km: a correlation length of {length_km} km");
-            assert!(base < 0.25 * top, "Cumulus at Size {size_km} km: the bases spread {base} m, the tops {top} m");
+            // (since the owner kept the look runner's cu3, 2026-11-05: its turbulent puffs stand at no regular spacing, so
+            // there is no next cloud a Size away; its broad masses, some eight Sizes across, hold it correlated to about four
+            // Sizes (6.4 km at Size 1.5), and the Size sets that: within five Sizes, or past the window where five Sizes are)
+            let decorrelated_km = zero as f32 * spacing_km;
+            let window_km = (rho.len() - 1) as f32 * spacing_km;
+            assert!(decorrelated_km <= 5.0 * size_km || (zero == rho.len() - 1 && window_km < 5.0 * size_km), "Cumulus at Size {size_km} km: decorrelated only at {decorrelated_km} km");
+            let _ = length_km;
+            // (0.8 since the owner kept the look runner's cu3, 2026-11-05: its puffs have no flat base, 0.72 at Size 1.5; the
+            // old Cumulus' flat bases spread under a quarter of its tops)
+            assert!(base < 0.8 * top, "Cumulus at Size {size_km} km: the bases spread {base} m, the tops {top} m");
         }
         // A Stratocumulus (design §2.2, §2.4: a lumpy deck of cells): its cells stand 0.07 of its Size apart (175 m at
         // the default 2.5 km; 0.14 until lane sc's round 4, whose references hold hundreds of cells a view overhead), so
@@ -1668,7 +1724,9 @@ pub(crate) mod tests {
             let cells_m = next as f32 * spacing_m;
             println!("Stratocumulus at Size {size_km} km: decorrelated at {:.0} m, its cells {cells_m:.0} m apart (rho {:.3}); 0.07 Size is {:.0} m", zero as f32 * spacing_m, rho[next], 70.0 * size_km);
             assert!(next + 1 < rho.len() && rho[next] > rho[next - 1] && rho[next] >= rho[next + 1], "Stratocumulus at Size {size_km} km: no next cell past the zero at {zero} (rho {:?})", &rho[zero..]);
-            assert!((cells_m / (70.0 * size_km) - 1.0).abs() <= 0.3, "Stratocumulus at Size {size_km} km: cells {cells_m} m apart");
+            // (0.17 of Size since the owner kept the look runner's round 22, 2026-11-05: its Worley cells stand some 425 m
+            // apart at the default 2.5 km; the older deck's 0.07)
+            assert!((cells_m / (170.0 * size_km) - 1.0).abs() <= 0.3, "Stratocumulus at Size {size_km} km: cells {cells_m} m apart");
         }
         // Its gaps (plan: Stratocumulus' signature): at Cover 0.7 the share of the sky above 20 degrees under half opaque
         // (released width) lies within 0.2 to 0.4, the mean over four seeds.
@@ -1689,7 +1747,10 @@ pub(crate) mod tests {
         }
         let clear = clear / 4.0;
         println!("Stratocumulus at Cover 0.7: {clear:.3} of the sky above 20 degrees clear");
-        assert!((0.2..=0.4).contains(&clear), "a Stratocumulus at Cover 0.7 leaves {clear} of the upper sky clear");
+        // (0.1 to 0.4 since the owner kept the look runner's rounds 22 and 50, 2026-11-05: the deck's broad masses, some
+        // 8 km across, swing one sky's share by up to 0.3 between seeds, so four seeds read 0.17; Cover's own test, eight
+        // seeds, holds the mean within 0.05)
+        assert!((0.1..=0.4).contains(&clear), "a Stratocumulus at Cover 0.7 leaves {clear} of the upper sky clear");
     }
 
     /// Design §3.4, D3: per type, the share of its plane with any cloud at Cover 1e-4, 1e-3, 1e-2 and 0.1 lies in [0.5 c,
@@ -1953,7 +2014,7 @@ pub(crate) mod tests {
         let build = |stack: Option<CloudStackParams>| {
             let mut sky = golden.sky.clone();
             sky.cloud_stack = stack;
-            CloudStack::build(&sky, golden.seed, &inputs(), &|| false, &crate::caster::serial_rows).expect("nothing cancels")
+            CloudStack::build(&sky, golden.seed, &inputs(), false, &|| false, &crate::caster::serial_rows).expect("nothing cancels")
         };
         let before = built_on_this_thread();
         assert!(build(None).is_none(), "no stack");

@@ -1,7 +1,9 @@
 //! What the head really draws: G2/G3 arcs simulated from their words (the
 //! sweep the firmware computes, its swept points and its flow), and the
 //! extrusions of each layer, so a move that ploughs through what the same
-//! layer has already printed is caught.
+//! layer has already printed is caught. A wall can brush the edge of an earlier
+//! bead as it turns. Contact counts towards a plough when the nozzle reaches
+//! the earlier bead's centre line somewhere along that stretch.
 
 use std::collections::HashMap;
 use std::f64::consts::TAU;
@@ -192,6 +194,16 @@ fn point_segment(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
     (p[0] - a[0] - t * vx).hypot(p[1] - a[1] - t * vy)
 }
 
+/// Two nonparallel segments meet if each straddles the other's line, endpoints included.
+fn intersects_across(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
+    fn straddles(a: [f64; 2], b: [f64; 2], p: [f64; 2], q: [f64; 2]) -> bool {
+        let side = |v: [f64; 2]| (b[0] - a[0]) * (v[1] - a[1]) - (b[1] - a[1]) * (v[0] - a[0]);
+        let (p, q) = (side(p), side(q));
+        (p <= 0.0 && q >= 0.0) || (q <= 0.0 && p >= 0.0)
+    }
+    straddles(a, b, c, d) && straddles(c, d, a, b)
+}
+
 /// A move may run this much (in units of its width) over an earlier bead of another
 /// feature at its own height, away from its ends, before it counts as ploughing through
 /// it. A move at right angles over one bead runs one width over it.
@@ -313,8 +325,10 @@ impl Printed {
         found
     }
 
-    /// How far a run goes over earlier beads of its height that it may not cross, away
-    /// from its own ends: sampled every quarter width.
+    /// Sample contact with earlier beads at this height every quarter width, away from
+    /// the run's ends. Count a continuous stretch when a segment intersects a bead's
+    /// centre line or a sample is close enough to ride on top. A turn that only brushes
+    /// the edge of a bead contributes no length.
     fn crossing(layer: &Layer, run: &Run, bound: f64) -> Option<Crossing> {
         if run.class == Class::Ironing || layer.beads.is_empty() || run.segs.is_empty() {
             return None;
@@ -330,6 +344,10 @@ impl Printed {
         let mut over = 0.0;
         let mut at = 0.0;
         let mut first: Option<(usize, usize)> = None;
+        let mut stretch_first = None;
+        // Hold the length from the first contact until this stretch reaches a centre line.
+        let mut pending = 0.0;
+        let mut reached_centre = false;
         for (k, w) in run.pts.windows(2).enumerate() {
             let (half, line) = run.segs[k];
             let step = (half * 0.5).min(0.1);
@@ -343,9 +361,16 @@ impl Printed {
                 let t = (s as f64 + 0.5) / n as f64;
                 let p = [w[0][0] + (w[1][0] - w[0][0]) * t, w[0][1] + (w[1][1] - w[0][1]) * t];
                 let dir = [(w[1][0] - w[0][0]) / len, (w[1][1] - w[0][1]) / len];
-                let hit = layer.grid.get(&cell(p)).into_iter().flatten().find(|&&i| {
+                let mut hit = None;
+                for &i in layer.grid.get(&cell(p)).into_iter().flatten() {
                     let b = &layer.beads[i as usize];
                     let exempt = (b.class == run.class && run.class.crosses_itself()) || b.class == Class::Ironing;
+                    // The ends of an earlier run reach into what it ran into (an infill line's
+                    // end into the wall printed after it): two of its widths are not counted.
+                    let tip = |e: bool, q: [f64; 2]| e && (p[0] - q[0]).hypot(p[1] - q[1]) < 4.0 * b.half;
+                    if exempt || tip(b.end_a, b.a) || tip(b.end_b, b.b) {
+                        continue;
+                    }
                     // Over the bead: across it within the narrower half width of its centre line,
                     // or along it on top of it (a path printed twice). Beads laid side by side,
                     // overlapping in a thin wall, run along each other a little apart.
@@ -354,14 +379,28 @@ impl Printed {
                     let across = bl > 0.0 && (dir[0] * by - dir[1] * bx).abs() / bl > CROSS_SIN;
                     let d = point_segment(p, b.a, b.b);
                     let reach = b.half.min(half);
-                    // The ends of an earlier run reach into what it ran into (an infill line's
-                    // end into the wall printed after it): two of its widths are not counted.
-                    let tip = |e: bool, q: [f64; 2]| e && (p[0] - q[0]).hypot(p[1] - q[1]) < 4.0 * b.half;
-                    !exempt && !tip(b.end_a, b.a) && !tip(b.end_b, b.b) && (if across { d < reach } else { d < ON_TOP * reach })
-                });
-                if let Some(&i) = hit {
-                    over += len / n as f64;
-                    first.get_or_insert((line, layer.beads[i as usize].line));
+                    let on_top = d < ON_TOP * reach;
+                    if on_top || (across && d < reach) {
+                        // Several beads can touch one sample. Any of them can confirm the stretch.
+                        hit.get_or_insert(b.line);
+                        if reached_centre || on_top || intersects_across(w[0], w[1], b.a, b.b) {
+                            reached_centre = true;
+                            break;
+                        }
+                    }
+                }
+                if let Some(over_line) = hit {
+                    let lines = *stretch_first.get_or_insert((line, over_line));
+                    pending += len / n as f64;
+                    if reached_centre {
+                        first.get_or_insert(lines);
+                        over += pending;
+                        pending = 0.0;
+                    }
+                } else {
+                    stretch_first = None;
+                    pending = 0.0;
+                    reached_centre = false;
                 }
             }
             at += len;

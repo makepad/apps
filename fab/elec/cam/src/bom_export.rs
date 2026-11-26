@@ -312,6 +312,8 @@ pub struct BomItem {
     pub variants: BTreeMap<String, BomOverride>,
     pub sheet_path: String,
     pub selected: bool,
+    /// This footprint is physically present on the board.
+    pub placed: bool,
 }
 impl BomItem {
     fn for_variant(&self, variant: &str) -> Self {
@@ -319,7 +321,7 @@ impl BomItem {
             symbol_id: self.symbol_id.clone(), reference: self.reference.clone(), unit_suffix: self.unit_suffix.clone(),
             value: self.value.clone(), footprint: self.footprint.clone(), datasheet: self.datasheet.clone(),
             description: self.description.clone(), fields: self.fields.clone(), attributes: self.attributes.clone(),
-            sheet_path: self.sheet_path.clone(), selected: self.selected, variants: BTreeMap::new(),
+            sheet_path: self.sheet_path.clone(), selected: self.selected, placed: self.placed, variants: BTreeMap::new(),
         };
         if let Some(values) = self.variants.get(variant) {
             macro_rules! texts { ($($key:ident),*) => { $(if let Some(v) = &values.$key { item.$key = v.clone(); })* }; }
@@ -338,6 +340,8 @@ impl BomItem {
             "Datasheet" => self.datasheet.clone(), "Description" => self.description.clone(),
             "${QUANTITY}" => "1".into(), "${ITEM_NUMBER}" => String::new(),
             "${DNP}" => flag(self.attributes.dnp),
+            crate::tables::LCSC_PART => crate::tables::lcsc_number(&self.fields).into(),
+            crate::tables::SUPPLIER_KEY => self.fields.get("supplier").map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default(),
             "${EXCLUDE_FROM_BOM}" => flag(self.attributes.exclude_from_bom),
             "${EXCLUDE_FROM_BOARD}" => flag(self.attributes.exclude_from_board),
             "${EXCLUDE_FROM_SIM}" => flag(self.attributes.exclude_from_sim),
@@ -393,6 +397,27 @@ fn cmp_text(a: &str, b: &str) -> std::cmp::Ordering { natural_cmp(&a.to_lowercas
 /// A table's cells and refs can also feed a factory profile; use `write_table` for reference quoting.
 /// An empty variant is the base variant; the caller selects dialog current-variant via `plan_files`.
 pub fn build_table(document: &BomDocument, options: &ResolvedBomOptions, variant: &str) -> BomTable {
+    BomTable {
+        header: options.view.fields.iter().filter(|f| f.show).map(|f| f.label.clone()).collect(),
+        delimiter: options.format.field_delimiter.chars().next().unwrap_or(','),
+        rows: build_rows(document, options, variant, |row, _| row),
+    }
+}
+
+/// A live row retains the identities used by CAM, even when two symbols share a reference.
+pub struct MemberRow {
+    pub row: BomRow,
+    pub paths: Vec<String>,
+}
+
+pub fn build_rows_with_paths(document: &BomDocument, options: &ResolvedBomOptions, variant: &str) -> Vec<MemberRow> {
+    build_rows(document, options, variant, |row, group| MemberRow {
+        row, paths: group.iter().map(|item| item.symbol_id.clone()).collect(),
+    })
+}
+
+fn build_rows<R>(document: &BomDocument, options: &ResolvedBomOptions, variant: &str,
+    finish: impl Fn(BomRow, &[&BomItem]) -> R) -> Vec<R> {
     let view = &options.view;
     let all_fields = document.available_fields();
     let mut seen = BTreeSet::new();
@@ -419,6 +444,12 @@ pub fn build_table(document: &BomDocument, options: &ResolvedBomOptions, variant
         match name {
             "Reference" => reference_list(&group.iter().map(|i| BomReference { reference: i.reference.clone(), unit_suffix: i.unit_suffix.clone() }).collect::<Vec<_>>(), &options.format),
             "${QUANTITY}" => group.len().to_string(),
+            // Assembly designators enumerate every fitted member, including repeated display refs.
+            crate::tables::ASSEMBLY_REFS => group.iter().map(|i| i.reference.as_str()).collect::<Vec<_>>().join(","),
+            // Group identity uses the specified footprint. Factory files show a package
+            // only if at least one member has actually been placed with that footprint.
+            crate::tables::PLACED_FOOTPRINT => group.iter().find(|i| i.placed).map(|i| i.footprint.clone()).unwrap_or_default(),
+            "" => String::new(),
             _ => {
                 let mut seen = BTreeSet::new();
                 group.iter().map(|item| item.field(name)).filter(|value| seen.insert(value.clone())).collect::<Vec<_>>().join(",")
@@ -431,16 +462,15 @@ pub fn build_table(document: &BomDocument, options: &ResolvedBomOptions, variant
         let order = cmp_text(a, b).then_with(|| cmp_text(&ga[0].field("Reference"), &gb[0].field("Reference")));
         if view.sort_asc { order } else { order.reverse() }
     });
-    BomTable {
-        header: view.fields.iter().filter(|f| f.show).map(|f| f.label.clone()).collect(),
-        delimiter: options.format.field_delimiter.chars().next().unwrap_or(','),
-        rows: sorted.iter().enumerate().map(|(index, (_, group))| BomRow {
+    sorted.iter().enumerate().map(|(index, (_, group))| {
+        let row = BomRow {
             refs: group.iter().map(|item| item.field("Reference")).collect(),
             cells: view.fields.iter().filter(|f| f.show).map(|f| {
                 if f.name == "${ITEM_NUMBER}" { (index + 1).to_string() } else { cell(group, &f.name) }
             }).collect(),
-        }).collect(),
-    }
+        };
+        finish(row, group)
+    }).collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1153,8 +1153,16 @@ mod tests {
                 |x, h| x - (std::f32::consts::PI / 6.0).cos() * h,
                 |_, _| 1.0,
             ),
-            // The cloth glows with a Gaussian of sigma 0.5 box units (its default).
-            (LightParams { shape: "scrim".to_string(), ..image_light("flat") }, h, |x, h| x - h, |x, h| (-2.0 * (x / h) * (x / h)).exp()),
+            // The cloth glows with the irradiance of the lamp behind it, (1 +
+            // (x/d)^2)^-1.5, the lamp d = 1.536 x 0.5 box units back (its
+            // default source size: the glow halves where a Gaussian of sigma
+            // 0.5 did).
+            (
+                LightParams { shape: "scrim".to_string(), ..image_light("flat") },
+                h,
+                |x, h| x - h,
+                |x, h| (1.0 + (x / h / (1.536_245 * 0.5)).powi(2)).powf(-1.5),
+            ),
         ];
         for (shape, depth, sdf, glow) in &shapes {
             let name = shape.shape.clone();

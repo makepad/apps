@@ -91,8 +91,10 @@ impl std::fmt::Debug for LiveResult {
 pub struct PrintJob {
     pub gen: u64,
     pub settings: fab::print::PrintSettings,
-    /// The colour of each job tool as Sliced and Print draw it (`print::tool_colours`).
+    /// Print-side spool colours, independent of the viewport.
     pub colours: Vec<[f32; 4]>,
+    pub model_colours: Vec<[f32; 4]>,
+    pub shared_tools: Vec<usize>,
     pub machine: fab_plate::machine::Machine,
     pub name: String,
     /// The plate's printed objects, the beads' part indices.
@@ -110,6 +112,12 @@ pub struct PrintJob {
     /// each with the job tool (0-based) its part prints in: the iron takes that filament's print
     /// temperature.
     pub melts: Vec<(fab::print::PreviewMelt, usize)>,
+}
+
+impl PrintJob {
+    pub fn palettes(&self) -> fab::print::ToolColours {
+        fab::print::ToolColours { material: self.colours.clone(), model: self.model_colours.clone(), shared_tools: self.shared_tools.clone() }
+    }
 }
 
 /// A part slot as the views know it: its content's contours and planned layers.
@@ -581,7 +589,7 @@ struct LiveState {
     insert_issues: Option<(u64, Vec<fab_printability::Issue>)>,
     /// The Print editor's slice in flight: its generation, printer and
     /// filament colours ([`Msg::PrintJob`]), until it is answered.
-    print_job: Option<(u64, fab_plate::machine::Machine, Vec<[f32; 4]>)>,
+    print_job: Option<(u64, fab_plate::machine::Machine, fab::print::ToolColours)>,
     /// What the estimate's preview was last told of the plate ([`Hub::plate`]).
     plate: Option<Arc<PlateShot>>,
     /// The publications' tiles, logged per two-second window ([`publish_tiles`]).
@@ -613,7 +621,7 @@ enum Msg {
     Failed { revision: u64, error: String },
     /// The Print editor asked for the slice `gen` on `machine` with these filament colours: the live
     /// tiles stream to it until it is answered.
-    PrintJob { gen: u64, machine: fab_plate::machine::Machine, colours: Vec<[f32; 4]> },
+    PrintJob { gen: u64, machine: fab_plate::machine::Machine, colours: fab::print::ToolColours },
     /// The Print editor's slice settled ([`settle`]).
     Settled { revision: u64, job: PrintJob, result: Result<Arc<makepad_fab_slice::live::Settled>, String>, seconds: f64 },
     /// Its preview is made ([`Msg::Settled`]), and its beads for the live tiles.
@@ -755,13 +763,18 @@ impl LiveOwner {
                     self.held.store(false, Ordering::Release);
                     guarded(&mut state, work, work.publish);
                 } else {
-                    self.held.store(true, Ordering::Release);
+                    #[cfg(test)]
+                    gates::reach("owner holds");
+                    self.held.store(true, Ordering::SeqCst);
                 }
             }
             let _depth = shot_depth::enter();
             let mut inbox = self.inbox.lock().unwrap();
-            let due = !paced || self.taken.load(Ordering::Acquire);
-            if inbox.msgs.iter().any(Msg::now) || (due && !inbox.msgs.is_empty()) {
+            let due = !paced || self.taken.load(Ordering::SeqCst);
+            // A view that took the newest publication while this owner was holding what it
+            // applied found nothing held and asked for nothing: what is held is due now.
+            let unpublished = state.unpublished != Unpublished::default();
+            if inbox.msgs.iter().any(Msg::now) || (due && (unpublished || !inbox.msgs.is_empty())) {
                 msgs = std::mem::take(&mut inbox.msgs);
                 continue;
             }
@@ -776,7 +789,7 @@ impl LiveOwner {
     /// A view took the newest publication: true when one is held for it (its caller posts
     /// [`Msg::Took`]).
     fn took(&self) -> bool {
-        !self.taken.swap(true, Ordering::AcqRel) && self.held.load(Ordering::Acquire)
+        !self.taken.swap(true, Ordering::SeqCst) && self.held.load(Ordering::SeqCst)
     }
 }
 
@@ -937,7 +950,7 @@ fn offsets(l: &LiveState) -> Arc<[[f32; 2]]> {
 struct ViewSettings {
     layer_height: f64,
     machine: Option<fab_plate::machine::Machine>,
-    colours: Vec<[f32; 4]>,
+    colours: fab::print::ToolColours,
     /// A test plate's input: its pieces say whose each of the slice's moves are.
     tests: Option<makepad_fab_slice::live::MakeInput>,
     /// The heat-set inserts the job melts in after the print ([`PrintJob::melts`]).
@@ -1472,9 +1485,14 @@ pub(crate) fn set_resume(engine: &LiveEngine, version: Arc<EngineVersion>, pool:
     engine.set_resume(Arc::new(move |checkpoint: makepad_fab_slice::live::Checkpoint| {
         let ticket = version.ticket(&checkpoint);
         let pool = pool.clone();
+        #[cfg(test)]
+        let version = version.clone();
         Arc::new(move |urgency: Urgency, job| {
             let ticket = if urgency == Urgency::Viewed { Ticket::none() } else { ticket.clone() };
-            submit(PendingJob { pool: pool.clone(), class: class_of(main, urgency), ticket, job: Arc::new(Leaf::new(Some(job))) }, true);
+            let job = PendingJob { pool: pool.clone(), class: class_of(main, urgency), ticket, job: Arc::new(Leaf::new(Some(job))) };
+            #[cfg(test)]
+            let Some(job) = (if HUB.get().is_some_and(|h| Arc::ptr_eq(&version, &h.main_version)) { gates::pace(job) } else { Some(job) }) else { return };
+            submit(job, true);
         }) as Spawn
     }));
 }
@@ -1701,13 +1719,14 @@ pub fn edited_fields(ev: &Evaluated, swaps: &[FieldSwap]) -> Vec<Option<fab_mode
     fields
 }
 
-fn send_live_plate(ev: &Arc<Evaluated>) {
-    let setup = hub().setup.lock().as_ref().map(|(_, s)| s.clone()).unwrap_or_else(CheckSetup::fab_defaults);
+pub(super) fn send_live_plate(ev: &Arc<Evaluated>, setup: CheckSetup) -> Result<(), &'static str> {
+    if let Some(why) = setup.plate_waits(ev) { return Err(why); }
     let (id, settings, parts) = (plate_id(ev), setup.id_for(&ev.plate), ev.plate.parts.len());
     let inserts = ev.plate.excluded.iter().enumerate().filter_map(|(i, p)| p.insert.as_ref().map(|_| i)).collect();
     drop(hub().insert_plate.set(Arc::new(InsertPlate { id, evaluated: ev.clone(), inserts })));
     let ev = ev.clone();
     hub().engine.set_input_with(id, settings, parts, Arc::new(move || input_for(plate_id(&ev), &setup, Arc::new(ev.plate.printable()), ev.machine.clone(), Some(&ev.frames), Some(&ev.fields))));
+    Ok(())
 }
 
 /// A live edit or settle's input: its identity, part count, and how to build it (on the
@@ -1726,7 +1745,7 @@ pub fn input_revision(input: &SliceInput) -> Option<u64> {
 
 /// What the live view reads a job's slices with.
 fn view_job(job: &PrintJob) {
-    let view = ViewSettings { layer_height: job.settings.layer_height, machine: Some(job.machine.clone()), colours: job.colours.clone(), tests: job.tests.clone(), melts: job.melts.clone() };
+    let view = ViewSettings { layer_height: job.settings.layer_height, machine: Some(job.machine.clone()), colours: job.palettes(), tests: job.tests.clone(), melts: job.melts.clone() };
     drop(hub().view.set(Arc::new(view)));
 }
 
@@ -1776,7 +1795,7 @@ pub fn settle(job: PrintJob, input: SliceInput) {
     let key = if job.check.is_some() { tag | 1 << 63 } else { tag };
     let print = job.check.is_none();
     if print {
-        h.owner.post(Msg::PrintJob { gen: job.gen, machine: job.machine.clone(), colours: job.colours.clone() });
+        h.owner.post(Msg::PrintJob { gen: job.gen, machine: job.machine.clone(), colours: job.palettes() });
     }
     let new = h.jobs.lock().insert(key, job).is_none();
     if print && new {
@@ -2131,6 +2150,7 @@ impl AiSlices {
 
 impl fab_ai::supports::SliceSource for AiSlices {
     fn input(&self, ev: &Evaluated) -> Result<(LiveInput, String), String> {
+        if let Some(why) = self.setup.plate_waits(ev) { return Err(why.into()); }
         let input = input_for(plate_id(ev), &self.setup, Arc::new(ev.plate.printable()), ev.machine.clone(), Some(&ev.frames), Some(&ev.fields));
         let name = format!("the app's print setup: {} / {}", self.setup.calibration_names().0, self.setup.process());
         Ok((input, name))
@@ -2307,6 +2327,54 @@ pub(crate) mod gates {
             let _ = came.send(());
             let _ = wait.recv();
         }
+    }
+
+    /// The hub engine's polls a test holds ([`pace_runs`]): each waits here as a job, on no thread.
+    static PACED: Mutex<Option<Vec<super::PendingJob>>> = Mutex::new(None);
+
+    /// The hub engine's runs wait after their first poll (each part's viewed layers, which it sends
+    /// first) until the guard lets them on: the observer ([`super::OBSERVE`]) hears "run held".
+    pub(crate) fn pace_runs() -> Paced {
+        *PACED.lock().unwrap() = Some(Vec::new());
+        Paced(())
+    }
+
+    /// Dropped, it lets the held polls on and holds no more.
+    pub(crate) struct Paced(());
+
+    impl Drop for Paced {
+        fn drop(&mut self) {
+            let held = PACED.lock().unwrap().take().unwrap_or_default();
+            for job in held {
+                super::submit(job, true);
+            }
+        }
+    }
+
+    /// A poll of the hub engine's run: held while a test paces the runs, else back to be submitted.
+    pub(super) fn pace(job: super::PendingJob) -> Option<super::PendingJob> {
+        let first = {
+            let mut paced = PACED.lock().unwrap();
+            let Some(held) = paced.as_mut() else { return Some(job) };
+            held.push(job);
+            held.len() == 1
+        };
+        if first {
+            if let Some(tx) = super::OBSERVE.lock().unwrap().as_ref() {
+                let _ = tx.send((std::time::Instant::now(), "run held".into(), None, None));
+            }
+        }
+        None
+    }
+
+    /// The live state's owner is idle with nothing unpublished, and a view took its newest
+    /// publication: every publication of what it applied is out and taken.
+    pub(crate) fn publications_taken() -> bool {
+        let owner = &super::hub().owner;
+        let _depth = super::shot_depth::enter();
+        let inbox = owner.inbox.lock().unwrap();
+        let idle = inbox.state.as_ref().is_some_and(|l| l.unpublished == super::Unpublished::default());
+        idle && inbox.msgs.is_empty() && !inbox.submitted && owner.taken.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -3000,7 +3068,7 @@ fn records_taker(revision: u64, kept: Option<Arc<Estimate>>) -> Option<RecordTak
     let mut timed = Some(crate::print::TimedPreview::new(&machine, tests.is_some(), part_offsets));
     let mut fed = std::time::Duration::ZERO;
     // The view's colours and the plate's objects, read once a preview is made.
-    let mut shown: Option<(Vec<[f32; 4]>, Arc<[String]>)> = None;
+    let mut shown: Option<(fab::print::ToolColours, Arc<[String]>)> = None;
     let taken = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let mut grew = 0;
     Some(Box::new(move |streamed| {
@@ -3405,12 +3473,13 @@ impl LiveSlice {
     /// The plate edits start from (each rebuilt plate); transforms reset to none.
     pub fn set_plate(&self, plate: Arc<Evaluated>, layer_height: f64, _materials: fab_printability::Materials) {
         // The UI is the views' only writer: a test plate's input stays as the last job set it.
-        let nf = plate.plate.parts.iter().map(|p| p.filament as usize).max().unwrap_or(1).max(1);
-        let colours = (0..nf).map(|f| plate.plate.parts.iter().find(|p| p.filament as usize == f + 1).map(|p| p.color).unwrap_or([0.8; 4])).collect();
+        let colours = crate::print::tool_colours(&plate, None);
         let view = ViewSettings { layer_height: layer_height.clamp(0.04, 1.0), machine: Some(plate.machine.clone()), colours, tests: view().tests.clone(), melts: crate::print::melt_steps(&plate.plate) };
         drop(hub().view.set(Arc::new(view)));
         hub().released.store(true, Ordering::Relaxed);
-        send_live_plate(&plate);
+        if let Err(why) = send_live_plate(&plate, print_setup()) {
+            log!("fab live: the plate waits: {why}");
+        }
     }
 
     /// A part's transform now, on the part as the plate has it (coalescing).
@@ -3652,6 +3721,44 @@ mod tests {
         paths
     }
 
+    /// A view that takes the newest publication while the owner decides to hold what it applied
+    /// finds nothing held and asks for nothing: the owner sees the take and publishes before it
+    /// parks, rather than leaving it for a next event (none comes once a slice is done).
+    #[test]
+    fn a_take_while_the_owner_holds_what_it_applied_gets_it_out() {
+        const STUCK: std::time::Duration = std::time::Duration::from_secs(5);
+        let owner = LiveOwner::new();
+        let published = std::sync::atomic::AtomicUsize::new(0);
+        // a part's layer is applied; a message for now publishes on its own (as the checks' do)
+        let handle = |l: &mut LiveState, m: Msg| match m {
+            Msg::Part(e) => apply_queued(l, e),
+            _ => {
+                published.fetch_add(1, Ordering::Relaxed);
+                owner.taken.store(false, Ordering::Release);
+            }
+        };
+        let publish = |l: &mut LiveState| {
+            l.unpublished = Unpublished::default();
+            published.fetch_add(1, Ordering::Relaxed);
+            owner.taken.store(false, Ordering::Release);
+        };
+        let work = Work { handle: &handle, publish: &publish, lost: &|why: String| panic!("the state was lost: {why}") };
+        let state = owner.inbox.lock().unwrap().state.take().expect("the state is parked");
+        let (arrived, go) = gates::arm("owner holds");
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                gates::mark();
+                owner.run(state, vec![Msg::Part(event_of((2, 11, 1, 0, 0, 0))), Msg::StartView], true, &work);
+            });
+            arrived.recv_timeout(STUCK).expect("the owner holds the layer it applied");
+            assert!(!owner.took(), "the view takes the newest with nothing held yet: it asks for nothing");
+            drop(go);
+        });
+        assert_eq!(published.load(Ordering::Relaxed), 2, "the layer applied before the take goes out before the owner parks");
+        let inbox = owner.inbox.into_inner().unwrap();
+        assert!(inbox.state.is_some_and(|l| l.unpublished == Unpublished::default()), "nothing waits for a next event");
+    }
+
     /// A queued event's identity, as the test made it: (kind, content key, revision, layer, region,
     /// which plan of the layer).
     type EventId = (u8, u64, u64, u32, u32, u32);
@@ -3819,7 +3926,7 @@ mod tests {
         let machine = fab_plate::machine::Machine::dual_nozzle_350();
         let job_of = {
             let machine = machine.clone();
-            move |gen: u64| PrintJob { gen, settings: fab::print::PrintSettings::default(), colours: vec![[0.8; 4]], machine: machine.clone(), name: "block".into(), objects: Arc::from(["block".to_string()]), check: None, fallback: None, catalog: None, tests: None, melts: Vec::new() }
+            move |gen: u64| PrintJob { gen, settings: fab::print::PrintSettings::default(), colours: vec![[0.8; 4]], model_colours: vec![[0.8; 4]], shared_tools: Vec::new(), machine: machine.clone(), name: "block".into(), objects: Arc::from(["block".to_string()]), check: None, fallback: None, catalog: None, tests: None, melts: Vec::new() }
         };
         let job = Arc::new(job_of(0));
         // The edit's plate (an empty one), and the Print editor's (another).
@@ -4014,7 +4121,7 @@ mod tests {
                 Arc::new(move || input_for(plate_id(&ev), &setup, Arc::new(ev.plate.printable()), ev.machine.clone(), Some(&ev.frames), Some(&ev.fields)))
             };
             let input = SliceInput { plate_id: plate_id(&ev), settings_id: setup.id_for(&ev.plate), parts: ev.plate.parts.len(), make };
-            let job = PrintJob { gen: 0, settings: fab::print::PrintSettings::default(), colours: vec![[0.8; 4]], machine: ev.machine.clone(), name: "lost".into(), objects: Arc::from(["block".to_string()]), check: None, fallback: None, catalog: None, tests: None, melts: Vec::new() };
+            let job = PrintJob { gen: 0, settings: fab::print::PrintSettings::default(), colours: vec![[0.8; 4]], model_colours: vec![[0.8; 4]], shared_tools: Vec::new(), machine: ev.machine.clone(), name: "lost".into(), objects: Arc::from(["block".to_string()]), check: None, fallback: None, catalog: None, tests: None, melts: Vec::new() };
             (input, job)
         };
         let (input, job) = block(2);

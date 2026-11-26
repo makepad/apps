@@ -1,0 +1,60 @@
+use mod.motion.*
+
+// Type 1: text ranges. Three specimens, one per selection unit: a weight that travels through
+// the letters, a light that passes word to word, and lines that widen and step aside. Each
+// range sweeps on the live clock, so the held slide keeps moving, calmly.
+let look = import("shared/motion_deck_look")
+
+let TEXT_X = 520.0
+let FLEX = Font{family: "Roboto Flex" weight: 300}
+// A slow eased sweep from left of the text to right of it, period seconds, phase offset.
+let sweep = fn(period, phase) {
+    return fn(t) { -0.45 + 1.9 * ease(@ease_in_out_sine, fract(live() / period + phase)) }
+}
+let enter = fn(at) { return tween(0, 1, at, at + 1.4, @ease_in_out_cubic) }
+let rise = fn(at) { return tween(14, 0, at, at + 1.4, @ease_in_out_cubic) }
+
+let specimens = [
+    // by letter: a variable-font weight and a small lift pass through the letters.
+    Text{name: "letters" text: "Weight travels through the letters." font: FLEX size: 54 color: look.BONE
+        at: vec2(TEXT_X, 330) by: @letter opacity: enter(0.9) y: rise(0.9)
+        range: Range{to: 0.22 soft: 0.16 ease: @ease_in_out slide: sweep(7.0, 0.0) wght: 860 y: -10}}
+    // by word: the selected word lifts into the light, the rest rests dim.
+    Text{name: "words" text: "One word at a time takes the light." font: FLEX{weight: 420} size: 54 color: look.BONE
+        at: vec2(TEXT_X, 520) by: @letter opacity: enter(1.1) y: rise(1.1)
+        ranges: [Range{by: @word to: 0.16 soft: 0.1 ease: @ease_in_out slide: sweep(8.0, 0.35) invert: true opacity: 0.38}
+            Range{by: @word to: 0.16 soft: 0.1 ease: @ease_in_out slide: sweep(8.0, 0.35) color: look.COOL scale: 1.06 y: -6}]}
+    // by line: each line widens on the width axis and steps right, then settles back.
+    Text{name: "lines" text: "Whole lines widen\nand step aside,\none after another." font: FLEX{weight: 500} size: 50
+        color: look.BONE line_height: 1.05 at: vec2(TEXT_X, 690) by: @letter opacity: enter(1.3) y: rise(1.3)
+        range: Range{by: @line to: 0.34 soft: 0.3 ease: @ease_in_out slide: sweep(9.0, 0.7) wdth: 140 x: 28}}
+]
+
+let build_layers = fn() {
+    let layers = [Draw2D{name: "ground" size: vec2(1920, 1080) draw: fn(c, t, edit) { look.ground(c, t, live()) }}]
+    for s in specimens { layers.push(s) }
+    layers.push(Draw2D{name: "chrome" size: vec2(1920, 1080) draw: fn(c, t, edit) {
+        look.folio(c, t, "02", "Type")
+        look.heading(c, t, "Every letter, word and line.", "A range selects part of a text and blends offset, scale, opacity, colour and font axes into it.")
+        let rows = [{y: 384 at: 1.0 by: "by: @letter" what: "weight, lift"},
+            {y: 574 at: 1.2 by: "by: @word" what: "colour, opacity, scale"},
+            {y: 744 at: 1.4 by: "by: @line" what: "width axis, offset"}]
+        for r in rows {
+            look.label(c, t, r.at, r.by, look.LEFT, r.y, {font: look.MONO px: 24 color: look.COOL})
+            look.label(c, t, r.at + 0.15, r.what, look.LEFT, r.y + 34, {px: 22})
+        }
+        look.syntax(c, t, 2.0, "range: Range{by: @word  slide: ...  soft: 0.1  wght: 860  color: ...}")
+    }})
+    return layers
+}
+
+Motion{
+    label: "Every letter, word and line"
+    size: vec2(1920, 1080)
+    duration: 4.0
+    fps: 60
+    color: @hdr
+    background: look.INK
+    layers: build_layers()
+    post: look.post_chain(look.POST)
+}

@@ -1028,6 +1028,21 @@ fn an_output_jack_is_loaded_by_what_is_plugged_in_and_keyed_by_it() {
     // however fast the box steps and whichever publications the test's frames see
     let net = |name: &str| NetRef { board: unit.id, net: unit.circuit.net(name).unwrap_or_else(|| panic!("the tone box has {name}")).id };
     let (out, quiet) = (net("OUT"), net("QUIET"));
+    let heard = |lowered: &fab_elec_bench::Lowered| {
+        let mut names: Vec<_> = lowered.circuit.nodes.iter().filter(|n| n.heard).map(|n| n.name.clone()).collect();
+        names.sort();
+        names
+    };
+    assert_eq!(heard(host.lowered().expect("the tone box is lowered")), ["OSC", "OUT", "QUIET"],
+        "the stock jack and bench probes declare their voltage nets heard, excluding ground");
+    // OUT is also a stock probe. Move the probes off the jack to check the two declarations independently.
+    let mut bench_diff = bench.spec.clone();
+    bench_diff.probes = [Probe::VDiff(net("TIMING"), net("MID")), Probe::V(net("GND"))].into_iter()
+        .map(|probe| ScopeProbe { probe, label: String::new(), tip: Tip::default() }).collect();
+    let lowered = fab_elec_bench::lower(&design, unit.id, &bench_diff, &ModelLibs::generic());
+    assert_eq!(heard(&lowered), ["MID", "OUT", "TIMING"],
+        "the unprobed jack and both points of a differential probe are heard, and a ground probe stays unheard");
+
     let swing = |host: &mut SimHost, live: &mut SimLive, what: &str| {
         host.act(&SimAction::Cmd(SimCmd::press(key, true)));
         let [out, quiet] = [out, quiet].map(|n| host.index().net(n).expect("the net is lowered"));

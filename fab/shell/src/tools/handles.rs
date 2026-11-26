@@ -23,7 +23,9 @@ use crate::handle_style::*;
 use crate::params::*;
 use crate::ui::parts::active_part;
 use super::fine_drag::{inside, readout_rect, Fine, SNAP_DEG, SNAP_MM, SNAP_SCALE};
+use super::picks;
 use makepad_widgets_core::*;
+use std::sync::Arc;
 
 script_mod! {
     use mod.prelude.fab.*
@@ -218,6 +220,11 @@ struct Shape {
     at: DVec2,
 }
 
+/// What a box shows a value as: a ratio in percent, anything else as it is.
+fn typed_scale(p: &ParamView) -> f64 {
+    if p.kind == ParamKind::Ratio { 100.0 } else { 1.0 }
+}
+
 /// A print settings box's size or position row as it reads on the plate, as its rows in the
 /// Overrides editor do ([`plate_axis`]); none for any other row.
 fn box_axis(state: &AppState, p: &ParamView) -> Option<PlateAxis> {
@@ -253,6 +260,16 @@ pub struct FabShapeHandles {
     /// The parameter being typed into (double-click), and where.
     #[rust]
     editing: Option<(String, usize, String, DVec2)>,
+    /// The typed box's name on the semantic tree: its handle's value.
+    #[rust]
+    editor_name: String,
+    /// A refused value's reason, kept at the handle once its box closes: the tip's end.
+    #[rust]
+    refusal: Timer,
+    /// The command at a pick whose value box was opened ([`crate::params::CommandView::rev`]):
+    /// a new command opens its box once.
+    #[rust]
+    command_rev: u64,
     /// Press position for a feature pick (a click that is not a drag).
     #[rust]
     press: Option<DVec2>,
@@ -261,7 +278,15 @@ pub struct FabShapeHandles {
     #[rust]
     hold: Timer,
     #[rust]
-    held: Option<(DVec2, bool, bool)>,
+    held: Option<(DVec2, bool, bool, super::picks::SceneHit)>,
+    /// The right press waiting for the ring, and the latest position within its travel threshold.
+    #[rust]
+    menu_down: Option<(DVec2, DVec2)>,
+    #[rust]
+    menu_hold: Timer,
+    /// Keep grips and other widgets underneath the ring from capturing its next click.
+    #[rust]
+    menu_lock: Option<makepad_platform::event::SweepLock>,
     /// Where the last click picked, until the pointer moves off it: a press there is the pick's
     /// (a double click's second), though the first click's part now shows a handle under it.
     #[rust]
@@ -283,6 +308,7 @@ pub struct FabShapeHandles {
 
 /// How long a press is held still before Select Other opens (seconds).
 const HOLD_SECONDS: f64 = 0.45;
+const MENU_HOLD_SECONDS: f64 = 0.3;
 
 fn mm(p: V3) -> Vec3f {
     vec3(p[0] as f32 * 0.001, p[1] as f32 * 0.001, p[2] as f32 * 0.001)
@@ -301,7 +327,12 @@ pub fn handle_shape(h: &ParamHandle) -> HandleShape {
 }
 
 /// The parameters whose handles show for a part.
-pub fn shown_params<'a>(state: &AppState, pp: &'a PartParamsView) -> Vec<&'a ParamView> {
+pub fn shown_params<'a>(state: &'a AppState, pp: &'a PartParamsView) -> Vec<&'a ParamView> {
+    // a command at a pick on this part (Round): its handle alone
+    if let Some(c) = state.params.command.as_ref().filter(|c| c.object == pp.object && c.param.handle.is_some()) {
+        return vec![&c.param];
+    }
+    if state.steps.marker.is_some() { return Vec::new(); }
     let with = |p: &&ParamView| p.handle.is_some() && !p.detail && !p.derived;
     if let Some(focus) = &state.params.focus {
         let v: Vec<&ParamView> = pp.params.iter().filter(with).filter(|p| p.objects.iter().any(|o| o == focus)).collect();
@@ -325,7 +356,10 @@ impl FabShapeHandles {
     /// Move, Turn, Scale and Paint tools have their own grips.
     fn wanted(state: &AppState) -> Option<usize> {
         if crate::ui::test_prints::picked(state).is_some() { return None; }
-        if state.slice_blocks_edits() || !matches!(state.ui.gizmo, GizmoMode::Off | GizmoMode::Shape) || state.tool != Tool::Select {
+        let blocked = if state.steps.marker.is_some() {
+            state.params.command.is_none() || state.pick_tool_block_reason().is_some()
+        } else { state.slice_blocks_edits() };
+        if blocked || !matches!(state.ui.gizmo, GizmoMode::Off | GizmoMode::Shape) || state.tool != Tool::Select {
             return None;
         }
         active_part(state)
@@ -686,6 +720,126 @@ impl FabShapeHandles {
         (ptr.origin, ptr.dir, super::picks::pixel(state.view.camera(self.pane), self.area.rect(cx)))
     }
 
+    fn cancel_menu_hold(&mut self, cx: &mut Cx) {
+        if self.menu_down.take().is_some() {
+            cx.stop_timer(self.menu_hold);
+        }
+    }
+
+    fn open_menu(&mut self, cx: &mut Cx, state: &mut AppState) {
+        let Some((at, pointer)) = self.menu_down.take() else { return };
+        let Some(&view) = state.ui.plate_keys.get(self.pane.0 as usize) else { return };
+        if state.picks.other.is_some() || !cx.fingers.is_area_captured(view) { return; }
+        let mut items = picks::menu_items(&state.picks.list, state.picks.repeat.as_ref());
+        if let Some(why) = state.pick_tool_block_reason() {
+            for item in items.iter_mut().filter(|item| picks::modelling_command(item.command)) {
+                item.disabled = true;
+                item.words = why.clone();
+            }
+        }
+        if items.is_empty() { return; }
+        let Some(lock) = cx.acquire_sweep_lock(view) else { return };
+        let mut menu = picks::MarkingMenu::open(self.pane, view.rect(cx), at, items);
+        menu.pointer = pointer;
+        self.menu_lock = Some(lock);
+        state.picks.menu = Some(menu);
+        self.press = None;
+        self.held = None;
+        cx.stop_timer(self.hold);
+        cx.action(picks::PickAction::Hover(None));
+        // the view drops what a click would take while the ring is up
+        crate::ui::redraw(cx, &[ids!(tool_overlay), ids!(viewport)]);
+    }
+
+    fn close_menu(&mut self, cx: &mut Cx, state: &mut AppState) {
+        self.menu_lock = None;
+        state.picks.menu = None;
+        crate::ui::redraw(cx, &[ids!(tool_overlay), ids!(viewport)]);
+    }
+
+    /// The stage forwards the viewport's pointer even when the navigator consumed it.
+    fn menu_input(&mut self, cx: &mut Cx, input: &ViewportInput, state: &mut AppState) -> bool {
+        if let Some(menu) = &mut state.picks.menu {
+            if menu.pane != self.pane { return true; }
+            menu.fit(input.rect);
+            let pos = match input.kind {
+                ViewportInputKind::PointerDown { pos, .. } | ViewportInputKind::PointerMove { pos, .. }
+                | ViewportInputKind::PointerUp { pos, .. } => pos,
+                ViewportInputKind::HoverOut => {
+                    // A captured, cancelled or off-view release is forwarded as HoverOut.
+                    if menu.stroke || menu.press {
+                        self.close_menu(cx, state);
+                    } else if menu.hot.take().is_some() {
+                        crate::ui::redraw(cx, &[ids!(tool_overlay)]);
+                    }
+                    return true;
+                }
+                _ => return true,
+            };
+            let mut changed = pos != menu.pointer;
+            if changed || !matches!(input.kind, ViewportInputKind::PointerUp { .. }) {
+                let hot = picks::menu_hot(menu, &menu.layout, pos);
+                changed |= hot != menu.hot;
+                menu.pointer = pos;
+                menu.hot = hot;
+            }
+            match input.kind {
+                ViewportInputKind::PointerDown { .. } if !menu.stroke => menu.press = true,
+                ViewportInputKind::PointerUp { .. } if menu.stroke || menu.press => {
+                    if menu.stroke && menu.hot.is_none() {
+                        menu.stroke = false;
+                        changed = true;
+                    } else {
+                        if let Some(item) = menu.items.iter().find(|item| Some(item.slot) == menu.hot) {
+                            if item.disabled {
+                                super::session::with(|s| s.hint = item.words.clone());
+                            } else {
+                                cx.action(ShellAction::Command(item.command.into()));
+                            }
+                        }
+                        self.close_menu(cx, state);
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+            if changed { crate::ui::redraw(cx, &[ids!(tool_overlay)]); }
+            return true;
+        }
+        // The ordinary viewport input reflects x for a See through camera. The strip and
+        // ring use window points; once open the viewport forwards those directly.
+        let window_point = |pos: DVec2| {
+            if state.view.pane(self.pane).link.how() == Some(LinkHow::Through) {
+                dvec2(2.0 * input.rect.pos.x + input.rect.size.x - pos.x, pos.y)
+            } else { pos }
+        };
+        match input.kind {
+            ViewportInputKind::PointerDown { button: PointerButton::Secondary, pos, .. }
+                if picks::active(state) && state.picks.other.is_none() && self.drag.is_none() && !state.picks.list.is_empty() => {
+                // Every nonempty list offers at least Insert Selector.
+                let pos = window_point(pos);
+                self.cancel_menu_hold(cx);
+                if !picks::on_strip(picks::strip_view(state, self.pane, input.rect), &state.picks.list, pos) {
+                    self.menu_down = Some((pos, pos));
+                    self.menu_hold = cx.start_timeout(MENU_HOLD_SECONDS);
+                }
+            }
+            ViewportInputKind::PointerMove { pos, buttons, .. } => {
+                if let Some((at, pointer)) = &mut self.menu_down {
+                    let pos = window_point(pos);
+                    if buttons & 2 == 0 || pos.distance(at) >= crate::nav::DRAG_THRESHOLD_PT {
+                        self.cancel_menu_hold(cx);
+                    } else {
+                        *pointer = pos;
+                    }
+                }
+            }
+            ViewportInputKind::PointerUp { button: PointerButton::Secondary, .. } | ViewportInputKind::HoverOut => self.cancel_menu_hold(cx),
+            _ => {}
+        }
+        false
+    }
+
     /// The Edit shape mode's picks: hover asks what a click would take, a click picks (Shift
     /// adds, a double click the body), a press held still opens Select Other. A press on a
     /// handle is the handle's.
@@ -694,40 +848,41 @@ impl FabShapeHandles {
         if !super::picks::active(state) {
             return;
         }
+        let scene = super::picks::SceneHit { revision: state.scene_revision, hit: input.hit };
         match input.kind {
             ViewportInputKind::PointerMove { pos, buttons: 0, .. } => {
                 if self.last_pick.is_some_and(|p| (pos - p).length() >= 4.0) {
                     self.last_pick = None;
                 }
-                let on_strip = super::picks::strip(self.area.rect(cx)).iter().any(|(r, _)| r.contains(pos));
+                let on_strip = super::picks::on_strip(picks::strip_view(state, self.pane, self.area.rect(cx)), &state.picks.list, pos);
                 let ray = (self.hover.is_none() && state.picks.other.is_none() && !on_strip).then(|| self.pick_ray(cx, state, pos));
                 let view = (*state.view.camera(self.pane), self.area.rect(cx));
-                cx.action(PickAction::Hover(ray.map(|(from, dir, pixel)| super::picks::Hover { from, dir, pixel, at: pos, view })));
+                cx.action(PickAction::Hover(ray.map(|(from, dir, pixel)| super::picks::Hover { scene, from, dir, pixel, at: pos, view })));
             }
             ViewportInputKind::PointerMove { pos, .. } => {
-                if self.held.is_some_and(|(at, _, _)| (pos - at).length() >= 4.0) {
+                if self.held.is_some_and(|(at, _, _, _)| (pos - at).length() >= 4.0) {
                     cx.stop_timer(self.hold);
                     self.held = None;
                 }
             }
             ViewportInputKind::PointerDown { button: PointerButton::Primary, pos, mods, tap_count } => {
                 // Select Other open: this press closes it (a row's press is the overlay's); the
-                // kind filter's strip and a handle take their own presses.
-                let on_strip = super::picks::strip(self.area.rect(cx)).iter().any(|(r, _)| r.contains(pos));
+                // kind filter's strip, a command's box and a handle take their own presses.
+                let on_strip = super::picks::on_strip(picks::strip_view(state, self.pane, self.area.rect(cx)), &state.picks.list, pos);
                 if state.picks.other.is_some() || on_strip || (self.target_at(pos).is_some() && !self.on_last_pick(state, pos)) {
                     self.held = None;
                     return;
                 }
-                self.held = Some((pos, mods.shift, tap_count >= 2));
+                self.held = Some((pos, mods.shift, tap_count >= 2, scene));
                 self.hold = cx.start_timeout(HOLD_SECONDS);
             }
             ViewportInputKind::PointerUp { button: PointerButton::Primary, pos, .. } => {
                 cx.stop_timer(self.hold);
-                if let Some((at, add, body)) = self.held.take() {
-                    if (pos - at).length() < 4.0 {
+                if let Some((at, add, body, down)) = self.held.take() {
+                    if (pos - at).length() < 4.0 && down.revision == scene.revision {
                         self.last_pick = Some(pos);
                         let (from, dir, pixel) = self.pick_ray(cx, state, pos);
-                        cx.action(PickAction::At { from, dir, pixel, add, body });
+                        cx.action(PickAction::At { scene, from, dir, pixel, add, body });
                     }
                 }
             }
@@ -745,7 +900,43 @@ impl FabShapeHandles {
         super::picks::active(state) && self.last_pick.is_some_and(|p| (pos - p).length() < 4.0)
     }
 
+    /// Open the value box for `p` (of part `part`): its unit, decimals and limits as the panel's
+    /// row has them, and the part's declared parameters as names it reads (`wall * 2`).
+    fn open_editor(&mut self, cx: &mut Cx, state: &AppState, p: &ParamView, part: usize) {
+        let scale = typed_scale(p);
+        self.editor.suffix = match p.unit.as_str() { "" => String::new(), "°" => "°".into(), u => format!(" {u}") };
+        // (a ratio's decimals are its fraction's: shown in percent, two fewer)
+        self.editor.precision = (precision(p.kind, p.step) as f64 - if p.kind == ParamKind::Ratio { 2.0 } else { 0.0 }).max(0.0);
+        // what a typed number is held to: the declared limits (none: any value)
+        let [lo, hi] = p.limits;
+        (self.editor.min, self.editor.max) = match (lo, hi) {
+            (Some(lo), Some(hi)) if hi > lo => (lo * scale, hi * scale),
+            _ => (0.0, 0.0),
+        };
+        let names = state.params.part(part).map(|pp| named_values(pp)).unwrap_or_else(|| Arc::from(Vec::new()));
+        self.editor.set_names(cx, names, p.links);
+        self.editor.set_formula(cx, p.formula.as_deref());
+        self.editor_name = format!("{} handle value", p.label);
+        self.editor.set_value(cx, p.value.num().unwrap_or(0.0) * scale);
+        self.editor.begin_edit(cx);
+    }
+
+    /// A new command at a pick (Round) opens its value box by its handle, once: drag the handle
+    /// or type the value.
+    fn open_command_box(&mut self, cx: &mut Cx, scope: &mut Scope) {
+        let Some(state) = scope.data.get::<AppState>() else { return };
+        let Some(c) = state.params.command.as_ref().filter(|c| c.rev != self.command_rev) else { return };
+        if self.drag.is_some() || self.editing.is_some() { return; }
+        let (Some(i), Some(at)) = (Self::wanted(state), self.shapes.iter().find(|s| matches!(&s.target, Target::HandleGrip { key, .. } if *key == c.param.key)).map(|s| s.at)) else { return };
+        self.command_rev = c.rev;
+        self.editing = Some((c.param.key.clone(), i, c.object.clone(), at));
+        let p = c.param.clone();
+        self.open_editor(cx, state, &p, i);
+        self.draw_prim.redraw(cx);
+    }
+
     pub(crate) fn handle_viewport_input(&mut self, cx: &mut Cx, input: &ViewportInput, state: &mut AppState) {
+        if self.menu_input(cx, input, state) { return; }
         if self.drag.is_some() || self.editing.is_some() { return; }
         self.pick_input(cx, input, state);
         match input.kind {
@@ -793,7 +984,17 @@ impl Widget for FabShapeHandles {
         node.set_size = self.nodes.len() as u32;
     }
 
-    fn semantics_parts(&self, _cx: &Cx, out: &mut Vec<(u64, Option<u64>, a11y_tree::Node)>) {
+    fn semantics_parts(&self, cx: &Cx, out: &mut Vec<(u64, Option<u64>, a11y_tree::Node)>) {
+        // A double-clicked handle's typed box, as the box itself says it (its value, what it
+        // reads or why it refuses). Typing reaches it by key focus, so the node takes no actions.
+        if self.editing.is_some() {
+            let mut node = a11y_tree::Node::default();
+            self.editor.semantics(cx, &mut node);
+            makepad_platform::a11y::set_string(&mut node.name, &self.editor_name);
+            node.bounds = makepad_platform::a11y::semantic_rect(self.editor.area().rect(cx));
+            node.actions = a11y_tree::Actions::empty();
+            out.push((u64::MAX - 2, None, node));
+        }
         // the print settings box drawn: its size on the plate as drawn
         if let Some((object, size, rect)) = &self.drawn_box {
             let mut node = a11y_tree::Node { role: a11y_tree::Role::Image, bounds: makepad_platform::a11y::semantic_rect(*rect), ..Default::default() };
@@ -825,12 +1026,48 @@ impl Widget for FabShapeHandles {
             self.draw_prim.redraw(cx);
         }
         let Some(state) = scope.data.get_mut::<AppState>() else { return };
+        if self.menu_down.is_some() || self.menu_lock.is_some() {
+            let cancel = match event {
+                // Once open, Escape closes the menu at the viewport before its tool sees the key.
+                Event::KeyDown(ke) => self.menu_down.is_some() && ke.key_code == KeyCode::Escape,
+                Event::WindowLostFocus(_) | Event::Pause | Event::Background => true,
+                Event::MouseUp(e) => !self.area.clipped_rect(cx).contains(e.abs),
+                // The stage forwards mouse and touch events but not a standalone capture cancellation.
+                Event::FingerCancel(_) => state.ui.plate_keys.get(self.pane.0 as usize)
+                    .is_some_and(|&view| matches!(event.hits(cx, view), Hit::FingerUp(e) if e.cancelled)),
+                _ => false,
+            };
+            if cancel || !picks::active(state) || self.menu_lock.as_ref().is_some_and(|lock| !lock.is_active()) {
+                self.cancel_menu_hold(cx);
+                if state.picks.menu.as_ref().is_some_and(|m| m.pane == self.pane) {
+                    self.close_menu(cx, state);
+                    return;
+                }
+            }
+            if self.menu_hold.is_event(event).is_some() && state.picks.menu.is_none() {
+                self.open_menu(cx, state);
+            }
+        }
+        if state.picks.menu.is_some() { return; }
+        self.menu_lock = None;
+        self.open_command_box(cx, scope);
+        let Some(state) = scope.data.get_mut::<AppState>() else { return };
         // A press held still in the Edit shape mode: Select Other at the pointer, and no click.
         if self.hold.is_event(event).is_some() {
-            if let Some((at, add, _)) = self.held.take() {
+            if let Some((at, add, _, scene)) = self.held.take() {
                 let (from, dir, pixel) = self.pick_ray(cx, state, at);
-                cx.action(super::picks::PickAction::Other { from, dir, pixel, at, add });
+                cx.action(super::picks::PickAction::Other { scene, from, dir, pixel, at, add });
             }
+        }
+        // A press on a grip while typing: the typing ends (what was typed and not entered goes)
+        // and the grip drags at once.
+        if self.editing.is_some() && matches!(event, Event::MouseDown(e) if e.button.is_primary() && self.target_at(e.abs).is_some()) {
+            cx.set_key_focus(Area::Empty);
+            self.editing = None;
+            self.draw_prim.redraw(cx);
+        }
+        if self.refusal.is_event(event).is_some() {
+            cx.widget_action(self.uid, makepad_widgets_core::tip::TipAction::HoverOut);
         }
         // The typed value of a double-clicked handle.
         if let Some((key, part, object, _)) = self.editing.clone() {
@@ -841,12 +1078,30 @@ impl Widget for FabShapeHandles {
             if let Some(v) = ended {
                 self.editing = None;
                 let Some(state) = scope.data.get::<AppState>() else { return };
-                if let Some(p) = state.params.part(part).and_then(|pp| pp.param(&key)) {
-                    Self::commit(cx, &object, &key, ParamValue::Num(clamp_value(p, v)));
+                // (a box left on the value it opened with commits nothing: a command's opens at a
+                // value below its range)
+                if let Some(p) = state.params.part(part).and_then(|pp| state.params.param_of(pp, &key)) {
+                    let v = v / typed_scale(p);
+                    if let Some((value, code)) = typed_formula(p, &actions, uid) {
+                        cx.action(ParamAction::Link { object, key, code, value: within_limits(p, value / typed_scale(p)) });
+                    } else if p.formula.is_some() || state.params.shown_value(p).num().is_none_or(|was| (was - v).abs() > 1e-9) {
+                        Self::commit(cx, &object, &key, ParamValue::Num(within_limits(p, v)));
+                    }
                 }
                 self.draw_prim.redraw(cx);
             } else if !self.editor.is_interacting() {
                 self.editing = None;
+                // A press elsewhere closed a box that refused its text: nothing commits, and the
+                // reason stays where the box was as long as a panel box keeps its own.
+                if let Some(reason) = self.editor.refusal() {
+                    use makepad_widgets_core::tip::{TipAction, TipRequest};
+                    let mut request = TipRequest::plain(reason.to_string(), self.editor.area().rect(cx));
+                    request.delay_secs = 0.0;
+                    request.intent = makepad_widgets_core::badge::BadgeIntent::Error;
+                    cx.widget_action(self.uid, TipAction::HoverInWith(request));
+                    cx.stop_timer(self.refusal);
+                    self.refusal = cx.start_timeout(makepad_widgets_core::value_input::INVALID_LINGER_SECS);
+                }
                 self.draw_prim.redraw(cx);
             }
             // A press elsewhere ends typing: the editor commits on its own focus loss.
@@ -872,7 +1127,7 @@ impl Widget for FabShapeHandles {
                 let Some(target) = self.target_at(fe.abs) else { return };
                 match target {
                     Target::Count { key, delta } => {
-                        if let Some(p) = pp.param(&key) {
+                        if let Some(p) = state.params.param_of(&pp, &key) {
                             if let ParamValue::Num(v) = p.value {
                                 let nv = clamp_value(p, v + delta);
                                 if nv != v {
@@ -882,16 +1137,15 @@ impl Widget for FabShapeHandles {
                         }
                     }
                     Target::HandleGrip { key, grip } => {
-                        let Some(p) = pp.param(&key) else { return };
+                        let Some(p) = state.params.param_of(&pp, &key).cloned() else { return };
+                        let p = &p;
                         if fe.tap_count >= 2 && p.kind.is_numeric() {
                             // Type a value in.
                             let at = self.shapes.iter().find(|s| s.target == Target::HandleGrip { key: key.clone(), grip }).map(|s| s.at).unwrap_or(fe.abs);
                             self.editing = Some((key.clone(), i, pp.object.clone(), at));
                             self.drag = None;
                             state.params.dragging = None;
-                            let v = p.value.num().unwrap_or(0.0);
-                            self.editor.set_value(cx, v);
-                            self.editor.begin_edit(cx);
+                            self.open_editor(cx, state, p, i);
                             self.draw_prim.redraw(cx);
                             return;
                         }
@@ -915,7 +1169,8 @@ impl Widget for FabShapeHandles {
             }
             Hit::FingerMove(fe) => {
                 let Some(mut drag) = self.drag.clone() else { return };
-                let Some(p) = pp.param(&drag.key) else { return };
+                let Some(p) = state.params.param_of(&pp, &drag.key).cloned() else { return };
+                let p = &p;
                 let Some(h) = &p.handle else { return };
                 let ptr = self.pointer(cx, state, fe.abs);
                 let view = Self::view_dir(state, self.pane);
@@ -1074,7 +1329,7 @@ impl Widget for FabShapeHandles {
                     None => None,
                 });
                 if let Some((key, grip, value, snapped)) = shown {
-                    if let Some(p) = pp.param(&key) {
+                    if let Some(p) = state.params.param_of(&pp, &key) {
                         let v = value.unwrap_or_else(|| state.params.shown_value(p));
                         let at = self.shapes.iter().find(|s| match &s.target {
                             Target::HandleGrip { key: k, grip: g } => *k == key && *g == grip,
@@ -1092,6 +1347,18 @@ impl Widget for FabShapeHandles {
                             self.label(cx, at, &text);
                         }
                     }
+                }
+            }
+        }
+        // a command at a pick (Round): what its value does, under its handle; its box opens once
+        if let Some(c) = &state.params.command {
+            if let Some(at) = self.shapes.iter().find(|s| matches!(&s.target, Target::HandleGrip { key, .. } if *key == c.param.key)).map(|s| s.at) {
+                // (a drag's value takes the pointer's label)
+                if self.drag.is_none() {
+                    self.label(cx, at + dvec2(0.0, 26.0), &c.says);
+                }
+                if c.rev != self.command_rev {
+                    self.next_frame = cx.new_next_frame();
                 }
             }
         }

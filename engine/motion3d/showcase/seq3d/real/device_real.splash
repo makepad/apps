@@ -1,0 +1,10 @@
+use mod.flow.*
+use mod.cut.*
+let g   = Graphic{src: asset("ast_rdevicemotiondocaaaaaaaaaa", "arev_0000000000000000000000000000000000000000000000000000000000000003") span: [0.0, 8.0]}
+let out = CutOutput{frame: g.out(@frame)}
+Flow{
+    kind: @cut
+    output: {width: 960 height: 540 fps: 30}
+    duration: 8.0
+    g, out
+}

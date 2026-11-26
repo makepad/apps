@@ -1,4 +1,4 @@
-//! KiCad's 3D model library (EKMODELS, `local/agent_state/electronics/ekmodels/DESIGN.md`): where its
+//! KiCad's 3D model library (EKMODELS): where its
 //! models are, which library version a board's models come from, and the hosts Fab downloads one
 //! model file from.
 //!

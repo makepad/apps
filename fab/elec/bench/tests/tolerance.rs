@@ -93,7 +93,7 @@ fn tolerance_sites_and_member_draws() -> Result<(), String> {
 
     let mut input = LowerInput {
         nets: ["0", "a", "b"].into_iter().enumerate()
-            .map(|(i, name)| LowerNet { id: net(i as u32), name: name.into(), supply: false }).collect(),
+            .map(|(i, name)| LowerNet { id: net(i as u32), name: name.into(), supply: false, heard: false }).collect(),
         ground: net(0),
         parts: vec![resistor(1, "r1"), resistor(2, "r2")],
         supplies: Vec::new(),
@@ -102,7 +102,7 @@ fn tolerance_sites_and_member_draws() -> Result<(), String> {
         probes: Vec::new(),
     };
     let before = lower_input(&input, 0, &libs);
-    input.nets.push(LowerNet { id: net(3), name: "c".into(), supply: false });
+    input.nets.push(LowerNet { id: net(3), name: "c".into(), supply: false, heard: false });
     input.parts.insert(0, resistor(3, "r0"));
     let after = lower_input(&input, 1, &libs);
     // each resistor's other end is a net of its own: only those open ends are noted, by net

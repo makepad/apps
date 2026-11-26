@@ -1,0 +1,925 @@
+// Scene kits (kits.rs): their prototypes with defaults, the screen helper materials and the template functions, evaluated once into mod.scene.
+use mod.std.*
+use mod.math.*
+use mod.pod.*
+use mod.scene.*
+
+// ---------------------------------------------------------------- screens
+// An animated app UI for device screens when no media is given
+// (`screen: @demo`): a gradient, a header, cards sliding in, a progress bar.
+mod.scene.DemoScreen = ShaderMaterial{
+    color: #000000
+    roughness: 0.08
+    clearcoat: 1
+    clearcoat_roughness: 0.02
+    hooks: {
+    emissive_fn: fn(p: vec3, n: vec3, uv: vec2, t: float) -> vec3 {
+        var c = mix(vec3(0.20, 0.05, 0.28), vec3(0.03, 0.05, 0.14), uv.y)
+        if uv.y > 0.9 {
+            c = c * 0.4 + vec3(0.05, 0.06, 0.1)
+        }
+        var k = 0.0
+        while k < 4.0 {
+            let appear = clamp((t - 0.35 * k - 0.3) * 2.5, 0.0, 1.0)
+            let slide = (1.0 - appear) * (1.0 - appear) * 0.6
+            let cy = 0.76 - k * 0.19
+            let d = max(abs(uv.x - 0.5 - slide) - 0.40, abs(uv.y - cy) - 0.075)
+            let inside = clamp(0.5 - d * 300.0, 0.0, 1.0) * appear
+            let hue = vec3(0.3 + 0.2 * k, 0.55, 0.95 - 0.15 * k)
+            c = mix(c, vec3(0.16, 0.17, 0.32), inside * 0.8)
+            let line = clamp(0.5 - (abs(uv.y - cy - 0.02) - 0.008) * 800.0, 0.0, 1.0) * step(abs(uv.x - 0.55 - slide), 0.22) * appear
+            let line2 = clamp(0.5 - (abs(uv.y - cy + 0.025) - 0.006) * 800.0, 0.0, 1.0) * step(abs(uv.x - 0.5 - slide), 0.17) * appear
+            c = mix(c, vec3(0.9, 0.92, 1.0), line * 0.9)
+            c = mix(c, vec3(0.55, 0.58, 0.75), line2 * 0.8)
+            let chip = clamp(0.5 - (length(vec2((uv.x - 0.2 - slide) * 0.5, uv.y - cy)) - 0.03) * 400.0, 0.0, 1.0) * appear
+            c = mix(c, hue, chip)
+            k = k + 1.0
+        }
+        let bar = clamp(0.5 - (abs(uv.y - 0.06) - 0.012) * 600.0, 0.0, 1.0) * step(abs(uv.x - 0.5), 0.4)
+        let fill = step(uv.x, 0.1 + 0.8 * fract(t * 0.25))
+        c = mix(c, mix(vec3(0.25, 0.25, 0.3), vec3(1.0, 0.35, 0.2), fill), bar)
+        return c * 1.3
+    }
+    }
+}
+mod.scene.ScreenOff = MeshPhysicalMaterial{color: #050507 roughness: 0.05 clearcoat: 1 clearcoat_roughness: 0.02}
+
+// ---------------------------------------------------------------- devices
+mod.scene.Device = mod.scene.Device{
+    kind: @phone
+    screen: @demo
+    body: MeshPhysicalMaterial{preset: @brushed_metal color: #2a2c31}
+    bezel: MeshPhysicalMaterial{color: #07080a roughness: 0.2 clearcoat: 1}
+    open: 105
+    // How a picture fits the screen: @cover (crop, never stretch), @contain
+    // (letterbox) or @fill (stretch). `crop`: [x, y, w, h] in the picture's
+    // pixels, keyable (a reframe's crop keys follow the action).
+    fit: @cover
+    crop: @none
+    // Screen width / height; 0 = the device's own (phone 9:19.5, tablet
+    // 4:3 landscape). A phone given `aspect: 9 / 16` shows a 1080×1920 app
+    // run whole, pixel for pixel.
+    aspect: 0
+}
+
+mod.scene.screen_crop = fn(p) {
+    let c = if p.crop == @none { nil } else { p.crop }
+    return c
+}
+mod.scene.kit_device_phone = fn(p) {
+    let a = if p.aspect > 0 { p.aspect } else { 9 / 19.5 }
+    let w = 1.5 * a
+    return Group3D{children: [
+        Mesh{geometry: BoxGeometry{width: w + 0.08 height: 1.6 depth: 0.085 radius: 0.11 radius_segments: 6} material: p.body}
+        Mesh{geometry: BoxGeometry{width: w + 0.04 height: 1.56 depth: 0.02 radius: 0.095 radius_segments: 6} position: vec3(0, 0, 0.034) material: p.bezel}
+        Mesh{geometry: PlaneGeometry{width: w height: 1.5} position: vec3(0, 0, 0.0445) material: screen_material(p.screen, nil, p.fit, mod.scene.screen_crop(p), a)}
+        Mesh{geometry: BoxGeometry{width: 0.22 height: 0.045 depth: 0.004 radius: 0.02 radius_segments: 3} position: vec3(0, 0.71, 0.046) material: MeshBasicMaterial{color: #000000}}
+    ]}
+}
+
+mod.scene.kit_device_tablet = fn(p) {
+    let a = if p.aspect > 0 { p.aspect } else { 1.78 / 1.23 }
+    let h = 1.78 / a
+    return Group3D{children: [
+        Mesh{geometry: BoxGeometry{width: 1.9 height: h + 0.12 depth: 0.07 radius: 0.08 radius_segments: 6} material: p.body}
+        Mesh{geometry: BoxGeometry{width: 1.86 height: h + 0.08 depth: 0.02 radius: 0.07 radius_segments: 6} position: vec3(0, 0, 0.028) material: p.bezel}
+        Mesh{geometry: PlaneGeometry{width: 1.78 height: h} position: vec3(0, 0, 0.0385) material: screen_material(p.screen, nil, p.fit, mod.scene.screen_crop(p), a)}
+    ]}
+}
+
+// The lid hinges on the base's back edge; `open` is degrees (0 = shut).
+mod.scene.kit_device_laptop = fn(p) {
+    return Group3D{children: [
+        Mesh{geometry: BoxGeometry{width: 2.2 height: 0.07 depth: 1.5 radius: 0.035 radius_segments: 4} position: vec3(0, 0.035, 0) material: p.body}
+        Mesh{geometry: BoxGeometry{width: 1.9 height: 0.004 depth: 0.75} position: vec3(0, 0.071, -0.2) material: p.bezel}
+        Mesh{geometry: BoxGeometry{width: 0.7 height: 0.004 depth: 0.4} position: vec3(0, 0.071, 0.47) material: MeshPhysicalMaterial{color: #16171a roughness: 0.3}}
+        Group3D{
+            position: vec3(0, 0.07, -0.74)
+            rotation: add(vec3(90, 0, 0), mul(p.open, vec3(-1, 0, 0)))
+            children: [
+                Mesh{geometry: BoxGeometry{width: 2.2 height: 1.45 depth: 0.035 radius: 0.03 radius_segments: 4} position: vec3(0, 0.725, 0) material: p.body}
+                Mesh{geometry: BoxGeometry{width: 2.16 height: 1.41 depth: 0.004} position: vec3(0, 0.725, 0.019) material: p.bezel}
+                Mesh{geometry: PlaneGeometry{width: 2.0 height: 1.25} position: vec3(0, 0.74, 0.0215) material: screen_material(p.screen, nil, p.fit, mod.scene.screen_crop(p), 1.6)}
+            ]
+        }
+    ]}
+}
+
+mod.scene.kit_device_monitor = fn(p) {
+    return Group3D{children: [
+        Mesh{geometry: BoxGeometry{width: 3.0 height: 1.75 depth: 0.06 radius: 0.03 radius_segments: 4} position: vec3(0, 1.45, 0) material: p.body}
+        Mesh{geometry: BoxGeometry{width: 2.96 height: 1.71 depth: 0.004} position: vec3(0, 1.45, 0.031) material: p.bezel}
+        Mesh{geometry: PlaneGeometry{width: 2.84 height: 1.6} position: vec3(0, 1.46, 0.0335) material: screen_material(p.screen, nil, p.fit, mod.scene.screen_crop(p), 2.84 / 1.6)}
+        Mesh{geometry: BoxGeometry{width: 0.16 height: 0.7 depth: 0.08 radius: 0.02 radius_segments: 3} position: vec3(0, 0.35, -0.08) material: p.body}
+        Mesh{geometry: BoxGeometry{width: 0.9 height: 0.035 depth: 0.55 radius: 0.015 radius_segments: 3} position: vec3(0, 0.0175, 0) material: p.body}
+    ]}
+}
+
+// ------------------------------------------------------------- turntable
+mod.scene.Turntable = mod.scene.Turntable{
+    speed: 25
+    plinth: true
+    plinth_radius: 1.6
+    plinth_height: 0.12
+    plinth_material: MeshPhysicalMaterial{preset: @ceramic color: #e9e9ec}
+}
+
+mod.scene.kit_turntable = fn(p) {
+    return Group3D{children: [
+        Group3D{rotation: spin(vec3(0, p.speed, 0)) position: vec3(0, p.plinth_height, 0) children: p.children}
+        Mesh{visible: p.plinth geometry: CylinderGeometry{radius: p.plinth_radius height: p.plinth_height radial_segments: 96} position: vec3(0, p.plinth_height * 0.5, 0) rotation: spin(vec3(0, p.speed, 0)) material: p.plinth_material}
+    ]}
+}
+
+// ----------------------------------------------------------------- fields
+mod.scene.Field = mod.scene.Field{
+    preset: @galaxy
+    count: 4000
+    size: 0.05
+    color: #6fb7ff
+    color2: #ff5ab4
+    radius: 4.0
+    height: 1.2
+    grid: 50
+    spacing: 0.24
+    speed: 12
+    react: @none
+    start: 0.0
+    seed: 1
+}
+
+mod.scene.kit_field_galaxy = fn(p) {
+    return Group3D{rotation: spin(vec3(0, p.speed, 0)) scale: follow_music(p.react, 1.0, 1.15) children: [
+        Points{layout: SpiralLayout{count: p.count radius: p.radius turns: 2.5 height: p.height * 0.25} size: p.size color: p.color}
+        Points{layout: BallLayout{count: p.count / 4 radius: p.radius * 0.22 seed: p.seed} size: p.size * 1.6 color: p.color2}
+        Points{layout: BallLayout{count: p.count / 3 radius: p.radius * 1.3 seed: p.seed + 1 surface: false} size: p.size * 0.5 color: p.color opacity: 0.5}
+    ]}
+}
+
+mod.scene.kit_field_swarm = fn(p) {
+    return Group3D{rotation: spin(vec3(0, p.speed, 0)) children: [
+        Instances{
+            geometry: IcosahedronGeometry{radius: p.size * 2.0}
+            layout: BallLayout{count: p.count radius: p.radius seed: p.seed}
+            order: @random
+            stagger: 1.2 / p.count
+            each: {scale: tween(0, 1, p.start, p.start + 0.6, @ease_out_back) rotation: spin(vec3(40, 70, 0))}
+            rotation_jitter: 180
+            scale_jitter: 0.5
+            color_jitter: 0.25
+            material: MeshStandardMaterial{color: p.color metalness: 0.4 roughness: 0.3}
+        }
+    ]}
+}
+
+mod.scene.kit_field_wave_grid = fn(p) {
+    return Instances{
+        geometry: BoxGeometry{width: p.spacing * 0.8 height: 0.2 depth: p.spacing * 0.8 radius: 0.02 radius_segments: 2}
+        layout: GridLayout{count: vec3(p.grid, 1, p.grid) spacing: vec3(p.spacing, 1, p.spacing)}
+        order: @distance
+        stagger: 0.08
+        each: {
+            position: pingpong(tween(vec3(0, 0, 0), vec3(0, p.height, 0), 0, 1, @ease_in_out_sine), 1)
+            scale: follow_music(p.react, vec3(1, 1, 1), vec3(1, 3, 1))
+        }
+        color_jitter: 0.12
+        material: MeshStandardMaterial{color: p.color metalness: 0.3 roughness: 0.35}
+    }
+}
+
+mod.scene.kit_field_pillars = fn(p) {
+    return Instances{
+        geometry: CylinderGeometry{radius: p.spacing * 0.35 height: 1 radial_segments: 12}
+        layout: GridLayout{count: vec3(p.grid, 1, p.grid) spacing: vec3(p.spacing, 1, p.spacing)}
+        order: @distance
+        stagger: 0.05
+        each: {
+            scale: follow_music(p.react, vec3(1, 0.15, 1), vec3(1, p.height * 3.0, 1))
+            emissive: follow_music(p.react, 0.0, 2.0)
+        }
+        color_jitter: 0.1
+        material: MeshStandardMaterial{color: p.color metalness: 0.5 roughness: 0.3}
+    }
+}
+
+mod.scene.kit_field_confetti = fn(p) {
+    return Particles{
+        count: p.count
+        rate: 0
+        start: p.start
+        lifetime: 4.0
+        lifetime_jitter: 1.0
+        emitter: BoxEmitter{size: vec3(p.radius * 1.6, 0.2, p.radius * 0.6)}
+        position: vec3(0, p.height * 2.5, 0)
+        direction: vec3(0, 1, 0)
+        spread: 50
+        speed: 2.5
+        speed_jitter: 1.5
+        gravity: vec3(0, -3, 0)
+        drag: 1.2
+        turbulence: 1.5
+        spin: 6
+        seed: p.seed
+        looping: false
+        size_start: 1
+        size_end: 1
+        color_start: p.color
+        color_end: p.color2
+        geometry: PlaneGeometry{width: p.size * 2.0 height: p.size * 3.0}
+        material: MeshStandardMaterial{color: #ffffff roughness: 0.4 side: @double}
+    }
+}
+
+mod.scene.kit_field_dots = fn(p) {
+    return Points{
+        layout: GridLayout{count: vec3(p.grid, 1, p.grid) spacing: vec3(p.spacing, 1, p.spacing)}
+        stagger: 0.002
+        size: p.size
+        shape: @circle
+        color: p.color
+        each: {opacity: pingpong(tween(0.2, 1, 0, 1, @ease_in_out_sine), 1) scale: follow_music(p.react, 1, 2)}
+    }
+}
+
+// ----------------------------------------------------------------- shapes
+mod.scene.ShapeSet = mod.scene.ShapeSet{
+    preset: @floating
+    color: #ff5a36
+    color2: #3f7cff
+    color3: #f2f0ea
+    spread: 1.0
+    speed: 1.0
+    start: 0.0
+    stagger: 0.12
+}
+
+mod.scene.kit_shapes_floating = fn(p) {
+    let a = MeshPhysicalMaterial{color: p.color roughness: 0.25 clearcoat: 1}
+    let b = MeshPhysicalMaterial{color: p.color2 roughness: 0.3 clearcoat: 0.6}
+    let c = MeshPhysicalMaterial{preset: @ceramic color: p.color3}
+    let pop = tween(0, 1, p.start, p.start + 0.7, @ease_out_back)
+    return Group3D{scale: p.spread children: [
+        Mesh{geometry: TorusGeometry{radius: 0.55 tube: 0.2} position: wiggle(vec3(-1.8, 0.6, 0), 0.12, 0.4 * p.speed, 1) rotation: spin(vec3(30, 50, 0)) scale: delay(pop, 0) material: a}
+        Mesh{geometry: SphereGeometry{radius: 0.5} position: wiggle(vec3(0.2, 1.1, -0.8), 0.12, 0.4 * p.speed, 2) scale: delay(pop, p.stagger) material: b}
+        Mesh{geometry: BoxGeometry{width: 0.8 height: 0.8 depth: 0.8 radius: 0.12 radius_segments: 4} position: wiggle(vec3(1.7, 0.2, 0.2), 0.12, 0.4 * p.speed, 3) rotation: spin(vec3(20, 35, 10)) scale: delay(pop, p.stagger * 2) material: c}
+        Mesh{geometry: ConeGeometry{radius: 0.45 height: 0.9 radial_segments: 48} position: wiggle(vec3(-0.6, -0.6, 0.6), 0.12, 0.4 * p.speed, 4) rotation: spin(vec3(0, 40, 25)) scale: delay(pop, p.stagger * 3) material: a}
+        Mesh{geometry: TorusKnotGeometry{radius: 0.35 tube: 0.12} position: wiggle(vec3(0.9, -0.7, 0.5), 0.12, 0.4 * p.speed, 5) rotation: spin(vec3(15, 60, 0)) scale: delay(pop, p.stagger * 4) material: b}
+        Mesh{geometry: CapsuleGeometry{radius: 0.2 length: 0.6} position: wiggle(vec3(-1.3, -0.3, -0.9), 0.12, 0.4 * p.speed, 6) rotation: spin(vec3(50, 0, 30)) scale: delay(pop, p.stagger * 5) material: c}
+    ]}
+}
+
+mod.scene.kit_shapes_stack = fn(p) {
+    let drop = tween(vec3(0, 3, 0), vec3(0, 0, 0), p.start, p.start + 0.6, @ease_out_bounce)
+    return Group3D{scale: p.spread children: [
+        Mesh{geometry: BoxGeometry{width: 1.6 height: 0.3 depth: 1.6 radius: 0.06 radius_segments: 3} position: add(vec3(0, 0.15, 0), delay(drop, 0)) material: MeshPhysicalMaterial{color: p.color3 roughness: 0.4}}
+        Mesh{geometry: BoxGeometry{width: 1.2 height: 0.3 depth: 1.2 radius: 0.06 radius_segments: 3} position: add(vec3(0, 0.45, 0), delay(drop, p.stagger)) material: MeshPhysicalMaterial{color: p.color2 roughness: 0.3}}
+        Mesh{geometry: BoxGeometry{width: 0.8 height: 0.3 depth: 0.8 radius: 0.06 radius_segments: 3} position: add(vec3(0, 0.75, 0), delay(drop, p.stagger * 2)) material: MeshPhysicalMaterial{color: p.color roughness: 0.3}}
+        Mesh{geometry: SphereGeometry{radius: 0.25} position: add(vec3(0, 1.15, 0), delay(drop, p.stagger * 3)) material: MeshPhysicalMaterial{color: p.color3 roughness: 0.15 clearcoat: 1}}
+    ]}
+}
+
+mod.scene.kit_shapes_rings = fn(p) {
+    let m = MeshPhysicalMaterial{preset: @chrome}
+    return Group3D{scale: p.spread children: [
+        Mesh{geometry: TorusGeometry{radius: 1.6 tube: 0.05 tubular_segments: 160} rotation: spin(vec3(40 * p.speed, 10, 0)) material: m}
+        Mesh{geometry: TorusGeometry{radius: 1.3 tube: 0.05 tubular_segments: 160} rotation: spin(vec3(0, 50 * p.speed, 30)) material: MeshPhysicalMaterial{color: p.color metalness: 1 roughness: 0.2}}
+        Mesh{geometry: TorusGeometry{radius: 1.0 tube: 0.05 tubular_segments: 160} rotation: spin(vec3(20, 0, 60 * p.speed)) material: MeshPhysicalMaterial{color: p.color2 metalness: 1 roughness: 0.2}}
+        Mesh{geometry: SphereGeometry{radius: 0.45} rotation: spin(vec3(0, 30, 0)) material: MeshPhysicalMaterial{preset: @glass}}
+    ]}
+}
+
+mod.scene.kit_shapes_blobs = fn(p) {
+    return Group3D{scale: p.spread children: [
+        Mesh{geometry: IcosahedronGeometry{radius: 0.8 detail: 5} position: vec3(-1.1, 0.2, 0) displace: 0.18 displace_speed: 0.5 * p.speed material: MeshPhysicalMaterial{preset: @chrome}}
+        Mesh{geometry: IcosahedronGeometry{radius: 0.6 detail: 5} position: vec3(0.9, 0.5, -0.4) displace: 0.14 displace_speed: 0.6 * p.speed material: MeshPhysicalMaterial{color: p.color roughness: 0.2 clearcoat: 1}}
+        Mesh{geometry: IcosahedronGeometry{radius: 0.45 detail: 5} position: vec3(0.4, -0.6, 0.6) displace: 0.12 displace_speed: 0.7 * p.speed material: MeshPhysicalMaterial{preset: @glass}}
+    ]}
+}
+
+// ------------------------------------------------------------ effects (Fx)
+mod.scene.Fx = mod.scene.Fx{
+    preset: @burst
+    count: 400
+    size: 0.06
+    color: #ffd27a
+    color2: #ff4a2a
+    start: 0.0
+    duration: 1.5
+    radius: 2.0
+    speed: 1.0
+    seed: 1
+    text: "MOTION"
+    font: @bold
+    curve: LissajousCurve{a: 2.2 b: 1.2 c: 1.0 freq: vec3(1, 2, 1) phase: 90}
+    amount: 1.0
+    from: @demo
+    to: @off
+    width: 3.2
+    height: 1.8
+    geometry: IcosahedronGeometry{radius: 1 detail: 2}
+    material: MeshPhysicalMaterial{color: #e8e8ec roughness: 0.3 clearcoat: 1}
+    svg: "M 0 0 L 60 0 L 60 60 L 30 90 L 0 60 Z"
+    depth: 0.3
+    grid: 24
+    spacing: 0.22
+    resolution: 14
+    height: 0.8
+}
+
+// Particles.
+mod.scene.kit_fx_burst = fn(p) {
+    return Particles{count: p.count rate: 0 start: p.start lifetime: p.duration lifetime_jitter: p.duration * 0.4
+        emitter: SphereEmitter{radius: 0.05} direction: vec3(0, 0, 0) spread: 180 speed: 4.0 * p.speed speed_jitter: 2.5
+        drag: 2.5 gravity: vec3(0, -1.5, 0) size_start: p.size * 2.0 size_end: 0.0 color_start: p.color color_end: p.color2
+        fade_out: 0.4 shape: @star seed: p.seed looping: false}
+}
+mod.scene.kit_fx_sparks = fn(p) {
+    return Particles{count: p.count rate: p.count / 0.9 start: p.start lifetime: 0.9 lifetime_jitter: 0.4
+        direction: vec3(0, 1, 0) spread: 28 speed: 5.0 * p.speed speed_jitter: 2.0 gravity: vec3(0, -9, 0) drag: 0.4
+        size_start: p.size size_end: 0.0 color_start: p.color color_end: p.color2 shape: @soft seed: p.seed}
+}
+mod.scene.kit_fx_confetti = fn(p) {
+    return Particles{count: p.count rate: 0 start: p.start lifetime: 4.0 lifetime_jitter: 1.0
+        emitter: BoxEmitter{size: vec3(p.radius * 1.6, 0.2, p.radius * 0.6)} position: vec3(0, p.radius, 0)
+        direction: vec3(0, 1, 0) spread: 50 speed: 2.5 speed_jitter: 1.5 gravity: vec3(0, -3, 0) drag: 1.2 turbulence: 1.5 spin: 6
+        seed: p.seed looping: false size_start: 1 size_end: 1 color_start: p.color color_end: p.color2
+        geometry: PlaneGeometry{width: p.size * 2.0 height: p.size * 3.0} material: MeshStandardMaterial{color: #ffffff roughness: 0.4 side: @double}}
+}
+mod.scene.kit_fx_trail = fn(p) {
+    return Particles{count: p.count rate: p.count / 1.4 start: p.start lifetime: 1.4 lifetime_jitter: 0.3
+        direction: vec3(0, 1, 0) spread: 180 speed: 0.25 * p.speed drag: 1.0 turbulence: 0.4
+        size_start: p.size * 1.5 size_end: 0.0 color_start: p.color color_end: p.color2 shape: @soft seed: p.seed
+        path: p.curve path_duration: p.duration * 2.0}
+}
+mod.scene.kit_fx_swarm_path = fn(p) {
+    return Instances{geometry: IcosahedronGeometry{radius: p.size} layout: CurveLayout{curve: p.curve count: p.count}
+        order: @forward stagger: p.duration / p.count
+        each: {scale: tween(0, 1, p.start, p.start + 0.4, @ease_out_back) position: wiggle(vec3(0, 0, 0), 0.08, 1.2, p.seed) rotation: spin(vec3(60, 90, 0))}
+        color_jitter: 0.2 material: MeshStandardMaterial{color: p.color metalness: 0.4 roughness: 0.3}}
+}
+mod.scene.kit_fx_text_swarm = fn(p) {
+    return Instances{geometry: BoxGeometry{width: p.size height: p.size depth: p.size}
+        layout: TextLayout{text: p.text font: p.font count: p.count size: p.radius * 0.5}
+        order: @random stagger: 0.4 / p.count
+        scatter: tween(p.amount, 0, p.start, p.start + p.duration, @ease_in_out_cubic) scatter_radius: p.radius * 2.0
+        color_jitter: 0.2 material: MeshStandardMaterial{color: p.color metalness: 0.5 roughness: 0.3}}
+}
+mod.scene.kit_fx_text_sparks = fn(p) {
+    return Particles{count: p.count rate: p.count / 1.2 start: p.start lifetime: 1.2 lifetime_jitter: 0.4
+        emitter: TextEmitter{text: p.text font: p.font size: p.radius * 0.5 count: 6000}
+        direction: vec3(0, 1, 0) spread: 40 speed: 0.8 * p.speed turbulence: 0.8 drag: 0.6
+        size_start: p.size size_end: 0.0 color_start: p.color color_end: p.color2 shape: @soft seed: p.seed}
+}
+mod.scene.kit_fx_snow = fn(p) {
+    return Particles{count: p.count rate: p.count / 6.0 start: p.start - 6.0 lifetime: 6.0
+        emitter: BoxEmitter{size: vec3(p.radius * 3.0, 0.1, p.radius * 2.0)} position: vec3(0, p.radius * 1.5, 0)
+        direction: vec3(0, -1, 0) spread: 10 speed: 0.5 * p.speed turbulence: 0.3 size_start: p.size size_end: p.size
+        color_start: #ffffff color_end: #dfe8ff shape: @soft seed: p.seed}
+}
+mod.scene.kit_fx_embers = fn(p) {
+    return Particles{count: p.count rate: p.count / 3.0 start: p.start - 3.0 lifetime: 3.0 lifetime_jitter: 1.0
+        emitter: DiscEmitter{radius: p.radius} direction: vec3(0, 1, 0) spread: 20 speed: 0.8 * p.speed
+        turbulence: 0.8 drag: 0.2 size_start: p.size size_end: 0.0 color_start: p.color color_end: p.color2 shape: @soft seed: p.seed}
+}
+
+// Instanced fields.
+mod.scene.kit_fx_cube_grid = fn(p) {
+    return Instances{geometry: BoxGeometry{width: p.spacing * 0.85 height: p.spacing * 0.85 depth: p.spacing * 0.85 radius: 0.01 radius_segments: 2}
+        layout: GridLayout{count: vec3(p.grid, p.grid, 1) spacing: vec3(p.spacing, p.spacing, 1)}
+        order: @distance stagger: 0.04
+        each: {scale: pingpong(tween(vec3(0.2, 0.2, 0.2), vec3(1, 1, 1), 0, 0.8, @ease_in_out_sine), 0.8) rotation: pingpong(tween(vec3(0, 0, 0), vec3(0, 90, 0), 0, 0.8), 0.8)}
+        color_jitter: 0.15 material: MeshStandardMaterial{color: p.color metalness: 0.3 roughness: 0.35}}
+}
+mod.scene.kit_fx_cube_sphere = fn(p) {
+    return Group3D{rotation: spin(vec3(0, 20 * p.speed, 0)) children: [
+        Instances{geometry: BoxGeometry{width: p.size * 2.0 height: p.size * 2.0 depth: p.size * 4.0}
+            layout: SphereLayout{count: p.count radius: p.radius} align: true order: @random stagger: 1.0 / p.count
+            each: {scale: add(vec3(1, 1, 0.3), mul(pingpong(tween(0, 1, 0, 0.6, @ease_in_out_sine), 0.6), vec3(0, 0, 2)))}
+            color_jitter: 0.2 material: MeshStandardMaterial{color: p.color metalness: 0.6 roughness: 0.25}}
+    ]}
+}
+mod.scene.kit_fx_wave = fn(p) {
+    return Instances{geometry: BoxGeometry{width: p.spacing * 0.8 height: 0.2 depth: p.spacing * 0.8 radius: 0.02 radius_segments: 2}
+        layout: GridLayout{count: vec3(p.grid, 1, p.grid) spacing: vec3(p.spacing, 1, p.spacing)}
+        order: @distance stagger: 0.08
+        each: {position: pingpong(tween(vec3(0, 0, 0), vec3(0, p.amount, 0), 0, 1, @ease_in_out_sine), 1)}
+        color_jitter: 0.12 material: MeshStandardMaterial{color: p.color metalness: 0.3 roughness: 0.35}}
+}
+mod.scene.kit_fx_helix = fn(p) {
+    return Group3D{rotation: spin(vec3(0, 40 * p.speed, 0)) children: [
+        Instances{geometry: SphereGeometry{radius: p.size width_segments: 12 height_segments: 8}
+            layout: HelixLayout{count: p.count radius: p.radius * 0.5 turns: 4 height: p.radius * 2.0}
+            order: @forward stagger: p.duration / p.count
+            each: {scale: tween(0, 1, p.start, p.start + 0.4, @ease_out_back)}
+            material: MeshStandardMaterial{color: p.color emissive: p.color2 emissive_intensity: 0.4}}
+    ]}
+}
+mod.scene.kit_fx_voxel_morph = fn(p) {
+    return Instances{geometry: BoxGeometry{width: p.radius / p.resolution * 1.8 height: p.radius / p.resolution * 1.8 depth: p.radius / p.resolution * 1.8}
+        layout: VoxelLayout{geometry: SphereGeometry{radius: p.radius * 0.6} resolution: p.resolution}
+        morph_to: VoxelLayout{geometry: TorusKnotGeometry{radius: p.radius * 0.55 tube: p.radius * 0.2} resolution: p.resolution + 6}
+        morph: tween(0, 1, p.start, p.start + p.duration, @ease_in_out_cubic) order: @random stagger: 0.6 / p.count
+        color_jitter: 0.15 material: MeshStandardMaterial{color: p.color metalness: 0.4 roughness: 0.3}}
+}
+mod.scene.kit_fx_voxel_text = fn(p) {
+    return Instances{geometry: BoxGeometry{width: 0.07 height: 0.07 depth: 0.07}
+        layout: VoxelLayout{geometry: SphereGeometry{radius: p.radius * 0.6} resolution: p.resolution}
+        morph_to: VoxelLayout{text: p.text font: p.font size: p.radius * 0.5 depth: 0.25 resolution: p.resolution * 5}
+        morph: tween(0, 1, p.start, p.start + p.duration, @ease_in_out_cubic) order: @random stagger: 0.6 / p.count
+        color_jitter: 0.15 material: MeshStandardMaterial{color: p.color metalness: 0.4 roughness: 0.3}}
+}
+
+// Deformers (the same fields work on any Mesh or Model).
+mod.scene.kit_fx_shatter = fn(p) {
+    return Mesh{geometry: p.geometry material: p.material rotation: spin(vec3(0, 30 * p.speed, 0))
+        explode: keys([p.start, 0], [p.start + p.duration * 0.4, p.amount * p.radius, @ease_out_expo], [p.start + p.duration, 0, @ease_in_out_cubic])}
+}
+mod.scene.kit_fx_ripple_pool = fn(p) {
+    return Mesh{geometry: PlaneGeometry{width: p.radius * 2.0 height: p.radius * 2.0 width_segments: 160 height_segments: 160} rotation: vec3(-90, 0, 0)
+        ripple: 0.025 * p.amount ripple_frequency: 0.9 ripple_speed: p.speed material: MeshPhysicalMaterial{color: p.color roughness: 0.1 clearcoat: 1 metalness: 0.2}}
+}
+mod.scene.kit_fx_twister = fn(p) {
+    return Mesh{geometry: BoxGeometry{width: 0.6 height: p.radius * 1.6 depth: 0.6 height_segments: 64 radius: 0.05 radius_segments: 3}
+        twist: pingpong(tween(-60 * p.amount, 60 * p.amount, 0, p.duration, @ease_in_out_sine), p.duration) material: p.material}
+}
+mod.scene.kit_fx_bender = fn(p) {
+    return Mesh{geometry: CylinderGeometry{radius: 0.25 height: p.radius * 1.6 height_segments: 64 radial_segments: 32}
+        bend: pingpong(tween(-90 * p.amount, 90 * p.amount, 0, p.duration, @ease_in_out_sine), p.duration) material: p.material}
+}
+
+// Procedural geometry.
+mod.scene.kit_fx_ribbons = fn(p) {
+    return Mesh{geometry: EngineGeometry{engine: @ribbons count: p.count / 20 speed: p.speed seed: p.seed size: p.radius * 0.35 width: 0.12}
+        material: MeshPhysicalMaterial{color: p.color emissive: p.color2 emissive_intensity: 0.4 side: @double roughness: 0.3}}
+}
+mod.scene.kit_fx_tree = fn(p) {
+    return Mesh{geometry: EngineGeometry{engine: @tree seed: p.seed size: p.radius * 0.35 iterations: 5}
+        scale: tween(0, 1, p.start, p.start + p.duration, @ease_out_back) material: MeshStandardMaterial{color: p.color roughness: 0.6}}
+}
+mod.scene.kit_fx_metaballs = fn(p) {
+    return Mesh{geometry: EngineGeometry{engine: @metaballs count: 6 speed: p.speed seed: p.seed size: p.radius * 0.4}
+        material: MeshPhysicalMaterial{preset: @chrome color: p.color}}
+}
+mod.scene.kit_fx_tube_draw = fn(p) {
+    return Mesh{geometry: TubeGeometry{path: p.curve radius: p.size tubular_segments: 400 radial_segments: 12 draw_end: tween(0, 1, p.start, p.start + p.duration, @ease_in_out_cubic)}
+        material: MeshPhysicalMaterial{color: p.color emissive: p.color2 emissive_intensity: 0.6 roughness: 0.25}}
+}
+mod.scene.kit_fx_ribbon_path = fn(p) {
+    return Mesh{geometry: RibbonGeometry{path: p.curve width: p.size * 6.0 twist: 720 segments: 400}
+        material: MeshPhysicalMaterial{color: p.color side: @double roughness: 0.25 clearcoat: 1}}
+}
+mod.scene.kit_fx_vase = fn(p) {
+    return Mesh{geometry: LatheGeometry{points: [vec2(0.0, 0), vec2(0.5, 0), vec2(0.62, 0.3), vec2(0.45, 0.9), vec2(0.25, 1.3), vec2(0.32, 1.6), vec2(0.28, 1.62)] segments: 96}
+        scale: p.radius * 0.5 rotation: spin(vec3(0, 30 * p.speed, 0)) material: MeshPhysicalMaterial{preset: @ceramic color: p.color}}
+}
+mod.scene.kit_fx_svg_logo = fn(p) {
+    return Mesh{geometry: SvgGeometry{path: p.svg size: p.radius depth: p.depth bevel_size: 0.02 bevel_thickness: 0.02}
+        rotation: tween(vec3(0, -90, 0), vec3(0, 0, 0), p.start, p.start + p.duration, @ease_out_back) material: p.material}
+}
+
+// Transitions between two pictures (2D layers as textures, images, @demo).
+mod.scene.kit_fx_cube_flip = fn(p) {
+    return Group3D{position: vec3(0, 0, 0 - p.width * 0.5) rotation: tween(vec3(0, 0, 0), vec3(0, -90, 0), p.start, p.start + p.duration, @ease_in_out_cubic) children: [
+        Mesh{geometry: PlaneGeometry{width: p.width height: p.height} position: vec3(0, 0, p.width * 0.5) material: screen_material(p.from)}
+        Mesh{geometry: PlaneGeometry{width: p.width height: p.height} position: vec3(p.width * 0.5, 0, 0) rotation: vec3(0, 90, 0) material: screen_material(p.to)}
+    ]}
+}
+mod.scene.kit_fx_page_curl = fn(p) {
+    return Group3D{children: [
+        Mesh{geometry: PlaneGeometry{width: p.width height: p.height} position: vec3(0, 0, -0.02) material: screen_material(p.to)}
+        Mesh{geometry: PlaneGeometry{width: p.width height: p.height width_segments: 96 height_segments: 4}
+            curl: tween(0, 1, p.start, p.start + p.duration, @ease_in_out_cubic) curl_radius: p.width * 0.08
+            material: screen_material(p.from, MeshBasicMaterial{side: @double})}
+    ]}
+}
+mod.scene.PortalMaterial = MeshBasicMaterial{
+    alpha_test: 0.5
+    side: @double
+    hooks: {
+    surface: fn(p: vec3, n: vec3, uv: vec2, t: float) -> vec4 {
+        let c = self.material_color(uv)
+        let d = length((uv - vec2(0.5, 0.5)) * vec2(1.78, 1.0))
+        return vec4(c.xyz, step(self.u_custom.x * 1.2, d))
+    }
+    emissive_fn: fn(p: vec3, n: vec3, uv: vec2, t: float) -> vec3 {
+        let d = length((uv - vec2(0.5, 0.5)) * vec2(1.78, 1.0))
+        let ring = clamp(1.0 - abs(d - self.u_custom.x * 1.2) * 40.0, 0.0, 1.0) * step(0.001, self.u_custom.x) * step(self.u_custom.x, 0.999)
+        return vec3(0.4, 0.9, 1.6) * ring * 3.0
+    }
+    }
+}
+mod.scene.kit_fx_portal = fn(p) {
+    return Group3D{children: [
+        Mesh{geometry: PlaneGeometry{width: p.width height: p.height} position: vec3(0, 0, -0.3) scale: tween(0.85, 1, p.start, p.start + p.duration, @ease_out_cubic) material: screen_material(p.to)}
+        Mesh{geometry: PlaneGeometry{width: p.width height: p.height} material: screen_material(p.from, mod.scene.PortalMaterial{uniforms: {progress: tween(0, 1, p.start, p.start + p.duration, @ease_in_cubic)}})}
+    ]}
+}
+mod.scene.kit_fx_depth_push = fn(p) {
+    return Group3D{children: [
+        Mesh{geometry: PlaneGeometry{width: p.width height: p.height} position: tween(vec3(0, 0, 0), vec3(0, 0, -4), p.start, p.start + p.duration, @ease_in_cubic)
+            opacity: tween(1, 0, p.start + p.duration * 0.3, p.start + p.duration) material: screen_material(p.from, MeshBasicMaterial{transparent: true})}
+        Mesh{geometry: PlaneGeometry{width: p.width height: p.height} position: tween(vec3(0, 0, 2.5), vec3(0, 0, 0), p.start + p.duration * 0.3, p.start + p.duration, @ease_out_cubic)
+            opacity: tween(0, 1, p.start + p.duration * 0.3, p.start + p.duration * 0.7) material: screen_material(p.to, MeshBasicMaterial{transparent: true})}
+    ]}
+}
+
+// ------------------------------------------------------------------ crowds
+// `Crowd{…}`: instanced people with per-person seeded variation (body
+// variant, height, colour jitter, bob phase), eyes coloured by side, arms
+// raised by `arms` and by the music (`cheer`), and a share holding signs.
+// Parameters follow M1's 2D Crowd layer: count, variants, seed, react.
+mod.scene.Crowd = mod.scene.Crowd{
+    count: 240
+    shape: @arena
+    variants: 3
+    seed: 1
+    radius: 3.5
+    spacing: 0.55
+    tier: 0.22
+    arc: 150
+    color: #4a5590
+    color2: #6a78b8
+    eyes: #7fd6ff
+    eyes2: #ff5a36
+    react: @beat
+    hop: 0.12
+    bob: 0.04
+    arms: 0.15
+    cheer: @energy
+    signs: 0.12
+    sign_color: #f2f0ea
+    stagger: 0.8
+    // When the crowd pops up out of the floor (negative: already standing).
+    start: -1
+}
+
+mod.scene.crowd_move = fn(p) {
+    let bob = pingpong(tween(vec3(0, 0, 0), vec3(0, p.bob, 0), 0, 0.45, @ease_in_out_sine), 0.45)
+    let m = if p.react == @none { bob } else { add(bob, mul(vec3(0, 1, 0), follow_music(p.react, 0, p.hop))) }
+    return add(m, tween(vec3(0, -3, 0), vec3(0, 0, 0), p.start, p.start + 0.8, @ease_out_back))
+}
+
+mod.scene.crowd_lay = fn(p, v, off) {
+    return CrowdLayout{count: p.count shape: p.shape radius: p.radius spacing: p.spacing tier: p.tier arc: p.arc seed: p.seed variant: v variants: p.variants offset: off}
+}
+
+mod.scene.kit_crowd = fn(p) {
+    let kids = []
+    let sx = [1.0, 1.25, 0.9, 1.1]
+    let sy = [1.0, 0.85, 1.15, 0.95]
+    let mv = mod.scene.crowd_move(p)
+    let body = MeshStandardMaterial{color: p.color roughness: 0.8}
+    let head = MeshStandardMaterial{color: p.color2 roughness: 0.7}
+    let armv = if p.cheer == @none { mul(p.arms, 150) } else { add(mul(p.arms, 150), follow_music(p.cheer, 0, 110)) }
+    for v in 0..p.variants {
+        let k = v - floor(v / 4) * 4
+        let h = 0.72 * sy[k]
+        kids.push(Instances{geometry: CapsuleGeometry{radius: 0.13 * sx[k] length: 0.46 * sy[k]} layout: mod.scene.crowd_lay(p, v, vec3(0, h * 0.5, 0)) align: true
+            order: @phase stagger: p.stagger each: {position: mv} color_jitter: 0.12 material: body})
+        kids.push(Instances{geometry: SphereGeometry{radius: 0.12 width_segments: 16 height_segments: 12} layout: mod.scene.crowd_lay(p, v, vec3(0, h + 0.1, 0)) align: true
+            order: @phase stagger: p.stagger each: {position: mv} color_jitter: 0.1 material: head})
+        for side in [@left, @right] {
+            let col = if side == @left { p.eyes } else { p.eyes2 }
+            kids.push(Instances{geometry: BoxGeometry{width: 0.13 height: 0.032 depth: 0.02} align: true
+                layout: CrowdLayout{count: p.count shape: p.shape radius: p.radius spacing: p.spacing tier: p.tier arc: p.arc seed: p.seed variant: v variants: p.variants side: side offset: vec3(0, h + 0.12, 0.11)}
+                order: @phase stagger: p.stagger each: {position: mv} cast_shadow: false
+                material: MeshBasicMaterial{color: col emissive: col emissive_intensity: 2.5}})
+        }
+        for s in [-1, 1] {
+            kids.push(Instances{geometry: LatheGeometry{points: [vec2(0, -0.4), vec2(0.045, -0.38), vec2(0.05, -0.05), vec2(0.0, 0.0)] segments: 10}
+                layout: mod.scene.crowd_lay(p, v, vec3(0.17 * sx[k] * s, h * 0.82, 0)) align: true rotation_jitter: 12
+                order: @phase stagger: p.stagger each: {position: mv rotation: mul(armv, vec3(0, 0, s))} material: body})
+        }
+    }
+    if p.signs > 0 {
+        kids.push(Instances{geometry: BoxGeometry{width: 0.46 height: 0.3 depth: 0.02} align: true
+            layout: CrowdLayout{count: p.count shape: p.shape radius: p.radius spacing: p.spacing tier: p.tier arc: p.arc seed: p.seed pick: p.signs offset: vec3(0, 1.3, 0.04)}
+            order: @phase stagger: p.stagger each: {position: mv rotation: pingpong(tween(vec3(0, 0, -8), vec3(0, 0, 8), 0, 0.9, @ease_in_out_sine), 0.9)}
+            color_jitter: 0.2 material: MeshStandardMaterial{color: p.sign_color roughness: 0.6}})
+    }
+    return Group3D{children: kids}
+}
+
+// -------------------------------------------------------------- spotlights
+// `Spotlights{…}`: volumetric-looking additive cones (soft edges, fading
+// to the floor, a pool of light below) that slam on with the music's hits
+// (`react: @beat` — 1 on each beat, decaying) or hold with `react: @none`.
+mod.scene.Spotlights = mod.scene.Spotlights{
+    count: 4
+    spread: 5
+    height: 5
+    angle: 16
+    color: #fff2d6
+    color2: #7fb8ff
+    intensity: 1.0
+    react: @beat
+    sweep: 18
+    start: 0
+}
+
+mod.scene.SpotConeMaterial = MeshBasicMaterial{
+    transparent: true
+    blending: @additive
+    depth_write: false
+    side: @double
+    hooks: {
+    surface: fn(p: vec3, n: vec3, uv: vec2, t: float) -> vec4 {
+        let c = self.material_color(uv)
+        // Soft at the silhouette (facing the eye = dense), fading to the far end.
+        let v = normalize(self.u_cam.xyz - p)
+        let facing = pow(abs(dot(normalize(n), v)), 1.6)
+        let along = clamp(uv.y, 0.0, 1.0)
+        return vec4(c.xyz, c.w * facing * (0.25 + 0.75 * along) * 0.55)
+    }
+    }
+}
+
+mod.scene.PoolMaterial = MeshBasicMaterial{
+    transparent: true
+    blending: @additive
+    depth_write: false
+    hooks: {
+    surface: fn(p: vec3, n: vec3, uv: vec2, t: float) -> vec4 {
+        let c = self.material_color(uv)
+        let d = length(uv - vec2(0.5, 0.5)) * 2.0
+        return vec4(c.xyz, c.w * clamp(1.0 - d, 0.0, 1.0) * clamp(1.0 - d, 0.0, 1.0) * 0.6)
+    }
+    }
+}
+
+mod.scene.kit_spotlights = fn(p) {
+    let kids = []
+    let hit = if p.react == @none { p.intensity } else { add(mul(p.intensity, 0.15), follow_music(p.react, 0, p.intensity)) }
+    let on = mul(hit, tween(0, 1, p.start, p.start + 0.05))
+    for i in 0..p.count {
+        let x = if p.count > 1 { (i / (p.count - 1) - 0.5) * p.spread } else { 0 }
+        let col = if i - floor(i / 2) * 2 == 0 { p.color } else { p.color2 }
+        let r = p.height * 0.0174533 * p.angle
+        let sway = pingpong(tween(vec3(0, 0, 0 - p.sweep), vec3(0, 0, p.sweep), 0, 2.2 + i * 0.37, @ease_in_out_sine), 2.2 + i * 0.37)
+        kids.push(Group3D{position: vec3(x, p.height, 0) rotation: sway children: [
+            Mesh{geometry: CylinderGeometry{radius_top: 0.05 radius_bottom: r height: p.height radial_segments: 48 open_ended: true} position: vec3(0, 0 - p.height * 0.5, 0)
+                cast_shadow: false receive_shadow: false material: mod.scene.SpotConeMaterial{color: col opacity: on}}
+            Mesh{geometry: CylinderGeometry{radius: 0.12 height: 0.2 radial_segments: 24} material: MeshStandardMaterial{color: #1a1b1f metalness: 0.6 roughness: 0.4}}
+            Mesh{geometry: PlaneGeometry{width: r * 2.6 height: r * 2.6} position: vec3(0, 0.02 - p.height, 0) rotation: vec3(-90, 0, 0)
+                cast_shadow: false receive_shadow: false material: mod.scene.PoolMaterial{color: col opacity: on}}
+        ]})
+    }
+    return Group3D{children: kids}
+}
+
+// A glowing wireframe (mazes, grids, holograms): additive lines, bloom-ready.
+mod.scene.GlowWireMaterial = MeshBasicMaterial{wireframe: true blending: @additive transparent: true depth_write: false color: #3fd6ff emissive: #3fd6ff emissive_intensity: 2.5}
+
+// The extruded pattern slab's material: the picture projected onto the top
+// faces from above (the slab spans u_custom: x0, z0, width, depth in world
+// units), stripes up the sides in `sheen_color` / `rim_color`.
+mod.scene.SlabMaterial = MeshStandardMaterial{
+    color: #ffffff
+    roughness: 0.55
+    sheen_color: #f0ebe0
+    rim_color: #2a44c8
+    hooks: {
+    surface: fn(p: vec3, n: vec3, uv: vec2, t: float) -> vec4 {
+        if n.y > 0.5 {
+            let q = (vec2(p.x, p.z) - self.u_custom.xy) / max(self.u_custom.zw, vec2(0.0001, 0.0001))
+            return self.material_color(vec2(q.x, 1.0 - q.y))
+        }
+        let s = step(0.5, fract(p.y * 9.0))
+        return vec4(mix(self.u_sheen_color.xyz, self.u_rim.xyz, s), 1.0)
+    }
+    }
+}
+
+// The extruded pattern slab: a grid of boxes, the picture (`from`: a 2D
+// layer's texture name, an image, @demo) on their tops, striped sides,
+// blocks lifting and sinking on every beat over a slow wave. Centre it at
+// the origin; orbit or dive the camera around it.
+mod.scene.kit_fx_pattern_slab = fn(p) {
+    let size = p.grid * p.spacing
+    let half = size * 0.5
+    return Instances{geometry: BoxGeometry{width: p.spacing * 0.97 height: p.height depth: p.spacing * 0.97}
+        layout: GridLayout{count: vec3(p.grid, 1, p.grid) spacing: vec3(p.spacing, 1, p.spacing)}
+        each: {position: vec3(0, p.height * 0.5, 0)}
+        heights: Heightfield{kind: @blocks_wave amount: mul(p.amount, tween(0, 1, p.start, p.start + 0.6, @ease_out_cubic)) cell: vec2(p.spacing * 4, p.spacing * 3) speed: 0.2 * p.speed seed: p.seed}
+        material: screen_material(p.from, mod.scene.SlabMaterial{sheen_color: p.color rim_color: p.color2 uniforms: {x0: 0 - half z0: 0 - half w: size d: size}}, @cover, nil, 1)}
+}
+
+// ------------------------------------------------------------ line looks
+// Line materials for a diagram / engraving world (unlit, ink on paper):
+// `ContourMaterial` draws isolines of height, `HatchMaterial` cross-hatches
+// by a light direction, `EngraveMaterial` engraves banknote lines whose
+// width follows the shade. `color` is the paper, `rim_color` the ink,
+// `uniforms` tune spacing and width.
+mod.scene.ContourMaterial = MeshBasicMaterial{
+    color: #f0ebe0
+    rim_color: #1a1a1a
+    side: @double
+    uniforms: {spacing: 0.12 width: 0.14 major: 5 unused: 0}
+    hooks: {
+    surface: fn(p: vec3, n: vec3, uv: vec2, t: float) -> vec4 {
+        let c = self.material_color(uv)
+        let h = p.y / max(self.u_custom.x, 0.0001)
+        let f = abs(fract(h + 0.5) - 0.5)
+        let w = self.u_custom.y * 0.5
+        var line = 1.0 - smoothstep(w * 0.5, w, f)
+        let m = abs(fract(h / max(self.u_custom.z, 1.0) + 0.5) - 0.5) * max(self.u_custom.z, 1.0)
+        line = max(line, 1.0 - smoothstep(w, w * 1.8, m))
+        return vec4(mix(c.xyz, self.u_rim.xyz, line), c.w)
+    }
+    }
+}
+mod.scene.HatchMaterial = MeshBasicMaterial{
+    color: #f0ebe0
+    rim_color: #1a1a1a
+    uniforms: {spacing: 0.07 lx: 0.4 ly: 0.8 lz: 0.45}
+    hooks: {
+    surface: fn(p: vec3, n: vec3, uv: vec2, t: float) -> vec4 {
+        let c = self.material_color(uv)
+        let l = normalize(vec3(self.u_custom.y, self.u_custom.z, self.u_custom.w))
+        let shade = 1.0 - clamp(dot(normalize(n), l) * 0.5 + 0.5, 0.0, 1.0)
+        let s = max(self.u_custom.x, 0.001)
+        let h1 = abs(fract((p.x + p.y) / s) - 0.5)
+        let h2 = abs(fract((p.x - p.y + p.z) / s) - 0.5)
+        let h3 = abs(fract((p.z + p.y * 0.5) / s * 1.7) - 0.5)
+        var ink = step(h1, shade * 0.45)
+        ink = max(ink, step(h2, (shade - 0.35) * 0.6))
+        ink = max(ink, step(h3, (shade - 0.65) * 0.8))
+        return vec4(mix(c.xyz, self.u_rim.xyz, ink), c.w)
+    }
+    }
+}
+mod.scene.EngraveMaterial = MeshBasicMaterial{
+    color: #efe6cf
+    rim_color: #2a3a2a
+    uniforms: {spacing: 0.035 lx: -0.5 ly: 0.8 lz: 0.4}
+    hooks: {
+    surface: fn(p: vec3, n: vec3, uv: vec2, t: float) -> vec4 {
+        let c = self.material_color(uv)
+        let l = normalize(vec3(self.u_custom.y, self.u_custom.z, self.u_custom.w))
+        let shade = 1.0 - clamp(dot(normalize(n), l) * 0.6 + 0.4, 0.0, 1.0)
+        // Lines follow the form: height plus a swell along the normal's x.
+        let s = max(self.u_custom.x, 0.001)
+        let f = abs(fract((p.y + n.x * 0.15 + sin(p.x * 3.0) * 0.03) / s) - 0.5)
+        let ink = 1.0 - smoothstep(shade * 0.5, shade * 0.5 + 0.08, f)
+        return vec4(mix(c.xyz, self.u_rim.xyz, ink), c.w)
+    }
+    }
+}
+
+// A heightfield terrain in contour lines (a displaced plane).
+mod.scene.kit_fx_contour_terrain = fn(p) {
+    return Mesh{geometry: PlaneGeometry{width: p.radius * 2 height: p.radius * 2 width_segments: 200 height_segments: 200} rotation: vec3(-90, 0, 0)
+        displace: p.amount displace_frequency: 0.35 displace_speed: 0.05 * p.speed
+        material: mod.scene.ContourMaterial{color: p.color rim_color: p.color2 uniforms: {spacing: p.spacing width: 0.14 major: 5 unused: 0}}}
+}
+
+// ------------------------------------------------------- gravity and orbits
+// A grid sheet sagging into a gravity well around a mass (`amount` = its
+// depth, keyable), drawn as grid lines; the mass sits in the well.
+mod.scene.GravityGridMaterial = MeshBasicMaterial{
+    color: #05070d
+    rim_color: #6fd0ff
+    side: @double
+    uniforms: {mass: 1 cell: 0.35 soft: 0.6 unused: 0}
+    hooks: {
+    vertex_displace: fn(p: vec3, n: vec3, uv: vec2, t: float) -> vec3 {
+        let r = length(p.xy)
+        let d = self.u_custom.x / sqrt(r * r + self.u_custom.z * self.u_custom.z)
+        return p - vec3(0.0, 0.0, d - self.u_custom.x / max(sqrt(64.0 + self.u_custom.z * self.u_custom.z), 0.001))
+    }
+    surface: fn(p: vec3, n: vec3, uv: vec2, t: float) -> vec4 {
+        let c = self.u_color
+        let q = vec2(p.x, p.z) / max(self.u_custom.y, 0.001)
+        let g = min(abs(fract(q.x + 0.5) - 0.5), abs(fract(q.y + 0.5) - 0.5))
+        let line = 1.0 - smoothstep(0.02, 0.06, g)
+        return vec4(mix(c.xyz, self.u_rim.xyz, line), 1.0)
+    }
+    emissive_fn: fn(p: vec3, n: vec3, uv: vec2, t: float) -> vec3 {
+        let q = vec2(p.x, p.z) / max(self.u_custom.y, 0.001)
+        let g = min(abs(fract(q.x + 0.5) - 0.5), abs(fract(q.y + 0.5) - 0.5))
+        return self.u_rim.xyz * (1.0 - smoothstep(0.0, 0.05, g)) * 0.8
+    }
+    }
+}
+mod.scene.kit_fx_gravity_well = fn(p) {
+    let depth = mul(p.amount, tween(0, 1, p.start, p.start + p.duration, @ease_in_out_cubic))
+    return Group3D{children: [
+        Mesh{geometry: PlaneGeometry{width: p.radius * 2 height: p.radius * 2 width_segments: 160 height_segments: 160} rotation: vec3(-90, 0, 0) cast_shadow: false
+            material: mod.scene.GravityGridMaterial{rim_color: p.color uniforms: {mass: depth cell: p.spacing soft: 0.6 unused: 0}}}
+        Mesh{geometry: SphereGeometry{radius: 0.35 * p.size / 0.06} position: add(vec3(0, 0.1, 0), mul(depth, vec3(0, -0.8, 0)))
+            material: MeshStandardMaterial{color: p.color2 emissive: p.color2 emissive_intensity: 1.5}}
+    ]}
+}
+
+// An accretion disk: a hot swirling ring (additive, bands winding inward
+// faster near the centre) with orbiting sparks, around a dark core.
+mod.scene.AccretionMaterial = MeshBasicMaterial{
+    transparent: true
+    blending: @additive
+    depth_write: false
+    side: @double
+    uniforms: {inner: 0.6 outer: 2.4 speed: 1 unused: 0}
+    hooks: {
+    surface: fn(p: vec3, n: vec3, uv: vec2, t: float) -> vec4 {
+        let c = self.material_color(uv)
+        let q = vec2(uv.x - 0.5, uv.y - 0.5) * 2.0
+        let r = length(q) * self.u_custom.y
+        let a = atan2(q.y, q.x)
+        let k = clamp((r - self.u_custom.x) / max(self.u_custom.y - self.u_custom.x, 0.001), 0.0, 1.0)
+        // Keplerian-ish: inner bands turn faster.
+        let spin = t * self.u_custom.z * 2.0 / max(pow(r, 1.5), 0.2)
+        let bands = 0.55 + 0.45 * sin(a * 3.0 + spin * 4.0 + log(max(r, 0.01)) * 9.0)
+        let glow = pow(1.0 - k, 2.2) * smoothstep(0.0, 0.08, k) * bands
+        let hot = mix(self.u_rim.xyz, c.xyz, k)
+        return vec4(hot * glow * 2.2, glow)
+    }
+    }
+}
+mod.scene.kit_fx_accretion_disk = fn(p) {
+    return Group3D{rotation: vec3(-72, 0, 12) children: [
+        Mesh{geometry: PlaneGeometry{width: p.radius * 2 height: p.radius * 2} cast_shadow: false receive_shadow: false
+            material: mod.scene.AccretionMaterial{color: p.color2 rim_color: p.color uniforms: {inner: p.radius * 0.25 outer: p.radius speed: p.speed unused: 0}}}
+        Mesh{geometry: SphereGeometry{radius: p.radius * 0.22} material: MeshBasicMaterial{color: #000000}}
+        Group3D{rotation: vec3(90, 0, 0) children: [
+            Particles{count: p.count rate: p.count / 4 start: p.start - 4 lifetime: 4 emitter: RingEmitter{radius: p.radius * 0.8} speed: 0 swirl: 2.5 * p.speed
+                drag: 0.2 size_start: p.size size_end: 0 color_start: p.color color_end: p.color2 blending: @additive shape: @soft seed: p.seed}
+        ]}
+    ]}
+}
+
+// ----------------------------------------------------- path-built instances
+// Paperclips: a wire bent along PaperclipCurve, instanced by the hundred.
+mod.scene.kit_fx_paperclips = fn(p) {
+    return Instances{geometry: TubeGeometry{path: PaperclipCurve{length: p.size * 16 width: p.size * 5} radius: p.size * 0.35 tubular_segments: 220 radial_segments: 8}
+        layout: BallLayout{count: p.count radius: p.radius seed: p.seed} rotation_jitter: 180 scale_jitter: 0.15 color_jitter: 0.1
+        order: @random stagger: p.duration / p.count
+        each: {scale: tween(0, 1, p.start, p.start + 0.4, @ease_out_back) rotation: spin(vec3(20 * p.speed, 35 * p.speed, 0))}
+        material: MeshPhysicalMaterial{preset: @chrome color: p.color}}
+}
+// A braided tube: `count` strands (3 by default) woven along y, drawn on.
+mod.scene.kit_fx_braid = fn(p) {
+    let kids = []
+    let n = if p.count > 8 { 3 } else { p.count }
+    for k in 0..n {
+        let col = if k - floor(k / 2) * 2 == 0 { p.color } else { p.color2 }
+        kids.push(Mesh{geometry: TubeGeometry{path: BraidCurve{strand: k strands: n radius: p.radius * 0.15 turns: 3 length: p.radius * 2} radius: p.size * 1.5
+                tubular_segments: 400 radial_segments: 14 draw_end: tween(0, 1, p.start, p.start + p.duration, @ease_in_out_cubic)}
+            material: MeshPhysicalMaterial{color: col roughness: 0.35 clearcoat: 0.6}})
+    }
+    return Group3D{children: kids}
+}
+
+// ------------------------------------------------------------- callouts
+// `Callout{target: vec3 text offset color}`: a leader line from a point in
+// 3D to a label that always faces the camera (a HUD box in the scene).
+// For 2D HUD layers, read the anchors of named nodes instead
+// (`Scene3dLayer::anchors`).
+mod.scene.Callout = mod.scene.Callout{
+    target: vec3(0, 0, 0)
+    offset: vec3(1.2, 0.8, 0)
+    text: "LABEL"
+    font: @bold
+    size: 0.18
+    color: #f0ebe0
+    color2: #ff5a1f
+    start: 0
+}
+mod.scene.kit_callout = fn(p) {
+    let tip = p.target + p.offset
+    return Group3D{children: [
+        Line3D{points: [p.target, tip, tip + vec3(0.5, 0, 0)] width: 2 color: p.color2 trim_end: tween(0, 1, p.start, p.start + 0.4, @ease_out_cubic)}
+        Mesh{geometry: SphereGeometry{radius: 0.04} position: p.target material: MeshBasicMaterial{color: p.color2}}
+        Group3D{position: tip + vec3(0.55, 0, 0) look_at: @camera scale: tween(0, 1, p.start + 0.3, p.start + 0.6, @ease_out_back) children: [
+            Mesh{geometry: PlaneGeometry{width: p.size * 6 height: p.size * 2} position: vec3(p.size * 2.6, 0, -0.01) material: MeshBasicMaterial{color: #0a0b10 opacity: 0.8 transparent: true}}
+            Text3D{text: p.text font: p.font size: p.size depth: 0 align: @left position: vec3(0, 0 - p.size * 0.35, 0) material: MeshBasicMaterial{color: p.color}}
+        ]}
+    ]}
+}
+
+// Wire maze and shatter-into-particles effects.
+mod.scene.kit_fx_wire_maze = fn(p) {
+    return Group3D{children: [
+        Instances{geometry: BoxGeometry{width: 0.06 height: p.height depth: p.spacing * 1.03} align: true
+            layout: MazeLayout{cols: p.grid rows: p.grid cell: p.spacing seed: p.seed}
+            order: @distance stagger: p.duration / (p.grid * p.spacing)
+            each: {position: tween(vec3(0, 0 - p.height, 0), vec3(0, p.height * 0.5, 0), p.start, p.start + 0.5, @ease_out_cubic)}
+            cast_shadow: false material: mod.scene.GlowWireMaterial{color: p.color emissive: p.color}}
+        Mesh{geometry: PlaneGeometry{width: p.grid * p.spacing height: p.grid * p.spacing width_segments: p.grid height_segments: p.grid} rotation: vec3(-90, 0, 0)
+            cast_shadow: false material: mod.scene.GlowWireMaterial{color: p.color2 emissive: p.color2 emissive_intensity: 0.8}}
+    ]}
+}
+mod.scene.kit_fx_shatter_burst = fn(p) {
+    return Group3D{children: [
+        Mesh{geometry: p.geometry material: p.material rotation: spin(vec3(0, 25 * p.speed, 0))
+            explode: tween(0, p.radius * p.amount, p.start, p.start + p.duration, @ease_out_expo)
+            opacity: tween(1, 0, p.start + p.duration * 0.15, p.start + p.duration * 0.6)}
+        Particles{count: p.count rate: 0 start: p.start lifetime: p.duration lifetime_jitter: p.duration * 0.4 looping: false
+            emitter: SurfaceEmitter{geometry: p.geometry count: 4096} spread: 180 speed: 3.5 * p.speed speed_jitter: 2 drag: 1.5 gravity: vec3(0, -2, 0)
+            size_start: p.size size_end: 0 color_start: p.color color_end: p.color2 blending: @additive shape: @soft seed: p.seed}
+    ]}
+}
+
+// A module's last expression is its value, not a statement: end on a
+// plain value so the last definition above is kept.
+mod.scene.kits_loaded = true
+true

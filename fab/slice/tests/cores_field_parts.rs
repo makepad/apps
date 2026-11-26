@@ -1,13 +1,14 @@
 //! Field parts slice on the cores through the live engine, the way the app slices them: a vase
-//! (engine nodes), a lattice (a Splash-kernel field) and a Links part each settle, and the
-//! settled G-code's hash pins what the shipping path prints. Each part is the smallest of its
-//! kind and the layers are thick: the path, not the detail, is under test.
+//! (engine nodes), a lattice (a Splash-kernel field) and a Links part each settle to the G-code
+//! the plain slice of the same frames prints ([`slice_frames`], the engine's reference), byte for
+//! byte with its settings. Each part is the smallest of its kind and the layers are thick: the
+//! path, not the detail, is under test.
 
 use fab_model::eval::Evaluated;
 use fab_model::FabModel;
 use fab_plate::machine::Machine;
 use makepad_fab_settings::profiles::{JobSetup, Preset};
-use makepad_fab_slice::live::{Frame, LiveEngine, LiveEvent, LiveInput, Next, PartField, Spawn, Urgency};
+use makepad_fab_slice::live::{slice_frames, Frame, LiveEngine, LiveEvent, LiveInput, Next, PartField, Spawn, Urgency};
 use std::sync::{atomic::{AtomicU64, Ordering}, mpsc, Arc, Mutex};
 
 fn setup() -> JobSetup {
@@ -78,10 +79,18 @@ fn settle_gcode(ev: &Evaluated) -> (usize, String) {
     }
 }
 
-/// Settles the plate on the cores: (its layers, the FNV-1a hash of its G-code).
-fn settle(ev: &Evaluated) -> (usize, u64) {
+/// The plate settled on the cores prints what its plain slice prints: the whole G-code, its
+/// settings included, byte for byte.
+fn settles_as_sliced(ev: &Evaluated, what: &str) {
     let (layers, gcode) = settle_gcode(ev);
-    (layers, gcode.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3)))
+    let i = input(ev);
+    let plain = slice_frames(&setup(), &i.plate, i.frames.as_ref().expect("field frames"), &[], None).unwrap_or_else(|e| panic!("the {what}'s plain slice failed: {e}"));
+    assert!(plain.stats.layers > 0 && layers == plain.stats.layers, "the {what} settles {layers} layers, its plain slice {}", plain.stats.layers);
+    if gcode != plain.gcode {
+        let k = gcode.lines().zip(plain.gcode.lines()).position(|(a, b)| a != b);
+        let line = |g: &str| k.and_then(|k| g.lines().nth(k)).unwrap_or("(none: one ends first)").to_string();
+        panic!("the {what}'s settled G-code ({} bytes) is not its plain slice's ({} bytes): first at line {k:?}, {:?} against {:?}", gcode.len(), plain.gcode.len(), line(&gcode), line(&plain.gcode));
+    }
 }
 
 fn vase() -> Evaluated {
@@ -91,11 +100,7 @@ fn vase() -> Evaluated {
 
 #[test]
 fn a_vase_settles_on_the_cores() {
-    let (layers, hash) = settle(&vase());
-    // The slicing grid stands on the part's own lattice and the planner centres the part's
-    // patterns on its shape's own box, neither on its field's proven extent: a tighter proof
-    // changes which cells there are, never where the contours' points or the infill's lines fall.
-    assert_eq!((layers, hash), (68, 0x87c071eef9c2896d), "the vase's settled G-code (hash {hash:016x})");
+    settles_as_sliced(&vase(), "vase");
 }
 
 /// The vase sliced under looser boxes (as a weaker extent proof gives them, each holding the
@@ -138,14 +143,12 @@ fn a_looser_extent_prints_the_same_gcode() {
 fn a_lattice_settles_on_the_cores() {
     let ev = evaluate("use mod.fab.*\nscript(\"lattice_cube.cad.splash\", params: {lattice_size: 10mm lattice_period: 5mm})\nplace(\"lattice_cube\", object: \"lattice\", at: [150mm 150mm], name: \"Lattice cube\")\n",
         ("lattice_cube.cad.splash", include_str!("../../app/resources/lattice_cube.cad.splash")));
-    let (layers, hash) = settle(&ev);
-    assert_eq!((layers, hash), (25, 0x10d29a1a54be990f), "the lattice's settled G-code (hash {hash:016x})");
+    settles_as_sliced(&ev, "lattice");
 }
 
 #[test]
 fn a_links_part_settles_on_the_cores() {
     let chain = "use mod.model.*\nuse mod.fab.*\nlet m = mod.model\nlet chain = m.links([[0 0 0] [20mm 0 0]], {size: 6mm bar: 0.8mm})\nobject(chain, name: \"Chain\")\n";
     let ev = evaluate("use mod.fab.*\nscript(\"chain.cad.splash\")\nplace(\"chain\", at: [150mm 150mm], name: \"Chain part\")\n", ("chain.cad.splash", chain));
-    let (layers, hash) = settle(&ev);
-    assert_eq!((layers, hash), (9, 0x9f06d2f9ec8e0d19), "the Links part's settled G-code (hash {hash:016x})");
+    settles_as_sliced(&ev, "Links part");
 }

@@ -1,0 +1,34 @@
+# The live audio owner: the node types of an audio graph, the schedule a
+# revision is prepared into, the one device callback that mixes every live
+# instance, and the runtime that hands schedules to it. Widget-free: a host
+# gives it a device by calling `AudioEngine::render` from its callback.
+[package]
+name = "makepad-stage-live-audio"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Private Stage live audio owner: prepared schedules and the realtime mix"
+
+[lib]
+name = "makepad_stage_live_audio"
+path = "src/lib.rs"
+
+[dependencies]
+relax-attr = { path = "../../../../../libs/relax/attr" }
+# The engine: node types, schedules and the render pass, without decks.
+makepad-audio-engine = { path = "../../../../../libs/audio_engine" }
+# The score as one node of the audio graph (`Score`, a nested player).
+makepad-score-live = { path = "../../../../../libs/score_live" }
+makepad-flow = { path = "../../../../../libs/flow", default-features = false, features = ["live"] }
+makepad-lock-free = { path = "../../../../../libs/lock_free" }
+makepad-audio-dsp = { path = "../../../../../libs/audio_dsp" }
+makepad-stage-audio-media = { path = "../../../../apps/engine/audio_media" }
+makepad-stage-asset-stream = { path = "../../../../apps/stage/libs/asset_stream", default-features = false }
+
+[dev-dependencies]
+makepad-asset-data = { path = "../../../../apps/engine/asset/data" }
+
+# The golden render's flow fixture travels with the app slices.
+[package.metadata.commercial]
+include = ["fixtures/root.flow.splash"]

@@ -1,0 +1,43 @@
+# The agent loop over edits and motion documents: inspect,
+# frame, strip, onion, timeline, audio analyze and draft renders, for people
+# and AI agents. A library (Stage's in-app AI calls it in process) and the
+# `makepad-edit-tools` CLI, which draws in its own hidden window only for
+# the commands that need pictures.
+[package]
+name = "makepad-story-edit-tools"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "makepad_story_edit_tools"
+
+[[bin]]
+name = "makepad-edit-tools"
+path = "src/bin/makepad-edit-tools/main.rs"
+
+[dependencies]
+# The one loudness meter.
+makepad-audio-dsp = { path = "../../../../../libs/audio_dsp" }
+makepad-widgets = { path = "../../../../../widgets", default-features = false }
+makepad-story-cut = { path = "../cut" }
+# Frames, renders, media resolution and the offline mixdown.
+makepad-story-edit-render = { path = "../edit_render", default-features = false, features = ["store", "export", "models"] }
+# Effect presets and their text-level seekability, from the installed packs.
+makepad-content-packs = { path = "../../../../apps/engine/content_packs" }
+# Motion documents: loading, diagnostics, evaluation.
+makepad-motion = { path = "../../../../apps/engine/motion", features = ["scene3d"] }
+# The document font table (families, files, where they are).
+makepad-doc-fonts = { path = "../../../../apps/engine/fonts" }
+# Render-kit effects for `effect-strip`.
+makepad-stage-render-kit = { path = "../../../../apps/engine/render_kit" }
+# The waveform picture of `audio analyze --waveform` (the asset previews' recipe).
+makepad-audio-picture = { path = "../../../../../libs/audio_picture" }
+# Decoded PCM for `audio analyze`.
+makepad-stage-audio-media = { path = "../../../../apps/engine/audio_media" }
+makepad-asset-data = { path = "../../../../apps/engine/asset/data" }
+# `--json` output.
+makepad-strict-json = { path = "../../../../../libs/strict_json" }
+# PNG output of frames, strips and onion trails.
+makepad-zune-png = { path = "../../../../../libs/zune/zune-png", version = "0.5.2" }

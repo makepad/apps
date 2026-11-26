@@ -3,6 +3,7 @@
 
 use crate::api::*;
 use crate::tools::session;
+use crate::viewport::paint::LiveSwatch;
 use makepad_widgets_core::*;
 
 #[derive(Clone, Debug)]
@@ -56,7 +57,7 @@ fn paint_rgb(state: &AppState, part: &PlatePart, erase: bool) -> ([f32; 3], Opti
     if erase {
         return ([part.color[0], part.color[1], part.color[2]], Some(part.print_color.clone()));
     }
-    // The colour as its material shows now (the mapping may have changed since the pick).
+    // The authored model colour may have changed since the pick.
     let shown = state.ui.paint_name.as_deref().and_then(|n| state.print.colors.row(n)).map(|r| [r.shown[0], r.shown[1], r.shown[2]]);
     (shown.unwrap_or(state.ui.paint_color), state.ui.paint_name.clone())
 }
@@ -69,10 +70,38 @@ pub fn active(state: &AppState) -> bool {
     state.ui.gizmo == GizmoMode::Paint && state.tool == Tool::Select && state.ui.in_mode(PlateMode::Design)
 }
 
-/// The stroke being drawn: its part, points (printer mm), radius (mm), colour and whether it
-/// erases, for the views to show at once.
-pub fn live_stroke() -> Option<(String, Vec<[f64; 3]>, f64, [f32; 3], bool)> {
-    session::with(|s| s.paint.stroke.as_ref().or(s.paint.pending.as_ref()).filter(|st| !st.points.is_empty()).map(|st| (st.object.clone(), st.points.clone(), st.radius, st.rgb, st.erase)))
+fn preview_colour(state: &AppState, target: PaintTarget, name: Option<&str>, model: [f32; 3]) -> [f32; 3] {
+    if let Some(tint) = target.tint() { return tint; }
+    let row = name.and_then(|n| state.print.colors.row(n));
+    match state.view.colours {
+        fab_plate::ColourMode::Model => row.map_or(model, |r| r.design),
+        fab_plate::ColourMode::Material => state.print.target_printer().and_then(|_| row?.spool())
+            .map_or(fab_plate::UNMAPPED_RGB, |[r, g, b, _]| [r, g, b]),
+    }
+}
+
+fn live_swatch(state: &AppState, part: &PlatePart, target: PaintTarget, name: Option<&str>, model: [f32; 3]) -> LiveSwatch {
+    let rgb = preview_colour(state, target, name, model);
+    LiveSwatch::new(part, target, name, rgb)
+}
+
+/// A stroke keeps its authored RGB until the edit lands. The viewport resolves its named ink
+/// against the current view each time it draws the stroke.
+type StrokePreview<C = [f32; 3]> = (String, Vec<[f64; 3]>, f64, C, bool);
+
+fn stroke_with<C>(colour: impl FnOnce(&Stroke) -> C) -> Option<StrokePreview<C>> {
+    session::with(|s| {
+        let st = s.paint.stroke.as_ref().or(s.paint.pending.as_ref()).filter(|st| !st.points.is_empty())?;
+        Some((st.object.clone(), st.points.clone(), st.radius, colour(st), st.erase))
+    })
+}
+
+pub fn live_stroke() -> Option<StrokePreview> {
+    stroke_with(|st| st.rgb)
+}
+
+pub(crate) fn stroke_preview(state: &AppState) -> Option<StrokePreview<LiveSwatch>> {
+    stroke_with(|st| live_swatch(state, &st.part, st.target, st.color.as_deref(), st.rgb))
 }
 
 /// The height (printer mm) of the newest point of the stroke being drawn or waiting to land.
@@ -94,8 +123,8 @@ pub fn feature_at(part: &PlatePart, p: [f64; 3]) -> Option<String> {
 }
 
 /// What the fill would paint now, for the views: the part, the features' regions (model frame)
-/// and their names (`""`: the whole part).
-pub fn live_fill(state: &AppState) -> Option<(String, Vec<fab_paint_field::Region>, Vec<String>)> {
+/// their names (`""`: the whole part), and the colour shown by the current mode.
+pub fn live_fill(state: &AppState) -> Option<(String, Vec<fab_paint_field::Region>, Vec<String>, LiveSwatch)> {
     // a pattern shows once its script builds: a plain fill's preview would show the part all in
     // the paint colour
     if state.ui.paint_mode == PaintMode::Pattern {
@@ -114,7 +143,13 @@ pub fn live_fill(state: &AppState) -> Option<(String, Vec<fab_paint_field::Regio
             regions.push(region);
             names.push(f.clone().unwrap_or_default());
         }
-        Some((object, regions, names))
+        let (name, model) = if state.ui.paint_erase ^ s.paint.alt {
+            (Some(part.print_color.as_str()), [part.color[0], part.color[1], part.color[2]])
+        } else {
+            (state.ui.paint_name.as_deref(), state.ui.paint_color)
+        };
+        let swatch = live_swatch(state, part, state.ui.paint_target, name, model);
+        Some((object, regions, names, swatch))
     })
 }
 
@@ -384,4 +419,31 @@ pub fn owns_scroll(state: &AppState, mods: &KeyModifiers) -> bool {
 /// A brush diameter for the readouts: one decimal below 10 mm, whole mm above.
 pub fn diameter_text(mm: f64) -> String {
     if mm < 10.0 { format!("{mm:.1}") } else { format!("{mm:.0}") }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::print::colours;
+
+    #[test]
+    fn brush_and_fill_preview_follow_the_colour_mode() {
+        let model = [0.25, 0.5, 0.75];
+        let spool = [0.1, 0.2, 0.3];
+        let colour = fab_plate::PrintColor { name: "Body".into(), rgb: Some(model), design: None,
+            fallback: [0.8; 3], implicit: false, material: None, at: vec![] };
+        let mut state = AppState::default();
+        let layout = colours::parse_loadout("printer\tPrinter\nleft\tA1\tAMS A\tloaded\tPLA\t0.1 0.2 0.3", &["Left".into()]).unwrap();
+        state.print.colors = colours::resolve(&[colour], &["Body".into()], layout, "PLA", &[], &[]);
+        let selected = |s: &AppState| preview_colour(s, PaintTarget::Color, Some("Body"), [0.0; 3]);
+        assert_eq!(selected(&state), model);
+        state.view.colours = fab_plate::ColourMode::Material;
+        assert_eq!(selected(&state), fab_plate::UNMAPPED_RGB, "a saved loadout is offline");
+        state.print.links.picked = crate::print::PrinterChoice::Real("Printer".into());
+        state.print.printers.set(&state.print.links.picked, Default::default());
+        assert_eq!(selected(&state), spool);
+        state.print.colors.rows[0].tray.as_mut().unwrap().colour = None;
+        assert_eq!(selected(&state), fab_plate::UNMAPPED_RGB, "mapped tray without ink");
+        assert_eq!(preview_colour(&state, PaintTarget::SupportBlock, None, model), PaintTarget::SupportBlock.tint().unwrap());
+    }
 }

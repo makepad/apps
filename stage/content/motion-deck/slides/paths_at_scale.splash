@@ -1,0 +1,59 @@
+use mod.motion.*
+
+// Shape & paths 2: geometry-carrying paths. A field of 2,016 filled outlines morphs moon ->
+// bell -> sparkle -> play and back, row by row, every frame. A frame
+// carries each path's numbers, so a morph is arithmetic on points, not text re-parsed.
+// The slide runs long (play @hold over ten minutes) so the field never stops while the slide shows.
+let look = import("shared/motion_deck_look")
+
+let CELL = 20.0
+let COLUMNS = 72
+let ROWS = 28
+let COUNT = COLUMNS * ROWS
+let ORIGIN = vec2(96, 318)
+let SPACING = vec2(24.0, 23.4)
+// One morph cycle through four outlines, each move a 2 s ease into the next, repeated for the
+// whole slide: at any moment a diagonal band of the field is between two shapes.
+let CYCLE = 8.0
+let SHAPES = keys(
+    [0.0, icon_path("wm/moon", CELL)],
+    [2.0, icon_path("wm/bell", CELL), @ease_in_out_sine],
+    [4.0, icon_path("stage/sparkle", CELL), @ease_in_out_sine],
+    [6.0, icon_path("stage/play", CELL), @ease_in_out_sine],
+    [8.0, icon_path("wm/moon", CELL), @ease_in_out_sine])
+// A copy starts its cycle LAG after the one before it in its band: a band takes about 2 s.
+let LAG = 0.0032
+
+// Three bands, cool to bone, each a Repeat with one constant fill (a per-copy colour function
+// would cost more than the morph). Each band starts where the row of the band before ends,
+// so the wave runs straight across.
+let BAND = 24
+let band = fn(k, fill) {
+    return Repeat{name: "field " + k count: BAND * ROWS layout: @grid columns: BAND spacing: SPACING
+        at: vec2(ORIGIN.x + k * BAND * SPACING.x, ORIGIN.y) span: [k * BAND * LAG, 600.0]
+        delay: LAG opacity: tween(0, 0.88, 0.6, 2.2, @ease_in_out_cubic)
+        layer: Path{svg: repeat(SHAPES, CYCLE, @restart) fill: fill}}
+}
+
+Motion{
+    label: "Thousands of paths, live"
+    size: vec2(1920, 1080)
+    duration: 600.0
+    fps: 60
+    color: @hdr
+    background: look.INK
+    layers: [
+        Draw2D{name: "ground" size: vec2(1920, 1080) draw: fn(c, t, edit) { look.ground(c, t, live()) }}
+        // The field: each copy starts its cycle LAG after the one before, so the morph rolls
+        // across and down the grid as one slow diagonal wave.
+        band(0, look.COOL)
+        band(1, mix(look.COOL, look.BONE, 0.55))
+        band(2, look.BONE)
+        Draw2D{name: "chrome" size: vec2(1920, 1080) draw: fn(c, t, edit) {
+            look.folio(c, t, "04", "Shape and paths")
+            look.heading(c, t, "Thousands of paths, live.", "A frame carries each outline's geometry, so 2,016 outlines morph every frame at full rate.")
+            look.syntax(c, t, 2.0, "Repeat{count: 2016  layer: Path{svg: keys(...)}}")
+        }}
+    ]
+    post: look.post_chain(look.POST)
+}

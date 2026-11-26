@@ -24,7 +24,7 @@ pub(super) fn scene_of(board: &Board, fills: &[ZoneFill]) -> DrawScene {
 /// Only the requested items, in the same list/fill order as the full scene.
 /// `Board::locate` uses the board's index, with its usual fallback for direct list edits.
 pub fn scene_of_items(board: &Board, fills: &[ZoneFill], items: &[ItemId]) -> DrawScene {
-    let mut selected: [Vec<usize>; 7] = std::array::from_fn(|_| Vec::new());
+    let mut selected: [Vec<usize>; ITEM_KINDS.len()] = std::array::from_fn(|_| Vec::new());
     for &id in items {
         let Some((kind, index)) = board.locate(id) else { continue };
         if let Some(slot) = ITEM_KINDS.iter().position(|&k| k == kind) {
@@ -56,9 +56,9 @@ pub fn scene_of_fill_region(board: &Board, fill: &ZoneFill, region: BBox) -> Dra
 }
 
 // This is the historical scene order, independent of ItemId allocation order.
-const ITEM_KINDS: [ItemKind; 7] = [
+const ITEM_KINDS: [ItemKind; 9] = [
     ItemKind::Placed, ItemKind::Track, ItemKind::Via, ItemKind::Hole,
-    ItemKind::Zone, ItemKind::Graphic, ItemKind::Text,
+    ItemKind::Zone, ItemKind::Graphic, ItemKind::Text, ItemKind::Keepout, ItemKind::Cutout,
 ];
 
 struct Builder {
@@ -91,10 +91,10 @@ impl Builder {
         }
     }
 
-    fn items(&mut self, board: &Board, fills: &[ZoneFill], selected: Option<&[Vec<usize>; 7]>) {
+    fn items(&mut self, board: &Board, fills: &[ZoneFill], selected: Option<&[Vec<usize>; ITEM_KINDS.len()]>) {
         let copper = board.stackup.copper();
         let lengths = [board.placed.len(), board.tracks.len(), board.vias.len(), board.holes.len(),
-            board.zones.len(), board.graphics.len(), board.texts.len()];
+            board.zones.len(), board.graphics.len(), board.texts.len(), board.keepouts.len(), board.cutouts.len()];
         for (slot, kind) in ITEM_KINDS.into_iter().enumerate() {
             let indices = (0..if selected.is_none() { lengths[slot] } else { 0 })
                 .chain(selected.into_iter().flat_map(|lists| lists[slot].iter().copied()));
@@ -260,7 +260,25 @@ impl Builder {
                     self.push(t.layer, shape, None, tag, None);
                 }
             }
-            ItemKind::Keepout | ItemKind::Cutout | ItemKind::Tuning => {}
+            ItemKind::Keepout => {
+                let keepout = &board.keepouts[index];
+                let tag = Tag { item: keepout.id, sub: 0, role: Role::Graphic };
+                for layer in keepout.layers.iter() {
+                    for ring in keepout.area.rings() {
+                        for shape in ring_strokes(ring, 100_000) {
+                            self.push(layer, shape, None, tag, None);
+                        }
+                    }
+                }
+            }
+            ItemKind::Cutout => {
+                let cutout = &board.cutouts[index];
+                let tag = Tag { item: cutout.id, sub: 0, role: Role::Outline };
+                for shape in path_strokes(&cutout.contour.path, 100_000) {
+                    self.push(LayerId::EDGE, shape, None, tag, None);
+                }
+            }
+            ItemKind::Tuning => {}
         }
     }
 
@@ -371,6 +389,30 @@ mod tests {
     use fab_elec_parts::{FpTextKind, PadKind};
     use fab_elec_design::fixture::fp::{chip, pin_header, tssop};
     use std::sync::Arc;
+
+    #[test]
+    fn keepout_and_cutout_edges_survive_a_scene_rebuild() {
+        let mut board = Board::new(BoardId(0), "openings");
+        board.outline.push(Contour::rect(P::ZERO, P::mm(20.0, 20.0), 0));
+        let keepout = board.alloc_id();
+        board.keepouts.push(fab_elec_board::BoardKeepout {
+            id: keepout, area: PolySet::rect(BBox::new(P::mm(1.0, 1.0), P::mm(3.0, 3.0))),
+            layers: LayerSet::one(LayerId::B_CU), forbid: fab_elec_parts::Forbid::ALL,
+            reason: "antenna".into(), origin: Origin::Authored, z: None,
+        });
+        let cutout = board.alloc_id();
+        board.cutouts.push(fab_elec_board::Cutout { id: cutout, name: "slot".into(), origin: Origin::Authored,
+            contour: Contour::rect(P::mm(5.0, 5.0), P::mm(10.0, 10.0), 0) });
+        let full = scene_of(&board, &[]);
+        let edited = scene_of_items(&board, &[], &[keepout, cutout]);
+        for scene in [&full, &edited] {
+            let strokes = |layer, id| scene.layer(layer).unwrap().shapes.iter().filter(|s| s.tag.item == id).count();
+            assert_eq!(strokes(LayerId::B_CU, keepout), 4);
+            assert_eq!(strokes(LayerId::EDGE, cutout), 4);
+        }
+        assert!(full.substrate.contains(P::mm(2.0, 2.0)));
+        assert!(!full.substrate.contains(P::mm(6.0, 6.0)));
+    }
 
     #[test]
     fn board_scene_preserves_geometry_layers_and_tags() {

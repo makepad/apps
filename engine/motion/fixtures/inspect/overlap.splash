@@ -1,0 +1,10 @@
+use mod.motion.*
+Motion{size: vec2(640, 480) duration: 2.0 fps: 20 layers: [
+    Text{name: "first" text: "H" size: 48 at: vec2(80, 60)}
+    Text{name: "overlap" text: "H" size: 48 at: vec2(85, 60)}
+    Text{name: "separate" text: "H" size: 48 at: vec2(400, 60)}
+    Group{opacity: 0 layers: [Text{text: "H" size: 48 at: vec2(80, 60)}]}
+    Text{name: "unrevealed" text: "H" size: 48 at: vec2(80, 60) reveal: 0}
+    Text{name: "spaces" text: "H         H" size: 48 at: vec2(80, 240)}
+    Text{name: "in whitespace" text: "H" size: 24 at: vec2(180, 255)}
+]}

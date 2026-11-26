@@ -21,6 +21,41 @@ pub mod threemf;
 
 pub use settings::*;
 
+/// How the plate displays its print colours.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ColourMode {
+    #[default]
+    Model,
+    Material,
+}
+
+impl ColourMode {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Material => "material",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key.trim() {
+            "model" => Some(Self::Model),
+            "material" => Some(Self::Material),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Model => "Model colours",
+            Self::Material => "Material colours",
+        }
+    }
+}
+
+/// The viewport's missing spool colour, sRGB #e04040 in linear light.
+pub const UNMAPPED_RGB: [f32; 3] = [0.7454042, 0.05126946, 0.05126946];
+
 /// An indexed triangle mesh in millimetres. Triangles wind counter-clockwise
 /// seen from outside (outward normals by the right-hand rule).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -248,6 +283,13 @@ pub enum OpticsSource {
     Measured,
 }
 
+/// The board surface from which a keepout's height band is measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeepoutSide {
+    Top,
+    Bottom,
+}
+
 /// This records space on a board that this part keeps clear of other parts.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Keepout {
@@ -255,11 +297,17 @@ pub struct Keepout {
     pub board: String,
     /// This names the thing keeping the space clear, with one record per thing.
     pub name: String,
+    /// The host key of the port whose part carries this record, if any.
+    pub feature: Option<String>,
+    /// A room reserves its outline only against other rooms.
+    pub room: bool,
     /// This is the outline in the board's own frame, in kernel units, with the board's
     /// x and y coordinates.
     pub area: Vec<[f64; 2]>,
-    /// This is the occupied band `[low, high]`, in kernel units, measured up from the
-    /// board's top surface.
+    /// The board surface the band is measured from (`@top` unless the record says `@bottom`).
+    pub side: KeepoutSide,
+    /// This is the occupied band `[low, high]`, in kernel units, measured outward from the
+    /// board's surface on `side`.
     pub z: [f64; 2],
 }
 
@@ -319,10 +367,9 @@ pub struct Part {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PrintColor {
     pub name: String,
-    /// The design colour (linear RGB) when it is set apart from the material's (an override);
-    /// `None`: the colour of the material it maps to.
+    /// The model colour the person picked (linear RGB).
     pub rgb: Option<[f32; 3]>,
-    /// The colour shown when it has no override and no mapped material reports one.
+    /// Its default model colour when neither a picked nor a design colour is known.
     pub fallback: [f32; 3],
     /// The colour the design asks for without an override (the albedo of a painted material
     /// that prints as it): what picks its tray. `None`: any colour of the material type.

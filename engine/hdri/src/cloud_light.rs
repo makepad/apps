@@ -35,6 +35,11 @@ const SLAB_GAIN: f32 = 1.5;
 /// A sheet's cover stands for the optical depth -ln(1 - cover) in its diffuse transmittance. The cover is held below
 /// this, where its opacity rounds to 1.
 const SHEET_COVER_MAX: f32 = 0.999;
+/// How far the deck types' dome (the Stratocumulus', the Altocumulus', the Cumulus') moves from the open sky's mean
+/// toward the grey of its own luminance: the look runner's dome was the sky's mean whiter (B/R 1.6 against its sky's
+/// 1.9), standing in for the sunlit cloud round a shaded face and the sun scattered many times inside it. On the
+/// engine's bluer sky (B/R 2.2 at sun 45) the deck's shaded sides stood blue-grey where the runner's cu3 is white-grey.
+const DECK_DOME_WHITE: f32 = 0.8;
 /// The shadows between layers fade in over the sun's first two degrees (the sine of its elevation). A sun on the
 /// horizon throws a higher layer's shadow far off, and as it sets the shadows do not snap off.
 const SHADOW_FADE_SIN: f32 = 0.035;
@@ -391,7 +396,9 @@ pub fn light_pass<E: LitEntry>(entries: &[E], inputs: &LightInputs) -> Vec<Entry
             // own share too, a Cumulus' dome went from B/R 1.97 to 1.17 and its shaded sides to 1.04 against
             // kloofendal_48d's 1.39.
             let open_above = lights[i + 1..].iter().fold(1.0f32, |open, light| open * (1.0 - light.dome_share));
-            (inputs.a_top.mix(vec3f(grey, grey, grey), 1.0 - open_above) * cascade, bounce, sun_bounce)
+            let white = if matches!(entry.genus(), CloudGenus::Stratocumulus | CloudGenus::Altocumulus | CloudGenus::Cumulus) { DECK_DOME_WHITE } else { 0.0 };
+            let g = 1.0 - (1.0 - white) * open_above;
+            (inputs.a_top.mix(vec3f(grey, grey, grey), g) * cascade, bounce, sun_bounce)
         } else {
             let open_above = lights[i..].iter().fold(1.0f32, |open, light| open * (1.0 - light.dome_share));
             (greyed(1.0 - open_above) * cascade, bounce, sun_bounce)
@@ -500,11 +507,7 @@ fn passed_from<E: LitEntry>(above: &[E], classic: bool, marched: bool, hit_m: Ve
     }
 }
 
-/// smoothstep under its own name, so no glob can make it ambiguous (volumetric.rs `smooth`).
-fn smooth(a: f32, b: f32, x: f32) -> f32 {
-    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
+use crate::patterns::smooth;
 
 #[cfg(test)]
 mod tests {
@@ -754,16 +757,20 @@ mod tests {
         assert_eq!(lights[0].dome_share, 0.5);
         assert!(close(lights[0].ambient, greyed(0.5), 1.0e-6), "{:?}", lights[0].ambient);
         // A volume is greyed once (design §12.9 item 5): its own share is its tau_up's, so alone it takes the dome as it
-        // is whatever its share, and under a layer it greys by that layer's share alone, without the classic half.
+        // is whatever its share, and under a layer it greys by that layer's share alone, without the classic half. A deck
+        // type's volume (the Cumulus here) starts DECK_DOME_WHITE of the way to the grey, a heap's (the Cumulonimbus) at none.
         let grey = luminance(A_TOP);
         let once = |g: f32| A_TOP.mix(vec3f(grey, grey, grey), g);
-        for share in [0.0f32, 0.5, 1.0] {
-            let volume = Mock { marched: true, ..Mock::modern(CloudGenus::Cumulus, 1200.0, share, 0.0) };
-            let lights = light_pass(&[volume], &inputs(&sun_at));
-            assert_eq!(lights[0].dome_share, share);
-            assert!(close(lights[0].ambient, A_TOP, 1.0e-6), "a volume at share {share}: {:?}", lights[0].ambient);
-            let lights = light_pass(&[volume, Mock::modern(CloudGenus::Stratocumulus, 3000.0, 0.25, 0.0)], &inputs(&sun_at));
-            assert!(close(lights[0].ambient, once(0.25), 1.0e-6), "a volume at share {share} under 0.25: {:?}", lights[0].ambient);
+        for (genus, white) in [(CloudGenus::Cumulonimbus, 0.0f32), (CloudGenus::Cumulus, DECK_DOME_WHITE)] {
+            for share in [0.0f32, 0.5, 1.0] {
+                let volume = Mock { marched: true, ..Mock::modern(genus, 1200.0, share, 0.0) };
+                let lights = light_pass(&[volume], &inputs(&sun_at));
+                assert_eq!(lights[0].dome_share, share);
+                assert!(close(lights[0].ambient, once(white), 1.0e-6), "a {genus:?} at share {share}: {:?}", lights[0].ambient);
+                let lights = light_pass(&[volume, Mock::modern(CloudGenus::Stratocumulus, 3000.0, 0.25, 0.0)], &inputs(&sun_at));
+                let under = once(1.0 - (1.0 - white) * 0.75);
+                assert!(close(lights[0].ambient, under, 1.0e-6), "a {genus:?} at share {share} under 0.25: {:?}", lights[0].ambient);
+            }
         }
     }
 

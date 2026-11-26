@@ -104,7 +104,7 @@ fn reference(c: &Compiled, ran: Ran, state: &mut [u32], actual: &[u32], events: 
     let mut replay = Replay { rx: ran.rx, evs: events.iter().filter(pinned) };
     let mut scratch = vec![0; e.program.scratch_words()];
     let mut mem = ir::Mem { ctx: &mut [], state, shared: ir::Shared::Read(&c.lowered.shared_init), bufs: &[] };
-    let mut io = ir::Io { ins: [&[], &[]], outs: [&mut [], &mut []] };
+    let mut io = ir::Io::default();
     ir::run_ports(&e.program, &mut scratch, &mut mem, &mut io, 1, &mut replay);
     assert_eq!(&*mem.state, actual, "runtime state diverges from AIR after {} at {}", e.name, ran.start);
     assert_eq!(replay.evs.next(), None, "AIR omitted a device duty");

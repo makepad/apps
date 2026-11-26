@@ -1,6 +1,7 @@
 //! Generic assembly tables resolved from the circuit and the board's placed footprints.
 
-use crate::profile::{BomRow, PlaceRow, ResolvedProfile};
+use crate::bom_export::{build_table, BomField, BomFormat, BomView, FilterScope, ResolvedBomOptions};
+use crate::profile::{PlaceRow, ResolvedProfile};
 use crate::text::deg_str;
 use fab_elec_board::Board;
 use fab_elec_circuit::{Circuit, Component};
@@ -72,62 +73,52 @@ impl PlacementRules {
     }
 }
 
-#[derive(Copy, Clone)]
-enum BomColumn {
-    Value,
-    Refs,
-    Footprint,
-    Mpn,
-    Supplier,
-    Quantity,
-    Empty,
+/// The orderable part's identity is shared by the live sheet and every factory profile.
+pub fn assembly_view() -> BomView {
+    let columns = [
+        ("Reference", "Refs", false), ("${QUANTITY}", "Qty", false),
+        ("Value", "Value", true), ("Footprint", "Footprint", true), ("mpn", "MPN", true),
+        ("supplier", "Supplier", false), ("supplier_part", "Supplier part", true),
+        ("Description", "Description", false), ("${DNP}", "DNP", true),
+        (LCSC_PART, "LCSC Part #", true), (SUPPLIER_KEY, "Supplier key", true),
+    ];
+    BomView {
+        fields: columns.into_iter().map(|(name, label, group_by)| BomField {
+            name: name.into(), label: label.into(), group_by, show: !matches!(name, LCSC_PART | SUPPLIER_KEY),
+        }).collect(),
+        sort_field: "Reference".into(), filter_scope: FilterScope::Visible, ..BomView::default()
+    }
 }
 
-const BOM_COLUMN_ALIASES: &[(&[&str], BomColumn)] = &[
-    (&["Comment", "Value"], BomColumn::Value),
-    (&["Designator", "Reference", "Refs"], BomColumn::Refs),
-    (&["Footprint", "Package"], BomColumn::Footprint),
-    (&["Part", "MPN", "Manufacturer Part"], BomColumn::Mpn),
-    (&["LCSC Part #", "LCSC Part", "LCSC", "JLCPCB Part #"], BomColumn::Supplier),
-    (&["Qty", "Quantity"], BomColumn::Quantity),
-    (&["Description"], BomColumn::Empty),
+pub(crate) const ASSEMBLY_REFS: &str = "${ASSEMBLY_REFS}";
+pub(crate) const LCSC_PART: &str = "${LCSC_PART}";
+pub(crate) const SUPPLIER_KEY: &str = "${SUPPLIER_KEY}";
+pub(crate) const PLACED_FOOTPRINT: &str = "${PLACED_FOOTPRINT}";
+
+const BOM_COLUMN_ALIASES: &[(&[&str], &str)] = &[
+    (&["Comment", "Value"], "Value"),
+    (&["Designator", "Reference", "Refs"], ASSEMBLY_REFS),
+    (&["Footprint", "Package"], PLACED_FOOTPRINT),
+    (&["Part", "MPN", "Manufacturer Part"], "mpn"),
+    (&["LCSC Part #", "LCSC Part", "LCSC", "JLCPCB Part #"], LCSC_PART),
+    (&["Qty", "Quantity"], "${QUANTITY}"),
 ];
 
 /// Replaces the rows while retaining the profile's headers and delimiters.
 pub fn fill_generic_tables(profile: &mut ResolvedProfile, board: &Board, circuit: &Circuit, rules: &PlacementRules) {
-    let bom_columns: Vec<_> = profile.bom.header.iter().map(|header| {
-        BOM_COLUMN_ALIASES.iter()
-            .find(|(aliases, _)| aliases.iter().any(|alias| header.eq_ignore_ascii_case(alias)))
-            .map_or(BomColumn::Empty, |(_, column)| *column)
-    }).collect();
-    let footprints: BTreeMap<_, _> = board.placed.iter().map(|p| (p.comp, p.footprint.name.as_str())).collect();
-    let mut groups: BTreeMap<(&str, &str, String, String), Vec<String>> = BTreeMap::new();
-    // A power flag exists only on the schematic and has no assembly BOM row.
-    for comp in circuit.comps.iter().filter(|c| !c.dnp && c.part.kind != PartKind::PowerFlag) {
-        let value = comp.value.as_ref().map_or("", |v| v.text.as_str());
-        let footprint = footprints.get(&comp.id).copied().unwrap_or("");
-        let fields = merged_fields(comp);
-        let mpn = fields.get("mpn").cloned().unwrap_or_default();
-        let supplier = lcsc_number(&fields).to_string();
-        groups.entry((value, footprint, mpn, supplier)).or_default().push(comp.refdes.clone());
+    let mut view = assembly_view();
+    view.exclude_dnp = true;
+    // Retain the assembly's grouping keys independently of which columns the factory wants.
+    view.fields.retain(|f| f.group_by);
+    for field in &mut view.fields { field.show = false; }
+    for header in &profile.bom.header {
+        let name = BOM_COLUMN_ALIASES.iter().find(|(aliases, _)| aliases.iter().any(|a| header.eq_ignore_ascii_case(a)))
+            .map_or("", |(_, name)| *name);
+        view.fields.push(BomField { name: name.into(), label: header.clone(), group_by: false, show: true });
     }
-    let mut bom_rows = Vec::with_capacity(groups.len());
-    for ((value, footprint, mpn, supplier), mut refs) in groups {
-        refs.sort_by(|a, b| natural_cmp(a, b));
-        let designators = refs.join(",");
-        let cells = bom_columns.iter().map(|column| match column {
-            BomColumn::Value => value.to_string(),
-            BomColumn::Refs => designators.clone(),
-            BomColumn::Footprint => footprint.to_string(),
-            BomColumn::Mpn => mpn.clone(),
-            BomColumn::Supplier => supplier.clone(),
-            BomColumn::Quantity => refs.len().to_string(),
-            BomColumn::Empty => String::new(),
-        }).collect();
-        bom_rows.push(BomRow { cells, refs });
-    }
-    bom_rows.sort_by(|a, b| natural_cmp(&a.refs[0], &b.refs[0]));
-    profile.bom.rows = bom_rows;
+    let options = ResolvedBomOptions { view, symbol_scope: Default::default(),
+        format: BomFormat { ref_delimiter: ",".into(), ..Default::default() } };
+    profile.bom.rows = build_table(&bom_from_circuit(circuit, Some(board)), &options, "").rows;
 
     let bbox = board.outline_bbox();
     let origin = match rules.origin {
@@ -179,8 +170,8 @@ fn merged_fields(comp: &Component) -> BTreeMap<String, String> {
 }
 
 /// Resolve the LCSC number once so the displayed column and the group key cannot disagree.
-fn lcsc_number(fields: &BTreeMap<String, String>) -> &str {
-    if fields.get("supplier").is_some_and(|supplier| supplier.eq_ignore_ascii_case("lcsc")) {
+pub(crate) fn lcsc_number(fields: &BTreeMap<String, String>) -> &str {
+    if fields.get("supplier").is_some_and(|supplier| supplier.trim().eq_ignore_ascii_case("lcsc")) {
         return fields.get("supplier_part").map_or("", String::as_str);
     }
     fields.iter().find(|(name, _)| name.eq_ignore_ascii_case("lcsc")).map_or("", |(_, value)| value.as_str())
@@ -238,16 +229,19 @@ pub(crate) fn natural_cmp(a: &str, b: &str) -> Ordering {
 }
 
 /// S46 BOM input from circuit components; the host adds variant/sheet metadata that the
-/// circuit model does not yet carry. This does not change the generic factory table policy.
+/// circuit model does not yet carry. Factory profiles and the live sheet consume this document.
 pub fn bom_from_circuit(circuit: &Circuit, board: Option<&Board>) -> crate::bom_export::BomDocument {
     let footprints: BTreeMap<_, _> = board.into_iter().flat_map(|b| &b.placed)
         .map(|p| (p.comp, p.footprint.name.as_str())).collect();
     crate::bom_export::BomDocument {
         // A power flag exists only on the schematic and has no part to order.
         items: circuit.comps.iter().filter(|c| c.part.kind != PartKind::PowerFlag).map(|comp| {
-            let footprint = footprints.get(&comp.id).copied()
+            let on_board = footprints.get(&comp.id).copied();
+            let footprint = on_board
                 .or_else(|| comp.part.footprint.as_ref().map(|f| f.name.as_str())).unwrap_or("");
-            bom_component(comp, footprint)
+            let mut item = bom_component(comp, footprint);
+            item.placed = on_board.is_some();
+            item
         }).collect(),
         ..Default::default()
     }
@@ -261,6 +255,7 @@ pub fn bom_from_board(board: &Board, circuit: &Circuit) -> crate::bom_export::Bo
         items: board.placed.iter().map(|placed| {
             let mut item = components.get(&placed.comp).map_or_else(
                 crate::bom_export::BomItem::default, |c| bom_component(c, &placed.footprint.name));
+            item.placed = true;
             item.symbol_id = placed.path.clone();
             item.reference = placed.refdes.clone();
             item.footprint = placed.footprint.name.clone();
@@ -270,11 +265,16 @@ pub fn bom_from_board(board: &Board, circuit: &Circuit) -> crate::bom_export::Bo
     }
 }
 
+pub(crate) fn excludes_bom(comp: &Component) -> bool {
+    comp.fields.get("exclude_from_bom").or_else(|| comp.part.fields.get("exclude_from_bom"))
+        .is_some_and(|value| matches!(value, "1" | "true" | "yes"))
+}
+
 fn bom_component(comp: &Component, footprint: &str) -> crate::bom_export::BomItem {
     let fields = merged_fields(comp);
     let flag = |name: &str| fields.get(name).is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
     let attributes = crate::bom_export::BomAttributes {
-        dnp: comp.dnp, exclude_from_bom: flag("exclude_from_bom"),
+        dnp: comp.dnp, exclude_from_bom: excludes_bom(comp),
         exclude_from_board: flag("exclude_from_board"), exclude_from_sim: flag("exclude_from_sim"),
         exclude_from_pos_files: flag("exclude_from_pos_files"),
     };

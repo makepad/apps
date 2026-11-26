@@ -60,7 +60,8 @@ fn program(app: &TestApp) -> Program {
     let rows = script.into_iter().flat_map(|s| s.field("solids").and_then(|f| f.value.items()).expect("the solids")).map(|s| {
         let kind = s.field("type").and_then(|f| f.value.name()).expect("solid type");
         let id = s.field("id").and_then(|f| f.value.string()).expect("solid id");
-        format!("{} {id}", kind.to_lowercase())
+        let proto = makepad_model_script::lang::protos::proto(kind).expect("the inspected solid has a prototype");
+        format!("{} {id}", fab_model::steps::verb(proto.call))
     }).collect();
     Program { source, project, rows }
 }
@@ -234,7 +235,7 @@ object(post)
     round_trip(&app, "an AI program", || {
         let reply = text(&call(&app, "script", &batch).expect("script"));
         assert!(reply.contains("solid: \"post/post\""), "{reply}");
-    }, |p| p.source == source && p.rows == ["cylinder post"]);
+    }, |p| p.source == source && p.rows == ["Cylinder post"]);
     let head = head_of(&text(&call(&app, "inspect", "{}").expect("inspect")));
     let edits = r#"place("post", name: "Post")"#;
     let batch = format!(r#"{{"request_id":"undo-1-place","expected":{head:?},"edits":{}}}"#, Value::Str(edits.to_string()).to_json());
@@ -263,7 +264,7 @@ object(post)
     let before_delete = program(&app);
     round_trip(&app, "the tree's delete", || {
         let _ = show_tab(&app, "Features");
-        let label = label_of(&app, "cylinder post");
+        let label = label_of(&app, "Cylinder post");
         app.locator(Selector::role(Role::ListItem).name(label)).wait_visible().select();
         app.locator(Selector::role(Role::Button).name("Delete feature")).wait_visible().press();
     }, |p| p.rows.is_empty() && !p.source.contains("let post =") && !p.source.contains("object(post)"));
@@ -276,7 +277,7 @@ object(post)
         app.locator(Selector::role(Role::Button).name("Add feature")).wait_visible().press();
         app.locator(Selector::role(Role::MenuItem).name("From a sketch")).wait_visible().press();
         app.locator(Selector::role(Role::MenuItem).name("Extrude")).wait_visible().press();
-    }, |p| p.rows.iter().any(|r| r.starts_with("extrude ")));
+    }, |p| p.rows.iter().any(|r| r.starts_with("Extrude ")));
 
     // ---- the Part panel's position field ----
     pick_part(&app, "Post");

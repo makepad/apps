@@ -1,0 +1,37 @@
+use mod.motion.*
+// CIRCLE REVEAL — an accent disc and an ink disc 80 ms behind it grow out
+// of `origin` until the ink covers the frame (0.58 s — cut underneath at
+// 0.6 s), then a hole opens from the same point with an accent ring on its
+// edge, revealing the next shot. Put it on a track above the cut, starting
+// 0.6 s before it.
+// Why: an iris from a point both shots share (a button, a face) makes the
+// cut feel motivated — the new shot comes out of something on screen.
+Motion{
+    label: "Circle reveal"
+    brief: "Discs grow from a point to cover the cut at 0.6 s, then a ringed hole reveals the next shot."
+    tags: ["transition", "wipe", "circle", "iris", "shape"]
+    duration: 1.3
+    inputs: {
+        origin: input(@vec2, vec2(960, 540), "Where the circles grow from, px")
+        lead: input(@color, #ff5c39, "Leading disc and ring")
+        slab: input(@color, #0b0d12, "Covering disc")
+    }
+    layers: [
+        // cover: two discs 4600 px across, enough to cover the frame from any origin inside it
+        Group{at: in(@origin) span: [0.0, 0.6] layers: [
+            Ellipse{at: vec2(-2300, -2300) size: vec2(4600, 4600) fill: in(@lead) scale: tween(0, 1, 0.0, 0.5, @ease_in_cubic)}
+            Ellipse{at: vec2(-2300, -2300) size: vec2(4600, 4600) fill: in(@slab) scale: tween(0, 1, 0.08, 0.58, @ease_in_cubic)}
+        ]}
+        // reveal (its clock starts at 0.6): the ink frame with a growing hole, ringed in the accent
+        Group{
+            span: [0.6, 0.7]
+            mask_mode: @inverse
+            mask: Ellipse{at: in(@origin) - vec2(2300, 2300) size: vec2(4600, 4600) scale: tween(0, 1, 0.0, 0.7, @ease_in_out_cubic)}
+            layers: [Rect{size: vec2(1920, 1080) fill: in(@slab)}]
+        }
+        Group{at: in(@origin) span: [0.6, 0.7] layers: [
+            Ellipse{at: vec2(-2300, -2300) size: vec2(4600, 4600) stroke: in(@lead) width: tween(240, 0, 0.0, 0.7, @ease_in_cubic)
+                    scale: tween(0, 1, 0.0, 0.7, @ease_in_out_cubic)}
+        ]}
+    ]
+}

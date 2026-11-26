@@ -1,0 +1,27 @@
+/** A Repeat copy's item of its `source` list: `item()` whole, `item(@name)` a record's field. */
+mod.motion.item = fn(field = nil) { mod.motion.Item{field: field} }
+/** A typed input declaration: `input(@image)`, `input(@color, #f00, "Accent")`, `input(@list, ["a", "b"])`. */
+mod.motion.input = fn(ty, default = nil, doc = "") { mod.motion.Input{ty: ty default: default doc: doc} }
+/** `at: along(points_or_svg, progress)`: the origin rides a path. */
+mod.motion.along = fn(path, progress = 0.0) { mod.motion.Along{path: path progress: progress} }
+/** `stagger(step, @forward | @reverse | @center | @edges | @random, seed = 1)`. */
+mod.motion.stagger = fn(step, order = @forward, seed = 1) { mod.motion.Stagger{step: step order: order seed: seed} }
+/** Musical and spoken time (§10.3); counting from 0, offsets in seconds. */
+mod.motion.beat = fn(n, offset = 0.0) { mod.motion.Beat{n: n offset: offset} }
+mod.motion.bar = fn(n, beat = 0.0, offset = 0.0) { mod.motion.Bar{n: n beat: beat offset: offset} }
+mod.motion.downbeat = fn(n, offset = 0.0) { mod.motion.Downbeat{n: n offset: offset} }
+mod.motion.onset = fn(n, offset = 0.0) { mod.motion.Onset{n: n offset: offset} }
+mod.motion.section = fn(name, offset = 0.0, nth = 0) { mod.motion.Section{name: name offset: offset nth: nth} }
+mod.motion.word = fn(voice, index, offset = 0.0, nth = 0, after = nil) { mod.motion.Word{voice: voice index: index offset: offset nth: nth after: after} }
+mod.motion.line = fn(voice, index, offset = 0.0) { mod.motion.Line{voice: voice index: index offset: offset} }
+/** A named layer's playhead (its own seconds, `in` and `speed` included) and its progress 0..1 over its span: bind a counter or a bar to a nested clip. */
+mod.motion.playhead = fn(name) { mod.motion.Playhead{name: name} }
+mod.motion.progress = fn(name, from = 0.0, to = 1.0) { mod.motion.Progress{name: name from: from to: to} }
+/** Second `s` of the host edit: the same moment in every graphic that shows it. */
+mod.motion.edit = fn(s, offset = 0.0) { mod.motion.Edit{s: s offset: offset} }
+/** Another layer's path for a Text to ride: `path: layer("curve")`, or a chart's series line: `layer("chart", "loss")`. */
+mod.motion.layer = fn(name, series = nil) { mod.motion.LayerPath{name: name series: series} }
+/** A 3D node for a 2D layer to follow: `at: anchor("scene", "eye_3")` (the Scene3D layer's name, a named node in it). */
+mod.motion.anchor = fn(scene, node) { mod.motion.Anchor{scene: scene node: node} }
+/** A length in beats: `beats(1/8)`. */
+mod.motion.beats = fn(n) { mod.motion.Beats{n: n} }

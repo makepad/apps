@@ -353,18 +353,13 @@ fn align_arg(session: &mut Session, v: &Value) -> Result<AlignBy, String> {
 
 /// The printed objects `object` names (one, or a list; none: all), each on the plate.
 pub(crate) fn objects_arg(ev: &Evaluated, args: &Value) -> Result<Vec<String>, String> {
-    let objects: Vec<String> = match args.get("object") {
-        Some(Value::Str(o)) => vec![o.clone()],
-        Some(Value::Arr(a)) => a.iter().filter_map(Value::as_str).map(str::to_string).collect(),
-        _ => Vec::new(),
-    };
-    for o in &objects {
-        if !ev.plate.parts.iter().any(|p| &p.object == o) {
-            let names: Vec<&str> = ev.plate.parts.iter().map(|p| p.object.as_str()).collect();
-            return Err(format!("'{o}' is not on the plate (printed objects: {})", names.join(", ")));
-        }
+    let parts = &ev.plate.parts;
+    let resolve = |object: &str| crate::printed_part_index(parts, object).map(|i| parts[i].object.clone());
+    match args.get("object") {
+        Some(Value::Str(o)) => Ok(vec![resolve(o)?]),
+        Some(Value::Arr(a)) => a.iter().filter_map(Value::as_str).map(resolve).collect(),
+        _ => Ok(Vec::new()),
     }
-    Ok(objects)
 }
 
 /// The picture's lens: `fov` (degrees, a photo's) or `ortho` (a drawing's), checked.

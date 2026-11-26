@@ -262,6 +262,7 @@ pub fn edits(c: &Compiled, ev: &Evaluated, action: &PartAction) -> Result<Vec<Ch
             None => vec![Change::PlateSettings { set: Vec::new(), reset: vec![key.clone()] }],
         },
         PartAction::ClearPlateSettings => vec![Change::PlateSettings { set: Vec::new(), reset: ev.plate.settings.iter().map(|(k, _)| k.clone()).collect() }],
+        PartAction::SetArrangeGap(gap) => vec![Change::ArrangeGap(Some(*gap))],
         // Every object back to its slot in the plate's arrangement.
         PartAction::Arrange => {
             let mut out = Vec::new();
@@ -382,6 +383,7 @@ pub fn plate_info(c: Option<&Compiled>, ev: &Evaluated, revision: u64) -> PlateI
     let bed = &ev.machine.bed;
     PlateInfo {
         parts,
+        arrange_gap: ev.arrange_gap,
         settings: ev.plate.settings.clone(),
         nozzles: ev.machine.nozzles.iter().map(|z| z.name.clone()).collect(),
         colors: ev.colors.clone(),
@@ -507,11 +509,12 @@ mod tests {
         assert_eq!(state.field_loop_marks, marks + 1, "an unchanged issue does not invalidate the rows again");
     }
 
-    /// The Part panel's Position is the part's origin (what its `at` places), wherever its box is
-    /// about it: a Position edit puts the origin there; a turn and a scale keep it. A scale by
+    /// The Part panel's default Position is the part's origin. Its footprint fields move it by
+    /// the difference from the selected anchor. A turn and a scale keep the origin. A scale by
     /// axis is one undo step, which takes the part back to its uniform scale of 1.
     #[test]
     fn position_is_the_parts_origin() {
+        use fab::ui::parts::PositionAnchor;
         // The box sits 15 mm off its model origin along X (the plate's X too).
         let (mut model_, mut evaluator, c, ev) = model("let body = m.box({size: [20mm 12mm 20mm] at: [15mm 6mm 0]})\nobject(body)\n");
         let p = &plate_info(Some(&c), &ev, 1).parts[0];
@@ -524,7 +527,11 @@ mod tests {
             std::array::from_fn(|r| d[r][0] * o[0] + d[r][1] * o[1] + d[r][2] * o[2] + d[r][3])
         };
         let to = origin_after(PartAction::Place { object: object.clone(), at: [o[0] + 10.0, o[1] - 4.0], rotate: p.rotate });
-        assert!(near(to, [o[0] + 10.0, o[1] - 4.0, o[2]]), "{to:?}");
+        assert!(near(to, [o[0] + 10.0, o[1] - 4.0, o[2]]), "an origin move must apply both XY deltas: {to:?}");
+        let to = origin_after(PositionAnchor::Centre.place_field(p, 0, p.center()[0] + 7.0));
+        assert!(near(to, [o[0] + 7.0, o[1], o[2]]), "Centre X must move by the footprint delta and preserve Y: {to:?}");
+        let to = origin_after(PositionAnchor::Corner.place_field(p, 1, p.min_mm[1] - 4.0));
+        assert!(near(to, [o[0], o[1] - 4.0, o[2]]), "Corner Y must move by the min-corner delta and preserve X: {to:?}");
         let turned = origin_after(PartAction::Place { object: object.clone(), at: [o[0], o[1]], rotate: 90.0 });
         assert!(near(turned, o), "a turn keeps the Position: {turned:?}");
         // a scale is its `place` scale itself, by axis too

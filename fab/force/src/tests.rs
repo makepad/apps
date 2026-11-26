@@ -521,7 +521,7 @@ fn rays_meet_the_nearest_quad_through_the_buckets() {
 #[test]
 fn the_slicers_patterns_and_filament_types_map_onto_the_model() {
     use crate::material::{filament_of_type, Infill};
-    for name in ["zig-zag", "alignedrectilinear", "line", "zigzag", "crosszag", "lockedzag", "grid", "crosshatch", "2dlattice", "triangles", "tri-hexagon", "cubic", "adaptivecubic", "supportcubic", "gyroid", "honeycomb", "3dhoneycomb", "lightning", "hilbertcurve", "archimedeanchords", "octagramspiral", "concentric"] {
+    for name in ["zig-zag", "alignedrectilinear", "line", "zigzag", "crosszag", "lockedzag", "grid", "crosshatch", "2dlattice", "triangles", "tri-hexagon", "cubic", "adaptivecubic", "supportcubic", "gyroid", "tpmsd", "tpmsfk", "honeycomb", "3dhoneycomb", "lightning", "hilbertcurve", "archimedeanchords", "octagramspiral", "concentric"] {
         assert!(Infill::from_setting(name).is_some(), "{name}");
     }
     assert_eq!(Infill::from_setting("gyroid"), Some(Infill::Gyroid));

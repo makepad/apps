@@ -1,0 +1,11 @@
+use mod.scene.*
+// Crowd facing the stage camera: per-person variants and colours, eyes lit
+// by side (blue left, orange right), everyone hopping on the beat and
+// cheering with the energy, signs up. Render with --music synthetic:120.
+Scene3D{ look: @toon bpm: 120
+  camera: Camera{position: tween(vec3(0, 2.2, -1), vec3(0, 1.4, 1.2), 0, 6, @ease_in_out_cubic) target: vec3(0, 0.9, 6) fov: 45}
+  children: [
+    Crowd{count: 260 shape: @arena radius: 3 arc: 100 tier: 0.1 eyes: #5ab8ff eyes2: #ff7a3a arms: 0.25 signs: 0.15}
+    Spotlights{count: 3 spread: 5 height: 4.5 position: vec3(0, 0, 4.5) react: @beat}
+    Mesh{geometry: PlaneGeometry{width: 60 height: 60} rotation: vec3(-90, 0, 0) material: MeshStandardMaterial{color: #e8d9b8}}
+  ] }

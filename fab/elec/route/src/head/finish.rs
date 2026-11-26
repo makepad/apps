@@ -41,6 +41,7 @@ pub fn finish(
     let started = Instant::now();
     let board = &base.board;
     let mut answer = RouteProposal {
+        pair: None,
         id, source: ProposalSource::Gesture { id: sample.id, seq: sample.seq, tier: Tier::Full },
         unit: base.unit, base_generation: board.generation, base_hash: base.hash,
         ops: hand.ops.clone(), checked: None, metrics: hand.metrics.clone(), verified: hand.verified,

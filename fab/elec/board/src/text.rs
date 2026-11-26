@@ -557,6 +557,10 @@ fn ridden_clear(board: &Board, requested: &HashSet<ItemId>, riding: &[ItemId], n
         .collect()
 }
 
+/// How far from an edited item a part's reference label is looked at again: a few label lengths.
+/// An edit's label pass takes the parts this near what it moved (`arrange_references`' `items`).
+pub const LABEL_NEAR: Nm = 3_000_000;
+
 /// Re-place the reference labels of the placements `items` (board ids), and of every part in a row
 /// with one of them, as `SetField { item, field: Field::Label(FpTextKind::Reference, Some(..)) }` ops
 /// for the labels that move. Other parts, pinned labels, locked placements and template or derived

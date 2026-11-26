@@ -1,0 +1,20 @@
+// A 16:9 desktop master reframed for 9:16 with authored crop keys.
+use mod.flow.*
+use mod.cut.*
+
+let wide = Clip{src: asset("ast_stufm3o7yer634iv7s5tliljom", "arev_77b67e882ccb22ad58b4377ee0ec21efa7bdca35e9dd558aa40f02dec9ea157f") span: [0.0, 4.0] fit: @fill}
+let tall = Reframe{
+    input: wide.out(@frame)
+    mode: @keys
+    crop: keys([0.0, [0.0, 0.0, 1080.0, 1920.0]], [2.0, [1000.0, 100.0, 1080.0, 1920.0]], [3.0, [2000.0, 200.0, 1080.0, 1920.0], @hold])
+    safe: @reels
+}
+let out = CutOutput{frame: tall.out(@frame)}
+
+Flow{
+    kind: @cut
+    label: "Reframed"
+    output: {width: 1080 height: 1920 fps: 30}
+    duration: 4.0
+    wide, tall, out
+}

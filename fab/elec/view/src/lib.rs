@@ -3,6 +3,7 @@
 //! schematic, board, 3D, instruments). Views never touch source text.
 
 pub mod board;
+pub mod bom;
 pub mod canvas;
 pub mod explorer;
 pub mod firmware;
@@ -12,12 +13,13 @@ pub mod instruments;
 pub mod library;
 pub mod live;
 pub mod proof;
+pub mod req_list;
 pub mod snapshot;
 pub mod states;
 pub mod trace;
 
 pub use snapshot::{DesignSnapshot, DocText, DocsView, JobEnd, Refusal, RouteJobState, StageFlags, StateOf, Tagged, ViewAction};
-pub use snapshot::{ElecLive, ElecPanel};
+pub use snapshot::{CaseHeld, ElecLive, ElecPanel, ReqShown};
 pub use states::{board_rows, board_texels, part_rows, sheet_rows, sheet_texels, with_flash, ItemStates, SheetIndex, StatesOf, ViewState};
 
 #[cfg(test)]

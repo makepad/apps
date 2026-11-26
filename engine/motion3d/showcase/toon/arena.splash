@@ -1,0 +1,18 @@
+use mod.scene.*
+// Toon arena: a one-point-perspective stage in a cartoon look (flat bands,
+// ink outlines, paper and halftone), an instanced crowd bouncing on the
+// beat with cheers on the energy, spotlight cones slamming on each hit,
+// and a camera pushing in then craning up. Render with --music synthetic:120.
+Scene3D{ look: @toon bpm: 120
+  camera: Camera{position: tween(vec3(0, 2.6, 13), vec3(0, 5.2, 8.6), beat(0), beat(12), @ease_in_out_cubic) target: tween(vec3(0, 1.4, -1), vec3(0, 0.8, -1.5), beat(0), beat(12), @ease_in_out_cubic) fov: 42}
+  children: [
+    // The stage and its back wall: a one-point perspective box.
+    Mesh{geometry: BoxGeometry{width: 6 height: 0.6 depth: 3} position: vec3(0, 0.3, -2) material: MeshStandardMaterial{color: #d94f30}}
+    Mesh{geometry: BoxGeometry{width: 9 height: 5 depth: 0.3} position: vec3(0, 2.5, -3.8) material: MeshStandardMaterial{color: #2e3a6a}}
+    Mesh{geometry: TorusGeometry{radius: 1.2 tube: 0.12} position: vec3(0, 2.8, -3.5) material: MeshStandardMaterial{color: #f2c14e}}
+    Mesh{geometry: CylinderGeometry{radius: 0.35 height: 1.6} position: vec3(-2.2, 1.4, -2) material: MeshStandardMaterial{color: #f2f0ea}}
+    Mesh{geometry: CylinderGeometry{radius: 0.35 height: 1.6} position: vec3(2.2, 1.4, -2) material: MeshStandardMaterial{color: #f2f0ea}}
+    Spotlights{count: 4 spread: 6 height: 5 position: vec3(0, 0, -2) color: #fff2c0 color2: #ffd0e8}
+    Crowd{count: 180 shape: @arena radius: 2.6 arc: 110 tier: 0.08 position: vec3(0, 0, 0.5) color: #3a3f66 color2: #4a5288}
+    Mesh{geometry: PlaneGeometry{width: 40 height: 40} rotation: vec3(-90, 0, 0) material: MeshStandardMaterial{color: #e8d9b8}}
+  ] }

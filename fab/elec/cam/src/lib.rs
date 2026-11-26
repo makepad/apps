@@ -35,6 +35,7 @@ pub mod package;
 pub mod placement_export;
 pub mod plot;
 pub mod profile;
+pub mod profile_doc;
 pub mod tables;
 pub mod text;
 pub mod validate;

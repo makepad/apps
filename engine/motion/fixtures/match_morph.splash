@@ -1,0 +1,10 @@
+use mod.motion.*
+// A rewrite: the words of one line fly to their places in the next (same word, n-th with n-th),
+// the new ones fade in, the dropped ones fade out. Below, the same idea on a typeset formula,
+// pieces matched by their \id names. Last, the Fourier series growing a term (S_3 into S_4), centred: the
+// existing terms keep their names and slide apart, the new term fades in.
+Motion{size: vec2(1280, 720) duration: 4.0 background: #101418 layers: [
+    MatchMorph{steps: ["a² + b² = c²", "c² = a² + b²"] times: [0.5] by: @word size: 96 colors: [#f0ebe0, #ff9a3c] at: vec2(220, 150) duration: 1.8}
+    MatchMorph{math: true steps: ["\\id{p}{a^2} + \\id{q}{b^2} = \\id{r}{c^2}", "\\id{r}{c^2} = \\id{p}{a^2} + \\id{q}{b^2} + 2ab"] times: [1.0] by: @id size: 88 color: #f0ebe0 at: vec2(220, 420) duration: 1.8}
+    MatchMorph{math: true steps: ["S_3(x) = \\frac{4}{\\pi}\\left[\\id{a}{\\sin x} + \\id{b}{\\frac{\\sin 3x}{3}} + \\id{c}{\\frac{\\sin 5x}{5}}\\right]", "S_4(x) = \\frac{4}{\\pi}\\left[\\id{a}{\\sin x} + \\id{b}{\\frac{\\sin 3x}{3}} + \\id{c}{\\frac{\\sin 5x}{5}} + \\id{d}{\\frac{\\sin 7x}{7}}\\right]"] times: [1.5] by: @id size: 40 color: #f0ebe0 align: @center at: vec2(640, 610) duration: 1.8}
+]}

@@ -1,0 +1,80 @@
+use mod.motion.*
+
+// A local 27B model on a Linux node wrote these three Motion documents on 2026-10-12.
+// For each document it received a one-sentence brief and the relevant section of the
+// Motion guide. The layers, helper functions, size, duration and background are
+// exactly the model's. We wrapped the documents in this module for the deck's panels.
+// Docs: qwen-ranges1, qwen-bones1, qwen-feather2.
+
+// ---- "Ideas travel fast" (text ranges) ----
+let ranges = {
+    brief: "A 4 second title card: \"Ideas travel fast\" in a bold variable font, centred. A highlight sweeps across it letter by letter over 3 seconds: the letters turn orange, rise 20 units and grow slightly."
+    size: vec2(1920, 1080) duration: 4.0 background: #0e1117
+    layers: [
+        Text{
+            name: "title"
+            text: "Ideas travel fast"
+            font: Font{family: "Inter" weight: 800}
+            size: 128
+            color: #f0f2f5
+            align: @center
+            at: vec2(960, 540)
+            by: @letter
+            range: Range{
+                to: 0.3
+                slide: tween(-0.4, 1.0, 0, 3, @ease_in_out)
+                soft: 0.15
+                color: #ff7b00
+                y: -20
+                scale: 1.08
+            }
+        }
+    ]
+}
+
+// ---- "Tentacle and Arm" (bones, IK) ----
+let ball_doc = fn(t) { vec2(950 + 100*cos(t*2.0), 350 + 70*sin(t*2.0)) }
+let ball_local = fn(t) { ball_doc(t) - vec2(700, 450) }
+let bones = {
+    brief: "A 3 second document: a green tentacle-like tapered shape of three bones that bends smoothly as its bones rotate, plus a two-bone orange arm whose tip reaches for a small white ball moving in a circle-ish path."
+    size: vec2(1280, 720) duration: 3.0 background: #1a1a2e
+    layers: [
+        // Green tentacle
+        Bones{name: "tentacle" at: vec2(150, 400)
+            bones: [Bone{name: "seg1" length: 100 rotate: keys([0, -8], [1.5, 18], [3, -8])}
+                    Bone{name: "seg2" length: 80 rotate: keys([0, -18], [1.5, 28], [3, -18])}
+                    Bone{name: "seg3" length: 60 rotate: keys([0, -28], [1.5, 40], [3, -28])}]
+            layers: [Path{name: "tentacle_body"
+                          svg: "M 0 -16 C 60 -20, 140 -10, 240 0 C 140 10, 60 20, 0 16 Z"
+                          fill: #2ecc71}]}
+
+        // Orange arm
+        Bones{name: "arm" at: vec2(700, 450)
+            bones: [Bone{name: "upper" length: 120}
+                    Bone{name: "lower" length: 100}]
+            ik: [IK{end: "lower" target: ball_local bend: @ccw mix: 1}]
+            layers: [Path{name: "arm_body"
+                          svg: "M 0 -10 L 220 -4 L 220 4 L 0 10 Z"
+                          fill: #e67e22}]}
+
+        // White ball
+        Ellipse{name: "ball" size: vec2(24, 24) fill: #ffffff
+                at: vec2(950, 350)
+                x: fn(t) { 100*cos(t*2.0) }
+                y: fn(t) { 70*sin(t*2.0) }}
+    ]
+}
+
+// ---- "Cyan Star Glow" (feather @outer) ----
+let glow = {
+    brief: "A 2 second document: a five-pointed star filled cyan in the centre that keeps a crisp edge but has a glowing halo around it, and the halo grows from nothing to large."
+    size: vec2(1280, 720) duration: 2.0 background: #0a0e14
+    layers: [
+        Path{name: "star" svg: "M0,-120 L28,-39 L114,-37 L46,15 L71,97 L0,48 L-71,97 L-46,15 L-114,-37 L-28,-39 Z"
+             fill: #00e5ff at: vec2(526, 240)
+             feather: tween(0, 250, 0, 2.0, @ease_out_cubic)
+             feather_side: @outer}
+    ]
+}
+
+{ranges: ranges bones: bones glow: glow}

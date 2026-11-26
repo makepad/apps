@@ -994,7 +994,7 @@ mod env_tests {
         p.base_image = Some(BaseImageParams { key: "sunny".to_string(), ..BaseImageParams::default() });
         let hot = Env::new_with(&p, &images).hot_spots();
         assert_eq!(hot.len(), 1, "the photograph's sun alone: {hot:?}");
-        assert!(hot[0].0.dot(sun) > 0.9999, "{hot:?}");
+        assert!(hot[0].dir.dot(sun) > 0.9999, "{hot:?}");
         // Cut from the map, it is not drawn: nothing to refine.
         p.base_image.as_mut().unwrap().remove_sun = true;
         assert!(Env::new_with(&p, &images).hot_spots().is_empty());

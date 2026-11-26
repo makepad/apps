@@ -21,6 +21,8 @@
 //!   of every solid (`crate::paint`).
 //! - `m.fixed`, `m.force`, `m.pressure`, `m.torque`: the force study, where the part is held
 //!   and loaded, kept out of every solid (`crate::study`).
+//! - `m.expect(name, solid, {x y z volume_mm3 count wall})`: a number the person gave, judged on
+//!   every build (`crate::expect`).
 //!
 //! A script is a dynamic mesh file: the project places it (an **instance**, with its own
 //! parameter values) and each object it emits gets its own placement. Each instance is
@@ -113,6 +115,8 @@ pub fn paint_files(source: &str) -> Vec<String> {
 /// libraries' own calls name, for the compile key.
 #[derive(Clone, Default)]
 pub struct ScriptEnv {
+    /// Inherited by this compiled script on parameter previews and generated-part passes.
+    pub(crate) imports: Arc<[String]>,
     pub libraries: Arc<Vec<lang::Library>>,
     pub inputs: Arc<lang::Inputs>,
     pub generators: BTreeMap<String, Generator>,
@@ -125,7 +129,7 @@ pub struct ScriptEnv {
 impl ScriptEnv {
     /// O(1): the libraries and inputs as given.
     pub fn new(libraries: Vec<lang::Library>, inputs: lang::Inputs) -> ScriptEnv {
-        ScriptEnv { libraries: Arc::new(libraries), inputs: Arc::new(inputs), library_reads: Arc::default(), generators: BTreeMap::new() }
+        ScriptEnv { libraries: Arc::new(libraries), inputs: Arc::new(inputs), imports: Arc::default(), library_reads: Arc::default(), generators: BTreeMap::new() }
     }
 
     pub fn with_generator(mut self, kind: impl Into<String>, generator: Generator) -> Self {
@@ -154,13 +158,13 @@ impl ScriptEnv {
 
     /// The same env, not a copy of equal content: one `set_env` made both (O(1)).
     pub fn same(&self, other: &ScriptEnv) -> bool {
-        Arc::ptr_eq(&self.libraries, &other.libraries) && Arc::ptr_eq(&self.inputs, &other.inputs)
+        Arc::ptr_eq(&self.libraries, &other.libraries) && Arc::ptr_eq(&self.inputs, &other.inputs) && Arc::ptr_eq(&self.imports, &other.imports)
     }
 }
 
 impl std::fmt::Debug for ScriptEnv {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ScriptEnv").field("libraries", &self.libraries).field("inputs", &self.inputs).field("generators", &self.generators.keys().collect::<Vec<_>>()).finish()
+        f.debug_struct("ScriptEnv").field("libraries", &self.libraries).field("inputs", &self.inputs).field("imports", &self.imports).field("generators", &self.generators.keys().collect::<Vec<_>>()).finish()
     }
 }
 
@@ -205,6 +209,8 @@ pub const ROOTS: &[RootFn] = &[
     RootFn { name: "force", args: &["region", "newtons"], model: true },
     RootFn { name: "pressure", args: &["region", "mpa"], model: true },
     RootFn { name: "torque", args: &["region", "nmm"], model: true },
+    // The person's numbers: a solid's size, volume, count or wall, judged on every build (`crate::expect`).
+    RootFn { name: "expect", args: &["name", "solid", "want"], model: true },
 ];
 
 /// The statements that mark a solid as an area of the plate rather than something printed: the
@@ -372,6 +378,8 @@ pub struct Script {
     pub paint_files: Arc<HashMap<String, String>>,
     /// Each emitted object's force study (`crate::study`), by object name; none without one.
     pub study: HashMap<String, Arc<crate::study::Study>>,
+    /// The person's checks in the order the script makes them.
+    pub expects: Vec<crate::expect::Expect>,
     /// The fields its graded and grown parts were compiled with (a recompile with moved values uses
     /// the same); a part without one asks in `program.stress_requests` or `program.grow_requests`.
     pub solved: Solved,
@@ -440,11 +448,17 @@ pub fn color_srgb(rgb: [f32; 3]) -> u32 {
 /// `files` reads the project's other files (the paint files a script names).
 pub fn compile_with(file: &str, source: &str, names: Option<Arc<lang::names::Names>>, assets: &Arc<Assets>, facets: &Arc<FacetAssets>, pictures: &Arc<crate::picture::Pictures>, context: &CompileContext, env: &ScriptEnv, overrides: HashMap<(u32, u32), f64>, solved: &Solved, skip: &[String], files: &dyn Fn(&str) -> Option<String>) -> Result<Script, Vec<Diag>> {
     compile_generated(file, source, names, assets, facets, pictures, context, env, overrides, solved, skip, &HashMap::new(), files)
+        .map_err(lang::EvalError::diagnostics)
 }
 
-pub(crate) fn compile_generated(file: &str, source: &str, names: Option<Arc<lang::names::Names>>, assets: &Arc<Assets>, facets: &Arc<FacetAssets>, pictures: &Arc<crate::picture::Pictures>, context: &CompileContext, env: &ScriptEnv, overrides: HashMap<(u32, u32), f64>, solved: &Solved, skip: &[String], generated: &HashMap<String, GenPart>, files: &dyn Fn(&str) -> Option<String>) -> Result<Script, Vec<Diag>> {
+pub(crate) fn compile_generated(file: &str, source: &str, names: Option<Arc<lang::names::Names>>, assets: &Arc<Assets>, facets: &Arc<FacetAssets>, pictures: &Arc<crate::picture::Pictures>, context: &CompileContext, env: &ScriptEnv, overrides: HashMap<(u32, u32), f64>, solved: &Solved, skip: &[String], generated: &HashMap<String, GenPart>, files: &dyn Fn(&str) -> Option<String>) -> Result<Script, lang::EvalError> {
+    compile_document(file, source, names, assets, facets, pictures, context, env.clone(), overrides, solved, skip, generated, files)
+}
+
+pub(crate) fn compile_document(file: &str, source: &str, names: Option<Arc<lang::names::Names>>, assets: &Arc<Assets>, facets: &Arc<FacetAssets>, pictures: &Arc<crate::picture::Pictures>, context: &CompileContext, env: ScriptEnv, overrides: HashMap<(u32, u32), f64>, solved: &Solved, skip: &[String], generated: &HashMap<String, GenPart>, files: &dyn Fn(&str) -> Option<String>) -> Result<Script, lang::EvalError> {
     let images = crate::picture::sizes(pictures);
-    let program = lang::evaluate_skipping(source, &Options { assets, images: &images, extension: "fab", libraries: &env.libraries, inputs: &env.inputs, unit: UNIT, roots: ROOTS, overrides: overrides.clone(), weave: Some(context.weave), solved: solved.clone(), generated }, names, skip)?;
+    let opts = Options { assets, images: &images, extension: "fab", libraries: &env.libraries, inputs: &env.inputs, unit: UNIT, roots: ROOTS, overrides: overrides.clone(), weave: Some(context.weave), solved: solved.clone(), generated };
+    let program = opts.evaluate_with_imports(source, &env.imports, names, skip)?;
     // Jointed solids: one assembly per connected set.
     let n = program.solids.len();
     let mut set: Vec<usize> = (0..n).collect();
@@ -593,7 +607,7 @@ pub(crate) fn compile_generated(file: &str, source: &str, names: Option<Arc<lang
         }
     }
     if !errors.is_empty() {
-        return Err(errors);
+        return Err(lang::EvalError::Document(errors));
     }
     let read = std::cell::RefCell::new(HashMap::new());
     let reading = |f: &str| {
@@ -606,7 +620,8 @@ pub(crate) fn compile_generated(file: &str, source: &str, names: Option<Arc<lang
     let paint = crate::paint::compile(&program, &objects, assets, facets, pictures, &reading)?;
     let paint_files = Arc::new(read.into_inner());
     let study = crate::study::compile(&program, &objects)?;
-    Ok(Script { file: file.to_string(), program, assets: assets.clone(), facets: facets.clone(), pictures: pictures.clone(), context: *context, env: env.clone(), objects, panel, paint, paint_files, study, solved: solved.clone(), overrides, skip: skip.to_vec(), generated: generated.clone(), generated_key: [0; 32] })
+    let expects = crate::expect::compile(&program)?;
+    Ok(Script { file: file.to_string(), program, assets: assets.clone(), facets: facets.clone(), pictures: pictures.clone(), context: *context, env, objects, panel, paint, paint_files, study, expects, solved: solved.clone(), overrides, skip: skip.to_vec(), generated: generated.clone(), generated_key: [0; 32] })
 }
 
 pub fn compile(file: &str, source: &str, assets: &Arc<Assets>, facets: &Arc<FacetAssets>, pictures: &Arc<crate::picture::Pictures>, context: &CompileContext, files: &dyn Fn(&str) -> Option<String>) -> Result<Script, Vec<Diag>> {

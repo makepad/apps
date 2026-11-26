@@ -24,6 +24,13 @@
 //! Cost of a drag: O(the item's size) at its start (logged), O(the moving rat lines) per grid step,
 //! O(1) per pointer move otherwise.
 //!
+//! A running place job marks existing parts at their proposed poses in pane-state z.
+//! `PlacePreview::sync` keys the marks and the retained displacement hairlines to the proposal
+//! and drawn board Arcs. A new pair scans the ops, sorts the pose-op ids and looks up each
+//! distinct placement on both boards. Slot 4 merges the sorted marks with its ordinary rows.
+//! Between proposals the CPU submits at most one retained stroke list with camera uniforms.
+//! Idle panes need no placement texture, uploads, line submissions or animation frames.
+//!
 //! Keys act on what is under the pointer (`plan`), each one undo step committed at the press:
 //! Delete or Backspace deletes the hovered item (a part goes back to the tray) and the picture
 //! fades it out where it stood; F pours the net of the copper under the pointer (else the
@@ -43,11 +50,12 @@
 //! their alpha).
 
 pub mod flags;
+mod settings_panel;
 
 use super::batch::Templates;
 use super::checks::{check_marks, wave_may_clear, CheckMark};
 use super::held::{HeldDraw, HeldLook, HeldVars, PENDING_MIX};
-use super::rats::RatsDraw;
+use super::rats::{self, RatsDraw};
 use super::focus::{focus_box, focus_camera, Glide};
 use super::draw::{
     DrawBoardGlow, DrawBoardLayer, DrawBoardPad, DrawBoardPadMax, DrawBoardStroke, DrawBoardStrokeMax, DrawBoardTri, DrawBoardTriMax,
@@ -55,16 +63,16 @@ use super::draw::{
 use super::inst::{PadTemplate, StrokeTemplate, TriTemplate};
 use super::lists::{BoardTextures, BoardUniforms, StreamList};
 use super::heatkey::HeatKey;
-use super::routeline::{cut_words, left_open, pushed, selected_unrouted, still_open, unpushed_words, why_open, LeftOpen, LineButton, LineKey, RouteLine};
-use super::tools::{apply_strip, method_anchor, method_name, strip_presses, Armed, BoardStripAction, BoardTool, StripPress, StripShow, METHODS, STRIP_PARTS};
+use super::routeline::{cut_words, left_open, pushed, selected_unrouted, still_open, unpushed_words, why_open, HandLine, LeftOpen, LineButton, LineKey, RouteLine};
+use super::tools::{apply_strip, flyout_anchor, method_name, strip_presses, Armed, BoardStripAction, BoardTool, PartEdit, StripPress, StripShow, Tidying, ARRANGEMENTS, METHODS, STRIP_PARTS};
 use crate::canvas::tools::{draw_bar, draw_strip, over_strip, ToolClicks, STRIP_INSET, STRIP_TOP};
 use super::marks::MarkOverlay;
 use crate::live::flags::ProbeFlags;
-use super::nodes::{probe_names, BoardItems};
+use super::nodes::{probe_names, BoardItems, PressItems};
 use super::plan;
 use super::rail::RailLayer;
 use super::scene::DrawScene;
-use super::gesture::{classify, pour_cut, snap_target, track_widths, Press, Routing};
+use super::gesture::{classify, pour_cut, snap_target, track_widths, tune_hit, Press, Routing};
 use super::shared::{BoardDraw, BoardDraws, BoardGeom};
 use super::status::{BarPress, BoardStatus, BAR_PARTS};
 use super::theme::BoardTheme;
@@ -76,15 +84,15 @@ use crate::canvas::{pane::{SavedView2d, ViewOnArrival, BOARD_MAX_PPU, HIT_RADIUS
 use crate::live::probe::{carries_probe, host_bench, probe_key, probe_on_click, probe_target, ProbeGesture};
 use crate::snapshot::{next_tag, DesignSnapshot, ElecLive, RouteJobState, StateOf, ViewAction};
 use crate::{ItemStates, StatesOf};
-use fab_elec_board::{Anchor, Board, BoardOp, ConnItem, Connectivity, Field, Item, ItemKind};
+use fab_elec_board::{Anchor, Board, BoardOp, ConnItem, Connectivity, Field, Item, ItemKind, Placed};
 use fab_elec_circuit::Violation;
-use fab_elec_core::{to_mm, Angle, BoardId, CompId, FeatureRef, ItemId, LayerId, NetId, Nm, Sel, Side, P};
+use fab_elec_core::{to_mm, Angle, BBox, BlockId, BoardId, CompId, FeatureRef, ItemId, LayerId, NetId, Nm, Sel, Side, P};
 use fab_elec_design::{BenchOp, Design, DesignOp, Focus, FocusKind, FocusOrigin, PartRef, Place, ProbeOf};
-use fab_elec_route::{GestureKind, JobPhase, Method, Mode, Posture, ProposalSource, Reason, RouteProposal, Tier};
+use fab_elec_route::{GestureKind, JobId, JobPhase, Method, Mode, Posture, ProposalSource, Reason, RouteProposal, Tier};
 use fab_elec_sim::heat::HeatField;
 use makepad_widgets_core::{makepad_platform::a11y_tree, SemanticLookup, *};
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::collections::{HashSet, VecDeque};
+use std::sync::{Arc, Weak};
 
 script_mod! {
     use mod.prelude.widgets_internal.*
@@ -111,18 +119,28 @@ script_mod! {
         route_line: mod.widgets.BoardRouteLine{}
         // The tool strip (`tools`): the host gives it its look; none here, only the keys.
         tools: View{width: Fit height: Fit visible: false}
+        settings: View{visible: false}
         status: View{visible: false}
         draw_line: mod.draw.DrawCanvasLine{}
         draw_box: mod.draw.DrawCanvasBox{}
+        draw_polygon: mod.draw.DrawVector{}
         // The Measure ruler (`seg` from its start to its end), the Zone rectangle being dragged
-        // (`zone` 1, `seg` its corners) or drawn copper's rubber line while its answer is late
-        // (`zone` 2), in the pane's local points: one quad over the pane.
+        // (`zone` 1, `seg` its corners), drawn copper's rubber line (`zone` 2), or the Select
+        // marquee (3 for a window, 4 for a crossing), in the pane's local points.
         draw_ruler: mod.draw.DrawQuad{
             seg: uniform(vec4(0.0))
             ink: uniform(vec4(1.0))
             zone: uniform(0.0)
             pixel: fn() {
-                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                let p = self.pos * self.rect_size
+                let sdf = Sdf2d.viewport(p)
+                if self.zone > 2.5 {
+                    sdf.rect(self.seg.x, self.seg.y, max(1.0, self.seg.z - self.seg.x), max(1.0, self.seg.w - self.seg.y))
+                    sdf.fill_keep(vec4(self.ink.xyz, 0.08))
+                    let dash = if self.zone > 3.5 {step(2.5, mod(p.x + p.y, 7.0))} else {1.0}
+                    sdf.stroke(vec4(self.ink.rgb, self.ink.a * dash), 1.0)
+                    return sdf.result
+                }
                 if self.zone > 1.5 {
                     sdf.move_to(self.seg.x, self.seg.y)
                     sdf.line_to(self.seg.z, self.seg.w)
@@ -203,6 +221,56 @@ fn mean(v: &[f64]) -> f64 {
     }
 }
 
+/// The request tag returns the catalog outcome to the pane that issued it.
+#[derive(Clone, Debug)]
+pub struct StitchPress {
+    pub tag: u64,
+    pub args: Vec<(String, String)>,
+}
+
+impl StitchPress {
+    pub const ACTION: &'static str = "elec.zone.stitch";
+}
+
+#[derive(Clone, Debug)]
+pub struct BoardEditPress {
+    pub tag: u64,
+    pub action: &'static str,
+    pub args: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BoardEditDone {
+    pub tag: u64,
+    pub refusal: Option<String>,
+}
+
+/// A catalog action started or finished waiting for this board's committed pours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FillWaitNotice {
+    pub unit: BoardId,
+    pub action: &'static str,
+    pub label: &'static str,
+    pub waiting: bool,
+}
+
+struct PendingStitch {
+    tag: u64,
+    unit: BoardId,
+    net: String,
+    anchor: ChipAnchor,
+    layer: ChipLayer,
+    live: CanvasLive,
+}
+
+impl PendingStitch {
+    fn status(&mut self, cx: &Cx, waiting: bool) {
+        let text = if waiting { format!("waiting for the {} pour to refill", self.net) } else { format!("Stitching {}…", self.net) };
+        self.layer.set(vec![Chip { id: 0, kind: ChipKind::Info, text, anchor: self.anchor, align: [0.0, 0.5] }],
+            cx.seconds_since_app_start());
+    }
+}
+
 /// The Board pane widget (module docs).
 #[derive(Script, ScriptHook, Widget)]
 pub struct BoardPane {
@@ -252,6 +320,9 @@ pub struct BoardPane {
     #[find]
     #[live]
     status: WidgetRef,
+    #[find]
+    #[live]
+    settings: WidgetRef,
     /// The theme's panel ground: a light one gives the light board look (unless `set_light`).
     #[live]
     ground: Vec4f,
@@ -265,6 +336,8 @@ pub struct BoardPane {
     draw_box: DrawCanvasBox,
     #[live]
     draw_ruler: DrawQuad,
+    #[live]
+    draw_polygon: DrawVector,
     #[live]
     draw_text: DrawText,
     #[rust]
@@ -321,6 +394,8 @@ struct Route {
     blocked: Option<String>,
     /// The track a dragged segment could not push and walks round instead, as its chip says it.
     walked: Option<String>,
+    /// Reports for preview pictures still on screen or being built on the drawing worker.
+    readout: RouteReadout,
     /// Why the host refused the gesture's newest sample, until an answer follows (the chip says it,
     /// so a drag the router does not answer is never silent), and that refusal's `seq`.
     refused: Option<String>,
@@ -334,6 +409,88 @@ struct Route {
     cut_seen: Option<Arc<Connectivity>>,
     /// The text of the chip the gesture shows.
     chip: Option<String>,
+}
+
+struct ReadoutLabel {
+    board: Weak<Board>,
+    id: fab_elec_route::ProposalId,
+    conn: Option<Weak<Connectivity>>,
+    text: String,
+}
+
+#[derive(Default)]
+struct RouteReadout {
+    labels: Vec<ReadoutLabel>,
+}
+
+impl RouteReadout {
+    fn cache(&mut self, board: &Arc<Board>, id: fab_elec_route::ProposalId, conn: Option<&Arc<Connectivity>>, text: impl FnOnce() -> String) -> bool {
+        if self.labels.last().is_some_and(|old| old.id == id && old.board.as_ptr() == Arc::as_ptr(board)
+            && old.conn.as_ref().map(Weak::as_ptr) == conn.map(Arc::as_ptr)) {
+            return false;
+        }
+        self.labels.retain(|old| old.board.strong_count() != 0 && old.board.as_ptr() != Arc::as_ptr(board));
+        self.labels.push(ReadoutLabel { board: Arc::downgrade(board), id, conn: conn.map(Arc::downgrade), text: text() });
+        true
+    }
+
+    fn remember(&mut self, board: &Arc<Board>, id: fab_elec_route::ProposalId, report: &fab_elec_route::meander::Report) -> bool {
+        self.cache(board, id, None, || tune_text(report))
+    }
+
+    fn remember_pair(&mut self, snap: &DesignSnapshot, net: NetId, mate: NetId) -> bool {
+        let Some(p) = &snap.proposal else { return false };
+        let Some(report) = &p.pair else { return false };
+        let Some(board) = snap.preview.as_ref().and_then(|d| d.unit(p.unit)).and_then(|u| u.board.as_ref()) else { return false };
+        // A board-first load can publish the preview while still holding the committed
+        // connectivity. Only a preview result for this board can qualify either leg.
+        let conn = if snap.checking(p.unit) { None } else {
+            snap.conn.iter().find(|c| c.of == StateOf::Preview && c.unit == Some(p.unit)
+                && c.generation == board.generation).map(|c| &c.value)
+        };
+        self.cache(board, p.id, conn, || {
+            use fab_elec_board::length::{difference_text, net_lengths, Measurement};
+            let pair = board.pairs.iter().find(|p| (p.p == net && p.n == mate) || (p.p == mate && p.n == net));
+            let Some(pair) = pair else { return "the pair declaration has changed".to_string() };
+            let nets = [pair.p, pair.n];
+            let lengths = conn.map(|c| net_lengths(board, c, &nets));
+            let leg = |name: &str, net, nm: i64| {
+                let mut text = format!("{name} {:.3} mm", nm as f64 / 1e6);
+                if let Some(length) = lengths.as_ref().and_then(|l| l.get(&net)) {
+                    if length.partial { text.push_str(" (partial)"); }
+                    if length.measurement == Measurement::NoStackup { text.push_str(" (vias not counted: no stackup)"); }
+                }
+                text
+            };
+            let mut text = format!("{}   {}", leg("P", pair.p, report.p_length), leg("N", pair.n, report.n_length));
+            let tol = board.length_matches.iter().filter(|m| matches!(m.nets.as_slice(), [a, b] if [*a, *b] == nets || [*b, *a] == nets)).map(|m| m.tol).min();
+            if let Some(tol) = tol {
+                let (skew, allowed) = difference_text(report.skew, tol);
+                text.push_str(&format!("\nskew {skew}   tolerance {allowed}"));
+            } else {
+                text.push_str(&format!("\nskew {:.3} mm", report.skew as f64 / 1e6));
+            }
+            if conn.is_none() { text.push_str("   checking connectivity"); }
+            if let Some(block) = &report.blocked {
+                let leg = if block.leg == pair.p { "P" } else { "N" };
+                text.push_str(&format!("\n{leg} blocked at ({:.3}, {:.3}) mm by {}\nneeds {:.3} mm",
+                    to_mm(block.at.x), to_mm(block.at.y), block.source.reason(), block.need as f64 / 1e6));
+            }
+            text
+        })
+    }
+
+    fn shown(&self, board: &Arc<Board>) -> Option<&str> {
+        self.labels.iter().rev().find(|label| label.board.as_ptr() == Arc::as_ptr(board)).map(|label| label.text.as_str())
+    }
+}
+
+fn tune_text(report: &fab_elec_route::meander::Report) -> String {
+    let mm = |nm: i64| nm as f64 / 1e6;
+    let mut text = format!("reached {:.3} of {:.3} mm, {:.3} mm short", mm(report.reached), mm(report.target), mm(report.short_by));
+    if report.partial { text.push_str(" (partial)"); }
+    if report.no_stackup { text.push_str(" (vias not counted: no stackup)"); }
+    text
 }
 
 impl Route {
@@ -507,11 +664,135 @@ fn heat_texels(field: &HeatField, current: Option<u64>) -> Option<Vec<u8>> {
     }).collect())
 }
 
+/// Resolve a selection once when it or the geometry changes. Component selections from
+/// other panes can name an unplaced part; keep its id so the key can explain the refusal.
+fn part_target<'a>(board: &'a Board, sel: &Sel) -> Option<(CompId, Option<&'a Placed>)> {
+    if sel.unit() != Some(board.unit) { return None; }
+    let comp = match sel {
+        Sel::Item(_, item) => {
+            let p = board.placed_item(*item)?;
+            return Some((p.comp, Some(p)));
+        }
+        Sel::Comp(c) | Sel::Feature(FeatureRef::Part(c) | FeatureRef::Body(c) | FeatureRef::Pad(c, _) | FeatureRef::Port(c, _)) => c.comp,
+        Sel::Pin(p) => p.comp,
+        _ => return None,
+    };
+    Some((comp, board.placed_of(comp)))
+}
+
+#[derive(Default)]
+struct PartSelection {
+    ids: Vec<CompId>,
+    items: Vec<ItemId>,
+    transform: bool,
+    arrange: bool,
+}
+
+impl PartSelection {
+    fn new(board: &Board, selected: &[Sel]) -> Self {
+        let mut parts = Self::default();
+        let mut seen = HashSet::new();
+        let mut editable = true;
+        let mut first_box = None;
+        for (comp, placed) in selected.iter().filter_map(|s| part_target(board, s)) {
+            if !seen.insert(comp) { continue; }
+            parts.ids.push(comp);
+            if let Some(p) = placed {
+                parts.items.push(p.id);
+                editable &= plan::part_refusal(p).is_none();
+                if selected.len() >= 2 && !parts.arrange {
+                    let bounds = plan::courtyard_box(p);
+                    parts.arrange = *first_box.get_or_insert(bounds) != bounds;
+                }
+            } else {
+                editable = false;
+            }
+        }
+        parts.transform = editable && !parts.ids.is_empty();
+        parts.arrange &= editable;
+        parts
+    }
+}
+
+/// The overlay on the drawn board. Weak keys keep pointer identity without owning an old board.
+struct PlacePreview {
+    job: JobId,
+    proposal: Weak<RouteProposal>,
+    board: Weak<Board>,
+    moved: Vec<ItemId>,
+    lines: Option<StreamList>,
+}
+
+impl PlacePreview {
+    /// Returns whether the pane needs to rewrite its rows. A newer snapshot can arrive before
+    /// its picture. Keep the old picture's overlay while that same job still owns the preview.
+    fn sync(slot: &mut Option<Self>, drawn: &Arc<Board>, source: Option<(JobId, &Arc<RouteProposal>, &DesignSnapshot)>,
+        stroke: impl FnOnce() -> Option<StrokeTemplate>) -> bool {
+        let Some((job, p, snap)) = source else {
+            return slot.take().is_some_and(|old| !old.moved.is_empty());
+        };
+        let same_board = p.unit == drawn.unit && slot.as_ref().is_some_and(|old| old.board.as_ptr() == Arc::as_ptr(drawn) && old.job == job);
+        if same_board && slot.as_ref().is_some_and(|old| old.proposal.as_ptr() == Arc::as_ptr(p)) {
+            return false;
+        }
+        let preview = snap.preview.as_ref().and_then(|d| d.unit(p.unit)?.board.as_ref());
+        let old = slot.get_or_insert_with(|| Self {
+            job, proposal: Weak::new(), board: Weak::new(), moved: Vec::new(), lines: None,
+        });
+        let mut moved = Vec::new();
+        let mut lines = None;
+        if let Some(base) = preview.filter(|b| Arc::ptr_eq(b, drawn))
+            .and_then(|_| snap.design.unit(p.unit)?.board.as_deref())
+        {
+            let Some(t) = stroke() else { return false };
+            (moved, lines) = Self::moves(base, drawn, &p.ops, &t);
+        } else if same_board && preview.is_some() {
+            old.proposal = Arc::downgrade(p);
+            return false;
+        }
+        let changed = old.moved != moved;
+        *old = Self { job, proposal: Arc::downgrade(p), board: Arc::downgrade(drawn), moved, lines };
+        changed
+    }
+
+    fn moves(base: &Board, drawn: &Board, ops: &[BoardOp], stroke: &StrokeTemplate) -> (Vec<ItemId>, Option<StreamList>) {
+        let mut moved: Vec<_> = ops.iter().filter_map(|op| match op {
+            BoardOp::SetField { item, field: Field::At(_) | Field::Rot(_) | Field::Side(_) }
+                if item.0 < base.next_item => Some(*item),
+            _ => None,
+        }).collect();
+        moved.sort_unstable();
+        moved.dedup();
+        let mut data = Vec::new();
+        moved.retain(|&id| {
+            let Some((from, to)) = base.placed_item(id).zip(drawn.placed_item(id)) else { return false };
+            if from.at != to.at {
+                rats::append_line(&mut data, from.at, to.at, stroke);
+                return true;
+            }
+            from.rot != to.rot || from.side != to.side
+        });
+        (moved, rats::list(data, stroke))
+    }
+}
+
+/// The Select marquee being dragged: its box (world mm, the press at one corner) and the
+/// selection at its press, which Shift adds to and a cancelled press puts back.
+struct BoardMarquee {
+    rect: [f64; 4],
+    crossing: bool,
+    before: Vec<Sel>,
+}
+
 #[derive(Default)]
 struct PaneState {
     unit: Option<BoardId>,
+    stitch_target: Option<(NetId, Option<ItemId>)>,
+    stitch: Option<PendingStitch>,
+    settings: settings_panel::SettingsPanel,
     /// Selection labels are resolved only on selection or geometry changes, never per frame.
     selected: Vec<Sel>,
+    parts: PartSelection,
     selection_summary: String,
     /// The shared drawing the lists below were synced from.
     drawn: Option<Arc<BoardDraw>>,
@@ -541,6 +822,11 @@ struct PaneState {
     held: Option<HeldDraw>,
     /// During a hold, x dims the held item and y lifts the neighbours its newest shown answer pushes.
     dims: Option<ItemStates>,
+    /// The ordinary slot-4 rows, before the place overlay. None until another feature needs slot 4.
+    ordinary_rows: Option<Vec<(u32, [f32; 4])>>,
+    place_preview: Option<PlacePreview>,
+    /// A completed picture that a newer place proposal has already superseded.
+    skipped_place: Option<(Weak<RouteProposal>, Weak<Board>)>,
     rats: RatsDraw,
     /// The connectivity a host without `ElecLive` hands in (`set_conn`).
     conn: Option<Arc<Connectivity>>,
@@ -569,9 +855,9 @@ struct PaneState {
     violations_awaiting: Arc<Vec<u64>>,
     violations_gen: u64,
     /// Resolved once per (findings generation, awaiting list, drawn geometry generation, unit,
-    /// preview proposal awaiting a wave).
+    /// preview proposal awaiting a wave, whether the unit waits for its whole-board checks).
     marks: Vec<CheckMark>,
-    marks_key: Option<(u64, usize, u64, BoardId, usize)>,
+    marks_key: Option<(u64, usize, u64, BoardId, usize, bool)>,
     /// `set_light`'s choice; `None` follows the theme's ground.
     light: Option<bool>,
     /// The host named the unit (`set_unit`); otherwise the pane follows the electronics host.
@@ -623,16 +909,202 @@ struct PaneState {
     /// Where the last press on the canvas went down, world mm: the Zone and Measure drags start
     /// there (a marquee knows only its box).
     press_at: Option<[f64; 2]>,
+    /// Logical pins when the Tune press landed, before the drag threshold.
+    tune_press: Option<(BoardId, Arc<fab_elec_circuit::Circuit>)>,
+    /// Both starting terminals are picked on this picture, even if a new board arrives before the drag threshold.
+    pair_press: Option<(Arc<BoardDraw>, Arc<fab_elec_board::RuleMatrix>, LayerId)>,
     /// The Measure tool's ruler (from, to), world mm, drawn until the next press or Escape.
     ruler: Option<[[f64; 2]; 2]>,
-    /// The Zone tool's rectangle while it is dragged, world mm (min x, min y, max x, max y).
-    zone_box: Option<[f64; 4]>,
+    /// The shape being drawn, local to this pane and unit until a close or drag release.
+    shape: ShapeGesture,
+    /// The Select marquee while it is dragged.
+    marquee: Option<BoardMarquee>,
     /// The strip's height as one column, measured while it stands so: past the pane's height
     /// it stands in two (its board actions beside the rest).
     strip_tall: f64,
 }
 
+/// The raw first press selects a Zone's net. The vertices themselves lie on the board grid.
+#[derive(Debug)]
+struct DrawnShape {
+    from: [f64; 2],
+    points: Vec<P>,
+}
+
+#[derive(Default)]
+enum ShapeGesture {
+    #[default]
+    Idle,
+    Polygon(DrawnShape),
+    Rectangle { from: [f64; 2], to: [f64; 2] },
+}
+
+fn snapped(at: [f64; 2], grid_mm: f64) -> P {
+    let grid = (grid_mm.max(0.001) * 1e6).round() as i64;
+    let snap = |mm: f64| ((mm * 1e6 / grid as f64).round() as i64 * grid) as Nm;
+    P::new(snap(at[0]), snap(at[1]))
+}
+
+const CLOSE_RADIUS: f64 = 6.0; // logical screen points, independent of zoom
+
+/// Build the press from the selection on the displayed board. A direct transform never
+/// requests the catalog's optional move to the nearest legal placement.
+pub fn part_gesture(design: &Design, unit: BoardId, parts: &[CompId], edit: PartEdit) -> ViewAction {
+    use crate::snapshot::Invocation;
+    let (name, mut args, planned) = match edit {
+        PartEdit::Rotate(by) => {
+            let degrees = if by > Angle::HALF { by.degrees() - 360.0 } else { by.degrees() };
+            ("elec.part.rotate", vec![("by", degrees.to_string())], plan::rotate(design, unit, parts, by))
+        }
+        PartEdit::Flip => ("elec.part.flip", vec![], plan::flip(design, unit, parts)),
+        PartEdit::Arrange(plan::Arrangement::Align(edge)) => ("elec.part.align", vec![("edge", edge.name().into())], plan::align(design, unit, parts, edge)),
+        PartEdit::Arrange(plan::Arrangement::Distribute(axis)) => ("elec.part.distribute", vec![("axis", axis.name().into())], plan::distribute(design, unit, parts, axis)),
+    };
+    let action = match planned {
+        Ok(edit) => ViewAction::Ops { ops: edit.ops, place: edit.place, label: edit.label },
+        Err(why) => ViewAction::PlanRefused(why),
+    };
+    let Some(unit) = design.unit(unit) else { return action };
+    let Some(names) = parts.iter().map(|&id| Invocation::part(unit, id)).collect::<Option<Vec<_>>>() else { return action };
+    args.push(("parts", names.join(", ")));
+    args.push(("legalise", "off".into()));
+    Invocation::new(name, &unit.name, args).attach(action)
+}
+
+fn keepout_layer(board: &Board, active: Option<LayerId>) -> LayerId {
+    let active = active.unwrap_or(LayerId::F_CU);
+    if board.copper_set().has(active) { active }
+    else if active.side() == fab_elec_core::LayerSide::Back { LayerId::B_CU }
+    else { LayerId::F_CU }
+}
+
+impl DrawnShape {
+    fn near_start(&self, at: [f64; 2], px_per_mm: f64) -> bool {
+        let first = self.points[0];
+        (at[0] - to_mm(first.x)).hypot(at[1] - to_mm(first.y)) * px_per_mm <= CLOSE_RADIUS
+    }
+
+    fn plan(&self, tool: BoardTool, design: &Design, board: &Board, active: Option<LayerId>, net: Option<NetId>) -> Result<plan::Plan, String> {
+        match tool {
+            BoardTool::Zone => {
+                let layer = active.filter(|l| board.copper_set().has(*l)).unwrap_or(LayerId::F_CU);
+                plan::zone(design, board.unit, &self.points, net, layer)
+            }
+            BoardTool::Outline => plan::outline(design, board.unit, &self.points),
+            BoardTool::Keepout => {
+                let layer = keepout_layer(board, active);
+                plan::keepout(design, board.unit, &self.points, fab_elec_core::LayerSet::one(layer), fab_elec_parts::Forbid::ALL, "Keep clear")
+            }
+            BoardTool::Cutout => plan::cutout(design, board.unit, &self.points, "Cutout"),
+            _ => unreachable!("only shape tools finish a drawing"),
+        }
+    }
+}
+
+/// Complete a polygon or drag rectangle using the snapped integer vertices of the drawing.
+pub fn shape_gesture(tool: BoardTool, design: &Design, board: &Board, active: Option<LayerId>, net: Option<NetId>, points: Vec<P>) -> ViewAction {
+    let shape = DrawnShape { from: [0.0; 2], points };
+    let action = match shape.plan(tool, design, board, active, net) {
+        Ok(edit) => ViewAction::Ops { ops: edit.ops, place: vec![], label: edit.label },
+        Err(why) => ViewAction::PlanRefused(why),
+    };
+    let mut fields = Vec::new();
+    let name = match tool {
+        BoardTool::Outline => "elec.board.outline",
+        BoardTool::Cutout => "elec.cutout.add",
+        BoardTool::Keepout => {
+            fields.push(("layers", keepout_layer(board, active).name()));
+            fields.push(("reason", "Keep clear".into()));
+            "elec.keepout.add"
+        }
+        _ => return action,
+    };
+    let Some(unit) = design.unit(board.unit) else { return action };
+    fields.push(("points", shape.points.iter().map(|p| format!("{} {}", to_mm(p.x), to_mm(p.y))).collect::<Vec<_>>().join(", ")));
+    crate::snapshot::Invocation::new(name, &unit.name, fields).attach(action)
+}
+
+impl ShapeGesture {
+    /// The canvas sends a release for each tap of a double-click. Its first tap has already
+    /// supplied the last vertex. A second tap after first-point closure starts nothing.
+    fn click(&mut self, at: [f64; 2], grid_mm: f64, px_per_mm: f64, clicks: u32) -> bool {
+        match self {
+            Self::Polygon(shape) => {
+                if clicks >= 2 || shape.near_start(at, px_per_mm) { return true; }
+                shape.points.push(snapped(at, grid_mm));
+            }
+            Self::Idle if clicks == 1 => {
+                *self = Self::Polygon(DrawnShape { from: at, points: vec![snapped(at, grid_mm)] });
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn backspace(&mut self) {
+        if let Self::Polygon(shape) = self {
+            shape.points.pop();
+            if shape.points.is_empty() { self.cancel(); }
+        }
+    }
+
+    fn drag(&mut self, from: [f64; 2], to: [f64; 2]) {
+        *self = Self::Rectangle { from, to };
+    }
+
+    fn cancel(&mut self) { *self = Self::Idle; }
+
+    fn finish(&mut self, grid_mm: f64) -> Option<DrawnShape> {
+        match std::mem::take(self) {
+            Self::Idle => None,
+            Self::Polygon(shape) => Some(shape),
+            Self::Rectangle { from, to } => {
+                let bounds = fab_elec_core::BBox::new(snapped(from, grid_mm), snapped(to, grid_mm));
+                Some(DrawnShape { from, points: plan::rect_points(bounds).to_vec() })
+            }
+        }
+    }
+}
+
 impl PaneState {
+    /// A moved-only partial has no new ids. A threshold above every drawable id enables just
+    /// the marked rows. The holes pass disables both with its usual negative threshold.
+    fn place_fresh_from(&self, fresh: Option<u32>) -> Option<u32> {
+        fresh.or_else(|| self.place_preview.as_ref().filter(|p| !p.moved.is_empty()).map(|_| 1 << 24))
+    }
+
+    /// Return a texture owed solely to the finished overlay for release by its owner.
+    fn sync_place(&mut self, drawn: &Arc<Board>, source: Option<(JobId, &Arc<RouteProposal>, &DesignSnapshot)>,
+        stroke: impl FnOnce() -> Option<StrokeTemplate>) -> Option<ItemStates> {
+        if PlacePreview::sync(&mut self.place_preview, drawn, source, stroke) {
+            if self.ordinary_rows.is_none() && self.place_preview.as_ref().is_none_or(|p| p.moved.is_empty()) {
+                return self.dims.take();
+            }
+            self.write_pane_rows(drawn.next_item as usize);
+        }
+        None
+    }
+
+    fn set_ordinary_rows(&mut self, count: usize, rows: Vec<(u32, [f32; 4])>) {
+        self.ordinary_rows = Some(rows);
+        self.write_pane_rows(count);
+    }
+
+    fn write_pane_rows(&mut self, count: usize) {
+        let ordinary = self.ordinary_rows.as_deref().unwrap_or_default();
+        let moved = self.place_preview.as_ref().map_or(&[][..], |p| p.moved.as_slice());
+        let mut rows = Vec::with_capacity(ordinary.len() + moved.len());
+        let mut rest = ordinary.iter().copied().peekable();
+        for &ItemId(id) in moved {
+            while let Some(row) = rest.next_if(|row| row.0 < id) { rows.push(row); }
+            let (_, mut texel) = rest.next_if(|row| row.0 == id).unwrap_or((id, [0.0; 4]));
+            texel[2] = 1.0;
+            rows.push((id, texel));
+        }
+        rows.extend(rest);
+        self.dims.get_or_insert_with(ItemStates::new).write(count, rows);
+    }
+
     fn hold(&self) -> Option<&Hold> {
         match &self.drag {
             Some(Drag::Hold(hold)) => Some(hold),
@@ -676,7 +1148,13 @@ struct Chips {
     live: CanvasLive,
     shown: bool,
     timer: Timer,
+    /// "Place them anyway", while the chips offer it: the scope its press places with the panel
+    /// free. It stays through hovers until pressed, a click elsewhere, Escape or another note.
+    offer: Option<(BoardId, Vec<CompId>)>,
 }
+
+/// The chip of an offer that its press acts on.
+const OFFER_CHIP: u32 = 1;
 
 /// How long a key's chip stays when the pointer does not move off what it names.
 const NOTE_SECONDS: f64 = 3.0;
@@ -698,6 +1176,7 @@ impl BoardPane {
     /// (V9). A sash drag refits only while the camera keeps its fit (no pan or zoom since).
     /// A plate's saved view not shown yet places the board the first time instead (7b).
     pub fn fit_when_shown(&mut self, cx: &mut Cx) {
+        self.cancel_shape();
         if self.opening_view.as_ref().is_some_and(|opening| opening.saved.is_some()) {
             return;
         }
@@ -799,8 +1278,11 @@ impl BoardPane {
 
     fn show(&mut self, unit: Option<BoardId>) {
         if self.st.unit != unit {
+            self.cancel_shape();
+            self.st.settings = Default::default();
             self.st.unit = unit;
             self.st.selected.clear();
+            self.st.parts = PartSelection::default();
             self.st.selection_summary.clear();
             self.st.refit = true;
             self.end_drag(None);
@@ -877,6 +1359,7 @@ impl BoardPane {
         if self.st.selected == selected { return; }
         self.st.selected = selected;
         self.selection_summary();
+        self.sync_stitch_target(cx);
         self.redraw(cx);
     }
 
@@ -888,6 +1371,9 @@ impl BoardPane {
     /// Refresh names once when the selection or its drawn geometry changes. Component/feature
     /// joins may visit placements here; drawing only reads the resulting bounded string.
     fn selection_summary(&mut self) {
+        self.st.parts = self.st.drawn.as_ref().filter(|d| Some(d.unit) == self.st.unit)
+            .map_or_else(PartSelection::default, |d| PartSelection::new(&d.board, &self.st.selected));
+        self.selection_marks();
         self.st.selection_summary.clear();
         if self.st.selected.is_empty() { return; }
         self.st.selection_summary = format!(", {} selected", self.st.selected.len());
@@ -911,6 +1397,19 @@ impl BoardPane {
             self.st.selection_summary.push_str(": ");
             self.st.selection_summary.push_str(&labels.join(", "));
         }
+    }
+
+    /// The selected parts and any chip marks share the pane's emphasis rows. A drag has
+    /// its own rows until it ends. Drawing reads the texture without visiting the selection.
+    fn selection_marks(&mut self) {
+        if self.st.hold().is_some() { return; }
+        let Some(draw) = &self.st.drawn else { return };
+        if self.st.parts.items.is_empty() && self.st.marked.is_empty() && self.st.ordinary_rows.is_none() { return; }
+        let mut rows: Vec<_> = self.st.parts.items.iter().chain(&self.st.marked)
+            .map(|id| (id.0, [0.0, 1.0, 0.0, 0.0])).collect();
+        rows.sort_unstable_by_key(|row| row.0);
+        rows.dedup_by_key(|row| row.0);
+        self.st.set_ordinary_rows(draw.board.next_item as usize, rows);
     }
 
     /// Light one net of this board in this pane (the host's focused or probed net): its copper
@@ -1112,6 +1611,24 @@ impl BoardPane {
         if self.st.drawn.as_ref().is_some_and(|d| Arc::ptr_eq(d, &draw)) {
             return;
         }
+        // An already superseded picture may finish building. Keep the displayed round until
+        // the board for the new round is ready, so its marks and geometry change together.
+        if let Some((_, Some(p))) = self.route_job(cx) {
+            if p.metrics.place.is_some() {
+                if self.st.skipped_place.as_ref().is_some_and(|(proposal, board)|
+                    proposal.as_ptr() == Arc::as_ptr(&p) && board.as_ptr() == Arc::as_ptr(&draw.board))
+                {
+                    return;
+                }
+                let snap = &cx.get_global::<ElecLive>().snap;
+                let is_drawn = |d: &Design| d.unit(unit).and_then(|u| u.board.as_ref()).is_some_and(|b| Arc::ptr_eq(b, &draw.board));
+                if !is_drawn(&snap.design) && !snap.preview.as_ref().is_some_and(|d| is_drawn(d)) {
+                    self.st.skipped_place = Some((Arc::downgrade(&p), Arc::downgrade(&draw.board)));
+                    return;
+                }
+            }
+        }
+        self.st.skipped_place = None;
         // While a gesture lands only the picture that ends the landing is taken: nothing on screen
         // goes back to the committed state for the evaluation of a commit the host cannot carry.
         if self.st.drawn.is_some() && !self.takes_picture(cx, &draw.board) {
@@ -1160,6 +1677,7 @@ impl BoardPane {
             BoardDraws::retire(cx, old);
         }
         self.selection_summary();
+        self.sync_stitch_target(cx);
     }
 
     fn layer_shown(&self, l: LayerId) -> bool {
@@ -1334,6 +1852,13 @@ impl BoardPane {
         self.st.rats.sync(conn.as_ref(), shown.as_ref(), &held, &at, &t.stroke);
         let rats = BoardUniforms { thin_alpha: 1.0, ..*base };
         self.st.rats.draw(cx, &mut self.draw_stroke.draw_vars, &rats, theme.rats, by, &t.stroke);
+        if let Some(lines) = self.st.place_preview.as_mut().and_then(|p| p.lines.as_mut()) {
+            let stroke = &mut self.draw_stroke.draw_vars;
+            let mut ink = [0.0; 4];
+            stroke.get_uniform(cx, live_id!(fresh_ink), &mut ink);
+            let u = BoardUniforms { cam: base.cam, clip: base.clip, thin_alpha: 1.0, layer_ink: ink, ..BoardUniforms::default() };
+            lines.draw(cx, stroke, &BoardTextures::default(), &u);
+        }
         let cam = self.pane.cam;
         let visible: Vec<LayerId> = self.st.layers.iter().map(|s| s.layer).filter(|l| self.layer_shown(*l)).collect();
         let shown = |l: LayerId| visible.contains(&l);
@@ -1355,7 +1880,33 @@ impl BoardPane {
 
     /// One canvas input (canvas::pane's grammar).
     fn input(&mut self, cx: &mut Cx, input: CanvasInput<Sel>) {
+        match &input {
+            CanvasInput::Click { at, .. } if self.click_offer(cx, *at) => return,
+            // Escape takes the offer away first: one step out.
+            CanvasInput::Escape if matches!(self.st.shape, ShapeGesture::Idle) && self.st.chips.as_ref().is_some_and(|chips| chips.offer.is_some()) => {
+                if let Some(chips) = self.st.chips.as_mut() {
+                    chips.offer = None;
+                }
+                self.clear_note(cx);
+                return;
+            }
+            _ => {}
+        }
         match input {
+            CanvasInput::Press { key: Sel::Item(unit, _), down: true } if self.st.armed.tool == BoardTool::Tune => {
+                self.st.tune_press = self.design(cx).and_then(|d| Some((unit, d.unit(unit)?.circuit.clone())));
+            }
+            CanvasInput::Press { key: Sel::Item(unit, _), down: true } if self.st.armed.tool == BoardTool::RoutePair => {
+                self.st.pair_press = self.st.drawn.as_ref().filter(|d| d.unit == unit).and_then(|d| {
+                    let snap = &cx.get_global_ref::<ElecLive>()?.snap;
+                    let rules = snap.of(&snap.rules, unit)?;
+                    Some((d.clone(), rules.value.clone(), self.st.active.unwrap_or(LayerId::F_CU)))
+                });
+            }
+            CanvasInput::Press { down: false, .. } => {
+                self.st.tune_press = None;
+                self.st.pair_press = None;
+            }
             CanvasInput::Hover(sel) => {
                 self.st.hover = match sel {
                     Some(Sel::Item(_, item)) => Some(item),
@@ -1368,13 +1919,28 @@ impl BoardPane {
             }
             // Keys while copper is drawn adjust it (V, W, /); S flips Shove; the rest act on what
             // is hovered.
+            CanvasInput::Key { code: KeyCode::ReturnKey | KeyCode::NumpadEnter, .. }
+                if matches!(self.st.shape, ShapeGesture::Polygon(_)) => self.finish_shape(cx),
+            CanvasInput::Key { code: KeyCode::Backspace, .. } if self.st.armed.tool.draws_shape() => {
+                self.st.shape.backspace();
+                self.redraw(cx);
+            }
             CanvasInput::Key { code, modifiers, .. } if self.route_key(cx, code, modifiers) => {}
+            CanvasInput::Key { code: KeyCode::KeyX, modifiers, .. }
+                if modifiers.shift && !(modifiers.control || modifiers.alt || modifiers.logo) => self.set_armed(cx, self.st.armed.key(BoardTool::RoutePair)),
+            CanvasInput::Key { code: KeyCode::KeyR, modifiers, under }
+                if self.st.armed.tool == BoardTool::Select && !(modifiers.control || modifiers.alt || modifiers.logo) => {
+                let by = if modifiers.shift { Angle::QUARTER.neg() } else { Angle::QUARTER };
+                self.edit_parts(cx, PartEdit::Rotate(by), under.as_ref());
+            }
             CanvasInput::Key { code, modifiers, under } if !(modifiers.shift || modifiers.control || modifiers.alt || modifiers.logo) => match code {
                 KeyCode::Delete | KeyCode::Backspace => self.key_delete(cx, under),
                 KeyCode::KeyF => self.key_pour(cx),
+                KeyCode::KeyB if self.st.armed.tool == BoardTool::Select => self.edit_parts(cx, PartEdit::Flip, under.as_ref()),
                 KeyCode::KeyA => self.key_labels(cx),
                 KeyCode::KeyS => self.flip_shove(cx),
                 // The strip's tools: X arms Route, V goes back to Select.
+                KeyCode::KeyT => self.set_armed(cx, self.st.armed.key(BoardTool::Tune)),
                 KeyCode::KeyX => self.set_armed(cx, self.st.armed.key(BoardTool::Route)),
                 KeyCode::KeyV => self.set_armed(cx, self.st.armed.key(BoardTool::Select)),
                 _ => {}
@@ -1382,13 +1948,21 @@ impl BoardPane {
             // Escape with no drag running: away with the ruler, and out of the armed tool.
             CanvasInput::Escape if self.st.armed != Armed::default() || self.st.ruler.is_some() => {
                 self.st.ruler = None;
-                self.st.zone_box = None;
+                self.cancel_shape();
                 self.set_armed(cx, self.st.armed.escape());
                 self.redraw(cx);
             }
-            // Via places where it is clicked; Zone and Measure act on drags only.
+            // A shape starts on a click release; a press that passed the drag threshold has no click.
             CanvasInput::Click { at, .. } if self.st.armed.tool == BoardTool::Via => self.place_via(cx, at),
-            CanvasInput::Click { .. } if matches!(self.st.armed.tool, BoardTool::Zone | BoardTool::Measure) => {}
+            CanvasInput::Click { at, clicks, .. } if self.st.armed.tool.draws_shape() => {
+                if self.st.drawn.as_ref().map(|d| d.unit) != self.st.unit { return; }
+                if self.st.shape.click(at, self.grid_mm, self.pane.cam.px_per_unit, clicks) {
+                    self.finish_shape(cx);
+                } else {
+                    self.redraw(cx);
+                }
+            }
+            CanvasInput::Click { .. } if self.st.armed.tool == BoardTool::Measure => {}
             CanvasInput::DragStart { from, at, .. } if self.tool_drags() => {
                 self.st.press_at = Some(from);
                 self.tool_drag(cx, at, false);
@@ -1400,6 +1974,28 @@ impl BoardPane {
                 let Some(from) = self.st.press_at else { return };
                 let far = |v: f64, lo: f64, hi: f64| if (v - lo).abs() <= (v - hi).abs() { hi } else { lo };
                 self.tool_drag(cx, [far(from[0], rect[0], rect[2]), far(from[1], rect[1], rect[3])], done);
+            }
+            CanvasInput::Marquee { rect, done, shift, crossing } if self.st.armed.tool == BoardTool::Select =>
+                self.marquee(cx, rect, done, shift, crossing),
+            CanvasInput::Click { key: Some(Sel::Item(_, _)), at, shift: true, .. }
+                if self.st.armed.tool == BoardTool::Select => {
+                let Some(draw) = self.st.drawn.clone() else { return };
+                // On a dense board the topmost item under the press is often copper or a pour:
+                // shift takes the first part under it.
+                let Some((sel, comp)) = self.part_under(&draw, at) else { return };
+                let mut selected = self.st.selected.clone();
+                if self.st.parts.ids.contains(&comp) {
+                    selected.retain(|s| !part_target(&draw.board, s).is_some_and(|(id, _)| id == comp));
+                } else {
+                    selected.push(sel);
+                }
+                self.set_selection(cx, &selected);
+                self.publish_selection(cx);
+            }
+            CanvasInput::Click { key: None, shift: false, .. } | CanvasInput::Escape
+                if self.st.armed.tool == BoardTool::Select && !self.st.selected.is_empty() => {
+                self.set_selection(cx, &[]);
+                cx.widget_action(self.uid, ViewAction::Unfocus);
             }
             CanvasInput::Click { key: Some(sel @ Sel::Item(unit, item)), at, .. } => {
                 let placed = self.st.drawn.as_ref().and_then(|d| match d.board.locate(item) {
@@ -1499,6 +2095,26 @@ impl BoardPane {
         }
     }
 
+    /// One plan on the committed board per press. The strip acts on the selection;
+    /// only a key without selected parts falls back to the pointer.
+    fn edit_parts(&mut self, cx: &mut Cx, edit: PartEdit, under: Option<&Sel>) {
+        let (Some(unit), Some(design)) = (self.st.unit, self.design(cx)) else { return };
+        let Some(board) = design.unit(unit).and_then(|u| u.board.as_deref()) else { return };
+        let hovered = under.and_then(|sel| part_target(board, sel)).map(|(comp, _)| comp);
+        let parts = if self.st.parts.ids.is_empty() { hovered.as_slice() } else { &self.st.parts.ids };
+        self.send_part_or_shape(cx, part_gesture(&design, unit, parts, edit));
+    }
+
+    fn send_part_or_shape(&mut self, cx: &mut Cx, action: ViewAction) {
+        let inner = if let ViewAction::Planned { action, .. } = &action { action.as_ref() } else { &action };
+        match inner {
+            ViewAction::Ops { .. } => self.clear_note(cx),
+            ViewAction::PlanRefused(why) => self.note(cx, ChipKind::Refused, why.clone(), Vec::new()),
+            _ => return,
+        }
+        crate::snapshot::Invocation::send(cx, self.uid, action);
+    }
+
     /// Delete or Backspace: delete exactly the hovered item, one undo step at the press, and fade
     /// it out once the picture lacks it; or say why not.
     fn key_delete(&mut self, cx: &mut Cx, under: Option<Sel>) {
@@ -1575,12 +2191,118 @@ impl BoardPane {
         self.pour(cx, net);
     }
 
+    /// Left to right takes parts wholly inside the window. Right to left takes parts whose
+    /// visible shape boxes meet the band, excluding footprint text. Shift adds to the press
+    /// selection. Both preview locally and publish on release. Both pay for the same layer-index
+    /// query, O(h log h) to sort h hits, item lookups and the selection update. A window also
+    /// checks each candidate part's full visible box.
+    fn marquee(&mut self, cx: &mut Cx, rect: [f64; 4], done: bool, shift: bool, crossing: bool) {
+        let Some(draw) = self.st.drawn.clone() else { return };
+        let Some(unit) = self.st.unit.filter(|unit| *unit == draw.unit) else { return };
+        let before = match self.st.marquee.take() {
+            Some(marquee) => marquee.before,
+            None => self.st.selected.clone(),
+        };
+        let order = self.pick_order();
+        let geom = &draw.geom;
+        let items = BoardItems { unit: geom.board.unit, board: &geom.board, scene: &geom.scene, pick: &geom.pick, items: &geom.items, order: &order };
+        let mut selected = if shift { before.clone() } else { Vec::new() };
+        let mut held: HashSet<CompId> = selected.iter().filter_map(|sel| part_target(&draw.board, sel).map(|(comp, _)| comp)).collect();
+        for (_, comp) in items.parts_in_band(rect, crossing) {
+            if held.insert(comp) {
+                selected.push(Sel::Comp(fab_elec_core::CompRef { board: unit, comp }));
+            }
+        }
+        self.set_selection(cx, &selected);
+        if done {
+            self.publish_selection(cx);
+        } else {
+            self.st.marquee = Some(BoardMarquee { rect, crossing, before });
+        }
+        self.redraw(cx);
+    }
+
+    /// A Select marquee whose press ended without its release (Escape, a cancelled touch): the
+    /// selection at its press comes back. O(selected).
+    fn end_marquee(&mut self, cx: &mut Cx) {
+        if self.pane.pressed() { return; }
+        let Some(marquee) = self.st.marquee.take() else { return };
+        self.set_selection(cx, &marquee.before);
+        self.redraw(cx);
+    }
+
+    /// Tell the other views what this pane selected: nothing, one item (its focus), or a group
+    /// (the views' shared selection, as the schematic's marquee sends it). O(selected).
+    fn publish_selection(&self, cx: &mut Cx) {
+        match self.st.selected.as_slice() {
+            [] => cx.widget_action(self.uid, ViewAction::Unfocus),
+            [sel] => {
+                let part = self.st.drawn.as_ref().is_some_and(|draw| part_target(&draw.board, sel).is_some());
+                let kind = if part { FocusKind::Part } else { FocusKind::Board };
+                cx.widget_action(self.uid, ViewAction::Focus(Focus { kind, sel: sel.clone(), origin: FocusOrigin::Board }));
+            }
+            group => cx.widget_action(self.uid, crate::ViewState { selected: group.to_vec(), emphasis: Vec::new() }),
+        }
+    }
+
+    /// The first part under world `at` on the drawn board (`BoardItems::part_at`), as a selection
+    /// and its component: what a shift-click adds or takes away. O(hits).
+    fn part_under(&self, draw: &BoardDraw, at: [f64; 2]) -> Option<(Sel, CompId)> {
+        let order = self.pick_order();
+        let geom = &draw.geom;
+        let items = BoardItems { unit: draw.unit, board: &geom.board, scene: &geom.scene, pick: &geom.pick, items: &geom.items, order: &order };
+        items.part_at(at, HIT_RADIUS / self.pane.cam.px_per_unit.max(1e-12)).map(|(item, comp)| (Sel::Item(draw.unit, item), comp))
+    }
+
     /// The net of the copper at world `at` on the drawn board, topmost first. O(hits).
     fn net_at(&self, draw: &BoardDraw, at: [f64; 2]) -> Option<NetId> {
         let order = self.pick_order();
         let geom = &draw.geom;
         let items = BoardItems { unit: draw.unit, board: &geom.board, scene: &geom.scene, pick: &geom.pick, items: &geom.items, order: &order };
         items.probe_at(at, HIT_RADIUS / self.pane.cam.px_per_unit.max(1e-12)).map(|hit| hit.net)
+    }
+
+    fn sync_stitch_target(&mut self, cx: &mut Cx) {
+        let target = self.st.drawn.as_ref().filter(|draw| Some(draw.unit) == self.st.unit).and_then(|draw| {
+            if let [Sel::Item(_, id)] = self.st.selected.as_slice() {
+                if let Some((ItemKind::Zone, i)) = draw.board.locate(*id) {
+                    return draw.board.zones[i].net.map(|net| (net, Some(*id)));
+                }
+            }
+            let net = self.net_at(draw, self.pane.pointer_world()?)?;
+            draw.board.zones.iter().any(|z| z.net == Some(net)).then_some((net, None))
+        });
+        if self.st.stitch_target != target {
+            self.st.stitch_target = target;
+            self.tools.widget(cx, ids!(stitch_options)).set_visible(cx, target.is_some());
+            self.redraw(cx);
+        }
+    }
+
+    fn stitch_pressed(&mut self, cx: &mut Cx) {
+        if self.st.stitch.is_some() { return }
+        let (Some((net, zone)), Some(draw)) = (self.st.stitch_target, self.st.drawn.clone()) else { return };
+        let Some(design) = self.design(cx) else { return };
+        let Some(unit) = design.unit(draw.unit).filter(|unit| Some(unit.id) == self.st.unit) else { return };
+        let Some(network) = draw.board.nets.get(net.ix()) else { return };
+        let pitch = self.tools.widget(cx, ids!(stitch_pitch)).text();
+        let Some(mm) = super::status::parse_mm(&pitch, 0.0, to_mm(Nm::MAX)).filter(|m| fab_elec_core::mm(*m) > 0) else {
+            return self.note(cx, ChipKind::Refused, "enter a positive stitch pitch in millimetres".into(), Vec::new());
+        };
+        let pad = self.via_diameter(cx, unit.id);
+        let drill = self.via_drill(cx, &draw.board, unit.id, Some(net));
+        let mut args = vec![("unit".into(), unit.name.clone()), ("net".into(), network.name.clone()),
+            ("pitch".into(), mm.to_string()), ("pad".into(), to_mm(pad).to_string()), ("drill".into(), to_mm(drill).to_string())];
+        if let Some(id) = zone { args.push(("zone".into(), id.0.to_string())); }
+        self.clear_note(cx);
+        let tag = next_tag();
+        let button = self.tools.widget(cx, ids!(a_stitch)).area().rect(cx);
+        let anchor = ChipAnchor::Screen { at: [self.st.strip_at.pos.x + self.st.strip_at.size.x + 8.0, button.pos.y + button.size.y * 0.5] };
+        let mut pending = PendingStitch { tag, unit: unit.id, net: network.name.clone(), anchor, layer: ChipLayer::default(), live: CanvasLive::off(cx) };
+        pending.status(cx, false);
+        self.st.stitch = Some(pending);
+        self.redraw(cx);
+        cx.action(StitchPress { tag, args });
     }
 
     /// Pour `net` (else the circuit's ground) over the whole board on the active copper layer: F
@@ -1622,17 +2344,15 @@ impl BoardPane {
         let at = self.pane.pointer_world().unwrap_or(self.pane.cam.center);
         let chips = match &mut self.st.chips {
             Some(chips) => chips,
-            None => self.st.chips.insert(Chips { layer: ChipLayer::default(), live: CanvasLive::off(cx), shown: false, timer: Timer::empty() }),
+            None => self.st.chips.insert(Chips { layer: ChipLayer::default(), live: CanvasLive::off(cx), shown: false, timer: Timer::empty(), offer: None }),
         };
+        chips.offer = None;
         chips.layer.set(vec![Chip { id: 0, kind, text, anchor: ChipAnchor::World { at, dx: 14.0, dy: 14.0 }, align: [0.0, 0.0] }], cx.seconds_since_app_start());
         chips.shown = true;
         chips.timer = cx.start_timeout(NOTE_SECONDS);
-        if !marked.is_empty() && self.st.hold().is_none() {
-            if let Some(count) = self.st.drawn.as_ref().map(|draw| draw.board.next_item as usize) {
-                let rows = marked.iter().map(|item| (item.0, [0.0, 1.0, 0.0, 0.0])).collect();
-                self.st.dims.get_or_insert_with(ItemStates::new).write(count, rows);
-                self.st.marked = marked;
-            }
+        if !marked.is_empty() {
+            self.st.marked = marked;
+            self.selection_marks();
         }
         self.redraw(cx);
     }
@@ -1640,17 +2360,60 @@ impl BoardPane {
     fn clear_note(&mut self, cx: &mut Cx) {
         if !self.st.marked.is_empty() {
             self.st.marked.clear();
-            if self.st.hold().is_none() {
-                if let (Some(dims), Some(count)) = (self.st.dims.as_mut(), self.st.drawn.as_ref().map(|draw| draw.board.next_item as usize)) {
-                    dims.write(count, Vec::new());
-                }
-            }
+            self.selection_marks();
         }
-        let Some(chips) = self.st.chips.as_mut().filter(|chips| chips.shown) else { return };
+        let Some(chips) = self.st.chips.as_mut().filter(|chips| chips.shown && chips.offer.is_none()) else { return };
         chips.shown = false;
         chips.layer.set(Vec::new(), cx.seconds_since_app_start());
         cx.stop_timer(chips.timer);
         self.redraw(cx);
+    }
+
+    /// The strip's Place held standing panel parts (`plan::PlacePress`): two chips over them say
+    /// why, and offer "Place them anyway", which places the whole scope with the panel free. The
+    /// offer stays until it is pressed, a click lands elsewhere, Escape, or another note.
+    fn offer_place(&mut self, cx: &mut Cx, unit: BoardId, press: plan::PlacePress) {
+        let Some(design) = self.design(cx) else { return };
+        let Some(board) = design.unit(unit).and_then(|found| found.board.as_deref()) else { return };
+        let bbox = press.held.iter().filter_map(|&comp| board.placed_of(comp)).fold(BBox::EMPTY, |b, placed| b.union(placed.bbox()));
+        if bbox.is_empty() {
+            return;
+        }
+        let center = bbox.center();
+        let at = [center.x as f64 / 1e6, center.y as f64 / 1e6];
+        let why = match press.held.len() {
+            1 => "1 panel part stays where it stands: the case is built round it".to_owned(),
+            n => format!("{n} panel parts stay where they stand: the case is built round them"),
+        };
+        log!("fab.board: place held {} panel parts on unit {}", press.held.len(), unit.0);
+        self.clear_note(cx);
+        let chips = match &mut self.st.chips {
+            Some(chips) => chips,
+            None => self.st.chips.insert(Chips { layer: ChipLayer::default(), live: CanvasLive::off(cx), shown: false, timer: Timer::empty(), offer: None }),
+        };
+        cx.stop_timer(chips.timer);
+        chips.layer.set(vec![
+            Chip { id: 0, kind: ChipKind::Info, text: why, anchor: ChipAnchor::World { at, dx: 14.0, dy: 14.0 }, align: [0.0, 0.0] },
+            Chip { id: OFFER_CHIP, kind: ChipKind::Value, text: "Place them anyway".into(), anchor: ChipAnchor::World { at, dx: 14.0, dy: 34.0 }, align: [0.0, 0.0] },
+        ], cx.seconds_since_app_start());
+        chips.shown = true;
+        chips.offer = Some((unit, press.parts));
+        self.redraw(cx);
+    }
+
+    /// A click while "Place them anyway" is offered: on its chip, the whole scope is placed with
+    /// the panel free; elsewhere the offer goes. True when the click was the offer's.
+    fn click_offer(&mut self, cx: &mut Cx, at: [f64; 2]) -> bool {
+        let screen = self.pane.cam.to_screen(at);
+        let Some(chips) = self.st.chips.as_mut().filter(|chips| chips.offer.is_some()) else { return false };
+        let pressed = chips.layer.hit([screen.x, screen.y]) == Some(OFFER_CHIP);
+        let (unit, parts) = chips.offer.take().expect("an offer");
+        if pressed {
+            log!("fab.board: place {} parts with the panel free on unit {}", parts.len(), unit.0);
+            cx.widget_action(self.uid, ViewAction::Place { unit, parts, all: false, free_panel: true });
+        }
+        self.clear_note(cx);
+        pressed
     }
 
     /// The Measure ruler with its length beside its end, or the Zone rectangle being dragged: one
@@ -1670,21 +2433,89 @@ impl BoardPane {
         Some([mm(route.routing.head_start()), mm(route.routing.g.cursor)])
     }
 
+    /// The same hover ink, translucent fill and hairline as a dragged rectangle. Only the
+    /// confirmed edges and the edge to the pointer are stroked until the ring closes.
+    fn draw_polygon_preview(&mut self, cx: &mut Cx2d, rect: Rect, ink: [f32; 4]) {
+        let ShapeGesture::Polygon(shape) = &self.st.shape else { return };
+        let pointer = self.pane.pointer_world();
+        let closing = pointer.is_some_and(|p| shape.near_start(p, self.pane.cam.px_per_unit));
+        let start = shape.points[0];
+        let tip = pointer.map(|p| if closing { start } else { snapped(p, self.grid_mm) });
+        let screen = |p: P| {
+            let at = self.pane.cam.to_screen([to_mm(p.x), to_mm(p.y)]);
+            (at.x as f32, at.y as f32)
+        };
+        let (x, y) = screen(start);
+        let path = |draw: &mut DrawVector| {
+            draw.move_to(x, y);
+            for p in shape.points[1..].iter().copied().chain(tip) {
+                let (x, y) = screen(p);
+                draw.line_to(x, y);
+            }
+        };
+        cx.begin_turtle(Walk { abs_pos: Some(rect.pos), width: Size::Fixed(rect.size.x), height: Size::Fixed(rect.size.y),
+            ..Default::default() }, Layout { clip_x: true, clip_y: true, ..Default::default() });
+        let draw = &mut self.draw_polygon;
+        draw.begin();
+        if shape.points.len() + usize::from(tip.is_some()) >= 3 {
+            draw.set_color(ink[0], ink[1], ink[2], 0.16);
+            path(draw);
+            draw.close();
+            draw.fill();
+        }
+        draw.set_color(ink[0], ink[1], ink[2], ink[3]);
+        path(draw);
+        draw.stroke(1.0);
+        draw.circle(x, y, 2.5);
+        draw.fill();
+        if closing {
+            draw.circle(x, y, CLOSE_RADIUS as f32);
+            draw.stroke(1.5);
+        }
+        draw.end(cx);
+        cx.end_turtle();
+    }
+
     fn draw_tool_marks(&mut self, cx: &mut Cx2d, rect: Rect) {
         let cam = self.pane.cam;
         let local = |w: [f64; 2]| {
             let s = cam.to_screen(w) - rect.pos;
             [s.x as f32, s.y as f32]
         };
-        let ink = Tokens::for_theme(!self.light()).hover;
-        let (seg, zone, label) = if let Some([from, to]) = self.st.ruler {
+        let tokens = Tokens::for_theme(!self.light());
+        if let Some(Drag::Route(route)) = &self.st.drag {
+            if matches!(route.routing.g.kind, GestureKind::Tune { .. } | GestureKind::RoutePair { .. }) {
+                let label = route.refused.as_deref().or_else(|| route.readout.shown(&self.st.drawn.as_ref()?.board));
+                if let Some(label) = label {
+                    let p = route.routing.g.cursor;
+                    let at = cam.to_screen([to_mm(p.x), to_mm(p.y)]) + dvec2(10.0, 6.0);
+                    let ink = if route.refused.is_some() { tokens.warning } else { tokens.hover };
+                    let color = self.draw_text.color;
+                    self.draw_text.color = vec4(ink[0], ink[1], ink[2], ink[3]);
+                    self.draw_text.draw_abs(cx, at, label);
+                    self.draw_text.color = color;
+                }
+                return;
+            }
+        }
+        let mut ink = tokens.hover;
+        let (seg, zone, label) = if let Some(m) = &self.st.marquee {
+            // the Select marquee, in the selection's colour as the schematic draws its own
+            ink = tokens.selection;
+            let (a, b) = (local([m.rect[0], m.rect[1]]), local([m.rect[2], m.rect[3]]));
+            let zone = if m.crossing { 4.0 } else { 3.0 };
+            ([a[0].min(b[0]), a[1].min(b[1]), a[0].max(b[0]), a[1].max(b[1])], zone, None)
+        } else if let Some([from, to]) = self.st.ruler {
             let (a, b) = (local(from), local(to));
             let (dx, dy) = (to[0] - from[0], to[1] - from[1]);
             let label = format!("{:.3} mm   dx {:.3}   dy {:.3}", dx.hypot(dy), dx, dy);
             ([a[0], a[1], b[0], b[1]], 0.0, Some((dvec2(b[0] as f64 + 10.0, b[1] as f64 + 6.0), label)))
-        } else if let Some(z) = self.st.zone_box {
-            let (a, b) = (local([z[0], z[1]]), local([z[2], z[3]]));
+        } else if let ShapeGesture::Rectangle { from, to } = &self.st.shape {
+            let (a, b) = (local(*from), local(*to));
             ([a[0].min(b[0]), a[1].min(b[1]), a[0].max(b[0]), a[1].max(b[1])], 1.0, None)
+        } else if matches!(self.st.shape, ShapeGesture::Polygon(_)) {
+            self.draw_polygon_preview(cx, rect, ink);
+            return;
         } else if let Some([from, to]) = self.rubber() {
             let (a, b) = (local(from), local(to));
             ([a[0], a[1], b[0], b[1]], 2.0, None)
@@ -1727,8 +2558,12 @@ impl BoardPane {
             }
         }
         let dark = !self.light();
+        let clip = [rect.pos.x as f32, rect.pos.y as f32, (rect.pos.x + rect.size.x) as f32, (rect.pos.y + rect.size.y) as f32];
+        if let Some(stitch) = self.st.stitch.as_mut().filter(|s| Some(s.unit) == self.st.unit) {
+            stitch.layer.draw(cx, &self.pane.cam, clip, Tokens::for_theme(dark), &stitch.live, &mut self.draw_line, &mut self.draw_box, &mut self.draw_text, now);
+            animating |= stitch.layer.animating(now);
+        }
         if let Some(chips) = self.st.chips.as_mut() {
-            let clip = [rect.pos.x as f32, rect.pos.y as f32, (rect.pos.x + rect.size.x) as f32, (rect.pos.y + rect.size.y) as f32];
             chips.layer.draw(cx, &self.pane.cam, clip, Tokens::for_theme(dark), &chips.live, &mut self.draw_line, &mut self.draw_box, &mut self.draw_text, now);
             animating |= chips.layer.animating(now);
         }
@@ -1741,7 +2576,11 @@ impl BoardPane {
     /// takes on the picture on screen, in the pane's own pick order (`BoardItems::pressed`,
     /// `gesture::classify`): O(hits).
     fn begin_drag(&mut self, cx: &mut Cx, unit: BoardId, from: [f64; 2], at: [f64; 2]) {
-        let Some(draw) = self.st.drawn.clone() else { return };
+        let pair_press = self.st.pair_press.take().filter(|(draw, _, _)| draw.unit == unit);
+        let draw = if self.st.armed.tool == BoardTool::RoutePair {
+            pair_press.as_ref().map(|(d, _, _)| d.clone())
+        } else { self.st.drawn.clone() };
+        let Some(draw) = draw else { return };
         let (p, tol) = (nm(from), self.pick_nm());
         let order = self.pick_order();
         let geom = &draw.geom;
@@ -1751,6 +2590,25 @@ impl BoardPane {
         let routes = cx.has_global::<ElecLive>();
         // Armed Route draws copper from a pad or a track's end, and nothing else starts.
         let route_tool = self.st.armed.tool == BoardTool::Route;
+        if self.st.armed.tool == BoardTool::Tune {
+            if let Some((_, circuit)) = self.st.tune_press.take().filter(|(id, _)| routes && *id == unit) {
+                if let Some(routing) = tune_hit(&geom.board, &pressed, p).and_then(|hit| Routing::tune(&geom.board, hit, circuit)) {
+                    self.begin_route(cx, routing, draw, at);
+                }
+            }
+            return;
+        }
+        if self.st.armed.tool == BoardTool::RoutePair {
+            if let Some((_, rules, active)) = pair_press {
+                let pressed = classify(&geom.board, &pressed, p, tol, active, false);
+                match Routing::pair(&geom.board, &rules, pressed) {
+                    Ok(Some(routing)) => self.begin_route(cx, routing, draw, at),
+                    Ok(None) => {}
+                    Err(why) => self.note(cx, ChipKind::Refused, why, Vec::new()),
+                }
+            }
+            return;
+        }
         let press = classify(&geom.board, &pressed, p, tol, active, route_tool);
         if route_tool && !matches!(press, Press::Route { .. }) {
             return;
@@ -1766,7 +2624,9 @@ impl BoardPane {
                 self.begin_hold(cx, unit, placed, from);
                 self.move_hold(cx, at);
             }
-            press @ (Press::Route { .. } | Press::Seg { .. }) if routes => self.begin_route(cx, unit, press, draw, at),
+            press @ (Press::Route { .. } | Press::Seg { .. }) if routes => {
+                if let Some(routing) = Routing::start(&press, &geom.board, unit) { self.begin_route(cx, routing, draw, at); }
+            }
             _ => {}
         }
     }
@@ -1791,20 +2651,16 @@ impl BoardPane {
     }
 
     /// Copper drawing or a segment drag starts on the picture at the press, which the gesture keeps.
-    fn begin_route(&mut self, cx: &mut Cx, unit: BoardId, press: Press, frozen: Arc<BoardDraw>, at: [f64; 2]) {
+    fn begin_route(&mut self, cx: &mut Cx, mut routing: Routing, frozen: Arc<BoardDraw>, at: [f64; 2]) {
         self.end_drag(Some(&mut *cx));
-        let Some(mut routing) = Routing::start(&press, &frozen.geom.board, unit) else { return };
-        if let (Press::Route { .. }, Some(w)) = (press, self.st.track_w) {
-            routing.set_width(w);
-        }
-        // Drawn copper pushes or walks as the switch says; a dragged segment pushes either way.
-        if let Press::Route { .. } = press {
+        if matches!(routing.g.kind, GestureKind::Route) {
+            if let Some(w) = self.st.track_w { routing.set_width(w); }
             routing.g.mode = self.route_mode();
         }
         log!("fab.board: gesture {} from {:?} on {:?}", routing.id.0, routing.g.start, routing.g.layer);
         self.st.drag = Some(Drag::Route(Route {
             routing, frozen, seen: None, landing: None, sent: VecDeque::new(), waits: Vec::new(), blocked: None, walked: None,
-            refused: None, refusal_seq: 0, finished: None, cut: None, cut_seen: None, chip: None,
+            readout: RouteReadout::default(), refused: None, refusal_seq: 0, finished: None, cut: None, cut_seen: None, chip: None,
         }));
         self.move_route(cx, at, false);
     }
@@ -1819,6 +2675,12 @@ impl BoardPane {
         let landing = release.then(Self::release_landing);
         let uid = self.uid;
         let Some(route) = self.st.route_mut().filter(|r| r.landing.is_none()) else { return };
+        if release && matches!(route.routing.g.kind, GestureKind::Tune { .. } | GestureKind::RoutePair { .. }) && cx.has_global::<ElecLive>() {
+            if let Some(prior) = cx.get_global::<ElecLive>().snap.last_refusal.as_ref().filter(|r| r.sample == Some(route.routing.id.tag())) {
+                // The release sends a fresh sample. Its answer may be legal even if the last one wasn't.
+                route.refusal_seq = prior.seq;
+            }
+        }
         // Finishing: the router lays the rest from where the head was; the pointer no longer moves
         // it, and the release commits the Finish once it is in.
         if route.routing.g.finish {
@@ -1835,6 +2697,7 @@ impl BoardPane {
         } else {
             None
         };
+        route.routing.set_span_end(&geom.board, p);
         let sample = if release { route.routing.release(p, trail, target) } else { route.routing.moved(p, trail, target) };
         route.sent(sample.seq);
         cx.widget_action(uid, ViewAction::Gesture(sample));
@@ -1869,13 +2732,27 @@ impl BoardPane {
         });
         let uid = self.uid;
         let Some(route) = self.st.route_mut() else { return };
+        let mut redraw = false;
+        if shown == Some(route.routing.id) {
+            if let Some((p, report)) = snap.proposal.as_ref().and_then(|p| Some((p, p.metrics.tune.as_ref()?.as_ref().ok()?))) {
+                if let Some(board) = snap.live().unit(p.unit).and_then(|u| u.board.as_ref()) {
+                    redraw |= route.readout.remember(board, p.id, report);
+                }
+            }
+            if let (Some(net), GestureKind::RoutePair { mate, .. }) = (route.routing.g.net, &route.routing.g.kind) {
+                redraw |= route.readout.remember_pair(snap, net, *mate);
+            }
+        }
         // A refused sample of a released gesture ends it before any commit; its preview goes.
-        if route.landing.as_ref().is_some_and(|l| !l.sent && refused == Some(l.tag)) {
+        let measured = matches!(route.routing.g.kind, GestureKind::Tune { .. } | GestureKind::RoutePair { .. });
+        if route.landing.as_ref().is_some_and(|l| !l.sent && refused == Some(l.tag))
+            && (!measured || refusal.as_ref().is_some_and(|r| r.seq != route.refusal_seq)) {
             log!("fab.board: gesture {} refused before its commit", route.routing.id.0);
+            let why = refusal.as_ref().filter(|_| measured).map(|r| r.reason.clone());
             self.end_drag(Some(cx));
+            if let Some(why) = why { self.note(cx, ChipKind::Refused, why, Vec::new()); }
             return;
         }
-        let mut redraw = false;
         if let Some(answer) = answer.filter(|a| route.seen.as_ref().is_none_or(|seen| !Arc::ptr_eq(seen, a))) {
             // The hand part's ops, from the stretch answer the Finish follows.
             let hand = route.routing.answer.as_ref().map(|kept| kept.ops.len());
@@ -2027,7 +2904,7 @@ impl BoardPane {
         }
         let ready = hold.landing.as_ref().is_some_and(|l| !l.sent) && routing.commit_ready();
         if let Some((count, rows)) = dims {
-            self.st.dims.get_or_insert_with(ItemStates::new).write(count, rows);
+            self.st.set_ordinary_rows(count, rows);
             self.redraw(cx);
         }
         match chip {
@@ -2084,6 +2961,16 @@ impl BoardPane {
         }
         if code == KeyCode::Slash && modifiers.shift {
             return false;
+        }
+        if self.st.route_mut().is_some_and(|r| r.landing.is_none() && matches!(r.routing.g.kind, GestureKind::RoutePair { .. })) {
+            let why = match code {
+                KeyCode::KeyV => "pair vias come next",
+                KeyCode::KeyW => "pair track widths come from the net classes",
+                KeyCode::KeyF => "automatic finish is unavailable for pairs",
+                _ => "the pointer trail sets the pair bends",
+            };
+            self.note(cx, ChipKind::Refused, why.into(), Vec::new());
+            return true;
         }
         let widths = if code == KeyCode::KeyW { self.route_widths(cx) } else { None };
         let uid = self.uid;
@@ -2150,8 +3037,7 @@ impl BoardPane {
         log!("fab.board: holding {item:?}: {} instances in {:.2} ms", held.instances, held.build_ms);
         self.st.held = Some(held);
         self.st.marked.clear();
-        let dims = self.st.dims.get_or_insert_with(ItemStates::new);
-        dims.write(board.next_item as usize, vec![(item.0, [1.0, 0.0, 0.0, 0.0])]);
+        self.st.set_ordinary_rows(board.next_item as usize, vec![(item.0, [1.0, 0.0, 0.0, 0.0])]);
         let routing = if cx.has_global::<ElecLive>() { Routing::hold(&board, unit, item, origin) } else { None };
         self.st.drag = Some(Drag::Hold(Hold {
             unit, item, from, origin, by: P::new(0, 0), previewed: false, tag: None, board, landing: None, routing, seen: None,
@@ -2201,9 +3087,7 @@ impl BoardPane {
         self.st.held = None;
         let (previewed, sent) = match &drag {
             Drag::Hold(hold) => {
-                if let Some(dims) = self.st.dims.as_mut() {
-                    dims.write(hold.board.next_item as usize, Vec::new());
-                }
+                self.selection_marks();
                 (hold.previewed, hold.landing.as_ref().is_some_and(|l| l.sent))
             }
             Drag::Route(route) => (true, route.landing.as_ref().is_some_and(|l| l.sent)),
@@ -2275,11 +3159,16 @@ impl BoardPane {
         self.st.landing().is_some() && self.takes_picture(cx, &draw.board)
     }
 
-    /// The connectivity the ratsnest draws: the host snapshot's for this unit, or `set_conn`'s.
+    /// The connectivity the ratsnest, the route line and Route selected read: the host snapshot's
+    /// for this unit, or `set_conn`'s. None while the unit waits for its whole-board checks: its
+    /// connectivity so far is the board's without its pours, so no line or count is drawn from it.
     fn conn(&self, cx: &mut Cx) -> Option<Arc<Connectivity>> {
         let unit = self.st.unit?;
         if cx.has_global::<ElecLive>() {
             let snap = &cx.get_global::<ElecLive>().snap;
+            if snap.checking(unit) {
+                return None;
+            }
             return snap.of(&snap.conn, unit).map(|t| t.value.clone());
         }
         self.st.conn.clone()
@@ -2307,20 +3196,19 @@ impl BoardPane {
     /// preview's new tracks, vias or part); `None` while the committed board is shown. Ids are
     /// never reused, so this one comparison finds every new item.
     fn fresh_from(&self, cx: &mut Cx) -> Option<u32> {
-        let draw = BoardDraws::current(cx, self.st.unit?)?;
+        let draw = self.st.drawn.as_ref()?;
         let design = self.design(cx)?;
         let committed = design.unit(draw.unit)?.board.as_ref()?;
         (draw.board.next_item > committed.next_item).then_some(committed.next_item)
     }
 
-    /// The route job on this pane's board, and whether the shown picture is its running partial
-    /// (its new copper then draws pending).
-    fn route_job(&self, cx: &Cx) -> Option<(Arc<RouteJobState>, bool)> {
+    /// The job on this pane's board and the snapshot proposal that belongs to that running job.
+    fn route_job(&self, cx: &Cx) -> Option<(Arc<RouteJobState>, Option<Arc<RouteProposal>>)> {
         let unit = self.st.unit?;
         let live = cx.get_global_ref::<ElecLive>()?;
         let job = live.snap.job.clone().filter(|job| job.status.unit == unit)?;
-        let partial = job.end.is_none()
-            && live.snap.proposal.as_ref().is_some_and(|p| matches!(p.source, ProposalSource::Job { job: id, .. } if id == job.status.job));
+        let partial = live.snap.proposal.as_ref().filter(|p| job.end.is_none() && p.unit == unit
+            && matches!(p.source, ProposalSource::Job { job: id, .. } if id == job.status.job)).cloned();
         Some((job, partial))
     }
 
@@ -2329,8 +3217,9 @@ impl BoardPane {
     /// names; None without a host or before a picture.
     fn route_line_key(&mut self, cx: &mut Cx) -> Option<LineKey> {
         let job = self.route_job(cx);
-        if let Some((job, _)) = job.as_ref().filter(|(job, _)| job.end.is_none()) {
-            return Some(LineKey::Job { status: job.status, organic: job.method == Method::Organic });
+        if let Some((job, partial)) = job.as_ref().filter(|(job, _)| job.end.is_none()) {
+            let hand = partial.as_ref().and_then(|p| p.metrics.place.as_ref()).map_or_else(HandLine::default, |m| HandLine::of(&m.hand));
+            return Some(LineKey::Job { status: job.status, organic: job.method == Method::Organic, hand });
         }
         let unit = self.st.unit?;
         let (committed, preview_shown) = {
@@ -2390,13 +3279,13 @@ impl BoardPane {
         cx.widget_action(self.uid, ViewAction::Route { unit, nets, method, reroute });
     }
 
-    /// Whether the armed tool takes drags (Zone, Measure).
+    /// Whether the armed tool takes a shape or ruler drag.
     fn tool_drags(&self) -> bool {
-        matches!(self.st.armed.tool, BoardTool::Zone | BoardTool::Measure)
+        self.st.armed.tool.draws_shape() || self.st.armed.tool == BoardTool::Measure
     }
 
-    /// A Zone or Measure drag from where its press went down to world `to`; `done` on release:
-    /// the ruler stays until the next press, the zone is added. O(1) per move.
+    /// A rectangle or Measure drag from where its press went down to world `to`; `done` on release:
+    /// the ruler stays until the next press, a rectangle commits one edit. O(1) per move.
     fn tool_drag(&mut self, cx: &mut Cx, to: [f64; 2], done: bool) {
         let Some(from) = self.st.press_at else { return };
         match self.st.armed.tool {
@@ -2406,24 +3295,18 @@ impl BoardPane {
                     self.set_armed(cx, self.st.armed.done());
                 }
             }
-            BoardTool::Zone => {
-                let rect = [from[0].min(to[0]), from[1].min(to[1]), from[0].max(to[0]), from[1].max(to[1])];
-                self.st.zone_box = (!done).then_some(rect);
-                if done {
-                    self.add_zone(cx, from, rect);
-                    self.set_armed(cx, self.st.armed.done());
-                }
+            tool if tool.draws_shape() => {
+                self.st.shape.drag(from, to);
+                if done { self.finish_shape(cx); }
             }
             _ => {}
         }
         self.redraw(cx);
     }
 
-    /// A world point snapped to the pane's grid, in nm.
-    fn snapped(&self, at: [f64; 2]) -> P {
-        let grid = (self.grid_mm.max(0.001) * 1e6).round() as i64;
-        let snap = |mm: f64| ((mm * 1e6 / grid as f64).round() as i64 * grid) as Nm;
-        P::new(snap(at[0]), snap(at[1]))
+    fn cancel_shape(&mut self) {
+        self.st.shape.cancel();
+        self.st.press_at = None;
     }
 
     /// The Via tool's click at world `at`: a via there on the net of the copper under it, the Via
@@ -2457,33 +3340,28 @@ impl BoardPane {
         }
     }
 
-    /// The Zone tool's release: a zone over the grid-snapped rectangle on the active copper layer,
-    /// of the net of the copper where the drag began, else ground (`plan::zone`); one undo step.
-    fn add_zone(&mut self, cx: &mut Cx, from: [f64; 2], rect: [f64; 4]) {
+    /// Both gestures commit through the same shape plan in a single history step.
+    fn finish_shape(&mut self, cx: &mut Cx) {
+        let Some(shape) = self.st.shape.finish(self.grid_mm) else { return };
+        self.redraw(cx);
         let Some(design) = self.design(cx) else { return };
-        let Some(draw) = self.st.drawn.clone() else { return };
-        let net = self.net_at(&draw, from);
-        let layer = self.st.active.filter(|l| draw.board.copper_set().has(*l)).unwrap_or(LayerId::F_CU);
-        let area = fab_elec_core::BBox::new(self.snapped([rect[0], rect[1]]), self.snapped([rect[2], rect[3]]));
-        match plan::zone(&design, draw.unit, area, net, layer) {
-            Ok(plan) => {
-                log!("fab.board: {}", plan.label);
-                self.clear_note(cx);
-                cx.widget_action(self.uid, ViewAction::Ops { ops: plan.ops, place: vec![], label: plan.label });
-            }
-            Err(why) => self.note(cx, ChipKind::Refused, why, Vec::new()),
-        }
+        let Some(draw) = self.st.drawn.clone().filter(|d| Some(d.unit) == self.st.unit) else { return };
+        let tool = self.st.armed.tool;
+        let net = if tool == BoardTool::Zone { self.net_at(&draw, shape.from) } else { None };
+        self.send_part_or_shape(cx, shape_gesture(tool, &design, &draw.board, self.st.active, net, shape.points));
+        self.set_armed(cx, self.st.armed.done());
     }
 
-    /// Update from the circuit: the circuit's parts the board does not place yet, placed under
-    /// the board (`plan::place_unplaced`), one undo step; or a chip saying there are none.
+    /// Update from the circuit: the circuit's parts the board does not place yet, placed by the
+    /// placer as a job (`ViewAction::Place`), round the parts that stand; a part it finds no room
+    /// for goes in the row under the board (`plan::place_unplaced`). Or a chip saying there are none.
     fn place_from_circuit(&mut self, cx: &mut Cx) {
         let (Some(unit), Some(design)) = (self.st.unit, self.design(cx)) else { return };
         match plan::place_unplaced(&design, unit) {
-            Ok((place, label)) => {
-                log!("fab.board: {label}");
+            Ok((place, _)) => {
+                log!("fab.board: place {} parts from the circuit on unit {}", place.len(), unit.0);
                 self.clear_note(cx);
-                cx.widget_action(self.uid, ViewAction::Ops { ops: vec![], place, label });
+                cx.widget_action(self.uid, ViewAction::Place { unit, parts: Vec::new(), all: false, free_panel: false });
             }
             Err(why) => self.note(cx, ChipKind::Info, why, Vec::new()),
         }
@@ -2543,8 +3421,9 @@ impl BoardPane {
     fn fit_strip(&mut self, cx: &mut Cx2d, above: Rect) {
         let mut strip = self.tools.widget(cx, ids!(strip));
         let drawn = strip.area().rect(cx);
-        let column = self.tools.widget(cx, ids!(col_a)).area().rect(cx).size.x;
-        let two = column > 0.0 && drawn.size.x > column * 1.5;
+        let a = self.tools.widget(cx, ids!(col_a)).area().rect(cx);
+        let b = self.tools.widget(cx, ids!(col_b)).area().rect(cx);
+        let two = a.size.x > 0.0 && b.pos.x >= a.pos.x + a.size.x;
         if !two {
             self.st.strip_tall = drawn.size.y;
         }
@@ -2569,12 +3448,43 @@ impl BoardPane {
                 self.set_armed(cx, self.st.armed.click(tool, double));
             }
             StripPress::Method => {
-                if let Some(anchor) = method_anchor(cx, &self.tools) {
+                if let Some(anchor) = flyout_anchor(cx, &self.tools, ids!(a_method)) {
                     let rows = METHODS.iter().map(|m| (method_name(*m), *m == self.st.method)).collect();
                     cx.action(BoardStripAction::MethodMenu { rows, anchor });
                 }
             }
+            StripPress::Part(edit) => self.edit_parts(cx, edit, None),
+            StripPress::ArrangeMenu => {
+                let Some(draw) = self.st.drawn.as_ref().filter(|d| Some(d.unit) == self.st.unit) else { return };
+                if let Some(anchor) = flyout_anchor(cx, &self.tools, ids!(a_arrange)) {
+                    let parts: Vec<_> = self.st.parts.items.iter().filter_map(|id| draw.board.placed_item(*id)).collect();
+                    let enabled = ARRANGEMENTS.map(|(_, action)| self.st.parts.transform && action.available(&parts));
+                    cx.action(BoardStripAction::ArrangeMenu { pane: self.uid, unit: draw.unit, enabled, anchor });
+                }
+            }
             StripPress::Shove => self.flip_shove(cx),
+            StripPress::Place => {
+                let (Some(unit), Some(design)) = (self.st.unit, self.design(cx)) else { return };
+                match plan::PlacePress::of(&design, unit, &self.st.parts.ids) {
+                    Ok(press) => {
+                        let parts = &press.parts;
+                        log!("fab.board: place {} on unit {}", if parts.is_empty() { "the parts not on the board".to_owned() } else { format!("{} parts", parts.len()) }, unit.0);
+                        self.clear_note(cx);
+                        if press.send() {
+                            cx.widget_action(self.uid, ViewAction::Place { unit, parts: parts.clone(), all: false, free_panel: false });
+                        }
+                        if !press.held.is_empty() {
+                            self.offer_place(cx, unit, press);
+                        }
+                    }
+                    Err(why) => self.note(cx, ChipKind::Info, why, Vec::new()),
+                }
+            }
+            StripPress::Tidy => {
+                if let Some(unit) = self.st.unit {
+                    cx.action(BoardStripAction::Tidy { unit, parts: self.st.parts.ids.clone() });
+                }
+            }
             StripPress::Fill => self.pour(cx, None),
             // the host's Checks editor lists the findings
             StripPress::Check => cx.action(crate::ElecPanel::Checks),
@@ -2598,6 +3508,7 @@ impl BoardPane {
     /// Arm a tool (or go back to Select); the strip shows it at the next draw.
     fn set_armed(&mut self, cx: &mut Cx, armed: Armed) {
         if self.st.armed != armed {
+            if self.st.armed.tool != armed.tool { self.cancel_shape(); self.st.tune_press = None; self.st.pair_press = None; }
             log!("fab.board: tool {:?}{}", armed.tool, if armed.kept { " (kept)" } else { "" });
             self.st.armed = armed;
             self.redraw(cx);
@@ -2641,6 +3552,9 @@ impl BoardPane {
             route_all: !running && unrouted > 0,
             route_selected: !running && selected > 0,
             clear_routes: !running && clearable,
+            transform: self.st.parts.transform,
+            arrange: self.st.parts.arrange,
+            tidy_busy: self.st.unit.zip(cx.get_global_ref::<Tidying>()).is_some_and(|(unit, busy)| busy.boards.contains(&unit)),
             shove: !self.st.walks,
         }
     }
@@ -2714,9 +3628,11 @@ impl BoardPane {
                 && !p.last;
             follows.then_some((p, snap.live()))
         });
+        // The checks' merge keeps the findings' generation: the flag alone tells it apart.
+        let checking = |unit| cx.get_global_ref::<ElecLive>().is_some_and(|live| live.snap.checking(unit));
         let key = drawn.zip(violations.as_ref()).map(|(draw, (generation, _, awaiting))| {
             let proposal = wave.map_or(0, |(p, _)| Arc::as_ptr(p) as usize);
-            (*generation, Arc::as_ptr(awaiting) as usize, draw.geom_gen, draw.unit, proposal)
+            (*generation, Arc::as_ptr(awaiting) as usize, draw.geom_gen, draw.unit, proposal, checking(draw.unit))
         });
         if key == self.st.marks_key {
             return;
@@ -2789,8 +3705,21 @@ impl BoardPane {
         // job's partial is steady instead (faint, bright edges): a long job draws only on change.
         // Drawn copper whose newest sample waits for its answer shows its old head the same way
         // until the answer is in; a wait still under `STALE_SECONDS` asks for the frame it ends in.
-        let fresh = self.fresh_from(cx).filter(|first| *first < (1 << 24));
+        let mut fresh = self.fresh_from(cx).filter(|first| *first < (1 << 24));
         let job = self.route_job(cx);
+        let place = job.as_ref().and_then(|(job, partial)| {
+            partial.as_ref().filter(|p| p.metrics.place.is_some()).map(|p| (job.status.job, p))
+        });
+        if place.is_some() || self.st.place_preview.is_some() {
+            if let Some(board) = self.st.drawn.as_ref().map(|draw| draw.board.clone()) {
+                let snap = cx.get_global_ref::<ElecLive>().map(|live| live.snap.clone());
+                let source = place.zip(snap.as_deref()).map(|((job, p), snap)| (job, p, snap));
+                if let Some(mut texture) = self.st.sync_place(&board, source, || BoardDraws::templates(cx).map(|t| t.stroke)) {
+                    texture.release(cx);
+                }
+                fresh = self.st.place_fresh_from(fresh);
+            }
+        }
         let waiting = self.st.drag.as_ref().and_then(|drag| match drag {
             Drag::Route(route) if route.landing.is_none() && route.routing.stale() => route.sent.front().map(|(_, since)| *since),
             _ => None,
@@ -2799,7 +3728,7 @@ impl BoardPane {
         if waiting.is_some() && !stale && !cx.next_frame_is_pending(self.st.next_frame) {
             self.st.next_frame = cx.new_next_frame();
         }
-        let pending = fresh.is_some() && (stale || job.as_ref().is_some_and(|(_, partial)| *partial));
+        let pending = fresh.is_some() && (stale || job.as_ref().is_some_and(|(_, partial)| partial.is_some()));
         if fresh.is_some() && !pending && !cx.next_frame_is_pending(self.st.next_frame) {
             self.st.next_frame = cx.new_next_frame();
         }
@@ -2964,9 +3893,15 @@ impl BoardPane {
         }
         let board = self.st.drawn.as_ref().map(|draw| draw.board.clone());
         let name_of = |net: NetId| board.as_ref().and_then(|b| b.nets.get(net.ix())).map(|n| n.name.clone());
+        let part_of = |comp: CompId| board.as_ref().and_then(|b| b.placed_of(comp)).map(|p| p.refdes.clone());
+        let design = self.design(cx);
+        let block_of = |block: BlockId| {
+            let unit = design.as_ref()?.unit(board.as_ref()?.unit)?;
+            unit.circuit.tree.get(block.ix()).map(|b| b.path.clone())
+        };
         let why = self.st.left_open.as_ref().map_or(&[][..], |left| &left.why[..]);
         let line_rect = self.right_of_strip(rect);
-        self.route_line.draw(cx, line_rect, key, &self.st.still_open, why, name_of, &theme);
+        self.route_line.draw(cx, line_rect, key, &self.st.still_open, why, name_of, part_of, block_of, &theme);
         self.draw_drag(cx, &theme, active, &base);
         self.draw_keys(cx, &theme, active, &base, rect);
         self.draw_tool_marks(cx, rect);
@@ -3027,6 +3962,14 @@ impl Widget for BoardPane {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if !matches!(self.st.shape, ShapeGesture::Idle)
+            && (matches!(event, Event::KeyFocus(f) if f.prev == self.draw_bg.area() && f.focus != f.prev)
+                || matches!(event, Event::MouseDown(e) if !self.st.rect.contains(e.abs))
+                || matches!(event, Event::WindowLostFocus(_))) {
+            self.cancel_shape();
+            self.redraw(cx);
+        }
+        if self.settings_event(cx, event, scope) { return; }
         self.route_poll(cx);
         self.hold_poll(cx);
         if self.status.visible() {
@@ -3054,14 +3997,43 @@ impl Widget for BoardPane {
         }
         // The method the strip's flyout picked (the host draws the flyout).
         if let Event::Actions(actions) = event {
-            let picked = actions.iter().filter_map(|a| a.downcast_ref::<BoardStripAction>())
-                .filter_map(|a| match a { BoardStripAction::Method(i) => METHODS.get(*i).copied(), _ => None }).last();
-            if let Some(method) = picked {
-                self.set_method(cx, method);
+            for action in actions {
+                if let Some(wait) = action.downcast_ref::<FillWaitNotice>().filter(|wait| wait.action == StitchPress::ACTION) {
+                    if let Some(stitch) = self.st.stitch.as_mut().filter(|s| s.unit == wait.unit) {
+                        stitch.status(cx, wait.waiting);
+                        self.redraw(cx);
+                    }
+                }
+                if let Some(done) = action.downcast_ref::<BoardEditDone>() {
+                    if let Some(stitch) = self.st.stitch.take_if(|s| s.tag == done.tag) {
+                        if let Some(why) = done.refusal.as_ref().filter(|_| Some(stitch.unit) == self.st.unit) {
+                            self.note(cx, ChipKind::Refused, why.clone(), Vec::new());
+                        }
+                        self.redraw(cx);
+                    }
+                }
+            }
+            for action in actions.iter().filter_map(|a| a.downcast_ref::<BoardStripAction>()) {
+                match action {
+                    BoardStripAction::Method(i) => {
+                        if let Some(&method) = METHODS.get(*i) { self.set_method(cx, method); }
+                    }
+                    BoardStripAction::Arrange { pane, unit, command } if *pane == self.uid && Some(*unit) == self.st.unit => {
+                        self.edit_parts(cx, PartEdit::Arrange(*command), None);
+                    }
+                    _ => {}
+                }
             }
         }
         // The tool strip is over the canvas: its presses, hovers and scrolls are its own.
         let actions = cx.capture_actions(|cx| self.tools.handle_event(cx, event, scope));
+        let board_button = self.tools.button(cx, ids!(a_board));
+        if board_button.clicked(&actions) || matches!(event, Event::Actions(a) if board_button.clicked(a)) {
+            self.toggle_settings(cx);
+        }
+        if self.tools.button(cx, ids!(a_stitch)).clicked(&actions) {
+            self.stitch_pressed(cx);
+        }
         for press in strip_presses(cx, &self.tools, &actions) {
             self.strip_pressed(cx, press);
         }
@@ -3109,11 +4081,12 @@ impl Widget for BoardPane {
             let shown = self.st.drawn.as_ref().map(|d| (d.unit, d.gen, Arc::as_ptr(&d.geom)));
             let current = self.st.unit.and_then(|u| BoardDraws::current(cx, u)).map(|d| (d.unit, d.gen, Arc::as_ptr(&d.geom)));
             // New findings matter only over a drawn board (the marks resolve against it).
-            let findings = self.violations(cx).map(|(generation, _, awaiting)| (generation, Arc::as_ptr(&awaiting) as usize));
+            let checking = self.st.unit.is_some_and(|unit| cx.get_global_ref::<ElecLive>().is_some_and(|live| live.snap.checking(unit)));
+            let findings = self.violations(cx).map(|(generation, _, awaiting)| (generation, Arc::as_ptr(&awaiting) as usize, checking));
             // The route line hides while a job runs on this board and returns when it ends.
             let line = shown.is_some() && self.route_line_key(cx) != self.route_line.key();
             if current.is_some() && current != shown
-                || shown.is_some() && findings != self.st.marks_key.map(|key| (key.0, key.1))
+                || shown.is_some() && findings != self.st.marks_key.map(|key| (key.0, key.1, key.5))
                 || self.st.landing().is_some()
                 || line
             {
@@ -3207,16 +4180,61 @@ impl Widget for BoardPane {
         if matches!(event, Event::DragEnd) {
             self.cancel_placing(cx);
         }
+        // During a press the canvas consumes Escape to release the pointer. Cancel the
+        // board's draft too, including a rectangle over empty space with no drag target.
+        let escape_press = self.pane.pressed() && !matches!(self.st.shape, ShapeGesture::Idle)
+            && matches!(event, Event::KeyDown(k) if k.key_code == KeyCode::Escape);
         let inputs = {
             let Some(draw) = self.st.drawn.clone() else { return };
             let order = self.pick_order();
             let geom = &draw.geom;
-            let items = BoardItems { unit: geom.board.unit, board: &geom.board, scene: &geom.scene, pick: &geom.pick, items: &geom.items, order: &order };
+            let base = BoardItems { unit: geom.board.unit, board: &geom.board, scene: &geom.scene, pick: &geom.pick, items: &geom.items, order: &order };
+            let items = PressItems { base, select: self.st.armed.tool == BoardTool::Select, selected: &self.st.selected };
             self.pane.handle_event(cx, event, self.draw_bg.area(), &items)
         };
         for input in inputs {
             self.input(cx, input);
         }
+        if escape_press && !self.pane.pressed() {
+            self.input(cx, CanvasInput::Escape);
+        }
+        if matches!(event, Event::MouseMove(_)) {
+            self.sync_stitch_target(cx);
+        }
+        if matches!(self.st.armed.tool, BoardTool::Tune | BoardTool::RoutePair) && !self.pane.pressed() {
+            let pointer = match event { Event::MouseMove(e) => Some(e.abs), Event::MouseUp(e) => Some(e.abs), _ => None };
+            if let Some(p) = pointer.filter(|p| self.st.rect.contains(*p)) {
+                let at = self.pane.cam.to_world(p);
+                let order = self.pick_order();
+                if let Some(draw) = &self.st.drawn {
+                    let geom = &draw.geom;
+                    let items = BoardItems { unit: draw.unit, board: &geom.board, scene: &geom.scene, pick: &geom.pick, items: &geom.items, order: &order };
+                    let hits = items.pressed(at, HIT_RADIUS / self.pane.cam.px_per_unit.max(1e-12));
+                    let hand = if self.st.armed.tool == BoardTool::RoutePair {
+                        let press = classify(&geom.board, &hits, nm(at), self.pick_nm(), self.st.active.unwrap_or(LayerId::F_CU), true);
+                        matches!(press, Press::Route { start: Anchor::Pad { .. }, net, .. } if geom.board.pairs.iter().any(|p| p.p == net || p.n == net))
+                    } else {
+                        tune_hit(&geom.board, &hits, nm(at)).is_some()
+                    };
+                    cx.set_cursor(if hand { MouseCursor::Hand } else { MouseCursor::Default });
+                }
+            }
+        }
+        if self.st.armed.tool.draws_shape() {
+            let pointer = match event {
+                Event::MouseMove(e) => Some(e.abs),
+                Event::MouseUp(e) => Some(e.abs),
+                _ => None,
+            };
+            if pointer.is_some_and(|p| self.st.rect.contains(p))
+                && (!self.pane.pressed() || matches!(self.st.shape, ShapeGesture::Rectangle { .. })) {
+                cx.set_cursor(MouseCursor::Crosshair);
+            }
+            if matches!(self.st.shape, ShapeGesture::Polygon(_)) && matches!(event, Event::MouseMove(_)) {
+                self.redraw(cx);
+            }
+        }
+        self.end_marquee(cx);
         // A hovered pour's lit edge follows the pointer (uniforms only).
         if self.st.hover_pour && matches!(event, Event::MouseMove(_)) {
             self.redraw(cx);
@@ -3298,6 +4316,7 @@ impl Widget for BoardPane {
             }
         }
         self.fit_strip(cx, above);
+        self.draw_settings(cx, scope, above);
         // the Checks editor lists the unit this pane shows: told once per change, which redraws
         // the window so the editor follows wherever it drew
         let unit = self.st.drawn.as_ref().map(|draw| draw.unit);
@@ -3335,12 +4354,302 @@ mod tests {
 
     fn snapshot(design: Arc<fab_elec_design::Design>) -> DesignSnapshot {
         DesignSnapshot {
+            profiles: Arc::default(), profile_diags: Arc::default(),
             design, preview: None, preview_tag: None, preview_by: None, created: vec![], last_commit: None,
             sheets: vec![], proposal: None, job: None, conn: vec![], rules: vec![], fills: vec![], sysnets: None, export: vec![], benches: Arc::default(),
             violations: Tagged { unit: None, of: StateOf::Committed, generation: 0, value: Arc::new(vec![]) },
-            awaiting: Arc::new(vec![]), last_refusal: None, stale: StageFlags::default(), head: String::new(),
+            awaiting: Arc::new(vec![]), cases: Arc::default(), checking: vec![], last_refusal: None, stale: StageFlags::default(), head: String::new(),
             source_map: None, docs: None, catalog: None,
         }
+    }
+
+    #[test]
+    fn tune_readout_keeps_the_reported_lengths_and_measurement_qualifiers() {
+        use super::RouteReadout;
+        use fab_elec_board::Board;
+        use fab_elec_core::BoardId;
+        use fab_elec_route::ProposalId;
+        use std::sync::Arc;
+        let mut report = fab_elec_route::meander::Report {
+            reached: 45_000_000, target: 45_000_000, short_by: 0, uncoupled_added: None,
+            partial: false, no_stackup: false,
+        };
+        let values = |s: &str| s.split_whitespace().filter_map(|v| v.trim_end_matches(',').parse::<f64>().ok()).collect::<Vec<_>>();
+        let a = Arc::new(Board::new(BoardId(0), "A"));
+        let b = Arc::new((*a).clone());
+        let mut labels = RouteReadout::default();
+        labels.remember(&a, ProposalId(1), &report);
+        report.reached = 41_234_000;
+        report.short_by = 3_766_000;
+        report.partial = true;
+        report.no_stackup = true;
+        labels.remember(&b, ProposalId(2), &report);
+        assert_eq!(values(labels.shown(&a).unwrap()), [45., 45., 0.], "the earlier picture still shows its own report");
+        let text = labels.shown(&b).unwrap();
+        assert_eq!(values(text), [41.234, 45., 3.766]);
+        assert!(text.contains("short") && text.contains("partial") && text.contains("vias not counted: no stackup"));
+    }
+
+    #[test]
+    fn pair_release_joins_both_pads_in_one_step_and_waits_for_its_preview_connectivity() {
+        use super::{classify, snap_target, Press, RouteReadout, Routing};
+        use super::super::{nodes::Pressed, pick::Hit, scene::{Role, Tag}};
+        use fab_elec_board::{connect, resolve_rules, Anchor};
+        use fab_elec_core::{Canon, LayerId, PadIx};
+        use fab_elec_design::DesignOp;
+        use fab_elec_route::{head, Base, GestureKind, ProposalId, RBase};
+        let mut sources = fab_elec_lang::Sources::new();
+        sources.add("pair.ckt.splash", r#"use mod.elec.*
+let e = mod.elec
+let p = e.net({name: "P"})
+let n = e.net({name: "N"})
+let a = e.r(1kohm, p, n)
+let b = e.r(1kohm, p, n)
+let c = e.r(1kohm, e.net({name: "other"}), e.net({name: "return"}))
+e.pair(p, n, {gap: 0.6mm skew: 0.1mm})
+"#).unwrap();
+        sources.add("pair.pcb.splash", r#"board("pair")
+outline([[[0mm 0mm] [40mm 0mm] [40mm 30mm] [0mm 30mm] [0mm 0mm]]])
+place("a", [10mm 5mm])
+place("b", [25mm 20mm], {rot: -90deg})
+place("c", [35mm 5mm])
+"#).unwrap();
+        let design = Arc::new(fab_elec_lang::evaluate(&sources, &fab_elec_lang::std_libs()).unwrap().design);
+        let unit = &design.units[0];
+        let board = unit.board.as_ref().unwrap();
+        let pair = board.pairs[0];
+        let layer = LayerId::F_CU;
+        let rules = Arc::new(resolve_rules(board, None));
+        let pad = |part: &str, net| {
+            let placed = board.placed_of(unit.circuit.comp(part).unwrap().id).unwrap();
+            let i = placed.pad_nets.iter().position(|v| *v == Some(net)).unwrap();
+            let a = Anchor::Pad { placed: placed.id, pad: PadIx(i as u16) };
+            let p = board.anchor_pos(a).unwrap();
+            let hit = Hit { layer, tag: Tag { item: placed.id, sub: i as u32, role: Role::Pad }, net: Some(net), index: 0, poly: false, dist: 0 };
+            (a, p, hit)
+        };
+        let press = |at, hit| classify(board, &[Pressed::Copper(hit)], at, 0, layer, true);
+        let (a, at, hit) = pad("a", pair.p);
+        let ordinary = press(at, hit);
+        assert!(matches!(Routing::start(&ordinary, board, unit.id).unwrap().g.kind, GestureKind::Route));
+        let mut drag = Routing::pair(board, &rules, ordinary).unwrap().unwrap();
+        let (mate, mate_at, _) = pad("a", pair.n);
+        assert_eq!(drag.g.start, a);
+        assert!(matches!(drag.g.kind, GestureKind::RoutePair { mate: n, mate_start, mate_start_at }
+            if n == pair.n && mate_start == mate && mate_start_at == mate_at));
+        let (_, at, hit) = pad("c", board.net("other").unwrap());
+        assert!(Routing::pair(board, &rules, press(at, hit)).unwrap().is_none());
+        assert!(Routing::pair(board, &rules, Press::Nothing).unwrap().is_none());
+
+        let base_conn = Arc::new(connect(board, &[]));
+        assert!(base_conn.unrouted.contains(&pair.p) && base_conn.unrouted.contains(&pair.n));
+        let base = Base::new(board.clone(), rules, base_conn.clone(), Arc::default());
+        drag.moved(P::mm(10., 20.), 0, None);
+        let (arrival, at, hit) = pad("b", pair.n);
+        let target = snap_target(board, &[hit], &drag.g).unwrap();
+        assert_eq!(target.0, arrival);
+        let sample = drag.release(at, 0, Some(target));
+        let answer = Arc::new(head::answer(&base, &RBase::build(board), &sample, &mut head::GestureState::default(), ProposalId(1)).proposal().unwrap());
+        assert!(answer.verified, "{:?}", answer.metrics.pair_refusal);
+        assert!(drag.offer(&answer) && drag.commit_ready());
+        let report = answer.pair.as_ref().unwrap();
+        assert!(report.blocked.is_none());
+        let ops: Vec<_> = answer.ops.iter().cloned().map(|op| DesignOp::Board { unit: unit.id, op }).collect();
+        let mut preview = (*design).clone();
+        let applied = preview.apply_all(&ops, false).unwrap();
+        let [step] = applied.as_slice() else { panic!("both legs form one undo step") };
+        let drawn = preview.units[0].board.as_ref().unwrap().clone();
+        assert_eq!(drawn.tracks.len(), 2);
+        assert!(drawn.tracks.iter().flat_map(|t| t.ends).all(|a| matches!(a, Anchor::Pad { .. })));
+        let mut snap = snapshot(design.clone());
+        snap.preview = Some(Arc::new(preview.clone()));
+        snap.proposal = Some(answer.clone());
+        let tag = |of, generation, value| Tagged { unit: Some(unit.id), of, generation, value };
+        snap.conn.push(tag(StateOf::Committed, board.generation, base_conn.clone()));
+        snap.checking.push(unit.id);
+        // Even a preview-tagged result is provisional while the unit owes its checks.
+        snap.conn.push(tag(StateOf::Preview, drawn.generation, base_conn.clone()));
+        let mut labels = RouteReadout::default();
+        assert!(labels.remember_pair(&snap, pair.p, pair.n));
+        let pending = labels.shown(&drawn).unwrap();
+        assert!(pending.contains("checking connectivity") && !pending.contains("partial"));
+        let values = |s: &str| s.split_whitespace().filter_map(|v| v.parse::<f64>().ok()).collect::<Vec<_>>();
+        let nums = values(pending);
+        assert_eq!(nums.len(), 4);
+        assert_eq!(pending.split_whitespace().filter(|word| *word == "mm").count(), nums.len());
+        assert!((nums[0] * 1e6 - report.p_length as f64).abs() <= 500.);
+        assert!((nums[1] * 1e6 - report.n_length as f64).abs() <= 500.);
+        assert!((nums[2] * 1e6 - report.skew as f64).abs() <= 5000.);
+        assert_eq!(nums[3], 0.1);
+        // When checking clears, an older generation still cannot qualify the legs.
+        snap.conn.pop();
+        snap.conn.push(tag(StateOf::Preview, board.generation, base_conn));
+        snap.checking.clear();
+        assert!(!labels.remember_pair(&snap, pair.p, pair.n));
+        let joined = Arc::new(connect(&drawn, &[]));
+        assert!(!joined.unrouted.contains(&pair.p) && !joined.unrouted.contains(&pair.n));
+        snap.conn.push(tag(StateOf::Preview, drawn.generation, joined));
+        assert!(labels.remember_pair(&snap, pair.p, pair.n));
+        let done = labels.shown(&drawn).unwrap();
+        assert!(!done.contains("partial") && !done.contains("checking connectivity"));
+        assert_eq!(values(done), nums);
+        assert!(!labels.remember_pair(&snap, pair.p, pair.n));
+        preview.apply_all(&step.inverse(), true).unwrap();
+        assert_eq!(preview.units[0].board.as_ref().unwrap().content_hash(), board.content_hash());
+    }
+
+    #[test]
+    fn polygon_clicks_and_rectangle_drags_commit_the_drawn_points_once() {
+        use super::{BoardTool, ShapeGesture};
+        use fab_elec_board::{Area, BoardOp, Item};
+        use fab_elec_core::{BBox, Canon, LayerId, PolySet};
+        use fab_elec_design::DesignOp;
+        let grid = 0.5;
+        let zoom = 10.0;
+        let clicks = [[2.12, 3.12], [8.1, 3.2], [8.2, 9.1], [5.1, 6.1], [2.2, 9.22]];
+        let polygon = [P::mm(2.0, 3.0), P::mm(8.0, 3.0), P::mm(8.0, 9.0), P::mm(5.0, 6.0), P::mm(2.0, 9.0)];
+        let mut gesture = ShapeGesture::Idle;
+        for tool in [BoardTool::Zone, BoardTool::Outline, BoardTool::Keepout, BoardTool::Cutout] {
+            let mut design = fab_elec_fixtures::ledctl();
+            let board = design.units[0].board.clone().unwrap();
+            let before = board.content_hash();
+            for at in clicks { assert!(!gesture.click(at, grid, zoom, 1)); }
+            gesture.backspace();
+            assert!(!gesture.click(clicks[4], grid, zoom, 1));
+            match tool {
+                BoardTool::Zone => {
+                    // Five screen points from the first vertex: close without appending it.
+                    assert!(gesture.click([2.5, 3.0], grid, zoom, 1));
+                }
+                BoardTool::Outline => {
+                    // The second tap of the last double-click can land on a different grid point.
+                    assert!(gesture.click([2.3, 9.2], grid, zoom, 2));
+                }
+                // Enter finishes the existing vertices.
+                BoardTool::Keepout | BoardTool::Cutout => {}
+                _ => unreachable!(),
+            }
+            let shape = gesture.finish(grid).unwrap();
+            assert_eq!(shape.from, clicks[0], "the unsnapped start picks a zone's net");
+            assert_eq!(shape.points, polygon);
+            let plan = shape.plan(tool, &design, &board, Some(LayerId::B_CU), board.net("GND")).unwrap();
+            let [DesignOp::Board { op, .. }] = plan.ops.as_slice() else { panic!("one op for {tool:?}") };
+            let area = PolySet::from_ring_nonzero(polygon.to_vec());
+            match op {
+                BoardOp::Add(Item::Zone(z)) => assert_eq!(z.area, Area::Poly(area)),
+                BoardOp::Add(Item::Keepout(k)) => assert_eq!(k.area, area),
+                BoardOp::SetOutline(contours) => assert_eq!(PolySet::from_ring_nonzero(contours[0].to_ring(1)), area),
+                BoardOp::Add(Item::Cutout(c)) => assert_eq!(PolySet::from_ring_nonzero(c.contour.to_ring(1)), area),
+                _ => panic!("unexpected {tool:?} op"),
+            }
+            let steps = design.apply_all(&plan.ops, false).unwrap();
+            let [step] = steps.as_slice() else { panic!("one history step for {tool:?}") };
+            design.apply_all(&step.inverse(), true).unwrap();
+            assert_eq!(design.units[0].board.as_ref().unwrap().content_hash(), before);
+            assert!(gesture.finish(grid).is_none());
+        }
+
+        // Escape and Backspace on the first vertex both leave nothing to commit.
+        gesture.click(clicks[0], grid, zoom, 1);
+        gesture.cancel();
+        assert!(gesture.finish(grid).is_none());
+        gesture.click(clicks[0], grid, zoom, 1);
+        gesture.backspace();
+        assert!(gesture.finish(grid).is_none());
+
+        // A drag replaces any open path. Reversed corners still give the old zone rectangle.
+        gesture.click(clicks[0], grid, zoom, 1);
+        gesture.drag(clicks[2], clicks[0]);
+        let rect = gesture.finish(grid).unwrap();
+        let design = fab_elec_fixtures::ledctl();
+        let board = design.units[0].board.as_ref().unwrap();
+        let plan = rect.plan(BoardTool::Zone, &design, board, Some(LayerId::F_CU), None).unwrap();
+        let [DesignOp::Board { op: BoardOp::Add(Item::Zone(z)), .. }] = plan.ops.as_slice() else { panic!("one zone") };
+        assert_eq!(rect.from, clicks[2]);
+        assert_eq!(z.area, Area::Poly(PolySet::rect(BBox::new(polygon[0], polygon[2]))));
+    }
+
+    #[test]
+    fn place_preview_follows_the_drawn_round_and_restores_pane_rows() {
+        use super::{rats, BoardOp, Field, Item, JobId, PaneState, ProposalSource, RouteProposal, StrokeTemplate};
+        use fab_elec_core::{Angle, CompId, ItemId};
+        use fab_elec_parts::FpTextKind;
+
+        let mut snap = snapshot(Arc::new(fab_elec_fixtures::ledctl()));
+        let unit = snap.design.units.iter().position(|u| u.board.is_some()).unwrap();
+        let base = snap.design.units[unit].board.clone().unwrap();
+        let (a, b, label) = (&base.placed[0], &base.placed[1], &base.placed[2]);
+        let to = a.at.add(P::mm(2.0, 1.0));
+        let job = JobId(1);
+        let round = |step, ops: Vec<BoardOp>| {
+            let mut board = (*base).clone();
+            board.apply_all(&ops).unwrap();
+            let proposal = Arc::new(RouteProposal {
+                pair: None,
+                id: Default::default(), source: ProposalSource::Job { job, step }, unit: board.unit,
+                base_generation: base.generation, base_hash: Default::default(), ops, checked: None,
+                metrics: fab_elec_route::RouteMetrics { place: Some(Default::default()), ..Default::default() },
+                verified: true, collisions: vec![], open: vec![], head: None, solve_us: 0, last: false, label: String::new(),
+            });
+            (proposal, Arc::new(board))
+        };
+        let label_pose = fab_elec_board::LabelPose { at: P::mm(2.0, 3.0), rot: Angle::QUARTER, pinned: false };
+        let (first, shown) = round(0, vec![
+            BoardOp::SetField { item: a.id, field: Field::At(to) },
+            BoardOp::SetField { item: a.id, field: Field::Rot(a.rot.add(Angle::QUARTER)) },
+            BoardOp::SetField { item: a.id, field: Field::Side(a.side.flipped()) },
+            BoardOp::SetField { item: b.id, field: Field::Rot(b.rot.add(Angle::QUARTER)) },
+            BoardOp::SetField { item: label.id, field: Field::Label(FpTextKind::Reference, Some(label_pose)) },
+        ]);
+        let preview = |board| {
+            let mut d = (*snap.design).clone();
+            d.units[unit].board = Some(board);
+            Arc::new(d)
+        };
+        let template = || Some(StrokeTemplate::packed());
+        let cached = || panic!("an unchanged or unmatched picture must reuse its lines");
+        let mut pane = PaneState::default();
+        snap.preview = Some(preview(shown.clone()));
+        pane.sync_place(&base, Some((job, &first, &snap)), cached);
+        assert!(pane.dims.is_none(), "the committed picture waiting for the first round stays settled");
+        pane.sync_place(&shown, Some((job, &first, &snap)), template);
+        assert_eq!(base.next_item, shown.next_item, "the first round only edits existing ids");
+        assert_eq!(pane.place_fresh_from(None), Some(1 << 24), "a moved-only round enables the pending shader");
+        let rows = pane.dims.as_ref().unwrap();
+        assert_eq!(rows.row(a.id.ix())[2], 1.0, "a translated placement is pending");
+        assert_eq!(rows.row(b.id.ix())[2], 1.0, "a rotation about an unchanged origin is pending");
+        assert_eq!(rows.row(label.id.ix())[2], 0.0, "a label edit doesn't ghost the placement");
+        let lines = pane.place_preview.as_ref().unwrap().lines.as_ref().unwrap().publication();
+        let mut expected = Vec::new();
+        rats::append_line(&mut expected, a.at, to, &StrokeTemplate::packed());
+        assert_eq!(lines.segments()[0].data(), expected, "one hairline, from the committed to the shown origin");
+        pane.sync_place(&shown, Some((job, &first, &snap)), cached);
+
+        let mut brought = a.clone();
+        brought.id = ItemId(base.next_item);
+        brought.comp = CompId(base.placed.iter().map(|p| p.comp.0).max().unwrap() + 1);
+        let (next, new_board) = round(1, vec![
+            BoardOp::Add(Item::Placed(brought)),
+            BoardOp::SetField { item: label.id, field: Field::Side(label.side.flipped()) },
+        ]);
+        snap.preview = Some(preview(new_board.clone()));
+        pane.sync_place(&shown, Some((job, &next, &snap)), cached);
+        assert_eq!(pane.dims.as_ref().unwrap().row(a.id.ix())[2], 1.0, "the old visible round keeps its marks");
+        pane.sync_place(&new_board, Some((job, &next, &snap)), template);
+        let rows = pane.dims.as_ref().unwrap();
+        assert_eq!(rows.row(a.id.ix())[2], 0.0, "replacement clears old marks");
+        assert_eq!(rows.row(label.id.ix())[2], 1.0, "the replacement marks a flip in place");
+        assert_eq!(rows.row(base.next_item as usize)[2], 0.0, "a brought part uses only the fresh-id threshold");
+        assert_eq!(pane.place_fresh_from(Some(base.next_item)), Some(base.next_item), "brought parts retain their threshold");
+        assert!(pane.place_preview.as_ref().unwrap().lines.is_none(), "a flip in place and a brought part get no line");
+        assert!(pane.sync_place(&new_board, None, cached).is_some() && pane.dims.is_none(), "removal restores an absent binding");
+        assert!(pane.place_fresh_from(None).is_none(), "ending the job disables the moved-only treatment");
+
+        pane.set_ordinary_rows(new_board.next_item as usize, vec![(label.id.0, [1.0, 1.0, 0.0, 0.0])]);
+        pane.sync_place(&new_board, Some((job, &next, &snap)), template);
+        assert_eq!(pane.dims.as_ref().unwrap().row(label.id.ix()), [1.0, 1.0, 1.0, 0.0], "dimming and emphasis coexist with the move");
+        pane.sync_place(&new_board, None, cached);
+        assert_eq!(pane.dims.as_ref().unwrap().row(label.id.ix()), [1.0, 1.0, 0.0, 0.0], "ending the job preserves ordinary rows");
     }
 
     #[test]

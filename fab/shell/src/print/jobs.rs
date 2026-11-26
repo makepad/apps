@@ -8,9 +8,9 @@
 //! - `plate/`: the plate's scripts as they were;
 //! - `state.txt`: where the job is now, the only file that changes.
 //!
-//! A job appears whole: its folder is written under another name and then renamed. The running and
-//! queued jobs always stay; of the ended ones the newest [`KEEP_ENDED`] stay, up to
-//! [`KEEP_ENDED_BYTES`]. A queued job starts only on a person's press: the plate has to be cleared.
+//! A job appears whole when its temporary folder is renamed. Startup discards interrupted writes.
+//! Committed jobs stay in the print history until the person deletes them. A queued job starts
+//! only when the person confirms the plate has been cleared.
 //!
 //! Main-loop cost: none on disk (workers read and write it), a list scan per printer report.
 
@@ -18,11 +18,7 @@ use super::*;
 use fab_printer_link::model::TrayId;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-
-/// The ended jobs kept, newest first.
-pub const KEEP_ENDED: usize = 20;
-/// What the ended jobs may hold on disk; the newest always stays.
-pub const KEEP_ENDED_BYTES: u64 = 2 << 30;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const FORMAT: &str = "1";
 const PACKAGE: &str = "package.gcode.3mf";
@@ -47,6 +43,12 @@ pub struct JobMeta {
     /// Its folder's name.
     pub id: String,
     pub name: String,
+    /// The confirmed destination. Jobs saved before the printer picker have none.
+    pub printer: Option<String>,
+    /// Whether the confirmed destination uses a virtual printer link.
+    pub virtual_printer: bool,
+    /// The serial suffix shown by the confirmed link, when available.
+    pub serial_suffix: Option<String>,
     /// Wall-clock seconds of the press of Print.
     pub created: f64,
     /// Print time and printer routines inside it (s).
@@ -61,8 +63,13 @@ pub struct JobMeta {
     /// The filaments it prints with (0-based), and the tray that feeds each slot.
     pub used: Vec<usize>,
     pub trays: Vec<Option<TrayId>>,
-    /// The filament colours its preview draws.
+    /// Print-side colours, including the print colour's fallback for an unknown tray.
     pub colours: Vec<[f32; 4]>,
+    /// Tools whose Material preview shows red in place of their print-side colour.
+    pub unknown_spool_tools: Vec<usize>,
+    /// Empty for a job saved before model palettes.
+    pub model_colours: Vec<[f32; 4]>,
+    pub shared_colour_tools: Vec<usize>,
     /// The plate's object label ids, by part: the G-code names parts by these.
     pub labels: Vec<u32>,
     pub flow_calibration: bool,
@@ -139,23 +146,66 @@ fn one_line(s: &str) -> String {
     s.replace(['\n', '\r'], " ")
 }
 
+/// Whether the configured model names the model in the job's slicer profile.
+pub fn same_printer(configured: &str, printer_model: &str) -> bool {
+    makepad_fab_settings::family::of_model(printer_model.trim()).is_some_and(|f| f.same_model(configured, printer_model))
+}
+
 impl JobMeta {
+    /// Jobs saved without a destination could only have gone to a configured printer.
+    pub fn for_printer(&self, choice: &PrinterChoice) -> bool {
+        match (self.printer.as_deref(), choice) {
+            (None, PrinterChoice::Real(_)) => true,
+            (Some(id), PrinterChoice::Real(name)) => id.strip_prefix("printer:") == Some(name.as_str()),
+            (Some(id), PrinterChoice::Virtual(name)) => id.strip_prefix("virtual:") == Some(name.as_str()),
+            _ => false,
+        }
+    }
+
+    pub(super) fn for_report(&self, printer: &PrinterChoice, report: &fab_printer_link::Snapshot) -> bool {
+        self.virtual_printer == report.virtual_printer && self.for_printer(printer)
+            && self.serial_suffix.as_ref().zip(report.serial_suffix.as_ref()).is_none_or(|(saved, reported)| saved == reported)
+    }
+
     /// A new job's folder name: ordered by time, readable, unique per press.
     pub fn new_id(name: &str, created: f64) -> String {
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let now_ms = (created * 1000.0) as u64;
+        let mut last = LAST.load(Ordering::Relaxed);
+        let stamp = loop {
+            let next = now_ms.max(last + 1);
+            match LAST.compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break next,
+                Err(actual) => last = actual,
+            }
+        };
         let safe: String = name.chars().take(48).map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect();
-        format!("{:014}-{safe}", (created * 1000.0) as u64)
+        format!("{stamp:014}-{safe}")
     }
 
     fn text(&self) -> String {
-        let colours = self.colours.iter().map(|c| numbers(c)).collect::<Vec<_>>().join(";");
+        let palette = |v: &[[f32; 4]]| v.iter().map(|c| numbers(c)).collect::<Vec<_>>().join(";");
+        let colours = palette(&self.colours);
+        let model_colours = palette(&self.model_colours);
+        let shared_colour_tools = numbers(&self.shared_colour_tools);
         let trays = self.trays.iter().map(|t| t.map_or("-".to_string(), |t| format!("{}:{}", t.ams, t.slot))).collect::<Vec<_>>().join(",");
         let mut out = format!(
-            "format={FORMAT}\nname={}\ncreated={}\nplanned={}\nprepare={}\nlayers={}\nmax_z={}\ntool_changes={}\nfilament_mm={}\nfilament_g={}\nused={}\ntrays={trays}\ncolours={colours}\nlabels={}\nflow_calibration={}\ntimelapse={}\nhead_offset_x={}\nhead_lift={}\ndual={}\nprinter_model={}\nmachine_preset={}\n",
+            "format={FORMAT}\nname={}\ncreated={}\nplanned={}\nprepare={}\nlayers={}\nmax_z={}\ntool_changes={}\nfilament_mm={}\nfilament_g={}\nused={}\ntrays={trays}\ncolours={colours}\nmodel_colours={model_colours}\nshared_colour_tools={shared_colour_tools}\nlabels={}\nflow_calibration={}\ntimelapse={}\nhead_offset_x={}\nhead_lift={}\ndual={}\nprinter_model={}\nmachine_preset={}\n",
             one_line(&self.name), self.created, self.planned, self.prepare, self.layers, self.max_z, self.tool_changes,
             numbers(&self.filament_mm), numbers(&self.filament_g), numbers(&self.used), numbers(&self.labels),
             self.flow_calibration, self.timelapse, self.head_offset_x, self.head_lift, self.dual,
             one_line(&self.printer_model), one_line(&self.machine_preset),
         );
+        if !self.unknown_spool_tools.is_empty() {
+            out.push_str(&format!("unknown_spool_tools={}\n", numbers(&self.unknown_spool_tools)));
+        }
+        if let Some(id) = &self.printer {
+            out.push_str(&format!("printer={}\n", one_line(id)));
+        }
+        out.push_str(&format!("virtual={}\n", self.virtual_printer));
+        if let Some(suffix) = &self.serial_suffix {
+            out.push_str(&format!("serial={}\n", one_line(suffix)));
+        }
         for preset in &self.filament_presets {
             out.push_str(&format!("filament_preset={}\n", one_line(preset)));
         }
@@ -198,12 +248,18 @@ impl JobMeta {
             "-" => Some(None),
             t => t.split_once(':').and_then(|(a, s)| Some(Some(TrayId { ams: a.parse().ok()?, slot: s.parse().ok()? }))),
         }).collect::<Option<Vec<_>>>()?;
-        let colours = get("colours")?.split(';').filter(|c| !c.is_empty()).map(|c| {
+        let palette = |text: &str| text.split(';').filter(|c| !c.is_empty()).map(|c| {
             parse_numbers::<f32>(c).and_then(|c| <[f32; 4]>::try_from(c).ok())
-        }).collect::<Option<Vec<_>>>()?;
+        }).collect::<Option<Vec<_>>>();
         Some(JobMeta {
             id: id.to_string(),
             name: get("name")?.to_string(),
+            printer: get("printer").map(str::to_string),
+            virtual_printer: match get("virtual") {
+                Some(flag) => flag.parse().ok()?,
+                None => get("printer").is_some_and(|id| id.starts_with("virtual:")),
+            },
+            serial_suffix: get("serial").map(str::to_string),
             created: num("created")?,
             planned: num("planned")?,
             prepare: num("prepare")?,
@@ -214,7 +270,10 @@ impl JobMeta {
             filament_g: parse_numbers(get("filament_g")?)?,
             used: parse_numbers(get("used")?)?,
             trays,
-            colours,
+            colours: palette(get("colours")?)?,
+            unknown_spool_tools: parse_numbers(get("unknown_spool_tools").unwrap_or(""))?,
+            model_colours: palette(get("model_colours").unwrap_or(""))?,
+            shared_colour_tools: parse_numbers(get("shared_colour_tools").unwrap_or(""))?,
             labels: parse_numbers(get("labels")?)?,
             flow_calibration: get("flow_calibration")? == "true",
             timelapse: get("timelapse")? == "true",
@@ -282,6 +341,7 @@ impl JobState {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SavedState {
     pub state: JobState,
+    pub stopped_reason: Option<String>,
     /// Wall-clock seconds it was started and ended.
     pub started: Option<f64>,
     pub ended: Option<f64>,
@@ -294,6 +354,7 @@ impl SavedState {
         let mut out = format!("state={}\nreached={}\n", self.state.word(), self.reached);
         if let Some(t) = self.started { out.push_str(&format!("started={t}\n")); }
         if let Some(t) = self.ended { out.push_str(&format!("ended={t}\n")); }
+        if let Some(why) = &self.stopped_reason { out.push_str(&format!("stopped_reason={}\n", one_line(why))); }
         if let JobState::Failed(why) = &self.state { out.push_str(&format!("why={}\n", one_line(why))); }
         out
     }
@@ -310,7 +371,7 @@ impl SavedState {
             _ => return None,
         };
         let time = |key: &str| map.get(key).and_then(|v| v.parse().ok());
-        Some(SavedState { state, started: time("started"), ended: time("ended"), reached: time("reached").unwrap_or(0.0) })
+        Some(SavedState { stopped_reason: map.get("stopped_reason").map(|s| s.to_string()), state, started: time("started"), ended: time("ended"), reached: time("reached").unwrap_or(0.0) })
     }
 }
 
@@ -362,35 +423,14 @@ pub fn read_all(dir: &Path) -> Vec<(JobMeta, SavedState)> {
             out.push((meta, state));
         }
     }
-    out.sort_by(|a, b| b.0.created.total_cmp(&a.0.created));
+    out.sort_by(|a, b| b.0.created.total_cmp(&a.0.created).then_with(|| b.0.id.cmp(&a.0.id)));
     out
-}
-
-fn folder_bytes(path: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(path) else { return 0 };
-    entries.flatten().map(|e| match e.metadata() {
-        Ok(m) if m.is_dir() => folder_bytes(&e.path()),
-        Ok(m) => m.len(),
-        Err(_) => 0,
-    }).sum()
-}
-
-/// Removes the ended jobs past the bounds, oldest first; returns their ids.
-pub fn prune(dir: &Path) -> Vec<String> {
-    let (mut kept, mut bytes, mut gone) = (0, 0, Vec::new());
-    for (meta, _) in read_all(dir).iter().filter(|(_, s)| s.state.ended()) {
-        kept += 1;
-        bytes += folder_bytes(&dir.join(&meta.id));
-        if (kept > KEEP_ENDED || bytes > KEEP_ENDED_BYTES) && kept > 1 && remove(dir, &meta.id).is_ok() {
-            gone.push(meta.id.clone());
-        }
-    }
-    gone
 }
 
 /// A job Fab holds: what is on disk, and its preview while it is wanted.
 #[derive(Clone, Debug, Default)]
 pub struct CommittedJob {
+    pub stopped_reason: Option<String>,
     pub meta: Arc<JobMeta>,
     pub state: JobState,
     /// Its own preview: made from its package, or the slice its package was made from. Immutable,
@@ -405,10 +445,9 @@ pub struct CommittedJob {
     pub ended_at: Option<f64>,
     /// How far it printed (s of its preview).
     pub reached: f64,
-    /// Read from disk: no link's tracker knows it, the printer's reports alone say how it ends.
+    /// Restored from disk or left on a previous link. Only printer reports can say how it ends.
     pub restored: bool,
-    /// `Snapshot::job_sends` once the link has taken it: what the link's tracker said before
-    /// that was about another job.
+    /// Send number on the current link. Zero means no send tracker owns this job.
     pub link_send: u64,
 }
 
@@ -422,6 +461,7 @@ impl CommittedJob {
             ended_at: saved.ended.map(here),
             reached: saved.reached,
             state: saved.state,
+            stopped_reason: saved.stopped_reason,
             restored: true,
             ..Default::default()
         }
@@ -432,6 +472,7 @@ impl CommittedJob {
         let there = |t: f64| wall - (now - t);
         SavedState {
             state: self.state.clone(),
+            stopped_reason: self.stopped_reason.clone(),
             started: (!matches!(self.state, JobState::Queued | JobState::Preparing)).then(|| there(self.sent_at)),
             ended: self.ended_at.map(there),
             reached: self.reached,
@@ -446,7 +487,9 @@ mod tests {
     fn meta(id: &str, created: f64) -> JobMeta {
         JobMeta {
             id: id.into(), name: "lattice cube".into(), created, planned: 7225.5, prepare: 321.25, layers: 174, max_z: 34.8, tool_changes: 3,
+            printer: Some("printer:bench".into()), virtual_printer: false, serial_suffix: Some("0001".into()),
             filament_mm: vec![1000.5, 0.0], filament_g: vec![3.25, 0.0], used: vec![0], trays: vec![Some(TrayId { ams: 1, slot: 2 }), None],
+            unknown_spool_tools: vec![1], model_colours: vec![[1.0, 0.0, 0.0, 1.0], [0.0, 0.2, 0.0, 1.0]], shared_colour_tools: vec![0],
             colours: vec![[0.5, 0.25, 1.0, 1.0], [0.1, 0.2, 0.3, 1.0]], labels: vec![12, 345], flow_calibration: true, timelapse: false,
             head_offset_x: 26.5, head_lift: 2.25, dual: true, printer_model: "H2D".into(), machine_preset: "a machine".into(), filament_presets: vec!["one, with a comma".into(), "two".into()],
             accepted: vec![Accepted { kind: "floating_island".into(), layer: Some(58), count: 5 }, Accepted { kind: "out_of_reach".into(), layer: None, count: 1 }],
@@ -463,17 +506,139 @@ mod tests {
     }
 
     #[test]
+    fn same_millisecond_job_ids_increase() {
+        let first = JobMeta::new_id("cube", 100.5);
+        let second = JobMeta::new_id("cube", 100.5);
+        assert!(second > first, "successive presses in one millisecond need increasing folder ids: {first}, {second}");
+    }
+
+    #[test]
+    fn printer_reports_only_reconcile_their_own_jobs() {
+        use fab_printer_link::{JobStage, JobStatus, Snapshot, model::PrinterState};
+
+        // A config and a virtual printer can share both a name and the file they print.
+        let a = PrinterChoice::Real("bench".into());
+        let b = PrinterChoice::Virtual("bench".into());
+        let spare = PrinterChoice::Real("spare".into());
+        let job = JobMeta { id: "a".into(), name: "cube".into(), layers: 4, printer_model: "Bambu Lab H2D".into(), printer: a.id(), ..Default::default() };
+        let text = job.text();
+        assert_eq!(text.lines().filter(|l| l.starts_with("printer=")).collect::<Vec<_>>(), ["printer=printer:bench"], "one configured destination line");
+        assert_eq!(JobMeta::parse("a", &text).unwrap(), job, "the destination round-trips with the job");
+        let old = JobMeta::parse("old", &text.replace("printer=printer:bench\n", "").replace("virtual=false\n", "")).unwrap();
+        assert!(!old.virtual_printer, "a job saved without a destination used a real link");
+        assert_eq!(old.printer, None, "an earlier record has no destination");
+        let other = JobMeta { id: "b".into(), printer: b.id(), virtual_printer: true, ..job.clone() };
+        assert!(text.lines().any(|l| l == "virtual=false") && other.text().lines().any(|l| l == "virtual=true"));
+        assert_eq!(JobMeta::parse("b", &other.text()).unwrap(), other, "the virtual link survives a restart");
+        assert_eq!(other.printer.as_deref(), Some("virtual:bench"), "the virtual destination has its own namespace");
+        let legacy_virtual = JobMeta::parse("legacy-virtual", &other.text().replace("virtual=true\n", "")).unwrap();
+        assert!(legacy_virtual.virtual_printer, "the virtual: destination identifies a job saved before the virtual flag");
+
+        let sent = SavedState { state: JobState::Sent, ..Default::default() };
+        let mut p = PrintState::default();
+        p.set_configured_printers(&["bench".into(), "spare".into()]);
+        let newer = JobMeta { id: "new".into(), ..job.clone() };
+        for meta in [job, other] {
+            p.follow.jobs.push(CommittedJob { meta: Arc::new(meta), state: JobState::Sent, link_send: 1, ..Default::default() });
+        }
+        let publish = |p: &mut PrintState, choice: &PrinterChoice, gcode: &str, model: &str, name: Option<&str>, layers: Option<u32>, tracker: Option<JobStage>| {
+            p.links.picked = choice.clone();
+            let state = PrinterState { gcode_state: Some(gcode.into()), job_name: name.map(str::to_string), total_layers: layers, ..Default::default() };
+            let job = tracker.map(|stage| JobStatus { name: "cube".into(), file: String::new(), stage });
+            p.printers.set(choice, Arc::new(Snapshot { state: Arc::new(state), model: model.into(), job, job_sends: 1, virtual_printer: matches!(choice, PrinterChoice::Virtual(_)), ..Default::default() }));
+            follow::printer_changed(p, 10.0);
+        };
+        let report = |p: &mut PrintState, choice: &PrinterChoice, gcode: &str, tracker| publish(p, choice, gcode, "H2D", Some("cube"), Some(4), tracker);
+        let running = |p: &PrintState| p.follow.job.as_ref().and_then(|j| j.id.clone());
+        report(&mut p, &b, "RUNNING", None);
+        assert_eq!(running(&p).as_deref(), Some("b"), "B follows its own same-named copy");
+        let rows = job_list::rows(&p, 10.0);
+        assert_eq!(rows[0].state, "Printing", "A's row keeps its saved state while B reports layers");
+        assert!(rows[0].detail.starts_with("bench · "), "A's row names its destination");
+        report(&mut p, &b, "FINISH", Some(JobStage::Finished));
+        assert_eq!(p.follow.jobs[0].state, JobState::Sent, "B's terminal tracker leaves A printing");
+        assert_eq!(p.follow.jobs[1].state, JobState::Finished, "B's terminal tracker finishes B's copy");
+        assert_eq!(p.follow.shown().unwrap().meta.id, "b", "B's finished card shows B's saved job");
+        p.follow.jobs.push(CommittedJob::restored(legacy_virtual, sent.clone(), 10.0, 10.0));
+        report(&mut p, &b, "FINISH", None);
+        assert_eq!(p.follow.job_of("legacy-virtual").unwrap().state, JobState::Finished, "a virtual FINISH ends its restored legacy job");
+
+        report(&mut p, &a, "RUNNING", None);
+        let before = p.follow.jobs[0].saved(10.0, 10.0);
+        follow::unlink_printer(&mut p, None, 10.0);
+        assert_eq!(p.follow.jobs[0].saved(10.0, 10.0), before, "switching away preserves A's saved state");
+        p.follow.jobs.push(CommittedJob { meta: Arc::new(newer), state: JobState::Sent, link_send: 1, ..Default::default() });
+        report(&mut p, &a, "FINISH", Some(JobStage::Finished));
+        assert_eq!(p.follow.jobs[0].state, JobState::Sent, "a same-printer relink's reused send number must leave the old job printing");
+        assert_eq!(p.follow.job_of("new").unwrap().state, JobState::Finished, "the new link finishes its own same-named send");
+        assert_eq!(p.follow.jobs[0].link_send, 0, "unlink clears the old send number");
+        report(&mut p, &a, "FINISH", Some(JobStage::Finished));
+        assert_eq!(p.follow.jobs[0].state, JobState::Sent, "a repeated terminal report still belongs to the new send");
+        follow::unlink_printer(&mut p, None, 10.0);
+
+        let absent = JobMeta { id: "absent".into(), name: "bracket".into(), ..old.clone() };
+        p.follow.jobs.push(CommittedJob::restored(old, sent.clone(), 10.0, 10.0));
+        p.follow.jobs.push(CommittedJob::restored(absent, sent, 10.0, 10.0));
+        report(&mut p, &b, "IDLE", None);
+        assert_eq!(p.follow.jobs[0].state, JobState::Sent, "B's IDLE must leave A's job printing");
+        assert_eq!(p.follow.job_of("old").unwrap().state, JobState::Sent, "a virtual IDLE leaves the old record alone");
+        report(&mut p, &b, "FINISH", None);
+        assert_eq!(p.follow.jobs[0].state, JobState::Sent, "B's same-named FINISH leaves A's detached job printing");
+        assert_eq!(p.follow.job_of("old").unwrap().state, JobState::Sent, "a virtual FINISH leaves the old record alone");
+        report(&mut p, &spare, "IDLE", None);
+        assert_eq!(p.follow.job_of("old").unwrap().state, JobState::Sent, "a second configured printer's IDLE must leave the legacy job printing");
+        assert!(p.follow.shown().is_none(), "an idle printer cannot claim a legacy job for its card");
+        for (model, name, layers) in [("A1", Some("cube"), Some(4)), ("H2D", None, Some(4)), ("H2D", Some("cube"), None), ("H2D", Some("cube"), Some(3)), ("H2D", Some("other"), Some(4))] {
+            publish(&mut p, &spare, "RUNNING", model, name, layers, None);
+            assert_eq!(running(&p), None, "legacy running match needs its model, name and layers: {model}, {name:?}, {layers:?}");
+            publish(&mut p, &spare, "FINISH", model, name, layers, None);
+            assert_eq!(p.follow.job_of("old").unwrap().state, JobState::Sent, "an incomplete or mismatching FINISH leaves the legacy job printing");
+        }
+        report(&mut p, &spare, "RUNNING", None);
+        assert_eq!(running(&p).as_deref(), Some("old"), "the matching model, name and layers pick up the legacy job");
+        report(&mut p, &spare, "FINISH", None);
+        assert_eq!(p.follow.job_of("old").unwrap().state, JobState::Finished, "positive evidence finishes the legacy job with two printers configured");
+        assert_eq!(p.follow.job_of("absent").unwrap().state, JobState::Sent, "that finish says nothing about the other legacy job");
+        p.set_configured_printers(&["spare".into()]);
+        publish(&mut p, &spare, "IDLE", "A1", None, None, None);
+        assert_eq!(p.follow.job_of("absent").unwrap().state, JobState::Sent, "even a sole printer of another model cannot end the legacy job");
+        report(&mut p, &spare, "IDLE", None);
+        assert_eq!(p.follow.job_of("absent").unwrap().state, JobState::EndedUnseen, "the sole configured printer of its model can end a legacy job by absence");
+        report(&mut p, &a, "RUNNING", None);
+        assert_eq!(running(&p).as_deref(), Some("a"), "A picks up its own running job on return");
+        report(&mut p, &a, "FINISH", None);
+        assert_eq!(p.follow.jobs[0].state, JobState::Finished, "A's new link can finish its job without the old tracker");
+    }
+
+    #[test]
     fn a_job_reads_back_as_it_was_saved() {
         let dir = folder("round");
         let m = meta("a", 100.5);
         let saved = SavedState { state: JobState::Sent, started: Some(100.5), ..Default::default() };
         commit(&dir, &m, &saved, b"the package", &BTreeMap::from([("dir/plate.fab.splash".to_string(), "text".to_string())])).unwrap();
+        assert!(m.text().lines().any(|l| l == "serial=0001"), "only the panel suffix is written");
+        let old = m.text().lines().filter(|l| !l.starts_with("serial=") && !l.starts_with("model_colours=") && !l.starts_with("shared_colour_tools=") && !l.starts_with("unknown_spool_tools=")).collect::<Vec<_>>().join("\n");
+        let old = JobMeta::parse("old", &old).expect("legacy record");
+        assert_eq!(old.serial_suffix, None, "records without a suffix still load");
+        assert!(old.model_colours.is_empty() && old.unknown_spool_tools.is_empty());
+        assert_eq!(old.colours, m.colours);
+        let mut state = crate::AppState::default();
+        state.print.follow.monitor = true;
+        state.print.play.color = super::super::ColorBy::Filament;
+        state.print.follow.jobs.push(CommittedJob { meta: Arc::new(old), ..Default::default() });
+        state.print.follow.picked = Some("old".into());
+        assert_eq!(state.colour_notice().as_deref(), Some("This job was saved before model colours were kept: it shows its spool colours"));
+        state.print.follow.jobs.push(CommittedJob { meta: Arc::new(m.clone()), ..Default::default() });
+        state.print.follow.picked = Some(m.id.clone());
+        assert_eq!(state.colour_notice().as_deref(), Some("1 tool prints several model colours; each shows its first"));
+        state.view.colours = fab_plate::ColourMode::Material;
+        assert!(state.colour_notice().is_none(), "the held job has its own spool colours");
         let all = read_all(&dir);
         assert_eq!(all, vec![(m.clone(), saved)]);
         assert_eq!(read_package(&dir, "a").unwrap(), b"the package");
         assert_eq!(std::fs::read_to_string(dir.join("a/plate/dir_plate.fab.splash")).unwrap(), "text");
         // Only the state changes, whole.
-        let ended = SavedState { state: JobState::Failed("no filament".into()), started: Some(100.5), ended: Some(200.25), reached: 55.5 };
+        let ended = SavedState { state: JobState::Failed("no filament".into()), started: Some(100.5), ended: Some(200.25), reached: 55.5, ..Default::default() };
         save_state(&dir, "a", &ended).unwrap();
         assert_eq!(read_all(&dir), vec![(m, ended)]);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -495,29 +660,45 @@ mod tests {
     }
 
     #[test]
-    fn only_ended_jobs_past_the_bound_go() {
-        let dir = folder("prune");
-        let ended = SavedState { state: JobState::Finished, ..Default::default() };
-        for i in 0..KEEP_ENDED + 3 {
-            commit(&dir, &meta(&format!("old{i}"), 100.0 + i as f64), &ended, b"p", &BTreeMap::new()).unwrap();
+    fn startup_keeps_every_job_newest_first() {
+        let dir = folder("history");
+        let mut expected = Vec::new();
+        for i in 0..26 {
+            // Two presses per millisecond also exercise the tie-break when reloading a folder.
+            let created = 100.0 + (i / 2) as f64;
+            let id = JobMeta::new_id("cube", created);
+            let printer = if i % 2 == 0 { "printer:bench" } else { "printer:spare" };
+            let job = JobMeta { printer: Some(printer.into()), ..meta(&id, created) };
+            let state = match i { 0 => JobState::Sent, 1 => JobState::Queued, _ => JobState::Finished };
+            let saved = SavedState { state, ..Default::default() };
+            commit(&dir, &job, &saved, b"package", &BTreeMap::new()).unwrap();
+            expected.push((job, saved));
         }
-        // Older than all of them: what is running or queued always stays.
-        commit(&dir, &meta("running", 1.0), &SavedState { state: JobState::Sent, ..Default::default() }, b"p", &BTreeMap::new()).unwrap();
-        commit(&dir, &meta("queued", 2.0), &SavedState { state: JobState::Queued, ..Default::default() }, b"p", &BTreeMap::new()).unwrap();
-        let mut gone = prune(&dir);
-        gone.sort();
-        assert_eq!(gone, vec!["old0", "old1", "old2"]);
-        let left: Vec<String> = read_all(&dir).into_iter().map(|(m, _)| m.id).collect();
-        assert_eq!(left.len(), KEEP_ENDED + 2);
-        assert!(left.iter().any(|id| id == "running") && left.iter().any(|id| id == "queued"));
+        expected.reverse();
+        let interrupted = dir.join(".writing-interrupted");
+        std::fs::create_dir(&interrupted).unwrap();
+        let all = read_all(&dir);
+        assert_eq!(all.len(), expected.len(), "startup keeps the full history and both live jobs");
+        assert_eq!(all, expected, "both printers' jobs reload newest first with their saved states");
+        assert!(!interrupted.exists(), "startup removes the interrupted write");
+        let mut state = PrintState::default();
+        for (meta, saved) in all {
+            assert_eq!(read_package(&dir, &meta.id).unwrap(), b"package", "the package for {} survives startup", meta.id);
+            state.follow.jobs.push(CommittedJob::restored(meta, saved, 0.0, 0.0));
+        }
+        let listed = job_list::rows(&state, 0.0);
+        let (history, queued_and_running) = expected.split_at(24);
+        let display_order = queued_and_running.iter().rev().chain(history);
+        assert!(listed.iter().map(|row| &row.id).eq(display_order.map(|(meta, _)| &meta.id)),
+            "the list shows the running job, the queued job and all 24 finished jobs newest first");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn a_restored_job_keeps_its_times_across_the_app_clock() {
         // Started 600 s before this run's clock reads 1000.
-        let job = CommittedJob::restored(meta("a", 5000.0), SavedState { state: JobState::Sent, started: Some(5000.0), ended: None, reached: 12.5 }, 1000.0, 5600.0);
+        let job = CommittedJob::restored(meta("a", 5000.0), SavedState { state: JobState::Sent, started: Some(5000.0), ended: None, reached: 12.5, ..Default::default() }, 1000.0, 5600.0);
         assert_eq!((job.sent_at, job.ended_at, job.reached, job.restored), (400.0, None, 12.5, true));
-        assert_eq!(job.saved(1000.0, 5600.0), SavedState { state: JobState::Sent, started: Some(5000.0), ended: None, reached: 12.5 });
+        assert_eq!(job.saved(1000.0, 5600.0), SavedState { state: JobState::Sent, started: Some(5000.0), ended: None, reached: 12.5, ..Default::default() });
     }
 }

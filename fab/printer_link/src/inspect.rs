@@ -29,6 +29,7 @@ impl Snapshot {
         let state = &self.state;
         obj(vec![
             ("name", s(&self.name)), ("model", s(&self.model)), ("status", s(self.status.label())),
+            ("virtual_printer", Value::Bool(self.virtual_printer)),
             ("serial_suffix", text(self.serial_suffix.as_deref())),
             ("gcode_state", text(state.gcode_state.as_deref())), ("progress", number(state.progress)),
             ("layer", state.layer.map(|n| Value::Int(n as i64)).unwrap_or(Value::Null)),

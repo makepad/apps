@@ -1,0 +1,10 @@
+use mod.scene.*
+// Two soft shadow-casting lights over 2 500 instances and a floor.
+Scene3D{ background: #101218 environment: Environment{preset: @studio intensity: 0.4} camera: Camera{position: vec3(0, 12, 18) target: vec3(0, 0, 0) fov: 40}
+  lights: [DirectionalLight{position: vec3(4, 8, 3) intensity: 2 cast_shadow: true shadow_softness: 3 shadow_size: 2048}
+           SpotLight{position: vec3(-6, 8, 4) target: vec3(0, 0, 0) angle: 35 penumbra: 0.5 intensity: 80 cast_shadow: true shadow_size: 2048}]
+  children: [
+    Instances{geometry: CylinderGeometry{radius: 0.15 height: 1 radial_segments: 16} layout: GridLayout{count: vec3(50, 1, 50) spacing: vec3(0.5, 1, 0.5)}
+      each: {scale: repeat(tween(vec3(1, 0.3, 1), vec3(1, 3, 1), 0, 1, @ease_in_out_sine), 2) position: vec3(0, 0.5, 0)} order: @distance stagger: 0.04 material: MeshStandardMaterial{color: #e0e4ea roughness: 0.5}}
+    Mesh{geometry: PlaneGeometry{width: 60 height: 60} rotation: vec3(-90, 0, 0) material: MeshStandardMaterial{color: #808890}}
+  ] }

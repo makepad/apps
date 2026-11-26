@@ -1,0 +1,19 @@
+[package]
+name = "fab-elec-bom"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Live electronics BOM and offline board fabrication estimates"
+
+[dependencies]
+fab-elec-core = { path = "../core" }
+fab-elec-cam = { path = "../cam" }
+fab-elec-circuit = { path = "../circuit" }
+fab-elec-board = { path = "../board" }
+fab-elec-design = { path = "../design" }
+makepad-strict-json = { path = "../../../../../libs/strict_json" }
+
+[dev-dependencies]
+fab-elec-fixtures = { path = "../fixtures" }
+fab-elec-lang = { path = "../lang" }

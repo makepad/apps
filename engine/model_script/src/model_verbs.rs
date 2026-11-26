@@ -17,18 +17,19 @@ use crate::rig_rest::{rig_rest, RigRest};
 use crate::value::*;
 use crate::{Admit, ModelHost};
 use makepad_csg_math::{portable::PortableFloat, Vec3d};
+use makepad_model::transform::{inverse, matrix_mul, transform_point, Matrix4, IDENTITY_MATRIX};
 use makepad_model::{
     Action as MeshAction, Attachment, BooleanMode, CollisionProxy, Construction,
     ConstructionOperation, Decal, GlbLamp, GlbShading, LightEmitter, LightKind,
     LodLevel, Material, MeshEditingOperation, MeshPrimitive, Opening, Operation,
-    PatternKind, ProgramOp, RgbaImage, Roof, RoofKind, SceneNode, SceneOperation,
+    PatternKind, ProgramOp, RgbaImage, Roof, RoofKind, SceneNode, SceneOperation, SceneState,
     SelectionOperation, SelectionQuery, Shape, Socket, SurfaceAlpha, SurfaceChannel,
     SurfaceDerivation, SurfaceLayer, SurfaceMaterial, SurfaceOperation, SurfacePattern,
     Transform, VehicleWheel, VisualWheelMotion, Wall,
 };
 use makepad_script::makepad_math::*;
 use makepad_script::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -356,8 +357,6 @@ pub fn script_model_state(alias: &str) -> ScriptModelState {
 
 // ── builder state ───────────────────────────────────────────────────────
 
-#[derive(Clone, Default)]
-struct Node { parent: Option<String>, pos: [f64; 3], rot: [f64; 4], scale: [f64; 3], local: Option<[[f64; 3]; 2]> }
 fn bounds_of(points: impl IntoIterator<Item = [f64; 3]>) -> Option<[[f64; 3]; 2]> {
     let mut b: Option<[[f64; 3]; 2]> = None;
     for p in points { let e = b.get_or_insert([p, p]); for d in 0..3 { e[0][d] = e[0][d].min(p[d]); e[1][d] = e[1][d].max(p[d]); } }
@@ -381,7 +380,10 @@ struct ModelBuilder {
     texture_timings: Vec<makepad_model::TextureTiming>,
     /// Texture tile size in metres for materials declared with `tile`.
     tiles: HashMap<String, f64>,
-    nodes: HashMap<String, Node>,
+    scene: SceneState,
+    bounds: BTreeMap<String, [[f64; 3]; 2]>,
+    decals: BTreeSet<String>,
+    logged_detached_paint: bool,
     rigged: bool,
     /// Rest position of the hips joint when the rig is not the humanoid
     /// template (`m.character`); clip authoring keys the root from it.
@@ -403,6 +405,48 @@ struct ModelBuilder {
     looped: HashMap<String, usize>,
     /// Text and sign materials' width / height (`m.aspect(mat)`).
     aspects: HashMap<String, f64>,
+}
+impl ModelBuilder {
+    fn translated_bounds(&self, name: &str) -> Option<[[f64; 3]; 2]> {
+        let pos = self.scene.nodes[name].transform.translation;
+        self.bounds.get(name).map(|b| b.map(|corner| std::array::from_fn(|d| corner[d] + pos[d])))
+    }
+
+    fn detached_paint(&self, removed: &[&str]) -> makepad_model::Result<DetachedPaint> {
+        let mut moves = DetachedPaint::default();
+        let mut pending = Vec::new();
+        for name in &self.decals {
+            let Some(parent) = self.scene.nodes[name].parent.as_deref() else { continue };
+            if removed.contains(&parent) && !removed.contains(&name.as_str()) {
+                moves.roots.push(name.clone());
+                let frame = self.scene.world_matrix(parent)?;
+                if frame != IDENTITY_MATRIX { pending.push((name.as_str(), frame)); }
+            }
+        }
+        if pending.is_empty() { return Ok(moves); }
+        let mut children = BTreeMap::<&str, Vec<&str>>::new();
+        for (name, node) in &self.scene.nodes {
+            if let Some(parent) = node.parent.as_deref() {
+                if !removed.contains(&name.as_str()) { children.entry(parent).or_default().push(name); }
+            }
+        }
+        // Keep each surviving node's local TRS. Express the lost parent frame
+        // in that node's axes before applying it to the mesh and its children.
+        while let Some((name, frame)) = pending.pop() {
+            let local = self.scene.nodes[name].transform.matrix()?;
+            let bake = matrix_mul(inverse(local)?, matrix_mul(frame, local));
+            moves.bakes.push((name.to_owned(), bake));
+            if let Some(children) = children.get(name) {
+                pending.extend(children.iter().map(|&child| (child, bake)));
+            }
+        }
+        Ok(moves)
+    }
+}
+#[derive(Default)]
+struct DetachedPaint {
+    roots: Vec<String>,
+    bakes: Vec<(String, Matrix4)>,
 }
 struct BuilderHandle(ModelBuilder);
 
@@ -493,7 +537,7 @@ pub fn v_model_new(vm: &mut ScriptVm, host: &Rc<dyn ModelHost>, args: ScriptObje
         class = "prop".into();
     }
     let ty = builder_type(vm, host);
-    let builder = ModelBuilder { name: slug(&name), class, ops: Arc::new(Vec::new()), op_keys: Vec::new(), op_error: None, materials: Vec::new(), texture_timings: Vec::new(), tiles: HashMap::new(), nodes: HashMap::new(), rigged: false, rest_hips: None, clip_rest: Vec::new(), selections: 0, lod_models: Vec::new(), habitat, body_names: HashMap::new(), sites: HashMap::new(), looped: HashMap::new(), aspects: HashMap::new() };
+    let builder = ModelBuilder { name: slug(&name), class, ops: Arc::new(Vec::new()), op_keys: Vec::new(), op_error: None, materials: Vec::new(), texture_timings: Vec::new(), tiles: HashMap::new(), scene: SceneState::default(), bounds: BTreeMap::new(), decals: BTreeSet::new(), logged_detached_paint: false, rigged: false, rest_hips: None, clip_rest: Vec::new(), selections: 0, lod_models: Vec::new(), habitat, body_names: HashMap::new(), sites: HashMap::new(), looped: HashMap::new(), aspects: HashMap::new() };
     vm.bx.heap_mut().new_handle(ty, Box::new(BuilderHandle(builder))).into()
 }
 
@@ -744,7 +788,7 @@ impl Recorder<'_, '_> {
         } else if !owns {
             name = format!("{name}.{call}");
         }
-        let taken = |b: &ModelBuilder, n: &str| b.nodes.contains_key(n) || b.materials.iter().any(|m| m == n);
+        let taken = |b: &ModelBuilder, n: &str| b.scene.nodes.contains_key(n) || b.materials.iter().any(|m| m == n);
         if taken(self.b(), &name) {
             let first = name.clone();
             name = (2..).map(|n| format!("{first}#{n}")).find(|c| !taken(self.b(), c)).unwrap();
@@ -763,7 +807,7 @@ impl Recorder<'_, '_> {
     }
     fn declare(&mut self, name: &str) -> bool {
         if !self.name_ok(name) { return false; }
-        if self.b().nodes.contains_key(name) { self.error = Some(format!("object '{name}' already exists; pick another name or m.delete(\"{name}\") first")); return false; }
+        if self.b().scene.nodes.contains_key(name) { self.error = Some(format!("object '{name}' already exists; pick another name or m.delete(\"{name}\") first")); return false; }
         true
     }
     fn select_all(&mut self, object: &str, element: &str, operation: Operation) {
@@ -778,11 +822,39 @@ impl Recorder<'_, '_> {
         self.op(Operation::Selection(SelectionOperation::Delete { object: object.into(), name: sel }));
     }
     fn emit_node(&mut self, name: &str) {
-        let n = self.b().nodes.get(name).cloned().unwrap_or_default();
+        let node = self.b().scene.nodes[name].clone();
         self.op(Operation::Scene(SceneOperation::Node {
             object: name.into(),
-            node: SceneNode { parent: n.parent, linked_to: None, transform: Transform { translation: n.pos, rotation: n.rot, scale: n.scale } },
+            node,
         }));
+    }
+    fn transform_mesh(&mut self, name: &str, matrix: Matrix4) {
+        if matrix != IDENTITY_MATRIX {
+            self.select_all(name, "vertices", Operation::Transform { object: name.into(), vertices: Vec::new(), matrix });
+        }
+    }
+    fn remove_nodes(&mut self, removed: &[&str], parent: Option<&str>, moves: DetachedPaint) {
+        for (name, matrix) in moves.bakes {
+            self.transform_mesh(&name, matrix);
+            if let Some(bounds) = self.b().bounds.get_mut(&name) {
+                let corners = (0..8).map(|i| transform_point(matrix, [bounds[i & 1][0], bounds[(i >> 1) & 1][1], bounds[(i >> 2) & 1][2]]));
+                *bounds = bounds_of(corners).unwrap();
+            }
+        }
+        if parent.is_none() && !moves.roots.is_empty() && !self.b().logged_detached_paint {
+            self.host.log("model.delete: paint from a deleted target moved to the model root".into());
+            self.b().logged_detached_paint = true;
+        }
+        for name in moves.roots {
+            self.b().scene.nodes.get_mut(&name).unwrap().parent = parent.map(str::to_owned);
+            self.emit_node(&name);
+        }
+        for &name in removed {
+            self.op(Operation::DeleteObject { object: name.to_owned() });
+            self.b().scene.nodes.remove(name);
+            self.b().decals.remove(name);
+            self.b().bounds.remove(name);
+        }
     }
     /// A new object: rot/scale are baked into its vertices, so the node keeps
     /// only its position (booleans, wheels and mirrors stay simple).
@@ -801,10 +873,15 @@ impl Recorder<'_, '_> {
             self.select_all(name, "vertices", Operation::Transform { object: name.into(), vertices: Vec::new(), matrix: m });
         }
         let parent = self.opt_part(o, id!(parent));
-        if let Some(p) = &parent { if !self.b().nodes.contains_key(p) { self.error = Some(format!("parent '{p}' was deleted")); } }
+        if let Some(p) = &parent { if !self.b().scene.nodes.contains_key(p) { self.error = Some(format!("parent '{p}' was deleted")); } }
         let pos = opt_v3(self.vm, o, id!(pos)).unwrap_or([0.; 3]);
-        self.b().nodes.insert(name.into(), Node { parent: parent.filter(|p| p != name), pos, rot: [0., 0., 0., 1.], scale: [1.; 3], local });
-        if pos != [0.; 3] || self.b().nodes[name].parent.is_some() { self.emit_node(name); }
+        self.b().scene.nodes.insert(name.into(), SceneNode {
+            parent: parent.filter(|p| p != name),
+            transform: Transform { translation: pos, ..Transform::default() },
+            ..SceneNode::default()
+        });
+        if let Some(local) = local { self.b().bounds.insert(name.into(), local); }
+        if pos != [0.; 3] || self.b().scene.nodes[name].parent.is_some() { self.emit_node(name); }
     }
     fn shape(&mut self, shape: Shape, keys: &[&str], local: Option<[[f64; 3]; 2]>) -> ScriptValue {
         let name = self.new_name();
@@ -832,7 +909,7 @@ impl Recorder<'_, '_> {
         if v.is_nil() { default } else if let Some(b) = v.as_bool() { b.then_some(default.unwrap_or(40.)) } else { Some(value_f32(self.vm, v) as f64) }
     }
     fn known(&mut self, name: &str) -> bool {
-        if self.b().nodes.contains_key(name) { return true; }
+        if self.b().scene.nodes.contains_key(name) { return true; }
         self.error = Some(format!("unknown object '{name}'"));
         false
     }
@@ -968,7 +1045,12 @@ impl Recorder<'_, '_> {
             }
             "delete" => {
                 let Some(name) = self.part(0) else { return NIL };
-                if self.known(&name) { self.op(Operation::DeleteObject { object: name.clone() }); self.b().nodes.remove(&name); }
+                if self.known(&name) {
+                    match self.b().detached_paint(&[&name]) {
+                        Ok(moves) => self.remove_nodes(&[&name], None, moves),
+                        Err(error) => return self.fail(makepad_model::describe_error(&error)),
+                    }
+                }
                 NIL
             }
             "socket" => self.m_socket(),
@@ -1452,13 +1534,13 @@ impl Recorder<'_, '_> {
         let Some(name) = self.part(0) else { return NIL };
         let o = self.opts(1, &["pos", "rot", "scale", "parent"]);
         if !self.known(&name) { return NIL; }
-        let mut n = self.b().nodes[&name].clone();
-        if let Some(p) = opt_v3(self.vm, o, id!(pos)) { n.pos = p; }
-        if let Some(r) = opt_v3(self.vm, o, id!(rot)) { n.rot = quat_euler_deg(r); }
+        let mut n = self.b().scene.nodes[&name].clone();
+        if let Some(p) = opt_v3(self.vm, o, id!(pos)) { n.transform.translation = p; }
+        if let Some(r) = opt_v3(self.vm, o, id!(rot)) { n.transform.rotation = quat_euler_deg(r); }
         let s = opt(self.vm, o, id!(scale));
-        if !s.is_nil() { n.scale = if let Some(x) = s.as_number() { [x; 3] } else { let p = value_vec3(self.vm, s); [p.x as f64, p.y as f64, p.z as f64] }; }
+        if !s.is_nil() { n.transform.scale = if let Some(x) = s.as_number() { [x; 3] } else { let p = value_vec3(self.vm, s); [p.x as f64, p.y as f64, p.z as f64] }; }
         if let Some(p) = self.opt_part(o, id!(parent)) { n.parent = (p != name).then_some(p); }
-        self.b().nodes.insert(name.clone(), n);
+        self.b().scene.nodes.insert(name.clone(), n);
         self.emit_node(&name);
         NIL
     }
@@ -1467,16 +1549,19 @@ impl Recorder<'_, '_> {
         let name = self.new_name();
         let keep = self.flag(2, id!(keep), false);
         if !self.known(&a) || !self.known(&b) || !self.declare(&name) { return NIL; }
+        let bounds_a = self.b().translated_bounds(&a);
+        let local = if mode == "union" { merge(bounds_a, self.b().translated_bounds(&b)) } else { bounds_a };
+        let moves = if keep { None } else {
+            match self.b().detached_paint(&[&a, &b]) {
+                Ok(moves) => Some(moves),
+                Err(error) => return self.fail(makepad_model::describe_error(&error)),
+            }
+        };
         self.construction(&name, Construction::Boolean { a: a.clone(), b: b.clone(), mode: match mode { "union" => BooleanMode::Union, "difference" => BooleanMode::Difference, _ => BooleanMode::Intersection } });
-        let world = |n: &Node| n.local.map(|l| [0, 1].map(|i| std::array::from_fn(|d| l[i][d] + n.pos[d])));
-        let (na, nb) = (self.b().nodes[&a].clone(), self.b().nodes[&b].clone());
-        let local = if mode == "union" { merge(world(&na), world(&nb)) } else { world(&na) };
-        if !keep {
-            for s in [&a, &b] { self.op(Operation::DeleteObject { object: s.clone() }); }
-            self.b().nodes.remove(&a); self.b().nodes.remove(&b);
-        }
         // Boolean results are baked in model space.
-        self.b().nodes.insert(name.clone(), Node { rot: [0., 0., 0., 1.], scale: [1.; 3], local, ..Default::default() });
+        self.b().scene.nodes.insert(name.clone(), SceneNode::default());
+        if let Some(local) = local { self.b().bounds.insert(name.clone(), local); }
+        if let Some(moves) = moves { self.remove_nodes(&[&a, &b], Some(&name), moves); }
         self.handle_of(&name, false)
     }
     fn m_mirror(&mut self) -> ScriptValue {
@@ -1503,8 +1588,15 @@ impl Recorder<'_, '_> {
         let up = opt_v3(self.vm, o, id!(up)).unwrap_or([0., 1., 0.]);
         let depth = opt_num(self.vm, o, id!(depth)).unwrap_or(size[0].max(size[1]) * 0.5);
         let offset = opt_num(self.vm, o, id!(offset)).unwrap_or(0.0015);
-        self.construction(&name, Construction::Decal { material, decal: Decal { target, center, normal, up, size, depth, offset } });
-        self.b().nodes.insert(name.clone(), Node { rot: [0., 0., 0., 1.], scale: [1.; 3], ..Default::default() });
+        let to_target = match self.b().scene.world_matrix(&target).and_then(inverse) {
+            Ok(matrix) => matrix,
+            Err(error) => return self.fail(makepad_model::describe_error(&error)),
+        };
+        self.construction(&name, Construction::Decal { material, decal: Decal { target: target.clone(), center, normal, up, size, depth, offset } });
+        self.transform_mesh(&name, to_target);
+        self.b().scene.nodes.insert(name.clone(), SceneNode { parent: Some(target), ..SceneNode::default() });
+        self.b().decals.insert(name.clone());
+        self.emit_node(&name);
         self.handle_of(&name, false)
     }
     /// Shaped vector text in a linear MSDF texture, decoded by the material shader.
@@ -1751,7 +1843,7 @@ impl Recorder<'_, '_> {
         // the Y/Z middle of anything turned about it is the axle), not the
         // node origin: a tyre built off its origin (a union, a mesh in model
         // coordinates) still spins in place. Size defaults come from it too.
-        let local = self.b().nodes.get(&name).and_then(|n| n.local);
+        let local = self.b().bounds.get(&name).copied();
         let pivot = local.map_or([0.; 3], |b| std::array::from_fn(|d| { let c = (b[0][d] + b[1][d]) * 0.5; if c.abs() < 1e-9 { 0. } else { c } }));
         let radius = local.map_or(0.34, |b| ((b[1][1] - b[0][1]).max(b[1][2] - b[0][2]) * 0.5).max(0.01));
         let width = local.map_or(0.24, |b| (b[1][0] - b[0][0]).max(0.01));
@@ -1881,7 +1973,7 @@ impl Recorder<'_, '_> {
             keyed.map(|(program, (hash, bytes))| {
                 let alias = format!("{SCRIPT_MODEL_PREFIX}{}", b.name);
                 let request = ScriptModelRequest { alias: alias.clone(), hash: hash.clone(), title: b.name.replace('-', " "), class: b.class.clone(), program, materials: Arc::new(b.materials.clone()), texture_timings: Arc::new(b.texture_timings.clone()) };
-                let bounds = b.nodes.values().fold(None, |acc, n| merge(acc, n.local.map(|l| [0, 1].map(|i| std::array::from_fn(|d| l[i][d] + n.pos[d])))));
+                let bounds = b.bounds.keys().fold(None, |acc, name| merge(acc, b.translated_bounds(name)));
                 (alias, hash, bytes, (request, bounds))
             })
         };
@@ -2029,32 +2121,87 @@ m
         assert_eq!(crowns.iter().filter(|c| c.is_none()).count(), 3, "materials without crown omit the key");
     }
 
-    #[test]
-    fn mesh_normals_and_ao_reach_glb_and_counts_name_the_mesh() {
-        fn record(parts: &str) -> (Vec<ProgramOp>, Vec<String>) {
-            #[derive(Default)]
-            struct Messages(std::cell::RefCell<Vec<String>>);
-            impl ModelHost for Messages { fn log(&self, message: String) { self.0.borrow_mut().push(message); } }
-            let host_box = Box::leak(Box::new(ScriptVmHost::new((), ())));
-            let mut vm = ScriptVm { host: host_box.host_context(), bx: Box::new(ScriptVmBase::new()) };
-            let messages = Rc::new(Messages::default());
-            let host: Rc<dyn ModelHost> = messages.clone();
-            let module = vm.new_module(id!(game));
-            vm.add_method(module, id!(model_new), &[], move |vm, args| v_model_new(vm, &host, args));
-            vm.capture_errors();
-            let source = format!(r#"use mod.pod.*
+    fn record(parts: &str) -> (Vec<ProgramOp>, Vec<String>) {
+        #[derive(Default)]
+        struct Messages(std::cell::RefCell<Vec<String>>);
+        impl ModelHost for Messages { fn log(&self, message: String) { self.0.borrow_mut().push(message); } }
+        let host_box = Box::leak(Box::new(ScriptVmHost::new((), ())));
+        let mut vm = ScriptVm { host: host_box.host_context(), bx: Box::new(ScriptVmBase::new()) };
+        let messages = Rc::new(Messages::default());
+        let host: Rc<dyn ModelHost> = messages.clone();
+        let module = vm.new_module(id!(game));
+        vm.add_method(module, id!(model_new), &[], move |vm, args| v_model_new(vm, &host, args));
+        vm.capture_errors();
+        let source = format!(r#"use mod.pod.*
 let m = mod.game.model_new("mesh-test")
 {parts}
 m
 "#);
-            let out = vm.eval(ScriptMod::new("", "", "mesh_test.splash", 1, 0, &source, &[]));
-            let errors = vm.take_errors();
-            assert!(errors.is_empty(), "{errors:?}");
-            let handle = out.as_handle().unwrap();
-            let ops = vm.bx.heap_ref().handle_ref::<BuilderHandle>(handle).unwrap().0.ops.to_vec();
-            let messages = messages.0.borrow().clone();
-            (ops, messages)
+        let out = vm.eval(ScriptMod::new("", "", "mesh_test.splash", 1, 0, &source, &[]));
+        let errors = vm.take_errors();
+        assert!(errors.is_empty(), "{errors:?}");
+        let handle = out.as_handle().unwrap();
+        let ops = vm.bx.heap_ref().handle_ref::<BuilderHandle>(handle).unwrap().0.ops.to_vec();
+        let messages = messages.0.borrow().clone();
+        (ops, messages)
+    }
+
+    #[test]
+    fn decal_follows_its_target_and_survives_reparenting() {
+        let (ops, messages) = record(r#"
+let base = m.box({pos: vec3(2, 0, 0)})
+let hull = m.box({parent: base})
+m.move(hull, {pos: vec3(1, 1, 0), rot: vec3(0, 0, 30), scale: vec3(2, 1, 0.5)})
+let stripe = m.decal(hull, {pos: vec3(3, 1, 0.25), size: vec2(0.4, 0.3)})
+m.move(base, {pos: vec3(4, 0, 0)})
+let cutter = m.box({size: vec3(0.2, 0.2, 0.2), pos: vec3(5, 1, 0.25)})
+let panel = m.subtract(hull, cutter)
+m.move(panel, {pos: vec3(0, 1, 0)})
+m.delete(panel)
+let badge = m.decal(base, {pos: vec3(4, 0, 0.5)})
+m.delete(base)
+"#);
+        assert_eq!(messages.len(), 1, "two targets deleted, one root-move report: {messages:?}");
+        assert!(messages[0].contains("model root"), "{messages:?}");
+        let mut scene = makepad_model::Workspace::new(Default::default()).unwrap();
+        let mut projected = Vec::new();
+        let mut stages = Vec::new();
+        for op in ops {
+            let ProgramOp::Op(op) = op else { panic!("expected a document operation") };
+            scene.execute(std::slice::from_ref(&op), None).unwrap();
+            let (stage, parent, offset) = match &op {
+                Operation::Construction(c) if c.object == "stripe" => {
+                    projected = scene.object("stripe").unwrap().vertices().iter().map(|v| v.position).collect();
+                    assert!(projected.len() >= 3, "projection produced a surface");
+                    continue;
+                }
+                Operation::Scene(SceneOperation::Node { object, node }) if object == "stripe" && node.parent.as_deref() == Some("hull") =>
+                    ("attached", Some("hull"), [0., 0., 0.]),
+                Operation::Scene(SceneOperation::Node { object, .. }) if object == "base" && !projected.is_empty() =>
+                    ("moved target", Some("hull"), [2., 0., 0.]),
+                Operation::DeleteObject { object } if object == "hull" =>
+                    ("boolean", Some("panel"), [2., 0., 0.]),
+                Operation::DeleteObject { object } if object == "panel" =>
+                    ("deleted", None, [2., 1., 0.]),
+                _ => continue,
+            };
+            assert_eq!(scene.scene().nodes["stripe"].parent.as_deref(), parent, "{stage}");
+            let world = scene.scene().world_matrix("stripe").unwrap();
+            let vertices = scene.object("stripe").unwrap().vertices();
+            assert_eq!(vertices.len(), projected.len(), "{stage} vertex count");
+            for (vertex, source) in vertices.iter().zip(&projected) {
+                let point = transform_point(world, vertex.position);
+                for d in 0..3 {
+                    assert!((point[d] - (source[d] + offset[d])).abs() < 1e-10, "{stage} vertex {:?}: {point:?}", vertex.id);
+                }
+            }
+            stages.push(stage);
         }
+        assert_eq!(stages, ["attached", "moved target", "boolean", "deleted"]);
+    }
+
+    #[test]
+    fn mesh_normals_and_ao_reach_glb_and_counts_name_the_mesh() {
         let record_mesh = |options: &str| record(&format!(r#"
 let points = [vec3(0, 0, 0), vec3(1, 0, 0), vec3(0, 1, 0), vec3(0, 0, 1)]
 let card = m.mesh(points, [[0, 1, 2], [0, 3, 1]], {{{options}}})
@@ -2205,11 +2352,11 @@ m
         assert!(errors.is_empty(), "{errors:?}");
         let h = out.as_handle().expect("the builder");
         let b = &vm.bx.heap_ref().handle_ref::<BuilderHandle>(h).unwrap().0;
-        let mut names: Vec<&str> = b.nodes.keys().map(|k| k.as_str()).collect();
+        let mut names: Vec<&str> = b.scene.nodes.keys().map(|k| k.as_str()).collect();
         names.sort();
         assert_eq!(names, vec!["band[0]", "band[1]", "band[2]", "base", "box@17", "hull", "rim.tube"]);
         assert_eq!(b.materials, vec!["stone".to_string()]);
-        assert_eq!(b.nodes["band[1]"].parent.as_deref(), Some("base"));
+        assert_eq!(b.scene.nodes["band[1]"].parent.as_deref(), Some("base"));
         assert!(b.ops.iter().any(|op| matches!(op, ProgramOp::Op(Operation::Construction(ConstructionOperation { object, kind: Construction::Shape { shape: Shape::Box { .. }, .. } })) if object == "hull.box")), "{:?}", b.ops);
     }
 

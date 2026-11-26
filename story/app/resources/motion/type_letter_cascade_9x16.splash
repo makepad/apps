@@ -1,0 +1,32 @@
+use mod.motion.*
+// LETTER CASCADE, 9:16 — the portrait cut of type_letter_cascade: the word
+// drops to 170 px so about eight letters fit the 840 px safe width, and the
+// pair sits at the optical centre of the safe area.
+// Why: the cascade needs horizontal room to read as a wave; smaller type
+// keeps every letter inside the platform's buttons.
+Motion{
+    label: "Letter cascade 9:16"
+    brief: "One big word whose letters fall in on a spring, one after another; portrait."
+    tags: ["kinetic-type", "headline", "playful", "reveal", "9:16"]
+    size: vec2(1080, 1920) duration: 4.6
+    inputs: {
+        word: input(@text, "Cascade", "One word, up to about eight letters")
+        kicker: input(@text, "INTRODUCING", "Small caps line above")
+        ink: input(@color, #f4f7fa, "Word colour")
+        accent: input(@color, #ff5c39, "Kicker colour")
+        background: input(@color, #0b0d12, "Ground")
+    }
+    layers: [
+        Rect{size: vec2(1080, 1920) fill: in(@background)}
+        Text{text: in(@kicker) font: Font{family: "Inter" weight: 600} size: 30 tracking: 0.3 color: in(@accent)
+             at: vec2(520, 640) wrap: 840 align: @center
+             opacity: keys([0.1, 0], [0.5, 1, @ease_out_cubic], [3.9, 1], [4.2, 0, @ease_in_cubic])
+             y: tween(16, 0, 0.1, 0.7, @ease_out_quint)}
+        Text{text: in(@word) font: Font{family: "Inter" weight: 800} size: 170 tracking: -0.04 color: in(@ink)
+             at: vec2(520, 694) wrap: 840 align: @center
+             by: @letter stagger: 0.05
+             y: keys([0.3, -160], [1.2, 0, spring(210, 17)], [3.8, 0], [4.15, 120, @ease_in_cubic])
+             rotate: keys([0.3, -14], [1.2, 0, spring(210, 15)], [3.8, 0], [4.15, 8, @ease_in_cubic])
+             opacity: keys([0.3, 0], [0.42, 1, @ease_out_cubic], [3.9, 1], [4.15, 0, @ease_in_cubic])}
+    ]
+}

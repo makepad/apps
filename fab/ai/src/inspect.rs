@@ -199,7 +199,9 @@ fn thread_fit(args: &Value, c: &Compiled, eval: &Evaluator) -> Result<S, String>
     if rod_pitch < 2.0 * profile.nozzle {
         note.push_str(&format!("; a {rod_pitch} mm pitch is under two {} mm nozzle widths, so the flanks barely resolve", profile.nozzle));
     }
+    // the check: whether it turns by hand and holds; `verdict` says how it fails
     Ok(obj(vec![
+        crate::checks::Check::of(verdict == "fits").fields().remove(0),
         ("verdict", s(verdict)),
         ("radial_clearance", r(radial)),
         ("needs", r(free)),
@@ -210,9 +212,48 @@ fn thread_fit(args: &Value, c: &Compiled, eval: &Evaluator) -> Result<S, String>
     ]))
 }
 
+fn fitted_parts(args: &Value, eval: &mut Evaluator) -> Result<S, String> {
+    let solid = |key| args.get(key).and_then(Value::as_str).ok_or_else(|| format!("'{key}' needs a solid id"));
+    let pick = |key| p3(args.get(key)).ok_or_else(|| format!("'{key}' needs a point on the seating face, [x, y, z] in model mm"));
+    let (a, b) = (solid("a")?, solid("b")?);
+    if a == b { return Err("fit needs two different parts; a and b are the same part".into()); }
+    let (a_at, b_at) = (pick("a_at")?, pick("b_at")?);
+    let turn = args.get("turn").map(|v| num(v).ok_or("'turn' needs a finite angle in degrees")).transpose()?.unwrap_or(0.0);
+    let fit = crate::fit::measure(&eval.object_mesh(a)?, &eval.object_mesh(b)?, a_at, b_at, turn)?;
+
+    // Keep small gaps readable down to the contact tolerance; mm() rounds to hundredths.
+    let length = |x: f64| S::Verbatim(format!("{}mm", (x * 1e9).round() / 1e9 + 0.0));
+    let point = |p: Vec3d| arr([p.x, p.y, p.z].map(length));
+    let direction = |p: Vec3d| arr([p.x, p.y, p.z].map(S::Num));
+    let sides = fit.gaps.iter().enumerate().filter_map(|(i, gap)| {
+        let g = gap.as_ref()?;
+        let dir = fit.directions[i];
+        let axis = dir.dominant_axis();
+        let model_axis = [Vec3d::X, Vec3d::Y, Vec3d::Z][axis];
+        let label = if dir.cross(model_axis).length() < 1e-12 {
+            ["x", "y", "z"][axis]
+        } else if i < 2 { "u" } else { "v" };
+        let sign = if i % 2 == 0 { "+" } else { "-" };
+        Some(obj(vec![("side", s(format!("{sign}{label}"))), ("direction", direction(dir)),
+            ("gap", length(g.distance)), ("from", point(g.a)), ("to", point(g.b))]))
+    });
+    let mut fields = vec![
+        ("seat", flag(fit.seat)),
+        ("overlap_mm3", S::Num(fit.overlap_mm3)),
+        ("side_gap", fit.side_gap.map_or(S::Nil, length)),
+        ("sides", arr(sides)),
+        ("pose", obj(vec![("axis", direction(fit.axis)), ("angle", S::Num(fit.degrees)), ("move", point(fit.translation))])),
+    ];
+    if let Some(bb) = fit.overlap_bounds {
+        fields.push(("overlap_bounds", obj(vec![("min", point(bb.min)), ("max", point(bb.max))])));
+    }
+    Ok(obj(fields))
+}
+
 pub fn measure_tool(args: &Value, c: &Compiled, ev: &Evaluated, eval: &mut Evaluator) -> Result<S, String> {
-    let what = args.get("what").and_then(Value::as_str).ok_or("'what' is missing: size, clearance, distance, wall, angle, edge, faces, thread_fit or mass")?;
+    let what = args.get("what").and_then(Value::as_str).ok_or("'what' is missing: size, clearance, distance, wall, angle, edge, faces, fit, thread_fit or mass")?;
     match what {
+        "fit" => fitted_parts(args, eval),
         "thread_fit" => thread_fit(args, c, eval),
         "size" => {
             let mut rows = Vec::new();
@@ -305,7 +346,7 @@ pub fn measure_tool(args: &Value, c: &Compiled, ev: &Evaluated, eval: &mut Evalu
             let gap = measure::plane_distance([pa.x, pa.y, pa.z], [na.x, na.y, na.z], [pb.x, pb.y, pb.z], [nb.x, nb.y, nb.z]);
             Ok(obj(vec![("distance", r(gap.distance)), ("angle", deg(gap.angle_deg)), ("parallel", flag(gap.parallel)), ("from", v3(pa)), ("to", v3(pb))]))
         }
-        other => Err(format!("unknown measurement '{other}' (size, clearance, distance, wall, angle, edge, faces, thread_fit, mass)")),
+        other => Err(format!("unknown measurement '{other}' (size, clearance, distance, wall, angle, edge, faces, fit, thread_fit, mass)")),
     }
 }
 
@@ -325,7 +366,7 @@ fn finding(kind: &str, severity: &str, object: &str, at: Option<Vec3d>, message:
 /// necks (a cross-section much smaller than above and below it).
 pub fn check_mesh(args: &Value, ev: &Evaluated, eval: &mut Evaluator, line_width: f64) -> Result<S, String> {
     let (findings, rows) = mesh_findings(args, ev, eval, line_width, true)?;
-    Ok(obj(vec![("frame", s("model (mm, Y up)")), ("line_width", r(line_width)), ("findings", arr(findings)), ("solids", arr(rows))]))
+    Ok(obj(vec![crate::checks::Check::of(!crate::checks::has_error(&findings)).fields().remove(0), ("frame", s("model (mm, Y up)")), ("line_width", r(line_width)), ("findings", arr(findings)), ("solids", arr(rows))]))
 }
 
 /// The mesh check's findings and its per-solid rows.
@@ -426,33 +467,89 @@ pub fn edges_value(mesh: &TriMesh) -> S {
     }))
 }
 
-/// A face name as the script writes it: `b.top`, `e.side(2)`, `s.inner()`, `s.inner(b.front)`,
+/// A face name as the script writes it: `b.top`, `e.side(section.base)` or `e.side(2)`, `s.inner()`, `s.inner(b.front)`,
 /// `r.face(m.edge(b.top, b.front))`, `r.corner(b.top, b.front, b.right)` (`b` the part it
 /// comes from).
-pub fn written(n: &makepad_csg_graph::edges::FaceName, parts: &std::collections::HashMap<makepad_csg_graph::Key, String>) -> String {
+pub fn written(
+    n: &makepad_csg_graph::edges::FaceName,
+    parts: &std::collections::HashMap<makepad_csg_graph::Key, String>,
+    sides: &std::collections::HashMap<makepad_csg_graph::Key, Vec<Option<String>>>,
+) -> String {
     use makepad_csg_graph::edges::Role;
     let of = parts.get(&n.origin).map_or("?", String::as_str);
-    let list = |l: &[&makepad_csg_graph::edges::FaceName]| l.iter().map(|n| written(n, parts)).collect::<Vec<_>>().join(", ");
+    let list = |l: &[&makepad_csg_graph::edges::FaceName]| l.iter().map(|n| written(n, parts, sides)).collect::<Vec<_>>().join(", ");
     match &n.role {
         Role::Named(f) => format!("{of}.{}", f.name()),
-        Role::Side(i) => format!("{of}.side({i})"),
+        Role::Side(i) => match sides.get(&n.origin).and_then(|names| names.get(*i as usize)).and_then(Option::as_deref) {
+            Some(segment) => format!("{of}.side({segment})"),
+            None => format!("{of}.side({i})"),
+        },
         Role::Inner(None) => format!("{of}.inner()"),
-        Role::Inner(Some(outer)) => format!("{of}.inner({})", written(outer, parts)),
+        Role::Inner(Some(outer)) => format!("{of}.inner({})", written(outer, parts, sides)),
         Role::Blend(a, b) => format!("{of}.face(m.edge({}))", list(&[a, b])),
-        Role::Corner(round) => format!("{of}.corner({})", list(&round.iter().collect::<Vec<_>>())),
+        Role::Corner(_) => format!("{of}.corner({})", list(&corner_faces(n, parts))),
     }
 }
 
-/// The name that picks a face: the first only it holds on the body, else its first.
+/// The names a corner is written with: those of its faces the script can write (each face holds
+/// its part's name and its builder's), else all.
+fn corner_faces<'n>(n: &'n makepad_csg_graph::edges::FaceName, parts: &std::collections::HashMap<makepad_csg_graph::Key, String>) -> Vec<&'n makepad_csg_graph::edges::FaceName> {
+    let makepad_csg_graph::edges::Role::Corner(round) = &n.role else { return Vec::new() };
+    let some: Vec<_> = round.iter().filter(|x| writable(x, parts)).collect();
+    if some.is_empty() { round.iter().collect() } else { some }
+}
+
+/// Whether the script can write name `n`: every part it comes from is a part the script names
+/// (`leg2`; not a builder under its part's placement, nor an anonymous call inside another).
+pub(crate) fn writable(n: &makepad_csg_graph::edges::FaceName, parts: &std::collections::HashMap<makepad_csg_graph::Key, String>) -> bool {
+    use makepad_csg_graph::edges::Role;
+    let named = parts.get(&n.origin).is_some_and(|id| !id.is_empty() && !id.starts_with(|c: char| c.is_ascii_digit()) && id.chars().all(|c| c.is_alphanumeric() || c == '_'));
+    named && match &n.role {
+        Role::Inner(Some(outer)) => writable(outer, parts),
+        Role::Blend(a, c) => writable(a, parts) && writable(c, parts),
+        Role::Corner(round) => round.iter().any(|x| writable(x, parts)),
+        _ => true,
+    }
+}
+
+/// The steps name `n` comes from as written: its own and its faces' (a corner's written ones).
+fn origins(n: &makepad_csg_graph::edges::FaceName, parts: &std::collections::HashMap<makepad_csg_graph::Key, String>, out: &mut Vec<makepad_csg_graph::Key>) {
+    use makepad_csg_graph::edges::Role;
+    out.push(n.origin);
+    match &n.role {
+        Role::Inner(Some(outer)) => origins(outer, parts, out),
+        Role::Blend(a, c) => {
+            origins(a, parts, out);
+            origins(c, parts, out);
+        }
+        Role::Corner(_) => corner_faces(n, parts).into_iter().for_each(|x| origins(x, parts, out)),
+        _ => {}
+    }
+}
+
+/// Face `face`'s names the script can write, in the order a pick takes them: from steps the body
+/// holds once first (a step it holds twice names every copy), then the outermost part's first.
+/// Never by the names' own order: they are sorted by key.
+pub(crate) fn face_names(b: &fab_model::eval::ExactBody, face: u32) -> Vec<&makepad_csg_graph::edges::FaceName> {
+    let Some(f) = b.faces.iter().find(|f| f.id == face) else { return Vec::new() };
+    let mut names: Vec<_> = f.names.iter().filter(|n| writable(n, &b.parts)).collect();
+    names.sort_by_cached_key(|n| {
+        let mut keys = Vec::new();
+        origins(n, &b.parts, &mut keys);
+        (keys.iter().any(|k| b.repeated.contains(k)), b.order.iter().position(|k| *k == n.origin))
+    });
+    names
+}
+
+/// The name that picks a face: its first in [`face_names`]' order. One every copy shares only
+/// when it has no other (the edits then refuse it, [`shared_name`]).
 pub(crate) fn face_pick(b: &fab_model::eval::ExactBody, face: u32) -> Option<String> {
-    let f = b.faces.iter().find(|f| f.id == face)?;
-    let only = f.names.iter().find(|n| b.faces.iter().filter(|g| g.names.contains(n)).count() == 1);
-    only.or(f.names.first()).map(|n| written(n, &b.parts))
+    face_names(b, face).first().map(|n| written(n, &b.parts, &b.sides))
 }
 
 /// Whether face `face` holds the name a script writes as `name`.
 pub(crate) fn face_holds(b: &fab_model::eval::ExactBody, face: u32, name: &str) -> bool {
-    b.faces.iter().find(|f| f.id == face).is_some_and(|f| f.names.iter().any(|n| written(n, &b.parts) == name))
+    face_named(b, face, name).is_some()
 }
 
 /// The names of an edge's two faces that pick it, in order (`m.edge(a, b)`).
@@ -481,21 +578,37 @@ pub(crate) fn edge_near(b: &fab_model::eval::ExactBody, [a, c]: [&str; 2], e: &m
 
 /// `m.edge(a, c)` with its options: the point `near` it, the chain.
 pub(crate) fn edge_text(a: &str, c: &str, near: Option<[f64; 3]>, chain: bool) -> String {
-    let near = near.map(|at| format!("near: [{:.2}mm {:.2}mm {:.2}mm]", at[0], at[1], at[2]));
+    let near = near.map(|at| format!("near: {}", makepad_script::syntax::write::list(at.map(|v| format!("{v:.2}mm")))));
     let options: Vec<String> = near.into_iter().chain(chain.then(|| "chain: true".to_string())).collect();
     if options.is_empty() { format!("m.edge({a}, {c})") } else { format!("m.edge({a}, {c}, {{{}}})", options.join(" ")) }
 }
 
+/// Why an edit by the name `name` face `face` holds must not be made: the name comes from a part
+/// the body holds more than once (a part and its anonymous mirror, two equal unplaced boxes), so
+/// it names every copy's face and an edit by it could land on another copy. None: the name is
+/// this face's own.
+pub(crate) fn shared_name(b: &fab_model::eval::ExactBody, face: u32, name: &str) -> Option<String> {
+    let n = face_named(b, face, name)?;
+    let mut keys = Vec::new();
+    origins(n, &b.parts, &mut keys);
+    let key = keys.into_iter().find(|k| b.repeated.contains(k))?;
+    let part = b.parts.get(&key).map_or("?", String::as_str);
+    Some(format!("two faces share the name `{name}`: this body holds the same `{part}` more than once, and an edit by that name could land on the other copy, so nothing was changed (give each copy a `let` of its own, placed where it goes)"))
+}
+
 /// The name face `face` holds that the script writes as `text`.
 pub(crate) fn face_named<'b>(b: &'b fab_model::eval::ExactBody, face: u32, text: &str) -> Option<&'b makepad_csg_graph::edges::FaceName> {
-    b.faces.iter().find(|f| f.id == face)?.names.iter().find(|n| written(n, &b.parts) == text)
+    let numeric = std::collections::HashMap::new();
+    b.faces.iter().find(|f| f.id == face)?.names.iter().find(|n| {
+        written(n, &b.parts, &b.sides) == text || (!b.sides.is_empty() && written(n, &b.parts, &numeric) == text)
+    })
 }
 
 /// An exact body's sharp edges, each with its two faces and the selector that picks it
 /// (`m.edge(a, b)`, with `near:` where the two faces meet in several pieces).
 pub fn exact_edges(b: &fab_model::eval::ExactBody) -> S {
     let sharp: Vec<_> = b.edges.iter().filter(|e| !e.smooth).collect();
-    let pairs: Vec<Option<String>> = sharp.iter().map(|e| edge_pair(b, e).map(|pair| pair.join(", "))).collect();
+    let pairs: Vec<_> = sharp.iter().map(|e| edge_pair(b, e)).collect();
     arr(sharp.iter().zip(&pairs).take(64).map(|(e, pair)| {
         let mut f = vec![("id", int(e.id)), ("kind", name(e.kind)), ("convex", flag(e.convex)), ("at", v3(dvec3(e.at[0], e.at[1], e.at[2]))), ("length", r(e.size))];
         if let Some(radius) = e.radius {
@@ -504,9 +617,9 @@ pub fn exact_edges(b: &fab_model::eval::ExactBody) -> S {
         if !e.faces.is_empty() {
             f.push(("faces", arr(e.faces.iter().map(|&i| int(i)))));
         }
-        if let Some(pair) = pair {
-            let near = if pairs.iter().filter(|p| p.as_ref() == Some(pair)).count() > 1 { format!(", {{near: [{:.2}mm {:.2}mm {:.2}mm]}}", e.at[0], e.at[1], e.at[2]) } else { String::new() };
-            f.push(("edge", s(&format!("m.edge({pair}{near})"))));
+        if let Some([a, c]) = pair {
+            let shared = pairs.iter().filter(|p| *p == pair).nth(1).is_some();
+            f.push(("edge", s(edge_text(a, c, shared.then_some(e.at), false))));
         }
         obj(f)
     }))
@@ -522,8 +635,16 @@ pub fn exact_value(name_of: &str, b: &fab_model::eval::ExactBody) -> S {
         if let Some(normal) = e.normal {
             f.push(("normal", at(normal)));
         }
-        if !e.names.is_empty() {
-            f.push(("names", arr(e.names.iter().map(|n| s(&written(n, &b.parts))))));
+        // the names the script can write, the one a pick takes first
+        let mut names: Vec<String> = Vec::new();
+        for n in face_names(b, e.id) {
+            let n = written(n, &b.parts, &b.sides);
+            if !names.contains(&n) {
+                names.push(n);
+            }
+        }
+        if !names.is_empty() {
+            f.push(("names", arr(names.iter().map(|n| s(n)))));
         }
         obj(f)
     });
@@ -543,13 +664,17 @@ pub fn exact_value(name_of: &str, b: &fab_model::eval::ExactBody) -> S {
 /// and an example, for the guide.
 pub fn vocabulary(group: &str) -> Result<String, String> {
     use makepad_model_script::lang::protos::{Group, PROTOS};
-    let groups = [Group::Primitive, Group::Generator, Group::Mechanical, Group::Text, Group::Modify, Group::Combine, Group::Field, Group::Brep, Group::Joint, Group::Weave, Group::Lighten, Group::Sketch, Group::Shape, Group::Segment, Group::Look, Group::Study];
+    let groups = [Group::Primitive, Group::Generator, Group::Mechanical, Group::Text, Group::Modify, Group::Combine, Group::Field, Group::Brep, Group::Joint, Group::Weave, Group::Lighten, Group::Sketch, Group::Shape, Group::Segment, Group::Look, Group::Study, Group::Handle];
+    let names = |prefix: &str| groups.iter().map(|g| match g.aliases() {
+        [] => g.name().to_string(),
+        aliases => format!("{} ({prefix}{})", g.name(), aliases.join(" or ")),
+    }).collect::<Vec<_>>().join(", ");
+    let group = group.trim();
     if group.is_empty() {
-        let names: Vec<&str> = groups.iter().map(|g| g.name()).collect();
-        return Ok(format!("Ask for `vocabulary <group>`: {}. A builder's fields are required first, then optional (?).", names.join(", ")));
+        return Ok(format!("Ask for `vocabulary <group>`: {}. A builder's fields are required first, then optional (?).", names("")));
     }
-    let Some(g) = groups.iter().find(|g| g.name() == group).copied() else {
-        return Err(format!("no vocabulary group '{group}'"));
+    let Some(g) = groups.iter().copied().find(|g| g.name().eq_ignore_ascii_case(group) || g.aliases().iter().any(|alias| alias.eq_ignore_ascii_case(group))) else {
+        return Err(format!("no vocabulary group '{}'; the groups are: {}", group.escape_debug(), names("also ")));
     };
     let mut out = String::new();
     for p in PROTOS.iter().filter(|p| p.group == g) {

@@ -9,16 +9,16 @@
 //!   argument's literal.
 //! - **Part fields**: the number literals written in a part's builder call
 //!   (`radius: 2.3mm`, an element of `size: [40mm 10mm 30mm]`), typed by the
-//!   prototype's field table. Fields written as expressions are worked out and
-//!   not listed.
+//!   prototype's field table. Fields can also follow arithmetic expressions of
+//!   declared parameters.
 //!
 //! A parameter belongs to the plate parts whose solids use it (directly, through
 //! other `let`s, or inside an SDF field's fn). Lengths show in millimetres and
 //! angles in degrees. Its handle is its field's (an extrusion's height arrow, a
 //! cylinder's radius ring, a position's point) in the model frame, its `rate` the
 //! handle's travel per unit of value, found by evaluating the program with the
-//! parameter moved (an override of the evaluation, not a text change). An edit
-//! is one [`Edit::Set`] of the site: one undo step. A solid's placement (`at`, `rotate`,
+//! parameter moved (an override of the evaluation, not a text change). Changing
+//! a value or its formula takes one undo step. A solid's placement (`at`, `rotate`,
 //! `scale`) is a value too, written whole: what the view's gizmo drags ([`placed`]).
 //!
 //! A cage (`m.cage`) lists its points one row each, a point written as three numbers taking
@@ -30,6 +30,7 @@ use crate::program::{self, part_id, split_id, Compiled, Instance, Script, UNIT};
 use crate::{Change, Edit};
 use makepad_csg_graph::{Op, Plane};
 use makepad_model_script::lang::{edit, protos, Program, Solid};
+use makepad_script::syntax::quantity::{self, Measure, NamedValue, Reading};
 use makepad_script::syntax::{Kind as SKind, Node};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
@@ -273,12 +274,19 @@ pub struct Param {
     pub kind: Kind,
     pub unit: String,
     pub value: PValue,
+    /// The field's expression as written when it follows declared parameters.
+    pub formula: Option<String>,
+    /// How far a drag reaches (display units). Where the script declares no range, a span round
+    /// the value: it scales the drag and limits nothing.
     pub min: f64,
     pub max: f64,
+    /// The bounds a value is held to: the ones the script or the builder declares (display
+    /// units). A side with none takes any value; the model refuses one it cannot build.
+    pub limits: [Option<f64>; 2],
     pub step: f64,
     /// Choice labels and the Splash they write (`@xz`).
     pub choices: Vec<(String, String)>,
-    /// The literal's bytes in the instance's script.
+    /// The value's bytes in the instance's script.
     pub site: Range<usize>,
     pub declared: bool,
     /// Worked out from other parameters (shown, not edited).
@@ -318,6 +326,11 @@ fn pretty(name: &str) -> String {
     let s = name.replace('_', " ");
     let mut c = s.chars();
     c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+}
+
+/// A declared range as the bounds a value is held to: none when it is empty.
+fn declared(min: f64, max: f64) -> [Option<f64>; 2] {
+    if max > min { [Some(min), Some(max)] } else { [None, None] }
 }
 
 /// Lengths to millimetres, angles to degrees.
@@ -528,6 +541,54 @@ fn literal(node: &Node) -> Option<f64> {
     }
 }
 
+// A nonliteral value the quantity evaluator can read, excluding a lone name
+// (which already has its own row) and data such as a list or a function.
+fn arithmetic(node: &Node) -> bool {
+    matches!(node.kind, SKind::Chain { .. } | SKind::Paren { .. } | SKind::Unary { .. })
+}
+
+fn named_value(p: &Param) -> Option<NamedValue> {
+    let (_, name) = split_id(&p.key)?;
+    let measure = match p.kind {
+        Kind::Length | Kind::Radius | Kind::Diameter => Measure::Length,
+        Kind::Angle => Measure::Angle,
+        Kind::Ratio => Measure::Fraction,
+        Kind::Count | Kind::Number | Kind::Seed => Measure::Plain,
+        _ => return None,
+    };
+    Some(NamedValue { name: name.to_string(), label: p.label.clone(), value: script_value(p.kind, p.value.num()?), measure })
+}
+
+/// Read a formula as its row's box reads it, in the row's units (`shown`'s: millimetres,
+/// degrees; ratios as fractions, though their box shows percent). It must read a declared
+/// parameter, and mean the same in a script: a bare number takes the box's display unit
+/// there (`wall + 1` adds 1 mm) but the base unit in Splash (1 m), so such text is refused
+/// with the spelling that says what the box meant. O(text).
+pub(crate) fn formula_value(code: &str, kind: Kind, names: &[NamedValue]) -> Result<f64, String> {
+    let unit = if kind.is_length() { "mm" } else if kind == Kind::Angle { "°" } else if kind == Kind::Ratio { "%" } else { "" };
+    let reading = Reading::from_suffix(unit);
+    let r = quantity::evaluate(code, &reading, names).map_err(|e| e.message)?;
+    if r.names.is_empty() {
+        return Err("a link must read a declared parameter".into());
+    }
+    let (base, base_unit) = match reading.measure {
+        Measure::Length => (Reading::from_suffix("m"), "m"),
+        Measure::Angle => (Reading::from_suffix("rad"), "rad"),
+        Measure::Time => (Reading::from_suffix("s"), "s"),
+        Measure::Fraction => (Reading { measure: Measure::Fraction, unit: String::new(), scale: 1.0 }, "fractions"),
+        Measure::Plain => return Ok(r.value),
+    };
+    let shown_base = r.value * reading.scale;
+    let agrees = quantity::evaluate(code, &base, names).is_ok_and(|b| {
+        let b = b.value * base.scale;
+        (shown_base - b).abs() <= (1e-9 * shown_base.abs().max(b.abs())).max(1e-12)
+    });
+    if !agrees {
+        return Err(format!("`{code}` reads differently in script units ({base_unit}). Write `{}`", r.script));
+    }
+    Ok(if kind == Kind::Ratio { shown_base } else { r.value })
+}
+
 /// The parameter model of an evaluated project: one entry per plate part. Keys are
 /// `instance/site`: a declared parameter is the instance's own (its value is the project's),
 /// a part field is its script's (an edit changes every instance of that script).
@@ -609,8 +670,10 @@ fn instance_params(inst: &Instance, ev: &Evaluated, base: usize, rates: Option<&
                 kind,
                 unit: kind.default_unit().to_string(),
                 value: PValue::Num(value),
+                formula: None,
                 min,
                 max,
+                limits: [v(q.call.min), v(q.call.max)],
                 step: v(q.call.step).unwrap_or(if matches!(kind, Kind::Count | Kind::Seed) { 1.0 } else { 0.1 }),
                 choices: Vec::new(),
                 site: span.clone(),
@@ -624,9 +687,9 @@ fn instance_params(inst: &Instance, ev: &Evaluated, base: usize, rates: Option<&
             solids,
         ));
     }
-    // Each solid's fields, found once for the literals and the declared params' handles.
+    let names: Vec<_> = all.iter().filter_map(|(p, _)| named_value(p)).collect();
+    // Each solid's fields, found once for their rows and the declared params' handles.
     let fields_of: Vec<Vec<(String, &Node)>> = p.solids.iter().map(|s| part_fields(p, s)).collect();
-    // Solid fields written as literals.
     for (i, s) in p.solids.iter().enumerate() {
         let Some(proto) = protos::proto(s.proto) else { continue };
         let fields = &fields_of[i];
@@ -689,8 +752,10 @@ fn instance_params(inst: &Instance, ev: &Evaluated, base: usize, rates: Option<&
                             kind: Kind::Choice,
                             unit: String::new(),
                             value: PValue::Choice(at),
+                            formula: None,
                             min: 0.0,
                             max: 0.0,
+                            limits: [None, None],
                             step: 0.0,
                             choices: list.iter().map(|c| (pretty(c), format!("@{c}"))).collect(),
                             site: n.span.clone(),
@@ -705,8 +770,16 @@ fn instance_params(inst: &Instance, ev: &Evaluated, base: usize, rates: Option<&
                     ));
                     continue;
                 }
-                let Some(raw) = literal(n) else { continue };
-                let kind = if def.kind == protos::Kind::Scale { Kind::Ratio } else { kind_of(def.kind) };
+                let kind = kind_of(def.kind);
+                let (value, formula) = match literal(n) {
+                    Some(raw) => (shown(kind, raw), None),
+                    None if kind.is_numeric() && arithmetic(n) && !names.is_empty() => {
+                        let code = text(p, &n.span).trim();
+                        let Ok(value) = formula_value(code, kind, &names) else { continue };
+                        (value, Some(code.to_string()))
+                    }
+                    None => continue,
+                };
                 let axis = ["X", "Y", "Z"];
                 let label = match index {
                     // A point's or a placement's coordinates; other lists (a size per point) count.
@@ -714,18 +787,19 @@ fn instance_params(inst: &Instance, ev: &Evaluated, base: usize, rates: Option<&
                     Some(k) => format!("{} {k}", def.label),
                     None => def.label.to_string(),
                 };
-                let value = shown(kind, raw);
                 let (min, max) = if def.max > def.min { (shown(kind, def.min), shown(kind, def.max)) } else { (value.min(0.0), value.abs().max(1.0) * 4.0) };
-                let mut anchor = field_anchor(op, name, index).map(|a| a.transformed(&frame[..]));
-                if name == "at" {
-                    if let Some(k) = index.filter(|k| *k < 3) {
-                        let parent = s.parent.and_then(|j| ev.objects.get(base + j)).map(|o| o.world).unwrap_or(*frame);
-                        let at = [frame[0][3], frame[1][3], frame[2][3]];
-                        let mut axes = vec![[0.0; 3]; 3];
-                        axes[k] = xf_dir(&parent[..], [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]][k]);
-                        anchor = Some(Anchor::Point { at, axes });
-                    }
-                }
+                let limits = if def.max > def.min { declared(min, max) } else { [None, None] };
+                let anchor = if formula.is_some() {
+                    None
+                } else if let ("at", Some(k)) = (name, index.filter(|k| *k < 3)) {
+                    let parent = s.parent.and_then(|j| ev.objects.get(base + j)).map(|o| o.world).unwrap_or(*frame);
+                    let at = [frame[0][3], frame[1][3], frame[2][3]];
+                    let mut axes = vec![[0.0; 3]; 3];
+                    axes[k] = xf_dir(&parent[..], [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]][k]);
+                    Some(Anchor::Point { at, axes })
+                } else {
+                    field_anchor(op, name, index).map(|a| a.transformed(&frame[..]))
+                };
                 all.push((
                     Param {
                         key,
@@ -735,8 +809,10 @@ fn instance_params(inst: &Instance, ev: &Evaluated, base: usize, rates: Option<&
                         kind,
                         unit: kind.default_unit().to_string(),
                         value: PValue::Num(value),
+                        formula,
                         min,
                         max,
+                        limits,
                         step: if def.step > 0.0 { shown(kind, def.step) } else { 0.1 },
                         choices: Vec::new(),
                         site: n.span.clone(),
@@ -752,7 +828,7 @@ fn instance_params(inst: &Instance, ev: &Evaluated, base: usize, rates: Option<&
             }
         }
     }
-    let calls = call_params(inst, &all);
+    let calls = call_params(inst, &all, &names);
     all.extend(calls);
     all.extend(pattern_params(inst));
     all.extend(settings_params(inst));
@@ -773,7 +849,7 @@ fn instance_params(inst: &Instance, ev: &Evaluated, base: usize, rates: Option<&
 /// (`bow.len`: the part the call makes, and the fn's parameter) where no field in `listed` is
 /// that value already: a part a fn makes is set by what its call passes, the fn's code being
 /// every call's.
-fn call_params(inst: &Instance, listed: &[(Param, Vec<usize>)]) -> Vec<(Param, Vec<usize>)> {
+fn call_params(inst: &Instance, listed: &[(Param, Vec<usize>)], names: &[NamedValue]) -> Vec<(Param, Vec<usize>)> {
     let p = &inst.script.program;
     let q_id = |site: &str| part_id(&inst.name, site);
     let seen: HashSet<(usize, usize)> = listed.iter().map(|(q, _)| (q.site.start, q.site.end)).collect();
@@ -797,15 +873,33 @@ fn call_params(inst: &Instance, listed: &[(Param, Vec<usize>)]) -> Vec<(Param, V
                 _ => vec![(param.to_string(), arg)],
             };
             for (path, n) in values {
-                let Some(raw) = literal(n).filter(|_| !seen.contains(&(n.span.start, n.span.end))) else { continue };
-                // The part's name and the parameter must name this argument.
-                let Some(owner) = made.iter().map(|&j| &p.solids[j]).find(|o| edit::site_span(p, &format!("{}.{path}", o.id)).is_ok_and(|r| r == n.span)) else { continue };
-                let written = text(p, &n.span);
-                let kind = match kind_of_literal(written) {
-                    Kind::Number if path == param && !written.contains(['.', 'e']) => Kind::Count,
-                    kind => kind,
+                if seen.contains(&(n.span.start, n.span.end)) { continue; }
+                let written = text(p, &n.span).trim();
+                let (kind, value, formula) = match literal(n) {
+                    Some(raw) => {
+                        let kind = match kind_of_literal(written) {
+                            Kind::Number if path == param && !written.contains(['.', 'e']) => Kind::Count,
+                            kind => kind,
+                        };
+                        (kind, shown(kind, raw), None)
+                    }
+                    None if arithmetic(n) && !names.is_empty() => {
+                        // A function argument has no prototype field. Its units come from
+                        // the names and explicit units in its expression.
+                        let Some((kind, value)) = [Kind::Number, Kind::Length, Kind::Angle].into_iter()
+                            .find_map(|kind| Some((kind, formula_value(written, kind, names).ok()?))) else { continue };
+                        (kind, value, Some(written.to_string()))
+                    }
+                    None => continue,
                 };
-                let value = shown(kind, raw);
+                // The part's name and the parameter must resolve to this call's argument.
+                let Some(owner) = made.iter().map(|&j| &p.solids[j]).find(|o| {
+                    if formula.is_some() {
+                        edit::part_value(p, o, &path).is_ok_and(|arg| arg.span == n.span)
+                    } else {
+                        edit::site_span(p, &format!("{}.{path}", o.id)).is_ok_and(|span| span == n.span)
+                    }
+                }) else { continue };
                 out.push((
                     Param {
                         key: q_id(&format!("{}.{path}", owner.id)),
@@ -815,8 +909,10 @@ fn call_params(inst: &Instance, listed: &[(Param, Vec<usize>)]) -> Vec<(Param, V
                         kind,
                         unit: kind.default_unit().to_string(),
                         value: PValue::Num(value),
+                        formula,
                         min: if value > 0.0 { 0.0 } else { value * 2.0 },
                         max: value.abs().max(1.0) * 4.0,
+                        limits: [None, None],
                         step: if kind == Kind::Count { 1.0 } else { 0.1 },
                         choices: Vec::new(),
                         site: n.span.clone(),
@@ -864,8 +960,10 @@ fn cage_rows(inst: &Instance, s: &Solid, i: usize, field: &str, items: &[Node], 
             kind,
             unit: kind.default_unit().to_string(),
             value,
+            formula: None,
             min: 0.0,
             max: 0.0,
+            limits: [None, None],
             step: if face { 1.0 } else { 0.1 },
             choices: Vec::new(),
             site: n.span.clone(),
@@ -975,8 +1073,10 @@ fn settings_params(inst: &Instance) -> Vec<(Param, Vec<usize>)> {
                     kind,
                     unit: kind.default_unit().to_string(),
                     value,
+                    formula: None,
                     min,
                     max,
+                    limits: declared(min, max),
                     step,
                     choices,
                     site,
@@ -1103,8 +1203,10 @@ fn pattern_params(inst: &Instance) -> Vec<(Param, Vec<usize>)> {
             kind,
             unit: kind.default_unit().to_string(),
             value,
+            formula: None,
             min: def.map_or(0.0, |d| if kind.is_length() { shown(kind, d.min) } else { d.min }),
             max: def.map_or(0.0, |d| if kind.is_length() { shown(kind, d.max) } else { d.max }),
+            limits: def.map_or([None, None], |d| if kind.is_length() { declared(shown(kind, d.min), shown(kind, d.max)) } else { declared(d.min, d.max) }),
             step: def.map_or(0.0, |d| if kind.is_length() { shown(kind, d.step) } else { d.step }),
             choices,
             site,
@@ -1360,6 +1462,27 @@ fn script_value(kind: Kind, v: f64) -> f64 {
     }
 }
 
+/// Whether a numeric row can store an expression in its instance's script.
+pub fn can_link(p: &Param) -> bool {
+    p.kind.is_numeric() && p.value.num().is_some() && !p.declared && !p.derived && region_setting(&p.key).is_none()
+        && split_id(&p.key).is_some_and(|(_, site)| !site.contains(PATTERN_SITE))
+}
+
+/// Replace this row's value with arithmetic that reads the instance's declared parameters.
+pub fn link(c: &Compiled, parts: &[PartParams], key: &str, code: &str) -> Result<Change, String> {
+    let p = parts.iter().flat_map(|pp| &pp.params).find(|p| p.key == key).ok_or_else(|| format!("no parameter '{key}'"))?;
+    if !can_link(p) {
+        return Err(format!("'{}' holds a number", p.label));
+    }
+    let inst = c.instance(&p.instance).ok_or_else(|| format!("no instance for '{key}'"))?;
+    let mut seen = HashSet::new();
+    let names: Vec<_> = parts.iter().flat_map(|pp| &pp.params)
+        .filter(|&row| row.declared && row.instance == p.instance && seen.insert(&row.key))
+        .filter_map(named_value).collect();
+    formula_value(code, p.kind, &names)?;
+    Ok(Change::Script { file: inst.script.file.clone(), edit: Edit::Splice { range: p.site.clone(), text: code.to_string() } })
+}
+
 /// The change that sets parameter `key` to `value` (display units): a declared parameter's
 /// value in its instance, or a part field's literal in its script.
 pub fn edit(c: &Compiled, parts: &[PartParams], key: &str, value: &PValue) -> Result<Change, String> {
@@ -1392,7 +1515,12 @@ pub fn edit(c: &Compiled, parts: &[PartParams], key: &str, value: &PValue) -> Re
         PValue::Point(v) if p.kind == Kind::Point => point_text(&inst.script.program, p, site, v)?,
         _ => return Err("points and profiles are edited one coordinate at a time".into()),
     };
-    Ok(Change::Script { file: inst.script.file.clone(), edit: Edit::Set { site: site.to_string(), value: text } })
+    let edit = if p.formula.is_some() && matches!(value, PValue::Num(_)) {
+        Edit::Splice { range: p.site.clone(), text }
+    } else {
+        Edit::Set { site: site.to_string(), value: text }
+    };
+    Ok(Change::Script { file: inst.script.file.clone(), edit })
 }
 
 /// The fields that place a solid in the frame it is placed in: where its origin sits, and how
@@ -1646,9 +1774,13 @@ fn param_text(p: &Param) -> String {
         PValue::Point(c) => list(c.iter().map(|x| format!("{}{}", num(*x), p.unit)).collect()),
         PValue::Profile(_) => "nil".into(),
     };
-    let range = if p.kind.is_numeric() && p.value.num().is_some() { format!(" min: {}{u} max: {}{u}", num(p.min), num(p.max), u = p.unit) } else { String::new() };
+    let formula = p.formula.as_ref().map(|f| format!(" formula: {}", q(f))).unwrap_or_default();
+    // the declared limits only: a drag's reach is no limit on a set value
+    let range = if p.kind.is_numeric() && p.value.num().is_some() {
+        p.limits.iter().zip(["min", "max"]).filter_map(|(l, n)| l.map(|x| format!(" {n}: {}{}", num(x), p.unit))).collect()
+    } else { String::new() };
     format!(
-        "{{key: {} label: {} group: {} kind: @{} value: {v}{range}{}{}}}",
+        "{{key: {} label: {} group: {} kind: @{} value: {v}{formula}{range}{}{}}}",
         q(&p.key),
         q(&p.label),
         q(&p.group),
@@ -1999,14 +2131,101 @@ pub fn is_helical(c: &Compiled, instance: &str, solid: &str) -> bool {
 /// nothing committed): what a ghost builds while the parameter moves.
 pub fn with_value(c: &Compiled, parts: &[PartParams], key: &str, value: &PValue) -> Result<Script, String> {
     let (inst, _) = split_id(key).and_then(|(i, site)| Some((c.instance(i)?, site))).ok_or_else(|| format!("no instance for '{key}'"))?;
+    with_change(inst, &edit(c, parts, key, value)?)
+}
+
+/// Instance `inst`'s script with one value change made, compiled (nothing evaluated, nothing
+/// committed): a parameter pinned at its value, or one edit of its source.
+pub fn with_change(inst: &Instance, change: &Change) -> Result<Script, String> {
     let s = &inst.script;
-    match edit(c, parts, key, value)? {
+    match change {
         Change::Param { name, value, .. } => compile_pinned(s, s.source(), value.map(|v| (name.as_str(), v))),
         Change::Script { edit, .. } => {
-            let source = makepad_model_script::lang::edit::apply(&s.program, &edit)?;
+            let source = makepad_model_script::lang::edit::apply(&s.program, edit)?;
             compile_pinned(s, &source, None)
         }
         _ => Err("not a parameter".into()),
+    }
+}
+
+/// Where a [`Template`]'s code takes its value.
+pub const AT_VALUE: &str = "%value%";
+
+/// How a command writes the one number it drags (a round on a pick): at each value the change
+/// its commit makes, which a preview builds without committing. A number the script already
+/// holds is set where it is; one it does not hold yet comes with the code that writes it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Template {
+    pub file: String,
+    pub kind: Kind,
+    pub writes: Writes,
+}
+
+/// What a [`Template`] changes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Writes {
+    /// A value site of the script, as `fab.params` keys it without its instance
+    /// (`joined.radius`, `body.radius`).
+    Set { site: String },
+    /// A declared parameter of `instance`.
+    Param { instance: String, name: String },
+    /// One field of a solid's call written or added as `code` ([`AT_VALUE`] where the value
+    /// goes): `radius:` on a box that had none, `at: [0, %value%, 0]`.
+    Field { solid: String, field: String, code: String },
+    /// A solid's code replaced by `code` ([`AT_VALUE`] where the value goes): a hard union
+    /// rewritten as its blend.
+    Replace { solid: String, code: String },
+    /// `code`, written on `solid`, becomes `solid` ([`Edit::After`]): a fillet of a body's picked
+    /// edges, the part keeping its name.
+    After { solid: String, code: String },
+    /// Several sites, each written `base + rate * value`: a box's face pulled out, its size and
+    /// its centre moving together so the opposite face stays.
+    Many(Vec<Linked>),
+    /// `then`, once each inline solid (its id) is hoisted into a `let` of its own name
+    /// ([`Edit::Rename`]): an edit by the faces of a copy the body holds twice, written by that
+    /// copy's own name (`leg1_mirror.top`, not `leg1.top`).
+    Hoisted { hoists: Vec<(String, String)>, then: Box<Writes> },
+}
+
+/// One site of [`Writes::Many`]: written `base + rate * value`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Linked {
+    pub writes: Writes,
+    pub base: f64,
+    pub rate: f64,
+}
+
+impl Template {
+    /// The changes that write `v` (display units: millimetres for a length): one batch.
+    pub fn changes(&self, v: f64) -> Vec<Change> {
+        let mut out = Vec::new();
+        self.write(&self.writes, v, &mut out);
+        out
+    }
+
+    fn write(&self, writes: &Writes, v: f64, out: &mut Vec<Change>) {
+        let text = fresh(self.kind, v);
+        let script = |edit: Edit| Change::Script { file: self.file.clone(), edit };
+        out.push(match writes {
+            Writes::Set { site } => script(Edit::Set { site: site.clone(), value: text }),
+            Writes::Param { instance, name } => Change::Param { instance: instance.clone(), name: name.clone(), value: Some(script_value(self.kind, v)) },
+            Writes::Field { solid, field, code } => script(Edit::Field { solid: solid.clone(), field: field.clone(), code: code.replace(AT_VALUE, &text) }),
+            Writes::Replace { solid, code } => script(Edit::Replace { solid: solid.clone(), code: code.replace(AT_VALUE, &text) }),
+            Writes::After { solid, code } => script(Edit::After { solid: solid.clone(), code: code.replace(AT_VALUE, &text) }),
+            Writes::Many(sites) => {
+                for l in sites {
+                    self.write(&l.writes, l.base + l.rate * v, out);
+                }
+                return;
+            }
+            Writes::Hoisted { hoists, then } => {
+                for (solid, to) in hoists {
+                    out.push(script(Edit::Rename { solid: solid.clone(), to: to.clone() }));
+                }
+                self.write(then, v, out);
+                return;
+            }
+        });
     }
 }
 

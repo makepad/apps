@@ -23,11 +23,14 @@
 //! (its scene, the board's preparation and art) drew in the rest (9 and 8 draws). Each phase reads both views from one read of the UI, as a read after input
 //! draws every window while the bench plays: the rest's draws include one, its closing read's.
 //!
-//! The orbit also waits for the board's run to have started and its lights to hold for a rest's
-//! length: a run that starts late publishes its first lights into the rest (a bucket run's board
-//! compiled its run's plan cold for 1.8 s, and both views drew twice more in the rest). A view
-//! that draws too often in the rest is named with where its draws came from: the test's reads,
-//! publications (the board's live values, a board drawing), or elsewhere.
+//! The orbit also waits for the board's run to have settled (`sim_steady`: no publication follows
+//! until a command) and its lights to hold for a rest's length. A run that starts late publishes
+//! its first lights into the rest (a bucket run's board compiled its run's plan cold for 1.8 s,
+//! and both views drew twice more in the rest), and a quiet half second alone is no rest: a cold
+//! box's run crawled while its plan compiled (4.4 s), publishing seldom, then published its way
+//! to rest in the orbit's (6 draws asked of each view by publications). A view that draws too
+//! often in the rest is named with where its draws came from: the test's reads, publications
+//! (the board's live values, a board drawing), or elsewhere.
 //!
 //! HAL offscreen (`MAKEPAD_HAL_BACKEND=offscreen`), native GPU, no window.
 
@@ -125,9 +128,10 @@ fn num(v: &Value) -> Option<f64> {
     }
 }
 
-/// The board's run has stepped (`sim_t`, the run's simulated time, past 0).
-fn run_started(report: &Value) -> bool {
-    report.get("sim_t").and_then(num).is_some_and(|t| t > 0.0)
+/// The board's run has stepped (`sim_t`, the run's simulated time, past 0) and settled
+/// (`sim_steady`): what it shows now holds until a command.
+fn run_settled(report: &Value) -> bool {
+    report.get("sim_t").and_then(num).is_some_and(|t| t > 0.0) && report.get("sim_steady").and_then(Value::as_bool) == Some(true)
 }
 
 /// Where the last pointer move over the view was (window points), once one came.
@@ -193,11 +197,11 @@ fn neither_view_draws_while_an_orbit_rests_and_both_finish_their_still_average_a
         });
         let seen = seen.expect("a read of both views");
         assert!(tone_box_shown(&seen), "both views still with the tone box shown: {} and {}", seen[0].to_json(), seen[1].to_json());
-        // The board's run started and its lights holding: no publication asks either view to draw
+        // The board's run settled and its lights holding: no publication asks either view to draw
         // for a rest's length.
-        wait_until(&app, "the board's run started, its lights holding for a rest's length", || {
+        wait_until(&app, "the board's run settled, its lights holding for a rest's length", || {
             let r = reports(&app);
-            if !run_started(&r[0]) {
+            if !run_settled(&r[0]) {
                 return false;
             }
             let from = counts(&r);

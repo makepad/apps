@@ -60,7 +60,7 @@ use makepad_fab_slicer::nonplanar::{NpBox, NpPlan, NpSettings};
 use makepad_fab_slicer::sdf::{PlaneSlope, SdfParams, SdfSource, Slab, SlopeMap};
 use makepad_fab_slicer::source::{ContourSource, MeshSource, PaintAt};
 use makepad_fab_toolpath::stages::{self, PartPlan, PlateCtl, PlatePart, PlateRun, Task};
-use makepad_fab_toolpath::{contours_some, is_support_key, par, plan_one, regions_bytes, Emit, ObjectInput, ObjectLayer, ObjectPlan, Params, Toolpaths, DROPPED_TIPS};
+use makepad_fab_toolpath::{contours_some, grade, grade_key, is_support_key, par, paint_reads, plan_one, plan_reads, plan_reads_held, regions_bytes, solve_grade, Emit, ObjectInput, ObjectLayer, ObjectPlan, Params, Toolpaths, DROPPED_TIPS};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -145,6 +145,12 @@ pub struct Frame {
     /// A pure SDF part: sliced from this field, `local` is then its display
     /// mesh only. None: sliced from `local`.
     pub field: Option<PartField>,
+}
+
+/// The class displacement takes the representative's vertices to the copy's local mesh.
+/// Adding the copy's frame offset places them on the bed.
+fn copy_plan_offset(copy_offset: Pt, class_displacement: Pt) -> Pt {
+    copy_offset.add(class_displacement)
 }
 
 /// A pure SDF part: its live typed shape (model coordinates, kernels as
@@ -1280,6 +1286,8 @@ struct Caches {
     cuts: Vec<((u64, u64), Arc<CutLayers>)>,
     /// (content key, settings) → the part's plan in its frame.
     plans: Vec<((u64, u64), Arc<ObjectPlan>)>,
+    /// Per part, the warp of its current cuts and grading settings, held between revisions.
+    grades: Vec<Option<(u64, Arc<grade::Graded>)>>,
     /// Per part slot whose supports the sink shows as [`PRUNED`]: the plan's settings, and the
     /// layers it was sent less some trees.
     pruned: Vec<Option<(u64, Vec<u32>)>>,
@@ -2993,6 +3001,9 @@ struct Slot {
 
 /// A precut contour source: the engine's cut, falling back to the source.
 struct Precut {
+    /// The live slice's cut key (`slot.key`), the same one its cut cache reuses contours by, under
+    /// the code that makes parts ([`with_code`]).
+    key: Option<u64>,
     mesh: Arc<dyn ContourSource + Send + Sync>,
     field: bool,
     bounds: ([f64; 3], [f64; 3]),
@@ -3001,6 +3012,7 @@ struct Precut {
 }
 
 impl ContourSource for Precut {
+    fn content_key(&self) -> Option<u64> { self.key }
     fn bounds(&self) -> ([f64; 3], [f64; 3]) {
         self.bounds
     }
@@ -3467,6 +3479,12 @@ impl Trace {
     }
 }
 
+/// An adaptive part's key and the warp available to its windows in this revision.
+struct PartGrade {
+    key: u64,
+    warp: Option<Arc<grade::Graded>>,
+}
+
 /// One revision's planned model layers per part. What a part not planned whole has goes to the
 /// caches when the revision ends, also when it is superseded or dropped at a suspension: the next
 /// revision of that content plans only the rest.
@@ -3475,6 +3493,7 @@ struct Assembled<'a> {
     keys: Vec<u64>,
     settings: u64,
     parts: Vec<Assembly>,
+    grades: Vec<Option<PartGrade>>,
 }
 impl std::ops::Deref for Assembled<'_> {
     type Target = Vec<Assembly>;
@@ -3486,11 +3505,15 @@ impl std::ops::DerefMut for Assembled<'_> {
 impl Drop for Assembled<'_> {
     fn drop(&mut self) {
         let kept: Vec<_> = self.parts.iter_mut().enumerate().filter(|(_, a)| !a.iter().all(|r| r.iter().all(Option::is_none))).map(|(i, a)| (i, std::mem::take(a))).collect();
-        if kept.is_empty() {
-            return;
-        }
+        // Copies that shared their owner's plan take its warp too. Superseded revisions keep
+        // any warp already solved, just as they keep their completed layers.
+        let grades = self.grades.iter_mut().map(|part| {
+            let part = part.as_mut()?;
+            Some((part.key, part.warp.take().or_else(|| grade::held(part.key))?))
+        }).collect();
         // A panic while the caches were held: recovery discards them anyway.
         let Ok(mut c) = self.shared.caches.lock() else { return };
+        let old_grades = std::mem::replace(&mut c.grades, grades);
         // What they replace is let go of with the caches let go.
         let mut replaced = Vec::with_capacity(kept.len());
         for (i, a) in kept {
@@ -3498,7 +3521,7 @@ impl Drop for Assembled<'_> {
             replaced.push(c.partial_plans[i].replace((self.keys[i], self.settings, a)));
         }
         drop(c);
-        drop(replaced);
+        drop((old_grades, replaced));
     }
 }
 
@@ -3840,7 +3863,7 @@ async fn run(shared: &Arc<Shared>, snap: &Snapshot, phase: &std::sync::atomic::A
             let (i, r) = (ms[k], ms[r]);
             if r != i && filaments[r] == filaments[i] && input.plate.parts[r].print == input.plate.parts[i].print && no_trees_key(&input.plate.parts[r]) == no_trees_key(&input.plate.parts[i]) {
                 let rep = slots[r].clone();
-                let off = rep.off.add(d);
+                let off = copy_plan_offset(slots[i].off, d);
                 let sliced = Frame { offset: [off.x_mm(), off.y_mm(), 0.0], ..rep.sliced.clone() };
                 slots[i] = Slot { off, sliced, ..rep };
             }
@@ -3848,9 +3871,16 @@ async fn run(shared: &Arc<Shared>, snap: &Snapshot, phase: &std::sync::atomic::A
     }
     // Contours and final model layers share the view's band order. Cached
     // plans need no work; copies share the first slot of the same content.
-    let own_params = |i: usize| {
+    let part_params: Vec<_> = (0..n).map(|i| {
         let own = input.plate.parts.get(i).filter(|p| !p.print.is_empty()).map(|p| job.with_overrides(&p.print));
         Params::from_job(own.as_ref().unwrap_or(&job), filaments[i])
+    }).collect();
+    let precut = |i: usize, field: bool, by_z| {
+        let slot = &slots[i];
+        // The cut key under the code that makes parts: a live patch of the grading never finds
+        // a warp the code before it solved.
+        let source = Precut { key: Some(with_code(slot.key, code.part)), mesh: slot.src.clone(), field, bounds: slot.src.bounds(), by_z, np: slot.np.clone() };
+        ObjectInput { overrides: placed.parts[i].print.clone(), name: placed.parts[i].name.clone(), source: Box::new(source), filament: filaments[i] }
     };
     let planning = !snap.moving || snap.settle.is_some();
     // Each part's plan settings: the plate's with its own support settings and no-trees areas.
@@ -3862,7 +3892,6 @@ async fn run(shared: &Arc<Shared>, snap: &Snapshot, phase: &std::sync::atomic::A
     let owners: Vec<usize> = (0..n).map(|i| (0..i).find(|&j| slots[j].key == slots[i].key && settings_of[j] == settings_of[i]).unwrap_or(i)).collect();
     let mut plans: Vec<Option<Arc<ObjectPlan>>> = slots.iter().zip(&settings_of).map(|(slot, &settings)| cached(&shared.caches.lock().unwrap().plans, (slot.key, settings))).collect();
     let dirty: Vec<bool> = (0..n).map(|i| planning && plans[i].is_none() && owners[i] == i).collect();
-    let mut assembled = Assembled { shared, keys: slots.iter().map(|s| s.key).collect(), settings: model, parts: vec![Vec::new(); n] };
     // A part is edited when its content or its slice's settings differ from the last
     // revision's: its viewed layer is drawn even once a newer input came, and it goes first.
     let edited: Vec<bool> = {
@@ -3880,7 +3909,7 @@ async fn run(shared: &Arc<Shared>, snap: &Snapshot, phase: &std::sync::atomic::A
                 planes.push(None);
             }
             None => {
-                let h = makepad_fab_toolpath::layers::object_heights(&*slot.src, &own_params(i));
+                let h = makepad_fab_toolpath::layers::object_heights(&*slot.src, &part_params[i]);
                 layer_count.push(h.len());
                 planes.push(Some(h));
             }
@@ -3888,7 +3917,7 @@ async fn run(shared: &Arc<Shared>, snap: &Snapshot, phase: &std::sync::atomic::A
     }
     // What part `i`'s supports cost, in the meter's units: none when it has none to plan.
     let support_units = |i: usize| {
-        let p = own_params(i);
+        let p = &part_params[i];
         if p.support.is_some() || p.normal_support.is_some() { layer_count[i] as f64 * SUPPORT_LAYER_UNITS } else { 0.0 }
     };
     {
@@ -3931,9 +3960,9 @@ async fn run(shared: &Arc<Shared>, snap: &Snapshot, phase: &std::sync::atomic::A
             traces.push(None);
             continue;
         }
-        let params = own_params(i);
-        let heights = planes[i].take().unwrap_or_else(|| makepad_fab_toolpath::layers::object_heights(&*slot.src, &params));
-        let zs: Vec<f64> = heights.iter().map(|&(z, h)| makepad_fab_toolpath::cut_z(&params, z, h)).collect();
+        let params = &part_params[i];
+        let heights = planes[i].take().unwrap_or_else(|| makepad_fab_toolpath::layers::object_heights(&*slot.src, params));
+        let zs: Vec<f64> = heights.iter().map(|&(z, h)| makepad_fab_toolpath::cut_z(params, z, h)).collect();
         let focus = snap.focus_z.map(|z| heights.partition_point(|(pz, _)| *pz < z));
         // An edited field re-traces only the layers its edit reaches (a glued group's cut reads
         // its other parts too).
@@ -4103,6 +4132,17 @@ async fn run(shared: &Arc<Shared>, snap: &Snapshot, phase: &std::sync::atomic::A
             }
         }
     }
+    let heights: Vec<Vec<(f64, f64)>> = (0..n).map(|i| match (&traces[i], &cuts[i]) {
+        (Some(t), _) => t.heights.clone(),
+        (_, Some(c)) => c.iter().map(|l| (l.0, l.1)).collect(),
+        _ => unreachable!("every slot has layer planes"),
+    }).collect();
+    let grades = (0..n).map(|i| {
+        part_params[i].sparse_opts.adaptive?;
+        let key = grade_key(&precut(i, false, HashMap::new()), &job, &heights[i])?;
+        Some(PartGrade { key, warp: None })
+    }).collect();
+    let mut assembled = Assembled { shared, keys: current.clone(), settings: model, parts: vec![Vec::new(); n], grades };
     // The model layers a superseded revision of the same content planned, and the sink still
     // shows, are not planned again.
     {
@@ -4129,14 +4169,6 @@ async fn run(shared: &Arc<Shared>, snap: &Snapshot, phase: &std::sync::atomic::A
         meter.more(assembled[i].len().saturating_sub(1) as f64 * layer_count[i] as f64);
         meter.done(planned as f64);
     }
-    let heights_of = |i: usize| -> Vec<(f64, f64)> {
-        match (&traces[i], &cuts[i]) {
-            (Some(t), _) => t.heights.clone(),
-            (_, Some(c)) => c.iter().map(|l| (l.0, l.1)).collect(),
-            _ => unreachable!("every slot has layer planes"),
-        }
-    };
-    let heights: Vec<Vec<(f64, f64)>> = (0..n).map(heights_of).collect();
     let mut bands: Vec<Option<Bands>> = (0..n).map(|i| {
         if owners[i] != i || (!dirty[i] && traces[i].is_none()) { return None; }
         let a = &assembled[i];
@@ -4162,7 +4194,7 @@ async fn run(shared: &Arc<Shared>, snap: &Snapshot, phase: &std::sync::atomic::A
         // Each condition that keeps none says so ([`LiveEngine::part_kept`]).
         let decided = (|| -> Result<(usize, Vec<usize>, LastModel), String> {
             let (from, old_total) = t.from.clone().map_err(|why| format!("no last cut: {why}"))?;
-            let params = own_params(i);
+            let params = &part_params[i];
             let slot = &slots[i];
             if params.exp.vase.is_some() {
                 return Err("vase mode reads every layer".into());
@@ -4226,7 +4258,7 @@ async fn run(shared: &Arc<Shared>, snap: &Snapshot, phase: &std::sync::atomic::A
                 repainted.iter().any(|&(a, b): &(f64, f64)| z - h <= b && z >= a)
             };
             let keep: Vec<usize> = (0..total.min(old_total)).filter(|&k| {
-                let (a, b) = makepad_fab_toolpath::plan_reads(&params, k, k + 1, total);
+                let (a, b) = plan_reads(params, k, k + 1, total);
                 (k > 0 || same_height) && (a..b).all(|j| t.reuse[j].is_some() && !painted_at(j))
             }).collect();
             if keep.is_empty() {
@@ -4265,15 +4297,28 @@ async fn run(shared: &Arc<Shared>, snap: &Snapshot, phase: &std::sync::atomic::A
     let field_ms = snap.started.elapsed().as_secs_f64() * 1e3;
     let mut focus_z = snap.focus_z;
     let focus_of = |i: usize, z: Option<f64>| z.map(|z| heights[i].partition_point(|(pz, _)| *pz < z));
-    // A part's model layers `a..b` read these layers' contours (paint by position splits each
-    // window on its own; region paint reads every layer).
-    let reads_of = |i: usize, a: usize, b: usize| {
+    // The requested model layers and the contours the window must be given.
+    let reads_of = |i: usize, a: usize, b: usize, held: bool| {
         let total = heights[i].len();
-        let params = own_params(i);
+        let params = &part_params[i];
         let (a, b) = if params.exp.vase.is_some() { (0, total) } else { (a, b) };
-        if slots[i].src.painted() && slots[i].src.paint_at().is_none() { (a, b, 0, total) } else {
-            let (ra, rb) = makepad_fab_toolpath::plan_reads(&params, a, b, total);
-            (a, b, ra, rb)
+        let src = &slots[i].src;
+        let position_paint = src.paint_at().is_some();
+        let (ra, rb) = if src.painted() && !position_paint {
+            (0, total)
+        } else {
+            let (ra, rb) = if held { plan_reads_held(params, a, b, total) } else { plan_reads(params, a, b, total) };
+            // Paint by position reads the outlines within its skin, which can reach past the context.
+            let (pa, pb) = if position_paint { paint_reads(params, &heights[i], a, b) } else { (ra, rb) };
+            (ra.min(pa), rb.max(pb))
+        };
+        (a, b, ra, rb)
+    };
+    let regions_at = |i: usize, k: usize, t: Option<&Trace>| -> Regions {
+        match (t, &cuts[i]) {
+            (Some(t), _) => t.traced[k].as_ref().or(t.reuse[k].as_ref()).expect("the window's contours are traced").regions.clone(),
+            (_, Some(c)) => c[k].2.regions.clone(),
+            _ => unreachable!("window has contours"),
         }
     };
     // Edited parts first, their viewed layers drawn even once a newer input came; then the other
@@ -4299,19 +4344,27 @@ async fn run(shared: &Arc<Shared>, snap: &Snapshot, phase: &std::sync::atomic::A
         let Some(band) = bands[i].as_mut() else { continue };
         let total = band.done.len();
         let focus_k = focus_of(i, focus_z).unwrap_or(0).min(total.saturating_sub(1));
+        let part = &mut assembled.grades[i];
+        if let Some(part) = part {
+            // The previous revision or an earlier part of this one may hold the warp.
+            part.warp = grade::held(part.key);
+        }
+        let held = part.as_ref().is_some_and(|g| g.warp.is_some());
+        let missing = part.as_mut().filter(|_| !held && dirty[i] && !band.pending.is_empty());
         // A viewed layer planned already (by a superseded revision of this content, or kept from
         // the last plan) is this revision's viewed layer with no work: said once it is sent.
-        if band.done.get(focus_k) == Some(&true) {
+        let mut window = if band.done.get(focus_k) == Some(&true) {
             planned_views.push(LiveEvent::Viewed { revision: rev, part: i, layer: focus_k as u32, field_ms, slice_ms: 0.0, plan_ms: 0.0 });
-            continue;
-        }
-        let Some((a, b)) = band.pending.pop_front() else { continue };
-        let (a, b, read_a, read_b) = reads_of(i, a, b);
-        let params = own_params(i);
+            None
+        } else { band.pending.pop_front().map(|(a, b)| reads_of(i, a, b, held)) };
+        // A missing warp needs every contour once, including when only later windows remain.
+        let trace_range = if missing.is_some() { 0..total }
+            else if let Some((_, _, a, b)) = window { a..b }
+            else { continue };
         let trace_at = std::time::Instant::now();
         let chunk_cancel = if protect { None } else { Some(cancel) };
         if let Some(t) = traces[i].as_mut() {
-            let ks = (read_a..read_b).filter(|&k| t.todo(k)).collect();
+            let ks = trace_range.filter(|&k| t.todo(k)).collect();
             if !live_trace::trace(shared, &slots[i], t, ks, chunk_cancel, &meter, &part_work[i]) {
                 return keep_all(&mut traces);
             }
@@ -4319,20 +4372,28 @@ async fn run(shared: &Arc<Shared>, snap: &Snapshot, phase: &std::sync::atomic::A
         let slice_ms = trace_at.elapsed().as_secs_f64() * 1e3;
         let plan_at = std::time::Instant::now();
         send_cuts(cuts_now(&traces));
+        if let Some(part) = missing {
+            let contours = (0..total).map(|k| regions_at(i, k, traces[i].as_ref()).to_vec()).collect();
+            let o = precut(i, true, HashMap::new());
+            let ctl = par::Ctl { cancel: chunk_cancel, focus: Some(focus_k), ..Default::default() };
+            let Ok(warp) = solve_grade(ctl, &o, &job, &heights[i], contours) else { return keep_all(&mut traces) };
+            part.warp = Some(warp.expect("a keyed adaptive part has a warp"));
+            window = window.map(|(a, b, _, _)| reads_of(i, a, b, true));
+        }
+        let Some((a, b, read_a, read_b)) = window else {
+            part_work[i].plan_ns.fetch_add(plan_at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            continue;
+        };
         let focus_events = Mutex::new(Vec::new());
         if dirty[i] {
+            let params = &part_params[i];
             let by_z = (read_a..read_b).map(|k| {
                 let (z, h) = heights[i][k];
-                let regions = match (&traces[i], &cuts[i]) {
-                    (Some(t), _) => t.traced[k].as_ref().or(t.reuse[k].as_ref()).expect("the window's contours are traced").regions.clone(),
-                    (_, Some(c)) => c[k].2.regions.clone(),
-                    _ => unreachable!("window has contours"),
-                };
-                (makepad_fab_toolpath::cut_z(&params, z, h).to_bits(), regions)
+                (makepad_fab_toolpath::cut_z(params, z, h).to_bits(), regions_at(i, k, traces[i].as_ref()))
             }).collect();
             let slot = &slots[i];
             let key = slot.key;
-            let o = ObjectInput { overrides: placed.parts[i].print.clone(), name: placed.parts[i].name.clone(), source: Box::new(Precut { mesh: slot.src.clone(), field: slot.sliced.field.is_some(), bounds: slot.src.bounds(), by_z, np: slot.np.clone() }), filament: filaments[i] };
+            let o = precut(i, slot.sliced.field.is_some(), by_z);
             if let Err(e) = check_inputs(&job, std::slice::from_ref(&o)) { return fail(e); }
             #[cfg(test)]
             {
@@ -4429,9 +4490,8 @@ async fn run(shared: &Arc<Shared>, snap: &Snapshot, phase: &std::sync::atomic::A
         let Some(band) = bands[i].as_ref() else { continue };
         let open = dirty[i] && band.done.iter().any(|d| !d) || traces[i].as_ref().is_some_and(|t| (0..t.zs.len()).any(|k| t.todo(k)));
         if !open { continue; }
-        let slot = &slots[i];
         // Contours outside the cut come from the part's own source (a CPU part's trace tasks).
-        let o = ObjectInput { overrides: placed.parts[i].print.clone(), name: placed.parts[i].name.clone(), source: Box::new(Precut { mesh: slot.src.clone(), field: false, bounds: slot.src.bounds(), by_z: HashMap::new(), np: slot.np.clone() }), filament: filaments[i] };
+        let o = precut(i, false, HashMap::new());
         if dirty[i] {
             if let Err(e) = check_inputs(&job, std::slice::from_ref(&o)) { return fail(e); }
         }
@@ -4448,12 +4508,13 @@ async fn run(shared: &Arc<Shared>, snap: &Snapshot, phase: &std::sync::atomic::A
         if !dirty[i] { continue; }
         let done = &bands[i].as_ref().unwrap().done;
         let mut reads = vec![false; done.len()];
+        let held = assembled.grades[i].as_ref().is_some_and(|g| g.warp.is_some());
         let mut k = 0;
         while k < done.len() {
             if done[k] { k += 1; continue; }
             let a = k;
             while k < done.len() && !done[k] { k += 1; }
-            let (_, _, ra, rb) = reads_of(i, a, k);
+            let (_, _, ra, rb) = reads_of(i, a, k, held);
             reads[ra..rb].fill(true);
         }
         for k in (0..done.len()).filter(|&k| reads[k]) {
@@ -4640,10 +4701,10 @@ async fn run(shared: &Arc<Shared>, snap: &Snapshot, phase: &std::sync::atomic::A
         if owners[i] != i {
             plans[i] = plans[owners[i]].clone();
         } else if dirty[i] {
-            let params = own_params(i);
-            let by_z = cuts[i].iter().map(|(z, h, r)| (makepad_fab_toolpath::cut_z(&params, *z, *h).to_bits(), r.regions.clone())).collect();
+            let params = &part_params[i];
+            let by_z = cuts[i].iter().map(|(z, h, r)| (makepad_fab_toolpath::cut_z(params, *z, *h).to_bits(), r.regions.clone())).collect();
             let outlines = cuts[i].iter().map(|l| l.2.regions.to_vec()).collect();
-            let o = ObjectInput { overrides: placed.parts[i].print.clone(), name: placed.parts[i].name.clone(), source: Box::new(Precut { mesh: slot.src.clone(), field: slot.sliced.field.is_some(), bounds: slot.src.bounds(), by_z, np: slot.np.clone() }), filament: filaments[i] };
+            let o = precut(i, slot.sliced.field.is_some(), by_z);
             if let Err(e) = check_inputs(&job, std::slice::from_ref(&o)) { return fail(e); }
             // The planner tells where it is within its share of this part's supports; their
             // records and the finished plan take the rest.
@@ -5296,7 +5357,7 @@ pub fn slice_frames(setup: &JobSetup, plate: &Plate, frames: &[Frame], paint: &[
     let off = |i: usize| Pt::from_mm(frames[i].offset[0], frames[i].offset[1]);
     let placed = (0..objects.len()).map(|i| {
         let (r, d) = classes[i];
-        (plans[r].clone().expect("planned"), off(r).add(d))
+        (plans[r].clone().expect("planned"), copy_plan_offset(off(i), d))
     }).collect();
     let tp = makepad_fab_toolpath::merge_named(placed, &names);
     let boxes: Vec<_> = tp.objects.iter().map(|o| (o.min, o.max)).collect();
@@ -6530,6 +6591,73 @@ mod tests {
         let computed = e.layers_computed() - before;
         assert_eq!(computed, box_layers, "every dirty layer is planned exactly once");
         assert!(r.gcode == fresh1.gcode, "the incremental slice differs from the fresh one");
+    }
+
+    /// A top-layers edit of an adaptive part keeps its warp: it solves none, and its viewed layer
+    /// plans from the window's own contours. The parts: a cube, and a field post painted by
+    /// position whose paint skin reaches past the window's shell context (a field part asserts
+    /// that it is given every contour it reads).
+    #[test]
+    fn a_shell_edit_reuses_the_parts_warp_for_its_viewed_layer() {
+        use makepad_csg_sdf::SdfNode;
+        let mut cube_plate = plate();
+        cube_plate.parts.truncate(1);
+        cube_plate.parts[0].mesh = cube([96.0, 96.0, 0.0], [8.0; 3]);
+        // A 12 mm post 20 mm tall (model Y up), a ball of tool 2 on its +X wall.
+        let shape = Arc::new(SdfShape { root: SdfNode::Box { size: [12.0, 20.0, 12.0], radius: 0.0 }, min: [-6.5, -10.5, -6.5], max: [6.5, 10.5, 6.5], materials: Vec::new() });
+        let local = Arc::new(cube([-6.0, -6.0, 0.0], [12.0, 12.0, 20.0]));
+        let mut mesh = (*local).clone();
+        mesh.translate([150.0, 120.0, 0.0]);
+        let post = Plate { excluded: Vec::new(), settings: Vec::new(), parts: vec![Part { paint: Some(ball_paint([156.0, 120.0, 10.0])), object: "post".into(), name: "post".into(), filament: 1, color: [1.0; 4], mesh, ..Default::default() }] };
+        let place = [[1.0, 0.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [0.0, 1.0, 0.0, 10.0]];
+        let frames = Arc::new(vec![Frame { local, offset: [150.0, 120.0, 0.0], field: Some(PartField::new(shape, place)) }]);
+        // Each viewed at its middle, where the post's paint skin lies inside it both ways.
+        for (name, p, frames, mut setup, focus) in [("cube", cube_plate, None, setup().keep(&[0]), 4.0), ("painted post", post, Some(frames), (*setup()).clone(), 10.0)] {
+            let p = Arc::new(p);
+            for (k, v) in [("sparse_infill_pattern", "gyroid"), ("adaptive_infill_mode", "lobes"), ("sparse_infill_density", "40%"),
+                ("layer_height", "0.25"), ("initial_layer_print_height", "0.25"), ("top_shell_layers", "4"), ("fab_paint_skin_depth", "4")] {
+                setup.process.values.set_str(k, v);
+            }
+            let (e, rx) = engine();
+            e.set_focus_z(Some(focus));
+            let input = |id, s| {
+                let mut i = LiveInput::ready(1, id, s, p.clone(), Arc::new(Vec::new()));
+                i.frames = frames.clone();
+                i
+            };
+            e.settle(1, input(1, setup.clone()));
+            let _ = settled(&rx, 1);
+            idle(&e);
+            let solves = grade::solves();
+            let cached = || {
+                let c = e.shared.caches.lock().unwrap();
+                let (key, warp) = c.grades[0].as_ref().expect("the finished revision keeps its part's warp");
+                assert!(warp.graded, "the adaptive {name} must have a graded interior");
+                (*key, Arc::downgrade(warp))
+            };
+            let (key, first) = cached();
+            let planned = e.layers_computed();
+            setup.process.values.set_str("top_shell_layers", "5");
+            e.settle(2, input(2, setup));
+            let mut first_cut = None;
+            loop {
+                match rx.recv().expect("the edited revision settles") {
+                    LiveEvent::PartCut { part: 0, layers, stale, .. } if first_cut.is_none() => {
+                        let pending: usize = stale.iter().map(|&(lo, hi)| (hi - lo) as usize).sum();
+                        first_cut = Some((layers.len(), pending));
+                    }
+                    LiveEvent::Settled { tag: 2, result, .. } => { result.expect("the shell edit slices"); break; }
+                    _ => {}
+                }
+            }
+            idle(&e);
+            let (total, pending) = first_cut.expect("the shell edit publishes a focus cut");
+            assert!(0 < pending && pending < total, "the {name}'s warm focus cut must trace a proper window before publishing it ({pending} of {total} pending)");
+            assert!(e.layers_computed() > planned, "the {name}'s shell edit must replan model layers");
+            assert_eq!(grade::solves(), solves, "the {name}'s shell edit must solve no warp");
+            let (new_key, second) = cached();
+            assert!(key == new_key && first.ptr_eq(&second), "the revised {name} must keep the same keyed warp");
+        }
     }
 
     /// With a cross-layer pattern (lightning, adaptive cubic) an edit reaches

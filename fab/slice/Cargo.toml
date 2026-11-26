@@ -36,6 +36,7 @@ fab-model = { path = "../model" }
 fab-colour = { path = "../colour" }
 
 [dev-dependencies]
+fab-printer-link = { path = "../printer_link" }
 fab-sdf-engine = { path = "../sdf_engine" }
 
 [lints.rust]

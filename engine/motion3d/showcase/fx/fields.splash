@@ -1,0 +1,11 @@
+use mod.scene.*; use mod.post
+// Instanced fields: a sphere of cubes, a voxel morph (sphere to knot), a helix, a wave.
+Scene3D{ look: @studio
+  camera: Camera{position: vec3(0, 3.5, 12) target: vec3(0, 0.8, 0) focal_length: 35}
+  post: [ContactShadows{opacity: 0.6} post.Bloom{strength: 0.3}]
+  children: [
+    Fx{preset: @cube_sphere position: vec3(-3.6, 1.6, 0) count: 700 radius: 1.3 size: 0.05 color: #3f7cff}
+    Fx{preset: @voxel_morph position: vec3(0, 1.6, 0) radius: 2 resolution: 12 start: 0.5 duration: 2.5 color: #ff5a36}
+    Fx{preset: @helix position: vec3(3.6, 1.6, 0) count: 160 radius: 1.2 size: 0.07 color: #f2c14e color2: #ff8a00}
+    Fx{preset: @wave position: vec3(0, -0.3, 0) grid: 36 spacing: 0.26 amount: 0.35 color: #c9d2e3}
+  ] }

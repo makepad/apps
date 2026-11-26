@@ -1,0 +1,63 @@
+use mod.motion.*
+
+// Characters 3: blends driven live. The pointer's position (0..1 over the picture, written
+// by the host into the inputs pointer_x / pointer_y) drives a blend2 over a field of tiles
+// (corner radius, turn, colour) and a pose blend of a character (idle -> wave -> cheer).
+// Until the host writes the inputs (they start at -1), an autopilot moves a virtual pointer
+// on a slow figure, so the slide runs by itself. The marker shows where the pointer is.
+let look = import("shared/motion_deck_look")
+
+let pointer_x = fn(t) {
+    let p = in(@pointer_x)
+    return if p < 0.0 { 0.5 + 0.4 * sin(live() * 0.33) } else { p }
+}
+let pointer_y = fn(t) {
+    let p = in(@pointer_y)
+    return if p < 0.0 { 0.55 + 0.3 * sin(live() * 0.47 + 1.2) } else { p }
+}
+let enter = fn(at) { return tween(0, 1, at, at + 1.4, @ease_in_out_cubic) }
+
+let TILE = 76.0
+let GAP = 30.0
+let COLS = 6
+let ROWS = 4
+let FIELD = vec2(150, 380)
+
+Motion{
+    label: "Blends, driven live"
+    size: vec2(1920, 1080)
+    duration: 600.0
+    fps: 60
+    color: @hdr
+    background: look.INK
+    inputs: {pointer_x: -1.0 pointer_y: -1.0}
+    layers: [
+        Draw2D{name: "ground" size: vec2(1920, 1080) draw: fn(c, t, edit) { look.ground(c, t, live()) }}
+        // One tile, repeated: x blends square -> round, y blends the turn; colour across both.
+        Repeat{name: "tiles" count: COLS * ROWS layout: @grid columns: COLS spacing: vec2(TILE + GAP, TILE + GAP)
+            at: FIELD opacity: enter(0.9) delay: 0.04
+            layer: Rect{size: vec2(TILE, TILE) anchor: vec2(0.5, 0.5)
+                radius: blend(pointer_x, {at: [0, 1] values: [4, TILE * 0.5]} )
+                rotate: blend(pointer_y, {at: [0, 1] values: [-30, 30]} )
+                fill: blend2(pointer_x, pointer_y, {cols: [0, 1] rows: [0, 1]
+                    values: [[look.COOL, look.SEA], [look.BONE, look.GRAPHITE]] ease: @ease_in_out})}}
+        Character{name: "mood" model: @spark at: vec2(1400, 900) height: 520 seed: 11 blink: 3.6 opacity: enter(1.1)
+            look: {top: #ede6d3 accent: #74d4f2}
+            pose: blend(pointer_x, {at: [0, 0.5, 1] values: [@idle, @wave, @cheer]})}
+        Path{name: "floor" svg: "M 0 0 L 600 0" stroke: look.BONE width: 1 at: vec2(1100, 900)
+            opacity: tween(0, 0.2, 0.6, 2.0, @ease_in_out_cubic)}
+        // The pointer, as the audience sees it.
+        Ellipse{name: "pointer" size: vec2(34, 34) stroke: look.BONE width: 2 fill: #0000 opacity: enter(1.6)
+            at: fn(t) { vec2(pointer_x(t) * 1920 - 17, pointer_y(t) * 1080 - 17) }}
+        Ellipse{name: "pointer dot" size: vec2(8, 8) fill: look.BONE opacity: enter(1.6)
+            at: fn(t) { vec2(pointer_x(t) * 1920 - 4, pointer_y(t) * 1080 - 4) }}
+        Draw2D{name: "chrome" size: vec2(1920, 1080) draw: fn(c, t, edit) {
+            look.folio(c, t, "08", "Characters and bones")
+            look.heading(c, t, "Blends, driven live.", "Any field and any pose blends between values; the pointer drives them, frame by frame.")
+            look.label(c, t, 1.6, "blend2(x, y)  radius, turn, colour", FIELD.x, 860, {font: look.MONO px: 22})
+            look.label(c, t, 1.7, "pose: blend(x, [@idle, @wave, @cheer])", 1400, 960, {font: look.MONO px: 22 align: @center})
+            look.syntax(c, t, 2.0, "blend(fn(t) { in(@pointer_x) }, {at: [0, 0.5, 1] values: [...]})")
+        }}
+    ]
+    post: look.post_chain(look.POST)
+}

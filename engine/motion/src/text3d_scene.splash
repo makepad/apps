@@ -1,0 +1,4 @@
+use mod.scene.*
+// A Text3D layer's scene (text3d.rs): its preset run for the layer, resolved into the `text3d` input.
+use mod.motion.modules.text3d.*
+text3d_scene(in(@text3d))

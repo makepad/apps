@@ -1,0 +1,25 @@
+use mod.motion.*
+use mod.motion.modules.film.*
+use mod.motion.modules.kinetic.*
+
+// Type under an effect: two fonts glide in (each embedded cut to the glyphs drawn here), the
+// film post chain (bloom, vignette, grain) over the frame.
+let TITLE = Font{family: "Roboto Flex" weight: 600}
+let MONO = Font{family: "JetBrains Mono" weight: 400}
+
+let draw = fn(c, t, edit) {
+    c.gradient([[0, 0], [1920, 0], [1920, 1080], [0, 1080]], {radial: [960, 470, 40, 1180] stops: [[0, #14161b], [1, #090a0d]]}, 0.9)
+    glide_text(c, "One page, one wasm", 160, 480, t, 0.05, {font: TITLE px: 96 color: #f0ede6 dur: 0.5 rise: 14})
+    glide_text(c, "fonts cut to their glyphs", 160, 560, t, 0.6, {font: MONO px: 36 color: #74d4f2 dur: 0.4 rise: 10})
+}
+
+Motion{
+    label: "Export fixture / type"
+    size: vec2(1920, 1080)
+    duration: 1.2
+    fps: 60
+    color: @hdr
+    background: #090a0d
+    layers: [Draw2D{name: "type" size: vec2(1920, 1080) draw: draw}]
+    post: film_post({ca: 0 bloom: 0.15 threshold: 1.0 knee: 0.5 radius: 0.8 halation: 0.04 vignette: 0.28 grain: 0.008})
+}

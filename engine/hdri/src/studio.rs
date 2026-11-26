@@ -20,7 +20,7 @@
 
 use makepad_draw::*;
 use super::{az_el_from_dir, dir_from_az_el, Blend, EnvSun, LightParams, LightShape, RoomParams, StudioParams, CASTER_REFERENCE_WIDTH, KELVIN_RANGE};
-use super::room::{disc_daylight, MirrorProxy, Room, RoomLight, Stand, DEFAULT_REACH};
+use super::room::{disc_daylight, Ground, MirrorProxy, Room, RoomLight, Stand, DEFAULT_REACH};
 use super::pattern::PatternLight;
 use crate::sky::{luminance, xyz_to_linear_rgb};
 use super::shaped::{box_x_sign, face_frame, half_extents, stroke_box, ShapedLight};
@@ -31,6 +31,7 @@ use super::gels::gel_stack;
 use super::spectrum::light_source_rgb;
 use super::image_light::{ImageSet, LightImage};
 use super::light_fx::LightFx;
+use super::light_model::{candle::CandleLight, LightModel, ModelHit};
 use super::caster::{caster_drawn, caster_flag, rows_by, serial_rows, BrightBox, CasterBloom, CasterLayer, RowRunner};
 use std::borrow::Cow;
 
@@ -114,6 +115,11 @@ pub(super) fn held_light_color(light: &LightParams) -> Vec3f {
     let base = match light.rgb {
         Some(rgb) => vec3f(rgb[0], rgb[1], rgb[2]),
         None => held_light_white(light),
+    };
+    let base = match light.modifier.as_ref() {
+        // A gold reflector's cloth tints the light it gives back (reflector.rs).
+        Some(m) if m.kind() == super::params::ModifierKind::Reflector => base * super::reflector::finish_tint(super::reflector::Finish::from_ribs(m.ribs)),
+        _ => base,
     };
     base * gels.conversion * gels.filter * 2.0f32.powf(light.intensity_ev)
 }
@@ -445,9 +451,12 @@ pub struct Studio {
     /// Each shadow caster's own layer (redesign §5, `caster.rs`): its
     /// strength, tint and softness raster, in step with `lights`; None for a light.
     casters: Vec<Option<CasterLayer>>,
-    /// False while no light has any extra and no caster a raster:
-    /// `apply_lights` then runs the loop as it was.
+    /// False while no light has any extra, no caster a raster and no light a
+    /// 3D model: `apply_lights` then runs the loop as it was.
     any_fx: bool,
+    /// Each light's 3D model (light_model.rs: a 3D light of a kind that has
+    /// one), in step with `lights`; None for every other entry.
+    models: Vec<Option<LightModel>>,
     /// What the room (room.rs) reads of each entry, in step with `lights`.
     in_room: Vec<InRoom>,
     /// The room the lights stand in, in place of the gradient (`build_room`).
@@ -549,7 +558,8 @@ impl Studio {
         // its pattern.
         let fx: Vec<LightFx> = drawn.iter().map(|l| LightFx::new(l, images).against_sky(against_sky)).collect();
         let casters: Vec<Option<CasterLayer>> = enabled.iter().map(|l| if l.is_caster() { CasterLayer::new(l, images, width, run) } else { None }).collect();
-        let any_fx = fx.iter().any(|fx| !fx.is_plain()) || casters.iter().flatten().any(|c| !c.is_plain());
+        let models: Vec<Option<LightModel>> = drawn.iter().zip(&fx).map(|(l, fx)| if l.is_caster() { None } else { LightModel::new(l, fx.modifier()) }).collect();
+        let any_fx = fx.iter().any(|fx| !fx.is_plain()) || casters.iter().flatten().any(|c| !c.is_plain()) || models.iter().any(Option::is_some);
         let in_room = enabled
             .iter()
             .map(|l| InRoom {
@@ -559,7 +569,7 @@ impl Studio {
                 casts: l.gobo.as_ref().is_some_and(|g| g.project_on_backdrop && !g.fill_sky),
             })
             .collect();
-        Studio {
+        let mut built = Studio {
             top: rgb(studio.top),
             horizon: rgb(studio.horizon),
             floor: rgb(studio.floor),
@@ -569,12 +579,19 @@ impl Studio {
             fx,
             casters,
             any_fx,
+            models,
             in_room,
             room: None,
             texel: std::f32::consts::TAU / width.max(CASTER_REFERENCE_WIDTH) as f32,
             mirrored: Vec::new(),
             mirror_flags: Vec::new(),
+        };
+        // A studio's candles take its backdrop's light until a room or the sky lights them (`build_room`,
+        // `light_candles_outdoors`).
+        if !against_sky {
+            built.light_candles_by_backdrop();
         }
+        built
     }
 
     /// Stands the lights in the room `p` (Studio mode, `StudioParams::room`):
@@ -602,8 +619,15 @@ impl Studio {
     /// The floor's mirror takes one layer per light that adds light, each
     /// looked up against its own place (`mirror_proxy`) and drawn there for
     /// this studio's texel (`mirrored_light`).
-    pub(super) fn build_room(&mut self, p: &RoomParams, sky: &(dyn Fn(Vec3f) -> Vec3f + Sync), hot: &[(Vec3f, f32)], cancelled: &dyn Fn() -> bool, run: RowRunner) -> bool {
-        let shell = Room::new(p);
+    ///
+    /// A room whose floor side is open stands on `ground` (the scene's ground,
+    /// read through the outside it is seen in): its floor takes the ground's
+    /// albedo, gloss and roughness, and its bounce the ground's mean albedo.
+    pub(super) fn build_room(&mut self, p: &RoomParams, sky: &(dyn Fn(Vec3f) -> Vec3f + Sync), hot: &[(Vec3f, f32)], ground: Option<Ground>, cancelled: &dyn Fn() -> bool, run: RowRunner) -> bool {
+        let mut shell = Room::new(p);
+        if let Some(ground) = ground {
+            shell = shell.with_ground(ground);
+        }
         let lengths: Vec<f32> = self.in_room.iter().enumerate().filter(|(_, info)| info.lights).map(|(i, info)| self.room_length(i, info)).collect();
         let piece_arc = room_piece_arc(&lengths);
         if piece_arc > ROOM_PIECE_DEG.to_radians() {
@@ -629,13 +653,15 @@ impl Studio {
                 self.box_room_lights(i, info, &shell, sky, piece_arc)
             };
             let Some(light) = light else { continue };
-            if info.stand.unwrap_or(p.stands) {
+            // (a candle stands on its own mount)
+            if info.stand.unwrap_or(p.stands) && !self.is_candle(i) {
                 stands.push(light.stand);
             }
             placed.extend(light.pieces);
         }
         // The mirror's layers, each looked up where its light stands.
-        let layered: Vec<usize> = (0..self.lights.len()).filter(|&i| self.casters[i].is_none() && self.lights[i].blend == Blend::Add).collect();
+        // (a candle light is not mirrored by the floor: its model is not its flat face)
+        let layered: Vec<usize> = (0..self.lights.len()).filter(|&i| self.casters[i].is_none() && self.lights[i].blend == Blend::Add && !self.is_candle(i)).collect();
         let far = mean_distance(placed.iter());
         let proxies: Vec<MirrorProxy> = layered.iter().map(|&i| self.mirror_proxy(i, &placed, far)).collect();
         self.mirror_flags = layered
@@ -645,12 +671,63 @@ impl Studio {
         self.mirrored = layered;
         // The daylight: the openings with the outside's light through each, and the discs out there.
         let openings = shell.openings();
-        let windows: Vec<_> = openings.into_iter().map(|opening| (opening, opening.daylight(sky, hot))).collect();
+        // a real window lets in its panes' share (its frame and bars keep the rest out)
+        let windows: Vec<_> = openings.into_iter().map(|opening| (opening, opening.daylight(sky, hot) * opening.glass)).collect();
         let daylight = if windows.is_empty() { Vec::new() } else { hot.iter().map(|&(dir, radius)| disc_daylight(sky, dir, radius)).collect() };
         let light = |k: usize, d: Vec3f, foot: f32| self.mirrored_light(k, d, sky, foot);
-        let room = shell.with_daylight(windows, daylight).with_lights(placed, &stands).with_grids(run).with_mirror(proxies, self.texel, &light, sky, run);
+        // The pattern lights' housed tubes' bodies (pattern.rs `housings`).
+        let housings = self.lights.iter().filter_map(|l| l.shaped.as_ref()?.pattern()).map(|p| p.housings().to_vec()).collect();
+        let room = shell
+            .with_daylight(windows, daylight)
+            .with_lights(placed, &stands)
+            .with_housings(housings)
+            .with_grids(run)
+            .with_mirror(proxies, self.texel, &light, sky, run);
+        // The candles' models take the room's light where they stand (their own flames apart).
+        let candles: Vec<usize> = (0..self.models.len()).filter(|&i| self.is_candle(i)).collect();
+        for &i in &candles {
+            let Some(at) = self.models[i].as_ref().and_then(LightModel::candle_middle) else { continue };
+            let apart = |entry: usize| candles.contains(&entry);
+            let axes = [vec3f(1.0, 0.0, 0.0), vec3f(-1.0, 0.0, 0.0), vec3f(0.0, 1.0, 0.0), vec3f(0.0, -1.0, 0.0), vec3f(0.0, 0.0, 1.0), vec3f(0.0, 0.0, -1.0)];
+            let cube = axes.map(|n| room.irradiance_apart(at, n, &apart));
+            if let Some(model) = self.models[i].as_mut() {
+                model.set_candle_light(CandleLight::Cube(cube));
+            }
+        }
         self.room = Some(std::sync::Arc::new(room));
         true
+    }
+
+    /// Whether entry `i` is a candle light (its model is a candle's).
+    fn is_candle(&self, i: usize) -> bool {
+        self.models.get(i).and_then(Option::as_ref).is_some_and(|m| m.candle_middle().is_some())
+    }
+
+    /// Whether any entry is a candle light.
+    pub fn has_candles(&self) -> bool {
+        (0..self.models.len()).any(|i| self.is_candle(i))
+    }
+
+    /// Lights the candles' models outdoors (Sky mode): the floor's light `lit`, its key `key` (the map's frame), the
+    /// ground's albedo. A room's candles are lit by the room instead (`build_room`).
+    pub fn light_candles_outdoors(&mut self, lit: crate::floor::FloorLighting, key: Option<Vec3f>, ground: Vec3f) {
+        if self.room.is_some() {
+            return;
+        }
+        for model in self.models.iter_mut().flatten() {
+            model.set_candle_light(CandleLight::Sky { lit, key, ground });
+        }
+    }
+
+    /// Lights the candles' models in a studio without a room: the backdrop's top over them, its floor under them and
+    /// its horizon round them.
+    fn light_candles_by_backdrop(&mut self) {
+        let pi = std::f32::consts::PI;
+        let (top, horizon, floor) = (self.top * pi, self.horizon * pi, self.floor * pi);
+        let side = (top + floor) * 0.25 + horizon * 0.5;
+        for model in self.models.iter_mut().flatten() {
+            model.set_candle_light(CandleLight::Cube([side, side, top, floor, side, side]));
+        }
     }
 
     /// The floor mirror's light `k` (`mirrored`) alone over black along `d`,
@@ -673,11 +750,11 @@ impl Studio {
         let black = Vec3f::default();
         if fx.fills_with_sky() {
             let cover = light.cover(d);
-            if cover > 0.0 { fx.window(d, cover, black, sky(d)) } else { black }
+            if cover > 0.0 { fx.window(d, cover, black, sky) } else { black }
         } else if fx.is_plain() {
             light.draw_at(d, black, false, texel)
         } else {
-            fx.apply(d, black, light.draw_at(d, black, false, texel))
+            fx.apply_at(d, black, light.draw_at(d, black, false, texel), texel)
         }
     }
 
@@ -792,7 +869,7 @@ impl Studio {
                 let d = (frame.center + frame.right * x + frame.up * y).normalize();
                 let own = if fx.fills_with_sky() {
                     let cover = light.cover(d);
-                    if cover > 0.0 { fx.window(d, cover, black, sky(d)) } else { black }
+                    if cover > 0.0 { fx.window(d, cover, black, sky) } else { black }
                 } else if fx.is_plain() {
                     light.draw(d, black, false)
                 } else {
@@ -846,6 +923,7 @@ impl Studio {
                 near: area * std::f32::consts::FRAC_1_PI,
                 entry: i,
                 shaped_beam: fx.shapes_beam(info.casts),
+                omni: false,
             });
         }
         (!out.is_empty()).then_some(InRoomLight { pieces: out, stand })
@@ -875,6 +953,23 @@ impl Studio {
     /// long side) samples of the light, as a 2D light's.
     fn box_room_lights_3d(&self, i: usize, info: &InRoom, space: InSpace, sky: &dyn Fn(Vec3f) -> Vec3f, piece_arc: f32) -> Option<InRoomLight> {
         let light = &self.lights[i];
+        // A candle light: each flame a small light that shines all round, at its intensity in the light's colour.
+        if let Some(flames) = self.models[i].as_ref().map(LightModel::candle_flames).filter(|f| !f.is_empty()) {
+            let out: Vec<RoomLight> = flames
+                .iter()
+                .map(|&(pos, intensity)| RoomLight {
+                    pos,
+                    normal: vec3f(0.0, 1.0, 0.0),
+                    intensity: light.color * intensity,
+                    near: 0.01 * 0.01,
+                    entry: i,
+                    shaped_beam: false,
+                    omni: true,
+                })
+                .collect();
+            let at = self.models[i].as_ref().and_then(LightModel::candle_middle).unwrap_or(out[0].pos);
+            return Some(InRoomLight { pieces: out, stand: Stand { at, half_height: 0.0, by_bottom: true } });
+        }
         let fx = &self.fx[i];
         let flags = dimmers(&self.lights[i + 1..], &self.fx[i + 1..], &self.casters[i + 1..]);
         let black = Vec3f::default();
@@ -898,7 +993,7 @@ impl Studio {
                 let dir = q.normalize();
                 let own = if fx.fills_with_sky() {
                     let cover = light.cover(dir);
-                    if cover > 0.0 { fx.window(dir, cover, black, sky(dir)) } else { black }
+                    if cover > 0.0 { fx.window(dir, cover, black, sky) } else { black }
                 } else if fx.is_plain() {
                     light.draw_beamed(dir, black, false, false)
                 } else {
@@ -935,6 +1030,7 @@ impl Studio {
                 near: area * std::f32::consts::FRAC_1_PI,
                 entry: i,
                 shaped_beam: fx.shapes_beam(info.casts),
+                omni: false,
             });
         }
         // The stand holds the face's middle; its half height is how far the face reaches up and down.
@@ -1009,6 +1105,7 @@ impl Studio {
                 near: area * std::f32::consts::FRAC_1_PI,
                 entry: i,
                 shaped_beam: fx.shapes_beam(info.casts),
+                omni: false,
             })
             .collect();
         let tall = d * (frame.up.y.abs() * half.y + frame.right.y.abs() * half.x);
@@ -1054,7 +1151,8 @@ impl Studio {
         };
         let count = pieces_over(path.length(), piece_arc);
         let arc = path.length() / count as f32;
-        let pieces = over_stroke_pieces(axis, cos_cover, path, count, &drawn, cancelled, run)?;
+        let band = light.shaped.as_ref().and_then(|s| s.stroke_band_reach()).unwrap_or(path.reach());
+        let pieces = over_stroke_pieces(axis, cos_cover, path, band, count, &drawn, cancelled, run)?;
         let mut out = Vec::with_capacity(count);
         // (the piece's place along the stroke, 0..1, and its half extent in metres)
         let mut placed = Vec::with_capacity(count);
@@ -1079,6 +1177,7 @@ impl Studio {
                 near: area * std::f32::consts::FRAC_1_PI,
                 entry: i,
                 shaped_beam: fx.shapes_beam(info.casts),
+                omni: false,
             });
             // The piece's own half extent: half its length and the band's reach.
             placed.push(((k as f32 + 0.5) / count as f32, (0.5 * arc + path.reach()).min(1.5).tan() * distance));
@@ -1124,7 +1223,8 @@ impl Studio {
             let flags = dimmers(&self.lights[index + 1..], &self.fx[index + 1..], &self.casters[index + 1..]);
             let black = Vec3f::default();
             let drawn = |d: Vec3f| dimmed(&flags, d, fx.apply(d, black, light.draw(d, black, false)));
-            let integral = over_cone(axis, cos_cover, &stroke_cells(path, cos_cover), &drawn);
+            let band = light.shaped.as_ref().and_then(|s| s.stroke_band_reach()).unwrap_or(path.reach());
+            let integral = over_cone(axis, cos_cover, &stroke_cells(path, band, cos_cover), &drawn);
             return Some(EnvSun { dir: axis, radiance: EnvSun::cone_radiance(integral.emission, cos_radius), cos_radius, facing: integral.facing, cos_cover });
         }
         let integral = match light.shaped.as_ref().and_then(|s| s.pattern()) {
@@ -1148,7 +1248,14 @@ impl Studio {
         // The engine's key light carries what gets past its own gobo, doors and
         // grid, times its face's wear (its radiance; its cone, facing share and
         // covering cone are its shape's, which the extras only cut).
-        Some(EnvSun { radiance: key.radiance * self.key_share(index), ..key })
+        // A boxed key's colour is its light's, times the face's mean colour (a dirty cover's stains): a pattern's
+        // emission, summed from what the map draws, carries it already.
+        let radiance = key.radiance * self.key_share(index);
+        let radiance = match self.fx[index].tint_mean() {
+            Some(t) if light.shaped.as_ref().and_then(|s| s.pattern()).is_none() => vec3f(radiance.x * t.x, radiance.y * t.y, radiance.z * t.z),
+            _ => radiance,
+        };
+        Some(EnvSun { radiance, ..key })
     }
 
     /// Whether the key is a window filled with sky, which `Env` measures
@@ -1184,14 +1291,14 @@ impl Studio {
         let (axis, cos_radius, cos_cover) = light.key_cones();
         let flags = dimmers(&self.lights[index + 1..], &self.fx[index + 1..], &self.casters[index + 1..]);
         let drawn = |d: Vec3f| {
-            let glass = fx.glass(d, self.cover(index, d));
-            // Only the glass is looked through: the sky is worked out nowhere else.
-            if !(glass > 0.0) {
+            let cover = self.cover(index, d);
+            // Only the window is looked at: the sky is worked out nowhere else.
+            if !(cover > 0.0) {
                 return Vec3f::default();
             }
-            dimmed(&flags, d, fx.through_glass(d, glass, sky(d)))
+            dimmed(&flags, d, fx.lets_in(d, cover, fx.glass(d, cover), sky))
         };
-        let stroke = light.shaped.as_ref().and_then(|s| s.stroke_path()).map(|path| stroke_cells(path, cos_cover));
+        let stroke = light.shaped.as_ref().and_then(|s| Some(stroke_cells(s.stroke_path()?, s.stroke_band_reach()?, cos_cover)));
         let side = cone_cell(cos_cover);
         let cells = |centre: Vec3f| {
             let own = match &stroke {
@@ -1252,7 +1359,7 @@ impl Studio {
         for caster in self.casters.iter_mut().flatten() {
             caster.clear_bloom();
         }
-        self.any_fx = self.fx.iter().any(|fx| !fx.is_plain()) || self.casters.iter().flatten().any(|c| !c.is_plain());
+        self.any_fx = self.fx.iter().any(|fx| !fx.is_plain()) || self.casters.iter().flatten().any(|c| !c.is_plain()) || self.models.iter().any(Option::is_some);
     }
 
     /// The caster at studio entry `entry`; None for a light.
@@ -1354,6 +1461,8 @@ impl Studio {
                 // A caster multiplies what is drawn before it and adds nothing
                 // (`draw_caster`). It is never the key, so nothing skips it.
                 c = draw_caster(&self.lights[i], fx, caster, dir, c);
+            } else if let Some(model) = &self.models[i] {
+                c = self.draw_model(i, model, dir, c, skip == Some(i), texel);
             } else if fx.is_plain() {
                 c = self.draw_lights(i..i + 1, dir, c, skip, texel);
             } else if fx.fills_with_sky() {
@@ -1364,14 +1473,60 @@ impl Studio {
                 // map without it lacks exactly the sky the key carries (D1).
                 let cover = self.cover(i, dir);
                 if cover > 0.0 {
-                    c = if skip == Some(i) { c * (1.0 - fx.hides(dir, cover)) } else { fx.window(dir, cover, c, sky(dir)) };
+                    c = if skip == Some(i) { c * (1.0 - fx.hides(dir, cover)) } else { fx.window(dir, cover, c, sky) };
                 }
             } else {
                 let after = self.draw_lights(i..i + 1, dir, c, skip, texel);
-                c = fx.apply(dir, c, after);
+                c = fx.apply_at(dir, c, after, texel);
             }
         }
         c
+    }
+
+    /// Entry `i` drawn as its 3D model (light_model.rs) over `acc` along
+    /// `dir`, for a map texel `texel` radians tall: what the model covers
+    /// hides what is behind it. Its cloth's front shows the light as its flat
+    /// face draws it at the point the hit stands for (its own code over
+    /// black, then what hangs in front of it, the parts the model draws as
+    /// geometry left out of its modifier), through its beam along the ray
+    /// itself and with its flash's image moved (`ModelHit::Face`); a
+    /// translucent back glows with what passes the cloth; a solid is lit in
+    /// the light's colour; what stands in front of the cloth (a flash tube,
+    /// a lamp's dome) shows the whole face (`ModelHit::Whole`). `left_out`
+    /// (the key left out, N3) keeps only what it hides.
+    fn draw_model(&self, i: usize, model: &LightModel, dir: Vec3f, acc: Vec3f, left_out: bool, texel: f32) -> Vec3f {
+        let tinted = |c: Vec3f, t: Option<Vec3f>| match t {
+            Some(t) => vec3f(c.x * t.x, c.y * t.y, c.z * t.z),
+            None => c,
+        };
+        let (light, fx) = (&self.lights[i], &self.fx[i]);
+        let black = Vec3f::default();
+        let mut own = black;
+        let cover = model.trace(dir, texel, |d, hit, w| {
+            if left_out {
+                return;
+            }
+            let c = match hit {
+                ModelHit::Face { at, mirror } => {
+                    let (glow, tint) = fx.bare_glow_tint(at, texel);
+                    tinted(light.draw_beamed(at, black, false, false) * (fx.passes(at) * glow * light.model_beam(d) * mirror), tint)
+                }
+                ModelHit::Back { at } => light.draw_beamed(at, black, false, false) * fx.back_glow(at).unwrap_or(0.0),
+                ModelHit::Solid { level } => light.color * level,
+                ModelHit::Candle(h) => vec3f(light.color.x * h.rel.x, light.color.y * h.rel.y, light.color.z * h.rel.z) + h.plain * luminance(light.color) + h.abs,
+                ModelHit::Whole { at } => {
+                    let (glow, tint) = fx.glow_tint(at, texel);
+                    tinted(light.draw_beamed(at, black, false, false) * (fx.passes(at) * glow * light.model_beam(d)), tint)
+                }
+            };
+            own = own + c * w;
+        });
+        // (a candle's flame alone covers nothing: its glow adds to what is behind it)
+        if !(cover > 0.0) && own == black {
+            return acc;
+        }
+        let c = acc * (1.0 - cover) + own;
+        vec3f(c.x.max(0.0), c.y.max(0.0), c.z.max(0.0))
     }
 
     /// How much of light `index` covers `dir` ([`PreparedLight::cover`]).
@@ -1413,6 +1568,25 @@ impl Studio {
     /// never pay for it (D15, M5); `Env` measures it once, on the engine's first ask.
     pub fn key(&self) -> Option<EnvSun> {
         self.key_index.and_then(|index| self.measured_key(index))
+    }
+
+    /// The open boxes' bare tubes (`LightFx::core_radius`) as discs in the
+    /// map's own frame, each its direction and angular radius: a crisp disc
+    /// a few texels across that texel centres alone hit unevenly (a 34 x 26
+    /// degree open softbox's 0.8 degree tube lost 2 % of its light to a 1K
+    /// bake), so the bake area-averages its texels as it does the sun's.
+    pub fn hot_cores(&self) -> Vec<(Vec3f, f32)> {
+        self.lights
+            .iter()
+            .zip(&self.fx)
+            .filter_map(|(light, fx)| {
+                let radius = fx.core_radius()?;
+                let frame = &light.frame;
+                let centre = frame.center.normalize();
+                let out = |side: Vec3f| centre.dot((frame.center + side * radius).normalize()).clamp(-1.0, 1.0).acos();
+                Some((centre, out(frame.right).max(out(frame.up))))
+            })
+            .collect()
     }
 }
 
@@ -1638,11 +1812,13 @@ fn caster_sharp_coverage(light: &PreparedLight, fx: &LightFx, dir: Vec3f) -> f32
 /// For [`over_cone`] over the covering cone (`cos_cover`) of the stroke whose
 /// centre line is `path`: how many samples per axis the cell round a direction
 /// takes. Where the stroke may draw (its path widened by a cell's reach finds
-/// the cell), enough for STROKE_SAMPLES_PER_REACH of them per stroke reach;
-/// elsewhere none.
-fn stroke_cells(path: &ArcPath, cos_cover: f32) -> impl Fn(Vec3f) -> usize {
+/// the cell, its glow included), enough for STROKE_SAMPLES_PER_REACH of them
+/// per `band`, the reach of its band without the glow
+/// (`ShapedLight::stroke_band_reach`), so a glow does not thin the samples on
+/// the band; elsewhere none.
+fn stroke_cells(path: &ArcPath, band: f32, cos_cover: f32) -> impl Fn(Vec3f) -> usize {
     let side = cone_cell(cos_cover);
-    let fine = ((side * STROKE_SAMPLES_PER_REACH / path.reach()).ceil() as usize).clamp(1, STROKE_FINE_MAX);
+    let fine = ((side * STROKE_SAMPLES_PER_REACH / band.min(path.reach())).ceil() as usize).clamp(1, STROKE_FINE_MAX);
     let scan = path.widened(side * std::f32::consts::FRAC_1_SQRT_2);
     move |centre: Vec3f| if scan.nearest(centre).dist < scan.reach() { fine } else { 0 }
 }
@@ -1967,13 +2143,14 @@ fn over_stroke_pieces(
     axis: Vec3f,
     cos_cover: f32,
     path: &ArcPath,
+    band: f32,
     pieces: usize,
     light: &(dyn Fn(Vec3f) -> Vec3f + Sync),
     cancelled: &dyn Fn() -> bool,
     run: RowRunner,
 ) -> Option<Vec<StrokePiece>> {
     let pieces = pieces.max(1);
-    let grid = ConeGrid::new(axis, cos_cover, &stroke_cells(path, cos_cover), ROOM_PIECE_SAMPLES);
+    let grid = ConeGrid::new(axis, cos_cover, &stroke_cells(path, band, cos_cover), ROOM_PIECE_SAMPLES);
     // Each cell's light, by the pieces it reaches (a cell touches one or two).
     let cells = rows_by(grid.visited.len(), run, cancelled, &|c| {
         let cell = grid.visited[c];
@@ -2158,6 +2335,17 @@ impl PreparedLight {
     fn beam(&self, dir: Vec3f) -> f32 {
         match (self.space, self.frame.face) {
             (Some(space), Some(n)) => beam_factor(space.beam, dir.dot(n)),
+            _ => 1.0,
+        }
+    }
+
+    /// A 3D light's beam (`beam`) on what its model's cloth sends along `dir`
+    /// (light_model.rs): a diffuse face's (exponent 0) is 1 wherever the
+    /// camera sees the cloth's inside, past its rim's plane too; a narrower
+    /// one's falls with the angle off the face's axis, held just short of 0.
+    fn model_beam(&self, dir: Vec3f) -> f32 {
+        match (self.space, self.frame.face) {
+            (Some(space), Some(n)) if space.beam > 0.0 => beam_factor(space.beam, dir.dot(n).max(1.0e-3)),
             _ => 1.0,
         }
     }

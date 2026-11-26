@@ -3,7 +3,8 @@
 //! the camera, the hover (with its 120 ms fade) and the semantic nodes.
 //!
 //! Grammar: click focuses (empty canvas: `Click { key: None }`); a drag of an item past four
-//! points is that item's drag; a drag of empty canvas is a marquee; the pan key (space), Alt
+//! points is that item's drag; a drag of empty canvas, or from a background item's inside
+//! (`CanvasItems::marquee_over`: a pour), is a marquee; the pan key (space), Alt
 //! held at the press, the middle or secondary button, or two fingers pan; the wheel, a pinch, or Ctrl/Cmd with two
 //! fingers zoom; a key acts on what is under the pointer; Escape cancels a drag first, else
 //! steps out. The pointer is a hand over anything draggable and grabs while dragging.
@@ -48,8 +49,9 @@ pub enum CanvasInput<K> {
     DragEnd { key: K, at: [f64; 2] },
     /// Escape during an item drag: the view restores the committed state.
     DragCancel { key: K },
-    /// A marquee over empty canvas, its world box; `done` on release.
-    Marquee { rect: [f64; 4], done: bool, shift: bool },
+    /// A marquee's world box, with `done` on release. Left to right takes parts wholly inside.
+    /// `crossing` is true left of the press and takes parts the band touches. O(1) to emit either.
+    Marquee { rect: [f64; 4], done: bool, shift: bool, crossing: bool },
     /// A key, with the item under the pointer it acts on.
     Key { code: KeyCode, modifiers: KeyModifiers, under: Option<K> },
     /// Escape with no drag running: one step out (leave the reveal, then clear the selection).
@@ -67,6 +69,15 @@ struct Press<K> {
     dragging: bool,
     clicks: u32,
     shift: bool,
+    /// The press went down on a background item's inside: a drag draws the marquee.
+    marquee: bool,
+}
+
+impl<K> Press<K> {
+    /// The item this press drags, if it drags one (not a marquee from a background item).
+    fn drags(&self) -> Option<&K> {
+        self.key.as_ref().filter(|_| !self.marquee)
+    }
 }
 
 /// The canvas pane under the pointer, across all panes in the window. A Cx global of a pane id,
@@ -385,10 +396,8 @@ impl<K: Clone + PartialEq + Hash + std::fmt::Debug> CanvasPane<K> {
             keys.hovered = None;
         }
         self.picked = at.map(|s| (self.cam.to_world(s), self.cam.px_per_unit));
-        let under = at.and_then(|s| {
-            let r = HIT_RADIUS / self.cam.px_per_unit.max(1e-12);
-            items.hit(self.cam.to_world(s), r).into_iter().next()
-        });
+        let r = HIT_RADIUS / self.cam.px_per_unit.max(1e-12);
+        let under = at.and_then(|s| items.hit(self.cam.to_world(s), r).into_iter().next());
         if under != self.hover {
             self.hover = under.clone();
             self.hover_start = now;
@@ -396,7 +405,9 @@ impl<K: Clone + PartialEq + Hash + std::fmt::Debug> CanvasPane<K> {
             out.push(CanvasInput::Hover(under));
         }
         if self.press.is_none() {
-            cx.set_cursor(if self.hover.is_some() { MouseCursor::Hand } else { MouseCursor::Default });
+            // A hand over what a drag would move; a pour's inside draws the marquee instead.
+            let drags = at.zip(self.hover.as_ref()).is_some_and(|(s, key)| !items.marquee_over(key, self.cam.to_world(s), r));
+            cx.set_cursor(if drags { MouseCursor::Hand } else { MouseCursor::Default });
         }
     }
 
@@ -446,14 +457,16 @@ impl<K: Clone + PartialEq + Hash + std::fmt::Debug> CanvasPane<K> {
                 let pan = self.space_held || e.modifiers.alt || pan_button;
                 self.nav.stop();
                 let r = HIT_RADIUS / self.cam.px_per_unit.max(1e-12);
-                let key = if pan { None } else { items.hit(self.cam.to_world(e.abs), r).into_iter().next() };
+                let world = self.cam.to_world(e.abs);
+                let key = if pan { None } else { items.hit(world, r).into_iter().next() };
+                let marquee = key.as_ref().is_some_and(|key| items.marquee_over(key, world, r));
                 if pan {
                     self.moved_by_hand();
                     self.nav.drag_begin(e.time);
                     cx.set_cursor(MouseCursor::Grabbing);
                 }
                 if let Some(key) = &key { out.push(CanvasInput::Press { key: key.clone(), down: true }); }
-                self.press = Some(Press { key, start: e.abs, last: e.abs, pan, dragging: false, clicks: e.tap_count.max(1), shift: e.modifiers.shift });
+                self.press = Some(Press { key, start: e.abs, last: e.abs, pan, dragging: false, clicks: e.tap_count.max(1), shift: e.modifiers.shift, marquee });
             }
             Hit::FingerMove(e) => {
                 let cam = self.cam;
@@ -467,7 +480,7 @@ impl<K: Clone + PartialEq + Hash + std::fmt::Debug> CanvasPane<K> {
                 }
                 if !press.dragging && (e.abs - press.start).length() > DRAG_THRESHOLD {
                     press.dragging = true;
-                    match &press.key {
+                    match press.drags() {
                         Some(key) => {
                             cx.set_cursor(MouseCursor::Grabbing);
                             out.push(CanvasInput::DragStart { key: key.clone(), from: cam.to_world(press.start), at: cam.to_world(e.abs) });
@@ -476,9 +489,12 @@ impl<K: Clone + PartialEq + Hash + std::fmt::Debug> CanvasPane<K> {
                     }
                 }
                 if press.dragging {
-                    match &press.key {
+                    match press.drags() {
                         Some(key) => out.push(CanvasInput::DragMove { key: key.clone(), at: cam.to_world(e.abs) }),
-                        None => out.push(CanvasInput::Marquee { rect: cam.rect_to_world(Rect { pos: press.start, size: e.abs - press.start }), done: false, shift: press.shift }),
+                        None => out.push(CanvasInput::Marquee {
+                            rect: cam.rect_to_world(Rect { pos: press.start, size: e.abs - press.start }),
+                            done: false, shift: press.shift, crossing: e.abs.x < press.start.x,
+                        }),
                     }
                 }
             }
@@ -489,9 +505,12 @@ impl<K: Clone + PartialEq + Hash + std::fmt::Debug> CanvasPane<K> {
                     self.nav.drag_end(e.time);
                     self.animate(cx);
                 } else if press.dragging {
-                    match press.key {
-                        Some(key) => out.push(CanvasInput::DragEnd { key, at: self.cam.to_world(e.abs) }),
-                        None => out.push(CanvasInput::Marquee { rect: self.cam.rect_to_world(Rect { pos: press.start, size: e.abs - press.start }), done: true, shift: press.shift }),
+                    match press.drags() {
+                        Some(key) => out.push(CanvasInput::DragEnd { key: key.clone(), at: self.cam.to_world(e.abs) }),
+                        None => out.push(CanvasInput::Marquee {
+                            rect: self.cam.rect_to_world(Rect { pos: press.start, size: e.abs - press.start }),
+                            done: true, shift: press.shift, crossing: e.abs.x < press.start.x,
+                        }),
                     }
                 } else {
                     out.push(CanvasInput::Click { key: press.key, at: self.cam.to_world(e.abs), clicks: press.clicks, shift: press.shift });
@@ -535,7 +554,7 @@ impl<K: Clone + PartialEq + Hash + std::fmt::Debug> CanvasPane<K> {
             let press = self.press.take();
             if let Some(key) = press.as_ref().and_then(|press| press.key.clone()) { out.push(CanvasInput::Press { key, down: false }); }
             match press {
-                Some(Press { key: Some(key), dragging: true, pan: false, .. }) => out.push(CanvasInput::DragCancel { key }),
+                Some(Press { key: Some(key), dragging: true, pan: false, marquee: false, .. }) => out.push(CanvasInput::DragCancel { key }),
                 Some(_) => {}
                 None => out.push(CanvasInput::Escape),
             }

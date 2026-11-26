@@ -1,4 +1,5 @@
 use makepad_fab_settings::machine::Job;
+use makepad_fab_settings::options::options;
 
 const HOPS: [&str; 4] = ["Auto Lift", "Normal Lift", "Slope Lift", "Spiral Lift"];
 
@@ -23,6 +24,27 @@ pub fn check(job: &Job) -> Result<(), String> {
         let v = job.s(key);
         if job.cfg.has(key) && !allowed.contains(&v) {
             bad.push(format!("{key} \"{v}\" (expected {})", allowed.join(", ")));
+        }
+    }
+    if crate::infill::is_tpms(job.s("sparse_infill_pattern")) {
+        let key = "adaptive_infill_mode";
+        let mode = job.s(key);
+        if job.cfg.has(key) && !matches!(mode, "disabled" | "distance_warp" | "lobes") {
+            let documented = &options().get(key).unwrap().enum_values;
+            let why = if documented.iter().any(|v| v == mode) {
+                "is not built in Fab yet (built: disabled, distance_warp, lobes)"
+            } else {
+                "(expected disabled, distance_warp, lobes)"
+            };
+            bad.push(format!("{key} \"{mode}\" {why}"));
+        }
+        let key = "adaptive_infill_interior_density";
+        let density = job.f(key);
+        if job.cfg.has(key) && !(density > 0.0 && density <= 100.0) {
+            bad.push(format!("{key} \"{}\" (must be finite, greater than 0 and at most 100%)", job.s(key)));
+        }
+        if crate::infill::adaptive_gradient(job).is_none() {
+            bad.push(format!("adaptive_infill_gradient \"{}\" (expected linear, quadratic, exponential)", job.s("adaptive_infill_gradient")));
         }
     }
     for e in 0..job.extruders() {

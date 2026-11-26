@@ -1,0 +1,21 @@
+[package]
+name = "makepad-flow-assets"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# The asset library behind the open-source flow engine's result seam: an
+# asset worker implementing `makepad_flow::engine::results::ResultStore`.
+
+[dependencies]
+makepad-flow = { path = "../../../../libs/flow", default-features = false, features = ["media"] }
+makepad-strict-json = { path = "../../../../libs/strict_json" }
+makepad-asset-client = { path = "../../../apps/engine/asset/client" }
+makepad-asset-data = { path = "../../../apps/engine/asset/data" }
+
+[dev-dependencies]
+makepad-flow = { path = "../../../../libs/flow", features = ["client", "host"] }
+makepad-asset-store = { path = "../../../apps/engine/asset/store" }
+makepad-ai-hub = { path = "../../../../libs/ai/hub", default-features = false }
+makepad-micro-serde = { path = "../../../../libs/micro_serde" }

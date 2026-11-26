@@ -7,6 +7,7 @@ use mod.model.*
 use mod.fab.*
 let m = mod.model
 let pcb = board("tonebox")
+// Set pipes to {row: @x} or {row: @y} to fix the channel orientation in board coordinates.
 let case = enclosure(pcb, {pipes: {}})
 object(case.base, name: "Base")
 let clear = Material{albedo: [0.9 0.92 0.9] name: "Clear"}

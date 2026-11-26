@@ -52,6 +52,8 @@ pub enum Stage {
     Classes,
     /// A block of layers' shared data for cross-layer sparse infill. Block.
     Aux,
+    /// The distance warp of the part's sparse TPMS infill. Part.
+    Grade,
     /// One island's fills. Island; per layer a group.
     Infill,
     /// The finished layer (paint by position: of every filament). Per stream; for every stream a group.
@@ -79,6 +81,7 @@ impl Stage {
             Stage::Bridges => "bridges",
             Stage::Classes => "classes",
             Stage::Aux => "aux",
+            Stage::Grade => "grade",
             Stage::Infill => "infill",
             Stage::Layer => "layer",
             Stage::Vase => "vase",
@@ -129,7 +132,7 @@ impl Task {
     /// The layer its span names: none for a part's or a block's task.
     fn span_layer(self) -> u32 {
         match self.stage {
-            Stage::Regions | Stage::Vase | Stage::Supports | Stage::Finish | Stage::Aux => makepad_fab_slicer::par::NO_LAYER,
+            Stage::Regions | Stage::Vase | Stage::Supports | Stage::Finish | Stage::Aux | Stage::Grade => makepad_fab_slicer::par::NO_LAYER,
             _ => self.layer,
         }
     }
@@ -303,6 +306,9 @@ pub struct PartPlan<'a> {
     capture: Option<Vec<Mutex<GivenLayer>>>,
     used: Mutex<GivenUse>,
     outline: Vec<Slot<Vec<ExPolygon>>>,
+    grade_key: Option<u64>,
+    held_grade: Option<Arc<grade::Graded>>,
+    grade: Slot<grade::Graded>,
     streams: OnceLock<Vec<Stream>>,
     /// Finished layers put before the streams are known (stream, layer, layers): they go in
     /// when [`Stage::Regions`] splits the part. Its lock orders a put against that split.
@@ -328,7 +334,8 @@ impl<'a> PartPlan<'a> {
             let _ = streams.set(vec![Stream::new(o.filament, params.clone(), n)]);
         }
         let xy = XyComp::of(&own, o);
-        let lift = if own.cfg.i64_at("raft_layers", 0) > 0 { params.raft_lift } else { 0.0 };
+        let lift = params.raft_lift;
+        let grade_key = grade_key_for(o, &params, xy, &heights);
         let zones: Vec<Zone> = if params.exp.vase.is_some() { Vec::new() } else { o.source.settings_zones().into_iter().map(|z| Zone { set: ZoneSet::of(&z.values), region: z.region }).collect() };
         let fills = region_fills(&params, &zones);
         let zone_at = (0..if zones.is_empty() { 0 } else { n }).map(|_| Slot::default()).collect();
@@ -354,6 +361,9 @@ impl<'a> PartPlan<'a> {
             capture: None,
             used: Mutex::default(),
             outline: (0..n).map(|_| Slot::default()).collect(),
+            grade_key,
+            held_grade: grade_key.and_then(grade::held),
+            grade: Slot::default(),
             streams,
             finished_early: Mutex::default(),
             heights,
@@ -508,7 +518,8 @@ impl<'a> PartPlan<'a> {
         match t.stage {
             Stage::Trace => {}
             Stage::Outline => d.push(trace(k)),
-            Stage::Supports => d.extend((0..n).map(outline)),
+            Stage::Grade if self.held_grade.is_some() => {}
+            Stage::Supports | Stage::Grade => d.extend((0..n).map(outline)),
             // The streams' tasks it adds read the traces and outlines it holds.
             Stage::Regions => d.extend((0..n).flat_map(|j| [outline(j), trace(j)])),
             Stage::Walls if t.island == EVERY => {
@@ -624,6 +635,9 @@ impl<'a> PartPlan<'a> {
             if p.sparse_pattern.cross_layer() {
                 d.push(Task::layer(Stage::Aux, s, k / AUX_BLOCK));
             }
+            if p.sparse_opts.adaptive.is_some() {
+                d.push(Task::part(Stage::Grade));
+            }
         }
         d.sort();
         d.dedup();
@@ -684,6 +698,7 @@ impl<'a> PartPlan<'a> {
             Stage::Bridges => layer(t.stream).bridges.clear(),
             Stage::Classes => layer(t.stream).classes.clear(),
             Stage::Aux => self.stream(t.stream as usize).aux[k].clear(),
+            Stage::Grade => self.grade.clear(),
             Stage::Infill => layer(t.stream).infill.get().into_iter().flatten().for_each(Slot::clear),
             Stage::Layer => {
                 for st in self.streams.get().into_iter().flatten() {
@@ -736,6 +751,17 @@ impl<'a> PartPlan<'a> {
             Stage::Aux => {
                 let _t = prof::scope(prof::Stage::Infill);
                 self.aux(s, k);
+            }
+            Stage::Grade => {
+                let _t = prof::scope(prof::Stage::Infill);
+                let g = self.held_grade.clone().unwrap_or_else(|| {
+                    let p = &self.params;
+                    let adaptive = p.sparse_opts.adaptive.as_ref().expect("only adaptive TPMS infill requests a grade");
+                    let outlines: Vec<_> = self.outline.iter().map(Slot::get).collect();
+                    let layers: Vec<_> = self.heights.iter().zip(&outlines).map(|(&(z, h), o)| (z, h, o.as_slice())).collect();
+                    grade::graded_shared(self.grade_key, &layers, adaptive, p.density, grade_period(p))
+                });
+                self.grade.put_arc(g);
             }
             Stage::Infill => {
                 let _t = prof::scope(prof::Stage::Infill);
@@ -1214,6 +1240,9 @@ impl<'a> PartPlan<'a> {
         let aux_start = aux_held.as_ref().map_or(0, |a| a.0);
         // the part's own sparse's (0), or a regions' fill's (its index + 1)
         let aux_of = |slot: usize| aux_held.as_ref().and_then(|a| a.1.get(slot)).unwrap_or(&no_aux);
+        // A part with no body thick enough to grade keeps the plain pattern, as with the mode off.
+        let warp = p.sparse_opts.adaptive.map(|_| self.grade.get()).filter(|g| g.graded).map(infill::Aux::Warp);
+        let own_aux = warp.as_ref().unwrap_or_else(|| aux_of(0));
         let lower = if k > 0 { Some(self.outline[k - 1].get()) } else { None };
         let solid_angle = p.infill_direction + if index % 2 == 1 { std::f64::consts::FRAC_PI_2 } else { 0.0 };
         let mut fills = Vec::new();
@@ -1361,7 +1390,8 @@ impl<'a> PartPlan<'a> {
             }
             let internal = role == Role::Bridge && std::ptr::eq(area, &cls.bridge);
             let lower = if internal { None } else { lower.as_deref() };
-            let mut paths = crate::infill(p, role, &mine, region, index, h, solid_angle, center, first, z, lower, !cls.band.is_empty(), aux_start, aux_of(aux), sparse, &cores);
+            let aux = if aux == 0 { own_aux } else { aux_of(aux) };
+            let mut paths = crate::infill(p, role, &mine, region, index, h, solid_angle, center, first, z, lower, !cls.band.is_empty(), aux_start, aux, sparse, &cores);
             // Bridges over the sparse infill below are internal bridges when the job has their
             // speed: the same lines, their own role, speed and volume factor.
             if internal && p.speeds.internal_bridge.is_some() {
@@ -1530,16 +1560,13 @@ impl<'a> PartPlan<'a> {
         if self.paint_at.is_none() || params.first(k) {
             return None;
         }
-        let mid = |j: usize| self.heights[j].0 - 0.5 * self.heights[j].1;
         let (n, d) = (self.heights.len(), params.paint_skin);
         let (bottom, top) = (self.heights[0].0 - self.heights[0].1, self.heights[n - 1].0);
-        let z = mid(k);
+        let z = self.heights[k].0 - 0.5 * self.heights[k].1;
         if z - d <= bottom || z + d >= top {
             return None;
         }
-        let lo = (0..k).rev().take_while(|&j| mid(j) >= z - d).last().unwrap_or(k);
-        let hi = (k + 1..n).take_while(|&j| mid(j) <= z + d).last().unwrap_or(k);
-        Some((lo, hi))
+        Some(crate::skin_span(&self.heights, d, k))
     }
 
     /// Layer `k`'s inside, deeper under the part's surface than the paint's skin: its outline

@@ -71,12 +71,10 @@
 //! plane. Its Fresnel is a dielectric's (Schlick, F0 0.04), scaled by
 //! `floor_gloss`.
 //!
-//! A road (plan P3, `RoadParams`) is painted on the floor along the room's
-//! long side: asphalt whose albedo varies over a few metres, solid edge
-//! lines and dashed lines between the lanes, each line's edges and each
-//! dash's ends box-filtered over a 2048 wide map's texel where the floor is
-//! seen (`LINE_FOOT`, as the stands' edges), and its own gloss and roughness
-//! for the mirror, blended into the floor's across the road's filtered edge.
+//! A room whose floor side is open (`RoomParams::open_floor`: a tunnel, a
+//! bridge) stands on the scene's ground (`Ground`): its floor's albedo, gloss
+//! and roughness are the ground's there, its road (an old file's room road
+//! is moved onto the ground's by `HdriParams::clamp`) and what lies beside it.
 //!
 //! Open walls (plan P3, `RoomParams::open_walls`) are a tunnel's mouths: a
 //! view ray that leaves the room through one sees the environment outside
@@ -106,12 +104,26 @@
 //! one hung near the ceiling) and the ceiling's pipe grid are thin cylinders
 //! drawn over the room with an analytic coverage, their edges faded over
 //! one fixed width (`LINE_FOOT`), so every lookup draws the same room. They are dark metal lit as the room is.
+//! So are the light fittings' bodies (`Housing`, a pattern light's housed tubes: pattern.rs `housings`): boxes
+//! behind the lights' faces, their front face on the face, of their own albedo; the light's picture is drawn over
+//! them. Each light's are kept in a grid over its face (`HousingGroup`), so a lookup finds the few its ray comes
+//! near from the cells under its stretch through the face; for each of those in the cone round one, the nearest
+//! approach of the ray to the box (15 pairs of its slabs' sides) and, where it is covered, the irradiance there
+//! summed as a stand's is.
+//!
+//! The floor, the walls and the ceiling are each a material (`RoomParams::floor_material` and the others,
+//! room_material.rs) or their flat colour: a pattern round that colour, read in the plane's own metres at the
+//! footprint the lookup's texel has there (`Room::foot`: its width over the way to the surface, stretched as the
+//! surface turns away), worn by where it lies in the room. A cove blends the floor's into the wall's, a window's
+//! reveal is the wall's material, and the floor's mirror reads the material's gloss. A material's mean is its
+//! colour, so the bounce (the room's mean albedo) is the same with or without it.
 use makepad_draw::*;
 use makepad_render_material::ibl::{dir_to_equirect_uv, equirect_uv_to_dir, EnvMap};
 
 use super::image_light::SummedArea;
-use super::noise::fbm2;
-use super::params::{CoveWalls, RoadParams, RoomParams};
+use super::params::{CoveWalls, RoomParams, RoomWindow, ROOM_WEAR_DEFAULT, ROOM_WINDOW_DEPTH_M};
+use super::room_material::{self, RoomMaterial, Side, Surface, Weather};
+use super::room_window::{Met, Paint, Styled};
 use crate::sky::luminance;
 
 /// A mirror layer (`MirrorLayer`, a light's equirect for the wide lobes of a
@@ -154,6 +166,9 @@ const PIPE_ALBEDO: f32 = 0.06;
 /// 2048 wide map's texel. One width for every lookup (a bake at any size,
 /// its refined texels, the keyless copy), so they all draw the same room.
 const LINE_FOOT: f32 = std::f32::consts::TAU / 2048.0;
+/// The footprint, metres, a surface beside an opening is read at in the
+/// floor's mirror of it (`Room::beside_mouth`): its materials' mean.
+const BESIDE_MOUTH_FOOT: f32 = 1.0;
 /// How far under the ceiling the grid hangs, metres.
 const GRID_DROP: f32 = 0.08;
 /// A light whose bottom is within this of the ceiling, or above this share of
@@ -177,9 +192,6 @@ const GRID_NODES_MAX: usize = 1 << 16;
 /// The nearest a light counts as standing to a plane, metres: no grid is
 /// finer than GRID_SHARE of it.
 const GRID_NEAR_M: f32 = 0.01;
-/// A road's asphalt varies over patches about this wide, metres, and its noise's seed.
-const ROAD_PATCH_M: f32 = 3.0;
-const ROAD_SEED: u32 = 0x726f_6164;
 /// The outside's light through an opening is measured over this many
 /// cosine-weighted directions a side (`Opening::daylight`), and a disc in it
 /// over this many points a side.
@@ -221,6 +233,16 @@ pub struct RoomLight {
     pub entry: usize,
     /// Whether its grid, doors or gobo shape its beam (else it is a bare Lambertian face).
     pub shaped_beam: bool,
+    /// It shines all round (a candle's flame): `intensity` is its intensity
+    /// every way and `normal` is not read.
+    pub omni: bool,
+}
+
+impl RoomLight {
+    /// Whether a point at `x` lies in front of it (always, for one that shines all round).
+    fn fronts(&self, x: Vec3f) -> bool {
+        self.omni || self.normal.dot(x - self.pos) > 0.0
+    }
 }
 
 /// A thin cylinder from `a` to `b`.
@@ -238,16 +260,263 @@ struct Rod {
 
 impl Rod {
     fn new(a: Vec3f, b: Vec3f, radius: f32) -> Rod {
-        let centre = (a + b) * 0.5;
-        let reach = 0.5 * (b - a).length() + radius;
-        let far = centre.length();
-        let (axis, cos_reach) = if far > reach * 1.001 {
-            let angle = (reach / far).asin() + LINE_FOOT;
-            (centre / far, if angle < std::f32::consts::PI { angle.cos() } else { -1.0 })
-        } else {
-            (vec3f(0.0, 1.0, 0.0), -1.0)
-        };
+        let (axis, cos_reach) = reach_cone((a + b) * 0.5, 0.5 * (b - a).length() + radius);
         Rod { a, b, radius, axis, cos_reach }
+    }
+}
+
+/// The cone round the camera that holds a sphere of radius `reach` round
+/// `centre` and a faded edge past it: its axis and the cosine of its half
+/// angle (-1 when the camera is inside the sphere).
+fn reach_cone(centre: Vec3f, reach: f32) -> (Vec3f, f32) {
+    let far = centre.length();
+    if far > reach * 1.001 {
+        let angle = (reach / far).asin() + LINE_FOOT;
+        (centre / far, if angle < std::f32::consts::PI { angle.cos() } else { -1.0 })
+    } else {
+        (vec3f(0.0, 1.0, 0.0), -1.0)
+    }
+}
+
+/// A light fitting's body (pattern.rs `housings`): a box round `centre`
+/// (map frame, metres from the camera), `half` its half extents along its
+/// `axes` (unit, at right angles), of grey `albedo`, lit as the room is.
+#[derive(Clone, Copy, Debug)]
+pub struct Housing {
+    pub centre: Vec3f,
+    pub axes: [Vec3f; 3],
+    pub half: Vec3f,
+    pub albedo: f32,
+}
+
+/// Where a view ray from the camera along `d` passes box `h`: the least,
+/// over the ray in front of the camera, of how far its point lies outside
+/// the box along the axis it is farthest out on (metres, negative inside),
+/// and where the ray enters the box grown by that much (or by nothing, where
+/// it passes through): its distance and the face's outward normal. The
+/// excess along the ray is the greatest of six lines in the distance (the
+/// slabs' sides), so its least lies where two of them cross (or at the
+/// camera). None where it enters nowhere in front of the camera.
+fn ray_to_box(d: Vec3f, h: &Housing) -> Option<(f32, f32, Vec3f)> {
+    let o = [-h.centre.dot(h.axes[0]), -h.centre.dot(h.axes[1]), -h.centre.dot(h.axes[2])];
+    let v = [d.dot(h.axes[0]), d.dot(h.axes[1]), d.dot(h.axes[2])];
+    let half = [h.half.x, h.half.y, h.half.z];
+    let excess = |t: f32| (0..3).map(|i| (o[i] + t * v[i]).abs() - half[i]).fold(f32::MIN, f32::max);
+    // The six lines: slope s v_i, offset s o_i - half_i.
+    let lines: [(f32, f32); 6] = std::array::from_fn(|k| {
+        let (i, s) = (k / 2, if k % 2 == 0 { 1.0 } else { -1.0 });
+        (s * v[i], s * o[i] - half[i])
+    });
+    let mut least = excess(0.0);
+    for a in 0..6 {
+        for b in a + 1..6 {
+            let slope = lines[a].0 - lines[b].0;
+            if slope.abs() < 1.0e-9 {
+                continue;
+            }
+            let t = (lines[b].1 - lines[a].1) / slope;
+            if t > 0.0 {
+                least = least.min(excess(t));
+            }
+        }
+    }
+    // Where the ray enters the box grown by the excess: the latest of its slabs' near sides.
+    let grow = least.max(0.0) + 1.0e-6;
+    let (mut t_in, mut t_out, mut normal) = (0.0f32, f32::INFINITY, Vec3f::default());
+    for i in 0..3 {
+        let hg = half[i] + grow;
+        if v[i].abs() < 1.0e-9 {
+            if o[i].abs() > hg {
+                return None;
+            }
+            continue;
+        }
+        let (t1, t2) = ((-hg - o[i]) / v[i], (hg - o[i]) / v[i]);
+        let (near, far) = (t1.min(t2), t1.max(t2));
+        if near > t_in {
+            t_in = near;
+            normal = h.axes[i] * if v[i] > 0.0 { -1.0 } else { 1.0 };
+        }
+        t_out = t_out.min(far);
+    }
+    (t_in > 0.0 && t_in <= t_out).then_some((least, t_in, normal))
+}
+
+/// How far, per metre along a view ray, a point of it can lie outside a
+/// housing's box in the group's frame and still be drawn over it: the edge
+/// fade (half LINE_FOOT) grown by sqrt 3 for the box's own axes against the
+/// frame's, rounded up so that the float error of `ray_to_box` stays inside;
+/// and the same in metres at the camera.
+const HOUSING_NEAR_SLOPE: f32 = LINE_FOOT;
+const HOUSING_NEAR_M: f32 = 1.0e-3;
+
+/// One light's housings (`Room::with_housings`), with a grid over its face
+/// that finds the few a view ray comes near: a lookup tests only those, in
+/// the light's own order, so a pattern of many tubes costs about what one
+/// of its cells does.
+#[derive(Debug)]
+struct HousingGroup {
+    /// Each housing with the cone round the camera that holds it (`reach_cone`).
+    housings: Vec<(Housing, Vec3f, f32)>,
+    /// The cone round the camera that holds them all (and so each one's).
+    axis: Vec3f,
+    cos_reach: f32,
+    /// The grid's frame: two axes along the face, then the face's normal
+    /// (the first housing's axes), and the box holding every housing in it,
+    /// metres from the camera.
+    frame: [Vec3f; 3],
+    lo: [f32; 3],
+    hi: [f32; 3],
+    /// Cells along the frame's first two axes, and each cell's size, metres.
+    cells: [usize; 2],
+    cell: [f32; 2],
+    /// Per cell (along the first axis, then rows up the second), the
+    /// housings whose box in the frame overlaps it, in order: cell k's are
+    /// `members[starts[k]..starts[k + 1]]`.
+    starts: Vec<u32>,
+    members: Vec<u32>,
+}
+
+thread_local! {
+    /// A lookup's housings from more than one cell, sorted (`HousingGroup::near`).
+    static HOUSINGS_NEAR: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl HousingGroup {
+    /// About one cell per housing, square on the face. Per build, each
+    /// housing's eight corners and the cells its box overlaps.
+    fn new(housings: Vec<Housing>) -> Option<HousingGroup> {
+        let first = *housings.first()?;
+        let frame = first.axes;
+        // Each housing's box in the frame, from its half extents along its own axes.
+        let boxes: Vec<([f32; 3], [f32; 3])> = housings
+            .iter()
+            .map(|h| {
+                let (mut lo, mut hi) = ([0.0f32; 3], [0.0f32; 3]);
+                for i in 0..3 {
+                    let c = h.centre.dot(frame[i]);
+                    let reach = (0..3).map(|k| h.axes[k].dot(frame[i]).abs() * [h.half.x, h.half.y, h.half.z][k]).sum::<f32>();
+                    (lo[i], hi[i]) = (c - reach, c + reach);
+                }
+                (lo, hi)
+            })
+            .collect();
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for (l, h) in &boxes {
+            for i in 0..3 {
+                lo[i] = lo[i].min(l[i]);
+                hi[i] = hi[i].max(h[i]);
+            }
+        }
+        let n = housings.len();
+        let (w, h) = ((hi[0] - lo[0]).max(1.0e-6), (hi[1] - lo[1]).max(1.0e-6));
+        let across = ((n as f32 * w / h).sqrt().round() as usize).clamp(1, n);
+        let cells = [across, n.div_ceil(across).clamp(1, n)];
+        let cell = [w / cells[0] as f32, h / cells[1] as f32];
+        let span = |b: &([f32; 3], [f32; 3]), i: usize| {
+            let at = |x: f32| (((x - lo[i]) / cell[i]).floor().max(0.0) as usize).min(cells[i] - 1);
+            at(b.0[i])..=at(b.1[i])
+        };
+        // Count each cell's housings, then lay them in, in order.
+        let mut starts = vec![0u32; cells[0] * cells[1] + 1];
+        for b in &boxes {
+            for y in span(b, 1) {
+                for x in span(b, 0) {
+                    starts[y * cells[0] + x + 1] += 1;
+                }
+            }
+        }
+        for k in 1..starts.len() {
+            starts[k] += starts[k - 1];
+        }
+        let mut fill = starts.clone();
+        let mut members = vec![0u32; *starts.last().unwrap() as usize];
+        for (j, b) in boxes.iter().enumerate() {
+            for y in span(b, 1) {
+                for x in span(b, 0) {
+                    let k = y * cells[0] + x;
+                    members[fill[k] as usize] = j as u32;
+                    fill[k] += 1;
+                }
+            }
+        }
+        // The group's cone: round the sphere holding its box.
+        let centre = (0..3).fold(Vec3f::default(), |s, i| s + frame[i] * (0.5 * (lo[i] + hi[i])));
+        let radius = (0..3).map(|i| (0.5 * (hi[i] - lo[i])).powi(2)).sum::<f32>().sqrt();
+        let (axis, cos_reach) = reach_cone(centre, radius);
+        let housings = housings
+            .into_iter()
+            .map(|h| {
+                let (axis, cos_reach) = reach_cone(h.centre, h.half.length());
+                (h, axis, cos_reach)
+            })
+            .collect();
+        Some(HousingGroup { housings, axis, cos_reach, frame, lo, hi, cells, cell, starts, members })
+    }
+
+    /// Calls `each` on every housing a view ray along `d` from the camera,
+    /// before `t_room`, can be drawn over by (`ray_to_box` within the edge
+    /// fade, where the ray enters it), in order; it may call it on a few
+    /// more. Those it leaves out add nothing. Per lookup: the group's cone,
+    /// the stretch of the ray within its box grown by the fade (six slab
+    /// sides), the cells under that stretch and their housings, sorted when
+    /// more than one cell holds them.
+    fn near(&self, d: Vec3f, t_room: f32, mut each: impl FnMut(&(Housing, Vec3f, f32))) {
+        if d.dot(self.axis) < self.cos_reach {
+            return;
+        }
+        // Where along the ray its point lies within the box grown by HOUSING_NEAR_M plus HOUSING_NEAR_SLOPE t.
+        let v = [d.dot(self.frame[0]), d.dot(self.frame[1]), d.dot(self.frame[2])];
+        let (mut t0, mut t1) = (0.0f32, t_room);
+        let mut clip = |slope: f32, from: f32| {
+            // slope t >= from
+            if slope > 0.0 {
+                t0 = t0.max(from / slope);
+            } else if slope < 0.0 {
+                t1 = t1.min(from / slope);
+            } else if from > 0.0 {
+                t1 = -1.0;
+            }
+        };
+        for i in 0..3 {
+            clip(v[i] + HOUSING_NEAR_SLOPE, self.lo[i] - HOUSING_NEAR_M);
+            clip(HOUSING_NEAR_SLOPE - v[i], -self.hi[i] - HOUSING_NEAR_M);
+        }
+        if !(t0 <= t1) {
+            return;
+        }
+        // The cells under that stretch, grown by its reach at its far end.
+        let grow = HOUSING_NEAR_M + HOUSING_NEAR_SLOPE * t1;
+        let mut range = [0..=0, 0..=0];
+        for i in 0..2 {
+            let (a, b) = (t0 * v[i], t1 * v[i]);
+            let at = |x: f32| (((x - self.lo[i]) / self.cell[i]).floor().max(0.0) as usize).min(self.cells[i] - 1);
+            range[i] = if t1.is_finite() { at(a.min(b) - grow)..=at(a.max(b) + grow) } else { 0..=self.cells[i] - 1 };
+        }
+        let cell = |x: usize, y: usize| {
+            let k = y * self.cells[0] + x;
+            &self.members[self.starts[k] as usize..self.starts[k + 1] as usize]
+        };
+        let ([x0, x1], [y0, y1]) = ([*range[0].start(), *range[0].end()], [*range[1].start(), *range[1].end()]);
+        if x0 == x1 && y0 == y1 {
+            for &j in cell(x0, y0) {
+                each(&self.housings[j as usize]);
+            }
+            return;
+        }
+        let mut near = HOUSINGS_NEAR.with(|n| std::mem::take(&mut *n.borrow_mut()));
+        near.clear();
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                near.extend_from_slice(cell(x, y));
+            }
+        }
+        near.sort_unstable();
+        near.dedup();
+        for &j in &near {
+            each(&self.housings[j as usize]);
+        }
+        HOUSINGS_NEAR.with(|n| *n.borrow_mut() = near);
     }
 }
 
@@ -414,10 +683,36 @@ pub struct Hit {
     plane: Option<usize>,
     /// It is an open wall: the ray leaves the room there.
     pub open: bool,
+    /// What of a real window it is (`WindowPart`): none off them.
+    pub window: WindowPart,
+    /// A styled window's own paint there (`room_window::Styled`): its
+    /// albedo, in place of the room's surfaces'.
+    paint: Option<Vec3f>,
 }
 
-/// One open wall (`Room::openings`): its middle, the way into the room, its
-/// own axes along the wall (horizontal `u`, up `v`) and its half sizes along them, metres.
+/// What of a real window a ray meets (`Hit::window`): nothing of one, its
+/// reveal (the wall's depth round it: the jambs, the head and the sill), its
+/// frame or a bar (their faces and their sides), or a pane's glass, with how
+/// much glass it holds (`RoomWindow::glass`: 0 an open hole).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum WindowPart {
+    #[default]
+    None,
+    Reveal,
+    Bar,
+    Glass(f32),
+    /// A styled window's frame, a sash or its bars (`room_window`).
+    Frame,
+    /// A styled window's surround on the wall's room face, a door's handles.
+    Surround,
+    /// A door's leaf.
+    Door,
+}
+
+/// One open wall or real window (`Room::openings`): its middle, the way into
+/// the room, its own axes along the wall (horizontal `u`, up `v`) and its half
+/// sizes along them, metres, and the share of it that is open (`glass`: 1 for
+/// an open wall, a real window's panes without its frame and bars).
 #[derive(Clone, Copy, Debug)]
 pub struct Opening {
     pub center: Vec3f,
@@ -425,6 +720,160 @@ pub struct Opening {
     pub u: Vec3f,
     pub v: Vec3f,
     pub half: Vec2f,
+    pub glass: f32,
+}
+
+/// The ground under a room whose floor side is open (`RoomParams::open_floor`)
+/// at a floor point: its albedo, how much it mirrors and how blurred.
+#[derive(Clone, Copy, Debug)]
+pub struct GroundAt {
+    pub albedo: Vec3f,
+    pub gloss: f32,
+    pub roughness: f32,
+}
+
+/// The scene's ground as a room standing on it reads it: a floor point (in the
+/// room's frame, the camera at the origin) to the ground there, and the
+/// ground's mean albedo (the bounce's). Shared with the outside it is read
+/// from, so it reads the ground's near relief once that is handed in.
+#[derive(Clone)]
+pub struct Ground {
+    pub at: std::sync::Arc<dyn Fn(Vec3f) -> GroundAt + Send + Sync>,
+    pub mean: Vec3f,
+}
+
+impl std::fmt::Debug for Ground {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ground").field("mean", &self.mean).finish()
+    }
+}
+
+/// A real window (`RoomWindow`) as the room casts into it: the plane it lies
+/// in (WEST .. SOUTH), its rectangle (`Opening`'s middle, axes and half
+/// sizes), its frame's and bars' half width and its panes' size along `u` and `v`.
+#[derive(Clone, Debug)]
+struct RealWindow {
+    plane: usize,
+    center: Vec3f,
+    u: Vec3f,
+    v: Vec3f,
+    half: Vec2f,
+    bar: f32,
+    pane: Vec2f,
+    /// Out of the room, through the wall.
+    out: Vec3f,
+    /// The wall's thickness round it (its reveal), the frame's middle this far
+    /// into it, and the frame's and bars' own depth.
+    depth: f32,
+    set: f32,
+    bar_depth: f32,
+    /// Its panes' glass (`RoomWindow::glass`).
+    glass_amount: f32,
+    /// A styled window or a door (`RoomWindow::is_plain` false): its own
+    /// shape, which `trace` and `glass` then leave to it.
+    styled: Option<Box<Styled>>,
+}
+
+impl RealWindow {
+    /// What a ray from the room along `d` meets once it crosses the wall's
+    /// inner face at `at` inside the window's rectangle: how much further it
+    /// runs, the surface's normal and the part. The wall's depth makes a
+    /// reveal round the window (the ray leaves the rectangle sideways before
+    /// the frame: a jamb, the head or the sill); the frame and the bars stand
+    /// `bar_depth` deep round `set` (their faces, and their sides where the
+    /// ray crosses into one between its faces); past them the ray meets the
+    /// pane's glass at `set`. None off the rectangle or for a ray going back.
+    fn trace(&self, at: Vec3f, d: Vec3f) -> Option<(f32, Vec3f, WindowPart)> {
+        let q = at - self.center;
+        let (u0, v0) = (q.dot(self.u), q.dot(self.v));
+        if !(u0.abs() <= self.half.x && v0.abs() <= self.half.y) {
+            return None;
+        }
+        let dz = d.dot(self.out);
+        if !(dz > 1.0e-6) {
+            return None;
+        }
+        let (du, dv) = (d.dot(self.u), d.dot(self.v));
+        let side = |c: f32, dc: f32, half: f32| {
+            if dc > 1.0e-9 {
+                (half - c) / dc
+            } else if dc < -1.0e-9 {
+                (-half - c) / dc
+            } else {
+                f32::INFINITY
+            }
+        };
+        let (su, sv) = (side(u0, du, self.half.x), side(v0, dv, self.half.y));
+        let (s_side, side_normal) = if su < sv { (su, self.u * -du.signum()) } else { (sv, self.v * -dv.signum()) };
+        let front = (self.set - 0.5 * self.bar_depth).max(0.0) / dz;
+        let back = (self.set + 0.5 * self.bar_depth).min(self.depth) / dz;
+        if s_side < front {
+            return Some((s_side.max(0.0), side_normal, WindowPart::Reveal));
+        }
+        if !self.opens(at + d * front) {
+            return Some((front, -self.out, WindowPart::Bar));
+        }
+        if s_side < back {
+            // the frame's inner edge, round the rectangle
+            return Some((s_side, side_normal, WindowPart::Bar));
+        }
+        if !self.opens(at + d * back) {
+            // a bar's side, the one the ray runs into between the faces
+            let normal = if du.abs() * self.pane.y > dv.abs() * self.pane.x { self.u * -du.signum() } else { self.v * -dv.signum() };
+            return Some((0.5 * (front + back), normal, WindowPart::Bar));
+        }
+        Some((self.set / dz, -self.out, WindowPart::Glass(self.glass_amount)))
+    }
+
+    /// The share of the light outside that comes in through its panes' glass (a
+    /// clear pane's mean Fresnel loss, about a tenth, and a little absorption).
+    fn transmission(&self) -> f32 {
+        1.0 - 0.12 * self.glass_amount
+    }
+
+    /// A point in the window's own frame (`room_window`): along the wall, up, out through it.
+    fn local(&self, p: Vec3f) -> Vec3f {
+        let q = p - self.center;
+        vec3f(q.dot(self.u), q.dot(self.v), q.dot(self.out))
+    }
+
+    fn local_dir(&self, d: Vec3f) -> Vec3f {
+        vec3f(d.dot(self.u), d.dot(self.v), d.dot(self.out))
+    }
+
+    /// A direction of the window's own frame in the room's.
+    fn world(&self, n: Vec3f) -> Vec3f {
+        self.u * n.x + self.v * n.y + self.out * n.z
+    }
+
+    /// The share of the outside's light it lets through: a plain window's
+    /// panes' share and its glass's transmission, a styled one's own.
+    fn passes(&self) -> f32 {
+        match &self.styled {
+            Some(styled) => styled.share,
+            None => self.glass() * self.transmission(),
+        }
+    }
+
+    /// The share of its rectangle its panes leave open (its frame and bars closed).
+    fn glass(&self) -> f32 {
+        let (w, h) = (2.0 * self.half.x, 2.0 * self.half.y);
+        let (open_w, open_h) = ((w - 2.0 * self.bar * (w / self.pane.x)).max(0.0), (h - 2.0 * self.bar * (h / self.pane.y)).max(0.0));
+        (open_w * open_h / (w * h).max(1.0e-6)).clamp(0.0, 1.0)
+    }
+
+    /// The point `p` on its plane lies in one of its panes (off the frame and the bars).
+    fn opens(&self, p: Vec3f) -> bool {
+        let q = p - self.center;
+        let (u, v) = (q.dot(self.u), q.dot(self.v));
+        if !(u.abs() < self.half.x && v.abs() < self.half.y) {
+            return false;
+        }
+        // where it lies in its pane, from the pane's lower left corner: a bar (half of one on each side of a line,
+        // the frame's on the outer edges) takes `bar` from every edge
+        let (iu, iv) = ((u + self.half.x).rem_euclid(self.pane.x), (v + self.half.y).rem_euclid(self.pane.y));
+        iu > self.bar && iu < self.pane.x - self.bar && iv > self.bar && iv < self.pane.y - self.bar
+    }
 }
 
 /// A bright disc outside (the sun, the moon) shining in through the open
@@ -463,29 +912,6 @@ struct PlaneGrid {
     kinked: Vec<u32>,
 }
 
-/// A road on the floor (`RoadParams`) as the room draws it: `across` and
-/// `along` are the floor's axes across and along the road (x and z for a road
-/// running north to south), `centre` the road's middle line and `anchor` the
-/// middle of a dash, in those coordinates.
-#[derive(Clone, Debug)]
-struct Road {
-    along_z: bool,
-    centre: f32,
-    anchor: f32,
-    half: f32,
-    lane: f32,
-    lanes: u32,
-    line_half: f32,
-    asphalt: Vec3f,
-    variation: f32,
-    paint: Vec3f,
-    edge_lines: bool,
-    dash: f32,
-    gap: f32,
-    gloss: f32,
-    roughness: f32,
-}
-
 #[derive(Debug)]
 pub struct Room {
     min: Vec3f,
@@ -494,13 +920,30 @@ pub struct Room {
     walls: CoveWalls,
     /// Which planes stand open (indexed as FLOOR .. SOUTH; only walls do).
     open: [bool; 6],
+    /// The real windows in the closed walls (`RoomParams::windows`).
+    real: Vec<RealWindow>,
+    /// Some of them are styled (`RealWindow::styled`): their reveals take
+    /// their daylight from their glass, and their surrounds stand in the room.
+    styled: bool,
+    /// The floor side stands open: the floor is the scene's ground (`ground`)
+    /// in place of `floor`, where the ground has been handed in (`with_ground`).
+    open_floor: bool,
+    /// The scene's ground outside a hybrid room (`with_ground`): under an open
+    /// floor the floor itself, and past the openings what the room's lights
+    /// fall on out there (`lamps_outside`).
+    ground: Option<Ground>,
     floor: Vec3f,
     wall: Vec3f,
     ceiling: Vec3f,
+    /// What the floor, the walls and the ceiling are made of (`room_material`); None the flat colour.
+    floor_material: Option<RoomMaterial>,
+    wall_material: Option<RoomMaterial>,
+    ceiling_material: Option<RoomMaterial>,
+    /// How worn they are (`RoomParams::wear`).
+    wear: f32,
     gloss: f32,
     roughness: f32,
     bounce: f32,
-    road: Option<Road>,
     lights: Vec<RoomLight>,
     /// The lights whose beam nothing shapes (summed into the grids) and the others, as indices into `lights`.
     smooth: Vec<usize>,
@@ -512,6 +955,8 @@ pub struct Room {
     /// The even irradiance the room bounces round itself.
     ambient: Vec3f,
     rods: Vec<Rod>,
+    /// The light fittings' bodies, one group per light (`HousingGroup`).
+    housings: Vec<HousingGroup>,
     /// The ceiling grid's spacing, metres; None without one.
     grid: Option<f32>,
     /// Each plane's grid of the smooth lights' irradiance (`with_grids`); None sums them per lookup.
@@ -538,10 +983,7 @@ fn mul(a: Vec3f, b: Vec3f) -> Vec3f {
     vec3f(a.x * b.x, a.y * b.y, a.z * b.z)
 }
 
-fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
-    let t = ((x - e0) / (e1 - e0)).max(0.0).min(1.0);
-    t * t * (3.0 - 2.0 * t)
-}
+use makepad_draw::smoothstep as smooth;
 
 /// The share of the window `x - w/2 .. x + w/2` that lies inside `-half ..
 /// half`: a stripe `2 half` wide box-filtered over a footprint `w` wide.
@@ -552,111 +994,6 @@ fn stripe(x: f32, half: f32, w: f32) -> f32 {
     let lo = (x - 0.5 * w).max(-half);
     let hi = (x + 0.5 * w).min(half);
     ((hi - lo) / w).max(0.0).min(1.0)
-}
-
-/// The share of `s - w/2 .. s + w/2` that dashes `dash` long, `gap` apart,
-/// the first starting at 0, cover: the dashes box-filtered over `w`.
-fn dashes(s: f32, dash: f32, gap: f32, w: f32) -> f32 {
-    let period = dash + gap;
-    // How much of 0..x the dashes cover (x of any sign).
-    let on = |x: f32| {
-        let k = (x / period).floor();
-        k * dash + (x - k * period).max(0.0).min(dash)
-    };
-    if !(w > 1.0e-6) {
-        let k = s - (s / period).floor() * period;
-        return if k < dash { 1.0 } else { 0.0 };
-    }
-    ((on(s + 0.5 * w) - on(s - 0.5 * w)) / w).max(0.0).min(1.0)
-}
-
-impl Road {
-    fn new(p: &RoadParams, min: Vec3f, max: Vec3f) -> Road {
-        let p = p.clamped();
-        let along_z = max.z - min.z >= max.x - min.x;
-        let middle = (min + max) * 0.5;
-        let (centre, anchor) = if along_z { (middle.x, middle.z) } else { (middle.z, middle.x) };
-        Road {
-            along_z,
-            centre,
-            anchor: anchor - 0.5 * p.dash_m,
-            half: 0.5 * p.lanes as f32 * p.lane_width_m,
-            lane: p.lane_width_m,
-            lanes: p.lanes,
-            line_half: 0.5 * p.line_width_m,
-            asphalt: rgb(p.asphalt),
-            variation: p.variation,
-            paint: Vec3f::all(p.paint),
-            edge_lines: p.edge_lines,
-            dash: p.dash_m,
-            gap: p.gap_m,
-            gloss: p.gloss,
-            roughness: p.roughness,
-        }
-    }
-
-    /// The floor point `pos` (seen from the camera at its distance) in the
-    /// road's coordinates, and the footprint of a LINE_FOOT texel there
-    /// across and along the road, metres.
-    fn place(&self, pos: Vec3f) -> (f32, f32, f32, f32) {
-        let (across, along) = if self.along_z { (pos.x - self.centre, pos.z - self.anchor) } else { (pos.z - self.centre, pos.x - self.anchor) };
-        let t = pos.length();
-        let flat = vec2f(pos.x, pos.z).length().max(1.0e-6);
-        // The texel's footprint on the floor: t LINE_FOOT across the view, stretched by 1 / sin(depression) along it.
-        let foot = t * LINE_FOOT;
-        let stretch = t / (-pos.y).max(0.02 * t);
-        let (hx, hz) = (pos.x / flat, pos.z / flat);
-        let (h_across, h_along) = if self.along_z { (hx, hz) } else { (hz, hx) };
-        let w_across = foot * ((h_across * stretch).powi(2) + h_along * h_along).sqrt();
-        let w_along = foot * ((h_along * stretch).powi(2) + h_across * h_across).sqrt();
-        (across, along, w_across, w_along)
-    }
-
-    /// How much of the texel at floor point `pos` the road covers, filtered.
-    fn cover(&self, pos: Vec3f) -> f32 {
-        let (across, _, w_across, _) = self.place(pos);
-        stripe(across, self.half, w_across)
-    }
-
-    /// The floor's albedo at `pos` where the road lies: the asphalt, its
-    /// patches and its paint, blended into `floor` across the road's edge.
-    fn albedo(&self, pos: Vec3f, floor: Vec3f) -> Vec3f {
-        let (across, along, w_across, w_along) = self.place(pos);
-        let road = stripe(across, self.half, w_across);
-        if !(road > 0.0) {
-            return floor;
-        }
-        let (x, y) = (across / ROAD_PATCH_M, along / ROAD_PATCH_M);
-        let asphalt = self.asphalt * (1.0 + self.variation * 1.2 * (fbm2(x, y, 3, ROAD_SEED) - 0.5));
-        let mut paint = 0.0f32;
-        if self.edge_lines {
-            let edge = self.half - self.line_half;
-            paint += stripe(across - edge, self.line_half, w_across) + stripe(across + edge, self.line_half, w_across);
-        }
-        for k in 1..self.lanes {
-            let at = -self.half + k as f32 * self.lane;
-            let line = stripe(across - at, self.line_half, w_across);
-            if line > 0.0 {
-                paint += line * if self.gap > 0.0 { dashes(along, self.dash, self.gap, w_along) } else { 1.0 };
-            }
-        }
-        let paint = paint.min(1.0);
-        let surface = asphalt + (self.paint - asphalt) * paint;
-        floor + (surface - floor) * road
-    }
-
-    /// The road's mean albedo, its paint's share in.
-    fn mean(&self) -> Vec3f {
-        let width = 2.0 * self.half;
-        let mut paint = 0.0;
-        if self.edge_lines {
-            paint += 4.0 * self.line_half;
-        }
-        let dashed = if self.gap > 0.0 { self.dash / (self.dash + self.gap) } else { 1.0 };
-        paint += (self.lanes.saturating_sub(1)) as f32 * 2.0 * self.line_half * dashed;
-        let share = (paint / width).min(1.0);
-        self.asphalt + (self.paint - self.asphalt) * share
-    }
 }
 
 impl Room {
@@ -675,19 +1012,28 @@ impl Room {
         let [north, south, east, west] = p.open();
         let mut open = [false; 6];
         (open[NORTH], open[SOUTH], open[EAST], open[WEST]) = (north, south, east, west);
+        let real: Vec<RealWindow> = p.real_windows().iter().filter_map(|window| real_window(window, min, max, &open, rgb(p.wall), rgb(p.floor))).collect();
+        let styled = real.iter().any(|w| w.styled.is_some());
         let mut room = Room {
             min,
             max,
             cove,
             walls,
             open,
+            real,
+            styled,
+            open_floor: p.open_floor(),
+            ground: None,
             floor: rgb(p.floor),
             wall: rgb(p.wall),
             ceiling: rgb(p.ceiling),
+            floor_material: p.floor_material.as_deref().and_then(RoomMaterial::from_name),
+            wall_material: p.wall_material.as_deref().and_then(RoomMaterial::from_name),
+            ceiling_material: p.ceiling_material.as_deref().and_then(RoomMaterial::from_name),
+            wear: p.wear.unwrap_or(ROOM_WEAR_DEFAULT),
             gloss: p.floor_gloss,
             roughness: p.floor_roughness,
             bounce: p.bounce,
-            road: p.road.as_ref().map(|road| Road::new(road, min, max)),
             lights: Vec::new(),
             smooth: Vec::new(),
             shaped: Vec::new(),
@@ -695,6 +1041,7 @@ impl Room {
             windows: Vec::new(),
             ambient: Vec3f::default(),
             rods: Vec::new(),
+            housings: Vec::new(),
             grid: if p.ceiling_grid { Some(p.grid_spacing_m) } else { None },
             grids: Default::default(),
             mirror: None,
@@ -730,9 +1077,64 @@ impl Room {
                     NORTH => (vec3f(0.0, 0.0, 1.0), vec3f(mid.x, y, lo.z), vec3f(1.0, 0.0, 0.0), half.x),
                     _ => (vec3f(0.0, 0.0, -1.0), vec3f(mid.x, y, hi.z), vec3f(1.0, 0.0, 0.0), half.x),
                 };
-                Opening { center, normal, u, v: up, half: vec2f(half_u, half_y) }
+                Opening { center, normal, u, v: up, half: vec2f(half_u, half_y), glass: 1.0 }
             })
+            .chain(self.real.iter().map(|w| Opening { center: w.center, normal: plane_normal(w.plane), u: w.u, v: w.v, half: w.half, glass: w.passes() }))
             .collect()
+    }
+
+    /// The scene's ground round a hybrid room: past its openings the room's
+    /// lights light it (`lamps_outside`), and with the floor side open the
+    /// floor reads its albedo, gloss and roughness from it. Before the lights
+    /// (`with_lights`), whose bounce takes the ground's mean albedo.
+    pub fn with_ground(mut self, ground: Ground) -> Room {
+        self.ground = Some(ground);
+        self
+    }
+
+    /// The ground the floor is, where the room stands on it.
+    fn floor_ground(&self) -> Option<&Ground> {
+        if self.open_floor { self.ground.as_ref() } else { None }
+    }
+
+    /// The room's floor is the scene's ground (`with_ground`).
+    pub fn on_ground(&self) -> bool {
+        self.open_floor
+    }
+
+    /// A real window where a window light (a fake window) is seen: on the
+    /// closed wall the camera sees along `d` (unit, the light's middle),
+    /// `width_rad` x `height_rad` across as the camera sees it there, with
+    /// `panes` and a `frame_m` frame. None when `d` meets the floor, the
+    /// ceiling or an open wall.
+    pub fn window_seen(&self, d: Vec3f, width_rad: f32, height_rad: f32, panes: (u32, u32), frame_m: f32) -> Option<RoomWindow> {
+        let hit = self.cast(Vec3f::default(), d)?;
+        let plane = hit.plane?;
+        if !(WEST..=SOUTH).contains(&plane) || self.open[plane] {
+            return None;
+        }
+        let mid = (self.min + self.max) * 0.5;
+        let p = hit.pos;
+        // `RoomWindow::along_m`: toward the east on the north and south walls, toward the north (-z) on the others
+        let (wall, along) = match plane {
+            NORTH => ("north", p.x - mid.x),
+            SOUTH => ("south", p.x - mid.x),
+            EAST => ("east", mid.z - p.z),
+            _ => ("west", mid.z - p.z),
+        };
+        let (width, height) = (2.0 * hit.t * (0.5 * width_rad).tan(), 2.0 * hit.t * (0.5 * height_rad).tan());
+        let window = RoomWindow {
+            wall: wall.to_string(),
+            along_m: along,
+            sill_m: (p.y - self.min.y - 0.5 * height).max(0.0),
+            width_m: width,
+            height_m: height,
+            panes_x: panes.0.max(1),
+            panes_y: panes.1.max(1),
+            frame_m,
+            ..RoomWindow::default()
+        };
+        Some(window.clamped())
     }
 
     /// The outside's light through the open walls: `windows`, each opening
@@ -752,33 +1154,30 @@ impl Room {
     pub fn with_lights(mut self, lights: Vec<RoomLight>, stands: &[Stand]) -> Room {
         // The bounce: each light puts out pi I0 (a Lambertian face), which the
         // room's mean albedo hands round its whole area until it is absorbed.
-        // An open wall reflects nothing; a road takes its share of the floor.
+        // An open wall reflects nothing; a floor on the ground bounces the ground's mean.
         let size = self.max - self.min;
         let (floor_area, ceiling_area) = (size.x * size.z, size.x * size.z);
         let wall_areas = [size.y * size.z, size.y * size.z, size.y * size.x, size.y * size.x];
         let wall_area: f32 = wall_areas.iter().sum();
         let openings = self.openings();
-        let open_area: f32 = openings.iter().map(|o| 4.0 * o.half.x * o.half.y).sum();
+        // (a styled window or a door is open only where its glass is; a plain one counts whole, as it always has)
+        let open_walls = openings.len() - self.real.len();
+        let pass: Vec<f32> = (0..openings.len()).map(|i| if i < open_walls { 1.0 } else { self.real[i - open_walls].styled.as_ref().map_or(1.0, |s| s.share) }).collect();
+        let open_area: f32 = openings.iter().zip(&pass).map(|(o, pass)| 4.0 * o.half.x * o.half.y * pass).sum();
         let closed_wall = (wall_area - open_area).max(0.0);
         let area = floor_area + wall_area + ceiling_area;
-        let floor_mean = match &self.road {
-            Some(road) => {
-                let (lo, hi) = if road.along_z { (self.min.x, self.max.x) } else { (self.min.z, self.max.z) };
-                let covered = ((road.centre + road.half).min(hi) - (road.centre - road.half).max(lo)).max(0.0) / (hi - lo).max(1.0e-6);
-                self.floor + (road.mean() - self.floor) * covered
-            }
-            None => self.floor,
-        };
+        let floor_mean = self.floor_ground().map_or(self.floor, |g| g.mean);
         let mean = (floor_mean * floor_area + self.wall * closed_wall + self.ceiling * ceiling_area) / area;
-        let mut put_out = lights.iter().fold(Vec3f::default(), |sum, l| sum + l.intensity * std::f32::consts::PI);
+        // a face puts out pi times its intensity along its normal, a flame 4 pi times its intensity
+        let mut put_out = lights.iter().fold(Vec3f::default(), |sum, l| sum + l.intensity * (if l.omni { 4.0 } else { 1.0 } * std::f32::consts::PI));
         // An opening puts in pi times its radiance over its area, as a Lambertian face filling it does.
         for (opening, radiance) in &self.windows {
             put_out += *radiance * (std::f32::consts::PI * 4.0 * opening.half.x * opening.half.y);
         }
         // A disc outside puts in its irradiance over each opening it shines in through, as the opening faces it.
         for sun in &self.daylight {
-            for opening in &openings {
-                put_out += sun.irradiance * (opening.half.x * opening.half.y * 4.0 * (-opening.normal.dot(sun.dir)).max(0.0));
+            for (opening, pass) in openings.iter().zip(&pass) {
+                put_out += sun.irradiance * (opening.half.x * opening.half.y * 4.0 * (-opening.normal.dot(sun.dir)).max(0.0) * pass);
             }
         }
         let keep = |a: f32| a.min(0.95) / (1.0 - a.min(0.95));
@@ -812,6 +1211,13 @@ impl Room {
         self
     }
 
+    /// Puts the light fittings' bodies in (pattern.rs `housings`), one list
+    /// per light, drawn over the room as the stands are, in that order.
+    pub fn with_housings(mut self, housings: Vec<Vec<Housing>>) -> Room {
+        self.housings = housings.into_iter().filter_map(HousingGroup::new).collect();
+        self
+    }
+
     /// Lays each plane's grid of the smooth lights' irradiance (rows spread
     /// by `run`). The same grids whatever the map's width, so every lookup
     /// (a bake at any size, the keyless copy, the key) reads the same room.
@@ -841,11 +1247,11 @@ impl Room {
                 .smooth
                 .iter()
                 .copied()
-                .filter(|&i| corners.iter().any(|c| self.lights[i].normal.dot(*c - self.lights[i].pos) > 0.0))
+                .filter(|&i| corners.iter().any(|c| self.lights[i].fronts(*c)))
                 .filter_map(|i| {
                     let l = &self.lights[i];
                     let d = (l.pos - corners[0]).dot(normal);
-                    let lit = if l.normal.dot(normal) < 0.0 { d } else { d / Vec3f::cross(l.normal, normal).length().max(1.0e-6) };
+                    let lit = if l.omni || l.normal.dot(normal) < 0.0 { d } else { d / Vec3f::cross(l.normal, normal).length().max(1.0e-6) };
                     (d > 0.0).then(|| (lit.max(l.near.sqrt()).max(GRID_NEAR_M), i))
                 })
                 .collect();
@@ -879,7 +1285,7 @@ impl Room {
                 .copied()
                 .filter(|&i| {
                     let l = &self.lights[i];
-                    let front = corners.iter().filter(|c| l.normal.dot(**c - l.pos) > 0.0).count();
+                    let front = corners.iter().filter(|c| l.fronts(**c)).count();
                     front < 4
                 })
                 .map(|i| i as u32)
@@ -972,7 +1378,8 @@ impl Room {
         run: &dyn Fn(usize, &(dyn Fn(usize) + Sync)),
     ) -> Room {
         self.texel = texel;
-        let glossy = self.gloss > 0.0 || self.road.as_ref().is_some_and(|road| road.gloss > 0.0);
+        // (the ground always mirrors a little: its asphalt's and its grass's sheen, a lake's water)
+        let glossy = self.gloss > 0.0 || self.floor_ground().is_some();
         if !glossy {
             return self;
         }
@@ -1167,8 +1574,40 @@ impl Room {
         below.min(ceiling)
     }
 
-    /// Where a ray from `o` (inside the room) along `d` (unit) meets the room.
+    /// Where a ray from `o` (inside the room) along `d` (unit) meets the room:
+    /// its shell (`cast_shell`), or nearer, a styled window's surround.
     pub fn cast(&self, o: Vec3f, d: Vec3f) -> Option<Hit> {
+        self.cast_seen(o, d, 0.0)
+    }
+
+    /// `cast` for a lookup whose footprint is `foot` radians across (a
+    /// map's texel): a styled window's bars are at least as wide as that
+    /// footprint where the ray meets them (`Styled::trace`).
+    fn cast_seen(&self, o: Vec3f, d: Vec3f, foot: f32) -> Option<Hit> {
+        let hit = self.cast_shell(o, d, foot);
+        if !self.styled {
+            return hit;
+        }
+        let mut best: Option<(f32, Vec3f, Vec3f, Paint)> = None;
+        for w in &self.real {
+            let Some(styled) = &w.styled else { continue };
+            let reach = best.map_or(hit.map_or(f32::INFINITY, |h| h.t), |b| b.0);
+            if let Some((t, n, paint)) = styled.parts(w.local(o), w.local_dir(d), reach) {
+                best = Some((t, w.world(n), styled.albedo(paint, 1.0), paint));
+            }
+        }
+        match best {
+            Some((t, normal, albedo, paint)) => {
+                let window = if paint == Paint::Door { WindowPart::Door } else { WindowPart::Surround };
+                Some(Hit { t, pos: o + d * t, normal, plane: None, open: false, window, paint: Some(albedo) })
+            }
+            None => hit,
+        }
+    }
+
+    /// Where a ray from `o` (inside the room) along `d` (unit) meets the
+    /// room's walls, floor, ceiling and coves, and the real windows in them.
+    fn cast_shell(&self, o: Vec3f, d: Vec3f, foot: f32) -> Option<Hit> {
         let exit = |lo: Vec3f, hi: Vec3f| -> (f32, Vec3f) {
             let mut t = f32::INFINITY;
             let mut n = Vec3f::default();
@@ -1199,7 +1638,38 @@ impl Room {
         let at = o + d * t_box;
         if self.cove <= 0.0 || self.sdf(at) > -1.0e-4 {
             let plane = plane_of(n_box);
-            return Some(Hit { t: t_box, pos: at, normal: n_box, plane: Some(plane), open: self.open[plane] });
+            if !self.open[plane] && plane >= WEST {
+                for w in self.real.iter().filter(|w| w.plane == plane) {
+                    let Some(styled) = &w.styled else {
+                        let Some((s, normal, part)) = w.trace(at, d) else { continue };
+                        let (t, pos) = (t_box + s, at + d * s);
+                        return Some(match part {
+                            WindowPart::Glass(_) => Hit { t, pos, normal, plane: Some(plane), open: true, window: part, paint: None },
+                            _ => Hit { t, pos, normal, plane: None, open: false, window: part, paint: None },
+                        });
+                    };
+                    let q = at - w.center;
+                    if !(q.dot(w.u).abs() <= w.half.x && q.dot(w.v).abs() <= w.half.y) {
+                        continue;
+                    }
+                    let Some(m) = styled.trace(w.local(at), w.local_dir(d), 0.5 * foot * (o - at).length()) else { continue };
+                    let (t, pos, normal) = (t_box + m.s, at + d * m.s, w.world(m.normal));
+                    return Some(match m.met {
+                        Met::Glass(glass) => Hit { t, pos, normal, plane: Some(plane), open: true, window: WindowPart::Glass(glass), paint: None },
+                        Met::Open => Hit { t, pos, normal, plane: Some(plane), open: true, window: WindowPart::Glass(0.0), paint: None },
+                        Met::Solid { paint, shade, reveal } => {
+                            let window = match paint {
+                                _ if reveal => WindowPart::Reveal,
+                                Paint::Door => WindowPart::Door,
+                                Paint::Surround | Paint::Metal => WindowPart::Surround,
+                                _ => WindowPart::Frame,
+                            };
+                            Hit { t, pos, normal, plane: None, open: false, window, paint: Some(styled.albedo(paint, shade)) }
+                        }
+                    });
+                }
+            }
+            return Some(Hit { t: t_box, pos: at, normal: n_box, plane: Some(plane), open: self.open[plane], window: WindowPart::None, paint: None });
         }
         // In a cove: the surface is between the box the cove rounds off and the planes.
         let r = self.cove;
@@ -1234,34 +1704,110 @@ impl Room {
             self.sdf(pos + vec3f(0.0, 0.0, e)) - self.sdf(pos - vec3f(0.0, 0.0, e)),
         );
         let normal = if g.length() > 1.0e-12 { g.normalize() } else { n_box };
-        Some(Hit { t, pos, normal, plane: None, open: false })
+        Some(Hit { t, pos, normal, plane: None, open: false, window: WindowPart::None, paint: None })
     }
 
-    /// The floor's albedo at `pos`: the room's, or its road's where it lies.
-    fn floor_at(&self, pos: Vec3f) -> Vec3f {
-        match &self.road {
-            Some(road) => road.albedo(pos, self.floor),
-            None => self.floor,
+    /// The surface where `hit` lands, seen at a footprint `foot` metres
+    /// across (`foot`): the floor's (the ground's on the flat floor of a room
+    /// standing on it), turned up through a cove into the wall's, or the
+    /// ceiling's, each its material's (`room_material`) or its flat colour.
+    /// A window's reveal is the wall's material on its own faces.
+    fn surface(&self, hit: &Hit, foot: f32) -> Surface {
+        let flat = |albedo: Vec3f| Surface { albedo, gloss: 1.0, roughness: 0.0 };
+        if let Some(paint) = hit.paint {
+            return flat(paint);
         }
-    }
-
-    /// The albedo where `hit` lands: the floor's (its road's on the flat
-    /// floor), turned up through a cove into the wall's, or the ceiling's.
-    fn albedo(&self, hit: &Hit) -> Vec3f {
+        // the frame and the bars are white paint, a little off the wall's colour
+        match hit.window {
+            WindowPart::Reveal => return self.side_surface(Side::Wall, hit.pos, hit.normal, foot),
+            WindowPart::Bar => return flat(vec3f(0.78, 0.78, 0.76)),
+            _ => {}
+        }
         if hit.normal.y < -0.5 {
-            return self.ceiling;
+            return self.side_surface(Side::Ceiling, hit.pos, hit.normal, foot);
         }
-        let floor = if hit.plane == Some(FLOOR) { self.floor_at(hit.pos) } else { self.floor };
         let k = smooth(0.25, 0.95, hit.normal.y);
-        self.wall + (floor - self.wall) * k
+        let floor = || match self.floor_ground().filter(|_| hit.plane == Some(FLOOR)) {
+            Some(ground) => flat((ground.at)(hit.pos).albedo),
+            None => self.side_surface(Side::Floor, hit.pos, hit.normal, foot),
+        };
+        if k >= 1.0 {
+            return floor();
+        }
+        let wall = self.side_surface(Side::Wall, hit.pos, hit.normal, foot);
+        if k <= 0.0 {
+            return wall;
+        }
+        let floor = floor();
+        Surface {
+            albedo: wall.albedo + (floor.albedo - wall.albedo) * k,
+            gloss: wall.gloss + (floor.gloss - wall.gloss) * k,
+            roughness: wall.roughness + (floor.roughness - wall.roughness) * k,
+        }
     }
 
-    /// The floor's gloss and roughness at floor point `pos`: its road's where it lies.
+    /// The floor, a wall or the ceiling at `pos` (a wall facing `normal`'s
+    /// level part: a cove's, a reveal's own face) for a footprint `foot`:
+    /// its material in its plane's own metres (a wall's up from the floor),
+    /// worn by where it lies in the room, or its flat colour.
+    fn side_surface(&self, side: Side, pos: Vec3f, normal: Vec3f, foot: f32) -> Surface {
+        let (base, material) = match side {
+            Side::Floor => (self.floor, self.floor_material),
+            Side::Wall => (self.wall, self.wall_material),
+            Side::Ceiling => (self.ceiling, self.ceiling_material),
+        };
+        let Some(material) = material else { return Surface { albedo: base, gloss: 1.0, roughness: 0.0 } };
+        let (plane, (u, v)) = match side {
+            Side::Floor => (FLOOR, (pos.x, pos.z)),
+            Side::Ceiling => (CEILING, (pos.x, pos.z)),
+            // a plain window's sill or head (level; a cove's normal never is this level on a wall): the wall it is cut
+            // through (the one its point lies furthest beyond), u along that wall as on its face and v across its depth
+            Side::Wall if normal.y.abs() > 0.99 => {
+                let in_x = (self.min.x - pos.x).max(pos.x - self.max.x) > (self.min.z - pos.z).max(pos.z - self.max.z);
+                let mid = (self.min + self.max) * 0.5;
+                if in_x {
+                    (if pos.x < mid.x { WEST } else { EAST }, (pos.z, pos.x))
+                } else {
+                    (if pos.z < mid.z { NORTH } else { SOUTH }, (pos.x, pos.z))
+                }
+            }
+            Side::Wall => {
+                let k = plane_of(vec3f(normal.x, 0.0, normal.z));
+                let (u, _) = plane_uv(k, pos);
+                (k, (u, pos.y - self.min.y))
+            }
+        };
+        // the distance to the nearest closed wall (on the floor and the ceiling, which have no top: infinitely far), or
+        // up from the floor and down from the ceiling (on a wall)
+        let (seam_m, top_m) = match side {
+            Side::Wall => (pos.y - self.min.y, self.max.y - pos.y),
+            _ => {
+                let gaps = [(WEST, pos.x - self.min.x), (EAST, self.max.x - pos.x), (NORTH, pos.z - self.min.z), (SOUTH, self.max.z - pos.z)];
+                (gaps.iter().filter(|(k, _)| !self.open[*k]).map(|(_, g)| *g).fold(f32::INFINITY, f32::min).max(0.0), f32::INFINITY)
+            }
+        };
+        // the open walls (mouths), each's distance and the point's place along its edge, and the nearest, for the leaks
+        let mouths = [(WEST, pos.x - self.min.x, pos.z), (EAST, self.max.x - pos.x, pos.z), (NORTH, pos.z - self.min.z, pos.x), (SOUTH, self.max.z - pos.z, pos.x)]
+            .map(|(k, g, along)| if self.open[k] { (g.max(0.0), along) } else { (f32::INFINITY, along) });
+        let open_m = mouths.iter().map(|m| m.0).fold(f32::INFINITY, f32::min);
+        let weather = Weather { side, seam_m, top_m, amount: self.wear, open_m, mouths };
+        room_material::surface(material, base, u, v, foot, &weather, 0x9e37_79b9u32.wrapping_mul(plane as u32 + 1))
+    }
+
+    /// The footprint, metres, of a lookup `texel` radians wide (a 2048 wide
+    /// map's for a point lookup) on `hit`, `reach` metres along the view `d`:
+    /// stretched along the view as the surface turns away from it.
+    fn foot(hit: &Hit, d: Vec3f, reach: f32, texel: f32) -> f32 {
+        let texel = if texel > 0.0 { texel } else { LINE_FOOT };
+        (texel * reach / hit.normal.dot(d).abs().max(0.05)).min(100.0)
+    }
+
+    /// The floor's gloss and roughness at floor point `pos`: the ground's where the room stands on it.
     fn gloss_at(&self, pos: Vec3f) -> (f32, f32) {
-        match &self.road {
-            Some(road) => {
-                let k = road.cover(pos);
-                (self.gloss + (road.gloss - self.gloss) * k, self.roughness + (road.roughness - self.roughness) * k)
+        match self.floor_ground() {
+            Some(ground) => {
+                let g = (ground.at)(pos);
+                (g.gloss, g.roughness)
             }
             None => (self.gloss, self.roughness),
         }
@@ -1269,21 +1815,55 @@ impl Room {
 
     /// The outside's light on a surface at `x` facing `n`: each opening's
     /// (`Opening::on`), and each disc's where a ray toward it leaves through an open wall.
+    /// In a styled window's opening (its reveal, its frames, a door's leaf)
+    /// the window's own opening lights it from its glass, deeper in the wall
+    /// (so a frame's face toward the room takes none of it), and the sun
+    /// reaches it only through that glass (`reaches_out`).
     fn daylight_on(&self, x: Vec3f, n: Vec3f) -> Vec3f {
+        let recess = if self.styled { self.real.iter().find(|w| w.styled.as_ref().is_some_and(|s| s.in_recess(w.local(x)))) } else { None };
         let mut e = Vec3f::default();
         for (opening, radiance) in &self.windows {
-            e += *radiance * opening.on(x, n);
+            match recess.and_then(|w| w.styled.as_ref().map(|s| (w, s))) {
+                Some((w, styled)) if (opening.center - w.center).length() < 1.0e-5 && opening.normal.dot(plane_normal(w.plane)) > 0.99 => {
+                    let glass = Opening { center: w.center + w.out * styled.glass_w, ..*opening };
+                    e += *radiance * glass.on(x, n);
+                }
+                _ => e += *radiance * opening.on(x, n),
+            }
         }
         for sun in &self.daylight {
             let facing = n.dot(sun.dir);
             if !(facing > 0.0) {
                 continue;
             }
-            if self.cast(x + n * 1.0e-3, sun.dir).is_some_and(|hit| hit.open) {
+            if self.reaches_out(x + n * 1.0e-3, sun.dir, recess) {
                 e += sun.irradiance * facing;
             }
         }
         e
+    }
+
+    /// A ray from `x` along `dir` leaves the room through an opening: from a
+    /// styled window's opening (`recess`), out through its glass, or back
+    /// into the room past its reveal and on out through another.
+    fn reaches_out(&self, x: Vec3f, dir: Vec3f, recess: Option<&RealWindow>) -> bool {
+        let Some((w, styled)) = recess.and_then(|w| w.styled.as_ref().map(|s| (w, s))) else {
+            return self.cast(x, dir).is_some_and(|hit| hit.open);
+        };
+        let (o, d) = (w.local(x), w.local_dir(dir));
+        if !(o.z > 0.0) {
+            // on the wall's room face (an arched head's corners, a door's lining): as anywhere in the room
+            return self.cast(x, dir).is_some_and(|hit| hit.open);
+        }
+        if d.z > 1.0e-6 {
+            return matches!(styled.trace(o, d, 0.0).map(|m| m.met), Some(Met::Glass(_) | Met::Open));
+        }
+        if !(d.z < -1.0e-6) {
+            return false;
+        }
+        let at = x + dir * (o.z / -d.z);
+        let face = w.local(at);
+        styled.opens_at(vec2f(face.x, face.y)) && self.cast(at + dir * 1.0e-4, dir).is_some_and(|hit| hit.open)
     }
 
     /// The irradiance at `x` on a surface facing `n`: every light's, through
@@ -1292,6 +1872,23 @@ impl Room {
         let mut e = self.ambient;
         for l in &self.lights {
             e += lit_by(l, x, n, beam);
+        }
+        if !self.daylight.is_empty() || !self.windows.is_empty() {
+            e += self.daylight_on(x, n);
+        }
+        e
+    }
+
+    /// The irradiance at `x` on a face of normal `n` (unit) from the room's
+    /// bounce, its daylight and every light whose entry `apart` does not
+    /// name, their beams unshaped: what lights a model standing in the room
+    /// besides its own light (light_model_candle.rs).
+    pub fn irradiance_apart(&self, x: Vec3f, n: Vec3f, apart: &dyn Fn(usize) -> bool) -> Vec3f {
+        let mut e = self.ambient;
+        for l in &self.lights {
+            if !apart(l.entry) {
+                e += light_on(l, x, n);
+            }
         }
         if !self.daylight.is_empty() || !self.windows.is_empty() {
             e += self.daylight_on(x, n);
@@ -1348,9 +1945,14 @@ impl Room {
         e
     }
 
-    /// What a diffuse surface at `hit` sends back.
-    fn diffuse(&self, hit: &Hit, beam: &dyn Fn(usize, Vec3f) -> f32) -> Vec3f {
-        mul(self.albedo(hit), self.surface_irradiance(hit, beam)) * std::f32::consts::FRAC_1_PI
+    /// What a diffuse surface at `hit` sends back, seen at a footprint `foot` metres across.
+    fn diffuse(&self, hit: &Hit, foot: f32, beam: &dyn Fn(usize, Vec3f) -> f32) -> Vec3f {
+        self.diffuse_of(hit, self.surface(hit, foot).albedo, beam)
+    }
+
+    /// What a diffuse surface at `hit` of `albedo` sends back.
+    fn diffuse_of(&self, hit: &Hit, albedo: Vec3f, beam: &dyn Fn(usize, Vec3f) -> f32) -> Vec3f {
+        mul(albedo, self.surface_irradiance(hit, beam)) * std::f32::consts::FRAC_1_PI
     }
 
     /// The room along `d` from the camera (unit, map frame), with stands and
@@ -1363,13 +1965,20 @@ impl Room {
     /// narrower than the map the mirror was built for filters its pixels over
     /// their own texel, as a pattern's lookup does, from the same room.
     pub fn radiance(&self, d: Vec3f, texel: f32, beam: &dyn Fn(usize, Vec3f) -> f32, sky: &dyn Fn(Vec3f) -> Vec3f, light: &dyn Fn(usize, Vec3f, f32) -> Vec3f) -> Vec3f {
-        let Some(hit) = self.cast(Vec3f::default(), d) else { return Vec3f::default() };
+        let Some(hit) = self.cast_seen(Vec3f::default(), d, texel) else { return Vec3f::default() };
         if hit.open {
-            return self.over_rigging(d, hit.t, sky(d), beam);
+            let mut c = sky(d) + self.lamps_outside(d, beam);
+            if let WindowPart::Glass(glass) = hit.window {
+                c = self.through_glass(&hit, d, glass, c, texel, beam, sky, light);
+            }
+            return self.over_rigging(d, hit.t, c, beam);
         }
-        let mut c = self.diffuse(&hit, beam);
+        let surface = self.surface(&hit, Self::foot(&hit, d, hit.t, texel));
+        let mut c = self.diffuse_of(&hit, surface.albedo, beam);
         // A glossy floor mirrors the room, the outside through its open walls, and the lights.
         let (gloss, roughness) = if hit.plane == Some(FLOOR) { self.gloss_at(hit.pos) } else { (self.gloss, self.roughness) };
+        // (at most 1: a glossier spot, oil on concrete, never mirrors more light than reaches it)
+        let (gloss, roughness) = ((gloss * surface.gloss).min(1.0), (roughness + surface.roughness).min(1.0));
         if gloss > 0.0 && hit.normal.y > 0.999 {
             let cos = (-d.y).max(0.0);
             let fresnel = gloss * (0.04 + 0.96 * (1.0 - cos).powi(5));
@@ -1385,11 +1994,71 @@ impl Room {
                 None => f32::INFINITY,
             };
             if let Some(mirror) = &self.mirror {
-                seen += mirror.look(o, r, reach, roughness, texel, light);
+                seen += mirror.look(o, r, reach, roughness, texel, light, false);
             }
             c = c * (1.0 - fresnel) + seen * fresnel;
         }
         self.over_rigging(d, hit.t, c, beam)
+    }
+
+    /// A real window's pane seen along `d` at `hit`, `outside` beyond it: the
+    /// glass (`glass` of it) lets the outside through less its Fresnel share
+    /// and a little absorption, and mirrors the room at that share, 4 % seen
+    /// straight on rising toward grazing: the room's surfaces where the
+    /// mirrored ray meets them (the outside again through an opening) and the
+    /// lights along it (`Mirror::look`, a polished surface's).
+    #[allow(clippy::too_many_arguments)]
+    fn through_glass(&self, hit: &Hit, d: Vec3f, glass: f32, outside: Vec3f, texel: f32, beam: &dyn Fn(usize, Vec3f) -> f32, sky: &dyn Fn(Vec3f) -> Vec3f, light: &dyn Fn(usize, Vec3f, f32) -> Vec3f) -> Vec3f {
+        if !(glass > 0.0) {
+            return outside;
+        }
+        let n = hit.normal;
+        let cos = (-d.dot(n)).clamp(0.0, 1.0);
+        let fresnel = glass * (0.04 + 0.96 * (1.0 - cos).powi(5));
+        let r = d - n * (2.0 * d.dot(n));
+        let o = hit.pos + n * 1.0e-3;
+        let mut seen = Vec3f::default();
+        let mut reach = f32::INFINITY;
+        if let Some(back) = self.cast(o, r) {
+            seen = if back.open { sky(r) } else { self.diffuse(&back, Self::foot(&back, r, hit.t + back.t, texel), beam) };
+            reach = back.t;
+        }
+        if let Some(mirror) = &self.mirror {
+            seen += mirror.look(o, r, reach, 0.0, texel.max(self.texel), light, true);
+        }
+        outside * ((1.0 - fresnel) * (1.0 - 0.04 * glass)) + seen * fresnel
+    }
+
+    /// The room's lights on the ground the camera sees along `d` past an
+    /// opening: the ground's albedo there under each light that reaches it
+    /// through an opening (its beam, the inverse square), so the light of a
+    /// tunnel's or a bridge's lamps runs on out of its mouths and fades,
+    /// where the outside itself (lightless, `sky`) has none of it. None
+    /// without the ground, above the horizon or past the light's reach.
+    fn lamps_outside(&self, d: Vec3f, beam: &dyn Fn(usize, Vec3f) -> f32) -> Vec3f {
+        let Some(ground) = &self.ground else { return Vec3f::default() };
+        if self.lights.is_empty() || !(d.y < -1.0e-4) {
+            return Vec3f::default();
+        }
+        let p = d * (self.min.y / d.y);
+        let up = vec3f(0.0, 1.0, 0.0);
+        let mut e = Vec3f::default();
+        for l in &self.lights {
+            let k = lit_by(l, p, up, beam);
+            if !(k.x + k.y + k.z > 0.0) {
+                continue;
+            }
+            // the way from the light to the ground point leaves the room through an opening, not a wall
+            let to = p - l.pos;
+            let reach = to.length();
+            if self.cast(l.pos, to * (1.0 / reach.max(1.0e-6))).is_some_and(|hit| hit.open && hit.t < reach) {
+                e += k;
+            }
+        }
+        if !(e.x + e.y + e.z > 0.0) {
+            return Vec3f::default();
+        }
+        mul((ground.at)(p).albedo, e) * std::f32::consts::FRAC_1_PI
     }
 
     /// What the floor at `o` mirrors of the room and the outside along `r`,
@@ -1401,21 +2070,23 @@ impl Room {
     /// is as blurred as its image of the sun, and a polished one's is sharp,
     /// its edge filtered over the map's texel `texel`.
     fn mirrored_room(&self, o: Vec3f, r: Vec3f, back: &Hit, roughness: f32, texel: f32, beam: &dyn Fn(usize, Vec3f) -> f32, sky: &dyn Fn(Vec3f) -> Vec3f) -> Vec3f {
+        // the room's image is as sharp as the camera's texel over the whole way, blurred by the floor's lobe
+        let foot = Self::foot(back, r, o.length() + back.t, texel) + roughness * roughness * back.t;
         if self.mouths.is_empty() {
-            return self.diffuse(back, beam);
+            return self.diffuse(back, foot, beam);
         }
         let lobe = Lobe::new(r, roughness, texel);
-        let open = self.mouths.iter().filter_map(|mouth| lobe.on(mouth, o)).map(|on| on.share()).sum::<f32>().min(1.0);
+        let open = self.mouths.iter().filter_map(|mouth| lobe.on(mouth, o).map(|on| on.share() * mouth.glass)).sum::<f32>().min(1.0);
         if !(open > 0.0) {
             // (where `r` leaves with no share, the filter's own rounding: it sees the outside)
-            return if back.open { self.outside_mirrored(r, roughness, texel, sky) } else { self.diffuse(back, beam) };
+            return if back.open { self.outside_mirrored(r, roughness, texel, sky) } else { self.diffuse(back, foot, beam) };
         }
         let inside = if open >= 1.0 {
             Vec3f::default()
         } else if back.open {
             self.beside_mouth(o, r, beam)
         } else {
-            self.diffuse(back, beam)
+            self.diffuse(back, foot, beam)
         };
         inside * (1.0 - open) + self.outside_mirrored(r, roughness, texel, sky) * open
     }
@@ -1453,7 +2124,8 @@ impl Room {
                 let w = 1.0 / (gap * gap + 1.0e-8);
                 if let Some(hit) = self.cast(mouth.center + from + mouth.normal * 0.01, out) {
                     if !hit.open {
-                        sum += self.diffuse(&hit, beam) * w;
+                        // (the room's mean there: a blend of four points needs no finer detail)
+                        sum += self.diffuse(&hit, BESIDE_MOUTH_FOOT, beam) * w;
                     }
                 }
                 weight += w;
@@ -1544,6 +2216,23 @@ impl Room {
                 c = c + (lit - c) * cover;
             }
         }
+        for group in &self.housings {
+            group.near(d, t_room, |(housing, axis, cos_reach)| {
+                if d.dot(*axis) < *cos_reach {
+                    return;
+                }
+                let Some((excess, t, normal)) = ray_to_box(d, housing) else { return };
+                if t >= t_room {
+                    return;
+                }
+                let w = foot * t;
+                let cover = smooth(w, -w, excess);
+                if cover > 0.0 {
+                    let lit = self.irradiance(d * t, normal, beam) * (housing.albedo * std::f32::consts::FRAC_1_PI);
+                    c = c + (lit - c) * cover;
+                }
+            });
+        }
         if let Some(spacing) = self.grid {
             let y = self.max.y - GRID_DROP;
             if d.y > 1.0e-4 {
@@ -1589,7 +2278,7 @@ fn light_on(l: &RoomLight, x: Vec3f, n: Vec3f) -> Vec3f {
 fn facing(l: &RoomLight, x: Vec3f, n: Vec3f) -> Option<(f32, Vec3f)> {
     let v = l.pos - x;
     // The cosines' signs first, before the distance: most pairs face away.
-    let (at_surface, at_light) = (n.dot(v), -l.normal.dot(v));
+    let (at_surface, at_light) = (n.dot(v), if l.omni { v.length() } else { -l.normal.dot(v) });
     if !(at_surface > 0.0) || !(at_light > 0.0) {
         return None;
     }
@@ -1625,6 +2314,49 @@ fn plane_normal(k: usize) -> Vec3f {
         NORTH => vec3f(0.0, 0.0, 1.0),
         _ => vec3f(0.0, 0.0, -1.0),
     }
+}
+
+/// A real window (`RoomWindow`, as clamp() holds it) in the room between `min`
+/// and `max`: its rectangle on its wall, held inside the wall (a hand's width
+/// off its edges), its frame and bars, and its panes; None on an open wall or
+/// where nothing of it is left inside the wall.
+fn real_window(p: &RoomWindow, min: Vec3f, max: Vec3f, open: &[bool; 6], wall: Vec3f, floor: Vec3f) -> Option<RealWindow> {
+    let p = p.clamped();
+    let plane = [NORTH, SOUTH, EAST, WEST][p.wall_index()];
+    if open[plane] {
+        return None;
+    }
+    let mid = (min + max) * 0.5;
+    let up = vec3f(0.0, 1.0, 0.0);
+    // its wall's own axis along it (`Room::openings`'), where the wall stands, and how far "along" points along it:
+    // toward the east on the north and south walls, toward the north (-z) on the east and west walls
+    let (u, wall_at, along_sign, span) = match plane {
+        NORTH => (vec3f(1.0, 0.0, 0.0), vec3f(mid.x, 0.0, min.z), 1.0, (min.x, max.x)),
+        SOUTH => (vec3f(1.0, 0.0, 0.0), vec3f(mid.x, 0.0, max.z), 1.0, (min.x, max.x)),
+        EAST => (vec3f(0.0, 0.0, 1.0), vec3f(max.x, 0.0, mid.z), -1.0, (min.z, max.z)),
+        _ => (vec3f(0.0, 0.0, 1.0), vec3f(min.x, 0.0, mid.z), -1.0, (min.z, max.z)),
+    };
+    const EDGE: f32 = 0.05;
+    let along = |a: Vec3f| a.dot(u);
+    let c = along(wall_at) + along_sign * p.along_m;
+    let (lo_u, hi_u) = ((c - 0.5 * p.width_m).max(span.0 + EDGE), (c + 0.5 * p.width_m).min(span.1 - EDGE));
+    // (a door runs down to the floor)
+    let (lo_v, hi_v) = if p.is_door() { (min.y, (min.y + p.height_m).min(max.y - EDGE)) } else { ((min.y + p.sill_m).max(min.y + EDGE), (min.y + p.sill_m + p.height_m).min(max.y - EDGE)) };
+    if !(hi_u - lo_u > 0.05 && hi_v - lo_v > 0.05) {
+        return None;
+    }
+    let half = vec2f(0.5 * (hi_u - lo_u), 0.5 * (hi_v - lo_v));
+    let center = wall_at - u * along(wall_at) + u * (0.5 * (lo_u + hi_u)) + up * (0.5 * (lo_v + hi_v));
+    let pane = vec2f(2.0 * half.x / p.panes_x as f32, 2.0 * half.y / p.panes_y as f32);
+    let bar = (0.5 * p.frame_m).min(0.45 * pane.x.min(pane.y));
+    let depth = p.depth_m.unwrap_or(ROOM_WINDOW_DEPTH_M).clamp(0.0, 1.0);
+    // the frame stands two thirds of the way out in the wall, as deep as its bars are wide (at most the wall)
+    let bar_depth = (2.0 * bar).min(depth);
+    let set = (0.65 * depth).max(0.5 * bar_depth).min((depth - 0.5 * bar_depth).max(0.5 * bar_depth));
+    let out = plane_normal(plane) * -1.0;
+    let glass_amount = p.glass.unwrap_or(1.0).clamp(0.0, 1.0);
+    let styled = (!p.is_plain()).then(|| Box::new(Styled::new(&p, half, depth, glass_amount, wall, floor, lo_v - min.y, max.y - hi_v)));
+    Some(RealWindow { plane, center, u, v: up, half, bar, pane, out, depth, set, bar_depth, glass_amount, styled })
 }
 
 /// A point of plane `k` in the plane's own coordinates: (x, z) on the floor
@@ -1825,7 +2557,10 @@ impl Mirror {
     /// (a light's own when it has the layer alone), and the layer is read
     /// once, with its first light. A light the ray runs away from (a floor
     /// point beyond that light) adds nothing.
-    fn look(&self, o: Vec3f, r: Vec3f, reach: f32, roughness: f32, texel: f32, light: &dyn Fn(usize, Vec3f, f32) -> Vec3f) -> Vec3f {
+    /// With `front_only` (a window's glass, which can look at a light from behind), a light's face seen from the
+    /// side away from the camera adds nothing: its back is the housing's.
+    #[allow(clippy::too_many_arguments)]
+    fn look(&self, o: Vec3f, r: Vec3f, reach: f32, roughness: f32, texel: f32, light: &dyn Fn(usize, Vec3f, f32) -> Vec3f, front_only: bool) -> Vec3f {
         let mut sum = Vec3f::default();
         let from_eye = o.length();
         for l in &self.lights {
@@ -1843,7 +2578,11 @@ impl Mirror {
                 }
             }
             if let Some(t) = l.proxy.meet(o, r, reach) {
-                if blurred < 1.0 {
+                let behind = match l.proxy {
+                    MirrorProxy::Plane { normal, offset } => front_only && !((o.dot(normal) - offset) * -offset > 0.0),
+                    MirrorProxy::Sphere { .. } => false,
+                };
+                if blurred < 1.0 && !behind {
                     let q = o + r * t;
                     let len = q.length().max(1.0e-4);
                     let foot = (texel * (from_eye + t) / len).max(2.0 * mirror_lobe(roughness, t, len));
@@ -1904,3 +2643,111 @@ fn ray_to_segment(d: Vec3f, a: Vec3f, b: Vec3f) -> Option<(f32, f32, Vec3f)> {
     let normal = if gap > 1.0e-9 { gap_v / gap } else { -d };
     Some((t, gap, normal))
 }
+/// Hybrid studios (2026-11-05): a room's sides open per wall and floor, its real windows, and an old room road.
+#[cfg(test)]
+mod hybrid_tests {
+    use super::*;
+    use crate::params::{FloorKind, RoadBeside, RoadParams, RoomSides, OPEN_WALL_NAMES};
+    use crate::presets::preset;
+
+    #[test]
+    fn every_old_open_walls_name_loads_to_the_same_walls() {
+        let (t, f) = (true, false);
+        let want = [
+            ("none", [f, f, f, f]),
+            ("back", [t, f, f, f]),
+            ("front", [f, t, f, f]),
+            ("ends", [t, t, f, f]),
+            ("east", [f, f, t, f]),
+            ("west", [f, f, f, t]),
+            ("sides", [f, f, t, t]),
+            ("all", [t, t, t, t]),
+        ];
+        assert_eq!(OPEN_WALL_NAMES.len(), want.len());
+        for (name, walls) in want {
+            let room = RoomParams { open_walls: Some(name.to_string()), ..RoomParams::default() };
+            assert_eq!(room.open(), walls, "{name}");
+            assert!(!room.open_floor(), "{name}: an old file's floor stays closed");
+            assert_eq!(room.is_hybrid(), walls.contains(&true), "{name}");
+        }
+        // `sides`, once written, wins over the old name
+        let room = RoomParams { open_walls: Some("all".to_string()), sides: Some(RoomSides { west: true, ..RoomSides::default() }), ..RoomParams::default() };
+        assert_eq!(room.open(), [f, f, f, t]);
+    }
+
+    #[test]
+    fn a_fake_window_alone_is_not_hybrid() {
+        let fake = preset("Wooden daylight").unwrap();
+        assert!(fake.lights.iter().any(|l| l.gobo.as_ref().is_some_and(|g| g.fill_sky)), "the preset has a window light");
+        assert!(!fake.is_hybrid(), "a window light is a fake window");
+        let mut real = fake.clone();
+        real.studio.room.get_or_insert_with(RoomParams::default).windows = Some(vec![RoomWindow::default()]);
+        assert!(real.is_hybrid(), "a real window opens the room");
+        let mut open = fake.clone();
+        open.studio.room.get_or_insert_with(RoomParams::default).sides = Some(RoomSides { east: true, ..RoomSides::default() });
+        assert!(open.is_hybrid(), "an open wall opens the room");
+        assert!(!preset("Clear noon").unwrap().is_hybrid(), "a sky is not a studio");
+        assert!(preset("Road tunnel").unwrap().is_hybrid() && preset("Bridge").unwrap().is_hybrid());
+    }
+
+    #[test]
+    fn an_old_room_road_becomes_the_grounds_road() {
+        let mut p = preset("Car studio").unwrap();
+        let room = p.studio.room.get_or_insert_with(RoomParams::default);
+        room.open_walls = Some("ends".to_string());
+        room.road = Some(RoadParams { lanes: 3, lane_width_m: 3.25, ..RoadParams::default() });
+        p.floor = None;
+        let fixed = p.clamp();
+        assert!(fixed.iter().any(|f| f == "studio.room.road"), "{fixed:?}");
+        let room = p.studio.room.as_ref().unwrap();
+        assert!(room.road.is_none());
+        assert_eq!(room.open(), [true, true, false, false], "its open walls carry over");
+        assert!(room.open_floor(), "it stands on the ground");
+        let floor = p.floor.as_ref().unwrap();
+        assert_eq!((floor.kind(), floor.lanes, floor.lane_width(), floor.beside()), (FloorKind::Road, 3, 3.25, RoadBeside::Room));
+        assert_eq!(floor.beside_color, Some(room.floor));
+        assert!(p.is_hybrid());
+        assert!(p.clamp().is_empty(), "moved once");
+    }
+
+    #[test]
+    fn a_real_window_opens_its_panes_and_keeps_its_bars() {
+        // the default room: 10 m wide, 12 deep, the camera 1.6 m up in its middle; the window in the back wall (z -6)
+        // from 1 m to 3 m above the floor (y -0.6 to 1.4 from the camera), x -1.5 to 1.5: 3 x 2 panes a metre square,
+        // bars 10 cm wide at x -0.5 and 0.5 and y 0.4
+        let window = RoomWindow { wall: "north".to_string(), along_m: 0.0, sill_m: 1.0, width_m: 3.0, height_m: 2.0, panes_x: 3, panes_y: 2, frame_m: 0.1, ..RoomWindow::default() };
+        let room = Room::new(&RoomParams { windows: Some(vec![window]), ..RoomParams::default() });
+        let open = |x: f32, y: f32| room.cast(Vec3f::default(), vec3f(x, y, -6.0).normalize()).unwrap().open;
+        assert!(open(0.0, -0.1) && open(-1.0, 0.9) && open(1.0, -0.1), "a pane");
+        assert!(!open(0.5, -0.1) && !open(0.0, 0.4), "a bar");
+        assert!(!open(-1.47, -0.1), "the frame");
+        assert!(!open(3.0, -0.1) && !open(0.0, 2.0), "the wall beside and above");
+        assert!(!room.cast(Vec3f::default(), vec3f(0.0, -0.1, 6.0).normalize()).unwrap().open, "the other walls stay closed");
+        let opening = *room.openings().last().unwrap();
+        // (the panes' share of the rectangle, 0.81, times what the glass lets through, 0.88)
+        assert!((opening.glass - 0.81 * 0.88).abs() < 1.0e-3, "the panes' share: {}", opening.glass);
+        assert!((opening.half.x - 1.5).abs() < 1.0e-4 && (opening.half.y - 1.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn a_window_light_made_real_stands_where_it_is_seen() {
+        // looking at the back wall (6 m off) 0.5 m right of the middle and 0.4 m up, a window 2 x 1 m as seen
+        let room = Room::new(&RoomParams::default());
+        let d = vec3f(0.5, 0.4, -6.0).normalize();
+        let t = vec3f(0.5, 0.4, -6.0).length();
+        let (w, h) = (2.0 * (1.0 / t).atan(), 2.0 * (0.5 / t).atan());
+        let window = room.window_seen(d, w, h, (4, 2), 0.05).unwrap();
+        assert_eq!((window.wall.as_str(), window.panes_x, window.panes_y), ("north", 4, 2));
+        assert!((window.along_m - 0.5).abs() < 1.0e-3 && (window.width_m - 2.0).abs() < 1.0e-3 && (window.height_m - 1.0).abs() < 1.0e-3, "{window:?}");
+        // its middle 0.4 m over the camera, 2 m over the floor; its sill half its height under that
+        assert!((window.sill_m - (1.6 + 0.4 - 0.5)).abs() < 1.0e-3, "{window:?}");
+        // the real window opens where the light was seen
+        let real = Room::new(&RoomParams { windows: Some(vec![window]), ..RoomParams::default() });
+        assert!(real.cast(Vec3f::default(), vec3f(0.3, 0.3, -6.0).normalize()).unwrap().open);
+        // the floor, the ceiling and an open wall take none
+        assert!(room.window_seen(vec3f(0.0, -1.0, -0.1).normalize(), w, h, (1, 1), 0.05).is_none());
+        let open = Room::new(&RoomParams { sides: Some(RoomSides { north: true, ..RoomSides::default() }), ..RoomParams::default() });
+        assert!(open.window_seen(d, w, h, (1, 1), 0.05).is_none());
+    }
+}
+

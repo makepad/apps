@@ -1,0 +1,36 @@
+use mod.motion.*
+// A zoom lens on the focus: a round window over where the action is,
+// showing the frame under it magnified, with a thin rim.
+let r = run()
+let f = fn(t) { return r.focus(t, {settle: 0.4}) }
+Motion{
+    label: "Zoom lens (follows the focus)"
+    size: vec2(1080, 1920)
+    duration: 3600.0
+    inputs: {
+        zoom: input(@number, 1.8, "Magnification")
+        radius: input(@number, 190, "Lens radius")
+    }
+    layers: [
+        Shader{name: "lens"
+            input: @below
+            params: {
+                cx: fn(t) { return f(t).centre[0] }
+                cy: fn(t) { return f(t).centre[1] }
+                radius: in(@radius)
+                zoom: in(@zoom)
+                presence: fn(t) { return f(t).presence }
+            }
+            pixel: fn() {
+                let p = self.pos * self.size
+                let c = vec2(self.cx, self.cy)
+                let d = length(p - c)
+                let inside = 1.0 - smoothstep(self.radius - 1.5, self.radius + 0.5, d)
+                let uv = (c + (p - c) / self.zoom) / self.size
+                let color = self.below.sample(clamp(uv, vec2(0.0, 0.0), vec2(1.0, 1.0)))
+                let rim = smoothstep(self.radius - 7.0, self.radius - 5.0, d) * inside
+                let lit = mix(color, vec4(1.0, 1.0, 1.0, 1.0), rim * 0.9)
+                return lit * inside * self.presence
+            }}
+    ]
+}

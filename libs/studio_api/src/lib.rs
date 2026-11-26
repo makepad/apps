@@ -1,4 +1,4 @@
-//! Stage's AI control API (CUTS.md §10.4): one typed tool registry that
+//! Stage's AI control API: one typed tool registry that
 //! drives the CUT page, Motion documents, effects, the library and FLOW
 //! generation, app runs, audio sync and feedback, exposed unchanged through
 //! three front ends:

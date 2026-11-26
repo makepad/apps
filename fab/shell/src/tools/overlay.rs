@@ -22,8 +22,9 @@
 
 use crate::api::*;
 use crate::api::PaneId;
-use crate::tools::{measure, section, session, snap};
+use crate::tools::{measure, picks, section, session, snap};
 use makepad_widgets_core::*;
+use std::sync::Arc;
 
 script_mod! {
     use mod.prelude.fab.*
@@ -99,6 +100,7 @@ script_mod! {
     mod.widgets.FabToolOverlay = set_type_default() do mod.widgets.FabToolOverlayBase{
         width: Fill
         height: Fill
+        color_overlap: fab.color_error
         color_notice_warn: fab.color_warning
         color_measure: fab.color_vp_measure
         color_section: fab.color_vp_section
@@ -169,10 +171,17 @@ pub struct DrawToolPanel {
 /// width, with a gap), and further right by a tool strip's width when one is open beside it.
 const RAIL_RIGHT: f64 = 56.0;
 const STRIP_WIDTH: f64 = 42.0;
+/// Where those lines wrap while the navigation gizmo is shown: left of its column (96 pt and the
+/// stage's 8 pt inset, `nav_col` in stage.rs), with a gap.
+const NAV_LEFT: f64 = 112.0;
+/// Under the gizmo's column (its top, `nav_top`, the gizmo's 96 pt, a gap): where the lines start
+/// when the room left of it is narrower than `LINE_MIN`, and take the view's width instead.
+const NAV_BELOW: f64 = 104.0;
+const LINE_MIN: f64 = 160.0;
 
 /// A tool's strip is open beside the rail (Paint's, Sculpt's, Force's, Edit shape's).
 fn strip_open(state: &AppState) -> bool {
-    crate::tools::paint::active(state)
+    state.tool == Tool::MeasureFit || crate::tools::paint::active(state)
         || crate::tools::sculpt::active(state)
         || state.force_tool()
         || (state.ui.gizmo == GizmoMode::Shape && state.tool == Tool::Select && state.ui.in_mode(PlateMode::Design))
@@ -184,6 +193,13 @@ const DIAMOND: f32 = 1.0;
 const SQUARE: f32 = 2.0;
 /// The tick along a crease under the pointer, long (points).
 const TICK_PX: f64 = 22.0;
+
+/// The ring as drawn, retained for semantic queries between frames.
+struct DrawnMenu {
+    bounds: Rect,
+    layout: Arc<picks::MenuLayout>,
+    items: Vec<picks::MenuItem>,
+}
 
 #[derive(Script, ScriptHook, WidgetRef, WidgetRegister)]
 pub struct FabToolOverlay {
@@ -197,6 +213,8 @@ pub struct FabToolOverlay {
     layout: Layout,
     #[live]
     color_notice_warn: Vec4f,
+    #[live]
+    color_overlap: Vec4f,
     #[live]
     color_measure: Vec4f,
     #[live]
@@ -228,6 +246,10 @@ pub struct FabToolOverlay {
     area: Area,
     #[rust(PaneId::PLATE_ZERO)]
     pub pane: PaneId,
+    /// The gizmo's top in the view, as the stage placed it (lower under a render row that would
+    /// reach its column, or under Mechanics' header strip).
+    #[rust(6.0)]
+    pub nav_top: f64,
     #[rust]
     next_frame: NextFrame,
     #[rust]
@@ -246,6 +268,8 @@ pub struct FabToolOverlay {
     /// Select Other's rows as drawn (window points), for the pointer.
     #[rust]
     other_rows: Vec<Rect>,
+    #[rust]
+    menu_shown: Option<DrawnMenu>,
 }
 
 impl FabToolOverlay {
@@ -297,18 +321,28 @@ impl FabToolOverlay {
         let picks = &state.picks;
         // the kind filter, while picks are made
         if crate::tools::picks::active(state) {
-            for (r, kind) in crate::tools::picks::strip(rect) {
+            let controls = picks::strip_view(state, self.pane, rect);
+            for (r, kind) in crate::tools::picks::strip(controls) {
                 let on = kind == picks.filter;
                 self.draw_panel.color = if on { vec4(self.color_accent.x, self.color_accent.y, self.color_accent.z, 0.9) } else { vec4(0.06, 0.06, 0.07, 0.8) };
                 self.draw_panel.draw_abs(cx, r);
                 self.small_text(cx, r.pos + dvec2(9.0, 5.0), kind.label(), if on { vec4(1.0, 1.0, 1.0, 1.0) } else { self.color_measure });
+            }
+            // the commands the picks take (Round, Chamfer): the one running lit
+            let running = state.params.command.as_ref().map(|c| c.param.label.as_str());
+            let blocked = state.pick_tool_block_reason().is_some();
+            for (r, label, _) in crate::tools::picks::commands(controls, &picks.list) {
+                let on = running == Some(label);
+                self.draw_panel.color = if on { vec4(self.color_accent.x, self.color_accent.y, self.color_accent.z, 0.9) } else { vec4(0.06, 0.06, 0.07, 0.8) };
+                self.draw_panel.draw_abs(cx, r);
+                self.small_text(cx, r.pos + dvec2(9.0, 5.0), label, if blocked { vec4(0.55, 0.55, 0.55, 1.0) } else if on { vec4(1.0, 1.0, 1.0, 1.0) } else { self.color_measure });
             }
             self.draw_panel.color = vec4(0.06, 0.06, 0.07, 0.92);
         }
         let at = |p: [f64; 3]| proj.project(vec3(p[0] as f32 * 0.001, p[1] as f32 * 0.001, p[2] as f32 * 0.001));
         let halo = vec4(0.04, 0.04, 0.04, 0.85);
         // what a click would take on a crease: a tick along it at the pointer's point
-        if let (Some(under), None) = (&picks.under, &picks.other) {
+        if let (Some(under), None, None) = (&picks.under, &picks.other, &picks.menu) {
             if let Some((p, d)) = under.tick.filter(|_| under.view == (*state.view.camera(self.pane), rect)) {
                 let ends = [0.0, 0.5].map(|k| on_plate(state, &under.object, [p[0] + d[0] * k, p[1] + d[1] * k, p[2] + d[2] * k]).and_then(at));
                 if let [Some(a), Some(b)] = ends {
@@ -344,7 +378,7 @@ impl FabToolOverlay {
                 }
             }
         }
-        if let (Some(under), None) = (&picks.under, &picks.other) {
+        if let (Some(under), None, None) = (&picks.under, &picks.other, &picks.menu) {
             if under.view == (*state.view.camera(self.pane), rect) {
                 self.small_text(cx, under.at + dvec2(16.0, 14.0), &under.words, self.color_measure);
             }
@@ -369,6 +403,48 @@ impl FabToolOverlay {
                 self.other_rows.push(rect);
             }
         }
+        if let Some(menu) = picks.menu.as_ref().filter(|m| m.pane == self.pane) {
+            self.draw_menu(cx, menu, rect, halo);
+        }
+    }
+
+    fn draw_menu(&mut self, cx: &mut Cx2d, menu: &picks::MarkingMenu, view: Rect, halo: Vec4f) {
+        let dark = vec4(0.06, 0.06, 0.07, 0.95);
+        let white = vec4(1.0, 1.0, 1.0, 1.0);
+        let previous_panel = self.draw_panel.color;
+        if menu.stroke {
+            self.seg(cx, menu.at, menu.pointer, halo, 4.4, false);
+            self.seg(cx, menu.at, menu.pointer, self.color_accent, 2.2, false);
+        }
+        self.marker(cx, menu.at, picks::HUB_RADIUS + 2.0, halo, DISC, true);
+        self.marker(cx, menu.at, picks::HUB_RADIUS, self.color_accent, DISC, true);
+        for (slot, rect, lines) in &menu.layout.pills {
+            let hot = menu.hot == Some(*slot);
+            let panel = if hot { self.color_accent } else { dark };
+            let disabled = menu.items.iter().any(|item| item.slot == *slot && item.disabled);
+            let text = if disabled { vec4(0.55, 0.55, 0.55, 1.0) } else if hot { white } else { self.color_measure };
+            self.menu_pill(cx, *rect, lines, panel, text);
+        }
+        // what the stroke will do: its words beside the hot pill, away from the hub
+        if let Some(item) = menu.items.iter().find(|item| Some(item.slot) == menu.hot) {
+            if let Some((rect, lines)) = picks::chip_rect(view, &menu.layout, item.slot, menu.pointer, &item.words) {
+                self.menu_pill(cx, rect, &lines, dark, white);
+            }
+        }
+        self.draw_panel.color = previous_panel;
+        if self.menu_shown.as_ref().is_none_or(|shown| !Arc::ptr_eq(&shown.layout, &menu.layout)) {
+            let hub = Rect { pos: menu.at, size: DVec2::default() }.add_margin(DVec2::all(picks::HUB_RADIUS));
+            let bounds = menu.layout.pills.iter().fold(hub, |bounds, (_, rect, _)| bounds.hull(*rect));
+            self.menu_shown = Some(DrawnMenu { bounds, layout: menu.layout.clone(), items: menu.items.clone() });
+        }
+    }
+
+    fn menu_pill(&mut self, cx: &mut Cx2d, rect: Rect, lines: &[String], panel: Vec4f, text: Vec4f) {
+        self.draw_panel.color = panel;
+        self.draw_panel.draw_abs(cx, rect);
+        for (i, line) in lines.iter().enumerate() {
+            self.small_text(cx, rect.pos + dvec2(9.0, 4.0 + i as f64 * 14.0), line, text);
+        }
     }
 
     /// Select Other is the pointer's while it is open: a row under it lights up, a press picks
@@ -378,8 +454,13 @@ impl FabToolOverlay {
         // a press on the kind filter's strip sets it
         if let Event::MouseDown(e) = event {
             if crate::tools::picks::active(state) {
-                if let Some((_, kind)) = crate::tools::picks::strip(self.area.rect(cx)).into_iter().find(|(r, _)| r.contains(e.abs)) {
+                let controls = picks::strip_view(state, self.pane, self.area.rect(cx));
+                if let Some((_, kind)) = crate::tools::picks::strip(controls).into_iter().find(|(r, _)| r.contains(e.abs)) {
                     cx.action(PickAction::Filter(kind));
+                    return;
+                }
+                if let Some((.., command)) = crate::tools::picks::commands(controls, &state.picks.list).into_iter().find(|(r, ..)| r.contains(e.abs)) {
+                    cx.action(crate::api::ShellAction::Command(command.into()));
                     return;
                 }
             }
@@ -745,6 +826,61 @@ impl FabToolOverlay {
         }
     }
 
+    fn draw_fit(&mut self, cx: &mut Cx2d, state: &AppState, proj: &ViewProjector, view: Rect) {
+        let at = |point| proj.project(super::transform::mm_to_world(point));
+        session::with(|s| {
+            let Some(Ok(fit)) = &s.fit.result else {
+                if let Some(p) = s.fit.a.as_ref().and_then(|pick| at(pick.point)) {
+                    self.marker(cx, p, 5.0, self.color_accent, DIAMOND, true);
+                }
+                return;
+            };
+            if let Some(bounds) = &fit.overlap_bounds {
+                let corners = bounds.map(at);
+                for i in 0..8 {
+                    for bit in [1, 2, 4] {
+                        if i & bit != 0 { continue; }
+                        if let (Some(a), Some(b)) = (corners[i], corners[i | bit]) {
+                            self.seg(cx, a, b, self.color_overlap, 2.0, false);
+                        }
+                    }
+                }
+            }
+            let mut placed = Vec::<Rect>::new();
+            for (i, gap) in fit.gaps.iter().enumerate() {
+                let Some(gap) = gap else { continue };
+                let (Some(a), Some(b)) = (at(gap.from), at(gap.to)) else { continue };
+                let smallest = fit.smallest == Some(i);
+                let color = if smallest { self.color_accent } else { self.color_measure };
+                let width = if smallest { 2.5 } else { 1.5 };
+                self.seg(cx, a, b, color, width, false);
+                let along = at(std::array::from_fn(|k| gap.from[k] + gap.direction[k])).map_or(b - a, |p| p - a);
+                let unit = if along.length() > 1e-6 { along / along.length() } else { dvec2(1.0, 0.0) };
+                let tick = dvec2(-unit.y, unit.x) * 3.5;
+                for p in [a, b] { self.seg(cx, p - tick, p + tick, color, width, false); }
+
+                let label = super::fit::length(&state.units, gap.distance_mm);
+                let size = self.draw_text.layout(cx, 0.0, 0.0, None, false, Align::default(), &label).size_in_lpxs;
+                let size = dvec2(size.width as f64, size.height as f64) * self.draw_text.font_scale as f64;
+                let mid = (a + b) * 0.5;
+                let offset = unit * 12.0;
+                let base = mid + offset - dvec2(if unit.x < 0.0 { size.x } else { 0.0 }, size.y * 0.5);
+                let mut rect = Rect { pos: base, size };
+                // Four gaps may project onto almost the same pixel at plate scale.
+                for row in [0.0, 1.0, -1.0, 2.0, -2.0, 3.0, -3.0] {
+                    let top = base + dvec2(0.0, row * (size.y + 3.0));
+                    rect.pos = dvec2(top.x.clamp(view.pos.x, (view.pos.x + view.size.x - size.x).max(view.pos.x)),
+                        top.y.clamp(view.pos.y, (view.pos.y + view.size.y - size.y).max(view.pos.y)));
+                    if placed.iter().all(|other| !rect.intersects(*other)) { break; }
+                }
+                let end = dvec2(mid.x.clamp(rect.pos.x, rect.pos.x + size.x), mid.y.clamp(rect.pos.y, rect.pos.y + size.y));
+                self.seg(cx, mid, end, color, 1.0, false);
+                self.halo_text(cx, rect.pos, &label, color);
+                placed.push(rect);
+            }
+        });
+    }
+
     fn draw_measurements(&mut self, cx: &mut Cx2d, state: &AppState, proj: &ViewProjector) {
         let units = state.units;
         session::with(|session| {
@@ -950,7 +1086,7 @@ impl WidgetNode for FabToolOverlay {
 
 impl FabToolOverlay {
     pub(crate) fn handle_viewport_input(&mut self, cx: &mut Cx, input: &ViewportInput, state: &AppState) {
-        if state.tool != Tool::Select || !state.view.overlays.measurements { return; }
+        if state.picks.menu.is_some() || state.tool != Tool::Select || !state.view.overlays.measurements { return; }
         if let ViewportInputKind::PointerMove { pos, buttons: 0, .. } = input.kind {
             let proj = ViewProjector::new(*state.view.camera(self.pane), input.rect);
             if measure::point_at(state, &proj, pos).is_some() { cx.set_cursor(MouseCursor::Hand); }
@@ -971,6 +1107,26 @@ impl Widget for FabToolOverlay {
             let mut node = a11y_tree::Node { role: a11y_tree::Role::Status, bounds: makepad_platform::a11y::semantic_rect(self.area.rect(cx)), ..Default::default() };
             makepad_platform::a11y::set_string(&mut node.name, "Plate preview");
             out.push((2, None, node));
+        }
+        if let Some(menu) = &self.menu_shown {
+            const MENU: u64 = 3;
+            let mut node = a11y_tree::Node {
+                role: a11y_tree::Role::Menu, bounds: makepad_platform::a11y::semantic_rect(menu.bounds),
+                set_size: menu.layout.pills.len() as u32, ..Default::default()
+            };
+            makepad_platform::a11y::set_string(&mut node.name, "Marking menu");
+            out.push((MENU, None, node));
+            for (i, (slot, rect, _)) in menu.layout.pills.iter().enumerate() {
+                let Some(item) = menu.items.iter().find(|item| item.slot == *slot) else { continue };
+                let mut node = a11y_tree::Node {
+                    role: a11y_tree::Role::MenuItem, bounds: makepad_platform::a11y::semantic_rect(*rect),
+                    pos_in_set: i as u32 + 1, ..Default::default()
+                };
+                node.states.set(a11y_tree::States::DISABLED, item.disabled);
+                makepad_platform::a11y::set_string(&mut node.name, &item.label);
+                makepad_platform::a11y::set_string(&mut node.description, &item.words);
+                out.push((MENU + 1 + *slot as u64, Some(MENU), node));
+            }
         }
     }
 
@@ -997,7 +1153,7 @@ impl Widget for FabToolOverlay {
             self.area.redraw(cx);
         }
         // In Mechanics the pointer belongs to its picker.
-        if state.ui.in_mode(PlateMode::Mechanics) { return; }
+        if state.ui.in_mode(PlateMode::Mechanics) || state.picks.menu.is_some() { return; }
         self.other_event(cx, event, state);
         if state.tool != Tool::Select || !state.view.overlays.measurements { return; }
         let proj = ViewProjector::new(*state.view.camera(self.pane), self.area.rect(cx));
@@ -1060,6 +1216,13 @@ impl Widget for FabToolOverlay {
         let mut wants_frames = false;
         self.notice_shown = None;
         self.preview_shown = false;
+        let menu = scope.data.get_mut::<AppState>().filter(|s| picks::active(s)).and_then(|s| s.picks.menu.as_mut())
+            .filter(|m| m.pane == self.pane && rect.size.x > 2.0 && rect.size.y > 2.0);
+        if let Some(menu) = menu {
+            menu.fit(rect);
+        } else {
+            self.menu_shown = None;
+        }
         if rect.size.x > 2.0 && rect.size.y > 2.0 {
             if let Some(state) = scope.data.get_mut::<AppState>() {
                 let state: &AppState = state;
@@ -1067,7 +1230,10 @@ impl Widget for FabToolOverlay {
                 let proj = ViewProjector::new(*vs.camera(self.pane), rect);
                 let mechanics = state.ui.in_mode(PlateMode::Mechanics);
                 let left = RAIL_RIGHT + if strip_open(state) { STRIP_WIDTH } else { 0.0 };
-                let mut line_y = 46.0;
+                let full = rect.size.x - left - 16.0;
+                let beside = rect.size.x - left - if vs.overlays.nav_gizmo { NAV_LEFT } else { 16.0 };
+                // a narrow view leaves too little room left of the gizmo: the lines go under it
+                let (line_width, mut line_y) = if vs.overlays.nav_gizmo && beside < LINE_MIN { (full, self.nav_top + NAV_BELOW) } else { (beside, 46.0) };
                 if mechanics {
                     self.draw_mech_check(cx, state, &proj, rect);
                 } else {
@@ -1088,22 +1254,28 @@ impl Widget for FabToolOverlay {
                     }
                     // The tool's one-line feedback, under the view's top edge and right of the rail
                     // (and of a tool's strip beside it).
-                    let hint = session::with(|s| match (s.hint.is_empty(), s.draft.is_empty()) {
+                    let fitting = super::fit::in_pane(state, self.pane);
+                    let hint = if fitting {
+                        self.draw_fit(cx, state, &proj, rect);
+                        session::with(|s| s.fit.label(&state.units))
+                    } else { session::with(|s| match (s.hint.is_empty(), s.draft.is_empty()) {
                         (true, false) if !crate::tools::picks::active(state) => format!("{} ({})", s.draft, crate::ui::keymap::shortcut(crate::ui::keymap::ShortcutId::Shape)),
                         (true, _) => s.draft.clone(),
                         (false, _) => s.hint.clone(),
-                    });
-                    if !hint.is_empty() {
-                        self.small_text(cx, rect.pos + dvec2(left, line_y), &hint, self.color_measure);
-                        line_y += 20.0;
+                    }) };
+                    // wrapped at the lines' width, so a long hint never runs under the gizmo
+                    if (fitting || !hint.is_empty()) && line_width > 0.0 {
+                        let walk = Walk::new(Size::Fixed(line_width), Size::fit()).with_abs_pos(rect.pos + dvec2(left, line_y));
+                        self.draw_text_small.color = self.color_measure;
+                        let drawn = self.draw_text_small.draw_walk_with_wrap(cx, walk, Align::default(), true, &hint);
+                        line_y += (drawn.size.y + 4.0).max(20.0);
                     }
                 }
                 self.notice_revision = state.ui.notices.revision;
                 self.preview_shown = state.plate.preview;
                 if let Some(notice) = state.ui.notices.get(NoticeView::Plate) {
-                    let width = rect.size.x - left - 16.0;
-                    if width > 0.0 {
-                        let walk = Walk::new(Size::Fixed(width), Size::fit()).with_abs_pos(rect.pos + dvec2(left, line_y));
+                    if line_width > 0.0 {
+                        let walk = Walk::new(Size::Fixed(line_width), Size::fit()).with_abs_pos(rect.pos + dvec2(left, line_y));
                         self.draw_text_small.color = if notice.standing { self.color_notice_warn } else { self.color_measure };
                         let max_lines = self.draw_text_small.max_lines;
                         self.draw_text_small.max_lines = 3;

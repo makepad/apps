@@ -2263,6 +2263,7 @@ let field = fn(p) {
         let part = |field| SdfNode::Kernel(SdfKernel::splash(field, bounds));
         let pool = TaskPool::closed();
         let root = part(SdfSplashExpr::compile_traced(&mut vm, doc, SplashPoint::Vec3, &[]).unwrap());
+        crate::field::tests::assert_spliced_without_work(&root);
         let f = Field::new(&root, false, &pool).unwrap();
         assert!(f.proven > 0.0, "the proof gives the step");
         // the stretch of the body's frame, and a blend is no steeper than its steepest

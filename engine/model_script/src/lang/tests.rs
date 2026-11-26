@@ -7,6 +7,27 @@ fn eval(src: &str) -> Result<Program, Vec<Diag>> {
 }
 
 #[test]
+fn solid_inputs_keep_argument_order_across_users_and_bypass() {
+    let p = eval(r#"let m = mod.model
+let base = m.brep.box({size: [8mm 6mm 4mm]})
+let cutter = m.brep.cylinder({radius: 1mm height: 8mm})
+let a = m.brep.subtract(base, cutter)
+let boss = m.brep.sphere({radius: 2mm off: true})
+let b = m.brep.union(base, boss)
+let eased = m.brep.fillet(a, 1mm)
+let twice = m.brep.union(base, [cutter, [cutter]])
+let panel = m.panel(base, {cuts: [cutter boss]})
+"#).expect("the shared exact parts compile");
+    let index = |id: &str| p.solids.iter().position(|s| s.id == id).expect(id);
+    let inputs = |id: &str| p.solids[index(id)].inputs.as_slice();
+    assert_eq!(inputs("a"), [index("base"), index("cutter")], "subtract reads each operand exactly once, base first");
+    assert_eq!(inputs("b"), [index("base"), index("boss")], "the second user keeps its shared base and bypassed boss");
+    assert_eq!(inputs("eased"), [index("a")], "the fillet reads just its source");
+    assert_eq!(inputs("twice"), [index("base"), index("cutter"), index("cutter")], "nested lists retain intentional repetitions");
+    assert_eq!(inputs("panel"), [index("base"), index("cutter"), index("boss")], "the panel reads its base before its optional cuts");
+}
+
+#[test]
 fn a_library_and_host_inputs_reach_the_script() {
     let libraries = [Library {
         file: "shelf.splash".into(),
@@ -269,7 +290,7 @@ fn edited(edit: edit::Edit) -> Result<String, String> {
 
 #[test]
 fn edits_splice_exactly_the_bytes_they_change() {
-    use edit::Edit;
+    use edit::{Anchor, Edit};
     let set = |site: &str, value: &str| edited(Edit::Set { site: site.into(), value: value.into() });
     assert_eq!(set("h", "25mm").unwrap(), EDIT_SRC.replace("param(20mm", "param(25mm"));
     assert_eq!(set("b.radius", "2.5mm").unwrap(), EDIT_SRC.replace("radius: 2mm", "radius: 2.5mm"));
@@ -282,13 +303,66 @@ fn edits_splice_exactly_the_bytes_they_change() {
     assert!(field.contains("height: 30mm segments: 64}") || field.contains("height: 30mm, segments: 64}"), "{field}");
     let opts = edited(Edit::Field { solid: "d".into(), field: "edges".into(), code: "{top: true}".into() }).unwrap();
     assert!(opts.contains("m.fillet(c, 0.5mm, {edges: {top: true}})"), "{opts}");
-    let add = edited(Edit::Add { code: "let lid = m.box({size: [10mm 2mm 10mm]})".into(), before: None }).unwrap();
+    let add = edited(Edit::Add { code: "let lid = m.box({size: [10mm 2mm 10mm]})".into(), at: Anchor::Auto }).unwrap();
     assert!(add.contains("let lid = m.box({size: [10mm 2mm 10mm]})\nplace(d"), "{add}");
+    let after_def = |src: &str, code: &str, name: &str, nth| edit::add(src, code, &Anchor::After { name: name.into(), nth }, &["object"]);
+    let src = "fn base() { 1 }\nlet end = 2\n";
+    let first = after_def(src, "object(a)", "base", 0).unwrap();
+    assert_eq!(after_def(&first, "object(b)", "base", 1).unwrap(), "fn base() { 1 }\nobject(a)\nobject(b)\nlet end = 2\n", "the second addition belongs two slots past the definition");
+    assert_eq!(after_def(&first, "object(b)", "base", 0).unwrap(), "fn base() { 1 }\nobject(b)\nobject(a)\nlet end = 2\n", "a fresh after(base) restarts immediately below base");
+    assert_eq!(after_def(src, "object(a)", "base", usize::MAX).unwrap(), format!("{src}object(a)\n"), "an offset past the last statement appends");
+    assert_eq!(after_def(src, "object(a)", "missing", 0).unwrap_err(), "no statement `let missing` or `fn missing`", "an unknown after-anchor names the missing definition");
     // A cutter's delete leaves the subtract with nothing to do: its base, under its name.
     let removed = edited(Edit::Remove { solid: "b".into() }).unwrap();
     assert_eq!(removed, EDIT_SRC.replace("let a = m.box", "let c = m.box").replace("let b = m.cylinder({radius: 2mm height: 30mm})\nlet c = m.subtract(a, b)\n", ""));
     let renamed = edited(Edit::Rename { solid: "b".into(), to: "bore".into() }).unwrap();
     assert!(renamed.contains("let bore = m.cylinder") && renamed.contains("m.subtract(a, bore)"), "{renamed}");
+
+    fn inline_mirror(p: &Program) -> &str {
+        &p.solids.iter().find(|s| !s.named && s.proto == "BrepMirror").expect("the inline mirror must have a solid id").id
+    }
+    let rename = |id: &str, to: &str| Edit::Rename { solid: id.into(), to: to.into() };
+    let leg = "use mod.model.*\nuse mod.fab.*\nlet m = mod.model\nlet leg = m.brep.box({size: [10mm 10mm 10mm] at: [-20mm 0 0]})\n";
+    let mirror = "m.brep.mirror(leg, {plane: @yz keep: false})";
+    let p = eval(&format!("{leg}let pair = m.brep.union(leg, {mirror})\nplace(pair)\n")).expect("the pair with an inline mirror evaluates");
+    let id = inline_mirror(&p);
+    assert_eq!(edit::hoist_name(&p, id, &[]).as_deref(), Some("leg_mirror"), "the suggested name combines the input and builder");
+    assert_eq!(edit::hoist_name(&p, id, &["leg_mirror"]).as_deref(), Some("leg_mirror2"), "the next hoist in a batch skips its reserved name");
+    assert_eq!(edit::hoist_name(&p, "leg", &[]), None, "a named input already has its own binding");
+    let out = edit::apply(&p, &rename(id, "leg_mirror")).expect("an inline union operand can take a name");
+    assert_eq!(out, format!("{leg}let leg_mirror = {mirror}\nlet pair = m.brep.union(leg, leg_mirror)\nplace(pair)\n"), "only the mirror moves into a binding before the union");
+    eval(&out).expect("the union with the named mirror still evaluates");
+    eval(&format!("{out}let drilled = m.brep.hole(pair, {{on: leg_mirror.top at: [20mm 5mm 0] diameter: 2mm}})\nplace(drilled)\n")).expect("the image alone names its faces as its source does, each its own");
+
+    let later = "fn leg_mirror() { 0 }\nlet [a, leg_mirror2] = [0, 1]\n";
+    let p = eval(&format!("{leg}place({mirror})\n{later}")).expect("a bare root can place an inline mirror");
+    let id = inline_mirror(&p);
+    assert_eq!(edit::apply(&p, &rename(id, "leg_mirror")).unwrap_err(), "'leg_mirror' is not a free name", "a later fn reserves its name for the whole file");
+    assert_eq!(edit::hoist_name(&p, id, &[]).as_deref(), Some("leg_mirror3"), "the suggested name skips the fn and both names bound by a let");
+    let out = edit::apply(&p, &rename(id, "leg_mirror3")).expect("an argument of a bare root call can take a name");
+    assert_eq!(out, format!("{leg}let leg_mirror3 = {mirror}\nplace(leg_mirror3)\n{later}"), "the new binding goes just before the bare root call");
+
+    let p = eval(&format!("{leg}for i in 0..2 {{ place({mirror}) }}\n")).expect("the loop can place inline mirrors");
+    let id = inline_mirror(&p);
+    assert_eq!(edit::apply(&p, &rename(id, "leg_mirror")).unwrap_err(), format!("'{id}' is written inside a loop, which makes one each pass: name it in the loop's code"), "hoisting a loop body must explain that each pass makes a solid");
+
+    let after = |solid: &str, code: &str| Edit::After { solid: solid.into(), code: code.into() };
+    let rounded = edited(after("c", "m.fillet(c, 1mm)")).unwrap();
+    assert_eq!(rounded, EDIT_SRC.replace("let c = m.subtract(a, b)\n", "let c_subtract = m.subtract(a, b)\nlet c = m.fillet(c_subtract, 1mm)\n"), "the code becomes c, right after what c was (now named by its kind), and d reads it");
+    let placed = edited(after("d", "m.fillet(d, 1mm)")).unwrap();
+    assert_eq!(placed, EDIT_SRC.replace("let d = m.fillet(c,", "let d_fillet = m.fillet(c,").replace("place(d,", "let d = m.fillet(d_fillet, 1mm)\nplace(d,"), "the placed part keeps its name");
+    let again = edit::apply(&eval(&placed).unwrap(), &after("d", "m.fillet(d, 2mm)")).unwrap();
+    assert!(again.contains("let d_fillet2 = m.fillet(d_fillet, 1mm)\nlet d = m.fillet(d_fillet2, 2mm)\nplace(d,"), "a taken name is numbered: {again}");
+    let p = eval(EDIT_SRC).unwrap();
+    for (id, code, why) in [("missing", "c", "top level"), ("h", "h", "no solid"), ("c", "m.fillet(", "`m.fillet(` does not parse")] {
+        let result = edit::apply(&p, &after(id, code));
+        assert!(result.as_ref().is_err_and(|e| e.contains(why)), "after({id}) with `{code}` should explain '{why}': {result:?}");
+    }
+    let src = "use mod.model.*\nuse mod.fab.*\nlet m = mod.model\nlet b = m.brep.box({size: [4mm 4mm 4mm]})\nlet f = m.brep.fillet(b, 0.5mm, {edges: m.edge(b.top, b.front)})\nplace(f)\nplace(b, name: \"block\")\nm.fixed(b)\nlet b = b\nplace(b)\n";
+    let out = edit::apply(&eval(src).unwrap(), &after("b", "m.brep.fillet(b, 1mm, {edges: m.edge(b.bottom, b.back)})")).unwrap();
+    assert!(out.contains("let b_box = m.brep.box({size: [4mm 4mm 4mm]})\nlet b = m.brep.fillet(b_box, 1mm, {edges: m.edge(b_box.bottom, b_box.back)})\nlet f = m.brep.fillet(b, 0.5mm, {edges: m.edge(b_box.top, b_box.front)})"), "the code reads what b was, the later plain read reads b, the face names follow the box: {out}");
+    assert!(out.ends_with("place(b, name: \"block\")\nm.fixed(b)\nlet b = b\nplace(b)\n"), "the roots and a shadowing let keep reading b: {out}");
+    eval(&out).expect("the edited program with renamed face names evaluates");
     let at = edited(Edit::RootArg { kind: "place".into(), solid: "d".into(), name: "at".into(), code: Some("[30mm, 40mm]".into()) }).unwrap();
     assert!(at.ends_with("place(d, at: [30mm, 40mm])\n"), "{at}");
     let fil = edited(Edit::RootArg { kind: "place".into(), solid: "d".into(), name: "filament".into(), code: Some("2".into()) }).unwrap();
@@ -360,6 +434,27 @@ fn a_negative_array_item_needs_commas() {
         let err = turned(written).unwrap_err();
         assert!(err.contains(says), "{written}: {err}");
     }
+
+    let fillet = |near: &str| format!("let m = mod.model\nlet b = m.brep.box({{size: [10mm 10mm 10mm]}})\nlet shelled = m.brep.fillet(b, 0.8mm, {{edges: [\n    {{near: [{near}]}}\n]}})\n");
+    let mismatch = "BrepFillet: 'edges.near' must be 3 numbers [..], not a list of 2";
+    let errors = eval(&fillet("0mm 40mm -25mm")).err().expect("the two-item near selector must fail lowering");
+    let [error, warning] = errors.as_slice() else { panic!("the field error must precede the retained warning: {errors:?}") };
+    assert_eq!((error.line, error.col), (3, 28), "the primary error must stay at the fillet call's opening parenthesis");
+    assert_eq!((warning.line, warning.col), (4, 22), "the secondary diagnostic must point at the minus on the next line");
+    assert!(warning.message.contains("`40mm, -25mm`"), "the warning must show how to separate the negative coordinate: {warning}");
+    assert_eq!(error.message, format!("{mismatch}. Array warning at {warning}"), "the first error Fab sends must include the located repair");
+
+    let plain = fillet("0mm 40mm");
+    let errors = eval(&plain).err().expect("an ordinary two-item near selector must fail lowering");
+    assert_eq!(errors, [Diag { line: 3, col: 28, message: mismatch.into() }], "a size mismatch without the warning must be unchanged");
+    let separate = plain.replace("let shelled", "let pair = [3 -1]; let shelled");
+    let errors = eval(&separate).err().expect("a warning in a different statement cannot fix the near selector");
+    assert_eq!(errors[0].message, mismatch, "a different statement on the call's line must not be cited");
+    assert!(errors.iter().skip(1).any(|d| d.message.contains("`3, -1`")), "the separate warning must still be retained");
+
+    let errors = eval("let pair = [3 -1]\nmissing_function()").err().expect("an unknown function must fail VM evaluation");
+    assert_eq!(errors[0].line, 2, "the VM error must remain first");
+    assert!(errors.iter().skip(1).any(|d| (d.line, d.col) == (1, 15) && d.message.contains("`3, -1`")), "VM failures must retain the document's located minus warning too");
 }
 
 /// The parser warns at a `-` that reads like a negative item (`[10mm 10mm 12mm -2mm]` is three
@@ -367,10 +462,12 @@ fn a_negative_array_item_needs_commas() {
 #[test]
 fn a_minus_inside_brackets_builds_with_a_warning() {
     let head = "use mod.model.*\nuse mod.fab.*\nlet m = mod.model\n";
-    let p = eval(&format!("{head}let k = m.box({{size: [10mm 10mm 12mm -2mm]}})\nplace(k)\n")).unwrap();
-    let says = "`12mm -2mm` inside [ ] reads as one value, 12mm - 2mm: write `12mm - 2mm`, or `12mm, -2mm` for two items";
-    let note = p.notes.iter().find(|n| n.message == says).unwrap_or_else(|| panic!("{:?}", p.notes));
-    assert_eq!(note.line, 4, "{note:?}");
+    let source = format!("{head}let k = m.box({{size: [10mm 10mm 12mm -2mm]}})\nplace(k)\n");
+    let p = eval(&source).unwrap();
+    let parsed = makepad_script::parser::parse_warnings(&source);
+    let [warning] = parsed.as_slice() else { panic!("the box should have one parser warning: {parsed:?}") };
+    let note = p.notes.iter().find(|n| n.message == warning.message).expect("the model must keep the parser's complete warning");
+    assert_eq!((note.line, note.col), (4, warning.column + 1), "the build note keeps the warning's document position");
     let written = eval(&format!("{head}let k = m.box({{size: [10mm, 10mm, 10mm]}})\nplace(k)\n")).unwrap();
     assert!(written.notes.is_empty(), "{:?}", written.notes);
 }
@@ -406,15 +503,16 @@ fn examples_parse_to_the_items_they_show() {
 /// that name; and definitions a later edit reads earlier move up to it, with what they read.
 #[test]
 fn added_statements_go_before_their_use() {
+    use edit::Anchor;
     let src = "let m = mod.model\nlet a = m.box({size: [k(1) 2mm 2mm]})\nobject(a)\n";
     let roots = ["object"];
-    assert_eq!(edit::add(src, "fn k(x) { x * 1mm }", None, &roots).unwrap(), "let m = mod.model\nfn k(x) { x * 1mm }\nlet a = m.box({size: [k(1) 2mm 2mm]})\nobject(a)\n");
-    assert!(edit::add(src, "use mod.math.*", None, &roots).unwrap().starts_with("use mod.math.*\nlet m"));
+    assert_eq!(edit::add(src, "fn k(x) { x * 1mm }", &Anchor::Auto, &roots).unwrap(), "let m = mod.model\nfn k(x) { x * 1mm }\nlet a = m.box({size: [k(1) 2mm 2mm]})\nobject(a)\n");
+    assert!(edit::add(src, "use mod.math.*", &Anchor::Auto, &roots).unwrap().starts_with("use mod.math.*\nlet m"));
     let with_use = "use mod.model.*\nlet m = mod.model\nobject(a)\n";
-    assert!(edit::add(with_use, "use mod.math.*", Some("m"), &roots).unwrap().starts_with("use mod.model.*\nuse mod.math.*\nlet m"));
-    assert!(edit::add(src, "let w = 2mm", None, &roots).unwrap().contains("let w = 2mm\nobject(a)"), "nothing reads it: before the object");
-    assert!(edit::add(src, "let w = 2mm", Some("a"), &roots).unwrap().contains("let w = 2mm\nlet a"));
-    assert!(edit::add(src, "let w = 2mm", Some("b"), &roots).unwrap_err().contains("no statement `let b` or `fn b`"));
+    assert!(edit::add(with_use, "use mod.math.*", &Anchor::Before("m".into()), &roots).unwrap().starts_with("use mod.model.*\nuse mod.math.*\nlet m"));
+    assert!(edit::add(src, "let w = 2mm", &Anchor::Auto, &roots).unwrap().contains("let w = 2mm\nobject(a)"), "nothing reads it: before the object");
+    assert!(edit::add(src, "let w = 2mm", &Anchor::Before("a".into()), &roots).unwrap().contains("let w = 2mm\nlet a"));
+    assert!(edit::add(src, "let w = 2mm", &Anchor::Before("b".into()), &roots).unwrap_err().contains("no statement `let b` or `fn b`"));
     let late = "let a = m.box({size: [k(1) 2mm 2mm]})\nobject(a)\nfn j(x) { x }\nfn k(x) { j(x) * 1mm }\n";
     let placed = edit::place_defs(late, &["k".into(), "j".into()]).unwrap();
     assert_eq!(placed, "fn j(x) { x }\nfn k(x) { j(x) * 1mm }\nlet a = m.box({size: [k(1) 2mm 2mm]})\nobject(a)\n");
@@ -1443,6 +1541,82 @@ fn voronoi_foam_is_one_piece_with_its_web() {
     assert_eq!(reached, total, "a piece of the foam or web is loose");
 }
 
+#[test]
+fn path_children_and_segment_side_selectors() {
+    const HEAD: &str = "use mod.model.*\nlet m = mod.model\n";
+    const CHILDREN: &str = "Path{from: [0 0]\n    base := LineTo{to: [40mm 0]}\n    RoundCorner{r: 2mm}\n    right := LineTo{to: [40mm 20mm]}\n    cap := ArcTo{to: [0 20mm] r: 20mm}\n}";
+    const LIST: &str = "Path{from: [0 0] segs: [LineTo{to: [40mm 0]} RoundCorner{r: 2mm} LineTo{to: [40mm 20mm]} ArcTo{to: [0 20mm] r: 20mm}]}";
+    let script = |path: &str| format!("{HEAD}let section = {path}\nlet body = m.brep.extrude({{sketch: section height: 10mm}})\n");
+    let shape = |p: &Program| {
+        let steps = csg_graph::eval::brep_steps(&p.graph, p.solid("body").unwrap().node);
+        let BrepOp::Extrude { sketch, .. } = &steps[0].op else { panic!("body must extrude the section") };
+        sketch.shapes[0].clone()
+    };
+    let children = eval(&script(CHILDREN)).expect("named and unnamed children lower");
+    let listed = eval(&script(LIST)).expect("a generated segment list still lowers");
+    assert_eq!(shape(&children), shape(&listed), "children and segs describe the same Path");
+    let Shape::Path { segs, .. } = shape(&children) else { panic!("the extrude retains its Path") };
+    assert!(matches!(&segs[..], [Seg::Line(_), Seg::Fillet(_), Seg::Line(_), Seg::ArcRadius { .. }]), "the unnamed corner stays between base and right");
+    let sides = |p: &Program| p.solid("body").unwrap().sides.clone();
+    assert_eq!(sides(&children), [Some("base".into()), None, Some("right".into()), Some("cap".into()), None], "side names include the unnamed corner and implicit closing line");
+    assert_eq!(sides(&listed), vec![None; 5], "list entries and the closing line are unnamed");
+    for (path, line, message) in [
+        (CHILDREN.replace("from: [0 0]", "segs: []"), 3, "a Path takes its segments as children or as segs: [..], not both"),
+        (CHILDREN.replace("base :=", "start :="), 4, "a segment can't be named `start`: the Path uses that name; call it base, lip, ..."),
+        (CHILDREN.replace("RoundCorner{r: 2mm}", "Circle{radius: 2mm}"), 5, "'Circle' is not a path segment"),
+        (CHILDREN.replace("RoundCorner{r: 2mm}", "bad := 42"), 5, "'42' is not a path segment"),
+    ] {
+        let errors = eval(&script(&path)).err().expect("an invalid Path is refused");
+        assert!(errors.iter().any(|d| d.line == line && d.col > 1 && d.message.contains(message)), "locate {message} on line {line}: {errors:?}");
+    }
+    const ROUND: &str = "let r = m.brep.fillet(body, 1mm, {edges: m.edge(body.top, body.side(section.base))})\n";
+    let face = |p: &Program| {
+        let steps = csg_graph::eval::brep_steps(&p.graph, p.solid("r").unwrap().node);
+        let edge = steps.iter().find_map(|s| match &s.op { BrepOp::Fillet { edges, .. } => edges.named.first(), _ => None }).unwrap();
+        let selected = [&edge.a, &edge.b].into_iter().find(|f| matches!(f.role, Role::Side(_))).expect("the edge includes the selected side");
+        selected.clone()
+    };
+    let src = script(CHILDREN) + ROUND;
+    let named = face(&eval(&src).expect("a named segment selects its side"));
+    let indexed = face(&eval(&src.replace("side(section.base)", "side(0)")).expect("a numbered side still compiles"));
+    assert_eq!(named, indexed, "both forms produce the same complete face name");
+    let shifted = src.replace("base :=", "LineBy{by: [0 5mm]} base :=");
+    assert_eq!(face(&eval(&shifted).unwrap()).role, Role::Side(1), "inserting before base moves its side index");
+    for sketch in ["Sketch{shapes: [section Circle{radius: 1mm}]}", "[section]"] {
+        let p = eval(&src.replace("sketch: section", &format!("sketch: {sketch}"))).unwrap();
+        assert_eq!(face(&p).role, Role::Side(0), "a hand-written selector resolves against the first Path of {sketch}");
+        assert!(sides(&p).is_empty(), "a sketch or list exposes no writable Path child names");
+    }
+    let revolve = src.replace("m.brep.extrude({sketch: section height: 10mm})", "m.brep.revolve({sketch: section angle: 90deg})").replace("body.top", "body.start");
+    let p = eval(&revolve).expect("a revolved Path names its sides");
+    assert_eq!(face(&p).role, Role::Side(0), "a revolve resolves the segment against its own Path");
+    assert_eq!(sides(&p), sides(&children), "a direct Path has the same side names on a revolve");
+    let wrong = src.clone() + "let bad = m.brep.pull(r, {face: r.side(section.base) by: 1mm})\n";
+    let numbered = src.clone() + "let bad = m.brep.pull(r, {face: r.side(2) by: 1mm})\n";
+    let later = src.replace("sketch: section", "sketch: [Circle{radius: 1mm} section]");
+    let stride = format!("{HEAD}let stride = LineBy{{by: [0 5mm]}}\nlet section = Path{{segs: [LineTo{{to: [10mm 0]}} stride stride LineTo{{to: [0 10mm]}}]}}\nlet body = m.brep.extrude({{sketch: section height: 10mm}})\n");
+    let unique = stride.replace("stride stride", "stride");
+    let aliases = stride.replace("segs: [LineTo{to: [10mm 0]} stride stride LineTo{to: [0 10mm]}]", "a := stride b := stride LineTo{to: [0 10mm]}");
+    let p = eval(&aliases).expect("a segment can occur twice without a selector");
+    let body = p.solid("body").unwrap();
+    assert_eq!(&body.sides[..2], &[Some("a".into()), Some("b".into())], "both child names remain in the side table");
+    assert!(body.side_name(0).is_none() && body.side_name(1).is_none(), "an ambiguous object cannot be written as a unique side selector");
+    let select_stride = ROUND.replace("section.base", "stride");
+    assert_eq!(face(&eval(&(unique + &select_stride)).unwrap()).role, Role::Side(1), "a segment object in a generated list names its side");
+    let repeated = stride + &select_stride;
+    let repeated_path = src.replace("sketch: section", "sketch: [section Circle{radius: 1mm} section]");
+    for (bad, message) in [
+        (wrong, "side(section.base) names a side of the extrude that drew section: write it on that part, e.g. body.side(section.base)"),
+        (numbered, "side(i) is a side of the extrude or revolve that drew the sketch: write it on that part, e.g. body.side(2)"),
+        (later, "side(section.base): put section first in its sketch, or name the side by number"),
+        (repeated, "stride makes sides 1 and 2: name the side by number, e.g. body.side(1)"),
+        (repeated_path, "section.base makes sides 0 and 6: name the side by number, e.g. body.side(0)"),
+    ] {
+        let errors = eval(&bad).err().expect("an unresolved or ambiguous segment is refused");
+        assert!(errors.iter().any(|d| d.line as usize == bad.lines().count() && d.col > 1 && d.message.contains(message)), "locate the selector diagnostic {message}: {errors:?}");
+    }
+}
+
 /// A sweep's `scale` is its size along the way: an exact sweep's one per path point, or the end's
 /// reached evenly; no sweep takes it again as a placement scale.
 #[test]
@@ -1450,9 +1624,15 @@ fn a_sweeps_scale_sizes_it_along_the_way() {
     let src = "use mod.model.*\nuse mod.fab.*\nlet m = mod.model\nlet path = [[0, 0, 0] [0, 10mm, 0] [0, 40mm, 0]]\nlet lock = m.brep.sweep({sketch: Circle{radius: 1mm} path: path scale: [1.2 0.8 0.5]})\nlet horn = m.brep.sweep({sketch: Circle{radius: 1mm} path: path scale: 0.2})\nlet rod = m.sweep({sketch: Circle{radius: 1mm} path: path scale: 0.5})\nplace(lock)\nplace(horn)\nplace(rod)\n";
     let p = eval(src).unwrap();
     let op = |name: &str| &p.graph.node(p.solid(name).unwrap().node).op;
-    let Op::Brep { op: BrepOp::Sweep { path, scale, .. }, .. } = op("lock") else { panic!("lock: {:?}", op("lock")) };
+    let exact_sweep = |name: &str| {
+        let Op::Brep { op: BrepOp::Place { at, rotate, scale }, inputs } = op(name) else { panic!("{name} needs its own exact placement") };
+        assert_eq!((*at, *rotate, *scale), ([0.0; 3], [0.0; 3], [1.0; 3]), "{name}'s sweep scale must leave its placement at identity");
+        let [sweep] = inputs.as_slice() else { panic!("{name} must place one sweep") };
+        &p.graph.node(*sweep).op
+    };
+    let Op::Brep { op: BrepOp::Sweep { path, scale, .. }, .. } = exact_sweep("lock") else { panic!("lock needs an exact sweep") };
     assert_eq!((path.len(), scale.as_slice()), (3, &[1.2, 0.8, 0.5][..]));
-    let Op::Brep { op: BrepOp::Sweep { scale, .. }, .. } = op("horn") else { panic!("horn: {:?}", op("horn")) };
+    let Op::Brep { op: BrepOp::Sweep { scale, .. }, .. } = exact_sweep("horn") else { panic!("horn needs an exact sweep") };
     assert_eq!(scale.len(), 3);
     assert!((scale[0] - 1.0).abs() < 1e-12 && (scale[1] - 0.8).abs() < 1e-12 && (scale[2] - 0.2).abs() < 1e-12, "{scale:?}");
     let Op::Sweep { scale, .. } = op("rod") else { panic!("rod: {:?}", op("rod")) };
@@ -1736,4 +1916,46 @@ fn the_no_solid_refusal_stays_short_and_names_values() {
     assert_eq!(err.matches(anonymous[0]).count(), 1, "the loop's parts once: {err}");
     assert!(err.contains("takes: w, red, value_0"), "the values: {err}");
     assert!(err.contains(" more") && err.contains("fab.tree") && err.contains("fab.params"), "where the rest are: {err}");
+}
+
+/// A library's fns are called by name in an isolate of their own, with values copied in and out,
+/// any number of times, and a failure is located in the library's source.
+#[test]
+fn a_module_isolate_calls_a_library_fn_by_name_with_copied_values() {
+    let libraries = [Library {
+        file: "rules.splash".into(),
+        source: "use mod.math.*\nfn gap(a, b) {\n    return abs(a.at[0] - b.at[0]) - a.w / 2 - b.w / 2\n}\nfn plan(ports, spec) {\n    let out = []\n    for p in ports { out.push({name: p.name + \"!\" gap: gap(p, ports[0]) kind: p.kind ok: spec.ok ?? true}) }\n    return {rows: out count: ports.len() nothing: nil}\n}\nfn broken(p) {\n    return p.missing.deeper\n}\nfn builds() {\n    return m.box({size: [1mm 1mm 1mm]})\n}\nlet lib = {plan: plan broken: broken builds: builds}\nlib".into(),
+    }];
+    let mut iso = ModuleIsolate::load(&libraries).expect("the library loads");
+    assert!(iso.has("plan") && !iso.has("gap") && !iso.has("nope"), "the library's own object names what can be called");
+    let port = |name: &str, x: f64| V::record(vec![("name", V::Str(name.into())), ("at", V::Arr(vec![V::Num(x), V::Num(0.0)])), ("w", V::Num(0.002)), ("kind", V::Id("light".into()))]);
+    let ports = V::Arr(vec![port("A", 0.0), port("B", 0.0035)]);
+    let first = iso.call("plan", &[ports.clone(), V::record(vec![])]).expect("the plan is called");
+    let again = iso.call("plan", &[ports, V::record(vec![("ok", V::Bool(false))])]).expect("the same isolate takes another call");
+    let V::Obj(out) = &first else { panic!("a record comes back: {first:?}") };
+    assert!(matches!(out.get("count"), Some(V::Num(n)) if *n == 2.0), "an array argument is copied whole: {first:?}");
+    assert!(matches!(out.get("nothing"), Some(V::Nil)), "nil comes back as nil");
+    let Some(V::Arr(rows)) = out.get("rows") else { panic!("rows: {first:?}") };
+    let V::Obj(row) = &rows[1] else { panic!("row: {rows:?}") };
+    assert!(matches!(row.get("name"), Some(V::Str(s)) if s == "B!"), "text is copied in and back");
+    assert!(matches!(row.get("kind"), Some(V::Id(s)) if s == "light"), "an id stays an id");
+    assert!(matches!(row.get("gap"), Some(V::Num(n)) if (*n - 0.0015).abs() < 1e-12), "numbers are the script's own, gap of 3.5mm - 2mm");
+    let V::Obj(row) = &(match &again { V::Obj(o) => o.get("rows").cloned(), _ => None }).and_then(|r| match r { V::Arr(r) => r.into_iter().next(), _ => None }).expect("the second call's rows") else { panic!() };
+    assert!(matches!(row.get("ok"), Some(V::Bool(false))), "the second call has its own spec");
+
+    let errors = iso.call("broken", &[V::record(vec![])]).expect_err("a fn that reads a missing field fails");
+    assert!(errors.iter().any(|e| e.message.contains("rules.splash:") ), "a failure is located in the library: {errors:?}");
+    assert!(iso.call("plan", &[V::Arr(vec![]), V::record(vec![])]).is_ok(), "the isolate is still usable after a failed call");
+    let errors = iso.call("builds", &[]).expect_err("an isolate has no part builders");
+    assert!(errors.iter().any(|e| e.message.contains("rules.splash:")), "{errors:?}");
+    let errors = iso.call("nope", &[]).expect_err("an unknown name");
+    assert!(errors[0].message.contains("no fn named 'nope'") && errors[0].message.contains("plan"), "{errors:?}");
+    let errors = iso.call("plan", &[V::Fn(makepad_script::NIL), V::Nil]).expect_err("a fn cannot cross");
+    assert!(errors[0].message.contains("argument 1"), "{errors:?}");
+    let bad = V::record(vec![("p", V::Other("a thing".into()))]);
+    assert!(iso.call("plan", &[bad, V::Nil]).is_err(), "an unreadable value is refused");
+
+    let broken = [Library { file: "bad.splash".into(), source: "fn f() {\n    return 1 +\n}\nlet lib = {f: f}\nlib".into() }];
+    let errors = ModuleIsolate::load(&broken).err().expect("a library that does not parse is refused");
+    assert!(errors.iter().any(|e| e.message.contains("bad.splash")), "a load error names the library: {errors:?}");
 }

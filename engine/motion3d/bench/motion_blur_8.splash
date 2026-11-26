@@ -1,0 +1,6 @@
+use mod.scene.*; use mod.post
+// Eight-sample motion blur (one scene pass per sample) on a spinning shape.
+Scene3D{ background: #101218 environment: Environment{preset: @studio} camera: Camera{position: vec3(0, 1, 7) target: vec3(0, 0, 0) fov: 40}
+  post: [post.MotionBlur{shutter: 180 samples: 8} post.Bloom{}]
+  lights: [DirectionalLight{position: vec3(4, 8, 3) intensity: 2}]
+  children: [Mesh{geometry: TorusKnotGeometry{radius: 1.3 tube: 0.35 tubular_segments: 256 radial_segments: 32} rotation: spin(vec3(0, 540, 90)) material: MeshPhysicalMaterial{color: #36a2ff clearcoat: 1}}] }

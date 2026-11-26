@@ -58,20 +58,7 @@ script_mod! {
                 width: Fit height: Fit flow: Right align: Align{y: 0.5}
                 padding: Inset{top: 2 bottom: 2 left: 0 right: 0} spacing: 1
                 a11y: {role: "toolbar" label: "Mechanics actions"}
-                // the plate's mode, where the plate's own row has it in the other modes
-                run_mode := Run{
-                    FabTip{ text: "What the plate is for: Design edits it, Mechanics runs it in a physics sim, Monitor shows the printer's job. It stays as it is across workspaces."
-                        plate_mode := mod.widgets.FabDropdownButton{
-                            height: 24
-                            a11y: {label: "Plate mode"}
-                            tag: @fab_plate_mode
-                            owner: @fab_plate_mode
-                            label +: { text: "Mechanics" }
-                        }
-                    }
-                }
                 run_parts := Run{
-                    rule := Rule{}
                     FabTip{ text: "Drop: let the selected parts fall onto the plate (all parts when none is selected)"
                         drop := Button{ a11y: {label: "Drop"} draw_icon +: { svg: crate_resource("self://resources/icons/drop.svg") } }
                     }
@@ -157,15 +144,15 @@ pub struct FabMechActions {
     view: View,
     /// Each run's width without its leading rule, as last drawn (0: not drawn yet).
     #[rust]
-    runs: [f64; 4],
+    runs: [f64; 3],
     /// The header strip's height as last drawn (0: not drawn yet).
     #[rust]
     strip_h: f64,
 }
 
 /// The bar's runs, in order.
-fn runs() -> [&'static [LiveId]; 4] {
-    [ids!(bar.run_mode), ids!(bar.run_parts), ids!(bar.run_scene), ids!(bar.run_play)]
+fn runs() -> [&'static [LiveId]; 3] {
+    [ids!(bar.run_parts), ids!(bar.run_scene), ids!(bar.run_play)]
 }
 
 /// What a run's leading rule takes: the rule (1) with its margins (4 + 4) and the run's spacing (1).
@@ -179,10 +166,10 @@ const STRIP_RIGHT: f64 = 8.0;
 /// How runs of `widths` (rules not counted) fill rows of `room` in order, each run after a row's
 /// first adding its rule: which runs start a row, the width a run wider than the room is squeezed
 /// to (it then wraps its own controls, on rows of its own), and the widest row's inner width.
-fn arrange(widths: &[f64; 4], room: f64) -> ([bool; 4], [Option<f64>; 4], f64) {
+fn arrange(widths: &[f64; 3], room: f64) -> ([bool; 3], [Option<f64>; 3], f64) {
     let room = room.max(1.0);
-    let mut starts = [false; 4];
-    let mut squeeze = [None; 4];
+    let mut starts = [false; 3];
+    let mut squeeze = [None; 3];
     let (mut row, mut widest) = (0.0f64, 0.0f64);
     for (i, &natural) in widths.iter().enumerate() {
         let w = if natural > room {
@@ -216,7 +203,7 @@ impl FabMechActions {
     /// own wraps its controls as well. The arrangement is set before the
     /// bar draws, from the run widths [`Self::measure`] took after the last draw; the very first
     /// draw is one row. It is read back from the widgets, never kept apart from them (a design
-    /// reload puts their defaults back). Per draw: eight lookups and the bar's walk. O(1).
+    /// reload puts their defaults back). Per draw: six lookups and the bar's walk. O(1).
     fn arrange(&mut self, cx: &mut Cx2d, walk: Walk) {
         if self.runs.contains(&0.0) {
             return;
@@ -253,7 +240,7 @@ impl FabMechActions {
     /// natural width it had, which is what decides when it stops being squeezed. A width that changed (a
     /// label, Listen showing, the first draw) asks for one more draw, so the arrangement follows on
     /// the next frame; a settled bar asks for none. The rects are only good after the draw: one read
-    /// before it sees the area this redraw is about to replace. Per draw: eight lookups, four rect
+    /// before it sees the area this redraw is about to replace. Per draw: six lookups, three rect
     /// reads.
     fn measure(&mut self, cx: &mut Cx2d) {
         let mut changed = false;

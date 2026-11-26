@@ -19,9 +19,9 @@ use crate::progress::Progress;
 use crate::request::{Base, Effort, RouteScope};
 use crate::solution::RouteSolution;
 use crate::world::{Fixity, RBase, RItem};
-use fab_elec_board::{dangling_ends, Board, BoardOp, ConnItem, Connectivity, ItemKind, RuleMatrix, ZoneFill};
-use fab_elec_circuit::{Circuit, ViaSize};
-use fab_elec_core::{BBox, ClassId, CompId, ItemId, LayerId, LayerSet, NetId, Nm, P};
+use fab_elec_board::{dangling_ends, Board, ConnItem, Connectivity, ItemKind, RuleMatrix, ZoneFill};
+use fab_elec_circuit::ViaSize;
+use fab_elec_core::{BBox, ClassId, ItemId, LayerId, LayerSet, NetId, Nm, P};
 use std::sync::Arc;
 
 /// The copper layers and each one's preferred direction.
@@ -243,11 +243,6 @@ pub fn rnet(board: &Board, rules: &RuleMatrix, conn: &Connectivity, stack: &RSta
 pub trait Autorouter {
     fn name(&self) -> &str;
     fn route(&mut self, p: &RouteProblem, progress: &Progress) -> RouteSolution;
-}
-
-/// Makes any placement legal with minimal movement (E1 4.8).
-pub trait Legaliser {
-    fn legalise(&mut self, board: &Board, circuit: &Circuit, scope: &[CompId]) -> Vec<BoardOp>;
 }
 
 /// The point of a terminal piece a route attaches to when nothing nearer is wanted: a pad's or

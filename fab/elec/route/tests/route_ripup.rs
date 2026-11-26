@@ -428,6 +428,25 @@ fn rip_up_moves_a_net_out_of_the_way_and_streams_it() {
     assert_crosses_gap(&sol, N, mm(6.0), mm(4.4), mm(5.6));
     assert_crosses_gap(&sol, M2, mm(6.0), mm(1.0), mm(1.85));
     assert_eq!(sol.metrics.work.rips, 2, "history: one failed M1 rip must precede the successful M2 rip");
+    // Where the work went: each expansion is of one search kind, and each one after the first
+    // pass belongs to one attempt, kept or rolled back.
+    let work = &sol.metrics.work;
+    let s = work.by_search;
+    assert_eq!(s.widening + s.blockers + s.priced_blockers + s.what_if + s.escape, work.expansions, "work: the search kinds must sum to the expansions: {s:?}");
+    assert_eq!(work.open_after_first_pass, 1, "work: the first pass must leave N open");
+    let a = work.by_attempt;
+    assert!(a.kept > 0 && a.rolled_back > 0, "work: the kept and the rolled-back attempt must each count work: {a:?}");
+    assert_eq!(a.kept + a.rolled_back, work.expansions - first.metrics.work.expansions, "work: the attempts' fates must sum to the work after the first pass: {a:?}");
+    assert!(a.after_unkeepable <= a.rolled_back, "work: work after an attempt could no longer be kept is part of its rollback: {a:?}");
+
+    // At fast effort the job ends after the first pass: N stays open, blocked by M1, nothing is
+    // ripped, and the work is the first pass's.
+    let mut fast = p.clone();
+    fast.effort = Effort::Fast;
+    let quick = GridRouter::default().route(&fast, &Progress::new());
+    assert!(blocked_by(&quick, N, &[M1]) && quick.open.len() == 1, "fast: the first pass's open net and its blocker are named: {:?}", quick.open);
+    assert_eq!((quick.metrics.work.rips, quick.metrics.work.expansions), (0, first.metrics.work.expansions),
+        "fast: no rip-up, only the first pass's work");
 
     assert!(
         partials.windows(2).all(|pair| pair[0].0 < pair[1].0),

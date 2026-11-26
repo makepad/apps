@@ -43,7 +43,9 @@
 //! and the basis for A-N9b across rates. In rounds it judges past the first plan and the read's
 //! settling time, with the start reported separately. A second candidate take checks what the
 //! merged points inside a period contribute. With `ELEC_TAKE_SELF=1` as well, it runs the reference
-//! twice, applies both judges and compares both nets' delivered frames by bits.
+//! twice, applies both judges and compares both nets' delivered frames by bits. With
+//! `ELEC_SHIP_PLAN=1` (bar B's split, at the shipping settings) its run in rounds holds the plan
+//! in force to the shipping plan's blocks and stages (`SHIP_PLAN`).
 //! Fast's bars against that reference (`ELEC_RATE=48000`, res
 //! 100 us): the worst pitch (between the triggers) at most 0.28 cents off, the LINE third-octave band furthest off at
 //! most 1.682 dB (1.65 dB until the bypass corner fix, #6659, made the bypass correct and moved
@@ -68,7 +70,8 @@
 //! `ELEC_RATE` picks the run's Hz; `ELEC_HELPERS=0` steps it whole (default: in rounds on the
 //! host's pool, `ELEC_HELPERS=host`).
 //! `ELEC_STEPS_A_PERIOD=<n>` caps a Fast board step at 1/n of its sample period for n >= 2,
-//! keeping its sample rate and noise spacing.
+//! keeping its sample rate and noise spacing; its rounds keep the plan made at the shipping step,
+//! so bar A's split at the quarter step plays the plan that ships.
 //! `board <secs> <res us,..> snapshot` takes a snapshot of the
 //! run (`LiveSim::snapshot`) at each return from `advance` and prints what one costs: microseconds and
 //! the bytes it allocates (counted by the example's allocator), and a restore's microseconds.
@@ -964,6 +967,14 @@ impl<const N: usize> Sink for TakeSink<'_, N> {
     }
 }
 
+/// drum16's board planned at the shipping settings (Fast's 100 us at the audio rate, the heard
+/// band, the board's own declarations): its blocks and its stages. Every user's run plays this
+/// plan, and the planner's tests plan at other steps, so bar B's split holds its plan to it
+/// (`ELEC_SHIP_PLAN`): the supplies in block 0, the voices beside the MCU on stage 1, the snare
+/// after its noise and the line out last. A planner change that moves it retakes the realtime
+/// take and sets it again.
+const SHIP_PLAN: (usize, usize) = (8, 4);
+
 #[derive(Default)]
 struct DrumRun<'a> {
     res: f64,
@@ -1030,7 +1041,7 @@ struct Declared {
 impl Declared {
     /// The planner's bars (`plan_blocks` with the live ones).
     fn opts(&self) -> fab_elec_sim::analysis::partition::PartOpts {
-        fab_elec_sim::analysis::partition::PartOpts { never_cut: self.never_cut.clone(), land: self.land.clone(), cut_tol: fab_elec_sim::analysis::round::CUT_TOL, hub_tol: 0.1, fmin: 10.0, fmax: self.fmax, band: self.band, per_octave: 4, min_island: 8, control: Vec::new(), supplies: Vec::new(), round: self.round }
+        fab_elec_sim::analysis::partition::PartOpts { never_cut: self.never_cut.clone(), land: self.land.clone(), cut_tol: fab_elec_sim::analysis::round::CUT_TOL, hub_tol: 0.1, fmin: 10.0, fmax: self.fmax, band: self.band, per_octave: 4, min_island: 8, control: Vec::new(), supplies: Vec::new(), heard: Vec::new(), round: self.round }
     }
 
     /// The circuit with `only` declared its supplies instead of the board's.
@@ -2239,9 +2250,13 @@ fn drum(secs: f64, run: DrumRun<'_>) -> (Rec, Vec<String>) {
     // drum16 has an audio output: the host's default rate for it
     let sample_rate = drum_rate(reference);
     let mut max_step = defaults.max_step;
+    // the step the plan is made at: the shipping step (`LiveSim::step_cap` at the default bound)
+    // when `ELEC_STEPS_A_PERIOD` steps finer, the run's own step otherwise
+    let mut plan_step = None;
     if res > 0.0 && sample_rate.is_finite() && sample_rate > 0.0 {
         if let Some(n) = std::env::var("ELEC_STEPS_A_PERIOD").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n >= 2) {
             max_step = max_step.min(1.0 / (sample_rate * n as f64));
+            plan_step = Some(defaults.max_step.min(1.0 / sample_rate));
         }
     }
     let spec = LiveSpec {
@@ -2260,7 +2275,11 @@ fn drum(secs: f64, run: DrumRun<'_>) -> (Rec, Vec<String>) {
         print!("{}", plan.report());
     }
     let max_step = sim.step_cap();
+    let plan_step = plan_step.unwrap_or(max_step);
     println!("  sample rate {:.1} kHz: steps of at most {:.2} us", sim.sample_rate() / 1e3, max_step * 1e6);
+    if plan_step != max_step && rounds.is_some() {
+        println!("  planned at the shipping step, {:.2} us: the rounds play the plan that ships", plan_step * 1e6);
+    }
     sim.attach(Some(device));
     // `ELEC_HELPERS=host`: in rounds on the host's pool, a run's work where the host's live bench
     // puts it (`host_pool`); the planner's work goes to its background jobs too
@@ -2320,7 +2339,7 @@ fn drum(secs: f64, run: DrumRun<'_>) -> (Rec, Vec<String>) {
     if attrib {
         use fab_elec_sim::analysis::attrib::Attribution;
         use fab_elec_sim::analysis::partition::{partition, PartOpts};
-        let opts = PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: fab_elec_sim::analysis::round::CUT_TOL, hub_tol: 0.1, fmin: 10.0, fmax: 0.5 / max_step, band: f64::INFINITY, per_octave: 4, min_island: 8, control: Vec::new(), supplies: Vec::new(), round: 32.0 * max_step };
+        let opts = PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: fab_elec_sim::analysis::round::CUT_TOL, hub_tol: 0.1, fmin: 10.0, fmax: 0.5 / max_step, band: f64::INFINITY, per_octave: 4, min_island: 8, control: Vec::new(), supplies: Vec::new(), heard: Vec::new(), round: 32.0 * max_step };
         let p = partition(&lowered.circuit, &opts).unwrap_or_else(|e| panic!("the board partitions: {}", e.message));
         let blocks: Vec<Vec<String>> = p.border_blocks(&DRUM_BORDER).expect("the border nets exist").iter()
             .map(|b| b.iter().map(|&u| p.names[u].clone()).collect()).collect();
@@ -2382,7 +2401,7 @@ fn drum(secs: f64, run: DrumRun<'_>) -> (Rec, Vec<String>) {
                 let (born, to) = entry.split_once('>').unwrap_or((entry, entry));
                 Land { born: born.to_string(), to: to.to_string() }
             }).collect()).unwrap_or_default();
-            sim.set_planner(Some(Box::new(Declared { fmax: 0.5 / max_step, band, never_cut: Vec::new(), land, round: sim.round_len(), only: declared.clone(), handovers: handovers.clone(), states: plan_states(), pool: plan_pool.clone(), carry: std::env::var_os("ELEC_CARRY").is_some() && !carry_source }))).unwrap_or_else(|d| panic!("the round plan installs: {d}"));
+            sim.set_planner(Some(Box::new(Declared { fmax: 0.5 / plan_step, band, never_cut: Vec::new(), land, round: sim.round_len(), only: declared.clone(), handovers: handovers.clone(), states: plan_states(), pool: plan_pool.clone(), carry: std::env::var_os("ELEC_CARRY").is_some() && !carry_source }))).unwrap_or_else(|d| panic!("the round plan installs: {d}"));
             // A synchronous first plan is already in rounds. Only a deferred plan calls started.
             if take && sim.block_work().is_some() {
                 sink.started();
@@ -2397,6 +2416,16 @@ fn drum(secs: f64, run: DrumRun<'_>) -> (Rec, Vec<String>) {
         }
     }
     let wall = start.elapsed() - taken.iter().map(|&(d, _)| d).sum::<Duration>();
+    // board-acc's reference arm runs whole; its candidate in rounds is the one held
+    if std::env::var_os("ELEC_SHIP_PLAN").is_some() && rounds.is_some() {
+        assert!((res - 100e-6).abs() < 1e-12 && sample_rate == AUDIO_SAMPLE_RATE && band == heard,
+            "ELEC_SHIP_PLAN: a run in rounds at the shipping settings (res 100 us, {AUDIO_SAMPLE_RATE} Hz, the heard band), not res {res} s, {sample_rate} Hz, band {band} Hz");
+        let plan = sim.round_plan().expect("ELEC_SHIP_PLAN: the board runs in rounds at the shipping settings");
+        let stages = plan.blocks.iter().map(|b| b.stage as usize + 1).max().unwrap_or(0);
+        let shape: Vec<String> = plan.blocks.iter().map(|b| format!("{} (stage {})", b.name, b.stage)).collect();
+        assert_eq!((plan.blocks.len(), stages), SHIP_PLAN, "the shipping plan is {} blocks over {} stages: {shape:?}", SHIP_PLAN.0, SHIP_PLAN.1);
+        println!("board-acc ship plan: {} blocks over {stages} stages, as shipped", plan.blocks.len());
+    }
     if take {
         sink.ended(sim.t());
         sink.idle();
@@ -2757,11 +2786,37 @@ fn relative_error(error: f64, scale: f64) -> f64 {
 /// and its distance from the reference is its stated cost, printed: a change to Fast keeps each
 /// judged band within 1 dB of the Fast before it, and the oscillators within 2 cents of the
 /// reference at the host's 96 kHz. A metal oscillator's pitch is the slope of its edge error
-/// between the triggers (`edge_pitch`); its phase step at a trigger is judged on its own: in rounds
-/// each oscillator's largest within 26 us of the reference, the 48 kHz band's figure (25.0 us,
-/// y[4], at 96 kHz) with its scatter (0.9 us). The reference's own noise is under 0.2 us (Exact at
-/// reltol 1e-4 against 1e-5: steps 0.1 us, scatter 0.16 us), whole Fast's steps under 1 us.
+/// between the triggers (`edge_pitch`); its phase step at a trigger is printed, and a plan's own
+/// steps at hits are judged by what is heard (the hit bar, `HIT_ON_TIME_US`): at the 48 kHz band
+/// in rounds they reach 25 us with drum16's own pattern and 194 us with every voice on every step,
+/// unheard. The reference's own noise is under 0.2 us (Exact at reltol 1e-4 against 1e-5: steps
+/// 0.1 us, scatter 0.16 us), whole Fast's steps under 1 us.
 const BAND_JUDGED_DB: f64 = 30.0;
+
+/// The hats' envelopes: their edges are when a hat sounds (the hit bar, `HIT_ON_TIME_US`).
+const HATS_ENVELOPES: [&str; 2] = ["ENV", "OENV"];
+
+/// The hit bar: a plan's own phase steps at hits, judged by what is heard. The oscillators of the
+/// hats' metal run free, so every hit of the circuit itself catches them at another phase: a step
+/// moves no hit, and is heard only if it widens the hits' tone from one hit to the next. Per hats
+/// hit (`hit_figures`), against the reference: the hats' triggers and envelopes on time within
+/// `HIT_ON_TIME_US` (a flam needs a millisecond); each hit's hats bands from `HIT_FROM_HZ` to
+/// `BAND_TOP_HZ` within `HIT_BAND_DB`; and from one hit to the next, the run's largest band change
+/// there at most `HIT_SPREAD_DB` over the reference's. The bounds are the figures with every voice
+/// and the accent on every step (`ELEC_PATTERN=full`, the 48 kHz band in rounds on one helper at
+/// 96 kHz: 7.9 us, 1.2 dB, 0.17 dB) with headroom. Below `HIT_FROM_HZ`, where HATS is 20 to 30 dB
+/// under its loudest band, the figures are printed, not judged: there that run's hit-to-hit change
+/// reaches 5.2 dB against the reference's 3.9 dB.
+const HIT_ON_TIME_US: f64 = 10.0;
+
+/// The hit bar's lowest judged band (Hz, `HIT_ON_TIME_US`).
+const HIT_FROM_HZ: u32 = 2000;
+
+/// The hit bar's largest band difference of a hit from the reference's (dB, `HIT_ON_TIME_US`).
+const HIT_BAND_DB: f64 = 1.5;
+
+/// The hit bar's largest widening of the change from one hit to the next (dB, `HIT_ON_TIME_US`).
+const HIT_SPREAD_DB: f64 = 0.5;
 
 /// The highest third-octave band board-acc judges (Hz): the 20 kHz band, past what most hear and
 /// at a 48 kHz run's band edge, is printed, not judged.
@@ -3441,6 +3496,7 @@ fn polyline_errors(base: &Rec, cand: &Rec, names: &[String], cand_names: &[Strin
     let mut worst_edge: Option<(&str, f64)> = None;
     let mut worst_pitch: Option<(&str, f64)> = None;
     let mut worst_step: Option<(&str, f64)> = None;
+    let mut worst_on_time: Option<(&str, f64)> = None;
     let events = trigger_events(base, names, from, to);
     let mut edge_lines = Vec::new();
     let mut count_mismatches = 0;
@@ -3480,7 +3536,7 @@ fn polyline_errors(base: &Rec, cand: &Rec, names: &[String], cand_names: &[Strin
         if let Some(net) = ["LINE", "NOISE"].iter().position(|n| *n == name.as_str()) {
             band_max[net] = band_errors("", name, &a, &b, 1e-6, to - from, false);
         }
-        if DRUM_TRIGGERS.contains(&name.as_str()) || (0..6).any(|k| *name == format!("hats.metal.y[{k}]")) {
+        if DRUM_TRIGGERS.contains(&name.as_str()) || HATS_ENVELOPES.contains(&name.as_str()) || (0..6).any(|k| *name == format!("hats.metal.y[{k}]")) {
             let level = lo + 0.5 * range;
             let reference = rising_edges(base, i, level, from, to);
             let run = rising_edges(cand, j, level, from, to);
@@ -3501,6 +3557,10 @@ fn polyline_errors(base: &Rec, cand: &Rec, names: &[String], cand_names: &[Strin
                 }
                 if worst_edge.is_none_or(|(_, value)| max > value) {
                     worst_edge = Some((name, max));
+                }
+                let hats = ["CHAT", "OHAT"].contains(&name.as_str()) || HATS_ENVELOPES.contains(&name.as_str());
+                if hats && worst_on_time.is_none_or(|(_, value)| max > value) {
+                    worst_on_time = Some((name, max));
                 }
                 format!("mean_abs_dt_us={:.6e} max_abs_dt_us={max:.6e}", sum / run.len() as f64)
             };
@@ -3533,15 +3593,101 @@ fn polyline_errors(base: &Rec, cand: &Rec, names: &[String], cand_names: &[Strin
     for line in edge_lines {
         println!("{line}");
     }
+    let hits = hit_figures(base, cand, names, cand_names, &grid, from, to);
     let net_summary = worst_net.map_or_else(|| "n/a rms/range=n/a".to_string(), |(name, value)| format!("{name} rms/range={value:.6e}"));
     let edge_summary = worst_edge.map_or_else(|| "n/a max_abs_dt_us=n/a".to_string(), |(name, value)| format!("{name} max_abs_dt_us={value:.6e}"));
     let [line_band, noise_band] = band_max.map(band_summary);
     let pitch_summary = worst_pitch.map_or_else(|| "n/a cents=n/a".to_string(), |(name, value)| format!("{name} cents={value:.3}"));
     let step_summary = worst_step.map_or_else(|| "n/a us=n/a".to_string(), |(name, value)| format!("{name} us={value:.1}"));
     println!("board-acc summary res_us={:.6}: worst_net={net_summary} audio={audio_summary} line_band_max_abs_db={line_band} noise_band_max_abs_db={noise_band} worst_edge={edge_summary} worst_pitch={pitch_summary} worst_phase_step={step_summary} edge_count_mismatches={count_mismatches}", res * 1e6);
+    let verdict = |ok: bool| if ok { "PASS" } else { "FAIL" };
+    let on_time = worst_on_time.map_or_else(|| "on_time=n/a".to_string(), |(name, us)| format!("on_time={name} {us:.3} us (bar {HIT_ON_TIME_US}) -> {}", verdict(us <= HIT_ON_TIME_US)));
+    let per_hit = match hits {
+        Some((band, excess, n)) => format!("per_hit={band:.3} dB (bar {HIT_BAND_DB}) -> {} spread_excess={} hits={n}", verdict(band <= HIT_BAND_DB),
+            excess.map_or_else(|| "n/a".to_string(), |x| format!("{x:+.3} dB (bar {HIT_SPREAD_DB}) -> {}", verdict(x <= HIT_SPREAD_DB)))),
+        None => "per_hit=n/a spread_excess=n/a hits=0".to_string(),
+    };
+    println!("board-acc hits res_us={:.6}: {on_time} {per_hit}", res * 1e6);
     if std::env::var_os("ELEC_ACC_EDGES").is_some() {
         error_in_time(base, cand, names, cand_names, &grid);
     }
+}
+
+/// The hit bar's figures (`HIT_ON_TIME_US`) on HATS, run against reference: a hit is a CHAT or
+/// OHAT pulse's first edge, its window from 1 ms before it to the next hit, at most 100 ms. Prints
+/// each hit's largest band difference (third octaves within `BAND_JUDGED_DB` of the hit's loudest,
+/// to `BAND_TOP_HZ`), from `HIT_FROM_HZ` up and below it, and per pad each next hit's largest band
+/// change from the hit before, in the reference and in the run. Returns the largest difference
+/// from `HIT_FROM_HZ` up, the largest excess of the run's change over the reference's there (None
+/// without two hits of a pad), and the hits; None without HATS or a hit. O(hits x the window's FFT).
+fn hit_figures(base: &Rec, cand: &Rec, names: &[String], cand_names: &[String], grid: &[f64], from: f64, to: f64) -> Option<(f64, Option<f64>, usize)> {
+    let take = |r: &Rec, ns: &[String]| -> Option<Vec<f64>> {
+        let i = ns.iter().position(|n| n == "HATS")?;
+        let mut out = Vec::new();
+        resample(r, i, grid, &mut out);
+        Some(out)
+    };
+    let (a, b) = (take(base, names)?, take(cand, cand_names)?);
+    let at = |t: f64| (((t - grid[0]) * 1e6).round().max(0.0) as usize).min(grid.len() - 1);
+    let mut hits: Vec<(f64, &str)> = Vec::new();
+    for pad in ["CHAT", "OHAT"] {
+        // the pad's own trigger edges; a pulse's second edge is no hit
+        let only: Vec<String> = names.iter().map(|n| if n == pad { n.clone() } else { String::new() }).collect();
+        let mut last = f64::NEG_INFINITY;
+        for e in trigger_events(base, &only, from, to) {
+            if e - last > 20e-3 {
+                hits.push((e, pad));
+            }
+            last = e;
+        }
+    }
+    hits.sort_by(|x, y| x.0.total_cmp(&y.0));
+    // the largest band difference of `y` from `x`, from `HIT_FROM_HZ` up and below, and its band
+    let differ = |x: &[f64], y: &[f64]| -> ((f64, u32), (f64, u32)) {
+        let (rx, ry) = (third_octave(x, 1e-6), third_octave(y, 1e-6));
+        let loudest = THIRD_OCTAVE_HZ.iter().zip(&rx).filter(|(hz, _)| **hz <= BAND_TOP_HZ).filter_map(|(_, v)| *v).filter(|v| v.is_finite()).fold(f64::NEG_INFINITY, f64::max);
+        let (mut high, mut low) = ((0.0, 0), (0.0, 0));
+        for (band, &hz) in THIRD_OCTAVE_HZ.iter().enumerate() {
+            let (Some(u), Some(v)) = (rx[band], ry[band]) else { continue };
+            if hz > BAND_TOP_HZ || u < loudest - BAND_JUDGED_DB {
+                continue;
+            }
+            let d = if u == v { 0.0 } else { (v - u).abs() };
+            let side = if hz >= HIT_FROM_HZ { &mut high } else { &mut low };
+            if d > side.0 {
+                *side = (d, hz);
+            }
+        }
+        (high, low)
+    };
+    let mut windows: Vec<(&str, usize, usize)> = Vec::new();
+    let mut worst = 0.0f64;
+    for (h, &(e, pad)) in hits.iter().enumerate() {
+        let end = hits.get(h + 1).map_or(to, |x| x.0).min(e + 0.1).min(to);
+        let (lo, hi) = (at(e - 1e-3), at(end));
+        if hi < lo + 5000 {
+            continue;
+        }
+        let ((high, high_hz), (low, low_hz)) = differ(&a[lo..hi], &b[lo..hi]);
+        worst = worst.max(high);
+        println!("  hit {pad} at {e:.6} s: hats bands run-ref, {HIT_FROM_HZ} to {BAND_TOP_HZ} Hz at most {high:.3} dB ({high_hz} Hz); below, {low:.3} dB ({low_hz} Hz), not judged");
+        windows.push((pad, lo, hi - lo));
+    }
+    if windows.is_empty() {
+        return None;
+    }
+    let mut excess: Option<f64> = None;
+    for pad in ["CHAT", "OHAT"] {
+        let mine: Vec<&(&str, usize, usize)> = windows.iter().filter(|w| w.0 == pad).collect();
+        for w in mine.windows(2) {
+            let len = w[0].2.min(w[1].2);
+            let ((rh, _), (rl, _)) = differ(&a[w[0].1..w[0].1 + len], &a[w[1].1..w[1].1 + len]);
+            let ((uh, _), (ul, _)) = differ(&b[w[0].1..w[0].1 + len], &b[w[1].1..w[1].1 + len]);
+            excess = Some(excess.map_or(uh - rh, |x| x.max(uh - rh)));
+            println!("  hit to hit {pad} at {:.6} s: the largest band change, {HIT_FROM_HZ} to {BAND_TOP_HZ} Hz: reference {rh:.3} dB, run {uh:.3} dB; below, reference {rl:.3} dB, run {ul:.3} dB, not judged", grid[w[1].1]);
+        }
+    }
+    Some((worst, excess, windows.len()))
 }
 
 fn board_errors(base: &Rec, cand: &Rec, names: &[String], cand_names: &[String], res: f64) {
@@ -3569,7 +3715,7 @@ fn board_errors(base: &Rec, cand: &Rec, names: &[String], cand_names: &[String],
 
 fn board_accuracy(secs: f64, ress: &[f64], ref_reltol: f64) {
     let mut wanted: Vec<String> = ["LINE", "SUM", "VREF", "VA", "KICKOUT", "LOW", "HIGH", "HATS", "NOISE"]
-        .into_iter().chain(DRUM_TRIGGERS).map(String::from).collect();
+        .into_iter().chain(DRUM_TRIGGERS).chain(HATS_ENVELOPES).map(String::from).collect();
     wanted.extend((0..6).map(|i| format!("hats.metal.y[{i}]")));
     wanted.sort();
     let take = std::env::var("ELEC_TAKE").as_deref() == Ok("1");
@@ -3621,7 +3767,7 @@ fn board_accuracy(secs: f64, ress: &[f64], ref_reltol: f64) {
 
 fn partitions(b: &Board) {
     use fab_elec_sim::analysis::partition::{partition, PartOpts};
-    let opts = |fmax: f64, control: Vec<String>| PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: fab_elec_sim::analysis::round::CUT_TOL, hub_tol: 0.1, fmin: 10.0, fmax, band: f64::INFINITY, per_octave: 4, min_island: 8, control, supplies: Vec::new(), round: 16.0 / fmax };
+    let opts = |fmax: f64, control: Vec<String>| PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: fab_elec_sim::analysis::round::CUT_TOL, hub_tol: 0.1, fmin: 10.0, fmax, band: f64::INFINITY, per_octave: 4, min_island: 8, control, supplies: Vec::new(), heard: Vec::new(), round: 16.0 / fmax };
     let report = |title: &str, c: &SimCircuit, o: PartOpts| {
         let t = Instant::now();
         let p = partition(c, &o);
@@ -3673,7 +3819,7 @@ fn helds(b: &Board, shares: bool) {
     impl Sink for Nothing {
         fn point(&mut self, _at: f64, _outer: Option<f64>, _x: &[f64]) {}
     }
-    let opts = |fmax: f64, control: Vec<String>| PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: fab_elec_sim::analysis::round::CUT_TOL, hub_tol: 0.1, fmin: 10.0, fmax, band: f64::INFINITY, per_octave: 4, min_island: 8, control, supplies: Vec::new(), round: 16.0 / fmax };
+    let opts = |fmax: f64, control: Vec<String>| PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: fab_elec_sim::analysis::round::CUT_TOL, hub_tol: 0.1, fmin: 10.0, fmax, band: f64::INFINITY, per_octave: 4, min_island: 8, control, supplies: Vec::new(), heard: Vec::new(), round: 16.0 / fmax };
     let show = |title: &str, ckt: &SimCircuit, s: &Solver, t: f64, o: &PartOpts| {
         match held(s, t, &circuit_opts(ckt, o)) {
             Ok(h) => {

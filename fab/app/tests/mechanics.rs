@@ -533,7 +533,7 @@ fn chainmail(app: &TestApp) {
 /// nothing of its own): one live input, one whole slice of the shelf, one check.
 fn sliced_once(app: &TestApp, mark: u64, what: &str) {
     let lines = wait_for(app, &format!("the check {what} to be built"), || {
-        let lines = app.log_since(mark).ok()?.lines;
+        let lines = app.log_since(mark).expect("the app's log").lines;
         lines.iter().any(|l| l.contains("fab loose: ") && l.contains(" pieces, ")).then_some(lines)
     });
     let count = |s: &str| lines.iter().filter(|l| l.contains(s)).count();

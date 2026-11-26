@@ -59,4 +59,6 @@ let r_bleed = e.r(47kohm, out, gnd, {package: "0402"})
 let jack   = e.part(jack_3_5mm({}), {pins: {T: out R: out S: gnd}})
 
 e.fixed(usb, {edge: @left})
+// The plug goes into the jack through the right wall.
+e.fixed(jack, {edge: @right})
 e.width(vbus, 0.5mm)

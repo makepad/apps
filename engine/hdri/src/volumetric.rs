@@ -345,16 +345,7 @@ fn tile_index(period: usize, x: i32, y: i32, z: i32) -> usize {
     ((z.rem_euclid(p) * p + y.rem_euclid(p)) * p + x.rem_euclid(p)) as usize
 }
 
-/// Lattice cell and position inside it.
-fn lattice(v: f32) -> (i32, f32) {
-    let floor = v.floor();
-    (floor as i32, v - floor)
-}
-
-/// Perlin's quintic fade: no creases along cell edges.
-fn fade(t: f32) -> f32 {
-    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
-}
+use crate::noise::{cell as lattice, fade};
 
 /// Tiling gradient noise: `period` cells per tile, one of Perlin's twelve
 /// cube-edge gradients per lattice point.
@@ -1121,11 +1112,7 @@ fn remap01(v: f32, lo: f32, hi: f32) -> f32 {
     ((v - lo) / (hi - lo)).clamp(0.0, 1.0)
 }
 
-/// smoothstep under its own name, so no glob can make it ambiguous.
-fn smooth(a: f32, b: f32, x: f32) -> f32 {
-    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
+use crate::patterns::smooth;
 
 #[cfg(test)]
 mod tests {
@@ -1733,6 +1720,10 @@ mod env_tests {
             })
             .find(|p| Env::new(p).sun().is_some_and(|key| luminance(key.radiance) > 0.5 * clear))
             .expect("an azimuth where the sun shows through the clouds");
+        // A disc wider than the refinement's sub-samples (8 x 8 in a 5.6 degree texel, 0.7 degrees apart), so the
+        // 64-wide map holds it wherever it falls: the 0.53 degree disc fell between them once the air lifted it.
+        let mut p = p;
+        p.sky.sun_disc.size_deg = 2.0;
         let env = Env::new(&p);
         let map = env.bake_marched(64, 32);
         let keyless = env.bake_keyless_marched(&map, 32, serial).expect("the sun is the key");

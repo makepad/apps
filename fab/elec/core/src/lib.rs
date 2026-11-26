@@ -16,6 +16,7 @@
 //! - `xform`: `Xform3`, a unit's rigid pose in its parent frame.
 //! - `canon`: the canonical binary form and the content hash.
 //! - `drive`: `Drive` and `Pull`, a bench's drive of a stubbed pin (benches and design ops).
+//! - `pace`: the host's hook for giving its CPU pool a turn during long board computations.
 //!
 //! Performance: nothing here runs per frame. Shape and distance functions are O(1) per pair
 //! (polygon cores O(vertices)); `PolySet` ops are O(n log n) in the vertices involved; index
@@ -29,6 +30,7 @@ pub mod geom;
 pub mod ids;
 pub mod index;
 pub mod layer;
+pub mod pace;
 pub mod poly;
 mod poly_grid;
 pub mod pquad;

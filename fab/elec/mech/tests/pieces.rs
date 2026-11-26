@@ -11,7 +11,7 @@ use fab_model::eval::Evaluator;
 use fab_model::program::split_id;
 use fab_model::{Change, FabModel, PlaceArg};
 use fab_plate::machine::Machine;
-use fab_plate::{Optics, OpticsSource, PartMesh};
+use fab_plate::{Keepout, KeepoutSide, Optics, OpticsSource, PartMesh};
 
 const CASE: &str = r#"use mod.model.*
 use mod.fab.*
@@ -74,6 +74,15 @@ fn a_vented_snapped_case_with_a_cable_exit_builds_closed_and_prints_clean() {
     let names: Vec<&str> = e.plate.parts.iter().map(|p| p.name.as_str()).collect();
     let part = |n: &str| e.plate.parts.iter().find(|p| p.name == n).unwrap_or_else(|| panic!("{n} on the plate: {names:?}"));
     let (base, lid) = (part("Base"), part("Lid"));
+    for (part, side, corner, hole) in [(base, KeepoutSide::Bottom, "Rest pin", "Standoff"),
+                                       (lid, KeepoutSide::Top, "Corner presser", "Lid post")] {
+        assert_eq!(part.keepouts.len(), 4, "{}: one record per support it carries", part.name);
+        assert!(part.keepouts.iter().all(|k| k.side == side && k.board == unit.name), "{}: every record is on its side of this board", part.name);
+        assert_eq!(part.keepouts.iter().filter(|k| k.name == corner).count(), 2, "{}: a {corner} at each corner no hole holds", part.name);
+        for h in &pcb.holes {
+            assert!(part.keepouts.iter().any(|k| k.name == format!("{hole} {}", h.name)), "{}: a {hole} at {}", part.name, h.name);
+        }
+    }
     assert_eq!(base.mesh.open_edges(), 0, "the vented base is closed");
     assert_eq!(lid.mesh.open_edges(), 0, "the vented lid with its snap bumps is closed");
     assert!(base.mesh.bounds().min[2].abs() < 1e-6 && lid.mesh.bounds().min[2].abs() < 1e-6, "both stand on the bed (the lid on its roof)");
@@ -154,12 +163,14 @@ let names = ["A" "B" "C"]
 let lone = light_block([first], case.frame, case.shell, {})
 let pair = light_block([first, near[0]], case.frame, case.shell, {})
 let apart = light_block([first, far[0]], case.frame, case.shell, {})
+let row = light_block(leds, case.frame, case.shell, {})
+object(row.lid.add[0], name: "Row block")
 for i in 0..lone.lid.add.len() { object(lone.lid.add[i], name: "Lone " + names[i]) }
 for i in 0..pair.lid.add.len() { object(pair.lid.add[i], name: "Pair " + names[i]) }
 for i in 0..apart.lid.add.len() { object(apart.lid.add[i], name: "Apart " + names[i]) }
 let tight = light_block(pcb.ports, case.frame, case.shell, {along: 1.5mm})
 if tight.pipes.len() == 0 && tight.lid.add.len() == 0 && tight.refused.len() == 1 {
-    object(m.box({size: [1mm 1mm 1mm]}), name: "Refused")
+    object(m.box({size: [1mm 1mm 1mm] keepouts: tight.keepouts}), name: "Refused")
 }
 "#;
 
@@ -201,6 +212,7 @@ fn light_pipes_carry_each_led_through_the_lid_and_print_into_it() {
     assert_eq!(lid.len(), 1, "the lid's object holds the lid's shell and its pipes: {names:?}");
     let lid = lid[0];
     assert_eq!(parts[lid].name, "Lid", "the lid's shell reads as the lid");
+    assert_eq!(parts[lid].mesh.open_edges(), 0, "the piped lid is closed");
     assert!(parts.iter().all(|p| !p.name.contains('#')), "no part shows a generated name: {names:?}");
     for &i in &pipes {
         assert_eq!(parts[i].body_of, group, "every pipe prints into the lid");
@@ -252,23 +264,36 @@ fn light_pipes_carry_each_led_through_the_lid_and_print_into_it() {
         assert!(near(apply(m2p, apply(exit, [0.0, 0.0, 1.0])), to_plate([x, y, top + 1.0])), "{path}: the exit frame's Z leaves the lid");
     }
 
-    // The board space the block takes, for the board to reserve: one record, on the lid alone,
-    // naming the board and the block's LEDs, over every channel and its 1.2mm wall, from the
-    // block's underside up to the roof's, measured from the board's top surface.
+    // Compare both sets of records in board coordinates, including the refused row's.
     assert!(pipes.iter().all(|&i| parts[i].keepouts.is_empty()), "the pipes keep no board space of their own");
-    let [block] = parts[lid].keepouts.as_slice() else { panic!("the lid keeps one block's board space: {:?}", parts[lid].keepouts) };
-    assert_eq!(block.board, "ledctl", "the record names its board");
-    assert!(leds.iter().all(|port| block.name.split(' ').any(|word| word == port.refdes)), "the record names the block by its LEDs: {}", block.name);
+    let refused = parts.iter().find(|p| p.name == "Refused").expect("the tight row was refused");
+    let surface = to_mm(pcb.stackup.thickness);
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    for (part, half_along) in [(&parts[lid], 0.6), (refused, 0.75)] {
+        let records: Vec<_> = part.keepouts.iter().filter(|k| k.name.starts_with("Light pipe ")).collect();
+        assert_eq!(records.len(), 2 * leds.len(), "{} has one room and one block record per LED", part.name);
+        for port in &leds {
+            let key = feature_key(&FeatureRef::Port(CompRef { board: mech.unit, comp: port.comp }, port.index)).unwrap();
+            let [x, y, z] = port.at.map(to_mm);
+            for (kind, room, hx, hy) in [("room", true, half_along + 0.4, 1.4), ("block", false, half_along + 1.2, 2.2)] {
+                let name = format!("Light pipe {kind} {}", port.refdes);
+                let record = records.iter().find(|k| k.name == name).expect(&name);
+                assert_eq!(record.feature.as_deref(), Some(key.as_str()), "{name} follows its LED");
+                assert_eq!((record.room, record.side, record.board.as_str()), (room, KeepoutSide::Top, "ledctl"), "{name}");
+                let plan: Vec<_> = record.area.iter().map(|p| p.map(mm)).collect();
+                assert_eq!(plan, [[x - hx, y - hy], [x + hx, y - hy], [x + hx, y + hy], [x - hx, y + hy]].map(|p| p.map(mm)), "{name} plan");
+                assert!(near(surface + record.z[0], z + 0.4) && near(surface + record.z[1], top - 1.6), "{name} band {:?}", record.z);
+            }
+        }
+    }
+    let block = parts[lid].keepouts.iter().find(|k| k.name == "Light pipe block D1").unwrap();
     let xs: Vec<f64> = leds.iter().map(|port| to_mm(port.at[0])).collect();
     let (x0, x1) = (xs.iter().copied().fold(f64::MAX, f64::min), xs.iter().copied().fold(f64::MIN, f64::max));
-    let [_, y, z] = leds[0].at.map(to_mm);
-    let lo = [0, 1].map(|k| block.area.iter().map(|p| p[k]).fold(f64::MAX, f64::min));
-    let hi = [0, 1].map(|k| block.area.iter().map(|p| p[k]).fold(f64::MIN, f64::max));
-    let near = |a: f64, b: f64| (a - b).abs() < 1e-6;
-    assert!(block.area.len() == 4 && near(lo[0], x0 - 1.8) && near(hi[0], x1 + 1.8) && near(lo[1], y - 2.2) && near(hi[1], y + 2.2),
-        "the area is the block's plan, its channels and their walls: {lo:?}..{hi:?} for LEDs at x {x0}..{x1}, y {y}");
-    let surface = to_mm(pcb.stackup.thickness);
-    assert!(near(surface + block.z[0], z + 0.4), "the band starts at the block's underside, 0.4mm over the LEDs: {:?}", block.z);
+    let [_, y, _] = leds[0].at.map(to_mm);
+    // These boxes overlap along a straight row and share both their width and their band.
+    let union_volume = (x1 - x0 + 3.6) * 4.4 * (block.z[1] - block.z[0]);
+    let row = parts.iter().find(|p| p.name == "Row block").expect("the row's block before cutting channels");
+    assert!(near(row.mesh.volume(), union_volume), "the block's {} mm³ equals the boxes' {union_volume} mm³", row.mesh.volume());
     assert!(lid_at([x0 - 1.5, y, surface + block.z[0] + 0.1]) && !lid_at([x0 - 1.5, y, surface + block.z[0] - 0.1]), "the block's wall starts at the band's foot");
     assert!(lid_at([x0 - 3.0, y, surface + block.z[1] + 0.1]) && !lid_at([x0 - 3.0, y, surface + block.z[1] - 0.1]), "beside the block, the band's top is the roof's underside");
 
@@ -306,6 +331,22 @@ fn light_pipes_carry_each_led_through_the_lid_and_print_into_it() {
         .unwrap_or_else(|e| panic!("the case copies: {e}"));
     let (_, e) = evaluated.expect("a fresh apply evaluates");
     assert_eq!(e.plate.parts.iter().filter(|p| p.optics == estimate).count(), 16, "the copy's pipes keep their optics");
+
+    // The generator's tight test allows 0.001 mm. Room interiors must overlap by more
+    // than that on both axes to conflict; rooms sharing an edge can coexist.
+    let overlaps = |a: &Keepout, b: &Keepout| {
+        (0..2).all(|i| a.area[2][i].min(b.area[2][i]) - a.area[0][i].max(b.area[0][i]) > 0.001)
+    };
+    for (part, printable) in [(refused, false), (&parts[lid], true)] {
+        let rooms: Vec<_> = part.keepouts.iter().filter(|k| k.room).collect();
+        let mut pairs = Vec::new();
+        for (i, a) in rooms.iter().enumerate() {
+            for b in &rooms[..i] {
+                if overlaps(a, b) { pairs.push((&a.name, &b.name)); }
+            }
+        }
+        assert_eq!(pairs.is_empty(), printable, "{} room overlaps: {pairs:?}", part.name);
+    }
 }
 
 const SEATS: &str = r#"use mod.model.*

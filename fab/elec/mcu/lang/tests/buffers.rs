@@ -76,7 +76,7 @@ impl Core {
         let program = &c.lowered.entries[entry].program;
         let mut scratch = vec![0; program.scratch_words()];
         let mut mem = ir::Mem { ctx: &mut [], state: &mut self.state, shared: ir::Shared::Read(&c.lowered.shared_init), bufs: &bufs };
-        let mut io = ir::Io { ins: [&[], &[]], outs: [&mut [], &mut []] };
+        let mut io = ir::Io::default();
         let mut ports = CorePorts { bufs: &bufs, seen: &mut self.seen, faults: &mut self.faults };
         ir::run_ports(program, &mut scratch, &mut mem, &mut io, 1, &mut ports);
     }

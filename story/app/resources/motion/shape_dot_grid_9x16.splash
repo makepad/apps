@@ -1,0 +1,39 @@
+use mod.motion.*
+// DOT GRID, 9:16 — the portrait cut of shape_dot_grid: a 9 × 16 field.
+// DOT GRID — a field of dots that blooms out from the centre (each
+// dot pops on ease_out_back, delayed by its distance from the centre),
+// then keeps breathing: a sharp 2 s swell that also flushes each dot to
+// the accent. Each dot's swell is looped from its own start time, so the
+// centre-out delays turn into rings rippling outward, forever.
+// Why: one rule (delay = distance) makes 144 layers move as one field; the
+// grid is built with a `for` loop, so density is a two-number change.
+let dots = []
+for row in 0..16 {
+    for col in 0..9 {
+        let d = sqrt((col - 4) * (col - 4) + (row - 7.5) * (row - 7.5)) * 0.09
+        dots.push(Group{
+            at: vec2(140 + col * 100, 210 + row * 100)
+            scale: tween(0, 1, 0.1 + d, 0.7 + d, @ease_out_back)
+            layers: [
+                Ellipse{at: vec2(-7, -7) size: vec2(14, 14)
+                        scale: repeat(keys([0.7 + d, 1.0], [1.0 + d, 2.4, @ease_out_cubic], [1.7 + d, 1.0, @ease_in_out_cubic], [2.7 + d, 1.0]), 2.0)
+                        fill: repeat(keys([0.7 + d, in(@dot)], [1.0 + d, in(@accent), @ease_out_cubic], [1.7 + d, in(@dot), @ease_in_out_cubic], [2.7 + d, in(@dot)]), 2.0)}
+            ]
+        })
+    }
+}
+Motion{
+    label: "Dot grid ripple 9:16"
+    brief: "A grid of dots that blooms from the centre and then ripples outward in a loop; portrait."
+    tags: ["background", "grid", "dots", "loop", "shape", "tech", "9:16"]
+    size: vec2(1080, 1920) duration: 6.0
+    inputs: {
+        dot: input(@color, #ffffff33, "Resting dot colour")
+        accent: input(@color, #ff5c39, "Colour at the crest of a ripple")
+        background: input(@color, #0b0d12, "Ground")
+    }
+    layers: [
+        Rect{size: vec2(1080, 1920) fill: in(@background)}
+        Group{layers: dots}
+    ]
+}

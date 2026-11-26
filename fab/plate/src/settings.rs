@@ -74,6 +74,8 @@ pub struct PrintSetting {
     /// One short line: what it does.
     pub hint: &'static str,
     pub kind: SettingKind,
+    /// Choices shown first in the dropdown, in order, with a note on when to use each.
+    pub common: &'static [(&'static str, &'static str)],
     /// The value when neither the profile nor the project has one.
     pub default: &'static str,
     /// Folded away until asked for.
@@ -89,10 +91,18 @@ const fn num(min: f64, max: f64, step: f64, unit: &'static str) -> SettingKind {
 }
 
 const SPARSE: &[(&str, &str)] = &[
-    ("grid", "Grid"), ("cubic", "Cubic"), ("gyroid", "Gyroid"), ("zig-zag", "Rectilinear"), ("alignedrectilinear", "Aligned rectilinear"), ("line", "Line"),
+    ("grid", "Grid"), ("cubic", "Cubic"), ("gyroid", "Gyroid"), ("tpmsd", "TPMS-D"), ("tpmsfk", "TPMS-FK"), ("zig-zag", "Rectilinear"), ("alignedrectilinear", "Aligned rectilinear"), ("line", "Line"),
     ("zigzag", "Zig zag"), ("crosszag", "Cross zag"), ("lockedzag", "Locked zag"), ("crosshatch", "Crosshatch"), ("2dlattice", "2D lattice"), ("triangles", "Triangles"),
     ("tri-hexagon", "Tri-hexagon"), ("adaptivecubic", "Adaptive cubic"), ("supportcubic", "Support cubic"), ("honeycomb", "Honeycomb"), ("3dhoneycomb", "3D honeycomb"),
     ("lightning", "Lightning"), ("hilbertcurve", "Hilbert curve"), ("archimedeanchords", "Archimedean chords"), ("octagramspiral", "Octagram spiral"), ("concentric", "Concentric"),
+];
+const COMMON_SPARSE: &[(&str, &str)] = &[
+    ("gyroid", "strong in every direction, the all-rounder"),
+    ("cubic", "strong and quick"),
+    ("grid", "simple and fast"),
+    ("lightning", "least plastic, only holds up the top"),
+    ("adaptivecubic", "saves plastic in big parts"),
+    ("zig-zag", "fastest"),
 ];
 const SURFACE: &[(&str, &str)] = &[
     ("monotonic", "Monotonic"), ("monotonicline", "Monotonic line"), ("zig-zag", "Rectilinear"), ("alignedrectilinear", "Aligned rectilinear"), ("concentric", "Concentric"),
@@ -104,17 +114,17 @@ const TOP_SURFACE: &[(&str, &str)] = &[
 ];
 
 const fn row(group: SettingGroup, key: &'static str, label: &'static str, hint: &'static str, kind: SettingKind, default: &'static str) -> PrintSetting {
-    PrintSetting { group, mode: "", key, label, hint, kind, default, advanced: false, scope: SettingScope::Object, needs: "" }
+    PrintSetting { group, mode: "", key, label, hint, kind, common: &[], default, advanced: false, scope: SettingScope::Object, needs: "" }
 }
 const fn adv(group: SettingGroup, key: &'static str, label: &'static str, hint: &'static str, kind: SettingKind, default: &'static str) -> PrintSetting {
-    PrintSetting { group, mode: "", key, label, hint, kind, default, advanced: true, scope: SettingScope::Object, needs: "" }
+    PrintSetting { group, mode: "", key, label, hint, kind, common: &[], default, advanced: true, scope: SettingScope::Object, needs: "" }
 }
 /// A row of a mode: under `mode`, shown while `needs` is on ("" for the mode's own switch).
 const fn mode(group: SettingGroup, mode: &'static str, needs: &'static str, key: &'static str, label: &'static str, hint: &'static str, kind: SettingKind, default: &'static str) -> PrintSetting {
-    PrintSetting { group, mode, key, label, hint, kind, default, advanced: true, scope: SettingScope::Object, needs }
+    PrintSetting { group, mode, key, label, hint, kind, common: &[], default, advanced: true, scope: SettingScope::Object, needs }
 }
 const fn plate(group: SettingGroup, key: &'static str, label: &'static str, hint: &'static str, kind: SettingKind, default: &'static str, why: &'static str) -> PrintSetting {
-    PrintSetting { group, mode: "", key, label, hint, kind, default, advanced: false, scope: SettingScope::Plate(why), needs: "" }
+    PrintSetting { group, mode: "", key, label, hint, kind, common: &[], default, advanced: false, scope: SettingScope::Plate(why), needs: "" }
 }
 
 use SettingGroup::{Infill, Material, Quality, Speed, Support, TopBottom, Walls};
@@ -159,7 +169,11 @@ pub const PRINT_SETTINGS: &[PrintSetting] = &[
     mode(Walls, "Arc overhangs", "fab_arc_overhangs", "fab_arc_overhang_speed", "Arc speed", "Speed of the arcs", num(1.0, 15.0, 0.5, "mm/s"), "5"),
     // ---- Infill ----
     row(Infill, "sparse_infill_density", "Density", "How full the inside is: more is stronger, slower and heavier", num(0.0, 100.0, 1.0, "%"), "20%"),
-    row(Infill, "sparse_infill_pattern", "Pattern", "The shape of the fill inside", SettingKind::Choice(SPARSE), "gyroid"),
+    PrintSetting { common: COMMON_SPARSE, ..row(Infill, "sparse_infill_pattern", "Pattern", "The shape of the fill inside", SettingKind::Choice(SPARSE), "gyroid") },
+    // Adaptive density: under the pattern while it is one the grading draws ([`GRADED_PATTERNS`]).
+    PrintSetting { needs: SPARSE_PATTERN, advanced: false, ..mode(Infill, "Adaptive density", "", "adaptive_infill_mode", "Adaptive density", "Fills the core more thinly than near the surfaces: less plastic, the walls keep their support. Distance grades each body to its deepest point; Lobes grades each lobe, joined by a narrower neck, to its own", SettingKind::Choice(&[("disabled", "Off"), ("distance_warp", "Distance"), ("lobes", "Lobes")]), "disabled") },
+    PrintSetting { advanced: false, ..mode(Infill, "Adaptive density", "adaptive_infill_mode", "adaptive_infill_interior_density", "Core density", "How full the deepest part is; the density above is the one near the surfaces", num(1.0, 100.0, 1.0, "%"), "10%") },
+    PrintSetting { advanced: false, ..mode(Infill, "Adaptive density", "adaptive_infill_mode", "adaptive_infill_gradient", "Gradient", "How the density changes from the surfaces to the core: quadratic keeps it full deeper, exponential thins it sooner", SettingKind::Choice(&[("linear", "Linear"), ("quadratic", "Quadratic"), ("exponential", "Exponential")]), "linear") },
     row(Infill, "infill_direction", "Direction", "Angle of the fill lines", num(0.0, 360.0, 1.0, "°"), "45"),
     adv(Infill, "infill_wall_overlap", "Wall overlap", "How far the fill reaches into the walls", num(0.0, 100.0, 1.0, "%"), "15%"),
     adv(Infill, "sparse_infill_line_width", "Line width (0 = default)", "Width of the infill lines", num(0.0, 2.0, 0.01, "mm"), "0.4"),
@@ -346,9 +360,15 @@ pub const BRIM_READS: &[(&str, &[&str])] = &[
     ("outer_and_inner", &["brim_width", "brim_object_gap"]),
 ];
 
+/// The sparse pattern: the rows under it show while it is one they apply to.
+pub const SPARSE_PATTERN: &str = "sparse_infill_pattern";
+
+/// The sparse patterns adaptive density grades (the TPMS patterns).
+pub const GRADED_PATTERNS: &[&str] = &["gyroid", "tpmsd", "tpmsfk"];
+
 /// Whether `s` shows, with `value` giving a setting's shown value: under a switch while it is on,
-/// under the support type or the rim while the chosen kind reads it, and only while what it is
-/// under shows.
+/// under the support type or the rim while the chosen kind reads it, under the sparse pattern
+/// while it is one adaptive density grades, and only while what it is under shows.
 pub fn needs_met(s: &PrintSetting, value: &dyn Fn(&PrintSetting) -> String) -> bool {
     if s.needs.is_empty() {
         return true;
@@ -358,6 +378,7 @@ pub fn needs_met(s: &PrintSetting, value: &dyn Fn(&PrintSetting) -> String) -> b
     let on = match parent.key {
         SUPPORT_TYPE => support_reads(&v, s.key),
         BRIM_TYPE => BRIM_READS.iter().any(|(kind, keys)| *kind == v && keys.contains(&s.key)),
+        SPARSE_PATTERN => GRADED_PATTERNS.contains(&v.as_str()),
         _ => setting_on(parent, &v),
     };
     on && needs_met(parent, value)
@@ -372,6 +393,10 @@ mod tests {
         for s in PRINT_SETTINGS {
             assert_eq!(PRINT_SETTINGS.iter().filter(|o| o.key == s.key).count(), 1, "{} twice", s.key);
             assert!(!s.label.is_empty() && !s.hint.is_empty(), "{}", s.key);
+            for (i, (value, _)) in s.common.iter().enumerate() {
+                assert!(matches!(s.kind, SettingKind::Choice(c) if c.iter().any(|(v, _)| v == value)), "{} has no choice {value}", s.key);
+                assert!(!s.common[..i].iter().any(|(v, _)| v == value), "{} lists {value} twice among its common choices", s.key);
+            }
             if !s.needs.is_empty() {
                 let parent = print_setting(s.needs).unwrap_or_else(|| panic!("{} needs {}", s.key, s.needs));
                 assert_eq!(parent.group, s.group, "{}", s.key);
@@ -430,6 +455,22 @@ mod tests {
             for supports in ["0", "1"] {
                 let values = [("enable_support", supports), ("brim_type", rim)];
                 assert_eq!((shown("brim_width", &values), shown("brim_object_gap", &values)), (width, gap), "{rim}");
+            }
+        }
+    }
+
+    /// Adaptive density shows under a pattern it grades, and its own rows while it is on.
+    #[test]
+    fn adaptive_rows_show_under_the_graded_patterns() {
+        let SettingKind::Choice(patterns) = print_setting(SPARSE_PATTERN).unwrap().kind else { panic!("the sparse pattern is a choice") };
+        for graded in GRADED_PATTERNS {
+            assert!(patterns.iter().any(|(v, _)| v == graded), "{graded} is not a sparse pattern");
+        }
+        for (pattern, mode, switch, rows) in [("gyroid", "disabled", true, false), ("tpmsd", "distance_warp", true, true), ("tpmsfk", "lobes", true, true), ("grid", "distance_warp", false, false)] {
+            let values = [(SPARSE_PATTERN, pattern), ("adaptive_infill_mode", mode)];
+            assert_eq!(shown("adaptive_infill_mode", &values), switch, "the switch with {pattern}");
+            for key in ["adaptive_infill_interior_density", "adaptive_infill_gradient"] {
+                assert_eq!(shown(key, &values), rows, "{key} with {pattern} and {mode}");
             }
         }
     }

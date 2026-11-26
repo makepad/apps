@@ -1,0 +1,24 @@
+# Content expansion packs: the one interface the effect library and the
+# kinetic text library plug into a host through. Motion, the edit renderer
+# and the edit tools draw effects, transitions, engine geometry and kinetic
+# text only through these traits; a host that installed no pack builds and
+# runs on Motion and the render kit alone. A pack is a value a host installs
+# at start (compiled in today; a pack loaded at run time hands over the same
+# trait objects), so the interface names only Makepad types.
+[package]
+name = "makepad-content-packs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "The expansion interface: effect/look/transition and kinetic text providers a host installs"
+
+[lib]
+name = "makepad_content_packs"
+
+[dependencies]
+makepad-widgets = { path = "../../../../widgets", default-features = false }
+# The sound a look reads at its frame's time.
+makepad-audio-reactive = { path = "../../../../libs/audio_reactive" }
+# The vertex stream procedural engine geometry is written in.
+makepad-geom3d = { path = "../../../../libs/geom3d" }

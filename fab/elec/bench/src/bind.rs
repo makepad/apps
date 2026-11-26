@@ -1,6 +1,7 @@
 //! Classify a design unit or a circuit of its own into the model-binding table's ordered input.
 
 use crate::bench::BenchSpec;
+use crate::expect::Probe;
 use crate::input::{LedColor, LowerInput, LowerNet, LowerPart, LowerPin, PartKind, Taper};
 use crate::lower::LowerDiag;
 use crate::models::{Bind, ModelLibs};
@@ -48,10 +49,12 @@ pub fn bind_circuit(circuit: &Circuit, scope: BoardId, bench: &BenchSpec, libs: 
     };
     input.ground = NetRef { board: scope, net: ground.id };
     let supplies = declared_supplies(circuit);
+    let heard = declared_heard(circuit, scope, bench);
     input.nets = circuit.nets.iter().map(|net| LowerNet {
         id: NetRef { board: scope, net: net.id },
         name: net.name.clone(),
         supply: net.id != ground.id && net.kind != NetKind::Ground && supplies.contains(&net.id),
+        heard: net.id != ground.id && net.kind != NetKind::Ground && heard.binary_search(&net.id).is_ok(),
     }).collect();
     for comp in &circuit.comps {
         let id = CompRef { board: scope, comp: comp.id };
@@ -128,6 +131,32 @@ fn declared_supplies(circuit: &Circuit) -> Vec<NetId> {
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// The output jack channels and bench voltage probe points on this board, in net order.
+fn declared_heard(circuit: &Circuit, scope: BoardId, bench: &BenchSpec) -> Vec<NetId> {
+    let mut heard = Vec::new();
+    for jack in crate::audio::output_jacks(circuit) {
+        heard.extend(jack.channels());
+    }
+    let mut point = |net: NetRef| {
+        if net.board == scope {
+            heard.push(net.net);
+        }
+    };
+    for probe in &bench.probes {
+        match probe.probe {
+            Probe::V(net) => point(net),
+            Probe::VDiff(a, b) => {
+                point(a);
+                point(b);
+            }
+            Probe::I(_) | Probe::P(_) => {}
+        }
+    }
+    heard.sort_unstable();
+    heard.dedup();
+    heard
 }
 
 fn classify(

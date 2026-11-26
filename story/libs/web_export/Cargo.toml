@@ -1,0 +1,39 @@
+# Web export: an edit compiled into a film for the browser (Share -> Web
+# export in Stage, `makepad-film-build` for CI and agents, `export_web` for
+# Stage's AI). One library runs the phases: resolve, analyse, kernels,
+# shaders, fonts, link (a cargo wasm32 build of the player with the film
+# packed in), optimise and compress, write.
+[package]
+name = "makepad-story-web-export"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "makepad_story_web_export"
+path = "src/lib.rs"
+
+[[bin]]
+name = "makepad-film-build"
+path = "src/main.rs"
+
+[dependencies]
+# Resolve: the edit, its documents and every file they use, in memory.
+makepad-story-player-bundle = { path = "../../tools/player_bundle" }
+# The pack the film's wasm carries.
+makepad-story-film-pack = { path = "../film_pack" }
+# Fonts cut to the glyphs the film draws.
+makepad-font-subset = { path = "../../../../../libs/font_subset" }
+# The wasm the linker made, stripped and measured.
+makepad-wasm-strip = { path = "../../../../../libs/wasm_strip" }
+# The fonts' naming records, for the credits.
+ttf-parser = { path = "../../../../../libs/ttf-parser" }
+# The generic packing pieces: the stripped web runtime, the output
+# folder, font coverage, brotli and the static server.
+makepad-web-pack = { path = "../../../../../libs/web_pack" }
+makepad-strict-json = { path = "../../../../../libs/strict_json" }
+# The shader pack's reader, for the safety gate's loop check.
+makepad-platform = { path = "../../../../../platform" }
+# The bounded-loop check (shared with wasm-export).
+makepad-wasm-export = { path = "../../../../apps/tools/wasm-export", default-features = false }

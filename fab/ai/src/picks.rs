@@ -85,6 +85,8 @@ impl Kind {
 pub struct Written {
     /// The id of each part its names come from, by the key of the part's step.
     pub parts: std::collections::HashMap<makepad_csg_graph::Key, String>,
+    /// Direct Path references for the parts this selector uses in their original scope.
+    pub sides: std::collections::HashMap<makepad_csg_graph::Key, Vec<Option<String>>>,
     pub names: WrittenNames,
 }
 
@@ -118,21 +120,27 @@ impl Written {
                 origins(c, &mut keys);
             }
         }
-        let parts = keys.into_iter().filter_map(|k| Some((k, b.parts.get(&k)?.clone()))).collect();
-        Written { parts, names }
+        let parts: std::collections::HashMap<_, _> = keys.into_iter().filter_map(|k| Some((k, b.parts.get(&k)?.clone()))).collect();
+        let sides = parts.keys().filter_map(|k| Some((*k, b.sides.get(k)?.clone()))).collect();
+        Written { parts, sides, names }
     }
 
     /// The selector with each part's id written as `name` gives it. Err: the id of a part `name`
     /// gives none for.
     pub fn text(&self, name: impl Fn(&str) -> Option<String>) -> Result<String, String> {
         let mut parts = std::collections::HashMap::new();
+        let mut sides = std::borrow::Cow::Borrowed(&self.sides);
         for (key, id) in &self.parts {
-            parts.insert(*key, name(id).ok_or_else(|| id.clone())?);
+            let local = name(id).ok_or_else(|| id.clone())?;
+            if local != *id && sides.contains_key(key) {
+                sides.to_mut().remove(key);
+            }
+            parts.insert(*key, local);
         }
         Ok(match &self.names {
-            WrittenNames::Face(f) => inspect::written(f, &parts),
+            WrittenNames::Face(f) => inspect::written(f, &parts, &sides),
             WrittenNames::Edge([a, c], near, chain) => {
-                let mut pair = [inspect::written(a, &parts), inspect::written(c, &parts)];
+                let mut pair = [inspect::written(a, &parts, &sides), inspect::written(c, &parts, &sides)];
                 pair.sort();
                 inspect::edge_text(&pair[0], &pair[1], *near, *chain)
             }
@@ -156,9 +164,11 @@ pub struct Pick {
     pub kind: Kind,
     /// The printed object it is on (`instance/object`).
     pub object: String,
+    /// The solid this pick resolves on (`instance/solid`). For a whole-part pick this is `object`.
+    pub on: String,
     /// The solids it names (`instance/solid`): two for a crease, else one.
     pub solids: Vec<String>,
-    /// Where it was pointed at, in the object's model frame: the point and the outward normal.
+    /// Where it was pointed at, in `on`'s model frame: the point and the outward normal.
     pub at: Option<(P3, P3)>,
     /// The first solid's box in the model frame, to draw a pick without a point.
     pub bounds: Option<(P3, P3)>,
@@ -174,7 +184,7 @@ pub struct Pick {
     pub written: Option<Written>,
     /// How it is found again after a build, on an exact part.
     pub named: Option<Named>,
-    /// What the view draws of it, in the model frame: an edge's curve, a face's outline.
+    /// What the view draws of it, in `on`'s model frame: an edge's curve, a face's outline.
     pub outline: Vec<Vec<P3>>,
     /// On a part drawn from its field, the features the view tints and how strongly
     /// ([`makepad_csg_sdf::SdfNode::Id`]): an edit's, or a crease's two at half.
@@ -187,14 +197,20 @@ impl Pick {
     /// What the model is told with the person's line.
     pub fn detail(&self) -> String {
         let mut out = format!("write: {}. {}", self.write.join("; "), self.what);
+        if self.on != self.object {
+            out.push_str(&format!(" Picked on step `{}`.", short(&self.on)));
+        }
         if let Some((p, nm)) = self.at {
-            out.push_str(&format!(" At [{:.2} {:.2} {:.2}] mm, normal [{:.3} {:.3} {:.3}], in {}'s model frame (Y up).", p[0], p[1], p[2], nm[0], nm[1], nm[2], self.object));
+            out.push_str(&format!(" At [{:.2} {:.2} {:.2}] mm, normal [{:.3} {:.3} {:.3}], in {}'s model frame (Y up).", p[0], p[1], p[2], nm[0], nm[1], nm[2], self.on));
         }
         out
     }
 
     fn value(&self) -> S {
         let mut f = vec![("id", s(&self.id)), ("kind", s(self.kind.name())), ("label", s(&self.label)), ("object", s(&self.object)), ("solids", arr(self.solids.iter().map(s))), ("write", arr(self.write.iter().map(s))), ("what", s(&self.what))];
+        if self.on != self.object {
+            f.push(("on", s(&self.on)));
+        }
         if let Some(sel) = &self.selector {
             f.push(("select", s(sel)));
         }
@@ -204,6 +220,34 @@ impl Pick {
         }
         obj(f)
     }
+}
+
+/// The viewport's installed step surface hit, in the step's model frame (mm).
+#[derive(Clone, Debug)]
+pub struct ViewHit {
+    pub object: String,
+    pub on: String,
+    pub at: P3,
+    pub normal: P3,
+    /// Model displacement per plate mm along the viewing ray.
+    pub dir: P3,
+    pub depth: f64,
+    /// Model mm per pixel at the hit.
+    pub pixel: f64,
+}
+
+/// Private host operations for the person's view.
+pub enum ViewPick {
+    Point { hit: Option<ViewHit>, kind: String, gesture: Gesture },
+    Select(Value),
+    Retain(Option<String>),
+}
+
+#[derive(Clone, Copy)]
+pub enum Gesture {
+    Click { add: bool },
+    Hover,
+    Along,
 }
 
 /// The picks of the document on the bed.
@@ -218,18 +262,22 @@ pub struct Picks {
     switched: u64,
     /// The picks a build dropped since the AI last read them: why.
     dropped: Vec<String>,
-    /// The exact bodies read on the build `on`, by printed object (`None`: not exact).
+    /// The exact bodies read on the build `on`, by resolved solid (`None`: not exact).
     exact: Vec<(String, Option<Arc<fab_model::eval::ExactBody>>)>,
+    /// Those read on the build before, until the picks follow the newer one: what a renamed
+    /// solid's key was called.
+    before: Vec<(String, Option<Arc<fab_model::eval::ExactBody>>)>,
 }
 
 /// What is asked for: a pick named by the AI, or by the view's ray.
 #[derive(Clone, Debug)]
 struct Want {
     kind: Kind,
+    on: String,
     solids: Vec<String>,
-    /// A model point (of the first solid's frame) to snap onto its surface.
+    /// A point in `on`'s model frame to snap onto its surface.
     at: Option<P3>,
-    /// On an exact part (the printed object `solids[0]`), the face or edge by its names.
+    /// On the exact solid `on`, the face or edge by its names.
     named: Option<Named>,
 }
 
@@ -244,12 +292,15 @@ struct IdAt {
     node: SdfNode,
 }
 
-/// The solid face `face` of exact printed object `object` comes from: the part named first in its
-/// names (`b` of `b.top`, the fillet of a blend).
-fn exact_feature(b: &fab_model::eval::ExactBody, face: u32, object: &str) -> Option<String> {
-    let name = b.faces.iter().find(|f| f.id == face)?.names.first()?;
-    let id = b.parts.get(&name.origin)?;
-    Some(match object.rsplit_once('/') {
+/// The solid face `face` of exact solid `on` comes from: the part of the name a pick
+/// takes (`b` of `b.top`, the fillet of a blend), else of its outermost part's name (an
+/// anonymous one).
+fn exact_feature(b: &fab_model::eval::ExactBody, face: u32, on: &str) -> Option<String> {
+    let names = &b.faces.iter().find(|f| f.id == face)?.names;
+    let outer = || names.iter().filter_map(|n| b.order.iter().position(|k| *k == n.origin)).min().map(|i| b.order[i]);
+    let key = inspect::face_names(b, face).first().map(|n| n.origin).or_else(outer)?;
+    let id = b.parts.get(&key)?;
+    Some(match on.rsplit_once('/') {
         Some((instance, _)) => fab_model::program::part_id(instance, id),
         None => id.clone(),
     })
@@ -304,7 +355,7 @@ fn parse_selector(text: &str) -> Result<(Named, bool, Option<P3>), String> {
 }
 
 /// How far `p` is from a polyline.
-fn polyline_distance(points: &[P3], p: P3) -> f64 {
+pub(crate) fn polyline_distance(points: &[P3], p: P3) -> f64 {
     if let [only] = points {
         return dot(sub(p, *only), sub(p, *only)).sqrt();
     }
@@ -457,16 +508,16 @@ fn side_words(lo: P3, hi: P3, p: P3, normal: P3) -> String {
 }
 
 /// What a description says of one solid.
-struct Facts {
-    id: String,
-    short: String,
-    builder: String,
+pub(crate) struct Facts {
+    pub(crate) id: String,
+    pub(crate) short: String,
+    pub(crate) builder: String,
     /// `file:line` and the line itself.
     statement: Option<(String, String)>,
     bounds: Option<(P3, P3)>,
     values: Vec<String>,
     /// The solid it is part of, then that one's, outward.
-    parents: Vec<String>,
+    pub(crate) parents: Vec<String>,
     /// The printed object it is in, and that part's index on the plate.
     object: String,
     part: usize,
@@ -496,8 +547,17 @@ fn tol_of(pixel: Option<(f64, f64)>, depth: f64, scale: f64) -> f64 {
 }
 
 impl Session {
+    /// The committed solid the tool's picks were resolved on.
+    pub(crate) fn build_on(&self, picks: &[&Pick]) -> Result<(&fab_model::program::Instance, usize), String> {
+        let first = picks.first().ok_or("no picks to build on")?;
+        if let Some(other) = picks.iter().find(|p| p.on != first.on) {
+            return Err(format!("the picks are on different steps: `{}` and `{}`", first.on, other.on));
+        }
+        self.compiled.as_ref().ok_or("nothing is built yet")?.part(&first.on).ok_or_else(|| format!("no solid '{}'", first.on))
+    }
+
     /// Solid `name`'s facts for a description.
-    fn facts(&mut self, name: &str) -> Result<Facts, String> {
+    pub(crate) fn facts(&mut self, name: &str) -> Result<Facts, String> {
         let located = self.locate(name)?;
         let (ev, c) = (self.shown_last().ok_or("nothing is built yet")?, self.shown_compiled().ok_or("nothing is built yet")?);
         let (inst, i) = c.part(&located.name).ok_or_else(|| format!("no solid '{}'", located.name))?;
@@ -545,27 +605,36 @@ impl Session {
 
     /// A pick of `want` described: what to write, what it is, where.
     fn describe(&mut self, want: &Want) -> Result<Pick, String> {
+        self.describe_hit(want, None)
+    }
+
+    fn describe_hit(&mut self, want: &Want, normal: Option<P3>) -> Result<Pick, String> {
         let first = self.facts(&want.solids[0])?;
         let second = match want.solids.get(1) {
             Some(b) => Some(self.facts(b)?),
             None => None,
         };
-        // The point, on the first solid's own surface (a crease's on the part's).
-        let at = match want.at {
-            Some(p) => {
-                let q = match (want.kind, self.part_field(first.part)) {
+        // A feature can also belong to another printed part. The pick belongs to the part hit.
+        let part = if want.on == first.object { first.part } else { self.locate(&want.on)?.part };
+        let object = self.shown_last().ok_or("nothing is built yet")?.plate.parts[part].object.clone();
+        // A step supplies its own surface. Field features of a whole part snap to their individual solids.
+        let surface = if want.on == object { &first.id } else { &want.on };
+        let root = if want.on == object { self.part_field(part) } else { None };
+        let at = match (want.at, normal) {
+            (Some(p), Some(n)) => Some((p, n)),
+            (Some(p), None) => {
+                let q = match (want.kind, &root) {
                     (Kind::Crease | Kind::Body, Some(root)) => {
-                        let q = onto(&root, p);
-                        Some((q, unit(gradient(&root, q)).unwrap_or([0.0, 1.0, 0.0])))
+                        let q = onto(root, p);
+                        Some((q, unit(gradient(root, q)).unwrap_or([0.0, 1.0, 0.0])))
                     }
-                    _ => self.surface_query(&first.id).ok().and_then(|sq| sq.nearest_model(p)),
+                    _ => self.surface_query(surface).ok().and_then(|sq| sq.nearest_model(p)),
                 };
                 q.or(Some((p, [0.0, 1.0, 0.0])))
             }
-            None => None,
+            (None, _) => None,
         };
         let solids: Vec<String> = std::iter::once(first.id.clone()).chain(second.as_ref().map(|b| b.id.clone())).collect();
-        let root = self.part_field(first.part);
         let wall_there = match (&root, at) {
             (Some(root), Some((p, nm))) => wall(root, p, nm),
             _ => None,
@@ -657,10 +726,10 @@ impl Session {
             ),
             Kind::Face | Kind::Edge | Kind::Chain => {
                 let (label, write, what, (selector, written), outline) = self.describe_exact(want, &first, want.at)?;
-                return Ok(Pick { id: String::new(), kind: want.kind, object: first.object.clone(), solids, at, bounds: first.bounds, label, write, what: format!("{what}{wall_words}"), selector: Some(selector), written, named: want.named.clone(), outline, tint, tick });
+                return Ok(Pick { id: String::new(), kind: want.kind, object, on: want.on.clone(), solids, at, bounds: first.bounds, label, write, what: format!("{what}{wall_words}"), selector: Some(selector), written, named: want.named.clone(), outline, tint, tick });
             }
         };
-        Ok(Pick { id: String::new(), kind: want.kind, object: first.object.clone(), solids, at, bounds: first.bounds, label, write, what, selector: None, written: None, named: None, outline: Vec::new(), tint, tick })
+        Ok(Pick { id: String::new(), kind: want.kind, object, on: want.on.clone(), solids, at, bounds: first.bounds, label, write, what, selector: None, written: None, named: None, outline: Vec::new(), tint, tick })
     }
 
     /// What the view's ray (plate frame) points at, as `kind` asks (`None`: as it lands).
@@ -671,23 +740,24 @@ impl Session {
         let to_plate = ev.fields.get(hit.part).and_then(|f| f.as_ref()).map_or(ev.model_to_plate[hit.part], |f| f.to_printer);
         let tol = tol_of(pixel, hit.depth, frame_scale(&to_plate));
         let at = Some(hit.point);
-        let body = Want { kind: Kind::Body, solids: vec![hit.object.clone()], at, named: None };
+        let want = |kind, solids| Want { kind, on: hit.object.clone(), solids, at, named: None };
+        let body = want(Kind::Body, vec![hit.object.clone()]);
         if kind == Some(Kind::Body) {
             return Ok(Some(body));
         }
         let Some(root) = self.part_field(hit.part) else {
             // an exact part: its faces and edges by their names
             if kind != Some(Kind::Spot) {
-                if let Some(w) = self.exact_want(&hit.object, hit.point, kind, tol)? {
+                if let Some(w) = self.exact_want(&hit.object, &hit.object, hit.point, kind, tol)? {
                     return Ok(Some(w));
                 }
             }
             // a mesh part: the smallest of its solids round the point
             let feature = self.feature_at(hit.part, &hit.object, hit.point, tol);
             return Ok(Some(match (kind, feature) {
-                (Some(Kind::Spot), f) => Want { kind: Kind::Spot, solids: vec![f.unwrap_or(hit.object.clone())], at, named: None },
+                (Some(Kind::Spot), f) => want(Kind::Spot, vec![f.unwrap_or(hit.object.clone())]),
                 (Some(Kind::Crease | Kind::Edges | Kind::Edge | Kind::Chain), _) => return Err("creases and edges are picked on parts drawn from their field or exact (m.brep) parts; on this part pick a feature or a spot".into()),
-                (_, Some(f)) => Want { kind: Kind::Feature, solids: vec![f], at, named: None },
+                (_, Some(f)) => want(Kind::Feature, vec![f]),
                 (_, None) => body,
             }));
         };
@@ -696,66 +766,66 @@ impl Session {
         let reach = if kind == Some(Kind::Crease) { 3.0 * tol } else { tol };
         let f = field_at(&root, hit.point, hit.normal, tol);
         let Some(winner) = f.winner.and_then(name) else {
-            return Ok(Some(if kind == Some(Kind::Spot) { Want { kind: Kind::Spot, solids: vec![hit.object.clone()], at, named: None } } else { body }));
+            return Ok(Some(if kind == Some(Kind::Spot) { want(Kind::Spot, vec![hit.object.clone()]) } else { body }));
         };
         let crease = f.runner.filter(|(_, d)| d.abs() <= reach + f.joint.map_or(0.0, |j| j.1)).and_then(|(t, _)| name(t));
         // A field part has no faces: a face is the edit there, an edge the crease or its own edges.
         Ok(Some(match kind {
-            Some(Kind::Spot) => Want { kind: Kind::Spot, solids: vec![winner], at, named: None },
-            Some(Kind::Edit | Kind::Feature | Kind::Face) => Want { kind: Kind::Edit, solids: vec![winner], at, named: None },
-            Some(Kind::Edges) => Want { kind: Kind::Edges, solids: vec![winner], at, named: None },
+            Some(Kind::Spot) => want(Kind::Spot, vec![winner]),
+            Some(Kind::Edit | Kind::Feature | Kind::Face) => want(Kind::Edit, vec![winner]),
+            Some(Kind::Edges) => want(Kind::Edges, vec![winner]),
             Some(Kind::Crease) => match crease {
-                Some(other) => Want { kind: Kind::Crease, solids: vec![winner, other], at, named: None },
+                Some(other) => want(Kind::Crease, vec![winner, other]),
                 None => return Err(format!("no crease within {NEAR_PX} pixels: point nearer where two edits meet")),
             },
             Some(Kind::Edge | Kind::Chain) => match crease {
-                Some(other) => Want { kind: Kind::Crease, solids: vec![winner, other], at, named: None },
-                None if f.sharp => Want { kind: Kind::Edges, solids: vec![winner], at, named: None },
+                Some(other) => want(Kind::Crease, vec![winner, other]),
+                None if f.sharp => want(Kind::Edges, vec![winner]),
                 None => return Err(format!("no crease or edge within {NEAR_PX} pixels: point nearer an edge")),
             },
             _ => match crease {
-                Some(other) => Want { kind: Kind::Crease, solids: vec![winner, other], at, named: None },
-                None if f.sharp => Want { kind: Kind::Edges, solids: vec![winner], at, named: None },
-                None => Want { kind: Kind::Edit, solids: vec![winner], at, named: None },
+                Some(other) => want(Kind::Crease, vec![winner, other]),
+                None if f.sharp => want(Kind::Edges, vec![winner]),
+                None => want(Kind::Edit, vec![winner]),
             },
         }))
     }
 
-    /// Printed object `object`'s exact body on this build, read once per build; None when it is
+    /// Solid `on`'s exact body on this build, read once per build; None when it is
     /// not exact.
-    fn exact_body(&mut self, object: &str) -> Result<Option<Arc<fab_model::eval::ExactBody>>, String> {
+    pub(crate) fn exact_body(&mut self, on: &str) -> Result<Option<Arc<fab_model::eval::ExactBody>>, String> {
         let current = match (&self.picks.on, &self.shown_last()) {
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),
             _ => false,
         };
-        if !current {
-            self.picks.exact.clear();
+        if !current && !self.picks.exact.is_empty() {
+            self.picks.before = std::mem::take(&mut self.picks.exact);
         }
-        if let Some((_, b)) = self.picks.exact.iter().find(|(o, _)| o == object) {
+        if let Some((_, b)) = self.picks.exact.iter().find(|(o, _)| o == on) {
             return Ok(b.clone());
         }
-        let b = self.eval.object_exact(object)?.map(Arc::new);
+        let b = self.eval.object_exact(on)?.map(Arc::new);
         if current {
-            self.picks.exact.push((object.to_string(), b.clone()));
+            self.picks.exact.push((on.to_string(), b.clone()));
         }
         Ok(b)
     }
 
-    /// On exact printed object `object`, what model point `p` points at as `kind` asks (`None`:
+    /// On exact solid `on`, what model point `p` points at as `kind` asks (`None`:
     /// as it lands: the edge within `tol` mm, else the face): a face or an edge by its names, its
     /// chain, or the feature the face comes from. None when the part is not exact, or its faces
     /// have no names (the pick is then a feature by its box).
-    fn exact_want(&mut self, object: &str, p: P3, kind: Option<Kind>, tol: f64) -> Result<Option<Want>, String> {
-        let Some(b) = self.exact_body(object)? else { return Ok(None) };
+    fn exact_want(&mut self, object: &str, on: &str, p: P3, kind: Option<Kind>, tol: f64) -> Result<Option<Want>, String> {
+        let Some(b) = self.exact_body(on)? else { return Ok(None) };
         let edgy = matches!(kind, Some(Kind::Edge | Kind::Chain | Kind::Crease | Kind::Edges));
         let reach = if edgy { 3.0 * tol } else { tol };
-        let Some(at) = self.eval.object_exact_at(object, p, reach)? else { return Ok(None) };
+        let Some(at) = self.eval.object_exact_at(on, p, reach)? else { return Ok(None) };
         let face = at.face.and_then(|f| inspect::face_pick(&b, f));
         let edge = at.edge.and_then(|id| b.edges.iter().find(|e| e.id == id)).and_then(|e| inspect::edge_pair(&b, e));
-        let want = |kind: Kind, named: Named| Some(Want { kind, solids: vec![object.to_string()], at: Some(p), named: Some(named) });
+        let want = |kind: Kind, named: Named| Some(Want { kind, on: on.to_string(), solids: vec![object.to_string()], at: Some(p), named: Some(named) });
         Ok(match kind {
             Some(Kind::Body) => None,
-            Some(Kind::Edit | Kind::Feature) => at.face.and_then(|f| exact_feature(&b, f, object)).map(|f| Want { kind: Kind::Feature, solids: vec![f], at: Some(p), named: None }),
+            Some(Kind::Edit | Kind::Feature) => at.face.and_then(|f| exact_feature(&b, f, on)).map(|f| Want { kind: Kind::Feature, on: on.to_string(), solids: vec![f], at: Some(p), named: None }),
             Some(Kind::Face) => face.and_then(|f| want(Kind::Face, Named::Face(f))),
             Some(Kind::Chain) => match edge {
                 Some(pair) => want(Kind::Chain, Named::Edge(pair)),
@@ -777,12 +847,12 @@ impl Session {
     /// is, its selector (as text and as names) and outline. `at`: where it was pointed at (it
     /// chooses among an edge's pieces).
     fn describe_exact(&mut self, want: &Want, first: &Facts, at: Option<P3>) -> Result<(String, Vec<String>, String, (String, Option<Written>), Vec<Vec<P3>>), String> {
-        let b = self.exact_body(&first.object)?.ok_or_else(|| format!("`{}` is no longer an exact part", first.short))?;
+        let b = self.exact_body(&want.on)?.ok_or_else(|| format!("`{}` is no longer an exact solid", short(&want.on)))?;
         let named = want.named.clone().ok_or("an exact pick without its names")?;
         let statement = |f: &Facts| f.statement.as_ref().map_or(String::new(), |(place, text)| format!(" at {place} `{text}`"));
         let of = format!("`{}`{}", first.short, statement(first));
         let feature_words = |me: &mut Session, face: u32| -> String {
-            let Some(name) = exact_feature(&b, face, &first.object).filter(|f| *f != first.id) else { return String::new() };
+            let Some(name) = exact_feature(&b, face, &want.on).filter(|f| *f != first.id) else { return String::new() };
             match me.facts(&name) {
                 Ok(f) => format!("; it comes from `{}` ({}){}", f.short, f.builder, statement(&f)),
                 Err(_) => String::new(),
@@ -791,7 +861,7 @@ impl Session {
         match named {
             Named::Face(name) => {
                 let pieces: Vec<&makepad_csg_graph::BrepEntity> = b.faces.iter().filter(|f| inspect::face_holds(&b, f.id, &name)).collect();
-                let Some(face) = pieces.first().copied() else { return Err(format!("`{}` has no face `{name}` any more", first.short)) };
+                let Some(face) = pieces.first().copied() else { return Err(format!("`{}` has no face `{name}` any more", short(&want.on))) };
                 let ids: Vec<u32> = pieces.iter().map(|f| f.id).collect();
                 let outline = b.edges.iter().filter(|e| e.faces.iter().any(|f| ids.contains(f))).map(|e| e.points.clone()).collect();
                 let area: f64 = pieces.iter().map(|f| f.size).sum();
@@ -799,7 +869,7 @@ impl Session {
                 let split = if pieces.len() > 1 { format!(", in {} pieces", pieces.len()) } else { String::new() };
                 let comes = feature_words(self, face.id);
                 let write = vec![format!("`{name}`: a face of {of}{comes}. A shell opens it with `{{open: {name}}}`; an edge of it is `m.edge({name}, <the other face>)`")];
-                let what = format!("The face `{name}` of `{}`: {}, {:.1} mm²{normal}{split}.", first.short, face.kind, area);
+                let what = format!("The face `{name}` of `{}`: {}, {:.1} mm²{normal}{split}.", short(&want.on), face.kind, area);
                 let written = inspect::face_named(&b, face.id, &name).map(|n| Written::new(&b, WrittenNames::Face(n.clone())));
                 Ok((name.clone(), write, what, (name, written), outline))
             }
@@ -807,12 +877,12 @@ impl Session {
                 let pieces = inspect::edges_between(&b, &pair[0], &pair[1]);
                 let d = |e: &makepad_csg_graph::BrepEntity| at.map_or(0.0, |p| polyline_distance(&e.points, p));
                 let Some(edge) = pieces.iter().copied().min_by(|x, y| d(x).total_cmp(&d(y))) else {
-                    return Err(format!("`{}` and `{}` no longer meet on `{}`", pair[0], pair[1], first.short));
+                    return Err(format!("`{}` and `{}` no longer meet on `{}`", pair[0], pair[1], short(&want.on)));
                 };
                 let chain = want.kind == Kind::Chain;
                 let selector = inspect::edge_selector(&b, &pair, edge, chain);
                 let edges: Vec<&makepad_csg_graph::BrepEntity> = if chain {
-                    let ids = self.eval.object_exact_at(&first.object, edge.at, 1e-3)?.map(|a| a.chain).unwrap_or_default();
+                    let ids = self.eval.object_exact_at(&want.on, edge.at, 1e-3)?.map(|a| a.chain).unwrap_or_default();
                     b.edges.iter().filter(|e| ids.contains(&e.id)).collect()
                 } else {
                     vec![edge]
@@ -825,12 +895,12 @@ impl Session {
                     let length: f64 = edges.iter().map(|e| e.size).sum();
                     (
                         vec![format!("`{selector}`: {} edges of {of} continuing tangent from where `{}` meets `{}`{comes}. Round them all with `m.brep.fillet(<part>, <radius>, {{edges: {selector}}})`", edges.len(), pair[0], pair[1])],
-                        format!("A chain of {} edges, {:.1} mm in all, starting at the edge where `{}` meets `{}` on `{}` ({shape}).", edges.len(), length, pair[0], pair[1], first.short),
+                        format!("A chain of {} edges, {:.1} mm in all, starting at the edge where `{}` meets `{}` on `{}` ({shape}).", edges.len(), length, pair[0], pair[1], short(&want.on)),
                     )
                 } else {
                     (
                         vec![format!("`{selector}`: an edge of {of}{comes}. Round or bevel it with `m.brep.fillet(<part>, <radius>, {{edges: {selector}}})` or `m.brep.chamfer`")],
-                        format!("The edge where `{}` meets `{}` on `{}`: {shape}.", pair[0], pair[1], first.short),
+                        format!("The edge where `{}` meets `{}` on `{}`: {shape}.", pair[0], pair[1], short(&want.on)),
                     )
                 };
                 let named = |text: &str| edge.faces.iter().find_map(|f| inspect::face_named(&b, *f, text)).cloned();
@@ -881,7 +951,7 @@ impl Session {
                         continue;
                     }
                     if let Some(t) = trace_field(&e.node, o, d, f.shape.min, f.shape.max) {
-                        rows.push((Want { kind: Kind::Edit, solids: vec![solid], at: Some(add_scaled(o, d, t)), named: None }, t / scale));
+                        rows.push((Want { on: hit.object.clone(), kind: Kind::Edit, solids: vec![solid], at: Some(add_scaled(o, d, t)), named: None }, t / scale));
                     }
                 }
                 rows.sort_by(|a, b| a.1.total_cmp(&b.1));
@@ -889,61 +959,95 @@ impl Session {
                 if let (Some(w), Some((r, dist))) = (at.winner.and_then(name), at.runner) {
                     if dist.abs() <= 3.0 * tol + at.joint.map_or(0.0, |j| j.1) {
                         if let Some(r) = name(r) {
-                            rows.push((Want { kind: Kind::Crease, solids: vec![w, r], at: Some(hit.point), named: None }, hit.depth));
+                            rows.push((Want { on: hit.object.clone(), kind: Kind::Crease, solids: vec![w, r], at: Some(hit.point), named: None }, hit.depth));
                         }
                     }
                 }
             }
             None => {
                 // an exact part: the face there, the edge near it and its chain, first
-                if let Some(b) = self.exact_body(&hit.object)? {
-                    if let Some(at) = self.eval.object_exact_at(&hit.object, hit.point, 3.0 * tol)? {
-                        let row = |kind: Kind, named: Named| (Want { kind, solids: vec![hit.object.clone()], at: Some(hit.point), named: Some(named) }, hit.depth);
-                        if let Some(face) = at.face.and_then(|f| inspect::face_pick(&b, f)) {
-                            rows.push(row(Kind::Face, Named::Face(face)));
-                        }
-                        if let Some(pair) = at.edge.and_then(|id| b.edges.iter().find(|e| e.id == id)).and_then(|e| inspect::edge_pair(&b, e)) {
-                            rows.push(row(Kind::Edge, Named::Edge(pair.clone())));
-                            if at.chain.len() > 1 {
-                                rows.push(row(Kind::Chain, Named::Edge(pair)));
-                            }
-                        }
-                    }
-                }
+                rows = self.exact_rows(&hit.object, &hit.object, hit.point, hit.depth, tol)?;
                 let exact_rows = rows.len();
                 let model = self.params()?;
                 if let Some(pp) = model.iter().find(|pp| pp.part == hit.part) {
                     for solid in pp.objects.iter().filter(|s| **s != hit.object) {
                         let Some((lo, hi)) = ev.objects.iter().find(|i| &i.name == solid).and_then(|i| i.bounds) else { continue };
                         if let Some((t0, _)) = slab(o, d, lo, hi) {
-                            rows.push((Want { kind: Kind::Feature, solids: vec![solid.clone()], at: Some(add_scaled(o, d, t0.max(0.0))), named: None }, t0 / scale));
+                            rows.push((Want { on: hit.object.clone(), kind: Kind::Feature, solids: vec![solid.clone()], at: Some(add_scaled(o, d, t0.max(0.0))), named: None }, t0 / scale));
                         }
                     }
                 }
                 rows[exact_rows..].sort_by(|a, b| a.1.total_cmp(&b.1));
             }
         }
-        rows.push((Want { kind: Kind::Body, solids: vec![hit.object.clone()], at: Some(hit.point), named: None }, hit.depth));
+        rows.push((Want { on: hit.object.clone(), kind: Kind::Body, solids: vec![hit.object.clone()], at: Some(hit.point), named: None }, hit.depth));
         Ok(rows)
+    }
+
+    fn exact_rows(&mut self, object: &str, on: &str, at_point: P3, depth: f64, tol: f64) -> Result<Vec<(Want, f64)>, String> {
+        let mut rows = Vec::new();
+        if let Some(b) = self.exact_body(on)? {
+            if let Some(at) = self.eval.object_exact_at(on, at_point, 3.0 * tol)? {
+                let row = |kind: Kind, named: Named| (Want { on: on.to_string(), kind, solids: vec![object.to_string()], at: Some(at_point), named: Some(named) }, depth);
+                if let Some(face) = at.face.and_then(|f| inspect::face_pick(&b, f)) {
+                    rows.push(row(Kind::Face, Named::Face(face)));
+                }
+                if let Some(pair) = at.edge.and_then(|id| b.edges.iter().find(|e| e.id == id)).and_then(|e| inspect::edge_pair(&b, e)) {
+                    rows.push(row(Kind::Edge, Named::Edge(pair.clone())));
+                    if at.chain.len() > 1 {
+                        rows.push(row(Kind::Chain, Named::Edge(pair)));
+                    }
+                }
+                if on != object {
+                    if let Some(id) = at.face.and_then(|f| exact_feature(&b, f, on)) {
+                        rows.push((Want { kind: Kind::Feature, on: on.into(), solids: vec![id], at: Some(at_point), named: None }, depth));
+                    }
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Resolve a step relative to its printed object's instance, including on a later build.
+    fn pick_step(&mut self, object: &str, step: &str) -> Result<String, String> {
+        let (instance, _) = fab_model::program::split_id(object).ok_or_else(|| format!("no instance for '{object}'"))?;
+        let on = if step.contains('/') { step.to_string() } else { fab_model::program::part_id(instance, step) };
+        if on != object {
+            let reason = || format!("'{on}' is not a step of '{object}'");
+            let target = self.facts(&on).map_err(|e| format!("{}: {e}", reason()))?;
+            let compiled = self.shown_compiled().ok_or("nothing is built yet")?;
+            let (inst, body) = compiled.part(object).ok_or_else(reason)?;
+            let solids = &inst.script.program.solids;
+            let mut spine = std::iter::successors(Some(&solids[body]), |s| s.inputs.first().map(|&i| &solids[i]));
+            if target.object != object || !spine.any(|s| s.id == target.short) {
+                return Err(reason());
+            }
+        }
+        if self.exact_body(&on)?.is_none() {
+            return Err(format!("'{on}' of '{object}' is not an exact solid"));
+        }
+        Ok(on)
     }
 
     /// A pick as the AI or a row of Select Other names it: a solid's name (the edit, or on a
     /// part not drawn from its field the feature; the printed object itself is the body), two
     /// names (the crease where they meet), or `{solid, at, kind}` (`at`: a model point, snapped
     /// onto the surface; `kind` defaults to spot; `solids` for a crease).
-    fn want_of(&mut self, v: &Value) -> Result<Want, String> {
-        let kind_for = |me: &mut Session, name: &str| -> Result<Kind, String> {
-            let f = me.facts(name)?;
-            Ok(if f.id == f.object { Kind::Body } else if me.part_field(f.part).is_some() { Kind::Edit } else { Kind::Feature })
+    fn want_of(&mut self, v: &Value, view_row: bool) -> Result<Want, String> {
+        let kind_for = |me: &Session, f: &Facts| {
+            if f.id == f.object { Kind::Body } else if me.part_field(f.part).is_some() { Kind::Edit } else { Kind::Feature }
         };
         match v {
-            Value::Str(name) => Ok(Want { kind: kind_for(self, name)?, solids: vec![name.clone()], at: None, named: None }),
+            Value::Str(name) => {
+                let f = self.facts(name)?;
+                Ok(Want { kind: kind_for(self, &f), on: f.object, solids: vec![f.id], at: None, named: None })
+            }
             Value::Arr(pair) => {
                 let names: Vec<String> = pair.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
                 if names.len() != 2 || pair.len() != 2 {
                     return Err("a crease is two solids' names: [\"body\" \"knob\"]".into());
                 }
-                Ok(Want { kind: Kind::Crease, solids: names, at: None, named: None })
+                Ok(Want { kind: Kind::Crease, on: self.facts(&names[0])?.object, solids: names, at: None, named: None })
             }
             Value::Obj(_) => {
                 let at = match v.get("at") {
@@ -959,34 +1063,37 @@ impl Session {
                     Some(k) => Some(Kind::parse(k).ok_or_else(|| format!("'kind' is one of edit, crease, edges, spot, feature, body, face, edge, chain; not '{k}'"))?),
                     None => None,
                 };
+                let first = self.facts(solids.first().ok_or("a pick needs a solid")?)?;
+                let on = match v.get("on") {
+                    Some(step) => self.pick_step(&first.object, step.as_str().ok_or("'on' names a step of the printed object")?)?,
+                    None => first.object.clone(),
+                };
                 // an exact part's face or edge by what a script writes for it
                 if let Some(text) = str_arg(v, "select") {
                     let (named, chain, near) = parse_selector(text)?;
-                    let object = self.facts(&solids[0])?.object;
                     let kind = match (&named, kind) {
                         (Named::Face(_), None | Some(Kind::Face)) => Kind::Face,
                         (Named::Edge(_), None) => if chain { Kind::Chain } else { Kind::Edge },
                         (Named::Edge(_), Some(k @ (Kind::Edge | Kind::Chain))) => k,
                         (_, Some(k)) => return Err(format!("'select' `{text}` is not a {}", k.name())),
                     };
-                    return Ok(Want { kind, solids: vec![object], at: near.or(at), named: Some(named) });
+                    return Ok(Want { kind, on, solids: vec![first.object], at: near.or(at), named: Some(named) });
                 }
                 let kind = match kind {
                     Some(k) => k,
                     None if solids.len() == 2 => Kind::Crease,
                     None if at.is_some() => Kind::Spot,
-                    None => kind_for(self, &solids[0])?,
+                    None => kind_for(self, &first),
                 };
                 if (kind == Kind::Crease) != (solids.len() == 2) {
                     return Err("a crease names two solids, every other pick one".into());
                 }
-                if matches!(kind, Kind::Face | Kind::Edge | Kind::Chain) {
+                if matches!(kind, Kind::Face | Kind::Edge | Kind::Chain) || (!view_row && at.is_some() && v.get("on").is_some() && matches!(kind, Kind::Feature | Kind::Edit)) {
                     let p = at.ok_or("a face, edge or chain is named by 'select' (as fab.exact writes it), or pointed at with 'at'")?;
-                    let object = self.facts(&solids[0])?.object;
                     // a point the AI names has no pixel: an edge within a millimetre
-                    return self.exact_want(&object, p, Some(kind), 1.0 / 3.0)?.ok_or_else(|| format!("`{}` is not an exact part with named faces: pick a feature or a spot", short(&object)));
+                    return self.exact_want(&first.object, &on, p, Some(kind), 1.0 / 3.0)?.ok_or_else(|| format!("`{}` is not an exact part with named faces: pick a feature or a spot", short(&on)));
                 }
-                Ok(Want { kind, solids, at, named: None })
+                Ok(Want { kind, on, solids, at, named: None })
             }
             _ => Err("a pick is a solid's name, two names (a crease), or {solid at kind}".into()),
         }
@@ -1001,7 +1108,9 @@ impl Session {
 
     /// The picks follow a build: each described again by its names on the new build (its point
     /// snapped back onto the surface); a pick whose solid is gone drops, and the next read says
-    /// why. Another document on the bed clears them. Per build: one description per pick.
+    /// why. A name through a solid renamed by a step written after it (`r.face(..)` once `r` is
+    /// `r_chamfer` and `r` a pull of it) reads the new name. Another document on the bed clears
+    /// them. Per build: one description per pick.
     pub fn picks_follow_build(&mut self) {
         if self.picks.switched != self.switched {
             self.picks.switched = self.switched;
@@ -1020,15 +1129,25 @@ impl Session {
             return;
         }
         self.picks.on = self.shown_last();
-        self.picks.exact.clear();
+        let mut before = std::mem::take(&mut self.picks.exact);
+        if before.is_empty() {
+            before = std::mem::take(&mut self.picks.before);
+        }
+        self.picks.before.clear();
         if self.picks.list.is_empty() {
             return;
         }
         let list = std::mem::take(&mut self.picks.list);
         let mut changed = false;
         for old in list {
-            let want = Want { kind: old.kind, solids: old.solids.clone(), at: old.at.map(|a| a.0), named: old.named.clone() };
-            match self.describe(&want) {
+            let described = (|| {
+                if old.on != old.object {
+                    self.pick_step(&old.object, &old.on)?;
+                }
+                let named = old.named.as_ref().and_then(|n| self.renamed(&before, &old.on, n)).or_else(|| old.named.clone());
+                self.describe(&Want { kind: old.kind, on: old.on.clone(), solids: old.solids.clone(), at: old.at.map(|a| a.0), named })
+            })();
+            match described {
                 Ok(mut pick) => {
                     pick.id = old.id.clone();
                     changed |= pick != old;
@@ -1045,9 +1164,180 @@ impl Session {
         }
     }
 
-    fn picks_value(&mut self) -> S {
+    /// Name `named` on solid `on` on the build before (its exact body in `before`) read with
+    /// the solids since renamed (a key whose solid has another id now); None when none was.
+    fn renamed(&mut self, before: &[(String, Option<Arc<fab_model::eval::ExactBody>>)], on: &str, named: &Named) -> Option<Named> {
+        let old = before.iter().find(|(o, _)| o == on)?.1.clone()?;
+        let new = self.exact_body(on).ok()??;
+        let ids: Vec<(&str, &str)> = old.parts.iter().filter_map(|(k, was)| new.parts.get(k).filter(|now| *now != was).map(|now| (was.as_str(), now.as_str()))).collect();
+        if ids.is_empty() {
+            return None;
+        }
+        // each solid's id read through (`r.` in `r.face(..)`) the id it has now
+        let rename = |t: &str| {
+            let mut out = String::with_capacity(t.len());
+            let mut rest = t;
+            while let Some(c) = rest.chars().next() {
+                if c.is_alphabetic() || c == '_' {
+                    let n = rest.find(|ch: char| !(ch.is_alphanumeric() || ch == '_')).unwrap_or(rest.len());
+                    let word = &rest[..n];
+                    let dotted = rest[n..].starts_with('.');
+                    out.push_str(ids.iter().find(|(was, _)| dotted && *was == word).map_or(word, |(_, now)| now));
+                    rest = &rest[n..];
+                } else {
+                    out.push(c);
+                    rest = &rest[c.len_utf8()..];
+                }
+            }
+            out
+        };
+        Some(match named {
+            Named::Face(t) => Named::Face(rename(t)),
+            Named::Edge([a, b]) => Named::Edge([rename(a), rename(b)]),
+        })
+    }
+
+    fn view_rows(&mut self, rows: Vec<(Want, f64)>, normal: Option<P3>) -> S {
+        let mut out = Vec::new();
+        for (want, depth) in rows {
+            let Ok(p) = self.describe_hit(&want, normal.filter(|_| want.kind != Kind::Feature)) else { continue };
+            let mut f = vec![("kind", s(p.kind.name())), ("label", s(&p.label)), ("depth", mm(depth))];
+            let mut spec = vec![("kind", s(p.kind.name())), ("solids", arr(p.solids.iter().map(s)))];
+            if p.on != p.object {
+                spec.push(("on", s(&p.on)));
+            }
+            if let Some((at, _)) = p.at {
+                spec.push(("at", arr(at.iter().map(|x| n(*x)))));
+            }
+            if let Some(sel) = &p.selector {
+                spec.push(("select", s(sel)));
+            }
+            f.push(("pick", obj(spec)));
+            out.push(obj(f));
+        }
+        obj(vec![("rows", arr(out))])
+    }
+
+    fn point_result(&mut self, want: Option<Want>, gesture: Gesture, normal: Option<P3>, drain: bool) -> Result<S, String> {
+        if matches!(gesture, Gesture::Hover) {
+            // the view draws what a click would take: its outline too
+            return Ok(match want {
+                Some(w) => {
+                    let pick = self.describe_hit(&w, normal)?;
+                    let mut f = vec![("hover", pick.value())];
+                    if !pick.outline.is_empty() {
+                        f.push(("outline", arr(pick.outline.iter().map(|line| arr(line.iter().map(|p| arr(p.iter().map(|x| n(*x)))))))));
+                    }
+                    // the view's own: the features it tints, a crease's tick
+                    if !pick.tint.is_empty() {
+                        f.push(("tint", arr(pick.tint.iter().map(|(id, w)| arr([int(*id), n(*w as f64)])))));
+                    }
+                    if let Some((p, d)) = pick.tick {
+                        f.push(("tick", arr([arr(p.iter().map(|x| n(*x))), arr(d.iter().map(|x| n(*x)))])));
+                    }
+                    obj(f)
+                }
+                None => obj(vec![("hover", S::Nil)]),
+            });
+        }
+        let adding = matches!(gesture, Gesture::Click { add: true });
+        let Some(want) = want else {
+            if !adding && !self.picks.list.is_empty() {
+                self.picks.list.clear();
+                self.picks.rev += 1;
+            }
+            return Ok(self.picks_value(drain));
+        };
+        let pick = self.describe_hit(&want, normal)?;
+        if !adding {
+            self.picks.list.clear();
+        }
+        // Picking what is picked again takes it off (Shift), or keeps it alone.
+        let again = self.picks.list.iter().position(|p| p.on == pick.on && p.kind == pick.kind && p.solids == pick.solids && p.selector == pick.selector);
+        match again {
+            Some(i) if adding => {
+                self.picks.list.remove(i);
+                self.picks.rev += 1;
+            }
+            _ => self.add_pick(pick),
+        }
+        Ok(self.picks_value(drain))
+    }
+
+    /// Drop picks of a surface the person has left. Only an AI read consumes the reasons.
+    fn retain_picks_for_view(&mut self, target: Option<&str>) {
+        let before = self.picks.list.len();
+        self.picks.list.retain(|p| {
+            let keep = p.on == target.unwrap_or(&p.object);
+            if !keep {
+                self.picks.dropped.push(format!("{} ({} {}): marker moved from {} to {}", p.id, p.kind.name(), p.label, p.on, target.unwrap_or("the whole part")));
+            }
+            keep
+        });
+        if self.picks.list.len() != before {
+            self.picks.rev += 1;
+        }
+    }
+
+    /// A host operation, never dispatched by tool name. A marked view supplies its own hit.
+    pub fn view_pick(&mut self, request: ViewPick) -> Reply {
+        self.picks_follow_build();
+        let result = match request {
+            ViewPick::Retain(on) => {
+                self.retain_picks_for_view(on.as_deref());
+                Ok(S::Nil)
+            }
+            ViewPick::Select(args) => self.select(&args, false),
+            ViewPick::Point { hit, kind, gesture } => self.view_point(hit.as_ref(), &kind, gesture),
+        };
+        match result {
+            Ok(v) => Reply::ok(v),
+            Err(e) => Reply::err(e),
+        }
+    }
+
+    fn view_point(&mut self, hit: Option<&ViewHit>, filter: &str, gesture: Gesture) -> Result<S, String> {
+        let Some(hit) = hit else {
+            return if matches!(gesture, Gesture::Along) { Ok(self.view_rows(Vec::new(), None)) } else { self.point_result(None, gesture, None, false) };
+        };
+        let on = self.pick_step(&hit.object, &hit.on)?;
+        let tol = NEAR_PX * hit.pixel;
+        let want = |kind| Want { on: on.clone(), kind, solids: vec![hit.object.clone()], at: Some(hit.at), named: None };
+        if matches!(gesture, Gesture::Along) {
+            let mut rows = self.exact_rows(&hit.object, &on, hit.at, hit.depth, tol)?;
+            let first_feature = rows.len();
+            let c = self.shown_compiled().ok_or("nothing is built yet")?;
+            let ev = self.shown_last().ok_or("nothing is built yet")?;
+            let (inst, k) = c.part(&on).ok_or("the shown step is gone")?;
+            let solids = &inst.script.program.solids;
+            let mut inputs = solids[k].inputs.clone();
+            let mut seen = std::collections::HashSet::new();
+            let from = add_scaled(hit.at, hit.dir, -hit.depth);
+            while let Some(i) = inputs.pop() {
+                if !seen.insert(i) { continue; }
+                inputs.extend_from_slice(&solids[i].inputs);
+                let id = fab_model::program::part_id(&inst.name, &solids[i].id);
+                if rows[..first_feature].iter().any(|(w, _)| w.kind == Kind::Feature && w.solids[0] == id) { continue; }
+                let Some((lo, hi)) = ev.objects.iter().find(|o| o.name == id).and_then(|o| o.bounds) else { continue };
+                if let Some((t, _)) = slab(from, hit.dir, lo, hi) {
+                    rows.push((Want { solids: vec![id], at: Some(add_scaled(from, hit.dir, t.max(0.0))), ..want(Kind::Feature) }, t));
+                }
+            }
+            rows[first_feature..].sort_by(|a, b| a.1.total_cmp(&b.1));
+            rows.push((want(Kind::Body), hit.depth));
+            return Ok(self.view_rows(rows, Some(hit.normal)));
+        }
+        let kind = Kind::parse(filter);
+        let w = match kind {
+            Some(k @ (Kind::Body | Kind::Spot)) => Some(want(k)),
+            _ => self.exact_want(&hit.object, &on, hit.at, kind, tol)?,
+        };
+        self.point_result(w, gesture, Some(hit.normal), false)
+    }
+
+    fn picks_value(&mut self, drain: bool) -> S {
         let mut f = vec![("picks", arr(self.picks.list.iter().map(Pick::value)))];
-        if !self.picks.dropped.is_empty() {
+        if drain && !self.picks.dropped.is_empty() {
             f.push(("dropped", arr(std::mem::take(&mut self.picks.dropped).into_iter().map(s))));
         }
         if self.picks.list.is_empty() {
@@ -1063,13 +1353,16 @@ impl Session {
     /// (Select Other's rows).
     pub(crate) fn select_tool(&mut self, args: &Value) -> Reply {
         self.picks_follow_build();
-        match self.select(args) {
+        match self.select(args, true) {
             Ok(v) => Reply::ok(v),
             Err(e) => Reply::err(e),
         }
     }
 
-    fn select(&mut self, args: &Value) -> Result<S, String> {
+    fn select(&mut self, args: &Value, drain: bool) -> Result<S, String> {
+        if args.get("camera").is_some() && args.get("on").is_some() {
+            return Err("a pixel picks what the view shows: name the step's face with 'select', or point at it with 'at'".into());
+        }
         let kind = match str_arg(args, "kind") {
             None | Some("any") => None,
             Some(k) => Some(Kind::parse(k).ok_or_else(|| format!("'kind' is any, edit, crease, edges, spot, feature, body, face, edge or chain; not '{k}'"))?),
@@ -1102,65 +1395,11 @@ impl Session {
         if let Some((from, dir, pixel)) = ray {
             if args.get("along").and_then(Value::as_bool) == Some(true) {
                 let rows = self.along(from, dir, pixel)?;
-                let mut out = Vec::new();
-                for (want, depth) in rows {
-                    let Ok(p) = self.describe(&want) else { continue };
-                    let mut f = vec![("kind", s(p.kind.name())), ("label", s(&p.label)), ("depth", mm(depth))];
-                    let mut spec = vec![("kind", s(p.kind.name())), ("solids", arr(p.solids.iter().map(s)))];
-                    if let Some((at, _)) = p.at {
-                        spec.push(("at", arr(at.iter().map(|x| n(*x)))));
-                    }
-                    if let Some(sel) = &p.selector {
-                        spec.push(("select", s(sel)));
-                    }
-                    f.push(("pick", obj(spec)));
-                    out.push(obj(f));
-                }
-                return Ok(obj(vec![("rows", arr(out))]));
+                return Ok(self.view_rows(rows, None));
             }
             let want = self.want_at_ray(from, dir, pixel, kind)?;
-            if args.get("hover").and_then(Value::as_bool) == Some(true) {
-                // the view draws what a click would take: its outline too
-                return Ok(match want {
-                    Some(w) => {
-                        let pick = self.describe(&w)?;
-                        let mut f = vec![("hover", pick.value())];
-                        if !pick.outline.is_empty() {
-                            f.push(("outline", arr(pick.outline.iter().map(|line| arr(line.iter().map(|p| arr(p.iter().map(|x| n(*x)))))))));
-                        }
-                        // the view's own: the features it tints, a crease's tick
-                        if !pick.tint.is_empty() {
-                            f.push(("tint", arr(pick.tint.iter().map(|(id, w)| arr([int(*id), n(*w as f64)])))));
-                        }
-                        if let Some((p, d)) = pick.tick {
-                            f.push(("tick", arr([arr(p.iter().map(|x| n(*x))), arr(d.iter().map(|x| n(*x)))])));
-                        }
-                        obj(f)
-                    }
-                    None => obj(vec![("hover", S::Nil)]),
-                });
-            }
-            let Some(want) = want else {
-                if !adding && !self.picks.list.is_empty() {
-                    self.picks.list.clear();
-                    self.picks.rev += 1;
-                }
-                return Ok(self.picks_value());
-            };
-            let pick = self.describe(&want)?;
-            if !adding {
-                self.picks.list.clear();
-            }
-            // Picking what is picked again takes it off (Shift), or keeps it alone.
-            let again = self.picks.list.iter().position(|p| p.kind == pick.kind && p.solids == pick.solids && p.selector == pick.selector);
-            match again {
-                Some(i) if adding => {
-                    self.picks.list.remove(i);
-                    self.picks.rev += 1;
-                }
-                _ => self.add_pick(pick),
-            }
-            return Ok(self.picks_value());
+            let gesture = if args.get("hover").and_then(Value::as_bool) == Some(true) { Gesture::Hover } else { Gesture::Click { add: adding } };
+            return self.point_result(want, gesture, None, drain);
         }
         if let Some(r) = args.get("remove") {
             let ids: Vec<&str> = match r {
@@ -1173,19 +1412,19 @@ impl Session {
                 return Err(format!("no pick {}: the picks are {}", ids.join(", "), self.picks.list.iter().map(|p| p.id.as_str()).collect::<Vec<_>>().join(", ")));
             }
             self.picks.rev += 1;
-            return Ok(self.picks_value());
+            return Ok(self.picks_value(drain));
         }
         if args.get("clear").and_then(Value::as_bool) == Some(true) {
             if !self.picks.list.is_empty() {
                 self.picks.list.clear();
                 self.picks.rev += 1;
             }
-            return Ok(self.picks_value());
+            return Ok(self.picks_value(drain));
         }
         let (list, replace) = match (args.get("set"), args.get("add")) {
             (Some(list), _) => (list, true),
             (None, Some(list)) if !matches!(list, Value::Bool(_)) => (list, false),
-            _ => return Ok(self.picks_value()),
+            _ => return Ok(self.picks_value(drain)),
         };
         // a list of picks, or one
         let items: Vec<&Value> = match list {
@@ -1196,7 +1435,7 @@ impl Session {
         let mut picks = Vec::new();
         let mut problems = Vec::new();
         for (i, item) in items.iter().enumerate() {
-            match self.want_of(item).and_then(|w| self.describe(&w)) {
+            match self.want_of(item, !drain).and_then(|w| self.describe(&w)) {
                 Ok(p) => picks.push(p),
                 Err(e) => problems.push(format!("pick {}: {e}", i + 1)),
             }
@@ -1211,6 +1450,6 @@ impl Session {
         for p in picks {
             self.add_pick(p);
         }
-        Ok(self.picks_value())
+        Ok(self.picks_value(drain))
     }
 }

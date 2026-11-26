@@ -1,0 +1,50 @@
+use mod.motion.*
+// A 5 s lower third: a plate slides in behind a mask, an accent bar grows,
+// name and role follow, and the plate slides back out.
+Motion{
+    label: "Lower third"
+    duration: 5.0
+    fps: 30
+    inputs: {
+        name: input(@text, "Jordan Vale", "Who")
+        role: input(@text, "Founder, Makepad", "What they do")
+        accent: input(@color, #ffcc00, "Bar colour")
+    }
+    layers: [
+        Group{
+            name: "plate"
+            at: vec2(120, 820)
+            mask: Rect{size: vec2(760, 150) fill: #ffffff}
+            layers: [
+                Rect{
+                    name: "panel"
+                    size: vec2(700, 150) radius: 14 fill: #111418e6
+                    x: keys([0, -720], [0.6, 0, @ease_out_expo], [4.3, 0], [4.9, -720, @ease_in_expo])
+                }
+                Rect{
+                    name: "accent"
+                    at: vec2(24, 24) size: vec2(10, 102) radius: 5 fill: in(@accent)
+                    anchor: vec2(0.5, 1.0)
+                    scale: keys([0.3, [1, 0]], [0.8, [1, 1], @ease_out_back], [4.2, [1, 1]], [4.5, [1, 0], @ease_in])
+                }
+                Text{
+                    name: "name"
+                    text: in(@name)
+                    font: Font{family: "Inter" weight: 700} size: 52
+                    at: vec2(58, 26)
+                    opacity: keys([0.5, 0], [0.8, 1], [4.2, 1], [4.4, 0])
+                    x: keys([0.5, -30], [0.9, 0, @ease_out_cubic])
+                }
+                Text{
+                    name: "role"
+                    text: in(@role)
+                    font: Font{family: "Inter" weight: 400} size: 32 color: #aab2c0
+                    at: vec2(60, 90)
+                    by: @word stagger: 0.05
+                    opacity: keys([0.7, 0], [1.0, 1], [4.2, 1], [4.4, 0])
+                    x: keys([0.7, -20], [1.1, 0, @ease_out_cubic])
+                }
+            ]
+        }
+    ]
+}

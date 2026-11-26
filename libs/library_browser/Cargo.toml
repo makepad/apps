@@ -1,0 +1,22 @@
+# The library browser the product windows share (Story's CUT and DECK,
+# Stage's SCORE): the card list, the lanes read from the asset store, the
+# catalogue worker and the drafts of the open documents.
+[package]
+name = "makepad-library-browser"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "The library browser shared by the product windows"
+
+[lib]
+name = "makepad_library_browser"
+
+[dependencies]
+makepad-widgets = { path = "../../../../widgets", default-features = false }
+makepad-look = { path = "../../../../libs/look" }
+makepad-strict-json = { path = "../../../../libs/strict_json" }
+makepad-asset-client = { path = "../../../apps/engine/asset/client" }
+makepad-asset-data = { path = "../../../apps/engine/asset/data" }
+makepad-asset-connection = { path = "../asset_connection" }
+makepad-app-shell = { path = "../../../apps/libs/app_shell" }

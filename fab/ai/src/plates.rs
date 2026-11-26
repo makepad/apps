@@ -24,6 +24,9 @@ use crate::AUTOSAVE_FILE;
 use fab_model::project;
 use std::path::{Path, PathBuf};
 
+/// Reserved store directory for journals put away by the person.
+pub const REMOVED_SESSIONS: &str = "removed-sessions";
+
 /// Where a plate came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Origin {
@@ -279,7 +282,7 @@ impl PlateStore {
         let Ok(list) = std::fs::read_dir(&self.root) else { return Vec::new() };
         list.flatten().filter_map(|e| {
             let id = e.file_name().into_string().ok()?;
-            e.path().is_dir().then(|| self.read(&id)).flatten()
+            (id != REMOVED_SESSIONS && e.path().is_dir()).then(|| self.read(&id)).flatten()
         }).collect()
     }
 
@@ -511,6 +514,11 @@ impl PlateStore {
     /// folder of its own) and its working copy; it is off the list. `trash` moves one path.
     pub fn delete(&self, id: &str, trash: &dyn Fn(&Path) -> Result<(), String>) -> Result<(), String> {
         let plate = self.read(id).ok_or_else(|| format!("no plate {id}"))?;
+        // The id folder moves first. If that rename is refused (on Windows, a handle open
+        // inside), nothing else has moved: the plate stays taken off the list with every file
+        // kept. A later failure on a project file leaves a project the person can still open
+        // from its file.
+        trash(&self.dir(id))?;
         if let Some(file) = &plate.file {
             let dir = file.parent().unwrap_or(Path::new("."));
             if dir.parent() == Some(self.home.as_path()) && projects_in(dir).len() == 1 {
@@ -523,7 +531,7 @@ impl PlateStore {
                 }
             }
         }
-        trash(&self.dir(id))
+        Ok(())
     }
 }
 

@@ -1,0 +1,35 @@
+use mod.motion.*
+// SPOTLIGHT, 9:16 — the portrait cut of demo_spotlight, lighting a wide
+// button at the bottom of a phone screen. Original notes follow.
+// SPOTLIGHT — dims everything except the part of the screen that
+// matters. The dim fades in while the hole closes from 180% down onto the
+// target on ease_in_out_cubic, so the eye is herded, not cut to. The hole
+// has a feathered edge and a thin ring; on the way out it opens back up
+// and the dim lifts. Transparent overlay.
+// Why: contrast is the strongest pointer there is; the closing hole adds
+// direction, and the feather keeps it from looking like a cut-out.
+Motion{
+    label: "Spotlight 9:16"
+    brief: "Dims the screen except a soft-edged hole that closes onto the target; portrait."
+    tags: ["demo", "overlay", "spotlight", "focus", "vignette", "product", "9:16"]
+    size: vec2(1080, 1920) duration: 4.0
+    inputs: {
+        target: input(@vec2, vec2(540, 1550), "Centre of the lit area, px")
+        target_size: input(@vec2, vec2(980, 120), "Size of the lit area, px")
+        radius: input(@number, 60, "Corner radius of the hole; half the height for a pill")
+        dim: input(@color, #000000b3, "The dim")
+        ring: input(@color, #ffffff59, "Ring around the hole")
+    }
+    layers: [
+        Group{
+            mask_mode: @inverse
+            mask: Rect{at: in(@target) - in(@target_size) * 0.5 size: in(@target_size) radius: in(@radius) feather: 18
+                       scale: keys([0.0, 1.8], [0.9, 1.0, @ease_in_out_cubic], [3.4, 1.0], [4.0, 1.8, @ease_in_out_cubic])}
+            opacity: keys([0.0, 0], [0.5, 1, @ease_out_cubic], [3.5, 1], [4.0, 0, @ease_in_cubic])
+            layers: [Rect{size: vec2(1080, 1920) fill: in(@dim)}]
+        }
+        Rect{at: in(@target) - in(@target_size) * 0.5 size: in(@target_size) radius: in(@radius) stroke: in(@ring) width: 2
+             scale: keys([0.0, 1.8], [0.9, 1.0, @ease_in_out_cubic], [3.4, 1.0], [4.0, 1.8, @ease_in_out_cubic])
+             opacity: keys([0.5, 0], [0.9, 1, @ease_out_cubic], [3.3, 1], [3.6, 0, @ease_in_cubic])}
+    ]
+}

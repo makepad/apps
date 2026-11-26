@@ -525,6 +525,7 @@ fn obstacle_masks(
             }
         };
         knock.push(grown(piece.shape(), gap + h));
+        fab_elec_core::pace::pace();
     }
     for (_, l, base) in &ctx.prep.higher {
         if *l == layer && base.bbox().intersects(&near) {
@@ -534,6 +535,7 @@ fn obstacle_masks(
     for (piece, kind) in &selected.pieces {
         let SelectedKind::Thermal(t) = kind else { continue };
         let PieceKind::Copper(c) = &piece.kind else { continue };
+        fab_elec_core::pace::pace();
         let ConnItem::Pad { placed, pad } = c.item else { continue };
         let Some(p) = ctx.board.placed_item(placed) else { continue };
         let b = c.shape.bbox();
@@ -573,13 +575,22 @@ fn tile_fill(ctx: &Ctx<'_>, layer: LayerId, key: TileKey) -> FillTile {
         ControlFlow::Continue(())
     });
     let selected = select(ctx, layer, near, candidates.into_iter().filter_map(|key| ctx.index.get(key)));
+    // A large board's tile took up to 1 s: the host's pool gets a turn between its phases.
+    fab_elec_core::pace::pace();
     let (mut knock, masks) = obstacle_masks(ctx, layer, near, &selected, h, false);
+    fab_elec_core::pace::pace();
     if h > 0 {
-        knock.extend(masks.iter().map(|mask| mask.offset(h, ARC_ERR)));
+        knock.extend(masks.iter().map(|mask| {
+            fab_elec_core::pace::pace();
+            mask.offset(h, ARC_ERR)
+        }));
     } else {
         knock.extend(masks.iter().cloned());
     }
-    e = e.difference(&PolySet::union_all(knock.iter()));
+    let knocked = PolySet::union_all(knock.iter());
+    fab_elec_core::pace::pace();
+    e = e.difference(&knocked);
+    fab_elec_core::pace::pace();
     let tile_set = PolySet::rect(tile);
     if h == 0 {
         let mut polys = e.intersection(&tile_set).split();
@@ -588,7 +599,9 @@ fn tile_fill(ctx: &Ctx<'_>, layer: LayerId, key: TileKey) -> FillTile {
         return FillTile::from_polys(key, polys, own, tile);
     }
     let clip = ctx.prep.base.intersection(&tile_set).difference(&PolySet::union_all(masks.iter()));
+    fab_elec_core::pace::pace();
     let set = e.offset(h, ARC_ERR).intersection(&clip);
+    fab_elec_core::pace::pace();
     let mut polys = set.split();
     polys.sort_by_cached_key(poly_key);
     partition_tile(key, tile, polys, &e, &clip, h, &selected.own)
@@ -1488,14 +1501,19 @@ pub fn changed_box(before: &ZoneFill, after: &ZoneFill) -> BBox {
 }
 
 /// Every zone's fill, in id order. Builds one piece index for all zones.
-/// Computes each zone's [`FillPlan::full`] tiles in order, then assembles its result.
+/// Computes each zone's [`FillPlan::full`] tiles in order, then assembles its result. Gives the
+/// host's pool a turn before each tile ([`fab_elec_core::pace`]): a large board's zone took 1.9 s
+/// at a 2-core share, one tile up to 1 s.
 pub fn fill_all(board: &Board, rules: &RuleMatrix) -> Vec<ZoneFill> {
     let index = PieceIndex::build(board, &[]);
     let mut zones: Vec<_> = board.zones.iter().collect();
     zones.sort_by_key(|zone| zone.id);
     zones.into_iter().map(|zone| {
         let plan = FillPlan::full(board, rules, zone.id, &index);
-        let tiles = (0..plan.len()).map(|i| plan.tile(board, rules, &index, i)).collect();
+        let tiles = (0..plan.len()).map(|i| {
+            fab_elec_core::pace::pace();
+            plan.tile(board, rules, &index, i)
+        }).collect();
         plan.finish(tiles)
     }).collect()
 }
@@ -2407,7 +2425,13 @@ pub(crate) mod tests {
             filled.layer(LayerId::inner(2)).expect("second inner fill").set().contains(centre),
             "the second inner layer covers the drill centre beyond the blind via's span",
         );
+        // The only hook installed in this test binary: a host's pool, counted.
+        static TURNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn turn() { TURNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        fab_elec_core::pace::install_pace(turn);
+        let turns = TURNS.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(fill_all(&board, &rules), vec![filled], "the shared-index fill agrees on every copper layer");
+        assert!(TURNS.load(std::sync::atomic::Ordering::Relaxed) > turns, "the full fill gives the host's pool a turn between its tiles");
     }
 
     fn check_seams(fill: &ZoneFill) {

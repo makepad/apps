@@ -1,0 +1,12 @@
+[package]
+name = "makepad-splash-syntax"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "makepad_splash_syntax"
+
+[dependencies]
+makepad-stack-budget = { path = "../../../../libs/stack_budget" }

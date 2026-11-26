@@ -1,0 +1,14 @@
+use mod.scene.*; use mod.post
+// Procedural geometry: vj_fx's flow ribbons, L-system tree and metaballs, a tube drawing on, a twisted ribbon, a lathed vase, an extruded SVG.
+Scene3D{ look: @studio
+  camera: Camera{position: vec3(0, 3, 13) target: vec3(0, 1.2, 0) focal_length: 32}
+  post: [ContactShadows{opacity: 0.6} post.Bloom{strength: 0.3}]
+  children: [
+    Fx{preset: @ribbons position: vec3(-4.5, 1.8, 0) count: 240 radius: 2.2 color: #3f7cff color2: #7fd6ff}
+    Fx{preset: @tree position: vec3(-1.5, 0, 0) radius: 1.4 start: 0.2 duration: 1.5 color: #8a6a4a}
+    Fx{preset: @metaballs position: vec3(1.5, 1.4, 0) radius: 1.8}
+    Fx{preset: @tube_draw position: vec3(4.5, 1.5, 0) size: 0.05 start: 0 duration: 3 curve: TorusKnotCurve{p: 2 q: 5 radius: 1.0} color: #ff5a36 color2: #ff5a36}
+    Fx{preset: @ribbon_path position: vec3(0, 3.8, -1) size: 0.08 curve: CircleCurve{radius: 3} color: #f2c14e}
+    Fx{preset: @vase position: vec3(-3, -0.1, 2) radius: 1.2 color: #e8e2d6}
+    Fx{preset: @svg_logo position: vec3(3, 0.4, 2) radius: 1 start: 0.2 material: MeshPhysicalMaterial{preset: @chrome}}
+  ] }

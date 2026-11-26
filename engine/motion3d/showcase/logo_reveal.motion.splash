@@ -1,0 +1,82 @@
+use mod.motion.*; use mod.scene; use mod.post
+// 3D kinetic type logo reveal: chrome letters fly in from depth one by one
+// over a black mirror floor, a hot ring sweeps through, sparks burst on
+// the landing, the camera dollies in with parallax while the 50 mm lens
+// pulls focus onto the word. Dramatic key/rim rig, ACES, a cool grade.
+Motion{
+    size: vec2(1920, 1080)
+    duration: 5.0
+    layers: [
+        Scene3D{
+            background: #030406
+            environment: scene.Environment{preset: @studio intensity: 1.4 rotation: 30}
+            tone_mapping: @aces
+            exposure: 1.05
+            temporal_aa: 3
+            camera: Camera{
+                position: tween(vec3(1.6, 0.9, 11), vec3(-0.4, 0.45, 7.6), 0, 5, @ease_out_cubic)
+                target: tween(vec3(0.6, 0.3, 0), vec3(0, 0.35, 0), 0, 5, @ease_out_cubic)
+                focal_length: 50
+            }
+            post: [
+                scene.ContactShadows{opacity: 0.7 blur: 0.2 far: 0.8}
+                post.Bloom{strength: 0.55 radius: 0.6 threshold: 1.6}
+                post.DepthOfField{focus: tween(4.5, 7.6, 0, 2.2, @ease_in_out_cubic) f_stop: 2.0}
+                scene.ColorGrade{contrast: 1.15 saturation: 1.05 temperature: -0.25 lift: vec4(0.0, 0.004, 0.012, 1)}
+                post.Vignette{amount: 0.4}
+            ]
+            lights: [scene.LightRig{preset: @dramatic target: vec3(0, 0.4, 0)}]
+            children: [
+                Text3D{
+                    name: "word"
+                    text: "MAKEPAD"
+                    font: @bold
+                    size: 0.78
+                    depth: 0.3
+                    bevel: 0.035
+                    bevel_segments: 3
+                    position: vec3(0, 0.45, 0)
+                    by: @letter
+                    stagger: 0.09
+                    order: @center
+                    each: {
+                        position: tween(vec3(0, -0.6, -6), vec3(0, 0, 0), 0.2, 1.3, @ease_out_back)
+                        rotation: tween(vec3(-80, 25, 0), vec3(0, 0, 0), 0.2, 1.4, @ease_out_cubic)
+                        opacity: tween(0, 1, 0.2, 0.6)
+                    }
+                    material: scene.MeshPhysicalMaterial{preset: @chrome roughness: 0.08 clearcoat: 1}
+                }
+                scene.Mesh{
+                    geometry: scene.TorusGeometry{radius: 3.4 tube: 0.02 radial_segments: 12 tubular_segments: 200}
+                    position: vec3(0, 0.45, 0)
+                    rotation: tween(vec3(80, 0, 0), vec3(96, 0, 360), 0.8, 4.2, @ease_in_out_quint)
+                    scale: tween(0.3, 1.0, 0.8, 1.8, @ease_out_expo)
+                    cast_shadow: false
+                    material: scene.MeshBasicMaterial{color: #000000 emissive: #ff5a36 emissive_intensity: 8}
+                }
+                scene.Particles{
+                    count: 600
+                    rate: 0
+                    start: 1.35
+                    lifetime: 1.6
+                    lifetime_jitter: 0.5
+                    emitter: scene.BoxEmitter{size: vec3(6.0, 0.7, 0.4)}
+                    position: vec3(0, 0.45, 0)
+                    direction: vec3(0, 1, 0.3)
+                    spread: 70
+                    speed: 2.2
+                    speed_jitter: 0.8
+                    gravity: vec3(0, -2.5, 0)
+                    drag: 0.8
+                    size_start: 0.06
+                    size_end: 0.0
+                    color_start: #fff2c0
+                    color_end: #ff5a36
+                    shape: @star
+                    looping: false
+                }
+                scene.Ground{radius: 40 fade: vec2(3, 12) material: scene.MeshStandardMaterial{color: #030304 roughness: 0.45 specular_intensity: 0.2 env_intensity: 0.15 reflectivity: 0.45 reflection_blur: 0.1}}
+            ]
+        }
+    ]
+}

@@ -1,0 +1,51 @@
+use mod.motion.*
+// A 6 s kinetic-typography title. The headline rises letter by letter out
+// of a tilt, an accent bar draws itself under it, the subline follows word
+// by word, and everything leaves together in the last second.
+Motion{
+    label: "Kinetic title"
+    duration: 6.0
+    fps: 30
+    background: #0b0d12
+    inputs: {
+        headline: input(@text, "Notes, instantly", "The big line")
+        subline: input(@text, "Write it down before it is gone", "The small line")
+        accent: input(@color, #ff5a36, "Bar colour")
+    }
+    layers: [
+        Ellipse{
+            name: "glow"
+            at: vec2(360, 180) size: vec2(1200, 720)
+            fill: #ff5a3622
+            scale: tween(0.6, 1.0, 0.0, 1.2, @ease_out_expo)
+            opacity: sequence([[0, 0], [1, 0.8, @ease_out], [1, 4.2], [0, 0.8, @ease_in]])
+        }
+        Text{
+            name: "headline"
+            text: in(@headline)
+            font: Font{family: "Inter" weight: 800} size: 132
+            at: vec2(960, 360) align: @center
+            by: @letter stagger: 0.035
+            opacity: keys([0, 0], [0.25, 1, @ease_out], [5.0, 1], [5.5, 0, @ease_in])
+            y: keys([0, 60], [0.6, 0, @ease_out_back], [5.0, 0], [5.6, -40, @ease_in_cubic])
+            rotate: tween(-12, 0, 0.0, 0.5, @ease_out_cubic)
+        }
+        Path{
+            name: "bar"
+            svg: "M0 0 L720 0"
+            stroke: in(@accent) width: 10 cap: @round
+            at: vec2(600, 560)
+            trim_end: tween(0, 1, 0.9, 1.7, @ease_in_out_cubic)
+            trim_start: tween(0, 1, 5.0, 5.6, @ease_in_cubic)
+        }
+        Text{
+            name: "subline"
+            text: in(@subline)
+            font: Font{family: "Inter" weight: 500} size: 44 color: #c9ced8
+            at: vec2(960, 610) align: @center
+            by: @word stagger: 0.08
+            opacity: keys([1.4, 0], [1.9, 1, @ease_out], [5.0, 1], [5.4, 0])
+            y: tween(24, 0, 1.4, 2.0, @ease_out_quint)
+        }
+    ]
+}

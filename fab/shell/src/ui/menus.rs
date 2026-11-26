@@ -190,8 +190,7 @@ pub(crate) fn view_menu(state: &AppState) -> Vec<MenuItem> {
         })
         .collect();
 
-    let measurements = measurement_tools().into_iter().map(|(id, kind)| {
-        let tool = Tool::Measure(kind);
+    let measurements = measurement_tools().into_iter().map(|(id, tool)| {
         MenuItem::new(id, tool.label()).radio(state.tool == tool)
     }).collect();
 
@@ -260,14 +259,15 @@ pub(crate) fn view_menu(state: &AppState) -> Vec<MenuItem> {
 /// Workspace rows carry their workspace's id in the id's low half.
 const WORKSPACE_BASE: u64 = 0x6269_6d77_0000_0000;
 
-fn measurement_tools() -> [(LiveId, MeasureKind); 6] {
+fn measurement_tools() -> [(LiveId, Tool); 7] {
     [
-        (live_id!(measure_distance), MeasureKind::Distance),
-        (live_id!(measure_area), MeasureKind::Area),
-        (live_id!(measure_angle), MeasureKind::Angle),
-        (live_id!(measure_edge), MeasureKind::EdgeLength),
-        (live_id!(measure_radius), MeasureKind::Radius),
-        (live_id!(measure_faces), MeasureKind::FaceDistance),
+        (live_id!(measure_distance), Tool::Measure(MeasureKind::Distance)),
+        (live_id!(measure_area), Tool::Measure(MeasureKind::Area)),
+        (live_id!(measure_angle), Tool::Measure(MeasureKind::Angle)),
+        (live_id!(measure_edge), Tool::Measure(MeasureKind::EdgeLength)),
+        (live_id!(measure_radius), Tool::Measure(MeasureKind::Radius)),
+        (live_id!(measure_faces), Tool::Measure(MeasureKind::FaceDistance)),
+        (live_id!(measure_fit), Tool::MeasureFit),
     ]
 }
 
@@ -296,8 +296,8 @@ fn current_path(state: &AppState) -> Option<std::path::PathBuf> {
 /// One picked row → one action. Everything here has a reader that moves
 /// pixels; see the module doc for what is deliberately absent.
 pub(crate) fn action_for(state: &AppState, id: LiveId) -> Option<ShellAction> {
-    if let Some((_, kind)) = measurement_tools().into_iter().find(|(key, _)| *key == id) {
-        return Some(ShellAction::SetTool(Tool::Measure(kind)));
+    if let Some((_, tool)) = measurement_tools().into_iter().find(|(key, _)| *key == id) {
+        return Some(ShellAction::SetTool(tool));
     }
     if let Some(i) = recent_index(id) {
         return state.plates.plates.get(i).map(|p| ShellAction::OpenPlate(p.id.clone()));

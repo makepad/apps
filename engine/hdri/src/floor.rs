@@ -16,7 +16,8 @@ use makepad_draw::*;
 use makepad_render_material::ibl;
 
 use super::noise::hash01;
-use super::params::{FloorKind, FloorParams, FloorPattern, FLOOR_FAR_SHORE_RANGE};
+use super::params::{FloorKind, FloorParams, FloorPattern, PlazaJoints, RoadBeside, FLOOR_FAR_SHORE_RANGE};
+use super::rain_water::RainOnWater;
 use super::weather::SNOW_ALBEDO;
 use std::sync::Arc;
 
@@ -30,7 +31,7 @@ use std::sync::Arc;
 /// | Snow | snow | drift crests | old snow in the hollows |
 /// | Rock | stone | gravel | the soil in the cracks |
 /// | Road | asphalt | paint | the verge (gravel and short grass) |
-/// | Plaza | tiles | the dirt in the joints | moss |
+/// | Plaza | tiles | the dirt in the joints (a model's own: the joints' fill, `PLAZA_SAND`, `PLAZA_MORTAR`) | moss |
 /// | Mountain | the summit's rock | the valley's dry grass and scrub | the valley's rock |
 /// | Lake | the shore's pebbles and sand | the deep water's body (what its depths send back up, dark) | the far bank's soil (half of it; Grass the rest) |
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -44,6 +45,12 @@ pub struct FloorRecipe {
 
 /// A road lane's width, metres (§3.5).
 pub const LANE_WIDTH_M: f32 = 3.5;
+/// The Plaza's joints filled with sand (`PlazaJoints::Sand`): warm and brown, darker than the tiles (the jointing sand
+/// of the survey's running-bond paving, r/g 1.3, b/g 0.7), nearly flush.
+pub const PLAZA_SAND: [f32; 3] = [0.19, 0.145, 0.10];
+/// The Plaza's joints filled with mortar (`PlazaJoints::Mortar`): a light warm grey, half as light again as the tiles
+/// (the fan setts' mortar, 1.8 times their red setts' luminance, r/g 1.1 to 1.2, b/g 0.85), nearly flush.
+pub const PLAZA_MORTAR: [f32; 3] = [0.40, 0.37, 0.32];
 /// The verge's width either side of a road, metres; a Grass field beyond it.
 pub const VERGE_M: f32 = 3.0;
 /// The Lake's "in front": the map azimuth (degrees, a light's azimuth) the water lies toward; the shore is behind,
@@ -66,6 +73,9 @@ pub const SLUSH_ALBEDO: [f32; 3] = [0.30, 0.30, 0.31];
 pub const SUMMIT_MIN_M: f32 = 10.0;
 /// The distance over which a Mountain's valley fades into the horizon haze (its aerial perspective), metres.
 pub const MOUNTAIN_HAZE_M: f32 = 25_000.0;
+/// The farthest a planes' texel's distance says, metres: the planes keep it as a half float and the GPU's march holds
+/// it to 65 km (`makepad-floor`), so a texel at about this shows ground at least that far (`FloorHere::dist`).
+const PLANES_DIST_MAX_M: f32 = 64_000.0;
 
 /// The beach a floor lays on its own side of the skyline's sea (plan hdri-8 §3.10, D2), metres of ground inward from
 /// its shoreline, at the floor's own eye (matched to the strip by angle, Q1).
@@ -144,6 +154,33 @@ const RIPPLE_BEND_RATE: f32 = 0.45;
 /// RIPPLE_GONE: laxer than the noise octaves' BAND_FULL and BAND_GONE.
 const RIPPLE_GONE: f32 = 2.5;
 const RIPPLE_FULL: f32 = 7.0;
+/// The Lake's gusts (§3.8; the dunes lane, 2026-11-09): wind over water is never even. Its gusts raise the ripples in
+/// lanes drawn out along it between calmer ones, and in the lee of a shore it blows off, the water lies glassy for
+/// its first tens of metres (Physical Open Waters' capillary mask, written our own way). One factor on the ripples'
+/// slopes at each ground point (`FloorModel::gust`) sets both how strong the ripples the mirror shows are and how
+/// rough the mirror is: the slopes the texel leaves unresolved, which the mirror turns by (`visible_tilt`). The sun's
+/// glitter keeps the lake's mean ripples, so its light holds across bake widths. The lanes' noise cells along the wind and across it (two octaves, the second at 0.4 of the
+/// first with 0.3 of its weight), each whole from GUST_FULL of its cells a footprint and gone at GUST_GONE; the
+/// factor 0.35..1.45 times GUST_SCALE, which makes its mean square 1 over open water (the lake's mean sheen and
+/// glitter hold); the lee: GUST_LEE of the gusts' factor within GUST_LEE_M.0 of the shore up-wind, all of it from
+/// GUST_LEE_M.1 (a low bank's lee: no trees or walls stand on our shores).
+const GUST_CELLS_M: [f32; 2] = [160.0, 50.0];
+const GUST_GONE: f32 = 1.5;
+const GUST_FULL: f32 = 4.0;
+const GUST_SCALE: f32 = 1.0327;
+const GUST_LEE: f32 = 0.15;
+const GUST_LEE_M: (f32, f32) = (5.0, 60.0);
+/// How far outside the shore's sector edge a point inside it is taken to lie for its lee (`lee`), metres: on the water
+/// side, so the edge's own crossing tells which way the wind blows across it.
+const LEE_EDGE_OUT_M: f32 = 1.0e-3;
+/// The facets one texel of rippled water mirrors by (`mirror_lobe`): the visible slopes along the look's plane from
+/// where they turn their backs to the eye up to MIRROR_LOBE_U deviations, in steps of MIRROR_LOBE_DU deviations up to
+/// MIRROR_LOBE_DU_MOST as the table they are read from is coarser (at most 2 MIRROR_LOBE_U / MIRROR_LOBE_DU of them;
+/// past 4 deviations a Gaussian's weight is under 1e-3 of its peak).
+const MIRROR_LOBE_U: f32 = 4.0;
+const MIRROR_LOBE_DU: f32 = 0.25;
+const MIRROR_LOBE_DU_MOST: f32 = 1.0;
+const MIRROR_LOBE_NODES: usize = 32;
 
 /// What the far model gives along one direction below the horizon.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -155,7 +192,8 @@ pub struct FloorFar {
     pub water: f32,
     /// The share that is ice (a frozen lake), 0..1.
     pub ice: f32,
-    /// The water's normal (its ripples), unit, facing up; straight up where it is flat.
+    /// The water's normal (its ripples), unit, facing up; straight up where it is flat. On the Lake the mean of the
+    /// facets the eye sees (`visible_tilt`), which the mirror's one exact lookup takes.
     pub normal: Vec3f,
     /// How much of the atmosphere's blend into the horizon haze the ground keeps (`Atmosphere::sky_on_ground`): 1,
     /// less over a far valley.
@@ -172,6 +210,14 @@ pub struct FloorFar {
     pub slopes: f32,
     /// The variance (per axis) of all the ripples' slopes (0 on flat water and off the water): the glitter's masking.
     pub slopes_all: f32,
+    /// The variance (per axis) of the slopes the mirror leaves unresolved, as the Lake's gusts scale them: the facets
+    /// the texel's water mirrors the sky by spread round `normal`, their visible mean (`mirror_lobe`). 0 where the
+    /// mirror is one direction: flat water, the skyline's sea, off the water.
+    pub rough: f32,
+    /// How far the ground it shows lies along the direction, metres: the eye over the sine of the depression, the
+    /// Mountain's valley its drop and the eye below (f32::MAX at or above level). The air between is what a viewer
+    /// height's sky sees it through (`Atmosphere::sky_over_at`).
+    pub dist: f32,
 }
 
 /// The floor's far model of one map (§2's far zone; the whole floor when no relief is attached).
@@ -181,7 +227,7 @@ pub struct FloorModel {
     seed: u32,
     eye: f32,
     reach: f32,
-    numbers: [f32; 6],
+    numbers: [f32; 8],
     recipe: FloorRecipe,
     /// The weather's snow covers the floor (`effects(weather).snow`); a Lake is then frozen.
     snow: bool,
@@ -197,9 +243,12 @@ pub struct FloorModel {
     /// Road: the verge and the field beyond it; Lake: the beach and the far bank; Mountain: the valley (`second`).
     second: Vec3f,
     third: Vec3f,
-    /// Road: its direction on the ground (x, z) and its half width, metres.
-    along: [f32; 2],
+    /// Road: its centre line on the ground (straight or bent) and its half width, metres.
+    road: RoadPath,
     half: f32,
+    haze: f32,
+    /// Road: the verge's width beyond its edge, metres (`FloorParams::verge_m`: VERGE_M beside grass, 0 beside the rest).
+    verge: f32,
     /// Mountain: the summit's radius, metres.
     summit: f32,
     /// The Grass field beside a road and on a lake's far bank: Grass at its default dryness, under this floor's tint,
@@ -214,6 +263,142 @@ pub struct FloorModel {
     /// The skyline's sea the floor carries on below the strip (D2): None without a skyline, a sea or for a Mountain,
     /// whose valley takes everything below the horizon (Q4).
     sea: Option<Arc<SeaEdge>>,
+    /// Lake: the frame its gusts are worked out in (`gust`, `lee`), once.
+    gusts: Option<GustFrame>,
+    /// The rain falling on its water (rain_water.rs; the weather lane, 2026-11-09): the Lake's and the skyline's sea's
+    /// mirror takes the rain's rings and sheen (`with_rain`). None without rain or under snow.
+    rain: Option<RainOnWater>,
+    /// The damp film's slopes (variance per axis) on the main, second and third grounds (`damp_films`), which
+    /// `damp_slopes_at` lays as the albedo's shares are laid.
+    films: [f32; 3],
+}
+
+/// The Lake's gusts' frame (`FloorModel::gusts`): the ripples' seeded wind, the direction it blows toward (x, z, as
+/// `ripple_waves` turns them), and the shore's sector's two edges (None at Shore 0), each its direction out from the
+/// eye's foot and its normal into the land (x, z, x, z).
+#[derive(Clone, Copy, Debug)]
+struct GustFrame {
+    wind: [f32; 2],
+    edges: Option<[[f32; 4]; 2]>,
+}
+
+impl GustFrame {
+    /// The frame of seed `seed` and Shore `shore` (0..1: the sector Shore x 90 degrees either side of straight behind).
+    fn new(seed: u32, shore: f32) -> GustFrame {
+        let wind = std::f32::consts::TAU * hash01(seed as i32, 0, 0, 0x7199);
+        let sector = shore * std::f32::consts::FRAC_PI_2;
+        let behind = LAKE_FRONT_AZ_DEG.to_radians() + std::f32::consts::PI;
+        // (an edge at azimuth e runs out along (sin e, -cos e); the land lies toward the rising azimuth from the first,
+        // the falling one from the second)
+        let edge = |e: f32, side: f32| [e.sin(), -e.cos(), side * e.cos(), side * e.sin()];
+        GustFrame { wind: [wind.cos(), wind.sin()], edges: (sector > 0.0).then(|| [edge(behind - sector, 1.0), edge(behind + sector, -1.0)]) }
+    }
+}
+
+/// The mirror's normal over rippled water at ground point (x, z) seen along a look of depression sine `s`: the resolved
+/// ripples' `normal` turned toward the eye by the mean slope of the facets the eye sees among the slopes the texel
+/// leaves unresolved (variance `left` per axis). At a grazing look rough water hides its facets turned away, so what it
+/// mirrors lies higher in the sky, and glassy water mirrors the horizon: Smith's visible-normal mean for Gaussian
+/// slopes of deviation sigma, sigma Phi(t) / (t Phi(t) + phi(t)) with t the look's slope over sigma (1.25 sigma at
+/// the horizon, nothing looking down). `normal` itself where nothing is unresolved.
+pub(crate) fn visible_tilt(normal: Vec3f, left: f32, x: f32, z: f32, s: f32) -> Vec3f {
+    let r = (x * x + z * z).sqrt();
+    if !(left > 0.0) || !(r > 0.0) || !(normal.y > 0.0) {
+        return normal;
+    }
+    let sigma = left.sqrt();
+    let t = s / (1.0 - s * s).max(1.0e-12).sqrt() / sigma;
+    let tilt = sigma * visible_mean(t);
+    // (toward the eye: the ground point's direction from it, reversed)
+    vec3f(normal.x / normal.y - tilt * x / r, 1.0, normal.z / normal.y - tilt * z / r).normalize()
+}
+
+/// The mean slope toward the eye of the facets it sees, in deviations of Gaussian slopes, for a look whose slope is
+/// `t` deviations: Phi(t) / (t Phi(t) + phi(t)) (`visible_tilt`; 1.25 at the horizon).
+fn visible_mean(t: f32) -> f32 {
+    let (cdf, pdf) = normal_cdf_pdf(t);
+    cdf / (t * cdf + pdf)
+}
+
+/// The standard normal distribution's CDF (by its tanh form, within 3e-4) and density at `t`.
+fn normal_cdf_pdf(t: f32) -> (f32, f32) {
+    (0.5 * (1.0 + (0.797_884_6 * (t + 0.044_715 * t * t * t)).tanh()), (-0.5 * t * t).exp() * 0.398_942_3)
+}
+
+/// How far the facets `mirror_lobe` spreads the mirror by turn its elevation, along the look `d` (unit, below the
+/// horizon) over water leaving `rough` per axis unresolved: the standard deviation, radians, of twice their visible
+/// slopes along the look (of the density (t + u) phi(u) from u = -t: its mean Phi / Z, its mean square
+/// (t Phi + 2 phi) / Z, Z = t Phi + phi). 0 without unresolved slopes.
+pub(crate) fn mirror_spread(d: Vec3f, rough: f32) -> f32 {
+    let s = (-d.y).min(1.0);
+    if !(rough > 0.0) || !(s > 0.0) {
+        return 0.0;
+    }
+    let sigma = rough.sqrt();
+    let t = s / (1.0 - s * s).max(1.0e-12).sqrt() / sigma;
+    let (cdf, pdf) = normal_cdf_pdf(t);
+    let z = t * cdf + pdf;
+    let mean = cdf / z;
+    2.0 * sigma * ((t * cdf + 2.0 * pdf) / z - mean * mean).max(0.0).sqrt()
+}
+
+/// What water of normal `n` mirrors along the look `d` (unit): `d` reflected about it, held above the horizon (a facet
+/// that would mirror the ground mirrors the horizon's sky instead).
+pub(crate) fn mirror_of(d: Vec3f, n: Vec3f) -> Vec3f {
+    let m = d - n * (2.0 * d.dot(n));
+    if m.y > 0.0 { m } else { vec3f(m.x, 1.0e-4, m.z).normalize() }
+}
+
+/// The facets one texel of rippled water mirrors the sky by (plan hdri-8 §3.8; the dunes lane's fixes, 2026-11-09):
+/// `node(m, c, w)` for each, its mirror direction m (`mirror_of`), the cosine c of the look against it (its Fresnel's)
+/// and its weight w (the weights sum to 1). The texel's water mirrors the sky through every facet it sees among the
+/// slopes it leaves unresolved, `rough` per axis round their visible mean `normal` (`visible_tilt`, along the look
+/// `d`, unit, below the horizon): Smith's visible slopes along the look's plane, density (t + u) phi(u) from u = -t
+/// (the facets turned away from the eye) in deviations, t the look's slope over sigma, on a grid of MIRROR_LOBE_DU
+/// deviations, or of half the mirror's elevation `step` (radians) where that is coarser (the spacing of the table the
+/// caller reads the facets' sky from: a finer grid finds nothing more in it), at most MIRROR_LOBE_DU_MOST.
+/// Across the look's plane a facet turns the mirror by its slope times twice the look's own, which at the grazing
+/// looks rough water spreads its mirror at is too little to spread. Where the mirror's lookup is one direction (no
+/// unresolved slopes, a level look) one node: `normal` itself, weight 1.
+/// At the default Ripples the far water's facets mirror the sky from the horizon to some 20 degrees up, about 9 on
+/// average: a lookup along their mean alone loses the low sky's light (a skyline's city, the haze band, a sunset's
+/// glow), which these spread back over the water.
+pub(crate) fn mirror_lobe(d: Vec3f, normal: Vec3f, rough: f32, step: f32, node: &mut dyn FnMut(Vec3f, f32, f32)) {
+    let s = (-d.y).min(1.0);
+    let h = (d.x * d.x + d.z * d.z).sqrt();
+    if !(rough > 0.0) || !(h > 0.0) || !(s > 0.0) || !(normal.y > 0.0) {
+        node(mirror_of(d, normal), (-d.dot(normal)).clamp(0.0, 1.0), 1.0);
+        return;
+    }
+    let sigma = rough.sqrt();
+    let t = s / (1.0 - s * s).max(1.0e-12).sqrt() / sigma;
+    let mean = visible_mean(t);
+    // the grid's midpoints from where the facets turn their backs to the eye, and their weights (a facet's slope u
+    // deviations turns the mirror's elevation by about 2 sigma u)
+    let du = (0.5 * step / sigma).clamp(MIRROR_LOBE_DU, MIRROR_LOBE_DU_MOST);
+    let from = (-t).max(-MIRROR_LOBE_U);
+    let count = (((MIRROR_LOBE_U - from) / du).ceil() as usize).clamp(1, MIRROR_LOBE_NODES);
+    let mut weights = [0.0f32; MIRROR_LOBE_NODES];
+    let mut total = 0.0f32;
+    for (i, w) in weights.iter_mut().enumerate().take(count) {
+        let u = from + (i as f32 + 0.5) * du;
+        *w = (t + u).max(0.0) * (-0.5 * u * u).exp();
+        total += *w;
+    }
+    if !(total > 0.0) {
+        node(mirror_of(d, normal), (-d.dot(normal)).clamp(0.0, 1.0), 1.0);
+        return;
+    }
+    // each facet's slope: the mean's, turned along the look by its own visible slope less the mean (away from the eye
+    // is along the look's horizontal direction)
+    let (hx, hz) = (d.x / h, d.z / h);
+    let (px, pz) = (normal.x / normal.y, normal.z / normal.y);
+    for (i, &w) in weights.iter().enumerate().take(count) {
+        let u = from + (i as f32 + 0.5) * du;
+        let k = sigma * (mean - u);
+        let n = vec3f(px + k * hx, 1.0, pz + k * hz).normalize();
+        node(mirror_of(d, n), (-d.dot(n)).clamp(0.0, 1.0), w / total);
+    }
 }
 
 /// The ripples' waves of seed `seed` (`FloorModel::waves`): around one seeded wind, the shorter the wider their spread.
@@ -228,11 +413,7 @@ fn ripple_waves(seed: u32) -> [[f32; 5]; RIPPLE_WAVES] {
     })
 }
 
-/// smoothstep under its own name, so no glob can make it ambiguous.
-fn smooth(a: f32, b: f32, x: f32) -> f32 {
-    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
+use crate::patterns::smooth;
 
 /// An edge at `x` = 0 softened over `width` (a footprint): 0 well below, 1 well above; a hard step at width 0.
 fn soft_step(x: f32, width: f32) -> f32 {
@@ -324,13 +505,18 @@ impl FloorModel {
             drift: (alt - albedo) * DISTANT_HUE,
             second: Vec3f::default(),
             third: Vec3f::default(),
-            along: [0.0, -1.0],
+            road: RoadPath::new(0.0, 0.0, 0.0),
             half: 0.0,
+            haze: 1.0,
+            verge: VERGE_M,
             summit: SUMMIT_MIN_M,
             field,
             waves: [[0.0; 5]; RIPPLE_WAVES],
             skyline: false,
             sea: None,
+            gusts: None,
+            rain: None,
+            films: damp_films(&floor),
         };
         match kind {
             // (a field's mean depends on the look's depression: `main_at`)
@@ -347,16 +533,19 @@ impl FloorModel {
             FloorKind::Snow => {}
             FloorKind::Rock => model.main = snowed(albedo.mix(alt, 0.15 + 0.6 * floor.gravel), 0.85),
             FloorKind::Road => {
-                let width = floor.lanes as f32 * LANE_WIDTH_M;
+                let lane = floor.lane_width();
+                let width = floor.lanes as f32 * lane;
                 // a dashed centre line (12 cm, a third of its length) and two 15 cm edge lines
                 let paint = if floor.markings { (0.12 / 3.0 + 2.0 * 0.15) / width } else { 0.0 };
-                // under snow the road is white but for two slush tracks a lane (Q5): 2 x 0.5 m of each 3.5 m
-                model.main = if snow { v3(SNOW_ALBEDO).mix(v3(SLUSH_ALBEDO), 1.0 / LANE_WIDTH_M) } else { albedo.mix(alt, paint) };
+                // under snow the road is white but for two slush tracks a lane (Q5): 2 x 0.5 m of each lane
+                model.main = if snow { v3(SNOW_ALBEDO).mix(v3(SLUSH_ALBEDO), 1.0 / lane) } else { albedo.mix(alt, paint) };
                 model.second = snowed(under, 1.0);
-                model.third = snowed(field, 1.0);
-                let heading = floor.heading_deg.to_radians();
-                // a light's azimuth: 0 north (-z), 90 east (+x)
-                model.along = [heading.sin(), -heading.cos()];
+                // what lies beside the road: the field (Grass), or a material of its own meeting the asphalt's edge
+                let beside = road_beside(&floor, tint).unwrap_or(field);
+                model.field = beside;
+                model.third = snowed(beside, 1.0);
+                model.verge = floor.verge_m();
+                model.road = RoadPath::new(floor.heading_deg, floor.signed_curve_radius(), floor.curve_start());
                 model.half = 0.5 * width;
                 model.drift = (field - under) * DISTANT_HUE;
             }
@@ -364,20 +553,36 @@ impl FloorModel {
                 let joint = match floor.pattern() {
                     FloorPattern::Square => 2.0 * 0.01 / floor.tile_m,
                     FloorPattern::Herringbone => 3.0 * 0.01 / floor.tile_m,
-                    FloorPattern::Cobbles => 2.0 * 0.015 / floor.tile_m,
+                    FloorPattern::Cobbles | FloorPattern::Fan => 2.0 * 0.015 / floor.tile_m,
+                    // saw cuts 4 mm wide
+                    FloorPattern::Concrete => 2.0 * 0.004 / floor.tile_m,
                 }
                 .min(0.5);
-                let moss = 0.3 * hash01(floor.seed as i32, 7, 3, 0x91a2);
-                model.main = snowed(albedo.mix(alt.mix(under, moss), joint), 1.0);
+                // the joints' fill (the GPU's ask takes it as the recipe's `alt`, `kinds_recipe`) and the share of the
+                // joints' moss it keeps: open joints moss over, sand less, mortar little
+                let (fill, keeps) = match floor.joints() {
+                    PlazaJoints::Open => (recipe.alt, 1.0),
+                    PlazaJoints::Sand => (PLAZA_SAND, 0.6),
+                    PlazaJoints::Mortar => (PLAZA_MORTAR, 0.3),
+                };
+                model.recipe.alt = fill;
+                let moss = keeps * 0.3 * hash01(floor.seed as i32, 7, 3, 0x91a2);
+                model.main = snowed(albedo.mix((v3(fill) * tint).mix(under, moss), joint), 1.0);
             }
             FloorKind::Mountain => {
                 model.main = snowed(albedo, 0.85);
                 model.summit = SUMMIT_MIN_M * (1.0 + hash01(floor.seed as i32, 11, 5, 0x5a17));
-                // the valley: forest and meadow below, rock above, snow over the snow line on its gentle slopes
-                let rock = 0.2 + 0.3 * floor.ruggedness;
-                let snow_line = 0.5 * (1.0 - floor.snow_line);
-                model.second = snowed(alt.mix(under, rock).mix(v3(SNOW_ALBEDO), snow_line), 0.85);
-                model.drift = (under - alt) * DISTANT_HUE;
+                // the far valley is its flat floor: its crops in their shares (the GPU's `crop` and `crops`): green (the
+                // Grass field's mean), dark (0.55 of it), ripening (half green, half ripe), ripe (the valley's dry grass at
+                // 2.4 times its albedo) and fallow (0.8 of the valley's rock); under the snow line's share on the flat
+                // floor, at 0 of Height with its noise under the footprint (the GPU's `fsn`: smoothstep(line - 0.04,
+                // line + 0.04, 0), half at Snow line 0, none from 0.04)
+                let ripe = alt * 2.4;
+                let crops = field * 0.3 + field * (0.55 * 0.12) + field.mix(ripe, 0.5) * 0.16 + ripe * 0.2 + under * (0.8 * 0.22);
+                let t = ((0.04 - floor.snow_line) / 0.08).clamp(0.0, 1.0);
+                model.second = snowed(crops.mix(v3(SNOW_ALBEDO), t * t * (3.0 - 2.0 * t)), 0.85);
+                // (the far parcels' hue drifts between green and ripe)
+                model.drift = (ripe - field) * DISTANT_HUE;
             }
             FloorKind::Lake => {
                 model.main = if snow { v3(ICE_ALBEDO).mix(v3(SNOW_ALBEDO), ICE_SNOW_SHARE) } else { alt };
@@ -385,9 +590,116 @@ impl FloorModel {
                 model.third = snowed(under.mix(field, 0.5), 1.0);
                 model.drift = (field - under) * DISTANT_HUE;
                 model.waves = ripple_waves(floor.seed);
+                model.gusts = Some(GustFrame::new(floor.seed, numbers[2]));
             }
         }
+        model.overgrow(&floor, snow);
         model
+    }
+
+    /// Overgrowth (`FloorParams::overgrowth`) in the far model: the moss and fine grass along the cracks and joints
+    /// (the GPU's `mod.draw.FloorMoss`: its band's mean share in `OVERGROWTH_MOSS`) and the plants' mean cover where
+    /// the planes hand over (twice the near reach down; the GPU's `og_mean`, `overgrowth_cover`) in their mean colour
+    /// (`overgrowth_plants`) over each zone, and on a road the verge's grass creeping over the asphalt's edge as a
+    /// fringe. Under snow weather the cover buries them, but for the edge's creep (the GPU's moves it under snow too);
+    /// at 0 nothing changes.
+    fn overgrow(&mut self, floor: &FloorParams, snow: bool) {
+        let og = floor.overgrowth();
+        if !(og > 0.0) {
+            return;
+        }
+        // the verge creeping over the asphalt's edges (the GPU's `og_creep`), as the near relief: not a room's floor;
+        // beside grass the shoulder taken over in patches and its ragged fringe of tongues (half of the band) by the
+        // crept edge, three quarters of it at Overgrowth 1; beside the rest the shoulder's ground
+        if self.kind == FloorKind::Road && floor.beside() != RoadBeside::Room {
+            let creep = (og * OVERGROWTH_CREEP_M * 2.0 / (2.0 * self.half)).min(1.0);
+            let over = if floor.beside() == RoadBeside::Grass { self.second.mix(self.field, 0.75 * og) } else { self.second };
+            self.main = self.main.mix(over, creep);
+        }
+        if snow {
+            return;
+        }
+        let s = (self.eye / (2.0 * self.reach)).atan().sin();
+        let tint = v3(floor.tint);
+        // the growth's reach out from a course (the GPU's `mo_reach`, its mean), its band's width (full within the
+        // reach, soft to 1.3 of it: `og_band` at k 1) times its cushions' mean (`MOSS_CUSHIONS`), and the share of the
+        // courses it has taken by Overgrowth (`mo_take`'s sh before a kind's say, `moss_patch`)
+        let reach = 0.006 + 0.02 * og;
+        let width_m = 2.3 * reach * MOSS_CUSHIONS;
+        let sh = (1.15 * og).min(1.0);
+        // (each kind's cells, largest plant, share of rosettes, uprightness, mean say and dryness, as its GPU shader's
+        // `og_cell`, `og_size`, `og_rshare`, `og_upright`, `og_dens` and `og_dry`)
+        let cover = |cell: f32, size: [f32; 2], rshare: f32, upright: f32, say: f32| overgrowth_cover(cell, size, rshare, upright, say, og, s);
+        let moss = |dry: f32| v3(OVERGROWTH_MOSS[0]).mix(v3(OVERGROWTH_MOSS[1]), dry * dry) * tint * OVERGROWTH_MOSS_SHADE;
+        match self.kind {
+            FloorKind::Road => {
+                let wr = floor.wear;
+                let width = 2.0 * self.half;
+                let lane = floor.lane_width();
+                // the band along the cracks (their length a square metre grows with Wear, `ROAD_CRACKS_M`), along the
+                // fatigue mesh's lines in the wheel paths (`road_fatigue`) and the edge seams' (5.5 cm and 0.75 reach
+                // each, its mean kept as the footprint widens it: `og_mask`), lining a share of them that is the whole
+                // of sh by the edges and 0.75 of it from 2.5 m in (`ek`: the half width's mean of that ramp)
+                let hw = self.half;
+                let ek = (hw.min(0.5) + 0.5 * (hw - 0.5).clamp(0.0, 2.0)) / hw.max(0.01);
+                let lined = moss_patch(sh * (0.75 + 0.25 * ek));
+                let (fat, fat_m) = road_fatigue(wr, lane);
+                let band = (ROAD_CRACKS_M * wr * wr + fat_m) * width_m * lined
+                    + 2.0 * (0.055 + 0.75 * reach) * MOSS_CUSHIONS * moss_patch(sh) / width;
+                self.main = self.main.mix(moss(0.2), band.min(1.0));
+                // the plants in the cracks (their hearts within 0.61 of the largest radius of a course, `og_dens`: a band
+                // 1.4 of it wide; by the edges 0.055 and 0.75 of it, 0.8 of the say) and the fatigue mesh's share of
+                // the wheel paths (0.6 of it)
+                let rp = 0.61 * 0.075 * (0.6 + 0.4 * og);
+                let say = (0.5 + 0.5 * wr) * (ROAD_CRACKS_M * wr * wr * 1.4 * rp * 0.75 + 0.6 * fat + 0.8 * 2.0 * (0.055 + 0.75 * rp) / width);
+                self.main = self.main.mix(overgrowth_plants(0.7, 0.0, 0.2) * tint, cover(0.25, [0.075, 0.3], 0.7, 0.0, say));
+                if floor.beside() == RoadBeside::Grass {
+                    // the shoulder taken over by the grass in patches (half of it at Overgrowth 1)
+                    self.second = self.second.mix(self.field, 0.5 * og);
+                }
+            }
+            FloorKind::Plaza => {
+                // the joints filled and their edges spilled over by the reach either side (the band's share as the
+                // units draw it, `plaza_band`), most in open joints
+                let joint = self.plaza_joint(floor);
+                let fill = match floor.joints() {
+                    PlazaJoints::Open => 1.0,
+                    PlazaJoints::Sand => 0.7,
+                    PlazaJoints::Mortar => 0.35,
+                };
+                self.main = self.main.mix(moss(0.2), plaza_band(floor.pattern(), floor.tile_m, joint, reach) * MOSS_CUSHIONS * moss_patch(sh * fill));
+                // (the joints' half width about a quarter of their share of a tile)
+                let jh = (0.25 * joint * floor.tile_m).max(0.0005);
+                let cell = (0.5 * floor.tile_m).clamp(0.12, 0.3);
+                let size = [0.07f32.min(0.45 * cell), 0.2];
+                // (the joint and the band of hearts either side of it, 0.55 of the mean radius each: `og_dens`)
+                let say = fill * (joint * (1.0 + 0.55 * 0.675 * size[0] * (0.6 + 0.4 * og) / jh)).min(1.0);
+                self.main = self.main.mix(overgrowth_plants(0.75, 0.0, 0.2) * tint, cover(cell, size, 0.75, 0.0, say));
+            }
+            FloorKind::Rock => {
+                // the crevices on the slab's share (their length a square metre 1.25 / stone size, the band their width
+                // and 0.7 of the reach either side: `og_crev`), between the stones (`rk_wsm`, their mean share 0.12)
+                let st = floor.stone_m.max(0.05);
+                let crev = ROCK_SLAB_SHARE * (1.25 / st * 2.0 * (0.8 * st * 0.037 + 0.7 * reach)).min(1.0);
+                self.main = self.main.mix(moss(0.25), (crev * (1.0 - 0.12) * MOSS_CUSHIONS * moss_patch(sh)).min(1.0));
+                self.main = self.main.mix(overgrowth_plants(0.6, 0.0, 0.25) * tint, cover(0.35, [0.075, 0.28], 0.6, 0.0, 0.05 + 0.2 * ROCK_SLAB_SHARE + 0.1 * (1.0 - ROCK_SLAB_SHARE)));
+            }
+            // dune grass in stands, bare sand between (every cell of a stand may hold one, about a third of the dune in
+            // stands: the GPU's `og_dens`)
+            FloorKind::Sand => self.main = self.main.mix(overgrowth_plants(0.0, 1.0, 0.45) * tint, cover(0.45, [0.2, 0.5], 0.0, 1.0, 0.37)),
+            _ => {}
+        }
+    }
+
+    /// The Plaza's joints' share of its ground (its pattern's joints over its tile size).
+    fn plaza_joint(&self, floor: &FloorParams) -> f32 {
+        match floor.pattern() {
+            FloorPattern::Square => 2.0 * 0.01 / floor.tile_m,
+            FloorPattern::Herringbone => 3.0 * 0.01 / floor.tile_m,
+            FloorPattern::Cobbles | FloorPattern::Fan => 2.0 * 0.015 / floor.tile_m,
+            FloorPattern::Concrete => 2.0 * 0.004 / floor.tile_m,
+        }
+        .min(0.5)
     }
 
     /// This floor under the skyline (plan hdri-8 §3.10): `skyline` whether the strip is drawn over it (Sky mode, its
@@ -421,9 +733,112 @@ impl FloorModel {
         [[r.alt[0], r.alt[1], r.alt[2], 0.0], [r.albedo[0], r.albedo[1], r.albedo[2], SEA_BEACH_M]]
     }
 
+    /// This floor's water under the rain `rain` (`weather::rain_on_water`; the weather lane, 2026-11-09): the Lake's and
+    /// the skyline's sea's mirror takes the rain's slopes, its young rings near the eye and the sheen of all of it
+    /// (`sample_with`). None leaves the floor as it was, bit for bit.
+    pub(crate) fn with_rain(mut self, rain: Option<RainOnWater>) -> FloorModel {
+        self.rain = rain;
+        self
+    }
+
+    /// The air's haze (the sky's atmosphere haze, weathered: 1 a clear day's, more in hazy weather).
+    pub fn with_haze(mut self, haze: f32) -> FloorModel {
+        self.haze = haze.clamp(0.0, 10.0);
+        self
+    }
+
+    /// How much of the ground's light reaches the viewer along `d` (unit, below the horizon) by night: the air's
+    /// transmittance over the distance to the ground point, exp(-r / V) with V the visibility, NIGHT_VISIBILITY_M in a
+    /// clear sky's haze and less in step with the haze; the rest of the look is the night air's own light
+    /// (`Env::floor_ground`). By day the atmosphere blends the ground into its bright haze over the lowest degrees
+    /// (`Atmosphere::sky_over`); by night that air is dark, and a road lit by the moon runs on to the
+    /// horizon rather than fading to black a few degrees down (the owner's "why does the road stop").
+    pub fn night_keep(&self, d: Vec3f) -> f32 {
+        if !(d.y < 0.0) {
+            return 0.0;
+        }
+        let r = self.eye_m() * (d.x * d.x + d.z * d.z).sqrt() / -d.y;
+        (-r * self.haze / NIGHT_VISIBILITY_M).exp()
+    }
+
+    /// The road's centre line.
+    pub fn road(&self) -> &RoadPath {
+        &self.road
+    }
+
+    /// A Road's asphalt share at the ground point along `d` (unit, below the horizon): 1 on the road, 0 beside it,
+    /// its edge soft over a texel's footprint as `sample_with` draws it; 0 for every other kind and above the
+    /// horizon. The hand-over's second material (`FloorMatch`).
+    pub fn road_share(&self, d: Vec3f, texel: f32) -> f32 {
+        if self.kind != FloorKind::Road {
+            return 0.0;
+        }
+        let s = (-d.y).min(1.0);
+        if !(s > 0.0) {
+            return 0.0;
+        }
+        let to_ground = self.eye / s;
+        let (x, z) = (d.x * to_ground, d.z * to_ground);
+        let r = (d.x * d.x + d.z * d.z).sqrt() * to_ground;
+        let foot = if texel > 0.0 { self.eye * texel / (s * s).max(1.0e-30) } else { 0.0 };
+        let frame = self.road.frame(x, z);
+        let lateral = frame.v.abs();
+        let ahead = (x * frame.t[0] + z * frame.t[1]).abs();
+        let width = if r > 0.0 { (foot * lateral + r * texel * ahead) / r } else { 0.0 };
+        1.0 - soft_step(lateral - self.half, width)
+    }
+
+    /// A Lake's ground at the ground point (x, z) `r` metres out (`texel` the lookup's width in radians, `foot` its
+    /// footprint along the look, metres): its beach's share and its water's (the rest is the far bank).
+    fn lake_ground(&self, x: f32, z: f32, r: f32, texel: f32, foot: f32) -> (f32, f32) {
+        let front = LAKE_FRONT_AZ_DEG.to_radians();
+        let (fx, fz) = (front.sin(), -front.cos());
+        // the angle off straight behind past the shore's sector there (Shore: its share of the back half), from
+        // their cosines (the sector's edge is no wider than a texel: the difference of cosines over the
+        // sector's sine is the angle there; a sector of no width is all water)
+        let cos_behind = if r > 0.0 { (-(x * fx + z * fz) / r).clamp(-1.0, 1.0) } else { 1.0 };
+        let sector = self.numbers[2] * std::f32::consts::FRAC_PI_2;
+        let past = (sector.cos() - cos_behind) / sector.sin().max(0.05);
+        let land = 1.0 - soft_step(past, texel);
+        let beach = land * (1.0 - soft_step(r - LAKE_BEACH_M, foot));
+        // (under the skyline the water runs on to the horizon: Far shore applies only without it, Q3)
+        let water = if self.skyline { 1.0 - land } else { (1.0 - land) * (1.0 - soft_step(r - self.numbers[0], foot)) };
+        (beach, water)
+    }
+
+    /// The slopes (variance per axis) of the damp film between the puddles at the ground point along `d` (unit, below
+    /// the horizon; `Env::damp_sheen`): each ground's own (`damp_films`) in its share of the texel, as `sample_with`
+    /// lays them: a Road's asphalt, its verge and what lies beside it, a Lake's beach and its far bank (its water has
+    /// no damp ground), the other kinds' one ground. The shares' slopes add as variances: the mixed facets' second
+    /// moment. Above the horizon, the main ground's.
+    pub(crate) fn damp_slopes_at(&self, d: Vec3f, texel: f32) -> f32 {
+        let [main, second, third] = self.films;
+        let s = (-d.y).min(1.0);
+        if !(s > 0.0) || !matches!(self.kind, FloorKind::Road | FloorKind::Lake) {
+            return main;
+        }
+        let to_ground = self.eye / s;
+        let (x, z) = (d.x * to_ground, d.z * to_ground);
+        let r = (d.x * d.x + d.z * d.z).sqrt() * to_ground;
+        let foot = if texel > 0.0 { self.eye * texel / (s * s).max(1.0e-30) } else { 0.0 };
+        if self.kind == FloorKind::Road {
+            // (the road's and the verge's edges as `sample_with` softens them)
+            let frame = self.road.frame(x, z);
+            let lateral = frame.v.abs();
+            let ahead = (x * frame.t[0] + z * frame.t[1]).abs();
+            let width = if r > 0.0 { (foot * lateral + r * texel * ahead) / r } else { 0.0 };
+            let road = 1.0 - soft_step(lateral - self.half, width);
+            let verge = (1.0 - soft_step(lateral - self.half - self.verge, width)) - road;
+            return main * road + second * verge + third * (1.0 - road - verge);
+        }
+        let (beach, water) = self.lake_ground(x, z, r, texel, foot);
+        let ground = 1.0 - water;
+        if ground > 0.0 { (second * beach + third * (ground - beach)) / ground } else { second }
+    }
+
     /// The kind's own numbers as the GPU's ask takes them (`FloorParams::kind_numbers`, as clamped): under the skyline
     /// a Lake's Far shore is its farthest (Q3: the water runs on to the horizon; the planes never reach it).
-    pub fn ask_numbers(&self) -> [f32; 6] {
+    pub fn ask_numbers(&self) -> [f32; 8] {
         let mut numbers = self.numbers;
         if self.skyline && self.kind == FloorKind::Lake {
             numbers[0] = FLOOR_FAR_SHORE_RANGE.1;
@@ -484,17 +899,32 @@ impl FloorModel {
         self.recipe
     }
 
+    /// True when the planes hand over to this far model by twice the near reach on the eye's own ground, where
+    /// `FloorMatch` carries their lit mean and fine texture on: every kind but the Mountain, Sand and the Lake. A
+    /// Mountain's planes run on to the coarse reach and their top rows are already its far valley (the GPU fades the
+    /// valley into the far model's mean by the coarse reach, onto the flat valley floor's distance): a hand-over measured
+    /// on the eye's own ground just inside R reads the valley far below against the summit's rock there (a gain that
+    /// darkened the whole far valley), and its speckle (cells of 2.5 planes texels, 5.5 tall) runs on with that contrast
+    /// over the far ridges and up the haze band to the horizon: vertical stripes. Sand's planes run on over its dunes
+    /// to the coarse reach: the hand-over read the dune the viewer stands on against the flat ground, and its gain and
+    /// speckle (the ripples' contrast) ran on over the far dunes: tinted bands and vertical stripes. The Lake's ground
+    /// just inside R is its beach, and past 2R it has none but the far bank: the pebbles' contrast ran on over the bank's
+    /// grass and up the haze as stripes.
+    pub fn hands_over_at_reach(&self) -> bool {
+        !matches!(self.kind, FloorKind::Mountain | FloorKind::Sand | FloorKind::Lake)
+    }
+
     /// True when the floor mirrors the sky (a Lake's water or ice, the skyline's sea it carries on), so the discs'
     /// reflections are as small as they are.
     pub fn mirrors(&self) -> bool {
         self.kind == FloorKind::Lake || self.sea.is_some()
     }
 
-    /// True when the floor's water has ripples (a Lake that is not frozen, Ripples over 0): its sun is drawn as an
-    /// analytic glitter (`glitter`), not as the mirrored disc.
+    /// True when the floor's water has ripples (a Lake that is not frozen, Ripples over 0, or under rain): its sun is
+    /// drawn as an analytic glitter (`glitter`), not as the mirrored disc.
     /// The skyline's sea (never frozen: the strip's sea is open water under any weather) ripples at SEA_RIPPLES.
     pub fn rippled(&self) -> bool {
-        (self.kind == FloorKind::Lake && !self.snow && self.numbers[1] > 0.0 && self.vary) || (self.sea.is_some() && self.vary)
+        (self.kind == FloorKind::Lake && !self.snow && (self.numbers[1] > 0.0 || self.rain.is_some()) && self.vary) || (self.sea.is_some() && self.vary)
     }
 
     /// The water's Ripples: a Lake's own, else the skyline's sea's.
@@ -530,7 +960,7 @@ impl FloorModel {
         let up = vec3f(0.0, 1.0, 0.0);
         let s = (-d.y).min(1.0);
         if !(s > 0.0) {
-            return FloorFar { albedo: self.main_at(0.0), water: 0.0, ice: 0.0, normal: up, keep: 1.0, shade: 1.0, glint: up, slopes: 0.0, slopes_all: 0.0 };
+            return FloorFar { albedo: self.main_at(0.0), water: 0.0, ice: 0.0, normal: up, keep: 1.0, shade: 1.0, glint: up, slopes: 0.0, slopes_all: 0.0, rough: 0.0, dist: f32::MAX };
         }
         let h = (d.x * d.x + d.z * d.z).sqrt();
         // the ground point and its distance, and a texel's footprint on the ground: along the look and across it
@@ -539,15 +969,17 @@ impl FloorModel {
         let r = h * to_ground;
         let foot = if texel > 0.0 { self.eye * texel / (s * s).max(1.0e-30) } else { 0.0 };
         let side = r * texel;
-        let mut far = FloorFar { albedo: self.main_at(s), water: 0.0, ice: 0.0, normal: up, keep: 1.0, shade: 1.0, glint: up, slopes: 0.0, slopes_all: 0.0 };
+        let mut far = FloorFar { albedo: self.main_at(s), water: 0.0, ice: 0.0, normal: up, keep: 1.0, shade: 1.0, glint: up, slopes: 0.0, slopes_all: 0.0, rough: 0.0, dist: to_ground.min(f32::MAX) };
         match self.kind {
             FloorKind::Road => {
-                let lateral = (x * self.along[1] - z * self.along[0]).abs();
-                let ahead = (x * self.along[0] + z * self.along[1]).abs();
+                // the ground point in the road's own frame: across it and along it, the road's direction there
+                let frame = self.road.frame(x, z);
+                let lateral = frame.v.abs();
+                let ahead = (x * frame.t[0] + z * frame.t[1]).abs();
                 // the edges' softening: the radial footprint across the road and the lateral one along it
                 let width = if r > 0.0 { (foot * lateral + side * ahead) / r } else { 0.0 };
                 let road = 1.0 - soft_step(lateral - self.half, width);
-                let verge = (1.0 - soft_step(lateral - self.half - VERGE_M, width)) - road;
+                let verge = (1.0 - soft_step(lateral - self.half - self.verge, width)) - road;
                 far.albedo = self.main * road + self.second * verge + self.third * (1.0 - road - verge);
             }
             FloorKind::Mountain => {
@@ -563,21 +995,11 @@ impl FloorModel {
                 far.albedo = summit * plateau + valley * (1.0 - plateau);
                 far.shade = shade;
                 far.keep = plateau + haze * (1.0 - plateau);
+                far.dist = far.dist * plateau + (depth / s).min(f32::MAX) * (1.0 - plateau);
                 return far;
             }
             FloorKind::Lake => {
-                let front = LAKE_FRONT_AZ_DEG.to_radians();
-                let (fx, fz) = (front.sin(), -front.cos());
-                // the angle off straight behind past the shore's sector there (Shore: its share of the back half), from
-                // their cosines (the sector's edge is no wider than a texel: the difference of cosines over the
-                // sector's sine is the angle there; a sector of no width is all water)
-                let cos_behind = if r > 0.0 { (-(x * fx + z * fz) / r).clamp(-1.0, 1.0) } else { 1.0 };
-                let sector = self.numbers[2] * std::f32::consts::FRAC_PI_2;
-                let past = (sector.cos() - cos_behind) / sector.sin().max(0.05);
-                let land = 1.0 - soft_step(past, texel);
-                let beach = land * (1.0 - soft_step(r - LAKE_BEACH_M, foot));
-                // (under the skyline the water runs on to the horizon: Far shore applies only without it, Q3)
-                let water = if self.skyline { 1.0 - land } else { (1.0 - land) * (1.0 - soft_step(r - self.numbers[0], foot)) };
+                let (beach, water) = self.lake_ground(x, z, r, texel, foot);
                 let ground = (1.0 - water).max(0.0);
                 // the lake's own share keeps its bed's or its ice's colour unvaried: what shows there is its mirror
                 let (dry, shade) = if ground > 0.0 { self.distant((self.second * beach + self.third * (ground - beach)) * (1.0 / ground), x, z, foot, 1.0, self.fade_in(r)) } else { (self.main, 1.0) };
@@ -587,13 +1009,34 @@ impl FloorModel {
                     far.ice = water;
                 } else if water > 0.0 || r < 2.0 * self.reach {
                     far.water = water;
-                    // (a held bake's mirror stays level; its glitter follows the wavelets as a released one's does).
-                    // The ripples also run under the shore's sector within the planes' 2R, where their own waterline
-                    // meanders past the wedge's edge: their water there takes this normal too (only the water reads
-                    // it), so it ripples on across the edge's column instead of lying flat beside it
+                    // (a held bake leaves the ripples it resolves level; its glitter follows the wavelets as a released
+                    // one's does). The ripples also run under the shore's sector within the planes' 2R, where their own
+                    // waterline meanders past the wedge's edge: their water there takes this normal too (only the
+                    // water reads it), so it ripples on across the edge's column instead of lying flat beside it
+                    // The mirror: the ripples as the gusts there raise them (`gust`), and the slopes the texel leaves
+                    // unresolved as they raise them, which the mirror's facets spread by (`rough`, `mirror_lobe`) round
+                    // their visible mean (`visible_tilt`), held or released alike: the far lake is the same in a drag
+                    // and once released. The sun's glitter keeps the lake's mean ripples: a gust lane resolved at one
+                    // bake width and averaged at another would change its light, which holds across widths (`glitter`)
                     let (normal, slopes) = self.ripple_normal(x, z, foot, side);
-                    far.normal = if ripples { normal } else { up };
+                    // (no ripples, no gusts to scale)
+                    let gust = if slopes > 0.0 || normal.y < 1.0 { self.gust(x, z, foot, side) } else { 1.0 };
+                    let mut centre = if ripples { vec3f(gust * normal.x / normal.y, 1.0, gust * normal.z / normal.y).normalize() } else { up };
+                    far.rough = slopes * gust * gust;
                     (far.glint, far.slopes, far.slopes_all) = (normal, slopes, self.all_slopes());
+                    // Rain (the weather lane): its young rings the texel resolves turn the mirror with the ripples (a held
+                    // bake leaves them level, as it does the ripples), the rest of its slopes spread it; the glitter takes
+                    // all of the rain's slopes as unresolved
+                    if let Some(rain) = &self.rain {
+                        let (gx, gz, left) = rain.at(x, z, foot, side);
+                        if ripples {
+                            centre = vec3f(centre.x / centre.y - gx, 1.0, centre.z / centre.y - gz).normalize();
+                        }
+                        far.rough += left;
+                        far.slopes += rain.all();
+                        far.slopes_all += rain.all();
+                    }
+                    far.normal = visible_tilt(centre, far.rough, x, z, s);
                 }
                 self.sea_over(&mut far, d, s, texel, (x, z, foot, side), ripples);
                 return far;
@@ -643,6 +1086,14 @@ impl FloorModel {
                 let (normal, slopes) = self.ripple_normal(x, z, foot, side);
                 far.normal = if ripples { normal } else { vec3f(0.0, 1.0, 0.0) };
                 (far.glint, far.slopes, far.slopes_all) = (normal, slopes, self.all_slopes());
+                // rain on the sea (the weather lane): far off, its slopes are all a sheen, which the mirror's facets
+                // spread it by round their visible mean
+                if let Some(rain) = &self.rain {
+                    far.rough = rain.all();
+                    far.slopes += rain.all();
+                    far.slopes_all += rain.all();
+                    far.normal = visible_tilt(far.normal, far.rough, x, z, s);
+                }
             }
         }
     }
@@ -719,6 +1170,86 @@ impl FloorModel {
     /// near relief carries the ground's own detail, all of it from 2R, fading in over the fade zone between.
     fn fade_in(&self, r: f32) -> f32 {
         smooth(self.reach, 2.0 * self.reach, r)
+    }
+
+    /// The gusts' factor on the Lake's ripples at ground point (x, z) (GUST_CELLS_M; 1 for the skyline's sea on the other
+    /// kinds): two octaves of value noise in a frame turned to the ripples' seeded wind (`ripple_waves`), drawn out
+    /// along it, each band-limited to the footprint as it lies in the lanes' frame (`foot` along the look, `side`
+    /// across it: a lane along the look stays where one across it is long gone); past the footprint the factor's
+    /// mean square, 1 (the slopes' variance it scales holds). In a shore's lee it falls to GUST_LEE (`lee`).
+    fn gust(&self, x: f32, z: f32, foot: f32, side: f32) -> f32 {
+        let Some(frame) = self.gusts.as_ref().filter(|_| self.vary) else {
+            return 1.0;
+        };
+        let [wx, wz] = frame.wind;
+        let r = (x * x + z * z).sqrt();
+        let (vx, vz) = if r > 0.0 { (x / r, z / r) } else { (0.0, 1.0) };
+        // the footprint's reach in the lanes' cells, along the wind and across it
+        let (va, vc) = (vx * wx + vz * wz, vz * wx - vx * wz);
+        let along = ((va * foot) * (va * foot) + (vc * side) * (vc * side)).sqrt() / GUST_CELLS_M[0];
+        let across = ((vc * foot) * (vc * foot) + (va * side) * (va * side)).sqrt() / GUST_CELLS_M[1];
+        let cells = along.max(across);
+        let keep = |scale: f32| if cells > 0.0 { smooth(GUST_GONE, GUST_FULL, scale / cells) } else { 1.0 };
+        let (k1, k2) = (keep(1.0), keep(0.4));
+        let lee = self.lee(x, z, frame);
+        if !(k1 > 0.0) {
+            return lee;
+        }
+        let (u, v) = (x * wx + z * wz, z * wx - x * wz);
+        let seed = self.seed.wrapping_mul(0x2545_f491);
+        let n1 = cell_noise(u / GUST_CELLS_M[0], v / GUST_CELLS_M[1], seed ^ 0x6a51_0000);
+        let n2 = cell_noise(u / (0.4 * GUST_CELLS_M[0]) + 5.3, v / (0.4 * GUST_CELLS_M[1]) + 1.7, seed ^ 0x6a52_0000);
+        let n = 0.5 + 0.7 * (n1 - 0.5) + 0.3 * (n2 - 0.5) * k2;
+        let g = GUST_SCALE * (0.35 + 1.1 * smooth(0.2, 0.8, n));
+        (1.0 + (g * g - 1.0) * k1).max(0.0).sqrt() * lee
+    }
+
+    /// The Lake's lee at ground point (x, z) for its gusts' wind (`frame`): GUST_LEE where the shore up-wind (the far
+    /// shore at Far shore, without the skyline; the shore's sector behind the viewer) is within GUST_LEE_M.0, rising
+    /// to 1 by GUST_LEE_M.1 of open water up-wind. The wind wraps round the point of land under the viewer's feet, so the
+    /// sector shelters the water only as much as the wind crosses its edge GUST_LEE_M.1 or more from the point (none at
+    /// the point: the lee has no edge along the line the wind passes the point on).
+    /// A point inside the sector is its land, or the water of a bay the GPU's meander cuts into it within 2R (`wig` in
+    /// lake.rs: up to about 1.8 m in from the straight edge, which `sample_with` gives a mirror too): it takes the lee of
+    /// the open water just outside the nearer edge, so the shelter runs on across the edge's line. A bay lies in the
+    /// land's lee where the wind blows off the land there and open to it where the wind blows in, as the water beside it.
+    fn lee(&self, x: f32, z: f32, frame: &GustFrame) -> f32 {
+        let [wx, wz] = frame.wind;
+        let (mut x, mut z) = (x, z);
+        if let Some(edges) = &frame.edges {
+            let inside = edges.map(|[_, _, nx, nz]| x * nx + z * nz);
+            if inside[0] >= 0.0 && inside[1] >= 0.0 {
+                let k = if inside[0] <= inside[1] { 0 } else { 1 };
+                let out = inside[k] + LEE_EDGE_OUT_M;
+                (x, z) = (x - out * edges[k][2], z - out * edges[k][3]);
+            }
+        }
+        let open = |fetch: f32| smooth(GUST_LEE_M.0, GUST_LEE_M.1, fetch);
+        let mut shelter = 0.0f32;
+        let pw = x * wx + z * wz;
+        let r2 = x * x + z * z;
+        if !self.skyline {
+            let f = self.numbers[0];
+            let q = pw * pw - r2 + f * f;
+            if q >= 0.0 && r2 < f * f {
+                shelter = shelter.max(1.0 - open(pw + q.sqrt()));
+            }
+        }
+        // the sector's two edges: rays from the eye's foot, Shore x 90 degrees either side of straight behind
+        if let Some(edges) = &frame.edges {
+            for &[bx, bz, _, _] in edges {
+                // where the wind up-wind of p crosses the edge: p - s w = t b, s up-wind of p, t out from the point
+                let det = wx * bz - wz * bx;
+                if det.abs() > 1.0e-6 {
+                    let s = (x * bz - z * bx) / det;
+                    let t = (wx * z - wz * x) / det;
+                    if s >= 0.0 && t >= 0.0 {
+                        shelter = shelter.max((1.0 - open(s)) * smooth(0.0, GUST_LEE_M.1, t));
+                    }
+                }
+            }
+        }
+        1.0 - (1.0 - GUST_LEE) * shelter
     }
 
     /// The water's normal at ground point (x, z) (§3.8): the seeded wind waves of Ripples' slope, their crests bent, each
@@ -1077,15 +1608,8 @@ impl Bilinear {
     }
 }
 
-/// The GPU's integer hash (makepad-floor's `hu`), for `fade_start`.
-fn gpu_hash(x: u32) -> u32 {
-    let mut x = x;
-    x ^= x >> 16;
-    x = x.wrapping_mul(2146121005);
-    x ^= x >> 15;
-    x = x.wrapping_mul(2221713035);
-    x ^ (x >> 16)
-}
+/// The GPU's integer hash (makepad-floor's `hu`), for `fade_start`: noise.rs's lowbias32, the same constants.
+use crate::noise::hash_u32 as gpu_hash;
 
 /// A periodic value noise round the turn (makepad-floor's `ring`): u 0..1, n knots, layer k; 0..1.
 fn ring(u: f32, n: f32, k: u32, seed: u32) -> f32 {
@@ -1123,11 +1647,20 @@ const SPECKLE_SD: f32 = 0.115;
 /// (colour included), and a fine speckle of the planes' own texel contrast there, fading with distance. Measured
 /// once when the planes are attached, from their texels and the map's light: bare lookups and maps without planes
 /// are unchanged.
+///
+/// A road is two grounds, the asphalt and what lies beside it, and it bends: the ratio at the road's azimuths just
+/// inside R is the asphalt's (and its paint's), which painted radially out to the horizon drew a straight road over
+/// the bent far road. So where the far model
+/// tells its own material apart (`material`: the road's share at a ground point), the asphalt takes one ratio over
+/// the whole turn and the ground beside it the bins', each texel by its own share; a far point then takes the ratio
+/// of what it is, wherever the road runs.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FloorMatch {
     reach: f32,
     gain: Vec<Vec3f>,
     contrast: Vec<f32>,
+    /// The second material's ratio over the whole turn (a road's asphalt), where the far model has one.
+    second: Option<Vec3f>,
     /// A planes texel (radians): the speckle's scale.
     texel: f32,
     seed: u32,
@@ -1136,8 +1669,9 @@ pub struct FloorMatch {
 impl FloorMatch {
     /// Measured over the planes' rows from 0.4 to 0.58 of the near reach `reach` (where the planes are wholly the
     /// near relief: their fade starts at 0.6 R at the earliest, `fade_start`): `near(d, texel)` is the planes' lit ground along d, `far(d)` the far model's. None when no
-    /// texel lies in that band.
-    pub fn measure(planes: &FloorPlanes, reach: f32, seed: u32, near: &dyn Fn(Vec3f, &FloorTexel) -> Vec3f, far: &dyn Fn(Vec3f) -> Vec3f) -> Option<FloorMatch> {
+    /// texel lies in that band. `material(d)` is the far model's share of its second material at the ground point
+    /// along d (a road's asphalt; None for a ground of one material), whose ratio is taken over the whole turn.
+    pub fn measure(planes: &FloorPlanes, reach: f32, seed: u32, near: &dyn Fn(Vec3f, &FloorTexel) -> Vec3f, far: &dyn Fn(Vec3f) -> Vec3f, material: Option<&dyn Fn(Vec3f) -> f32>) -> Option<FloorMatch> {
         let eye = planes.eye_m();
         if !(reach > 0.0 && eye > 0.0) {
             return None;
@@ -1147,6 +1681,8 @@ impl FloorMatch {
         let (top, bottom) = ((eye / (0.58 * reach)).atan().to_degrees(), (eye / (0.4 * reach)).atan().to_degrees());
         let mut near_sum = vec![Vec3f::default(); MATCH_BINS];
         let mut far_sum = vec![Vec3f::default(); MATCH_BINS];
+        let mut weight = vec![0.0f32; MATCH_BINS];
+        let (mut near_second, mut far_second, mut weight_second) = (Vec3f::default(), Vec3f::default(), 0.0f32);
         let mut spread = vec![0.0f32; MATCH_BINS];
         let mut rows = vec![0.0f32; MATCH_BINS];
         for y in 0..h {
@@ -1164,8 +1700,14 @@ impl FloorMatch {
                 let d = super::dir_from_az_el(az, el);
                 let b = x * MATCH_BINS / w;
                 let ln = near(d, &planes.texel(x, y));
-                near_sum[b] += ln;
-                far_sum[b] += far(d);
+                let lf = far(d);
+                let m = material.map_or(0.0, |material| material(d).clamp(0.0, 1.0));
+                near_sum[b] += ln * (1.0 - m);
+                far_sum[b] += lf * (1.0 - m);
+                weight[b] += 1.0 - m;
+                near_second += ln * m;
+                far_second += lf * m;
+                weight_second += m;
                 let l = crate::sky::luminance(ln);
                 l1[b] += l;
                 l2[b] += l * l;
@@ -1183,9 +1725,12 @@ impl FloorMatch {
             return None;
         }
         let ratio = |a: f32, b: f32| if b > 0.0 && a.is_finite() { (a / b).clamp(0.5, 2.0) } else { 1.0 };
-        let mut gain: Vec<Vec3f> = (0..MATCH_BINS)
-            .map(|b| vec3f(ratio(near_sum[b].x, far_sum[b].x), ratio(near_sum[b].y, far_sum[b].y), ratio(near_sum[b].z, far_sum[b].z)))
-            .collect();
+        let ratio3 = |a: Vec3f, b: Vec3f| vec3f(ratio(a.x, b.x), ratio(a.y, b.y), ratio(a.z, b.z));
+        // the ground beside the second material, over the whole turn: the bins the second material fills (fewer than
+        // a texel's worth of the first in them) take it
+        let whole = ratio3(near_sum.iter().fold(Vec3f::default(), |s, &v| s + v), far_sum.iter().fold(Vec3f::default(), |s, &v| s + v));
+        let mut gain: Vec<Vec3f> = (0..MATCH_BINS).map(|b| if weight[b] >= 1.0 { ratio3(near_sum[b], far_sum[b]) } else { whole }).collect();
+        let second = material.map(|_| if weight_second > 0.0 { ratio3(near_second, far_second) } else { whole });
         let mut contrast: Vec<f32> = (0..MATCH_BINS).map(|b| if rows[b] > 0.0 { (spread[b] / rows[b]).clamp(0.0, 0.3) } else { 0.0 }).collect();
         // smoothed round the turn (two passes of 1 2 1), so the bins never show as sectors
         for _ in 0..2 {
@@ -1196,7 +1741,7 @@ impl FloorMatch {
                 contrast[b] = (c[p] + c[b] * 2.0 + c[q]) * 0.25;
             }
         }
-        Some(FloorMatch { reach, gain, contrast, texel: std::f32::consts::TAU / w as f32, seed })
+        Some(FloorMatch { reach, gain, contrast, second, texel: std::f32::consts::TAU / w as f32, seed })
     }
 
     /// The near reach it hands over at (metres).
@@ -1212,11 +1757,11 @@ impl FloorMatch {
     }
 
     /// What the far ground along `d` (r metres away on the ground) is multiplied by: the bins' gain, read linearly
-    /// between their centres, times the speckle (`residual`: the share of the measured contrast the far model's own
-    /// texture does not already carry); and how much of that applies, 0 until the planes' fade starts (`fade_start`)
-    /// rising to 1 at 2R, the GPU's `near_rd`. `texel` is the lookup's (radians): the speckle fades where its cells are
-    /// finer than it.
-    pub fn at(&self, d: Vec3f, r: f32, texel: f32, residual: f32) -> (Vec3f, f32) {
+    /// between their centres (the second material's over the whole turn by its share `material` at the point), times
+    /// the speckle (`residual`: the share of the measured contrast the far model's own texture does not already
+    /// carry); and how much of that applies, 0 until the planes' fade starts (`fade_start`) rising to 1 at 2R, the
+    /// GPU's `near_rd`. `texel` is the lookup's (radians): the speckle fades where its cells are finer than it.
+    pub fn at(&self, d: Vec3f, r: f32, texel: f32, residual: f32, material: f32) -> (Vec3f, f32) {
         let share = smooth(self.reach * fade_start(d, self.seed), 2.0 * self.reach, r);
         if !(share > 0.0) {
             return (Vec3f::all(1.0), 0.0);
@@ -1227,7 +1772,11 @@ impl FloorMatch {
         let t = f - b0;
         let b0 = (b0 as i64).rem_euclid(MATCH_BINS as i64) as usize;
         let b1 = (b0 + 1) % MATCH_BINS;
-        let gain = self.gain[b0] * (1.0 - t) + self.gain[b1] * t;
+        let mut gain = self.gain[b0] * (1.0 - t) + self.gain[b1] * t;
+        if let Some(second) = self.second {
+            let m = material.clamp(0.0, 1.0);
+            gain = gain * (1.0 - m) + second * m;
+        }
         let contrast = (self.contrast[b0] * (1.0 - t) + self.contrast[b1] * t) * residual * (self.reach / r.max(self.reach)).sqrt();
         (gain * (1.0 + contrast * self.speckle(d, texel)).max(0.0), share)
     }
@@ -1321,6 +1870,20 @@ impl FloorLighting {
             None => self.night * self.tilt(n),
         }
     }
+
+    /// The light a face of normal `n` takes from the ground round it (irradiance; day, night): the ground a level
+    /// Lambertian plane of albedo `ground`, lit as level ground is (the sky and the sun on it, the night's light), so
+    /// its radiance is ground x E / pi, which the face sees over the view factor (1 - n.y) / 2. `tilt`'s moments are
+    /// the sky's upper hemisphere alone, so a tilted face took no light from the ground it faces: a slip face in the
+    /// sun's shadow took the blue sky only. One bounce, exact for a level plane round the face; 0 for a level face.
+    pub fn bounce(&self, n: [f32; 3], ground: Vec3f) -> (Vec3f, Vec3f) {
+        let view = ((1.0 - n[1]) * 0.5).clamp(0.0, 1.0);
+        if !(view > 0.0) {
+            return (Vec3f::default(), Vec3f::default());
+        }
+        let g = ground * view;
+        (g * (self.sky + self.sun * self.sun_level), g * self.night)
+    }
 }
 
 /// The floor along one direction for the map (`Env::floor_at`): the far model there and, where the planes reach, their
@@ -1357,6 +1920,17 @@ impl FloorHere {
             _ => self.far.keep,
         }
     }
+
+    /// How far the ground the texel shows lies, metres: the far model's, or the planes' own distance where they reach.
+    /// A planes' texel at their distance's cap (PLANES_DIST_MAX_M) shows ground at least that far: the far model's
+    /// ground beyond (a Mountain's valley floor 100 km out near the horizon) where that is farther.
+    pub fn dist(&self) -> f32 {
+        self.mixed(self.far.dist, |t| match t.dist {
+            d if d >= PLANES_DIST_MAX_M => d.max(self.far.dist),
+            d if d > 0.0 => d,
+            _ => self.far.dist,
+        })
+    }
 }
 
 /// The share of a texel a wet ground puts under water by the floor's kind (plan hdri-8 §3, Q6), from `cover`, the
@@ -1373,6 +1947,43 @@ pub fn wet_cover(kind: FloorKind, wet: f32, cover: f32) -> f32 {
         _ => cover,
     };
     if flood > 0.0 { 1.0 - (1.0 - held) * (1.0 - flood) } else { held }
+}
+
+/// The slopes (variance per axis) of the film of water on a wet ground between its puddles (`Env::damp_sheen`), by
+/// what its surface is: the Road's asphalt and the Plaza's stones paved (weather::DAMP_SLOPES), Sand and Snow (slush)
+/// granular, as the plain ground's sand and soil without a floor (DAMP_SLOPES_GRAINS), Rock, a Mountain's scree and a
+/// Lake's shore stony (DAMP_SLOPES_STONES), Grass its blades (DAMP_SLOPES_BLADES).
+pub(crate) fn damp_slopes(kind: Option<FloorKind>) -> f32 {
+    use super::weather::{DAMP_SLOPES, DAMP_SLOPES_BLADES, DAMP_SLOPES_GRAINS, DAMP_SLOPES_STONES};
+    match kind {
+        Some(FloorKind::Road | FloorKind::Plaza) => DAMP_SLOPES,
+        Some(FloorKind::Sand | FloorKind::Snow) | None => DAMP_SLOPES_GRAINS,
+        Some(FloorKind::Rock | FloorKind::Mountain | FloorKind::Lake) => DAMP_SLOPES_STONES,
+        Some(FloorKind::Grass) => DAMP_SLOPES_BLADES,
+    }
+}
+
+/// The damp films of a floor's main, second and third grounds (`FloorModel::films`, as `damp_slopes` gives each
+/// ground's): a Road's asphalt, its verge (a gravel shoulder: stony) and what lies beside it (the Grass field's blades,
+/// Gravel's stones, Sand's grains, Concrete and a room's paving paved); a Lake's beach (its shore's, stony) and its far
+/// bank (half soil, granular, half the Grass field: their mixed variance); the other kinds' one ground throughout.
+fn damp_films(floor: &FloorParams) -> [f32; 3] {
+    use super::weather::{DAMP_SLOPES, DAMP_SLOPES_BLADES, DAMP_SLOPES_GRAINS, DAMP_SLOPES_STONES};
+    let kind = floor.kind();
+    let main = damp_slopes(Some(kind));
+    match kind {
+        FloorKind::Road => {
+            let beside = match floor.beside() {
+                RoadBeside::Grass => DAMP_SLOPES_BLADES,
+                RoadBeside::Gravel => DAMP_SLOPES_STONES,
+                RoadBeside::Sand => DAMP_SLOPES_GRAINS,
+                RoadBeside::Concrete | RoadBeside::Room => DAMP_SLOPES,
+            };
+            [main, DAMP_SLOPES_STONES, beside]
+        }
+        FloorKind::Lake => [main, main, 0.5 * (DAMP_SLOPES_GRAINS + DAMP_SLOPES_BLADES)],
+        _ => [main; 3],
+    }
 }
 
 /// The puddles' share of a texel from its hollow (0..1) at Wet ground `wet`: the deepest hollows first, more of them
@@ -1416,6 +2027,247 @@ pub fn glitter(v: Vec3f, l: Vec3f, n: Vec3f, irradiance: Vec3f, radius: f32, slo
     // each other, so the glitter fades there instead of growing as 1 / cv
     let masked = |c: f32| 2.0 / (1.0 + (1.0 + 2.0 * all * (1.0 - c * c).max(0.0) / (c * c)).sqrt());
     irradiance * (fresnel * p * masked(cv) * masked(l.y) / (4.0 * cv * ch * ch * ch * ch))
+}
+
+/// What lies beside a road (`FloorParams::beside`), its albedo under the floor's `tint`; None for Grass (the field:
+/// the GPU's verge and field draw it). Gravel the Rock kind's gravel, Sand the Sand kind's, Concrete a mid grey
+/// paving, Room the colour the room standing on the ground gives it (`beside_color`, untinted: it is the room's own).
+fn road_beside(floor: &FloorParams, tint: Vec3f) -> Option<Vec3f> {
+    match floor.beside() {
+        RoadBeside::Grass => None,
+        RoadBeside::Gravel => Some(v3(FloorModel::recipe(FloorKind::Rock).alt) * tint),
+        RoadBeside::Sand => Some(v3(FloorModel::recipe(FloorKind::Sand).albedo) * tint),
+        RoadBeside::Concrete => Some(v3(CONCRETE_ALBEDO) * tint),
+        RoadBeside::Room => Some(v3(floor.beside_color.unwrap_or(CONCRETE_ALBEDO))),
+    }
+}
+
+/// The road's centre line on the ground (plan §3.5; bends 2026-11-07): a straight along Heading through the
+/// viewer's place, or one that bends ahead: straight to where the bend starts, then a circular arc of the bend's
+/// radius through a quarter turn, then straight on along the new way. With the start at or behind the viewer the
+/// viewer stands on the arc, which began that far behind (never more than a quarter turn behind), the road's
+/// direction at the viewer still the Heading, so a room standing on the road (a tunnel, a bridge) keeps the road
+/// between its mouths. Both the far model and the GPU's relief (`makepad_floor`'s road shader, the same pieces) read
+/// a ground point through `frame`: how far it lies across the road (signed, + to the left of the way ahead) and
+/// along it, and the road's direction there, so the lanes, their markings and the ruts follow the bend.
+#[derive(Clone, Copy, Debug)]
+pub struct RoadPath {
+    /// The heading (unit, x and z: a light's azimuth, 0 north) and the lateral unit (+: left of it).
+    a: [f32; 2],
+    n: [f32; 2],
+    /// The arc's radius (metres) and which side its centre lies (+1 left, -1 right; 0: straight).
+    r: f32,
+    sgn: f32,
+    /// The arc's centre, the unit from it to the anchor (where the road's direction is the heading), the heading
+    /// there, the arc's angles from the anchor (radians, `lo` 0 or less, `hi` the quarter turn) and the anchor's
+    /// distance along the road.
+    c: [f32; 2],
+    e1: [f32; 2],
+    e2: [f32; 2],
+    lo: f32,
+    hi: f32,
+    u0: f32,
+}
+
+/// A ground point in the road's frame (`RoadPath::frame`): across the road (`v`, metres, + to the left of the way
+/// ahead), along it (`u`, metres, + ahead) and the road's direction there (`t`, unit, x and z).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RoadFrame {
+    pub v: f32,
+    pub u: f32,
+    pub t: [f32; 2],
+}
+
+/// The bend's sweep: a quarter turn, then straight on.
+const ROAD_SWEEP: f32 = std::f32::consts::FRAC_PI_2;
+
+impl RoadPath {
+    /// A road along `heading_deg`, bending with `signed_radius` (`FloorParams::signed_curve_radius`: 0 straight,
+    /// negative left, positive right) from `start_m` ahead (0 or less: the viewer stands on the bend).
+    pub fn new(heading_deg: f32, signed_radius: f32, start_m: f32) -> RoadPath {
+        let h = heading_deg.to_radians();
+        // a light's azimuth: 0 north (-z), 90 east (+x); the lateral unit has the road's +v side on its left
+        let a = [h.sin(), -h.cos()];
+        let n = [a[1], -a[0]];
+        let r = signed_radius.abs();
+        let sgn = if !(r >= 1.0) || !signed_radius.is_finite() { 0.0 } else if signed_radius < 0.0 { 1.0 } else { -1.0 };
+        let r = if sgn == 0.0 { 0.0 } else { r };
+        let start = if start_m.is_finite() { start_m } else { 0.0 };
+        let u0 = start.max(0.0);
+        let lo = if sgn == 0.0 { 0.0 } else { (start.min(0.0) / r).max(-ROAD_SWEEP) };
+        let anchor = [a[0] * u0, a[1] * u0];
+        let c = [anchor[0] + sgn * r * n[0], anchor[1] + sgn * r * n[1]];
+        let e1 = [-sgn * n[0], -sgn * n[1]];
+        RoadPath { a, n, r, sgn, c, e1, e2: a, lo, hi: ROAD_SWEEP, u0 }
+    }
+
+    /// Whether the road bends.
+    pub fn bends(&self) -> bool {
+        self.sgn != 0.0
+    }
+
+    /// The arc's point, outward radial and direction at angle `phi` from the anchor.
+    fn arc(&self, phi: f32) -> ([f32; 2], [f32; 2], [f32; 2]) {
+        let (sn, cs) = phi.sin_cos();
+        let rad = [self.e1[0] * cs + self.e2[0] * sn, self.e1[1] * cs + self.e2[1] * sn];
+        let t = [-self.e1[0] * sn + self.e2[0] * cs, -self.e1[1] * sn + self.e2[1] * cs];
+        ([self.c[0] + self.r * rad[0], self.c[1] + self.r * rad[1]], rad, t)
+    }
+
+    /// The ground point (x, z) in the road's frame.
+    pub fn frame(&self, x: f32, z: f32) -> RoadFrame {
+        if self.sgn == 0.0 {
+            return RoadFrame { v: x * self.a[1] - z * self.a[0], u: x * self.a[0] + z * self.a[1], t: self.a };
+        }
+        let q = [x - self.c[0], z - self.c[1]];
+        let theta = (q[0] * self.e2[0] + q[1] * self.e2[1]).atan2(q[0] * self.e1[0] + q[1] * self.e1[1]);
+        if theta >= self.lo && theta <= self.hi {
+            let rho = (q[0] * q[0] + q[1] * q[1]).sqrt();
+            let (_, _, t) = self.arc(theta);
+            return RoadFrame { v: -self.sgn * (rho - self.r), u: self.u0 + self.r * theta, t };
+        }
+        let phi = if theta < self.lo { self.lo } else { self.hi };
+        let (s, rad, t) = self.arc(phi);
+        let w = [x - s[0], z - s[1]];
+        RoadFrame { v: -self.sgn * (w[0] * rad[0] + w[1] * rad[1]), u: self.u0 + self.r * phi + w[0] * t[0] + w[1] * t[1], t }
+    }
+
+    /// The point `u` metres along the road and the road's direction there.
+    pub fn point(&self, u: f32) -> ([f32; 2], [f32; 2]) {
+        if self.sgn == 0.0 {
+            return ([self.a[0] * u, self.a[1] * u], self.a);
+        }
+        let theta = (u - self.u0) / self.r;
+        if theta >= self.lo && theta <= self.hi {
+            let (p, _, t) = self.arc(theta);
+            return (p, t);
+        }
+        let phi = if theta < self.lo { self.lo } else { self.hi };
+        let (s, _, t) = self.arc(phi);
+        let along = u - (self.u0 + self.r * phi);
+        ([s[0] + t[0] * along, s[1] + t[1] * along], t)
+    }
+
+    /// The lateral unit at direction `t`: the road's left.
+    pub fn left_of(t: [f32; 2]) -> [f32; 2] {
+        [t[1], -t[0]]
+    }
+
+    /// The heading's lateral unit (the road's left at the viewer).
+    pub fn left(&self) -> [f32; 2] {
+        self.n
+    }
+}
+
+/// The night air's visibility in a clear sky's haze (1): the distance over which the ground's light falls to 1/e on
+/// its way to the viewer (`FloorModel::night_keep`); a clear night's meteorological range.
+const NIGHT_VISIBILITY_M: f32 = 20_000.0;
+
+/// A mid grey concrete paving's albedo (linear): what lies beside a road set to Concrete.
+const CONCRETE_ALBEDO: [f32; 3] = [0.36, 0.35, 0.33];
+
+/// How far the ground beside a road creeps over the asphalt's edge on average at Overgrowth 1, metres (the GPU's
+/// `og_creep`).
+const OVERGROWTH_CREEP_M: f32 = 0.225;
+/// The overgrowth's moss and fine grass along the cracks: their mean albedo green and at dryness 1 (the GPU's `mo_col`,
+/// mixed by the dryness squared).
+const OVERGROWTH_MOSS: [[f32; 3]; 2] = [[0.07, 0.118, 0.031], [0.11, 0.127, 0.049]];
+/// The moss's brightness against those greens (the GPU's `mo_col` scales its colour the same): the moss references'
+/// (D:/hdri-refs, luminance about 0.04-0.07 against the greens' 0.10). The owner chose it over the full greens, which
+/// read as lime paint in the joints at noon; at a 7 degree sun the road's cracks read darker, still green.
+const OVERGROWTH_MOSS_SHADE: f32 = 0.52;
+/// A road's cracks' length a square metre over Wear squared (along the tracks, across, the bays' secondary and tertiary
+/// ones, as `cracks` lays them; measured against the near relief's mean; the fatigue mesh is `road_fatigue`'s).
+const ROAD_CRACKS_M: f32 = 2.2;
+/// The Rock floor's slab's share of its ground (the GPU's `smoothstep(0.52, 0.66, ..)` of a gradient noise).
+const ROCK_SLAB_SHARE: f32 = 0.25;
+/// The moss's cushions' mean cover over its band (the GPU's `mo_take` under the footprint: its resolved cushions'
+/// mean over a band's profile).
+const MOSS_CUSHIONS: f32 = 0.83;
+
+/// A road's fatigue cracking at Wear `wr` on lanes `lane` m wide (the GPU's `gshare`, `gator`): the share of the road
+/// it has cracked (two bands of about 0.6 m a lane, the share of their length over its threshold, as `crack_mean`) and
+/// the length a square metre of road of the mesh's lines the moss lines (its long lines, its cracks across and its
+/// chords: 4.5, 2.5 and 1.2 m a square metre of the mesh, the chords by Wear).
+fn road_fatigue(wr: f32, lane: f32) -> (f32, f32) {
+    if !(wr > 0.6) {
+        return (0.0, 0.0);
+    }
+    let th = 1.0 - 1.7333 * (wr - 0.6);
+    let share = 1.2 / lane.max(0.5) * (0.98 - 1.2 * (th - 0.025)).clamp(0.0, 1.0);
+    (share, share * (4.5 + 2.5 + 1.2 * ((wr - 0.6) / 0.3).clamp(0.0, 1.0)))
+}
+
+/// The share of a Plaza's ground the moss's band takes at reach `reach` (m) on paving of `pattern`, tile `tile` m, its
+/// joints `joint` of the ground (the GPU's `og_bmean`): the joints and a rim of the reach inside every unit, the rims'
+/// overlap at the units' corners taken in, with L the joints' half width (the GPU's `jh`) plus the reach, a square tile
+/// or slab 1 - (1 - 2 L / s)^2, a brick 1 - (1 - 2 L / s)(1 - 4 L / s), a fan's sett its rounded square inset by L; a
+/// sett 0.8 k^2 of its cell, its rim along the GPU's first order distance: t^2 of it kept, t^4 + b t^3 = 1, b = 8.14
+/// reach / (k s).
+fn plaza_band(pattern: FloorPattern, tile: f32, joint: f32, reach: f32) -> f32 {
+    let (s, c) = (tile, joint);
+    if pattern == FloorPattern::Cobbles {
+        let k = ((1.0 - c) / 0.8).sqrt().min(0.97);
+        let b = 8.14 * reach / (k * s);
+        let mut t = 1.0 / (1.0 + 0.25 * b);
+        for _ in 0..2 {
+            t -= (t * t * t * (t + b) - 1.0) / (t * t * (4.0 * t + 3.0 * b));
+        }
+        return 1.0 - 0.8 * k * k * t * t;
+    }
+    let jh = match pattern {
+        FloorPattern::Herringbone => 0.5 * s * (3.0 - (9.0 - 8.0 * c).sqrt()) / 4.0,
+        FloorPattern::Fan => {
+            let q = 0.25 * s.min(0.2) / s;
+            let b = 4.0 - 1.7168147 * q;
+            s * (b - (b * b - 12.566371 * (c - 0.8584073 * q * q)).sqrt()) / 6.2831853
+        }
+        _ => 0.5 * s * (1.0 - (1.0 - c).sqrt()),
+    };
+    let u = (jh + reach) / s;
+    let a = (1.0 - 2.0 * u).max(0.0);
+    match pattern {
+        FloorPattern::Herringbone => 1.0 - a * (1.0 - 4.0 * u).max(0.0),
+        FloorPattern::Fan => {
+            let qr = (0.25 * s.min(0.2) / s - u).max(0.0);
+            1.0 - (a * a - 0.8584073 * qr * qr).max(0.0)
+        }
+        _ => 1.0 - a * a,
+    }
+}
+
+/// The share of the cracks' courses the moss and fine grass have taken where `mo_take` is given the share `sh` (the
+/// GPU's `mo_patch`, its mean: its threshold 0.76 - 0.52 sh over a noise held as `smoothstep(th - 0.26, th + 0.26, ..)`).
+fn moss_patch(sh: f32) -> f32 {
+    let x = sh.clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}
+
+/// The overgrowth's plants' mean albedo, untinted (the GPU's `og_pmean`): a clump's blades (greener and darker on a
+/// weed, paler on the dune grass, by how `upright` they stand) and their straw by the dryness `dry`, a rosette's leaves,
+/// by the share of rosettes `rshare`.
+fn overgrowth_plants(rshare: f32, upright: f32, dry: f32) -> Vec3f {
+    let blades = v3([0.058, 0.11, 0.03]).mix(v3([0.13, 0.15, 0.085]), upright).mix(v3([0.3, 0.26, 0.13]), 0.5 * dry * dry + 0.15 * dry);
+    blades.mix(v3([0.047, 0.075, 0.029]), rshare)
+}
+
+/// The overgrowth's plants' mean cover seen `s` (the sine of the depression) down, at Overgrowth `og`, for a kind whose
+/// plants stand one in a cell `cell` m across by Overgrowth's chance times the kind's mean say `say`, the largest
+/// `size` (a rosette's radius, a clump's height, m) at Overgrowth 1, a share `rshare` of them rosettes, the clumps'
+/// blades `upright` (the GPU's `og_tau`, `og_mean`): n a square metre; a rosette 0.675 of the largest radius on
+/// average, its leaves 0.6 of its disc, a third as high as wide; a clump 0.7 of the tallest high, its blades' cover
+/// from above and from the side by that height (the GPU's `og_cs`: 0.0032 and 0.0064 m^2 a metre for a weed's,
+/// 0.005 and 0.0205 for the dune grass's).
+fn overgrowth_cover(cell: f32, size: [f32; 2], rshare: f32, upright: f32, say: f32, og: f32, s: f32) -> f32 {
+    let n = og * say / (cell * cell);
+    let rr = 0.675 * size[0] * (0.6 + 0.4 * og);
+    let hc = 0.7 * size[1] * (0.5 + 0.5 * og);
+    let pi = std::f32::consts::PI;
+    let mx = |a: f32, b: f32| a + (b - a) * upright;
+    let top = rshare * 0.6 * pi * rr * rr + (1.0 - rshare) * mx(0.0032, 0.005) * hc;
+    let side = rshare * 0.33 * rr * rr + (1.0 - rshare) * mx(0.0064, 0.0205) * hc;
+    let cot = (1.0 - s * s).max(0.0).sqrt() / s.max(1.0e-6);
+    1.0 - (-n * (top + side * cot)).exp()
 }
 
 /// A Grass field's mean albedo seen `s` (the sine of the depression) down (§3.1): green running to golden by
@@ -1583,7 +2435,9 @@ pub(crate) mod tests {
             new.floor = new.floor.take().map(|floor| floor.without_variation());
             let mut worst = 0.0f32;
             for _ in 0..400 {
-                let el = -0.05 - 89.9 * next();
+                // by night the floor's ground runs on through the night air (`night_keep`) where the old ground
+                // fades out over the 2 degrees under the horizon: the same below that band, to the air's share
+                let el = if name == "night" { -2.0 - 87.9 * next() } else { -0.05 - 89.9 * next() };
                 let d = dir_from_az_el(360.0 * next(), el);
                 for texel in [0.0, std::f32::consts::TAU / 1024.0] {
                     let at = Sampling { texel, ..Sampling::default() };
@@ -1593,7 +2447,7 @@ pub(crate) mod tests {
                 }
             }
             println!("{name}: the flat floor is the old ground within {worst:e}");
-            assert!(worst <= 1.0e-5, "{name}: {worst}");
+            assert!(worst <= if name == "night" { 1.0e-2 } else { 1.0e-5 }, "{name}: {worst}");
         }
     }
 
@@ -1723,6 +2577,77 @@ pub(crate) mod tests {
         assert!(field != asphalt);
     }
 
+    /// Road bends (2026-11-07): the road's frame is the straight one up to the bend's start, then follows a quarter
+    /// turn of the radius (to the right: east of a north heading), then runs straight on; a point on the centre line
+    /// reads as across 0, along its distance, whatever the piece. With the start behind the viewer, the viewer stands
+    /// on the bend and the road's direction at the viewer is still the heading.
+    #[test]
+    fn a_bent_road_turns_a_quarter_round_its_radius_and_runs_on() {
+        let straight = super::RoadPath::new(0.0, 0.0, 30.0);
+        let f = straight.frame(2.0, -10.0);
+        assert_eq!((f.v, f.u, f.t), (-2.0, 10.0, [0.0, -1.0]), "a north road: + across is west, + along is north");
+        let right = super::RoadPath::new(0.0, 100.0, 30.0);
+        assert!(right.bends());
+        // before the bend the frames agree
+        let (a, b) = (straight.frame(1.5, -20.0), right.frame(1.5, -20.0));
+        assert!((a.v - b.v).abs() < 1.0e-4 && (a.u - b.u).abs() < 1.0e-4 && a.t == b.t, "{a:?} {b:?}");
+        // the bend's end: a quarter turn of 100 m from 30 m ahead ends 130 m up the road, 100 m east of the straight
+        // line (the centre at (100, -30)), heading east
+        let (end, t) = right.point(30.0 + 100.0 * std::f32::consts::FRAC_PI_2);
+        assert!((end[0] - 100.0).abs() < 1.0e-3 && (end[1] + 130.0).abs() < 1.0e-3, "{end:?}");
+        assert!((t[0] - 1.0).abs() < 1.0e-4 && t[1].abs() < 1.0e-4, "{t:?}");
+        // past it the road runs east: 50 m on is (150, -130)
+        let (on, _) = right.point(30.0 + 100.0 * std::f32::consts::FRAC_PI_2 + 50.0);
+        assert!((on[0] - 150.0).abs() < 1.0e-3 && (on[1] + 130.0).abs() < 1.0e-3, "{on:?}");
+        // the centre line reads as across 0, along u, on every piece; 2 m to its left as across +2
+        for u in [-40.0f32, 0.0, 29.0, 31.0, 100.0, 180.0, 220.0, 400.0] {
+            let (p, t) = right.point(u);
+            let f = right.frame(p[0], p[1]);
+            assert!(f.v.abs() < 1.0e-2 && (f.u - u).abs() < 1.0e-2, "{u}: {f:?}");
+            assert!((f.t[0] - t[0]).abs() < 1.0e-3 && (f.t[1] - t[1]).abs() < 1.0e-3, "{u}: {f:?} against {t:?}");
+            let n = super::RoadPath::left_of(t);
+            let g = right.frame(p[0] + 2.0 * n[0], p[1] + 2.0 * n[1]);
+            assert!((g.v - 2.0).abs() < 1.0e-2 && (g.u - u).abs() < 1.0e-2, "{u}: {g:?}");
+        }
+        // to the left the bend is mirrored: its end 100 m west
+        let left = super::RoadPath::new(0.0, -100.0, 30.0);
+        let (end, _) = left.point(30.0 + 100.0 * std::f32::consts::FRAC_PI_2);
+        assert!((end[0] + 100.0).abs() < 1.0e-3 && (end[1] + 130.0).abs() < 1.0e-3, "{end:?}");
+        // the viewer on the bend: the road's direction at the viewer is the heading, the arc began 50 m behind, and
+        // behind that it is straight along the way it had there
+        let on_it = super::RoadPath::new(0.0, 100.0, -50.0);
+        let (p0, t0) = on_it.point(0.0);
+        assert!(p0[0].abs() < 1.0e-4 && p0[1].abs() < 1.0e-4 && (t0[1] + 1.0).abs() < 1.0e-4, "{p0:?} {t0:?}");
+        let (p1, t1) = on_it.point(-50.0);
+        // (the arc's centre lies 100 m east: behind the viewer too the road bends toward it)
+        assert!((p1[0] - (100.0 - 100.0 * 0.5f32.cos())).abs() < 1.0e-2 && (p1[1] - 100.0 * 0.5f32.sin()).abs() < 1.0e-2, "{p1:?}");
+        let (p2, t2) = on_it.point(-80.0);
+        assert!((t2[0] - t1[0]).abs() < 1.0e-4 && (t2[1] - t1[1]).abs() < 1.0e-4, "straight before the arc");
+        assert!(((p2[0] - p1[0]) + 30.0 * t1[0]).abs() < 1.0e-2 && ((p2[1] - p1[1]) + 30.0 * t1[1]).abs() < 1.0e-2, "{p2:?}");
+        // the far model follows it: 150 m up a road bending right from 30 m, the asphalt lies east of north
+        let floor = FloorParams { curve: Some("right".to_string()), curve_radius_m: Some(100.0), curve_start_m: Some(30.0), markings: false, ..floor_of("road") };
+        let model = FloorModel::new(&floor, false).without_variation();
+        let asphalt = model.sample(dir_from_az_el(0.0, -45.0), 0.0).albedo;
+        let (p, _) = model.road().point(150.0);
+        let (az, el) = az_el_from_dir(vec3f(p[0], -floor.eye_m, p[1]).normalize());
+        assert!(az > 20.0 && az < 90.0, "150 m along, the road lies east of north: {az}");
+        assert_eq!(model.sample(dir_from_az_el(az, el), 0.0).albedo, asphalt, "asphalt there");
+        assert_ne!(model.sample(dir_from_az_el(0.0, el), 0.0).albedo, asphalt, "and the field straight north at that depression");
+    }
+
+    #[test]
+    fn night_visibility_depends_on_distance_and_haze() {
+        let floor = floor_of("road");
+        let clear = FloorModel::new(&floor, false);
+        let hazy = FloorModel::new(&floor, false).with_haze(3.0);
+        // by night the ground's light runs on: nearly all of it from 100 m, over half from 10 km in clear air, less in
+        // haze; none at or above the horizon
+        let look = |r: f32| vec3f(0.0, -floor.eye_m, -r).normalize();
+        assert!(clear.night_keep(look(100.0)) > 0.99 && clear.night_keep(look(10_000.0)) > 0.55 && clear.night_keep(look(10_000.0)) < 0.65, "{} {}", clear.night_keep(look(100.0)), clear.night_keep(look(10_000.0)));
+        assert!(hazy.night_keep(look(10_000.0)) < 0.25, "{}", hazy.night_keep(look(10_000.0)));
+        assert_eq!(clear.night_keep(vec3f(0.0, 0.0, -1.0)), 0.0);
+    }
+
     /// Plan hdri-8 §3.8 (D2: one water model): the far lake's open water is the weather's full-water ground for the
     /// same direction, its bed the floor's: a flat Lake (Ripples 0) under a clear noon sky equals, within 1e-5, the
     /// floorless map under a clear weather with Wet ground 1.00 and the lake bed's colour for its ground.
@@ -1740,7 +2665,13 @@ pub(crate) mod tests {
             wet.sky.weather = Some(WeatherParams { kind: "clear".to_string(), wet_ground: 1.0, ..WeatherParams::default() });
             let puddled = Env::new(&wet);
             let mut worst = 0.0f32;
+            // by night the floor's water runs on through the night air (`FloorModel::night_keep`) where the old
+            // ground fades out over the 2 degrees under the horizon: the same below that band, to the air's share
+            let night = name == "Moonlit night";
             for depression in [0.5f32, 2.0, 5.0, 15.0, 40.0, 80.0] {
+                if night && depression < 2.0 {
+                    continue;
+                }
                 for az in [-60.0f32, -20.0, 0.0, 35.0, 70.0] {
                     let d = dir_from_az_el(floor::LAKE_FRONT_AZ_DEG + az, -depression);
                     let (a, b) = (floored.radiance(d), puddled.radiance(d));
@@ -1748,7 +2679,7 @@ pub(crate) mod tests {
                 }
             }
             println!("{name}: the lake is the full-water ground within {worst:e}");
-            assert!(worst <= 1.0e-5, "{name}: {worst}");
+            assert!(worst <= if night { 5.0e-3 } else { 1.0e-5 }, "{name}: {worst}");
         }
     }
 
@@ -1877,8 +2808,11 @@ pub(crate) mod tests {
         assert_eq!(HdriParams::from_json(&p.to_json()).unwrap(), p);
         let old = HdriParams::from_json(&super::super::presets::preset("Clear noon").unwrap().to_json()).unwrap();
         assert_eq!(old.floor, None, "a file from before the floor has none");
+        // (but a hybrid studio standing on the ground: a tunnel's or a bridge's floor is the ground's)
         for name in super::super::presets::PRESET_NAMES {
-            assert_eq!(super::super::presets::preset(name).unwrap().floor, None, "{name} stays floorless");
+            let p = super::super::presets::preset(name).unwrap();
+            let on_ground = p.studio.room.as_ref().is_some_and(|room| room.open_floor());
+            assert_eq!(p.floor.is_some(), on_ground, "{name}: a floor exactly where a room stands on the ground");
         }
         let (merged, report) = old.merge_json(r#"{"floor": {"kind": "sand", "dunes": 0.7, "seed": 12.6}}"#).unwrap();
         let floor = merged.floor.unwrap();
@@ -1944,9 +2878,9 @@ pub(crate) mod tests {
     /// Plan hdri-8 §6: a flat floor is the old ground. A plane texel with an upward normal, no occlusion, no shadow, no
     /// hollow and the old ground colour for albedo composes to the floorless map's ground: by day, under an overcast,
     /// by night (the moon the key) and under rain on a wet ground (whose puddles a texel with no hollow does not hold:
-    /// the old damp ground between them). Exactly, within 1e-5, through the composition itself (`sky_layers_on`, the
-    /// ground relit by the cover, and the weather's wet ground); and through packed planes attached to the map within
-    /// their 8-bit key term (1 %).
+    /// the old damp ground between them: the floor is Sand, whose film is the plain ground's grains, `damp_films`).
+    /// Exactly, within 1e-5, through the composition itself (`sky_layers_on`, the ground relit by the cover, and the
+    /// weather's wet ground); and through packed planes attached to the map within their 8-bit key term (1 %).
     #[test]
     fn a_flat_floor_is_the_old_ground() {
         use super::super::presets::preset;
@@ -1957,12 +2891,12 @@ pub(crate) mod tests {
             let code = FloorTexel::unpack(&level(p.sky.atmosphere.ground_color, 0.0).pack()).albedo;
             p.sky.atmosphere.ground_color = code;
             let old = Env::new(&p);
-            // The rock's far model tinted so its mean albedo (what the sky's ground bounce reads, 30 degrees down) is
+            // The sand's far model tinted so its mean albedo (what the sky's ground bounce reads, 30 degrees down) is
             // the old ground's: the atmosphere over the floor is then the floorless map's.
-            let mut rock = floor_of("rock");
-            let mean = FloorModel::new(&rock, false).mean_albedo(30f32.to_radians());
-            rock.tint = std::array::from_fn(|c| rock.tint[c] * code[c] / mean[c]);
-            let mut floored = with_floor(&p, Some(rock));
+            let mut sand = floor_of("sand");
+            let mean = FloorModel::new(&sand, false).mean_albedo(30f32.to_radians());
+            sand.tint = std::array::from_fn(|c| sand.tint[c] * code[c] / mean[c]);
+            let mut floored = with_floor(&p, Some(sand));
             floored.floor.as_mut().unwrap().eye_m = 2.0;
             let env = Env::new(&floored);
             let key = key_sine(&env);
@@ -1977,10 +2911,12 @@ pub(crate) mod tests {
                 let here = FloorHere { far, near: Some((level(code, key), 1.0)) };
                 let c = weather::relit_ground(d, env.sky_layers_on(d, atmo, None, Sampling::default(), Some(&here)), env.ground_gain);
                 let c = match &env.weather {
-                    // the mirror's sheen shows the sky as the weather shows it (`base_layer`'s `seen`; no strip here)
+                    // the mirror shows the sky as the weather shows it (`base_layer`'s `seen`; no strip here), the damp
+                    // ground's sheen through its film's facets (`Env::damp_sheen`)
                     Some(weather) => {
                         let seen = |v: Vec3f| weather.veil(v, env.sky_layers(v, atmo, None, Sampling::default()), env.weather_sun, env.dome) + weather.lightning(v, 0.0);
-                        weather.ground_covered(d, env.sky_layers_on(d, atmo, None, Sampling::default(), Some(&here)), env.ground_gain, &seen, 0.0)
+                        let sheen = || env.damp_sheen(d, behind);
+                        weather.ground_sheened(d, env.sky_layers_on(d, atmo, None, Sampling::default(), Some(&here)), env.ground_gain, &seen, 0.0, None, &sheen)
                     }
                     None => c,
                 };
@@ -1993,7 +2929,9 @@ pub(crate) mod tests {
             let attached: Vec<Vec3f> = near_dirs().iter().map(|&d| env.base_layer(d, None, behind)).collect();
             let packed = worst_relative(&want, &attached);
             println!("{name}: the flat floor is the old ground within {exact:e} composed, {packed:e} through packed planes");
-            assert!(exact <= 1.0e-5, "{name}: {exact}");
+            // by night the floor's ground runs on through the night air (`FloorModel::night_keep`): the old ground to
+            // the air's share (the near directions all lie under the glow's 2 degree band)
+            assert!(exact <= if name == "night" { 5.0e-3 } else { 1.0e-5 }, "{name}: {exact}");
             assert!(packed <= 0.01, "{name}: {packed}");
         }
     }
@@ -2493,7 +3431,7 @@ pub(crate) mod tests {
                     // (the floor as it is under this strip: its puddles mirror the strip standing over them)
                     let base = env.base_under_skyline(d, None, Sampling::default());
                     let want = match &env.weather {
-                        Some(weather) => skyline::over_veiled(s, base, &|x| env.city_veil(weather, d, None, x)),
+                        Some(weather) => skyline::over_veiled(s, base, &|x| env.city_veil(weather, d, None, x, 0.0)),
                         None => skyline::over_veiled(s, base, &|x| x),
                     };
                     let got = env.base_at(d, None, Sampling::default());

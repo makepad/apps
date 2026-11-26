@@ -1,0 +1,28 @@
+use mod.motion.*
+// Spotlight: the frame dims except a rounded hole over the widget `target`
+// names, or over the focus when `target` is empty.
+let r = run()
+let box = fn(t) {
+    if in(@target) == "" { return r.focus(t, {pad: in(@pad) settle: 0.35}) }
+    return r.widget(in(@target), t, {pad: in(@pad)})
+}
+Motion{
+    label: "Spotlight (follows the app)"
+    size: vec2(1080, 1920)
+    duration: 3600.0
+    inputs: {
+        target: input(@text, "", "Widget path to light; empty follows the focus")
+        dim: input(@number, 0.62, "How dark the rest gets, 0..1")
+        pad: input(@number, 24, "Space around the widget")
+        radius: input(@number, 28, "Corner radius of the hole")
+    }
+    layers: [
+        Group{name: "dim"
+            mask: Rect{at: fn(t) { return box(t).at } size: fn(t) { return box(t).size } radius: in(@radius) fill: #ffffff}
+            mask_mode: @inverse
+            opacity: fn(t) { return box(t).presence * in(@dim) }
+            layers: [
+                Rect{at: vec2(-4000, -4000) size: vec2(12000, 12000) fill: #05070b}
+            ]}
+    ]
+}

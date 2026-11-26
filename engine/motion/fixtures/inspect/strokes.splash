@@ -1,0 +1,10 @@
+use mod.motion.*
+Motion{size: vec2(640, 480) duration: 2.0 fps: 20 layers: [
+    Text{name: "label" text: "HELLO" size: 48 at: vec2(80, 60)}
+    Path{name: "crossing" svg: "M 60 90 L 400 90" stroke: #fff width: 3}
+    Path{name: "clear" svg: "M 60 160 L 400 160" stroke: #fff width: 3}
+    Path{name: "trimmed" svg: "M 0 90 L 400 90" stroke: #fff width: 3 trim_end: 0.1}
+    Path{name: "transparent" svg: "M 60 90 L 400 90" stroke: #fff0 width: 3}
+    Path{name: "diagonal clear" svg: "M 0 40 L 130 170" stroke: #fff width: 2}
+    Path{name: "curved crossing" svg: "M 60 90 Q 230 100 400 90" stroke: #fff width: 3}
+]}

@@ -1,0 +1,23 @@
+# Stage's host of the model build service (KERNELS.md §3.10, PM2): Scene3D
+# documents author models with the same builders Sandbox's games use
+# (`makepad-model-script`), and this crate builds them with
+# `makepad-model-build` into Stage's OWN asset store (one store engine,
+# separate roots per app: a Sandbox product reaches Stage only by an explicit
+# import or publish). It keeps the installed products Scene3D documents read
+# and is pumped from the UI thread by whoever draws them.
+[package]
+name = "makepad-stage-model-host"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+makepad-model-script = { path = "../../../apps/engine/model_script" }
+makepad-model-build = { path = "../model_build" }
+# The warm pool the builds run on, and the UI signal.
+makepad-platform = { path = "../../../../platform" }
+# Stage's store root (`STAGE_ASSET_ROOT`) and the `m.import` fetches.
+makepad-asset-client = { path = "../asset/client" }
+makepad-asset-data = { path = "../../../apps/engine/asset/data" }
+makepad-model = { path = "../../../../libs/model" }

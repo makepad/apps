@@ -495,3 +495,49 @@ fn handheld_hand_routed_ends_are_continued() {
     assert!(after.is_empty(), "DRC is clean after a save and reload: {after:?}");
     assert_eq!(fixed_copper(&*reloaded), fixed_copper(&*board), "the fixed copper is as it was");
 }
+
+/// P2's gate: the constructive seed's placement routes. With every part of ledctl placed afresh
+/// by `place::seed` and the hand copper taken off (the pours stay), the grid router routes every
+/// net and its copper is DRC-clean. (ledavr and the handheld are measured runs: their routes take
+/// longer than a test may.)
+#[test]
+fn seeded_ledctl_routes_completely() {
+    use fab_elec_route::place::{seed, PlaceProblem, SeedOpts};
+    let design = ledctl();
+    let unit = design.units.iter().find(|u| u.board.as_ref().is_some_and(|b| !b.placed.is_empty()))
+        .expect("fixture setup: a placed board");
+    let mut board = (**unit.board.as_ref().expect("a board")).clone();
+    let placement = PlaceProblem::new(&board, &[]);
+    let mut poses: Vec<_> = placement.movables.iter().map(|m| m.start).collect();
+    let report = seed(&board, &unit.circuit, &placement, &mut poses, &SeedOpts::default());
+    assert!(report.unplaced.is_empty(), "setup: the seed places every part: {:?}", report.unplaced);
+    for (m, pose) in placement.movables.iter().zip(&poses) {
+        let p = board.placed.iter_mut().find(|p| p.id == m.item).expect("a movable is on the board");
+        (p.at, p.rot, p.side) = (pose.at, pose.rot, pose.side);
+    }
+    board.tracks.clear();
+    board.vias.clear();
+    board.reindex();
+
+    let board = Arc::new(board);
+    let rules = Arc::new(resolve_rules(&board, None));
+    let fills = Arc::new(fill_all(&board, &rules));
+    let conn = Arc::new(connect(&board, &fills));
+    let base = Base::new(board, rules.clone(), conn, fills);
+    let nets = scope_nets(&base.board, &base.conn, &RouteScope::All);
+    let world = Arc::new(RBase::build(&base.board));
+    let p = problem(&base, world, &nets, Style::FortyFive, Effort::default());
+    let sol = GridRouter::default().route(&p, &Progress::new());
+    let open: Vec<_> = sol.open.iter().map(|(net, why)| format!("{} {why:?}", base.board.nets[net.ix()].name)).collect();
+    assert!(open.is_empty(), "every net of the seeded board routes: {} of {} do; open: {open:?}", p.nets.len() - open.len(), p.nets.len());
+
+    let mut routed = (*base.board).clone();
+    routed.apply_all(&sol.ops()).unwrap_or_else(|e| panic!("the routes apply: {e:?}"));
+    let fills = fill_all(&routed, &rules);
+    let conn = connect(&routed, &fills);
+    let found: Vec<_> = drc(&routed, &conn, &rules, &fills, None).violations.iter()
+        .filter(|v| matches!(v.kind, CheckKind::Clearance | CheckKind::EdgeClearance | CheckKind::HoleClearance
+            | CheckKind::Short | CheckKind::Dangling | CheckKind::DanglingVia | CheckKind::ViaInPad | CheckKind::CourtyardOverlap))
+        .map(|v| format!("{:?} {}", v.kind, v.message)).collect();
+    assert!(found.is_empty(), "the seeded board's copper is DRC-clean: {found:?}");
+}

@@ -17,7 +17,7 @@
 //! each zone it reaches, the refilled zones' tiles, `connect_indexed` (geometry for the fresh
 //! pieces only, plus O(n log n) passes over the previous lists) and `drc_indexed` (geometry
 //! around the delta, connectivity findings in full). No step builds a full piece list.
-//! Measured (native, a Linux node, the Effort(1) grid form): one net inside the pour checks in
+//! Measured (native, a Linux node, the grid engine): one net inside the pour checks in
 //! 34 ms on ledctl (100 items) and 760 ms on ledctl4x4 (2236 items, `fill_all` 857 ms there); the
 //! zone refill is nearly all of it, as the refill reaches most of the pour.
 

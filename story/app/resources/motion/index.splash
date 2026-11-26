@@ -1,0 +1,44 @@
+// The bundled motion library (D2): every document with its
+// portrait cut and its category, in the order the library should list them.
+// Each file is a complete Motion document; `landscape` is 1920×1080 and
+// `portrait` 1080×1920 (the same design re-set for the Reels/TikTok/Shorts
+// safe area). Seed them into the library as AssetKind::Motion with the
+// document's own `tags` plus `category`.
+[
+    {name: "type_word_punch" category: @kinetic_type landscape: "type_word_punch.splash" portrait: "type_word_punch_9x16.splash"}
+    {name: "type_letter_cascade" category: @kinetic_type landscape: "type_letter_cascade.splash" portrait: "type_letter_cascade_9x16.splash"}
+    {name: "type_split_reveal" category: @kinetic_type landscape: "type_split_reveal.splash" portrait: "type_split_reveal_9x16.splash"}
+    {name: "type_mask_wipe" category: @kinetic_type landscape: "type_mask_wipe.splash" portrait: "type_mask_wipe_9x16.splash"}
+    {name: "type_typewriter" category: @kinetic_type landscape: "type_typewriter.splash" portrait: "type_typewriter_9x16.splash"}
+    {name: "type_count_up" category: @kinetic_type landscape: "type_count_up.splash" portrait: "type_count_up_9x16.splash"}
+    {name: "type_quote_card" category: @kinetic_type landscape: "type_quote_card.splash" portrait: "type_quote_card_9x16.splash"}
+    {name: "sync_voice_karaoke" category: @sync landscape: "sync_voice_karaoke.splash" portrait: "sync_voice_karaoke_9x16.splash"}
+    {name: "sync_voice_word_punch" category: @sync landscape: "sync_voice_word_punch.splash" portrait: "sync_voice_word_punch_9x16.splash"}
+    {name: "sync_beat_words" category: @sync landscape: "sync_beat_words.splash" portrait: "sync_beat_words_9x16.splash"}
+    {name: "sync_beat_pulse_title" category: @sync landscape: "sync_beat_pulse_title.splash" portrait: "sync_beat_pulse_title_9x16.splash"}
+    {name: "title_clean" category: @title landscape: "title_clean.splash" portrait: "title_clean_9x16.splash"}
+    {name: "title_bold" category: @title landscape: "title_bold.splash" portrait: "title_bold_9x16.splash"}
+    {name: "title_editorial" category: @title landscape: "title_editorial.splash" portrait: "title_editorial_9x16.splash"}
+    {name: "lower_third_clean" category: @title landscape: "lower_third_clean.splash" portrait: "lower_third_clean_9x16.splash"}
+    {name: "lower_third_bold" category: @title landscape: "lower_third_bold.splash" portrait: "lower_third_bold_9x16.splash"}
+    {name: "lower_third_editorial" category: @title landscape: "lower_third_editorial.splash" portrait: "lower_third_editorial_9x16.splash"}
+    {name: "end_card_cta" category: @title landscape: "end_card_cta.splash" portrait: "end_card_cta_9x16.splash"}
+    {name: "shape_logo_draw" category: @shape landscape: "shape_logo_draw.splash" portrait: "shape_logo_draw_9x16.splash"}
+    {name: "shape_blobs" category: @shape landscape: "shape_blobs.splash" portrait: "shape_blobs_9x16.splash"}
+    {name: "shape_dot_grid" category: @shape landscape: "shape_dot_grid.splash" portrait: "shape_dot_grid_9x16.splash"}
+    {name: "shape_icon_burst" category: @shape landscape: "shape_icon_burst.splash" portrait: "shape_icon_burst_9x16.splash"}
+    {name: "shape_progress_bar" category: @shape landscape: "shape_progress_bar.splash" portrait: "shape_progress_bar_9x16.splash"}
+    {name: "chart_bar" category: @shape landscape: "chart_bar.splash" portrait: "chart_bar_9x16.splash"}
+    {name: "chart_line" category: @shape landscape: "chart_line.splash" portrait: "chart_line_9x16.splash"}
+    {name: "chart_donut" category: @shape landscape: "chart_donut.splash" portrait: "chart_donut_9x16.splash"}
+    {name: "demo_callout" category: @demo landscape: "demo_callout.splash" portrait: "demo_callout_9x16.splash"}
+    {name: "demo_highlight_box" category: @demo landscape: "demo_highlight_box.splash" portrait: "demo_highlight_box_9x16.splash"}
+    {name: "demo_spotlight" category: @demo landscape: "demo_spotlight.splash" portrait: "demo_spotlight_9x16.splash"}
+    {name: "demo_zoom_lens" category: @demo landscape: "demo_zoom_lens.splash" portrait: "demo_zoom_lens_9x16.splash"}
+    {name: "demo_keystroke" category: @demo landscape: "demo_keystroke.splash" portrait: "demo_keystroke_9x16.splash"}
+    {name: "demo_cursor_trail" category: @demo landscape: "demo_cursor_trail.splash" portrait: "demo_cursor_trail_9x16.splash"}
+    {name: "demo_step_counter" category: @demo landscape: "demo_step_counter.splash" portrait: "demo_step_counter_9x16.splash"}
+    {name: "wipe_slabs" category: @transition landscape: "wipe_slabs.splash" portrait: "wipe_slabs_9x16.splash"}
+    {name: "wipe_stripes" category: @transition landscape: "wipe_stripes.splash" portrait: "wipe_stripes_9x16.splash"}
+    {name: "wipe_circle" category: @transition landscape: "wipe_circle.splash" portrait: "wipe_circle_9x16.splash"}
+]

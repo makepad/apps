@@ -61,6 +61,7 @@ use std::sync::Arc;
 
 /// A project's file extension (`demo.fab.splash`).
 pub const EXTENSION: &str = "fab.splash";
+const DEFAULT_IMPORT: &str = "use mod.fab.*";
 pub const MESH_EXTENSION: &str = "mesh";
 pub const FACETS_EXTENSION: &str = "facets";
 pub const MEMORY_EXTENSION: &str = "eeprom";
@@ -68,6 +69,7 @@ const MAGIC: &[u8; 4] = b"FMSH";
 const FACETS_MAGIC: &[u8; 4] = b"FFCT";
 
 const ROOTS: &[RootFn] = &[
+    RootFn { name: "arrange", args: &["gap"], model: false },
     RootFn { name: "settings", args: &["values"], model: false },
     RootFn { name: "measure", args: &["points", "kind", "name"], model: false },
     RootFn { name: "test_print", args: &["name", "instance", "object", "link", "at", "size", "turn", "pose", "on", "brim"], model: false },
@@ -335,11 +337,15 @@ impl ColorDef {
 }
 
 /// The project: its scripts, linked placements and saved rulers.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Project {
+    /// Top-level `use` statements, in source order, shared with the object scripts.
+    pub imports: Arc<[String]>,
     pub scripts: Vec<ScriptRef>,
     /// One per emitted object the project places (objects without one are free).
     pub places: Vec<Placement>,
+    /// Requested space between shelf slots, in bed mm. None uses the default shelf pack.
+    pub arrange_gap: Option<f64>,
     /// Saved rulers in creation order; they have no evaluation or slicing effect.
     pub measures: Vec<Measure>,
     /// The test prints in creation order; they have no effect on the plate's own print.
@@ -348,6 +354,27 @@ pub struct Project {
     pub settings: Vec<(String, String)>,
     /// The print colours, in order.
     pub colors: Vec<ColorDef>,
+}
+
+impl Default for Project {
+    fn default() -> Self {
+        Self { imports: Arc::from([DEFAULT_IMPORT.to_string()]), scripts: Vec::new(), places: Vec::new(), arrange_gap: None, measures: Vec::new(), test_prints: Vec::new(), settings: Vec::new(), colors: Vec::new() }
+    }
+}
+
+impl std::fmt::Debug for Project {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // content_hash uses this representation. Keep saved hashes for the usual project.
+        let mut project = f.debug_struct("Project");
+        if !matches!(self.imports.as_ref(), [u] if u == DEFAULT_IMPORT) {
+            project.field("imports", &self.imports);
+        }
+        if let Some(gap) = self.arrange_gap {
+            project.field("arrange_gap", &gap);
+        }
+        project.field("scripts", &self.scripts).field("places", &self.places).field("measures", &self.measures)
+            .field("test_prints", &self.test_prints).field("settings", &self.settings).field("colors", &self.colors).finish()
+    }
 }
 
 impl Project {
@@ -414,6 +441,13 @@ pub fn parse(text: &str) -> Result<Project, Vec<Diag>> {
         return Err(vec![diag(s.loc, "a project (.fab.splash) holds no geometry: model it in an object script (.cad.splash) and place that with script(...)")]);
     }
     let mut project = Project::default();
+    let syntax = &program.names.syntax;
+    let imports: Vec<_> = syntax.statements().iter()
+        .filter(|s| matches!(s.kind, makepad_script::syntax::Kind::Use { .. }))
+        .map(|s| syntax.text(s).to_string()).collect();
+    if !imports.is_empty() {
+        project.imports = imports.into();
+    }
     let mut errors = Vec::new();
     for root in &program.roots {
         let r = match root.kind {
@@ -437,6 +471,11 @@ pub fn parse(text: &str) -> Result<Project, Vec<Diag>> {
                     errors.push(diag(root.loc, format!("two test prints are named '{}'", t.name)));
                 } else {
                     project.test_prints.push(t);
+                }
+            }),
+            "arrange" => arrange_gap(root).map(|gap| {
+                if project.arrange_gap.replace(gap).is_some() {
+                    errors.push(diag(root.loc, "the project has two arrange statements: give the gap once"));
                 }
             }),
             "color" => color_def(root).map(|c| {
@@ -603,6 +642,24 @@ fn script_ref(root: &lang::Root) -> Result<ScriptRef, Diag> {
     Ok(ScriptRef { name, file, params })
 }
 
+/// A plate XY in script lengths, converted to printer millimetres.
+fn place_xy(root: &lang::Root, key: &str) -> Result<[f64; 2], Diag> {
+    let bad = || diag(root.loc, format!("place: '{key}' must be two finite lengths"));
+    let Some(V::Arr(a)) = value(root, key) else { return Err(bad()) };
+    let [x, y] = a.as_slice() else { return Err(bad()) };
+    let mm = |v: &V| v.num().map(|n| n * UNIT).filter(|n| n.is_finite()).ok_or_else(bad);
+    Ok([mm(x)?, mm(y)?])
+}
+
+pub(crate) fn checked_arrange_gap(mm: f64) -> Result<f64, String> {
+    if mm.is_finite() && mm >= 0.0 { Ok(mm) } else { Err("arrange: gap must be a finite, non-negative length".into()) }
+}
+
+fn arrange_gap(root: &lang::Root) -> Result<f64, Diag> {
+    let Some(V::Num(n)) = value(root, "gap") else { return Err(diag(root.loc, "arrange takes a length: arrange(gap: 5mm)")) };
+    checked_arrange_gap(n * UNIT).map_err(|e| diag(root.loc, e))
+}
+
 fn placement(root: &lang::Root) -> Result<Placement, Diag> {
     let bad = |m: String| diag(root.loc, format!("place: {m}"));
     let instance = match value(root, "instance") {
@@ -641,11 +698,8 @@ fn placement(root: &lang::Root) -> Result<Placement, Diag> {
         Some(_) => return Err(bad("'link' must be a positive integer; omit it for the original".into())),
     };
     p.at = match value(root, "at") {
-        None => None,
-        Some(v) => {
-            let a = nums("at", v, 2)?;
-            Some([a[0] * UNIT, a[1] * UNIT])
-        }
+        Some(V::Id(id)) if id == "free" => None,
+        _ => root.get("at").map(|_| place_xy(root, "at")).transpose()?,
     };
     p.rotate = match value(root, "rotate") {
         None => [0.0; 3],
@@ -879,12 +933,13 @@ fn test_print(root: &lang::Root) -> Result<TestPrint, Diag> {
 }
 
 const EDIT_ROOTS: &[RootFn] = &[
+    RootFn { name: "arrange", args: &["gap"], model: false },
     RootFn { name: "settings", args: &["values"], model: false },
     RootFn { name: "measure", args: &["points", "kind", "name"], model: false },
     RootFn { name: "test_print", args: &["name", "instance", "object", "link", "at", "size", "turn", "pose", "on", "brim"], model: false },
     RootFn { name: "script", args: &["file", "name", "params"], model: false },
     RootFn { name: "color", args: &["name", "rgb", "at", "material"], model: false },
-    RootFn { name: "place", args: &["instance", "object", "link", "at", "rotate", "scale", "drop", "name", "color", "paint", "print", "show", "hidden", "settings", "supports"], model: false },
+    RootFn { name: "place", args: &["instance", "object", "link", "at", "rotate", "scale", "drop", "name", "color", "paint", "print", "show", "hidden", "settings", "supports", "center", "corner"], model: false },
     RootFn { name: "params", args: &["instance", "values"], model: false },
     RootFn { name: "remove", args: &["instance"], model: false },
     RootFn { name: "rename", args: &["color", "to"], model: false },
@@ -921,10 +976,15 @@ pub fn changes(text: &str) -> Result<Vec<crate::Change>, Vec<Diag>> {
                     }
                 }
                 "place" => {
+                    if ["at", "center", "corner"].iter().filter(|key| root.get(key).is_some()).count() > 1 {
+                        return Err(diag(root.loc, "place: use one of at, center or corner"));
+                    }
                     let p = placement(root)?;
                     for (key, _) in &root.args {
                         let arg = match key.as_str() {
                             "at" => PlaceArg::At(p.at),
+                            "center" => PlaceArg::Center(place_xy(root, key)?),
+                            "corner" => PlaceArg::Corner(place_xy(root, key)?),
                             "rotate" => PlaceArg::Rotate(p.rotate),
                             "scale" => PlaceArg::Scale(p.scale),
                             "drop" => PlaceArg::Drop(p.drop),
@@ -946,6 +1006,7 @@ pub fn changes(text: &str) -> Result<Vec<crate::Change>, Vec<Diag>> {
                     let t = test_print(root)?;
                     out.push(Change::TestPrint { name: t.name.clone(), set: Some(t) });
                 }
+                "arrange" => out.push(Change::ArrangeGap(root.get("gap").map(|_| arrange_gap(root)).transpose()?)),
                 "color" => {
                     let c = color_def(root)?;
                     out.push(Change::Color { name: c.name.clone(), set: Some(c) });
@@ -1029,11 +1090,22 @@ fn settings_text(settings: &[(String, String)]) -> String {
 
 /// Write a project. `unit` says how an instance's parameter is written (its script's literal).
 pub fn write(project: &Project, unit: &dyn Fn(&str, &str) -> Unit) -> String {
-    let mut out = String::from("// A Fab project: object scripts placed on the plate.\nuse mod.fab.*\n\n");
+    let mut out = String::from("// A Fab project: object scripts placed on the plate.\n");
+    for import in project.imports.iter() {
+        out.push_str(import);
+        out.push('\n');
+    }
+    out.push('\n');
+    // With selective imports the generated project calls may need their module path.
+    let fab = if project.imports.iter().any(|u| u == DEFAULT_IMPORT) { "" } else { "mod.fab." };
+    if let Some(gap) = project.arrange_gap {
+        out.push_str(&format!("{fab}arrange(gap: {gap}mm)\n\n"));
+    }
     if !project.settings.is_empty() {
-        out.push_str(&format!("settings({})\n\n", settings_text(&project.settings)));
+        out.push_str(&format!("{fab}settings({})\n\n", settings_text(&project.settings)));
     }
     for c in &project.colors {
+        out.push_str(fab);
         out.push_str(&color_text(c));
         out.push('\n');
     }
@@ -1041,7 +1113,7 @@ pub fn write(project: &Project, unit: &dyn Fn(&str, &str) -> Unit) -> String {
         out.push('\n');
     }
     for s in &project.scripts {
-        out.push_str(&format!("script({}", quote(&s.file)));
+        out.push_str(&format!("{fab}script({}", quote(&s.file)));
         if s.name != stem(&s.file) {
             out.push_str(&format!(", name: {}", quote(&s.name)));
         }
@@ -1115,11 +1187,11 @@ pub fn write(project: &Project, unit: &dyn Fn(&str, &str) -> Unit) -> String {
         if !p.supports.is_empty() {
             args.push(supports_text(&p.supports));
         }
-        out.push_str(&format!("place({})\n", args.join(", ")));
+        out.push_str(&format!("{fab}place({})\n", args.join(", ")));
     }
     for m in &project.measures {
         let points = m.points.iter().map(|p| format!("[{}mm, {}mm, {}mm]", num(p[0]), num(p[1]), num(p[2]))).collect::<Vec<_>>().join(", ");
-        out.push_str(&format!("measure(points: [{points}], kind: @{}", m.kind));
+        out.push_str(&format!("{fab}measure(points: [{points}], kind: @{}", m.kind));
         if let Some(name) = &m.name {
             out.push_str(&format!(", name: {}", quote(name)));
         }
@@ -1127,7 +1199,7 @@ pub fn write(project: &Project, unit: &dyn Fn(&str, &str) -> Unit) -> String {
     }
     for t in &project.test_prints {
         let three = |v: [f64; 3]| format!("[{}mm, {}mm, {}mm]", num(v[0]), num(v[1]), num(v[2]));
-        out.push_str(&format!("test_print({}, instance: {}, object: {}", quote(&t.name), quote(&t.instance), quote(&t.object)));
+        out.push_str(&format!("{fab}test_print({}, instance: {}, object: {}", quote(&t.name), quote(&t.instance), quote(&t.object)));
         if t.link > 0 {
             out.push_str(&format!(", link: {}", t.link));
         }
@@ -1154,6 +1226,10 @@ pub fn write(project: &Project, unit: &dyn Fn(&str, &str) -> Unit) -> String {
 /// The strokes files a script reads, from `dir` (one missing: its layer paints nothing until
 /// the brush makes it).
 pub fn load_strokes(dir: &Path, source: &str, out: &mut BTreeMap<String, Arc<fab_paint_field::Strokes>>) -> Result<(), String> {
+    load_strokes_recording(dir, source, out, &mut |_, _| {})
+}
+
+fn load_strokes_recording(dir: &Path, source: &str, out: &mut BTreeMap<String, Arc<fab_paint_field::Strokes>>, record: &mut dyn FnMut(&str, &[u8])) -> Result<(), String> {
     for f in crate::program::strokes_files(source) {
         script_file_name(&f)?;
         if out.contains_key(&f) {
@@ -1161,6 +1237,7 @@ pub fn load_strokes(dir: &Path, source: &str, out: &mut BTreeMap<String, Arc<fab
         }
         if let Ok(bytes) = std::fs::read(dir.join(&f)) {
             let log = fab_paint_field::Strokes::from_bytes(&bytes).map_err(|e| format!("{}: {e}", dir.join(&f).display()))?;
+            record(&f, &bytes);
             out.insert(f, Arc::new(log));
         }
     }
@@ -1171,6 +1248,11 @@ pub fn load_strokes(dir: &Path, source: &str, out: &mut BTreeMap<String, Arc<fab
 /// files they read.
 #[allow(clippy::type_complexity)]
 pub fn load_scripts(project_path: &Path, project: &Project) -> Result<(BTreeMap<String, String>, BTreeMap<String, Arc<fab_paint_field::Strokes>>), String> {
+    load_scripts_recording(project_path, project, &mut |_, _| {})
+}
+
+#[allow(clippy::type_complexity)]
+fn load_scripts_recording(project_path: &Path, project: &Project, record: &mut dyn FnMut(&str, &[u8])) -> Result<(BTreeMap<String, String>, BTreeMap<String, Arc<fab_paint_field::Strokes>>), String> {
     let dir = project_path.parent().unwrap_or(Path::new("."));
     let mut out = BTreeMap::new();
     let mut strokes = BTreeMap::new();
@@ -1190,7 +1272,7 @@ pub fn load_scripts(project_path: &Path, project: &Project) -> Result<(BTreeMap<
                 }
             }
         }
-        load_strokes(dir, &text, &mut strokes)?;
+        load_strokes_recording(dir, &text, &mut strokes, record)?;
         out.insert(s.file.clone(), text);
     }
     Ok((out, strokes))
@@ -1199,12 +1281,27 @@ pub fn load_scripts(project_path: &Path, project: &Project) -> Result<(BTreeMap<
 /// Open a project file: its text, the scripts it references and the paint files they read
 /// (beside it), its meshes and their painted leaves.
 pub fn load(path: &Path, env: &ScriptEnv) -> Result<crate::FabModel, String> {
+    load_with_env(path, |_, _| Ok((env.clone(), ()))).map(|(model, ())| model)
+}
+
+/// Open the same project with its own board inputs before any object script compiles.
+/// The caller can keep the evaluated electronics that supplied those inputs.
+pub fn load_with_env<T>(path: &Path, env_for: impl FnOnce(&crate::Docs, &crate::ElecAssets) -> Result<(ScriptEnv, T), String>)
+    -> Result<(crate::FabModel, T), String>
+{
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let project = parse(&text).map_err(|d| d.iter().map(|d| format!("{}:{d}", path.display())).collect::<Vec<_>>().join("\n"))?;
-    let (scripts, strokes) = load_scripts(path, &project)?;
+    let mut files = BTreeMap::new();
+    let (scripts, strokes) = load_scripts_recording(path, &project, &mut |name, bytes| {
+        files.insert(name.to_owned(), Arc::from(bytes));
+    })?;
+    files.extend(scripts.iter().map(|(n, text)| (n.clone(), Arc::from(text.as_bytes()))));
     let file = path.file_name().and_then(|s| s.to_str()).unwrap_or("model");
     let name = file.strip_suffix(&format!(".{EXTENSION}")).unwrap_or(file);
-    let (assets, facets) = load_meshes(path)?;
+    files.insert(file.to_owned(), Arc::from(text.as_bytes()));
+    let (assets, facets) = load_meshes_recording(path, &mut |mesh, bytes| {
+        files.insert(format!("{name}.meshes/{mesh}"), bytes);
+    })?;
     let dir = path.parent().unwrap_or(Path::new("."));
     let shapes = load_grown(dir, &scripts);
     let mut pictures = crate::picture::Pictures::new();
@@ -1212,7 +1309,20 @@ pub fn load(path: &Path, env: &ScriptEnv) -> Result<crate::FabModel, String> {
         crate::picture::load(dir, text, &mut pictures)?;
     }
     let (docs, elec_assets, memory) = load_elec(path)?;
-    let mut model = crate::FabModel::load_with_assets(name, &text, scripts, strokes, Arc::new(assets), Arc::new(facets), Arc::new(pictures), env.clone()).map_err(|f| f.to_string())?;
+    for (file, picture) in &pictures {
+        files.insert(file.clone(), Arc::from(picture.bytes.as_slice()));
+    }
+    for (script, part, stored, _) in &shapes {
+        files.insert(crate::grown::file_name(script, part), stored.bytes.clone());
+    }
+    for (file, text) in &docs {
+        files.insert(format!("{name}.elec/{file}"), Arc::from(text.as_bytes()));
+    }
+    for (file, bytes) in elec_assets.iter().chain(&memory) {
+        files.insert(format!("{name}.elec/{file}"), bytes.clone());
+    }
+    let (env, state) = env_for(&docs, &elec_assets)?;
+    let mut model = crate::FabModel::load_with_assets(name, &text, scripts, strokes, Arc::new(assets), Arc::new(facets), Arc::new(pictures), env).map_err(|f| f.to_string())?;
     if !docs.is_empty() {
         model.set_docs(Arc::new(docs));
     }
@@ -1226,7 +1336,8 @@ pub fn load(path: &Path, env: &ScriptEnv) -> Result<crate::FabModel, String> {
         model.set_grown(&file, &part, Some(Arc::new(grid)));
         model.set_stored(&file, &part, Some(Arc::new(stored)));
     }
-    Ok(model)
+    model.opened_files = Some(crate::LoadedProject { manifest: file.to_owned(), files });
+    Ok((model, state))
 }
 
 /// The grown shapes kept beside the scripts. One that does not read is as none: its part grows.
@@ -1653,6 +1764,10 @@ pub fn save_meshes(project: &Path, assets: &Assets, facets: &FacetAssets) -> Res
 
 /// The meshes and painted leaves beside a project, read together (no folder: none).
 pub fn load_meshes(project: &Path) -> Result<(Assets, FacetAssets), String> {
+    load_meshes_recording(project, &mut |_, _| {})
+}
+
+fn load_meshes_recording(project: &Path, record: &mut dyn FnMut(&str, Arc<[u8]>)) -> Result<(Assets, FacetAssets), String> {
     let dir = meshes_dir(project);
     let mut out = Assets::new();
     let mut facets = FacetAssets::new();
@@ -1672,6 +1787,7 @@ pub fn load_meshes(project: &Path) -> Result<(Assets, FacetAssets), String> {
             let data = facets_of_bytes(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
             facets.insert(name, Arc::new(data));
         }
+        if let Some(file) = path.file_name().and_then(|n| n.to_str()) { record(file, bytes.into()); }
     }
     Ok((out, facets))
 }

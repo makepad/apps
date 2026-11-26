@@ -46,6 +46,19 @@ pub const PARAMS_VERSION: u32 = 1;
 pub const MODE_NAMES: &[&str] = &["sky", "studio"];
 /// Accepted values of `SunParams::mode`; the first is the fallback.
 pub const SUN_MODE_NAMES: &[&str] = &["time", "manual"];
+/// `AtmosphereParams::aerosol`: the haze's kind (atmosphere.rs, `Aerosol`). Continental is the calibrated default.
+pub const AEROSOL_NAMES: &[&str] = &["continental", "maritime", "urban", "desert"];
+/// What clamp() keeps of `AtmosphereParams::haze_top_m`, in metres: a shallow morning layer to a desert
+/// afternoon's. The panel's slider and the assistant's schema read it from here (D17).
+pub const HAZE_TOP_RANGE_M: (f32, f32) = (300.0, 3000.0);
+/// The layer's top when the panel turns it on, and where clamp() puts a NaN one: a fair afternoon's over land.
+pub const HAZE_TOP_DEFAULT_M: f32 = 1500.0;
+/// `AtmosphereParams::viewer_height_m`: the viewer's height over the ground, metres: a person on a plain to an
+/// airliner's cruise and above it.
+pub const VIEWER_HEIGHT_RANGE: (f32, f32) = (1.0, 20_000.0);
+/// The viewer's height the clear sky was calibrated at (atmosphere.rs, VIEWER_HEIGHT): what None stands for, and
+/// where clamp() puts a NaN height.
+pub const VIEWER_HEIGHT_DEFAULT: f32 = 200.0;
 /// Accepted values of `LightParams::shape`; the first is the fallback. Phase 1b
 /// added polygon, stroke and scrim, which the shape core draws (hdri/shape.rs).
 /// Plan P2 added pattern, an SVG pattern of tubes and panels on a 3D face (pattern.rs).
@@ -73,7 +86,7 @@ pub const ROAD_LANES_RANGE: (u32, u32) = (1, 8);
 /// `ModifierParams::kind`: what a light's face looks like (modifier.rs). A
 /// window is a template (a gobo filled with sky), no pattern of its own.
 pub const MODIFIER_KIND_NAMES: &[&str] = &[
-    "none", "softbox", "strip", "octabox", "umbrella", "silver_umbrella", "beauty_dish", "ring_light", "fresnel", "bulb", "led_panel", "gradient", "street_lamp", "window",
+    "none", "softbox", "strip", "octabox", "umbrella", "silver_umbrella", "beauty_dish", "ring_light", "fresnel", "bulb", "led_panel", "gradient", "street_lamp", "window", "reflector", "fluorescent", "candle",
 ];
 /// Accepted values of `WeatherParams::kind`; the first is the fallback. The
 /// kinds follow apps/weather's SkyKind classes (clear, overcast, rain, snow,
@@ -146,6 +159,13 @@ pub const AURORA_WIDTH_RANGE: (f32, f32) = (10.0, 180.0);
 pub const AURORA_FOLDS_RANGE: (f32, f32) = (0.0, 1.0);
 /// What clamp() keeps of `AuroraParams::rays`.
 pub const AURORA_RAYS_RANGE: (f32, f32) = (0.0, 1.0);
+/// What clamp() keeps of `LightPollutionParams::strength` (hundreds of thousands of people: 1 is a town of 100 000,
+/// 0.01 a village of 1000; the On box turns it off).
+pub const LIGHT_POLLUTION_STRENGTH_RANGE: (f32, f32) = (0.01, 100.0);
+/// What clamp() keeps of `LightPollutionParams::distance_km`.
+pub const LIGHT_POLLUTION_DISTANCE_RANGE: (f32, f32) = (1.0, 300.0);
+/// What clamp() keeps of `LightPollutionParams::lamps` (0 sodium .. 1 white LED).
+pub const LIGHT_POLLUTION_LAMPS_RANGE: (f32, f32) = (0.0, 1.0);
 /// Accepted values of `AuroraParams::color`; the first is the fallback.
 pub const AURORA_COLOR_NAMES: &[&str] = &["classic", "magenta tops", "storm", "custom"];
 /// The colour presets' line amounts (green 557.7 nm, red 630.0 nm, nitrogen: 427.8 nm plus the first positive
@@ -211,6 +231,10 @@ macro_rules! clamped_copy {
 #[path = "cloud_params.rs"]
 mod cloud_params;
 pub use cloud_params::*;
+// A candle light's block (modifier kind "candle"), a child for the same reason.
+#[path = "candle_params.rs"]
+mod candle_params;
+pub use candle_params::*;
 
 clamped_copy!(
     SunParams,
@@ -225,10 +249,12 @@ clamped_copy!(
     WeatherParams,
     StudioParams,
     RoomParams,
+    RoomWindow,
     RoadParams,
     ModifierParams,
     SpaceParams,
     PatternParams,
+    GlowParams,
     LightParams,
     PolygonParams,
     StrokeParams,
@@ -411,6 +437,26 @@ pub struct AtmosphereParams {
     pub ozone: f32,
     /// Linear 0..=1, the ground below the horizon.
     pub ground_color: [f32; 3],
+    /// 0..=20, the stratosphere's thin haze (the Junge layer, 15-25 km); 1 = a quiet year's (a vertical optical
+    /// depth of 0.008), 10-20 = the year after a large volcanic eruption. Lit by a sun that has set for the air
+    /// below it, it makes the glow over the sunset point and the purple light of civil twilight. None is 1 (files
+    /// saved before it).
+    pub stratosphere: Option<f32>,
+    /// The haze's kind (`AEROSOL_NAMES`): continental (inland, the calibrated default), maritime (sea salt: whiter,
+    /// a stronger glow round the sun), urban (soot: greyer, it absorbs), desert (dust: yellow, it absorbs blue).
+    /// None is continental (files saved before it).
+    pub aerosol: Option<String>,
+    /// The top of the haze's boundary layer (`HAZE_TOP_RANGE_M`, metres, the mixing height): the haze even from the
+    /// ground up to it and thin over it, the free troposphere's, its optical depth still the Haze control's. A low top
+    /// packs the haze near the ground: a whiter horizon band under a cleaner sky, and seen from above, the layer's top
+    /// as a line. None: no layer, the haze thins out evenly with height (a 1.2 km scale height), the calibrated sky.
+    pub haze_top_m: Option<f32>,
+    /// The viewer's height over the ground, metres (VIEWER_HEIGHT_RANGE): the sky is seen from it, its horizon dips
+    /// below level by the ground's curve (1.4 deg from 2000 m) and the ground below it is seen through the air
+    /// between, so it fades into the haze with its distance (aerial perspective); a floor stands its eye below the
+    /// viewer and is seen through the air over its own distance. None is the sky as it was: 200 m, the ground below
+    /// the horizon blended into the horizon's haze over 3 degrees (files saved before it).
+    pub viewer_height_m: Option<f32>,
 }
 
 #[derive(Clone, Debug, PartialEq, SerJson, DeJson)]
@@ -495,6 +541,11 @@ pub struct WeatherParams {
     pub lightning: bool,
     /// Seed of the bolt, the virga and the puddles.
     pub seed: u32,
+    /// The rain breaks the water's mirror (hdri/rain_water.rs; the weather lane, 2026-11-09): each drop leaves a ring of
+    /// fine waves, drawn by the eye where a texel resolves them, and the rain's slopes spread the mirror of the puddles,
+    /// the floor's lake and its sea into a sheen as the rain grows. None (files before it) as true: water under falling
+    /// rain is never calm. False: the water mirrors as calm water under any rain. Nothing without rain, nor under snow.
+    pub rain_on_water: Option<bool>,
 }
 
 impl Default for WeatherParams {
@@ -507,6 +558,7 @@ impl Default for WeatherParams {
             snow: false,
             lightning: false,
             seed: 1,
+            rain_on_water: None,
         }
     }
 }
@@ -581,7 +633,8 @@ pub struct NightParams {
     pub moon_size_deg: f32,
     /// 0..=10.
     pub moon_brightness: f32,
-    /// Linear 0..=1, airglow colour.
+    /// Linear 0..=1, the night glow's colour: it tints the whole natural glow (its lines and continuum) channel by
+    /// channel against the default [0.02, 0.03, 0.06], the physical glow; black turns it off.
     pub glow_color: [f32; 3],
     /// 0..=10.
     pub glow_strength: f32,
@@ -591,6 +644,24 @@ pub struct NightParams {
     pub nebulas: Option<NebulaParams>,
     /// Plan hdri-7 §4: the aurora. None or off draws nothing.
     pub aurora: Option<AuroraParams>,
+    /// A town's glow over the horizon (light pollution). None or off draws nothing.
+    pub light_pollution: Option<LightPollutionParams>,
+}
+
+/// A town's light scattered in the night air: a dome over the horizon toward it, Garstang-style (1986). None, or Some
+/// with `on` false, draws nothing.
+#[derive(Clone, Debug, PartialEq, SerJson, DeJson)]
+pub struct LightPollutionParams {
+    pub on: bool,
+    /// The town's size in hundreds of thousands of people, 0.01..=100 (1: a town of 100 000; its glow 45 degrees up
+    /// toward it follows Walker's law, 0.01 P D^-2.5 of the natural sky).
+    pub strength: f32,
+    /// Where the town lies, degrees clockwise from north, wrapped to 0..360.
+    pub azimuth_deg: f32,
+    /// How far away it is, km, 1..=300: near, the glow climbs high; far, it is a low dome.
+    pub distance_km: f32,
+    /// The street lamps, 0 high-pressure sodium (orange) .. 1 white LED (bluer, and scattered higher).
+    pub lamps: f32,
 }
 
 /// Plan hdri-7 §2: the Milky Way's band. None, or Some with `on` false, draws nothing: the map is the base's.
@@ -745,7 +816,496 @@ pub struct RoomParams {
     pub open_walls: Option<String>,
     /// Plan P3: a road painted on the floor (`RoadParams`); None is the plain floor.
     pub road: Option<RoadParams>,
+    /// The sides that stand open, wall by wall and the floor (`RoomSides`): in
+    /// place of `open_walls`, which a file saved before keeps and `open()`
+    /// still reads while this is None. An open floor stands the room on the
+    /// scene's ground (the Floor entry's kind, its road and what lies beside
+    /// it) in place of its own floor colour: a tunnel's or a bridge's floor.
+    pub sides: Option<RoomSides>,
+    /// Real windows: openings in the closed walls (`RoomWindow`) the outside
+    /// shows through and lights the room through, unlike a window light (a
+    /// fake window: an area light with panes). None or empty: no real window.
+    pub windows: Option<Vec<RoomWindow>>,
+    /// What the floor, the walls and the ceiling are made of (`ROOM_MATERIAL_NAMES`, room_material.rs): a pattern
+    /// round the surface's own colour above, whose mean is that colour. None (or "none") is the flat colour.
+    pub floor_material: Option<String>,
+    pub wall_material: Option<String>,
+    pub ceiling_material: Option<String>,
+    /// 0..=1: how worn the room's materials are (grime along the floor's seams, peeling paint, stains, oil; 0 new).
+    /// None: ROOM_WEAR_DEFAULT.
+    pub wear: Option<f32>,
 }
+
+/// `RoomParams::floor_material`, `wall_material`, `ceiling_material`: what a surface is made of; "none" is its flat
+/// colour. Any surface takes any of them (a brick floor, a plank wall), though each is drawn for its usual place.
+pub const ROOM_MATERIAL_NAMES: &[&str] = &[
+    "none", "plaster", "brick", "painted_brick", "form_concrete", "polished_concrete", "terrazzo", "epoxy", "planks", "herringbone", "chevron",
+    "basket_weave",
+];
+/// `RoomParams::wear`: what None stands for, and the range clamp() keeps.
+pub const ROOM_WEAR_DEFAULT: f32 = 0.3;
+pub const ROOM_WEAR_RANGE: (f32, f32) = (0.0, 1.0);
+
+/// `RoomWindow::wall`: the walls a real window can stand in, as `RoomParams::open`
+/// orders them (north is the back wall at azimuth 0, south the one behind the
+/// camera, east at azimuth 90, west at 270).
+pub const ROOM_WALL_NAMES: &[&str] = &["north", "south", "east", "west"];
+
+/// Which sides of a room stand open (`RoomParams::sides`): each wall, and the
+/// floor (the room then stands on the scene's ground).
+#[derive(Clone, Copy, Debug, Default, PartialEq, SerJson, DeJson)]
+pub struct RoomSides {
+    pub north: bool,
+    pub south: bool,
+    pub east: bool,
+    pub west: bool,
+    pub floor: bool,
+}
+
+/// A real window (`RoomParams::windows`): a rectangle open in one of the
+/// room's closed walls, its frame and its bars (the panes' mullions) left as
+/// wall. The outside shows through its panes and lights the room through them.
+#[derive(Clone, Debug, PartialEq, SerJson, DeJson)]
+pub struct RoomWindow {
+    /// The wall it stands in (`ROOM_WALL_NAMES`).
+    pub wall: String,
+    /// -30..=30 m: its middle along the wall from the wall's middle (toward
+    /// the east on the north and south walls, toward the north on the east and
+    /// west walls).
+    pub along_m: f32,
+    /// 0..=19 m: its sill above the floor; 0.2..=60 m wide, 0.2..=20 m high
+    /// (held inside its wall).
+    pub sill_m: f32,
+    pub width_m: f32,
+    pub height_m: f32,
+    /// 1..=12 panes across and up, the frame and the bars between them
+    /// 0..=0.5 m wide.
+    pub panes_x: u32,
+    pub panes_y: u32,
+    pub frame_m: f32,
+    /// 0..=1 m: the wall's thickness round the window, its reveal (the jambs,
+    /// the head and the sill as the wall's depth), the frame set into it.
+    /// None: ROOM_WINDOW_DEPTH_M.
+    pub depth_m: Option<f32>,
+    /// 0..=1: the glass in its panes, 1 clear glass that mirrors the room at
+    /// its Fresnel share (4 % straight on), 0 an open hole. None: 1.
+    pub glass: Option<f32>,
+    /// The window light (a fake window) it was made real from, by name, so it
+    /// can be made fake again (the light comes back on); None for one of its own.
+    pub from_light: Option<String>,
+    /// How its panes are held (`WINDOW_STYLE_NAMES`): "grid" one frame and
+    /// even bars (what a window had before styles, and None), "sash" two
+    /// sliding sashes (the upper of `panes_x` x `panes_y`, the lower of
+    /// `lower_panes_x` x `lower_panes_y`) meeting on a thicker rail, "casement"
+    /// side-hinged leaves (`leaves`, two by default) on a mullion, each of
+    /// `panes_x` x `panes_y`, "steel" a thin steel frame of many tall panes.
+    /// The fields after `from_light` are all None in a file saved before
+    /// them, which then draws as before.
+    pub style: Option<String>,
+    /// Its head (`WINDOW_TOP_NAMES`): "flat" (None), a "segmental" arch
+    /// `rise_m` high or a "round" one (a half circle). The arch cuts the
+    /// opening, its reveal and its frame along the curve.
+    pub top: Option<String>,
+    /// 0.02..=10 m: a segmental arch's rise over its springing, held under half
+    /// the width. None: WINDOW_RISE_DEFAULT_M.
+    pub rise_m: Option<f32>,
+    /// 1..=12: a sash window's lower sash panes across and up. None: one pane.
+    pub lower_panes_x: Option<u32>,
+    pub lower_panes_y: Option<u32>,
+    /// What stands round it on the wall's room face (`WINDOW_SURROUND_NAMES`):
+    /// "none" (None), "plain" (a projecting sill and a lintel band) or
+    /// "classical" (pilasters with brackets under a cornice cap, a sill and,
+    /// under a window, a panelled apron).
+    pub surround: Option<String>,
+    /// 0..=0.5 m: how far its sill and its lintel band (or cornice) stand out
+    /// of the wall into the room. None: WINDOW_SILL_OUT_M and WINDOW_LINTEL_OUT_M.
+    pub sill_out_m: Option<f32>,
+    pub lintel_out_m: Option<f32>,
+    /// It is a door: its opening runs down to the floor (its sill is 0
+    /// whatever `sill_m` says), closed by `leaves` (1..=2) of the `leaf` kind
+    /// (`DOOR_LEAF_NAMES`, "panelled" when None), with a glazed transom
+    /// `transom_m` (0..=2 m, None 0: none) high over them.
+    pub door: Option<bool>,
+    pub leaves: Option<u32>,
+    pub leaf: Option<String>,
+    pub transom_m: Option<f32>,
+    /// What the rules pick within the kit's ranges (the surround's sizes, a
+    /// door's panels): windows of one seed are one building's set. None: 0.
+    pub seed: Option<u32>,
+    /// Albedo 0..=1 per channel: the frame's and the bars' paint (None: the
+    /// style's, white, a steel window's grey), the surround's (None: the
+    /// wall's) and a door's leaves (None: the leaf's, the frame's paint for a
+    /// panelled or glazed leaf).
+    pub frame_color: Option<[f32; 3]>,
+    pub surround_color: Option<[f32; 3]>,
+    pub door_color: Option<[f32; 3]>,
+}
+
+impl Default for RoomWindow {
+    /// A 3 m wide, 2 m high window of 3 x 2 panes in the back wall, its sill
+    /// at 0.9 m, with an 8 cm frame and bars.
+    fn default() -> Self {
+        RoomWindow {
+            wall: "north".to_string(),
+            along_m: 0.0,
+            sill_m: 0.9,
+            width_m: 3.0,
+            height_m: 2.0,
+            panes_x: 3,
+            panes_y: 2,
+            frame_m: 0.08,
+            depth_m: None,
+            glass: None,
+            from_light: None,
+            style: None,
+            top: None,
+            rise_m: None,
+            lower_panes_x: None,
+            lower_panes_y: None,
+            surround: None,
+            sill_out_m: None,
+            lintel_out_m: None,
+            door: None,
+            leaves: None,
+            leaf: None,
+            transom_m: None,
+            seed: None,
+            frame_color: None,
+            surround_color: None,
+            door_color: None,
+        }
+    }
+}
+
+/// `RoomWindow::depth_m` when it has none: a brick wall's 25 cm.
+pub const ROOM_WINDOW_DEPTH_M: f32 = 0.25;
+
+/// `RoomWindow::style`, `top`, `surround` and `leaf`, in the panel's order.
+pub const WINDOW_STYLE_NAMES: &[&str] = &["grid", "sash", "casement", "steel"];
+pub const WINDOW_TOP_NAMES: &[&str] = &["flat", "segmental", "round"];
+pub const WINDOW_SURROUND_NAMES: &[&str] = &["none", "plain", "classical"];
+pub const DOOR_LEAF_NAMES: &[&str] = &["panelled", "glazed", "flush", "shutter"];
+/// The building kits `RoomWindow::with_kit` picks a consistent set from.
+pub const WINDOW_KIT_NAMES: &[&str] = &["victorian", "factory", "modern"];
+
+/// `RoomWindow::rise_m`, `sill_out_m`, `lintel_out_m` when None, metres.
+pub const WINDOW_RISE_DEFAULT_M: f32 = 0.4;
+pub const WINDOW_SILL_OUT_M: f32 = 0.06;
+pub const WINDOW_LINTEL_OUT_M: f32 = 0.05;
+/// The ranges clamp() holds them to.
+pub const WINDOW_RISE_RANGE: (f32, f32) = (0.02, 10.0);
+pub const WINDOW_OUT_RANGE: (f32, f32) = (0.0, 0.5);
+pub const WINDOW_TRANSOM_RANGE: (f32, f32) = (0.0, 2.0);
+pub const DOOR_LEAVES_RANGE: (u32, u32) = (1, 2);
+
+/// Typed view of `RoomWindow::style`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowStyle {
+    Grid,
+    Sash,
+    Casement,
+    Steel,
+}
+
+/// Typed view of `RoomWindow::top`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowTop {
+    Flat,
+    Segmental,
+    Round,
+}
+
+/// Typed view of `RoomWindow::surround`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowSurround {
+    None,
+    Plain,
+    Classical,
+}
+
+/// Typed view of `RoomWindow::leaf`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DoorLeaf {
+    Panelled,
+    Glazed,
+    Flush,
+    Shutter,
+}
+
+/// A building's set of windows and doors (`RoomWindow::with_kit`): after
+/// the two facade kits the owner chose (an apartment block's sash windows
+/// and panelled doors in a black classical surround; a factory's arched
+/// steel windows, flush steel doors and a roller shutter in concrete) and a
+/// modern one (white casements and a glazed door).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowKit {
+    Victorian,
+    Factory,
+    Modern,
+}
+
+impl WindowKit {
+    /// A kit by name (`WINDOW_KIT_NAMES`, read loosely).
+    pub fn named(name: &str) -> Option<WindowKit> {
+        [WindowKit::Victorian, WindowKit::Factory, WindowKit::Modern].into_iter().zip(WINDOW_KIT_NAMES).find(|(_, n)| is_choice(name, n)).map(|(kit, _)| kit)
+    }
+}
+
+/// A seed's value at `salt` in 0..1 (the same for the same seed and salt).
+pub fn window_rule(seed: u32, salt: u32) -> f32 {
+    let mut h = seed.wrapping_mul(0x9E37_79B1) ^ salt.wrapping_mul(0x85EB_CA77);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2C1B_3C6D);
+    h ^= h >> 12;
+    h = h.wrapping_mul(0x297A_2D39);
+    h ^= h >> 15;
+    (h >> 8) as f32 / (1u32 << 24) as f32
+}
+
+/// `lo..hi` at the seed's value for `salt`.
+fn rule_in(seed: u32, salt: u32, lo: f32, hi: f32) -> f32 {
+    lo + (hi - lo) * window_rule(seed, salt)
+}
+
+impl RoomWindow {
+    fn clamp_fields(&mut self, prefix: &str, f: &mut Fixes) {
+        let d = RoomWindow::default();
+        f.choice(prefix, "wall", &mut self.wall, ROOM_WALL_NAMES);
+        f.range(prefix, "along_m", &mut self.along_m, -30.0, 30.0, d.along_m);
+        f.range(prefix, "sill_m", &mut self.sill_m, 0.0, 19.0, d.sill_m);
+        f.range(prefix, "width_m", &mut self.width_m, 0.2, 60.0, d.width_m);
+        f.range(prefix, "height_m", &mut self.height_m, 0.2, 20.0, d.height_m);
+        f.int(prefix, "panes_x", &mut self.panes_x, 1, 12);
+        f.int(prefix, "panes_y", &mut self.panes_y, 1, 12);
+        f.range(prefix, "frame_m", &mut self.frame_m, 0.0, 0.5, d.frame_m);
+        if let Some(depth) = self.depth_m.as_mut() {
+            f.range(prefix, "depth_m", depth, 0.0, 1.0, ROOM_WINDOW_DEPTH_M);
+        }
+        if let Some(glass) = self.glass.as_mut() {
+            f.range(prefix, "glass", glass, 0.0, 1.0, 1.0);
+        }
+        if let Some(style) = self.style.as_mut() {
+            f.choice(prefix, "style", style, WINDOW_STYLE_NAMES);
+        }
+        if let Some(top) = self.top.as_mut() {
+            f.choice(prefix, "top", top, WINDOW_TOP_NAMES);
+        }
+        if let Some(rise) = self.rise_m.as_mut() {
+            f.range(prefix, "rise_m", rise, WINDOW_RISE_RANGE.0, WINDOW_RISE_RANGE.1, WINDOW_RISE_DEFAULT_M);
+        }
+        if let Some(n) = self.lower_panes_x.as_mut() {
+            f.int(prefix, "lower_panes_x", n, 1, 12);
+        }
+        if let Some(n) = self.lower_panes_y.as_mut() {
+            f.int(prefix, "lower_panes_y", n, 1, 12);
+        }
+        if let Some(surround) = self.surround.as_mut() {
+            f.choice(prefix, "surround", surround, WINDOW_SURROUND_NAMES);
+        }
+        if let Some(out) = self.sill_out_m.as_mut() {
+            f.range(prefix, "sill_out_m", out, WINDOW_OUT_RANGE.0, WINDOW_OUT_RANGE.1, WINDOW_SILL_OUT_M);
+        }
+        if let Some(out) = self.lintel_out_m.as_mut() {
+            f.range(prefix, "lintel_out_m", out, WINDOW_OUT_RANGE.0, WINDOW_OUT_RANGE.1, WINDOW_LINTEL_OUT_M);
+        }
+        if let Some(n) = self.leaves.as_mut() {
+            f.int(prefix, "leaves", n, DOOR_LEAVES_RANGE.0, DOOR_LEAVES_RANGE.1);
+        }
+        if let Some(leaf) = self.leaf.as_mut() {
+            f.choice(prefix, "leaf", leaf, DOOR_LEAF_NAMES);
+        }
+        if let Some(transom) = self.transom_m.as_mut() {
+            f.range(prefix, "transom_m", transom, WINDOW_TRANSOM_RANGE.0, WINDOW_TRANSOM_RANGE.1, 0.0);
+        }
+        if let Some(c) = self.frame_color.as_mut() {
+            f.color(prefix, "frame_color", c, 1.0, WINDOW_WHITE);
+        }
+        if let Some(c) = self.surround_color.as_mut() {
+            f.color(prefix, "surround_color", c, 1.0, WINDOW_WHITE);
+        }
+        if let Some(c) = self.door_color.as_mut() {
+            f.color(prefix, "door_color", c, 1.0, WINDOW_WHITE);
+        }
+    }
+
+    /// Its wall's index in `ROOM_WALL_NAMES` (`RoomParams::open`'s order), read loosely.
+    pub fn wall_index(&self) -> usize {
+        ROOM_WALL_NAMES.iter().position(|name| is_choice(&self.wall, name)).unwrap_or(0)
+    }
+
+    /// `style` read loosely: Grid when None or unknown.
+    pub fn style(&self) -> WindowStyle {
+        let at = self.style.as_deref().and_then(|s| WINDOW_STYLE_NAMES.iter().position(|n| is_choice(s, n))).unwrap_or(0);
+        [WindowStyle::Grid, WindowStyle::Sash, WindowStyle::Casement, WindowStyle::Steel][at]
+    }
+
+    /// `top` read loosely: Flat when None or unknown.
+    pub fn top(&self) -> WindowTop {
+        let at = self.top.as_deref().and_then(|s| WINDOW_TOP_NAMES.iter().position(|n| is_choice(s, n))).unwrap_or(0);
+        [WindowTop::Flat, WindowTop::Segmental, WindowTop::Round][at]
+    }
+
+    /// `surround` read loosely: None when None or unknown.
+    pub fn surround(&self) -> WindowSurround {
+        let at = self.surround.as_deref().and_then(|s| WINDOW_SURROUND_NAMES.iter().position(|n| is_choice(s, n))).unwrap_or(0);
+        [WindowSurround::None, WindowSurround::Plain, WindowSurround::Classical][at]
+    }
+
+    /// `leaf` read loosely: Panelled when None or unknown.
+    pub fn leaf(&self) -> DoorLeaf {
+        let at = self.leaf.as_deref().and_then(|s| DOOR_LEAF_NAMES.iter().position(|n| is_choice(s, n))).unwrap_or(0);
+        [DoorLeaf::Panelled, DoorLeaf::Glazed, DoorLeaf::Flush, DoorLeaf::Shutter][at]
+    }
+
+    /// It is a door (`door`).
+    pub fn is_door(&self) -> bool {
+        self.door == Some(true)
+    }
+
+    /// The leaves it has: a door's `leaves` (one when None), a casement's
+    /// (two when None, one on a window narrower than 80 cm), else one.
+    pub fn leaves(&self) -> u32 {
+        let default = if !self.is_door() && self.style() == WindowStyle::Casement && self.width_m >= 0.8 { 2 } else { 1 };
+        self.leaves.unwrap_or(default).clamp(DOOR_LEAVES_RANGE.0, DOOR_LEAVES_RANGE.1)
+    }
+
+    /// A segmental arch's rise (`rise_m`, WINDOW_RISE_DEFAULT_M when None).
+    pub fn rise(&self) -> f32 {
+        self.rise_m.unwrap_or(WINDOW_RISE_DEFAULT_M)
+    }
+
+    /// The glazed transom over a door's leaves, metres (0: none).
+    pub fn transom(&self) -> f32 {
+        self.transom_m.unwrap_or(0.0)
+    }
+
+    pub fn seed(&self) -> u32 {
+        self.seed.unwrap_or(0)
+    }
+
+    /// How far its sill and its lintel band stand out of the wall.
+    pub fn sill_out(&self) -> f32 {
+        self.sill_out_m.unwrap_or(WINDOW_SILL_OUT_M)
+    }
+
+    pub fn lintel_out(&self) -> f32 {
+        self.lintel_out_m.unwrap_or(WINDOW_LINTEL_OUT_M)
+    }
+
+    /// The paint of its frame and bars: `frame_color`, or its style's.
+    pub fn frame_paint(&self) -> [f32; 3] {
+        self.frame_color.unwrap_or(if self.style() == WindowStyle::Steel { WINDOW_STEEL } else { WINDOW_WHITE })
+    }
+
+    /// The paint of a door's leaves: `door_color`, or its leaf's (the frame's for a panelled or glazed one).
+    pub fn door_paint(&self) -> [f32; 3] {
+        self.door_color.unwrap_or(match self.leaf() {
+            DoorLeaf::Panelled | DoorLeaf::Glazed => self.frame_paint(),
+            DoorLeaf::Flush => WINDOW_FLUSH_STEEL,
+            DoorLeaf::Shutter => WINDOW_SHUTTER,
+        })
+    }
+
+    /// It draws as a window did before styles: a grid with a flat head,
+    /// no surround, not a door (then `room::Room` keeps its old path).
+    pub fn is_plain(&self) -> bool {
+        self.style() == WindowStyle::Grid && self.top() == WindowTop::Flat && self.surround() == WindowSurround::None && !self.is_door()
+    }
+
+    /// The window (or, `door`, the door) of `kit`'s set for `seed`, in its
+    /// place and at its size: the style, the head, the pane counts (each pane
+    /// about as big as the kit's, the same for every window of the seed), the
+    /// frame, the surround and the colours, chosen within the kit's ranges
+    /// from the seed alone, so every window and door of one seed in a room is
+    /// one building's set. A door keeps `leaves` and `leaf` when they are set.
+    pub fn with_kit(mut self, kit: WindowKit, seed: u32, door: bool) -> RoomWindow {
+        self.seed = Some(seed);
+        self.door = if door { Some(true) } else { None };
+        if door {
+            self.sill_m = 0.0;
+        }
+        let r = |salt: u32| window_rule(seed, salt);
+        let across = |pane: f32, width: f32| ((width / pane).round() as u32).clamp(1, 12);
+        match kit {
+            WindowKit::Victorian => {
+                // an upper sash of small panes about 25 cm across and two or three up over one big pane
+                self.style = Some("sash".to_string());
+                self.top = Some(if r(1) < 0.25 { "segmental" } else { "flat" }.to_string());
+                self.rise_m = Some((0.1 * self.width_m).clamp(WINDOW_RISE_RANGE.0, WINDOW_RISE_RANGE.1));
+                self.panes_x = across(rule_in(seed, 2, 0.24, 0.3), self.width_m).clamp(2, 4);
+                self.panes_y = if r(3) < 0.7 { 2 } else { 3 };
+                self.lower_panes_x = Some(1);
+                self.lower_panes_y = Some(1);
+                self.frame_m = rule_in(seed, 4, 0.055, 0.065);
+                self.surround = Some("classical".to_string());
+                self.sill_out_m = Some(rule_in(seed, 5, 0.07, 0.09));
+                self.lintel_out_m = Some(rule_in(seed, 6, 0.14, 0.18));
+                // the kit's near-black paint, now and then a deep green; the door black, green or oxblood
+                let paint = if r(7) < 0.75 { [0.1, 0.1, 0.105] } else { [0.06, 0.13, 0.095] };
+                self.frame_color = Some(paint);
+                self.surround_color = Some(paint);
+                self.door_color = Some([[0.06, 0.06, 0.065], [0.06, 0.14, 0.1], [0.3, 0.08, 0.06]][(r(8) * 3.0) as usize % 3]);
+                if door {
+                    (self.style, self.top, self.rise_m, self.lower_panes_x, self.lower_panes_y) = (None, None, None, None, None);
+                    self.leaves.get_or_insert(if self.width_m >= 1.4 { 2 } else { 1 });
+                    self.leaf.get_or_insert_with(|| "panelled".to_string());
+                    self.transom_m = Some(rule_in(seed, 9, 0.22, 0.3));
+                }
+            }
+            WindowKit::Factory => {
+                // steel panes about 22 cm across and 35 up, a segmental head, on a concrete sill under a lintel
+                self.style = Some("steel".to_string());
+                self.top = Some("segmental".to_string());
+                self.rise_m = Some((rule_in(seed, 1, 0.09, 0.13) * self.width_m).clamp(WINDOW_RISE_RANGE.0, WINDOW_RISE_RANGE.1));
+                self.panes_x = across(rule_in(seed, 2, 0.28, 0.34), self.width_m);
+                self.panes_y = across(rule_in(seed, 3, 0.42, 0.52), self.height_m);
+                self.frame_m = rule_in(seed, 4, 0.03, 0.04);
+                self.surround = Some("plain".to_string());
+                self.sill_out_m = Some(rule_in(seed, 5, 0.06, 0.09));
+                self.lintel_out_m = Some(rule_in(seed, 6, 0.04, 0.07));
+                self.frame_color = Some(WINDOW_STEEL);
+                self.surround_color = Some([0.4, 0.39, 0.37]);
+                self.door_color = None;
+                if door {
+                    (self.style, self.top, self.rise_m) = (None, None, None);
+                    self.leaves.get_or_insert(if self.width_m >= 1.3 { 2 } else { 1 });
+                    self.leaf.get_or_insert_with(|| "flush".to_string());
+                    self.door_color = Some(if self.leaf() == DoorLeaf::Shutter { WINDOW_SHUTTER } else { WINDOW_FLUSH_STEEL });
+                    self.transom_m = None;
+                }
+            }
+            WindowKit::Modern => {
+                // white casements of one pane a leaf (now and then a top light), a slim plain surround
+                self.style = Some("casement".to_string());
+                self.top = None;
+                self.panes_x = 1;
+                self.panes_y = if r(3) < 0.3 { 2 } else { 1 };
+                self.frame_m = rule_in(seed, 4, 0.065, 0.08);
+                self.surround = Some("plain".to_string());
+                self.sill_out_m = Some(rule_in(seed, 5, 0.03, 0.05));
+                self.lintel_out_m = Some(0.0);
+                self.frame_color = Some([0.86, 0.86, 0.84]);
+                self.surround_color = None;
+                self.door_color = Some(if r(8) < 0.5 { [0.86, 0.86, 0.84] } else { [0.08, 0.085, 0.09] });
+                if door {
+                    self.style = None;
+                    self.leaves.get_or_insert(1);
+                    self.leaf.get_or_insert_with(|| "glazed".to_string());
+                    self.transom_m = None;
+                }
+            }
+        }
+        self.clamped()
+    }
+}
+
+/// The paints a window's parts take when they have no colour of their own:
+/// a white frame, a steel window's grey, a flush steel door's and a roller
+/// shutter's.
+pub const WINDOW_WHITE: [f32; 3] = [0.78, 0.78, 0.76];
+pub const WINDOW_STEEL: [f32; 3] = [0.3, 0.31, 0.32];
+pub const WINDOW_FLUSH_STEEL: [f32; 3] = [0.42, 0.41, 0.37];
+pub const WINDOW_SHUTTER: [f32; 3] = [0.07, 0.075, 0.08];
 
 /// Plan P3: a road on a room's floor (`RoomParams::road`), a tunnel's: dark
 /// asphalt with lanes, solid edge lines and dashed lines between the lanes.
@@ -836,6 +1396,12 @@ impl Default for RoomParams {
             grid_spacing_m: 1.5,
             open_walls: None,
             road: None,
+            sides: None,
+            windows: None,
+            floor_material: None,
+            wall_material: None,
+            ceiling_material: None,
+            wear: None,
         }
     }
 }
@@ -866,6 +1432,47 @@ impl RoomParams {
         if let Some(road) = self.road.as_mut() {
             road.clamp_fields(&join_path(prefix, "road"), f);
         }
+        if let Some(windows) = self.windows.as_mut() {
+            for (i, window) in windows.iter_mut().enumerate() {
+                window.clamp_fields(&format!("{}[{}]", join_path(prefix, "windows"), i), f);
+            }
+        }
+        for (name, material) in [("floor_material", &mut self.floor_material), ("wall_material", &mut self.wall_material), ("ceiling_material", &mut self.ceiling_material)] {
+            if let Some(m) = material.as_mut() {
+                f.choice(prefix, name, m, ROOM_MATERIAL_NAMES);
+            }
+        }
+        if let Some(wear) = self.wear.as_mut() {
+            f.range(prefix, "wear", wear, ROOM_WEAR_RANGE.0, ROOM_WEAR_RANGE.1, ROOM_WEAR_DEFAULT);
+        }
+    }
+
+    /// The open sides as `sides` holds them, or (a file saved before it) as
+    /// `open_walls` names them, its floor closed.
+    pub fn sides(&self) -> RoomSides {
+        if let Some(sides) = self.sides {
+            return sides;
+        }
+        let [north, south, east, west] = self.open_walls_named();
+        RoomSides { north, south, east, west, floor: false }
+    }
+
+    /// The room stands on the scene's ground: its floor side is open.
+    pub fn open_floor(&self) -> bool {
+        self.sides().floor
+    }
+
+    /// Its real windows (`windows`), none when None.
+    pub fn real_windows(&self) -> &[RoomWindow] {
+        self.windows.as_deref().unwrap_or(&[])
+    }
+
+    /// The studio is hybrid (inside and outside at once): a wall or the floor
+    /// stands open, or a real window opens a wall. A window light (a fake
+    /// window) never makes it so.
+    pub fn is_hybrid(&self) -> bool {
+        let s = self.sides();
+        s.north || s.south || s.east || s.west || s.floor || !self.real_windows().is_empty()
     }
 
     /// Which walls the cove rounds: `COVE_WALL_NAMES` read loosely, 0 when
@@ -883,9 +1490,15 @@ impl RoomParams {
         }
     }
 
-    /// Which walls stand open (`open_walls` read loosely): [north, south,
-    /// east, west], the walls at azimuth 0, 180, 90 and 270.
+    /// Which walls stand open (`sides`, else `open_walls` read loosely):
+    /// [north, south, east, west], the walls at azimuth 0, 180, 90 and 270.
     pub fn open(&self) -> [bool; 4] {
+        let s = self.sides();
+        [s.north, s.south, s.east, s.west]
+    }
+
+    /// The walls `open_walls` names (a file saved before `sides`).
+    fn open_walls_named(&self) -> [bool; 4] {
         let Some(open) = self.open_walls.as_deref() else { return [false; 4] };
         let is = |name: &str| is_choice(open, name);
         let (back, front) = (is("back") || is("ends") || is("all"), is("front") || is("ends") || is("all"));
@@ -1028,6 +1641,46 @@ pub struct LightParams {
     /// (`pattern::hold_face`). Kept, not read, on another shape. Last in the
     /// struct, as `kind`.
     pub pattern: Option<PatternParams>,
+    /// A soft halo round the light's face in its own colour (`GlowParams`):
+    /// a little bloom, set per light. None, or strength 0, draws none. A
+    /// stroke lit with Add reads it; kept, not read, on the other shapes and
+    /// blends. Last in the struct, as `kind`.
+    pub glow: Option<GlowParams>,
+}
+
+/// What clamp() keeps of `GlowParams::strength` (0 is no glow).
+pub const LIGHT_GLOW_STRENGTH_RANGE: (f32, f32) = (0.0, 1.0);
+/// What clamp() keeps of `GlowParams::reach_deg`, in degrees.
+pub const LIGHT_GLOW_REACH_RANGE: (f32, f32) = (0.1, 10.0);
+
+/// A light's glow (`LightParams::glow`, owner 2026-11-07: "a bit of glow in
+/// neon"): a soft halo round its face in its own colour, as the air and the
+/// glass round a lit neon tube show it. A little bloom, set per light; never
+/// rays or a lens flare, which are the camera's and are not drawn in a map.
+/// It falls off as e^(-x / reach) with x the angle out from the face's edge,
+/// faded to nothing by 6 x reach, and it adds to the light's own light.
+#[derive(Clone, Debug, PartialEq, SerJson, DeJson)]
+pub struct GlowParams {
+    /// `LIGHT_GLOW_STRENGTH_RANGE`, 0..=1 (default 0.3): the halo's light as a
+    /// share of the face's own (0 draws none).
+    pub strength: f32,
+    /// `LIGHT_GLOW_REACH_RANGE`, 0.1..=10 degrees (default 1.5): how far out
+    /// from the face's edge the halo falls to a third (e^-1).
+    pub reach_deg: f32,
+}
+
+impl Default for GlowParams {
+    fn default() -> Self {
+        GlowParams { strength: 0.3, reach_deg: 1.5 }
+    }
+}
+
+impl GlowParams {
+    fn clamp_fields(&mut self, prefix: &str, f: &mut Fixes) {
+        let d = GlowParams::default();
+        f.range(prefix, "strength", &mut self.strength, LIGHT_GLOW_STRENGTH_RANGE.0, LIGHT_GLOW_STRENGTH_RANGE.1, d.strength);
+        f.range(prefix, "reach_deg", &mut self.reach_deg, LIGHT_GLOW_REACH_RANGE.0, LIGHT_GLOW_REACH_RANGE.1, d.reach_deg);
+    }
 }
 
 /// Plan P2: a pattern light's pattern (`LightParams::pattern`, pattern.rs).
@@ -1095,6 +1748,14 @@ pub struct PatternParams {
     /// 0..=1: how much a tube's corners and bends dim (its connectors: a
     /// honeycomb's Y joints, a frame's corners; 1 dark).
     pub corner_dim: f32,
+    /// 0..=1, or None (2026-11-10): each tube of a generator sits in a light
+    /// fitting's body, a box this albedo (a grey or aluminium housing) round
+    /// it on the face's back, drawn in a room and lit as the room is
+    /// (pattern.rs `housings`, room.rs `Housing`). A housed tube's light
+    /// ends square at the ends of its centre line, the housing's end plates
+    /// past them, where a bare LED tube's round dark caps still glow a
+    /// little. None: bare tubes, as before.
+    pub housing: Option<f32>,
 }
 
 /// A pattern's own SVG text (`PatternParams::svg`), shared: a copy of the
@@ -1188,6 +1849,9 @@ pub const PATTERN_TUBE_RANGE_M: (f32, f32) = (0.001, 1.0);
 pub const PATTERN_COUNT_MAX: u32 = 256;
 /// The widest gap and mount spacing, metres (`PatternParams::gap_m`, `mount_spacing_m`).
 pub const PATTERN_GAP_MAX_M: f32 = 50.0;
+/// A housing's albedo where one is turned on or comes in as NaN (`PatternParams::housing`): grey
+/// powder-coated metal or weathered aluminium.
+pub const PATTERN_HOUSING_DEFAULT: f32 = 0.5;
 
 impl Default for PatternParams {
     /// A new pattern light's (owner's car rooms): a honeycomb of 5 x 4
@@ -1207,6 +1871,7 @@ impl Default for PatternParams {
             mount_spacing_m: 0.0,
             mount_dim: 0.5,
             corner_dim: 0.4,
+            housing: None,
         }
     }
 }
@@ -1261,6 +1926,9 @@ impl PatternParams {
         f.range(prefix, "mount_spacing_m", &mut self.mount_spacing_m, 0.0, PATTERN_GAP_MAX_M, d.mount_spacing_m);
         f.range(prefix, "mount_dim", &mut self.mount_dim, 0.0, 1.0, d.mount_dim);
         f.range(prefix, "corner_dim", &mut self.corner_dim, 0.0, 1.0, d.corner_dim);
+        if let Some(albedo) = self.housing.as_mut() {
+            f.range(prefix, "housing", albedo, 0.0, 1.0, PATTERN_HOUSING_DEFAULT);
+        }
     }
 }
 
@@ -1366,15 +2034,62 @@ pub struct ModifierParams {
     pub rim: f32,
     /// 0..=1: how much brighter its middle is (a baffle's, a flash's hot spot).
     pub baffle: f32,
-    /// 0..=48: ribs of an umbrella, LEDs of a ring, steps of a fresnel, diodes across a panel.
+    /// 0..=48: ribs of an umbrella, LEDs of a ring, steps of a fresnel, diodes across a panel;
+    /// a reflector's finish (0 white, 1 silver, 2 gold); a fluorescent bank's tubes.
     pub ribs: u32,
     /// 0..=0.8: the centre plate of a beauty dish, the strobe head in an umbrella, a share of the radius.
     pub plate: f32,
+    /// 0..=0.8: how evenly the face spreads the flash: a closed softbox's,
+    /// strip's or octabox's cloth (modifier.rs `Modifier::spot`, 0 the single
+    /// diffuser the Profoto plates show), a reflector bowl's finish (toward
+    /// satin), a beauty dish's bowl (0 silver to 0.8 white), an umbrella's
+    /// front cover (RLS026, RLS027), how far behind a gradient's scrim its
+    /// lamp stands (modifier.rs `Scrim`), a ring light's thick diffuser
+    /// (`Modifier::ring_diffused`). None (older files) is 0, a gradient's 0.6.
+    pub diffusion: Option<f32>,
+    /// -1..=1: where across a reflector the light that lights it stands
+    /// (reflector.rs): -1 over its left edge, 1 over its right, None (older
+    /// files) 0, its middle; where across a gradient's scrim its lamp stands
+    /// (modifier.rs `Scrim`: -0.5 its left edge, -1 far off it).
+    pub across: Option<f32>,
+    /// 0..=1: how deep a gradient's scrim is creased (modifier.rs `Scrim`: a
+    /// few long smooth folds from a pinch near its middle to the frame, lit by
+    /// its lamp); None (older files) `SCRIM_CREASES_DEFAULT`, the plates' scrim.
+    pub creases: Option<f32>,
+    /// 0..=1: a gradient's second lamp, of the first's kind, depth and beam,
+    /// its light that share of the first's (RLS048); None none.
+    pub fill: Option<f32>,
+    /// -1..=1: where across the scrim the second lamp stands, as `across`;
+    /// None `SCRIM_FILL_ACROSS_DEFAULT`, off the right edge.
+    pub fill_across: Option<f32>,
+    /// -1..=1: where a gradient's round lamp is aimed, up (+) or down (-) the
+    /// scrim's middle line from its middle, past its edge from 0.5 on
+    /// (SoftBox_Gradient: a lamp near the bottom aimed far below it); None
+    /// the middle.
+    pub aim: Option<f32>,
+    /// 0..=1: how taut a reflector's metallised cloth is pulled one way
+    /// (reflector.rs): 0 crumpled and opened again (RLS038-041), 1 its long
+    /// parallel tension folds alone (the round bounce cards); None 0.
+    pub pull: Option<f32>,
+    /// -90..=90: the way a reflector's cloth is pulled, so its tension folds
+    /// run, in degrees counter-clockwise from the face's x (the silver card
+    /// 11, the gold -18); None 0.
+    pub pull_angle: Option<f32>,
+    /// Kind "candle": the candles, their flames, holder and mount
+    /// (`CandleParams`, candle_params.rs). None reads as its defaults; kept,
+    /// not read, on another kind.
+    pub candle: Option<CandleParams>,
 }
+
+/// A gradient scrim's crease depth when a file leaves it out
+/// (`ModifierParams::creases`), and its second lamp's place
+/// (`ModifierParams::fill_across`).
+pub const SCRIM_CREASES_DEFAULT: f32 = 1.0;
+pub const SCRIM_FILL_ACROSS_DEFAULT: f32 = 0.6;
 
 impl Default for ModifierParams {
     fn default() -> Self {
-        ModifierParams { kind: "softbox".to_string(), rim: 0.04, baffle: 0.4, ribs: 16, plate: 0.3 }
+        ModifierParams { kind: "softbox".to_string(), rim: 0.04, baffle: 0.4, ribs: 16, plate: 0.3, diffusion: None, across: None, creases: None, fill: None, fill_across: None, aim: None, pull: None, pull_angle: None, candle: None }
     }
 }
 
@@ -1386,6 +2101,33 @@ impl ModifierParams {
         f.range(prefix, "baffle", &mut self.baffle, 0.0, 1.0, d.baffle);
         f.int(prefix, "ribs", &mut self.ribs, 0, 48);
         f.range(prefix, "plate", &mut self.plate, 0.0, 0.8, d.plate);
+        if let Some(diffusion) = self.diffusion.as_mut() {
+            f.range(prefix, "diffusion", diffusion, 0.0, 0.8, 0.0);
+        }
+        if let Some(across) = self.across.as_mut() {
+            f.range(prefix, "across", across, -1.0, 1.0, 0.0);
+        }
+        if let Some(creases) = self.creases.as_mut() {
+            f.range(prefix, "creases", creases, 0.0, 1.0, SCRIM_CREASES_DEFAULT);
+        }
+        if let Some(fill) = self.fill.as_mut() {
+            f.range(prefix, "fill", fill, 0.0, 1.0, 0.0);
+        }
+        if let Some(fill_across) = self.fill_across.as_mut() {
+            f.range(prefix, "fill_across", fill_across, -1.0, 1.0, SCRIM_FILL_ACROSS_DEFAULT);
+        }
+        if let Some(aim) = self.aim.as_mut() {
+            f.range(prefix, "aim", aim, -1.0, 1.0, 0.0);
+        }
+        if let Some(pull) = self.pull.as_mut() {
+            f.range(prefix, "pull", pull, 0.0, 1.0, 0.0);
+        }
+        if let Some(pull_angle) = self.pull_angle.as_mut() {
+            f.range(prefix, "pull_angle", pull_angle, -90.0, 90.0, 0.0);
+        }
+        if let Some(candle) = self.candle.as_mut() {
+            candle.clamp_fields(&join_path(prefix, "candle"), f);
+        }
     }
 
     /// The kind, read loosely; an unknown name is none.
@@ -1404,6 +2146,9 @@ impl ModifierParams {
             "gradient" => ModifierKind::Gradient,
             "street_lamp" => ModifierKind::StreetLamp,
             "window" => ModifierKind::Window,
+            "reflector" => ModifierKind::Reflector,
+            "fluorescent" => ModifierKind::Fluorescent,
+            "candle" => ModifierKind::Candle,
             _ => ModifierKind::None,
         }
     }
@@ -1426,6 +2171,16 @@ pub enum ModifierKind {
     Gradient,
     StreetLamp,
     Window,
+    /// A flat collapsible reflector panel (reflector.rs): `ribs` its finish,
+    /// 0 white, 1 silver, 2 gold.
+    Reflector,
+    /// A bank of fluorescent tubes (modifier.rs `fluorescent_raw`): `ribs`
+    /// its tubes, `plate` its reflector (0 crumpled foil to 0.8 a polished
+    /// trough per tube), `baffle` a cloth over it, `rim` its housing.
+    Fluorescent,
+    /// Candles and their flames (`ModifierParams::candle`,
+    /// light_model_candle.rs): always in 3D, upright, standing on its mount.
+    Candle,
 }
 
 /// A paint layer's strokes (`LightParams::paint`), drawn in their order, each
@@ -1792,7 +2547,8 @@ pub struct GoboParams {
     pub density: f32,
     /// 0.1..=10: the size of leaves and fronds (1: a leaf about a sixth of the light's smaller side).
     pub scale: f32,
-    /// Where leaves and fronds fall and how they turn.
+    /// Where leaves and fronds fall and how they turn, and how far each blind
+    /// slat sits off the blinds' tilt.
     pub seed: u32,
     /// 0..=1: how far in front of the light the gobo hangs. 0 gives sharp
     /// edges (blinds too), 1 a penumbra about an eighth of the light's
@@ -2096,8 +2852,12 @@ pub const SKYLINE_SEED_MAX: u32 = 9_999_999;
 
 /// `FloorParams::kind`, in the inspector's order (plan hdri-8 §3).
 pub const FLOOR_KIND_NAMES: &[&str] = &["grass", "sand", "snow", "rock", "road", "plaza", "mountain", "lake"];
-/// `FloorParams::pattern`, the Plaza's paving.
-pub const FLOOR_PATTERN_NAMES: &[&str] = &["square", "herringbone", "cobbles"];
+/// `FloorParams::pattern`, the Plaza's paving: square slabs, a herringbone of bricks, cobbles in curving rows, concrete
+/// slabs with saw-cut joints, setts in fan arcs.
+pub const FLOOR_PATTERN_NAMES: &[&str] = &["square", "herringbone", "cobbles", "concrete", "fan"];
+/// `FloorParams::joints`, what fills the Plaza's joints: open (dark, deep, moss in patches), sand (warm, nearly flush)
+/// or mortar (light, nearly flush).
+pub const FLOOR_JOINT_NAMES: &[&str] = &["open", "sand", "mortar"];
 /// The largest `FloorParams::seed` clamp() keeps (the panel's dice draws 0..=99999).
 pub const FLOOR_SEED_MAX: u32 = 99_999;
 /// Each channel of `FloorParams::tint`.
@@ -2124,12 +2884,25 @@ pub const FLOOR_SPARKLE_RANGE: (f32, f32) = (0.0, 1.0);
 pub const FLOOR_STONE_RANGE: (f32, f32) = (0.05, 2.0);
 /// Rock: `gravel`.
 pub const FLOOR_GRAVEL_RANGE: (f32, f32) = (0.0, 1.0);
-/// Road: `lanes`.
-pub const FLOOR_LANES_RANGE: (u32, u32) = (1, 4);
+/// Road: `lanes` (up to 8, as a tunnel's road had).
+pub const FLOOR_LANES_RANGE: (u32, u32) = (1, 8);
+/// Road: `lane_width_m`, metres.
+pub const FLOOR_LANE_WIDTH_RANGE: (f32, f32) = (2.0, 5.0);
+/// Road: `beside`, what lies beside the road: Grass (a gravel shoulder giving way to the grass over a verge, then a
+/// field), Gravel, Concrete, Sand, or Room (the colour of the floor of the room standing on the ground: a tunnel's
+/// walkways in its own concrete, `beside_color`).
+pub const ROAD_BESIDE_NAMES: &[&str] = &["grass", "gravel", "concrete", "sand", "room"];
 /// Road: `wear`.
 pub const FLOOR_WEAR_RANGE: (f32, f32) = (0.0, 1.0);
-/// Plaza: `tile_m`, metres.
-pub const FLOOR_TILE_RANGE: (f32, f32) = (0.1, 2.0);
+/// Road: `curve`, which way the road bends ahead: straight, or round to the left or the right (`RoadCurve`).
+pub const ROAD_CURVE_NAMES: &[&str] = &["straight", "left", "right"];
+/// Road: `curve_radius_m`, the bend's radius in metres (a hairpin to a motorway's sweep).
+pub const FLOOR_CURVE_RADIUS_RANGE: (f32, f32) = (20.0, 2000.0);
+/// Road: `curve_start_m`, where the bend starts along the road, metres ahead of the viewer; 0 or less puts the viewer
+/// on the bend, which began that far behind.
+pub const FLOOR_CURVE_START_RANGE: (f32, f32) = (-300.0, 500.0);
+/// Plaza: `tile_m`, metres (a sett of 10 cm to a car park's concrete slab of 6 m).
+pub const FLOOR_TILE_RANGE: (f32, f32) = (0.1, 6.0);
 /// Mountain: `drop_m`, the drop below the summit in metres.
 pub const FLOOR_DROP_RANGE: (f32, f32) = (100.0, 3000.0);
 /// Mountain: `ruggedness`.
@@ -2142,6 +2915,8 @@ pub const FLOOR_FAR_SHORE_RANGE: (f32, f32) = (50.0, 5000.0);
 pub const FLOOR_LAKE_RIPPLES_RANGE: (f32, f32) = (0.0, 1.0);
 /// Lake: `shore`, the share of the turn behind the viewer that is land.
 pub const FLOOR_SHORE_RANGE: (f32, f32) = (0.0, 1.0);
+/// Road, Plaza, Rock, Sand: `overgrowth`, the plants neglected ground sprouts (0: none).
+pub const FLOOR_OVERGROWTH_RANGE: (f32, f32) = (0.0, 1.0);
 
 /// The floor (plan hdri-8): the map's lower hemisphere in Sky mode as a ground of one kind, seen from `eye_m` over
 /// it. The engine draws its far model (`hdri/floor.rs`) from these settings alone; the app renders the near relief on
@@ -2203,6 +2978,45 @@ pub struct FloorParams {
     pub lake_ripples: f32,
     /// Lake: the share of the turn behind the viewer that is land (0: a jetty in open water).
     pub shore: f32,
+    /// Road: each lane's width, metres (FLOOR_LANE_WIDTH_RANGE). None (a file saved before it): 3.5.
+    pub lane_width_m: Option<f32>,
+    /// Road: what lies beside it (`ROAD_BESIDE_NAMES`). None: grass.
+    pub beside: Option<String>,
+    /// Road beside "room": the colour there (linear albedo 0..=1), the floor colour of the room standing on the
+    /// ground (a hybrid studio's map sets it from its room). None: a mid grey concrete.
+    pub beside_color: Option<[f32; 3]>,
+    /// Road: which way it bends ahead (`ROAD_CURVE_NAMES`). None: straight.
+    pub curve: Option<String>,
+    /// Road: the bend's radius, metres (FLOOR_CURVE_RADIUS_RANGE). None: 150.
+    pub curve_radius_m: Option<f32>,
+    /// Road: where the bend starts, metres ahead along the road (FLOOR_CURVE_START_RANGE); 0 or less: the viewer
+    /// stands on the bend, which began that far behind. None: 30. A room standing on the road (a tunnel, a bridge)
+    /// keeps the bend past its mouths.
+    pub curve_start_m: Option<f32>,
+    /// Plaza: what fills the joints (`FLOOR_JOINT_NAMES`). None: open, as before the fills.
+    pub joints: Option<String>,
+    /// Road, Plaza, Rock, Sand: the plants neglected ground sprouts, 0..1 (FLOOR_OVERGROWTH_RANGE): tufts of the Grass
+    /// kind's blades out of a road's cracks and seams and over its edge, in a plaza's joints, in rock's crevices and at
+    /// the foot of its stones, in clumps on sand. None or 0: none, every floor as before.
+    pub overgrowth: Option<f32>,
+}
+
+/// Typed view of `FloorParams::curve`, in ROAD_CURVE_NAMES' order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RoadCurve {
+    Straight,
+    Left,
+    Right,
+}
+
+/// Typed view of `FloorParams::beside`, in ROAD_BESIDE_NAMES' order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RoadBeside {
+    Grass,
+    Gravel,
+    Concrete,
+    Sand,
+    Room,
 }
 
 impl Default for FloorParams {
@@ -2235,6 +3049,14 @@ impl Default for FloorParams {
             far_shore_m: 600.0,
             lake_ripples: 0.3,
             shore: 0.4,
+            lane_width_m: None,
+            beside: None,
+            beside_color: None,
+            curve: None,
+            curve_radius_m: None,
+            curve_start_m: None,
+            joints: None,
+            overgrowth: None,
         }
     }
 }
@@ -2268,6 +3090,16 @@ pub enum FloorPattern {
     Square,
     Herringbone,
     Cobbles,
+    Concrete,
+    Fan,
+}
+
+/// Typed view of `FloorParams::joints`, in FLOOR_JOINT_NAMES' order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PlazaJoints {
+    Open,
+    Sand,
+    Mortar,
 }
 
 impl FloorParams {
@@ -2282,31 +3114,115 @@ impl FloorParams {
             FloorPattern::Herringbone
         } else if is_choice(&self.pattern, "cobbles") {
             FloorPattern::Cobbles
+        } else if is_choice(&self.pattern, "concrete") {
+            FloorPattern::Concrete
+        } else if is_choice(&self.pattern, "fan") {
+            FloorPattern::Fan
         } else {
             FloorPattern::Square
         }
     }
 
+    /// Plaza: what fills the joints; None or an unknown string is Open.
+    pub fn joints(&self) -> PlazaJoints {
+        match self.joints.as_deref() {
+            Some(j) if is_choice(j, "sand") => PlazaJoints::Sand,
+            Some(j) if is_choice(j, "mortar") => PlazaJoints::Mortar,
+            _ => PlazaJoints::Open,
+        }
+    }
+
+    /// Road: each lane's width (3.5 m when None).
+    pub fn lane_width(&self) -> f32 {
+        self.lane_width_m.unwrap_or(3.5)
+    }
+
+    /// Road: what lies beside it; None or an unknown string is Grass.
+    pub fn beside(&self) -> RoadBeside {
+        match self.beside.as_deref() {
+            Some(b) if is_choice(b, "gravel") => RoadBeside::Gravel,
+            Some(b) if is_choice(b, "concrete") => RoadBeside::Concrete,
+            Some(b) if is_choice(b, "sand") => RoadBeside::Sand,
+            Some(b) if is_choice(b, "room") => RoadBeside::Room,
+            _ => RoadBeside::Grass,
+        }
+    }
+
+    /// Road: the verge between the road's edge and what lies beside it, metres: Grass's gravel shoulder giving way to
+    /// the grass (3 m), none for the others (they meet the asphalt at its edge).
+    pub fn verge_m(&self) -> f32 {
+        if self.beside() == RoadBeside::Grass { 3.0 } else { 0.0 }
+    }
+
+    /// Road: which way it bends; None or an unknown string is Straight.
+    pub fn curve(&self) -> RoadCurve {
+        match self.curve.as_deref() {
+            Some(c) if is_choice(c, "left") => RoadCurve::Left,
+            Some(c) if is_choice(c, "right") => RoadCurve::Right,
+            _ => RoadCurve::Straight,
+        }
+    }
+
+    /// Road: the bend's radius, metres (150 when None).
+    pub fn curve_radius(&self) -> f32 {
+        self.curve_radius_m.unwrap_or(150.0)
+    }
+
+    /// Road: where the bend starts, metres ahead (30 when None; 0 or less: the viewer stands on it).
+    pub fn curve_start(&self) -> f32 {
+        self.curve_start_m.unwrap_or(30.0)
+    }
+
+    /// Road: the bend's radius signed by its way, as the GPU ask takes it: 0 straight, negative to the left, positive
+    /// to the right.
+    pub fn signed_curve_radius(&self) -> f32 {
+        match self.curve() {
+            RoadCurve::Straight => 0.0,
+            RoadCurve::Left => -self.curve_radius(),
+            RoadCurve::Right => self.curve_radius(),
+        }
+    }
+
+    /// Road, Plaza, Rock, Sand: the overgrowth (0 when None); the other kinds take none.
+    pub fn overgrowth(&self) -> f32 {
+        match self.kind() {
+            FloorKind::Road | FloorKind::Plaza | FloorKind::Rock | FloorKind::Sand => self.overgrowth.unwrap_or(0.0),
+            _ => 0.0,
+        }
+    }
+
     /// The kind's own numbers in the order of §3's tables, the rest 0 (the GPU ask's `params`, plan hdri-8 §4.9):
     /// Grass length, dryness, wind; Sand ripples, dunes; Snow softness, sparkle; Rock stone size, gravel; Road lanes,
-    /// heading, wear (markings apart); Plaza tile size (pattern apart); Mountain drop, ruggedness, snow line; Lake far
-    /// shore, ripples, shore.
-    pub fn kind_numbers(&self) -> [f32; 6] {
+    /// heading, wear, lane width, what lies beside it (`RoadBeside` as its index; markings apart, the verge's width
+    /// follows from it), the bend's signed radius (`signed_curve_radius`: 0 straight) and where it starts;
+    /// Plaza tile size and the joints' fill (`PlazaJoints` as its index; the pattern apart); Mountain drop, ruggedness,
+    /// snow line; Lake far shore, ripples, shore. The eighth is the overgrowth on the kinds that take it (`overgrowth`).
+    pub fn kind_numbers(&self) -> [f32; 8] {
         let n = |a: &[f32]| {
-            let mut out = [0.0; 6];
+            let mut out = [0.0; 8];
             out[..a.len()].copy_from_slice(a);
             out
         };
-        match self.kind() {
+        let mut out = match self.kind() {
             FloorKind::Grass => n(&[self.grass_length_m, self.dryness, self.wind]),
             FloorKind::Sand => n(&[self.ripples, self.dunes]),
             FloorKind::Snow => n(&[self.softness, self.sparkle]),
             FloorKind::Rock => n(&[self.stone_m, self.gravel]),
-            FloorKind::Road => n(&[self.lanes as f32, self.heading_deg, self.wear]),
-            FloorKind::Plaza => n(&[self.tile_m]),
+            FloorKind::Road => n(&[
+                self.lanes as f32,
+                self.heading_deg,
+                self.wear,
+                self.lane_width(),
+                self.beside() as usize as f32,
+                self.signed_curve_radius(),
+                self.curve_start(),
+            ]),
+            FloorKind::Plaza => n(&[self.tile_m, self.joints() as usize as f32]),
             FloorKind::Mountain => n(&[self.drop_m, self.ruggedness, self.snow_line]),
             FloorKind::Lake => n(&[self.far_shore_m, self.lake_ripples, self.shore]),
-        }
+        };
+        out[7] = self.overgrowth();
+        out
     }
 
     fn clamp_fields(&mut self, prefix: &str, f: &mut Fixes) {
@@ -2336,6 +3252,30 @@ impl FloorParams {
         f.range(prefix, "far_shore_m", &mut self.far_shore_m, FLOOR_FAR_SHORE_RANGE.0, FLOOR_FAR_SHORE_RANGE.1, d.far_shore_m);
         f.range(prefix, "lake_ripples", &mut self.lake_ripples, FLOOR_LAKE_RIPPLES_RANGE.0, FLOOR_LAKE_RIPPLES_RANGE.1, d.lake_ripples);
         f.range(prefix, "shore", &mut self.shore, FLOOR_SHORE_RANGE.0, FLOOR_SHORE_RANGE.1, d.shore);
+        if let Some(w) = self.lane_width_m.as_mut() {
+            f.range(prefix, "lane_width_m", w, FLOOR_LANE_WIDTH_RANGE.0, FLOOR_LANE_WIDTH_RANGE.1, 3.5);
+        }
+        if let Some(b) = self.beside.as_mut() {
+            f.choice(prefix, "beside", b, ROAD_BESIDE_NAMES);
+        }
+        if let Some(c) = self.beside_color.as_mut() {
+            f.color(prefix, "beside_color", c, 1.0, [0.4, 0.4, 0.38]);
+        }
+        if let Some(c) = self.curve.as_mut() {
+            f.choice(prefix, "curve", c, ROAD_CURVE_NAMES);
+        }
+        if let Some(r) = self.curve_radius_m.as_mut() {
+            f.range(prefix, "curve_radius_m", r, FLOOR_CURVE_RADIUS_RANGE.0, FLOOR_CURVE_RADIUS_RANGE.1, 150.0);
+        }
+        if let Some(s) = self.curve_start_m.as_mut() {
+            f.range(prefix, "curve_start_m", s, FLOOR_CURVE_START_RANGE.0, FLOOR_CURVE_START_RANGE.1, 30.0);
+        }
+        if let Some(j) = self.joints.as_mut() {
+            f.choice(prefix, "joints", j, FLOOR_JOINT_NAMES);
+        }
+        if let Some(o) = self.overgrowth.as_mut() {
+            f.range(prefix, "overgrowth", o, FLOOR_OVERGROWTH_RANGE.0, FLOOR_OVERGROWTH_RANGE.1, 0.0);
+        }
     }
 }
 
@@ -2516,9 +3456,12 @@ impl SerJson for StrokeParams {
 /// A scrim light: a rect of diffusion cloth lit from behind.
 #[derive(Clone, Debug, PartialEq, SerJson, DeJson)]
 pub struct ScrimParams {
-    /// 0.05..=1: the spread of the glow the light behind the cloth makes, as a
-    /// fraction of the half size (a Gaussian's sigma). 0.05 is a tight hot
-    /// spot, 1 nearly even.
+    /// 0.05..=1: the spread of the glow the lamp behind the cloth makes, as a
+    /// fraction of the half size. The cloth glows with the lamp's irradiance,
+    /// (1 + (r/d)²)^-1.5 at r half sizes from its middle, the lamp d = 1.54 x
+    /// this behind it, so the glow falls to half where a Gaussian of this
+    /// sigma would. 0.05 is a tight hot spot, 1 nearly even; at 0.5 the lamp is
+    /// 0.77 half sizes back, as a photographed backlit scrim's is.
     pub source_size: f32,
     /// 0..=0.2: a dark frame inside the outline, as a fraction of the shorter half size.
     pub frame: f32,
@@ -2543,6 +3486,32 @@ impl ScrimParams {
 pub enum Mode {
     Sky,
     Studio,
+}
+
+/// What stands round the camera, the Backdrop entry's one choice (2026-11-07): nothing (an outdoor sky, Sky mode),
+/// the gradient (Studio with no room) or a room (Studio with `StudioParams::room`). A view over `HdriParams::mode`
+/// and `studio.room`, which the file keeps as before (`HdriParams::backdrop_kind`, `set_backdrop_kind`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackdropKind {
+    None,
+    Gradient,
+    Room,
+}
+
+/// The Backdrop choice's names, in `BackdropKind` order.
+pub const BACKDROP_NAMES: &[&str] = &["none", "gradient", "room"];
+
+impl BackdropKind {
+    pub const ALL: [BackdropKind; 3] = [BackdropKind::None, BackdropKind::Gradient, BackdropKind::Room];
+
+    pub fn as_str(self) -> &'static str {
+        BACKDROP_NAMES[self as usize]
+    }
+
+    /// The kind at `index` of `ALL`; past the end is the last.
+    pub fn from_index(index: usize) -> BackdropKind {
+        BackdropKind::ALL[index.min(BackdropKind::ALL.len() - 1)]
+    }
 }
 
 /// Typed view of `SunParams::mode`.
@@ -2682,7 +3651,7 @@ impl Default for SunParams {
 
 impl Default for AtmosphereParams {
     fn default() -> Self {
-        AtmosphereParams { haze: 1.0, air: 1.0, ozone: 1.0, ground_color: [0.18, 0.17, 0.15] }
+        AtmosphereParams { haze: 1.0, air: 1.0, ozone: 1.0, ground_color: [0.18, 0.17, 0.15], stratosphere: None, aerosol: None, haze_top_m: None, viewer_height_m: None }
     }
 }
 
@@ -2713,7 +3682,14 @@ impl Default for NightParams {
             milky_way: None,
             nebulas: None,
             aurora: None,
+            light_pollution: None,
         }
+    }
+}
+
+impl Default for LightPollutionParams {
+    fn default() -> Self {
+        LightPollutionParams { on: true, strength: 1.0, azimuth_deg: 180.0, distance_km: 30.0, lamps: 0.5 }
     }
 }
 
@@ -2792,6 +3768,7 @@ impl Default for LightParams {
             modifier: None,
             space: None,
             pattern: None,
+            glow: None,
         }
     }
 }
@@ -2809,6 +3786,71 @@ impl HdriParams {
         } else {
             Mode::Sky
         }
+    }
+
+    /// A hybrid studio (2026-11-05): a studio whose room opens onto the
+    /// outside (`RoomParams::is_hybrid`: an open wall or floor, or a real
+    /// window). Its outside is the scene's outdoor one (sun and time, clouds,
+    /// weather, night, skyline, ground), with the controls a sky has.
+    pub fn is_hybrid(&self) -> bool {
+        self.mode() == Mode::Studio && self.studio.room.as_ref().is_some_and(|room| room.is_hybrid())
+    }
+
+    /// The Backdrop choice the scene shows (`BackdropKind`): None in Sky mode, whatever the studio holds; in Studio
+    /// a Room when it has one, else the Gradient.
+    pub fn backdrop_kind(&self) -> BackdropKind {
+        match self.mode() {
+            Mode::Sky => BackdropKind::None,
+            Mode::Studio if self.studio.room.is_some() => BackdropKind::Room,
+            Mode::Studio => BackdropKind::Gradient,
+        }
+    }
+
+    /// Picks the Backdrop choice: None sets Sky mode and keeps the studio as it is, so a switch back restores it;
+    /// Gradient sets Studio mode and takes the room away, handing it back for the caller to keep; Room sets Studio
+    /// mode and, with no room, puts in `last_room` (the last one the caller kept) or `RoomParams::default()`.
+    /// Only `mode` and `studio.room` change.
+    pub fn set_backdrop_kind(&mut self, kind: BackdropKind, last_room: Option<&RoomParams>) -> Option<RoomParams> {
+        match kind {
+            BackdropKind::None => {
+                self.mode = Mode::Sky.as_str().to_string();
+                None
+            }
+            BackdropKind::Gradient => {
+                self.mode = Mode::Studio.as_str().to_string();
+                self.studio.room.take()
+            }
+            BackdropKind::Room => {
+                self.mode = Mode::Studio.as_str().to_string();
+                if self.studio.room.is_none() {
+                    self.studio.room = Some(last_room.cloned().unwrap_or_default());
+                }
+                None
+            }
+        }
+    }
+
+    /// One road (2026-11-05): a room's own road (`RoomParams::road`, a file saved before) becomes the ground's. The
+    /// room's floor side opens (it stands on the ground), its open walls carry over to `sides`, and the floor is a
+    /// Road at the old road's lanes, lane width and markings, the room's floor colour beside it. Reported as
+    /// "studio.room.road".
+    fn move_room_road(&mut self, f: &mut Fixes) {
+        let Some(room) = self.studio.room.as_mut() else { return };
+        let Some(road) = room.road.take() else { return };
+        let mut sides = room.sides();
+        sides.floor = true;
+        room.sides = Some(sides);
+        room.open_walls = None;
+        let beside = room.floor;
+        let floor = self.floor.get_or_insert_with(FloorParams::default);
+        floor.on = true;
+        floor.kind = FloorKind::Road.as_str().to_string();
+        floor.lanes = road.lanes.clamp(FLOOR_LANES_RANGE.0, FLOOR_LANES_RANGE.1);
+        floor.lane_width_m = Some(road.lane_width_m);
+        floor.markings = road.edge_lines || road.gap_m > 0.0 || road.dash_m > 0.0;
+        floor.beside = Some("room".to_string());
+        floor.beside_color = Some(beside);
+        f.push("studio.room", "road");
     }
 
     /// Sanitises NaN/∞, clamps every field into its documented range, maps unknown
@@ -2829,6 +3871,7 @@ impl HdriParams {
             f.push("", "version");
         }
         f.choice("", "mode", &mut self.mode, MODE_NAMES);
+        self.move_room_road(&mut f);
         f.range("", "intensity_ev", &mut self.intensity_ev, -10.0, 10.0, defaults.intensity_ev);
         f.wrap180("", "rotation_deg", &mut self.rotation_deg, defaults.rotation_deg);
         self.sky.clamp_fields("sky", &mut f);
@@ -3006,6 +4049,19 @@ impl AtmosphereParams {
         f.range(prefix, "air", &mut self.air, 0.0, 10.0, d.air);
         f.range(prefix, "ozone", &mut self.ozone, 0.0, 10.0, d.ozone);
         f.color(prefix, "ground_color", &mut self.ground_color, 1.0, d.ground_color);
+        if let Some(strat) = self.stratosphere.as_mut() {
+            f.range(prefix, "stratosphere", strat, 0.0, 20.0, 1.0);
+        }
+        if let Some(kind) = self.aerosol.as_mut() {
+            f.choice(prefix, "aerosol", kind, AEROSOL_NAMES);
+        }
+        if let Some(top) = self.haze_top_m.as_mut() {
+            let (lo, hi) = HAZE_TOP_RANGE_M;
+            f.range(prefix, "haze_top_m", top, lo, hi, HAZE_TOP_DEFAULT_M);
+        }
+        if let Some(height) = self.viewer_height_m.as_mut() {
+            f.range(prefix, "viewer_height_m", height, VIEWER_HEIGHT_RANGE.0, VIEWER_HEIGHT_RANGE.1, VIEWER_HEIGHT_DEFAULT);
+        }
     }
 }
 
@@ -3048,6 +4104,9 @@ impl NightParams {
         if let Some(b) = self.aurora.as_mut() {
             b.clamp_fields(&join_path(prefix, "aurora"), f);
         }
+        if let Some(b) = self.light_pollution.as_mut() {
+            b.clamp_fields(&join_path(prefix, "light_pollution"), f);
+        }
     }
 
     /// The Milky Way's block when it draws: Some and on.
@@ -3063,6 +4122,21 @@ impl NightParams {
     /// The aurora's block when it draws: Some and on.
     pub fn aurora_drawn(&self) -> Option<&AuroraParams> {
         self.aurora.as_ref().filter(|b| b.on)
+    }
+
+    /// The town's glow when it draws: Some, on and of some strength.
+    pub fn light_pollution_drawn(&self) -> Option<&LightPollutionParams> {
+        self.light_pollution.as_ref().filter(|b| b.on && b.strength > 0.0)
+    }
+}
+
+impl LightPollutionParams {
+    fn clamp_fields(&mut self, prefix: &str, f: &mut Fixes) {
+        let d = LightPollutionParams::default();
+        f.range(prefix, "strength", &mut self.strength, LIGHT_POLLUTION_STRENGTH_RANGE.0, LIGHT_POLLUTION_STRENGTH_RANGE.1, d.strength);
+        f.wrap360(prefix, "azimuth_deg", &mut self.azimuth_deg, d.azimuth_deg);
+        f.range(prefix, "distance_km", &mut self.distance_km, LIGHT_POLLUTION_DISTANCE_RANGE.0, LIGHT_POLLUTION_DISTANCE_RANGE.1, d.distance_km);
+        f.range(prefix, "lamps", &mut self.lamps, LIGHT_POLLUTION_LAMPS_RANGE.0, LIGHT_POLLUTION_LAMPS_RANGE.1, d.lamps);
     }
 }
 
@@ -3402,6 +4476,9 @@ impl LightParams {
         if let Some(pattern) = self.pattern.as_mut() {
             pattern.clamp_fields(&join_path(prefix, "pattern"), f);
         }
+        if let Some(glow) = self.glow.as_mut() {
+            glow.clamp_fields(&join_path(prefix, "glow"), f);
+        }
         if self.shape() == LightShape::Pattern && self.kind() == LightKind::Light {
             // A pattern is its own content on its own face: no picture, gobo,
             // aim (its face's beam shapes it), wear or modifier housing.
@@ -3424,6 +4501,8 @@ impl LightParams {
                 }
             }
         }
+        // A candle stands in 3D, upright, as its flame (candle_params.rs).
+        hold_candle(self, prefix, f);
         // A 3D light's 2D placement follows its face (not read, so not reported).
         super::space::follow_face(self);
     }
@@ -3569,9 +4648,11 @@ fn template_for(schema: &str) -> Option<JsonValue> {
         "lights[].lightning" => json_tree(&LightningParams::default()).ok(),
         "studio.room" => json_tree(&RoomParams::default()).ok(),
         "studio.room.road" => json_tree(&RoadParams::default()).ok(),
+        "studio.room.windows[]" => json_tree(&RoomWindow::default()).ok(),
         "lights[].modifier" => json_tree(&ModifierParams::default()).ok(),
         "lights[].space" => json_tree(&SpaceParams::default()).ok(),
         "lights[].pattern" => json_tree(&PatternParams::default()).ok(),
+        "lights[].glow" => json_tree(&GlowParams::default()).ok(),
         "base_image" => json_tree(&BaseImageParams::default()).ok(),
         "sky.volumetric" => json_tree(&VolumetricParams::default()).ok(),
         "sky.weather" => json_tree(&WeatherParams::default()).ok(),
@@ -3588,6 +4669,7 @@ fn template_for(schema: &str) -> Option<JsonValue> {
         "sky.night.milky_way" => json_tree(&MilkyWayParams::default()).ok(),
         "sky.night.nebulas" => json_tree(&NebulaParams::default()).ok(),
         "sky.night.aurora" => json_tree(&AuroraParams::default()).ok(),
+        "sky.night.light_pollution" => json_tree(&LightPollutionParams::default()).ok(),
         "floor" => json_tree(&FloorParams::default()).ok(),
         _ => None,
     }
@@ -3609,6 +4691,8 @@ fn integer_range(schema: &str) -> Option<(f64, f64)> {
         "sky.night.nebulas.seed" | "sky.night.aurora.seed" => Some((0.0, u32::MAX as f64)),
         "floor.seed" | "floor.lanes" => Some((0.0, u32::MAX as f64)),
         "studio.room.road.lanes" => Some((0.0, u32::MAX as f64)),
+        "studio.room.windows[].panes_x" | "studio.room.windows[].panes_y" | "studio.room.windows[].lower_panes_x" | "studio.room.windows[].lower_panes_y" => Some((0.0, u32::MAX as f64)),
+        "studio.room.windows[].leaves" | "studio.room.windows[].seed" => Some((0.0, u32::MAX as f64)),
         _ => None,
     }
 }
@@ -3626,6 +4710,7 @@ fn fixed_length(schema: &str) -> Option<usize> {
         "lights[].aim.barn_doors" => Some(4),
         "lights[].space.position_m" => Some(3),
         "sky.night.aurora.mix" | "floor.tint" => Some(3),
+        "studio.room.windows[].frame_color" | "studio.room.windows[].surround_color" | "studio.room.windows[].door_color" => Some(3),
         "lights[].polygon.points[]" | "lights[].stroke.points[]" | "lights[].paint.strokes[].stroke.points[]" => Some(2),
         _ => None,
     }
@@ -3986,7 +5071,7 @@ mod tests {
             ..CloudLayerParams::default()
         };
         let cirrus = CloudLayerParams {
-            cirrus: Some(CirrusParams { base_m: v, size_km: v, streak_length: v, fineness: v, hooks: v, fall_streaks: v, patchiness: v, opacity: v }),
+            cirrus: Some(CirrusParams { base_m: v, size_km: v, streak_length: v, fineness: v, hooks: v, fall_streaks: v, patchiness: v, opacity: v, contrails: None }),
             ..common(CloudGenus::Cirrus)
         };
         let nimbostratus = CloudLayerParams {
@@ -4206,6 +5291,41 @@ mod tests {
         assert_eq!(date(2026, 13, 5).0, (2026, 12, 5));
         assert_eq!(date(2026, 0, 0), ((2026, 1, 1), vec!["sky.sun.month".to_string(), "sky.sun.day".to_string()]));
         assert_eq!(date(1500, 6, 21).0, (1900, 6, 21));
+    }
+
+    /// The Backdrop choice (2026-11-07) reads Sky as None and a studio by its room, and setting it changes `mode` and
+    /// `studio.room` only: None keeps the studio for a switch back, Gradient hands the room back, Room puts back the
+    /// room it is given or a default one, and a file's JSON is the same as before for each.
+    #[test]
+    fn the_backdrop_choice_is_a_view_over_mode_and_room() {
+        assert_eq!(BackdropKind::ALL.map(BackdropKind::as_str), ["none", "gradient", "room"]);
+        assert_eq!((BackdropKind::from_index(1), BackdropKind::from_index(9)), (BackdropKind::Gradient, BackdropKind::Room));
+        let mut p = HdriParams::default();
+        assert_eq!(p.backdrop_kind(), BackdropKind::None);
+        p.studio.top = [0.5, 0.25, 0.125];
+        let mut room = RoomParams::default();
+        room.width_m = 20.0;
+        p.studio.room = Some(room.clone());
+        // Sky keeps its studio: still None, and the room is kept.
+        assert_eq!(p.backdrop_kind(), BackdropKind::None);
+        let before = p.clone();
+        assert_eq!(p.set_backdrop_kind(BackdropKind::Room, None), None);
+        assert_eq!((p.mode(), p.backdrop_kind()), (Mode::Studio, BackdropKind::Room));
+        assert_eq!(p.studio, before.studio, "the kept room comes back");
+        assert_eq!(p.set_backdrop_kind(BackdropKind::Gradient, None), Some(room.clone()), "the room is handed back");
+        assert_eq!((p.mode(), p.backdrop_kind(), p.studio.room.is_none()), (Mode::Studio, BackdropKind::Gradient, true));
+        assert_eq!(p.studio.top, [0.5, 0.25, 0.125]);
+        assert_eq!(p.set_backdrop_kind(BackdropKind::Room, Some(&room)), None);
+        assert_eq!(p.studio.room.as_ref().map(|r| r.width_m), Some(20.0), "the last room comes back");
+        p.set_backdrop_kind(BackdropKind::Gradient, None);
+        p.set_backdrop_kind(BackdropKind::Room, None);
+        assert_eq!(p.studio.room, Some(RoomParams::default()), "no last room: a default one");
+        assert_eq!(p.set_backdrop_kind(BackdropKind::None, None), None);
+        assert_eq!((p.mode(), p.backdrop_kind(), p.studio.room.is_some()), (Mode::Sky, BackdropKind::None, true));
+        // Only mode and the room changed: everything else is as it was.
+        let mut back = before.clone();
+        back.studio.room = p.studio.room.clone();
+        assert_eq!(p, back);
     }
 
     #[test]
@@ -4837,6 +5957,62 @@ mod source_param_tests {
         let (merged, report) = merged.merge_json(r#"{"lights": [{"image": {"key": "a.png", "fit": "fit", "zoom": 2}}]}"#).unwrap();
         assert_eq!(merged.lights[0].image.as_ref().unwrap().fit(), ImageFit::Fit);
         assert_eq!(report, ["ignored: lights[0].image.zoom"]);
+    }
+
+    /// A file saved before window styles (a real window with only its first
+    /// fields) loads as it was and is written back byte for byte, its window
+    /// still plain (drawn as before); the new fields are held by clamp() and
+    /// saved and loaded like the others.
+    #[test]
+    fn a_window_saved_before_styles_loads_byte_for_byte() {
+        let old = RoomWindow { wall: "east".to_string(), along_m: 1.5, sill_m: 0.7, width_m: 2.0, height_m: 1.5, panes_x: 4, panes_y: 2, frame_m: 0.06, depth_m: Some(0.3), glass: Some(0.8), ..RoomWindow::default() };
+        let saved = HdriParams { mode: "studio".to_string(), studio: StudioParams { room: Some(RoomParams { windows: Some(vec![old]), ..RoomParams::default() }), ..StudioParams::default() }, ..HdriParams::default() };
+        let text = saved.to_json();
+        let window_text = saved.studio.room.as_ref().unwrap().real_windows()[0].serialize_json();
+        for key in ["style", "top", "rise_m", "lower_panes", "surround", "sill_out_m", "lintel_out_m", "door", "leaves", "leaf", "transom_m", "seed", "frame_color", "surround_color", "door_color"] {
+            assert!(!window_text.contains(&format!("\"{key}")), "{key} is not written for an old window: {window_text}");
+        }
+        let mut loaded = HdriParams::from_json(&text).unwrap();
+        assert!(loaded.clamp().is_empty());
+        assert_eq!(loaded.to_json(), text, "written back byte for byte");
+        let window = &loaded.studio.room.as_ref().unwrap().real_windows()[0];
+        assert!(window.is_plain() && window.style() == WindowStyle::Grid && window.surround() == WindowSurround::None);
+        // the new fields: out of range held, a name read loosely, kept through a save
+        let mut styled = HdriParams::default();
+        let wild = RoomWindow {
+            style: Some(" SASH ".to_string()),
+            top: Some("dome".to_string()),
+            rise_m: Some(40.0),
+            lower_panes_x: Some(0),
+            leaves: Some(5),
+            transom_m: Some(-1.0),
+            sill_out_m: Some(2.0),
+            frame_color: Some([2.0, -1.0, 0.5]),
+            ..RoomWindow::default()
+        };
+        styled.studio.room = Some(RoomParams { windows: Some(vec![wild]), ..RoomParams::default() });
+        let fixed = styled.clamp();
+        let w = &styled.studio.room.as_ref().unwrap().real_windows()[0];
+        assert_eq!((w.style.as_deref(), w.top.as_deref(), w.rise_m, w.lower_panes_x, w.leaves, w.transom_m, w.sill_out_m, w.frame_color), (Some("sash"), Some("flat"), Some(10.0), Some(1), Some(2), Some(0.0), Some(0.5), Some([1.0, 0.0, 0.5])));
+        assert_eq!(fixed.len(), 8, "{fixed:?}");
+        assert_eq!(HdriParams::from_json(&styled.to_json()).unwrap(), styled);
+    }
+
+    /// One seed's kit picks one building's set: two windows of one size match
+    /// in everything but their place, and its door shares their paint.
+    #[test]
+    fn a_kit_picks_one_set_per_seed() {
+        for kit in [WindowKit::Victorian, WindowKit::Factory, WindowKit::Modern] {
+            let at = |along_m: f32| RoomWindow { along_m, width_m: 1.4, height_m: 2.2, ..RoomWindow::default() }.with_kit(kit, 5, false);
+            let (a, b) = (at(-2.0), at(2.0));
+            assert_eq!(RoomWindow { along_m: 0.0, ..a.clone() }, RoomWindow { along_m: 0.0, ..b }, "{kit:?}");
+            assert!(!a.is_plain() && a.clamped() == a, "{kit:?}");
+            let door = RoomWindow { width_m: 1.0, height_m: 2.4, ..RoomWindow::default() }.with_kit(kit, 5, true);
+            assert!(door.is_door() && door.sill_m == 0.0 && door.frame_color == a.frame_color, "{kit:?}");
+        }
+        assert_eq!(RoomWindow::default().with_kit(WindowKit::Victorian, 1, false).style(), WindowStyle::Sash);
+        assert_eq!(RoomWindow::default().with_kit(WindowKit::Factory, 1, false).style(), WindowStyle::Steel);
+        assert_eq!(WindowKit::named("Factory"), Some(WindowKit::Factory));
     }
 }
 
@@ -5490,6 +6666,7 @@ mod weather_param_tests {
                 snow: i % 2 == 0,
                 lightning: i % 3 == 0,
                 seed: 7 + i as u32,
+                rain_on_water: (i % 2 == 1).then_some(true),
             });
             assert!(p.clamp().is_empty(), "{name} is a documented kind");
             assert_eq!(p.sky.weather.as_ref().unwrap().kind().as_str(), *name);
@@ -5926,7 +7103,7 @@ mod reader_tests {
             let (before, after, sky) = (Vec3f::all(0.25), vec3f(2.0, 1.5, 1.0), vec3f(0.3, 0.5, 0.9));
             for d in directions() {
                 same(a.apply(d, before, after), b.apply(d, before, after), format_args!("light {i}: what passes its extras at {d:?}"));
-                same(a.window(d, 0.5, before, sky), b.window(d, 0.5, before, sky), format_args!("light {i}: its window at {d:?}"));
+                same(a.window(d, 0.5, before, &|_| sky), b.window(d, 0.5, before, &|_| sky), format_args!("light {i}: its window at {d:?}"));
             }
         }
         // The two blocks' own readers, handed the face as `LightFx` hands it.
@@ -6025,7 +7202,7 @@ mod reader_tests {
     #[test]
     fn the_sky_layers_and_the_backdrop_read_as_clamp_holds_them() {
         let mut raw = HdriParams::default();
-        raw.sky.atmosphere = AtmosphereParams { haze: f32::INFINITY, air: f32::NAN, ozone: -1.0, ground_color: [f32::NAN, 2.0, -1.0] };
+        raw.sky.atmosphere = AtmosphereParams { haze: f32::INFINITY, air: f32::NAN, ozone: -1.0, ground_color: [f32::NAN, 2.0, -1.0], stratosphere: None, aerosol: None, haze_top_m: None, viewer_height_m: Some(f32::NAN) };
         raw.sky.sun_disc = SunDiscParams { size_deg: f32::INFINITY, softness: f32::NEG_INFINITY, ..SunDiscParams::default() };
         raw.sky.sun.month = 2;
         raw.sky.sun.day = 31;
@@ -6043,6 +7220,7 @@ mod reader_tests {
             milky_way: Some(MilkyWayParams { on: true, strength: f32::INFINITY, turn_deg: f32::NAN, tilt_deg: 200.0, core: f32::NAN, dust: -1.0 }),
             nebulas: Some(NebulaParams { on: true, amount: f32::NAN, size: f32::INFINITY, brightness: -1.0, realism: 2.0, seed: 3 }),
             aurora: Some(AuroraParams { on: true, strength: f32::INFINITY, color: "Storm ".to_string(), mix: [f32::NAN; 3], direction_deg: f32::NAN, height_deg: 500.0, width_deg: f32::NEG_INFINITY, folds: f32::NAN, rays: 7.0, seed: 1 }),
+            light_pollution: Some(LightPollutionParams { on: true, strength: f32::INFINITY, azimuth_deg: f32::NAN, distance_km: -4.0, lamps: f32::NAN }),
         };
         raw.studio = StudioParams { top: [f32::NAN, 20.0, -1.0], horizon: [0.5, f32::INFINITY, 0.2], floor: [0.1; 3], horizon_softness: f32::NAN, room: None };
         let mut clamped = raw.clone();

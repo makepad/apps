@@ -28,7 +28,7 @@ fn organic_relaxes_the_ledctl_fixture() {
     let nets = scope_nets(&base.board, &base.conn, &RouteScope::All);
     let world = Arc::new(RBase::build(&base.board));
     // Effort 1: the cheapest grid route of the fixture; the relaxer settles well inside its 100-step bound.
-    let p = problem(&base, world, &nets, Style::FortyFive, Effort(1));
+    let p = problem(&base, world, &nets, Style::FortyFive, Effort::Full);
     let grid = GridRouter::default().route(&p, &Progress::new());
     let first_step = grid.metrics.work.transactions;
 

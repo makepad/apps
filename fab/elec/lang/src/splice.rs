@@ -34,6 +34,49 @@ use makepad_script::syntax::{self, Kind, Syntax};
 use std::collections::BTreeMap;
 use std::ops::Range;
 
+/// All components made by exactly the same source call, including instances on other boards.
+#[derive(Default)]
+pub struct SharedCalls {
+    members: BTreeMap<CompRef, std::sync::Arc<[CompRef]>>,
+}
+impl SharedCalls {
+    pub fn new(design: &Design, map: &SourceMap) -> Self {
+        let mut by_call = BTreeMap::new();
+        for unit in &design.units {
+            for c in &unit.circuit.comps {
+                let part = CompRef { board: unit.id, comp: c.id };
+                if let Some(at) = map.locate(&Sel::Comp(part)) {
+                    by_call.entry((at.doc, at.span.start, at.span.end)).or_insert_with(Vec::new).push(part);
+                }
+            }
+        }
+        let mut members = BTreeMap::new();
+        for group in by_call.into_values().filter(|g| g.len() > 1) {
+            let group: std::sync::Arc<[CompRef]> = group.into();
+            for part in group.iter() { members.insert(*part, group.clone()); }
+        }
+        Self { members }
+    }
+
+    pub fn group(&self, part: CompRef) -> &[CompRef] {
+        self.members.get(&part).map_or(&[], |g| &g[..])
+    }
+
+    /// A partial selection cannot write the call without also changing unselected instances.
+    pub fn partial_groups(&self, parts: &[CompRef]) -> Vec<&[CompRef]> {
+        let mut counts = BTreeMap::new();
+        for part in parts.iter().copied().collect::<std::collections::BTreeSet<_>>() {
+            if let Some(&first) = self.group(part).first() {
+                *counts.entry(first).or_insert(0) += 1;
+            }
+        }
+        counts.into_iter().filter_map(|(first, count)| {
+            let group = self.group(first);
+            (count < group.len()).then_some(group)
+        }).collect()
+    }
+}
+
 /// The text side of one commit.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct SpanEdit {
@@ -157,7 +200,8 @@ pub(crate) fn splice_inner(
     ops: &[DesignOp],
     resolve_drives: bool,
 ) -> Result<SpanEdit, Diag> {
-    let mut out = SpanEdit::default();
+    let edits = pin_splice::assembly_edits(sources, map, design, ops)?;
+    let mut out = SpanEdit { reevaluate: !edits.is_empty(), edits, ..SpanEdit::default() };
     let mut written = Vec::new();
     // Board ops and factory headers: one splice per unit, the unit's ops in commit order.
     let mut units: Vec<BoardId> = Vec::new();
@@ -265,7 +309,7 @@ pub(crate) fn splice_inner(
                             DesignOp::Circuit { unit: u, op: CircuitOp::Disconnect { pin: (c, p) } } if u == unit && c == comp && p == pin));
                         pin_splice::no_connect(sources, map, design, *unit, *comp, *pin, *nc, freed)?
                     }
-                    CircuitOp::SetField { comp, key, text } => pin_splice::set_field(sources, map, design, *unit, *comp, key, text.as_deref())?,
+                    CircuitOp::SetField { .. } | CircuitOp::SetDnp { .. } => continue, // spliced by expression above
                     CircuitOp::SetRef { comp, to } => circuit_splice::set_ref(sources, map, design, *unit, *comp, to.as_deref())?,
                     CircuitOp::SetBody { part, body } => circuit_splice::set_body(sources, map, design, *unit, part, body.as_deref())?,
                     CircuitOp::AddPart { .. } | CircuitOp::InsertSeries { .. } | CircuitOp::Hint { .. } | CircuitOp::NetStyle { .. } |

@@ -295,6 +295,11 @@ impl Demo {
         if !docs.is_empty() {
             model.set_docs(Arc::new(docs));
         }
+        let files = self.files.iter().map(|&(name, source)| {
+            let relative = if elec(name) { format!("{}.elec/{name}", self.key) } else { name.to_owned() };
+            (relative, Arc::from(source.as_bytes()))
+        }).collect();
+        model.opened_files = Some(fab_model::LoadedProject { manifest: project, files });
         Ok(model)
     }
 }

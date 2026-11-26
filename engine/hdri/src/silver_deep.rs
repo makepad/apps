@@ -36,6 +36,7 @@
 //! few microseconds; only a deep silver umbrella pays it.
 use makepad_draw::*;
 
+use super::modifier::log_uniform;
 use super::noise::{fbm2, hash01, value2};
 
 const DEG: f32 = std::f32::consts::PI / 180.0;
@@ -184,6 +185,33 @@ struct Look {
     spark_p: f32,
     scratch: f32,
     scr_t: f32,
+    /// How big the fabric's features are on the face: the folds, ribs,
+    /// troughs, seams, wrinkles, rumples, weave, crinkle, sparkle and
+    /// scratches keep their size in the cloth, so on a smaller umbrella they
+    /// take a larger share of its radius (1 for the deep 165 cm bowl).
+    size: f32,
+    /// Where the seam down a panel's middle starts, over the radius, and
+    /// its width.
+    seam_from: f32,
+    seam_w: f32,
+    /// The foil's grain: one flat facet per grain (a grain 0.0064 of the
+    /// radius at `size` 1), each mirroring the light at its own tilt
+    /// (log-uniform over a factor e^`grain`; 0 none).
+    grain: f32,
+    /// The seam down a panel's middle as the cloth's height, from the
+    /// panel's tension map (`DeepSilver::seam_height`): its puckers' height
+    /// where the ribs pull across it, the sewn ridge's height, and how
+    /// strongly the flash picks out their slopes (0, 0: the painted `seam`
+    /// line alone).
+    pucker: f32,
+    seam_ridge: f32,
+    seam_light: f32,
+    /// The seam's stitched fold: where the two panels are sewn the cloth
+    /// turns under into a narrow steep groove down the seam. On the mirror
+    /// foil any tilt turns the flash's reflection away, so both its walls
+    /// darken by their slope, wherever the flash is: RLS025's seams read as
+    /// thin dark lines right into the hub. How strongly (0 none).
+    stitch: f32,
 }
 
 const DEEP: Look = Look {
@@ -279,6 +307,43 @@ const DEEP: Look = Look {
     spark_p: 0.0002,
     scratch: 0.3,
     scr_t: 0.9,
+    size: 1.0,
+    seam_from: 0.7,
+    seam_w: 0.0022,
+    grain: 1.5,
+    pucker: 0.0,
+    seam_ridge: 0.0,
+    stitch: 0.0,
+    seam_light: 0.0,
+};
+
+/// A shallow silver bowl's dull fabric (`DeepSilver::shallow`): the deep
+/// bowl's gores, ribs, folds and foil, without their rise toward the rim (the
+/// shallow bowl's hot ring, `Modifier::silver_profile_at`, sets the level
+/// over the radius); its cloth's features at their size on RLS025's 105 cm
+/// bowl. As RLS025's: no lighter panel middle (the light runs beside the
+/// ribs and seams, `Modifier::silver_umbrella`), the ribs bright lines where
+/// the bowl mirrors the flash, the seams sewn ridges from near the hub that
+/// pucker where the ribs pull across them (`seam_height`, lit), and
+/// the foil grainy, and each gore curved more steeply away from its ribs
+/// (a broad dark trough beside each, one side lighter).
+const SHALLOW: Look = Look {
+    out_rise: 0.0,
+    outer_mid: 0.0,
+    rib_in: -0.6,
+    seam: 1.0,
+    seam_w: 0.004,
+    pucker: 0.014,
+    seam_ridge: 0.0015,
+    seam_light: 1.2,
+    stitch: 2.5,
+    size: 165.0 / 105.0,
+    seam_from: 0.06,
+    grain: 1.0,
+    trough: 0.5,
+    trough_w: 0.06,
+    tilt: 0.4,
+    ..DEEP
 };
 
 /// One fold size: its layer number (for the hashes), the cell along a rib
@@ -298,16 +363,9 @@ const FOLD_SIZES: [FoldSize; 2] = [
     FoldSize { layer: 1, cell: 0.013, lens: (0.02, 0.05), wids: (0.006, 0.011), keep: DEEP.keep_small, amp: DEEP.fold_small },
 ];
 
-fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
-    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
+use crate::patterns::smooth;
 
-/// exp(-(x / sigma)²).
-fn gauss(x: f32, sigma: f32) -> f32 {
-    let t = x / sigma;
-    (-t * t).exp()
-}
+use crate::patterns::gauss;
 
 /// value2 at the prototype's spread (`NOISE_MATCH`), in about [0, 1].
 fn vn(x: f32, y: f32, seed: u32) -> f32 {
@@ -381,6 +439,8 @@ struct Fold {
 /// cotangent, which finds a point's cell) and the folds, side by side.
 #[derive(Clone, Debug)]
 struct FoldTable {
+    /// The cell along a rib, at the look's size.
+    cell: f32,
     cells: usize,
     cot: Vec<f32>,
     folds: Vec<Fold>,
@@ -400,17 +460,65 @@ pub struct DeepSilver {
     side_amp: Vec<f32>,
     tables: [FoldTable; 2],
     /// The face's mean over the polygon, with the stand's colour in units of
-    /// the result (`new`), which `factor` divides by.
+    /// the result (`new`), which `factor` divides by; for the dull fabric
+    /// alone (`shallow`), its mean, which `fabric` divides by.
     level: f32,
+    look: &'static Look,
 }
 
 impl DeepSilver {
     /// The face of an umbrella with `ribs` ribs (at least 3), its folds and
     /// glints from `seed`.
     pub fn new(ribs: u32, seed: u32) -> DeepSilver {
+        let mut deep = Self::build(ribs, seed, &DEEP);
+        // The level: the face behind the stand and the stand's colour,
+        // averaged over the polygon. The stand's colour is in units of the
+        // final mean, so the level solves for it.
+        let n = TABLE_SAMPLES;
+        let (mut face_sum, mut stand_sum, mut count) = (0.0f64, 0.0f64, 0u32);
+        for j in 0..n {
+            for i in 0..n {
+                let x = (i as f32 + 0.5) / n as f32 * 2.0 - 1.0;
+                let y = (j as f32 + 0.5) / n as f32 * 2.0 - 1.0;
+                if let Some(face) = deep.face(x, y, false) {
+                    let (alpha, colour) = deep.stand(x, y);
+                    face_sum += (face * (1.0 - alpha)) as f64;
+                    stand_sum += (alpha * colour) as f64;
+                    count += 1;
+                }
+            }
+        }
+        if count > 0 {
+            let (face_mean, stand_mean) = (face_sum / count as f64, stand_sum / count as f64);
+            deep.level = ((face_mean / (1.0 - stand_mean).max(0.5)) as f32).max(1.0e-6);
+        }
+        deep
+    }
+
+    /// A shallow silver bowl's dull fabric alone (`fabric`): the deep bowl's
+    /// curved gores, ribs, rib folds, rumples, wrinkle bands and foil, with
+    /// no flash's reflection and no stand, its mean 1 over the polygon.
+    pub fn shallow(ribs: u32, seed: u32) -> DeepSilver {
+        let mut foil = Self::build(ribs, seed, &SHALLOW);
+        let n = TABLE_SAMPLES;
+        let (mut sum, mut count) = (0.0f64, 0u32);
+        for j in 0..n {
+            for i in 0..n {
+                let x = (i as f32 + 0.5) / n as f32 * 2.0 - 1.0;
+                let y = (j as f32 + 0.5) / n as f32 * 2.0 - 1.0;
+                if let Some(face) = foil.face(x, y, true) {
+                    sum += face as f64;
+                    count += 1;
+                }
+            }
+        }
+        foil.level = if count > 0 { ((sum / count as f64) as f32).max(1.0e-6) } else { 1.0 };
+        foil
+    }
+
+    fn build(ribs: u32, seed: u32, look: &'static Look) -> DeepSilver {
         let ribs = ribs.max(3) as usize;
         let half = std::f32::consts::PI / ribs as f32;
-        let look = &DEEP;
         let panels = (0..ribs as i32)
             .map(|k| {
                 let creases = std::array::from_fn(|ci| {
@@ -453,30 +561,8 @@ impl DeepSilver {
                 }
             })
             .collect();
-        let tables = [Self::fold_table(&FOLD_SIZES[0], sides, half, seed), Self::fold_table(&FOLD_SIZES[1], sides, half, seed)];
-        let mut deep = DeepSilver { ribs, half, cos_half: half.cos(), sin_half: half.sin(), seed, panels, side_amp, tables, level: 1.0 };
-        // The level: the face behind the stand and the stand's colour,
-        // averaged over the polygon. The stand's colour is in units of the
-        // final mean, so the level solves for it.
-        let n = TABLE_SAMPLES;
-        let (mut face_sum, mut stand_sum, mut count) = (0.0f64, 0.0f64, 0u32);
-        for j in 0..n {
-            for i in 0..n {
-                let x = (i as f32 + 0.5) / n as f32 * 2.0 - 1.0;
-                let y = (j as f32 + 0.5) / n as f32 * 2.0 - 1.0;
-                if let Some(face) = deep.face(x, y) {
-                    let (alpha, colour) = deep.stand(x, y);
-                    face_sum += (face * (1.0 - alpha)) as f64;
-                    stand_sum += (alpha * colour) as f64;
-                    count += 1;
-                }
-            }
-        }
-        if count > 0 {
-            let (face_mean, stand_mean) = (face_sum / count as f64, stand_sum / count as f64);
-            deep.level = ((face_mean / (1.0 - stand_mean).max(0.5)) as f32).max(1.0e-6);
-        }
-        deep
+        let tables = [Self::fold_table(&FOLD_SIZES[0], sides, half, seed, look), Self::fold_table(&FOLD_SIZES[1], sides, half, seed, look)];
+        DeepSilver { ribs, half, cos_half: half.cos(), sin_half: half.sin(), seed, panels, side_amp, tables, level: 1.0, look }
     }
 
     /// The folds of one size on every rib side, a cell at a time along the
@@ -484,9 +570,10 @@ impl DeepSilver {
     /// found). A rib side's folds share a slant (with a little jitter per
     /// fold) and gather in runs (a smooth noise along the rib); each side's
     /// fold zone sits a little in or out.
-    fn fold_table(size: &FoldSize, sides: usize, half: f32, seed: u32) -> FoldTable {
-        let look = &DEEP;
-        let cells = (1.1 / size.cell) as usize + 8;
+    fn fold_table(size: &FoldSize, sides: usize, half: f32, seed: u32, look: &Look) -> FoldTable {
+        let k = look.size;
+        let (cell, lens, wids) = (size.cell * k, (size.lens.0 * k, size.lens.1 * k), (size.wids.0 * k, size.wids.1 * k));
+        let cells = (1.1 / cell) as usize + 8;
         let lay = size.layer;
         let sin_half = half.sin();
         let mut cot = Vec::with_capacity(sides);
@@ -498,15 +585,15 @@ impl DeepSilver {
             for j in 0..cells as i32 {
                 let cell_j = j - 4;
                 let hk = |f: i32| hash01(q, cell_j, 100 + lay * 32 + f, seed);
-                let a0 = (cell_j as f32 + 0.15 + 0.7 * hk(2)) * size.cell;
+                let a0 = (cell_j as f32 + 0.15 + 0.7 * hk(2)) * cell;
                 let clus = smooth(0.3, 0.7, vn(a0 * look.clus_f + 0.37, q as f32 * 7.31 + lay as f32 * 3.3 + 0.5, seed.wrapping_add(3)));
                 let exists = hk(1) < size.keep * (0.1 + 0.9 * clus);
                 let al = al_side + 20.0 * DEG * (hk(3) - 0.5);
                 let (sa, ca) = (al.sin(), al.cos());
                 // It ends near the panel's centreline.
                 let longest = (look.reach * a0 * sin_half / (sa + ca * sin_half)).max(0.001);
-                let len = (size.lens.0 * (size.lens.1 / size.lens.0).powf(hk(4))).max(0.001).min(longest);
-                let width = (size.wids.0 + (size.wids.1 - size.wids.0) * hk(5)) * (len / size.lens.1).powf(0.3);
+                let len = (lens.0 * (lens.1 / lens.0).powf(hk(4))).max(0.001).min(longest);
+                let width = (wids.0 + (wids.1 - wids.0) * hk(5)) * (len / lens.1).powf(0.3);
                 let aw = a0 - zone;
                 let window = smooth(0.1, 0.2, a0) * (0.15 + 0.85 * smooth(0.24, 0.38, aw)) * (1.0 - 0.55 * smooth(0.55, 0.75, aw)) * (1.0 - smooth(0.86, 0.94, a0));
                 let amp = if exists && len > 0.008 { size.amp * (0.35 + 0.65 * hk(6).powf(0.7)) * window * (0.7 + 0.3 * clus) } else { 0.0 };
@@ -514,7 +601,7 @@ impl DeepSilver {
                 folds.push(Fold { a0, ca, sa, len, width, amp, bend: (hk(7) - 0.5) * 0.3, t0, end: 0.45 + 0.35 * hk(10), phase: hk(11) * 6.28 });
             }
         }
-        FoldTable { cells, cot, folds }
+        FoldTable { cell, cells, cot, folds }
     }
 
     /// The folds of one size at a point `a` along its nearest rib from the
@@ -523,9 +610,9 @@ impl DeepSilver {
     /// A fold is a crisp bar: hard edges about a pixel wide, brightest at its
     /// lip (the rim side), pointed at its far end, a softly lit broad flank
     /// on its hub side, a hard dark crease beyond the lip.
-    fn folds(&self, table: &FoldTable, cell: f32, a: f32, d: f32, q: usize, hw: f32) -> (f32, f32) {
-        let look = &DEEP;
-        let (e, cw) = (look.edge_px, look.crease_w);
+    fn folds(&self, table: &FoldTable, a: f32, d: f32, q: usize, hw: f32) -> (f32, f32) {
+        let look = self.look;
+        let (e, cw, cell) = (look.edge_px * look.size, look.crease_w, table.cell);
         let jq = ((a + d * table.cot[q]) / cell).floor() as i32 + 4;
         let (mut g, mut k) = (0.0f32, 0.0f32);
         for dj in -2..=2 {
@@ -558,10 +645,59 @@ impl DeepSilver {
         (g * fade, k * fade)
     }
 
+    /// The seam down a panel's middle as the cloth's height at `along` the
+    /// seam from the hub and `across` it (box units), on panel `kf`, from the
+    /// panel's tension map (the owner's fabric recipe): the two rib tips at
+    /// the panel's corners pull the cloth toward them (weighted 1 / r^2), the
+    /// hub holds it along the seam. Where the pull runs along the seam (near
+    /// the hub) it is a taut, straight sewn ridge; where the tips pull across
+    /// it (from about a third of the radius out) the cloth is slack along it
+    /// and the seam puckers: short folds whose crests run along the tension,
+    /// across the seam, sampled in that frame (stretched along the tension,
+    /// squeezed across it, domain-warped, a crease profile), a little longer
+    /// the slacker the seam, in runs; the hem holds the seam's end flat.
+    /// Lengths at the look's `size`.
+    fn seam_height(&self, along: f32, across: f32, kf: f32) -> f32 {
+        let look = self.look;
+        let sz = look.size;
+        let seed = |k: u32| self.seed.wrapping_add(k);
+        // The tension map: the tips' pull along and across the seam, and the hub's hold.
+        let (mut t_along, mut t_across) = (1.0f32, 0.0f32);
+        for side in [-1.0f32, 1.0] {
+            let (va, vc) = (self.cos_half - along, side * self.sin_half - across);
+            let d2 = va * va + vc * vc + 0.01;
+            let d = d2.sqrt();
+            let w = 1.0 / d2;
+            t_along += w * va.abs() / d;
+            t_across += w * vc.abs() / d;
+        }
+        let slack = t_across / (t_along + t_across);
+        let on = smooth(look.seam_from - 0.02, look.seam_from + 0.02, along) * (1.0 - smooth(0.88, 0.96, along));
+        // The sewn ridge, wandering a little where the seam is slack.
+        let wander = 0.003 * sz * slack * fbm(along * 15.0 / sz + kf * 2.7, kf * 1.3, 2, seed(141));
+        let ridge = look.seam_ridge * sz * gauss(across - wander, 0.003 * sz);
+        // The puckers in the tension frame: along the tension is across the
+        // seam (stretched: the folds run long that way), across the tension
+        // is along the seam (squeezed: a fold every `spacing`).
+        let spacing = 0.03 * sz;
+        let reach = (0.015 + 0.025 * slack) * sz;
+        let warp = fbm(along * 6.0 / sz + kf * 3.3, across * 20.0 / sz, 2, seed(151));
+        let ut = across / reach * 0.35 + 2.0 * warp;
+        let vt = along / spacing + 1.5 * warp + kf * 7.1;
+        let v = (fbm2(ut, vt, 3, seed(161)) - 0.5) * 1.6 + 0.5;
+        let v = v.clamp(0.0, 1.0);
+        let profile = 0.7 * (1.0 - (2.0 * v - 1.0).abs()) + 0.3 * v;
+        let runs = smooth(0.25, 0.5, vn(along * 4.0 / sz + kf * 3.1, kf * 5.7, seed(171)));
+        let puckers = look.pucker * sz * smooth(0.25, 0.45, slack) * runs * gauss(across, reach) * profile;
+        on * (ridge + puckers)
+    }
+
     /// The face at (`x`, `y`) before the level and without the stand; None
-    /// outside the polygon.
-    fn face(&self, x: f32, y: f32) -> Option<f32> {
-        let look = &DEEP;
+    /// outside the polygon. With `fabric` only the dull fabric: no flash's
+    /// reflection, its glints or its brightening of the ribs and foil.
+    fn face(&self, x: f32, y: f32, fabric: bool) -> Option<f32> {
+        let look = self.look;
+        let sz = look.size;
         let half = self.half;
         let r = x.hypot(y);
         let theta = y.atan2(x);
@@ -603,7 +739,7 @@ impl DeepSilver {
         let ocrease = (look.crease * (8.0 * cr).tanh() + 0.3 * look.crease * (8.0 * cr2).tanh()).exp();
         let warp = fbm(s * 1.5 + kf * 3.3, r * 3.0, 3, seed(29));
         let clus = smooth(0.4, 0.7, 0.5 + fbm(s * 1.8 + kf * 2.1, r * 3.5, 3, seed(31)));
-        let crinkle = fbm(along * 70.0 + kf * 3.1, across * 70.0, 2, seed(61));
+        let crinkle = fbm(along * (70.0 / sz) + kf * 3.1, across * (70.0 / sz), 2, seed(61));
         let broad = fbm(along * 3.5 + kf * 1.3, across * 5.0 + kf * 0.7, 3, seed(91));
         // Rumples: soft elongated creases near the radius in two slants, each
         // with a crisp lit crest and a shadowed side (a ridged noise embossed
@@ -613,10 +749,10 @@ impl DeepSilver {
             let famf = fam as f32;
             let u_ = along * ca + across * sa;
             let v_ = -along * sa + across * ca;
-            let ph = v_ * 32.0 + 0.5 + fbm(u_ * 2.5 + kf * 2.3 + famf * 5.0, v_ * 4.0, 2, seed(111 + fam as u32));
-            let ridge = |dv: f32| (1.0 - (std::f32::consts::PI * (ph + dv * 32.0)).sin().abs()).powi(5);
-            let run = smooth(0.55, 0.75, 0.5 + fbm(u_ * 10.0 + famf * 3.1, v_ * 20.0 + kf * 1.1, 2, seed(121 + fam as u32)));
-            rumple += (ridge(0.0) - ridge(0.005)) * run * (0.5 + 0.5 * famf);
+            let ph = v_ * (32.0 / sz) + 0.5 + fbm(u_ * 2.5 + kf * 2.3 + famf * 5.0, v_ * 4.0, 2, seed(111 + fam as u32));
+            let ridge = |dv: f32| (1.0 - (std::f32::consts::PI * (ph + dv * (32.0 / sz))).sin().abs()).powi(5);
+            let run = smooth(0.55, 0.75, 0.5 + fbm(u_ * (10.0 / sz) + famf * 3.1, v_ * (20.0 / sz) + kf * 1.1, 2, seed(121 + fam as u32)));
+            rumple += (ridge(0.0) - ridge(0.005 * sz)) * run * (0.5 + 0.5 * famf);
         }
         let mesh_amp = 0.6 + 0.8 * (0.5 + fbm(along * 12.0 + kf * 1.7, across * 12.0, 2, seed(67)));
         let mesh_warp = fbm(along * 20.0, across * 20.0 + kf * 2.9, 2, seed(73));
@@ -641,8 +777,8 @@ impl DeepSilver {
         // ------------------------------------------------ the crease folds on the ribs
         let (mut g, mut kd) = (0.0f32, 0.0f32);
         if r > 0.07 && r < 0.95 {
-            for (table, size) in self.tables.iter().zip(&FOLD_SIZES) {
-                let (gl, kl) = self.folds(table, size.cell, a, d, q, hwf);
+            for table in &self.tables {
+                let (gl, kl) = self.folds(table, a, d, q, hwf);
                 g = g.max(gl * self.side_amp[q]);
                 kd = kd.max(kl * self.side_amp[q]);
             }
@@ -685,10 +821,36 @@ impl DeepSilver {
         let upside = if theta.sin() < rib_angle.sin() { 1.0 } else { 0.0 };
         let dn = d / hwf.max(1.0e-3);
         let sheen = look.sheen * upside * gauss(dn - look.sheen_d, look.sheen_w) * smooth(0.3, 0.5, r);
-        let trough = 1.0 - look.trough * (-d / (look.trough_w * (0.3 + r))).exp();
+        let trough = 1.0 - look.trough * (-d / (look.trough_w * sz * (0.3 + r))).exp();
         let gore = (1.0 + look.outer_mid * smooth(0.9, 0.2, s.abs()) + look.tilt * (upside - 0.5) * (1.0 - dn)) * trough + sheen;
         let mut outer = look.floor * gore * (1.0 + look.out_rise * smooth(0.55, 0.85, r)) * (1.0 + look.tilt * 0.5 * b * s) * panel.shade * ocrease * (1.0 + look.broad * 2.0 * broad);
         outer *= 1.0 + look.facet_diff * ga / 0.25;
+        // The seam's height lit by the flash below the hub: a slope facing it
+        // brighter, one facing away darker (the normal from the height's slope).
+        if look.pucker > 0.0 || look.seam_ridge > 0.0 {
+            let e = 0.0015 * sz;
+            let h0 = self.seam_height(along, across, kf);
+            let ha = (self.seam_height(along + e, across, kf) - h0) / e;
+            let hc = (self.seam_height(along, across + e, kf) - h0) / e;
+            // The slope in the face (the seam's along and across directions at the panel's angle `c`).
+            let (sc, cc) = c.sin_cos();
+            let (gx, gy) = (ha * cc - hc * sc, ha * sc + hc * cc);
+            let (lx, ly) = (-x, -0.1 - y);
+            let ll = lx.hypot(ly).max(1.0e-3);
+            outer *= (-look.seam_light * (gx * lx + gy * ly) / ll).clamp(-1.0, 1.0).exp();
+        }
+        // The stitched fold: a groove of depth `w` and width `w` down the
+        // seam, its walls' slope (the gaussian's, peak about 0.86 at
+        // 0.7 w off the seam) darkening the mirror foil; deepest near the hub,
+        // where the seam is taut, shallower out where it puckers.
+        if look.stitch > 0.0 {
+            let w = 0.008 * sz;
+            let xs = across / w;
+            let slope = 2.0 * xs.abs() * (-xs * xs).exp();
+            let on = smooth(look.seam_from - 0.02, look.seam_from + 0.02, along) * (1.0 - smooth(0.88, 0.96, along));
+            let taut = 1.0 - 0.5 * smooth(0.3, 0.7, r);
+            outer *= (-look.stitch * slope * on * taut).exp();
+        }
         outer *= (1.0 + look.g_out * g - look.k_out * kc).clamp(0.3, 3.0);
         // Beyond the lobe a fold's crest can still face the flash: isolated
         // glint bars on the dull fabric, fading outward.
@@ -696,31 +858,34 @@ impl DeepSilver {
         let glint = look.plateau * look.glint_far * panel.lobe * far * g.min(1.2) * (1.0 - look.k_cliff * kc);
         // Wavy wrinkle bands across the gore, in clusters: a soft face toward
         // the light and a crisper shadowed face.
-        let wph = (along + 0.35 * across * sgn + 0.06 * warp * 4.0) / look.wr_pitch * (1.0 + 0.25 * warp);
+        let wph = (along + 0.35 * across * sgn + 0.06 * warp * 4.0) / (look.wr_pitch * sz) * (1.0 + 0.25 * warp);
         let fr = wph - wph.floor();
         let wshape = (if fr < 0.7 { smooth(0.0, 0.7, fr) } else { 1.0 - smooth(0.7, 0.82, fr) }) * 2.0 - 1.0;
         let wamp = look.wrinkle * clus * smooth(0.72, 0.85, r) * (1.0 - smooth(0.95, 0.985, r));
         outer *= (1.0 + wamp * wshape) * (1.0 + look.rumple * rumple * smooth(0.2, 0.4, r));
+        let (spec, glint, env) = if fabric { (0.0, 0.0, 1.0) } else { (spec, glint, env) };
         let mut l = outer + spec + glint;
-        let bright = smooth(0.0, 0.5, env);
+        // The fabric alone (a shallow bowl): bright where its ring mirrors the
+        // flash, out to about two thirds of the radius.
+        let bright = if fabric { 1.0 - smooth(0.35, 0.7, r) } else { smooth(0.0, 0.5, env) };
 
         // ------------------------------------------------ ribs: thin dark lines (thinner in the core), a lit edge
-        let w = look.rib_w * (1.0 - 0.3 * smooth(0.45, 0.75, r)) * (0.75 + 0.25 * smooth(0.1, 0.45, r)) * (0.45 + 0.55 * smooth(0.02, 0.14, r));
+        let w = look.rib_w * sz * (1.0 - 0.3 * smooth(0.45, 0.75, r)) * (0.75 + 0.25 * smooth(0.1, 0.45, r)) * (0.45 + 0.55 * smooth(0.02, 0.14, r));
         let rib_dark = look.rib_out + (look.rib_in - look.rib_out) * bright;
         l *= 1.0 - rib_dark.clamp(0.0, 0.97) * gauss(d, 0.4 * w);
         l *= 1.0 + look.rib_lift * upside * gauss(d - 0.8 * w, 0.3 * w) * (1.0 - 0.7 * bright);
-        let knot = gauss(a - 0.45, 0.007) * gauss(d, 0.7 * w);
+        let knot = gauss(a - 0.45, 0.007 * sz) * gauss(d, 0.7 * w);
         l *= 1.0 - (1.0 - look.knot) * knot;
 
         // ------------------------------------------------ the outer zone: seam, rim, the thin light bound edge
-        let seam = 1.0 - (1.0 - look.seam) * gauss(r * sin_d.abs(), 0.0022) * smooth(0.68, 0.72, r);
+        let seam = 1.0 - (1.0 - look.seam) * gauss(r * sin_d.abs(), look.seam_w * sz) * smooth(look.seam_from - 0.02, look.seam_from + 0.02, r);
         let rim = 1.0 - (1.0 - look.rim_dim) * smooth(0.86, 0.96, r);
         let hem_d = self.cos_half - along;
         let bound = 1.0 + look.bound * gauss(hem_d - 0.011, 0.0035);
         l *= seam * rim * bound;
 
         // ------------------------------------------------ fine fabric: woven foil mesh, crinkle, crinkle glints, sparkle
-        let pw = look.weave_pitch;
+        let pw = look.weave_pitch * sz;
         let mw = mesh_warp * 0.6;
         let pi = std::f32::consts::PI;
         let mesh = 0.5 * ((pi * (along / pw + mw)).cos().abs().powi(8) + (pi * (across / pw - mw)).cos().abs().powi(8)) - 0.12;
@@ -730,13 +895,13 @@ impl DeepSilver {
         // Crinkle glints: small crisp dashes across the radius where a crinkle
         // faces the flash; more near the light.
         let (ca, sa) = ((25.0 * DEG).cos(), (25.0 * DEG).sin() * sgn);
-        let cgn = vn((along * ca + across * sa) * 160.0 + kf * 3.3, (across * ca - along * sa) * 45.0 + kf * 7.1, seed(101));
+        let cgn = vn((along * ca + across * sa) * (160.0 / sz) + kf * 3.3, (across * ca - along * sa) * (45.0 / sz) + kf * 7.1, seed(101));
         let cmask = smooth(look.cg_t, look.cg_t + 0.03, cgn) * clus;
         let near_light = smooth(0.3, 0.45, r) * (1.0 - 0.6 * smooth(0.55, 0.9, r)) * (1.0 - smooth(0.97, 0.99, r));
         l *= 1.0 + look.cglint * cmask * near_light * (1.0 - bright);
         // Sparkle: a few pinpoint glints in the foil, in cells of a 700 pixel
         // face.
-        let (ix, iy) = (((x + 1.0) * 350.0).floor() as i32, ((y + 1.0) * 350.0).floor() as i32);
+        let (ix, iy) = (((x + 1.0) * (350.0 / sz)).floor() as i32, ((y + 1.0) * (350.0 / sz)).floor() as i32);
         if bright < 0.5 && hash01(ix, iy, 0, seed(7)) < look.spark_p * smooth(0.3, 0.6, r) {
             l *= 1.0 + look.sparkle;
         }
@@ -747,9 +912,14 @@ impl DeepSilver {
             let (cn, sn) = (an.cos(), an.sin());
             let u_ = along * cn + across * sn;
             let v_ = -along * sn + across * cn;
-            let sc = vn(u_ * 9.0 + kf * 3.7 + famf * 11.0, v_ * 340.0 + kf * 5.3, seed(81 + fam));
+            let sc = vn(u_ * (9.0 / sz) + kf * 3.7 + famf * 11.0, v_ * (340.0 / sz) + kf * 5.3, seed(81 + fam));
             let line = smooth(look.scr_t, look.scr_t + 0.06, sc);
             l *= 1.0 + look.scratch * line * (1.0 - 1.7 * bright) * (0.3 + 0.7 * smooth(0.0, 0.3, env));
+        }
+        // The grain: a facet per grain, each at its own tilt (mean 1).
+        if look.grain > 0.0 {
+            let (gx, gy) = (((x + 1.0) * (156.0 / sz)).floor() as i32, ((y + 1.0) * (156.0 / sz)).floor() as i32);
+            l *= log_uniform(hash01(gx, gy, 3, seed(131)), look.grain);
         }
         // ------------------------------------------------ the hem
         if hem_d.abs() < 0.004 {
@@ -813,11 +983,23 @@ impl DeepSilver {
         (alpha, colour)
     }
 
+    /// A shallow bowl's dull fabric at `u` (box units, the ribs' ends at
+    /// radius 1): mean 1 over the polygon, 1 outside it.
+    pub fn fabric(&self, u: Vec2f) -> f32 {
+        self.face(u.x, u.y, true).map_or(1.0, |f| f / self.level)
+    }
+
+    /// `factor` without the strobe head and its stand in front, which a
+    /// light's 3D model draws as geometry (light_model.rs).
+    pub fn factor_bare(&self, u: Vec2f) -> f32 {
+        self.face(u.x, u.y, false).map_or(0.0, |face| face / self.level)
+    }
+
     /// The face's emission at `u` (box units, the ribs' ends at radius 1) as
     /// a share of the light's: mean 1 over the polygon, 0 outside it, about
     /// 220 in the clipped core, 0.004 to 0.12 on the stand and the head.
     pub fn factor(&self, u: Vec2f) -> f32 {
-        match self.face(u.x, u.y) {
+        match self.face(u.x, u.y, false) {
             Some(face) => {
                 let (alpha, colour) = self.stand(u.x, u.y);
                 face * (1.0 - alpha) / self.level + alpha * colour

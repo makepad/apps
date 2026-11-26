@@ -1,0 +1,26 @@
+// Music ducked under a voiceover with subtitles.
+use mod.flow.*
+use mod.cut.*
+
+let demo   = Clip{src: run("ast_fklvc3bvjnuijdg33d2uuitkbi", "arev_e2e0b2ddc168547400e68147bf9e0161866f9cad405c9f94a2a47a5dcfe955ac", "ast_rbzhbuglyvqk6nprgjwvl2o33q", "arev_925b7b93f54e7cfa717f5f213568db1fdaea73ef483fc3ebbad2ea042a533bd1") in: marker(@new_note, -1.0) span: [2.0, 12.0]}
+let music  = AudioClip{src: asset("ast_qdyytgcolstqfb6rgnbpnwva3m", "arev_b07daf865cbe8c601af1644e4b1168662f5faad1224b8806370e61e13b2270c2") span: [0.0, 16.0] gain: 0.8 fade_in: 1.0 fade_out: 2.0 duck: {under: [@voice] depth_db: -12 attack: 0.1 release: 0.5}}
+let voice  = VoiceOver{
+    voice: {engine: @kokoro id: "bm_daniel" speed: 1.0}
+    lines: [
+        line("Notes starts with one tap.", marker(@new_note), asset("ast_aaaaaaaaaaaaaaaaaaaaaaaaaa", "arev_1111111111111111111111111111111111111111111111111111111111111111"), "tk1-0000000000000000")
+        line("Type, and it saves as you go.", marker(@typing, 0.2))
+        line("That's it.", 13.5)
+    ]
+    fade_in: 0.01
+}
+let subs   = Subtitles{source: voice.out(@audio) style: "karaoke/pop" anchor: vec2(0.5, 0.72) safe: @reels max_words: 4}
+let top    = Stack{layers: [demo.out(@frame), subs.out(@frame)]}
+let out    = CutOutput{frame: top.out(@frame) audio: [conn(1, music.out(@audio)), conn(2, voice.out(@audio))]}
+
+Flow{
+    kind: @cut
+    label: "Notes voiceover"
+    output: {width: 1080 height: 1920 fps: 30 loudness: -14}
+    duration: 16.0
+    demo, music, voice, subs, top, out
+}

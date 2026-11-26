@@ -2,13 +2,15 @@
 //! a job's own slice, cut at the layer the printer reports (`layer_num` / `total_layer_num`) with
 //! that layer lit, what is still to print dimmed, and the nozzle placed along it by Fab's time model.
 //!
-//! - The printer's job is found among the committed ones by its name and layer count, never in the
+//! - The printer's job is found among its committed jobs by name and layer count, never in the
 //!   plate's slice. Without a copy, Monitor says what the printer runs and shows what it reports
 //!   (name, layer N / M, progress, time left). After a restart the same search finds the running
 //!   job again, and its slice is made from its package on a worker.
 //! - Monitor has its own playback and camera ([`Follow::hidden_play`], [`crate::api::PaneState::hidden_view`]):
 //!   nothing the plate or Design's slice does reaches a job it holds, and nothing done in it
 //!   reaches the other workspaces.
+//! - A virtual printer reports its job's clock (`print_seconds`) and the rate it runs at
+//!   (`print_rate`): the playhead is exactly there, and runs at that rate until the next report.
 //! - The printer reports no position. Every status report re-anchors the playhead: a new layer
 //!   starts at its first move, the first report of a job places it from the time left, and in
 //!   between the clock runs at print speed and waits at the end of the layer for the next
@@ -49,6 +51,10 @@ pub struct PrinterJob {
     pub limit: f64,
     /// Wall-clock seconds of the last report.
     pub synced_at: f64,
+    /// A printer that reports its job's clock exactly (a virtual one) also says how many job
+    /// seconds the clock runs per second until its next report. None: the printer reports no
+    /// clock, and the playhead is Fab's estimate.
+    pub rate: Option<f64>,
     /// The nozzle moves (printing, not paused or in a printer routine).
     pub running: bool,
 }
@@ -57,7 +63,7 @@ impl PrinterJob {
     /// The estimated playhead at `now`.
     pub fn time_at(&self, now: f64) -> f64 {
         if !self.running { return self.time; }
-        (self.time + (now - self.synced_at).max(0.0)).min(self.limit.max(self.time))
+        (self.time + (now - self.synced_at).max(0.0) * self.rate.unwrap_or(1.0)).min(self.limit.max(self.time))
     }
 
     /// The preview's layer index of the printer's layer.
@@ -124,6 +130,13 @@ pub struct Follow {
     pub closed: bool,
     /// The printer's running job (None: idle, finished or no printer).
     pub job: Option<PrinterJob>,
+    /// Whose last saved job Monitor shows when the reporting printer is idle.
+    pub reporting_printer: Option<PrinterChoice>,
+    reporting_snapshot: Option<Arc<fab_printer_link::Snapshot>>,
+    /// A report from this printer alone can settle a legacy job by absence.
+    sole_real: Option<PrinterChoice>,
+    /// The saved job identified by the printer's terminal report.
+    terminal_job: Option<String>,
     /// Where the head is by Fab's slice timing (preview seconds): what is later is still to print.
     pub live: f64,
     /// The playback that is not on screen: the other workspaces' while Monitor shows, Monitor's
@@ -137,7 +150,7 @@ pub struct Follow {
 
 impl Default for Follow {
     fn default() -> Self {
-        Follow { on: true, head_moves: false, monitor: false, jobs: Vec::new(), jobs_read: false, picked: None, confirm_start: None, unsaved: Vec::new(), closed: false, job: None, live: 0.0, hidden_play: Playback::default(), heard: None, stats: None }
+        Follow { on: true, head_moves: false, monitor: false, jobs: Vec::new(), jobs_read: false, picked: None, confirm_start: None, unsaved: Vec::new(), closed: false, job: None, reporting_printer: None, reporting_snapshot: None, sole_real: None, terminal_job: None, live: 0.0, hidden_play: Playback::default(), heard: None, stats: None }
     }
 }
 
@@ -147,20 +160,52 @@ fn same_name(fab: &str, printer: &str, numbered: bool) -> bool {
     if numbered {
         return printer == fab_printer_link::job::plain_file_name(fab);
     }
-    let strip = |s: &str| s.trim().trim_end_matches(".gcode.3mf").trim_end_matches(".3mf").to_string();
+    fn strip(s: &str) -> &str { s.trim().trim_end_matches(".gcode.3mf").trim_end_matches(".3mf") }
     strip(fab) == strip(printer)
+}
+
+/// A saved model may already use the short name that the printer reports.
+fn legacy_model_matches(saved: &str, reported: &str) -> bool {
+    let saved = saved.trim();
+    !saved.is_empty() && (saved.eq_ignore_ascii_case(reported.trim()) || jobs::same_printer(reported, saved))
+}
+
+/// Before destinations were saved, all three reported facts are needed to identify a copy.
+fn matches_legacy_job(meta: &jobs::JobMeta, p: &fab_printer_link::Snapshot) -> bool {
+    let s = &p.state;
+    s.total_layers.is_some_and(|layers| layers > 0 && layers == meta.layers)
+        && s.job_name.as_deref().is_some_and(|name| !name.trim().is_empty() && same_name(&meta.name, name, s.numbered_heads))
+        && legacy_model_matches(&meta.printer_model, &p.model)
 }
 
 /// Fab's copy of a job the printer reports: the one it sent, by name and layer count, or an ended
 /// one of the same name and count printed again. A printer that doesn't say what it prints runs
 /// what Fab has just sent it. Queued jobs aren't on the printer, whatever their name.
-fn job_of_report(f: &Follow, name: Option<&str>, total: Option<u32>, numbered: bool) -> Option<usize> {
-    let fits = |j: &CommittedJob| total.filter(|t| *t > 0).is_none_or(|t| t == j.meta.layers) && name.is_none_or(|n| same_name(&j.meta.name, n, numbered));
-    f.jobs.iter().position(|j| j.state == JobState::Sent && fits(j))
-        .or_else(|| f.jobs.iter().position(|j| name.is_some() && j.state.ended() && fits(j)))
+fn job_of_report(f: &Follow, printer: &PrinterChoice, p: &fab_printer_link::Snapshot) -> Option<usize> {
+    let s = &p.state;
+    let fits = |j: &CommittedJob| s.total_layers.filter(|t| *t > 0).is_none_or(|t| t == j.meta.layers)
+        && s.job_name.as_deref().is_none_or(|n| same_name(&j.meta.name, n, s.numbered_heads));
+    let find = |sent: bool| {
+        let mut legacy = None;
+        for (i, j) in f.jobs.iter().enumerate() {
+            let eligible = if sent { j.state == JobState::Sent } else { j.state.ended() };
+            if !eligible || !j.meta.for_report(printer, p) { continue; }
+            if j.meta.printer.is_some() {
+                if fits(j) { return Some(i); }
+            } else if legacy.is_none() && matches_legacy_job(&j.meta, p) {
+                legacy = Some(i);
+            }
+        }
+        legacy
+    };
+    find(true).or_else(|| s.job_name.as_ref().and_then(|_| find(false)))
 }
 
 impl Follow {
+    fn reporting_link(&self) -> Option<(&PrinterChoice, &fab_printer_link::Snapshot)> {
+        self.reporting_printer.as_ref().zip(self.reporting_snapshot.as_deref())
+    }
+
     pub fn job_of(&self, id: &str) -> Option<&CommittedJob> {
         self.jobs.iter().find(|j| j.meta.id == id)
     }
@@ -178,7 +223,8 @@ impl Follow {
         match &self.job {
             Some(job) => job.id.as_deref().and_then(|id| self.job_of(id)),
             None if self.closed => None,
-            None => self.jobs.iter().find(|j| j.state != JobState::Queued),
+            None => self.terminal_job.as_deref().and_then(|id| self.job_of(id)).or_else(|| self.jobs.iter().find(|j| j.state != JobState::Queued
+                && self.reporting_link().is_none_or(|(printer, p)| j.meta.printer.is_some() && j.meta.for_report(printer, p)))),
         }
     }
 
@@ -196,9 +242,30 @@ impl Follow {
 }
 
 impl PrintState {
+    /// Refresh the config choices and the sole-printer exception when the config list arrives.
+    pub fn set_configured_printers(&mut self, names: &[String]) {
+        self.links.choices = names.iter().map(|n| (PrinterChoice::Real(n.clone()), n.clone())).collect();
+        self.follow.sole_real = match names {
+            [name] => Some(PrinterChoice::Real(name.clone())),
+            _ => None,
+        };
+    }
+
+    pub fn unwatched_while_virtual(&self, job: &CommittedJob) -> bool {
+        job.state == JobState::Sent && !job.meta.virtual_printer && job.meta.for_printer(&self.links.picked)
+            && (job.meta.printer.is_some() || self.follow.sole_real.as_ref() == Some(&self.links.picked))
+            && self.shown_printer().is_some_and(|s| s.virtual_printer)
+    }
+
+    /// Legacy queued jobs can start only on the sole configured real printer.
+    pub fn job_destination_matches(&self, meta: &jobs::JobMeta, report: &fab_printer_link::Snapshot) -> bool {
+        meta.for_report(&self.links.picked, report)
+            && (meta.printer.is_some() || self.follow.sole_real.as_ref() == Some(&self.links.picked))
+    }
+
     /// The printer has a job, or one is on its way to it: a new one waits in the queue.
     pub fn printer_busy(&self) -> bool {
-        self.printer.as_ref().is_some_and(|p| p.state.busy() || p.job.as_ref().is_some_and(|j| j.stage.active()))
+        self.target_printer().is_some_and(|p| p.state.busy() || p.job.as_ref().is_some_and(|j| j.stage.active()))
     }
 
     /// Monitor shows a job: the one the printer runs, or a committed one until its card is
@@ -238,12 +305,16 @@ pub fn view_text(p: &PrintState, pv: &PrintPreview) -> String {
     let sent = p.follow.shown();
     // A printer that numbers its heads names a job by the file it was uploaded as: once Fab
     // knows the job, it goes by Fab's name.
-    let numbered = p.printer.as_ref().is_some_and(|printer| printer.state.numbered_heads);
+    let numbered = p.shown_printer().is_some_and(|printer| printer.state.numbered_heads);
     let known = job.filter(|_| numbered).and_then(|j| j.id.as_deref()).and_then(|id| p.follow.job_of(id)).map(|c| c.meta.name.as_str());
     let name = known.or(job.and_then(|j| j.name.as_deref())).or(sent.map(|s| s.meta.name.as_str())).unwrap_or("");
     if p.following().is_some() {
         return match (job, sent) {
-            (Some(j), _) if j.layer > 0 => format!("{name}  ·  {}  ·  head position estimated from Fab's slice timing", j.doing()),
+            (Some(j), _) if j.layer > 0 => {
+                // A printer that reports its job's clock (a virtual one) places the head exactly.
+                let head = if j.rate.is_some() { "head position from the printer's clock" } else { "head position estimated from Fab's slice timing" };
+                format!("{name}  ·  {}  ·  {head}", j.doing())
+            }
             (Some(j), _) => format!("{name}  ·  {}  ·  nothing printed yet", j.doing()),
             (None, Some(s)) if s.state == JobState::Queued => format!("{name}  ·  queued, as it will go to the printer"),
             (None, Some(s)) if s.state == JobState::EndedUnseen => format!("{name}  ·  as it went to the printer: it ended while Fab was closed"),
@@ -278,10 +349,10 @@ pub fn view_text(p: &PrintState, pv: &PrintPreview) -> String {
 pub fn layer_line(state: &PrintState, new: &fab_printer_link::Snapshot, now: f64) -> Option<String> {
     let s = &new.state;
     let layer = s.layer.filter(|l| *l > 0 && s.busy())?;
-    if state.printer.as_ref().is_some_and(|old| old.state.layer == Some(layer)) {
+    if state.printer_of(&state.links.picked).is_some_and(|old| old.state.layer == Some(layer)) {
         return None;
     }
-    let copy = job_of_report(&state.follow, s.job_name.as_deref(), s.total_layers, s.numbered_heads).map(|i| &state.follow.jobs[i]);
+    let copy = job_of_report(&state.follow, &state.links.picked, new).map(|i| &state.follow.jobs[i]);
     let total = s.total_layers.map_or("?".to_string(), |t| t.to_string());
     let elapsed = copy.filter(|j| !j.state.ended()).map_or("no Start print here".to_string(), |j| format!("{:.1} s since Start print", now - j.sent_at));
     let planned = copy.and_then(|j| j.preview.as_ref()).map_or("no slice".to_string(), |pv| format!("planned start {:.1} s", timeline::layer_span(pv, (layer - 1).min(pv.max_layer())).0));
@@ -293,12 +364,16 @@ pub fn layer_line(state: &PrintState, new: &fab_printer_link::Snapshot, now: f64
 /// How the jobs on the printer ended, from this report: the link's tracker for what it sent in
 /// this run of the app (a tracker from before the send says nothing about it), the printer's
 /// state for what a restart found.
-fn end_jobs(state: &mut PrintState, now: f64) {
-    let Some(p) = state.printer.clone() else { return };
-    if let Some(tracked) = p.job.as_ref().filter(|t| !t.stage.active()) {
+fn end_jobs(state: &mut PrintState, p: &fab_printer_link::Snapshot, matched: Option<usize>, now: f64) -> Option<usize> {
+    let printer = &state.links.picked;
+    let tracker = p.job.as_ref().filter(|t| p.job_sends != 0 && !t.stage.active());
+    let mut terminal_job = None;
+    if let Some(tracked) = tracker {
         // The link's tracker carries Fab's own name for the job, in every family.
-        let of_it = |j: &CommittedJob| j.state == JobState::Sent && !j.restored && p.job_sends >= j.link_send && same_name(&j.meta.name, &tracked.name, false);
-        if let Some(i) = state.follow.jobs.iter().position(of_it) {
+        terminal_job = state.follow.jobs.iter().position(|j| j.link_send == p.job_sends
+            && j.meta.for_report(printer, p) && same_name(&j.meta.name, &tracked.name, false)
+            && (j.meta.printer.is_some() || matches_legacy_job(&j.meta, p)));
+        if let Some(i) = terminal_job.filter(|&i| state.follow.jobs[i].state == JobState::Sent) {
             let ended = match &tracked.stage {
                 JobStage::Finished => JobState::Finished,
                 JobStage::Failed(why) => JobState::Failed(why.clone()),
@@ -308,21 +383,31 @@ fn end_jobs(state: &mut PrintState, now: f64) {
         }
     }
     let s = &p.state;
-    let Some(gcode) = s.gcode_state.as_deref() else { return };
-    let running = job_of_report(&state.follow, s.job_name.as_deref(), s.total_layers, s.numbered_heads).filter(|_| s.busy());
+    let Some(gcode) = s.gcode_state.as_deref() else { return terminal_job };
+    let terminal = matches!(gcode, "FINISH" | "FAILED") && s.job_name.is_some();
+    let tracked_report = tracker.filter(|t| terminal && s.job_name.as_deref().is_some_and(|n| same_name(&t.name, n, s.numbered_heads)));
+    let running = matched.filter(|_| s.busy());
     for i in 0..state.follow.jobs.len() {
         let job = &state.follow.jobs[i];
-        if job.state != JobState::Sent || !job.restored || running == Some(i) {
+        if job.state != JobState::Sent || !job.restored || running == Some(i) || !job.meta.for_report(printer, p) {
             continue;
         }
-        let same = s.job_name.as_deref().is_some_and(|n| same_name(&job.meta.name, n, s.numbered_heads));
-        let ended = match gcode {
-            "FINISH" if same => JobState::Finished,
-            "FAILED" if same => JobState::Failed("the printer reports the print failed or was stopped".into()),
-            _ => JobState::EndedUnseen,
+        // A terminal tracker from this link can identify a newer send of the very same file.
+        if tracked_report.is_some_and(|t| same_name(&job.meta.name, &t.name, false)) {
+            continue;
+        }
+        let ended = if terminal && matched == Some(i) {
+            if gcode == "FINISH" { JobState::Finished } else { JobState::Failed("the printer reports the print failed or was stopped".into()) }
+        } else {
+            if job.meta.printer.is_none() && (state.follow.sole_real.as_ref() != Some(printer)
+                || !legacy_model_matches(&job.meta.printer_model, &p.model)) {
+                continue;
+            }
+            JobState::EndedUnseen
         };
         end_job(&mut state.follow, i, ended, now);
     }
+    terminal_job.or_else(|| matched.filter(|&i| terminal && state.follow.jobs[i].state.ended()))
 }
 
 fn end_job(f: &mut Follow, i: usize, ended: JobState, now: f64) {
@@ -352,28 +437,71 @@ fn match_line(prev: Option<&PrinterJob>, f: &Follow) -> Option<String> {
     Some(match (job.id.as_deref().and_then(|id| f.job_of(id)), &job.unmatched) {
         (Some(copy), None) => format!("{on}: job {}, {}, {} layers, planned {:.0} s, head at {:.0} s of it", copy.meta.id, copy.state.label(), copy.meta.layers, copy.meta.planned, job.time),
         (_, why) => {
-            let named: Vec<String> = f.jobs.iter().filter(|j| job.name.as_deref().is_some_and(|n| same_name(&j.meta.name, n, false) || same_name(&j.meta.name, n, true))).map(|j| format!("{} layers {}", j.meta.layers, j.state.label())).collect();
+            let named: Vec<String> = f.jobs.iter().filter(|j| {
+                (j.meta.printer.is_some() || job.id.as_ref() == Some(&j.meta.id))
+                    && f.reporting_link().is_some_and(|(printer, p)| j.meta.for_report(printer, p))
+                    && job.name.as_deref().is_some_and(|n| same_name(&j.meta.name, n, false) || same_name(&j.meta.name, n, true))
+            }).map(|j| format!("{} layers {}", j.meta.layers, j.state.label())).collect();
             format!("{on}: no slice: {}; saved under that name: [{}]", why.as_deref().unwrap_or("-"), named.join(", "))
         }
     })
+}
+
+/// A replacement link has its own send counter and tracker, even when returning to the same printer.
+/// A link that never reported lets go of its jobs too: without a report, every job for the
+/// picked printer is reset, since clearing a send number, leaving a job's end to the printer's
+/// reports and stopping a twin's virtual print are right for any of them.
+pub fn unlink_printer(state: &mut PrintState, stopped: Option<&str>, now: f64) {
+    let previous = state.printers.remove(&state.links.picked);
+    for i in 0..state.follow.jobs.len() {
+        let job = &mut state.follow.jobs[i];
+        let ours = match &previous {
+            Some(report) => job.meta.for_report(&state.links.picked, report),
+            None => job.meta.for_printer(&state.links.picked),
+        };
+        if !ours { continue; }
+        job.link_send = 0;
+        if job.state == JobState::Sent {
+            job.restored = true;
+            if let Some(why) = stopped.filter(|_| job.meta.virtual_printer) {
+                job.stopped_reason = Some(why.into());
+                end_job(&mut state.follow, i, JobState::Stopped, now);
+            }
+        }
+    }
+    if previous.is_some() {
+        state.follow.heard = None;
+        printer_changed(state, now);
+    }
 }
 
 /// A new printer snapshot: rebuild the job and re-anchor the playhead. Returns true while
 /// the followed nozzle keeps moving (the caller asks for frames).
 pub fn printer_changed(state: &mut PrintState, now: f64) -> bool {
     let held = state.monitor_holds();
+    let printer = state.printer_of(&state.links.picked).cloned();
+    let reporting = printer.as_ref().map(|_| &state.links.picked);
+    if state.follow.reporting_printer.as_ref() != reporting {
+        state.follow.reporting_printer = reporting.cloned();
+    }
+    state.follow.reporting_snapshot.clone_from(&printer);
     let prev = state.follow.job.take();
-    if let Some(report) = state.printer.as_ref().map(|p| Arc::as_ptr(&p.state) as usize) {
+    if let Some(report) = printer.as_ref().map(|p| Arc::as_ptr(&p.state) as usize) {
         if state.follow.heard.is_none_or(|(last, _)| last != report) {
             state.follow.heard = Some((report, now));
         }
     }
-    if state.printer.as_ref().is_some_and(|p| p.state.busy()) {
+    if state.shown_printer().is_some_and(|p| p.state.busy()) {
         state.follow.closed = false;
     }
     // How Fab's job went, frozen for its card and its view.
-    end_jobs(state, now);
-    let printer = state.printer.clone().filter(|p| p.state.busy());
+    let matched = printer.as_ref().filter(|p| p.state.busy() || matches!(p.state.gcode_state.as_deref(), Some("FINISH" | "FAILED")))
+        .and_then(|p| job_of_report(&state.follow, &state.links.picked, p));
+    let terminal = printer.as_ref().and_then(|p| end_jobs(state, p, matched, now)).map(|i| &state.follow.jobs[i].meta.id);
+    if state.follow.terminal_job.as_ref() != terminal {
+        state.follow.terminal_job = terminal.cloned();
+    }
+    let printer = printer.filter(|p| p.state.busy());
     let job = printer.map(|p| {
         let s = &p.state;
         let gcode = s.gcode_state.clone().unwrap_or_default();
@@ -383,11 +511,13 @@ pub fn printer_changed(state: &mut PrintState, now: f64) -> bool {
             stage: s.stage_name().filter(|_| !printing_stage || gcode != "RUNNING"),
             layer: s.layer.unwrap_or(0), total_layers: s.total_layers.filter(|t| *t > 0),
             progress: s.progress, remaining_minutes: s.remaining_minutes,
-            running: gcode == "RUNNING" && printing_stage && s.layer.unwrap_or(0) > 0,
+            // A reported clock runs while its rate says so, even through a change of filament.
+            running: gcode == "RUNNING" && s.layer.unwrap_or(0) > 0 && s.print_rate.map_or(printing_stage, |rate| rate > 0.0),
             synced_at: now,
+            rate: s.print_seconds.and(s.print_rate),
             ..Default::default()
         };
-        let copy = job_of_report(&state.follow, job.name.as_deref(), job.total_layers, s.numbered_heads).map(|i| &state.follow.jobs[i]);
+        let copy = matched.map(|i| &state.follow.jobs[i]);
         job.id = copy.map(|c| c.meta.id.clone());
         match copy.and_then(|c| c.preview.clone()) {
             Some(pv) => {
@@ -396,6 +526,10 @@ pub fn printer_changed(state: &mut PrintState, now: f64) -> bool {
                 let same_job = prev.as_ref().filter(|p| p.id == job.id && p.preview.as_ref().is_some_and(|q| Arc::ptr_eq(q, &pv)));
                 job.time = if job.layer == 0 {
                     0.0
+                } else if let Some(exact) = s.print_seconds {
+                    // The printer's own clock: the playhead is there, and runs on from it.
+                    job.limit = job.limit.max(exact);
+                    exact
                 } else if let Some(p) = same_job.filter(|p| p.layer == job.layer) {
                     // The same layer: the clock carries on.
                     p.time_at(now).clamp(t0, job.limit)
@@ -526,7 +660,7 @@ pub(crate) mod tests {
             part_layers: Vec::new(),
             chunks: Vec::new(),
             layers, total: 10.0 + count as f64 * 10.0, grown: None,
-            bounds: [[0.0; 3], [10.0, 0.0, 0.8]], speed_range: [100.0, 100.0], filament_colors: vec![[1.0; 4]],
+            bounds: [[0.0; 3], [10.0, 0.0, 0.8]], speed_range: [100.0, 100.0], colours: super::super::ToolColours { material: vec![[1.0; 4]], model: vec![[1.0; 4]], ..Default::default() },
             roles: Vec::new(), changes: Vec::new(), timeline: Arc::new(Still), summary: Vec::new(), pauses: Vec::new(), melts: Vec::new(), modes: Vec::new(), max_z_rate: 0.0, nonplanar: None,
             ghosts: RetainedInstances::new(PREVIEW_SLOTS, Vec::<f32>::new().into()).unwrap(), filament_use: Vec::new(), purges: 0, purge_seconds: 0.0, prepare_seconds: 10.0, id: 7, part_offsets: Arc::from([]), part_objects: Arc::from([]), tools: Vec::new(),
         })
@@ -535,15 +669,76 @@ pub(crate) mod tests {
     /// A job on the printer's way, as Start print leaves it.
     fn sent(name: &str, preview: Arc<PrintPreview>, sent_at: f64) -> CommittedJob {
         CommittedJob {
-            meta: Arc::new(super::super::jobs::JobMeta { id: format!("id-{name}-{sent_at}"), name: name.into(), layers: preview.max_layer() + 1, planned: preview.total, ..Default::default() }),
+            meta: Arc::new(super::super::jobs::JobMeta { id: format!("id-{name}-{sent_at}"), name: name.into(), printer: PrinterChoice::Real("Sim".into()).id(), layers: preview.max_layer() + 1, planned: preview.total, ..Default::default() }),
             state: JobState::Sent, preview: Some(preview), sent_at, ..Default::default()
         }
     }
 
     fn report(state: &mut PrintState, reports: &mut Reports, json: &str, now: f64) -> bool {
         let s = reports.apply(json.as_bytes()).unwrap().unwrap();
-        state.printer = Some(Arc::new(Snapshot { name: "Sim".into(), status: ConnectionStatus::Connected, state: Arc::new(s), ..Default::default() }));
+        state.links.picked = PrinterChoice::Real("Sim".into());
+        state.printers.set(&state.links.picked, Arc::new(Snapshot { name: "Sim".into(), status: ConnectionStatus::Connected, state: Arc::new(s), ..Default::default() }));
         printer_changed(state, now)
+    }
+
+    #[test]
+    fn only_the_confirmed_link_can_match_or_end_a_job() {
+        let mut state = PrintState::default();
+        state.links.picked = PrinterChoice::Real("bench".into());
+        let meta = jobs::JobMeta { id: "real".into(), name: "cube".into(), printer: state.links.picked.id(), serial_suffix: Some("0001".into()), layers: 4, ..Default::default() };
+        state.follow.jobs.push(CommittedJob::restored(meta, jobs::SavedState { state: JobState::Sent, ..Default::default() }, 0.0, 0.0));
+        let report = |state: &mut PrintState, virtual_printer, serial: Option<&str>, gcode: &str| {
+            let status = fab_printer_link::model::PrinterState {
+                gcode_state: Some(gcode.into()), job_name: Some("cube".into()), total_layers: Some(4), ..Default::default()
+            };
+            state.printers.set(&state.links.picked, Arc::new(Snapshot { virtual_printer, serial_suffix: serial.map(str::to_string), state: Arc::new(status), ..Default::default() }));
+            printer_changed(state, 1.0);
+        };
+        for gcode in ["IDLE", "FINISH", "RUNNING"] {
+            report(&mut state, true, Some("0001"), gcode);
+            assert_eq!(state.follow.jobs[0].state, JobState::Sent, "a twin's {gcode} leaves the real job running");
+            assert!(state.follow.shown().is_none(), "a twin's {gcode} cannot show the real job");
+        }
+        assert!(match_line(None, &state.follow).unwrap().ends_with("saved under that name: []"), "the twin's diagnostics exclude the real job");
+        assert!(state.unwatched_while_virtual(&state.follow.jobs[0]));
+        let mut twin = state.follow.jobs[0].clone();
+        let meta = Arc::make_mut(&mut twin.meta);
+        meta.id = "twin".into();
+        meta.virtual_printer = true;
+        state.follow.jobs.push(twin);
+        unlink_printer(&mut state, Some("Switched back to Connected."), 2.0);
+        let twin = &state.follow.jobs[1];
+        assert_eq!(twin.state, JobState::Stopped);
+        let saved = twin.saved(3.0, 10.0);
+        assert_eq!(saved.stopped_reason.as_deref(), Some("Switched back to Connected."));
+        assert!(state.follow.unsaved.iter().any(|id| id == "twin"));
+        assert_eq!(state.follow.jobs[0].state, JobState::Sent);
+        for gcode in ["IDLE", "FINISH", "RUNNING"] {
+            report(&mut state, false, Some("0002"), gcode);
+            assert_eq!(state.follow.jobs[0].state, JobState::Sent, "a replacement machine's {gcode} leaves the original job running");
+            assert!(state.follow.shown().is_none(), "a replacement machine's {gcode} cannot show the original job");
+        }
+        assert!(match_line(None, &state.follow).unwrap().ends_with("saved under that name: []"), "the replacement's diagnostics exclude the original job");
+        for suffix in [None, Some("0001")] {
+            report(&mut state, false, suffix, "RUNNING");
+            assert_eq!(state.follow.job.as_ref().unwrap().id.as_deref(), Some("real"), "compatible printer suffix {suffix:?}");
+        }
+        report(&mut state, false, Some("0001"), "FINISH");
+        assert_eq!(state.follow.jobs[0].state, JobState::Finished, "the real printer finishes its own job");
+
+        // A link that never reported lets go of what it sent all the same.
+        unlink_printer(&mut state, None, 3.0);
+        let printer = state.links.picked.id();
+        for (id, virtual_printer, link_send) in [("unheard-twin", true, 1), ("unheard-real", false, 2)] {
+            let meta = jobs::JobMeta { id: id.into(), name: "cube".into(), printer: printer.clone(), virtual_printer, layers: 4, ..Default::default() };
+            state.follow.jobs.push(CommittedJob { meta: Arc::new(meta), state: JobState::Sent, link_send, ..Default::default() });
+        }
+        assert!(state.target_printer().is_none());
+        unlink_printer(&mut state, Some("Switched back to Connected."), 4.0);
+        let twin = state.follow.job_of("unheard-twin").unwrap();
+        assert_eq!((&twin.state, twin.link_send, twin.stopped_reason.as_deref()), (&JobState::Stopped, 0, Some("Switched back to Connected.")), "an unheard twin's print stops when it is unlinked");
+        let real = state.follow.job_of("unheard-real").unwrap();
+        assert_eq!((&real.state, real.link_send, real.restored), (&JobState::Sent, 0, true), "an unheard link's real job is let go: no send number, its end left to the printer's reports");
     }
 
     #[test]
@@ -565,7 +760,7 @@ pub(crate) mod tests {
         assert_eq!(layer_line(&s, &snapshot, 143.0), None);
         // A job Fab has no copy of: the printer's numbers alone.
         s.follow.jobs.clear();
-        s.printer = None;
+        s.printers.clear();
         s.follow.job = None;
         let snapshot = next(&mut r, r#"{"print":{"msg":1,"layer_num":4}}"#);
         assert_eq!(layer_line(&s, &snapshot, 150.0).as_deref(), Some("layer 4 / 4: no Start print here, no slice, printer 61 %, 12 min left"));
@@ -583,6 +778,45 @@ pub(crate) mod tests {
         // The other way round: job A's own report has its times.
         let snapshot = Snapshot { state: Arc::new(r.apply(br#"{"print":{"msg":1,"subtask_name":"a","layer_num":4}}"#).unwrap().unwrap()), ..Default::default() };
         assert_eq!(layer_line(&s, &snapshot, 150.0).as_deref(), Some("layer 4 / 4: 50.0 s since Start print, planned start 40.0 s, printer 60 %, 12 min left"));
+    }
+
+    /// A virtual printer's reported clock is the playhead, exactly, and runs at its rate; a
+    /// printer that reports none keeps the estimate.
+    #[test]
+    fn a_reported_job_clock_places_the_playhead_exactly() {
+        let mut s = PrintState::default();
+        s.set_preview(preview());
+        s.follow.jobs.push(sent("block", preview(), 0.0));
+        s.follow.monitor = true;
+        let report = |s: &mut PrintState, layer: u32, clock: Option<(f64, f64)>, now: f64| {
+            let status = fab_printer_link::model::PrinterState {
+                gcode_state: Some("RUNNING".into()), job_name: Some("block".into()), layer: Some(layer), total_layers: Some(4),
+                print_seconds: clock.map(|c| c.0), print_rate: clock.map(|c| c.1), ..Default::default()
+            };
+            s.links.picked = PrinterChoice::Real("Sim".into());
+            s.printers.set(&s.links.picked, Arc::new(Snapshot { name: "Sim".into(), status: ConnectionStatus::Connected, state: Arc::new(status), ..Default::default() }));
+            printer_changed(s, now)
+        };
+        // Layer 2 of the slice runs from 20 s to 30 s.
+        report(&mut s, 2, Some((22.5, 2.0)), 100.0);
+        assert_eq!(s.follow.live, 22.5, "the printer's clock, not the layer's start or the time left");
+        let text = view_text(&s, &preview());
+        assert!(text.ends_with("head position from the printer's clock"), "a reported clock is not called an estimate: {text}");
+        place(&mut s, 102.0);
+        assert_eq!(s.follow.live, 26.5, "it runs at the reported rate");
+        report(&mut s, 2, Some((27.0, 2.0)), 103.0);
+        assert_eq!(s.follow.live, 27.0, "the next report places it again");
+        place(&mut s, 120.0);
+        assert!(s.follow.live > 29.9 && s.follow.live < 30.0, "it waits at the end of the layer: {}", s.follow.live);
+        report(&mut s, 2, Some((28.0, 0.0)), 130.0);
+        place(&mut s, 140.0);
+        assert_eq!(s.follow.live, 28.0, "a rate of 0 holds it");
+        // A report with no clock is estimated as it always was: a new layer starts at its first move.
+        report(&mut s, 3, None, 150.0);
+        assert_eq!(s.follow.live, 30.0);
+        assert_eq!(s.follow.job.as_ref().unwrap().rate, None);
+        let text = view_text(&s, &preview());
+        assert!(text.ends_with("head position estimated from Fab's slice timing"), "without a clock the head is an estimate: {text}");
     }
 
     #[test]

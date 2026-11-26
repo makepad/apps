@@ -23,10 +23,11 @@ fn a_pane_probes_into_the_bench_the_host_runs() {
     assert_eq!(host_bench(&cx), None, "without an electronics host there is no bench to probe into");
     let benches = Arc::new(fab_elec_lang::bench_views(&evaluated, &sources));
     let snap = DesignSnapshot {
+        profiles: Arc::default(), profile_diags: Arc::default(),
         design: Arc::new(evaluated.design.clone()), preview: None, preview_tag: None, preview_by: None, created: vec![],
         last_commit: None, sheets: vec![], proposal: None, job: None, conn: vec![], rules: vec![], fills: vec![],
         sysnets: None, export: vec![], violations: Tagged { unit: None, of: StateOf::Committed, generation: 0, value: Arc::new(vec![]) },
-        awaiting: Arc::new(vec![]), last_refusal: None, stale: StageFlags::NONE, head: String::new(),
+        awaiting: Arc::new(vec![]), cases: Arc::default(), checking: vec![], last_refusal: None, stale: StageFlags::NONE, head: String::new(),
         benches, source_map: None, docs: None, catalog: None,
     };
     cx.set_global(ElecLive::new(Arc::new(snap)));

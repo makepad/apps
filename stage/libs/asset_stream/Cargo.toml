@@ -1,0 +1,21 @@
+[package]
+name = "makepad-stage-asset-stream"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "makepad_stage_asset_stream"
+
+[features]
+# The decoding reader (`reader`, `AvReader`) needs the platform decoders and
+# the audio media helpers. Without it the crate is pure contracts: identity,
+# timelines, the index, payloads, the page window, transport.
+default = ["reader"]
+reader = ["dep:makepad-platform", "dep:makepad-stage-audio-media"]
+
+[dependencies]
+makepad-asset-data = { path = "../../../../apps/engine/asset/data" }
+makepad-platform = { path = "../../../../../platform", optional = true }
+makepad-stage-audio-media = { path = "../../../engine/audio_media", optional = true }

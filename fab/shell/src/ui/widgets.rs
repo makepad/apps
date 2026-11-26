@@ -468,6 +468,27 @@ script_mod! {
                 font_size: fab.font_size_ui
             }
         }
+        // a pill that shows an icon (a row too narrow for its words): the icon in the text's inks
+        draw_icon +: {
+            hover: instance(0.0)
+            down: instance(0.0)
+            active: instance(0.0)
+            disabled: instance(0.0)
+            color: fab.color_text_dim
+            color_hover: fab.color_text_active
+            color_active: fab.color_text
+            color_disabled: fab.color_text_muted
+            // premultiplied with the glyph's coverage, as DrawSvg's own colour is (the inks carry
+            // alpha)
+            get_color: fn() {
+                let base = self.eval_gradient()
+                let ink = self.color
+                    .mix(self.color_hover, self.hover)
+                    .mix(self.color_active, self.active)
+                    .mix(self.color_disabled, self.disabled)
+                return vec4(ink.rgb * ink.a * base.a, ink.a * base.a) * self.opacity
+            }
+        }
         animator: Animator{
             disabled: {
                 default: @off
@@ -476,6 +497,7 @@ script_mod! {
                     apply: {
                         draw_bg: {disabled: 0.0}
                         draw_text: {disabled: 0.0}
+                        draw_icon: {disabled: 0.0}
                     }
                 }
                 on: AnimatorState{
@@ -483,6 +505,7 @@ script_mod! {
                     apply: {
                         draw_bg: {disabled: 1.0}
                         draw_text: {disabled: 1.0}
+                        draw_icon: {disabled: 1.0}
                     }
                 }
             }
@@ -493,6 +516,7 @@ script_mod! {
                     apply: {
                         draw_bg: {down: snap(0.0), hover: 0.0}
                         draw_text: {down: snap(0.0), hover: 0.0}
+                        draw_icon: {down: snap(0.0), hover: 0.0}
                     }
                 }
                 on: AnimatorState{
@@ -500,6 +524,7 @@ script_mod! {
                     apply: {
                         draw_bg: {down: snap(0.0), hover: 1.0}
                         draw_text: {down: snap(0.0), hover: 1.0}
+                        draw_icon: {down: snap(0.0), hover: 1.0}
                     }
                 }
                 down: AnimatorState{
@@ -507,6 +532,7 @@ script_mod! {
                     apply: {
                         draw_bg: {down: snap(1.0), hover: 1.0}
                         draw_text: {down: snap(1.0), hover: 1.0}
+                        draw_icon: {down: snap(1.0), hover: 1.0}
                     }
                 }
             }
@@ -517,6 +543,7 @@ script_mod! {
                     apply: {
                         draw_bg: {active: 0.0}
                         draw_text: {active: 0.0}
+                        draw_icon: {active: 0.0}
                     }
                 }
                 on: AnimatorState{
@@ -524,6 +551,7 @@ script_mod! {
                     apply: {
                         draw_bg: {active: 1.0}
                         draw_text: {active: 1.0}
+                        draw_icon: {active: 1.0}
                     }
                 }
             }
@@ -730,8 +758,11 @@ script_mod! {
     // =====================================================================
 
     mod.widgets.FabCheckBox = CheckBox{
-        height: theme.prop_row_height
-        width: Fit
+        // As wide as its label, up to the room left on its line; a longer label wraps there
+        // and the box grows a row, so a narrow panel never clips it.
+        height: Fit{min: theme.prop_row_height}
+        width: Fit{max: FitBound.Rel{base: Base.Line factor: 1.0}}
+        flow: Right{wrap: true}
         align: Align{x: 0.0 y: 0.5}
         padding: Inset{left: 0 right: 0 top: 0 bottom: 0}
         margin: Inset{top: 0 bottom: 0 left: 0 right: 0}
@@ -975,6 +1006,10 @@ script_mod! {
             spacing: 1
         }
     }
+
+    // Fab's number rows: their fields carry units, so a field keeps room for `-360.0 mm`
+    // between its arrow zones before its row puts it under the label.
+    mod.widgets.FabNumberRow = mod.widgets.PropNumberRow{value_min: 84}
 
     // Label-left / value-right row.
     mod.widgets.FabPropRow = View{

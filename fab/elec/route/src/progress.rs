@@ -15,27 +15,71 @@
 //! The slot lock covers only field reads or swaps; copies, old partial drops and sink
 //! callbacks happen outside them. No UI thread waits for an engine or a callback.
 //!
-//! Job status is stored in atomics. Its optional sink runs on the engine's thread, outside
-//! every lock, on each `begin_net`, `retry_net`, `block_net` or `set_phase`. A retry shows in the
+//! Job status is stored in atomics. Its optional sink (`Send + Sync`) runs on the engine's thread,
+//! or on a pool worker during a place job's seat comparison (`comparing`, one publisher at a time),
+//! outside every lock, on each `begin_net`, `retry_net`, `block_net` or `set_phase`. A retry shows in the
 //! status (`attempt`, `retry`, then `blocked_by` when the net stays blocked): offers stay the
 //! settled, legal states.
 
 use crate::solution::RouteSolution;
-use fab_elec_core::NetId;
+use fab_elec_core::{BlockId, NetId};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// One of the two private placements being compared. Group indices start at zero.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum CompareStep {
+    Waiting,
+    Round(u32),
+    Group(u32),
+    Done,
+}
+
+impl CompareStep {
+    fn code(self) -> u64 {
+        match self {
+            Self::Waiting => 0,
+            Self::Round(n) => (1 << 32) | u64::from(n),
+            Self::Group(n) => (2 << 32) | u64::from(n),
+            Self::Done => 3 << 32,
+        }
+    }
+
+    fn read(slot: &AtomicU64) -> Self {
+        let value = slot.load(Ordering::Acquire);
+        match value >> 32 {
+            0 => Self::Waiting,
+            1 => Self::Round(value as u32),
+            2 => Self::Group(value as u32),
+            _ => Self::Done,
+        }
+    }
+}
+
 /// What a running job is doing, for the status line.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum JobPhase {
+    /// The placed tray is committed and its case inputs are being evaluated.
+    WaitCase,
+    /// A whole placement under the generator's revised port rooms.
+    Replace { pass: u32 },
     /// Routing nets one transaction at a time; `NetStatus::current` names the net.
     Nets,
     /// Cleanup passes over routed copper; `NetStatus::current` names the unit's first net.
     Cleanup,
     /// Relaxing all copper; `step` is the job's current step (no current net).
     Relax { step: u32 },
+    /// A place job seeding its parts: `round` 0 is the first seeding, each later one a round by
+    /// routing demand (`place::seed`). `routed` counts the parts placed, `failed` those without
+    /// room and `total` the parts in scope (no current net).
+    Seed { round: u32 },
+    /// A place job matching repeated blocks once its seeding stands (`place::seed`'s conform):
+    /// group `group` (from 0) of `of`, whose first copy is the block `first`.
+    Match { group: u32, of: u32, first: BlockId },
+    /// Both runs have the same list of repeated groups. Their proposals stay private.
+    Compare { seated: CompareStep, plain: CompareStep, of: u32 },
 }
 
 /// Why an engine routes its current net again.
@@ -104,13 +148,19 @@ pub struct Progress {
     open: AtomicU32,
     current: AtomicU32,
     phase: AtomicU32,
-    relax_step: AtomicU32,
+    phase_step: AtomicU32,
+    /// `JobPhase::Match`'s `of` and `first`.
+    phase_of: AtomicU32,
+    phase_block: AtomicU32,
+    seated: AtomicU64,
+    plain: AtomicU64,
+    comparison_updates: AtomicU64,
     attempt: AtomicU32,
     retry: AtomicU32,
     blocked_by: AtomicU32,
     routed: AtomicU32,
     total: AtomicU32,
-    cancel: AtomicBool,
+    cancel: Arc<AtomicBool>,
     want: AtomicBool,
     slot: Mutex<Option<(u32, Arc<RouteSolution>)>>,
     sink: Option<Sink>,
@@ -138,7 +188,9 @@ impl fmt::Debug for Progress {
             .field("open", &self.open)
             .field("current", &self.current)
             .field("phase", &self.phase)
-            .field("relax_step", &self.relax_step)
+            .field("phase_step", &self.phase_step)
+            .field("phase_of", &self.phase_of)
+            .field("phase_block", &self.phase_block)
             .field("attempt", &self.attempt)
             .field("retry", &self.retry)
             .field("blocked_by", &self.blocked_by)
@@ -168,18 +220,32 @@ impl Default for Progress {
 impl Progress {
     /// Progress in `JobPhase::Nets` with a latest-offer slot and its first partial requested.
     pub fn new() -> Progress {
+        Self::with_cancel(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Private seat trials keep their own progress while observing the job's Stop or Discard.
+    pub(crate) fn private_trial(&self) -> Arc<Progress> {
+        Arc::new(Self::with_cancel(self.cancel.clone()))
+    }
+
+    fn with_cancel(cancel: Arc<AtomicBool>) -> Progress {
         Progress {
             work: AtomicU64::new(0),
             open: AtomicU32::new(0),
             current: AtomicU32::new(u32::MAX),
             phase: AtomicU32::new(0),
-            relax_step: AtomicU32::new(0),
+            phase_step: AtomicU32::new(0),
+            phase_of: AtomicU32::new(0),
+            phase_block: AtomicU32::new(0),
+            seated: AtomicU64::new(0),
+            plain: AtomicU64::new(0),
+            comparison_updates: AtomicU64::new(0),
             attempt: AtomicU32::new(0),
             retry: AtomicU32::new(u32::MAX),
             blocked_by: AtomicU32::new(u32::MAX),
             routed: AtomicU32::new(0),
             total: AtomicU32::new(0),
-            cancel: AtomicBool::new(false),
+            cancel,
             want: AtomicBool::new(true),
             slot: Mutex::new(None),
             sink: None,
@@ -265,14 +331,50 @@ impl Progress {
         }
     }
 
+    /// Each run updates its own slot. One publisher drains concurrent notifications so an
+    /// older snapshot cannot overtake a newer one on the job channel.
+    pub(crate) fn comparing(&self, seated: bool, step: CompareStep) {
+        let slot = if seated { &self.seated } else { &self.plain };
+        slot.store(step.code(), Ordering::Release);
+        if self.comparison_updates.fetch_add(1, Ordering::AcqRel) == 0 {
+            let mut pending = 1;
+            loop {
+                self.publish();
+                pending = self.comparison_updates.fetch_sub(pending, Ordering::AcqRel) - pending;
+                if pending == 0 { break }
+            }
+        }
+    }
+
     /// Change phase (only this method does), clear the current net and publish the current status.
     pub fn set_phase(&self, phase: JobPhase) {
         let phase = match phase {
+            JobPhase::WaitCase => 6,
+            JobPhase::Replace { pass } => {
+                self.phase_step.store(pass, Ordering::Relaxed);
+                7
+            }
             JobPhase::Nets => 0,
             JobPhase::Cleanup => 1,
             JobPhase::Relax { step } => {
-                self.relax_step.store(step, Ordering::Relaxed);
+                self.phase_step.store(step, Ordering::Relaxed);
                 2
+            }
+            JobPhase::Seed { round } => {
+                self.phase_step.store(round, Ordering::Relaxed);
+                3
+            }
+            JobPhase::Match { group, of, first } => {
+                self.phase_step.store(group, Ordering::Relaxed);
+                self.phase_of.store(of, Ordering::Relaxed);
+                self.phase_block.store(first.0, Ordering::Relaxed);
+                4
+            }
+            JobPhase::Compare { seated, plain, of } => {
+                self.seated.store(seated.code(), Ordering::Relaxed);
+                self.plain.store(plain.code(), Ordering::Relaxed);
+                self.phase_of.store(of, Ordering::Relaxed);
+                5
             }
         };
         self.phase.store(phase, Ordering::Relaxed);
@@ -286,9 +388,20 @@ impl Progress {
     /// Read the job's phase, current net and latest offered counts using atomics only.
     pub fn status(&self) -> NetStatus {
         let phase = match self.phase.load(Ordering::Relaxed) {
+            6 => JobPhase::WaitCase,
+            7 => JobPhase::Replace { pass: self.phase_step.load(Ordering::Relaxed) },
             0 => JobPhase::Nets,
             1 => JobPhase::Cleanup,
-            _ => JobPhase::Relax { step: self.relax_step.load(Ordering::Relaxed) },
+            2 => JobPhase::Relax { step: self.phase_step.load(Ordering::Relaxed) },
+            3 => JobPhase::Seed { round: self.phase_step.load(Ordering::Relaxed) },
+            4 => JobPhase::Match {
+                group: self.phase_step.load(Ordering::Relaxed),
+                of: self.phase_of.load(Ordering::Relaxed),
+                first: BlockId(self.phase_block.load(Ordering::Relaxed)),
+            },
+            _ => JobPhase::Compare {
+                seated: CompareStep::read(&self.seated), plain: CompareStep::read(&self.plain), of: self.phase_of.load(Ordering::Relaxed),
+            },
         };
         let current = self.current.load(Ordering::Relaxed);
         let blocked_by = self.blocked_by.load(Ordering::Relaxed);
@@ -315,6 +428,13 @@ impl Progress {
     /// The number of nets still open, as the engine last said.
     pub fn set_open(&self, n: u32) {
         self.open.store(n, Ordering::Relaxed);
+    }
+    /// A place job's counts: the parts placed and those without room so far (`NetStatus::routed`
+    /// and `failed`); published with the status.
+    pub fn set_placed(&self, placed: u32, without_room: u32) {
+        self.routed.store(placed, Ordering::Relaxed);
+        self.open.store(without_room, Ordering::Relaxed);
+        self.publish();
     }
     /// The most recently reported number of open nets.
     pub fn open(&self) -> u32 {
@@ -455,6 +575,16 @@ mod tests {
             ],
             "status: nets publish in order, keep the phase and clear on a phase change"
         );
+        // Every phase reads back as it was set: each is stored under its own number.
+        let phases = Progress::new();
+        for phase in [
+            JobPhase::Replace { pass: 2 }, JobPhase::WaitCase, JobPhase::Nets, JobPhase::Cleanup, JobPhase::Relax { step: 3 }, JobPhase::Seed { round: 2 },
+            JobPhase::Match { group: 1, of: 4, first: BlockId(5) },
+            JobPhase::Compare { seated: CompareStep::Group(1), plain: CompareStep::Round(2), of: 4 },
+        ] {
+            phases.set_phase(phase);
+            assert_eq!(phases.status().phase, phase, "{phase:?} reads back as set");
+        }
         assert_eq!(
             statuses.iter().map(|status| (status.attempt, status.retry, status.blocked_by)).collect::<Vec<_>>(),
             vec![

@@ -39,8 +39,8 @@ fn index() -> ValueIndex {
     }
     let input = LowerInput {
         nets: vec![
-            LowerNet { id: net(0), name: "gnd".into(), supply: false },
-            LowerNet { id: net(1), name: "vdd".into(), supply: true },
+            LowerNet { id: net(0), name: "gnd".into(), supply: false, heard: false },
+            LowerNet { id: net(1), name: "vdd".into(), supply: true, heard: false },
         ],
         ground: net(0), parts, sources: Vec::new(), probes: Vec::new(),
         supplies: vec![Supply { net: net(1), v: 3.3, limit: None, ramp: None }],

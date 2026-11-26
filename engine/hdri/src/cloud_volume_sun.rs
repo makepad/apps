@@ -29,13 +29,15 @@
 //! - **Held** ([`SunDepthGrid::shared`] with `held`): only the coarse level is filled (the same law); the fine level
 //!   is used when a released bake left it for the same key (a light-only drag), and is filled on release.
 //! - **Caches**: levels and tau_up grids are kept process-wide by key (the sun, the caller's shape key, Cover, seed and
-//!   the grid's own geometry; tau_up without the sun), what live maps hold plus the newest few, logged, never failing.
+//!   the grid's own geometry; tau_up without the sun), what live maps hold plus the newest of the rest by their bytes
+//!   (SUN_LEVEL_BUDGET and TAU_UP_BUDGET: about the last 14 Stratocumulus presets' light grids, down to about 4 of
+//!   the largest), logged, never failing.
 //!
 //! Positions are metres round the viewer: x east, y up, z south, as the footprint grid's.
 
 use makepad_draw::*;
 use crate::caster::RowRunner;
-use crate::cloud_volume::{kept_by_key, rows_by, shared_by_key, GridCache};
+use crate::cloud_volume::{kept_by_key, rows_by, shared_by_bytes, GridCache};
 use crate::cloud_volume_light::POWDER_REACH_M;
 use crate::volumetric::{Cancelled, LIGHT_MIN_SIN};
 use std::sync::{Arc, Mutex};
@@ -414,8 +416,8 @@ impl SunDepthGrid {
             format!("{:.0} m level built in {:.0} ms ({:.1} MB, {} density reads)", level.across_m, ms, level.bytes() as f64 / 1.0e6, level.samples)
         };
         let keyed = |fine: bool| Self::level(spec, fine, extinction, clear, cancelled, run).map(|level| SunLevel { key: key(fine), ..level });
-        let coarse = shared_by_key(&SUN_LEVELS, key(false), &|| keyed(false), "sun-depth grid", &built)?;
-        let fine = if held { kept_by_key(&SUN_LEVELS, key(true)) } else { Some(shared_by_key(&SUN_LEVELS, key(true), &|| keyed(true), "sun-depth grid", &built)?) };
+        let coarse = shared_by_bytes(&SUN_LEVELS, key(false), &|| keyed(false), "sun-depth grid", &built, SUN_LEVEL_BUDGET, SunLevel::bytes)?;
+        let fine = if held { kept_by_key(&SUN_LEVELS, key(true)) } else { Some(shared_by_bytes(&SUN_LEVELS, key(true), &|| keyed(true), "sun-depth grid", &built, SUN_LEVEL_BUDGET, SunLevel::bytes)?) };
         Ok(Self::from_levels(spec, coarse, fine))
     }
 
@@ -638,9 +640,8 @@ impl TauUpGrid {
     /// scale of its own.
     pub fn shared(base_m: f32, top_m: f32, half_m: f32, shape: u64, cover: f32, seed: u32, extinction: Extinction, clear: Option<ClearSpan>, cancelled: &dyn Fn() -> bool, run: RowRunner) -> Result<Arc<TauUpGrid>, Cancelled> {
         let key = key_of(&[2, base_m.to_bits(), top_m.to_bits(), half_m.to_bits(), shape as u32, (shape >> 32) as u32, cover.to_bits(), seed]);
-        shared_by_key(&TAU_UPS, key, &|| TauUpGrid::build(base_m, top_m, half_m, extinction, clear, cancelled, run).map(|grid| TauUpGrid { key, ..grid }), "tau_up grid", &|grid, ms| {
-            format!("{}^2 x {} built in {:.0} ms ({:.1} MB)", grid.n, grid.levels, ms, grid.bytes() as f64 / 1.0e6)
-        })
+        let built = |grid: &TauUpGrid, ms: f64| format!("{}^2 x {} built in {:.0} ms ({:.1} MB)", grid.n, grid.levels, ms, grid.bytes() as f64 / 1.0e6);
+        shared_by_bytes(&TAU_UPS, key, &|| TauUpGrid::build(base_m, top_m, half_m, extinction, clear, cancelled, run).map(|grid| TauUpGrid { key, ..grid }), "tau_up grid", &built, TAU_UP_BUDGET, TauUpGrid::bytes)
     }
 
     /// The depth straight up from `p` to the shell's top: 0 above it, the base's below it, 0 outside the square.
@@ -694,6 +695,15 @@ impl TauUpGrid {
 /// The sun-depth levels and tau_up grids in use, oldest first.
 static SUN_LEVELS: GridCache<SunLevel> = Mutex::new(Vec::new());
 static TAU_UPS: GridCache<TauUpGrid> = Mutex::new(Vec::new());
+/// The bytes of sun-depth levels no live map holds that their cache keeps, the newest ones: a cloud preset's two levels
+/// are 1.8-22.3 MB (a Stratocumulus' 11.2, the storm's 20.1), so about its last 7 (the largest) to 14 (a
+/// Stratocumulus) presets' levels, more of the smaller ones. (A count of eight kept the live map's levels and eight
+/// more: a first preset's went at about the sixth or seventh.)
+const SUN_LEVEL_BUDGET: usize = 160_000_000;
+/// The bytes of tau_up grids no live map holds that their cache keeps, the newest ones: 1.9-23.9 MB a cloud preset (a
+/// Stratocumulus' 3.7), so about its last 4 (the largest) to 26 (a Stratocumulus) presets' grids (256 MB of light
+/// grids in all, with the levels).
+const TAU_UP_BUDGET: usize = 96_000_000;
 
 /// A key no other grid has: a level or a tau_up grid built for one map, outside the caches (its GPU copy is never
 /// taken for another's).

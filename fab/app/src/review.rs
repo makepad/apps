@@ -12,7 +12,7 @@
 //! the plate view's field shade, in its own paint baked for the capture (a
 //! variant's paint is the variant's, on the variant's shape).
 
-use fab::fab_sdf_tiles::draw::{draw_tiles_lit, material_texture, DrawSdfTileLit};
+use fab::fab_sdf_tiles::draw::{draw_tiles_lit, DrawSdfTileLit};
 use fab::fab_sdf_tiles::surface::Chunk;
 use fab::fab_sdf_tiles::trace::{Cam, Tiles};
 use fab::viewport::paint::{pack_stills, StillBake};
@@ -35,7 +35,8 @@ pub struct ReviewField {
     pub key: [u8; 32],
     /// Its shape's frame onto the plate (printer mm), row-major.
     pub to_printer: [[f64; 4]; 3],
-    /// Its print colour: what shows where it has no materials of its own.
+    pub colours: fab_plate::ColourMode,
+    /// The owning part’s colour in this render.
     pub color: [f32; 4],
     /// Its own colour paint as the views show it, in the render's colours; None: none. Each
     /// capture bakes it for itself (or takes the plate view's very bake of it): a variant's
@@ -230,7 +231,7 @@ pub fn review_fields(ev: &fab_model::eval::Evaluated, objects: &[String]) -> (Ve
         // the field as a distance (a part scaled by axis has its stretch in its shape)
         let (shape, key, to_printer, _) = f.distance();
         let paint = ev.placed_paint(i).filter(|p| p.shown().has(fab_paint_field::Channel::Color)).map(|p| fab::viewport::paint::StillPaint::new(p.shown().clone(), p.palette(), &p.from_printer, b.min, b.max, *key, to_printer));
-        fields.push(ReviewField { object: part.object.clone(), shape: shape.clone(), key: *key, to_printer: *to_printer, color: part.color, paint });
+        fields.push(ReviewField { object: part.object.clone(), shape: shape.clone(), key: *key, to_printer: *to_printer, color: part.color, colours: ev.colour_mode, paint });
     }
     (fields, bounds)
 }
@@ -313,12 +314,16 @@ pub fn prepare_ball() -> Result<PreparedStaticPreview, String> {
     PreparedStaticPreview::prepare(makepad_render::StaticModel::parse_glb(&glb).map_err(|e| format!("ball model: {e}"))?)
 }
 
-/// The plate in the colours a render asks for: the design's (each print colour's override, else
-/// its design colour), or the trays' its print colours map to, as the plate holds them.
+/// The plate in the mode requested for this render.
 pub fn shown_plate(ev: &fab_model::eval::Evaluated, colours: fab_ai::Colours) -> std::borrow::Cow<'_, fab_model::eval::Evaluated> {
-    match colours {
-        fab_ai::Colours::Design => std::borrow::Cow::Owned(ev.in_design_colors()),
-        fab_ai::Colours::Spools => std::borrow::Cow::Borrowed(ev),
+    let mode = match colours {
+        fab_ai::Colours::Design => fab_plate::ColourMode::Model,
+        fab_ai::Colours::Spools => fab_plate::ColourMode::Material,
+    };
+    if mode == ev.colour_mode {
+        std::borrow::Cow::Borrowed(ev)
+    } else {
+        std::borrow::Cow::Owned(ev.in_colours(mode))
     }
 }
 
@@ -1002,7 +1007,7 @@ impl FabReviewRenderer {
         let fields = fields
             .into_iter()
             .map(|of| {
-                let table = (of.shape.materials.len() > 1).then(|| material_texture(cx, &of.shape.materials));
+                let table = (of.shape.materials.len() > 1).then(|| fab::viewport::sdf::tile_materials(cx, &of.shape.materials, of.color, of.colours));
                 TracedField { of, tiles: Tiles::new(), table, settled: false }
             })
             .collect();
@@ -1155,7 +1160,7 @@ impl FabReviewRenderer {
             let paint = task.paint.as_ref().and_then(|p| p.as_ref()).and_then(|p| Some((&p.texture, p.ctl, p.headers.iter().find(|(o, _)| *o == f.of.object)?.1)));
             // matte, as the review's meshes are (they carry no material of their own): a field part
             // and an exact one of the same shape look the same
-            let look = fab::fab_sdf_tiles::draw::TileLook { matte: true, ..fab::viewport::sdf::tile_look(&f.of.shape.materials, f.of.color, f.table.as_ref()) };
+            let look = fab::fab_sdf_tiles::draw::TileLook { matte: true, ..fab::viewport::sdf::tile_look(&f.of.shape.materials, f.of.color, f.of.colours, f.table.as_ref()) };
             draw_tiles_lit(cx, &mut self.draw_tile_lit, f.tiles.drawn(), Some(&cam), f.tiles.one_sided(), &scene.projection, side as f32, &world_from_obj, &[], look, paint, &light);
         }
         if let (Some(scale), Some(half)) = (&task.ortho, look.ortho) {
@@ -1303,7 +1308,7 @@ mod tests {
     /// paint pink, as designed, and grey when asked for the trays' colours; a field part's paint
     /// (its palette) alike.
     #[test]
-    fn a_render_shows_the_design_colours_unless_asked_for_the_trays() {
+    fn a_render_defaults_to_the_live_colour_mode_and_can_override_it() {
         let (pink, grey) = ([0.9f32, 0.3, 0.55], [0.53f32, 0.53, 0.53]);
         let material = format!("let pink = Material{{albedo: [{} {} {}] name: \"Pink\"}}\n", pink[0], pink[1], pink[2]);
         let ball = "let body = m.sdf({field: fn(p) { return sdf_sphere(p, 20mm) } bounds: [[-20mm, -20mm, -20mm] [20mm, 20mm, 20mm]] cell: 0.5mm})\nobject(body)\nm.fill(m.sphere({radius: 8mm at: [0 20mm 0]}), pink)\n";
@@ -1317,7 +1322,8 @@ mod tests {
             // the plate's pink on a grey spool
             let inks = [("Pink".to_string(), grey)].into_iter().collect();
             assert!(session.map_colours(std::sync::Arc::new(fab_model::eval::Mapped { inks, tools: Default::default() })).is_some(), "the mapping takes");
-            for (args, want) in [("{}", pink), (r#"{"colours":"spools"}"#, grey)] {
+            session.set_colour_view(fab_plate::ColourMode::Material, true);
+            for (args, want) in [("{}", grey), (r#"{"colours":"model"}"#, pink), (r#"{"colours":"material"}"#, grey)] {
                 let reply = session.call("render", &makepad_model::json::parse(args.as_bytes()).unwrap(), None);
                 assert!(reply.ok, "{}", reply.text);
                 let Some(fab_ai::RenderRequest::Sheets { objects, extra, camera, .. }) = reply.render else { panic!("fab.render asks for sheets") };

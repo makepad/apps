@@ -1,6 +1,6 @@
 //! Moonraker link worker; the simulator uses the same steps and transfer thread.
 use crate::job::{heads_fit, JobStage, JobStatus, PrintJob, PrintOptions, Tracker};
-use crate::link::{drive, publish, spawn_transfer, Command, CommandState, ConnectionStatus, Driven, Shared, Snapshot, Storage, Transfer};
+use crate::link::{drive, publish, spawn_transfer, Command, CommandState, ConnectionStatus, Driven, SessionLease, Shared, Snapshot, Storage, Transfer};
 use crate::model::{AmsUnit, CloudNozzleId, Colour, Extruder, LoadedSlot, PrinterState, Temperature, Tray, TrayId};
 use crate::moonraker::{self, ByteStream, Client, Error, Heater, StartParams, Status, StatusSocket};
 use crate::moonraker_sim::SimMoonraker;
@@ -151,6 +151,7 @@ fn state(status: &Status, firmware: &str) -> PrinterState {
 enum Target { Configured(Arc<PrinterConfig>), Simulated(SimMoonraker) }
 impl Target {
     fn credentials(&self) -> Result<(&str, Option<Secret>), Error> {
+        crate::entries::CREDENTIAL.enter();
         match self {
             Self::Simulated(_) => Ok(("memory", None)),
             Self::Configured(config) => match &config.access {
@@ -181,12 +182,14 @@ impl Target {
         }
     }
     fn client(&self, stop: &Arc<AtomicBool>) -> Result<Client<Stream>, Error> {
+        crate::entries::MOONRAKER_HTTP.enter();
         let (host, key) = self.credentials()?;
         let mut client = Client::new(self.stream(false, stop)?, host, key)?;
         client.set_stop(stop.clone());
         Ok(client)
     }
     fn socket(&self, stop: &Arc<AtomicBool>, heads: usize) -> Result<StatusSocket<Stream>, Error> {
+        crate::entries::MOONRAKER_WEBSOCKET.enter();
         let (host, key) = self.credentials()?;
         StatusSocket::connect_stoppable(self.stream(true, stop)?, host, key, heads, Some(stop))
     }
@@ -592,14 +595,19 @@ fn connected(shared: &Shared, worker: &mut Worker, mut live: Live) -> Result<(),
     }
     Ok(())
 }
+fn lease_endpoint(host: &str, port: u16) -> Result<SessionLease, ConnectionStatus> {
+    SessionLease::for_printer(format!("moonraker:{}:{port}", host.to_ascii_lowercase()))
+}
+
 pub(crate) fn run(shared: Arc<Shared>, name: String) {
     let snapshot = (**shared.slot.lock().unwrap_or_else(|e| e.into_inner())).clone();
     let mut worker = Worker::new(snapshot);
     drive(&shared, &mut worker, |worker| {
         let config = PrinterConfig::load(&name).map_err(ConnectionStatus::Offline)?;
-        let Access::Moonraker { api_key, .. } = &config.access else { return Err(ConnectionStatus::Offline("printer configuration changed protocol")); };
+        let Access::Moonraker { port, api_key } = &config.access else { return Err(ConnectionStatus::Offline("printer configuration changed protocol")); };
         worker.snapshot.name = api_key.as_ref().map_or_else(|| name.clone(), |key| key.redact(&name));
         worker.snapshot.model = config.model.clone();
+        let _endpoint = lease_endpoint(&config.host, *port)?;
         worker.storage = Some(HttpStorage::new(Target::Configured(Arc::new(config)), shared.stop.clone()));
         publish(&shared, &worker.snapshot);
         let live = Live::connect(worker.storage.as_ref().unwrap(), shared.heads_of(&worker.snapshot.model))?;
@@ -623,6 +631,18 @@ mod tests {
     use crate::moonraker_sim::SIM_HEADS;
     use makepad_strict_json::{obj, s};
     use std::sync::mpsc::{channel, Receiver, Sender};
+
+    #[test]
+    fn moonraker_leases_the_host_and_effective_port() {
+        let first = lease_endpoint("Printer.invalid", 7125).unwrap();
+        let duplicate = || lease_endpoint("printer.invalid", 7125);
+        let refused = ConnectionStatus::Offline("printer already linked in this process");
+        assert_eq!(duplicate().err(), Some(refused.clone()));
+        let _other_port = lease_endpoint("printer.invalid", 8125).unwrap();
+        assert_eq!(duplicate().err(), Some(refused));
+        drop(first);
+        assert!(duplicate().is_ok());
+    }
 
     struct FileSim {
         dir: std::path::PathBuf,

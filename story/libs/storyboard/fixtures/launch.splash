@@ -1,0 +1,69 @@
+// Notes 2.0 — a 20 s launch film, 9:16. The board the cut is made from.
+use mod.storyboard.*
+
+let story = Row{kind: @story label: "Story"}
+let visuals = Row{kind: @visuals label: "Visuals"}
+let voice = Row{kind: @voice label: "Voiceover"}
+let music = Row{kind: @music label: "Music"}
+let refs = Row{kind: @refs label: "References"}
+
+// Five beats: problem, promise, proof, proof, call to action.
+let hook = Scene{row: story span: [0.0, 4.0] title: "Ideas leak"
+    intent: "Every good idea slips away before you write it down" mood: "restless, close"
+    look: "Handwritten words drift off the frame and fade" kit: "@swiss" music: "bars 1-2, intro"
+    stack: "plate: paper grain · type: handwritten words drift · detail: ink bleed"}
+let promise = Scene{row: story span: [4.0, 4.0] title: "One tap"
+    intent: "Notes catches them in one tap" mood: "bright, confident"
+    look: "White type slams in on the downbeat over the brand orange" kit: "@swiss" music: "bar 3, the drop"
+    stack: "plate: brand orange · type: Anton @mask_up"}
+let sync = Scene{row: story span: [8.0, 4.0] title: "Everywhere"
+    intent: "Your notes follow you from phone to laptop" mood: "fluid"
+    look: "The phone from the desk photo pushes in, then the screen flies to a laptop"
+    music: "bars 5-6" media: "b-roll: the desk photo animated" from: @desk
+    prompt: "slow push in on the phone on the desk, morning light" flow: "bundled:image-to-video" seed: 7}
+let search = Scene{row: story span: [12.0, 4.0] title: "Find anything"
+    intent: "Search finds a note from months ago instantly" mood: "precise, calm"
+    look: "The app run: typing 'launch' fills the list; the hit glows" music: "bars 7-8"
+    media: "app run: Notes search"}
+let cta = Scene{row: story span: [16.0, 4.0] title: "Get Notes 2.0"
+    intent: "Download today" mood: "warm, final"
+    look: "Logo lockup, store badges, the orange floods the frame on the last downbeat" kit: "@swiss"
+    music: "bars 9-10, outro"}
+
+let vo1 = Note{row: voice span: [0.4, 3.3] text: "Your best ideas never wait for you."}
+let vo2 = Note{row: voice span: [4.3, 3.4] text: "Now they don't have to. One tap, it's saved."}
+let vo3 = Note{row: voice span: [8.4, 3.2] text: "On your phone, your laptop, everywhere."}
+let vo4 = Note{row: voice span: [12.4, 3.3] text: "And found again in a second."}
+let vo5 = Note{row: voice span: [16.4, 3.0] text: "Notes 2.0. Out now."}
+
+let shot1 = Note{row: visuals span: [0.0, 8.0] color: #f0b34d text: "Keep it type-led until the drop; no UI before 8 s"}
+let shot2 = Note{row: visuals span: [12.0, 4.0] text: "Real app footage, 1:1 pixels, no fake UI"}
+
+let song = Ref{row: music span: [0.0, 20.0] media: @audio src: asset("ast_song_bright_120", "arev_song_1") label: "Bright pop, 120 BPM" role: @use}
+
+let desk = Ref{row: refs span: [8.0, 4.0] media: @image src: asset("ast_desk_photo", "arev_desk_1")
+    label: "Desk photo" note: "Morning light, phone left of the laptop" role: @generate
+    prompt: "slow push in on the phone on the desk, morning light" seed: 7}
+let tone = Ref{row: refs span: [0.0, 8.0] media: @video src: asset("ast_mood_clip", "arev_mood_1")
+    label: "Mood: paper and ink" note: "Take the grain and the slow drift"}
+let frame = Ref{row: refs span: [12.0, 4.0] media: @frame src: asset("ast_mood_clip", "arev_mood_1") at: 2.4
+    label: "The glow on the hit"}
+let brand = Ref{row: refs span: [16.0, 4.0] media: @swatch colors: [#ff5c39, #14171c, #f4f7fa] label: "Brand palette"}
+
+let l1 = Link{from: hook to: tone label: "style"}
+let l2 = Link{from: sync to: desk label: "footage"}
+let l3 = Link{from: cta to: brand label: "palette"}
+
+Storyboard{
+    title: "Notes 2.0 launch"
+    duration: 20.0
+    bpm: 120
+    music: song
+    format: {width: 1080 height: 1920}
+    brief: "20 s launch film for Notes 2.0, 9:16, bold kinetic type, our brand colours, voiceover"
+    style: "Swiss grid, Anton headlines, brand orange on ink, paper grain; cuts on downbeats"
+    kit: "@swiss"
+    rows: [story, visuals, voice, music, refs]
+    items: [hook, promise, sync, search, cta, vo1, vo2, vo3, vo4, vo5, shot1, shot2, song, desk, tone, frame, brand]
+    links: [l1, l2, l3]
+}

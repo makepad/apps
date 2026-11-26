@@ -72,6 +72,8 @@ pub enum CircuitOp {
     /// Write (`Some`) or remove (`None`) one of a component's own text fields, the
     /// `fields: {key: "text"}` of the call that makes it (`Component::fields`).
     SetField { comp: CompId, key: String, text: Option<String> },
+    /// Whether to omit this component from assembly while keeping its footprint and schematic.
+    SetDnp { comp: CompId, dnp: bool },
     /// Store the component's reference designator on its call, or remove it to resume numbering.
     SetRef { comp: CompId, to: Option<String> },
     /// Write (`Some`: a Splash object such as `{mesh: "parts/lcsc/C1525.glb"}`) or remove (`None`)

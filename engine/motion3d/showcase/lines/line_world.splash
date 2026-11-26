@@ -1,0 +1,13 @@
+use mod.scene.*
+// Line materials, one ink on paper: contour isolines of a heightfield,
+// cross-hatching by light, banknote engraving and a wireframe.
+Scene3D{ background: #f0ebe0 tone_mapping: @none
+  camera: Camera{orbit: true target: vec3(0, 0.6, 0) yaw: tween(-20, 20, 0, 6, @ease_in_out_sine) pitch: 26 distance: 9 fov: 36}
+  lights: [AmbientLight{intensity: 1}]
+  children: [
+    Fx{preset: @contour_terrain radius: 6 amount: 0.9 spacing: 0.1 color: #f0ebe0 color2: #1a1a1a position: vec3(0, -0.6, 0)}
+    Mesh{geometry: TorusKnotGeometry{radius: 0.7 tube: 0.24 tubular_segments: 200 radial_segments: 24} position: vec3(-2.2, 1.2, 0) rotation: spin(vec3(10, 30, 0))
+         material: HatchMaterial{}}
+    Mesh{geometry: SphereGeometry{radius: 0.9 width_segments: 96 height_segments: 64} position: vec3(0.3, 1.1, 0.4) material: EngraveMaterial{}}
+    Mesh{geometry: IcosahedronGeometry{radius: 0.8 detail: 1} position: vec3(2.4, 1.2, 0) rotation: spin(vec3(0, 40, 20)) material: MeshBasicMaterial{wireframe: true color: #1a1a1a}}
+  ] }

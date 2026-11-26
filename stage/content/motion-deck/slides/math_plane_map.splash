@@ -1,0 +1,53 @@
+use mod.motion.*
+
+// Math 3: maps move the whole plane. Two number planes carry the same circle, wave and point;
+// on the first beat a matrix shears and turns the left plane, on the second a complex map
+// z -> z^2 / 3 folds the right one. The grid, the axes and every item move together, with
+// lines subdivided as they bend. map_at eases each map in.
+let look = import("shared/motion_deck_look")
+
+let LINEAR_AT = 2.6
+let COMPLEX_AT = 5.4
+let MAP_LEN = 2.2
+let R = [-2, 2, 1]
+let enter = fn(at) { return tween(0, 1, at, at + 1.4, @ease_in_out_cubic) }
+
+// The same three things on each plane.
+let items = fn() {
+    return [
+        Parametric{name: "circle" f: fn(s) { vec2(cos(s), sin(s)) } color: look.COOL width: 4}
+        Graph{name: "wave" f: fn(x) { 0.6 * sin(2.0 * x) } from: -2 to: 2 color: look.SEA width: 3}
+        Dot{name: "point" at: vec2(1, 1) radius: 9 color: look.BONE}
+    ]
+}
+
+Motion{
+    label: "Maps move the plane"
+    size: vec2(1920, 1080)
+    duration: 9.0
+    fps: 60
+    color: @hdr
+    background: look.INK
+    layers: [
+        Draw2D{name: "ground" size: vec2(1920, 1080) draw: fn(c, t, edit) { look.ground(c, t, live()) }}
+        Plot{name: "linear" x: R y: R grid: @plane color: look.ASH grid_color: #8d919a30 at: vec2(250, 360) size: vec2(560, 500)
+            reveal: [0.6, 1.0] opacity: enter(0.5)
+            map: [[1.2, 0.5], [0.3, 0.9]] map_at: tween(0, 1, LINEAR_AT, LINEAR_AT + MAP_LEN, @ease_in_out_cubic)
+            layers: items()}
+        Plot{name: "complex" x: R y: R grid: @plane color: look.ASH grid_color: #8d919a30 at: vec2(1110, 360) size: vec2(560, 500)
+            reveal: [0.8, 1.0] opacity: enter(0.7)
+            map: fn(p) { let z = cmul(p, p) return vec2(z[0] / 3.0, z[1] / 3.0) }
+            map_at: tween(0, 1, COMPLEX_AT, COMPLEX_AT + MAP_LEN, @ease_in_out_cubic)
+            layers: items()}
+        Math{name: "matrix" tex: "\\begin{pmatrix}1.2 & 0.5\\\\ 0.3 & 0.9\\end{pmatrix}" size: 28 color: look.BONE align: @center
+            at: vec2(530, 892) opacity: enter(LINEAR_AT - 0.4)}
+        Math{name: "square" tex: "z \\to \\frac{z^2}{3}" size: 28 color: look.BONE align: @left
+            at: vec2(1712, 560) opacity: enter(COMPLEX_AT - 0.4)}
+        Draw2D{name: "chrome" size: vec2(1920, 1080) draw: fn(c, t, edit) {
+            look.folio(c, t, "11", "Math")
+            look.heading(c, t, "Maps move the plane.", "A matrix or any function of the point: grid, axes and curves move together and stay smooth.")
+            look.syntax(c, t, 2.0, "Plot{map: fn(p) { cmul(p, p) / 3 }  map_at: tween(0, 1, ...)}")
+        }}
+    ]
+    post: look.post_chain(look.POST)
+}

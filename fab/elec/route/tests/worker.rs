@@ -346,7 +346,7 @@ fn a_base_without_a_delta_updates_like_a_fresh_unit() {
         method: Method::Interactive,
         engine: Engine::Grid,
         style: None,
-        effort: Effort(1),
+        effort: Effort::Full,
         layers: None,
         reroute: false,
     };
@@ -421,7 +421,7 @@ fn bases_cost_nothing_on_the_worker_and_jobs_build_their_basis() {
         method: Method::Interactive,
         engine: Engine::Grid,
         style: None,
-        effort: Effort(1),
+        effort: Effort::Full,
         layers: None,
         reroute: false,
     };
@@ -496,4 +496,173 @@ fn bases_cost_nothing_on_the_worker_and_jobs_build_their_basis() {
     drop(handle);
     worker.join().expect("dropping the handle stops the worker");
     spawn.run();
+}
+
+/// Why: `elec.place` runs as a job off the worker's thread, as routing does. The parts the board
+/// does not place yet come with the job; each seeding it keeps is a checked proposal that adds
+/// them on legal spots inside the outline, its status counts them, and a cancel still ends it
+/// with a legal final proposal.
+#[test]
+fn place_job_brings_parts_onto_legal_spots_and_cancels() {
+    use fab_elec_board::placement::PlacementIndex;
+    use fab_elec_board::{Item, Placed};
+    use fab_elec_route::{JobPhase, PlaceJob, PlaceMode};
+    let design = ledctl();
+    let unit = &design.units[0];
+    let mut board = (**unit.board.as_ref().expect("fixture setup: ledctl unit 0 has a board")).clone();
+    // Three resistors leave the board for the tray, with the copper: the host brings them in the
+    // row under the outline, as the tray's own layout puts them.
+    board.tracks.clear();
+    board.vias.clear();
+    let below = board.outline_bbox().min.y - mm(10.0);
+    let mut add: Vec<Placed> = Vec::new();
+    for path in ["lamps[0].r", "lamps[1].r", "lamps[2].r"] {
+        let at = board.placed.iter().position(|p| p.path == path).expect("fixture setup: the resistors are placed");
+        let mut part = board.placed.remove(at);
+        part.at = P::new(part.at.x, below);
+        add.push(part);
+    }
+    board.reindex();
+    let base = base_of(Arc::new(board));
+    let (wake, wakes) = mpsc::channel();
+    let (handle, inbox) = route_channel(move || {
+        let _ = wake.send(());
+    });
+    let worker = RouteWorker::new(inbox, Arc::new(ThreadSpawn::default()));
+    let worker = thread::spawn(move || worker.run());
+    handle.request(RouteRequest::Base(base.clone())).unwrap();
+    let mut job = PlaceJob {
+        job: JobId(1), unit: base.unit, scope: add.iter().map(|p| p.comp).collect(), mode: PlaceMode::Place, held: 0,
+        rooms: Vec::new(), plan: None, add: add.clone(), circuit: unit.circuit.clone(),
+    };
+    handle.request(RouteRequest::Place(job.clone())).unwrap();
+    let (stream, statuses) = job_stream(&handle, &wakes, job.job);
+    let last = stream.last().expect("a job ends with its final proposal");
+    let had = drc(&base.board, &base.conn, &base.rules, &base.fills, None).violations;
+    let was = FindingNets::of(&base.board, &base.conn);
+    for proposal in &stream {
+        let checked = proposal.checked.as_ref().expect("a place proposal applies");
+        let now = FindingNets::of(&checked.board, &checked.conn);
+        let new: Vec<_> = new_or_worse(&had, &was, &checked.violations, &now).into_iter()
+            .map(|i| format!("{:?} {}", checked.violations[i].kind, checked.violations[i].message)).collect();
+        assert!(proposal.verified, "{} is verified; new findings {new:#?}", proposal.label);
+    }
+    let place = last.metrics.place.as_ref().expect("a place proposal carries its metrics");
+    assert_eq!((place.placed, place.no_room.len(), place.ripped), (3, 0, 0), "the three parts find room and rip nothing");
+    let added: Vec<_> = last.ops.iter().filter_map(|op| match op {
+        BoardOp::Add(Item::Placed(p)) => Some(p),
+        _ => None,
+    }).collect();
+    assert_eq!(added.len(), 3, "the proposal adds each brought part once: {:?}", last.ops);
+    assert!(added.iter().zip(0..).all(|(p, k)| p.id == ItemId(base.board.next_item + k)), "brought parts take ids from the base's next_item on");
+    let checked = last.checked.as_ref().expect("a verified proposal has a checked board");
+    let outside: Vec<_> = PlacementIndex::new(&checked.board, None).outside_outline().into_iter().map(|(p, _)| p.refdes.clone()).collect();
+    assert!(outside.is_empty(), "every placed part lies inside the outline: {outside:?}");
+    assert!(statuses.iter().any(|s| matches!(s.phase, JobPhase::Seed { .. }) && s.total == 3 && s.routed == 3),
+        "the status counts the parts placed of those in scope: {statuses:?}");
+
+    job.job = JobId(2);
+    handle.request(RouteRequest::Place(job.clone())).unwrap();
+    handle.request(RouteRequest::Cancel(job.job)).unwrap();
+    let (stream, _) = job_stream(&handle, &wakes, job.job);
+    let cancelled = stream.last().expect("a cancelled job ends with its final proposal");
+    assert!(cancelled.verified && cancelled.metrics.place.is_some(), "a cancelled place job's final is legal: {}", cancelled.label);
+
+    drop(handle);
+    worker.join().expect("dropping the handle stops the worker");
+}
+
+/// A part placed again takes with it only the unlocked copper that served its pads, and the
+/// router's copper its new spot collides with: the rest of its nets and all locked copper stay,
+/// the hand-drawn pieces are counted against the part, and the proposal finds nothing new (no end
+/// left anchored to nothing, no clearance broken). Handheld's MCU, which nearly every net of the
+/// board meets (ripping its whole nets would take most of the copper) and which has hand-drawn
+/// tracks to its expander.
+#[test]
+fn placing_a_part_again_rips_only_the_copper_it_needs() {
+    use fab_elec_board::{BoardKeepout, CarriedKeepout, Origin, PortRoom};
+    use fab_elec_core::{BBox, FeatureRef, LayerSet, PolySet, Side};
+    use fab_elec_parts::Forbid;
+    use fab_elec_route::{PlaceJob, PlaceMode};
+    use std::collections::BTreeSet;
+    let sources = fab_elec_fixtures::docs("handheld").expect("handheld is a stock project");
+    let design = fab_elec_lang::evaluate(&sources, &fab_elec_lang::std_libs())
+        .unwrap_or_else(|diags| panic!("handheld evaluates: {diags:?}")).design;
+    let unit = design.units.iter().find(|u| u.board.as_ref().is_some_and(|b| !b.placed.is_empty()))
+        .expect("fixture setup: handheld has a placed board");
+    let mut board = unit.board.clone().expect("a board");
+    let mcu = board.placed.iter().find(|p| p.refdes == "U1").expect("fixture setup: handheld's U1").clone();
+    let unlocked = |locked: bool, origin: &Origin| !locked && matches!(origin, Origin::Solved { .. } | Origin::Authored);
+    let nets: BTreeSet<_> = mcu.pad_nets.iter().flatten().copied().collect();
+    let whole = board.tracks.iter().filter(|t| unlocked(t.locked, &t.origin) && nets.contains(&t.net)).count()
+        + board.vias.iter().filter(|v| unlocked(v.locked, &v.origin) && nets.contains(&v.net)).count();
+    let at_mcu = |t: &&fab_elec_board::Track| t.ends.iter().any(|e| matches!(e, Anchor::Pad { placed, .. } if *placed == mcu.id));
+    let anchored: Vec<ItemId> = board.tracks.iter().filter(|t| unlocked(t.locked, &t.origin)).filter(at_mcu).map(|t| t.id).collect();
+    let hand_anchored = board.tracks.iter().filter(|t| !t.locked && matches!(t.origin, Origin::Authored)).filter(at_mcu).count();
+    assert!(!anchored.is_empty() && hand_anchored > 0, "fixture setup: router and hand-drawn tracks reach U1's pads");
+
+    // A small band at the MCU's centre must follow it through the worker's copper retries.
+    let from = FeatureRef::Generated("Cover at U1".into());
+    let port = PortRoom { comp: mcu.comp, room: None, keepout: Some(CarriedKeepout {
+        from: from.clone(), area: PolySet::rect(BBox::new(P::mm(-0.05, 0.0), P::mm(0.1, 0.08))),
+        band: (mm(1.0), mm(2.0)), side: Side::Top,
+    }) };
+    let published = port.placed(mcu.at).keepout.unwrap();
+    let scratch = Arc::make_mut(&mut board);
+    let cover = scratch.alloc_id();
+    scratch.keepouts.push(BoardKeepout {
+        id: cover, area: published.area, layers: LayerSet::one(LayerId::F_CU.on(published.side)), forbid: Forbid::FOOTPRINTS,
+        reason: "Cover".into(), origin: Origin::Derived { from }, z: Some(published.band),
+    });
+    scratch.reindex();
+    let base = base_of(board.clone());
+    let (wake, wakes) = mpsc::channel();
+    let (handle, inbox) = route_channel(move || {
+        let _ = wake.send(());
+    });
+    let worker = RouteWorker::new(inbox, Arc::new(ThreadSpawn::default()));
+    let worker = thread::spawn(move || worker.run());
+    handle.request(RouteRequest::Base(base.clone())).unwrap();
+    let job = PlaceJob {
+        job: JobId(1), unit: base.unit, scope: vec![mcu.comp], mode: PlaceMode::Place, held: 0, rooms: vec![port], plan: None, add: Vec::new(), circuit: unit.circuit.clone(),
+    };
+    handle.request(RouteRequest::Place(job.clone())).unwrap();
+    let (stream, _) = job_stream(&handle, &wakes, job.job);
+    let last = stream.last().expect("a job ends with its final proposal");
+    for proposal in &stream {
+        let checked = &proposal.checked.as_ref().expect("a place proposal applies").board;
+        let owner = checked.placed_of(mcu.comp).unwrap();
+        let source = board.keepouts.iter().find(|k| k.id == cover).unwrap();
+        let actual = checked.keepouts.iter().find(|k| k.id == cover).unwrap();
+        assert_eq!(actual.area, source.area.translated(owner.at.sub(mcu.at)), "the worker checks the cover at the offered MCU pose");
+        assert_eq!(actual.layers, source.layers);
+        assert_eq!(actual.z, source.z);
+    }
+    let checked = last.checked.as_ref().expect("a place proposal applies");
+    let had = drc(&base.board, &base.conn, &base.rules, &base.fills, None).violations;
+    let new: Vec<_> = new_or_worse(&had, &FindingNets::of(&base.board, &base.conn), &checked.violations, &FindingNets::of(&checked.board, &checked.conn))
+        .into_iter().map(|i| &checked.violations[i]).filter(|v| v.kind != fab_elec_circuit::CheckKind::Unconnected)
+        .map(|v| format!("{:?} {} {:?}", v.kind, v.message, v.items)).collect();
+    assert!(last.verified && new.is_empty(), "placing U1 again finds nothing new but unrouted connections: {new:#?}");
+    assert!(last.ops.iter().any(|op| matches!(op, BoardOp::SetField { item, .. } if *item == mcu.id)), "the placer moves U1: {:?}", last.ops);
+    let removed: BTreeSet<ItemId> = last.ops.iter().filter_map(|op| match op { BoardOp::Remove(id) => Some(*id), _ => None }).collect();
+    let place = last.metrics.place.as_ref().expect("a place proposal carries its metrics");
+    assert_eq!(place.ripped as usize, removed.len(), "the metrics count the copper the proposal removes");
+    assert!(anchored.iter().all(|id| removed.contains(id)), "every unlocked track that U1's pads anchor goes with it");
+    assert!(removed.len() < whole, "the rest of U1's nets stays: {} removed of the {whole} unlocked items on its nets", removed.len());
+    let locked = |id: &ItemId| match base.board.locate(*id) {
+        Some((fab_elec_board::ItemKind::Track, i)) => base.board.tracks[i].locked,
+        Some((fab_elec_board::ItemKind::Via, i)) => base.board.vias[i].locked,
+        _ => true,
+    };
+    assert!(!removed.iter().any(locked), "only unlocked tracks and vias are removed");
+    let hand_removed = removed.iter().filter(|id| base.board.locate(**id).is_some_and(|(kind, i)| match kind {
+        fab_elec_board::ItemKind::Track => matches!(base.board.tracks[i].origin, Origin::Authored),
+        fab_elec_board::ItemKind::Via => matches!(base.board.vias[i].origin, Origin::Authored),
+        _ => false,
+    })).count();
+    assert!(matches!(place.hand.as_slice(), [h] if h.comp == mcu.comp && (h.tracks + h.vias) as usize == hand_removed && h.tracks as usize >= hand_anchored),
+        "the hand-drawn copper removed is counted against U1 alone: {:?}, {hand_removed} removed, {hand_anchored} at its pads", place.hand);
+    drop(handle);
+    worker.join().expect("dropping the handle stops the worker");
 }

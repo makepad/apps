@@ -441,11 +441,7 @@ fn turn01(x: f32, z: f32) -> f32 {
     (quarter * 0.25).clamp(0.0, 0.999_999)
 }
 
-/// Local copy (as in clouds.rs), so no glob can make the name ambiguous.
-fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
-    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
+use crate::patterns::smooth as smoothstep;
 
 #[cfg(test)]
 mod tests {

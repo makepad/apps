@@ -1,6 +1,6 @@
 //! The only input to the engine strand; a lock covers only an inbox operation, never engine work.
 
-use fab_elec_board::{Factories, Item, RuleMatrix, ZoneFill};
+use fab_elec_board::{Factories, Item, PortRoom, RuleMatrix, ZoneFill};
 use fab_elec_circuit::{Circuit, Violation};
 use crate::EvalDone;
 use fab_elec_core::{BoardId, ContentHash, DocId, ItemId, NetId, Sel};
@@ -17,8 +17,18 @@ pub const CASE_KEEPOUT: &str = "case:";
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Ticket(pub u64);
 
+/// The original edit or the tagged preview the person released. An expired tag still
+/// answers its press, without committing a newer sample from another pane.
+pub enum PlannerEdit {
+    Direct { edit: fab_elec_design::Resolved, circuits: Vec<(BoardId, Weak<Circuit>)> },
+    Release { seq: Option<u64>, tag: u64 },
+}
+
 /// Ordered edits and control messages for the engine strand.
 pub enum Cmd {
+    /// A view's identified planner press. The strand checks the proposed invocation against
+    /// the actual edit (or the exact released sample) before linking the journal.
+    Planner { call: fab_elec_view::snapshot::Invocation, edit: PlannerEdit, ticket: Ticket },
     /// Ops as one undo step. `expect` is the board content hash the ops were made against and
     /// `circuits` the unit circuits their ids name ([`circuits_named`]); a mismatch of either
     /// rejects the whole command, applying nothing and reporting it in `Step::rejected`.
@@ -57,6 +67,8 @@ pub enum Cmd {
     /// The host refuses sample `seq` instead of committing it (the bed is changing): it ends
     /// like a cancelled one, with one refusal naming `tag` and `reason`.
     RefusePreview { seq: u64, tag: u64, reason: String },
+    /// Discard this job's preview and roll back its bring if that is still the history head.
+    DiscardJob { seq: u64, tag: u64 },
     /// End an applied preview and a waiting sample whose seq is at most `seq`.
     CancelPreview { seq: u64 },
     Undo,
@@ -64,17 +76,24 @@ pub enum Cmd {
     /// Factory capabilities by profile name, resolved by the host off the strand.
     SetFactories(Arc<Factories>),
     /// Mechanical case checks of `unit`, computed against that board unit's committed
-    /// `generation`. Replace its previous case findings; ignore a result older than the held one.
-    /// Not logged and not an undo step. O(C log C + waivers) for incoming and held case findings;
-    /// each snapshot adds O(V + C) to merge with the other checks. Nothing runs per frame.
-    CaseFindings { unit: BoardId, generation: u64, findings: Vec<Violation> },
+    /// `generation` in the app's case check `run`; `cased`: the plate had case parts for it.
+    /// Replace its previous case findings; ignore a result older than the held one. Snapshots say
+    /// which run they hold (`DesignSnapshot::cases`). Not logged and not an undo step.
+    /// O(C log C + waivers) for incoming and held case findings; each snapshot adds O(V + C) to
+    /// merge with the other checks. Nothing runs per frame.
+    CaseFindings { unit: BoardId, generation: u64, run: u64, cased: bool, findings: Vec<Violation> },
     /// The board space the plate's case keeps clear on `unit` (its parts' `m.keepouts`
     /// records naming this board), as item sets by record name. Each set replaces the unit's
     /// derived items from `FeatureRef::Panel("case:<name>")`; a `case:` set it does not name is
     /// removed, so an empty list clears them all. Not logged and not an undo step, and an
     /// unchanged set changes nothing (no board generation). Cost: one `Design` copy (O(units)
     /// `Arc`s) and O(keepouts) to find the held sets, plus `Design::set_derived` per set.
-    CaseKeepouts { unit: BoardId, sets: Vec<(String, Vec<Item>)> },
+    /// `rooms` and `plan` replace the port geometry and placement rule for the evaluated board.
+    /// Incompatible rules leave their reason for the next place answer.
+    CaseKeepouts { unit: BoardId, generation: u64, sets: Vec<(String, Vec<Item>)>, rooms: Vec<PortRoom>, plan: Result<Option<Arc<dyn fab_elec_route::PlacePlan>>, String> },
+    /// The design generation a model evaluation covered. Its records, when available,
+    /// precede this outcome in the mailbox. An error leaves the last rooms available.
+    CaseOutcome { unit: BoardId, stamp: u64, reason: Option<String> },
 }
 
 /// A whole-document or asset change supplied by another writer.
@@ -159,6 +178,8 @@ pub enum Outcome {
         targets: Vec<Sel>,
         /// The effect of this commit on the simulated circuit.
         circuit: CircuitChange,
+        /// Extra answer fields (key, Splash value text) supplied by this edit's resolver.
+        notes: Vec<(String, String)>,
     },
     /// The sample accepted as the live preview.
     Previewed { tag: u64 },
@@ -179,6 +200,16 @@ pub enum TaskResult {
         fill: ZoneFill,
         /// The live preview's sample seq the fill was made for; None: the committed results.
         preview: Option<u64>,
+    },
+    /// A pool task's whole-board checks of the unit's board at `generation` over `rules` and
+    /// `fills` (kept, so the merge can tell they are still the unit's by `Arc` identity).
+    Checks {
+        unit: BoardId,
+        generation: u64,
+        rules: Arc<RuleMatrix>,
+        fills: Arc<Vec<ZoneFill>>,
+        conn: Arc<fab_elec_board::Connectivity>,
+        drc: Arc<Vec<Violation>>,
     },
 }
 
@@ -219,7 +250,7 @@ impl Mailbox {
         let mut inbox = self.lock();
         if let Some(old) = inbox.preview.replace(s) {
             let named = inbox.cmds.iter().rev()
-                .any(|(_, cmd)| matches!(cmd, Cmd::CommitPreview { seq, tag } if *seq == old.seq && *tag == old.tag));
+                .any(|(_, cmd)| matches!(cmd, Cmd::CommitPreview { seq, tag } | Cmd::Planner { edit: PlannerEdit::Release { seq: Some(seq), tag }, .. } if *seq == old.seq && *tag == old.tag));
             if named {
                 inbox.committing.push(old);
             } else {
@@ -247,6 +278,12 @@ impl Mailbox {
 
     pub fn take(&self) -> Inbox {
         std::mem::take(&mut *self.lock())
+    }
+
+    /// A command or a preview sample waits: work a person waits on, not only task results.
+    pub fn has_commands(&self) -> bool {
+        let inbox = self.lock();
+        !inbox.cmds.is_empty() || inbox.preview.is_some()
     }
 
     /// Retired snapshots, answers and samples alone do not count as waiting work.

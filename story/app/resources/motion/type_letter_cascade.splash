@@ -1,0 +1,32 @@
+use mod.motion.*
+// LETTER CASCADE — letters drop in one after another on a spring, each
+// tipping upright as it settles, under a small tracked-out kicker. They
+// leave the way they came: a staggered fall, first letter first.
+// Why: a spring gives each letter weight and a tiny overshoot, and the
+// 50 ms stagger turns ten separate drops into one wave.
+Motion{
+    label: "Letter cascade"
+    brief: "One big word whose letters fall in on a spring, one after another."
+    tags: ["kinetic-type", "headline", "playful", "reveal"]
+    duration: 4.6
+    inputs: {
+        word: input(@text, "Cascade", "One word, up to about ten letters")
+        kicker: input(@text, "INTRODUCING", "Small caps line above")
+        ink: input(@color, #f4f7fa, "Word colour")
+        accent: input(@color, #ff5c39, "Kicker colour")
+        background: input(@color, #0b0d12, "Ground")
+    }
+    layers: [
+        Rect{size: vec2(1920, 1080) fill: in(@background)}
+        Text{text: in(@kicker) font: Font{family: "Inter" weight: 600} size: 32 tracking: 0.3 color: in(@accent)
+             at: vec2(960, 352) wrap: 1600 align: @center
+             opacity: keys([0.1, 0], [0.5, 1, @ease_out_cubic], [3.9, 1], [4.2, 0, @ease_in_cubic])
+             y: tween(16, 0, 0.1, 0.7, @ease_out_quint)}
+        Text{text: in(@word) font: Font{family: "Inter" weight: 800} size: 240 tracking: -0.04 color: in(@ink)
+             at: vec2(960, 416) wrap: 1600 align: @center
+             by: @letter stagger: 0.05
+             y: keys([0.3, -180], [1.2, 0, spring(210, 17)], [3.8, 0], [4.15, 140, @ease_in_cubic])
+             rotate: keys([0.3, -14], [1.2, 0, spring(210, 15)], [3.8, 0], [4.15, 8, @ease_in_cubic])
+             opacity: keys([0.3, 0], [0.42, 1, @ease_out_cubic], [3.9, 1], [4.15, 0, @ease_in_cubic])}
+    ]
+}

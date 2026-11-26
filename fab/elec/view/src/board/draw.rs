@@ -29,14 +29,15 @@
 //!
 //! In the vertex stage, `item` indexes the host's `item_states` texture (selection, ghost,
 //! violation severity, emphasis; w below zero an outside edit's flash, mixed toward `flash_ink`,
-//! the AI accent) and the pane's `pane_states` texture (dim in x; emphasis in y,
-//! which marks items a key changed besides its target). Each enabled texture is sampled nearest
-//! through `Live.net_uv`, only for an index inside its own capacity; disabled or missing rows
-//! contribute zero state. A vec4 and a dim varying carry these values
-//! to the fragment stage, which applies violation, selection, emphasis, ghost and dim in order.
+//! the AI accent) and the pane's `pane_states` texture (dim in x, emphasis in y, place-job moves
+//! in z). Each enabled texture is sampled nearest through `Live.net_uv` for ids within its capacity.
+//! The vertex stage combines the host ghost and pane dim into the final opacity in item_state.y.
+//! This leaves one scalar varying for the moved flag with the same texture reads and varying count.
+//! The fragment applies violation, selection and emphasis before that opacity.
 //! Before them, an item at or past the `fresh_item` uniform (a preview's new items: ids the
 //! committed board has not issued yet) mixes toward `fresh_ink` by `fresh_mix`; -1 marks none.
-//! While those items are a running route job's partial (`fresh_pending`), they also draw faint
+//! A running place job also marks existing placements in the pane row at their item id.
+//! While the shown proposal is pending (`fresh_pending`), both kinds of item draw faint
 //! inside and bright along their edge (strokes and pads; polygons only faint).
 //! A lit net (`lit_net`, the instance's board `net`) lifts toward white and everything else
 //! fades, both by `lit_mix`: the net under a dragged probe, in every pane at once.
@@ -114,15 +115,15 @@ script_mod! {
         shape: varying(vec4f)
         live_ink: varying(vec3f)
         item_state: varying(vec4f)
-        item_dim: varying(float)
+        place_moved: varying(float)
         live_flow: varying(vec2f)
         fade: varying(float)
         screen: varying(vec2f)
 
         vertex: fn() {
             let art = self.art_mask.x > 0.0 || self.art_mask.y > 0.0 || self.art_mask.z > 0.0 || self.art_mask.w > 0.0
-            self.item_state = vec4(0.0)
-            self.item_dim = 0.0
+            self.item_state = vec4(0.0, 1.0, 0.0, 0.0)
+            self.place_moved = 0.0
             let base = if self.ink.w > 0.0 {self.ink} else {self.layer_ink}
             self.live_ink = base.xyz
             self.live_flow = vec2(0.0)
@@ -140,13 +141,15 @@ script_mod! {
                     let size = self.item_states.size()
                     if self.item < size.x*size.y {
                         self.item_state = self.item_states.sample_nearest(Live.net_uv(self.item, size))
+                        self.item_state.y = if self.item_state.y > 0.5 {self.ghost_alpha} else {1.0}
                     }
                 }
                 if self.pane_states_on > 0.5 {
                     let size = self.pane_states.size()
                     if self.item < size.x*size.y {
                         let pane = self.pane_states.sample_nearest(Live.net_uv(self.item, size))
-                        self.item_dim = pane.x
+                        self.place_moved = pane.z
+                        if pane.x > 0.0 { self.item_state.y = self.item_state.y*mix(1.0, self.dim_alpha, pane.x) }
                         // a key's emphasis, over an outside edit's flash (w below zero) only where set
                         if pane.y > 0.0 { self.item_state.w = max(self.item_state.w, pane.y) }
                     }
@@ -230,7 +233,7 @@ script_mod! {
                 let alpha = cover*mix(self.fade, 1.0, edge)*base.w*self.layer_alpha
                 let mut result = vec4(rgb*alpha, alpha)
                 // The straight-colour operations expressed in premultiplied space.
-                if self.fresh_item >= 0.0 && self.item >= self.fresh_item {
+                if self.fresh_item >= 0.0 && (self.item >= self.fresh_item || self.place_moved > 0.5) {
                     result = vec4(mix(result.xyz, self.fresh_ink.xyz*result.w, self.fresh_mix), result.w)
                     // A running job's copper: faint inside, bright along its edge, until it commits.
                     if self.fresh_pending > 0.0 {
@@ -261,12 +264,7 @@ script_mod! {
                     let flash = clamp(-self.item_state.w, 0.0, 1.0)
                     result = vec4(mix(result.xyz, self.flash_ink.xyz*result.w, 0.6*flash), result.w)
                 }
-                if self.item_state.y > 0.5 {
-                    result *= self.ghost_alpha
-                }
-                if self.item_dim > 0.0 {
-                    result *= mix(1.0, self.dim_alpha, self.item_dim)
-                }
+                if self.item_state.y != 1.0 { result *= self.item_state.y }
                 self.fb0 = result
             }
         }
@@ -329,14 +327,14 @@ script_mod! {
         hole_dir: varying(vec2f)
         live_ink: varying(vec3f)
         item_state: varying(vec4f)
-        item_dim: varying(float)
+        place_moved: varying(float)
         fade: varying(float)
         screen: varying(vec2f)
 
         vertex: fn() {
             let art = self.art_mask.x > 0.0 || self.art_mask.y > 0.0 || self.art_mask.z > 0.0 || self.art_mask.w > 0.0
-            self.item_state = vec4(0.0)
-            self.item_dim = 0.0
+            self.item_state = vec4(0.0, 1.0, 0.0, 0.0)
+            self.place_moved = 0.0
             let base = if self.ink.w > 0.0 {self.ink} else {self.layer_ink}
             self.live_ink = base.xyz
             if !art && self.live_on > 0.5 {
@@ -350,13 +348,15 @@ script_mod! {
                     let size = self.item_states.size()
                     if self.item < size.x*size.y {
                         self.item_state = self.item_states.sample_nearest(Live.net_uv(self.item, size))
+                        self.item_state.y = if self.item_state.y > 0.5 {self.ghost_alpha} else {1.0}
                     }
                 }
                 if self.pane_states_on > 0.5 {
                     let size = self.pane_states.size()
                     if self.item < size.x*size.y {
                         let pane = self.pane_states.sample_nearest(Live.net_uv(self.item, size))
-                        self.item_dim = pane.x
+                        self.place_moved = pane.z
+                        if pane.x > 0.0 { self.item_state.y = self.item_state.y*mix(1.0, self.dim_alpha, pane.x) }
                         // a key's emphasis, over an outside edit's flash (w below zero) only where set
                         if pane.y > 0.0 { self.item_state.w = max(self.item_state.w, pane.y) }
                     }
@@ -418,7 +418,7 @@ script_mod! {
                 let alpha = cover*self.fade*base.w*self.layer_alpha
                 let mut result = vec4(rgb*alpha, alpha)
                 // The straight-colour operations expressed in premultiplied space.
-                if self.fresh_item >= 0.0 && self.item >= self.fresh_item {
+                if self.fresh_item >= 0.0 && (self.item >= self.fresh_item || self.place_moved > 0.5) {
                     result = vec4(mix(result.xyz, self.fresh_ink.xyz*result.w, self.fresh_mix), result.w)
                     if self.fresh_pending > 0.0 {
                         result *= mix(1.0, mix(0.3, 1.0, clamp(1.75+dpad*ppd, 0.0, 1.0)), self.fresh_pending)
@@ -447,12 +447,7 @@ script_mod! {
                     let flash = clamp(-self.item_state.w, 0.0, 1.0)
                     result = vec4(mix(result.xyz, self.flash_ink.xyz*result.w, 0.6*flash), result.w)
                 }
-                if self.item_state.y > 0.5 {
-                    result *= self.ghost_alpha
-                }
-                if self.item_dim > 0.0 {
-                    result *= mix(1.0, self.dim_alpha, self.item_dim)
-                }
+                if self.item_state.y != 1.0 { result *= self.item_state.y }
                 self.fb0 = result
             }
         }
@@ -514,15 +509,15 @@ script_mod! {
         clip: uniform(vec4(-1e20, -1e20, 1e20, 1e20))
         live_ink: varying(vec3f)
         item_state: varying(vec4f)
-        item_dim: varying(float)
+        place_moved: varying(float)
         fade: varying(float)
         screen: varying(vec2f)
         heat_uv: varying(vec2f)
 
         vertex: fn() {
             let art = self.art_mask.x > 0.0 || self.art_mask.y > 0.0 || self.art_mask.z > 0.0 || self.art_mask.w > 0.0
-            self.item_state = vec4(0.0)
-            self.item_dim = 0.0
+            self.item_state = vec4(0.0, 1.0, 0.0, 0.0)
+            self.place_moved = 0.0
             let base = if self.ink.w > 0.0 {self.ink} else {self.layer_ink}
             self.live_ink = base.xyz
             if !art && self.live_on > 0.5 && self.live_net >= 0.0 {
@@ -534,13 +529,15 @@ script_mod! {
                     let size = self.item_states.size()
                     if self.item < size.x*size.y {
                         self.item_state = self.item_states.sample_nearest(Live.net_uv(self.item, size))
+                        self.item_state.y = if self.item_state.y > 0.5 {self.ghost_alpha} else {1.0}
                     }
                 }
                 if self.pane_states_on > 0.5 {
                     let size = self.pane_states.size()
                     if self.item < size.x*size.y {
                         let pane = self.pane_states.sample_nearest(Live.net_uv(self.item, size))
-                        self.item_dim = pane.x
+                        self.place_moved = pane.z
+                        if pane.x > 0.0 { self.item_state.y = self.item_state.y*mix(1.0, self.dim_alpha, pane.x) }
                         // a key's emphasis, over an outside edit's flash (w below zero) only where set
                         if pane.y > 0.0 { self.item_state.w = max(self.item_state.w, pane.y) }
                     }
@@ -588,7 +585,7 @@ script_mod! {
                     }
                 }
                 // The straight-colour operations expressed in premultiplied space.
-                if self.fresh_item >= 0.0 && self.item >= self.fresh_item {
+                if self.fresh_item >= 0.0 && (self.item >= self.fresh_item || self.place_moved > 0.5) {
                     result = vec4(mix(result.xyz, self.fresh_ink.xyz*result.w, self.fresh_mix), result.w)
                     if self.fresh_pending > 0.0 {
                         result *= mix(1.0, 0.3, self.fresh_pending)
@@ -617,12 +614,7 @@ script_mod! {
                     let flash = clamp(-self.item_state.w, 0.0, 1.0)
                     result = vec4(mix(result.xyz, self.flash_ink.xyz*result.w, 0.6*flash), result.w)
                 }
-                if self.item_state.y > 0.5 {
-                    result *= self.ghost_alpha
-                }
-                if self.item_dim > 0.0 {
-                    result *= mix(1.0, self.dim_alpha, self.item_dim)
-                }
+                if self.item_state.y != 1.0 { result *= self.item_state.y }
                 self.fb0 = result
             }
         }

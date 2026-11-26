@@ -360,9 +360,7 @@ impl Shapes {
 }
 
 /// A hash's top 24 bits in [0, 1).
-fn unit(h: u32) -> f32 {
-    (h >> 8) as f32 * (1.0 / 16_777_216.0)
-}
+use crate::noise::unit;
 
 /// The folds and curls of ribbon `k` within `span` km of the middle (`sc` the shapes' scale): the folds from the
 /// ribbons' `shared` seed, each ribbon's a little moved, the curls from its `own`.

@@ -80,6 +80,7 @@ fn builders() -> Vec<(&'static str, &'static [&'static str], Make)> {
         ("fixed", &["t", "opts"], fixed),
         ("width", &["net", "w"], width),
         ("pair", &["p", "n", "opts"], pair),
+        ("match_length", &["nets", "opts"], match_length),
         ("group", &["name", "members"], group),
         ("param", &["value", "min", "max", "step", "label"], param),
         ("netclass", &["name", "rules"], netclass),
@@ -376,8 +377,8 @@ fn comp_fields(c: &Ctx, h: &Here, arg: usize, o: &Obj, fields: &mut Fields) -> R
 /// Read the call's fields, stored reference and optional `added` order, locating mistakes at
 /// the written value. Editor add paths write `added` so the part is numbered after the count,
 /// in this order, and adding it renumbers no other part.
-fn comp_text_options(c: &Ctx, h: &Here, arg: usize, opts: &V, fields: &mut Fields) -> Result<(Option<String>, Option<u32>), (Here, String)> {
-    let Some(o) = opts.obj() else { return Ok((None, None)) };
+fn comp_options(c: &Ctx, h: &Here, arg: usize, opts: &V, fields: &mut Fields) -> Result<(Option<String>, Option<u32>, bool), (Here, String)> {
+    let Some(o) = opts.obj() else { return Ok((None, None, false)) };
     comp_fields(c, h, arg, o, fields)?;
     let refdes = match o.get("ref") {
         None => None,
@@ -391,7 +392,11 @@ fn comp_text_options(c: &Ctx, h: &Here, arg: usize, opts: &V, fields: &mut Field
             option_here(c, h, arg, &["added"]), format!("added: expected a positive whole number, got {}", shown(value)),
         ))? as u32),
     };
-    Ok((refdes, added))
+    let dnp = match o.get("dnp") {
+        None => false,
+        Some(v) => v.bool().ok_or_else(|| (option_here(c, h, arg, &["dnp"]), format!("dnp: expected true or false, got {}", v.describe())))?,
+    };
+    Ok((refdes, added, dnp))
 }
 
 fn pin_kind(name: &str) -> Option<PinKind> {
@@ -455,10 +460,10 @@ fn port_nets(c: &mut Ctx, v: &V) -> Result<Vec<usize>, String> {
 }
 
 /// A new component of part `part` made at `h`.
-fn new_comp(c: &mut Ctx, h: &Here, callee: &str, part: usize, value: Option<Value>, fields: Fields, (refdes, added): (Option<String>, Option<u32>)) -> usize {
+fn new_comp(c: &mut Ctx, h: &Here, callee: &str, part: usize, value: Option<Value>, fields: Fields, (refdes, added, dnp): (Option<String>, Option<u32>, bool)) -> usize {
     let path = item_path(c, h, callee);
     let inst = c.build.inst();
-    c.build.comps.push(CompRec { path, part, value, refdes, added, conns: vec![], nc: vec![], inst, fields, here: h.clone(), site: None, pin_sites: vec![] });
+    c.build.comps.push(CompRec { path, part, value, refdes, added, dnp, conns: vec![], nc: vec![], inst, fields, here: h.clone(), site: None, pin_sites: vec![] });
     let comp = c.build.comps.len() - 1;
     c.build.comps[comp].site = value_site_at(c, h, comp);
     comp
@@ -1265,13 +1270,13 @@ fn part(c: Shared) -> Native {
                 return fail(&mut cx, &h, format!("{path}: {m}"));
             }
         };
-        let comp = new_comp(&mut cx, &h, "part", p, None, Fields::default(), (None, None));
+        let comp = new_comp(&mut cx, &h, "part", p, None, Fields::default(), (None, None, false));
         if let Err(m) = hook_up(&mut cx, &h, comp, &opts) {
             let path = cx.build.comps[comp].path.clone();
             return fail(&mut cx, &h, format!("{path}: {m}"));
         }
         let mut fields = Fields::default();
-        let (refdes, added) = match comp_text_options(&cx, &h, 1, &opts, &mut fields) {
+        let (refdes, added, dnp) = match comp_options(&cx, &h, 1, &opts, &mut fields) {
             Ok(refdes) => refdes,
             Err((at, m)) => {
                 let path = cx.build.comps[comp].path.clone();
@@ -1281,6 +1286,7 @@ fn part(c: Shared) -> Native {
         cx.build.comps[comp].fields = fields;
         cx.build.comps[comp].refdes = refdes;
         cx.build.comps[comp].added = added;
+        cx.build.comps[comp].dnp = dnp;
         comp_handle(vm, &cx, comp, None)
     })
 }
@@ -1295,10 +1301,10 @@ fn read_nc(o: &Obj, def: &PartDef) -> Result<Vec<PinIx>, String> {
     }).collect()
 }
 
-/// Read the pins, no-connect list and value of `e.part`. Its text options are read by `comp_text_options`.
+/// Read the pins, no-connect list and value of `e.part`. Its text options are read by `comp_options`.
 fn hook_up(c: &mut Ctx, h: &Here, comp: usize, opts: &V) -> Result<(), String> {
     let Some(o) = opts_of(opts)? else { return Ok(()) };
-    check_opts(o, &["pins", "nc", "value", "fields", "ref", "added"])?;
+    check_opts(o, &["pins", "nc", "value", "fields", "ref", "added", "dnp"])?;
     let def = c.parts[c.build.comps[comp].part].def.clone();
     match o.get("pins") {
         None | Some(V::Nil) => {}
@@ -1431,7 +1437,7 @@ fn two_pin(c: Shared, prefix: &'static str, unit: QtyUnit) -> Native {
             let mut package = "0402".to_string();
             let mut fields = Fields::default();
             if let Some(o) = o {
-                check_opts(o, &["package", "volts", "tol", "fields", "ref", "nc", "added"])?;
+                check_opts(o, &["package", "volts", "tol", "fields", "ref", "nc", "added", "dnp"])?;
                 if positional_tol && o.get("tol").is_some() {
                     return Err("a tolerance cannot be written both positionally and in tol:".into());
                 }
@@ -1453,7 +1459,7 @@ fn two_pin(c: Shared, prefix: &'static str, unit: QtyUnit) -> Native {
                 return fail(&mut cx, &h, format!("{path}: {m}"));
             }
         };
-        let checked = comp_text_options(&c.borrow(), &h, two_pin_net_arg(1, positional_tol) + 1, opts, &mut fields);
+        let checked = comp_options(&c.borrow(), &h, two_pin_net_arg(1, positional_tol) + 1, opts, &mut fields);
         let reference = match checked {
             Ok(reference) => reference,
             Err((at, m)) => {
@@ -1516,7 +1522,7 @@ fn led(c: Shared) -> Native {
         let h = here(vm, &c.borrow());
         let checked = (|| -> Result<(String, String, f64), String> {
             let Some(o) = opts_of(&opts)? else { return Err("needs {color: @green package: \"0603\"}".into()) };
-            check_opts(o, &["color", "package", "current", "fields", "ref", "nc", "added"])?;
+            check_opts(o, &["color", "package", "current", "fields", "ref", "nc", "added", "dnp"])?;
             let Some(color) = o.get("color").and_then(V::text_or_id).map(str::to_string) else {
                 return Err("color: expected a colour name (@green)".into());
             };
@@ -1553,7 +1559,7 @@ fn led(c: Shared) -> Native {
             Err(m) => return fail_here(m),
         };
         let mut fields = Fields::default();
-        let checked = comp_text_options(&c.borrow(), &h, 0, &opts, &mut fields);
+        let checked = comp_options(&c.borrow(), &h, 0, &opts, &mut fields);
         let reference = match checked {
             Ok(reference) => reference,
             Err((at, m)) => {
@@ -2140,6 +2146,18 @@ fn length(v: &V, what: &str) -> Result<i32, String> {
     v.num().map(nm).ok_or_else(|| format!("{what}: expected a length, got {}", v.describe()))
 }
 
+fn positive_length(v: &V, what: &str) -> Result<Nm, String> {
+    let metres = v.num().ok_or_else(|| format!("{what}: expected a length, got {}", v.describe()))?;
+    let value = (metres * 1e9).round();
+    if !value.is_finite() || value <= 0.0 {
+        return Err(format!("{what}: must be > 0 and finite"));
+    }
+    if value > Nm::MAX as f64 {
+        return Err(format!("{what}: length is outside the nanometre range"));
+    }
+    Ok(value as Nm)
+}
+
 fn intent(c: &Shared, vm: &ScriptVm, callee: &str, make: impl FnOnce() -> Result<IntentRec, String>) -> ScriptValue {
     let mut cx = c.borrow_mut();
     match make() {
@@ -2194,6 +2212,10 @@ fn fixed(c: Shared) -> Native {
                 }
                 if let Some(p) = o.get("at") {
                     at = Some(point(p).ok_or_else(|| format!("at: expected [x, y], got {}", p.describe()))?);
+                    // A spot is one part's: a block's parts cannot all stand on it.
+                    if matches!(t, Tgt::Inst(_)) {
+                        return Err("at: a spot fixes one part: name the part, not the block".into());
+                    }
                 }
                 if let Some(r) = o.get("rot") {
                     rot = Some(Angle::rad(r.num().ok_or_else(|| format!("rot: expected an angle, got {}", r.describe()))?));
@@ -2214,6 +2236,7 @@ fn width(c: Shared) -> Native {
     })
 }
 
+/// Writes a pair and, with `skew`, an adjacent length match checked once both nets are fully routed.
 fn pair(c: Shared) -> Native {
     Box::new(move |vm, args| {
         let (p, n, opts) = (read(vm, args, "p"), read(vm, args, "n"), read(vm, args, "opts"));
@@ -2230,9 +2253,10 @@ fn pair(c: Shared) -> Native {
             if p == n {
                 return Err("p and n are the same net".into());
             }
-            let (mut gap, mut z0) = (None, None);
+            let (mut gap, mut z0, mut skew) = (None, None, None);
             if let Some(o) = opts_of(&opts)? {
-                check_opts(o, &["gap", "z0"])?;
+                check_opts(o, &["gap", "z0", "skew"])?;
+                skew = o.get("skew").map(|v| positive_length(v, "skew")).transpose()?;
                 if let Some(v) = o.get("gap") {
                     let g = length(v, "gap")?;
                     if g <= 0 {
@@ -2249,7 +2273,26 @@ fn pair(c: Shared) -> Native {
                 }
             }
             // A missing gap resolves downstream through ClassRules.pair, then the board rule.
-            Ok(IntentRec::Pair { p, n, gap, z0, here: h })
+            Ok(IntentRec::Pair { p, n, gap, z0, skew, here: h })
+        })
+    })
+}
+
+/// Writes a length match checked once every member net is fully routed.
+fn match_length(c: Shared) -> Native {
+    Box::new(move |vm, args| {
+        let (nets, opts) = (read(vm, args, "nets"), read(vm, args, "opts"));
+        let h = here(vm, &c.borrow());
+        intent(&c, vm, "match_length", || {
+            let list = nets.list().ok_or_else(|| format!("nets: expected a list of nets, got {}", nets.describe()))?;
+            let nets = list.iter().enumerate().map(|(i, v)| match v.handle() {
+                Some(Handle::Net(n)) => Ok(n),
+                _ => Err(format!("nets[{}]: expected a net, got {}", i, v.describe())),
+            }).collect::<Result<Vec<_>, _>>()?;
+            let opts = opts_of(&opts)?.ok_or("tol: missing length tolerance")?;
+            check_opts(opts, &["tol"])?;
+            let tol = positive_length(opts.get("tol").ok_or("tol: missing length tolerance")?, "tol")?;
+            Ok(IntentRec::LengthMatch { nets, tol, here: h })
         })
     })
 }

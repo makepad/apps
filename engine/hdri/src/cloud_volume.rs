@@ -22,8 +22,13 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 /// Rows a call of the row runner takes while a grid builds: the cancel is polled between calls.
 const ROWS_PER_CALL: usize = 64;
-/// Grids no live map holds that the cache keeps, the newest ones.
+/// Items no live map holds that a cache kept by count keeps, the newest ones ([`shared_by_key`]: the light records,
+/// which fill as bakes read them, so their size is not known when they are kept).
 const KEEP_UNHELD: usize = 8;
+/// The bytes of footprint grids no live map holds that their cache keeps, the newest ones: eight 1024^2 grids of
+/// 29.2 MB, the eight the cache kept by count before (a cloud preset's grids are kept by the light grids' budgets,
+/// cloud_volume_sun.rs).
+const GRID_BUDGET: usize = 256_000_000;
 /// The max pyramid starts at this level of the mip chain (cells of 4 x 4 nodes, 250 m on a 1024 grid over 64 km): a
 /// skip needs no finer cell, and finer ones would cost more than the nodes themselves.
 const PYRAMID_FIRST: usize = 2;
@@ -630,48 +635,88 @@ pub fn footprint_grid_key(fields: &[f32], seed: u32, size: usize, span_m: f32) -
 
 /// The grid of `key`, shared process-wide: a lookup makes it the newest; a key not kept is built by `build` outside
 /// the lock (it may be stopped: then nothing is kept), and when two threads built one key the first one's stays. The
-/// cache keeps every grid a live map holds (an Arc beside its own) and the KEEP_UNHELD newest of the rest; it drops
-/// the oldest past that, never fails for a count, and logs each build and each drop.
+/// cache keeps every grid a live map holds (an Arc beside its own) and the newest of the rest up to GRID_BUDGET bytes;
+/// it drops the oldest past that, never fails for a size, and logs each build and each drop.
 pub fn shared_footprint_grid(key: u64, build: &dyn Fn() -> Result<FootprintGrid, Cancelled>) -> Result<Arc<FootprintGrid>, Cancelled> {
-    shared_by_key(&GRIDS, key, build, "footprint grid", &|grid, ms| format!("{}^2 built in {:.0} ms ({:.1} MB)", grid.size(), ms, grid.bytes() as f64 / 1.0e6))
+    shared_by_bytes(&GRIDS, key, build, "footprint grid", &|grid, ms| format!("{}^2 built in {:.0} ms ({:.1} MB)", grid.size(), ms, grid.bytes() as f64 / 1.0e6), GRID_BUDGET, FootprintGrid::bytes)
 }
 
-/// A process-wide cache of built grids by key, oldest first ([`shared_by_key`]).
+/// A process-wide cache of built grids by key, oldest first ([`shared_by_key`], [`shared_by_bytes`]).
 pub(crate) type GridCache<T> = Mutex<Vec<(u64, Arc<T>)>>;
+
+/// What a cache keeps of the items no live map holds, the newest ones: a count of them, or their bytes up to a budget
+/// (an item's bytes from the function).
+enum Keep<T> {
+    Newest(usize),
+    Bytes(usize, fn(&T) -> usize),
+}
+
+/// [`shared_kept`] keeping the KEEP_UNHELD newest items no live map holds.
+pub(crate) fn shared_by_key<T>(cache: &GridCache<T>, key: u64, build: &dyn Fn() -> Result<T, Cancelled>, what: &str, built: &dyn Fn(&T, f64) -> String) -> Result<Arc<T>, Cancelled> {
+    shared_kept(cache, key, build, what, built, Keep::Newest(KEEP_UNHELD))
+}
+
+/// [`shared_kept`] keeping the newest items no live map holds up to `budget` bytes, `bytes` an item's.
+pub(crate) fn shared_by_bytes<T>(cache: &GridCache<T>, key: u64, build: &dyn Fn() -> Result<T, Cancelled>, what: &str, built: &dyn Fn(&T, f64) -> String, budget: usize, bytes: fn(&T) -> usize) -> Result<Arc<T>, Cancelled> {
+    shared_kept(cache, key, build, what, built, Keep::Bytes(budget, bytes))
+}
 
 /// The item of `key` in `cache`: a lookup makes it the newest; a key not kept is built by `build` outside the lock (it
 /// may be stopped: then nothing is kept), and when two threads built one key the first one's stays. The cache keeps
-/// every item a live map holds (an Arc beside its own) and the KEEP_UNHELD newest of the rest; it drops the oldest past
-/// that, never fails for a count, and logs each build (`what` and `built`'s text, given the item and the build's
-/// milliseconds) and each drop.
-pub(crate) fn shared_by_key<T>(cache: &GridCache<T>, key: u64, build: &dyn Fn() -> Result<T, Cancelled>, what: &str, built: &dyn Fn(&T, f64) -> String) -> Result<Arc<T>, Cancelled> {
+/// every item a live map holds (an Arc beside its own) and the newest of the rest that `keep` allows; it drops the
+/// oldest past that, never fails for a count or a size (a miss builds again), and logs each build (`what` and
+/// `built`'s text, given the item and the build's milliseconds) and each drop (with its bytes under a budget).
+fn shared_kept<T>(cache: &GridCache<T>, key: u64, build: &dyn Fn() -> Result<T, Cancelled>, what: &str, built: &dyn Fn(&T, f64) -> String, keep: Keep<T>) -> Result<Arc<T>, Cancelled> {
     if let Some(item) = kept_by_key(cache, key) {
         return Ok(item);
     }
     let start = std::time::Instant::now();
     let item = Arc::new(build()?);
     let ms = start.elapsed().as_secs_f64() * 1000.0;
-    let (item, dropped, kept) = {
+    // An item's share of what is kept: one under a count, its bytes under a budget.
+    fn one<T>(_: &T) -> usize {
+        1
+    }
+    let (most, size, by_bytes): (usize, fn(&T) -> usize, bool) = match keep {
+        Keep::Newest(count) => (count, one::<T>, false),
+        Keep::Bytes(budget, bytes) => (budget, bytes, true),
+    };
+    let (item, trimmed) = {
         let mut items = cache.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((_, first)) = items.iter().find(|(kept, _)| *kept == key) {
             return Ok(first.clone());
         }
         items.push((key, item.clone()));
-        let mut unheld = items.iter().filter(|(_, item)| Arc::strong_count(item) == 1).count();
-        let mut dropped = 0usize;
+        // Which items no live map holds, taken once: a map can let go of its last Arc on another thread without this
+        // lock, and an item counted as held must not go (its bytes are not in `unheld`).
+        let free: Vec<bool> = items.iter().map(|(_, item)| Arc::strong_count(item) == 1).collect();
+        let mut unheld: usize = items.iter().zip(&free).filter(|&(_, &free)| free).map(|((_, item), _)| size(item)).sum();
+        let (mut dropped, mut dropped_size) = (0usize, 0usize);
+        let mut at = 0;
         items.retain(|(_, item)| {
-            let goes = unheld > KEEP_UNHELD && Arc::strong_count(item) == 1;
+            let goes = unheld > most && free[at];
+            at += 1;
             if goes {
-                unheld -= 1;
+                let s = size(item);
+                unheld -= s;
                 dropped += 1;
+                dropped_size += s;
             }
             !goes
         });
-        (item, dropped, items.len())
+        (item, (dropped > 0).then_some((items.len(), dropped, dropped_size, unheld)))
     };
     log!("hdri clouds: {} {}", what, built(&item, ms));
-    if dropped > 0 {
-        log!("hdri clouds: {}s trimmed to {} ({} dropped)", what, kept, dropped);
+    if let Some((kept, dropped, dropped_size, unheld)) = trimmed {
+        if by_bytes {
+            // (the cover solves, 36 bytes each, trim one at every miss once their budget is full: not logged)
+            if dropped_size >= 1024 * dropped {
+                let mb = |bytes: usize| bytes as f64 / 1.0e6;
+                log!("hdri clouds: {}s trimmed to {} ({} dropped, {:.1} MB; {:.1} MB kept that no map holds, of {:.0} MB)", what, kept, dropped, mb(dropped_size), mb(unheld), mb(most));
+            }
+        } else {
+            log!("hdri clouds: {}s trimmed to {} ({} dropped)", what, kept, dropped);
+        }
     }
     Ok(item)
 }
@@ -909,7 +954,8 @@ mod tests {
                 println!("the volume's Cumulus recipe at Size {size_km} on its grid ({} m cells): off by {worst:.4} at most ({} 0.02), {:.5} on average", grid.cell_m(0), if worst <= 0.02 { "within" } else { "over" }, sum / 1000.0);
                 assert!(worst <= held_to, "the volume's grid at Size {size_km} is off its recipe by {worst}");
                 println!("  its strength where the recipe stands cloud ({inside} points): off by {strength_worst:.4} at most (held to {strength_held}), {:.5} on average", strength_sum / inside.max(1) as f32);
-                assert!(inside > 100 && strength_worst <= strength_held, "the volume's grid at Size {size_km} reads its clouds' strength off by {strength_worst} ({inside} points in cloud)");
+                // (a deck's recipe has no strength channel: the Cumulus drawn as the deck holds 0 there)
+                assert!(shape.is_deck() || (inside > 100 && strength_worst <= strength_held), "the volume's grid at Size {size_km} reads its clouds' strength off by {strength_worst} ({inside} points in cloud)");
             }
         }
     }

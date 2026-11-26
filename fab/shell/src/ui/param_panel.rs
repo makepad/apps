@@ -55,13 +55,13 @@ script_mod! {
             // name's start is never cut at the panel's edge); the sections' gap above it, none
             // below: every bar stands that gap from the next, the Part's next section's too
             margin: Inset{right: 0.0 - theme.prop_pad top: theme.prop_section_gap * 2.0}
-            // its bar indented a short level (10 in from the rows' start)
+            // its bar indented a short level (10 in from the section's rows' start), its rows with it
             header +: {hdr +: {margin: Inset{left: 10.0} padding: Inset{left: theme.prop_label_gap right: theme.prop_pad}}}
             body: View{
                 width: Fill height: Fit flow: Down
-                // room above and below the rows (a step less than a section's: it is nested)
-                padding: Inset{top: 4 bottom: 6}
-                // (no inset of its own: its rows line up with the Part's other rows)
+                // room above and below the rows (a step less than a section's: it is nested);
+                // its rows start where its bar does (indented with it)
+                padding: Inset{left: 10.0 top: 4 bottom: 6}
                 content := View{width: Fill height: Fit flow: Down spacing: theme.prop_row_gap margin: Inset{}}
             }
         }

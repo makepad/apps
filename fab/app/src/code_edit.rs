@@ -529,18 +529,47 @@ pub fn param_key(params: &fab::params::ParamState, key: &str) -> Option<String> 
 /// The Add menu's primitives (as plate parts) and the vocabulary by its groups.
 const PRIMITIVES: [(&str, &str); 5] = [("box", "Box"), ("cylinder", "Cylinder"), ("sphere", "Sphere"), ("cone", "Cone"), ("torus", "Torus")];
 
+/// The Add and Modify grids' icons: a primitive's own, and (`group_icon`) a group's tile that
+/// its types share until they get their own.
+fn icon(name: &'static str) -> &'static str {
+    match name {
+        "box" => "self://resources/icons/add_box.svg",
+        "cylinder" | "cone" => "self://resources/icons/add_cylinder.svg",
+        "sphere" => "self://resources/icons/add_sphere.svg",
+        "torus" => "self://resources/icons/radio_off.svg",
+        _ => "self://resources/icons/cube.svg",
+    }
+}
+
+fn group_icon(g: Group) -> &'static str {
+    match g {
+        Group::Generator => "self://resources/icons/extrude.svg",
+        Group::Brep => "self://resources/icons/cube.svg",
+        Group::Combine => "self://resources/icons/duplicate_linked.svg",
+        Group::Modify => "self://resources/icons/round.svg",
+        Group::Mechanical => "self://resources/icons/gear.svg",
+        Group::Text => "self://resources/icons/label.svg",
+        Group::Field => "self://resources/icons/sculpt.svg",
+        Group::Joint => "self://resources/icons/link.svg",
+        Group::Weave => "self://resources/icons/weave.svg",
+        Group::Lighten => "self://resources/icons/grid.svg",
+        _ => "self://resources/icons/shape.svg",
+    }
+}
+
 const MENU_GROUPS: [(Group, &str); 10] = [(Group::Generator, "From a sketch"), (Group::Brep, "Exact (B-rep)"), (Group::Combine, "Combine"), (Group::Modify, "Modify"), (Group::Mechanical, "Mechanical"), (Group::Text, "Text"), (Group::Field, "Field"), (Group::Joint, "Joint"), (Group::Weave, "Weave"), (Group::Lighten, "Lighten")];
 
 /// The Design workspace's Add menu: a flyout per group of the vocabulary, each type by its name.
 pub fn add_menu() -> Vec<fab::ui::popover::MenuItem> {
     use fab::ui::popover::MenuItem;
     use makepad_widgets::LiveId;
-    let mut menu = vec![MenuItem::new(LiveId::from_str("add_group_primitive"), "Primitives")
-        .flyout(PRIMITIVES.iter().map(|(shape, label)| MenuItem::new(LiveId::from_str(&format!("add_shape_{shape}")), label)).collect())];
+    let mut menu = vec![MenuItem::new(LiveId::from_str("add_group_primitive"), "Primitives").svg(icon("box"))
+        .flyout(PRIMITIVES.iter().map(|(shape, label)| MenuItem::new(LiveId::from_str(&format!("add_shape_{shape}")), label).svg(icon(shape))).collect())];
     for (g, label) in MENU_GROUPS {
-        let items: Vec<MenuItem> = PROTOS.iter().filter(|p| p.group == g).map(|p| MenuItem::new(LiveId::from_str(&format!("add_op_{}", p.name)), p.name)).collect();
+        let svg = group_icon(g);
+        let items: Vec<MenuItem> = PROTOS.iter().filter(|p| p.group == g).map(|p| MenuItem::new(LiveId::from_str(&format!("add_op_{}", p.name)), p.name).svg(svg)).collect();
         if !items.is_empty() {
-            menu.push(MenuItem::new(LiveId::from_str(&format!("add_group_{}", g.name())), label).flyout(items));
+            menu.push(MenuItem::new(LiveId::from_str(&format!("add_group_{}", g.name())), label).svg(svg).flyout(items));
         }
     }
     menu
@@ -584,19 +613,20 @@ pub fn modify_menu(has_part: bool) -> Vec<fab::ui::popover::MenuItem> {
     use fab::ui::popover::MenuItem;
     use makepad_widgets::LiveId;
     let features: Vec<MenuItem> = add_menu().into_iter().filter(|m| m.id != LiveId::from_str("add_group_primitive")).collect();
-    let prims = |verb: &str| -> Vec<MenuItem> {
-        [("box", "Box"), ("cylinder", "Cylinder"), ("sphere", "Sphere")].iter().map(|(p, label)| MenuItem::new(LiveId::from_str(&format!("shape_{verb}_{p}")), label)).collect()
+    let prims = |verb: &str, svgs: [&'static str; 3]| -> Vec<MenuItem> {
+        [("box", "Box"), ("cylinder", "Cylinder"), ("sphere", "Sphere")].iter().zip(svgs).map(|((p, label), svg)| MenuItem::new(LiveId::from_str(&format!("shape_{verb}_{p}")), label).svg(svg)).collect()
     };
+    let cuts = ["self://resources/icons/cut_box.svg", "self://resources/icons/cut_cylinder.svg", "self://resources/icons/cut_sphere.svg"];
+    let joins = [icon("box"), icon("cylinder"), icon("sphere")];
     vec![
-        MenuItem::new(LiveId::from_str("modify_feature"), "Add feature").flyout(features).enabled_if(has_part),
-        MenuItem::new(LiveId::from_str("modify_cut"), "Cut away").flyout(prims("subtract")).enabled_if(has_part),
-        MenuItem::new(LiveId::from_str("modify_join"), "Join").flyout(prims("add")).enabled_if(has_part),
+        MenuItem::new(LiveId::from_str("modify_feature"), "Add feature").svg("self://resources/icons/plus.svg").flyout(features).enabled_if(has_part),
+        MenuItem::new(LiveId::from_str("modify_cut"), "Cut away").svg(cuts[0]).flyout(prims("subtract", cuts)).enabled_if(has_part),
+        MenuItem::new(LiveId::from_str("modify_join"), "Join").svg("self://resources/icons/add.svg").flyout(prims("add", joins)).enabled_if(has_part),
         MenuItem::sep(),
-        MenuItem::new(LiveId::from_str("shape_cut_bottom"), "Cut bottom flat").enabled_if(has_part),
-        MenuItem::new(LiveId::from_str("shape_cut_plane"), "Cut along a plane").enabled_if(has_part),
-        MenuItem::new(LiveId::from_str("shape_split"), "Split, keep both halves with pins").enabled_if(has_part),
-        MenuItem::sep(),
-        MenuItem::new(LiveId::from_str("modify_settings_here"), fab::ui::code::SETTINGS_HERE).enabled_if(has_part),
+        MenuItem::new(LiveId::from_str("shape_cut_bottom"), "Cut bottom flat").svg("self://resources/icons/cut_bottom.svg").enabled_if(has_part),
+        MenuItem::new(LiveId::from_str("shape_cut_plane"), "Plane cut").svg("self://resources/icons/cut_plane.svg").enabled_if(has_part),
+        MenuItem::new(LiveId::from_str("shape_split"), "Split + pins").svg("self://resources/icons/split_pins.svg").enabled_if(has_part),
+        MenuItem::new(LiveId::from_str("modify_settings_here"), "Settings here").svg("self://resources/icons/settings_here.svg").enabled_if(has_part),
     ]
 }
 

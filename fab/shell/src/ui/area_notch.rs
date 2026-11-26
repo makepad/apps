@@ -151,13 +151,13 @@ script_mod! {
         }
         // one nub per editor kind (`Editor::kind`), its glyph and its menu name
         Viewport := Notch{tip +: {text: "Plate" chip +: {a11y: {label: "Plate: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/place_plate.svg")}}}}
-        Device := Notch{tip +: {text: "3D view" chip +: {a11y: {label: "3D view: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/area_3d.svg")}}}}
+        Device := Notch{tip +: {text: "Product" chip +: {a11y: {label: "Product: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/area_3d.svg")}}}}
         Plates := Notch{tip +: {text: "Plates" chip +: {a11y: {label: "Plates: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/grid.svg")}}}}
         Parts := Notch{tip +: {text: "Parts" chip +: {a11y: {label: "Parts: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/object.svg")}}}}
         Part := Notch{tip +: {text: "Part" chip +: {a11y: {label: "Part: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/cube.svg")}}}}
         Slicer := Notch{tip +: {text: "Slicer" chip +: {a11y: {label: "Slicer: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/layers.svg")}}}}
         Settings := Notch{tip +: {text: "Job" chip +: {a11y: {label: "Job: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/gear.svg")}}}}
-        Printer := Notch{tip +: {text: "Printer" chip +: {a11y: {label: "Printer: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/printer.svg")}}}}
+        Printer := Notch{tip +: {text: "Printers" chip +: {a11y: {label: "Printers: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/printer.svg")}}}}
         Calibrate := Notch{tip +: {text: "Calibrate" chip +: {a11y: {label: "Calibrate: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/ruler.svg")}}}}
         Features := Notch{tip +: {text: "Features" chip +: {a11y: {label: "Features: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/shape.svg")}}}}
         Code := Notch{tip +: {text: "Program" chip +: {a11y: {label: "Program: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/code.svg")}}}}
@@ -290,14 +290,14 @@ enum Place {
 }
 
 /// Whether an area with this front editor shows its nub in the editor's toolbar: every panel
-/// editor, the code and the plate view (each starts with a `FabEditorBar`; the plate view's is
-/// its stage's top row); the other views and the camera keep the corner.
+/// editor, the code, the plate view and the Product view (each starts with a `FabEditorBar`; the
+/// plate view's is its stage's top row); the other views keep the corner.
 fn in_toolbar(kind: LiveId) -> bool {
     use Editor::*;
     matches!(
         Editor::of_kind(kind),
         Some(Plates | Parts | Part | Slicer | Settings | Printer | Calibrate | Mechanics | Features | Slice | Arm | Scan | Force
-            | Overrides | TestPrints | Strength | Library | Checks | BoardControls | Paint | Jobs | Performance | Code | Viewport)
+            | Overrides | TestPrints | Strength | Library | Checks | BoardControls | Paint | Jobs | Performance | Code | Viewport | Device)
     )
 }
 

@@ -10,7 +10,7 @@
 //! state (the full name in a tooltip). Right: the requirements chip, the job strip (or the save
 //! status while quitting), a reserved slot for the second-window icon (a plate also open in
 //! another Fab window), the headset, undo / redo, the workspace menu (it names the shown
-//! workspace and lists them all, Cmd+1-9; [`crate::ui::workspace_tabs`]), the camera, the AI
+//! workspace and lists them all, Cmd+1-9; [`crate::ui::workspace_tabs`]), the AI
 //! column and Print. (The code is an editor like any other: its area's selector, or ` to show it.)
 //!
 //! The slice is a render mode of the plate view (`stage`), not a workspace. Print
@@ -130,8 +130,8 @@ script_mod! {
                 }
                 // Always available: starts the XR server and pairs a device by its PIN.
                 xr_caption := mod.widgets.XrCaptionButton{app: "fab" margin: Inset{left: 0 right: 0}}
-                // history | the workspace menu (it names the shown one) and its + | the camera and
-                // the assistant | Print
+                // history | the workspace menu (it names the shown one) and its + | the assistant |
+                // Print (the printer camera is the Printers editor's)
                 FabTip{ text: #(keymap::tooltip(Key::Undo))
                     undo := CapIcon{ a11y: {label: "Undo"} draw_icon +: { svg: crate_resource("self://resources/icons/undo.svg") } }
                 }
@@ -141,9 +141,6 @@ script_mod! {
                 CapRule{}
                 workspaces := mod.widgets.FabWorkspaceTabs{}
                 CapRule{}
-                FabTip{ text: "Printer camera: float its live view over the window"
-                    camera := CapIcon{ a11y: {label: "Printer camera"} draw_icon +: { svg: crate_resource("self://resources/icons/camera.svg") } }
-                }
                 FabTip{ text: #(keymap::tooltip(Key::Chat))
                     chat := CapIcon{ a11y: {label: "AI assistant"} draw_icon +: { svg: crate_resource("self://resources/icons/spark.svg") } }
                 }
@@ -268,10 +265,6 @@ pub fn handle_actions(cx: &mut Cx, bar: &WidgetRef, actions: &Actions, state: &A
             cx.action(ShellAction::SetRenderMode(RenderMode::Slice));
         }
         cx.action(PrintAction::AskPrint(true));
-    }
-    // the printer camera floats over the window, or goes
-    if bar.button(cx, ids!(right.camera)).clicked(actions) {
-        cx.action(crate::ui::stage::StageAction::CameraPip(!state.ui.camera_pip));
     }
     if bar.button(cx, ids!(right.chat)).clicked(actions) {
         cx.action(ShellAction::Command("toggle chat".into()));

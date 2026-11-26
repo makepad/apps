@@ -191,7 +191,7 @@ object(block)
 
 fn monitor(app: TestApp, sim: &Path, results: &Path) {
     app.locator(Selector::role(Role::Window)).wait_visible();
-    workspace_row::press(&app, "Design");
+    workspace_row::press(&app, "3D modeling");
     place_block(&app, tools_up(&app));
 
     // Slice (the Slice render mode slices and shows it): the plate's slice, Design's business. The
@@ -249,7 +249,7 @@ fn monitor(app: TestApp, sim: &Path, results: &Path) {
     app.locator(top_layer.clone()).set_value("0.5");
     wait_name(&app, "Looking back at layer");
     let looked = wait_layer(&app, None);
-    workspace_row::press(&app, "Design");
+    workspace_row::press(&app, "3D modeling");
     assert_eq!(wait_layer(&app, Some(plate_count)), (plate_count, plate_count), "Design's slider was not moved");
     let head = tools_up(&app);
     let taller = r##"use mod.model.*
@@ -383,10 +383,10 @@ fn comes_back(app: TestApp, sim: &Path, jobs_dir: &Path) {
     // The queued job is listed and stays where it is when the first ends.
     wait_name(&app, "next: Queued");
     // Leaving Monitor is final for this run, even when another busy report arrives.
-    workspace_row::press(&app, "Design");
+    workspace_row::press(&app, "3D modeling");
     report(sim, &on_the_job("RUNNING", 0, 6, 50, 19));
     wait_report(&app, 6);
-    workspace_row::assert_shown(&app, "Design");
+    workspace_row::assert_shown(&app, "3D modeling");
     workspace_row::press(&app, "Monitor");
     report(sim, &on_the_job("FINISH", -1, JOB_LAYERS, 100, 0));
     wait_name(&app, "block: Finished");
@@ -468,7 +468,7 @@ fn print_button(app: TestApp, sim: &Path) {
     wait_no_name(&app, QUESTION);
 
     // From every workspace.
-    for ws in ["Mechanics", "Monitor", "Design"] {
+    for ws in ["Mechanics", "Monitor", "3D modeling"] {
         workspace_row::press(&app, ws);
         app.locator(print.clone()).click();
         wait_name(&app, QUESTION);
@@ -729,7 +729,7 @@ fn ticked_test_prints_commit_as_one_job_named_for_them() {
                 wait_name(&app, &format!("{}: Finished", meta.name));
                 std::fs::remove_file(fab_printer_link::sim::started_path(&sim)).unwrap();
                 report(&sim, IDLE);
-                workspace_row::press(&app, "Design");
+                workspace_row::press(&app, "3D modeling");
                 let head = tools_up(&app);
                 let batch = format!(r#"{{"request_id":"test-prints-untick-{head}","expected":{head:?},"action":"set","name":"Right","on":false}}"#);
                 call(&app, "test_print", &batch).expect("untick Right for the next print");
@@ -791,7 +791,7 @@ fn installed_profile_prints_queued_and_accepted_jobs_and_monitor_resumes() {
         wait_name(&app, &format!("{}: Finished", meta.name));
         std::fs::remove_file(fab_printer_link::sim::started_path(&sim)).unwrap();
         report(&sim, IDLE);
-        workspace_row::press(&app, "Design");
+        workspace_row::press(&app, "3D modeling");
         small_plate(&app, true);
         wait_for_within(&app, Duration::from_secs(120), || named(&app, "Not printable: floating island"));
         assert!(!names(&app).iter().any(|n| n == "Start print"), "the problem blocks printing until accepted");
@@ -887,15 +887,15 @@ fn a_committed_job_comes_back_after_a_restart_and_the_next_one_waits_for_its_pre
                 }
                 "workspace" => {
                     workspace_row::press(&app, "Mechanics");
-                    workspace_row::press(&app, "Design");
+                    workspace_row::press(&app, "3D modeling");
                 }
                 "edit" => place_block(&app, head),
                 _ => unreachable!(),
             }
-            workspace_row::assert_shown(&app, "Design");
+            workspace_row::assert_shown(&app, "3D modeling");
             report(&sim, &on_the_job("RUNNING", 0, 7, 60, 18).replace("\"msg\":1", "\"msg\":0"));
             wait_report(&app, 7);
-            workspace_row::assert_shown(&app, "Design");
+            workspace_row::assert_shown(&app, "3D modeling");
         });
     }
     let _ = std::fs::remove_dir_all(&dir);

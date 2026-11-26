@@ -229,23 +229,40 @@ impl Widget for FabTrayGrid {
             fab_printer_link::model::LoadedSlot::Tray(id) => Some(id),
             fab_printer_link::model::LoadedSlot::NoneOrExternal => None,
         });
-        let header_h = 18.0;
-        let h = rows.iter().map(|_| header_h + CELL_H + 6.0).sum::<f64>();
+        // One spool per group (each tool of a toolchanger, each head): one grid of them all, each
+        // cell named by its group. Otherwise each unit's trays under its name.
+        let single = rows.len() > 1 && rows.iter().all(|(_, trays)| trays.len() <= 1);
+        let tags: Vec<String> = if single { rows.iter().filter(|(_, t)| !t.is_empty()).map(|(name, _)| name.clone()).collect() } else { Vec::new() };
+        if single {
+            let all = rows.iter().flat_map(|(_, trays)| trays.iter().copied()).collect();
+            rows = vec![(String::new(), all)];
+        }
+        // a grid: as many trays to a row as the width takes, wrapping onto more rows
+        let header_h = if single { 0.0 } else { 18.0 };
+        let width = cx.peek_walk_turtle(walk).size.x;
+        let columns = ((width + 6.0) / CELL_W).floor().max(1.0) as usize;
+        let lines = |n: usize| n.div_ceil(columns).max(1) as f64;
+        let h = rows.iter().map(|(_, trays)| header_h + lines(trays.len()) * CELL_H + 6.0).sum::<f64>();
         let rect = cx.walk_turtle(Walk { height: Size::Fixed(h.max(0.0)), ..walk });
         cx.add_aligned_rect_area(&mut self.area, rect);
         let mut y = rect.pos.y;
         for (name, trays) in &rows {
-            self.draw_small.draw_abs(cx, dvec2(rect.pos.x, y + 2.0), name);
+            if !name.is_empty() {
+                self.draw_small.draw_abs(cx, dvec2(rect.pos.x, y + 2.0), name);
+            }
             y += header_h;
             for (i, tray) in trays.iter().enumerate() {
-                let x = rect.pos.x + i as f64 * CELL_W;
-                // The cell's card.
-                self.draw_chip.spool = 0.0;
-                self.draw_chip.fill = vec4(0.0, 0.0, 0.0, 0.18);
+                let x = rect.pos.x + (i % columns) as f64 * CELL_W;
+                let y = y + (i / columns) as f64 * CELL_H;
+                // no plate behind a tray; the one feeding the nozzle that prints is ringed
                 let printing = feeding.is_some() && tray.id == feeding;
-                self.draw_chip.ring = if printing { vec4(1.0, 1.0, 1.0, 0.75) } else { vec4(1.0, 1.0, 1.0, 0.06) };
-                self.draw_chip.radius = 3.0;
-                self.draw_chip.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(CELL_W - 6.0, CELL_H) });
+                if printing {
+                    self.draw_chip.spool = 0.0;
+                    self.draw_chip.fill = vec4(0.0, 0.0, 0.0, 0.0);
+                    self.draw_chip.ring = vec4(1.0, 1.0, 1.0, 0.75);
+                    self.draw_chip.radius = 3.0;
+                    self.draw_chip.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(CELL_W - 6.0, CELL_H - 6.0) });
+                }
                 let empty = tray.present == Some(false) || (tray.material.is_none() && tray.colour.is_none());
                 self.draw_chip.spool = 1.0;
                 self.draw_chip.empty = if empty { 1.0 } else { 0.0 };
@@ -255,7 +272,13 @@ impl Widget for FabTrayGrid {
                 self.draw_chip.spool = 0.0;
                 self.draw_chip.empty = 0.0;
                 let material = if empty { "Empty".to_string() } else { tray.material.clone().unwrap_or_else(|| "?".into()) };
-                let label = if s.numbered_heads { material } else { format!("{} {}", tray_label(tray.id), material) };
+                // in one grid of single spools: the group's name, the material under it
+                let tag = tags.get(i).cloned();
+                let label = match &tag {
+                    Some(tag) => tag.clone(),
+                    None if s.numbered_heads => material.clone(),
+                    None => format!("{} {}", tray_label(tray.id), material),
+                };
                 let tw = self.draw_name.prepare_single_line_run(cx, &label).map(|r| r.width_in_lpxs as f64).unwrap_or(40.0);
                 self.draw_name.draw_abs(cx, dvec2(x + ((CELL_W - 6.0 - tw) * 0.5).max(2.0), y + SPOOL + 9.0), &label);
                 let colour = tray.colour.map(|c| { let [r, g, b, _] = c.0; format!(" colour #{:02x}{:02x}{:02x}", (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8) }).unwrap_or_default();
@@ -264,13 +287,16 @@ impl Widget for FabTrayGrid {
                 self.items.push((format!("{name} {label}{colour}{left}{printing}"), Rect { pos: dvec2(x, y), size: dvec2(CELL_W - 6.0, CELL_H) }, tray.id));
                 // An external spool has no tag to read what is left from (it reports 0).
                 let external = tray.id.is_some_and(|i| matches!(i.ams, 254 | 255));
-                if let Some(r) = tray.remain.filter(|r| *r >= 0.0 && !empty && !external && !s.numbered_heads) {
+                if tag.is_some() {
+                    let tw = self.draw_small.prepare_single_line_run(cx, &material).map(|r| r.width_in_lpxs as f64).unwrap_or(20.0);
+                    self.draw_small.draw_abs(cx, dvec2(x + ((CELL_W - 6.0 - tw) * 0.5).max(2.0), y + SPOOL + 24.0), &material);
+                } else if let Some(r) = tray.remain.filter(|r| *r >= 0.0 && !empty && !external && !s.numbered_heads) {
                     let t = format!("{r:.0}%");
                     let tw = self.draw_small.prepare_single_line_run(cx, &t).map(|r| r.width_in_lpxs as f64).unwrap_or(20.0);
                     self.draw_small.draw_abs(cx, dvec2(x + (CELL_W - 6.0 - tw) * 0.5, y + SPOOL + 24.0), &t);
                 }
             }
-            y += CELL_H + 6.0;
+            y += lines(trays.len()) * CELL_H + 6.0;
         }
         DrawStep::done()
     }

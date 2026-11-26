@@ -20,13 +20,14 @@ script_mod! {
     // A section nested in the Legend: its bar a level in (under the Legend's icon, as the Part
     // panel's parameter groups), its rows where the Legend's other rows are.
     let LegendPart = PropSection{
-        grip: false
+        // a grip to move it within the Legend (never out of it)
+        grip: true
         margin: Inset{}
-        header +: {hdr +: {margin: Inset{left: theme.prop_icon_size + theme.prop_label_gap} padding: Inset{left: theme.prop_label_gap right: theme.prop_pad}}}
+        header +: {hdr +: {margin: Inset{left: 10.0} padding: Inset{left: theme.prop_label_gap right: theme.prop_pad}}}
         body: View{
             width: Fill height: Fit flow: Down
             // its rows a level in too: they start where its bar does
-            padding: Inset{left: theme.prop_icon_size + theme.prop_label_gap top: 4 bottom: 6}
+            padding: Inset{left: 10.0 top: 4 bottom: 6}
         }
     }
 
@@ -109,13 +110,21 @@ script_mod! {
                     body +: {
                         // nested: the colours' key (titled as the colour mode) with the print
                         // time, then the materials
-                        key_box := LegendPart{
-                            header +: {hdr +: {title +: {text: "Feature"}}}
-                            body +: { legend := mod.widgets.FabSliceLegend{part: 1} }
-                        }
-                        material_box := LegendPart{
-                            header +: {hdr +: {title +: {text: "Material"}}}
-                            body +: { materials := mod.widgets.FabSliceLegend{part: 2} }
+                        // (each in its slot: the box it moves in when dragged by its grip)
+                        legend_parts := View{
+                            width: Fill height: Fit flow: Down
+                            key_box_slot := View{width: Fill height: Fit
+                                key_box := LegendPart{
+                                    header +: {hdr +: {title +: {text: "Feature"}}}
+                                    body +: { legend := mod.widgets.FabSliceLegend{part: 1} }
+                                }
+                            }
+                            material_box_slot := View{width: Fill height: Fit
+                                material_box := LegendPart{
+                                    header +: {hdr +: {title +: {text: "Material"}}}
+                                    body +: { materials := mod.widgets.FabSliceLegend{part: 2} }
+                                }
+                            }
                         }
                     }
                 }
@@ -177,6 +186,10 @@ impl Widget for FabSlicePanel {
             let order: Vec<(LiveId, WidgetRef, WidgetRef)> = [(live_id!(display_slot), live_id!(display)), (live_id!(compare_slot), live_id!(compare)), (live_id!(legend_box_slot), live_id!(legend_box)), (live_id!(printability_slot), live_id!(printability)), (live_id!(overhang_list_slot), live_id!(overhang_list))]
                 .into_iter().map(|(slot, id)| (slot, self.view.widget(cx, &[id]), self.view.widget(cx, &[slot]))).collect();
             crate::ui::widgets::section_reorder(cx, event, live_id!(slice_sections), &order, self.view.area());
+            // and the Legend's own, which move within it
+            let nested: Vec<(LiveId, WidgetRef, WidgetRef)> = [(live_id!(key_box_slot), live_id!(key_box)), (live_id!(material_box_slot), live_id!(material_box))]
+                .into_iter().map(|(slot, id)| (slot, self.view.widget(cx, &[id]), self.view.widget(cx, &[slot]))).collect();
+            crate::ui::widgets::section_reorder(cx, event, live_id!(slice_legend_parts), &nested, self.view.area());
         }
         // the sections' headers first (their hover, and a drag across them folding them all)
         if matches!(event, Event::MouseMove(_) | Event::MouseDown(_) | Event::MouseUp(_) | Event::MouseLeave(_) | Event::ClearHover) {
@@ -229,6 +242,8 @@ impl Widget for FabSlicePanel {
         // the sections in the order they were dragged into
         let body = self.view.widget(cx, ids!(body));
         crate::ui::widgets::apply_section_order(cx, live_id!(slice_sections), &body);
+        let legend_parts = self.view.widget(cx, ids!(legend_parts));
+        crate::ui::widgets::apply_section_order(cx, live_id!(slice_legend_parts), &legend_parts);
         if let Some(state) = scope.data.get::<AppState>() {
             let p = &state.print;
             let b = self.view.view(cx, ids!(body));

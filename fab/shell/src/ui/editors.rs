@@ -105,7 +105,7 @@ pub enum Family {
 pub const MENU: [(&str, &[Editor]); 7] = [
     ("3D views", &[Editor::Viewport, Editor::Device]),
     ("Plate data", &[Editor::Plates, Editor::Parts, Editor::Part, Editor::Steps, Editor::Code, Editor::Journal]),
-    ("Print", &[Editor::Slicer, Editor::Overrides, Editor::TestPrints, Editor::Settings, Editor::Printer, Editor::Calibrate, Editor::Jobs]),
+    ("Print", &[Editor::Slicer, Editor::Overrides, Editor::Printer]),
     ("Analysis", &[Editor::Slice, Editor::Strength, Editor::Force, Editor::Mechanics, Editor::Performance]),
     ("Electronics", &[Editor::Circuit, Editor::Board, Editor::Library, Editor::Checks, Editor::Requirements, Editor::Bom, Editor::Bench, Editor::BoardControls, Editor::Scope, Editor::Transport, Editor::Firmware]),
     ("Experimental", &[Editor::Arm, Editor::ArmCell, Editor::ArmCompare, Editor::Scan, Editor::ScanView]),
@@ -134,13 +134,13 @@ const fn def(editor: Editor, tab: LiveId, kind: LiveId, name: &'static str, titl
 /// Every editor, in [`Editor`]'s order.
 pub const EDITORS: [EditorDef; 41] = [
     def(Editor::Viewport, live_id!(tab_viewport), live_id!(Viewport), "Plate", "Plate", true),
-    def(Editor::Device, live_id!(tab_device), live_id!(Device), "3D view", "3D view", false),
+    def(Editor::Device, live_id!(tab_device), live_id!(Device), "Product", "Product", false),
     def(Editor::Plates, live_id!(tab_plates), live_id!(Plates), "Plates", "Plates", false),
     def(Editor::Parts, live_id!(tab_parts), live_id!(Parts), "Parts", "Parts", false),
     def(Editor::Part, live_id!(tab_part), live_id!(Part), "Part", "Part", false),
     def(Editor::Slicer, live_id!(tab_slicer), live_id!(Slicer), "Slicer", "Slicer", false),
     def(Editor::Settings, live_id!(tab_settings), live_id!(Settings), "Job", "Job", false),
-    def(Editor::Printer, live_id!(tab_printer), live_id!(Printer), "Printer", "Printer", false),
+    def(Editor::Printer, live_id!(tab_printer), live_id!(Printer), "Printers", "Printers", false),
     def(Editor::Calibrate, live_id!(tab_calibrate), live_id!(Calibrate), "Calibrate", "Calibrate", false),
     def(Editor::Camera, live_id!(tab_camera), live_id!(Camera), "Camera", "Camera", false),
     def(Editor::Features, live_id!(tab_features), live_id!(Features), "Features", "Features", false),
@@ -228,10 +228,10 @@ impl Editor {
     }
 
     /// Alone in an area it shows no tab bar, only the nub: a view that keeps the corner clear and
-    /// has no toolbar of its own (the Plate view's and the Program's nub is their toolbar's first
-    /// button, under a tab bar as every panel's).
+    /// has no toolbar of its own (the Plate view's, the Program's and the Product view's nub is
+    /// their toolbar's first button, under a tab bar as every panel's).
     pub fn bare_alone(self) -> bool {
-        self.keeps_corner() && !matches!(self, Editor::Viewport | Editor::Code)
+        self.keeps_corner() && !matches!(self, Editor::Viewport | Editor::Code | Editor::Device)
     }
 
     /// The editor whose bodies are of `kind`.
@@ -250,7 +250,7 @@ impl Editor {
 
     /// An editor no area shows any more (it went into another), kept for the layouts that name it.
     pub fn retired(self) -> bool {
-        matches!(self, Editor::Parameters | Editor::Paint | Editor::Camera)
+        matches!(self, Editor::Parameters | Editor::Paint | Editor::Camera | Editor::Calibrate | Editor::Jobs | Editor::Settings | Editor::TestPrints)
     }
 
     pub fn of_kind(kind: LiveId) -> Option<Editor> {

@@ -203,6 +203,8 @@ script_mod! {
                 width: Fill
                 height: Fill
                 fit: ImageFit.CropToFill
+                // its corners rounded as the well it fills
+                draw_bg +: { border_radius: fab.radius }
             }
             corner := View{
                 width: Fill

@@ -48,15 +48,14 @@ script_mod! {
         // A group sits on its section's card, its title under the section's title (past the
         // section's icon); its rows and the next group's title follow on the row rhythm.
         Group := PropSection{
-            // the model's groups, in the model's order: no grip to move them
-            grip: false
+            // a grip to move it among its part's groups (never out of them)
+            grip: true
             // out over the enclosing section's inset, so its rows start and end where the Part's
             // other rows do (and its title where theirs is)
             margin: Inset{left: 0.0 - theme.prop_pad right: 0.0 - theme.prop_pad}
-            // its bar indented a level: it starts under its section's icon (an icon and a gap in from
-            // the rows' start, which is `prop_pad` in from the Group, set out by its margin above),
-            // so its chevron sits below that icon and its title lines up with the section's
-            header +: {hdr +: {margin: Inset{left: theme.prop_pad + theme.prop_icon_size + theme.prop_label_gap} padding: Inset{left: theme.prop_label_gap right: theme.prop_pad}}}
+            // its bar indented a short level (10 in from the rows' start, which is `prop_pad`
+            // in from the Group, set out by its margin above)
+            header +: {hdr +: {margin: Inset{left: theme.prop_pad + 10.0} padding: Inset{left: theme.prop_label_gap right: theme.prop_pad}}}
             body: View{
                 width: Fill height: Fit flow: Down
                 // room above and below the rows (a step less than a section's: it is nested)
@@ -405,6 +404,13 @@ pub struct FabParamPanel {
     templates: HashMap<LiveId, ScriptObjectRef>,
     #[rust]
     items: ComponentMap<LiveId, (WidgetRef, LiveId)>,
+    /// The key its groups' order is kept by (`widgets::section_reorder`): the shown part's, so
+    /// a group moves among its own part's groups only. None until a part shows.
+    #[rust]
+    order_key: Option<LiveId>,
+    /// The groups as last drawn, in order (their ids).
+    #[rust]
+    group_ids: Vec<LiveId>,
     /// The rows of the last draw: id, what, rect.
     #[rust]
     rows: Vec<(LiveId, RowKind, Rect)>,
@@ -440,6 +446,13 @@ pub struct FabParamPanel {
     /// were taken from: built once per parameter model, not per frame.
     #[rust]
     names: Option<(usize, std::sync::Arc<[makepad_script::syntax::quantity::NamedValue]>)>,
+    /// The editor's search (`widgets::filter_sections`), its words lowercased: while it holds
+    /// any, only the rows whose group and label hold every word draw, their groups open.
+    #[rust]
+    filter: Vec<String>,
+    /// What the search reads, as the last draw had it: each group's name and its rows' labels.
+    #[rust]
+    searchable: Vec<(String, Vec<String>)>,
 }
 
 impl ScriptHook for FabParamPanel {
@@ -858,6 +871,14 @@ impl Widget for FabParamPanel {
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         if matches!(event, Event::Draw(_)) { return; }
+        // a group held by its grip moves among its part's groups, the others sliding aside: first,
+        // so the press is the grip's, not its header's fold
+        if let (Some(key), true) = (self.order_key, matches!(event, Event::MouseDown(_) | Event::MouseMove(_) | Event::MouseUp(_) | Event::NextFrame(_))) {
+            let order: Vec<(LiveId, WidgetRef, WidgetRef)> = self.group_ids.iter()
+                .filter_map(|id| self.items.get(id).map(|(w, _)| (*id, w.clone(), w.clone())))
+                .collect();
+            crate::ui::widgets::section_reorder(cx, event, key, &order, self.area);
+        }
         crate::ui::widgets::section_headers(cx, event, self.items.iter().filter(|(_, (_, t))| *t == live_id!(Group)).map(|(_, (w, _))| w));
         let claimed_before = event.pointer_claimed_area();
         let Some(state) = scope.data.get::<AppState>() else { return };
@@ -1098,8 +1119,32 @@ impl Widget for FabParamPanel {
         }
         cx.begin_turtle(walk, self.layout);
         let editing = self.rows_for_step(state, &pp);
-        let groups = grouped(state, editing.as_ref().map_or(&pp.params, |rows| &rows.params), self.volumes);
-        if let Some(rows) = &editing {
+        let mut groups = grouped(state, editing.as_ref().map_or(&pp.params, |rows| &rows.params), self.volumes);
+        // in the order they were dragged into (per part), the held one last (drawn over the others)
+        let key = LiveId::from_str(&format!("param_groups:{}", pp.object));
+        self.order_key = Some(key);
+        let held = crate::ui::widgets::held_section(cx, key);
+        groups.sort_by_key(|(g, _)| crate::ui::widgets::section_rank(cx, key, row_id(&RowKind::Group(g.clone()))));
+        if let Some(i) = groups.iter().position(|(g, _)| Some(row_id(&RowKind::Group(g.clone()))) == held) {
+            let g = groups.remove(i);
+            groups.push(g);
+        }
+        self.searchable = groups.iter().map(|(g, ps)| (g.clone(), ps.iter().map(|p| p.label.clone()).collect())).collect();
+        // the editor's search: a group whose name holds every word shows whole, else only its
+        // rows whose group and label together hold them (so "holes depth" finds Holes' Depth)
+        let filtering = !self.filter.is_empty();
+        if filtering {
+            let words = &self.filter;
+            groups = groups.into_iter().filter_map(|(g, ps)| {
+                if holds_all(words, &g) { return Some((g, ps)); }
+                let ps: Vec<_> = ps.into_iter().filter(|p| holds_all(words, &format!("{g} {}", p.label))).collect();
+                (!ps.is_empty()).then_some((g, ps))
+            }).collect();
+        }
+        self.group_ids = groups.iter().map(|(g, _)| row_id(&RowKind::Group(g.clone()))).collect();
+        if filtering {
+            // (the hints say what the part is; a search shows its matches alone)
+        } else if let Some(rows) = &editing {
             if let Some(w) = self.item(cx, live_id!(param_edit_step), live_id!(Hint)) {
                 w.label(cx, ids!(text)).set_text(cx, &rows.heading);
                 w.draw_all(cx, &mut Scope::empty());
@@ -1113,14 +1158,14 @@ impl Widget for FabParamPanel {
             }
         }
         let grow: Vec<&str> = state.params.grow_lines.iter().filter(|l| l.object == pp.object).map(|l| l.text.as_str()).collect();
-        if !grow.is_empty() && !self.volumes && editing.is_none() {
+        if !grow.is_empty() && !self.volumes && editing.is_none() && !filtering {
             if let Some(w) = self.item(cx, live_id!(param_grow), live_id!(Hint)) {
                 w.label(cx, ids!(text)).set_text(cx, &grow.join("\n"));
                 w.draw_all(cx, &mut Scope::empty());
                 self.rows.push((live_id!(param_grow), RowKind::Hint, w.area().rect(cx)));
             }
         }
-        if groups.is_empty() && !self.volumes && editing.is_none() {
+        if groups.is_empty() && !self.volumes && editing.is_none() && !filtering {
             if let Some(w) = self.item(cx, live_id!(param_hint), live_id!(Hint)) {
                 w.label(cx, ids!(text)).set_text(cx, "This part has no shape parameters (an imported mesh). Ask the AI to rebuild it as a program to tune it here.");
                 w.draw_all(cx, &mut Scope::empty());
@@ -1131,7 +1176,7 @@ impl Widget for FabParamPanel {
             let gk = RowKind::Group(group.clone());
             let gid = row_id(&gk);
             // (the picked volume's one group always shows its rows)
-            let open = self.volumes || editing.is_some() || self.open.contains(&group);
+            let open = self.volumes || editing.is_some() || filtering || self.open.contains(&group);
             let Some(section) = self.item(cx, gid, live_id!(Group)) else { continue };
             if !self.applied.get(&gid).is_some_and(|c| c.shows_group(&group)) {
                 section.label(cx, ids!(hdr.title)).set_text(cx, &group);
@@ -1149,7 +1194,7 @@ impl Widget for FabParamPanel {
             // it shrinks smoothly like the fixed sections instead of vanishing.
             if !open && section.as_prop_section().opened(cx) <= 0.001 {
                 crate::ui::widgets::section_rows(cx, &section, children);
-                section.draw_all(cx, &mut Scope::empty());
+                draw_at_offset(cx, key, gid, &section);
                 self.rows[start].2 = section.widget(cx, ids!(hdr)).area().rect(cx);
                 continue;
             }
@@ -1248,7 +1293,7 @@ impl Widget for FabParamPanel {
             }
             let children = self.axis_runs(cx, children, &labels);
             crate::ui::widgets::section_rows(cx, &section, children);
-            section.draw_all(cx, &mut Scope::empty());
+            draw_at_offset(cx, key, gid, &section);
             for (id, kind, rect) in &mut self.rows[start..] {
                 if let Some((w, _)) = self.items.get(id) {
                     *rect = if matches!(kind, RowKind::Group(_)) { w.widget(cx, ids!(hdr)).area().rect(cx) }
@@ -1258,7 +1303,7 @@ impl Widget for FabParamPanel {
                 }
             }
         }
-        if !self.volumes && editing.is_none() {
+        if !self.volumes && editing.is_none() && (!filtering || holds_all(&self.filter, MASS)) {
             self.draw_mass(cx, state, &pp);
         }
         cx.end_turtle_with_area(&mut self.area);
@@ -1266,7 +1311,36 @@ impl Widget for FabParamPanel {
     }
 }
 
+/// Whether `text` holds every one of the search's `words` (lowercased), case aside.
+fn holds_all(words: &[String], text: &str) -> bool {
+    let text = text.to_lowercase();
+    words.iter().all(|w| text.contains(w.as_str()))
+}
+
+/// A group drawn at its offset while one of its part's groups moves (`widgets::section_offset`:
+/// its top margin, given back by its bottom one, so nothing after it moves with it).
+fn draw_at_offset(cx: &mut Cx2d, key: LiveId, id: LiveId, section: &WidgetRef) {
+    let offset = crate::ui::widgets::section_offset(cx, key, id);
+    let mut walk = section.walk(cx);
+    walk.margin.top += offset;
+    walk.margin.bottom -= offset;
+    section.draw_walk_all(cx, &mut Scope::empty(), walk);
+}
+
 impl FabParamPanel {
+    /// The editor's search words (none: show all); whether any of its rows holds them all (by
+    /// the last draw's rows). The filter is the panel's own: its rows are drawn, not children a
+    /// filter could hide one by one.
+    pub fn set_filter(&mut self, cx: &mut Cx, words: &[String]) -> bool {
+        if self.filter != words {
+            self.filter = words.to_vec();
+            self.area.redraw(cx);
+        }
+        words.is_empty() || holds_all(words, MASS) || self.searchable.iter().any(|(group, labels)| {
+            holds_all(words, group) || labels.iter().any(|label| holds_all(words, &format!("{group} {label}")))
+        })
+    }
+
     /// The Mass and balance row: closed until the person opens it, then the part weighed as the
     /// job prints it (the app asks `fab.measure {what: "mass"}`, as the AI does) and its figures
     /// here, while the view marks its centre of mass.

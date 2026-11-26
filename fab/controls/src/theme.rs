@@ -290,6 +290,8 @@ pub fn script_mod(vm: &mut ScriptVm) {
             // and outline, as the menus and popovers)
             color_float: theme.color_surface_container_high
             color_float_border: theme.color_bevel_outset_2
+            // the soft drop shadow under every floating card (toolbars, flyouts, menus)
+            color_float_shadow: #x00000070
             // the shadow along a scrolled panel's top edge, under its toolbar
             color_scroll_shade: #x0000004d
             // Checkboxes / toggles, Fab's inset well and its filled state.

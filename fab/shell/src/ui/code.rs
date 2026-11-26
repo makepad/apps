@@ -870,8 +870,10 @@ impl Widget for FabFeaturesPanel {
 }
 
 const ROW: f64 = 24.0;
-/// A tree level's indent, the Parts outliner's.
+/// The fold chevron's column.
 const INDENT: f64 = 18.0;
+/// A tree level's indent, the Parts outliner's (`parts::TREE_STEP`).
+const STEP: f64 = 12.0;
 /// How long a fold takes to open or close (s), in the tree and in the Parts outliner (a fn, not
 /// a const: a live session patches a fn's new value in, a const's needs a restart).
 pub fn fold_s() -> f64 {
@@ -1515,7 +1517,7 @@ impl Widget for FabFeatureTree {
             // The Parts outliner's grid: a level is 18 wide, a fold's slot is the level's first 18
             // (its 10-wide chevron centred in it) and the kind starts 6 after it, so a part's
             // top rows fold under its swatch and their kinds start where its name does.
-            let x = r.pos.x + 6.0 + f.depth as f64 * INDENT;
+            let x = r.pos.x + 6.0 + f.depth as f64 * STEP;
             let fold = (f.children > 0).then_some(Rect { pos: dvec2(x, r.pos.y), size: dvec2(INDENT, r.size.y) });
             if let Some(fold) = fold {
                 let icon = Rect { pos: fold.pos + dvec2((INDENT - 10.0) * 0.5, (fold.size.y - 10.0) * 0.5), size: dvec2(10.0, 10.0) };

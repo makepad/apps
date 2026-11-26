@@ -75,6 +75,9 @@ pub struct MenuItem {
     pub swatch: Option<MenuSwatch>,
     /// A short id in a fixed-width column between the swatch and the label ("A2").
     pub tag: String,
+    /// An icon (`self://resources/icons/…`). A menu whose every row has one lays out as a
+    /// grid of tiles (`menu::Level::lay_out_grid`).
+    pub svg: Option<&'static str>,
 }
 
 impl MenuItem {
@@ -93,6 +96,7 @@ impl MenuItem {
             submenu: Vec::new(),
             swatch: None,
             tag: String::new(),
+            svg: None,
         }
     }
 
@@ -162,6 +166,12 @@ impl MenuItem {
 
     /// Turn this row into a flyout parent. Firing it opens `rows` instead of
     /// emitting a pick.
+    /// The row's icon; see [`MenuItem::svg`].
+    pub fn svg(mut self, svg: &'static str) -> Self {
+        self.svg = Some(svg);
+        self
+    }
+
     pub fn flyout(mut self, rows: Vec<MenuItem>) -> Self {
         self.submenu = rows;
         self
@@ -182,6 +192,7 @@ impl MenuItem {
             submenu: Vec::new(),
             swatch: None,
             tag: String::new(),
+            svg: None,
         }
     }
 }

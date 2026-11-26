@@ -142,7 +142,7 @@ fn rebuilding(app: &TestApp) -> bool {
 fn pick_part(app: &TestApp, name: &str) {
     app.locator(Selector::role(Role::Tab).name("Parts")).click();
     app.locator(Selector::role(Role::TreeItem).name(name)).wait_visible().click();
-    workspace_row::press(app, "Design");
+    workspace_row::press(app, "3D modeling");
     app.locator(Selector::id("t_shape")).wait_visible().click();
 }
 
@@ -189,7 +189,7 @@ fn field_parts_are_never_meshed_in_normal_use(app: TestApp) {
     // one reading at the end covers every step) ----
     app.locator(Selector::role(Role::Tab).name("Parts")).click();
     app.locator(Selector::role(Role::TreeItem).name("Field part")).wait_visible().click();
-    for ws in ["Monitor", "Mechanics", "Design"] {
+    for ws in ["Monitor", "Mechanics", "3D modeling"] {
         workspace_row::press(&app, ws);
     }
     let (e_ws, m_ws) = settled(&app);

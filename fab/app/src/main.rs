@@ -187,7 +187,7 @@ script_mod! {
                         }
                         // its own list: the chat redraws itself as it changes
                         b: View{width: Fill height: Fill new_batch: true
-                            ai_chat := AiChatPanel{width: Fill height: Fill}
+                            ai_chat := AiChatPanel{width: Fill height: Fill web_research: true}
                         }
                     }
                     // Offscreen review passes for fab.render (1x1, invisible).
@@ -1761,10 +1761,15 @@ impl App {
             }
             return true;
         }
+        // Q: the view pie around the pointer, in the Plate view under it
+        if ke.key_code == KeyCode::KeyQ && plain && !ke.is_repeat {
+            cx.action(fab::ui::stage::StageAction::ViewPie);
+            return true;
+        }
         let gizmo = match ke.key_code {
             KeyCode::KeyB if plain && model_keys => Some(GizmoMode::Paint),
             KeyCode::KeyK if plain && self.state.ui.in_mode(PlateMode::Design) => Some(GizmoMode::Sculpt),
-            KeyCode::KeyQ if plain && model_keys => Some(GizmoMode::Off),
+            KeyCode::KeyW if plain && model_keys => Some(GizmoMode::Off),
             KeyCode::KeyG if plain && model_keys => Some(GizmoMode::Move),
             KeyCode::KeyR if plain && model_keys => Some(GizmoMode::Rotate),
             KeyCode::KeyS if plain && model_keys => Some(GizmoMode::Scale),
@@ -7612,7 +7617,7 @@ impl ChatHost for App {
                 NoticeView::Plate => "Plate",
                 NoticeView::Board => "Board",
                 NoticeView::Circuit => "Schematic",
-                NoticeView::Device => "3D view",
+                NoticeView::Device => "Product",
                 NoticeView::Scope => "Scope",
             });
             target.context.push_str(": ");

@@ -1039,14 +1039,17 @@ impl NavController for Navigator {
         };
         cam.fit_clip_planes(&state.scene.bounds, self.aspect());
         self.switched = Some((was, cam));
+        crate::view_prefs::save_ortho(ortho);
         // A glide on its way goes on in the new projection: its next step would take the old
-        // one back.
+        // one back. Else the projection changes in a glide of its own (a narrowing perspective
+        // between the two: `orbit::lerp_camera`).
         if let Some(anim) = &mut self.anim {
             orbit::set_ortho(&mut anim.from, ortho);
             orbit::set_ortho(&mut anim.to, ortho);
+            self.commit(state, cam, preset);
+        } else {
+            self.glide(state, cam, ANIM_SLOW, preset);
         }
-        crate::view_prefs::save_ortho(ortho);
-        self.commit(state, cam, preset);
     }
 
     fn orbit_by(&mut self, _cx: &mut Cx, state: &mut AppState, dx: f32, dy: f32) {

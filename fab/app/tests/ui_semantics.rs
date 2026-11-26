@@ -189,7 +189,7 @@ object(block)
     // ---- the workspace switch, then the Slice render mode ----
     // The workspace tabs set the plate's mode: the plate view's header, drawn with its render
     // switch, has no Plate mode control of its own beside it (it once doubled the tabs).
-    for ws in ["Monitor", "Design"] {
+    for ws in ["Monitor", "3D modeling"] {
         workspace_row::press(&app, ws);
         app.locator(Selector::id("rm_slice")).wait_visible();
         assert_eq!(app.locator(Selector::all().name("Plate mode")).count(), 0, "the plate view's header in {ws} has no Plate mode control");

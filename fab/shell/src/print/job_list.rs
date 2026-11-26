@@ -120,6 +120,14 @@ script_mod! {
         detail := mod.widgets.FabLabelSmall{width: Fill max_lines: 1 text_overflow: TextOverflow.Ellipsis}
     }
 
+    // One printer's jobs in the Printers editor's Jobs tab, in the Jobs list's order: rows made
+    // from `Row`, one per job, and kept.
+    mod.widgets.FabJobRowsBase = #(FabJobRows::register_widget(vm))
+    mod.widgets.FabJobRows = set_type_default() do mod.widgets.FabJobRowsBase{
+        width: Fill height: Fit flow: Down
+        Row := mod.widgets.FabJobRow{}
+    }
+
     mod.widgets.FabJobListBase = #(FabJobList::register_widget(vm))
     mod.widgets.FabJobList = set_type_default() do mod.widgets.FabJobListBase{
         width: Fill height: Fit flow: Down
@@ -337,5 +345,139 @@ mod tests {
         p.follow.jobs[0].ended_at = None;
         Arc::make_mut(&mut p.follow.jobs[0].meta).filament_g = vec![0.0, 0.0];
         assert_eq!(rows(&p, 9999.0)[0].detail, "Planned 31:52", "unknown elapsed and zero grams are omitted");
+    }
+}
+
+/// Which printer's jobs a [`FabJobRows`] lists: one printer's (its id, `printer:…` /
+/// `virtual:…`), or those of none of `listed` (jobs of printers no longer set up, and without one).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum JobsOf {
+    #[default]
+    Nobody,
+    Printer(String),
+    Others(Vec<String>),
+}
+
+impl JobsOf {
+    fn takes(&self, job: &CommittedJob) -> bool {
+        match self {
+            JobsOf::Nobody => false,
+            JobsOf::Printer(id) => job.meta.printer.as_deref() == Some(id.as_str()),
+            JobsOf::Others(listed) => job.meta.printer.as_ref().is_none_or(|id| !listed.contains(id)),
+        }
+    }
+}
+
+/// How many jobs `of` has, and whether one of them is on its way or printing. O(jobs).
+pub fn jobs_count(p: &PrintState, of: &JobsOf) -> (usize, bool) {
+    let printing = p.follow.job.as_ref().and_then(|live| live.id.as_deref());
+    let mut count = 0;
+    let mut active = false;
+    for job in p.follow.jobs.iter().filter(|j| of.takes(j)) {
+        count += 1;
+        active |= matches!(job.state, JobState::Preparing | JobState::Sent) || printing == Some(job.meta.id.as_str());
+    }
+    (count, active)
+}
+
+/// One printer's jobs, a row each (the Jobs list's rows: a press shows that job), active first,
+/// then the queue, then history. Rows are made from the `Row` template and kept by job.
+#[derive(Script, Widget)]
+pub struct FabJobRows {
+    #[uid] uid: WidgetUid,
+    #[source] source: ScriptObjectRef,
+    #[walk] walk: Walk,
+    #[layout] layout: Layout,
+    /// Whose jobs.
+    #[rust] pub of: JobsOf,
+    #[rust] templates: std::collections::HashMap<LiveId, ScriptObjectRef>,
+    #[rust] items: ComponentMap<LiveId, WidgetRef>,
+    #[rust] order: Vec<usize>,
+    /// The rows drawn last.
+    #[rust] shown: Vec<LiveId>,
+    #[redraw] #[rust] area: Area,
+}
+
+impl ScriptHook for FabJobRows {
+    fn on_before_apply(&mut self, _vm: &mut ScriptVm, apply: &Apply, _scope: &mut Scope, _value: ScriptValue) {
+        if apply.is_reload() {
+            self.templates.clear();
+        }
+    }
+
+    fn on_after_apply(&mut self, vm: &mut ScriptVm, apply: &Apply, scope: &mut Scope, value: ScriptValue) {
+        if !apply.is_eval() {
+            if let Some(obj) = value.as_object() {
+                vm.vec_with(obj, |vm, vec| {
+                    for kv in vec {
+                        if let (Some(id), Some(t)) = (kv.key.as_id(), kv.value.as_object()) {
+                            self.templates.insert(id, vm.new_object_ref(t));
+                        }
+                    }
+                });
+            }
+        }
+        if apply.is_reload() {
+            if let Some(template) = self.templates.get(&live_id!(Row)) {
+                let v: ScriptValue = template.as_object().into();
+                for (_, w) in self.items.iter_mut() {
+                    w.script_apply(vm, apply, scope, v);
+                }
+            }
+        }
+    }
+}
+
+impl FabJobRows {
+    fn item(&mut self, cx: &mut Cx, id: LiveId) -> Option<WidgetRef> {
+        if let Some(w) = self.items.get(&id) {
+            return Some(w.clone());
+        }
+        let value: ScriptValue = self.templates.get(&live_id!(Row))?.as_object().into();
+        let w = cx.with_vm(|vm| WidgetRef::script_from_value(vm, value));
+        cx.widget_tree_insert_child(self.uid, id, w.clone());
+        self.items.insert(id, w.clone());
+        Some(w)
+    }
+}
+
+impl Widget for FabJobRows {
+    fn semantics(&self, _cx: &Cx, node: &mut a11y_tree::Node) {
+        node.role = a11y_tree::Role::List;
+        makepad_platform::a11y::set_string(&mut node.name, "Jobs");
+    }
+
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        for id in &self.shown {
+            if let Some(w) = self.items.get(id) {
+                w.handle_event(cx, event, scope);
+            }
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        cx.begin_turtle(walk, self.layout);
+        self.shown.clear();
+        if let Some(state) = scope.data.get::<AppState>() {
+            let p = &state.print;
+            fill_order(&p.follow, &mut self.order);
+            let shown = p.follow.shown().map(|j| j.meta.id.clone());
+            let order = std::mem::take(&mut self.order);
+            for &i in &order {
+                let job = &p.follow.jobs[i];
+                if !self.of.takes(job) { continue; }
+                let id = LiveId::from_str(&job.meta.id);
+                let Some(w) = self.item(cx, id) else { continue };
+                if let Some(mut widget) = w.borrow_mut::<FabJobRow>() {
+                    widget.sync(cx, &row(job, p, shown.as_deref()));
+                }
+                // (a row needs nothing of the app's state to draw)
+                w.draw_all(cx, &mut Scope::empty());
+                self.shown.push(id);
+            }
+            self.order = order;
+        }
+        cx.end_turtle_with_area(&mut self.area);
+        DrawStep::done()
     }
 }

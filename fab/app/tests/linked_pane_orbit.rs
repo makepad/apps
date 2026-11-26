@@ -178,7 +178,7 @@ fn neither_view_draws_while_an_orbit_rests_and_both_finish_their_still_average_a
     config.env.insert("FAB_VIEW_PREFS".into(), prefs.display().to_string());
     let result = run_with_config(config, |app: TestApp| {
         app.locator(Selector::role(Role::Window)).wait_visible();
-        view_menu(&app, &["Workspace", "Design"]);
+        view_menu(&app, &["Workspace", "3D modeling"]);
         view_menu(&app, &["Underside view"]);
         // its chip says what the view is
         app.locator(Selector::role(Role::StaticText).name("Underside of Plate")).wait_visible();

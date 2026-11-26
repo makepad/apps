@@ -334,8 +334,8 @@ fn chain(app: &TestApp) {
 fn reopen(app: &TestApp) {
     let tip = "Grab links[0] links[5]";
     for _ in 0..4 {
-        workspace_row::press(app, "Design");
-        workspace_row::wait_shown(app, "Design");
+        workspace_row::press(app, "3D modeling");
+        workspace_row::wait_shown(app, "3D modeling");
         enter(app, tip);
     }
 }

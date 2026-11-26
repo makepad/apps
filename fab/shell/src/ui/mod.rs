@@ -24,7 +24,6 @@ pub mod checks_panel;
 pub mod requirements_panel;
 pub mod bom_panel;
 pub mod board_controls;
-pub mod jobs_panel;
 pub mod journal_panel;
 pub mod perf_panel;
 pub mod area_notch;
@@ -83,7 +82,6 @@ pub fn script_mod(vm: &mut ScriptVm) {
     print_settings::script_mod(vm);
     parts::script_mod(vm);
     plates::script_mod(vm);
-    camera::script_mod(vm);
     mechanics::script_mod(vm);
     arm::script_mod(vm);
     scan::script_mod(vm);
@@ -103,7 +101,6 @@ pub fn script_mod(vm: &mut ScriptVm) {
     requirements_panel::script_mod(vm);
     bom_panel::script_mod(vm);
     board_controls::script_mod(vm);
-    jobs_panel::script_mod(vm);
     journal_panel::script_mod(vm);
     perf_panel::script_mod(vm);
     area_notch::script_mod(vm);

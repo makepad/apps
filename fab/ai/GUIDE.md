@@ -90,7 +90,7 @@ Write each number the person states as `m.expect("8 mm hole", hole, {x: 8mm})`; 
 
 ## Sections
 
-`project`, `params`, `edit`, `field`, `plates`, `workflow`, `print`, `paint` (colour, fills, support block and enforce), `find` (a part with no name, by looking), `supports`, `force`, `joints`, `checks` (what an edit built, what each check answers), `threads`, `weave`, `printability`, `printer`, `image`, `compare`, `annotate`, `host` (panels, generated parts, host keys, frames), `embed` (a nut, a magnet or a board printed into a part), `melt` (heat-set inserts melted into a part after the print), `elec` (circuits, boards, routing, checks, fabrication files, the bench), `names` (other CAD tools' words: patterns, split, helix, hull, gears, mates), `vocabulary` (every builder and its fields, from the code, a group at a time).
+`project`, `params`, `edit`, `field`, `plates`, `workflow`, `print`, `paint` (colour, fills, support block and enforce), `find` (a part with no name, by looking), `supports`, `force`, `joints`, `checks` (what an edit built, what each check answers), `threads`, `weave`, `printability`, `printer`, `image`, `compare`, `annotate`, `host` (panels, generated parts, host keys, frames), `embed` (a nut, a magnet or a board printed into a part), `melt` (heat-set inserts melted into a part after the print), `elec` (circuits, boards, routing, checks, fabrication files, the bench), `fit` (a part for a real product: ask which, research its numbers), `names` (other CAD tools' words: patterns, split, helix, hull, gears, mates), `vocabulary` (every builder and its fields, from the code, a group at a time).
 
 <!-- section: project -->
 ## project
@@ -821,6 +821,18 @@ m.expect("about 14 cm3", bracket, {volume_mm3: {min: 13000 max: 15000}})
 - Plant a fault: a `dry_run` of an edit that breaks the expect (the hole at 10 mm) must answer it as failing before you trust it.
 
 Report every `@not_checked` and every `not_checked` row with its why: a check that did not run is not a pass. Numbers come from these checks and from `fab.measure`, never from a render, which judges shape only. A check you wrote yourself is trusted once it has failed on purpose: plant the fault with `dry_run` (a size it must catch) and see it fail, then build without it.
+
+<!-- section: fit -->
+## fit
+
+A part that has to fit a real thing (a phone, a shelf post, a GoPro mount, a fan, a pipe, a standard screw) works only if its mating dimensions are right. Go in this order.
+
+1. **Ask what only the person knows, first.** If the thing comes in versions that differ where your part meets it (model, generation, size, year, metric or imperial), ask which one with `chat.ask` before researching: one question, 2 to 6 likely `choices` ("IKEA Kallax", "IKEA Billy", "Other"). Skip it when they named it exactly or a picture shows it. Do not ask what you can look up.
+2. **Research the numbers.** Look up the exact dimensions where the part meets the thing with your web search and fetch: the maker's spec page, a datasheet or drawing, the standard (ISO, DIN, ANSI). Prefer official sources; when two disagree, say so and take the one from the maker. Note each number's source. Standard hardware is built in: `m.metric("M4")` for screws and nuts (section `threads`).
+3. **When the web does not have it, ask the person to measure**: `chat.ask` saying what to measure, where and how (calipers across the flats, at the widest point), with the unit.
+4. **Build from the numbers.** Each researched dimension is a `param` named and labelled for what it is (`let post_d = param(32mm, label: "Ivar post diameter (IKEA spec)")`), so the person can correct it. Add print clearance where parts meet: about +0.2 mm on a radius or per side for a sliding or snug fit, +0.3 to 0.5 mm for a loose one, less (0 to 0.1 mm) for a press fit; a clearance is its own `param`. Pin each mating number with `m.expect` (section `checks`), so no later edit drifts off it.
+5. **Check the fit.** `fab.measure` the opening against the thing's size plus clearance, `fab.section` through the fit, and `fab.check`. For a critical fit, offer a small test piece of only the mating region first.
+6. **Say what you used**: each dimension, its source, the clearance, and what you could not confirm, so the person can measure it before printing.
 
 <!-- section: threads -->
 ## threads

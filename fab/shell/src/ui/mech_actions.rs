@@ -27,9 +27,7 @@ script_mod! {
     }
     // a run's rule: the toolbars' (a plain View's quad draws nothing of itself)
     let Rule = mod.widgets.FabVRule{ margin: Inset{left: 5 right: 5} }
-    // A run of the bar's controls that stays together: a narrow view wraps the bar between runs
-    // (`FabMechActions::arrange`), and inside one only when the run alone is wider than the view.
-    // Each run after the first leads with a rule, shown unless the run starts a row.
+    // A group of the bar's controls; each after the first leads with a rule.
     let Run = View{ width: Fit height: Fit flow: Right align: Align{y: 0.5} spacing: 1 }
 
     mod.widgets.FabMechActionsBase = #(FabMechActions::register_widget(vm))
@@ -38,28 +36,28 @@ script_mod! {
         height: Fill
         flow: Down
         align: Align{x: 0.5 y: 0.0}
-        // The header strip: the plate view's toolbar in Mechanics, as every editor's (the
-        // panel's ground, a toolbar's height a row): its left end the area's editor selector
-        // (the notch layer draws it there) and a rule (`STRIP_LEFT`), then the bar.
-        strip := View{
-            width: Fill height: Fit flow: Right align: Align{y: 0.5}
+        // The header strip: the plate view's toolbar in Mechanics, as every editor's: one row that
+        // clips where the view narrows and scrolls sideways (drag it, or the wheel), its left end
+        // the area's editor selector (the notch layer draws it there) and a rule.
+        strip := mod.widgets.FabEditorBar{
             cursor: MouseCursor.Default
-            padding: Inset{left: #(crate::ui::area_notch::TOOLBAR_SLOT) right: #(crate::ui::area_notch::TOOLBAR_END)}
-            spacing: 6
-            show_bg: true
-            // the toolbars' ground (a shade above the panel's) and their subtle foot line
-            draw_bg +: {
-                pixel: fn() {
-                    let foot = step(self.rect_size.y - 1.0, self.pos.y * self.rect_size.y) * 0.15
-                    return vec4(fab.color_toolbar.xyz * (1.0 - foot), 1.0)
-                }
-            }
-            selector_rule := mod.widgets.FabVRule{}
             bar := View{
                 width: Fit height: Fit flow: Right align: Align{y: 0.5}
                 padding: Inset{top: 8 bottom: 8 left: 0 right: 0} spacing: 1
                 a11y: {role: "toolbar" label: "Mechanics actions"}
                 run_parts := Run{
+                    // the plate's mode first, as on the plate's own bar in the other modes, so the
+                    // sim can be left for Design or Monitor
+                    FabTip{ text: "What the plate is for: Design edits it, Mechanics runs it in a physics sim, Monitor shows the printer's job. It stays as it is across workspaces."
+                        plate_mode := mod.widgets.FabDropdownButton{
+                            height: 24
+                            a11y: {label: "Plate mode"}
+                            tag: @fab_plate_mode
+                            owner: @fab_plate_mode
+                            label +: { text: "Mechanics" }
+                        }
+                    }
+                    Rule{}
                     FabTip{ text: "Drop: let the selected parts fall onto the plate (all parts when none is selected)"
                         drop := Button{ a11y: {label: "Drop"} draw_icon +: { svg: crate_resource("self://resources/icons/drop.svg") } }
                     }
@@ -84,6 +82,10 @@ script_mod! {
                 }
                 run_scene := Run{
                     rule := Rule{}
+                    // the view's tool rails, on or off, as on the plate's own bar
+                    FabTip{ text: "Show the tool rails at the view's left"
+                        mech_tools := Toggle{ a11y: {label: "Tools"} draw_icon +: { svg: crate_resource("self://resources/icons/select.svg") } }
+                    }
                     FabTip{ text: "Supports: this plate's planned supports as loose pieces, already broken free; whether each can leave the part"
                         supports := Toggle{ a11y: {label: "Supports"} draw_icon +: { svg: crate_resource("self://resources/icons/supports.svg") } }
                     }
@@ -143,136 +145,31 @@ script_mod! {
 pub struct FabMechActions {
     #[deref]
     view: View,
-    /// Each run's width without its leading rule, as last drawn (0: not drawn yet).
-    #[rust]
-    runs: [f64; 3],
     /// The header strip's height as last drawn (0: not drawn yet).
     #[rust]
     strip_h: f64,
 }
 
-/// The bar's runs, in order.
-fn runs() -> [&'static [LiveId]; 3] {
-    [ids!(bar.run_parts), ids!(bar.run_scene), ids!(bar.run_play)]
-}
-
-/// What a run's leading rule takes: the rule (1) with its margins (5 + 5) and the run's spacing (1).
-const RULE_W: f64 = 12.0;
-/// The gap between the bar's runs.
-const RUN_GAP: f64 = 1.0;
-/// What the strip keeps clear: the area's selector at its left end with its rule and gap, and a
-/// margin at its right.
-const STRIP_LEFT: f64 = crate::ui::area_notch::TOOLBAR_SLOT + 1.0 + 6.0;
-const STRIP_RIGHT: f64 = crate::ui::area_notch::TOOLBAR_END;
-
-/// How runs of `widths` (rules not counted) fill rows of `room` in order, each run after a row's
-/// first adding its rule: which runs start a row, the width a run wider than the room is squeezed
-/// to (it then wraps its own controls, on rows of its own), and the widest row's inner width.
-fn arrange(widths: &[f64; 3], room: f64) -> ([bool; 3], [Option<f64>; 3], f64) {
-    let room = room.max(1.0);
-    let mut starts = [false; 3];
-    let mut squeeze = [None; 3];
-    let (mut row, mut widest) = (0.0f64, 0.0f64);
-    for (i, &natural) in widths.iter().enumerate() {
-        let w = if natural > room {
-            squeeze[i] = Some(room);
-            room
-        } else {
-            natural
-        };
-        let joined = row + RUN_GAP + RULE_W + w;
-        if i == 0 || joined > room {
-            starts[i] = true;
-            row = w;
-        } else {
-            row = joined;
-        }
-        widest = widest.max(row);
-    }
-    (starts, squeeze, widest)
-}
-
 impl FabMechActions {
-    /// The header strip's height as last drawn (0 before its first draw): one row of a tab bar's
-    /// height, more when the bar wraps. Read before the strip draws in a pass, its area is not
+    /// The header strip's height as last drawn (0 before its first draw): a toolbar's. Read before the strip draws in a pass, its area is not
     /// there yet, so [`Self::measure`] keeps it. O(1).
     pub fn strip_height(&self) -> f64 {
         self.strip_h
     }
 
-    /// The bar in one row while it fits the strip (less the nub at its left end), else wrapped
-    /// between its runs, each row's first run without its rule; a run wider than the room on its
-    /// own wraps its controls as well. The arrangement is set before the
-    /// bar draws, from the run widths [`Self::measure`] took after the last draw; the very first
-    /// draw is one row. It is read back from the widgets, never kept apart from them (a design
-    /// reload puts their defaults back). Per draw: six lookups and the bar's walk. O(1).
-    fn arrange(&mut self, cx: &mut Cx2d, walk: Walk) {
-        if self.runs.contains(&0.0) {
-            return;
-        }
-        let room = cx.peek_walk_turtle(walk).size.x - STRIP_LEFT - STRIP_RIGHT;
-        let (starts, squeeze, widest) = arrange(&self.runs, room);
-        for (i, run) in runs().into_iter().enumerate() {
-            if i > 0 {
-                let rule = self.view.view(cx, run).widget(cx, ids!(rule));
-                if rule.visible() == starts[i] {
-                    rule.set_visible(cx, !starts[i]);
-                }
-            }
-            if let Some(mut run) = self.view.widget(cx, run).borrow_mut::<View>() {
-                (run.walk.width, run.layout.flow) = match squeeze[i] {
-                    Some(w) => (Size::Fixed(w), Flow::right_wrap()),
-                    None => (Size::fit(), Flow::right()),
-                };
-            }
-        }
-        if let Some(mut bar) = self.view.widget(cx, ids!(bar)).borrow_mut::<View>() {
-            if starts.iter().skip(1).any(|s| *s) {
-                // a hair over the widest row, so the turtle breaks where the rows above did
-                bar.walk.width = Size::Fixed(widest + 0.5);
-                bar.layout.flow = Flow::right_wrap();
-            } else {
-                bar.walk.width = Size::fit();
-                bar.layout.flow = Flow::right();
-            }
-        }
-    }
-
-    /// The strip's height and each run's width as just drawn, less its rule where one showed; a squeezed run keeps the
-    /// natural width it had, which is what decides when it stops being squeezed. A width that changed (a
-    /// label, Listen showing, the first draw) asks for one more draw, so the arrangement follows on
-    /// the next frame; a settled bar asks for none. The rects are only good after the draw: one read
-    /// before it sees the area this redraw is about to replace. Per draw: six lookups, three rect
-    /// reads.
+    /// The strip's height as just drawn (its area holds only after the draw); a height that
+    /// changed asks for one more draw. One rect read per draw.
     fn measure(&mut self, cx: &mut Cx2d) {
-        let mut changed = false;
-        let strip_h = self.view.view(cx, ids!(strip)).area().rect(cx).size.y;
+        let strip_h = self.view.widget(cx, ids!(strip)).area().rect(cx).size.y;
         if (strip_h - self.strip_h).abs() > 0.25 {
             self.strip_h = strip_h;
-            changed = true;
-        }
-        for (i, run) in runs().into_iter().enumerate() {
-            let squeezed = self.view.widget(cx, run).borrow::<View>().is_some_and(|v| matches!(v.walk.width, Size::Fixed(_)));
-            let run = self.view.view(cx, run);
-            let drawn = run.area().rect(cx).size.x;
-            if squeezed || drawn <= 0.0 {
-                continue;
-            }
-            let ruled = i > 0 && run.widget(cx, ids!(rule)).visible();
-            let w = drawn - if ruled { RULE_W } else { 0.0 };
-            if (w - self.runs[i]).abs() > 0.25 {
-                self.runs[i] = w;
-                changed = true;
-            }
-        }
-        if changed {
             self.view.redraw(cx);
         }
     }
 
     /// Select the part under a right-click (unless it already is) and open the menu on it.
     pub(super) fn open_context(&self, cx: &mut Cx, state: &AppState, pane: PaneId, at: DVec2) {
-        if !state.mech.ready || self.view.view(cx, ids!(strip)).area().rect(cx).contains(at) {
+        if !state.mech.ready || self.view.widget(cx, ids!(strip)).area().rect(cx).contains(at) {
             return;
         }
         let rect = self.view.area().rect(cx);
@@ -435,7 +332,6 @@ impl Widget for FabMechActions {
             bar.view(cx, ids!(speed)).label(cx, ids!(label)).set_text(cx, &speed_text(m));
             bar.view(cx, ids!(contact)).label(cx, ids!(label)).set_text(cx, contact_label(m.contact));
         }
-        self.arrange(cx, walk);
         let step = self.view.draw_walk(cx, scope, walk);
         self.measure(cx);
         step

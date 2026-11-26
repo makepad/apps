@@ -22,6 +22,8 @@ use makepad_widgets_core::widget_tree::CxWidgetExt;
 const ADD_MENU: LiveId = live_id!(fab_parts_add);
 const PART_MENU: LiveId = live_id!(fab_parts_context);
 const ORIGIN_FIELD_MAX: f64 = 400.0;
+/// How far a row of the parts tree sits in per level.
+const TREE_STEP: f64 = 12.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowKind {
@@ -407,17 +409,13 @@ script_mod! {
         show_bg: true
         draw_bg +: { color: fab.color_editor }
         draw_shade: mod.draw.FabScrollShade{}
-        // the toolbar: the area's editor selector, the filter, then Arrange's gap (Arrange is the
-        // 3D view's rail's)
+        // the toolbar: the area's editor selector, then the filter
         tools := mod.widgets.FabEditorBar{
             // narrows the list to the parts whose names hold every word typed (Add, Feature and
             // Shape stand in the 3D view's bar)
             filter := mod.widgets.FabSearch{
                 width: Fill{min: 60}
                 row +: { input +: { empty_text: "Filter" a11y: {label: "Filter parts"} } }
-            }
-            pack_gap_tip := FabTip{ text: "Arrange's gap: the room it keeps between parts"
-                pack_gap := mod.widgets.ValueInput{width: 84 height: 24 label: "Gap" a11y: {label: "Arrange gap"} min: 0.0 max: 0.0 step: 0.5 precision: 1 suffix: " mm"}
             }
         }
         mod.widgets.FabHr{}
@@ -508,6 +506,30 @@ script_mod! {
                     // the dimensions, quieter than the name
                     size := mod.widgets.FabLabelSmall{ width: Fill text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis
                         draw_text +: { color: fab.color_text_muted row_alpha: instance(1.0) get_color: fn() { return vec4(self.color.rgb, self.color.a * self.row_alpha) } }
+                    }
+                }
+                // The engine that builds the part (Exact, Field, Mesh) as a pill; its tip says what
+                // that engine is good at (`PartEngine::tip`).
+                engine_tip := FabTip{
+                    engine := View{
+                        width: Fit
+                        height: 18
+                        padding: Inset{left: 5 right: 5}
+                        align: Align{x: 0.5 y: 0.5}
+                        cursor: MouseCursor.Hand
+                        show_bg: true
+                        draw_bg +: {
+                            pixel: fn() {
+                                let dpi = self.draw_pass.dpi_factor
+                                let lo = floor(self.rect_pos * dpi + 0.5) / dpi - self.rect_pos
+                                let hi = floor((self.rect_pos + self.rect_size) * dpi + 0.5) / dpi - self.rect_pos
+                                let sdf = Sdf2d.viewport_px(self.pos * self.rect_size, dpi)
+                                sdf.box(lo.x, lo.y, hi.x - lo.x, hi.y - lo.y, fab.radius)
+                                sdf.fill(theme.prop_field)
+                                return sdf.result
+                            }
+                        }
+                        label := mod.widgets.FabLabelSmall{ text: "" draw_text +: { color: fab.color_text_muted } }
                     }
                 }
                 // The part's colour, its edges on device pixels, with its nozzle's letter, left of the eye;
@@ -638,7 +660,7 @@ script_mod! {
                             // what Position measures from
                             anchor_row := TransformRow{
                                 label +: {text: "Anchor"}
-                                value +: {anchor := PropDropDown{width: Fill labels: ["Origin" "Centre" "Corner"] a11y: {label: "Position anchor"}}}
+                                value +: {num +: {visible: false} anchor := PropDropDown{width: Fill labels: ["Origin" "Centre" "Corner"] a11y: {label: "Position anchor"}}}
                             }
                             // X and Y side by side, each its axis inside its field
                             xy := TransformRow{
@@ -667,22 +689,11 @@ script_mod! {
                                     trail +: {width: 30 padding: Inset{left: 4} lock := mod.widgets.FabIconCheck{ a11y: {label: "Keep proportions"} width: Fill height: Fill padding: Inset{left: 4 right: 4 top: 3 bottom: 3} draw_icon +: { svg: crate_resource("self://resources/icons/link.svg") } }}
                                 }
                             }
-                            // The part's actions as a light strip (duplicate and delete are the parts list's menu).
+                            // The part's actions as a light strip (duplicate and delete are the parts list's menu;
+                            // Drop to plate and Frame selected are the 3D view's toolbar's).
                             buttons := View{
                                 width: Fill height: Fit flow: Right spacing: 2 margin: Inset{top: 4}
                                 align: Align{x: 0.0 y: 0.5}
-                                FabTip{text: "Drop to plate"
-                                    drop := mod.widgets.FabActionButton{
-                                        a11y: {label: "Drop to plate"}
-                                        draw_icon +: {svg: crate_resource("self://resources/icons/drop.svg")}
-                                    }
-                                }
-                                FabTip{text: "Frame in view"
-                                    frame := mod.widgets.FabActionButton{
-                                        a11y: {label: "Frame in view"}
-                                        draw_icon +: {svg: crate_resource("self://resources/icons/fit.svg")}
-                                    }
-                                }
                                 FabTip{text: "Make printable"
                                     make_printable := mod.widgets.FabActionButton{
                                         visible: false
@@ -729,15 +740,16 @@ script_mod! {
 pub fn part_add_menu(cx: &mut Cx, actions: &Actions) {
     if let Some(anchor) = dropdown_clicked(actions, ADD_MENU) {
         let items = vec![
-            MenuItem::new(live_id!(add_box), "Box"),
-            MenuItem::new(live_id!(add_cylinder), "Cylinder"),
-            MenuItem::new(live_id!(add_sphere), "Sphere"),
-            MenuItem::new(live_id!(add_cone), "Cone"),
-            MenuItem::new(live_id!(add_torus), "Torus"),
+            MenuItem::new(live_id!(add_box), "Box").svg("self://resources/icons/add_box.svg"),
+            MenuItem::new(live_id!(add_cylinder), "Cylinder").svg("self://resources/icons/add_cylinder.svg"),
+            MenuItem::new(live_id!(add_sphere), "Sphere").svg("self://resources/icons/add_sphere.svg"),
+            MenuItem::new(live_id!(add_cone), "Cone").svg("self://resources/icons/add_cylinder.svg"),
+            MenuItem::new(live_id!(add_torus), "Torus").svg("self://resources/icons/radio_off.svg"),
             MenuItem::sep(),
-            MenuItem::new(live_id!(add_import), "Import STL, 3MF or glTF…").key(&keymap::shortcut(Key::Import)),
-            MenuItem::new(live_id!(add_picture), "Colour picture…"),
-            MenuItem::new(live_id!(add_image), "From image… (AI hub)"),
+            // tiles: short labels (the import's formats and key are in its dialog and the keymap)
+            MenuItem::new(live_id!(add_import), "Import…").svg("self://resources/icons/import.svg"),
+            MenuItem::new(live_id!(add_picture), "Colour picture…").svg("self://resources/icons/palette.svg"),
+            MenuItem::new(live_id!(add_image), "From image…").svg("self://resources/icons/spark.svg"),
         ];
         open_menu(cx, ADD_MENU, items, anchor, MenuPlace::Below);
     }
@@ -836,6 +848,9 @@ struct RowDisplay {
     slot: String,
     /// The swatch's tooltip: the nozzle and tray its colour prints from.
     tip: String,
+    /// The engine pill's word and tooltip (bodies built by different engines: "Mixed").
+    engine: &'static str,
+    engine_tip: &'static str,
     rect: Option<Rect>,
     /// The row as drawn, which its node stands where it shows ([`Widget::semantics_part_area`]).
     area: Area,
@@ -878,9 +893,9 @@ pub struct FabPartsPanel {
     /// holds every word (folds are ignored meanwhile, so no match hides).
     #[rust]
     filter: String,
-    /// Part rows whose feature tree is open (all start closed).
+    /// Part rows whose feature tree the person closed (every tree starts open).
     #[rust]
-    open_trees: HashSet<u64>,
+    closed_trees: HashSet<u64>,
     /// A part's tree opening or closing: how far it is open (0..1) and where it heads; a tree
     /// still closing keeps its place in the list until it is shut.
     #[rust]
@@ -999,8 +1014,9 @@ impl FabPartsPanel {
 
     fn toggle_row(&mut self, cx: &mut Cx, key: u64) {
         if self.tree_of.contains_key(&key) && !row_of(&self.tree, key).is_some_and(Row::is_branch) {
-            let open = !self.open_trees.remove(&key);
-            if open { self.open_trees.insert(key); }
+            // closed: it opens; open: it closes
+            let open = self.closed_trees.remove(&key);
+            if !open { self.closed_trees.insert(key); }
             // it slides open or shut from where it is now
             let to = if open { 1.0 } else { 0.0 };
             self.reveal.entry(key).or_insert((1.0 - to, to)).1 = to;
@@ -1016,7 +1032,7 @@ impl FabPartsPanel {
         if row.is_branch() {
             Some(!self.collapsed.contains(&row.key))
         } else if self.tree_of.contains_key(&row.key) {
-            Some(self.open_trees.contains(&row.key))
+            Some(!self.closed_trees.contains(&row.key))
         } else {
             None
         }
@@ -1187,7 +1203,7 @@ impl Widget for FabPartsPanel {
                 for (now, to) in self.reveal.values_mut() {
                     *now = if *to > *now { (*now + step).min(*to) } else { (*now - step).max(*to) };
                 }
-                // a tree that got where it was going needs no entry (open_trees says the rest)
+                // a tree that got where it was going needs no entry (closed_trees says the rest)
                 self.reveal.retain(|_, (now, to)| now != to);
                 if self.reveal.is_empty() { self.reveal_last = None; } else { self.reveal_frame = cx.new_next_frame(); }
                 self.view.redraw(cx);
@@ -1296,14 +1312,10 @@ impl Widget for FabPartsPanel {
             self.filter = text;
             self.view.redraw(cx);
         }
-        if let Some(gap) = self.view.value_input(cx, ids!(tools.pack_gap_tip.pack_gap)).ended(actions) {
-            cx.action(PartAction::SetArrangeGap(gap));
-        }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         let Some(state) = scope.data.get::<AppState>() else { return self.view.draw_walk(cx, scope, walk) };
-        self.view.value_input(cx, ids!(tools.pack_gap_tip.pack_gap)).set_value(cx, state.plate.arrange_gap.unwrap_or(8.0));
         self.sync_tree(state);
         self.order.clear();
         if self.filter.trim().is_empty() {
@@ -1330,13 +1342,16 @@ impl Widget for FabPartsPanel {
             let has = if instance == state.source.instance { !state.source.features.is_empty() } else { state.source.trees.get(instance).is_some_and(|t| !t.is_empty()) };
             if has { self.tree_of.insert(row.key, instance.to_string()); }
         }
-        self.open_trees.retain(|key| self.tree_of.contains_key(key));
+        // (a part whose tree is being read again keeps it closed: kept while its row stays)
+        let rows: HashSet<u64> = self.tree.iter().map(|r| r.key).collect();
+        self.closed_trees.retain(|key| rows.contains(key));
         self.reveal.retain(|key, _| self.tree_of.contains_key(key));
         self.items.clear();
         for &i in &self.order {
             self.items.push((i, false));
             let key = self.tree[i].key;
-            if self.open_trees.contains(&key) || self.reveal.get(&key).is_some_and(|(now, _)| *now > 0.0) { self.items.push((i, true)); }
+            let open = self.tree_of.contains_key(&key) && !self.closed_trees.contains(&key);
+            if open || self.reveal.get(&key).is_some_and(|(now, _)| *now > 0.0) { self.items.push((i, true)); }
         }
         let parts = &state.plate.parts;
         let revision = ((state.plate.revision, state.field_loop_marks), state.print.revision);
@@ -1351,6 +1366,7 @@ impl Widget for FabPartsPanel {
                 }
                 let p = &parts[row.rename];
                 let [r, g, b] = crate::ui::popover::display_rgb([p.color[0], p.color[1], p.color[2]]);
+                let mixed = row.parts.iter().any(|i| parts[*i].engine != p.engine);
                 RowDisplay {
                     size: row.detail_text(&state.plate),
                     selected: false,
@@ -1360,6 +1376,8 @@ impl Widget for FabPartsPanel {
                     color: [r, g, b, 1.0],
                     slot: String::new(),
                     tip: String::new(),
+                    engine: if mixed { "Mixed" } else { p.engine.label() },
+                    engine_tip: if mixed { "Its bodies are built by different engines: each body's pill names its own" } else { p.engine.tip() },
                     rect: None,
                     area: Area::Empty,
                 }
@@ -1396,7 +1414,7 @@ impl Widget for FabPartsPanel {
         let feature_picked = state.source.selected.is_some();
         for (row, shown) in self.tree.iter().zip(&mut self.rows) {
             shown.selected = if row.is_part() {
-                let in_tree = feature_picked && self.open_trees.contains(&row.key) && self.tree_of.get(&row.key).is_some_and(|i| *i == state.source.instance);
+                let in_tree = feature_picked && !self.closed_trees.contains(&row.key) && self.tree_of.get(&row.key).is_some_and(|i| *i == state.source.instance);
                 !in_tree && row.parts.iter().all(|i| parts[*i].element.is_some_and(|e| state.scene_state.selection.contains(e)))
             } else {
                 row.annotation_selected(state)
@@ -1415,10 +1433,10 @@ impl Widget for FabPartsPanel {
                 self.visible_rows.push(pos);
                 if tree {
                     // under its part's text: the row's indent, past the swatch
-                    let indent = 10.0 + 18.0 * depth(&self.tree, &self.tree[i]) as f64 + 14.0;
+                    let indent = 10.0 + TREE_STEP * depth(&self.tree, &self.tree[i]) as f64 + 14.0;
                     let item = list.item(cx, pos, live_id!(Features));
                     let key = self.tree[i].key;
-                    let open = self.reveal.get(&key).map_or(if self.open_trees.contains(&key) { 1.0 } else { 0.0 }, |(now, _)| *now);
+                    let open = self.reveal.get(&key).map_or(if self.closed_trees.contains(&key) { 0.0 } else { 1.0 }, |(now, _)| *now);
                     if let (Some(instance), Some(mut t)) = (self.tree_of.get(&key), item.borrow_mut::<crate::ui::code::FabFeatureTree>()) {
                         t.show_instance(instance, indent, open);
                     }
@@ -1428,12 +1446,12 @@ impl Widget for FabPartsPanel {
                 let (row, shown) = (&self.tree[i], &mut self.rows[i]);
                 let item = list.item(cx, pos, live_id!(Row));
                 let sel = if shown.selected { 1.0 } else { 0.0 };
-                let indent = 10.0 + 18.0 * depth(&self.tree, row) as f64;
+                let indent = 10.0 + TREE_STEP * depth(&self.tree, row) as f64;
                 if let Some(mut view) = item.as_view().borrow_mut() {
                     view.layout.padding.left = indent;
                     view.draw_bg.set_dyn_instance(cx, live_id!(selected), &[sel]);
                 }
-                let open = if row.is_branch() { Some(!self.collapsed.contains(&row.key)) } else if self.tree_of.contains_key(&row.key) { Some(self.open_trees.contains(&row.key)) } else { None };
+                let open = if row.is_branch() { Some(!self.collapsed.contains(&row.key)) } else if self.tree_of.contains_key(&row.key) { Some(!self.closed_trees.contains(&row.key)) } else { None };
                 item.widget(cx, ids!(branch)).set_visible(cx, open == Some(false));
                 item.widget(cx, ids!(branch_open)).set_visible(cx, open == Some(true));
                 item.view(cx, ids!(linked)).set_visible(cx, row.is_part() && linked(&self.tree, row));
@@ -1444,6 +1462,11 @@ impl Widget for FabPartsPanel {
                     sw.draw_bg.set_dyn_instance(cx, live_id!(color), &[r, g, b, 1.0]);
                 }
                 item.label(cx, ids!(swatch.slot)).set_text(cx, &shown.slot);
+                item.widget(cx, ids!(engine_tip)).set_visible(cx, row.is_part());
+                item.label(cx, ids!(engine.label)).set_text(cx, shown.engine);
+                if let Some(mut tip) = item.widget(cx, ids!(engine_tip)).borrow_mut::<makepad_widgets_core::tip::Tip>() {
+                    if tip.text != shown.engine_tip { tip.text = shown.engine_tip.to_string(); }
+                }
                 if let Some(mut tip) = item.widget(cx, ids!(swatch_tip)).borrow_mut::<makepad_widgets_core::tip::Tip>() {
                     tip.text.clone_from(&shown.tip);
                 }
@@ -2194,9 +2217,6 @@ impl Widget for FabPartPanel {
         let p = &state.plate.parts[index];
         let object = &p.object;
         let v = &self.view;
-        if v.button(cx, ids!(body.transform.buttons.frame)).clicked(actions) {
-            cx.action(ShellAction::FrameSelected);
-        }
         if state.slice_blocks_edits() { return; }
         if v.radio_button(cx, ids!(body.transform.rs.scale.trail.lock)).clicked(actions) {
             state.ui.scale_locked = !state.ui.scale_locked;
@@ -2260,12 +2280,6 @@ impl Widget for FabPartPanel {
                 cx.action(PartAction::Scale { object: object.clone(), scale: scale_by_field(p.scale, axis, value, state.ui.scale_locked) });
             }
         }
-        if v.button(cx, ids!(body.transform.buttons.drop)).clicked(actions) {
-            cx.action(PartAction::Drop { object: object.clone() });
-        }
-        if v.button(cx, ids!(body.transform.buttons.frame)).clicked(actions) {
-            cx.action(ShellAction::FrameSelected);
-        }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -2288,7 +2302,6 @@ impl Widget for FabPartPanel {
                 for id in [ids!(body.transform.xy), ids!(body.transform.rs), ids!(body.transform.anchor_row)] {
                     v.widget(cx, id).set_visible(cx, can_edit);
                 }
-                v.button(cx, ids!(body.transform.buttons.drop)).set_enabled(cx, can_edit);
                 let position = (index, state.plate.revision, self.anchor, state.scene_state.nudge_of(p.element));
                 if self.position_shown != Some(position) {
                     self.shown_xy = self.anchor.xy(&p);

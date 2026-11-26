@@ -147,7 +147,9 @@ impl Widget for FabForcePanel {
         let Event::Actions(actions) = event else { return };
         let v = &self.view;
         if v.button(cx, ids!(to_job)).clicked(actions) {
-            cx.action(ShowPanel(Editor::Settings));
+            // the job: the Printers editor's Jobs tab
+            cx.action(ShowPanel(Editor::Printer));
+            cx.action(crate::print::panel::ShowJobTab);
         }
         if let Some(anchor) = dropdown_clicked(actions, STUDY_AS_MENU) {
             let names = scope.data.get::<AppState>().map(|s| s.force.filaments.clone()).unwrap_or_default();

@@ -11,8 +11,7 @@ script_mod! {
     use mod.prelude.fab.*
     use mod.widgets.*
 
-    // v10's corner chips: each a FabFloat (color_float at 94 %, radius_lg); the faces inside are
-    // fab.radius and carry no outline.
+    // the toolbar's segments and buttons: no faces of their own at rest
     let Segment = mod.widgets.FabSegmentTab{
         height: 22
         padding: Inset{left: 14 right: 14 top: 0 bottom: 0}
@@ -26,60 +25,64 @@ script_mod! {
 
     mod.widgets.FabDevice3dBase = #(FabDevice3d::register_widget(vm))
     mod.widgets.FabDevice3d = set_type_default() do mod.widgets.FabDevice3dBase{
-        width: Fill height: Fill flow: Overlay
+        width: Fill height: Fill flow: Down
         event_order: EventOrder.Up
-        device_viewport := FabViewport{selects_parts: true}
-        corners := View{
-            new_batch: true
-            width: Fill height: Fit flow: Right
-            padding: 8
-            // the controls at the right (the instant shows only in the recorder)
-            readout := View{width: Fill height: Fit}
-            right := View{
-                width: Fit height: Fit flow: Down spacing: 4
-                align: Align{x: 1.0}
-                controls := mod.widgets.FabFloat{
-                    flow: Right spacing: 2
-                    padding: Inset{left: 2 right: 2 top: 2 bottom: 2}
-                    align: Align{y: 0.5}
-                    assembled := Segment{text: "Assembled"}
-                    kit := Segment{text: "Kit"}
-                    reset := mod.widgets.FabFlatButton{
-                        text: "Reset" height: 22
-                        padding: Inset{left: 10 right: 10 top: 0 bottom: 0}
-                        draw_text +: {color: fab.color_text_dim}
+        // the editor's toolbar, as every editor's (its area's selector at the left end): how the
+        // product shows (assembled or as a kit), the camera's presets, the case and the shot
+        editor_bar := mod.widgets.FabEditorBar{
+            assembled := Segment{text: "Assembled"}
+            kit := Segment{text: "Kit"}
+            mod.widgets.FabVRule{}
+            reset := mod.widgets.FabFlatButton{
+                text: "Reset" height: 22
+                padding: Inset{left: 10 right: 10 top: 0 bottom: 0}
+                draw_text +: {color: fab.color_text_dim}
+            }
+            iso := ViewButton{text: "Iso"}
+            top := ViewButton{text: "Top"}
+            front := ViewButton{text: "Front"}
+            mod.widgets.FabVRule{}
+            case := Segment{
+                text: "Case" independent: true
+                padding: Inset{left: 10 right: 10 top: 0 bottom: 0}
+                draw_bg +: {color_active: fab.color_button_active}
+                draw_text +: {color_active: fab.color_text_on_accent}
+            }
+            // the rare product shot: this view traced, the everyday view raster
+            shot := Segment{
+                text: "Product shot" independent: true
+                padding: Inset{left: 10 right: 10 top: 0 bottom: 0}
+                draw_bg +: {color_active: fab.color_button_active}
+                draw_text +: {color_active: fab.color_text_on_accent}
+            }
+        }
+        body := View{
+            width: Fill height: Fill flow: Overlay
+            device_viewport := FabViewport{selects_parts: true}
+            corners := View{
+                new_batch: true
+                width: Fill height: Fit flow: Right
+                padding: 8
+                // the instant shows only in the recorder
+                readout := View{width: Fill height: Fit}
+                right := View{
+                    width: Fit height: Fit flow: Down spacing: 4
+                    align: Align{x: 1.0}
+                    // the shot's progress while it traces
+                    shot_row := mod.widgets.FabFloat{
+                        visible: false
+                        padding: Inset{left: 8 right: 8 top: 4 bottom: 4}
+                        shot_progress := mod.widgets.FabLabel{text: ""}
                     }
-                    iso := ViewButton{text: "Iso"}
-                    top := ViewButton{text: "Top"}
-                    front := ViewButton{text: "Front"}
-                    case := Segment{
-                        text: "Case" independent: true
-                        padding: Inset{left: 10 right: 10 top: 0 bottom: 0}
-                        draw_bg +: {color_active: fab.color_button_active}
-                        draw_text +: {color_active: fab.color_text_on_accent}
+                    // the build instructions: the plan's steps one at a time
+                    steps := mod.widgets.FabFloat{
+                        flow: Right spacing: 2
+                        padding: Inset{left: 2 right: 2 top: 2 bottom: 2}
+                        align: Align{y: 0.5}
+                        prev := ViewButton{text: "Back"}
+                        step_label := mod.widgets.FabLabel{text: "" padding: Inset{left: 6 right: 6}}
+                        next := ViewButton{text: "Next"}
                     }
-                    // the rare product shot: this view traced, the everyday view raster
-                    shot := Segment{
-                        text: "Product shot" independent: true
-                        padding: Inset{left: 10 right: 10 top: 0 bottom: 0}
-                        draw_bg +: {color_active: fab.color_button_active}
-                        draw_text +: {color_active: fab.color_text_on_accent}
-                    }
-                }
-                // the shot's progress while it traces
-                shot_row := mod.widgets.FabFloat{
-                    visible: false
-                    padding: Inset{left: 8 right: 8 top: 4 bottom: 4}
-                    shot_progress := mod.widgets.FabLabel{text: ""}
-                }
-                // the build instructions: the plan's steps one at a time
-                steps := mod.widgets.FabFloat{
-                    flow: Right spacing: 2
-                    padding: Inset{left: 2 right: 2 top: 2 bottom: 2}
-                    align: Align{y: 0.5}
-                    prev := ViewButton{text: "Back"}
-                    step_label := mod.widgets.FabLabel{text: "" padding: Inset{left: 6 right: 6}}
-                    next := ViewButton{text: "Next"}
                 }
             }
         }
@@ -385,7 +388,9 @@ impl Widget for FabDevice3d {
                 self.set_framing(state, framing);
             }
             if !matches!(self.framing, Framing::Manual) {
-                self.frame(state, pane, cx.peek_walk_turtle(walk).size);
+                // the view under the toolbar
+                let size = cx.peek_walk_turtle(walk).size - dvec2(0.0, crate::ui::area_notch::TOOLBAR_H);
+                self.frame(state, pane, size);
             }
         }
         self.view.draw_walk(cx, scope, walk)

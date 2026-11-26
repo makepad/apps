@@ -136,6 +136,18 @@ script_mod! {
                 self.vertex_pos = vec4(2.0 * pos.x - 1.0, 1.0 - 2.0 * pos.y, 0.0, 1.0)
             }
         }
+        // its rounded corners, drawn over the picture in the ground around it (`ground`)
+        draw_mask: mod.draw.DrawQuad{
+            ground: uniform(fab.color_editor)
+            radius: uniform(fab.radius_lg)
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                sdf.box(0.0, 0.0, self.rect_size.x, self.rect_size.y, self.radius)
+                sdf.fill(vec4(1.0, 1.0, 1.0, 1.0))
+                let outside = 1.0 - sdf.result.w
+                return vec4(self.ground.xyz * outside, outside)
+            }
+        }
         label: FabLabelDim{ text: "" }
     }
 
@@ -150,7 +162,7 @@ script_mod! {
             height: 206
             flow: Overlay
             padding: 3
-            cam_box := View{ width: Fill height: Fill camera := mod.widgets.FabPrinterCamera{} }
+            cam_box := View{ width: Fill height: Fill camera := mod.widgets.FabPrinterCamera{ draw_mask +: { ground: uniform(fab.color_float) } } }
             head := View{
                 width: Fill height: Fit flow: Right padding: 4
                 cursor: MouseCursor.Move
@@ -345,6 +357,8 @@ pub struct FabPrinterCamera {
     #[live] draw_picture: DrawQuad,
     #[live] draw_bed: DrawQuad,
     #[live] draw_badge: DrawText,
+    /// The rounded corners over the picture.
+    #[live] draw_mask: DrawQuad,
     #[live]
     label: WidgetRef,
     /// Accessibility can read the status of the displayed slot without keeping a retired feed alive.
@@ -658,6 +672,7 @@ impl Widget for FabPrinterCamera {
             },
         };
         self.displayed = displayed;
+        self.draw_mask.draw_abs(cx, rect);
         self.label.set_text(cx, &text);
         if !text.is_empty() {
             // It wraps short of the panel's button at the top right.

@@ -14,6 +14,7 @@
 use super::*;
 use makepad_fab_settings::virtual_printer::Kind as VirtualKind;
 use crate::api::AppState;
+use std::collections::HashMap;
 use crate::ui::popover::{menu_picked, open_menu, ui_actions, FabUiAction, MenuItem, MenuPlace};
 
 /// A menu longer than this splits into submenus.
@@ -65,14 +66,14 @@ script_mod! {
             }
         }
     }
-    // A status pill: dot + text, coloured by `state` (0 off, 1 ok, 2 busy, 3 error).
+    // A status: its words, then a dot coloured by `state` (0 off, 1 ok, 2 busy, 3 error) at the
+    // right, no backdrop.
     mod.widgets.FabStatusPill = View{
         width: Fit
         height: 20
         flow: Right
         align: Align{x: 0.0 y: 0.5}
-        spacing: 6
-        padding: Inset{left: 8 right: 9 top: 0 bottom: 0}
+        padding: Inset{left: 0 right: 14 top: 0 bottom: 0}
         show_bg: true
         draw_bg +: {
             state: instance(0.0)
@@ -82,14 +83,12 @@ script_mod! {
                 if self.state > 0.5 { c = fab.color_ok }
                 if self.state > 1.5 { c = fab.color_accent }
                 if self.state > 2.5 { c = fab.color_error }
-                sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, self.rect_size.y * 0.25)
-                sdf.fill(vec4(c.xyz, 0.16))
-                sdf.circle(10.0, self.rect_size.y * 0.5, 3.0)
+                sdf.circle(self.rect_size.x - 4.0, self.rect_size.y * 0.5, 3.0)
                 sdf.fill(c)
                 return sdf.result
             }
         }
-        text := mod.widgets.FabLabelSmall{ margin: Inset{left: 6} text: "" draw_text +: { color: fab.color_text } }
+        text := mod.widgets.FabLabelSmall{ text: "" draw_text +: { color: fab.color_text } }
     }
 
     let PrintRow = mod.widgets.FabFieldRow{}
@@ -99,68 +98,138 @@ script_mod! {
         label +: { width: Fill max_lines: 1 text_overflow: TextOverflow.Ellipsis text: "—" }
     }
 
+    // A printer's folding section in the Printers editor: its name, and a status pill in the
+    // header's trail.
+    let PrinterSection = PropSection{
+        header +: {hdr +: {
+            icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/printer.svg")}}
+            title +: {text: ""}
+            trail +: {
+                width: Fit height: Fit flow: Right spacing: 4 align: Align{y: 0.5}
+                pill := mod.widgets.FabStatusPill{}
+            }
+        }}
+        body +: {flow: Down spacing: 2 padding: Inset{top: 4 bottom: 8}}
+    }
+
+    // A part of a printer's section: a nested section that folds, as the Part panel's parameter
+    // groups and the Legend's parts (its bar a short level in), no card behind it.
+    let Sub = PropSection{
+        margin: Inset{}
+        header +: {hdr +: {
+            // in by the indent on the left; on the right, the same edge as every header's
+            margin: Inset{left: 10 right: theme.prop_pad}
+            padding: Inset{left: theme.prop_label_gap right: theme.prop_pad}
+        }}
+        body +: {flow: Down spacing: 6 padding: Inset{left: 10 right: theme.prop_pad top: 6 bottom: 8}}
+    }
+
+    // A row of the Status table: the name in a column of its own, the value beside it; a rule
+    // between the columns and under the row, and every other row shaded (`odd`).
+    let TableRow = View{
+        width: Fill height: Fit flow: Right align: Align{y: 0.5}
+        show_bg: true
+        draw_bg +: {
+            odd: instance(0.0)
+            last: instance(0.0)
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                sdf.rect(1.0, 0.0, self.rect_size.x - 2.0, self.rect_size.y)
+                sdf.fill(vec4(1.0, 1.0, 1.0, 0.03 * self.odd))
+                // the rule between the columns, and under the row (not the last)
+                sdf.rect(#(TABLE_NAME_W), 0.0, 1.0, self.rect_size.y)
+                sdf.fill(#xffffff14)
+                sdf.rect(1.0, self.rect_size.y - 1.0, self.rect_size.x - 2.0, (1.0 - self.last))
+                sdf.fill(#xffffff14)
+                return sdf.result
+            }
+        }
+        name := mod.widgets.FabLabelDim{ width: #(TABLE_NAME_W) padding: Inset{left: 8 right: 8 top: 5 bottom: 5} text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis }
+        value := mod.widgets.FabLabel{ width: Fill padding: Inset{left: 8 right: 8 top: 5 bottom: 5} text: "" }
+    }
+
+    // The job of the printer in use (in the Printers editor's Jobs tab): its profile, its
+    // colours on the printer's trays, its slice, each a section of the printer's.
     mod.widgets.FabSettingsPanelBase = #(FabSettingsPanel::register_widget(vm))
     mod.widgets.FabSettingsPanel = set_type_default() do mod.widgets.FabSettingsPanelBase{
         width: Fill
-        height: Fill
+        height: Fit
         flow: Down
-        show_bg: true
-        draw_bg +: { color: fab.color_editor }
-        // the toolbar: the area's editor selector (and this editor's tools, when it has any)
-        editor_bar := mod.widgets.FabEditorBar{
-            // filters the rows below by name (a section's title shows it whole)
-            search := mod.widgets.FabSearch{width: Fill{min: 80} row +: {input +: {empty_text: "Filter"}}}
+        spacing: 2
+        profile := Sub{
+            header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/gear.svg")}} title +: {text: "Profile"}}}
+            body +: {
+                source_row := PrintRow{ name +: {text: "Profiles"}
+                    source := Pick{ tag: @print_source owner: @print_source }
+                }
+                machine_row := PrintRow{ name +: {text: "Printer"}
+                    machine := Pick{ tag: @print_machine owner: @print_machine }
+                }
+                plate_row := PrintRow{ name +: {text: "Plate"}
+                    plate := Pick{ tag: @print_plate owner: @print_plate }
+                }
+                process_row := PrintRow{ name +: {text: "Process"}
+                    process := Pick{ tag: @print_process owner: @print_process }
+                }
+            }
         }
-        // the job's settings as the Part editor's: sections that fold, each a bar with its glyph
-        body := mod.widgets.FabScroll{
-            padding: Inset{left: theme.prop_pad right: theme.prop_pad top: #(crate::ui::widgets::PANEL_TOP)}
-            // its slot: the box the section moves in when dragged by its grip (`section_reorder`)
-            profile_slot := View{width: Fill height: Fit
-                profile := PropSection{
-                    header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/gear.svg")}} title +: {text: "Profile"}}}
-                    body +: {
-                        source_row := PrintRow{ name +: {text: "Profiles"}
-                            source := Pick{ tag: @print_source owner: @print_source }
-                        }
-                        machine_row := PrintRow{ name +: {text: "Printer"}
-                            machine := Pick{ tag: @print_machine owner: @print_machine }
-                        }
-                        plate_row := PrintRow{ name +: {text: "Plate"}
-                            plate := Pick{ tag: @print_plate owner: @print_plate }
-                        }
-                        process_row := PrintRow{ name +: {text: "Process"}
-                            process := Pick{ tag: @print_process owner: @print_process }
-                        }
+        colours := Sub{
+            header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/palette.svg")}} title +: {text: "Colours"}}}
+            body +: {
+                map := mod.widgets.FabColorMap{}
+                note := mod.widgets.FabLabelSmall{ width: Fill text: "" }
+            }
+        }
+        slice := Sub{
+            header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/layers.svg")}} title +: {text: "Slice"}}}
+            body +: {
+                status_row := View{
+                    width: Fill height: Fit flow: Down spacing: 6
+                    progress := mod.widgets.FabProgress{ width: Fill visible: false }
+                    status := mod.widgets.FabLabel{ width: Fill text: "Not sliced yet." }
+                }
+                actions := View{
+                    width: Fill height: Fit flow: Right spacing: 6
+                    FabTip{ text: "Write the sliced plate as a printer package"
+                        export := mod.widgets.FabButton{ text: "Export…" }
+                    }
+                }
+                summary := mod.widgets.FabLabelSmall{ width: Fill text: "" }
+            }
+        }
+    }
+
+    // The printers other than the one in use, before or after it in the list (`part` 0 or 1):
+    // each a section with what it last reported and the button that puts it in use.
+    mod.widgets.FabPrinterSectionsBase = #(FabPrinterSections::register_widget(vm))
+    mod.widgets.FabPrinterSections = set_type_default() do mod.widgets.FabPrinterSectionsBase{
+        width: Fill height: Fit flow: Down
+        Printer := PrinterSection{
+            body +: {
+                summary := mod.widgets.FabLabelDim{ width: Fill text: "" }
+                use_row := View{
+                    width: Fill height: Fit flow: Right
+                    FabTip{ text: "Use this printer: its trays, its job and its status show here, and Print sends to it"
+                        use_btn := mod.widgets.FabButton{ text: "Use this printer" }
                     }
                 }
             }
-            // its slot: the box the section moves in when dragged by its grip (`section_reorder`)
-            colours_slot := View{width: Fill height: Fit
-                colours := PropSection{
-                    header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/palette.svg")}} title +: {text: "Colours"}}}
-                    body +: {
-                        map := mod.widgets.FabColorMap{}
-                        note := mod.widgets.FabLabelSmall{ width: Fill text: "" }
-                    }
-                }
-            }
-            // its slot: the box the section moves in when dragged by its grip (`section_reorder`)
-            slice_slot := View{width: Fill height: Fit
-                slice := PropSection{
-                    header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/layers.svg")}} title +: {text: "Slice"}}}
-                    body +: {
-                        status_row := View{
-                            width: Fill height: Fit flow: Down spacing: 6
-                            progress := mod.widgets.FabProgress{ width: Fill visible: false }
-                            status := mod.widgets.FabLabel{ width: Fill text: "Not sliced yet." }
-                        }
-                        actions := View{
-                            width: Fill height: Fit flow: Right spacing: 6
-                            FabTip{ text: "Write the sliced plate as a printer package"
-                                export := mod.widgets.FabButton{ text: "Export…" }
-                            }
-                        }
-                        summary := mod.widgets.FabLabelSmall{ width: Fill text: "" }
+        }
+    }
+
+    // The Jobs tab: each printer a section with the jobs sent to it (and "Other printers" for
+    // jobs of printers no longer set up), each job a row as the Jobs list's.
+    mod.widgets.FabPrinterJobsBase = #(FabPrinterJobs::register_widget(vm))
+    mod.widgets.FabPrinterJobs = set_type_default() do mod.widgets.FabPrinterJobsBase{
+        width: Fill height: Fit flow: Down
+        Printer := PrinterSection{
+            body +: {
+                jobs := mod.widgets.FabJobRows{}
+                none := mod.widgets.FabLabelDim{ width: Fill visible: false margin: Inset{left: 10} text: "No jobs sent to this printer yet." }
+                use_row := View{
+                    width: Fill height: Fit flow: Right margin: Inset{left: 10 top: 4}
+                    FabTip{ text: "Use this printer: its job (profile, colours, slice) shows here, and Print sends to it"
+                        use_btn := mod.widgets.FabButton{ text: "Use this printer" }
                     }
                 }
             }
@@ -174,152 +243,559 @@ script_mod! {
         flow: Down
         show_bg: true
         draw_bg +: { color: fab.color_editor }
-        // the toolbar: the area's editor selector (and this editor's tools, when it has any)
-        editor_bar := mod.widgets.FabEditorBar{}
-        body := mod.widgets.FabScroll{
-            padding: Inset{left: 10 right: 10 top: 10 bottom: 10}
-            spacing: 10
-            link := PrintRow{
-                name +: { text: "Printer" }
-                FabTip{width: Fill text: "Choose the printer whose trays Fab uses"
-                    picker := Pick{tag: @printer_link owner: @printer_link}
-                }
-                modes := View{width: Fit height: Fit flow: Right visible: false
-                    connected := mod.widgets.FabSegmentTab{text: "Connected" a11y: {label: "Connected mode"}}
-                    disconnected := mod.widgets.FabSegmentTab{text: "Virtual" a11y: {label: "Virtual mode"}}
+        // the toolbar: the area's editor selector, Add printer, and the filter
+        editor_bar := mod.widgets.FabEditorBar{
+            // the printers, or the jobs sent to each
+            view_tabs := View{
+                width: Fit height: Fit flow: Right align: Align{y: 0.5}
+                printers_tab := mod.widgets.FabUnderlineTab{ text: "Printers" a11y: {label: "Printers"} }
+                jobs_tab := mod.widgets.FabUnderlineTab{ text: "Jobs" a11y: {label: "Jobs"} }
+            }
+            mod.widgets.FabVRule{}
+            FabTip{ text: "Add a printer: a virtual twin of a printer model, or your network printer"
+                add_printer := mod.widgets.FabIconButton{
+                    width: 28 height: 24 padding: Inset{left: 6 right: 6 top: 4 bottom: 4}
+                    a11y: {label: "Add printer"}
+                    draw_icon +: {svg: crate_resource("self://resources/icons/plus.svg")}
                 }
             }
-            link_note := mod.widgets.FabLabelSmall{width: Fill height: Fit text: "" visible: false}
+            // narrows the list to the printers whose names hold every word typed
+            search := mod.widgets.FabSearch{width: Fill{min: 80} row +: {input +: {empty_text: "Filter"}}}
+        }
+        body := mod.widgets.FabScroll{
+            padding: Inset{left: theme.prop_pad right: theme.prop_pad top: #(crate::ui::widgets::PANEL_TOP)}
+            // no printer in use (or none at all): what to do
             none := mod.widgets.FabCard{
                 visible: true
+                margin: Inset{bottom: 10}
                 title := mod.widgets.FabTitleLabel{ text: "" }
                 text := mod.widgets.FabLabelDim{ width: Fill text: "" }
             }
-            confirm := mod.widgets.FabCard{
+            before := mod.widgets.FabPrinterSections{part: 0}
+            // the printer in use: everything it reports, its trays, the print's question and its
+            // camera, each a section of its own that folds (no cards)
+            active := PrinterSection{
                 visible: false
-                question := mod.widgets.FabLabel{ width: Fill text: "" }
-                stick_row := PrintRow{ visible: false name +: {text: "USB stick"}
-                    stick := Pick{ tag: @resin_stick owner: @resin_stick }
-                }
-                progress := mod.widgets.FabProgress{ width: Fill height: 8 visible: false }
-                check := mod.widgets.FabLabelDim{ width: Fill text: "" }
-                blocker := mod.widgets.FabLabel{ width: Fill text: "" visible: false draw_text +: { color: fab.color_error } }
-                FabTip{ text: "Show this printability error in the slice view; again for the next one"
-                    show_issue := mod.widgets.FabButton{ text: "" visible: false }
-                }
-                accept := mod.widgets.FabCheckBox{ text: "" visible: false }
-                flow_cali := mod.widgets.FabCheckBox{ text: "Flow calibration" }
-                timelapse := mod.widgets.FabCheckBox{ text: "Timelapse" }
-                plate_clear := mod.widgets.FabCheckBox{ text: "The plate is clear: the last print is off the bed" }
-                speed_row := mod.widgets.FabVirtualSpeed{}
-                buttons := View{
-                    width: Fill height: Fit flow: Right spacing: 6
-                    go := mod.widgets.FabButtonAccent{ text: "Start print" }
-                    cancel := mod.widgets.FabButton{ text: "Cancel" }
-                }
-            }
-            card := mod.widgets.FabCard{
-                visible: false
-                head := View{
-                    width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}
-                    icon_slot := View{
-                        width: 36 height: 36
-                        padding: Inset{left: 4 right: 4 top: 4 bottom: 4}
-                        show_bg: true
-                        draw_bg +: {
-                            pixel: fn() {
-                                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
-                                sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, fab.radius_lg)
-                                sdf.fill(fab.color_input)
-                                return sdf.result
+                body +: {
+                    link_note := mod.widgets.FabLabelSmall{width: Fill height: Fit text: "" visible: false}
+                    // the print's question, from the top bar's Print until Start print or Cancel
+                    confirm := Sub{
+                        visible: false
+                        header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/play.svg")}} title +: {text: "Print"}}}
+                        body +: {
+                            question := mod.widgets.FabLabel{ width: Fill text: "" }
+                            stick_row := PrintRow{ visible: false name +: {text: "USB stick"}
+                                stick := Pick{ tag: @resin_stick owner: @resin_stick }
+                            }
+                            progress := mod.widgets.FabProgress{ width: Fill height: 8 visible: false }
+                            check := mod.widgets.FabLabelDim{ width: Fill text: "" }
+                            blocker := mod.widgets.FabLabel{ width: Fill text: "" visible: false draw_text +: { color: fab.color_error } }
+                            FabTip{ text: "Show this printability error in the slice view; again for the next one"
+                                show_issue := mod.widgets.FabButton{ text: "" visible: false }
+                            }
+                            accept := mod.widgets.FabCheckBox{ text: "" visible: false }
+                            flow_cali := mod.widgets.FabCheckBox{ text: "Flow calibration" }
+                            timelapse := mod.widgets.FabCheckBox{ text: "Timelapse" }
+                            plate_clear := mod.widgets.FabCheckBox{ text: "The plate is clear: the last print is off the bed" }
+                            speed_row := mod.widgets.FabVirtualSpeed{}
+                            buttons := View{
+                                width: Fill height: Fit flow: Right spacing: 6
+                                go := mod.widgets.FabButtonAccent{ text: "Start print" }
+                                cancel := mod.widgets.FabButton{ text: "Cancel" }
                             }
                         }
-                        FabIcon{ icon_walk: Walk{width: 28 height: 28} draw_icon +: { svg: crate_resource("self://resources/icons/printer.svg") color: fab.color_text } }
                     }
-                    names := View{
-                        width: Fill height: Fit flow: Down spacing: 2
-                        name := mod.widgets.FabTitleLabel{ text: "" }
-                        model := mod.widgets.FabLabelDim{ text: "" }
+                    // the printer's own state: its live view, its model, heads, bed, storage and
+                    // errors; the camera pops out to float over the window by its button in the
+                    // header (and comes back by the floating card's ×, or here)
+                    card := Sub{
+                        visible: false
+                        header +: {hdr +: {
+                            icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/printer.svg")}}
+                            title +: {text: "Status"}
+                            trail +: {
+                                width: Fit height: Fit flow: Right align: Align{y: 0.5}
+                                pop_tip := FabTip{ text: "Pop the camera out: it floats over the window, wherever you work"
+                                    pop_out := mod.widgets.FabIconButton{
+                                        width: 24 height: 22 padding: Inset{left: 4 right: 4 top: 3 bottom: 3}
+                                        a11y: {label: "Pop out camera"}
+                                        draw_icon +: {svg: crate_resource("self://resources/icons/maximize.svg")}
+                                    }
+                                }
+                            }
+                        }}
+                        body +: {
+                            cam_box := View{ width: Fill height: 200 camera := mod.widgets.FabPrinterCamera{} }
+                            floating := View{
+                                visible: false
+                                width: Fill height: Fit flow: Right spacing: 6 align: Align{y: 0.5}
+                                mod.widgets.FabLabelDim{ width: Fill text: "The camera floats over the window." }
+                                FabTip{ text: "Put the camera back here"
+                                    back := mod.widgets.FabButton{ text: "Back here" }
+                                }
+                            }
+                            // what the printer reports, as a table: a row each for its model, each head,
+                            // the bed, the chamber, storage and errors (`printer_rows`)
+                            status_table := View{
+                                width: Fill height: Fit flow: Down spacing: 0
+                                show_bg: true
+                                draw_bg +: {
+                                    pixel: fn() {
+                                        let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                                        sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, fab.radius)
+                                        sdf.stroke(#xffffff14, 1.0)
+                                        return sdf.result
+                                    }
+                                }
+                                row0 := TableRow{ visible: false }
+                                row1 := TableRow{ visible: false }
+                                row2 := TableRow{ visible: false }
+                                row3 := TableRow{ visible: false }
+                                row4 := TableRow{ visible: false }
+                                row5 := TableRow{ visible: false }
+                                row6 := TableRow{ visible: false }
+                                row7 := TableRow{ visible: false }
+                                row8 := TableRow{ visible: false }
+                                row9 := TableRow{ visible: false }
+                            }
+                            note := mod.widgets.FabLabel{ width: Fill text: "" }
+                            controls := View{
+                                width: Fill height: Fit flow: Right spacing: 6 align: Align{y: 0.5}
+                                clear := mod.widgets.FabButton{ text: "Clear printer error" visible: false }
+                                Filler{}
+                                FabTip{ text: "List the files on the printer's USB drive"
+                                    storage := mod.widgets.FabButton{ text: "Storage" }
+                                }
+                            }
+                        }
                     }
-                    pill := mod.widgets.FabStatusPill{}
-                }
-                telemetry := mod.widgets.FabLabelDim{ width: Fill text: "" }
-                note := mod.widgets.FabLabel{ width: Fill text: "" }
-                controls := View{
-                    width: Fill height: Fit flow: Right spacing: 6 align: Align{y: 0.5}
-                    clear := mod.widgets.FabButton{ text: "Clear printer error" visible: false }
-                    Filler{}
-                    FabTip{ text: "List the files on the printer's USB drive"
-                        storage := mod.widgets.FabButton{ text: "Storage" }
+                    orient := Sub{
+                        visible: false
+                        header +: {hdr +: {title +: {text: "Orientation test"}}}
+                        body +: {
+                            text := mod.widgets.FabLabelDim{ width: Fill text: "" }
+                            status := mod.widgets.FabLabel{ width: Fill text: "" visible: false }
+                            FabTip{ text: "Write the orientation test's file to the printer's USB stick"
+                                save := mod.widgets.FabButton{ text: "Save the test to the stick" }
+                            }
+                        }
+                    }
+                    stats_card := Sub{
+                        visible: false
+                        header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/layers.svg")}} title +: {text: "The printer reports"}}}
+                        body +: {
+                            heads := mod.widgets.FabColourRows{}
+                            printer_text := mod.widgets.FabLabelDim{ width: Fill text: "" }
+                            job_title := mod.widgets.FabGroupTitle{ text: "THE JOB THAT WAS SENT" }
+                            job_text := mod.widgets.FabLabelDim{ width: Fill text: "" }
+                            filaments := mod.widgets.FabColourRows{ job: true }
+                            FabTip{ text: "Everything else the printer's reports carry, without who or where it is"
+                                raw_button := mod.widgets.FabButton{ text: "Raw report" }
+                            }
+                            raw := mod.widgets.FabLabelDim{ width: Fill visible: false text: "" }
+                        }
+                    }
+                    job := mod.widgets.FabJobCard{ visible: false }
+                    trays_card := Sub{
+                        visible: false
+                        header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/nozzle.svg")}} title +: {text: "Filament on the printer"}}}
+                        body +: {
+                            trays := mod.widgets.FabTrayGrid{}
+                        }
+                    }
+                    map_card := Sub{
+                        header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/palette.svg")}} title +: {text: "Colours → trays"}}}
+                        body +: {
+                            map := mod.widgets.FabColorMap{}
+                        }
+                    }
+                    // its settings, last: how Fab links to it, a virtual printer's feed paths, and calibration
+                    settings_box := Sub{
+                        header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/gear.svg")}} title +: {text: "Settings"}}}
+                        body +: {
+                            mode_row := PrintRow{ name +: { text: "Link" }
+                                modes := View{width: Fit height: Fit flow: Right
+                                    connected := mod.widgets.FabSegmentTab{text: "Connected" a11y: {label: "Connected mode"}}
+                                    disconnected := mod.widgets.FabSegmentTab{text: "Virtual" a11y: {label: "Virtual mode"}}
+                                }
+                            }
+                            // a virtual printer's feed paths
+                            virtual_card := View{
+                                visible: false
+                                width: Fill height: Fit flow: Down spacing: 6
+                                kind_row := PrintRow{ name +: {text: "Kind"}
+                                    FabTip{width: Fill text: "Choose trays feeding nozzles or one spool per tool"
+                                        kind := Pick{tag: @virtual_kind owner: @virtual_kind}
+                                    }
+                                }
+                                heads_row := PrintRow{ name +: {text: "Heads"}
+                                    FabTip{text: "Remove one head" minus := mod.widgets.FabButton{text: "−"}}
+                                    count := mod.widgets.FabLabel{text: "" width: Fit}
+                                    FabTip{text: "Add one head" plus := mod.widgets.FabButton{text: "+"}}
+                                }
+                                trays_row := PrintRow{ name +: {text: "Trays per nozzle"}
+                                    FabTip{text: "Remove one tray per nozzle" minus := mod.widgets.FabButton{text: "−"}}
+                                    count := mod.widgets.FabLabel{text: "" width: Fit}
+                                    FabTip{text: "Add one tray per nozzle" plus := mod.widgets.FabButton{text: "+"}}
+                                }
+                                tpu_row := FabTip{text: "Give TPU its own external feed path"
+                                    tpu := mod.widgets.FabCheckBox{text: "Dedicated TPU path"}
+                                }
+                                reset_row := PrintRow{ name +: {text: "Preset"}
+                                    FabTip{width: Fill text: "Replace the layout and tray contents with a preset"
+                                        reset := Pick{tag: @virtual_reset owner: @virtual_reset label +: {text: "Reset to preset"}}
+                                    }
+                                }
+                                mod.widgets.FabLabelSmall{width: Fill height: Fit flow: Right{wrap: true} text: "Set slot contents in the trays below or in the colour list."}
+                            }
+                            no_settings := mod.widgets.FabLabelDim{ width: Fill text: "This printer has no link or feed settings in Fab." visible: false }
+                            // tuning Fab to this printer and its filament: each step a section
+                            calibrate_part := View{
+                                width: Fill height: Fit flow: Down spacing: 4 margin: Inset{top: 4}
+                                cal_title := mod.widgets.FabGroupTitle{ text: "CALIBRATION" }
+                                cal_context := mod.widgets.FabLabelDim{ width: Fill text: "" }
+                                steps := mod.widgets.FabCalibrateSteps{}
+                                cal_status := mod.widgets.FabLabelDim{ width: Fill text: "" }
+                            }
+                        }
                     }
                 }
             }
-            orient := mod.widgets.FabCard{
+            after := mod.widgets.FabPrinterSections{part: 1}
+        }
+        // the Jobs tab: every printer with the jobs sent to it
+        jobs_body := mod.widgets.FabScroll{
+            visible: false
+            padding: Inset{left: theme.prop_pad right: theme.prop_pad top: #(crate::ui::widgets::PANEL_TOP)}
+            jobs_none := mod.widgets.FabCard{
                 visible: false
-                mod.widgets.FabGroupTitle{ text: "ORIENTATION TEST" }
-                text := mod.widgets.FabLabelDim{ width: Fill text: "" }
-                status := mod.widgets.FabLabel{ width: Fill text: "" visible: false }
-                FabTip{ text: "Write the orientation test's file to the printer's USB stick"
-                    save := mod.widgets.FabButton{ text: "Save the test to the stick" }
-                }
+                margin: Inset{bottom: 10}
+                title := mod.widgets.FabTitleLabel{ text: "No printer in use." }
+                text := mod.widgets.FabLabelDim{ width: Fill text: "Use one of the printers below: its job, its profile, colours and slice, shows in its section." }
             }
-            stats_card := mod.widgets.FabCard{
+            jobs_before := mod.widgets.FabPrinterJobs{part: 0}
+            // the printer in use: its job (profile, colours, slice), then the jobs sent to it
+            jobs_active := PrinterSection{
                 visible: false
-                mod.widgets.FabGroupTitle{ text: "THE PRINTER REPORTS" }
-                heads := mod.widgets.FabColourRows{}
-                printer_text := mod.widgets.FabLabelDim{ width: Fill text: "" }
-                job_title := mod.widgets.FabGroupTitle{ text: "THE JOB THAT WAS SENT" }
-                job_text := mod.widgets.FabLabelDim{ width: Fill text: "" }
-                filaments := mod.widgets.FabColourRows{ job: true }
-                FabTip{ text: "Everything else the printer's reports carry, without who or where it is"
-                    raw_button := mod.widgets.FabButton{ text: "Raw report" }
-                }
-                raw := mod.widgets.FabLabelDim{ width: Fill visible: false text: "" }
-            }
-            job := mod.widgets.FabJobCard{ visible: false }
-            virtual_card := mod.widgets.FabCard{
-                visible: false
-                mod.widgets.FabGroupTitle{text: "VIRTUAL PRINTER"}
-                kind_row := PrintRow{ name +: {text: "Kind"}
-                    FabTip{width: Fill text: "Choose trays feeding nozzles or one spool per tool"
-                        kind := Pick{tag: @virtual_kind owner: @virtual_kind}
+                body +: {
+                    job_settings := mod.widgets.FabSettingsPanel{}
+                    sent := Sub{
+                        header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/clock.svg")}} title +: {text: "Sent jobs"}}}
+                        body +: {
+                            sent_rows := mod.widgets.FabJobRows{}
+                            sent_none := mod.widgets.FabLabelDim{ width: Fill visible: false text: "No jobs sent to this printer yet." }
+                        }
                     }
                 }
-                heads_row := View{width: Fill height: Fit flow: Right{wrap: true} spacing: 6 align: Align{y: 0.5}
-                    mod.widgets.FabLabelDim{text: "Heads" width: 96}
-                    FabTip{text: "Remove one head" minus := mod.widgets.FabButton{text: "−"}}
-                    count := mod.widgets.FabLabel{text: "" width: Fit}
-                    FabTip{text: "Add one head" plus := mod.widgets.FabButton{text: "+"}}
-                }
-                trays_row := View{width: Fill height: Fit flow: Right{wrap: true} spacing: 6 align: Align{y: 0.5}
-                    mod.widgets.FabLabelDim{text: "Trays per nozzle" width: 96}
-                    FabTip{text: "Remove one tray per nozzle" minus := mod.widgets.FabButton{text: "−"}}
-                    count := mod.widgets.FabLabel{text: "" width: Fit}
-                    FabTip{text: "Add one tray per nozzle" plus := mod.widgets.FabButton{text: "+"}}
-                }
-                tpu_row := FabTip{text: "Give TPU its own external feed path"
-                    tpu := mod.widgets.FabCheckBox{text: "Dedicated TPU path"}
-                }
-                FabTip{width: Fill text: "Replace the layout and tray contents with a preset"
-                    reset := Pick{tag: @virtual_reset owner: @virtual_reset label +: {text: "Reset to preset"}}
-                }
-                mod.widgets.FabLabelSmall{width: Fill height: Fit flow: Right{wrap: true} text: "Set slot contents in the trays below or in the colour list."}
             }
-            trays_card := mod.widgets.FabCard{
-                visible: false
-                mod.widgets.FabGroupTitle{ text: "FILAMENT ON THE PRINTER" }
-                trays := mod.widgets.FabTrayGrid{}
+            jobs_after := mod.widgets.FabPrinterJobs{part: 1}
+        }
+    }
+}
+
+/// The card when no printer is in use: with printers to pick from, and with none at all.
+const NO_PRINTER: (&str, &str) = ("No printer in use.", "Use one of the printers below to assign materials, slice and print on it.");
+const NO_PRINTERS: (&str, &str) = ("No printers yet.", "Add a virtual twin with + to assign materials, slice and try printing without a printer, or add your printer's address and access code in ~/.makepad/fab/printers.");
+
+/// Shows the Printers editor's Jobs tab (where the job of the printer in use is).
+#[derive(Clone, Debug)]
+pub struct ShowJobTab;
+
+/// The printers the editor lists: every one but "No printer".
+fn listed(p: &PrintState) -> Vec<(PrinterChoice, String)> {
+    p.links.choices.iter().filter(|(c, _)| *c != PrinterChoice::None).cloned().collect()
+}
+
+/// Whether `title` holds every word of the filter (lowercased words; none: all).
+fn shows(words: &[String], title: &str) -> bool {
+    let title = title.to_lowercase();
+    words.iter().all(|w| title.contains(w.as_str()))
+}
+
+// ===========================================================================
+// The Jobs tab
+// ===========================================================================
+
+/// The Jobs tab's sections: a printer each (as the Printers tab lists them, the filter's), its
+/// header saying how many jobs it has and whether one prints, its body the jobs sent to it; then
+/// "Other printers" for jobs of printers no longer set up, when there are any.
+#[derive(Script, Widget)]
+pub struct FabPrinterJobs {
+    #[uid] uid: WidgetUid,
+    #[source] source: ScriptObjectRef,
+    #[walk] walk: Walk,
+    #[layout] layout: Layout,
+    /// The printers before the one in use (0) or after it (1, with "Other printers").
+    #[live] part: u32,
+    /// The editor's filter, its words lowercased.
+    #[rust] pub query: Vec<String>,
+    #[rust] templates: HashMap<LiveId, ScriptObjectRef>,
+    #[rust] items: ComponentMap<LiveId, WidgetRef>,
+    /// The sections drawn last, and their printers (none: "Other printers").
+    #[rust] shown: Vec<LiveId>,
+    #[rust] choices: Vec<(LiveId, PrinterChoice)>,
+    #[redraw] #[rust] area: Area,
+}
+
+impl ScriptHook for FabPrinterJobs {
+    fn on_before_apply(&mut self, _vm: &mut ScriptVm, apply: &Apply, _scope: &mut Scope, _value: ScriptValue) {
+        if apply.is_reload() {
+            self.templates.clear();
+        }
+    }
+
+    fn on_after_apply(&mut self, vm: &mut ScriptVm, apply: &Apply, scope: &mut Scope, value: ScriptValue) {
+        if !apply.is_eval() {
+            if let Some(obj) = value.as_object() {
+                vm.vec_with(obj, |vm, vec| {
+                    for kv in vec {
+                        if let (Some(id), Some(t)) = (kv.key.as_id(), kv.value.as_object()) {
+                            self.templates.insert(id, vm.new_object_ref(t));
+                        }
+                    }
+                });
             }
-            map_card := mod.widgets.FabCard{
-                mod.widgets.FabGroupTitle{ text: "COLOURS → TRAYS" }
-                map := mod.widgets.FabColorMap{}
+        }
+        if apply.is_reload() {
+            if let Some(template) = self.templates.get(&live_id!(Printer)) {
+                let v: ScriptValue = template.as_object().into();
+                for (_, w) in self.items.iter_mut() {
+                    w.script_apply(vm, apply, scope, v);
+                }
             }
         }
     }
 }
 
-/// The card in place of the printer's when none is linked.
-const NO_PRINTER: (&str, &str) = ("No printer linked.", "Pick a virtual printer above to assign materials, slice and try printing without one, or add your printer's address and access code in ~/.makepad/fab/printers.");
+impl FabPrinterJobs {
+    /// The sections shown, in order: their headers for the editor's swipe-fold.
+    pub fn headers(&self) -> Vec<WidgetRef> {
+        self.shown.iter().filter_map(|id| self.items.get(id).cloned()).collect()
+    }
+
+    fn item(&mut self, cx: &mut Cx, id: LiveId, open: bool) -> Option<WidgetRef> {
+        if let Some(w) = self.items.get(&id) {
+            return Some(w.clone());
+        }
+        let value: ScriptValue = self.templates.get(&live_id!(Printer))?.as_object().into();
+        let w = cx.with_vm(|vm| WidgetRef::script_from_value(vm, value));
+        cx.widget_tree_insert_child(self.uid, id, w.clone());
+        // open at first: the printer in use, and one with a job on its way or printing
+        w.as_prop_section().set_is_open(cx, open, Animate::No);
+        self.items.insert(id, w.clone());
+        Some(w)
+    }
+}
+
+impl Widget for FabPrinterJobs {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if matches!(event, Event::Draw(_)) { return; }
+        for id in &self.shown {
+            if let Some(w) = self.items.get(id) {
+                w.handle_event(cx, event, scope);
+            }
+        }
+        let Event::Actions(actions) = event else { return };
+        for (id, choice) in &self.choices {
+            if self.items.get(id).is_some_and(|w| w.button(cx, ids!(use_btn)).clicked(actions)) {
+                cx.action(PrintAction::LinkPrinter(choice.clone()));
+            }
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        use crate::print::job_list::{jobs_count, FabJobRows, JobsOf};
+        cx.begin_turtle(walk, self.layout);
+        self.shown.clear();
+        // the sections first (what each holds), then drawn: a section's rows read the app's state
+        let mut plan: Vec<(LiveId, String, JobsOf, usize, bool, bool)> = Vec::new();
+        if let Some(state) = scope.data.get::<AppState>() {
+            let p = &state.print;
+            let printers = listed(p);
+            let ids: Vec<String> = printers.iter().filter_map(|(c, _)| c.id()).collect();
+            // the printers before the one in use, or after it (all of them before when none is)
+            let at = printers.iter().position(|(c, _)| *c == p.links.picked);
+            let range = match (self.part, at) {
+                (0, Some(i)) => 0..i,
+                (0, None) => 0..printers.len(),
+                (_, Some(i)) => i + 1..printers.len(),
+                (_, None) => 0..0,
+            };
+            self.choices.clear();
+            let mut sections: Vec<(LiveId, String, JobsOf, bool)> = Vec::new();
+            for (c, title) in &printers[range] {
+                let Some(pid) = c.id().filter(|_| shows(&self.query, title)) else { continue };
+                self.choices.push((choice_id(c), c.clone()));
+                sections.push((choice_id(c), title.clone(), JobsOf::Printer(pid), true));
+            }
+            // jobs of printers no longer set up: last, after every printer
+            let others = JobsOf::Others(ids);
+            if (self.part == 1 || at.is_none()) && jobs_count(p, &others).0 > 0 && shows(&self.query, "Other printers") {
+                sections.push((live_id!(other_printers), "Other printers".to_string(), others, false));
+            }
+            for (id, title, of, usable) in sections {
+                let (count, active) = jobs_count(p, &of);
+                plan.push((id, title, of, count, active, usable));
+            }
+        }
+        for (id, title, of, count, active, usable) in plan {
+            let Some(w) = self.item(cx, id, active) else { continue };
+            w.view(cx, ids!(use_row)).set_visible(cx, usable);
+            w.label(cx, ids!(hdr.title)).set_text(cx, &title);
+            let (dot, text) = match count {
+                _ if active => (2.0, format!("Printing · {count} jobs")),
+                0 => (0.0, "No jobs".to_string()),
+                1 => (1.0, "1 job".to_string()),
+                n => (1.0, format!("{n} jobs")),
+            };
+            let pill = w.view(cx, ids!(pill));
+            if let Some(mut pill) = pill.borrow_mut() {
+                pill.draw_bg.set_dyn_instance(cx, live_id!(state), &[dot as f32]);
+            }
+            pill.label(cx, ids!(text)).set_text(cx, &text);
+            w.label(cx, ids!(none)).set_visible(cx, count == 0);
+            if let Some(mut rows) = w.widget(cx, ids!(jobs)).borrow_mut::<FabJobRows>() {
+                rows.of = of;
+            }
+            w.draw_all(cx, scope);
+            self.shown.push(id);
+        }
+        cx.end_turtle_with_area(&mut self.area);
+        DrawStep::done()
+    }
+}
+
+// ===========================================================================
+// The printers not in use
+// ===========================================================================
+
+/// The printers before or after the one in use (`part` 0 or 1), each a folding section with the
+/// status it last reported and "Use this printer". Sections are made from
+/// the `Printer` template, one per printer, and kept for its next draw.
+#[derive(Script, Widget)]
+pub struct FabPrinterSections {
+    #[uid] uid: WidgetUid,
+    #[source] source: ScriptObjectRef,
+    #[walk] walk: Walk,
+    #[layout] layout: Layout,
+    #[live] part: u32,
+    /// The editor's filter, its words lowercased.
+    #[rust] pub query: Vec<String>,
+    #[rust] templates: HashMap<LiveId, ScriptObjectRef>,
+    #[rust] items: ComponentMap<LiveId, WidgetRef>,
+    /// The sections drawn last, and their printers.
+    #[rust] shown: Vec<(LiveId, PrinterChoice)>,
+    #[redraw] #[rust] area: Area,
+}
+
+impl ScriptHook for FabPrinterSections {
+    fn on_before_apply(&mut self, _vm: &mut ScriptVm, apply: &Apply, _scope: &mut Scope, _value: ScriptValue) {
+        if apply.is_reload() {
+            self.templates.clear();
+        }
+    }
+
+    fn on_after_apply(&mut self, vm: &mut ScriptVm, apply: &Apply, scope: &mut Scope, value: ScriptValue) {
+        if !apply.is_eval() {
+            if let Some(obj) = value.as_object() {
+                vm.vec_with(obj, |vm, vec| {
+                    for kv in vec {
+                        if let (Some(id), Some(t)) = (kv.key.as_id(), kv.value.as_object()) {
+                            self.templates.insert(id, vm.new_object_ref(t));
+                        }
+                    }
+                });
+            }
+        }
+        if apply.is_reload() {
+            if let Some(template) = self.templates.get(&live_id!(Printer)) {
+                let v: ScriptValue = template.as_object().into();
+                for (_, w) in self.items.iter_mut() {
+                    w.script_apply(vm, apply, scope, v);
+                }
+            }
+        }
+    }
+}
+
+impl FabPrinterSections {
+    /// The sections shown, in order: their headers for the editor's swipe-fold.
+    pub fn headers(&self) -> Vec<WidgetRef> {
+        self.shown.iter().filter_map(|(id, _)| self.items.get(id).cloned()).collect()
+    }
+
+    fn item(&mut self, cx: &mut Cx, id: LiveId) -> Option<WidgetRef> {
+        if let Some(w) = self.items.get(&id) {
+            return Some(w.clone());
+        }
+        let value: ScriptValue = self.templates.get(&live_id!(Printer))?.as_object().into();
+        let w = cx.with_vm(|vm| WidgetRef::script_from_value(vm, value));
+        cx.widget_tree_insert_child(self.uid, id, w.clone());
+        // a printer not in use starts folded: its header says how it is
+        w.as_prop_section().set_is_open(cx, false, Animate::No);
+        self.items.insert(id, w.clone());
+        Some(w)
+    }
+}
+
+impl Widget for FabPrinterSections {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if matches!(event, Event::Draw(_)) { return; }
+        // (their headers' hover and swipe-fold are the editor's: `FabPrinterPanel::headers`)
+        for (id, _) in &self.shown {
+            if let Some(w) = self.items.get(id) {
+                w.handle_event(cx, event, scope);
+            }
+        }
+        let Event::Actions(actions) = event else { return };
+        for (id, choice) in &self.shown {
+            let Some(w) = self.items.get(id) else { continue };
+            if w.button(cx, ids!(use_btn)).clicked(actions) {
+                cx.action(PrintAction::LinkPrinter(choice.clone()));
+            }
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
+        cx.begin_turtle(walk, self.layout);
+        self.shown.clear();
+        if let Some(state) = _scope.data.get::<AppState>() {
+            let p = &state.print;
+            let printers = listed(p);
+            let at = printers.iter().position(|(c, _)| *c == p.links.picked).filter(|_| p.resin.is_none());
+            let range = match (self.part, at) {
+                (0, Some(i)) => 0..i,
+                (0, None) => 0..printers.len(),
+                (_, Some(i)) => i + 1..printers.len(),
+                (_, None) => 0..0,
+            };
+            for (choice, title) in &printers[range] {
+                if !shows(&self.query, title) { continue; }
+                let id = choice_id(choice);
+                let Some(w) = self.item(cx, id) else { continue };
+                w.label(cx, ids!(hdr.title)).set_text(cx, title);
+                let (state_n, status, summary) = match p.printer_of(choice) {
+                    Some(snap) => {
+                        let (n, text) = printer_status(snap);
+                        let mode = if snap.virtual_printer { " · Virtual" } else { "" };
+                        (n, text, format!("{}{mode}. Use it to see its trays, its job and its status here.", snap.model))
+                    }
+                    None => (0.0, "Not in use".to_string(), "Use it to see its trays, its job and its status here, and to print on it.".to_string()),
+                };
+                let pill = w.view(cx, ids!(pill));
+                if let Some(mut pill) = pill.borrow_mut() {
+                    pill.draw_bg.set_dyn_instance(cx, live_id!(state), &[state_n as f32]);
+                }
+                pill.label(cx, ids!(text)).set_text(cx, &status);
+                w.label(cx, ids!(summary)).set_text(cx, &summary);
+                w.draw_all(cx, &mut Scope::empty());
+                self.shown.push((id, choice.clone()));
+            }
+        }
+        cx.end_turtle_with_area(&mut self.area);
+        DrawStep::done()
+    }
+}
 
 /// Stage, progress, layer, time left, temperatures, storage and errors, as short lines.
 /// The printer's status in a word or two, and its pill's state (0 off, 1 ready, 2 busy, 3 attention).
@@ -430,6 +906,99 @@ pub fn printer_telemetry(p: &fab_printer_link::Snapshot) -> String {
         lines.push(format!("HMS: {}", s.hms.iter().map(|h| h.code()).collect::<Vec<_>>().join(", ")));
     }
     lines.join("\n")
+}
+
+/// What the Status table shows, a row each: the model, each head (its nozzle, temperature and
+/// the filament feeding it), the bed, the chamber, storage, errors.
+pub fn printer_rows(p: &fab_printer_link::Snapshot) -> Vec<(String, String)> {
+    let s = &p.state;
+    let mut rows = Vec::new();
+    let suffix = p.serial_suffix.as_ref().map(|s| format!(" · …{s}")).unwrap_or_default();
+    let mode = if p.virtual_printer { " · Virtual" } else { "" };
+    rows.push(("Model".to_string(), format!("{}{suffix}{mode}", p.model)));
+    // each head: its nozzle, its temperature and the filament feeding it (the telemetry's heads)
+    let mut heads: Vec<_> = s.heads().into_iter().filter_map(|e| e.id.map(|id| (id, Some(e)))).collect();
+    if !s.numbered_heads {
+        for id in [fab_printer_link::model::CloudNozzleId(1), fab_printer_link::model::CloudNozzleId(0)] {
+            if !heads.iter().any(|(head, _)| *head == id) && s.nozzles.iter().any(|n| n.id == Some(id)) {
+                heads.push((id, None));
+            }
+        }
+        heads.sort_by_key(|(id, _)| s.head_of(*id));
+    }
+    for (id, ext) in heads {
+        let Some(name) = s.head_name(id) else { continue };
+        let noz = s.nozzles.iter().find(|n| n.id == Some(id));
+        let nozzle = [noz.and_then(|n| n.diameter).map(|d| format!("{d:.1} mm")), noz.and_then(|n| n.kind.clone())]
+            .into_iter().flatten().collect::<Vec<_>>().join(" ");
+        let temp = ext.map(|e| temp_text(e.temperature)).filter(|t| t != "–");
+        let feed = match ext.and_then(|e| e.loaded) {
+            Some(fab_printer_link::model::LoadedSlot::Tray(tray)) => {
+                let material = s.tray(tray).and_then(|t| t.material.clone()).filter(|m| !m.is_empty()).unwrap_or_else(|| "filament".into());
+                Some(match tray.ams {
+                    _ if s.numbered_heads => material,
+                    254 | 255 => format!("{material} from the external spool"),
+                    a if a >= 128 => format!("{material} from AMS HT {}", a - 127),
+                    _ => format!("{material} from tray {}", super::colours::tray_text(tray)),
+                })
+            }
+            _ => None,
+        };
+        let value = [Some(nozzle).filter(|n| !n.is_empty()), temp, feed].into_iter().flatten().collect::<Vec<_>>().join(" · ");
+        rows.push((name, if value.is_empty() { "–".into() } else { value }));
+    }
+    rows.push(("Bed".to_string(), temp_text(s.bed)));
+    if s.chamber.current.is_some() {
+        rows.push(("Chamber".to_string(), temp_text(s.chamber)));
+    }
+    let storage = match s.storage {
+        _ if p.virtual_printer => Some("Simulated".to_string()),
+        Some(false) => Some("No USB drive: insert one to print".to_string()),
+        Some(true) => Some("USB drive".to_string()),
+        None if p.status == fab_printer_link::ConnectionStatus::Connected => Some("Not reported yet".to_string()),
+        None => None,
+    };
+    if let Some(storage) = storage {
+        rows.push(("Storage".to_string(), storage));
+    }
+    if let Some(e) = s.print_error.filter(|e| *e != 0) {
+        rows.push(("Error".to_string(), format!("{e:08X}")));
+    }
+    if !s.hms.is_empty() {
+        rows.push(("HMS".to_string(), s.hms.iter().map(|h| h.code()).collect::<Vec<_>>().join(", ")));
+    }
+    rows
+}
+
+/// The Status table's name column.
+const TABLE_NAME_W: f64 = 84.0;
+
+/// The Status table's rows (ten rows; a longer list puts the rest in the last).
+fn set_status_rows(cx: &mut Cx, card: &WidgetRef, rows: &[(String, String)]) {
+    let paths = [ids!(row0), ids!(row1), ids!(row2), ids!(row3), ids!(row4), ids!(row5), ids!(row6), ids!(row7), ids!(row8), ids!(row9)];
+    // more rows than the table has: the last one holds the rest, each named
+    let last = paths.len() - 1;
+    let spill = (rows.len() > paths.len()).then(|| rows[last..].iter().map(|(n, v)| format!("{n}: {v}")).collect::<Vec<_>>().join(" · "));
+    let shown = rows.len().min(paths.len());
+    for (i, path) in paths.into_iter().enumerate() {
+        let row = card.widget(cx, path);
+        row.set_visible(cx, i < rows.len());
+        if let Some(mut view) = row.borrow_mut::<View>() {
+            view.draw_bg.set_dyn_instance(cx, live_id!(odd), &[(i % 2) as f32]);
+            view.draw_bg.set_dyn_instance(cx, live_id!(last), &[u8::from(i + 1 == shown) as f32]);
+        }
+        match (&spill, rows.get(i)) {
+            (Some(rest), Some(_)) if i == last => {
+                row.label(cx, ids!(name)).set_text(cx, "More");
+                row.label(cx, ids!(value)).set_text(cx, rest);
+            }
+            (_, Some((name, value))) => {
+                row.label(cx, ids!(name)).set_text(cx, name);
+                row.label(cx, ids!(value)).set_text(cx, value);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Why printing is not offered, the last command's answer (the job card says it when it shows),
@@ -587,10 +1156,10 @@ impl FabSettingsPanel {
         let set_pick = |cx: &mut Cx, path: &[LiveId], text: &str| {
             v.view(cx, path).label(cx, ids!(label)).set_text(cx, if text.is_empty() { "—" } else { text });
         };
-        set_pick(cx, ids!(body.profile.source_row.source), if s.use_installed { "Installed profiles" } else { "Fab defaults" });
-        set_pick(cx, ids!(body.profile.machine_row.machine), &s.machine);
-        set_pick(cx, ids!(body.profile.plate_row.plate), if s.plate.is_empty() { NO_PLATE_FITS } else { &s.plate });
-        set_pick(cx, ids!(body.profile.process_row.process), &s.process);
+        set_pick(cx, ids!(profile.source_row.source), if s.use_installed { "Installed profiles" } else { "Fab defaults" });
+        set_pick(cx, ids!(profile.machine_row.machine), &s.machine);
+        set_pick(cx, ids!(profile.plate_row.plate), if s.plate.is_empty() { NO_PLATE_FITS } else { &s.plate });
+        set_pick(cx, ids!(profile.process_row.process), &s.process);
         // Each colour prints the material in its tray, with that material's settings. A material
         // whose colours the slice prints nothing in is not the job's.
         let prints = |i: usize| {
@@ -602,11 +1171,11 @@ impl FabSettingsPanel {
             format!("{at}: {}", m.preset)
         }).collect();
         let note = [materials.join("\n"), p.profiles.note.clone()].into_iter().filter(|t| !t.trim().is_empty()).collect::<Vec<_>>().join("\n");
-        v.label(cx, ids!(body.colours.note)).set_text(cx, note.trim());
+        v.label(cx, ids!(colours.note)).set_text(cx, note.trim());
 
         let (status, progress) = slice_status(p);
-        v.label(cx, ids!(body.slice.status_row.status)).set_text(cx, &status);
-        let bar = v.view(cx, ids!(body.slice.status_row.progress));
+        v.label(cx, ids!(slice.status_row.status)).set_text(cx, &status);
+        let bar = v.view(cx, ids!(slice.status_row.progress));
         bar.set_visible(cx, progress.is_some());
         if let Some(f) = progress {
             crate::ui::widgets::set_progress(cx, &bar, f as f32);
@@ -615,8 +1184,8 @@ impl FabSettingsPanel {
             Some(pv) if !p.stale => pv.summary.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("\n"),
             _ => String::new(),
         };
-        v.label(cx, ids!(body.slice.summary)).set_text(cx, &summary);
-        v.button(cx, ids!(body.slice.actions.export)).set_enabled(cx, !state.plate.parts.is_empty());
+        v.label(cx, ids!(slice.summary)).set_text(cx, &summary);
+        v.button(cx, ids!(slice.actions.export)).set_enabled(cx, !state.plate.parts.is_empty());
     }
 }
 
@@ -627,23 +1196,7 @@ impl Widget for FabSettingsPanel {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        if let Event::Actions(actions) = event {
-            if self.view.text_input(cx, ids!(editor_bar.search.row.input)).changed(actions).is_some() {
-                self.view.redraw(cx);
-            }
-        }
-        // a section held by its grip moves with the pointer, the others sliding aside
-        // (`section_reorder`): first, and with its animation's frames too
-        if matches!(event, Event::MouseDown(_) | Event::MouseMove(_) | Event::MouseUp(_) | Event::NextFrame(_)) {
-            let order: Vec<(LiveId, WidgetRef, WidgetRef)> = [(live_id!(profile_slot), live_id!(profile)), (live_id!(colours_slot), live_id!(colours)), (live_id!(slice_slot), live_id!(slice))]
-                .into_iter().map(|(slot, id)| (slot, self.view.widget(cx, &[id]), self.view.widget(cx, &[slot]))).collect();
-            crate::ui::widgets::section_reorder(cx, event, live_id!(job_sections), &order, self.view.area());
-        }
-        // the sections' headers first (their hover, and a drag across them folding them all)
-        if matches!(event, Event::MouseMove(_) | Event::MouseDown(_) | Event::MouseUp(_) | Event::MouseLeave(_) | Event::ClearHover) {
-            let sections = [ids!(profile), ids!(colours), ids!(slice)].map(|path| self.view.widget(cx, path));
-            crate::ui::widgets::section_headers(cx, event, &sections);
-        }
+        // (its sections' headers are the Printers editor's: `FabPrinterPanel::headers`)
         self.view.handle_event(cx, event, scope);
         let Event::Actions(actions) = event else { return };
         let Some(state) = scope.data.get::<AppState>() else { return };
@@ -654,7 +1207,7 @@ impl Widget for FabSettingsPanel {
         }
         self.picks(cx, actions, state);
         let v = &self.view;
-        if v.button(cx, ids!(body.slice.actions.export)).clicked(actions) {
+        if v.button(cx, ids!(slice.actions.export)).clicked(actions) {
             cx.action(PrintAction::Export);
         }
         if actions.iter().any(|a| a.downcast_ref::<PrintAction>().is_some_and(|a| !a.moves_playhead())) {
@@ -663,16 +1216,9 @@ impl Widget for FabSettingsPanel {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        // the sections in the order they were dragged into
-        let body = self.view.widget(cx, ids!(body));
-        crate::ui::widgets::apply_section_order(cx, live_id!(job_sections), &body);
         if let Some(state) = scope.data.get::<AppState>() {
             self.sync(cx, state);
         }
-        // the toolbar's search filters the sections' rows (`filter_sections`)
-        let query = self.view.text_input(cx, ids!(editor_bar.search.row.input)).text();
-        let sections = [ids!(profile), ids!(colours), ids!(slice)].map(|path| self.view.widget(cx, path));
-        crate::ui::widgets::filter_sections(cx, live_id!(job_sections), &query, &sections);
         self.view.draw_walk(cx, scope, walk)
     }
 }
@@ -701,6 +1247,12 @@ pub struct FabPrinterPanel {
     /// The stats' clock while a job runs.
     #[rust]
     tick: Timer,
+    /// The filter's words, as the last draw read them.
+    #[rust]
+    query_words: Vec<String>,
+    /// The Jobs tab shows (else the Printers tab).
+    #[rust]
+    jobs_view: bool,
 }
 
 fn choice_id(choice: &PrinterChoice) -> LiveId {
@@ -714,23 +1266,25 @@ impl FabPrinterPanel {
     fn sync_links(&mut self, cx: &mut Cx, p: &PrintState) {
         let links = &p.links;
         let label = if links.title.is_empty() { p.target_printer().map(|p| p.name.as_str()) } else { Some(links.title.as_str()) };
-        self.view.label(cx, ids!(body.link.picker.label)).set_text(cx, label.unwrap_or("No printer"));
+        self.view.label(cx, ids!(body.active.hdr.title)).set_text(cx, label.unwrap_or(""));
         self.mode_printer = match &links.picked {
             PrinterChoice::Real(config) if p.resin.is_none() && (p.target_printer().is_some() || links.disconnected) => Some(config.clone()),
             _ => None,
         };
-        let modes = self.view.view(cx, ids!(body.link.modes));
-        modes.set_visible(cx, self.mode_printer.is_some());
+        let modes = self.view.view(cx, ids!(body.active.modes));
+        self.view.view(cx, ids!(body.active.mode_row)).set_visible(cx, self.mode_printer.is_some());
         let disconnected = p.target_printer().map_or(links.disconnected, |s| s.virtual_printer);
         for (id, active) in [(ids!(connected), !disconnected), (ids!(disconnected), disconnected)] {
             let button = modes.radio_button(cx, id);
             if button.active(cx) != active { button.set_active(cx, active, Animate::No); }
         }
-        let note = self.view.label(cx, ids!(body.link_note));
+        let note = self.view.label(cx, ids!(body.active.link_note));
         note.set_visible(cx, !links.note.is_empty());
         note.set_text(cx, &links.note);
-        let card = self.view.view(cx, ids!(body.virtual_card));
+        let card = self.view.view(cx, ids!(body.active.virtual_card));
         card.set_visible(cx, links.layout.is_some() && p.resin.is_none());
+        // a printer with neither a link mode nor a virtual layout: nothing to set
+        self.view.label(cx, ids!(body.active.no_settings)).set_visible(cx, self.mode_printer.is_none() && (links.layout.is_none() || p.resin.is_some()));
         let Some(layout) = links.layout else { return };
         let nozzles = layout.kind == VirtualKind::Nozzles;
         card.label(cx, ids!(kind_row.kind.label)).set_text(cx, if nozzles { "Nozzles" } else { "Toolchanger" });
@@ -748,24 +1302,14 @@ impl FabPrinterPanel {
     fn link_actions(&self, cx: &mut Cx, actions: &Actions, p: &PrintState) {
         let links = &p.links;
         if let Some(config) = &self.mode_printer {
-            let modes = self.view.view(cx, ids!(body.link.modes));
+            let modes = self.view.view(cx, ids!(body.active.modes));
             if let Some(i) = modes.radio_button_set(cx, ids_array!(connected, disconnected)).selected(cx, actions) {
                 cx.action(PrintAction::PrinterMode(config.clone(), i == 1));
             }
         }
         for action in ui_actions(actions) {
             let FabUiAction::DropdownClicked { tag, anchor } = action else { continue };
-            let items = if *tag == live_id!(printer_link) {
-                let mut items: Vec<_> = links.choices.iter().map(|(choice, title)| {
-                    MenuItem::new(choice_id(choice), title)
-                        .checked(*choice == links.picked && (*choice != PrinterChoice::None || p.target_printer().is_none()))
-                }).collect();
-                if !links.twin_presets.is_empty() {
-                    let twins = links.twin_presets.iter().map(|preset| MenuItem::new(twin_id(preset), preset)).collect();
-                    items.push(MenuItem::new(live_id!(make_twin), "Virtual twin of…").flyout(twins));
-                }
-                items
-            } else if *tag == live_id!(virtual_kind) {
+            let items = if *tag == live_id!(virtual_kind) {
                 let Some(layout) = links.layout else { continue };
                 vec![MenuItem::new(live_id!(nozzles), "Nozzles").checked(layout.kind == VirtualKind::Nozzles),
                      MenuItem::new(live_id!(toolchanger), "Toolchanger").checked(layout.kind == VirtualKind::Toolchanger)]
@@ -774,12 +1318,22 @@ impl FabPrinterPanel {
             } else { continue };
             open_menu(cx, *tag, items, *anchor, MenuPlace::Below);
         }
-        if let Some(id) = menu_picked(actions, live_id!(printer_link)) {
-            if let Some((choice, _)) = links.choices.iter().find(|(choice, _)| choice_id(choice) == id) {
-                cx.action(PrintAction::LinkPrinter(choice.clone()));
-            } else if let Some(preset) = links.twin_presets.iter().find(|preset| twin_id(preset) == id) {
-                cx.action(PrintAction::MakeTwin(preset.clone()));
+        // Add printer: a virtual twin of a model (it is put in use), or how to add a network printer
+        if self.view.button(cx, ids!(editor_bar.add_printer)).clicked(actions) {
+            let anchor = self.view.widget(cx, ids!(editor_bar.add_printer)).area().rect(cx);
+            let twins: Vec<MenuItem> = links.twin_presets.iter().map(|preset| MenuItem::new(twin_id(preset), preset)).collect();
+            let mut items = Vec::new();
+            if twins.is_empty() {
+                items.push(MenuItem::new(live_id!(make_twin), "Virtual twin of…").disabled());
+            } else {
+                items.push(MenuItem::new(live_id!(make_twin), "Virtual twin of…").flyout(twins));
             }
+            items.push(MenuItem::sep());
+            items.push(MenuItem::new(live_id!(network_printer), "Network printer: its address and access code in ~/.makepad/fab/printers").disabled());
+            open_menu(cx, live_id!(add_printer), items, anchor, MenuPlace::Below);
+        }
+        if let Some(preset) = menu_picked(actions, live_id!(add_printer)).and_then(|id| links.twin_presets.iter().find(|preset| twin_id(preset) == id)) {
+            cx.action(PrintAction::MakeTwin(preset.clone()));
         }
         let Some(mut l) = links.layout else { return };
         if let Some(id) = menu_picked(actions, live_id!(virtual_reset)) {
@@ -788,7 +1342,7 @@ impl FabPrinterPanel {
             }
             return;
         }
-        let card = self.view.view(cx, ids!(body.virtual_card));
+        let card = self.view.view(cx, ids!(body.active.virtual_card));
         if let Some(id) = menu_picked(actions, live_id!(virtual_kind)) {
             let kind = if id == live_id!(nozzles) { VirtualKind::Nozzles } else { VirtualKind::Toolchanger };
             if l.kind == kind { return; }
@@ -817,34 +1371,44 @@ impl FabPrinterPanel {
             self.sync_resin(cx, state, r);
             return;
         }
-        v.view(cx, ids!(body.orient)).set_visible(cx, false);
+        v.widget(cx, ids!(body.orient)).set_visible(cx, false);
+        // calibration: for the printer and filament the job uses
+        let cal = &p.calibrate;
+        v.widget(cx, ids!(body.calibrate_part)).set_visible(cx, true);
+        v.label(cx, ids!(body.calibrate_part.cal_context)).set_text(cx, &if cal.printer.is_empty() || cal.filament.is_empty() {
+            "Choose a printer and filament in the Job editor".to_string()
+        } else {
+            format!("For {} · {}", cal.printer, cal.filament)
+        });
+        v.label(cx, ids!(body.calibrate_part.cal_status)).set_visible(cx, !cal.status.is_empty());
+        v.label(cx, ids!(body.calibrate_part.cal_status)).set_text(cx, &cal.status);
+        // the camera: in Status, or floating over the window (then a line and the way back)
+        v.widget(cx, ids!(body.card.pop_tip)).set_visible(cx, true);
+        v.view(cx, ids!(body.card.cam_box)).set_visible(cx, !state.ui.camera_pip);
+        v.view(cx, ids!(body.card.floating)).set_visible(cx, state.ui.camera_pip);
+        // no printer in use: what to do (pick one below, or add one)
+        let in_use = p.links.picked != PrinterChoice::None;
         let none = v.view(cx, ids!(body.none));
-        none.set_visible(cx, p.shown_printer().is_none());
-        none.label(cx, ids!(title)).set_text(cx, NO_PRINTER.0);
-        none.label(cx, ids!(text)).set_text(cx, NO_PRINTER.1);
+        none.set_visible(cx, !in_use);
+        let (title, text) = if listed(p).is_empty() { NO_PRINTERS } else { NO_PRINTER };
+        none.label(cx, ids!(title)).set_text(cx, title);
+        none.label(cx, ids!(text)).set_text(cx, text);
+        v.widget(cx, ids!(body.active)).set_visible(cx, in_use && self.active_shows(p));
+        let (pill_state, pill_text) = p.shown_printer().map_or((0.0, "Connecting".to_string()), |printer| printer_status(printer));
+        self.set_pill(cx, pill_state, &pill_text);
         for path in [ids!(body.card), ids!(body.trays_card)] {
-            v.view(cx, path).set_visible(cx, p.shown_printer().is_some());
+            v.widget(cx, path).set_visible(cx, p.shown_printer().is_some());
         }
-        v.view(cx, ids!(body.map_card)).set_visible(cx, true);
+        v.widget(cx, ids!(body.map_card)).set_visible(cx, true);
         let Some(printer) = p.shown_printer() else {
             v.view(cx, ids!(body.job)).set_visible(cx, false);
-            v.view(cx, ids!(body.confirm)).set_visible(cx, false);
-            v.view(cx, ids!(body.stats_card)).set_visible(cx, false);
+            v.widget(cx, ids!(body.confirm)).set_visible(cx, false);
+            v.widget(cx, ids!(body.stats_card)).set_visible(cx, false);
             return;
         };
         let s = &printer.state;
-        let card = v.view(cx, ids!(body.card));
-        card.label(cx, ids!(head.names.name)).set_text(cx, &printer.name);
-        let suffix = printer.serial_suffix.as_ref().map(|s| format!(" · …{s}")).unwrap_or_default();
-        let mode = if printer.virtual_printer { " · Virtual" } else { "" };
-        card.label(cx, ids!(head.names.model)).set_text(cx, &format!("{}{suffix}{mode}", printer.model));
-        let (pill_state, pill_text) = printer_status(printer);
-        let pill = card.view(cx, ids!(head.pill));
-        if let Some(mut pill) = pill.borrow_mut() {
-            pill.draw_bg.set_dyn_instance(cx, live_id!(state), &[pill_state as f32]);
-        }
-        pill.label(cx, ids!(text)).set_text(cx, &pill_text);
-        card.label(cx, ids!(telemetry)).set_text(cx, &printer_telemetry(printer));
+        let card = v.widget(cx, ids!(body.card));
+        set_status_rows(cx, &card, &printer_rows(printer));
         let supported = fab_printer_link::printing_supported();
         card.label(cx, ids!(note)).set_text(cx, &printer_note(printer, supported, job_card::job_view(p, Cx::time_now()).is_some()));
         card.view(cx, ids!(controls)).set_visible(cx, supported);
@@ -852,7 +1416,7 @@ impl FabPrinterPanel {
 
         // Everything the printer reports and the job's own numbers: Monitor's.
         let monitor = state.ui.in_mode(crate::api::PlateMode::Monitor);
-        let stats = v.view(cx, ids!(body.stats_card));
+        let stats = v.widget(cx, ids!(body.stats_card));
         stats.set_visible(cx, monitor);
         if monitor {
             let now = Cx::time_now();
@@ -881,7 +1445,7 @@ impl FabPrinterPanel {
 
         // The confirm card: open from the press until Cancel or Start print, whatever the slice is
         // doing; the app's checks decide what stands in the way.
-        let confirm = v.view(cx, ids!(body.confirm));
+        let confirm = v.widget(cx, ids!(body.confirm));
         confirm.set_visible(cx, supported && p.confirm_print);
         if supported && p.confirm_print {
             let row = confirm.view(cx, ids!(speed_row));
@@ -930,8 +1494,92 @@ impl FabPrinterPanel {
 }
 
 impl FabPrinterPanel {
+    /// Every folding section the editor shows: the printers before the one in use, it and its
+    /// parts with the calibration steps, then the printers after it. (`section_headers` sorts
+    /// them down the screen.)
+    fn headers(&self, cx: &Cx) -> Vec<WidgetRef> {
+        let v = &self.view;
+        let mut out = Vec::new();
+        if let Some(list) = v.widget(cx, ids!(body.before)).borrow::<FabPrinterSections>() {
+            out.extend(list.headers());
+        }
+        out.push(v.widget(cx, ids!(body.active)));
+        for path in [ids!(body.confirm), ids!(body.card), ids!(body.orient), ids!(body.stats_card),
+            ids!(body.trays_card), ids!(body.map_card), ids!(body.settings_box)] {
+            out.push(v.widget(cx, path));
+        }
+        if let Some(steps) = v.widget(cx, ids!(body.calibrate_part.steps)).borrow::<crate::print::calibrate::FabCalibrateSteps>() {
+            out.extend(steps.headers());
+        }
+        if let Some(list) = v.widget(cx, ids!(body.after)).borrow::<FabPrinterSections>() {
+            out.extend(list.headers());
+        }
+        if let Some(list) = v.widget(cx, ids!(jobs_body.jobs_before)).borrow::<FabPrinterJobs>() {
+            out.extend(list.headers());
+        }
+        for path in [ids!(jobs_body.jobs_active) as &[LiveId], ids!(jobs_body.job_settings.profile), ids!(jobs_body.job_settings.colours),
+            ids!(jobs_body.job_settings.slice), ids!(jobs_body.sent)] {
+            out.push(v.widget(cx, path));
+        }
+        if let Some(list) = v.widget(cx, ids!(jobs_body.jobs_after)).borrow::<FabPrinterJobs>() {
+            out.extend(list.headers());
+        }
+        out
+    }
+
+    /// The Jobs tab's section of the printer in use: its name, its jobs' count, the jobs sent to
+    /// it (its job, the Job panel, syncs itself); with none in use, what to do.
+    fn sync_job_tab(&self, cx: &mut Cx, p: &PrintState) {
+        use crate::print::job_list::{jobs_count, FabJobRows, JobsOf};
+        let v = &self.view;
+        let in_use = p.links.picked != PrinterChoice::None;
+        v.widget(cx, ids!(jobs_body.jobs_none)).set_visible(cx, !in_use);
+        let active = v.widget(cx, ids!(jobs_body.jobs_active));
+        active.set_visible(cx, in_use && self.active_shows(p));
+        let Some(id) = p.links.picked.id() else { return };
+        let title = p.links.choices.iter().find(|(c, _)| *c == p.links.picked).map(|(_, t)| t.clone()).unwrap_or_default();
+        active.label(cx, ids!(hdr.title)).set_text(cx, &title);
+        let of = JobsOf::Printer(id);
+        let (count, printing) = jobs_count(p, &of);
+        let (dot, text) = match count {
+            _ if printing => (2.0, format!("Printing · {count} jobs")),
+            0 => (1.0, "In use".to_string()),
+            1 => (1.0, "In use · 1 job".to_string()),
+            n => (1.0, format!("In use · {n} jobs")),
+        };
+        let pill = active.view(cx, ids!(pill));
+        if let Some(mut pill) = pill.borrow_mut() {
+            pill.draw_bg.set_dyn_instance(cx, live_id!(state), &[dot as f32]);
+        }
+        pill.label(cx, ids!(text)).set_text(cx, &text);
+        active.label(cx, ids!(sent_none)).set_visible(cx, count == 0);
+        if let Some(mut rows) = active.widget(cx, ids!(sent_rows)).borrow_mut::<FabJobRows>() {
+            rows.of = of;
+        }
+    }
+
+    /// The status pill in the header of the printer in use.
+    fn set_pill(&self, cx: &mut Cx, state: f64, text: &str) {
+        let pill = self.view.view(cx, ids!(body.active.pill));
+        if let Some(mut pill) = pill.borrow_mut() {
+            pill.draw_bg.set_dyn_instance(cx, live_id!(state), &[state as f32]);
+        }
+        pill.label(cx, ids!(text)).set_text(cx, text);
+    }
+
+    /// The editor's filter, its words lowercased.
+    fn query(&self, cx: &Cx) -> Vec<String> {
+        self.view.text_input(cx, ids!(editor_bar.search.row.input)).text().split_whitespace().map(|w| w.to_lowercase()).collect()
+    }
+
+    /// Whether the printer in use passes the filter.
+    fn active_shows(&self, p: &PrintState) -> bool {
+        let title = p.links.choices.iter().find(|(c, _)| *c == p.links.picked).map(|(_, t)| t.clone()).unwrap_or_default();
+        shows(&self.query_words, &title)
+    }
+
     /// Where the printability errors are, one press each: the confirm card's button. The errors.
-    fn show_issue(&self, cx: &mut Cx, confirm: &ViewRef, p: &PrintState) -> Vec<usize> {
+    fn show_issue(&self, cx: &mut Cx, confirm: &WidgetRef, p: &PrintState) -> Vec<usize> {
         let errors = p.print_errors();
         let show = confirm.button(cx, ids!(show_issue));
         show.set_visible(cx, !errors.is_empty());
@@ -953,8 +1601,13 @@ impl FabPrinterPanel {
         let p = &state.print;
         let v = &self.view;
         for path in [ids!(body.trays_card), ids!(body.stats_card), ids!(body.map_card)] {
-            v.view(cx, path).set_visible(cx, false);
+            v.widget(cx, path).set_visible(cx, false);
         }
+        // a resin printer has no camera on Fab's link, nor filament to calibrate
+        for path in [ids!(body.card.pop_tip), ids!(body.card.cam_box), ids!(body.card.floating)] {
+            v.widget(cx, path).set_visible(cx, false);
+        }
+        v.widget(cx, ids!(body.calibrate_part)).set_visible(cx, false);
         let job = p.resin_job.as_ref();
         let stick = r.route == Route::Stick;
         let none = v.view(cx, ids!(body.none));
@@ -971,16 +1624,22 @@ impl FabPrinterPanel {
         none.set_visible(cx, !title.is_empty());
         none.label(cx, ids!(title)).set_text(cx, title);
         none.label(cx, ids!(text)).set_text(cx, &text);
-        let card = v.view(cx, ids!(body.card));
+        // the resin printer's own section (the filament printers below it)
+        let active = v.widget(cx, ids!(body.active));
+        let card = v.widget(cx, ids!(body.card));
         let shown = match &r.linked {
             _ if stick => Some(r.printer.as_str()),
             Linked::Found(name) => Some(name.as_str()),
             _ => None,
         };
         card.set_visible(cx, shown.is_some());
-        if let Some(name) = shown {
-            card.label(cx, ids!(head.names.name)).set_text(cx, job.map_or(name, |j| j.printer.as_str()));
-            card.label(cx, ids!(head.names.model)).set_text(cx, if stick { "Prints from a USB stick" } else { "Resin printer on Fab's link" });
+        active.set_visible(cx, true);
+        active.label(cx, ids!(hdr.title)).set_text(cx, shown.map_or("Resin printer", |name| job.map_or(name, |j| j.printer.as_str())));
+        if shown.is_none() {
+            self.set_pill(cx, 0.0, "Not linked");
+        }
+        if let Some(_name) = shown {
+            set_status_rows(cx, &card, &[("Kind".to_string(), if stick { "Prints from a USB stick" } else { "Resin printer on Fab's link" }.to_string())]);
             let (pill_state, pill_text) = match job {
                 Some(j) if matches!(j.stage, ResinStage::Saving { .. }) => (2.0, "Saving"),
                 _ if stick => (1.0, "USB stick"),
@@ -989,12 +1648,7 @@ impl FabPrinterPanel {
                 Some(_) => (2.0, "Printing"),
                 None => (1.0, "Linked"),
             };
-            let pill = card.view(cx, ids!(head.pill));
-            if let Some(mut pill) = pill.borrow_mut() {
-                pill.draw_bg.set_dyn_instance(cx, live_id!(state), &[pill_state as f32]);
-            }
-            pill.label(cx, ids!(text)).set_text(cx, pill_text);
-            card.label(cx, ids!(telemetry)).set_text(cx, "");
+            self.set_pill(cx, pill_state, pill_text);
             card.label(cx, ids!(note)).set_text(cx, "");
             card.view(cx, ids!(controls)).set_visible(cx, false);
         }
@@ -1002,7 +1656,7 @@ impl FabPrinterPanel {
         v.widget(cx, ids!(body.job)).set_visible(cx, job.is_some() && !state.ui.in_mode(crate::api::PlateMode::Monitor));
 
         // the orientation test, for a printer that prints from a stick
-        let orient = v.view(cx, ids!(body.orient));
+        let orient = v.widget(cx, ids!(body.orient));
         orient.set_visible(cx, stick);
         orient.label(cx, ids!(text)).set_text(cx, resin::TEST_TEXT);
         let status = resin::test_status(r);
@@ -1011,7 +1665,7 @@ impl FabPrinterPanel {
         orient.button(cx, ids!(save)).set_visible(cx, !matches!(r.test, resin::TestFile::Saving { .. }));
 
         // the confirm card: open from the press until Cancel or Start print
-        let confirm = v.view(cx, ids!(body.confirm));
+        let confirm = v.widget(cx, ids!(body.confirm));
         confirm.set_visible(cx, p.confirm_print);
         if p.confirm_print {
             confirm.view(cx, ids!(speed_row)).set_visible(cx, false);
@@ -1052,10 +1706,23 @@ impl FabPrinterPanel {
 impl Widget for FabPrinterPanel {
     fn semantics(&self, _cx: &Cx, node: &mut a11y_tree::Node) {
         node.role = a11y_tree::Role::Group;
-        makepad_platform::a11y::set_string(&mut node.name, "Printer");
+        makepad_platform::a11y::set_string(&mut node.name, "Printers");
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        // asked for the job (the Force panel's link): the Jobs tab
+        if let Event::Actions(actions) = event {
+            if actions.iter().any(|a| a.downcast_ref::<ShowJobTab>().is_some()) {
+                self.jobs_view = true;
+                self.view.redraw(cx);
+            }
+        }
+        // every header in the editor (the printers', the in-use one's parts, its calibration
+        // steps): their hover, and a swipe across them folding them all, in one pass
+        if matches!(event, Event::MouseMove(_) | Event::MouseDown(_) | Event::MouseUp(_) | Event::MouseLeave(_) | Event::ClearHover) {
+            let headers = self.headers(cx);
+            crate::ui::widgets::section_headers(cx, event, &headers);
+        }
         if self.tick.is_event(event).is_some() {
             self.tick = Timer::empty();
             self.view.redraw(cx);
@@ -1067,8 +1734,18 @@ impl Widget for FabPrinterPanel {
             return;
         }
         let Some(state) = scope.data.get::<AppState>() else { return };
+        if self.view.text_input(cx, ids!(editor_bar.search.row.input)).changed(actions).is_some() {
+            self.view.redraw(cx);
+        }
+        // the Printers tab or the Jobs tab
+        for (path, jobs) in [(ids!(editor_bar.printers_tab), false), (ids!(editor_bar.jobs_tab), true)] {
+            if self.view.radio_button(cx, path).clicked(actions) && self.jobs_view != jobs {
+                self.jobs_view = jobs;
+                self.view.redraw(cx);
+            }
+        }
         self.link_actions(cx, actions, &state.print);
-        if self.view.view(cx, ids!(body.stats_card)).button(cx, ids!(raw_button)).clicked(actions) {
+        if self.view.widget(cx, ids!(body.stats_card)).button(cx, ids!(raw_button)).clicked(actions) {
             self.raw_open = !self.raw_open;
             self.view.redraw(cx);
         }
@@ -1088,7 +1765,7 @@ impl Widget for FabPrinterPanel {
             }
         }
         let v = &self.view;
-        let confirm = v.view(cx, ids!(body.confirm));
+        let confirm = v.widget(cx, ids!(body.confirm));
         if confirm.visible() {
             let row = confirm.view(cx, ids!(speed_row));
             if let Some(speed) = job_card::picked_speed(cx, &row, actions) {
@@ -1117,7 +1794,7 @@ impl Widget for FabPrinterPanel {
         if let Some(on) = confirm.check_box(cx, ids!(accept)).changed(actions) {
             cx.action(PrintAction::AcceptErrors(on));
         }
-        let card = v.view(cx, ids!(body.card));
+        let card = v.widget(cx, ids!(body.card));
         if let Some(dest) = &self.control_destination {
             if card.button(cx, ids!(controls.clear)).clicked(actions) {
                 cx.action(PrintAction::PrinterControl(dest.clone(), PrinterControl::ClearError));
@@ -1126,7 +1803,14 @@ impl Widget for FabPrinterPanel {
                 cx.action(PrintAction::PrinterControl(dest.clone(), PrinterControl::CheckStorage));
             }
         }
-        if v.view(cx, ids!(body.orient)).button(cx, ids!(save)).clicked(actions) {
+        // the camera pops out to float over the window, and back
+        if v.button(cx, ids!(body.card.pop_out)).clicked(actions) {
+            cx.action(crate::ui::stage::StageAction::CameraPip(!state.ui.camera_pip));
+        }
+        if v.button(cx, ids!(body.card.back)).clicked(actions) {
+            cx.action(crate::ui::stage::StageAction::CameraPip(false));
+        }
+        if v.widget(cx, ids!(body.orient)).button(cx, ids!(save)).clicked(actions) {
             cx.action(PrintAction::SaveOrientationTest);
         }
         if actions.iter().any(|a| a.downcast_ref::<PrintAction>().is_some_and(|a| !a.moves_playhead())) {
@@ -1135,6 +1819,28 @@ impl Widget for FabPrinterPanel {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        // the filter, for the printer in use and the others' sections
+        self.query_words = self.query(cx);
+        for path in [ids!(body.before), ids!(body.after)] {
+            if let Some(mut list) = self.view.widget(cx, path).borrow_mut::<FabPrinterSections>() {
+                list.query.clone_from(&self.query_words);
+            }
+        }
+        for path in [ids!(jobs_body.jobs_before), ids!(jobs_body.jobs_after)] {
+            if let Some(mut list) = self.view.widget(cx, path).borrow_mut::<FabPrinterJobs>() {
+                list.query.clone_from(&self.query_words);
+            }
+        }
+        // the tab shown, and its body
+        self.view.widget(cx, ids!(body)).set_visible(cx, !self.jobs_view);
+        self.view.widget(cx, ids!(jobs_body)).set_visible(cx, self.jobs_view);
+        for (path, on) in [(ids!(editor_bar.printers_tab), !self.jobs_view), (ids!(editor_bar.jobs_tab), self.jobs_view)] {
+            let tab = self.view.radio_button(cx, path);
+            if tab.active(cx) != on { tab.set_active(cx, on, Animate::No); }
+        }
+        if let Some(state) = scope.data.get::<AppState>() {
+            self.sync_job_tab(cx, &state.print);
+        }
         if let Some(state) = scope.data.get::<AppState>() {
             self.sync(cx, state);
         }

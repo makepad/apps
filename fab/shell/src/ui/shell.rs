@@ -231,19 +231,15 @@ script_mod! {
                 Part := FabPartPanel{}
                 Slicer := FabSlicerPanel{}
                 Overrides := FabOverridesPanel{}
-                TestPrints := FabTestPrintsPanel{}
                 Strength := FabStrengthPanel{}
                 Library := FabLibraryPanel{}
                 Checks := FabChecksPanel{}
                 Requirements := FabRequirementsPanel{}
                 Bom := FabBomPanel{}
                 BoardControls := FabBoardControlsPanel{}
-                Jobs := FabJobsPanel{}
                 Performance := FabPerfPanel{}
                 ModelSources := FabModelSources{}
-                Settings := FabSettingsPanel{}
                 Printer := FabPrinterPanel{}
-                Calibrate := FabCalibratePanel{}
                 Mechanics := FabMechanicsPanel{}
                 Features := FabFeaturesPanel{}
                 Steps := FabStepsPanel{}
@@ -1783,7 +1779,10 @@ impl FabShell {
             let dock = self.view.dock(cx, ids!(main.dock));
             let plates = self.areas.as_ref().map(|tree| tree.instances()).unwrap_or_default();
             for plate in plates.into_iter().map(|(_, i)| i).filter(|i| i.editor == Editor::Viewport) {
-                if dock.item(plate.tab()).radio_button(cx, ids!(render_row.view_bar.show_tools)).clicked(actions) {
+                let body = dock.item(plate.tab());
+                // (the plate's View options, or Mechanics' bar's toggle)
+                let asked = actions.iter().any(|a| a.downcast_ref::<crate::ui::stage::ToolRailsAsked>().is_some_and(|t| t.0 == plate));
+                if asked || body.radio_button(cx, ids!(mechanics_ui.mech_tools)).clicked(actions) {
                     cx.action(ShellAction::EditWorkspaces(ListOp::Region {
                         instance: plate, tools: Some(!ws.instance_state(plate).tools), left: None,
                     }));
@@ -2595,6 +2594,17 @@ impl FabShell {
             }
         }
         if screen != state.ui.screen {
+            // A Product view the dock stops showing (its tab behind another) parks, as one a
+            // layout leaves off screen does: an unparked one would keep the shared layers (the
+            // traced field parts) on the device's poses, so a part dragged on the plate would show
+            // where it was until the drop.
+            let device = 1u64 << Editor::Device as u64;
+            if state.ui.screen & device != 0 && screen & device == 0 {
+                for &(panel, park) in ELECTRONICS_PARK {
+                    let body = dock.borrow_mut().and_then(|mut dock| dock.items().get(&panel.tab()).map(|(_, body)| body.clone()));
+                    if let Some(body) = body { park(&body, cx); }
+                }
+            }
             state.ui.screen = screen;
             dock.redraw(cx);
         }

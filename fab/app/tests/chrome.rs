@@ -258,7 +258,7 @@ fn distinct_inset(frame: &Frame, x0: usize, y0: usize, x1: usize, y1: usize) -> 
 
 #[makepad_test]
 fn the_first_frame_centres_its_labels_and_keeps_composites_in_their_rects(app: TestApp) {
-    app.locator(workspace_row::tab("Design")).wait_visible();
+    app.locator(workspace_row::tab("3D modeling")).wait_visible();
     // `main` is the shell's root view: its rect is the window's content area,
     // in the same layout points every widget rect below uses.
     let shell = app.locator(Selector::id("main")).wait_visible().snapshot();
@@ -276,7 +276,7 @@ fn the_first_frame_centres_its_labels_and_keeps_composites_in_their_rects(app: T
     let to_px = |v: i64| ((v as f64) * dpi).round().max(0.0) as usize;
 
     // ---- 1. the workspace tabs' labels are ink-centred ---------------------
-    for id in ["Design", "Monitor", "Mechanics"] {
+    for id in ["3D modeling", "Monitor", "Mechanics"] {
         let snap = app.locator(workspace_row::tab(id)).snapshot();
         let delta = ink_offset(&frame, &snap, dpi, true);
         assert!(delta.abs() <= TOLERANCE_LPX, "label centring: `{id}`'s ink sits {delta:+.3} logical px off the box center (tolerance {TOLERANCE_LPX}); see {path:?}");

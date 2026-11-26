@@ -2233,8 +2233,9 @@ pub fn script_mod(vm: &mut ScriptVm) {
     job_card::script_mod(vm);
     job_stats::script_mod(vm);
     job_list::script_mod(vm);
-    panel::script_mod(vm);
+    // the calibration steps before the Printers editor, which shows them
     calibrate::script_mod(vm);
+    panel::script_mod(vm);
     resin::script_mod(vm);
 }
 

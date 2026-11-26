@@ -370,6 +370,11 @@ pub fn plate_info(c: Option<&Compiled>, ev: &Evaluated, revision: u64) -> PlateI
                 dropped: h.drop,
                 arriving: false,
                 triangles: p.mesh.triangles.len(),
+                engine: match ev.engine(i) {
+                    fab_model::eval::Engine::Exact => fab::api::PartEngine::Exact,
+                    fab_model::eval::Engine::Field => fab::api::PartEngine::Field,
+                    fab_model::eval::Engine::Mesh => fab::api::PartEngine::Mesh,
+                },
                 imported_mesh: c.is_some_and(|c| fab_ai::printable_tool::is_imported_mesh(c, &p.object)),
                 blocking: report.is_some_and(|r| r.blocking()),
                 issues: report.map(|r| r.issues.iter().map(|i| i.describe(&ev.machine)).collect()).unwrap_or_default(),

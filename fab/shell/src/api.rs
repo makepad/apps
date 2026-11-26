@@ -1225,7 +1225,7 @@ impl Workspace {
 
     pub fn label(self) -> &'static str {
         match self {
-            Workspace::Design => "Design",
+            Workspace::Design => "3D modeling",
             Workspace::Monitor => "Monitor",
             Workspace::Mechanics => "Mechanics",
             Workspace::Arm => "Arm",
@@ -1455,6 +1455,8 @@ pub struct UiState {
     pub show_zones: bool,
     /// The printer camera floating over the window (the Camera panel's Floating).
     pub camera_pip: bool,
+    /// The Test prints mode's sidebar of tests shows (the plate toolbar's Tests).
+    pub tests_sidebar: bool,
     pub gizmo: GizmoMode,
     pub paint_radius: f64,
     pub paint_color: [f32; 3],
@@ -1637,6 +1639,7 @@ impl Default for UiState {
             also_open: false,
             show_zones: false,
             camera_pip: false,
+            tests_sidebar: false,
             gizmo: GizmoMode::Off,
             paint_radius: 3.0,
             paint_color: [0.8, 0.05, 0.05],
@@ -1887,6 +1890,39 @@ impl PartialEq for PaintView {
     }
 }
 
+/// The engine that builds a part's solid (the model's three): what its edits can do and how
+/// exact its surfaces are. The parts list shows it as a pill.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PartEngine {
+    /// A mesh (CSG): triangles, also a solid of another engine a boolean took through the mesh.
+    #[default]
+    Mesh,
+    /// An exact body (B-rep): true faces and edges.
+    Exact,
+    /// A distance field (SDF): smooth blends, lattices, sculpting.
+    Field,
+}
+
+impl PartEngine {
+    /// The pill's word.
+    pub fn label(self) -> &'static str {
+        match self {
+            PartEngine::Mesh => "Mesh",
+            PartEngine::Exact => "Exact",
+            PartEngine::Field => "Field",
+        }
+    }
+
+    /// The pill's tooltip: what the engine is and what it is good at.
+    pub fn tip(self) -> &'static str {
+        match self {
+            PartEngine::Mesh => "Mesh engine (CSG): built from triangles. Imported models, and solids a boolean took through the mesh",
+            PartEngine::Exact => "Exact engine (B-rep): true faces and edges, so Round, Chamfer, Pull, Hole and Shell act on them precisely",
+            PartEngine::Field => "Field engine (SDF): a distance field, for smooth blends, lattices, sculpting and paint",
+        }
+    }
+}
+
 /// One placed part of the plate, as the parts list and the part panel
 /// show it. Positions are printer millimetres (Z up, bed origin).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1948,6 +1984,8 @@ pub struct PlatePart {
     /// they are dropped.
     pub arriving: bool,
     pub triangles: usize,
+    /// The engine that builds its solid.
+    pub engine: PartEngine,
     /// Its source imports a mesh asset that can be repaired.
     pub imported_mesh: bool,
     /// Off the volume or out of every nozzle's reach.

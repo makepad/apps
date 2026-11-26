@@ -56,7 +56,7 @@ impl Origin {
 
     pub fn name(self) -> &'static str {
         match self {
-            Origin::Design => "Design",
+            Origin::Design => "3D modeling",
             Origin::Mechanics => "Mechanics",
             Origin::Monitor => "Monitor",
             Origin::Arm => "Arm",
@@ -122,15 +122,15 @@ impl Origin {
                 let plate = T::split(Vertical, FromB(STEPS_H), plate(), T::area(Editor::Steps));
                 let centre = if code { T::split(Horizontal, FromB(width.unwrap_or(CODE_START_W)), plate, T::area(Editor::Code)) } else { plate };
                 let left = T::stack(&[Editor::Plates, Editor::Parts, Editor::Journal], 1);
-                let top = T::stack(&[Editor::Part, Editor::Slicer, Editor::Settings, Editor::Printer, Editor::Calibrate], 0);
-                let below = T::stack(&[Editor::Overrides, Editor::Strength, Editor::TestPrints], 0);
+                let top = T::stack(&[Editor::Part, Editor::Slicer, Editor::Printer], 0);
+                let below = T::stack(&[Editor::Overrides, Editor::Strength], 0);
                 let right = T::split(Vertical, Weighted(0.5), top, below);
                 T::split(Horizontal, FromA(250.0), left, T::split(Horizontal, FromB(320.0), centre, right))
             }
             Origin::Mechanics => T::split(Horizontal, FromB(320.0), plate(), T::area(Editor::Mechanics)),
             Origin::Monitor => {
-                // (the printer's camera floats over the window: the title bar's camera button)
-                T::split(Horizontal, FromB(460.0), plate(), T::stack(&[Editor::Printer, Editor::Calibrate], 0))
+                // (the printer's camera, its calibration: its section in Printers)
+                T::split(Horizontal, FromB(460.0), plate(), T::area(Editor::Printer))
             }
             Origin::Arm => T::split(Horizontal, FromB(380.0), T::stack(&[Editor::ArmCell, Editor::ArmCompare], 0), T::area(Editor::Arm)),
             Origin::Scan => T::split(Horizontal, FromB(340.0), T::area(Editor::ScanView), T::area(Editor::Scan)),
@@ -856,7 +856,9 @@ impl Workspaces {
                 (None, None) => return None,
             };
             let tree = without_retired(tree);
-            tree.whole().then_some(WorkspaceDef { id: d.id, name: d.name, mode: d.mode, origin: d.origin, shape: 0, tree, maximized: None })
+            // a default still under its old name takes the new one ("Design" is "3D modeling")
+            let name = if d.origin == Some(Origin::Design) && d.name == "Design" { Origin::Design.name().to_string() } else { d.name };
+            tree.whole().then_some(WorkspaceDef { id: d.id, name, mode: d.mode, origin: d.origin, shape: 0, tree, maximized: None })
         }).collect::<Option<_>>()?;
         if list.is_empty() {
             return None;

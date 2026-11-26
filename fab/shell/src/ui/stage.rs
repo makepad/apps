@@ -84,15 +84,7 @@ script_mod! {
         height: Fit
         cursor: MouseCursor.Default
         show_bg: true
-        draw_bg +: {
-            pixel: fn() {
-                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
-                sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, fab.radius_lg)
-                sdf.fill_keep(fab.color_float)
-                sdf.stroke(fab.color_float_border, 1.0)
-                return sdf.result
-            }
-        }
+        draw_bg: mod.draw.FabFloatBg{}
     }
     // The slice status chip's floating face, sized for a pane caption.
     let PaneLabel = Float{
@@ -106,29 +98,44 @@ script_mod! {
         label := mod.widgets.FabLabelSmall{ text: "" }
     }
     let Tool = mod.widgets.FabTool{}
-    // A render mode, styled as the panels' tabs: no face, its name half-lit at rest and lit
-    // under the pointer, the chosen one in the full ink over an accent underline.
-    let RenderSegment = mod.widgets.FabSegmentTab{
-        height: 24
-        padding: Inset{left: 10 right: 10 top: 0 bottom: 0}
+    // A toggle of the view bar, as tall as the render switch's segments.
+    // A tile of View options' grid: its icon over its name, lit (the accent, black ink) while on.
+    let OptionTile = mod.widgets.FabIconCheck{
+        width: 88 height: 60
+        flow: Down align: Align{x: 0.5 y: 0.5}
+        padding: Inset{left: 4 right: 4 top: 8 bottom: 6}
+        icon_walk: Walk{width: 18 height: 18}
+        label_walk: Walk{width: Fit height: Fit margin: Inset{top: 6}}
+        draw_text +: {
+            color: fab.color_text
+            color_active: fab.color_text_on_accent
+            text_style: theme.font_regular{font_size: fab.font_size_small}
+        }
+    }
+    // A pill of the view pie: its name on the floating cards' ground, lit (the accent, black
+    // ink) while the pointer points at it (`hot`).
+    let PiePill = View{
+        width: #(PIE_PILL.x) height: #(PIE_PILL.y)
+        align: Align{x: 0.5 y: 0.5}
+        show_bg: true
         draw_bg +: {
+            hot: instance(0.0)
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
-                sdf.box(6.0, self.rect_size.y - 2.0, self.rect_size.x - 12.0, 2.0, 0.5)
-                sdf.fill(vec4(fab.color_accent.xyz, fab.color_accent.w * self.active))
+                sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, self.rect_size.y * 0.5 - 0.5)
+                sdf.fill_keep(mix(fab.color_float, fab.color_accent, self.hot))
+                sdf.stroke(fab.color_float_border, 1.0)
                 return sdf.result
             }
         }
-        draw_text +: {
-            color: mix(fab.color_text_dim, fab.color_text, 0.5)
-            color_hover: fab.color_text
-            color_down: fab.color_text
-            color_active: fab.color_text_active
-            // (the one just clicked keeps the keyboard: it reads as chosen, not as rest)
-            color_focus: fab.color_text_active
+        label := mod.widgets.FabLabel{
+            text: ""
+            draw_text +: {
+                hot: instance(0.0)
+                get_color: fn() { return mix(fab.color_text, fab.color_text_on_accent, self.hot) }
+            }
         }
     }
-    // A toggle of the view bar, as tall as the render switch's segments.
     let ViewToggle = mod.widgets.FabIconCheck{
         width: 28
         height: 24
@@ -226,16 +233,39 @@ script_mod! {
                         t_settings_here := Tool{ a11y: {label: "Print settings here"} draw_icon +: { svg: crate_resource("self://resources/icons/settings_here.svg") } }
                     }
                     Sep{}
-                    // an action, not a tool: a button the size of the tools
-                    FabTip{ text: "Arrange every part on the plate"
-                        arrange_all := mod.widgets.FabIconButton{
-                            width: 32 height: 32
-                            align: Align{x: 0.5 y: 0.5}
-                            padding: Inset{left: 8 right: 8 top: 8 bottom: 8}
-                            icon_walk: Walk{width: 16 height: 16}
-                            a11y: {label: "Arrange plate"}
-                            draw_icon +: { svg: crate_resource("self://resources/icons/arrange.svg") }
+                    // Arrange: its row across the top (the gap, and the button that arranges)
+                    FabTip{ text: "Arrange every part on the plate: set the gap, then Arrange"
+                        arrange_all := Tool{ independent: true a11y: {label: "Arrange plate"} draw_icon +: { svg: crate_resource("self://resources/icons/arrange.svg") } }
+                    }
+                }
+            }
+            // Test prints: the tests and their properties in a floating sidebar at the view's bottom
+            // right (the toolbar's Tests), growing upward no higher than under the gizmo's column
+            tests_side := View{
+                visible: false
+                width: Fill height: Fill flow: Right
+                align: Align{x: 1.0 y: 1.0}
+                padding: Inset{top: #(crate::ui::area_notch::TOOLBAR_H + 116.0) right: 10 bottom: 10}
+                // as high as its tests need, never past the view's room
+                tests_card := Float{
+                    width: 380 height: Fit{max: FitBound.Rel{base: Base.Full factor: 1.0}} flow: Down
+                    padding: Inset{left: 4 right: 4 top: 6 bottom: 6}
+                    View{
+                        width: Fill height: Fit flow: Right align: Align{y: 0.5}
+                        padding: Inset{left: 8 right: 2 bottom: 4}
+                        mod.widgets.FabLabel{ width: Fill text: "Tests" draw_text +: { text_style: theme.font_bold{font_size: fab.font_size_ui} } }
+                        side_add_tip := FabTip{ text: #(crate::ui::test_prints::ADD_TIP)
+                            side_add := ViewButton{ a11y: {label: "Add test cube"} draw_icon +: { svg: crate_resource("self://resources/icons/plus.svg") } }
                         }
+                        FabTip{ text: "Close the tests"
+                            tests_close := ViewButton{ a11y: {label: "Close tests"} draw_icon +: { svg: crate_resource("self://resources/icons/close.svg") } }
+                        }
+                    }
+                    tests_totals := mod.widgets.FabLabelSmall{ visible: false width: Fill margin: Inset{left: 8 right: 8 bottom: 4} text: "" }
+                    tests_scroll := mod.widgets.FabScroll{
+                        height: Fit{max: FitBound.Rel{base: Base.Full factor: 1.0}}
+                        padding: Inset{left: 2 right: 2 top: 0}
+                        tests := mod.widgets.FabTestSections{}
                     }
                 }
             }
@@ -252,7 +282,7 @@ script_mod! {
                         visible: false
                         flow: Right
                         align: Align{y: 0.5}
-                        padding: 3
+                        padding: Inset{left: 8 right: 8 top: 3 bottom: 3}
                         spacing: 1
                         a11y: {role: "radio_group" label: "Paint tools"}
                         FabTip{ text: #(format!("{}: drag on a part. Hold {} to erase", keymap::tooltip(Key::PaintBrush), keymap::shortcut(Key::PaintInvert)))
@@ -312,7 +342,7 @@ script_mod! {
                         visible: false
                         flow: Right
                         align: Align{y: 0.5}
-                        padding: 3
+                        padding: Inset{left: 8 right: 8 top: 3 bottom: 3}
                         spacing: 1
                         a11y: {role: "radio_group" label: "Shape tools"}
                         // What a click picks (for the AI's chat): the kind filter.
@@ -373,7 +403,7 @@ script_mod! {
                         visible: false
                         flow: Right
                         align: Align{y: 0.5}
-                        padding: 3
+                        padding: Inset{left: 8 right: 8 top: 3 bottom: 3}
                         spacing: 1
                         a11y: {role: "radio_group" label: "Sculpt tools"}
                         FabTip{ text: #(format!("{}: drag on a part. Hold {} to lower", keymap::tooltip(Key::SculptRaise), keymap::shortcut(Key::SculptInvert)))
@@ -391,6 +421,25 @@ script_mod! {
                         }
                         FabTip{ text: "Sculpt strength (0.1 to 1.0): drag up or down, or scroll"
                             strength := mod.widgets.FabBrushDial{ width: 38 sculpt: true strength: true }
+                        }
+                    }
+                    // Arrange: the room it keeps between parts, and the button that arranges them all.
+                    arrange_bar := ToolRow{
+                        visible: false
+                        flow: Right
+                        align: Align{y: 0.5}
+                        padding: Inset{left: 8 right: 4 top: 3 bottom: 3}
+                        spacing: 6
+                        a11y: {label: "Arrange"}
+                        FabTip{ text: "The gap Arrange keeps between parts"
+                            arrange_gap := mod.widgets.ValueInput{width: 110 height: 26 label: "Gap" a11y: {label: "Arrange gap"} min: 0.0 max: 0.0 step: 0.5 precision: 1 suffix: " mm"}
+                        }
+                        FabTip{ text: "Arrange every part on the plate with this gap"
+                            arrange_go := mod.widgets.FabButtonAccent{ text: "Arrange" height: 26 padding: Inset{left: 12 right: 12} }
+                        }
+                        VSep{}
+                        FabTip{ text: "Done arranging"
+                            arrange_done := ViewButton{ a11y: {label: "Done arranging"} draw_icon +: { svg: crate_resource("self://resources/icons/close.svg") } }
                         }
                     }
                     // Measure Fit: turn the fitted part a quarter, or clear the fit.
@@ -414,7 +463,7 @@ script_mod! {
                         visible: false
                         flow: Right
                         align: Align{y: 0.5}
-                        padding: 3
+                        padding: Inset{left: 8 right: 8 top: 3 bottom: 3}
                         spacing: 1
                         a11y: {role: "radio_group" label: "Force kinds"}
                         FabTip{ text: #(format!("{}. {} reads a hole's wall as a face", keymap::tooltip(Key::ForceFixed), keymap::shortcut(Key::ForceFlip)))
@@ -665,46 +714,12 @@ script_mod! {
             height: Fit
             flow: Down
             // The plate view's toolbar, as every editor's: the area's editor selector (the notch
-            // layer draws it at the bar's left end), then the plate's mode with the render mode
-            // beside it (as tabs), what makes and changes parts, and what the view shows, in
-            // groups apart by rules.
+            // layer draws it at the bar's left end), what makes and changes parts, Test prints'
+            // group; at its right end what the view shows: the plate's mode, the render mode and
+            // the view's options, a rule before the area's close.
             // A held job keeps only the mode (it has no other look); Mechanics has its own bar.
             modes_row := mod.widgets.FabEditorBar{
                 // (a solid bar over the view, as every editor's toolbar)
-                mode_card := View{
-                    width: Fit height: Fit flow: Right align: Align{y: 0.5}
-                    FabTip{ text: "What the plate is for: Design edits it, Mechanics runs it in a physics sim, Monitor shows the printer's job. It stays as it is across workspaces."
-                        plate_mode := mod.widgets.FabDropdownButton{
-                            height: 24
-                            a11y: {label: "Plate mode"}
-                            tag: @fab_plate_mode
-                            owner: @fab_plate_mode
-                            label +: { text: "Design" }
-                        }
-                    }
-                }
-                render_modes := View{
-                    a11y: {role: "radio_group" label: "Render mode"}
-                    width: Fit height: Fit flow: Right align: Align{y: 0.5} spacing: 1
-                    normal_tip := FabTip{ text: #(format!("The parts, in the look View › Shading sets ({})", keymap::shortcut(Key::SliceView)))
-                        rm_normal := RenderSegment{ text: "Normal" }
-                    }
-                    slice_tip := FabTip{ text: #(format!("The sliced print over the plate: edit and it reslices live ({})", keymap::shortcut(Key::SliceView)))
-                        rm_slice := RenderSegment{ text: "Sliced" }
-                    }
-                    force_tip := FabTip{ text: "The selected part's stress as it will print, under the fixtures and loads you put on it: edit and it is studied again"
-                        rm_force := RenderSegment{ text: "Force" }
-                    }
-                }
-                colour_rule := mod.widgets.FabVRule{}
-                // The plate's colours: the model's own, or the loaded materials' (Material colours).
-                colour_modes := View{
-                    a11y: {role: "radio_group" label: "Plate colours"}
-                    width: Fit height: Fit flow: Right align: Align{y: 0.5} spacing: 1
-                    model_colours := RenderSegment{ text: "Model colours" a11y: {label: "Model colours"} }
-                    material_colours := RenderSegment{ text: "Material colours" a11y: {label: "Material colours"} }
-                }
-                create_rule := mod.widgets.FabVRule{}
                 // What makes and changes parts: Add (a new part) and Modify (the selected part's
                 // features and shape edits). Handled for the app (`main`).
                 create_card := View{
@@ -725,39 +740,80 @@ script_mod! {
                             label +: { text: "Modify" }
                         }
                     }
+                    // the selected part down onto the bed
+                    FabTip{ text: "Drop to plate: sit the selected part on the bed"
+                        drop_part := ViewButton{ a11y: {label: "Drop to plate"} draw_icon +: { svg: crate_resource("self://resources/icons/drop.svg") } }
+                    }
+                }
+                // Test prints: a cube on the picked part, and the tests' sidebar
+                tests_rule := mod.widgets.FabVRule{ visible: false }
+                tests_group := View{
+                    visible: false
+                    width: Fit height: Fit flow: Right align: Align{y: 0.5} spacing: 1
+                    add_test_tip := FabTip{ text: #(crate::ui::test_prints::ADD_TIP)
+                        add_test := ViewButton{ a11y: {label: "Add test cube"} draw_icon +: { svg: crate_resource("self://resources/icons/add_box.svg") } }
+                    }
+                    FabTip{ text: "Tests: the test prints and their properties, in a sidebar at the view's right"
+                        tests_toggle := ViewToggle{
+                            width: Fit
+                            padding: Inset{left: 6 right: 8 top: 4 bottom: 4}
+                            text: "Tests"
+                            label_walk: Walk{width: Fit height: Fit margin: Inset{left: 5}}
+                            a11y: {label: "Tests"}
+                            draw_icon +: { svg: crate_resource("self://resources/icons/cut_box.svg") }
+                            draw_text +: {
+                                color: fab.color_text
+                                color_active: fab.color_text_on_accent
+                                text_style: theme.font_regular{font_size: fab.font_size_ui}
+                            }
+                        }
+                    }
+                }
+                // The view's options (what it shows, its framing, the filament colours) in their
+                // flyout, at the bar's right end before the area's close, a rule between
+                Filler{}
+                // why the colours shown are not what will print (a missing spool's colour, ...):
+                // a warning mark, the reason in its tooltip
+                colour_notice_tip := FabTip{
+                    colour_notice := View{
+                        visible: false width: 24 height: 24 align: Align{x: 0.5 y: 0.5}
+                        cursor: MouseCursor.Hand
+                        FabIconSmall{ icon_walk: Walk{width: 14 height: 14} draw_icon +: { color: fab.color_warning svg: crate_resource("self://resources/icons/warning.svg") } }
+                    }
+                }
+                // what the view shows: the plate's mode, its render mode (Normal, Sliced, Force) and
+                // the view's options, together at the bar's right end
+                mode_card := View{
+                    width: Fit height: Fit flow: Right align: Align{y: 0.5}
+                    FabTip{ text: "What the plate is for: Design edits it, Mechanics runs it in a physics sim, Monitor shows the printer's job. It stays as it is across workspaces."
+                        plate_mode := mod.widgets.FabDropdownButton{
+                            height: 24
+                            a11y: {label: "Plate mode"}
+                            tag: @fab_plate_mode
+                            owner: @fab_plate_mode
+                            label +: { text: "Design" }
+                        }
+                    }
+                }
+                render_tip := FabTip{ text: #(format!("How the plate shows: Normal, Sliced (the print over the plate, reslicing live as you edit) or Force (the selected part's stress) ({})", keymap::shortcut(Key::SliceView)))
+                    render_mode := mod.widgets.FabDropdownButton{
+                        height: 24
+                        a11y: {label: "Render mode"}
+                        tag: @fab_render_mode
+                        owner: @fab_render_mode
+                        label +: { text: "Normal" }
+                    }
+                }
+                FabTip{ text: "View options: the tool rails, the projection, framing, the filament colours and what the slice shows"
+                    view_options := mod.widgets.FabDropdownButton{
+                        a11y: {label: "View options"}
+                        tag: @fab_view_options
+                        owner: @fab_view_options
+                        height: 24
+                        label +: { text: "View options" }
+                    }
                 }
                 view_rule := mod.widgets.FabVRule{}
-                // What the view shows in this mode: the View menu's toggles, with its keys.
-                view_bar := View{
-                    a11y: {role: "toolbar" label: "View"}
-                    width: Fit height: Fit flow: Right align: Align{y: 0.5} spacing: 1
-                    // the view's tool rails, on or off (its area menu's Tools)
-                    FabTip{ text: "Show the tool rails at the view's left"
-                        show_tools := ViewToggle{ a11y: {label: "Tools"} draw_icon +: { svg: crate_resource("self://resources/icons/select.svg") } }
-                    }
-                    // the projection, in every mode (on: orthographic)
-                    FabTip{ text: #(keymap::tooltip(Key::Ortho))
-                        ortho := ViewToggle{ a11y: {label: "Orthographic"} draw_icon +: { svg: crate_resource("self://resources/icons/ortho.svg") } }
-                    }
-                    // the whole plate back in view, in every mode
-                    FabTip{ text: #(keymap::tooltip(Key::FrameAll))
-                        frame_all := ViewButton{ a11y: {label: "Frame plate"} draw_icon +: { svg: crate_resource("self://resources/icons/fit.svg") } }
-                    }
-                    // Sliced: what the slice shows
-                    supports_tip := FabTip{ text: #(keymap::tooltip(Key::ShowSupports))
-                        show_supports := ViewToggle{ a11y: {label: "Show supports"} draw_icon +: { svg: crate_resource("self://resources/icons/supports.svg") } }
-                    }
-                    travel_tip := FabTip{ text: "Show travel"
-                        show_travel := ViewToggle{ a11y: {label: "Show travel"} draw_icon +: { svg: crate_resource("self://resources/icons/travel.svg") } }
-                    }
-                    parts_tip := FabTip{ text: "Show parts under the toolpaths"
-                        show_parts := ViewToggle{ a11y: {label: "Show parts"} draw_icon +: { svg: crate_resource("self://resources/icons/cube.svg") } }
-                    }
-                    // a project with a board: the board in place, never printed
-                    board_tip := FabTip{ text: "Show the circuit board in place: it is never printed or sliced"
-                        show_board := ViewToggle{ a11y: {label: "Show board"} draw_icon +: { svg: crate_resource("self://resources/icons/board.svg") } }
-                    }
-                }
             }
             // View › See-Through's opacity and glow, while it is on
             see_row := Float{
@@ -791,15 +847,6 @@ script_mod! {
                     see_glow := mod.widgets.Slider{ width: 110 height: 18 text: "" min: 0.0 max: 1.0 step: 0.01 default: 0.35 precision: 2 }
                 }
             }
-            // why the colours shown are not what will print (a missing spool's colour, ...)
-            colour_panel := View{
-                width: Fill height: Fit flow: Down align: Align{x: 0.5}
-                padding: Inset{top: 4 left: 40 right: 40}
-                colour_notice := mod.widgets.FabLabelSmall{
-                    width: Fill height: Fit visible: false align: Align{x: 0.5}
-                    flow: Right{wrap: true} text: ""
-                }
-            }
         }
         nav := View{
             width: Fill
@@ -815,6 +862,86 @@ script_mod! {
                 align: Align{x: 0.5}
                 spacing: 4
                 gizmo := FabNavGizmo{ width: 96 }
+            }
+        }
+        // The view pie (Q held): the views round the pointer, each where the view looks from (Top
+        // up, Right right, …), Frame selected low right, Frame all low left; releasing Q there
+        // takes it (`FabStage::pie`)
+        pie_layer := View{
+            visible: false
+            width: Fill height: Fill flow: Overlay
+            pie_hub := View{
+                width: #(PIE_HUB) height: #(PIE_HUB)
+                show_bg: true
+                draw_bg +: {
+                    pixel: fn() {
+                        let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                        let r = self.rect_size.x * 0.5
+                        sdf.circle(r, r, r - 1.0)
+                        sdf.fill_keep(fab.color_float)
+                        sdf.stroke(fab.color_float_border, 1.0)
+                        sdf.circle(r, r, 2.5)
+                        sdf.fill(fab.color_text)
+                        return sdf.result
+                    }
+                }
+            }
+            pie0 := PiePill{ label +: { text: "Top" } }
+            pie1 := PiePill{ label +: { text: "Back" } }
+            pie2 := PiePill{ label +: { text: "Right" } }
+            pie3 := PiePill{ label +: { text: "Frame selected" } }
+            pie4 := PiePill{ label +: { text: "Bottom" } }
+            pie5 := PiePill{ label +: { text: "Frame all" } }
+            pie6 := PiePill{ label +: { text: "Left" } }
+            pie7 := PiePill{ label +: { text: "Front" } }
+        }
+        // View options' flyout: a card under its button at the toolbar's right end, a grid of
+        // tiles (icon and name, lit while on); what the slice shows and the board only when they
+        // apply. A press outside it, Escape or the button again closes it.
+        view_flyout := View{
+            visible: false
+            width: Fill height: Fill flow: Right
+            align: Align{x: 1.0 y: 0.0}
+            padding: Inset{top: #(crate::ui::area_notch::TOOLBAR_H + 4.0) right: 44}
+            options_card := Float{
+                width: 284 height: Fit flow: Down
+                padding: 6 spacing: 6
+                grid := View{
+                    width: Fill height: Fit flow: Right{wrap: true} spacing: 2
+                        FabTip{ text: "The tool rails at the view's left"
+                            o_rails := OptionTile{ text: "Tool rails" a11y: {label: "Tool rails"} draw_icon +: { svg: crate_resource("self://resources/icons/select.svg") } }
+                        }
+                        FabTip{ text: #(keymap::tooltip(Key::Ortho))
+                            o_ortho := OptionTile{ text: "Orthographic" a11y: {label: "Orthographic"} draw_icon +: { svg: crate_resource("self://resources/icons/ortho.svg") } }
+                        }
+                        FabTip{ text: #(keymap::tooltip(Key::FrameAll))
+                            o_frame_all := OptionTile{ text: "Frame plate" a11y: {label: "Frame plate"} draw_icon +: { svg: crate_resource("self://resources/icons/fit.svg") } }
+                        }
+                        FabTip{ text: #(keymap::tooltip(Key::FrameSelected))
+                            o_frame_sel := OptionTile{ text: "Frame selected" a11y: {label: "Frame selected"} draw_icon +: { svg: crate_resource("self://resources/icons/frame_sel.svg") } }
+                        }
+                        FabTip{ text: "Each part in the colour of the filament it prints with (off: the model's own colours)"
+                            o_colours := OptionTile{ text: "Filament colours" a11y: {label: "Filament colours"} draw_icon +: { svg: crate_resource("self://resources/icons/palette.svg") } }
+                        }
+                        FabTip{ text: "Show the circuit board in place: it is never printed or sliced"
+                            o_board := OptionTile{ text: "Circuit board" a11y: {label: "Circuit board"} draw_icon +: { svg: crate_resource("self://resources/icons/board.svg") } }
+                        }
+                }
+                slice_title := mod.widgets.FabLabelSmall{ visible: false margin: Inset{left: 4 top: 2} text: "SLICE" }
+                slice_grid := View{
+                    visible: false
+                    width: Fill height: Fit flow: Right{wrap: true} spacing: 2
+                        FabTip{ text: #(keymap::tooltip(Key::ShowSupports))
+                            o_supports := OptionTile{ text: "Supports" a11y: {label: "Supports"} draw_icon +: { svg: crate_resource("self://resources/icons/supports.svg") } }
+                        }
+                        FabTip{ text: "Show travel"
+                            o_travel := OptionTile{ text: "Travel" a11y: {label: "Travel"} draw_icon +: { svg: crate_resource("self://resources/icons/travel.svg") } }
+                        }
+                        FabTip{ text: "Show the parts under the toolpaths"
+                            o_parts := OptionTile{ text: "Parts" a11y: {label: "Parts"} draw_icon +: { svg: crate_resource("self://resources/icons/cube.svg") } }
+                        }
+                }
+                notice := mod.widgets.FabLabelSmall{ visible: false width: Fill margin: Inset{left: 4 right: 4} text: "" draw_text +: { color: fab.color_warning } }
             }
         }
         // Beside the primary tool rail, still in the pane's top-left corner.
@@ -847,15 +974,17 @@ struct StageDrawKeys {
     /// Visibility of the model bottom, render and slice rows, resin, camera and progress overlays.
     chrome: Option<ChromeKey>,
     /// The three slice tips and toggles and this pane's orthographic toggle.
-    view_bar: Option<ViewBarKey>,
-    /// The plate colours' segments and the notice under the toolbar.
-    colours: Option<(fab_plate::ColourMode, (usize, bool), bool, usize, bool, bool, crate::print::ColorBy, bool, bool)>,
-    /// The board tip and toggle, including the scan for boards and their visibility.
-    board_revision: Option<u64>,
+    /// The plate's mode label, Test prints' toolbar group and its sidebar (the mode, the
+    /// sidebar open in the lead pane, a part picked, the print's revision for the totals).
+    tests: Option<(Option<PlateMode>, bool, bool, bool, u64)>,
+    /// The colours' warning mark beside View options (why they differ from the print's).
+    colours: Option<(fab_plate::ColourMode, (usize, bool), bool, usize, bool, bool, crate::print::ColorBy, bool)>,
     /// The three Design tool buttons and the paint, shape, sculpt and force strips and their controls.
     tools: Option<ToolBarsKey>,
     /// Visibility of the see-through row.
     see_row: Option<bool>,
+    /// Frame selected's and Drop's enabled states (a part picked; and the plate editable).
+    part_actions: Option<(bool, bool)>,
     /// The active-part lookup for the existing tool rail key.
     has_part: Option<((u64, u64, u64), bool)>,
     /// The layer and height lookups for the slice's layer label.
@@ -958,21 +1087,13 @@ struct ChromeKey {
     camera_pip: bool,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-struct ViewBarKey {
-    sliced: bool,
-    resin: bool,
-    finish: bool,
-    supports: bool,
-    travel: bool,
-    parts: bool,
-    ortho: bool,
-}
 
 #[derive(Clone, Copy, PartialEq)]
 struct ToolBarsKey {
     design: bool,
     paint: Option<PaintBarKey>,
+    /// Arrange's row (its gap as last shown).
+    arrange: Option<u64>,
     /// Measure Fit's Turn and Clear.
     fit: bool,
     /// Edit shape: Lay flat's toggle and the pick kind filter.
@@ -1008,7 +1129,19 @@ pub struct FabStage {
     #[rust]
     workspace_shown: Option<(Option<PlateMode>, bool)>,
     #[rust]
-    print_revision: Option<(u64, u64, Option<PlateMode>, bool, Option<(u32, u32)>, bool, bool)>,
+    print_revision: Option<(u64, u64, Option<PlateMode>, bool, Option<(u32, u32)>, bool)>,
+    /// Arrange's row shows (the rail's Arrange pressed): the gap, and the button that arranges.
+    #[rust]
+    arranging: bool,
+    /// View options' flyout is open.
+    #[rust]
+    options_open: bool,
+    /// The view pie while Q is held: its centre (window points) and the slot pointed at.
+    #[rust]
+    pie: Option<(DVec2, Option<u8>)>,
+    /// The pointer's last place over the window, where the pie opens.
+    #[rust]
+    pointer: DVec2,
     /// The step line over the view as last set: the step and the part's step count.
     #[rust]
     step_line: Option<(usize, usize)>,
@@ -1046,6 +1179,42 @@ pub struct FabStage {
 }
 
 const OWN_VIEWPORT: &[LiveId] = ids!(viewport);
+
+/// The view pie's pills (points), the hub's side, how far the pills stand from the centre, and
+/// how far the pointer goes from it before a direction counts.
+const PIE_PILL: DVec2 = DVec2 { x: 112.0, y: 26.0 };
+const PIE_HUB: f64 = 26.0;
+const PIE_RADIUS: f64 = 92.0;
+const PIE_DEAD: f64 = 16.0;
+
+/// The view pie's slot the pointer points at from `centre`: none in the dead zone, else the
+/// nearest of the eight compass directions (0 north, clockwise).
+fn pie_hot(centre: DVec2, pointer: DVec2) -> Option<u8> {
+    let d = pointer - centre;
+    if d.length() < PIE_DEAD {
+        return None;
+    }
+    Some(((d.x.atan2(-d.y) / std::f64::consts::FRAC_PI_4).round() as i32).rem_euclid(8) as u8)
+}
+
+/// What the view pie's slot does: the view from where it stands (Top up, Right right, …), Front
+/// and Back the upper diagonals, the framings the lower ones.
+fn pie_action(slot: u8) -> ShellAction {
+    match slot {
+        0 => ShellAction::PresetView(PresetView::Top),
+        1 => ShellAction::PresetView(PresetView::Back),
+        2 => ShellAction::PresetView(PresetView::Right),
+        3 => ShellAction::FrameSelected,
+        4 => ShellAction::PresetView(PresetView::Bottom),
+        5 => ShellAction::FrameAll,
+        6 => ShellAction::PresetView(PresetView::Left),
+        _ => ShellAction::PresetView(PresetView::Front),
+    }
+}
+
+/// View options' Tool rails: this Plate view's rails on or off (the shell keeps them per view).
+#[derive(Clone, Copy, Debug)]
+pub struct ToolRailsAsked(pub crate::ui::areas::Instance);
 
 /// A stage's pane and its viewport: one, its own (an Underside or Traced view is a Plate view
 /// of its own).
@@ -1163,13 +1332,152 @@ impl FabStage {
         }
     }
 
+    /// The view pie's events: Q pressed over this view opens it round the pointer (kept inside
+    /// the view), the pointer aims it, Q released takes the slot aimed at (none: nothing), Escape
+    /// or a press closes it. Whether the event was the pie's alone (a press while it is open).
+    fn pie_event(&mut self, cx: &mut Cx, event: &Event) -> bool {
+        match event {
+            Event::MouseMove(e) => {
+                self.pointer = e.abs;
+                if let Some((centre, hot)) = &mut self.pie {
+                    let aimed = pie_hot(*centre, e.abs);
+                    if aimed != *hot {
+                        *hot = aimed;
+                        self.view.redraw(cx);
+                    }
+                }
+                false
+            }
+            Event::Actions(actions) if actions.iter().any(|a| matches!(a.downcast_ref::<StageAction>(), Some(StageAction::ViewPie))) => {
+                let view = self.view.area().rect(cx);
+                if self.pie.is_none() && view.contains(self.pointer) {
+                    // round the pointer, the ring kept inside the view
+                    let reach = dvec2(PIE_RADIUS + PIE_PILL.x * 0.5 + 6.0, PIE_RADIUS + PIE_PILL.y * 0.5 + 6.0);
+                    let lo = view.pos + reach;
+                    let hi = view.pos + view.size - reach;
+                    let centre = dvec2(self.pointer.x.clamp(lo.x, hi.x.max(lo.x)), self.pointer.y.clamp(lo.y, hi.y.max(lo.y)));
+                    self.pie = Some((centre, pie_hot(centre, self.pointer)));
+                    self.view.redraw(cx);
+                }
+                false
+            }
+            Event::KeyUp(ke) if ke.key_code == KeyCode::KeyQ => {
+                if let Some((_, hot)) = self.pie.take() {
+                    if let Some(slot) = hot {
+                        cx.action(pie_action(slot));
+                    }
+                    self.view.redraw(cx);
+                }
+                false
+            }
+            Event::KeyDown(ke) if ke.key_code == KeyCode::Escape && self.pie.is_some() => {
+                self.pie = None;
+                self.view.redraw(cx);
+                true
+            }
+            Event::MouseDown(_) if self.pie.is_some() => {
+                self.pie = None;
+                self.view.redraw(cx);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The view pie's layer as it draws: shown while open, its pills round its centre, the one
+    /// aimed at lit. Ten lookups while it is open.
+    fn sync_pie(&mut self, cx: &mut Cx) {
+        let layer = self.view.view(cx, ids!(pie_layer));
+        if layer.visible() != self.pie.is_some() {
+            layer.set_visible(cx, self.pie.is_some());
+        }
+        let Some((centre, hot)) = self.pie else { return };
+        if let Some(mut hub) = self.view.widget(cx, ids!(pie_layer.pie_hub)).borrow_mut::<View>() {
+            hub.walk.abs_pos = Some(centre - DVec2::all(PIE_HUB * 0.5));
+        }
+        let pills = [ids!(pie_layer.pie0), ids!(pie_layer.pie1), ids!(pie_layer.pie2), ids!(pie_layer.pie3),
+            ids!(pie_layer.pie4), ids!(pie_layer.pie5), ids!(pie_layer.pie6), ids!(pie_layer.pie7)];
+        for (k, path) in pills.into_iter().enumerate() {
+            let angle = k as f64 * std::f64::consts::FRAC_PI_4;
+            let at = centre + dvec2(angle.sin(), -angle.cos()) * PIE_RADIUS - PIE_PILL * 0.5;
+            let lit = if hot == Some(k as u8) { 1.0 } else { 0.0 };
+            let pill = self.view.widget(cx, path);
+            if let Some(mut view) = pill.borrow_mut::<View>() {
+                view.walk.abs_pos = Some(at);
+                view.draw_bg.set_dyn_instance(cx, live_id!(hot), &[lit]);
+            }
+            if let Some(mut label) = pill.label(cx, ids!(label)).borrow_mut() {
+                label.draw_text.set_dyn_instance(cx, live_id!(hot), &[lit]);
+            }
+        }
+    }
+
+    /// View options' tiles as the view has them: on or off, offered or not (a slice's options in
+    /// Sliced, the board's on a plate with one), and why the colours shown differ from the print's.
+    /// A dozen lookups while the flyout is open.
+    fn sync_options(cx: &mut Cx, view: &View, pane: PaneId, state: &AppState) {
+        let p = &state.print;
+        let card = view.view(cx, ids!(view_flyout.options_card));
+        let set = |cx: &mut Cx, path: &[LiveId], on: bool, works: bool| {
+            let tile = card.radio_button(cx, path);
+            if tile.active(cx) != on { tile.set_active(cx, on, Animate::No); }
+            if tile.disabled(cx) == works { tile.set_disabled(cx, !works); }
+        };
+        set(cx, ids!(o_rails), view.view(cx, ids!(model_ui.left)).visible(), true);
+        set(cx, ids!(o_ortho), state.view.camera(pane).ortho, true);
+        set(cx, ids!(o_frame_all), false, true);
+        set(cx, ids!(o_frame_sel), false, active_part(state).is_some());
+        set(cx, ids!(o_colours), state.view.colours == fab_plate::ColourMode::Material, true);
+        // what the slice shows (the printed surface draws neither travel nor the parts under it;
+        // a resin printer's layers are no toolpaths)
+        let sliced = state.render_mode() == RenderMode::Slice;
+        card.widget(cx, ids!(slice_title)).set_visible(cx, sliced);
+        card.widget(cx, ids!(slice_grid)).set_visible(cx, sliced);
+        if sliced {
+            let resin = p.resin_shown().is_some();
+            set(cx, ids!(o_supports), p.play.supports, !resin);
+            set(cx, ids!(o_travel), p.play.travel, !resin && !p.finish);
+            set(cx, ids!(o_parts), p.play.show_model, !resin && !p.finish);
+        }
+        let board = state.board_shown();
+        card.widget(cx, ids!(o_board)).set_visible(cx, board.is_some());
+        set(cx, ids!(o_board), board == Some(true), true);
+        let notice = state.colour_notice();
+        card.label(cx, ids!(notice)).set_visible(cx, notice.is_some());
+        card.label(cx, ids!(notice)).set_text(cx, notice.as_deref().unwrap_or(""));
+    }
+
+    /// A tile pressed in View options' flyout (`instance`: this Plate view).
+    fn view_option(cx: &mut Cx, instance: crate::ui::areas::Instance, state: &AppState, pick: LiveId) {
+        let p = &state.print;
+        match pick {
+            id if id == live_id!(vo_rails) => cx.action(ToolRailsAsked(instance)),
+            id if id == live_id!(vo_ortho) => cx.action(ShellAction::ToggleOrtho),
+            id if id == live_id!(vo_frame_all) => cx.action(ShellAction::FrameAll),
+            id if id == live_id!(vo_frame_sel) => cx.action(ShellAction::FrameSelected),
+            id if id == live_id!(vo_colours) => {
+                let on = state.view.colours == fab_plate::ColourMode::Material;
+                cx.action(ShellAction::SetColourMode(if on { fab_plate::ColourMode::Model } else { fab_plate::ColourMode::Material }));
+            }
+            id if id == live_id!(vo_supports) => cx.action(PrintAction::ShowSupports(!p.play.supports)),
+            id if id == live_id!(vo_travel) => cx.action(PrintAction::ShowTravel(!p.play.travel)),
+            id if id == live_id!(vo_parts) => cx.action(PrintAction::ShowModel(!p.play.show_model)),
+            id if id == live_id!(vo_board) => {
+                if let Some(shown) = state.board_shown() {
+                    cx.action(ShellAction::ShowBoard(!shown));
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// The two rail containers (and the chosen tool's row at the top) keep their visibility as
     /// the plate mode switches their parents; the toolbar's Tools toggle says which.
     pub fn set_tools_shown(&mut self, cx: &mut Cx, shown: bool) {
         self.view.view(cx, ids!(model_ui.left)).set_visible(cx, shown);
         self.view.view(cx, ids!(model_ui.context)).set_visible(cx, shown);
         self.view.view(cx, ids!(mechanics_ui.left)).set_visible(cx, shown);
-        let toggle = self.view.radio_button(cx, ids!(render_row.view_bar.show_tools));
+        let toggle = self.view.radio_button(cx, ids!(mechanics_ui.mech_tools));
         if toggle.active(cx) != shown {
             toggle.set_active(cx, shown, Animate::No);
         }
@@ -1477,6 +1785,10 @@ pub enum StageAction {
     LayFlat(bool),
     Zones(bool),
     CameraPip(bool),
+    /// The Test prints mode's sidebar of tests, open or closed.
+    TestsSidebar(bool),
+    /// Q pressed: the view pie opens round the pointer in the Plate view under it.
+    ViewPie,
     /// The brush radius (mm).
     PaintRadius(f64),
     /// Erase on or off (Alt flips it while held).
@@ -1538,6 +1850,9 @@ pub fn apply(state: &mut AppState, action: &StageAction) {
         StageAction::LayFlat(on) => state.ui.lay_flat = *on,
         StageAction::Zones(on) => state.ui.show_zones = *on,
         StageAction::CameraPip(on) => state.ui.camera_pip = *on,
+        StageAction::TestsSidebar(on) => state.ui.tests_sidebar = *on,
+        // (the Plate view under the pointer opens its pie: `FabStage::pie_event`)
+        StageAction::ViewPie => {}
         StageAction::PaintRadius(r) => state.ui.paint_radius = r.clamp(crate::tools::paint::MIN_RADIUS, crate::tools::paint::MAX_RADIUS),
         StageAction::PaintColor(i) => {
             // Picking a material paints with it.
@@ -1607,6 +1922,33 @@ impl Widget for FabStage {
         if scope.data.get::<AppState>().is_some_and(|state| !state.ui.plate_shown(self.instance)) {
             self.handle_hidden(cx, event, scope);
             return;
+        }
+        // the view pie: open on Q over this view, aim with the pointer, release Q to take it
+        if self.pie_event(cx, event) {
+            return;
+        }
+        // View options' flyout closes on a press outside it (its button toggles it) and on Escape
+        if self.options_open {
+            let close = match event {
+                Event::MouseDown(e) => {
+                    let card = self.view.view(cx, ids!(view_flyout.options_card)).area().rect(cx);
+                    let button = self.view.widget(cx, ids!(render_row.view_options)).area().rect(cx);
+                    !card.contains(e.abs) && !button.contains(e.abs)
+                }
+                Event::KeyDown(k) => k.key_code == KeyCode::Escape,
+                _ => false,
+            };
+            if close {
+                self.options_open = false;
+                self.view.redraw(cx);
+            }
+        }
+        // the tests sidebar's sections: their hover, and a swipe across them folding them all
+        if matches!(event, Event::MouseMove(_) | Event::MouseDown(_) | Event::MouseUp(_) | Event::MouseLeave(_) | Event::ClearHover)
+            && self.view.view(cx, ids!(model_ui.tests_side)).visible()
+        {
+            let heads = self.view.widget(cx, ids!(tests_side.tests)).borrow::<crate::ui::test_prints::FabTestSections>().map(|t| t.headers()).unwrap_or_default();
+            crate::ui::widgets::section_headers(cx, event, &heads);
         }
         if let Some(state) = scope.data.get_mut::<AppState>() {
             match event {
@@ -1720,35 +2062,29 @@ impl Widget for FabStage {
             let tools = v.view(cx, ids!(mechanics_ui.left.tools));
             crate::ui::mechanics::handle_tools(cx, &tools, actions);
         }
-        // A clicked radio has already changed its own active state. Sync its group on
-        // the next draw even if the action leaves the model as it was (e.g. Remove).
-        let bar = v.view(cx, ids!(render_row.view_bar));
-        if bar.radio_button(cx, ids!(ortho)).clicked(actions) {
-            self.draw_keys.view_bar = None;
-            cx.action(ShellAction::ToggleOrtho);
+        // View options: its button opens and closes the flyout; a tile acts as its option
+        if dropdown_clicked(actions, live_id!(fab_view_options)).is_some() {
+            self.options_open = !self.options_open;
+            cx.redraw_area(v.area());
         }
-        if bar.button(cx, ids!(frame_all)).clicked(actions) {
-            cx.action(ShellAction::FrameAll);
+        let card = v.view(cx, ids!(view_flyout.options_card));
+        for (path, pick) in [
+            (ids!(o_rails), live_id!(vo_rails)), (ids!(o_ortho), live_id!(vo_ortho)), (ids!(o_frame_all), live_id!(vo_frame_all)),
+            (ids!(o_frame_sel), live_id!(vo_frame_sel)), (ids!(o_colours), live_id!(vo_colours)), (ids!(o_supports), live_id!(vo_supports)),
+            (ids!(o_travel), live_id!(vo_travel)), (ids!(o_parts), live_id!(vo_parts)), (ids!(o_board), live_id!(vo_board)),
+        ] {
+            let tile = card.radio_button(cx, path);
+            if tile.clicked(actions) {
+                // (a framing tile is an action: it does not stay lit)
+                if matches!(pick, p if p == live_id!(vo_frame_all) || p == live_id!(vo_frame_sel)) {
+                    tile.set_active(cx, false, Animate::No);
+                }
+                Self::view_option(cx, self.instance, state, pick);
+            }
         }
-        if bar.radio_button(cx, ids!(show_supports)).clicked(actions) {
-            self.draw_keys.view_bar = None;
-            cx.action(PrintAction::ShowSupports(!state.print.play.supports));
-        }
-        if bar.radio_button(cx, ids!(show_travel)).clicked(actions) {
-            self.draw_keys.view_bar = None;
-            cx.action(PrintAction::ShowTravel(!state.print.play.travel));
-        }
-        if bar.radio_button(cx, ids!(show_parts)).clicked(actions) {
-            self.draw_keys.view_bar = None;
-            cx.action(PrintAction::ShowModel(!state.print.play.show_model));
-        }
-        // what the pressed toggle now shows, not the plate's flag flipped: a plate that lands
-        // between the toggle's last sync and the press (another job's) can say otherwise
-        let show_board = bar.radio_button(cx, ids!(show_board));
-        if show_board.clicked(actions) {
-            self.draw_keys.board_revision = None;
-            if state.board_shown().is_some() {
-                cx.action(ShellAction::ShowBoard(show_board.active(cx)));
+        if v.button(cx, ids!(render_row.drop_part)).clicked(actions) {
+            if let Some(i) = active_part(state).filter(|_| !state.slice_blocks_edits()) {
+                cx.action(PartAction::Drop { object: state.plate.parts[i].object.clone() });
             }
         }
         let tools = ids!(model_ui.left.tools);
@@ -1776,8 +2112,27 @@ impl Widget for FabStage {
             Self::set_mode(cx, state, GizmoMode::Sculpt);
             cx.redraw_area(v.area());
         }
-        if tv.button(cx, ids!(arrange_all)).clicked(actions) {
+        // Arrange: the rail's button opens its row (and closes it); the row's Arrange arranges
+        if tv.radio_button(cx, ids!(arrange_all)).clicked(actions) {
+            self.arranging = !self.arranging;
+            self.draw_keys.tools = None;
+            cx.redraw_area(v.area());
+        }
+        let arrange = v.widget(cx, ids!(model_ui.context.arrange_bar));
+        if arrange.button(cx, ids!(arrange_go)).clicked(actions) && !state.slice_blocks_edits() {
             cx.action(PartAction::Arrange);
+        }
+        if arrange.button(cx, ids!(arrange_done)).clicked(actions) {
+            self.arranging = false;
+            self.draw_keys.tools = None;
+            cx.redraw_area(v.area());
+        }
+        // its gap: a finite length, none below zero, and only a change
+        if let Some(gap) = arrange.value_input(cx, ids!(arrange_gap)).ended(actions) {
+            let now = state.plate.arrange_gap.unwrap_or(8.0);
+            if gap.is_finite() && gap >= 0.0 && (gap - now).abs() > 1e-9 && !state.slice_blocks_edits() {
+                cx.action(PartAction::SetArrangeGap(gap));
+            }
         }
         if tv.radio_button(cx, ids!(t_force)).clicked(actions) {
             Self::force_tool(cx, state);
@@ -1893,21 +2248,63 @@ impl Widget for FabStage {
         if let Some(g) = v.slider(cx, ids!(render_row.see_row.see_glow)).slided(actions) {
             cx.action(ShellAction::SetSeeGlow(g as f32));
         }
-        let colours = v.view(cx, ids!(colour_modes));
-        for (id, mode) in [(ids!(model_colours), fab_plate::ColourMode::Model), (ids!(material_colours), fab_plate::ColourMode::Material)] {
-            if colours.radio_button(cx, id).clicked(actions) {
-                cx.action(ShellAction::SetColourMode(mode));
+        // the plate's mode: a menu of the three, the one in force ticked
+        if let Some(anchor) = dropdown_clicked(actions, live_id!(fab_plate_mode)) {
+            // Design shows the whole plate; Test prints is Design with only the ticked tests
+            let tests = state.ui.in_mode(PlateMode::Design) && state.print.test_mode;
+            let row = |mode: PlateMode, label: &str| MenuItem::new(LiveId(live_id!(fab_plate_mode).0 ^ (mode as u64 + 1)), label).radio(state.ui.in_mode(mode) && !(tests && mode == PlateMode::Design));
+            let items = vec![
+                row(PlateMode::Design, "Design"),
+                MenuItem::new(live_id!(fab_plate_mode_tests), "Test prints").radio(tests),
+                row(PlateMode::Mechanics, "Mechanics"),
+                row(PlateMode::Monitor, "Monitor"),
+            ];
+            open_menu(cx, live_id!(fab_plate_mode), items, anchor, MenuPlace::Below);
+        }
+        if let Some(pick) = menu_picked(actions, live_id!(fab_plate_mode)) {
+            if pick == live_id!(fab_plate_mode_tests) {
+                if !state.ui.in_mode(PlateMode::Design) {
+                    cx.action(ShellAction::SetPlateMode(PlateMode::Design));
+                }
+                if !state.print.test_mode {
+                    cx.action(PrintAction::TestMode(true));
+                }
+            } else if let Some(mode) = [PlateMode::Design, PlateMode::Mechanics, PlateMode::Monitor].into_iter().find(|m| pick.0 == live_id!(fab_plate_mode).0 ^ (*m as u64 + 1)) {
+                cx.action(ShellAction::SetPlateMode(mode));
+                // every other mode prints the whole plate
+                if state.print.test_mode {
+                    cx.action(PrintAction::TestMode(false));
+                }
             }
         }
-        let modes = v.view(cx, ids!(render_row.render_modes));
-        if modes.radio_button(cx, ids!(rm_normal)).clicked(actions) {
-            cx.action(ShellAction::SetRenderMode(state.normal_mode()));
+        // Test prints: a cube on the picked part, and the tests' sidebar
+        if v.button(cx, ids!(render_row.add_test)).clicked(actions) || v.button(cx, ids!(tests_side.side_add)).clicked(actions) {
+            crate::ui::test_prints::add(cx, state, None);
         }
-        if modes.radio_button(cx, ids!(rm_slice)).clicked(actions) {
-            cx.action(ShellAction::SetRenderMode(RenderMode::Slice));
+        if v.radio_button(cx, ids!(render_row.tests_toggle)).clicked(actions) {
+            cx.action(StageAction::TestsSidebar(!state.ui.tests_sidebar));
         }
-        if modes.radio_button(cx, ids!(rm_force)).clicked(actions) {
-            cx.action(ShellAction::SetRenderMode(RenderMode::Force));
+        if v.button(cx, ids!(tests_side.tests_close)).clicked(actions) {
+            cx.action(StageAction::TestsSidebar(false));
+        }
+        // the render mode's flyout: Normal, Sliced, and Force on Design's plate
+        if let Some(anchor) = dropdown_clicked(actions, live_id!(fab_render_mode)) {
+            let mode = state.render_mode();
+            let normal = !matches!(mode, RenderMode::Slice | RenderMode::Force);
+            let mut items = vec![
+                MenuItem::new(live_id!(rm_normal), "Normal").radio(normal).key(&keymap::shortcut(Key::SliceView)),
+                MenuItem::new(live_id!(rm_slice), "Sliced").radio(mode == RenderMode::Slice).key(&keymap::shortcut(Key::SliceView)),
+            ];
+            if state.ui.in_mode(PlateMode::Design) {
+                items.push(MenuItem::new(live_id!(rm_force), "Force").radio(mode == RenderMode::Force));
+            }
+            open_menu(cx, live_id!(fab_render_mode), items, anchor, MenuPlace::Below);
+        }
+        match menu_picked(actions, live_id!(fab_render_mode)) {
+            Some(id) if id == live_id!(rm_normal) => cx.action(ShellAction::SetRenderMode(state.normal_mode())),
+            Some(id) if id == live_id!(rm_slice) => cx.action(ShellAction::SetRenderMode(RenderMode::Slice)),
+            Some(id) if id == live_id!(rm_force) => cx.action(ShellAction::SetRenderMode(RenderMode::Force)),
+            _ => {}
         }
         // ---- slice view ----
         let sv = v.view(cx, ids!(slice_ui));
@@ -2046,7 +2443,7 @@ impl Widget for FabStage {
                 GizmoMode::Force => mode == RenderMode::Force,
                 _ => false,
             };
-            let context = !mechanics && design && ((state.tool == Tool::Select && row_tool) || state.tool == Tool::MeasureFit) && v.view(cx, ids!(model_ui.context)).visible();
+            let context = !mechanics && design && ((state.tool == Tool::Select && row_tool) || state.tool == Tool::MeasureFit || self.arranging) && v.view(cx, ids!(model_ui.context)).visible();
             let nav_top = NAV_TOP + strip + toolbar + if context { CONTEXT_ROW } else { 0.0 };
             let nav = v.widget(cx, ids!(primary.nav));
             let moved = nav.borrow_mut::<View>().is_some_and(|mut nav| {
@@ -2082,12 +2479,11 @@ impl Widget for FabStage {
                 v.view(cx, ids!(model_ui.bottom)).set_visible(cx, !slice);
                 // Every Plate view has its toolbar; the sim's view has none (its bar holds the mode).
                 v.view(cx, ids!(render_row)).set_visible(cx, !mechanics);
-                v.view(cx, ids!(render_row.render_modes)).set_visible(cx, looks);
+                v.widget(cx, ids!(render_row.render_tip)).set_visible(cx, looks);
                 v.view(cx, ids!(render_row.create_card)).set_visible(cx, looks);
-                v.view(cx, ids!(render_row.view_bar)).set_visible(cx, looks);
                 // a group's rule goes with it (a held job's bar holds only the mode)
-                for rule in [ids!(render_row.create_rule), ids!(render_row.view_rule)] {
-                    v.widget(cx, rule).set_visible(cx, looks);
+                for path in [ids!(render_row.view_options)] {
+                    v.widget(cx, path).set_visible(cx, looks);
                 }
                 v.view(cx, ids!(slice_ui)).set_visible(cx, slice && lead);
                 v.view(cx, ids!(slice_ui.resin_ui)).set_visible(cx, resin);
@@ -2095,65 +2491,54 @@ impl Widget for FabStage {
                 v.button(cx, ids!(slice_ui.resin_ui.resin_row.resin_live)).set_visible(cx, resin_live);
                 v.widget(cx, ids!(progress_card)).set_visible(cx, lead);
             }
-            // The view bar: its toggles by the mode alone, each as the view has it.
-            let view_bar = ViewBarKey {
-                sliced: mode == RenderMode::Slice, resin, finish: p.finish,
-                supports: p.play.supports, travel: p.play.travel, parts: p.play.show_model,
-                ortho: state.view.camera(self.pane).ortho,
-            };
-            if self.draw_keys.view_bar != Some(view_bar) {
-                self.draw_keys.view_bar = Some(view_bar);
-                let bar = v.view(cx, ids!(render_row.view_bar));
-                // The printed surface draws neither travel nor the parts under it; a resin printer's
-                // layers are no toolpaths.
-                for (tip, toggle, on, works) in [
-                    (ids!(supports_tip), ids!(show_supports), view_bar.supports, !resin),
-                    (ids!(travel_tip), ids!(show_travel), view_bar.travel, !resin && !view_bar.finish),
-                    (ids!(parts_tip), ids!(show_parts), view_bar.parts, !resin && !view_bar.finish),
-                ] {
-                    bar.widget(cx, tip).set_visible(cx, view_bar.sliced);
-                    let toggle = bar.radio_button(cx, toggle);
-                    if toggle.active(cx) != on {
-                        toggle.set_active(cx, on, Animate::No);
+            // The plate's mode in its flyout (Test prints: Design with the ticked tests alone), and
+            // Test prints' toolbar group and sidebar of tests
+            let tests_mode = design && p.test_mode;
+            let tests_key = (plate_mode, tests_mode, state.ui.tests_sidebar && lead, active_part(state).is_some(), p.revision);
+            if self.draw_keys.tests != Some(tests_key) {
+                self.draw_keys.tests = Some(tests_key);
+                let name = match plate_mode {
+                    Some(PlateMode::Mechanics) => "Mechanics",
+                    Some(PlateMode::Monitor) => "Monitor",
+                    _ if tests_mode => "Test prints",
+                    _ => "Design",
+                };
+                v.widget(cx, ids!(render_row.plate_mode.label)).set_text(cx, name);
+                v.widget(cx, ids!(render_row.tests_rule)).set_visible(cx, tests_mode);
+                v.widget(cx, ids!(render_row.tests_group)).set_visible(cx, tests_mode);
+                v.radio_button(cx, ids!(render_row.tests_toggle)).set_active(cx, tests_key.2, Animate::No);
+                let has_part = tests_key.3;
+                v.widget(cx, ids!(render_row.add_test)).set_disabled(cx, !has_part);
+                v.widget(cx, ids!(tests_side.side_add)).set_disabled(cx, !has_part);
+                for tip in [ids!(render_row.add_test_tip), ids!(tests_side.side_add_tip)] {
+                    if let Some(mut tip) = v.widget(cx, tip).borrow_mut::<makepad_widgets_core::tip::Tip>() {
+                        tip.text = if has_part { crate::ui::test_prints::ADD_TIP } else { SELECT_A_PART }.to_string();
                     }
-                    if toggle.disabled(cx) == works {
-                        toggle.set_disabled(cx, !works);
-                    }
                 }
-                let ortho = bar.radio_button(cx, ids!(ortho));
-                if ortho.active(cx) != view_bar.ortho {
-                    ortho.set_active(cx, view_bar.ortho, Animate::No);
-                }
+                v.view(cx, ids!(model_ui.tests_side)).set_visible(cx, tests_mode && tests_key.2);
             }
-            // the board's toggle, in every mode of a plate with a board
-            if self.draw_keys.board_revision != Some(state.plate.revision) {
-                self.draw_keys.board_revision = Some(state.plate.revision);
-                let bar = v.view(cx, ids!(render_row.view_bar));
-                let board = state.board_shown();
-                bar.widget(cx, ids!(board_tip)).set_visible(cx, board.is_some());
-                let show_board = bar.radio_button(cx, ids!(show_board));
-                if show_board.active(cx) != (board == Some(true)) {
-                    show_board.set_active(cx, board == Some(true), Animate::No);
-                }
+            // View options' flyout, while open: each tile as the view has it
+            let open = self.options_open && lead && !mechanics;
+            let flyout = v.view(cx, ids!(view_flyout));
+            if flyout.visible() != open {
+                flyout.set_visible(cx, open);
             }
-            // The plate's colours in the toolbar (short words in a narrow view) and the notice
-            // under it.
-            let width = cx.peek_walk_turtle(walk).size.x;
-            let compact = width < 320.0;
+            if open {
+                Self::sync_options(cx, &self.view, self.pane, state);
+                let totals = crate::ui::test_prints::totals(state);
+                v.label(cx, ids!(tests_side.tests_totals)).set_visible(cx, totals.is_some());
+                v.label(cx, ids!(tests_side.tests_totals)).set_text(cx, totals.as_deref().unwrap_or(""));
+            }
+            // Filament colours' toggle and the notice beside it.
             let colours = state.view.colours;
-            let key = (colours, state.colour_notice_tools(), p.target_printer().is_some(), state.view.missing_spool_colours, slice, held, p.play.color, p.finish, compact);
+            let key = (colours, state.colour_notice_tools(), p.target_printer().is_some(), state.view.missing_spool_colours, slice, held, p.play.color, p.finish);
             if self.draw_keys.colours != Some(key) {
                 self.draw_keys.colours = Some(key);
-                let group = v.view(cx, ids!(colour_modes));
-                for (id, mode, short) in [(ids!(model_colours), fab_plate::ColourMode::Model, "Model"), (ids!(material_colours), fab_plate::ColourMode::Material, "Material")] {
-                    let segment = group.radio_button(cx, id);
-                    segment.set_text(if compact { short } else { mode.label() });
-                    segment.set_active(cx, mode == colours, Animate::No);
-                }
                 let notice = state.colour_notice();
-                let label = v.label(cx, ids!(colour_notice));
-                label.set_visible(cx, notice.is_some());
-                if let Some(text) = notice { label.set_text(cx, &text); }
+                v.widget(cx, ids!(colour_notice)).set_visible(cx, notice.is_some());
+                if let Some(mut tip) = v.widget(cx, ids!(colour_notice_tip)).borrow_mut::<makepad_widgets_core::tip::Tip>() {
+                    tip.text = notice.unwrap_or_default();
+                }
             }
             // the tool overlay's lines start under the gizmo
             let overlay = v.widget(cx, ids!(design_overlay.tool_overlay));
@@ -2165,6 +2550,14 @@ impl Widget for FabStage {
             if moved {
                 overlay.redraw(cx);
             }
+            // Drop and Frame selected act on the selected part: off without one (Drop also while
+            // the slice holds the plate)
+            let picked = active_part(state).is_some();
+            let part_actions = (picked, picked && !state.slice_blocks_edits());
+            if self.draw_keys.part_actions != Some(part_actions) {
+                self.draw_keys.part_actions = Some(part_actions);
+                v.button(cx, ids!(render_row.drop_part)).set_enabled(cx, part_actions.1);
+            }
             let gizmo = (design && state.tool == Tool::Select).then_some(state.ui.gizmo);
             let sculpt_on = gizmo == Some(GizmoMode::Sculpt);
             let tools = ToolBarsKey {
@@ -2175,6 +2568,7 @@ impl Widget for FabStage {
                     target: state.ui.paint_target,
                     scaled: state.ui.paint_pattern.kind.scaled(),
                 }),
+                arrange: (self.arranging && design).then(|| state.plate.arrange_gap.unwrap_or(8.0).to_bits()),
                 fit: state.tool == Tool::MeasureFit,
                 lay_flat: (gizmo == Some(GizmoMode::Shape)).then_some((state.ui.lay_flat, state.picks.filter)),
                 sculpt: sculpt_on.then(|| crate::tools::sculpt::operation(state)),
@@ -2208,6 +2602,15 @@ impl Widget for FabStage {
                     }
                 }
                 v.widget(cx, ids!(model_ui.context.fit_bar)).set_visible(cx, tools.fit);
+                let arrange = v.widget(cx, ids!(model_ui.context.arrange_bar));
+                arrange.set_visible(cx, tools.arrange.is_some());
+                v.radio_button(cx, ids!(arrange_all)).set_active(cx, tools.arrange.is_some(), Animate::No);
+                if let Some(gap) = tools.arrange {
+                    let field = arrange.value_input(cx, ids!(arrange_gap));
+                    if !field.borrow().is_some_and(|f| f.is_interacting()) {
+                        field.set_value(cx, f64::from_bits(gap));
+                    }
+                }
                 let sb = v.widget(cx, ids!(model_ui.context.shape_bar));
                 sb.set_visible(cx, tools.lay_flat.is_some());
                 if let Some((lay_flat, filter)) = tools.lay_flat {
@@ -2266,10 +2669,6 @@ impl Widget for FabStage {
                 tv.redraw(cx);
                 tv.tip(cx, ids!(rotate_tip)).set_text(&if sculpt_on { keymap::entry(Key::Rotate).action.into() } else { keymap::tooltip(Key::Rotate) });
                 tv.tip(cx, ids!(section_tip)).set_text(&if sculpt_on { keymap::entry(Key::Section).action.into() } else { keymap::tooltip(Key::Section) });
-                let modes = v.view(cx, ids!(render_row.render_modes));
-                let slice_key = if sculpt_on { String::new() } else { format!(" ({})", keymap::shortcut(Key::SliceView)) };
-                modes.tip(cx, ids!(normal_tip)).set_text(&format!("The parts, in the look View › Shading sets{slice_key}"));
-                modes.tip(cx, ids!(slice_tip)).set_text(&format!("The sliced print over the plate: edit and it reslices live{slice_key}"));
                 tv.widget(cx, ids!(t_shape)).set_visible(cx, design);
                 // The area tools draw on the shown slice: where its trees stand, on its layers.
                 tv.widget(cx, ids!(no_trees_tip)).set_visible(cx, design && mode == RenderMode::Slice);
@@ -2278,11 +2677,9 @@ impl Widget for FabStage {
                 // a box goes on the picked part: none picked, the tool waits for one
                 tv.widget(cx, ids!(t_settings_here)).set_disabled(cx, !has_part);
                 tv.tip(cx, ids!(settings_here_tip)).set_text(if has_part { SETTINGS_HERE_TIP } else { SELECT_A_PART });
-                modes.radio_button(cx, ids!(rm_normal)).set_active(cx, !matches!(mode, RenderMode::Slice | RenderMode::Force), Animate::No);
-                modes.radio_button(cx, ids!(rm_slice)).set_active(cx, mode == RenderMode::Slice, Animate::No);
-                modes.radio_button(cx, ids!(rm_force)).set_active(cx, mode == RenderMode::Force, Animate::No);
-                // Force studies a part of Design's plate
-                modes.widget(cx, ids!(force_tip)).set_visible(cx, design);
+                // the render mode in its flyout's button
+                let shown = match mode { RenderMode::Slice => "Sliced", RenderMode::Force => "Force", _ => "Normal" };
+                v.widget(cx, ids!(render_row.render_mode.label)).set_text(cx, shown);
                 let select = state.tool == Tool::Select;
                 for (id, on) in [
                     (ids!(t_select), select && state.ui.gizmo == GizmoMode::Off),
@@ -2317,8 +2714,7 @@ impl Widget for FabStage {
                 }
             }
             let checking = p.streamed.as_ref().and_then(|s| s.checking());
-            let jobs_area = state.ui.on_screen(Editor::Jobs);
-            let print_key = (p.revision, state.plate.revision, plate_mode, slice, checking, jobs_area, lead);
+            let print_key = (p.revision, state.plate.revision, plate_mode, slice, checking, lead);
             if self.print_revision != Some(print_key) {
                 self.print_revision = Some(print_key);
                 let failed = v.view(cx, ids!(model_ui.bottom.slice_failed));
@@ -2328,9 +2724,9 @@ impl Widget for FabStage {
                 }
 
                 let has_job_card = crate::print::job_card::job_view(p, Cx::time_now()).is_some();
-                v.view(cx, ids!(monitor_job)).set_visible(cx, lead && state.ui.in_mode(PlateMode::Monitor) && (has_job_card || (!p.follow.jobs.is_empty() && !jobs_area)));
+                v.view(cx, ids!(monitor_job)).set_visible(cx, lead && state.ui.in_mode(PlateMode::Monitor) && (has_job_card || !p.follow.jobs.is_empty()));
                 v.widget(cx, ids!(monitor_job.card)).set_visible(cx, has_job_card);
-                v.widget(cx, ids!(monitor_job.jobs)).set_visible(cx, !jobs_area);
+                v.widget(cx, ids!(monitor_job.jobs)).set_visible(cx, true);
                 // Monitor: the printer's job, followed or said.
                 let job = p.follow.shown_printing().filter(|_| state.ui.in_mode(PlateMode::Monitor));
                 let unknown = job.filter(|j| j.preview.is_none());
@@ -2458,6 +2854,7 @@ impl Widget for FabStage {
                 }
             }
         }
+        self.sync_pie(cx);
         while self.view.draw_walk(cx, scope, walk).is_step() {}
         DrawStep::done()
     }

@@ -1,8 +1,10 @@
-//! The Calibrate panel's state and actions: the guided steps (fits and friction for
-//! Mechanics, then flow, temperature and pressure advance, then the print head), each making
-//! a test part the app slices and shows in the Slice render mode. Printing it is the Printer panel's Print
-//! button and its confirm, never this panel. The app fills the state; the panel only shows
-//! it and sends [`CalibrateAction`]s.
+//! Calibration, in the Printers editor's section of the printer in use: the guided steps (fits
+//! and friction for Mechanics, then flow, temperature and pressure advance, then the print head),
+//! each a section of its own that folds ([`FabCalibrateSteps`]). A step's section holds all of
+//! it: what it feeds, Make test part (the app slices the part and shows it in the Slice render
+//! mode), then that part's check and the answer to save, and Clear result once done. Printing
+//! the part is the Print button's and its confirm, never this. The app fills the state; the
+//! steps only show it and send [`CalibrateAction`]s.
 
 use crate::api::AppState;
 use makepad_widgets_core::*;
@@ -80,178 +82,195 @@ script_mod! {
         input := mod.widgets.FabInput{ is_numeric_only: true empty_text: "Number" }
     }
 
-    mod.widgets.FabCalibratePanelBase = #(FabCalibratePanel::register_widget(vm))
-    mod.widgets.FabCalibratePanel = set_type_default() do mod.widgets.FabCalibratePanelBase{
-        width: Fill
-        height: Fill
-        flow: Down
-        show_bg: true
-        draw_bg +: { color: fab.color_editor }
-        // the toolbar: the area's editor selector (and this editor's tools, when it has any)
-        editor_bar := mod.widgets.FabEditorBar{}
-        body := mod.widgets.FabScroll{
-            padding: Inset{left: 10 right: 10 top: 10 bottom: 10}
-            spacing: 10
-            head := mod.widgets.FabCard{
-                mod.widgets.FabTitleLabel{ text: "Calibrate" }
-                context := mod.widgets.FabLabelDim{ width: Fill text: "Choose a printer and filament in Settings" }
-            }
-            selected := mod.widgets.FabCard{
-                visible: false
-                title := mod.widgets.FabTitleLabel{ width: Fill text: "" }
+    // The steps, each a nested section that folds (as the Part panel's parameter groups): its
+    // title, the date it was done in the header's trail; in its body what it feeds, Make test part,
+    // the made part's check and answer, Clear result.
+    mod.widgets.FabCalibrateStepsBase = #(FabCalibrateSteps::register_widget(vm))
+    mod.widgets.FabCalibrateSteps = set_type_default() do mod.widgets.FabCalibrateStepsBase{
+        width: Fill height: Fit flow: Down
+        Step := PropSection{
+            margin: Inset{}
+            header +: {hdr +: {
+                margin: Inset{left: 10}
+                padding: Inset{left: theme.prop_label_gap right: theme.prop_pad}
+                title +: {text: ""}
+                trail +: {
+                    width: Fit height: Fit flow: Right align: Align{y: 0.5}
+                    done := mod.widgets.FabLabelDim{ text: "" }
+                }
+            }}
+            body +: {
+                flow: Down spacing: 6 padding: Inset{left: 10 top: 6 bottom: 8}
                 feeds := mod.widgets.FabLabelDim{ width: Fill text: "" }
+                result := mod.widgets.FabLabel{ width: Fill text: "" visible: false }
                 blocked := mod.widgets.FabLabelDim{ width: Fill text: "" visible: false }
                 make := View{
                     width: Fill height: Fit flow: Down spacing: 6
-                    FabTip{ text: "Make and slice the selected step's test part, then show its slice"
+                    FabTip{ text: "Make and slice this step's test part, then show its slice"
                         part := mod.widgets.FabButton{ text: "Make test part" }
                     }
-                    mod.widgets.FabLabelDim{ width: Fill text: "The part slices and its print shows. It prints only when you press Print and confirm." }
+                    mod.widgets.FabLabelSmall{ width: Fill text: "The part slices and its print shows. It prints only when you press Print and confirm." }
                 }
-            }
-            coupon := mod.widgets.FabCard{
-                visible: false
-                name := mod.widgets.FabTitleLabel{ width: Fill text: "" }
-                check := mod.widgets.FabLabel{ width: Fill text: "" }
-                variants := mod.widgets.FabLabelDim{ width: Fill text: "" }
-                first := AnswerField{}
-                second := AnswerField{ visible: false }
-                error := mod.widgets.FabLabel{ width: Fill visible: false text: "" draw_text +: { color: fab.color_error } }
-                FabTip{ text: "Save the result for this printer and filament"
-                    save := mod.widgets.FabButton{ text: "Save result" }
+                // the made part: what to check on the print, and the answer
+                coupon := View{
+                    visible: false
+                    width: Fill height: Fit flow: Down spacing: 6
+                    name := mod.widgets.FabLabel{ width: Fill text: "" draw_text +: { text_style: theme.font_bold{ font_size: fab.font_size_ui } } }
+                    check := mod.widgets.FabLabel{ width: Fill text: "" }
+                    variants := mod.widgets.FabLabelDim{ width: Fill text: "" }
+                    first := AnswerField{}
+                    second := AnswerField{ visible: false }
+                    error := mod.widgets.FabLabel{ width: Fill visible: false text: "" draw_text +: { color: fab.color_error } }
+                    FabTip{ text: "Save the result for this printer and filament"
+                        save := mod.widgets.FabButton{ text: "Save result" }
+                    }
                 }
-            }
-            clear_result := FabTip{
-                visible: false
-                text: "Forget the selected step's saved result for this printer and filament"
-                clear := mod.widgets.FabFlatButton{ text: "Clear result" draw_text +: { text_style: theme.font_regular{ font_size: fab.font_size_small } } }
-            }
-            status := mod.widgets.FabLabelDim{ width: Fill text: "" }
-            mod.widgets.FabLabelDim{ text: "STEPS" }
-            steps := FlatList{
-                width: Fill height: Fit flow: Down
-                scroll_bars +: { show_scroll_x: false show_scroll_y: false }
-                Step := View{
-                    width: Fill height: Fit flow: Right spacing: 8
-                    padding: Inset{left: 10 right: 10 top: 7 bottom: 7}
-                    cursor: MouseCursor.Hand
-                    show_bg: true
-                    draw_bg +: {
-                        selected: instance(0.0)
-                        hover: instance(0.0)
-                        pixel: fn() {
-                            let sdf = Sdf2d.viewport(self.pos * self.rect_size)
-                            sdf.rect(0.0, 0.0, self.rect_size.x, self.rect_size.y)
-                            sdf.fill(fab.color_editor.mix(fab.color_row_hover, self.hover * 0.6).mix(fab.color_selection_bg, self.selected))
-                            sdf.rect(0.0, 0.0, 2.0 * self.selected, self.rect_size.y)
-                            sdf.fill(fab.color_accent)
-                            return sdf.result
-                        }
-                    }
-                    animator: Animator{
-                        hover: {
-                            default: @off
-                            off: AnimatorState{
-                                from: {all: Forward {duration: fab.anim_fast}}
-                                apply: { draw_bg: {hover: 0.0} }
-                            }
-                            on: AnimatorState{
-                                from: {all: Snap}
-                                apply: { draw_bg: {hover: 1.0} }
-                            }
-                        }
-                    }
-                    text := View{
-                        width: Fill height: Fit
-                        title := mod.widgets.FabLabel{ width: Fill text: "" }
-                    }
-                    result := View{
-                        width: Fit height: Fit flow: Right spacing: 6 visible: false
-                        summary := mod.widgets.FabLabel{ width: Fit text: "" }
-                        date := mod.widgets.FabLabelDim{ width: Fit text: "" }
-                    }
+                clear_result := FabTip{
+                    visible: false
+                    text: "Forget this step's saved result for this printer and filament"
+                    clear := mod.widgets.FabFlatButton{ text: "Clear result" draw_text +: { text_style: theme.font_regular{ font_size: fab.font_size_small } } }
                 }
             }
         }
     }
 }
 
-#[derive(Script, ScriptHook, Widget)]
-pub struct FabCalibratePanel {
-    #[deref]
-    view: View,
+/// The calibration steps as sections, made from the `Step` template, one per step and kept.
+/// One step is the app's selected one: its made part and its answer show in its section; Make in
+/// another step selects it first.
+#[derive(Script, Widget)]
+pub struct FabCalibrateSteps {
+    #[uid] uid: WidgetUid,
+    #[source] source: ScriptObjectRef,
+    #[walk] walk: Walk,
+    #[layout] layout: Layout,
+    #[rust] templates: std::collections::HashMap<LiveId, ScriptObjectRef>,
+    #[rust] items: ComponentMap<LiveId, WidgetRef>,
+    /// The steps drawn last.
+    #[rust] count: usize,
     /// Preserve drafts across redraws, but never carry an answer into another step or setup.
     #[rust]
     shown: Option<(String, String, usize, Option<CouponView>)>,
     #[rust]
     error: String,
+    #[redraw] #[rust] area: Area,
 }
 
-impl FabCalibratePanel {
+impl ScriptHook for FabCalibrateSteps {
+    fn on_before_apply(&mut self, _vm: &mut ScriptVm, apply: &Apply, _scope: &mut Scope, _value: ScriptValue) {
+        if apply.is_reload() {
+            self.templates.clear();
+        }
+    }
+
+    fn on_after_apply(&mut self, vm: &mut ScriptVm, apply: &Apply, scope: &mut Scope, value: ScriptValue) {
+        if !apply.is_eval() {
+            if let Some(obj) = value.as_object() {
+                vm.vec_with(obj, |vm, vec| {
+                    for kv in vec {
+                        if let (Some(id), Some(t)) = (kv.key.as_id(), kv.value.as_object()) {
+                            self.templates.insert(id, vm.new_object_ref(t));
+                        }
+                    }
+                });
+            }
+        }
+        if apply.is_reload() {
+            if let Some(template) = self.templates.get(&live_id!(Step)) {
+                let v: ScriptValue = template.as_object().into();
+                for (_, w) in self.items.iter_mut() {
+                    w.script_apply(vm, apply, scope, v);
+                }
+            }
+        }
+    }
+}
+
+fn step_id(i: usize) -> LiveId {
+    LiveId(i as u64 + 1)
+}
+
+impl FabCalibrateSteps {
+    /// The steps' sections, in order: their headers for the editor's swipe-fold.
+    pub fn headers(&self) -> Vec<WidgetRef> {
+        (0..self.count).filter_map(|i| self.items.get(&step_id(i)).cloned()).collect()
+    }
+
+    fn item(&mut self, cx: &mut Cx, i: usize) -> Option<WidgetRef> {
+        let id = step_id(i);
+        if let Some(w) = self.items.get(&id) {
+            return Some(w.clone());
+        }
+        let value: ScriptValue = self.templates.get(&live_id!(Step))?.as_object().into();
+        let w = cx.with_vm(|vm| WidgetRef::script_from_value(vm, value));
+        cx.widget_tree_insert_child(self.uid, id, w.clone());
+        // a step starts folded; the selected one opens (`sync`)
+        w.as_prop_section().set_is_open(cx, false, Animate::No);
+        self.items.insert(id, w.clone());
+        Some(w)
+    }
+
+    /// The selected step's form, emptied when the step, the setup or its part changes. Whether it did.
     fn sync_form(&mut self, cx: &mut Cx, state: &CalibrateState) -> bool {
         let changed = self.shown.as_ref().is_none_or(|(printer, filament, selected, coupon)| {
             printer != &state.printer || filament != &state.filament || *selected != state.selected || coupon != &state.coupon
         });
         if changed {
+            let opened = self.shown.as_ref().is_none_or(|(_, _, selected, coupon)| *selected != state.selected || (coupon.is_none() && state.coupon.is_some()));
             self.shown = Some((state.printer.clone(), state.filament.clone(), state.selected, state.coupon.clone()));
-            self.view.text_input(cx, ids!(body.coupon.first.input)).set_text(cx, "");
-            self.view.text_input(cx, ids!(body.coupon.second.input)).set_text(cx, "");
+            if let Some(w) = self.items.get(&step_id(state.selected)).cloned() {
+                w.text_input(cx, ids!(coupon.first.input)).set_text(cx, "");
+                w.text_input(cx, ids!(coupon.second.input)).set_text(cx, "");
+                // the selected step opens (a new selection, or its part just made)
+                if opened {
+                    w.as_prop_section().set_is_open(cx, true, Animate::Yes);
+                }
+            }
             self.error.clear();
         }
         changed
     }
 
-    fn sync(&mut self, cx: &mut Cx, state: &CalibrateState) {
-        self.sync_form(cx, state);
-        let v = &self.view;
-        let context = if state.printer.is_empty() || state.filament.is_empty() {
-            "Choose a printer and filament in Settings".to_string()
-        } else {
-            format!("{} · {}", state.printer, state.filament)
+    fn sync_step(&self, cx: &mut Cx, w: &WidgetRef, i: usize, row: &CalStepRow, state: &CalibrateState) {
+        w.label(cx, ids!(hdr.title)).set_text(cx, &row.title);
+        w.label(cx, ids!(done)).set_text(cx, &row.done.as_ref().map(|d| format!("✓ {d}")).unwrap_or_default());
+        w.label(cx, ids!(feeds)).set_text(cx, &row.feeds);
+        w.label(cx, ids!(result)).set_visible(cx, row.done.is_some() && !row.summary.is_empty());
+        w.label(cx, ids!(result)).set_text(cx, &row.summary);
+        w.label(cx, ids!(blocked)).set_visible(cx, row.blocked.is_some());
+        w.label(cx, ids!(blocked)).set_text(cx, row.blocked.as_deref().unwrap_or(""));
+        w.view(cx, ids!(make)).set_visible(cx, row.blocked.is_none());
+        w.widget(cx, ids!(clear_result)).set_visible(cx, row.done.is_some());
+        let part = state.coupon.as_ref().filter(|_| i == state.selected);
+        let coupon = w.view(cx, ids!(coupon));
+        coupon.set_visible(cx, part.is_some());
+        let Some(part) = part else { return };
+        coupon.label(cx, ids!(name)).set_text(cx, &part.name);
+        coupon.label(cx, ids!(check)).set_text(cx, &part.check);
+        coupon.label(cx, ids!(variants)).set_text(cx, &part.variants.join("\n"));
+        coupon.label(cx, ids!(variants)).set_visible(cx, !part.variants.is_empty());
+        let (first, second) = match part.answer {
+            AnswerKind::Number => ("Number", ""),
+            AnswerKind::Two(q1, q2) => (q1, q2),
+            AnswerKind::Angle => ("Degrees", ""),
+            AnswerKind::Measure => ("", ""),
         };
-        v.label(cx, ids!(body.head.context)).set_text(cx, &context);
-        let step = state.steps.get(state.selected);
-        let selected = v.view(cx, ids!(body.selected));
-        selected.set_visible(cx, step.is_some());
-        if let Some(step) = step {
-            selected.label(cx, ids!(title)).set_text(cx, &step.title);
-            selected.label(cx, ids!(feeds)).set_text(cx, &step.feeds);
-            selected.label(cx, ids!(blocked)).set_visible(cx, step.blocked.is_some());
-            selected.label(cx, ids!(blocked)).set_text(cx, step.blocked.as_deref().unwrap_or(""));
-            selected.view(cx, ids!(make)).set_visible(cx, step.blocked.is_none());
-        }
-        v.widget(cx, ids!(body.clear_result)).set_visible(cx, step.is_some_and(|step| step.done.is_some()));
-        let coupon = v.view(cx, ids!(body.coupon));
-        coupon.set_visible(cx, state.coupon.is_some());
-        if let Some(part) = &state.coupon {
-            coupon.label(cx, ids!(name)).set_text(cx, &part.name);
-            coupon.label(cx, ids!(check)).set_text(cx, &part.check);
-            coupon.label(cx, ids!(variants)).set_text(cx, &part.variants.join("\n"));
-            coupon.label(cx, ids!(variants)).set_visible(cx, !part.variants.is_empty());
-            let (first, second) = match part.answer {
-                AnswerKind::Number => ("Number", ""),
-                AnswerKind::Two(q1, q2) => (q1, q2),
-                AnswerKind::Angle => ("Degrees", ""),
-                AnswerKind::Measure => ("", ""),
-            };
-            coupon.view(cx, ids!(first)).set_visible(cx, part.answer != AnswerKind::Measure);
-            coupon.view(cx, ids!(second)).set_visible(cx, matches!(part.answer, AnswerKind::Two(..)));
-            for (label, input, text) in [(ids!(first.label), ids!(first.input), first), (ids!(second.label), ids!(second.input), second)] {
-                coupon.label(cx, label).set_text(cx, text);
-                let input = coupon.text_input(cx, input);
-                if input.empty_text() != text {
-                    input.set_empty_text(cx, text.to_string());
-                }
+        coupon.view(cx, ids!(first)).set_visible(cx, part.answer != AnswerKind::Measure);
+        coupon.view(cx, ids!(second)).set_visible(cx, matches!(part.answer, AnswerKind::Two(..)));
+        for (label, input, text) in [(ids!(first.label), ids!(first.input), first), (ids!(second.label), ids!(second.input), second)] {
+            coupon.label(cx, label).set_text(cx, text);
+            let input = coupon.text_input(cx, input);
+            if input.empty_text() != text {
+                input.set_empty_text(cx, text.to_string());
             }
         }
         coupon.label(cx, ids!(error)).set_text(cx, &self.error);
         coupon.label(cx, ids!(error)).set_visible(cx, !self.error.is_empty());
-        v.label(cx, ids!(body.status)).set_text(cx, &state.status);
     }
 
-    fn answer(&self, cx: &mut Cx, coupon: &CouponView) -> Result<CalibrateAction, String> {
-        let first = self.view.text_input(cx, ids!(body.coupon.first.input)).text();
-        let second = self.view.text_input(cx, ids!(body.coupon.second.input)).text();
+    fn answer(&self, cx: &mut Cx, w: &WidgetRef, coupon: &CouponView) -> Result<CalibrateAction, String> {
+        let first = w.text_input(cx, ids!(coupon.first.input)).text();
+        let second = w.text_input(cx, ids!(coupon.second.input)).text();
         let number = |text: &str, label: &str| {
             let range = if coupon.variants.is_empty() { "greater than zero".to_string() } else { format!("from 1 to {}", coupon.variants.len()) };
             text.trim().parse::<usize>().ok()
@@ -272,88 +291,86 @@ impl FabCalibratePanel {
     }
 }
 
-impl Widget for FabCalibratePanel {
+impl Widget for FabCalibrateSteps {
     fn semantics(&self, _cx: &Cx, node: &mut a11y_tree::Node) {
         node.role = a11y_tree::Role::Group;
         makepad_platform::a11y::set_string(&mut node.name, "Calibrate");
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        self.view.handle_event(cx, event, scope);
+        if matches!(event, Event::Draw(_)) { return; }
+        // (their headers' hover and swipe-fold are the Printers editor's: `headers`)
+        let steps = self.headers();
+        for w in &steps {
+            w.handle_event(cx, event, scope);
+        }
         let Event::Actions(actions) = event else { return };
         let Some(state) = scope.data.get::<AppState>() else { return };
         let state = &state.print.calibrate;
         // An action from an old form must not save against a newly selected step/setup.
         if self.sync_form(cx, state) {
-            self.view.redraw(cx);
+            self.area.redraw(cx);
             return;
         }
-        let list = self.view.flat_list(cx, ids!(body.steps));
-        for (id, item) in list.items_with_actions(actions) {
-            let i = id.0 as usize - 1;
-            if i < state.steps.len() && item.as_view().finger_up(actions).is_some_and(|up| up.is_over && !up.cancelled) {
-                cx.action(CalibrateAction::Select(i));
-                return;
+        for (i, w) in steps.iter().enumerate() {
+            let Some(row) = state.steps.get(i) else { continue };
+            // Make: this step selected first, then its part
+            if w.button(cx, ids!(make.part)).clicked(actions) && row.blocked.is_none() {
+                if i != state.selected {
+                    cx.action(CalibrateAction::Select(i));
+                }
+                cx.action(CalibrateAction::MakePart);
+            }
+            if w.button(cx, ids!(clear_result.clear)).clicked(actions) && row.done.is_some() {
+                if i != state.selected {
+                    cx.action(CalibrateAction::Select(i));
+                }
+                self.shown = None;
+                cx.action(CalibrateAction::Clear);
+                self.area.redraw(cx);
             }
         }
-        let step = state.steps.get(state.selected);
-        if self.view.button(cx, ids!(body.selected.make.part)).clicked(actions) && step.is_some_and(|step| step.blocked.is_none()) {
-            cx.action(CalibrateAction::MakePart);
-        }
-        if self.view.text_input(cx, ids!(body.coupon.first.input)).changed(actions).is_some()
-            || self.view.text_input(cx, ids!(body.coupon.second.input)).changed(actions).is_some()
+        let Some(w) = steps.get(state.selected) else { return };
+        if w.text_input(cx, ids!(coupon.first.input)).changed(actions).is_some()
+            || w.text_input(cx, ids!(coupon.second.input)).changed(actions).is_some()
         {
             self.error.clear();
-            self.view.redraw(cx);
+            self.area.redraw(cx);
         }
-        if self.view.button(cx, ids!(body.coupon.save)).clicked(actions) {
+        if w.button(cx, ids!(coupon.save)).clicked(actions) {
             if let Some(coupon) = &state.coupon {
-                match self.answer(cx, coupon) {
+                match self.answer(cx, w, coupon) {
                     Ok(answer) => {
                         self.error.clear();
                         cx.action(answer);
                     }
                     Err(error) => self.error = error,
                 }
-                self.view.redraw(cx);
+                self.area.redraw(cx);
             }
         }
-        if self.view.button(cx, ids!(body.clear_result.clear)).clicked(actions) && step.is_some_and(|step| step.done.is_some()) {
-            self.shown = None;
-            cx.action(CalibrateAction::Clear);
-            self.view.redraw(cx);
-        }
         if actions.iter().any(|a| a.downcast_ref::<CalibrateAction>().is_some()) {
-            self.view.redraw(cx);
+            self.area.redraw(cx);
         }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        if let Some(state) = scope.data.get::<AppState>() {
-            self.sync(cx, &state.print.calibrate);
-        }
-        // FlatList fills the column in place; the outer FabScroll owns all scrolling.
-        while let Some(step) = self.view.draw_walk(cx, scope, walk).step() {
-            let Some(mut list) = step.borrow_mut::<FlatList>() else { continue };
-            if let Some(state) = scope.data.get::<AppState>() {
-                let state = &state.print.calibrate;
-                for (i, row) in state.steps.iter().enumerate() {
-                    let Some(item) = list.item(cx, LiveId(i as u64 + 1), live_id!(Step)) else { continue };
-                    let selected = if i == state.selected { 1.0 } else { 0.0 };
-                    if let Some(mut item) = item.borrow_mut::<View>() {
-                        item.draw_bg.set_dyn_instance(cx, live_id!(selected), &[selected]);
-                    }
-                    item.label(cx, ids!(text.title)).set_text(cx, &row.title);
-                    item.view(cx, ids!(result)).set_visible(cx, row.done.is_some());
-                    if let Some(date) = &row.done {
-                        item.label(cx, ids!(result.date)).set_text(cx, &format!("✓ {date}"));
-                        item.label(cx, ids!(result.summary)).set_text(cx, &row.summary);
-                    }
-                    item.draw_all(cx, &mut Scope::empty());
-                }
+        cx.begin_turtle(walk, self.layout);
+        if let Some(app) = scope.data.get::<AppState>() {
+            let state = &app.print.calibrate;
+            // the steps first, so the form's reset finds the selected one
+            for i in 0..state.steps.len() {
+                self.item(cx, i);
             }
-            list.items.retain_visible();
+            self.count = state.steps.len();
+            self.sync_form(cx, state);
+            for (i, row) in state.steps.iter().enumerate() {
+                let Some(w) = self.items.get(&step_id(i)).cloned() else { continue };
+                self.sync_step(cx, &w, i, row, state);
+                w.draw_all(cx, &mut Scope::empty());
+            }
         }
+        cx.end_turtle_with_area(&mut self.area);
         DrawStep::done()
     }
 }

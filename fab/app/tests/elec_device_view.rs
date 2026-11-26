@@ -371,7 +371,7 @@ fn the_device_view_holds_still_keeps_its_case_and_shows_models_as_they_arrive() 
 
         // 2. Design with its whole slice shown, then Mechanics, then back.
         let fresh = case_of(&closed_report(&app));
-        workspace(&app, "Design");
+        workspace(&app, "3D modeling");
         app.locator(Selector::id("rm_slice")).wait_visible().click();
         app.locator(Selector::id("rm_slice")).wait_checked(true);
         wait_until(&app, "the whole slice", || whole_slice(&app));

@@ -254,7 +254,7 @@ fn the_gizmo_and_the_panel_follow_the_part_through_drags_and_commits(app: TestAp
     // Turn chosen in Design is still chosen after Monitor; Move is a button there too.
     app.locator(Selector::id("t_rotate")).wait_visible().click();
     workspace_row::press(&app, "Monitor");
-    workspace_row::press(&app, "Design");
+    workspace_row::press(&app, "3D modeling");
     app.locator(Selector::id("t_rotate")).wait_checked(true);
 
     // Pick the vase in the parts list (a narrow window stacks it behind its tab).

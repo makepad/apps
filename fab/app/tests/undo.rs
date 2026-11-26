@@ -113,7 +113,7 @@ fn post_x(source: &str) -> Option<f64> {
 fn tree(app: &TestApp) -> Vec<String> {
     // The tree is the Design workspace's.
     if !show_tab(app, "Features") {
-        workspace_row::press(app, "Design");
+        workspace_row::press(app, "3D modeling");
         show_tab(app, "Features");
     }
     app.widget_snapshot()
@@ -249,7 +249,7 @@ object(post)
     }, |p| param_value(p, "r").is_some_and(|v| (v - 11.0).abs() < 1e-6));
 
     // ---- a typed program edit ----
-    workspace_row::press(&app, "Design");
+    workspace_row::press(&app, "3D modeling");
     round_trip(&app, "a typed program edit", || {
         let before = program(&app).source;
         let code = before.replace("param(30mm", "param(40mm");

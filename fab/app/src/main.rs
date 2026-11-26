@@ -1711,7 +1711,9 @@ impl App {
                 KeyCode::KeyH if m.alt && !m.shift => tools::isolate::unhide_all(cx),
                 KeyCode::KeyH if m.shift && !m.alt => tools::isolate::isolate_selected(cx),
                 KeyCode::KeyH if plain => tools::isolate::hide_selected(cx),
-                KeyCode::Slash if plain => {
+                // (and the numpad's `/`: where `/` is Shift+7, QWERTZ and the Nordic layouts, no
+                // bare key names `/`)
+                KeyCode::Slash | KeyCode::NumpadDivide if plain => {
                     let hint = tools::isolate::toggle_solo(cx, &self.state);
                     tools::session::with(|s| s.hint = hint.into());
                 }

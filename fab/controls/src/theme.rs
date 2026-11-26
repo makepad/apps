@@ -252,6 +252,8 @@ pub fn script_mod(vm: &mut ScriptVm) {
             color_text: #(text)
             color_text_dim: #(dim)
             color_text_muted: #(muted)
+            // a disabled button's text and icon: a dark wash over its ground, not a dimmed ink
+            color_disabled_ink: #x00000066
             color_text_active: #(text)
             // what the pointer is on lights to the sheet's hover ink (white over Fab's resting ink)
             color_text_hover: theme.color_text_hover

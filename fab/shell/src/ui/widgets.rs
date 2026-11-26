@@ -128,7 +128,7 @@ script_mod! {
             color_hover: fab.color_text_active
             color_down: fab.color_text_active
             color_focus: fab.color_text
-            color_disabled: fab.color_text_muted
+            color_disabled: fab.color_disabled_ink
             text_style: theme.font_regular{
                 font_size: fab.font_size_ui
             }
@@ -235,7 +235,7 @@ script_mod! {
             color_hover: fab.color_text_active
             color_down: fab.color_text_active
             color_focus: fab.color_text
-            color_disabled: fab.color_text_muted
+            color_disabled: fab.color_disabled_ink
             text_style: theme.font_regular{
                 font_size: fab.font_size_ui
             }
@@ -331,7 +331,7 @@ script_mod! {
             color: fab.color_text
             color_hover: fab.color_text_active
             color_down: fab.color_text_active
-            color_disabled: fab.color_text_muted
+            color_disabled: fab.color_disabled_ink
             get_color: fn() {
                 return self.color
                     .mix(self.color_hover, self.hover)
@@ -469,7 +469,7 @@ script_mod! {
             color_down: fab.color_text_active
             color_active: fab.color_text
             color_focus: fab.color_text_dim
-            color_disabled: fab.color_text_muted
+            color_disabled: fab.color_disabled_ink
             text_style: theme.font_regular{
                 font_size: fab.font_size_ui
             }
@@ -483,7 +483,7 @@ script_mod! {
             color: fab.color_text_dim
             color_hover: fab.color_text_active
             color_active: fab.color_text
-            color_disabled: fab.color_text_muted
+            color_disabled: fab.color_disabled_ink
             // premultiplied with the glyph's coverage, as DrawSvg's own colour is (the inks carry
             // alpha)
             get_color: fn() {
@@ -642,7 +642,7 @@ script_mod! {
             color_down: fab.color_text_active
             // on the accent's bright face, while on: black (the sheet's ink on the accent)
             color_active: fab.color_text_on_accent
-            color_disabled: fab.color_text_muted
+            color_disabled: fab.color_disabled_ink
             get_color: fn() {
                 return self.color
                     .mix(self.color_active, self.active)

@@ -80,7 +80,7 @@ const PAD_CARD_W: f64 = 264.0;
 /// What a playhead step ([`PrintAction::moves_playhead`]) changes: the slice in the view, the
 /// layer slider, the transport with its time and layer readouts, a resin printer's layer and
 /// the headset's view. Everything else in the stage and the panels stays as it was drawn.
-pub const PLAYHEAD: &[&[LiveId]] = &[ids!(viewport), ids!(slice_ui.right_col), ids!(slice_ui.bottom.bar_row.bar), ids!(slice_ui.resin_ui), ids!(xr)];
+pub const PLAYHEAD: &[&[LiveId]] = &[ids!(viewport), ids!(slice_ui.bottom.bar_row.bar), ids!(slice_ui.resin_ui), ids!(xr)];
 
 script_mod! {
     use mod.prelude.fab.*
@@ -283,8 +283,7 @@ script_mod! {
             // Design: the picked part's editor in a sidebar at the view's right edge, under the
             // gizmo's column (the toolbar's Part), while a part is picked and the view has room
             // for it; at the view's foot, as tall as its sections, never past the view's room
-            // (then it scrolls). A
-            // slice's layer slider moves to its left (`slice_ui`'s `part_room`).
+            // (then it scrolls).
             part_side := View{
                 visible: false
                 width: Fill height: Fill flow: Right
@@ -550,6 +549,93 @@ script_mod! {
                         }
                     }
             }
+            bottom := View{
+                width: Fill
+                height: Fill
+                flow: Down
+                Filler{}
+                // Why the plate does not slice, in every workspace with the model.
+                slice_failed := Float{
+                    visible: false
+                    width: Fit
+                    height: Fit
+                    margin: Inset{left: 10 bottom: 6}
+                    padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
+                    slice_failed_text := mod.widgets.FabLabel{ text: "" a11y: {label: "Why the plate does not slice"} }
+                }
+                // The part shows as it was at a step of its build (the Steps editor's marker).
+                step_shown := Float{
+                    visible: false
+                    width: Fit
+                    height: Fit
+                    flow: Right
+                    spacing: 10
+                    align: Align{y: 0.5}
+                    margin: Inset{left: 10 bottom: 6}
+                    padding: Inset{left: 12 right: 8 top: 4 bottom: 4}
+                    step_shown_text := mod.widgets.FabLabel{ text: "" a11y: {label: "The step the view shows"} }
+                    step_back := mod.widgets.FabButton{ text: "Back to the end" a11y: {label: "Back to the end"} }
+                    step_rollback := mod.widgets.FabButton{ text: "Roll back to here" }
+                }
+            }
+        }
+
+        // ---- Mechanics: tools (each tool's help is its tooltip) ----
+        mechanics_ui := View{
+            visible: false width: Fill height: Fill flow: Overlay
+            left := View{
+                // under the header strip (`MECH_TOOLS_GAP` below it)
+                width: Fit height: Fill flow: Down padding: Inset{left: 10 top: 40}
+                tools := Float{
+                    flow: Down padding: 3 spacing: 1
+                    a11y: {role: "radio_group" label: "Mechanics tools"}
+                    FabTip{ place: TipPlace.Right wrap_width: 360 text: #(format!("{}: drag a part to hold and move it. {} moves it nearer or farther. {} to orbit (bare drag off a part).", keymap::tooltip(Key::MechGrab), keymap::shortcut(Key::MechDepth), keymap::shortcut(Key::MechOrbit)))
+                        t_grab := Tool{ a11y: {label: "Grab"} draw_icon +: { svg: crate_resource("self://resources/icons/grab.svg") } }
+                    }
+                    FabTip{ place: TipPlace.Right wrap_width: 360 text: #(format!("{}: drag a part, let go to throw it. {} moves it nearer or farther. {} to orbit (bare drag off a part).", keymap::tooltip(Key::MechThrow), keymap::shortcut(Key::MechDepth), keymap::shortcut(Key::MechOrbit)))
+                        t_throw := Tool{ a11y: {label: "Throw"} draw_icon +: { svg: crate_resource("self://resources/icons/throw.svg") } }
+                    }
+                    FabTip{ place: TipPlace.Right wrap_width: 360 text: #(format!("{}: click a part to pin it at that point; click a pinned part to unpin it. {} to orbit (bare drag off a part).", keymap::tooltip(Key::MechPin), keymap::shortcut(Key::MechOrbit)))
+                        t_pin := Tool{ a11y: {label: "Pin"} draw_icon +: { svg: crate_resource("self://resources/icons/pin.svg") } }
+                    }
+                    FabTip{ place: TipPlace.Right wrap_width: 360 text: #(format!("{}: drag a part to hang it from the pointer and let it swing. {} moves it nearer or farther. {} to orbit (bare drag off a part).", keymap::tooltip(Key::MechDangle), keymap::shortcut(Key::MechDepth), keymap::shortcut(Key::MechOrbit)))
+                        t_dangle := Tool{ a11y: {label: "Dangle"} draw_icon +: { svg: crate_resource("self://resources/icons/dangle.svg") } }
+                    }
+                    FabTip{ place: TipPlace.Right wrap_width: 360 text: #(format!("{}: click a part to push it away from you. {} to orbit (bare drag off a part).", keymap::tooltip(Key::MechPoke), keymap::shortcut(Key::MechOrbit)))
+                        t_poke := Tool{ a11y: {label: "Poke"} draw_icon +: { svg: crate_resource("self://resources/icons/poke.svg") } }
+                    }
+                }
+            }
+            actions := mod.widgets.FabMechActions{}
+        }
+
+        // ---- slice view ----
+        slice_ui := View{
+            visible: false
+            width: Fill
+            height: Fill
+            flow: Overlay
+            // a resin printer's slice: the shown layer flat, beside the playback card (whose pad
+            // walks the stack)
+            resin_ui := View{
+                visible: false
+                width: Fill
+                height: Fill
+                flow: Down
+                Filler{}
+                resin_row := View{
+                    width: Fill
+                    height: Fit
+                    flow: Right
+                    align: Align{y: 1.0}
+                    spacing: 10
+                    padding: Inset{left: #(56.0 + PAD_CARD_W + 10.0) bottom: 12}
+                    resin_panel := mod.widgets.FabResinPanel{}
+                    FabTip{ text: "Follow the printer again: the view shows the layer it cured last"
+                        resin_live := mod.widgets.FabButton{ visible: false text: "Back to live" }
+                    }
+                }
+            }
             // The playback, in a floating card at the view's bottom left: the pad (a Kaoss pad's
             // square: up it the layers, across it the moves within the layer), the transport and
             // the time under it, then the layer and what prints there.
@@ -625,6 +711,8 @@ script_mod! {
             // The slice's state over the view: never a modal, the view
             // stays live (an out-of-date slice shows faded under it).
             chip_layer := View{
+                // (shown with something to say: `slice_status`)
+                visible: false
                 width: Fill
                 height: Fit
                 flow: Down
@@ -2565,7 +2653,6 @@ impl Widget for FabStage {
                     tip.text = if picked { "Part: the picked part's editor in a sidebar at the view's right" } else { "Part: pick a part to edit it here" }.to_string();
                 }
                 v.view(cx, ids!(model_ui.part_side)).set_visible(cx, picked && on);
-                v.widget(cx, ids!(slice_ui.right_col.part_room)).set_visible(cx, picked && on);
             }
             if lead {
                 state.ui.part_side_shown = part_key.1 && part_key.2;
@@ -2574,7 +2661,7 @@ impl Widget for FabStage {
             let part_w = state.ui.part_side_w;
             if self.part_w_shown != Some(part_w) {
                 self.part_w_shown = Some(part_w);
-                let paths: [(&[LiveId], f64); 2] = [(ids!(model_ui.part_side.part_col.part_room.part_card), part_w), (ids!(slice_ui.right_col.part_room), part_w + PART_SIDE_RIGHT - 6.0)];
+                let paths: [(&[LiveId], f64); 1] = [(ids!(model_ui.part_side.part_col.part_room.part_card), part_w)];
                 for (path, w) in paths {
                     let view = v.view(cx, path);
                     if let Some(mut inner) = view.borrow_mut() {
@@ -2809,9 +2896,11 @@ impl Widget for FabStage {
                     let showing = p.showing().cloned();
                     let has = showing.is_some();
                     sv.view(cx, ids!(bottom.bar_row.legend_gap)).set_visible(cx, design);
-                    // the layer slider walks a slice's layers, or a resin printer's
-                    sv.view(cx, ids!(right_col)).set_visible(cx, has || p.resin_shown().is_some());
-                    sv.view(cx, ids!(bottom)).set_visible(cx, has);
+                    // the pad walks a slice's layers, or a resin printer's (its stack alone: no
+                    // transport, no moves)
+                    let resin_stack = p.resin_shown().is_some();
+                    sv.view(cx, ids!(bottom)).set_visible(cx, has || resin_stack);
+                    sv.view(cx, ids!(bottom.bar_row.bar.row.transport)).set_visible(cx, !resin_stack);
                     let bar = sv.view(cx, ids!(bottom.bar_row.bar));
                     let job_view = p.monitor_preview();
                     bar.view(cx, ids!(follow_row)).set_visible(cx, job_view.is_some());
@@ -2887,7 +2976,15 @@ impl Widget for FabStage {
             });
             if self.draw_keys.playback != playback {
                 self.draw_keys.playback = playback;
-                if let Some(pv) = playback.and_then(|_| p.showing()) {
+                if let Some(r) = playback.and_then(|_| p.resin_shown()) {
+                    // a resin printer's stack: its layer and height (no time, nothing printing)
+                    let top = p.play.layer_hi.min(r.count.saturating_sub(1));
+                    let info = v.view(cx, ids!(slice_ui.bottom.bar_row.bar.info));
+                    info.label(cx, ids!(layer_label)).set_text(cx, &format!("Layer {} / {}  ·  {:.2} mm", top + 1, r.count, r.top_of(top)));
+                    info.label(cx, ids!(now)).set_text(cx, "");
+                    self.layer_shown = None;
+                    self.time_shown = None;
+                } else if let Some(pv) = playback.and_then(|_| p.showing()) {
                     // Following a job: where the head is, also while the whole job shows.
                     let at = if p.following().is_some() { p.follow.live } else { p.play.time };
                     let time = (at.max(0.0).round() as u64, pv.total.max(0.0).round() as u64, p.making_preview());

@@ -77,7 +77,7 @@ keymap! {
     Hide => ("H", "Hide selected", "Design / Monitor", Global),
     Isolate => ("Shift+H", "Isolate selected", "Design / Monitor", Global),
     Unhide => ("Alt+H", "Unhide all", "Design / Monitor", Global),
-    Solo => ("/", "Solo the selection", "Design / Monitor", Global),
+    Solo => ("/", "Solo the selection (the numpad's / too)", "Design / Monitor", Global),
     Xray => ("Alt+Z", "X-ray", "Design / Monitor", Global),
     Measure => ("M", "Measure (cycle distance, area, angle, edge, radius, faces, fit)", "Design / Monitor", Global),
     Section => ("C", "Clip: a cross-section through the parts", "Design / Monitor (outside Sculpt)", Global),
@@ -220,7 +220,7 @@ const KEY_NAMES: &[(KeyCode, &str)] = &[
     (KeyCode::Numpad0, "Numpad 0"), (KeyCode::Numpad1, "Numpad 1"), (KeyCode::Numpad2, "Numpad 2"),
     (KeyCode::Numpad3, "Numpad 3"), (KeyCode::Numpad4, "Numpad 4"), (KeyCode::Numpad5, "Numpad 5"),
     (KeyCode::Numpad6, "Numpad 6"), (KeyCode::Numpad7, "Numpad 7"), (KeyCode::Numpad8, "Numpad 8"),
-    (KeyCode::Numpad9, "Numpad 9"),
+    (KeyCode::Numpad9, "Numpad 9"), (KeyCode::NumpadDivide, "Numpad /"),
 ];
 
 /// One chord as the table writes it ("Cmd/Ctrl+Shift+D"); none for a mouse gesture, a modifier

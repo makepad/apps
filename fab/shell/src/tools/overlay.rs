@@ -295,16 +295,6 @@ impl FabToolOverlay {
     fn draw_picks(&mut self, cx: &mut Cx2d, state: &AppState, proj: &ViewProjector, rect: Rect) {
         use crate::tools::picks::on_plate;
         let picks = &state.picks;
-        // the kind filter, while picks are made
-        if crate::tools::picks::active(state) {
-            for (r, kind) in crate::tools::picks::strip(rect) {
-                let on = kind == picks.filter;
-                self.draw_panel.color = if on { vec4(self.color_accent.x, self.color_accent.y, self.color_accent.z, 0.9) } else { vec4(0.06, 0.06, 0.07, 0.8) };
-                self.draw_panel.draw_abs(cx, r);
-                self.small_text(cx, r.pos + dvec2(9.0, 5.0), kind.label(), if on { vec4(1.0, 1.0, 1.0, 1.0) } else { self.color_measure });
-            }
-            self.draw_panel.color = vec4(0.06, 0.06, 0.07, 0.92);
-        }
         let at = |p: [f64; 3]| proj.project(vec3(p[0] as f32 * 0.001, p[1] as f32 * 0.001, p[2] as f32 * 0.001));
         let halo = vec4(0.04, 0.04, 0.04, 0.85);
         // what a click would take on a crease: a tick along it at the pointer's point
@@ -375,15 +365,6 @@ impl FabToolOverlay {
     /// that row or closes the list, Esc closes it.
     fn other_event(&mut self, cx: &mut Cx, event: &Event, state: &mut AppState) {
         use crate::tools::picks::PickAction;
-        // a press on the kind filter's strip sets it
-        if let Event::MouseDown(e) = event {
-            if crate::tools::picks::active(state) {
-                if let Some((_, kind)) = crate::tools::picks::strip(self.area.rect(cx)).into_iter().find(|(r, _)| r.contains(e.abs)) {
-                    cx.action(PickAction::Filter(kind));
-                    return;
-                }
-            }
-        }
         let Some(other) = &mut state.picks.other else { return };
         match event {
             Event::MouseMove(e) => {

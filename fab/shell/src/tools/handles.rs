@@ -699,8 +699,7 @@ impl FabShapeHandles {
                 if self.last_pick.is_some_and(|p| (pos - p).length() >= 4.0) {
                     self.last_pick = None;
                 }
-                let on_strip = super::picks::strip(self.area.rect(cx)).iter().any(|(r, _)| r.contains(pos));
-                let ray = (self.hover.is_none() && state.picks.other.is_none() && !on_strip).then(|| self.pick_ray(cx, state, pos));
+                let ray = (self.hover.is_none() && state.picks.other.is_none()).then(|| self.pick_ray(cx, state, pos));
                 let view = (*state.view.camera(self.pane), self.area.rect(cx));
                 cx.action(PickAction::Hover(ray.map(|(from, dir, pixel)| super::picks::Hover { from, dir, pixel, at: pos, view })));
             }
@@ -711,10 +710,9 @@ impl FabShapeHandles {
                 }
             }
             ViewportInputKind::PointerDown { button: PointerButton::Primary, pos, mods, tap_count } => {
-                // Select Other open: this press closes it (a row's press is the overlay's); the
-                // kind filter's strip and a handle take their own presses.
-                let on_strip = super::picks::strip(self.area.rect(cx)).iter().any(|(r, _)| r.contains(pos));
-                if state.picks.other.is_some() || on_strip || (self.target_at(pos).is_some() && !self.on_last_pick(state, pos)) {
+                // Select Other open: this press closes it (a row's press is the overlay's); a
+                // handle takes its own presses.
+                if state.picks.other.is_some() || (self.target_at(pos).is_some() && !self.on_last_pick(state, pos)) {
                     self.held = None;
                     return;
                 }

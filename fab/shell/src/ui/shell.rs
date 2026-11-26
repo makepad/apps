@@ -88,7 +88,7 @@ script_mod! {
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
                 sdf.rect(0.0, 0.0, self.rect_size.x, self.rect_size.y)
-                sdf.fill(fab.color_header.mix(fab.color_editor, self.active))
+                sdf.fill(fab.color_header.mix(fab.color_toolbar, self.active))
                 let w = self.rect_size.x - 12.0
                 sdf.box(6.0, self.rect_size.y - 2.0, w, 2.0, 0.5)
                 sdf.fill(vec4(fab.color_accent.xyz, fab.color_accent.w * self.active))
@@ -219,7 +219,6 @@ script_mod! {
                 Library := FabLibraryPanel{}
                 Checks := FabChecksPanel{}
                 BoardControls := FabBoardControlsPanel{}
-                Paint := FabPaintPanel{}
                 Jobs := FabJobsPanel{}
                 Performance := FabPerfPanel{}
                 ModelSources := FabModelSources{}

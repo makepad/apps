@@ -813,8 +813,8 @@ impl AreaTree {
                         }
                     }
                 }
-                // one editor whose body keeps the nub's corner clear: no tab bar, only the nub
-                let hide_tab_bar = out.len() == 1 && alone.is_some_and(|e| e.keeps_corner());
+                // one view without a toolbar of its own: no tab bar, only the nub
+                let hide_tab_bar = out.len() == 1 && alone.is_some_and(|e| e.bare_alone());
                 map.insert(id.area_live_id(), DockItem::Tabs { tabs: out, selected: front.unwrap_or(0), closable: false, hide_tab_bar });
                 id.area_live_id()
             }

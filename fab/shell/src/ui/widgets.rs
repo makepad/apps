@@ -726,7 +726,9 @@ script_mod! {
     mod.widgets.FabToolSep = View{ width: 20 height: 1 margin: Inset{left: 6 top: 4 bottom: 4} show_bg: true draw_bg +: { color: fab.color_border_light } }
 
     // =====================================================================
-    // Checkbox — Fab's inset well with a white tick.
+    // Checkbox — a text field's well: a #00000020 fill, its outline #00000040 at rest, #ffffff20
+    // under the pointer, #ffffff40 with focus; the tick in the text's ink, lit under the pointer.
+    // The property kit's PropCheckBox (the slicer's rows, Global, Advanced) draws the same.
     // =====================================================================
 
     mod.widgets.FabCheckBox = CheckBox{
@@ -735,39 +737,111 @@ script_mod! {
         align: Align{x: 0.0 y: 0.5}
         padding: Inset{left: 0 right: 0 top: 0 bottom: 0}
         margin: Inset{top: 0 bottom: 0 left: 0 right: 0}
-        label_walk: Walk{ width: Fit height: Fit margin: Inset{left: 18 right: 0 top: 0 bottom: 0} }
+        label_walk: Walk{ width: Fit height: Fit margin: Inset{left: 19 right: 0 top: 0 bottom: 0} }
         draw_bg +: {
             size: uniform(13.0)
-            border_size: uniform(1.0)
-            border_radius: uniform(fab.radius)
-            color: fab.color_toggle_off
-            color_hover: fab.color_input_hover
-            color_down: fab.color_input_active
-            color_active: fab.color_toggle_on
-            color_focus: fab.color_toggle_off
-            color_disabled: fab.color_editor_alt
-            border_color: fab.color_border
-            border_color_hover: fab.color_border_light
-            border_color_down: fab.color_border
-            border_color_active: fab.color_border
-            border_color_focus: fab.color_focus_ring
-            border_color_disabled: fab.color_border
-            mark_color: vec4(0.0, 0.0, 0.0, 0.0)
-            mark_color_hover: vec4(0.0, 0.0, 0.0, 0.0)
-            mark_color_down: vec4(0.0, 0.0, 0.0, 0.0)
-            mark_color_active: fab.color_toggle_mark
-            mark_color_active_hover: fab.color_toggle_mark
-            mark_color_focus: vec4(0.0, 0.0, 0.0, 0.0)
-            mark_color_disabled: fab.color_text_muted
+            border_radius: uniform(1.5)
+            mark_at_end: uniform(0.0)
+            color: uniform(#x00000020)
+            border_color: uniform(#x00000040)
+            border_color_hover: uniform(#xffffff20)
+            border_color_focus: uniform(#xffffff40)
+            mark_color_active: uniform(fab.color_text)
+            mark_color_hover: uniform(fab.color_text_hover)
+            mark_color_disabled: uniform(fab.color_text_dim)
+            pixel: fn() {
+                let dpi = self.draw_pass.dpi_factor
+                let px = 1.0 / dpi
+                let origin = self.rect_pos + vec2((self.rect_size.x - self.size) * self.mark_at_end, (self.rect_size.y - self.size) * 0.5 + self.mark_box_offset_y)
+                let lo = floor(origin * dpi + 0.5) / dpi - self.rect_pos
+                let hi = floor((origin + vec2(self.size)) * dpi + 0.5) / dpi - self.rect_pos
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                // The well and its 1 pt outline, as a text field's, covered per device pixel: the
+                // SDF's own soft edge would leave a 1 pt line at half strength.
+                let q = self.pos * self.rect_size
+                let r = self.border_radius
+                let e = max(lo - q, q - hi) + vec2(r, r)
+                let d = length(max(e, vec2(0.0, 0.0))) + min(max(e.x, e.y), 0.0) - r
+                let outer = clamp(0.5 - d * dpi, 0.0, 1.0)
+                let ring = outer - clamp(0.5 - (d + 1.0) * dpi, 0.0, 1.0)
+                let f = self.color * (1.0 - self.disabled * 0.5)
+                let line = self.border_color.mix(self.border_color_hover, self.hover).mix(self.border_color_focus, max(self.focus, self.down)).mix(self.border_color, self.disabled)
+                let well = vec4(f.rgb * f.a, f.a) * outer
+                sdf.result = vec4(line.rgb * line.a, line.a) * ring + well * (1.0 - line.a * ring)
+                let c = (lo + hi) * 0.5
+                let ink = self.mark_color_active.mix(self.mark_color_hover, self.hover).mix(self.mark_color_disabled, self.disabled)
+                // The tick (or a mixed dash) is 1.5 pt wide, in the text's ink.
+                if self.mixed > 0.5 {
+                    sdf.move_to(lo.x + 3.0, c.y)
+                    sdf.line_to(hi.x - 3.0, c.y)
+                    sdf.stroke(ink, 0.75)
+                } else if self.active > 0.5 {
+                    sdf.move_to(c.x - 3.0, c.y)
+                    sdf.line_to(c.x - 1.0, c.y + 2.0)
+                    sdf.line_to(c.x + 3.0, c.y - 2.0)
+                    sdf.stroke(ink, 0.75)
+                }
+                return sdf.result
+            }
         }
         draw_text +: {
             ink_centered: true
             color: fab.color_text
-            color_hover: fab.color_text_active
+            color_hover: fab.color_text_hover
             color_active: fab.color_text
-            color_disabled: fab.color_text_muted
+            color_disabled: fab.color_text_dim
             text_style: theme.font_regular{
                 font_size: fab.font_size_ui
+            }
+        }
+    }
+
+    mod.widgets.PropCheckBox = mod.widgets.PropCheckBox{
+        label_walk: Walk{width: Fill height: Fit margin: Inset{left: 19}}
+        draw_bg +: {
+            size: uniform(13.0)
+            border_radius: uniform(1.5)
+            mark_at_end: uniform(0.0)
+            color: uniform(#x00000020)
+            border_color: uniform(#x00000040)
+            border_color_hover: uniform(#xffffff20)
+            border_color_focus: uniform(#xffffff40)
+            mark_color_active: uniform(fab.color_text)
+            mark_color_hover: uniform(fab.color_text_hover)
+            mark_color_disabled: uniform(fab.color_text_dim)
+            pixel: fn() {
+                let dpi = self.draw_pass.dpi_factor
+                let px = 1.0 / dpi
+                let origin = self.rect_pos + vec2((self.rect_size.x - self.size) * self.mark_at_end, (self.rect_size.y - self.size) * 0.5 + self.mark_box_offset_y)
+                let lo = floor(origin * dpi + 0.5) / dpi - self.rect_pos
+                let hi = floor((origin + vec2(self.size)) * dpi + 0.5) / dpi - self.rect_pos
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                // The well and its 1 pt outline, as a text field's, covered per device pixel: the
+                // SDF's own soft edge would leave a 1 pt line at half strength.
+                let q = self.pos * self.rect_size
+                let r = self.border_radius
+                let e = max(lo - q, q - hi) + vec2(r, r)
+                let d = length(max(e, vec2(0.0, 0.0))) + min(max(e.x, e.y), 0.0) - r
+                let outer = clamp(0.5 - d * dpi, 0.0, 1.0)
+                let ring = outer - clamp(0.5 - (d + 1.0) * dpi, 0.0, 1.0)
+                let f = self.color * (1.0 - self.disabled * 0.5)
+                let line = self.border_color.mix(self.border_color_hover, self.hover).mix(self.border_color_focus, max(self.focus, self.down)).mix(self.border_color, self.disabled)
+                let well = vec4(f.rgb * f.a, f.a) * outer
+                sdf.result = vec4(line.rgb * line.a, line.a) * ring + well * (1.0 - line.a * ring)
+                let c = (lo + hi) * 0.5
+                let ink = self.mark_color_active.mix(self.mark_color_hover, self.hover).mix(self.mark_color_disabled, self.disabled)
+                // The tick (or a mixed dash) is 1.5 pt wide, in the text's ink.
+                if self.mixed > 0.5 {
+                    sdf.move_to(lo.x + 3.0, c.y)
+                    sdf.line_to(hi.x - 3.0, c.y)
+                    sdf.stroke(ink, 0.75)
+                } else if self.active > 0.5 {
+                    sdf.move_to(c.x - 3.0, c.y)
+                    sdf.line_to(c.x - 1.0, c.y + 2.0)
+                    sdf.line_to(c.x + 3.0, c.y - 2.0)
+                    sdf.stroke(ink, 0.75)
+                }
+                return sdf.result
             }
         }
     }
@@ -850,14 +924,33 @@ script_mod! {
     // selector (the notch layer draws that chip there: `area_notch::TOOLBAR_SLOT`), then the
     // editor's own tools (its toggles and actions), its search always last. Every panel editor
     // starts with one, so the tab bar above holds only the area's tabs.
-    mod.widgets.FabEditorBar = View{
+    // A row of tools that scrolls sideways once it is wider than its room: a drag (from a button
+    // too) or the mouse wheel moves it, with no bar drawn. `mask` covers its side padding with
+    // the editor ground, so tools scrolled under the area's selector or close button go under.
+    mod.widgets.FabToolScrollBase = #(FabToolScroll::register_widget(vm))
+    mod.widgets.FabToolScroll = set_type_default() do mod.widgets.FabToolScrollBase{
+        width: Fill height: Fit flow: Right
+        scroll_bars: mod.widgets.ScrollBars{
+            show_scroll_x: true show_scroll_y: false
+            scroll_bar_x.drag_scrolling: true
+            scroll_bar_x.use_vertical_finger_scroll: true
+            scroll_bar_x.show_handle: false
+        }
+        draw_mask +: {
+            color: uniform(fab.color_toolbar)
+            pixel: fn() { return vec4(self.color.xyz * self.color.w, self.color.w) }
+        }
+    }
+
+    mod.widgets.FabEditorBar = mod.widgets.FabToolScroll{
+        mask: true
         width: Fill height: #(crate::ui::area_notch::TOOLBAR_H)
         flow: Right align: Align{y: 0.5} spacing: 6
-        // its ground (none, or a bar's own: `color`) and a subtle line along its foot, a whole
-        // point on device pixels
+        // its ground (a shade above the panel's) and a subtle line along its foot, a whole point
+        // on device pixels
         show_bg: true
         draw_bg +: {
-            color: uniform(#x00000000)
+            color: uniform(fab.color_toolbar)
             line: uniform(0.15)
             pixel: fn() {
                 let foot = step(self.rect_size.y - 1.0, self.pos.y * self.rect_size.y) * self.line
@@ -1697,6 +1790,51 @@ const SEARCH_OPEN_S: f64 = 0.16;
 /// opens; it closes again on a press outside it or when the field lets go of the keyboard,
 /// either empty, or on Escape (which clears it). A search with words in it stays open. Its
 /// field is `row.input`, as before.
+/// A row of tools that scrolls sideways when it is clipped ([`FabToolScroll`] in the script):
+/// the app turns a mouse drag's scrolling off everywhere (a drag selects, folds or moves), and
+/// this row turns it back on for the presses that start in it, so a drag that starts on a
+/// button scrolls the row (a click still clicks). The wheel scrolls it as well.
+#[derive(Script, ScriptHook, Widget)]
+pub struct FabToolScroll {
+    #[deref]
+    view: View,
+    /// Its side padding covered with the editor ground, drawn over what scrolled under it.
+    #[live]
+    mask: bool,
+    #[live]
+    draw_mask: DrawQuad,
+}
+
+impl Widget for FabToolScroll {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        let ours = matches!(event, Event::MouseDown(e) if self.view.area().clipped_rect(cx).contains(e.abs));
+        if ours {
+            cx.set_mouse_drag_scrolling(true);
+        }
+        self.view.handle_event(cx, event, scope);
+        if ours {
+            cx.set_mouse_drag_scrolling(false);
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        while self.view.draw_walk(cx, scope, walk).is_step() {}
+        if self.mask {
+            let rect = self.view.area().rect(cx);
+            let pad = self.view.layout.padding;
+            // (above the foot line, which stays)
+            let h = (rect.size.y - 1.0).max(0.0);
+            self.draw_mask.new_draw_call(cx);
+            for (x, w) in [(rect.pos.x, pad.left), (rect.pos.x + rect.size.x - pad.right, pad.right)] {
+                if w > 0.0 {
+                    self.draw_mask.draw_abs(cx, Rect { pos: dvec2(x, rect.pos.y), size: dvec2(w, h) });
+                }
+            }
+        }
+        DrawStep::done()
+    }
+}
+
 #[derive(Script, ScriptHook, Widget)]
 pub struct FabSearch {
     #[deref]

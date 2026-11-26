@@ -66,7 +66,8 @@ pub enum Editor {
     Checks,
     /// The run board's keys and knobs (the Transport's controls header brings it forward).
     BoardControls,
-    /// The paint brush's colour and settings (the plate's rail keeps the paint tools).
+    /// Retired: the paint brush's colour and settings are in the plate view's row of the
+    /// chosen tool's tools. Kept so a saved layout that names it still reads.
     Paint,
     /// Saved print jobs and the printer's progress.
     Jobs,
@@ -95,7 +96,7 @@ pub enum Family {
 /// Experimental's editors are offered only while View › Experimental has their family on.
 pub const MENU: [(&str, &[Editor]); 7] = [
     ("3D views", &[Editor::Viewport, Editor::Device]),
-    ("Plate data", &[Editor::Plates, Editor::Parts, Editor::Part, Editor::Paint, Editor::Code]),
+    ("Plate data", &[Editor::Plates, Editor::Parts, Editor::Part, Editor::Code]),
     ("Print", &[Editor::Slicer, Editor::Overrides, Editor::TestPrints, Editor::Settings, Editor::Printer, Editor::Calibrate, Editor::Camera, Editor::Jobs]),
     ("Analysis", &[Editor::Slice, Editor::Strength, Editor::Force, Editor::Mechanics, Editor::Performance]),
     ("Electronics", &[Editor::Circuit, Editor::Board, Editor::Library, Editor::Checks, Editor::Bench, Editor::BoardControls, Editor::Scope, Editor::Transport, Editor::Firmware]),
@@ -207,11 +208,18 @@ impl Editor {
         self == Editor::Circuit
     }
 
-    /// Its body keeps the top-left corner clear for its area's nub: alone in an area it shows no
-    /// tab bar, only the nub. Every other editor alone keeps a tab bar of one, the nub at its
-    /// left end, so the nub covers none of it.
+    /// Its body keeps the top-left corner clear for its area's nub: a view, not a list. Every
+    /// other editor alone keeps a tab bar of one, the nub at its left end, so the nub covers none
+    /// of it.
     pub fn keeps_corner(self) -> bool {
         matches!(self, Editor::Viewport | Editor::Code | Editor::Device | Editor::Board | Editor::Circuit | Editor::Bench | Editor::Scope | Editor::Transport | Editor::Firmware)
+    }
+
+    /// Alone in an area it shows no tab bar, only the nub: a view that keeps the corner clear and
+    /// has no toolbar of its own (the Plate view's and the Program's nub is their toolbar's first
+    /// button, under a tab bar as every panel's).
+    pub fn bare_alone(self) -> bool {
+        self.keeps_corner() && !matches!(self, Editor::Viewport | Editor::Code)
     }
 
     /// The editor whose bodies are of `kind`.
@@ -230,7 +238,7 @@ impl Editor {
 
     /// An editor no area shows any more (it went into another), kept for the layouts that name it.
     pub fn retired(self) -> bool {
-        matches!(self, Editor::Parameters)
+        matches!(self, Editor::Parameters | Editor::Paint)
     }
 
     pub fn of_kind(kind: LiveId) -> Option<Editor> {

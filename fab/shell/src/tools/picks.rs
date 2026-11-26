@@ -176,22 +176,6 @@ pub fn pixel(cam: &Camera, rect: Rect) -> [f64; 2] {
     }
 }
 
-/// The kind filter's strip in the view while picks are made: each kind's box (window points)
-/// along the view's bottom left, right of the tool rail and the Edit shape strip.
-pub fn strip(view: Rect) -> Vec<(Rect, PickKind)> {
-    let mut x = view.pos.x + 104.0;
-    let y = view.pos.y + view.size.y - 36.0;
-    PickKind::ALL
-        .iter()
-        .map(|k| {
-            let w = k.label().len() as f64 * 6.5 + 18.0;
-            let r = Rect { pos: dvec2(x, y), size: dvec2(w, 22.0) };
-            x += w + 4.0;
-            (r, *k)
-        })
-        .collect()
-}
-
 /// Picks are made in the Edit shape mode of the Select tool, in Design.
 pub fn active(state: &AppState) -> bool {
     state.ui.gizmo == GizmoMode::Shape && state.tool == Tool::Select && state.ui.in_mode(PlateMode::Design)

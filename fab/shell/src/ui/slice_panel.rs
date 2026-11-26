@@ -17,6 +17,19 @@ script_mod! {
     // (the app's own sections, rows and fields: `PropSection` is Fab's, as every editor's)
     use mod.widgets.*
 
+    // A section nested in the Legend: its bar a level in (under the Legend's icon, as the Part
+    // panel's parameter groups), its rows where the Legend's other rows are.
+    let LegendPart = PropSection{
+        grip: false
+        margin: Inset{}
+        header +: {hdr +: {margin: Inset{left: theme.prop_icon_size + theme.prop_label_gap} padding: Inset{left: theme.prop_label_gap right: theme.prop_pad}}}
+        body: View{
+            width: Fill height: Fit flow: Down
+            // its rows a level in too: they start where its bar does
+            padding: Inset{left: theme.prop_icon_size + theme.prop_label_gap top: 4 bottom: 6}
+        }
+    }
+
     mod.widgets.FabSlicePanelBase = #(FabSlicePanel::register_widget(vm))
     mod.widgets.FabSlicePanel = set_type_default() do mod.widgets.FabSlicePanelBase{
         width: Fill
@@ -94,7 +107,16 @@ script_mod! {
                 legend_box := PropSection{
                     header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/palette.svg")}} title +: {text: "Legend"}}}
                     body +: {
-                        legend := mod.widgets.FabSliceLegend{}
+                        // nested: the colours' key (titled as the colour mode) with the print
+                        // time, then the materials
+                        key_box := LegendPart{
+                            header +: {hdr +: {title +: {text: "Feature"}}}
+                            body +: { legend := mod.widgets.FabSliceLegend{part: 1} }
+                        }
+                        material_box := LegendPart{
+                            header +: {hdr +: {title +: {text: "Material"}}}
+                            body +: { materials := mod.widgets.FabSliceLegend{part: 2} }
+                        }
                     }
                 }
             }
@@ -158,7 +180,8 @@ impl Widget for FabSlicePanel {
         }
         // the sections' headers first (their hover, and a drag across them folding them all)
         if matches!(event, Event::MouseMove(_) | Event::MouseDown(_) | Event::MouseUp(_) | Event::MouseLeave(_) | Event::ClearHover) {
-            let sections = [ids!(display), ids!(compare), ids!(legend_box), ids!(printability), ids!(overhang_list)].map(|path| self.view.widget(cx, path));
+            // (the Legend's nested Feature and Material sections among them)
+            let sections = [ids!(display), ids!(compare), ids!(legend_box), ids!(key_box), ids!(material_box), ids!(printability), ids!(overhang_list)].map(|path| self.view.widget(cx, path));
             crate::ui::widgets::section_headers(cx, event, &sections);
         }
         self.view.handle_event(cx, event, scope);
@@ -242,6 +265,10 @@ impl Widget for FabSlicePanel {
             // a section with nothing to show hides: the legend and the overhangs come with a
             // slice, Printability with a slice or something found
             b.widget(cx, ids!(legend_box)).set_visible(cx, has);
+            // the key's section is titled as the colour mode (the overhang key while it shows)
+            let key = if p.overhangs && !p.play.active { "Overhang" } else { p.play.color.label() };
+            b.label(cx, ids!(key_box.title)).set_text(cx, key);
+            b.widget(cx, ids!(material_box)).set_visible(cx, has && crate::print::timeline::legend_has_materials(state));
             b.widget(cx, ids!(printability)).set_visible(cx, fixable || crate::print::timeline::issues_shown(p));
             b.widget(cx, ids!(overhang_list)).set_visible(cx, crate::print::support_list::has_lines(p));
             let none = b.label(cx, ids!(none));

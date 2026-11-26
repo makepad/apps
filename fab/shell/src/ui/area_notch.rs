@@ -169,7 +169,6 @@ script_mod! {
         Library := Notch{tip +: {text: "Library" chip +: {a11y: {label: "Library: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/folder_open.svg")}}}}
         Checks := Notch{tip +: {text: "Checks" chip +: {a11y: {label: "Checks: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/check.svg")}}}}
         BoardControls := Notch{tip +: {text: "Board controls" chip +: {a11y: {label: "Board controls: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/gear.svg")}}}}
-        Paint := Notch{tip +: {text: "Paint" chip +: {a11y: {label: "Paint: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/paint.svg")}}}}
         Jobs := Notch{tip +: {text: "Jobs" chip +: {a11y: {label: "Jobs: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/layers.svg")}}}}
         Performance := Notch{tip +: {text: "Performance" chip +: {a11y: {label: "Performance: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/speed.svg")}}}}
         ModelSources := Notch{tip +: {text: "Model sources" chip +: {a11y: {label: "Model sources: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/import.svg")}}}}

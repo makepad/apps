@@ -47,11 +47,11 @@ script_mod! {
             padding: Inset{left: #(crate::ui::area_notch::TOOLBAR_SLOT) right: #(crate::ui::area_notch::TOOLBAR_END)}
             spacing: 6
             show_bg: true
-            // the panel's ground, and the toolbars' subtle foot line
+            // the toolbars' ground (a shade above the panel's) and their subtle foot line
             draw_bg +: {
                 pixel: fn() {
                     let foot = step(self.rect_size.y - 1.0, self.pos.y * self.rect_size.y) * 0.15
-                    return vec4(fab.color_editor.xyz * (1.0 - foot), 1.0)
+                    return vec4(fab.color_toolbar.xyz * (1.0 - foot), 1.0)
                 }
             }
             selector_rule := mod.widgets.FabVRule{}

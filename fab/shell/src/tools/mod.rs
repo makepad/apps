@@ -439,11 +439,6 @@ impl ToolController for ToolSet {
 
                 match state.tool {
                     Tool::Select => {
-                        // A click on the pick kind filter's strip is the strip's: the part
-                        // under it stays picked.
-                        if crate::tools::picks::active(state) && crate::tools::picks::strip(input.rect).iter().any(|(r, _)| r.contains(pos)) {
-                            return InputResponse::consumed();
-                        }
                         if state.ui.lay_flat && !mods.shift {
                             // A test print's piece shown, picked in place or the ticked ones on the
                             // bed: the click lays the piece, where the app finds the face it meets.

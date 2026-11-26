@@ -3689,7 +3689,7 @@ impl FabViewport {
                 crate::ui::redraw(cx, &[ids!(tool_overlay)]);
                 if brush_controls != (state.ui.paint_radius, crate::tools::paint::erasing(state), state.ui.sculpt_radius, crate::tools::sculpt::operation(state)) {
                     // Brush radius and Alt-mode changes also appear in the tool strips.
-                    crate::ui::redraw(cx, &[ids!(model_ui.left.paint_bar), ids!(model_ui.left.sculpt_bar)]);
+                    crate::ui::redraw(cx, &[ids!(model_ui.context.paint_bar), ids!(model_ui.context.sculpt_bar)]);
                 }
             }
         }

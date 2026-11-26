@@ -601,6 +601,11 @@ pub struct FabSliceLegend {
     color_error: Vec4f,
     #[rust]
     hint: PropHint,
+    /// Which of it this one draws: 0 all of it; 1 the colours' key and the print time (the
+    /// Legend's first nested section), 2 the materials and the filament (its second). The parts
+    /// leave out the key's heading word, their section's title says it.
+    #[live]
+    part: u32,
     #[rust]
     area: Area,
     /// Material row hit rectangles and their full design-to-spool explanations.
@@ -677,7 +682,40 @@ fn metres(mm: f64) -> String {
     }
 }
 
-fn legend_rows(s: &AppState) -> Vec<Row> {
+/// The legend's rows, or one part of them (see [`FabSliceLegend::part`]).
+fn legend_rows(s: &AppState, part: u32) -> Vec<Row> {
+    let mut out = all_legend_rows(s);
+    if part == 0 {
+        // whole, the materials' heading only over their table
+        out.retain(|r| !matches!(r, Row::Head(name, cols) if name == "MATERIAL" && cols.is_empty()));
+        return out;
+    }
+    let split = out.iter().position(|r| matches!(r, Row::Head(_, _)) && material_head(r)).unwrap_or(out.len());
+    let mut rows: Vec<Row> = if part == 1 { out.drain(..split).collect() } else { out.drain(split..).collect() };
+    // the heading word is the section's title: a heading keeps its columns' names, or goes
+    rows.retain(|r| !matches!(r, Row::Head(_, cols) if cols.is_empty()));
+    for r in rows.iter_mut() {
+        if let Row::Head(name, _) = r {
+            name.clear();
+        }
+    }
+    while matches!(rows.first(), Some(Row::Gap)) {
+        rows.remove(0);
+    }
+    rows
+}
+
+/// Where the materials begin: their table's heading, or the totals' first material line.
+fn material_head(r: &Row) -> bool {
+    matches!(r, Row::Head(name, _) if name == "MATERIAL")
+}
+
+/// The Legend's Material section has rows: a preview with its materials (not the overhang key).
+pub fn legend_has_materials(s: &AppState) -> bool {
+    !legend_rows(s, 2).is_empty()
+}
+
+fn all_legend_rows(s: &AppState) -> Vec<Row> {
     let p = &s.print;
     let mut out = Vec::new();
     if p.overhangs && !p.play.active {
@@ -757,9 +795,8 @@ fn legend_rows(s: &AppState) -> Vec<Row> {
     let plate = pv.printability.plate.as_ref();
     let cost_of = |slot: usize| plate.and_then(|p| p.filaments.iter().find(|f| f.filament as usize == slot + 1)).map(|f| f.cost).filter(|c| *c > 0.0);
     // Each material's print, then what the changes purge of them all, on its own row.
-    if !pv.filament_use.is_empty() {
-        out.push(Row::Head("MATERIAL".into(), "PRINTS    TIME      COST".into()));
-    }
+    // (always a heading: it is where the Legend's Material section begins)
+    out.push(Row::Head("MATERIAL".into(), if pv.filament_use.is_empty() { String::new() } else { "PRINTS    TIME      COST".into() }));
     let (mut purge_grams, mut purge_cost) = (0.0, None::<f64>);
     for u in &pv.filament_use {
         let color = pv.filament_colors.get(u.slot).copied();
@@ -823,7 +860,7 @@ impl Widget for FabSliceLegend {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        let rows = scope.data.get::<AppState>().map(legend_rows).unwrap_or_default();
+        let rows = scope.data.get::<AppState>().map(|s| legend_rows(s, self.part)).unwrap_or_default();
         self.text.clear();
         self.hits.clear();
         for r in &rows {

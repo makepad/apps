@@ -1606,6 +1606,12 @@ pub struct FabPaintPalette {
     #[rust] area: Area,
 }
 
+/// After a pick: the plate view's paint row draws in a list of its own that the view's redraws
+/// reuse, so the swatch ring, the brush dial's disc and the support toggles redraw only when asked.
+fn repaint_brush_row(cx: &mut Cx) {
+    crate::ui::redraw(cx, &[ids!(model_ui.context.paint_bar)]);
+}
+
 impl Widget for FabPaintPalette {
     fn semantics(&self, _cx: &Cx, node: &mut a11y_tree::Node) {
         node.role = a11y_tree::Role::RadioGroup;
@@ -1632,6 +1638,7 @@ impl Widget for FabPaintPalette {
         let Some(key) = cx.a11y.action_part_key(request.node) else { return ActionResult::Unhandled };
         let Some((_, index)) = key.checked_sub(1).and_then(|i| self.chips.get(i as usize)) else { return ActionResult::Unsupported };
         cx.action(crate::ui::stage::StageAction::PaintColor(*index));
+        repaint_brush_row(cx);
         ActionResult::Handled
     }
 
@@ -1654,6 +1661,7 @@ impl Widget for FabPaintPalette {
                 if let Some((_, index)) = self.chips.iter().find(|(r, _)| r.contains(fe.abs)) {
                     self.hint.clear(cx, uid);
                     cx.action(crate::ui::stage::StageAction::PaintColor(*index));
+                    repaint_brush_row(cx);
                 }
             }
             _ => {}
@@ -1679,10 +1687,15 @@ impl Widget for FabPaintPalette {
         let chip = self.chip;
         let gap = (chip * 0.22).round();
         let cell_h = chip + 11.0;
-        let width = cx.turtle().next_walk_width(walk.width, walk.margin);
+        // A Fit width (a row of tools across the view) takes every swatch in one row.
+        let fit = walk.width.is_fit();
+        let width = if fit { colors.len().max(1) as f64 * (chip + gap) - gap + 4.0 } else { cx.turtle().next_walk_width(walk.width, walk.margin) };
         let columns = (((width + gap) / (chip + gap)).floor().max(1.0) as usize).min(colors.len().max(1));
         let grid_w = columns as f64 * (chip + gap) - gap;
         let mut walk = walk;
+        if fit {
+            walk.width = Size::Fixed(width);
+        }
         walk.height = Size::Fixed(colors.len().div_ceil(columns) as f64 * (cell_h + gap) + 1.0);
         let rect = cx.walk_turtle(walk);
         // clear of the active swatch's outline on the left

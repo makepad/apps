@@ -22,7 +22,6 @@ pub mod library_float;
 pub mod library_panel;
 pub mod checks_panel;
 pub mod board_controls;
-pub mod paint_panel;
 pub mod jobs_panel;
 pub mod perf_panel;
 pub mod area_notch;
@@ -97,7 +96,6 @@ pub fn script_mod(vm: &mut ScriptVm) {
     library_panel::script_mod(vm);
     checks_panel::script_mod(vm);
     board_controls::script_mod(vm);
-    paint_panel::script_mod(vm);
     jobs_panel::script_mod(vm);
     perf_panel::script_mod(vm);
     area_notch::script_mod(vm);

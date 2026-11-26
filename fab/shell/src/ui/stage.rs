@@ -74,6 +74,23 @@ script_mod! {
 
     // A floating card over the view (the tool strips' card).
     let Float = mod.widgets.FabFloat{}
+    // A floating row of the chosen tool's tools: as wide as its tools, never wider than the view
+    // (then it scrolls sideways: drag it, or the wheel).
+    let ToolRow = mod.widgets.FabToolScroll{
+        width: Fit{max: FitBound.Rel{base: Base.Full factor: 1.0}}
+        height: Fit
+        cursor: MouseCursor.Default
+        show_bg: true
+        draw_bg +: {
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, fab.radius_lg)
+                sdf.fill_keep(vec4(fab.color_float.xyz, 0.94))
+                sdf.stroke(fab.color_float_border, 1.0)
+                return sdf.result
+            }
+        }
+    }
     // The slice status chip's floating face, sized for a pane caption.
     let PaneLabel = Float{
         visible: false
@@ -122,6 +139,11 @@ script_mod! {
         icon_walk: Walk{width: 16 height: 16}
     }
     let Sep = mod.widgets.FabToolSep{}
+    // the separator in a row of tools (the context bar's)
+    let VSep = View{ width: 1 height: 20 margin: Inset{left: 5 right: 5} show_bg: true draw_bg +: {
+        color: uniform(#xffffff1a)
+        pixel: fn() { return vec4(self.color.xyz * self.color.w, self.color.w) }
+    } }
 
     // The primary pane keeps all tools and gizmos, clipped to its own rectangle.
     let Primary = View{
@@ -178,13 +200,13 @@ script_mod! {
                     FabTip{ text: #(keymap::tooltip(Key::Shape))
                         t_shape := Tool{ a11y: {label: "Edit shape"} draw_icon +: { svg: crate_resource("self://resources/icons/shape.svg") } }
                     }
-                    FabTip{ text: #(format!("{}: its tools open beside this strip", keymap::tooltip(Key::Paint)))
+                    FabTip{ text: #(format!("{}: its tools open at the top of the view", keymap::tooltip(Key::Paint)))
                         t_paint := Tool{ a11y: {label: "Paint"} draw_icon +: { svg: crate_resource("self://resources/icons/paint.svg") } }
                     }
-                    FabTip{ text: #(format!("{}: its tools open beside this strip", keymap::tooltip(Key::Sculpt)))
+                    FabTip{ text: #(format!("{}: its tools open at the top of the view", keymap::tooltip(Key::Sculpt)))
                         t_sculpt := Tool{ a11y: {label: "Sculpt"} draw_icon +: { svg: crate_resource("self://resources/icons/sculpt.svg") } }
                     }
-                    FabTip{ text: #(format!("{}: its kinds open beside this strip", keymap::tooltip(Key::Force)))
+                    FabTip{ text: #(format!("{}: its kinds open at the top of the view", keymap::tooltip(Key::Force)))
                         t_force := Tool{ a11y: {label: "Force"} draw_icon +: { svg: crate_resource("self://resources/icons/force.svg") } }
                     }
                     Sep{}
@@ -201,165 +223,191 @@ script_mod! {
                         t_settings_here := Tool{ a11y: {label: "Print settings here"} draw_icon +: { svg: crate_resource("self://resources/icons/settings_here.svg") } }
                     }
                 }
-                // The paint tools, a narrow strip beside the rail for as long as Paint is the tool.
-                paint_bar := Float{
-                    visible: false
-                    width: 38
-                    flow: Down
-                    padding: 3
-                    spacing: 1
-                    a11y: {role: "radio_group" label: "Paint tools"}
-                    FabTip{ place: TipPlace.Right text: #(format!("{}: drag on a part. Hold {} to erase", keymap::tooltip(Key::PaintBrush), keymap::shortcut(Key::PaintInvert)))
-                        p_brush := Tool{ a11y: {label: "Paint brush"} draw_icon +: { svg: crate_resource("self://resources/icons/paint.svg") } }
+            }
+            // The chosen tool's own tools (Paint, Edit shape, Sculpt, Force): a floating row across the
+            // top of the view under its toolbar, centred in the room right of the rail.
+            context := View{
+                width: Fill
+                height: Fit
+                align: Align{x: 0.5}
+                // clear of the rail on the left and the axis gizmo on the right
+                padding: Inset{left: 58 right: 96 top: #(crate::ui::area_notch::TOOLBAR_H + 10.0)}
+                    // The paint tools and the brush's settings and colour, for as long as Paint is the tool.
+                    paint_bar := ToolRow{
+                        visible: false
+                        flow: Right
+                        align: Align{y: 0.5}
+                        padding: 3
+                        spacing: 1
+                        a11y: {role: "radio_group" label: "Paint tools"}
+                        FabTip{ text: #(format!("{}: drag on a part. Hold {} to erase", keymap::tooltip(Key::PaintBrush), keymap::shortcut(Key::PaintInvert)))
+                            p_brush := Tool{ a11y: {label: "Paint brush"} draw_icon +: { svg: crate_resource("self://resources/icons/paint.svg") } }
+                        }
+                        FabTip{ text: #(format!("{}: paint the part's own colour back. Hold {} to paint", keymap::tooltip(Key::PaintErase), keymap::shortcut(Key::PaintInvert)))
+                            p_erase := Tool{ a11y: {label: "Erase"} draw_icon +: { svg: crate_resource("self://resources/icons/erase.svg") } }
+                        }
+                        FabTip{ text: #(format!("{}: click a feature to fill it; {} adds more. Hold {} to erase", keymap::tooltip(Key::PaintFeature), keymap::shortcut(Key::PaintExtend), keymap::shortcut(Key::PaintInvert)))
+                            p_feature := Tool{ a11y: {label: "Fill feature"} draw_icon +: { svg: crate_resource("self://resources/icons/fill_feature.svg") } }
+                        }
+                        FabTip{ text: #(format!("{}: click a part to fill all of it. Hold {} to erase", keymap::tooltip(Key::PaintPart), keymap::shortcut(Key::PaintInvert)))
+                            p_part := Tool{ a11y: {label: "Fill part"} draw_icon +: { svg: crate_resource("self://resources/icons/fill_part.svg") } }
+                        }
+                        FabTip{ text: #(format!("{}: the fill spreads until an edge sharper than the angle. Hold {} to erase", keymap::tooltip(Key::PaintFlood), keymap::shortcut(Key::PaintInvert)))
+                            p_smooth := Tool{ a11y: {label: "Smooth fill"} draw_icon +: { svg: crate_resource("self://resources/icons/fill_smooth.svg") } }
+                        }
+                        FabTip{ text: #(format!("{}: click a part to fill it with a pattern of its own colour and the paint colour, through its volume", keymap::tooltip(Key::PaintPattern)))
+                            p_pattern := Tool{ a11y: {label: "Pattern fill"} draw_icon +: { svg: crate_resource("self://resources/icons/fill_pattern.svg") } }
+                        }
+                        dials_sep := VSep{}
+                        FabTip{ text: #(format!("Brush diameter in mm ({} in the view, {} and {}): drag up or down, or scroll", keymap::shortcut(Key::PaintSizeScroll), keymap::shortcut(Key::PaintSmaller), keymap::shortcut(Key::PaintLarger)))
+                            diameter := mod.widgets.FabBrushDial{ width: 38}
+                        }
+                        FabTip{ text: "Smooth fill angle: the sharpest edge it spreads over. Drag up or down, or scroll"
+                            angle := mod.widgets.FabBrushDial{ width: 38 angle: true }
+                        }
+                        FabTip{ text: "Pattern: cells, noise, marble, bands or a ramp up the part. Click for the next"
+                            pattern_kind := mod.widgets.FabPatternDial{ width: 38 which: 0 }
+                        }
+                        FabTip{ text: "Pattern size in mm: a cell, a swirl, a band. Drag up or down, or scroll"
+                            pattern_scale := mod.widgets.FabPatternDial{ width: 38 which: 1 }
+                        }
+                        FabTip{ text: "Pattern seed: another number, another pattern of the kind. Drag up or down, or scroll"
+                            pattern_seed := mod.widgets.FabPatternDial{ width: 38 which: 2 }
+                        }
+                        FabTip{ text: "Sharpness: 0 blends the colours (printed dithered), 1 turns one into the other at once. Drag up or down, or scroll"
+                            pattern_sharp := mod.widgets.FabPatternDial{ width: 38 which: 3 }
+                        }
+                        FabTip{ text: "Balance: more of the paint colour (up) or of the part's own (down). Drag up or down, or scroll"
+                            pattern_balance := mod.widgets.FabPatternDial{ width: 38 which: 4 }
+                        }
+                        palette_sep := VSep{}
+                        palette_tip := FabTip{ text: "Material colour: click a swatch to paint with it"
+                            palette := mod.widgets.FabPaintPalette{ width: Fit }
+                        }
+                        supports_sep := VSep{}
+                        FabTip{ text: "Block supports: paint where no support may stand or touch (m.support_block). Erase takes it off"
+                            p_block := Tool{ independent: true a11y: {label: "Block supports"} draw_icon +: { svg: crate_resource("self://resources/icons/support_block.svg") } }
+                        }
+                        FabTip{ text: "Enforce supports: paint where supports always go, however shallow the face (m.support_enforce). Erase takes it off"
+                            p_enforce := Tool{ independent: true a11y: {label: "Enforce supports"} draw_icon +: { svg: crate_resource("self://resources/icons/supports.svg") } }
+                        }
                     }
-                    FabTip{ place: TipPlace.Right text: #(format!("{}: paint the part's own colour back. Hold {} to paint", keymap::tooltip(Key::PaintErase), keymap::shortcut(Key::PaintInvert)))
-                        p_erase := Tool{ a11y: {label: "Erase"} draw_icon +: { svg: crate_resource("self://resources/icons/erase.svg") } }
+                    shape_bar := ToolRow{
+                        new_batch: true
+                        visible: false
+                        flow: Right
+                        align: Align{y: 0.5}
+                        padding: 3
+                        spacing: 1
+                        a11y: {role: "radio_group" label: "Shape tools"}
+                        // What a click picks (for the AI's chat): the kind filter.
+                        FabTip{ text: "Pick any: what lies under the pointer, an edge near it, else the face or feature"
+                            k_any := Tool{ a11y: {label: "Pick any"} draw_icon +: { svg: crate_resource("self://resources/icons/pick_any.svg") } }
+                        }
+                        FabTip{ text: "Pick faces: a part's face (on a part drawn from its field, the edit)"
+                            k_face := Tool{ a11y: {label: "Pick faces"} draw_icon +: { svg: crate_resource("self://resources/icons/pick_face.svg") } }
+                        }
+                        FabTip{ text: "Pick edges: a part's edge (on a part drawn from its field, a crease or an edit's edges)"
+                            k_edge := Tool{ a11y: {label: "Pick edges"} draw_icon +: { svg: crate_resource("self://resources/icons/pick_edge.svg") } }
+                        }
+                        FabTip{ text: "Pick features: a hole, a boss, a fillet, as the model names them"
+                            k_feature := Tool{ a11y: {label: "Pick features"} draw_icon +: { svg: crate_resource("self://resources/icons/pick_feature.svg") } }
+                        }
+                        FabTip{ text: "Pick bodies: the whole solid under the pointer"
+                            k_body := Tool{ a11y: {label: "Pick bodies"} draw_icon +: { svg: crate_resource("self://resources/icons/pick_body.svg") } }
+                        }
+                        VSep{}
+                        FabTip{ text: "Subtract a box from the picked node (or the part): drag its handles to place it"
+                            s_cut_box := Tool{ a11y: {label: "Subtract box"} draw_icon +: { svg: crate_resource("self://resources/icons/cut_box.svg") } }
+                        }
+                        FabTip{ text: "Subtract a cylinder from the picked node (or the part): drag its handles to place it"
+                            s_cut_cyl := Tool{ a11y: {label: "Subtract cylinder"} draw_icon +: { svg: crate_resource("self://resources/icons/cut_cylinder.svg") } }
+                        }
+                        FabTip{ text: "Subtract a sphere from the picked node (or the part): drag its handles to place it"
+                            s_cut_sphere := Tool{ a11y: {label: "Subtract sphere"} draw_icon +: { svg: crate_resource("self://resources/icons/cut_sphere.svg") } }
+                        }
+                        VSep{}
+                        FabTip{ text: "Add box to part: a plinth under the part to stand it on"
+                            s_add_box := Tool{ a11y: {label: "Add box to part"} draw_icon +: { svg: crate_resource("self://resources/icons/add_box.svg") } }
+                        }
+                        FabTip{ text: "Add cylinder to part: a disc under the part to stand it on"
+                            s_add_cyl := Tool{ a11y: {label: "Add cylinder to part"} draw_icon +: { svg: crate_resource("self://resources/icons/add_cylinder.svg") } }
+                        }
+                        FabTip{ text: "Add sphere to part: attach it to the picked node (or the part) and drag its handles to place it"
+                            s_add_sphere := Tool{ a11y: {label: "Add sphere to part"} draw_icon +: { svg: crate_resource("self://resources/icons/add_sphere.svg") } }
+                        }
+                        VSep{}
+                        FabTip{ text: "Cut bottom: cut everything below a level just over the bed (drag its handle to set the height)"
+                            s_cut_bottom := Tool{ a11y: {label: "Cut bottom"} draw_icon +: { svg: crate_resource("self://resources/icons/cut_bottom.svg") } }
+                        }
+                        FabTip{ text: "Cut with a plane: a slab to move and turn; keeps the other side"
+                            s_cut_plane := Tool{ a11y: {label: "Cut with plane"} draw_icon +: { svg: crate_resource("self://resources/icons/cut_plane.svg") } }
+                        }
+                        FabTip{ text: "Keep both halves, add pins: split the part where its cut plane is (or level through its middle) with alignment pins sized for the printer; each half goes on the plate flat side down"
+                            s_split := Tool{ a11y: {label: "Keep both halves, add pins"} draw_icon +: { svg: crate_resource("self://resources/icons/split_pins.svg") } }
+                        }
+                        VSep{}
+                        FabTip{ text: "Place on plate: sit the part's lowest point on the bed"
+                            s_place := Tool{ a11y: {label: "Place on plate"} draw_icon +: { svg: crate_resource("self://resources/icons/place_plate.svg") } }
+                        }
+                        FabTip{ text: #(format!("Lay flat: click a surface of the part, or of a test print's piece, to turn it face down onto the bed ({} cancels)", keymap::shortcut(Key::Cancel)))
+                            s_lay_flat := Tool{ independent: true a11y: {label: "Lay flat"} draw_icon +: { svg: crate_resource("self://resources/icons/lay_flat.svg") } }
+                        }
                     }
-                    FabTip{ place: TipPlace.Right text: #(format!("{}: click a feature to fill it; {} adds more. Hold {} to erase", keymap::tooltip(Key::PaintFeature), keymap::shortcut(Key::PaintExtend), keymap::shortcut(Key::PaintInvert)))
-                        p_feature := Tool{ a11y: {label: "Fill feature"} draw_icon +: { svg: crate_resource("self://resources/icons/fill_feature.svg") } }
+                    sculpt_bar := ToolRow{
+                        visible: false
+                        flow: Right
+                        align: Align{y: 0.5}
+                        padding: 3
+                        spacing: 1
+                        a11y: {role: "radio_group" label: "Sculpt tools"}
+                        FabTip{ text: #(format!("{}: drag on a part. Hold {} to lower", keymap::tooltip(Key::SculptRaise), keymap::shortcut(Key::SculptInvert)))
+                            s_raise := Tool{ a11y: {label: "Raise"} draw_icon +: { svg: crate_resource("self://resources/icons/sculpt_raise.svg") } }
+                        }
+                        FabTip{ text: #(format!("{}: drag on a part. Hold {} to raise", keymap::tooltip(Key::SculptLower), keymap::shortcut(Key::SculptInvert)))
+                            s_lower := Tool{ a11y: {label: "Lower"} draw_icon +: { svg: crate_resource("self://resources/icons/sculpt_lower.svg") } }
+                        }
+                        FabTip{ text: #(format!("{}: cut a sharp groove", keymap::tooltip(Key::SculptCrease)))
+                            s_crease := Tool{ a11y: {label: "Crease"} draw_icon +: { svg: crate_resource("self://resources/icons/sculpt_crease.svg") } }
+                        }
+                        VSep{}
+                        FabTip{ text: #(format!("Brush diameter in mm ({} in the view, {} and {}): drag up or down, or scroll", keymap::shortcut(Key::SculptSizeScroll), keymap::shortcut(Key::SculptSmaller), keymap::shortcut(Key::SculptLarger)))
+                            diameter := mod.widgets.FabBrushDial{ width: 38 sculpt: true }
+                        }
+                        FabTip{ text: "Sculpt strength (0.1 to 1.0): drag up or down, or scroll"
+                            strength := mod.widgets.FabBrushDial{ width: 38 sculpt: true strength: true }
+                        }
                     }
-                    FabTip{ place: TipPlace.Right text: #(format!("{}: click a part to fill all of it. Hold {} to erase", keymap::tooltip(Key::PaintPart), keymap::shortcut(Key::PaintInvert)))
-                        p_part := Tool{ a11y: {label: "Fill part"} draw_icon +: { svg: crate_resource("self://resources/icons/fill_part.svg") } }
+                    // The Force tool's kinds: what a click on the studied part adds. Fab reads the
+                    // click as a face or a hole's wall by itself; Alt takes the other reading.
+                    force_bar := ToolRow{
+                        visible: false
+                        flow: Right
+                        align: Align{y: 0.5}
+                        padding: 3
+                        spacing: 1
+                        a11y: {role: "radio_group" label: "Force kinds"}
+                        FabTip{ text: #(format!("{}. {} reads a hole's wall as a face", keymap::tooltip(Key::ForceFixed), keymap::shortcut(Key::ForceFlip)))
+                            f_fixed := Tool{ a11y: {label: "Fixed"} draw_icon +: { svg: crate_resource("self://resources/icons/force_fixed.svg") } }
+                        }
+                        FabTip{ text: #(format!("{}. {} reads a hole's wall as a face", keymap::tooltip(Key::ForceLoad), keymap::shortcut(Key::ForceFlip)))
+                            f_force := Tool{ a11y: {label: "Force"} draw_icon +: { svg: crate_resource("self://resources/icons/force_arrow.svg") } }
+                        }
+                        FabTip{ text: #(format!("{}. {} reads a hole's wall as a face", keymap::tooltip(Key::ForcePressure), keymap::shortcut(Key::ForceFlip)))
+                            f_pressure := Tool{ a11y: {label: "Pressure"} draw_icon +: { svg: crate_resource("self://resources/icons/force_pressure.svg") } }
+                        }
+                        FabTip{ text: #(format!("{}. {} reads a hole's wall as a face", keymap::tooltip(Key::ForceTorque), keymap::shortcut(Key::ForceFlip)))
+                            f_torque := Tool{ a11y: {label: "Torque"} draw_icon +: { svg: crate_resource("self://resources/icons/force_torque.svg") } }
+                        }
+                        VSep{}
+                        FabTip{ text: "Size: of the next load (N, MPa or N mm), or of the load picked. Drag up or down, or scroll"
+                            force_size := mod.widgets.FabBrushDial{ width: 38 force: true }
+                        }
+                        VSep{}
+                        FabTip{ text: #(format!("{}: the load picked (click it, or in the feature tree)", keymap::tooltip(Key::ForceRemove)))
+                            f_remove := Tool{ independent: true a11y: {label: "Remove load"} draw_icon +: { svg: crate_resource("self://resources/icons/trash.svg") } }
+                        }
                     }
-                    FabTip{ place: TipPlace.Right text: #(format!("{}: the fill spreads until an edge sharper than the angle. Hold {} to erase", keymap::tooltip(Key::PaintFlood), keymap::shortcut(Key::PaintInvert)))
-                        p_smooth := Tool{ a11y: {label: "Smooth fill"} draw_icon +: { svg: crate_resource("self://resources/icons/fill_smooth.svg") } }
-                    }
-                    FabTip{ place: TipPlace.Right text: #(format!("{}: click a part to fill it with a pattern of its own colour and the paint colour, through its volume", keymap::tooltip(Key::PaintPattern)))
-                        p_pattern := Tool{ a11y: {label: "Pattern fill"} draw_icon +: { svg: crate_resource("self://resources/icons/fill_pattern.svg") } }
-                    }
-                    dials_sep := Sep{}
-                    FabTip{ place: TipPlace.Right text: #(format!("Brush diameter in mm ({} in the view, {} and {}): drag up or down, or scroll", keymap::shortcut(Key::PaintSizeScroll), keymap::shortcut(Key::PaintSmaller), keymap::shortcut(Key::PaintLarger)))
-                        diameter := mod.widgets.FabBrushDial{}
-                    }
-                    FabTip{ place: TipPlace.Right text: "Smooth fill angle: the sharpest edge it spreads over. Drag up or down, or scroll"
-                        angle := mod.widgets.FabBrushDial{ angle: true }
-                    }
-                    FabTip{ place: TipPlace.Right text: "Pattern: cells, noise, marble, bands or a ramp up the part. Click for the next"
-                        pattern_kind := mod.widgets.FabPatternDial{ which: 0 }
-                    }
-                    FabTip{ place: TipPlace.Right text: "Pattern size in mm: a cell, a swirl, a band. Drag up or down, or scroll"
-                        pattern_scale := mod.widgets.FabPatternDial{ which: 1 }
-                    }
-                    FabTip{ place: TipPlace.Right text: "Pattern seed: another number, another pattern of the kind. Drag up or down, or scroll"
-                        pattern_seed := mod.widgets.FabPatternDial{ which: 2 }
-                    }
-                    FabTip{ place: TipPlace.Right text: "Sharpness: 0 blends the colours (printed dithered), 1 turns one into the other at once. Drag up or down, or scroll"
-                        pattern_sharp := mod.widgets.FabPatternDial{ which: 3 }
-                    }
-                    FabTip{ place: TipPlace.Right text: "Balance: more of the paint colour (up) or of the part's own (down). Drag up or down, or scroll"
-                        pattern_balance := mod.widgets.FabPatternDial{ which: 4 }
-                    }
-                    palette_sep := Sep{}
-                    palette_tip := FabTip{ place: TipPlace.Right text: "Material colour: click a swatch to paint with it"
-                        palette := mod.widgets.FabPaintPalette{}
-                    }
-                    supports_sep := Sep{}
-                    FabTip{ place: TipPlace.Right text: "Block supports: paint where no support may stand or touch (m.support_block). Erase takes it off"
-                        p_block := Tool{ independent: true a11y: {label: "Block supports"} draw_icon +: { svg: crate_resource("self://resources/icons/support_block.svg") } }
-                    }
-                    FabTip{ place: TipPlace.Right text: "Enforce supports: paint where supports always go, however shallow the face (m.support_enforce). Erase takes it off"
-                        p_enforce := Tool{ independent: true a11y: {label: "Enforce supports"} draw_icon +: { svg: crate_resource("self://resources/icons/supports.svg") } }
-                    }
-                }
-                shape_bar := Float{
-                    new_batch: true
-                    visible: false
-                    width: 38
-                    flow: Down
-                    padding: 3
-                    spacing: 1
-                    a11y: {role: "radio_group" label: "Shape tools"}
-                    FabTip{ place: TipPlace.Right text: "Subtract a box from the picked node (or the part): drag its handles to place it"
-                        s_cut_box := Tool{ a11y: {label: "Subtract box"} draw_icon +: { svg: crate_resource("self://resources/icons/cut_box.svg") } }
-                    }
-                    FabTip{ place: TipPlace.Right text: "Subtract a cylinder from the picked node (or the part): drag its handles to place it"
-                        s_cut_cyl := Tool{ a11y: {label: "Subtract cylinder"} draw_icon +: { svg: crate_resource("self://resources/icons/cut_cylinder.svg") } }
-                    }
-                    FabTip{ place: TipPlace.Right text: "Subtract a sphere from the picked node (or the part): drag its handles to place it"
-                        s_cut_sphere := Tool{ a11y: {label: "Subtract sphere"} draw_icon +: { svg: crate_resource("self://resources/icons/cut_sphere.svg") } }
-                    }
-                    Sep{}
-                    FabTip{ place: TipPlace.Right text: "Add box to part: a plinth under the part to stand it on"
-                        s_add_box := Tool{ a11y: {label: "Add box to part"} draw_icon +: { svg: crate_resource("self://resources/icons/add_box.svg") } }
-                    }
-                    FabTip{ place: TipPlace.Right text: "Add cylinder to part: a disc under the part to stand it on"
-                        s_add_cyl := Tool{ a11y: {label: "Add cylinder to part"} draw_icon +: { svg: crate_resource("self://resources/icons/add_cylinder.svg") } }
-                    }
-                    FabTip{ place: TipPlace.Right text: "Add sphere to part: attach it to the picked node (or the part) and drag its handles to place it"
-                        s_add_sphere := Tool{ a11y: {label: "Add sphere to part"} draw_icon +: { svg: crate_resource("self://resources/icons/add_sphere.svg") } }
-                    }
-                    Sep{}
-                    FabTip{ place: TipPlace.Right text: "Cut bottom: cut everything below a level just over the bed (drag its handle to set the height)"
-                        s_cut_bottom := Tool{ a11y: {label: "Cut bottom"} draw_icon +: { svg: crate_resource("self://resources/icons/cut_bottom.svg") } }
-                    }
-                    FabTip{ place: TipPlace.Right text: "Cut with a plane: a slab to move and turn; keeps the other side"
-                        s_cut_plane := Tool{ a11y: {label: "Cut with plane"} draw_icon +: { svg: crate_resource("self://resources/icons/cut_plane.svg") } }
-                    }
-                    FabTip{ place: TipPlace.Right text: "Keep both halves, add pins: split the part where its cut plane is (or level through its middle) with alignment pins sized for the printer; each half goes on the plate flat side down"
-                        s_split := Tool{ a11y: {label: "Keep both halves, add pins"} draw_icon +: { svg: crate_resource("self://resources/icons/split_pins.svg") } }
-                    }
-                    Sep{}
-                    FabTip{ place: TipPlace.Right text: "Place on plate: sit the part's lowest point on the bed"
-                        s_place := Tool{ a11y: {label: "Place on plate"} draw_icon +: { svg: crate_resource("self://resources/icons/place_plate.svg") } }
-                    }
-                    FabTip{ place: TipPlace.Right text: #(format!("Lay flat: click a surface of the part, or of a test print's piece, to turn it face down onto the bed ({} cancels)", keymap::shortcut(Key::Cancel)))
-                        s_lay_flat := Tool{ independent: true a11y: {label: "Lay flat"} draw_icon +: { svg: crate_resource("self://resources/icons/lay_flat.svg") } }
-                    }
-                }
-                sculpt_bar := Float{
-                    visible: false
-                    width: 38
-                    flow: Down
-                    padding: 3
-                    spacing: 1
-                    a11y: {role: "radio_group" label: "Sculpt tools"}
-                    FabTip{ place: TipPlace.Right text: #(format!("{}: drag on a part. Hold {} to lower", keymap::tooltip(Key::SculptRaise), keymap::shortcut(Key::SculptInvert)))
-                        s_raise := Tool{ a11y: {label: "Raise"} draw_icon +: { svg: crate_resource("self://resources/icons/sculpt_raise.svg") } }
-                    }
-                    FabTip{ place: TipPlace.Right text: #(format!("{}: drag on a part. Hold {} to raise", keymap::tooltip(Key::SculptLower), keymap::shortcut(Key::SculptInvert)))
-                        s_lower := Tool{ a11y: {label: "Lower"} draw_icon +: { svg: crate_resource("self://resources/icons/sculpt_lower.svg") } }
-                    }
-                    FabTip{ place: TipPlace.Right text: #(format!("{}: cut a sharp groove", keymap::tooltip(Key::SculptCrease)))
-                        s_crease := Tool{ a11y: {label: "Crease"} draw_icon +: { svg: crate_resource("self://resources/icons/sculpt_crease.svg") } }
-                    }
-                    Sep{}
-                    FabTip{ place: TipPlace.Right text: #(format!("Brush diameter in mm ({} in the view, {} and {}): drag up or down, or scroll", keymap::shortcut(Key::SculptSizeScroll), keymap::shortcut(Key::SculptSmaller), keymap::shortcut(Key::SculptLarger)))
-                        diameter := mod.widgets.FabBrushDial{ sculpt: true }
-                    }
-                    FabTip{ place: TipPlace.Right text: "Sculpt strength (0.1 to 1.0): drag up or down, or scroll"
-                        strength := mod.widgets.FabBrushDial{ sculpt: true strength: true }
-                    }
-                }
-                // The Force tool's kinds: what a click on the studied part adds. Fab reads the
-                // click as a face or a hole's wall by itself; Alt takes the other reading.
-                force_bar := Float{
-                    visible: false
-                    width: 38
-                    flow: Down
-                    padding: 3
-                    spacing: 1
-                    a11y: {role: "radio_group" label: "Force kinds"}
-                    FabTip{ place: TipPlace.Right text: #(format!("{}. {} reads a hole's wall as a face", keymap::tooltip(Key::ForceFixed), keymap::shortcut(Key::ForceFlip)))
-                        f_fixed := Tool{ a11y: {label: "Fixed"} draw_icon +: { svg: crate_resource("self://resources/icons/force_fixed.svg") } }
-                    }
-                    FabTip{ place: TipPlace.Right text: #(format!("{}. {} reads a hole's wall as a face", keymap::tooltip(Key::ForceLoad), keymap::shortcut(Key::ForceFlip)))
-                        f_force := Tool{ a11y: {label: "Force"} draw_icon +: { svg: crate_resource("self://resources/icons/force_arrow.svg") } }
-                    }
-                    FabTip{ place: TipPlace.Right text: #(format!("{}. {} reads a hole's wall as a face", keymap::tooltip(Key::ForcePressure), keymap::shortcut(Key::ForceFlip)))
-                        f_pressure := Tool{ a11y: {label: "Pressure"} draw_icon +: { svg: crate_resource("self://resources/icons/force_pressure.svg") } }
-                    }
-                    FabTip{ place: TipPlace.Right text: #(format!("{}. {} reads a hole's wall as a face", keymap::tooltip(Key::ForceTorque), keymap::shortcut(Key::ForceFlip)))
-                        f_torque := Tool{ a11y: {label: "Torque"} draw_icon +: { svg: crate_resource("self://resources/icons/force_torque.svg") } }
-                    }
-                    Sep{}
-                    FabTip{ place: TipPlace.Right text: "Size: of the next load (N, MPa or N mm), or of the load picked. Drag up or down, or scroll"
-                        force_size := mod.widgets.FabBrushDial{ force: true }
-                    }
-                    Sep{}
-                    FabTip{ place: TipPlace.Right text: #(format!("{}: the load picked (click it, or in the feature tree)", keymap::tooltip(Key::ForceRemove)))
-                        f_remove := Tool{ independent: true a11y: {label: "Remove load"} draw_icon +: { svg: crate_resource("self://resources/icons/trash.svg") } }
-                    }
-                }
             }
             bottom := View{
                 width: Fill
@@ -578,8 +626,7 @@ script_mod! {
             // groups apart by rules.
             // A held job keeps only the mode (it has no other look); Mechanics has its own bar.
             modes_row := mod.widgets.FabEditorBar{
-                // a solid bar over the view (the toolbar's foot line as every one's)
-                draw_bg +: { color: uniform(fab.color_editor) }
+                // (a solid bar over the view, as every editor's toolbar)
                 mode_card := View{
                     width: Fit height: Fit flow: Right align: Align{y: 0.5}
                     FabTip{ text: "What the plate is for: Design edits it, Mechanics runs it in a physics sim, Monitor shows the printer's job. It stays as it is across workspaces."
@@ -899,7 +946,8 @@ struct ViewBarKey {
 struct ToolBarsKey {
     design: bool,
     paint: Option<PaintBarKey>,
-    lay_flat: Option<bool>,
+    /// Edit shape: Lay flat's toggle and the pick kind filter.
+    lay_flat: Option<(bool, crate::tools::picks::PickKind)>,
     sculpt: Option<StrokeOp>,
     force: Option<ForceKind>,
 }
@@ -909,7 +957,6 @@ struct PaintBarKey {
     mode: PaintMode,
     erasing: bool,
     target: PaintTarget,
-    strip_settings: bool,
     scaled: bool,
 }
 
@@ -1084,10 +1131,11 @@ impl FabStage {
         }
     }
 
-    /// The two rail containers keep their visibility as the plate mode switches their parents;
-    /// the toolbar's Tools toggle says which.
+    /// The two rail containers (and the chosen tool's row at the top) keep their visibility as
+    /// the plate mode switches their parents; the toolbar's Tools toggle says which.
     pub fn set_tools_shown(&mut self, cx: &mut Cx, shown: bool) {
         self.view.view(cx, ids!(model_ui.left)).set_visible(cx, shown);
+        self.view.view(cx, ids!(model_ui.context)).set_visible(cx, shown);
         self.view.view(cx, ids!(mechanics_ui.left)).set_visible(cx, shown);
         let toggle = self.view.radio_button(cx, ids!(render_row.view_bar.show_tools));
         if toggle.active(cx) != shown {
@@ -1419,6 +1467,15 @@ pub enum StageAction {
     ForceSize(ForceKind, f64),
 }
 
+/// The Edit shape row's pick kinds.
+const PICK_KINDS: [(&[LiveId], crate::tools::picks::PickKind); 5] = [
+    (ids!(k_any), crate::tools::picks::PickKind::Any),
+    (ids!(k_face), crate::tools::picks::PickKind::Face),
+    (ids!(k_edge), crate::tools::picks::PickKind::Edge),
+    (ids!(k_feature), crate::tools::picks::PickKind::Feature),
+    (ids!(k_body), crate::tools::picks::PickKind::Body),
+];
+
 /// The Force strip's kinds.
 const FORCE_KINDS: [(&[LiveId], ForceKind); 4] = [
     (ids!(f_fixed), ForceKind::Fixed),
@@ -1521,6 +1578,11 @@ impl Widget for FabStage {
         if let Some(state) = scope.data.get_mut::<AppState>() {
             match event {
                 Event::MouseDown(event) => {
+                    // A press anywhere in this view (its toolbar too) makes it the Plate that
+                    // Frame all, Ortho and the presets act on.
+                    if self.view.area().rect(cx).contains(event.abs) && state.view.plate_number(self.pane).is_some() {
+                        state.view.pressed_plate = self.pane;
+                    }
                     for (id, path) in bound_panes(self.pane) {
                         let Some(pane) = state.view.panes.get_mut(id.0 as usize).and_then(Option::as_mut) else { continue };
                         let viewport = self.view.widget(cx, path);
@@ -1686,7 +1748,7 @@ impl Widget for FabStage {
             cx.redraw_area(v.area());
         }
         // The paint strip beside the rail.
-        let pb = v.view(cx, ids!(model_ui.left.paint_bar));
+        let pb = v.widget(cx, ids!(model_ui.context.paint_bar));
         if pb.radio_button(cx, ids!(p_brush)).clicked(actions) {
             self.draw_keys.tools = None;
             cx.action(StageAction::PaintErase(false));
@@ -1709,7 +1771,7 @@ impl Widget for FabStage {
                 cx.action(StageAction::PaintTarget(if state.ui.paint_target == target { PaintTarget::Color } else { target }));
             }
         }
-        let sb = v.view(cx, ids!(model_ui.left.shape_bar));
+        let sb = v.widget(cx, ids!(model_ui.context.shape_bar));
         for (id, op) in [
             (ids!(s_cut_box), Some(ShapeOp::Subtract(ShapePrim::Box))),
             (ids!(s_cut_cyl), Some(ShapeOp::Subtract(ShapePrim::Cylinder))),
@@ -1735,18 +1797,24 @@ impl Widget for FabStage {
                 cx.redraw_area(v.area());
             }
         }
+        for (id, kind) in PICK_KINDS {
+            if sb.radio_button(cx, id).clicked(actions) {
+                self.draw_keys.tools = None;
+                cx.action(crate::tools::picks::PickAction::Filter(kind));
+            }
+        }
         if sb.radio_button(cx, ids!(s_lay_flat)).clicked(actions) {
             self.draw_keys.tools = None;
             cx.action(StageAction::LayFlat(!state.ui.lay_flat));
         }
-        let sb = v.view(cx, ids!(model_ui.left.sculpt_bar));
+        let sb = v.widget(cx, ids!(model_ui.context.sculpt_bar));
         for (id, op) in [(ids!(s_raise), StrokeOp::Raise), (ids!(s_lower), StrokeOp::Lower), (ids!(s_crease), StrokeOp::Crease)] {
             if sb.radio_button(cx, id).clicked(actions) {
                 self.draw_keys.tools = None;
                 cx.action(StageAction::SculptOp(op));
             }
         }
-        let fb = v.view(cx, ids!(model_ui.left.force_bar));
+        let fb = v.widget(cx, ids!(model_ui.context.force_bar));
         for (id, kind) in FORCE_KINDS {
             if fb.radio_button(cx, id).clicked(actions) {
                 self.draw_keys.tools = None;
@@ -1971,9 +2039,8 @@ impl Widget for FabStage {
             if self.draw_keys.chrome != Some(chrome) {
                 self.draw_keys.chrome = Some(chrome);
                 v.view(cx, ids!(model_ui.bottom)).set_visible(cx, !slice);
-                // The sim's view has no slice (its bar holds the mode); a job Monitor holds has no other
-                // look, the mode stays.
-                v.view(cx, ids!(render_row)).set_visible(cx, !mechanics && lead);
+                // Every Plate view has its toolbar; the sim's view has none (its bar holds the mode).
+                v.view(cx, ids!(render_row)).set_visible(cx, !mechanics);
                 v.view(cx, ids!(render_row.render_modes)).set_visible(cx, looks);
                 v.view(cx, ids!(render_row.create_card)).set_visible(cx, looks);
                 v.view(cx, ids!(render_row.view_bar)).set_visible(cx, looks);
@@ -2037,10 +2104,9 @@ impl Widget for FabStage {
                     mode: state.ui.paint_mode,
                     erasing: crate::tools::paint::erasing(state),
                     target: state.ui.paint_target,
-                    strip_settings: !state.ui.on_screen(Editor::Paint),
                     scaled: state.ui.paint_pattern.kind.scaled(),
                 }),
-                lay_flat: (gizmo == Some(GizmoMode::Shape)).then_some(state.ui.lay_flat),
+                lay_flat: (gizmo == Some(GizmoMode::Shape)).then_some((state.ui.lay_flat, state.picks.filter)),
                 sculpt: sculpt_on.then(|| crate::tools::sculpt::operation(state)),
                 force: (gizmo == Some(GizmoMode::Force) && mode == RenderMode::Force).then_some(state.ui.force_kind),
             };
@@ -2050,9 +2116,9 @@ impl Widget for FabStage {
                 v.widget(cx, ids!(model_ui.left.tools.t_sculpt)).set_visible(cx, design);
                 v.widget(cx, ids!(model_ui.left.tools.t_force)).set_visible(cx, design);
                 // The paint strip stays for as long as Paint is the tool, and goes when another is chosen.
-                let pb = v.view(cx, ids!(model_ui.left.paint_bar));
+                let pb = v.widget(cx, ids!(model_ui.context.paint_bar));
                 pb.set_visible(cx, tools.paint.is_some());
-                if let Some(PaintBarKey { mode, erasing, target, strip_settings, scaled }) = tools.paint {
+                if let Some(PaintBarKey { mode, erasing, target, scaled }) = tools.paint {
                     for (id, on) in [
                         (ids!(p_brush), mode == PaintMode::Brush && !erasing),
                         (ids!(p_erase), erasing),
@@ -2065,32 +2131,31 @@ impl Widget for FabStage {
                     ] {
                         pb.radio_button(cx, id).set_active(cx, on, Animate::No);
                     }
-                    // the separator before the support tools stays: it parts them from the paint tools
-                    for id in [ids!(dials_sep), ids!(palette_sep), ids!(palette_tip)] {
-                        pb.widget(cx, id).set_visible(cx, strip_settings);
-                    }
-                    pb.widget(cx, ids!(diameter)).set_visible(cx, strip_settings && mode == PaintMode::Brush);
-                    pb.widget(cx, ids!(angle)).set_visible(cx, strip_settings && mode == PaintMode::Flood);
+                    pb.widget(cx, ids!(diameter)).set_visible(cx, mode == PaintMode::Brush);
+                    pb.widget(cx, ids!(angle)).set_visible(cx, mode == PaintMode::Flood);
                     for (id, on) in [(ids!(pattern_kind), true), (ids!(pattern_scale), scaled), (ids!(pattern_seed), scaled), (ids!(pattern_sharp), true), (ids!(pattern_balance), true)] {
-                        pb.widget(cx, id).set_visible(cx, strip_settings && mode == PaintMode::Pattern && on);
+                        pb.widget(cx, id).set_visible(cx, mode == PaintMode::Pattern && on);
                     }
                 }
-                let sb = v.view(cx, ids!(model_ui.left.shape_bar));
+                let sb = v.widget(cx, ids!(model_ui.context.shape_bar));
                 sb.set_visible(cx, tools.lay_flat.is_some());
-                if let Some(lay_flat) = tools.lay_flat {
+                if let Some((lay_flat, filter)) = tools.lay_flat {
+                    for (id, kind) in PICK_KINDS {
+                        sb.radio_button(cx, id).set_active(cx, filter == kind, Animate::No);
+                    }
                     for id in [ids!(s_cut_box), ids!(s_cut_cyl), ids!(s_cut_sphere), ids!(s_add_box), ids!(s_add_cyl), ids!(s_add_sphere), ids!(s_cut_bottom), ids!(s_cut_plane), ids!(s_split), ids!(s_place)] {
                         sb.radio_button(cx, id).set_active(cx, false, Animate::No);
                     }
                     sb.radio_button(cx, ids!(s_lay_flat)).set_active(cx, lay_flat, Animate::No);
                 }
-                let sb = v.view(cx, ids!(model_ui.left.sculpt_bar));
+                let sb = v.widget(cx, ids!(model_ui.context.sculpt_bar));
                 sb.set_visible(cx, sculpt_on);
                 if let Some(op) = tools.sculpt {
                     for (id, brush) in [(ids!(s_raise), StrokeOp::Raise), (ids!(s_lower), StrokeOp::Lower), (ids!(s_crease), StrokeOp::Crease)] {
                         sb.radio_button(cx, id).set_active(cx, op == brush, Animate::No);
                     }
                 }
-                let fb = v.view(cx, ids!(model_ui.left.force_bar));
+                let fb = v.widget(cx, ids!(model_ui.context.force_bar));
                 fb.set_visible(cx, tools.force.is_some());
                 if let Some(selected) = tools.force {
                     for (id, kind) in FORCE_KINDS {

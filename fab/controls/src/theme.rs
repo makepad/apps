@@ -103,8 +103,11 @@ const TEXT_REST: &str = "#aaaaaa";
 const TEXT_DIM: &str = "#666666";
 const TEXT_HOT: &str = "#ffffff";
 
-/// How much brighter the panels' ground is than the sheet's `color_surface_container`.
-const PANEL_LIFT: f64 = 1.15;
+/// How much brighter the editors' toolbars (and the shown tab over each) are than the sheet's
+/// `color_surface_container`.
+const TOOLBAR_LIFT: f64 = 1.15;
+/// How much brighter the panels' ground is: a step under their toolbars, which it parts from.
+const PANEL_LIFT: f64 = 1.08;
 
 /// `0xRRGGBBAA` with each colour channel times `by` (capped at full), its alpha kept.
 fn brighter(c: u32, by: f64) -> u32 {
@@ -130,6 +133,10 @@ fn toned(mut sheet: StyleSheet) -> StyleSheet {
         for ink in ["color_on_surface_variant", "color_text_meta", "color_text_disabled", "color_label_inner_disabled", "color_label_outer_disabled", "color_label_disabled"] {
             tones.push_str(&format!("mod.theme.{ink} = {TEXT_DIM}\n"));
         }
+        // The property kit's fields (number fields and sliders, dropdowns, segmented choices) a
+        // tad darker than the library's light grey (#3d3d3f on Fab's #2e2e30 panel): resting at
+        // #373739, and lighting to that old grey under the pointer.
+        tones.push_str("mod.theme.prop_field = #x373739\nmod.theme.prop_field_hover = #x3d3d3f\n");
         sheet.theme.push_str(&tones);
     }
     sheet
@@ -187,10 +194,12 @@ pub fn script_mod(vm: &mut ScriptVm) {
     let muted = ScriptValue::from_color(inks.muted);
     // the panels' ground (the lists and editors under their tabs) a step above the sheet's own
     // rung: its colour, `PANEL_LIFT` up
-    let panel = {
+    let (panel, toolbar) = {
         let theme = vm.module(id!(theme));
         // (nil when the sheet has no such rung: the plain rung then, below)
-        vm.value(theme, id!(color_surface_container)).as_color().map_or(ScriptValue::NIL, |c| ScriptValue::from_color(brighter(c, PANEL_LIFT)))
+        let rung = vm.value(theme, id!(color_surface_container)).as_color();
+        let lift = |by| rung.map_or(ScriptValue::NIL, |c| ScriptValue::from_color(brighter(c, by)));
+        (lift(PANEL_LIFT), lift(TOOLBAR_LIFT))
     };
     script_eval!(vm, {
         use mod.prelude.widgets.*
@@ -204,6 +213,9 @@ pub fn script_mod(vm: &mut ScriptVm) {
             color_editor: #(panel) ?? theme.color_surface_container
             color_editor_alt: mix(#(panel) ?? theme.color_surface_container, theme.color_surface_container_high, 0.5)
             color_header: theme.color_surface_container_high
+            // the editors' toolbars (under their area's tabs) and the shown tab over each: a
+            // shade above the panel ground
+            color_toolbar: #(toolbar) ?? theme.color_surface_container
             color_panel: #(panel) ?? theme.color_surface_container
             color_panel_sub: theme.color_inset
             color_popover: theme.color_surface_container_high

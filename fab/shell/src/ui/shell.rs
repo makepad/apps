@@ -226,7 +226,6 @@ script_mod! {
                 Viewport := FabStage{}
                 Device := FabDevice3d{}
                 Plates := FabPlatesPanel{}
-                Journal := FabJournalPanel{}
                 Parts := FabPartsPanel{}
                 Part := FabPartPanel{}
                 Slicer := FabSlicerPanel{}
@@ -237,7 +236,6 @@ script_mod! {
                 Requirements := FabRequirementsPanel{}
                 Bom := FabBomPanel{}
                 BoardControls := FabBoardControlsPanel{}
-                Performance := FabPerfPanel{}
                 ModelSources := FabModelSources{}
                 Printer := FabPrinterPanel{}
                 Mechanics := FabMechanicsPanel{}
@@ -815,9 +813,6 @@ pub struct FabShell {
     /// The Board pane and unit that opened the Arrange menu.
     #[rust]
     arrange_from: Option<(WidgetUid, fab_elec_core::BoardId)>,
-    /// Whether the shell has enabled the frame monitor for the Performance editor.
-    #[rust]
-    perf_shown: bool,
     /// The editor shown alone over the workspace ([`crate::api::UiState::page`]), as laid out.
     #[rust]
     page: Option<Editor>,
@@ -2129,15 +2124,6 @@ impl FabShell {
         cx.action(ShellAction::EditAreas(WorkspaceOp::Reveal { editor: panel, from }));
     }
 
-    /// Close the editor's tab when it is on screen or bring it forward. O(instances) per toggle.
-    fn toggle_editor(&mut self, cx: &mut Cx, state: &AppState, editor: Editor) {
-        let held = self.areas.as_ref().and_then(|tree| tree.instances().into_iter().find(|(_, i)| i.editor == editor));
-        match held {
-            Some((area, instance)) if state.ui.on_screen(editor) => cx.action(ShellAction::EditAreas(WorkspaceOp::CloseTab { area, instance })),
-            _ => self.show_panel(cx, editor),
-        }
-    }
-
     /// Keeps the area a press lands in (a tab's, or the body's under it), for a Reveal the press
     /// leads to. Per press: the dock's drop query, O(tab sets + splits), and O(nodes) mapping.
     fn note_press(&mut self, cx: &Cx, abs: DVec2) {
@@ -2368,11 +2354,6 @@ impl Widget for FabShell {
             if actions.iter().any(|a| matches!(a.downcast_ref::<ShellAction>(), Some(ShellAction::ShowPlates))) {
                 self.show_panel(cx, Editor::Plates);
             }
-            if actions.iter().any(|a| matches!(a.downcast_ref::<ShellAction>(), Some(ShellAction::TogglePerf))) {
-                if let Some(state) = scope.data.get::<AppState>() {
-                    self.toggle_editor(cx, state, Editor::Performance);
-                }
-            }
             // An electronics view's focus, plain or from its widget: the board pane answers it.
             for a in actions.iter() {
                 let view_action = a.downcast_ref::<fab_elec_view::ViewAction>()
@@ -2445,11 +2426,6 @@ impl Widget for FabShell {
                 relay = true;
             }
             self.experimental = (state.ui.arm_shown, state.ui.scan_shown);
-            let perf = state.ui.on_screen(Editor::Performance);
-            if self.perf_shown != perf {
-                self.perf_shown = perf;
-                cx.perf_monitor.set_enabled(perf);
-            }
             // the temporary layout's strip comes, goes or changes its words: O(1) per draw
             let temp = state.ui.workspaces.temp.as_ref().filter(|t| t.def.id == state.ui.workspaces.current).map(|t| match t.by {
                 ShownBy::Ai => (format!("Shown by the AI: {}", t.def.name), true),

@@ -182,7 +182,6 @@ script_mod! {
         Checks := Notch{tip +: {text: "Checks" chip +: {a11y: {label: "Checks: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/check.svg")}}}}
         BoardControls := Notch{tip +: {text: "Board controls" chip +: {a11y: {label: "Board controls: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/gear.svg")}}}}
         Jobs := Notch{tip +: {text: "Jobs" chip +: {a11y: {label: "Jobs: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/layers.svg")}}}}
-        Performance := Notch{tip +: {text: "Performance" chip +: {a11y: {label: "Performance: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/speed.svg")}}}}
         ModelSources := Notch{tip +: {text: "Model sources" chip +: {a11y: {label: "Model sources: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/import.svg")}}}}
     }
 }
@@ -297,7 +296,7 @@ fn in_toolbar(kind: LiveId) -> bool {
     matches!(
         Editor::of_kind(kind),
         Some(Plates | Parts | Part | Slicer | Settings | Printer | Calibrate | Mechanics | Features | Slice | Arm | Scan | Force
-            | Overrides | TestPrints | Strength | Library | Checks | BoardControls | Paint | Jobs | Performance | Code | Viewport | Device)
+            | Overrides | TestPrints | Strength | Library | Checks | BoardControls | Paint | Jobs | Code | Viewport | Device)
     )
 }
 

@@ -1262,8 +1262,9 @@ script_mod! {
         // the room at each end for the hover chevrons (5 pt in, 4 pt wide): an axis label or a
         // value starts just past them, not the library's wider 14 pt in
         arrow_zone: 10.0
-        // an axis's label (X, Y, Z) in bold
-        draw_label +: {text_style: theme.font_bold{font_size: theme.prop_font_size line_spacing: 1.0}}
+        // the name inside the field (a number's, an axis's): at its left in the second voice, the
+        // value at its right
+        draw_label +: {color: fab.color_text_dim text_style: theme.font_regular{font_size: theme.prop_font_size line_spacing: 1.0}}
         draw_bg +: {
             fill_color: uniform(#xffffff10)
             fill_color_hover: uniform(#xffffff28)

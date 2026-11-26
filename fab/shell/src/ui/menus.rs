@@ -8,7 +8,6 @@
 
 use fab_sdf_tiles::trace::DragDetail;
 use crate::api::*;
-use crate::ui::editors::Editor;
 use crate::ui::keymap::{self, ShortcutId as Key};
 use crate::ui::popover::MenuItem;
 use crate::workspaces::{ListOp, PlatePair};
@@ -245,9 +244,6 @@ pub(crate) fn view_menu(state: &AppState) -> Vec<MenuItem> {
         MenuItem::new(live_id!(view_workspace), "Workspace").flyout(workspaces),
         MenuItem::new(live_id!(view_follow_ai), "Follow AI").checked(state.ui.follow_ai),
         MenuItem::new(live_id!(view_code), "Code").key(&keymap::shortcut(Key::Code)).checked(state.ui.code_shown()).enabled_if(state.ui.kind() == Workspace::Design),
-        MenuItem::new(live_id!(view_perf), "Performance")
-            .key(&keymap::shortcut(Key::Perf))
-            .checked(state.ui.on_screen(Editor::Performance)),
         // work that is done enough to keep but not to offer: shown on this machine on request
         MenuItem::new(live_id!(view_experimental), "Experimental").flyout(vec![
             MenuItem::new(live_id!(exp_arm), "Arm").checked(state.ui.arm_shown),
@@ -371,7 +367,6 @@ pub(crate) fn action_for(state: &AppState, id: LiveId) -> Option<ShellAction> {
             _ if id == live_id!(view_xray) => Some(ShellAction::ToggleXray),
             _ if id == live_id!(view_see_through) => Some(ShellAction::ToggleSeeThrough),
             _ if id == live_id!(view_glass) => Some(ShellAction::ToggleGlass),
-            _ if id == live_id!(view_perf) => Some(ShellAction::TogglePerf),
             _ if id == live_id!(vp_front) => Some(ShellAction::PresetView(PresetView::Front)),
             _ if id == live_id!(vp_back) => Some(ShellAction::PresetView(PresetView::Back)),
             _ if id == live_id!(vp_left) => Some(ShellAction::PresetView(PresetView::Left)),

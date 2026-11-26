@@ -65,12 +65,13 @@ script_mod! {
                 content := View{width: Fill height: Fit flow: Down spacing: theme.prop_row_gap margin: Inset{}}
             }
         }
-        // Every row's label column is `LABEL_W` at most, the Part panel's Transform's too, so the
-        // panel's fields all start at one line.
-        Num := FabNumberRow{label +: {width: #(LABEL_W)} value +: {num +: {min: 0.0 max: 0.0 precision: 1}}}
+        // A number's name is inside its field, at its left, the value at its right
+        // (`inline_axis`): the row keeps no label column. Every other row's label column is
+        // `LABEL_W` wide.
+        Num := FabNumberRow{label +: {visible: false width: 0} gap +: {width: 0} value +: {num +: {min: 0.0 max: 0.0 precision: 1}}}
         // A seed: its number, and a button that writes a new one.
         Seed := FabNumberRow{
-            label +: {width: #(LABEL_W)}
+            label +: {visible: false width: 0} gap +: {width: 0}
             value +: {num +: {min: 0.0 max: 0.0 precision: 0}}
             trail +: {width: Fit reseed := mod.widgets.FabFlatButton{text: "Reseed" a11y: {label: "Reseed"}}}
         }
@@ -88,10 +89,10 @@ script_mod! {
         Pick := PropDropDownRow{label +: {width: #(LABEL_W)}}
         // A field's axes drawn as one row: its name, then the axes' fields side by side (taken from
         // their rows, which are not drawn; each axis named inside its field). See `axis_runs`.
-        Axes := PropRow{label +: {width: #(LABEL_W)} value +: {flow: Right spacing: 4}}
+        Axes := PropRow{label +: {visible: false width: 0} gap +: {width: 0} value +: {flow: Right spacing: 4}}
         // A point: one row, its axes side by side, each named inside its field (a 2D one hides Z).
         Point := PropRow{
-            label +: {width: #(LABEL_W)}
+            label +: {visible: false width: 0} gap +: {width: 0}
             value +: {
                 flow: Right spacing: 4
                 x := ValueInput{width: Fill height: Fill min_height: 0 label: "X" min: 0.0 max: 0.0 precision: 1}
@@ -110,7 +111,8 @@ script_mod! {
         Derived := PropRow{label +: {width: #(LABEL_W)} value +: {text := mod.widgets.FabLabelSmall{width: Fill text: ""}}}
         Hint := View{
             width: Fill height: Fit
-            padding: Inset{left: #(LABEL_W) + theme.prop_label_gap right: theme.prop_pad top: 4 bottom: 6}
+            // (under the fields, which start at the row's left now their names are inside them)
+            padding: Inset{left: 4 right: theme.prop_pad top: 4 bottom: 6}
             text := mod.widgets.FabLabelSmall{width: Fill text: ""}
         }
     }
@@ -361,9 +363,9 @@ enum RowKind {
 
 /// A Num row's field as one axis of an [`Axes`] row (`axis` inside it), or in its own row (`None`).
 /// Only what changed is set.
-fn inline_axis(cx: &mut Cx, row: &WidgetRef, axis: Option<&str>) {
+fn inline_axis(cx: &mut Cx, row: &WidgetRef, name: &str) {
     if let Some(mut num) = row.value_input(cx, ids!(num)).borrow_mut() {
-        let want = axis.unwrap_or("");
+        let want = name;
         if num.label != want {
             num.label = want.to_string();
             num.redraw(cx);
@@ -374,7 +376,10 @@ fn inline_axis(cx: &mut Cx, row: &WidgetRef, axis: Option<&str>) {
 /// A Num row's field, reached through the row's own children rather than the widget tree (an
 /// [`Axes`] row draws it, so the tree must keep it under its row; this puts it back there too).
 fn row_num(cx: &mut Cx, row: &WidgetRef) -> Option<WidgetRef> {
-    let child = |w: &WidgetRef, name: LiveId| w.borrow::<View>().and_then(|v| v.children.iter().find(|(id, _)| *id == name).map(|(_, c)| c.clone()));
+    let find = |v: &View, name: LiveId| v.children.iter().find(|(id, _)| *id == name).map(|(_, c)| c.clone());
+    // (a number row is a `PropRow`, its children its View's)
+    let child = |w: &WidgetRef, name: LiveId| w.borrow::<View>().and_then(|v| find(&v, name))
+        .or_else(|| w.borrow::<makepad_widgets_core::property::PropRow>().and_then(|r| find(&r, name)));
     let value = child(row, live_id!(value))?;
     let num = child(&value, live_id!(num))?;
     if row.widget(cx, ids!(num)).widget_uid() != num.widget_uid() {
@@ -716,7 +721,9 @@ impl FabParamPanel {
                     let name = ["X", "Y", "Z"][i];
                     crate::ui::print_settings::name_control(cx, &num, &format!("{} {name}", p.label), "spin_button");
                     let suf = suf.clone();
-                    script_apply_eval!(cx, num, {min: #(min) max: #(max) step: #(step) snap: #(1.0) precision: #(prec) suffix: #(suf) reach_only: #(reach)});
+                    // the first segment names the point and its axis, the others their axis
+                    let inside = if i == 0 { format!("{} {name}", p.label) } else { name.to_string() };
+                    script_apply_eval!(cx, num, {min: #(min) max: #(max) step: #(step) snap: #(1.0) precision: #(prec) suffix: #(suf) reach_only: #(reach) label: #(inside)});
                     num.set_visible(cx, i < n);
                 }
             }
@@ -760,8 +767,11 @@ impl FabParamPanel {
                         axes.label(cx, ids!(label)).set_text(cx, &base);
                         // the axes' own fields, side by side (each still its row's: its value, drag and
                         // refusal are the row's; the row itself is not drawn)
+                        // the first segment names the field and its axis, the others their axis
                         for (i, (_, w)) in rows[k..k + n].iter().enumerate() {
-                            inline_axis(cx, w, Some(AXES[order[i]]));
+                            let axis = AXES[order[i]];
+                            let name = if i == 0 { format!("{base} {axis}") } else { axis.to_string() };
+                            inline_axis(cx, w, &name);
                         }
                         // Each field stays its row's in the widget tree (the row's lookups of `num`
                         // set its value), so it is reached through the row's own children and only
@@ -782,8 +792,8 @@ impl FabParamPanel {
                     }
                 }
             }
-            if labels[k].is_some() {
-                inline_axis(cx, &rows[k].1, None);
+            if let Some(name) = labels[k].as_deref() {
+                inline_axis(cx, &rows[k].1, name);
             }
             out.push(rows[k].clone());
             k += 1;
@@ -943,7 +953,7 @@ impl Widget for FabParamPanel {
                     None => pp.param(key)?,
                 };
                 // a name its row cut short shows whole first
-                let label = self.items.get(id).map(|(w, _)| w.label(cx, ids!(label))).filter(|l| l.is_truncated()).map(|l| l.text());
+                let label = self.items.get(id).map(|(w, _)| w.value_input(cx, ids!(num))).filter(|n| n.label_cut()).map(|n| n.label());
                 let tip = match label {
                     Some(name) if p.hint.is_empty() => name,
                     Some(name) => format!("{name}\n{}", p.hint),

@@ -121,7 +121,7 @@ impl Origin {
                 let (code, width) = code;
                 let plate = T::split(Vertical, FromB(STEPS_H), plate(), T::area(Editor::Steps));
                 let centre = if code { T::split(Horizontal, FromB(width.unwrap_or(CODE_START_W)), plate, T::area(Editor::Code)) } else { plate };
-                let left = T::stack(&[Editor::Plates, Editor::Parts, Editor::Journal], 1);
+                let left = T::stack(&[Editor::Plates, Editor::Parts], 1);
                 let top = T::stack(&[Editor::Slicer, Editor::Printer], 0);
                 let below = T::stack(&[Editor::Overrides, Editor::Strength], 0);
                 let right = T::split(Vertical, Weighted(0.5), top, below);

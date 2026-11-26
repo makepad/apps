@@ -5099,8 +5099,6 @@ impl AppState {
                 self.ui.notices.clear_passing(*view, *before);
                 self.ui.notices.revision != revision
             }
-            // the shell's: it closes the Performance editor or brings it on screen
-            TogglePerf => false,
             ToggleCommandPalette => {
                 self.ui.command_palette_open = !self.ui.command_palette_open;
                 true
@@ -5628,7 +5626,6 @@ pub enum ShellAction {
     SetWorkspace(Workspace),
     Notice { view: NoticeView, text: String },
     ClearPassingNotice { view: NoticeView, before: f64 },
-    TogglePerf,
     ToggleCommandPalette,
     /// Bring the Plates panel forward (File > Browse Plates…).
     ShowPlates,

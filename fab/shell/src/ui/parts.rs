@@ -668,24 +668,24 @@ script_mod! {
                             // X and Y side by side, each its axis inside its field
                             xy := TransformRow{
                                 margin: Inset{top: theme.prop_row_gap}
-                                label +: {text: "Position"}
+                                label +: {text: "Position" visible: false width: 0} gap +: {width: 0}
                                 value +: {
                                     flow: Right spacing: 4
-                                    num +: {a11y: {label: "X"} label: "X" min: -50.0 max: #(ORIGIN_FIELD_MAX) step: 0.5 snap: 5.0 precision: 1 suffix: " mm"}
+                                    num +: {a11y: {label: "X"} label: "Position X" min: -50.0 max: #(ORIGIN_FIELD_MAX) step: 0.5 snap: 5.0 precision: 1 suffix: " mm"}
                                     num_y := ValueInput{width: Fill height: Fill min_height: 0 a11y: {label: "Y"} label: "Y" min: -50.0 max: #(ORIGIN_FIELD_MAX) step: 0.5 snap: 5.0 precision: 1 suffix: " mm"}
                                 }
                             }
                             rs := View{width: Fill height: Fit flow: Down spacing: theme.prop_row_gap margin: Inset{top: theme.prop_row_gap}
                                 rot := TransformRow{
-                                    label +: {text: "Turn"}
-                                    value +: {num +: {a11y: {label: "Turn"} min: -360.0 max: 360.0 step: 1.0 snap: 15.0 precision: 0 suffix: "°"}}
+                                    label +: {text: "Turn" visible: false width: 0} gap +: {width: 0}
+                                    value +: {num +: {a11y: {label: "Turn"} label: "Turn" min: -360.0 max: 360.0 step: 1.0 snap: 15.0 precision: 0 suffix: "°"}}
                                 }
                                 // X, Y and Z side by side, the proportions lock after them
                                 scale := TransformRow{
-                                    label +: {text: "Scale"}
+                                    label +: {text: "Scale" visible: false width: 0} gap +: {width: 0}
                                     value +: {
                                         flow: Right spacing: 4
-                                        num +: {a11y: {label: "Scale X"} label: "X" min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}
+                                        num +: {a11y: {label: "Scale X"} label: "Scale X" min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}
                                         num_y := ValueInput{width: Fill height: Fill min_height: 0 a11y: {label: "Scale Y"} label: "Y" min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}
                                         num_z := ValueInput{width: Fill height: Fill min_height: 0 a11y: {label: "Scale Z"} label: "Z" min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}
                                     }

@@ -77,7 +77,8 @@ pub enum Editor {
     Paint,
     /// Saved print jobs and the printer's progress.
     Jobs,
-    /// The frame profiler graph.
+    /// Retired: the frame profiler graph, a debugging tool. Kept so a saved layout that names it
+    /// still reads.
     Performance,
     /// Where the 3D models of electronics parts may come from, and every external resource's
     /// licence.
@@ -85,6 +86,8 @@ pub enum Editor {
     /// The project's targets and the evidence for each verdict.
     Requirements,
     Bom,
+    /// Retired: the plate journal's records, a debugging view (the journal itself is still
+    /// written). Kept so a saved layout that names it still reads.
     Journal,
 }
 
@@ -106,9 +109,9 @@ pub enum Family {
 /// Experimental's editors are offered only while View › Experimental has their family on.
 pub const MENU: [(&str, &[Editor]); 7] = [
     ("3D views", &[Editor::Viewport, Editor::Device]),
-    ("Plate data", &[Editor::Plates, Editor::Parts, Editor::Steps, Editor::Code, Editor::Journal]),
+    ("Plate data", &[Editor::Plates, Editor::Parts, Editor::Steps, Editor::Code]),
     ("Print", &[Editor::Slicer, Editor::Overrides, Editor::Printer]),
-    ("Analysis", &[Editor::Slice, Editor::Strength, Editor::Force, Editor::Mechanics, Editor::Performance]),
+    ("Analysis", &[Editor::Slice, Editor::Strength, Editor::Force, Editor::Mechanics]),
     ("Electronics", &[Editor::Circuit, Editor::Board, Editor::Library, Editor::Checks, Editor::Requirements, Editor::Bom, Editor::Bench, Editor::BoardControls, Editor::Scope, Editor::Transport, Editor::Firmware]),
     ("Experimental", &[Editor::Arm, Editor::ArmCell, Editor::ArmCompare, Editor::Scan, Editor::ScanView]),
     ("Settings", &[Editor::ModelSources]),
@@ -252,7 +255,7 @@ impl Editor {
 
     /// An editor no area shows any more (it went into another), kept for the layouts that name it.
     pub fn retired(self) -> bool {
-        matches!(self, Editor::Part | Editor::Parameters | Editor::Paint | Editor::Camera | Editor::Calibrate | Editor::Jobs | Editor::Settings | Editor::TestPrints)
+        matches!(self, Editor::Part | Editor::Parameters | Editor::Paint | Editor::Camera | Editor::Calibrate | Editor::Jobs | Editor::Settings | Editor::TestPrints | Editor::Performance | Editor::Journal)
     }
 
     pub fn of_kind(kind: LiveId) -> Option<Editor> {

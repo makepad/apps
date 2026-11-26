@@ -159,7 +159,6 @@ keymap! {
     Slice => ("Cmd/Ctrl+R", "Slice the plate", "App", Global),
     Chat => ("Cmd/Ctrl+K", "Ask the AI", "App", Global),
     Palette => ("F3", "Command palette", "App", Global),
-    Perf => ("Shift+F3", "Performance graph", "App", Global),
     Open => ("Cmd/Ctrl+O", "Open", "App", Global),
     Import => ("Cmd/Ctrl+I", "Import meshes", "App", Global),
     Plates => ("Cmd/Ctrl+Shift+M", "Browse plates", "App", Global),

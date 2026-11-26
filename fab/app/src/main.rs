@@ -1522,7 +1522,6 @@ impl App {
         if !ke.is_repeat {
             let action = match ke.key_code {
                 KeyCode::F1 => Some(ShellAction::ShowKeymapHelp(!self.state.ui.keymap_help_open)),
-                KeyCode::F3 if m.shift => Some(ShellAction::TogglePerf),
                 KeyCode::F3 => Some(ShellAction::ToggleCommandPalette),
                 KeyCode::KeyS if m.is_primary() => {
                     self.model_command("save", &[], false);

@@ -118,6 +118,11 @@ pub enum WorkspaceOp {
     /// instance no area holds, any other trading places with the front tab when another area
     /// holds it.
     SetEditor { area: AreaId, editor: Editor },
+    /// `editor` as a new tab of `area`, in front (its tab bar's plus): a repeatable editor
+    /// ([`Editor::repeatable`]) as another instance, its lowest that no area holds; any other
+    /// comes forward where the area holds it, moves here as a tab drag would move it where
+    /// another area does, else opens here.
+    AddTab { area: AreaId, editor: Editor },
     /// The two areas trade their stacks (the area menu's Swap with).
     Swap { a: AreaId, b: AreaId },
     /// A new area on `side` of node `area` holding `editor`, the split's sash at `align` (the area
@@ -602,6 +607,28 @@ impl AreaTree {
                 let instance = self.free_instance(editor, taken);
                 if let Some((tabs, selected)) = self.stack_mut(area) {
                     tabs[*selected] = instance;
+                }
+                Ok(())
+            }
+            WorkspaceOp::AddTab { area, editor } => {
+                let (tabs, selected) = self.stack_of(area).ok_or(OpError::NoArea(area))?;
+                if let Some(k) = tabs.iter().position(|i| i.editor == editor).filter(|_| !editor.repeatable()) {
+                    if k == selected {
+                        return Err(OpError::Unchanged);
+                    }
+                    if let Some((_, selected)) = self.stack_mut(area) {
+                        *selected = k;
+                    }
+                    return Ok(());
+                }
+                let held = (!editor.repeatable()).then(|| self.instances().into_iter().find(|(_, i)| i.editor == editor)).flatten();
+                if let Some((_, theirs)) = held {
+                    return self.move_to(Moving::Tab(theirs), area, DropAt::Center);
+                }
+                let instance = self.free_instance(editor, taken);
+                if let Some((tabs, selected)) = self.stack_mut(area) {
+                    tabs.push(instance);
+                    *selected = tabs.len() - 1;
                 }
                 Ok(())
             }

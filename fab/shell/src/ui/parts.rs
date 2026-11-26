@@ -194,7 +194,11 @@ fn measurement_group(measurements: &[Measurement]) -> AnnotationGroup {
 pub fn tree_rows(plate: &PlateInfo, annotations: &[AnnotationGroup]) -> Vec<Row> {
     let mut groups: Vec<Vec<usize>> = Vec::new();
     let mut scripts = HashMap::new();
-    for (i, p) in plate.parts.iter().enumerate() {
+    // in their declared order: the plate lists its printed parts first, so a part switched off
+    // would otherwise drop to the end (ties, a placed object's several bodies, as listed)
+    let mut order: Vec<usize> = (0..plate.parts.len()).collect();
+    order.sort_by_key(|&i| (plate.parts[i].order, i));
+    for (i, p) in order.into_iter().map(|i| (i, &plate.parts[i])) {
         let script = if p.script.is_empty() { p.object.split('/').next().unwrap_or(&p.object) } else { &p.script };
         let group = *scripts.entry(script).or_insert_with(|| {
             groups.push(Vec::new());
@@ -616,7 +620,7 @@ script_mod! {
         }
         body := mod.widgets.FabScroll{
             visible: false
-            padding: Inset{left: theme.prop_pad right: theme.prop_pad}
+            padding: Inset{left: theme.prop_pad right: theme.prop_pad top: #(crate::ui::widgets::PANEL_TOP)}
             // The sections draw in lists of their own: a section records again only when what
             // it shows changed (its setters, or the panel's key of `rest`). The part's name and
             // size are the parts list's (rename there).
@@ -2288,6 +2292,19 @@ mod tree_tests {
     fn part(script: &str, link: u32, name: &str) -> PlatePart {
         let instance = if link == 0 { script.to_string() } else { format!("{script}~{link}") };
         PlatePart { printed: true, object: format!("{instance}/body"), script: script.into(), link, file: format!("{script}.cad.splash"), name: name.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn the_tree_keeps_the_declared_order_whatever_prints() {
+        // the plate lists its printed parts first: "wheel", switched off, comes after "body"
+        let mut wheel = part("wheel", 0, "Wheel");
+        wheel.order = (0, 0);
+        wheel.printed = false;
+        let mut body = part("body", 0, "Body");
+        body.order = (1, 0);
+        let plate = PlateInfo { parts: vec![body, wheel], ..Default::default() };
+        let names: Vec<String> = tree_rows(&plate, &[]).into_iter().map(|r| r.name).collect();
+        assert_eq!(names, ["Wheel", "Body"], "declared order, not printed first");
     }
 
     #[test]

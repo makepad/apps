@@ -41,13 +41,15 @@ script_mod! {
     use mod.prelude.fab.*
     use mod.widgets.*
 
-    // Caption glyphs in the quiet ink, the full ink under the pointer.
+    // Caption glyphs in the body's ink, lit under the pointer.
     let CapIcon = mod.widgets.FabIconButton{
         width: 28
         height: 26
         padding: Inset{left: 6 right: 6 top: 5 bottom: 5}
-        draw_icon +: {color: fab.color_text_dim}
+        draw_icon +: {color: fab.color_text}
     }
+    // Between the caption's groups (history, the workspaces, the tools, Print).
+    let CapRule = mod.widgets.FabVRule{height: 16 margin: Inset{left: 6 right: 6}}
 
     // A well in the caption: the field colour, no frame, its edges on device pixels.
     let Well = View{
@@ -91,17 +93,24 @@ script_mod! {
                 }
                 // Always available: starts the XR server and pairs a device by its PIN.
                 xr_caption := mod.widgets.XrCaptionButton{app: "fab" margin: Inset{left: 0 right: 0}}
-                // history, then the workspace menu (it names the shown one), left of the code
+                // history | the workspace menu (it names the shown one) and its + | the camera and
+                // the assistant | Print
                 FabTip{ text: #(keymap::tooltip(Key::Undo))
                     undo := CapIcon{ a11y: {label: "Undo"} draw_icon +: { svg: crate_resource("self://resources/icons/undo.svg") } }
                 }
                 FabTip{ text: #(keymap::tooltip(Key::Redo))
                     redo := CapIcon{ a11y: {label: "Redo"} draw_icon +: { svg: crate_resource("self://resources/icons/redo.svg") } }
                 }
+                CapRule{}
                 workspaces := mod.widgets.FabWorkspaceTabs{}
+                CapRule{}
+                FabTip{ text: "Printer camera: float its live view over the window"
+                    camera := CapIcon{ a11y: {label: "Printer camera"} draw_icon +: { svg: crate_resource("self://resources/icons/camera.svg") } }
+                }
                 FabTip{ text: #(keymap::tooltip(Key::Chat))
                     chat := CapIcon{ a11y: {label: "AI assistant"} draw_icon +: { svg: crate_resource("self://resources/icons/spark.svg") } }
                 }
+                CapRule{}
                 FabTip{ text: "Print the sliced plate (asks first)"
                     print := mod.widgets.FabButtonAccent{ text: "Print" height: 24 padding: Inset{left: 14 right: 14} }
                 }
@@ -184,6 +193,10 @@ pub fn handle_actions(cx: &mut Cx, bar: &WidgetRef, actions: &Actions, state: &A
             cx.action(ShellAction::SetRenderMode(RenderMode::Slice));
         }
         cx.action(PrintAction::AskPrint(true));
+    }
+    // the printer camera floats over the window, or goes
+    if bar.button(cx, ids!(right.camera)).clicked(actions) {
+        cx.action(crate::ui::stage::StageAction::CameraPip(!state.ui.camera_pip));
     }
     if bar.button(cx, ids!(right.chat)).clicked(actions) {
         cx.action(ShellAction::Command("toggle chat".into()));

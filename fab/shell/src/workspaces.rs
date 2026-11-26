@@ -126,8 +126,8 @@ impl Origin {
             }
             Origin::Mechanics => T::split(Horizontal, FromB(320.0), plate(), T::area(Editor::Mechanics)),
             Origin::Monitor => {
-                let right = T::split(Vertical, FromA(340.0), T::area(Editor::Camera), T::stack(&[Editor::Printer, Editor::Calibrate], 0));
-                T::split(Horizontal, FromB(460.0), plate(), right)
+                // (the printer's camera floats over the window: the title bar's camera button)
+                T::split(Horizontal, FromB(460.0), plate(), T::stack(&[Editor::Printer, Editor::Calibrate], 0))
             }
             Origin::Arm => T::split(Horizontal, FromB(380.0), T::stack(&[Editor::ArmCell, Editor::ArmCompare], 0), T::area(Editor::Arm)),
             Origin::Scan => T::split(Horizontal, FromB(340.0), T::area(Editor::ScanView), T::area(Editor::Scan)),

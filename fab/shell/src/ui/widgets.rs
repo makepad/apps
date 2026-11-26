@@ -202,8 +202,12 @@ script_mod! {
             color_down: fab.color_accent_dim
             color_focus: fab.color_accent
         }
+        // its words on the accent's bright face: black, under the pointer and pressed too
         draw_text +: {
             color: fab.color_text_on_accent
+            color_hover: fab.color_text_on_accent
+            color_down: fab.color_text_on_accent
+            color_focus: fab.color_text_on_accent
         }
     }
 
@@ -584,6 +588,7 @@ script_mod! {
             color: fab.color_text
             color_hover: fab.color_text_active
             color_down: fab.color_text_active
+            // on the accent's bright face, while on: black (the sheet's ink on the accent)
             color_active: fab.color_text_on_accent
             color_disabled: fab.color_text_muted
             get_color: fn() {
@@ -712,7 +717,7 @@ script_mod! {
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
                 sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, fab.radius_lg)
-                sdf.fill_keep(vec4(fab.color_float.xyz, 0.94))
+                sdf.fill_keep(fab.color_float)
                 sdf.stroke(fab.color_float_border, 1.0)
                 return sdf.result
             }
@@ -726,8 +731,8 @@ script_mod! {
     mod.widgets.FabToolSep = View{ width: 20 height: 1 margin: Inset{left: 6 top: 4 bottom: 4} show_bg: true draw_bg +: { color: fab.color_border_light } }
 
     // =====================================================================
-    // Checkbox — a text field's well: a #00000020 fill, its outline #00000040 at rest, #ffffff20
-    // under the pointer, #ffffff40 with focus; the tick in the text's ink, lit under the pointer.
+    // Checkbox — a text field's well: a #00000020 fill, its outline #00000040 at rest, #ffffff40
+    // under the pointer, #ffffff20 with focus; the tick in the text's ink, lit under the pointer.
     // The property kit's PropCheckBox (the slicer's rows, Global, Advanced) draws the same.
     // =====================================================================
 
@@ -744,8 +749,8 @@ script_mod! {
             mark_at_end: uniform(0.0)
             color: uniform(#x00000020)
             border_color: uniform(#x00000040)
-            border_color_hover: uniform(#xffffff20)
-            border_color_focus: uniform(#xffffff40)
+            border_color_hover: uniform(#xffffff40)
+            border_color_focus: uniform(#xffffff20)
             mark_color_active: uniform(fab.color_text)
             mark_color_hover: uniform(fab.color_text_hover)
             mark_color_disabled: uniform(fab.color_text_dim)
@@ -804,8 +809,8 @@ script_mod! {
             mark_at_end: uniform(0.0)
             color: uniform(#x00000020)
             border_color: uniform(#x00000040)
-            border_color_hover: uniform(#xffffff20)
-            border_color_focus: uniform(#xffffff40)
+            border_color_hover: uniform(#xffffff40)
+            border_color_focus: uniform(#xffffff20)
             mark_color_active: uniform(fab.color_text)
             mark_color_hover: uniform(fab.color_text_hover)
             mark_color_disabled: uniform(fab.color_text_dim)
@@ -853,8 +858,8 @@ script_mod! {
     // The row sets the height, as for the property kit's fields: a desktop sheet gives a
     // TextInput a field's height of its own, which stood the field taller than its row (a button
     // beside it, a tree row it renames in) and put the text below the row's middle.
-    // A text field: a #00000020 fill; its outline #00000040 at rest, #ffffff20 under the
-    // pointer, #ffffff40 with focus.
+    // A text field: a #00000020 fill; its outline #00000040 at rest, #ffffff40 under the
+    // pointer, #ffffff20 with focus.
     mod.widgets.FabInput = TextInput{
         height: theme.prop_row_height
         min_height: 0
@@ -871,9 +876,9 @@ script_mod! {
             color_2: uniform(vec4(-1.0, -1.0, -1.0, -1.0))
             border_radius: fab.radius
             border_color: uniform(#x00000040)
-            border_color_hover: uniform(#xffffff20)
-            border_color_focus: uniform(#xffffff40)
-            border_color_down: uniform(#xffffff40)
+            border_color_hover: uniform(#xffffff40)
+            border_color_focus: uniform(#xffffff20)
+            border_color_down: uniform(#xffffff20)
             border_color_empty: uniform(#x00000040)
         }
         draw_text +: {
@@ -966,7 +971,7 @@ script_mod! {
 
     // A search field (a toolbar's): at rest only its magnifier, a button at the toolbar's right
     // end; pressed, it opens leftward into the field (`FabSearch`). The input is the box (a
-    // #00000020 fill; its outline #00000040 at rest, #ffffff20 under the pointer, #ffffff40 with
+    // #00000020 fill; its outline #00000040 at rest, #ffffff40 under the pointer, #ffffff20 with
     // focus), the magnifier over its left end; a toolbar's field's height (28: room above and
     // below the words), wherever it is.
     mod.widgets.FabSearchBase = #(FabSearch::register_widget(vm))
@@ -997,9 +1002,9 @@ script_mod! {
                     color_empty: uniform(#x00000020)
                     color_2: uniform(vec4(-1.0, -1.0, -1.0, -1.0))
                     border_color: uniform(#x00000040)
-                    border_color_hover: uniform(#xffffff20)
-                    border_color_focus: uniform(#xffffff40)
-                    border_color_down: uniform(#xffffff40)
+                    border_color_hover: uniform(#xffffff40)
+                    border_color_focus: uniform(#xffffff20)
+                    border_color_down: uniform(#xffffff20)
                     border_color_empty: uniform(#x00000040)
                     border_color_2: uniform(vec4(-1.0, -1.0, -1.0, -1.0))
                 }
@@ -1293,6 +1298,9 @@ script_mod! {
         width: Fill
         height: Fill
         flow: Down
+        // a baseline gap under the editor's toolbar, so its first row never touches it (a body
+        // that sets its own padding keeps at least this at its top)
+        padding: Inset{top: #(PANEL_TOP)}
         fade_size: #(SCROLL_SHADE_H)
         fade_ramp: #(SCROLL_SHADE_RAMP)
         fade_top: true
@@ -1695,6 +1703,9 @@ pub(crate) fn section_headers<'a>(cx: &mut Cx, event: &Event, sections: impl Int
         title.redraw(cx);
     }
 }
+
+/// The gap at the top of an editor's body, under its toolbar ([`FabScroll`]'s and every body's).
+pub const PANEL_TOP: f64 = 8.0;
 
 /// The shadow under an editor's toolbar while its content is scrolled down: how deep it is, and
 /// how far the content must be scrolled for it to reach full strength.

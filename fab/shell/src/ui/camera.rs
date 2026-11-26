@@ -1,5 +1,5 @@
-//! The Camera panel: the linked printer's live view (the Monitor workspace,
-//! or the plate view's corner). The stream runs only while it is shown: the printer
+//! The linked printer's live view, floating over the window ([`FabCameraFloat`], opened from
+//! the title bar's camera button). The stream runs only while it is shown: the printer
 //! serves one live viewer, so a panel that stops drawing lets its feed tear
 //! the session down within a few seconds.
 //!
@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 script_mod! {
     use mod.prelude.widgets_internal.*
     use mod.prelude.fab.*
+    use mod.widgets.*
     mod.widgets.FabPrinterCameraBase = #(FabPrinterCamera::register_widget(vm))
     mod.widgets.FabPrinterCamera = set_type_default() do mod.widgets.FabPrinterCameraBase{
         width: Fill
@@ -27,59 +28,118 @@ script_mod! {
         label: FabLabelDim{ text: "" }
     }
 
-    mod.widgets.FabCameraPanelBase = #(FabCameraPanel::register_widget(vm))
-    mod.widgets.FabCameraPanel = set_type_default() do mod.widgets.FabCameraPanelBase{
+    // The camera floating over the whole window (the title bar's camera button): a card dragged
+    // by its top, kept inside the window, with Hide.
+    mod.widgets.FabCameraFloatBase = #(FabCameraFloat::register_widget(vm))
+    mod.widgets.FabCameraFloat = set_type_default() do mod.widgets.FabCameraFloatBase{
         width: Fill
         height: Fill
-        flow: Overlay
-        show_bg: true
-        draw_bg +: { color: #x101214 }
-        cam_box := View{ width: Fill height: Fill camera := mod.widgets.FabPrinterCamera{} }
-        moved := View{
-            visible: false
-            width: Fill height: Fill align: Align{x: 0.5 y: 0.5}
-            mod.widgets.FabLabelDim{ text: "The camera is showing in the corner of the plate view." }
-        }
-        head := View{
-            width: Fill height: Fit flow: Right padding: 6
-            Filler{}
-            mod.widgets.FabTip{ text: "Show the camera in the corner of the plate view"
-                pop := mod.widgets.FabButton{ text: "In the view" }
+        card := mod.widgets.FabFloat{
+            width: 320
+            height: 206
+            flow: Overlay
+            padding: 3
+            cam_box := View{ width: Fill height: Fill camera := mod.widgets.FabPrinterCamera{} }
+            head := View{
+                width: Fill height: Fit flow: Right padding: 4
+                cursor: MouseCursor.Move
+                Filler{}
+                mod.widgets.FabTip{ text: "Hide the camera"
+                    close := mod.widgets.FabIconButton{ a11y: {label: "Hide camera"} draw_bg +: { color: #x000000a0 } draw_icon +: { svg: crate_resource("self://resources/icons/close.svg") color: #xffffffd0 } }
+                }
             }
         }
     }
 }
 
-/// The Camera panel: the live view, and a button that moves it into the
-/// plate view's corner (the printer serves one live viewer, so the panel's
-/// own feed rests while the corner one runs).
+/// The printer camera floating over the window while [`crate::api::UiState::camera_pip`] is on
+/// (the title bar's camera button): its card
+/// where it was dragged (at first the window's bottom right), kept inside the window.
 #[derive(Script, ScriptHook, Widget)]
-pub struct FabCameraPanel {
+pub struct FabCameraFloat {
     #[deref]
     view: View,
+    /// The card's top left, once dragged (window points).
+    #[rust]
+    at: Option<DVec2>,
+    /// A drag by its top: the pointer's offset in the card.
+    #[rust]
+    grab: Option<DVec2>,
+    /// The window's rect as last drawn, that the card stays in.
+    #[rust]
+    room: Rect,
 }
 
-impl Widget for FabCameraPanel {
-    fn semantics(&self, _cx: &Cx, node: &mut a11y_tree::Node) {
-        node.role = a11y_tree::Role::Group;
-        makepad_platform::a11y::set_string(&mut node.name, "Camera");
+/// Its gap from the window's bottom right at first, clear of the plate view's player.
+const FLOAT_INSET: f64 = 16.0;
+const FLOAT_BOTTOM: f64 = 96.0;
+
+impl FabCameraFloat {
+    fn shown(scope: &mut Scope) -> bool {
+        scope.data.get::<AppState>().is_some_and(|s| s.ui.camera_pip)
     }
 
+    fn clamp(&self, at: DVec2, size: DVec2) -> DVec2 {
+        let lo = self.room.pos;
+        let hi = self.room.pos + self.room.size - size;
+        dvec2(at.x.clamp(lo.x, hi.x.max(lo.x)), at.y.clamp(lo.y, hi.y.max(lo.y)))
+    }
+}
+
+impl Widget for FabCameraFloat {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if !Self::shown(scope) {
+            self.grab = None;
+            return;
+        }
+        let card = self.view.widget(cx, ids!(card));
+        let rect = card.area().rect(cx);
+        let on_button = |cx: &Cx, p: DVec2| self.view.widget(cx, ids!(close)).area().rect(cx).contains(p);
+        match event {
+            // a press on its top (not a button) drags it; any press on it is its own, not the
+            // dock's under it
+            Event::MouseDown(e) if rect.contains(e.abs) => {
+                let head = self.view.widget(cx, ids!(head)).area().rect(cx);
+                if e.button.is_primary() && head.contains(e.abs) && !on_button(cx, e.abs) {
+                    self.grab = Some(e.abs - rect.pos);
+                }
+                if !on_button(cx, e.abs) {
+                    e.handled.set(card.area());
+                }
+            }
+            Event::MouseMove(e) => {
+                if let Some(grab) = self.grab {
+                    self.at = Some(self.clamp(e.abs - grab, rect.size));
+                    self.view.redraw(cx);
+                }
+            }
+            Event::MouseUp(_) => self.grab = None,
+            _ => {}
+        }
         self.view.handle_event(cx, event, scope);
         if let Event::Actions(actions) = event {
-            if self.view.button(cx, ids!(head.pop)).clicked(actions) {
-                cx.action(crate::ui::stage::StageAction::CameraPip(true));
+            if self.view.button(cx, ids!(close)).clicked(actions) {
+                cx.action(crate::ui::stage::StageAction::CameraPip(false));
             }
         }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        let pip = scope.data.get::<AppState>().is_some_and(|s| s.ui.camera_pip);
-        self.view.view(cx, ids!(cam_box)).set_visible(cx, !pip);
-        self.view.view(cx, ids!(moved)).set_visible(cx, pip);
-        self.view.view(cx, ids!(head)).set_visible(cx, !pip);
-        self.view.draw_walk(cx, scope, walk)
+        if !Self::shown(scope) {
+            return DrawStep::done();
+        }
+        cx.begin_turtle(walk, Layout::default());
+        self.room = cx.turtle().rect();
+        let card = self.view.widget(cx, ids!(card));
+        let mut card_walk = card.walk(cx);
+        let fixed = |s: Size, or: f64| if let Size::Fixed(v) = s { v } else { or };
+        let size = dvec2(fixed(card_walk.width, 320.0), fixed(card_walk.height, 206.0));
+        let first = self.room.pos + self.room.size - size - dvec2(FLOAT_INSET, FLOAT_BOTTOM);
+        let at = self.clamp(self.at.unwrap_or(first), size);
+        card_walk = card_walk.with_abs_pos(at);
+        card.draw_walk_all(cx, scope, card_walk);
+        cx.end_turtle();
+        DrawStep::done()
     }
 }
 

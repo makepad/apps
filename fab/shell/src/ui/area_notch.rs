@@ -116,12 +116,25 @@ script_mod! {
             draw_bg +: {
                 pixel: fn() {
                     let sdf = Sdf2d.viewport(self.pos * self.rect_size)
-                    sdf.box(0.0, 0.0, self.rect_size.x, self.rect_size.y, fab.radius_lg)
-                    sdf.fill(fab.color_float)
+                    sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, fab.radius_lg)
+                    sdf.fill_keep(fab.color_float)
+                    sdf.stroke(fab.color_float_border, 1.0)
                     return sdf.result
                 }
             }
             text := mod.widgets.FabLabelSmall{}
+        }
+        // after an area's last tab: a new tab, of the editor picked from its menu
+        AddTab := mod.widgets.FabTip{
+            text: "New tab: pick its editor"
+            button := mod.widgets.FabIconButton{
+                a11y: {label: "New tab"}
+                width: 20 height: 20
+                align: Align{x: 0.5 y: 0.5}
+                padding: Inset{left: 0 right: 0 top: 0 bottom: 0}
+                icon_walk: Walk{width: 14 height: 14}
+                draw_icon +: {svg: crate_resource("self://resources/icons/plus.svg") color: fab.color_text_dim}
+            }
         }
         // a toolbar's close button, at its right end past the search: closes the area's tab
         CloseTab := mod.widgets.FabTip{
@@ -146,7 +159,6 @@ script_mod! {
         Settings := Notch{tip +: {text: "Job" chip +: {a11y: {label: "Job: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/gear.svg")}}}}
         Printer := Notch{tip +: {text: "Printer" chip +: {a11y: {label: "Printer: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/printer.svg")}}}}
         Calibrate := Notch{tip +: {text: "Calibrate" chip +: {a11y: {label: "Calibrate: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/ruler.svg")}}}}
-        Camera := Notch{tip +: {text: "Camera" chip +: {a11y: {label: "Camera: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/camera.svg")}}}}
         Features := Notch{tip +: {text: "Features" chip +: {a11y: {label: "Features: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/shape.svg")}}}}
         Code := Notch{tip +: {text: "Program" chip +: {a11y: {label: "Program: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/code.svg")}}}}
         Mechanics := Notch{tip +: {text: "Mechanics" chip +: {a11y: {label: "Mechanics: area menu"} draw_icon +: {svg: crate_resource("self://resources/icons/grab.svg")}}}}
@@ -188,6 +200,8 @@ pub struct NotchedArea {
     /// Whether its front tab may close (the area has another tab, or there is another area):
     /// then its toolbar shows a close button at its right end.
     pub closable: bool,
+    /// Its last tab, while its tab bar shows: the new-tab button sits after it.
+    pub last: Option<LiveId>,
 }
 
 /// The view that speaks in an area with this front editor.
@@ -305,6 +319,9 @@ pub struct FabAreaNotches {
     /// Each toolbar's close button, by its area's front tab.
     #[rust]
     closes: ComponentMap<LiveId, WidgetRef>,
+    /// Each tab bar's new-tab button, by its area's front tab.
+    #[rust]
+    adds: ComponentMap<LiveId, WidgetRef>,
     /// A press on a nub's chip, held: its tab and where it went down. The editor menu opens on
     /// the press and takes the pointer, so the drag that moves the area is read off the raw
     /// moves (`handle_event`).
@@ -406,6 +423,7 @@ impl FabAreaNotches {
         self.corners.clear();
         self.items.retain(|tab, _| areas.iter().any(|a| a.tab == *tab));
         self.closes.retain(|tab, _| areas.iter().any(|a| a.tab == *tab && a.closable));
+        self.adds.retain(|tab, _| areas.iter().any(|a| a.tab == *tab && a.last.is_some()));
         self.notice_items.retain(|tab, _| areas.iter().any(|a| a.tab == *tab));
         self.notice_revision = None;
         self.areas = areas;
@@ -476,6 +494,15 @@ impl FabAreaNotches {
     /// The area whose chip was pressed, and the chip's rectangle (the menu opens under it). A
     /// press that dragged the area is none.
     /// The front tab whose close button (at its toolbar's right end) was clicked.
+    /// A tab bar's new-tab button pressed (its menu opens on the press, as the editor menu's):
+    /// its area's front tab, and the button's rect for the menu to hang from.
+    pub fn add_pressed(&self, cx: &Cx, actions: &Actions) -> Option<(LiveId, Rect)> {
+        self.adds.iter().find_map(|(tab, w)| {
+            let button = w.button(cx, ids!(button));
+            button.pressed(actions).then(|| (*tab, button.area().rect(cx)))
+        })
+    }
+
     pub fn closed(&self, cx: &Cx, actions: &Actions) -> Option<LiveId> {
         self.closes.iter().find_map(|(tab, w)| w.button(cx, ids!(button)).clicked(actions).then_some(*tab))
     }
@@ -590,6 +617,17 @@ impl FabAreaNotches {
     }
 
     /// The close button of `tab`'s toolbar.
+    fn add(&mut self, cx: &mut Cx, tab: LiveId) -> Option<WidgetRef> {
+        if let Some(w) = self.adds.get(&tab) {
+            return Some(w.clone());
+        }
+        let value: ScriptValue = self.templates.get(&live_id!(AddTab))?.as_object().into();
+        let w = cx.with_vm(|vm| WidgetRef::script_from_value(vm, value));
+        cx.widget_tree_insert_child(self.uid, LiveId::from_str(&format!("add:{}", tab.0)), w.clone());
+        self.adds.insert(tab, w.clone());
+        Some(w)
+    }
+
     fn close(&mut self, cx: &mut Cx, tab: LiveId) -> Option<WidgetRef> {
         if let Some(w) = self.closes.get(&tab) {
             return Some(w.clone());
@@ -690,6 +728,9 @@ impl Widget for FabAreaNotches {
         for (_, w) in self.closes.iter_mut() {
             w.handle_event(cx, event, scope);
         }
+        for (_, w) in self.adds.iter_mut() {
+            w.handle_event(cx, event, scope);
+        }
         if !captured && self.corner_event(cx, event) {
             return;
         }
@@ -763,6 +804,17 @@ impl Widget for FabAreaNotches {
                     let at = dvec2(rect.pos.x + rect.size.x - TOOL_INSET - 22.0, rect.pos.y + (TOOLBAR_H - 20.0) / 2.0);
                     let walk = close.walk(cx).with_abs_pos(at);
                     close.draw_walk_all(cx, scope, walk);
+                }
+            }
+            // after its last tab, while its tab bar shows: the new-tab button
+            if let (Some(last), Some(dock)) = (area.last, dock.as_ref()) {
+                let tab_rect = dock.tab_widget(last).area().rect(cx);
+                if tab_rect.size.x >= 1.0 {
+                    if let Some(add) = self.add(cx, area.tab) {
+                        let at = dvec2(tab_rect.pos.x + tab_rect.size.x + 4.0, tab_rect.pos.y + (tab_rect.size.y - 20.0) / 2.0);
+                        let walk = add.walk(cx).with_abs_pos(at);
+                        add.draw_walk_all(cx, scope, walk);
+                    }
                 }
             }
             // The notice at the area's foot, centred, over the editor's own bar when it has one

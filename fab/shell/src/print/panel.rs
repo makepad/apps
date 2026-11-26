@@ -112,7 +112,7 @@ script_mod! {
         }
         // the job's settings as the Part editor's: sections that fold, each a bar with its glyph
         body := mod.widgets.FabScroll{
-            padding: Inset{left: theme.prop_pad right: theme.prop_pad}
+            padding: Inset{left: theme.prop_pad right: theme.prop_pad top: #(crate::ui::widgets::PANEL_TOP)}
             // its slot: the box the section moves in when dragged by its grip (`section_reorder`)
             profile_slot := View{width: Fill height: Fit
                 profile := PropSection{

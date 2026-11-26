@@ -225,7 +225,6 @@ script_mod! {
                 Settings := FabSettingsPanel{}
                 Printer := FabPrinterPanel{}
                 Calibrate := FabCalibratePanel{}
-                Camera := FabCameraPanel{}
                 Mechanics := FabMechanicsPanel{}
                 Features := FabFeaturesPanel{}
                 Code := FabCodePanel{}
@@ -533,6 +532,8 @@ script_mod! {
         // bar's left end (a layer of the shell, so the workspace's flow never moves it; it takes
         // presses before the dock).
         area_nubs := mod.widgets.FabAreaNotches{}
+        // the printer camera floating over the window (the Camera panel's Floating)
+        camera_float := mod.widgets.FabCameraFloat{}
         keymap_help := FabKeymapHelp{}
         about := FabAbout{}
         command_palette := FabCommandPalette{}
@@ -549,6 +550,8 @@ const RECORDER_H: f64 = 55.0;
 
 /// The owner id of an area's menu, and its rows past the editors.
 const AREA_MENU: LiveId = live_id!(area_menu);
+/// The owner id of a tab bar's new-tab menu (the editors, by group).
+const ADD_MENU: LiveId = live_id!(area_add_menu);
 const TOOLS: LiveId = live_id!(area_tools);
 const SPLIT_RIGHT: LiveId = live_id!(area_split_right);
 const SPLIT_DOWN: LiveId = live_id!(area_split_down);
@@ -752,6 +755,9 @@ pub struct FabShell {
     /// The area whose menu is open.
     #[rust]
     area_menu: Option<AreaId>,
+    /// The area whose new-tab menu is open.
+    #[rust]
+    add_menu: Option<AreaId>,
     /// The dock's shown editors changed since the state last heard ([`Self::publish_screen`]).
     #[rust]
     screen_stale: bool,
@@ -1433,7 +1439,8 @@ impl FabShell {
                     Some(DockItem::Tab { kind, .. }) if tab != GHOST_TAB => {
                         let strip = self.plate_strip && *kind == Editor::Viewport.kind();
                         let closable = tabs.len() > 1 || area_count > 1;
-                        Some((*set, NotchedArea { tab, kind: *kind, bar: !hide_tab_bar, strip, closable }))
+                        let last = tabs.last().copied().filter(|_| !hide_tab_bar);
+                        Some((*set, NotchedArea { tab, kind: *kind, bar: !hide_tab_bar, strip, closable, last }))
                     }
                     _ => None,
                 }
@@ -1501,6 +1508,28 @@ impl FabShell {
         footer.push(MenuItem::new(CLOSE_AREA, "Close area").enabled_if(areas > 1));
         self.area_menu = Some(area);
         crate::ui::popover::open_menu_columns(cx, AREA_MENU, columns, footer, anchor, MenuPlace::Below);
+    }
+
+    /// A tab bar's new-tab menu: every editor the area menu offers, by its groups; those the
+    /// area holds are marked (picking one brings it forward).
+    fn open_add_menu(&mut self, cx: &mut Cx, tab: LiveId, anchor: Rect) {
+        let Some(area) = self.area_of_shown_tab(tab) else { return };
+        let Some(tree) = &self.areas else { return };
+        let Some((tabs, _)) = tree.stack_of(area) else { return };
+        let (arm, scan) = self.experimental;
+        let offered = |e: &Editor| match e.family() {
+            Some(Family::Arm) => arm,
+            Some(Family::Scan) => scan,
+            _ => true,
+        };
+        let columns: Vec<(String, Vec<MenuItem>)> = MENU.iter().filter_map(|(heading, editors)| {
+            let rows: Vec<_> = editors.iter().filter(|e| offered(e))
+                .map(|e| MenuItem::new(e.tab(), e.title()).current(tabs.iter().any(|i| i.editor == *e)))
+                .collect();
+            (!rows.is_empty()).then(|| ((*heading).to_owned(), rows))
+        }).collect();
+        self.add_menu = Some(area);
+        crate::ui::popover::open_menu_columns(cx, ADD_MENU, columns, Vec::new(), anchor, MenuPlace::Below);
     }
 
     /// A row of an area menu picked.
@@ -1597,6 +1626,12 @@ impl FabShell {
         if let Some(id) = menu_picked(actions, AREA_MENU) {
             self.area_menu_picked(cx, id, workspaces);
         }
+        // a tab bar's new-tab menu: the editor picked opens as a new tab of that area
+        if let Some(id) = menu_picked(actions, ADD_MENU) {
+            if let (Some(area), Some(editor)) = (self.add_menu.take(), Editor::all().find(|e| e.tab() == id)) {
+                cx.action(ShellAction::EditAreas(WorkspaceOp::AddTab { area, editor }));
+            }
+        }
         // a plate view's toolbar Tools toggle: its tool rails on or off, as its area menu's Tools
         if let Some(ws) = workspaces {
             let dock = self.view.dock(cx, ids!(main.dock));
@@ -1613,6 +1648,10 @@ impl FabShell {
         let pressed = nubs.borrow::<FabAreaNotches>().and_then(|n| n.pressed(cx, actions));
         if let Some((tab, chip)) = pressed {
             self.open_area_menu(cx, tab, chip, workspaces);
+        }
+        let added = nubs.borrow::<FabAreaNotches>().and_then(|n| n.add_pressed(cx, actions));
+        if let Some((tab, button)) = added {
+            self.open_add_menu(cx, tab, button);
         }
         // a toolbar's close button: its area's front tab closes, as the area menu's Close tab
         let closed = nubs.borrow::<FabAreaNotches>().and_then(|n| n.closed(cx, actions));
@@ -2968,6 +3007,37 @@ mod tests {
 
     /// The area menu's edits: another Scope opens beside one, an editor on screen swaps places, a
     /// split shows the first editor not on screen, and the last area does not close.
+    #[test]
+    fn the_new_tab_button_adds_a_tab_brings_one_forward_or_moves_a_lone_editor() {
+        use crate::ui::areas::OpError;
+        let mut tree = layouts::defaults()[1].1.clone();
+        let area_of = |t: &AreaTree, e: Editor| t.showing(e).expect("the editor has an area");
+        let scope_area = area_of(&tree, Editor::Scope);
+        let stack = |t: &AreaTree, a| t.stack_of(a).map(|(tabs, k)| (tabs.to_vec(), k)).expect("the area's stack");
+        let (before, _) = stack(&tree, scope_area);
+        // a repeatable editor the area shows: another instance, as a new tab in front
+        tree.apply(WorkspaceOp::AddTab { area: scope_area, editor: Editor::Scope }).expect("a second Scope opens");
+        let (tabs, k) = stack(&tree, scope_area);
+        assert!(tabs.len() == before.len() + 1 && tabs[k].editor == Editor::Scope && tabs[k].tab() != Editor::Scope.tab(), "another Scope, in front: {tabs:?}");
+        let before = tabs;
+        // a lone editor another area holds moves here, as a new tab in front
+        let board_area = area_of(&tree, Editor::Board);
+        tree.apply(WorkspaceOp::AddTab { area: scope_area, editor: Editor::Board }).expect("the Board moves here");
+        let (tabs, k) = stack(&tree, scope_area);
+        assert!(tabs.len() == before.len() + 1 && tabs[k].editor == Editor::Board, "the Board is a new tab, in front: {tabs:?}");
+        assert!(tree.area_of_tab(Editor::Board.tab()) != Some(board_area), "it left the area it was in");
+        // one no area holds: a new tab of it, in front
+        tree.apply(WorkspaceOp::AddTab { area: scope_area, editor: Editor::Slice }).expect("Slice opens here");
+        let (tabs, k) = stack(&tree, scope_area);
+        assert_eq!(tabs[k].editor, Editor::Slice, "the new tab is in front");
+        assert_eq!(tabs.last().map(|i| i.editor), Some(Editor::Slice), "after the others");
+        // one the area holds, behind: it comes forward, no tab added
+        tree.apply(WorkspaceOp::AddTab { area: scope_area, editor: Editor::Board }).expect("the Board comes forward");
+        let (again, k) = stack(&tree, scope_area);
+        assert!(again.len() == tabs.len() && again[k].editor == Editor::Board, "brought forward, not added");
+        assert_eq!(tree.apply(WorkspaceOp::AddTab { area: scope_area, editor: Editor::Board }).err(), Some(OpError::Unchanged), "already in front");
+    }
+
     #[test]
     fn area_menu_edits_put_swap_split_and_close() {
         use crate::ui::areas::OpError;

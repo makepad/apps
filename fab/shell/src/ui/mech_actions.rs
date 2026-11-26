@@ -141,7 +141,7 @@ script_mod! {
                 pixel: fn() {
                     let sdf = Sdf2d.viewport(self.pos * self.rect_size)
                     sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, fab.radius_lg)
-                    sdf.fill_keep(vec4(fab.color_float.xyz, 0.94))
+                    sdf.fill_keep(fab.color_float)
                     sdf.stroke(fab.color_float_border, 1.0)
                     return sdf.result
                 }

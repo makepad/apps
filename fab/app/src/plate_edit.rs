@@ -329,7 +329,13 @@ pub fn plate_info(c: Option<&Compiled>, ev: &Evaluated, revision: u64) -> PlateI
             let instance = split_id(&p.object).map_or(p.object.as_str(), |(i, _)| i);
             let compiled = instances.get(instance);
             let (script, link) = split_link(instance);
+            let object = split_id(&p.object).map_or(p.object.as_str(), |(_, o)| o);
+            let order = (
+                c.and_then(|c| c.instances.iter().position(|i| i.name == instance)).unwrap_or(usize::MAX),
+                compiled.and_then(|i| i.placed.iter().position(|placed| placed.object == object)).unwrap_or(usize::MAX),
+            );
             fab::api::PlatePart {
+                order,
                 printed: excluded.is_none(),
                 hidden: h.hidden,
                 insert: excluded.is_some_and(|p| p.insert.is_some()),

@@ -45,7 +45,7 @@ script_mod! {
         // the preview's settings as the Part editor's: sections that fold, each a bar with its
         // glyph; a section with nothing to show hides (`draw_walk`)
         body := mod.widgets.FabScroll{
-            padding: Inset{left: theme.prop_pad right: theme.prop_pad}
+            padding: Inset{left: theme.prop_pad right: theme.prop_pad top: #(crate::ui::widgets::PANEL_TOP)}
             a11y: {role: "group" label: "Print preview legend"}
             // nothing sliced yet: what the slice is waiting for
             none := mod.widgets.FabLabelDim{ width: Fill text: "" margin: Inset{left: 4 top: 4 bottom: 8} }

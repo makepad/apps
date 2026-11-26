@@ -1444,7 +1444,7 @@ pub struct UiState {
     /// The nozzle-zone overlay on the plate (each nozzle's reach, keep-outs,
     /// ceilings): off by default, on while its chip is toggled.
     pub show_zones: bool,
-    /// The printer camera in the view's corner.
+    /// The printer camera floating over the window (the Camera panel's Floating).
     pub camera_pip: bool,
     pub gizmo: GizmoMode,
     pub paint_radius: f64,
@@ -1881,6 +1881,10 @@ impl PartialEq for PaintView {
 /// show it. Positions are printer millimetres (Z up, bed origin).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PlatePart {
+    /// Where it is declared: its placement's place among the project's placements, and its
+    /// object's among the placement's objects. The parts list keeps this order, which a part's
+    /// printing on or off (the plate lists the printed ones first) does not move.
+    pub order: (usize, usize),
     /// Included in slicing/printing; excluded parts remain editable on the bed.
     pub printed: bool,
     /// Its `place(...)` says `hidden: true`: kept on the plate, out of the views (a board turned

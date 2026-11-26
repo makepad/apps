@@ -45,6 +45,9 @@ const CONTEXT_MENU: LiveId = live_id!(fab_stage_context);
 /// The navigation gizmo's row's top inset; Mechanics adds its header strip's height, the other
 /// modes the top toolbar's.
 const NAV_TOP: f64 = 6.0;
+/// The room the chosen tool's row takes under the toolbar (its gap above, its tallest, the Paint
+/// row with its dials, and a gap below), that the navigation gizmo keeps clear of.
+const CONTEXT_ROW: f64 = 10.0 + 50.0 + 6.0;
 /// The top toolbar's top inset (`render_row`: none, it is the view's toolbar) and its height (an
 /// editor toolbar's).
 const RENDER_ROW_TOP: f64 = 0.0;
@@ -85,7 +88,7 @@ script_mod! {
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
                 sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, fab.radius_lg)
-                sdf.fill_keep(vec4(fab.color_float.xyz, 0.94))
+                sdf.fill_keep(fab.color_float)
                 sdf.stroke(fab.color_float_border, 1.0)
                 return sdf.result
             }
@@ -221,6 +224,18 @@ script_mod! {
                     }
                     settings_here_tip := FabTip{ text: #(SETTINGS_HERE_TIP)
                         t_settings_here := Tool{ a11y: {label: "Print settings here"} draw_icon +: { svg: crate_resource("self://resources/icons/settings_here.svg") } }
+                    }
+                    Sep{}
+                    // an action, not a tool: a button the size of the tools
+                    FabTip{ text: "Arrange every part on the plate"
+                        arrange_all := mod.widgets.FabIconButton{
+                            width: 32 height: 32
+                            align: Align{x: 0.5 y: 0.5}
+                            padding: Inset{left: 8 right: 8 top: 8 bottom: 8}
+                            icon_walk: Walk{width: 16 height: 16}
+                            a11y: {label: "Arrange plate"}
+                            draw_icon +: { svg: crate_resource("self://resources/icons/arrange.svg") }
+                        }
                     }
                 }
             }
@@ -691,9 +706,6 @@ script_mod! {
                     FabTip{ text: #(keymap::tooltip(Key::FrameAll))
                         frame_all := ViewButton{ a11y: {label: "Frame plate"} draw_icon +: { svg: crate_resource("self://resources/icons/fit.svg") } }
                     }
-                    FabTip{ text: "Arrange every part on the plate"
-                        arrange_all := ViewButton{ a11y: {label: "Arrange plate"} draw_icon +: { svg: crate_resource("self://resources/icons/arrange.svg") } }
-                    }
                     // Sliced: what the slice shows
                     supports_tip := FabTip{ text: #(keymap::tooltip(Key::ShowSupports))
                         show_supports := ViewToggle{ a11y: {label: "Show supports"} draw_icon +: { svg: crate_resource("self://resources/icons/supports.svg") } }
@@ -757,39 +769,6 @@ script_mod! {
                 align: Align{x: 0.5}
                 spacing: 4
                 gizmo := FabNavGizmo{ width: 96 }
-            }
-        }
-        pip_layer := View{
-            visible: false
-            width: Fill
-            height: Fill
-            flow: Down
-            Filler{}
-            pip_row := View{
-                width: Fill
-                height: Fit
-                flow: Right
-                padding: Inset{right: 12 bottom: 96}
-                Filler{}
-                pip := Float{
-                    width: 320
-                    height: 206
-                    flow: Overlay
-                    padding: 3
-                    cam_box := View{ width: Fill height: Fill camera := mod.widgets.FabPrinterCamera{} }
-                    pip_head := View{
-                        width: Fill height: Fit flow: Right padding: 4
-                        Filler{}
-                        show_bg: true
-                        draw_bg +: { color: #x00000000 }
-                        FabTip{ text: "Dock the camera as a panel"
-                            pip_dock := mod.widgets.FabIconButton{ a11y: {label: "Dock camera"} draw_bg +: { color: #x000000a0 } draw_icon +: { svg: crate_resource("self://resources/icons/maximize.svg") color: #xffffffd0 } }
-                        }
-                        FabTip{ text: "Hide the camera"
-                            pip_close := mod.widgets.FabIconButton{ a11y: {label: "Hide camera"} draw_bg +: { color: #x000000a0 } draw_icon +: { svg: crate_resource("self://resources/icons/close.svg") color: #xffffffd0 } }
-                        }
-                    }
-                }
             }
         }
         // Beside the primary tool rail, still in the pane's top-left corner.
@@ -1697,9 +1676,6 @@ impl Widget for FabStage {
         if bar.button(cx, ids!(frame_all)).clicked(actions) {
             cx.action(ShellAction::FrameAll);
         }
-        if bar.button(cx, ids!(arrange_all)).clicked(actions) {
-            cx.action(PartAction::Arrange);
-        }
         if bar.radio_button(cx, ids!(show_supports)).clicked(actions) {
             self.draw_keys.view_bar = None;
             cx.action(PrintAction::ShowSupports(!state.print.play.supports));
@@ -1742,6 +1718,9 @@ impl Widget for FabStage {
         if tv.radio_button(cx, ids!(t_sculpt)).clicked(actions) {
             Self::set_mode(cx, state, GizmoMode::Sculpt);
             cx.redraw_area(v.area());
+        }
+        if tv.button(cx, ids!(arrange_all)).clicked(actions) {
+            cx.action(PartAction::Arrange);
         }
         if tv.radio_button(cx, ids!(t_force)).clicked(actions) {
             Self::force_tool(cx, state);
@@ -1900,14 +1879,6 @@ impl Widget for FabStage {
         if sv.button(cx, ids!(bottom.bar_row.bar.follow_row.back_live)).clicked(actions) || sv.button(cx, ids!(resin_ui.resin_row.resin_live)).clicked(actions) {
             cx.action(PrintAction::FollowPrinter(true));
         }
-        let pip = v.view(cx, ids!(pip_layer.pip_row.pip.pip_head));
-        if pip.button(cx, ids!(pip_close)).clicked(actions) {
-            cx.action(StageAction::CameraPip(false));
-        }
-        if pip.button(cx, ids!(pip_dock)).clicked(actions) {
-            cx.action(StageAction::CameraPip(false));
-            cx.action(ShowPanel(Editor::Camera));
-        }
         // ---- the part menu ----
         if let Some(pick) = menu_picked(actions, CONTEXT_MENU) {
             let objects = Self::selected_objects(state);
@@ -2006,7 +1977,15 @@ impl Widget for FabStage {
             // and under the top toolbar while it shows, so the gizmo takes none of its width (its
             // height is fixed: an area of the last frame reads empty here, mid-draw)
             let toolbar = if !mechanics && v.view(cx, ids!(render_row)).visible() { RENDER_ROW_TOP + RENDER_ROW_H } else { 0.0 };
-            let nav_top = NAV_TOP + strip + toolbar;
+            // and under the chosen tool's row across the top (Paint, Edit shape, Sculpt, Force),
+            // while it shows: the rails shown, the tool one with a row
+            let row_tool = match state.ui.gizmo {
+                GizmoMode::Paint | GizmoMode::Shape | GizmoMode::Sculpt => true,
+                GizmoMode::Force => mode == RenderMode::Force,
+                _ => false,
+            };
+            let context = !mechanics && design && state.tool == Tool::Select && row_tool && v.view(cx, ids!(model_ui.context)).visible();
+            let nav_top = NAV_TOP + strip + toolbar + if context { CONTEXT_ROW } else { 0.0 };
             let nav = v.widget(cx, ids!(primary.nav));
             let moved = nav.borrow_mut::<View>().is_some_and(|mut nav| {
                 let moved = (nav.layout.padding.top - nav_top).abs() > 0.25;
@@ -2052,7 +2031,6 @@ impl Widget for FabStage {
                 v.view(cx, ids!(slice_ui.resin_ui)).set_visible(cx, resin);
                 // Monitor stopped following the resin job when the layers moved by hand
                 v.button(cx, ids!(slice_ui.resin_ui.resin_row.resin_live)).set_visible(cx, resin_live);
-                v.view(cx, ids!(pip_layer)).set_visible(cx, state.ui.camera_pip && lead);
                 v.widget(cx, ids!(progress_card)).set_visible(cx, lead);
             }
             // The view bar: its toggles by the mode alone, each as the view has it.

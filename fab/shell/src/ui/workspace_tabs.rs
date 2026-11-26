@@ -45,11 +45,13 @@ script_mod! {
             text_overflow: TextOverflow.Ellipsis
         }
         draw_icon +: {svg: crate_resource("self://resources/icons/spark.svg")}
-        well: theme.prop_field
-        selected_face: theme.prop_choice_on
+        // no well and no face for the shown one: the caption's ground, a face only under the
+        // pointer; the names in the body's ink, the shown one lit
+        well: #x00000000
+        selected_face: #x00000000
         hover_face: fab.color_button_hover
         accent: fab.color_accent
-        ink: fab.color_text_dim
+        ink: fab.color_text
         selected_ink: fab.color_text_active
         color_cue: fab.color_text_active
         rename_input: mod.widgets.TextInput{

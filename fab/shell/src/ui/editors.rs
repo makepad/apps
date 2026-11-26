@@ -21,6 +21,8 @@ pub enum Editor {
     Settings,
     Printer,
     Calibrate,
+    /// Retired: the printer's camera floats over the window (the title bar's camera button).
+    /// Kept so a saved layout that names it still reads.
     Camera,
     Features,
     Code,
@@ -97,7 +99,7 @@ pub enum Family {
 pub const MENU: [(&str, &[Editor]); 7] = [
     ("3D views", &[Editor::Viewport, Editor::Device]),
     ("Plate data", &[Editor::Plates, Editor::Parts, Editor::Part, Editor::Code]),
-    ("Print", &[Editor::Slicer, Editor::Overrides, Editor::TestPrints, Editor::Settings, Editor::Printer, Editor::Calibrate, Editor::Camera, Editor::Jobs]),
+    ("Print", &[Editor::Slicer, Editor::Overrides, Editor::TestPrints, Editor::Settings, Editor::Printer, Editor::Calibrate, Editor::Jobs]),
     ("Analysis", &[Editor::Slice, Editor::Strength, Editor::Force, Editor::Mechanics, Editor::Performance]),
     ("Electronics", &[Editor::Circuit, Editor::Board, Editor::Library, Editor::Checks, Editor::Bench, Editor::BoardControls, Editor::Scope, Editor::Transport, Editor::Firmware]),
     ("Experimental", &[Editor::Arm, Editor::ArmCell, Editor::ArmCompare, Editor::Scan, Editor::ScanView]),
@@ -238,7 +240,7 @@ impl Editor {
 
     /// An editor no area shows any more (it went into another), kept for the layouts that name it.
     pub fn retired(self) -> bool {
-        matches!(self, Editor::Parameters | Editor::Paint)
+        matches!(self, Editor::Parameters | Editor::Paint | Editor::Camera)
     }
 
     pub fn of_kind(kind: LiveId) -> Option<Editor> {

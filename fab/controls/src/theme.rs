@@ -102,12 +102,16 @@ const TEXT_REST: &str = "#aaaaaa";
 /// Every dimmed word (labels, counts, kinds, dimensions, placeholders, inactive tabs).
 const TEXT_DIM: &str = "#666666";
 const TEXT_HOT: &str = "#ffffff";
+/// Words and marks on the accent's bright face (the Print button, an active toggle).
+const TEXT_ON_ACCENT: &str = "#x000000";
 
 /// How much brighter the editors' toolbars (and the shown tab over each) are than the sheet's
 /// `color_surface_container`.
-const TOOLBAR_LIFT: f64 = 1.15;
+const TOOLBAR_LIFT: f64 = 1.15 * 1.10;
+/// How much brighter the tab bars are than the sheet's `color_surface_container_high`.
+const TAB_LIFT: f64 = 1.10;
 /// How much brighter the panels' ground is: a step under their toolbars, which it parts from.
-const PANEL_LIFT: f64 = 1.08;
+const PANEL_LIFT: f64 = 1.08 * 0.95;
 
 /// `0xRRGGBBAA` with each colour channel times `by` (capped at full), its alpha kept.
 fn brighter(c: u32, by: f64) -> u32 {
@@ -129,14 +133,15 @@ fn toned(mut sheet: StyleSheet) -> StyleSheet {
                 tones.push_str(&format!("mod.theme.{ink}{state} = {tone}\n"));
             }
         }
-        tones.push_str(&format!("mod.theme.color_text_on_accent = {TEXT_REST}\n"));
+        // on the accent's bright face (a primary button, an active toggle): black
+        tones.push_str(&format!("mod.theme.color_text_on_accent = {TEXT_ON_ACCENT}\n"));
         for ink in ["color_on_surface_variant", "color_text_meta", "color_text_disabled", "color_label_inner_disabled", "color_label_outer_disabled", "color_label_disabled"] {
             tones.push_str(&format!("mod.theme.{ink} = {TEXT_DIM}\n"));
         }
-        // The property kit's fields (number fields and sliders, dropdowns, segmented choices) a
-        // tad darker than the library's light grey (#3d3d3f on Fab's #2e2e30 panel): resting at
-        // #373739, and lighting to that old grey under the pointer.
-        tones.push_str("mod.theme.prop_field = #x373739\nmod.theme.prop_field_hover = #x3d3d3f\n");
+        // The property kit's fields (number fields and sliders, dropdowns, segmented choices): a
+        // faint white over whatever ground they sit on (#ffffff10), a shade more under the
+        // pointer.
+        tones.push_str("mod.theme.prop_field = #xffffff10\nmod.theme.prop_field_hover = #xffffff18\n");
         sheet.theme.push_str(&tones);
     }
     sheet
@@ -194,12 +199,13 @@ pub fn script_mod(vm: &mut ScriptVm) {
     let muted = ScriptValue::from_color(inks.muted);
     // the panels' ground (the lists and editors under their tabs) a step above the sheet's own
     // rung: its colour, `PANEL_LIFT` up
-    let (panel, toolbar) = {
+    let (panel, toolbar, header) = {
         let theme = vm.module(id!(theme));
         // (nil when the sheet has no such rung: the plain rung then, below)
         let rung = vm.value(theme, id!(color_surface_container)).as_color();
-        let lift = |by| rung.map_or(ScriptValue::NIL, |c| ScriptValue::from_color(brighter(c, by)));
-        (lift(PANEL_LIFT), lift(TOOLBAR_LIFT))
+        let high = vm.value(theme, id!(color_surface_container_high)).as_color();
+        let lift = |rung: Option<u32>, by| rung.map_or(ScriptValue::NIL, |c| ScriptValue::from_color(brighter(c, by)));
+        (lift(rung, PANEL_LIFT), lift(rung, TOOLBAR_LIFT), lift(high, TAB_LIFT))
     };
     script_eval!(vm, {
         use mod.prelude.widgets.*
@@ -212,7 +218,8 @@ pub fn script_mod(vm: &mut ScriptVm) {
             color_area: #(panel) ?? theme.color_surface_container
             color_editor: #(panel) ?? theme.color_surface_container
             color_editor_alt: mix(#(panel) ?? theme.color_surface_container, theme.color_surface_container_high, 0.5)
-            color_header: theme.color_surface_container_high
+            // the tab bars (`TAB_LIFT` over the sheet's high rung)
+            color_header: #(header) ?? theme.color_surface_container_high
             // the editors' toolbars (under their area's tabs) and the shown tab over each: a
             // shade above the panel ground
             color_toolbar: #(toolbar) ?? theme.color_surface_container
@@ -254,7 +261,9 @@ pub fn script_mod(vm: &mut ScriptVm) {
             color_accent: theme.color_focus
             color_accent_hover: theme.color_focus
             color_accent_dim: theme.color_bg_highlight
-            color_selection_bg: theme.color_bg_highlight
+            // a picked list row: the section headers' shade (#00000020 over the panel ground),
+            // opaque, so a row that mixes into it from its ground reads as that shade
+            color_selection_bg: mix(#(panel) ?? theme.color_surface_container, #x000000, 0.125)
             color_focus_ring: theme.color_focus
             color_warning: #xe0a020
             color_error: #xe04040
@@ -277,8 +286,10 @@ pub fn script_mod(vm: &mut ScriptVm) {
 
             // ---- chrome extras ----
             // Floating chrome over the view (the tool strip, the cards, chips).
-            color_float: theme.color_surface_container
-            color_float_border: #x333333
+            // (one look for everything that floats: a toolbar over the view is a flyout's fill
+            // and outline, as the menus and popovers)
+            color_float: theme.color_surface_container_high
+            color_float_border: theme.color_bevel_outset_2
             // the shadow along a scrolled panel's top edge, under its toolbar
             color_scroll_shade: #x0000004d
             // Checkboxes / toggles, Fab's inset well and its filled state.

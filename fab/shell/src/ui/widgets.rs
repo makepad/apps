@@ -1164,6 +1164,51 @@ script_mod! {
     // section's bar starts further in: `param_panel`'s Group). Its title is bold, so the sections
     // read apart from their rows; its rows have room above and below; twice the theme's gap below
     // each.
+    // A number field's (a slider's) fill: a faint white over its well, brighter under the
+    // pointer and brighter still while pressed or dragged. Fab's own fields and the property
+    // kit's number rows (`PropNumberRow`'s field, made before Fab) alike.
+    mod.widgets.ValueInput = mod.widgets.ValueInput{
+        draw_bg +: {
+            fill_color: uniform(#xffffff18)
+            fill_color_hover: uniform(#xffffff28)
+            fill_color_drag: uniform(#xffffff40)
+            pixel: fn() {
+                let sdf = Sdf2d.viewport_px(self.pos * self.rect_size, self.draw_pass.dpi_factor)
+                let w = self.rect_size.x
+                let h = self.rect_size.y
+                let hairline = 1.0 / self.draw_pass.dpi_factor
+                let inset = hairline * 0.5
+                let top = self.radius * self.round_top
+                let bottom = self.radius * self.round_bottom
+                let base = self.color.mix(self.color_hover, self.hover).mix(self.color_drag, self.drag)
+                sdf.box_y(inset, inset, w - hairline, h - hairline, top, bottom)
+                let reveal = mix(1.0, max(self.hover, max(self.drag, self.focus)), self.flat)
+                sdf.fill_keep(vec4(base.rgb, base.a * reveal))
+                if self.fill >= 0.0 {
+                    // The fill's edge on a device pixel: a crisp line at any scale, never a soft column.
+                    let fill_x = floor((1.0 + (w - 2.0) * self.fill) * self.draw_pass.dpi_factor + 0.5) / self.draw_pass.dpi_factor
+                    let ink = self.fill_color.mix(self.fill_color_hover, self.hover).mix(self.fill_color_drag, self.drag)
+                    let wash = vec4(ink.xyz, ink.w * step(self.pos.x * w, fill_x))
+                    sdf.fill_keep(wash)
+                }
+                sdf.fill_keep(vec4(self.color_marked.rgb, self.color_marked.a * self.marked * 0.18))
+                if self.focus > 0.5 {
+                    // SDF strokes take a half-width.
+                    sdf.stroke_keep(self.color_focus, hairline * 0.5)
+                }
+                if self.invalid > 0.0 {
+                    sdf.stroke(vec4(self.color_invalid.rgb, self.color_invalid.a * self.invalid), 1.5)
+                }
+                return sdf.result
+            }
+        }
+    }
+    mod.widgets.PropNumberRow = mod.widgets.PropNumberRow{
+        value +: {
+            num := mod.widgets.ValueInput{width: Fill height: Fill min_height: 0}
+        }
+    }
+
     mod.widgets.PropSection = mod.widgets.PropSection{
         margin: Inset{bottom: theme.prop_section_gap * 2.0}
         // a grip at the header's right end: a drag on it moves the section among its editor's

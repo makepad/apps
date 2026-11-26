@@ -1164,12 +1164,12 @@ script_mod! {
     // section's bar starts further in: `param_panel`'s Group). Its title is bold, so the sections
     // read apart from their rows; its rows have room above and below; twice the theme's gap below
     // each.
-    // A number field's (a slider's) fill: a faint white over its well, brighter under the
+    // A number field's (a slider's) fill: a faint white over its well (#ffffff10), brighter under the
     // pointer and brighter still while pressed or dragged. Fab's own fields and the property
     // kit's number rows (`PropNumberRow`'s field, made before Fab) alike.
     mod.widgets.ValueInput = mod.widgets.ValueInput{
         draw_bg +: {
-            fill_color: uniform(#xffffff18)
+            fill_color: uniform(#xffffff10)
             fill_color_hover: uniform(#xffffff28)
             fill_color_drag: uniform(#xffffff40)
             pixel: fn() {

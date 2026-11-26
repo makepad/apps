@@ -233,7 +233,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
             color_border_light: theme.color_bevel_outset_1
             color_row_hover: theme.color_outset_hover
             // a foldable section's header: a shade under the panel, never a lift
-            color_section: #x00000020
+            color_section: #x0000002b
             color_input: theme.color_inset
             color_input_hover: theme.color_inset_hover
             color_input_active: theme.color_inset_active
@@ -261,9 +261,9 @@ pub fn script_mod(vm: &mut ScriptVm) {
             color_accent: theme.color_focus
             color_accent_hover: theme.color_focus
             color_accent_dim: theme.color_bg_highlight
-            // a picked list row: the section headers' shade (#00000020 over the panel ground),
-            // opaque, so a row that mixes into it from its ground reads as that shade
-            color_selection_bg: mix(#(panel) ?? theme.color_surface_container, #x000000, 0.125)
+            // a picked list row: the section headers' shade (`color_section` over the panel
+            // ground), opaque, so a row that mixes into it from its ground reads as that shade
+            color_selection_bg: mix(#(panel) ?? theme.color_surface_container, #x000000, 0.168)
             color_focus_ring: theme.color_focus
             color_warning: #xe0a020
             color_error: #xe04040

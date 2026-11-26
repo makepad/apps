@@ -45,6 +45,7 @@ script_mod! {
             text_overflow: TextOverflow.Ellipsis
         }
         draw_icon +: {svg: crate_resource("self://resources/icons/spark.svg")}
+        draw_chevron +: {svg: crate_resource("self://resources/icons/chevron_down.svg")}
         // no well and no face for the shown one: the caption's ground, a face only under the
         // pointer; the names in the body's ink, the shown one lit
         well: #x00000000
@@ -120,6 +121,9 @@ pub struct FabWorkspaceTabs {
     draw_cue: DrawText,
     #[live]
     draw_icon: DrawSvg,
+    /// The list's chevron, an icon on the row's middle (a `⌄` glyph sits low in its line).
+    #[live]
+    draw_chevron: DrawSvg,
     #[live]
     well: Vec4f,
     #[live]
@@ -508,8 +512,11 @@ impl Widget for FabWorkspaceTabs {
             self.face(cx, more, if self.hover == Some(Part::More) { self.hover_face } else { self.well });
             self.draw_text.color = self.selected_ink;
             self.draw_text.draw_abs(cx, dvec2(more.pos.x + 12.0, more.pos.y + NAME_Y), &shown_name);
-            let chevron = Rect { pos: dvec2(more.pos.x + more.size.x - GLYPH_W, more.pos.y), size: dvec2(GLYPH_W, TAB_H) };
-            self.glyph(cx, chevron, "⌄", false);
+            // a 10 pt chevron centred in the glyph's cell, on the row's middle as the `+`
+            let size = 10.0;
+            let cell = Rect { pos: dvec2(more.pos.x + more.size.x - GLYPH_W, more.pos.y), size: dvec2(GLYPH_W, TAB_H) };
+            self.draw_chevron.color = self.ink;
+            self.draw_chevron.draw_abs(cx, Rect { pos: cell.pos + (cell.size - dvec2(size, size)) * 0.5, size: dvec2(size, size) });
         } else {
             self.more_area = Area::Empty;
         }

@@ -16,6 +16,8 @@ pub enum Editor {
     /// Every plate and the demos: the first tab on the left.
     Plates,
     Parts,
+    /// Retired: the selected part's editor is a sidebar of the Plate view in Design (`stage`'s
+    /// `part_side`). Kept so a saved layout that names it still reads.
     Part,
     Slicer,
     Settings,
@@ -104,7 +106,7 @@ pub enum Family {
 /// Experimental's editors are offered only while View › Experimental has their family on.
 pub const MENU: [(&str, &[Editor]); 7] = [
     ("3D views", &[Editor::Viewport, Editor::Device]),
-    ("Plate data", &[Editor::Plates, Editor::Parts, Editor::Part, Editor::Steps, Editor::Code, Editor::Journal]),
+    ("Plate data", &[Editor::Plates, Editor::Parts, Editor::Steps, Editor::Code, Editor::Journal]),
     ("Print", &[Editor::Slicer, Editor::Overrides, Editor::Printer]),
     ("Analysis", &[Editor::Slice, Editor::Strength, Editor::Force, Editor::Mechanics, Editor::Performance]),
     ("Electronics", &[Editor::Circuit, Editor::Board, Editor::Library, Editor::Checks, Editor::Requirements, Editor::Bom, Editor::Bench, Editor::BoardControls, Editor::Scope, Editor::Transport, Editor::Firmware]),
@@ -250,7 +252,7 @@ impl Editor {
 
     /// An editor no area shows any more (it went into another), kept for the layouts that name it.
     pub fn retired(self) -> bool {
-        matches!(self, Editor::Parameters | Editor::Paint | Editor::Camera | Editor::Calibrate | Editor::Jobs | Editor::Settings | Editor::TestPrints)
+        matches!(self, Editor::Part | Editor::Parameters | Editor::Paint | Editor::Camera | Editor::Calibrate | Editor::Jobs | Editor::Settings | Editor::TestPrints)
     }
 
     pub fn of_kind(kind: LiveId) -> Option<Editor> {

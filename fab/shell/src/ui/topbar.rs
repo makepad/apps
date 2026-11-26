@@ -144,6 +144,10 @@ script_mod! {
                 FabTip{ text: #(keymap::tooltip(Key::Chat))
                     chat := CapIcon{ a11y: {label: "AI assistant"} draw_icon +: { svg: crate_resource("self://resources/icons/spark.svg") } }
                 }
+                // Fab's own settings (how the 3D views take the mouse, ...) in their flyout
+                FabTip{ text: "Settings: how the 3D views take the mouse"
+                    settings := CapIcon{ a11y: {label: "Settings"} draw_icon +: { svg: crate_resource("self://resources/icons/cog.svg") } }
+                }
                 CapRule{}
                 FabTip{ text: "Print the sliced plate (asks first)"
                     print := mod.widgets.FabButtonAccent{ text: "Print" height: 24 padding: Inset{left: 14 right: 14} }
@@ -269,6 +273,18 @@ pub fn handle_actions(cx: &mut Cx, bar: &WidgetRef, actions: &Actions, state: &A
     if bar.button(cx, ids!(right.chat)).clicked(actions) {
         cx.action(ShellAction::Command("toggle chat".into()));
     }
+    // Settings: its flyout under the cog, and what is picked there
+    let cog = bar.widget(cx, ids!(right.settings));
+    if bar.button(cx, ids!(right.settings)).clicked(actions) {
+        open_menu(cx, SETTINGS_MENU, settings_menu(state), cog.area().rect(cx), MenuPlace::Below);
+    }
+    if let Some(pick) = menu_picked(actions, SETTINGS_MENU) {
+        if let Some(scheme) = NavScheme::ALL.into_iter().find(|s| nav_row(*s) == pick) {
+            cx.action(crate::ui::stage::StageAction::Nav(scheme));
+        } else if pick == live_id!(settings_invert_wheel) {
+            cx.action(crate::ui::stage::StageAction::InvertWheel(!state.ui.invert_wheel));
+        }
+    }
     for action in ui_actions(actions) {
         if let FabUiAction::MenuBarOpen { owner, anchor, press } = action {
             let items = if *owner == live_id!(fab_menu_all) {
@@ -286,6 +302,24 @@ pub fn handle_actions(cx: &mut Cx, bar: &WidgetRef, actions: &Actions, state: &A
             cx.action(action);
         }
     }
+}
+
+/// The owner of the caption's Settings flyout.
+const SETTINGS_MENU: LiveId = live_id!(fab_settings);
+
+/// A 3D navigation scheme's row in Settings.
+fn nav_row(scheme: NavScheme) -> LiveId {
+    LiveId::from_str(&format!("settings_nav_{}", scheme.key()))
+}
+
+/// Settings: how the 3D views take the mouse, as other 3D programs do (each scheme's gestures
+/// beside its name), and the wheel's zoom the other way. O(schemes).
+fn settings_menu(state: &AppState) -> Vec<MenuItem> {
+    let mut items = vec![MenuItem::heading("3D navigation")];
+    items.extend(NavScheme::ALL.into_iter().map(|s| MenuItem::new(nav_row(s), s.name()).radio(state.ui.nav == s).note(s.summary())));
+    items.push(MenuItem::sep());
+    items.push(MenuItem::new(live_id!(settings_invert_wheel), "Invert zoom wheel").checked(state.ui.invert_wheel));
+    items
 }
 
 /// The owners of the workspaces' menus: a tab's, `+`'s and `⌄`'s.

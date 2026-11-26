@@ -398,7 +398,7 @@ script_mod! {
     // A Transform number row: its label column the Parameters rows' (`param_panel::LABEL_W`), so
     // the Part panel's fields all start at one line.
     let TransformRow = PropNumberRow{
-        label +: {width: Fill{weight: 0 basis: "42%" max: #(crate::ui::param_panel::LABEL_W)}}
+        label +: {width: #(crate::ui::param_panel::LABEL_W)}
     }
 
     mod.widgets.FabPartsPanelBase = #(FabPartsPanel::register_widget(vm))
@@ -630,10 +630,13 @@ script_mod! {
         show_bg: true
         draw_bg +: { color: fab.color_editor }
         // Nothing selected: the plate at a glance.
-        // the toolbar: the area's editor selector (and this editor's tools, when it has any)
+        // the toolbar: the area's editor selector (and this editor's tools, when it has any); as
+        // the Plate view's sidebar (`stage`'s `part_side`): its title, the filter and its close
         editor_bar := mod.widgets.FabEditorBar{
+            title := mod.widgets.FabLabel{ visible: false text: "Part" draw_text +: { text_style: theme.font_bold{font_size: fab.font_size_ui} } }
             // filters the rows below by name (a section's title shows it whole)
             search := mod.widgets.FabSearch{width: Fill{min: 80} row +: {input +: {empty_text: "Filter"}}}
+            side_close := ToolIcon{ visible: false a11y: {label: "Close part"} draw_icon +: { svg: crate_resource("self://resources/icons/close.svg") } }
         }
         none := PropSection{
             // (one section alone: nothing to move it among)
@@ -711,7 +714,8 @@ script_mod! {
                 params_slot := View{width: Fill height: Fit
                     params := PropSection{
                         header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/shape.svg")}} title +: {text: "Parameters"}}}
-                        body +: {panel := mod.widgets.FabParamPanel{}}
+                        // (its groups keep the sections' gap between them: no room of its own)
+                        body +: {padding: Inset{left: theme.prop_pad right: theme.prop_pad top: 0 bottom: 0} panel := mod.widgets.FabParamPanel{}}
                     }
                 }
                 // its slot: the box the section moves in when dragged by its grip (`section_reorder`)
@@ -2209,7 +2213,7 @@ impl Widget for FabPartPanel {
         self.view.handle_event(cx, event, scope);
         let Event::Actions(actions) = event else { return };
         let Some(state) = scope.data.get_mut::<AppState>() else { return };
-        if !state.ui.on_screen(crate::ui::editors::Editor::Part) {
+        if !state.ui.on_screen(crate::ui::editors::Editor::Part) && !state.ui.part_side_shown {
             // off screen: none of its controls can be pressed
             return;
         }

@@ -118,6 +118,33 @@ pub fn save_slice(on: bool) {
     save("slice", if on { "1" } else { "0" });
 }
 
+/// How the 3D views take the mouse (the caption's Settings › 3D navigation), as the person chose.
+pub fn load_nav() -> crate::api::NavScheme {
+    load("nav").and_then(|k| crate::api::NavScheme::from_key(&k)).unwrap_or_default()
+}
+
+pub fn save_nav(scheme: crate::api::NavScheme) {
+    save("nav", scheme.key());
+}
+
+/// The Part sidebar's width, as the person dragged it.
+pub fn load_part_side_w() -> Option<f64> {
+    load("part_side_w").and_then(|w| w.trim().parse::<f64>().ok()).filter(|w| w.is_finite())
+}
+
+pub fn save_part_side_w(width: f64) {
+    save("part_side_w", &format!("{width:.0}"));
+}
+
+/// The wheel zooms the other way (Settings › Invert zoom wheel).
+pub fn load_invert_wheel() -> bool {
+    load("invert_wheel").as_deref() == Some("1")
+}
+
+pub fn save_invert_wheel(on: bool) {
+    save("invert_wheel", if on { "1" } else { "0" });
+}
+
 /// The view is orthographic (View › Orthographic), as the person left it.
 pub fn load_ortho() -> bool {
     load("ortho").as_deref() == Some("1")

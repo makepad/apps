@@ -1,11 +1,11 @@
 //! `Navigator`: the camera controller behind the plate view (owned by
 //! `FabViewport`), implementing `api::NavController`:
 //!
-//! * **Orbit** — MMB drags, Shift+MMB pans, primary+MMB dollies, and the wheel
-//!   zooms *to the cursor*. the primary modifier with LMB dollies;
-//!   Alt+LMB pans in Select. Shift+LMB
-//!   drags orbit in every tool, starting on a part or off it (a Shift click
-//!   without travel still reaches the tool). Turntable by
+//! * **Orbit** — which drags orbit, pan and dolly is the person's [`NavScheme`] (Settings › 3D
+//!   navigation; [`gesture`]). Fab's own: MMB drags, Shift+MMB pans, primary+MMB dollies; in
+//!   Select a bare LMB drag orbits, RMB or Alt+LMB pans, primary+LMB dollies; Shift+LMB drags
+//!   orbit in every tool, starting on a part or off it (a click without travel still reaches the
+//!   tool). The wheel zooms *to the cursor* in every scheme. Turntable by
 //!   default (up-locked, so twenty mixed drags cannot tilt the horizon),
 //!   trackball on request. An orbit picks its pivot as it starts: on an object
 //!   the view shows whole, the object's centre, so it turns in place; on an
@@ -56,6 +56,128 @@ pub(crate) const DRAG_THRESHOLD_PT: f64 = 4.0;
 /// an object's box at up to 1/1.05 of the view (its corners lie on the sphere it fits), so the
 /// share is the whole view: whatever framing shows whole turns in place.
 pub(crate) const FRAMED_VIEW_SHARE: f64 = 1.0;
+
+/// What a press with `button` and `mods` drags under `scheme`, and whether it starts at once (a
+/// middle press, which clicks nothing) or once the pointer travels (a left or right press stays a
+/// click for the tool or the context menu until then). `select`: the Select tool is on, whose bare
+/// left drag the schemes that orbit with it take; other tools own a bare left drag. O(1).
+fn gesture(scheme: NavScheme, button: PointerButton, mods: KeyModifiers, select: bool) -> Option<(Drag, bool)> {
+    use PointerButton::{Middle, Primary, Secondary};
+    let ctrl = mods.control || mods.logo;
+    let bare = !mods.shift && !mods.alt && !ctrl;
+    let now = |drag| Some((drag, true));
+    let later = |drag| Some((drag, false));
+    match scheme {
+        NavScheme::Fab => match button {
+            Middle if mods.shift => now(Drag::Pan),
+            Middle if mods.is_primary() => now(Drag::Dolly),
+            Middle => now(Drag::Orbit),
+            // Shift+LMB orbits in every tool
+            Primary if mods.shift && !mods.alt && !ctrl => later(Drag::Orbit),
+            Secondary if select => later(Drag::Pan),
+            Primary if select && mods.alt => later(Drag::Pan),
+            Primary if select && mods.is_primary() => later(Drag::Dolly),
+            Primary if select => later(Drag::Orbit),
+            _ => None,
+        },
+        NavScheme::Slicer => match button {
+            Middle => now(Drag::Pan),
+            Primary if select && bare => later(Drag::Orbit),
+            Secondary if select && bare => later(Drag::Pan),
+            _ => None,
+        },
+        NavScheme::Blender => match button {
+            // Alt+LMB stands in for the middle button, in every tool
+            Middle | Primary if button == Middle || mods.alt => {
+                let drag = if mods.shift { Drag::Pan } else if ctrl { Drag::Dolly } else { Drag::Orbit };
+                if button == Middle { now(drag) } else { later(drag) }
+            }
+            _ => None,
+        },
+        NavScheme::Fusion => match button {
+            Middle if mods.shift => now(Drag::Orbit),
+            Middle => now(Drag::Pan),
+            _ => None,
+        },
+        NavScheme::SolidWorks => match button {
+            Middle if ctrl => now(Drag::Pan),
+            Middle if mods.shift => now(Drag::Dolly),
+            Middle => now(Drag::Orbit),
+            _ => None,
+        },
+        NavScheme::Onshape => match button {
+            Middle => now(Drag::Pan),
+            Secondary if ctrl => later(Drag::Pan),
+            Secondary => later(Drag::Orbit),
+            _ => None,
+        },
+        NavScheme::Maya => match button {
+            Primary if mods.alt => later(Drag::Orbit),
+            Middle if mods.alt => now(Drag::Pan),
+            Secondary if mods.alt => later(Drag::Dolly),
+            _ => None,
+        },
+    }
+}
+
+/// A primary press with `mods` under `scheme` may drag a marquee (in the Select tool): where a bare
+/// left drag orbits (Fab's, the slicers'), Shift with it, as the slicers do; elsewhere a left drag
+/// without Alt (Alt+left is a camera gesture in Blender's and Maya's). O(1).
+fn marquee_gesture(scheme: NavScheme, mods: KeyModifiers, select: bool) -> bool {
+    let ctrl = mods.control || mods.logo;
+    select && !mods.alt && match scheme {
+        NavScheme::Fab | NavScheme::Slicer => mods.shift && !ctrl,
+        _ => true,
+    }
+}
+
+/// A marquee dragged in the view: where it began and is now, whether it adds to the selection,
+/// and whether it travelled far enough to be one (until then the press is a click).
+#[derive(Clone, Copy, Debug)]
+struct Marquee {
+    from: DVec2,
+    to: DVec2,
+    additive: bool,
+    active: bool,
+}
+
+/// The parts a marquee from `m.from` to `m.to` takes in the view `rect`: their boxes on screen
+/// wholly inside it when dragged rightwards, touching it when dragged leftwards (as CAD programs
+/// do). Parts out of the view or partly behind the eye are not taken. O(parts).
+fn marquee_pick(state: &AppState, pane: PaneId, rect: Rect, m: &Marquee) -> Vec<ElementId> {
+    let lo = dvec2(m.from.x.min(m.to.x), m.from.y.min(m.to.y));
+    let hi = dvec2(m.from.x.max(m.to.x), m.from.y.max(m.to.y));
+    let crossing = m.to.x < m.from.x;
+    let proj = ViewProjector::new(*state.view.camera(pane), rect);
+    let mut out = Vec::new();
+    for p in state.plate.parts.iter().filter(|p| !p.hidden) {
+        let Some(e) = p.element.filter(|e| state.is_visible(*e)) else { continue };
+        let Some(b) = state.scene.element(e).map(|el| el.bounds).filter(|b| !aabb_is_empty(b)) else { continue };
+        let pose = state.pose_in(pane, e);
+        let mut sl = dvec2(f64::MAX, f64::MAX);
+        let mut sh = dvec2(f64::MIN, f64::MIN);
+        let mut seen = true;
+        for i in 0..8 {
+            let c = vec3(if i & 1 == 0 { b.min.x } else { b.max.x }, if i & 2 == 0 { b.min.y } else { b.max.y }, if i & 4 == 0 { b.min.z } else { b.max.z });
+            match proj.project(pose.map_or(c, |p| pose_apply(&p, c))) {
+                Some(s) => { sl = dvec2(sl.x.min(s.x), sl.y.min(s.y)); sh = dvec2(sh.x.max(s.x), sh.y.max(s.y)); }
+                None => { seen = false; break; }
+            }
+        }
+        if !seen { continue; }
+        let inside = sl.x >= lo.x && sl.y >= lo.y && sh.x <= hi.x && sh.y <= hi.y;
+        let touching = sl.x <= hi.x && sh.x >= lo.x && sl.y <= hi.y && sh.y >= lo.y;
+        if inside || (crossing && touching) {
+            out.push(e);
+        }
+    }
+    if m.additive {
+        let mut all: Vec<ElementId> = state.scene_state.selection.set.iter().copied().filter(|e| !out.contains(e)).collect();
+        all.extend(out);
+        return all;
+    }
+    out
+}
 
 /// What a press that may turn into an orbit is on.
 #[derive(Clone, Copy, Debug)]
@@ -170,6 +292,8 @@ pub struct Navigator {
     auto_persp: bool,
     /// Laptops have no numpad; the top-row digits drive the preset views too.
     emulate_numpad: bool,
+    /// A primary press that may drag a marquee (`marquee_gesture`), or one being dragged.
+    marquee: Option<Marquee>,
     /// The person's last switch of projection: the camera before it and the one it gave. Switched
     /// straight back (the view untouched since), the camera before comes back to the bit: worked
     /// back from the orthographic height in f32 the eye can land a step off.
@@ -200,6 +324,7 @@ impl Default for Navigator {
             anim: None,
             auto_persp: false,
             emulate_numpad: true,
+            marquee: None,
             switched: None,
         }
     }
@@ -475,41 +600,33 @@ impl Navigator {
                     Some(hit) => Some(Press { point: hit.point, part: Some(hit.element) }),
                     None => state.plate.bed_point(&ViewProjector::new(*state.view.camera(self.pane), input.rect).ray(pos)).map(|point| Press { point, part: None }),
                 };
-                let shift_orbit = button == PointerButton::Primary && mods.shift && !mods.alt && !mods.control && !mods.logo;
                 if crate::tools::annotate::owns_input(state, input) || crate::tools::paint::owns_input(state, input) || crate::tools::sculpt::owns_input(state, input) {
                     // A brush press stops camera motion and leaves the drag to the tool.
                     self.anim = None;
                     return InputResponse::default();
                 }
-                let middle = button == PointerButton::Middle;
-                // Emulated three-button mouse: a bare LMB press may become an
-                // orbit, Alt+LMB / RMB a pan, primary+LMB a dolly — only once
-                // the pointer travels; until then it is a click for the tool
-                // or the context menu, so nothing is consumed here. Only in
-                // the select tool: measure/section own their LMB.
-                if shift_orbit {
-                    // Shift+LMB orbits in every tool; a click without travel stays the tool's.
-                    self.pending = Some((Drag::Orbit, DVec2::default(), press));
-                } else if !middle && tap_count < 2 && state.tool == Tool::Select {
-                    let kind = if button == PointerButton::Secondary || mods.alt {
-                        Drag::Pan
-                    } else if mods.is_primary() {
-                        Drag::Dolly
-                    } else {
-                        Drag::Orbit
-                    };
-                    // What the press is on: the orbit's pivot comes from it once the press turns into one.
-                    self.pending = Some((kind, DVec2::default(), press));
+                // A marquee in the Select tool (`marquee_gesture`): once the pointer travels; a click
+                // without travel stays the tool's, so nothing is consumed here.
+                self.marquee = None;
+                // (not while the marker draws or Edit shape picks: their drags are their own)
+                let selecting = state.tool == Tool::Select && !crate::tools::annotate::active(state) && !crate::tools::picks::active(state);
+                if button == PointerButton::Primary && tap_count < 2 && marquee_gesture(state.ui.nav, mods, selecting) {
+                    let additive = mods.is_primary() || (mods.shift && !matches!(state.ui.nav, NavScheme::Fab | NavScheme::Slicer)) || state.ui.nav == NavScheme::Onshape;
+                    self.marquee = Some(Marquee { from: pos, to: pos, additive, active: false });
+                    return InputResponse::default();
                 }
-                if middle {
+                // The scheme's drags: a middle press drags at once; a left or right one only once
+                // the pointer travels, until then a click for the tool or the context menu, so
+                // nothing is consumed here (a second click of a double is the tool's). What the
+                // press is on gives the orbit its pivot once it turns into one.
+                let held = gesture(state.ui.nav, button, mods, state.tool == Tool::Select);
+                if let Some((kind, false)) = held {
+                    if button != PointerButton::Primary || tap_count < 2 {
+                        self.pending = Some((kind, DVec2::default(), press));
+                    }
+                }
+                if let Some((drag, true)) = held {
                     self.anim = None;
-                    let drag = if mods.shift {
-                        Drag::Pan
-                    } else if mods.is_primary() {
-                        Drag::Dolly
-                    } else {
-                        Drag::Orbit
-                    };
                     self.begin_drag_at(drag, state, press);
                     return InputResponse {
                         consumed: true,
@@ -539,6 +656,24 @@ impl Navigator {
                     }
                 }
                 InputResponse::default()
+            }
+            ViewportInputKind::PointerMove { pos, delta, buttons, .. } if self.marquee.is_some() => {
+                let Some(m) = self.marquee.as_mut() else { return InputResponse::default() };
+                if buttons == 0 {
+                    // the release went elsewhere (a menu took it)
+                    self.marquee = None;
+                    if state.ui.marquee.take().is_some() { crate::ui::redraw(cx, &[ids!(tool_overlay)]); }
+                    return InputResponse::default();
+                }
+                let _ = delta;
+                m.to = pos;
+                if !m.active && (m.to - m.from).length() < DRAG_THRESHOLD_PT {
+                    return InputResponse::default();
+                }
+                m.active = true;
+                state.ui.marquee = Some((self.pane, m.from, m.to));
+                crate::ui::redraw(cx, &[ids!(tool_overlay)]);
+                InputResponse { consumed: true, cursor: Some(MouseCursor::Crosshair), ..Default::default() }
             }
             ViewportInputKind::PointerMove { delta, buttons, .. } => {
                 let mut initial_delta = None;
@@ -572,6 +707,18 @@ impl Navigator {
                     wants_frames: true,
                     ..Default::default()
                 }
+            }
+            ViewportInputKind::PointerUp { .. } if self.marquee.is_some() => {
+                let m = self.marquee.take().expect("a marquee");
+                state.ui.marquee = None;
+                if !m.active {
+                    // no travel: a click, the tool's
+                    return InputResponse::default();
+                }
+                let picked = marquee_pick(state, self.pane, input.rect, &m);
+                cx.action(ShellAction::SelectSet(picked));
+                crate::ui::redraw(cx, &[ids!(tool_overlay)]);
+                InputResponse { consumed: true, redraw: true, cursor: Some(MouseCursor::Default), ..Default::default() }
             }
             ViewportInputKind::PointerUp { .. } => {
                 self.pending = None;
@@ -623,7 +770,9 @@ impl Navigator {
                     // Positive scroll is away from the model, everywhere in
                     // this repo. Dolly about a point on the cursor ray, which
                     // leaves that point on exactly the same pixel.
-                    let steps = (delta.y as f32 / 80.0).clamp(-1.5, 1.5);
+                    // (Settings' Invert zoom wheel turns it round)
+                    let dy = if state.ui.invert_wheel { -delta.y } else { delta.y };
+                    let steps = (dy as f32 / 80.0).clamp(-1.5, 1.5);
                     if steps.abs() < 1e-4 {
                         return InputResponse::default();
                     }
@@ -936,6 +1085,13 @@ impl NavController for Navigator {
             self.last_aspect = (input.rect.size.x / input.rect.size.y) as f32;
         }
         match input.kind {
+            // Escape lets go of a marquee being dragged.
+            ViewportInputKind::KeyDown { key: KeyCode::Escape, .. } if self.marquee.is_some_and(|m| m.active) => {
+                self.marquee = None;
+                state.ui.marquee = None;
+                crate::ui::redraw(cx, &[ids!(tool_overlay)]);
+                InputResponse { consumed: true, cursor: Some(MouseCursor::Default), ..Default::default() }
+            }
             // Escape stops any glide or drag in flight.
             ViewportInputKind::KeyDown { key: KeyCode::Escape, .. } if self.is_animating() => {
                 self.anim = None;
@@ -1431,6 +1587,34 @@ mod tests {
         assert_eq!(nav.preset_for_key(KeyCode::Key2, plain), None);
         assert!(nav.orbit_step_for_key(KeyCode::Key2).is_some());
         assert!(nav.orbit_step_for_key(KeyCode::Key1).is_none());
+    }
+
+    /// Each scheme's drags are its program's, a middle press dragging at once and a left or right
+    /// one only once it travels; a marquee needs the Select tool (and Shift where a bare left
+    /// drag orbits).
+    #[test]
+    fn each_scheme_maps_its_drags() {
+        use PointerButton::{Middle, Primary, Secondary};
+        let m = |shift: bool, alt: bool, control: bool| KeyModifiers { shift, alt, control, ..Default::default() };
+        let none = m(false, false, false);
+        assert_eq!(gesture(NavScheme::Fab, Middle, none, true), Some((Drag::Orbit, true)));
+        assert_eq!(gesture(NavScheme::Fab, Primary, none, true), Some((Drag::Orbit, false)));
+        assert_eq!(gesture(NavScheme::Fab, Primary, none, false), None, "another tool owns a bare left drag");
+        assert_eq!(gesture(NavScheme::Slicer, Middle, none, true), Some((Drag::Pan, true)));
+        assert_eq!(gesture(NavScheme::Blender, Primary, none, true), None);
+        assert_eq!(gesture(NavScheme::Blender, Primary, m(false, true, false), false), Some((Drag::Orbit, false)));
+        assert_eq!(gesture(NavScheme::Blender, Middle, m(true, false, false), true), Some((Drag::Pan, true)));
+        assert_eq!(gesture(NavScheme::Fusion, Middle, m(true, false, false), true), Some((Drag::Orbit, true)));
+        assert_eq!(gesture(NavScheme::Fusion, Middle, none, true), Some((Drag::Pan, true)));
+        assert_eq!(gesture(NavScheme::SolidWorks, Middle, m(false, false, true), true), Some((Drag::Pan, true)));
+        assert_eq!(gesture(NavScheme::SolidWorks, Middle, m(true, false, false), true), Some((Drag::Dolly, true)));
+        assert_eq!(gesture(NavScheme::Onshape, Secondary, none, false), Some((Drag::Orbit, false)));
+        assert_eq!(gesture(NavScheme::Onshape, Secondary, m(false, false, true), false), Some((Drag::Pan, false)));
+        assert_eq!(gesture(NavScheme::Maya, Middle, none, true), None);
+        assert_eq!(gesture(NavScheme::Maya, Secondary, m(false, true, false), true), Some((Drag::Dolly, false)));
+        assert!(marquee_gesture(NavScheme::Fab, m(true, false, false), true) && !marquee_gesture(NavScheme::Fab, none, true));
+        assert!(!marquee_gesture(NavScheme::Fab, m(true, false, false), false), "only in the Select tool");
+        assert!(marquee_gesture(NavScheme::Blender, none, true) && !marquee_gesture(NavScheme::Maya, m(false, true, false), true));
     }
 
     #[test]

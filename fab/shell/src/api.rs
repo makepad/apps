@@ -1388,9 +1388,97 @@ impl Notices {
     }
 }
 
+/// How the 3D views take the mouse: which drags orbit, pan and zoom, and which modifier adds a
+/// click to the selection, as other 3D programs do it (the caption's Settings). The gestures
+/// themselves are the navigator's (`nav::gesture`); the wheel zooms to the cursor in each.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NavScheme {
+    /// Fab's own: a left or middle drag orbits, a right drag pans; Shift+left orbits in any tool.
+    #[default]
+    Fab,
+    /// The slicers' (Bambu Studio, PrusaSlicer, OrcaSlicer): a left drag orbits, a right or
+    /// middle drag pans.
+    Slicer,
+    /// A middle drag orbits, Shift+middle pans, Ctrl+middle zooms; Alt+left stands in for the
+    /// middle button (its three-button emulation).
+    Blender,
+    /// Shift+middle orbits, a middle drag pans.
+    Fusion,
+    /// A middle drag orbits, Ctrl+middle pans, Shift+middle zooms.
+    SolidWorks,
+    /// A right drag orbits, Ctrl+right or a middle drag pans; a click adds to the selection.
+    Onshape,
+    /// Alt+left orbits, Alt+middle pans, Alt+right zooms.
+    Maya,
+}
+
+impl NavScheme {
+    pub const ALL: [NavScheme; 7] = [
+        NavScheme::Fab, NavScheme::Slicer, NavScheme::Blender, NavScheme::Fusion,
+        NavScheme::SolidWorks, NavScheme::Onshape, NavScheme::Maya,
+    ];
+
+    /// Its name in Settings.
+    pub fn name(self) -> &'static str {
+        match self {
+            NavScheme::Fab => "Fab",
+            NavScheme::Slicer => "Slicers",
+            NavScheme::Blender => "Blender",
+            NavScheme::Fusion => "Fusion",
+            NavScheme::SolidWorks => "SolidWorks",
+            NavScheme::Onshape => "Onshape",
+            NavScheme::Maya => "Maya",
+        }
+    }
+
+    /// Its gestures in a line (Settings' note beside its name).
+    pub fn summary(self) -> &'static str {
+        match self {
+            NavScheme::Fab => "Left or middle drag orbits · right drag pans",
+            NavScheme::Slicer => "Left drag orbits · right or middle drag pans",
+            NavScheme::Blender => "Middle drag orbits · Shift+middle pans",
+            NavScheme::Fusion => "Shift+middle orbits · middle drag pans",
+            NavScheme::SolidWorks => "Middle drag orbits · Ctrl+middle pans",
+            NavScheme::Onshape => "Right drag orbits · middle drag pans",
+            NavScheme::Maya => "Alt+left orbits · Alt+middle pans",
+        }
+    }
+
+    /// Its word in the preferences file.
+    pub fn key(self) -> &'static str {
+        match self {
+            NavScheme::Fab => "fab",
+            NavScheme::Slicer => "slicer",
+            NavScheme::Blender => "blender",
+            NavScheme::Fusion => "fusion",
+            NavScheme::SolidWorks => "solidworks",
+            NavScheme::Onshape => "onshape",
+            NavScheme::Maya => "maya",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<NavScheme> {
+        NavScheme::ALL.into_iter().find(|s| s.key() == key.trim())
+    }
+
+    /// A click with `mods` on a part adds it to the selection or takes it off (else it picks the
+    /// part alone).
+    pub fn toggles_selection(self, mods: &KeyModifiers) -> bool {
+        match self {
+            NavScheme::Fab | NavScheme::Blender | NavScheme::Maya => mods.shift,
+            NavScheme::Slicer | NavScheme::Fusion | NavScheme::SolidWorks => mods.shift || mods.is_primary(),
+            NavScheme::Onshape => true,
+        }
+    }
+}
+
 /// UI chrome state. Everything a panel needs to draw itself.
 #[derive(Clone, Debug)]
 pub struct UiState {
+    /// How the 3D views take the mouse (Settings › 3D navigation), and the wheel zooming the
+    /// other way; both kept per machine (`view_prefs`).
+    pub nav: NavScheme,
+    pub invert_wheel: bool,
     /// The caption's workspaces and the one shown ([`Self::kind`] is what it is).
     /// Edit > Undo the AI's Last Turn: the presses of Undo that take the AI's last turn back,
     /// while its steps are the newest (None: not offered).
@@ -1457,6 +1545,16 @@ pub struct UiState {
     pub camera_pip: bool,
     /// The Test prints mode's sidebar of tests shows (the plate toolbar's Tests).
     pub tests_sidebar: bool,
+    /// Design's Part sidebar in the Plate view (the plate toolbar's Part): on until put away.
+    pub part_sidebar: bool,
+    /// A marquee being dragged in a Plate view: the view, and its corners (window points). The
+    /// navigator sets it, the tool overlay draws it.
+    pub marquee: Option<(PaneId, DVec2, DVec2)>,
+    /// The Part sidebar's width, its left edge dragged (kept per machine).
+    pub part_side_w: f64,
+    /// The Part sidebar is on screen (a part picked in Design, the sidebar on, room for it): its
+    /// controls act. Set as the lead Plate view draws.
+    pub part_side_shown: bool,
     pub gizmo: GizmoMode,
     pub paint_radius: f64,
     pub paint_color: [f32; 3],
@@ -1611,6 +1709,8 @@ impl UiState {
 impl Default for UiState {
     fn default() -> Self {
         UiState {
+            nav: crate::view_prefs::load_nav(),
+            invert_wheel: crate::view_prefs::load_invert_wheel(),
             undo_turn: None,
             workspaces: crate::workspaces::Workspaces::default(),
             plate_mode: PlateMode::Design,
@@ -1640,6 +1740,10 @@ impl Default for UiState {
             show_zones: false,
             camera_pip: false,
             tests_sidebar: false,
+            part_sidebar: true,
+            part_side_shown: false,
+            marquee: None,
+            part_side_w: crate::view_prefs::load_part_side_w().unwrap_or(crate::ui::stage::PART_SIDE_W).clamp(crate::ui::stage::PART_SIDE_MIN_W, crate::ui::stage::PART_SIDE_MAX_W),
             gizmo: GizmoMode::Off,
             paint_radius: 3.0,
             paint_color: [0.8, 0.05, 0.05],

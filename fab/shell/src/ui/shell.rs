@@ -1266,7 +1266,7 @@ impl FabShell {
     }
 
     /// The modes' editors as the stacks show them: Slice beside the parts while the slice is
-    /// on, Force beside the part while the forces show, each in front from when its mode came on
+    /// on, Force beside the slicer while the forces show, each in front from when its mode came on
     /// until another tab of its stack is pressed.
     fn mode_extras(&self) -> Vec<(Editor, Editor, bool)> {
         let mut out = Vec::new();
@@ -1274,7 +1274,7 @@ impl FabShell {
             out.push((Editor::Parts, Editor::Slice, self.extra_front == Some(Editor::Slice)));
         }
         if self.force_shown {
-            out.push((Editor::Part, Editor::Force, self.extra_front == Some(Editor::Force)));
+            out.push((Editor::Slicer, Editor::Force, self.extra_front == Some(Editor::Force)));
         }
         out
     }
@@ -3054,18 +3054,18 @@ mod tests {
         assert!(sheet.parent_split(circuit).map(|(split, ..)| split) == sheet.showing(Editor::Checks).and_then(|a| sheet.parent_split(a)).map(|(split, ..)| split),
             "Checks opens beside the sheet");
         // Design without its lower stack (an old file's): no area shows Overrides; asked for from
-        // the Part's area, it comes into the Part's stack, in front
+        // the Slicer's area, it comes into the Slicer's stack, in front
         show(&mut cx, &mut shell, &mut state, Origin::Design);
         let below = tree(&shell).showing(Editor::Overrides).expect("Design shows Overrides");
         run(&mut cx, &mut shell, &mut state, |cx, _, _| cx.action(ShellAction::EditAreas(WorkspaceOp::Close { area: below })));
         shell.publish_screen(&mut cx, &mut state);
-        assert!(!state.ui.on_screen(Editor::Overrides) && state.ui.on_screen(Editor::Part), "no area shows Overrides");
-        let part = tree(&shell).showing(Editor::Part).expect("the Part's area");
+        assert!(!state.ui.on_screen(Editor::Overrides) && state.ui.on_screen(Editor::Slicer), "no area shows Overrides");
+        let part = tree(&shell).showing(Editor::Slicer).expect("the Slicer's area");
         shell.pressed_area = shell.shown.map(|(ws, _)| (ws, part));
         act(&mut cx, &mut shell, &mut state, vec![Box::new(ShowPanel(Editor::Overrides)) as Box<dyn ActionTrait>]);
         shell.publish_screen(&mut cx, &mut state);
-        assert!(tree(&shell).showing(Editor::Overrides) == Some(part) && front(&tree(&shell), Editor::Part) == Some(Editor::Overrides) && state.ui.on_screen(Editor::Overrides),
-            "the press brings Overrides into the Part's stack, in front");
+        assert!(tree(&shell).showing(Editor::Overrides) == Some(part) && front(&tree(&shell), Editor::Slicer) == Some(Editor::Overrides) && state.ui.on_screen(Editor::Overrides),
+            "the press brings Overrides into the Slicer's stack, in front");
 
         // a Plate the dock holds but does not show is published hidden and lets go of the scene
         // host, which the Plate on screen takes with the shared studio work; it stays unparked

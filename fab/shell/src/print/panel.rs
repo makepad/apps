@@ -115,7 +115,8 @@ script_mod! {
     // A part of a printer's section: a nested section that folds, as the Part panel's parameter
     // groups and the Legend's parts (its bar a short level in), no card behind it.
     let Sub = PropSection{
-        margin: Inset{}
+        // with its body's spacing (2), the sections' gap above it
+        margin: Inset{top: theme.prop_section_gap}
         header +: {hdr +: {
             // in by the indent on the left; on the right, the same edge as every header's
             margin: Inset{left: 10 right: theme.prop_pad}

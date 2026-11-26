@@ -22,7 +22,9 @@ script_mod! {
     let LegendPart = PropSection{
         // a grip to move it within the Legend (never out of it)
         grip: true
-        margin: Inset{}
+        // the sections' gap above it, none below: every bar stands that gap from the next, the
+        // Legend's own next section's too (the Legend's body keeps no room of its own)
+        margin: Inset{top: theme.prop_section_gap * 2.0}
         header +: {hdr +: {margin: Inset{left: 10.0} padding: Inset{left: theme.prop_label_gap right: theme.prop_pad}}}
         body: View{
             width: Fill height: Fit flow: Down
@@ -108,6 +110,8 @@ script_mod! {
                 legend_box := PropSection{
                     header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/palette.svg")}} title +: {text: "Legend"}}}
                     body +: {
+                        // (its parts keep the sections' gap between them: no room of its own)
+                        padding: Inset{left: theme.prop_pad right: theme.prop_pad top: 0 bottom: 0}
                         // nested: the colours' key (titled as the colour mode) with the print
                         // time, then the materials
                         // (each in its slot: the box it moves in when dragged by its grip)

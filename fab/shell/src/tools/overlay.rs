@@ -96,6 +96,18 @@ script_mod! {
         }
     }
 
+    // A marquee being dragged: a faint accent wash, its edge in the accent.
+    mod.draw.DrawToolMarquee = mod.draw.DrawToolPanel{
+        color: vec4(0.3, 0.6, 1.0, 1.0)
+        pixel: fn() {
+            let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+            sdf.rect(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0)
+            sdf.fill_keep(vec4(self.color.xyz, 0.12))
+            sdf.stroke(vec4(self.color.xyz, 0.85), 1.0)
+            return sdf.result
+        }
+    }
+
     mod.widgets.FabToolOverlayBase = #(FabToolOverlay::register_widget(vm))
     mod.widgets.FabToolOverlay = set_type_default() do mod.widgets.FabToolOverlayBase{
         width: Fill
@@ -113,6 +125,7 @@ script_mod! {
         draw_line: mod.draw.DrawToolLine{}
         draw_marker: mod.draw.DrawToolMarker{}
         draw_panel: mod.draw.DrawToolPanel{}
+        draw_marquee: mod.draw.DrawToolMarquee{ color: fab.color_accent }
         draw_text: mod.draw.DrawText{
             text_style: theme.font_bold{
                 font_size: fab.font_size_small
@@ -238,6 +251,8 @@ pub struct FabToolOverlay {
     draw_marker: DrawToolMarker,
     #[live]
     draw_panel: DrawToolPanel,
+    #[live]
+    draw_marquee: DrawToolPanel,
     #[live]
     draw_text: DrawText,
     #[live]
@@ -1229,6 +1244,12 @@ impl Widget for FabToolOverlay {
                 } else {
                     self.draw_marks(cx, state, &proj, rect);
                     self.draw_picks(cx, state, &proj, rect);
+                    // a marquee being dragged in this view
+                    if let Some((_, a, b)) = state.ui.marquee.filter(|(pane, _, _)| *pane == self.pane) {
+                        let lo = dvec2(a.x.min(b.x), a.y.min(b.y));
+                        let hi = dvec2(a.x.max(b.x), a.y.max(b.y));
+                        self.draw_marquee.draw_abs(cx, Rect { pos: lo, size: hi - lo });
+                    }
                     self.draw_mass(cx, state, &proj);
                     let readout = self.draw_brush(cx, state, &proj);
                     wants_frames = readout || session::with(|s| s.wants_frames());

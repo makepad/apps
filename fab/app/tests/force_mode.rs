@@ -227,7 +227,7 @@ fn force_while_the_slicer_runs(app: TestApp) {
     app.type_text("Export the Print");
     app.press_key(KeyCode::ReturnKey);
     wait_until(&app, "the slice to start", || slice_state(&app).ends_with('%'));
-    let (_, orange, _) = shares(&app, "Part");
+    let (_, orange, _) = shares(&app, "Slicer");
 
     shown(&app, Selector::role(Role::Radio).name("Force").nth(0)).select();
     let opened = Instant::now();

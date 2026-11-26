@@ -139,9 +139,9 @@ fn toned(mut sheet: StyleSheet) -> StyleSheet {
             tones.push_str(&format!("mod.theme.{ink} = {TEXT_DIM}\n"));
         }
         // The property kit's fields (number fields and sliders, dropdowns, segmented choices): a
-        // faint white over whatever ground they sit on (#ffffff10), a shade more under the
-        // pointer.
-        tones.push_str("mod.theme.prop_field = #xffffff10\nmod.theme.prop_field_hover = #xffffff18\n");
+        // shade under whatever ground they sit on (#0000002b, the section headers' were), a
+        // little less under the pointer.
+        tones.push_str("mod.theme.prop_field = #x0000002b\nmod.theme.prop_field_hover = #x0000001c\n");
         sheet.theme.push_str(&tones);
     }
     sheet
@@ -232,8 +232,9 @@ pub fn script_mod(vm: &mut ScriptVm) {
             color_border: theme.color_bevel_inset_2
             color_border_light: theme.color_bevel_outset_1
             color_row_hover: theme.color_outset_hover
-            // a foldable section's header: a shade under the panel, never a lift
-            color_section: #x0000002b
+            // a foldable section's header: a faint white over the panel (#ffffff10, the fields'
+            // were)
+            color_section: #xffffff10
             color_input: theme.color_inset
             color_input_hover: theme.color_inset_hover
             color_input_active: theme.color_inset_active
@@ -261,9 +262,9 @@ pub fn script_mod(vm: &mut ScriptVm) {
             color_accent: theme.color_focus
             color_accent_hover: theme.color_focus
             color_accent_dim: theme.color_bg_highlight
-            // a picked list row: the section headers' shade (`color_section` over the panel
-            // ground), opaque, so a row that mixes into it from its ground reads as that shade
-            color_selection_bg: mix(#(panel) ?? theme.color_surface_container, #x000000, 0.168)
+            // a picked list row: the section headers' lighter grey (`color_section` over the panel
+            // ground), opaque, so a row that mixes into it from its ground reads as that grey
+            color_selection_bg: mix(#(panel) ?? theme.color_surface_container, #xffffff, 0.063)
             color_focus_ring: theme.color_focus
             color_warning: #xe0a020
             color_error: #xe04040

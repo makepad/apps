@@ -143,6 +143,16 @@ pub fn redraw_now(cx: &mut Cx, root: &WidgetRef, paths: &[&[LiveId]]) {
         }
         if let Some(editor) = editors::Editor::all().find(|editor| path.len() == 1 && editor.tab() == path[0]) {
             let dock = root.dock(cx, ids!(dock));
+            // the Part's editor is the Plate views' sidebar: each Plate body's
+            if editor == editors::Editor::Part {
+                let plate = editors::Editor::Viewport.kind();
+                let bodies: Vec<WidgetRef> = dock.borrow_mut().map(|mut dock| {
+                    dock.items().values().filter(|(kind, _)| *kind == plate).map(|(_, body)| body.clone()).collect()
+                }).unwrap_or_default();
+                for body in bodies {
+                    body.widget(cx, ids!(part_side)).redraw(cx);
+                }
+            }
             if editor.repeatable() {
                 let tabs: Vec<LiveId> = dock.borrow_mut().map(|mut dock| {
                     dock.items().iter().filter(|(_, (kind, _))| *kind == editor.kind()).map(|(tab, _)| *tab).collect()

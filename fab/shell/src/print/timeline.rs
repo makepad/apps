@@ -6,6 +6,9 @@
 //!   handle rides with the layer being printed.
 //! * [`FabMoveSlider`] — the moves within the current layer, left to right:
 //!   drag to put the nozzle anywhere along the layer's path.
+//! * [`FabSlicePad`] — the playback's pad, a Kaoss pad's square: up it the layers (layer 1 at the
+//!   foot), across it the moves within the layer; a press or a drag puts the playhead at any
+//!   moment of the print, a glowing point where it is.
 //! * [`FabSliceLegend`] — what the colours mean in the current colour mode,
 //!   with the totals: time and path length per feature, print time, the
 //!   filament each slot uses and its cost when known.
@@ -152,6 +155,74 @@ script_mod! {
         }
     }
 
+    mod.draw.DrawFabPad = mod.std.set_type_default() do #(DrawFabPad::script_shader(vm)){
+        ..mod.draw.DrawQuad
+        // the point (fractions: across the layer's moves, up the layers), the cut-away floor, a
+        // press and the pointer over it
+        px: 0.0
+        py: 0.0
+        lo: 0.0
+        down: 0.0
+        hover: 0.0
+        pixel: fn() {
+            let p = self.pos * self.rect_size
+            let sdf = Sdf2d.viewport(p)
+            let w = self.rect_size.x
+            let h = self.rect_size.y
+            let r = 5.0
+            // the well, a step darker than the card
+            sdf.box(0.5, 0.5, w - 1.0, h - 1.0, r)
+            sdf.fill_keep(vec4(0.0, 0.0, 0.0, 0.32))
+            sdf.stroke(vec4(1.0, 1.0, 1.0, 0.06 + 0.06 * self.hover), 1.0)
+            let inset = 6.0
+            let iw = w - inset * 2.0
+            let ih = h - inset * 2.0
+            // the layers cut away below the bottom handle, shaded
+            sdf.rect(inset, inset + ih * (1.0 - self.lo), iw, ih * self.lo)
+            sdf.fill(vec4(0.0, 0.0, 0.0, 0.22))
+            // a quarter grid
+            let g = vec4(1.0, 1.0, 1.0, 0.045)
+            sdf.rect(inset + iw * 0.25, inset, 1.0, ih)
+            sdf.fill(g)
+            sdf.rect(inset + iw * 0.5, inset, 1.0, ih)
+            sdf.fill(g)
+            sdf.rect(inset + iw * 0.75, inset, 1.0, ih)
+            sdf.fill(g)
+            sdf.rect(inset, inset + ih * 0.25, iw, 1.0)
+            sdf.fill(g)
+            sdf.rect(inset, inset + ih * 0.5, iw, 1.0)
+            sdf.fill(g)
+            sdf.rect(inset, inset + ih * 0.75, iw, 1.0)
+            sdf.fill(g)
+            // the printed share of the layer, and the crosshair through the point
+            let x = inset + iw * self.px
+            let y = inset + ih * (1.0 - self.py)
+            let a = fab.color_accent
+            sdf.rect(inset, y - 1.0, x - inset, 2.0)
+            sdf.fill(vec4(a.xyz, 0.55))
+            sdf.rect(x - 0.5, inset, 1.0, ih)
+            sdf.fill(vec4(a.xyz, 0.22))
+            sdf.rect(inset, y - 0.5, iw, 1.0)
+            sdf.fill(vec4(a.xyz, 0.22))
+            // the point's glow, wider while pressed
+            sdf.circle(x, y, 16.0 + 8.0 * self.down)
+            sdf.fill(vec4(a.xyz, 0.08 + 0.08 * self.down))
+            sdf.circle(x, y, 9.0 + 3.0 * self.down)
+            sdf.fill(vec4(a.xyz, 0.18 + 0.12 * self.down))
+            sdf.circle(x, y, 5.0)
+            sdf.fill_keep(fab.color_text_active)
+            sdf.stroke(vec4(0.0, 0.0, 0.0, 0.5), 1.0)
+            return sdf.result
+        }
+    }
+
+    mod.widgets.FabSlicePadBase = #(FabSlicePad::register_widget(vm))
+    mod.widgets.FabSlicePad = set_type_default() do mod.widgets.FabSlicePadBase{
+        width: Fill
+        height: 132
+        draw_pad: mod.draw.DrawFabPad{}
+    }
+
     mod.widgets.FabMoveSliderBase = #(FabMoveSlider::register_widget(vm))
     mod.widgets.FabMoveSlider = set_type_default() do mod.widgets.FabMoveSliderBase{
         width: Fill
@@ -226,6 +297,23 @@ pub struct DrawFabRange {
     head: f32,
     #[live]
     vertical: f32,
+    #[live]
+    hover: f32,
+}
+
+#[derive(Script, ScriptHook, Debug)]
+#[repr(C)]
+pub struct DrawFabPad {
+    #[deref]
+    draw_super: DrawQuad,
+    #[live]
+    px: f32,
+    #[live]
+    py: f32,
+    #[live]
+    lo: f32,
+    #[live]
+    down: f32,
     #[live]
     hover: f32,
 }
@@ -500,6 +588,116 @@ impl Widget for FabMoveSlider {
             .unwrap_or(0.0);
         self.draw_bar.head = head.clamp(0.0, 1.0);
         self.draw_bar.draw_walk(cx, walk);
+        DrawStep::done()
+    }
+}
+
+// ===========================================================================
+// The playback pad
+// ===========================================================================
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct FabSlicePad {
+    #[uid]
+    uid: WidgetUid,
+    #[walk]
+    walk: Walk,
+    #[redraw]
+    #[live]
+    draw_pad: DrawFabPad,
+    #[rust]
+    dragging: bool,
+}
+
+/// The pad's well inside its rect: the point travels within it.
+const PAD_INSET: f64 = 6.0;
+
+/// Where the playhead is on the pad: across the shown top layer's moves, up the layers. O(layers).
+fn pad_point(state: &AppState) -> Option<(f32, f32, f32)> {
+    let pv = state.print.showing()?;
+    let top = shown_top_layer(&state.print, pv);
+    let (a, b) = layer_span(pv, top);
+    let max = pv.max_layer().max(1) as f32;
+    let x = ((state.print.play.time - a) / (b - a).max(1e-9)) as f32;
+    Some((x.clamp(0.0, 1.0), top as f32 / max, state.print.play.layer_lo as f32 / max))
+}
+
+impl FabSlicePad {
+    /// The moment under `abs`: its layer up the pad, the moves across it. Shows that layer on top
+    /// and puts the playhead there.
+    fn pick(&self, cx: &mut Cx, abs: DVec2, state: &AppState) {
+        let Some(pv) = state.print.showing().filter(|_| !state.print.making_preview()) else { return };
+        let r = self.draw_pad.area().rect(cx);
+        let fx = ((abs.x - r.pos.x - PAD_INSET) / (r.size.x - PAD_INSET * 2.0).max(1.0)).clamp(0.0, 1.0);
+        let fy = 1.0 - ((abs.y - r.pos.y - PAD_INSET) / (r.size.y - PAD_INSET * 2.0).max(1.0)).clamp(0.0, 1.0);
+        let max = pv.max_layer();
+        let layer = ((fy * max as f64).round() as u32).max(state.print.play.layer_lo);
+        let (a, b) = layer_span(pv, layer);
+        cx.action(PrintAction::SetTopLayer(layer));
+        cx.action(PrintAction::Scrub(a + (b - a) * fx));
+    }
+}
+
+impl Widget for FabSlicePad {
+    // (to a reader: the moves within the layer, as the move slider was; the layer is the layer
+    // slider's)
+    fn semantics(&self, _cx: &Cx, node: &mut a11y_tree::Node) {
+        node.role = a11y_tree::Role::Slider;
+        makepad_platform::a11y::set_string(&mut node.name, "Moves in the layer");
+        node.range = Some(a11y_tree::RangeValue { min: 0.0, max: 1.0, now: self.draw_pad.px as f64, step: 0.0 });
+        node.actions.insert(a11y_tree::Actions::SET_VALUE);
+    }
+
+    fn handle_action(&mut self, cx: &mut Cx, request: &a11y_tree::ActionRequest, scope: &mut Scope) -> a11y_tree::ActionResult {
+        use a11y_tree::{ActionArg, ActionResult, Actions};
+        if request.action != Actions::SET_VALUE { return ActionResult::Unhandled; }
+        let value = match &request.arg {
+            ActionArg::Number(value) => Some(*value),
+            ActionArg::Text(value) => value.parse::<f64>().ok(),
+            _ => None,
+        };
+        let Some(value) = value.filter(|v| v.is_finite()) else { return ActionResult::Unsupported };
+        let Some(state) = scope.data.get::<AppState>() else { return ActionResult::Disabled };
+        let Some(pv) = state.print.showing().filter(|_| !state.print.making_preview()) else { return ActionResult::Disabled };
+        let (a, b) = layer_span(pv, shown_top_layer(&state.print, pv));
+        cx.action(PrintAction::Scrub(a + (b - a) * value.clamp(0.0, 1.0)));
+        ActionResult::Handled
+    }
+
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        let Some(state) = scope.data.get::<AppState>() else { return };
+        match event.hits(cx, self.draw_pad.area()) {
+            Hit::FingerHoverIn(_) => {
+                cx.set_cursor(MouseCursor::Crosshair);
+                self.draw_pad.hover = 1.0;
+                self.draw_pad.redraw(cx);
+            }
+            Hit::FingerHoverOut(_) => {
+                self.draw_pad.hover = 0.0;
+                self.draw_pad.redraw(cx);
+            }
+            Hit::FingerDown(fe) if fe.device.is_primary_hit() => {
+                self.dragging = true;
+                self.draw_pad.down = 1.0;
+                self.pick(cx, fe.abs, state);
+                self.draw_pad.redraw(cx);
+            }
+            Hit::FingerMove(fe) if self.dragging => self.pick(cx, fe.abs, state),
+            Hit::FingerUp(_) => {
+                self.dragging = false;
+                self.draw_pad.down = 0.0;
+                self.draw_pad.redraw(cx);
+            }
+            _ => {}
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let (x, y, lo) = scope.data.get::<AppState>().and_then(pad_point).unwrap_or((0.0, 0.0, 0.0));
+        self.draw_pad.px = x;
+        self.draw_pad.py = y;
+        self.draw_pad.lo = lo;
+        self.draw_pad.draw_walk(cx, walk);
         DrawStep::done()
     }
 }

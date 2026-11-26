@@ -50,12 +50,13 @@ script_mod! {
         Group := PropSection{
             // a grip to move it among its part's groups (never out of them)
             grip: true
-            // out over the enclosing section's inset, so its rows start and end where the Part's
-            // other rows do (and its title where theirs is)
-            margin: Inset{left: 0.0 - theme.prop_pad right: 0.0 - theme.prop_pad}
-            // its bar indented a short level (10 in from the rows' start, which is `prop_pad`
-            // in from the Group, set out by its margin above)
-            header +: {hdr +: {margin: Inset{left: theme.prop_pad + 10.0} padding: Inset{left: theme.prop_label_gap right: theme.prop_pad}}}
+            // out over the enclosing section's right inset, so its fields end where the Part's
+            // other fields do; its rows start where theirs do (inside the left inset, so a long
+            // name's start is never cut at the panel's edge); the sections' gap above it, none
+            // below: every bar stands that gap from the next, the Part's next section's too
+            margin: Inset{right: 0.0 - theme.prop_pad top: theme.prop_section_gap * 2.0}
+            // its bar indented a short level (10 in from the rows' start)
+            header +: {hdr +: {margin: Inset{left: 10.0} padding: Inset{left: theme.prop_label_gap right: theme.prop_pad}}}
             body: View{
                 width: Fill height: Fit flow: Down
                 // room above and below the rows (a step less than a section's: it is nested)
@@ -66,31 +67,31 @@ script_mod! {
         }
         // Every row's label column is `LABEL_W` at most, the Part panel's Transform's too, so the
         // panel's fields all start at one line.
-        Num := FabNumberRow{label +: {width: Fill{weight: 0 basis: "42%" max: #(LABEL_W)}} value +: {num +: {min: 0.0 max: 0.0 precision: 1}}}
+        Num := FabNumberRow{label +: {width: #(LABEL_W)} value +: {num +: {min: 0.0 max: 0.0 precision: 1}}}
         // A seed: its number, and a button that writes a new one.
         Seed := FabNumberRow{
-            label +: {width: Fill{weight: 0 basis: "42%" max: #(LABEL_W)}}
+            label +: {width: #(LABEL_W)}
             value +: {num +: {min: 0.0 max: 0.0 precision: 0}}
             trail +: {width: Fit reseed := mod.widgets.FabFlatButton{text: "Reseed" a11y: {label: "Reseed"}}}
         }
         // A grown pattern's live step counter, with pause and resume while it grows.
         Growth := PropRow{
-            label +: {width: Fill{weight: 0 basis: "42%" max: #(LABEL_W)}}
+            label +: {width: #(LABEL_W)}
             value +: {
                 flow: Right align: Align{y: 0.5}
                 text := mod.widgets.FabLabelSmall{width: Fill text: "" max_lines: 1}
                 pause := mod.widgets.FabFlatButton{text: "Pause" a11y: {label: "Pause growth"}}
             }
         }
-        Bool := PropCheckRow{label +: {width: Fill{weight: 0 basis: "42%" max: #(LABEL_W)}}}
-        Choice := PropSegmentedRow{label +: {width: Fill{weight: 0 basis: "42%" max: #(LABEL_W)}}}
-        Pick := PropDropDownRow{label +: {width: Fill{weight: 0 basis: "42%" max: #(LABEL_W)}}}
+        Bool := PropCheckRow{label +: {width: #(LABEL_W)}}
+        Choice := PropSegmentedRow{label +: {width: #(LABEL_W)}}
+        Pick := PropDropDownRow{label +: {width: #(LABEL_W)}}
         // A field's axes drawn as one row: its name, then the axes' fields side by side (taken from
         // their rows, which are not drawn; each axis named inside its field). See `axis_runs`.
-        Axes := PropRow{label +: {width: Fill{weight: 0 basis: "42%" max: #(LABEL_W)}} value +: {flow: Right spacing: 4}}
+        Axes := PropRow{label +: {width: #(LABEL_W)} value +: {flow: Right spacing: 4}}
         // A point: one row, its axes side by side, each named inside its field (a 2D one hides Z).
         Point := PropRow{
-            label +: {width: Fill{weight: 0 basis: "42%" max: #(LABEL_W)}}
+            label +: {width: #(LABEL_W)}
             value +: {
                 flow: Right spacing: 4
                 x := ValueInput{width: Fill height: Fill min_height: 0 label: "X" min: 0.0 max: 0.0 precision: 1}
@@ -106,7 +107,7 @@ script_mod! {
             }
             editor := mod.widgets.FabProfileEditor{}
         }
-        Derived := PropRow{label +: {width: Fill{weight: 0 basis: "42%" max: #(LABEL_W)}} value +: {text := mod.widgets.FabLabelSmall{width: Fill text: ""}}}
+        Derived := PropRow{label +: {width: #(LABEL_W)} value +: {text := mod.widgets.FabLabelSmall{width: Fill text: ""}}}
         Hint := View{
             width: Fill height: Fit
             padding: Inset{left: #(LABEL_W) + theme.prop_label_gap right: theme.prop_pad top: 4 bottom: 6}
@@ -941,7 +942,14 @@ impl Widget for FabParamPanel {
                     Some(rows) => rows.params.iter().find(|p| p.key == *key)?,
                     None => pp.param(key)?,
                 };
-                Some((*id, *rect, p.hint.clone()))
+                // a name its row cut short shows whole first
+                let label = self.items.get(id).map(|(w, _)| w.label(cx, ids!(label))).filter(|l| l.is_truncated()).map(|l| l.text());
+                let tip = match label {
+                    Some(name) if p.hint.is_empty() => name,
+                    Some(name) => format!("{name}\n{}", p.hint),
+                    None => p.hint.clone(),
+                };
+                Some((*id, *rect, tip))
             });
             match hint {
                 Some((id, rect, hint)) => self.hint.hover(cx, self.uid, Some((id, rect, hint.as_str()))),

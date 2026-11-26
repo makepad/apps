@@ -66,6 +66,17 @@ const PANE_LABEL_ICON: f64 = 12.0 + 4.0;
 /// it ([`crate::ui::progress_card`]).
 pub const SLIDER_TOP: f64 = 300.0;
 
+/// The Part sidebar's width at first, its range as its left edge is dragged, and the narrowest
+/// Plate view that shows it (narrower, the view keeps its room and the toolbar's Part stays off).
+pub const PART_SIDE_W: f64 = 300.0;
+pub const PART_SIDE_MIN_W: f64 = 240.0;
+pub const PART_SIDE_MAX_W: f64 = 640.0;
+const PART_SIDE_MIN_VIEW: f64 = 640.0;
+/// The Part sidebar's gap to the view's right edge.
+const PART_SIDE_RIGHT: f64 = 10.0;
+/// The playback card's width (its pad as wide, less its padding).
+const PAD_CARD_W: f64 = 264.0;
+
 /// What a playhead step ([`PrintAction::moves_playhead`]) changes: the slice in the view, the
 /// layer slider, the transport with its time and layer readouts, a resin printer's layer and
 /// the headset's view. Everything else in the stage and the panels stays as it was drawn.
@@ -266,6 +277,57 @@ script_mod! {
                         height: Fit{max: FitBound.Rel{base: Base.Full factor: 1.0}}
                         padding: Inset{left: 2 right: 2 top: 0}
                         tests := mod.widgets.FabTestSections{}
+                    }
+                }
+            }
+            // Design: the picked part's editor in a sidebar at the view's right edge, under the
+            // gizmo's column (the toolbar's Part), while a part is picked and the view has room
+            // for it; at the view's foot, as tall as its sections, never past the view's room
+            // (then it scrolls). A
+            // slice's layer slider moves to its left (`slice_ui`'s `part_room`).
+            part_side := View{
+                visible: false
+                width: Fill height: Fill flow: Right
+                align: Align{x: 1.0 y: 0.0}
+                padding: Inset{top: #(crate::ui::area_notch::TOOLBAR_H + 116.0) right: #(PART_SIDE_RIGHT) bottom: 10}
+                part_col := View{
+                    width: Fit height: Fill flow: Down
+                    // the room the card may grow into, upward from its foot
+                    part_room := View{
+                        width: Fit height: Fill flow: Down
+                        align: Align{y: 1.0}
+                        part_card := Float{
+                            width: #(PART_SIDE_W) height: Fit{max: FitBound.Rel{base: Base.Full factor: 1.0}} flow: Overlay
+                            padding: Inset{left: 3 right: 3 top: 3 bottom: 3}
+                            // on the panels' ground, so its sections sit on their own colour
+                            draw_bg +: { color: fab.color_editor }
+                            part := mod.widgets.FabPartPanel{
+                                show_bg: false
+                                height: Fit{max: FitBound.Rel{base: Base.Full factor: 1.0}}
+                                editor_bar +: {
+                                    padding: Inset{left: 8 right: 2}
+                                    draw_bg +: { line: 0.0 }
+                                    rule +: { visible: false }
+                                    title +: { visible: true }
+                                    side_close +: { visible: true }
+                                }
+                                body +: { height: Fit{max: FitBound.Rel{base: Base.Full factor: 1.0}} }
+                            }
+                            // its left edge: a drag makes the sidebar wider or narrower
+                            part_grip := View{
+                                width: 6 height: Fill
+                                margin: Inset{left: -3}
+                                cursor: MouseCursor.EwResize
+                                show_bg: true
+                                draw_bg +: {
+                                    hover: instance(0.0)
+                                    pixel: fn() {
+                                        let line = 1.0 - step(1.0, abs(self.pos.x * self.rect_size.x - 3.0))
+                                        return vec4(fab.color_accent.xyz, 1.0) * line * self.hover
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -488,128 +550,28 @@ script_mod! {
                         }
                     }
             }
+            // The playback, in a floating card at the view's bottom left: the pad (a Kaoss pad's
+            // square: up it the layers, across it the moves within the layer), the transport and
+            // the time under it, then the layer and what prints there.
             bottom := View{
                 width: Fill
                 height: Fill
                 flow: Down
-                Filler{}
-                // Why the plate does not slice, in every workspace with the model.
-                slice_failed := Float{
-                    visible: false
-                    width: Fit
-                    height: Fit
-                    margin: Inset{left: 10 bottom: 6}
-                    padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
-                    slice_failed_text := mod.widgets.FabLabel{ text: "" a11y: {label: "Why the plate does not slice"} }
-                }
-                // The part shows as it was at a step of its build (the Steps editor's marker).
-                step_shown := Float{
-                    visible: false
-                    width: Fit
-                    height: Fit
-                    flow: Right
-                    spacing: 10
-                    align: Align{y: 0.5}
-                    margin: Inset{left: 10 bottom: 6}
-                    padding: Inset{left: 12 right: 8 top: 4 bottom: 4}
-                    step_shown_text := mod.widgets.FabLabel{ text: "" a11y: {label: "The step the view shows"} }
-                    step_back := mod.widgets.FabButton{ text: "Back to the end" a11y: {label: "Back to the end"} }
-                    step_rollback := mod.widgets.FabButton{ text: "Roll back to here" }
-                }
-            }
-        }
-
-        // ---- Mechanics: tools (each tool's help is its tooltip) ----
-        mechanics_ui := View{
-            visible: false width: Fill height: Fill flow: Overlay
-            left := View{
-                // under the header strip (`MECH_TOOLS_GAP` below it)
-                width: Fit height: Fill flow: Down padding: Inset{left: 10 top: 40}
-                tools := Float{
-                    flow: Down padding: 3 spacing: 1
-                    a11y: {role: "radio_group" label: "Mechanics tools"}
-                    FabTip{ place: TipPlace.Right wrap_width: 360 text: #(format!("{}: drag a part to hold and move it. {} moves it nearer or farther. {} to orbit (bare drag off a part).", keymap::tooltip(Key::MechGrab), keymap::shortcut(Key::MechDepth), keymap::shortcut(Key::MechOrbit)))
-                        t_grab := Tool{ a11y: {label: "Grab"} draw_icon +: { svg: crate_resource("self://resources/icons/grab.svg") } }
-                    }
-                    FabTip{ place: TipPlace.Right wrap_width: 360 text: #(format!("{}: drag a part, let go to throw it. {} moves it nearer or farther. {} to orbit (bare drag off a part).", keymap::tooltip(Key::MechThrow), keymap::shortcut(Key::MechDepth), keymap::shortcut(Key::MechOrbit)))
-                        t_throw := Tool{ a11y: {label: "Throw"} draw_icon +: { svg: crate_resource("self://resources/icons/throw.svg") } }
-                    }
-                    FabTip{ place: TipPlace.Right wrap_width: 360 text: #(format!("{}: click a part to pin it at that point; click a pinned part to unpin it. {} to orbit (bare drag off a part).", keymap::tooltip(Key::MechPin), keymap::shortcut(Key::MechOrbit)))
-                        t_pin := Tool{ a11y: {label: "Pin"} draw_icon +: { svg: crate_resource("self://resources/icons/pin.svg") } }
-                    }
-                    FabTip{ place: TipPlace.Right wrap_width: 360 text: #(format!("{}: drag a part to hang it from the pointer and let it swing. {} moves it nearer or farther. {} to orbit (bare drag off a part).", keymap::tooltip(Key::MechDangle), keymap::shortcut(Key::MechDepth), keymap::shortcut(Key::MechOrbit)))
-                        t_dangle := Tool{ a11y: {label: "Dangle"} draw_icon +: { svg: crate_resource("self://resources/icons/dangle.svg") } }
-                    }
-                    FabTip{ place: TipPlace.Right wrap_width: 360 text: #(format!("{}: click a part to push it away from you. {} to orbit (bare drag off a part).", keymap::tooltip(Key::MechPoke), keymap::shortcut(Key::MechOrbit)))
-                        t_poke := Tool{ a11y: {label: "Poke"} draw_icon +: { svg: crate_resource("self://resources/icons/poke.svg") } }
-                    }
-                }
-            }
-            actions := mod.widgets.FabMechActions{}
-        }
-
-        // ---- slice view ----
-        slice_ui := View{
-            visible: false
-            width: Fill
-            height: Fill
-            flow: Overlay
-            right_col := View{
-                width: Fill
-                height: Fill
-                flow: Right
-                clip_x: false
-                clip_y: false
-                Filler{}
-                layer_col := View{
-                    width: Fit
-                    height: Fill
-                    flow: Down
-                    clip_x: false
-                    clip_y: false
-                    padding: Inset{right: 16 top: #(SLIDER_TOP) bottom: 100}
-                    layers := mod.widgets.FabLayerSlider{}
-                }
-            }
-            // a resin printer's slice: the shown layer flat, in place of the print's bar
-            resin_ui := View{
-                visible: false
-                width: Fill
-                height: Fill
-                flow: Down
-                Filler{}
-                resin_row := View{
-                    width: Fill
-                    height: Fit
-                    flow: Right
-                    align: Align{y: 1.0}
-                    spacing: 10
-                    padding: Inset{left: 56 bottom: 12}
-                    resin_panel := mod.widgets.FabResinPanel{}
-                    FabTip{ text: "Follow the printer again: the view shows the layer it cured last"
-                        resin_live := mod.widgets.FabButton{ visible: false text: "Back to live" }
-                    }
-                }
-            }
-            bottom := View{
-                width: Fill
-                height: Fill
-                flow: Down
-                align: Align{x: 0.5}
+                align: Align{x: 0.0}
                 Filler{}
                 bar_row := View{
                     width: Fill height: Fit flow: Right
                     // Clear of the tool strip that stays over Design's slice.
                     legend_gap := View{ width: 44 height: 1 }
                     bar := Float{
-                        width: Fill
+                        width: #(PAD_CARD_W)
                         flow: Down
-                        margin: Inset{left: 12 right: 80 bottom: 12}
-                        padding: Inset{left: 10 right: 14 top: 8 bottom: 8}
-                        spacing: 4
+                        margin: Inset{left: 12 bottom: 12}
+                        padding: Inset{left: 8 right: 8 top: 8 bottom: 8}
+                        spacing: 6
                         follow_row := View{
                             visible: false
-                            width: Fill height: Fit flow: Right align: Align{y: 0.5} spacing: 10 padding: Inset{left: 4 top: 2}
+                            width: Fill height: Fit flow: Down spacing: 6 padding: Inset{left: 2 top: 2}
                             FabTip{ text: "Follow the printer again: the view shows the layer it prints, the head where Fab's slice timing puts it"
                                 back_live := mod.widgets.FabButton{ visible: false text: "Back to live" }
                             }
@@ -617,16 +579,18 @@ script_mod! {
                         }
                         job_box := View{
                             visible: false
-                            width: Fill height: Fit padding: Inset{left: 4 right: 2 bottom: 4}
+                            width: Fill height: Fit padding: Inset{left: 2 right: 2 bottom: 4}
                             job_bar := mod.widgets.FabJobTimeline{}
                         }
-                        // Two rows: the transport and its scrubber (to the start of the layer,
-                        // play, to its end, the speed, then the scrubber taking the rest), then
-                        // the time and what is printing there.
                         row := View{
-                            width: Fill height: Fit flow: Down spacing: 4
+                            width: Fill height: Fit flow: Down spacing: 6
+                            FabTip{ text: "Drag on the pad: up it the layers, across it the moves within the layer"
+                                time_scrub := mod.widgets.FabSlicePad{}
+                            }
+                            // to the start of the layer, play, to its end, the speed; the time at
+                            // the right end
                             transport := View{
-                                width: Fill height: Fit flow: Right align: Align{y: 0.5} spacing: 4
+                                width: Fill height: Fit flow: Right align: Align{y: 0.5} spacing: 2
                                 FabTip{ text: "Back to the start of the layer"
                                     to_start := mod.widgets.FabIconButton{ a11y: {label: "Start of layer"} width: 28 height: 28 padding: Inset{left: 7 right: 7 top: 7 bottom: 7} draw_icon +: { svg: crate_resource("self://resources/icons/skip_back.svg") } }
                                 }
@@ -642,19 +606,17 @@ script_mod! {
                                 FabTip{ text: "Playback speed"
                                     speed := mod.widgets.FabDropdownButton{ tag: @fab_stage_speed owner: @fab_stage_speed label +: { text: "60×" } }
                                 }
-                                time_scrub := mod.widgets.FabMoveSlider{ width: Fill margin: Inset{left: 6 right: 6} }
+                                Filler{}
+                                time_label := mod.widgets.FabLabelSmall{ width: Fit text: "" margin: Inset{right: 2} }
                             }
-                            // what prints there (it wraps on a narrow view), then, apart by a rule at
-                            // the right end, the time
+                            // the layer, then what prints there (it wraps)
                             meta := View{
-                                width: Fill height: Fit flow: Right align: Align{y: 0.5} spacing: 12 padding: Inset{left: 4 right: 6}
+                                width: Fill height: Fit flow: Down padding: Inset{left: 2 right: 2}
                                 info := View{
-                                    width: Fill height: Fit flow: Right{wrap: true} align: Align{y: 0.5} spacing: 12
-                                    layer_label := mod.widgets.FabLabel{ width: Fit text: "" }
-                                    now := mod.widgets.FabLabelSmall{ width: Fit text: "" }
+                                    width: Fill height: Fit flow: Down spacing: 3
+                                    layer_label := mod.widgets.FabLabel{ width: Fill text: "" }
+                                    now := mod.widgets.FabLabelSmall{ width: Fill text: "" draw_text +: { color: fab.color_text_muted } }
                                 }
-                                time_rule := mod.widgets.FabVRule{ height: 14 }
-                                time_label := mod.widgets.FabLabelSmall{ width: Fit text: "" }
                             }
                         }
                     }
@@ -772,6 +734,10 @@ script_mod! {
                 // The view's options (what it shows, its framing, the filament colours) in their
                 // flyout, at the bar's right end before the area's close, a rule between
                 Filler{}
+                // Design's Part sidebar at the view's right, shown or put away
+                part_tip := FabTip{ text: "Part: the picked part's editor in a sidebar at the view's right"
+                    part_toggle := ViewToggle{ visible: false a11y: {label: "Part"} draw_icon +: { svg: crate_resource("self://resources/icons/sidebar.svg") } }
+                }
                 // why the colours shown are not what will print (a missing spool's colour, ...):
                 // a warning mark, the reason in its tooltip
                 colour_notice_tip := FabTip{
@@ -977,6 +943,8 @@ struct StageDrawKeys {
     /// The plate's mode label, Test prints' toolbar group and its sidebar (the mode, the
     /// sidebar open in the lead pane, a part picked, the print's revision for the totals).
     tests: Option<(Option<PlateMode>, bool, bool, bool, u64)>,
+    /// Design's Part sidebar: offered in this view, a part picked, opened, over a slice.
+    part_side: Option<(bool, bool, bool, bool)>,
     /// The colours' warning mark beside View options (why they differ from the print's).
     colours: Option<(fab_plate::ColourMode, (usize, bool), bool, usize, bool, bool, crate::print::ColorBy, bool)>,
     /// The three Design tool buttons and the paint, shape, sculpt and force strips and their controls.
@@ -1114,6 +1082,12 @@ struct PaintBarKey {
 pub struct FabStage {
     #[deref]
     view: View,
+    /// The Part sidebar's left edge held: where the press was and the width then.
+    #[rust]
+    part_drag: Option<(f64, f64)>,
+    /// The Part sidebar's width as last set on its card and the slider's room.
+    #[rust]
+    part_w_shown: Option<f64>,
     /// The no-trees area the context menu was opened on (`instance/solid`).
     #[rust]
     menu_area: Option<String>,
@@ -1787,6 +1761,12 @@ pub enum StageAction {
     CameraPip(bool),
     /// The Test prints mode's sidebar of tests, open or closed.
     TestsSidebar(bool),
+    /// How the 3D views take the mouse (the caption's Settings), kept per machine.
+    Nav(NavScheme),
+    /// The wheel zooms the other way (Settings), kept per machine.
+    InvertWheel(bool),
+    /// Design's Part sidebar in the Plate view, shown or put away.
+    PartSidebar(bool),
     /// Q pressed: the view pie opens round the pointer in the Plate view under it.
     ViewPie,
     /// The brush radius (mm).
@@ -1851,6 +1831,15 @@ pub fn apply(state: &mut AppState, action: &StageAction) {
         StageAction::Zones(on) => state.ui.show_zones = *on,
         StageAction::CameraPip(on) => state.ui.camera_pip = *on,
         StageAction::TestsSidebar(on) => state.ui.tests_sidebar = *on,
+        StageAction::Nav(scheme) => {
+            state.ui.nav = *scheme;
+            crate::view_prefs::save_nav(*scheme);
+        }
+        StageAction::InvertWheel(on) => {
+            state.ui.invert_wheel = *on;
+            crate::view_prefs::save_invert_wheel(*on);
+        }
+        StageAction::PartSidebar(on) => state.ui.part_sidebar = *on,
         // (the Plate view under the pointer opens its pie: `FabStage::pie_event`)
         StageAction::ViewPie => {}
         StageAction::PaintRadius(r) => state.ui.paint_radius = r.clamp(crate::tools::paint::MIN_RADIUS, crate::tools::paint::MAX_RADIUS),
@@ -1941,6 +1930,41 @@ impl Widget for FabStage {
             if close {
                 self.options_open = false;
                 self.view.redraw(cx);
+            }
+        }
+        // the Part sidebar's left edge: a drag sets its width (kept when it lets go)
+        let grip = self.view.view(cx, ids!(model_ui.part_side.part_col.part_room.part_card.part_grip));
+        let lit = |cx: &mut Cx, on: f32| {
+            if let Some(mut g) = grip.borrow_mut() { g.draw_bg.set_dyn_instance(cx, id!(hover), &[on]); }
+            grip.redraw(cx);
+        };
+        if grip.visible() {
+            match event.hits(cx, grip.area()) {
+                Hit::FingerHoverIn(_) => {
+                    cx.set_cursor(MouseCursor::EwResize);
+                    lit(cx, 1.0);
+                }
+                Hit::FingerHoverOut(_) if self.part_drag.is_none() => lit(cx, 0.0),
+                Hit::FingerDown(fe) if fe.device.is_primary_hit() => {
+                    if let Some(state) = scope.data.get::<AppState>() {
+                        self.part_drag = Some((fe.abs.x, state.ui.part_side_w));
+                    }
+                }
+                Hit::FingerMove(fe) => {
+                    if let (Some((x0, w0)), Some(state)) = (self.part_drag, scope.data.get_mut::<AppState>()) {
+                        state.ui.part_side_w = (w0 + x0 - fe.abs.x).clamp(PART_SIDE_MIN_W, PART_SIDE_MAX_W);
+                        self.view.redraw(cx);
+                    }
+                }
+                Hit::FingerUp(_) => {
+                    self.part_drag = None;
+                    lit(cx, 0.0);
+                    if let Some(state) = scope.data.get::<AppState>() {
+                        crate::view_prefs::save_part_side_w(state.ui.part_side_w);
+                    }
+                    self.view.redraw(cx);
+                }
+                _ => {}
             }
         }
         // the tests sidebar's sections: their hover, and a swipe across them folding them all
@@ -2287,6 +2311,13 @@ impl Widget for FabStage {
         if v.button(cx, ids!(tests_side.tests_close)).clicked(actions) {
             cx.action(StageAction::TestsSidebar(false));
         }
+        // Design's Part sidebar: the toolbar's Part, and the sidebar's own close
+        if v.radio_button(cx, ids!(render_row.part_toggle)).clicked(actions) {
+            cx.action(StageAction::PartSidebar(!state.ui.part_sidebar));
+        }
+        if v.button(cx, ids!(part_side.part_col.part_room.part_card.part.editor_bar.side_close)).clicked(actions) {
+            cx.action(StageAction::PartSidebar(false));
+        }
         // the render mode's flyout: Normal, Sliced, and Force on Design's plate
         if let Some(anchor) = dropdown_clicked(actions, live_id!(fab_render_mode)) {
             let mode = state.render_mode();
@@ -2516,6 +2547,41 @@ impl Widget for FabStage {
                     }
                 }
                 v.view(cx, ids!(model_ui.tests_side)).set_visible(cx, tests_mode && tests_key.2);
+            }
+            // Design's Part sidebar: in the lead view of Design (not its test prints, whose tests
+            // take that side) while a part is picked and the view is wide enough, left of a
+            // slice's layer slider; the toolbar's Part shows or puts it away
+            let wide = cx.peek_walk_turtle(walk).size.x >= PART_SIDE_MIN_VIEW;
+            let offered = lead && design && !tests_mode && wide;
+            let picked = offered && active_part(state).is_some();
+            let part_key = (offered, picked, state.ui.part_sidebar, slice);
+            if self.draw_keys.part_side != Some(part_key) {
+                self.draw_keys.part_side = Some(part_key);
+                let (offered, picked, on, _) = part_key;
+                v.widget(cx, ids!(render_row.part_toggle)).set_visible(cx, offered);
+                v.widget(cx, ids!(render_row.part_toggle)).set_disabled(cx, !picked);
+                v.radio_button(cx, ids!(render_row.part_toggle)).set_active(cx, on && picked, Animate::No);
+                if let Some(mut tip) = v.widget(cx, ids!(render_row.part_tip)).borrow_mut::<makepad_widgets_core::tip::Tip>() {
+                    tip.text = if picked { "Part: the picked part's editor in a sidebar at the view's right" } else { "Part: pick a part to edit it here" }.to_string();
+                }
+                v.view(cx, ids!(model_ui.part_side)).set_visible(cx, picked && on);
+                v.widget(cx, ids!(slice_ui.right_col.part_room)).set_visible(cx, picked && on);
+            }
+            if lead {
+                state.ui.part_side_shown = part_key.1 && part_key.2;
+            }
+            // its width, as dragged: the card's, and the room a slice's layer slider keeps beside it
+            let part_w = state.ui.part_side_w;
+            if self.part_w_shown != Some(part_w) {
+                self.part_w_shown = Some(part_w);
+                let paths: [(&[LiveId], f64); 2] = [(ids!(model_ui.part_side.part_col.part_room.part_card), part_w), (ids!(slice_ui.right_col.part_room), part_w + PART_SIDE_RIGHT - 6.0)];
+                for (path, w) in paths {
+                    let view = v.view(cx, path);
+                    if let Some(mut inner) = view.borrow_mut() {
+                        inner.walk.width = Size::Fixed(w);
+                    }
+                    view.redraw(cx);
+                }
             }
             // View options' flyout, while open: each tile as the view has it
             let open = self.options_open && lead && !mechanics;

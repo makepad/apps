@@ -488,13 +488,15 @@ impl ToolController for ToolSet {
                                 cx.action(ShellAction::PickOverride(None));
                             }
                         };
+                        // the scheme's modifier (Shift in Fab's) adds a click to the selection
+                        let toggle = state.ui.nav.toggles_selection(&mods);
                         match input.hit {
                             Some(hit) => {
-                                // Shift in the Edit shape mode adds or takes off a pick, and
-                                // keeps the part it is on picked.
-                                if mods.shift && crate::tools::picks::active(state) {
+                                // In the Edit shape mode it adds or takes off a pick, and keeps
+                                // the part it is on picked.
+                                if toggle && crate::tools::picks::active(state) {
                                     cx.action(ShellAction::SelectAdd(hit.element));
-                                } else if mods.shift {
+                                } else if toggle {
                                     cx.action(ShellAction::SelectToggle(hit.element));
                                 } else {
                                     cx.action(ShellAction::SelectOnly(hit.element));
@@ -506,8 +508,9 @@ impl ToolController for ToolSet {
                                     cx.action(crate::params::ParamAction::Focus(None));
                                 }
                             }
+                            // a click on nothing lets go of it all, unless the modifier is held
                             None => {
-                                if !mods.shift {
+                                if !(toggle && state.ui.nav != NavScheme::Onshape) {
                                     cx.action(ShellAction::ClearSelection);
                                     unpick(cx);
                                 }

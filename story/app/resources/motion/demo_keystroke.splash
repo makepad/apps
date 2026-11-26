@@ -1,0 +1,39 @@
+use mod.motion.*
+// KEYSTROKE BADGE — shows the shortcut being pressed. Keycaps rise in one
+// after another on ease_out_back, then all dip together (6 px in 60 ms, a
+// softer return) the moment the shortcut fires, and the action's name
+// fades in under them. Caps hug their glyphs, so "⌘", "Shift" and "Space"
+// all work; the row is centred whatever its length. Transparent overlay,
+// bottom centre inside title safe.
+// Why: the stagger shows the order of the keys, the shared dip shows the
+// moment of the chord, and the label says what it did.
+Motion{
+    label: "Keystroke badge"
+    brief: "Keycaps that rise in, press together, and name the action."
+    tags: ["demo", "overlay", "keyboard", "shortcut", "product"]
+    duration: 2.8
+    inputs: {
+        keys: input(@text, "⌘    Shift    K", "Keys separated by four spaces")
+        action: input(@text, "Command palette", "What the shortcut does")
+        ink: input(@color, #f4f7fa, "Key and label text")
+        cap: input(@color, #1a1f27f2, "Keycap fill")
+        edge: input(@color, #ffffff33, "Keycap edge")
+    }
+    layers: [
+        Group{
+            opacity: tween(1, 0, 2.45, 2.8, @ease_in_cubic)
+            y: keys([0.9, 0.0], [0.96, 6.0, @ease_out_cubic], [1.2, 0.0, @ease_out_cubic])
+            layers: [
+                Text{text: in(@keys) font: Font{family: "Inter" weight: 600} size: 56 color: in(@ink)
+                     at: vec2(960, 822) wrap: 1920 align: @center
+                     by: @word stagger: 0.08
+                     plate: in(@cap) plate_each: true plate_pad: vec2(22, 14) plate_radius: 14 plate_stroke: in(@edge) plate_width: 2
+                     y: tween(40, 0, 0.1, 0.55, @ease_out_back) opacity: tween(0, 1, 0.1, 0.3, @ease_out_cubic)}
+            ]
+        }
+        Text{text: in(@action) font: Font{family: "Inter" weight: 500} size: 36 color: in(@ink)
+             at: vec2(960, 938) wrap: 1920 align: @center
+             y: tween(10, 0, 0.95, 1.4, @ease_out_quint)
+             opacity: keys([0.95, 0], [1.3, 1, @ease_out_cubic], [2.45, 1], [2.8, 0, @ease_in_cubic])}
+    ]
+}

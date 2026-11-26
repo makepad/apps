@@ -23,6 +23,8 @@ pub struct NodeInfo {
     /// code that built the circuit: a round plan may take its consumers' currents a round late
     /// there (`analysis::round`). It is the design's intent, never a value.
     pub supply: bool,
+    /// The design declares that the circuit's outputs read this node. The flag records intent, never a value.
+    pub heard: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -593,9 +595,16 @@ pub enum BoundaryKind {
     /// boundaries): a one-port standing in for the circuit that holds the node, driven by the
     /// boundary's branch current less this source's value (the same current as the holder has
     /// counted it), so the node moves at once by what the holder will do a round later. Its
-    /// impedance is set as parameters (`r`, `rb`, `tau`, `l`: `r + rb / (1 + s tau) + s l`), all
-    /// zero until then, where the boundary holds its value. It stamps nothing of its own.
-    Port { of: u32 },
+    /// impedance is `r + rb / (1 + s tau) + s l`. At a declared supply, `second` adds
+    /// `rb2 / (1 + s tau2)`. The parameters start at zero, where the boundary holds its value.
+    /// It stamps nothing of its own.
+    Port { of: u32, second: bool },
+    /// Corrects voltage boundary `of` (an index into this circuit's boundaries) by `g` times
+    /// its own node's voltage less the delayed table of that node as the far block read it.
+    /// The gain defaults to zero. Without a table the correction is inactive.
+    Echo { of: u32 },
+    /// Table of the dimensionless gain for echo instance `echo`. It owns no unknowns or stamps.
+    EchoGain { echo: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1201,7 +1210,7 @@ impl SimCircuit {
         let mut index = HashMap::new();
         index.insert("0".to_string(), GND);
         SimCircuit {
-            nodes: vec![NodeInfo { name: "0".into(), ic: None, nodeset: None, supply: false }],
+            nodes: vec![NodeInfo { name: "0".into(), ic: None, nodeset: None, supply: false, heard: false }],
             devices: Banks::default(),
             models: Vec::new(),
             opts: Options::default(),
@@ -1240,11 +1249,15 @@ impl SimCircuit {
     /// value: an independent source's waveform, a GPIO's mode, and a resistor's (finite, non-zero),
     /// capacitor's or inductor's (one no mutual couples) value. A resistor's thermal noise source
     /// (`#noise`) follows its value in a live run with its draws kept, so its new density is not
-    /// listed. Empty when equal; `None` when anything else differs (a node, a model, a device
-    /// added, moved or renamed, another field). O(devices).
+    /// listed. A node's heard flag (`NodeInfo::heard`) is what the plan weighs, not the circuit:
+    /// a probe that only adds one keeps the run, and the run keeps its plan's heard nets until a
+    /// change reaches its planner. Empty when equal; `None` when anything else differs (a node, a
+    /// model, a device added, moved or renamed, another field). O(devices).
     pub fn value_changes(&self, new: &SimCircuit) -> Option<Vec<Change>> {
         let (a, b) = (&self.devices, &new.devices);
-        if self.nodes != new.nodes || self.models != new.models || self.opts != new.opts || self.temp_c != new.temp_c
+        let same_nodes = self.nodes.len() == new.nodes.len()
+            && self.nodes.iter().zip(&new.nodes).all(|(old, new)| NodeInfo { heard: new.heard, ..old.clone() } == *new);
+        if !same_nodes || self.models != new.models || self.opts != new.opts || self.temp_c != new.temp_c
             || a.k != b.k || a.ctl != b.ctl || a.b != b.b || a.sw != b.sw
             || a.d != b.d || a.q != b.q || a.reg != b.reg || a.m != b.m || a.j != b.j || a.o != b.o || a.boundary != b.boundary || a.cell != b.cell
             || a.r.len() != b.r.len() || a.c.len() != b.c.len() || a.l.len() != b.l.len()
@@ -1307,7 +1320,7 @@ impl SimCircuit {
             return n;
         }
         let n = self.nodes.len() as Node;
-        self.nodes.push(NodeInfo { name: name.to_string(), ic: None, nodeset: None, supply: false });
+        self.nodes.push(NodeInfo { name: name.to_string(), ic: None, nodeset: None, supply: false, heard: false });
         self.index.insert(name.to_string(), n);
         n
     }
@@ -1334,6 +1347,14 @@ impl SimCircuit {
         let n = self.node(node);
         if n != GND {
             self.nodes[n as usize].supply = true;
+        }
+    }
+
+    /// Declares a voltage node heard by the circuit's outputs (`NodeInfo::heard`). Ground is never heard.
+    pub fn declare_heard(&mut self, node: &str) {
+        let n = self.node(node);
+        if n != GND {
+            self.nodes[n as usize].heard = true;
         }
     }
 

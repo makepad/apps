@@ -1,0 +1,19 @@
+// The host's kernel entries (objects.rs): kernels the host builds around a
+// document's fns. Each is compiled with the declarations the host gives it
+// (`next`, `State`, `h`, `nx` ...) and the document fn bound by name.
+{
+    // A Sim's init: its state's first values, then the document's `init`.
+    sim_init: fn(i) {
+        next[i] = State{}
+        sim_init_user(i)
+    }
+    // A Sim without `init`.
+    none: fn(i) {}
+    // FieldGeometry: one height per vertex of an nx by nz grid of size sx by sz.
+    field_vertex: fn(i) {
+        let w = int(nx)
+        let x = (float(i % w) / (nx - 1.0) - 0.5) * sx
+        let z = (float(i / w) / (nz - 1.0) - 0.5) * sz
+        h[i] = field_fn(x, z)
+    }
+}

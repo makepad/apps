@@ -246,6 +246,12 @@ pub trait CanvasItems {
     fn hit(&self, at: [f64; 2], radius: f64) -> Vec<Self::Key>;
     /// The semantic nodes of the items `cam` shows, their rectangles in logical points.
     fn nodes(&self, cam: &Camera2d) -> Vec<CanvasNode<Self::Key>>;
+    /// Whether a drag that starts on `key` at world point `at` draws a marquee instead of moving
+    /// it: the inside of a background item (a board's pour), which a press and release still
+    /// clicks. The pointer is no hand over it. None by default.
+    fn marquee_over(&self, _key: &Self::Key, _at: [f64; 2], _radius: f64) -> bool {
+        false
+    }
 }
 
 /// One item as a semantic node: a virtual child of the canvas a remote driver can find by name

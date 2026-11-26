@@ -1,0 +1,18 @@
+# Stage's performance UI: column layout, deck tabs, library navigation,
+# and the step grid. View and widget code only. No flow runtime and no
+# instrument engine. The Stage app links this after review.
+
+[package]
+name = "makepad-stage-ui"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Stage performance UI models and the step-grid widget"
+
+[dependencies]
+makepad-widgets = { path = "../../../../../widgets", default-features = false, features = ["charts", "color", "data", "pickers"] }
+makepad-look = { path = "../../../../../libs/look" }
+makepad-asset-data = { path = "../../../../apps/engine/asset/data" }
+makepad-stage-audio-wave = { path = "../audio_wave" }
+makepad-live-frame = { path = "../../../../../libs/live_frame" }

@@ -5,7 +5,7 @@
 //!                 --filament NAME|FILE [--filament ...] [--map 1,2] [--object-filament 1,2]
 //!                 [--at X,Y ...] [--bed "Textured PEI Plate"] [--nozzle-volume Standard,Standard]
 //!                 [--profiles DIR] --out plate.gcode.3mf [--gcode plate.gcode] [--records plate.fabrec]
-//! fab-slice golden CASE [--golden DIR] [--out DIR] [--layer N] [--layer-times] [--own-flush] [--installed DIR]
+//! fab-slice golden CASE --golden DIR [--out DIR] [--layer N] [--layer-times] [--own-flush] [--installed DIR]
 //! fab-slice estimate FILE.gcode --machine ... --process ... --filament ...
 //! fab-slice import FILE [--profiles DIR] [--into DIR]
 //! fab-slice fab --doc FILE.fab.splash|FILE.cad.splash --machine P --process P --filament P [--filament ...]
@@ -19,7 +19,7 @@ use makepad_fab_slicer::mesh::load_model;
 use std::path::{Path, PathBuf};
 
 fn usage() -> ! {
-    eprintln!("usage:\n  fab-slice slice --model FILE [--model FILE] --machine P --process P --filament P [--filament P] [--map 1,2] [--object-filament 1,2] [--at X,Y] [--bed NAME] [--nozzle-volume A,B] [--profiles DIR] [--flat [--tree DIR]] --out FILE.gcode.3mf [--gcode FILE] [--records FILE]\n  fab-slice golden CASE [--golden DIR] [--out DIR] [--layer N]\n  fab-slice estimate FILE.gcode --machine P --process P --filament P\n  fab-slice import FILE [--profiles DIR] [--into DIR]\n  fab-slice fab --doc FILE.fab.splash|FILE.cad.splash --machine P --process P --filament P [--filament P] [--map 1,2] [--colors A,B] [--flat [--tree DIR]] [--documents DIR] [--preview FILE.png] --out FILE.gcode.3mf [--gcode FILE]");
+    eprintln!("usage:\n  fab-slice slice --model FILE [--model FILE] --machine P --process P --filament P [--filament P] [--map 1,2] [--object-filament 1,2] [--at X,Y] [--bed NAME] [--nozzle-volume A,B] [--profiles DIR] [--flat [--tree DIR]] --out FILE.gcode.3mf [--gcode FILE] [--records FILE]\n  fab-slice golden CASE --golden DIR [--out DIR] [--layer N]\n  fab-slice estimate FILE.gcode --machine P --process P --filament P\n  fab-slice import FILE [--profiles DIR] [--into DIR]\n  fab-slice fab --doc FILE.fab.splash|FILE.cad.splash --machine P --process P --filament P [--filament P] [--map 1,2] [--colors A,B] [--flat [--tree DIR]] [--documents DIR] [--preview FILE.png] --out FILE.gcode.3mf [--gcode FILE]");
     std::process::exit(2)
 }
 
@@ -185,8 +185,10 @@ fn apply_sets(setup: &mut JobSetup, a: &Args) {
     }
 }
 
-fn golden_root(a: &Args) -> PathBuf {
-    a.one("--golden").map(PathBuf::from).or_else(|| std::env::var_os("FAB_GOLDEN").map(PathBuf::from)).unwrap_or_else(|| PathBuf::from("local/agent_state/fab/golden"))
+/// The reference run's folder, from the required `--golden DIR`. There is no
+/// default: the reference files are not part of the repository.
+fn golden_root(a: &Args) -> Result<PathBuf, String> {
+    a.one("--golden").map(PathBuf::from).ok_or_else(|| "missing --golden DIR: the folder holding the reference run (inputs/presets/, the reference gcode and result.json)".to_string())
 }
 
 /// Object centres from the reference run's summary (`result.json`).
@@ -217,7 +219,7 @@ fn reference_centres(dir: &Path) -> Vec<(f64, f64)> {
 
 fn cmd_golden(a: &Args, name: &str) -> Result<(), String> {
     let case = CASES.iter().find(|c| c.name == name).ok_or_else(|| format!("unknown case {name}; cases: {}", CASES.iter().map(|c| c.name).collect::<Vec<_>>().join(", ")))?;
-    let root = golden_root(a);
+    let root = golden_root(a)?;
     let pre = |f: &str| -> Result<Preset, String> { Ok(Preset::from_flat(load_preset_file(&root.join("inputs/presets").join(f))?)) };
     // `--installed DIR`: the job from the user's installed profiles (their
     // selected printer, process and first filaments) instead of the
@@ -378,7 +380,7 @@ fn cmd_bench(a: &Args) -> Result<(), String> {
     let root = golden_root(a);
     let pre = |f: &str| -> Result<Preset, String> {
         let p = Path::new(f);
-        let path = if p.exists() { p.to_path_buf() } else { root.join("inputs/presets").join(f) };
+        let path = if p.exists() { p.to_path_buf() } else { root.clone()?.join("inputs/presets").join(f) };
         Ok(Preset::from_flat(load_preset_file(&path)?))
     };
     let process = a.one("--process").unwrap_or_else(|| "process_0.20_standard.json".into());
@@ -504,7 +506,7 @@ fn cmd_bench_edit(a: &Args) -> Result<(), String> {
     let root = golden_root(a);
     let pre = |f: &str| -> Result<Preset, String> {
         let p = Path::new(f);
-        let path = if p.exists() { p.to_path_buf() } else { root.join("inputs/presets").join(f) };
+        let path = if p.exists() { p.to_path_buf() } else { root.clone()?.join("inputs/presets").join(f) };
         Ok(Preset::from_flat(load_preset_file(&path)?))
     };
     let process = a.one("--process").unwrap_or_else(|| "process_0.20_standard.json".into());

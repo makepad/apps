@@ -83,7 +83,7 @@ script_mod! {
                 picker := mod.widgets.ColorPicker{ width: Fill popover: false with_alpha: false }
                 buttons := View{
                     width: Fill height: Fit flow: Right spacing: 6
-                    material := mod.widgets.FabButton{ text: "Use the material's colour" }
+                    material := mod.widgets.FabButton{ text: "Use the design colour" }
                     Filler{}
                     done := mod.widgets.FabButton{ text: "Done" }
                 }
@@ -108,6 +108,11 @@ const SWATCH: f64 = 20.0;
 const WARN: f64 = 16.0;
 /// The slot dropdown: the spool's swatch, the tray and the material, the chevron.
 const SLOT_W: f64 = 112.0;
+/// The room a row keeps for the colour's name beside its swatch. A row narrower than that
+/// with its slot beside it puts the slot on a line of its own under the name.
+const NAME_MIN: f64 = 48.0;
+/// From the row's left edge to the name: the swatch and the gaps round it.
+const NAME_X: f64 = 4.0 + SWATCH + 6.0;
 /// A line of the note under a row (why an automatic pick moved).
 const NOTE_LINE: f64 = 14.0;
 
@@ -356,7 +361,7 @@ fn tip(state: &AppState, row: &Row, spot: Spot) -> String {
     }
     // An automatic pick moved for the print to change filament less says why.
     let moved = row.moved.as_ref().filter(|m| row.how == How::Auto && !m.stays).map(|mv| format!("Picked automatically for the {} nozzle: {}", m.layout.heads[mv.head].to_ascii_lowercase(), mv.why()));
-    let pick = if m.layout.live { "Press to pick a tray" } else { "Press to pick a tray; right-click to set what its tray holds" };
+    let pick = if m.layout.live && !state.print.target_printer().is_some_and(|p| p.virtual_printer) { "Press to pick a tray" } else { "Press to pick a tray; right-click to set what its tray holds" };
     match spot {
         Spot::Swatch => [Some(mapping_tip(row, &m.layout.heads)), moved].into_iter().flatten().collect::<Vec<_>>().join("\n"),
         Spot::Mapping => [Some(mapping_tip(row, &m.layout.heads)), moved, Some(pick.into())].into_iter().flatten().collect::<Vec<_>>().join("\n"),
@@ -403,7 +408,7 @@ impl FabColorLink {
         self.closing = false;
         cx.stop_timer(self.close_timer);
         if let Some(e) = self.editor(cx) {
-            e.label(cx, ids!(title)).set_text(cx, &format!("{}: its design colour (Normal view; the slice shows the spool's colour)", row.name));
+            e.label(cx, ids!(title)).set_text(cx, &format!("{}: model colour", row.name));
             e.color_picker(cx, ids!(picker)).set_color(cx, to_srgb(row.design));
             e.button(cx, ids!(buttons.material)).set_enabled(cx, row.over.is_some());
             e.as_view().animator_play(cx, ids!(open.on));
@@ -592,14 +597,14 @@ impl Widget for FabColorLink {
         }
         match event.hits(cx, self.area) {
             Hit::FingerDown(_) | Hit::FingerHoverOut(_) => self.hint.clear(cx, uid),
-            // What a tray holds is set by hand only while the printer is not reporting.
+            // An offline or virtual tray's contents can be set by hand.
             Hit::FingerUp(fe) if fe.device.mouse_button().is_some_and(|b| b.is_secondary()) => {
                 if !fe.is_over || fe.cancelled {
                     return;
                 }
                 let Some(state) = scope.data.get::<AppState>() else { return };
                 let m = &state.print.colors;
-                let tray = self.spots.iter().find(|(r, _, spot)| *spot == Spot::Mapping && r.contains(fe.abs)).and_then(|(_, name, _)| m.row(name)).and_then(|row| row.pos).filter(|_| !m.layout.live).and_then(|pos| m.layout.tray(pos));
+                let tray = self.spots.iter().find(|(r, _, spot)| *spot == Spot::Mapping && r.contains(fe.abs)).and_then(|(_, name, _)| m.row(name)).and_then(|row| row.pos).filter(|_| !m.layout.live || state.print.target_printer().is_some_and(|p| p.virtual_printer)).and_then(|pos| m.layout.tray(pos));
                 if let Some(t) = tray {
                     self.tray_editing = Some(t.pos);
                     self.hint.clear(cx, uid);
@@ -659,8 +664,21 @@ impl Widget for FabColorLink {
         }
         cx.begin_turtle(walk, Layout::flow_down());
         if let Some(row) = row {
-            let rect = cx.walk_turtle(Walk { width: Size::fill(), height: Size::Fixed(ROW_H), ..Walk::default() });
-            let (x, y) = (rect.pos.x, rect.pos.y);
+            let line = cx.walk_turtle(Walk { width: Size::fill(), height: Size::Fixed(ROW_H), ..Walk::default() });
+            let (x, y) = (line.pos.x, line.pos.y);
+            // Too narrow for the name beside the slot (with the mark between them and the warning
+            // column after): the slot takes a line of its own under the name, as wide as fits.
+            let stacked = line.size.x < NAME_X + NAME_MIN + 2.0 * (WARN + 6.0) + SLOT_W;
+            let (rect, slot) = if stacked {
+                let under = cx.walk_turtle(Walk { width: Size::fill(), height: Size::Fixed(ROW_H), ..Walk::default() });
+                let width = (x + line.size.x - WARN - 6.0 - (x + NAME_X)).clamp(0.0, SLOT_W);
+                (Rect { pos: line.pos, size: dvec2(line.size.x, 2.0 * ROW_H) },
+                    Rect { pos: dvec2(x + NAME_X, under.pos.y + 2.0), size: dvec2(width, ROW_H - 4.0) })
+            } else {
+                (line, Rect { pos: dvec2(x + line.size.x - WARN - 6.0 - SLOT_W, y + 2.0), size: dvec2(SLOT_W, ROW_H - 4.0) })
+            };
+            // The slot's line: the row's own, or the one under it.
+            let sy = slot.pos.y - 2.0;
             // A colour the slice prints nothing in shows as one the plate does not use.
             let alpha = if row.used && !state.print.unprinted.contains(&row.name) { 1.0 } else { 0.5 };
             let unassigned = row.used && row.unassigned();
@@ -683,7 +701,6 @@ impl Widget for FabColorLink {
             self.spots.push((sw, row.name.clone(), Spot::Swatch));
             // The slot, at the right: a dropdown of the spool's swatch, its tray and material. The
             // warning mark's column is kept on every row, so the slots of a list line up.
-            let slot = Rect { pos: dvec2(x + rect.size.x - WARN - 6.0 - SLOT_W, y + 2.0), size: dvec2(SLOT_W, ROW_H - 4.0) };
             self.draw_chip.fill = vec4(0.0, 0.0, 0.0, 0.0);
             self.draw_chip.ring = self.color_border;
             self.draw_chip.radius = 4.0;
@@ -692,14 +709,14 @@ impl Widget for FabColorLink {
             // Between the design and the slot: a ≠ mark where the spool's colour is not the
             // design's, else an arrow.
             if row.mismatch.is_some() {
-                let mark = Rect { pos: dvec2(slot.pos.x - WARN - 2.0, y + (ROW_H - WARN) * 0.5), size: dvec2(WARN, WARN) };
+                let mark = Rect { pos: dvec2(slot.pos.x - WARN - 2.0, sy + (ROW_H - WARN) * 0.5), size: dvec2(WARN, WARN) };
                 warning_mark(cx, &mut self.draw_chip, &mut self.draw_warn, mark, self.color_warning, "≠");
                 self.spots.push((mark, row.name.clone(), Spot::Differs));
             } else {
                 self.draw_small.color = self.color_dim;
-                self.draw_small.draw_abs(cx, dvec2(slot.pos.x - 14.0, y + 12.0), "→");
+                self.draw_small.draw_abs(cx, dvec2(slot.pos.x - 14.0, sy + 12.0), "→");
             }
-            let spool = Rect { pos: dvec2(slot.pos.x + 4.0, sw.pos.y), size: sw.size };
+            let spool = Rect { pos: dvec2(slot.pos.x + 4.0, sy + 8.0), size: sw.size };
             self.draw_chip.ring = self.color_error;
             self.draw_chip.ring_width = 1.5;
             // An unassigned tray is a red hollow square, never a grey spool.
@@ -718,7 +735,7 @@ impl Widget for FabColorLink {
             self.draw_chip.ring_width = 1.0;
             let tx = spool.pos.x + SWATCH + 6.0;
             let chevron_w = 14.0;
-            let slot_room = (slot.pos.x + SLOT_W - chevron_w - tx).max(0.0);
+            let slot_room = (slot.pos.x + slot.size.x - chevron_w - tx).max(0.0);
             self.draw_name.color = if unassigned { self.color_error } else { self.color_text };
             self.draw_name.color.w *= alpha;
             let tray = match row.pos.filter(|_| !row.unassigned()) {
@@ -726,18 +743,19 @@ impl Widget for FabColorLink {
                 None => "No tray".into(),
             };
             let tray = ellipsis(cx, &self.draw_name, &tray, slot_room);
-            self.draw_name.draw_abs(cx, dvec2(tx, y + 3.0), &tray);
+            self.draw_name.draw_abs(cx, dvec2(tx, sy + 3.0), &tray);
             self.draw_small.color = if unassigned { self.color_error } else if row.mismatch.is_some() { self.color_warning } else { self.color_dim };
             self.draw_small.color.w *= alpha;
             let material = if row.unassigned() { "pick one".into() } else { material_text(&row) };
-            let material = ellipsis(cx, &self.draw_small, &material, slot_room);
-            self.draw_small.draw_abs(cx, dvec2(tx, y + 20.0), &material);
+            let material = ellipsis(cx, &self.draw_small, &format!("Spool · {material}"), slot_room);
+            self.draw_small.draw_abs(cx, dvec2(tx, sy + 20.0), &material);
             self.draw_small.color = self.color_dim;
-            self.draw_small.draw_abs(cx, dvec2(slot.pos.x + SLOT_W - chevron_w + 2.0, y + 11.0), "▾");
+            self.draw_small.draw_abs(cx, dvec2(slot.pos.x + slot.size.x - chevron_w + 2.0, sy + 11.0), "▾");
             self.spots.push((slot, row.name.clone(), Spot::Mapping));
             // The name (and "base" for the part's own colour), and how the slot was chosen.
-            let name_x = sw.pos.x + SWATCH + 6.0;
-            let room = (slot.pos.x - WARN - 6.0 - name_x).max(0.0);
+            let name_x = x + NAME_X;
+            // Beside the slot, up to its mark; above it, up to the warning column.
+            let room = (if stacked { x + line.size.x - WARN - 6.0 } else { slot.pos.x - WARN - 6.0 } - name_x).max(0.0);
             let tag = self.base && base_tag(&row.name);
             let base_w = if tag { self.draw_small.prepare_single_line_run(cx, "base").map(|r| r.width_in_lpxs as f64).unwrap_or(0.0) + 6.0 } else { 0.0 };
             self.draw_name.color = self.color_text;
@@ -751,10 +769,10 @@ impl Widget for FabColorLink {
             }
             self.draw_small.color = self.color_dim;
             self.draw_small.color.w *= alpha;
-            let how = ellipsis(cx, &self.draw_small, how_word(&row), room);
+            let how = ellipsis(cx, &self.draw_small, &format!("Model · {}", how_word(&row)), room);
             self.draw_small.draw_abs(cx, dvec2(name_x, y + 20.0), &how);
             if !row.warnings.is_empty() {
-                let wr = Rect { pos: dvec2(x + rect.size.x - WARN - 4.0, y + (ROW_H - WARN) * 0.5), size: dvec2(WARN, WARN) };
+                let wr = Rect { pos: dvec2(x + line.size.x - WARN - 4.0, y + (ROW_H - WARN) * 0.5), size: dvec2(WARN, WARN) };
                 warning_mark(cx, &mut self.draw_chip, &mut self.draw_warn, wr, self.color_warning, "!");
                 self.spots.push((wr, row.name.clone(), Spot::Warn));
             }

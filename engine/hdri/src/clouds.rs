@@ -27,11 +27,9 @@ const CELL_M: f32 = 3000.0;
 const CIRRUS_CELL_FACTOR: f32 = 2.0;
 const CUMULUS_OCTAVES: u32 = 6;
 /// Far from the zenith one pixel spans many fine octaves, which alias into
-/// sparkle. Between these distances (in cells from the point overhead) the
-/// deck fades down to its broad octaves.
+/// sparkle. From 4 to 16 cells from the point overhead (cloud_sheets'
+/// `detail_at`) the deck fades down to its broad octaves.
 const BROAD_OCTAVES: u32 = 3;
-const DETAIL_FADE_START: f32 = 4.0;
-const DETAIL_FADE_END: f32 = 16.0;
 const SHADOW_OCTAVES: u32 = 4;
 const SHADOW_STEPS: usize = 4;
 /// Horizontal reach of the shadow march per unit of tan(sun zenith), in
@@ -427,22 +425,12 @@ fn deck_point(d: Vec3f, sin_el: f32, altitude: f32, cell: f32) -> Vec2f {
     vec2f(d.x * reach, d.z * reach)
 }
 
-/// 1 near the point overhead, 0 far away, for `fbm_lod`.
-fn detail_at(distance_cells: f32) -> f32 {
-    1.0 - smoothstep(DETAIL_FADE_START, DETAIL_FADE_END, distance_cells)
-}
+use crate::cloud_sheets::detail_at;
 
 /// fbm whose fine octaves fade out with `detail` (1 = all `fine` octaves,
-/// 0 = only the `broad` ones).
+/// 0 = only the `broad` ones): cloud_sheets' `lod_fbm`.
 fn fbm_lod(p: Vec2f, fine: u32, broad: u32, detail: f32, seed: u32) -> f32 {
-    if detail >= 1.0 {
-        return fbm2(p.x, p.y, fine, seed);
-    }
-    let low = fbm2(p.x, p.y, broad, seed);
-    if detail <= 0.0 {
-        return low;
-    }
-    low + (fbm2(p.x, p.y, fine, seed) - low) * detail
+    crate::cloud_sheets::lod_fbm(p, crate::cloud_sheets::Lod { fine, broad, detail }, seed)
 }
 
 /// Henyey-Greenstein phase function, normalised over the sphere (1/sr): the
@@ -461,11 +449,7 @@ fn x2_rise(amount: f32) -> f32 {
     0.5 * (1.0 - smoothstep(0.0, 0.1, amount))
 }
 
-/// Local copy (as in sky.rs), so no glob can make the name ambiguous.
-fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
-    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
+use crate::patterns::smooth as smoothstep;
 
 #[cfg(test)]
 mod tests {
@@ -798,7 +782,8 @@ mod env_tests {
                 overcast_key.radiance,
                 clear_key.radiance
             );
-            let at_sun = dir_from_az_el(180.0, el);
+            // (the disc's centre as it is drawn, lifted by the refraction)
+            let at_sun = clear.sky_discs().sun.expect("the disc is drawn").dir;
             assert!(
                 luminance(overcast.radiance(at_sun)) < 1.0e-2 * luminance(clear.radiance(at_sun)),
                 "el {el}: the disc shows through: {:?} vs {:?}",
@@ -810,19 +795,25 @@ mod env_tests {
 
     #[test]
     fn the_key_is_dimmed_by_the_unfaded_cover() {
-        // Partial cover, a 3 degree sun: the key follows cover_toward the sun,
-        // not the deck's faded alpha.
+        // Partial cover, a 3 degree sun: the key follows cover_toward over the
+        // sun's disc as it is drawn (its mean, lifted by the refraction), not
+        // the deck's faded alpha.
         let sun_dir = dir_from_az_el(180.0, 3.0);
         let clear_key = luminance(Env::new(&sun_at(0.0, 3.0)).sun().unwrap().radiance);
+        let seen = Env::new(&sun_at(0.0, 3.0)).sky_discs().sun.expect("the disc is drawn").dir;
         let mut unlike_the_faded_alpha = 0;
         for seed in 0..8 {
             let mut p = sun_at(0.5, 3.0);
             p.seed = seed;
             let layer = CloudLayer::new(&p.sky.clouds, seed, sun_dir).unwrap();
             let key = luminance(Env::new(&p).sun().unwrap().radiance) / clear_key;
-            let want = 1.0 - layer.cover_toward(sun_dir);
+            // (the cover's mean over the disc as it is drawn, per channel, as the key takes it)
+            let env = Env::new(&p);
+            let atmo = env.atmo.as_ref().unwrap();
+            let sun = atmo.sun_irradiance();
+            let want = luminance(sun * atmo.disc_mean(&|d| 1.0 - layer.cover_toward(d))) / luminance(sun);
             assert!((key - want).abs() < 1.0e-4, "seed {seed}: key {key}, 1 - cover {want}");
-            if ((1.0 - layer.sample(sun_dir).alpha) - want).abs() > 0.05 {
+            if ((1.0 - layer.sample(seen).alpha) - want).abs() > 0.05 {
                 unlike_the_faded_alpha += 1;
             }
         }
@@ -844,10 +835,14 @@ mod env_tests {
         let overcast_key = overcast.sun().expect("and stays the key, dimmed");
         assert!(luminance(clear_key.radiance) > 0.0);
         assert!(luminance(overcast_key.radiance) < 1.0e-3 * luminance(clear_key.radiance));
-        // What is left of the disc's texel is the airglow and the moonlit air
-        // in front of the cloud (about 1 % here), not the moon: before the
-        // cover was unfaded 60 % of it showed through.
-        let at_moon = dir_from_az_el(180.0, 3.0);
+        // What is left of the disc where it is lit is the airglow and the
+        // moonlit air in front of the cloud, not the moon: before the cover was
+        // unfaded 60 % of it showed through. The sun stands below the moon, so
+        // the moon is a crescent (147 degrees of phase) lit along its bottom:
+        // read there, 0.92 of its radius down. Its centre is the night side,
+        // lit by the earthshine alone (5e-5 of a full moon), and there the air
+        // in front of the deck is about 5 % of what shows.
+        let at_moon = dir_from_az_el(180.0, 3.0 - 0.92 * 0.26);
         assert!(
             luminance(overcast.radiance(at_moon)) < 5.0e-2 * luminance(clear.radiance(at_moon)),
             "{:?} vs {:?}",

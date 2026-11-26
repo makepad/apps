@@ -82,5 +82,7 @@ pub fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
     rail::script_mod(vm);
     tray::script_mod(vm);
     findings::script_mod(vm);
+    crate::req_list::script_mod(vm);
+    crate::bom::script_mod(vm);
     view::script_mod(vm)
 }

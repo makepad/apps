@@ -652,7 +652,8 @@ pub(crate) fn fill_region_edit(before: &ZoneFill, after: &ZoneFill) -> Option<Re
 /// Whole-item and regional fill edits, sorted by item. Global changes require a full build.
 fn edited_items(old: &Board, old_fills: &Arc<Vec<ZoneFill>>, new: &Board, new_fills: &Arc<Vec<ZoneFill>>) -> Option<(Vec<ItemId>, Vec<RegionEdit>)> {
     let delta = BoardDelta::between(old, new);
-    if delta.global {
+    // Cutouts also change the substrate mesh, which belongs to the whole board.
+    if delta.global || old.cutouts != new.cutouts {
         return None;
     }
     let mut edited: Vec<ItemId> = delta.added.into_iter().chain(delta.removed).chain(delta.changed).collect();

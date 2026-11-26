@@ -1,0 +1,22 @@
+// An example cut (clips, an app run, a transition, effects, a title, music) with canonical ids.
+use mod.flow.*
+use mod.cut.*
+
+let intro  = Clip{src: asset("ast_yqzlg4xa4mbgpzs6e2qsuqwhsu", "arev_5ab3f998fd4a7b6860a9337b9924be40ad341d12276e341079ce2093539c715f") in: 2.0 span: [0.0, 6.0] fit: @fill}
+let demo   = Clip{src: run("ast_fklvc3bvjnuijdg33d2uuitkbi", "arev_e2e0b2ddc168547400e68147bf9e0161866f9cad405c9f94a2a47a5dcfe955ac", "ast_rbzhbuglyvqk6nprgjwvl2o33q", "arev_925b7b93f54e7cfa717f5f213568db1fdaea73ef483fc3ebbad2ea042a533bd1") in: marker(@note_saved, -1.0) span: [5.0, 12.0]}
+let wipe   = Transition{a: intro.out(@frame) b: demo.out(@frame) effect: "" span: [5.0, 1.0]}
+let glow   = Fx{input: wipe.out(@frame) effect: "kit/bloom" p1: keys([0.0, 0.2], [3.0, 0.8, @ease_out]) span: [0.0, 17.0]}
+let title  = Title{text: "Notes, instantly" span: [1.0, 3.0] anchor: vec2(0.5, 0.8)}
+let top    = Stack{layers: [glow.out(@frame), title.out(@frame)]}
+let music  = AudioClip{src: asset("ast_qdyytgcolstqfb6rgnbpnwva3m", "arev_b07daf865cbe8c601af1644e4b1168662f5faad1224b8806370e61e13b2270c2") in: 30.0 span: [0.0, 17.0] gain: keys([0.0, 0.0], [1.0, 1.0], [16.0, 1.0], [17.0, 0.0])}
+let voice  = AudioClip{src: run("ast_fklvc3bvjnuijdg33d2uuitkbi", "arev_e2e0b2ddc168547400e68147bf9e0161866f9cad405c9f94a2a47a5dcfe955ac", "ast_rbzhbuglyvqk6nprgjwvl2o33q", "arev_925b7b93f54e7cfa717f5f213568db1fdaea73ef483fc3ebbad2ea042a533bd1") span: [5.0, 12.0] gain: 0.8}
+let out    = CutOutput{frame: top.out(@frame) audio: [conn(1, music.out(@audio)), conn(2, voice.out(@audio))]}
+
+Flow{
+    kind: @cut
+    label: "Notes launch 9:16"
+    output: {width: 1080 height: 1920 fps: 60}
+    duration: 17.0
+    bpm: 120
+    intro, demo, wipe, glow, title, top, music, voice, out
+}

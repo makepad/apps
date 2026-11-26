@@ -14,7 +14,7 @@ use fab_force::opt::cuts::{cross, dot, unit, Cut, ROOF_COS};
 use fab_force::opt::search::Score;
 use fab_force::opt::variants::{Family, Size, Variant};
 use fab_force::V3;
-use makepad_model_script::lang::edit::Edit;
+use makepad_model_script::lang::edit::{Anchor, Edit};
 use makepad_model_script::lang::Program;
 
 /// Printer mm to a part's model frame: the inverse of its `model_to_plate` (a rotation, a
@@ -221,7 +221,7 @@ pub fn edits(p: &Program, solid: usize, f: &Frame, cuts: &[Cut]) -> Result<(Vec<
         lets.push(code);
         i = j;
     }
-    let mut out: Vec<Edit> = lets.into_iter().map(|code| Edit::Add { code, before: Some(target.id.clone()) }).collect();
+    let mut out: Vec<Edit> = lets.into_iter().map(|code| Edit::Add { code, at: Anchor::Before(target.id.clone()) }).collect();
     if matches!(target.proto, "Difference") {
         out.extend(names.iter().map(|n| Edit::Operand { solid: target.id.clone(), code: n.clone() }));
     } else {
@@ -457,8 +457,8 @@ mod tests {
         assert_eq!(
             edits[..2],
             [
-                Edit::Add { code: "let upright_holes = m.hole_row({from: [-8mm, 22mm, -20mm] to: [8mm, 22mm, -20mm] count: 3 diameter: 8mm length: 8mm axis: [0, 0, 1]})".into(), before: Some("bracket".into()) },
-                Edit::Add { code: "let level_slots = for x in [-8mm, 0, 8mm] { m.pocket({center: [x, 0, 7.5mm] size: [6mm, 20mm] depth: 4mm axis: [0, 1, 0] corner: 1mm}) }".into(), before: Some("bracket".into()) },
+                Edit::Add { code: "let upright_holes = m.hole_row({from: [-8mm, 22mm, -20mm] to: [8mm, 22mm, -20mm] count: 3 diameter: 8mm length: 8mm axis: [0, 0, 1]})".into(), at: Anchor::Before("bracket".into()) },
+                Edit::Add { code: "let level_slots = for x in [-8mm, 0, 8mm] { m.pocket({center: [x, 0, 7.5mm] size: [6mm, 20mm] depth: 4mm axis: [0, 1, 0] corner: 1mm}) }".into(), at: Anchor::Before("bracket".into()) },
             ],
             "{code:#?}"
         );

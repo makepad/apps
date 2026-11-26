@@ -12,15 +12,16 @@
 //! A snapshot hook releases the host's mirrors before the replaced snapshot is retired. Hosts
 //! with work between draining and kicking call those methods separately; otherwise use `event`.
 
-use crate::{circuits_named, gesture_sample, job_sample, Cmd, Engine, Inbox, Mailbox, Outcome, RouteStart, Sample, Step, TaskResult, Ticket, Written};
+use crate::inbox::PlannerEdit;
+use crate::{circuits_named, gesture_sample, job_sample, Cmd, DocSet, Engine, Inbox, Job, Mailbox, Outcome, RouteStart, Sample, Step, TaskResult, Ticket, Written};
 use fab_elec_board::RuleMatrix;
-use fab_elec_core::{BoardId, ContentHash, DocId, ItemId};
+use fab_elec_core::{BoardId, CompId, ContentHash, DocId, ItemId, NetId};
 use fab_elec_circuit::CircuitOp;
 use fab_elec_design::{By, Design, DesignOp, TextEdit};
-use fab_elec_route::{route_channel, GestureId, GestureSample, JobId, JobPhase, JobStatus, Method, ProposalSource, RouteEvent, RouteHandle, RouteMetrics, RouteRequest, RouteWorker, Spawn};
+use fab_elec_route::{route_channel, GestureId, GestureSample, JobId, JobPhase, JobStatus, Method, ProposalSource, RouteEvent, RouteHandle, RouteMetrics, RouteRequest, RouteScope, RouteWorker, Spawn};
 use fab_elec_view::{DesignSnapshot, ElecLive, JobEnd, Refusal, RouteJobState, StageFlags, ViewAction};
 use makepad_widgets_core::makepad_platform::thread::{
-    CancellationToken, Class, SignalToUI, Strand, TaskHandle, TaskPool, ThreadOptions, ThreadSpawner,
+    checkpoint_when_due, CancellationToken, Class, SignalToUI, Strand, TaskHandle, TaskPool, ThreadOptions, ThreadSpawner,
     Ticket as TaskTicket, ToUIReceiver, ToUISender,
 };
 use makepad_widgets_core::{log, Cx};
@@ -86,6 +87,7 @@ struct RunningJob {
 }
 
 struct LiveGesture {
+    circuit: Option<(BoardId, Weak<fab_elec_circuit::Circuit>)>,
     id: GestureId,
     tag: u64,
     seq: u64,
@@ -154,6 +156,8 @@ pub struct Driver<X: Send + 'static> {
     snap: Option<Arc<DesignSnapshot>>,
     /// Per key, the planning task and the token that stops its queued tiles.
     fills: HashMap<(BoardId, ItemId, bool), (TaskHandle<()>, CancellationToken)>,
+    /// Per unit, the whole-board checks task and the generation it checks.
+    checks: HashMap<BoardId, (u64, TaskHandle<()>)>,
     /// Independent commit and preview evaluations; IDs keep late results from clearing newer handles.
     eval_task: Option<(u64, TaskHandle<()>)>,
     preview_task: Option<(u64, TaskHandle<()>)>,
@@ -177,6 +181,10 @@ pub struct Driver<X: Send + 'static> {
     value_preview: Option<u64>,
     router: Option<Router>,
     job_state: Option<Arc<RouteJobState>>,
+    parked: Option<(Ticket, JobId)>,
+    /// A start can already be in the inbox when the person cancels the parked job.
+    cancelled_wait: Option<JobId>,
+    place_notice: Option<String>,
     /// The running or ended job's last proposal's metrics (None until its last proposal), for
     /// the caller's answer: what it routed and left open.
     job_metrics: Option<RouteMetrics>,
@@ -198,6 +206,9 @@ pub struct Driver<X: Send + 'static> {
 impl<X: Send + 'static> Driver<X> {
     /// An empty host loop using the project's shared number and logged-entry counters.
     pub fn new(cx: &mut Cx, steps: Arc<AtomicU64>, logged: Arc<AtomicU64>) -> Self {
+        // Board computations on the engine strand (a large board's full fill) give the pool a turn
+        // when due. The strand takes its state out of its lock while a job runs.
+        fab_elec_core::pace::install_pace(|| { let _ = checkpoint_when_due(); });
         Self {
             mailbox: Mailbox::default(),
             strand: Strand::with_state(&cx.task_pool(), "elec engines", None::<Engine>),
@@ -205,6 +216,7 @@ impl<X: Send + 'static> Driver<X> {
             rx: ToUIReceiver::default(),
             snap: None,
             fills: HashMap::new(),
+            checks: HashMap::new(),
             eval_task: None,
             preview_task: None,
             waiting: false,
@@ -218,6 +230,7 @@ impl<X: Send + 'static> Driver<X> {
             value_preview: None,
             router: None,
             job_state: None,
+            parked: None, cancelled_wait: None, place_notice: None,
             job_metrics: None,
             pool: cx.task_pool(),
             spawner: cx.thread_spawner(),
@@ -273,6 +286,18 @@ impl<X: Send + 'static> Driver<X> {
         &self.logged
     }
 
+    /// Run metadata work in command order with accepted edits and bed changes.
+    pub fn on_strand(&self, job: impl FnOnce() + Send + 'static) {
+        self.strand.submit(Class::Visible, TaskTicket::none(), move |_| job()).detach();
+    }
+
+    /// The model's first plate notification may follow the initial empty engine.
+    pub fn attach_journal(&self, sink: Arc<dyn crate::JournalSink>) {
+        self.strand.submit(Class::Visible, TaskTicket::none(), move |state| {
+            if let Some(engine) = state.take() { *state = Some(engine.with_journal(Some(sink))); }
+        }).detach();
+    }
+
     /// The strand job that (re)loads the engine; the engine it replaces, with its log and
     /// preview, and `old` (the commands the old engine did not take and the snapshots retired
     /// for it) are dropped there, off the UI thread.
@@ -286,6 +311,13 @@ impl<X: Send + 'static> Driver<X> {
             *state = Some(engine);
             if let Some(engine) = state {
                 let _ = tx.0.send(Msg::Snapshot(engine.snapshot()));
+                // A design loaded board first owes its fills: a first step hands them to the pool.
+                if !fab_elec_design::engines::owed(engine.results()).is_empty() {
+                    let step = engine.step(Inbox::default(), &mut |snap| {
+                        let _ = tx.0.send(Msg::Snapshot(snap));
+                    });
+                    let _ = tx.0.send(Msg::Step(step));
+                }
             }
         }));
     }
@@ -306,6 +338,9 @@ impl<X: Send + 'static> Driver<X> {
         for (_, (task, tiles)) in self.fills.drain() {
             task.cancel();
             tiles.cancel();
+        }
+        for (_, (_, task)) in self.checks.drain() {
+            task.cancel();
         }
         self.fill_inputs.clear();
         if let Some((_, task)) = self.eval_task.take() {
@@ -336,6 +371,9 @@ impl<X: Send + 'static> Driver<X> {
             router.clear_shown = true;
         }
         self.job_state = None;
+        self.parked = None;
+        self.cancelled_wait = None;
+        self.place_notice = None;
         self.undo = None;
         self.redo = None;
         self.docs_out = None;
@@ -417,11 +455,20 @@ impl<X: Send + 'static> Driver<X> {
                 let seq = self.next_seq();
                 let running = self.router.as_mut().and_then(|router| router.job.as_mut())
                     .expect("the answer matches the running job");
-                self.mailbox.preview(job_sample(answer, running.by, seq).expect("a job answer"));
+                let refusal = answer.metrics.tune.as_ref().and_then(|result| result.as_ref().err())
+                    .or(answer.metrics.pair_refusal.as_ref()).cloned();
+                if refusal.is_some() {
+                    self.mailbox.retire_answer(answer);
+                } else {
+                    self.mailbox.preview(job_sample(answer, running.by, seq).expect("a job answer"));
+                }
                 running.seq = Some(seq);
                 if last {
                     self.job_metrics = metrics;
-                    self.mailbox.push(Cmd::CommitPreview { seq, tag: running.tag });
+                    self.mailbox.push(match refusal {
+                        Some(reason) => Cmd::RefusePreview { seq, tag: running.tag, reason },
+                        None => Cmd::CommitPreview { seq, tag: running.tag },
+                    });
                     running.ended = true;
                     let state = self.job_state.as_ref().expect("a running job has status");
                     self.job_state = Some(Arc::new(RouteJobState { end: Some(JobEnd::Finished), open, ..(**state).clone() }));
@@ -435,9 +482,11 @@ impl<X: Send + 'static> Driver<X> {
                     && router.gesture.as_ref().is_some_and(|gesture| gesture.id == id && !gesture.ended))) => {
                 let answer = Arc::new(p);
                 let seq = self.next_seq();
-                self.mailbox.preview(gesture_sample(answer.clone(), By::Person, seq).expect("a gesture answer"));
+                let mut preview = gesture_sample(answer.clone(), By::Person, seq).expect("a gesture answer");
                 let gesture = self.router.as_mut().and_then(|router| router.gesture.as_mut())
                     .expect("the answer matches the live gesture");
+                preview.circuits.extend(gesture.circuit.clone());
+                self.mailbox.preview(preview);
                 gesture.seq = seq;
                 gesture.state = GestureState::Answered;
                 self.live_preview = Some((seq, gesture.tag));
@@ -497,6 +546,16 @@ impl<X: Send + 'static> Driver<X> {
                     self.waiting = step.waiting;
                     self.undo = step.undo;
                     self.redo = step.redo;
+                    if let Some((ticket, id, unit)) = step.parked {
+                        self.parked = Some((ticket, id));
+                        self.job_metrics = None;
+                        self.job_state = Some(Arc::new(RouteJobState {
+                            status: JobStatus { job: id, unit, phase: JobPhase::WaitCase, current: None,
+                                routed: 0, failed: 0, total: 0, attempt: 0, retry: None, blocked_by: None },
+                            current_name: None, end: None, scope: Arc::new(RouteScope::Parts(Vec::new())),
+                            method: Method::default(), open: Arc::default(),
+                        }));
+                    }
                     self.answer(step.outcomes);
                     if let Some(docs) = step.docs {
                         self.docs_out = Some(docs);
@@ -515,10 +574,12 @@ impl<X: Send + 'static> Driver<X> {
                             }
                         }
                     }
-                    for RouteStart { ticket: _, by, job, base } in step.routes {
+                    for RouteStart { ticket, by, job, base } in step.routes {
+                        if self.cancelled_wait == Some(job.id()) { continue }
+                        if self.parked == Some((ticket, job.id())) { self.parked = None; }
                         if self.router().is_none() {
                             self.mailbox.push(Cmd::RefusePreview {
-                                seq: self.next_seq(), tag: job.job.tag(), reason: "the route worker could not start".into(),
+                                seq: self.next_seq(), tag: job.id().tag(), reason: "the route worker could not start".into(),
                             });
                             continue;
                         }
@@ -526,21 +587,31 @@ impl<X: Send + 'static> Driver<X> {
                         let router = self.router.as_mut().expect("the route worker started");
                         // The invoke that started this route kept the running job first (`keep_job`).
                         debug_assert!(router.job.as_ref().is_none_or(|old| old.ended), "a route starts only after the running job was kept");
-                        let (unit, hash) = (job.unit, base.hash);
+                        let (id, unit, hash) = (job.id(), job.unit(), base.hash);
                         router.held.insert(base.unit, base.hash);
-                        route_request(router, RouteRequest::Base(base));
-                        route_request(router, RouteRequest::Route(job.clone()));
                         router.job = Some(RunningJob {
-                            id: job.job, tag: job.job.tag(), unit, base: hash, by, reserved, seq: None, ended: false,
+                            id, tag: id.tag(), unit, base: hash, by, reserved, seq: None, ended: false,
                         });
                         self.job_metrics = None;
+                        // A place job's line counts parts from its first moment; its scope names them.
+                        let (phase, scope, method) = match &job {
+                            Job::Pair(job) => {
+                                let mut nets = vec![job.route.net];
+                                if let Some((mate, _)) = base.rules.partner(job.route.net) { nets.push(mate); }
+                                (JobPhase::Nets, RouteScope::Nets(nets), Method::default())
+                            }
+                            Job::Tune(job) => (JobPhase::Nets, RouteScope::Nets(vec![job.tune.net]), Method::default()),
+                            Job::Route(job) => (JobPhase::Nets, job.scope.clone(), job.method),
+                            Job::Place(job) => (JobPhase::Seed { round: 0 }, RouteScope::Parts(job.scope.clone()), Method::default()),
+                        };
+                        route_request(router, RouteRequest::Base(base));
+                        route_request(router, job.request());
                         self.job_state = Some(Arc::new(RouteJobState {
                             status: JobStatus {
-                                job: job.job, unit, phase: JobPhase::Nets, current: None, routed: 0, failed: 0, total: 0,
+                                job: id, unit, phase, current: None, routed: 0, failed: 0, total: 0,
                                 attempt: 0, retry: None, blocked_by: None,
                             },
-                            current_name: None, end: None, scope: Arc::new(job.scope.clone()),
-                            method: job.method, open: Arc::default(),
+                            current_name: None, end: None, scope: Arc::new(scope), method, open: Arc::default(),
                         }));
                     }
                     for job in step.fills {
@@ -580,6 +651,21 @@ impl<X: Send + 'static> Driver<X> {
                             Err(error) => log!("electronics fill: {error}"),
                         }
                     }
+                    for job in step.checks {
+                        let (unit, generation) = (job.task.unit, job.task.generation);
+                        let tx = self.rx.sender();
+                        // Off the strand: commands apply while a board's whole-board checks run.
+                        match cx.task_pool().submit_named(Class::Visible, "elec checks", move || {
+                            let _ = tx.send(Msg::Fill(job.run()));
+                        }) {
+                            Ok(task) => {
+                                if let Some((_, old)) = self.checks.insert(unit, (generation, task)) {
+                                    old.cancel();
+                                }
+                            }
+                            Err(error) => log!("electronics checks: {error}"),
+                        }
+                    }
                     for job in step.evals {
                         let id = job.id;
                         let preview = job.preview.is_some();
@@ -604,6 +690,11 @@ impl<X: Send + 'static> Driver<X> {
                             if self.fill_inputs.get(&key).is_some_and(|(g, r, p)| *g == *generation && r.ptr_eq(&Arc::downgrade(rules)) && p == preview) {
                                 self.fills.remove(&key);
                                 self.fill_inputs.remove(&key);
+                            }
+                        }
+                        TaskResult::Checks { unit, generation, .. } => {
+                            if self.checks.get(unit).is_some_and(|(g, _)| *g == *generation) {
+                                self.checks.remove(unit);
                             }
                         }
                         TaskResult::Eval(done) => {
@@ -642,6 +733,9 @@ impl<X: Send + 'static> Driver<X> {
         self.mailbox.push(cmd);
     }
 
+    /// The caller binds metadata to this ticket immediately before submitting its command.
+    pub fn next_ticket(&self) -> Ticket { Ticket(self.tickets + 1) }
+
     /// Queue a tool call and retain its caller; O(tool bytes) plus expected O(1) per call.
     pub fn invoke(&mut self, tool: String, args: Vec<(String, String)>, preview: bool, by: By, reply: Sender<Outcome>) {
         self.keep_job();
@@ -649,7 +743,9 @@ impl<X: Send + 'static> Driver<X> {
         let ticket = Ticket(self.tickets);
         self.replies.insert(ticket, reply);
         self.tools.insert(ticket, tool.clone());
-        let route = tool == "elec.route";
+        // A job waits for the drag: it starts on the board the drag leaves.
+        let route = tool == "elec.route"
+            || tool == "elec.place" && args.iter().any(|(key, mode)| key == "mode" && mode.trim_start_matches('@') == "place");
         let cmd = Cmd::Invoke { tool, args, preview, by, ticket };
         if let Some(router) = self.router.as_mut().filter(|router| route && router.gesture.as_ref().is_some_and(|g| !g.ended)) {
             log!("electronics route: waits for the drag on the board to end");
@@ -670,6 +766,17 @@ impl<X: Send + 'static> Driver<X> {
         self.replies.insert(ticket, reply);
         self.tools.insert(ticket, label.clone());
         self.mailbox.push(Cmd::Text { doc, base_rev, edits, group: None, label, tag: None, by, ticket: Some(ticket) });
+        self.kick();
+    }
+
+    /// Queue a document-set change as one undo step and route its outcome to its caller.
+    pub fn docs(&mut self, set: Vec<DocSet>, label: String, by: By, reply: Sender<Outcome>) {
+        self.keep_job();
+        self.tickets += 1;
+        let ticket = Ticket(self.tickets);
+        self.replies.insert(ticket, reply);
+        self.tools.insert(ticket, label.clone());
+        self.mailbox.push(Cmd::Docs { set, label, by, ticket: Some(ticket) });
         self.kick();
     }
 
@@ -696,6 +803,15 @@ impl<X: Send + 'static> Driver<X> {
     /// Deliver and forget only this step's replies; expected O(outcomes) per step.
     fn answer(&mut self, outcomes: Vec<(Ticket, Outcome)>) {
         for (ticket, outcome) in outcomes {
+            if self.parked.is_some_and(|(pending, _)| pending == ticket) {
+                self.parked = None;
+                self.job_state = None;
+            }
+            if let Outcome::Done { notes, .. } = &outcome {
+                let lines: Vec<_> = notes.iter().filter(|(key, _)| matches!(key.as_str(), "case" | "case_plan"))
+                    .map(|(_, words)| words.as_str()).collect();
+                if !lines.is_empty() { self.place_notice = Some(lines.join("\n")); }
+            }
             self.tools.remove(&ticket);
             if let Some(reply) = self.replies.remove(&ticket) {
                 let _ = reply.send(outcome);
@@ -710,7 +826,10 @@ impl<X: Send + 'static> Driver<X> {
         }
         let mailbox = self.mailbox.clone();
         let tx = self.rx.sender();
-        self.job = Some(self.strand.submit(Class::Interactive, TaskTicket::none(), move |state| {
+        // A person waits on commands and previews; a step that only merges task results (fills,
+        // checks, evaluations) is what the view shows next, not an answer to input.
+        let class = if mailbox.has_commands() { Class::Interactive } else { Class::Visible };
+        self.job = Some(self.strand.submit(class, TaskTicket::none(), move |state| {
             // A failed load leaves the inbox intact; only an engine may take it.
             if let Some(engine) = state {
                 let step = engine.step(mailbox.take(), &mut |snap| {
@@ -783,7 +902,24 @@ impl<X: Send + 'static> Driver<X> {
         if changed { self.show(cx) } else { None }
     }
 
+    fn end_wait(&mut self, id: JobId, discard: bool) -> bool {
+        if !self.parked.is_some_and(|(_, waiting)| waiting == id) { return false }
+        self.parked = None;
+        self.cancelled_wait = Some(id);
+        let seq = self.next_seq();
+        let tag = id.tag();
+        self.mailbox.push(if discard { Cmd::DiscardJob { seq, tag } } else {
+            Cmd::RefusePreview { seq, tag, reason: "placement stopped while waiting for the case; the brought parts were kept".into() }
+        });
+        if discard { self.job_state = None; }
+        else if let Some(state) = &mut self.job_state { Arc::make_mut(state).end = Some(JobEnd::Stopped); }
+        true
+    }
+
+    pub fn take_place_notice(&mut self) -> Option<String> { self.place_notice.take() }
+
     fn stop_job(&mut self, id: JobId) {
+        if self.end_wait(id, false) { return }
         let Some(router) = &mut self.router else { return };
         let Some(job) = router.job.as_mut().filter(|job| job.id == id && !job.ended) else { return };
         let (seq, reserved, tag) = (job.seq, job.reserved, job.tag);
@@ -799,7 +935,8 @@ impl<X: Send + 'static> Driver<X> {
 
     /// Before an edit while a route job runs: stop it and keep what it has routed as one undo step,
     /// so the edit lands on top of the route (the mailbox orders the keep's commit before the edit).
-    fn keep_job(&mut self) {
+    pub fn keep_job(&mut self) {
+        if let Some((_, id)) = self.parked { self.stop_job(id); }
         if let Some(id) = self.router.as_ref().and_then(|router| router.job.as_ref())
             .filter(|job| !job.ended).map(|job| job.id) {
             self.stop_job(id);
@@ -810,6 +947,27 @@ impl<X: Send + 'static> Driver<X> {
     pub fn act(&mut self, action: ViewAction) -> Option<ViewAction> {
         let mut host_action = None;
         match action {
+            ViewAction::Planned { call, action } => {
+                let edit = match *action {
+                    ViewAction::Ops { ops, place, label } => {
+                        self.keep_job();
+                        let circuits = self.snap.as_ref().map_or_else(Vec::new, |s| circuits_named(&s.design, &ops));
+                        PlannerEdit::Direct { edit: fab_elec_design::Resolved { ops, place, label }, circuits }
+                    }
+                    ViewAction::Land(tag) => {
+                        let seq = self.take_landing(tag).map(|(seq, _)| seq);
+                        PlannerEdit::Release { seq, tag }
+                    }
+                    other => return self.act(other),
+                };
+                self.tickets += 1;
+                self.mailbox.push(Cmd::Planner { call, edit, ticket: Ticket(self.tickets) });
+            }
+            ViewAction::PlanRefused(_) => return None,
+            ViewAction::Land(tag) => {
+                if self.live_preview.is_some_and(|(_, actual)| actual == tag) { return self.act(ViewAction::CommitPreview); }
+                return None
+            }
             ViewAction::Gesture(sample) => {
                 let Some(router) = self.router() else { return None };
                 let new = !router.gesture.as_ref().is_some_and(|gesture| gesture.id == sample.id && !gesture.ended);
@@ -818,6 +976,10 @@ impl<X: Send + 'static> Driver<X> {
                     let seq = self.next_seq();
                     let tag = sample.id.tag();
                     self.router.as_mut().expect("the router was made for this sample").gesture = Some(LiveGesture {
+                        circuit: match &sample.gesture.kind {
+                            fab_elec_route::GestureKind::Tune { circuit, .. } => Some((sample.gesture.unit, Arc::downgrade(circuit))),
+                            _ => None,
+                        },
                         id: sample.id, tag, seq, state: GestureState::Waiting, ended: false,
                     });
                     self.live_preview = Some((seq, tag));
@@ -846,23 +1008,18 @@ impl<X: Send + 'static> Driver<X> {
                     }
                 }
             }
-            ViewAction::Route { unit, nets, method, reroute } => {
-                // By name, as every route caller does, from the board the person saw. Nobody waits
-                // on the reply: the job's state in the snapshot carries its progress and outcome.
-                let board = self.snap.as_ref().and_then(|snap| snap.design.unit(unit)).and_then(|u| u.board.clone());
-                let args = route_args(unit, &nets, method, reroute, board.as_deref())?;
-                let (reply, _) = std::sync::mpsc::channel();
-                self.invoke("elec.route".into(), args, false, By::Person, reply);
-            }
+            // The app submits these presses through its catalog and binds the job's ticket there.
+            ViewAction::Route { .. } | ViewAction::Place { .. } => return None,
             ViewAction::StopRoute(id) => {
                 self.stop_job(id);
             }
             ViewAction::DiscardRoute(id) => {
+                if self.end_wait(id, true) { return None }
                 let Some(router) = &mut self.router else { return None };
                 let Some(job) = router.job.as_ref().filter(|job| job.id == id && !job.ended) else { return None };
                 let (seq, tag) = (job.seq.unwrap_or(job.reserved), job.tag);
                 route_request(router, RouteRequest::Cancel(id));
-                self.mailbox.push(Cmd::RefusePreview { seq, tag, reason: "the route was discarded".into() });
+                self.mailbox.push(Cmd::DiscardJob { seq, tag });
                 router.job = None;
                 self.job_state = None;
             }
@@ -929,6 +1086,19 @@ impl<X: Send + 'static> Driver<X> {
         self.send_deferred();
         self.kick();
         host_action
+    }
+
+    fn take_landing(&mut self, tag: u64) -> Option<(u64, u64)> {
+        self.live_preview.take_if(|(_, actual)| *actual == tag)
+            .or_else(|| self.ended_preview.take_if(|(_, actual)| *actual == tag))
+    }
+
+    /// Refuse only the sample released by this pane.
+    pub fn refuse_landing(&mut self, tag: u64, reason: &str) {
+        if let Some((seq, _)) = self.take_landing(tag) {
+            self.mailbox.push(Cmd::RefusePreview { seq, tag, reason: reason.into() });
+            self.kick();
+        }
     }
 
     /// Refuse the view's live sample instead of committing it (the host takes no edit now): the
@@ -999,13 +1169,12 @@ impl<X: Send + 'static> Driver<X> {
     }
 }
 
-/// The `elec.route` arguments of a pane's route: the unit, the nets by name on `board` (none: every
-/// unrouted net) and the method unless it is the default. None when nets are named and the board is
-/// gone. O(nets).
-fn route_args(unit: BoardId, nets: &[fab_elec_core::NetId], method: Method, reroute: bool, board: Option<&fab_elec_board::Board>) -> Option<Vec<(String, String)>> {
+/// The pane's Route call, naming the selected nets from the shown design. An empty selection
+/// routes every unrouted net. A selection whose board is gone cannot be submitted.
+pub fn route_action(design: Option<&Design>, unit: BoardId, nets: &[NetId], method: Method, reroute: bool) -> Option<(&'static str, Vec<(String, String)>)> {
     let mut args = vec![("unit".to_owned(), unit.0.to_string())];
     if !nets.is_empty() {
-        let board = board?;
+        let board = design?.unit(unit)?.board.as_deref()?;
         let names: Vec<&str> = nets.iter().filter_map(|net| board.nets.get(net.ix())).map(|net| net.name.as_str()).collect();
         args.push(("nets".to_owned(), names.join(",")));
     }
@@ -1016,14 +1185,31 @@ fn route_args(unit: BoardId, nets: &[fab_elec_core::NetId], method: Method, rero
     if reroute {
         args.push(("reroute".to_owned(), "true".to_owned()));
     }
-    Some(args)
+    Some((crate::edit_actions::ROUTE.name, args))
+}
+
+/// The pane's Place call, naming the board and the selected component paths from the shown design.
+pub fn place_action(design: Option<&Design>, unit: BoardId, parts: &[CompId], all: bool, free_panel: bool) -> Option<(&'static str, Vec<(String, String)>)> {
+    let unit = design?.unit(unit)?;
+    let mut args = vec![("unit".to_owned(), unit.name.clone()), ("mode".to_owned(), "@place".to_owned())];
+    if !parts.is_empty() {
+        let names: Vec<_> = parts.iter().filter_map(|id| unit.circuit.comps.get(id.ix())).map(|c| c.path.as_str()).collect();
+        args.push(("parts".to_owned(), names.join(",")));
+    }
+    if all {
+        args.push(("all".to_owned(), "true".to_owned()));
+    }
+    if free_panel {
+        args.push(("panel".to_owned(), "@free".to_owned()));
+    }
+    Some(("elec.place", args))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fab_elec_board::{Anchor, BoardOp, Factories};
-    use fab_elec_core::{Canon, ContentHash, LayerId, NetId, P};
+    use fab_elec_board::{Anchor, BoardOp, Factories, Origin, Track};
+    use fab_elec_core::{mm, Canon, ContentHash, LayerId, NetId, PadIx, Path, P};
     use fab_elec_design::{Design, DesignOp, Resolved};
     use fab_elec_fixtures::ledctl;
     use fab_elec_route::{scope_nets, Gesture, GestureKind, ProposalId, RouteInbox, RouteMetrics, RouteProposal, RouteScope, SampleCause, SampleRefused, Tier, Work};
@@ -1155,8 +1341,290 @@ mod tests {
         driver.drain(cx, &mut |_, _, _| false);
     }
 
+    const ATTACHED: &str = r#"track( "P", // the hand-drawn continuation
+  "F.Cu",  0.20mm, [[7mm 19mm], [7mm 25mm], "b:1"] )"#;
+
+    fn tune_driver() -> (Driver<()>, Cx, Receiver<()>, JoinHandle<()>, DocId, String) {
+        let pcb = format!(
+            r#"board("tune")
+outline([[[0mm 0mm] [40mm 0mm] [40mm 30mm] [0mm 30mm] [0mm 0mm]]])
+place("a", [10mm 5mm])
+place("b", [10mm 25mm])
+track("P", "F.Cu", 0.2mm, ["a:1", [7mm 5mm], [7mm 19mm]])
+{ATTACHED}
+track("N", "F.Cu", 0.2mm, ["a:2", [13mm 5mm], [13mm 10mm], [16mm 13mm], [16mm 17mm], [13mm 20mm], [13mm 25mm], "b:2"])
+"#
+        );
+        let mut sources = fab_elec_lang::Sources::new();
+        sources
+            .add(
+                "tune.ckt.splash",
+                r#"use mod.elec.*
+let e = mod.elec
+let p = e.net({name: "P"})
+let n = e.net({name: "N"})
+let x = e.net({name: "X"})
+let q = e.net({name: "Q"})
+let loose = e.net({name: "LOOSE"})
+let a = e.r(1kohm, p, n)
+let b = e.r(1kohm, p, n)
+let c = e.r(1kohm, q, x)
+let d = e.r(1kohm, q, x)
+let f = e.r(1kohm, q, x)
+e.match_length([p,n], {tol: 0.01mm})
+e.match_length([n,x], {tol: 0.02mm})
+"#,
+            )
+            .unwrap();
+        let doc = sources.add("tune.pcb.splash", pcb.clone()).unwrap();
+        let evaluated = fab_elec_lang::evaluate(&sources, &fab_elec_lang::std_libs()).unwrap();
+        let (design, docs) = crate::Docs::from_evaluated(sources, evaluated);
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let (steps, logged) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let mut driver = Driver::<()>::new(&mut cx, steps.clone(), logged.clone());
+        driver.load(&mut cx, None, move |_| {
+            Engine::new(design, Arc::new(Factories::new()), steps, logged, "tune".into())
+                .with_docs(docs)
+                .with_app_tools()
+        });
+        finish(&mut driver, &mut cx);
+        let (woke, wakes) = mpsc::channel();
+        let (handle, inbox) = route_channel(move || {
+            let _ = woke.send(());
+        });
+        let thread = std::thread::spawn(move || RouteWorker::new(inbox, Arc::new(OwnThreads)).run());
+        driver.router = Some(Router::new(handle));
+        (driver, cx, wakes, thread, doc, pcb)
+    }
+
+    #[test]
+    fn tune_gesture_releases_one_step_and_refuses_a_third_unplaced_pin() {
+        let (mut driver, mut cx, wakes, thread, _, _) = tune_driver();
+        let before = driver.snap().unwrap().clone();
+        let unit = &before.design.units[0];
+        let board = unit.board.as_ref().unwrap();
+        let track = &board.tracks[0];
+        let point = track.path.segs[0].end();
+        let start = Anchor::Track { id: track.id, at: fab_elec_core::OnTrack { seg: 1, frac: 0 } };
+        let press = |driver: &mut Driver<()>, cx: &mut Cx, id: GestureId| {
+            let circuit = driver.snap().unwrap().design.units[0].circuit.clone();
+            let kind = GestureKind::Tune { track: track.id, from: 1, to: 2, circuit };
+            let mut gesture = Gesture::new(kind, unit.id, board.generation, start, point, track.layer);
+            gesture.net = Some(track.net);
+            gesture.cursor = P::mm(6., 19.);
+            driver.act(ViewAction::Gesture(GestureSample { id, seq: 1, gesture }));
+            show(driver, cx, &wakes, |_, snap| snap.preview_tag == Some(id.tag()));
+            assert_ne!(driver.snap().unwrap().live().units[0].board.as_ref().unwrap().tracks, board.tracks);
+        };
+        let id = GestureId(41);
+        press(&mut driver, &mut cx, id);
+        driver.act(ViewAction::CommitPreview);
+        settle(&mut driver, &mut cx);
+        assert_ne!(driver.snap().unwrap().design.units[0].board.as_ref().unwrap().tracks, board.tracks);
+        driver.undo();
+        settle(&mut driver, &mut cx);
+        assert_eq!(driver.snap().unwrap().design.units[0].board.as_ref().unwrap().tracks, board.tracks);
+        assert!(driver.undo_step().is_none());
+
+        let id = GestureId(42);
+        press(&mut driver, &mut cx, id);
+        let text = before.docs.as_ref().unwrap().texts.iter().find(|d| d.name == "tune.ckt.splash").unwrap();
+        let end = text.text.len() as u32;
+        let edit = TextEdit { doc: text.doc, span: end..end, text: "let spare = e.r(1kohm, p, x)\n".into() };
+        let (reply, _rx) = mpsc::channel();
+        driver.text(text.doc, text.rev, vec![edit], "Add spare pin".into(), By::Person, reply);
+        let deadline = Instant::now() + HANG;
+        loop {
+            driver.event(&mut cx, &mut |_, _, _| false);
+            if driver.snap().unwrap().design.units[0].circuit.comp("spare").is_some() { break; }
+            assert!(Instant::now() < deadline, "the unplaced part evaluates");
+            std::thread::yield_now();
+        }
+        let snap = driver.snap().unwrap();
+        let pins = snap.design.units[0].circuit.comps.iter().flat_map(|c| &c.conns).filter(|(_, n)| *n == track.net).count();
+        assert_eq!(pins, 3);
+        assert_eq!(snap.design.units[0].board.as_ref().unwrap().content_hash(), board.content_hash());
+        let step = driver.undo_step();
+        assert!(step.is_some());
+        driver.act(ViewAction::CommitPreview);
+        settle(&mut driver, &mut cx);
+        let snap = driver.show(&mut cx).unwrap();
+        assert_eq!(snap.design.units[0].board.as_ref().unwrap().tracks, board.tracks);
+        assert_eq!(driver.undo_step(), step);
+        let reason = snap.last_refusal.as_ref().unwrap();
+        assert_eq!(reason.sample, Some(id.tag()));
+        assert!(reason.reason.contains("circuit changed after this edit was planned"), "{}", reason.reason);
+        drop(driver);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn catalog_tune_commits_the_meander_and_junction_and_undo_restores_both() {
+        use fab_elec_circuit::CheckKind;
+        let (mut driver, mut cx, wakes, thread, doc, pcb) = tune_driver();
+        let before = driver.snap().unwrap().clone();
+        let findings =
+            |snap: &DesignSnapshot| snap.violations.value.iter().filter(|v| v.kind == CheckKind::Length).count();
+        assert_eq!(findings(&before), 1);
+        let invoke = |driver: &mut Driver<()>, cx: &mut Cx, net: &str, fields: &[(&str, &str)]| {
+            let (reply, recv) = mpsc::channel();
+            let mut args = vec![("net".into(), net.to_owned())];
+            args.extend(fields.iter().map(|&(k, v)| (k.into(), v.into())));
+            driver.invoke("elec.net.tune".into(), args, false, By::Ai { turn: 1, call: 1 }, reply);
+            finish(driver, cx);
+            let mut answer = None;
+            show(driver, cx, &wakes, |_, _| {
+                answer = recv.try_recv().ok();
+                answer.is_some()
+            });
+            answer.unwrap()
+        };
+        for (net, fields, reason) in [
+            ("LOOSE", &[][..], "no length match"),
+            ("N", &[][..], "P, N / N, X"),
+            ("Q", &[("target", "60")][..], "branched"),
+            ("P", &[("target", "1mm")][..], "already at or above"),
+        ] {
+            let Outcome::Refused(r) = invoke(&mut driver, &mut cx, net, fields) else {
+                panic!("{net} should be refused")
+            };
+            assert!(r.text.contains(reason), "{}", r.text);
+            assert!(driver.undo_step().is_none());
+        }
+        let Outcome::Done { notes, .. } =
+            invoke(&mut driver, &mut cx, "P", &[("at", "[7mm 12mm]"), ("amplitude", "1")])
+        else {
+            panic!("expected a tune commit")
+        };
+        let snap = driver.snap().unwrap();
+        let board = snap.design.units[0].board.as_ref().unwrap();
+        let original = before.design.units[0].board.as_ref().unwrap();
+        let p = board.net("P").unwrap();
+        let n = board.net("N").unwrap();
+        let read = fab_elec_board::length::net_lengths(board, &snap.of(&snap.conn, board.unit).unwrap().value, &[p, n]);
+        assert!((read[&p].nm - read[&n].nm).abs() <= i64::from(mm(0.01)));
+        assert_eq!(findings(snap), 0);
+        assert!(notes.contains(&("reached".into(), format!("{:.6}", read[&p].nm as f64 / 1e6))));
+        assert_ne!(board.tracks[1].ends[0], original.tracks[1].ends[0]);
+        assert_eq!(board.anchor_pos(board.tracks[1].ends[0]), Some(P::mm(7., 19.)));
+        let text = |snap: &DesignSnapshot| {
+            snap.docs.as_ref().unwrap().texts.iter().find(|d| d.doc == doc).unwrap().text.clone()
+        };
+        let saved = text(snap);
+        assert_eq!(saved.matches("track(").count(), 3);
+        assert!(saved.contains(ATTACHED));
+        let reloaded = fab_elec_lang::board_doc::lower(doc, &saved, &snap.design.units[0].circuit, None).unwrap();
+        assert_eq!(reloaded.board.tracks, board.tracks);
+        driver.undo();
+        settle(&mut driver, &mut cx);
+        let undone = driver.snap().unwrap();
+        assert_eq!(undone.design.units[0].board.as_ref().unwrap().tracks, original.tracks);
+        assert_eq!(text(undone).as_ref(), pcb);
+        assert_eq!(findings(undone), 1);
+        assert!(driver.undo_step().is_none());
+        drop(driver);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn catalog_pair_route_commits_both_pad_anchored_legs_and_undo_restores_the_source() {
+        use fab_elec_circuit::CheckKind;
+        let mut sources = fab_elec_lang::Sources::new();
+        sources.add("pair.ckt.splash", r#"use mod.elec.*
+let e = mod.elec
+let p = e.net({name: "P"})
+let n = e.net({name: "N"})
+let a = e.r(1kohm, p, n)
+let b = e.r(1kohm, p, n)
+e.pair(p, n, {gap: 0.6mm})
+"#).unwrap();
+        let pcb = r#"board("pair")
+outline([[[0mm 0mm] [40mm 0mm] [40mm 30mm] [0mm 30mm] [0mm 0mm]]])
+place("a", [10mm 5mm])
+place("b", [25mm 20mm], {rot: -90deg})
+"#;
+        let doc = sources.add("pair.pcb.splash", pcb).unwrap();
+        let evaluated = fab_elec_lang::evaluate(&sources, &fab_elec_lang::std_libs()).unwrap();
+        let (design, docs) = crate::Docs::from_evaluated(sources, evaluated);
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let (steps, logged) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let mut driver = Driver::<()>::new(&mut cx, steps.clone(), logged.clone());
+        driver.load(&mut cx, None, move |_| {
+            Engine::new(design, Arc::new(Factories::new()), steps, logged, "pair".into())
+                .with_docs(docs).with_app_tools()
+        });
+        finish(&mut driver, &mut cx);
+        let (woke, wakes) = mpsc::channel();
+        let (handle, inbox) = route_channel(move || { let _ = woke.send(()); });
+        let thread = std::thread::spawn(move || RouteWorker::new(inbox, Arc::new(OwnThreads)).run());
+        driver.router = Some(Router::new(handle));
+        let route = |driver: &mut Driver<()>, cx: &mut Cx, to: &str, waypoints: &str| {
+            let (reply, recv) = mpsc::channel();
+            let args = [("pair", "N"), ("from", "a:1"), ("to", to), ("waypoints", waypoints)]
+                .map(|(k,v)| (k.to_owned(), v.to_owned())).to_vec();
+            driver.invoke("elec.pair.route".into(), args, false, By::Ai { turn: 1, call: 1 }, reply);
+            finish(driver, cx);
+            let mut answer = None;
+            show(driver, cx, &wakes, |_, _| { answer = recv.try_recv().ok(); answer.is_some() });
+            match answer {
+                Some(Outcome::Done { notes, .. }) => notes,
+                Some(Outcome::Refused(r)) => panic!("pair route refused: {}", r.text),
+                _ => panic!("expected the pair to commit"),
+            }
+        };
+        let notes = route(&mut driver, &mut cx, "b:2", "[[10 20]]");
+        let snap = driver.snap().unwrap();
+        let board = snap.design.units[0].board.as_ref().unwrap();
+        assert_eq!(board.tracks.len(), 2);
+        let pair = board.pairs[0];
+        let spacing = pair.gap.unwrap() + (board.tracks[0].w + board.tracks[1].w) / 2;
+        assert_eq!((board.tracks[0].net, board.tracks[1].net), (pair.p, pair.n));
+        assert!(board.tracks.iter().all(|t| t.ends.iter().all(|a| matches!(a, fab_elec_board::Anchor::Pad { .. }))));
+        let lengths = fab_elec_board::length::net_lengths(board, &snap.of(&snap.conn, board.unit).unwrap().value, &[pair.p,pair.n]);
+        let skew = (lengths[&pair.p].nm - lengths[&pair.n].nm).abs();
+        assert!(skew > 0);
+        assert!(notes.contains(&("skew".into(), format!("{:.6}", skew as f64 / 1e6))));
+        assert!(snap.violations.value.iter().all(|v| !matches!(v.kind, CheckKind::PairGap | CheckKind::Clearance | CheckKind::Short)));
+        let text = |snap: &DesignSnapshot| snap.docs.as_ref().unwrap().texts.iter().find(|d| d.doc == doc).unwrap().text.clone();
+        let written = text(snap);
+        assert_eq!(written.matches("track(").count(), 2);
+        let reloaded = fab_elec_lang::board_doc::lower(doc, &written, &snap.design.units[0].circuit, None).unwrap();
+        assert_eq!(reloaded.board.tracks, board.tracks);
+        driver.undo();
+        settle(&mut driver, &mut cx);
+        let undone = driver.snap().unwrap();
+        assert!(undone.design.units[0].board.as_ref().unwrap().tracks.is_empty());
+        assert_eq!(text(undone).as_ref(), pcb);
+        assert!(driver.undo_step().is_none());
+
+        // The same room, one lattice step apart. Only a verified worker offer
+        // gets a report through the catalog and commits its two tracks.
+        for short_by in [1, 0] {
+            let x = 10. + f64::from(2 * spacing - short_by) / 1e6;
+            let notes = route(&mut driver, &mut cx, &format!("[{x:.6} 13]"),
+                &format!("[[10 15] [20 15] [20 7] [{x:.6} 7]]"));
+            let board = driver.snap().unwrap().design.units[0].board.as_ref().unwrap();
+            assert_eq!(board.tracks.len(), 2);
+            let field = |key: &str| notes.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+            if short_by == 1 {
+                assert_eq!(field("reason"), Some("\"the pair's own earlier run\""));
+                assert!(field("blocked_leg").is_some() && field("need").is_some());
+                assert!(board.tracks.iter().all(|t| t.path.end().y < fab_elec_core::mm(13.)));
+            } else {
+                assert!(field("blocked_leg").is_none() && field("reason").is_none());
+                assert!(board.tracks.iter().all(|t| t.path.end().y == fab_elec_core::mm(13.)));
+            }
+            driver.undo();
+            settle(&mut driver, &mut cx);
+            assert_eq!(text(driver.snap().unwrap()).as_ref(), pcb);
+        }
+        drop(driver);
+        thread.join().unwrap();
+    }
+
     fn route_answer(source: ProposalSource, base_hash: ContentHash, ops: Vec<BoardOp>) -> RouteProposal {
         RouteProposal {
+            pair: None,
             id: ProposalId(0),
             source,
             unit: BoardId(0),
@@ -1179,18 +1647,17 @@ mod tests {
     fn a_panes_route_names_its_nets_method_and_reroute_for_the_resolver() {
         let design = ledctl();
         let unit = design.units.iter().find(|unit| unit.board.is_some()).expect("fixture setup: ledctl has a board unit");
-        let board = unit.board.as_deref().expect("the unit's board");
         let nets = [NetId(0), NetId(1)];
         for (method, named, reroute) in [(Method::Interactive, &nets[..], false), (Method::Organic, &[][..], false), (Method::Organic, &nets[..], true)] {
-            let args = route_args(unit.id, named, method, reroute, Some(board)).expect("the board is there");
-            let crate::Plan::Route(job) = crate::route_plan(&design, None, "elec.route", &args).expect("the pane's arguments resolve") else {
+            let (name, args) = route_action(Some(&design), unit.id, named, method, reroute).expect("the board is there");
+            let crate::Plan::Job(Job::Route(job)) = crate::route_plan(&design, None, name, &args).expect("the pane's arguments resolve") else {
                 panic!("elec.route plans a route job");
             };
             assert_eq!((job.unit, job.method, job.reroute), (unit.id, method, reroute), "the job routes the pane's board by the pane's method, re-routing when asked ({args:?})");
             let want = if named.is_empty() { RouteScope::All } else { RouteScope::Nets(named.to_vec()) };
             assert_eq!(job.scope, want, "named nets are routed by name, none means every unrouted net");
         }
-        assert!(route_args(unit.id, &nets, Method::Organic, false, None).is_none(), "named nets on a board that is gone route nothing");
+        assert!(route_action(None, unit.id, &nets, Method::Organic, false).is_none(), "named nets on a board that is gone route nothing");
     }
 
     #[test]
@@ -1222,6 +1689,12 @@ mod tests {
         assert_eq!(driver.undo_step(), Some(1), "a dropped receiver does not stop the invoked commit's step");
         assert!(driver.replies.is_empty() && driver.tools.is_empty(), "a closed caller is removed after its outcome");
         assert!(!driver.busy(), "the completed step leaves the driver idle despite the closed reply channel");
+
+        let (reply, receiver) = std::sync::mpsc::channel();
+        driver.docs(vec![DocSet::Add { name: "first.req.splash".into(), text: "".into() }], "Add requirements".into(), By::Person, reply);
+        finish(&mut driver, &mut cx);
+        assert!(matches!(receiver.try_recv(), Ok(Outcome::Refused(r)) if r.label == "Add requirements")
+            && driver.replies.is_empty() && driver.tools.is_empty(), "a Docs refusal reaches its caller and releases its ticket");
 
         driver.act(ViewAction::Preview { notes: vec![], tag: 101, ops: vec![], place: vec![], label: "first pane".into() });
         finish(&mut driver, &mut cx);
@@ -1980,7 +2453,12 @@ mod tests {
             scope_nets(board, &conn.value, &RouteScope::All).into_iter().take(2).collect::<Vec<_>>()
         };
         assert_eq!(nets.len(), 2, "fixture setup: ledctl has two open nets");
+        let ticket = driver.next_ticket();
         assert!(driver.act(ViewAction::Route { unit, nets: nets.clone(), method: Method::Interactive, reroute: false }).is_none(), "a route is not a broadcast action");
+        assert_eq!(driver.next_ticket(), ticket, "only the host submits the Route press");
+        let (name, args) = route_action(driver.snap().map(|s| s.design.as_ref()), unit, &nets, Method::Interactive, false).unwrap();
+        let (reply, receiver) = mpsc::channel();
+        driver.invoke(name.into(), args, false, By::Person, reply);
         finish(&mut driver, &mut cx);
         let id = driver.router.as_ref().and_then(|router| router.job.as_ref()).map(|job| job.id)
             .expect("the pane's route starts a job on ledctl's exact fills");
@@ -2011,8 +2489,275 @@ mod tests {
         let snap = driver.snap().expect("the committed route is shown");
         assert!(snap.proposal.is_none(), "the finished route is committed, not previewed");
         assert_ne!(board_hash(&snap.design), before, "the finished route commits its copper");
+        assert!(matches!(receiver.try_recv(), Ok(Outcome::Done { by: By::Person, .. })), "the board's Route answers its own ticket");
         drop(driver);
         thread.join().expect("the route worker exits when its channel closes");
+    }
+
+    /// Why: the board strip's Update (the person's Place) and the AI's `elec.place` with `@place`
+    /// run a real place job through the tools a Fab session registers: the circuit's parts the
+    /// board does not place yet go on legal spots inside the outline (a part the circuit fixes to a
+    /// spot on that spot), the job shows as placing
+    /// while it runs, its final commits as one undo step, the AI's answer counts what it placed,
+    /// and with nothing left to place the call is refused with what to do instead.
+    #[test]
+    fn a_place_job_brings_the_circuit_parts_onto_the_board() {
+        use fab_elec_board::placement::{placed_courtyard, PlacementIndex};
+        use fab_elec_route::place::Pose;
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let steps = Arc::new(AtomicU64::new(0));
+        let logged = Arc::new(AtomicU64::new(0));
+        for (cased, part, cancel) in [(true, "D1", Some(false)), (true, "D1", Some(true)),
+            (false, "D1", None), (true, "R1", None)] {
+            let mut empty = ledctl();
+            let board = Arc::make_mut(empty.units[0].board.as_mut().unwrap());
+            board.placed.clear();
+            board.tracks.clear();
+            board.vias.clear();
+            board.zones.clear();
+            board.reindex();
+            let unit = board.unit;
+            let generation = board.generation;
+            let mut driver = Driver::<()>::new(&mut cx, Arc::default(), Arc::default());
+            driver.load(&mut cx, None, move |_| Engine::new(empty, Arc::new(Factories::new()), Arc::default(),
+                Arc::default(), "place".into()).with_app_tools());
+            finish(&mut driver, &mut cx);
+            let (handle, inbox) = route_channel(|| {});
+            driver.router = Some(Router::new(handle));
+            driver.push(Cmd::CaseFindings { unit, generation, run: 1, cased, findings: vec![] });
+            let (reply, receiver) = mpsc::channel();
+            driver.invoke("elec.place".into(), vec![("mode".into(), "@place".into()), ("parts".into(), part.into())],
+                false, By::Person, reply);
+            finish(&mut driver, &mut cx);
+            let state = driver.job_state.as_ref().expect("placing has a line immediately");
+            let id = state.status.job;
+            if let Some(discard) = cancel {
+                assert_eq!(state.status.phase, JobPhase::WaitCase);
+                assert!(take_work(&inbox).is_empty());
+                assert!(driver.snap().unwrap().design.units[0].board.as_ref().unwrap().placed.len() == 1);
+                driver.act(if discard { ViewAction::DiscardRoute(id) } else { ViewAction::StopRoute(id) });
+                driver.push(Cmd::CaseOutcome { unit, stamp: driver.snap().unwrap().design.generation, reason: None });
+                driver.kick();
+                finish(&mut driver, &mut cx);
+                assert!(take_work(&inbox).is_empty(), "the late case cannot restart a cancelled wait");
+                assert!(matches!(receiver.try_recv(), Ok(Outcome::Refused(_))));
+                assert_eq!(driver.snap().unwrap().design.units[0].board.as_ref().unwrap().placed.len(), usize::from(!discard));
+                assert_eq!(driver.undo_step().is_none(), discard);
+                assert!(driver.redo_step().is_none());
+            } else {
+                assert!(matches!(state.status.phase, JobPhase::Seed { .. }));
+                assert!(take_work(&inbox).iter().any(|work| matches!(work, Work::Request(RouteRequest::Place(job)) if job.add.len() == 1)));
+                assert!(driver.undo_step().is_none());
+            }
+        }
+        let taken = ["lamps[0].r", "lamps[1].r", "lamps[2].r", "btn.sw"];
+        let mut design = ledctl();
+        // The button is fixed to a spot: where it stood, turned a half. Brought, it lands there
+        // instead of in the row under the board.
+        let spot = design.units[0].board.as_deref().and_then(|b| b.placed.iter().find(|p| p.path == taken[3]))
+            .map(|p| fab_elec_board::Spot { comp: p.comp, at: p.at, rot: Some(p.rot.add(fab_elec_core::Angle::HALF)) })
+            .expect("fixture setup: btn.sw is placed");
+        Arc::make_mut(&mut design.units[0].circuit).intents.push(fab_elec_circuit::Intent::Fixed {
+            t: fab_elec_circuit::Target::Comp(spot.comp), edge: None, at: Some(spot.at), rot: spot.rot,
+        });
+        let board = Arc::make_mut(design.units[0].board.as_mut().expect("fixture setup: ledctl unit 0 has a board"));
+        board.spots = vec![spot];
+        board.placed.retain(|p| !taken.contains(&p.path.as_str()));
+        board.tracks.clear();
+        board.vias.clear();
+        // Without pours no fill job stands between a commit and the next job's start, so every
+        // wait below is on a worker event (`show`).
+        board.zones.clear();
+        // A hand-drawn track from lamps[3].d to its resistor, the LED moved a quarter of the way
+        // to the board's middle, off where its nets pull it: placing the LED again takes the
+        // track off, counted against the LED, and one undo brings it back.
+        let led = board.placed.iter().position(|p| p.path == "lamps[3].d").expect("fixture setup: lamps[3].d is placed");
+        let middle = board.outline_bbox().center();
+        let at = board.placed[led].at;
+        board.placed[led].at = at.add(P::new((middle.x - at.x) / 4, (middle.y - at.y) / 4));
+        let (led_id, led_ref) = (board.placed[led].id, board.placed[led].refdes.clone());
+        let resistor = board.placed.iter().find(|p| p.path == "lamps[3].r").expect("fixture setup: lamps[3].r is placed");
+        let (pad, net, far) = board.placed[led].pad_nets.iter().enumerate().find_map(|(k, net)| {
+            let net = (*net)?;
+            let j = resistor.pad_nets.iter().position(|n| *n == Some(net))?;
+            Some((PadIx(k as _), net, (resistor.id, PadIx(j as _), resistor.pad_at(PadIx(j as _))?)))
+        }).expect("fixture setup: the LED and its resistor share a net");
+        let from = board.placed[led].pad_at(pad).expect("fixture setup: the LED's pad");
+        let id = board.alloc_id();
+        board.tracks.push(Track {
+            id, net, layer: LayerId::F_CU, w: mm(0.25), widths: None, path: Path::new(from).line(far.2),
+            ends: [Anchor::Pad { placed: led_id, pad }, Anchor::Pad { placed: far.0, pad: far.1 }], locked: false, origin: Origin::Authored,
+        });
+        board.reindex();
+        let mut driver = Driver::<()>::new(&mut cx, steps.clone(), logged.clone());
+        driver.load(&mut cx, None, move |_| {
+            Engine::new(design, Arc::new(Factories::new()), steps, logged, "place".into()).with_app_tools()
+        });
+        finish(&mut driver, &mut cx);
+        let (woke, wakes) = mpsc::channel();
+        let (handle, inbox) = route_channel(move || {
+            let _ = woke.send(());
+        });
+        let thread = std::thread::spawn(move || RouteWorker::new(inbox, Arc::new(OwnThreads)).run());
+        driver.router = Some(Router::new(handle));
+        let unit = BoardId(0);
+        let placed_inside = |snap: &DesignSnapshot| {
+            let board = snap.design.unit(unit).and_then(|u| u.board.as_deref()).expect("the board stays");
+            let outside: Vec<_> = PlacementIndex::new(board, None).outside_outline().into_iter().map(|(p, _)| p.path.clone()).collect();
+            taken.iter().all(|path| board.placed.iter().any(|p| p.path == *path)) && outside.is_empty()
+        };
+        let on_spot = |snap: &DesignSnapshot| {
+            let board = snap.design.unit(unit).and_then(|u| u.board.as_deref()).expect("the board stays");
+            board.placed_of(spot.comp).is_some_and(|p| spot.holds(p))
+        };
+
+        let ticket = driver.next_ticket();
+        assert!(driver.act(ViewAction::Place { unit, parts: vec![], all: false, free_panel: false }).is_none(), "a place is not a broadcast action");
+        assert_eq!(driver.next_ticket(), ticket, "only the host submits the Place press");
+        let (name, args) = place_action(driver.snap().map(|s| s.design.as_ref()), unit, &[], false, false).unwrap();
+        let (reply, receiver) = mpsc::channel();
+        driver.invoke(name.into(), args, false, By::Person, reply);
+        finish(&mut driver, &mut cx);
+        assert!(driver.router.as_ref().and_then(|router| router.job.as_ref()).is_some(), "the person's Place starts a job");
+        show(&mut driver, &mut cx, &wakes, |driver, snap| {
+            snap.job.as_ref().and_then(|state| state.end) == Some(JobEnd::Finished) && driver.undo_step().is_some()
+        });
+        let snap = driver.snap().expect("the placed board is shown");
+        let state = snap.job.as_ref().expect("the finished job keeps its state");
+        assert!(matches!(state.status.phase, JobPhase::Seed { .. } | JobPhase::Match { .. }) && (state.status.total, state.status.routed) == (4, 4),
+            "the job shows as placing the four parts: {:?}", state.status);
+        assert!(placed_inside(snap), "the four parts are committed on legal spots inside the outline");
+        assert!(on_spot(snap), "the button fixed to a spot is brought onto it, turned as the spot says");
+        assert!(snap.proposal.is_none(), "the finished place is committed, not previewed");
+        assert!(matches!(receiver.try_recv(), Ok(Outcome::Done { by: By::Person, .. })), "the board's Place answers its own ticket");
+
+        driver.undo();
+        settle(&mut driver, &mut cx);
+        assert!(!placed_inside(driver.snap().expect("the undone board is shown")), "one undo takes the whole placement back");
+        let (reply, receiver) = mpsc::channel();
+        driver.invoke("elec.place".into(), vec![("mode".into(), "@place".into())], false, By::Ai { turn: 1, call: 1 }, reply);
+        finish(&mut driver, &mut cx);
+        let mut answer = None;
+        show(&mut driver, &mut cx, &wakes, |_, _| {
+            answer = answer.take().or_else(|| receiver.try_recv().ok());
+            answer.is_some()
+        });
+        let Some(Outcome::Done { notes, .. }) = answer else { panic!("the AI's place answers Done") };
+        assert!(notes.iter().any(|(key, value)| key == "placed" && value == "4") && notes.iter().any(|(key, _)| key == "wirelength_mm"),
+            "the answer counts the parts placed and their wirelength: {notes:?}");
+        assert!(notes.iter().all(|(key, _)| key != "panel_held"), "bringing parts holds none of the four: {notes:?}");
+        assert!(placed_inside(driver.snap().expect("the AI's placement is shown")), "the AI's place lands the parts as the person's did");
+        assert!(on_spot(driver.snap().expect("the AI's placement is shown")), "the AI's place brings the button onto its spot too");
+
+        let (reply, receiver) = mpsc::channel();
+        driver.invoke("elec.place".into(), vec![("mode".into(), "@place".into())], false, By::Ai { turn: 1, call: 2 }, reply);
+        finish(&mut driver, &mut cx);
+        assert!(matches!(receiver.try_recv(), Ok(Outcome::Refused(why)) if why.text.contains("all: true")),
+            "with every part placed the call is refused and says how to place again");
+
+        // Every part now stands inside the outline. A whole-board place keeps the panel poses.
+        let snap = driver.snap().expect("the AI's placement is shown");
+        let whole = board_hash(&snap.design);
+        let placed_unit = snap.design.unit(unit).unwrap();
+        let board = placed_unit.board.as_deref().unwrap();
+        let panel: Vec<_> = placed_unit.circuit.comps.iter().filter(|c| c.part.body.as_ref().is_some_and(|b| !b.ports.is_empty()))
+            .map(|c| (c.id, Pose::from(board.placed_of(c.id).unwrap()))).collect();
+        let committed = |driver: &Driver<()>| driver.snap().and_then(|snap| snap.design.unit(unit)?.board.clone()).expect("the board stays");
+        let (reply, receiver) = mpsc::channel();
+        driver.invoke("elec.place".into(), vec![("mode".into(), "@place".into()), ("all".into(), "true".into())], false, By::Ai { turn: 1, call: 3 }, reply);
+        finish(&mut driver, &mut cx);
+        let mut answer = None;
+        show(&mut driver, &mut cx, &wakes, |_, _| {
+            answer = answer.take().or_else(|| receiver.try_recv().ok());
+            answer.is_some()
+        });
+        let Some(Outcome::Done { notes, .. }) = answer else { panic!("placing the whole board answers Done") };
+        let lamps: Vec<_> = (0..8).map(|i| format!("\"lamps[{i}]\"")).collect();
+        let lamps = format!("{{copies: [{}] parts_each: 2 ", lamps.join(" "));
+        assert!(notes.iter().any(|(key, rows)| key == "conformed" && rows.contains(&lamps)),
+            "the answer includes the eight lamps as one group: {notes:?}");
+        let reason = "the panel parts the case is built round stay where they stand; panel: @free places them too";
+        let expected = format!("{{count: {} why: \"{reason}\"}}", panel.len());
+        assert!(notes.iter().any(|(key, value)| key == "panel_held" && value == &expected),
+            "the answer explains how many standing panel parts were held: {notes:?}");
+        let placed = committed(&driver);
+        for (comp, pose) in panel {
+            assert_eq!(Pose::from(placed.placed_of(comp).unwrap()), pose, "held panel part {comp:?}");
+        }
+        let courts = placed.placed.iter().fold(fab_elec_core::BBox::EMPTY, |b, p| b.union(placed_courtyard(p).bbox()));
+        let area = |b: fab_elec_core::BBox| b.width() as f64 * b.height() as f64;
+        let share = format!("{:.3}", area(courts) / area(placed.outline_bbox()));
+        assert!(notes.iter().any(|(key, value)| key == "box_share" && value == &share),
+            "the answer gives the placed courtyard box's share of the outline: {notes:?}");
+        driver.undo();
+        settle(&mut driver, &mut cx);
+        assert_eq!(board_hash(&driver.snap().expect("the undone board is shown").design), whole, "one undo takes the whole placement back");
+
+        let before = committed(&driver);
+        let hand = before.tracks.iter().find(|t| t.id == id).cloned().expect("the hand-drawn track is on the board");
+        let led_at = before.placed_item(led_id).map(|p| (p.at, p.rot, p.side));
+        let mut args = vec![("mode".into(), "@place".into()), ("parts".into(), "lamps[3].d".into())];
+        let (reply, receiver) = mpsc::channel();
+        driver.invoke("elec.place".into(), args.clone(), false, By::Ai { turn: 1, call: 4 }, reply);
+        finish(&mut driver, &mut cx);
+        assert!(matches!(receiver.try_recv(), Ok(Outcome::Refused(why)) if why.text.contains("held: 1") && why.text.contains(reason)),
+            "naming just the LED explains the hold and how to free it");
+        args.push(("panel".into(), "@free".into()));
+        let (reply, receiver) = mpsc::channel();
+        driver.invoke("elec.place".into(), args, false, By::Ai { turn: 1, call: 5 }, reply);
+        finish(&mut driver, &mut cx);
+        let mut answer = None;
+        show(&mut driver, &mut cx, &wakes, |_, _| {
+            answer = answer.take().or_else(|| receiver.try_recv().ok());
+            answer.is_some()
+        });
+        let Some(Outcome::Done { notes, .. }) = answer else { panic!("placing the LED again answers Done") };
+        let counted = format!("[{{part: \"{led_ref}\" tracks: 1 vias: 0}}]");
+        assert!(notes.iter().any(|(key, value)| key == "hand_drawn_removed" && *value == counted),
+            "the answer counts the hand-drawn track against the LED: {notes:?}");
+        let placed = committed(&driver);
+        assert!(placed.placed_item(led_id).map(|p| (p.at, p.rot, p.side)) != led_at && placed.tracks.iter().all(|t| t.id != id),
+            "the LED moves and its hand-drawn track goes");
+        driver.undo();
+        settle(&mut driver, &mut cx);
+        let back = committed(&driver);
+        assert_eq!(back.tracks.iter().find(|t| t.id == id), Some(&hand), "one undo brings the hand-drawn track back as it was");
+        assert_eq!(back.placed_item(led_id).map(|p| (p.at, p.rot, p.side)), led_at, "and the LED where it stood");
+        drop(driver);
+        thread.join().expect("the route worker exits when its channel closes");
+    }
+
+    #[test]
+    fn a_place_answer_explains_the_choice_when_the_leds_have_seats() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let steps = Arc::new(AtomicU64::new(0));
+        let logged = Arc::new(AtomicU64::new(0));
+        let design = ledctl();
+        let unit = &design.units[0];
+        let parts = unit.board.as_ref().unwrap().placed.iter()
+            .filter(|p| unit.circuit.comps[p.comp.ix()].part.kind != fab_elec_parts::PartKind::Led)
+            .map(|p| p.path.as_str()).collect::<Vec<_>>().join(" ");
+        let mut driver = Driver::<()>::new(&mut cx, steps.clone(), logged.clone());
+        driver.load(&mut cx, None, move |_| Engine::new(design, Arc::new(Factories::new()), steps, logged, "place".into()).with_app_tools());
+        finish(&mut driver, &mut cx);
+        let (woke, wakes) = mpsc::channel();
+        let (handle, inbox) = route_channel(move || { let _ = woke.send(()); });
+        let thread = std::thread::spawn(move || RouteWorker::new(inbox, Arc::new(OwnThreads)).run());
+        driver.router = Some(Router::new(handle));
+        let (reply, receiver) = mpsc::channel();
+        let args = vec![("mode".into(), "@place".into()), ("panel".into(), "@free".into()), ("parts".into(), parts)];
+        driver.invoke("elec.place".into(), args, false, By::Ai { turn: 1, call: 1 }, reply);
+        finish(&mut driver, &mut cx);
+        let mut answer = None;
+        show(&mut driver, &mut cx, &wakes, |_, _| {
+            answer = receiver.try_recv().ok();
+            answer.is_some()
+        });
+        let Some(Outcome::Done { notes, .. }) = answer else { panic!("placing with standing LEDs answers Done") };
+        let line = &notes.iter().find(|(key, _)| key == "seat_guard").expect("the answer explains the seat guard").1;
+        assert!((line.contains("seats kept:") || line.contains("plain kept:")) && line.contains(" mm against "), "{line}");
+        drop(driver);
+        thread.join().unwrap();
     }
 
     /// Why: stopping a job commits exactly its shown partial while the worker is still held.

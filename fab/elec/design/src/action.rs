@@ -289,6 +289,8 @@ pub enum Risk {
     Edit,
     /// Writes files outside the project or talks to a device or a service.
     External,
+    /// Writes the person's own library outside the project, such as a price entry. The person confirms each entry.
+    Library,
 }
 
 static CATALOG: Mutex<&'static [ActionDef]> = Mutex::new(&[]);

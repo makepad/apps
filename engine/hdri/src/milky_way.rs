@@ -217,7 +217,7 @@ fn ridged(x: f32, y: f32, z: f32, octaves: f32, full: usize, seed: u32) -> f32 {
         let w = (octaves - i as f32).clamp(0.0, 1.0);
         let r = if w > 0.0 {
             let o = 17.13 * i as f32;
-            let n = perlin3(p[0] + o, p[1] + 0.37 * o, p[2] - 0.61 * o, seed.wrapping_add((i as u32).wrapping_mul(0x9e37_79b9)));
+            let n = perlin3(p[0] + o, p[1] + 0.37 * o, p[2] - 0.61 * o, crate::noise::octave_seed(seed, i as u32));
             mean + w * ((1.0 - n.abs()).powi(MW_RIDGE_POW) - mean)
         } else {
             mean

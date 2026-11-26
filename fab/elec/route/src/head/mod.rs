@@ -24,10 +24,12 @@
 mod drag;
 mod finish;
 pub mod obstacles;
+mod pair;
 mod push;
 mod ride;
 mod shove;
 mod stretch;
+mod tune;
 pub mod via;
 
 use self::obstacles::{HullCache, WorldObstacles};
@@ -244,7 +246,7 @@ pub fn answer_counted(
     state.hulls.clear_added();
     let dragged = matches!(gesture.kind, GestureKind::DragSeg { .. } | GestureKind::DragCorner { .. });
     let stretched = matches!(gesture.kind, GestureKind::DragParts | GestureKind::DragVia(_));
-    if !matches!(gesture.kind, GestureKind::Route) && !dragged && !stretched {
+    if !matches!(gesture.kind, GestureKind::Route | GestureKind::RoutePair { .. } | GestureKind::Tune { .. }) && !dragged && !stretched {
         return (Answer::Refused(SampleCause::Unsupported, "only drawing copper and dragging tracks, parts and vias are answered yet"), 0);
     }
     // Drags push in either mode (`drag`, `stretch`); a route pushes in Shove (`push`).
@@ -256,6 +258,16 @@ pub fn answer_counted(
         || gesture.start != Anchor::Free && board.anchor_pos(gesture.start) != Some(gesture.start_at)
     {
         return (Answer::Refused(SampleCause::Invalid, "what you grabbed has moved"), 0);
+    }
+    if let GestureKind::Tune { track, from, to, circuit } = &gesture.kind {
+        let result = tune::answer(base, world, sample, id, *track, *from, *to, circuit, started);
+        state.newest = Some((board.generation, sample.seq));
+        return (Answer::Proposal(result), 0);
+    }
+    if let GestureKind::RoutePair { mate, mate_start, mate_start_at } = gesture.kind {
+        let result = pair::answer(base, world, sample, id, (mate, mate_start, mate_start_at), started);
+        state.newest = Some((board.generation, sample.seq));
+        return (Answer::Proposal(result), 0);
     }
     let mut queries = 0;
     if dragged || stretched {
@@ -478,6 +490,7 @@ pub(super) fn proposal(
         }
     }
     RouteProposal {
+        pair: None,
         id, source, unit: base.unit, base_generation: base.board.generation, base_hash: base.hash,
         ops, checked: None, metrics, verified: collisions.is_empty(), collisions, open: Vec::new(), head: Some(head),
         solve_us: started.elapsed().as_micros().min(u32::MAX as u128) as u32,

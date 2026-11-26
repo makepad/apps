@@ -39,13 +39,15 @@ use crate::connect::{pieces, ConnItem, Connectivity};
 use crate::geom::Copper;
 use crate::index::{piece_clearance, PKey, Piece, PieceIndex, PieceKind};
 use crate::ops::BoardDelta;
+use crate::placement::PlacementIndex;
+pub use crate::placement::bands_overlap;
 use crate::rules::{RuleMatrix, RuleRef};
 use crate::text::{footprint_text, text_bound, text_strokes};
 use crate::zone::{class_of, TileKey, ZoneFill};
 use crate::{Anchor, Board, ItemKind, Placed, Track, Zone, ARC_ERR};
 use fab_elec_circuit::{CheckKind, Measure, Violation};
 use fab_elec_core::{
-    clearance, BBox, Canon, CompId, CompRef, FeatureRef, Index, ItemId, LayerId, LayerSet, NetId, Nm, PadIx, PolySet,
+    clearance, Angle, BBox, Canon, CompId, CompRef, FeatureRef, Index, ItemId, LayerId, LayerSet, NetId, Nm, PadIx, PolySet,
     Seg, Sel, Severity, Shape, Side, Writer, P,
 };
 use fab_elec_core::{dist::core_distance, shape::Core};
@@ -146,6 +148,11 @@ fn check_pair_with(
     }
     let gap = gap();
     short_of(gap, need.gap).then(|| PairFault { gap, need, at: overlap_centre(ab.inflate(need.gap), bb) })
+}
+
+/// The pair-gap verdict for two route-world copper pieces, using the same measurement as DRC.
+pub fn check_pair_gap(rules: &RuleMatrix, a: &Copper, b: &Copper) -> Option<PairFault> {
+    check_pair_gap_with(rules, a, b, || clearance(&a.shape, &b.shape))
 }
 
 /// A pair-gap fault between track pieces on one layer, using the caller's exact distance.
@@ -364,7 +371,7 @@ pub struct DrcResult {
 /// Connectivity findings are replaced in full: changed joins can affect items outside the delta's
 /// region, including a via whose joined-layer count changes through a zone fill.
 fn is_connectivity(k: &CheckKind) -> bool {
-    matches!(k, CheckKind::Short | CheckKind::Unconnected | CheckKind::DanglingVia | CheckKind::PourNeck)
+    matches!(k, CheckKind::Short | CheckKind::Unconnected | CheckKind::DanglingVia | CheckKind::PourNeck | CheckKind::Length | CheckKind::Skew)
 }
 
 /// The previous list with an update folded in (matched and sorted by content id).
@@ -793,6 +800,62 @@ fn courtyard_violation(board: &Board, a: &crate::Placed, b: &crate::Placed, at: 
     .hint("move one part")
 }
 
+fn through_violation(board: &Board, drilled: &crate::Placed, b: &crate::Placed, at: P) -> Violation {
+    Violation::new(
+        CheckKind::CourtyardOverlap,
+        Severity::Error,
+        Some(board.unit),
+        vec![Sel::Item(board.unit, drilled.id), Sel::Item(board.unit, b.id)],
+        "courtyard",
+        format!("through-hole pads of {} come out under the courtyard of {} on the other side", drilled.refdes, b.refdes),
+    )
+    .at(at)
+    .hint("move one part")
+}
+
+fn hole_violation(board: &Board, part: &crate::Placed, hole: ItemId, at: P) -> Violation {
+    let name = board.holes.iter().find(|h| h.id == hole).map_or("", |h| h.name.as_str());
+    let what = if name.is_empty() { "a board hole".to_string() } else { format!("the hole {name}") };
+    Violation::new(
+        CheckKind::CourtyardOverlap,
+        Severity::Error,
+        Some(board.unit),
+        vec![Sel::Item(board.unit, part.id), Sel::Item(board.unit, hole)],
+        "courtyard",
+        format!("the courtyard of {} covers {what}", part.refdes),
+    )
+    .at(at)
+    .hint("move the part off the hole")
+}
+
+fn outline_violation(board: &Board, part: &crate::Placed, at: P) -> Violation {
+    Violation::new(
+        CheckKind::CourtyardOverlap,
+        Severity::Error,
+        Some(board.unit),
+        vec![Sel::Item(board.unit, part.id)],
+        "courtyard",
+        format!("the courtyard of {} leaves the board outline", part.refdes),
+    )
+    .at(at)
+    .hint("move it inside, or fix it to an edge if it overhangs on purpose")
+}
+
+fn spot_violation(board: &Board, part: &crate::Placed, spot: &crate::Spot) -> Violation {
+    let (at, rot) = spot.pose(part.rot);
+    let pose = |at: P, rot: Angle| format!("({}, {}) mm turned {}°", mm3(at.x), mm3(at.y), rot.degrees());
+    Violation::new(
+        CheckKind::FixedSpot,
+        Severity::Error,
+        Some(board.unit),
+        vec![Sel::Item(board.unit, part.id)],
+        "fixed spot",
+        format!("{} is fixed at {} but stands at {}", part.refdes, pose(at, rot), pose(part.at, part.rot)),
+    )
+    .at(part.at)
+    .hint("move it back to its spot, or change the spot in the circuit")
+}
+
 struct SilkFault {
     gap: Nm,
     at: P,
@@ -910,6 +973,8 @@ pub fn drc(
     let mut pairs: Vec<(&Sel, &Sel)> = Vec::new();
     let mut pair_gap_pairs: Vec<(&Sel, &Sel)> = Vec::new();
     for (i, a) in pcs.iter().enumerate() {
+        // Gives the host's pool a turn when due: a large board's full check ran for seconds.
+        fab_elec_core::pace::pace();
         let ab = boxes[i];
         if !in_scope(&ab) {
             continue;
@@ -937,6 +1002,7 @@ pub fn drc(
     pairs.sort();
     pairs.dedup();
     for (sx, sy) in pairs {
+        fab_elec_core::pace::pace();
         // the worst piece pair of the two items decides the finding; pieces further apart than
         // any clearance cannot be closer than theirs
         let mut worst: Option<PairFault> = None;
@@ -964,6 +1030,7 @@ pub fn drc(
     pair_gap_pairs.sort();
     pair_gap_pairs.dedup();
     for (sx, sy) in pair_gap_pairs {
+        fab_elec_core::pace::pace();
         // All segments choose the same worst fault in full and regional runs.
         let mut worst: Option<PairFault> = None;
         for &i in &by_sel[sx] {
@@ -1016,6 +1083,7 @@ pub fn drc(
     edge_items.sort();
     edge_items.dedup();
     for s in edge_items {
+        fab_elec_core::pace::pace();
         let mut worst: Option<(Nm, P)> = None;
         for &i in &by_sel[s] {
             if let Some(g) = piece_edge(&pcs[i], boxes[i]) {
@@ -1047,6 +1115,7 @@ pub fn drc(
     let copper = board.copper_set();
     let mut via_in_pad_pairs = Vec::new();
     for (i, (item, shape, _)) in drills.iter().enumerate() {
+        fab_elec_core::pace::pace();
         let ConnItem::Via(id) = item else { continue };
         let bb = drill_boxes[i];
         if !in_scope(&bb) {
@@ -1079,6 +1148,7 @@ pub fn drc(
     // copper clearance from another item's drilled hole
     let mut pairs: Vec<(&Sel, &Sel)> = Vec::new();
     for (i, c) in pcs.iter().enumerate() {
+        fab_elec_core::pace::pace();
         let cb = boxes[i];
         if !in_scope(&cb) {
             continue;
@@ -1100,6 +1170,7 @@ pub fn drc(
     pairs.sort();
     pairs.dedup();
     for (sx, sy) in pairs {
+        fab_elec_core::pace::pace();
         // Check every piece in both directions so a delta chooses the same worst as a full run.
         let mut worst: Option<PairFault> = None;
         for (copper_sel, drill_sel) in [(sx, sy), (sy, sx)] {
@@ -1130,6 +1201,7 @@ pub fn drc(
     // spacing between drilled holes
     let mut pairs: Vec<(&Sel, &Sel, PairFault)> = Vec::new();
     for (i, (item, circle, _)) in drills.iter().enumerate() {
+        fab_elec_core::pace::pace();
         let ab = circle.bbox();
         if !in_scope(&ab) {
             continue;
@@ -1168,6 +1240,7 @@ pub fn drc(
     let keepout_index = Index::build(keepout_boxes.iter().enumerate().map(|(i, b)| (*b, i as u32)).collect());
     let mut pairs: Vec<(&Sel, &Sel)> = Vec::new();
     for (i, c) in pcs.iter().enumerate() {
+        fab_elec_core::pace::pace();
         let cb = boxes[i];
         if !in_scope(&cb) {
             continue;
@@ -1188,6 +1261,7 @@ pub fn drc(
     pairs.sort();
     pairs.dedup();
     for (sx, sy) in pairs {
+        fab_elec_core::pace::pace();
         // All pieces and owned keepouts choose the same fault in a full or delta run.
         let mut worst: Option<PairFault> = None;
         for &i in &by_sel[sx] {
@@ -1216,7 +1290,7 @@ pub fn drc(
         }
     }
 
-    board_checks(board, rules, &keepouts, scope, region, &mut out);
+    board_checks(board, rules, keepouts, scope, region, &mut out);
     connectivity_checks(board, conn, &mut out);
     let zone_polys = |zone: ItemId| {
         pcs.iter().filter_map(move |c| match (c.item, &c.shape) {
@@ -1264,6 +1338,7 @@ pub fn drc_indexed(
     let mut keepout_pairs = BTreeSet::new();
 
     visit_index(index, scope, |piece| {
+        fab_elec_core::pace::pace();
         if let Some(a) = active_copper(piece, &stale) {
             let sa = PieceSel::new(board, a.item);
             index.query(a.layer, piece.bbox.inflate(max_c.max(1)), |other| {
@@ -1349,6 +1424,7 @@ pub fn drc_indexed(
 
     let mut out = Vec::new();
     for (sx, sy) in clearance_pairs {
+        fab_elec_core::pace::pace();
         let mut worst: Option<PairFault> = None;
         for (pa, a) in sx.copper(index, board, &stale) {
             let reach = pa.bbox.inflate(max_c);
@@ -1371,6 +1447,7 @@ pub fn drc_indexed(
     }
 
     for (sx, sy) in pair_gap_pairs {
+        fab_elec_core::pace::pace();
         let mut worst: Option<PairFault> = None;
         for (pa, a) in sx.copper(index, board, &stale) {
             for (pb, b) in sy.copper(index, board, &stale) {
@@ -1389,6 +1466,7 @@ pub fn drc_indexed(
     }
 
     for sel in edge_items {
+        fab_elec_core::pace::pace();
         let mut worst: Option<(Nm, P)> = None;
         for (piece, c) in sel.copper(index, board, &stale) {
             let cb = piece.bbox;
@@ -1412,6 +1490,7 @@ pub fn drc_indexed(
     }
 
     for (sx, sy) in hole_pairs {
+        fab_elec_core::pace::pace();
         let mut worst: Option<PairFault> = None;
         for (copper_sel, drill_sel) in [(&sx, &sy), (&sy, &sx)] {
             for (copper_piece, c) in copper_sel.copper(index, board, &stale) {
@@ -1480,7 +1559,7 @@ pub fn drc_indexed(
         }
     }
 
-    board_checks(board, rules, &board_keepouts(board), scope, region, &mut out);
+    board_checks(board, rules, board_keepouts(board), scope, region, &mut out);
     connectivity_checks(board, conn, &mut out);
     let zone_polys = |zone: ItemId| {
         index.pieces(zone).filter_map(|piece| piece.copper()).filter_map(|c| match &c.shape {
@@ -1568,9 +1647,9 @@ fn ordered_sels(a: PieceSel, b: PieceSel) -> (PieceSel, PieceSel) {
 }
 
 // Owner, area, copper layers, what it forbids, the side of a footprint's keepout, the height band.
-type DrcKeepout = (ItemId, Shape, LayerSet, Forbid, Option<Side>, Option<(Nm, Nm)>);
+pub(crate) type DrcKeepout = (ItemId, Shape, LayerSet, Forbid, Option<Side>, Option<(Nm, Nm)>);
 
-const KEEPOUT_MESSAGE: &str = "inside a keepout that forbids it";
+pub(crate) const KEEPOUT_MESSAGE: &str = "inside a keepout that forbids it";
 
 /// Does a keepout with height band `z` catch copper? Copper lies on the board surface, so a band
 /// that starts above it (a light pipe's) forbids bodies only. `None` is every height.
@@ -1578,16 +1657,7 @@ pub fn reaches_copper(z: Option<(Nm, Nm)>) -> bool {
     z.map_or(true, |(lo, _)| lo <= 0)
 }
 
-/// Do two height bands overlap with positive length? A missing band is every height, so an
-/// unknown body or an unbounded keepout never hides a breach.
-pub fn bands_overlap(a: Option<(Nm, Nm)>, b: Option<(Nm, Nm)>) -> bool {
-    match (a, b) {
-        (Some((a0, a1)), Some((b0, b1))) => a0.max(b0) < a1.min(b1),
-        _ => true,
-    }
-}
-
-fn board_keepouts(board: &Board) -> Vec<DrcKeepout> {
+pub(crate) fn board_keepouts(board: &Board) -> Vec<DrcKeepout> {
     let mut keepouts: Vec<_> = board
         .keepouts
         .iter()
@@ -1610,7 +1680,7 @@ fn board_keepouts(board: &Board) -> Vec<DrcKeepout> {
 fn board_checks(
     board: &Board,
     rules: &RuleMatrix,
-    keepouts: &[DrcKeepout],
+    keepouts: Vec<DrcKeepout>,
     scope: Option<BBox>,
     region: Option<BBox>,
     out: &mut Vec<Violation>,
@@ -1618,84 +1688,39 @@ fn board_checks(
     silk_checks(board, rules, scope, region, out);
     let in_scope = |b: &BBox| scope.is_none_or_box(b);
     let at_ok = |p: P| in_region(region, p);
-    // Nonempty courtyards in board coordinates, indexed for both placement checks.
-    let courtyards: Vec<_> = board
-        .placed
-        .iter()
-        .filter_map(|p| {
-            // The placement box contains the courtyard, so rejecting it cannot discard an in-scope courtyard.
-            if p.footprint.courtyard.is_empty() || !in_scope(&p.bbox()) {
-                return None;
-            }
-            let Shape::Poly(area) = p.shape_to_board(&Shape::Poly(p.footprint.courtyard.clone())) else { return None };
-            let bb = area.bbox();
-            (!area.is_empty() && in_scope(&bb)).then_some((p, area, bb))
-        })
-        .collect();
-    let courtyard_index = Index::build(courtyards.iter().enumerate().map(|(i, (_, _, bb))| (*bb, i as u32)).collect());
-
-    // Keepouts that forbid other footprints on their side use positive courtyard area, and a
-    // positive overlap of the body's height band with the keepout's.
-    let mut pairs: Vec<(Sel, Sel, P, String)> = Vec::new();
-    for (owner, area, layers, forbid, side, z) in keepouts {
-        if !forbid.has(Forbid::FOOTPRINTS) {
-            continue;
-        }
-        let Shape::Poly(area) = area else { continue };
-        courtyard_index.query(area.bbox(), |_, j| {
-            let (p, courtyard, _) = &courtyards[j as usize];
-            let same_side = side.map_or_else(
-                || layers.has(if p.side == Side::Top { LayerId::F_CU } else { LayerId::B_CU }),
-                |s| s == p.side,
-            );
-            if p.id != *owner && same_side && bands_overlap(*z, p.body_z) {
-                let overlap = courtyard.intersection(area);
-                if !overlap.is_empty() && overlap.area() > 0.0 {
-                    let message = match (p.body_z, *z) {
-                        (Some((b0, b1)), Some((k0, k1))) => format!(
-                            "body {}-{} mm high reaches into the keepout's {}-{} mm band",
-                            mm3(b0),
-                            mm3(b1),
-                            mm3(k0),
-                            mm3(k1)
-                        ),
-                        _ => KEEPOUT_MESSAGE.into(),
-                    };
-                    pairs.push((Sel::Item(board.unit, p.id), Sel::Item(board.unit, *owner), overlap.bbox().center(), message));
-                }
-            }
-            ControlFlow::Continue(())
-        });
-    }
-    pairs.sort();
-    pairs.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
-    for (sx, sy, at, message) in pairs {
+    let placement = PlacementIndex::with_keepouts(board, scope, keepouts);
+    for (part, owner, at, message) in placement.keepout_pairs() {
         if at_ok(at) {
+            let sx = Sel::Item(board.unit, part);
+            let sy = Sel::Item(board.unit, owner);
             out.push(keepout_violation(board, rules, &sx, &sy, at, message));
         }
     }
-
-    // Same-side courtyard overlaps; touching edges alone are legal.
-    let mut pairs = Vec::new();
-    for (i, (a, area, bb)) in courtyards.iter().enumerate() {
-        courtyard_index.query(*bb, |_, j| {
-            let j = j as usize;
-            let (b, other, _) = &courtyards[j];
-            if j > i && a.side == b.side {
-                let overlap = area.intersection(other);
-                if !overlap.is_empty() && overlap.area() > 0.0 {
-                    let (a, b) = if a.id <= b.id { (*a, *b) } else { (*b, *a) };
-                    pairs.push((a, b, overlap.bbox().center()));
-                }
-            }
-            ControlFlow::Continue(())
-        });
-    }
-    pairs.sort_by_key(|(a, b, at)| (a.id, b.id, *at));
-    pairs.dedup_by_key(|(a, b, _)| (a.id, b.id));
-    for (a, b, at) in pairs {
+    for (a, b, at) in placement.courtyard_pairs() {
         if at_ok(at) {
             out.push(courtyard_violation(board, a, b, at));
+        }
+    }
+    for (a, b, at) in placement.through_pairs() {
+        if at_ok(at) {
+            out.push(through_violation(board, a, b, at));
+        }
+    }
+    for (part, hole, at) in placement.hole_pairs() {
+        if at_ok(at) {
+            out.push(hole_violation(board, part, hole, at));
+        }
+    }
+    for (part, at) in placement.outside_outline() {
+        if at_ok(at) {
+            out.push(outline_violation(board, part, at));
+        }
+    }
+    // A part the circuit fixes to a spot stands there: O(spots) lookups.
+    for spot in &board.spots {
+        let Some(part) = board.placed_of(spot.comp) else { continue };
+        if !spot.holds(part) && in_scope(&part.bbox()) && at_ok(part.at) {
+            out.push(spot_violation(board, part, spot));
         }
     }
 
@@ -1837,7 +1862,53 @@ fn silk_checks(
     }
 }
 
+fn length_checks(board: &Board, conn: &Connectivity, out: &mut Vec<Violation>) {
+    use crate::length::{difference_text, net_lengths, Measurement};
+    if board.length_matches.is_empty() { return; }
+    let lengths = net_lengths(board, conn, &[]);
+    let name = |id: NetId| board.nets.get(id.ix()).map_or("?", |n| n.name.as_str());
+    let sel = |net| Sel::Net(fab_elec_core::NetRef { board: board.unit, net });
+    for group in &board.length_matches {
+        let Some(comparison) = group.compare(&lengths) else { continue };
+        let tol = i64::from(group.tol);
+        if !comparison.complete || comparison.spread <= tol { continue; }
+        let reference = lengths[&comparison.reference];
+        let rule = format!("length match {:?} within {tol} nm", group.nets.iter().map(|&n| name(n)).collect::<Vec<_>>());
+        let mut report = |kind, items, diff, at: Option<P>, mut message: String| {
+            if comparison.measurement == Measurement::NoStackup {
+                message.push_str(" (");
+                message.push_str(comparison.measurement.text());
+                message.push(')');
+            }
+            let mut finding = Violation::new(kind, Severity::Error, Some(board.unit), items, &rule, message)
+                .hint("lengthen the shorter net, or relax the tolerance");
+            if let Ok(actual) = Nm::try_from(diff) {
+                finding = finding.measures(Measure::Len(actual), Measure::Len(group.tol));
+            }
+            finding.at = at.or(reference.at);
+            out.push(finding);
+        };
+        if let [a, b] = group.nets.as_slice() {
+            if let Some(pair) = board.pairs.iter().find(|p| (p.p == *a && p.n == *b) || (p.p == *b && p.n == *a)) {
+                let (actual, allowed) = difference_text(comparison.spread, group.tol);
+                report(CheckKind::Skew, vec![sel(pair.p), sel(pair.n)], comparison.spread, lengths[a].at,
+                    format!("{} and {} differ by {actual}; the pair allows {allowed}", name(pair.p), name(pair.n)));
+                continue;
+            }
+        }
+        for &n in &group.nets {
+            let diff = reference.nm - lengths[&n].nm;
+            if diff > tol {
+                let (actual, allowed) = difference_text(diff, group.tol);
+                report(CheckKind::Length, vec![sel(n)], diff, lengths[&n].at,
+                    format!("{} is {actual} shorter than {}; the match allows {allowed}", name(n), name(comparison.reference)));
+            }
+        }
+    }
+}
+
 fn connectivity_checks(board: &Board, conn: &Connectivity, out: &mut Vec<Violation>) {
+    length_checks(board, conn, out);
     let unit = Some(board.unit);
     // connectivity, always in full
     let mut joined_layers: HashMap<ItemId, LayerSet> = HashMap::new();
@@ -2122,11 +2193,11 @@ fn limit_hint(rules: &RuleMatrix, rule: RuleRef, hint: &str) -> String {
     }
 }
 
-fn mm3(v: Nm) -> String {
+pub(crate) fn mm3(v: Nm) -> String {
     format!("{:.3}", v as f64 / 1e6)
 }
 
-trait ScopeBox {
+pub(crate) trait ScopeBox {
     fn is_none_or_box(&self, b: &BBox) -> bool;
 }
 
@@ -3073,6 +3144,92 @@ mod tests {
         Arc::make_mut(&mut board.placed[1].footprint).courtyard = PolySet::new();
         let result = run(&board, None);
         assert!(!result.violations.iter().any(|v| v.kind == CheckKind::CourtyardOverlap), "an empty courtyard never overlaps");
+
+        // A through-hole pin and its joint come out on the far side, under whatever sits there.
+        let courtyard_findings = |board: &Board| -> Vec<Violation> {
+            run(board, None).violations.into_iter().filter(|v| v.kind == CheckKind::CourtyardOverlap).collect()
+        };
+        let mut thru = footprint.as_ref().clone();
+        thru.pads[0].kind = PadKind::Thru;
+        thru.pads[0].stack = PadStack::thru(PadShape::Circle { d: 500_000 });
+        thru.pads[0].drill = Some(fab_elec_parts::Drill { size: P::new(300_000, 300_000), offset: P::ZERO });
+        board.placed[1].footprint = Arc::new(thru);
+        board.placed[1].side = Side::Bottom;
+        board.placed[1].at.x = 12_500_000;
+        let found = courtyard_findings(&board);
+        assert_eq!(found.len(), 1, "a bottom part's through-hole pad under a top courtyard is one finding");
+        assert_eq!(found[0].items, vec![Sel::Item(board.unit, board.placed[0].id), Sel::Item(board.unit, board.placed[1].id)], "the finding selects both parts");
+        assert_eq!(found[0].message, "through-hole pads of U2 come out under the courtyard of U1 on the other side", "the message says which part is drilled");
+        board.placed[0].side = Side::Bottom;
+        board.placed[1].side = Side::Top;
+        assert_eq!(courtyard_findings(&board).len(), 1, "the rule holds with the sides swapped");
+        board.placed[0].side = Side::Top;
+        board.placed[1].side = Side::Bottom;
+        board.placed[0].footprint = board.placed[1].footprint.clone();
+        assert_eq!(courtyard_findings(&board).len(), 1, "two through-hole parts each under the other are one finding");
+        board.placed[0].footprint = footprint.clone();
+        board.placed[1].at.x = 13_500_000;
+        assert!(courtyard_findings(&board).is_empty(), "a through-hole pad beside the far courtyard is no finding");
+        board.placed[1].footprint = footprint.clone();
+        board.placed[1].at.x = 12_500_000;
+        assert!(courtyard_findings(&board).is_empty(), "a surface pad under a courtyard on the other side is no finding");
+
+        // The courtyard stays inside the outline, unless the circuit fixes the part to an edge.
+        board.placed[1].side = Side::Top;
+        board.placed[1].at = P::new(19_500_000, 6_000_000);
+        let found = courtyard_findings(&board);
+        assert_eq!(found.len(), 1, "a courtyard past the outline is one finding");
+        assert_eq!(found[0].items, vec![Sel::Item(board.unit, board.placed[1].id)], "the finding names the part");
+        assert_eq!(found[0].message, "the courtyard of U2 leaves the board outline", "the finding says what is wrong");
+        assert!(found[0].at.is_some_and(|at| at.x > 20_000_000), "the finding points outside the outline");
+        board.edge_parts = vec![CompId(1)];
+        assert!(courtyard_findings(&board).is_empty(), "a part fixed to an edge may overhang");
+        board.edge_parts.clear();
+        board.placed[1].at = P::new(13_500_000, 12_000_000);
+
+        // A part the circuit fixes to a spot stands there; elsewhere, or turned, is one finding.
+        let spot_findings = |board: &Board| -> Vec<Violation> {
+            run(board, None).violations.into_iter().filter(|v| v.kind == CheckKind::FixedSpot).collect()
+        };
+        let hash = |board: &Board| board.content_hash();
+        let unspotted = hash(&board);
+        board.spots = vec![crate::Spot { comp: CompId(1), at: board.placed[1].at, rot: None }];
+        assert_ne!(hash(&board), unspotted, "a spot is part of the board's hash");
+        assert!(spot_findings(&board).is_empty(), "a part on its spot, any turn, is no finding");
+        board.spots[0].rot = Some(Angle::QUARTER);
+        let found = spot_findings(&board);
+        assert_eq!(found.len(), 1, "a part on its spot but turned otherwise is one finding");
+        assert_eq!(found[0].items, vec![Sel::Item(board.unit, board.placed[1].id)], "the finding names the part");
+        assert_eq!(found[0].message, "U2 is fixed at (13.500, 12.000) mm turned 90° but stands at (13.500, 12.000) mm turned 0°",
+            "the finding gives the spot and where the part stands");
+        board.placed[1].rot = Angle::QUARTER;
+        assert!(spot_findings(&board).is_empty(), "turned as its spot says, it is no finding");
+        board.placed[1].at.x += 1;
+        assert_eq!(spot_findings(&board).len(), 1, "a nanometre off its spot is a finding");
+        board.placed[1].at.x -= 1;
+        board.placed[1].rot = Angle::ZERO;
+        board.spots.clear();
+        assert_eq!(hash(&board), unspotted, "a board without spots keeps its hash");
+
+        // A body keeps off the board's holes, on either side.
+        let hole = board.alloc_id();
+        board.holes.push(crate::Hole {
+            id: hole, name: "H1".into(), at: P::new(14_000_000, 12_500_000), drill: 1_000_000, pad: None, net: None,
+            plated: false, origin: Origin::Authored,
+        });
+        let hole_findings = |board: &Board| -> Vec<Violation> {
+            courtyard_findings(board).into_iter().filter(|v| v.items.contains(&Sel::Item(board.unit, hole))).collect()
+        };
+        let found = hole_findings(&board);
+        assert_eq!(found.len(), 1, "a courtyard over a board hole is one finding");
+        assert_eq!(found[0].items, vec![Sel::Item(board.unit, board.placed[1].id), Sel::Item(board.unit, hole)], "the finding selects the part and the hole");
+        assert_eq!(found[0].message, "the courtyard of U2 covers the hole H1", "the finding names the part and the hole");
+        board.placed[1].side = Side::Bottom;
+        assert_eq!(hole_findings(&board).len(), 1, "a hole goes through both sides");
+        board.placed[1].side = Side::Top;
+        board.holes[0].at = P::new(15_200_000, 12_000_000);
+        assert!(hole_findings(&board).is_empty(), "a hole beside the courtyard is no finding");
+        board.holes.clear();
 
         board.placed[1].footprint = footprint.clone();
         Arc::make_mut(&mut board.placed[0].footprint).keepouts.push(Keepout {

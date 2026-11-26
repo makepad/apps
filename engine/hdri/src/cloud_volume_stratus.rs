@@ -238,7 +238,7 @@ impl VolumeShape {
             key,
             genus: spec.genus,
             stratus: None,
-            sc: None,
+            deck: None,
             ns: None,
         };
         // Cover (design §3): the footprint's share solved for the upper sky's views, as a Cumulus'.
@@ -246,7 +246,7 @@ impl VolumeShape {
         let n = |_: u32, x: f32, y: f32| recipe.at(vec2f(x, y), &measured)[0];
         let top = set.table(1, &n).at(TAPER_TOP);
         shape.stratus = Some(StratusShape { recipe, depth_m, mottling: b.mottling.clamp(0.0, 1.0), ragged: b.ragged_edges.clamp(0.0, 1.0), noise_m: cell_m / MASK_FREQ, top });
-        shape.solve_share(c, &set, &n);
+        shape.solve_share(c, &set, &n, cancelled, run)?;
         shape.key = footprint_grid_key(&[bits(key as u32), bits((key >> 32) as u32), shape.threshold, shape.share, shape.gated as u32 as f32], stream, TOP_COLS, 0.0);
         Ok(Some(shape))
     }

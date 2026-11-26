@@ -1,0 +1,114 @@
+# Makepad Story: video cutting (CUT) and presentation decks (DECK) on the
+# product shell, with the AI control API, its chat and the video maker.
+[package]
+name = "makepad-story"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Makepad Story — video cutting and presentation decks"
+publish = false
+default-run = "makepad-story"
+
+[lib]
+name = "story"
+path = "src/lib.rs"
+
+[[bin]]
+name = "makepad-story"
+path = "src/main.rs"
+
+# `cargo makepad desktop bundle -p makepad-story` builds the macOS .app.
+[package.metadata.makepad.desktop]
+name = "Makepad Story"
+identifier = "nl.makepad.story"
+icon = "resources/icon_1024.png"
+
+[features]
+default = ["tweaker"]
+# The design overlay (Shift+F10 with the dev overlays on). On for development
+# builds; the Runner's releases build without it (--no-default-features).
+tweaker = ["dep:makepad-widgets-tweaker", "makepad-widgets/data", "makepad-widgets/dock", "makepad-widgets/fab"]
+# The chat's Local provider: the hub's election (fleet chat node on the LAN,
+# or a model on this machine). A release builds with it only when the Runner compiles with CUDA.
+localai = ["makepad-app-aichat/localai"]
+
+[dependencies]
+# The families Story names: fab, editors, media, pickers, dock (the shell's
+# Dock and DockSplitter: also without `tweaker`, as releases build).
+makepad-widgets = { path = "../../../../widgets", default-features = false, features = ["rich_text", "fab", "editors", "media", "pickers", "dock"] }
+makepad-widgets-tweaker = { path = "../../../../widgets/families/tweaker", optional = true }
+makepad-widgets-sheets = { path = "../../../../widgets/sheets" }
+makepad-code-editor = { path = "../../../../code_editor" }
+makepad-code-values = { path = "../../../../libs/code_values" }
+makepad-edit-values = { path = "../../../../libs/edit_values" }
+makepad-strict-json = { path = "../../../../libs/strict_json" }
+makepad-look = { path = "../../../../libs/look" }
+makepad-civil-time = { path = "../../../../libs/civil_time" }
+makepad-filesystem-watcher = { path = "../../../../libs/filesystem_watcher" }
+makepad-app-registry = { path = "../../../../libs/app_registry" }
+makepad-model-install = { path = "../../../../libs/model_install" }
+makepad-audio-decode = { path = "../../../../libs/audio_decode" }
+makepad-script-compute-sched = { path = "../../../../platform/script/compute_sched" }
+jpeg-encoder = { path = "../../../../libs/jpeg-encoder", version = "0.6.1" }
+makepad-flow = { path = "../../../../libs/flow", features = ["host", "live"] }
+makepad-flowgraph = { path = "../../../../libs/flowgraph" }
+makepad-flow-ui = { path = "../../../../libs/flow_ui" }
+# The generation studio's API (no page): the video maker's presets.
+makepad-flow-studio = { path = "../../../../libs/flow_studio" }
+makepad-flow-assets = { path = "../../../apps/engine/flow_assets" }
+makepad-live-frame = { path = "../../../../libs/live_frame" }
+makepad-value-pickers = { path = "../../../../libs/value_pickers" }
+makepad-editor-panel = { path = "../../../../libs/editor_panel" }
+# The chat panel with its engine and its `gen` image tool.
+makepad-app-aichat = { path = "../../../aichat", default-features = false, features = ["engine", "gen"] }
+makepad-ai-services = { path = "../../../../libs/ai/services" }
+# (its local model runtime only through `localai` above, the chat's)
+makepad-ai-hub = { path = "../../../../libs/ai/hub", default-features = false }
+makepad-app-host = { path = "../../../../libs/app_host" }
+makepad-studio-protocol = { path = "../../../../platform/studio" }
+makepad-web-pack = { path = "../../../../libs/web_pack" }
+# File > Export > Web page: a document as one trace-shaken wasm page (web_page_export.rs).
+makepad-wasm-export = { path = "../../../apps/tools/wasm-export", default-features = false }
+# The product shell: user state, theme choice, pump clock, pages, the
+# window's chat and the tool host.
+makepad-app-shell = { path = "../../../apps/libs/app_shell" }
+# The AI control API tools every product window has, and the generation tools.
+makepad-product-tools = { path = "../../libs/product_tools" }
+makepad-studio-api = { path = "../../../apps/libs/studio_api" }
+makepad-asset-connection = { path = "../../../apps/libs/asset_connection" }
+# The library browser: the card list, the lanes, the drafts.
+makepad-library-browser = { path = "../../../apps/libs/library_browser" }
+makepad-asset-data = { path = "../../../apps/engine/asset/data" }
+makepad-asset-client = { path = "../../../apps/engine/asset/client" }
+makepad-asset-importer = { path = "../../../apps/engine/asset/importer" }
+makepad-content-packs = { path = "../../../apps/engine/content_packs" }
+makepad-motion = { path = "../../../apps/engine/motion", features = ["scene3d"] }
+makepad-motion-draw = { path = "../../../apps/engine/motion_draw", features = ["scene3d"] }
+makepad-stage-motion3d = { path = "../../../apps/engine/motion3d", default-features = false, features = ["models"] }
+makepad-doc-fonts = { path = "../../../apps/engine/fonts" }
+makepad-audio-lyrics = { path = "../../../apps/engine/audio_lyrics" }
+makepad-stage-audio-media = { path = "../../../apps/engine/audio_media" }
+# The widget kit and the house theme the pages paint with.
+makepad-stage-ui = { path = "../../../apps/stage/libs/stage_ui" }
+# The tweak panel's font picker, font row and effects stack, and the Motion
+# document kind of its editor panel.
+makepad-stage-motion-pickers = { path = "../../../apps/stage/libs/motion_pickers" }
+# The sound root: one deck of the audio engine playing the preview feed.
+makepad-stage-live-audio = { path = "../../../apps/stage/libs/live_audio" }
+# Story's crates.
+makepad-story-cut = { path = "../libs/cut" }
+makepad-story-deck = { path = "../libs/deck" }
+makepad-story-storyboard = { path = "../../../apps/story/libs/storyboard" }
+makepad-story-edit-render = { path = "../libs/edit_render", default-features = false, features = ["store", "export", "models"] }
+makepad-story-edit-voice = { path = "../libs/edit_voice", default-features = false, features = ["kokoro", "publish"] }
+makepad-story-edit-tools = { path = "../libs/edit_tools", default-features = false }
+makepad-story-production = { path = "../libs/production" }
+makepad-story-video-agent = { path = "../libs/video_agent" }
+makepad-story-web-export = { path = "../libs/web_export" }
+makepad-story-app-run = { path = "../libs/app_run" }
+makepad-story-audio-features = { path = "../libs/audio_features" }
+
+[dev-dependencies]
+# tests/agent_tools.rs drives Story over its `app` service.
+makepad-test = { path = "../../../../libs/makepad_test" }
+makepad-remote = { path = "../../../../libs/remote" }

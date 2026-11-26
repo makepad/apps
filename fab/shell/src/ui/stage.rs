@@ -393,6 +393,21 @@ script_mod! {
                             strength := mod.widgets.FabBrushDial{ width: 38 sculpt: true strength: true }
                         }
                     }
+                    // Measure Fit: turn the fitted part a quarter, or clear the fit.
+                    fit_bar := ToolRow{
+                        visible: false
+                        flow: Right
+                        align: Align{y: 0.5}
+                        padding: 3
+                        spacing: 1
+                        a11y: {label: "Measure Fit tools"}
+                        FabTip{ text: #(keymap::tooltip(Key::FitTurn))
+                            fit_turn := Tool{ independent: true a11y: {label: "Turn 90°"} draw_icon +: { svg: crate_resource("self://resources/icons/rotate.svg") } }
+                        }
+                        FabTip{ text: #(keymap::tooltip(Key::FitClear))
+                            fit_clear := Tool{ independent: true a11y: {label: "Clear fit"} draw_icon +: { svg: crate_resource("self://resources/icons/close.svg") } }
+                        }
+                    }
                     // The Force tool's kinds: what a click on the studied part adds. Fab reads the
                     // click as a face or a hole's wall by itself; Alt takes the other reading.
                     force_bar := ToolRow{
@@ -437,6 +452,20 @@ script_mod! {
                     margin: Inset{left: 10 bottom: 6}
                     padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
                     slice_failed_text := mod.widgets.FabLabel{ text: "" a11y: {label: "Why the plate does not slice"} }
+                }
+                // The part shows as it was at a step of its build (the Steps editor's marker).
+                step_shown := Float{
+                    visible: false
+                    width: Fit
+                    height: Fit
+                    flow: Right
+                    spacing: 10
+                    align: Align{y: 0.5}
+                    margin: Inset{left: 10 bottom: 6}
+                    padding: Inset{left: 12 right: 8 top: 4 bottom: 4}
+                    step_shown_text := mod.widgets.FabLabel{ text: "" a11y: {label: "The step the view shows"} }
+                    step_back := mod.widgets.FabButton{ text: "Back to the end" a11y: {label: "Back to the end"} }
+                    step_rollback := mod.widgets.FabButton{ text: "Roll back to here" }
                 }
             }
         }
@@ -667,6 +696,14 @@ script_mod! {
                         rm_force := RenderSegment{ text: "Force" }
                     }
                 }
+                colour_rule := mod.widgets.FabVRule{}
+                // The plate's colours: the model's own, or the loaded materials' (Material colours).
+                colour_modes := View{
+                    a11y: {role: "radio_group" label: "Plate colours"}
+                    width: Fit height: Fit flow: Right align: Align{y: 0.5} spacing: 1
+                    model_colours := RenderSegment{ text: "Model colours" a11y: {label: "Model colours"} }
+                    material_colours := RenderSegment{ text: "Material colours" a11y: {label: "Material colours"} }
+                }
                 create_rule := mod.widgets.FabVRule{}
                 // What makes and changes parts: Add (a new part) and Modify (the selected part's
                 // features and shape edits). Handled for the app (`main`).
@@ -754,6 +791,15 @@ script_mod! {
                     see_glow := mod.widgets.Slider{ width: 110 height: 18 text: "" min: 0.0 max: 1.0 step: 0.01 default: 0.35 precision: 2 }
                 }
             }
+            // why the colours shown are not what will print (a missing spool's colour, ...)
+            colour_panel := View{
+                width: Fill height: Fit flow: Down align: Align{x: 0.5}
+                padding: Inset{top: 4 left: 40 right: 40}
+                colour_notice := mod.widgets.FabLabelSmall{
+                    width: Fill height: Fit visible: false align: Align{x: 0.5}
+                    flow: Right{wrap: true} text: ""
+                }
+            }
         }
         nav := View{
             width: Fill
@@ -802,6 +848,8 @@ struct StageDrawKeys {
     chrome: Option<ChromeKey>,
     /// The three slice tips and toggles and this pane's orthographic toggle.
     view_bar: Option<ViewBarKey>,
+    /// The plate colours' segments and the notice under the toolbar.
+    colours: Option<(fab_plate::ColourMode, (usize, bool), bool, usize, bool, bool, crate::print::ColorBy, bool, bool)>,
     /// The board tip and toggle, including the scan for boards and their visibility.
     board_revision: Option<u64>,
     /// The three Design tool buttons and the paint, shape, sculpt and force strips and their controls.
@@ -925,6 +973,8 @@ struct ViewBarKey {
 struct ToolBarsKey {
     design: bool,
     paint: Option<PaintBarKey>,
+    /// Measure Fit's Turn and Clear.
+    fit: bool,
     /// Edit shape: Lay flat's toggle and the pick kind filter.
     lay_flat: Option<(bool, crate::tools::picks::PickKind)>,
     sculpt: Option<StrokeOp>,
@@ -959,6 +1009,9 @@ pub struct FabStage {
     workspace_shown: Option<(Option<PlateMode>, bool)>,
     #[rust]
     print_revision: Option<(u64, u64, Option<PlateMode>, bool, Option<(u32, u32)>, bool, bool)>,
+    /// The step line over the view as last set: the step and the part's step count.
+    #[rust]
+    step_line: Option<(usize, usize)>,
     #[rust]
     time_shown: Option<(u64, u64, bool)>,
     #[rust]
@@ -1530,6 +1583,7 @@ impl ScriptHook for FabStage {
             self.synced = None;
             self.workspace_shown = None;
             self.print_revision = None;
+            self.step_line = None;
             self.time_shown = None;
             self.layer_shown = None;
             self.now_shown = None;
@@ -1688,10 +1742,13 @@ impl Widget for FabStage {
             self.draw_keys.view_bar = None;
             cx.action(PrintAction::ShowModel(!state.print.play.show_model));
         }
-        if bar.radio_button(cx, ids!(show_board)).clicked(actions) {
+        // what the pressed toggle now shows, not the plate's flag flipped: a plate that lands
+        // between the toggle's last sync and the press (another job's) can say otherwise
+        let show_board = bar.radio_button(cx, ids!(show_board));
+        if show_board.clicked(actions) {
             self.draw_keys.board_revision = None;
-            if let Some(shown) = state.board_shown() {
-                cx.action(ShellAction::ShowBoard(!shown));
+            if state.board_shown().is_some() {
+                cx.action(ShellAction::ShowBoard(show_board.active(cx)));
             }
         }
         let tools = ids!(model_ui.left.tools);
@@ -1786,6 +1843,14 @@ impl Widget for FabStage {
             self.draw_keys.tools = None;
             cx.action(StageAction::LayFlat(!state.ui.lay_flat));
         }
+        let fit = v.widget(cx, ids!(model_ui.context.fit_bar));
+        for (id, action) in [(ids!(fit_turn), ShellAction::TurnFit), (ids!(fit_clear), ShellAction::ClearFit)] {
+            let button = fit.radio_button(cx, id);
+            if button.clicked(actions) {
+                button.set_active(cx, false, Animate::No);
+                cx.action(action);
+            }
+        }
         let sb = v.widget(cx, ids!(model_ui.context.sculpt_bar));
         for (id, op) in [(ids!(s_raise), StrokeOp::Raise), (ids!(s_lower), StrokeOp::Lower), (ids!(s_crease), StrokeOp::Crease)] {
             if sb.radio_button(cx, id).clicked(actions) {
@@ -1810,7 +1875,7 @@ impl Widget for FabStage {
         }
         if tv.radio_button(cx, ids!(t_measure)).clicked(actions) {
             let m = Tool::Measure(MeasureKind::Distance);
-            cx.action(ShellAction::SetTool(if matches!(state.tool, Tool::Measure(_)) { Tool::Select } else { m }));
+            cx.action(ShellAction::SetTool(if matches!(state.tool, Tool::Measure(_) | Tool::MeasureFit) { Tool::Select } else { m }));
         }
         if tv.radio_button(cx, ids!(t_no_trees)).clicked(actions) {
             cx.action(ShellAction::SetTool(if state.tool == Tool::NoTrees { Tool::Select } else { Tool::NoTrees }));
@@ -1828,15 +1893,10 @@ impl Widget for FabStage {
         if let Some(g) = v.slider(cx, ids!(render_row.see_row.see_glow)).slided(actions) {
             cx.action(ShellAction::SetSeeGlow(g as f32));
         }
-        // the plate's mode: a menu of the three, the one in force ticked
-        if let Some(anchor) = dropdown_clicked(actions, live_id!(fab_plate_mode)) {
-            let row = |mode: PlateMode, label: &str| MenuItem::new(LiveId(live_id!(fab_plate_mode).0 ^ (mode as u64 + 1)), label).radio(state.ui.in_mode(mode));
-            let items = vec![row(PlateMode::Design, "Design"), row(PlateMode::Mechanics, "Mechanics"), row(PlateMode::Monitor, "Monitor")];
-            open_menu(cx, live_id!(fab_plate_mode), items, anchor, MenuPlace::Below);
-        }
-        if let Some(pick) = menu_picked(actions, live_id!(fab_plate_mode)) {
-            if let Some(mode) = [PlateMode::Design, PlateMode::Mechanics, PlateMode::Monitor].into_iter().find(|m| pick.0 == live_id!(fab_plate_mode).0 ^ (*m as u64 + 1)) {
-                cx.action(ShellAction::SetPlateMode(mode));
+        let colours = v.view(cx, ids!(colour_modes));
+        for (id, mode) in [(ids!(model_colours), fab_plate::ColourMode::Model), (ids!(material_colours), fab_plate::ColourMode::Material)] {
+            if colours.radio_button(cx, id).clicked(actions) {
+                cx.action(ShellAction::SetColourMode(mode));
             }
         }
         let modes = v.view(cx, ids!(render_row.render_modes));
@@ -1874,6 +1934,14 @@ impl Widget for FabStage {
             }
             if row.button(cx, ids!(to_end)).clicked(actions) {
                 cx.action(PrintAction::Scrub(b));
+            }
+        }
+        if v.button(cx, ids!(model_ui.bottom.step_shown.step_back)).clicked(actions) {
+            cx.action(crate::ui::steps::StepsAction::Show(None));
+        }
+        if v.button(cx, ids!(model_ui.bottom.step_shown.step_rollback)).clicked(actions) {
+            if let Some(i) = state.steps.shown.filter(|i| i + 1 < state.steps.chips.len()) {
+                cx.action(crate::ui::steps::StepsAction::RollBack(i));
             }
         }
         if sv.button(cx, ids!(bottom.bar_row.bar.follow_row.back_live)).clicked(actions) || sv.button(cx, ids!(resin_ui.resin_row.resin_live)).clicked(actions) {
@@ -1949,12 +2017,6 @@ impl Widget for FabStage {
                     v.widget(cx, id).set_visible(cx, !mechanics);
                 }
                 v.view(cx, ids!(mechanics_ui)).set_visible(cx, mechanics);
-                let name = match plate_mode {
-                    Some(PlateMode::Mechanics) => "Mechanics",
-                    Some(PlateMode::Monitor) => "Monitor",
-                    _ => "Design",
-                };
-                v.widget(cx, ids!(render_row.plate_mode.label)).set_text(cx, name);
             }
             let mech_tool = mechanics.then_some(state.mech.tool);
             if self.draw_keys.mechanics_tool != mech_tool {
@@ -1984,7 +2046,7 @@ impl Widget for FabStage {
                 GizmoMode::Force => mode == RenderMode::Force,
                 _ => false,
             };
-            let context = !mechanics && design && state.tool == Tool::Select && row_tool && v.view(cx, ids!(model_ui.context)).visible();
+            let context = !mechanics && design && ((state.tool == Tool::Select && row_tool) || state.tool == Tool::MeasureFit) && v.view(cx, ids!(model_ui.context)).visible();
             let nav_top = NAV_TOP + strip + toolbar + if context { CONTEXT_ROW } else { 0.0 };
             let nav = v.widget(cx, ids!(primary.nav));
             let moved = nav.borrow_mut::<View>().is_some_and(|mut nav| {
@@ -2074,6 +2136,35 @@ impl Widget for FabStage {
                     show_board.set_active(cx, board == Some(true), Animate::No);
                 }
             }
+            // The plate's colours in the toolbar (short words in a narrow view) and the notice
+            // under it.
+            let width = cx.peek_walk_turtle(walk).size.x;
+            let compact = width < 320.0;
+            let colours = state.view.colours;
+            let key = (colours, state.colour_notice_tools(), p.target_printer().is_some(), state.view.missing_spool_colours, slice, held, p.play.color, p.finish, compact);
+            if self.draw_keys.colours != Some(key) {
+                self.draw_keys.colours = Some(key);
+                let group = v.view(cx, ids!(colour_modes));
+                for (id, mode, short) in [(ids!(model_colours), fab_plate::ColourMode::Model, "Model"), (ids!(material_colours), fab_plate::ColourMode::Material, "Material")] {
+                    let segment = group.radio_button(cx, id);
+                    segment.set_text(if compact { short } else { mode.label() });
+                    segment.set_active(cx, mode == colours, Animate::No);
+                }
+                let notice = state.colour_notice();
+                let label = v.label(cx, ids!(colour_notice));
+                label.set_visible(cx, notice.is_some());
+                if let Some(text) = notice { label.set_text(cx, &text); }
+            }
+            // the tool overlay's lines start under the gizmo
+            let overlay = v.widget(cx, ids!(design_overlay.tool_overlay));
+            let moved = overlay.borrow_mut::<crate::tools::overlay::FabToolOverlay>().is_some_and(|mut o| {
+                let moved = (o.nav_top - nav_top).abs() > 0.25;
+                o.nav_top = nav_top;
+                moved
+            });
+            if moved {
+                overlay.redraw(cx);
+            }
             let gizmo = (design && state.tool == Tool::Select).then_some(state.ui.gizmo);
             let sculpt_on = gizmo == Some(GizmoMode::Sculpt);
             let tools = ToolBarsKey {
@@ -2084,6 +2175,7 @@ impl Widget for FabStage {
                     target: state.ui.paint_target,
                     scaled: state.ui.paint_pattern.kind.scaled(),
                 }),
+                fit: state.tool == Tool::MeasureFit,
                 lay_flat: (gizmo == Some(GizmoMode::Shape)).then_some((state.ui.lay_flat, state.picks.filter)),
                 sculpt: sculpt_on.then(|| crate::tools::sculpt::operation(state)),
                 force: (gizmo == Some(GizmoMode::Force) && mode == RenderMode::Force).then_some(state.ui.force_kind),
@@ -2115,6 +2207,7 @@ impl Widget for FabStage {
                         pb.widget(cx, id).set_visible(cx, mode == PaintMode::Pattern && on);
                     }
                 }
+                v.widget(cx, ids!(model_ui.context.fit_bar)).set_visible(cx, tools.fit);
                 let sb = v.widget(cx, ids!(model_ui.context.shape_bar));
                 sb.set_visible(cx, tools.lay_flat.is_some());
                 if let Some((lay_flat, filter)) = tools.lay_flat {
@@ -2201,11 +2294,26 @@ impl Widget for FabStage {
                     (ids!(t_sculpt), select && state.ui.gizmo == GizmoMode::Sculpt),
                     (ids!(t_force), state.force_tool()),
                     (ids!(t_clip), state.tool == Tool::Section),
-                    (ids!(t_measure), matches!(state.tool, Tool::Measure(_))),
+                    (ids!(t_measure), matches!(state.tool, Tool::Measure(_) | Tool::MeasureFit)),
                     (ids!(t_no_trees), state.tool == Tool::NoTrees),
                     (ids!(t_settings_here), state.tool == Tool::SettingsHere),
                 ] {
                     tv.radio_button(cx, id).set_active(cx, on, Animate::No);
+                }
+            }
+            // the line over the view that says a step shows, with the way back
+            let step = state.steps.shown.filter(|_| lead).map(|i| (i, state.steps.chips.len()));
+            if self.step_line != step {
+                self.step_line = step;
+                let line = v.view(cx, ids!(model_ui.bottom.step_shown));
+                line.set_visible(cx, step.is_some());
+                if let Some((i, of)) = step {
+                    line.label(cx, ids!(step_shown_text)).set_text(cx, &format!("Step {} of {of} · the part still prints all {of} · Esc: back to the end", i + 1));
+                    let rollback = line.widget(cx, ids!(step_rollback));
+                    rollback.set_visible(cx, i + 1 < of);
+                    if i + 1 < of {
+                        crate::ui::print_settings::name_control(cx, &rollback, &format!("Roll back to step {} of {of}", i + 1), "button");
+                    }
                 }
             }
             let checking = p.streamed.as_ref().and_then(|s| s.checking());

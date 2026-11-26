@@ -1,0 +1,15 @@
+[package]
+name = "makepad-stage-audio-media"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "makepad_stage_audio_media"
+
+[dependencies]
+makepad-platform = { path = "../../../../platform" }
+makepad-audio-decode = { path = "../../../../libs/audio_decode" }
+makepad-mp4-index = { path = "../../../../libs/mp4_index" }
+makepad-asset-data = { path = "../../../apps/engine/asset/data" }

@@ -152,7 +152,7 @@ impl ScopeEdit {
 pub(super) struct ScopeDesk {
     tools: Option<ScopeTools>,
     /// The calls on the worker, oldest first: its id, the caller's call, who asked and the tool.
-    calls: VecDeque<(CallId, Option<u64>, By, &'static str)>,
+    calls: VecDeque<(CallId, Delivery, By, &'static str)>,
     /// Probe edits waiting for the engine to take an edit, with the call that asked.
     edits: VecDeque<(CallId, BenchOp, Sender<Result<Site, String>>)>,
     /// Added probes the engine made, waiting for the shown snapshot to have them: the call that
@@ -166,7 +166,7 @@ pub(super) struct ScopeDesk {
     pub(super) project: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
     /// The trace jobs on the pool (a take's save, a listing), each with the call to answer
     /// (None: a person's).
-    jobs: Vec<(Option<u64>, ToUIOneshotReceiver<TraceDone>)>,
+    jobs: Vec<(Delivery, ToUIOneshotReceiver<TraceDone>)>,
     /// The project changed (`ElecHost::set_project`): its traces are no longer the ones shown.
     pub(super) left_project: bool,
 }
@@ -333,7 +333,7 @@ impl ElecHost {
     fn scope_edits(&mut self, cx: &mut Cx) {
         while !self.scope.edits.is_empty() && self.settled && self.outside.is_none() && !self.driver.previewing() {
             let (asked, op, reply) = self.scope.edits.pop_front().expect("checked above");
-            let Some(&(_, _, by, _)) = self.scope.calls.iter().find(|(call, ..)| *call == asked) else { continue };
+            let Some(&(_, dest, by, _)) = self.scope.calls.iter().find(|(call, ..)| *call == asked) else { continue };
             let Some(snap) = self.driver.snap() else {
                 let _ = reply.send(Err("the design is still loading".into()));
                 continue;
@@ -361,9 +361,10 @@ impl ElecHost {
             let was = if removed { probe_site(snap, &name, &of) } else { None };
             let args = vec![("net".to_string(), of.target.clone()), (more.0.to_string(), more.1), ("bench".to_string(), name.clone())];
             let (tx, rx) = std::sync::mpsc::channel();
+            let binding = self.bind_call(dest);
             self.driver.invoke("elec.bench.probe".to_string(), args, false, by, tx);
             let edit = ScopeEdit { reply, bench: name, removed, was };
-            self.engine_calls.push(EngineCall { call: None, name: "elec.bench.probe", rx, text: None, scope: Some(edit), before: None });
+            self.engine_calls.push(EngineCall { dest: None, binding, call: None, name: "elec.bench.probe", rx, text: None, scope: Some(edit), before: None, reqs: None });
         }
     }
 
@@ -494,7 +495,7 @@ impl ElecHost {
         let _ = self.trace_job(cx, None, "elec trace list", rx, job);
     }
 
-    fn trace_job(&mut self, cx: &mut Cx, call: Option<u64>, name: &'static str, rx: ToUIOneshotReceiver<TraceDone>, job: impl FnOnce() + Send + 'static) -> Result<(), String> {
+    fn trace_job(&mut self, cx: &mut Cx, call: Delivery, name: &'static str, rx: ToUIOneshotReceiver<TraceDone>, job: impl FnOnce() + Send + 'static) -> Result<(), String> {
         let task = cx.task_pool().submit_named(Class::Interactive, name, job).map_err(|error| format!("{name} could not start: {error}"))?;
         task.detach();
         self.scope.jobs.push((call, rx));
@@ -525,7 +526,7 @@ impl ElecHost {
             match done {
                 TraceDone::Saved(Ok(path), traces) => {
                     if live { cx.get_global::<ElecLive>().traces = Arc::new(traces); }
-                    if call.is_none() { self.trace_notice(cx, None); }
+                    if reply(call).is_none() { self.trace_notice(cx, None); }
                     self.answer(call, Ok(fab_ai::out::text(&fab_ai::out::obj(vec![("path", fab_ai::out::s(&path))]))));
                 }
                 TraceDone::Saved(Err(why), _) => self.save_failed(cx, call, why),
@@ -537,8 +538,8 @@ impl ElecHost {
     }
 
     /// A save that failed: the AI's call hears why, a person's press (None) reads it in the Scope.
-    fn save_failed(&mut self, cx: &mut Cx, call: Option<u64>, why: String) {
-        if call.is_none() { self.trace_notice(cx, Some(format!("Trace not saved: {why}"))); }
+    fn save_failed(&mut self, cx: &mut Cx, call: Delivery, why: String) {
+        if reply(call).is_none() { self.trace_notice(cx, Some(format!("Trace not saved: {why}"))); }
         self.answer(call, Err(why));
     }
 

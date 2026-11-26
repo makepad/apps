@@ -401,7 +401,7 @@ fn an_ideal_clock_s_crystal_nets_rest_at_its_oscillator_s_bias() {
     let (net, part) = (input_net, input_part);
     let input = LowerInput {
         nets: ["0", "VCC", "X1", "X2"].into_iter().enumerate()
-            .map(|(i, name)| LowerNet { id: net(i as u32), name: name.into(), supply: false }).collect(),
+            .map(|(i, name)| LowerNet { id: net(i as u32), name: name.into(), supply: false, heard: false }).collect(),
         ground: net(0),
         supplies: vec![Supply { net: net(1), v: 5.0, limit: None, ramp: None }],
         sources: Vec::new(),
@@ -456,7 +456,7 @@ fn shift_registers_beside_firmware_lower_only_their_outputs() {
         register
     };
     let input = LowerInput {
-        nets: names.into_iter().enumerate().map(|(i, name)| LowerNet { id: net(i as u32), name: name.into(), supply: false }).collect(),
+        nets: names.into_iter().enumerate().map(|(i, name)| LowerNet { id: net(i as u32), name: name.into(), supply: false, heard: false }).collect(),
         ground: net(0),
         supplies: vec![Supply { net: net(1), v: 5.0, limit: None, ramp: None }],
         sources: Vec::new(),
@@ -520,7 +520,7 @@ fn a_probe_s_tip_load_lowers_across_its_points_and_an_ideal_tip_lowers_nothing()
     // between 22 pF to N and 22 pF to ground, with no DC path of its own
     let input = |probes: Vec<ScopeProbe>| LowerInput {
         nets: ["0", "IN", "N", "F"].into_iter().enumerate()
-            .map(|(i, name)| LowerNet { id: net(i as u32), name: name.into(), supply: false }).collect(),
+            .map(|(i, name)| LowerNet { id: net(i as u32), name: name.into(), supply: false, heard: false }).collect(),
         ground: net(0),
         supplies: vec![Supply { net: net(1), v: 5.0, limit: None, ramp: Some(1e-9) }],
         sources: Vec::new(),

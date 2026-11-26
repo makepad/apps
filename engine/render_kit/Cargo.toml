@@ -1,0 +1,34 @@
+# The rendering kit: every VFX a motion graphic or an edit
+# clip needs, as GPU passes that are pure functions of `t` and keyable
+# parameters — temporal motion blur and echo, blurs, glow and bloom,
+# shadows, stroke, bevel, gradients, noise, displacement, blend modes,
+# masks and mattes, 2.5D layers with a camera and depth of field,
+# particles, tapered path strokes and colour grading. A library the host
+# drives from its draw (Motion layers, edit clip Fx stacks), plus
+# `makepad-render-kit`, its GPU pixel tests, benchmarks and demo strip.
+[package]
+name = "makepad-stage-render-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "makepad_stage_render_kit"
+
+[[bin]]
+name = "makepad-render-kit"
+path = "src/main.rs"
+required-features = ["gpu"]
+
+[features]
+default = ["gpu"]
+# The GPU side: RenderKit's passes and shaders, and the demo tool. Without
+# it the crate is the effect catalog, keyable values, effect stacks and the
+# camera maths: what Motion checks a document's effects with, with no UI.
+gpu = ["dep:makepad-widgets", "dep:makepad-zune-png"]
+
+[dependencies]
+makepad-widgets = { path = "../../../../widgets", default-features = false, optional = true }
+# The demo strip and test failures are written as PNG.
+makepad-zune-png = { path = "../../../../libs/zune/zune-png", version = "0.5.2", optional = true }

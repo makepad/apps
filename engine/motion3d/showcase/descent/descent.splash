@@ -1,0 +1,189 @@
+use mod.scene.*; use mod.post
+// The descent and camera roll from P(DOOM) (REF-threejs-2104029135790072196
+// §2, 0:10–0:16.5), rebuilt from generic primitives with a new harbor lyric.
+// - the landscape is FieldGeometry over a Splash loss function;
+// - its isolines and hatching are shader code (fwidth, so they keep a
+//   constant pixel width);
+// - the optimizer trail is gradient descent run in Splash, drawn as a
+//   glowing Line3D with a comet tail;
+// - the lyric rides curves as Text3D paths;
+// - the camera is a flight through shots, from the chart into the world, with
+//   a 180° roll.
+// Time 0 here is 10.0 s of the reference.
+
+// ---- the loss surface (one function every part reads) ----------------
+let loss = fn(x, z) {
+    let bowl = 0.010 * ((x - 2.0) * (x - 2.0) + (z + 1.0) * (z + 1.0))
+    let r2 = (x - 3.0) * (x - 3.0) + (z + 2.0) * (z + 2.0)
+    let sharp = -1.6 * exp(0.0 - r2 / 6.0) - 1.3 * exp(0.0 - r2 / 0.7) - 1.3 * exp(0.0 - r2 / 0.07)
+    let flat = -0.9 * exp(0.0 - ((x + 4.5) * (x + 4.5) + (z - 3.5) * (z - 3.5)) / 7.0)
+    let ridge = 0.38 * sin(x * 0.42 + z * 0.2) * cos(z * 0.36 - x * 0.15)
+    let fine = 0.05 * sin(x * 1.6 + 1.7) * sin(z * 1.3 - 0.4) + 0.02 * sin(x * 3.1 - z * 2.3)
+    return 1.6 + bowl + sharp + flat + ridge + fine
+}
+
+// ---- gradient descent: momentum, a little noise (the jagged trail) and a
+// pull toward the sharp minimum that grows as it goes (the story).
+let descent = fn() {
+    let pts = []
+    var x = -7.0
+    var z = 6.0
+    var vx = 0.0
+    var vz = 0.0
+    let e = 0.01
+    let n = 220
+    for i in 0..n {
+        let s = i / n
+        let gx = (loss(x + e, z) - loss(x - e, z)) / (2.0 * e)
+        let gz = (loss(x, z + e) - loss(x, z - e)) / (2.0 * e)
+        let jit = sin(i * 1.7) * cos(i * 0.61)
+        vx = vx * 0.8 - 0.04 * gx + 0.05 * jit * (1.0 - s)
+        vz = vz * 0.8 - 0.04 * gz - 0.05 * jit * (1.0 - s)
+        let pull = 0.002 + 0.01 * s * s
+        vx = vx + pull * (3.0 - x)
+        vz = vz + pull * (-2.0 - z)
+        x = x + vx
+        z = z + vz
+        pts.push(vec3(x, loss(x, z) + 0.1, z))
+    }
+    return pts
+}
+let trail = descent()
+// The trail's length, so the lyric can ride just behind the head.
+let trail_len = fn() {
+    var l = 0.0
+    for i in 1..trail.len() {
+        l = l + (trail[i] - trail[i - 1]).length()
+    }
+    return l
+}
+let L = trail_len()
+let head = fn(t) { return clamp((t - 1.35) / 2.25, 0.0, 1.0) }
+let at = fn(u) {
+    let n = trail.len()
+    let k = clamp(u, 0.0, 1.0) * (n - 1)
+    let i = floor(k)
+    let j = min(i + 1, n - 1)
+    return trail[i] + (trail[j] - trail[i]) * (k - i)
+}
+
+// ---- the loss chart (a vertical plane that lays down to become the ground)
+let chart = fn() {
+    let pts = []
+    for i in 0..220 {
+        let s = i / 219.0
+        let x = -7.5 + 15.0 * s
+        let drop = 1.0 / (1.0 + exp((s - 0.55) * 40.0))
+        let y = 1.2 + 3.2 * drop + 0.18 * sin(i * 2.1) * cos(i * 0.73) + 0.08 * sin(i * 5.3)
+        pts.push(vec3(x, y, 0.0))
+    }
+    return pts
+}
+let curve = chart()
+// A smoothed copy for the lyric to ride (letters follow the trend, not the noise).
+let smooth = fn(src, k) {
+    let out = []
+    let n = src.len()
+    for i in 0..n {
+        var acc = vec3(0, 0, 0)
+        var w = 0.0
+        for j in (i - k)..(i + k + 1) {
+            let q = clamp(j, 0, n - 1)
+            acc = acc + src[q]
+            w = w + 1.0
+        }
+        out.push(acc / w + vec3(0, 0.25, 0))
+    }
+    return out
+}
+let ride = smooth(curve, 9)
+
+Scene3D{ background: #050506 tone_mapping: @aces
+  fog: Fog{color: #050506 near: 9 far: 32}
+  camera: Camera{fov: 36 up: tween(vec3(0, 1, 0), vec3(0, 1, 0), 0, 1)
+    shots: [
+      CameraShot{at: 0 hold: 0.95 position: vec3(0.3, 3.0, 16.5) target: vec3(0.3, 3.0, 6)}
+      CameraShot{at: 1.45 position: vec3(-5.5, 5.5, 13) target: at(0.05)}
+      // Following the optimizer: each shot frames the head and the lyric
+      // riding behind it (half the lyric's length back along the trail).
+      CameraShot{at: 1.95 position: at(head(1.95) - 2.2 / L) + vec3(2.2, 2.6, 3.6) target: at(head(1.95) - 2.2 / L) roll: -6}
+      CameraShot{at: 2.45 position: at(head(2.45) - 2.2 / L) + vec3(2.0, 2.8, 3.4) target: at(head(2.45) - 2.2 / L) roll: -9}
+      CameraShot{at: 3.2 position: vec3(3.6, 4.6, 5.4) target: vec3(3, -1.0, -2) roll: 2}
+      CameraShot{at: 3.8 hold: 2.1 position: vec3(3, 5.2, 3.2) target: vec3(3, -1.4, -2) fov: 50}
+      CameraShot{at: 6.4 position: vec3(3, 4.6, 2.6) target: vec3(3, -1.4, -2) roll: 180 fov: 50}
+    ]}
+  post: [
+    post.Bloom{strength: 0.9 threshold: 0.85}
+    post.DepthOfField{focus: 9 f_stop: 2.2}
+    post.Vignette{amount: 0.45}
+    FilmGrain{amount: 0.05}
+  ]
+  lights: [AmbientLight{intensity: 1}]
+  children: [
+    // The landscape: dark faces that hide what is behind, white isolines
+    // of height at a constant pixel width, a faint hatch across the slopes.
+    Mesh{name: "land" geometry: FieldGeometry{field: loss size: vec2(26, 26) segments: vec2(180, 180)}
+      scale: tween(vec3(1, 0.001, 1), vec3(1, 1, 1), 0.85, 1.6, @ease_in_out_cubic)
+      material: MeshBasicMaterial{color: #0b0b0d
+        uniforms: {spacing: 0.06 width: 0.7 hatch: 9 major: 5}
+        hooks: {
+        surface: fn(p: vec3, n: vec3, uv: vec2, t: float) -> vec4 {
+            let h = p.y / self.u_custom.x + 0.5
+            let fw = abs(dFdx(h)) + abs(dFdy(h))
+            let d = abs(fract(h) - 0.5) / max(fw, 0.0001)
+            let iso = 1.0 - clamp(d - self.u_custom.y, 0.0, 1.0)
+            let hm = h / self.u_custom.w
+            let fm = abs(dFdx(hm)) + abs(dFdy(hm))
+            let major = 1.0 - clamp(abs(fract(hm) - 0.5) / max(fm, 0.0001) - 0.9, 0.0, 1.0)
+            let q = p.x * self.u_custom.z
+            let fq = abs(dFdx(q)) + abs(dFdy(q))
+            let hatch = (1.0 - clamp(abs(fract(q) - 0.5) / max(fq, 0.0001) - 0.3, 0.0, 1.0)) * clamp(1.0 - n.y, 0.0, 1.0) * 0.5
+            let ink = max(max(iso * 0.55, major * 0.9), hatch * 0.3)
+            // A dim lit ground under the lines: slopes a little lighter.
+            let ground = self.u_color.xyz * (0.7 + 1.6 * clamp(1.0 - n.y, 0.0, 1.0))
+            return vec4(mix(ground, vec3(0.93, 0.92, 0.9), ink), 1.0)
+        }
+        }}}
+
+    // The loss chart: axes and the noisy orange curve drawing on, the lyric
+    // riding it; the whole plane lays down onto the ground as the camera dives.
+    Group3D{position: vec3(0, 0, 6) rotation: tween(vec3(0, 0, 0), vec3(-90, 0, 0), 0.9, 1.5, @ease_in_out_cubic)
+      opacity: tween(1, 0, 1.5, 2.1) children: [
+        Line3D{points: [vec3(-7.6, 5.4, 0), vec3(-7.6, 0.6, 0), vec3(7.8, 0.6, 0)] width: 2 color: #8a8a8a}
+        Line3D{polylines: [[vec3(-7.8, 1.6, 0), vec3(-7.6, 1.6, 0)], [vec3(-7.8, 2.6, 0), vec3(-7.6, 2.6, 0)], [vec3(-7.8, 3.6, 0), vec3(-7.6, 3.6, 0)], [vec3(-7.8, 4.6, 0), vec3(-7.6, 4.6, 0)]] width: 2 color: #8a8a8a}
+        Text3D{text: "LOSS (LOG)" font: @mono size: 0.18 depth: 0 position: vec3(-7.3, 5.3, 0) align: @left material: MeshBasicMaterial{color: #9a9a9a}}
+        Text3D{text: "STEP →" font: @mono size: 0.18 depth: 0 position: vec3(7.2, 0.25, 0) material: MeshBasicMaterial{color: #9a9a9a}}
+        Line3D{points: curve width: 3 color: #ff6a1a intensity: 2.2 tail: 0.0 trim_end: tween(0.05, 1, 0, 0.95, @linear)}
+        Mesh{geometry: SphereGeometry{radius: 0.09} position: fn(t) { return curve[floor(clamp((0.05 + 0.95 * t / 0.95), 0.0, 1.0) * 219)] }
+          material: MeshBasicMaterial{color: #ffd9a0 emissive: #ffb060 emissive_intensity: 8}}
+        Text3D{text: "We fold a silver road" font: @bold size: 0.62 depth: 0.02 path: CatmullRomCurve3{points: ride} path_start: 0.02
+          path_offset: tween(0, 5.2, 0, 0.95, @linear) by: @letter each: {opacity: tween(0, 1, 0, 0.12)} stagger: 0.035
+          material: MeshBasicMaterial{color: #f2efe8}}
+    ]}
+
+    // The optimizer's trail: glowing orange, a comet tail, drawing down into
+    // the sharp basin; its head a hot point.
+    Line3D{points: trail width: 4 color: #ff5a14 intensity: 3.2 tail: 0.7 trim_end: fn(t) { return head(t) } fade: vec2(14, 34)}
+    Line3D{points: trail width: 1.6 color: #ff5a14 intensity: 1.2 opacity: 0.6 trim_end: fn(t) { return head(t) } fade: vec2(14, 34)}
+    Mesh{geometry: SphereGeometry{radius: 0.08} position: fn(t) { return at(head(t)) }
+      material: MeshBasicMaterial{color: #ffe2b0 emissive: #ffa050 emissive_intensity: 10} span: vec2(1.35, 5.4)}
+
+    // The lyric follows the path in 3D.
+    Text3D{text: "along the harbor wall" font: @bold size: 0.34 depth: 0.02 path: CatmullRomCurve3{points: trail} path_start: 0.0
+      path_offset: fn(t) { return max(head(t) * L - 4.6, 0.0) } span: vec2(1.2, 2.25) by: @word stagger: 0.28 each: {opacity: tween(0, 1, 1.25, 1.45)}
+      material: MeshBasicMaterial{color: #ffb07a emissive: #ff7a30 emissive_intensity: 1.2}}
+
+    // The basin's labels, laid on the ground and facing up.
+    Callout{target: vec3(3.3, -1.2, -1.5) offset: vec3(1.1, 1.0, 0) text: "sharp minimum" size: 0.2 color: #c8c8c8 color2: #c8c8c8 start: 3.6}
+    Text3D{text: "(generalizes poorly)" font: @mono size: 0.16 depth: 0 position: vec3(4.7, 0.45, -1.95) look_at: @camera span: vec2(3.9, 3) material: MeshBasicMaterial{color: #7a7a7a}}
+    Text3D{text: "1e-8" font: @mono size: 0.22 depth: 0 position: vec3(5.6, 1.1, -0.2) rotation: vec3(-90, 0, 20) span: vec2(3.2, 4) material: MeshBasicMaterial{color: #cfcfcf}}
+    Text3D{text: "1e-7" font: @mono size: 0.22 depth: 0 position: vec3(-1.4, 1.35, 0.8) rotation: vec3(-90, 0, -30) span: vec2(3.2, 4) material: MeshBasicMaterial{color: #cfcfcf}}
+    Text3D{text: "Tide 0.04" font: @mono size: 0.22 depth: 0 position: vec3(2.4, 1.3, 1.6) rotation: vec3(-90, 0, 0) span: vec2(3.2, 4) material: MeshBasicMaterial{color: #ff5a14}}
+
+    // "Day hems the SKYLINE": wide heavy type over the basin, letters filling in turn.
+    Text3D{text: "DAY HEMS THE" font: @mono size: 0.18 depth: 0 position: vec3(0.95, 2.95, -0.55) look_at: @camera align: @left span: vec2(3.5, 3.4) material: MeshBasicMaterial{color: #e8e6e0}}
+    Text3D{text: "SKYLINE" font: @bold size: 0.72 depth: 0.1 tracking: 0.06 position: vec3(3, 2.75, -0.5) look_at: @camera span: vec2(3.75, 3.2)
+      by: @letter stagger: 0.18 each: {opacity: tween(0.15, 1, 0, 0.12)} material: MeshBasicMaterial{color: #f2efe8}}
+    // "night pulls one SEAM": after the roll, the other way up.
+    Text3D{text: "SEAM" font: @bold size: 0.72 depth: 0.1 tracking: 0.06 position: vec3(3.0, 1.65, 0.7) look_at: @camera rotation: vec3(0, 0, 180) span: vec2(6.1, 1) by: @letter stagger: 0.1 each: {opacity: tween(0, 1, 0, 0.1)} material: MeshBasicMaterial{color: #f2efe8}}
+  ] }

@@ -33,6 +33,7 @@ pub const COMMANDS: &[(&str, &str, Option<Key>)] = &[
     ("measure edge", "Measure Edge", None),
     ("measure radius", "Measure Radius", None),
     ("measure faces", "Measure Faces", None),
+    ("measure fit", "Measure Fit", None),
     ("undo", "Undo", Some(Key::Undo)),
     ("redo", "Redo", Some(Key::Redo)),
     ("undo ai turn", "Undo the AI's Last Turn", None),
@@ -52,6 +53,12 @@ pub const COMMANDS: &[(&str, &str, Option<Key>)] = &[
     ("toggle zones", "Nozzle Zones", None),
     ("toggle code", "Show or Hide the Code", Some(Key::Code)),
     ("insert selector", "Insert the Picks' Selectors in the Code", None),
+    ("round", "Round the Picked Edges", None),
+    ("chamfer", "Chamfer the Picked Edges", None),
+    ("pull", "Pull the Picked Face", None),
+    ("hole", "Drill a Hole at the Picked Face", None),
+    ("shell", "Shell, Open at the Picked Faces", None),
+    ("repeat last", "Repeat the Last Command on the Picks", None),
     ("drop to plate", "Drop to Plate", None),
     ("arrange plate", "Arrange Plate", None),
     ("toggle overhangs", "Overhangs", None),
@@ -290,8 +297,15 @@ impl FabCommandPalette {
         }
     }
 
-    fn run(&mut self, cx: &mut Cx) {
+    fn blocked(i: usize, scope: &mut Scope) -> Option<String> {
+        let (command, _, _) = COMMANDS.get(i)?;
+        if !crate::tools::picks::modelling_command(command) { return None; }
+        scope.data.get::<AppState>()?.pick_tool_block_reason()
+    }
+
+    fn run(&mut self, cx: &mut Cx, scope: &mut Scope) {
         if let Some(&i) = self.hits.get(self.cursor) {
+            if Self::blocked(i, scope).is_some() { return; }
             cx.action(ShellAction::ToggleCommandPalette);
             match COMMANDS.get(i) {
                 Some((name, _, _)) => cx.action(ShellAction::Command(name.to_string())),
@@ -324,7 +338,7 @@ impl Widget for FabCommandPalette {
                     }
                 }
                 KeyCode::ReturnKey => {
-                    self.run(cx);
+                    self.run(cx, scope);
                     return;
                 }
                 _ => {}
@@ -352,7 +366,7 @@ impl Widget for FabCommandPalette {
             // A press taken away (a list or the host took the finger) runs nothing.
             if self.view.view(cx, id).finger_up(actions).is_some_and(|e| !e.cancelled) {
                 self.cursor = self.top + slot;
-                self.run(cx);
+                self.run(cx, scope);
                 return;
             }
         }
@@ -385,7 +399,7 @@ impl Widget for FabCommandPalette {
                 match hits.get(self.top + slot) {
                     Some(&ci) => {
                         let (label, key) = self.row(ci);
-                        let (label, key) = (label.to_string(), key);
+                        let label = Self::blocked(ci, scope).map_or_else(|| label.to_string(), |why| format!("{label} · {why}"));
                         row.set_visible(cx, true);
                         row.label(cx, ids!(label)).set_text(cx, &label);
                         row.label(cx, ids!(shortcut)).set_text(cx, &key.map(keymap::shortcut).unwrap_or_default());

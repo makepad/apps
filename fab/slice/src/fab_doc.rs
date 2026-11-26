@@ -69,15 +69,16 @@ pub fn evaluate(setup: &JobSetup, model: &FabModel, calibrated: &Arc<colour_sets
 
 /// The evaluated parts sliced: their print colours in `colors` order print with filaments 1,
 /// 2, .. (each on the nozzle the job's filament map gives it), every other with filament 1;
-/// each filament's colour is its print colour's as the parts show it.
+/// painted names supply filament colours from the print mapping in either viewport mode.
 pub fn slice(setup: &mut JobSetup, ev: &mut Evaluated, colors: &[String]) -> Result<SliceResult, String> {
     let map = setup.filament_map.clone();
     let part_colors = ev.part_colors.clone();
     ev.plate.map_colors(&part_colors, &|name| colors.iter().position(|c| c == name).map(|k| (k as u32 + 1, map.get(k).map_or(0, |n| n.max(&1) - 1) as usize)));
     for (k, name) in colors.iter().enumerate().take(setup.filaments.len()) {
-        let shown = ev.plate.parts.iter().filter_map(|p| p.paint.as_ref()).flat_map(|sp| sp.colors.iter()).find(|c| c.color.as_deref() == Some(name.as_str()));
-        if let Some(c) = shown {
-            setup.filament_colours[k] = Some(format!("#{:06X}", fab_model::program::color_srgb(c.rgb) >> 8));
+        let painted = ev.plate.parts.iter().filter_map(|p| p.paint.as_ref()).flat_map(|sp| sp.colors.iter()).any(|c| c.color.as_deref() == Some(name.as_str()));
+        if painted {
+            let rgb = fab_model::eval::shown_color(&ev.colors, &ev.mapped.inks, name);
+            setup.filament_colours[k] = Some(format!("#{:06X}", fab_model::program::color_srgb(rgb) >> 8));
         }
     }
     let frames: Vec<Frame> = ev

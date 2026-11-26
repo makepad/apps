@@ -86,6 +86,7 @@ pub fn kind_word(name: &str) -> &'static str {
         Some(DocKind::Profile) => "profile",
         Some(DocKind::View) => "view",
         Some(DocKind::Firmware) => "firmware",
+        Some(DocKind::Requirements) => "requirements",
         None => "other",
     }
 }

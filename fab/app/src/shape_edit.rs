@@ -27,12 +27,13 @@ use fab::api::{settings_span, BedArea, ShapeOp, ShapePrim, NO_TREES_HEIGHT};
 use fab_model::eval::{euler_xyz, rotation_xyz, turn_onto, Evaluated};
 use fab_model::program::{part_id, Compiled, Instance};
 use fab_model::volumes::{free_name, mm, settings_statement, taken, ModelWriter, DEFAULT_SETTINGS};
-use fab_model::{Change, Edit, PlaceArg};
+use fab_model::{Anchor, Change, Edit, PlaceArg};
 use makepad_model_script::lang::csg_graph::{eval::transform_matrix, Op};
 use fab_plate::machine::Rect;
 use fab_plate::Bounds;
 use makepad_model_script::lang::edit::{call_fields, part_call};
 use makepad_model_script::lang::{protos, Program, Solid};
+use makepad_script::syntax::write::list;
 
 /// Where the object sits: its model-to-plate frame (row-major 3x4, mm) and its box on the plate.
 pub struct Placed {
@@ -70,7 +71,7 @@ pub fn changes(inst: &Instance, target: &str, op: ShapeOp, at: &Placed, bed: &Re
         Some(field) => {
             let old = field_code(p, s, field)?;
             let old = old.strip_prefix('[').and_then(|o| o.strip_suffix(']')).unwrap_or(&old).trim().to_string();
-            edits.push(Edit::Add { code: tool, before: Some(target.to_string()) });
+            edits.push(Edit::Add { code: tool, at: Anchor::Before(target.to_string()) });
             edits.push(Edit::Field { solid: target.to_string(), field: field.to_string(), code: format!("[{old} {name}]") });
         }
         None => {
@@ -92,8 +93,8 @@ pub fn changes(inst: &Instance, target: &str, op: ShapeOp, at: &Placed, bed: &Re
                 (false, true) => format!("m.blend([{base} {name}], 0mm)"),
                 (false, false) => format!("m.union({base}, [{name}])"),
             };
-            edits.push(Edit::Add { code: format!("let {base} = {}", &p.source()[span]), before: Some(target.to_string()) });
-            edits.push(Edit::Add { code: tool, before: Some(target.to_string()) });
+            edits.push(Edit::Add { code: format!("let {base} = {}", &p.source()[span]), at: Anchor::Before(target.to_string()) });
+            edits.push(Edit::Add { code: tool, at: Anchor::Before(target.to_string()) });
             edits.push(Edit::Replace { solid: target.to_string(), code: joined });
         }
     }
@@ -128,7 +129,7 @@ pub fn split(inst: &Instance, target: &str, at: &Placed, bed: &Rect) -> Result<(
         let r = (v * 10_000.0).round() / 10_000.0;
         if r == 0.0 { 0.0 } else { r }
     };
-    let opts = format!("{{center: [{}, {}, {}] normal: [{} {} {}]}}", mm(center[0]), mm(center[1]), mm(center[2]), dir(normal[0]), dir(normal[1]), dir(normal[2]));
+    let opts = format!("{{center: {} normal: {}}}", list(center.map(mm)), list(normal.map(|v| dir(v).to_string())));
     let mut edits = vec![Edit::Root { kind: "object".into(), solid: target.to_string(), add: false }];
     // The slab alone cut the part: its base splits. Else the rest of the part does.
     let sole = slab.filter(|&c| field_code(p, s, "b").is_ok_and(|b| b.trim_matches(|ch: char| ch == '[' || ch == ']' || ch.is_whitespace()) == p.solids[c].id));
@@ -140,15 +141,15 @@ pub fn split(inst: &Instance, target: &str, at: &Placed, bed: &Rect) -> Result<(
         None => {
             let whole = free_name(p, &format!("{target}_whole"), false);
             edits.push(Edit::Rename { solid: target.to_string(), to: whole.clone() });
-            edits.push(Edit::Add { code: format!("let {target} = m.split({whole}, {opts})"), before: None });
+            edits.push(Edit::Add { code: format!("let {target} = m.split({whole}, {opts})"), at: Anchor::Auto });
             if let Some(c) = slab {
                 edits.push(Edit::Remove { solid: p.solids[c].id.clone() });
             }
         }
     }
     let other = (2..).map(|i| format!("{}_{i}", object.name)).find(|n| !inst.script.objects.iter().any(|o| o.name == *n) && !taken(p, n)).unwrap();
-    edits.push(Edit::Add { code: format!("object({target}[1], name: \"{}\")", object.name), before: None });
-    edits.push(Edit::Add { code: format!("object({target}[0], name: \"{other}\")"), before: None });
+    edits.push(Edit::Add { code: format!("object({target}[1], name: \"{}\")", object.name), at: Anchor::Auto });
+    edits.push(Edit::Add { code: format!("object({target}[0], name: \"{other}\")"), at: Anchor::Auto });
     let file = inst.script.file.clone();
     let mut changes: Vec<Change> = edits.into_iter().map(|edit| Change::Script { file: file.clone(), edit }).collect();
     // Both halves turn the cut's normal up, the kept one about its middle.

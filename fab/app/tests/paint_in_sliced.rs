@@ -96,7 +96,7 @@ fn follow(app: &TestApp, from: u64) -> Reslice {
     let mut read = 0;
     let mut whole_since = None;
     wait_poll(app, || {
-        let lines = app.log_since(from).map(|t| t.lines).unwrap_or_default();
+        let lines = app.log_since(from).expect("the app's log").lines;
         for line in &lines[read.min(lines.len())..] {
             if let Some(revision) = field(line, "fab live input: revision=") {
                 r = Reslice { revision: Some(revision), inputs: r.inputs + 1, ..Default::default() };

@@ -1,6 +1,6 @@
 //! Layer art: a board's layers rasterised into board-space tiles, what Fab's 3D board material
 //! samples (and what the 2D board view can reuse as its far-zoom picture). The packing is the one
-//! contract EBOARD and E3D share (local/agent_state/electronics/shared/tile-packing.md):
+//! contract EBOARD and E3D share:
 //!
 //! | Plane | r | g | b | a |
 //! |---|---|---|---|---|

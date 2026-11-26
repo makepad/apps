@@ -212,6 +212,8 @@ pub const SETTINGS_KIND: &str = "print settings";
 pub struct FeatureRow {
     pub id: String,
     pub op: String,
+    /// The builder verb or group kind shown and spoken for this row.
+    pub verb: String,
     /// The object it makes or changes ("" if none).
     pub object: String,
     /// The solid's host key, empty when it has none.
@@ -248,7 +250,7 @@ pub struct FeatureRow {
 impl FeatureRow {
     /// A test print's row: a feature of its model in the tree, with no code of its own, so no eye.
     pub fn test_print(name: &str, object: &str) -> FeatureRow {
-        FeatureRow { id: format!("{TEST_PRINT_ID}{name}"), op: TEST_PRINT_KIND.to_string(), object: object.to_string(), detail: TEST_PRINT.to_string(), ..Default::default() }
+        FeatureRow { id: format!("{TEST_PRINT_ID}{name}"), op: TEST_PRINT_KIND.to_string(), verb: TEST_PRINT_KIND.to_string(), object: object.to_string(), detail: TEST_PRINT.to_string(), ..Default::default() }
     }
 
     /// What the tree calls it.
@@ -1551,12 +1553,12 @@ impl Widget for FabFeatureTree {
                 self.draw_name.draw_abs(cx, at, &name);
                 let mut after = at.x + self.draw_name.prepare_single_line_run(cx, &name).map_or(0.0, |run| run.width_in_lpxs as f64) + 6.0;
                 // its kind ("cylinder"), in the quietest ink
-                if !f.op.is_empty() {
+                if !f.verb.is_empty() {
                     self.draw_op.color = self.color_kind;
                     if f.off { self.draw_op.color.w *= 0.4; }
-                    self.draw_op.draw_abs(cx, dvec2(after, r.pos.y + 6.0), &f.op);
+                    self.draw_op.draw_abs(cx, dvec2(after, r.pos.y + 6.0), &f.verb);
                     self.draw_op.color = dim_color;
-                    after += self.draw_op.prepare_single_line_run(cx, &f.op).map_or(0.0, |run| run.width_in_lpxs as f64) + 6.0;
+                    after += self.draw_op.prepare_single_line_run(cx, &f.verb).map_or(0.0, |run| run.width_in_lpxs as f64) + 6.0;
                 }
                 // How it takes part in its parent, in a disc after the kind: − cut away, + joined,
                 // ∩ intersected; the base has none.
@@ -1611,7 +1613,7 @@ impl Widget for FabFeatureTree {
                 self.draw_row.draw_abs(cx, Rect { pos: dvec2(x, if *after { r.pos.y + ROW - 2.0 } else { r.pos.y - 2.0 }), size: dvec2((r.pos.x + r.size.x - x).max(0.0), 2.0) });
             }
             if partial { cx.end_turtle(); }
-            self.rows.push(FeatureHit { rect: r, name: name_rect, fold, folded: is_folded(f), eye, link, key: f.link.clone(), label: format!("{role} {} {} level {}{}{}{}", f.op, f.name(), f.depth + 1, if f.off { " bypassed" } else { "" }, if f.link.is_empty() { "" } else { " linked" }, mark.as_ref().map(|what| format!(", {what}")).unwrap_or_default()), id: f.id.clone(), parent: f.parent.clone(), editable: f.editable, bypass: f.editable && !f.root && f.op != "call" && !settings, off: f.off, mark: mark_rect, role: f.role, can_role: f.can_role });
+            self.rows.push(FeatureHit { rect: r, name: name_rect, fold, folded: is_folded(f), eye, link, key: f.link.clone(), label: format!("{role} {} {} level {}{}{}{}", f.verb, f.name(), f.depth + 1, if f.off { " bypassed" } else { "" }, if f.link.is_empty() { "" } else { " linked" }, mark.as_ref().map(|what| format!(", {what}")).unwrap_or_default()), id: f.id.clone(), parent: f.parent.clone(), editable: f.editable, bypass: f.editable && !f.root && f.op != "call" && !settings, off: f.off, mark: mark_rect, role: f.role, can_role: f.can_role });
         }
         cx.end_turtle();
         self.draw_name.color = name_color;

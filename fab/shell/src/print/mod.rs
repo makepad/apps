@@ -241,8 +241,7 @@ impl ColorBy {
 pub struct JobMaterial {
     /// The filament preset its tray's material resolves to (in Fab defaults: a label only).
     pub preset: String,
-    /// Its colour (linear RGBA) as Sliced and Print draw it: the colour its tray reports,
-    /// else its print colour's own colour.
+    /// Its print-side linear RGBA, from the linked tray or the unmapped red.
     pub color: [f32; 4],
     /// The nozzle it prints with (the machine's index: left 0, right 1).
     pub nozzle: usize,
@@ -491,6 +490,34 @@ impl PreviewMelt {
     }
 }
 
+/// Both views of the same filament slots. A saved job can predate the model palette.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ToolColours {
+    pub material: Vec<[f32; 4]>,
+    pub model: Vec<[f32; 4]>,
+    /// Zero-based slots shared by several model colours.
+    pub shared_tools: Vec<usize>,
+}
+
+impl ToolColours {
+    pub fn shown(&self, mode: fab_plate::ColourMode) -> &[[f32; 4]] {
+        match mode {
+            fab_plate::ColourMode::Model if !self.model.is_empty() => &self.model,
+            _ => &self.material,
+        }
+    }
+
+    /// The job slots which actually printed, in their slice order.
+    pub fn for_tools(&self, tools: &[usize]) -> Self {
+        let [r, g, b] = fab_plate::UNMAPPED_RGB;
+        Self {
+            material: tools.iter().map(|&i| self.material.get(i).copied().unwrap_or([r, g, b, 1.0])).collect(),
+            model: tools.iter().map(|&i| self.model.get(i).copied().unwrap_or([0.8, 0.8, 0.78, 1.0])).collect(),
+            shared_tools: tools.iter().enumerate().filter_map(|(slot, tool)| self.shared_tools.contains(tool).then_some(slot)).collect(),
+        }
+    }
+}
+
 /// A sliced plate ready to play.
 pub struct PrintPreview {
     /// A test plate's pieces, one per test print: none for a whole plate.
@@ -529,7 +556,7 @@ pub struct PrintPreview {
     pub bounds: [[f32; 3]; 2],
     /// Commanded speed range of the extrusions (mm/s).
     pub speed_range: [f32; 2],
-    pub filament_colors: Vec<[f32; 4]>,
+    pub colours: ToolColours,
     pub roles: Vec<PreviewRole>,
     /// The feature table's rows after the roles: time at the tool changes.
     pub changes: Vec<PreviewChange>,
@@ -985,7 +1012,7 @@ impl PrintPreview {
     }
 
     /// The palette texture's texels (see [`palette`]).
-    pub fn palette(&self) -> Vec<f32> {
+    pub fn palette(&self, mode: fab_plate::ColourMode) -> Vec<f32> {
         let mut data = vec![0.5f32; palette::WIDTH * 4];
         let mut put = |i: usize, c: [f32; 4]| data[i * 4..i * 4 + 4].copy_from_slice(&c);
         for r in &self.roles {
@@ -993,7 +1020,7 @@ impl PrintPreview {
                 put(palette::ROLES + r.id as usize, r.color);
             }
         }
-        for (i, c) in self.filament_colors.iter().take(palette::FILAMENT_COUNT).enumerate() {
+        for (i, c) in self.colours.shown(mode).iter().take(palette::FILAMENT_COUNT).enumerate() {
             put(palette::FILAMENTS + i, *c);
         }
         put(palette::NOZZLES, NOZZLE_COLORS[0]);
@@ -1172,6 +1199,8 @@ pub struct PrintState {
     /// Bumped when [`Self::base_values`] change.
     pub base_revision: u64,
     pub profiles: PrintProfiles,
+    /// Available links and the controls for the selected virtual printer.
+    pub links: PrinterPicker,
     pub status: SliceStatus,
     /// The parts of the plate being sliced that won't fit the selected printer (off its bed, or
     /// out of a nozzle's reach): they slice anyway, and this says so beside the slice.
@@ -1199,7 +1228,9 @@ pub struct PrintState {
     pub exported: Option<std::path::PathBuf>,
     /// Bumped on every change the viewport must redraw for.
     pub revision: u64,
-    pub printer: Option<Arc<fab_printer_link::Snapshot>>,
+    pub printers: Printers,
+    pub camera: crate::ui::camera::PrinterCamera,
+    pub camera_turns: crate::ui::camera::CameraTurns,
     /// The print colours on the printer (each one's position, its material, its warnings):
     /// made again on a printer report or a project change, never per frame.
     pub colors: colours::Mapping,
@@ -1224,8 +1255,8 @@ pub struct PrintState {
     pub accept_errors: Option<u64>,
     /// The job whose package is being made for the printer (Start print was pressed).
     pub sending: Option<String>,
-    /// Stop was pressed: the confirm row shows.
-    pub confirm_stop: bool,
+    /// The destination whose Stop confirmation is open.
+    pub confirm_stop: Option<ControlDestination>,
     pub print_options: fab_printer_link::PrintOptions,
     /// The print safety check of the shown slice (Ok: what passed; Err: why it is refused).
     /// Start print is offered only after a pass.
@@ -1288,6 +1319,26 @@ impl StreamedIssues {
 }
 
 impl PrintState {
+    /// The latest snapshot of the printer the plate is prepared for.
+    pub fn target_printer(&self) -> Option<&Arc<fab_printer_link::Snapshot>> {
+        self.printer_of(&self.links.picked)
+    }
+
+    /// The target snapshot, for fixtures that update its report in place.
+    pub fn target_printer_mut(&mut self) -> Option<&mut Arc<fab_printer_link::Snapshot>> {
+        self.printers.get_mut(&self.links.picked)
+    }
+
+    /// The latest snapshot of the printer Monitor shows, the target until M3.
+    pub fn shown_printer(&self) -> Option<&Arc<fab_printer_link::Snapshot>> {
+        self.target_printer()
+    }
+
+    /// The latest snapshot reported by this printer.
+    pub fn printer_of(&self, choice: &PrinterChoice) -> Option<&Arc<fab_printer_link::Snapshot>> {
+        self.printers.get(choice)
+    }
+
     /// The slice in a word and a fraction: `Slicing` with its progress, `Failed`, `Sliced` while
     /// the shown slice is current, `Waiting` when the Slice view is open and the slice is not
     /// there yet, `Off` when nothing asks for one (Sliced, Monitor, Print and Export each slice
@@ -1333,7 +1384,7 @@ impl PrintState {
     /// printability check still running.
     pub fn firm_blocker(&self) -> Option<String> {
         // A used print colour with no tray would silently print with the first material's spool.
-        if self.printer.is_some() {
+        if self.target_printer().is_some() {
             let mut open = self.colors.rows.iter().filter(|r| r.used && r.unassigned());
             if let Some(first) = open.next() {
                 let more = open.count();
@@ -1649,10 +1700,122 @@ impl PrintState {
     }
 }
 
+/// A link is independent of the machine profile used for slicing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum PrinterChoice {
+    #[default]
+    None,
+    Real(String),
+    Virtual(String),
+}
+
+/// The latest snapshots by printer choice, in insertion order.
+#[derive(Default)]
+pub struct Printers(Vec<(PrinterChoice, Arc<fab_printer_link::Snapshot>)>);
+
+impl Printers {
+    pub fn get(&self, choice: &PrinterChoice) -> Option<&Arc<fab_printer_link::Snapshot>> {
+        self.0.iter().find(|(id, _)| id == choice).map(|(_, snapshot)| snapshot)
+    }
+
+    pub fn get_mut(&mut self, choice: &PrinterChoice) -> Option<&mut Arc<fab_printer_link::Snapshot>> {
+        self.0.iter_mut().find(|(id, _)| id == choice).map(|(_, snapshot)| snapshot)
+    }
+
+    pub fn set(&mut self, choice: &PrinterChoice, snapshot: Arc<fab_printer_link::Snapshot>) {
+        if let Some(previous) = self.get_mut(choice) {
+            *previous = snapshot;
+        } else {
+            self.0.push((choice.clone(), snapshot));
+        }
+    }
+
+    pub fn remove(&mut self, choice: &PrinterChoice) -> Option<Arc<fab_printer_link::Snapshot>> {
+        let index = self.0.iter().position(|(id, _)| id == choice)?;
+        Some(self.0.remove(index).1)
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+impl PrinterChoice {
+    /// The destination saved in the printer picker and in a committed job.
+    pub fn id(&self) -> Option<String> {
+        match self {
+            Self::Real(name) => Some(format!("printer:{name}")),
+            Self::Virtual(name) => Some(format!("virtual:{name}")),
+            Self::None => None,
+        }
+    }
+}
+
+/// The printer shown when a control was drawn. A configured printer can report in either mode.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ControlDestination {
+    Filament { choice: PrinterChoice, virtual_printer: bool },
+    ResinJob { printer: String, stack: Option<u64>, started: Option<f64> },
+}
+
+impl ControlDestination {
+    pub fn filament(state: &PrintState) -> Option<Self> {
+        let report = state.shown_printer()?;
+        (state.links.picked != PrinterChoice::None).then(|| Self::Filament {
+            choice: state.links.picked.clone(), virtual_printer: report.virtual_printer,
+        })
+    }
+
+    pub fn resin(job: &resin::ResinJob) -> Self {
+        Self::ResinJob { printer: job.printer.clone(), stack: job.stack, started: job.started }
+    }
+
+    pub fn matches(&self, state: &PrintState) -> bool {
+        match self {
+            Self::Filament { choice, virtual_printer } => choice != &PrinterChoice::None && choice == &state.links.picked
+                && state.shown_printer().is_some_and(|s| s.virtual_printer == *virtual_printer),
+            Self::ResinJob { printer, stack, started } => state.resin_job.as_ref().is_some_and(|j|
+                !j.ended() && &j.printer == printer && &j.stack == stack && &j.started == started),
+        }
+    }
+}
+
+/// Counts shown on the virtual card. Updated on layout changes so drawing never counts trays.
+#[derive(Clone, Copy, Debug)]
+pub struct VirtualControls {
+    pub kind: makepad_fab_settings::virtual_printer::Kind,
+    pub heads: usize,
+    pub trays: usize,
+    pub tpu: bool,
+}
+
+/// Labels for the link and reset menus, and any reason the last change was refused.
+#[derive(Default)]
+pub struct PrinterPicker {
+    pub disconnected: bool,
+    pub choices: Vec<(PrinterChoice, String)>,
+    pub picked: PrinterChoice,
+    /// The selected menu label, shared by successive draws.
+    pub title: String,
+    pub presets: Vec<(String, String)>,
+    pub twin_presets: Vec<String>,
+    pub layout: Option<VirtualControls>,
+    pub note: String,
+}
+
 /// Everything the Print editor asks for. Settings and Slice/Export are the
 /// app's (it owns the slicer); playback is [`apply`]'s.
 #[derive(Clone, Debug)]
 pub enum PrintAction {
+    /// Switch which printer reports to this panel.
+    LinkPrinter(PrinterChoice),
+    /// Choose a configured printer’s link mode.
+    PrinterMode(String, bool),
+    MakeTwin(String),
+    /// Change the feed paths of the linked virtual printer.
+    VirtualLayout { kind: makepad_fab_settings::virtual_printer::Kind, heads: usize, trays: usize, tpu: bool },
+    /// Restore a factory layout and its loaded spools to the linked virtual printer.
+    ResetVirtual(String),
     /// Whole plate (false) or the ticked test prints (true): what the Slicer shows, slices and prints.
     TestMode(bool),
     Overhangs(bool),
@@ -1700,7 +1863,7 @@ pub enum PrintAction {
     // ---- the linked printer ----
     /// Show (or close) the confirm row of Print / Stop. Nothing is sent.
     AskPrint(bool),
-    AskStop(bool),
+    AskStop(ControlDestination, bool),
     SetPrintOption(PrintOption, bool),
     /// The confirm card's "Print anyway" tick: Start print goes with the shown slice's
     /// printability errors.
@@ -1724,7 +1887,9 @@ pub enum PrintAction {
     /// The job is over and read: its card goes.
     CloseJob,
     /// Pause, resume, stop (confirmed), clear the error, list the storage (the app's).
-    PrinterControl(PrinterControl),
+    PrinterControl(ControlDestination, PrinterControl),
+    /// How fast a virtual printer runs its job (the app's: it tells the held link).
+    SetVirtualSpeed(fab_printer_link::Speed),
     /// Monitor follows the printer's job (on by default); manual playback turns it off.
     FollowPrinter(bool),
     /// Set what a tray of the offline loadout holds (the app's; a reporting printer's trays
@@ -1936,7 +2101,7 @@ fn apply_play(state: &mut PrintState, action: &PrintAction) -> bool {
         PrintAction::CutAtLayer(on) => p.cut = *on,
         PrintAction::ComparePlanar(on) => p.compare_planar = *on,
         PrintAction::AskPrint(on) => {
-            state.confirm_stop = false;
+            state.confirm_stop = None;
             if *on {
                 // Already open: it stays as it is (a tick on the plate check too), back in view.
                 if !state.confirm_print {
@@ -1951,7 +2116,12 @@ fn apply_play(state: &mut PrintState, action: &PrintAction) -> bool {
             }
             state.confirm_print = *on;
         }
-        PrintAction::AskStop(on) => { state.confirm_stop = *on; state.confirm_print = false; }
+        PrintAction::AskStop(dest, true) if dest.matches(state) => {
+            state.confirm_stop = Some(dest.clone());
+            state.confirm_print = false;
+        }
+        PrintAction::AskStop(dest, false) | PrintAction::PrinterControl(dest, PrinterControl::Stop)
+            if state.confirm_stop.as_ref() == Some(dest) => state.confirm_stop = None,
         // a resin printer's tick is for its stack
         PrintAction::AcceptErrors(on) if state.resin.is_some() => {
             let r = state.resin.as_mut().unwrap();
@@ -2000,7 +2170,6 @@ fn apply_play(state: &mut PrintState, action: &PrintAction) -> bool {
         PrintAction::AskStartJob(id) => state.follow.confirm_start = id.clone(),
         PrintAction::StartJob(_) => state.follow.confirm_start = None,
         PrintAction::RemoveJob(_) => {}
-        PrintAction::PrinterControl(PrinterControl::Stop) => state.confirm_stop = false,
         _ => return false,
     }
     state.bump();
@@ -2132,7 +2301,7 @@ mod tests {
             grown: None,
             bounds: [[0.0; 3], [10.0, 0.0, 0.6]],
             speed_range: [100.0, 100.0],
-            filament_colors: vec![[1.0; 4]],
+            colours: ToolColours { material: vec![[1.0; 4]], model: vec![[1.0; 4]], ..Default::default() },
             roles: Vec::new(),
             changes: Vec::new(),
             timeline: Arc::new(Still),
@@ -2163,7 +2332,7 @@ mod tests {
         assert_eq!(p.cut_at(99.0).count(), 6);
         assert_eq!(p.layer_at(0.5), 0);
         assert_eq!(p.layer_at(4.0), 2);
-        assert_eq!(p.palette().len(), palette::WIDTH * 4);
+        assert_eq!(p.palette(fab_plate::ColourMode::Model).len(), palette::WIDTH * 4);
     }
 
     #[test]

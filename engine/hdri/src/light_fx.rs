@@ -22,14 +22,15 @@
 //! light's own box, or for a stroke the box round the stroke (`face_axes`).
 
 use super::*;
-use super::aim::Aim;
-use super::gobo::Gobo;
+use super::aim::{Aim, FabricGrid};
+use super::gobo::{Gobo, Penumbra};
 use super::imperfections::Imperfections;
 use super::modifier::Modifier;
 use super::noise::hash01;
 use super::shaped::{box_x_sign, face_frame, half_extents, stroke_box};
 use super::space::{beam_exponent, beam_factor};
 use super::studio::{project_held, LightFrame};
+use crate::sky::luminance;
 
 /// Strata per axis for the key light's share (`LightFx::key_share`).
 /// Jittered, because a regular grid beats against panes, slats and grid cells.
@@ -52,6 +53,13 @@ const KEY_JITTER_SEED: u32 = 0x6b65_7921;
 /// Midpoints per axis of the scan that finds where in its box a key draws,
 /// before the strata are laid over that part (`LightFx::key_share`).
 const KEY_SCAN: i32 = 48;
+/// A window's frame and bars are painted and catch the daylight its glass
+/// lets in: the Lightmap "Main Window" photograph reads its frame, sash and
+/// bars at 0.023-0.039 of the sky in its upper panes and 0.15 of the street
+/// in its lower ones, 0.065 of the mean of what its glass shows, a near
+/// neutral grey a touch toward the sky's colour (`FRAME_TINT`).
+const FRAME_LIT: f32 = 0.065;
+const FRAME_TINT: f32 = 0.25;
 
 /// The box every extra is laid in, with the two facts each needs about it:
 /// its frame, `sx`, the sign that turns the frame's `right` into the viewer's
@@ -133,11 +141,24 @@ impl LightFx {
             gain: 2.0f32.powf(light.intensity_ev),
             fill_sky: gobo.is_some_and(|g| g.fill_sky),
             frame_hides: false,
-            gobo: gobo.and_then(|g| Gobo::new(g, half, images)),
-            aim: aim.as_ref().and_then(|a| Aim::new(a, toward, frame.right * sx, frame.up, half, light.softness)),
+            gobo: gobo.and_then(|g| Gobo::new_with(g, half, images, Penumbra::of(light))),
+            // A soft light's grid is sewn fabric: a strip's, a softbox's or an
+            // octabox's, or an umbrella's or a parabolic's round one.
+            aim: aim.as_ref().and_then(|a| Aim::new(a, toward, frame.right * sx, frame.up, half, light.softness)).map(|a| {
+                let sewn = light.modifier.as_ref().and_then(|m| match m.kind() {
+                    ModifierKind::Strip => Some(FabricGrid::Strip),
+                    ModifierKind::Softbox | ModifierKind::Octabox => Some(FabricGrid::Box),
+                    ModifierKind::Umbrella | ModifierKind::SilverUmbrella => Some(FabricGrid::Round),
+                    _ => None,
+                });
+                match sewn {
+                    Some(kind) => a.fabric_grid(kind),
+                    None => a,
+                }
+            }),
             surface: light.imperfections.as_ref().and_then(|p| Imperfections::new(p, half)),
             half,
-            modifier: if light.is_caster() { None } else { light.modifier.as_ref().and_then(|m| Modifier::new(m, half)) },
+            modifier: if light.is_caster() { None } else { light.modifier.as_ref().and_then(|m| Modifier::new_shaped(m, half, light.shape() == LightShape::Disc)) },
             space_beam: space.map(|s| beam_exponent(s.beam)),
         }
     }
@@ -283,6 +304,67 @@ impl LightFx {
         worn * self.modifier.as_ref().map_or(1.0, |modifier| modifier.factor(q))
     }
 
+    /// `glow` and the colour the face takes there over it (`Modifier::tint`, a
+    /// dirty cover's stains; None where it keeps the light's own), worked out
+    /// once, the face's fine detail band-limited to a map's texel `texel`
+    /// (radians; 0 for its finest).
+    pub fn glow_tint(&self, dir: Vec3f, texel: f32) -> (f32, Option<Vec3f>) {
+        self.glow_tint_with(dir, texel, true)
+    }
+
+    /// `bare_glow` and its colour (`glow_tint`).
+    pub fn bare_glow_tint(&self, dir: Vec3f, texel: f32) -> (f32, Option<Vec3f>) {
+        self.glow_tint_with(dir, texel, false)
+    }
+
+    fn glow_tint_with(&self, dir: Vec3f, texel: f32, head: bool) -> (f32, Option<Vec3f>) {
+        if self.surface.is_none() && self.modifier.is_none() {
+            return (1.0, None);
+        }
+        let Some(q) = self.face(dir) else { return (1.0, None) };
+        let worn = self.surface.as_ref().map_or(1.0, |surface| surface.factor(q));
+        match self.modifier.as_ref() {
+            Some(modifier) => {
+                let (f, t) = if head { modifier.factor_tint(q, texel) } else { modifier.factor_bare_tint(q, texel) };
+                (worn * f, t)
+            }
+            None => (worn, None),
+        }
+    }
+
+    /// The colour the face's light takes on average (`Modifier::tint_mean`):
+    /// what the engine's key carries of the face's colour.
+    pub fn tint_mean(&self) -> Option<Vec3f> {
+        self.modifier.as_ref()?.tint_mean()
+    }
+
+    /// The face's modifier, if it has one (light_model.rs builds a model's
+    /// outline from it).
+    pub fn modifier(&self) -> Option<&Modifier> {
+        self.modifier.as_ref()
+    }
+
+    /// `glow` without what a light's 3D model draws as geometry in front of
+    /// its face (`Modifier::factor_bare`: an umbrella's strobe head and stand).
+    pub fn bare_glow(&self, dir: Vec3f) -> f32 {
+        if self.surface.is_none() && self.modifier.is_none() {
+            return 1.0;
+        }
+        let Some(q) = self.face(dir) else { return 1.0 };
+        let worn = self.surface.as_ref().map_or(1.0, |surface| surface.factor(q));
+        worn * self.modifier.as_ref().map_or(1.0, |modifier| modifier.factor_bare(q))
+    }
+
+    /// The glow of the back of the face's cloth at `dir` (the point of the
+    /// face it is the back of), as a 3D model sees it from behind
+    /// (`Modifier::back`, worn as the front is): None where the back is
+    /// opaque.
+    pub fn back_glow(&self, dir: Vec3f) -> Option<f32> {
+        let q = self.face(dir)?;
+        let back = self.modifier.as_ref()?.back(q)?;
+        Some(self.surface.as_ref().map_or(1.0, |surface| surface.factor(q)) * back)
+    }
+
     /// `glow` without the face's hot core (`Modifier::core_at`, an open
     /// box's bare tube), which `key_share` takes analytically: the core is
     /// smaller than its strata.
@@ -307,18 +389,31 @@ impl LightFx {
     /// What the light really does at `dir`, given the map `before` it and
     /// `after` its own code drew it: its effect, scaled.
     pub fn apply(&self, dir: Vec3f, before: Vec3f, after: Vec3f) -> Vec3f {
+        self.apply_at(dir, before, after, 0.0)
+    }
+
+    /// `apply` with the face's fine detail band-limited to a map's texel
+    /// `texel` (radians).
+    pub fn apply_at(&self, dir: Vec3f, before: Vec3f, after: Vec3f, texel: f32) -> Vec3f {
         // The light does not reach this direction: nothing to scale.
         if after == before {
             return after;
         }
-        let k = match self.blend {
-            Blend::Add => self.passes(dir) * self.glow(dir),
-            Blend::Multiply => self.blocks(dir),
+        let (k, tint) = match self.blend {
+            Blend::Add => {
+                let (glow, tint) = self.glow_tint(dir, texel);
+                (self.passes(dir) * glow, tint)
+            }
+            Blend::Multiply => (self.blocks(dir), None),
         };
-        if k == 1.0 {
+        if k == 1.0 && tint.is_none() {
             return after;
         }
-        let c = before + (after - before) * k;
+        let d = after - before;
+        let c = match tint {
+            Some(t) => before + vec3f(d.x * t.x, d.y * t.y, d.z * t.z) * k,
+            None => before + d * k,
+        };
         // Wear can lift k above 1. A light that also hides what is behind it
         // (a scrim) must not push that below zero.
         vec3f(c.x.max(0.0), c.y.max(0.0), c.z.max(0.0))
@@ -326,12 +421,41 @@ impl LightFx {
 
     /// A window filled with sky at `dir`: where the light's shape covers
     /// (`cover` 0..=1) and its gobo passes, what is `behind` gives way to
-    /// `sky`, the map's sky along `dir`, at 2^intensity_ev. The frame and the
-    /// bars leave what is behind them as it was, or hide it against the sky
-    /// (`hides`).
-    pub fn window(&self, dir: Vec3f, cover: f32, behind: Vec3f, sky: Vec3f) -> Vec3f {
+    /// `sky(dir)`, the map's sky, at 2^intensity_ev. The frame and the bars
+    /// leave what is behind them as it was, or hide it against the sky
+    /// (`hides`), and show their paint lit by the sky (`lets_in`).
+    pub fn window(&self, dir: Vec3f, cover: f32, behind: Vec3f, sky: &dyn Fn(Vec3f) -> Vec3f) -> Vec3f {
         let glass = self.glass(dir, cover);
-        behind * (1.0 - self.hidden(cover, glass)) + self.through_glass(dir, glass, sky)
+        behind * (1.0 - self.hidden(cover, glass)) + self.lets_in(dir, cover, glass, sky)
+    }
+
+    /// What a window filled with sky adds to the map at `dir`, where its
+    /// shape covers `cover` of it and `glass` of it is glass: the sky through
+    /// the glass (`through_glass`) and, on the rest, its frame and bars, the
+    /// paint the sky lights (`paint`). What it carries as the key (D1).
+    pub fn lets_in(&self, dir: Vec3f, cover: f32, glass: f32, sky: &dyn Fn(Vec3f) -> Vec3f) -> Vec3f {
+        let mut c = if glass > 0.0 { self.through_glass(dir, glass, sky(dir)) } else { Vec3f::default() };
+        let frame = cover.max(0.0).min(1.0) - glass;
+        if frame > 0.0 {
+            c = c + self.paint(sky) * frame;
+        }
+        c
+    }
+
+    /// A window's painted frame and bars as the light through its glass
+    /// lights them: `FRAME_LIT` of what the glass shows on average at
+    /// 2^intensity_ev, a grey a quarter of the way to its colour. The sky is
+    /// read at five points over the opening (its middle and four points
+    /// toward its corners) and the brightest left out, so a sun behind one of
+    /// them (a disc a hundred times the sky) does not light the frame.
+    fn paint(&self, sky: &dyn Fn(Vec3f) -> Vec3f) -> Vec3f {
+        let (right, up) = (self.frame.right * self.sx, self.frame.up);
+        let at = |x: f32, y: f32| sky((self.frame.center + right * (x * self.half.x) + up * (y * self.half.y)).normalize());
+        let mut s = [at(0.0, 0.0), at(-0.6, 0.6), at(0.6, 0.6), at(-0.6, -0.6), at(0.6, -0.6)];
+        s.sort_by(|a, b| luminance(*a).total_cmp(&luminance(*b)));
+        let c = (s[0] + s[1] + s[2] + s[3]) * 0.25;
+        let grey = Vec3f::all(luminance(c));
+        (grey + (c - grey) * FRAME_TINT) * (FRAME_LIT * self.gain)
     }
 
     /// How much of a window filled with sky is glass at `dir`, 0..=1: where
@@ -342,10 +466,18 @@ impl LightFx {
     }
 
     /// The sky a window lets in at `dir` through `glass` of glass: `sky` at
-    /// 2^intensity_ev, times the face's wear. What the window adds to the map,
-    /// and so what it carries as the key (D1).
+    /// 2^intensity_ev, times the face's wear: what the window adds to the map
+    /// through its glass (`lets_in` adds its frame's paint).
     pub fn through_glass(&self, dir: Vec3f, glass: f32, sky: Vec3f) -> Vec3f {
         sky * (self.gain * glass * self.glow(dir))
+    }
+
+    /// The radius of the face's hot core in its frame's units
+    /// (`Modifier::core_radius`, an open box's bare tube), None for a face
+    /// without one (`Modifier::core_mass` 0).
+    pub fn core_radius(&self) -> Option<f32> {
+        let modifier = self.modifier.as_ref()?;
+        (modifier.core_mass() > 0.0).then(|| modifier.core_radius())
     }
 
     /// The share of a key light's emission that gets past everything in front
@@ -532,9 +664,11 @@ mod tests {
 
     /// D12 (M8): in Sky mode a window filled with sky stands against the very
     /// sky it shows, so at 0 EV it drew nothing at all, not even its bars.
-    /// Its frame and bars now hide the sky behind them and read dark, its
-    /// glass shows the sky as before, and nothing is brighter than the sky.
-    /// Behind a studio they still leave the backdrop as it was.
+    /// Its frame and bars now hide the sky behind them and read dark (their
+    /// paint, lit at `FRAME_LIT` of what the glass shows, under a tenth of
+    /// the sky beside them), its glass shows the sky as before, and nothing is
+    /// brighter than the sky. Behind a studio they still leave the backdrop
+    /// as it was, their paint over it.
     #[test]
     fn a_sky_window_draws_its_frame_and_bars_in_sky_mode() {
         let window = LightParams {
@@ -551,33 +685,34 @@ mod tests {
         let classify = |base: &HdriParams| {
             let with = Env::new(&HdriParams { lights: vec![window.clone()], ..base.clone() });
             let without = Env::new(base);
-            // Directions the window turns black, dark (under 5 % of the sky) and leaves as the sky.
-            let (mut black, mut dark, mut same) = (Vec::new(), 0, 0);
+            // Directions the window draws dark (under a tenth of the sky, with
+            // the sky there) and leaves as the sky.
+            let (mut dark, mut same) = (Vec::new(), 0);
             for &d in &dirs {
                 let (a, b) = (luminance(with.radiance(d)), luminance(without.radiance(d)));
                 assert!(a <= b * (1.0 + 1.0e-4) + 1.0e-7, "brighter than the sky at {:?}: {a} over {b}", az_el_from_dir(d));
-                if a == 0.0 {
-                    black.push(d);
-                }
-                if a < 0.05 * b {
-                    dark += 1;
+                if a < 0.1 * b {
+                    dark.push((d, b));
                 } else if (a - b).abs() <= 1.0e-4 * b {
                     same += 1;
                 }
             }
-            (black, dark, same)
+            (dark, same)
         };
-        let (black, dark, glass) = classify(&HdriParams::default());
-        assert!(dark > 40 && black.len() > 20, "the frame and bars draw dark against the sky: {dark} ({} black) of {} directions", black.len(), dirs.len());
+        let (dark, glass) = classify(&HdriParams::default());
+        assert!(dark.len() > 40, "the frame and bars draw dark against the sky: {} of {} directions", dark.len(), dirs.len());
         assert!(glass > 200, "the glass shows the sky: {glass} of {}", dirs.len());
         // The centre is where the two bars cross.
-        assert!(black.iter().any(|d| d.dot(dir_from_az_el(200.0, 20.0)) > 0.9999), "the bars' crossing is dark");
-        // Behind a studio, frame and bars leave the backdrop as it was.
+        assert!(dark.iter().any(|(d, _)| d.dot(dir_from_az_el(200.0, 20.0)) > 0.9999), "the bars' crossing is dark");
+        // Behind a studio, frame and bars leave the backdrop as it was, their
+        // paint over it: lit, but under a tenth of the sky.
         let grey = HdriParams { studio: StudioParams { top: [0.2; 3], horizon: [0.2; 3], floor: [0.2; 3], ..StudioParams::default() }, ..studio(Vec::new()) };
         let with = Env::new(&HdriParams { lights: vec![window.clone()], ..grey.clone() });
         let without = Env::new(&grey);
-        for d in black {
-            assert_eq!(with.radiance(d), without.radiance(d), "behind a studio the bars show the backdrop at {:?}", az_el_from_dir(d));
+        for (d, sky) in dark {
+            let (a, b) = (with.radiance(d), without.radiance(d));
+            let paint = luminance(a) - luminance(b);
+            assert!(a.x >= b.x && a.y >= b.y && a.z >= b.z && paint > 0.0 && paint < 0.1 * sky, "behind a studio the bars show the backdrop and their paint at {:?}: {a:?} over {b:?}", az_el_from_dir(d));
         }
     }
 

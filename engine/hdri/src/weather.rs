@@ -14,7 +14,12 @@
 //!   sky, with or without a weather: [`relit_ground`]). Snow is a ground
 //!   albedo of 0.8 (through the weathered ground colour). Wet ground mirrors
 //!   the sky by water's Fresnel reflectance, the bolt included, as a dull
-//!   sheen on damp ground and as a flat mirror in fbm puddles.
+//!   sheen on damp ground (blurred by its film's rough facets in the map,
+//!   `DAMP_SLOPES`, `Env::damp_sheen`) and as a flat mirror in fbm puddles. Under rain the
+//!   puddles do not mirror flat (rain_water.rs, `Env::rain_puddle`): each drop
+//!   leaves a ring of capillary-gravity waves, the young rings turn the mirror
+//!   where a texel resolves them and the rest of the rain's slopes spread it
+//!   into a sheen; the floor's lake and sea take the same slopes.
 //! - **Rain.** Haze that greys the distance, with virga: shafts hanging under
 //!   the deck toward the horizon, darker curtains over the haze and what is
 //!   behind it. An environment map holds no streaks.
@@ -22,6 +27,10 @@
 //!   horizon, glowing toward the sun; dense at 1, when only the ground at the
 //!   feet shows through it. It spreads round the sky the sunlight it takes
 //!   out of the sun's beam, and no more (D7).
+//! - **Bows.** The sunlit fog sends back a fog bow (rainbow.rs, `Weather::with_bows`): single scattering of the sun's
+//!   beam through the slab by its drops' bow phase, where the sun is up and lights it (under a closed deck or behind a
+//!   cloud the sun under the clouds is gone, and the bow with it). The rain's rainbow stands in the showers' shafts
+//!   (cloud_placed.rs), not in the veil, which has no place.
 //! - **Lightning.** A bolt from the deck toward the horizon and a flash lobe
 //!   around its top that fades out at the horizon, standing inside the rain.
 //!   Its channel is halved again and again with each midpoint pushed aside
@@ -43,13 +52,15 @@ use makepad_draw::*;
 use super::cloud_facts::CloudFacts;
 use super::clouds::hg_phase;
 use super::noise::{fbm2, hash01};
+use super::rain_water::RainOnWater;
+use super::rainbow::{bows_share, Bow, Drops, BOW_PASS};
 use super::{dir_from_az_el, LightParams, SkyParams, WeatherKind, WeatherParams, LIGHTNING_GLOW_RGB, LIGHTNING_WIDTH_DEG};
 use crate::sky::luminance;
 
 /// Snow on the ground: albedo 0.8.
 pub(crate) const SNOW_ALBEDO: [f32; 3] = [0.8, 0.8, 0.8];
 /// The viewer's height above the ground: how near the ground below is.
-const EYE_M: f32 = 2.0;
+pub(crate) const EYE_M: f32 = 2.0;
 
 /// Fog's optical depth straight up is FOG_ZENITH times its thickened amount
 /// (`thickened`); the layer is FOG_HEIGHT_M thick and a level path through it
@@ -202,6 +213,27 @@ pub(crate) const WATER_F0: f32 = 0.02;
 /// Wet ground is darker (water fills its pores) and has a dull sheen.
 const WET_DARKEN: f32 = 0.45;
 const WET_SHEEN: f32 = 0.5;
+/// The slopes (variance per axis) of the film of water on damp ground between the puddles: the film fills the
+/// ground's fine texture (its pores, under half a millimetre) and follows its coarse texture (a road's macrotexture:
+/// profile depths of 0.2-3 mm over wavelengths of 0.5-50 mm), whose slopes are of the order of 0.2. So damp ground
+/// mirrors the sky through facets of an RMS slope of 0.2 (Beckmann's m, 0.02 per axis): a blurred sheen drawn out
+/// toward the eye, the streaks of a wet road, where a puddle's level water mirrors sharply (`Env::damp_sheen`).
+/// A paved ground's: the Road's asphalt and the Plaza's stones (`floor::damp_slopes` gives each ground its own).
+pub(crate) const DAMP_SLOPES: f32 = 0.02;
+/// A granular ground's film (damp sand, slush, the plain ground's sand and soil): the water stands in the necks between
+/// grains of 0.1-2 mm and the surface over them is the grains' caps with their menisci. The bare caps' slopes run to
+/// 30-40 degrees (an RMS slope of 0.5); the water levels the menisci between them, and saturated sand at a swash line
+/// is a near-level film (about 0.01 per axis, measured on a beach toward a low sun). Damp ground lies between: an RMS
+/// slope of about 0.35 (0.06 per axis). At 0.125 its facets turned some 20 degrees toward the eye met a grazing look
+/// at a Fresnel of 0.1-0.15 and mirrored the sky 30-50 degrees up, so wet sand toward the sun read as dry. Its sheen
+/// is a soft brightening toward the light, 20-30 degrees wide.
+pub(crate) const DAMP_SLOPES_GRAINS: f32 = 0.06;
+/// A stony ground's film (gravel, the rock's stones, a mountain's scree, a lake's shore): wet stones of centimetres
+/// to decimetres, rounded, their faces at any tilt up to their flanks: an RMS slope of about 0.7 (0.25 per axis).
+pub(crate) const DAMP_SLOPES_STONES: f32 = 0.25;
+/// Wet grass's film: drops and sheets on blades that stand at every tilt (grasses' leaves are mostly steep), an RMS
+/// slope of about 1 (0.5 per axis): the dew's diffuse glow round the light's mirror direction, no mirror image.
+pub(crate) const DAMP_SLOPES_BLADES: f32 = 0.5;
 /// What shows of the ground through a puddle.
 const PUDDLE_BOTTOM: f32 = 0.35;
 /// Metres per cell of the puddle noise, and the distances between which the
@@ -346,6 +378,19 @@ pub fn weathered_sky(sky: &SkyParams) -> SkyParams {
         out.atmosphere.ground_color = SNOW_ALBEDO;
     }
     out
+}
+
+/// The rain on standing water of the weather block `w` (rain_water.rs), its drops placed by its seed: None where it asks
+/// for calm water (`WeatherParams::rain_on_water` false), without rain, and under snow (the snow kind's rain is the
+/// snowfall's haze, which leaves no rings, and its lake is frozen). Water under falling rain is never calm (the rainbow
+/// lane, round 3: a calm mirror under rain showed the whole reflected bow round the ground), so a block that does not
+/// say (None, files from before it) has the rain break it.
+pub(crate) fn rain_on_water(w: &WeatherParams) -> Option<RainOnWater> {
+    if w.rain_on_water == Some(false) {
+        return None;
+    }
+    let drawn = effects(w);
+    if drawn.rain > 0.0 && !drawn.snow { RainOnWater::of(drawn.rain, w.seed) } else { None }
 }
 
 /// The kind for one of apps/weather's `SkyKind` discriminants
@@ -1058,6 +1103,23 @@ pub struct Weather {
     /// How much of the virga hangs: 1 over the older clouds; over a cloud stack the drawn share of its band under the
     /// raining layers (`CloudFacts::virga_share`), 0 at Cover 0.
     virga_share: f32,
+    /// The rain falling on standing water (rain_water.rs): the rings each drop leaves and the sheen of steady rain, on
+    /// the puddles (`Env::rain_puddle`) and the floor's water. None without rain, and under snow, whose rain is the
+    /// snowfall's haze.
+    rain_water: Option<RainOnWater>,
+    /// The fog's bow under this map's sun (`with_bows`); None draws none.
+    bows: Option<Box<Bows>>,
+}
+
+/// The fog bow of the fog, as the sun's light at the ground (`sun_white`, before the clouds) shows it. (The rain's
+/// rainbow is the showers': cloud_placed.rs.)
+struct Bows {
+    fog: Bow,
+    sun_white: Vec3f,
+    /// Toward the sun, once a map: the fog's optical depth, and what of its light passes a shaft of virga and the rain
+    /// over the fog at BOW_PASS.
+    fog_sun: f32,
+    fog_lit: f32,
 }
 
 impl Weather {
@@ -1129,6 +1191,8 @@ impl Weather {
             bolt: if drawn.lightning { Some(build_bolt(&BoltPlace::seeded(params.seed))) } else { None },
             bolts: Vec::new(),
             virga_share,
+            rain_water: rain_on_water(params),
+            bows: None,
         };
         weather.fog_glow = weather.fog_glow_share();
         if let Some(mut bolt) = weather.bolt.take() {
@@ -1147,6 +1211,49 @@ impl Weather {
             bolt.flash = flash_share(cover(bolt.top_dir));
         }
         self
+    }
+
+    /// This weather with its fog's bow (rainbow.rs) under `atmo`'s sun. The fog's glow gives up the share of its light
+    /// the bow takes (`bows_share`), so the fog still spreads no more than it takes out of the beam (D7).
+    ///
+    /// The rain veil draws no rainbow (the rainbow lane, round 3). It is the same rain everywhere, from the ground to the
+    /// cloud base out to RAIN_RANGE_M round the eye, so a bow in it is a whole ring of one strength over an even pale
+    /// disc, wherever the sky is clear. Real rain with the sun out falls in showers under their clouds: the bow stands in
+    /// the shower's shaft where the sun reaches it (the placed Cumulonimbus, cloud_placed.rs `PlacedVolume::rain_light`),
+    /// and under a deck closed enough for rain to fall everywhere the sun does not reach the rain at all.
+    pub(crate) fn with_bows(mut self, atmo: &crate::atmosphere::Atmosphere) -> Weather {
+        if !(self.effects.fog > 0.0) || !(self.sun_dir.y > 0.0) {
+            return self;
+        }
+        let sun = atmo.sun_bands();
+        let (rain_sun, shaft) = (self.rain_depth(self.sun_dir), 1.0 - self.virga(self.sun_dir));
+        self.bows = Some(Box::new(Bows {
+            fog: Bow::new(Drops::fog(), &sun),
+            sun_white: atmo.sun_irradiance(),
+            fog_sun: self.fog_depth(self.sun_dir),
+            fog_lit: shaft * (-BOW_PASS * rain_sun).exp(),
+        }));
+        self.fog_glow *= 1.0 - bows_share();
+        self
+    }
+
+    /// The light a slab's bow sends along `d`, single scattering through the slab: `phase` its bows' phase there (as
+    /// the sun's light at the ground shows it), `view` the slab's optical depth along `d`, `reach` how much of the
+    /// slab's height that path climbs (0..1), `sun` its depth toward the sun from the ground, `lit` what else lets the
+    /// sun through to it. A drop a share t along the path is lit through (1 - reach t) of `sun` and seen through t of
+    /// `view`, each at BOW_PASS: integral over t of view exp(-BOW_PASS (t view + (1 - reach t) sun)).
+    fn bow_light(phase: Vec3f, view: f32, reach: f32, sun: f32, lit: f32) -> Vec3f {
+        if !(view > 0.0) || !(lit > 0.0) {
+            return Vec3f::default();
+        }
+        let (k, sunlit) = (view - reach * sun, (-BOW_PASS * sun).exp());
+        let column = if (BOW_PASS * k).abs() < 1.0e-4 {
+            view * sunlit
+        } else {
+            // (both exponents at or below zero: no overflow however deep the slab)
+            view * (sunlit - (-BOW_PASS * (view + (1.0 - reach) * sun)).exp()) / (BOW_PASS * k)
+        };
+        phase * (column * lit)
     }
 
     /// The fog's glow per unit of the sun's irradiance (D7). The fog takes
@@ -1220,6 +1327,17 @@ impl Weather {
         self.effects.rain > 0.0 || self.effects.fog > 0.0
     }
 
+    /// The rain falling on standing water (rain_water.rs), None without rain or under snow.
+    pub(crate) fn rain_water(&self) -> Option<&RainOnWater> {
+        self.rain_water.as_ref()
+    }
+
+    /// True when rain falls on the wet ground's puddles: they then mirror through the rain's slopes
+    /// (`ground_sheened`, `Env::rain_puddle`), not as flat mirrors.
+    pub(crate) fn rains_on_puddles(&self) -> bool {
+        self.rain_water.is_some() && self.effects.wet_ground > 0.0
+    }
+
     /// The ground below the horizon under this weather. `ground` is what the
     /// dry sky drew along `d`, lit by the clear sky; `gain` is what this map's
     /// sky does to that light (`Env` measures it: under a closed deck the
@@ -1227,47 +1345,31 @@ impl Weather {
     /// shows along a direction above the horizon (it is asked for the mirror
     /// image of `d`; `Env` passes the sky as the weather shows it, through the
     /// rain and fog and with the bolt, so the mirror is no brighter than the
-    /// sky above it). Above the horizon `ground` passes unchanged.
+    /// sky above it). Above the horizon `ground` passes unchanged. The damp
+    /// ground between the puddles mirrors `sky_at` flat, by Fresnel's share of
+    /// its sheen; the map blurs that sheen through its film's facets
+    /// (`ground_sheened`, `Env::damp_sheen`).
     pub fn ground(&self, d: Vec3f, ground: Vec3f, gain: Vec3f, sky_at: &dyn Fn(Vec3f) -> Vec3f) -> Vec3f {
         self.ground_with(d, ground, gain, sky_at, Puddles::Field)
-    }
-
-    /// [`Self::ground`] with the puddles at their mean share everywhere (the
-    /// share the far ground already draws), so a few looks round the horizon
-    /// read the wet ground's mean, not whether they hit a puddle: what the
-    /// skyline's strip takes for its ground (`Env::skyline_light`'s ground
-    /// ring, the skirt's hold). The ground is linear in the puddles' weight,
-    /// so this is the mean of `ground` over the puddles. A dry ground is
-    /// `ground`'s, bit for bit.
-    pub fn ground_even(&self, d: Vec3f, ground: Vec3f, gain: Vec3f, sky_at: &dyn Fn(Vec3f) -> Vec3f) -> Vec3f {
-        self.ground_with(d, ground, gain, sky_at, Puddles::Even)
-    }
-
-    /// `ground` with no puddles: the damp ground between them, its dull sheen included. What the skyline's strip takes
-    /// for its own ground under a wet ground: its near rise, and below the horizon the ground between the puddles (plan
-    /// hdri-6 §5, fix wave 1). A dry ground is `ground`'s, bit for bit.
-    pub fn ground_damp(&self, d: Vec3f, ground: Vec3f, gain: Vec3f, sky_at: &dyn Fn(Vec3f) -> Vec3f) -> Vec3f {
-        self.ground_with(d, ground, gain, sky_at, Puddles::Dry)
-    }
-
-    /// `ground` all under water: a puddle's bottom and what it mirrors by Fresnel, wherever `d` looks. What the map
-    /// shows in the puddles it lays over the skyline's strip where the strip gives way to its floor under a wet ground
-    /// (`Env`'s `under_band`). A dry ground is `ground`'s, bit for bit.
-    pub(crate) fn ground_water(&self, d: Vec3f, ground: Vec3f, gain: Vec3f, sky_at: &dyn Fn(Vec3f) -> Vec3f) -> Vec3f {
-        self.ground_with(d, ground, gain, sky_at, Puddles::Full)
     }
 
     fn ground_with(&self, d: Vec3f, ground: Vec3f, gain: Vec3f, sky_at: &dyn Fn(Vec3f) -> Vec3f, puddles: Puddles) -> Vec3f {
         self.ground_with_cover(d, ground, gain, sky_at, &|| self.puddle_cover(d, puddles))
     }
 
-    /// [`Self::ground`] with the puddles' share given (`cover`, 0..1): the floor's own (plan hdri-8 T2: by its kind, in
-    /// its hollows). A dry ground is `ground`'s, bit for bit.
-    pub(crate) fn ground_covered(&self, d: Vec3f, ground: Vec3f, gain: Vec3f, sky_at: &dyn Fn(Vec3f) -> Vec3f, cover: f32) -> Vec3f {
-        self.ground_with_cover(d, ground, gain, sky_at, &|| cover)
+    fn ground_with_cover(&self, d: Vec3f, ground: Vec3f, gain: Vec3f, sky_at: &dyn Fn(Vec3f) -> Vec3f, cover: &dyn Fn() -> f32) -> Vec3f {
+        self.ground_with_water(d, ground, gain, sky_at, cover, None, None)
     }
 
-    fn ground_with_cover(&self, d: Vec3f, ground: Vec3f, gain: Vec3f, sky_at: &dyn Fn(Vec3f) -> Vec3f, cover: &dyn Fn() -> f32) -> Vec3f {
+    /// The ground as the map draws it: the puddles' share `cover`, their water `water(c)` where given (under rain) or a
+    /// flat mirror of `sky_at`, and between them the damp ground's sheen `sheen()`: what its film of water mirrors along
+    /// `d` through its rough facets (DAMP_SLOPES, `Env::damp_sheen`), Fresnel's share in, in place of the flat mirror's
+    /// sharp image. So only standing water mirrors sharply. A dry ground is `ground`'s, bit for bit.
+    pub(crate) fn ground_sheened(&self, d: Vec3f, ground: Vec3f, gain: Vec3f, sky_at: &dyn Fn(Vec3f) -> Vec3f, cover: f32, water: Option<&dyn Fn(Vec3f) -> Vec3f>, sheen: &dyn Fn() -> Vec3f) -> Vec3f {
+        self.ground_with_water(d, ground, gain, sky_at, &|| cover, water, Some(sheen))
+    }
+
+    fn ground_with_water(&self, d: Vec3f, ground: Vec3f, gain: Vec3f, sky_at: &dyn Fn(Vec3f) -> Vec3f, cover: &dyn Fn() -> f32, water: Option<&dyn Fn(Vec3f) -> Vec3f>, sheen: Option<&dyn Fn() -> Vec3f>) -> Vec3f {
         if !(d.y < 0.0) {
             return ground;
         }
@@ -1279,38 +1381,44 @@ impl Weather {
         }
         // Schlick's Fresnel for water: a mirror at grazing angles, 2 % head-on.
         let fresnel = water_fresnel(down);
-        let mirror = sky_at(vec3f(d.x, -d.y, d.z));
         let puddle = cover();
-        // Damp ground between the puddles: darker, with a dull sheen. A puddle:
-        // a flat mirror over what shows of its bottom.
-        let damp = c * (1.0 - WET_DARKEN * wet) + mirror * (fresnel * WET_SHEEN * wet);
-        let water = water_surface(c, mirror, fresnel);
+        // (the sky's flat mirror image, looked up only where something mirrors it flat)
+        let mirror = || sky_at(vec3f(d.x, -d.y, d.z));
+        // Damp ground between the puddles: darker, with a dull sheen (its film's, or the flat mirror's by Fresnel). A
+        // puddle: a flat mirror over what shows of its bottom (or the water given).
+        let damp = match sheen {
+            Some(sheen) if puddle < 1.0 => c * (1.0 - WET_DARKEN * wet) + sheen() * self.film_share(),
+            Some(_) => c * (1.0 - WET_DARKEN * wet),
+            None => c * (1.0 - WET_DARKEN * wet) + mirror() * (fresnel * WET_SHEEN * wet),
+        };
+        if !(puddle > 0.0) && sheen.is_some() {
+            return damp;
+        }
+        let water = match water {
+            Some(water) if puddle > 0.0 => water(c),
+            _ => water_surface(c, mirror(), fresnel),
+        };
         damp.mix(water, puddle)
     }
 
-    /// How much of what the ground along `d` mirrors `ground_with` lets through (`ground`, `ground_even`, `ground_damp`
-    /// or `ground_water` by `puddles`): the damp ground's sheen between the puddles, Fresnel's term in them, by their
-    /// share. The ground is affine in the mirror, and this is its slope; 0 above the horizon or on a dry ground. What
-    /// `Env` takes out of the floor's veil where the mirror shows the skyline's strip, which is veiled over its own
-    /// distance instead (plan hdri-6 R1).
-    pub(crate) fn mirror_share(&self, d: Vec3f, puddles: Puddles) -> f32 {
-        let wet = self.effects.wet_ground;
-        if wet <= 0.0 || !(d.y < 0.0) {
-            return 0.0;
-        }
-        self.mirror_share_covered(d, self.puddle_cover(d, puddles))
+    /// The share of the damp ground's sheen (`Env::damp_sheen`) that `ground_sheened` adds between the puddles: the
+    /// film's, WET_SHEEN of the wetness.
+    pub(crate) fn film_share(&self) -> f32 {
+        WET_SHEEN * self.effects.wet_ground
     }
 
-    /// [`Self::mirror_share`] with the puddles' share given (`ground_covered`).
-    pub(crate) fn mirror_share_covered(&self, d: Vec3f, cover: f32) -> f32 {
+    /// How much of what the ground along `d` mirrors `ground_sheened` lets through (the puddles' share `cover`; `rained`
+    /// when rain roughens them): the ground is affine in the mirror, and this is its slope; 0 above the horizon or on a
+    /// dry ground. The damp ground's sheen is a spread of the sky read from a table (`Env::damp_sheen`), and so are
+    /// rained puddles (`Env::rain_puddle`), so only the flat puddles' Fresnel term lets `d`'s own mirror through. What
+    /// `Env` takes out of the floor's veil where the mirror shows the skyline's strip, which is veiled over its own
+    /// distance instead (plan hdri-6 R1).
+    pub(crate) fn mirror_share_sheened(&self, d: Vec3f, cover: f32, rained: bool) -> f32 {
         let wet = self.effects.wet_ground;
-        if wet <= 0.0 || !(d.y < 0.0) {
+        if wet <= 0.0 || !(d.y < 0.0) || rained {
             return 0.0;
         }
-        let down = (-d.y).min(1.0);
-        let fresnel = water_fresnel(down);
-        let damp = fresnel * WET_SHEEN * wet;
-        damp + (fresnel - damp) * cover
+        water_fresnel((-d.y).min(1.0)) * cover
     }
 
     /// The puddles' share of the ground along `d` (0..1; 0 above the horizon or on a dry ground).
@@ -1395,14 +1503,20 @@ impl Weather {
     /// the veil as the map draws it, the clouds and their light included
     /// (`Env` measures it once per map).
     pub fn veil(&self, d: Vec3f, c: Vec3f, sun_irradiance: Vec3f, ambient: Vec3f) -> Vec3f {
-        self.veil_with(d, c, sun_irradiance, ambient, true, f32::INFINITY)
+        self.veil_with(d, c, sun_irradiance, ambient, true, f32::INFINITY, 0.0)
+    }
+
+    /// `veil` as a bake's texel `texel` (radians) across sees it: the bows averaged over the texel (`Bow::phase`), so
+    /// they hold no detail finer than the bake. 0 is `veil`.
+    pub fn veil_at(&self, d: Vec3f, c: Vec3f, sun_irradiance: Vec3f, ambient: Vec3f, texel: f32) -> Vec3f {
+        self.veil_with(d, c, sun_irradiance, ambient, true, f32::INFINITY, texel)
     }
 
     /// `veil` without the rain's shafts: the rain haze and the fog only, over their whole path along `d`. What stands in
     /// front of the shafts, the skyline's strip, is veiled so (plan hdri-6 §5b) where its distance is not known
     /// (`veil_within`).
     pub fn veil_without_virga(&self, d: Vec3f, c: Vec3f, sun_irradiance: Vec3f, ambient: Vec3f) -> Vec3f {
-        self.veil_with(d, c, sun_irradiance, ambient, false, f32::INFINITY)
+        self.veil_with(d, c, sun_irradiance, ambient, false, f32::INFINITY, 0.0)
     }
 
     /// `veil_without_virga` in front of what stands `far_m` (metres) along `d`: the rain haze and the fog over their path
@@ -1411,7 +1525,14 @@ impl Weather {
     /// under rain, the far ranges veiled more. At or beyond the path this is `veil_without_virga`, bit for bit (the
     /// capped path is the path itself); still affine in `c`.
     pub fn veil_within(&self, d: Vec3f, c: Vec3f, sun_irradiance: Vec3f, ambient: Vec3f, far_m: f32) -> Vec3f {
-        self.veil_with(d, c, sun_irradiance, ambient, false, far_m)
+        self.veil_with(d, c, sun_irradiance, ambient, false, far_m, 0.0)
+    }
+
+    /// `veil_within` as a bake's texel `texel` (radians) across sees it, the bows averaged over the texel as `veil_at`
+    /// averages them: what the skyline's strip shows is veiled so (`Env::city_veil`). `far_m` INFINITY is
+    /// `veil_without_virga` so seen; texel 0 is `veil_within`.
+    pub fn veil_within_at(&self, d: Vec3f, c: Vec3f, sun_irradiance: Vec3f, ambient: Vec3f, far_m: f32, texel: f32) -> Vec3f {
+        self.veil_with(d, c, sun_irradiance, ambient, false, far_m, texel)
     }
 
     /// The share of a light's own light that reaches the eye through the rain and the fog from `far_m` (metres) along `d`
@@ -1430,8 +1551,10 @@ impl Weather {
         (-(1.0 - LIGHT_FORWARD) * tau).exp()
     }
 
-    /// `veil`'s body; `shafts` lays the rain's virga over the haze, and the slabs' paths are capped at `far_m`.
-    fn veil_with(&self, d: Vec3f, c: Vec3f, sun_irradiance: Vec3f, ambient: Vec3f, shafts: bool, far_m: f32) -> Vec3f {
+    /// `veil`'s body; `shafts` lays the rain's virga over the haze, and the slabs' paths are capped at `far_m`; the
+    /// bows are averaged over a texel `texel` across.
+    #[allow(clippy::too_many_arguments)]
+    fn veil_with(&self, d: Vec3f, c: Vec3f, sun_irradiance: Vec3f, ambient: Vec3f, shafts: bool, far_m: f32, texel: f32) -> Vec3f {
         let mut c = c;
         // The air under a deck is lit by what that deck passes down, as the
         // clouds' own undersides are: `ambient` is that deck's light, the
@@ -1448,7 +1571,8 @@ impl Weather {
             }
         }
         if self.effects.fog > 0.0 {
-            let through = (-self.fog_depth_within(d, far_m)).exp();
+            let depth = self.fog_depth_within(d, far_m);
+            let through = (-depth).exp();
             // Fog is lit by the dome, greyed as the clouds grey it (half on a
             // clear day, all of it under a closed deck), and by the sun:
             // evenly, from the many scatterings inside it, and with a glow
@@ -1459,6 +1583,15 @@ impl Weather {
             let even = FOG_DIFFUSE * self.sun_dir.y.max(0.0) / std::f32::consts::PI;
             let glow = hg_phase(d.dot(self.sun_dir), FOG_G);
             c = c * through + (sky + sun_irradiance * (self.fog_glow * (even + glow))) * (1.0 - through);
+            // The bow's light: the sun's under the clouds (as a share of its light at the ground, which the bow's
+            // colours were worked out with) through what hangs toward it.
+            if let Some(bows) = self.bows.as_deref() {
+                let white = bows.sun_white;
+                let cover = |s: f32, w: f32| if w > 0.0 { s / w } else { 0.0 };
+                let cover = vec3f(cover(sun_irradiance.x, white.x), cover(sun_irradiance.y, white.y), cover(sun_irradiance.z, white.z));
+                let reach = slab_reach(d.y, FOG_HEIGHT_M, FOG_RANGE_M, far_m);
+                c += Weather::bow_light(bows.fog.phase(d.dot(self.sun_dir), texel), depth, reach, bows.fog_sun, bows.fog_lit) * cover;
+            }
         }
         c
     }
@@ -1550,8 +1683,8 @@ fn flooded(cover: f32, flood: f32) -> f32 {
     if flood > 0.0 { 1.0 - (1.0 - cover) * (1.0 - flood) } else { cover }
 }
 
-/// How a wet ground's puddles are read: their field (the map's own), their mean share everywhere (`ground_even`), none
-/// (`ground_damp`), or everywhere (`ground_water`: the floor's water, what shows where the skyline's strip gives way).
+/// How a wet ground's puddles are read (`Weather::puddle_cover`): their field (the map's own), their mean share everywhere, none
+/// (the damp ground between them), or everywhere (the floor's water, what shows where the skyline's strip gives way).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Puddles {
     Field,
@@ -1579,13 +1712,15 @@ pub fn relit_ground(d: Vec3f, ground: Vec3f, gain: Vec3f) -> Vec3f {
 
 /// What [`haze_relit`] reads along a ground-side direction (only where the ground side still blends into the haze):
 /// the stack's light just above the horizon along its azimuth over the clear sky's luminance there (`ring`, the
-/// horizon ring's), the clear sky's horizon haze along that azimuth, its lit ground, and its ground side along the
-/// direction itself.
+/// horizon ring's), the clear sky's horizon haze along that azimuth, its lit ground, its ground side along the
+/// direction itself, and the night's part of the ground side there (`Env::night_ground_side`: the night sky's
+/// light on the ground, through the night air), which the day's clear sky never explains.
 pub(crate) struct HazeFrame {
     pub(crate) ring: Vec3f,
     pub(crate) haze: Vec3f,
     pub(crate) ground: Vec3f,
     pub(crate) clear: Vec3f,
+    pub(crate) night: Vec3f,
 }
 
 /// The ground side `c` along `d` as it goes into [`relit_ground`] under a modern cloud stack (design §12.14 item 2).
@@ -1597,7 +1732,10 @@ pub(crate) struct HazeFrame {
 /// horizon's light to the lit ground's and never past either. `c` at and above the horizon and where the blend has
 /// reached the ground, which read no `frame()`. (Round 4 took the ring's ratio over the whole clear blend, the sunlit
 /// clear ground's share too: toward the sun the ground side rose to 1.75 times the horizon's light 1.5 degrees down,
-/// a lighter strip under the horizon.)
+/// a lighter strip under the horizon.) The night's part of `c` (`HazeFrame::night`) passes through untouched: it is
+/// the night sky's light, which the clear day sky's light never explains, so relighting it by
+/// the stack's day light took a lit road to black over the lowest three degrees (the owner's "why does the road
+/// stop", 2026-11-07); the deck's own take on the night's light is the night sky's (the moon it hides).
 pub(crate) fn haze_relit(d: Vec3f, c: Vec3f, gain: Vec3f, frame: &dyn Fn() -> HazeFrame) -> Vec3f {
     if !(d.y < 0.0) {
         return c;
@@ -1607,13 +1745,99 @@ pub(crate) fn haze_relit(d: Vec3f, c: Vec3f, gain: Vec3f, frame: &dyn Fn() -> Ha
         return c;
     }
     let f = frame();
+    let c = c - f.night;
     let lit = f.ring * luminance(f.haze) * (1.0 - s) + f.ground * gain * s;
     let over = |lit: f32, c: f32, clear: f32, g: f32| {
         let detail = if clear > 1.0e-9 && c.is_finite() { c / clear } else { 1.0 };
         let k = 1.0 + (g - 1.0) * s;
         if k > 1.0e-9 && lit.is_finite() { lit * detail / k } else { c }
     };
-    vec3f(over(lit.x, c.x, f.clear.x, gain.x), over(lit.y, c.y, f.clear.y, gain.y), over(lit.z, c.z, f.clear.z, gain.z))
+    vec3f(over(lit.x, c.x, f.clear.x, gain.x), over(lit.y, c.y, f.clear.y, gain.y), over(lit.z, c.z, f.clear.z, gain.z)) + f.night
+}
+
+/// How the clouds relight the air between a viewer at a height of its own and the ground, per part of its light
+/// (`atmosphere::AirLight`), per channel; `Env` measures it once a map with the ground's gain. Half or more of the clear
+/// air's light is the sun's, scattered once (from 2000 m with the sun 30 degrees up, half of it away from the sun and
+/// three quarters toward it: Rayleigh-blue, with the haze's glow toward the sun), and a closed deck hides the sun from
+/// that air: the ground's gain kept that part, so the land under a grey deck stayed sky-blue and glowed toward the
+/// hidden sun.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct AirRelight {
+    /// What reaches the air of the sun's light: the clouds' cover along the sun's disc, as the key takes it.
+    pub(crate) sunlit: Vec3f,
+    /// The light round the air under the clouds over the clear sky's: what the multiple scattering is a scattering of.
+    pub(crate) diffuse: Vec3f,
+}
+
+/// What [`aerial_relit`] reads over the lowest GROUND_BLEND under a cloud stack with a modern entry, where the air takes
+/// the horizon's light, as [`HazeFrame`]'s: the stack's light just above the horizon along the direction's azimuth over
+/// the clear sky's luminance there (`ring`), the clear sky's horizon haze along that azimuth (`haze`) and the night's
+/// part of the ground side (`night`).
+pub(crate) struct AirFrame {
+    pub(crate) ring: Vec3f,
+    pub(crate) haze: Vec3f,
+    pub(crate) night: Vec3f,
+}
+
+/// [`haze_relit`] and [`relit_ground`] for a sky seen from a viewer height (`AtmosphereParams::viewer_height_m`), under
+/// any cover. There the clear ground side `c` is no blend of the horizon's haze into the ground over GROUND_BLEND: at
+/// every depression it is the air's own light in front of the ground (`air`, `Atmosphere::air_light`) plus the ground's
+/// light through that air, the ground fading into the haze by its distance; `grounded` says whether a ground stands
+/// behind the air at all (not between level and the grazing ray over the planet's ground). Each part takes its own
+/// light (`relight`): the air's sunlit part what reaches it of the sun, its diffuse part the light round it under the
+/// clouds, their sum held inside the gamut as the clear air's is (`AirLight::relit`; summed raw, a low sun's negative
+/// blue took the ground side toward it below 0), the ground behind it `gain` (the light on the ground under the clouds,
+/// `Env::ground_gain`). The gain alone relit the whole ground side, which keeps the clear air's sunlit share: from
+/// 2000 m under a closed Nimbostratus the land 10 degrees down was 2.4 times as blue as red, and 3 degrees down toward
+/// the hidden sun four times the ground's light. Over the lowest GROUND_BLEND the air blends into its light at level,
+/// as `relit_ground` blends: under a cloud stack with a modern entry (`horizon`) the stack's light just above the
+/// horizon along `d`'s azimuth over the clear haze's there, per channel (`ring` times the haze's luminance over the
+/// haze: at level the air is that haze and takes the stack's own colour, as `haze_relit`'s haze does), and the night's
+/// part passes through untouched; under the other covers (a classic stack, the older deck, the volume, the weather's
+/// deck) its clear light, as `relit_ground` leaves the horizon. What `c` holds past an air with no ground behind it (a
+/// disc over a dipped horizon, the stars) passes unrelit. Returned over `relit_ground`'s own factor, as `haze_relit`'s
+/// is. `horizon` is read only over the band, `air` below the horizon.
+pub(crate) fn aerial_relit(
+    d: Vec3f,
+    c: Vec3f,
+    gain: Vec3f,
+    relight: &AirRelight,
+    grounded: bool,
+    air: &dyn Fn() -> crate::atmosphere::AirLight,
+    horizon: Option<&dyn Fn() -> AirFrame>,
+) -> Vec3f {
+    if !(d.y < 0.0) {
+        return c;
+    }
+    let s = smooth(0.0, GROUND_BLEND, (-d.y).min(1.0));
+    let air = air();
+    let total = air.total();
+    // the air under the clouds: its sunlit part by the sun's light that reaches it, its diffuse part by the light round
+    // it, held inside the gamut as the clear air is
+    let under = air.relit(relight.sunlit, relight.diffuse);
+    // the air's light at level: the stack's horizon light over the band under a modern stack, else its clear light
+    let (c, level, night) = match horizon {
+        Some(frame) if s < 1.0 => {
+            let f = frame();
+            let lum = luminance(f.haze);
+            let ring = |air: f32, ring: f32, haze: f32| if haze > 1.0e-9 && air.is_finite() { ring * lum * (air / haze) } else { f32::NAN };
+            (c - f.night, vec3f(ring(total.x, f.ring.x, f.haze.x), ring(total.y, f.ring.y, f.haze.y), ring(total.z, f.ring.z, f.haze.z)), f.night)
+        }
+        _ => (c, total, Vec3f::default()),
+    };
+    let relit = |c: f32, total: f32, level: f32, under: f32, g: f32| {
+        // (a dark clear horizon, which gives no ratio, takes the air under the clouds at level too)
+        let level = if level.is_finite() { level } else { under };
+        let rest = c - total;
+        let lit = level * (1.0 - s) + under * s + if grounded { rest * g } else { rest };
+        let k = 1.0 + (g - 1.0) * s;
+        if k > 1.0e-9 && lit.is_finite() { lit / k } else { c }
+    };
+    vec3f(
+        relit(c.x, total.x, level.x, under.x, gain.x),
+        relit(c.y, total.y, level.y, under.y, gain.y),
+        relit(c.z, total.z, level.z, under.z, gain.z),
+    ) + night
 }
 
 /// Optical depth along a ray of elevation sine `sin_elevation` through a level
@@ -1651,6 +1875,12 @@ fn slab_path(sin_elevation: f32, height_m: f32, range_m: f32) -> f32 {
     }
 }
 
+/// How much of a level slab `height_m` thick a path along elevation sine `sin_elevation` climbs before it leaves it or
+/// ends (`slab_path`, capped at `far_m`): 0..1, 0 at and below the horizon.
+fn slab_reach(sin_elevation: f32, height_m: f32, range_m: f32, far_m: f32) -> f32 {
+    (capped(slab_path(sin_elevation, height_m, range_m), far_m) * sin_elevation.max(0.0) / height_m).clamp(0.0, 1.0)
+}
+
 /// A fog amount as the depth it gives, per FOG_ZENITH: linear over the kinds'
 /// amounts, then steeply denser toward 1 (FOG_DENSE).
 fn thickened(fog: f32) -> f32 {
@@ -1667,10 +1897,7 @@ fn segment_distance(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
     (dx * dx + dy * dy).sqrt()
 }
 
-fn gauss(distance: f32, sigma: f32) -> f32 {
-    let q = distance / sigma;
-    (-q * q).exp()
-}
+use crate::patterns::gauss;
 
 /// `gauss` across a line, averaged over a texel whose square projects onto
 /// the line's normal as two sides `sides` long: the profile convolved with
@@ -1732,11 +1959,7 @@ fn erf(x: f64) -> f64 {
     if x < 0.0 { -value } else { value }
 }
 
-/// smoothstep under its own name, so no glob can make it ambiguous.
-fn smooth(a: f32, b: f32, x: f32) -> f32 {
-    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
+use crate::patterns::smooth;
 
 #[cfg(test)]
 mod tests {
@@ -2069,8 +2292,9 @@ mod tests {
         vec3f(d[0], d[1], d[2])
     }
 
-    /// `mirror_share` is the slope of the ground in what it mirrors (`ground_with` is affine in it), for every way the
-    /// puddles are read, on a damp, a puddled, a flooding and a flooded floor, near the horizon and near the feet.
+    /// `mirror_share_sheened` is the slope of the ground as the map draws it in what it mirrors (`ground_sheened` is
+    /// affine in it, the damp ground's sheen held), for every way the puddles are read, on a damp, a puddled, a flooding
+    /// and a flooded floor, near the horizon and near the feet.
     #[test]
     fn the_mirror_share_is_the_grounds_slope_in_its_mirror() {
         for wet_ground in [0.3, 0.7, 0.95, 1.0] {
@@ -2078,16 +2302,18 @@ mod tests {
             sky.weather.as_mut().unwrap().wet_ground = wet_ground;
             let w = Weather::new(&sky, sun()).unwrap();
             let one = Vec3f::all(1.0);
+            let sheen = || vec3f(0.3, 0.4, 0.5);
             for puddles in [Puddles::Field, Puddles::Even, Puddles::Dry] {
                 for i in 0..48 {
                     let d = dir_from_az_el(i as f32 * 7.5, -[0.3, 1.0, 2.0, 5.0, 12.0, 40.0][i % 6]);
-                    let at = |m: f32| w.ground_with(d, vec3f(0.2, 0.15, 0.1), one, &|_| Vec3f::all(m), puddles);
+                    let cover = w.puddle_cover(d, puddles);
+                    let at = |m: f32| w.ground_sheened(d, vec3f(0.2, 0.15, 0.1), one, &|_| Vec3f::all(m), cover, None, &sheen);
                     let slope = (at(10.0) - at(0.0)).x / 10.0;
-                    let share = w.mirror_share(d, puddles);
+                    let share = w.mirror_share_sheened(d, cover, false);
                     assert!((slope - share).abs() <= 1e-5, "wet {wet_ground}, {puddles:?}, {d:?}: the slope {slope}, the share {share}");
                 }
             }
-            assert_eq!(w.mirror_share(dir_from_az_el(10.0, 5.0), Puddles::Field), 0.0, "above the horizon nothing is mirrored");
+            assert_eq!(w.mirror_share_sheened(dir_from_az_el(10.0, 5.0), 1.0, false), 0.0, "above the horizon nothing is mirrored");
         }
     }
 
@@ -2535,7 +2761,8 @@ mod env_tests {
                 }
                 let map = env.bake(64);
                 let atmo = env.atmo.as_ref().unwrap();
-                let sun = atmo.sun_dir();
+                // (the beam arrives from where the sun is seen, lifted by the refraction)
+                let sun = atmo.disc_dir();
                 let e = luminance(atmo.sun_irradiance());
                 let weather = env.weather.as_ref();
                 let disc = e * weather.map_or(1.0, |weather| weather.transmittance_toward(sun));

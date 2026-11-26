@@ -4,7 +4,7 @@ use crate::map::SourceMap;
 use crate::source::located;
 use fab_elec_board::{
     Anchor, Area, Board, BoardKeepout, Cutout, Finish, Flash, Graphic, Hole, Islands,
-    ItemKind, LabelPose, LayerRole, Origin, Placed, RuleCode, RuleSet, StackKind, StackLayer, Stackup, Tent, Text,
+    ItemKind, LabelPose, LayerRole, Origin, Placed, RuleCode, Rules, RuleSet, StackKind, StackLayer, Stackup, Tent, Text,
     Track, TuneSide, TuneStyle, TuneTarget, Tuning, Via, ViaKind, Waiver, Zone, ZoneSettings,
 };
 use fab_elec_circuit::{Circuit, ViaSize};
@@ -201,6 +201,13 @@ fn shape(s: &Shape) -> String {
     };
     call(name, args, vec![])
 }
+/// The source selection for an unknown profile in this board document.
+pub fn factory_site(doc: DocId, text: &str) -> Option<Sel> {
+    let tree = syntax::parse_with(text, &units()).ok()?;
+    let node = tree.statements().iter().find(|n| n.callee_path() == Some("factory"))?;
+    Some(Sel::Source { doc, start: node.span.start as u32, end: node.span.end as u32 })
+}
+
 fn rule_fields(r: &RuleSet, default: &RuleSet) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     for (key, value, base) in [
@@ -268,7 +275,7 @@ pub(crate) fn header_statements(b: &Board, _c: &Circuit, factory: Option<&str>, 
     if let Some(profile) = factory { emit(HeaderKind::Factory, call("factory", vec![string(profile)], vec![])); }
     if b.stackup != Stackup::standard_2_layer() { emit(HeaderKind::Stackup, call("stackup", vec![stack(&b.stackup)], vec![])); }
     if !b.outline.is_empty() { emit(HeaderKind::Outline, call("outline", vec![array(b.outline.iter().map(|c| path(&c.path, None)))], vec![])); }
-    let fields = rule_fields(&b.rules.base, &RuleSet::standard());
+    let fields = rule_fields(&b.rules.base, &Rules::standard().base);
     if !fields.is_empty() { emit(HeaderKind::Rules, call("rules", vec![object(fields)], vec![])); }
     for w in &b.rules.waivers { emit(HeaderKind::Waive, call("waive", vec![string(&format!("{:016x}", w.violation)), string(&w.reason)], vec![])); }
     for r in &b.rules.custom {
@@ -908,7 +915,7 @@ impl Read<'_> {
             }
             "rules" => {
                 let (a, _) = self.args(n, 1, None)?;
-                b.rules.base = self.rules(&a[0], RuleSet::standard())?;
+                b.rules.base = self.rules(&a[0], Rules::standard().base)?;
                 Some(None)
             }
             "waive" => {

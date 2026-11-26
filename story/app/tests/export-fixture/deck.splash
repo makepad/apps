@@ -1,0 +1,29 @@
+use mod.flow.*
+use mod.cut.*
+use mod.deck.*
+
+// The deck of story's web export options test (story/app/src/web_page_export.rs,
+// options_serve_the_folder_and_hold_out_a_stress_replay): a deck in its own folder, with an image
+// from that folder. The export itself runs on a real talk in the CI run of `makepad-story --export-web`.
+Deck{
+    title: "Web export fixture"
+    output: {width: 1920 height: 1080}
+    transition: transition(0.4, "101_trans_dissolve")
+    slides: [
+        Slide{
+            name: @type
+            graphic: "slides/type_slide"
+            duration: 1.2
+            beats: [0.6]
+            play: @hold
+            notes: "Two fonts gliding in under a film post chain; one beat."
+        }
+        Slide{
+            name: @picture
+            graphic: "slides/picture_slide"
+            duration: 1.0
+            play: @hold
+            notes: "The folder's image fading in, with a caption; entered through the dissolve."
+        }
+    ]
+}

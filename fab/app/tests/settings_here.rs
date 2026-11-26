@@ -242,7 +242,7 @@ fn seq(app: &TestApp) -> u64 {
 }
 
 fn lines(app: &TestApp, from: u64) -> Vec<String> {
-    app.log_since(from).map(|t| t.lines).unwrap_or_default()
+    app.log_since(from).expect("the app's log").lines
 }
 
 /// The number after `name` in `line`.

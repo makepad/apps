@@ -458,6 +458,44 @@ fn slug(s: &str) -> String {
     if t.is_empty() { "preset".into() } else { t }
 }
 
+fn import_sparse_pattern(values: &mut Config, notes: &mut Vec<String>) {
+    const KEY: &str = "sparse_infill_pattern";
+    let Some(stored) = values.map.get_mut(KEY) else { return };
+    let patterns = match stored {
+        Value::Scalar(s) => std::slice::from_mut(s),
+        Value::Vector(v) => v.as_mut_slice(),
+    };
+    let printable = &options().get(KEY).expect("the sparse pattern option").enum_values;
+    for pattern in patterns {
+        *pattern = crate::spellings::read(KEY, std::mem::take(pattern));
+        if printable.contains(pattern) { continue; }
+        let substitute = match pattern.as_str() {
+            "quartercubic" => "cubic",
+            "lateral-honeycomb" => "honeycomb",
+            "lateral-lattice" => "2dlattice",
+            _ => {
+                notes.push(format!("sparse infill pattern {pattern:?} is not one Fab prints: kept, pick another before slicing"));
+                continue;
+            }
+        };
+        notes.push(format!("sparse infill pattern {pattern:?} is not one Fab prints: imported as {substitute:?}"));
+        *pattern = substitute.into();
+    }
+}
+
+/// An adaptive infill mode of Orca's that Fab does not build yet is kept as written and named
+/// in the import's notes: a TPMS pattern does not slice with it until it is changed.
+fn import_adaptive_mode(values: &Config, notes: &mut Vec<String>) {
+    let Some(stored) = values.map.get("adaptive_infill_mode") else { return };
+    let modes = match stored {
+        Value::Scalar(s) => std::slice::from_ref(s),
+        Value::Vector(v) => v.as_slice(),
+    };
+    for mode in modes.iter().filter(|m| !matches!(m.as_str(), "disabled" | "distance_warp" | "lobes")) {
+        notes.push(format!("adaptive infill mode {mode:?} is not built in Fab yet: kept, set it to disabled, distance_warp or lobes before slicing a TPMS pattern"));
+    }
+}
+
 /// Settle each preset against the profiles the user has installed: a
 /// project's preset becomes its parent plus the keys it marks as changed
 /// (the rest follow the parent, as the project's own app reads it); a preset
@@ -503,6 +541,8 @@ pub fn settle(batch: &mut ImportBatch, store: &ProfileStore, source: &str) {
             ip.report.known = p.values.map.keys().filter(|k| options().get(k).is_some() && !IDENTITY_KEYS.contains(&k.as_str()) && !LAYOUT_KEYS.contains(&k.as_str())).count();
             ip.report.unknown.retain(|k| p.values.has(k));
         }
+        import_sparse_pattern(&mut p.values, &mut ip.notes);
+        import_adaptive_mode(&p.values, &mut ip.notes);
         if store.path_of(&p.name).is_none() {
             continue;
         }
@@ -588,6 +628,49 @@ mod tests {
         let d = std::env::temp_dir().join(format!("fab-import-test-{}-{name}", std::process::id()));
         let _ = std::fs::create_dir_all(&d);
         d
+    }
+
+    #[test]
+    fn sparse_pattern_imports_explain_substitutions_and_keep_unknown_names() {
+        let store = ProfileStore::open(&[], &[]);
+        for (source, expected, note) in [
+            ("quartercubic", "cubic", Some(r#"imported as "cubic""#)),
+            ("lateral-honeycomb", "honeycomb", Some(r#"imported as "honeycomb""#)),
+            ("lateral-lattice", "2dlattice", Some(r#"imported as "2dlattice""#)),
+            ("gyroid", "gyroid", None),
+            ("rectilinear", "zig-zag", None),
+            ("future-pattern", "future-pattern", Some("kept, pick another before slicing")),
+        ] {
+            let mut batch = ImportBatch { tree: "OrcaSlicer".into(), ..ImportBatch::default() };
+            let json = format!(r#"{{"type":"process","name":"Standalone","sparse_infill_pattern":"{source}"}}"#);
+            one_preset(json.as_bytes(), "process.json", &mut batch);
+            let mut cfg = Config::new();
+            cfg.set_str("print_settings_id", "Project");
+            cfg.set_str("sparse_infill_pattern", source);
+            split_project(&cfg, "Metadata/project_settings.config", &mut batch);
+            settle(&mut batch, &store, "test");
+            let notes: Vec<_> = note.map(|n| format!("sparse infill pattern {source:?} is not one Fab prints: {n}")).into_iter().collect();
+            for name in ["Standalone", "Project"] {
+                let p = batch.presets.iter().find(|p| p.preset.name == name).unwrap();
+                assert_eq!(p.preset.values.str("sparse_infill_pattern"), expected, "{name}: {source}");
+                assert_eq!(p.notes, notes, "{name}: {source}");
+            }
+        }
+    }
+
+    #[test]
+    fn unbuilt_adaptive_modes_are_kept_and_named() {
+        let store = ProfileStore::open(&[], &[]);
+        for (mode, noted) in [("smooth_blend", true), ("normal_z", true), ("lobes", false), ("distance_warp", false), ("disabled", false)] {
+            let mut batch = ImportBatch { tree: "OrcaSlicer".into(), ..ImportBatch::default() };
+            let json = format!(r#"{{"type":"process","name":"Graded","sparse_infill_pattern":"gyroid","adaptive_infill_mode":"{mode}"}}"#);
+            one_preset(json.as_bytes(), "process.json", &mut batch);
+            settle(&mut batch, &store, "test");
+            let p = batch.presets.iter().find(|p| p.preset.name == "Graded").unwrap();
+            assert_eq!(p.preset.values.str("adaptive_infill_mode"), mode, "{mode} is kept as written");
+            let notes: Vec<_> = noted.then(|| format!("adaptive infill mode {mode:?} is not built in Fab yet: kept, set it to disabled, distance_warp or lobes before slicing a TPMS pattern")).into_iter().collect();
+            assert_eq!(p.notes, notes, "the notes for {mode}");
+        }
     }
 
     #[test]

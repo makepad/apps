@@ -44,6 +44,8 @@ pub enum Origin {
 const TRANSPORT_START_H: f64 = 77.0;
 /// The Program's width beside the plate in a new Design, before the person sizes it.
 pub const CODE_START_W: f64 = 440.0;
+/// The Steps area under Design's plate: its header and the strip's one row.
+const STEPS_H: f64 = 64.0;
 
 impl Origin {
     /// The caption's starting order.
@@ -117,8 +119,9 @@ impl Origin {
                 // slicer, the job, the printer (the part's parameters are a section of the Part) over the
                 // overrides, strength and test prints; the program beside the plate
                 let (code, width) = code;
-                let centre = if code { T::split(Horizontal, FromB(width.unwrap_or(CODE_START_W)), plate(), T::area(Editor::Code)) } else { plate() };
-                let left = T::stack(&[Editor::Plates, Editor::Parts], 1);
+                let plate = T::split(Vertical, FromB(STEPS_H), plate(), T::area(Editor::Steps));
+                let centre = if code { T::split(Horizontal, FromB(width.unwrap_or(CODE_START_W)), plate, T::area(Editor::Code)) } else { plate };
+                let left = T::stack(&[Editor::Plates, Editor::Parts, Editor::Journal], 1);
                 let top = T::stack(&[Editor::Part, Editor::Slicer, Editor::Settings, Editor::Printer, Editor::Calibrate], 0);
                 let below = T::stack(&[Editor::Overrides, Editor::Strength, Editor::TestPrints], 0);
                 let right = T::split(Vertical, Weighted(0.5), top, below);

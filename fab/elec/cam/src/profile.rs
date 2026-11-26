@@ -1,6 +1,7 @@
 //! The resolved factory profile: plain data the writers take (seam of lane ECAM).
 //!
-//! A profile document (Splash, evaluated by `lang`) becomes this: naming, format variants,
+//! A literal factory profile selects a file set and supplies the capability limits. The resolved
+//! profile holds the names, format variants,
 //! capability limits and the BOM and placement tables with their Splash functions already
 //! applied to the design. `cam` never calls the VM.
 
@@ -108,47 +109,32 @@ pub struct ResolvedProfile {
     pub tolerance: Nm,
 }
 
-/// The built-in factory profiles, by the name a board's `factory(..)` and `elec.factory.set`
-/// take, in the order they are offered.
+/// The names of the Rust export formats (file sets) a profile document may select.
 pub const PROFILES: [&str; 2] = ["standard 2-layer", "JLCPCB 2-layer"];
 
-/// The built-in profiles' capabilities by name: the factories whose minima become a board's rules
-/// when its document names one (`apply_capabilities`). O(profiles).
+/// The built-in factory minima used by the board's effective rules.
 pub fn builtin_factories() -> fab_elec_board::Factories {
-    PROFILES.iter().filter_map(|name| ResolvedProfile::builtin(name, "", "")).map(|p| (p.name, std::sync::Arc::new(p.capabilities))).collect()
+    crate::profile_doc::builtins().iter().map(|p| (p.name.clone(), p.caps.clone())).collect()
 }
 
 impl ResolvedProfile {
-    /// A built-in profile by its name in [`PROFILES`] (letter case aside), for `project` at
-    /// `rev`; None for any other name. Its tables start empty (`tables::fill_generic_tables`).
-    pub fn builtin(name: &str, project: &str, rev: &str) -> Option<ResolvedProfile> {
-        let name = name.trim();
-        if name.eq_ignore_ascii_case(PROFILES[0]) {
-            Some(Self::standard_2_layer(project, rev))
-        } else if name.eq_ignore_ascii_case(PROFILES[1]) {
-            Some(Self::jlc_2_layer(project, rev))
-        } else {
-            None
-        }
+    /// A built-in profile by name, ignoring letter case. Its tables start empty.
+    pub fn builtin(name: &str, project: &str, rev: &str) -> Option<Self> {
+        let def = crate::profile_doc::builtins().iter().find(|p| p.name.eq_ignore_ascii_case(name.trim()))?;
+        Some(Self::from_definition(def, project, rev))
     }
 
-    /// Standard two-layer fabrication files with JLC assembly headers. Fill the empty tables
-    /// with `PlacementRules::jlc()` so placement coordinates share the Gerber frame.
-    pub fn jlc_2_layer(project: &str, rev: &str) -> ResolvedProfile {
-        let mut profile = Self::standard_2_layer(project, rev);
-        profile.name = "JLCPCB 2-layer".into();
-        profile.bom.header = ["Comment", "Designator", "Footprint", "LCSC Part #"]
-            .iter().map(|s| s.to_string()).collect();
-        profile.placement.header = ["Designator", "Mid X", "Mid Y", "Layer", "Rotation"]
-            .iter().map(|s| s.to_string()).collect();
-        profile.readme = format!("{project} revision {rev}: fabrication and assembly files for the JLCPCB 2-layer profile.\n");
-        profile
+    pub fn jlc_2_layer(project: &str, rev: &str) -> Self {
+        Self::builtin(PROFILES[1], project, rev).expect("the built-in JLCPCB profile")
     }
 
-    /// The built-in generic profile "standard 2-layer": copper, mask, paste, silk and edge
-    /// layers of both sides as X2 Gerber, plated and non-plated drills, BOM and placement as
-    /// CSV, a readme, one zip. Tables start empty; the caller fills them from the design.
-    pub fn standard_2_layer(project: &str, rev: &str) -> ResolvedProfile {
+    pub fn standard_2_layer(project: &str, rev: &str) -> Self {
+        Self::builtin(PROFILES[0], project, rev).expect("the built-in standard profile")
+    }
+
+    /// Build the named factory's package using its selected file set.
+    pub fn from_definition(def: &crate::profile_doc::ProfileDef, project: &str, rev: &str) -> Self {
+        let jlc = def.format == PROFILES[1];
         let g = |layer: LayerId, suffix: &str| FileSpec {
             name: format!("{project}-{suffix}.gbr"),
             kind: FileKind::Gerber { layer, variant: GerberVariant::X2 },
@@ -170,25 +156,14 @@ impl ResolvedProfile {
             FileSpec { name: "README.txt".into(), kind: FileKind::Readme },
         ];
         ResolvedProfile {
-            name: "standard 2-layer".into(),
+            name: def.name.clone(),
             project: project.into(),
             rev: rev.into(),
-            capabilities: Capabilities {
-                min_track: 150_000,
-                min_clearance: 150_000,
-                min_drill: 300_000,
-                min_annular: 130_000,
-                via_in_pad: false,
-                layers: vec![1, 2],
-                board_min: (5_000_000, 5_000_000),
-                board_max: (400_000_000, 500_000_000),
-                thickness: vec![800_000, 1_000_000, 1_600_000],
-                thickness_tol_ppm: 50_000,
-            },
+            capabilities: (*def.caps).clone(),
             files,
             gerber: GerberFormat { decimals: 6 },
             drill: DrillFormat { inch: false, zeros: Zeros::Decimal, int_digits: 3, frac_digits: 3 },
-            bom: BomTable { header: vec!["Comment".into(), "Designator".into(), "Footprint".into(), "Part".into()], rows: vec![], delimiter: ',' },
+            bom: BomTable { header: vec!["Comment".into(), "Designator".into(), "Footprint".into(), (if jlc { "LCSC Part #" } else { "Part" }).into()], rows: vec![], delimiter: ',' },
             placement: PlacementTable {
                 origin: P::ZERO,
                 bottom_x: None,
@@ -196,7 +171,7 @@ impl ResolvedProfile {
                 rows: vec![],
                 delimiter: ',',
             },
-            readme: format!("{project} revision {rev}: fabrication files for the standard 2-layer profile.\n"),
+            readme: format!("{project} revision {rev}: {} files for the {} profile.\n", if jlc { "fabrication and assembly" } else { "fabrication" }, def.name),
             zip: Some(format!("{project}-{rev}.zip")),
             tolerance: 1_000,
         }

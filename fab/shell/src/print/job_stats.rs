@@ -238,10 +238,10 @@ pub fn job_lines(p: &PrintState, pv: &PrintPreview, stats: &JobStats, now: f64) 
 }
 
 /// Each filament of the job, in its colour: used and left, by Fab's slice timing.
-pub fn filament_rows(p: &PrintState, pv: &PrintPreview, stats: &JobStats) -> Vec<(Option<[f32; 4]>, String)> {
+pub fn filament_rows(mode: fab_plate::ColourMode, p: &PrintState, pv: &PrintPreview, stats: &JobStats) -> Vec<(Option<[f32; 4]>, String)> {
     pv.filament_use.iter().map(|f| {
         let done = stats.printed(pv, f.slot, p.follow.live);
-        let colour = pv.filament_colors.get(f.slot).map(|c| {
+        let colour = pv.colours.shown(mode).get(f.slot).map(|c| {
             let s = to_srgb([c[0], c[1], c[2]]);
             [s.x, s.y, s.z, 1.0]
         });
@@ -297,9 +297,9 @@ impl Widget for FabColourRows {
         let rows = scope.data.get::<AppState>().map_or_else(Vec::new, |state| {
             let p = &state.print;
             if self.job {
-                p.job_stats().map_or_else(Vec::new, |(pv, stats)| filament_rows(p, pv, stats))
+                p.job_stats().map_or_else(Vec::new, |(pv, stats)| filament_rows(state.view.colours, p, pv, stats))
             } else {
-                p.printer.as_ref().map_or_else(Vec::new, |printer| head_rows(printer))
+                p.shown_printer().map_or_else(Vec::new, |printer| head_rows(printer))
             }
         });
         let rect = cx.walk_turtle(Walk { height: Size::Fixed(rows.len() as f64 * ROW_H), ..walk });
@@ -337,7 +337,8 @@ mod tests {
         let p = Arc::get_mut(&mut pv).unwrap();
         p.beads = crate::print::BeadStreams::surface(RetainedInstances::new(PREVIEW_SLOTS, data.into()).unwrap());
         p.filament_use = vec![FilamentUse { slot: 0, grams: 3.0, metres: 1.5, ..Default::default() }, FilamentUse { slot: 1, grams: 1.0, metres: 0.5, ..Default::default() }];
-        p.filament_colors = vec![[1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]];
+        p.colours.material = vec![[1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]];
+        p.colours.model = vec![[0.0, 1.0, 0.0, 1.0], [1.0; 4]];
         pv
     }
 
@@ -352,13 +353,15 @@ mod tests {
         let mut p = PrintState::default();
         // Half way through the second layer: half of filament 1's three layers' first two thirds.
         p.follow.live = 25.0;
-        let rows = filament_rows(&p, &pv, &stats);
+        let rows = filament_rows(fab_plate::ColourMode::Material, &p, &pv, &stats);
         assert_eq!(rows[0].1, "Filament 1: 1.5 g used, 1.5 g left of 3.0 g · 0.75 of 1.50 m");
         assert_eq!(rows[1].1, "Filament 2: 0.0 g used, 1.0 g left of 1.0 g · 0.00 of 0.50 m");
-        assert!(rows[0].0.is_some());
+        let model = filament_rows(fab_plate::ColourMode::Model, &p, &pv, &stats);
+        assert_eq!(model[0].1, rows[0].1, "changing mode keeps the quantities");
+        assert_ne!(model[0].0, rows[0].0, "the job's model and spool swatches differ");
         // Printed through: all of it.
         p.follow.live = pv.total;
-        let rows = filament_rows(&p, &pv, &stats);
+        let rows = filament_rows(fab_plate::ColourMode::Material, &p, &pv, &stats);
         assert_eq!(rows[1].1, "Filament 2: 1.0 g used, 0.0 g left of 1.0 g · 0.50 of 0.50 m");
         // The lines: planned, the layers and their heights, the changes.
         p.follow.live = 30.0;

@@ -1,0 +1,11 @@
+use mod.flow.*
+
+let transport = Transport{bpm: 96 playing: 0}
+let music = Score{
+    clock: transport.out(@clock)
+    score: "score"
+}
+let mix = AudioMixer{inputs: [conn(1, music.out(@audio))] master: 0.8}
+let out = AudioOutput{audio: mix.out(@audio) enabled: 0}
+
+Flow{transport, music, mix, out}

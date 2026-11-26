@@ -703,9 +703,9 @@ struct Splice {
     dist: u8,
     grid: Option<u8>,
     control: Option<u8>,
-    /// Its element counter and its work counter.
+    /// Its element counter and the low and high words of its work counter.
     i: Var,
-    work: Option<Var>,
+    work: [Option<Var>; 2],
     /// The element loop's index in its body.
     at: usize,
     shared_base: u32,
@@ -996,7 +996,7 @@ impl Build<'_> {
     /// read from the program, its grid from the program's payload.
     fn splice(&mut self, pc: usize) -> Result<Val, String> {
         let slot = self.t[pc][1] as usize;
-        let k = std::mem::replace(&mut self.splices[slot], Splice { prog: Program::default(), points: 0, dist: 0, grid: None, control: None, i: Var(0), work: None, at: 0, shared_base: 0, defs: HashMap::new() });
+        let k = std::mem::replace(&mut self.splices[slot], Splice { prog: Program::default(), points: 0, dist: 0, grid: None, control: None, i: Var(0), work: [None; 2], at: 0, shared_base: 0, defs: HashMap::new() });
         let frame_base = self.frame;
         self.frame += k.prog.frame_words;
         let mut vmap: Vec<Val> = k.prog.vals.iter().map(|t| { self.p.vals.push(*t); Val(self.p.vals.len() as u32 - 1) }).collect();
@@ -1037,6 +1037,11 @@ impl Build<'_> {
             Stmt::Def(d, op) => {
                 // what reads the host's buffers and parameters is read from here instead
                 match op {
+                    // The tile discards the counter updates. Keep their dead operands defined
+                    // until the tile optimizer removes the arithmetic.
+                    Op::Get(r) if k.work.contains(&Some(*r)) => {
+                        return Ok(vec![Stmt::Def(v(d, vmap), Op::ConstI(0))]);
+                    }
                     Op::Load { region: Region::Buf(b), base, extent, off } => {
                         if *b == k.points {
                             let lane = point_lane(k, *base, *off)?;
@@ -1105,7 +1110,7 @@ impl Build<'_> {
                 vec![Stmt::Def(v(d, vmap), ir::map_op(op, vmap, rmap))]
             }
             Stmt::Set(r, x) => {
-                if Some(*r) == k.work {
+                if k.work.contains(&Some(*r)) {
                     return Ok(Vec::new());
                 }
                 vec![Stmt::Set(rmap[r.0 as usize], v(x, vmap))]
@@ -1224,13 +1229,13 @@ fn splice_of(slot: &KernelSlot, shared: &mut Vec<u32>) -> Result<Splice, String>
     }
     // what runs after the loop stores the work counter
     let mut post = HashMap::new();
-    let mut work = None;
+    let mut work = [None; 2];
     for s in &prog.body[at + 1..] {
         match s {
             Stmt::Def(v, op) => { post.insert(v.0, *op); }
-            Stmt::Store { region: Region::Ctx, base, val, .. } if *base == K_WORK => {
+            Stmt::Store { region: Region::Ctx, base, val, .. } if (K_WORK..=K_WORK + 1).contains(base) => {
                 if let Some(Op::Get(w)) = post.get(&val.0).or_else(|| defs.get(&val.0)) {
-                    work = Some(*w);
+                    work[(*base - K_WORK) as usize] = Some(*w);
                 }
             }
             _ => {}
@@ -1933,13 +1938,38 @@ impl Build<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use makepad_csg_sdf::links::{LinkLoop, Links};
     use makepad_csg_sdf::mesh_field::MeshData;
     use makepad_csg_sdf::strokes::{StrokeOp, Strokes};
     use makepad_csg_sdf::texture::{SdfTexture, TexProject};
     use makepad_csg_sdf::{distance_slot, SdfDeform, SdfKernel, SdfOp, SdfPlace};
+
+    pub(crate) fn assert_spliced_without_work(root: &SdfNode) {
+        fn check(block: &Block, work: [Var; 2]) {
+            for stmt in block {
+                match stmt {
+                    Stmt::Store { region: Region::Ctx, base, .. } => assert!(*base != K_WORK && *base != K_WORK + 1, "tile stores work word {base}"),
+                    Stmt::Def(_, Op::Get(r)) | Stmt::Set(r, _) => assert!(!work.contains(r), "tile retained work variable {r:?} in {stmt:?}"),
+                    Stmt::If(_, yes, no) => { check(yes, work); check(no, work); }
+                    Stmt::Loop { body, .. } => check(body, work),
+                    _ => {}
+                }
+            }
+        }
+
+        let (table, texels, leaves) = lowered(root).unwrap();
+        let [slot] = table.as_slice() else { panic!("expected one Splash field") };
+        assert!(leaves.is_empty(), "the kernel must be spliced");
+        let k = splice_of(slot, &mut Vec::new()).unwrap();
+        let [Some(lo), Some(hi)] = k.work else { panic!("expected a kernel that stores both work words") };
+        assert_ne!(lo, hi, "the work words must have distinct variables");
+        let Ok((tile, _)) = build(&texels, &table, false, &[], false) else { panic!("could not splice the kernel") };
+        // This single-kernel tile appends the kernel's variables after its own element counter.
+        let base = (tile.vars.len() - k.prog.vars.len()) as u32;
+        check(&tile.body, [Var(base + lo.0), Var(base + hi.0)]);
+    }
 
     fn sphere(radius: f64) -> SdfNode {
         SdfNode::Sphere { radius }

@@ -1,0 +1,6 @@
+use mod.scene.*
+// 100 000 instances (lower poly), GPU-animated by a vertex deform.
+Scene3D{ background: #101218 environment: Environment{preset: @studio} camera: Camera{orbit: true yaw: spin(20) pitch: 35 distance: 60 fov: 40}
+  lights: [DirectionalLight{position: vec3(3, 6, 4) intensity: 2}]
+  children: [Instances{geometry: BoxGeometry{width: 0.2 height: 0.2 depth: 0.2} layout: GridLayout{count: vec3(400, 1, 250) spacing: vec3(0.25, 1, 0.25)}
+    each: {rotation: spin(vec3(0, 90, 0))} color_jitter: 0.3 material: MeshStandardMaterial{color: #4f8cff roughness: 0.4}}] }

@@ -1,0 +1,23 @@
+# The evaluation harness for AI-generated videos: a fixed
+# benchmark of briefs, run through the in-app generator headlessly against
+# a chosen model, measured (inspect, render, safe zones, motion density,
+# brief conformance) and judged by a vision review against the written
+# rubric; results as a markdown + JSON table and a contact-sheet gallery.
+[package]
+name = "makepad-story-video-eval"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "makepad-video-eval"
+path = "src/bin/makepad-video-eval.rs"
+
+[dependencies]
+makepad-micro-serde = { path = "../../../../../libs/micro_serde" }
+# The edit model: output format, duration and node kinds of a generated edit.
+makepad-story-cut = { path = "../cut" }
+# The judge: the Claude Code CLI provider (the user's configured, logged-in
+# backend; no key in this crate) and the PNG codec.
+makepad-ai-hub = { path = "../../../../../libs/ai/hub", default-features = false }

@@ -1,0 +1,47 @@
+use mod.motion.*
+// Camera moves for Draw2D layers: a 2D camera, its mapping both ways, and blends between set-ups.
+//
+// A camera is `{x y zoom rot w h}`: the world point at the frame's centre, its scale (1: world
+// units are document units), its roll in radians (clockwise), and the frame size (`w h`,
+// default 1920 x 1080). World units are y down, like the document's.
+//
+//   use mod.motion.modules.camera2d.*
+//   Draw2D{draw: fn(c, t, edit) {
+//       let cam = cam2d_mix({x: 960 y: 540 zoom: 1}, {x: 1400 y: 300 zoom: 2.5 rot: 0.1}, ease(@ease_in_out_cubic, prog(t, 1.0, 1.6)))
+//       cam2d_apply(c, cam)          // what follows is drawn in world units
+//       c.stroke([[1300, 300], [1500, 300]], 2, #eee9df, 1)
+//   }}
+
+// Draw what follows on `c` through the camera (sets c's transform).
+let cam2d_apply = fn(c, cam) {
+    let cs = cos(cam.rot ?? 0.0) * cam.zoom
+    let sn = sin(cam.rot ?? 0.0) * cam.zoom
+    c.set_transform(cs, sn, -sn, cs, (cam.w ?? 1920.0) / 2.0 - (cs * cam.x - sn * cam.y), (cam.h ?? 1080.0) / 2.0 - (sn * cam.x + cs * cam.y))
+}
+// A world point (vec2) on screen: where to put a HUD label, a spark, a screen-space glow.
+let cam2d_to_screen = fn(cam, p) {
+    let cs = cos(cam.rot ?? 0.0) * cam.zoom
+    let sn = sin(cam.rot ?? 0.0) * cam.zoom
+    return vec2(cs * (p.x - cam.x) - sn * (p.y - cam.y) + (cam.w ?? 1920.0) / 2.0, sn * (p.x - cam.x) + cs * (p.y - cam.y) + (cam.h ?? 1080.0) / 2.0)
+}
+// A screen point (vec2) in the world.
+let cam2d_to_world = fn(cam, p) {
+    let cs = cos(cam.rot ?? 0.0) / cam.zoom
+    let sn = sin(cam.rot ?? 0.0) / cam.zoom
+    let dx = p.x - (cam.w ?? 1920.0) / 2.0
+    let dy = p.y - (cam.h ?? 1080.0) / 2.0
+    return vec2(cam.x + cs * dx + sn * dy, cam.y - sn * dx + cs * dy)
+}
+// Between two cameras, k 0..1: position and roll linear, zoom geometric, so a push-in keeps
+// its apparent speed. Ease `k` for the move (`ease(@ease_in_out_cubic, prog(t, t0, t1))`).
+let cam2d_mix = fn(a, b, k) {
+    return {x: mix(a.x, b.x, k) y: mix(a.y, b.y, k) zoom: exp(mix(ln(a.zoom), ln(b.zoom), k)) rot: mix(a.rot ?? 0.0, b.rot ?? 0.0, k)
+        w: a.w ?? 1920.0 h: a.h ?? 1080.0}
+}
+// A frame shake as a vec2 offset in px: value noise at `freq` Hz, `amount` px at most
+// (0..~20; decay it with `pulse(t, hit, 0.1)` for a hit). Different `seed`s shake independently.
+let cam2d_shake = fn(t, amount, freq, seed) {
+    return vec2(vnoise(t * freq, 0.5, seed) * amount, vnoise(t * freq, 7.5, seed + 1.0) * amount)
+}
+
+{cam2d_apply: cam2d_apply cam2d_to_screen: cam2d_to_screen cam2d_to_world: cam2d_to_world cam2d_mix: cam2d_mix cam2d_shake: cam2d_shake}

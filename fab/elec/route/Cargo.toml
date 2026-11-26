@@ -14,6 +14,8 @@ fab-elec-core = { path = "../core" }
 fab-elec-circuit = { path = "../circuit" }
 fab-elec-board = { path = "../board" }
 fab-elec-parts = { path = "../parts" }
+# a basis built once per base, its other askers waiting off the CPU (`once::ComputeOnce`)
+makepad-core-util = { path = "../../../../../libs/core_util" }
 
 [features]
 # Hooks for dependent crates' tests (the host's real-worker tests); no product build enables it.

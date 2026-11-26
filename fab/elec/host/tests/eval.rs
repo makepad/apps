@@ -1,6 +1,6 @@
 //! Document-backed evaluation, adoption and history ordering without a scheduler or clock.
 
-use fab_elec_board::{Board, BoardKeepout, BoardOp, Factories, Item, Origin};
+use fab_elec_board::{Board, BoardKeepout, BoardOp, CarriedKeepout, Factories, Item, Origin, PortRoom};
 use fab_elec_circuit::{CircuitOp, End, QtyUnit, Quantity, Value};
 use fab_elec_core::{mm, Angle, BBox, BoardId, Canon, CompRef, Diag, DocId, FeatureRef, ItemId, LayerId, LayerSet, PolySet, Sel, Side, P};
 use fab_elec_design::{AssetBytes, BenchOp, By, Design, DesignOp, EntryKind, FileOp, PartRef, Place, ProbeOf, Resolved, TextEdit};
@@ -874,7 +874,8 @@ fn circuit_edits_relower_the_board_with_its_ids_and_an_older_move_undoes_by_text
 /// it never enters the history or a document.
 #[test]
 fn a_case_keepout_is_derived_kept_through_a_relowering_and_goes_with_the_case() {
-    let (mut engine, mailbox, ..) = setup();
+    let (engine, mailbox, ..) = setup();
+    let mut engine = engine.with_app_tools();
     let loaded = texts(&engine);
     let unit = BoardId(0);
     let name = "Light pipe block D1 D2";
@@ -886,23 +887,51 @@ fn a_case_keepout_is_derived_kept_through_a_relowering_and_goes_with_the_case() 
     let held = |engine: &Engine| board(engine).keepouts.iter()
         .filter(|k| matches!(&k.origin, Origin::Derived { from: FeatureRef::Panel(from) } if from.starts_with(CASE_KEEPOUT)))
         .cloned().collect::<Vec<_>>();
-    let publish = |x: Option<f64>| Cmd::CaseKeepouts { unit, sets: x.map(|x| (name.to_string(), vec![block(x)])).into_iter().collect() };
+    let comp = board(&engine).placed[0].comp;
+    let set = format!("@elec:port:{}:{}:0/{name}", unit.0, comp.0);
+    let port = |width| PortRoom {
+        comp, room: Some(PolySet::rect(BBox::new(P::ZERO, P::mm(width, 2.0)))),
+        keepout: Some(CarriedKeepout {
+            from: FeatureRef::Panel(format!("{CASE_KEEPOUT}{set}")), area: PolySet::rect(BBox::new(P::ZERO, P::mm(6.0, 4.4))),
+            band: (mm(1.2), mm(9.0)), side: Side::Top,
+        }),
+    };
+    let publish = |generation, x: Option<f64>, rooms| Cmd::CaseKeepouts {
+        unit, generation, plan: Ok(None), sets: x.map(|x| (set.clone(), vec![block(x)])).into_iter().collect(), rooms,
+    };
 
-    mailbox.push(publish(Some(10.0)));
+    let evaluated = board(&engine).generation;
+    assert!(engine.case_rooms(unit).is_none());
+    mailbox.push(Cmd::Invoke {
+        tool: "elec.place".into(), args: tool_args([("mode", "@place"), ("all", "true")]),
+        by: By::Person, preview: false, ticket: Ticket(1),
+    });
+    let started = step(&mut engine, &mailbox);
+    let [start] = started.routes.as_slice() else { panic!("expected a place job: {:?}", started.rejected) };
+    assert!(matches!(&start.job, fab_elec_host::Job::Place(job) if job.rooms.is_empty()), "a job before the first publication carries no rooms");
+    mailbox.push(publish(evaluated, Some(10.0), vec![port(1.0)]));
     let first = step(&mut engine, &mailbox);
     assert!(first.rejected.is_empty() && first.evals.is_empty(), "a case publication applies without an evaluation");
+    assert_eq!(engine.case_rooms(unit), Some((evaluated, [port(1.0)].as_slice())), "the room belongs to the generation the case read");
     let [kept] = held(&engine).try_into().expect("the board holds one case keepout");
-    assert_eq!(kept.origin, Origin::Derived { from: FeatureRef::Panel(format!("{CASE_KEEPOUT}{name}")) }, "it is derived from the case's record");
+    assert_eq!(kept.origin, Origin::Derived { from: FeatureRef::Panel(format!("{CASE_KEEPOUT}{set}")) }, "the engine preserves the opaque set key");
+    assert_eq!(kept.reason, name);
     assert!(engine.log().entries.is_empty(), "a case publication is not an undo step");
     assert_eq!(texts(&engine), loaded, "a case keepout is written to no document");
     let generation = board(&engine).generation;
     let design = engine.design().clone();
-    mailbox.push(publish(Some(10.0)));
+    mailbox.push(publish(evaluated, Some(10.0), vec![port(1.0)]));
     step(&mut engine, &mailbox);
     assert_eq!(board(&engine).generation, generation, "the same publication again leaves the board generation");
     assert!(Arc::ptr_eq(engine.design(), &design), "and the committed design as it was");
 
-    mailbox.push(publish(Some(12.0)));
+    mailbox.push(publish(generation, Some(10.0), vec![port(2.0)]));
+    step(&mut engine, &mailbox);
+    assert_eq!(engine.case_rooms(unit), Some((generation, [port(2.0)].as_slice())), "the new publication replaces the room");
+    assert_eq!(board(&engine).generation, generation, "a room-only change leaves the board generation alone");
+    assert!(Arc::ptr_eq(engine.design(), &design) && engine.log().entries.is_empty(), "only the held rooms changed");
+
+    mailbox.push(publish(generation, Some(12.0), vec![port(2.0)]));
     step(&mut engine, &mailbox);
     let [moved] = held(&engine).try_into().expect("the board still holds one case keepout");
     assert_eq!(moved.id, kept.id, "a moved block replaces its keepout in place");
@@ -922,10 +951,131 @@ fn a_case_keepout_is_derived_kept_through_a_relowering_and_goes_with_the_case() 
     let [relowered] = held(&engine).try_into().expect("the re-lowered board keeps the case keepout");
     assert_eq!((relowered.area, relowered.z, relowered.origin), (moved.area, moved.z, moved.origin), "as it was");
 
-    mailbox.push(publish(None));
+    let evaluated = board(&engine).generation;
+    mailbox.push(publish(evaluated, None, Vec::new()));
     step(&mut engine, &mailbox);
     assert!(held(&engine).is_empty(), "a publication without the block (the case gone) removes its keepout");
+    assert_eq!(engine.case_rooms(unit), Some((evaluated, [].as_slice())), "an empty publication clears the port rooms");
     assert_eq!(engine.log().entries.len(), 1, "only the rename is in the history");
+    check_bring_history();
+}
+
+/// Keep, split and discard an actual tray bring, including its document and selection ledger.
+fn check_bring_history() {
+    let unit = BoardId(0);
+    let mut sources = fab_elec_fixtures::docs("ledctl").unwrap();
+    let doc = sources.find("ledctl.pcb.splash").unwrap();
+    let stock = &sources.doc(doc).unwrap().text;
+    let without_lamps = stock.lines().filter(|l| l.starts_with("board(") || l.starts_with("outline(")
+        || l.starts_with("place(\"mcu.") || l.starts_with("hole(")).collect::<Vec<_>>().join("\n");
+    sources.apply(&[TextEdit::trimmed(doc, stock, &without_lamps)]).unwrap();
+    for (discard, intervene) in [(false, false), (false, true), (true, false), (true, true)] {
+        let (design, docs) = Docs::load(sources.clone(), fab_elec_lang::std_libs());
+        let mut engine = Engine::new(design, Arc::new(Factories::new()), Arc::default(), Arc::default(), "place".into())
+            .with_docs(docs).with_app_tools();
+        let mailbox = Mailbox::default();
+        let before = texts(&engine);
+        let before_board = board(&engine).content_hash();
+        let generation = board(&engine).generation;
+        let ticket = Ticket(10);
+        mailbox.push(Cmd::CaseFindings { unit, generation, run: 1, cased: true, findings: vec![] });
+        mailbox.push(Cmd::Invoke { tool: "elec.place".into(), args: tool_args([("mode", "@place"), ("parts", "D1,D2")]),
+            by: By::Person, preview: false, ticket });
+        let mut done = step(&mut engine, &mailbox);
+        let bring = engine.log().entries.last().expect("the tray bring committed").seq;
+        let tray = texts(&engine);
+        let tray_board = board(&engine).content_hash();
+        assert_ne!(tray_board, before_board);
+        let led = board(&engine).placed.iter().find(|p| p.refdes == "D1").unwrap().id;
+        let standing = board(&engine).placed[0].id;
+        let (waiting, id, owner) = done.parked.expect("the tray bring is visible");
+        assert_eq!((waiting, owner), (ticket, unit));
+        let stamp = engine.design().generation;
+        mailbox.push(Cmd::CaseOutcome { unit, stamp: stamp - 1, reason: None });
+        loop {
+            assert!(done.routes.is_empty() && done.rejected.is_empty());
+            for fill in done.fills { mailbox.result(fill.run()); }
+            for check in done.checks { mailbox.result(check.run()); }
+            done = step(&mut engine, &mailbox);
+            if done.checks.is_empty() && done.fills.is_empty() { break }
+        }
+        assert!(done.routes.is_empty(), "an exact board and yesterday's publication still wait");
+        let tag = id.tag();
+        // Discard before release, including after an intervening edit. The kept trials
+        // exercise an evaluation at the bring and one that supersedes it.
+        if !discard {
+            let ports: Vec<_> = board(&engine).placed.iter().filter(|p| ["D1", "D2"].contains(&p.refdes.as_str()))
+                .map(|p| PortRoom { comp: p.comp, room: Some(PolySet::rect(BBox::new(P::ZERO, P::mm(1., 2.)))), keepout: None }).collect();
+            if !intervene {
+                mailbox.push(Cmd::CaseKeepouts { unit, generation: board(&engine).generation, sets: vec![], rooms: ports.clone(), plan: Ok(None) });
+            }
+            mailbox.push(Cmd::CaseOutcome { unit, stamp: stamp + u64::from(intervene),
+                reason: intervene.then(|| "failed to build the roof".into()) });
+            let released = step(&mut engine, &mailbox);
+            let [start] = released.routes.as_slice() else { panic!("the stamped outcome releases the job") };
+            assert_eq!(start.job.id(), id);
+            let fab_elec_host::Job::Place(job) = &start.job else { panic!("expected a place job") };
+            assert!(job.add.is_empty() && job.scope.len() == 2);
+            if !intervene { assert_eq!(job.rooms, ports); }
+        }
+        if intervene {
+            mailbox.push(move_part(standing, P::mm(1., 0.), "adjust MCU"));
+            assert!(step(&mut engine, &mailbox).rejected.is_empty());
+        }
+        let between = texts(&engine);
+        if discard {
+            mailbox.push(Cmd::DiscardJob { seq: 11, tag });
+            let discarded = step(&mut engine, &mailbox);
+            assert_eq!(discarded.redo, None);
+            if intervene {
+                assert!(matches!(discarded.outcomes.as_slice(), [(_, Outcome::Refused(reason))] if reason.text.contains("adjust MCU")));
+                assert_eq!(texts(&engine), between);
+                assert_eq!(engine.log().head, 2);
+            } else {
+                assert_eq!(texts(&engine), before);
+                assert_eq!(board(&engine).content_hash(), before_board);
+                assert!(engine.log().entries.is_empty());
+                check_board(&engine);
+            }
+            continue;
+        }
+        let ops = [standing, led].into_iter().map(|item| DesignOp::Board { unit, op: BoardOp::Move { item, by: P::mm(1.0, -4.0) } }).collect();
+        mailbox.preview(Sample { seq: 11, tag, ops, place: vec![], label: "keep placement".into(), by: By::Person,
+            proposal: None, notes: vec![], circuits: vec![], expect: None });
+        mailbox.push(Cmd::CommitPreview { seq: 11, tag });
+        let kept = step(&mut engine, &mailbox);
+        assert!(kept.rejected.is_empty(), "{:?}", kept.rejected);
+        assert_eq!(engine.log().head, if intervene { 3 } else { 1 });
+        assert_eq!(engine.log().entries.last().unwrap().label, "keep placement");
+        assert!(matches!(kept.outcomes.as_slice(), [(_, Outcome::Done { seq, notes, .. })]
+            if (*seq == bring) == !intervene && notes.iter().any(|(_, v)| v.contains("adjust MCU")) == intervene));
+        assert!(matches!(kept.outcomes.as_slice(), [(_, Outcome::Done { notes, .. })]
+            if notes.iter().any(|(key, value)| key == "case" && value.contains(if intervene { "failed to build the roof" } else { "waited for the case" }))));
+        let after = texts(&engine);
+        let after_board = board(&engine).content_hash();
+        check_board(&engine);
+        mailbox.push(Cmd::Undo);
+        assert!(step(&mut engine, &mailbox).rejected.is_empty());
+        if intervene {
+            assert_eq!(texts(&engine), between);
+            mailbox.push(Cmd::Undo);
+            step(&mut engine, &mailbox);
+            assert_eq!(texts(&engine), tray);
+            assert_eq!(board(&engine).content_hash(), tray_board);
+            mailbox.push(Cmd::Redo);
+            step(&mut engine, &mailbox);
+        } else {
+            assert_eq!(texts(&engine), before);
+            assert_eq!(board(&engine).content_hash(), before_board);
+            check_board(&engine);
+        }
+        mailbox.push(Cmd::Redo);
+        assert!(step(&mut engine, &mailbox).rejected.is_empty());
+        assert_eq!(texts(&engine), after);
+        assert_eq!(board(&engine).content_hash(), after_board);
+        check_board(&engine);
+    }
+
 }
 
 /// Broken text keeps the usable unit; repairing the same gesture keeps one undo entry.
@@ -2014,7 +2164,9 @@ fn part_place_plans_the_panes_drag_or_tray_drop_and_places_the_footprint() {
     };
     let mut ops = vec![DesignOp::Board { unit, op: BoardOp::Move { item: placed.id, by: at.sub(placed.at) } }];
     ops.extend(label_ops(unit, board(&engine), &ops, &[placed.id]));
-    assert_eq!(plan(&engine, &args).expect("the placed resistor can move"),
+    let mut exact = args.clone();
+    exact.push(("legalise".into(), "@off".into()));
+    assert_eq!(plan(&engine, &exact).expect("the placed resistor can move"),
         Resolved { ops, place: vec![], label: format!("Move {}", placed.refdes) },
         "moving a placed part plans the pane's displacement and affected labels together");
     for (field, value, reason) in [
@@ -2039,7 +2191,7 @@ fn part_place_plans_the_panes_drag_or_tray_drop_and_places_the_footprint() {
         place: vec![Place { unit, part: PartRef::Path(placed.path.clone()), at, rot: None, side: None }],
         label: format!("Place {}", placed.refdes),
     };
-    assert_eq!(plan(&engine, &args).expect("the tray resistor can be dropped"), drop, "an ordinary drop keeps the pane's placement defaults");
+    assert_eq!(plan(&engine, &exact).expect("the tray resistor can be dropped"), drop, "an ordinary drop keeps the pane's placement defaults");
     let args = tool_args([("part", &placed.path), ("at", "[34mm, 25mm]"), ("rot", "-90deg"), ("side", "@bottom")]);
     let requested = Place { rot: Some(Angle::deg(-90.0)), side: Some(Side::Bottom), ..drop.place[0].clone() };
     assert_eq!(plan(&engine, &args).expect("a tray drop accepts a rotation and side"),
@@ -2050,6 +2202,113 @@ fn part_place_plans_the_panes_drag_or_tray_drop_and_places_the_footprint() {
         "the engine acknowledges one committed placement with no circuit change");
     let after = board(&engine).placed.iter().find(|p| p.comp == placed.comp).expect("the committed footprint is on the board");
     assert_eq!((after.at, after.rot, after.side), (at, Angle::deg(-90.0), Side::Bottom), "the board adopts the requested anchor, rotation and side");
+}
+
+#[test]
+fn part_place_rotate_and_tidy_report_the_correction_from_the_requested_pose() {
+    use fab_elec_board::placement::{body_at, placed_courtyard, PlacementIndex};
+
+    let (engine, mailbox, ..) = setup();
+    let mut engine = engine.with_app_tools();
+    let placed = |engine: &Engine, path: &str| board(engine).placed.iter().find(|p| p.path == path)
+        .expect("the fixture part is placed").clone();
+    let part = placed(&engine, "mcu.boot_r");
+    let mcu = placed(&engine, "mcu.u");
+    let point = |at: P| format!("[{}mm {}mm]", f64::from(at.x) / 1e6, f64::from(at.y) / 1e6);
+    let invoke = |engine: &mut Engine, tool: &str, args| {
+        let ticket = Ticket(engine.log().entries.len() as u64 + 1);
+        mailbox.push(Cmd::Invoke { tool: tool.into(), args, preview: false, by: By::Ai { turn: 1, call: ticket.0 }, ticket });
+        let done = until_answer(engine, &mailbox);
+        assert!(done.rejected.is_empty(), "{tool} commits its requested pose: {:?}", done.rejected);
+        let [(answered, Outcome::Done { notes, .. })] = done.outcomes.as_slice() else { panic!("{tool} must answer once") };
+        assert_eq!(*answered, ticket, "the placement report belongs to the committing call");
+        notes.clone()
+    };
+    let clear = |engine: &Engine| PlacementIndex::new(board(engine), None).courtyard_pairs().is_empty();
+
+    // Drop from the tray first, then exercise the existing part's Move op on the same board.
+    mailbox.push(commit(vec![DesignOp::Board { unit: board(&engine).unit, op: BoardOp::Remove(part.id) }], "Return resistor to tray"));
+    let removed = until_answer(&mut engine, &mailbox);
+    assert!(removed.rejected.is_empty() && board(&engine).placed_of(part.comp).is_none(), "the resistor starts in the tray");
+    let wish = point(mcu.at);
+    let args = tool_args([("part", part.path.as_str()), ("at", &wish)]);
+    let notes = invoke(&mut engine, "elec.part.place", args.clone());
+    let landed = placed(&engine, &part.path);
+    assert_ne!(landed.at, mcu.at, "a tray drop onto the MCU moves the resistor off its anchor");
+    assert!(clear(&engine), "the legalised drop leaves no courtyard pair");
+    assert_eq!(placed(&engine, &mcu.path).at, mcu.at, "the MCU remains fixed");
+    let row = format!(r#"[{{part: "{}" moved_mm: {:.3}}}]"#, part.refdes, landed.at.dist(mcu.at) / 1e6);
+    assert_eq!(notes, [("legalised".into(), row)], "the committed answer names the resistor and its displacement in mm to three decimals");
+
+    let mut exact = args.clone();
+    exact.push(("legalise".into(), "@off".into()));
+    let notes = invoke(&mut engine, "elec.part.place", exact.clone());
+    assert_eq!(placed(&engine, &part.path).at, mcu.at, "off keeps the exact requested anchor");
+    assert!(notes.is_empty() && !clear(&engine), "off leaves the requested overlap and has no correction to report");
+    invoke(&mut engine, "elec.part.place", args);
+    assert_eq!(placed(&engine, &part.path).at, landed.at, "moving the placed resistor takes the same nearest spot as its tray drop");
+
+    // Alongside the last lamp resistor, leave a gap that the boot resistor's long side would cross.
+    let neighbour = placed(&engine, "lamps[7].r");
+    let turned = landed.rot.add(Angle::deg(90.0));
+    let reach = |rot| -body_at(&landed, P::ZERO, rot, landed.side, false).bbox().min.y;
+    let edge = placed_courtyard(&neighbour).bbox().max.y;
+    let overlap = P::new(neighbour.at.x, edge + reach(landed.rot) - mm(0.01));
+    let near = tool_args([("part", &part.path), ("at", &point(overlap))]);
+    let plan = fab_elec_host::edit_actions::part_place(engine.design(), engine.docs(), "elec.part.place", &near);
+    assert!(matches!(plan, Ok(Plan::Noted { notes, .. }) if notes.iter().any(|(key, _)| key == "legalised")),
+        "the resolver corrects a 0.01 mm courtyard overlap and says so");
+
+    let beside = P::new(neighbour.at.x, edge + (reach(landed.rot) + reach(turned)) / 2);
+    let notes = invoke(&mut engine, "elec.part.place", tool_args([("part", &part.path), ("at", &point(beside))]));
+    assert_eq!(placed(&engine, &part.path).at, beside, "a legal request lands exactly beside the neighbour");
+    assert!(notes.is_empty() && clear(&engine), "the legal move has no legalised entry or courtyard overlap");
+    assert!(body_at(&landed, beside, turned, landed.side, false).bbox().intersects(&placed_courtyard(&neighbour).bbox()),
+        "the uncorrected turn would overlap the neighbouring resistor");
+    let notes = invoke(&mut engine, "elec.part.rotate", tool_args([("parts", &part.path)]));
+    let rotated = placed(&engine, &part.path);
+    assert_eq!((rotated.rot, rotated.side), (turned, landed.side), "the corrected turn keeps the requested angle and side");
+    assert!(rotated.at != beside && clear(&engine), "rotation about the anchor adds a move to clear the neighbour");
+    assert!(notes.iter().any(|(key, _)| key == "legalised"), "the rotation answer reports its correction");
+
+    invoke(&mut engine, "elec.part.place", exact.clone());
+    let overlap = board(&engine).clone();
+    assert!(!clear(&engine), "the exact move gives Tidy an overlapping pair");
+    let notes = invoke(&mut engine, "elec.place", vec![]);
+    assert!(clear(&engine), "tidying the whole board clears every courtyard pair");
+    let tidied = placed(&engine, &part.path);
+    let row = format!(r#"[{{part: "{}" moved_mm: {:.3}}}]"#, part.refdes, tidied.at.dist(mcu.at) / 1e6);
+    assert_eq!(notes, [("legalised".into(), row)], "Tidy reports the corrected part and its displacement");
+    for old in overlap.placed.iter().filter(|p| p.comp != part.comp) {
+        assert_eq!(board(&engine).placed_of(old.comp).unwrap().at, old.at, "Tidy moved {}", old.refdes);
+    }
+    let history = engine.log().entries.len();
+    mailbox.push(Cmd::Invoke { tool: "elec.place".into(), args: vec![], by: By::Person, preview: false, ticket: Ticket(90) });
+    let refused = until_answer(&mut engine, &mailbox);
+    assert!(matches!(refused.outcomes.as_slice(), [(Ticket(90), Outcome::Refused(why))]
+        if why.text == "Every part already sits on a legal spot."), "a legal board explains why Tidy did nothing");
+    assert_eq!(engine.log().entries.len(), history, "a second Tidy adds no undo step");
+
+    invoke(&mut engine, "elec.part.place", exact);
+    // Only the MCU is in scope. The smaller resistor keeps its spot.
+    invoke(&mut engine, "elec.place", tool_args([("parts", &mcu.path)]));
+    assert_eq!(placed(&engine, &part.path).at, mcu.at, "a named scope leaves even a smaller overlapping neighbour fixed");
+    mailbox.push(Cmd::Undo);
+    let undone = until_answer(&mut engine, &mailbox);
+    assert!(undone.rejected.is_empty() && !clear(&engine), "one undo restores the overlapping pair");
+    let both = format!("{},{}", part.refdes, mcu.refdes);
+    invoke(&mut engine, "elec.place", tool_args([("parts", &both), ("pin", &part.path)]));
+    assert!(placed(&engine, &part.path).at == mcu.at && clear(&engine), "the pinned resistor settles before the larger MCU");
+    mailbox.push(Cmd::Undo);
+    assert!(until_answer(&mut engine, &mailbox).rejected.is_empty(), "the pin-prioritised move undoes");
+    let resistor = placed(&engine, &part.path);
+    mailbox.push(commit(vec![DesignOp::Board { unit: overlap.unit, op: BoardOp::SetField {
+        item: resistor.id, field: fab_elec_board::Field::Locked(true),
+    } }], "Lock the overlapping resistor"));
+    assert!(until_answer(&mut engine, &mailbox).rejected.is_empty(), "the lock commits");
+    invoke(&mut engine, "elec.place", tool_args([("parts", &both), ("pin", &mcu.path), ("mode", "@legalise")]));
+    assert_eq!(placed(&engine, &part.path).at, resistor.at, "a named locked resistor stays fixed even against a pinned MCU");
+    assert!(placed(&engine, &mcu.path).at != mcu.at && clear(&engine), "the named MCU clears the lock");
 }
 
 #[test]

@@ -15,7 +15,9 @@ use makepad_draw::*;
 use makepad_half::f16;
 use makepad_openexr::{write_to_vec, Compression, ExrChannel, ExrImage, ExrPart};
 use makepad_render_material::ibl::{self, EnvMap};
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use super::caster::{rows_by, serial_rows, RowRunner};
 use super::image::{roll_quarter, sanitize_radiance};
 use super::{arr, vec};
 
@@ -66,6 +68,41 @@ fn check_face(face: &FaceImage, what: &str) -> Result<(), String> {
         return Err(format!("{what}: the face is empty or its buffer does not match {}x{}", face.size, face.size));
     }
     Ok(())
+}
+
+/// `row(0..rows)` through `run` (`caster::rows_by`, which nothing cancels here), each row into its
+/// own value, in row order; one by one on this thread if `run` skipped a row. A writer's rows are
+/// independent, so its file is the same bytes whichever thread coded a row.
+fn rows_in_order<T: Send + Sync>(rows: usize, run: RowRunner, row: &(dyn Fn(usize) -> T + Sync)) -> Vec<T> {
+    rows_by(rows, run, &|| false, row).unwrap_or_else(|| (0..rows).map(row).collect())
+}
+
+/// A map in the file convention, row by row, as `roll_quarter` turns it. A width that is a
+/// multiple of 4 turns by whole texels, so each row is read turned where it lies (file column x
+/// is engine column x + w/4, wrapping at the seam) and the map is not copied; any other width, or
+/// an incomplete map, is rolled whole first.
+struct FileRows<'a> {
+    map: Cow<'a, EnvMap>,
+    /// The engine column of file column 0.
+    shift: usize,
+}
+
+impl<'a> FileRows<'a> {
+    fn of(env: &'a EnvMap) -> FileRows<'a> {
+        let (width, height) = (env.width, env.height);
+        if width % 4 == 0 && width > 0 && height > 0 && env.data.len() >= width * height {
+            FileRows { map: Cow::Borrowed(env), shift: width / 4 }
+        } else {
+            FileRows { map: Cow::Owned(roll_quarter(env, true)), shift: 0 }
+        }
+    }
+
+    /// Row `y`'s texels, file column 0 first.
+    fn row(&self, y: usize) -> impl Iterator<Item = &[f32; 4]> + '_ {
+        let width = self.map.width;
+        let (left, right) = self.map.data[y * width..(y + 1) * width].split_at(self.shift);
+        right.iter().chain(left)
+    }
 }
 
 /// Encodes a single-part scanline OpenEXR with R, G and B channels and ZIP compression (16 rows
@@ -153,35 +190,43 @@ fn rgbe_storable(x: f32) -> f32 {
 /// texels cannot be run-length coded, so they are written flat, as the format requires (and as
 /// `ibl::load_hdr` expects). An empty or short map writes a header with no pixel data.
 pub fn encode_hdr(env: &EnvMap) -> Vec<u8> {
-    let file = roll_quarter(env, true);
-    let (width, height) = (file.width, file.height);
+    encode_hdr_by(env, &serial_rows)
+}
+
+/// `encode_hdr` with its scanlines coded through `run`, each into its own buffer, the buffers
+/// joined in row order.
+fn encode_hdr_by(env: &EnvMap, run: RowRunner) -> Vec<u8> {
+    let file = FileRows::of(env);
+    let (width, height) = (file.map.width, file.map.height);
     let mut out = Vec::with_capacity(width * height * 4 + 96);
     out.extend_from_slice(b"#?RADIANCE\n# Made with Makepad HDRI\nFORMAT=32-bit_rle_rgbe\n\n");
     out.extend_from_slice(format!("-Y {height} +X {width}\n").as_bytes());
-    if file.data.len() < width * height {
+    if file.map.data.len() < width * height {
         return out;
     }
     let rle = (8..=0x7fff).contains(&width);
-    let mut scan = vec![[0u8; 4]; width];
+    for scanline in rows_in_order(height, run, &|y| hdr_scanline(file.row(y), width, rle)) {
+        out.extend_from_slice(&scanline);
+    }
+    out
+}
+
+/// One scanline of `width` texels: RGBE, flat, or after the new-style marker each of the four
+/// channels run-length coded when `rle`.
+fn hdr_scanline<'a>(texels: impl Iterator<Item = &'a [f32; 4]>, width: usize, rle: bool) -> Vec<u8> {
+    let scan: Vec<[u8; 4]> = texels.map(|t| ibl::float_to_rgbe([rgbe_storable(t[0]), rgbe_storable(t[1]), rgbe_storable(t[2])])).collect();
+    if !rle {
+        return scan.into_flattened();
+    }
+    // (a channel's literals cost a count byte per 128)
+    let mut out = Vec::with_capacity(4 + 4 * (width + width.div_ceil(128)));
+    out.extend_from_slice(&[2, 2, (width >> 8) as u8, (width & 0xff) as u8]);
     let mut channel = vec![0u8; width];
-    for y in 0..height {
-        for (x, texel) in scan.iter_mut().enumerate() {
-            let t = file.data[y * width + x];
-            *texel = ibl::float_to_rgbe([rgbe_storable(t[0]), rgbe_storable(t[1]), rgbe_storable(t[2])]);
+    for c in 0..4 {
+        for (value, texel) in channel.iter_mut().zip(&scan) {
+            *value = texel[c];
         }
-        if !rle {
-            for texel in &scan {
-                out.extend_from_slice(texel);
-            }
-            continue;
-        }
-        out.extend_from_slice(&[2, 2, (width >> 8) as u8, (width & 0xff) as u8]);
-        for c in 0..4 {
-            for (value, texel) in channel.iter_mut().zip(&scan) {
-                *value = texel[c];
-            }
-            rle_component(&channel, &mut out);
-        }
+        rle_component(&channel, &mut out);
     }
     out
 }
@@ -233,7 +278,7 @@ fn rle_component(data: &[u8], out: &mut Vec<u8>) {
 /// Tonemaps linear texels to opaque 8-bit RGBA through `sky::display_rgb` (ACES fit, then gamma
 /// 2.2) at an exposure of 2^exposure_ev, the same transform the preview shows. EV is clamped to
 /// ±20. A NaN texel comes out black, not garbage.
-fn tonemap_rgba(texels: impl Iterator<Item = [f32; 3]>, exposure_ev: f32) -> Vec<u8> {
+pub fn tonemap_rgba(texels: impl Iterator<Item = [f32; 3]>, exposure_ev: f32) -> Vec<u8> {
     let ev = if exposure_ev.is_finite() { exposure_ev.clamp(-20.0, 20.0) } else { 0.0 };
     let exposure = 2.0f32.powf(ev);
     // NaN clamps to NaN and then casts to 0.
@@ -248,17 +293,29 @@ fn tonemap_rgba(texels: impl Iterator<Item = [f32; 3]>, exposure_ev: f32) -> Vec
 
 /// Tonemaps the map to an 8-bit PNG in the file convention, for LDR skyboxes.
 pub fn encode_png(env: &EnvMap, exposure_ev: f32) -> Result<Vec<u8>, String> {
+    encode_png_by(env, exposure_ev, &serial_rows)
+}
+
+/// `encode_png` with its rows tonemapped through `run`, joined in row order; the PNG coding
+/// itself (`Cx::encode_rgba_as_png`) stays on this thread.
+fn encode_png_by(env: &EnvMap, exposure_ev: f32, run: RowRunner) -> Result<Vec<u8>, String> {
     check_map(env, "PNG")?;
-    let file = roll_quarter(env, true);
-    let rgba = tonemap_rgba(file.data.iter().map(|t| [t[0], t[1], t[2]]), exposure_ev);
-    Cx::encode_rgba_as_png(file.width as u32, file.height as u32, &rgba)
+    let file = FileRows::of(env);
+    let rgba = rows_in_order(file.map.height, run, &|y| tonemap_rgba(file.row(y).map(|t| [t[0], t[1], t[2]]), exposure_ev)).concat();
+    Cx::encode_rgba_as_png(file.map.width as u32, file.map.height as u32, &rgba)
 }
 
 /// Tonemaps one cube face to an 8-bit PNG, `size` × `size`.
 pub fn encode_face_png(face: &FaceImage, exposure_ev: f32) -> Result<Vec<u8>, String> {
+    face_png(face, exposure_ev, &serial_rows)
+}
+
+/// `encode_face_png` with its rows tonemapped through `run`.
+fn face_png(face: &FaceImage, exposure_ev: f32, run: RowRunner) -> Result<Vec<u8>, String> {
     check_face(face, "PNG")?;
-    let rgba = tonemap_rgba(face.rgb.as_chunks::<3>().0.iter().copied(), exposure_ev);
-    Cx::encode_rgba_as_png(face.size as u32, face.size as u32, &rgba)
+    let size = face.size;
+    let rgba = rows_in_order(size, run, &|y| tonemap_rgba(face.rgb[y * size * 3..(y + 1) * size * 3].as_chunks::<3>().0.iter().copied(), exposure_ev)).concat();
+    Cx::encode_rgba_as_png(size as u32, size as u32, &rgba)
 }
 
 /// Face file suffixes, in `cube_faces` order: +X −X +Y −Y +Z −Z.
@@ -411,6 +468,23 @@ pub fn export_all(
     progress: &dyn Fn(f32),
     cancelled: &dyn Fn() -> bool,
 ) -> Result<(Vec<PathBuf>, ExrReport), String> {
+    export_all_by(base, env, opts, progress, cancelled, &serial_rows)
+}
+
+/// `export_all` with each file's rows coded through `run` (`run(n, row)` calls `row(0..n)`, each
+/// once, and joins, as `Env::bake_par`'s runner does: `pool.fan_out` inside a pool job): the
+/// `.hdr`'s scanlines and the PNGs' tonemapping, each row on its own and joined in row order, so
+/// every file holds the same bytes as `export_all`'s. The EXRs (their planes and the ZIP of
+/// `makepad_openexr`, which is most of their time), the PNGs' compression, the cube faces'
+/// sampling and the file writes stay on this thread.
+pub fn export_all_by(
+    base: &Path,
+    env: &EnvMap,
+    opts: &ExportOptions,
+    progress: &dyn Fn(f32),
+    cancelled: &dyn Fn() -> bool,
+    run: &dyn Fn(usize, &(dyn Fn(usize) + Sync)),
+) -> Result<(Vec<PathBuf>, ExrReport), String> {
     check_map(env, "export")?;
     let stem = export_stem(base);
     let named = |suffix: &str| {
@@ -451,10 +525,10 @@ pub fn export_all(
             return Err(EXPORT_CANCELLED.to_string());
         }
         let encoded = match face {
-            None => encode_map(env, format, opts, &mut report),
+            None => encode_map(env, format, opts, &mut report, run),
             Some(index) => {
                 let faces = faces.get_or_insert_with(|| cube_faces(env, (env.width / 4).max(1)));
-                encode_face(&faces[index], format, opts, &mut report)
+                encode_face(&faces[index], format, opts, &mut report, run)
             }
         };
         match encoded.and_then(|bytes| stage(&path, &bytes)) {
@@ -500,27 +574,27 @@ fn export_stem(base: &Path) -> PathBuf {
     }
 }
 
-fn encode_map(env: &EnvMap, format: Format, opts: &ExportOptions, report: &mut ExrReport) -> Result<Vec<u8>, String> {
+fn encode_map(env: &EnvMap, format: Format, opts: &ExportOptions, report: &mut ExrReport, run: RowRunner) -> Result<Vec<u8>, String> {
     match format {
         Format::Exr => {
             let (bytes, file_report) = encode_exr(env, opts.precision)?;
             report.clipped = report.clipped.max(file_report.clipped);
             Ok(bytes)
         }
-        Format::Hdr => Ok(encode_hdr(env)),
-        Format::Png => encode_png(env, opts.png_ev),
+        Format::Hdr => Ok(encode_hdr_by(env, run)),
+        Format::Png => encode_png_by(env, opts.png_ev, run),
     }
 }
 
 /// Faces are EXR or PNG only; `.hdr` never reaches here.
-fn encode_face(face: &FaceImage, format: Format, opts: &ExportOptions, report: &mut ExrReport) -> Result<Vec<u8>, String> {
+fn encode_face(face: &FaceImage, format: Format, opts: &ExportOptions, report: &mut ExrReport, run: RowRunner) -> Result<Vec<u8>, String> {
     match format {
         Format::Exr => {
             let (bytes, file_report) = face_exr(face, opts.precision)?;
             report.clipped = report.clipped.max(file_report.clipped);
             Ok(bytes)
         }
-        Format::Hdr | Format::Png => encode_face_png(face, opts.png_ev),
+        Format::Hdr | Format::Png => face_png(face, opts.png_ev, run),
     }
 }
 

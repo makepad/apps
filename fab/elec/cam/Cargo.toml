@@ -12,6 +12,7 @@ fab-elec-parts = { path = "../parts" }
 fab-elec-circuit = { path = "../circuit" }
 fab-elec-board = { path = "../board" }
 fab-elec-design = { path = "../design" }
+makepad-script = { path = "../../../../../platform/script" }
 makepad-zip-file = { path = "../../../../../libs/zip_file" }
 
 [dev-dependencies]

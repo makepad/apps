@@ -1,0 +1,705 @@
+use mod.motion.*
+// Kinetic type, spark-drawn annotations and in-plate wipes for Draw2D, timed in plate seconds.
+//
+//   use mod.motion.modules.kinetic.*
+//   use mod.motion.modules.camera2d.*
+//   Motion{size: vec2(1920, 1080) duration: 4 color: @hdr layers: [
+//       Rect{size: vec2(1920, 1080) fill: #0a0a0b}
+//       Draw2D{draw: fn(c, t, edit) {
+//           c.save()
+//           cam2d_apply(c, beat_cam(t, [0.5, 1.25, 2.0], {live: t}))
+//           slam(c, "MOVE", 960, 570, t, 0.5, {px: 240 align: @center})
+//           annotate(c, "PLATE SECONDS", vec2(1150, 610), vec2(1350, 730), t, 1.1, {})
+//           c.restore()
+//           hud_frame(c, t, 0, {no: "01" section: "KINETIC" out: 3.4})
+//           shutter(c, prog(t, 3.5, 4.0), {})
+//       }}
+//   ]}
+//
+// Coordinates and px are canvas units, y down; text is single-line with an alphabetic baseline
+// unless documented otherwise. Draw helpers keep the caller's transform and alpha; only the two
+// whole-frame wipes reset the transform, restoring it afterwards. Ink defaults to #0a0a0b.
+// No song or host clock is read. `live` is an optional numeric clock for blink/drift only.
+// Pure frame evaluation: pass rise_letters' `layout` and spark_line's `lengths` built at load
+// to avoid repeating layout/measurement. Work scales with letters, tokens/visible candidates,
+// path vertices and live spark births; beat lookup is logarithmic plus the still-decaying hits.
+// Wipes scale with bars/edge points; tear's optional draw callback runs twice while split.
+
+use mod.motion.modules.words.*
+use mod.motion.modules.sparks.*
+use mod.motion.modules.camera2d.*
+use mod.motion.modules.numbers.*
+use mod.motion.modules.print.*
+use mod.motion.modules.paths.*
+
+let GROT = Font{family: "Roboto Flex" weight: 900 axes: {wdth: 100}}
+let MONO = Font{family: "JetBrains Mono" weight: 400}
+let DIGITS = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+
+// Canvas alignment as a number: numeric 0..1, @left, @center or @right.
+let align_number = fn(a) {
+    if a.is_number() { return a }
+    if a == @center || a == @centre { return 0.5 }
+    if a == @right || a == @end { return 1.0 }
+    return 0.0
+}
+
+// Per-letter progress; i is zero based, lag and dur are seconds (zero dur steps at its start).
+let letter_prog = fn(t, t0, dur, i, lag) {
+    let start = t0 + i * lag
+    return prog(t, start, start + max(0.0, dur))
+}
+
+// Adapt the spark module's linear segments to transformed, alpha-aware canvas strokes. The
+// native seg_rgb deliberately ignores the canvas transform; stroke leaves blend state unchanged.
+let spark_canvas = fn(c, alpha) {
+    return {seg_rgb: fn(ax, ay, bx, by, width, r, g, b, a) {
+        let rgb = linear_to_srgb(vec3(r, g, b))
+        c.stroke([[ax, ay], [bx, by]], width, [rgb.x, rgb.y, rgb.z], a * alpha)
+    }}
+}
+
+// Clone supplied font axes before punching them; k is the remaining hit (1 -> 0).
+// o.weight_punch ?? 0 and o.width_punch ?? 0 are additive wght/wdth units, opt-in on an axes record.
+let punched_font = fn(font, k, o) {
+    let axes = font.axes ?? nil
+    let weight = o.weight_punch ?? 0.0
+    let width = o.width_punch ?? 0.0
+    if axes == nil || k <= 0.0 || (weight == 0.0 && width == 0.0) { return font }
+    let punched = {}
+    for key, value in axes { punched[key] = value }
+    let w = (axes.wght ?? font.weight ?? 400.0) + weight * k
+    if (axes.wght ?? nil) != nil { punched.wght = w }
+    if width != 0.0 { punched.wdth = (axes.wdth ?? 100.0) + width * k }
+    return font{weight: w axes: punched}
+}
+
+// A grotesk slam of text at (x, y), hidden before plate time t0. o.from ?? 1.3 -> 1 over
+// o.dur ?? 0.16 seconds, ease_out_expo; o.color ?? #eee9df under a white-hot flash.
+// o.px ?? 120, o.font ?? GROT, o.align ?? @left, o.baseline ?? @alphabetic, o.ls ?? 0,
+// o.stroke ?? 0, o.alpha ?? 1 follow c.text. o.echoes ?? 3 trailing outline copies have
+// o.echo_step ?? 0.06 scale spacing, o.echo_offset ?? vec2(-12, 8), o.echo_alpha ?? 0.3,
+// o.echo_stroke ?? 1.5 and o.echo_dur ?? 0.3 seconds of decay. Axis punches as punched_font.
+let slam = fn(c, text, x, y, t, t0, o) {
+    if t < t0 { return }
+    let age = t - t0
+    let k = 1.0 - ease(@ease_out_expo, prog(t, t0, t0 + max(0.0, o.dur ?? 0.16)))
+    let scale = 1.0 + ((o.from ?? 1.3) - 1.0) * k
+    let font = punched_font(o.font ?? GROT, k, o)
+    let px = o.px ?? 120.0
+    let alpha = o.alpha ?? 1.0
+    let style = {px: px font: font align: o.align ?? @left baseline: o.baseline ?? @alphabetic
+        ls: o.ls ?? 0.0 color: o.color ?? #eee9df alpha: alpha stroke: o.stroke ?? 0.0}
+    let tail = 1.0 - ease(@ease_out_expo, prog(age, 0.0, max(0.0, o.echo_dur ?? 0.3)))
+    let echoes = max(0.0, floor(o.echoes ?? 3.0))
+    let offset = o.echo_offset ?? vec2(-12.0, 8.0)
+    if tail > 0.0 {
+        for i in 0..echoes {
+            let j = echoes - i
+            let es = scale + j * (o.echo_step ?? 0.06) * tail
+            c.save()
+            c.translate(x + offset.x * j * tail, y + offset.y * j * tail)
+            c.scale(es, es)
+            c.text(text, 0, 0, style{alpha: alpha * (o.echo_alpha ?? 0.3) * tail / j stroke: o.echo_stroke ?? 1.5})
+            c.restore()
+        }
+    }
+    c.save()
+    c.translate(x, y)
+    c.scale(scale, scale)
+    c.text(text, 0, 0, style)
+    if k > 0.0 { c.text(text, 0, 0, style{color: [2.0, 1.9, 1.7] alpha: alpha * k}) }
+    c.restore()
+}
+
+// text in font at px rises into (x, y) from t0, each letter over dur seconds, delayed by
+// o.lag ?? 0.04 seconds. o.rise ?? 70 px; o.ease ?? @ease_out_expo; o.alpha ?? 1,
+// o.color ?? #eee9df, o.align ?? @left, o.baseline ?? @alphabetic, o.ls ?? 0 (tracking).
+// o.layout ?? layout_word(text, font, px, o.ls ?? 0): supply that record from load for reuse.
+// o.slam ?? false gives each letter a slam (same options; o.echoes ?? 0 for letters).
+let rise_letters = fn(c, text, font, px, x, y, t, t0, dur, o) {
+    if t < t0 { return }
+    let laid = o.layout ?? layout_word(text, font, px, o.ls ?? 0.0)
+    let left = x - laid.width * align_number(o.align ?? @left)
+    let lag = max(0.0, o.lag ?? 0.04)
+    for i in 0..laid.letters.len() {
+        let g = laid.letters[i]
+        let u = letter_prog(t, t0, dur, i, lag)
+        if u > 0.0 {
+            let k = ease(o.ease ?? @ease_out_expo, u)
+            let gy = y + (o.rise ?? 70.0) * (1.0 - k)
+            let style = o{px: px font: font align: @center ls: 0.0 alpha: (o.alpha ?? 1.0) * k}
+            if o.slam ?? false {
+                slam(c, g.ch, left + g.x, gy, t, t0 + i * lag, style{dur: dur echoes: o.echoes ?? 0})
+            } else {
+                c.text(g.ch, left + g.x, gy, style{color: o.color ?? #eee9df baseline: o.baseline ?? @alphabetic})
+            }
+        }
+    }
+}
+
+// A reversible fade/translation envelope, in plate seconds. o.dur ?? 1.0 s,
+// o.ease ?? @ease_in_out_cubic, o.rise ?? 18 px, o.alpha ?? 1. Optional o.out
+// starts a fade out over o.out_dur ?? 0.8 s with o.leave ?? -10 px of drift.
+// No scale change, overshoot or light modulation. Also useful for shader uniforms.
+let fade_pose = fn(t, t0, o) {
+    let enter = ease(o.ease ?? @ease_in_out_cubic, prog(t, t0, t0 + max(0.0, o.dur ?? 1.0)))
+    let out = o.out ?? nil
+    let leave = if out == nil { 0.0 } else {
+        ease(o.ease ?? @ease_in_out_cubic, prog(t, out, out + max(0.0, o.out_dur ?? 0.8)))
+    }
+    return {alpha: (o.alpha ?? 1.0) * enter * (1.0 - leave)
+        y: (o.rise ?? 18.0) * (1.0 - enter) + (o.leave ?? -10.0) * leave}
+}
+
+// Whole-line glide to (x, alphabetic baseline y). fade_pose options plus the
+// c.text options: font ?? GROT, px ?? 120, color ?? #eee9df, align, ls, stroke.
+// Normally one text draw. Optional highlight: {start: 4 end: 10 color: #ff4d12}
+// colours a glyph range (end exclusive). Supply layout: layout_word(text, font,
+// px, ls) at load for highlighted lines: O(letters) draws, no repeated layout.
+let glide_text = fn(c, text, x, y, t, t0, o) {
+    let pose = fade_pose(t, t0, o)
+    if pose.alpha <= 0.0 { return }
+    let style = o{font: o.font ?? GROT px: o.px ?? 120 color: o.color ?? #eee9df alpha: pose.alpha}
+    let highlight = o.highlight ?? nil
+    if highlight == nil {
+        c.text(text, x, y + pose.y, style)
+    } else {
+        let laid = o.layout ?? layout_word(text, style.font, style.px, o.ls ?? 0.0)
+        let left = x - laid.width * align_number(o.align ?? @left)
+        // In another language (an output's translation) the highlight covers
+        // the same share of the line.
+        let share = laid.letters.len() / max(1, text.to_chars().len())
+        let from = floor(highlight.start * share)
+        let to = ceil(highlight.end * share)
+        for i in 0..laid.letters.len() {
+            let g = laid.letters[i]
+            let ink = if i >= from && i < to { highlight.color } else { style.color }
+            c.text(g.ch, left + g.x, y + pose.y, style{align: @center ls: 0 color: ink})
+        }
+    }
+}
+
+// Apply the same envelope to a block: fade_block(c, t, 1.2, {dur: 1.2}, fn(c, alpha) {
+//     c.rect(80, 200, 500, 240, #15171a, 1)
+// }). The callback composes transforms; it must not reset the supplied canvas.
+// Canvas alpha is absolute: pass alpha: parent_alpha when nesting, using the
+// callback's second argument. The caller's state is restored afterwards.
+// Invisible blocks skip the callback; no offscreen target is allocated.
+let fade_block = fn(c, t, t0, o, draw) {
+    let pose = fade_pose(t, t0, o)
+    if pose.alpha <= 0.0 { return }
+    c.save()
+    c.translate(0, pose.y)
+    c.alpha(pose.alpha)
+    draw(c, pose.alpha)
+    c.restore()
+}
+
+// Continuous camera dollies, with no beat impulses. cues is an ascending list of
+// {at: seconds camera: {x y zoom rot} dur: optional seconds}. o.camera is the
+// initial camera (default centred 1920x1080), o.dur ?? 1.4, o.ease ?? @ease_in_out_cubic.
+// An interrupted dolly continues from its position at the next cue, without a jump.
+// o.live ?? t drives a sinusoidal drift: o.drift ?? 2 px, o.drift_rate ?? 0.06
+// radians/s, o.zoom_drift ?? 0.002 (fractional amplitude). No ambient rotation.
+// O(number of released cues) scalar work per frame; prepare cue records at load.
+let dolly_cam = fn(t, cues, o) {
+    var camera = o.camera ?? {x: 960 y: 540 zoom: 1 rot: 0 w: 1920 h: 1080}
+    for i in 0..cues.len() {
+        let cue = cues[i]
+        if t < cue.at { break }
+        let until = if i + 1 < cues.len() { min(t, cues[i + 1].at) } else { t }
+        let k = ease(o.ease ?? @ease_in_out_cubic,
+            prog(until, cue.at, cue.at + max(0.0, cue.dur ?? o.dur ?? 1.4)))
+        camera = cam2d_mix(camera, cue.camera, k)
+    }
+    let phase = (o.live ?? t) * (o.drift_rate ?? 0.06)
+    let drift = o.drift ?? 2.0
+    return camera{x: camera.x + drift * sin(phase) y: camera.y + drift * sin(phase * 0.83)
+        zoom: camera.zoom * (1.0 + (o.zoom_drift ?? 0.002) * sin(phase * 0.73))}
+}
+
+// Type text at (x, y) from t0 at o.cps ?? 24 characters/s. Returns vec2(caret x, baseline y),
+// even before t0 (no drawing then). o.font ?? MONO, o.px ?? 40, o.color ?? #eee9df,
+// o.alpha ?? 1, o.ls ?? 0, o.align ?? @left (aligns the complete line, keeping its left edge fixed).
+// o.caret ?? true, o.caret_width ?? 3, o.caret_gap ?? 4, o.accent ?? #ff4d12; o.blink ?? 0.8
+// seconds per cycle on o.live ?? t. o.caret_soft ?? false replaces blinking with a
+// smooth 0.35..0.75 opacity breath (use blink: 3.2, glow: 0 for calm type).
+// o.glow ?? 0.3 sets spark heat at the caret; 0 disables it.
+// o.tokens ?? [] overrides the uniform schedule: [{start: 0 end: 4 t0: 1.2
+//     candidates: [["word", 0.8], ["work", 0.2]] pick: 0 hold: 0.35}], in time/character order.
+// start/end are character indices, end exclusive, including spaces; token t0 is a plate time.
+// A token types at cps; candidates default [], pick ?? 0, hold ?? 0.35 s after its last character.
+// o.pop_lead ?? 0.18 s, o.pop_dur ?? 0.12 s collapse, o.pop_width ?? 290 px,
+// o.pop_px ?? 14, o.pop_gap ?? 28 px above the cap line, o.ink ?? #0a0a0b.
+let typed = fn(c, text, x, y, t, t0, o) {
+    let px = o.px ?? 40.0
+    let font = o.font ?? MONO
+    let ls = o.ls ?? 0.0
+    let alpha = o.alpha ?? 1.0
+    let color = o.color ?? #eee9df
+    let accent = o.accent ?? #ff4d12
+    let cps = max(0.0, o.cps ?? 24.0)
+    let n = max(0, text.split("").len() - 2)
+    let measure = {font: font px: px ls: ls}
+    let align = align_number(o.align ?? @left)
+    let left = x - (if align == 0.0 { 0.0 } else { c.measure(text, measure) * align })
+    let gap = o.caret_gap ?? 4.0
+    if t < t0 { return vec2(left + gap, y) }
+    let tokens = o.tokens ?? []
+    var count = min(n, floor((t - t0) * cps))
+    var last = if cps > 0.0 { t0 + count / cps } else { t0 }
+    if tokens.len() > 0 {
+        count = 0
+        last = t0
+        for tk in tokens {
+            if t >= tk.t0 {
+                let start = clamp(tk.start, 0, n)
+                let end = clamp(tk.end, start, n)
+                let shown = min(end - start, floor((t - tk.t0) * cps))
+                count = max(count, start + shown)
+                last = max(last, tk.t0 + (if cps > 0.0 { shown / cps } else { 0.0 }))
+            }
+        }
+    }
+    c.text(text, left, y, measure{color: color alpha: alpha count: count})
+    let caret = vec2(left + c.measure(text, measure{count: count}) + gap, y)
+    for tk in tokens {
+        let rows = tk.candidates ?? []
+        let lead = max(0.0, o.pop_lead ?? 0.18)
+        let complete = tk.t0 + (if cps > 0.0 { max(0, tk.end - tk.start) / cps } else { 0.0 })
+        let close = complete + (tk.hold ?? 0.35)
+        let collapse = ease(@ease_in_cubic, prog(t, close, close + max(0.0, o.pop_dur ?? 0.12)))
+        if rows.len() > 0 && t >= tk.t0 - lead && collapse < 1.0 {
+            let built = ease(@ease_out_expo, prog(t, tk.t0 - lead, tk.t0))
+            let a = alpha * built * (1.0 - collapse)
+            let pw = o.pop_width ?? 290.0
+            let ps = o.pop_px ?? 14.0
+            let rh = ps * 1.6
+            let h = (rows.len() + 1) * rh + 12.0
+            let ax = left + c.measure(text, measure{count: tk.start})
+            let ay = y - px * 0.8 - (o.pop_gap ?? 28.0)
+            c.save()
+            c.translate(ax, ay)
+            c.scale(1.0, 1.0 - collapse)
+            c.rect(0, 0, 1, o.pop_gap ?? 28.0, color, a * 0.5)
+            c.rect(-3, o.pop_gap ?? 28.0, 7, 1, color, a * 0.5)
+            c.rect(0, -h, pw, h, o.ink ?? #0a0a0b, a)
+            c.stroke([[0, 0], [0, -h], [pw, -h]], 1, color, a * 0.5)
+            c.text("NEXT / " + (if t >= tk.t0 { "SELECTED" } else { "CANDIDATES" }), 10, -h + rh,
+                {font: MONO px: ps * 0.8 color: color alpha: a * 0.65})
+            var peak = 0.0
+            for row in rows { peak = max(peak, max(0.0, row[1])) }
+            for i in 0..rows.len() {
+                let p = clamp(rows[i][1], 0.0, 1.0)
+                let picked = t >= tk.t0 && i == (tk.pick ?? 0)
+                let ry = -h + (i + 2) * rh
+                let col = if picked { accent } else { color }
+                if picked { c.rect(1, ry - ps, pw - 2, rh, accent, a * 0.16) }
+                c.text(rows[i][0], 10, ry, {font: MONO px: ps color: col alpha: a})
+                c.rect(pw * 0.55, ry - ps * 0.65, pw * 0.24 * (if peak > 0.0 { p / peak } else { 0.0 }) * built,
+                    ps * 0.45, col, a * (if picked { 1.0 } else { 0.4 }))
+                c.text(fixed(p, 2), pw - 8, ry, {font: MONO px: ps * 0.85 align: @right color: col alpha: a})
+            }
+            c.restore()
+        }
+    }
+    let blink = o.blink ?? 0.8
+    let on = t - last < 0.12 || blink <= 0.0 || fract((o.live ?? t) / blink) < 0.5
+    let soft = o.caret_soft ?? false
+    if (o.caret ?? true) && (soft || on) {
+        let opacity = if soft && blink > 0.0 { 0.55 + 0.2 * sin((o.live ?? t) * 6.283185307179586 / blink) } else { 1.0 }
+        c.rect(caret.x, y - px * 0.78, o.caret_width ?? 3.0, px * 0.9, accent, alpha * opacity)
+        let heat = o.glow ?? 0.3
+        if heat > 0.0 {
+            spark_head(spark_canvas(c, alpha), caret.x + (o.caret_width ?? 3.0) * 0.5, y - px * 0.78,
+                o.live ?? t, {scale: px / 100.0 heat: heat * (0.35 + 0.65 * exp(-(t - last) / 0.12))})
+        }
+    }
+    return caret
+}
+
+// Retimed plate clock: repeat the first period seconds at t0 for n total plays, then continue
+// from the last play without a forward jump. Before t0, period <= 0 or n <= 1 returns t.
+// For a repeated slam: slam(c, text, x, y, retrig(t, t0, 0.12, 4), t0, {}). No defaults.
+let retrig = fn(t, t0, period, n) {
+    if t < t0 || period <= 0.0 || n <= 1.0 { return t }
+    return t - period * min(floor((t - t0) / period), floor(n) - 1.0)
+}
+
+// Draw text at (x, y) as horizontally displaced slices; amount is displacement in px (0 is
+// ordinary text). o.slices ?? 7, o.rate ?? 24 changes/s, o.seed ?? 1; o.px ?? 120,
+// o.font ?? GROT, o.align ?? @left, o.color ?? #eee9df, o.alpha ?? 1, o.ls ?? 0.
+// Alphabetic baseline. o.metrics ?? text_layout(text, font, px * 0.75) may be supplied at load.
+let glitch_slices = fn(c, text, x, y, t, amount, o) {
+    let px = o.px ?? 120.0
+    let font = o.font ?? GROT
+    let style = o{px: px font: font color: o.color ?? #eee9df baseline: @alphabetic}
+    if amount == 0.0 { c.text(text, x, y, style) return }
+    let laid = o.metrics ?? text_layout(text, font, px * 0.75)
+    let width = c.measure(text, style)
+    let left = x - width * align_number(o.align ?? @left)
+    let slices = max(1.0, floor(o.slices ?? 7.0))
+    let top = y - laid.ascent
+    let height = laid.ascent + laid.descent
+    let frame = floor(t * (o.rate ?? 24.0))
+    for i in 0..slices {
+        let shift = amount * noise1(frame + i * 17.0, o.seed ?? 1.0)
+        c.text(text, x + shift, y, style{clip: [left + shift - px, top + height * i / slices, width + px * 2.0, height / slices]})
+    }
+}
+
+// A flat polyline pts = [x0, y0, x1, y1, ...] draws by arc length over dur seconds from t0.
+// o.ease ?? @ease_in_out_cubic; o.lengths ?? lengths(pts), precompute at load for long paths.
+// o.width ?? 1.5, o.color ?? #eee9df, o.alpha ?? 1; o.trail ?? 90 px is the recently hot part,
+// o.glow_step ?? 12 px its sampling spacing, o.cool ?? 0.24 s after arrival, o.heat ?? 0.7,
+// o.scale ?? 0.55 for the head. o.rate ?? 60 births/s (0 disables particles), o.life ?? 0.28 s,
+// o.speed ?? 120 px/s, o.gravity ?? 260 px/s², o.seed ?? 1. Empty/zero-length paths draw nothing;
+// dur <= 0 draws the completed line immediately. No mutable emitter or playback history.
+let spark_line = fn(c, pts, t, t0, dur, o) {
+    if t < t0 || pts.len() < 4 { return }
+    let L = o.lengths ?? lengths(pts)
+    let n = L.len()
+    let total = L[n - 1]
+    if total <= 0.0 { return }
+    let t1 = t0 + max(0.0, dur)
+    let e = o.ease ?? @ease_in_out_cubic
+    let head = total * ease(e, prog(t, t0, t1))
+    let width = o.width ?? 1.5
+    let alpha = o.alpha ?? 1.0
+    let trail = max(0.0, o.trail ?? 90.0)
+    let cool = 1.0 - prog(t, t1, t1 + max(0.0, o.cool ?? 0.24))
+    let heat = (o.heat ?? 0.7) * cool
+    let visible = [[pts[0], pts[1]]]
+    for i in 1..n {
+        if L[i - 1] < head && L[i] > L[i - 1] {
+            let end = min(head, L[i])
+            let f = (end - L[i - 1]) / (L[i] - L[i - 1])
+            visible.push([mix(pts[2 * i - 2], pts[2 * i], f), mix(pts[2 * i - 1], pts[2 * i + 1], f)])
+        }
+    }
+    c.stroke(visible, width, o.color ?? #eee9df, alpha)
+    if heat > 0.0 && trail > 0.0 {
+        for i in 1..n {
+            let a = max(L[i - 1], max(0.0, head - trail))
+            let b = min(L[i], head)
+            if b > a {
+                let spacing = o.glow_step ?? 12.0
+                let steps = max(1.0, ceil((b - a) / (if spacing > 0.0 { spacing } else { 12.0 })))
+                for j in 0..steps {
+                    let s0 = mix(a, b, j / steps)
+                    let s1 = mix(a, b, (j + 1.0) / steps)
+                    let p = point_at(pts, L, s0)
+                    let q = point_at(pts, L, s1)
+                    let hot = heat * pow(clamp(1.0 - (head - (s0 + s1) * 0.5) / trail, 0.0, 1.0), 2.0)
+                    c.stroke([[p.x, p.y], [q.x, q.y]], width * 4.0, #ff4d12, alpha * hot * 0.22)
+                    c.stroke([[p.x, p.y], [q.x, q.y]], width * 1.2, [2.0, 1.2, 0.6], alpha * hot)
+                }
+            }
+        }
+    }
+    let sc = spark_canvas(c, alpha)
+    let head_at = fn(tb) {
+        if tb < t0 || tb > t1 { return nil }
+        let p = point_at(pts, L, total * ease(e, prog(tb, t0, t1)))
+        return vec2(p.x, p.y)
+    }
+    spark_particles(sc, t, head_at, {born: [t0, t1] rate: o.rate ?? 60.0 life: o.life ?? 0.28
+        speed: o.speed ?? 120.0 gravity: o.gravity ?? 260.0 seed: o.seed ?? 1.0 heat: o.heat ?? 0.7})
+    if heat > 0.0 {
+        let p = point_at(pts, L, head)
+        spark_head(sc, p.x, p.y, t, {scale: o.scale ?? 0.55 heat: heat})
+    }
+}
+
+// Arc-length draw-on with an unlit coloured tip, no particles or flicker.
+// Same path/width/color/lengths/ease options as spark_line, with o.fade ?? 0.4 s
+// for opacity in/out of the tip, o.head ?? 2 px (0 hides it). Geometry remains
+// after the tip fades. Supply lengths at load for long paths; O(path vertices).
+let glide_line = fn(c, pts, t, t0, dur, o) {
+    if t < t0 || pts.len() < 4 { return }
+    let arc = o.lengths ?? lengths(pts)
+    let total = arc[arc.len() - 1]
+    if total <= 0.0 { return }
+    let fade = max(0.0, o.fade ?? 0.4)
+    let alpha = (o.alpha ?? 1.0) * ease(@ease_in_out_sine, prog(t, t0, t0 + fade))
+    spark_line(c, pts, t, t0, dur, o{lengths: arc alpha: alpha heat: 0 rate: 0})
+    let head = o.head ?? 2.0
+    let keep = 1.0 - ease(@ease_in_out_sine, prog(t, t0 + dur, t0 + dur + fade))
+    if head > 0.0 && keep > 0.0 {
+        let p = point_at(pts, arc, total * ease(o.ease ?? @ease_in_out_cubic, prog(t, t0, t0 + dur)))
+        c.circle(p.x, p.y, head, o.color ?? #eee9df, alpha * keep)
+    }
+}
+
+// Leader from vec2 from to vec2 to over o.dur ?? 0.45 s from t0, then label types at its end.
+// o.elbow ?? nil inserts a vec2 bend. o.tick ?? 5 px; o.offset ?? vec2(8, -8) for the label;
+// o.px ?? 18, o.font ?? MONO, o.cps ?? 32, o.align ?? @left, o.color ?? #eee9df,
+// o.alpha ?? 1. Other spark_line options pass through; no blinking caret on the label.
+// o.tick_dur ?? 0.12 and o.tick_ease ?? @ease_out_expo animate the end ticks;
+// use tick_dur: 0.5, tick_ease: @ease_in_out_cubic for a calm annotation.
+let annotate = fn(c, label, from, to, t, t0, o) {
+    if t < t0 { return }
+    let dur = max(0.0, o.dur ?? 0.45)
+    let elbow = o.elbow ?? nil
+    let pts = if elbow == nil { [from.x, from.y, to.x, to.y] } else { [from.x, from.y, elbow.x, elbow.y, to.x, to.y] }
+    spark_line(c, pts, t, t0, dur, o)
+    let alpha = o.alpha ?? 1.0
+    let color = o.color ?? #eee9df
+    let tick_dur = max(0.0, o.tick_dur ?? 0.12)
+    let tick_ease = o.tick_ease ?? @ease_out_expo
+    let tick = (o.tick ?? 5.0) * ease(tick_ease, prog(t, t0 + dur, t0 + dur + tick_dur))
+    let dot = if (o.tick_dur ?? nil) == nil { 1.0 } else { ease(tick_ease, prog(t, t0, t0 + tick_dur)) }
+    c.circle(from.x, from.y, 2, color, alpha * dot)
+    if tick > 0.0 { c.stroke([[to.x, to.y - tick], [to.x, to.y + tick]], o.width ?? 1.5, color, alpha) }
+    let offset = o.offset ?? vec2(8.0, -8.0)
+    typed(c, label, to.x + offset.x, to.y + offset.y, t, t0 + dur,
+        o{font: o.font ?? MONO px: o.px ?? 18.0 cps: o.cps ?? 32.0 caret: false tokens: []})
+}
+
+// Dimension between vec2 a and b, drawn from t0 over o.dur ?? 0.45 s, with perpendicular
+// end ticks o.tick ?? 8 px. Centred label sits o.offset ?? -12 px along the line's normal;
+// o.px ?? 18, o.font ?? MONO, o.cps ?? 32, o.color ?? #eee9df, o.alpha ?? 1.
+// Other spark_line options pass through. The label stays horizontal for oblique dimensions.
+// o.tick_dur ?? 0.12 and o.tick_ease ?? @ease_out_expo work as in annotate.
+let dim_line = fn(c, a, b, label, t, t0, o) {
+    if t < t0 { return }
+    let dur = max(0.0, o.dur ?? 0.45)
+    let d = b - a
+    let normal = vec2(-d.y, d.x) / max(length(d), 0.001)
+    let tick = normal * (o.tick ?? 8.0)
+    spark_line(c, [a.x, a.y, b.x, b.y], t, t0, dur, o)
+    for pair in [[a, t0], [b, t0 + dur]] {
+        let q = pair[0]
+        let k = ease(o.tick_ease ?? @ease_out_expo, prog(t, pair[1], pair[1] + max(0.0, o.tick_dur ?? 0.12)))
+        if k > 0.0 {
+            let r = tick * k
+            c.stroke([q - r, q + r], o.width ?? 1.5, o.color ?? #eee9df, o.alpha ?? 1.0)
+        }
+    }
+    let mid = (a + b) * 0.5 + normal * (o.offset ?? -12.0)
+    typed(c, label, mid.x, mid.y, t, t0 + dur,
+        {px: o.px ?? 18.0 font: o.font ?? MONO cps: o.cps ?? 32.0 color: o.color ?? #eee9df
+            alpha: o.alpha ?? 1.0 align: @center caret: false})
+}
+
+// Flying crop marks, slide number/section and a spark-drawn top rule. t/t0 are plate seconds;
+// o.out ?? nil starts the exit. o.dur ?? 0.35 s for entry/exit; o.w ?? 1920, o.h ?? 1080,
+// o.inset ?? 36, o.length ?? 22, o.width ?? 1.25, o.alpha ?? 0.65, o.color ?? #eee9df;
+// o.no ?? "01", o.section ?? "", o.font ?? MONO, o.px ?? 16. Call outside the world camera.
+// Calm option: {dur: 0.8 ease: @ease_in_out_cubic travel: 18 heat: 0 rate: 0}.
+let hud_frame = fn(c, t, t0, o) {
+    if t < t0 { return }
+    let dur = max(0.0, o.dur ?? 0.35)
+    let entry = ease(o.ease ?? @ease_out_expo, prog(t, t0, t0 + dur))
+    let out = o.out ?? nil
+    let keep = if out == nil { 1.0 } else { 1.0 - ease(o.ease ?? @ease_in_cubic, prog(t, out, out + dur)) }
+    let k = entry * keep
+    let alpha = (o.alpha ?? 0.65) * k
+    let w = o.w ?? 1920.0
+    let length = o.length ?? 22.0
+    let inset = o.inset ?? 36.0
+    crop_marks(c, o{inset: mix(inset - (o.travel ?? (inset + length + 24.0)), inset, k) alpha: alpha})
+    c.save()
+    c.translate(0, -(o.travel ?? 80.0) * (1.0 - k))
+    let no = o.no ?? "01"
+    let number = if no.is_number() { fixed(no, 0) } else { no }
+    typed(c, number + "   " + (o.section ?? ""), inset + 28, inset + 28, t, t0,
+        {font: o.font ?? MONO px: o.px ?? 16.0 color: o.color ?? #eee9df alpha: alpha cps: 48 caret: false})
+    spark_line(c, [inset + 28, inset + 56, w - inset - 28, inset + 56], t, t0, dur,
+        {width: o.width ?? 1.25 color: o.color ?? #eee9df alpha: alpha rate: o.rate ?? 30 scale: 0.35 heat: o.heat ?? 0.5})
+    c.restore()
+}
+
+// Mechanical wheels for any finite value at (x, alphabetic baseline y); fractions of the last
+// displayed digit drive its roll, higher wheels roll on carry. o.decimals ?? 0 fixed places,
+// o.digits ?? 1 minimum integer digits (reserve columns across a carry); sign is automatic.
+// o.group ?? "," thousands separator ("" disables), o.point ?? "." decimal separator,
+// o.px ?? 100, o.font ?? MONO, o.color ?? #eee9df, o.alpha ?? 1, o.align ?? @left,
+// o.ls ?? 0; o.step ?? c.measure("0", ...) is a digit cell width, o.row ?? px * 1.05 its roll.
+// Reuses the same detent/carry as film.odometer. Returns the complete number's width in px.
+let roll_number = fn(c, value, x, y, o) {
+    let decimals = max(0.0, floor(o.decimals ?? 0.0))
+    let mult = pow(10.0, decimals)
+    let count = abs(value) * mult
+    var whole = floor(abs(value) + 0.5 / mult)
+    var digits = 1
+    while whole >= 10.0 { digits = digits + 1 whole = floor(whole / 10.0) }
+    digits = max(digits, floor(o.digits ?? 1))
+    let font = o.font ?? MONO
+    let px = o.px ?? 100.0
+    let style = {font: font px: px color: o.color ?? #eee9df alpha: o.alpha ?? 1.0}
+    let step = o.step ?? (c.measure("0", style) + (o.ls ?? 0.0))
+    let row = o.row ?? px * 1.05
+    let group = o.group ?? ","
+    let point = o.point ?? "."
+    let gw = if group == "" { 0.0 } else { c.measure(group, style) }
+    let pw = if decimals > 0 { c.measure(point, style) } else { 0.0 }
+    let sw = if value < 0.0 { c.measure("-", style) } else { 0.0 }
+    let width = step * (digits + decimals) + floor((digits - 1) / 3) * gw + pw + sw
+    var at = x - width * align_number(o.align ?? @left)
+    if value < 0.0 { c.text("-", at, y, style) at = at + sw }
+    let metrics = text_layout("0", font, px * 0.75)
+    for i in 0..(digits + decimals) {
+        let pos = mod.forms.drum_pos(count, digits + decimals - i - 1)
+        let base = floor(pos)
+        let phase = pos - base
+        for j in -1..2 {
+            let fade = max(0.0, 1.0 - abs(j - phase) / 0.9)
+            c.text(DIGITS[mod.forms.wrap10(base + j)], at + step * 0.5, y + (j - phase) * row,
+                style{align: @center alpha: (o.alpha ?? 1.0) * fade clip: [at, y - metrics.ascent, step, metrics.ascent + metrics.descent]})
+        }
+        at = at + step
+        let remaining = digits - i - 1
+        if remaining > 0 && remaining % 3 == 0 && group != "" {
+            c.text(group, at, y, style)
+            at = at + gw
+        }
+        if remaining == 0 && decimals > 0 {
+            c.text(point, at, y, style)
+            at = at + pw
+        }
+    }
+    return width
+}
+
+// Index of the last beat <= plate time t, -1 before the first or for an empty list. beats is
+// an ascending list of plate seconds; simultaneous entries resolve to the last. No defaults.
+let beat_index = fn(t, beats) {
+    var lo = 0
+    var hi = beats.len()
+    while lo < hi {
+        let mid = floor((lo + hi) / 2)
+        if beats[mid] <= t { lo = mid + 1 } else { hi = mid }
+    }
+    return lo - 1
+}
+
+// Elapsed plate seconds, held at zero before t0. No defaults.
+let since = fn(t, t0) { return max(0.0, t - t0) }
+
+// A camera2d record for cam2d_apply: beats is an ascending list of plate seconds. Every beat
+// adds a zoom kick o.push ?? 0.04 and alternating roll +/- o.roll ?? 0.012 radians, decaying
+// with ease_out_expo over o.dur ?? 0.5 s. Overlapping kicks add; roll alternates by beat index.
+// o.camera ?? {x: 960 y: 540 zoom: 1 rot: 0 w: 1920 h: 1080} is the resting camera;
+// o.live ?? t drives slow noise drift, o.drift ?? 3 world px at o.drift_rate ?? 0.12 Hz,
+// o.seed ?? 1. Zero drift gives exact rest between kicks; empty beats gives drift only.
+let beat_cam = fn(t, beats, o) {
+    let base = o.camera ?? {x: 960.0 y: 540.0 zoom: 1.0 rot: 0.0 w: 1920.0 h: 1080.0}
+    let dur = max(0.0, o.dur ?? 0.5)
+    var i = beat_index(t, beats)
+    var push = 0.0
+    var roll = 0.0
+    while i >= 0 && t - beats[i] < dur {
+        let k = 1.0 - ease(@ease_out_expo, prog(t, beats[i], beats[i] + dur))
+        let even = i % 2 == 0
+        push = push + (o.push ?? 0.04) * k
+        roll = roll + (o.roll ?? 0.012) * (if even { 1.0 } else { -1.0 }) * k
+        i = i - 1
+    }
+    let live = (o.live ?? t) * (o.drift_rate ?? 0.12)
+    let seed = o.seed ?? 1.0
+    let drift = o.drift ?? 3.0
+    // cam2d_mix supplies the canonical camera record and inherited frame size.
+    return cam2d_mix(base, {x: base.x + noise1(live, seed) * drift y: base.y + noise1(live, seed + 1) * drift
+        zoom: base.zoom * (1.0 + push) rot: (base.rot ?? 0.0) + roll}, 1.0)
+}
+
+// Whole-frame ink bars closing over u = 0..1; o.enter ?? false reverses it for a reveal.
+// o.bars ?? 7 horizontal bars alternate left/right, o.lag ?? 0.08 is stagger relative to
+// one bar's duration (any count still finishes at 1); o.ink ?? #0a0a0b, o.w ?? 1920, o.h ?? 1080.
+let shutter = fn(c, u, o) {
+    let k = if o.enter ?? false { 1.0 - clamp(u, 0.0, 1.0) } else { clamp(u, 0.0, 1.0) }
+    if k <= 0.0 { return }
+    let w = o.w ?? 1920.0
+    let h = o.h ?? 1080.0
+    let ink = o.ink ?? #0a0a0b
+    c.save()
+    c.reset()
+    if k >= 1.0 {
+        c.rect(0, 0, w, h, ink, 1)
+    } else {
+        let bars = max(1.0, floor(o.bars ?? 7.0))
+        let lag = max(0.0, o.lag ?? 0.08)
+        for i in 0..bars {
+            let p = ease(@ease_in_out_cubic, clamp(k * (1.0 + (bars - 1.0) * lag) - i * lag, 0.0, 1.0))
+            if p > 0.0 { c.rect(if i % 2 == 0 { 0.0 } else { w * (1.0 - p) }, h * i / bars, w * p, h / bars + 1.0, ink, 1) }
+        }
+    }
+    c.restore()
+}
+
+// A jagged horizontal tear, u = 0..1 exits to ink; o.enter ?? false reverses it for entry.
+// o.ink ?? #0a0a0b, o.w ?? 1920, o.h ?? 1080, o.y ?? h/2 for the seam,
+// o.jag ?? 18 px, o.step ?? 64 px between teeth, o.seed ?? 1 (fixed throughout the wipe),
+// o.hot ?? #ff4d12, o.glow ?? 1 for the edge, o.slide ?? 80 px sideways movement with o.draw.
+// o.draw ?? nil: without it this is an ink overlay opening a gap through the plate. With
+// draw: fn(c) { ... } it paints an ink ground and redraws the plate in two clipped halves,
+// sliding the actual artwork apart. The callback must compose transforms (translate/scale/
+// rotate), keeping the supplied canvas; reset/set_transform/cam2d_apply replace that placement.
+// Call last in a layer, or use the callback to draw the entire plate. No framebuffer sampling.
+let tear = fn(c, u, o) {
+    let k = if o.enter ?? false { 1.0 - clamp(u, 0.0, 1.0) } else { clamp(u, 0.0, 1.0) }
+    let w = o.w ?? 1920.0
+    let h = o.h ?? 1080.0
+    let ink = o.ink ?? #0a0a0b
+    let draw = o.draw ?? nil
+    c.save()
+    c.reset()
+    if k <= 0.0 {
+        if draw != nil { draw(c) }
+        c.restore()
+        return
+    }
+    if k >= 1.0 {
+        c.rect(0, 0, w, h, ink, 1)
+        c.restore()
+        return
+    }
+    let p = ease(@ease_in_out_cubic, k)
+    let y = o.y ?? h * 0.5
+    let jag = abs(o.jag ?? 18.0)
+    let spacing = o.step ?? 64.0
+    let teeth = max(1.0, ceil(w / (if spacing > 0.0 { spacing } else { 64.0 })))
+    let seam = []
+    for i in 0..(teeth + 1) { seam.push(vec2(w * i / teeth, y + (hashn(i, o.seed ?? 1.0) * 2.0 - 1.0) * jag)) }
+    let slide = if draw == nil { 0.0 } else { o.slide ?? 80.0 }
+    let up = vec2(-slide * p, -(y + jag + 32.0) * p)
+    let down = vec2(slide * p, (h - y + jag + 32.0) * p)
+    let upper = []
+    let lower = []
+    for q in seam { upper.push(q + up) lower.push(q + down) }
+    if draw != nil {
+        c.rect(0, 0, w, h, ink, 1)
+        let top = [vec2(0, 0), vec2(w, 0)]
+        for i in 0..(teeth + 1) { top.push(seam[teeth - i]) }
+        let bottom = [vec2(0, h)]
+        for q in seam { bottom.push(q) }
+        bottom.push(vec2(w, h))
+        for part in [[top, up], [bottom, down]] {
+            c.save()
+            c.translate(part[1].x, part[1].y)
+            c.clip_begin(part[0])
+            draw(c)
+            c.clip_end()
+            c.restore()
+        }
+    } else {
+        let band = []
+        for q in upper { band.push(q) }
+        for i in 0..(teeth + 1) { band.push(lower[teeth - i]) }
+        c.poly(band, ink, 1)
+    }
+    let glow = (o.glow ?? 1.0) * 4.0 * k * (1.0 - k)
+    for edge in [upper, lower] {
+        c.stroke(edge, 18, o.hot ?? #ff4d12, glow * 0.14)
+        c.stroke(edge, 5, o.hot ?? #ff4d12, glow * 0.8)
+        c.stroke(edge, 1.5, [2.0, 1.7, 1.2], glow)
+    }
+    c.restore()
+}
+
+{slam: slam rise_letters: rise_letters glide_text: glide_text fade_pose: fade_pose fade_block: fade_block
+    dolly_cam: dolly_cam glide_line: glide_line typed: typed retrig: retrig glitch_slices: glitch_slices
+    annotate: annotate dim_line: dim_line hud_frame: hud_frame roll_number: roll_number spark_line: spark_line
+    beat_cam: beat_cam shutter: shutter tear: tear beat_index: beat_index since: since}

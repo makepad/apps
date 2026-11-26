@@ -1,0 +1,17 @@
+use mod.motion.*
+
+// A variable-font weight travelling through the letters (the motion deck's
+// type ranges): every letter steps through weights 300..860 as the range
+// passes, so most frames draw some letter at a weight not drawn before.
+Motion{
+    label: "weight wave"
+    size: vec2(1280, 240)
+    duration: 4.0
+    fps: 60
+    background: #101014
+    layers: [
+        Text{name: "letters" text: "Weight travels through the letters." font: Font{family: "Roboto Flex" weight: 300} size: 54 color: #e8e2d6
+            at: vec2(40, 150) by: @letter
+            range: Range{to: 0.22 soft: 0.16 ease: @ease_in_out slide: fn(t) { -0.45 + 1.9 * ease(@ease_in_out_sine, fract(t / 3.0)) } wght: 860}}
+    ]
+}

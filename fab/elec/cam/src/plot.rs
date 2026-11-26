@@ -144,7 +144,7 @@ pub fn build_model(board: &Board, circuit: &Circuit, fills: &[ZoneFill]) -> CamM
         model.holes.push((h.plated, hole));
     }
     // A power flag exists only on the schematic, so BOM validation expects no reference for it.
-    model.bom_refs = circuit.comps.iter().filter(|c| !c.dnp && c.part.kind != PartKind::PowerFlag).map(|c| c.refdes.clone()).collect();
+    model.bom_refs = circuit.comps.iter().filter(|c| !c.dnp && c.part.kind != PartKind::PowerFlag && !crate::tables::excludes_bom(c)).map(|c| c.refdes.clone()).collect();
     model
 }
 

@@ -42,7 +42,7 @@ use crate::xr_edit::{self, Affine, Command, EditOut, SliceAxis, XrEdit};
 use crate::xr_mech::{MechOut, SceneBodies, XrMech};
 use fab::api::{ArmAction, ForceAction, ForceField, MechAction, MechLight, MechScene, MechTool, Family, PlateMode, Workspace};
 use fab::model::ElementId;
-use fab::print::{PrintAction, PrinterControl};
+use fab::print::{ControlDestination, PrintAction, PrinterControl, PrintState};
 use fab::viewport::print::{draw_overlay_placed, draw_print_placed, DrawFabFar, DrawFabHead, DrawFabPath, DrawFabStrip, FarTiers, PrintFrame, PrintPalette, PrintPlacement};
 use fab::fab_sdf_tiles::draw::TileLight;
 use fab_model::eval::Evaluated;
@@ -315,6 +315,8 @@ pub struct FabXr {
     /// The wrist menu and the layer readout card.
     #[live]
     menu: XrWristMenu,
+    #[rust]
+    monitor_controls: Option<MonitorControls>,
     #[live]
     readout: XrPanel,
     /// The value chip by a held shape handle: a constant small size on screen (`chip_card`).
@@ -357,7 +359,7 @@ pub struct FabXr {
     #[rust]
     far_tiers: FarTiers,
     #[rust]
-    overlay_palette: PrintPalette,
+    live_palette: PrintPalette,
     /// A rebuilt plate to install at the next XR frame.
     #[rust]
     pending: Option<PreparedPlate>,
@@ -1296,9 +1298,12 @@ impl FabXr {
         for v in [(scale * 10.0).round() as u64 + ((scale - 1.0).abs() < 0.005) as u64 * 1000, workspace.index() as u64, mode.map_or(0, |m| m as u64 + 1), slice_shown(state) as u64, state.map_or(0, |s| s.render_mode() as u64), state.is_some_and(|s| s.ui.arm_shown) as u64, playing as u64, first as u64, report.as_ref().map_or(0, |r| Arc::as_ptr(r) as u64), pieces as u64] {
             key = (key ^ v).wrapping_mul(0x100_0000_01b3);
         }
-        if let Some(p) = state.filter(|_| mode == Some(PlateMode::Monitor)).map(|s| &s.print) {
+        let monitor = state.filter(|_| mode == Some(PlateMode::Monitor)).map(|s| &s.print);
+        let confirm_stop = monitor.is_some_and(|p| p.confirm_stop.as_ref().is_some_and(|dest|
+            matches!(dest, ControlDestination::Filament { .. }) && dest.matches(p)));
+        if let Some(p) = monitor {
             // a new snapshot of the printer is a new Arc
-            for v in [p.printer.as_ref().map_or(0, |s| Arc::as_ptr(s) as u64), p.confirm_stop as u64, p.follow.on as u64] {
+            for v in [p.shown_printer().map_or(0, |s| Arc::as_ptr(s) as u64), confirm_stop as u64, p.follow.on as u64] {
                 key = (key ^ v).wrapping_mul(0x100_0000_01b3);
             }
         }
@@ -1326,6 +1331,7 @@ impl FabXr {
         }
         let plate = self.plate.as_ref();
         self.menu.panel.set(key, |rows| {
+            self.monitor_controls = monitor.and_then(MonitorControls::shown);
             // the workspaces offered (an experimental one while View › Experimental has it)
             for (k, w) in Workspace::ALL.iter().enumerate().filter(|(_, w)| state.is_none_or(|s| s.workspace_shown(**w))) {
                 rows.row(Height::Fixed(44.0)).toggle(item::WORKSPACE + k as u32, w.label(), *w == workspace, Width::FILL);
@@ -1347,7 +1353,7 @@ impl FabXr {
             rows.row(Height::Fixed(52.0)).toggle(item::REAL_SIZE, real, (scale - 1.0).abs() < 0.005, Width::Flex(2.0)).button(item::UNDO, "Undo", Width::FILL).button(item::REDO, "Redo", Width::FILL);
             match (mode, workspace) {
                 (Some(PlateMode::Mechanics), _) => mech_rows(rows, mech, plate),
-                (Some(PlateMode::Monitor), _) => monitor_rows(rows, state),
+                (Some(PlateMode::Monitor), _) => monitor_rows(rows, state, self.monitor_controls.as_ref(), confirm_stop),
                 (_, w) if w.shows(Family::Arm) => arm_rows(rows, state),
                 _ => {
                     if mode == Some(PlateMode::Design) {
@@ -1433,6 +1439,10 @@ impl FabXr {
     }
 
     fn menu_action(&self, cx: &mut Cx, id: u32, state: Option<&fab::AppState>) {
+        if let Some(action) = self.monitor_controls.as_ref().and_then(|shown| shown.action(id)) {
+            cx.action(action);
+            return;
+        }
         let mech = state.map(|s| &s.mech);
         match id {
             item::PRINT_PART => {
@@ -1465,14 +1475,6 @@ impl FabXr {
             _ if (item::RENDER_MODE..item::RENDER_MODE + fab::api::RenderMode::ALL.len() as u32).contains(&id) => {
                 cx.action(fab::api::ShellAction::SetRenderMode(fab::api::RenderMode::ALL[(id - item::RENDER_MODE) as usize]));
             }
-            item::PRINTER_PAUSE => {
-                let paused = state.and_then(|s| s.print.printer.as_ref()).is_some_and(|p| p.state.gcode_state.as_deref() == Some("PAUSE"));
-                cx.action(PrintAction::PrinterControl(if paused { PrinterControl::Resume } else { PrinterControl::Pause }));
-            }
-            // Stop asks first, as the desktop's panel does
-            item::PRINTER_STOP => cx.action(PrintAction::AskStop(true)),
-            item::PRINTER_STOP_NO => cx.action(PrintAction::AskStop(false)),
-            item::PRINTER_STOP_YES => cx.action(PrintAction::PrinterControl(PrinterControl::Stop)),
             item::FOLLOW_PRINTER => cx.action(PrintAction::FollowPrinter(!state.is_some_and(|s| s.print.follow.on))),
             item::MECH_SHAKE => cx.action(MechAction::Shake(!mech.is_some_and(|m| m.shaking))),
             item::MECH_PREV_PIECE | item::MECH_NEXT_PIECE => {
@@ -1905,6 +1907,7 @@ impl FabXr {
             if let Some(pv) = &live.preview {
                 let mode = state.map_or(0.0, |s| s.print.play.color.shader_mode());
                 let frame = PrintFrame {
+                    colours: state.map(|s| s.view.colours).unwrap_or_default(),
                     preview: pv.clone(),
                     cut: fab::print::RunCut::all(&pv.beads),
                     travel_count: 0,
@@ -1926,13 +1929,13 @@ impl FabXr {
                     lit: None,
                     closed: Vec::new(),
                 };
-                draw_print_placed(cx3d, &frame, &mut self.print_palette, place, &xr_sdf_light(), (&mut self.draw_path, &mut self.draw_far, &mut self.far_tiers), &mut self.draw_head);
+                draw_print_placed(cx3d, &frame, &mut self.live_palette, place, &xr_sdf_light(), (&mut self.draw_path, &mut self.draw_far, &mut self.far_tiers), &mut self.draw_head);
             } else {
-                draw_overlay_placed(cx3d, &live.contours.all, &mut self.overlay_palette, place, [0.0, lit, lit + 1.0], None, &mut self.draw_overlay.draw_vars);
+                draw_overlay_placed(cx3d, &live.contours.all, &mut self.live_palette, place, [0.0, lit, lit + 1.0], None, &mut self.draw_overlay.draw_vars);
             }
             if markers_on {
                 if let Some(m) = &live.markers {
-                    draw_overlay_placed(cx3d, m, &mut self.overlay_palette, place, [0.0, lit, 0.0], None, &mut self.draw_overlay.draw_vars);
+                    draw_overlay_placed(cx3d, m, &mut self.live_palette, place, [0.0, lit, 0.0], None, &mut self.draw_overlay.draw_vars);
                 }
             }
         }
@@ -1954,12 +1957,12 @@ impl FabXr {
         if !slice_mode && !in_mech && markers_on && !grabbing {
             // printability on the model: the plate's markers
             if let Some(m) = state.and_then(|s| s.print.markers()) {
-                draw_overlay_placed(cx3d, m, &mut self.overlay_palette, place, [0.0, 1e9, 0.0], None, &mut self.draw_overlay.draw_vars);
+                draw_overlay_placed(cx3d, m, &mut self.live_palette, place, [0.0, 1e9, 0.0], None, &mut self.draw_overlay.draw_vars);
             }
         } else if !slice_mode && !in_mech && markers_on && grabbing {
             // while parts move: the live slice's printability once it has it
             if let Some(m) = self.live_shown.as_ref().and_then(|l| l.markers.as_ref()) {
-                draw_overlay_placed(cx3d, m, &mut self.overlay_palette, place, [0.0, 1e9, 0.0], None, &mut self.draw_overlay.draw_vars);
+                draw_overlay_placed(cx3d, m, &mut self.live_palette, place, [0.0, 1e9, 0.0], None, &mut self.draw_overlay.draw_vars);
             }
         }
         if !self.check.on {
@@ -2624,11 +2627,36 @@ fn chip_card(at: Vec3f, eye: &EyeFrame, aspect: f32, em_deg: f32, place: &mut Ch
     Card { center: eye.pos + eye.right * (c.x * d) + eye.up * (c.y * d) - eye.back * d, right: eye.right, up: eye.up, normal: eye.back, size: chip * d }
 }
 
+struct MonitorControls {
+    destination: ControlDestination,
+    paused: bool,
+}
+
+impl MonitorControls {
+    fn shown(p: &PrintState) -> Option<Self> {
+        let report = &p.shown_printer()?.state;
+        let paused = report.gcode_state.as_deref() == Some("PAUSE");
+        if !report.busy() { return None; }
+        Some(Self { destination: ControlDestination::filament(p)?, paused })
+    }
+
+    fn action(&self, id: u32) -> Option<PrintAction> {
+        let dest = &self.destination;
+        Some(match id {
+            item::PRINTER_PAUSE => PrintAction::PrinterControl(dest.clone(), if self.paused { PrinterControl::Resume } else { PrinterControl::Pause }),
+            item::PRINTER_STOP => PrintAction::AskStop(dest.clone(), true),
+            item::PRINTER_STOP_NO => PrintAction::AskStop(dest.clone(), false),
+            item::PRINTER_STOP_YES => PrintAction::PrinterControl(dest.clone(), PrinterControl::Stop),
+            _ => return None,
+        })
+    }
+}
+
 /// The printer panel's job and status: what the printer reports, Pause and Stop while a job runs
 /// (Stop asks first), following the job. Sending a print stays on the desktop.
-fn monitor_rows(rows: &mut makepad_xr_ui::Rows, state: Option<&fab::AppState>) {
+fn monitor_rows(rows: &mut makepad_xr_ui::Rows, state: Option<&fab::AppState>, controls: Option<&MonitorControls>, confirm_stop: bool) {
     let Some(p) = state.map(|s| &s.print) else { return };
-    let Some(printer) = &p.printer else {
+    let Some(printer) = p.shown_printer() else {
         rows.row(Height::Fixed(40.0)).text("No printer linked", Tone::Meta, Width::FILL);
         return;
     };
@@ -2648,14 +2676,14 @@ fn monitor_rows(rows: &mut makepad_xr_ui::Rows, state: Option<&fab::AppState>) {
             rows.row(Height::Fixed(30.0)).text(line, Tone::Meta, Width::FILL);
         }
     }
-    if fab_printer_link::printing_supported() && (s.busy() || paused) {
-        if p.confirm_stop {
+    if let Some(controls) = controls.filter(|_| fab_printer_link::printing_supported()) {
+        if confirm_stop {
             rows.row(Height::Fixed(52.0))
                 .text("Stop the print?", Tone::Warning, Width::FILL)
                 .button(item::PRINTER_STOP_YES, "Stop", Width::Fixed(112.0))
                 .button(item::PRINTER_STOP_NO, "Keep", Width::Fixed(112.0));
         } else {
-            rows.row(Height::Fixed(52.0)).button(item::PRINTER_PAUSE, if paused { "Resume" } else { "Pause" }, Width::FILL).button(item::PRINTER_STOP, "Stop", Width::FILL);
+            rows.row(Height::Fixed(52.0)).button(item::PRINTER_PAUSE, if controls.paused { "Resume" } else { "Pause" }, Width::FILL).button(item::PRINTER_STOP, "Stop", Width::FILL);
         }
     }
     rows.row(Height::Fixed(52.0)).toggle(item::FOLLOW_PRINTER, "Follow the printer", p.follow.on, Width::FILL);
@@ -3700,6 +3728,68 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Mutex};
+
+    #[test]
+    fn monitor_pause_reaches_only_the_filament_printer_while_a_resin_job_runs() {
+        use fab::print::{apply, resin::{ResinJob, ResinStage}, PrinterChoice};
+        use fab_printer_link::{Command, ConnectionStatus, PrinterState, Snapshot};
+
+        // Record the commands exactly where the two dispatchers hand them to their workers.
+        let mut resin_view = crate::sla::ResinView::default();
+        let mut dispatch = |p: &mut PrintState, action: PrintAction| {
+            let (mut resin, mut filament) = (Vec::new(), Vec::new());
+            if !crate::App::resin_print_action(p, &mut resin_view, &action, |_, c| resin.push(c)) {
+                let PrintAction::PrinterControl(dest, control) = action else { panic!("expected a printer control") };
+                crate::print::send_filament_control(p, &dest, control, |c| filament.push(c));
+            }
+            (resin, filament)
+        };
+
+        let mut p = PrintState::default();
+        p.links.picked = PrinterChoice::Real("fixture".into());
+        p.printers.set(&p.links.picked, Arc::new(Snapshot {
+            status: ConnectionStatus::Connected,
+            state: Arc::new(PrinterState { gcode_state: Some("RUNNING".into()), ..Default::default() }),
+            ..Default::default()
+        }));
+        let job = ResinJob {
+            name: "block".into(), printer: "fixture".into(), stage: ResinStage::Printing, stack: Some(1),
+            layer: 1, layers: 2, started: Some(1.0), ended: None, planned: None, left: None, note: String::new(),
+        };
+        let resin_job = ControlDestination::resin(&job);
+        p.resin_job = Some(job);
+
+        let shown = MonitorControls::shown(&p).unwrap();
+        let (resin, filament) = dispatch(&mut p, shown.action(item::PRINTER_PAUSE).unwrap());
+        assert!(resin.is_empty(), "XR Pause on the filament printer reached the resin printer");
+        assert!(matches!(filament.as_slice(), [Command::Pause]), "the filament printer must receive one Pause");
+
+        assert!(apply(&mut p, &shown.action(item::PRINTER_STOP).unwrap()));
+        assert_eq!(p.confirm_stop.as_ref(), Some(&shown.destination));
+        assert!(apply(&mut p, &PrintAction::AskStop(resin_job.clone(), true)));
+        assert_eq!(p.confirm_stop.as_ref(), Some(&resin_job));
+        apply(&mut p, &shown.action(item::PRINTER_STOP_NO).unwrap());
+        assert_eq!(p.confirm_stop.as_ref(), Some(&resin_job), "XR Keep must leave the resin confirmation open");
+        let stop = PrintAction::PrinterControl(resin_job, PrinterControl::Stop);
+        let (resin, filament) = dispatch(&mut p, stop);
+        assert_eq!(resin, [PrinterControl::Stop]);
+        assert!(filament.is_empty(), "a resin Stop reached the filament printer");
+        assert!(p.confirm_stop.is_none());
+
+        for was_virtual in [false, true] {
+            Arc::make_mut(p.target_printer_mut().unwrap()).virtual_printer = was_virtual;
+            let shown = MonitorControls::shown(&p).unwrap();
+            Arc::make_mut(p.target_printer_mut().unwrap()).virtual_printer = !was_virtual;
+            let (resin, filament) = dispatch(&mut p, shown.action(item::PRINTER_STOP_YES).unwrap());
+            assert!(resin.is_empty() && filament.is_empty(), "got a stale Stop after switching from virtual={was_virtual}");
+        }
+        let shown = MonitorControls::shown(&p).unwrap();
+        let other_report = p.target_printer().unwrap().clone();
+        p.links.picked = PrinterChoice::Real("other fixture".into());
+        p.printers.set(&p.links.picked, other_report);
+        let (resin, filament) = dispatch(&mut p, shown.action(item::PRINTER_PAUSE).unwrap());
+        assert!(resin.is_empty() && filament.is_empty(), "a different configured printer received XR Pause");
+    }
 
     /// Pictures asked for faster than they are made wait their turn: one worker on them at a
     /// time however many wait, none dropped, made in the order asked. The test moves on when a

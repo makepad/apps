@@ -1,0 +1,3 @@
+use mod.scene.*
+// Seq3D product reveal: a stylised bottle with your label image on a turntable (or product: file("x.glb")).
+Seq3D{template: @product_reveal text: "AURORA" subtitle: "sparkling water" image: file("screen.png") color: #1f6fff accent: #f2c14e}

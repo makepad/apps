@@ -1,0 +1,32 @@
+use mod.motion.*; use mod.scene; use mod.post
+// The beat-grid check: a field and a hero shape pulse on the music's beat.
+// Rendered at two timeline positions (--edit-offset 0 and 0.37) the pulses
+// land on the same EDIT times, not the same clip times.
+Motion{
+    size: vec2(1920, 1080)
+    duration: 2.0
+    layers: [
+        Scene3D{
+            background: #050507
+            tone_mapping: @aces
+            camera: Camera{position: vec3(0, 5, 10) target: vec3(0, 0, 0) fov: 40}
+            post: [post.Bloom{strength: 0.8 threshold: 0.8}]
+            lights: [scene.AmbientLight{intensity: 0.3} scene.DirectionalLight{position: vec3(3, 6, 4) intensity: 1.5}]
+            children: [
+                scene.Instances{
+                    geometry: scene.SphereGeometry{radius: 0.12 width_segments: 10 height_segments: 8}
+                    layout: scene.GridLayout{count: vec3(40, 1, 24) spacing: vec3(0.4, 1, 0.4)}
+                    each: {scale: scene.follow_music(@beat, 0.6, 1.6) emissive: scene.follow_music(@beat, #000000, #ffae3b)}
+                    material: scene.MeshStandardMaterial{color: #333844 emissive_intensity: 4}
+                }
+                scene.Mesh{
+                    geometry: scene.TorusGeometry{radius: 1.2 tube: 0.35}
+                    position: vec3(0, 1.8, 0)
+                    rotation: vec3(70, 0, 0)
+                    scale: scene.follow_music(@beat, 1.0, 1.5)
+                    material: scene.MeshPhysicalMaterial{color: #ffffff clearcoat: 1 roughness: 0.2 emissive: #ffae3b emissive_intensity: scene.follow_music(@beat, 0, 5)}
+                }
+            ]
+        }
+    ]
+}

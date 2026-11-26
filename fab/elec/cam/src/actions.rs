@@ -20,7 +20,7 @@ pub static ACTIONS: &[ActionDef] = &[
             FieldDef {
                 name: "profile",
                 kind: FieldKind::Text,
-                help: "The factory profile (standard 2-layer, JLCPCB 2-layer); the board's own when omitted, else standard 2-layer.",
+                help: "A built-in or project factory profile. Defaults to the board's factory, then standard 2-layer.",
                 required: false,
                 default: "",
             },
@@ -63,7 +63,7 @@ pub static ACTIONS: &[ActionDef] = &[
             FieldDef {
                 name: "profile",
                 kind: FieldKind::Text,
-                help: "The factory profile to make the board by: standard 2-layer or JLCPCB 2-layer.",
+                help: "The name of a built-in factory or a profile in a project .export.splash document.",
                 required: true,
                 default: "",
             },

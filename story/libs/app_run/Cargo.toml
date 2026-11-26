@@ -1,0 +1,46 @@
+# App runs: a typed Splash script that launches a
+# registry app hidden on the virtual clock, drives it through the remote
+# protocol, records it in process at an exact pixel size, and publishes the
+# MP4 and its run.json (marks, per-call frames, the focus track) as the
+# render of an `AppRun` asset. Also the `makepad-app-run` CLI: run,
+# --validate and --dump (the AI authoring blob).
+[package]
+name = "makepad-story-app-run"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# `devhub test` runs these tests in the lane's tree, never a JIT overlay: cargo builds the apps they
+# run from the checkout, and an overlay's tree is one only the JIT process reads
+[package.metadata.makepad]
+test-tree = "its tests cargo-build the registry apps they run from the checkout"
+
+[[bin]]
+name = "makepad-app-run"
+path = "src/bin/makepad-app-run.rs"
+required-features = ["host"]
+
+[features]
+default = ["host"]
+# Running apps: building and launching them, the remote protocol, recording
+# and publishing runs. Without it, the script model only (parse, check, the
+# runner over a host's own `Driver`), as a deck player reads demo steps.
+host = ["dep:makepad-remote", "dep:makepad-asset-client", "dep:makepad-widgets-sheets"]
+
+[dependencies]
+makepad-a11y = { path = "../../../../../libs/a11y" }
+makepad-script = { path = "../../../../../platform/script" }
+makepad-app-registry = { path = "../../../../../libs/app_registry" }
+makepad-strict-json = { path = "../../../../../libs/strict_json" }
+makepad-remote = { path = "../../../../../libs/remote", optional = true }
+makepad-core-util = { path = "../../../../../libs/core_util" }
+makepad-asset-data = { path = "../../../../apps/engine/asset/data" }
+makepad-asset-client = { path = "../../../../apps/engine/asset/client", optional = true }
+# The UI themes `theme` names: the catalogue, including the extra style sheets.
+makepad-widgets-core = { path = "../../../../../widgets/core" }
+makepad-widgets-sheets = { path = "../../../../../widgets/sheets", optional = true }
+
+[dev-dependencies]
+# A real store on loopback, to publish a run end to end.
+makepad-asset-store = { path = "../../../../apps/engine/asset/store" }

@@ -1,0 +1,137 @@
+use mod.motion.*
+// What `Motion{style: …}` does to a document (style.rs runs it in the document's VM, the style checked): the kit's plate, ornaments, screen and post around the author's layers, and its type and motion on them where the author set none.
+use mod.motion.modules.style.*
+
+// Whether `o` is made from the component `ty` (or is it).
+let st_is = fn(o, ty) {
+    var p = o
+    while p != nil && p.is_object() {
+        if p.gc_id() == ty.gc_id() { return true }
+        p = p.proto() ?? nil
+    }
+    false
+}
+// Whether the author already moves this layer (a track, a function, a reveal): then the kit's
+// animator stays off it.
+let st_moving = fn(v) {
+    v.is_fn() || v.is_object() && (st_is(v, Tween) || st_is(v, Keys) || st_is(v, Sequence) || st_is(v, Loop))
+}
+let st_moves = fn(t) {
+    for k in [@reveal, @show, @pop, @wave, @words, @number, @source] {
+        if (t[k] ?? nil) != nil { return true }
+    }
+    var o = t
+    while o != nil && o.is_object() && o.gc_id() != Text.gc_id() {
+        for k, v in o {
+            if st_moving(v) { return true }
+            if v.is_array() { for item in v { if st_moving(item) { return true } } }
+        }
+        o = o.proto() ?? nil
+    }
+    false
+}
+let st_default = fn(o, key, value) {
+    if (o[key] ?? nil) == nil { o[key] = value }
+}
+let st_round = fn(n) { round(n * 1000.0) / 1000.0 }
+
+// The kit's fields on one author Text.
+let st_text = fn(t, st) {
+    // A label keeps the house look: the kit's label face in its ink.
+    if (t.role ?? nil) == @label {
+        st_default(t, @font, st.kit.label)
+        st_default(t, @color, st.ink)
+        return nil
+    }
+    let size = if (t.size ?? nil) == nil { 72.0 } else if (t.size ?? nil).is_number() { (t.size ?? nil) } else { nil }
+    let display = size == nil || size >= 56.0
+    let face = if display { st.kit.display } else { st.kit.body }
+    let font = if display { st.display_font } else { st.body_font }
+    st_default(t, @font, font)
+    if font == face.font {
+        let stretch = face.stretch ?? 100.0
+        if stretch != 100.0 && !st_moves(t) { st_default(t, @wdth, stretch) }
+        if face.tracking != 0.0 && size != nil { st_default(t, @tracking, round(face.tracking * size * 100.0) / 100.0) }
+    }
+    st_default(t, @color, st.ink)
+    if display { st_default(t, @line_height, st.kit.leading) }
+    if display && st.upper && (t.text ?? nil) != nil && (t.text ?? nil).is_string() { t.text = (t.text ?? nil).to_upper() }
+    if st.text_effects.len() > 0 { st_default(t, @effects, st.text_effects) }
+    if (t.animate ?? nil) == @none {
+        t.animate = nil
+    } else if (t.animate ?? nil) == nil {
+        let animate = if display { st.animate } else { st.body_animate }
+        if animate != @none && !st_moves(t) {
+            t.animate = animate
+            st_default(t, @speed, st.speed)
+        }
+    }
+    nil
+}
+
+// The kit's fields on one author layer, and on its children.
+let st_layer = fn(l, st) {
+    if !l.is_object() { return nil }
+    if st_is(l, Text) { return st_text(l, st) }
+    if st_is(l, Text3D) {
+        if st.text3d != "" { st_default(l, @preset, st.text3d) }
+        st_default(l, @font, st.display_font)
+        st_default(l, @color, st.ink)
+        st_default(l, @accent, st.accent)
+    } else if st_is(l, KineticText) {
+        if st.kinetic != "" { st_default(l, @preset, "vjfx/" + st.kinetic) }
+    } else if st_is(l, Group) {
+        if (l.layers ?? nil) != nil { for item in (l.layers ?? nil) { st_layer(item, st) } }
+    } else if st_is(l, Repeat) {
+        if (l.layer ?? nil) != nil { st_layer((l.layer ?? nil), st) }
+    }
+    nil
+}
+
+// Lower `root.style` in place (`size` is the document's frame).
+let style_apply = fn(root, size) {
+    let s = (root.style ?? nil)
+    let ch = if s.is_object() { s } else { {} }
+    let pick = (if s.is_object() { s.kit } else { s }).to_string()
+    var kit = nil
+    for name, k in style_kits { if name.to_string() == pick { kit = k } }
+    let p = kit.palette
+    let st = {
+        kit: kit
+        bg: ch.bg ?? p.bg ink: ch.ink ?? p.ink accent: ch.accent ?? p.accent accent2: ch.accent2 ?? p.accent2 muted: ch.muted ?? p.muted
+        display_font: ch.display ?? kit.display.font body_font: ch.body ?? kit.body.font
+        animate: ch.animate ?? kit.animate body_animate: ch.body_animate ?? kit.body_animate
+        speed: ch.speed ?? kit.speed upper: ch.upper ?? kit.upper
+        text3d: (ch.text3d ?? kit.text3d).to_string() kinetic: (ch.kinetic ?? kit.kinetic).to_string().strip_prefix("vjfx/") ?? (ch.kinetic ?? kit.kinetic).to_string()
+        text_effects: kit.text_effects
+    }
+    let w = size.x
+    let h = size.y
+    let u = min(w, h)
+    let k = {w: st_round(w) h: st_round(h) cx: st_round(w * 0.5) cy: st_round(h * 0.5) m: st_round(round(u * 0.06)) u: st_round(u) s: st_round(u / 1080.0)
+             bg: st.bg ink: st.ink accent: st.accent accent2: st.accent2 muted: st.muted}
+    // The author's layers, with the kit's fields where they have none.
+    let layers = root.layers ?? []
+    for l in layers { st_layer(l, st) }
+    let all = []
+    if ch.plate ?? true {
+        let plate = kit.plate(k)
+        if (ch.fx ?? false) && kit.fx != "" { plate.push(Shader{name: "fx" effect: kit.fx size: vec2(k.w, k.h) opacity: 0.55}) }
+        all.push(Group{name: "style.plate" layers: plate})
+    }
+    for l in layers { all.push(l) }
+    if ch.ornaments ?? true {
+        let ornaments = kit.ornaments(k)
+        if ornaments.len() > 0 { all.push(Group{name: "style.ornaments" layers: ornaments}) }
+    }
+    let post = if ch.post ?? true { kit.post } else { [] }
+    // Not grouped: a screen reads the frame under it (`input: @below`), and inside a Group of its
+    // own that would be the empty group.
+    if (ch.post ?? true) && (ch.screen ?? true) { for l in kit.screen(k) { all.push(l) } }
+    root.layers = if post.len() == 0 { all } else { [Group{name: "style.post" size: vec2(w, h) effects: post layers: all}] }
+    st_default(root, @background, st.bg)
+    root.style = nil
+    nil
+}
+
+{style_apply: style_apply style_kits: style_kits}

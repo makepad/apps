@@ -1,0 +1,43 @@
+// A one-prompt showreel inside a vertical Short (after REF-Ac7SuDYTQDc):
+// the reel is a chapter list on the 120 BPM grid; the Short around it
+// plans its bands against the Shorts safe zones.
+use mod.storyboard.*
+
+let story = Row{kind: @story label: "Short"}
+let chapters = Row{kind: @chapters label: "Reel chapters"}
+let voice = Row{kind: @notes label: "On screen"}
+let refs = Row{kind: @refs label: "References"}
+
+let hook = Scene{row: story span: [0.0, 3.0] band: @headline title: "Hook" intent: "ONE PROMPT. Pro motion graphics?" look: "zoom-slam caps, the key word in orange"}
+let prompt = Scene{row: story span: [3.0, 3.5] band: @content title: "The prompt" intent: "a terminal types the one prompt" look: "orange-stroked card, 40 chars/s, block cursor"}
+let wait = Scene{row: story span: [6.5, 1.0] band: @headline title: "The wait" intent: "ONE PROMPT LATER · 45:10 → 45:12"}
+let result = Scene{row: story span: [7.5, 15.5] band: @content title: "It made this" intent: "the 15 s reel plays unedited in a 16:9 inset" look: "93 % width, orange glow border"}
+let honesty = Scene{row: story span: [23.0, 4.0] band: @content title: "Same prompt, 3 runs" intent: "three result cards, staggered 0.5 s"}
+let payoff = Scene{row: story span: [27.0, 3.0] band: @headline title: "1 of 3 finished" intent: "Impressive. Not guaranteed." look: "tracking slam, then the CTA"}
+
+let c1 = Chapter{row: chapters span: [7.5, 2.0] color: #0b0b0b band: @content skill: "EASING" look: "a cubic-bezier draws on, a playhead sweeps, ghost spacing circles" hero: "the orange ball" out: "the ball grows into the next background"}
+let c2 = Chapter{row: chapters span: [9.5, 1.5] color: #ff5a1f band: @content skill: "TYPOGRAPHY" look: "I MAKE THINGS MOVE. by baseline mask, per-letter bounce" hero: "the word MOVE." out: "zoom through the O"}
+let c3 = Chapter{row: chapters span: [11.0, 2.5] color: #f0ebe0 band: @content skill: "PATTERN" look: "truchet tiles, slit-scan strips on every beat" hero: "the tiling" out: "tilts into 3D"}
+let c4 = Chapter{row: chapters span: [13.5, 1.5] color: #101010 band: @content skill: "DIMENSION" look: "an extruded slab, blocks lift and sink" hero: "the slab" out: "camera dive with motion blur"}
+let c5 = Chapter{row: chapters span: [15.0, 2.0] color: #050505 band: @content skill: "PARTICLES" look: "a vortex converges into the word flow, then blows away" hero: "the word flow" out: "a ring becomes the next ball"}
+let c6 = Chapter{row: chapters span: [17.0, 1.0] color: #f0ebe0 band: @content skill: "PRINCIPLES" look: "Squash & Stretch, onion-skin arc" hero: "the bouncing ball" out: "the title smears away"}
+let c7 = Chapter{row: chapters span: [18.0, 1.0] color: #14235a band: @content skill: "SHADERS" look: "an SDF blob, orbiting metaballs, ring text" hero: "the blob" out: "white flash"}
+let c8 = Chapter{row: chapters span: [19.0, 1.5] color: #f0ebe0 band: @content skill: "FUNDAMENTALS" look: "one word per eighth note, each in its own style world" hero: "the words" out: "a circle zooms to camera"}
+let sting = Chapter{row: chapters span: [20.5, 2.0] color: #000000 band: @content skill: "LOGO" look: "MOTION. slams in with a spark burst, glitch on the C" hero: "the orange dot" out: "collapse into the dot"}
+
+let tag = Note{row: voice span: [0.0, 30.0] band: @tag text: "RUNS ITSELF · ONE PROMPT TEST"}
+let meta = Note{row: voice span: [7.5, 15.5] band: @meta text: "● RUN 3 · UNEDITED · MUSIC ALSO FROM CODE · x.x / 15.0 s"}
+let floor = Note{row: voice span: [0.0, 30.0] band: @floor text: "orange grid floor, glowing horizon at 0.80"}
+
+let palette = Ref{row: refs span: [0.0, 30.0] media: @swatch colors: [#f0ebe0, #ff5a1f, #0b0b0b] label: "Cream, orange, ink"}
+
+Storyboard{
+    title: "One prompt showreel"
+    duration: 30.0
+    bpm: 120
+    layout: @shorts
+    format: {width: 1080 height: 1920}
+    style: "Condensed heavy caps + tiny tracked mono; one accent; glow on the key word"
+    rows: [story, chapters, voice, refs]
+    items: [hook, prompt, wait, result, honesty, payoff, c1, c2, c3, c4, c5, c6, c7, c8, sting, tag, meta, floor, palette]
+}

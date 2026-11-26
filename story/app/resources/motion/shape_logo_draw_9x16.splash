@@ -1,0 +1,43 @@
+use mod.motion.*
+// LOGO DRAW-ON, 9:16 — the portrait cut of shape_logo_draw: the badge is
+// drawn at the safe area's centre and lifts 140 px to make room for the
+// wordmark below it; the wordmark is 96 px so ~12 letters fit.
+// Why: the vertical stack (mark over name) is the natural lockup for a
+// tall frame.
+Motion{
+    label: "Logo draw-on 9:16"
+    brief: "A logo mark drawn as a stroke, flooded into a solid badge, then the wordmark; portrait."
+    tags: ["logo", "reveal", "svg", "path", "intro", "9:16"]
+    size: vec2(1080, 1920) duration: 5.0
+    inputs: {
+        mark: input(@text, "M -62 70 L -62 -70 L 62 70 L 62 -70", "SVG path data, one stroke, about 200 px across, centred on 0,0")
+        wordmark: input(@text, "Northwind", "Name under the mark")
+        accent: input(@color, #ff5c39, "Badge colour")
+        ink: input(@color, #f4f7fa, "Stroke and wordmark")
+        background: input(@color, #0b0d12, "Ground")
+    }
+    layers: [
+        Rect{size: vec2(1080, 1920) fill: in(@background)}
+        Group{
+            at: vec2(520, 760)
+            y: tween(0, -140, 2.0, 2.8, @ease_in_out_quint)
+            scale: tween(1.0, 0.8, 2.0, 2.8, @ease_in_out_quint)
+            opacity: tween(1, 0, 4.55, 5.0, @ease_in_cubic)
+            layers: [
+                Ellipse{at: vec2(-180, -180) size: vec2(360, 360) fill: in(@accent)
+                        scale: tween(0, 1, 1.45, 2.1, spring(240, 19))}
+                Ellipse{at: vec2(-180, -180) size: vec2(360, 360) stroke: in(@ink) width: 10 rotate: 180
+                        trim_end: tween(0, 1, 0.2, 1.3, @ease_in_out_cubic)
+                        opacity: tween(1, 0, 1.5, 1.8, @ease_out_cubic)}
+                Path{svg: in(@mark) width: 26 cap: @round join: @round anchor: vec2(0, 0)
+                     stroke: keys([0.0, in(@ink)], [1.5, in(@ink)], [1.75, in(@background), @ease_out_cubic])
+                     trim_end: tween(0, 1, 0.45, 1.5, @ease_in_out_cubic)}
+            ]
+        }
+        Text{text: in(@wordmark) font: Font{family: "Inter" weight: 700} size: 96 tracking: -0.03 color: in(@ink)
+             at: vec2(520, 860) wrap: 840 align: @center
+             by: @letter stagger: 0.035
+             y: keys([2.3, 50], [3.1, 0, @ease_out_expo], [4.5, 0], [4.95, -30, @ease_in_cubic])
+             opacity: keys([2.3, 0], [2.6, 1, @ease_out_cubic], [4.5, 1], [4.9, 0, @ease_in_cubic])}
+    ]
+}

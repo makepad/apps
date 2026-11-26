@@ -95,6 +95,7 @@ pub struct ToolSession {
     pub sculpt: super::sculpt::SculptDraft,
     pub measure: MeasureDraft,
     pub measure_drag: Option<MeasureDrag>,
+    pub fit: super::fit::FitDraft,
     /// Snap under the cursor right now (drives the snap glyph).
     pub snap_cursor: Option<SnapHit>,
     pub section_drag: Option<SectionDrag>,
@@ -120,6 +121,7 @@ impl ToolSession {
         self.sculpt.reset_for_scene();
         self.measure.clear();
         self.measure_drag = None;
+        self.fit.clear();
         self.snap_cursor = None;
         self.section_drag = None;
         self.section_hover = None;

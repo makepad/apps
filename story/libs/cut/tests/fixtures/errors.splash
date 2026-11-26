@@ -1,0 +1,17 @@
+use mod.flow.*
+use mod.cut.*
+
+let a = Clip{src: asset("a1f3", "9c1e") span: [0.0, 4.0]}
+let b = Clip{src: asset("ast_yqzlg4xa4mbgpzs6e2qsuqwhsu", "arev_5ab3f998fd4a7b6860a9337b9924be40ad341d12276e341079ce2093539c715f") span: [3.0, 9.0]}
+let c = Still{span: [0.0, 1.0]}
+let fade = Transition{a: a.out(@frame) span: [3.0, 1.0]}
+let glow = Fx{input: fade.out(@frame) effect: "bloom" p1: keys([1.0, 0.2], [0.5, 0.8])}
+let wobble = Fx{input: glow.out(@frame) effect: "swirl" p2: keys([0.0, 0.0], [1.0, 1.0, @bounce])}
+let out = CutOutput{frame: wobble.out(@frame)}
+
+Flow{
+    kind: @cut
+    output: {width: 1920 height: 1080 fps: 30}
+    duration: 10.0
+    a, b, c, fade, glow, wobble, out
+}

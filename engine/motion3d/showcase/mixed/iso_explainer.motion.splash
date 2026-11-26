@@ -1,0 +1,46 @@
+use mod.motion.*; use mod.scene
+// Isometric explainer: an orthographic 3D diagram (a platform stack on a
+// rippling grid, shapes floating above) built from kits, with vector
+// call-outs drawn over it. The ortho camera pushes in on beat 4.
+Motion{
+    size: vec2(1920, 1080)
+    duration: 6.0
+    bpm: 120
+    layers: [
+        Rect{at: vec2(0, 0) size: vec2(1920, 1080) fill: #eef1f6}
+        Scene3D{
+            at: vec2(0, 0)
+            size: vec2(1920, 1080)
+            bpm: 120
+            environment: scene.Environment{preset: @softbox intensity: 0.9}
+            tone_mapping: @agx
+            exposure: 1.1
+            camera: Camera{
+                preset: @isometric
+                target: vec3(0, 0.9, 0)
+                height: 8
+                move: @push_in move_start: scene.beat(4) move_end: scene.beat(9) move_amount: 0.22
+            }
+            post: [scene.ContactShadows{opacity: 0.5 blur: 0.3 far: 1.5} scene.SSAO{radius: 0.3 intensity: 0.8}]
+            lights: [scene.LightRig{preset: @product target: vec3(0, 0.5, 0)}]
+            children: [
+                scene.Field{preset: @wave_grid grid: 24 spacing: 0.26 height: 0.25 color: #c9d6ee}
+                scene.ShapeSet{preset: @stack start: 0.4 stagger: 0.18 color: #ff5a36 color2: #3f7cff color3: #ffffff position: vec3(0, 0.2, 0)}
+                scene.ShapeSet{preset: @floating start: 1.4 spread: 0.55 position: vec3(0, 2.6, 0) color: #ff5a36 color2: #3f7cff}
+                scene.Ground{shadow_only: true shadow_opacity: 0.35}
+            ]
+        }
+        Group{opacity: tween(0, 1, 1.2, 1.5) layers: [
+            Path{svg: "M 0 0 L 140 -90 L 260 -90" stroke: #1b2233 width: 3 at: vec2(1060, 520) trim_end: tween(0, 1, 1.2, 1.8, @ease_out_cubic)}
+            Text{text: "Core" size: 44 weight: 700 color: #1b2233 at: vec2(1340, 410)}
+            Text{text: "What everything builds on" size: 26 color: #56607a at: vec2(1340, 470)}
+        ]}
+        Group{opacity: tween(0, 1, 2.2, 2.5) layers: [
+            Path{svg: "M 0 0 L -160 90 L -380 90" stroke: #1b2233 width: 3 at: vec2(820, 700) trim_end: tween(0, 1, 2.2, 2.8, @ease_out_cubic)}
+            Text{text: "Modules" size: 44 weight: 700 color: #1b2233 at: vec2(160, 770)}
+            Text{text: "Stacked, swappable, animated" size: 26 color: #56607a at: vec2(160, 830)}
+        ]}
+        Text{text: "How it fits together" size: 72 weight: 800 color: #1b2233 at: vec2(120, 110) by: @word stagger: 0.12
+             opacity: tween(0, 1, 0.2, 0.7) y: tween(30, 0, 0.2, 0.8, @ease_out_back)}
+    ]
+}

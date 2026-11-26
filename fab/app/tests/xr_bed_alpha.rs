@@ -84,7 +84,7 @@ fn pass_numbers(app: TestApp) -> (Pass, Pass) {
 fn settled(app: &TestApp, seq: &mut u64, ready: impl Fn(&Pass) -> bool) -> Pass {
     let (mut best, mut lines) = (Pass::default(), 0);
     wait_poll(app, || {
-        if let Ok(t) = app.log_since(*seq) {
+        { let t = app.log_since(*seq).expect("the app's log");
             *seq = t.last_seq;
             for l in &t.lines {
                 let Some(r) = l.split("fab xr pass: left eye ").nth(1) else { continue };

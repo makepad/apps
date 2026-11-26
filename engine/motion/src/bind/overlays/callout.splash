@@ -1,0 +1,46 @@
+use mod.motion.*
+// A callout bubble that tracks a widget: above it when the widget is in the
+// lower half of the frame, below it otherwise, with a pointer on the widget.
+let r = run()
+let w = fn(t) { return r.widget(in(@target), t, {pad: 8}) }
+let below = fn(t) { let b = w(t) return b.centre[1] < in(@frame).y * 0.5 }
+let bubble_at = fn(t) {
+    let b = w(t)
+    let x = b.centre[0] - in(@width) * 0.5
+    let left = 24
+    let right = in(@frame).x - in(@width) - 24
+    if x < left { x = left }
+    if x > right { x = right }
+    if below(t) { return [x, b.at[1] + b.size[1] + 36] }
+    return [x, b.at[1] - 36 - in(@height)]
+}
+let pop = fn(t) { let p = w(t).presence return 0.85 + 0.15 * p }
+Motion{
+    label: "Callout (tracks a widget)"
+    size: vec2(1080, 1920)
+    duration: 3600.0
+    inputs: {
+        target: input(@text, "", "Widget path the callout points at (\"main.save\")")
+        text: input(@text, "Saves instantly", "What the callout says")
+        frame: input(@vec2, vec2(1080, 1920), "The document size (the host sets the output size)")
+        width: input(@number, 520, "Bubble width")
+        height: input(@number, 132, "Bubble height")
+        fill: input(@color, #151a22, "Bubble colour")
+        color: input(@color, #ffffff, "Text colour")
+        accent: input(@color, #ffc933, "Pointer and edge colour")
+    }
+    layers: [
+        Rect{name: "pointer"
+            at: fn(t) { let b = w(t) if below(t) { return [b.centre[0] - 17, b.at[1] + b.size[1] + 5] } return [b.centre[0] - 17, b.at[1] - 39] }
+            size: vec2(34, 34) rotate: 45 radius: 4 fill: in(@fill) stroke: in(@accent) width: 3
+            opacity: fn(t) { return w(t).presence }}
+        Rect{name: "bubble"
+            at: fn(t) { return bubble_at(t) }
+            size: fn(t) { return [in(@width), in(@height)] } radius: 26 fill: in(@fill) stroke: in(@accent) width: 3
+            opacity: fn(t) { return w(t).presence }}
+        Text{name: "label"
+            text: in(@text) font: Font{family: "Inter" weight: 700} size: 46 color: in(@color) align: @center
+            at: fn(t) { let p = bubble_at(t) return [p[0] + in(@width) * 0.5, p[1] + in(@height) * 0.5 - 28] }
+            opacity: fn(t) { return w(t).presence }}
+    ]
+}

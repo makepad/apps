@@ -1,0 +1,37 @@
+use mod.motion.*
+// Colours as numbers for Draw2D: a #hex colour as [r, g, b, a] with any alpha, and blends between two colours, in linear light or rounded to 8 bits per channel.
+//
+// Draw2D takes a colour as #hex, rgba(…) (8 bits a channel, alpha too) or a list [r, g, b, a]
+// (0..1 as written, sRGB; alpha unrounded): these give the list.
+//
+//   use mod.motion.modules.color.*
+//   c.text("loss", 0, 0, {px: 40 color: color_rgba(#eee9df, 0.6 * fade_in)})
+//   c.rect(0, 0, 40, 40, color_mix(#ff4d12, #eee9df, cool, 1.0), 1.0)
+
+// [r, g, b, a]: the colour's channels (0..1, as written) with alpha `a`.
+let color_rgba = fn(c, a) { return [c.r, c.g, c.b, a] }
+// Between colours `a` and `b` (k 0..1) channel by channel as written (sRGB), each rounded to
+// 8 bits, as a CSS rgb() colour carries it; alpha `alpha`.
+let color_mix8 = fn(a, b, k, alpha) {
+    let ch = fn(x, y) {
+        let x8 = floor(x * 255.0 + 0.5)
+        let y8 = floor(y * 255.0 + 0.5)
+        return floor(x8 + (y8 - x8) * k + 0.5) / 255.0
+    }
+    return [ch(a.r, b.r), ch(a.g, b.g), ch(a.b, b.b), alpha]
+}
+// One channel as written (sRGB) in linear light, and back.
+let srgb_to_linear_ch = fn(x) { if x <= 0.04045 { return x / 12.92 } return pow((x + 0.055) / 1.055, 2.4) }
+let linear_to_srgb_ch = fn(x) { if x <= 0.0031308 { return x * 12.92 } return 1.055 * pow(x, 1.0 / 2.4) - 0.055 }
+// Between colours `a` and `b` (k 0..1) in linear light (no muddy middle), as written; alpha `alpha`.
+let color_mix = fn(a, b, k, alpha) {
+    let ch = fn(x, y) {
+        let lx = srgb_to_linear_ch(x)
+        return linear_to_srgb_ch(lx + (srgb_to_linear_ch(y) - lx) * k)
+    }
+    return [ch(a.r, b.r), ch(a.g, b.g), ch(a.b, b.b), alpha]
+}
+// [r, g, b]: the colour in linear light (what light sums, glows and seg_rgb's values over 1 are in).
+let color_linear = fn(c) { return [srgb_to_linear_ch(c.r), srgb_to_linear_ch(c.g), srgb_to_linear_ch(c.b)] }
+
+{color_rgba: color_rgba color_mix8: color_mix8 color_mix: color_mix color_linear: color_linear}

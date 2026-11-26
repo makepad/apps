@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36">
+  <!-- Create tray template glyph: two cursors meeting; black on transparent, the OS tints it -->
+  <g id="glyph"><polygon points="17.20,17.20 17.20,3.14 13.37,6.59 10.30,0.33 7.74,1.61 10.68,7.74 5.70,7.74" fill="#000" stroke="#000" stroke-width="1.4" stroke-linejoin="round"/><polygon points="18.80,18.80 18.80,32.86 22.63,29.41 25.70,35.67 28.26,34.39 25.32,28.26 30.30,28.26" fill="#000" stroke="#000" stroke-width="1.4" stroke-linejoin="round"/></g>
+</svg>

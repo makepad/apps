@@ -1,0 +1,42 @@
+# Voiceovers and subtitles for Stage's edits: voice
+# takes from TTS, their word timings, transcription of sources without a
+# script, the `vj-lyrics` v5 word timing file, SRT and WebVTT sidecars and
+# publishing takes and transcripts. Worker-safe: no UI, no platform loop.
+[package]
+name = "makepad-story-edit-voice"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[features]
+default = ["publish", "kokoro", "tts-timings", "transcribe", "align"]
+# Takes published to the asset store as `Audio` assets with waveform thumbnails.
+publish = ["dep:makepad-asset-client", "dep:jpeg-encoder"]
+# Kokoro-82M text-to-speech (Apache-2.0 weights): the default voice engine.
+kokoro = ["dep:makepad-ai-speech", "makepad-ai-speech/kokoro"]
+# IndexTTS-2.5 voice cloning. Opt-in: its weights are under the bilibili
+# Model Use License (restricted; review the model card before production or
+# commercial use), and it loads ~7 GB.
+indextts = ["dep:makepad-ai-speech", "makepad-ai-speech/indextts"]
+# Transcription of sources without a script: local whisper through the
+# karaoke alignment core (`makepad-audio-lyrics`).
+transcribe = ["dep:makepad-ai-speech", "makepad-ai-speech/whisper", "dep:makepad-audio-lyrics"]
+# Kokoro's own word timings and whisper forced alignment of
+# known text (used when the host gives a Synthesizer an aligner).
+tts-timings = ["kokoro"]
+align = ["transcribe"]
+
+[dependencies]
+makepad-story-cut = { path = "../cut" }
+makepad-asset-client = { path = "../../../../apps/engine/asset/client", optional = true }
+makepad-asset-data = { path = "../../../../apps/engine/asset/data" }
+makepad-strict-json = { path = "../../../../../libs/strict_json" }
+# The take's waveform thumbnail.
+jpeg-encoder = { path = "../../../../../libs/jpeg-encoder", version = "0.6.1", optional = true }
+makepad-ai-speech = { path = "../../../../../libs/ai/models/speech", default-features = false, optional = true }
+makepad-audio-lyrics = { path = "../../../../apps/engine/audio_lyrics", optional = true }
+
+[dev-dependencies]
+# A real store over loopback for the publish test.
+makepad-asset-store = { path = "../../../../apps/engine/asset/store" }

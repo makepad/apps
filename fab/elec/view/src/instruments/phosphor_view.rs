@@ -695,6 +695,9 @@ pub struct PhosphorView {
     frame_interval: Option<f64>,
     #[rust]
     next_frame: NextFrame,
+    /// Why the last draw recorded no new picture step, or `None` when it recorded one.
+    #[rust]
+    no_step: Option<&'static str>,
 }
 
 impl ScriptHook for PhosphorView {
@@ -715,6 +718,10 @@ impl PhosphorView {
     /// Axes of the picture actually accumulated, not merely an uploaded or queued frame.
     pub fn picture_map(&self) -> Option<PhosphorMap> { self.picture_map }
 
+    /// Why the last draw recorded no new step of the live picture, or `None` when it recorded one.
+    /// For diagnostics: a test or a log can say which wait kept the picture.
+    pub fn why_no_step(&self) -> Option<&'static str> { self.no_step }
+
     /// The newest waveform shown repeats a steady source's values from this trigger-relative time.
     pub fn held(&self) -> Option<f64> { self.held }
 
@@ -732,7 +739,21 @@ impl PhosphorView {
     pub fn set_twin_channel(&mut self, channel: Option<[f32; 4]>) { self.twin_channel = channel; }
     pub(super) fn set_twin_preview(&mut self, preview: bool) { self.twin_preview = preview; }
 
-    pub fn set_waterfall(&mut self, on: bool) { self.waterfall_on = on; }
+    pub fn set_waterfall(&mut self, on: bool) {
+        if self.waterfall_on && !on {
+            self.waterfall_pending = false;
+            if let Some(ring) = &mut self.waterfall {
+                ring.recorded = None;
+                ring.clear = true;
+            }
+        }
+        self.waterfall_on = on;
+    }
+
+    /// The pass that writes the waterfall's retained rows.
+    pub fn waterfall_pass(&self) -> Option<DrawPassId> {
+        self.waterfall.as_ref().map(|ring| ring.pass.draw_pass_id())
+    }
 
     /// While set, the raster keeps this logical size and the picture is stretched to the drawn rect
     /// (a display-only drag keeps its picture until the release lets the raster follow the rect).
@@ -747,6 +768,7 @@ impl PhosphorView {
 
     /// Draw the kept ring under the scope; newest row first, with the phosphor palette.
     pub fn draw_waterfall(&mut self, cx: &mut Cx2d, rect: Rect) {
+        if !self.waterfall_on { return; }
         let Some(ring) = &self.waterfall else { return };
         let vars = &mut self.draw_waterfall_grade.draw_vars;
         vars.set_texture(0, &ring.texture);
@@ -758,6 +780,7 @@ impl PhosphorView {
     }
 
     fn waterfall_row(&mut self, cx: &mut Cx2d) {
+        if !self.waterfall_on { return; }
         let Some(ring) = &mut self.waterfall else { return };
         if !ring.clear && unpainted(cx, &ring.pass, ring.recorded).is_some() { attach_unpainted(cx, &ring.pass); return; }
         if !ring.clear && !self.waterfall_pending { return; }
@@ -1143,8 +1166,9 @@ impl PhosphorView {
         }
     }
 
-    fn update_picture(&mut self, cx: &mut Cx2d, dt: f64) {
-        let Some(pictures) = &self.pictures else { return };
+    /// Records this draw's step of the picture. Returns why it recorded none, or `None` when it did.
+    fn update_picture(&mut self, cx: &mut Cx2d, dt: f64) -> Option<&'static str> {
+        let Some(pictures) = &self.pictures else { return Some("no picture yet") };
         let waiting = pictures.unpainted(cx).is_some();
         if self.clear_pending && !self.freeze_pending {
             // A clear replaces the step still waiting for its paint.
@@ -1152,13 +1176,23 @@ impl PhosphorView {
             if self.accumulate(cx, Some(Blend { keep: 0.0, scale: 0.0 }), Dirty::default()) {
                 self.clear_pending = false;
                 self.picture_has_data = false;
+                None
+            } else {
+                Some("accumulate shader warming up")
             }
         } else if waiting {
             // The step an earlier drawing recorded is the picture; the next one follows its paint, and the time
             // until then still decays it.
             attach_unpainted(cx, &pictures.passes[pictures.current]);
             self.persistence.idle(dt);
-        } else if !self.freeze_pending && !self.waterfall_pending && (self.stretch.is_none() || self.pending_hits) {
+            Some("previous step unpainted")
+        } else if self.freeze_pending {
+            Some("freeze pending")
+        } else if self.waterfall_pending {
+            Some("waterfall row pending")
+        } else if self.stretch.is_some() && !self.pending_hits {
+            Some("stretched picture kept with no new frame")
+        } else {
             let frame = self.uploaded.as_ref().filter(|_| self.pending_hits);
             let swept = frame.is_some_and(Hits::swept);
             let dirty = frame.map_or(Dirty::default(), |hits| hits.dirty);
@@ -1174,13 +1208,17 @@ impl PhosphorView {
                     std::mem::swap(&mut self.persistence, &mut self.trial);
                     if swept { self.picture_has_data = true; self.picture_map = map; self.refresh_stretch(); }
                     self.pending_hits = false;
+                    None
                 } else {
                     // Shader warm-up retains both the queued frame and its elapsed decay.
                     self.persistence.idle(dt);
+                    Some("accumulate shader warming up")
                 }
             } else {
                 std::mem::swap(&mut self.persistence, &mut self.trial);
+                let why = if self.pending_hits { "frame has no waveforms" } else { "no pending frame" };
                 self.pending_hits = false;
+                Some(why)
             }
         }
     }
@@ -1233,6 +1271,7 @@ impl WidgetNode for PhosphorView {
 
 impl Widget for PhosphorView {
     fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.no_step = Some("draw returned before the picture update");
         let rect = cx.walk_turtle(walk);
         cx.add_rect_area(&mut self.area, rect);
         let dpi = cx.current_dpi_factor();
@@ -1282,14 +1321,14 @@ impl Widget for PhosphorView {
         // While waiting, one grading quad samples the old picture and its already cached glow.
         let refresh_glow = glow_on && (self.stretch.is_none() || self.pending_hits || self.pictures.as_ref().is_some_and(|pictures| pictures.unpainted(cx).is_some()));
         if refresh_glow { self.begin_glow(cx); }
-        self.update_picture(cx, dt);
+        self.no_step = self.update_picture(cx, dt);
         if let Some(mut twin) = self.twin.take() {
             twin.exchange(self);
             self.last_draw = Some(now);
             self.refresh_stretch();
             self.check_pending_map();
             let waterfall_pending = std::mem::replace(&mut self.waterfall_pending, false);
-            self.update_picture(cx, dt);
+            let _ = self.update_picture(cx, dt);
             self.waterfall_pending = waterfall_pending;
             twin.exchange(self);
             self.twin = Some(twin);
@@ -1321,7 +1360,8 @@ impl Widget for PhosphorView {
         vars.set_uniform(cx, id!(channel), &self.channel);
         self.draw_grade.draw_abs(cx, rect);
 
-        if (self.pending_hits || self.clear_pending || self.freeze_pending || self.twin.as_ref().is_some_and(|twin| twin.pending_hits || twin.clear_pending) || self.waterfall.as_ref().is_some_and(|ring| ring.clear)) && !cx.next_frame_is_pending(self.next_frame) {
+        let clear_waterfall = self.waterfall_on && self.waterfall.as_ref().is_some_and(|ring| ring.clear);
+        if (self.pending_hits || self.clear_pending || self.freeze_pending || self.twin.as_ref().is_some_and(|twin| twin.pending_hits || twin.clear_pending) || clear_waterfall) && !cx.next_frame_is_pending(self.next_frame) {
             self.next_frame = cx.new_next_frame();
         }
         DrawStep::done()

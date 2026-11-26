@@ -1,0 +1,48 @@
+use mod.motion.*
+
+// Transitions & camera 2: one card of the transitions reel. The deck's cut places six of these
+// (params: {card: 0..5}) and joins them with five transition presets; each card names the
+// transition it arrived by, so the reel explains itself. Cards differ in ground (one is light)
+// so every transition reads.
+let look = import("shared/motion_deck_look")
+
+let CARDS = [
+    {name: "Five ways in." preset: "the slide transitions of DECK and CUT" ground: #090a0d ink: #f0ede6 mark: #74d4f2},
+    {name: "Push" preset: "105_trans_push" ground: #10262a ink: #f0ede6 mark: #5fb9a6},
+    {name: "Slide over" preset: "521_trans_slide_over" ground: #ece8df ink: #0c0d10 mark: #2b7a8f},
+    {name: "Motion blur" preset: "557_trans_tangent_motion_blur" ground: #14161b ink: #f0ede6 mark: #74d4f2},
+    {name: "Directional" preset: "522_trans_directional_scaled" ground: #1d2a3a ink: #f0ede6 mark: #f0a27a},
+    {name: "Dissolve" preset: "101_trans_dissolve" ground: #090a0d ink: #f0ede6 mark: #74d4f2}
+]
+// Each Graphic of the reel loads its own instance with its card input.
+let CARD = CARDS[int(clamp(in(@card, 0), 0, 5))]
+let IS_INTRO = in(@card, 0) < 0.5
+
+let ground = fn(c, t, edit) { c.rect(0, 0, 1920, 1080, CARD.ground, 1) }
+let draw = fn(c, t, edit) {
+    look.folio(c, 99.0, "14", "Transitions and camera")
+    c.text(CARD.preset, 164, 680, {font: if IS_INTRO { look.TEXT } else { look.MONO } px: 30 color: CARD.ink alpha: 0.62})
+    if IS_INTRO {
+        c.text("push, slide over, motion blur, directional, dissolve", 164, 730, {font: look.TEXT px: 30 color: CARD.ink alpha: 0.62})
+    }
+    c.rect(164, 760, 120, 3, CARD.mark, 0.9)
+}
+
+Motion{
+    label: "Transitions reel card"
+    size: vec2(1920, 1080)
+    duration: 600.0
+    fps: 60
+    color: @hdr
+    background: look.INK
+    inputs: {card: 0}
+    layers: [
+        Draw2D{name: "ground" size: vec2(1920, 1080) draw: ground}
+        // A wide, very soft disc of the card's mark colour drifting behind the word.
+        Ellipse{name: "glow" size: vec2(760, 760) fill: CARD.mark opacity: 0.16 feather: 260
+            at: fn(t) { vec2(960 + 50 * sin(live() * 0.2), 180) }}
+        Draw2D{name: "card" size: vec2(1920, 1080) draw: draw}
+        Text{name: "name" text: CARD.name font: look.TITLE size: 112 color: CARD.ink at: vec2(160, 460)}
+    ]
+    post: look.post_chain(look.POST)
+}

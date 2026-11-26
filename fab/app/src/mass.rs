@@ -18,7 +18,7 @@ impl App {
             let figures = same.as_ref().and_then(|m| m.figures.clone());
             let ai = same.is_some_and(|m| m.ai);
             self.state.params.mass = Some(MassShown { object: object.into(), panel: true, ai, figures });
-            self.ask_mass(object);
+            self.ask_mass(object, true);
         } else {
             // closing the row puts the marker away, the AI's pointing too
             self.state.params.mass = None;
@@ -26,10 +26,10 @@ impl App {
         fab::ui::redraw(cx, &[ids!(tool_overlay)]);
     }
 
-    fn ask_mass(&mut self, object: &str) {
+    fn ask_mass(&mut self, object: &str, person: bool) {
         if let Some(host) = &mut self.host {
             let args = json::obj(vec![("what", json::s("mass")), ("object", json::s(object)), ("outline", Value::Bool(true))]);
-            self.mass_call = Some(host.call("measure", args));
+            self.mass_call = Some(if person { host.call_as_person("measure", args) } else { host.call("measure", args) });
         }
     }
 
@@ -58,7 +58,7 @@ impl App {
             if let Some(object) = selected.filter(|s| weighed.contains(s)).or_else(|| weighed.first().cloned()) {
                 let panel = self.state.params.mass.as_ref().is_some_and(|m| m.panel && m.object == object);
                 self.state.params.mass = Some(MassShown { object: object.clone(), panel, ai: true, figures: None });
-                self.ask_mass(&object);
+                self.ask_mass(&object, false);
             }
         }
         if self.mass_call == Some(done.id) {
@@ -80,7 +80,7 @@ impl App {
                 m.ai = false;
                 if m.panel {
                     let object = m.object.clone();
-                    self.ask_mass(&object);
+                    self.ask_mass(&object, false);
                 } else {
                     self.state.params.mass = None;
                 }

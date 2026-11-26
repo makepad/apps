@@ -1,0 +1,38 @@
+use mod.motion.*
+use mod.post
+
+let look = import("look.splash")
+let MARK = {width: 24 travel: 16 ease: @linear}
+let LENS = {zoom: 1.0 shade: 0.4}
+
+let editor_panel = fn() {
+    View{
+        PanelModule{title: "Waterline"
+            PanelSlider{path: "MARK.width" min: 12 max: 96}
+            PanelNumber{path: "MARK.travel" min: 4 max: 48}
+            PanelEase{path: "MARK.ease"}
+            PanelMacro{label: "Wide shallows" targets: "MARK.width 12 96, MARK.travel 48 4"}
+        }
+        PanelModule{title: "Camera and shade"
+            PanelKnob{path: "LENS.zoom" min: 0.5 max: 2}
+            PanelSlider{path: "LENS.shade" min: 0.1 max: 0.8}
+        }
+        PanelModule{title: "Gauge label"
+            PanelColor{path: "look.INK"}
+            PanelFont{path: "look.FACE"}
+        }
+    }
+}
+
+Motion{
+    size: vec2(160, 90) duration: 2 background: #193442
+    inputs: {rise: 0}
+    color: @hdr post: [post.Vignette{amount: LENS.shade}]
+    layers: [
+        Camera{name: "gauge" span: [0.25, 1.5] zoom: LENS.zoom layers: [
+            Text{name: "label" text: "Tide" at: vec2(20, 12) size: 16 font: look.FACE color: look.INK}
+        ]}
+        Rect{name: "waterline" span: [0.5, 1] at: vec2(20, 52) size: vec2(MARK.width, 4) fill: #70b6c4
+            y: tween(in(@rise, 0) * MARK.travel, 0, 0, 1, MARK.ease)}
+    ]
+}

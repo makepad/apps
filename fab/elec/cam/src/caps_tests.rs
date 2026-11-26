@@ -1,4 +1,4 @@
-use crate::caps::{apply_capabilities, board_limits};
+use crate::caps::{apply_capabilities, board_limits, raised_rules};
 use crate::profile::Capabilities;
 use fab_elec_board::{Anchor, Board, BoardNet, CustomRule, Flash, Origin, RuleCode, RuleSet, Rules, Tent, Track, Via, ViaKind};
 use fab_elec_core::{mm, BoardId, ClassId, ContentHash, Contour, ItemId, LayerId, NetId, Path, Severity, P};
@@ -23,6 +23,7 @@ fn factory_minima_and_board_capabilities() {
         flash: Flash::All,
     });
     board.next_item = 4;
+    assert!(raised_rules(&board, &caps, "house").is_empty(), "a new board inherits every minimum");
     board.rules.base.track = Some(mm(0.1));
     board.rules.base.clearance = Some(mm(0.1));
     board.rules.base.drill = Some(mm(0.25));
@@ -31,6 +32,10 @@ fn factory_minima_and_board_capabilities() {
         name: "local minima".into(), when: RuleCode { id: 0, hash: ContentHash([0; 16]), at: (0, 0) },
         layers: None, set: RuleSet { track: Some(mm(0.1)), clearance: Some(mm(0.2)), drill: Some(mm(0.2)), ..RuleSet::default() }, severity: Severity::Error,
     });
+    let findings = raised_rules(&board, &caps, "house");
+    assert_eq!(findings.iter().map(|v| v.rule.as_str()).collect::<Vec<_>>(),
+        ["factory:house:track", "factory:house:clearance", "factory:house:drill", "factory:house:annular"]);
+    assert!(findings.iter().all(|v| v.severity == Severity::Warning && !v.fix_hint.is_empty()));
     let original = board.rules.clone();
     let raised = apply_capabilities(&board.rules, &caps);
     let mut expected = original.clone();

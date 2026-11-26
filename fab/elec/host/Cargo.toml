@@ -22,6 +22,8 @@ fab-elec-route = { path = "../route" }
 fab-elec-parts = { path = "../parts" }
 fab-elec-bench = { path = "../bench" }
 fab-elec-cam = { path = "../cam" }
+fab-elec-req = { path = "../req" }
+fab-elec-bom = { path = "../bom" }
 
 [dev-dependencies]
 fab-elec-route = { path = "../route", features = ["test-hooks"] }

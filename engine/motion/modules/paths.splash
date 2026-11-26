@@ -1,0 +1,293 @@
+use mod.motion.*
+// Polylines as data: shapes built as point lists, measured, sampled, resampled, offset, routed and hit-tested (construction at load, in double precision).
+//
+// A path is a flat list [x0, y0, x1, y1, …] (any units, any y direction); a point is a record
+// pt(x, y) = {x y} (double precision; vec2 is single). Shapes, closed ones repeat their first point:
+//   segment(a, b)  path([pts])  poly([pts]) (closed)  rect(corner, w, h) (h toward -y)
+//   arc(c, r, a0, a1, n)  ellipse(c, rx, ry, rot, n) (from the top, clockwise)  cubic(p0, p1, p2, p3, n)
+//   spline([pts], n)  spline_closed([pts], n) (Catmull-Rom through the points, n samples a span)
+// Measure and sample: lengths(p) (running length at each point), lengths32(p) (the same, each kept
+// at single precision as a Float32Array holds it), path_length(p), point_at(p, L, s) (the pt at
+// length s), resample(p, n, L), mix_paths(a, b, k, arc), align_paths(a, b), sub_path(p, i0, i1), path_bounds(p).
+// Shape them: offset_path(p, d, closed) (sideways, mitred), octilinear(p, closed, step, grid)
+// (routed at 0/45/90° on a grid, like a circuit trace), inside_path(x, y, p) (even-odd).
+//
+//   use mod.motion.modules.paths.*
+//   let wing = spline([pt(0, 0), pt(1, 0.6), pt(2.4, 0.5)], 12)
+//   let L = lengths(wing)
+//   let tip = point_at(wing, L, L[L.len() - 1] * ease(@ease_out_cubic, prog(t, 1.0, 1.8)))
+
+let pt = fn(x, y) { {x: x y: y} }
+let segment = fn(a, b) { [a.x, a.y, b.x, b.y] }
+// An open path through the points.
+let path = fn(ps) {
+    let out = []
+    for p in ps { out.push(p.x) out.push(p.y) }
+    return out
+}
+// A closed path through the points (the first point again at the end).
+let poly = fn(ps) {
+    let out = path(ps)
+    out.push(ps[0].x)
+    out.push(ps[0].y)
+    return out
+}
+// A rectangle from corner `c`, `w` toward +x and `h` toward -y (the top-left corner with y up).
+let rect = fn(c, w, h) { poly([c, pt(c.x + w, c.y), pt(c.x + w, c.y - h), pt(c.x, c.y - h)]) }
+// A circular arc from angle a0 to a1 (radians, counter-clockwise with y up), n segments.
+let arc = fn(c, r, a0, a1, n) {
+    let out = []
+    for i in 0..(n + 1) {
+        let a = a0 + (a1 - a0) * (i / n)
+        out.push(c.x + r * cos(a))
+        out.push(c.y + r * sin(a))
+    }
+    return out
+}
+// An ellipse round `c` (radii rx, ry, turned by `rot`), n segments from the top, clockwise; closed.
+let ellipse = fn(c, rx, ry, rot, n) {
+    let co = cos(rot)
+    let si = sin(rot)
+    let out = []
+    for i in 0..(n + 1) {
+        let a = PI / 2.0 + (-1.0 * TAU * i) / n
+        let x = rx * cos(a)
+        let y = ry * sin(a)
+        out.push(c.x + co * x - si * y)
+        out.push(c.y + si * x + co * y)
+    }
+    return out
+}
+// A cubic Bezier from p0 to p3 (controls p1, p2), n segments.
+let cubic = fn(p0, p1, p2, p3, n) {
+    let out = []
+    for i in 0..(n + 1) {
+        let t = i / n
+        let u = 1.0 - t
+        out.push(u * u * u * p0.x + 3.0 * u * u * t * p1.x + 3.0 * u * t * t * p2.x + t * t * t * p3.x)
+        out.push(u * u * u * p0.y + 3.0 * u * u * t * p1.y + 3.0 * u * t * t * p2.y + t * t * t * p3.y)
+    }
+    return out
+}
+// One Catmull-Rom span p1 -> p2 (p0, p3 its neighbours), n samples from p1 (p2 left out), onto `out`.
+let catmull_span = fn(out, p0, p1, p2, p3, n) {
+    for k in 0..n {
+        let t = k / n
+        let t2 = t * t
+        let t3 = t2 * t
+        out.push(0.5 * (2.0 * p1.x + (0.0 - p0.x + p2.x) * t + (2.0 * p0.x - 5.0 * p1.x + 4.0 * p2.x - p3.x) * t2 + (0.0 - p0.x + 3.0 * p1.x - 3.0 * p2.x + p3.x) * t3))
+        out.push(0.5 * (2.0 * p1.y + (0.0 - p0.y + p2.y) * t + (2.0 * p0.y - 5.0 * p1.y + 4.0 * p2.y - p3.y) * t2 + (0.0 - p0.y + 3.0 * p1.y - 3.0 * p2.y + p3.y) * t3))
+    }
+}
+// A Catmull-Rom curve through the points (the ends' neighbours are the ends), n samples a span.
+let spline = fn(ps, n) {
+    let out = []
+    let m = ps.len()
+    if m > 1 { for i in 0..(m - 1) { catmull_span(out, ps[max(0, i - 1)], ps[i], ps[i + 1], ps[min(m - 1, i + 2)], n) } }
+    out.push(ps[m - 1].x)
+    out.push(ps[m - 1].y)
+    return out
+}
+// The same round a loop of points; closed.
+let spline_closed = fn(ps, n) {
+    let out = []
+    let m = ps.len()
+    for i in 0..m { catmull_span(out, ps[(i - 1 + m) % m], ps[i], ps[(i + 1) % m], ps[(i + 2) % m], n) }
+    out.push(out[0])
+    out.push(out[1])
+    return out
+}
+
+// The running length at each point: L[0] = 0, L[i] the length up to point i.
+let lengths = fn(p) {
+    let n = p.len() / 2
+    let L = [0.0]
+    if n > 1 { for i in 1..n {
+        let dx = p[2 * i] - p[2 * i - 2]
+        let dy = p[2 * i + 1] - p[2 * i - 1]
+        L.push(L[i - 1] + sqrt(dx * dx + dy * dy))
+    } }
+    return L
+}
+// lengths(p) with every running length kept at single precision, as a Float32Array holds them
+// (for timing laid out against such a table).
+let lengths32 = fn(p) {
+    let n = p.len() / 2
+    let L = [0.0]
+    if n > 1 { for i in 1..n {
+        let dx = p[2 * i] - p[2 * i - 2]
+        let dy = p[2 * i + 1] - p[2 * i - 1]
+        L.push(vec2(L[i - 1] + sqrt(dx * dx + dy * dy), 0.0).x)
+    } }
+    return L
+}
+let path_length = fn(p) { let L = lengths(p) return L[L.len() - 1] }
+// The point pt(x, y) at length s along the path (clamped to its ends); `L` its lengths.
+let point_at = fn(p, L, s0) {
+    let n = p.len() / 2
+    if n < 2 { return pt(p[0], p[1]) }
+    let s = clamp(s0, 0.0, L[n - 1])
+    var lo = 0
+    var hi = n - 1
+    while hi - lo > 1 {
+        let m = floor((lo + hi) / 2)
+        if L[m] < s { lo = m } else { hi = m }
+    }
+    let u = (s - L[lo]) / max(0.000000001, L[hi] - L[lo])
+    return pt(p[2 * lo] + (p[2 * hi] - p[2 * lo]) * u, p[2 * lo + 1] + (p[2 * hi + 1] - p[2 * lo + 1]) * u)
+}
+// The path as n points evenly spaced along it (by its lengths `L`, lengths(p) when nil).
+let resample = fn(p, n, L = nil) {
+    let LL = L ?? lengths(p)
+    let tot = LL[LL.len() - 1]
+    let out = []
+    for i in 0..n {
+        let q = point_at(p, LL, (tot * i) / (n - 1))
+        out.push(q.x)
+        out.push(q.y)
+    }
+    return out
+}
+// `mix_paths(a, b, k, arc = 0)` and `align_paths(a, b)` are native (mod.motion): any two paths (a point
+// list, or a list of point lists for several contours) are paired contour by contour (extra contours
+// collapse to a point at the nearest centre of the other path), given equal point counts by splitting
+// the longest segments, started and wound where the points travel least; `mix_paths` moves each point k
+// 0..1 of the way (a straight line, or an arc turning `arc` radians), `align_paths` returns [a, b] so you
+// can mix them yourself.
+// Points i0 to i1 (inclusive) of a path.
+let sub_path = fn(p, i0, i1) {
+    let out = []
+    if i1 >= i0 { for i in i0..(i1 + 1) { out.push(p[2 * i]) out.push(p[2 * i + 1]) } }
+    return out
+}
+// [x0, y0, x1, y1]: the box round the path.
+let path_bounds = fn(p) {
+    var x0 = p[0]
+    var y0 = p[1]
+    var x1 = p[0]
+    var y1 = p[1]
+    let n = p.len() / 2
+    if n > 1 { for i in 1..n { x0 = min(x0, p[2 * i]) x1 = max(x1, p[2 * i]) y0 = min(y0, p[2 * i + 1]) y1 = max(y1, p[2 * i + 1]) } }
+    return [x0, y0, x1, y1]
+}
+
+// The unit normal [nx, ny] to the left of a -> b (+90°); a zero-length segment's is unscaled.
+let side_normal = fn(ax, ay, bx, by) {
+    let dx = bx - ax
+    let dy = by - ay
+    var l = sqrt(dx * dx + dy * dy)
+    if l == 0.0 { l = 1.0 }
+    return [0.0 - dy / l, dx / l]
+}
+// The path moved `d` sideways (to the left of its direction; negative: right), corners mitred and
+// the mitre held to twice `d`. A closed path (last point = first) joins round its seam.
+let offset_path = fn(p, d, closed) {
+    let n = p.len() / 2
+    let out = []
+    for i in 0..n {
+        var ai = i - 1
+        var bi = i + 1
+        if closed { if i == 0 { ai = n - 2 } if i == n - 1 { bi = 1 } }
+        let px = p[2 * i]
+        let py = p[2 * i + 1]
+        var nx = 0.0
+        var ny = 0.0
+        let has1 = ai >= 0
+        let has2 = bi < n
+        if has1 && has2 {
+            let n1 = side_normal(p[2 * ai], p[2 * ai + 1], px, py)
+            let n2 = side_normal(px, py, p[2 * bi], p[2 * bi + 1])
+            nx = n1[0] + n2[0]
+            ny = n1[1] + n2[1]
+            var l = sqrt(nx * nx + ny * ny)
+            if l == 0.0 { l = 1.0 }
+            nx = nx / l
+            ny = ny / l
+            let k = 1.0 / max(0.5, nx * n1[0] + ny * n1[1])
+            nx = nx * k
+            ny = ny * k
+        } elif has1 {
+            let n1 = side_normal(p[2 * ai], p[2 * ai + 1], px, py)
+            nx = n1[0]
+            ny = n1[1]
+        } else {
+            let n2 = side_normal(px, py, p[2 * bi], p[2 * bi + 1])
+            nx = n2[0]
+            ny = n2[1]
+        }
+        out.push(px + nx * d)
+        out.push(py + ny * d)
+    }
+    return out
+}
+// The path routed like a circuit trace: sampled every `step` along it (at least 2 points, 4 when
+// closed), snapped to a `grid`, each hop split into a straight run and a 45° run (alternating
+// which comes first), straight-through points dropped. `L`: its lengths (lengths(p) when nil).
+let octilinear = fn(p, closed, step, grid, L = nil) {
+    let LL = L ?? lengths(p)
+    let tot = LL[LL.len() - 1]
+    let m = max(if closed { 4.0 } else { 2.0 }, floor(tot / step + 0.5) + 1.0)
+    let q = []
+    for i in 0..m {
+        let a = point_at(p, LL, (tot * i) / (m - 1.0))
+        let sx = floor(a.x / grid + 0.5) * grid
+        let sy = floor(a.y / grid + 0.5) * grid
+        let ql = q.len()
+        if ql == 0 || q[ql - 2] != sx || q[ql - 1] != sy { q.push(sx) q.push(sy) }
+    }
+    var qn = q.len() / 2
+    if closed && qn > 1 {
+        if q[0] != q[2 * qn - 2] || q[1] != q[2 * qn - 1] { q.push(q[0]) q.push(q[1]) qn = qn + 1 }
+    }
+    let out = [q[0], q[1]]
+    if qn > 1 { for i in 1..qn {
+        let ax = q[2 * i - 2]
+        let ay = q[2 * i - 1]
+        let bx = q[2 * i]
+        let by = q[2 * i + 1]
+        let dx = bx - ax
+        let dy = by - ay
+        let mm = min(abs(dx), abs(dy))
+        var mx = 0.0
+        var my = 0.0
+        if i % 2 == 0 { mx = ax + sign(dx) * mm my = ay + sign(dy) * mm } else { mx = bx - sign(dx) * mm my = by - sign(dy) * mm }
+        if (mx != ax || my != ay) && (mx != bx || my != by) { out.push(mx) out.push(my) }
+        out.push(bx)
+        out.push(by)
+    } }
+    let on = out.len() / 2
+    let merged = [out[0], out[1]]
+    if on > 2 { for i in 1..(on - 1) {
+        let ml = merged.len()
+        let ax = merged[ml - 2]
+        let ay = merged[ml - 1]
+        let bx = out[2 * i]
+        let by = out[2 * i + 1]
+        let cx = out[2 * i + 2]
+        let cy = out[2 * i + 3]
+        if abs((bx - ax) * (cy - by) - (by - ay) * (cx - bx)) > 0.000000001 { merged.push(bx) merged.push(by) }
+    } }
+    merged.push(out[2 * on - 2])
+    merged.push(out[2 * on - 1])
+    return merged
+}
+// Whether (x, y) is inside the closed path (even-odd; a point on an edge may go either way).
+let inside_path = fn(x, y, p) {
+    let n = p.len() / 2
+    var c = false
+    var j = n - 1
+    for i in 0..n {
+        let ax = p[2 * i]
+        let ay = p[2 * i + 1]
+        let bx = p[2 * j]
+        let by = p[2 * j + 1]
+        if (ay > y) != (by > y) && x < ((bx - ax) * (y - ay)) / (by - ay) + ax { c = !c }
+        j = i
+    }
+    return c
+}
+
+{pt: pt segment: segment path: path poly: poly rect: rect arc: arc ellipse: ellipse cubic: cubic spline: spline spline_closed: spline_closed
+    lengths: lengths lengths32: lengths32 path_length: path_length point_at: point_at resample: resample mix_paths: mix_paths align_paths: align_paths
+    sub_path: sub_path path_bounds: path_bounds side_normal: side_normal offset_path: offset_path octilinear: octilinear
+    inside_path: inside_path}

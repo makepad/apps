@@ -1,0 +1,121 @@
+use mod.motion.*
+use mod.post
+use mod.motion.modules.kinetic.*
+use mod.motion.modules.camera2d.*
+use mod.motion.modules.words.*
+use mod.motion.modules.paths.*
+// Twelve seconds of Motion: impact, a typed thought, mechanical carry, then a torn exit.
+// Every cue is a plate second. The beat grid is explicit data; there is no audio dependency.
+// Layout and path lengths are prepared once. The final chapter keeps composed transforms so
+// tear's drawing callback can slide its actual artwork, including the HUD, in two halves.
+
+let INK = #0a0a0b
+let PAPER = #eee9df
+let HOT = #ff4d12
+let FACE = Font{family: "Roboto Flex" weight: 850 axes: {wdth: 100}}
+let MONO = Font{family: "JetBrains Mono" weight: 400}
+let BEATS = [0.55, 1.2, 1.85, 2.5, 3.15, 3.8, 4.9, 5.65, 6.25, 6.95, 8.75, 8.88, 9.01, 9.14, 9.8, 10.45]
+let RISE = "TYPE HAS WEIGHT."
+let LETTERS = layout_word(RISE, FACE, 62, 5)
+let TRACE = [220, 850, 700, 850, 840, 792, 1080, 902, 1390, 850, 1700, 850]
+let TRACE_LENGTHS = lengths(TRACE)
+let PROMPT = "MAKE EVERY WORD MOVE."
+let TOKENS = [
+    {start: 0 end: 5 t0: 4.9 candidates: [["MAKE", 0.72], ["LET", 0.18], ["SEE", 0.10]]},
+    {start: 5 end: 11 t0: 5.65 candidates: [["EVERY", 0.64], ["EACH", 0.28], ["ONE", 0.08]]},
+    {start: 11 end: 16 t0: 6.25 candidates: [["WORD", 0.81], ["LINE", 0.13], ["MARK", 0.06]]},
+    {start: 16 end: 21 t0: 6.95 candidates: [["STAY.", 0.12], ["MOVE.", 0.82], ["RISE.", 0.06]] pick: 1}
+]
+let AGAIN_METRICS = text_layout("AGAIN.", FACE, 230 * 0.75)
+
+// The first chapter: a flash, outline echoes, axis punch and letters arriving on their own clocks.
+let impact = fn(c, t) {
+    c.stroke([[280, 475], [1640, 475]], 1, PAPER, 0.12)
+    c.stroke([[280, 300], [1640, 300]], 1, PAPER, 0.12)
+    slam(c, "KINETIC", 960, 475, t, 0.55,
+        {px: 245 font: FACE align: @center color: PAPER weight_punch: 100 width_punch: 18 echoes: 3})
+    rise_letters(c, RISE, FACE, 62, 960, 614, t, 1.2, 0.3,
+        {layout: LETTERS ls: 5 align: @center lag: 0.045 rise: 90 slam: true from: 1.16 color: PAPER})
+    annotate(c, "CAP HEIGHT", vec2(1350, 300), vec2(1620, 220), t, 1.75,
+        {elbow: vec2(1510, 220) align: @right offset: vec2(0, -12) color: PAPER})
+    dim_line(c, vec2(380, 750), vec2(1540, 750), "1160 PX / ONE PLATE", t, 2.05, {color: PAPER})
+    spark_line(c, TRACE, t, 2.65, 0.9, {lengths: TRACE_LENGTHS color: HOT width: 2 rate: 80})
+}
+
+// The second chapter: token schedules, alternatives, probability bars and a live caret clock.
+let thought = fn(c, t) {
+    c.text("A THOUGHT, ONE TOKEN AT A TIME", 225, 225, {px: 22 font: MONO color: PAPER ls: 2})
+    c.rect(200, 465, 1130, 135, PAPER, 0.035)
+    let caret = typed(c, PROMPT, 225, 550, t, 4.65,
+        {px: 76 font: MONO cps: 22 tokens: TOKENS color: PAPER accent: HOT live: t
+            pop_width: 300 pop_px: 15 pop_lead: 0.18 glow: 0.35})
+    // A returned caret is also an anchor for other drawing.
+    c.circle(caret.x, caret.y + 25, 2.5, HOT, 0.65)
+    spark_line(c, [225, 630, 1180, 630, 1310, 520, 1660, 520], t, 5.0, 1.7,
+        {color: HOT width: 1.5 seed: 8})
+    annotate(c, "TOKEN / CONFIRMED", vec2(1240, 550), vec2(1400, 710), t, 7.2,
+        {elbow: vec2(1360, 710) color: PAPER px: 17})
+    dim_line(c, vec2(225, 810), vec2(1265, 810), "21 CHARACTERS / 4 CUES", t, 6.0, {color: PAPER})
+    c.text("SELECTED", 1530, 320, {px: 16 font: MONO align: @center color: PAPER alpha: 0.5})
+    roll_number(c, 0.12 + 0.7 * ease(@ease_out_expo, prog(t, 6.95, 7.5)), 1530, 415,
+        {px: 100 decimals: 2 align: @center color: HOT})
+}
+
+// The last chapter: four retriggers, horizontal slices, then a carry through one thousand.
+let release = fn(c, t) {
+    c.text("REPEAT / ROLL / RELEASE", 960, 225, {px: 22 font: MONO align: @center color: PAPER ls: 3})
+    if t < 9.45 {
+        slam(c, "AGAIN.", 960, 515, retrig(t, 8.75, 0.13, 4), 8.75,
+            {px: 230 font: FACE align: @center color: PAPER from: 1.24 echoes: 3})
+    } else {
+        glitch_slices(c, "AGAIN.", 960, 515, t, 32 * (1.0 - prog(t, 9.45, 9.95)),
+            {px: 230 font: FACE align: @center color: PAPER metrics: AGAIN_METRICS slices: 9 seed: 12})
+    }
+    let value = mix(998.98, 1002.12, ease(@ease_in_out_cubic, prog(t, 9.0, 10.7)))
+    roll_number(c, value, 960, 775, {px: 140 digits: 4 decimals: 2 align: @center color: HOT})
+    c.text("DECIMAL DETENTS / INTEGER CARRY", 960, 845, {px: 18 font: MONO align: @center color: PAPER alpha: 0.55})
+    spark_line(c, [340, 905, 790, 905, 880, 945, 1040, 865, 1130, 905, 1580, 905], t, 8.8, 1.75,
+        {color: HOT rate: 70 width: 1.5 seed: 21})
+}
+
+// The complete plate; tear replays this function in each half during its final transition.
+let plate = fn(c, t) {
+    let chapter = if t < 4.4 { 1 } elif t < 8.4 { 2 } else { 3 }
+    c.save()
+    if chapter < 3 {
+        cam2d_apply(c, beat_cam(t, BEATS, {live: t push: 0.04 roll: 0.012 drift: 3}))
+        if chapter == 1 { impact(c, t) } else { thought(c, t) }
+    } else { release(c, t) }
+    c.restore()
+    hud_frame(c, t, 0, {no: chapter section: ["IMPACT", "THOUGHT", "RELEASE"][chapter - 1] out: 11.15 color: PAPER})
+    let beat = beat_index(t, BEATS)
+    for i in 0..BEATS.len() {
+        let x = 130 + BEATS[i] / 12.0 * 1660
+        let age = since(t, BEATS[i])
+        let hit = if t >= BEATS[i] { 1.0 - ease(@ease_out_expo, prog(age, 0, 0.5)) } else { 0.0 }
+        c.rect(x, 992 - 18 * hit, 2, 12 + 18 * hit, if i == beat { HOT } else { PAPER }, if t >= BEATS[i] { 0.8 } else { 0.2 })
+    }
+    c.text("PLATE " + fixed(t, 2) + " s", 1784, 972, {px: 14 font: MONO align: @right color: PAPER alpha: 0.5})
+}
+
+Motion{
+    label: "Kinetic type / in-plate transitions"
+    size: vec2(1920, 1080)
+    duration: 12.0
+    color: @hdr
+    layers: [
+        Rect{size: vec2(1920, 1080) fill: INK}
+        Draw2D{draw: fn(c, t, edit) {
+            if t >= 11.2 {
+                tear(c, prog(t, 11.2, 12.0), {ink: INK seed: 8 draw: fn(half) { plate(half, t) }})
+            } else {
+                plate(c, t)
+                if t >= 4.05 && t < 4.4 { shutter(c, prog(t, 4.05, 4.4), {ink: INK}) }
+                if t >= 4.4 && t < 4.8 { shutter(c, prog(t, 4.4, 4.8), {ink: INK enter: true}) }
+                if t >= 8.05 && t < 8.4 { shutter(c, prog(t, 8.05, 8.4), {ink: INK bars: 9}) }
+                if t >= 8.4 && t < 8.7 { shutter(c, prog(t, 8.4, 8.7), {ink: INK bars: 9 enter: true}) }
+            }
+        }}
+    ]
+    post: [post.Bloom{strength: 0.45 threshold: 0.85 radius: 0.7} post.Shoulder{}]
+}

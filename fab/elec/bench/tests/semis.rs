@@ -70,7 +70,7 @@ fn discrete_semiconductors_lower_and_conduct() -> Result<(), String> {
     let mut libs = ModelLibs::generic();
     let input = LowerInput {
         nets: ["0", "supply", "diode", "npn.c", "npn.b", "nmos.on", "nmos.off", "pnp.c", "pnp.b", "pmos.d"]
-            .into_iter().enumerate().map(|(i, name)| LowerNet { id: net(i as u32), name: name.into(), supply: false }).collect(),
+            .into_iter().enumerate().map(|(i, name)| LowerNet { id: net(i as u32), name: name.into(), supply: false, heard: false }).collect(),
         ground: net(0),
         supplies: Vec::new(),
         sources: Vec::new(),
@@ -261,7 +261,7 @@ fn every_led_colour_is_a_capacitor_in_reverse_and_passes_no_dc() -> Result<(), S
     ];
     let input = LowerInput {
         nets: std::iter::once("0".to_string()).chain((0..colours.len()).map(|i| format!("lamp{i}")))
-            .enumerate().map(|(i, name)| LowerNet { id: net(i as u32), name, supply: false }).collect(),
+            .enumerate().map(|(i, name)| LowerNet { id: net(i as u32), name, supply: false, heard: false }).collect(),
         ground: net(0),
         supplies: Vec::new(),
         sources: Vec::new(),

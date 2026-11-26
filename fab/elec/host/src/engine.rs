@@ -1,34 +1,95 @@
 //! The strand's state and its apply, held-results, and completed-fill passes.
 
 use crate::docs::Docs;
+use crate::inbox::PlannerEdit;
 use crate::eval::place_ops;
-use crate::{circuits_named, CircuitChange, Cmd, CASE_KEEPOUT, DocSet, EvalDone, EvalJob, EvalOut, Inbox, Outcome, Plan, Resolver, RouteStart, Sample, TaskResult, Ticket};
-use fab_elec_board::{zone, Board, BoardDelta, BoardOp, Factories, ItemKind, Origin, RuleMatrix, ZoneFill};
+use crate::{circuits_named, CircuitChange, Cmd, CASE_KEEPOUT, DocSet, EvalDone, EvalJob, EvalOut, Inbox, Job, Outcome, Plan, Resolver, RouteStart, Sample, TaskResult, Ticket};
+use fab_elec_board::{zone, Board, BoardDelta, BoardOp, Factories, ItemKind, Origin, PortRoom, RuleMatrix, ZoneFill};
+use fab_elec_cam::profile_doc::{self, ProfileDef};
 use fab_elec_circuit::{CheckKind, Circuit, CircuitOp, Violation};
-use fab_elec_core::{BoardId, Canon, CompRef, ContentHash, DocId, FeatureRef, ItemId, Seg, Sel, Severity};
-use fab_elec_design::engines::{self, BoardResults, DesignResults, FillTask};
+use fab_elec_core::{BlockId, BoardId, Canon, CompId, CompRef, ContentHash, DocId, FeatureRef, ItemId, Seg, Sel, Severity};
+use fab_elec_design::action::ActionDef;
+use fab_elec_design::engines::{self, BoardResults, CheckTask, DesignResults, FillTask};
 use fab_elec_design::ops::{DesignApplied, DesignOpError};
-use fab_elec_design::{AssetBytes, AssetStep, By, Design, DesignOp, EntryKind, FileOp, OpEntry, OpLog, Place, Resolved, TextEdit, TextStep};
+use fab_elec_design::{AssetBytes, AssetStep, By, Design, DesignOp, EntryKind, FileOp, OpEntry, OpLog, Place, Resolved, SysOp, TextEdit, TextStep};
+use makepad_widgets_core::makepad_script::syntax::write::quote;
 use fab_elec_lang::{BenchView, DocKind, Evaluated, Libs, SourceMap, SourceRange, Sources, UnitState};
 use fab_elec_explore::rows::SheetRows;
-use fab_elec_route::{Base, JobId, Reason, RouteJob};
+use fab_elec_route::place::ConformStatus;
+use fab_elec_route::{Base, JobId, Reason};
+use fab_elec_view::board::view::FillWaitNotice;
 use fab_elec_view::snapshot::{next_tag, Committed};
-use fab_elec_view::{DesignSnapshot, Refusal, SheetIndex, StageFlags, StateOf, Tagged};
+use fab_elec_view::{CaseHeld, DesignSnapshot, Refusal, SheetIndex, StageFlags, StateOf, Tagged};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::{AcqRel, SeqCst}};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Instant;
 
+type ResultsResolver = fn(&Design, &DesignResults, &str, &[(String, String)]) -> Result<Plan, fab_elec_core::Diag>;
+
+#[derive(Clone, Copy)]
+enum ActionResolver {
+    Plain(Resolver),
+    WithProfiles(fn(&Design, &[ProfileDef], &str, &[(String, String)]) -> Result<Plan, fab_elec_core::Diag>),
+    WithResults(&'static ActionDef, ResultsResolver),
+    Authored(fn(&Design, Option<&Docs>, &str, &[(String, String)], By) -> Result<Plan, fab_elec_core::Diag>),
+}
+
+/// The accepted step and its live documents, borrowed only during publication on the
+/// strand. In particular an added document retains the original DocSet::Add text here.
+pub struct JournalStep<'a> {
+    docs: Option<&'a Docs>,
+    step: &'a TextStep,
+}
+
+impl JournalStep<'_> {
+    pub fn texts(&self) -> impl Iterator<Item = (&str, Option<&Arc<str>>)> {
+        let ids: BTreeSet<_> = self.step.edits.iter().map(|e| e.doc)
+            .chain(self.step.present.iter().map(|(id, _)| *id)).collect();
+        ids.into_iter().filter_map(move |id| {
+            let doc = &self.docs?.sources().all_docs()[id.ix()];
+            doc.lib.is_none().then(|| (doc.name.as_str(), (doc.present && doc.is_file()).then_some(&doc.text)))
+        })
+    }
+
+    pub fn assets(&self) -> &[AssetStep] { &self.step.assets }
+}
+
+pub enum JournalEvent<'a> {
+    Effect { ticket: Option<Ticket>, seq: u64, by: By, label: &'a str, changes: JournalStep<'a> },
+    History { undo: bool, before: Option<u64>, after: Option<u64>, changes: JournalStep<'a> },
+}
+
+type GestureReply = Box<dyn FnOnce(Result<u64, String>) + Send + Sync>;
+
+pub trait JournalSink: Send + Sync {
+    /// Bind a verified person invocation and supply its completion. Effect-only sinks can omit it.
+    fn gesture(&self, _ticket: Ticket, _name: &str, _args: &[(String, String)]) -> Option<GestureReply> { None }
+    fn receive(&self, event: JournalEvent<'_>);
+}
+
 pub struct Engine {
+    journal: Option<Arc<dyn JournalSink>>,
     design: Arc<Design>,
     results: DesignResults,
+    /// Catalog presses waiting for their unit's committed pours. Other edits can pass them.
+    waiting_for_fills: VecDeque<(FillWaitNotice, Queued)>,
+    fill_wait_notice: Option<Box<dyn Fn(FillWaitNotice) + Send>>,
     /// Per unit the router holds: the base last sent to it.
     routed: BTreeMap<BoardId, Base>,
     /// Monotonic route job identities for this engine.
     jobs: u32,
     /// The newest route waiting for its unit's committed fills to become exact.
-    waiting_route: Option<(Ticket, By, RouteJob)>,
+    waiting_route: Option<(Ticket, By, Job)>,
+    /// History of the tray commit still owned by each unfinished place request.
+    brings: HashMap<Ticket, Bring>,
     factories: Arc<Factories>,
+    base_factories: Arc<Factories>,
+    profiles: Arc<Vec<ProfileDef>>,
+    profile_diags: Arc<Vec<fab_elec_core::Diag>>,
+    profile_inputs: Vec<(DocId, u64)>,
+    profile_view: Weak<fab_elec_view::DocsView>,
+    factory_checks: std::cell::RefCell<BTreeMap<BoardId, FactoryChecks>>,
     preview: Option<Live>,
     /// One circuit/bench preview runs independently of committed evaluation.
     preview_job: Option<PreviewJob>,
@@ -37,11 +98,15 @@ pub struct Engine {
     /// Invoke callers wait until their evaluated sample is shown or refused; route callers
     /// keep their job tag until a commit or refusal answers them.
     preview_tickets: BTreeMap<u64, (Ticket, String)>,
+    gesture_replies: HashMap<Ticket, GestureReply>,
+    gesture_landings: HashMap<u64, Ticket>,
+    /// Answer fields waiting for the resolved commit, including while it is evaluated or retried.
+    answer_notes: HashMap<Ticket, Vec<(String, String)>>,
     /// A later drop can report the exact refusal of this sample.
     refused_preview: Option<(u64, Arc<Refusal>)>,
     /// Shared with the driver's pane samples, so tool and pane previews never reuse a seq.
     preview_seq: Arc<AtomicU64>,
-    resolvers: Vec<(&'static str, Resolver)>,
+    resolvers: Vec<(&'static str, ActionResolver)>,
     /// Set on a refused commit, preview sample, undo or redo; cleared by the next accepted edit.
     /// Cost: one Arc allocation per refusal, O(1) to share in snapshots, nothing per frame.
     last_refusal: Option<Arc<Refusal>>,
@@ -52,7 +117,11 @@ pub struct Engine {
     /// Stable rows and published indices, in committed unit order.
     sheets: Vec<Sheet>,
     /// Committed case findings per unit, sorted by content id.
-    case: BTreeMap<BoardId, (u64, Arc<Vec<Violation>>)>,
+    case: BTreeMap<BoardId, (CaseHeld, Arc<Vec<Violation>>)>,
+    /// The last case room publication for each board, including an evaluated empty list.
+    case_rooms: BTreeMap<BoardId, CaseRooms>,
+    /// What `case` holds, as snapshots publish it (`DesignSnapshot::cases`), rebuilt with `case_sorted`.
+    case_held: Arc<Vec<CaseHeld>>,
     /// Globally sorted and deduplicated on updates, so snapshots only need a linear merge.
     case_sorted: Vec<Violation>,
     /// Session notes from committed edits, kept while their corners remain on the board.
@@ -70,6 +139,9 @@ pub struct Engine {
     redo_mark: u64,
     /// The fill job running per zone: the generation and rules it fills with.
     in_flight: HashMap<(BoardId, ItemId), (u64, Arc<RuleMatrix>)>,
+    /// The whole-board checks job running per unit, at most one: a running pool task cannot be
+    /// stopped, and a pass an edit overtook merges under the edits since (`engines::rebase_checks`).
+    checks_in_flight: HashMap<BoardId, CheckStart>,
     head: String,
     /// Weak avoids forcing `Arc::make_mut` to clone items; with only weak refs it moves the board, invalidating the cached pointer.
     board_hashes: std::cell::RefCell<Vec<(BoardId, Weak<Board>, ContentHash)>>,
@@ -117,6 +189,15 @@ struct PreviewJob {
     asked: Instant,
 }
 
+struct FactoryChecks {
+    board: Weak<Board>,
+    profile: String,
+    factories: Weak<Factories>,
+    // Only an unknown profile points into source. A text-only edit can move its line.
+    source: Option<(DocId, Weak<str>)>,
+    findings: Vec<Violation>,
+}
+
 /// Verified text and evaluation retained for committing a shown preview without another splice.
 /// Carry cost: O(documents + units) for epoch bumps and document adoption, with no evaluation.
 struct Carry {
@@ -130,6 +211,50 @@ struct Carry {
     benches: Arc<Vec<BenchView>>,
     replaced: Vec<BoardId>,
     sites: Vec<Sel>,
+}
+
+struct Bring {
+    wait_for: Option<u64>,
+    seq: u64,
+    before: Option<BoardDocument>,
+}
+
+/// A place job edits one board document. Keep its source and selection ranges at the
+/// bring so the combined undo can span several separately spliced statements.
+struct BoardDocument {
+    doc: DocId,
+    text: Arc<str>,
+    map: Arc<SourceMap>,
+}
+
+impl BoardDocument {
+    fn read(docs: &Docs, doc: DocId) -> Self {
+        Self { doc, text: docs.text(doc).expect("a mapped board has a document").clone(), map: docs.map().clone() }
+    }
+
+    fn step_to(&self, to: &Self) -> TextStep {
+        let edit = TextEdit::trimmed(self.doc, &self.text, &to.text);
+        let end = edit.span.start + edit.text.len() as u32;
+        // Following one replacement can collapse the intermediate, unchanged statements
+        // inside it. Restore their exact selections and ranges along with the edited ones.
+        let adds = to.map.of_doc(self.doc).into_iter()
+            .filter(|(sel, r)| (r.span.start <= end && edit.span.start <= r.span.end) || self.map.locate(sel).is_none())
+            .map(|(sel, r)| (sel, r.doc, r.span)).collect();
+        let removes = self.map.of_doc(self.doc).into_iter().filter(|(sel, _)| to.map.locate(sel).is_none()).map(|(sel, _)| sel).collect();
+        TextStep { edits: vec![edit], adds, removes, ..Default::default() }
+    }
+}
+
+impl Bring {
+    /// Only the still-applied bring at the very end of the history can absorb the placement.
+    fn separate_step(&self, log: &OpLog) -> Option<String> {
+        let last = log.head.checked_sub(1).and_then(|i| log.entries.get(i));
+        if log.head == log.entries.len() && last.is_some_and(|entry| entry.seq == self.seq) { return None }
+        Some(match last.filter(|entry| entry.seq > self.seq) {
+            Some(entry) => format!("the parts were brought as their own undo step: {:?} came between", entry.label),
+            None => "the parts were brought as their own undo step: the history head changed".into(),
+        })
+    }
 }
 
 /// Preserve a committed sample's identity while its command waits behind other edits.
@@ -216,6 +341,41 @@ pub struct FillJob {
     pub delta: BoardDelta,
     /// The live preview's sample seq the fill was made for; None: the committed results.
     pub preview: Option<u64>,
+}
+
+/// What a running whole-board checks job started from: its generation and fills (which identify
+/// its result), the unit's results then and the board it checks, for `engines::rebase_checks`.
+struct CheckStart {
+    generation: u64,
+    fills: Arc<Vec<ZoneFill>>,
+    base: BoardResults,
+    board: Arc<Board>,
+}
+
+/// The whole-board checks a unit owes after a board-first load (`engines::owed_checks`), for a
+/// pool task: connectivity and DRC over the board with every fill exact. Off the strand, so
+/// commands apply while it runs. Its result merges as it is (`engines::merge_checks`), or under
+/// the edits that landed while it ran (`engines::rebase_checks`).
+#[derive(Clone)]
+pub struct CheckJob {
+    pub task: CheckTask,
+    pub board: Arc<Board>,
+    pub rules: Arc<RuleMatrix>,
+    pub fills: Arc<Vec<ZoneFill>>,
+}
+
+impl CheckJob {
+    pub fn run(&self) -> TaskResult {
+        let (conn, drc) = engines::whole_board_checks(&self.board, &self.rules, &self.fills);
+        TaskResult::Checks {
+            unit: self.task.unit,
+            generation: self.task.generation,
+            rules: self.rules.clone(),
+            fills: self.fills.clone(),
+            conn,
+            drc,
+        }
+    }
 }
 
 impl FillJob {
@@ -318,12 +478,16 @@ impl<C: Fn() -> bool, D: FnOnce(TaskResult)> Tiled<C, D> {
 pub struct Step {
     /// At most one committed evaluation and one preview evaluation to start on the pool.
     pub evals: Vec<EvalJob>,
+    /// Whole-board checks to start on the pool, one per unit that owes them and runs none.
+    pub checks: Vec<CheckJob>,
     /// The engine holds commands or runs an evaluation, so undo tops may still move; the host counts as busy.
     pub waiting: bool,
     /// Fill jobs to start on the pool (latest wins per zone).
     pub fills: Vec<FillJob>,
     /// Route jobs sent once the unit's committed fills are exact; a newer route replaces a parked one.
     pub routes: Vec<RouteStart>,
+    /// A tray bring waiting for its case evaluation, visible before the worker starts.
+    pub parked: Option<(Ticket, JobId, BoardId)>,
     /// Committed bases for the router: each unit `Cmd::RouteBase` asked for in this step, and each
     /// unit it holds whose committed board, rules, connectivity or fills moved since its last base
     /// (O(routed units) pointer compares per step).
@@ -373,26 +537,169 @@ fn sharp_notes(sample: &Sample) -> Option<(BoardId, Vec<Violation>)> {
     Some((unit, notes))
 }
 
+/// A tune job's length report or a place job's fields (Splash values) from its proposal: the parts placed, those
+/// without room by reference, the wirelength and demand overflow in mm, the demand rounds kept,
+/// the tracks and vias it took off, and of those the hand-drawn ones by part. `None` for any other
+/// sample. O(parts without room + parts with hand-drawn copper taken off).
+fn job_notes(design: &Design, sample: &Sample) -> Option<Vec<(String, String)>> {
+    let proposal = sample.proposal.as_ref()?;
+    if let Some(pair) = &proposal.pair {
+        let mut notes = vec![("side".into(), quote(match pair.side {
+            fab_elec_route::pair::Side::PLeft => "p_left",
+            fab_elec_route::pair::Side::NLeft => "n_left",
+        }))];
+        for (field, nm) in [("p_start_stub", pair.p_stubs[0]), ("p_end_stub", pair.p_stubs[1]),
+            ("n_start_stub", pair.n_stubs[0]), ("n_end_stub", pair.n_stubs[1]),
+            ("p_uncoupled", pair.p_uncoupled), ("n_uncoupled", pair.n_uncoupled),
+            ("p_length", pair.p_length), ("n_length", pair.n_length), ("skew", pair.skew)] {
+            notes.push((field.into(), format!("{:.6}", nm as f64 / 1e6)));
+        }
+        if let Some(blocked) = pair.blocked {
+            let board = design.unit(proposal.unit)?.board.as_ref()?;
+            notes.push(("blocked_leg".into(), quote(&board.nets.get(blocked.leg.ix())?.name)));
+            notes.push(("need".into(), format!("{:.6}", blocked.need as f64 / 1e6)));
+            notes.push(("reason".into(), quote(blocked.source.reason())));
+        }
+        return Some(notes);
+    }
+    if let Some(Ok(tune)) = &proposal.metrics.tune {
+        let mut notes = Vec::new();
+        for (field, nm) in [("reached", Some(tune.reached)), ("target", Some(tune.target)),
+                ("short_by", Some(tune.short_by)), ("uncoupled_added", tune.uncoupled_added)] {
+            if let Some(nm) = nm { notes.push((field.into(), format!("{:.6}", nm as f64 / 1e6))); }
+        }
+        return Some(notes);
+    }
+    let place = proposal.metrics.place.as_ref()?;
+    let mm = |nm: i64| format!("{:.3}", nm as f64 / 1e6);
+    let circuit = design.unit(proposal.unit).map(|unit| unit.circuit.clone());
+    let refdes = |comp: CompId| quote(&circuit.as_ref().and_then(|c| c.comps.get(comp.ix())).map_or_else(|| format!("#{}", comp.0), |c| c.refdes.clone()));
+    let mut notes = vec![("placed".to_owned(), place.placed.to_string())];
+    notes.push(("box_share".to_owned(), format!("{}.{:03}", place.box_permille / 1000, place.box_permille % 1000)));
+    if place.held > 0 {
+        notes.push(("panel_held".to_owned(), format!("{{count: {} why: {}}}", place.held, quote(crate::board_actions::PANEL_HELD_REASON))));
+    }
+    if let Some(line) = place.case_plan.as_ref().and_then(|guard| guard.note.as_ref()) {
+        notes.push(("case_plan".into(), line.clone()));
+    }
+    if let Some(line) = &place.seat_guard {
+        notes.push(("seat_guard".to_owned(), quote(line)));
+    }
+    if !place.no_room.is_empty() {
+        let names: Vec<_> = place.no_room.iter().map(|&comp| refdes(comp)).collect();
+        notes.push(("no_room".to_owned(), format!("[{}]", names.join(" "))));
+    }
+    notes.push(("wirelength_mm".to_owned(), mm(place.wirelength)));
+    notes.push(("overflow_mm".to_owned(), mm(place.overflow)));
+    notes.push(("demand_rounds".to_owned(), place.rounds.to_string()));
+    if place.ripped > 0 {
+        notes.push(("ripped".to_owned(), place.ripped.to_string()));
+    }
+    if !place.hand.is_empty() {
+        let parts: Vec<_> = place.hand.iter().map(|h| format!("{{part: {} tracks: {} vias: {}}}", refdes(h.comp), h.tracks, h.vias)).collect();
+        notes.push(("hand_drawn_removed".to_owned(), format!("[{}]", parts.join(" "))));
+    }
+    if !place.conformed.is_empty() {
+        let block = |b: BlockId| quote(&circuit.as_ref().and_then(|c| c.tree.get(b.ix())).map_or_else(|| format!("#{}", b.0), |b| b.path.clone()));
+        let rows: Vec<_> = place.conformed.iter().map(|group| {
+            let copies: Vec<_> = group.copies.iter().map(|&b| block(b)).collect();
+            let mut row = format!("{{copies: [{}] parts_each: {}", copies.join(" "), group.parts_each);
+            if let Some(&like) = group.like.and_then(|i| group.copies.get(i as usize)) {
+                row += &format!(" like: {}", block(like));
+            }
+            let why = match group.status {
+                ConformStatus::Kept => None,
+                ConformStatus::RefusedNear => Some("breaks_near"),
+                ConformStatus::RefusedOver => Some("raises_overflow"),
+                ConformStatus::NoSpot => Some("no_room"),
+                ConformStatus::SkippedUnplaced => Some("part_without_room"),
+                ConformStatus::SkippedMixedSides => Some("two_sides"),
+                ConformStatus::SkippedFixed => Some("fixed_part"),
+                ConformStatus::HeldApart => Some("held_apart"),
+                ConformStatus::RefusedAlike => Some("fewer_groups_alike"),
+            };
+            row += &why.map_or_else(|| " kept: true".to_owned(), |why| format!(" kept: false why: {}", quote(why)));
+            if let (Some(over), Some(length)) = (group.overflow, group.wirelength) {
+                row += &format!(" overflow_change_mm: {} wirelength_change_mm: {} moved: {}", mm(over), mm(length), group.moved);
+            }
+            row + "}"
+        }).collect();
+        notes.push(("conformed".to_owned(), format!("[{}]", rows.join(" "))));
+    }
+    Some(notes)
+}
+
+struct CaseRooms {
+    generation: u64,
+    ports: Vec<PortRoom>,
+    plan: Result<Option<Arc<dyn fab_elec_route::PlacePlan>>, String>,
+}
+
+/// Include the shipped profiles when loading, retaining explicit host capability overrides.
+fn initial_factories(mut supplied: Arc<Factories>) -> Arc<Factories> {
+    for def in profile_doc::builtins() {
+        if !supplied.contains_key(&def.name) {
+            Arc::make_mut(&mut supplied).insert(def.name.clone(), def.caps.clone());
+        }
+    }
+    supplied
+}
+
 impl Engine {
+    /// Read committed board lengths from the same connectivity snapshot used by board checks.
+    pub fn net_length(snap: &DesignSnapshot, args: &[(String, String)]) -> Result<String, fab_elec_core::Diag> {
+        crate::board_actions::net_length(snap, args)
+    }
+
     /// `steps` supplies numbers, including early reservations; `logged` tracks logged entries.
-    /// Load is the one time the strand computes full results, including fills inline.
+    /// The full results, fills included, computed inline: for tools and tests that need exact
+    /// results at once. A host loading a design for a person uses [`Engine::new_held`].
     pub fn new(design: Design, factories: Arc<Factories>, steps: Arc<AtomicU64>, logged: Arc<AtomicU64>, head: String) -> Engine {
+        let factories = initial_factories(factories);
         let results = engines::full_with(&design, &factories);
+        Engine::with_results(design, results, factories, steps, logged, head)
+    }
+
+    /// A design loaded board first (`engines::load_held`): every board's copper at once, its
+    /// zones owed to the pool, connectivity and DRC once after the last fill merges. The first
+    /// step hands the owed fills to the pool (`Driver::load` runs it).
+    pub fn new_held(design: Design, factories: Arc<Factories>, steps: Arc<AtomicU64>, logged: Arc<AtomicU64>, head: String) -> Engine {
+        let factories = initial_factories(factories);
+        let results = engines::load_held(&design, &factories);
+        Engine::with_results(design, results, factories, steps, logged, head)
+    }
+
+    fn with_results(design: Design, results: DesignResults, factories: Arc<Factories>, steps: Arc<AtomicU64>, logged: Arc<AtomicU64>, head: String) -> Engine {
         let mut engine = Engine {
-            design: Arc::new(design), results, routed: BTreeMap::new(), factories, preview: None, log: OpLog::default(),
-            jobs: 0, waiting_route: None,
-            preview_job: None, preview_next: None, preview_tickets: BTreeMap::new(), refused_preview: None,
+            journal: None, design: Arc::new(design), results, routed: BTreeMap::new(), base_factories: factories.clone(), factories,
+            profiles: Arc::default(), profile_diags: Arc::default(), profile_inputs: Vec::new(), profile_view: Weak::new(), factory_checks: Default::default(), preview: None, log: OpLog::default(),
+            waiting_for_fills: VecDeque::new(), fill_wait_notice: None, jobs: 0, waiting_route: None, brings: HashMap::new(),
+            preview_job: None, preview_next: None, preview_tickets: BTreeMap::new(), gesture_replies: HashMap::new(), gesture_landings: HashMap::new(), answer_notes: HashMap::new(), refused_preview: None,
             last_refusal: None, last_commit: None, refusals: 0,
             preview_seq: Arc::new(AtomicU64::new(0)), resolvers: Vec::new(),
             sheets: Vec::new(),
-            case: BTreeMap::new(), case_sorted: Vec::new(), steps, logged, redo_mark: 0, in_flight: HashMap::new(), head,
+            case: BTreeMap::new(), case_rooms: BTreeMap::new(), case_held: Arc::default(), case_sorted: Vec::new(), steps, logged, redo_mark: 0, in_flight: HashMap::new(), checks_in_flight: HashMap::new(), head,
             notes: BTreeMap::new(), notes_sorted: Vec::new(), commit_notes: HashMap::new(),
             mesh_keys: BTreeMap::new(), library_keys: BTreeMap::new(), library_changed: false, own_assets: BTreeMap::new(),
             board_hashes: std::cell::RefCell::new(Vec::new()),
             docs: None, held: VecDeque::new(), eval: None, evals: 0, typing: None,
         };
+        engine.refresh_profiles(true, &mut BTreeMap::new());
         engine.sync_sheets();
         engine
+    }
+
+    /// Attach after loading documents. Existing engines pay no per-edit journal cost.
+    pub fn with_journal(mut self, sink: Option<Arc<dyn JournalSink>>) -> Self {
+        self.journal = sink;
+        self
+    }
+
+    fn journal_effect(&mut self, ticket: Option<Ticket>) {
+        if let (Some(journal), Some(entry)) = (&mut self.journal, self.log.entries.last()) {
+            let changes = JournalStep { docs: self.docs.as_ref(), step: &entry.text };
+            journal.receive(JournalEvent::Effect { ticket, seq: entry.seq, by: entry.by, label: &entry.label, changes });
+        }
     }
 
     /// Put the documents `design` was evaluated from in front of the engine ([`Docs::load`]): board
@@ -400,7 +707,76 @@ impl Engine {
     /// the source map and the documents.
     pub fn with_docs(mut self, docs: Docs) -> Engine {
         self.docs = Some(docs);
+        let mut deltas = BTreeMap::new();
+        self.refresh_profiles(false, &mut deltas);
+        if !deltas.is_empty() {
+            // A full load stays exact. A board-first load leaves its pending work on the pool.
+            let update = if self.results.boards.iter().any(|b| b.pending.whole || !b.pending.zones.is_empty()) {
+                engines::update_held
+            } else {
+                engines::update_with
+            };
+            self.results = update(&self.results, &self.design, &deltas.into_iter().collect::<Vec<_>>(), &self.factories);
+        }
         self
+    }
+
+    /// Rebuild in document and statement order. A change to another document only compares
+    /// profile revisions. An unchanged view costs one pointer comparison on the strand.
+    fn refresh_profiles(&mut self, base_changed: bool, deltas: &mut BTreeMap<BoardId, BoardDelta>) -> bool {
+        let view = self.docs.as_ref().map(Docs::view);
+        if !base_changed && view.is_none_or(|v| self.profile_view.as_ptr() == Arc::as_ptr(v)) { return false; }
+        let documents = view.into_iter().flat_map(|v| &v.texts)
+            .filter(|t| DocKind::of_name(&t.name) == Some(DocKind::Profile));
+        self.profile_view = view.map_or_else(Weak::new, Arc::downgrade);
+        let inputs = documents.clone().map(|t| (t.doc, t.rev));
+        if !base_changed && inputs.clone().eq(self.profile_inputs.iter().copied()) { return false; }
+        self.profile_inputs = inputs.collect();
+
+        let mut profiles = Vec::new();
+        let mut factories = (*self.base_factories).clone();
+        for def in profile_doc::builtins() {
+            if let Some(caps) = factories.get(&def.name) {
+                profiles.push(ProfileDef { caps: caps.clone(), ..def.clone() });
+            }
+        }
+        // Hosts may also supply named minima directly through SetFactories.
+        for (name, caps) in &factories {
+            if !profile_doc::builtins().iter().any(|p| p.name == *name) {
+                profiles.push(ProfileDef { name: name.clone(), tier: None, format: fab_elec_cam::PROFILES[0].into(),
+                    caps: caps.clone(), span: 0..0 });
+            }
+        }
+        let mut names: HashSet<_> = profiles.iter().map(|p| p.name.to_ascii_lowercase()).collect();
+        let mut diags = Vec::new();
+        for text in documents {
+            let (defs, errors) = profile_doc::read(text.doc, &text.text);
+            diags.extend(errors);
+            for mut def in defs {
+                if !names.insert(def.name.to_ascii_lowercase()) {
+                    diags.push(fab_elec_core::Diag::error(format!("factory profile {:?} is already defined", def.name),
+                        vec![Sel::Source { doc: text.doc, start: def.span.start, end: def.span.end }]));
+                    continue;
+                }
+                if let Some(old) = self.factories.get(&def.name).filter(|c| **c == def.caps) {
+                    def.caps = old.clone();
+                }
+                factories.insert(def.name.clone(), def.caps.clone());
+                profiles.push(def);
+            }
+        }
+        for unit in &self.design.units {
+            let (Some(name), Some(board)) = (&unit.factory, &unit.board) else { continue };
+            if self.factories.get(name).map(Arc::as_ptr) != factories.get(name).map(Arc::as_ptr) {
+                engines::merge_delta(deltas.entry(unit.id).or_default(), &BoardDelta {
+                    global: true, bbox: board.outline_bbox(), ..Default::default()
+                });
+            }
+        }
+        if base_changed || factories != *self.factories { self.factories = Arc::new(factories); }
+        self.profiles = Arc::new(profiles);
+        self.profile_diags = Arc::new(diags);
+        true
     }
 
     /// Keep the plate's registered mesh keys for every later circuit adoption.
@@ -419,11 +795,24 @@ impl Engine {
     /// Fab's route job and the card, sheet, board, bench and system edits available through tool
     /// calls.
     pub fn with_app_tools(self) -> Engine {
-        self.with_resolver("elec.route", crate::route_plan)
+        self.with_bom_tools().with_resolver("elec.route", crate::route_plan)
             .with_resolver("elec.value.set", crate::edit_actions::value_set)
             .with_resolver("elec.part.place", crate::edit_actions::part_place)
+            .with_resolver("elec.part.rotate", crate::board_actions::rotate)
+            .with_resolver("elec.part.flip", crate::board_actions::flip)
+            .with_resolver("elec.part.align", crate::board_actions::align)
+            .with_resolver("elec.part.distribute", crate::board_actions::distribute)
+            .with_resolver(crate::board_actions::OUTLINE.name, crate::board_actions::board_shape)
+            .with_resolver(crate::board_actions::KEEPOUT.name, crate::board_actions::board_shape)
+            .with_resolver(crate::board_actions::CUTOUT.name, crate::board_actions::board_shape)
+            .with_results_resolver(&crate::board_actions::STITCH, crate::board_actions::stitch)
+            .with_resolver(crate::board_actions::PAIR_ROUTE.name, crate::board_actions::pair_route)
+            .with_resolver(crate::board_actions::TUNE.name, crate::board_actions::tune)
+            .with_resolver("elec.place", crate::board_actions::place)
             .with_resolver("elec.part.body.set", crate::model_actions::body_set)
-            .with_resolver("elec.factory.set", crate::edit_actions::factory_set)
+            .register("elec.factory.set", ActionResolver::WithProfiles(crate::edit_actions::factory_set))
+            .with_resolver("elec.stackup.set", crate::board_settings::resolve)
+            .with_resolver("elec.rules.set", crate::board_settings::resolve)
             .with_resolver("elec.part.add", crate::sheet_actions::part_add)
             .with_resolver("elec.part.remove", crate::sheet_actions::part_remove)
             .with_resolver("elec.part.rename", crate::sheet_actions::part_rename)
@@ -439,14 +828,40 @@ impl Engine {
             .with_resolver("elec.unit", crate::edit_actions::sys_edit)
     }
 
+    pub fn with_bom_tools(self) -> Engine {
+        use crate::bom_actions::*;
+        self.with_resolver(FIELD_SET.name, field_set).with_resolver(DNP_SET.name, dnp_set)
+            .with_resolver(ALT_USE.name, alt_use).register(ALT_ADD.name, ActionResolver::Authored(alt_add))
+    }
+
     /// Register or replace a prefix; O(prefixes) per call, O(registered prefix bytes) per dispatch.
-    pub fn with_resolver(mut self, prefix: &'static str, f: Resolver) -> Engine {
+    pub fn with_resolver(self, prefix: &'static str, f: Resolver) -> Engine {
+        self.register(prefix, ActionResolver::Plain(f))
+    }
+
+    /// This action reads the named board's committed results once its fills are exact.
+    fn with_results_resolver(self, action: &'static ActionDef, resolve: ResultsResolver) -> Engine {
+        self.register(action.name, ActionResolver::WithResults(action, resolve))
+    }
+
+    fn register(mut self, prefix: &'static str, f: ActionResolver) -> Engine {
         if let Some((_, resolver)) = self.resolvers.iter_mut().find(|(key, _)| *key == prefix) {
             *resolver = f;
         } else {
             self.resolvers.push((prefix, f));
         }
         self
+    }
+
+    fn resolver_for(&self, cmd: &Cmd) -> Option<ActionResolver> {
+        let tool = match cmd {
+            Cmd::Invoke { tool, .. } => tool.as_str(),
+            Cmd::Planner { call, .. } => call.name,
+            _ => return None,
+        };
+        self.resolvers.iter().filter(|(prefix, _)| {
+            tool.strip_prefix(*prefix).is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+        }).max_by_key(|(prefix, _)| prefix.len()).map(|(_, f)| *f)
     }
 
     /// Share the pane allocator before loading the engine; O(1) per load.
@@ -469,8 +884,44 @@ impl Engine {
         &self.design
     }
 
+    /// Notify the strip when an action starts or finishes waiting for its unit's fills.
+    pub fn with_fill_wait_notice(mut self, notice: impl Fn(FillWaitNotice) + Send + 'static) -> Self {
+        self.fill_wait_notice = Some(Box::new(notice));
+        self
+    }
+
+    fn pour_pending(&self, unit: BoardId) -> bool {
+        self.results.boards.iter().any(|r| r.unit == unit && !r.pending.zones.is_empty())
+    }
+
+    /// Restore the ready presses to the head of the command queue in arrival order. An
+    /// earlier press can dirty the pour again before the next press gets its turn.
+    fn resume_fill_waiters(&mut self, queue: &mut VecDeque<Queued>) -> bool {
+        let mut ready = Vec::new();
+        let mut exact = BTreeMap::new();
+        for (wait, call) in std::mem::take(&mut self.waiting_for_fills) {
+            if self.pour_pending(wait.unit) {
+                self.waiting_for_fills.push_back((wait, call));
+            } else {
+                ready.push(call);
+                exact.insert((wait.unit, wait.action), FillWaitNotice { waiting: false, ..wait });
+            }
+        }
+        if let Some(notice) = &self.fill_wait_notice {
+            for wait in exact.into_values() { notice(wait); }
+        }
+        if ready.is_empty() { return false; }
+        for call in ready.into_iter().rev() { queue.push_front(call); }
+        true
+    }
+
     pub fn results(&self) -> &DesignResults {
         &self.results
+    }
+
+    /// The evaluated board generation and position-relative port rooms from its latest case publication.
+    pub fn case_rooms(&self, unit: BoardId) -> Option<(u64, &[PortRoom])> {
+        self.case_rooms.get(&unit).map(|r| (r.generation, r.ports.as_slice()))
     }
 
     pub fn log(&self) -> &OpLog {
@@ -493,6 +944,7 @@ impl Engine {
         let mut rejected = Vec::new();
         let mut asked: Vec<BoardId> = Vec::new();
         let mut routes = Vec::new();
+        let mut parked = None;
         let mut outcomes = Vec::new();
         let mut deltas = BTreeMap::new();
         let mut changed = false;
@@ -500,6 +952,7 @@ impl Engine {
         let mut queue = std::mem::take(&mut self.held);
         queue.extend(cmds.into_iter().map(|(_, cmd)| Queued { cmd, sample: None, seq: None }));
         let mut fill_results = Vec::new();
+        let mut checks_merged = false;
         let mut evaluated = false;
         let mut preview_changed = false;
         // Adoption precedes commands and fills, so held commands can run in this step.
@@ -511,6 +964,17 @@ impl Engine {
                     } else if self.eval.as_ref().is_some_and(|job| job.id == done.id) {
                         evaluated = true;
                         changed |= self.finish_eval(*done, &mut queue, &mut deltas, &mut rejected, &mut outcomes);
+                    }
+                }
+                TaskResult::Checks { unit, generation, rules, fills, conn, drc } => {
+                    let started = self.checks_in_flight.get(&unit).is_some_and(|c| c.generation == generation && Arc::ptr_eq(&c.fills, &fills))
+                        .then(|| self.checks_in_flight.remove(&unit)).flatten();
+                    // Checks an edit overtook merge under the board's changes since they started.
+                    let merged = engines::merge_checks(&self.results, unit, generation, &rules, &fills, conn.clone(), drc.clone())
+                        .or_else(|| started.and_then(|c| engines::rebase_checks(&self.results, &self.design, &c.base, &c.board, conn, drc, &self.factories)));
+                    if let Some(results) = merged {
+                        self.results = results;
+                        checks_merged = true;
                     }
                 }
                 fill => fill_results.push(fill),
@@ -538,14 +1002,47 @@ impl Engine {
             }
         }
         let mut case_changed = false;
-        // A commit took its live preview's results over (and so changed no board results).
+        // Committed results already include all changes up to a preview adoption or fill-dependent action.
         let mut carried = false;
-        while let Some(Queued { cmd, sample: tag, seq }) = queue.pop_front() {
-            if matches!(&cmd, Cmd::Undo | Cmd::Redo) {
+        let mut refreshed = false;
+        let mut merge_committed = |engine: &mut Self| {
+            let mut applied = false;
+            for (unit, zone, generation, rules, fill) in committed.drain(..) {
+                if engine.in_flight.get(&(unit, zone)).is_some_and(|(g, r)| *g == generation && Arc::ptr_eq(r, &rules)) {
+                    engine.in_flight.remove(&(unit, zone));
+                }
+                if let Some(results) = engines::merge_fill(&engine.results, &engine.design, unit, zone, generation, &rules, fill) {
+                    engine.results = results;
+                    applied = true;
+                }
+            }
+            applied
+        };
+        let mut profiles_changed = false;
+        loop {
+            profiles_changed |= self.refresh_profiles(false, &mut deltas);
+            let resolver = queue.front().and_then(|call| self.resolver_for(&call.cmd));
+            if (matches!(resolver, Some(ActionResolver::WithResults(..))) || (queue.is_empty() && !self.waiting_for_fills.is_empty()))
+                && self.held.is_empty() && !self.eval_blocked() {
+                // Pass A normally follows the batch. Bring the board and committed fills up
+                // to date before resolving the action, including a move or zone removal in this inbox.
+                if (changed && !carried) || !deltas.is_empty() {
+                    let prior = std::mem::take(&mut deltas).into_iter().collect::<Vec<_>>();
+                    self.results = engines::update_held(&self.results, &self.design, &prior, &self.factories);
+                    refreshed = true;
+                    carried = true;
+                }
+                merged |= merge_committed(self);
+                if !self.waiting_for_fills.is_empty() && self.resume_fill_waiters(&mut queue) {
+                    continue; // A resumed call is now at the front. Select its resolver.
+                }
+            }
+            let Some(call) = queue.pop_front() else { break };
+            if matches!(&call.cmd, Cmd::Undo | Cmd::Redo) {
                 self.typing = None;
             }
-            let waits = match &cmd {
-                Cmd::Undo | Cmd::Redo => !self.held.is_empty() || self.eval_blocked(),
+            let waits = match &call.cmd {
+                Cmd::Undo | Cmd::Redo | Cmd::DiscardJob { .. } => !self.held.is_empty() || self.eval_blocked(),
                 Cmd::Commit { ops, .. } => !self.held.is_empty() || (self.needs_verify(ops) && self.eval_blocked()),
                 Cmd::Text { .. } => !self.held.is_empty(),
                 Cmd::CheckedText { .. } => !self.held.is_empty() || self.eval_blocked(),
@@ -554,14 +1051,69 @@ impl Engine {
                 // the circuit it reads, so it waits behind them like an undo (a burst of circuit
                 // edits would otherwise stamp each on a circuit the one before replaces).
                 Cmd::Invoke { .. } => !self.held.is_empty() || self.eval_blocked(),
-                Cmd::RouteBase { .. } | Cmd::CommitPreview { .. } | Cmd::CancelPreview { .. } | Cmd::RefusePreview { .. }
-                | Cmd::SetFactories(_) | Cmd::CaseFindings { .. } | Cmd::CaseKeepouts { .. } | Cmd::LibraryModels(_) | Cmd::LibraryDrop(_) => false,
+                Cmd::Planner { edit: PlannerEdit::Direct { edit, .. }, .. } => !self.held.is_empty() || (self.needs_verify(&edit.ops) && self.eval_blocked()),
+                Cmd::Planner { .. } | Cmd::RouteBase { .. } | Cmd::CommitPreview { .. } | Cmd::CancelPreview { .. } | Cmd::RefusePreview { .. }
+                | Cmd::CaseOutcome { .. } | Cmd::SetFactories(_) | Cmd::CaseFindings { .. } | Cmd::CaseKeepouts { .. } | Cmd::LibraryModels(_) | Cmd::LibraryDrop(_) => false,
             };
             if waits {
-                self.held.push_back(Queued { cmd, sample: tag, seq });
+                self.held.push_back(call);
                 continue;
             }
+            if let (Some(ActionResolver::WithResults(action, _)), Cmd::Invoke { args, .. }) = (resolver, &call.cmd) {
+                let unit = crate::edit_actions::arg(args, "unit").and_then(|name| self.design.unit_by_name(name.trim()));
+                if let Some(unit) = unit.map(|u| u.id).filter(|&id| self.pour_pending(id)) {
+                    let wait = FillWaitNotice { unit, action: action.name, label: action.label, waiting: true };
+                    if !self.waiting_for_fills.iter().any(|(pending, _)| *pending == wait) {
+                        if let Some(notice) = &self.fill_wait_notice { notice(wait); }
+                    }
+                    self.waiting_for_fills.push_back((wait, call));
+                    continue;
+                }
+            }
+            let Queued { cmd, sample: tag, seq } = call;
             match cmd {
+                Cmd::Planner { call, edit, ticket } => {
+                    let planned = match &edit {
+                        PlannerEdit::Direct { edit, .. } => Some((&edit.ops, &edit.place)),
+                        PlannerEdit::Release { seq, tag } => committing.iter().chain(preview.iter())
+                            .chain(self.preview.iter().map(|p| &p.sample))
+                            .chain(self.preview_next.iter()).chain(self.preview_job.iter().map(|p| &p.sample))
+                            .find(|s| Some(s.seq) == *seq && s.tag == *tag).map(|s| (&s.ops, &s.place)),
+                    };
+                    let has_plan = planned.is_some();
+                    // The resolver uses the before documents. Keep hints, other insertion sites,
+                    // ambiguous names and different wiring semantics all leave a plain effect.
+                    let binding = self.journal.as_ref().and_then(|journal| {
+                        let exact = match (resolver, planned) {
+                            (Some(ActionResolver::Plain(resolve)), Some((ops, place))) =>
+                                matches!(resolve(&self.design, self.docs.as_ref(), call.name, &call.args),
+                                    Ok(Plan::Edit(e)) if &e.ops == ops && &e.place == place),
+                            (_, None) => true, // the drop still gets its recorded refusal
+                            _ => false,
+                        };
+                        if exact { journal.gesture(ticket, call.name, &call.args) } else { None }
+                    });
+                    let bound = binding.map(|reply| { self.gesture_replies.insert(ticket, reply); ticket });
+                    let cmd = match edit {
+                        PlannerEdit::Direct { edit, circuits } => Cmd::Commit {
+                            ops: edit.ops, place: edit.place, label: edit.label, circuits, expect: None, by: By::Person, ticket: bound,
+                        },
+                        PlannerEdit::Release { seq, tag } => {
+                            if let Some(ticket) = bound { self.gesture_landings.insert(tag, ticket); }
+                            let Some(seq) = seq.filter(|_| has_plan) else {
+                                // A restart can reuse a sample sequence. Only its original tag
+                                // can settle this release, even if another pane now has that seq.
+                                let refused = self.refused_preview.as_ref().is_some_and(|(_, r)| r.sample == Some(tag))
+                                    && seq.is_some_and(|seq| self.answer_refused(seq, &mut rejected));
+                                if !refused { rejected.push(self.ended(tag)); }
+                                refusal_changed = true;
+                                continue;
+                            };
+                            Cmd::CommitPreview { seq, tag }
+                        }
+                    };
+                    queue.push_front(Queued { cmd, sample: None, seq: None });
+                }
                 Cmd::Commit { ops, place, label, circuits, expect, by, ticket } => {
                     let op = op_kind(&ops);
                     if let Err(refused) = self.check_circuits(&circuits) {
@@ -584,7 +1136,8 @@ impl Engine {
                         }
                         continue;
                     }
-                    match self.board_ops(ops, &place).and_then(|ops| self.commit(ops, label.clone(), expect, by)) {
+                    let place_ticket = tag.and_then(|tag| ticket.or_else(|| self.preview_tickets.get(&tag).map(|p| p.0)));
+                    match self.board_ops(ops, &place).and_then(|ops| self.commit(ops, label.clone(), expect, by, place_ticket)) {
                         Ok(batch) => {
                             let (created, sites) = self.board_created();
                             self.committed(tag, ticket, created, sites, None, &mut outcomes);
@@ -635,11 +1188,13 @@ impl Engine {
                     }
                 }
                 Cmd::Invoke { tool, args, preview: want_preview, by, ticket } => {
-                    let resolver = self.resolvers.iter().filter(|(prefix, _)| {
-                        tool.strip_prefix(*prefix).is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
-                    }).max_by_key(|(prefix, _)| prefix.len()).map(|(_, f)| *f);
                     let resolved = match resolver {
-                        Some(resolve) => resolve(&self.design, self.docs.as_ref(), &tool, &args).map_err(|diag| Refused {
+                        Some(resolve) => match resolve {
+                            ActionResolver::WithResults(_, f) => f(&self.design, &self.results, &tool, &args),
+                            ActionResolver::WithProfiles(f) => f(&self.design, &self.profiles, &tool, &args),
+                            ActionResolver::Plain(f) => f(&self.design, self.docs.as_ref(), &tool, &args),
+                            ActionResolver::Authored(f) => f(&self.design, self.docs.as_ref(), &tool, &args, by),
+                        }.map_err(|diag| Refused {
                             site: self.docs.as_ref().and_then(|docs| docs.site_of(&diag)), text: diag.message,
                         }),
                         None => {
@@ -647,41 +1202,43 @@ impl Engine {
                             Err(Refused { text: format!("no plan function for {prefix} yet"), site: None })
                         }
                     };
-                    match resolved {
-                        Ok(Plan::Edit(Resolved { ops, place, label })) if want_preview => {
-                            if let Some((tag, old_ticket, label)) = preview_ticket.take() {
-                                rejected.push(self.refuse(label, "invoke", Some(tag), Refused {
-                                    text: "the preview was replaced before it became live; ask again".into(), site: None,
-                                }));
-                                self.refusal_outcome(Some(old_ticket), &mut outcomes);
-                                refusal_changed = true;
-                            }
-                            let seq = self.preview_seq.fetch_add(1, SeqCst) + 1;
-                            let tag = next_tag();
-                            preview_ticket = Some((tag, ticket, label.clone()));
-                            let circuits = circuits_named(&self.design, &ops);
-                            preview = Some(Sample { seq, tag, ops, place, label, by, proposal: None, notes: vec![], circuits, expect: None });
-                        }
-                        Ok(Plan::Edit(Resolved { ops, place, label })) => queue.push_front(Queued {
-                            cmd: Cmd::Commit { circuits: circuits_named(&self.design, &ops), ops, place, label, expect: None, by, ticket: Some(ticket) },
-                            sample: None, seq: None,
-                        }),
-                        Ok(Plan::Route(mut job)) => {
+                    let (Resolved { ops, place, label }, notes) = match resolved {
+                        Ok(Plan::Edit(edit)) => (edit, Vec::new()),
+                        Ok(Plan::Noted { edit, notes }) => (edit, notes),
+                        Ok(Plan::Job(mut job)) => {
                             self.jobs += 1;
-                            job.job = JobId(self.jobs);
-                            let tag = job.job.tag();
+                            job.number(JobId(self.jobs));
+                            let tag = job.id().tag();
                             self.preview_tickets.insert(tag, (ticket, tool.clone()));
-                            let unit = job.unit;
+                            let unit = job.unit();
                             match self.design.unit(unit).filter(|found| found.board.is_some()) {
                                 Some(_) => {
                                     if let Some((old_ticket, _, old)) = self.waiting_route.take() {
-                                        let (_, label) = self.preview_tickets.remove(&old.job.tag())
+                                        let (_, label) = self.preview_tickets.remove(&old.id().tag())
                                             .expect("a parked route retains its caller");
-                                        rejected.push(self.refuse(label, "invoke", Some(old.job.tag()), Refused {
+                                        rejected.push(self.refuse(label, "invoke", Some(old.id().tag()), Refused {
                                             text: "replaced by a newer route".into(), site: None,
                                         }));
                                         self.refusal_outcome(Some(old_ticket), &mut outcomes);
                                         refusal_changed = true;
+                                    }
+                                    if let Job::Place(place) = &mut job {
+                                        match self.bring_for_place(place, ticket, by) {
+                                            Ok(Some(batch)) => {
+                                                parked = Some((ticket, place.job, unit));
+                                                changed |= batch.changed;
+                                                carried &= !batch.changed;
+                                                fold(&mut deltas, batch.deltas);
+                                            }
+                                            Ok(None) => {}
+                                            Err(refused) => {
+                                                self.preview_tickets.remove(&tag);
+                                                rejected.push(self.refuse(tool, "bring", Some(tag), refused));
+                                                self.refusal_outcome(Some(ticket), &mut outcomes);
+                                                refusal_changed = true;
+                                                continue;
+                                            }
+                                        }
                                     }
                                     // Parked until the end of the step: later commands of this step
                                     // and pass A move the committed board and fills it starts on.
@@ -696,12 +1253,36 @@ impl Engine {
                                     refusal_changed = true;
                                 }
                             }
+                            continue;
                         }
                         Err(refused) => {
                             rejected.push(self.refuse(tool, "invoke", None, refused));
                             self.refusal_outcome(Some(ticket), &mut outcomes);
                             refusal_changed = true;
+                            continue;
                         }
+                    };
+                    let circuits = circuits_named(&self.design, &ops);
+                    if want_preview {
+                        if let Some((tag, old_ticket, label)) = preview_ticket.take() {
+                            rejected.push(self.refuse(label, "invoke", Some(tag), Refused {
+                                text: "the preview was replaced before it became live; ask again".into(), site: None,
+                            }));
+                            self.refusal_outcome(Some(old_ticket), &mut outcomes);
+                            refusal_changed = true;
+                        }
+                        let seq = self.preview_seq.fetch_add(1, SeqCst) + 1;
+                        let tag = next_tag();
+                        preview_ticket = Some((tag, ticket, label.clone()));
+                        preview = Some(Sample { seq, tag, ops, place, label, by, proposal: None, notes: vec![], circuits, expect: None });
+                    } else {
+                        if !notes.is_empty() {
+                            self.answer_notes.insert(ticket, notes);
+                        }
+                        queue.push_front(Queued {
+                            cmd: Cmd::Commit { circuits, ops, place, label, expect: None, by, ticket: Some(ticket) },
+                            sample: None, seq: None,
+                        });
                     }
                 }
                 Cmd::RouteBase { unit } => {
@@ -756,6 +1337,8 @@ impl Engine {
                                 continue;
                             }
                         };
+                        // doc_set installed the exact DocSet::Add text in Sources. journal_effect
+                        // retains that original Arc while the committed presence step is in hand.
                         let seq = self.steps.fetch_add(1, SeqCst) + 1;
                         self.log.push(OpEntry {
                             seq, by, label, ops: vec![], inverse: vec![], text, text_inverse,
@@ -778,6 +1361,10 @@ impl Engine {
                         if let Some(notes) = sharp_notes(sample) {
                             engine.commit_notes.insert(sample.tag, notes);
                         }
+                        // Return the worker's measurements with the ticket that commits this offer.
+                        if let (Some(notes), Some(&(ticket, _))) = (job_notes(&engine.design, sample), engine.preview_tickets.get(&sample.tag)) {
+                            engine.answer_notes.entry(ticket).or_default().extend(notes);
+                        }
                     };
                     // Its sample was replaced in the slot after this commit was queued: commit it
                     // here, in this command's place, as a plain commit of the sample (verified
@@ -791,9 +1378,9 @@ impl Engine {
                         }
                         self.preview = None;
                         self.clear_preview_jobs(seq);
+                        stash_notes(self, &sample);
                         let ticket = self.preview_tickets.remove(&tag).map(|(ticket, _)| ticket);
                         let reserved = self.needs_verify(&sample.ops).then(|| self.steps.fetch_add(1, SeqCst) + 1);
-                        stash_notes(self, &sample);
                         queue.push_front(Queued {
                             cmd: Cmd::Commit {
                                 ops: sample.ops, place: sample.place, label: sample.label, circuits: sample.circuits, expect: sample.expect,
@@ -847,7 +1434,7 @@ impl Engine {
                     // sample's live preview over it is exactly what the commit makes (the same ops
                     // on the same design): the commit takes its results over, held and merged fills
                     // included, so the drop shows no older fill and refills nothing it filled.
-                    let current = !changed && deltas.is_empty();
+                    let current = !changed && !refreshed && deltas.is_empty();
                     let (sample, carry) = if preview.as_ref().is_some_and(|s| s.seq == seq) {
                         let sample = preview.take().expect("the slot holds this sample");
                         let old = self.preview.take();
@@ -933,8 +1520,9 @@ impl Engine {
                             });
                             continue;
                         }
-                        match self.board_ops(sample.ops, &sample.place)
-                            .and_then(|ops| self.commit(ops, sample.label.clone(), sample.expect, sample.by)) {
+                        match self.check_circuits(&sample.circuits)
+                            .and_then(|()| self.board_ops(sample.ops, &sample.place))
+                            .and_then(|ops| self.commit(ops, sample.label.clone(), sample.expect, sample.by, self.preview_tickets.get(&sample.tag).map(|p| p.0))) {
                             Ok(batch) => {
                                 let (created, sites) = self.board_created();
                                 self.committed(Some(sample.tag), None, created, sites, None, &mut outcomes);
@@ -961,9 +1549,38 @@ impl Engine {
                         refusal_changed = true;
                     }
                 }
+                Cmd::DiscardJob { seq, tag } => {
+                    let mut reason = String::from("the route was discarded");
+                    if let Some((ticket, _)) = self.preview_tickets.get(&tag) {
+                        if let Some(bring) = self.brings.remove(ticket) {
+                            if let Some(why) = bring.separate_step(&self.log) {
+                                reason = format!("{reason}. {why}");
+                            } else {
+                                let entry = self.log.entries.last().expect("the bring is the applied head").clone();
+                                match self.history(&entry, true) {
+                                    Ok(batch) => {
+                                        self.log.entries.pop();
+                                        self.log.head -= 1;
+                                        changed |= batch.changed;
+                                        carried &= !batch.changed;
+                                        fold(&mut deltas, batch.deltas);
+                                    }
+                                    Err(refused) => reason = format!("{reason}. The bring could not be undone: {}", refused.text),
+                                }
+                            }
+                        }
+                    }
+                    if self.waiting_route.as_ref().is_some_and(|(_, _, job)| job.id().tag() == tag) {
+                        self.waiting_route = None;
+                    }
+                    queue.push_front(Queued { cmd: Cmd::RefusePreview { seq, tag, reason }, sample: None, seq: None });
+                }
                 // The host's refusal of a view's sample ends it (and older ones) as a cancel
                 // does, with one refusal under its tag: the stored one if it was refused already.
                 Cmd::RefusePreview { seq, tag, reason } => {
+                    if self.waiting_route.as_ref().is_some_and(|(_, _, job)| job.id().tag() == tag) {
+                        self.waiting_route = None;
+                    }
                     if self.answer_refused(seq, &mut rejected) {
                         refusal_changed = true;
                         continue;
@@ -1044,34 +1661,38 @@ impl Engine {
                     }
                 }
                 Cmd::SetFactories(factories) => {
-                    for unit in &self.design.units {
-                        let (Some(name), Some(board)) = (&unit.factory, &unit.board) else { continue };
-                        let same = match (self.factories.get(name), factories.get(name)) {
-                            (Some(old), Some(new)) => Arc::ptr_eq(old, new),
-                            (None, None) => true,
-                            _ => false,
-                        };
-                        if !same {
-                            engines::merge_delta(deltas.entry(unit.id).or_default(), &BoardDelta {
-                                global: true, bbox: board.outline_bbox(), ..Default::default()
-                            });
+                    if !Arc::ptr_eq(&self.base_factories, &factories) {
+                        self.base_factories = factories;
+                        profiles_changed |= self.refresh_profiles(true, &mut deltas);
+                    }
+                }
+                Cmd::CaseOutcome { unit, stamp, reason } => {
+                    if let Some((ticket, _, job)) = &self.waiting_route {
+                        if let Some(bring) = self.brings.get_mut(ticket).filter(|bring|
+                            job.unit() == unit && bring.wait_for.is_some_and(|generation| stamp >= generation)) {
+                            bring.wait_for = None;
+                            let line = match reason {
+                                Some(why) => format!("the case did not publish for the new parts ({why}): placed without their rooms"),
+                                None => "the parts were brought and waited for the case".into(),
+                            };
+                            self.answer_notes.entry(*ticket).or_default().push(("case".into(), line));
                         }
                     }
-                    self.factories = factories;
                 }
-                Cmd::CaseFindings { unit, generation, mut findings } => {
-                    if self.case.get(&unit).is_some_and(|(held, _)| *held > generation) {
+                Cmd::CaseFindings { unit, generation, run, cased, mut findings } => {
+                    if self.case.get(&unit).is_some_and(|(held, _)| (held.generation, held.run) > (generation, run)) {
                         continue;
                     }
                     let Some(board) = self.design.unit(unit).and_then(|u| u.board.as_ref()) else { continue };
                     findings.sort_by_key(|v| v.id);
                     let waived: HashSet<_> = board.rules.waivers.iter().map(|w| w.violation).collect();
                     findings.retain(|v| !waived.contains(&v.id));
-                    self.case.insert(unit, (generation, Arc::new(findings)));
+                    self.case.insert(unit, (CaseHeld { unit, generation, run, cased }, Arc::new(findings)));
                     case_changed = true;
                 }
-                Cmd::CaseKeepouts { unit, sets } => {
+                Cmd::CaseKeepouts { unit, generation, sets, rooms, plan } => {
                     let Some(board) = self.design.unit(unit).and_then(|u| u.board.as_ref()) else { continue };
+                    self.case_rooms.insert(unit, CaseRooms { generation, ports: rooms, plan });
                     let named = |name: &str| sets.iter().any(|(set, _)| set == name);
                     let mut gone: Vec<FeatureRef> = Vec::new();
                     for keepout in &board.keepouts {
@@ -1134,6 +1755,7 @@ impl Engine {
             }
             let before = self.case.len();
             self.case.retain(|unit, _| self.design.unit(*unit).is_some_and(|u| u.board.is_some()));
+            self.case_rooms.retain(|unit, _| self.design.unit(*unit).is_some_and(|u| u.board.is_some()));
             case_changed |= self.case.len() != before;
             // A waiver committed with the rules applies to the held findings at once, not at the
             // next case rebuild (a rules edit moves no case input). O(C + waivers).
@@ -1150,6 +1772,7 @@ impl Engine {
             self.case_sorted = self.case.values().flat_map(|(_, findings)| findings.iter()).cloned().collect();
             self.case_sorted.sort_by_key(|v| v.id);
             self.case_sorted.dedup_by_key(|v| v.id);
+            self.case_held = Arc::new(self.case.values().map(|(held, _)| *held).collect());
         }
         if changed {
             // Only commits, undo and redo move the committed design; the preview never does.
@@ -1168,7 +1791,7 @@ impl Engine {
         }
         // A committed change rebuilds the live sample over the new committed results; factory
         // changes also require rebasing a live preview's effective rules.
-        let rebase = changed || !deltas.is_empty();
+        let rebase = changed || refreshed || !deltas.is_empty();
         // A circuit result over old text stays visible until its replacement arrives. A running
         // job retries on completion; never queue the older visible sample behind a newer job.
         let text_moved = self.preview.as_ref().and_then(|live| live.carry.as_ref()).is_some_and(|carry| {
@@ -1272,24 +1895,14 @@ impl Engine {
             self.refusal_outcome(Some(ticket), &mut outcomes);
             refusal_changed = true;
         }
-        if changed || preview_changed || case_changed || refusal_changed || self.last_commit != commit_before || !deltas.is_empty()
+        if changed || profiles_changed || refreshed || preview_changed || case_changed || refusal_changed || self.last_commit != commit_before || !deltas.is_empty()
             || self.preview.as_ref().map(|p| p.sample.seq) != preview_before {
             publish(self.make_snapshot(StageFlags::NONE));
             merged = false;
         }
 
-        for (unit, zone, generation, rules, fill) in committed {
-            if self.in_flight.get(&(unit, zone)).is_some_and(|(g, r)| *g == generation && Arc::ptr_eq(r, &rules)) {
-                self.in_flight.remove(&(unit, zone));
-            }
-            if let Some(results) = engines::merge_fill(
-                &self.results, &self.design, unit, zone, generation, &rules, fill,
-            ) {
-                self.results = results;
-                merged = true;
-            }
-        }
-        if merged {
+        merged |= merge_committed(self);
+        if merged || checks_merged {
             publish(self.make_snapshot(StageFlags::NONE));
         }
 
@@ -1314,6 +1927,18 @@ impl Engine {
             });
         }
 
+        let mut checks = Vec::new();
+        for task in engines::owed_checks(&self.results) {
+            let Ok(i) = self.results.boards.binary_search_by_key(&task.unit, |b| b.unit) else { continue };
+            let results = &self.results.boards[i];
+            if self.checks_in_flight.contains_key(&task.unit) {
+                continue;
+            }
+            let Some(board) = self.design.unit(task.unit).and_then(|u| u.board.as_ref()) else { continue };
+            self.checks_in_flight.insert(task.unit, CheckStart { generation: task.generation, fills: results.fills.clone(), base: results.clone(), board: board.clone() });
+            checks.push(CheckJob { task, board: board.clone(), rules: results.rules.clone(), fills: results.fills.clone() });
+        }
+
         if self.eval.is_none() && self.eval_blocked() {
             evals.push(self.start_eval(None));
         }
@@ -1333,7 +1958,7 @@ impl Engine {
             || self.docs.as_ref().map(Docs::revision) != revision {
             publish(self.make_snapshot(StageFlags::NONE));
         }
-        let waiting = !self.held.is_empty() || self.eval.is_some();
+        let waiting = !self.held.is_empty() || !self.waiting_for_fills.is_empty() || self.eval.is_some();
 
         let undo = self.log.head.checked_sub(1).map(|i| self.log.entries[i].seq);
         let redo = if self.logged.load(SeqCst) == self.redo_mark {
@@ -1350,19 +1975,31 @@ impl Engine {
         evals.retain(|job| job.preview.is_none() || self.preview_job.as_ref().is_some_and(|running| running.id == job.id));
         // O(1) when no route is parked; otherwise its unit's committed base, once exact. Before the
         // bases below, so a started unit's base goes once, with its job.
-        if let Some((_, _, job)) = &self.waiting_route {
-            match self.base_of(job.unit) {
-                Some(base) if base.exact => {
-                    let (ticket, by, job) = self.waiting_route.take().expect("a route is parked");
-                    self.routed.insert(job.unit, base.clone());
+        if let Some((ticket, _, job)) = &self.waiting_route {
+            let waiting_case = self.brings.get(ticket).is_some_and(|bring| bring.wait_for.is_some());
+            match self.base_of(job.unit()) {
+                Some(base) if base.exact && !waiting_case => {
+                    let (ticket, by, mut job) = self.waiting_route.take().expect("a route is parked");
+                    if let Job::Place(place) = &mut job {
+                        // A publication can arrive while fills are pending. Its offsets from component
+                        // positions still apply when the board has since changed generation.
+                        if let Some(case) = self.case_rooms.get(&place.unit) {
+                            place.rooms = case.ports.clone();
+                            match &case.plan {
+                                Ok(plan) => place.plan = plan.clone(),
+                                Err(why) => self.answer_notes.entry(ticket).or_default().push(("case_plan".into(), why.clone())),
+                            }
+                        }
+                    }
+                    self.routed.insert(job.unit(), base.clone());
                     routes.push(RouteStart { ticket, by, job, base });
                 }
                 Some(_) => {}
                 None => {
                     let (ticket, _, job) = self.waiting_route.take().expect("a route is parked");
-                    let (_, label) = self.preview_tickets.remove(&job.job.tag()).expect("a parked route retains its caller");
-                    rejected.push(self.refuse(label, "invoke", Some(job.job.tag()), Refused {
-                        text: format!("unit {} has no board", job.unit.0), site: None,
+                    let (_, label) = self.preview_tickets.remove(&job.id().tag()).expect("a parked route retains its caller");
+                    rejected.push(self.refuse(label, "invoke", Some(job.id().tag()), Refused {
+                        text: format!("unit {} has no board", job.unit().0), site: None,
                     }));
                     self.refusal_outcome(Some(ticket), &mut outcomes);
                     publish(self.make_snapshot(StageFlags::NONE));
@@ -1395,7 +2032,17 @@ impl Engine {
         }
         // Keep retired snapshots, answers and samples alive through every publish and all engine work.
         drop((dead, dead_answers, dead_samples));
-        Step { fills, routes, bases, evals, waiting, rejected, outcomes, undo, redo, docs }
+        for (ticket, outcome) in &outcomes {
+            if let Some(reply) = self.gesture_replies.remove(ticket) {
+                match outcome {
+                    Outcome::Done { seq, .. } => reply(Ok(*seq)),
+                    Outcome::Refused(r) => reply(Err(r.text.clone())),
+                    // A press commits its edit; a preview is not its answer, so it keeps waiting.
+                    Outcome::Previewed { .. } => { self.gesture_replies.insert(*ticket, reply); }
+                }
+            }
+        }
+        Step { fills, checks, routes, parked, bases, evals, waiting, rejected, outcomes, undo, redo, docs }
     }
 
     /// Evaluation serialises circuit/bench commits and history, but never blocks board previews.
@@ -1535,6 +2182,7 @@ impl Engine {
         }
         let (_, refusal) = self.refused_preview.take().expect("this sample was refused");
         rejected.push((refusal.label.clone(), refusal.text.clone()));
+        self.finish_gesture_refusal(refusal.sample, &refusal.text);
         self.last_refusal = Some(refusal);
         true
     }
@@ -1566,7 +2214,8 @@ impl Engine {
                 created.extend(done.placed);
                 let keys = with_assets(&self.mesh_keys, &verified.edit.assets);
                 let (design, deltas, replaced) = swap_evaluated(
-                    &self.design, std::mem::take(&mut verified.evaluated.design), &done.same_boards, [&*keys, &self.library_keys],
+                    &self.design, std::mem::take(&mut verified.evaluated.design),
+                    |id, name| docs.board_document(id).is_some() || has_board_doc(&verified.sources, name), &done.same_boards, [&*keys, &self.library_keys],
                 );
                 let results = engines::update_held(&self.results, &design, &deltas, &self.factories);
                 let sheets = self.preview_sheets(&design);
@@ -1728,13 +2377,17 @@ impl Engine {
 
     /// Dispatch history by entry kind; failed text restores the model before the head moves.
     /// A board entry whose units' epochs moved takes the text path, and an evaluation brings the
-    /// board along; its system ops still go to the model (G1: no text holds them yet).
+    /// board and its factory along. Other system ops still go to the model.
     fn history(&mut self, entry: &OpEntry, undo: bool) -> Result<Batch, Refused> {
         let (ops, text) = if undo { (&entry.inverse, &entry.text_inverse) } else { (&entry.ops, &entry.text) };
         if let Some(asset) = text.assets.iter().find(|asset| asset.available && self.mesh_keys.get(&asset.name).is_some_and(|held| *held != asset.key)) {
             return Err(Refused { text: format!("{} holds other bytes since this step: a changed asset reloads the bed's documents", asset.name), site: None });
         }
-        let system_only = || ops.iter().filter(|op| matches!(op, DesignOp::Sys(_))).cloned().collect::<Vec<_>>();
+        let system_only = || ops.iter().filter(|op| match op {
+            DesignOp::Sys(SysOp::SetFactory { unit, .. }) => !entry.epochs.iter().any(|(u, _)| u == unit),
+            DesignOp::Sys(_) => true,
+            _ => false,
+        }).cloned().collect::<Vec<_>>();
         let (model, follows): (std::borrow::Cow<[DesignOp]>, bool) = match entry.kind {
             EntryKind::Board => {
                 let current = self.docs.as_ref().is_none_or(|docs| entry.epochs.iter().all(|(unit, epoch)| docs.epoch(*unit) == *epoch));
@@ -1759,13 +2412,22 @@ impl Engine {
             }
         }
         self.follow_keys(&text.assets);
+        if let Some(journal) = &mut self.journal {
+            let head = |n: usize| n.checked_sub(1).map(|i| self.log.entries[i].seq);
+            let before = head(self.log.head);
+            let after = head(if undo { self.log.head - 1 } else { self.log.head + 1 });
+            let changes = JournalStep { docs: self.docs.as_ref(), step: text };
+            journal.receive(JournalEvent::History { undo, before, after, changes });
+        }
         Ok(batch)
     }
 
     /// Commit the shared swap; per result O(documents + metadata), plus the swap's changed-unit work.
     fn adopt(&mut self, sources: Option<Sources>, mut evaluated: Evaluated, benches: Arc<Vec<BenchView>>, same_boards: &[BoardId], deltas: &mut BTreeMap<BoardId, BoardDelta>) -> bool {
+        let docs = self.docs.as_ref().expect("adoption has documents");
         let (design, changes, replaced) = swap_evaluated(
-            &self.design, std::mem::take(&mut evaluated.design), same_boards, [&self.mesh_keys, &self.library_keys],
+            &self.design, std::mem::take(&mut evaluated.design),
+            |id, name| docs.board_document(id).is_some() || has_board_doc(sources.as_ref().unwrap_or(docs.sources()), name), same_boards, [&self.mesh_keys, &self.library_keys],
         );
         let changed = !Arc::ptr_eq(&design, &self.design);
         self.design = design;
@@ -1788,6 +2450,9 @@ impl Engine {
     /// Cost: pass A over the boards either delta reaches, as for a sample over the committed
     /// results, plus O(units) results clones (`Arc` fields) when a board continues.
     fn live(&self, sample: Sample, old: Option<Live>) -> Result<Live, (Sample, Refused)> {
+        if let Err(reason) = self.check_circuits(&sample.circuits) {
+            return Err((sample, reason));
+        }
         let resolved;
         let ops = if sample.place.is_empty() {
             sample.ops.as_slice()
@@ -1853,12 +2518,20 @@ impl Engine {
         Ok(ops)
     }
 
+    fn finish_gesture_refusal(&mut self, tag: Option<u64>, text: &str) {
+        if let Some(reply) = tag.and_then(|tag| self.gesture_landings.remove(&tag))
+            .and_then(|ticket| self.gesture_replies.remove(&ticket)) {
+            reply(Err(text.to_owned()));
+        }
+    }
+
     fn refuse(&mut self, label: String, op: &'static str, sample: Option<u64>, refused: Refused) -> (String, String) {
         if let Some(tag) = sample {
             self.commit_notes.remove(&tag);
         }
         self.refusals += 1;
         let Refused { text, site } = refused;
+        self.finish_gesture_refusal(sample, &text);
         let reason = crate::refusal::reason(&text);
         self.last_refusal = Some(Arc::new(Refusal {
             seq: self.refusals, label: label.clone(), op, text: text.clone(), reason, site, sample,
@@ -1867,8 +2540,10 @@ impl Engine {
     }
 
     /// Share the exact published refusal with the command's caller.
-    fn refusal_outcome(&self, ticket: Option<Ticket>, outcomes: &mut Vec<(Ticket, Outcome)>) {
+    fn refusal_outcome(&mut self, ticket: Option<Ticket>, outcomes: &mut Vec<(Ticket, Outcome)>) {
         if let (Some(ticket), Some(refusal)) = (ticket, &self.last_refusal) {
+            self.answer_notes.remove(&ticket);
+            self.brings.remove(&ticket);
             outcomes.push((ticket, Outcome::Refused(refusal.clone())));
         }
     }
@@ -1897,19 +2572,42 @@ impl Engine {
         }
         let ticket = ticket.or_else(|| tag.filter(|tag| *tag >= JobId(0).tag())
             .and_then(|tag| self.preview_tickets.remove(&tag).map(|(ticket, _)| ticket)));
+        let ticket = ticket.or_else(|| tag.and_then(|tag| self.gesture_landings.remove(&tag)));
+        self.journal_effect(ticket);
         let Some(entry) = self.log.entries.last() else { return };
         self.last_commit = Some(Arc::new(Committed { seq: entry.seq, tag, by: entry.by, created: created.clone() }));
         if let Some(ticket) = ticket {
             let targets = op_targets(&entry.ops);
             let circuit = text_change.unwrap_or_else(|| circuit_change(&entry.ops));
-            outcomes.push((ticket, Outcome::Done { seq: entry.seq, label: entry.label.clone(), created, sites, by: entry.by, targets, circuit }));
+            let notes = self.answer_notes.remove(&ticket).unwrap_or_default();
+            outcomes.push((ticket, Outcome::Done { seq: entry.seq, label: entry.label.clone(), created, sites, by: entry.by, targets, circuit, notes }));
         }
+    }
+
+    /// A cased board must expose newly brought light ports to its generator. Use the tray
+    /// poses already resolved by place_job, including any spots the circuit fixed.
+    fn bring_for_place(&mut self, place: &mut fab_elec_route::PlaceJob, ticket: Ticket, by: By) -> Result<Option<Batch>, Refused> {
+        if !self.case.get(&place.unit).is_some_and(|(held, _)| held.cased) || !place.add.iter().any(|p| {
+            place.circuit.comps.get(p.comp.ix()).and_then(|c| c.part.body.as_ref())
+                .is_some_and(|body| body.ports.iter().any(|port| port.kind == fab_elec_parts::BodyPortKind::Light))
+        }) { return Ok(None) }
+        let before = self.docs.as_ref().and_then(|docs| docs.map().locate(&Sel::Unit(place.unit))
+            .map(|r| BoardDocument::read(docs, r.doc)));
+        let label = format!("Bring {} parts for placement", place.add.len());
+        let ops = place.add.drain(..).map(|p| DesignOp::Board {
+            unit: place.unit, op: BoardOp::Add(fab_elec_board::Item::Placed(p)),
+        }).collect();
+        let batch = self.commit(ops, label, None, by, None)?;
+        self.journal_effect(Some(ticket));
+        let seq = self.log.entries.last().expect("bring recorded its board edit").seq;
+        self.brings.insert(ticket, Bring { seq, before, wait_for: Some(self.design.generation) });
+        Ok(Some(batch))
     }
 
     /// With documents: the model first (the validator), then the splice of the commit's board ops
     /// into the text. A splice that fails restores the design as it was: an O(1) rollback,
-    /// generations and item allocator included. System ops stay model-only (gap G1).
-    fn commit(&mut self, ops: Vec<DesignOp>, label: String, expect: Option<(BoardId, ContentHash)>, by: By) -> Result<Batch, Refused> {
+    /// generations and item allocator included. The factory header belongs to the board document.
+    fn commit(&mut self, ops: Vec<DesignOp>, label: String, expect: Option<(BoardId, ContentHash)>, by: By, place_ticket: Option<Ticket>) -> Result<Batch, Refused> {
         self.check_expect(expect)?;
         let before = self.docs.is_some().then(|| self.design.clone());
         let mut batch = apply_ops(Arc::make_mut(&mut self.design), &ops, false).map_err(|(i, error)| Refused {
@@ -1919,10 +2617,24 @@ impl Engine {
         let mut text_inverse = TextStep::default();
         let mut epochs = Vec::new();
         if let (Some(docs), Some(before)) = (&mut self.docs, before) {
-            let is_board = |op: &DesignOp| matches!(op, DesignOp::Board { .. });
-            let board: Option<Vec<DesignOp>> = (!ops.iter().all(is_board)).then(|| ops.iter().filter(|op| is_board(op)).cloned().collect());
-            let board = board.as_deref().unwrap_or(&ops);
-            if !board.is_empty() {
+            let written_unit = |op: &DesignOp| match op {
+                DesignOp::Board { unit, .. } => Some(*unit),
+                DesignOp::Sys(SysOp::SetFactory { unit, .. }) if docs.board_document(*unit).is_some() => Some(*unit),
+                _ => None,
+            };
+            let mut count = 0;
+            for unit in ops.iter().filter_map(&written_unit) {
+                count += 1;
+                if !epochs.iter().any(|(u, _)| *u == unit) {
+                    epochs.push((unit, docs.epoch(unit)));
+                }
+            }
+            if count > 0 {
+                let selected;
+                let board = if count == ops.len() { &ops[..] } else {
+                    selected = ops.iter().filter(|op| written_unit(op).is_some()).cloned().collect::<Vec<_>>();
+                    &selected
+                };
                 match docs.commit(&before, board) {
                     Ok((forward, inverse)) => (text, text_inverse) = (forward, inverse),
                     Err(diag) => {
@@ -1931,19 +2643,32 @@ impl Engine {
                         return Err(Refused { text: diag.message, site });
                     }
                 }
-                for op in board {
-                    if let DesignOp::Board { unit, .. } = op {
-                        if !epochs.iter().any(|(u, _)| u == unit) {
-                            epochs.push((*unit, docs.epoch(*unit)));
-                        }
-                    }
-                }
             }
         }
         self.typing = None;
-        // A batch with board ops is a board entry (its system ops ride along on the model, G1);
-        // only a batch of system ops alone is a system entry.
-        let kind = if ops.iter().any(|op| matches!(op, DesignOp::Board { .. })) || ops.is_empty() { EntryKind::Board } else { EntryKind::System };
+        // A spliced factory header follows the same text and epoch history as the board.
+        let kind = if !epochs.is_empty() || ops.iter().any(|op| matches!(op, DesignOp::Board { .. })) || ops.is_empty() { EntryKind::Board } else { EntryKind::System };
+        if let Some((ticket, bring)) = place_ticket.and_then(|t| self.brings.remove(&t).map(|b| (t, b))) {
+            if let Some(why) = bring.separate_step(&self.log) {
+                self.answer_notes.entry(ticket).or_default().push(("undo".into(), why));
+            } else {
+                let entry = self.log.entries.last_mut().expect("the bring is the applied head");
+                if let (Some(before), Some(docs)) = (bring.before, &self.docs) {
+                    let after = BoardDocument::read(docs, before.doc);
+                    entry.text = before.step_to(&after);
+                    entry.text_inverse = after.step_to(&before);
+                    if entry.epochs.iter().any(|(unit, epoch)| docs.epoch(*unit) != *epoch) {
+                        entry.kind = EntryKind::Eval;
+                        entry.epochs.clear();
+                    }
+                }
+                entry.label = label;
+                entry.ops.extend(ops);
+                batch.inverse.append(&mut entry.inverse);
+                entry.inverse = std::mem::take(&mut batch.inverse);
+                return Ok(batch);
+            }
+        }
         let seq = self.steps.fetch_add(1, SeqCst) + 1;
         self.log.push(OpEntry {
             kind, group: None, by, seq,
@@ -1965,6 +2690,7 @@ impl Engine {
     }
 
     /// Cost: O(units) lookup; the hash is cached per board `Arc`. A gesture's base never waits for fills.
+    /// A job's does, and for a board's whole-board checks too: its connectivity is from before them.
     fn base_of(&self, unit: BoardId) -> Option<Base> {
         let board = self.design.unit(unit)?.board.as_ref()?.clone();
         let results = self.results.boards.iter().find(|b| b.unit == unit)?;
@@ -1976,7 +2702,7 @@ impl Engine {
             fills: results.fills.clone(),
             delta: None,
             hash: self.board_hash(unit)?,
-            exact: results.pending.zones.is_empty(),
+            exact: results.pending.zones.is_empty() && !results.pending.whole,
         })
     }
 
@@ -2063,6 +2789,51 @@ impl Engine {
         }).collect()
     }
 
+    /// Board-wide factory checks share the snapshot merge with DRC. A fresh board or
+    /// capability set costs one outline walk, the profile's offered sizes, and four minima.
+    fn factory_findings(&self) -> Vec<Violation> {
+        let design = self.preview.as_ref().map_or(&self.design, |p| &p.design);
+        let mut cache = self.factory_checks.borrow_mut();
+        cache.retain(|id, _| design.unit(*id).is_some_and(|u| u.factory.is_some() && u.board.is_some()));
+        let mut out = Vec::new();
+        for unit in &design.units {
+            let (Some(board), Some(name)) = (&unit.board, &unit.factory) else { continue };
+            let caps = self.factories.get(name);
+            let doc = if caps.is_none() {
+                match self.preview.as_ref().and_then(|p| p.carry.as_ref()) {
+                    Some(carry) => carry.sources.find(&format!("{}.pcb.splash", unit.name)).and_then(|id| carry.sources.doc(id)),
+                    None => self.docs.as_ref().and_then(|docs| docs.board_document(unit.id)).filter(|d| d.present),
+                }
+            } else { None };
+            let current = cache.get(&unit.id).filter(|c| c.board.as_ptr() == Arc::as_ptr(board)
+                && c.profile == *name && c.factories.as_ptr() == Arc::as_ptr(&self.factories)
+                && match (&c.source, doc) {
+                    (Some((id, text)), Some(d)) => *id == d.id && std::ptr::eq(text.as_ptr(), Arc::as_ptr(&d.text)),
+                    (None, None) => true, _ => false,
+                });
+            let held = if let Some(current) = current { current } else {
+                let findings = if let Some(caps) = caps {
+                    let mut findings = fab_elec_cam::caps::board_limits(board, caps, name, unit.id);
+                    findings.extend(fab_elec_cam::caps::raised_rules(board, caps, name));
+                    findings
+                } else {
+                    let known = self.profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ");
+                    let site = doc.and_then(|d| fab_elec_lang::board_doc::factory_site(d.id, &d.text)).unwrap_or(Sel::Unit(unit.id));
+                    vec![Violation::new(CheckKind::Custom("factory.unknown".into()), Severity::Error,
+                        Some(unit.id), vec![site], &format!("factory:{name}:unknown"),
+                        format!("factory {name:?} is not a known profile; known: {known}"))
+                        .hint("choose a listed factory or correct the profile document")]
+                };
+                cache.insert(unit.id, FactoryChecks { board: Arc::downgrade(board), profile: name.clone(),
+                    factories: Arc::downgrade(&self.factories), source: doc.map(|d| (d.id, Arc::downgrade(&d.text))), findings });
+                &cache[&unit.id]
+            };
+            out.extend_from_slice(&held.findings);
+        }
+        out.sort_by_key(|v| v.id);
+        out
+    }
+
     /// Merge checks, case findings and session notes in linear time once the live notes are sorted.
     fn make_snapshot(&self, mut stale: StageFlags) -> Arc<DesignSnapshot> {
         if self.eval_blocked() || self.preview_job.is_some() {
@@ -2077,6 +2848,10 @@ impl Engine {
             fills.push(Tagged { unit: Some(b.unit), of: StateOf::Committed, generation: b.generation, value: b.fills.clone() });
             if !b.pending.zones.is_empty() {
                 stale = stale.with(StageFlags::FILLS);
+            }
+            // Results owing their whole board run connectivity and DRC after the last fill.
+            if b.pending.whole {
+                stale = stale.with(StageFlags::CONNECT).with(StageFlags::DRC);
             }
         }
         if let Some(preview) = &self.preview {
@@ -2094,15 +2869,18 @@ impl Engine {
             }
         }
         let (of, results) = self.preview.as_ref().map_or((StateOf::Committed, &self.results), |p| (StateOf::Preview, &p.results));
-        let mut awaiting: Vec<_> = results.boards.iter().flat_map(|b| {
+        // A board that owes its whole-board checks shows none of its findings yet (`engines::violations`).
+        let mut awaiting: Vec<_> = results.boards.iter().filter(|b| !b.pending.whole).flat_map(|b| {
             b.drc.iter().filter(move |v| engines::awaits_refill(b, v)).map(|v| v.id)
         }).collect();
+        let checking = results.boards.iter().filter(|b| b.pending.whole).map(|b| b.unit).collect();
         awaiting.sort_unstable();
         awaiting.dedup();
         let checks = engines::violations(results);
         let live = self.preview.as_ref().and_then(|p| sharp_notes(&p.sample));
         // Checks win ties. A live note for the same track shows its newest corner.
-        let mut extra = [self.case_sorted.as_slice(), live.as_ref().map_or(&[][..], |(_, notes)| notes.as_slice()),
+        let factory = self.factory_findings();
+        let mut extra = [factory.as_slice(), self.case_sorted.as_slice(), live.as_ref().map_or(&[][..], |(_, notes)| notes.as_slice()),
             self.notes_sorted.as_slice()];
         let count: usize = extra.iter().map(|list| list.len()).sum();
         let violations = if count == 0 {
@@ -2128,6 +2906,7 @@ impl Engine {
             out
         };
         Arc::new(DesignSnapshot {
+            profiles: self.profiles.clone(), profile_diags: self.profile_diags.clone(),
             design: self.design.clone(),
             preview: self.preview.as_ref().map(|p| p.design.clone()),
             preview_tag: self.preview.as_ref().map(|p| p.sample.tag),
@@ -2147,6 +2926,8 @@ impl Engine {
             }),
             violations: Tagged { unit: None, of, generation: results.generation, value: Arc::new(violations) },
             awaiting: Arc::new(awaiting),
+            cases: self.case_held.clone(),
+            checking,
             last_refusal: self.last_refusal.clone(),
             export: vec![], proposal: self.preview.as_ref().and_then(|p| p.sample.proposal.clone()), head: self.head.clone(), stale,
             job: None,
@@ -2158,11 +2939,15 @@ impl Engine {
     }
 }
 
+fn has_board_doc(sources: &Sources, name: &str) -> bool {
+    sources.find(&format!("{name}.pcb.splash")).is_some()
+}
+
 /// Per result: unit lookups, changed components' mesh resolution, and O(items) per replaced board.
 /// A changed unit's bodies resolve through `mesh_keys` in order: the plate's files, then the part
 /// library's models (a resolved key is no project path, so a later map leaves it).
 fn swap_evaluated(
-    current: &Arc<Design>, mut evaluated: Design, same_boards: &[BoardId], mesh_keys: [&BTreeMap<String, String>; 2],
+    current: &Arc<Design>, mut evaluated: Design, document_factory: impl Fn(BoardId, &str) -> bool, same_boards: &[BoardId], mesh_keys: [&BTreeMap<String, String>; 2],
 ) -> (Arc<Design>, Vec<(BoardId, BoardDelta)>, Vec<BoardId>) {
     let mut design = (**current).clone();
     let mut changed = false;
@@ -2177,6 +2962,12 @@ fn swap_evaluated(
         if let Some(old) = design.units.iter_mut().find(|old| old.id == unit.id) {
             if !Arc::ptr_eq(&old.circuit, &unit.circuit) {
                 old.circuit = unit.circuit.clone();
+                changed = true;
+            }
+            if old.factory != unit.factory && document_factory(unit.id, &unit.name) {
+                old.factory = unit.factory.clone();
+                let bbox = old.board.as_ref().map_or(Default::default(), |board| board.outline_bbox());
+                fold(&mut deltas, [(unit.id, BoardDelta { global: true, bbox, ..Default::default() })]);
                 changed = true;
             }
             if old.supplied != unit.supplied {
@@ -2227,15 +3018,10 @@ fn swap_evaluated(
     design.units.retain(|unit| evaluated.units.iter().any(|new| new.id == unit.id));
     changed |= design.units.len() != before;
     // THE CARRY (G1): step 6 deletes this block when system text is re-lowered here.
-    // Links, assembly, bindings and each existing unit's factory remain the engine's.
+    // Links, assembly and bindings remain the engine's.
     design.links = current.links.clone();
     design.assembly = current.assembly.clone();
     design.bindings = current.bindings.clone();
-    for unit in &mut design.units {
-        if let Some(old) = current.unit(unit.id) {
-            unit.factory = old.factory.clone();
-        }
-    }
     // A re-lowered board keeps the derived items its old board had (a case's keepouts): no text
     // writes them, and their source replaces them when it next publishes. O(items) per replaced
     // board to find them, plus `Design::set_derived` per source.
@@ -2344,7 +3130,7 @@ fn op_targets(ops: &[DesignOp]) -> Vec<Sel> {
     let mut out: Vec<Sel> = Vec::new();
     for op in ops {
         let sel = match op {
-            DesignOp::Circuit { unit, op: CircuitOp::SetValue { comp, .. } | CircuitOp::SetField { comp, .. } | CircuitOp::SetRef { comp, .. } } => {
+            DesignOp::Circuit { unit, op: CircuitOp::SetValue { comp, .. } | CircuitOp::SetField { comp, .. } | CircuitOp::SetDnp { comp, .. } | CircuitOp::SetRef { comp, .. } } => {
                 Sel::Comp(CompRef { board: *unit, comp: *comp })
             }
             DesignOp::Board { unit, op: BoardOp::Move { item, .. } | BoardOp::SetField { item, .. } | BoardOp::Detach(item) } => Sel::Item(*unit, *item),
@@ -2365,7 +3151,7 @@ fn circuit_change(ops: &[DesignOp]) -> CircuitChange {
         match op {
             DesignOp::Board { .. } => {}
             DesignOp::Circuit {
-                op: CircuitOp::Hint { .. } | CircuitOp::NetStyle { .. } | CircuitOp::SetField { .. } | CircuitOp::SetRef { .. } | CircuitOp::SetBody { .. }, ..
+                op: CircuitOp::Hint { .. } | CircuitOp::NetStyle { .. } | CircuitOp::SetField { .. } | CircuitOp::SetDnp { .. } | CircuitOp::SetRef { .. } | CircuitOp::SetBody { .. }, ..
             } => {}
             DesignOp::Circuit { op: CircuitOp::SetValue { .. }, .. } => change = CircuitChange::Values,
             DesignOp::Circuit { .. } | DesignOp::Bench { .. } | DesignOp::Sys(_) | DesignOp::File(_) => return CircuitChange::Structure,

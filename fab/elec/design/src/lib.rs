@@ -29,7 +29,7 @@ pub mod syserc;
 pub mod sysnets;
 pub mod trace;
 
-use fab_elec_board::{pairs_of, Board};
+use fab_elec_board::{edge_parts_of, pairs_of, Board};
 use fab_elec_circuit::Circuit;
 use fab_elec_core::{canon_enum, canon_struct, canon_tags, BlockId, BoardId, CompRef, Diag, FeatureRef, LinkId, NetId, NetRef, Nm, PinIx, PinRef, Sel, Xform3};
 use fab_elec_parts::{BodySource, VRange};
@@ -444,6 +444,9 @@ fn board_consistent(u: &Unit, b: &Board, err: &mut impl FnMut(String, Vec<Sel>))
     }
     if b.pairs != pairs_of(c) {
         err(format!("unit {}: the board's pairs do not mirror the circuit's", u.name), us.clone());
+    }
+    if b.edge_parts != edge_parts_of(c) {
+        err(format!("unit {}: the board's edge parts do not mirror the circuit's", u.name), us.clone());
     }
     let mut ids: Vec<fab_elec_core::ItemId> = Vec::new();
     for p in &b.placed {

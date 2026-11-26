@@ -8,7 +8,7 @@
 
 use fab::ui::code::{FeatureRow, SourceState, SourceTab, SETTINGS_KIND};
 use fab_model::program::{part_id, Compiled, Instance};
-use fab_model::{Change, Edit};
+use fab_model::{Anchor, Change, Edit};
 use makepad_model_script::lang::protos::{self, Group, PROTOS};
 use std::sync::Arc;
 
@@ -89,7 +89,7 @@ pub fn rows(inst: &Instance) -> Vec<FeatureRow> {
             Some(head) if done.insert(head.to_string()) => {
                 let members: Vec<usize> = tops.iter().copied().filter(|j| call_of(*j) == Some(head)).collect();
                 let range = p.names.syntax.find_let(head).and_then(|loc| p.names.syntax.node(&loc)).map_or(0..0, |n| n.span.clone());
-                out.push(FeatureRow { id: head.to_string(), op: "call".into(), line: (tree.line_of)(range.start), range, depth: 0, editable: true, group: true, ..Default::default() });
+                out.push(FeatureRow { id: head.to_string(), op: "call".into(), verb: "call".into(), line: (tree.line_of)(range.start), range, depth: 0, editable: true, group: true, ..Default::default() });
                 let at = out.len() - 1;
                 tree.list(&members, 1, &mut out);
                 out[at].children = out[at + 1..].iter().filter(|r| r.depth == 1).count();
@@ -306,6 +306,7 @@ fn study_rows(inst: &Instance, tree: &Tree, out: &mut Vec<FeatureRow>) {
         out.push(FeatureRow {
             id,
             op: call.into(),
+            verb: call.into(),
             object: part_id(&inst.name, object),
             line: (tree.line_of)(range.start),
             range,
@@ -361,7 +362,7 @@ impl Tree<'_> {
                 let off = group.iter().all(|j| p.solids[list[*j]].off);
                 let root = group.iter().any(|j| self.roots.contains(&list[*j]));
                 let object = part_id(&self.inst.name, &id);
-                out.push(FeatureRow { id, object, op, line: (self.line_of)(range.start), range, depth, role: role(p, list[k]), detail: format!("×{n}"), children: n, editable: true, group: true, off, root, ..Default::default() });
+                out.push(FeatureRow { id, object, verb: op.clone(), op, line: (self.line_of)(range.start), range, depth, role: role(p, list[k]), detail: format!("×{n}"), children: n, editable: true, group: true, off, root, ..Default::default() });
                 for j in group {
                     self.solid(list[j], depth + 1, false, out);
                 }
@@ -382,10 +383,17 @@ impl Tree<'_> {
             "Import" => p.source()[range.clone()].split('"').nth(1).unwrap_or("").to_string(),
             _ => String::new(),
         };
+        // A box with print settings shows that role whatever its shape.
+        let (op, verb) = if self.settings.contains(&i) {
+            (SETTINGS_KIND.to_string(), std::borrow::Cow::Borrowed(SETTINGS_KIND))
+        } else {
+            let call = protos::proto(s.proto).expect("a compiled solid has a prototype").call;
+            (s.proto.to_lowercase(), fab_model::steps::verb(call))
+        };
         out.push(FeatureRow {
             id: s.id.clone(),
-            // a box print settings are set in is that, whatever its shape
-            op: if self.settings.contains(&i) { SETTINGS_KIND.to_string() } else { s.proto.to_lowercase() },
+            op,
+            verb: verb.into(),
             object: part_id(&self.inst.name, &s.id),
             link: s.link.clone().unwrap_or_default(),
             line: (self.line_of)(range.start),
@@ -618,7 +626,7 @@ pub fn with_op(inst: &Instance, name: &str, selected: Option<&str>) -> Option<(V
         "Form" => FORM_EXAMPLE,
         _ => p.example,
     };
-    let mut edits = vec![Edit::Add { code: format!("let {id} = {example}"), before: None }];
+    let mut edits = vec![Edit::Add { code: format!("let {id} = {example}"), at: Anchor::Auto }];
     let local = selected.and_then(|s| s.strip_prefix(&format!("{}/", inst.name))).filter(|_| p.field("source").is_some());
     if let Some(src) = local {
         edits.push(Edit::Field { solid: id.clone(), field: "source".into(), code: src.to_string() });
@@ -627,7 +635,7 @@ pub fn with_op(inst: &Instance, name: &str, selected: Option<&str>) -> Option<(V
         }
     }
     if p.field("source").is_none() || local.is_some() {
-        edits.push(Edit::Add { code: format!("object({id})"), before: None });
+        edits.push(Edit::Add { code: format!("object({id})"), at: Anchor::Auto });
     }
     let file = inst.script.file.clone();
     Some((edits.into_iter().map(|edit| Change::Script { file: file.clone(), edit }).collect(), part_id(&inst.name, &id)))

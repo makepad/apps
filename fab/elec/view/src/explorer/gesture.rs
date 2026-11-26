@@ -185,6 +185,8 @@ impl<'a> ByPath<'a> {
 
 /// The output of every input: at most one action (V2) and the phase after it.
 pub(super) struct Step {
+    /// Only a release reports a rejected invocation. Pointer samples are previews.
+    pub refused_call: Option<(crate::snapshot::Invocation, String)>,
     /// The single action to send to the host, if any.
     pub action: Option<ViewAction>,
     /// The resulting phase.
@@ -195,6 +197,7 @@ pub(super) struct Step {
 
 /// Pure wire input. Arc clones happen at the press only; at rest there is no work.
 pub(super) struct EditGesture {
+    pub(super) library_key: Option<crate::library::EntryKey>,
     /// The only source of hit geometry and planning ids.
     frozen: Frozen,
     /// What was pressed.
@@ -255,7 +258,7 @@ impl EditGesture {
             }
         }).unwrap_or_default();
         Some(Self {
-            frozen, source, phase: Phase::Armed, from, origin, at: from, target,
+            library_key: None, frozen, source, phase: Phase::Armed, from, origin, at: from, target,
             planned: Planned::Nothing { chip: String::new() }, pick: 0, count: 1,
             chip: opening.clone(), opening, look: ChipLook::Plain,
             tag: None, shown: false, refusal: None, deferred: None, turn: 0, mirror: false,
@@ -272,7 +275,7 @@ impl EditGesture {
     /// A carried `source` at `at`, dragging from the start; `opening` is the chip before a plan.
     fn carry_from(frozen: Frozen, source: Source, opening: String, at: [f64; 2]) -> Self {
         Self {
-            frozen, source, phase: Phase::Dragging, from: at, origin: at, at,
+            library_key: None, frozen, source, phase: Phase::Dragging, from: at, origin: at, at,
             target: Target::None, planned: Planned::Nothing { chip: String::new() }, pick: 0, count: 1,
             chip: opening.clone(), opening, look: ChipLook::Plain,
             tag: None, shown: false, refusal: None, deferred: None, turn: 0, mirror: false,
@@ -327,8 +330,13 @@ impl EditGesture {
         {
             let end = (*from, self.at);
             self.phase = Phase::Idle;
-            return Step { action: self.cancel(), phase: Phase::Idle, name_end: Some(end) };
+            return Step { refused_call: None, action: self.cancel(), phase: Phase::Idle, name_end: Some(end) };
         }
+        let refused_call = if matches!(self.phase, Phase::Dragging | Phase::ClickWire)
+            && (self.tag().is_none() || self.refusal().is_some()) {
+            self.invocation().map(|call| (call, self.refusal().or_else(|| self.note().map(|n| n.0))
+                .filter(|s| !s.is_empty()).unwrap_or("nothing changed").to_owned()))
+        } else { None };
         let action = match self.phase {
             Phase::Armed if matches!(self.source, Source::Wire(Target::Pin { .. })) => {
                 self.phase = Phase::ClickWire;
@@ -346,7 +354,7 @@ impl EditGesture {
             }
             _ => None,
         };
-        self.step(action)
+        Step { refused_call, ..self.step(action) }
     }
 
     /// R turns a carried part a quarter clockwise (Shift: counter-clockwise), as R turns a
@@ -366,6 +374,17 @@ impl EditGesture {
         if flip_vertical { self.turn = (self.turn + 2) % 4; }
         if !matches!(self.target, Target::Canvas { .. }) { return self.step(None); }
         self.replan()
+    }
+
+    /// Resolve names only when the person releases the gesture.
+    pub(super) fn invocation(&self) -> Option<crate::snapshot::Invocation> {
+        let unit = self.frozen.design.units.get(self.frozen.unit)?;
+        let wire = match &self.source {
+            Source::Carry { .. } => return super::view::library_invocation(unit, self.library_key.as_ref()?, self.target, &self.planned),
+            Source::Wire(from) => Gesture::Wire { from: *from, to: self.target },
+            Source::Rail { net, kind } => Gesture::Wire { from: self.target, to: Target::Tag { net: *net, kind: *kind } },
+        };
+        super::view::sheet_invocation(unit, &wire, &[], &self.planned)
     }
 
     /// Whether the gesture carries a Library entry or a rail (no rubber wire, no drag threshold).
@@ -614,7 +633,7 @@ impl EditGesture {
     }
 
     /// Finish one input without hiding extra actions in the state machine.
-    fn step(&self, action: Option<ViewAction>) -> Step { Step { action, phase: self.phase, name_end: None } }
+    fn step(&self, action: Option<ViewAction>) -> Step { Step { refused_call: None, action, phase: self.phase, name_end: None } }
 }
 
 /// A carry's places: the same pin, the same net, or the same canvas cell of the same block.

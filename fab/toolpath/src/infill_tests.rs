@@ -6,7 +6,11 @@
 use crate::infill::{self, Aux, SparseIn, SparseOpts, Stroke};
 use crate::pattern::{Sparse, Surface};
 use crate::patterns::Ctx;
+use crate::plate_tests::{input, job};
+use crate::{check, par, plan_one, ObjectInput, ObjectPlan, Role};
+use makepad_fab_settings::machine::Job;
 use makepad_fab_slicer::geom::*;
+use makepad_fab_slicer::sdf::SdfSource;
 
 const S: f64 = 0.407; // 0.45 bead at 0.2 mm
 const D: f64 = 0.15;
@@ -24,6 +28,7 @@ fn region(size: f64) -> Vec<ExPolygon> {
 
 fn opts() -> SparseOpts {
     SparseOpts {
+        adaptive: None,
         shift_step: 0.4,
         rotate_step: 0.0,
         lattice: [(-45f64).to_radians(), 45f64.to_radians()],
@@ -120,7 +125,7 @@ fn expectation(p: Sparse) -> Option<(f64, f64, f64)> {
         Sparse::Grid => (1.0, 0.1, 1.0),
         Sparse::Triangles | Sparse::TriHexagon | Sparse::Cubic => (1.0, 0.1, 2.0),
         Sparse::Lattice2d => (1.0, 0.1, 2.0),
-        Sparse::Gyroid => (1.0, 0.15, 1.0),
+        Sparse::Gyroid | Sparse::TpmsD | Sparse::TpmsFk => (1.0, 0.15, 1.0),
         // Folded transition layers run up to √2 longer.
         Sparse::CrossHatch => (1.15, 0.3, 1.0),
         Sparse::Hilbert | Sparse::ArchimedeanChords | Sparse::OctagramSpiral => (1.0, 0.12, 1.0),
@@ -156,6 +161,215 @@ fn every_sparse_pattern_density_containment_coverage() {
         }
     }
     eprintln!("{report}");
+}
+
+/// Mark vertices covered by each target segment, searching only its x interval.
+fn gyroid_vertices_match(from: &crate::clipper::Pieces, to: &crate::clipper::Pieces) -> bool {
+    let mut vertices: Vec<_> = from.pts.iter().map(|&pt| (pt, false)).collect();
+    vertices.sort_unstable_by_key(|v| v.0.x);
+    let tol = scaled(0.02);
+    for i in 0..to.len() {
+        for w in to.piece(i).windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let lo = vertices.partition_point(|v| v.0.x < a.x.min(b.x) - tol);
+            let hi = vertices.partition_point(|v| v.0.x <= a.x.max(b.x) + tol);
+            for (p, hit) in &mut vertices[lo..hi] {
+                if !*hit && p.y >= a.y.min(b.y) - tol && p.y <= a.y.max(b.y) + tol {
+                    *hit = dist_point_segment(*p, a, b) <= tol as f64;
+                }
+            }
+        }
+    }
+    vertices.iter().all(|v| v.1)
+}
+
+#[test]
+fn tpms_sections_follow_the_field_and_meet_the_walls() {
+    use crate::clipper::{Clipper, Pieces, FREE};
+    use crate::patterns::{gyroid, GYROID_PERIOD};
+    use crate::tpms::{Tpms, DIAMOND_PERIOD, FISCHER_KOCH_PERIOD};
+    use std::f64::consts::TAU;
+
+    let r = region(38.0);
+    let mut clip = Clipper::new(&r);
+    let pivot = Pt::new(0, 0);
+    let base = S / D;
+    let mut closed_fk = false;
+    for li in [0, 6, 11] {
+        let z = 0.2 * (li + 1) as f64;
+        for (surface, period, pattern) in [
+            (Tpms::Gyroid, 2.0 * GYROID_PERIOD * base, None),
+            (Tpms::Diamond, DIAMOND_PERIOD * base, Some(Sparse::TpmsD)),
+            (Tpms::FischerKoch, FISCHER_KOCH_PERIOD * base, Some(Sparse::TpmsFk)),
+        ] {
+            let height = if pattern.is_none() { z - period / 4.0 } else { z };
+            let (pieces, loops) = surface.contours(&mut clip, pivot, height, period);
+            assert!(!pieces.is_empty(), "{surface:?} L{li}: no wall-to-wall contours");
+            if let Some(pat) = pattern {
+                assert!(pieces.ea.iter().chain(&pieces.eb).all(|&e| e != FREE), "{pat:?} L{li}: clipped contour has a free end");
+                for stroke in run(pat, &r, &Aux::None, li) {
+                    if stroke.closed {
+                        let ring = Polygon::new(stroke.pts);
+                        assert!(ring.perimeter() >= 4.0 * stroke.width * SCALE, "{pat:?} L{li}: printed a dot-sized loop");
+                        closed_fk |= pat == Sparse::TpmsFk;
+                    } else {
+                        for p in [stroke.pts[0], *stroke.pts.last().unwrap()] {
+                            assert!(clip.boundary_within(p, scaled(0.01)) <= scaled(0.005) as f64, "{pat:?} L{li}: stroke end {p:?} inside the region");
+                        }
+                    }
+                }
+            } else {
+                let mut analytic = Pieces::default();
+                gyroid(&mut clip, z, base, pivot, &mut analytic);
+                assert!(loops.is_empty(), "gyroid L{li}: found a closed loop between analytic waves");
+                assert!(gyroid_vertices_match(&pieces, &analytic), "gyroid L{li}: contour vertex over 0.02 mm from analytic lines");
+                assert!(gyroid_vertices_match(&analytic, &pieces), "gyroid L{li}: analytic vertex over 0.02 mm from contour lines");
+                let reference = analytic.length_mm();
+                assert!((pieces.length_mm() - reference).abs() <= 0.01 * reference, "gyroid L{li}: raw lengths differ by over 1%");
+            }
+
+            // Independent textbook field and its in-plane gradient per mm. Include the
+            // vertices clipping creates on the outer wall and the wall of the hole.
+            let k = TAU / period;
+            let (sz, cz) = (k * height).sin_cos();
+            let field = |x: f64, y: f64| {
+                let (x, y) = (k * x, k * y);
+                let (sx, cx) = x.sin_cos();
+                let (sy, cy) = y.sin_cos();
+                match surface {
+                    Tpms::Gyroid => sx * cy + sy * cz + sz * cx,
+                    Tpms::Diamond => sx * sy * sz + sx * cy * cz + cx * sy * cz + cx * cy * sz,
+                    Tpms::FischerKoch => (2.0 * x).cos() * sy * cz + cx * (2.0 * y).cos() * sz + sx * cy * (2.0 * k * height).cos(),
+                }
+            };
+            let delta = 1e-5;
+            for &pt in pieces.pts.iter().chain(loops.iter().flatten()) {
+                let p = pt.sub(pivot);
+                let (x, y) = (p.x_mm(), p.y_mm());
+                let dx = (field(x + delta, y) - field(x - delta, y)) / (2.0 * delta);
+                let dy = (field(x, y + delta) - field(x, y - delta)) / (2.0 * delta);
+                let error = field(x, y).abs() / dx.hypot(dy);
+                assert!(error < 0.005, "{surface:?} L{li}: contour vertex {pt:?} is {error:.6} mm off the zero set");
+            }
+        }
+    }
+    assert!(closed_fk, "Fischer-Koch S: no interior loop survived as a closed stroke");
+}
+
+#[test]
+fn graded_tpms_cube_sections() {
+    use crate::clipper::{Clipper, Pieces, FREE};
+    use crate::grade::{graded, Adaptive, Depth};
+    use crate::patterns::GYROID_PERIOD;
+    use crate::tpms::{DIAMOND_PERIOD, FISCHER_KOCH_PERIOD};
+    use crate::warp::Gradient;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let (sparse, interior, h) = (0.2, 0.1, 0.2);
+    let base = S / sparse;
+    let period = 2.0 * GYROID_PERIOD * base;
+    let square = |lo, hi| [ExPolygon::new(Polygon::rect(Pt::from_mm(lo, lo), Pt::from_mm(hi, hi)))];
+    let outline = square(0.0, 30.0);
+    let layers: Vec<_> = (1..=150).map(|i| (i as f64 * h, h, &outline[..])).collect();
+    let build = |i, lobes| Arc::new(graded(&layers, &Adaptive { interior: i, gradient: Gradient::Linear, lobes }, sparse, period));
+    let g = build(interior, false);
+    let lobes = build(interior, true);
+    for z in [0.0, 7.3, 15.0, 29.8] { for y in [0.4, 11.7, 26.0] { for x in [1.1, 15.0, 30.0] {
+        let p = [x, y, z];
+        let (a, b) = (g.warp.at(p), lobes.warp.at(p));
+        assert_eq!(a.map(f64::to_bits), b.map(f64::to_bits), "30 mm cube warp at {p:?}: distance {a:?}, lobes {b:?}");
+    }}}
+    let aux = Aux::Warp(Arc::clone(&g));
+    let zero = Aux::Warp(build(sparse, false));
+    // The constant outline occupies one slab. Sample the same voxel-centred t as the builder.
+    let depth = Depth::new(&[(0.0, 30.0, &outline)], period);
+    let shell = |t: f64| (t >= 0.5) as usize;
+    let wall = 0.5;
+    let region = square(wall, 30.0 - wall);
+    let clip = Clipper::new(&region);
+    let pivot = bbox_of(&outline).center();
+    let o = opts();
+    let as_pieces = |strokes: &[Stroke]| {
+        let mut pieces = Pieces::default();
+        for s in strokes {
+            pieces.push(&s.pts, FREE, FREE);
+            if s.closed { pieces.push(&[*s.pts.last().unwrap(), s.pts[0]], FREE, FREE); }
+        }
+        pieces
+    };
+    let mut failures = Vec::new();
+    let mut report = format!("stretch {:.5}, scales {:?}, build {:.2} ms\n", g.stretch, g.scales, g.ms);
+    for (pat, band) in [(Sparse::Gyroid, period), (Sparse::TpmsD, DIAMOND_PERIOD * base), (Sparse::TpmsFk, FISCHER_KOCH_PERIOD * base)] {
+        let first = layers.partition_point(|l| l.0 < 15.0 - band / 2.0);
+        let end = layers.partition_point(|l| l.0 < 15.0 + band / 2.0);
+        // Two shells, outside and inside half the depth: a TPMS section's own density varies at
+        // the scale of its period, so shells much smaller than a few periods only measure that.
+        let mut area = [0.0; 2];
+        let mut asked = [0.0; 2];
+        let mut lengths = [0.0; 2];
+        let mut plain_lengths = [0.0; 2];
+        let mut times = Vec::new();
+        for li in first..end {
+            let z = layers[li].0;
+            // Omit optional wall runs so the measured length comes from the TPMS section.
+            let inp = SparseIn { region: &region, width: 0.45, spacing: S, density: sparse,
+                ctx: Ctx { li, z, pivot, dir: 0.0 }, anchor: 0.0, max: 0.0, reach: 0.0, bridge_loop: false, height: h };
+            let timed = |aux| {
+                let start = Instant::now();
+                let strokes = infill::sparse(pat, &o, aux, &inp);
+                (strokes, start.elapsed().as_secs_f64() * 1000.0)
+            };
+            let (warped, warped_ms) = timed(&aux);
+            let (plain, plain_ms) = timed(&Aux::None);
+            times.push((li, warped_ms, plain_ms));
+            if warped.is_empty() { failures.push(format!("{pat:?} L{li}: empty warped section")); }
+            for s in &warped {
+                if s.closed {
+                    let mm = length(std::slice::from_ref(s));
+                    if mm < 4.0 * s.width { failures.push(format!("{pat:?} L{li}: closed stroke only {mm:.5} mm")); }
+                } else {
+                    for p in [s.pts[0], *s.pts.last().unwrap()] {
+                        let gap = clip.boundary_within(p, scaled(30.0)) / SCALE;
+                        if gap > 0.005 { failures.push(format!("{pat:?} L{li}: open end {p:?} is {gap:.5} mm from the wall")); }
+                    }
+                }
+            }
+            let identity = as_pieces(&infill::sparse(pat, &o, &zero, &inp));
+            let uniform = as_pieces(&plain);
+            let exact = identity.pts == uniform.pts && identity.span == uniform.span;
+            if !exact && !(gyroid_vertices_match(&identity, &uniform) && gyroid_vertices_match(&uniform, &identity)) {
+                failures.push(format!("{pat:?} L{li}: zero warp and plain strokes differ by over 0.02 mm"));
+            }
+
+            // Shift the 0.5 mm sample grid across the band so square depth shells do not
+            // always round outwards or inwards. Each sample still covers exactly 0.25 mm².
+            let phase = ((li - first) as f64 + 0.5) / (end - first) as f64;
+            let side = ((30.0 - 2.0 * wall) / 0.5) as usize;
+            for j in 0..side { for i in 0..side {
+                let t = depth.at([wall + (i as f64 + phase) * 0.5, wall + (j as f64 + phase) * 0.5, z]).0;
+                area[shell(t)] += 0.25;
+                asked[shell(t)] += 0.25 * Gradient::Linear.density(sparse, interior, t) / sparse;
+            }}
+            for (strokes, bins) in [(&warped, &mut lengths), (&plain, &mut plain_lengths)] {
+                for (a, b) in segments(strokes) {
+                    let p = lerp(a, b, 0.5);
+                    bins[shell(depth.at([p.x_mm(), p.y_mm(), z]).0)] += a.dist(b) / SCALE;
+                }
+            }
+        }
+        let ratio = |i: usize| lengths[i] / plain_lengths[i];
+        let want = |i: usize| asked[i] / area[i];
+        let total = lengths.iter().sum::<f64>() / plain_lengths.iter().sum::<f64>();
+        let want_total = asked.iter().sum::<f64>() / area.iter().sum::<f64>();
+        let band = format!("{pat:?} layers {first}..{end}");
+        report += &format!("{band}: outer shell {:.4} (asked {:.4}), inner shell {:.4} (asked {:.4}), total {total:.4} (asked {want_total:.4})\n  (layer, warped ms, plain ms) {times:.3?}\n",
+            ratio(0), want(0), ratio(1), want(1));
+        if !(ratio(1) <= ratio(0) - 0.1) { failures.push(format!("{band}: the inner shell is not sparser than the outer one")); }
+        if !((ratio(1) - want(1)).abs() <= 0.12) { failures.push(format!("{band}: the inner shell's density misses the asked one")); }
+        if !((total - want_total).abs() <= 0.05) { failures.push(format!("{band}: the layers' plastic misses the asked mean")); }
+    }
+    assert!(failures.is_empty(), "{}\n{report}", failures.join("\n"));
 }
 
 #[test]
@@ -242,4 +456,91 @@ fn unknown_pattern_is_an_error() {
     assert!(Sparse::parse("cubbic").is_none());
     assert!(Surface::parse("hilbertcurve").is_some());
     assert!(Surface::parse("grid").is_none());
+}
+
+fn cube() -> ObjectInput {
+    let field = |x: f64, y: f64, z: f64| (x - 12.0).abs().max((y - 12.0).abs()).max((z - 12.0).abs()) - 12.0;
+    input(Box::new(SdfSource::new(std::sync::Arc::new(field), ([0.0; 3], [24.0; 3]))))
+}
+
+fn gyroid_job() -> Job {
+    let mut j = job("classic");
+    j.cfg.set_str("sparse_infill_density", "20%");
+    j.cfg.set_str("sparse_infill_pattern", "gyroid");
+    j
+}
+
+fn plan_cube(cube: &ObjectInput, j: &Job) -> ObjectPlan {
+    check(j).expect("the cube's infill settings must pass validation");
+    plan_one(par::Ctl::default(), 0, cube, j).expect("the cube must plan to completion")
+}
+
+fn assert_same_layers(a: &ObjectPlan, b: &ObjectPlan, case: &str) {
+    assert_eq!(a.layers.len(), b.layers.len(), "{case} changed the layer count");
+    for (k, (a, b)) in a.layers.iter().zip(&b.layers).enumerate() {
+        assert!(format!("{a:?}") == format!("{b:?}"), "{case} changed the plan at layer {k}");
+    }
+}
+
+#[test]
+fn inactive_adaptive_settings_preserve_the_plan() {
+    let cube = cube();
+    // A 6 mm slab: no body a period deep, so nothing grades.
+    let field = |x: f64, y: f64, z: f64| ((x - 12.0).abs() - 12.0).max((y - 12.0).abs() - 12.0).max((z - 3.0).abs() - 3.0);
+    let slab = input(Box::new(SdfSource::new(std::sync::Arc::new(field), ([0.0; 3], [24.0, 24.0, 6.0]))));
+    let base = gyroid_job();
+    for (part, name, pattern, mode) in [(&cube, "cube", "gyroid", "disabled"), (&cube, "cube", "grid", "distance_warp"), (&slab, "slab", "gyroid", "distance_warp")] {
+        let mut j = base.clone();
+        j.cfg.set_str("sparse_infill_pattern", pattern);
+        let plain = plan_cube(part, &j);
+        j.cfg.set_str("adaptive_infill_mode", mode);
+        j.cfg.set_str("adaptive_infill_interior_density", "5%");
+        j.cfg.set_str("adaptive_infill_gradient", "exponential");
+        assert_same_layers(&plain, &plan_cube(part, &j), &format!("{mode} on the {name}'s {pattern}"));
+    }
+}
+
+#[test]
+fn distance_warp_reduces_the_cubes_sparse_infill() {
+    let cube = cube();
+    let mut j = gyroid_job();
+    let lengths = |plan: &ObjectPlan| -> Vec<f64> {
+        plan.layers.iter().map(|(_, _, layer)| {
+            layer.islands.iter().flat_map(|i| &i.fills).filter(|p| p.role == Role::SparseInfill).map(|p| p.length_mm()).sum()
+        }).collect()
+    };
+    let plain = lengths(&plan_cube(&cube, &j));
+    j.cfg.set_str("adaptive_infill_mode", "distance_warp");
+    j.cfg.set_str("adaptive_infill_interior_density", "10%");
+    j.cfg.set_str("adaptive_infill_gradient", "linear");
+    let planned = plan_cube(&cube, &j);
+    assert_same_layers(&planned, &plan_cube(&cube, &j), "repeating the distance_warp slice");
+    j.cfg.set_str("adaptive_infill_mode", "lobes");
+    assert_same_layers(&planned, &plan_cube(&cube, &j), "grading a single-lobe cube with lobes");
+    let graded = lengths(&planned);
+    assert_eq!(graded.len(), plain.len(), "grading changed the cube's layer count");
+    let (total, baseline) = (graded.iter().sum::<f64>(), plain.iter().sum::<f64>());
+    assert!(total < baseline, "graded sparse infill used {total} mm across the cube, plain used {baseline} mm");
+    for k in graded.len() / 3..2 * graded.len() / 3 {
+        assert!(graded[k] > 0.0 && graded[k] < plain[k], "middle layer {k} must retain shorter sparse infill, graded {} mm, plain {} mm", graded[k], plain[k]);
+    }
+}
+
+#[test]
+fn adaptive_settings_are_checked_for_tpms() {
+    let mut j = gyroid_job();
+    j.cfg.set_str("adaptive_infill_mode", "lobes");
+    check(&j).expect("gyroid must accept lobes");
+    let adaptive = SparseOpts::from_job(&j, 0.4, 0.45).adaptive;
+    assert!(adaptive.is_some_and(|a| a.lobes), "gyroid must plan the selected lobes mode, got {adaptive:?}");
+    j.cfg.set_str("adaptive_infill_mode", "normal_z");
+    let err = check(&j).expect_err("gyroid must refuse the unbuilt normal_z mode");
+    assert!(err.contains("adaptive_infill_mode \"normal_z\" is not built in Fab yet (built: disabled, distance_warp, lobes)"), "unbuilt mode diagnostic: {err}");
+    j.cfg.set_str("sparse_infill_pattern", "grid");
+    check(&j).expect("grid must ignore the normal_z mode");
+    j.cfg.set_str("sparse_infill_pattern", "gyroid");
+    j.cfg.set_str("adaptive_infill_mode", "distance_warp");
+    j.cfg.set_str("adaptive_infill_interior_density", "0%");
+    let err = check(&j).expect_err("distance_warp must refuse zero interior density");
+    assert!(err.contains("adaptive_infill_interior_density \"0%\""), "zero interior density diagnostic: {err}");
 }

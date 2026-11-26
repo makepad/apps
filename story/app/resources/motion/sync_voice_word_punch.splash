@@ -1,0 +1,37 @@
+use mod.motion.*
+// VOICE WORD PUNCH — one word at a time, exactly while it is spoken: each
+// word is its own layer, centred, with a `span` from the voiceover's word
+// timings, so it appears on the syllable and leaves when the word ends.
+// Words the voice leans on (emphasis, from loudness and pitch) come up
+// larger and in the accent; a pause leaves the frame empty, which reads
+// as a beat.
+// Why: the "one word per cut" look of short-form video, timed by the voice
+// itself — re-record or re-time the voice and the graphic follows.
+// Host: bind @vo to the edit's voiceover node.
+let v = voice(@vo)
+let words = []
+for i in 0..v.words.len() {
+    let w = v.words[i]
+    let stressed = w.emphasis > 0.7
+    words.push(Text{text: w.text span: [w.start, w.end - w.start + 0.08]
+                    font: Font{family: "Inter" weight: 900} size: if stressed { 260 } else { 200 } tracking: -0.045
+                    color: if stressed { in(@accent) } else { in(@ink) }
+                    at: vec2(960, if stressed { 384 } else { 420 }) wrap: 1920 align: @center
+                    scale: tween(1.25, 1.0, 0.0, 0.22, @ease_out_expo)
+                    opacity: tween(0, 1, 0.0, 0.05)})
+}
+Motion{
+    label: "Voice word punch"
+    brief: "One huge word at a time, on screen exactly while it is spoken; stressed words larger, in the accent."
+    tags: ["kinetic-type", "voice-sync", "punch", "speech", "short-form"]
+    duration: 4.8
+    inputs: {
+        ink: input(@color, #f4f7fa, "Word colour")
+        accent: input(@color, #ff5c39, "Stressed words")
+        background: input(@color, #0b0d12, "Ground")
+    }
+    layers: [
+        Rect{size: vec2(1920, 1080) fill: in(@background)}
+        Group{layers: words}
+    ]
+}

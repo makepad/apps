@@ -58,12 +58,18 @@ e.near(ldo_in, ldo.VIN, 2mm)
 // the amplifier enable's pull-down below); RESET pulls CHIP_PU low.
 let boot_button = e.part(tact_switch(), {pins: {A: boot B: gnd}})
 let reset_button = e.part(tact_switch(), {pins: {A: enable B: gnd}})
+// The case decides these: USB-C on the bottom edge, the buttons where the thumbs press them.
+e.fixed(usb, {edge: @bottom})
+e.fixed(boot_button)
+e.fixed(reset_button)
 
 // Board wiring R01/R02/R03: shared bus, panel reset P0, touch reset P2, IMU INT1 P6.
 let panel = e.part("panel", {pins: {
     VDD: vdd GND: gnd CSX: panel_cs SCLK: panel_clock RESX: panel_reset
     SIO0: panel_data[0] SIO1: panel_data[1] SIO2: panel_data[2] SIO3: panel_data[3]
 }})
+// The panel sits under the case's window.
+e.fixed(panel)
 let touch = e.part("touch", {pins: {VDD: vdd GND: gnd SDA: sda SCL: scl RST: touch_reset INT: touch_int}})
 // The real board's IMU (measured 2026-11-19): at rest face up its Z reads -1.08 g, so Z points into the
 // board, and tilting it by hand put its X toward the panel's top edge (row 0) and its Y along the
@@ -141,3 +147,6 @@ let bypass_cap = e.c(1uF, bypass, gnd, {package: "0603"})
 let amp_decouple = e.c(1uF, vbus, gnd, {package: "0603"})
 let pull_ctrl = e.r(10kohm, pa_ctrl, gnd, {package: "0402"})
 let speaker = e.part(header({pins: 2 pitch: 2.54mm}), {pins: {"1": spk_p "2": spk_n}})
+// The speaker's leads come in at the left edge, on the back.
+e.fixed(speaker, {edge: @left})
+e.side(speaker, @bottom)

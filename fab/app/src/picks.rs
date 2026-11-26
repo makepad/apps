@@ -1,5 +1,5 @@
 //! The view's picks between the Edit shape mode and the model worker: a click, a hover or a held
-//! press goes out as a `select` call with the pointer's ray; the worker keeps the picks (whoever
+//! press sends the installed step's hit, or the whole view's ray. The worker keeps the picks (whoever
 //! made them: the person, the AI's `fab.select`, an outside agent) and every answer's status
 //! carries them back. The view draws them, and the chat's composer shows each as a chip whose
 //! detail goes to the model with the person's line.
@@ -59,8 +59,24 @@ fn ray(from: [f64; 3], dir: [f64; 3], pixel: [f64; 2]) -> Vec<(&'static str, Val
     vec![("ray", json::obj(vec![("from", v3(from)), ("dir", v3(dir))])), ("pixel", Value::Arr(vec![Value::F64(pixel[0]), Value::F64(pixel[1])]))]
 }
 
+/// A hit on the marked part's own scene element. The scene mesh is already placed.
+fn step_hit(part: &PlatePart, on: &str, hit: fab::model::RayHit, dir: [f64; 3], pixel: [f64; 2]) -> Option<fab_ai::picks::ViewHit> {
+    use fab_model::params::{xf_dir, xf_point};
+    if part.element != Some(hit.element) { return None; }
+    let matrix = &part.model_from_printer;
+    let at = xf_point(matrix, [hit.point.x, hit.point.y, hit.point.z].map(|v| f64::from(v) * 1000.0));
+    let depth = f64::from(hit.t) * 1000.0;
+    let dir = xf_dir(matrix, dir);
+    let length = |v: [f64; 3]| v.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let plate = fab_model::weave::invert(matrix);
+    let n = [hit.normal.x, hit.normal.y, hit.normal.z].map(f64::from);
+    let normal = std::array::from_fn(|i| (0..3).map(|r| plate[r][i] * n[r]).sum());
+    let norm = length(normal);
+    Some(fab_ai::picks::ViewHit { object: part.object.clone(), on: on.into(), at, normal: normal.map(|x| x / norm), dir, depth, pixel: (pixel[0] + depth * pixel[1]) * length(dir) })
+}
+
 /// A pick as the view draws it.
-pub fn view(p: &fab_ai::picks::Pick) -> PickView {
+fn view(p: &fab_ai::picks::Pick) -> PickView {
     PickView { id: p.id.clone(), kind: p.kind.name().to_string(), label: p.label.clone(), object: p.object.clone(), at: p.at, bounds: p.bounds, outline: Arc::new(p.outline.clone()), tint: p.tint.clone() }
 }
 
@@ -82,6 +98,9 @@ fn row_pick(pick: &makepad_script::syntax::Node) -> Option<Value> {
     if let Some(at) = pick.field("at").and_then(|f| f.value.items()) {
         fields.push(("at", Value::Arr(at.iter().filter_map(|x| x.number()).map(Value::F64).collect())));
     }
+    if let Some(on) = words(pick, "on") {
+        fields.push(("on", Value::Str(on)));
+    }
     if let Some(sel) = words(pick, "select") {
         fields.push(("select", Value::Str(sel)));
     }
@@ -89,17 +108,71 @@ fn row_pick(pick: &makepad_script::syntax::Node) -> Option<Value> {
 }
 
 impl App {
+    pub(super) fn filter_view_picks(&mut self) {
+        let steps = &self.state.steps;
+        self.state.picks.list = Arc::new(self.picks.iter().filter(|p| {
+            if let Some(target) = &self.step_view.target {
+                steps.installed == Some(self.state.scene_revision) && p.on == *target && Some(&p.object) == steps.part.as_ref()
+            } else { self.step_view.leaving != Some(self.state.scene_revision) && p.on == p.object }
+        }).map(view).collect());
+    }
+
+    pub(super) fn forget_view_points(&mut self) {
+        self.pick_calls.clear();
+        self.pick_hover_stale = true;
+        self.pick_hover_next = None;
+        self.pick_other = None;
+        self.state.picks.under = None;
+        self.state.picks.other = None;
+        self.state.picks.menu = None;
+    }
+
+    pub(super) fn reconcile_pick_target(&mut self, cx: &mut Cx) {
+        let steps = &self.state.steps;
+        let target = steps.marker.and_then(|i| steps.chips.get(i)).zip(steps.part.as_deref().and_then(fab_model::program::split_id))
+            .map(|(chip, (instance, _))| fab_model::program::part_id(instance, &chip.id));
+        if self.step_view.target == target { return; }
+        self.step_view.target = target.clone();
+        self.state.steps.installed = None;
+        self.forget_view_points();
+        self.round_end(cx);
+        self.filter_view_picks();
+        if let Some(host) = &mut self.host {
+            host.view_pick(fab_ai::picks::ViewPick::Retain(target));
+        }
+    }
+
+    fn view_request(&self, scene: fab::tools::picks::SceneHit, from: [f64; 3], dir: [f64; 3], pixel: [f64; 2], kind: &str, gesture: fab_ai::picks::Gesture) -> Option<fab_ai::picks::ViewPick> {
+        use fab_ai::picks::{Gesture, ViewPick};
+        if scene.revision != self.state.scene_revision || self.step_view.leaving == Some(scene.revision) { return None; }
+        if let Some(on) = &self.step_view.target {
+            let steps = &self.state.steps;
+            if steps.shown != steps.marker || steps.busy.is_some() || steps.installed != Some(scene.revision) || self.previewing { return None; }
+            let part = self.state.plate.parts.iter().find(|p| Some(&p.object) == steps.part.as_ref())?;
+            let hit = scene.hit.and_then(|hit| step_hit(part, on, hit, dir, pixel));
+            return Some(ViewPick::Point { hit, kind: kind.into(), gesture });
+        }
+        let mut args = ray(from, dir, pixel);
+        args.push(("kind", json::s(kind)));
+        args.push(match gesture {
+            Gesture::Click { add } => ("add", Value::Bool(add)),
+            Gesture::Along => ("along", Value::Bool(true)),
+            Gesture::Hover => ("hover", Value::Bool(true)),
+        });
+        Some(ViewPick::Select(json::obj(args)))
+    }
+
     pub(super) fn pick_action(&mut self, cx: &mut Cx, action: &PickAction) {
         let filter = self.state.picks.filter.name();
         match action {
-            PickAction::At { from, dir, pixel, add, body } => {
-                let Some(host) = &mut self.host else { return };
-                let mut args = ray(*from, *dir, *pixel);
-                args.push(("kind", json::s(if *body { "body" } else { filter })));
-                args.push(("add", Value::Bool(*add)));
-                self.pick_calls.push(host.call(fab_ai::picks::TOOL, json::obj(args)));
+            PickAction::At { scene, from, dir, pixel, add, body } => {
+                let request = self.view_request(*scene, *from, *dir, *pixel, if *body { "body" } else { filter }, fab_ai::picks::Gesture::Click { add: *add });
+                if let (Some(host), Some(req)) = (&mut self.host, request) {
+                    self.pick_calls.push(host.view_pick(req));
+                }
             }
             PickAction::Hover(None) => {
+                self.pick_hover_stale = true;
                 self.pick_hover_next = None;
                 if self.state.picks.under.take().is_some() {
                     fab::ui::redraw(cx, &[ids!(tool_overlay), ids!(viewport)]);
@@ -109,18 +182,18 @@ impl App {
                 self.pick_hover_next = Some(*r);
                 self.send_pick_hover();
             }
-            PickAction::Other { from, dir, pixel, at, add } => {
-                let Some(host) = &mut self.host else { return };
-                let mut args = ray(*from, *dir, *pixel);
-                args.push(("along", Value::Bool(true)));
-                self.pick_other = Some((host.call(fab_ai::picks::TOOL, json::obj(args)), *at, *add));
-                self.state.picks.under = None;
+            PickAction::Other { scene, from, dir, pixel, at, add } => {
+                let request = self.view_request(*scene, *from, *dir, *pixel, filter, fab_ai::picks::Gesture::Along);
+                if let (Some(host), Some(req)) = (&mut self.host, request) {
+                    self.pick_other = Some((host.view_pick(req), *at, *add));
+                    self.state.picks.under = None;
+                }
             }
             PickAction::Row(row) => {
                 let Some(other) = self.state.picks.other.take() else { return };
                 if let (Some(row), Some(host)) = (row.and_then(|i| other.rows.get(i)), &mut self.host) {
                     if let Ok(pick) = json::parse(row.pick.as_bytes()) {
-                        self.pick_calls.push(host.call(fab_ai::picks::TOOL, json::obj(vec![(if other.add { "add" } else { "set" }, Value::Arr(vec![pick]))])));
+                        self.pick_calls.push(host.view_pick(fab_ai::picks::ViewPick::Select(json::obj(vec![(if other.add { "add" } else { "set" }, Value::Arr(vec![pick]))]))));
                     }
                 }
                 fab::ui::redraw(cx, &[ids!(tool_overlay)]);
@@ -137,11 +210,12 @@ impl App {
         if self.pick_hover.is_some() {
             return;
         }
-        let (Some(hover), Some(host)) = (self.pick_hover_next.take(), &mut self.host) else { return };
-        let mut args = ray(hover.from, hover.dir, hover.pixel);
-        args.push(("hover", Value::Bool(true)));
-        args.push(("kind", json::s(self.state.picks.filter.name())));
-        self.pick_hover = Some((host.call(fab_ai::picks::TOOL, json::obj(args)), hover));
+        let Some(hover) = self.pick_hover_next.take() else { return };
+        let req = self.view_request(hover.scene, hover.from, hover.dir, hover.pixel, self.state.picks.filter.name(), fab_ai::picks::Gesture::Hover);
+        if let (Some(host), Some(req)) = (&mut self.host, req) {
+            self.pick_hover_stale = false;
+            self.pick_hover = Some((host.view_pick(req), hover));
+        }
     }
 
     /// A worker job ended: a pick call's answer, and the picks its status carries.
@@ -150,7 +224,7 @@ impl App {
         if self.pick_hover.is_some_and(|h| h.0 == done.id) {
             let (_, hover) = self.pick_hover.take().unwrap();
             // still in Edit shape mode and still hovering: what a click would take
-            let under = parsed().filter(|_| done.ok && fab::tools::picks::active(&self.state)).and_then(|v| {
+            let under = parsed().filter(|_| done.ok && !self.pick_hover_stale && hover.scene.revision == self.state.scene_revision && fab::tools::picks::active(&self.state)).and_then(|v| {
                 let pick = &v.field("hover")?.value;
                 let point = |p: &makepad_script::syntax::Node| -> Option<[f64; 3]> {
                     let xs = p.items()?;
@@ -207,11 +281,12 @@ impl App {
         let (rev, picks) = &done.status.picks;
         if *rev != self.state.picks.rev {
             self.state.picks.rev = *rev;
-            self.state.picks.list = Arc::new(picks.iter().map(view).collect());
             if self.state.picks.lit.as_ref().is_some_and(|id| !picks.iter().any(|p| &p.id == id)) {
                 self.state.picks.lit = None;
             }
             self.picks = picks.clone();
+            self.filter_view_picks();
+            self.round_picks(cx);
             self.chat.refresh();
             fab::ui::redraw(cx, &[ids!(tool_overlay), ids!(viewport)]);
             // a click on a draft that lost a selector names it again
@@ -345,7 +420,7 @@ impl App {
         let text = format!("{}{selector}{}", &source[..span.start], &source[span.end..]);
         // the pick named it: it is no pick of its own
         if let Some(host) = &mut self.host {
-            host.call(fab_ai::picks::TOOL, json::obj(vec![("remove", json::s(&pick.id))]));
+            host.view_pick(fab_ai::picks::ViewPick::Select(json::obj(vec![("remove", json::s(&pick.id))])));
         }
         say(cx, String::new());
         if let (Some(f), Some(rp)) = (&site.shared, &mut self.repick) {
@@ -378,7 +453,7 @@ impl App {
     /// The chat's chip `id` was removed: the pick goes.
     pub(super) fn pick_removed(&mut self, id: &str) {
         if let Some(host) = &mut self.host {
-            host.call(fab_ai::picks::TOOL, json::obj(vec![("remove", json::s(id))]));
+            host.view_pick(fab_ai::picks::ViewPick::Select(json::obj(vec![("remove", json::s(id))])));
         }
     }
 
@@ -392,7 +467,7 @@ impl App {
             let instance = object.split_once('/').map_or(object, |(i, _)| i);
             self.program.as_ref().and_then(|(c, _)| c.instances.iter().find(|i| i.name == instance)).map(|i| i.script.file.clone())
         };
-        let written: Vec<(String, Option<String>)> = self.picks.iter().filter_map(|p| {
+        let written: Vec<(String, Option<String>)> = self.picks.iter().filter(|p| self.state.picks.list.iter().any(|shown| p.id == shown.id)).filter_map(|p| {
             let named = match p.kind {
                 Kind::Feature | Kind::Body | Kind::Edit => p.solids.first().map(|s| s.rsplit_once('/').map_or(s.as_str(), |(_, s)| s).to_string()),
                 _ => None,
@@ -426,5 +501,22 @@ impl App {
             self.state.picks.lit = id;
             fab::ui::redraw(cx, &[ids!(tool_overlay), ids!(viewport)]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installed_step_hit_uses_only_its_element_and_model_frame() {
+        // The step's X axis points up plate Y, its origin at (100, 200, 30) mm.
+        let part = PlatePart { object: "cut/shelled".into(), element: Some(ElementId(2)), model_from_printer: [[0., 1., 0., -200.], [-1., 0., 0., 100.], [0., 0., 1., -30.]], ..Default::default() };
+        let hit = fab::model::RayHit { element: ElementId(2), batch: 0, triangle: 0, t: 0.2, point: vec3f(0.09, 0.22, 0.035), normal: vec3f(-1., 0., 0.), bary: [0.; 2] };
+        let resolve = |hit| step_hit(&part, "cut/eased", hit, [1., 0., 0.], [0.1, 0.]);
+        let model = resolve(hit).expect("the installed step element accepts its surface hit");
+        assert!(model.at.iter().zip([20., 10., 5.]).all(|(v, mm)| (v - mm).abs() < 1e-5), "the placed point round trips to step model mm: {:?}", model.at);
+        assert_eq!((model.normal, model.dir), ([0., 1., 0.], [0., -1., 0.]), "normal and viewing direction share the step's rotated frame");
+        assert!(resolve(fab::model::RayHit { element: ElementId(3), ..hit }).is_none(), "the whole ghost or any other element is a geometry miss");
     }
 }

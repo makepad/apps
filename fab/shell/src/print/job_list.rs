@@ -1,11 +1,9 @@
-//! Saved prints in the Jobs editor and Monitor, with the printer and preparation first, then
-//! the queue and history.
+//! The Jobs editor and Monitor show active jobs first, the queue in print order, then history newest first.
 //!
-//! Main-loop cost: a linear list scan on a draw (three passes, no sorting), retaining the row
-//! buffer and allocating only row texts once it has room. Only visible rows draw; no previews
-//! are loaded and no disk is touched.
+//! A draw groups job indices in one pass, resolves the selected job once and builds labels only for visible portal rows.
+//! Workers load the history and previews.
 
-use super::jobs::JobState;
+use super::jobs::{CommittedJob, JobState};
 use super::*;
 use crate::api::AppState;
 use std::fmt::Write;
@@ -20,58 +18,79 @@ pub struct JobRow {
     pub shown: bool,
 }
 
-/// Jobs in display order. Their source is already newest first; reverse only the queue.
+/// All rows in the same order as the Jobs editor and Monitor.
 pub fn rows(p: &PrintState, _now: f64) -> Vec<JobRow> {
-    let mut out = Vec::with_capacity(p.follow.jobs.len());
-    fill_rows(p, &mut out);
-    out
+    let shown = p.follow.shown().map(|j| j.meta.id.as_str());
+    let mut order = Vec::new();
+    fill_order(&p.follow, &mut order);
+    order.into_iter().map(|i| row(&p.follow.jobs[i], p, shown)).collect()
 }
 
-fn fill_rows(p: &PrintState, out: &mut Vec<JobRow>) {
-    out.clear();
-    let printer = p.follow.job.as_ref();
-    let shown = p.follow.shown().map(|j| j.meta.id.as_str());
-    let group = |j: &jobs::CommittedJob| {
-        if matches!(j.state, JobState::Preparing | JobState::Sent)
-            || printer.is_some_and(|live| live.id.as_deref() == Some(j.meta.id.as_str()))
-        {
-            0
-        } else if j.state == JobState::Queued {
-            1
+fn fill_order(f: &follow::Follow, order: &mut Vec<usize>) {
+    let len = f.jobs.len();
+    order.resize(len, 0);
+    let printing = f.job.as_ref().and_then(|live| live.id.as_deref());
+    let mut active = 0;
+    let mut history = len;
+    // Walk oldest first. Fill history from the back and keep the queue in print order past len.
+    for (i, job) in f.jobs.iter().enumerate().rev() {
+        if matches!(job.state, JobState::Preparing | JobState::Sent) || printing == Some(job.meta.id.as_str()) {
+            order[active] = i;
+            active += 1;
+        } else if job.state == JobState::Queued {
+            order.push(i);
         } else {
-            2
+            history -= 1;
+            order[history] = i;
         }
+    }
+    order[..active].reverse();
+    order.copy_within(len.., active);
+    order.truncate(len);
+}
+
+fn row(job: &CommittedJob, p: &PrintState, shown: Option<&str>) -> JobRow {
+    let meta = &job.meta;
+    let state = if let Some(live) = p.follow.job.as_ref().filter(|live| live.id.as_deref() == Some(meta.id.as_str())) {
+        let mut state = format!("Layer {}", live.layer_text());
+        if let Some(progress) = live.progress {
+            let _ = write!(state, " · {progress:.0} %");
+        }
+        state
+    } else {
+        if p.unwatched_while_virtual(job) { "Not watched while Virtual".into() } else { job.state.label() }
     };
-    let jobs = &p.follow.jobs;
-    for job in jobs.iter().filter(|j| group(j) == 0)
-        .chain(jobs.iter().rev().filter(|j| group(j) == 1))
-        .chain(jobs.iter().filter(|j| group(j) == 2))
-    {
-        let meta = &job.meta;
-        let state = if let Some(live) = printer.filter(|live| live.id.as_deref() == Some(meta.id.as_str())) {
-            let mut state = format!("Layer {}", live.layer_text());
-            if let Some(progress) = live.progress {
-                let _ = write!(state, " · {progress:.0} %");
-            }
-            state
-        } else {
-            job.state.label()
-        };
-        let mut detail = String::new();
-        if job.state.ended() && job.state != JobState::EndedUnseen {
-            if let Some(ended) = job.ended_at {
-                let _ = write!(detail, "Elapsed {} · ", format_time(ended - job.sent_at));
-            }
+    let mut detail = String::new();
+    if let Some(id) = &meta.printer {
+        if let Some(name) = id.strip_prefix("virtual:") {
+            use makepad_fab_settings::family::{VIRTUAL_NOZZLES, VIRTUAL_TOOLCHANGER};
+            // Generated machines carry their virtual printer's id in the model. A twin
+            // carries its catalogue model, regardless of the name in the saved record.
+            let generated = meta.printer_model.rsplit_once(' ').is_some_and(|(family, id)|
+                id == name && matches!(family, VIRTUAL_NOZZLES | VIRTUAL_TOOLCHANGER));
+            let name = if meta.virtual_printer && !meta.machine_preset.is_empty() && !meta.printer_model.is_empty() && !generated {
+                &meta.machine_preset
+            } else { name };
+            let mode = if meta.virtual_printer { " (virtual)" } else { "" };
+            let _ = write!(detail, "{name}{mode} · ");
+        } else if let Some(name) = id.strip_prefix("printer:") {
+            let mode = if meta.virtual_printer { " (Virtual)" } else { "" };
+            let _ = write!(detail, "{name}{mode} · ");
         }
-        let _ = write!(detail, "Planned {}", format_time(meta.planned));
-        let grams: f64 = meta.filament_g.iter().sum();
-        if grams > 0.0 {
-            let _ = write!(detail, " · {grams:.1} g");
+    }
+    if job.state.ended() && job.state != JobState::EndedUnseen {
+        if let Some(ended) = job.ended_at {
+            let _ = write!(detail, "Elapsed {} · ", format_time(ended - job.sent_at));
         }
-        out.push(JobRow {
-            id: meta.id.clone(), name: meta.name.clone(), state, detail,
-            shown: shown == Some(meta.id.as_str()),
-        });
+    }
+    let _ = write!(detail, "Planned {}", format_time(meta.planned));
+    let grams: f64 = meta.filament_g.iter().sum();
+    if grams > 0.0 {
+        let _ = write!(detail, " · {grams:.1} g");
+    }
+    JobRow {
+        id: meta.id.clone(), name: meta.name.clone(), state, detail,
+        shown: shown == Some(meta.id.as_str()),
     }
 }
 
@@ -201,13 +220,7 @@ pub struct FabJobList {
     #[live]
     fill: bool,
     #[rust]
-    rows: Vec<JobRow>,
-}
-
-impl FabJobList {
-    fn sync(&mut self, state: &AppState) {
-        fill_rows(&state.print, &mut self.rows);
-    }
+    order: Vec<usize>,
 }
 
 impl Widget for FabJobList {
@@ -224,21 +237,26 @@ impl Widget for FabJobList {
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, mut walk: Walk) -> DrawStep {
         let Some(state) = scope.data.get::<AppState>() else { return DrawStep::done() };
-        self.sync(state);
-        if self.rows.is_empty() { return DrawStep::done(); }
+        fill_order(&state.print.follow, &mut self.order);
+        let len = self.order.len();
+        if len == 0 { return DrawStep::done(); }
+        let shown = state.print.follow.shown().map(|j| j.meta.id.clone());
         self.view.view(cx, ids!(heading)).set_visible(cx, !self.fill);
         if !self.fill {
-            walk.height = Size::Fixed(HEADING_H + self.rows.len().min(MAX_ROWS) as f64 * ROW_H);
+            walk.height = Size::Fixed(HEADING_H + len.min(MAX_ROWS) as f64 * ROW_H);
         }
         while let Some(step) = self.view.draw_walk(cx, scope, walk).step() {
             let list_ref = step.as_portal_list();
             let Some(mut list) = list_ref.borrow_mut() else { continue };
-            list.set_item_range(cx, 0, self.rows.len());
+            list.set_item_range(cx, 0, len);
             while let Some(index) = list.next_visible_item(cx) {
-                let Some(row) = self.rows.get(index) else { continue };
+                let Some(&job_index) = self.order.get(index) else { continue };
+                let Some(state) = scope.data.get::<AppState>() else { continue };
+                let f = &state.print.follow;
+                let row = row(&f.jobs[job_index], &state.print, shown.as_deref());
                 let item = list.item(cx, index, live_id!(Row));
                 if let Some(mut widget) = item.borrow_mut::<FabJobRow>() {
-                    widget.sync(cx, row);
+                    widget.sync(cx, &row);
                 }
                 item.draw_all(cx, scope);
             }
@@ -251,7 +269,7 @@ impl Widget for FabJobList {
 mod tests {
     use super::*;
     use super::super::follow::PrinterJob;
-    use super::super::jobs::{CommittedJob, JobMeta};
+    use super::super::jobs::JobMeta;
 
     fn job(id: &str, state: JobState, created: f64) -> CommittedJob {
         CommittedJob {

@@ -196,6 +196,8 @@ pub struct RouteProposal {
     pub open: Vec<(NetId, Reason)>,
     /// A gesture answer's head; `None` for a job's proposal.
     pub head: Option<HeadAnswer>,
+    /// A pair route's coupled and escape measurements on this proposal.
+    pub pair: Option<crate::pair::PairReport>,
     /// The worker's time from taking the sample to publishing this answer, in microseconds, for the
     /// pane's latency log; 0 for a job's proposal. Not content: `Canon` leaves it out.
     pub solve_us: u32,
@@ -221,6 +223,7 @@ impl Canon for RouteProposal {
             collisions,
             open,
             head,
+            pair,
             solve_us: _,
             last,
             label,
@@ -238,6 +241,7 @@ impl Canon for RouteProposal {
         head.canon(w);
         last.canon(w);
         label.canon(w);
+        if let Some(report) = pair { w.tag(1); report.canon(w); }
     }
 }
 

@@ -1,0 +1,36 @@
+# The pickers and panel widgets that need Motion's structure, the document
+# font table or the picture's face drawing: the font picker (the families a
+# document can name, each row in its own face, a variable font's axes as
+# sliders, a static family's faces), the font row of a panel, and the effects
+# stack. They sit on the open panel kit (`makepad-value-pickers`).
+[package]
+name = "makepad-stage-motion-pickers"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Font picker, font row and effects stack of the tweak panel (they need Motion's structure and the document font table)"
+
+[lib]
+name = "makepad_stage_motion_pickers"
+
+[dependencies]
+makepad-widgets = { path = "../../../../../widgets", default-features = false }
+makepad-editor-panel = { path = "../../../../../libs/editor_panel" }
+makepad-edit-values = { path = "../../../../../libs/edit_values" }
+makepad-value-pickers = { path = "../../../../../libs/value_pickers" }
+makepad-look = { path = "../../../../../libs/look" }
+# The effects' parameters (kits and their ranges).
+makepad-render-graph = { path = "../../../../../libs/render_graph", default-features = false }
+# The structure of a stack and the catalogue of what it can take.
+makepad-motion = { path = "../../../../apps/engine/motion", default-features = false }
+# The document font table (families, files, where they are).
+makepad-doc-fonts = { path = "../../../../apps/engine/fonts" }
+# A family's face as the picture draws it (the rows show each family so).
+makepad-motion-draw = { path = "../../../../apps/engine/motion_draw", default-features = false }
+# A variable font's axes and their ranges, read from its file.
+makepad-typography = { path = "../../../../../libs/typography" }
+
+
+[dev-dependencies]
+makepad-strict-json = { path = "../../../../../libs/strict_json" }

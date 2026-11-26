@@ -1,0 +1,14 @@
+use mod.scene.*; use mod.post
+// A mesh shattering into particles on a hit (beat 4 at 120 bpm): its
+// triangles fly out and fade while sparks burst from its surface.
+Scene3D{ background: #05060a tone_mapping: @aces bpm: 120
+  camera: Camera{position: vec3(0, 1.2, 7) target: vec3(0, 1.1, 0) fov: 40}
+  post: [post.Bloom{strength: 0.8 threshold: 0.8}]
+  lights: [LightRig{preset: @dramatic target: vec3(0, 1, 0)}]
+  environment: Environment{preset: @studio}
+  children: [
+    Fx{preset: @shatter_burst position: vec3(-1.6, 1.2, 0) start: beat(4) duration: 2 radius: 1.2 count: 900 size: 0.05 color: #fff2c0 color2: #ff5a36
+       geometry: IcosahedronGeometry{radius: 0.9 detail: 3} material: MeshPhysicalMaterial{color: #ff5a36 clearcoat: 1 roughness: 0.3 side: @double}}
+    Fx{preset: @shatter_burst position: vec3(1.6, 1.2, 0) start: beat(6) duration: 2 radius: 1.2 count: 900 size: 0.05 color: #bff4ff color2: #3f7cff
+       geometry: TorusKnotGeometry{radius: 0.6 tube: 0.22} material: GlowWireMaterial{color: #3fd6ff emissive: #3fd6ff}}
+  ] }

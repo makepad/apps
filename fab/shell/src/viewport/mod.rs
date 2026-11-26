@@ -645,7 +645,7 @@ fn pick_lines(state: &AppState, pane: PaneId) -> [Vec<Vec<Vec3f>>; 3] {
         }
     };
     let mut out: [Vec<Vec<Vec3f>>; 3] = Default::default();
-    if let (Some(under), None) = (&picks.under, &picks.other) {
+    if let (Some(under), None, None) = (&picks.under, &picks.other, &picks.menu) {
         if let Some((object, lines)) = under.outline.as_ref().filter(|_| under.view.0 == *state.view.camera(pane)) {
             world(object, lines, &mut out[0]);
         }
@@ -1211,6 +1211,9 @@ pub struct FabViewport {
     /// The last recorded frame had parts drawn as ghosts.
     #[rust]
     ghost_on: bool,
+    /// Original colour texel under an independently drawn copy.
+    #[rust]
+    copy_tint: Option<((ElementId, u32), f32)>,
     #[new]
     lit_pass: DrawPass,
     #[new]
@@ -1294,6 +1297,10 @@ pub struct FabViewport {
     /// in place.
     #[rust]
     cut_drawn: Option<[f32; 4]>,
+    /// The picked test print's box the last frame clipped to (centre and size, mm), for the
+    /// inspection: which cube a finished picture shows.
+    #[rust]
+    test_cut: Option<([f64; 3], [f64; 3])>,
     #[rust]
     elem_lut: ElementLut,
     /// This viewport's CORTAO chain between `aux` and `lit`, using aux depth and normals.
@@ -1347,6 +1354,9 @@ pub struct FabViewport {
     last_pointer: Option<DVec2>,
     #[rust]
     context_click: bool,
+    /// A press the marking menu took. Esc may close the ring before its button comes up.
+    #[rust]
+    menu_press: bool,
     #[rust]
     hovered_marker: Option<usize>,
     #[rust]
@@ -1492,8 +1502,19 @@ pub struct FabViewport {
 
 /// Everything the aux and lit passes (and so the composite) are recorded from. Equal keys:
 /// the retained pictures are still right and nothing is recorded.
+/// A second instance in the existing ghost pass. Its geometry is already in plate metres;
+/// its source element identifies it to the compositor without adding a pickable scene element.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct GhostCopy {
+    pub geometry: GeometryId,
+    pub source: ElementId,
+    /// Packed sRGB, the representation the ghost compositor reads.
+    pub tint: u32,
+}
+
 #[derive(Clone, PartialEq)]
 struct SceneKey {
+    ghost_copy: Option<GhostCopy>,
     size: DVec2,
     dpi: f64,
     generation: u64,
@@ -1635,6 +1656,7 @@ impl SceneKey {
         else if self.generation != o.generation { "generation" }
         else if self.revision != o.revision { "revision" }
         else if self.poses != o.poses { "poses" }
+        else if self.ghost_copy != o.ghost_copy { "ghost copy" }
         else if self.camera != o.camera { "camera" }
         else if self.shading != o.shading || self.overlays != o.overlays || self.xray != o.xray || self.look != o.look || self.lighting != o.lighting || self.volume != o.volume || self.see != o.see || self.glass != o.glass { "view" }
         else if self.clip != o.clip || self.cut != o.cut || self.caps != o.caps { "section" }
@@ -1669,6 +1691,7 @@ impl SceneKey {
         });
         let vs = &state.view;
         SceneKey {
+            ghost_copy: crate::tools::fit::ghost(state, pane),
             size,
             dpi,
             generation: state.scene.generation,
@@ -1761,8 +1784,19 @@ impl FabViewport {
     }
 
     pub fn park(&mut self, cx: &mut Cx, state: &mut AppState) {
+        self.dismiss_menu(cx, state);
         self.park_widget(cx);
         state.park_pane(self.pane);
+    }
+
+    // A hidden stage no longer dispatches to the handles that normally close its ring.
+    fn dismiss_menu(&self, cx: &mut Cx, state: &mut AppState) {
+        if self.role == PaneRole::Plate && state.picks.menu.as_ref().is_some_and(|m| m.pane == self.pane) {
+            state.picks.menu = None;
+            cx.sweep_unlock(self.area);
+            self.area.redraw(cx);
+            crate::ui::redraw(cx, &[ids!(tool_overlay)]);
+        }
     }
 
     /// What a viewport whose Plate the dock holds off screen still hears, each event handled as
@@ -1773,7 +1807,8 @@ impl FabViewport {
     /// The lead's scan takes its wait. What it skips only redraws, and a Plate shown again
     /// redraws ([`crate::ui::stage::FabStage::shown_again`]). O(1) per event it skips.
     pub fn handle_hidden(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        let Some(state) = scope.data.get::<AppState>() else { return };
+        let Some(state) = scope.data.get_mut::<AppState>() else { return };
+        self.dismiss_menu(cx, state);
         let full = match event {
             Event::GpuReset | Event::ScriptReapply | Event::LiveEdit | Event::DrawShadersReady
             | Event::WindowLostFocus(_) | Event::Pause | Event::Background | Event::Timer(_) => true,
@@ -1819,6 +1854,7 @@ impl FabViewport {
         self.pointer_input = None;
         self.last_pointer = None;
         self.context_click = false;
+        self.menu_press = false;
         self.hovered_marker = None;
         self.hovered_branch = None;
         self.pressed_marker = None;
@@ -2095,6 +2131,28 @@ impl FabViewport {
             viewport_rect: rect,
         };
         (fab, render)
+    }
+
+    // The ghost compositor reads colour from the source element's fourth texel. An opaque
+    // source has no ghost colour of its own. Supply the copy's tint without changing the
+    // source's visibility or pose in any pass. Only that texel is uploaded.
+    fn sync_copy_tint(&mut self, cx: &mut Cx, copy: Option<GhostCopy>, table_changed: bool) {
+        if table_changed { self.copy_tint = None; }
+        let tint = copy.map(|g| (g.source, g.tint));
+        if self.copy_tint.map(|(key, _)| key) == tint { return; }
+        let Some(table) = self.elem_lut.texture() else { return };
+        let width = self.elem_lut.size().0 as usize;
+        let replace = |cx: &mut Cx, id: ElementId, colour: f32| {
+            let texel = id.index() * STRIDE + 3;
+            let mut data = table.take_vec_f32(cx);
+            let old = std::mem::replace(&mut data[texel * 4 + 3], colour);
+            table.put_back_vec_f32(cx, data, Some(RectUsize::new(PointUsize::new(texel % width, texel / width), SizeUsize::new(1, 1))));
+            old
+        };
+        if let Some(((id, _), old)) = self.copy_tint.take() { replace(cx, id, old); }
+        if let Some((id, rgb)) = tint {
+            self.copy_tint = Some(((id, rgb), replace(cx, id, rgb as f32)));
+        }
     }
 
     /// The aux pass's meshes; `ghost`: only the parts drawn as ghosts (the ghost layer's).
@@ -2997,7 +3055,9 @@ impl FabViewport {
         // field parts alike; they are absent from the lit pass and the cascades, so they cast
         // no shadow.
         let poses = state.pane_poses(self.pane);
-        self.ghost_on = state.ghosts_drawn_under(poses);
+        let scene_ghosts = state.ghosts_drawn_under(poses);
+        let copy = crate::tools::fit::ghost(state, self.pane);
+        self.ghost_on = scene_ghosts || copy.is_some();
         if self.ghost_on {
             self.ghost_pass.set_pass_parent(cx.cx, comp_id);
             self.ghost_pass.set_size(cx, rect.size);
@@ -3014,10 +3074,23 @@ impl FabViewport {
             self.draw_aux.draw_vars.set_uniform(cx.cx, live_id!(clip_ctl), &[ghost_planes.len() as f32, 0.0, 0.0, 0.0]);
             {
                 let cx3d = &mut Cx3d::new(cx.cx);
-                self.draw_aux_pass(cx3d, fab_state, state, true);
+                if scene_ghosts { self.draw_aux_pass(cx3d, fab_state, state, true); }
+                if let Some(copy) = copy {
+                    // The fitted copy has its own pose baked on the worker. The element lookup
+                    // would apply the source's move a second time or hide a field part's mesh.
+                    cx3d.begin_scene_3d(fab_state);
+                    self.draw_aux.draw_vars.set_uniform(cx3d.cx, live_id!(elem_ctl), &[0.0; 4]);
+                    self.draw_aux.draw_geometry(cx3d.cx, copy.geometry);
+                    let (w, h) = self.elem_lut.size();
+                    self.draw_aux.draw_vars.set_uniform(cx3d.cx, live_id!(elem_ctl), &[w, h, STRIDE as f32, 1.0]);
+                    cx3d.end_scene_3d();
+                    self.draw_calls += 1;
+                }
             }
             let scene = scene_handle.borrow();
-            self.draw_calls += scene.sdf.borrow_mut().draw(cx, self.pane, sdf::SdfPass::GhostAux(&mut self.sdf_tile), &fab_state.view, &fab_state.projection, rect.size, Mat4f::identity(), ghost_planes, state);
+            if scene_ghosts {
+                self.draw_calls += scene.sdf.borrow_mut().draw(cx, self.pane, sdf::SdfPass::GhostAux(&mut self.sdf_tile), &fab_state.view, &fab_state.projection, rect.size, Mat4f::identity(), ghost_planes, state);
+            }
             cx.end_pass_sized_turtle();
             self.ghost_list.end(cx);
             cx.end_pass(&self.ghost_pass);
@@ -3652,7 +3725,9 @@ impl FabViewport {
             return resp.consumed;
         }
         if matches!(kind, ViewportInputKind::PointerDown { .. } | ViewportInputKind::PointerMove { .. } | ViewportInputKind::PointerUp { .. } | ViewportInputKind::HoverOut) {
-            self.pointer_input = Some(input);
+            self.pointer_input = Some(if matches!(kind, ViewportInputKind::PointerMove { buttons: 0, .. }) && crate::tools::picks::active(state) {
+                ViewportInput { hit: state.view.hover, ..input }
+            } else { input });
         }
         let brush_controls = (state.ui.paint_radius, crate::tools::paint::erasing(state), state.ui.sculpt_radius, crate::tools::sculpt::operation(state));
         let mut resp = self.navigator.handle(cx, &input, state);
@@ -3804,6 +3879,14 @@ impl FabViewport {
             _ => PointerButton::Primary,
         }
     }
+
+    fn buttons_of(device: &DigitDevice) -> u8 {
+        match Self::button_of(device) {
+            PointerButton::Primary => 1,
+            PointerButton::Secondary => 2,
+            PointerButton::Middle => 4,
+        }
+    }
 }
 
 impl WidgetNode for FabViewport {
@@ -3913,15 +3996,18 @@ impl Widget for FabViewport {
         // often it recorded the scene for a change, moved a resin cut in place and started its
         // still average again (and how often for the composite alone), how often a publication
         // asked it to draw (`records.published`), the board's run's simulated time (`sim_t`;
-        // null without the electronics host, 0 before the run has stepped), how many frames its
-        // navigation asked for after one it took (`nav_frames`: a glide's, a coast's, a moving
-        // drag's), the element under the pointer (`hover`), and the trees' branches: whether one
-        // is under the pointer and whether one is pressed, and what the slice's frame lights (the
-        // hovered branch, the picked one) with how many beads, and where the picked one stands on
-        // the screen. Then whether it draws a circuit board, how many of
+        // null without the electronics host, 0 before the run has stepped), whether that run has
+        // settled (`sim_steady`: no publication follows until a command; null without the host),
+        // how many frames its navigation asked for after one it took (`nav_frames`: a glide's, a
+        // coast's, a moving drag's), the element under the pointer (`hover`), and the trees'
+        // branches: whether one is under the pointer and whether one is pressed, and what the
+        // slice's frame lights (the hovered branch, the picked one) with how many beads, and where
+        // the picked one stands on the screen. Then whether it draws a circuit board, how many of
         // its part bodies are drawn from a model file (`model_bodies`), and the live
         // controls it shows: each one's name, whether it is a knob, where on the screen a press
-        // takes it (window points), whether the bench holds it pressed, and a knob's place.
+        // takes it (window points), whether the bench holds it pressed, and a knob's place; and
+        // whether a press on a control is the view's (`claimed`, from its down to its release):
+        // a test knows the view took the press and its release before the bench answers either.
         if let Some(key) = &self.scene_key {
             let c = &key.camera;
             let spot = self.issue_spot_drawn.as_ref().map_or_else(|| "null".to_string(), |(s, opacity)| {
@@ -3963,7 +4049,7 @@ impl Widget for FabViewport {
                     at.map_or_else(|| "null".to_string(), |p| format!("[{:.1},{:.1}]", p.x, p.y)))
             }).collect());
             node.description = format!(
-                r#"{{"camera":{{"eye":{:?},"target":{:?},"up":{:?},"hung":{},"ortho":{},"ortho_height":{:?}}},"parts_drawn":{},"settled":{},"at_rest":{},"traced":{},"still_samples":{},"screen_ao":{},"floor":{},"issue_spot":{},"records":{{"scene":{},"cut_moved":{},"draws":{},"still":{},"comp":{},"published":{}}},"sim_t":{},"nav_frames":{},"branches":{{"hovered":{},"pressed":{},"lit":{{"hovered":{},"picked":{},"beads":{},"picked_box":{}}}}},"boards_drawn":{},"model_bodies":{},"controls":[{}],"pointer":{},"hover":{},"selected":[{}]}}"#,
+                r#"{{"camera":{{"eye":{:?},"target":{:?},"up":{:?},"hung":{},"ortho":{},"ortho_height":{:?}}},"parts_drawn":{},"settled":{},"at_rest":{},"traced":{},"still_samples":{},"test_cut":{},"screen_ao":{},"floor":{},"issue_spot":{},"records":{{"scene":{},"cut_moved":{},"draws":{},"still":{},"comp":{},"published":{}}},"sim_t":{},"sim_steady":{},"nav_frames":{},"branches":{{"hovered":{},"pressed":{},"lit":{{"hovered":{},"picked":{},"beads":{},"picked_box":{}}}}},"boards_drawn":{},"model_bodies":{},"controls":[{}],"claimed":{},"pointer":{},"hover":{},"selected":[{}]}}"#,
                 [c.eye.x, c.eye.y, c.eye.z],
                 [c.target.x, c.target.y, c.target.z],
                 [c.up.x, c.up.y, c.up.z],
@@ -3975,6 +4061,7 @@ impl Widget for FabViewport {
                 at_rest,
                 !scene.sdf.borrow().tracing(),
                 self.still_aa.count(),
+                self.test_cut.map_or_else(|| "null".to_string(), |(at, size)| format!(r#"{{"at":[{},{},{}],"size":[{},{},{}]}}"#, at[0], at[1], at[2], size[0], size[1], size[2])),
                 self.ssao_on,
                 self.elem_lut.floor_drawn().unwrap_or(false),
                 spot,
@@ -3985,6 +4072,7 @@ impl Widget for FabViewport {
                 self.comp_restarts,
                 self.published_redraws,
                 live.map_or_else(|| "null".to_string(), |live| format!("{:?}", live.sim.status.t)),
+                live.map_or_else(|| "null".to_string(), |live| live.sim.status.steady.to_string()),
                 self.navigator.frames_asked(),
                 self.hovered_branch.is_some(),
                 self.pressed_branch.is_some(),
@@ -3995,6 +4083,7 @@ impl Widget for FabViewport {
                 scene.board_layer.drawable(),
                 scene.board_layer.model_bodies(),
                 controls.join(","),
+                self.press_claimed,
                 self.pointer_seen.map_or_else(|| "null".to_string(), |p| format!("[{:.1},{:.1}]", p.x, p.y)),
                 self.hover_seen.map_or_else(|| "null".to_string(), |e| e.0.to_string()),
                 selected.join(","),
@@ -4305,7 +4394,57 @@ impl Widget for FabViewport {
             // A blocked hover clears the overlays without picking through the covering layer.
             self.pointer_input = Some(ViewportInput { rect: self.area.rect(cx), kind: ViewportInputKind::HoverOut, hit: None });
         }
-        match event.hits(cx, self.area) {
+        let menu_open = self.role == PaneRole::Plate && state.picks.menu.as_ref().is_some_and(|m| m.pane == self.pane);
+        if menu_open && self.pointer_held {
+            self.menu_press = true;
+            self.context_click = false;
+        }
+        if menu_open && matches!(event, Event::KeyDown(ke) if ke.key_code == KeyCode::Escape) {
+            // The same Escape delivered to the Select tool would also end a command or clear the picks.
+            self.dismiss_menu(cx, state);
+            return;
+        }
+        // Grips and controls are hit-tested before the viewport. Its menu locks their hits,
+        // lifting its own lock just for this ordinary hit so a stroke keeps capture off-view.
+        let hit = if menu_open && cx.sweep_lock_area() == Some(self.area) {
+            cx.sweep_unlock(self.area);
+            let hit = event.hits(cx, self.area);
+            cx.sweep_lock(self.area);
+            hit
+        } else {
+            event.hits(cx, self.area)
+        };
+        if matches!(hit, Hit::FingerDown(_)) { self.menu_press = menu_open; }
+        if menu_open || self.menu_press {
+            // Live controls and plate markers can claim a press before deliver() and act on
+            // its release afterwards. Give the ring its window points before those paths.
+            let kind = match &hit {
+                Hit::FingerDown(e) => {
+                    self.pointer_held = true;
+                    Some(ViewportInputKind::PointerDown { button: Self::button_of(&e.device), pos: e.abs, mods: e.modifiers, tap_count: e.tap_count })
+                }
+                Hit::FingerMove(e) => Some(ViewportInputKind::PointerMove { pos: e.abs, delta: DVec2::default(), mods: e.modifiers, buttons: Self::buttons_of(&e.device) }),
+                Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) => Some(ViewportInputKind::PointerMove { pos: e.abs, delta: DVec2::default(), mods: e.modifiers, buttons: 0 }),
+                Hit::FingerUp(e) => {
+                    self.menu_press = false;
+                    self.pointer_held = false;
+                    self.last_pointer = None;
+                    self.context_click = false;
+                    Some(ViewportInputKind::PointerUp { button: Self::button_of(&e.device), pos: e.abs, mods: e.modifiers })
+                }
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                if menu_open {
+                    self.deliver(cx, state, kind, None);
+                    if matches!(&hit, Hit::FingerUp(e) if e.cancelled || !e.is_over || e.is_sweep) {
+                        self.pointer_input = Some(ViewportInput { rect: self.area.rect(cx), kind: ViewportInputKind::HoverOut, hit: None });
+                    }
+                }
+                return;
+            }
+        }
+        match hit {
             Hit::FingerDown(fe) => {
                 if self.live_press.claimed() || self.live_turn.claimed() || self.live_touch.is_some() { return; }
                 self.pointer_held = true;
@@ -4413,19 +4552,7 @@ impl Widget for FabViewport {
                 }
                 let delta = self.last_pointer.map(|p| pos - p).unwrap_or_default();
                 self.last_pointer = Some(pos);
-                let buttons = fe
-                    .device
-                    .mouse_button()
-                    .map(|b| {
-                        if b.is_middle() {
-                            4
-                        } else if b.is_secondary() {
-                            2
-                        } else {
-                            1
-                        }
-                    })
-                    .unwrap_or(1);
+                let buttons = Self::buttons_of(&fe.device);
                 self.deliver(
                     cx,
                     state,
@@ -4891,6 +5018,7 @@ impl Widget for FabViewport {
         // Each pane's table hides the floor from its own camera under the bed.
         let lut = self.elem_lut.sync(cx.cx, state, self.pane, &scene.sdf_drawn, scene.sdf_revision, &mut scene.sdf.borrow_mut().paint);
         let lut_changed = lut != elements::LutSync::Kept;
+        self.sync_copy_tint(cx.cx, crate::tools::fit::ghost(state, self.pane), lut_changed);
         if scene.host != Some(self.pane) {
             let environment = (scene.renderer.ibl_texture().map(Texture::texture_id), scene.lighting_revision);
             if self.review_environment != Some(environment) {
@@ -4931,6 +5059,7 @@ impl Widget for FabViewport {
         // composite records with them, or alone when only the hovered part or the resin layer
         // changed.
         let planes = view_planes(state);
+        self.test_cut = state.test_cut_shown().then(|| crate::ui::test_prints::shown(state)).flatten().map(|cube| (cube.center, cube.size));
         // A resin layer's cut: the scene passes record with it, and a new layer moves it in
         // place (`move_cut`), so scrubbing the layers records only the composite.
         let cut = layer_cut(state);
@@ -5661,10 +5790,13 @@ fn pick_ray_where(state: &AppState, pane: PaneId, ray: &crate::model::query::Ray
     let field = state.sdf.as_ref().map(|l| l.borrow());
     let poses = state.pane_poses(pane);
     let shown = |id| state.is_visible(id) && !state.plate.is_context(id) && !state.is_ghost_under(poses, id) && !state.case_hidden_in(pane, id);
+    // A marked part is drawn from its installed step mesh, including when the
+    // final part also has a field registered with the viewport.
+    let step = state.steps.shown.and(state.steps.part.as_ref()).and_then(|id| state.plate.parts.iter().find(|p| &p.object == id)?.element);
     let field_hit = field.as_ref().and_then(|l| {
         let o = [ray.origin.x as f64 * 1000.0, ray.origin.y as f64 * 1000.0, ray.origin.z as f64 * 1000.0];
         let d = [ray.dir.x as f64, ray.dir.y as f64, ray.dir.z as f64];
-        let (element, h) = l.pick(state, o, d, &shown)?;
+        let (element, h) = l.pick(state, o, d, &|id| Some(id) != step && shown(id))?;
         let t = (h.t * 0.001) as f32;
         let normal = vec3(h.normal[0] as f32, h.normal[1] as f32, h.normal[2] as f32);
         // facing the ray origin, as the mesh pick's
@@ -5672,7 +5804,7 @@ fn pick_ray_where(state: &AppState, pane: PaneId, ray: &crate::model::query::Ray
         // no triangle: the hit is on the field
         Some(RayHit { element, batch: u32::MAX, triangle: u32::MAX, t, point: ray.origin + ray.dir * t, normal, bary: [0.0, 0.0] })
     }).filter(|h| keep.is_none_or(|keep| keep(h.point)));
-    let pickable = |id| shown(id) && !field.as_ref().is_some_and(|l| l.picks(state, id));
+    let pickable = |id| shown(id) && (Some(id) == step || !field.as_ref().is_some_and(|l| l.picks(state, id)));
     let nearer = |a: Option<RayHit>, b: Option<RayHit>| match (a, b) {
         (Some(a), Some(b)) => Some(if b.t < a.t { b } else { a }),
         (a, b) => a.or(b),

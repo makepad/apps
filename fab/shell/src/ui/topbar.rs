@@ -7,9 +7,11 @@
 //! [`handle_actions`] and [`sync`].
 //!
 //! Left: the cube and the app's menus (File, Edit, View, Help). Centre: the document's name and
-//! state. Right: the job strip, the headset, undo / redo, the workspace menu (it names the shown
-//! workspace and lists them all, Cmd+1-9; [`crate::ui::workspace_tabs`]), the AI column and
-//! Print. (The code is an editor like any other: its area's selector, or ` to show it.)
+//! state (the full name in a tooltip). Right: the requirements chip, the job strip (or the save
+//! status while quitting), a reserved slot for the second-window icon (a plate also open in
+//! another Fab window), the headset, undo / redo, the workspace menu (it names the shown
+//! workspace and lists them all, Cmd+1-9; [`crate::ui::workspace_tabs`]), the camera, the AI
+//! column and Print. (The code is an editor like any other: its area's selector, or ` to show it.)
 //!
 //! The slice is a render mode of the plate view (`stage`), not a workspace. Print
 //! only opens the printer panel's confirm row (and shows the slice, which slices
@@ -25,15 +27,17 @@ use crate::ui::editors::Editor;
 use crate::ui::shell::ShowPanel;
 use crate::ui::workspace_tabs::{FabWorkspaceTabs, WorkspaceTabAction};
 use crate::workspaces::{ListOp, Origin, ShownBy, WorkspaceId};
+use fab_elec_view::ReqShown;
+use makepad_widgets_core::{job_strip::JobStrip, tip::{TipAction, TipWidgetRefExt}};
 use makepad_widgets_core::*;
 
-/// The caption's menus: owner id and items.
-fn menus() -> [(LiveId, fn(&AppState) -> Vec<MenuItem>); 4] {
+/// The caption's menus: owner id, title and items.
+fn menus() -> [(LiveId, &'static str, fn(&AppState) -> Vec<MenuItem>); 4] {
     [
-        (live_id!(fab_menu_file), file_menu),
-        (live_id!(fab_menu_edit), edit_menu),
-        (live_id!(fab_menu_view), view_menu),
-        (live_id!(fab_menu_help), |_| help_menu()),
+        (live_id!(fab_menu_file), "File", file_menu),
+        (live_id!(fab_menu_edit), "Edit", edit_menu),
+        (live_id!(fab_menu_view), "View", view_menu),
+        (live_id!(fab_menu_help), "Help", |_| help_menu()),
     ]
 }
 
@@ -67,6 +71,8 @@ script_mod! {
         }
     }
 
+    let JobsSlot = #(FabJobsSlot::register_widget(vm))
+
     mod.widgets.FabTopBar = View{
         width: Fill
         height: Fill
@@ -86,10 +92,41 @@ script_mod! {
                 flow: Right
                 align: Align{x: 1.0 y: 0.5}
                 spacing: 2
-                jobs := View{
+                // What the project requires, met of all: shown while a project has requirements.
+                requirements_tip := FabTip{
+                    requirements := mod.widgets.FabButton{
+                        visible: false height: 24
+                        draw_text +: {
+                            failing: instance(0.0) unknown: instance(0.0)
+                            get_color: fn() {
+                                return fab.color_ok.mix(fab.color_warning, self.unknown).mix(fab.color_error, self.failing)
+                            }
+                        }
+                    }
+                }
+                // The job strip, its line in a tooltip; while the app saves on quit, the save's
+                // status holds the slot instead.
+                jobs := JobsSlot{
                     width: Fit height: Fill
                     align: Align{y: 0.5}
-                    strip := mod.widgets.FabJobStrip{max_chars: #(JOB_LINE_CHARS)}
+                    jobs_tip := FabTip{wrap_width: 360 height: Fill flow: Right align: Align{y: 0.5}
+                        quit_line := Label{
+                            visible: false width: Fit height: Fit
+                            draw_text +: {color: fab.color_text text_style: theme.font_regular{font_size: fab.font_size_small}}
+                        }
+                        strip := mod.widgets.FabJobStrip{max_chars: #(JOB_LINE_CHARS)}
+                    }
+                }
+                // Always this size, icon or not, so nothing moves when it comes and goes.
+                also_slot := View{width: 28 height: 26
+                    also_tip := FabTip{ text: "This plate is also open in another Fab window."
+                        also := mod.widgets.FabIcon{
+                            visible: false
+                            margin: Inset{left: 7 top: 5}
+                            a11y: {label: "This plate is also open in another Fab window"}
+                            draw_icon +: { color: fab.color_warning svg: crate_resource("self://resources/icons/duplicate.svg") }
+                        }
+                    }
                 }
                 // Always available: starts the XR server and pairs a device by its PIN.
                 xr_caption := mod.widgets.XrCaptionButton{app: "fab" margin: Inset{left: 0 right: 0}}
@@ -133,7 +170,8 @@ script_mod! {
                 spacing: 6
                 align: Align{y: 0.5}
                 doc_name := mod.widgets.FabLabel{
-                    text: "Untitled"
+                    text: "Untitled" max_lines: 1 text_overflow: Ellipsis flow: Right
+                    hover_actions_enabled: true
                     draw_text +: { text_style: theme.font_bold{ font_size: fab.font_size_title } }
                 }
                 doc_state := mod.widgets.FabLabelSmall{ text: "" }
@@ -175,15 +213,52 @@ script_mod! {
     }
 }
 
+/// The job strip's slot: its tooltip names the shown job (its whole line), unless the save's
+/// status holds the slot while the app quits (`quit_status`).
+#[derive(Script, ScriptHook, Widget)]
+struct FabJobsSlot {
+    #[deref] view: View,
+    #[rust] tip_version: Option<(Option<jobs::JobId>, u64)>,
+}
+
+impl Widget for FabJobsSlot {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let tip = self.view.widget(cx, ids!(jobs_tip));
+        let strip = tip.child(id!(strip));
+        let job = strip.borrow::<JobStrip>().and_then(|s| s.shown_job());
+        let version = (job, jobs::board().seq());
+        if !tip.child(id!(quit_line)).visible() && self.tip_version != Some(version) {
+            let text = job.and_then(|id| jobs::board().get(id)).map_or_else(String::new, |j| j.line());
+            tip.as_tip().set_text(&text);
+            self.tip_version = Some(version);
+        }
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
 /// The caption's controls, from the app's action pass (`bar` is the
 /// `FabTopBar` view).
 pub fn handle_actions(cx: &mut Cx, bar: &WidgetRef, actions: &Actions, state: &AppState) {
+    // A plain label can report hover and still let its part of the caption drag the window.
+    let name = bar.label(cx, ids!(middle.title.doc_name));
+    if let Some(rect) = name.hover_in(actions) {
+        cx.widget_action(name.widget_uid(), TipAction::HoverIn(name.text(), rect));
+    } else if name.hover_out(actions) {
+        cx.widget_action(name.widget_uid(), TipAction::HoverOut);
+    }
     workspace_actions(cx, bar, actions, state);
     if bar.button(cx, ids!(right.undo)).clicked(actions) {
         cx.action(ShellAction::Command("undo".into()));
     }
     if bar.button(cx, ids!(right.redo)).clicked(actions) {
         cx.action(ShellAction::Command("redo".into()));
+    }
+    if bar.button(cx, ids!(right.requirements)).clicked(actions) {
+        cx.action(ShowPanel(Editor::Requirements));
     }
     if bar.button(cx, ids!(right.print)).clicked(actions) {
         cx.action(ShowPanel(Editor::Printer));
@@ -201,21 +276,21 @@ pub fn handle_actions(cx: &mut Cx, bar: &WidgetRef, actions: &Actions, state: &A
     if bar.button(cx, ids!(right.chat)).clicked(actions) {
         cx.action(ShellAction::Command("toggle chat".into()));
     }
-    for (owner, items) in menus() {
-        for action in ui_actions(actions) {
-            if let FabUiAction::MenuBarOpen { owner: requested, anchor, press } = action {
-                if *requested == owner {
-                    cx.action(FabUiAction::OpenMenu {
-                        owner, items: items(state), anchor: *anchor, place: MenuPlace::Below,
-                        menu_bar: true, press: *press,
-                    });
-                }
-            }
+    for action in ui_actions(actions) {
+        if let FabUiAction::MenuBarOpen { owner, anchor, press } = action {
+            let items = if *owner == live_id!(fab_menu_all) {
+                menus().into_iter().map(|(id, title, build)| MenuItem::new(id, title).flyout(build(state))).collect()
+            } else if let Some((_, _, build)) = menus().into_iter().find(|(id, _, _)| id == owner) {
+                build(state)
+            } else {
+                continue;
+            };
+            cx.action(FabUiAction::OpenMenu { owner: *owner, items, anchor: *anchor, place: MenuPlace::Below, menu_bar: true, press: *press });
         }
-        if let Some(pick) = menu_picked(actions, owner) {
-            if let Some(action) = menu_action_for(state, pick) {
-                cx.action(action);
-            }
+    }
+    for owner in menus().map(|(id, _, _)| id).into_iter().chain([live_id!(fab_menu_all)]) {
+        if let Some(action) = menu_picked(actions, owner).and_then(|pick| menu_action_for(state, pick)) {
+            cx.action(action);
         }
     }
 }
@@ -343,6 +418,8 @@ pub struct Caption {
     /// The shown one is Design's (its code toggle shows).
     pub design: bool,
     pub code: bool,
+    /// The plate is also open in another Fab window.
+    pub also_open: bool,
 }
 
 impl Caption {
@@ -362,14 +439,53 @@ impl Caption {
             }),
             design: state.ui.kind() == Workspace::Design,
             code: state.ui.code_shown(),
+            also_open: state.ui.also_open,
         }
     }
+}
+
+/// The app compares report Arc pointers in its caption update after non-draw events.
+/// Only a different report or a reapplied caption changes this button and its tooltip.
+pub fn sync_requirements(cx: &mut Cx, bar: &WidgetRef, shown: Option<&ReqShown>) {
+    let chip = bar.button(cx, ids!(right.requirements));
+    chip.set_visible(cx, shown.is_some());
+    if let Some(shown) = shown {
+        let report = &shown.report;
+        let (met, total) = report.met_count();
+        chip.set_text(cx, &format!("Requirements {met}/{total}"));
+        bar.tip(cx, ids!(right.requirements_tip)).set_text(&format!("What the project requires: {met} of {total} met"));
+        if let Some(mut button) = chip.borrow_mut() {
+            button.draw_text.set_dyn_instance(cx, id!(failing), &[u8::from(report.fail > 0) as f32]);
+            button.draw_text.set_dyn_instance(cx, id!(unknown), &[u8::from(report.unknown > 0) as f32]);
+            button.redraw(cx);
+        }
+    }
+}
+
+/// Pin the save status in the caption's job slot. Clearing it restores
+/// the strip's ordinary job selection and tooltip.
+pub fn quit_status(cx: &mut Cx, bar: &WidgetRef, text: Option<&str>) {
+    let slot = bar.widget(cx, ids!(right.jobs));
+    let Some(mut slot) = slot.borrow_mut::<FabJobsSlot>() else { return };
+    let tip = slot.view.widget(cx, ids!(jobs_tip));
+    let line = tip.child(id!(quit_line));
+    line.set_visible(cx, text.is_some());
+    tip.child(id!(strip)).set_visible(cx, text.is_none());
+    if let Some(text) = text {
+        line.set_text(cx, text);
+        tip.as_tip().set_text(text);
+    } else {
+        slot.tip_version = None;
+    }
+    drop(slot);
+    bar.redraw(cx);
 }
 
 /// Bring the caption up to date with its model (before a draw).
 pub fn sync(cx: &mut Cx, bar: &WidgetRef, caption: &Caption) {
     bar.label(cx, ids!(middle.title.doc_name)).set_text(cx, &caption.title);
     bar.label(cx, ids!(middle.title.doc_state)).set_text(cx, &caption.info);
+    bar.widget(cx, ids!(also)).set_visible(cx, caption.also_open);
     if let Some(mut tabs) = bar.widget(cx, ids!(workspaces)).borrow_mut::<FabWorkspaceTabs>() {
         tabs.set(cx, caption.tabs.clone(), caption.current, caption.temp.clone());
     }

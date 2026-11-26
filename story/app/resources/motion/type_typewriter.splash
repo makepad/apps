@@ -1,0 +1,47 @@
+use mod.motion.*
+// TYPEWRITER — a prompt field types a line at a human cadence (bursts and
+// pauses, not a constant rate) behind a solid caret, then the caret blinks
+// and the send button fills with the accent and pops.
+// Why: linear segments are intentional — typing has rhythm, not easing —
+// and the uneven key times are what make it read as a person typing.
+Motion{
+    label: "Typewriter prompt"
+    brief: "A prompt field that types a line with a caret, then sends it."
+    tags: ["kinetic-type", "typewriter", "product", "ui", "ai"]
+    duration: 5.0
+    inputs: {
+        prompt: input(@text, "Make a launch video for Notes", "The typed line, up to about 40 characters")
+        label: input(@text, "ASK ANYTHING", "Small caps label above the field")
+        accent: input(@color, #ff5c39, "Caret and send button")
+        ink: input(@color, #f4f7fa, "Typed text")
+        field: input(@color, #1a1f27, "Field fill")
+        background: input(@color, #0b0d12, "Ground")
+    }
+    layers: [
+        Rect{size: vec2(1920, 1080) fill: in(@background)}
+        Group{
+            at: vec2(960, 540)
+            y: keys([0.0, 40], [0.7, 0, @ease_out_expo], [4.55, 0], [5.0, -30, @ease_in_cubic])
+            opacity: keys([0.0, 0], [0.4, 1, @ease_out_cubic], [4.6, 1], [5.0, 0, @ease_in_cubic])
+            layers: [
+                Text{text: in(@label) font: Font{family: "Inter" weight: 600} size: 26 tracking: 0.24 color: #8e9aa7 at: vec2(-625, -140)}
+                // soft shadow, then the field
+                Rect{at: vec2(-660, -51) size: vec2(1320, 150) radius: 75 fill: #00000080 feather: 48}
+                Rect{at: vec2(-660, -75) size: vec2(1320, 150) radius: 75 fill: in(@field) stroke: #ffffff1f width: 2}
+                Text{text: in(@prompt) font: Font{family: "Inter" weight: 500} size: 52 tracking: -0.01 color: in(@ink)
+                     at: vec2(-590, -31)
+                     reveal: keys([0.7, 0.0], [1.3, 0.28], [1.55, 0.3], [2.2, 0.62], [2.45, 0.66], [2.9, 1.0])
+                     caret: keys([0.0, 1], [3.2, 0, @hold], [3.6, 1, @hold], [4.0, 0, @hold])
+                     caret_color: in(@accent)}
+                // send button: a quiet disc that fills and pops when the line is done
+                Ellipse{at: vec2(527, -48) size: vec2(96, 96) fill: #ffffff14}
+                Ellipse{at: vec2(527, -48) size: vec2(96, 96) fill: in(@accent)
+                        scale: keys([0.0, 0.0], [3.3, 0.0], [3.42, 0.88, @ease_out_cubic], [3.8, 1.0, @ease_out_back])}
+                Path{at: vec2(575, 0) anchor: vec2(0, 0) svg: "M -16 2 L 0 -16 L 16 2 M 0 -16 L 0 18" stroke: in(@ink) width: 7 rotate: 90}
+                Ellipse{at: vec2(527, -48) size: vec2(96, 96) stroke: in(@accent) width: 3
+                        scale: tween(1.0, 2.1, 3.42, 4.1, @ease_out_expo)
+                        opacity: keys([0.0, 0.0], [3.42, 0.0], [3.45, 0.8], [4.1, 0.0, @ease_out_cubic])}
+            ]
+        }
+    ]
+}

@@ -15,6 +15,10 @@
 //! `--route` streams previews from the route worker for all open nets, then commits its last proposal;
 //! `--organic` makes that job the `@organic` method (the grid route relaxed into curves).
 //! `--fixture --unplace N` leaves the first N fixture parts in the tray for drag placement.
+//! `--fixture --board NAME` shows another stock fixture's hand-placed board (`handheld`, `tonebox`).
+//! `--fixture --seed` places its parts afresh with the constructive placer (`place::seed`) from the
+//! circuit alone, and prints a `boardbench seed` line: its time, parts left without room and its
+//! wirelength against the hand placement's.
 //! `--kicad <path>` loads a board on the pool while an empty board is on screen, with import timings
 //! and its report; this takes precedence over generation and fixture flags.
 //! `--probe NAME` enables the probe chip and logs probes addressed to that bench.
@@ -1371,13 +1375,53 @@ impl MatchEvent for App {
             // A separate unit makes the pane fit the imported board when it arrives.
             (Board::new(BoardId(1), "Loading KiCad board"), None)
         } else if flag("--fixture") {
-            let mut design = fab_elec_fixtures::ledctl();
-            let Some(board) = design.units.iter_mut().find_map(|unit| unit.board.as_mut()) else {
+            let name = args.iter().position(|arg| arg == "--board").and_then(|i| args.get(i + 1)).map_or("ledctl", String::as_str);
+            let mut design = if name == "ledctl" {
+                fab_elec_fixtures::ledctl()
+            } else {
+                match fab_elec_fixtures::docs(name).map(|sources| fab_elec_lang::evaluate(&sources, &fab_elec_lang::std_libs())) {
+                    Some(Ok(evaluated)) => evaluated.design,
+                    Some(Err(diags)) => {
+                        eprintln!("boardbench fixture {name} does not evaluate: {diags:?}");
+                        cx.quit();
+                        return;
+                    }
+                    None => {
+                        eprintln!("boardbench has no stock fixture {name}");
+                        cx.quit();
+                        return;
+                    }
+                }
+            };
+            let Some(unit) = design.units.iter_mut().find(|unit| unit.board.as_ref().is_some_and(|b| !b.placed.is_empty())) else {
                 eprintln!("boardbench fixture has no board");
                 cx.quit();
                 return;
             };
-            let board = Arc::make_mut(board);
+            if flag("--seed") {
+                use fab_elec_route::place::{seed, Cost, PlaceProblem, SeedOpts};
+                let board = unit.board.as_mut().expect("the unit has a board");
+                let started = Instant::now();
+                let problem = PlaceProblem::new(board, &[]);
+                let hand: Vec<_> = problem.movables.iter().map(|m| m.start).collect();
+                let mut poses = hand.clone();
+                let report = seed(board, &unit.circuit, &problem, &mut poses, &SeedOpts::default());
+                let ms = started.elapsed().as_secs_f64() * 1000.0;
+                let (ours, theirs) = (Cost::new(&problem, &poses).terms().wirelength, Cost::new(&problem, &hand).terms().wirelength);
+                println!("boardbench seed ms={ms:.3} parts={} unplaced={} wirelength={:.2}x", poses.len(), report.unplaced.len(), ours as f64 / theirs.max(1) as f64);
+                let board = Arc::make_mut(board);
+                for (m, pose) in problem.movables.iter().zip(&poses) {
+                    if let Some(p) = board.placed.iter_mut().find(|p| p.id == m.item) {
+                        (p.at, p.rot, p.side) = (pose.at, pose.rot, pose.side);
+                    }
+                }
+                // The hand placement's copper and pours belong to its poses.
+                board.tracks.clear();
+                board.vias.clear();
+                board.zones.clear();
+                board.reindex();
+            }
+            let board = Arc::make_mut(unit.board.as_mut().expect("the unit has a board"));
             let n = number::<usize>(&args, "--unplace").unwrap_or(0).min(board.placed.len());
             let removed: Vec<_> = board.placed.drain(..n).collect();
             self.discarded.push(Box::new(removed));

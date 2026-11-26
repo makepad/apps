@@ -1159,6 +1159,7 @@ impl Wave {
         open.extend(unjoined);
         open.extend(stretch::sharp_corners(board, &ops));
         let proposal = RouteProposal {
+            pair: None,
             id, source,
             unit: base.unit, base_generation: generation, base_hash: base.hash,
             metrics: RouteMetrics::default(), ops, checked: None, verified: collisions.is_empty(), collisions,

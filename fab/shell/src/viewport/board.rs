@@ -472,8 +472,11 @@ pub struct BoardLayer {
     /// any, none per frame.
     links: Vec<Option<(Mat4f, Option<ElementId>)>>,
     links_key: Option<(u64, u64, usize)>,
-    /// Every scene board stands in a plate part whose placement says `hidden: true`: the layer
-    /// draws, casts and picks nothing (looked up with `links`).
+    /// Visibility from the holding parts, looked up with `links`.
+    parts_hidden: bool,
+    /// Resolving an archived job can scan the job list. Only its print revision in Monitor matters.
+    monitor_revision: Option<u64>,
+    /// The holding parts hide the boards or Monitor holds a job. Nothing draws, casts or picks.
     hidden: bool,
     /// The holding parts of the boards drawn: their own meshes stay out of the plate passes.
     drawn_parts: Vec<ElementId>,
@@ -512,6 +515,8 @@ impl Default for BoardLayer {
             poses: Vec::new(),
             links: Vec::new(),
             links_key: None,
+            parts_hidden: false,
+            monitor_revision: None,
             hidden: false,
             drawn_parts: Vec::new(),
             empty_art: None,
@@ -972,19 +977,15 @@ impl BoardLayer {
         // the holding part is looked up again, or its own mesh would draw through the board and a
         // Mechanics move would carry it away without the board.
         let links_key = (state.plate.revision, state.scene_revision, self.scene.as_ref().map_or(0, |scene| Arc::as_ptr(scene) as usize));
-        if self.links_key != Some(links_key) {
+        let links_changed = self.links_key != Some(links_key);
+        if links_changed {
             self.links_key = Some(links_key);
             let links = self.scene.as_ref().map_or_else(Vec::new, |scene| held_boards(scene, &state.plate.parts));
             if links != self.links {
                 self.links = links;
                 changed = true;
             }
-            let hidden = self.scene.as_ref().is_some_and(|scene| boards_hidden(scene, &state.plate.parts));
-            if hidden != self.hidden {
-                self.hidden = hidden;
-                self.casters.borrow_mut().set_hidden(hidden);
-                changed = true;
-            }
+            self.parts_hidden = self.scene.as_ref().is_some_and(|scene| boards_hidden(scene, &state.plate.parts));
         }
         let spot = state.elec_spot.map_or_else(
             || [(state.plate.bed_min[0] + state.plate.bed_max[0]) * 0.5, (state.plate.bed_min[1] + state.plate.bed_max[1]) * 0.5],
@@ -997,6 +998,16 @@ impl BoardLayer {
             let mut casters = self.casters.borrow_mut();
             for (i, board) in self.boards.iter().enumerate() {
                 casters.set_board_pose(i, &board.fab_from_board);
+            }
+        }
+        let monitor_revision = state.print.follow.monitor.then_some(state.print.revision);
+        if links_changed || self.monitor_revision != monitor_revision {
+            self.monitor_revision = monitor_revision;
+            let hidden = self.parts_hidden || (!self.boards.is_empty() && state.print.monitor_holds());
+            if self.hidden != hidden {
+                self.hidden = hidden;
+                self.casters.borrow_mut().set_hidden(hidden);
+                changed = true;
             }
         }
         changed
@@ -1437,6 +1448,33 @@ mod tests {
             }
             assert!(layer.bodies.instance_poses().eq(rest.iter().copied()), "{step}: the holder move preserves every stored instance matrix");
             assert_eq!(layer.bodies.build_requests(), builds, "{step}: the holder move requests no body build");
+        }
+
+        // Opening and closing an archived job leaves the plate, board scene and holder pose alone.
+        use crate::print::{apply, jobs::{CommittedJob, JobMeta, JobState}, PrintAction};
+        let grips = layer.port_tips(false, &moves);
+        let &(button, tip) = grips.first().expect("the board has a push button");
+        let ray = crate::model::query::Ray::new(tip + vec3(0.0, 0.0, 0.02), vec3(0.0, 0.0, -1.0));
+        state.print.follow.jobs.push(CommittedJob {
+            meta: Arc::new(JobMeta { id: "archived".into(), ..Default::default() }),
+            state: JobState::Finished,
+            ..Default::default()
+        });
+        state.print.follow.monitor = true;
+        for (action, visible) in [(PrintAction::PickJob(Some("archived".into())), false), (PrintAction::CloseJob, true)] {
+            apply(&mut state.print, &action);
+            let changed = layer.sync(&mut cx, &state);
+            assert_eq!(layer.drawable(), visible, "{action:?}: the lit pass gates the PCB and bodies");
+            assert!(changed, "{action:?}: the viewport must record its passes again");
+            let event = DrawEvent::default();
+            let mut draw = CxDraw::new(&mut cx, &event);
+            assert_eq!(layer.select(&mut draw, &SceneState3D::default(), &moves), visible, "{action:?}: the auxiliary pass gates the PCB and bodies");
+            assert_eq!(layer.comp_at(&ray, &moves).map(|hit| hit.0), visible.then_some(button), "{action:?}: the ray picks only a visible button");
+            assert_eq!(layer.port_tips(false, &moves), if visible { grips.as_slice() } else { &[] }, "{action:?}: only visible controls offer grips");
+            let mut casters = layer.casters.borrow_mut();
+            let revision = casters.revision();
+            casters.set_hidden(!visible);
+            assert_eq!(casters.revision(), revision, "{action:?}: the shadow casters already have the requested visibility");
         }
     }
 

@@ -228,6 +228,12 @@ impl TierPlan {
         }
     }
 
+    /// `b` and `d` hold the `Timed` part for no instant: the next load re-reads it, at whatever
+    /// time (a boundary fed new points, `Solver::feed`).
+    pub fn forget_instant(&mut self) {
+        self.at = f64::NAN;
+    }
+
     /// Re-reads the `Timed` instances' `f(0)` and `q(0)` at `cx.t` unless `b` and `d` hold them.
     fn at_time(&mut self, banks: &mut [Box<dyn Bank>], cx: &EvalCx) {
         if self.at.to_bits() == cx.t.to_bits() || self.timed_rows.is_empty() {

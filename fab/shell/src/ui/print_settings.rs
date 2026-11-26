@@ -21,6 +21,7 @@ const COPY_MENU: LiveId = live_id!(fab_slicer_copy);
 
 /// Choices up to this many sit as tabs in the row; more open a menu.
 const TAB_CHOICES: usize = 4;
+const MORE_PATTERNS: &str = "More patterns…";
 
 script_mod! {
     use mod.prelude.fab.*
@@ -55,7 +56,7 @@ script_mod! {
             }
         }
         Num := Setting{
-            row := PropNumberRow{
+            row := FabNumberRow{
                 value := mod.widgets.FabTip{width: Fill text: ""
                     // The sheet gives every number field a taller minimum than a property row (and the row's
                     // own height is fixed): the field takes the row's height, so its text centres in it.
@@ -84,6 +85,16 @@ script_mod! {
             row := PropDropDownRow{
                 value := mod.widgets.FabTip{width: Fill text: ""
                     pick := PropDropDown{}
+                }
+                trail +: {width: theme.prop_trail_width FabTip{text: "Remove the override: back to what it inherits" reset := Reset{}}}
+            }
+        }
+        // A pick whose short list says what each choice is for: its menu is as wide as those
+        // words, not the field (the menu stays inside the window).
+        PickNotes := Setting{
+            row := PropDropDownRow{
+                value := mod.widgets.FabTip{width: Fill text: ""
+                    pick := PropDropDown{popup_menu: mod.widgets.PopupMenu{width: Fit}}
                 }
                 trail +: {width: theme.prop_trail_width FabTip{text: "Remove the override: back to what it inherits" reset := Reset{}}}
             }
@@ -519,8 +530,14 @@ struct RowLook {
     set: bool,
     mixed: bool,
     locked: bool,
-    /// A choice's offered labels (a box offers the patterns a region takes).
-    choices: Vec<&'static str>,
+    expanded: bool,
+    /// The actual choices behind the displayed indices. The short list adds More after them.
+    choices: Vec<(&'static str, &'static str)>,
+}
+
+enum RowEdit {
+    Set(String),
+    More,
 }
 
 #[derive(Script, Widget)]
@@ -548,6 +565,9 @@ pub struct FabSlicerRows {
     synced: Option<(Filter, u64, u64, u64, Vec<SettingGroup>)>,
     #[rust]
     applied: HashMap<LiveId, RowLook>,
+    /// Rows showing their full choice list, until the corresponding dropdown closes.
+    #[rust]
+    expanded: HashMap<usize, DropDownRef>,
     /// The hover tooltip of a group header's note; never inline, so hovering moves nothing.
     #[rust]
     hint: PropHint,
@@ -641,12 +661,20 @@ impl FabSlicerRows {
     }
 
     /// The choices a row offers, as (value, label).
-    fn choices(&self, state: &AppState, s: &PrintSetting) -> Vec<(&'static str, &'static str)> {
+    fn choices(&self, state: &AppState, s: &PrintSetting, current: Option<&str>, expanded: bool) -> Vec<(&'static str, &'static str)> {
         let SettingKind::Choice(list) = s.kind else { return Vec::new() };
-        match self.box_row(state, s) {
+        let allowed = match self.box_row(state, s) {
             Some(p) => list.iter().copied().filter(|(_, l)| p.choices.iter().any(|c| c == l)).collect(),
             None => list.to_vec(),
+        };
+        if s.common.is_empty() || expanded {
+            return allowed;
         }
+        let mut short: Vec<_> = s.common.iter().filter_map(|(v, _)| allowed.iter().find(|(a, _)| a == v).copied()).collect();
+        if let Some(&choice) = allowed.iter().find(|(v, _)| Some(*v) == current) {
+            if !short.contains(&choice) { short.push(choice); }
+        }
+        short
     }
 
     /// Is this setting overridden here? (Any selected part, the project's global set, the box.)
@@ -681,7 +709,7 @@ impl FabSlicerRows {
             return;
         }
         let first = !self.applied.contains_key(&id);
-        let relabel = self.applied.get(&id).is_none_or(|old| old.choices != look.choices);
+        let relabel = self.applied.get(&id).is_none_or(|old| old.expanded != look.expanded || old.choices != look.choices);
         if first {
             let reset = w.widget(cx, ids!(reset));
             name_control(cx, &reset, &format!("Remove override: {}", ids.name), "button");
@@ -737,19 +765,35 @@ impl FabSlicerRows {
                     name_control(cx, &pick, name, "combo_box");
                 }
                 if relabel {
-                    w.drop_down(cx, ids!(pick)).set_labels(cx, look.choices.iter().map(|l| l.to_string()).collect());
+                    let dropdown = pick.as_drop_down();
+                    let mut labels: Vec<String> = look.choices.iter().map(|(_, l)| l.to_string()).collect();
+                    if !s.common.is_empty() {
+                        if look.expanded {
+                            dropdown.set_face_labels(cx, Vec::new());
+                        } else {
+                            dropdown.set_face_labels(cx, labels.clone());
+                            for ((value, _), label) in look.choices.iter().zip(&mut labels) {
+                                if let Some((_, note)) = s.common.iter().find(|(v, _)| v == value) {
+                                    label.push_str(": ");
+                                    label.push_str(note);
+                                }
+                            }
+                            labels.push(MORE_PATTERNS.into());
+                        }
+                    }
+                    dropdown.set_labels(cx, labels);
                 }
                 script_apply_eval!(cx, pick, {
                     marked: #(marked) mixed: #(mixed)
                     draw_text +: {color: if #(dim) {mod.theme.prop_ink_dim} else {mod.theme.color_text}}
                 });
                 pick.set_disabled(cx, look.locked);
-                if table.len() <= TAB_CHOICES {
+                if table.len() <= TAB_CHOICES && s.common.is_empty() {
                     let mut seg = w.widget(cx, ids!(seg));
                     if first { name_control(cx, &seg, name, "radio_group"); }
                     if let Some(mut inner) = seg.borrow_mut::<SegmentedControl>().filter(|_| relabel) {
-                        inner.options = look.choices.iter().map(|l| l.to_string()).collect();
-                        inner.option_names = look.choices.iter().map(|l| format!("{name} {l}")).collect();
+                        inner.options = look.choices.iter().map(|(_, l)| l.to_string()).collect();
+                        inner.option_names = look.choices.iter().map(|(_, l)| format!("{name} {l}")).collect();
                     }
                     script_apply_eval!(cx, seg, {
                         marked: #(marked) mixed: #(mixed)
@@ -775,8 +819,57 @@ impl FabSlicerRows {
         Some(w)
     }
 
+    fn sync_row(&mut self, cx: &mut Cx, state: &AppState, index: usize, w: &WidgetRef) {
+        let s = &PRINT_SETTINGS[index];
+        let (value, mixed) = self.shown_value(state, s);
+        let plate_only = matches!(s.scope, SettingScope::Plate(_));
+        let locked = plate_only && !matches!(self.filter.edit, Editing::Global);
+        let set = !locked && self.is_set(state, s);
+        let expanded = !s.common.is_empty() && self.expanded.contains_key(&index);
+        let choices = self.choices(state, s, (!mixed).then_some(value.as_str()), expanded);
+        let selected = choices.iter().position(|(v, _)| *v == value);
+        // A retained unknown pattern, or one the box cannot set, has no selected menu entry.
+        let mixed = mixed || (!s.common.is_empty() && selected.is_none());
+        self.configure(cx, index, w, RowLook { set, mixed, locked, expanded, choices });
+        w.widget(cx, ids!(reset)).set_visible(cx, set);
+        match s.kind {
+            SettingKind::Bool => w.check_box(cx, ids!(check)).set_state(cx,
+                if mixed { CheckState::Mixed } else if setting_on(s, &value) { CheckState::On } else { CheckState::Off }, Animate::No),
+            SettingKind::Number { .. } => {
+                let num = w.value_input(cx, ids!(num));
+                if !num.borrow().is_some_and(|n| n.is_interacting()) {
+                    let number = shown_number(&state.print, s, &value);
+                    num.set_value(cx, number);
+                    if let Some(mut n) = num.borrow_mut() {
+                        n.inherited = !set;
+                        n.mixed = mixed;
+                        n.placeholder = if number == 0.0 && s.label.contains("(0 =") { "Auto".into() } else { String::new() };
+                    }
+                }
+            }
+            SettingKind::Choice(_) => {
+                if let Some(i) = selected {
+                    w.segmented_control(cx, ids!(seg)).set_selected(cx, i);
+                    w.drop_down(cx, ids!(pick)).set_selected_item(cx, i);
+                }
+            }
+        }
+    }
+
     /// Reconcile the rows only when what they show changes.
     fn sync(&mut self, cx: &mut Cx2d, state: &AppState) {
+        // Dismissing the menu emits no Select action. Its face holds the pointer while open.
+        let expanded = self.expanded.len();
+        self.expanded.retain(|_, pick| {
+            if cx.sweep_lock_area() == Some(pick.area()) { return true; }
+            // Another overlay can hold the pointer above an open menu.
+            let mut node = a11y_tree::Node::default();
+            if let Some(inner) = pick.borrow() { inner.semantics(cx, &mut node); }
+            node.states.contains(a11y_tree::States::EXPANDED)
+        });
+        if self.expanded.len() != expanded {
+            self.synced = None;
+        }
         let folded: Vec<SettingGroup> = SettingGroup::ALL.into_iter().filter(|g| self.folded.contains(g)).collect();
         // a box's rows come with the part's parameters, not the plate's revision
         let boxed = {
@@ -796,7 +889,6 @@ impl FabSlicerRows {
         for (_, (w, _)) in self.items.iter() { w.set_visible(cx, false); }
         self.rows.clear();
         let searching = !self.filter.query.is_empty();
-        let global = matches!(self.filter.edit, Editing::Global);
         // a box: the settings it can set, every one (none is advanced there)
         let in_box = matches!(self.filter.edit, Editing::Box { .. });
         for group in SettingGroup::ALL {
@@ -838,40 +930,13 @@ impl FabSlicerRows {
                 let template = match s.kind {
                     SettingKind::Bool => live_id!(Bool),
                     SettingKind::Number { .. } => live_id!(Num),
-                    SettingKind::Choice(c) if c.len() <= TAB_CHOICES => live_id!(Choice),
+                    SettingKind::Choice(c) if c.len() <= TAB_CHOICES && s.common.is_empty() => live_id!(Choice),
+                    SettingKind::Choice(_) if !s.common.is_empty() => live_id!(PickNotes),
                     SettingKind::Choice(_) => live_id!(Pick),
                 };
                 let Some(w) = self.item(cx, ids.row, template) else { continue };
                 w.set_visible(cx, true);
-                let (value, mixed) = self.shown_value(state, s);
-                let plate_only = matches!(s.scope, SettingScope::Plate(_));
-                let locked = plate_only && !global;
-                let set = !locked && self.is_set(state, s);
-                let choices = self.choices(state, s);
-                self.configure(cx, index, &w, RowLook { set, mixed, locked, choices: choices.iter().map(|(_, l)| *l).collect() });
-                w.widget(cx, ids!(reset)).set_visible(cx, set);
-                match s.kind {
-                    SettingKind::Bool => w.check_box(cx, ids!(check)).set_state(cx,
-                        if mixed { CheckState::Mixed } else if setting_on(s, &value) { CheckState::On } else { CheckState::Off }, Animate::No),
-                    SettingKind::Number { .. } => {
-                        let num = w.value_input(cx, ids!(num));
-                        if !num.borrow().is_some_and(|n| n.is_interacting()) {
-                            let number = shown_number(&state.print, s, &value);
-                            num.set_value(cx, number);
-                            if let Some(mut n) = num.borrow_mut() {
-                                n.inherited = !set;
-                                n.mixed = mixed;
-                                n.placeholder = if number == 0.0 && s.label.contains("(0 =") { "Auto".into() } else { String::new() };
-                            }
-                        }
-                    }
-                    SettingKind::Choice(_) => {
-                        if let Some(i) = choices.iter().position(|(v, _)| *v == value) {
-                            w.segmented_control(cx, ids!(seg)).set_selected(cx, i);
-                            w.drop_down(cx, ids!(pick)).set_selected_item(cx, i);
-                        }
-                    }
-                }
+                self.sync_row(cx, state, index, &w);
                 self.rows.push((ids.row, Some(index)));
             }
             let children = self.rows[start..].iter().filter_map(|(id, _)| self.items.get(id).map(|(w, _)| (*id, w.clone()))).collect();
@@ -881,14 +946,20 @@ impl FabSlicerRows {
     }
 
     /// One row's new value, if this event gave it one.
-    fn edited(&self, cx: &mut Cx, state: &AppState, actions: &Actions, s: &PrintSetting, w: &WidgetRef) -> Option<String> {
+    fn edited(&self, cx: &mut Cx, actions: &Actions, index: usize, w: &WidgetRef) -> Option<RowEdit> {
+        let s = &PRINT_SETTINGS[index];
         match s.kind {
             SettingKind::Bool => w.check_box(cx, ids!(check)).changed(actions).map(|v| if v { "1".into() } else { "0".into() }),
             SettingKind::Number { .. } => w.value_input(cx, ids!(num)).ended(actions).and_then(|v| number_text(s, v)),
-            SettingKind::Choice(_) => w.segmented_control(cx, ids!(seg)).selected(actions)
-                .or_else(|| w.drop_down(cx, ids!(pick)).selected(actions))
-                .and_then(|i| self.choices(state, s).get(i).map(|(v, _)| v.to_string())),
-        }
+            SettingKind::Choice(_) => {
+                let i = w.segmented_control(cx, ids!(seg)).selected(actions).or_else(|| w.drop_down(cx, ids!(pick)).selected(actions))?;
+                let look = self.applied.get(&setting_ids()[index].row)?;
+                if !s.common.is_empty() && !look.expanded && i == look.choices.len() {
+                    return Some(RowEdit::More);
+                }
+                look.choices.get(i).map(|(v, _)| v.to_string())
+            }
+        }.map(RowEdit::Set)
     }
 
     /// Send a row's edit. A value equal to what it would inherit is no override at all. It
@@ -973,6 +1044,7 @@ impl Widget for FabSlicerRows {
                 }
             }
         }
+        let mut more = None;
         for (id, index) in &self.rows {
             let Some(index) = index else { continue };
             let s = &PRINT_SETTINGS[*index];
@@ -984,9 +1056,17 @@ impl Widget for FabSlicerRows {
             if matches!(s.scope, SettingScope::Plate(_)) && !matches!(self.filter.edit, Editing::Global) {
                 continue;
             }
-            if let Some(value) = self.edited(cx, state, actions, s, w) {
-                self.commit(cx, state, s, Some(value));
+            match self.edited(cx, actions, *index, w) {
+                Some(RowEdit::Set(value)) => self.commit(cx, state, s, Some(value)),
+                Some(RowEdit::More) => more = Some((*index, w.clone())),
+                None => {}
             }
+        }
+        if let Some((index, w)) = more {
+            let dropdown = w.drop_down(cx, ids!(pick));
+            self.expanded.insert(index, dropdown.clone());
+            self.sync_row(cx, state, index, &w);
+            if let Some(mut pick) = dropdown.borrow_mut() { pick.set_active(cx); };
         }
     }
 

@@ -1,0 +1,22 @@
+use mod.motion.*
+
+// An image from the deck's folder (embedded by the export), fading in, and a caption.
+let TEXT = Font{family: "Roboto Flex" weight: 420}
+
+let fade = fn(t) { ease(@ease_in_out_cubic, prog(t, 0.0, 0.5)) }
+
+let draw = fn(c, t, edit) {
+    c.text("An image from the deck's folder", 960, 980, {font: TEXT px: 32 color: #f0ede6 align: @center alpha: fade(t)})
+}
+
+Motion{
+    label: "Export fixture / picture"
+    size: vec2(1920, 1080)
+    duration: 1.0
+    fps: 60
+    background: #14161b
+    layers: [
+        Image{name: "icon" src: graphic("media/story_icon.png") size: vec2(640, 640) at: vec2(640, 200) opacity: fn(t) { fade(t) }}
+        Draw2D{name: "caption" size: vec2(1920, 1080) draw: draw}
+    ]
+}

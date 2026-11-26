@@ -1,0 +1,23 @@
+use mod.flow.*
+use mod.cut.*
+
+let cut_panel = fn() {
+    View{
+        PanelModule{title: "Harbour"
+            PanelColor{path: "look.INK"}
+        }
+    }
+}
+
+// ebb (plates/tide.splash): a steady waterline
+let p_ebb = Graphic{src: graphic("plates/tide.splash") span: [0, 2] params: {rise: 0}}
+// flood (plates/tide.splash): the waterline rises
+let p_flood = Graphic{src: graphic("plates/tide.splash") span: [2, 2] params: {rise: 1}}
+let picture = Stack{layers: [p_ebb.out(@frame), p_flood.out(@frame)]}
+let out = CutOutput{frame: picture.out(@frame)}
+
+Flow{
+    kind: @cut label: "Harbour tide"
+    output: {width: 160 height: 90 fps: 60} duration: 4
+    p_ebb, p_flood, picture, out
+}

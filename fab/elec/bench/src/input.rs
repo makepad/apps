@@ -28,6 +28,8 @@ pub struct LowerNet {
     /// Declared a supply: a power net, or a net on a power-output port (a block's port or a
     /// part's pin). The simulator's round plan may take its consumers' currents a round late there.
     pub supply: bool,
+    /// A channel of an output jack or a voltage point named by the bench's probes.
+    pub heard: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

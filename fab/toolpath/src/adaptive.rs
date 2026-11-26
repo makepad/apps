@@ -44,7 +44,7 @@ pub enum Seeds {
 }
 
 /// Mark the cells whose centres lie in `region` (row scans).
-fn raster(region: &[ExPolygon], x0: i64, y0: i64, cell: i64, nx: usize, ny: usize, out: &mut [bool]) {
+pub(crate) fn raster(region: &[ExPolygon], x0: i64, y0: i64, cell: i64, nx: usize, ny: usize, out: &mut [bool]) {
     if region.is_empty() {
         return;
     }
@@ -70,7 +70,7 @@ fn raster(region: &[ExPolygon], x0: i64, y0: i64, cell: i64, nx: usize, ny: usiz
 
 /// 1D squared distance transform with sample spacing `w` (lower envelope
 /// of parabolas): f[q] = min_p (w²(q − p)² + f[p]).
-fn edt_1d(f: &mut [f32], w: f32, v: &mut Vec<usize>, zz: &mut Vec<f32>, d: &mut Vec<f32>) {
+pub(crate) fn edt_1d(f: &mut [f32], w: f32, v: &mut Vec<usize>, zz: &mut Vec<f32>, d: &mut Vec<f32>) {
     let n = f.len();
     if n == 0 {
         return;

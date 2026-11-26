@@ -1,0 +1,28 @@
+use mod.motion.*
+// Words laid out letter by letter by a font: where each letter of a plain string sits, so a plate can draw a word's letters on their own (slammed in, lit one by one, set round a circle) and the word stays text you edit.
+//
+//   use mod.motion.modules.words.*
+//   let NOW = layout_word("NOW", Font{family: "Archivo" weight: 900}, 380)
+//   for g in NOW.letters { c.text(g.ch, 470.0 + g.x, 674.0, {px: 380 font: … align: @center}) }
+//
+// layout_word(text, font, px, tracking): the word set at `px` (px to the em, as c.text's `px`) with `tracking`
+// px between letters: {text width letters: [{ch x left w}]}: each letter's character, its centre and left
+// edge from the word's left edge, and its advance (px). The font's own kerning is kept.
+
+let layout_word = fn(text, font, px, tracking = 0.0) {
+    let L = text_layout(text, font, px * 0.75)
+    // the letters as one-letter strings (split("") gives an empty string at each end)
+    let parts = text.split("")
+    let letters = []
+    let n = L.glyphs.len()
+    if n > 0 {
+        for i in 0..n {
+            let g = L.glyphs[i]
+            let left = g.x + tracking * i
+            letters.push({ch: parts[g.char + 1] x: left + g.w / 2.0 left: left w: g.w})
+        }
+    }
+    return {text: text width: L.width + tracking * max(0, n - 1) letters: letters}
+}
+
+{layout_word: layout_word}

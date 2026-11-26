@@ -1,0 +1,2 @@
+ast_rdevicemotiondocaaaaaaaaaa=device_real.motion.splash
+ast_rphonefollowdocaaaaaaaaaaa=phone_follow.motion.splash

@@ -20,6 +20,10 @@ pub use grid::{ledctl_grid, ledctl_panel};
 pub use neck::pour_neck;
 pub use pair::ledctl_pair;
 
+/// ledctl's requirements document, kept out of `docs("ledctl")`: the tests that read
+/// requirements add it.
+pub const LEDCTL_REQ: &str = include_str!("../ledctl.req.splash");
+
 /// ledctl's documents.
 const LEDCTL: [(&str, &str); 3] = [
     ("ledctl.ckt.splash", include_str!("../ledctl.ckt.splash")),

@@ -182,6 +182,7 @@ pub fn legacy_cloud_layers(sky: &SkyParams) -> CloudStackParams {
                 fall_streaks: 0.0,
                 patchiness: 0.0,
                 opacity: 0.55,
+                contrails: None,
             }),
             ..lifted(CloudGenus::Cirrus, clouds.cirrus, clouds.altitude_m)
         });
@@ -384,12 +385,6 @@ pub fn storm_azimuth_deg(p: &HdriParams) -> f32 {
     }
 }
 
-/// Where a new Lenticular stands: the side opposite the sun turned a quarter clockwise (a quarter turn from the sun), so
-/// its plates are side-lit (their rims and bands show); east for a sun overhead.
-pub fn lenticular_azimuth_deg(p: &HdriParams) -> f32 {
-    (cumulonimbus_azimuth_deg(p) + 90.0).rem_euclid(360.0)
-}
-
 /// Where a new Cumulonimbus stands (design §4.3): opposite the sun, so its tower is sunlit; north for a sun overhead.
 pub fn cumulonimbus_azimuth_deg(p: &HdriParams) -> f32 {
     let sun = crate::atmosphere::sun_direction(&p.sky.sun);
@@ -503,11 +498,7 @@ mod tests {
     /// The seed of the points' spots, apart from the streams', so the spots do not follow the noise's own lattice.
     const SHARE_JITTER: u32 = 0x5ca1_ab1e;
 
-    /// clouds.rs's smoothstep, so the copies below round as the deck does.
-    fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
-        let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
-        t * t * (3.0 - 2.0 * t)
-    }
+    use crate::patterns::smooth as smoothstep;
 
     /// clouds.rs's `x2_rise`.
     fn x2_rise(amount: f32) -> f32 {
@@ -660,7 +651,7 @@ mod tests {
 
     /// The Cirrus block the lift makes of an older cirrus over a deck at `altitude_m` and `scale`.
     fn cirrus_block(altitude_m: f32, scale: f32) -> Option<CirrusParams> {
-        Some(CirrusParams { base_m: (altitude_m + 6000.0).max(8000.0), size_km: 6.0 * scale, streak_length: 6.7, fineness: 0.0, hooks: 0.0, fall_streaks: 0.0, patchiness: 0.0, opacity: 0.55 })
+        Some(CirrusParams { base_m: (altitude_m + 6000.0).max(8000.0), size_km: 6.0 * scale, streak_length: 6.7, fineness: 0.0, hooks: 0.0, fall_streaks: 0.0, patchiness: 0.0, opacity: 0.55, contrails: None })
     }
 
     /// Design §1.2: what a map without layers lists is exactly what its lift writes, for every preset and every clouds
@@ -668,7 +659,8 @@ mod tests {
     #[test]
     fn the_derived_rows_are_the_lift() {
         let cases = crate::cloud_baseline::clouds_baseline_cases();
-        let mut maps: Vec<(String, HdriParams)> = PRESET_NAMES.iter().map(|n| (n.to_string(), preset(n).unwrap())).collect();
+        // (the presets without layers: the cloud-type skies are made with one)
+        let mut maps: Vec<(String, HdriParams)> = PRESET_NAMES.iter().map(|n| (n.to_string(), preset(n).unwrap())).filter(|(_, p)| p.sky.cloud_stack.is_none()).collect();
         maps.extend(cases.iter().map(|(name, p, _)| (name.clone(), p.clone())));
         for (name, p) in &maps {
             let view = cloud_layers_view(p);

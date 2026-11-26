@@ -1,0 +1,33 @@
+use mod.motion.*
+// A highlight box that follows the app: the widget `target` names, or,
+// when `target` is empty, where the action is (the run's focus track). It
+// eases between targets and fades where there is nothing to show.
+let r = run()
+let box = fn(t) {
+    if in(@target) == "" { return r.focus(t, {pad: in(@pad) settle: 0.3}) }
+    return r.widget(in(@target), t, {pad: in(@pad)})
+}
+Motion{
+    label: "Highlight (follows the app)"
+    size: vec2(1080, 1920)
+    duration: 3600.0
+    inputs: {
+        target: input(@text, "", "Widget path to highlight (\"main.save\"); empty follows the focus")
+        color: input(@color, #ffc933, "Outline colour")
+        pad: input(@number, 14, "Space around the widget, in document units")
+        width: input(@number, 6, "Outline width")
+        radius: input(@number, 18, "Corner radius")
+    }
+    layers: [
+        Rect{name: "glow"
+            at: fn(t) { let b = box(t) return [b.at[0] - 6, b.at[1] - 6] }
+            size: fn(t) { let b = box(t) return [b.size[0] + 12, b.size[1] + 12] }
+            radius: in(@radius) stroke: in(@color) width: 14
+            opacity: fn(t) { return box(t).presence * 0.25 }}
+        Rect{name: "box"
+            at: fn(t) { return box(t).at }
+            size: fn(t) { return box(t).size }
+            radius: in(@radius) stroke: in(@color) width: in(@width)
+            opacity: fn(t) { return box(t).presence }}
+    ]
+}

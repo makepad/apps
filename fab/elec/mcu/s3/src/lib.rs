@@ -8,10 +8,7 @@
 //! (Shanghai) CO LTD): register addresses and fields ported with attribution
 //! from its soc headers (Apache-2.0 OR MIT) and hal mmu_ll.h (Apache-2.0);
 //! Xtensa core-isa.h (its MIT-style notice, in config.rs). Citations below use
-//! core-isa.h line numbers and the source references in facts.md §§1–3 and
-//! facts-machine.md §§3,6, under local/agent_state/electronics/emcu/s3/.
-//! ROM handoff/no-cache policy: fable-answers.md Q6 §1.2 and its block table;
-//! corrected Direct Boot offsets: local/plans/emcu-s3.md:27–30.
+//! core-isa.h line numbers.
 
 mod bus;
 mod input;

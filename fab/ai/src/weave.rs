@@ -39,7 +39,7 @@ fn part_value(ev: &Evaluated, w: &WeavePart, profile: &Profile) -> (bool, S) {
         ok,
         obj(vec![
             ("part", s(name)),
-            ("ok", flag(ok)),
+            crate::checks::Check::of(ok).fields().remove(0),
             ("links", int(c.links)),
             ("interlocks", int(c.pairs)),
             ("pieces", int(pieces)),
@@ -202,7 +202,7 @@ fn printed_value(p: &Printed) -> (bool, S) {
     (
         ok,
         obj(vec![
-            ("ok", flag(ok)),
+            crate::checks::Check::of(ok).fields().remove(0),
             ("layers", int(p.layers)),
             ("beads", int(c.beads)),
             ("min_bead_gap", opt(c.min_gap.map(|g| mm(g.0)))),
@@ -236,7 +236,9 @@ fn printed_value(p: &Printed) -> (bool, S) {
 /// `fab.weave`: every weave part's check (design geometry; with `as_printed`, also the sliced beads).
 pub fn check_value(ev: &Evaluated, profile: &Profile, print_setup: Option<&crate::PrintSetupFn>, as_printed: bool) -> S {
     if ev.weaves.is_empty() {
-        return obj(vec![("weaves", arr(Vec::new())), ("note", s("the program has no chains or chainmail: m.links, m.mail, m.drape"))]);
+        let mut fields = crate::checks::Check::NotChecked("the program has no chains or chainmail: m.links, m.mail, m.drape".into()).fields();
+        fields.push(("weaves", arr(Vec::new())));
+        return obj(fields);
     }
     // as printed: one slice of the plate with the app's own setup, judged per weave part
     let mut setup_name = String::new();
@@ -255,7 +257,7 @@ pub fn check_value(ev: &Evaluated, profile: &Profile, print_setup: Option<&crate
             let (pok, p) = match &sliced {
                 None => return (ok, v),
                 Some(Ok(checks)) => printed_value(&checks[k]),
-                Some(Err(e)) => (false, obj(vec![("error", s(e))])),
+                Some(Err(e)) => (false, obj(crate::checks::Check::NotChecked(format!("the plate could not be sliced: {e}")).fields())),
             };
             let v = match v {
                 S::Object(name, mut fields) => {
@@ -267,12 +269,16 @@ pub fn check_value(ev: &Evaluated, profile: &Profile, print_setup: Option<&crate
             (ok && pok, v)
         })
         .collect();
-    obj(vec![
-        ("ok", flag(parts.iter().all(|p| p.0))),
+    let mut fields = vec![crate::checks::Check::of(parts.iter().all(|p| p.0)).fields().remove(0)];
+    if !as_printed {
+        fields.push(("not_checked", crate::checks::not_checked(&[("the sliced beads".into(), "fab.weave {as_printed: true} slices the plate and checks them".into())])));
+    }
+    fields.extend([
         ("geometry", s(if as_printed { format!("design + as_printed ({setup_name})") } else { "design".into() })),
         ("profile", obj(vec![("nozzle", mm(profile.nozzle)), ("layer", mm(profile.layer)), ("material", s(&profile.material.name)), ("calibrated", flag(profile.measured.c_xy.is_some() || profile.measured.c_z_layers.is_some()))])),
         ("weaves", arr(parts.into_iter().map(|p| p.1))),
-    ])
+    ]);
+    obj(fields)
 }
 
 pub fn scene_of(name: &str) -> Result<WeaveScene, String> {

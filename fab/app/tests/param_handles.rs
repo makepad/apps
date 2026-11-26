@@ -13,7 +13,8 @@
 //!   rebuilds, and the vase (drawn from its field) never says "Rebuilding…"; values finer than
 //!   the step and a drag past the limit still end the indicator; its height handle grows it;
 //! - the bracket's subtracted feature (the counterbore) builds, and its thickness handle
-//!   thickens it.
+//!   thickens it; its typed box (a double-click on the handle) refuses text it cannot read, and
+//!   a press elsewhere closes the box but leaves the reason at the handle, nothing committed.
 //!
 //! HAL offscreen (`MAKEPAD_HAL_BACKEND=offscreen`), native GPU, no window.
 
@@ -264,6 +265,25 @@ place("vase", at: [222mm 165mm], name: "Bud vase")"#;
     let t0 = param(&app, "bracket/thickness");
     app.locator(Selector::role(Role::Slider).name("Thickness handle")).drag_by(0.0, -25.0);
     wait_within(&app, "the bracket to thicken by its handle", Duration::from_secs(30), || param(&app, "bracket/thickness") > t0 + 0.4);
+    wait_rebuilt(&app, "the thickness drag");
+
+    // ---- the handle's typed box: a refused value, a press elsewhere, the reason stays ----
+    let t1 = param(&app, "bracket/thickness");
+    let boxes = |app: &TestApp| app.widget_snapshot().nodes().iter().filter(|w| w.visible() && w.node.role == Role::SpinButton).count();
+    let refusing = |app: &TestApp| app.widget_snapshot().nodes().iter().any(|w| w.visible() && w.node.role == Role::SpinButton && w.node.description.contains("no parameter `nope`"));
+    let tip = |app: &TestApp| app.widget_snapshot().nodes().iter().any(|w| w.node.role == Role::Tooltip && w.node.name.contains("no parameter `nope`"));
+    let rows = boxes(&app);
+    let grip = Selector::role(Role::Slider).name("Thickness handle");
+    app.locator(grip.clone()).click_at_center();
+    app.locator(grip).click_at_center();
+    wait_for(&app, "the handle's box to open", || boxes(&app) > rows);
+    app.type_text("nope * 2");
+    wait_for(&app, "the box to say why it cannot read the text", || refusing(&app));
+    // (the row's label: nothing there to pick or press)
+    app.locator(Selector::role(Role::StaticText).name("Thickness")).click_at_center();
+    wait_for(&app, "the reason to stay at the handle once the box closes", || tip(&app));
+    assert!(!refusing(&app), "a press elsewhere closes the box");
+    assert_eq!(param(&app, "bracket/thickness"), t1, "a refused value commits nothing");
 }
 
 /// The app main thread's CPU budget per wait; the runtime also detects idle hangs.

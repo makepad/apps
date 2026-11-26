@@ -1,0 +1,32 @@
+# The AI control API tools every product window has (Stage, Story): the
+# document tree tools over the product's `Documents`, the asset library, the
+# effect catalogue, the status and the compute kernels.
+[package]
+name = "makepad-product-tools"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "The AI control API tools shared by the product windows"
+
+[lib]
+name = "makepad_product_tools"
+
+[dependencies]
+makepad-widgets = { path = "../../../../widgets", default-features = false }
+makepad-strict-json = { path = "../../../../libs/strict_json" }
+makepad-app-shell = { path = "../../../apps/libs/app_shell" }
+makepad-studio-api = { path = "../../../apps/libs/studio_api" }
+makepad-asset-data = { path = "../../../apps/engine/asset/data" }
+makepad-asset-client = { path = "../../../apps/engine/asset/client" }
+# The effect presets and the placeholder thumbnail.
+makepad-content-packs = { path = "../../../apps/engine/content_packs" }
+makepad-render-kernels = { path = "../../../../libs/render_kernels" }
+# The generation tools: the studio's API and the gen tool calls.
+makepad-flow-studio = { path = "../../../../libs/flow_studio" }
+makepad-gen = { path = "../../../../libs/gen" }
+jpeg-encoder = { path = "../../../../libs/jpeg-encoder", version = "0.6.1" }
+# import_media: a song's samples and its waveform thumbnail.
+makepad-stage-audio-media = { path = "../../../apps/engine/audio_media" }
+makepad-audio-decode = { path = "../../../../libs/audio_decode" }
+makepad-story-edit-voice = { path = "../../story/libs/edit_voice", default-features = false, features = ["publish"] }

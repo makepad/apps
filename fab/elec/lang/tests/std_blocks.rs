@@ -1,6 +1,6 @@
-use fab_elec_board::{resolve_rules, NetPair};
+use fab_elec_board::{resolve_rules, LengthMatch, NetPair, Spot};
 use fab_elec_circuit::{BlockDefId, Intent, RefKind, Target};
-use fab_elec_core::{mm, um, BlockId, Canon, Sel, Severity};
+use fab_elec_core::{mm, um, Angle, BlockId, Canon, Sel, Severity, P};
 use fab_elec_lang::{evaluate, std_libs, Sources, UnitState};
 
 fn sources(name: &str, text: &str) -> Sources {
@@ -17,12 +17,13 @@ use mod.elec.*
 let e = mod.elec
 let a = e.net({name: "a"})
 let b = e.net({name: "b"})
-e.pair(a, b, {gap: 0.15mm z0: 90})
+e.pair(a, b, {gap: 0.15mm z0: 90 skew: 0.1mm})
 e.pair(a, b)
 
 let p = e.net({})
 let n = e.net({})
 e.pair(p, n)
+e.match_length([n, p], {tol: 0.25mm})
 e.connect(a, p)
 e.connect(b, n)
 "#;
@@ -34,23 +35,32 @@ e.connect(b, n)
     let b = circuit.net("b").expect("pairs: net b exists").id;
     assert_ne!(a, b, "pairs: the two sides remain distinct nets");
     assert_eq!(circuit.nets.len(), 2, "pairs: both later net records merge into a and b");
-    assert_eq!(circuit.intents.len(), 3, "pairs: each declaration records one intent");
+    assert_eq!(circuit.intents.len(), 5);
     assert_eq!(
         circuit.intents[0],
         Intent::Pair { p: a, n: b, gap: Some(um(150.0)), z0: Some(90.0) },
         "pairs: explicit options retain polarity, the gap in nanometres and impedance in ohms"
     );
     assert_eq!(
-        circuit.intents[1],
+        circuit.intents[2],
         Intent::Pair { p: a, n: b, gap: None, z0: None },
         "pairs: omitted options stay unset for downstream rule resolution"
     );
     assert_eq!(
-        circuit.intents[2],
+        circuit.intents[3],
         Intent::Pair { p: a, n: b, gap: None, z0: None },
         "pairs: both net record indices resolve through connections made after the declaration"
     );
+    assert_eq!(circuit.intents[1], Intent::LengthMatch { nets: vec![a, b], tol: um(100.0) });
+    assert_eq!(circuit.intents[4], Intent::LengthMatch { nets: vec![b, a], tol: um(250.0) });
     let board = ev.design.units[0].board.as_deref().expect("pairs: the circuit unit has a board");
+    assert_eq!(board.length_matches, [
+        LengthMatch { nets: vec![a, b], tol: um(100.0) },
+        LengthMatch { nets: vec![b, a], tol: um(250.0) },
+    ]);
+    let mut without_matches = board.clone();
+    without_matches.length_matches.clear();
+    assert_ne!(without_matches.content_hash(), board.content_hash());
     assert_eq!(
         board.pairs,
         vec![
@@ -72,19 +82,68 @@ e.connect(b, n)
         ("e.pair(a, b, {unknown: 1})", "unknown option"),
         ("e.pair(a, b, {gap: 0mm})", "gap: must be > 0"),
         ("e.pair(a, b, {z0: 0})", "z0: must be a finite number > 0"),
+        ("e.pair(a, b, {skew: -1mm})", "skew: must be > 0"),
+        ("e.pair(a, b, {skew: @wide})", "skew: expected a length"),
+        ("e.match_length(a, {tol: 1mm})", "expected a list"),
+        ("e.match_length([], {tol: 1mm})", "at least two distinct nets"),
+        ("e.match_length([a], {tol: 1mm})", "at least two distinct nets"),
+        ("e.match_length([a, a], {tol: 1mm})", "at least two distinct nets"),
+        ("e.match_length([a, 1], {tol: 1mm})", "nets[1]: expected a net"),
+        ("e.match_length([a, b])", "tol: missing"),
+        ("e.match_length([a, b], {})", "tol: missing"),
+        ("e.match_length([a, b], 1)", "expected an options object"),
+        ("e.match_length([a, b], {skew: 1mm})", "unknown option"),
+        ("e.match_length([a, b], {tol: @wide})", "tol: expected a length"),
+        ("e.match_length([a, b], {tol: 0mm})", "tol: must be > 0"),
+        ("e.match_length([a, b], {tol: -1mm})", "tol: must be > 0"),
+        ("e.match_length([a, b], {tol: 3000mm})", "tol: length is outside"),
     ] {
         let mut src = Sources::new();
         let doc = src.add("invalid_pair.ckt.splash", format!("{prelude}{call}\n")).expect("invalid pair source is added");
-        let errors = evaluate(&src, &libs).expect_err("an invalid pair must be refused");
+        let errors = evaluate(&src, &libs).expect_err("an invalid intent must be refused");
         assert_eq!(errors.len(), 1, "{call}: exactly one diagnostic, got {errors:?}");
         let diag = &errors[0];
-        assert!(diag.message.starts_with("e.pair:"), "{call}: the diagnostic names e.pair: {diag:?}");
+        let callee = call.split_once('(').unwrap().0;
+        assert!(diag.message.starts_with(&format!("{callee}:")), "{call}: the diagnostic names its call: {diag:?}");
         assert!(diag.message.contains(message), "{call}: the diagnostic explains {message:?}: {diag:?}");
         assert!(
             diag.sel.contains(&Sel::Source { doc, start: prelude.len() as u32, end: (prelude.len() + call.len()) as u32 }),
-            "{call}: the diagnostic selects the offending pair call: {diag:?}"
+            "{call}: the diagnostic selects the offending call: {diag:?}"
         );
     }
+
+    let call = "e.match_length([a, b], {tol: 0.25mm})";
+    let mut src = Sources::new();
+    let doc = src.add("merged_match.ckt.splash", format!("{prelude}{call}\ne.connect(a, b)\n")).unwrap();
+    let errors = evaluate(&src, &libs).expect_err("a subsequent join leaves only one distinct net");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.starts_with("e.match_length:"));
+    assert!(errors[0].sel.contains(&Sel::Source { doc, start: prelude.len() as u32, end: (prelude.len() + call.len()) as u32 }));
+}
+
+#[test]
+fn a_spot_fixes_one_part_and_the_board_mirrors_it() {
+    let libs = std_libs();
+    let fixture = include_str!("../../fixtures/tonebox.ckt.splash");
+    let spot = "e.fixed(key, {at: [20mm, 10mm] rot: 90deg})";
+    let ev = evaluate(&sources("tonebox.ckt.splash", &format!("{fixture}\n{spot}\n")), &libs)
+        .unwrap_or_else(|errors| panic!("a spot on a part evaluates:\n{errors:#?}"));
+    let circuit = &ev.design.units[0].circuit;
+    let key = circuit.comps.iter().find(|c| c.path == "key").expect("tonebox: the key is a part").id;
+    let board = ev.design.units[0].board.as_deref().expect("tonebox: the circuit unit has a board");
+    assert_eq!(board.spots, vec![Spot { comp: key, at: P::new(mm(20.0), mm(10.0)), rot: Some(Angle::QUARTER) }],
+        "the board mirrors the spot, in nanometres and micro-degrees");
+
+    let call = "e.fixed(usb, {at: [1mm, 1mm]})";
+    let mut src = Sources::new();
+    let doc = src.add("tonebox.ckt.splash", format!("{fixture}\n{call}\n")).expect("a circuit document name");
+    let errors = evaluate(&src, &libs).expect_err("a spot on a block must be refused");
+    assert_eq!(errors.len(), 1, "a spot on a block: exactly one diagnostic, got {errors:?}");
+    assert!(errors[0].message.starts_with("e.fixed:") && errors[0].message.contains("at: a spot fixes one part"),
+        "the diagnostic says a spot is one part's: {:?}", errors[0]);
+    let start = (fixture.len() + 1) as u32;
+    assert!(errors[0].sel.contains(&Sel::Source { doc, start, end: start + call.len() as u32 }),
+        "the diagnostic selects the call: {:?}", errors[0]);
 }
 
 #[test]

@@ -1,0 +1,54 @@
+# The Generate agent of Stage's EDIT page: a model writes
+# Motion documents and the edit that places them, looks at what it made
+# (inspect reports, contact sheets), and fixes it until it is clean.
+#
+# Pure logic plus the chat backends: the tool table, the tool-call parser,
+# the loop (storyboard, write, inspect, look, fix; bounded, cancellable),
+# the transcript and per-document diffs a panel shows, and the authoring
+# guide (apps/apps/engine/motion/guide/SKILL.md, which Stage's Claude Code skill points at). Tools
+# are executed by a host (the EDIT page, or a headless evaluator), so every
+# change lands as an ordinary undoable edit of ordinary Splash.
+#
+# Backends: Claude Code (the person's logged-in CLI, with vision), the
+# Claude API (native tools, when a key is set) and, behind `hub`, the AI Hub
+# LLM nodes on the LAN. No in-process model: its hub session is given no
+# local weights, so it routes to a node that serves one or says there is none.
+[package]
+name = "makepad-story-video-agent"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[features]
+default = ["hub"]
+# The AI Hub fleet chat session: the hub's featureless chat (this machine's
+# node or the LAN's); the hub's `llm` would only add loading local weights,
+# which this session never names.
+hub = []
+
+[dependencies]
+makepad-ai-hub = { path = "../../../../../libs/ai/hub", default-features = false }
+makepad-strict-json = { path = "../../../../../libs/strict_json" }
+makepad-network = { path = "../../../../../platform/network" }
+makepad-base64 = { path = "../../../../../libs/base64" }
+
+[dev-dependencies]
+# The guide's Motion examples must load: a guide that teaches broken
+# syntax teaches the model broken syntax.
+makepad-motion = { path = "../../../../apps/engine/motion", features = ["dev-roots"] }
+
+# Files this crate reads outside its directory, for the app slices: the
+# authoring guide and references it gives the model (guide.rs).
+[package.metadata.commercial]
+include = [
+    "../../../../apps/engine/motion/guide/SKILL.md",
+    "../../../../apps/engine/motion/guide/canvas.md",
+    "../../../../apps/engine/motion/guide/performance.md",
+    "../../../../apps/engine/motion/guide/plot.md",
+    "../../../../apps/engine/motion/guide/deck.md",
+    "../../../../apps/engine/motion/guide/deck_edit.md",
+    "../../../../apps/engine/motion/guide/explainer.md",
+    "../../../../apps/engine/motion3d/MOTION3D.md",
+    "../../../stage/content/motion-deck/deck.splash",
+]

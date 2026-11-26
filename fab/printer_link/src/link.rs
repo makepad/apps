@@ -38,6 +38,10 @@ impl ConnectionStatus {
 pub struct Snapshot {
     pub name: String,
     pub model: String,
+    /// The trays and heads come from Fab's virtual printer layout.
+    pub virtual_printer: bool,
+    /// How fast a virtual printer's job runs ([`PrinterLink::set_virtual_speed`]).
+    pub virtual_speed: crate::virtual_run::Speed,
     pub serial_suffix: Option<String>,
     pub status: ConnectionStatus,
     pub state: Arc<PrinterState>,
@@ -76,13 +80,69 @@ pub(crate) struct Shared {
     /// The printer model the app last spoke for and the heads its profile has: a link whose
     /// printer reports each head on its own watches these while it links that model.
     heads: Mutex<Option<(String, usize)>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) pending_virtual: Mutex<Option<crate::VirtualSetup>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) pending_speed: Mutex<Option<crate::virtual_run::Speed>>,
     pub(crate) stop: Arc<AtomicBool>,
     thread: Mutex<Option<Thread>>,
 }
 
-fn registry() -> &'static Mutex<HashMap<String, Weak<Shared>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<String, Weak<Shared>>>> = OnceLock::new();
+impl Shared {
+    fn new(snapshot: Snapshot) -> Self {
+        Self {
+            slot: Mutex::new(Arc::new(snapshot)), commands: Mutex::new(VecDeque::new()),
+            revision: AtomicUsize::new(1), clients: AtomicUsize::new(1), heads: Mutex::new(None),
+            #[cfg(not(target_arch = "wasm32"))]
+            pending_virtual: Mutex::new(None),
+            #[cfg(not(target_arch = "wasm32"))]
+            pending_speed: Mutex::new(None),
+            stop: Arc::new(AtomicBool::new(false)), thread: Mutex::new(None),
+        }
+    }
+}
+
+#[derive(Default)]
+struct NamedLink {
+    current: Weak<Shared>,
+    // A cancelled replacement can disappear while an earlier worker still holds its leases.
+    running: bool,
+    waiter: Option<Thread>,
+}
+
+fn registry() -> &'static Mutex<HashMap<String, NamedLink>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, NamedLink>>> = OnceLock::new();
     REGISTRY.get_or_init(Default::default)
+}
+
+/// One worker at a time may enter the protocol code for this configuration name.
+struct RunningWorker(String);
+
+impl RunningWorker {
+    fn enter(name: &str, shared: &Shared) -> Option<Self> {
+        loop {
+            {
+                let mut registry = registry().lock().unwrap_or_else(|e| e.into_inner());
+                if shared.stop.load(Ordering::Acquire) { return None; }
+                let entry = registry.get_mut(name).expect("printer worker is registered");
+                if !entry.running {
+                    entry.running = true;
+                    return Some(Self(name.to_owned()));
+                }
+                entry.waiter = Some(std::thread::current());
+            }
+            std::thread::park();
+        }
+    }
+}
+
+impl Drop for RunningWorker {
+    fn drop(&mut self) {
+        let mut registry = registry().lock().unwrap_or_else(|e| e.into_inner());
+        let entry = registry.get_mut(&self.0).expect("running printer worker is registered");
+        entry.running = false;
+        if let Some(waiter) = entry.waiter.take() { waiter.unpark(); }
+    }
 }
 
 /// Multiple handles share one session. The last drop requests stop without joining the UI.
@@ -90,23 +150,26 @@ pub struct PrinterLink { shared: Arc<Shared>, seen: usize }
 
 impl PrinterLink {
     pub fn start(conf_name: &str) -> Self {
+        crate::entries::START.enter();
+        Self::start_with(conf_name, run)
+    }
+
+    fn start_with(conf_name: &str, run: impl FnOnce(Arc<Shared>, String) + Send + 'static) -> Self {
         let mut registry = registry().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(shared) = registry.get(conf_name).and_then(Weak::upgrade).filter(|s| !s.stop.load(Ordering::Acquire)) {
+        if let Some(shared) = registry.get(conf_name).and_then(|e| e.current.upgrade()).filter(|s| !s.stop.load(Ordering::Acquire)) {
             shared.clients.fetch_add(1, Ordering::Relaxed);
             return Self { shared, seen: 0 };
         }
-        let shared = Arc::new(Shared {
-            slot: Mutex::new(Arc::new(Snapshot {
-                name: if valid_name(conf_name) { conf_name.into() } else { "Printer".into() }, ..Default::default()
-            })),
-            commands: Mutex::new(VecDeque::new()),
-            revision: AtomicUsize::new(1), clients: AtomicUsize::new(1), heads: Mutex::new(None), stop: Arc::new(AtomicBool::new(false)), thread: Mutex::new(None),
-        });
-        registry.retain(|_, entry| entry.strong_count() != 0);
-        registry.insert(conf_name.to_string(), Arc::downgrade(&shared));
+        let shared = Arc::new(Shared::new(Snapshot {
+            name: if valid_name(conf_name) { conf_name.into() } else { "Printer".into() }, ..Default::default()
+        }));
+        registry.retain(|_, entry| entry.running || entry.current.strong_count() != 0);
+        registry.entry(conf_name.to_string()).or_default().current = Arc::downgrade(&shared);
         let worker = shared.clone();
         let name = conf_name.to_string();
-        match std::thread::Builder::new().name("fab-printer".into()).spawn(move || run(worker, name)) {
+        match std::thread::Builder::new().name("fab-printer".into()).spawn(move || {
+            if let Some(_running) = RunningWorker::enter(&name, &worker) { run(worker, name); }
+        }) {
             Ok(handle) => *shared.thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle.thread().clone()),
             Err(_) => {
                 let mut snapshot = (**shared.slot.lock().unwrap_or_else(|e| e.into_inner())).clone();
@@ -131,11 +194,7 @@ impl PrinterLink {
         if family.is_some_and(|f| f.link == makepad_fab_settings::family::Link::Moonraker) {
             return Self::simulate_moonraker(path, &model);
         }
-        let shared = Arc::new(Shared {
-            slot: Mutex::new(Arc::new(Snapshot { name: "Simulated printer".into(), model, ..Default::default() })),
-            commands: Mutex::new(VecDeque::new()),
-            revision: AtomicUsize::new(1), clients: AtomicUsize::new(1), heads: Mutex::new(None), stop: Arc::new(AtomicBool::new(false)), thread: Mutex::new(None),
-        });
+        let shared = Arc::new(Shared::new(Snapshot { name: "Simulated printer".into(), model, ..Default::default() }));
         if family.is_none() {
             let mut snapshot = (**shared.slot.lock().unwrap_or_else(|e| e.into_inner())).clone();
             snapshot.status = ConnectionStatus::Offline(makepad_fab_settings::family::UNSUPPORTED);
@@ -157,11 +216,7 @@ impl PrinterLink {
     /// A Moonraker printer in memory, following reports without reading any configuration.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn simulate_moonraker(path: std::path::PathBuf, model: &str) -> Self {
-        let shared = Arc::new(Shared {
-            slot: Mutex::new(Arc::new(Snapshot { name: "Simulated printer".into(), model: model.into(), ..Default::default() })),
-            commands: Mutex::new(VecDeque::new()),
-            revision: AtomicUsize::new(1), clients: AtomicUsize::new(1), heads: Mutex::new(None), stop: Arc::new(AtomicBool::new(false)), thread: Mutex::new(None),
-        });
+        let shared = Arc::new(Shared::new(Snapshot { name: "Simulated printer".into(), model: model.into(), ..Default::default() }));
         let worker = shared.clone();
         match std::thread::Builder::new().name("fab-printer-sim".into()).spawn(move || crate::moonraker_link::run_sim(worker, path)) {
             Ok(handle) => *shared.thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle.thread().clone()),
@@ -172,6 +227,39 @@ impl PrinterLink {
             }
         }
         Self { shared, seen: 0 }
+    }
+
+    /// An independent printer with the heads and spools in the supplied layout.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn virtual_printer(setup: crate::VirtualSetup) -> Self {
+        let mut snapshot = Snapshot { name: setup.name.clone(), model: setup.model.clone(), virtual_printer: true, ..Default::default() };
+        let shared = Arc::new(Shared::new(snapshot.clone()));
+        let worker = shared.clone();
+        match std::thread::Builder::new().name("fab-printer-virtual".into()).spawn(move || crate::virtual_link::run(worker, setup)) {
+            Ok(handle) => *shared.thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle.thread().clone()),
+            Err(_) => {
+                snapshot.status = ConnectionStatus::Offline("cannot start the virtual printer");
+                publish(&shared, &snapshot);
+            }
+        }
+        Self { shared, seen: 0 }
+    }
+
+    /// Replace this virtual printer's layout. Only the latest pending layout is needed.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_virtual(&self, setup: crate::VirtualSetup) {
+        if !self.shared.slot.lock().unwrap_or_else(|e| e.into_inner()).virtual_printer { return; }
+        let old = self.shared.pending_virtual.lock().unwrap_or_else(|e| e.into_inner()).replace(setup);
+        drop(old);
+        if let Some(thread) = &*self.shared.thread.lock().unwrap_or_else(|e| e.into_inner()) { thread.unpark(); }
+    }
+
+    /// Set how fast this virtual printer's job runs. Only the latest pending speed is needed.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_virtual_speed(&self, speed: crate::virtual_run::Speed) {
+        if !self.shared.slot.lock().unwrap_or_else(|e| e.into_inner()).virtual_printer { return; }
+        *self.shared.pending_speed.lock().unwrap_or_else(|e| e.into_inner()) = Some(speed);
+        if let Some(thread) = &*self.shared.thread.lock().unwrap_or_else(|e| e.into_inner()) { thread.unpark(); }
     }
 
     /// Queues a command for the link worker (it answers in the next snapshots).
@@ -223,16 +311,22 @@ impl Shared {
     pub(crate) fn queued(&self) -> Vec<Command> { self.commands.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect() }
 }
 
+static PUBLISHED: AtomicUsize = AtomicUsize::new(0);
+
+/// The UI checks this counter once per event and calls [`PrinterLink::poll`] on each link only when it changes.
+pub fn published() -> usize { PUBLISHED.load(Ordering::Acquire) }
+
 pub(crate) fn publish(shared: &Shared, snapshot: &Snapshot) {
     let next = Arc::new(snapshot.clone());
     let old = std::mem::replace(&mut *shared.slot.lock().unwrap_or_else(|e| e.into_inner()), next);
     drop(old);
     shared.revision.fetch_add(1, Ordering::Release);
+    PUBLISHED.fetch_add(1, Ordering::Release);
     SignalToUI::set_ui_signal();
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-struct SessionLease(String);
+pub(crate) struct SessionLease(String);
 
 #[cfg(not(target_arch = "wasm32"))]
 fn active_sessions() -> &'static Mutex<std::collections::HashSet<String>> {
@@ -242,6 +336,10 @@ fn active_sessions() -> &'static Mutex<std::collections::HashSet<String>> {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl SessionLease {
+    pub(crate) fn for_printer(key: String) -> Result<Self, ConnectionStatus> {
+        Self::take(key).ok_or(ConnectionStatus::Offline("printer already linked in this process"))
+    }
+
     fn take(key: String) -> Option<Self> {
         let inserted = active_sessions().lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone());
         if inserted { Some(Self(key)) } else { None }
@@ -266,6 +364,7 @@ pub(crate) struct Transfer {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn storage_session(name: &str) -> Result<crate::ftps::Ftps<crate::ftps::PrinterDialer>, String> {
+    crate::entries::STORAGE_SESSION.enter();
     use crate::{ftps::{Ftps, PrinterDialer}, secrets::PrinterConfig};
     let config = PrinterConfig::load(name).map_err(str::to_string)?;
     let leaf_pin = crate::tls::pinned_leaf(name).ok_or("the printer's certificate is not pinned yet (connect first)")?;
@@ -720,13 +819,13 @@ fn run(shared: Arc<Shared>, name: String) {
         worker.snapshot.name = code.redact(&name);
         publish(&shared, &worker.snapshot);
         // Reserve both aliases and certificate identity before MQTT authentication.
-        let _host = SessionLease::take(format!("host:{}", config.host.to_ascii_lowercase())).ok_or(ConnectionStatus::Offline("printer already linked in this process"))?;
+        let _host = SessionLease::for_printer(format!("host:{}", config.host.to_ascii_lowercase()))?;
         let (stream, serial) = tls::connect(&name, &config).map_err(|e| match e {
             tls::ConnectError::PinMismatch => ConnectionStatus::PinMismatch,
             tls::ConnectError::Offline(reason) => ConnectionStatus::Offline(reason),
         })?;
         if shared.stop.load(Ordering::Acquire) { return Ok(()); }
-        let _serial = SessionLease::take(format!("serial:{serial}")).ok_or(ConnectionStatus::Offline("printer already linked in this process"))?;
+        let _serial = SessionLease::for_printer(format!("serial:{serial}"))?;
         worker.snapshot.serial_suffix = Some(code.redact(&serial).chars().rev().take(4).collect::<String>().chars().rev().collect());
         let session = Session::connect(stream, &serial, code, Instant::now()).map_err(lost)?;
         connected(&shared, worker, session, code)
@@ -763,6 +862,128 @@ mod tests {
     use crate::mqtt::fake::{FakePrinter, SERIAL};
     use makepad_strict_json::{parse, Value};
     use std::cell::RefCell;
+
+    fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready() {
+            assert!(Instant::now() < deadline, "waiting for {what}");
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn either_printer_publishes_without_changing_the_other() {
+        let start = |name: &str| {
+            let mut link = PrinterLink::virtual_printer(crate::VirtualSetup {
+                name: name.into(), model: "Virtual".into(), numbered_heads: false, nozzle_diameters: vec![0.4], trays: Vec::new(),
+            });
+            // Drain the worker's first publication, after the initial Connecting revision.
+            wait_until("first publication", || link.shared.revision.load(Ordering::Acquire) != 1);
+            assert_eq!(link.poll().unwrap().status, ConnectionStatus::Connected);
+            link
+        };
+        let mut first = start("First");
+        let mut second = start("Second");
+        let check = |changed: &mut PrinterLink, quiet: &mut PrinterLink| {
+            let before = crate::published();
+            changed.send(Command::CheckStorage);
+            wait_until("published storage answer", || {
+                crate::published() != before && changed.poll().is_some_and(|s| s.storage_files.is_some())
+            });
+            assert!(quiet.poll().is_none());
+        };
+        check(&mut first, &mut second);
+        check(&mut second, &mut first);
+    }
+
+    #[test]
+    fn only_the_real_link_enters_transport() {
+        // Other unit tests use the memory transports in parallel. Count in a process of our own.
+        const CHILD: &str = "FAB_LINK_ENTRY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "link::tests::only_the_real_link_enters_transport", "--nocapture"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success(), "isolated entry counter test failed");
+            return;
+        }
+
+        const NAME: &str = "entry-fixture";
+        let before = crate::entry_counts();
+        let mut peer = PrinterLink::start_with(NAME, |shared, _| {
+            let printer = FakePrinter::default();
+            let _session = Session::connect(printer, SERIAL, &Secret::new(CODE.to_vec()), Instant::now()).unwrap();
+            publish(&shared, &Snapshot { status: ConnectionStatus::Connected, ..Default::default() });
+        });
+        // The public real constructor reuses the registered memory worker.
+        let real = PrinterLink::start(NAME);
+        wait_until("memory connection", || peer.poll().is_some_and(|s| s.status == ConnectionStatus::Connected));
+        let after = crate::entry_counts();
+        assert_eq!(after.start, before.start + 1);
+        assert_eq!(after.mqtt_connect, before.mqtt_connect + 1);
+        drop((real, peer));
+
+        let mut link = PrinterLink::virtual_printer(crate::VirtualSetup {
+            name: "Virtual fixture".into(), model: "Fixture".into(), numbered_heads: false, nozzle_diameters: vec![0.4], trays: Vec::new(),
+        });
+        link.send(Command::CheckStorage);
+        wait_until("virtual storage answer", || link.poll().is_some_and(|s| s.virtual_printer && s.storage_files.is_some()));
+        assert_eq!(crate::entry_counts(), after, "a virtual link entered a real printer path");
+    }
+
+    #[test]
+    fn restarting_the_same_name_waits_for_the_retiring_worker() {
+        use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
+        const NAME: &str = "relink-fixture";
+        fn start_sim(closing: Option<Receiver<()>>) -> PrinterLink {
+            PrinterLink::start_with(NAME, move |shared, _| {
+                let code = Secret::new(CODE.to_vec());
+                let mut worker = Worker::new(Snapshot::default(), FakeStorage::default());
+                drive(&shared, &mut worker, |worker| {
+                    let _host = SessionLease::for_printer("host:relink.invalid".into())?;
+                    let _serial = SessionLease::for_printer(format!("serial:{SERIAL}"))?;
+                    let printer = FakePrinter::default();
+                    let session = Session::connect(printer.clone(), SERIAL, &code, Instant::now()).map_err(lost)?;
+                    printer.report(&report("IDLE", ""));
+                    let result = connected(&shared, worker, session, &code);
+                    // Let the test finish the retiring session while it still holds both leases.
+                    if let Some(closing) = &closing { let _ = closing.recv_timeout(Duration::from_secs(10)); }
+                    result
+                });
+            })
+        }
+        fn wait_for_turn(link: &PrinterLink) {
+            let id = link.shared.thread.lock().unwrap().as_ref().unwrap().id();
+            wait_until("replacement to wait for the old worker", || {
+                registry().lock().unwrap()[NAME].waiter.as_ref().is_some_and(|w| w.id() == id)
+            });
+        }
+        let (release, closing) = channel();
+        let mut first = start_sim(Some(closing));
+        let other_handle = PrinterLink::start(NAME);
+        wait_until("first connection", || first.poll().is_some_and(|s| s.status == ConnectionStatus::Connected));
+        let old_worker = Arc::downgrade(&first.shared);
+        drop((first, other_handle));
+
+        let (entered, ran) = channel();
+        let cancelled = PrinterLink::start_with(NAME, move |_, _| { let _ = entered.send(()); });
+        let cancelled_worker = Arc::downgrade(&cancelled.shared);
+        wait_for_turn(&cancelled);
+        drop(cancelled);
+        assert_eq!(ran.recv_timeout(Duration::from_secs(10)), Err(RecvTimeoutError::Disconnected),
+            "dropping the waiting link must discard its connection routine");
+        wait_until("cancelled worker to exit", || cancelled_worker.strong_count() == 0);
+
+        let mut next = start_sim(None);
+        wait_for_turn(&next);
+        assert_eq!(next.poll().unwrap().status, ConnectionStatus::Connecting);
+        release.send(()).unwrap();
+        wait_until("replacement connection", || next.poll().is_some_and(|s| {
+            assert_ne!(s.status, ConnectionStatus::Offline("printer already linked in this process"));
+            s.status == ConnectionStatus::Connected
+        }));
+        assert_eq!(old_worker.strong_count(), 0, "the replacement connected before the old worker exited");
+    }
 
     #[test]
     fn rejected_duplicate_cannot_release_an_active_session() {

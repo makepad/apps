@@ -1,0 +1,44 @@
+use mod.motion.*; use mod.scene; use mod.post
+// Beat field: thousands of instances and a galaxy of points in one 3D
+// layer, the camera cutting its moves on the beat grid (120 bpm: crane
+// 0-4, orbit 4-12, push 12-16), vector words landing on beats 2, 6, 10.
+// With music bound (`react: @low`), the pillars and the swarm pulse too.
+Motion{
+    size: vec2(1920, 1080)
+    duration: 8.0
+    bpm: 120
+    layers: [
+        Rect{at: vec2(0, 0) size: vec2(1920, 1080) fill: #04040a}
+        Scene3D{
+            at: vec2(0, 0)
+            size: vec2(1920, 1080)
+            bpm: 120
+            fog: scene.FogExp2{color: #04040a density: 0.03}
+            environment: scene.Environment{preset: @neon intensity: 0.4}
+            tone_mapping: @aces
+            camera: Camera{
+                position: vec3(0, 3.5, 16)
+                target: vec3(0, 1, 0)
+                focal_length: 30
+                moves: [
+                    scene.CameraMove{type: @crane_up start: scene.beat(0) end: scene.beat(4) amount: 0.25}
+                    scene.CameraMove{type: @orbit_left start: scene.beat(4) end: scene.beat(12) amount: 70}
+                    scene.CameraMove{type: @push_in start: scene.beat(12) end: scene.beat(16) amount: 0.35}
+                ]
+            }
+            post: [post.Bloom{strength: 0.9 threshold: 0.8} post.MotionBlur{shutter: 180 samples: 3} scene.ColorGrade{contrast: 1.15 saturation: 1.2 temperature: -0.2}]
+            lights: [scene.AmbientLight{intensity: 0.25} scene.DirectionalLight{position: vec3(-4, 8, 3) intensity: 1.2} scene.PointLight{position: vec3(0, 3, 0) intensity: 90 color: #ff3a8c distance: 20}]
+            children: [
+                scene.Field{preset: @pillars grid: 60 spacing: 0.3 height: 1.2 color: #2d4fff react: @low}
+                scene.Field{preset: @galaxy count: 12000 radius: 9 size: 0.09 position: vec3(0, 5, -14) rotation: vec3(25, 0, 0) speed: 8 color: #8fb8ff color2: #ff5ab4}
+                scene.Field{preset: @swarm count: 500 radius: 1.6 position: vec3(0, 3.6, -2) size: 0.04 color: #ff3a8c start: 0.3}
+            ]
+        }
+        Text{text: "BUILD" size: 180 weight: 900 color: #ffffff at: vec2(960, 540) align: @center valign: @center span: [1.0, 1.8]
+             scale: tween(1.3, 1.0, 0.0, 0.4, @ease_out_expo) opacity: keys([0.0, 0], [0.1, 1], [1.6, 1], [1.8, 0])}
+        Text{text: "MOVE" size: 180 weight: 900 color: #ffffff at: vec2(960, 540) align: @center valign: @center span: [3.0, 1.8]
+             scale: tween(1.3, 1.0, 0.0, 0.4, @ease_out_expo) opacity: keys([0.0, 0], [0.1, 1], [1.6, 1], [1.8, 0])}
+        Text{text: "SHIP" size: 180 weight: 900 color: #ff3a8c at: vec2(960, 540) align: @center valign: @center span: [5.0, 3.0]
+             scale: tween(1.3, 1.0, 0.0, 0.4, @ease_out_expo) opacity: tween(0, 1, 0.0, 0.1)}
+    ]
+}

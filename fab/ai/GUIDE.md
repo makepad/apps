@@ -3,7 +3,7 @@
 A **project** (`name.fab.splash`) places **object scripts** (`name.cad.splash`). A script is a Splash program: builder calls bound by `let`, then `object(part)`. It is a dynamic STL, rebuilt from its parameters. `fab.script` writes a script, `fab.apply` edits one, `fab.place` edits the project; a batch that does not build commits nothing and names file, line, column and part. More: `fab.guide {section: "name"}` (sections at the end).
 
 - `fab.import(path: "part.3mf", new_plate: false)` adds mesh files as project parts with Size parameters and painted facets; `new_plate: true` opens a new plate.
-- `fab.plates {action: "list"}` lists every plate (id, name, file, last edited, `modified`: edits its file lacks yet) and the demos (key, title); `{action: "open", id}` puts a plate on the bed as it was left, `{action: "open", demo: "noise_vase"}` a demo as it ships, `"duplicate"` copies one, `"rename"` (with `name`) and `"remove"` (off the list, files kept). Section: plates.
+- `fab.plates` lists, opens, copies, renames and removes plates and opens the demos: section plates.
 
 ## Units and frames
 
@@ -70,9 +70,9 @@ m.fill(other, brown)
 object([head, lock, other], name: "bust")
 ```
 
-`fab.inspect` and `fab.tree` list such objects under `objects`: each body (its plate part) with its `engine` (`@mesh`, `@exact`, `@field`), and the object's `volume_mm3`. `volume_from` says where the volume comes from: the slice's layers once the plate is sliced (an overlap counts once), else the bodies' own volumes summed (an overlap counts once per body; `pending` while a field body's is still being read). If the slice's checks (`fab.check {slice: true}`) say `object X prints its bodies apart: <why>`, its bodies print as separate parts, with walls and double prints where they overlap.
+`fab.inspect` and `fab.tree` list such objects under `objects`, with their bodies' engines and volume: section project.
 
-Handles are opaque: no operators, no fields but an exact part's faces; numbers and vectors stay values. Builders take one options object, operations take inputs first (`m.fillet(part, radius, {edges})`). Every part takes `at`, `rotate` (X, Y, Z, or `{to: [x y z]}`: its Y turned onto that direction), `scale` (a sweep's `scale` is its own). Parts are named by their `let` (`bracket`, `holes[1]`, inner calls `b.fillet`); nothing prints unless `object(part)`. Exact builders: `box sphere cylinder torus extrude revolve sweep loft union subtract intersect fillet chamfer shell offset mirror` under `m.brep`. Edge selectors, all engines: `@all`, `{top: true}`, `{bottom: true}`, `{y: [a b]}`, `{within: [[min] [max]]}`, `{dir: @y}`, `{kind: @circle}`, `{convex: true}`, `{concave: true}`, `{min_length: 2mm}`, `{near: [x y z]}`, or a list (any of them).
+Handles are opaque: no operators, no fields but an exact part's faces; numbers and vectors stay values. Builders take one options object, operations take inputs first (`m.fillet(part, radius, {edges})`). Every part takes `at`, `rotate` (X, Y, Z, or `{to: [x y z]}`: its Y turned onto that direction), `scale` (a sweep's `scale` is its own). Parts are named by their `let` (`bracket`, `holes[1]`, inner calls `b.fillet`); nothing prints unless `object(part)`. Exact builders: `box sphere cylinder torus extrude revolve sweep loft union subtract intersect fillet chamfer shell offset pull hole mirror` under `m.brep`. Edge selectors, all engines: `@all`, `{top: true}`, `{bottom: true}`, `{y: [a b]}`, `{within: [[min] [max]]}`, `{dir: @y}`, `{kind: @circle}`, `{convex: true}`, `{concave: true}`, `{min_length: 2mm}`, `{near: [x y z]}`, or a list (any of them).
 
 ## Errors
 
@@ -80,11 +80,17 @@ An error names `file:line:col: part (Builder): message`. On an exact part, the l
 
 ## Check your work
 
-`fab.render`, `fab.section`, `fab.measure`, `fab.check_mesh` after each big step; `fab.exact` for an exact body's true volume, area, edges and faces; `fab.check` before you finish. Tune with `set(...)` rather than rebuild; `dry_run: true` builds without committing.
+Every edit answers `built` first: parts, joints, what it added or changed (model frame). Hold it against what was asked (count, sizes, joints); say what differs first. Section `checks`.
+
+Checks answer `check: @pass`, `@fail` or `@not_checked` with `why`; tell the person what did not run. Numbers come from checks or `fab.measure`, never pictures. Plant a fault with `dry_run` before trusting a check you wrote.
+
+Write each number the person states as `m.expect("8 mm hole", hole, {x: 8mm})`; an edit that breaks one is refused. Change one only when they ask, and say so.
+
+`fab.render`, `fab.section`, `fab.measure`, `fab.check_mesh` after each big step; `fab.interference` after editing a jointed object; `fab.exact` for an exact body's true volume, area, edges and faces; `fab.check` before you finish. Tune with `set(...)` rather than rebuild; `dry_run: true` builds without committing.
 
 ## Sections
 
-`project`, `params`, `edit`, `field`, `plates`, `workflow`, `print`, `paint` (colour, fills, support block and enforce), `find` (a part with no name, by looking), `supports`, `force`, `joints`, `threads`, `weave`, `printability`, `printer`, `image`, `compare`, `annotate`, `host` (panels, generated parts, host keys, frames), `embed` (a nut, a magnet or a board printed into a part), `melt` (heat-set inserts melted into a part after the print), `elec` (circuits, boards, routing, checks, fabrication files, the bench), `names` (other CAD tools' words: patterns, split, helix, hull, gears, mates), `vocabulary` (every builder and its fields, from the code, a group at a time).
+`project`, `params`, `edit`, `field`, `plates`, `workflow`, `print`, `paint` (colour, fills, support block and enforce), `find` (a part with no name, by looking), `supports`, `force`, `joints`, `checks` (what an edit built, what each check answers), `threads`, `weave`, `printability`, `printer`, `image`, `compare`, `annotate`, `host` (panels, generated parts, host keys, frames), `embed` (a nut, a magnet or a board printed into a part), `melt` (heat-set inserts melted into a part after the print), `elec` (circuits, boards, routing, checks, fabrication files, the bench), `names` (other CAD tools' words: patterns, split, helix, hull, gears, mates), `vocabulary` (every builder and its fields, from the code, a group at a time).
 
 <!-- section: project -->
 ## project
@@ -104,6 +110,9 @@ place("bracket", at: [150mm 160mm], name: "Bracket", color: "Orange")
   where the script's origin sits on the bed (turns and scales are about it too, so
   a shape edit never moves the part); `show: false` leaves an emitted object off the
   plate; `object:` can be left out when the instance emits one.
+  In `fab.place`, use `center: [200mm 160mm]` for the footprint's centre or `corner: [20mm 30mm]`
+  for its front-left (min X, min Y). Give one of `at`, `center` or `corner`. The project saves `at`.
+  `arrange(gap: 5mm)` keeps 5 mm between free parts’ slots through shape edits, measured before placement turns and scales, subject to toolhead clearance. `place("lid", at: @free)` puts a part back in the pack.
   `print: false` keeps the placement, settings and paint on the plate, drawn faint,
   and excludes it from slicing and printing. `print: true` includes it again.
   Each linked placement has its own flag: `place("bracket", link: 1, print: false)`
@@ -173,7 +182,8 @@ omitted fields unchanged; `name: null` clears the name. Remove shifts later
 indices down. Saved syntax is `measure(points: [[10mm 20mm 0mm] [30mm 20mm 0mm]],
 kind: @distance, name: "Gap A")`; `fab.place` can add that statement too.
 Without `action`, `fab.measure {what: ...}` keeps computing geometry measurements
-in the model frame, as before.
+in the model frame, as before. `fab.measure {what: "fit", a: "case/box", b: "case/lid", a_at: [9.4 10 0], b_at: [30 2 6.5]}` seats b on a using a pick on each mating face in its own model mm.
+Optional `turn` twists b about a’s outward normal in degrees. The reply gives the pose, overlap volume and bounds, side gaps (directions from a to b), and whether the faces seat.
 
 `fab.measure {what: "mass", object}` weighs a part as the job prints it (the filament's
 density, walls, shells and infill): its `grams`, `centre_of_mass`, inertia about that centre,
@@ -212,6 +222,14 @@ instance: "figure", object: "body", at: [0mm, 0mm, 80mm], size: [30mm, 30mm, 30m
 and `size` in the part's frame.
 
 Objects without a position are arranged on the bed; every object drops onto the plate. The left nozzle reaches X 0-325 and 320 mm high, the right X 25-350 and 325 mm.
+
+`fab.inspect` and `fab.tree` list the objects that print several bodies as one (`object([..])`) under `objects`: each body (its plate part) with its `engine` (`@mesh`, `@exact`, `@field`), and the object's `volume_mm3`. `volume_from` says where the volume comes from: the slice's layers once the plate is sliced (an overlap counts once), else the bodies' own volumes summed (an overlap counts once per body; `pending` while a field body's is still being read). If the slice's checks (`fab.check {slice: true}`) say `object X prints its bodies apart: <why>`, its bodies print as separate parts, with walls and double prints where they overlap.
+
+### steps
+
+`fab.tree` lists each plate part's `steps` in build order, with the same numbers and words as the person's history strip. Follow the first input back to the starting solid. The other operands of a boolean appear on its step, for example `Cut −holes ×6`. Edit a step at its value site with `set(eased.radius, 1.5mm)`. To add a step immediately after it, write `after(eased)` followed by a statement such as `let eased = m.brep.shell(eased, 1mm)` in the same edit.
+Preview one part at a step from that list with `fab.render {object: "bracket/bracket", step: "eased"}`.
+To keep that shape, use `rollback(bracket, to: eased)` in `fab.apply`. The part keeps its name, and one undo restores the later steps.
 
 <!-- section: params -->
 ## params
@@ -275,7 +293,16 @@ is any expression, a multi-line `for` too, and may read what an earlier replace 
 An added statement goes where it works, in any order in the batch: a `use` with the
 imports, a `let` or `fn` above the first statement that reads it (`replace(hair, m.tube({curves:
 for i in 0..12 { lock(i * 30°) }}))`, then `fn lock(a) {..}` and `use mod.math.*`, builds);
-`before(base)` puts the statements added after it above `base`. A part a script fn makes
+`before(base)` puts additions above `base`. With `after(base)`, ordinary additions go just
+below its definition in written order until the next anchor.
+
+To insert at any step `k` of a part, follow `after(k)` immediately with `let k = ...`.
+Later steps build on the new solid. If the insert breaks a later step, `fab.apply` refuses
+the batch and names that step. Include its repair in the same batch, for example
+`set(shelled.open, @closed)`. For an inline step, start the batch with
+`rename(inset.box, stock)`, then write `after(stock)` and `let stock = ...`.
+
+A part a script fn makes
 (`let bow = loop(..)`) is its call: `replace(bow, loop(..))`, `remove(bow)` and `rename` edit that
 call and its `let`, never the fn's code, which every call shares. Its values are what the call
 passes: `set(bow.len, 22mm)` sets the argument for the fn's `len`, and a field the fn writes from a
@@ -298,6 +325,8 @@ remove("vase_tall")
 Each batch is one undo step. Pass the head from `fab.inspect` (or the last
 answer) as `expected` and a fresh `request_id`. A new object: `fab.script` with
 the whole source (and a new `script` file name). Answers are Splash values.
+
+On an exact part, what the person picks takes one-number gestures, the same as theirs: `fab.round` (edges), `fab.pull` (a face: the values that make it, else `m.brep.pull(b, {face: b.top by: 5mm})`, out or in below 0, its holes with it), `fab.hole` (`m.brep.hole(b, {on: b.top at: [5mm 10mm 0] diameter: 4mm})`, from that face wherever it goes, through unless given a depth; `h.wall`, a blind one's `h.floor`), `fab.shell` (open at the picked faces). Each makes the part's body its step and keeps the part's name. In a `fab.select` pick, `on: "eased"` resolves a face or edge on that step even if a later step removes it, so you can build there with `after(eased)`.
 
 <!-- section: field -->
 ## field
@@ -330,6 +359,10 @@ let hand = m.ellipsoid({radii: [2mm 3.5mm 1.5mm] at: [17mm 8mm 3mm] rotate: {to:
 let figure = m.blend([body arm hand], 1.5mm)
 object(figure)
 ```
+
+Name a segment inside a `Path` with `:=`, for example `base := LineTo{to: [40mm 0]}`.
+With `let body = m.brep.extrude({sketch: section height: 10mm})`, pick that side with
+`body.side(section.base)`. Inserting a segment earlier in `section` keeps the pick on the side made by `base`.
 
 Inside `m.blend` and `m.carve`, `m.extrude` and `m.revolve` of a sketch are exact fields too (a
 draft is a bound): draw a flat outline with `Path` and `SplineTo` and blend it like any field part.
@@ -726,10 +759,68 @@ let back = m.bond(spine, segs)
 
 - Jointed parts are one object: emitting any of them (or none) puts the whole
   assembly on the plate, its bodies as laid out, placed and dropped together.
-- The loop: `fab.joints` (every joint ok, fuse risk, gaps, where the parts
-  touch, fixes) -> `fab.simulate` scenario `shake` (`articulates`, `binding`)
+- The loop: `fab.joints` (`check: @pass` when every joint is free, fuse risk, gaps, where the parts
+  touch, fixes) -> `fab.interference` (the other parts that collide, at rest or with a joint at an
+  end of its travel: each pair's depth, where and in which pose) -> `fab.simulate` scenario `shake` (`articulates`, `binding`)
   and `hang` (`hangs_right`) -> fix and repeat. Clearance joints swing
   freely: they do not hold a pose (`pose` shows `pose_drift`).
+
+<!-- section: checks -->
+## checks
+
+### What an edit built
+
+Every edit (`fab.apply`, `fab.script`, `fab.place`, `fab.fill`, `fab.history`, a dry run) answers `built` before anything else:
+
+```splash
+built: {parts: 3 joints: 1
+    objects: [{instance: "box", parts: 3, joints: 1, size: [42mm, 6mm, 56mm]}]
+    changed: [{part: "box/tag", engine: @mesh, size: [8mm, 2mm, 16mm], volume_mm3: 256.0}]}
+```
+
+- `parts` and `joints` count the whole plate; `objects` are the script instances the edit changed, each with its size over all its bodies; `changed` lists each body it added or changed with its engine, size and volume. Bodies it left alone are not listed (`diff` has the deltas); `fab.inspect`'s `built` lists every body under `bodies`.
+- Sizes are the model frame's (Y up, `[x y z]` as the script writes them), not the bed's: a part laid flat on the bed still reads its height as y. `placed_scale` says a placement scales it on the bed.
+- `volume_mm3: pending` is a field body's volume, read from its field in the background once the build is in. It is not a failure: `fab.inspect` has it then.
+
+Read it first and hold it against what was asked: a missing or extra part, a size off by a factor (radius for diameter, cm for mm), a joint that did not take. Say what differs before you go on.
+
+### Pass, fail or not checked
+
+Each check leads with `check`: `@pass` (it ran and holds), `@fail` (it ran and does not), or `@not_checked` with `why` (it could not run: no joints to check, a slice that failed). A list's rows carry their own (each joint, each weave part), and `not_checked` lists the checks an answer left out and why:
+
+- `fab.check`: fails on an error of the plate's checks or of the mesh findings. Unsliced it leaves out the sliced checks (`{slice: true}` runs them) and the mesh findings of field parts, which their slice checks.
+- `fab.check_mesh`: fails on an error finding (an open mesh).
+- `fab.joints`, `fab.weave`: fail when a joint or a weave part is not free; `@not_checked` with none. `fab.weave` leaves out the sliced beads unless `as_printed: true`.
+- `fab.interference`: fails when two parts of a jointed object overlap, at rest or with one joint at an end of its travel (its limits, else where its parts touch). Each overlap gives the two parts, `depth`, `at` (model frame, posed) and `pose` (`"lid at 90°"`): move or trim one of them, or narrow the joint's limits. A joint's own two parts and a part and what it is bonded to are `skipped`, with why (`fab.joints` checks a joint's own parts). `@not_checked` when nothing moves.
+- `fab.measure {what: "thread_fit"}`: passes when the thread fits; `verdict` says how it fails (`tight`, `binds`, `loose`, `mismatch`).
+- `fab.measure {what: "mass"}`: its `base` passes when the part stands on its base as modelled.
+
+### The person's numbers: m.expect
+
+A number the person states is theirs: write it into the script beside the shape, once, in their words, and every build judges it.
+
+```splash
+let plate = m.box({size: [60mm 6mm 40mm] at: [0, 3mm, 0]})
+let hole = m.cylinder({radius: 4mm height: 20mm})
+let holes = for x in [-25mm, -20mm, 20mm, 25mm] { m.cylinder({radius: 1.5mm height: 20mm at: [x 0 15mm]}) }
+let bracket = m.subtract(m.subtract(plate, hole), holes)
+object(bracket)
+m.expect("8 mm hole", hole, {x: 8mm z: 8mm})
+m.expect("4 mounting holes", holes, {count: 4})
+m.expect("spans a 60 mm rail", bracket, {x: {min: 60mm}})
+m.expect("at least 5 mm thick", bracket, {wall: {min: 5mm} at: [0, 6mm, -10mm]})
+m.expect("about 14 cm3", bracket, {volume_mm3: {min: 13000 max: 15000}})
+```
+
+- A name (the person's words), the solid or list of solids it checks (a cut, a hole, a body), and what is wanted: `x y z` (its size in the model frame), `volume_mm3`, `count` (how many solids the list has), `wall` (the thickness straight in from the surface point nearest `at`). Each is a value (lengths within `tol`, default 0.05 mm; a volume within 1%) or `{min max}`.
+- Write the person's numbers only. A number you work out (a clearance, a mass) is checked from the geometry: `fab.measure`, `fab.joints`.
+- Each edit's `built` counts them (`expects: {pass fail not_checked}`) and lists the ones that did not pass with what they saw; `fab.check` lists them all and fails on one that fails.
+- An edit of yours that makes one fail is refused like a build error, at its line, with what it saw: fix the edit. A tool's edit (`fab.strengthen`, `fab.orient`, `fab.settings_volume`) is refused the same way: if the person asked for this, change the expect first in an edit of its own (it says so), then run the tool. A person's own edits (a drag, the panel, the code) commit, and the failure shows with the part's warnings.
+- Change an expect only when the person asked for that number to change, and say so in your reply: the edit's answer has `expects_changed` with a line for it (``changed the person's check `8 mm hole`: x 8 mm → 10 mm``); repeat that line.
+- Not checked, with why: a field solid's volume (baked after the build) and wall (`fab.measure`), a drag's or picture's draft (judged when it is built in full), a `wall` point off the surface. A field's size is read from its proven extent.
+- Plant a fault: a `dry_run` of an edit that breaks the expect (the hole at 10 mm) must answer it as failing before you trust it.
+
+Report every `@not_checked` and every `not_checked` row with its why: a check that did not run is not a pass. Numbers come from these checks and from `fab.measure`, never from a render, which judges shape only. A check you wrote yourself is trusted once it has failed on purpose: plant the fault with `dry_run` (a size it must catch) and see it fail, then build without it.
 
 <!-- section: threads -->
 ## threads
@@ -792,7 +883,7 @@ m.fill(m.sphere({radius: 12mm}), Material{albedo: [0.8 0.1 0.1]})
   Mail keeps one width per column and one depth per row (that is what keeps
   every link interlocked), so it grades along x and y, not in rings; keep
   bridges under 10 mm (half size up to about 6.5 mm).
-- The loop: `fab.weave` (ok, one piece, no loose links, gaps in and across
+- The loop: `fab.weave` (`check: @pass`, one piece, no loose links, gaps in and across
   layers, bridges, fixes; `{"as_printed":true}` slices it and adds `support`
   (islands with nothing of their own link below, unanchored overhangs, steep
   facets needing support) and `mobility` (`moves`: every link prints as its
@@ -1062,9 +1153,11 @@ An unknown `m.<name>` call's error says what Fab calls it (`m.cut` is `m.subtrac
 
 Fab Electronics holds circuits (the schematic) and boards; a person edits them in the schematic, board and bench panes. Five tools reach it: `elec_read` (reads), `elec_edit` (edits, each one undo step, as a person's edit), `elec_run` (the bench's transport), `elec_export` (fabrication files, run once the person approves the call), each listing its actions, and `elec_text`, which changes a document's text as typing in its code pane does. `{action: "help", args: {of: "elec.route"}}` gives any electronics action's fields and its reply's shape, whichever of these tools it is asked through, and names the tool that runs it. Parts go by reference (`R1`) or path (`mcu.boot_r`); values as Splash text (`22k`, `100n`, `[12mm 30mm]`).
 
+Read a board's bill of materials with `elec.bom.read`. Follow `next` with `after` for more lines. Use a line ID, component paths, or unique references with `elec.bom.field.set` to set a field in one undo step. Omit `text` to restore the library value. `elec.cost.read` estimates board fabrication only, at the requested board quantity. Every amount comes from a dated offline rate profile. Fab never guesses a part price.
+
 A board from design to factory:
 1. `elec.design.read`: the units (circuits and boards), parts, values and nets; `only` takes a part, a net or a reference prefix (`SW`: every switch, with the nets they touch). `elec.board.read` (also `fab.board`): a board's outline, holes, ports, parts and heights, for a case round it (section `host`). Its `only` takes a reference (`SW1`), a prefix (`SW`), a part kind (`button`) or a port kind (`press`: the parts a finger presses). Without `board` on a design with several boards it answers each board's name, size, part and port counts, to pick one.
-2. Edit: `elec.value.set {comp value}`. `elec.library.list {find}` names the Library's parts, passives and blocks with their pins in order; `elec.part.add {part ends}` puts one on the sheet with each pin on a pin (`U1.PB0`), a net (`GND`) or open (`-`), or `{part series: U1.PB0}` between a pin and its net, and the answer's `made` names the new part. `elec.part.remove {parts}`, `elec.part.rename {part to}`, `elec.part.field {part key text}`; `elec.net.connect {pin to}` wires a pin to another pin, a net or a new net's name; `elec.net.disconnect {pin}`, `elec.net.rename {net to}`, `elec.pin.nc {pin nc}`. `elec.link.add {kind a b}`, `elec.link.remove`, `elec.link.replace`, `elec.unit.mount` and `elec.unit.unmount` join boards and place them in the system. `elec.part.place {part at rot side}` places a part from the tray onto the board or moves a placed one. A move's `checks` names a track it left short as `Dangling` and a connection it broke as `Unconnected`. Route again (`elec.route`) to reconnect moved parts; `elec.part.model`, `elec.part.model.from` and `elec.part.body.set` give a part its 3D model. Every board, circuit or system edit and every `elec_text` change to a circuit, block or part document answers once the checks run, with `checks: {new gone}` for that edit alone because these AI edits go one at a time. After an edit, `elec.sim.status {wait: <the answer's seq>}` answers once the bench runs the new circuit.
+2. Edit: `elec.value.set {comp value}`. `elec.library.list {find}` names the Library's parts, passives and blocks with their pins in order; `elec.part.add {part ends}` puts one on the sheet with each pin on a pin (`U1.PB0`), a net (`GND`) or open (`-`), or `{part series: U1.PB0}` between a pin and its net, and the answer's `made` names the new part. `elec.part.remove {parts}`, `elec.part.rename {part to}`, `elec.part.field {part key text}`; `elec.net.connect {pin to}` wires a pin to another pin, a net or a new net's name; `elec.net.disconnect {pin}`, `elec.net.rename {net to}`, `elec.pin.nc {pin nc}`. `elec.link.add {kind a b}`, `elec.link.remove`, `elec.link.replace`, `elec.unit.mount` and `elec.unit.unmount` join boards and place them in the system. `elec.part.place {part at rot side}` places a part from the tray onto the board or moves a placed one. For placed parts on one board, use `elec.part.rotate {parts by? unit?}` (default 90 degrees counter-clockwise), `elec.part.flip {parts unit?}`, `elec.part.align {parts edge unit?}` (left, right, top, bottom, centre_x, centre_y), or `elec.part.distribute {parts axis unit?}` (x, y). Coordinates are a wish: each moved part goes to the nearest legal spot (no courtyard overlap, inside the outline, pads clear of the edge), and the answer’s `legalised` says how far; `legalise: @off` places exactly. `elec.place {parts?}` moves every illegal part (or the named ones) to the nearest legal spot. Pad-anchored track ends follow their pads. A flip releases an end whose pad leaves its layer, and `checks` reports a resulting free end as `Dangling`. Route again (`elec.route`) to reconnect moved parts; `elec.part.model`, `elec.part.model.from` and `elec.part.body.set` give a part its 3D model. Every board, circuit or system edit and every `elec_text` change to a circuit, block or part document answers once the checks run, with `checks: {new gone}` for that edit alone because these AI edits go one at a time. After an edit, `elec.sim.status {wait: <the answer's seq>}` answers once the bench runs the new circuit.
 3. `elec.route {unit nets method}` routes the unrouted nets (`method: interactive` lays straight copper at 45 degrees, `organic` smooth curved copper with teardrops), in the background; the answer comes when the copper lands, with each net it left open and why.
 4. `elec.check.list {unit only severity}`: what ERC (circuits), DRC (boards) and the checks across boards find, errors first. `errors`, `warnings` and `total` count the findings the list holds; with a `unit`, `elsewhere` names the other units that have findings. Fix, route again, check again.
 5. `elec.factory.set {board profile}` sets the board house (`standard 2-layer`, `JLCPCB 2-layer`), whose minimum track, gap and drill become the board's rules. `elec.export {board profile}` writes Gerber, drill, BOM, placement and IPC-356 files and the zip into the project's fabrication folder, reads each back against the board and answers with the files and `validation: {valid ..}`; `elec.export.validate` checks the newest export again.
@@ -1076,6 +1169,8 @@ The Scope's tools record the running bench and read what it recorded. `elec.sour
 Firmware is a `.fw.splash` document that the bench's microcontroller runs. `elec.doc.list` names the documents with their kind and `rev`; `elec.doc.read {doc from to}` gives one's numbered lines and its `rev`. Change it with `fab.elec_text {doc rev edits: [{old new}]}`: each `old` is found exactly once in that revision (or give `text`, the whole document), and one call is one undo step. The change is compiled first, as the running bench builds it. Text that does not compile is not committed, and the error lists each diagnostic's `line` and `col`. When no bench run builds that firmware, the change goes in unchecked, and the answer says `compiled: false` and why. A stale `rev` is refused with the new one: read again. A compiled change restarts the run with the new image (`take.effect: restart`). `elec.flash.ask` brings the Firmware pane's Flash to row forward and answers with the boards it lists; the person chooses the board and presses Flash.
 
 The design is text too, and `fab.elec_text` changes it the same way: a circuit (`.ckt.splash`), its blocks (`.blocks.splash`), a bench (`.bench.splash`) or part definitions (`.part.splash`). It is the way to make many changes in one step (a block of parts and their nets is one call, one evaluation and one undo step) and to write what no action does. The change is evaluated before it is committed: text that adds a mistake is not committed, and the error gives the mistake's `doc`, `line` and `col`, so fix the text and send it again; a document that already had a mistake can be fixed one change at a time. The answer says `evaluated: true`, and `made` names the parts and nets the change defines.
+
+The person's targets for the device go in its requirements document (`.req.splash`), in their words: `require("fits a 60 x 40 case", board("main").size, {max: [60mm 40mm]})`, `require("DRC clean", checks(@drc).errors, {max: 0})`, `require("LEDs light", bench("bringup"))`, `require("prints in 3 hours", print.time, {max: 3h})`. Fab holds each against what it measures (the board, the checks, the case checks, the last Check bench, the slice) and answers pass, fail, unknown with why, or waived with the person's reason, as the Requirements editor and the bar's chip show. `elec.req.list` reads them. `elec.req.add {name measure bound}` writes one with the person's own numbers; `elec.req.remove {name}` takes one out when they ask. Only the person waives: when they say so, `elec.req.waive {name reason}` proposes a waiver with their reason, which they accept or decline in the Requirements editor, and until they accept it the row stays as it is (`proposed` on its row); say so in your reply. A text change of yours that writes `waive(..)` is refused; `propose_waiver(..)` is the form. `elec.req.unwaive {name}` takes a waiver or a proposal out. Each is one undo step, and `fab.elec_text` changes the document too; text that adds a mistake is refused. The work is done when `elec.req.list` answers `met: true` or each open row is the person's waiver. An unknown is not a pass: report each with its why and what would measure it (Check bench, slicing the plate, the case on the plate).
 
 Words from other electronics tools: schematic sheet: a circuit unit; ERC and DRC: `elec.check.list`; autorouter: `elec.route`; board house rules: `elec.factory.set`; plot Gerbers: `elec.export`. Footprints and zones are written in the board's text, which `fab.elec_text` does not change: ask the person, or work through the actions above.
 

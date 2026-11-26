@@ -193,6 +193,11 @@ pub struct PrinterState {
     pub wifi: Option<String>,
     /// The extruder printing now (`device.extruder.state`).
     pub active_extruder: Option<CloudNozzleId>,
+    /// A virtual printer's job clock, in the seconds a preview's timeline counts (a real
+    /// printer reports none).
+    pub print_seconds: Option<f64>,
+    /// The job seconds that clock runs per second: 0 while it is held or the job has ended.
+    pub print_rate: Option<f64>,
     /// The firmware updater's state (`upgrade_state.status`).
     pub firmware: Option<String>,
     /// What else the printer says went wrong: its other error fields, (field, value).

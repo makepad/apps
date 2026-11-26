@@ -1,0 +1,22 @@
+use mod.motion.*
+// Boolean shapes: a ring cut from two circles, a Venn diagram's three regions, letters cut from a plate.
+Motion{size: vec2(1920, 1080) duration: 4.0 background: #10141b layers: [
+    Math{tex: "A \\setminus B, \\quad A \\cup B, \\quad A \\cap B" size: 44 color: #f2efe6 at: vec2(960, 70) align: @center}
+    Shape{name: "ring" op: @difference at: vec2(120, 260) fill: #ff7a1a layers: [
+        Ellipse{size: vec2(360, 360)}
+        Ellipse{at: vec2(90, 90) size: vec2(180, 180)}
+    ] opacity: tween(0, 1, 0.0, 0.6)}
+    Shape{name: "union" op: @union at: vec2(620, 260) fill: #3fa9f533 stroke: #3fa9f5 width: 3 layers: [
+        Ellipse{size: vec2(260, 260)}
+        Ellipse{at: vec2(140, 0) size: vec2(260, 260)}
+    ] trim_end: tween(0, 1, 0.5, 1.5)}
+    Shape{name: "lens" op: @intersection at: vec2(620, 260) fill: #ff7a1a layers: [
+        Ellipse{size: vec2(260, 260)}
+        Ellipse{at: vec2(140, 0) size: vec2(260, 260)}
+    ] opacity: tween(0, 1, 1.5, 2.0)}
+    Shape{name: "plate" op: @difference at: vec2(1160, 300) fill: #f2efe6 layers: [
+        Rect{size: vec2(640, 220) radius: 28}
+        Text{text: "CUT" size: 120 font: Font{family: "Inter" weight: 900} at: vec2(320, 30) align: @center}
+    ]}
+    Text{text: "letters cut from a plate" size: 28 color: #8a96a8 at: vec2(1480, 560) align: @center}
+]}

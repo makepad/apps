@@ -11,8 +11,8 @@ use crate::canvas::pane::{node_part, part_key, HIT_RADIUS};
 use crate::live::flags::{anchor_pin, Anchor, PinSpot};
 use crate::live::probe::probe_label;
 use fab_elec_circuit::Component;
-use fab_elec_board::{Board, Placed};
-use fab_elec_core::{BBox, BoardId, ItemId, LayerId, LayerSet, NetId, Nm, OnTrack, Sel, P};
+use fab_elec_board::{Area, Board, ItemKind, Placed};
+use fab_elec_core::{BBox, BoardId, CompId, ItemId, LayerId, LayerSet, NetId, Nm, OnTrack, Sel, P};
 use makepad_widgets_core::{dvec2, makepad_platform::{a11y, a11y_tree}, Rect, SemanticLookup};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -378,6 +378,56 @@ impl Pressed {
 }
 
 impl BoardItems<'_> {
+    /// The first part under a press at `at`, in the pick's order (`pressed`), though copper, a via
+    /// or a pour lies over it: what a shift-click adds to the selection or takes from it. O(hits).
+    pub(crate) fn part_at(&self, at: [f64; 2], radius: f64) -> Option<(ItemId, CompId)> {
+        self.hit(at, radius).into_iter().find_map(|sel| match sel {
+            Sel::Item(_, item) => self.board.placed_item(item).map(|p| (item, p.comp)),
+            _ => None,
+        })
+    }
+
+    /// A window takes parts whose whole visible box is inside `band` (world mm). A crossing
+    /// takes a part when a visible non-text shape's box meets the band. Both query the same
+    /// layer indices, sort the hits by item, and return each placement once in item order.
+    pub(crate) fn parts_in_band(&self, band: [f64; 4], crossing: bool) -> Vec<(ItemId, CompId)> {
+        let band = BBox::new(P::new(to_nm(band[0].min(band[2])), to_nm(band[1].min(band[3]))),
+            P::new(to_nm(band[0].max(band[2])), to_nm(band[1].max(band[3]))));
+        let mut items: Vec<ItemId> = self.pick.in_rect(self.scene, band, false, self.order).into_iter()
+            .filter(|hit| !crossing || hit.tag.role != Role::Text)
+            .map(|hit| hit.tag.item).filter(|item| *item != OUTLINE_ITEM).collect();
+        items.sort_unstable();
+        items.dedup();
+        let visible = LayerSet::of(self.order);
+        items.into_iter().filter_map(|item| {
+            let entry = self.items.entry(item)?;
+            if entry.kind != Kind::Part { return None; }
+            if !crossing {
+                let bounds = self.visible_box(entry, visible).bounds(Kind::Part)?;
+                if !band.contains_box(&bounds) { return None; }
+            }
+            Some((item, self.board.placed[entry.board_ix as usize].comp))
+        }).collect()
+    }
+
+    /// Whether `key` is a pour and world point `at` lies inside it, farther than `radius` from
+    /// its outline: where a drag in Select mode draws the marquee (a pour moves by its outline,
+    /// or once selected). A pour over the whole board has no outline of its own. O(its vertices).
+    pub(crate) fn pour_inside(&self, key: &Sel, at: [f64; 2], radius: f64) -> bool {
+        let Sel::Item(_, item) = key else { return false };
+        let Some((ItemKind::Zone, i)) = self.board.locate(*item) else { return false };
+        let Some(zone) = self.board.zones.get(i) else { return false };
+        let Area::Poly(area) = &zone.area else { return true };
+        let near = |a: P, b: P| {
+            let (ax, ay, bx, by) = (to_mm(a.x), to_mm(a.y), to_mm(b.x), to_mm(b.y));
+            let (dx, dy) = (bx - ax, by - ay);
+            let len2 = dx * dx + dy * dy;
+            let t = if len2 > 0.0 { (((at[0] - ax) * dx + (at[1] - ay) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+            (at[0] - ax - t * dx).hypot(at[1] - ay - t * dy) <= radius
+        };
+        !area.rings().any(|ring| (0..ring.len()).any(|k| near(ring[k], ring[(k + 1) % ring.len()])))
+    }
+
     /// What a press at `at` takes, first first, within the pick radius `radius` (S8): the copper
     /// the press is inside (a pad, then a via, then the rest, each in pick order), then the body it
     /// is inside, then the copper and bodies within the radius in pick order, pours last (a pour
@@ -433,6 +483,30 @@ impl BoardItems<'_> {
         out.extend(bodies[inside..].iter().map(|body| Pressed::Body(body.4)));
         out.extend(pours.into_iter().map(Pressed::Pour));
         out
+    }
+}
+
+/// The board's items as the pane's input sees them. In Select mode a pour that is not selected
+/// is background: a drag from its inside draws the marquee, and the pointer is no hand there.
+pub(crate) struct PressItems<'a> {
+    pub base: BoardItems<'a>,
+    pub select: bool,
+    pub selected: &'a [Sel],
+}
+
+impl CanvasItems for PressItems<'_> {
+    type Key = Sel;
+
+    fn hit(&self, at: [f64; 2], radius: f64) -> Vec<Sel> {
+        self.base.hit(at, radius)
+    }
+
+    fn nodes(&self, cam: &Camera2d) -> Vec<CanvasNode<Sel>> {
+        self.base.nodes(cam)
+    }
+
+    fn marquee_over(&self, key: &Sel, at: [f64; 2], radius: f64) -> bool {
+        self.select && !self.selected.contains(key) && self.base.pour_inside(key, at, radius)
     }
 }
 
@@ -687,6 +761,94 @@ mod tests {
         let pressed = items.pressed([to_mm(pad_at.x), to_mm(pad_at.y)], radius);
         assert!(matches!(pressed.first(), Some(Pressed::Copper(h)) if h.tag.role == Role::Pad),
             "inside a pad that track {:?} ends in, the pad comes first: {:?}", track.id, pressed.first());
+
+        // A shift-click takes the part under the press though a track lies over it: on a track
+        // crossing a part's body the pick's first item is the track, and `part_at` is the part.
+        let mut crossed = board.clone();
+        let (body, _) = *boxes.iter().find(|(_, item)| *item == placed.id).expect("the part's body box");
+        let net = board.tracks[0].net;
+        let id = crossed.alloc_id();
+        crossed.tracks.push(fab_elec_board::Track {
+            id, net, layer: LayerId::F_CU, w: to_nm(0.25), widths: None,
+            path: fab_elec_core::Path::new(P::new(body.min.x, body.center().y)).line(P::new(body.max.x, body.center().y)),
+            ends: [fab_elec_board::Anchor::Free, fab_elec_board::Anchor::Free], locked: false, origin: fab_elec_board::Origin::Authored,
+        });
+        crossed.reindex();
+        let scene = scene_of(&crossed, &[]);
+        let mut index = ItemIndex::new(&crossed, &scene);
+        let pick = ScenePick::new(&scene, index.take_bodies());
+        let items = BoardItems { unit: unit.id, board: &crossed, scene: &scene, pick: &pick, items: &index, order: &order };
+        assert_eq!(items.hit(at, radius).first(), Some(&Sel::Item(unit.id, id)), "{}: on the track over its body, the pick's first item is the track", placed.refdes);
+        assert_eq!(items.part_at(at, radius), Some((placed.id, placed.comp)), "{}: a shift-click there takes the part", placed.refdes);
+    }
+
+    /// Left to right encloses parts, right to left crosses their visible shapes. A drag from
+    /// inside an unselected pour starts either band. Its outline and a selected pour still drag.
+    #[test]
+    fn a_window_encloses_parts_a_crossing_touches_them_and_either_starts_inside_a_pour() {
+        let design = fab_elec_fixtures::ledctl();
+        let unit = design.units.first().expect("ledctl has a first unit");
+        let mut board = unit.board.as_deref().expect("ledctl's first unit has a board").clone();
+        let (pour, whole) = (board.alloc_id(), board.alloc_id());
+        let around = board.outline_bbox();
+        let inner = BBox::new(P::new(around.min.x + to_nm(2.0), around.min.y + to_nm(2.0)), P::new(around.max.x - to_nm(2.0), around.max.y - to_nm(2.0)));
+        for (id, area) in [(pour, fab_elec_board::Area::Poly(fab_elec_core::PolySet::rect(inner))), (whole, fab_elec_board::Area::Board)] {
+            board.zones.push(fab_elec_board::Zone { id, net: None, name: String::new(), layers: LayerSet::of(&[LayerId::F_CU]), area,
+                priority: 0, settings: Default::default(), locked: false, origin: fab_elec_board::Origin::Authored });
+        }
+        board.reindex();
+        let scene = scene_of(&board, &[]);
+        let mut index = ItemIndex::new(&board, &scene);
+        let bodies = index.take_bodies();
+        let boxes = bodies.clone();
+        let pick = ScenePick::new(&scene, bodies);
+        let mut order: Vec<_> = scene.layers.iter().map(|(layer, _)| *layer).collect();
+        order.sort_by_key(|layer| (*layer != LayerId::F_CU, *layer));
+        let base = || BoardItems { unit: unit.id, board: &board, scene: &scene, pick: &pick, items: &index, order: &order };
+        let items = base();
+
+        let all = mm_box(board.outline_bbox().inflate(to_nm(1.0)));
+        let window = items.parts_in_band(all, false);
+        let mut taken: Vec<CompId> = window.iter().map(|(_, comp)| *comp).collect();
+        let mut every: Vec<CompId> = board.placed.iter().map(|p| p.comp).collect();
+        every.sort_unstable();
+        taken.sort_unstable();
+        assert_eq!(taken, every, "a window round the whole board takes every part, each once");
+        assert_eq!(items.parts_in_band([all[2], all[3], all[0], all[1]], true), window,
+            "a crossing and a window round the whole board take the same parts");
+        let placed = &board.placed[0];
+        let (body, _) = *boxes.iter().find(|(_, item)| *item == placed.id).expect("the first part's body box");
+        let shown = items.visible_box(items.items.entry(placed.id).expect("its entry"), LayerSet::of(&order)).bounds(Kind::Part).expect("its shown box");
+        let snug = mm_box(shown.inflate(to_nm(0.05)));
+        assert!(items.parts_in_band(snug, false).contains(&(placed.id, placed.comp)), "{}: a window just round its shown box takes it", placed.refdes);
+        let half = [snug[0], snug[1], (snug[0] + snug[2]) / 2.0, snug[3]];
+        assert!(!items.parts_in_band(half, false).contains(&(placed.id, placed.comp)), "{}: a window over half the part leaves it out", placed.refdes);
+        assert!(items.parts_in_band([half[2], half[3], half[0], half[1]], true).contains(&(placed.id, placed.comp)),
+            "{}: a crossing over the same half takes the part", placed.refdes);
+        let resistor = board.placed.iter().find(|p| p.path == "usb.cc[0]").expect("the USB pull-down resistor");
+        let gap = mm_box(BBox::point(resistor.at).inflate(to_nm(0.05)));
+        let copper = BoardItems { order: &[LayerId::F_CU], ..base() };
+        assert!(copper.parts_in_band(gap, true).is_empty(), "a crossing in empty copper between the resistor's pads takes nothing");
+        let silk = BoardItems { order: &[LayerId::F_SILK], ..base() };
+        let label = scene.layer(LayerId::F_SILK).expect("front silk").shapes.iter()
+            .find(|s| s.tag.item == resistor.id && s.tag.role == Role::Text).expect("the resistor's reference on silk");
+        assert!(!silk.parts_in_band(mm_box(label.shape.bbox()), true).contains(&(resistor.id, resistor.comp)),
+            "a crossing that only touches the resistor's reference leaves the part out");
+
+        let radius = 0.2;
+        let middle = mm_box(inner);
+        let inside = [(middle[0] + middle[2]) / 2.0, (middle[1] + middle[3]) / 2.0];
+        let edge = [middle[0], inside[1]];
+        let (pour, whole, part) = (Sel::Item(unit.id, pour), Sel::Item(unit.id, whole), Sel::Item(unit.id, placed.id));
+        let select = PressItems { base: base(), select: true, selected: &[] };
+        assert!(select.marquee_over(&pour, inside, radius), "a drag from a pour's inside draws the marquee");
+        assert!(!select.marquee_over(&pour, edge, radius), "a drag from its outline moves it");
+        assert!(select.marquee_over(&whole, edge, radius), "a pour over the whole board is background everywhere");
+        let c = body.center();
+        assert!(!select.marquee_over(&part, [to_mm(c.x), to_mm(c.y)], radius), "a part drags");
+        let held = [pour.clone()];
+        assert!(!PressItems { base: base(), select: true, selected: &held }.marquee_over(&pour, inside, radius), "a selected pour drags from its inside");
+        assert!(!PressItems { base: base(), select: false, selected: &[] }.marquee_over(&pour, inside, radius), "outside Select mode a pour drags as before");
     }
 
     #[test]

@@ -1,0 +1,12 @@
+use mod.scene.*
+// Deformers on ordinary meshes: shatter (explode + assemble), twist, bend, ripple.
+Scene3D{ look: @studio
+  camera: Camera{position: vec3(0, 3, 11) target: vec3(0, 1, 0) focal_length: 35}
+  post: [ContactShadows{opacity: 0.6}]
+  children: [
+    Fx{preset: @shatter position: vec3(-3.6, 1.6, 0) radius: 1.4 duration: 3 start: 0.3 material: MeshPhysicalMaterial{color: #ff5a36 clearcoat: 1 roughness: 0.25 side: @double}}
+    Fx{preset: @twister position: vec3(-0.6, 1.5, 0) radius: 1.2 duration: 1.5 material: MeshPhysicalMaterial{preset: @brushed_metal}}
+    Fx{preset: @bender position: vec3(1.8, 1.5, 0) radius: 1.2 duration: 1.5 material: MeshPhysicalMaterial{color: #3f7cff clearcoat: 1}}
+    Fx{preset: @ripple_pool position: vec3(0, -0.2, 0) radius: 5 speed: 0.8 color: #1b2b44}
+    Mesh{geometry: TorusKnotGeometry{radius: 0.6 tube: 0.2} position: vec3(4.2, 1.5, 0) ripple: 0.04 ripple_frequency: 2 ripple_speed: 1 material: MeshPhysicalMaterial{preset: @gold}}
+  ] }

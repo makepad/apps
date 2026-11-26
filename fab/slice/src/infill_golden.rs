@@ -40,7 +40,14 @@ fn range_len(s: &golden::GcodeStats, feature: &str, a: usize, b: usize) -> f64 {
 /// instead of printing another pattern.
 #[test]
 fn every_pattern_slices_and_unknown_fails() {
-    for (name, _) in makepad_fab_toolpath::pattern::Sparse::ALL {
+    use makepad_fab_toolpath::pattern::Sparse;
+    use std::collections::BTreeSet;
+
+    let fab_plate::SettingKind::Choice(choices) = fab_plate::print_setting("sparse_infill_pattern").unwrap().kind else { panic!("the sparse pattern is a choice") };
+    let offered: BTreeSet<_> = choices.iter().map(|(name, _)| *name).collect();
+    let printable: BTreeSet<_> = Sparse::ALL.into_iter().map(|(name, _)| name).collect();
+    assert_eq!(offered, printable, "the panel must offer every sparse pattern the slicer builds");
+    for (name, _) in Sparse::ALL {
         let st = crate::tests::bare_setup(1, &[("sparse_infill_pattern", name)]);
         let res = slice(&st, step_box(175.0, 160.0)).unwrap_or_else(|e| panic!("{name}: {e}"));
         let stats = golden::analyse(&res.gcode);

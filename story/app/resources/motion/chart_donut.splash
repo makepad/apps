@@ -1,0 +1,59 @@
+use mod.motion.*
+// DONUT CHART — three segments draw around a faint track one after
+// another, each picking up where the last stopped, on ease_in_out_cubic
+// (so the pen never jerks at a hand-off). The centre counts the headline
+// share; each legend row slides in as its segment draws, tying colour to
+// label without the viewer having to search.
+// Why: sequential drawing lets the viewer compare shares one at a time;
+// the largest share goes first and owns the centre number.
+let a = in(@a) / 100
+let ab = (in(@a) + in(@b)) / 100
+let row = fn(y, t0, colour, label, value) {
+    Group{at: vec2(1100, y) x: tween(-30, 0, t0, t0 + 0.7, @ease_out_quint) opacity: tween(0, 1, t0, t0 + 0.4, @ease_out_cubic) layers: [
+        Rect{at: vec2(0, 10) size: vec2(28, 28) radius: 6 fill: colour}
+        Text{text: label font: Font{family: "Inter" weight: 500} size: 40 color: in(@ink) at: vec2(56, 0)}
+        Text{text: value + "%" font: Font{family: "Inter" weight: 700} size: 40 color: in(@ink) at: vec2(640, 0) wrap: 300 align: @right}
+    ]}
+}
+Motion{
+    label: "Donut chart"
+    brief: "A three-segment donut drawn in sequence, with a counting centre value and a legend."
+    tags: ["chart", "data", "donut", "pie", "share", "infographic"]
+    duration: 6.0
+    inputs: {
+        title: input(@text, "Where the time goes", "Chart title")
+        a: input(@number, 54, "Largest share, percent") b: input(@number, 28, "Second share") c: input(@number, 18, "Third share (a + b + c = 100)")
+        la: input(@text, "Editing") lb: input(@text, "Rendering") lc: input(@text, "Review")
+        ca: input(@color, #ff5c39, "Segment 1") cb: input(@color, #7c83f5, "Segment 2") cc: input(@color, #2fb894, "Segment 3")
+        ink: input(@color, #f4f7fa, "Title, legend, centre number")
+        muted: input(@color, #8e9aa7, "Centre label")
+        track: input(@color, #ffffff12, "Empty ring")
+        background: input(@color, #0b0d12, "Ground")
+    }
+    layers: [
+        Rect{size: vec2(1920, 1080) fill: in(@background)}
+        Group{
+            opacity: tween(1, 0, 5.55, 6.0, @ease_in_cubic)
+            layers: [
+                Ellipse{at: vec2(360, 280) size: vec2(560, 560) stroke: in(@track) width: 72
+                        scale: tween(0.9, 1.0, 0.0, 0.8, @ease_out_expo) opacity: tween(0, 1, 0.0, 0.4, @ease_out_cubic)}
+                Ellipse{at: vec2(360, 280) size: vec2(560, 560) stroke: in(@ca) width: 72 cap: @butt
+                        trim_end: tween(0, a, 0.4, 1.4, @ease_in_out_cubic)}
+                Ellipse{at: vec2(360, 280) size: vec2(560, 560) stroke: in(@cb) width: 72 cap: @butt
+                        trim_start: a trim_end: tween(a, ab, 1.3, 2.1, @ease_in_out_cubic)}
+                Ellipse{at: vec2(360, 280) size: vec2(560, 560) stroke: in(@cc) width: 72 cap: @butt
+                        trim_start: ab trim_end: tween(ab, 1, 2.0, 2.7, @ease_in_out_cubic)}
+                Text{number: tween(0, in(@a), 0.4, 1.4, @ease_in_out_cubic) suffix: "%" tabular: true
+                     font: Font{family: "Inter" weight: 800} size: 120 tracking: -0.04 color: in(@ink)
+                     at: vec2(640, 468) wrap: 400 align: @center opacity: tween(0, 1, 0.4, 0.7, @ease_out_cubic)}
+                Text{text: in(@la) font: Font{family: "Inter" weight: 500} size: 34 color: in(@muted)
+                     at: vec2(640, 610) wrap: 400 align: @center opacity: tween(0, 1, 0.9, 1.4, @ease_out_cubic)}
+                Text{text: in(@title) font: Font{family: "Inter" weight: 700} size: 64 tracking: -0.02 color: in(@ink) at: vec2(1100, 330)
+                     opacity: tween(0, 1, 0.1, 0.6, @ease_out_cubic) y: tween(20, 0, 0.1, 0.9, @ease_out_quint)}
+                row(480, 0.6, in(@ca), in(@la), in(@a))
+                row(570, 1.4, in(@cb), in(@lb), in(@b))
+                row(660, 2.1, in(@cc), in(@lc), in(@c))
+            ]
+        }
+    ]
+}

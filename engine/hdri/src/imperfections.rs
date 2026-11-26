@@ -182,7 +182,7 @@ fn ridged(x: f32, y: f32, seed: u32) -> f32 {
     let (mut px, mut py) = (x, y);
     let (mut amplitude, mut sum, mut carry) = (0.5f32, 0.0f32, 1.0f32);
     for octave in 0..4u32 {
-        let n = value2(px, py, seed.wrapping_add(octave.wrapping_mul(0x9e37_79b9)));
+        let n = value2(px, py, crate::noise::octave_seed(seed, octave));
         let fold = 1.0 - (2.0 * n - 1.0).abs();
         let ridge = fold * fold;
         sum += ridge * amplitude * carry;

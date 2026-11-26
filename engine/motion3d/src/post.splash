@@ -1,0 +1,199 @@
+// The Scene3D renderer's own post passes, as kits (each a template building
+// ordinary graph passes from its parameters, as the render graph's kits
+// do): the reflecting floor and contact shadows (the renderer's maps, read
+// by name), the look (zoom blur, light shafts, paper) and the document's
+// PostPass chain. The renderer calls them with this frame's values; the
+// standard kits (Bloom, DepthOfField, Vignette, Grain, Outline) are the
+// render graph's own.
+use mod.std.*
+use mod.math.*
+use mod.pod.*
+
+// A reflecting floor after the lighting (@hdr, first): each floor pixel
+// (its world point from the depth, on the floor plane, facing up) takes the
+// mirrored scene at its pixel, blurred over 12 taps by the reflection blur
+// and weighted by Fresnel on the reflectivity. It runs on the lit frame, so
+// the floor keeps its own light under it. rp: reflectivity, blur, height.
+mod.scenepost.kit_reflect = fn(p) {
+    return [
+        {at: @hdr reads: [@color, @depth, "m3_reflect_map"] slots: ["color", "depth", "mirror"] uniforms: {rp: p.rp}
+            pixel: fn() -> vec4 {
+                let uv = self.uv()
+                let col = self.color.sample(uv)
+                let dd = self.depth.sample_nearest(uv).x
+                if dd >= 0.99999 {
+                    return col
+                }
+                let p = self.world_at(uv, dd)
+                if abs(p.y - self.rp.z) > 0.01 {
+                    return col
+                }
+                let br = self.rp.y * 0.03
+                var rc = vec3(0.0, 0.0, 0.0)
+                for k in 0..12 {
+                    let a = float(k) * 2.3999632
+                    let rr = sqrt((float(k) + 0.5) / 12.0) * br
+                    rc = rc + self.mirror.sample_nearest(uv + vec2(cos(a), sin(a)) * rr).xyz
+                }
+                rc = rc / 12.0
+                let v = normalize(self.eye() - p)
+                let ndv = clamp(v.y, 0.0, 1.0)
+                let fr = self.rp.x * (0.3 + 0.7 * pow(1.0 - ndv, 5.0))
+                return vec4(col.xyz * (1.0 - fr * 0.5) + rc * fr * col.w, col.w)
+            }}
+    ]
+}
+
+// Contact shadows on the ground (@hdr, first): each ground pixel (its world
+// point from the depth, on the ground plane) looks up the casters' depth
+// from under the ground over 24 taps and darkens by those just above it.
+// view_proj: the contact camera's view-projection; cp: opacity, blur,
+// far, the ground's height.
+mod.scenepost.kit_contact = fn(p) {
+    return [
+        {at: @hdr reads: [@color, @depth, "m3_contact_map"] slots: ["color", "depth", "contact"] uniforms: {view_proj: p.view_proj cp: p.cp}
+            pixel: fn() -> vec4 {
+                let uv = self.uv()
+                let col = self.color.sample(uv)
+                let dd = self.depth.sample_nearest(uv).x
+                if dd >= 0.99999 {
+                    return col
+                }
+                let p = self.world_at(uv, dd)
+                if abs(p.y - self.cp.w) > 0.01 {
+                    return col
+                }
+                let c = self.view_proj * vec4(p.x, p.y, p.z, 1.0)
+                let cw = c.w
+                let cuv = vec2(c.x / cw * 0.5 + 0.5, 0.5 - c.y / cw * 0.5)
+                if cuv.x < 0.0 || cuv.x > 1.0 || cuv.y < 0.0 || cuv.y > 1.0 {
+                    return col
+                }
+                let depth = c.z / cw
+                var occ = 0.0
+                for k in 0..24 {
+                    let a = float(k) * 2.3999632
+                    let rr = sqrt((float(k) + 0.5) / 24.0) * self.cp.y
+                    let d = self.contact.sample_nearest(cuv + vec2(cos(a), sin(a)) * rr).x
+                    let gap = d - depth
+                    occ = occ + step(0.0005, gap) * clamp(1.0 - gap / self.cp.z, 0.0, 1.0)
+                }
+                return vec4(col.xyz * (1.0 - self.cp.x * occ / 24.0), col.w)
+            }}
+    ]
+}
+
+// The look on the tone-mapped frame (@display), on the decoded colour: the
+// zoom blur averages 24 jittered taps toward the centre, the light shafts
+// smear bright pixels toward the light's screen position over 28 decaying
+// taps, the paper multiplies its colour, fibres and tooth in over a 45°
+// halftone in the shadows. zoom: amount; s0: light uv (v up), strength,
+// threshold; s1: colour, decay; p0: amount, halftone, cell (output px), on;
+// p1: paper colour.
+mod.scenepost.kit_look = fn(p) {
+    return [
+        {at: @display reads: [@color] uniforms: {zoom: p.zoom s0: p.s0 s1: p.s1 p0: p.p0 p1: p.p1}
+            helpers: {
+                phash: fn(p: vec2) -> float {
+                    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453)
+                }
+                pnoise2: fn(p: vec2) -> float {
+                    let i = floor(p)
+                    let f = fract(p)
+                    let u = f * f * (vec2(3.0, 3.0) - f * 2.0)
+                    return mix(mix(self.phash(i), self.phash(i + vec2(1.0, 0.0)), u.x), mix(self.phash(i + vec2(0.0, 1.0)), self.phash(i + vec2(1.0, 1.0)), u.x), u.y)
+                }
+                graded: fn(uv: vec2) -> vec4 {
+                    let s = self.color.sample(uv)
+                    let a = clamp(s.w, 0.0, 1.0)
+                    var c = vec3(0.0, 0.0, 0.0)
+                    if a > 0.0001 {
+                        c = s.xyz / a
+                    }
+                    return vec4(self.from_srgb(c), a)
+                }
+            }
+            pixel: fn() -> vec4 {
+                let uv = self.uv()
+                let texel = self.texel()
+                var acc = self.graded(uv)
+                if self.zoom > 0.001 {
+                    acc = vec4(0.0, 0.0, 0.0, 0.0)
+                    for j in 0..24 {
+                        let k = (float(j) + self.phash(floor(uv / texel))) / 24.0
+                        acc = acc + self.graded(vec2(0.5, 0.5) + (uv - vec2(0.5, 0.5)) * (1.0 - self.zoom * k))
+                    }
+                    acc = acc / 24.0
+                }
+                if self.s0.z > 0.0 {
+                    let lp = vec2(self.s0.x, 1.0 - self.s0.y)
+                    let dv = (uv - lp) / 28.0
+                    var sum = vec3(0.0, 0.0, 0.0)
+                    var w = 1.0
+                    var q = uv - dv * self.phash(floor(uv / texel))
+                    for j in 0..28 {
+                        let s = self.graded(q).xyz
+                        let b = max(dot(s, vec3(0.3, 0.5, 0.2)) - self.s0.w, 0.0)
+                        sum = sum + s * b * w
+                        w = w * self.s1.w
+                        q = q - dv
+                    }
+                    let sh = sum / 28.0 * self.s0.z * self.s1.xyz
+                    acc = vec4(acc.xyz + sh, max(acc.w, clamp(dot(sh, vec3(0.3, 0.5, 0.2)), 0.0, 1.0)))
+                }
+                var o = acc.xyz
+                if self.p0.w > 0.5 {
+                    let px = uv / texel
+                    let cell = self.p0.z
+                    let q = vec2(px.x + px.y, px.y - px.x) * 0.7071 / cell
+                    let f = fract(q) - vec2(0.5, 0.5)
+                    let y = dot(o, vec3(0.2126, 0.7152, 0.0722))
+                    let r = sqrt(clamp(1.0 - y * 1.6, 0.0, 1.0)) * 0.62
+                    let dotm = clamp((r - length(f)) * cell * 1.5, 0.0, 1.0)
+                    o = mix(o, o * (1.0 - dotm * 0.85), self.p0.y)
+                    let fib = self.pnoise2(px * vec2(0.9, 0.12)) * 0.6 + self.pnoise2(px * 0.35) * 0.4
+                    let tooth = self.phash(floor(px)) - 0.5
+                    let paper = self.p1.xyz * (0.93 + fib * 0.07) + vec3(tooth, tooth, tooth) * 0.02
+                    o = mix(o, o * paper, self.p0.x)
+                }
+                return vec4(self.to_srgb(o) * acc.w, acc.w)
+            }}
+    ]
+}
+
+// The document's PostPass chain on the tone-mapped frame (@display): each
+// pass's `fn(uv, c) -> vec3` (post_0..post_3, the document's functions in
+// place of these) on the decoded colour in turn, with their uniforms
+// (u_post0..3), the time and aspect (u_ptime), one texel (u_d.xy) and the
+// frame (graded(uv)).
+mod.scenepost.kit_post_pass = fn(p) {
+    return [
+        {at: @display reads: [@color] uniforms: {u_post0: p.u_post0 u_post1: p.u_post1 u_post2: p.u_post2 u_post3: p.u_post3 u_ptime: p.u_ptime u_d: p.u_d}
+            helpers: {
+                graded: fn(uv: vec2) -> vec4 {
+                    let s = self.color.sample(uv)
+                    let a = clamp(s.w, 0.0, 1.0)
+                    var c = vec3(0.0, 0.0, 0.0)
+                    if a > 0.0001 {
+                        c = s.xyz / a
+                    }
+                    return vec4(self.from_srgb(c), a)
+                }
+                post_0: fn(uv: vec2, c: vec3) -> vec3 { return c }
+                post_1: fn(uv: vec2, c: vec3) -> vec3 { return c }
+                post_2: fn(uv: vec2, c: vec3) -> vec3 { return c }
+                post_3: fn(uv: vec2, c: vec3) -> vec3 { return c }
+            }
+            pixel: fn() -> vec4 {
+                let g = self.graded(self.uv())
+                var c = g.xyz
+                c = self.post_0(self.uv(), c)
+                c = self.post_1(self.uv(), c)
+                c = self.post_2(self.uv(), c)
+                c = self.post_3(self.uv(), c)
+                return vec4(self.to_srgb(c) * g.w, g.w)
+            }}
+    ]
+}
+
+true

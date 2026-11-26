@@ -3,7 +3,7 @@
 
 use makepad_strict_json::Value;
 
-/// The families of CUTS.md §10.4 (plus the session and effect-authoring
+/// The control API's tool families (plus the session and effect-authoring
 /// tools), in the order the tool list shows them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Family {
@@ -11,17 +11,17 @@ pub enum Family {
     Session,
     /// Project / edit: the open cut's source, its timeline and its ops.
     Cut,
-    /// Motion documents and vector graphics (§10.2).
+    /// Motion documents and vector graphics.
     Motion,
     /// VJ effects and transitions as documents: list, author, apply.
     Effects,
     /// The library and generation on the AI Hub through FLOW presets.
     Assets,
-    /// App runs (§6): registry apps, dumps, scripts, marks.
+    /// App runs: registry apps, dumps, scripts, marks.
     AppRuns,
-    /// Music analysis, beat sync, voiceovers (§8, §10.3).
+    /// Music analysis, beat sync, voiceovers.
     Audio,
-    /// Looking at the result: inspect, frames, strips (§10.2).
+    /// Looking at the result: inspect, frames, strips.
     Feedback,
     /// The storyboard the cut is made from: its cards, notes and
     /// references, and updating the cut when it changes.

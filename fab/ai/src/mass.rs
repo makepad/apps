@@ -300,7 +300,9 @@ impl Session {
 fn answer(object: &str, fill: &Fill, mass: &Mass, outline: bool) -> S {
     let i = &mass.inertia;
     let b = &mass.base;
+    // the base's check: it stands on its base as modelled
     let mut base = vec![
+        crate::checks::Check::of(b.stands).fields().remove(0),
         ("stands", flag(b.stands)),
         ("margin", mm(b.margin)),
         ("area_mm2", n(b.area)),

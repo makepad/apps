@@ -22,12 +22,132 @@
 //! An image mask (B8) is box-filtered too, exactly, through a summed-area
 //! table of what its texels pass, one per picture, shared by every light and
 //! map that shows it (D15).
+//!
+//! Venetian blinds hang as real ones do (`BlindLayout`): rails, ladders with
+//! their lift cords, a tilt wand, the pull cord, and slats that never all sit
+//! at one angle.
+//!
+//! The penumbra takes the light's own shape (`Penumbra`): a far light turns
+//! every small gap into an image of itself, so a disc light's dapples are
+//! round and a ring light's are rings, where a box made them square (the
+//! lighting survey, sheet 03). A rect keeps B6's box. Far enough off (past
+//! RASTER_FROM of a leaf), a canopy is read through a raster of its leaves'
+//! union filtered by that shape (`CanopyRaster`): its leaves overlap within
+//! their clumps, and blurring each on its own and multiplying them darkened
+//! it, up to a quarter of its light at small leaves.
 
 use super::*;
 use super::foliage::Foliage;
 use super::image_light::{PictureMemo, SummedArea};
 use super::light_fx::face_axes;
-use std::sync::Arc;
+use super::noise::hash01;
+use std::sync::{Arc, OnceLock};
+
+/// The shape of a gobo's penumbra: the light's own, shrunk to the penumbra.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Penumbra {
+    /// A rect's, and every other shape's but a round one: B6's box, the
+    /// penumbra's half-width each way.
+    Box,
+    /// A disc light's: a disc, the penumbra's half-width its radius; a ring
+    /// light's: that ring, its hole `inner` of the radius (0 for a disc).
+    Round { inner: f32 },
+}
+
+impl Penumbra {
+    /// The penumbra of `light`'s gobo: round for a disc or a ring light, the
+    /// box for every other shape.
+    pub fn of(light: &LightParams) -> Penumbra {
+        match light.shape() {
+            LightShape::Disc => Penumbra::Round { inner: 0.0 },
+            // max/min, not clamp: a NaN reads as no hole.
+            LightShape::Ring => Penumbra::Round { inner: light.inner.max(0.0).min(0.95) },
+            _ => Penumbra::Box,
+        }
+    }
+
+    /// Its area over the square of its half-width.
+    fn area(self) -> f64 {
+        match self {
+            Penumbra::Box => 4.0,
+            Penumbra::Round { inner } => std::f64::consts::PI * (1.0 - (inner as f64) * (inner as f64)),
+        }
+    }
+}
+
+/// A canopy is read through a raster (`CanopyRaster`) once its penumbra's
+/// half-width is this share of its leaf length (a fern's pinnule) or more.
+/// Past it the shades of the leaves overlapping within a clump, each blurred
+/// on its own and multiplied, darken the canopy (a tree at leaf size 0.3, 60 x
+/// 45 degrees, density 0.9, passed 0.066 of the light at distance 1 where
+/// sharp it passed 0.090), and a gap smaller than the penumbra does not turn
+/// into an image of the light. Short of it the leaves' own filters
+/// (foliage.rs) pass the light sharp ones do to within about 1 %.
+const RASTER_FROM: f32 = 0.2;
+/// A canopy raster's cells per penumbra half-width, and its most cells: past
+/// them its cells grow and it reads a little softer than asked.
+const RASTER_CELLS_PER_SOFT: f32 = 4.0;
+const RASTER_CELLS_MAX: f32 = 262_144.0;
+/// The most horizontal slabs a round penumbra is taken as over an image mask's
+/// table (`RoundSlabs`): each is two boxes, its band's share of the disc.
+const ROUND_SLABS: f64 = 12.0;
+
+/// Venetian blinds' hardware, sized as on a 2 inch blind (51 mm slats on a 46
+/// mm pitch) in slat pitches, so it keeps to the slats whatever their number
+/// (the lighting survey, sheet 06, and the photographed blinds beside it). The
+/// head rail (55 mm) and the bottom rail (28 mm), each held to a share of the
+/// light's height, so a coarse blind of a few slats still passes its light.
+const HEAD_RAIL: f32 = 1.2;
+const HEAD_RAIL_MAX: f32 = 0.08;
+const BOTTOM_RAIL: f32 = 0.6;
+const BOTTOM_RAIL_MAX: f32 = 0.04;
+/// A ladder's two strings (1.2 mm) run down the slats' front and back edges,
+/// its lift cord (1.6 mm) between them through the slats' middles.
+const LADDER_STRING: f32 = 0.026;
+const LIFT_CORD: f32 = 0.035;
+/// The outer ladders hang this share of the width in from the blind's ends
+/// (at most LADDER_INSET_MAX pitches, 16 cm), and two neighbouring ladders at
+/// most LADDER_SPAN pitches (60 cm) apart: two on a square blind of a dozen
+/// slats, three or more on a wider or finer one.
+const LADDER_INSET: f32 = 0.12;
+const LADDER_INSET_MAX: f32 = 3.5;
+const LADDER_SPAN: f32 = 13.0;
+/// The tilt wand (9 mm across) hangs this share of the width in from the
+/// left end (at most WAND_IN_MAX pitches: the tilter sits outside the outer
+/// ladder), down to this share of the light's height from its top.
+const WAND: f32 = 0.2;
+const WAND_IN: f32 = 0.05;
+const WAND_IN_MAX: f32 = 1.2;
+const WAND_DROP: f32 = 0.66;
+/// The pull cord (the lift cords side by side, 4 mm) hangs this share of the
+/// width in from the right end (at most PULL_IN_MAX pitches, at the cord
+/// lock), down to this share of the height, its tassel (25 x 40 mm) below.
+const PULL_CORD: f32 = 0.09;
+const PULL_IN: f32 = 0.07;
+const PULL_IN_MAX: f32 = 1.5;
+const PULL_DROP: f32 = 0.75;
+const TASSEL: [f32; 2] = [0.55, 0.9];
+/// The wand and the pull cord hang in front of the slats, this many half slat widths.
+const IN_FRONT: f32 = 1.3;
+/// Vertical vanes (a 76 mm pitch) hang from a head rail (38 mm, at most a
+/// share of the height), a bead chain (3 mm) links them this share of the
+/// height above the light's foot, and the control chain hangs at the right
+/// end, down to this share of the height.
+const VANE_RAIL: f32 = 0.5;
+const VANE_RAIL_MAX: f32 = 0.05;
+const VANE_CHAIN: f32 = 0.04;
+const VANE_CHAIN_UP: f32 = 0.04;
+const CONTROL_DROP: f32 = 0.85;
+/// How far, in degrees, a slat sits off the blind's tilt at most: its
+/// ladder's rungs are not all alike (UNEVEN_FLOOR), and their slack shows
+/// most half way shut (UNEVEN_TILT more at 45 degrees, as sin 2·tilt). Each
+/// slat's share of it is fixed by the gobo's seed.
+const UNEVEN_FLOOR: f32 = 1.5;
+const UNEVEN_TILT: f32 = 4.5;
+/// The salt that keeps the slats' tilts apart from the leaves the same seed grows.
+const SLAT_SEED: u32 = 0xb11d_5a75;
+
+use crate::patterns::band_covers;
 
 /// Half-width, in s-units, of the penumbra of a gobo hanging `distance` 0..=1
 /// in front of its light. Against the light (0) its edges are sharp; far off
@@ -85,7 +205,6 @@ pub struct Gobo {
     panes: [u32; 2],
     bar: f32,
     frame: f32,
-    slats: f32,
     /// Half a slat's width, in slat pitches (`slat_width / 2`).
     slat_half: f32,
     /// sin and cos of the slats' tilt from edge-on.
@@ -95,10 +214,76 @@ pub struct Gobo {
     /// tilted slats spread their light that far (`blinds`).
     distance: f32,
     vertical: bool,
-    /// Leaves or fern fronds, scattered once from the seed (B7).
-    foliage: Option<Foliage>,
+    /// Venetian blinds: where their slats and hardware hang.
+    blind: Option<BlindLayout>,
+    /// The shape of the penumbra: the light's own.
+    penumbra: Penumbra,
+    /// Leaves or fern fronds, grown once from the seed (B7).
+    canopy: Option<Canopy>,
     /// The image mask (B8).
     image: Option<ImageMask>,
+    /// A soft image mask's round penumbra, laid out once over its table
+    /// (`RoundSlabs`): None for a box, a sharp mask, or a penumbra under a
+    /// texel across, which is read as a box.
+    round: Option<RoundSlabs>,
+}
+
+/// A leaves or fern gobo's canopy, as the gobo reads it.
+#[derive(Clone, Debug)]
+enum Canopy {
+    /// Sharp or nearly: its primitives, each box-filtered across itself (foliage.rs).
+    Primitives(Foliage),
+    /// Further off: its raster, filtered by the light's own shape.
+    Raster(Arc<CanopyRaster>),
+}
+
+/// Where a venetian blind's slats and hardware hang (`Gobo::blinds`), s-units.
+#[derive(Clone, Debug)]
+struct BlindLayout {
+    /// The slats' pitch, and the band across them that they fill: between the
+    /// rails for horizontal slats; for vertical vanes the light's width, past
+    /// which they go on. Slat k pivots (k + 1/2) pitches in from `lo`.
+    pitch: f32,
+    lo: f32,
+    hi: f32,
+    /// Each slat's tilt, (sin, cos), the lowest slat (the leftmost vane) first:
+    /// the blind's tilt, each slat off it by up to UNEVEN_FLOOR + UNEVEN_TILT
+    /// sin(2·tilt) degrees.
+    tilts: Vec<[f32; 2]>,
+    /// Horizontal slats: the first ladder's x, the ladders' spacing and their number.
+    ladder_x0: f32,
+    ladder_step: f32,
+    ladders: i32,
+}
+
+impl BlindLayout {
+    /// The blinds of `p` (clamped) over a light `rect` s-units half wide and tall.
+    fn new(p: &GoboParams, rect: Vec2f) -> BlindLayout {
+        let slats = p.slats.max(1) as f32;
+        let (pitch, lo, hi) = if p.vertical {
+            (2.0 * rect.x / slats, -rect.x, rect.x)
+        } else {
+            // The slats hang between the rails, which are sized in pitches.
+            let height = 2.0 * rect.y;
+            let pitch = height / (slats + HEAD_RAIL + BOTTOM_RAIL);
+            let head = (HEAD_RAIL * pitch).min(HEAD_RAIL_MAX * height);
+            let bottom = (BOTTOM_RAIL * pitch).min(BOTTOM_RAIL_MAX * height);
+            ((height - head - bottom) / slats, -rect.y + bottom, rect.y - head)
+        };
+        let uneven = UNEVEN_FLOOR + UNEVEN_TILT * (2.0 * p.tilt_deg).to_radians().sin().max(0.0);
+        let tilts = (0..p.slats.max(1) as i32)
+            .map(|k| {
+                let off = uneven * (2.0 * hash01(k, 0, 0, p.seed ^ SLAT_SEED) - 1.0);
+                let (sin, cos) = (p.tilt_deg + off).to_radians().sin_cos();
+                [sin, cos]
+            })
+            .collect();
+        let width = 2.0 * rect.x;
+        let inset = (LADDER_INSET * width).min(LADDER_INSET_MAX * pitch);
+        let inner = (width - 2.0 * inset).max(0.0);
+        let ladders = ((inner / (LADDER_SPAN * pitch)).ceil() as i32 + 1).max(2);
+        BlindLayout { pitch, lo, hi, tilts, ladder_x0: -rect.x + inset, ladder_step: (inner / (ladders - 1) as f32).max(1.0e-6), ladders }
+    }
 }
 
 /// An image gobo's picture, as the gobo reads it.
@@ -122,6 +307,11 @@ impl Gobo {
     /// from the parameters and the set alone and never reads a file, so a
     /// name the app has not loaded is simply no gobo.
     pub fn new(p: &GoboParams, half: Vec2f, images: &ImageSet) -> Option<Gobo> {
+        Gobo::new_with(p, half, images, Penumbra::Box)
+    }
+
+    /// `new` for a light whose own shape the penumbra takes (`Penumbra::of`).
+    pub fn new_with(p: &GoboParams, half: Vec2f, images: &ImageSet, shape: Penumbra) -> Option<Gobo> {
         // As clamp() holds it: its ranges and defaults are written once (L:132).
         let p = &p.clamped();
         let kind = p.kind();
@@ -136,12 +326,32 @@ impl Gobo {
             Some(img) => shared_pass_table(&img).map(ImageMask::Soft),
             None => None,
         };
-        let foliage = match kind {
-            GoboKind::Leaves => Some(Foliage::leaves(rect, p.density, p.scale, p.seed, soft)),
-            GoboKind::Fern => Some(Foliage::fern(rect, p.density, p.scale, p.seed, soft)),
+        // A soft mask's penumbra is the same disc or ring at every lookup.
+        let round = match (&image, shape) {
+            (Some(ImageMask::Soft(table)), Penumbra::Round { inner }) => RoundSlabs::new(table, vec2f(soft / rect.x, soft / rect.y), inner as f64),
             _ => None,
         };
+        // How fine the canopy is: past RASTER_FROM of it the penumbra reads
+        // its raster, whose cells are its mean over them (half a cell's
+        // penumbra), and the canopy is binned for that.
+        let feature = match kind {
+            GoboKind::Leaves => Foliage::leaf_length(rect, p.density, p.scale),
+            GoboKind::Fern => crate::foliage::FERN_PINNULE * Foliage::frond_length(rect, p.density, p.scale),
+            _ => 0.0,
+        };
+        let raster = (soft >= RASTER_FROM * feature).then(|| CanopyRaster::side(rect, soft));
+        let binned = raster.map_or(soft, |side| 0.5 * side);
+        let foliage = match kind {
+            GoboKind::Leaves => Some(Foliage::leaves(rect, p.density, p.scale, p.seed, binned)),
+            GoboKind::Fern => Some(Foliage::fern(rect, p.density, p.scale, p.seed, binned)),
+            _ => None,
+        };
+        let canopy = foliage.map(|f| match raster {
+            Some(side) => Canopy::Raster(Arc::new(CanopyRaster::new(f, side))),
+            None => Canopy::Primitives(f),
+        });
         let (tilt_sin, tilt_cos) = p.tilt_deg.to_radians().sin_cos();
+        let blind = (kind == GoboKind::Blinds).then(|| BlindLayout::new(p, rect));
         Some(Gobo {
             kind,
             s,
@@ -150,14 +360,16 @@ impl Gobo {
             panes: [p.panes_x, p.panes_y],
             bar: p.bar,
             frame: p.frame,
-            slats: p.slats as f32,
             slat_half: 0.5 * p.slat_width,
             tilt_sin,
             tilt_cos,
             distance: p.distance,
             vertical: p.vertical,
-            foliage,
+            blind,
+            penumbra: shape,
+            canopy,
             image,
+            round,
         })
     }
 
@@ -172,7 +384,11 @@ impl Gobo {
             GoboKind::Window => self.window(p, true),
             GoboKind::Grid => self.window(p, false),
             GoboKind::Blinds => self.blinds(p, q),
-            GoboKind::Leaves | GoboKind::Fern => self.foliage.as_ref().map_or(1.0, |f| f.transmission(p)),
+            GoboKind::Leaves | GoboKind::Fern => match &self.canopy {
+                Some(Canopy::Primitives(f)) => f.transmission(p),
+                Some(Canopy::Raster(raster)) => raster.mean(p, self.soft, self.penumbra),
+                None => 1.0,
+            },
             GoboKind::Image => self.image.as_ref().map_or(1.0, |mask| self.image_at(mask, p)),
         };
         if t.is_finite() {
@@ -184,15 +400,15 @@ impl Gobo {
 
     /// An image mask at `p` (s-units), stretched over the light's rectangle.
     /// Against the light it is as sharp as the image. Further off it is the
-    /// mean of the mask over the penumbra's box, soft s-units each way, as a
-    /// window's is: a box filter moves light about and loses none, and it
-    /// blurs fine detail away instead of ghosting it.
+    /// mean of the mask over the penumbra, soft s-units each way in the
+    /// light's own shape, as a window's is: a box filter moves light about
+    /// and loses none, and it blurs fine detail away instead of ghosting it.
     fn image_at(&self, mask: &ImageMask, p: Vec2f) -> f32 {
         // The unit box: -1..1 over the light's rectangle.
         let b = vec2f(p.x / self.rect.x, p.y / self.rect.y);
         match mask {
             ImageMask::Sharp(img) => image_mask(img, b),
-            ImageMask::Soft(table) => pass_mean(table, b, vec2f(self.soft / self.rect.x, self.soft / self.rect.y)),
+            ImageMask::Soft(table) => pass_mean(table, b, vec2f(self.soft / self.rect.x, self.soft / self.rect.y), self.round.as_ref()),
         }
     }
 
@@ -211,49 +427,133 @@ impl Gobo {
     }
 
     /// Venetian blinds at `p` (s-units; `q` is the same point in tangent
-    /// units). `slats` slats cross the light, pivoting on lines one pitch
-    /// apart; a slat is `slat_width` pitches deep (1.08 by default, so shut
-    /// blinds overlap; below 1 a gap stays open).
+    /// units), hung as real ones hang (`BlindLayout`): what the slats pass
+    /// (`slats_open`) past the blind's hardware (`blind_hardware`).
+    fn blinds(&self, p: Vec2f, q: Vec2f) -> f32 {
+        let Some(blind) = &self.blind else {
+            return 1.0;
+        };
+        // The axis across the slats: up the light for horizontal slats.
+        let (a, view) = if self.vertical { (p.x, q.x) } else { (p.y, q.y) };
+        let open = self.slats_open(blind, a, view);
+        if !(open > 0.0) {
+            return 0.0;
+        }
+        open * self.blind_hardware(blind, p, q)
+    }
+
+    /// The share of the light the slats pass at `a` across them, seen along a
+    /// ray whose slope across them is `view` (which is the tangent coordinate
+    /// itself). `slats` slats pivot on lines one pitch apart; a slat is
+    /// `slat_width` pitches deep (1.08 by default, so shut blinds overlap;
+    /// below 1 a gap stays open).
     ///
     /// A slat tilted by `tilt` from edge-on is the segment
     /// ±(slat_width/2)·pitch·(sin tilt, cos tilt) in (across the window,
-    /// toward the viewer). Seen along a ray whose slope across the window is
-    /// `view` (which is the tangent coordinate itself), it hides a band
+    /// toward the viewer). Seen along the ray it hides a band
     /// (slat_width/2)·pitch·|sin tilt − cos tilt · view| either side of its
     /// pivot, and never less than its own thickness. So open blinds seen
     /// from an angle close a little, and overlapping shut blinds stay shut
-    /// from every side.
+    /// from every side. Each slat has its own tilt (`BlindLayout::tilts`), so
+    /// the gaps are not all alike.
     ///
     /// The gaps are box-filtered, wider as the blinds close and the further
     /// they hang from the light (the gaps become slits that spread the
-    /// light): a gap narrower than the blur dims instead of vanishing, and a
-    /// shut one passes nothing. Against the light they are sharp.
-    fn blinds(&self, p: Vec2f, q: Vec2f) -> f32 {
-        // The axis across the slats: up the light for horizontal slats.
-        let (a, h, view) = if self.vertical { (p.x, self.rect.x, q.x) } else { (p.y, self.rect.y, q.y) };
-        let pitch = 2.0 * h / self.slats;
-        let cover = (self.slat_half * pitch * (self.tilt_sin - self.tilt_cos * view).abs()).max(0.03 * pitch);
-        // Half the open gap between two slats.
-        let gap = 0.5 * pitch - cover;
-        if !(gap > 0.0) {
-            return 0.0;
-        }
+    /// light): a gap narrower than the blur dims instead of vanishing, and
+    /// shut slats pass nothing. Against the light they are sharp. Horizontal
+    /// slats fill the band between the rails, which pass nothing; vertical
+    /// vanes go on past the light's sides.
+    fn slats_open(&self, blind: &BlindLayout, a: f32, view: f32) -> f32 {
+        let pitch = blind.pitch;
         // D9 (L:137): a slit spreads its light up to a quarter pitch each way,
         // as far as the blinds hang from the light, as the penumbra does:
         // against it (distance 0) they are sharp, as the Distance row
         // promises, where a spread held at a quarter pitch left shut 0.8-pitch
         // slats showing wide bands of sky at a third of it.
         let w = (self.soft + 0.25 * pitch * self.tilt_sin * self.distance).min(0.45 * pitch).max(1.0e-5);
-        // The gaps are centred on the lines half way between two pivots, which
-        // are the multiples of the pitch measured from the light's lower edge.
-        // Shifted by the gap's half-width they start on those multiples, and
-        // the open length up to `u` is a staircase with a ramp per pitch.
-        let open_up_to = |u: f32| {
-            let whole = (u / pitch).floor();
-            whole * 2.0 * gap + (u - whole * pitch).min(2.0 * gap)
-        };
-        let u = a + h + gap;
-        (open_up_to(u + w) - open_up_to(u - w)) / (2.0 * w)
+        let (lo, hi) = if self.vertical { (a - w, a + w) } else { ((a - w).max(blind.lo), (a + w).min(blind.hi)) };
+        if !(hi > lo) {
+            return 0.0;
+        }
+        // The slats whose band can reach the box: a band reaches at most
+        // (slat_width/2)·sqrt(1 + view²) pitches from its pivot.
+        let reach = (self.slat_half * (1.0 + view * view).sqrt()).max(0.03);
+        let n = blind.tilts.len() as i64;
+        let mut first = ((lo - blind.lo) / pitch - 0.5 - reach).floor() as i64;
+        let mut last = ((hi - blind.lo) / pitch - 0.5 + reach).ceil() as i64;
+        if !self.vertical {
+            first = first.max(0);
+            last = last.min(n - 1);
+        }
+        // The gaps between their bands within the box, in order: where shut
+        // slats overlap there are none, and the blinds pass exactly nothing.
+        let (mut open, mut covered_to) = (0.0f32, lo);
+        for k in first..=last {
+            let pivot = blind.lo + (k as f32 + 0.5) * pitch;
+            // Vanes past the light's sides repeat its vanes' tilts.
+            let [sin, cos] = blind.tilts[k.rem_euclid(n) as usize];
+            let band = (self.slat_half * pitch * (sin - cos * view).abs()).max(0.03 * pitch);
+            if pivot - band > covered_to {
+                open += (pivot - band).min(hi) - covered_to;
+            }
+            covered_to = covered_to.max(pivot + band);
+            if covered_to >= hi {
+                break;
+            }
+        }
+        if covered_to < hi {
+            open += hi - covered_to;
+        }
+        (open / (2.0 * w)).max(0.0).min(1.0)
+    }
+
+    /// What the blind's hardware lets through at `p` (s-units; `q` the same
+    /// point in tangent units), each part box-filtered by the gobo's
+    /// penumbra as a window's bars are. Horizontal slats: the ladders, each two
+    /// strings down the slats' front and back edges (so seen from the side
+    /// they part, by their depth times the ray's slope) with the lift cord
+    /// between them, and the tilt wand and the pull cord with its tassel,
+    /// which hang in front of the slats; the rails are `slats_open`'s. Vertical
+    /// vanes: the head rail, the chain linking the vanes near their foot and
+    /// the control chain.
+    fn blind_hardware(&self, blind: &BlindLayout, p: Vec2f, q: Vec2f) -> f32 {
+        let w = self.soft.max(1.0e-5);
+        let (hx, hy, pitch) = (self.rect.x, self.rect.y, blind.pitch);
+        let (width, height) = (2.0 * hx, 2.0 * hy);
+        // A rod `thick` across at x, hanging from above the light down to `bottom`.
+        let rod = |x: f32, thick: f32, bottom: f32| 1.0 - band_covers(p.x, x - 0.5 * thick, x + 0.5 * thick, w) * band_covers(p.y, bottom, f32::INFINITY, w);
+        let pull_in = (PULL_IN * width).min(PULL_IN_MAX * pitch);
+        if self.vertical {
+            let rail = (VANE_RAIL * pitch).min(VANE_RAIL_MAX * height);
+            let chain = -hy + VANE_CHAIN_UP * height;
+            let half_chain = 0.5 * VANE_CHAIN * pitch;
+            return (1.0 - band_covers(p.y, hy - rail, f32::INFINITY, w))
+                * (1.0 - band_covers(p.y, chain - half_chain, chain + half_chain, w))
+                * rod(hx - pull_in, VANE_CHAIN * pitch, hy - CONTROL_DROP * height);
+        }
+        let mut t = 1.0;
+        // The ladders either side of p.
+        let depth = (self.slat_half * pitch * self.tilt_cos * q.x).abs();
+        let (string, cord) = (0.5 * LADDER_STRING * pitch, 0.5 * LIFT_CORD * pitch);
+        let near = ((p.x - blind.ladder_x0) / blind.ladder_step).round() as i32;
+        for k in (near - 1).max(0)..=(near + 1).min(blind.ladders - 1) {
+            let x = blind.ladder_x0 + k as f32 * blind.ladder_step;
+            // Straight on the strings and the cord are one band; from the side three.
+            let covered = if depth - string <= cord {
+                let reach = (depth + string).max(cord);
+                band_covers(p.x, x - reach, x + reach, w)
+            } else {
+                band_covers(p.x, x - depth - string, x - depth + string, w) + band_covers(p.x, x - cord, x + cord, w) + band_covers(p.x, x + depth - string, x + depth + string, w)
+            };
+            t *= (1.0 - covered).max(0.0);
+        }
+        // The wand at the left end and the pull cord at the right hang in front of the slats.
+        let front = IN_FRONT * self.slat_half * pitch * q.x;
+        t *= rod(-hx + (WAND_IN * width).min(WAND_IN_MAX * pitch) - front, WAND * pitch, hy - WAND_DROP * height);
+        let (pull, end) = (hx - pull_in - front, hy - PULL_DROP * height);
+        t *= rod(pull, PULL_CORD * pitch, end);
+        let tassel = band_covers(p.x, pull - 0.5 * TASSEL[0] * pitch, pull + 0.5 * TASSEL[0] * pitch, w) * band_covers(p.y, end - TASSEL[1] * pitch, end, w);
+        t * (1.0 - tassel)
     }
 }
 
@@ -326,15 +626,246 @@ fn shared_pass_table(img: &Arc<EnvMap>) -> Option<Arc<PassTable>> {
     }))
 }
 
-/// The mean of the mask over the box round unit-box point `b` (placed as
-/// `image_mask` places it) with half-widths `r`, in unit-box units. The box
-/// is never narrower than a texel (`SummedArea::box_mean`), so a soft gobo
-/// is never blockier than a sharp one.
-fn pass_mean(table: &PassTable, b: Vec2f, r: Vec2f) -> f32 {
+/// The mean of the mask over the penumbra round unit-box point `b` (placed as
+/// `image_mask` places it) with half-widths `r`, in unit-box units: the box,
+/// or for a round light (`Penumbra::Round`) the disc or ring laid out in
+/// `round`. The box is never narrower than a texel (`SummedArea::box_mean`),
+/// so a soft gobo is never blockier than a sharp one; a round penumbra under
+/// a texel across is read as that box (`RoundSlabs::new` lays out none).
+fn pass_mean(table: &PassTable, b: Vec2f, r: Vec2f, round: Option<&RoundSlabs>) -> f32 {
     let (w, h) = (table.width() as f64, table.height() as f64);
     let x = (0.5 + 0.5 * b.x as f64) * w;
     let y = (0.5 - 0.5 * b.y as f64) * h;
-    table.box_mean(x, y, 0.5 * r.x as f64 * w, 0.5 * r.y as f64 * h)[0] as f32
+    match round {
+        Some(round) => round.mean(table, x, y),
+        None => table.box_mean(x, y, 0.5 * r.x as f64 * w, 0.5 * r.y as f64 * h)[0] as f32,
+    }
+}
+
+/// A round penumbra over an image mask's table, the same at every lookup of
+/// its gobo, so it is laid out once (`Gobo::new_with`): the ellipse with half
+/// axes `rx`, `ry` in texels (a round penumbra on the light, stretched as the
+/// picture is), less its hole `inner` of that for a ring, as horizontal slabs,
+/// up to ROUND_SLABS and none under a texel tall, each as wide as the disc's
+/// area in its band (`chord_mean`) and read as one box of the table. A slab
+/// under half a texel wide is read half a texel wide, and the mean is over
+/// the boxes as read, so the light stays.
+#[derive(Clone, Debug)]
+struct RoundSlabs {
+    /// Each box: its middle's offset from the lookup's row, its half width
+    /// and half height (texels), +1 for the disc's or -1 for the hole's, and
+    /// its area.
+    boxes: Vec<RoundBox>,
+    /// The boxes' signed area together.
+    area: f64,
+    /// The half axes, for the box a penumbra with no area left is read as.
+    rx: f64,
+    ry: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RoundBox {
+    dy: f64,
+    half_x: f64,
+    half_y: f64,
+    sign: f64,
+    area: f64,
+}
+
+impl RoundSlabs {
+    /// The disc or ring with hole `inner` over `table` for a penumbra of
+    /// half-widths `r` (unit-box units, as `pass_mean` takes them): None
+    /// where it is under a texel across either way, which is read as a box.
+    fn new(table: &PassTable, r: Vec2f, inner: f64) -> Option<RoundSlabs> {
+        let (w, h) = (table.width() as f64, table.height() as f64);
+        let (rx, ry) = (0.5 * r.x as f64 * w, 0.5 * r.y as f64 * h);
+        if !(rx >= 1.0 && ry >= 1.0) {
+            return None;
+        }
+        let n = (2.0 * ry).floor().max(2.0).min(ROUND_SLABS) as usize;
+        let (mut boxes, mut area) = (Vec::with_capacity(2 * n), 0.0f64);
+        for k in 0..n {
+            let (v0, v1) = (-1.0 + 2.0 * k as f64 / n as f64, -1.0 + 2.0 * (k + 1) as f64 / n as f64);
+            let (dy, half_y) = (0.5 * (v0 + v1) * ry, (0.5 * (v1 - v0) * ry).max(0.5));
+            for (radius, sign) in [(1.0, 1.0), (inner, -1.0)] {
+                let half_x = chord_mean(v0, v1, radius) * rx;
+                // No disc in this band, or a sliver of the hole under half a texel: nothing to take.
+                if !(half_x > 0.0) || (sign < 0.0 && half_x < 0.5) {
+                    continue;
+                }
+                let half_x = half_x.max(0.5);
+                let box_area = 4.0 * half_x * half_y;
+                boxes.push(RoundBox { dy, half_x, half_y, sign, area: box_area });
+                area += sign * box_area;
+            }
+        }
+        Some(RoundSlabs { boxes, area, rx, ry })
+    }
+
+    /// The mean of the mask over the penumbra round (x, y), in texels.
+    fn mean(&self, table: &PassTable, x: f64, y: f64) -> f32 {
+        if !(self.area > 0.0) {
+            return table.box_mean(x, y, self.rx, self.ry)[0] as f32;
+        }
+        let mut sum = 0.0f64;
+        for b in &self.boxes {
+            sum += b.sign * table.box_mean(x, y + b.dy, b.half_x, b.half_y)[0] * b.area;
+        }
+        (sum / self.area) as f32
+    }
+}
+
+/// The mean half-chord over the band a..b of a disc of `radius` centred on 0:
+/// its area in the band over twice the band's height. 0 for no disc.
+fn chord_mean(a: f64, b: f64, radius: f64) -> f64 {
+    if !(radius > 0.0 && b > a) {
+        return 0.0;
+    }
+    0.5 * radius * radius * (disc_area(b / radius) - disc_area(a / radius)) / (b - a)
+}
+
+/// Points of `disc_area`'s table over -1..=1.
+const DISC_AREA_STEPS: usize = 2048;
+
+/// The area of the unit disc below the line y = v, -1..=1 (held past it): 2
+/// ∫ sqrt(1 - t²) dt from -1, from a table, linear between its points (the
+/// table is exact at them; between, off by less than 1e-5 of the disc's
+/// area, worst at its rim).
+fn disc_area(v: f64) -> f64 {
+    static TABLE: OnceLock<Vec<f64>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        (0..=DISC_AREA_STEPS)
+            .map(|k| {
+                let v = (-1.0 + 2.0 * k as f64 / DISC_AREA_STEPS as f64).max(-1.0).min(1.0);
+                v * (1.0 - v * v).max(0.0).sqrt() + v.asin() + 0.5 * std::f64::consts::PI
+            })
+            .collect()
+    });
+    // max/min, not clamp: a NaN reads as the bottom of the disc.
+    let x = ((v + 1.0) * 0.5 * DISC_AREA_STEPS as f64).max(0.0).min(DISC_AREA_STEPS as f64);
+    let k = (x as usize).min(DISC_AREA_STEPS - 1);
+    table[k] + (x - k as f64) * (table[k + 1] - table[k])
+}
+
+/// A canopy far from its light (`RASTER_FROM`): the union of its leaves and
+/// stems rastered over the rectangle they are binned over, each cell its
+/// mean over the cell (their own filters at half a cell, foliage.rs), and the
+/// penumbra the raster's mean over the light's own shape (`Penumbra`). So
+/// leaves overlapping within a clump shade as one, and a gap smaller than the
+/// penumbra turns into an image of the light, a round dapple under a disc.
+/// Its rows are filled on their first read, by whichever bake thread reads
+/// them (a row is a function of its index alone, so a bake equals its
+/// parallel bake, as `lazy_grid`'s are), and kept as running sums, so a box
+/// or a disc of any size costs two reads a row it spans. Past its rectangle
+/// the edge cells hold, as an image mask's do.
+struct CanopyRaster {
+    /// The canopy binned for half a cell's penumbra: a lookup at a cell's
+    /// middle is its mean over the cell.
+    cells: Foliage,
+    /// The raster's lower left corner, s-units, a cell's side, and its size.
+    min: Vec2f,
+    side: f32,
+    nx: usize,
+    ny: usize,
+    /// Each row's running sums from its left end, nx + 1 of them.
+    rows: Vec<OnceLock<Box<[f64]>>>,
+}
+
+/// Its shape only: which rows are filled depends on what has been read.
+impl std::fmt::Debug for CanopyRaster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CanopyRaster").field("side", &self.side).field("nx", &self.nx).field("ny", &self.ny).finish()
+    }
+}
+
+impl CanopyRaster {
+    /// A cell's side, s-units, for a canopy over the light's rectangle `rect`
+    /// (s-units, its glow GLOW past it) and a penumbra of half-width `soft`:
+    /// RASTER_CELLS_PER_SOFT cells to it, at most RASTER_CELLS_MAX cells.
+    fn side(rect: Vec2f, soft: f32) -> f32 {
+        let half = rect + Vec2f::all(crate::foliage::GLOW);
+        (soft / RASTER_CELLS_PER_SOFT).max((4.0 * half.x * half.y / RASTER_CELLS_MAX).sqrt())
+    }
+
+    /// The raster of `foliage`, binned for half a cell's penumbra, cells `side` wide.
+    fn new(foliage: Foliage, side: f32) -> CanopyRaster {
+        let half = foliage.binned_half();
+        let (nx, ny) = (((2.0 * half.x / side).ceil() as usize).max(1), ((2.0 * half.y / side).ceil() as usize).max(1));
+        CanopyRaster { cells: foliage, min: vec2f(-half.x, -half.y), side, nx, ny, rows: (0..ny).map(|_| OnceLock::new()).collect() }
+    }
+
+    /// Row `j`'s running sums, filled on its first read.
+    fn row(&self, j: usize) -> &[f64] {
+        self.rows[j].get_or_init(|| {
+            let y = self.min.y + (j as f32 + 0.5) * self.side;
+            let mut sums = Vec::with_capacity(self.nx + 1);
+            let mut run = 0.0f64;
+            sums.push(run);
+            for i in 0..self.nx {
+                run += self.cells.transmission(vec2f(self.min.x + (i as f32 + 0.5) * self.side, y)) as f64;
+                sums.push(run);
+            }
+            sums.into_boxed_slice()
+        })
+    }
+
+    /// A row's cells integrated from x0 to x1, in cells, its end cells held
+    /// past its ends.
+    fn span(row: &[f64], x0: f64, x1: f64) -> f64 {
+        let n = row.len() - 1;
+        let at = |x: f64| {
+            // `as usize` saturates: left of the row is its first cell.
+            let i = (x.floor() as usize).min(n - 1);
+            row[i] + (x - i as f64) * (row[i + 1] - row[i])
+        };
+        at(x1) - at(x0)
+    }
+
+    /// The raster's mean over the penumbra round `p` (s-units): the box of
+    /// half-width `soft`, or the disc or ring of that radius, taken row by row,
+    /// each row's band as wide as the shape's area in it (a disc's: its
+    /// integral `disc_area` across the band over the band's height).
+    fn mean(&self, p: Vec2f, soft: f32, penumbra: Penumbra) -> f32 {
+        let cx = ((p.x - self.min.x) / self.side) as f64;
+        let cy = ((p.y - self.min.y) / self.side) as f64;
+        let r = (soft / self.side).max(1.0e-3) as f64;
+        let inner = match penumbra {
+            Penumbra::Round { inner } => inner as f64,
+            Penumbra::Box => 0.0,
+        };
+        let (lo, hi) = (cy - r, cy + r);
+        let mut sum = 0.0f64;
+        let mut j = lo.floor();
+        // The disc's and its hole's area below the band's lower edge, each over its radius squared.
+        let (mut outer_below, mut hole_below) = (disc_area(-1.0), disc_area(-1.0));
+        while j < hi {
+            let (a, b) = (lo.max(j), hi.min(j + 1.0));
+            // max/min: the rows past the raster hold its edge rows.
+            let row = self.row((j.max(0.0) as usize).min(self.ny - 1));
+            sum += match penumbra {
+                Penumbra::Box => (b - a) * CanopyRaster::span(row, cx - r, cx + r),
+                Penumbra::Round { .. } => {
+                    // Half the band's share of the disc (and of its hole), in cells².
+                    let outer_to = disc_area((b - cy) / r);
+                    let outer = 0.5 * r * r * (outer_to - outer_below);
+                    outer_below = outer_to;
+                    let mut band = CanopyRaster::span(row, cx - outer / (b - a), cx + outer / (b - a)) * (b - a);
+                    if inner > 0.0 {
+                        let ri = inner * r;
+                        let hole_to = disc_area(((b - cy) / ri).max(-1.0).min(1.0));
+                        let hole = 0.5 * ri * ri * (hole_to - hole_below);
+                        hole_below = hole_to;
+                        if hole > 0.0 {
+                            band -= CanopyRaster::span(row, cx - hole / (b - a), cx + hole / (b - a)) * (b - a);
+                        }
+                    }
+                    band
+                }
+            };
+            j += 1.0;
+        }
+        (sum / (penumbra.area() * r * r)) as f32
+    }
 }
 
 /// The studio a projected gobo lands on, in units of the camera's height
@@ -389,7 +920,7 @@ impl BackdropGobo {
     pub fn new(lights: &[LightParams], images: &ImageSet) -> Option<BackdropGobo> {
         let light = lights.iter().find(|l| l.key && casts(l)).or_else(|| lights.iter().find(|l| casts(l)))?;
         let (frame, sx, half) = face_axes(light);
-        let gobo = Gobo::new(light.gobo.as_ref()?, half, images)?;
+        let gobo = Gobo::new_with(light.gobo.as_ref()?, half, images, Penumbra::of(light))?;
         // The spot is where a ray as far below the horizon as the light is
         // above it meets the floor: FLOOR_HEIGHT / tan(elevation) out.
         let c = frame.center;
@@ -483,11 +1014,25 @@ mod tests {
         assert!(grid.transmission(vec2f(0.4 / 3.0, 0.0)) < 0.01);
     }
 
-    /// Mean transmission of 10-slat blinds over a 20 degree light.
+    /// Mean transmission of blinds where only their slats hang, n x n
+    /// samples: the band between the rails, over the middle half of the
+    /// width, clear of the ladders, the wand and the pull cord.
+    fn slats_mean(g: &Gobo, n: usize) -> f32 {
+        let blind = g.blind.as_ref().expect("blinds");
+        let mut sum = 0.0f64;
+        for j in 0..n {
+            for i in 0..n {
+                let p = vec2f(0.5 * g.rect.x * ((i as f32 + 0.5) / n as f32 * 2.0 - 1.0), blind.lo + (blind.hi - blind.lo) * (j as f32 + 0.5) / n as f32);
+                sum += g.transmission(p * g.s) as f64;
+            }
+        }
+        (sum / (n * n) as f64) as f32
+    }
+
+    /// Mean transmission of the slats of 10-slat blinds over a 20 degree light.
     fn blinds_mean(tilt_deg: f32) -> f32 {
         let h = 10f32.to_radians().tan();
-        let g = gobo(GoboParams { kind: "blinds".to_string(), slats: 10, tilt_deg, distance: 0.0, ..GoboParams::default() }, vec2f(h, h));
-        mean_over(&g, vec2f(h, h), 200)
+        slats_mean(&gobo(GoboParams { kind: "blinds".to_string(), slats: 10, tilt_deg, distance: 0.0, ..GoboParams::default() }, vec2f(h, h)), 200)
     }
 
     #[test]
@@ -505,7 +1050,7 @@ mod tests {
         let h = 10f32.to_radians().tan();
         let mean = |tilt_deg: f32, slat_width: f32| {
             let p = GoboParams { kind: "blinds".to_string(), slats: 10, tilt_deg, slat_width, distance: 0.0, ..GoboParams::default() };
-            mean_over(&gobo(p, vec2f(h, h)), vec2f(h, h), 200)
+            slats_mean(&gobo(p, vec2f(h, h)), 200)
         };
         // Shut, slats 0.8 pitches wide leave 0.2 of every pitch open; the
         // default 1.08 overlap and pass nothing.
@@ -564,10 +1109,12 @@ mod tests {
     #[test]
     fn a_wider_penumbra_keeps_the_light_a_gobo_passes() {
         // The blur is a box filter of the mask, so it moves light about and
-        // loses none: sharp and soft pass the same share.
+        // loses none: sharp and soft pass the same share. Sampled finely
+        // enough to see a blind's 1.2 mm ladder strings, which a coarser grid
+        // either hits or misses while they are sharp.
         let half = vec2f(0.5, 0.2);
         for kind in ["grid", "blinds"] {
-            let mean = |distance: f32| mean_over(&gobo(GoboParams { kind: kind.to_string(), distance, ..GoboParams::default() }, half), half, 200);
+            let mean = |distance: f32| mean_over(&gobo(GoboParams { kind: kind.to_string(), distance, ..GoboParams::default() }, half), half, 1200);
             let (sharp, soft) = (mean(0.0), mean(1.0));
             assert!(sharp > 0.3 && sharp < 0.99, "{kind}: {sharp}");
             assert!((sharp - soft).abs() < 0.01 * sharp, "{kind}: sharp {sharp}, soft {soft}");

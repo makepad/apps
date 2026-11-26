@@ -1,0 +1,64 @@
+use mod.motion.*
+
+// Characters 2: Character reach. Two characters from the bundled kits each reach for a soft
+// light drifting near them; the same two-bone IK solver as Bones places the hand after pose
+// and grounding, so the feet stay planted and the arm bends naturally. The lights are
+// feathered ellipses (@outer: a crisp core with a halo). Drift runs on live().
+let look = import("shared/motion_deck_look")
+
+let FLOOR_Y = 900.0
+let LEFT_FEET = vec2(640, FLOOR_Y)
+let RIGHT_FEET = vec2(1300, FLOOR_Y)
+let enter = fn(at) { return tween(0, 1, at, at + 1.4, @ease_in_out_cubic) }
+let calm_in = fn() { return smoothstep(0.0, 1.6, live()) }
+
+// Each light drifts on its own slow figure, relative to its character's feet.
+let light_a = fn(t) {
+    let a = live() * 0.35
+    return vec2(150 + 40 * sin(a), -330 + 75 * sin(a * 1.7 + 0.4)) * calm_in() + vec2(110, -170) * (1.0 - calm_in())
+}
+let light_b = fn(t) {
+    let a = live() * 0.29 + 2.0
+    return vec2(-160 + 40 * sin(a * 1.3), -350 + 70 * sin(a)) * calm_in() + vec2(-110, -170) * (1.0 - calm_in())
+}
+let light = fn(name, feet, offset, color, at) {
+    return [
+        Ellipse{name: name + " halo" size: vec2(64, 64) fill: color feather: 36 feather_side: @outer opacity: enter(at)
+            at: fn(t) { feet + offset(t) - vec2(32, 32) }}
+        Ellipse{name: name size: vec2(30, 30) fill: look.BONE opacity: enter(at)
+            at: fn(t) { feet + offset(t) - vec2(15, 15) }}
+    ]
+}
+
+let build_layers = fn() {
+    let layers = [
+        Draw2D{name: "ground" size: vec2(1920, 1080) draw: fn(c, t, edit) { look.ground(c, t, live()) }}
+        Path{name: "floor" svg: "M 0 0 L 1300 0" stroke: look.BONE width: 1 at: vec2(310, FLOOR_Y)
+            opacity: tween(0, 0.2, 0.6, 2.0, @ease_in_out_cubic)}
+        Character{name: "spark" model: @spark at: LEFT_FEET height: 520 seed: 7 blink: 3.4 opacity: enter(0.9)
+            look: {top: #ede6d3 accent: #74d4f2}
+            pose: @idle reach: {hand_r: light_a}}
+        Character{name: "pip" model: @pip at: RIGHT_FEET height: 530 seed: 3 blink: 3.9 facing: @left opacity: enter(1.1)
+            look: {accent: #f0a27a}
+            pose: @idle reach: {hand_r: light_b}}
+    ]
+    for l in light("light a", LEFT_FEET, light_a, look.COOL, 1.4) { layers.push(l) }
+    for l in light("light b", RIGHT_FEET, light_b, look.HOT, 1.5) { layers.push(l) }
+    layers.push(Draw2D{name: "chrome" size: vec2(1920, 1080) draw: fn(c, t, edit) {
+        look.folio(c, t, "07", "Characters and bones")
+        look.heading(c, t, "Characters reach.", "Hands and feet take a target; the same IK runs after pose and walk, so feet stay planted.")
+        look.syntax(c, t, 2.0, "Character{model: @spark  reach: {hand_r: fn(t) {...}}}")
+    }})
+    return layers
+}
+
+Motion{
+    label: "Characters reach"
+    size: vec2(1920, 1080)
+    duration: 600.0
+    fps: 60
+    color: @hdr
+    background: look.INK
+    layers: build_layers()
+    post: look.post_chain(look.POST)
+}

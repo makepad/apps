@@ -1,0 +1,2 @@
+# devhub ci writes proofs into each crate's ci.toml; its merge driver (merge.ci-proof) keeps both sides' proofs.
+ci.toml merge=ci-proof

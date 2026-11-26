@@ -3,7 +3,8 @@
 
 use crate::gesture::{GestureId, Style};
 use crate::proposal::JobId;
-use fab_elec_board::{Board, BoardDelta, Connectivity, RuleMatrix, ZoneFill};
+use fab_elec_board::{Board, BoardDelta, Connectivity, Placed, PortRoom, RuleMatrix, ZoneFill};
+use fab_elec_circuit::Circuit;
 use fab_elec_core::{BBox, BoardId, Canon, ClassId, CompId, ContentHash, LayerSet, NetId};
 use std::sync::Arc;
 
@@ -74,15 +75,16 @@ pub enum Engine {
     Named(String),
 }
 
-/// How hard to try: a deterministic number (candidate transactions per open net, via-reduction
-/// retries), never a wall-clock limit (E6 5.4).
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
-pub struct Effort(pub u32);
-
-impl Default for Effort {
-    fn default() -> Self {
-        Effort(4)
-    }
+/// How hard to try: a declared setting that ends at a step of the algorithm, never at a clock
+/// (E6 5.4). `Full` negotiates (rips up and reroutes) until a whole pass opens no fewer nets;
+/// `Fast` routes each net once and stops there: the nets one pass leaves open, with their
+/// blockers, in seconds, for judging a placement that is about to change. A board that routes at
+/// `Full` cannot fail because a caller asked for `Fast`; it shows what is left to negotiate.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Default)]
+pub enum Effort {
+    #[default]
+    Full,
+    Fast,
 }
 
 /// `elec.route`.
@@ -115,14 +117,81 @@ pub struct RestyleJob {
     pub authored: bool,
 }
 
+/// A published rule for checking a finished placement. Only its factory crosses threads.
+pub trait PlacePlan: Send + Sync {
+    fn open(&self) -> Result<Box<dyn PlacePlanner>, String>;
+}
+
+impl std::fmt::Debug for dyn PlacePlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("PlacePlan") }
+}
+
+impl PartialEq for dyn PlacePlan {
+    fn eq(&self, other: &Self) -> bool { std::ptr::addr_eq(self, other) }
+}
+
+/// One job's instance of the rule, opened and called on its placement worker.
+pub trait PlacePlanner {
+    fn plan(&mut self, board: &Board, circuit: &Circuit) -> Result<PlanVerdict, String>;
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlanVerdict {
+    pub rooms: Vec<PortRoom>,
+    pub refused: Vec<String>,
+    /// Counts of individual pipes, including every channel in a refused group.
+    pub refused_pipes: u32,
+    pub made_pipes: u32,
+}
+
+/// The final offer's guard result. An error before a verdict leaves its prediction absent.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct PlanReport {
+    pub calls: u32,
+    pub replaces: u32,
+    pub made_pipes: Option<u32>,
+    pub refused_pipes: Option<u32>,
+    pub note: Option<String>,
+}
+fab_elec_core::canon_struct!(PlanReport { calls, replaces, made_pipes, refused_pipes, note });
+
+/// One net-length edit on the committed route base.
+#[derive(Clone, PartialEq, Debug)]
+pub struct TuneJob {
+    pub job: JobId,
+    pub unit: BoardId,
+    pub tune: crate::meander::Tune,
+    pub circuit: Arc<Circuit>,
+}
+
+/// A single atomic differential route on the unit's worker base.
+#[derive(Clone, PartialEq, Debug)]
+pub struct PairJob {
+    pub job: JobId,
+    pub unit: BoardId,
+    pub route: crate::pair::Route,
+}
+
 /// `elec.place`.
 #[derive(Clone, PartialEq, Debug)]
 pub struct PlaceJob {
     pub job: JobId,
     pub unit: BoardId,
-    /// The parts to place or legalise; empty is every unlocked part.
+    /// The parts to place or legalise, among the board's and `add`'s; empty is every unlocked part.
     pub scope: Vec<CompId>,
     pub mode: PlaceMode,
+    /// Standing panel parts left out of the requested scope.
+    pub held: u32,
+    /// The unit's latest published port geometry, relative to each component's position in board axes.
+    pub rooms: Vec<PortRoom>,
+    pub plan: Option<Arc<dyn PlacePlan>>,
+    /// Parts of the circuit the board does not place yet, made by the host as the tray's drop
+    /// makes them (footprint, pad nets, body band; ids from the base's `next_item` on), each at
+    /// its spot in the row under the board: the job places them, and its proposal adds each on the
+    /// spot it found, or in that row when it found no room.
+    pub add: Vec<Placed>,
+    /// The unit's circuit: its blocks and intents steer the seed.
+    pub circuit: Arc<Circuit>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Default)]
@@ -144,6 +213,8 @@ pub enum RouteRequest {
     Route(RouteJob),
     Restyle(RestyleJob),
     Place(PlaceJob),
+    Tune(TuneJob),
+    Pair(PairJob),
     /// `elec.route.explain`.
     Explain { unit: BoardId, net: NetId },
     /// Stop a job at its next transaction boundary; its last proposal is legal.

@@ -1,0 +1,110 @@
+use mod.motion.*
+// Audio pictures for Draw2D layers: spectrum bars, a spectrum ring, an oscilloscope line and waveform bars, drawn from a track's sound.
+//
+// They draw lists, so any list works; a track gives them, frame-exact at the edit time
+// (a document reads the track it is placed with, `music(@clip)`):
+//   music(@m).spectrum(edit, n)        n levels 0..1, 30 Hz (first) to 16 kHz (last), log spaced
+//   music(@m).wave(edit, n, window)    n samples -1..1 across `window` seconds centred on `edit`
+//
+//   use mod.motion.modules.spectrum.*
+//   Draw2D{size: vec2(1920, 360) at: vec2(0, 700) draw: fn(c, t, edit) {
+//       spectrum_bars(c, music(@m).spectrum(edit, 48), {w: 1920 h: 360 color: #ff4d12 color2: #ffd27a})
+//   }}
+//   Draw2D{size: vec2(800, 800) at: vec2(560, 140) draw: fn(c, t, edit) {
+//       spectrum_ring(c, music(@m).spectrum(edit, 64), {x: 400 y: 400 r: 180 len: 200})
+//   }}
+//   Draw2D{size: vec2(1920, 300) draw: fn(c, t, edit) { wave_line(c, music(@m).wave(edit, 256, 0.04), {w: 1920 h: 300}) }}
+//
+// Options (all optional): the box `x y w h` (bars, lines) or the centre `x y` with inner
+// radius `r` and longest bar `len` (ring); `color` (low levels) and `color2` (high levels:
+// each bar mixes towards it by its level); `gap` 0..0.9 (share of a bar's slot left empty);
+// `floor` (a level below it draws nothing); `power` (levels^power: over 1 calms the quiet
+// bands, under 1 lifts them); `alpha`; `mirror: true` (bars grow up and down from the middle).
+
+// A level reshaped by the options: clamped, below `floor` nothing, then ^power.
+let level_of = fn(v, o) {
+    let floor = o.floor ?? 0.0
+    let x = clamp((v - floor) / max(1.0 - floor, 0.0001), 0.0, 1.0)
+    return pow(x, o.power ?? 1.5)
+}
+// A colour between o.color (level 0) and o.color2 (level 1), as [r, g, b].
+let level_color = fn(k, o) {
+    let a = o.color ?? #eee9df
+    let b = o.color2 ?? a
+    return [a.r + (b.r - a.r) * k, a.g + (b.g - a.g) * k, a.b + (b.b - a.b) * k]
+}
+
+// Vertical bars, one a level, across the box from the left; they grow from its bottom
+// (or from its middle both ways, `mirror: true`).
+let spectrum_bars = fn(c, levels, o) {
+    let n = levels.len()
+    if n == 0 { return }
+    let x0 = o.x ?? 0.0
+    let y0 = o.y ?? 0.0
+    let w = o.w ?? 1920.0
+    let h = o.h ?? 360.0
+    let slot = w / n
+    let bar = slot * (1.0 - clamp(o.gap ?? 0.25, 0.0, 0.9))
+    let alpha = o.alpha ?? 1.0
+    let mirror = o.mirror ?? false
+    for i in 0..n {
+        let k = level_of(levels[i], o)
+        if k > 0.0 {
+            let x = x0 + i * slot + (slot - bar) * 0.5
+            let len = if mirror { h * 0.5 * k } else { h * k }
+            let y = if mirror { y0 + h * 0.5 - len } else { y0 + h - len }
+            c.rect(x, y, bar, if mirror { len * 2.0 } else { len }, level_color(k, o), alpha)
+        }
+    }
+}
+
+// Bars around a circle: level i points out at angle `turn` + i of n turns (radians,
+// 0 = up, clockwise), from radius r, up to `len` long, `width` wide (default: the gap's share).
+let spectrum_ring = fn(c, levels, o) {
+    let n = levels.len()
+    if n == 0 { return }
+    let cx = o.x ?? 0.0
+    let cy = o.y ?? 0.0
+    let r = o.r ?? 160.0
+    let len = o.len ?? 160.0
+    let turn = o.turn ?? 0.0
+    let width = o.width ?? (6.283185307179586 * r / n * (1.0 - clamp(o.gap ?? 0.35, 0.0, 0.9)))
+    let alpha = o.alpha ?? 1.0
+    for i in 0..n {
+        let k = level_of(levels[i], o)
+        if k > 0.0 {
+            let a = turn + i * 6.283185307179586 / n
+            let dx = sin(a)
+            let dy = 0.0 - cos(a)
+            c.stroke([[cx + dx * r, cy + dy * r], [cx + dx * (r + len * k), cy + dy * (r + len * k)]], width, level_color(k, o), alpha)
+        }
+    }
+}
+
+// An oscilloscope: the samples as one line across the box, 0 on its middle, ±1 at its edges
+// (`gain` scales them), `width` px wide.
+let wave_line = fn(c, samples, o) {
+    let n = samples.len()
+    if n < 2 { return }
+    let x0 = o.x ?? 0.0
+    let y0 = o.y ?? 0.0
+    let w = o.w ?? 1920.0
+    let h = o.h ?? 300.0
+    let gain = o.gain ?? 1.0
+    let pts = []
+    for i in 0..n {
+        pts.push([x0 + w * i / (n - 1), y0 + h * 0.5 - clamp(samples[i] * gain, -1.0, 1.0) * h * 0.5])
+    }
+    c.stroke(pts, o.width ?? 3.0, o.color ?? #eee9df, o.alpha ?? 1.0)
+}
+
+// Waveform bars: each sample's size as a bar mirrored about the box's middle (a podcast's
+// look), coloured by its size like spectrum_bars.
+let wave_bars = fn(c, samples, o) {
+    let levels = []
+    for s in samples { levels.push(abs(s) * (o.gain ?? 1.0)) }
+    spectrum_bars(c, levels, {x: o.x ?? 0.0 y: o.y ?? 0.0 w: o.w ?? 1920.0 h: o.h ?? 300.0 gap: o.gap ?? 0.35
+        color: o.color ?? #eee9df color2: o.color2 ?? (o.color ?? #eee9df) alpha: o.alpha ?? 1.0 power: o.power ?? 1.0 floor: o.floor ?? 0.0 mirror: true})
+}
+
+{spectrum_bars: spectrum_bars spectrum_ring: spectrum_ring wave_line: wave_line wave_bars: wave_bars}

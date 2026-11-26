@@ -13,11 +13,21 @@
 //! clears the selection. Then the control: a double-click on the same part reveals it and the
 //! parts move, so the first check could see a move.
 //!
+//! A drag must show what its drop will take. An agent dragging a band over a row of parts in a
+//! hidden Fab window saw nothing selected. Hold the band to read its selection, cancel it with
+//! Escape, then release the same band and compare its selection with the held one.
+//! A thin band through the resistor takes it when dragged right to left. Reversing the same
+//! band leaves the sheet clear because the window doesn't enclose a body.
+//!
 //! Then the 3D view rings what the other views select and selects what it is clicked on (user,
 //! 11-18: "cross-select with Circuit/Board"): in Board + 3D the device view's recording must name
 //! the resistor the schematic still has selected, and after a click on another part in the board,
 //! that part. With its case off, a click on the resistor's body in the device view (seen from
 //! the top) selects the resistor again.
+//!
+//! Last, back in the Schematic workspace, an example with no circuit (Bistable switch) opened
+//! from File > Examples must empty the sheet (11-22 acceptance: the sheet kept the tone box's
+//! circuit and its parts count while the status bar said there was no circuit on the plate).
 //!
 //! HAL offscreen (`MAKEPAD_HAL_BACKEND=offscreen`), native GPU, no window.
 
@@ -48,6 +58,12 @@ fn schematic_panel() -> Selector {
 /// selected or revealed part.
 fn schematic(app: &TestApp) -> String {
     app.locator(schematic_panel()).try_snapshot().map(|node| node.value.clone()).unwrap_or_default()
+}
+
+/// A single pick names the part in the pane value. A group gives its count.
+fn selection_count(value: &str) -> usize {
+    let Some(picks) = value.rsplit(", ").next().and_then(|field| field.strip_suffix(" selected")) else { return 0 };
+    picks.parse().unwrap_or(1)
 }
 
 /// Every part on screen by its refdes: its semantic node (centre bounds, value). The schematic
@@ -166,7 +182,81 @@ fn a_click_selects_a_part_in_place_and_its_value_is_typed_in_the_card() {
 
         // Escape clears the selection.
         app.press_key(KeyCode::Escape);
-        wait_until(&app, "the selection cleared", || !schematic(&app).contains("selected"));
+        let mut cleared = String::new();
+        wait_until(&app, "the selection cleared", || {
+            cleared = schematic(&app);
+            !cleared.is_empty() && !cleared.contains("selected")
+        });
+
+        // Start on empty sheet above and left of the parts, clear of the strip down the left.
+        let bodies = settled(&app);
+        let panel = app.locator(schematic_panel()).snapshot().bounds;
+        let strip = app.locator(Selector::role(Role::Toolbar).name("Circuit tools")).snapshot().bounds;
+        let (mut left, mut top) = (panel.x + panel.w, panel.y + panel.h);
+        let (mut right, mut bottom) = (panel.x, panel.y);
+        for part in bodies.values() {
+            let (x, y) = part.bounds.center();
+            left = left.min(x);
+            top = top.min(y);
+            right = right.max(x);
+            bottom = bottom.max(y);
+        }
+        let x = (left - 60.0).max(strip.x + strip.w + 2.0).max(panel.x + 2.0);
+        let y = (top - 60.0).max(panel.y + 2.0);
+        let end_x = (right + 60.0).min(panel.x + panel.w - 2.0);
+        let end_y = (bottom + 60.0).min(panel.y + panel.h - 2.0);
+        assert!(x < left && y < top && end_x > right && end_y > bottom,
+            "the sheet has room for a band around the visible parts: panel {panel:?}, strip {strip:?}");
+        let hold_band = || {
+            let mut drag = app.press_at(f64::from(x), f64::from(y));
+            drag.move_by(f64::from(end_x - x), f64::from(end_y - y));
+            drag
+        };
+        let drag = hold_band();
+        let mut held = String::new();
+        wait_until(&app, "a held band shows what it takes before the release", || {
+            held = schematic(&app);
+            held.contains(" selected")
+        });
+        app.press_key(KeyCode::Escape);
+        drag.release();
+        wait_until(&app, "Escape puts the selection from the press back", || schematic(&app) == cleared);
+
+        hold_band().release();
+        wait_until(&app, "the released band takes what the held band showed", || schematic(&app) == held);
+        app.press_key(KeyCode::Escape);
+        wait_until(&app, "Escape clears the released band's selection", || schematic(&app) == cleared);
+
+        // A narrow column from the empty row above the parts (where the first band started) down
+        // through the resistor's centre: dragged right to left it crosses the resistor and takes
+        // it; dragged left to right, 6 points wide, it holds no body whole and takes nothing.
+        let (cx, cy) = part(&app, &resistor).snapshot().bounds.center();
+        let (cx, cy, row) = (f64::from(cx), f64::from(cy), f64::from(y));
+        let mut crossing = app.press_at(cx + 3.0, row);
+        crossing.move_by(-6.0, cy + 3.0 - row);
+        crossing.release();
+        let mut crossed = String::new();
+        wait_until(&app, "a right-to-left band takes a part it crosses", || {
+            crossed = schematic(&app);
+            selection_count(&crossed) > 0
+        });
+        let count = selection_count(&crossed);
+        if count == 1 {
+            assert_eq!(crossed, format!("{cleared}, {resistor} 22k selected"), "the crossing takes the resistor");
+        } else {
+            // A part above it may also be crossed. Shift-clicking the resistor then removes one
+            // member, which proves it was in the group even though the pane only named a count.
+            app.command(HANG, &["click"], &[("x", &cx.to_string()), ("y", &cy.to_string()), ("shift", "1"), ("wait", "1")]);
+            wait_until(&app, "the resistor belongs to the crossed group", || selection_count(&schematic(&app)) == count - 1);
+        }
+        app.press_key(KeyCode::Escape);
+        wait_until(&app, "Escape clears the crossing's selection", || schematic(&app) == cleared);
+        let mut window = app.press_at(cx - 3.0, row);
+        window.move_by(6.0, cy + 3.0 - row);
+        window.release();
+        // (the window's release has landed once a frame has drawn after it)
+        app.locator(schematic_panel()).wait_visible();
+        assert_eq!(schematic(&app), cleared, "the same column dragged left to right holds no body whole and takes nothing");
 
         // The control: a double-click reveals the part, and then the parts do move.
         let start = places(&settled(&app));
@@ -200,6 +290,15 @@ fn a_click_selects_a_part_in_place_and_its_value_is_typed_in_the_card() {
         let (x, y) = resistor_at.expect("the resistor's place in the device view");
         app.press_at(x, y).release();
         wait_until(&app, "the device view's click selecting the resistor", || ringed(&app) == Some(vec![resistor.clone()]));
+
+        // Back in the Schematic workspace, an example with no circuit opened from the File menu
+        // empties the sheet: the schematic says no parts, not the tone box's.
+        workspace_row::press(&app, "Schematic");
+        wait_until(&app, "the tone box's schematic again", || !schematic(&app).is_empty() && !schematic(&app).starts_with("0 parts"));
+        app.locator(Selector::role(Role::Button).name("File")).wait_visible().press();
+        app.locator(Selector::role(Role::MenuItem).name("Examples")).wait_visible().press();
+        app.locator(Selector::role(Role::MenuItem).name("Bistable switch")).wait_visible().press();
+        wait_until(&app, "the empty sheet of an example with no circuit", || schematic(&app) == "0 parts, 0 nets");
     });
     let cleanup = std::fs::remove_dir_all(&dir);
     result.unwrap();

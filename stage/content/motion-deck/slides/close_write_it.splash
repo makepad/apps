@@ -1,0 +1,45 @@
+use mod.motion.*
+
+// The close. A few very soft lights drift on slow orbits behind the last line (feathered
+// ellipses, the deck's first feature, as its last picture); the line and its quiet second
+// line glide in and hold. Everything ambient runs on live().
+let look = import("shared/motion_deck_look")
+
+let LIGHTS = [
+    {x: 520 y: 360 r: 260 orbit: 60 rate: 0.07 phase: 0.0 color: #74d4f2 alpha: 0.10},
+    {x: 1420 y: 300 r: 200 orbit: 80 rate: 0.05 phase: 1.7 color: #5fb9a6 alpha: 0.10},
+    {x: 1180 y: 780 r: 300 orbit: 50 rate: 0.06 phase: 3.1 color: #74d4f2 alpha: 0.08},
+    {x: 380 y: 820 r: 180 orbit: 70 rate: 0.08 phase: 4.4 color: #f0a27a alpha: 0.07},
+    {x: 1680 y: 640 r: 160 orbit: 40 rate: 0.09 phase: 2.4 color: #f0ede6 alpha: 0.05}
+]
+let enter = fn(at, dur) { return tween(0, 1, at, at + dur, @ease_in_out_cubic) }
+
+let build_layers = fn() {
+    let layers = [Draw2D{name: "ground" size: vec2(1920, 1080) draw: fn(c, t, edit) { look.ground(c, t, live()) }}]
+    for l in LIGHTS {
+        layers.push(Ellipse{name: "light" size: vec2(2.0 * l.r, 2.0 * l.r) fill: l.color feather: l.r * 0.9
+            opacity: fn(t) { l.alpha * smoothstep(0.0, 2.5, t) }
+            at: fn(t) { vec2(l.x - l.r + l.orbit * sin(live() * l.rate + l.phase), l.y - l.r + l.orbit * 0.6 * cos(live() * l.rate * 1.3 + l.phase)) }})
+    }
+    layers.push(Text{name: "line" text: "Write it. It moves." font: look.TITLE size: 120 color: look.BONE align: @center
+        at: vec2(960, 380) opacity: enter(0.5, 1.6) y: tween(18, 0, 0.5, 2.1, @ease_in_out_cubic)})
+    layers.push(Text{name: "quiet line" text: "Every slide in this deck is a Splash document you can open, read and change."
+        font: look.SERIF size: 40 color: look.BONE align: @center at: vec2(960, 580)
+        opacity: enter(1.6, 1.6) y: tween(14, 0, 1.6, 3.2, @ease_in_out_cubic)})
+    layers.push(Draw2D{name: "chrome" size: vec2(1920, 1080) draw: fn(c, t, edit) {
+        look.folio(c, t, "16", "Motion")
+        look.label(c, t, 3.0, "content/motion-deck  ·  deck.splash  ·  slides/", 960, 930, {font: look.MONO px: 22 align: @center})
+    }})
+    return layers
+}
+
+Motion{
+    label: "Write it. It moves."
+    size: vec2(1920, 1080)
+    duration: 6.0
+    fps: 60
+    color: @hdr
+    background: look.INK
+    layers: build_layers()
+    post: look.post_chain(look.POST)
+}

@@ -1,0 +1,40 @@
+use mod.motion.*
+
+// Math 1: typesetting. TeX becomes paths in the math face; named parts (\id) keep their
+// colour and travel between the steps of one MatchMorph: (a + b)^2 opens into the product
+// and settles as the expansion, each a and b flying to its new place. Below, the
+// definition of the derivative writes in, primes and all. Beats hold each step.
+let look = import("shared/motion_deck_look")
+
+let STEP_1 = 2.6
+let STEP_2 = 5.2
+let DEFINE_AT = 7.8
+let PARTS = {a: {color: look.COOL} b: {color: look.SEA} a2: {color: look.COOL} b2: {color: look.SEA}}
+
+Motion{
+    label: "Formulas that move"
+    size: vec2(1920, 1080)
+    duration: 10.0
+    fps: 60
+    color: @hdr
+    background: look.INK
+    layers: [
+        Draw2D{name: "ground" size: vec2(1920, 1080) draw: fn(c, t, edit) { look.ground(c, t, live()) }}
+        MatchMorph{name: "expansion" math: true by: @id size: 84 color: look.BONE align: @center at: vec2(960, 430)
+            steps: ["(\\id{a}{a}+\\id{b}{b})^2",
+                "(\\id{a}{a}+\\id{b}{b})(\\id{a2}{a}+\\id{b2}{b})",
+                "\\id{a}{a^2}+2\\id{a2}{a}\\id{b}{b}+\\id{b2}{b^2}"]
+            times: [STEP_1, STEP_2] durations: [1.6, 1.6] parts: PARTS
+            opacity: tween(0, 1, 0.8, 2.0, @ease_in_out_cubic) y: tween(14, 0, 0.8, 2.0, @ease_in_out_cubic)}
+        Math{name: "derivative" tex: "f'(x)=\\lim_{h\\to 0}\\frac{f(x+h)-f(x)}{h}" size: 56 display: true color: look.BONE align: @center
+            at: vec2(960, 660) opacity: tween(0, 1, DEFINE_AT, DEFINE_AT + 1.4, @ease_in_out_cubic)
+            y: tween(14, 0, DEFINE_AT, DEFINE_AT + 1.4, @ease_in_out_cubic)}
+        Draw2D{name: "chrome" size: vec2(1920, 1080) draw: fn(c, t, edit) {
+            look.folio(c, t, "09", "Math")
+            look.heading(c, t, "Formulas that move.", "TeX typesets into paths. Named parts keep their colour and travel from one step to the next.")
+            look.label(c, t, DEFINE_AT + 0.3, "primes, limits and fractions, in the math face", 960, 940, {align: @center})
+            look.syntax(c, t, 2.0, "MatchMorph{math: true  by: @id  steps: [\"(\\id{a}{a}+...)^2\", ...]}")
+        }}
+    ]
+    post: look.post_chain(look.POST)
+}

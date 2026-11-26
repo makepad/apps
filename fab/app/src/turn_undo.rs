@@ -66,6 +66,11 @@ impl TurnUndo {
         self.turns.iter().rev().find(|t| t.calls.contains(&call)).map(|t| t.turn)
     }
 
+    /// A turn's call made step `seq`.
+    pub fn made(&self, seq: u64) -> bool {
+        self.turns.iter().any(|t| t.steps.contains(&seq))
+    }
+
     /// Turn `turn` committed step `seq`.
     pub fn committed(&mut self, turn: u64, seq: u64) {
         let Some(t) = self.turns.iter_mut().find(|t| t.turn == turn) else { return };

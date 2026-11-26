@@ -173,7 +173,7 @@ fn gizmo(app: &TestApp) -> Option<(f64, f64)> {
 
 /// App log lines since `from` that rebuild, re-mesh or trace a new shape.
 fn rebuilds(app: &TestApp, from: u64) -> Vec<String> {
-    let lines = app.log_since(from).map(|t| t.lines).unwrap_or_default();
+    let lines = app.log_since(from).expect("the app's log").lines;
     lines.into_iter().filter(|l| l.contains("fab: placed") || l.contains("fab: edit:") || l.contains("fab: plate scene") || (l.contains("fab vp sdf tiles:") && l.contains("new shape"))).collect()
 }
 

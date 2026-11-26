@@ -1,0 +1,14 @@
+use mod.motion.*
+// Seq3D device showcase with real footage: the laptop plays a Scope screen
+// recording (2730×1904, covered to the lid's 16:10), the phone plays the
+// Notes app run recorded at 1080×1920, shown whole on a 9:16 screen.
+Motion{
+    size: vec2(1920, 1080)
+    duration: 8.0
+    layers: [
+        Seq3D{template: @device_showcase text: "SHIP IT" subtitle: "desktop and phone"
+              video: asset("ast_rdevicelaptopclipaaaaaaaaa", "arev_0000000000000000000000000000000000000000000000000000000000000001")
+              phone_video: asset("ast_rdevicephoneclipaaaaaaaaaa", "arev_0000000000000000000000000000000000000000000000000000000000000002")
+              phone_aspect: 0.5625}
+    ]
+}

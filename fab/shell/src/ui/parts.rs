@@ -10,7 +10,7 @@
 use crate::ui::code::TreeFold;
 use crate::api::*;
 use crate::ui::keymap::{self, ShortcutId as Key};
-use crate::model::state::{part_axes, pose_stretch_about, pose_turn_shift};
+use crate::model::state::{part_axes, pose_stretch_about, pose_turn_shift, Pose};
 use crate::print::colour_map::{FabColorLink, PartPick};
 use crate::print::trays::DrawFabChip;
 use crate::tools::transform::{mm_to_world, shown_part};
@@ -21,6 +21,7 @@ use makepad_widgets_core::widget_tree::CxWidgetExt;
 
 const ADD_MENU: LiveId = live_id!(fab_parts_add);
 const PART_MENU: LiveId = live_id!(fab_parts_context);
+const ORIGIN_FIELD_MAX: f64 = 400.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowKind {
@@ -406,13 +407,17 @@ script_mod! {
         show_bg: true
         draw_bg +: { color: fab.color_editor }
         draw_shade: mod.draw.FabScrollShade{}
-        // the toolbar: the area's editor selector, then the filter
+        // the toolbar: the area's editor selector, the filter, then Arrange's gap (Arrange is the
+        // 3D view's rail's)
         tools := mod.widgets.FabEditorBar{
             // narrows the list to the parts whose names hold every word typed (Add, Feature and
             // Shape stand in the 3D view's bar)
             filter := mod.widgets.FabSearch{
                 width: Fill{min: 60}
                 row +: { input +: { empty_text: "Filter" a11y: {label: "Filter parts"} } }
+            }
+            pack_gap_tip := FabTip{ text: "Arrange's gap: the room it keeps between parts"
+                pack_gap := mod.widgets.ValueInput{width: 84 height: 24 label: "Gap" a11y: {label: "Arrange gap"} min: 0.0 max: 0.0 step: 0.5 precision: 1 suffix: " mm"}
             }
         }
         mod.widgets.FabHr{}
@@ -630,13 +635,19 @@ script_mod! {
                     transform := PropSection{
                         header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/move.svg")}} title +: {text: "Transform"}}}
                         body +: {
+                            // what Position measures from
+                            anchor_row := TransformRow{
+                                label +: {text: "Anchor"}
+                                value +: {anchor := PropDropDown{width: Fill labels: ["Origin" "Centre" "Corner"] a11y: {label: "Position anchor"}}}
+                            }
                             // X and Y side by side, each its axis inside its field
                             xy := TransformRow{
+                                margin: Inset{top: theme.prop_row_gap}
                                 label +: {text: "Position"}
                                 value +: {
                                     flow: Right spacing: 4
-                                    num +: {a11y: {label: "X"} label: "X" min: -50.0 max: 400.0 step: 0.5 snap: 5.0 precision: 1 suffix: " mm"}
-                                    num_y := ValueInput{width: Fill height: Fill min_height: 0 a11y: {label: "Y"} label: "Y" min: -50.0 max: 400.0 step: 0.5 snap: 5.0 precision: 1 suffix: " mm"}
+                                    num +: {a11y: {label: "X"} label: "X" min: -50.0 max: #(ORIGIN_FIELD_MAX) step: 0.5 snap: 5.0 precision: 1 suffix: " mm"}
+                                    num_y := ValueInput{width: Fill height: Fill min_height: 0 a11y: {label: "Y"} label: "Y" min: -50.0 max: #(ORIGIN_FIELD_MAX) step: 0.5 snap: 5.0 precision: 1 suffix: " mm"}
                                 }
                             }
                             rs := View{width: Fill height: Fit flow: Down spacing: theme.prop_row_gap margin: Inset{top: theme.prop_row_gap}
@@ -1285,10 +1296,14 @@ impl Widget for FabPartsPanel {
             self.filter = text;
             self.view.redraw(cx);
         }
+        if let Some(gap) = self.view.value_input(cx, ids!(tools.pack_gap_tip.pack_gap)).ended(actions) {
+            cx.action(PartAction::SetArrangeGap(gap));
+        }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         let Some(state) = scope.data.get::<AppState>() else { return self.view.draw_walk(cx, scope, walk) };
+        self.view.value_input(cx, ids!(tools.pack_gap_tip.pack_gap)).set_value(cx, state.plate.arrange_gap.unwrap_or(8.0));
         self.sync_tree(state);
         self.order.clear();
         if self.filter.trim().is_empty() {
@@ -2090,6 +2105,13 @@ impl Widget for FabPatternDial {
 pub struct FabPartPanel {
     #[deref]
     view: View,
+    /// What the position fields measure from: the part's origin, its footprint's centre or corner.
+    #[rust]
+    anchor: PositionAnchor,
+    #[rust]
+    position_shown: Option<(usize, u64, PositionAnchor, Pose)>,
+    #[rust]
+    shown_xy: [f64; 2],
     /// What `rest` shows besides its setters' values, as it last recorded: the part and its
     /// plate (which of its sections and rows show, its painted colours) and the print colours
     /// (the colour row and the trays read them as they draw).
@@ -2097,9 +2119,29 @@ pub struct FabPartPanel {
     rest_shown: Option<(String, u64, crate::print::colours::Mapping)>,
 }
 
-impl FabPartPanel {
-    fn part<'a>(state: &'a AppState) -> Option<&'a PlatePart> {
-        active_part(state).and_then(|i| state.plate.parts.get(i))
+#[derive(Clone, Copy, Default, PartialEq)]
+pub enum PositionAnchor {
+    #[default]
+    Origin,
+    Centre,
+    Corner,
+}
+
+impl PositionAnchor {
+    fn xy(self, part: &PlatePart) -> [f64; 2] {
+        let [x, y, _] = match self {
+            Self::Origin => part.origin,
+            Self::Centre => part.center(),
+            Self::Corner => part.min_mm,
+        };
+        [x, y]
+    }
+
+    /// The origin move for an edit to one of the panel's two position fields.
+    pub fn place_field(self, part: &PlatePart, axis: usize, value: f64) -> PartAction {
+        let mut at = [part.origin[0], part.origin[1]];
+        at[axis] = value + (at[axis] - self.xy(part)[axis]);
+        PartAction::Place { object: part.object.clone(), at, rotate: part.rotate }
     }
 }
 
@@ -2152,6 +2194,10 @@ impl Widget for FabPartPanel {
         let p = &state.plate.parts[index];
         let object = &p.object;
         let v = &self.view;
+        if v.button(cx, ids!(body.transform.buttons.frame)).clicked(actions) {
+            cx.action(ShellAction::FrameSelected);
+        }
+        if state.slice_blocks_edits() { return; }
         if v.radio_button(cx, ids!(body.transform.rs.scale.trail.lock)).clicked(actions) {
             state.ui.scale_locked = !state.ui.scale_locked;
             crate::ui::redraw(cx, &[ids!(tab_part)]);
@@ -2159,7 +2205,6 @@ impl Widget for FabPartPanel {
         if p.imported_mesh && v.button(cx, ids!(body.transform.buttons.make_printable)).clicked(actions) {
             cx.action(PartAction::MakePrintable { object: object.clone() });
         }
-        // Its Position is its origin (what its `at` places): it turns and scales about that.
         let o = p.origin;
         let x = v.value_input(cx, ids!(body.transform.xy.value.num));
         let y = v.value_input(cx, ids!(body.transform.xy.value.num_y));
@@ -2172,9 +2217,9 @@ impl Widget for FabPartPanel {
         let about = mm_to_world([o[0], o[1], p.min_mm[2]]);
         let zero = vec3(0.0, 0.0, 0.0);
         let pose = if let Some(nx) = x.changed(actions) {
-            Some(pose_turn_shift(zero, 0.0, mm_to_world([nx - o[0], 0.0, 0.0])))
+            Some(pose_turn_shift(zero, 0.0, mm_to_world([nx - self.anchor.xy(p)[0], 0.0, 0.0])))
         } else if let Some(ny) = y.changed(actions) {
-            Some(pose_turn_shift(zero, 0.0, mm_to_world([0.0, ny - o[1], 0.0])))
+            Some(pose_turn_shift(zero, 0.0, mm_to_world([0.0, ny - self.anchor.xy(p)[1], 0.0])))
         } else if let Some(r) = v.value_input(cx, ids!(body.transform.rs.rot.value.num)).changed(actions) {
             Some(pose_turn_shift(about, (r - p.rotate) as f32, zero))
         } else {
@@ -2191,10 +2236,21 @@ impl Widget for FabPartPanel {
         }
         let p = &state.plate.parts[index];
         if let Some(nx) = x.ended(actions) {
-            cx.action(PartAction::Place { object: object.clone(), at: [nx, o[1]], rotate: p.rotate });
+            cx.action(self.anchor.place_field(p, 0, nx));
         }
         if let Some(ny) = y.ended(actions) {
-            cx.action(PartAction::Place { object: object.clone(), at: [o[0], ny], rotate: p.rotate });
+            cx.action(self.anchor.place_field(p, 1, ny));
+        }
+        if let Some(choice) = v.drop_down(cx, ids!(body.transform.anchor)).changed(actions) {
+            self.anchor = match choice { 1 => PositionAnchor::Centre, 2 => PositionAnchor::Corner, _ => PositionAnchor::Origin };
+            // A footprint may extend beyond the origin field's range. Equal limits give
+            // ValueInput an unbounded coordinate with the same scrub step and snap.
+            for field in [x, y] {
+                if let Some(mut f) = field.borrow_mut() {
+                    f.max = if self.anchor == PositionAnchor::Origin { ORIGIN_FIELD_MAX } else { f.min };
+                }
+            }
+            crate::ui::redraw(cx, &[ids!(tab_part)]);
         }
         if let Some(r) = v.value_input(cx, ids!(body.transform.rs.rot.value.num)).ended(actions) {
             cx.action(PartAction::Place { object: object.clone(), at: [o[0], o[1]], rotate: r });
@@ -2218,18 +2274,29 @@ impl Widget for FabPartPanel {
         crate::ui::widgets::apply_section_order(cx, live_id!(part_sections), &rest);
         if let Some(state) = scope.data.get::<AppState>() {
             // As it shows now: a part being placed reads where it is, not where it was.
-            let part = Self::part(state).map(|p| shown_part(state, p));
+            let part = active_part(state).map(|i| (i, shown_part(state, &state.plate.parts[i])));
             self.view.widget(cx, ids!(none)).set_visible(cx, part.is_none());
             if part.is_none() {
                 self.view.label(cx, ids!(none.plate_summary)).set_text(cx, &plate_summary(state));
             }
             // (a widget, not a View: the body is a scroll box with a shadow, `FabScroll`)
             self.view.widget(cx, ids!(body)).set_visible(cx, part.is_some());
-            if let Some(p) = part {
+            if let Some((index, p)) = part {
                 let v = &self.view;
                 v.button(cx, ids!(body.transform.buttons.make_printable)).set_visible(cx, p.imported_mesh);
-                v.value_input(cx, ids!(body.transform.xy.value.num)).set_value(cx, p.origin[0]);
-                v.value_input(cx, ids!(body.transform.xy.value.num_y)).set_value(cx, p.origin[1]);
+                let can_edit = !state.slice_blocks_edits();
+                for id in [ids!(body.transform.xy), ids!(body.transform.rs), ids!(body.transform.anchor_row)] {
+                    v.widget(cx, id).set_visible(cx, can_edit);
+                }
+                v.button(cx, ids!(body.transform.buttons.drop)).set_enabled(cx, can_edit);
+                let position = (index, state.plate.revision, self.anchor, state.scene_state.nudge_of(p.element));
+                if self.position_shown != Some(position) {
+                    self.shown_xy = self.anchor.xy(&p);
+                    self.position_shown = Some(position);
+                }
+                // Each setter leaves a field being edited alone and takes the value on release.
+                v.value_input(cx, ids!(body.transform.xy.value.num)).set_value(cx, self.shown_xy[0]);
+                v.value_input(cx, ids!(body.transform.xy.value.num_y)).set_value(cx, self.shown_xy[1]);
                 v.value_input(cx, ids!(body.transform.rs.rot.value.num)).set_value(cx, p.rotate);
                 v.value_input(cx, ids!(body.transform.rs.scale.value.num)).set_value(cx, p.scale[0] * 100.0);
                 v.value_input(cx, ids!(body.transform.rs.scale.value.num_y)).set_value(cx, p.scale[1] * 100.0);

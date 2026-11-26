@@ -25,9 +25,11 @@ pub struct Rules {
 canon_struct!(Rules { base, custom, checks, waivers });
 
 impl Rules {
-    /// The generic standard 2-layer rules (decision 8).
+    /// A fresh board inherits the four house-sensitive base minima. Only a value
+    /// explicitly set on the board can produce a finer-than-factory warning.
     pub fn standard() -> Rules {
-        Rules { base: RuleSet::standard(), ..Rules::default() }
+        let base = RuleSet { track: None, clearance: None, drill: None, annular: None, ..RuleSet::standard() };
+        Rules { base, ..Rules::default() }
     }
 }
 

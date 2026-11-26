@@ -17,6 +17,8 @@ fab-elec-instr = { path = "../instr" }
 fab-elec-circuit = { path = "../circuit" }
 fab-elec-design = { path = "../design" }
 fab-elec-lang = { path = "../lang" }
+fab-elec-bom = { path = "../bom" }
+fab-elec-req = { path = "../req" }
 fab-elec-parts = { path = "../parts" }
 # Colorimetry (the CIE observer): an LED's colour from its wavelength.
 fab-colour = { path = "../../colour" }

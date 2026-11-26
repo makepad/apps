@@ -1,0 +1,7 @@
+use mod.scene.*; use mod.post
+// 3D transition @cube_flip between two pictures (here images; in a Motion document, 2D layers as named textures).
+Scene3D{ background: #0b0c10
+  camera: Camera{position: vec3(0, 0, 2.5) target: vec3(0, 0, 0) fov: 45}
+  lights: [AmbientLight{intensity: 1}]
+  post: [post.Bloom{strength: 0.4}]
+  children: [Fx{preset: @cube_flip from: file("slide_a.png") to: file("slide_b.png") start: 0.3 duration: 2.8}] }

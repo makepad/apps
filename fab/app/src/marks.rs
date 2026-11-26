@@ -66,7 +66,7 @@ impl App {
     /// The marks leave the view (the chip's clear, a new document): the worker's unsent ones go too.
     pub(super) fn clear_marks(&mut self, cx: &mut Cx) {
         annotate::clear();
-        self.forget_marks();
+        self.forget_marks(true);
         fab::ui::redraw(cx, &[ids!(tool_overlay)]);
     }
 
@@ -74,19 +74,20 @@ impl App {
     pub(super) fn pop_mark(&mut self, cx: &mut Cx) {
         if annotate::pop() {
             if let Some(host) = &mut self.host {
-                host.call("annotate", json::obj(vec![("action", json::s("pop"))]));
+                host.call_as_person("annotate", json::obj(vec![("action", json::s("pop"))]));
             }
             fab::ui::redraw(cx, &[ids!(tool_overlay)]);
         }
     }
 
     /// The worker's marks and the text that went with them go (the view's own are the caller's).
-    pub(super) fn forget_marks(&mut self) {
+    pub(super) fn forget_marks(&mut self, person: bool) {
         self.mark_text = None;
         self.mark_read = None;
         self.mark_calls.clear();
         if let Some(host) = &mut self.host {
-            host.call("annotate", json::obj(vec![("action", json::s("clear"))]));
+            let args = json::obj(vec![("action", json::s("clear"))]);
+            if person { host.call_as_person("annotate", args); } else { host.call("annotate", args); }
         }
     }
 
@@ -135,11 +136,11 @@ impl App {
                     ("camera", camera_json(*camera, rect[0], rect[1])),
                     ("line", Value::Arr(line.iter().map(|p| Value::Arr(vec![Value::F64(p[0]), Value::F64(p[1])])).collect())),
                 ]);
-                let call = host.call("annotate", args);
+                let call = host.call_as_person("annotate", args);
                 self.mark_calls.push((call, *id));
             }
             MarkAction::Pop => self.pop_mark(cx),
-            MarkAction::Clear => self.forget_marks(),
+            MarkAction::Clear => self.forget_marks(true),
             MarkAction::Leave => {
                 self.state.ui.marker = false;
             }

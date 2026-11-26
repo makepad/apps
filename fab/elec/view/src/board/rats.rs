@@ -165,7 +165,8 @@ fn on_board(board: &Board, item: ConnItem) -> Option<P> {
     }
 }
 
-fn append_line(data: &mut Vec<f32>, pa: P, pb: P, t: &StrokeTemplate) {
+/// The ratsnest and placement displacements share this one-device-pixel stroke (thin_alpha = 1).
+pub(super) fn append_line(data: &mut Vec<f32>, pa: P, pb: P, t: &StrokeTemplate) {
     let [ax, ay] = inst::pt(pa);
     let [bx, by] = inst::pt(pb);
     t.append(data, &StrokeInst {
@@ -177,14 +178,14 @@ fn append_line(data: &mut Vec<f32>, pa: P, pb: P, t: &StrokeTemplate) {
     });
 }
 
-fn list(data: Vec<f32>, t: &StrokeTemplate) -> Option<StreamList> {
+pub(super) fn list(data: Vec<f32>, t: &StrokeTemplate) -> Option<StreamList> {
     if data.is_empty() {
         return None;
     }
     match RetainedInstances::from_segments(t.slots(), vec![InstanceSegment::new(data.into())]) {
         Ok(publication) => Some(StreamList::new(publication)),
         Err(e) => {
-            log!("fab.board: a ratsnest stream is not drawn: {e}");
+            log!("fab.board: a hairline stream is not drawn: {e}");
             None
         }
     }

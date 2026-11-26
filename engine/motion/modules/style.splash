@@ -1,0 +1,471 @@
+use mod.motion.*
+// Style kits: a palette, a type pairing, a motion language and the layers a frame gets under and over the author's (`Motion{style: @swiss}`).
+//
+//   use mod.motion.modules.style.*
+//   let k = {w: 1920 h: 1080 cx: 960 cy: 540 m: 65 u: 1080 s: 1
+//            bg: #xf2f0eb ink: #x111111 accent: #xe3001b accent2: #x111111 muted: #xb9b6ae}
+//   Motion{size: vec2(1920, 1080) duration: 4.0 layers: style_kits.swiss.plate(k)}
+//
+// A kit is data and functions. Its look and suits are what the guide says about it; palette is
+// bg (the paper), ink (type), accent, accent2 and muted; display (titles: a Text of size 56 or
+// more) and body (everything smaller) are faces {font (a Font) tracking (a fraction of the
+// size) stretch (Roboto Flex's width)}; upper sets display titles in capitals; label is the Font
+// of `role: @label` Texts; leading the display line height; animate and body_animate the
+// typography animators and speed their pace; text3d the Text3D preset and kinetic the
+// KineticText kit a layer without one gets; fx a vj_fx background (`style: {kit: … fx: true}`).
+// plate (under the author's layers), ornaments and screen (over them) are functions of the
+// frame k: its size w h, centre cx cy, margin m, short side u, that against 1080 s, and the
+// palette as k.bg k.ink k.accent k.accent2 k.muted (with the author's overrides). post is the
+// frame's effects and text_effects what every Text without effects gets.
+
+let swiss = {
+    look: "Swiss grid: off-white paper, a 12-column hairline grid drawing down, a red disc, tight black grotesque"
+    suits: "product launches, explainers, design and architecture, clean corporate"
+    palette: {bg: #xf2f0eb ink: #x111111 accent: #xe3001b accent2: #x111111 muted: #xb9b6ae}
+    display: {font: Font{family: "Inter" weight: 900} tracking: -0.035}
+    body: {font: Font{family: "Inter" weight: 500} tracking: 0}
+    upper: false
+    label: Font{family: "JetBrains Mono"}
+    leading: 0.95
+    animate: @mask_up
+    body_animate: @fade_up
+    speed: 1.1
+    text3d: "slab_stack"
+    kinetic: "342_title_card"
+    fx: ""
+    plate: fn(k) { [
+        Rect{name: "paper" size: vec2(k.w, k.h) fill: k.bg}
+        Repeat{name: "columns" count: 13 layout: @grid columns: 13 spacing: vec2((k.w - k.m * 2) / 12, 0) at: vec2(k.m, 0) delay: 0.03
+            layer: Rect{size: vec2(2, k.h) fill: k.muted opacity: 0.5 anchor: vec2(0.5, 0) scale: tween(vec2(1, 0), vec2(1, 1), 0.0, 0.9, @ease_out_cubic)}}
+        Rect{name: "baseline" at: vec2(k.m, k.h - k.m) size: vec2(k.w - k.m * 2, 3) fill: k.ink anchor: vec2(0, 0.5) scale: tween(vec2(0, 1), vec2(1, 1), 0.1, 0.9, @ease_out_expo)}
+        Ellipse{name: "red disc" at: vec2(k.w - k.m - k.u * 0.3, k.m) size: vec2(k.u * 0.3, k.u * 0.3) fill: k.accent scale: tween(0, 1, 0.15, 0.75, @ease_out_back)}
+    ] }
+    ornaments: fn(k) { [
+        Text{name: "index" text: "01" font: Font{family: "Inter" weight: 700} size: 30 * k.s color: k.ink at: vec2(k.m, k.m + 30 * k.s) opacity: tween(0, 1, 0.3, 0.6)}
+        Path{name: "register" svg: "M -14 0 L 14 0 M 0 -14 L 0 14" stroke: k.ink width: 2 at: vec2(k.w - k.m, k.h - k.m * 1.6) scale: k.s opacity: tween(0, 1, 0.3, 0.6)}
+    ] }
+    screen: fn(k) { [] }
+    post: [Effect{name: @grain amount: 0.025 size: 1.2}]
+    text_effects: []
+}
+
+let brutalist = {
+    look: "Brutalist: raw concrete grey, a thick black frame, a hard orange slab slamming in, hatching, a barcode and a heavy arrow; condensed caps and mono"
+    suits: "hype drops, streetwear, manifestos, bold statements"
+    palette: {bg: #xe4e4dc ink: #x0a0a0a accent: #xff3d00 accent2: #x1f3dff muted: #x9a9a92}
+    display: {font: Font{family: "Anton" weight: 400} tracking: 0.01}
+    body: {font: Font{family: "JetBrains Mono" weight: 700} tracking: 0}
+    upper: true
+    label: Font{family: "JetBrains Mono"}
+    leading: 0.72
+    animate: @rise
+    body_animate: @typewriter
+    speed: 1.8
+    text3d: "word_punch"
+    kinetic: "344_pow_burst"
+    fx: ""
+    plate: fn(k) { [
+        Rect{name: "concrete" size: vec2(k.w, k.h) fill: k.bg}
+        Pattern{name: "hatch" kind: @hatch color: k.muted cell: 18 weight: 0.35 at: vec2(k.w * 0.66, 0) size: vec2(k.w * 0.34, k.h) opacity: 0.55}
+        Rect{name: "slab" at: vec2(0, k.h * 0.72) size: vec2(k.w * 0.58, k.h * 0.28) fill: k.accent x: keys([0, 0 - k.w * 0.6], [0.35, 0, @ease_out_expo])}
+        Rect{name: "frame" at: vec2(k.m * 0.5, k.m * 0.5) size: vec2(k.w - k.m, k.h - k.m) fill: #x00000000 stroke: k.ink width: 14 * k.s}
+    ] }
+    ornaments: fn(k) { [
+        Path{name: "arrow" svg: "M 0 0 L 120 0 M 84 -36 L 120 0 L 84 36" stroke: k.ink width: 12 at: vec2(k.w - k.m * 2.8, k.h - k.m * 1.6) scale: k.s trim_end: tween(0, 1, 0.25, 0.55, @ease_out_expo)}
+        Repeat{name: "barcode" count: 16 layout: @grid columns: 16 spacing: vec2(11 * k.s, 0) at: vec2(k.m * 1.2, k.m * 1.2) jitter: {x: 5 * k.s} seed: 3
+            layer: Rect{size: vec2(5 * k.s, 70 * k.s) fill: k.ink}}
+    ] }
+    screen: fn(k) { [] }
+    post: [Effect{name: @grain amount: 0.05 size: 1.6}]
+    text_effects: []
+}
+
+let editorial = {
+    look: "Editorial serif: cream paper, magazine rules drawing across, a masthead and issue number, a high-contrast serif over a humanist sans"
+    suits: "stories, interviews, quotes, culture, long reads"
+    palette: {bg: #xf4eee4 ink: #x1c1a17 accent: #x8e2a1d accent2: #xb89560 muted: #x9c9385}
+    display: {font: Font{family: "Playfair Display" weight: 700} tracking: -0.01}
+    body: {font: Font{family: "IBM Plex Sans" weight: 400} tracking: 0}
+    upper: false
+    label: Font{family: "IBM Plex Sans"}
+    leading: 0.85
+    animate: @rise
+    body_animate: @fade_up
+    speed: 0.85
+    text3d: "cinematic_serif"
+    kinetic: "349_book_lines"
+    fx: ""
+    plate: fn(k) { [
+        Rect{name: "paper" size: vec2(k.w, k.h) fill: k.bg}
+        Rect{name: "top rule" at: vec2(k.m, k.m) size: vec2(k.w - k.m * 2, 3) fill: k.ink anchor: vec2(0, 0.5) scale: tween(vec2(0, 1), vec2(1, 1), 0.0, 1.2, @ease_in_out_cubic)}
+        Rect{name: "hairline" at: vec2(k.m, k.m + 12 * k.s) size: vec2(k.w - k.m * 2, 1) fill: k.ink anchor: vec2(0, 0.5) scale: tween(vec2(0, 1), vec2(1, 1), 0.15, 1.35, @ease_in_out_cubic)}
+        Rect{name: "bottom rule" at: vec2(k.m, k.h - k.m) size: vec2(k.w - k.m * 2, 1.5) fill: k.ink anchor: vec2(1, 0.5) scale: tween(vec2(0, 1), vec2(1, 1), 0.2, 1.4, @ease_in_out_cubic)}
+    ] }
+    ornaments: fn(k) { [
+        Text{name: "masthead" text: "THE REVIEW" font: Font{family: "IBM Plex Sans" weight: 600} size: 20 * k.s tracking: 6 * k.s color: k.ink at: vec2(k.m, k.m - 30 * k.s) opacity: tween(0, 1, 0.4, 1.0)}
+        Text{name: "issue" text: "No. 07" font: Font{family: "Playfair Display" italic: true} size: 24 * k.s color: k.accent align: @right at: vec2(k.w - k.m, k.m - 30 * k.s) opacity: tween(0, 1, 0.5, 1.1)}
+        Text{name: "folio" text: "— 12 —" font: Font{family: "Playfair Display"} size: 20 * k.s color: k.muted align: @center at: vec2(k.cx, k.h - k.m + 36 * k.s) opacity: tween(0, 1, 0.6, 1.2)}
+    ] }
+    screen: fn(k) { [] }
+    post: [
+        Effect{name: @grain amount: 0.035 size: 1.3}
+        Effect{name: @vignette amount: 0.12 feather: 0.8}
+    ]
+    text_effects: []
+}
+
+let retro70s = {
+    look: "Retro 70s: warm cream, a rust-orange-mustard-olive rainbow unrolling, a slow sun, bouncy extended type, film grain"
+    suits: "music, food, nostalgia, summer, lifestyle"
+    palette: {bg: #xf1e0bf ink: #x3a2215 accent: #xe2622b accent2: #xf0a531 muted: #x9c3d1c}
+    display: {font: Font{family: "Roboto Flex" weight: 900} tracking: -0.01 stretch: 130}
+    body: {font: Font{family: "Inter" weight: 600} tracking: 0}
+    upper: false
+    label: Font{family: "JetBrains Mono"}
+    leading: 0.95
+    animate: @elastic
+    body_animate: @fade_up
+    speed: 0.9
+    text3d: "puffy_pop"
+    kinetic: "378_puffy_pop"
+    fx: "vjfx/301_swell_sun"
+    plate: fn(k) { [
+        Rect{name: "paper" size: vec2(k.w, k.h) fill: k.bg}
+        Group{name: "rainbow" at: vec2(k.w - k.u * 0.62, k.h * 0.38) layers: [
+            Ellipse{size: vec2(k.u * 1.24, k.u * 1.24) fill: #x00000000 stroke: k.muted width: k.u * 0.07 trim_end: tween(0, 1, 0.0, 1.2, @ease_out_cubic)}
+            Ellipse{at: vec2(k.u * 0.07, k.u * 0.07) size: vec2(k.u * 1.1, k.u * 1.1) fill: #x00000000 stroke: k.accent width: k.u * 0.07 trim_end: tween(0, 1, 0.1, 1.3, @ease_out_cubic)}
+            Ellipse{at: vec2(k.u * 0.14, k.u * 0.14) size: vec2(k.u * 0.96, k.u * 0.96) fill: #x00000000 stroke: k.accent2 width: k.u * 0.07 trim_end: tween(0, 1, 0.2, 1.4, @ease_out_cubic)}
+            Ellipse{at: vec2(k.u * 0.21, k.u * 0.21) size: vec2(k.u * 0.82, k.u * 0.82) fill: #x00000000 stroke: #x6b7a34 width: k.u * 0.07 trim_end: tween(0, 1, 0.3, 1.5, @ease_out_cubic)}
+        ]}
+    ] }
+    ornaments: fn(k) { [Vector{name: "sun" icon: "weather/sun" size: vec2(k.u * 0.14, k.u * 0.14) fill: k.accent stroke: k.accent at: vec2(k.m, k.m) rotate: tween(0, 90, 0, 12) scale: tween(0, 1, 0.2, 0.9, @ease_out_back)}] }
+    screen: fn(k) { [] }
+    post: [
+        Effect{name: @grain amount: 0.07 size: 1.8}
+        Effect{name: @vignette amount: 0.35 feather: 0.7}
+    ]
+    text_effects: []
+}
+
+let y2k = {
+    look: "Y2K chrome: midnight blue, a pink glow, a drifting cyan grid floor, twinkling sparkles, extended caps with glow and a chromatic fringe"
+    suits: "tech launches, music drops, gaming, fashion, anything glossy"
+    palette: {bg: #x0b0b24 ink: #xeef4ff accent: #x8ef6ff accent2: #xff6ef2 muted: #x3a3d7a}
+    display: {font: Font{family: "Roboto Flex" weight: 900} tracking: 0 stretch: 125}
+    body: {font: Font{family: "Inter" weight: 600} tracking: 0}
+    upper: true
+    label: Font{family: "JetBrains Mono"}
+    leading: 0.95
+    animate: @pop
+    body_animate: @blur_in
+    speed: 1.1
+    text3d: "chrome_title"
+    kinetic: "338_chrome_text"
+    fx: "vjfx/09_synthwave"
+    plate: fn(k) { [
+        Rect{name: "night" size: vec2(k.w, k.h) fill: k.bg}
+        Ellipse{name: "glow" at: vec2(k.cx - k.u * 0.6, k.cy - k.u * 0.6) size: vec2(k.u * 1.2, k.u * 1.2) fill: k.accent2 opacity: 0.35 blur: k.u * 0.18}
+        Pattern{name: "grid floor" kind: @grid color: k.accent cell: k.u * 0.06 weight: 0.06 at: vec2(0, k.h * 0.62) size: vec2(k.w, k.h * 0.38) opacity: 0.45 speed: 0.4}
+    ] }
+    ornaments: fn(k) { [
+        Repeat{name: "sparkles" count: 7 layout: @grid columns: 7 spacing: vec2(k.w / 7, 0) at: vec2(k.w / 14, k.h * 0.12) jitter: {x: k.w * 0.04 y: k.h * 0.5 scale: 0.8} seed: 5 delay: 0.18
+            layer: Vector{icon: "stage/sparkle" size: vec2(k.u * 0.05, k.u * 0.05) fill: k.ink stroke: k.ink scale: repeat(keys([0, 0.2], [0.5, 1.0, @ease_out_back], [1.4, 0.2, @ease_in_out_sine]), 1.4, @restart)}}
+    ] }
+    screen: fn(k) { [] }
+    post: [
+        Effect{name: @glow threshold: 0.55 radius: 22 intensity: 1.1}
+        Effect{name: @chromatic_aberration amount: 2.5}
+        Effect{name: @grain amount: 0.04 size: 1.2}
+    ]
+    text_effects: []
+}
+
+let riso = {
+    look: "Risograph print: paper stock, fluoro-pink and yellow shapes overprinting, blue ink, everything screened to halftone dots, grain and misregistration"
+    suits: "zines, events, indie brands, posters, art"
+    palette: {bg: #xf3eddd ink: #x1f4196 accent: #xff4fae accent2: #xffd400 muted: #xcbc3ae}
+    display: {font: Font{family: "Anton" weight: 400} tracking: 0.02}
+    body: {font: Font{family: "IBM Plex Sans" weight: 600} tracking: 0}
+    upper: true
+    label: Font{family: "JetBrains Mono"}
+    leading: 0.72
+    animate: @rise
+    body_animate: @wipe
+    speed: 1.0
+    text3d: "extrude_in"
+    kinetic: "364_text_stripes"
+    fx: ""
+    plate: fn(k) { [
+        Rect{name: "paper" size: vec2(k.w, k.h) fill: k.bg}
+        Ellipse{name: "pink disc" at: vec2(k.w * 0.55, k.h * 0.08) size: vec2(k.u * 0.7, k.u * 0.7) fill: k.accent blend: @multiply opacity: 0.9 scale: tween(0.6, 1, 0.0, 1.0, @ease_out_cubic)}
+        Rect{name: "yellow block" at: vec2(k.w * 0.08, k.h * 0.5) size: vec2(k.w * 0.42, k.u * 0.36) fill: k.accent2 blend: @multiply rotate: -4 x: tween(0 - k.w * 0.1, 0, 0.0, 0.9, @ease_out_cubic)}
+    ] }
+    ornaments: fn(k) { [] }
+    screen: fn(k) { [Pattern{name: "style.screen halftone" kind: @halftone color2: k.bg cell: 7 * k.s weight: 1.0 size: vec2(k.w, k.h)}] }
+    post: [
+        Effect{name: @chromatic_aberration amount: 2}
+        Effect{name: @grain amount: 0.1 size: 1.6}
+    ]
+    text_effects: []
+}
+
+let blueprint = {
+    look: "Blueprint: cyanotype blue, a fine and a coarse grid, a datum circle and dimension line drawing on, a title block; technical caps and mono"
+    suits: "engineering, architecture, product teardown, how-it-works"
+    palette: {bg: #x0e3a70 ink: #xeaf3ff accent: #xffffff accent2: #x8fbfff muted: #x3e6ea6}
+    display: {font: Font{family: "IBM Plex Sans" weight: 600} tracking: 0.04}
+    body: {font: Font{family: "JetBrains Mono" weight: 400} tracking: 0.02}
+    upper: true
+    label: Font{family: "JetBrains Mono"}
+    leading: 0.95
+    animate: @wipe
+    body_animate: @typewriter
+    speed: 1.0
+    text3d: "wireframe"
+    kinetic: "321_typewriter"
+    fx: ""
+    plate: fn(k) { [
+        Rect{name: "sheet" size: vec2(k.w, k.h) fill: k.bg}
+        Pattern{name: "fine grid" kind: @grid color: k.muted cell: k.u * 0.025 weight: 0.08 size: vec2(k.w, k.h) opacity: 0.55}
+        Pattern{name: "grid" kind: @grid color: k.accent2 cell: k.u * 0.125 weight: 0.05 size: vec2(k.w, k.h) opacity: 0.5}
+    ] }
+    ornaments: fn(k) { [
+        Ellipse{name: "datum circle" at: vec2(k.w - k.m - k.u * 0.3, k.cy - k.u * 0.15) size: vec2(k.u * 0.3, k.u * 0.3) fill: #x00000000 stroke: k.accent2 width: 2 trim_end: tween(0, 1, 0.2, 1.4, @ease_in_out_cubic)}
+        Path{name: "crosshair" svg: "M -190 0 L 190 0 M 0 -190 L 0 190" stroke: k.accent2 width: 1.5 at: vec2(k.w - k.m - k.u * 0.15, k.cy) scale: k.s opacity: tween(0, 0.8, 0.6, 1.2)}
+        Path{name: "dimension" svg: "M 0 0 L 0 -18 M 0 -9 L 400 -9 M 400 0 L 400 -18 M 0 -9 L 14 -15 M 0 -9 L 14 -3 M 400 -9 L 386 -15 M 400 -9 L 386 -3" stroke: k.accent2 width: 2 at: vec2(k.m, k.h - k.m) scale: k.s trim_end: tween(0, 1, 0.4, 1.4, @ease_in_out_cubic)}
+        Rect{name: "title block" at: vec2(k.w - k.m - 340 * k.s, k.h - k.m - 110 * k.s) size: vec2(340 * k.s, 110 * k.s) fill: #x00000000 stroke: k.ink width: 2 opacity: tween(0, 1, 0.5, 1.0)}
+        Text{name: "sheet" text: "SHEET 1/1  REV A" font: Font{family: "JetBrains Mono"} size: 18 * k.s color: k.ink at: vec2(k.w - k.m - 320 * k.s, k.h - k.m - 50 * k.s) opacity: tween(0, 1, 0.7, 1.2)}
+    ] }
+    screen: fn(k) { [] }
+    post: [
+        Effect{name: @grain amount: 0.03 size: 1.2}
+        Effect{name: @vignette amount: 0.35 feather: 0.7}
+    ]
+    text_effects: []
+}
+
+let neon_noir = {
+    look: "Neon noir: near-black night, falling cyan rain, a magenta neon frame flickering on, glowing condensed caps, fringe and vignette"
+    suits: "thrillers, nightlife, gaming, synth music, trailers"
+    palette: {bg: #x07060e ink: #xf4f1ff accent: #xff2d8a accent2: #x19e6ff muted: #x2a2042}
+    display: {font: Font{family: "Anton" weight: 400} tracking: 0.05}
+    body: {font: Font{family: "Inter" weight: 500} tracking: 0}
+    upper: true
+    label: Font{family: "JetBrains Mono"}
+    leading: 0.75
+    animate: @blur_in
+    body_animate: @fade_up
+    speed: 0.9
+    text3d: "neon_sign"
+    kinetic: "374_neon_tube"
+    fx: "vjfx/312_light_neon_tubes"
+    plate: fn(k) { [
+        Rect{name: "night" size: vec2(k.w, k.h) fill: k.bg}
+        Repeat{name: "rain" count: 90 layout: @grid columns: 30 spacing: vec2(k.w / 30, k.h / 3) seed: 9 jitter: {x: k.w / 30 y: k.h / 3} delay: 0.037
+            layer: Rect{size: vec2(2, k.u * 0.05) fill: k.accent2 opacity: 0.25 y: repeat(tween(0 - k.h * 0.35, k.h * 0.35, 0, 0.9), 0.9, @restart)}}
+        Rect{name: "neon frame" at: vec2(k.m, k.m) size: vec2(k.w - k.m * 2, k.h - k.m * 2) radius: 12 fill: #x00000000 stroke: k.accent width: 5 trim_end: tween(0, 1, 0.1, 1.2, @ease_in_out_cubic) opacity: keys([0, 0], [0.1, 1], [0.16, 0.3], [0.22, 1])}
+    ] }
+    ornaments: fn(k) { [Path{name: "tube" svg: "M 0 0 L 260 0" stroke: k.accent2 width: 6 cap: @round at: vec2(k.m * 1.6, k.h - k.m * 1.8) scale: k.s trim_end: tween(0, 1, 0.5, 1.1, @ease_out_cubic)}] }
+    screen: fn(k) { [] }
+    post: [
+        Effect{name: @glow threshold: 0.7 radius: 18 intensity: 0.8}
+        Effect{name: @chromatic_aberration amount: 1.5}
+        Effect{name: @vignette amount: 0.55 feather: 0.6}
+        Effect{name: @grain amount: 0.06 size: 1.4}
+    ]
+    text_effects: []
+}
+
+let paper_cutout = {
+    look: "Paper cutout: craft paper, layered hills and a sun cut from coloured card with soft shadows, a drifting cloud, hand-lettered titles"
+    suits: "kids, education, storytelling, friendly brands, crafts"
+    palette: {bg: #xf6e7d2 ink: #x2a2a2a accent: #xee6c4d accent2: #x3f9fa3 muted: #xf2bf4a}
+    display: {font: Font{family: "LXGW WenKai" weight: 700} tracking: 0}
+    body: {font: Font{family: "Inter" weight: 600} tracking: 0}
+    upper: false
+    label: Font{family: "JetBrains Mono"}
+    leading: 0.9
+    animate: @pop
+    body_animate: @fade_up
+    speed: 0.9
+    text3d: "clay"
+    kinetic: "376_soft_plastic"
+    fx: ""
+    plate: fn(k) { [
+        Rect{name: "paper" size: vec2(k.w, k.h) fill: k.bg}
+        Ellipse{name: "sun" at: vec2(k.w * 0.72, k.h * 0.1) size: vec2(k.u * 0.26, k.u * 0.26) fill: k.muted y: tween(k.h * 0.2, 0, 0.0, 0.9, @ease_out_back) effects: [Effect{name: @drop_shadow distance: 8 radius: 6 opacity: 0.3}]}
+        Path{name: "back hill" svg: "M 0 180 C 300 0, 600 0, 960 140 C 1300 260, 1600 40, 1920 100 L 1920 480 L 0 480 Z" fill: k.accent2 anchor: vec2(0, 0) scale: vec2(k.w / 1920, k.s) at: vec2(0, k.h - 470 * k.s) y: tween(200 * k.s, 0, 0.0, 0.8, @ease_out_cubic) effects: [Effect{name: @drop_shadow distance: 8 radius: 8 opacity: 0.3}]}
+        Path{name: "front hill" svg: "M 0 120 C 400 260, 800 0, 1200 90 C 1500 160, 1700 60, 1920 150 L 1920 300 L 0 300 Z" fill: k.accent anchor: vec2(0, 0) scale: vec2(k.w / 1920, k.s) at: vec2(0, k.h - 290 * k.s) y: tween(200 * k.s, 0, 0.12, 0.9, @ease_out_cubic) effects: [Effect{name: @drop_shadow distance: 8 radius: 8 opacity: 0.3}]}
+    ] }
+    ornaments: fn(k) { [Vector{name: "cloud" icon: "weather/cloud" size: vec2(k.u * 0.16, k.u * 0.16) fill: #xffffff stroke: k.ink at: vec2(k.w * 0.1, k.h * 0.1) x: tween(0, k.w * 0.05, 0, 6) effects: [Effect{name: @drop_shadow distance: 6 radius: 5 opacity: 0.25}]}] }
+    screen: fn(k) { [] }
+    post: [Effect{name: @grain amount: 0.05 size: 1.5}]
+    text_effects: [Effect{name: @drop_shadow distance: 6 radius: 4 opacity: 0.3}]
+}
+
+let bauhaus = {
+    look: "Bauhaus: cream stock, a red circle, blue square and yellow triangle springing in, a black bar, geometric sans"
+    suits: "art and design, architecture, education, bold explainers"
+    palette: {bg: #xefe7d6 ink: #x161616 accent: #xd42a1c accent2: #x1d4f9e muted: #xf1b400}
+    display: {font: Font{family: "Roboto Flex" weight: 900} tracking: -0.02}
+    body: {font: Font{family: "Inter" weight: 500} tracking: 0}
+    upper: false
+    label: Font{family: "JetBrains Mono"}
+    leading: 0.95
+    animate: @pop
+    body_animate: @wipe
+    speed: 1.0
+    text3d: "slab_stack"
+    kinetic: "405_letter_snap"
+    fx: ""
+    plate: fn(k) { [
+        Rect{name: "paper" size: vec2(k.w, k.h) fill: k.bg}
+        Ellipse{name: "red circle" at: vec2(k.w - k.u * 0.62, k.h * 0.08) size: vec2(k.u * 0.5, k.u * 0.5) fill: k.accent scale: tween(0, 1, 0.0, 0.6, @ease_out_back)}
+        Rect{name: "blue square" at: vec2(k.w - k.u * 0.36, k.h * 0.46) size: vec2(k.u * 0.3, k.u * 0.3) fill: k.accent2 rotate: tween(-90, 0, 0.12, 0.8, @ease_out_back) scale: tween(0, 1, 0.12, 0.7, @ease_out_back)}
+        Path{name: "yellow triangle" svg: "M 0 300 L 170 0 L 340 300 Z" fill: k.muted at: vec2(k.w - k.u * 0.74, k.h * 0.6) scale: tween(0, k.s, 0.24, 0.9, @ease_out_back)}
+        Rect{name: "black bar" at: vec2(k.m, k.h - k.m - 18 * k.s) size: vec2(k.w * 0.4, 18 * k.s) fill: k.ink anchor: vec2(0, 0.5) scale: tween(vec2(0, 1), vec2(1, 1), 0.3, 0.9, @ease_out_expo)}
+    ] }
+    ornaments: fn(k) { [Ellipse{name: "dot" at: vec2(k.m, k.m) size: vec2(34 * k.s, 34 * k.s) fill: k.ink scale: tween(0, 1, 0.4, 0.8, @ease_out_back)}] }
+    screen: fn(k) { [] }
+    post: [Effect{name: @grain amount: 0.035 size: 1.3}]
+    text_effects: []
+}
+
+let terminal = {
+    look: "Data terminal: black CRT, phosphor-green mono typed on, a grid, corner brackets, a blinking REC status, a live level meter, scanlines and glow"
+    suits: "tech, security, data, dev tools, hacker stories"
+    palette: {bg: #x040a05 ink: #x3dff6e accent: #xc8ff3d accent2: #x19c8ff muted: #x0f3d1b}
+    display: {font: Font{family: "JetBrains Mono" weight: 700} tracking: 0.02}
+    body: {font: Font{family: "JetBrains Mono" weight: 400} tracking: 0}
+    upper: true
+    label: Font{family: "JetBrains Mono"}
+    leading: 0.95
+    animate: @typewriter
+    body_animate: @typewriter
+    speed: 1.4
+    text3d: "counter_roll"
+    kinetic: "351_matrix_rain"
+    fx: "vjfx/351_matrix_rain"
+    plate: fn(k) { [
+        Rect{name: "screen" size: vec2(k.w, k.h) fill: k.bg}
+        Pattern{name: "grid" kind: @grid color: k.muted cell: k.u * 0.05 weight: 0.05 size: vec2(k.w, k.h) opacity: 0.8}
+    ] }
+    ornaments: fn(k) { [
+        Path{name: "bracket tl" svg: "M 0 60 L 0 0 L 60 0" stroke: k.ink width: 4 at: vec2(k.m, k.m) scale: k.s}
+        Path{name: "bracket tr" svg: "M -60 0 L 0 0 L 0 60" stroke: k.ink width: 4 at: vec2(k.w - k.m, k.m) scale: k.s}
+        Path{name: "bracket bl" svg: "M 0 -60 L 0 0 L 60 0" stroke: k.ink width: 4 at: vec2(k.m, k.h - k.m) scale: k.s}
+        Path{name: "bracket br" svg: "M -60 0 L 0 0 L 0 -60" stroke: k.ink width: 4 at: vec2(k.w - k.m, k.h - k.m) scale: k.s}
+        Text{name: "status" text: "● REC   SYS/OK" font: Font{family: "JetBrains Mono"} size: 20 * k.s color: k.accent align: @right at: vec2(k.w - k.m - 20 * k.s, k.m + 40 * k.s) opacity: repeat(keys([0, 1], [0.6, 0.25, @hold]), 1.2, @restart)}
+        Repeat{name: "meter" count: 12 layout: @grid columns: 12 spacing: vec2(14 * k.s, 0) at: vec2(k.m + 20 * k.s, k.h - k.m - 80 * k.s) delay: 0.07
+            layer: Rect{size: vec2(8 * k.s, 60 * k.s) fill: k.ink anchor: vec2(0.5, 1) scale: repeat(keys([0, vec2(1, 0.3)], [0.4, vec2(1, 1), @ease_out_cubic], [0.8, vec2(1, 0.3), @ease_in_cubic]), 0.8, @restart)}}
+    ] }
+    screen: fn(k) { [Pattern{name: "style.screen scanlines" kind: @stripes color: #x000000 cell: 4 weight: 0.45 angle: 90 size: vec2(k.w, k.h) opacity: 0.35}] }
+    post: [
+        Effect{name: @glow threshold: 0.4 radius: 14 intensity: 0.9}
+        Effect{name: @chromatic_aberration amount: 1.2}
+        Effect{name: @vignette amount: 0.6 feather: 0.6}
+        Effect{name: @grain amount: 0.05 size: 1.2}
+    ]
+    text_effects: []
+}
+
+let luxury = {
+    look: "Luxury minimal: warm black, a slow pool of light, one gold hairline and a diamond, widely tracked Garamond caps closing in slowly"
+    suits: "fashion, jewellery, hotels, perfume, premium launches"
+    palette: {bg: #x0d0c0a ink: #xefe7d4 accent: #xc9a86a accent2: #x6f6048 muted: #x26231e}
+    display: {font: Font{family: "Cormorant Garamond" weight: 400} tracking: 0.2}
+    body: {font: Font{family: "Inter" weight: 400} tracking: 0.04}
+    upper: true
+    label: Font{family: "Inter"}
+    leading: 0.95
+    animate: @tracking
+    body_animate: @fade_up
+    speed: 0.6
+    text3d: "gold_foil"
+    kinetic: "373_gold_ogee"
+    fx: ""
+    plate: fn(k) { [
+        Rect{name: "black" size: vec2(k.w, k.h) fill: k.bg}
+        Ellipse{name: "light" at: vec2(k.cx - k.w * 0.5, k.cy - k.u * 0.7) size: vec2(k.w, k.u * 1.4) fill: k.accent2 blur: k.u * 0.2 opacity: 0.22}
+        Rect{name: "gold line" at: vec2(k.cx - k.w * 0.15, k.h * 0.88) size: vec2(k.w * 0.3, 1.5) fill: k.accent scale: tween(vec2(0, 1), vec2(1, 1), 0.4, 2.0, @ease_in_out_cubic)}
+    ] }
+    ornaments: fn(k) { [Path{name: "diamond" svg: "M 0 -9 L 9 0 L 0 9 L -9 0 Z" fill: k.accent at: vec2(k.cx, k.h * 0.88) scale: tween(0, k.s, 1.6, 2.2, @ease_out_back)}] }
+    screen: fn(k) { [] }
+    post: [
+        Effect{name: @halation threshold: 0.7 radius: 10 amount: 0.4}
+        Effect{name: @vignette amount: 0.45 feather: 0.6}
+        Effect{name: @grain amount: 0.03 size: 1.1}
+    ]
+    text_effects: []
+}
+
+let ink_wash = {
+    look: "Ink and watercolour: warm paper, indigo and vermilion washes blooming with dark pigment edges, an ink circle drawing itself, a brush-stroke underline, brush lettering"
+    suits: "stories, poetry, food, travel, handmade brands, calm explainers"
+    palette: {bg: #xf4efe4 ink: #x1b1b1b accent: #x3d7bb8 accent2: #xd9594c muted: #xc9bfa9}
+    display: {font: Font{family: "LXGW WenKai" weight: 700} tracking: 0}
+    body: {font: Font{family: "IBM Plex Sans" weight: 400} tracking: 0}
+    upper: false
+    label: Font{family: "JetBrains Mono"}
+    leading: 1.0
+    animate: @wipe
+    body_animate: @fade_up
+    speed: 0.9
+    text3d: "clay"
+    kinetic: "381_karaoke_ink"
+    fx: ""
+    plate: fn(k) { [
+        Rect{name: "paper" size: vec2(k.w, k.h) fill: k.bg}
+        Group{name: "blue wash" size: vec2(k.w, k.h) mask_feather: k.u * 0.06 opacity: tween(0, 0.9, 0.0, 1.2, @ease_out_sine)
+              mask: Ellipse{at: vec2(k.w * 0.5, k.h * 0.05) size: vec2(k.u * 0.95, k.u * 0.8) scale: tween(0.7, 1, 0.0, 2.0, @ease_out_cubic)}
+              layers: [Pattern{kind: @wash color: k.accent color2: #x00000000 cell: k.u * 0.35 weight: 0.42 size: vec2(k.w, k.h) speed: 0.2}]}
+        Group{name: "red wash" size: vec2(k.w, k.h) mask_feather: k.u * 0.05 opacity: tween(0, 0.8, 0.3, 1.5, @ease_out_sine)
+              mask: Ellipse{at: vec2(k.w * 0.04, k.h * 0.55) size: vec2(k.u * 0.6, k.u * 0.5) scale: tween(0.7, 1, 0.3, 2.3, @ease_out_cubic)}
+              layers: [Pattern{kind: @wash color: k.accent2 color2: #x00000000 cell: k.u * 0.25 weight: 0.45 size: vec2(k.w, k.h) speed: 0.15}]}
+    ] }
+    ornaments: fn(k) { [
+        Ellipse{name: "ink circle" at: vec2(k.w - k.m - k.u * 0.28, k.m) size: vec2(k.u * 0.28, k.u * 0.28) fill: #x00000000 stroke: k.ink width: 5 * k.s cap: @round trim_end: tween(0, 0.94, 0.2, 1.4, @ease_in_out_cubic)}
+        Path{name: "brush stroke" svg: "M 0 12 C 120 -6, 260 22, 420 4" stroke: k.ink width: 14 * k.s cap: @round at: vec2(k.m, k.h - k.m * 1.2) scale: k.s trim_end: tween(0, 1, 0.6, 1.3, @ease_out_cubic)}
+    ] }
+    screen: fn(k) { [] }
+    post: [
+        Effect{name: @grain amount: 0.06 size: 1.6}
+        Effect{name: @vignette amount: 0.15 feather: 0.8}
+    ]
+    text_effects: []
+}
+
+let benchmark = {
+    look: "Benchmark board: near-black ground, a dark board with an ivory hairline and faint grid, sodium orange and acid green accents, condensed caps over mono labels"
+    suits: "results, comparisons, scoreboards, leaderboards, tech reviews"
+    palette: {bg: #x0d0e0b ink: #xf1ead6 accent: #xff7a1a accent2: #xa6ff3d muted: #x9a9483}
+    display: {font: Font{family: "Anton" weight: 400} tracking: 0.02}
+    body: {font: Font{family: "Inter" weight: 500} tracking: 0}
+    upper: true
+    label: Font{family: "JetBrains Mono"}
+    leading: 0.75
+    animate: @tracking_slam
+    body_animate: @fade_up
+    speed: 1.0
+    text3d: "number_slam"
+    kinetic: "340_clock_flip"
+    fx: ""
+    plate: fn(k) { [
+        Rect{name: "ground" size: vec2(k.w, k.h) fill: k.bg}
+        Rect{name: "board" at: vec2(k.m, k.m) size: vec2(k.w - k.m * 2, k.h - k.m * 2) radius: 6 * k.s fill: #x14150f stroke: #xf1ead630 width: 1.5
+             scale: tween(vec2(1, 0.96), vec2(1, 1), 0.0, 0.4, @ease_out_cubic)}
+        Pattern{name: "grid" kind: @grid color: #xf1ead61c cell: k.u * 0.06 weight: 0.04 at: vec2(k.m, k.m) size: vec2(k.w - k.m * 2, k.h - k.m * 2)}
+    ] }
+    ornaments: fn(k) { [
+        Rect{name: "accent bar" at: vec2(k.m * 1.6, k.m * 1.6) size: vec2(90 * k.s, 6 * k.s) fill: k.accent scale: tween(vec2(0, 1), vec2(1, 1), 0.2, 0.6, @ease_out_expo) anchor: vec2(0, 0.5)}
+        Ellipse{name: "live" at: vec2(k.w - k.m * 1.6 - 14 * k.s, k.m * 1.6 - 4 * k.s) size: vec2(14 * k.s, 14 * k.s) fill: k.accent2 opacity: repeat(keys([0, 1], [0.6, 0.3, @hold]), 1.2, @restart)}
+    ] }
+    screen: fn(k) { [] }
+    post: [
+        Effect{name: @grain amount: 0.04 size: 1.2}
+        Effect{name: @vignette amount: 0.4 feather: 0.7}
+    ]
+    text_effects: []
+}
+
+{style_kits: {swiss: swiss brutalist: brutalist editorial: editorial retro70s: retro70s y2k: y2k riso: riso blueprint: blueprint neon_noir: neon_noir paper_cutout: paper_cutout bauhaus: bauhaus terminal: terminal luxury: luxury ink_wash: ink_wash benchmark: benchmark}}

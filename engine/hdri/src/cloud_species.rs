@@ -8,8 +8,8 @@
 //!   (`CloudGenus::new_cover`), so a saved layer with no Cover still draws at the default it was saved with.
 //! - A species lists only the rows that make its form; the others (Base, the light rows, wind, seed) keep their values.
 //!   The species of one type list the same rows, so picking one after another always gives the same layer.
-//! - Types with one form have none: Nimbostratus, Altostratus, the Lenticular (the lenticularis species itself, placed
-//!   by hand) and Mammatus (a feature of other clouds).
+//! - Types with one form have none: Nimbostratus, Altostratus, the Lenticular (not drawn since 2026-11-07) and Mammatus
+//!   (a feature of other clouds).
 //! - A row holds a species' number when the two are within half the row's step (`row_step`): the number its slider
 //!   shows. The number is the species' as the layer's clamp() holds it, so a Tops under a high Base reads as the form.
 //! - A layer names a species only while its rows hold it (`settle_species` after an edit).
@@ -23,8 +23,8 @@ use crate::{CloudGenus, CloudLayerParams};
 /// One named form of a cloud type.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CloudSpecies {
-    /// The WMO species' name as files store it ("congestus"). The inspector shows it after its type's ("Cumulus
-    /// congestus", `label`).
+    /// The WMO species' name as files store it ("congestus"), and as the inspector's Species row shows it, under the
+    /// Type row; `label` puts its type's before it ("Cumulus congestus").
     pub name: &'static str,
     /// The rows it sets, by their names (`CloudLayerParams::row`), each with the number that makes the form.
     pub rows: &'static [(&'static str, f32)],

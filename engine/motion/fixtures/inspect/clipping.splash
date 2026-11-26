@@ -1,0 +1,9 @@
+use mod.motion.*
+Motion{size: vec2(640, 480) duration: 2.0 fps: 20 layers: [
+    Rect{name: "cut" at: vec2(-10, 50) size: vec2(40, 40) fill: #fff}
+    Rect{name: "inside" at: vec2(0, 120) size: vec2(40, 40) fill: #fff}
+    Path{name: "stroke cut" svg: "M 100 1 H 180" stroke: #fff width: 6}
+    Text{name: "text cut" text: "HELLO" size: 48 at: vec2(620, 150)}
+    Text{name: "fitted inside" text: "A readable headline" size: 48 at: vec2(320, 250) align: @center fit: @safe}
+    Rect{name: "hidden cut" at: vec2(-10, 350) size: vec2(40, 40) fill: #fff0}
+]}

@@ -1,0 +1,39 @@
+[package]
+name = "makepad-wasm-export"
+version = "0.1.0"
+edition = "2021"
+description = "wasm-export: a makepad app as ONE trace-shaken wasm page (index.html, a loader, one wasm with everything embedded). Drivers exercise the app's web build in the trace host (Relax as a library), the runs' coverage is merged, the shader pack recorded, the files it fetched embedded, a held-out replay gates the result, and the page is packaged. Library and CLI; Story's File > Export > Web page calls the library"
+license = "MIT"
+publish = false
+
+[lib]
+name = "makepad_wasm_export"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wasm-export"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+# Story uses only orchestration; the compiler lives in the child CLI process.
+cli = ["dep:makepad-web-trace"]
+
+[dependencies]
+makepad-web-trace = { path = "trace", optional = true }
+# The embed format the platform reads (os/web/web_embed.rs).
+makepad-web-manifest = { path = "../../../../libs/web_manifest" }
+# The platform's web runtime as one script, Splash blanking, brotli for the report.
+makepad-web-pack = { path = "../../../../libs/web_pack" }
+# Fonts cut to the glyphs the runs drew.
+makepad-font-subset = { path = "../../../../libs/font_subset" }
+ttf-parser = { path = "../../../../libs/ttf-parser" }
+# The coverage files.
+makepad-strict-json = { path = "../../../../libs/strict_json" }
+# The shipped wasm, deflated (the page decodes it with DecompressionStream).
+makepad-fast-inflate = { path = "../../../../libs/fast_inflate" }
+# Finding and building the trace host as Makepad's launchers find theirs (tools.rs).
+makepad-app-registry = { path = "../../../../libs/app_registry" }
+# The shader packs' entries (merge, loop check).
+makepad-platform = { path = "../../../../platform" }

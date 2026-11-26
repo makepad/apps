@@ -1,0 +1,71 @@
+use mod.motion.*
+
+// Shape & paths 3: morphs and timing. Left, one outline becomes the next (moon, bell, sparkle,
+// gear with its hole, back to the moon): contours are paired and split to equal counts, and
+// start and winding are chosen so the points travel least; an onion skin shows the travel.
+// Right, the rate shapers: the same 2.4 s move under six eases, side by side.
+let look = import("shared/motion_deck_look")
+
+let HERO = 400.0
+let STEP = 2.6
+let MORPH = 1.2
+// Each outline holds, then eases into the next over MORPH seconds; STEP apart.
+let MORPHS = keys(
+    [0.0, icon_path("wm/moon", HERO)],
+    [STEP - MORPH, icon_path("wm/moon", HERO)],
+    [STEP, icon_path("wm/bell", HERO), @ease_in_out_cubic],
+    [2.0 * STEP - MORPH, icon_path("wm/bell", HERO)],
+    [2.0 * STEP, icon_path("stage/sparkle", HERO), @ease_in_out_cubic],
+    [3.0 * STEP - MORPH, icon_path("stage/sparkle", HERO)],
+    [3.0 * STEP, icon_path("stage/gear", HERO), @ease_in_out_cubic],
+    [4.0 * STEP - MORPH, icon_path("stage/gear", HERO)],
+    [4.0 * STEP, icon_path("wm/moon", HERO), @ease_in_out_cubic])
+let CYCLE = 4.0 * STEP
+let enter = fn(at) { return tween(0, 1, at, at + 1.4, @ease_in_out_cubic) }
+
+let TRACK_X = 1180.0
+let TRACK_W = 560.0
+let SHAPERS = [
+    {name: "@ease_in_out_cubic" ease: @ease_in_out_cubic},
+    {name: "there_and_back(@ease_in_out_cubic)" ease: there_and_back(@ease_in_out_cubic)},
+    {name: "running_start(@ease_in_out_cubic, -0.12)" ease: running_start(@ease_in_out_cubic, -0.12)},
+    {name: "@squish" ease: @squish},
+    {name: "@exponential_decay" ease: @exponential_decay},
+    {name: "@lingering" ease: @lingering}
+]
+
+let build_layers = fn() {
+    let layers = [
+        Draw2D{name: "ground" size: vec2(1920, 1080) draw: fn(c, t, edit) { look.ground(c, t, live()) }}
+        Path{name: "hero" svg: repeat(MORPHS, CYCLE, @restart) fill: look.COOL at: vec2(230, 400)
+            opacity: enter(0.8) onion: {count: 4 spacing: 0.07 opacity: 0.32 outline: true}}
+    ]
+    for i in 0..SHAPERS.len() {
+        let s = SHAPERS[i]
+        let y = 420.0 + i * 84.0
+        layers.push(Path{name: "track " + s.name svg: "M 0 0 L 560 0" stroke: look.GRAPHITE width: 1 at: vec2(TRACK_X, y)
+            opacity: enter(1.0 + 0.08 * i)})
+        layers.push(Ellipse{name: "dot " + s.name size: vec2(18, 18) fill: look.BONE at: vec2(TRACK_X - 9, y - 9)
+            x: repeat(tween(0, TRACK_W, 0, 2.4, s.ease), 3.4, @restart) opacity: enter(1.0 + 0.08 * i)})
+    }
+    layers.push(Draw2D{name: "chrome" size: vec2(1920, 1080) draw: fn(c, t, edit) {
+        look.folio(c, t, "05", "Shape and paths")
+        look.heading(c, t, "Any outline into any other.", "Contours pair up and points travel least; rate shapers give a move its character.")
+        for i in 0..SHAPERS.len() {
+            look.label(c, t, 1.1 + 0.08 * i, SHAPERS[i].name, TRACK_X, 420.0 + i * 84.0 - 18, {font: look.MONO px: 20})
+        }
+        look.syntax(c, t, 2.0, "Path{svg: keys([0, icon_path(\"wm/moon\", 400)], [1.2, icon_path(\"wm/bell\", 400), @ease_in_out_cubic])}")
+    }})
+    return layers
+}
+
+Motion{
+    label: "Any outline into any other"
+    size: vec2(1920, 1080)
+    duration: 600.0
+    fps: 60
+    color: @hdr
+    background: look.INK
+    layers: build_layers()
+    post: look.post_chain(look.POST)
+}

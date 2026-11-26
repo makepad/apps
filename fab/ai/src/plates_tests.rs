@@ -613,3 +613,50 @@ fn a_plates_electronics_are_its_files_and_outside_its_object_history() {
         assets[body].as_ref());
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn delete_moves_the_id_folder_first_and_a_refused_one_moves_nothing_else() {
+    let root = root("delete-order");
+    let store = store(&root);
+    let outside = root.join("elsewhere");
+    std::fs::create_dir_all(&outside).unwrap();
+    let make = |name: &str| {
+        let file = outside.join(format!("{name}.fab.splash"));
+        std::fs::write(&file, "// project").unwrap();
+        let plate = store.create(name, Some(file.clone()), String::new(), Origin::Plate).unwrap();
+        (plate.id, file)
+    };
+    // a trash that records its paths and moves them into a folder of its own
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let moves = |refuse: Option<PathBuf>, seen: &std::rc::Rc<std::cell::RefCell<Vec<PathBuf>>>| {
+        let (bin, seen) = (bin.clone(), seen.clone());
+        move |path: &Path| -> Result<(), String> {
+            seen.borrow_mut().push(path.to_path_buf());
+            if refuse.as_deref() == Some(path) { return Err(format!("{}: refused", path.display())) }
+            let to = bin.join(format!("{}-{}", seen.borrow().len(), path.file_name().unwrap().to_string_lossy()));
+            std::fs::rename(path, to).map_err(|e| e.to_string())
+        }
+    };
+    let fresh = || std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+
+    let (id, file) = make("first");
+    let seen = fresh();
+    store.delete(&id, &moves(None, &seen)).unwrap();
+    assert_eq!(seen.borrow()[0], store.dir(&id), "the id folder moves first");
+    assert_eq!(seen.borrow()[1], file, "then the project's file");
+    assert!(!store.dir(&id).exists() && !file.exists(), "both are in the trash");
+
+    let (id, file) = make("second");
+    let seen = fresh();
+    assert!(store.delete(&id, &moves(Some(store.dir(&id)), &seen)).is_err(), "a refused id folder is an error");
+    assert_eq!(*seen.borrow(), vec![store.dir(&id)], "nothing else was tried");
+    assert!(store.dir(&id).exists() && file.exists(), "every file is kept");
+
+    let (id, file) = make("third");
+    let seen = fresh();
+    assert!(store.delete(&id, &moves(Some(file.clone()), &seen)).is_err(), "a refused project file is an error");
+    assert!(!store.dir(&id).exists(), "the id folder had moved");
+    assert!(file.exists(), "the project's file is still there to open");
+    let _ = std::fs::remove_dir_all(root);
+}

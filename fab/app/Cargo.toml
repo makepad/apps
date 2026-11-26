@@ -32,6 +32,8 @@ fab-model = { path = "../model" }
 fab-materials = { path = "../materials" }
 # The electronics host (ARCHITECTURE 2.2).
 fab-elec-host = { path = "../elec/host" }
+fab-elec-bom = { path = "../elec/bom" }
+fab-elec-req = { path = "../elec/req" }
 fab-elec-cam = { path = "../elec/cam" }
 fab-elec-route = { path = "../elec/route" }
 fab-elec-lang = { path = "../elec/lang" }
@@ -89,6 +91,7 @@ makepad-fab-slicer = { path = "../slicer" }
 makepad-fab-toolpath = { path = "../toolpath" }
 makepad-civil-time = { path = "../../../../libs/civil_time" }
 makepad-zip-file = { path = "../../../../libs/zip_file" }
+makepad-git = { path = "../../../../libs/git" }
 makepad-strict-json = { path = "../../../../libs/strict_json" }
 makepad-model = { path = "../../../../libs/model" }
 makepad-render = { path = "../../../../libs/render" }
@@ -111,6 +114,9 @@ makepad-desk-link = { path = "../../../../libs/desk_link" }
 makepad-xr-stream = { path = "../../../../libs/xr_stream" }
 makepad-xr-nav = { path = "../../../../libs/xr_nav" }
 makepad-xr-ui = { path = "../../../../libs/xr_ui" }
+
+[target.'cfg(windows)'.dependencies]
+makepad-windows-sys = { path = "../../../../libs/windows/sys" }
 
 [lints.rust]
 # Under the JIT (`cfg(relax)`) the live state's owner checks it is entered with no lock held.

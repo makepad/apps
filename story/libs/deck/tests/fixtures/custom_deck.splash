@@ -1,0 +1,183 @@
+use mod.flow.*
+use mod.cut.*
+use mod.deck.*
+
+// Slide 1: a looping motion title, a kinetic title over a glowing effect.
+// Hold at two story beats, then loop its 8 seconds after both releases.
+let motion_title = Title{text: "Stage in five minutes" span: [0.0, 8.0] font_size: keys([0.0, 96.0], [4.0, 112.0, @ease_in_out], [8.0, 96.0, @ease_in_out])}
+let motion_glow = Fx{input: motion_title.out(@frame) effect: "366_slice_glitch" span: [0.0, 8.0] p1: 0.5}
+let motion_out = CutOutput{frame: motion_glow.out(@frame)}
+
+let intro = Flow{
+    kind: @cut
+    output: {width: 1920 height: 1080 fps: 30}
+    duration: 8.0
+    motion_title, motion_glow, motion_out
+}
+
+// Slide 2: a title with an effect, entered through a split slide.
+let words = Title{text: "A slide is a cut" span: [0.0, 6.0] font_size: 100.0}
+let words_glitch = Fx{input: words.out(@frame) effect: "366_slice_glitch" span: [0.0, 6.0] p1: 0.4}
+let words_out = CutOutput{frame: words_glitch.out(@frame)}
+
+// Slide 3: a live app is a layer like any other. `AppView{app: @counter}`
+// shows the app the slide's `apps` names; in CUT it is a placeholder.
+let counter_title = Title{text: "Click it yourself" span: [0.0, 6.0] font_size: 72.0 anchor: vec2(0.5, 0.08)}
+let counter_view = AppView{app: @counter fit: @fit span: [0.0, 6.0]}
+let counter_stack = Stack{layers: [conn(1, counter_view.out(@frame)), conn(2, counter_title.out(@frame))]}
+let counter_out = CutOutput{frame: counter_stack.out(@frame)}
+
+// Slide 4: the source beside a normal hosted app. Code reads the file on
+// disk; the demo uses the counter's controls. Both are ordinary cut layers.
+let live_title = Title{text: "The source. The running app." span: [0.0, 6.0] font_size: 64.0 anchor: vec2(0.5, 0.075)}
+let live_code = Code{app: @counter file: "examples/counter/src/main.rs" lines: [24, 56] width: 1000 height: 800 font_size: 15.0 rect: [0.03, 0.16, 0.5, 0.8] span: [0.0, 6.0]}
+let live_view = AppView{app: @counter fit: @fit rect: [0.55, 0.28, 0.42, 0.44] span: [0.0, 6.0]}
+let live_stack = Stack{layers: [conn(1, live_code.out(@frame)), conn(2, live_view.out(@frame)), conn(3, live_title.out(@frame))]}
+let live_out = CutOutput{frame: live_stack.out(@frame)}
+
+// Slide 5: Scope runs live in the slide. Its window (1640 x 800 points) is
+// fitted into the 16:9 picture, which leaves a band above it for the title.
+let scope_title = Title{text: "Scope: the code, live" span: [0.0, 6.0] font_size: 40.0 anchor: vec2(0.5, 0.036)}
+let scope_view = AppView{app: @codemap fit: @fit span: [0.0, 6.0]}
+let scope_stack = Stack{layers: [conn(1, scope_view.out(@frame)), conn(2, scope_title.out(@frame))]}
+let scope_out = CutOutput{frame: scope_stack.out(@frame)}
+
+// Slide 6: closing, plays once and holds.
+let closing_title = Title{text: "Questions?" span: [0.0, 3.0] font_size: 120.0}
+let closing_out = CutOutput{frame: closing_title.out(@frame)}
+
+Deck{
+    title: "Stage tour"
+    output: {width: 1920 height: 1080}
+    transition: transition(0.6, "101_trans_dissolve")
+    slides: [
+        Slide{
+            name: @intro
+            cut: intro
+            play: [0.0, 8.0]
+            beats: [2.0, 4.5]
+            notes: "Welcome. Click the picture or press Right to release each beat, then let the cut loop."
+            target_seconds: 20.0
+        }
+        Slide{
+            name: @title
+            cut: Flow{
+                kind: @cut
+                output: {width: 1920 height: 1080 fps: 30}
+                duration: 6.0
+                words, words_glitch, words_out
+            }
+            enter: transition(1.2, "520_trans_split_slide")
+            notes: "A slide is a cut: text, effects, media and motion graphics."
+            target_seconds: 30.0
+        }
+        Slide{
+            name: @counter
+            cut: Flow{
+                kind: @cut
+                output: {width: 1920 height: 1080 fps: 30}
+                duration: 6.0
+                counter_title, counter_view, counter_stack, counter_out
+            }
+            apps: {counter: App{app: "makepad-example-counter" size: [900, 600] audio: false}}
+            demo: [
+                wait_visible(@increment_button),
+                click(@increment_button),
+                hold(0.5),
+                click(@increment_button),
+                hold(0.5),
+                click(@increment_button),
+                hold(0.5),
+                wait_text(@counter_label, "Count: 3")
+            ]
+            notes: "Click the app yourself, or press D to run the demo: three clicks on the button, then it waits for the label."
+            target_seconds: 60.0
+        }
+        Slide{
+            name: @source_app
+            cut: Flow{
+                kind: @cut
+                output: {width: 1920 height: 1080 fps: 30}
+                duration: 6.0
+                live_title, live_code, live_view, live_stack, live_out
+            }
+            apps: {counter: App{app: "makepad-example-counter" size: [900, 600] audio: false}}
+            demo: [
+                wait_visible(@increment_button),
+                click(@increment_button),
+                hold(0.6),
+                click(@increment_button),
+                wait_text(@counter_label, "Count: 2"),
+                hold(1.5)
+            ]
+            notes: "The source on the left is a read-only view of the file on disk. The counter on the right is a native app hosted in this slide. Press D for two clicks and watch its label change, or click it yourself. If its release binary is missing, the slide shows build progress and opens the app when it is ready. Shift+D restarts the demo from a fresh app."
+            target_seconds: 90.0
+        }
+        Slide{
+            name: @scope
+            cut: Flow{
+                kind: @cut
+                output: {width: 1920 height: 1080 fps: 30}
+                duration: 6.0
+                scope_title, scope_view, scope_stack, scope_out
+            }
+            apps: {codemap: App{app: "scope" size: [1640, 800] audio: false env: {MAKEPAD_WM_CAPTION_CONTENT: "1"}}}
+            demo: [
+                // The map is prepared (the declarations are indexed) and drawn.
+                wait_text(@atlas_tab, "ready:", {max: 180}),
+                wait_settled({max: 30}),
+                hold(1.0),
+                // Zoom into the map and pan it.
+                scroll(@atlas_tab, 0, -300),
+                wait_settled({max: 30}),
+                drag(@atlas_tab, vec2(300, 200), {time: 1.5}),
+                wait_settled({max: 30}),
+                // Select a file on the map; the inspector names it.
+                click(vec2(800, 400)),
+                wait_text(@atlas_tab, "selected", {max: 30}),
+                hold(1.5),
+                // History: scrub the map through the commits, pin one, step.
+                click(@tm_toggle),
+                wait_settled({max: 120}),
+                hold(1.0),
+                drag(vec2(200, 700), vec2(1400, 700), {time: 4.0}),
+                wait_settled({max: 30}),
+                click(vec2(900, 700)),
+                wait_settled({max: 30}),
+                hold(1.0),
+                key("ArrowLeft"),
+                wait_settled({max: 30}),
+                hold(1.0),
+                key("ArrowLeft"),
+                wait_settled({max: 30}),
+                key("Escape"),
+                wait_settled({max: 30}),
+                // Activity: what the coding agents are doing.
+                click(@timeline_toggle),
+                wait_visible(@agent_timeline, {max: 30}),
+                hold(3.0),
+                // Lanes: one lane per agent session.
+                click(@scope_mode_lanes),
+                wait_visible(@lanes_view, {max: 30}),
+                wait_settled({max: 30}),
+                hold(3.0),
+                click(@scope_mode_map),
+                wait_visible(@atlas_tab, {max: 30})
+            ]
+            notes: "Scope is running live inside this slide, on this checkout (its generated agent sessions show in Activity and Lanes). Press D for the guided tour: zoom and pan the map, select a file, History (sweep the committer rows to scrub the commits, click to pin one, left and right step, Escape leaves), Activity, Lanes. Or click around yourself: wheel zooms, drag pans. A click gives Scope the keys, which pauses the tour; Ctrl+Esc takes the keys back and D resumes, Shift+D restarts."
+            target_seconds: 120.0
+        }
+        Slide{
+            name: @closing
+            cut: Flow{
+                kind: @cut
+                output: {width: 1920 height: 1080 fps: 30}
+                duration: 3.0
+                closing_title, closing_out
+            }
+            play: @hold
+            enter: transition(0.8, "102_trans_wipe", {p1: 0.2})
+            notes: "Thank you."
+        }
+    ]
+}

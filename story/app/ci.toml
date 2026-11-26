@@ -1,0 +1,10 @@
+# CI (devhub ci): [ci] is hand-written settings; the other sections are proofs devhub writes.
+
+[ci]
+runs = "--export-web motion-deck/deck.splash; --panel-effects"
+
+[tests.linux]
+date = "2026-11-07"
+digest = "276bb2b19791d447617fac10712ba65fa8303dad53f41ad76e966d0b0eae3c59"
+main = "4f8bf6f5c74eec138e10a4c72c10c8579cc3e40c"
+work = "f846b2047215349aa13ba2a265f13f3305635e8f"

@@ -2,9 +2,12 @@
 #
 # `fab/` is Fab: the 3D modeler and slicer (design, mechanics, slicing and printing) and its
 # electronics suite (schematic, board, routing, simulation, firmware and the bench). The app is
-# `makepad-fab` (fab/app). `engine/` and `libs/` hold the shared crates Fab and other apps use:
-# the HDRI and atmosphere engine, the asset data model, the model scripts, the app shell, the
-# explorer's motion kit and the studio registry.
+# `makepad-fab` (fab/app). `create/` is Makepad Work, where two people and their AIs finish
+# Makepad apps together (`makepad-work`, create/app; its core without UI is `makepad-work-core`, create/core). `synth/` is
+# Makepad Synth. `engine/` and `libs/` hold the shared crates Fab and other apps use: the HDRI and
+# atmosphere engine, the asset data model, the model scripts, the app shell, the explorer's motion
+# kit and the studio registry, and Story's engine (Motion and the asset stack), which
+# arrives with the crates under `stage/libs/` and `story/` ahead of Makepad Story itself.
 #
 # This repository has no workspace of its own. It is cloned into a Makepad checkout at
 # `apps/<dir>`, and its crates join Makepad's workspace, so Makepad's crates compile once for them
@@ -24,7 +27,12 @@ publish = false
 
 [target.'cfg(any())'.dependencies]
 makepad-asset-data    = { path = "engine/asset/data" }
+makepad-work-core     = { path = "create/core" }
+makepad-work          = { path = "create/app" }
 makepad-hdri-engine   = { path = "engine/hdri" }
+makepad-graph-layout  = { path = "libs/graph_layout" }
+makepad-ink-shapes    = { path = "libs/ink_shapes" }
+makepad-splash-syntax = { path = "libs/splash_syntax" }
 makepad-model-script  = { path = "engine/model_script" }
 fab-ai                = { path = "fab/ai" }
 makepad-fab           = { path = "fab/app" }
@@ -66,6 +74,7 @@ fab-elec-mcu-s3       = { path = "fab/elec/mcu/s3" }
 fab-elec-mcu-xtensa   = { path = "fab/elec/mcu/xtensa" }
 fab-elec-mech         = { path = "fab/elec/mech" }
 fab-elec-parts        = { path = "fab/elec/parts" }
+fab-elec-req          = { path = "fab/elec/req" }
 fab-elec-route        = { path = "fab/elec/route" }
 fab-elec-sim          = { path = "fab/elec/sim" }
 fab-elec-simhost      = { path = "fab/elec/simhost" }
@@ -105,5 +114,93 @@ makepad-fab-slice     = { path = "fab/slice" }
 makepad-fab-slicer    = { path = "fab/slicer" }
 makepad-fab-toolpath  = { path = "fab/toolpath" }
 makepad-app-shell     = { path = "libs/app_shell" }
+makepad-app-synth     = { path = "synth" }
 makepad-explore-kit   = { path = "libs/explore_kit" }
 makepad-studio-api    = { path = "libs/studio_api" }
+
+# Makepad Story's crates and the engine crates it shares with Stage and Work, moved here with Story:
+# the motion engine with its fonts, kits and renderers, the asset stack and the Stage libraries.
+# Storyboards: the 2D board the edit is made from, its diffs and incremental edit updates.
+makepad-story-storyboard = { path = "story/libs/storyboard" }
+makepad-asset-client  = { path = "engine/asset/client" }
+makepad-asset-store   = { path = "engine/asset/store" }
+makepad-asset-importer = { path = "engine/asset/importer" }
+# Modelling (shared by Sandbox and Stage): the Splash model builder and the
+# build service with its store cache.
+makepad-model-build   = { path = "engine/model_build" }
+# Stage's host of the model build service (its own store session).
+makepad-stage-model-host = { path = "engine/model_host" }
+makepad-stage-ui      = { path = "stage/libs/stage_ui" }
+makepad-stage-audio-media = { path = "engine/audio_media" }
+makepad-stage-asset-stream = { path = "stage/libs/asset_stream" }
+makepad-stage-audio-wave = { path = "stage/libs/audio_wave" }
+# The rendering kit: every VFX as keyable GPU passes.
+makepad-stage-render-kit = { path = "engine/render_kit" }
+# Motion graphics: AI-authored Splash documents drawn on the GPU.
+makepad-motion        = { path = "engine/motion" }
+# The document font table: families, files, licences, where the files are.
+makepad-doc-fonts     = { path = "engine/fonts" }
+# Drawing Motion frames (installed effect packs' presets, and Scene3D behind a feature).
+makepad-motion-draw   = { path = "engine/motion_draw" }
+# 3D motion graphics at three.js level: the Scene3D layer's scene graph,
+# geometry, materials, lights, GLB animation and post.
+makepad-stage-motion3d = { path = "engine/motion3d" }
+# The content expansion interface Motion, the edit renderer and the tools draw
+# effects and kinetic text through. A host installs the packs it carries (Stage
+# installs its VJ effects and its kinetic text).
+makepad-content-packs = { path = "engine/content_packs" }
+
+# Moved from the private repository with Story (REPOMOVE): the motion engine, its fonts, kits and
+# renderers, the asset stack and the Stage libraries Story and Work build on.
+makepad-app-asset-server = { path = "stage/apps/asset-server" }
+makepad-flow-assets   = { path = "engine/flow_assets" }
+# The asset store connection and host the product windows share.
+makepad-asset-connection = { path = "libs/asset_connection" }
+# The library browser the product windows share.
+makepad-library-browser = { path = "libs/library_browser" }
+makepad-audio-lyrics  = { path = "engine/audio_lyrics" }
+makepad-stage-live-audio = { path = "stage/libs/live_audio" }
+# The tweak panel's font picker, font row and effects stack (they need Motion).
+makepad-stage-motion-pickers = { path = "stage/libs/motion_pickers" }
+# wasm-export: an app as one trace-shaken wasm page (index.html, loader, one wasm);
+# Story's File > Export > Web page calls it. Replaces the film export once at parity.
+makepad-wasm-export   = { path = "tools/wasm-export" }
+# The web export's trace host (tools/wasm-export/trace): an app's web build on Relax against a
+# virtual browser, its coverage, merge and the replay-B gate.
+makepad-web-trace     = { path = "tools/wasm-export/trace" }
+
+# Makepad Story, moved from the private repository with its players, libraries and tools (REPOMOVE).
+# Makepad Story: CUT and DECK.
+makepad-story         = { path = "story/app" }
+# The player: a finished film played natively and in the browser.
+makepad-story-player  = { path = "story/apps/player" }
+# One Stage document (a cut, a deck, a Motion document) played full-window by
+# Stage's engines, with a deterministic mode a tracer drives.
+makepad-story-doc-player = { path = "story/apps/doc-player" }
+# The AI control API tools every product window has.
+makepad-product-tools = { path = "libs/product_tools" }
+makepad-story-cut     = { path = "story/libs/cut" }
+# Decks: slides of looping cuts with transitions, live apps and demo steps (DECK).
+makepad-story-deck    = { path = "story/libs/deck" }
+# Voiceovers, word timings, transcripts and subtitle sidecars.
+makepad-story-edit-voice = { path = "story/libs/edit_voice" }
+# The EDIT page's Generate agent: tools, loop, transcript and authoring guide.
+makepad-story-video-agent = { path = "story/libs/video_agent" }
+# Audio as animation data: beats, onsets, energy, bands, sections; voice pitch, pauses, word emphasis.
+makepad-story-audio-features = { path = "story/libs/audio_features" }
+# The edit renderer: locked-time frames, MP4 and the EDIT preview.
+makepad-story-edit-render = { path = "story/libs/edit_render" }
+# The agent loop CLI and library: inspect, frame, strip, onion, timeline,
+# audio analyze, draft renders.
+makepad-story-edit-tools = { path = "story/libs/edit_tools" }
+# App runs: the AppRun script executor, focus track and publisher.
+makepad-story-app-run = { path = "story/libs/app_run" }
+makepad-story-production = { path = "story/libs/production" }
+# The evaluation harness for AI-generated videos (`makepad-video-eval`).
+makepad-story-video-eval = { path = "story/libs/video_eval" }
+# The film bundle the browser player loads (`makepad-story-player-bundle`).
+makepad-story-player-bundle = { path = "story/tools/player_bundle" }
+# Web export: an edit compiled into one self-contained film.wasm (Share ->
+# Web export, `makepad-film-build`), and the pack its wasm carries.
+makepad-story-film-pack = { path = "story/libs/film_pack" }
+makepad-story-web-export = { path = "story/libs/web_export" }

@@ -1,0 +1,10 @@
+use mod.scene.*
+// Environment looks: the same scene under look: @clay (swap in @studio, @neon_night, @blueprint or @holographic; strips/looks.png shows all five at t = 2).
+Scene3D{ look: @clay
+  camera: Camera{preset: @three_quarter target: vec3(0, 1.1, 0) distance: 8.5 focal_length: 40}
+  post: [ContactShadows{}]
+  children: [
+    ShapeSet{preset: @floating position: vec3(0, 1.2, 0) spread: 0.9}
+    Device{kind: @laptop position: vec3(1.8, 0, 0.5) rotation: vec3(0, -30, 0) scale: 0.6}
+    Ground{}
+  ] }

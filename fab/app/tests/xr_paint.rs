@@ -57,7 +57,7 @@ fn coloured(app: TestApp) {
     assert!(reply.contains("red/"), "the part is placed: {reply}");
     let (mut seq, mut best) = (0, 0usize);
     wait_poll(&app, || {
-        if let Ok(t) = app.log_since(seq) {
+        { let t = app.log_since(seq).expect("the app's log");
             seq = t.last_seq;
             for l in &t.lines {
                 if let Some(n) = l.split("fab xr pass: left eye ").nth(1).and_then(|r| r.split(" solid px, ").nth(1)).and_then(|r| r.split(' ').next()).and_then(|n| n.parse::<usize>().ok()) {

@@ -1,0 +1,13 @@
+// What the LED controller must meet.
+require("fits a 60 x 40 case", board("ledctl").size, {max: [60mm 40mm]})
+require("two layers", board("ledctl").layers, {max: 2})
+require("every part placed", board("ledctl").unplaced, {max: 0})
+require("fully routed", board("ledctl").unrouted, {max: 0})
+require("ERC clean", checks(@erc).errors, {max: 0})
+require("DRC clean", checks(@drc, {unit: "ledctl"}).errors, {max: 0})
+require("sits in its case", case("ledctl").fits)
+require("LEDs light", bench("bringup"))
+require("3V3 holds", bench("bringup").expect("3V3 up"))
+require("prints in 3 hours", print.time, {max: 3h})
+require("under 40 g of filament", print.filament, {max: 40g})
+waive("prints in 3 hours", "first prototype: time is no concern")

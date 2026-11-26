@@ -9,7 +9,7 @@ use super::ExplorerView;
 use crate::{ElecLive, ViewAction};
 use super::super::gesture::{landed, Answer};
 use super::super::layout_job::KeepHints;
-use crate::snapshot::next_tag;
+use crate::snapshot::{next_tag, Invocation};
 use fab_elec_circuit::{Circuit, CircuitOp};
 use fab_elec_core::BoardId;
 use fab_elec_design::{DesignOp, Resolved};
@@ -21,6 +21,7 @@ use std::sync::Arc;
 pub(super) struct KeepEdit {
     tag: u64,
     edit: Resolved,
+    call: Option<Invocation>,
     unit: BoardId,
     /// The committed circuit the edit was planned on. A change to it ends the wait.
     committed: Arc<Circuit>,
@@ -50,23 +51,23 @@ impl ExplorerView {
         let tag = next_tag();
         cx.widget_action(self.uid, ViewAction::Preview { notes: vec![], tag, ops: edit.ops.clone(), place: edit.place.clone(), label: edit.label.clone() });
         let base = Arc::new(KeepBase { sheet: (*self.sheet).clone(), circuit: shown });
-        self.wait_keep(tag, edit, unit, committed, base, at);
+        self.wait_keep(tag, edit, unit, committed, base, at, None);
     }
 
     /// Release a Library part using its last planned sample, even if the host is still evaluating it.
     pub(super) fn keep_carry(&mut self, cx: &mut Cx) -> bool {
         let Some(gesture) = &self.gesture else { return false };
         let Some((tag, edit, base)) = gesture.carry_drop() else { return false };
-        self.wait_keep(tag, edit.clone(), base.circuit.unit, base.circuit.clone(), base.clone(), gesture.end_point());
+        self.wait_keep(tag, edit.clone(), base.circuit.unit, base.circuit.clone(), base.clone(), gesture.end_point(), gesture.invocation());
         // The layout may already be on screen with no worker signal left to wake the release.
         self.keep_snapshot(cx);
         true
     }
 
     /// Hold the displayed sheet until the host answers this edit's commit or refuses its preview.
-    fn wait_keep(&mut self, tag: u64, edit: Resolved, unit: BoardId, committed: Arc<Circuit>, base: Arc<KeepBase>, at: [f64; 2]) {
+    fn wait_keep(&mut self, tag: u64, edit: Resolved, unit: BoardId, committed: Arc<Circuit>, base: Arc<KeepBase>, at: [f64; 2], call: Option<Invocation>) {
         self.hold = Some((tag, unit, committed.clone()));
-        self.keep_edit = Some(KeepEdit { tag, edit, unit, committed, base, asked: false, at });
+        self.keep_edit = Some(KeepEdit { tag, edit, call, unit, committed, base, asked: false, at });
     }
 
     /// Use the shown carry layout's result or ask the worker once the released tag has evaluated.
@@ -75,7 +76,14 @@ impl ExplorerView {
         if !cx.has_global::<ElecLive>() { return; }
         let snap = cx.get_global::<ElecLive>().snap.clone();
         if let Some(answer) = landed(&snap, keep.tag, keep.unit, &keep.committed) {
-            if matches!(answer, Answer::Refused) { log!("fab.circuit: preview refused before its keep"); }
+            let why = match answer {
+                Answer::Refused => snap.last_refusal.as_ref().map(|r| r.reason.clone()),
+                Answer::BaseMoved => Some("the sheet changed before this edit could land".into()),
+                _ => None,
+            };
+            if let Some((call, why)) = keep.call.take().zip(why) {
+                Invocation::send(cx, self.uid, call.attach(ViewAction::PlanRefused(why)));
+            }
             self.keep_edit = None;
             return;
         }
@@ -113,6 +121,9 @@ impl ExplorerView {
         let hints = match hints {
             Ok(hints) => hints,
             Err(note) => {
+                if let Some(call) = keep.call {
+                    Invocation::send(cx, self.uid, call.attach(ViewAction::PlanRefused(note.clone())));
+                }
                 self.hold = None;
                 if let Some(gesture) = &mut self.gesture {
                     let mut step = gesture.refuse_keep(token, note);
@@ -125,15 +136,17 @@ impl ExplorerView {
                 return;
             }
         };
+        let mut tag = token;
         if !hints.is_empty() {
             let mut ops = keep.edit.ops;
             ops.extend(hints.into_iter().map(|(path, hint)| DesignOp::Circuit { unit: keep.unit, op: CircuitOp::Hint { path, hint: Some(hint) } }));
-            let tag = next_tag();
+            tag = next_tag();
             if let Some(gesture) = &mut self.gesture { gesture.retag(token, tag); }
             cx.widget_action(self.uid, ViewAction::Preview { notes: vec![], tag, ops, place: keep.edit.place, label: keep.edit.label });
             if let Some(hold) = &mut self.hold { hold.0 = tag; }
         }
-        cx.widget_action(self.uid, ViewAction::CommitPreview);
+        let action = keep.call.map_or(ViewAction::CommitPreview, |call| call.attach(ViewAction::Land(tag)));
+        Invocation::send(cx, self.uid, action);
         self.own_edit = Some(self.gen);
     }
 }

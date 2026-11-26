@@ -1,0 +1,47 @@
+use mod.motion.*
+// EDITORIAL TITLE — a magazine opener. Paper ground, hairline rules that
+// draw from the left margin, a numbered kicker, a large italic headline
+// resolving from a slight blur word by word, and a narrow body column.
+// Why: slow, even pacing (ease_out_quint throughout, no overshoot) and a
+// strict left margin make it feel typeset, not animated.
+Motion{
+    label: "Editorial title"
+    brief: "A magazine-style opener: rules, numbered kicker, large italic headline and a body column."
+    tags: ["title", "editorial", "magazine", "elegant"]
+    duration: 6.0
+    inputs: {
+        issue: input(@text, "No. 04", "Number or date, top left")
+        section: input(@text, "FIELD NOTES", "Section name, top right")
+        headline: input(@text, "The quiet craft of making things move", "Up to about eight words")
+        body: input(@text, "Motion is timing first, drawing second. Here is how we think about both.", "Two short sentences")
+        paper: input(@color, #f3efe6, "Ground")
+        ink: input(@color, #1b1d22, "Type and rules")
+        muted: input(@color, #6b6f77, "Body colour")
+        accent: input(@color, #ff5c39, "Kicker and column rule")
+    }
+    layers: [
+        Rect{size: vec2(1920, 1080) fill: in(@paper)}
+        Group{
+            opacity: tween(1, 0, 5.5, 6.0, @ease_in_cubic)
+            layers: [
+                Rect{at: vec2(160, 180) size: tween(vec2(0, 2), vec2(1600, 2), 0.0, 1.2, @ease_in_out_quint) fill: in(@ink)}
+                Rect{at: vec2(160, 900) size: tween(vec2(0, 2), vec2(1600, 2), 0.2, 1.4, @ease_in_out_quint) fill: in(@ink)}
+                Text{text: in(@issue) font: Font{family: "IBM Plex Sans" italic: true} size: 34 color: in(@accent)
+                     at: vec2(160, 206) opacity: tween(0, 1, 0.6, 1.1, @ease_out_cubic)}
+                Text{text: in(@section) font: Font{family: "Inter" weight: 600} size: 24 tracking: 0.28 color: in(@ink)
+                     at: vec2(1760, 214) wrap: 600 align: @right opacity: tween(0, 1, 0.7, 1.2, @ease_out_cubic)}
+                Text{text: in(@headline) font: Font{family: "IBM Plex Sans" italic: true} size: 124 color: in(@ink)
+                     line_height: 1.08 tracking: -0.02 wrap: 1180 at: vec2(160, 330)
+                     by: @word stagger: 0.07
+                     opacity: tween(0, 1, 0.8, 1.5, @ease_out_cubic)
+                     blur: tween(8, 0, 0.8, 1.5, @ease_out_cubic)
+                     y: tween(20, 0, 0.8, 1.7, @ease_out_quint)}
+                Rect{at: vec2(1400, 340) size: vec2(2, 200) fill: in(@accent)
+                     anchor: vec2(0.5, 0) scale: tween(vec2(1, 0), vec2(1, 1), 1.6, 2.4, @ease_out_quint)}
+                Text{text: in(@body) font: Font{family: "Inter"} size: 30 color: in(@muted) line_height: 1.45
+                     wrap: 330 at: vec2(1430, 336)
+                     opacity: tween(0, 1, 1.8, 2.6, @ease_out_cubic) y: tween(14, 0, 1.8, 2.8, @ease_out_quint)}
+            ]
+        }
+    ]
+}

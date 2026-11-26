@@ -1,4 +1,4 @@
-//! Built-in presets: seven skies and sixteen studio set-ups, as plain `HdriParams`.
+//! Built-in presets: seven skies, seven cloud types, three weathers and the studio set-ups, as plain `HdriParams`.
 //!
 //! The first six studios hang their lights against the gradient backdrop. The next five stand
 //! them in a room (`StudioParams::room`, room.rs) after the photographed studio HDRIs the owner
@@ -16,6 +16,10 @@
 //! - "Clear noon" runs on Time mode, so the date and place controls show something real.
 //! - The rest use a Manual sun, which pins the sun height the look depends on. Their clock and
 //!   date are still set to a matching time, for anything that reads them.
+//! - The weathers (the weather lane, 2026-11-09, after Physical Weather FX's named situations: names, not its
+//!   numbers) are combinations of the weather kinds and the cloud layers, on the plain ground as every sky preset:
+//!   after rain, overcast and wet, heavy rain, a misty winter morning and a snowy sunny day. Each kind's own cloud layer is added as its pick in the app
+//!   adds it (`add_weather_clouds`), and a weather that rains breaks the water's mirror (`rain_on_water`).
 //!
 //! Studio azimuths assume the camera looks north (−Z, the engine's forward and the centre column
 //! of the engine's equirect). Lights on the camera side therefore sit near azimuth 180, and rims
@@ -36,9 +40,9 @@ use super::pattern::{fit_face, hold_face, lattice_m, natural_size_m};
 use super::shaped::box_x_sign;
 use super::space::{follow_face, template_beam};
 use super::studio::light_frame;
-use super::{az_el_from_dir, GoboParams, HdriParams, LightParams, ModifierKind, PatternParams, PatternSvg, RoadParams, RoomParams, ScrimParams, SpaceParams, StrokeParams};
+use super::{add_weather_clouds, az_el_from_dir, AltocumulusParams, CloudGenus, CloudLayerParams, CloudStackParams, CumulonimbusParams, CumulusParams, FloorParams, GlowParams, GoboParams, HdriParams, LightParams, ModifierKind, PatternParams, PatternSvg, RoomParams, RoomSides, ScrimParams, SpaceParams, StratocumulusParams, StrokeParams, WeatherParams};
 
-pub const PRESET_NAMES: [&str; 23] = [
+pub const PRESET_NAMES: [&str; 42] = [
     "Clear noon",
     "Golden hour",
     "Sunset",
@@ -46,6 +50,19 @@ pub const PRESET_NAMES: [&str; 23] = [
     "Blue hour",
     "Moonlit night",
     "Starry night",
+    "Stratocumulus low sun",
+    "Stratocumulus high sun",
+    "Altocumulus",
+    "Cumulus",
+    "Stratus",
+    "Cirrus",
+    "Cirrostratus",
+    "After rain",
+    "Overcast and wet",
+    "Heavy rain",
+    "Misty winter morning",
+    "Snowy sunny day",
+    "After the shower",
     "Three-point",
     "Top softbox",
     "Rim pair",
@@ -61,7 +78,13 @@ pub const PRESET_NAMES: [&str; 23] = [
     "Car showroom",
     "Hexagon studio",
     "Road tunnel",
+    "Bridge",
+    "Bridge at night",
     "LED portal",
+    "Open boxes",
+    "Umbrellas",
+    "Open loft",
+    "Factory hall",
 ];
 
 /// A built-in preset by name, or None for an unknown name. Case, surrounding space, and '-'
@@ -77,6 +100,19 @@ pub fn preset(name: &str) -> Option<HdriParams> {
         "Blue hour" => blue_hour(),
         "Moonlit night" => moonlit_night(),
         "Starry night" => starry_night(),
+        "Stratocumulus low sun" => stratocumulus_low_sun(),
+        "Stratocumulus high sun" => stratocumulus_high_sun(),
+        "Altocumulus" => altocumulus(),
+        "Cumulus" => cumulus(),
+        "Stratus" => stratus(),
+        "Cirrus" => cirrus(),
+        "Cirrostratus" => cirrostratus(),
+        "After rain" => after_rain(),
+        "Overcast and wet" => overcast_and_wet(),
+        "Heavy rain" => heavy_rain(),
+        "Misty winter morning" => misty_winter_morning(),
+        "Snowy sunny day" => snowy_sunny_day(),
+        "After the shower" => after_the_shower(),
         "Three-point" => three_point(),
         "Top softbox" => top_softbox(),
         "Rim pair" => rim_pair(),
@@ -92,7 +128,13 @@ pub fn preset(name: &str) -> Option<HdriParams> {
         "Car showroom" => car_showroom(),
         "Hexagon studio" => hexagon_studio(),
         "Road tunnel" => road_tunnel(),
+        "Bridge" => bridge(),
+        "Bridge at night" => bridge_at_night(),
         "LED portal" => led_portal(),
+        "Open boxes" => open_boxes(),
+        "Umbrellas" => umbrellas(),
+        "Open loft" => open_loft(),
+        "Factory hall" => factory_hall(),
         _ => return None,
     })
 }
@@ -225,6 +267,158 @@ fn starry_night() -> HdriParams {
     night.stars = 1.0;
     night.star_brightness = 2.0;
     night.glow_strength = 1.5;
+    p
+}
+
+
+/// One cloud type alone in the sky (2026-11-07): Clear noon's air (haze 0.8, the haze the kept
+/// looks were matched at) with no older 2D cloud, a manual sun in the east-southeast at
+/// `elevation_deg`, and one layer of `genus` at its defaults, `cover` its share of the sky (None:
+/// the type's own), then `rows` sets the rows that make the look. The clock is set to a time that
+/// puts the sun there at 45°N.
+fn cloud_sky(seed: u32, genus: CloudGenus, elevation_deg: f32, month: u32, day: u32, hour: f32, cover: Option<f32>, rows: impl FnOnce(&mut CloudLayerParams)) -> HdriParams {
+    let mut p = sky(seed, elevation_deg, 124.0, month, day, hour);
+    p.sky.atmosphere.haze = 0.8;
+    p.sky.clouds.coverage = 0.0;
+    p.sky.clouds.cirrus = 0.0;
+    let mut layer = CloudLayerParams::new(genus, &[], seed);
+    if cover.is_some() {
+        layer.cover = cover;
+    }
+    rows(&mut layer);
+    p.sky.cloud_stack = Some(CloudStackParams { cover: 1.0, layers: vec![layer], ..CloudStackParams::default() });
+    p
+}
+
+/// The Stratocumulus' low-sun look (the look runner's round 50): the turbulence deck (Billows
+/// under 0.5) 600 m deep, warm light raking its underside.
+fn stratocumulus_low_sun() -> HdriParams {
+    cloud_sky(31, CloudGenus::Stratocumulus, 8.0, 2, 1, 8.3, Some(0.85), |l| {
+        let b = l.stratocumulus.get_or_insert_with(StratocumulusParams::default);
+        b.tops_m = 1800.0;
+        b.billows = 0.2;
+    })
+}
+
+/// The Stratocumulus' high-sun look (round 22): the cell deck (Billows 0.5), its rounded lumps
+/// with dark crevices between.
+fn stratocumulus_high_sun() -> HdriParams {
+    cloud_sky(32, CloudGenus::Stratocumulus, 40.0, 9, 1, 9.3, Some(0.8), |l| {
+        l.stratocumulus.get_or_insert_with(StratocumulusParams::default).tops_m = 1500.0;
+    })
+}
+
+/// The Altocumulus' kept look (ac2): small rounded cloudlets in rows at 3.5 km, sunlit edges.
+fn altocumulus() -> HdriParams {
+    cloud_sky(33, CloudGenus::Altocumulus, 30.0, 9, 22, 8.8, Some(0.42), |l| {
+        l.altocumulus.get_or_insert_with(AltocumulusParams::default).base_m = 3500.0;
+    })
+}
+
+/// The Cumulus' kept look (cu3): separate heaps at Size 1.5 km, white on the sunny sides.
+fn cumulus() -> HdriParams {
+    cloud_sky(34, CloudGenus::Cumulus, 45.0, 8, 22, 9.6, Some(0.1), |l| {
+        l.cumulus.get_or_insert_with(CumulusParams::default).tops_m = 2400.0;
+    })
+}
+
+/// A closed Stratus sheet (its new-layer Cover), the sun's glow through it.
+fn stratus() -> HdriParams {
+    cloud_sky(35, CloudGenus::Stratus, 35.0, 4, 1, 9.2, None, |_| {})
+}
+
+/// Cirrus: wind-combed streaks with hooked ends, high up.
+fn cirrus() -> HdriParams {
+    cloud_sky(37, CloudGenus::Cirrus, 35.0, 4, 1, 9.2, Some(0.35), |_| {})
+}
+
+/// Cirrostratus: a thin milky veil of ice over the blue.
+fn cirrostratus() -> HdriParams {
+    cloud_sky(38, CloudGenus::Cirrostratus, 35.0, 4, 1, 9.2, Some(0.9), |_| {})
+}
+
+/// A weather over a Manual sky (the weather lane, 2026-11-09): `weather`'s kind adds its own cloud layer as a pick in the
+/// app adds it (`add_weather_clouds`, onto the sky without older clouds), then the weather is written. Like every sky
+/// preset it brings no floor: its wet ground, puddles and snow lie on the plain ground, or on a floor added after.
+fn weathered(mut p: HdriParams, weather: WeatherParams) -> HdriParams {
+    p.sky.clouds.coverage = 0.0;
+    p.sky.clouds.cirrus = 0.0;
+    add_weather_clouds(&mut p, weather.kind());
+    p.sky.weather = Some(weather);
+    p
+}
+
+/// One more cloud layer of `genus` at Cover `cover` over the ones `p` has.
+fn with_layer(mut p: HdriParams, genus: CloudGenus, cover: f32) -> HdriParams {
+    let seed = p.seed;
+    let stack = p.sky.cloud_stack.get_or_insert_with(|| CloudStackParams { cover: 1.0, ..CloudStackParams::default() });
+    let mut layer = CloudLayerParams::new(genus, &stack.layers, seed);
+    layer.cover = Some(cover);
+    stack.layers.push(layer);
+    p
+}
+
+/// After the rain (Weather FX's "after rain, clearing"): the sun back out at 28 degrees in the afternoon over ground
+/// still wet, its hollows holding calm puddles that mirror the clearing sky; the air washed clear (haze 0.6) and a few
+/// cumulus left.
+fn after_rain() -> HdriParams {
+    let p = weathered(sky(41, 28.0, 230.0, 10, 1, 14.65), WeatherParams { wet_ground: 0.6, ..WeatherParams::default() });
+    let mut p = with_layer(p, CloudGenus::Cumulus, 0.3);
+    p.sky.atmosphere.haze = 0.6;
+    p
+}
+
+/// Overcast and wet, no rain (Weather FX's "overcast, wet, no rain"): the Overcast kind's grey deck over ground that
+/// rained a while ago, its puddles mirroring the deck.
+fn overcast_and_wet() -> HdriParams {
+    weathered(sky(42, 30.0, 200.0, 2, 15, 13.4), WeatherParams { kind: "overcast".to_string(), wet_ground: 0.7, ..WeatherParams::default() })
+}
+
+/// Heavy rain (Weather FX's "heavy rain, misty"): the Rain kind at its heaviest (10.7 mm/h) with a mist, its puddles
+/// broken by the rain into a sheen (`rain_on_water`).
+fn heavy_rain() -> HdriParams {
+    weathered(sky(43, 22.0, 200.0, 11, 22, 13.1), WeatherParams { kind: "rain".to_string(), rain: 1.0, fog: 0.25, rain_on_water: Some(true), ..WeatherParams::default() })
+}
+
+/// A misty winter morning (Weather FX's "misty winter morning"): snow on the ground and a mist over it, the sun just up
+/// in the south-east, warm through the mist toward it and grey away.
+fn misty_winter_morning() -> HdriParams {
+    let mut p = weathered(sky(44, 3.0, 125.0, 12, 1, 7.7), WeatherParams { fog: 0.4, snow: true, ..WeatherParams::default() });
+    p.sky.atmosphere.haze = 1.2;
+    p
+}
+
+/// A snowy sunny day (Weather FX's "winter snowy sunny day"): fresh snow under a clear winter sky, the sun 19 degrees
+/// up before noon, a few small cumulus.
+fn snowy_sunny_day() -> HdriParams {
+    let p = weathered(sky(45, 19.0, 160.0, 12, 22, 10.6), WeatherParams { snow: true, ..WeatherParams::default() });
+    let mut p = with_layer(p, CloudGenus::Cumulus, 0.12);
+    p.sky.atmosphere.haze = 0.7;
+    p
+}
+
+/// After the shower: the shower that passed is a wide Cumulonimbus whose near edge stands over the viewer, 9 km off to
+/// its middle and 18 km across, opposite a morning sun 15 degrees up; its dark base, 2.2 km up, fills the sky over the
+/// bow as in photos of showers, its rain falls under the whole base to the ground, the wind carrying it away from the
+/// sun, and the whole primary bow stands in that grey curtain from foot to foot with its secondary faint above it; the
+/// sky toward the sun clear with a few cumulus, the ground still wet with calm puddles that mirror the bow (no rain falls
+/// here any more). A full arc needs that: at a sun of 15 the bow's feet stand about 40 degrees to either side of the
+/// antisolar point, so the rain must reach that far at its distance (round 3's storm, 9 km off and 10 km wide, held only
+/// the bow's crest, and the white tower over it read nothing like the photos). Its anvil is small (an anvil reaching
+/// over the viewer toward the sun read as a hairy disc).
+fn after_the_shower() -> HdriParams {
+    let p = weathered(sky(34, 15.0, 90.0, 4, 17, 6.71), WeatherParams { wet_ground: 0.8, ..WeatherParams::default() });
+    let p = with_layer(p, CloudGenus::Cumulus, 0.1);
+    let mut p = with_layer(p, CloudGenus::Cumulonimbus, 1.0);
+    if let Some(layer) = p.sky.cloud_stack.as_mut().and_then(|stack| stack.layers.iter_mut().find(|l| l.genus() == Some(CloudGenus::Cumulus))) {
+        layer.cumulus.get_or_insert_with(CumulusParams::default).tops_m = 2400.0;
+    }
+    if let Some(layer) = p.sky.cloud_stack.as_mut().and_then(|stack| stack.layers.last_mut()) {
+        layer.wind_deg = Some(270.0);
+        let storm = layer.cumulonimbus.get_or_insert_with(CumulonimbusParams::default);
+        (storm.azimuth_deg, storm.distance_km, storm.tower_km, storm.base_m, storm.tops_m, storm.anvil, storm.rain_shaft) = (270.0, 9.0, 18.0, 2200.0, 11_000.0, 0.15, 1.0);
+    }
+    p.sky.atmosphere.haze = 0.8;
     p
 }
 
@@ -403,6 +597,9 @@ fn white_cyc() -> HdriParams {
         ceiling: [0.05; 3],
         floor_gloss: 0.1,
         floor_roughness: 0.5,
+        floor_material: Some("epoxy".to_string()),
+        wall_material: Some("plaster".to_string()),
+        wear: Some(0.1),
         ..RoomParams::default()
     };
     in_room(13, room, vec![
@@ -430,6 +627,8 @@ fn small_dark_studio() -> HdriParams {
         floor_roughness: 0.35,
         ceiling_grid: true,
         grid_spacing_m: 1.2,
+        floor_material: Some("epoxy".to_string()),
+        wear: Some(0.15),
         ..RoomParams::default()
     };
     in_room(14, room, vec![
@@ -455,6 +654,9 @@ fn wooden_daylight() -> HdriParams {
         floor_roughness: 0.25,
         ceiling_grid: true,
         grid_spacing_m: 2.0,
+        floor_material: Some("epoxy".to_string()),
+        wall_material: Some("planks".to_string()),
+        wear: Some(0.2),
         ..RoomParams::default()
     };
     let mut windows = sized(kit("Windows", ModifierKind::Window, 180.0, 8.0, 0.0), 70.0, 40.0);
@@ -486,6 +688,8 @@ fn neon_studio() -> HdriParams {
         floor_gloss: 0.9,
         floor_roughness: 0.08,
         stands: false,
+        floor_material: Some("planks".to_string()),
+        wear: Some(0.2),
         ..RoomParams::default()
     };
     let neon = LightParams {
@@ -495,7 +699,10 @@ fn neon_studio() -> HdriParams {
         elevation_deg: 8.0,
         softness: 0.3,
         intensity_ev: 5.5,
-        rgb: Some([1.0, 0.05, 0.1]),
+        // Neon's own saturated red and argon blue (the tube clips white at
+        // the room's exposure, its glow keeps the colour), and a little glow
+        // round it (owner, 2026-11-07).
+        rgb: Some([1.0, 0.012, 0.02]),
         stroke: Some(StrokeParams {
             points: vec![[350.0, 0.0], [354.0, 22.0], [358.0, 2.0], [2.0, 20.0], [6.0, 0.0], [10.0, 24.0], [14.0, 4.0]],
             curviness: 0.0,
@@ -503,8 +710,9 @@ fn neon_studio() -> HdriParams {
             closed: false,
             profile: Vec::new(),
             end_kelvin: None,
-            end_rgb: Some([0.1, 0.2, 1.0]),
+            end_rgb: Some([0.04, 0.1, 1.0]),
         }),
+        glow: Some(GlowParams { strength: 0.1, reach_deg: 0.6 }),
         ..LightParams::default()
     };
     let mut window = sized(kit("Window", ModifierKind::Window, 75.0, 10.0, 0.5), 34.0, 34.0);
@@ -532,6 +740,9 @@ fn umbrella_cyc() -> HdriParams {
         ceiling: [0.6, 0.6, 0.62],
         floor_gloss: 0.05,
         floor_roughness: 0.6,
+        floor_material: Some("epoxy".to_string()),
+        wall_material: Some("plaster".to_string()),
+        wear: Some(0.15),
         ..RoomParams::default()
     };
     in_room(17, room, vec![
@@ -557,6 +768,9 @@ fn car_studio() -> HdriParams {
         ceiling: [0.03; 3],
         floor_gloss: 0.3,
         floor_roughness: 0.35,
+        floor_material: Some("epoxy".to_string()),
+        wall_material: Some("plaster".to_string()),
+        wear: Some(0.1),
         ..RoomParams::default()
     };
     let overhead = LightParams {
@@ -594,6 +808,9 @@ fn car_showroom() -> HdriParams {
         floor_gloss: 0.9,
         floor_roughness: 0.02,
         stands: false,
+        floor_material: Some("polished_concrete".to_string()),
+        wall_material: Some("plaster".to_string()),
+        wear: Some(0.1),
         ..RoomParams::default()
     };
     let (camera, half_x, half_z) = (room.camera_height_m, 0.5 * room.width_m, 0.5 * room.depth_m);
@@ -655,6 +872,9 @@ fn hexagon_studio() -> HdriParams {
         floor_gloss: 0.45,
         floor_roughness: 0.12,
         stands: false,
+        floor_material: Some("epoxy".to_string()),
+        wall_material: Some("plaster".to_string()),
+        wear: Some(0.1),
         ..RoomParams::default()
     };
     // Hung 15 cm under the ceiling, a little north of straight overhead (off the pole of its frame).
@@ -731,6 +951,10 @@ fn flat_pattern(name: &str, pattern: PatternParams, centre_m: [f32; 3], down: bo
 /// than the tunnel, as a real one is by day. The rows run the tunnel's length, so their fittings
 /// close up and shrink toward each mouth and lie as dotted streaks of light along a car's flanks,
 /// shoulders and glass.
+///
+/// A hybrid (2026-11-05): both ends and the floor stand open, so the tunnel stands on the scene's
+/// ground, a two-lane Road (the ground's own, running on out of both mouths) with the tunnel's
+/// concrete beside it, and the outside is the scene's outdoor one.
 fn road_tunnel() -> HdriParams {
     let (width, height, lane) = (11.0, 6.5, 3.75);
     let room = RoomParams {
@@ -744,10 +968,13 @@ fn road_tunnel() -> HdriParams {
         floor_gloss: 0.1,
         floor_roughness: 0.5,
         stands: false,
-        open_walls: Some("ends".to_string()),
-        road: Some(RoadParams { lane_width_m: lane, gloss: 0.05, roughness: 0.5, dash_m: 3.0, gap_m: 9.0, ..RoadParams::default() }),
+        sides: Some(RoomSides { north: true, south: true, floor: true, ..RoomSides::default() }),
+        wall_material: Some("form_concrete".to_string()),
+        ceiling_material: Some("form_concrete".to_string()),
+        wear: Some(0.5),
         ..RoomParams::default()
     };
+    let ground = road_ground(lane, "room", room.floor);
     // From the camera: the rows over the road's edges, 0.3 m under the ceiling.
     let y = height - room.camera_height_m - 0.3;
     let west = tunnel_lights("Lights west", [-lane, y, 0.0], 1.0);
@@ -759,6 +986,7 @@ fn road_tunnel() -> HdriParams {
         exit_sign("Exit sign east", [east_wall, 1.3, 14.0], -1.0),
     ];
     let mut p = in_room(20, room, [west, east].into_iter().chain(signs).collect());
+    p.floor = Some(ground);
     // The day outside both mouths: the sun high in the south-southeast.
     p.sky.sun.mode = "manual".to_string();
     p.sky.sun.elevation_deg = 40.0;
@@ -767,18 +995,111 @@ fn road_tunnel() -> HdriParams {
     p
 }
 
+/// A bridge seen from under it (2026-11-05): a very short tunnel, 12 m of grey concrete deck 5.5 m
+/// over a two-lane country road, 16 m between its abutments, the camera at a car's height on the
+/// road's middle line. Both ends and the floor stand open: the ground's road runs on out of both
+/// sides of the bridge, grass beside it, under the scene's own day (a high sun, a few clouds). Two
+/// short rows of LED fittings under the deck over the road's edges (the east one the key), dim
+/// against the day through its ends and off the road.
+fn bridge() -> HdriParams {
+    let room = RoomParams {
+        width_m: 16.0,
+        depth_m: 12.0,
+        height_m: 5.5,
+        camera_height_m: 1.2,
+        floor: [0.32, 0.32, 0.31],
+        wall: [0.42, 0.41, 0.39],
+        ceiling: [0.30, 0.30, 0.29],
+        floor_gloss: 0.05,
+        floor_roughness: 0.6,
+        stands: false,
+        sides: Some(RoomSides { north: true, south: true, floor: true, ..RoomSides::default() }),
+        wall_material: Some("form_concrete".to_string()),
+        ceiling_material: Some("form_concrete".to_string()),
+        wear: Some(0.4),
+        ..RoomParams::default()
+    };
+    let ground = road_ground(3.5, "grass", room.floor);
+    // Two short rows under the deck over the road's edges, as the tunnel's (straight over the camera a row lay at the
+    // map's pole, where its texels sample it worst).
+    let y = room.height_m - room.camera_height_m - 0.2;
+    let mut west = lights_row("Underpass lights west", [-3.5, y, 0.0], 1.0, 10.0);
+    let mut east = lights_row("Underpass lights east", [3.5, y, 0.0], -1.0, 10.0);
+    (west.intensity_ev, east.intensity_ev) = (3.5, 3.5);
+    east.key = true;
+    let mut p = in_room(21, room, vec![west, east]);
+    p.floor = Some(ground);
+    p.sky.sun.mode = "manual".to_string();
+    p.sky.sun.elevation_deg = 45.0;
+    p.sky.sun.azimuth_deg = 200.0;
+    p.sky.clouds.coverage = 0.35;
+    p
+}
+
+/// The Bridge after dark (2026-11-07): the same underpass under a moonlit night, the sun 25
+/// degrees under the west-northwest horizon and a bright moon low in the east-southeast, the
+/// road bending to the right 40 m ahead of the viewer, past the north mouth (a 120 m radius).
+/// The bridge's own rows under the deck are turned up to the tunnel's level (5.5 EV, dim against
+/// the day in the Bridge). At night they are the underpass's only light and light the road under the deck.
+fn bridge_at_night() -> HdriParams {
+    let mut p = bridge();
+    for light in &mut p.lights {
+        light.intensity_ev = 5.5;
+    }
+    p.sky.sun.elevation_deg = -25.0;
+    p.sky.sun.azimuth_deg = 285.0;
+    p.sky.clouds.coverage = 0.15;
+    let night = &mut p.sky.night;
+    night.moon = true;
+    night.moon_elevation_deg = 25.0;
+    night.moon_azimuth_deg = 110.0;
+    night.moon_size_deg = 0.52;
+    night.moon_brightness = 1.5;
+    night.stars = 0.35;
+    night.star_brightness = 0.8;
+    night.glow_strength = 0.8;
+    if let Some(ground) = p.floor.as_mut() {
+        ground.curve = Some("right".to_string());
+        ground.curve_radius_m = Some(120.0);
+        ground.curve_start_m = Some(40.0);
+    }
+    p
+}
+
+/// The ground a road tunnel or a bridge stands on: a two-lane Road, `lane_m` a lane, its lines
+/// painted, a little worn, `beside` (`ROAD_BESIDE_NAMES`) along it (a room's: `room_floor`).
+fn road_ground(lane_m: f32, beside: &str, room_floor: [f32; 3]) -> FloorParams {
+    FloorParams {
+        kind: "road".to_string(),
+        lanes: 2,
+        lane_width_m: Some(lane_m),
+        wear: 0.2,
+        markings: true,
+        beside: Some(beside.to_string()),
+        beside_color: Some(room_floor),
+        ..FloorParams::default()
+    }
+}
+
 /// One row of tunnel lights along the tunnel (north to south), its middle at `middle_m`: a pattern
-/// light of one column of bars, each a 1.2 m LED fitting 0.3 m wide, one every 1.8 m, the row as
-/// long as the tunnel less a metre at each mouth. Its face lies along the row and looks down,
-/// tilted 25 degrees toward the road's middle (`toward` +1 to the east, -1 to the west); diffuse,
-/// so the far fittings still glow as they turn edge-on.
+/// light of one column of bars, each a tunnel luminaire (2026-11-10): a 1.3 m frosted diffuser 0.18 m
+/// wide, square at its ends, in a long, narrow grey housing about 1.5 x 0.3 m (`PatternParams::housing`,
+/// drawn and lit by the room), one every 1.8 m, the row as long as the tunnel less a metre at each
+/// mouth. Its face lies along the row and looks down, tilted 25 degrees toward the road's middle
+/// (`toward` +1 to the east, -1 to the west); diffuse, so the far fittings still glow as they turn
+/// edge-on.
 fn tunnel_lights(name: &str, middle_m: [f32; 3], toward: f32) -> LightParams {
-    let (fitting, between) = (1.2, 0.6);
-    let fittings = (58.0f32 / (fitting + between)).floor() as u32;
+    lights_row(name, middle_m, toward, 58.0)
+}
+
+/// A row of tunnel lights (`tunnel_lights`) `length_m` long: as many fittings as fit.
+fn lights_row(name: &str, middle_m: [f32; 3], toward: f32, length_m: f32) -> LightParams {
+    let (fitting, between) = (1.3, 0.5);
+    let fittings = (length_m / (fitting + between)).floor().max(1.0) as u32;
     let pattern = PatternParams {
         source: "bars".to_string(),
         cell_m: fitting,
-        tube_m: 0.3,
+        tube_m: 0.18,
         rows: fittings,
         columns: 1,
         gap_m: between,
@@ -786,9 +1107,10 @@ fn tunnel_lights(name: &str, middle_m: [f32; 3], toward: f32) -> LightParams {
         mount_spacing_m: 0.0,
         mount_dim: 0.5,
         corner_dim: 0.0,
+        housing: Some(0.5),
         ..PatternParams::default()
     };
-    let [width_m, height_m] = natural_size_m(&pattern).unwrap_or([0.5, 58.0]);
+    let [width_m, height_m] = natural_size_m(&pattern).unwrap_or([0.5, length_m]);
     let tilt = 25f32.to_radians();
     let front = vec3f(toward * tilt.sin(), -tilt.cos(), 0.0);
     let (yaw_deg, pitch_deg, roll_deg) = face_turn(middle_m, front, vec3f(0.0, 0.0, -1.0));
@@ -938,6 +1260,8 @@ fn led_portal() -> HdriParams {
         floor_gloss: 0.9,
         floor_roughness: 0.03,
         stands: false,
+        floor_material: Some("epoxy".to_string()),
+        wear: Some(0.1),
         ..RoomParams::default()
     };
     let svg = PatternSvg::new(portal_svg());
@@ -1001,14 +1325,181 @@ fn portal(name: &str, z_m: f32, floor_y_m: f32, svg: &PatternSvg) -> LightParams
     light
 }
 
+
+/// One studio light of `kind` with its modifier's `baffle` set (modifier.rs: a softbox's 0.7 the
+/// inner baffle alone, 1 the open box; an umbrella's 0 the parabolic with its front diffuser, 0.6
+/// the white bounce).
+fn baffled(mut light: LightParams, baffle: f32) -> LightParams {
+    if let Some(modifier) = light.modifier.as_mut() {
+        modifier.baffle = baffle;
+    }
+    light
+}
+
+/// The studio lights' cloth boxes up close (2026-11-07), large in front of the camera on a grey
+/// cyc under a dark ceiling: an open softbox (its bare tube, crumpled silver walls and flat back
+/// panel round the ring, the key), an open octabox beside it and an inner-baffle softbox (the lining's
+/// folded walls round its hot core) to the east.
+fn open_boxes() -> HdriParams {
+    let room = RoomParams {
+        width_m: 11.0,
+        depth_m: 11.0,
+        height_m: 4.8,
+        cove_m: 1.5,
+        cove_walls: "back".to_string(),
+        floor: [0.3, 0.3, 0.31],
+        wall: [0.34, 0.34, 0.35],
+        ceiling: [0.04; 3],
+        floor_gloss: 0.15,
+        floor_roughness: 0.45,
+        floor_material: Some("epoxy".to_string()),
+        wall_material: Some("plaster".to_string()),
+        wear: Some(0.1),
+        ..RoomParams::default()
+    };
+    in_room(24, room, vec![
+        as_key(baffled(sized(kit("Open softbox", ModifierKind::Softbox, 335.0, 12.0, 5.0), 34.0, 26.0), 1.0)),
+        baffled(sized(kit("Open octabox", ModifierKind::Octabox, 25.0, 14.0, 5.0), 34.0, 34.0), 1.0),
+        baffled(sized(kit("Inner baffle softbox", ModifierKind::Softbox, 80.0, 10.0, 4.5), 30.0, 22.0), 0.7),
+    ])
+}
+
+/// The studio lights' umbrellas up close (2026-11-07), large in front of the camera on a grey cyc:
+/// a white shoot-through umbrella (its ribs to the hem's corners as metal rods, the folds the rib
+/// tips pull), a shallow silver umbrella (its ring, spokes, stretchers and stitched seams into the
+/// hub) and a parabolic with its front diffuser stretched over the rib tips, to the east.
+fn umbrellas() -> HdriParams {
+    let room = RoomParams {
+        width_m: 11.0,
+        depth_m: 11.0,
+        height_m: 4.8,
+        cove_m: 1.5,
+        cove_walls: "back".to_string(),
+        floor: [0.42, 0.42, 0.44],
+        wall: [0.46, 0.46, 0.48],
+        ceiling: [0.05; 3],
+        floor_gloss: 0.08,
+        floor_roughness: 0.55,
+        floor_material: Some("epoxy".to_string()),
+        wall_material: Some("plaster".to_string()),
+        wear: Some(0.1),
+        ..RoomParams::default()
+    };
+    in_room(25, room, vec![
+        as_key(sized(kit("White umbrella", ModifierKind::Umbrella, 335.0, 14.0, 5.0), 38.0, 38.0)),
+        sized(kit("Silver umbrella", ModifierKind::SilverUmbrella, 25.0, 14.0, 4.5), 34.0, 34.0),
+        baffled(sized(kit("Parabolic", ModifierKind::Umbrella, 80.0, 12.0, 4.5), 34.0, 34.0), 0.0),
+    ])
+}
+
+
+/// A hybrid studio (2026-11-07): a pale loft whose east wall stands open to the outside and whose
+/// back wall has two tall sash windows in black classical surrounds (pilasters, brackets, a cornice
+/// cap, a sill and a panelled apron, after the apartment facade kit), with a panelled door under a
+/// transom in the west wall, the windows and the door one building's set (`RoomWindow::with_kit`,
+/// Victorian, one seed): the scene's own day (a sun in the south-west, a few clouds, the skyline and
+/// the ground) seen through the windows and lighting the room through them, with one softbox as the key.
+fn open_loft() -> HdriParams {
+    use super::{RoomWindow, WindowKit};
+    let set = 11;
+    let window = |along_m: f32| RoomWindow { wall: "north".to_string(), along_m, sill_m: 0.85, width_m: 1.5, height_m: 2.3, ..RoomWindow::default() }.with_kit(WindowKit::Victorian, set, false);
+    let door = RoomWindow { wall: "west".to_string(), along_m: 0.0, width_m: 1.05, height_m: 2.65, ..RoomWindow::default() }.with_kit(WindowKit::Victorian, set, true);
+    let room = RoomParams {
+        width_m: 12.0,
+        depth_m: 10.0,
+        height_m: 4.0,
+        floor: [0.36, 0.27, 0.18],
+        wall: [0.72, 0.71, 0.68],
+        ceiling: [0.7, 0.7, 0.68],
+        floor_gloss: 0.3,
+        floor_roughness: 0.3,
+        sides: Some(RoomSides { east: true, ..RoomSides::default() }),
+        windows: Some(vec![window(-2.6), window(2.6), door]),
+        floor_material: Some("herringbone".to_string()),
+        wall_material: Some("plaster".to_string()),
+        ceiling_material: Some("plaster".to_string()),
+        wear: Some(0.35),
+        ..RoomParams::default()
+    };
+    let mut p = in_room(27, room, vec![as_key(sized(kit("Softbox", ModifierKind::Softbox, 300.0, 10.0, 4.0), 22.0, 28.0))]);
+    p.sky.sun.mode = "manual".to_string();
+    p.sky.sun.elevation_deg = 35.0;
+    p.sky.sun.azimuth_deg = 140.0;
+    p.sky.clouds.coverage = 0.3;
+    p
+}
+
+/// A factory hall by day (2026-11-07), after the factory facade kit: a large hall of pale painted
+/// brick under a dark roof, tall steel windows of many panes with segmental heads on concrete sills
+/// under lintels in its north and east walls, and in its west wall flush steel double doors and a
+/// roller shutter under its coil box, all one building's set (`RoomWindow::with_kit`, Factory, one
+/// seed). A morning sun in the south-east falls in through the east windows in long patches of
+/// their panes on the concrete floor; one softbox high over the floor is the key.
+fn factory_hall() -> HdriParams {
+    use super::{RoomWindow, WindowKit};
+    let set = 7;
+    let window = |wall: &str, along_m: f32| RoomWindow { wall: wall.to_string(), along_m, sill_m: 1.3, width_m: 2.8, height_m: 4.4, depth_m: Some(0.35), ..RoomWindow::default() }.with_kit(WindowKit::Factory, set, false);
+    let mut windows: Vec<RoomWindow> = [-7.5, -2.5, 2.5, 7.5].iter().map(|&a| window("north", a)).collect();
+    windows.extend([-10.0, -5.0, 0.0, 5.0, 10.0].iter().map(|&a| window("east", a)));
+    let door = |along_m: f32, width_m: f32, height_m: f32, leaf: &str| {
+        RoomWindow { wall: "west".to_string(), along_m, width_m, height_m, depth_m: Some(0.35), leaf: Some(leaf.to_string()), frame_m: 0.06, ..RoomWindow::default() }.with_kit(WindowKit::Factory, set, true)
+    };
+    windows.push(door(-6.0, 2.0, 2.3, "flush"));
+    windows.push(door(4.0, 4.6, 4.4, "shutter"));
+    let room = RoomParams {
+        width_m: 24.0,
+        depth_m: 30.0,
+        height_m: 9.0,
+        floor: [0.3, 0.29, 0.27],
+        wall: [0.62, 0.6, 0.56],
+        ceiling: [0.22, 0.22, 0.23],
+        floor_gloss: 0.15,
+        floor_roughness: 0.5,
+        stands: false,
+        windows: Some(windows),
+        floor_material: Some("polished_concrete".to_string()),
+        wall_material: Some("painted_brick".to_string()),
+        ceiling_material: Some("form_concrete".to_string()),
+        wear: Some(0.45),
+        ..RoomParams::default()
+    };
+    let mut p = in_room(28, room, vec![as_key(sized(kit("Softbox", ModifierKind::Softbox, 200.0, 55.0, 3.0), 20.0, 20.0))]);
+    p.sky.sun.mode = "manual".to_string();
+    p.sky.sun.elevation_deg = 32.0;
+    p.sky.sun.azimuth_deg = 120.0;
+    p.sky.clouds.coverage = 0.25;
+    p
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::atmosphere::sun_direction;
     use crate::{LightShape, Mode, SunMode, LIGHT_LIMIT};
 
-    const SKY: [&str; 7] = ["Clear noon", "Golden hour", "Sunset", "Overcast", "Blue hour", "Moonlit night", "Starry night"];
-    const STUDIO: [&str; 16] = [
+    const SKY: [&str; 20] = [
+        "Clear noon",
+        "Golden hour",
+        "Sunset",
+        "Overcast",
+        "Blue hour",
+        "Moonlit night",
+        "Starry night",
+        "Stratocumulus low sun",
+        "Stratocumulus high sun",
+        "Altocumulus",
+        "Cumulus",
+        "Stratus",
+        "Cirrus",
+        "Cirrostratus",
+        "After rain",
+        "Overcast and wet",
+        "Heavy rain",
+        "Misty winter morning",
+        "Snowy sunny day",
+        "After the shower",
+    ];
+    const STUDIO: [&str; 22] = [
         "Three-point",
         "Top softbox",
         "Rim pair",
@@ -1024,7 +1515,13 @@ mod tests {
         "Car showroom",
         "Hexagon studio",
         "Road tunnel",
+        "Bridge",
+        "Bridge at night",
         "LED portal",
+        "Open boxes",
+        "Umbrellas",
+        "Open loft",
+        "Factory hall",
     ];
 
     /// The sun's elevation as the model computes it, in Time mode (NOAA) or Manual mode alike.
@@ -1119,7 +1616,7 @@ mod tests {
                 off.push(format!("{name} ({angle:.1} deg)"));
             }
         }
-        assert_eq!(manual_presets, 6, "every sky preset but Clear noon is Manual");
+        assert_eq!(manual_presets, 19, "every sky preset but Clear noon is Manual");
         assert!(off.is_empty(), "Time mode puts the sun away from the manual sun in: {}", off.join(", "));
     }
 

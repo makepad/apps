@@ -25,6 +25,8 @@ pub enum Editor {
     /// Kept so a saved layout that names it still reads.
     Camera,
     Features,
+    /// The selected part's build as a row of steps, under the plate view.
+    Steps,
     Code,
     Mechanics,
     Slice,
@@ -78,6 +80,10 @@ pub enum Editor {
     /// Where the 3D models of electronics parts may come from, and every external resource's
     /// licence.
     ModelSources,
+    /// The project's targets and the evidence for each verdict.
+    Requirements,
+    Bom,
+    Journal,
 }
 
 /// The kinds of editor the app's gates ask about: a sim, a host or a park follows whether an
@@ -98,10 +104,10 @@ pub enum Family {
 /// Experimental's editors are offered only while View › Experimental has their family on.
 pub const MENU: [(&str, &[Editor]); 7] = [
     ("3D views", &[Editor::Viewport, Editor::Device]),
-    ("Plate data", &[Editor::Plates, Editor::Parts, Editor::Part, Editor::Code]),
+    ("Plate data", &[Editor::Plates, Editor::Parts, Editor::Part, Editor::Steps, Editor::Code, Editor::Journal]),
     ("Print", &[Editor::Slicer, Editor::Overrides, Editor::TestPrints, Editor::Settings, Editor::Printer, Editor::Calibrate, Editor::Jobs]),
     ("Analysis", &[Editor::Slice, Editor::Strength, Editor::Force, Editor::Mechanics, Editor::Performance]),
-    ("Electronics", &[Editor::Circuit, Editor::Board, Editor::Library, Editor::Checks, Editor::Bench, Editor::BoardControls, Editor::Scope, Editor::Transport, Editor::Firmware]),
+    ("Electronics", &[Editor::Circuit, Editor::Board, Editor::Library, Editor::Checks, Editor::Requirements, Editor::Bom, Editor::Bench, Editor::BoardControls, Editor::Scope, Editor::Transport, Editor::Firmware]),
     ("Experimental", &[Editor::Arm, Editor::ArmCell, Editor::ArmCompare, Editor::Scan, Editor::ScanView]),
     ("Settings", &[Editor::ModelSources]),
 ];
@@ -126,7 +132,7 @@ const fn def(editor: Editor, tab: LiveId, kind: LiveId, name: &'static str, titl
 }
 
 /// Every editor, in [`Editor`]'s order.
-pub const EDITORS: [EditorDef; 37] = [
+pub const EDITORS: [EditorDef; 41] = [
     def(Editor::Viewport, live_id!(tab_viewport), live_id!(Viewport), "Plate", "Plate", true),
     def(Editor::Device, live_id!(tab_device), live_id!(Device), "3D view", "3D view", false),
     def(Editor::Plates, live_id!(tab_plates), live_id!(Plates), "Plates", "Plates", false),
@@ -138,6 +144,7 @@ pub const EDITORS: [EditorDef; 37] = [
     def(Editor::Calibrate, live_id!(tab_calibrate), live_id!(Calibrate), "Calibrate", "Calibrate", false),
     def(Editor::Camera, live_id!(tab_camera), live_id!(Camera), "Camera", "Camera", false),
     def(Editor::Features, live_id!(tab_features), live_id!(Features), "Features", "Features", false),
+    def(Editor::Steps, live_id!(tab_steps), live_id!(Steps), "Steps", "Steps", false),
     def(Editor::Code, live_id!(tab_code), live_id!(Code), "Program", "Program", false),
     def(Editor::Mechanics, live_id!(tab_mechanics), live_id!(Mechanics), "Mechanics", "Mechanics", false),
     def(Editor::Slice, live_id!(tab_slice), live_id!(Slice), "Slice", "Slice", false),
@@ -164,6 +171,9 @@ pub const EDITORS: [EditorDef; 37] = [
     def(Editor::Jobs, live_id!(tab_jobs), live_id!(Jobs), "Jobs", "Jobs", false),
     def(Editor::Performance, live_id!(tab_performance), live_id!(Performance), "Performance", "Performance", false),
     def(Editor::ModelSources, live_id!(tab_model_sources), live_id!(ModelSources), "Model sources", "Model sources", false),
+    def(Editor::Requirements, live_id!(tab_requirements), live_id!(Requirements), "Requirements", "Requirements", false),
+    def(Editor::Bom, live_id!(tab_bom), live_id!(Bom), "BOM", "BOM", false),
+    def(Editor::Journal, live_id!(tab_journal), live_id!(Journal), "Journal", "Journal", false),
 ];
 
 // The table is in the enum's order, so an editor finds its row by its discriminant; each editor
@@ -233,7 +243,7 @@ impl Editor {
             Editor::Arm | Editor::ArmCell | Editor::ArmCompare => Some(Family::Arm),
             Editor::Scan | Editor::ScanView => Some(Family::Scan),
             Editor::Device | Editor::Board | Editor::Circuit | Editor::Bench | Editor::Scope | Editor::Transport | Editor::Firmware
-            | Editor::Library | Editor::Checks | Editor::BoardControls => Some(Family::Electronics),
+            | Editor::Library | Editor::Checks | Editor::Requirements | Editor::Bom | Editor::BoardControls => Some(Family::Electronics),
             _ => None,
         }
     }

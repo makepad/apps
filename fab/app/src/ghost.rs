@@ -43,11 +43,61 @@ pub struct AreasRequest {
 #[derive(Debug)]
 pub struct AreasAction(pub u64, pub Arc<Vec<MarkedArea>>);
 
+/// One step of a part's build to show: the part's mesh as it was at `solid`, built off the UI
+/// thread from the program the plate was made from.
+pub struct StepRequest {
+    pub gen: u64,
+    pub program: Arc<fab_model::program::Compiled>,
+    pub model: Arc<Vec<PartParams>>,
+    pub value: Option<(String, PValue)>,
+    /// The plate the part is on: its whole mesh and frame, and what else is shown.
+    pub plate: Arc<fab_model::eval::Evaluated>,
+    /// The scene's name.
+    pub name: String,
+    pub instance: String,
+    /// The step's solid in the instance's script.
+    pub solid: String,
+    /// The placed part, an index into `plate`'s parts.
+    pub part: usize,
+    /// The step's number and the part's step count, for the log.
+    pub n: usize,
+    pub of: usize,
+}
+
+impl StepRequest {
+    fn render(&self, eval: &mut fab_model::eval::Evaluator, cancelled: &dyn Fn() -> bool) -> Result<fab_plate::RenderMesh, String> {
+        let inst = self.program.instance(&self.instance).ok_or_else(|| format!("no instance {}", self.instance))?;
+        let frame = self.plate.placed_frame(self.part).ok_or("the placed part is gone")?;
+        let render = |eval: &mut fab_model::eval::Evaluator, script: &fab_model::program::Script| {
+            let i = script.program.solids.iter().position(|s| s.id == self.solid).ok_or_else(|| format!("no solid {}", self.solid))?;
+            eval.step_render(script, i, frame, Some(cancelled))
+        };
+        match &self.value {
+            Some((key, value)) => render(eval, &params::with_value(&self.program, &self.model, key, value)?),
+            None => render(eval, &inst.script),
+        }
+    }
+}
+
+/// A step's plate and scene, ready to show.
+#[derive(Debug)]
+pub struct StepShown {
+    pub gen: u64,
+    pub n: usize,
+    pub of: usize,
+    pub plate: Arc<fab_model::eval::Evaluated>,
+    pub scene: Arc<fab::model::Scene>,
+    pub mesh_ms: f64,
+    pub scene_ms: f64,
+}
+
 pub struct GhostWorker {
     strand: Strand<fab_model::eval::Evaluator>,
     version: Version,
     /// The areas' own: a ghost never drops them, nor they a ghost.
     areas: Version,
+    /// The step requests' own: they replace only each other.
+    steps: Version,
 }
 
 impl GhostWorker {
@@ -58,6 +108,7 @@ impl GhostWorker {
             strand: Strand::with_state(&cx.task_pool(), "fab ghost", eval),
             version: Version::new(),
             areas: Version::new(),
+            steps: Version::new(),
         }
     }
 
@@ -67,6 +118,42 @@ impl GhostWorker {
             let areas = build_areas(eval, &req);
             Cx::post_action(AreasAction(req.gen, Arc::new(areas)));
         }).detach();
+    }
+
+    /// Replace queued step builds with this one. The running one stops at its next check once a
+    /// newer request is queued; a stale or failed build posts nothing.
+    pub fn step(&self, req: StepRequest) {
+        let ticket = self.steps.next();
+        let stale = ticket.clone();
+        self.strand.submit(Class::Interactive, ticket, move |eval| {
+            let started = std::time::Instant::now();
+            let cancelled = || stale.is_stale();
+            let render = match req.render(eval, &cancelled) {
+                Ok(render) => render,
+                Err(e) => {
+                    if !stale.is_stale() {
+                        log!("fab steps: step {}/{} of {} failed: {e}", req.n, req.of, req.instance);
+                    }
+                    return;
+                }
+            };
+            if stale.is_stale() {
+                return;
+            }
+            let mesh_ms = started.elapsed().as_secs_f64() * 1e3;
+            let shown = req.plate.with_step(req.part, render);
+            let scene = crate::plate_scene::build_step(&shown, &req.name, req.part, &req.plate.render[req.part]);
+            let scene_ms = started.elapsed().as_secs_f64() * 1e3 - mesh_ms;
+            if stale.is_stale() {
+                return;
+            }
+            Cx::post_action(StepShown { gen: req.gen, n: req.n, of: req.of, plate: Arc::new(shown), scene, mesh_ms, scene_ms });
+        }).detach();
+    }
+
+    /// Drop the step being built and any queued: the view went back to the whole part.
+    pub fn cancel_steps(&self) {
+        self.steps.bump();
     }
 
     /// Replace queued ghosts; publish the running ghost before taking the newest.
@@ -190,4 +277,28 @@ fn feature_edges(pos: &[[f64; 3]], tris: &[[u32; 3]]) -> Vec<[u32; 2]> {
         .collect();
     out.sort_unstable();
     out
+}
+
+#[cfg(test)]
+mod step_tests {
+    use super::*;
+
+    #[test]
+    fn command_draft_renders_the_rebound_step_in_the_committed_placement() {
+        let machine = fab_plate::machine::Machine::dual_nozzle_350();
+        let mut session = fab_ai::Session::new(machine.clone(), std::env::temp_dir());
+        let file = "block.cad.splash";
+        let src = format!("{}let left = m.brep.box({{size: [20mm 20mm 20mm]}})\nlet right = m.brep.box({{size: [10mm 10mm 10mm] at: [40mm 0 0]}})\nlet legs = m.brep.union(left, right)\nobject(legs)\n", fab_model::program::EMPTY);
+        let plate = session.replace_model(fab_model::FabModel::with_script("block", file, &src), None).unwrap();
+        let whole = plate.render[0].indices.clone();
+        let compiled = session.compiled.clone().unwrap();
+        let (draft, _, model) = session.preview_changes(&[fab_model::Change::Script { file: file.into(), edit: makepad_model_script::lang::edit::Edit::After { solid: "left".into(), code: "m.brep.fillet(left, 1mm)".into() } }], None).unwrap();
+        let mut eval = fab_model::eval::Evaluator::new(machine);
+        let mut req = StepRequest { gen: 1, program: compiled, model, value: None, plate, name: "block".into(), instance: "block".into(), solid: "left".into(), part: 0, n: 1, of: 2 };
+        let original = req.render(&mut eval, &|| false).unwrap();
+        req.program = draft;
+        let rounded = req.render(&mut eval, &|| false).unwrap();
+        assert!(rounded.indices.len() > original.indices.len(), "the draft resolves left at its new index and shows the added fillet");
+        assert_eq!(req.plate.render[0].indices, whole, "the committed whole-part mesh remains the ghost through the drag");
+    }
 }

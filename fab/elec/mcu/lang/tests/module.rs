@@ -282,7 +282,7 @@ fn modules_load_run_and_refuse() {
             let mut reference_scratch = vec![0; entry.program.scratch_words()];
             ir::run_ports(&entry.program, &mut reference_scratch, &mut ir::Mem {
                 ctx: &mut [], state: &mut expected, shared: ir::Shared::Read(&lowered.shared_init), bufs: &[],
-            }, &mut ir::Io { ins: [&[], &[]], outs: [&mut [], &mut []] }, 1, &mut host);
+            }, &mut ir::Io::default(), 1, &mut host);
             let mut scratch = vec![u32::MAX; m.scratch_words(k)];
             let ops = done(exec::run(&m, k, &mut actual, &mut scratch, &mut device));
             assert_eq!(actual, expected, "state: round {round}, entry {}", entry.name);

@@ -389,7 +389,7 @@ impl FabWorkspaceTabs {
         };
         if room >= 24.0 {
             let color = match cue.origin {
-                EditOrigin::Ai => ai_ink(cx),
+                EditOrigin::Ai | EditOrigin::Agent => ai_ink(cx),
                 EditOrigin::Disk | EditOrigin::Elsewhere => self.color_cue,
             };
             let words = self.note_layout(cx, &cue.words(), room);

@@ -279,6 +279,8 @@ fn touch_pairs(pcs: &[&Copper]) -> Vec<(u32, u32)> {
             (0..n as u32).filter(|i| pcs[*i as usize].layer == l).map(|i| (i, pcs[i as usize].shape.bbox())).collect();
         let index = Index::build(on.iter().map(|(i, b)| (*b, *i)).collect());
         for &(i, bbox) in &on {
+            // Gives the host's pool a turn when due: a large board's full pass ran for seconds.
+            fab_elec_core::pace::pace();
             let a = &pcs[i as usize];
             index.query(bbox, |_, j| {
                 if j > i && touch(a, &pcs[j as usize]) {
@@ -471,6 +473,7 @@ fn net_ratsnest(net: NetId, pts: &mut Vec<(u32, P, ConnItem)>) -> Vec<RatLine> {
     let mut near: Vec<Option<(i128, usize)>> = vec![None; pts.len()];
     let mut joined = ids[0];
     for _ in 1..ids.len() {
+        fab_elec_core::pace::pace();
         // `pts` is sorted by cluster: the joining cluster's anchors are one run.
         let run = pts.partition_point(|p| p.0 < joined)..pts.partition_point(|p| p.0 <= joined);
         for a in run.clone() {
@@ -767,6 +770,7 @@ pub fn connect_indexed(
         fresh_pieces.extend(index.pieces(*zone).filter_map(|p| Some((p, p.copper()?))));
     }
     for &(p, a) in &fresh_pieces {
+        fab_elec_core::pace::pace();
         if is_stale(a.item, &stale) {
             continue;
         }
@@ -813,6 +817,7 @@ pub fn connect_indexed(
     let mut pairs = Vec::new();
     // Joins between unchanged current pieces stand: neither side's copper moved, and neither was held.
     for (i, a) in pcs.iter().enumerate() {
+        fab_elec_core::pace::pace();
         if is_fresh[i] || !live[i] {
             continue;
         }
@@ -830,6 +835,7 @@ pub fn connect_indexed(
     }
     // Touches of the fresh pieces, each found once from a fresh end.
     for (i, &(p, a)) in selected.iter().enumerate() {
+        fab_elec_core::pace::pace();
         if !is_fresh[i] || !live[i] {
             continue;
         }

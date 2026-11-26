@@ -5,6 +5,37 @@ use fab_elec_parts::FpTextKind;
 use fab_elec_lang::{EvalError, NO_CANCEL, board_doc::{self, Ledger}, board_splice::{from_spans, splice_board}, evaluate, evaluate_from, source::{Sources, LIB_DOC}, splice::SpanEdit, splice_verified, std_libs, write};
 
 #[test]
+fn junction_remap_preserves_the_attached_statement_verbatim() {
+    use fab_elec_core::Path;
+    let fixture = fab_elec_fixtures::ledctl();
+    let circuit = &fixture.units[0].circuit;
+    let host = "track(\"GND\", \"F.Cu\", 0.2mm, [[1mm 1mm] [5mm 1mm]])";
+    let branch = "track( \"GND\", // this junction stays here\n  \"F.Cu\",  0.20mm, [[5mm 1mm] [6mm 1mm]] )";
+    let text = format!("board(\"ledctl\")\n{host}\n{branch}\n");
+    let mut sources = Sources::new();
+    let doc = sources.add("ledctl.pcb.splash", text).unwrap();
+    let lowered = board_doc::lower(doc, &sources.doc(doc).unwrap().text, circuit, None).unwrap();
+    let map = from_spans(doc, &lowered.spans);
+    let board = lowered.board;
+    let mut changed = board.tracks[0].clone();
+    let mut attached = board.tracks[1].clone();
+    let end = changed.path.end();
+    changed.path = Path::new(changed.path.start).line(P::mm(3.0, 3.0)).line(end);
+    attached.ends[0] = Anchor::Track { id: changed.id, at: fab_elec_board::ops::on_track(end, &changed.path).unwrap() };
+    assert_ne!(attached.ends, board.tracks[1].ends);
+    let ops = [changed, attached].map(|t| BoardOp::Replace(Item::Track(t)));
+    let splice = splice_board(&sources, &map, &board, circuit, &ops, None).unwrap();
+    assert_eq!(splice.edits.len(), 1);
+    sources.apply(&splice.edits).unwrap();
+    let written = &sources.doc(doc).unwrap().text;
+    assert!(written.contains(branch));
+    assert!(!written.contains(host));
+    let reloaded = board_doc::lower(doc, written, circuit, None).unwrap().board;
+    assert_eq!(reloaded.tracks[0].path.segs.len(), 2);
+    assert_eq!(reloaded.anchor_pos(reloaded.tracks[1].ends[0]), Some(end));
+}
+
+#[test]
 fn board_commits_preserve_text_and_follow_item_spans() {
     let fixture = fab_elec_fixtures::ledctl();
     let circuit = &fixture.units[0].circuit;

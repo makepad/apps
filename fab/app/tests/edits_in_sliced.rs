@@ -45,7 +45,7 @@ fn head(app: &TestApp) -> String {
 }
 
 fn lines(app: &TestApp, from: u64) -> Vec<String> {
-    app.log_since(from).map(|t| t.lines).unwrap_or_default()
+    app.log_since(from).expect("the app's log").lines
 }
 
 fn seq(app: &TestApp) -> u64 {

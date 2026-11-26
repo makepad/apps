@@ -1,0 +1,33 @@
+use mod.motion.*
+// BEAT WORDS, 9:16 — the portrait cut of sync_beat_words: the line wraps
+// to three or four lines at 112 px in the safe column. Original notes follow.
+// BEAT WORDS — a line that lands one word per beat of the music: the
+// stagger is `beats(1)` and the first word lands on `beat(0)`, so the text
+// follows the track's own grid (a slower or faster song re-times it). Each
+// word drops 60 px and settles within an eighth note, and the ground
+// flashes faintly on every beat.
+// Why: type that hits with the kick feels edited to the music even when
+// nothing else is; the flash makes the beat visible with the sound off.
+// Host: bind @m to the edit's music track.
+Motion{
+    label: "Beat words 9:16"
+    brief: "A line that lands one word per musical beat, with a faint flash on every beat; portrait."
+    tags: ["kinetic-type", "beat-sync", "music", "headline", "9:16"]
+    size: vec2(1080, 1920) duration: 5.0
+    inputs: {
+        line: input(@text, "Cut to the beat, not the clock", "One line, 4–8 words")
+        ink: input(@color, #f4f7fa, "Type colour")
+        accent: input(@color, #ff5c39, "Beat flash")
+        background: input(@color, #0b0d12, "Ground")
+    }
+    layers: [
+        Rect{size: vec2(1080, 1920) fill: in(@background)}
+        Rect{size: vec2(1080, 1920) fill: in(@accent)
+             opacity: fn(t, i, edit) { 0.12 * (1 - music(@m).beat_phase(edit)) * (1 - music(@m).beat_phase(edit)) }}
+        Text{text: in(@line) font: Font{family: "Inter" weight: 800} size: 112 tracking: -0.03 color: in(@ink) line_height: 1.1
+             at: vec2(520, 540) wrap: 840 align: @center
+             by: @word stagger: beats(1)
+             y: keys([beat(0), -60], [beat(0, 0.18), 0, @ease_out_expo], [4.55, 0], [5.0, 30, @ease_in_cubic])
+             opacity: keys([beat(0), 0], [beat(0, 0.06), 1], [4.6, 1], [5.0, 0, @ease_in_cubic])}
+    ]
+}

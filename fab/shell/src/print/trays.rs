@@ -1,8 +1,7 @@
 //! The printer's filament at a glance: [`FabTrayGrid`] draws every tray of
 //! the linked printer (each AMS unit as a row of spools with its real colour,
 //! material and what is left, the external spool last). It reads
-//! `AppState::print` and draws directly; it edits nothing (the print colours
-//! map to the trays in `colour_map`).
+//! `AppState::print` and draws directly. A virtual tray opens its spool menu.
 
 use super::*;
 use crate::api::AppState;
@@ -151,7 +150,11 @@ pub struct FabTrayGrid {
     draw_small: DrawText,
     /// Each tray as drawn: (label, rect), its accessible items.
     #[rust]
-    items: Vec<(String, Rect)>,
+    items: Vec<(String, Rect, Option<fab_printer_link::model::TrayId>)>,
+    /// The drawn grid receives presses on virtual spools.
+    #[rust] area: Area,
+    /// A menu pick applies to the cell that opened it.
+    #[rust] editing: Option<colours::Position>,
 }
 
 const SPOOL: f64 = 34.0;
@@ -166,18 +169,37 @@ impl Widget for FabTrayGrid {
     }
 
     fn semantics_parts(&self, _cx: &Cx, out: &mut Vec<(u64, Option<u64>, a11y_tree::Node)>) {
-        for (i, (label, rect)) in self.items.iter().enumerate() {
+        for (i, (label, rect, _)) in self.items.iter().enumerate() {
             let mut node = a11y_tree::Node { role: a11y_tree::Role::ListItem, bounds: makepad_platform::a11y::semantic_rect(*rect), pos_in_set: i as u32 + 1, set_size: self.items.len() as u32, ..Default::default() };
             makepad_platform::a11y::set_string(&mut node.name, label);
             out.push((i as u64 + 1, None, node));
         }
     }
 
-    fn handle_event(&mut self, _cx: &mut Cx, _event: &Event, _scope: &mut Scope) {}
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        use crate::ui::popover::{menu_picked, open_menu, MenuPlace};
+        let Some(state) = scope.data.get::<AppState>() else { return };
+        let p = &state.print;
+        if !p.target_printer().is_some_and(|p| p.virtual_printer) { return; }
+        let menu = LiveId::from_str(&format!("fab_grid_tray:{:?}", self.uid));
+        if let Event::Actions(actions) = event {
+            if let Some(edit) = menu_picked(actions, menu).and_then(colours::tray_edit_pick) {
+                if let Some(pos) = self.editing.take() { cx.action(PrintAction::EditTray(pos, edit)); }
+            }
+        }
+        if let Hit::FingerUp(fe) = event.hits(cx, self.area) {
+            if !fe.is_over || fe.cancelled { return; }
+            let Some((_, rect, Some(id))) = self.items.iter().find(|(_, r, _)| r.contains(fe.abs)) else { return };
+            if let Some(tray) = p.colors.layout.trays.iter().find(|t| t.pos.tray == *id) {
+                self.editing = Some(tray.pos);
+                open_menu(cx, menu, colours::tray_edit_menu(tray, &p.colors.layout.heads), *rect, MenuPlace::Below);
+            }
+        }
+    }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         self.items.clear();
-        let Some(printer) = scope.data.get::<AppState>().and_then(|s| s.print.printer.clone()) else {
+        let Some(printer) = scope.data.get::<AppState>().and_then(|s| s.print.target_printer().cloned()) else {
             cx.walk_turtle(Walk { height: Size::Fixed(0.0), ..walk });
             return DrawStep::done();
         };
@@ -210,6 +232,7 @@ impl Widget for FabTrayGrid {
         let header_h = 18.0;
         let h = rows.iter().map(|_| header_h + CELL_H + 6.0).sum::<f64>();
         let rect = cx.walk_turtle(Walk { height: Size::Fixed(h.max(0.0)), ..walk });
+        cx.add_aligned_rect_area(&mut self.area, rect);
         let mut y = rect.pos.y;
         for (name, trays) in &rows {
             self.draw_small.draw_abs(cx, dvec2(rect.pos.x, y + 2.0), name);
@@ -238,7 +261,7 @@ impl Widget for FabTrayGrid {
                 let colour = tray.colour.map(|c| { let [r, g, b, _] = c.0; format!(" colour #{:02x}{:02x}{:02x}", (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8) }).unwrap_or_default();
                 let left = tray.remain.filter(|r| *r >= 0.0 && !empty && !s.numbered_heads && !tray.id.is_some_and(|i| matches!(i.ams, 254 | 255))).map(|r| format!(", {r:.0}% left")).unwrap_or_default();
                 let printing = if printing { " feeding the nozzle that prints" } else { "" };
-                self.items.push((format!("{name} {label}{colour}{left}{printing}"), Rect { pos: dvec2(x, y), size: dvec2(CELL_W - 6.0, CELL_H) }));
+                self.items.push((format!("{name} {label}{colour}{left}{printing}"), Rect { pos: dvec2(x, y), size: dvec2(CELL_W - 6.0, CELL_H) }, tray.id));
                 // An external spool has no tag to read what is left from (it reports 0).
                 let external = tray.id.is_some_and(|i| matches!(i.ams, 254 | 255));
                 if let Some(r) = tray.remain.filter(|r| *r >= 0.0 && !empty && !external && !s.numbered_heads) {

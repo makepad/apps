@@ -29,6 +29,8 @@ impl GestureId {
 pub enum GestureKind {
     /// Route a track from `Gesture::start` toward the cursor (the head, E6 3.1).
     Route,
+    /// Draw both legs from the two terminals held at press, following the cursor trail.
+    RoutePair { mate: NetId, mate_start: Anchor, mate_start_at: P },
     /// Drag segment `seg` of `track` (E6 3.3).
     DragSeg { track: ItemId, seg: u32 },
     /// Drag the vertex `vertex` of `track` (0 is the path's start).
@@ -40,8 +42,8 @@ pub enum GestureKind {
     /// Bring a part from the tray: the candidate's footprint and pad nets, placed at the cursor
     /// with its own `rot` and `side`. The answer is its nearest legal place (the ghost).
     Place(Arc<Placed>),
-    /// Adjust a tuning object (its corridor or amplitude).
-    Tune(ItemId),
+    /// Refold these track vertices. Branching is measured on the circuit held at press.
+    Tune { track: ItemId, from: usize, to: usize, circuit: Arc<fab_elec_circuit::Circuit> },
     /// Fan out the pads of a placed part.
     Fanout(ItemId),
 }

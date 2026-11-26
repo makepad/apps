@@ -99,10 +99,9 @@ object(notch)
 const NOTCH_WIDTH: f64 = 6.0;
 const SLOT_WIDTH: f64 = 2.0;
 
-const PLATE: &str = r#"script("post.cad.splash")
-script("proud.cad.splash")
-script("notch.cad.splash")
-color("Colour 1", rgb: #xa03cf7)
+/// The three parts: fab.script put each script's instance on the plate, and these place them. (A
+/// `script(..)` line here would add a second instance of each, a copy elsewhere on the plate.)
+const PLATE: &str = r#"color("Colour 1", rgb: #xa03cf7)
 place("notch", object: "notch", at: [112mm 100mm], name: "Notch", color: "Colour 1")
 place("post", object: "post", at: [120mm 100mm], name: "Post", color: "Colour 1")
 place("proud", object: "block", at: [131mm 100mm], name: "Proud", color: "Colour 1")

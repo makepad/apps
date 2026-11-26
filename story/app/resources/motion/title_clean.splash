@@ -1,0 +1,45 @@
+use mod.motion.*
+// CLEAN TITLE — the quiet default. A tracked-out kicker in the accent, a
+// headline rising word by word on ease_out_quint (long, soft landing), a
+// secondary line and a short accent rule. One colour of emphasis;
+// everything else is ink. Exits as one block, faster than it came in.
+// Why: one easing family and 80 ms word steps read as calm and deliberate;
+// the rule arriving last "underlines" the finished title.
+Motion{
+    label: "Clean title"
+    brief: "Centred kicker, headline and subline, rising in word by word."
+    tags: ["title", "clean", "chapter", "intro"]
+    duration: 5.0
+    inputs: {
+        kicker: input(@text, "CHAPTER 01", "Small caps line above")
+        headline: input(@text, "Everything in one place", "Up to about six words")
+        subline: input(@text, "Notes, tasks and files, finally together.", "One sentence under the headline")
+        ink: input(@color, #f4f7fa, "Headline colour")
+        muted: input(@color, #a6b1bd, "Subline colour")
+        accent: input(@color, #ff5c39, "Kicker and rule")
+        background: input(@color, #0b0d12, "Ground")
+    }
+    layers: [
+        Rect{size: vec2(1920, 1080) fill: in(@background)}
+        Group{
+            y: tween(0, -40, 4.55, 5.0, @ease_in_cubic)
+            opacity: tween(1, 0, 4.55, 5.0, @ease_in_cubic)
+            layers: [
+                Text{text: in(@kicker) font: Font{family: "Inter" weight: 600} size: 30 tracking: 0.28 color: in(@accent)
+                     at: vec2(960, 362) wrap: 1600 align: @center
+                     opacity: tween(0, 1, 0.1, 0.6, @ease_out_cubic) y: tween(12, 0, 0.1, 0.8, @ease_out_quint)}
+                Text{text: in(@headline) font: Font{family: "Inter" weight: 700} size: 124 tracking: -0.03 color: in(@ink)
+                     at: vec2(960, 436) wrap: 1600 align: @center
+                     by: @word stagger: 0.08
+                     y: tween(48, 0, 0.3, 1.2, @ease_out_quint)
+                     opacity: tween(0, 1, 0.3, 0.7, @ease_out_cubic)}
+                Text{text: in(@subline) font: Font{family: "Inter" weight: 400} size: 44 color: in(@muted)
+                     at: vec2(960, 604) wrap: 1600 align: @center
+                     y: tween(24, 0, 0.8, 1.6, @ease_out_quint)
+                     opacity: tween(0, 1, 0.8, 1.3, @ease_out_cubic)}
+                Rect{at: vec2(920, 716) size: vec2(80, 4) radius: 2 fill: in(@accent)
+                     scale: tween(vec2(0, 1), vec2(1, 1), 1.1, 1.8, @ease_out_expo)}
+            ]
+        }
+    ]
+}

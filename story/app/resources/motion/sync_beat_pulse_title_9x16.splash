@@ -1,0 +1,37 @@
+use mod.motion.*
+// BEAT PULSE TITLE, 9:16 — the portrait cut of sync_beat_pulse_title:
+// the title sits at 140 px on the safe area's centre. Original notes follow.
+// BEAT PULSE TITLE — a title that breathes with the music: it kicks 6% on
+// every beat (a sharp attack that decays over the beat), the accent rule
+// under it fills once per bar, and the kicker blinks on the downbeat. All
+// three read `music(@m)` at the edit's time, so the pulse stays on the
+// grid wherever the clip is placed or trimmed.
+// Why: a static title on a music video looks dead; a small, exact pulse
+// ties it to the track without distracting from the words.
+// Host: bind @m to the edit's music track.
+Motion{
+    label: "Beat pulse title 9:16"
+    brief: "A title that kicks on every beat, with a rule that fills once per bar; portrait."
+    tags: ["title", "beat-sync", "music", "loop", "promo", "9:16"]
+    size: vec2(1080, 1920) duration: 8.0
+    inputs: {
+        kicker: input(@text, "LIVE TONIGHT", "Small caps line above")
+        headline: input(@text, "Night Shift", "The title")
+        ink: input(@color, #f4f7fa, "Title colour")
+        accent: input(@color, #ff5c39, "Kicker and rule")
+        background: input(@color, #0b0d12, "Ground")
+    }
+    layers: [
+        Rect{size: vec2(1080, 1920) fill: in(@background)}
+        Text{text: in(@kicker) font: Font{family: "Inter" weight: 700} size: 32 tracking: 0.32 color: in(@accent)
+             at: vec2(520, 560) wrap: 840 align: @center
+             opacity: fn(t, i, edit) { 0.55 + 0.45 * (1 - music(@m).bar_phase(edit)) }}
+        Text{text: in(@headline) font: Font{family: "Inter" weight: 900} size: 140 tracking: -0.045 color: in(@ink) line_height: 1.0
+             at: vec2(520, 620) wrap: 840 align: @center
+             scale: fn(t, i, edit) { 1.0 + 0.06 * (1 - music(@m).beat_phase(edit)) * (1 - music(@m).beat_phase(edit)) }
+             opacity: tween(0, 1, 0.0, 0.4, @ease_out_cubic)}
+        Rect{at: vec2(240, 800) size: vec2(600, 6) radius: 3 fill: #ffffff1f}
+        Rect{at: vec2(240, 800) radius: 3 fill: in(@accent)
+             size: fn(t, i, edit) { vec2(600 * music(@m).bar_phase(edit), 6) }}
+    ]
+}

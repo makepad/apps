@@ -53,7 +53,12 @@ pub enum PrimeRows {
 
 /// The protocol Fab talks to the printer over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Link { Mqtt, Moonraker }
+pub enum Link {
+    Mqtt,
+    Moonraker,
+    /// A virtual printer. Its reports and commands stay in Fab.
+    Virtual,
+}
 
 /// How a family's spools feed its heads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +85,11 @@ pub struct Family {
 /// Fab's own default printer's family, independent of the registry order.
 pub const DEFAULT: &Family = &DEFAULT_FAMILY;
 
+pub const VIRTUAL_NOZZLES: &str = "Fab Virtual nozzles";
+pub const VIRTUAL_TOOLCHANGER: &str = "Fab Virtual toolchanger";
+
+const THREE_MF_VERSION: &str = "02.08.02.61";
+
 static DEFAULT_FAMILY: Family = Family {
     maker: "Bambu Lab ",
     models: &["Bambu Lab "],
@@ -87,13 +97,12 @@ static DEFAULT_FAMILY: Family = Family {
     link: Link::Mqtt,
     spools: Spools::Units,
     templates: crate::template::Dialect::Compact,
-    package: Package::GcodeThreeMf { version: "02.08.02.61", models: &[("H2D", "O1D")] },
+    package: Package::GcodeThreeMf { version: THREE_MF_VERSION, models: &[("H2D", "O1D")] },
     own_filament_vendor: "Bambu Lab",
     prime_rows: PrimeRows::HoldFifth,
 };
 
-/// Every family Fab prints for.
-pub const FAMILIES: &[&Family] = &[DEFAULT, &Family {
+const TOOLCHANGER_FAMILY: Family = Family {
     models: &["Snapmaker U1"],
     maker: "Snapmaker ",
     flavor: Flavor::Named,
@@ -103,6 +112,24 @@ pub const FAMILIES: &[&Family] = &[DEFAULT, &Family {
     own_filament_vendor: "Snapmaker",
     prime_rows: PrimeRows::Climb,
     templates: crate::template::Dialect::Merged,
+};
+
+/// Every family Fab prints for.
+/// A static, so each family has one address: callers and tests may compare families by identity
+/// (`std::ptr::eq`). A `const` would let each use make its own copy of the families it lists.
+pub static FAMILIES: &[&Family] = &[DEFAULT, &TOOLCHANGER_FAMILY, &Family {
+    models: &[VIRTUAL_NOZZLES],
+    maker: "Fab ",
+    link: Link::Virtual,
+    package: Package::GcodeThreeMf { version: THREE_MF_VERSION, models: &[] },
+    own_filament_vendor: "Fab",
+    ..DEFAULT_FAMILY
+}, &Family {
+    models: &[VIRTUAL_TOOLCHANGER],
+    maker: "Fab ",
+    link: Link::Virtual,
+    own_filament_vendor: "Fab",
+    ..TOOLCHANGER_FAMILY
 }];
 
 /// The family of a job's, or a printer preset's, printer.
@@ -185,6 +212,11 @@ mod tests {
         let claimed = reversed.into_iter().find(|f| f.models.iter().any(|p| cfg.str("printer_model").starts_with(p))).expect("claimed in either order");
         assert!(std::ptr::eq(DEFAULT, claimed));
         assert!(of_model("unclaimed").is_none());
+        for (model, flavor) in [("Fab Virtual nozzles two-materials", Flavor::Mask), ("Fab Virtual toolchanger four-tools", Flavor::Named)] {
+            let family = of_model(model).expect("virtual model");
+            assert_eq!((family.link, family.flavor), (Link::Virtual, flavor));
+            assert!(std::ptr::eq(family, of_reported(model).expect("reported virtual model")));
+        }
     }
 
     #[test]

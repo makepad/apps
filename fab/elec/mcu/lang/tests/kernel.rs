@@ -368,6 +368,7 @@ fn frontend_and_verifier_refusals_name_the_property() {
         ("let bad = every(1, fn() {})", "unknown function `every`"),
         ("let bad = export(fn() {}); let bad = export(fn() {})", "two exports cannot share"),
         ("fn setup() {}; let ok = export(fn() {})", "cannot declare a setup fn"),
+        ("mono()\nlet ok = export(fn() {})", "unknown declaration `mono()`"),
         ("let bad = export(fn(a) { a + 1 })", "result is `return e`"),
         ("let bad = export(fn(a) { if a > 0 { 1 } else { return 2 } })", "result is `return e`"),
     ] {
@@ -382,6 +383,11 @@ fn frontend_and_verifier_refusals_name_the_property() {
             assert_eq!(errors[0].message, message, "{source}: refusal names the required constant block");
         }
     }
+    // A top-level declaration named like a layout constant is refused at its span.
+    let source = "LIMIT()\nlet ok = export(fn() {})";
+    let errors = match compile_kernel(source, &P, &KERNEL_LINES, &[("LIMIT", 4)]) { Err(e) => e, Ok(_) => panic!("must refuse {source}") };
+    assert_eq!(errors[0].message, "kernel layout constant `LIMIT` cannot be redeclared", "a declaration cannot redeclare a layout constant");
+    assert_eq!((errors[0].start, errors[0].end), (0, "LIMIT()".len()), "the refusal names the declaration");
     for (source, name) in [("let bad = export(fn() {})", "export"), ("fn setup() { load8u(0) }", "load8u")] {
         let errors = match compile(source, &P, &[], &[]) { Err(e) => e, Ok(_) => panic!("app cannot name {name}") };
         assert!(errors[0].message.contains(&format!("unknown function `{name}`")), "app {name} stays unknown: {:?}", errors);

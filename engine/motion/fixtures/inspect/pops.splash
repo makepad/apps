@@ -1,0 +1,17 @@
+use mod.motion.*
+// The continuity check: layers that cut in and out without an entrance or exit.
+Motion{size: vec2(1920, 1080) duration: 4.0 fps: 30 layers: [
+    Rect{name: "pop" at: vec2(100, 100) size: vec2(300, 200) fill: #fff span: [1.0, 1.5]}
+    Rect{name: "faded" at: vec2(500, 100) size: vec2(300, 200) fill: #fff span: [1.0, 1.5]
+        opacity: keys([0.0, 0], [0.4, 1, @ease_out], [1.2, 1], [1.5, 0, @ease_in])}
+    Rect{name: "beat" at: vec2(900, 100) size: vec2(300, 200) fill: #fff span: [1.0, 1.5] hard_cut: true}
+    Rect{name: "always" at: vec2(1300, 100) size: vec2(300, 200) fill: #fff}
+    Group{name: "card" span: [2.0, 1.0] layers: [
+        Rect{name: "card back" at: vec2(100, 500) size: vec2(600, 300) fill: #224}
+        Text{name: "card title" text: "Hello" size: 60 at: vec2(150, 550)}
+    ]}
+    Rect{name: "slide" y: 900 size: vec2(300, 120) fill: #fff x: tween(-400, 100, 0.5, 1.2, @ease_out)}
+    Rect{name: "grow" at: vec2(1300, 500) size: vec2(300, 300) fill: #fff span: [1.0, 3.0] anchor: vec2(0.5, 0.5)
+        scale: tween(vec2(0.05, 0.05), vec2(1, 1), 0.0, 0.4, @ease_out_back)}
+    Rect{name: "flash" at: vec2(1700, 900) size: vec2(10, 10) fill: #fff span: [1.0, 0.5]}
+]}

@@ -128,11 +128,13 @@ mod tests {
     /// (the key light disabled, the sun's disc hidden), its texels on and
     /// around the discs area-averaged as the map's are; the moon's disc has
     /// no switch of its own, so for the moonlit night it is a whole bake
-    /// through the lookup without the disc. Each preset as it is and turned
-    /// by 37 degrees (the key's reach is found in world space). Tolerance:
-    /// none, texel for texel, because the copy IS that bake (the same
-    /// function at the same texel centres, refined the same way; outside the
-    /// key's reach, the map).
+    /// through the lookup without the disc. The sun's reflections (After
+    /// rain's puddles) stay in the copy as the map's own light, which hiding
+    /// the disc takes away too: below the horizon the copy is the map. Each
+    /// preset as it is and turned by 37 degrees (the key's reach is found
+    /// in world space). Tolerance: none, texel for texel, because the copy
+    /// IS that bake (the same function at the same texel centres, refined
+    /// the same way; outside the key's reach, the map).
     #[test]
     fn every_presets_non_key_lights_survive_in_the_lighting_copy() {
         use crate::presets::{preset, PRESET_NAMES};
@@ -153,9 +155,27 @@ mod tests {
                     keys += 1;
                     match switched_off(&params, term) {
                         Some(p) => {
+                            // Baked and refined through the bake's lookups (`Sampling::bake`), as the map and its
+                            // copy are: they read a cloud layer over a texel's width, an exact lookup at a point, so
+                            // the discs' sub-samples differ wherever a cloud stands there (the sun's, or the moon's
+                            // in a day sky).
                             let without = Env::new(&p);
-                            let mut want = without.bake(64);
-                            refine_hot_spots(&mut want, &|d| without.radiance(d), &env.hot_spots());
+                            let cache = without.cloud_cache(64, volumetric::MARCH_MAX_WIDTH);
+                            let at = Sampling::bake(64, cache.as_ref());
+                            let radiance = |d: Vec3f| without.radiance_with(d, None, at);
+                            let mut want = bake_with(64, &radiance);
+                            refine_hot_spots(&mut want, &radiance, &env.hot_spots());
+                            // The disc's reflections (a wet ground's puddles, a lake) are the map's own light, not
+                            // the key's (the owner's ruling, 2026-11-09), so the copy keeps them; hiding the disc
+                            // takes them with it. Below the horizon (its dip from a viewer height included), where
+                            // nothing but they can tell the two apart, the copy is the map.
+                            if term == KeyTerm::Sun {
+                                let dip = env.atmo.as_ref().map_or(0.0, |atmo| atmo.horizon_dip());
+                                let (w, h) = (want.width, want.height);
+                                for y in (0..h).filter(|&y| std::f32::consts::FRAC_PI_2 - std::f32::consts::PI * y as f32 / h as f32 <= -dip) {
+                                    want.data[y * w..(y + 1) * w].copy_from_slice(&baked.map.data[y * w..(y + 1) * w]);
+                                }
+                            }
                             want
                         }
                         None => env.bake_without_key(64).unwrap(),
@@ -568,7 +588,40 @@ mod tests {
         let canopy = GoboParams { kind: "leaves".to_string(), density: 0.5, seed: 4, ..GoboParams::default() };
         let stripes = GoboParams { kind: "image".to_string(), image: "stripes".to_string(), ..GoboParams::default() };
         let case = |name: &str, params: HdriParams, tolerance: f64| KeyCase { name: name.to_string(), params, images: images.clone(), tolerance };
+        // The cloth boxes up close in a room on a glossy floor: an open softbox
+        // and an open octabox (their bare tubes, a crisp 0.8 degree disc with
+        // most of the light, which a 1K bake area-averages: `Studio::hot_cores`)
+        // and an inner-baffle softbox, `key` the key.
+        let open_boxes = |key: usize| {
+            let kit = |kind: ModifierKind, azimuth_deg: f32, elevation_deg: f32, intensity_ev: f32, size: [f32; 2], baffle: f32| {
+                let mut light = LightParams { azimuth_deg, elevation_deg, ..LightParams::default() };
+                crate::modifier::apply_template(&mut light, kind);
+                (light.intensity_ev, light.width_deg, light.height_deg) = (intensity_ev, size[0], size[1]);
+                light.modifier.as_mut().unwrap().baffle = baffle;
+                light
+            };
+            let mut lights = vec![
+                kit(ModifierKind::Softbox, 335.0, 12.0, 5.0, [34.0, 26.0], 1.0),
+                kit(ModifierKind::Octabox, 25.0, 14.0, 5.0, [34.0, 34.0], 1.0),
+                kit(ModifierKind::Softbox, 80.0, 10.0, 4.5, [30.0, 22.0], 0.7),
+            ];
+            lights[key].key = true;
+            let mut p = studio_1b(lights);
+            p.studio.room = Some(RoomParams {
+                width_m: 11.0,
+                depth_m: 11.0,
+                height_m: 4.8,
+                cove_m: 1.5,
+                cove_walls: "back".to_string(),
+                floor_gloss: 0.15,
+                floor_roughness: 0.45,
+                ..RoomParams::default()
+            });
+            p
+        };
         vec![
+            case("1b: an open softbox key beside an open octabox, in a room", open_boxes(0), 0.01),
+            case("1b: an open octabox key beside an open softbox, in a room", open_boxes(1), 0.01),
             case("1b: a softbox key half behind a window filled with sky", studio_1b(vec![softbox.clone(), window_over(18.0, 25.0, 30.0, 40.0)]), 0.01),
             case("1b: a stroke key half behind a window filled with sky", studio_1b(vec![arch_key(), window_over(110.0, 10.0, 30.0, 30.0)]), 0.01),
             case(
@@ -576,6 +629,7 @@ mod tests {
                 studio_1b(vec![window.clone(), window_over(15.0, 25.0, 30.0, 30.0)]),
                 0.02,
             ),
+            case("1b: a glowing stroke key", studio_1b(vec![LightParams { glow: Some(GlowParams { strength: 0.6, reach_deg: 2.0 }), ..arch_key() }]), 0.01),
             case("1b: a stroke key half under a soft black flag", studio_1b(vec![arch_key(), soft_flag(112.0, 8.0, 24.0, [0.0; 3])]), 0.01),
             case("1b: a stroke key under a blue gel", studio_1b(vec![arch_key(), soft_flag(80.0, 12.0, 30.0, [0.3, 0.5, 1.0])]), 0.01),
             case(

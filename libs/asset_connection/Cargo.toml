@@ -1,0 +1,24 @@
+# The product windows' asset library (Stage, Story): where the one `stage`
+# store is, the verified client the workers share, and its in-process host.
+[package]
+name = "makepad-asset-connection"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "The asset store connection and host shared by the product windows"
+
+[lib]
+name = "makepad_asset_connection"
+
+[dependencies]
+makepad-widgets = { path = "../../../../widgets", default-features = false }
+makepad-ai-hub = { path = "../../../../libs/ai/hub", default-features = false }
+makepad-asset-client = { path = "../../../apps/engine/asset/client" }
+# The store's in-process host (`embed`): host it here or attach.
+makepad-app-asset-server = { path = "../../stage/apps/asset-server" }
+
+[dev-dependencies]
+makepad-asset-data = { path = "../../../apps/engine/asset/data" }
+# The takeover test: the flow studio's publish worker follows the store too.
+makepad-flow-assets = { path = "../../engine/flow_assets" }

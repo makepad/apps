@@ -1,0 +1,13 @@
+use mod.scene.*
+// Six skinned GLB characters walking (CPU skinning every frame).
+Scene3D{ background: #202428 environment: Environment{preset: @studio} camera: Camera{position: vec3(0, 1.5, 6) target: vec3(0, 0.8, 0) fov: 40}
+  lights: [DirectionalLight{position: vec3(2, 4, 3) cast_shadow: true}]
+  children: [
+    Model{src: asset("lib-7953", "1") animation: "walk" fit: 1.6 ground: true position: vec3(-2.5, 0, 0)}
+    Model{src: asset("lib-7954", "1") animation: "sprint" fit: 1.6 ground: true position: vec3(-1.5, 0, -1)}
+    Model{src: asset("lib-7955", "1") animation: "idle" fit: 1.6 ground: true position: vec3(-0.5, 0, 0)}
+    Model{src: asset("lib-7959", "1") animation: "walk" fit: 1.6 ground: true position: vec3(0.5, 0, -1)}
+    Model{src: asset("lib-7960", "1") animation: "jump" fit: 1.6 ground: true position: vec3(1.5, 0, 0)}
+    Model{src: asset("lib-7961", "1") animation: "crouch" fit: 1.6 ground: true position: vec3(2.5, 0, -1)}
+    Mesh{geometry: PlaneGeometry{width: 20 height: 20} rotation: vec3(-90, 0, 0)}
+  ] }

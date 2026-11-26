@@ -316,11 +316,11 @@ impl SceneGpu {
         let sdf_sync = self.sdf.borrow_mut().sync(cx, state);
         self.sdf.borrow().scan.set_blocked(state.print.slice_state().0 == "Slicing", &cx.task_pool());
         // The stroke being drawn updates the traced field at once.
-        let stroke = crate::tools::paint::live_stroke();
+        let stroke = crate::tools::paint::stroke_preview(state);
         let mut fill = if state.ui.paint_mode != crate::api::PaintMode::Brush && crate::tools::paint::active(state) { crate::tools::paint::live_fill(state) } else { None };
         let live = match (&stroke, &mut fill) {
-            (Some((o, p, r, c, e)), _) => Some(paint::LivePaint::Stroke { object: o.as_str(), points: p.as_slice(), radius: *r, rgb: *c, erase: *e }),
-            (None, Some((o, regions, names))) => Some(paint::LivePaint::Fill { object: o.as_str(), regions: std::mem::take(regions), names: std::mem::take(names), rgb: state.ui.paint_color }),
+            (Some((o, p, r, c, e)), _) => Some(paint::LivePaint::Stroke { object: o.as_str(), points: p.as_slice(), radius: *r, swatch: *c, erase: *e }),
+            (None, Some((o, regions, names, swatch))) => Some(paint::LivePaint::Fill { object: o.as_str(), regions: std::mem::take(regions), names: std::mem::take(names), swatch: *swatch }),
             (None, None) => None,
         };
         self.sdf.borrow_mut().paint.set_live(state, live);

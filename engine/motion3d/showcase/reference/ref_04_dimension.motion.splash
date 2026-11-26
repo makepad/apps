@@ -1,0 +1,29 @@
+use mod.motion.*; use mod.scene
+// Rebuild of REF-Ac7SuDYTQDc chapter "04 DIMENSION" (13.5–15.25 s of the
+// reel, 120 bpm): the 2D pattern of the previous chapter, rendered as a
+// Motion layer into a texture, becomes the top of an extruded slab on
+// black with striped sides; blocks lift and sink on every beat while the
+// slab turns slowly; the exit is a camera dive into the surface with heavy
+// motion blur. (Motion has no truchet Pattern yet; @waves stands in.)
+Motion{
+    size: vec2(1920, 1080)
+    duration: 1.75
+    bpm: 120
+    layers: [
+        Rect{at: vec2(0, 0) size: vec2(1920, 1080) fill: #000000}
+        Scene3D{
+            size: vec2(1920, 1080)
+            layers: {pattern: Pattern{kind: @waves color: #2a44c8 color2: #f0ebe0 cell: 90 weight: 0.35 size: vec2(1920, 1080)}}
+            background: #000000
+            bpm: 120
+            tone_mapping: @aces
+            camera: Camera{orbit: true target: vec3(0, 0.3, 0) yaw: tween(30, 48, 0, 1.75) pitch: 38 distance: 10 fov: 32
+                           moves: [scene.CameraMove{type: @dive start: 1.25 end: 1.75 ease: @ease_in_expo}]}
+            post: [scene.ZoomBlur{amount: keys([0, 0], [1.25, 0], [1.75, 0.7, @ease_in_cubic])}]   // the dive's whip, from one render
+            lights: [scene.HemisphereLight{sky_color: #ffffff ground_color: #404040 intensity: 1.2} scene.DirectionalLight{position: vec3(3, 8, 5) intensity: 1.6}]
+            children: [
+                scene.Fx{preset: @pattern_slab from: "pattern" grid: 20 spacing: 0.3 height: 0.8 amount: 0.9 color: #f0ebe0 color2: #2a44c8}
+            ]
+        }
+    ]
+}

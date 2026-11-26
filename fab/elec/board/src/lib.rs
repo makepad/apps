@@ -21,7 +21,9 @@ pub mod connect;
 pub mod drc;
 pub mod geom;
 pub mod index;
+pub mod length;
 pub mod ops;
+pub mod placement;
 pub mod rings;
 pub mod rules;
 pub mod text;
@@ -31,7 +33,7 @@ use fab_elec_core::{
     canon_enum, canon_struct, canon_tags, Angle, BBox, BlockId, ClassId, CompId, Contour, FeatureRef, ItemId, LayerId, LayerSet, NetId, Nm,
     OnTrack, Path, PolySet, SolverId, Side, P,
 };
-use fab_elec_circuit::{Circuit, Intent, NetClass};
+use fab_elec_circuit::{Circuit, Intent, NetClass, Target};
 use fab_elec_parts::{Footprint, Forbid, Gfx, ThermalRule, ZoneConnect};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,6 +45,7 @@ pub use rules::{apply_capabilities, resolve_rules, resolve_rules_with, Capabilit
 pub use geom::{Copper, DrillHole};
 pub use rings::{RingIndex, Rings};
 pub use index::{IndexChange, PKey, Piece, PieceIndex, PieceKind};
+pub use length::LengthMatch;
 pub use zone::{
     changed_box, fill, fill_all, fill_update, fill_update_indexed, reaches, FillLattice, FillLayer, FillPlan,
     FillTile, PolyRef, TileKey, TileLabels, ZoneFill,
@@ -97,6 +100,13 @@ pub struct Board {
     pub classes: Vec<NetClass>,
     /// The circuit's differential pairs mirrored (`Intent::Pair`, in intent order).
     pub pairs: Vec<NetPair>,
+    /// Routed track length matches, in circuit intent order.
+    pub length_matches: Vec<LengthMatch>,
+    /// The circuit's parts fixed to an edge mirrored (`edge_parts_of`): their courtyards may
+    /// overhang the outline.
+    pub edge_parts: Vec<CompId>,
+    /// The circuit's parts fixed to a spot mirrored (`spots_of`): DRC finds one standing elsewhere.
+    pub spots: Vec<Spot>,
     pub placed: Vec<Placed>,
     pub tracks: Vec<Track>,
     pub vias: Vec<Via>,
@@ -118,10 +128,45 @@ pub struct Board {
     /// Derived, kept by the op path like `index`; see `RingIndex`.
     pub rings: RingIndex,
 }
-canon_struct!(Board {
-    unit, name, stackup, outline, nets, classes, pairs, placed, tracks, vias, zones, keepouts, holes,
-    cutouts, graphics, texts, tunings, rules
-});
+// Additive: `edge_parts`, `spots` and `length_matches` are written only when there are some, so a board without
+// keeps its hash.
+impl fab_elec_core::canon::Canon for Board {
+    fn canon(&self, w: &mut fab_elec_core::canon::Writer) {
+        let Board {
+            unit, name, stackup, outline, nets, classes, pairs, length_matches, edge_parts, spots, placed, tracks, vias, zones, keepouts,
+            holes, cutouts, graphics, texts, tunings, rules, generation: _, next_item: _, index: _, rings: _,
+        } = self;
+        unit.canon(w);
+        name.canon(w);
+        stackup.canon(w);
+        outline.canon(w);
+        nets.canon(w);
+        classes.canon(w);
+        pairs.canon(w);
+        placed.canon(w);
+        tracks.canon(w);
+        vias.canon(w);
+        zones.canon(w);
+        keepouts.canon(w);
+        holes.canon(w);
+        cutouts.canon(w);
+        graphics.canon(w);
+        texts.canon(w);
+        tunings.canon(w);
+        rules.canon(w);
+        if !edge_parts.is_empty() {
+            edge_parts.canon(w);
+        }
+        if !spots.is_empty() {
+            w.tag(1);
+            spots.canon(w);
+        }
+        if !length_matches.is_empty() {
+            w.tag(2);
+            length_matches.canon(w);
+        }
+    }
+}
 
 /// Where a board item came from (E4 Q7, ARCHITECTURE 5.7).
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
@@ -161,6 +206,91 @@ pub struct NetPair {
     pub gap: Option<Nm>,
 }
 canon_struct!(NetPair { p, n, gap });
+
+/// The parts a circuit fixes to an edge (`fixed(part, {edge: ..})`), a block's parts with it,
+/// sorted.
+pub fn edge_parts_of(c: &Circuit) -> Vec<CompId> {
+    let mut parts = std::collections::BTreeSet::new();
+    for intent in &c.intents {
+        let Intent::Fixed { t, edge: Some(_), .. } = intent else { continue };
+        match *t {
+            Target::Comp(comp) | Target::Pin(comp, _) => { parts.insert(comp); }
+            Target::Block(b) => parts.extend(c.block_comps(b)),
+        }
+    }
+    parts.into_iter().collect()
+}
+
+/// A part its circuit fixes to a spot (`fixed(part, {at rot})`): its origin stands at `at`, turned
+/// `rot` when the intent names one.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct Spot {
+    pub comp: CompId,
+    pub at: P,
+    pub rot: Option<Angle>,
+}
+canon_struct!(Spot { comp, at, rot });
+
+impl Spot {
+    /// The pose a part placed at this spot takes: `at`, and `rot` or else the pose's own.
+    pub fn pose(&self, rot: Angle) -> (P, Angle) {
+        (self.at, self.rot.unwrap_or(rot))
+    }
+
+    /// The part stands on its spot.
+    pub fn holds(&self, part: &Placed) -> bool {
+        part.at == self.at && self.rot.is_none_or(|rot| rot == part.rot)
+    }
+}
+
+/// A keepout carried by a component, paired with the derived board set it replaces.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CarriedKeepout {
+    pub from: FeatureRef,
+    pub area: PolySet,
+    pub band: (Nm, Nm),
+    pub side: Side,
+}
+
+/// A port's room and keepout use board axes, with coordinates relative to its component's
+/// position. The keepout's side is a board surface and its band is measured outward from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortRoom {
+    pub comp: CompId,
+    pub room: Option<PolySet>,
+    pub keepout: Option<CarriedKeepout>,
+}
+
+impl PortRoom {
+    /// Add the candidate component position to both areas.
+    pub fn placed(&self, at: P) -> Self {
+        Self {
+            comp: self.comp,
+            room: self.room.as_ref().map(|area| area.translated(at)),
+            keepout: self.keepout.as_ref().map(|k| CarriedKeepout {
+                from: k.from.clone(), area: k.area.translated(at), band: k.band, side: k.side,
+            }),
+        }
+    }
+
+    /// Express published board coordinates as offsets from the evaluated component position.
+    pub fn relative_to(&self, at: P) -> Self {
+        self.placed(at.neg())
+    }
+}
+
+/// The parts a circuit fixes to a spot, in intent order, a later intent for a part over an earlier
+/// one. A spot names one part: the language refuses one on a block, and a block target here gives
+/// none.
+pub fn spots_of(c: &Circuit) -> Vec<Spot> {
+    let mut spots: Vec<Spot> = Vec::new();
+    for intent in &c.intents {
+        let Intent::Fixed { t: Target::Comp(comp) | Target::Pin(comp, _), at: Some(at), rot, .. } = *intent else { continue };
+        spots.retain(|s| s.comp != comp);
+        spots.push(Spot { comp, at, rot });
+    }
+    spots
+}
 
 /// The circuit's differential pairs in intent order.
 pub fn pairs_of(c: &Circuit) -> Vec<NetPair> {
@@ -714,11 +844,17 @@ impl Board {
     pub fn new(unit: fab_elec_core::BoardId, name: &str) -> Board {
         Board { unit, name: name.into(), stackup: Stackup::standard_2_layer(), rules: Rules::standard(), ..Board::default() }
     }
-    /// Mirror the circuit's nets, classes and differential pairs.
+    /// Mirror the circuit's nets, classes, differential pairs, length matches, edge parts and spots.
     pub fn mirror(&mut self, c: &Circuit) {
         self.nets = c.nets.iter().map(|n| BoardNet { name: n.name.clone(), class: n.class }).collect();
         self.classes = c.classes.clone();
         self.pairs = pairs_of(c);
+        self.length_matches = c.intents.iter().filter_map(|intent| match intent {
+            Intent::LengthMatch { nets, tol } => Some(LengthMatch { nets: nets.clone(), tol: *tol }),
+            _ => None,
+        }).collect();
+        self.edge_parts = edge_parts_of(c);
+        self.spots = spots_of(c);
     }
     pub fn copper_count(&self) -> u8 {
         self.stackup.copper().len() as u8
@@ -844,4 +980,92 @@ impl Board {
         self.next_item += 1;
         id
     }
+}
+
+#[test]
+fn a_port_room_moves_with_its_position_and_keeps_its_board_axes_and_surface() {
+    use fab_elec_core::{mm, BoardId};
+    use placement::{Conflict, PlacementIndex};
+
+    let area = PolySet::from_ring_nonzero(vec![P::mm(1.0, 2.0), P::mm(4.0, 2.0), P::mm(1.0, 6.0)]);
+    let band = (mm(0.5), mm(2.0));
+    let from = FeatureRef::Panel("port A/Raised cover".into());
+    let local = PortRoom { comp: CompId(2), room: Some(area.clone()), keepout: Some(CarriedKeepout {
+        from: from.clone(), area, band, side: Side::Bottom,
+    }) };
+    let at = P::mm(10.0, 20.0);
+    let placed = local.placed(at);
+    let expected = PolySet::from_ring_nonzero(vec![P::mm(11.0, 22.0), P::mm(14.0, 22.0), P::mm(11.0, 26.0)]);
+    assert_eq!(placed.room, Some(expected.clone()));
+    assert_eq!(placed.keepout, Some(CarriedKeepout { from: from.clone(), area: expected.clone(), band, side: Side::Bottom }));
+    assert_eq!(placed.relative_to(at), local);
+
+    let mut board = Board::new(BoardId(0), "placement");
+    let footprint = Arc::new(Footprint {
+        courtyard: PolySet::rect(BBox::new(P::mm(-0.1, -0.1), P::mm(0.1, 0.1))), ..Default::default()
+    });
+    let old = P::mm(12.0, 23.0); // Inside the published triangle, clear of the owner's body.
+    let by = P::mm(20.0, 0.0);
+    for (comp, pos, rot, height) in [
+        (local.comp, at, Angle::QUARTER, band.0),
+        (CompId(3), old.add(by), Angle::ZERO, band.1),
+        (CompId(4), P::ZERO, Angle::ZERO, band.0),
+    ] {
+        let id = board.alloc_id();
+        board.placed.push(Placed {
+            id, comp, at: pos, rot, side: Side::Bottom, footprint: footprint.clone(), body_z: Some((0, height)),
+            path: format!("part{}", comp.0), refdes: String::new(), pad_nets: vec![], locked: false, origin: Origin::Authored,
+            value: None, ref_label: None, value_label: None, legend: None,
+        });
+    }
+    let (owner, tall, short) = (board.placed[0].id, board.placed[1].id, board.placed[2].id);
+    let fixed_offset = P::mm(0.0, 10.0);
+    let other_offset = P::mm(0.0, 20.0);
+    let other = FeatureRef::Panel("port B/Raised cover".into());
+    // Both ports and the fixed record have the same reason. Publish B and the fixed one
+    // before A, but list A's port first. Include a second old copy from A's source.
+    for (source, offset) in [
+        (other.clone(), other_offset), (FeatureRef::Panel("Raised cover".into()), fixed_offset),
+        (from.clone(), P::ZERO), (from, P::mm(0.0, -10.0)),
+    ] {
+        let id = board.alloc_id();
+        board.keepouts.push(BoardKeepout {
+            id, area: expected.translated(offset), z: Some(band), layers: LayerSet::of(&[LayerId::B_CU]), forbid: Forbid::FOOTPRINTS,
+            reason: "Raised cover".into(), origin: Origin::Derived { from: source },
+        });
+    }
+    board.reindex();
+    let stationary = PortRoom { comp: CompId(4), room: None, keepout: Some(CarriedKeepout {
+        from: other, area: expected.translated(other_offset), band, side: Side::Bottom,
+    }) };
+    let ports = [local, stationary];
+    let moving = [owner].into_iter().collect();
+    let hits = |index: &PlacementIndex, id, pos, rot, side| {
+        index.pose_conflicts(id, pos, rot, side).filter_map(|c| match c {
+            Conflict::Keepout { owner, .. } => Some(owner),
+            _ => None,
+        }).collect::<Vec<_>>()
+    };
+    let bottom = Side::Bottom;
+    assert_eq!(hits(&PlacementIndex::without(&board, &moving), tall, old, Angle::ZERO, bottom), [board.keepouts[2].id]);
+    let mut index = PlacementIndex::with_carried_keepouts(&board, &moving, &ports);
+    assert!(hits(&index, tall, old, Angle::ZERO, bottom).is_empty(), "the moving part's published keepout drops out");
+    assert!(hits(&index, tall, old.add(P::mm(0.0, -10.0)), Angle::ZERO, bottom).is_empty());
+    assert_eq!(hits(&index, tall, old.add(other_offset), Angle::ZERO, bottom), [board.keepouts[0].id], "the other port stays exactly once");
+    assert_eq!(hits(&index, tall, old.add(fixed_offset), Angle::ZERO, bottom), [board.keepouts[1].id], "the fixed record stays exactly once");
+    assert_eq!(hits(&index, owner, at.add(by), Angle::ZERO, Side::Top), [tall], "the candidate keepout reaches the standing body");
+    index.place(owner, at.add(by), Angle::ZERO, Side::Top);
+    assert!(hits(&index, tall, old, Angle::ZERO, bottom).is_empty(), "the old position stays clear");
+    assert_eq!(hits(&index, tall, old.add(by), Angle::ZERO, bottom), [owner], "the carried band blocks the tall body at its new pose");
+    assert!(hits(&index, short, old.add(by), Angle::ZERO, bottom).is_empty(), "the shorter body ends at the band's lower face");
+    assert!(hits(&index, tall, old.add(by), Angle::ZERO, Side::Top).is_empty(), "the opposite surface stays clear");
+
+    board.placed[0].at = at.add(by);
+    board.placed[0].rot = Angle::ZERO;
+    board.placed[0].side = Side::Top;
+    let (projected, removed) = placement::projected_carried_keepouts(&board, &moving, &ports);
+    assert_eq!(removed, [board.keepouts[3].id].into_iter().collect());
+    let mut moved = board.keepouts[2].clone();
+    moved.area = moved.area.translated(by);
+    assert_eq!(projected, [(owner, moved)], "the check replaces only the moving owner's derived member");
 }

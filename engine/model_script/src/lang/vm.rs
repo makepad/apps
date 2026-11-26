@@ -9,7 +9,7 @@
 //! and root calls take.
 
 use super::protos::{self, PROTOS};
-use super::{input_key, Diag, Input, Inputs, Library, RecordValue, Refusal, RootFn};
+use super::{input_key, Diag, EvalError, Input, Options, RecordValue, Refusal, RootFn};
 use makepad_script::*;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -49,6 +49,8 @@ pub struct Obj {
     pub proto: Option<String>,
     pub fields: Vec<(String, V)>,
     pub items: Vec<V>,
+    /// Own named and unnamed children in written order, as needed by a Path.
+    pub children: Vec<(Option<String>, V)>,
     pub loc: Option<(u32, u32)>,
 }
 
@@ -141,6 +143,18 @@ pub struct Ctx {
     pub texture: Option<ScriptObjectRef>,
     pub inputs: BTreeMap<(String, String), ScriptValue>,
     pub inputs_read: Vec<(String, String)>,
+    /// The fns the libraries export, by the name they export them under.
+    pub exports: Vec<(ScriptValue, String)>,
+    /// `m.host_call(..)` calls, their arguments read after the evaluation.
+    pub host_calls: Vec<HostCallRec>,
+}
+
+/// One `m.host_call(fn, args, board: ..)`: a library fn and the arguments to call it with again.
+pub struct HostCallRec {
+    pub board: String,
+    pub function: String,
+    pub args: ScriptValue,
+    pub loc: Option<(u32, u32)>,
 }
 
 /// The patterns and mappings `m.texture` compiles its kernels from.
@@ -229,9 +243,28 @@ fn brep_faces(proto: &str) -> (&'static [&'static str], &'static [&'static str])
         "BrepLoft" => (&["start", "end"], &[]),
         "BrepFillet" | "BrepChamfer" => (&[], &["face", "corner"]),
         "BrepShell" => (&[], &["inner"]),
+        "BrepHole" => (&["wall", "floor"], &[]),
         // Each half's face on the cut (on an exact part).
         "Split" => (&["cut"], &[]),
         _ => (&[], &[]),
+    }
+}
+
+/// The faces of part handle `source` named again on `copy` ([`new_face`]), with the methods that
+/// name the faces its step makes: a copy's faces go by its source's names, each the copy's own
+/// (`img.top` with `let img = m.brep.mirror(b, {keep: false})`).
+fn copy_faces(heap: &mut ScriptHeap, source: ScriptValue, copy: ScriptObject) {
+    let Some(src) = source.as_object().filter(|_| is_a(heap, source, id_lut!(Part))) else { return };
+    let fields: Vec<(ScriptValue, ScriptValue)> = heap.map_entries(src).iter().map(|e| (e.key, e.value)).collect();
+    for (k, v) in fields {
+        if is_a(heap, v, id_lut!(Face)) {
+            if let Some(role) = v.as_object().and_then(|o| heap.value(o, id_lut!(role).into(), NoTrap).as_id()) {
+                let face = new_face(heap, copy.into(), role, &[]);
+                heap.set_value_def(copy, k, face);
+            }
+        } else if ["face", "corner", "side", "inner"].iter().any(|m| k.as_id() == Some(lut_id(m))) {
+            heap.set_value_def(copy, k, v);
+        }
     }
 }
 
@@ -289,16 +322,28 @@ fn face_methods(vm: &mut ScriptVm) -> ScriptObject {
         let face = new_face(heap, me, id_lut!(corner), &[(id_lut!(round), list.into())]);
         made_here(vm, face)
     });
-    vm.add_method(on, id_lut!(side), script_args!(index = NIL), |vm, args| {
-        let me = arg(vm, args, id!(self));
-        let index = arg(vm, args, id_lut!(index));
-        let ok = index.as_number().is_some_and(|i| i >= 0.0 && i.fract() == 0.0);
-        if !is_a(vm.bx.heap_ref(), me, id_lut!(Part)) || !ok {
-            return script_err_invalid_args!(vm.trap(), "the side made from sketch segment i (0 the first): e.side(2)");
-        }
-        let face = new_face(vm.bx.heap_mut(), me, id_lut!(side), &[(id_lut!(index), index)]);
-        made_here(vm, face)
-    });
+    // On a part without numbered sides the segment form still reaches lowering, which
+    // can point to the generator that owns the Path.
+    for (method, numbered) in [(id_lut!(side), true), (id_lut!(segment_side), false)] {
+        vm.add_method(on, method, script_args!(index = NIL), move |vm, args| {
+            let me = arg(vm, args, id!(self));
+            let value = arg(vm, args, id_lut!(index));
+            let key = if value.as_object().is_some() {
+                id_lut!(seg)
+            } else if numbered && value.as_number().is_some_and(|i| i >= 0.0 && i.fract() == 0.0) {
+                id_lut!(index)
+            } else if !numbered && value.as_number().is_some() {
+                return script_err_invalid_args!(vm.trap(), "side(i) is a side of the extrude or revolve that drew the sketch: write it on that part, e.g. body.side(2)");
+            } else {
+                return script_err_invalid_args!(vm.trap(), "the side made from a sketch segment: e.side(2) or e.side(section.base)");
+            };
+            if !is_a(vm.bx.heap_ref(), me, id_lut!(Part)) {
+                return script_err_invalid_args!(vm.trap(), "a side belongs to a part: e.side(2) or e.side(section.base)");
+            }
+            let face = new_face(vm.bx.heap_mut(), me, id_lut!(side), &[(key, value)]);
+            made_here(vm, face)
+        });
+    }
     vm.add_method(on, id_lut!(inner), script_args!(outer = NIL), |vm, args| {
         let me = arg(vm, args, id!(self));
         let outer = arg(vm, args, id_lut!(outer));
@@ -482,6 +527,30 @@ fn install(vm: &mut ScriptVm, module: ScriptObject, ext: ScriptObject, ctx: Shar
         vm.bx.heap_mut().set_value_def(object, id_lut!(keepouts).into(), keepouts);
         value
     });
+    // `m.host_call(light_plan, {frame: .., shell: .., spec: ..}, board: "unit")`: leaves a library
+    // fn and the arguments it was called with for the host to call again with more of its own.
+    let hosted = ctx.clone();
+    vm.add_method(module, id_lut!(host_call), script_args!(function = NIL, args = NIL, board = NIL), move |vm, args| {
+        let function = arg(vm, args, id!(function));
+        let record = arg(vm, args, id!(args));
+        let board = arg(vm, args, id!(board));
+        let name = hosted.borrow().exports.iter().find(|(f, _)| *f == function).map(|(_, n)| n.clone());
+        let Some(name) = name else {
+            return script_err_invalid_args!(vm.trap(), "m.host_call's first argument is a fn a library exports: m.host_call(light_plan, {{..}}, board: \"unit\")");
+        };
+        let Some(board) = board.is_string_like().then(|| text_of(vm, board)).flatten().filter(|b| !b.is_empty()) else {
+            return script_err_invalid_args!(vm.trap(), "m.host_call needs the unit's name as text: board: \"unit\"");
+        };
+        let Some(holder) = record.as_object().filter(|_| p_is_options(vm.bx.heap_ref(), record)) else {
+            return script_err_invalid_args!(vm.trap(), "m.host_call's arguments are a record of the fn's parameters: {{frame: .., shell: ..}}");
+        };
+        let keep = vm.new_object_ref(holder);
+        let loc = loc_of_ip(vm, vm.trap_ip());
+        let mut ctx = hosted.borrow_mut();
+        ctx.keep.push(keep);
+        ctx.host_calls.push(HostCallRec { board, function: name, args: record, loc });
+        NIL
+    });
     // `m.edge(b.top, b.front, {near: [..] chain: true})`: an exact edge by the two faces it joins.
     vm.add_method(module, id_lut!(edge), script_args!(a = NIL, b = NIL, opts = NIL), |vm, args| {
         let (a, b, opts) = (arg(vm, args, id_lut!(a)), arg(vm, args, id_lut!(b)), arg(vm, args, id_lut!(opts)));
@@ -515,6 +584,7 @@ fn install(vm: &mut ScriptVm, module: ScriptObject, ext: ScriptObject, ctx: Shar
         made_here(vm, edge.into())
     });
     let methods = face_methods(vm);
+    let segment_side = vm.bx.heap_ref().value(methods, id_lut!(segment_side).into(), NoTrap);
     let method_fns: Vec<(LiveId, ScriptValue)> = ["face", "corner", "side", "inner"].iter().map(|m| (lut_id(m), vm.bx.heap_ref().value(methods, lut_id(m).into(), NoTrap))).collect();
     ctx.borrow_mut().keep.push(vm.bx.heap_mut().new_object_ref(methods));
     // `m.brep.box(..)`: the exact engine's builders under their own name, like the others.
@@ -524,7 +594,11 @@ fn install(vm: &mut ScriptVm, module: ScriptObject, ext: ScriptObject, ctx: Shar
         let c = ctx.clone();
         let tag = lut_id(p.name);
         let (roles, made) = brep_faces(p.name);
-        let made: Vec<(LiveId, ScriptValue)> = method_fns.iter().filter(|(m, _)| made.iter().any(|n| lut_id(n) == *m)).cloned().collect();
+        let mirror = p.name == "BrepMirror";
+        let mut made: Vec<(LiveId, ScriptValue)> = method_fns.iter().filter(|(m, _)| made.iter().any(|n| lut_id(n) == *m)).cloned().collect();
+        if !made.iter().any(|(m, _)| *m == id_lut!(side)) {
+            made.push((id_lut!(side), segment_side));
+        }
         let module = if p.group == protos::Group::Brep { brep } else { module };
         // Arguments: the call's own in order, the options object, then every field by name.
         let mut keys: Vec<&'static str> = p.args.to_vec();
@@ -631,6 +705,10 @@ fn install(vm: &mut ScriptVm, module: ScriptObject, ext: ScriptObject, ctx: Shar
                 for (m, f) in &made {
                     heap.set_value_def(handle, (*m).into(), *f);
                 }
+                // a mirror that keeps only the image is a copy of its source
+                if mirror && heap.value(object, lut_id("keep").into(), NoTrap).as_bool() == Some(false) {
+                    copy_faces(heap, heap.value(object, lut_id("source").into(), NoTrap), handle);
+                }
                 ctx.keep.push(heap.new_object_ref(object));
                 ctx.parts.push(PartCall { call, object, loc, stack: stack.clone(), loops: loops.clone(), piece });
                 handles.push(handle);
@@ -678,7 +756,6 @@ fn install(vm: &mut ScriptVm, module: ScriptObject, ext: ScriptObject, ctx: Shar
 pub struct Evaluated {
     pub host: Box<ScriptVmHost<(), ()>>,
     pub bx: Option<Box<ScriptVmBase>>,
-    pub errors: Vec<Diag>,
     /// The parser's warnings on the document: it runs, but likely not as written to
     /// (`[0 0 -30]` is two items).
     pub warnings: Vec<Diag>,
@@ -780,11 +857,33 @@ fn eval_input(vm: &mut ScriptVm, c: &Shared, key: &(String, String), input: &Inp
     read
 }
 
+/// Run just the inherited statements, so the VM retains the sources of live globs.
+fn import_scope(vm: &mut ScriptVm, imports: &[String]) -> Result<ScriptObject, EvalError> {
+    const FILE: &str = "<inherited imports>";
+    let source = imports.join("\n");
+    vm.eval(ScriptMod::new("", "", FILE, 1, 0, &source, &[]));
+    let errors: Vec<_> = vm.take_error_records().iter().map(|e| {
+        if let Some(loc) = e.loc().filter(|l| l.file() == FILE) {
+            let line = loc.line().max(1);
+            let text = source.lines().nth(line as usize - 1).unwrap_or("").trim();
+            Diag { line, col: loc.col() + 1, message: format!("inherited import `{text}`: {}", e.message()) }
+        } else {
+            Diag { line: 1, col: 1, message: format!("inherited imports: {}", e.text()) }
+        }
+    }).collect();
+    if !errors.is_empty() {
+        return Err(EvalError::Imports(errors));
+    }
+    vm.capture_errors();
+    vm.end_scope_of(FILE).ok_or_else(|| EvalError::Imports(vec![Diag { line: 1, col: 1, message: "inherited imports have no evaluation scope".into() }]))
+}
+
 /// Evaluate a document in a fresh VM with `mod.model`.
-pub fn evaluate(source: &str, extension: &str, roots: &[RootFn], overrides: HashMap<(u32, u32), f64>, libraries: &[Library], inputs: &Inputs) -> Evaluated {
+pub fn evaluate(source: &str, opts: &Options, imports: &[String]) -> Result<Evaluated, EvalError> {
+    let (extension, roots, libraries, inputs) = (opts.extension, opts.roots, opts.libraries, opts.inputs);
     let mut host = Box::new(ScriptVmHost::new((), ()));
     let bx = Box::new(ScriptVmBase::new());
-    let ctx: Shared = std::rc::Rc::new(RefCell::new(Ctx { overrides, ..Default::default() }));
+    let ctx: Shared = std::rc::Rc::new(RefCell::new(Ctx { overrides: opts.overrides.clone(), ..Default::default() }));
     let mut vm = ScriptVm { host: host.host_context(), bx };
     vm.set_script_domain("model");
     let module = vm.new_module(id!(model));
@@ -809,6 +908,9 @@ pub fn evaluate(source: &str, extension: &str, roots: &[RootFn], overrides: Hash
         if let Some(o) = value.as_object() {
             let fields: Vec<_> = vm.bx.heap_ref().map_entries(o).iter().map(|e| (e.key, e.value)).collect();
             for (key, value) in fields {
+                if value.as_object().is_some_and(|f| vm.bx.heap_ref().is_fn(f)) {
+                    ctx.borrow_mut().exports.push((value, key_string(key)));
+                }
                 vm.bx.heap_mut().set_value_def(ext, key, value);
             }
         } else {
@@ -891,14 +993,21 @@ pub fn evaluate(source: &str, extension: &str, roots: &[RootFn], overrides: Hash
     let mut errors: Vec<_> = vm.take_errors().iter().map(|e| diag_of(e)).collect();
     errors.extend(library_errors);
     // A broken environment cannot run the document; keep its original diagnostics.
-    let instructions = if errors.is_empty() {
-        vm.capture_errors();
+    if !errors.is_empty() {
+        return Err(EvalError::Document(errors));
+    }
+    vm.capture_errors();
+    // The imports run before the limit: a top-level body's return ends the budget it ran under.
+    let parent = if imports.is_empty() { None } else { Some(import_scope(&mut vm, imports)?) };
+    vm.with_instruction_limit(EVAL_LIMIT as u64, |vm| {
         // Rows count from 1 like an editor's lines; columns from 0.
-        vm.with_instruction_limit(EVAL_LIMIT as u64, |vm| vm.eval(ScriptMod::new("", "", &(DOC_FILE), 1, 0, &(source), &[])));
-        vm.last_limit_consumed()
-    } else {
-        0
-    };
+        let document = ScriptMod::new("", "", DOC_FILE, 1, 0, source, &[]);
+        match parent {
+            Some(parent) => vm.eval_in_scope(document, parent),
+            None => vm.eval(document),
+        }
+    });
+    let instructions = vm.last_limit_consumed();
     errors.extend(vm.take_errors().iter().map(|e| diag_of(e)).map(|mut d| {
         // An `m.<name>` call that is no builder: what Fab calls it.
         if let Some(name) = d.message.strip_prefix("method ").and_then(|m| m.strip_suffix(" not found on object")) {
@@ -910,12 +1019,16 @@ pub fn evaluate(source: &str, extension: &str, roots: &[RootFn], overrides: Hash
         d
     }));
     // Placed as the runtime's errors are ([`loc_of_ip`]).
-    let warnings = vm.take_warning_records().iter().filter_map(|w| {
+    let warnings: Vec<_> = vm.take_warning_records().iter().filter_map(|w| {
         let loc = w.loc().filter(|loc| loc.file().ends_with(DOC_FILE))?;
         Some(Diag { line: loc.line().max(1), col: loc.col() + 1, message: w.message().to_string() })
     }).collect();
+    if !errors.is_empty() {
+        errors.extend(warnings.into_iter().filter(Diag::is_array_minus_warning));
+        return Err(EvalError::Document(errors));
+    }
     let bx = vm.bx;
-    Evaluated { host, bx: Some(bx), errors, warnings, ctx, instructions }
+    Ok(Evaluated { host, bx: Some(bx), warnings, ctx, instructions })
 }
 
 /// Reads VM values into [`V`]s.
@@ -941,7 +1054,7 @@ impl<'a, 'b> Reader<'a, 'b> {
     fn read_part(&mut self, o: ScriptObject, index: usize) -> V {
         match self.read_object(o, 0) {
             V::Obj(obj) if obj.part.is_none() => {
-                let obj = Arc::new(Obj { ident: obj.ident, part: Some(index), proto: obj.proto.clone(), fields: obj.fields.clone(), items: obj.items.clone(), loc: obj.loc });
+                let obj = Arc::new(Obj { ident: obj.ident, part: Some(index), proto: obj.proto.clone(), fields: obj.fields.clone(), items: obj.items.clone(), children: obj.children.clone(), loc: obj.loc });
                 self.seen.insert(o, obj.clone());
                 V::Obj(obj)
             }
@@ -1031,23 +1144,23 @@ impl<'a, 'b> Reader<'a, 'b> {
             at = self.vm.bx.heap_ref().proto(obj).as_object();
         }
         let mut proto = None;
-        let mut raw: Vec<(String, ScriptValue)> = Vec::new();
-        let mut items = Vec::new();
+        let mut raw = Vec::new();
+        let mut field_names = std::collections::HashSet::new();
+        let mut children = Vec::new();
         for (level, obj) in chain.iter().enumerate() {
             let heap = self.vm.heap();
-            let mut fields: Vec<(String, ScriptValue)> = Vec::new();
-            heap.map_entries(*obj).iter().for_each(|e| fields.push((key_string(e.key), e.value)));
+            let mut fields: Vec<_> = heap.map_entries(*obj).iter().map(|e| (key_string(e.key), e.value, None)).collect();
             for index in 0..heap.vec_len(*obj) {
                 let entry = heap.vec_key_value(*obj, index, NoTrap);
-                if entry.key.is_nil() {
-                    if level == 0 {
-                        items.push(entry.value);
-                    }
-                } else {
-                    fields.push((key_string(entry.key), entry.value));
+                let name = (!entry.key.is_nil()).then(|| key_string(entry.key));
+                if level == 0 {
+                    children.push((name.clone(), entry.value));
+                }
+                if let Some(name) = name {
+                    fields.push((name, entry.value, (level == 0).then_some(index)));
                 }
             }
-            for (key, value) in fields {
+            for (key, value, child) in fields {
                 if key == "__proto" {
                     if proto.is_none() {
                         proto = value.as_id().map(id_string);
@@ -1058,20 +1171,27 @@ impl<'a, 'b> Reader<'a, 'b> {
                 if level > 0 && proto.is_some() {
                     continue;
                 }
-                if !raw.iter().any(|(k, _)| *k == key) {
-                    raw.push((key, value));
+                if field_names.insert(key.clone()) {
+                    raw.push((key, value, child));
                 }
             }
         }
-        if raw.is_empty() && proto.is_none() && !items.is_empty() {
-            return V::Arr(items.into_iter().map(|v| self.read_depth(v, depth + 1)).collect());
+        if raw.is_empty() && proto.is_none() && children.iter().any(|(k, _)| k.is_none()) {
+            return V::Arr(children.into_iter().filter(|(k, _)| k.is_none()).map(|(_, v)| self.read_depth(v, depth + 1)).collect());
         }
         let loc = self.loc_of(object);
         let ident = self.next;
         self.next += 1;
-        let fields: Vec<(String, V)> = raw.into_iter().map(|(key, value)| (key, self.read_depth(value, depth + 1))).collect();
-        let items: Vec<V> = items.into_iter().map(|v| self.read_depth(v, depth + 1)).collect();
-        let obj = Arc::new(Obj { ident, part: None, proto, fields, items, loc });
+        let children: Vec<_> = children.into_iter().map(|(key, value)| (key, self.read_depth(value, depth + 1))).collect();
+        let fields = raw.into_iter().map(|(key, value, child)| {
+            let value = match child {
+                Some(i) => children[i].1.clone(),
+                None => self.read_depth(value, depth + 1),
+            };
+            (key, value)
+        }).collect();
+        let items = children.iter().filter(|(key, _)| key.is_none()).map(|(_, value)| value.clone()).collect();
+        let obj = Arc::new(Obj { ident, part: None, proto, fields, items, children, loc });
         self.seen.insert(object, obj.clone());
         V::Obj(obj)
     }

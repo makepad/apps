@@ -9,7 +9,7 @@ use fab::ui::print_settings::control_name;
 use fab_plate::{print_setting, PrintSetting, SettingKind, PRINT_SETTINGS};
 use makepad_script::syntax::{self, Kind, Node};
 use makepad_strict_json::Value;
-use makepad_test::{run_with_config, Role, Selector, States, TestApp, TestConfig};
+use makepad_test::{run_with_config, KeyCode, Role, Selector, States, TestApp, TestConfig};
 use std::time::Duration;
 
 fn remote(app: &TestApp, args: &[String]) -> Result<Vec<String>, String> {
@@ -112,10 +112,21 @@ fn set(app: &TestApp, setting: &PrintSetting, value: &str) {
             let dropdown = app.widget_snapshot().nodes().iter()
                 .any(|n| n.visible() && n.role == Role::ComboBox && n.name == name);
             if dropdown {
-                app.locator(Selector::role(Role::ComboBox).name(&name)).expand();
-                let choice = Selector::role(Role::MenuItem).name(label);
-                app.locator(choice.clone()).wait_visible();
-                app.locator(Selector::role(Role::ComboBox).name(name)).select_option(label);
+                let combo = Selector::role(Role::ComboBox).name(&name);
+                app.locator(combo.clone()).expand();
+                let mut item = label.to_string();
+                if !setting.common.is_empty() {
+                    app.locator(Selector::role(Role::MenuItem).name("More patterns…")).wait_visible();
+                    if let Some((_, note)) = setting.common.iter().find(|(v, _)| *v == value) {
+                        item = format!("{label}: {note}");
+                    }
+                    if !app.widget_snapshot().nodes().iter().any(|n| n.visible() && n.role == Role::MenuItem && n.name == item) {
+                        app.locator(combo.clone()).select_option("More patterns…");
+                        item = label.to_string();
+                    }
+                }
+                app.locator(Selector::role(Role::MenuItem).name(&item)).wait_visible();
+                app.locator(combo).select_option(item);
             } else {
                 let tab = format!("{name} {label}");
                 app.locator(Selector::role(Role::Radio).name(&tab)).wait_visible();
@@ -299,6 +310,30 @@ fn slicer_rows_commit_to_the_project_and_undo() {
         println!("[print-modes] global");
         one_box(&app, "Global box");
         global_and_override(&app, "Global box");
+
+        let pattern = print_setting("sparse_infill_pattern").unwrap();
+        set(&app, pattern, "lightning");
+        wait_until(&app, "the common pattern in the project", || setting(&project(&app), "Global box", pattern.key).as_deref() == Some("lightning"));
+
+        let before = project(&app);
+        let combo = Selector::role(Role::ComboBox).name(control_name(pattern));
+        app.locator(combo.clone()).expand();
+        let noted = app.locator(Selector::role(Role::MenuItem).name("Lightning: least plastic, only holds up the top")).wait_visible().snapshot().bounds;
+        let field = app.locator(combo.clone()).snapshot().bounds;
+        assert!(noted.w > field.w, "the short list's notes are cut to the field: its menu is {} wide, the field {}", noted.w, field.w);
+        assert!(!app.widget_snapshot().nodes().iter().any(|n| n.visible() && n.role == Role::MenuItem && n.name == "Honeycomb"), "Honeycomb belongs under More");
+        app.locator(combo.clone()).select_option("More patterns…");
+        app.locator(Selector::role(Role::MenuItem).name("Honeycomb")).wait_visible();
+        assert_eq!(app.locator(combo.clone()).snapshot().value, "Lightning", "More keeps the current selection");
+        app.locator(combo.clone()).press_key(KeyCode::Escape);
+        assert_eq!(project(&app), before, "dismissing More keeps the project");
+
+        set(&app, pattern, "honeycomb");
+        wait_until(&app, "the full-list pattern in the project", || setting(&project(&app), "Global box", pattern.key).as_deref() == Some("honeycomb"));
+        wait_until(&app, "Honeycomb selected on the closed pattern dropdown", || {
+            let face = app.locator(combo.clone()).snapshot();
+            face.states.contains(States::COLLAPSED) && face.value == "Honeycomb"
+        });
 
         println!("[print-modes] multi");
         multi_select(&app, "Global box", "Other box");

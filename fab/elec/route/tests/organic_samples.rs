@@ -45,7 +45,7 @@ fn setup(board: Board) -> RouteProblem {
     let base = Base::new(board, rules, conn, fills);
     let nets = scope_nets(&base.board, &base.conn, &RouteScope::All);
     let world = Arc::new(RBase::build(&base.board));
-    problem(&base, world, &nets, Style::FortyFive, Effort(1))
+    problem(&base, world, &nets, Style::FortyFive, Effort::Full)
 }
 
 fn run(board: Board, finish: &Finish) -> Run {

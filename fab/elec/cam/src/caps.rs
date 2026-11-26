@@ -61,7 +61,7 @@ pub fn board_limits(board: &Board, caps: &Capabilities, profile: &str, unit: Boa
             format!("use {near} copper layers or choose another factory"),
             // a count is a count, not a length
             Some((count(layers), count(near as u8))),
-            vec![],
+            vec![Sel::Unit(unit)],
         );
     }
     let t = board.stackup.thickness;
@@ -73,9 +73,33 @@ pub fn board_limits(board: &Board, caps: &Capabilities, profile: &str, unit: Boa
             format!("board thickness {:.3} mm is not one {profile} offers ({} listed)", to_mm(t), caps.thickness.len()),
             format!("set the stackup to {:.3} mm or choose another factory", to_mm(near)),
             Some((Measure::Len(t), Measure::Len(near))),
-            vec![],
+            vec![Sel::Unit(unit)],
         );
     }
     out.sort_by(|a, b| a.rule.cmp(&b.rule));
+    out
+}
+
+/// A factory minimum as shown beside an authored value. Keep all significant nanometres.
+pub fn limit_text(nm: Nm) -> String {
+    if nm % 10_000 == 0 { format!("{:.2} mm", to_mm(nm)) } else { format!("{} mm", to_mm(nm)) }
+}
+
+/// Only a base minimum the person explicitly wrote can be finer than the house.
+pub fn raised_rules(board: &Board, caps: &Capabilities, profile: &str) -> Vec<Violation> {
+    let base = &board.rules.base;
+    let mut out = Vec::new();
+    for (rule, authored, limit) in [
+        ("track", base.track, caps.min_track), ("clearance", base.clearance, caps.min_clearance),
+        ("drill", base.drill, caps.min_drill), ("annular", base.annular, caps.min_annular),
+    ] {
+        let Some(have) = authored.filter(|&v| v < limit) else { continue };
+        let floor = limit_text(limit);
+        out.push(Violation::new(CheckKind::Custom(format!("factory.{rule}")), Severity::Warning,
+            Some(board.unit), vec![Sel::Unit(board.unit)], &format!("factory:{profile}:{rule}"),
+            format!("{rule} {} is finer than {profile}'s {floor}; the checks use {floor}", limit_text(have)))
+            .measures(Measure::Len(have), Measure::Len(limit))
+            .hint(format!("raise it to {floor}, or pick a finer house or tier")));
+    }
     out
 }

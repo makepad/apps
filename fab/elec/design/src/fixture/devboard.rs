@@ -8,7 +8,7 @@ use super::sbc::{block, board, component};
 use crate::options::{Field, Refused};
 use crate::{Assembly, Design, Frame, Mount};
 use fab_elec_board::Board;
-use fab_elec_circuit::Circuit;
+use fab_elec_circuit::{Circuit, Edge, Intent, Target};
 use fab_elec_core::{BlockId, BoardId, Contour, Side, Xform3, P};
 use fab_elec_parts::{FpMount, PartDef};
 use std::sync::Arc;
@@ -168,11 +168,16 @@ fn devboard_circuit(m: &Measured, usb_part: Arc<PartDef>) -> Circuit {
     let header = block(&mut c, "header");
     let power = block(&mut c, "power");
 
-    component(&mut c, "usb.j", "J1", usb_part, usb);
+    // The connectors overhang the -X edge on purpose: fixed to it, their courtyards may leave
+    // the outline.
+    let on_edge = |c: &mut Circuit, comp| c.intents.push(Intent::Fixed { t: Target::Comp(comp), edge: Some(Edge::Left), at: None, rot: None });
+    let j1 = component(&mut c, "usb.j", "J1", usb_part, usb);
+    on_edge(&mut c, j1);
     if m.dc.present {
         // The jack body enters the wall, so its opening is the body's face.
         let jack = parts::edge_plug("DC_JACK", (DC_WIDTH, DC_DEPTH, m.dc.height), None, FpMount::Thru, 10.0);
-        component(&mut c, "dc.j", "J2", jack, dc);
+        let j2 = component(&mut c, "dc.j", "J2", jack, dc);
+        on_edge(&mut c, j2);
     }
     let processor = match m.mcu {
         McuKind::Dip28 => parts::dip28_socketed(),

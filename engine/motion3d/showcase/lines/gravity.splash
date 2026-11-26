@@ -1,0 +1,11 @@
+use mod.scene.*; use mod.post
+// A mass sinking into a grid (a gravity well) beside an accretion disk,
+// with light shafts spilling from the disk's core.
+Scene3D{ background: #03050b tone_mapping: @aces
+  camera: Camera{position: tween(vec3(0, 3.2, 9), vec3(1.5, 2.2, 7), 0, 6, @ease_in_out_cubic) target: vec3(0.5, 0, 0) fov: 40}
+  post: [post.Bloom{strength: 0.9 threshold: 0.8} LightShafts{position: vec3(2.6, 1.6, -1) strength: 1.2 color: #ffb070 decay: 0.94 threshold: 0.6}]
+  lights: [AmbientLight{intensity: 0.3} DirectionalLight{position: vec3(2, 5, 3) intensity: 1.5}]
+  children: [
+    Fx{preset: @gravity_well position: vec3(-1.2, 0, 0) radius: 5 amount: 1.4 spacing: 0.35 start: 0.3 duration: 3 color: #6fd0ff color2: #ff5a1f}
+    Fx{preset: @accretion_disk position: vec3(2.6, 1.6, -1) radius: 1.6 count: 900 size: 0.03 color: #fff2c0 color2: #ff5a1f}
+  ] }

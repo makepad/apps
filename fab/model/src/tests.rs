@@ -8,7 +8,6 @@ const F: &str = "t.cad.splash";
 #[test]
 fn a_script_rebuilds_only_for_the_inputs_it_reads() {
     let m = FabModel::new("test");
-    let scripts = BTreeMap::new();
     let solved = program::Solved::new();
     let inputs = |b1: u8, b2: Option<u8>| lang::Inputs {
         kinds: vec!["board".into()],
@@ -19,7 +18,7 @@ fn a_script_rebuilds_only_for_the_inputs_it_reads() {
         lazy: None,
     };
     let env = ScriptEnv::new(Vec::new(), inputs(1, Some(2)));
-    let key = |source: &str, env: &ScriptEnv| script_key(F, source, &m.assets, &m.facets, &m.pictures, &m.context, env, &[], &scripts, &solved, &[]);
+    let key = |source: &str, env: &ScriptEnv| script_key(F, source, &m.assets, &m.facets, &m.pictures, &m.context, env, &[], m.state(), &solved, &[]);
     let literal = src("let b = board(\"b1\")");
     assert_eq!(key(&literal, &env), key(&literal, &env.clone()), "unchanged inputs keep the cached compile");
     assert_eq!(key(&literal, &env), key(&literal, &ScriptEnv::new(Vec::new(), inputs(1, Some(3)))), "an unread input's hash does not invalidate the compile");
@@ -135,6 +134,193 @@ fn prog(c: &Compiled) -> &makepad_model_script::lang::Program {
 }
 
 const BRACKET: &str = "let plate = m.box({size: [60mm 6mm 40mm]})\nlet hole = m.cylinder({radius: 4mm height: 20mm segments: 48})\nlet bracket = m.subtract(plate, hole)\nobject(bracket)\n";
+
+#[test]
+fn part_steps_follow_the_written_build_and_model_edits() {
+    let source = src(r#"let edge = param(5mm, min: 1mm, max: 6mm)
+let profile = Rect{size: [12mm 12mm]}
+let l = m.brep.extrude({sketch: profile height: 8mm})
+let eased = m.brep.fillet(
+    l, 0.1cm, {edges: m.edge(l.bottom, l.side(0))}
+)
+let rounded = m.brep.fillet(eased, edge, {edges: m.edge(l.top, l.side(2))})
+let rib = param(2mm)
+let width = rib
+let gussets = for x in [-1, 1] { m.brep.box({size: [width 2mm 2mm] at: [x * 6mm, 0, 0]}) }
+let braced = m.brep.union(rounded, gussets)
+let holes = for x in [-1, 1] {
+    [m.brep.cylinder({radius: 1mm height: 8mm at: [x * 3mm, 0, 0]}),
+     m.brep.cylinder({radius: 2mm height: 2mm at: [x * 3mm, 3mm, 0]})]
+}
+let drilled = m.brep.subtract(braced, holes)
+let bracket = m.brep.chamfer(drilled, 0.6mm, {edges: m.edge(l.top, l.side(0))})
+object(bracket)
+let twin = m.brep.mirror(l, {plane: @yz})
+fn make_pin(edge) { return m.brep.cylinder({radius: edge height: 2mm}) }
+let pin = make_pin(1mm)
+object([twin, pin], name: "Pair")
+let inset_size = [4mm 4mm 4mm]
+let inset_radius = 0.2mm
+let inset = m.brep.fillet(m.brep.box({size: inset_size}), inset_radius)
+object(inset)
+let block = m.brep.box({size: [8mm 8mm 8mm]})
+object(block)
+fn by_parameter(block) { return block.top }
+fn by_local(other) {
+    if other {
+        let block = [block.front, other]
+        return block.len()
+    }
+    return block.back
+}
+"#);
+    let mut model = FabModel::with_script("test", F, &source);
+    let script = model.compile_script(F).expect("the step examples compile without meshing");
+    let lists = steps::object_steps(&script, "bracket");
+    let [(body, spine)] = lists.as_slice() else { panic!("the bracket has one history") };
+    assert_eq!(spine, &steps::steps(&script, *body), "body and object queries give the same history");
+    let ids: Vec<_> = spine.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, ["l", "eased", "rounded", "braced", "drilled", "bracket"], "only spine solids are steps");
+    assert_eq!(spine.iter().map(|s| s.verb.as_ref()).collect::<Vec<_>>(), ["Extrude", "Round", "Round", "Join", "Cut", "Chamfer"], "the history uses the tools' verbs");
+    assert_eq!(spine.iter().map(|s| s.value.as_deref()).collect::<Vec<_>>(), [Some("8 mm"), Some("1 mm"), Some("5 mm"), None, None, Some("0.6 mm")], "literals and declared parameters use display units");
+    assert_eq!(spine[3].uses.iter().map(ToString::to_string).collect::<Vec<_>>(), ["+gussets ×2"], "the join groups the two loop boxes");
+    assert_eq!(spine[4].uses.iter().map(ToString::to_string).collect::<Vec<_>>(), ["−holes ×4"], "the cut counts both cylinders from each pass");
+    for (i, step) in spine.iter().enumerate() {
+        assert_eq!(step.n, i + 1, "step numbers start at one in build order");
+        let line = source.lines().nth(step.line as usize - 1).expect("the step has a source line");
+        assert!(line.starts_with(&format!("let {} =", step.id)), "step {} points to its own builder line", step.n);
+    }
+    assert!(spine.windows(2).all(|w| w[0].line < w[1].line), "the bracket's lines follow its construction");
+    assert_eq!(spine[0].end_line, spine[0].line, "a single-line builder ends on its own line");
+    let round = &spine[1];
+    assert_eq!(round.end_line, round.line + 2);
+    for line in round.line..=round.end_line {
+        assert_eq!(steps::step_of_line(spine, line), Some(1), "line {line} belongs to the multiline round");
+    }
+    assert_eq!(steps::step_of_line(spine, 1), Some(0), "before the first builder");
+    assert_eq!(steps::step_of_line(spine, spine[2].end_line + 1), Some(3), "an operand between steps points to its join");
+    assert_eq!(steps::step_of_line(spine, spine.last().unwrap().end_line + 1), None, "after the last step");
+    assert_eq!(spine[0].shared_with, ["Pair"], "the base names the other object built on it");
+    let pair = steps::object_steps(&script, "Pair");
+    assert_eq!(pair.len(), 2, "a multi-body object has a history for each body");
+    assert_eq!(pair[0].1[0].shared_with, ["bracket"], "sharing is visible from either object's history");
+    let pin = pair[1].1.last().expect("the pin has a step");
+    assert_eq!(pin.made_in.as_deref(), Some("make_pin"), "the function-made solid names its maker");
+    assert_eq!(pin.value.as_deref(), Some("edge"), "a function argument that shadows a declared param shows its written expression");
+    let inline = steps::object_steps(&script, "inset");
+    assert_eq!(inline[0].1.iter().map(|s| (s.id.as_str(), s.verb.as_ref())).collect::<Vec<_>>(), [("inset.box", "Box"), ("inset", "Round")], "the inline box keeps its own id and step");
+
+    let after = |solid: &str, code: &str| sc(Edit::After { solid: solid.into(), code: code.into() });
+    let (_, compiled) = model.edited(&[
+        after("block", "m.brep.fillet(block, 1mm, {edges: m.edge(block.top, block.front)})"),
+        after("block", "m.brep.chamfer(block, 1mm, {edges: m.edge(block_box.bottom, block_box.back)})"),
+        after("block_fillet", "m.brep.fillet(block_fillet, 1mm, {edges: m.edge(block_box.top, block_box.back)})"),
+        after("block_fillet2", "m.brep.fillet(block_fillet2, 1mm, {edges: m.edge(block_box.bottom, block_box.front)})"),
+        after("block", "m.brep.shell(block, 0.5mm)"),
+        Change::Param { instance: "t".into(), name: "edge".into(), value: Some(0.003) },
+    ]).expect("the tool edits and parameter override compile through the model");
+    let script = &compiled.instances[0].script;
+    let edited = steps::object_steps(script, "block");
+    assert_eq!(edited[0].1.iter().map(|s| (s.id.as_str(), s.verb.as_ref())).collect::<Vec<_>>(), [
+        ("block_box", "Box"), ("block_fillet3", "Round"), ("block_fillet2", "Round"),
+        ("block_fillet", "Round"), ("block_chamfer", "Chamfer"), ("block", "Shell"),
+    ], "After numbers repeated fillets, names a different kind for its own builder, and keeps the steps in build order");
+    let text = script.source();
+    assert!(text.contains("fn by_parameter(block) { return block.top }"), "a parameter keeps its own dotted reads: {text}");
+    assert!(text.contains("let block = [block_box.front, other]"), "a local binding's initializer can still read the original box: {text}");
+    assert!(text.contains("return block.len()"), "a dotted read after the local binding belongs to the local: {text}");
+    assert!(text.contains("return block_box.back"), "a read after the nested block belongs to the original box again: {text}");
+    assert_eq!(steps::object_steps(script, "bracket")[0].1[2].value.as_deref(), Some("3 mm"), "the headline follows this instance's current param value");
+
+    let rollback = |solid: &str, to: &str| sc(Edit::Truncate { solid: solid.into(), to: to.into() });
+    let mut eval = Evaluator::new(Machine::dual_nozzle_350());
+    let (_, rolled, ev) = apply(&mut model, &mut eval, "shorten", vec![rollback("bracket", "rounded")]);
+    assert!(ev.plate.parts.iter().any(|p| p.object == "t/bracket"));
+    let short = steps::part_steps(&rolled, "t/bracket");
+    assert_eq!(short.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["l", "eased", "bracket"]);
+    assert_eq!((&short[2].verb, &short[2].value), (&spine[2].verb, &spine[2].value));
+    let text = model.source(F).unwrap();
+    assert!(text.contains("let bracket = m.brep.fillet(eased, edge, {edges: m.edge(l.top, l.side(2))})"));
+    assert!(!text.contains("gussets") && !text.contains("let holes") && !text.contains("let width"));
+    assert!(text.contains("let edge = param(") && text.contains("let rib = param("));
+    assert_eq!(model.undo_labels().next(), Some("t: roll back bracket to rounded"));
+    model.history(&mut eval, model.head(), HistoryAction::Undo, None).expect("one undo restores the whole script");
+    assert_eq!(model.source(F), Some(source.as_str()));
+
+    let line = source.lines().position(|line| line.starts_with("let twin")).unwrap() + 1;
+    let shared = model.apply(&mut eval, "shared", model.head(), &[rollback("bracket", "l")], None).unwrap_err();
+    assert!(shared.to_string().contains(&format!("l is also read on line {line}")), "{shared}");
+    let off = model.apply(&mut eval, "off spine", model.head(), &[rollback("bracket", "pin")], None).unwrap_err();
+    assert!(off.to_string().contains("l, eased, rounded, braced, drilled, bracket"), "{off}");
+    assert_eq!(model.source(F), Some(source.as_str()), "both refusals leave the script intact");
+
+    let (_, rolled, _) = apply(&mut model, &mut eval, "inline", vec![rollback("inset", "inset.box")]);
+    assert_eq!(steps::part_steps(&rolled, "t/inset").iter().map(|s| (s.id.as_str(), s.verb.as_ref())).collect::<Vec<_>>(), [("inset", "Box")]);
+    let text = model.source(F).unwrap();
+    assert!(text.contains("let inset = m.brep.box({size: inset_size})") && text.contains("let inset_size") && !text.contains("inset_radius"));
+
+    let shared = format!("{source}object(\n    braced, name: \"Brace\"\n)\n");
+    let line = shared.lines().count() - 1;
+    let mut other = FabModel::with_script("test", F, &shared);
+    let err = other.apply(&mut eval, "shared removed step", other.head(), &[rollback("bracket", "rounded")], None).unwrap_err();
+    assert!(err.to_string().contains(&format!("line {line} reads braced: roll back would leave it unbound")), "{err}");
+}
+
+#[test]
+fn a_refused_insert_names_the_committed_step_that_lost_its_edge() {
+    let (mut model, mut eval) = setup();
+    let (_, compiled, _) = program(&mut model, &mut eval, "build", r#"let hole = m.brep.cylinder({radius: 2mm height: 40mm})
+let a = m.brep.box({size: [40mm 20mm 30mm]})
+let b = m.brep.fillet(a, 1mm, {edges: m.edge(a.top, a.front)})
+let c = m.brep.subtract(b, hole)
+object(c)
+"#);
+    let steps = steps::part_steps(&compiled, "t/c");
+    assert_eq!(steps.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["a", "b", "c"], "the committed spine has three adjacent builders");
+    let head = model.head();
+    let cut_top = sc(Edit::After { solid: "a".into(), code: "m.brep.subtract(a, m.brep.box({size: [60mm 4mm 60mm] at: [0 10mm 0]}))".into() });
+    let err = model.apply(&mut eval, "cut top", head, &[cut_top], None).expect_err("the insert takes away the edge b rounds");
+    let ApplyError::Build(f) = err else { panic!("the downstream fillet should refuse the build: {err}") };
+    assert_eq!(model.head(), head, "a refused insert leaves the committed history intact");
+    assert!(f.id == "b" && f.lost.is_some(), "the evaluator names the fillet whose edge was lost: {f}");
+    assert_eq!(steps::step_of_line(&steps, f.line), Some(2), "the candidate's fillet line points at c in the committed source");
+    assert_eq!(steps::step_of_failure(&steps, f.line, Some(&f.id)), Some(1), "the solid id points back to b despite the inserted line");
+    assert_eq!(steps::step_of_failure(&steps, steps[0].line, Some("hole")), Some(2), "the hole's badge attributes its failure to the cut");
+    assert_eq!(steps::step_of_failure(&steps, f.line, None), Some(2), "a program error uses its line");
+    assert_eq!(steps::step_of_failure(&steps, f.line, Some("new_solid")), Some(2), "an id absent from the committed steps also uses its line");
+}
+
+#[test]
+fn a_step_shows_as_it_was_built() {
+    let source = src("let base = m.brep.box({size: [20mm 10mm 20mm]})\nlet eased = m.brep.fillet(base, 2mm)\nlet hole = m.brep.cylinder({radius: 3mm height: 40mm})\nlet bracket = m.brep.subtract(eased, hole)\nobject(bracket)\nlet pin = m.brep.cylinder({radius: 2mm height: 8mm})\nobject(pin)\n");
+    let model = FabModel::with_script("test", F, &source);
+    let mut e = Evaluator::new(Machine::dual_nozzle_350());
+    let (compiled, ev) = model.evaluate(&mut e, None).expect("the bracket builds");
+    let script = compiled.instances[0].script.clone();
+    let spine = steps::part_steps(&compiled, "t/bracket");
+    assert_eq!(spine, steps::object_steps(&script, "bracket")[0].1, "part_steps is the part's object history");
+    assert_eq!(spine.len(), 3, "the bracket's spine is the box, its round and the cut");
+    assert!(steps::part_steps(&compiled, "t/nothing").is_empty() && steps::part_steps(&compiled, "nothing").is_empty(), "an unknown part has no steps");
+    let at = ev.plate.parts.iter().position(|p| p.object == "t/bracket").expect("the bracket is on the plate");
+    let frame = *ev.placed_frame(at).expect("the part has a frame");
+    let first = e.step_render(&script, spine[0].solid, &frame, None).expect("step 1 meshes");
+    let last = e.step_render(&script, spine.last().unwrap().solid, &frame, None).expect("the last step meshes");
+    assert!(!first.indices.is_empty() && !last.indices.is_empty(), "both steps give triangles");
+    let bounds = |rm: &fab_plate::RenderMesh| rm.positions.iter().fold(([f32::MAX; 3], [f32::MIN; 3]), |(lo, hi), p| (std::array::from_fn(|k| lo[k].min(p[k])), std::array::from_fn(|k| hi[k].max(p[k]))));
+    let (lo1, hi1) = bounds(&first);
+    let (lo2, hi2) = bounds(&last);
+    assert!((0..3).all(|k| lo1[k] <= lo2[k] + 1e-3 && hi1[k] >= hi2[k] - 1e-3), "step 1 holds the last step's bounds: {lo1:?} {hi1:?} vs {lo2:?} {hi2:?}");
+    assert!(first.indices.len() != last.indices.len(), "the cut changed the mesh");
+    assert!(e.step_render(&script, 9999, &frame, None).is_err(), "a solid that does not exist is an error");
+
+    let shown = ev.with_step(at, first.clone());
+    assert_eq!(shown.render[at].positions, first.positions, "the part shows the step's mesh");
+    assert!(shown.fields[at].is_none() && shown.paint[at].is_none(), "the part draws as a mesh, not from its field");
+    assert_eq!(shown.handles[at], ev.handles[at], "the part keeps its place call: the panels read its turn and scale from it");
+    let other = 1 - at;
+    assert_eq!(shown.render[other].positions, ev.render[other].positions, "the other part keeps its mesh");
+    assert_eq!(shown.plate.parts.len(), ev.plate.parts.len(), "the plate keeps its parts");
+}
 
 #[test]
 fn a_panel_applies_only_unclaimed_base_cuts_and_always_applies_generated_cuts() {
@@ -581,7 +767,7 @@ fn a_batch_that_does_not_build_commits_nothing() {
     let head = m.head();
     let before = m.source(F).unwrap().to_string();
     // A program error names its line and column.
-    let err = m.apply(&mut e, "r2", head, &[sc(Edit::Add { code: "let ball = m.union(m.sphere({radius: 5mm}), nothing)".into(), before: None })], None).unwrap_err();
+    let err = m.apply(&mut e, "r2", head, &[sc(Edit::Add { code: "let ball = m.union(m.sphere({radius: 5mm}), nothing)".into(), at: Anchor::Auto })], None).unwrap_err();
     match err {
         ApplyError::Build(f) => {
             assert_eq!((f.file.as_str(), f.line), (F, 8), "{f}");
@@ -711,24 +897,23 @@ fn a_drag_in_nested_blends_compiles_once_a_frame() {
     let parts = params::model(&c, &ev);
     let key = parts.iter().flat_map(|pp| pp.params.iter()).map(|q| q.key.as_str()).find(|k| k.ends_with("b0.points.6")).expect("the first cage's points are params").to_string();
     let s = &c.instances[0].script;
-    let time = |run: &dyn Fn()| {
-        let t = std::time::Instant::now();
+    // Work counted on this thread (evaluations, name parses), never timed.
+    let count = |run: &dyn Fn()| {
+        let before = makepad_model_script::lang::work_done();
         run();
-        t.elapsed().as_secs_f64()
+        let after = makepad_model_script::lang::work_done();
+        (after.0 - before.0, after.1 - before.1)
     };
-    // the best of five, taken in turns so that other work on the machine weighs on both alike
-    let (mut drag, mut compile) = (f64::INFINITY, f64::INFINITY);
-    for _ in 0..5 {
-        drag = drag.min(time(&|| {
-            let live = params::with_value(&c, &parts, &key, &PValue::Point(vec![4.0, 9.0, 4.0])).unwrap();
-            assert!(live.source().contains("[4mm 9mm 4mm]"));
-        }));
-        compile = compile.min(time(&|| {
-            program::compile(&s.file, s.source(), &s.assets, &s.facets, &s.pictures, &s.context, &|_| None).unwrap();
-        }));
-    }
-    eprintln!("drag in 12 nested blends: {:.1} ms a frame, one compile {:.1} ms", drag * 1e3, compile * 1e3);
-    assert!(drag < 1.5 * compile, "a drag frame took {:.1} ms, a compile {:.1} ms: the drag compiles twice", drag * 1e3, compile * 1e3);
+    let drag = count(&|| {
+        let live = params::with_value(&c, &parts, &key, &PValue::Point(vec![4.0, 9.0, 4.0])).unwrap();
+        assert!(live.source().contains("[4mm 9mm 4mm]"));
+    });
+    let compile = count(&|| {
+        program::compile(&s.file, s.source(), &s.assets, &s.facets, &s.pictures, &s.context, &|_| None).unwrap();
+    });
+    assert_eq!(compile.0, 1, "one compile evaluates the program once: {compile:?}");
+    assert_eq!(drag.0, 1, "a drag frame in 12 nested blends evaluates the program once, not once per blend or twice: {drag:?}");
+    assert!(drag.1 <= compile.1, "a drag frame parses the source no more often than a compile does: drag {drag:?}, compile {compile:?}");
 }
 
 #[test]
@@ -1164,8 +1349,36 @@ fn a_field_parts_cutter_has_its_box_and_moves() {
 /// script placed twice with other parameter values is two instances.
 #[test]
 fn a_project_saves_its_scripts_and_loads_back() {
-    let (mut m, mut e) = setup();
-    program(&mut m, &mut e, "r1", "let size = param(20mm, min: 5mm, max: 80mm)\nlet cube = m.box({size: [size size size]})\nobject(cube)\n");
+    let text = "// A Fab project: object scripts placed on the plate.\nuse mod.fab.*\nuse mod.model.param\n\nscript(\"t.cad.splash\")\n";
+    let body = "let size = param(20mm, min: 5mm, max: 80mm)\nlet cube = m.box({size: [size size size]})\nobject(cube)\n";
+    let source = format!("let m = mod.model\n{body}");
+    let mut m = FabModel::load("test", text, [(F.to_string(), source.clone())].into()).expect("the project with two imports parses");
+    assert_eq!(m.project_text(), text, "the project's ordered imports round-trip verbatim");
+    let implicit = project::parse("mod.fab.script(\"t.cad.splash\")\n").expect("a project can use qualified calls");
+    assert_eq!(project::write(&implicit, &|_, _| project::Unit::Plain), text.replace("use mod.model.param\n", ""), "a project with no use statements saves the usual Fab import");
+    let script = m.compile_script(F).expect("object and param resolve through the project's imports");
+    assert!(script.object("cube").is_some(), "the inherited object call emits the named cube");
+    assert_eq!(script.source(), source, "the compiled object script retains its own source");
+
+    let mut state = m.state().clone();
+    state.scripts.insert(F.to_string(), format!("{source}    m.param(\"invalid\")\n"));
+    let err = m.compile_ref(&state, &state.project.scripts[0], &[]).expect_err("the invalid param call must report a script error");
+    assert!(err.file == F && err.message.contains("param needs a number"), "the error belongs to the failing object script: {err}");
+    assert_eq!((err.line, err.col), (5, 12), "the error points to m.param's opening parenthesis in the script's own text");
+
+    state.scripts.insert(F.to_string(), source);
+    state.project = project::parse("use mod.model.param\nmod.fab.script(\"t.cad.splash\")\n").expect("a selective import project parses");
+    let err = m.compile_ref(&state, &state.project.scripts[0], &[]).expect_err("removing the Fab import must invalidate the compiled cube");
+    assert!(err.file == F && err.message.contains("variable object not found"), "the script reports the missing import: {err}");
+    state.scripts.insert(F.to_string(), src("let param = 2mm\nlet cube = m.box({size: [param param param]})\nobject(cube)\n"));
+    let explicit = m.compile_ref(&state, &state.project.scripts[0], &[]).expect("a script with its own use lines still builds");
+    assert!(explicit.object("cube").is_some(), "the script's own Fab import and shadowing let build the cube");
+
+    state.project = project::parse("let project_math = mod.math\nuse project_math.*\nmod.fab.script(\"t.cad.splash\")\n").expect("the import resolves in its original project");
+    let err = m.compile_ref(&state, &state.project.scripts[0], &[]).expect_err("the import alone cannot resolve a project-local let");
+    assert!(err.file.is_empty() && err.message.contains("use project_math.*"), "an invalid inherited import identifies the project and statement: {err}");
+
+    let mut e = Evaluator::new(Machine::dual_nozzle_350());
     let (_, c, ev) = apply(&mut m, &mut e, "r2", vec![
         Change::AddInstance { file: F.into(), source: None, name: Some("big".into()), at: Some([250.0, 100.0]) },
         Change::Param { instance: "big".into(), name: "size".into(), value: Some(0.04) },
@@ -1242,7 +1455,7 @@ fn ids_come_from_lets_and_paths_and_survive_value_edits() {
     let (_, c2, _) = apply(&mut m, &mut e, "r2", vec![sc(Edit::Set { site: "plate.extrude.height".into(), value: "5mm".into() })]);
     assert_eq!(prog(&c2).solids.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ids);
     // Inserting before keeps every id too.
-    let (_, c3, _) = apply(&mut m, &mut e, "r3", vec![sc(Edit::Add { code: "let spare = m.box({size: [5mm 5mm 5mm]})".into(), before: Some("plate".into()) })]);
+    let (_, c3, _) = apply(&mut m, &mut e, "r3", vec![sc(Edit::Add { code: "let spare = m.box({size: [5mm 5mm 5mm]})".into(), at: Anchor::Before("plate".into()) })]);
     for id in &ids {
         assert!(prog(&c3).solid(id).is_some(), "{id}");
     }
@@ -1274,46 +1487,108 @@ fn parameters_drive_solids_and_carry_kinds_handles_and_edits() {
         &mut m,
         &mut e,
         "p1",
-        "let h = param(30mm, min: 5mm, max: 100mm, label: \"Height\")\nlet wall = param(2mm)\nlet post = m.cylinder({radius: wall * 4 height: h segments: 32})\nlet fins = for x in [-9mm, 9mm] {\n    m.box({size: [2mm 10mm 12mm] at: [x, 0, 0]})\n    m.box({size: [12mm 10mm 2mm] at: [0, 0, x]})\n}\nlet part = m.union(post, fins)\nobject(part)\n",
+        "let h = param(30mm, min: 5mm, max: 100mm, label: \"Height\")\nlet wall = param(2mm)\nlet post = m.cylinder({radius: wall * 4 height: h segments: 32})\nlet fins = for x in [-9mm, 9mm] {\n    m.box({size: [2mm 10mm 12mm] at: [x, 0, 0]})\n    m.box({size: [12mm 10mm 2mm] at: [0, 0, x]})\n}\nlet part = m.union(post, fins, {at: [wall + 1, 0, 0]})\nobject(part)\n",
     );
     // A 30 mm post of radius 8 with four fins round it.
     let size = ev.plate.parts[0].mesh.bounds().size();
-    assert!((size[2] - 30.0).abs() < 1e-6, "{size:?}");
+    assert!((size[2] - 30.0).abs() < 1e-6, "the post is 30 mm tall: {size:?}");
     assert!((size[0] - 20.0).abs() < 0.01, "fins reach 10 mm out: {size:?}");
     let model = params::model(&c, &ev);
-    assert_eq!(model.len(), 1);
+    assert_eq!(model.len(), 1, "the post and fins share a part");
     let pp = &model[0];
     let find = |k: &str| pp.params.iter().find(|p| p.key == k).unwrap_or_else(|| panic!("no {k}: {:?}", pp.params.iter().map(|p| &p.key).collect::<Vec<_>>()));
     let h = find("t/h");
-    assert!(h.declared && h.kind == params::Kind::Length && h.min == 5.0 && h.max == 100.0 && h.label == "Height", "{h:?}");
+    assert!(h.declared && h.kind == params::Kind::Length && h.min == 5.0 && h.max == 100.0 && h.label == "Height", "height carries its declared kind, bounds and label: {h:?}");
+    // Declared bounds are limits; a range nothing declared is only a drag's reach, never a limit,
+    // and the AI is told the limits alone.
+    assert_eq!(h.limits, [Some(5.0), Some(100.0)], "the declared bounds hold a set value");
+    let wall = find("t/wall");
+    assert!(wall.max > wall.min && wall.limits == [None, None], "an undeclared range is reach only: {wall:?}");
+    let text = params::model_text(&model, &ev, true);
+    let line = |k: &str| text.lines().find(|l| l.contains(&format!("key: \"{k}\""))).unwrap_or_else(|| panic!("no {k} in {text}")).to_string();
+    assert!(line("t/h").contains("min: 5mm max: 100mm"), "the AI sees both height limits: {}", line("t/h"));
+    assert!(!line("t/wall").contains("max:"), "the AI sees no limit for wall's soft reach: {}", line("t/wall"));
+    assert!(line("t/post.radius").contains("formula: \"wall * 4\""), "the AI sees the radius formula on its row: {}", line("t/post.radius"));
     // The arrow's tip moves half a millimetre per millimetre of height (a centred cylinder).
     match &h.anchor {
-        Some(params::Anchor::Linear { to, rate, .. }) => assert!((to[1] - 15.0).abs() < 1e-9 && (rate - 0.5).abs() < 1e-6, "{to:?} {rate}"),
-        other => panic!("{other:?}"),
+        Some(params::Anchor::Linear { to, rate, .. }) => assert!((to[1] - 15.0).abs() < 1e-9 && (rate - 0.5).abs() < 1e-6, "height's arrow follows the post top: {to:?} {rate}"),
+        other => panic!("height needs a linear handle: {other:?}"),
     }
     // `wall` sets a radius through `wall * 4`: its ring moves 4 mm per mm.
     match &find("t/wall").anchor {
-        Some(params::Anchor::Radius { rate, .. }) => assert!((rate - 4.0).abs() < 1e-6, "{rate}"),
-        other => panic!("{other:?}"),
+        Some(params::Anchor::Radius { rate, .. }) => assert!((rate - 4.0).abs() < 1e-6, "wall's ring follows four times its change: {rate}"),
+        other => panic!("wall needs the post's radius handle: {other:?}"),
     }
-    // Fields written as literals are listed; fields written as expressions are not.
-    assert!(!pp.params.iter().any(|p| p.key == "t/post.radius" || p.key == "t/post.height"));
+    let radius = find("t/post.radius");
+    assert_eq!(radius.value.num(), Some(8.0), "the linked radius is in millimetres");
+    assert_eq!(radius.formula.as_deref(), Some("wall * 4"), "the linked row keeps the expression as written");
+    assert!(radius.anchor.is_none() && params::can_link(radius), "the linked radius accepts formulas and leaves its handle to wall");
+    assert!(!pp.params.iter().any(|p| p.key == "t/post.height"), "a lone name keeps only its declared row");
+    assert!(!pp.params.iter().any(|p| p.key == "t/part.at.0"), "a bare addend with a different script value stays code-only");
+    assert_eq!(find("t/part.at.1").value.num(), Some(0.0), "the adjacent literal in the same position vector has a row");
     let fin = pp.params.iter().find(|p| p.key.ends_with(".size.1")).expect("a fin's height");
-    assert!(fin.kind == params::Kind::Length && (fin.value.num().unwrap() - 10.0).abs() < 1e-9);
-    assert_eq!(find("t/post.segments").kind, params::Kind::Count);
+    assert!(fin.kind == params::Kind::Length && (fin.value.num().unwrap() - 10.0).abs() < 1e-9, "the literal fin height is a length in millimetres");
+    assert_eq!(find("t/post.segments").kind, params::Kind::Count, "segments are a count");
+    let fin_key = &fin.key;
+    let is_fin = |p: &&params::Param| &p.key == fin_key;
+    let fin_height = |ev: &Evaluated| {
+        let (lo, hi) = ev.objects.iter().find(|o| o.name == fin.objects[0]).and_then(|o| o.bounds).expect("the fin has built bounds");
+        hi[1] - lo[1]
+    };
+    let link = params::link(&c, &model, fin_key, "wall * 5").expect("a literal field takes a formula");
+    assert_eq!(link, sc(Edit::Splice { range: fin.site.clone(), text: "wall * 5".into() }), "the link replaces exactly the fin height's source span");
+    let refused = params::link(&c, &model, "t/h", "wall * 5").expect_err("a declared parameter holds its own number");
+    assert!(refused.contains("Height") && refused.contains("holds a number"), "the refusal identifies the declared row: {refused}");
+    assert!(params::link(&c, &model, fin_key, "wall * foo(2)").is_err(), "a formula cannot call script code");
+    assert!(params::link(&c, &model, fin_key, "2 * 3").is_err(), "constant arithmetic goes through the number edit");
+    let ambiguous = params::link(&c, &model, fin_key, "wall + 1").expect_err("a link must mean the same in box and script units");
+    assert!(ambiguous.contains("wall + 1mm"), "the unit error gives the spelling for the intended sum: {ambiguous}");
+    // A ratio's box shows percent and its script holds a fraction: a plain name doubled is 10% in
+    // the box but a factor of 10 in Splash, so it is refused; a named fraction reads the same.
+    let (n, ratio) = (
+        makepad_script::syntax::quantity::NamedValue { name: "n".into(), label: "N".into(), value: 5.0, measure: makepad_script::syntax::quantity::Measure::Plain },
+        makepad_script::syntax::quantity::NamedValue { name: "ratio".into(), label: "Ratio".into(), value: 0.25, measure: makepad_script::syntax::quantity::Measure::Fraction },
+    );
+    assert!(params::formula_value("n * 2", params::Kind::Ratio, std::slice::from_ref(&n)).is_err(), "a ratio formula whose box and script readings differ is refused");
+    assert_eq!(params::formula_value("ratio * 2", params::Kind::Ratio, &[ratio]), Ok(0.5), "a ratio formula reads as the model's fraction");
     // A declared parameter is the instance's value; a part field is its script's literal.
     let edit = params::edit(&c, &model, "t/h", &params::PValue::Num(42.0)).unwrap();
-    assert!(matches!(&edit, Change::Param { instance, name, value: Some(v) } if instance == "t" && name == "h" && (v - 0.042).abs() < 1e-12), "{edit:?}");
+    assert!(matches!(&edit, Change::Param { instance, name, value: Some(v) } if instance == "t" && name == "h" && (v - 0.042).abs() < 1e-12), "declared height is set in metres on its instance: {edit:?}");
     let field = params::edit(&c, &model, "t/post.segments", &params::PValue::Num(40.0)).unwrap();
-    assert_eq!(field, sc(Edit::Set { site: "post.segments".into(), value: "40".into() }));
-    let (_, _, ev2) = apply(&mut m, &mut e, "p2", vec![edit]);
-    assert!((ev2.plate.parts[0].mesh.bounds().size()[2] - 42.0).abs() < 1e-6);
+    assert_eq!(field, sc(Edit::Set { site: "post.segments".into(), value: "40".into() }), "a literal count still uses Set");
+    let (_, c, ev2) = apply(&mut m, &mut e, "p2", vec![edit, link]);
+    assert!((ev2.plate.parts[0].mesh.bounds().size()[2] - 42.0).abs() < 1e-6, "the built post follows its edited height");
+    let model = params::model(&c, &ev2);
+    let linked = model[0].params.iter().find(is_fin).expect("the fin row survives linking");
+    assert_eq!(linked.formula.as_deref(), Some("wall * 5"), "the rebuilt model keeps the fin formula");
+    assert_eq!(linked.value.num(), Some(10.0), "the new link reads 10 mm");
+    assert!((fin_height(&ev2) - 10.0).abs() < 1e-6, "the linked fin is 10 mm tall");
     // A preview evaluates without committing.
     let before = m.head();
-    let c = m.compile().unwrap();
-    let (_, _, pv) = m.preview(&mut e, &[params::edit(&c, &params::model(&c, &ev2), "t/h", &params::PValue::Num(60.0)).unwrap()], None).unwrap();
-    assert!((pv.plate.parts[0].mesh.bounds().size()[2] - 60.0).abs() < 1e-6);
-    assert_eq!(m.head(), before);
+    let (_, _, pv) = m.preview(&mut e, &[params::edit(&c, &model, "t/h", &params::PValue::Num(60.0)).unwrap()], None).unwrap();
+    assert!((pv.plate.parts[0].mesh.bounds().size()[2] - 60.0).abs() < 1e-6, "the height preview rebuilds the post");
+    assert_eq!(m.head(), before, "a preview leaves the document head in place");
+
+    let wall_edit = params::edit(&c, &model, "t/wall", &params::PValue::Num(3.0)).unwrap();
+    let (_, c, ev) = apply(&mut m, &mut e, "wall", vec![wall_edit]);
+    let model = params::model(&c, &ev);
+    let linked = model[0].params.iter().find(is_fin).expect("the fin row survives a wall edit");
+    assert_eq!(linked.value.num(), Some(15.0), "the linked fin follows the instance's 3 mm wall");
+    assert!((fin_height(&ev) - 15.0).abs() < 1e-6, "the built fin follows the wall to 15 mm");
+    let zero = params::link(&c, &model, fin_key, "wall * (1mm / (wall - 3mm))").expect_err("the denominator is zero at the instance's wall value");
+    assert!(zero.contains("divides by zero"), "link validation uses the edited wall value: {zero}");
+    let relink = params::link(&c, &model, fin_key, "wall * 4").expect("an existing formula can be replaced");
+    assert_eq!(relink, sc(Edit::Splice { range: linked.site.clone(), text: "wall * 4".into() }), "relink replaces the whole old formula");
+    let (_, c, ev) = apply(&mut m, &mut e, "relink", vec![relink]);
+    let model = params::model(&c, &ev);
+    let linked = model[0].params.iter().find(is_fin).expect("the fin row survives relinking");
+    assert_eq!((linked.value.num(), linked.formula.as_deref()), (Some(12.0), Some("wall * 4")), "the rebuilt fin follows the replacement formula");
+    let unlink = params::edit(&c, &model, fin_key, &params::PValue::Num(12.0)).expect("a number unlinks the row");
+    assert_eq!(unlink, sc(Edit::Splice { range: linked.site.clone(), text: "12mm".into() }), "a number replaces the formula even at the same value");
+    let (_, c, ev) = apply(&mut m, &mut e, "unlink", vec![unlink]);
+    let model = params::model(&c, &ev);
+    let literal = model[0].params.iter().find(is_fin).expect("the fin row survives unlinking");
+    assert_eq!((literal.value.num(), literal.formula.as_deref()), (Some(12.0), None), "the rebuilt fin holds a literal again");
 }
 
 /// A cage lists each point as a point row with its handle at the built point, each face as a
@@ -1513,7 +1788,7 @@ fn an_imported_mesh_takes_booleans_and_smooth_blends() {
     assert!((plate.mesh.volume() - want).abs() < 0.02 * want, "the bore is cut: volume {} for {want}", plate.mesh.volume());
     // A missing mesh names the meshes there are.
     let head = model.head();
-    let err = model.apply(&mut e, "m2", head, &[sc(Edit::Add { code: "let x = m.import(\"dog\")".into(), before: None }), sc(Edit::Add { code: "object(x)".into(), before: None })], None).unwrap_err();
+    let err = model.apply(&mut e, "m2", head, &[sc(Edit::Add { code: "let x = m.import(\"dog\")".into(), at: Anchor::Auto }), sc(Edit::Add { code: "object(x)".into(), at: Anchor::Auto })], None).unwrap_err();
     assert!(err.to_string().contains("no mesh 'dog'") && err.to_string().contains("figure"), "{err}");
 }
 
@@ -1546,7 +1821,7 @@ fn an_added_statement_keeps_an_unnamed_objects_placement() {
     let centre = |ev: &Evaluated| ev.plate.parts.iter().find(|p| p.object.ends_with(&name)).map(|p| p.mesh.bounds().center());
     let placed = (m.project_text(), centre(&ev).expect("placed"));
     for code in ["m.support_block(m.box({size: [5mm 5mm 5mm] at: [0 5mm 0]}))", "let peg = m.cylinder({radius: 1mm height: 4mm})"] {
-        let (_, c, ev) = apply(&mut m, &mut e, code, vec![sc(Edit::Add { code: code.into(), before: None })]);
+        let (_, c, ev) = apply(&mut m, &mut e, code, vec![sc(Edit::Add { code: code.into(), at: Anchor::Auto })]);
         let script = m.source(F).unwrap();
         assert!(script.contains(code), "{script}");
         assert_eq!(c.instances[0].script.objects[1].name, name, "{script}");
@@ -1601,11 +1876,11 @@ fn an_added_loop_let_evaluates() {
     let (mut m, mut e) = setup();
     program(&mut m, &mut e, "r1", BRACKET);
     let add = "let pegs = for i in 0..3 { m.cylinder({radius: 1mm height: 5mm at: [i * 4mm, 0, 0]}) }";
-    let (_, c, _) = apply(&mut m, &mut e, "r2", vec![sc(Edit::Add { code: add.into(), before: None })]);
+    let (_, c, _) = apply(&mut m, &mut e, "r2", vec![sc(Edit::Add { code: add.into(), at: Anchor::Auto })]);
     assert!(prog(&c).solid("pegs[2]").is_some(), "{}", m.source(F).unwrap());
     let (mut m, mut e) = setup();
     program(&mut m, &mut e, "r1", "let plate = m.box({size: [10mm 2mm 10mm]})\n");
-    let (_, c, _) = apply(&mut m, &mut e, "r2", vec![sc(Edit::Add { code: add.into(), before: None })]);
+    let (_, c, _) = apply(&mut m, &mut e, "r2", vec![sc(Edit::Add { code: add.into(), at: Anchor::Auto })]);
     assert!(prog(&c).solid("pegs[2]").is_some(), "{}", m.source(F).unwrap());
 }
 
@@ -1819,6 +2094,66 @@ fn a_patterns_knobs_are_part_controls_that_write_the_script() {
     let kill = model[0].params.iter().find(|p| p.key == key("kill")).unwrap();
     assert!(kill.value == params::PValue::Num(0.061) && !kill.site.is_empty(), "{kill:?}");
     assert!(!ev.patterns_pending(), "it grew to its steps");
+}
+
+#[test]
+fn plate_colour_modes_preserve_picture_filaments_and_print_keys() {
+    use fab_plate::{ColourMode, UNMAPPED_RGB};
+    let (mut model, mut evaluator) = setup();
+    let picture = crate::picture::Picture {
+        bytes: Arc::new(vec![1]),
+        image: Arc::new(fab_colour::Image { width: 2, height: 1, pixels: vec![[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]] }),
+    };
+    model.pictures = Arc::new([("tile.png".to_string(), Arc::new(picture))].into());
+    let ink = [0.04, 0.25, 0.85];
+    evaluator.mapped = Arc::new(eval::Mapped {
+        inks: [("Red".into(), ink)].into(),
+        tools: [("Red".into(), (1, 0)), ("White".into(), (2, 1))].into(),
+    });
+    let body = r#"let tile = m.picture({image: "tile.png" width: 2mm})
+object(tile)
+"#;
+    let picked_srgb = 0xb01020ff;
+    let colour = |name, rgb| Change::Color {
+        name: String::from(name),
+        set: Some(crate::project::ColorDef { rgb, ..crate::project::ColorDef::new(name) }),
+    };
+    let (_, _, mut ev) = apply(&mut model, &mut evaluator, "tile", vec![
+        colour("Red", Some(picked_srgb)), colour("White", Some(0xffffffff)), sc(Edit::Program { source: src(body) }),
+    ]);
+    let [r, g, b, _] = crate::program::color_linear(picked_srgb);
+    let picked = [r, g, b];
+    let paint = ev.paint[0].as_ref().unwrap().clone();
+    let slot = |name| paint.colors.iter().position(|c| c.color.as_deref() == Some(name)).unwrap();
+    let red = slot("Red");
+    let white = slot("White");
+    assert_eq!(paint.palette()[red], picked);
+    let keys = |ev: &Evaluated| ev.plate.parts.iter().zip(&ev.paint).map(|(part, paint)| {
+        (part.filament, part.nozzle, part.paint.as_ref().map(|p| (p.key, p.states(part.filament))), paint.as_ref().map(|p| p.key()))
+    }).collect::<Vec<_>>();
+    let before = keys(&ev);
+    let part = &ev.plate.parts[0];
+    let own = ev.part_color(0).unwrap();
+    assert_eq!(part.color[..3], eval::design_color(&ev.colors, own));
+    let material_own = ev.mapped.inks.get(own).copied().unwrap_or(UNMAPPED_RGB);
+    ev.set_colour_mode(ColourMode::Material);
+    assert_eq!(ev.plate.parts[0].color[..3], material_own);
+    let material = ev.paint[0].as_ref().unwrap();
+    assert_eq!(material.palette()[red], ink, "mapped spool");
+    assert_eq!(material.palette()[white], UNMAPPED_RGB, "mapped slot without ink");
+    assert_eq!(eval::display_color(&ev.colors, &ev.mapped.inks, ev.colour_mode, "Unassigned"), UNMAPPED_RGB);
+    assert_eq!(keys(&ev), before);
+    assert!(Arc::ptr_eq(&paint.program, &material.program), "same baked filament selections");
+    assert!(Arc::ptr_eq(paint.shown(), material.shown()), "same picture face");
+    assert_eq!(&material.palette()[paint.colors.len()..], &paint.palette()[paint.colors.len()..], "same simulated stack colours");
+    assert_eq!(ev.in_colours(ColourMode::Model).paint[0].as_ref().unwrap().palette(), paint.palette());
+    evaluator.colour_mode = ColourMode::Material;
+    let (_, built) = model.evaluate(&mut evaluator, None).unwrap();
+    assert_eq!(keys(&built), before, "building under either mode picks the same picture filaments");
+    assert_eq!(built.paint[0].as_ref().unwrap().palette(), material.palette());
+    ev.set_colour_view(ColourMode::Material, false);
+    assert_eq!(ev.paint[0].as_ref().unwrap().palette()[red], UNMAPPED_RGB, "a disconnected printer can still have a remembered tray");
+    assert_eq!(ev.mapped.inks["Red"], ink, "disconnecting the display leaves the print inputs intact");
 }
 
 /// A grown pattern's plate prints each colour on the tool the job puts it on. A part built with
@@ -2513,6 +2848,270 @@ fn the_vase_mouth_is_open_in_its_sections_and_mesh() {
     }
 }
 
+#[test]
+fn an_exact_hole_drills_from_its_face() {
+    use makepad_csg_graph::edges::{Face, Role};
+    use std::f64::consts::PI;
+
+    let (mut m, mut e) = setup();
+    let block = |height| format!("m.brep.box({{size: [40mm {height}mm 30mm]}})");
+    let drill = |body: &str, opts: &str| format!("let b = {body}\nlet h = m.brep.hole(b, {{diameter: 4mm {opts}}})\nobject(h)\n");
+    let top = "on: b.top at: [5mm 0 0]";
+    let blind = format!("{top} depth: 4mm");
+    let shaft_area = PI * 2.0 * 2.0;
+    let bore = "kind: @counterbore bore_diameter: 8mm bore_depth: 2mm depth: 6mm at: [[5mm, -5mm, 0] [-5mm, -5mm, 0]] dir: [0 2 0]";
+    let sink = "kind: @countersink sink_diameter: 8mm angle: 60deg depth: 6mm on: b.front at: [5mm 0 0]";
+    let taper = (4.0 - 2.0) / 30f64.to_radians().tan();
+    let frustum = PI * taper * (4.0 * 4.0 + 4.0 * 2.0 + 2.0 * 2.0) / 3.0;
+    for (case, height, opts, volume) in [
+        ("through", 10, top, shaft_area * 10.0),
+        ("blind", 10, blind.as_str(), shaft_area * 4.0),
+        ("blind follows the taller box", 20, blind.as_str(), shaft_area * 4.0),
+        ("two counterbores", 10, bore, 2.0 * (PI * 4.0 * 4.0 * 2.0 + shaft_area * 4.0)),
+        ("countersink on the front", 10, sink, frustum + shaft_area * (6.0 - taper)),
+    ] {
+        program(&mut m, &mut e, case, &drill(&block(height), opts));
+        let exact = e.object_exact("t/h").unwrap().unwrap_or_else(|| panic!("{case}: drilling must keep the part exact"));
+        let removed = 40.0 * f64::from(height) * 30.0 - exact.measure.volume;
+        assert!((removed - volume).abs() < volume * 1e-3, "{case}: expected to remove {volume} mm³, removed {removed} mm³");
+        if case == "blind" {
+            let owns = |f: &makepad_csg_graph::BrepEntity, face| {
+                f.names.iter().any(|n| n.role == Role::Named(face) && exact.parts.get(&n.origin).map(String::as_str) == Some("h"))
+            };
+            assert!(exact.faces.iter().any(|f| f.normal.is_none() && owns(f, Face::Wall)), "the cylindrical wall must be named h.wall");
+            assert!(exact.faces.iter().any(|f| owns(f, Face::Floor) && f.normal.is_some() && (f.at[0] - 5.0).abs() < 1e-3 && (f.at[1] - 1.0).abs() < 1e-3),
+                "the blind floor at the drilled point must be named h.floor");
+        }
+    }
+
+    for (case, body, opts, words) in [
+        ("tapped", block(10), "on: b.top at: [5mm 0 0] kind: @tapped", "a tapped hole on an exact part is not made yet: drill the tap size as a simple hole, or use m.hole on a field part"),
+        ("curved start", "m.brep.cylinder({radius: 8mm height: 10mm})".into(), "on: b.wall at: [8mm 0 0]", "a hole starts on a flat face"),
+    ] {
+        let edit = sc(Edit::Program { source: src(&drill(&body, opts)) });
+        let error = m.apply(&mut e, case, m.head(), &[edit], None).expect_err(case).to_string();
+        assert!(error.contains(words), "{case}: expected '{words}', got '{error}'");
+    }
+}
+
+#[test]
+fn a_segment_fillet_stays_on_the_same_geometric_edge() {
+    const PART: &str = "let section = Path{from: [5mm 0]
+    LineTo{to: [12mm 0]}
+    base := LineTo{to: [40mm 2mm]}
+    right := LineTo{to: [40mm 22mm]}
+    LineTo{to: [0 22mm]}
+    LineTo{to: [0 0]}
+}
+let body = m.brep.extrude({sketch: section height: 10mm})
+let r = m.brep.fillet(body, 1mm, {edges: m.edge(body.top, body.side(section.right))})
+object(r)
+";
+    let (mut m, mut e) = setup();
+    let mut round = |label: &str, source: &str| {
+        program(&mut m, &mut e, label, source);
+        e.object_exact("t/r").unwrap().expect("the fillet keeps an exact body")
+    };
+    let named = round("named", PART);
+    let numbered = round("numbered", &PART.replace("side(section.right)", "side(2)"));
+    assert_eq!(named.measure.faces, numbered.measure.faces, "index and segment give the same filleted face count");
+    assert!((named.measure.volume - numbered.measure.volume).abs() < 1e-6, "index and segment remove the same volume");
+    let body_key = |b: &eval::ExactBody| *b.parts.iter().find(|(_, id)| *id == "body").expect("the fillet names its extrude").0;
+    assert_eq!(named.sides[&body_key(&named)][2].as_deref(), Some("section.right"), "the extrude key carries the written segment reference");
+    let centre = |b: &eval::ExactBody| {
+        let mut curves = b.faces.iter().filter(|f| f.normal.is_none());
+        let face = curves.next().expect("rounding the edge introduces a curved face");
+        assert!(curves.next().is_none(), "only the selected straight edge was rounded");
+        face.at
+    };
+    let shifted = PART.replace("    LineTo{to: [12mm 0]}", "    LineBy{by: [0 5mm]}\n    LineTo{to: [12mm 0]}");
+    let still_right = round("insert before right", &shifted);
+    let old_index = round("keep the old number", &shifted.replace("side(section.right)", "side(2)"));
+    let distance = |a: [f64; 3], b: [f64; 3]| (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f64>().sqrt();
+    assert!(distance(centre(&named), centre(&still_right)) < 1e-5, "the rounded face stays at the same geometric centre");
+    assert!(distance(centre(&still_right), centre(&old_index)) > 1.0, "the old number now rounds a different face");
+    assert_eq!(still_right.sides[&body_key(&still_right)][3].as_deref(), Some("section.right"), "the written reference follows the shifted side index");
+    let builder = "m.brep.extrude({sketch: section height: 10mm})";
+    for (label, replacement, can_write) in [
+        ("captured Path", format!("fn make() {{ {builder} }}\nlet body = make()"), true),
+        ("local Path", format!("fn make(section) {{ {builder} }}\nlet body = make(section)"), false),
+        ("field expression", format!("let drawing = {{outline: section}}\nlet body = {}", builder.replace("sketch: section", "sketch: drawing.outline")), false),
+    ] {
+        let b = round(label, &PART.replace(&format!("let body = {builder}"), &replacement));
+        assert_eq!(b.sides.contains_key(&body_key(&b)), can_write, "{label} must give the writer only a reference in scope at the pick");
+    }
+}
+
+#[test]
+fn placed_copies_name_their_own_faces() {
+    use makepad_csg_graph::edges::{Face, FaceName, Role};
+    use makepad_csg_graph::eval::brep_steps;
+    use makepad_csg_graph::BrepOp;
+    use std::collections::BTreeSet;
+    use std::f64::consts::PI;
+
+    const LEGS: &str = "let leg1 = m.brep.box({size: [10mm 40mm 10mm] at: [-20mm 0 0]})
+let leg2 = m.brep.box({size: [10mm 40mm 10mm] at: [20mm 0 0]})
+let legs = m.brep.union(leg1, leg2)
+object(legs)
+";
+    let (mut m, mut e) = setup();
+    let exact = |e: &Evaluator, solid: &str| e.object_exact(solid).unwrap().unwrap_or_else(|| panic!("{solid} must be exact"));
+    let box_keys = |c: &Compiled, leg: &str| {
+        let p = prog(c);
+        let steps = brep_steps(&p.graph, p.solid(leg).expect("the script names the leg").node);
+        let [generator, place] = steps.as_slice() else { panic!("{leg} must have a box and a placement") };
+        assert!(matches!(generator.op, BrepOp::Box { .. }) && matches!(place.op, BrepOp::Place { .. }), "{leg} must place a box");
+        [generator.key, place.key]
+    };
+    let top = |body: &eval::ExactBody, leg: &str, place, x: f64| {
+        let owns_top = |n: &FaceName| n.role == Role::Named(Face::Top)
+            && body.parts.get(&n.origin).map(String::as_str) == Some(leg)
+            && !body.repeated.contains(&n.origin);
+        let faces: Vec<_> = body.faces.iter().filter(|f| f.names.iter().any(owns_top)).collect();
+        assert_eq!(faces.len(), 1, "{leg}.top must name exactly one face");
+        let face = faces[0];
+        assert!((face.at[0] - x).abs() < 1e-3, "{leg}.top must be at x={x}, found {:?}", face.at);
+        face.names.iter().find(|n| n.origin == place && owns_top(n)).cloned().unwrap_or_else(|| panic!("{leg}.top must carry its placement's name"))
+    };
+
+    let face_at = |body: &eval::ExactBody, name: &FaceName| {
+        let mut faces = body.faces.iter().filter(|f| f.names.contains(name));
+        let face = faces.next().unwrap_or_else(|| panic!("the moved face must retain {name:?}"));
+        assert!(faces.next().is_none(), "the moved face's name must select just one face");
+        face.at
+    };
+    let mut check_pair = |case: &str, script: &str, left_x| {
+        let (_, c, ev) = program(&mut m, &mut e, case, script);
+        let base = exact(&e, "t/legs");
+        let [left_box, left_place] = box_keys(&c, "leg1");
+        let right_keys = box_keys(&c, "leg2");
+        assert_eq!(left_box, right_keys[0], "both identical boxes must use one generator key");
+        let box_top = FaceName { origin: left_box, role: Role::Named(Face::Top) };
+        assert_eq!(base.faces.iter().filter(|f| f.names.contains(&box_top)).count(), 2, "both placed tops must retain the shared box name");
+        top(&base, "leg1", left_place, left_x);
+        let leg2_top = top(&base, "leg2", right_keys[1], 20.0);
+        let parts = params::model(&c, &ev);
+        for axis in 0..3 {
+            let key = format!("t/leg1.size.{axis}");
+            assert!(parts.iter().flat_map(|p| &p.params).any(|q| q.key == key), "{case} must expose the box size parameter {key}");
+        }
+
+        // Ask with the edited recipe before evaluating it, so a rebuild cannot make the check pass.
+        let resized = script.replacen("10mm 40mm", "12mm 40mm", 1);
+        let (_, edited) = m.edited(&[sc(Edit::Program { source: src(&resized) })]).expect("resizing leg1 compiles");
+        let edited_right = box_keys(&edited, "leg2");
+        assert_eq!(edited_right, right_keys, "resizing leg1 must preserve leg2's generator and placement keys");
+        assert!(makepad_csg_brep_model::engine().built(&edited_right), "leg2's generator and placement must already be built after the edit");
+
+        let rounded = script.replace("object(legs)", "let round = m.brep.fillet(legs, 1mm, {edges: m.edge(leg2.top, leg2.front)})\nobject(round)");
+        program(&mut m, &mut e, &format!("{case} fillet"), &rounded);
+        let round = exact(&e, "t/round");
+        let removed = base.measure.volume - round.measure.volume;
+        let one_edge = (1.0 - PI / 4.0) * 10.0;
+        assert!((removed - one_edge).abs() < one_edge * 1e-3, "the fillet must remove one edge's {one_edge} mm³, removed {removed} mm³");
+        assert!(round.faces.iter().any(|f| f.normal.is_none() && (f.at[0] - 20.0).abs() < 1e-3), "the rounded face must be on leg2");
+        (base, leg2_top, resized)
+    };
+    let (base, leg2_top, resized) = check_pair("two written placements", LEGS, -20.0);
+    let mixed = LEGS.replace(" at: [-20mm 0 0]", "");
+    let (mixed_base, mixed_top, _) = check_pair("unplaced leg1", &mixed, 0.0);
+    let pulled = mixed.replace("object(legs)", "let up = m.brep.pull(legs, {face: leg2.top by: 5mm})\nobject(up)");
+    program(&mut m, &mut e, "pull one leg", &pulled);
+    let up = exact(&e, "t/up");
+    let added = up.measure.volume - mixed_base.measure.volume;
+    assert!((added - 500.0).abs() < 1e-3, "pulling one 10 × 10 top by 5 mm must add 500 mm³, added {added}");
+    let at = face_at(&up, &mixed_top);
+    assert!((at[0] - 20.0).abs() < 1e-3 && (at[1] - 25.0).abs() < 1e-3, "leg2.top must move to y=25 on leg2, found {at:?}");
+
+    for (case, script) in [
+        ("leg1 resized", resized),
+        ("leg0 added", format!("let leg0 = m.brep.box({{size: [10mm 40mm 10mm] at: [-40mm 0 0]}})\n{}", LEGS.replace("union(leg1, leg2)", "union(leg0, [leg1, leg2])"))),
+        ("union swapped", LEGS.replace("union(leg1, leg2)", "union(leg2, leg1)")),
+        ("leg1 rounded", LEGS.replace("let legs = m.brep.union(leg1,", "let leg1r = m.brep.fillet(leg1, 1mm)\nlet legs = m.brep.union(leg1r,")),
+    ] {
+        let (_, c, _) = program(&mut m, &mut e, case, &script);
+        let name = top(&exact(&e, "t/legs"), "leg2", box_keys(&c, "leg2")[1], 20.0);
+        assert_eq!(name, leg2_top, "{case} must preserve the name of leg2.top");
+    }
+    let moved = LEGS.replace("at: [20mm", "at: [30mm");
+    let (_, c, _) = program(&mut m, &mut e, "leg2 moved", &moved);
+    top(&exact(&e, "t/legs"), "leg2", box_keys(&c, "leg2")[1], 30.0);
+
+    let drilled = LEGS.replace("let legs = m.brep.union(leg1, leg2)",
+        "let leg2h = m.brep.hole(leg2, {on: leg2.top at: [0 20mm 0] diameter: 2mm})\nlet legs = m.brep.union(leg1, leg2h)");
+    program(&mut m, &mut e, "drill placed leg", &drilled);
+    let body = exact(&e, "t/legs");
+    let removed = base.measure.volume - body.measure.volume;
+    let through = PI * 40.0;
+    assert!((removed - through).abs() < through * 1e-3, "the through hole must remove {through} mm³, removed {removed} mm³");
+    assert!(body.faces.iter().any(|f| (f.at[0] - 20.0).abs() < 1e-3 && f.names.iter().any(|n| n.role == Role::Named(Face::Wall))),
+        "the through hole must have a named wall at x=20 on leg2");
+
+    let block = |placement: &str| format!("let b = m.brep.box({{size: [10mm 40mm 10mm] {placement}}})\n");
+    let pull_front = "let p = m.brep.pull(h, {face: b.front by: 1mm})\nobject(p)\n";
+    for (case, placement, selector, x) in [
+        ("unplaced drilled box", "", "on: b.top", 0.0),
+        ("placed drilled box", "at: [20mm 0 0]", "on: b.top", 20.0),
+        ("rotated drilled box", "at: [20mm 0 0] rotate: [0 0 90deg]", "", 20.0),
+    ] {
+        let script = format!("{}let h = m.brep.hole(b, {{{selector} at: [0 20mm 0] diameter: 2mm}})\n{pull_front}", block(placement));
+        let (_, c, _) = program(&mut m, &mut e, case, &script);
+        let drilled = exact(&e, "t/h");
+        let pulled = exact(&e, "t/p");
+        let removed = 4000.0 - drilled.measure.volume;
+        let added = pulled.measure.volume - drilled.measure.volume;
+        assert!((removed - through).abs() < through * 1e-3, "{case}: the through hole must remove 40π mm³, removed {removed}");
+        assert!((added - 400.0).abs() < 0.01, "{case}: pulling the intact front by 1 mm must add 400 mm³, added {added}");
+        let front = FaceName { origin: box_keys(&c, "b")[1], role: Role::Named(Face::Front) };
+        let at = face_at(&pulled, &front);
+        assert!((at[0] - x).abs() < 1e-3 && (at[2] - 6.0).abs() < 1e-3, "{case}: b.front must reach x={x}, z=6, found {at:?}");
+        if selector.is_empty() {
+            let p = prog(&c);
+            let steps = brep_steps(&p.graph, p.solid("h").unwrap().node);
+            let axis = steps.iter().find_map(|s| match &s.op { BrepOp::Hole { dir, .. } => *dir, _ => None }).expect("the rotated default drill axis");
+            assert!((axis[0] - 1.0).abs() < 1e-12 && axis[1].abs() < 1e-12 && axis[2].abs() < 1e-12, "the box's inward -Y must drill along model +X, got {axis:?}");
+        }
+    }
+
+    let chain = format!("{}let h = m.brep.hole(b, {{at: [-2mm 20mm 0] diameter: 2mm}})\nlet h2 = m.brep.hole(h, {{at: [2mm 20mm 0] dir: [0, -1, 0] diameter: 2mm}})\nobject(h2)\n", block("at: [20mm 0 0]"));
+    program(&mut m, &mut e, "two holes in the same frame", &chain);
+    let twice = exact(&e, "t/h2");
+    let removed = 4000.0 - twice.measure.volume;
+    assert!((removed - 2.0 * through).abs() < 2.0 * through * 1e-3, "both through holes must cut the placed box, removed {removed} mm³");
+    for x in [18.0, 22.0] {
+        assert!(twice.faces.iter().any(|f| (f.at[0] - x).abs() < 1e-3 && f.names.iter().any(|n| n.role == Role::Named(Face::Wall))),
+            "the chain must have a drilled wall at model x={x}");
+    }
+
+    let scaled = format!("{}let h = m.brep.hole(b, {{on: b.top at: [0 20mm 0] diameter: 2mm}})\n", block("scale: 2"));
+    program(&mut m, &mut e, "scale the drilled box", &format!("{scaled}object(h)\n"));
+    let removed = 8.0 * 4000.0 - exact(&e, "t/h").measure.volume;
+    assert!((removed - 8.0 * through).abs() < 8.0 * through * 1e-3, "the hole's volume must scale with the box, removed {removed} mm³");
+    let edit = sc(Edit::Program { source: src(&format!("{scaled}{pull_front}")) });
+    let error = m.edited(&[edit]).err().expect("a scaled hole must refuse the lost source face while lowering").to_string();
+    assert!(error.contains("a hole on a scaled placement takes the body's own face names with it; select the face before the hole, or place without scale"), "{error}");
+    let restored = format!("{scaled}let both = m.brep.union(h, b)\n{}", pull_front.replace("pull(h,", "pull(both,"));
+    assert!(m.edited(&[sc(Edit::Program { source: src(&restored) })]).is_ok(), "a union that also contains the source placement must still accept b.front");
+
+    let bosses = "let bosses = for x in [-9mm, -3mm, 3mm, 9mm] {
+    m.brep.cylinder({radius: 1mm height: 2mm at: [x, 0, 0]})
+}
+let row = m.brep.union(bosses[0], [bosses[1], bosses[2], bosses[3]])
+object(row)
+";
+    program(&mut m, &mut e, "four placed bosses", bosses);
+    let row = exact(&e, "t/row");
+    let mut origins = BTreeSet::new();
+    for x in [-9.0, -3.0, 3.0, 9.0] {
+        let walls: BTreeSet<_> = row.faces.iter().filter(|f| (f.at[0] - x).abs() <= 1.0)
+            .flat_map(|f| &f.names).filter(|n| n.role == Role::Named(Face::Wall) && !row.repeated.contains(&n.origin))
+            .map(|n| n.origin).collect();
+        assert_eq!(walls.len(), 1, "the boss at x={x} must carry one placement-specific wall name");
+        assert!(origins.insert(*walls.first().unwrap()), "the boss at x={x} must have its own wall name");
+    }
+}
+
 /// An exact body through the whole path: Splash builders, graph, worker, plate; failures land at the line.
 #[test]
 fn brep_parts_build_on_the_plate() {
@@ -2950,18 +3549,29 @@ fn a_solid_states_how_light_passes_through_it() {
 }
 
 #[test]
-fn a_solid_keeps_board_space_clear() {
-    use fab_plate::Keepout;
+fn a_solid_keeps_board_space_clear_with_keepouts() {
+    use fab_plate::{Keepout, KeepoutSide};
 
     let (mut m, mut e) = setup();
     let record = r#"{board: "ledavr" name: "Pipe block" area: [[0mm, 0mm], [4mm, 0mm], [4mm, 2mm], [0mm, 2mm]] z: [1mm, 5mm]}"#;
-    let body = format!("let plain = m.box({{size: [4mm 4mm 4mm]}})\nlet held = m.keepouts(m.box({{size: [2mm 4mm 2mm] at: [2mm 0 0]}}), [{record}])\nobject([plain, held], name: \"Lid\")\n");
-    let expected = vec![Keepout {
+    let bottom = record.replace("name:", r#"side: @bottom feature: "port:key" room: true name:"#);
+    let carried = record.replace("name:", r#"feature: "other:key" room: false name:"#);
+    let records = format!("{record}, {bottom}, {carried}");
+    let body = format!("let plain = m.box({{size: [4mm 4mm 4mm]}})\nlet held = m.keepouts(m.box({{size: [2mm 4mm 2mm] at: [2mm 0 0]}}), [{records}])\nobject([plain, held], name: \"Lid\")\n");
+    let top = Keepout {
         board: "ledavr".into(),
         name: "Pipe block".into(),
+        feature: None,
+        room: false,
         area: vec![[0.0, 0.0], [4.0, 0.0], [4.0, 2.0], [0.0, 2.0]],
+        side: KeepoutSide::Top,
         z: [1.0, 5.0],
-    }];
+    };
+    let expected = [
+        top.clone(),
+        Keepout { side: KeepoutSide::Bottom, feature: Some("port:key".into()), room: true, ..top.clone() },
+        Keepout { feature: Some("other:key".into()), ..top },
+    ];
     let (_, _, lid) = program(&mut m, &mut e, "keepouts", &body);
     assert_eq!(lid.plate.parts.len(), 2, "the object's two bodies have their own parts");
     let plain = lid.plate.parts.iter().find(|p| p.object == "t/plain").unwrap();
@@ -2975,7 +3585,7 @@ fn a_solid_keeps_board_space_clear() {
     assert_eq!(joined.plate.parts.len(), 1, "only the union is emitted");
     assert!(joined.plate.parts[0].keepouts.is_empty(), "a boolean does not inherit an operand's keepouts");
 
-    let inserts = body.replace("object([plain, held], name: \"Lid\")", &format!("object(plain, name: \"Lid\")\ninsert(held, name: \"Pipe\", into: \"Lid\")\ninsert(m.box({{size: [1mm 1mm 1mm] keepouts: [{record}]}}), name: \"Field\", into: \"Lid\")"));
+    let inserts = body.replace("object([plain, held], name: \"Lid\")", &format!("object(plain, name: \"Lid\")\ninsert(held, name: \"Pipe\", into: \"Lid\")\ninsert(m.box({{size: [1mm 1mm 1mm] keepouts: [{records}]}}), name: \"Field\", into: \"Lid\")"));
     let (_, _, inserted) = program(&mut m, &mut e, "insert-keepouts", &inserts);
     assert_eq!(inserted.plate.parts.len(), 1, "only the host prints");
     assert!(inserted.plate.parts[0].keepouts.is_empty(), "inserts do not tag their host");
@@ -2988,6 +3598,12 @@ fn a_solid_keeps_board_space_clear() {
     for (record, field) in [
         (record.replace("[[0mm, 0mm], [4mm, 0mm], [4mm, 2mm], [0mm, 2mm]]", "[[0mm, 0mm], [4mm, 0mm]]"), "keepouts.area"),
         (record.replace("[1mm, 5mm]", "[3mm, 1mm]"), "keepouts.z"),
+        (bottom.replace("@bottom", "@left"), "keepouts.side"),
+        (bottom.replace("@bottom", "\"bottom\""), "keepouts.side"),
+        (bottom.replace("\"port:key\"", "\"\""), "keepouts.feature"),
+        (bottom.replace("\"port:key\"", "@port"), "keepouts.feature"),
+        (bottom.replace("room: true", "room: 1"), "keepouts.room"),
+        (bottom.replace("room: true", "room: \"true\""), "keepouts.room"),
     ] {
         for solid in [
             format!("m.keepouts(m.box({{size: [1mm 1mm 1mm]}}), [{record}])"),
@@ -3106,6 +3722,42 @@ fn arrange_keeps_each_footprint_where_its_nozzles_reach() {
     assert_eq!((slots, unplaced), (vec![("wide", [175.0, 160.0])], vec!["wide"]));
     let why = eval::no_room(&machine, "wide", [310.0, 50.0], &[0, 1]);
     assert_eq!(why, "no room for 'wide' (310 × 50 mm) where the Left and Right nozzles both reach");
+
+    let body = src("let a = m.box({size: [12mm 2mm 12mm]})\nlet b = m.box({size: [8mm 2mm 8mm]})\nlet fixed = m.box({size: [2mm 2mm 2mm]})\nobject(a)\nobject(b)\nobject(fixed)\n");
+    let project = "use mod.fab.*\nscript(\"t.cad.splash\")\nplace(\"t\", object: \"fixed\", at: [45mm 55mm], scale: 2)\n";
+    let mut m = FabModel::load("gap", project, [(F.to_string(), body)].into()).expect("the plate with a fixed part must load");
+    let mut e = Evaluator::new(machine);
+    let check_gap = |ev: &Evaluated, want: f64| {
+        let bounds = |id: &str| ev.plate.parts.iter().find(|p| p.object == id).unwrap_or_else(|| panic!("the pack must keep {id}")).bounds();
+        let (a, b) = (bounds("t/a"), bounds("t/b"));
+        assert!((a.center()[1] - b.center()[1]).abs() < 0.01, "both free parts must fit on one row");
+        assert!((b.min[0] - a.max[0] - want).abs() < 0.01, "free footprints must have {want} mm between them: {a:?}, {b:?}");
+        let fixed = bounds("t/fixed").center();
+        assert!((fixed[0] - 45.0).abs() < 0.01 && (fixed[1] - 55.0).abs() < 0.01, "changing the pack must preserve the fixed placement: {fixed:?}");
+    };
+    check_gap(&m.evaluate(&mut e, None).expect("the default pack must build").1, 8.0);
+    let (_, mut job, ev) = apply(&mut m, &mut e, "gap", project::changes("arrange(gap: 5mm)").unwrap());
+    check_gap(&ev, 5.0);
+    assert_eq!(project::parse(&m.project_text()).unwrap().arrange_gap, Some(5.0), "the saved project must reload its gap in millimetres");
+    let floor = e.machine.clearance.max_radius + 24.0;
+    job.settings.push(("print_sequence".into(), "by object".into()));
+    let ev = e.evaluate_with_gap(&job, m.project().arrange_gap, None).expect("the sequential job must build with the project gap");
+    check_gap(&ev, floor);
+    assert!(ev.warnings.iter().any(|w| w.contains("5 mm") && w.contains(&format!("{floor} mm")) && w.contains("clearance")), "the plate must explain the raised gap: {:?}", ev.warnings);
+    assert_eq!(m.project().arrange_gap, Some(5.0), "sequential clearance must preserve the requested gap");
+    let ev = e.evaluate_with_gap(&job, Some(floor + 1.0), None).expect("the sequential job must accept a wider gap");
+    check_gap(&ev, floor + 1.0);
+    assert!(!ev.warnings.iter().any(|w| w.contains("raised the arrange gap")), "a gap above toolhead clearance must be kept without a raise note");
+    let (_, _, explicit) = apply(&mut m, &mut e, "eight", project::changes("arrange(gap: 8mm)").unwrap());
+    assert_eq!(m.project_text().matches("arrange(").count(), 1, "a second gap must replace the saved statement");
+    let (_, _, ev) = apply(&mut m, &mut e, "reset", project::changes("arrange()").unwrap());
+    check_gap(&ev, 8.0);
+    for (a, b) in explicit.plate.parts.iter().zip(&ev.plate.parts) {
+        assert_eq!(a.bounds(), b.bounds(), "an explicit 8 mm gap must give {} its default position", a.object);
+    }
+    assert!(!m.project_text().contains("arrange("), "reset must remove the project gap statement");
+    assert!(project::changes("arrange(gap: -1mm)").unwrap_err()[0].message.contains("non-negative"), "negative gaps must explain the allowed range");
+    assert_eq!(project::parse("use mod.fab.*\narrange(gap: 0.005)").unwrap().arrange_gap, Some(5.0), "unitless project lengths must be metres");
 }
 
 /// The layout keeps what the job prints round the parts (its skirt, a brim) where their nozzles
@@ -3217,6 +3869,97 @@ fn a_study_is_kept_in_the_script_and_never_touches_the_shape() {
         let err = m.apply(&mut e, "bad", head, &[sc(Edit::Program { source: src(&format!("{plain}{bad}\n")) })], None).err().expect("refused");
         let err = format!("{err}");
         assert!(err.contains(says) && err.contains(":8:"), "{bad}: {err}");
+    }
+}
+
+/// The person's numbers keep their solids and lines, judge a measurement and explain an edit.
+#[test]
+fn an_expect_is_parsed_judged_and_its_changes_said() {
+    use crate::expect::{changes, describe, judge, Measure, Verdict};
+    let (mut m, mut e) = setup();
+    let plain = "let hole = m.cylinder({radius: 4mm height: 12mm})
+let holes = for i in 0..4 { m.cylinder({radius: 1mm height: 12mm at: [i * 4mm, 0, 0]}) }
+let body = m.subtract(m.box({size: [61mm 3mm 64mm]}), hole)
+object(body)
+";
+    let checked = [plain, r#"m.expect("8 mm hole", hole, {x: 8mm z: 8mm})
+m.expect("4 holes", holes, {count: 4})
+"#].concat();
+    let (_, c, ev) = program(&mut m, &mut e, "checked", &checked);
+    // the build judges them on what it made: the hole's own mesh (model frame), the list's length
+    let judged: Vec<(&str, Verdict)> = ev.expects.iter().map(|j| (j.expect.name.as_str(), j.verdict())).collect();
+    assert_eq!(judged, [("8 mm hole", Verdict::Pass), ("4 holes", Verdict::Pass)], "both hold on the build: {:?}", ev.expects);
+    assert!((ev.expects[0].seen[0].as_ref().unwrap() - 8.0).abs() < 0.05, "the hole is read from its own mesh: {:?}", ev.expects[0].seen);
+    // a wider hole fails at its line: a person's edit commits with a warning, an AI's would be refused
+    let head = m.head();
+    let wider = src(&checked.replace("radius: 4mm height: 12mm", "radius: 5mm height: 12mm"));
+    let (_, built) = m.apply(&mut e, "wider", head, &[sc(Edit::Program { source: wider })], None).expect("a person's edit commits");
+    let (_, after) = built.expect("it builds");
+    assert!(after.warnings.iter().any(|w| w.contains(":9:") && w.contains("m.expect \"8 mm hole\" fails: x is 10 mm, asked 8 mm")), "a warning at its line: {:?}", after.warnings);
+    let refused = crate::expect::newly_failing(Some(&ev), &after, false).expect("it fails where it held");
+    assert!(refused.line == 9 && refused.to_string().contains("It is the person's number"), "{refused}");
+    assert!(crate::expect::newly_failing(Some(&after), &after, false).is_none(), "one already failing is not refused again");
+    let script = &c.instances[0].script;
+    let before = &script.expects;
+    let [hole, holes] = before.as_slice() else { panic!("the script must keep both checks: {before:?}") };
+    assert_eq!([hole.name.as_str(), holes.name.as_str()], ["8 mm hole", "4 holes"], "the checks keep the person's words in script order");
+    assert_eq!([hole.loc.map(|p| p.0), holes.loc.map(|p| p.0)], [Some(9), Some(10)], "each check keeps its own source line");
+    let ids = |indices: &[usize]| indices.iter().map(|&i| script.program.solids[i].id.as_str()).collect::<Vec<_>>();
+    assert_eq!(ids(&hole.solids), ["hole"], "the size check points at the named hole");
+    assert_eq!(ids(&holes.solids), ["holes[0]", "holes[1]", "holes[2]", "holes[3]"], "the count keeps every solid in loop order");
+    let [x, z] = hole.wants.as_slice() else { panic!("the hole must have two wants") };
+    assert_eq!((&x.measure, &z.measure), (&Measure::X, &Measure::Z), "the checks name the two model axes");
+    assert_eq!((x.value, z.value, x.tol), (Some(8.0), Some(8.0), 0.05), "lengths and their default tolerance are in millimetres");
+    assert_eq!(judge(x, Ok(8.02)), Verdict::Pass, "a size within tolerance passes");
+    assert_eq!(judge(x, Ok(8.2)), Verdict::Fail, "a size outside tolerance fails");
+    assert_eq!(judge(x, Err("why".into())), Verdict::NotChecked("why".into()), "a missing measurement keeps its reason");
+    let count = &holes.wants[0];
+    assert_eq!(count.measure, Measure::Count, "the number of holes is a count");
+    assert_eq!((judge(count, Ok(4.0)), judge(count, Ok(4.01))), (Verdict::Pass, Verdict::Fail), "a count has no tolerance");
+    assert_eq!([describe(x), describe(count)], ["8 mm", "4"], "only the length carries millimetres");
+
+    let edited = src(&[plain, r#"m.expect("8 mm hole", hole, {x: 10mm z: 10mm})
+m.expect("fits a 60 mm fan", body, {x: {min: 60.4mm}})
+m.expect("material", body, {volume_mm3: {min: 11000 max: 13000}})
+m.expect("volume", body, {volume_mm3: 12000})
+m.expect("wall", body, {wall: 2mm at: [0 10mm 30mm] tol: 0.2mm})
+"#].concat());
+    let preview = m.script(F, &edited, None, &[], &m.state, &[]).expect("the edited checks compile");
+    let after = &preview.expects;
+    let fan = &after[1].wants[0];
+    assert_eq!(describe(fan), "at least 60.4 mm", "a lower bound keeps its fractional millimetres");
+    assert_eq!((judge(fan, Ok(60.0)), judge(fan, Ok(60.5))), (Verdict::Fail, Verdict::Pass), "a minimum admits only sizes at or above it");
+    let range = &after[2].wants[0];
+    assert_eq!(describe(range), "11000 to 13000 mm³", "a volume range carries cubic millimetres");
+    assert_eq!((judge(range, Ok(13000.0 + 5e-10)), judge(range, Ok(13000.1))), (Verdict::Pass, Verdict::Fail), "the upper bound allows rounding noise");
+    let volume = &after[3].wants[0];
+    assert_eq!((judge(volume, Ok(12120.0)), judge(volume, Ok(11879.0))), (Verdict::Pass, Verdict::Fail), "a volume target allows one percent");
+    let wall = &after[4].wants[0];
+    assert!(matches!(wall.measure, Measure::Wall { at } if at == [0.0, 10.0, 30.0]), "the wall point is in model millimetres");
+    assert_eq!((judge(wall, Ok(2.15)), judge(wall, Ok(2.25))), (Verdict::Pass, Verdict::Fail), "a wall uses the written length tolerance");
+    assert_eq!(changes(before, &after[..2]), [
+        "changed the person's check `8 mm hole`: x 8 mm → 10 mm, z 8 mm → 10 mm",
+        "removed the person's check `4 holes`",
+        "added the check `fits a 60 mm fan`: x at least 60.4 mm",
+    ], "each changed, removed or added check gets one line");
+    assert!(changes(before, before).is_empty(), "unchanged checks stay quiet");
+    let mut axes = hole.clone();
+    axes.wants[1].measure = Measure::Y;
+    axes.wants[1].value = Some(4.0);
+    assert_eq!(changes(&before[..1], &[axes]), ["changed the person's check `8 mm hole`: z dropped, y 4 mm added"], "a check lists dropped and added measures");
+
+    for (bad, says) in [
+        ("m.expect(solid: hole, want: {x: 8mm})", "give it the person's words first"),
+        ("m.expect(\"diameter\", 4, {x: 8mm})", "the second argument is the solid"),
+        ("m.expect(\"diameter\", hole, {diam: 8mm})", "unknown key 'diam'"),
+        ("m.expect(\"wall\", body, {wall: {min: 2mm}})", "wall needs at: [x y z]"),
+        ("m.expect(\"point\", body, {x: 8mm at: [0 0 0]})", "needs wall"),
+        ("m.expect(\"number\", holes, {count: {max: 3.5}})", "count.max must be a whole number"),
+    ] {
+        let head = m.head();
+        let err = m.apply(&mut e, "bad", head, &[sc(Edit::Program { source: src(&format!("{plain}{bad}\n")) })], None).err().expect("a malformed check must refuse the edit");
+        let err = err.to_string();
+        assert!(err.contains(":9:") && err.contains("m.expect: ") && err.contains(says), "{bad} must say '{says}' at line 9: {err}");
     }
 }
 

@@ -1,0 +1,49 @@
+use mod.motion.*
+// COUNT-UP — one big number races up and brakes hard into its value
+// (ease_out_expo: most of the distance in the first third), with tabular
+// figures so the digits hold still. The label rises in while it counts; a
+// delta chip pops once the number has landed.
+// Why: the braking curve makes the final value feel "arrived at", and
+// holding it 2 s gives the viewer time to read the number, not the motion.
+Motion{
+    label: "Big number count-up"
+    brief: "A large statistic counting up to its value, with a label and a delta chip."
+    tags: ["kinetic-type", "number", "data", "stat"]
+    duration: 4.5
+    inputs: {
+        value: input(@number, 2400000, "The number to count to")
+        decimals: input(@number, 0, "Digits after the point")
+        prefix: input(@text, "", "Before the number, e.g. $")
+        suffix: input(@text, "+", "After the number, e.g. % or M")
+        label: input(@text, "notes written this month", "What the number counts")
+        delta: input(@text, "▲ 38% vs last month", "Chip under the label; \"\" hides it")
+        ink: input(@color, #f4f7fa, "Number colour")
+        accent: input(@color, #ff5c39, "Rule colour")
+        positive: input(@color, #35c05f, "Chip colour")
+        background: input(@color, #0b0d12, "Ground")
+    }
+    layers: [
+        Rect{size: vec2(1920, 1080) fill: in(@background)}
+        Group{
+            opacity: tween(1, 0, 4.1, 4.5, @ease_in_cubic)
+            y: tween(0, -40, 4.1, 4.5, @ease_in_cubic)
+            layers: [
+                Text{number: tween(0, in(@value), 0.25, 2.25, @ease_out_expo) decimals: in(@decimals)
+                     prefix: in(@prefix) suffix: in(@suffix) tabular: true
+                     font: Font{family: "Inter" weight: 800} size: 260 tracking: -0.045 color: in(@ink)
+                     at: vec2(960, 314) wrap: 1920 align: @center
+                     opacity: tween(0, 1, 0.25, 0.5, @ease_out_cubic)
+                     scale: tween(0.92, 1.0, 0.25, 2.25, @ease_out_expo)}
+                Rect{at: vec2(912, 636) size: vec2(96, 8) radius: 4 fill: in(@accent)
+                     scale: tween(vec2(0, 1), vec2(1, 1), 0.5, 1.2, @ease_out_expo)}
+                Text{text: in(@label) font: Font{family: "Inter" weight: 500} size: 48 color: #a6b1bd
+                     at: vec2(960, 681) wrap: 1920 align: @center
+                     opacity: tween(0, 1, 0.6, 1.1, @ease_out_cubic) y: tween(24, 0, 0.6, 1.3, @ease_out_quint)}
+                Text{text: in(@delta) font: Font{family: "Inter" weight: 600} size: 32 color: in(@positive)
+                     at: vec2(960, 801) wrap: 1920 align: @center
+                     plate: #35c05f24 plate_pad: vec2(22, 10) plate_radius: 26
+                     scale: tween(0.6, 1.0, 2.1, 2.6, @ease_out_back) opacity: tween(0, 1, 2.1, 2.3, @ease_out_cubic)}
+            ]
+        }
+    ]
+}

@@ -522,6 +522,24 @@ fn extent(scan: &ScanView) -> Option<([f32; 3], f32)> {
     Some((c, r.max(0.2)))
 }
 
+#[derive(Clone, Copy, PartialEq)]
+struct SplatKey {
+    instances: u64,
+    newest: u32,
+    busy: bool,
+    size: DVec2,
+    colour: bool,
+    accent: [f32; 3],
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct ScanFrameKey {
+    view: Mat4f,
+    projection: Mat4f,
+    splats: SplatKey,
+    dpi: f64,
+}
+
 #[derive(Script, ScriptHook, Widget)]
 pub struct FabScanView {
     #[uid]
@@ -574,25 +592,21 @@ pub struct FabScanView {
     pass: DrawPass,
     #[new]
     pass_list: DrawList,
-    /// The splats' draw call, recorded only when the points, the newest keyframe or the pass's
-    /// size change (an orbit or a zoom changes the pass's camera and nothing else).
+    /// The retained draw call. An orbit or zoom changes only the pass camera.
     #[new]
     splat_list: DrawList,
     #[new]
     color_texture: Texture,
     #[new]
     depth_texture: Texture,
-    #[rust]
-    initialized: bool,
     /// The instances drawn, and the job making the next set.
     #[rust]
     built: Option<Built>,
     #[rust]
     building: Option<(Sources, TaskHandle<Built>)>,
-    /// What the splat draw call was last recorded for: the instances, the newest keyframe, whether
-    /// the scan is under way, the pass's size.
+    /// The picture in the colour texture, including the inputs to its retained draw call.
     #[rust]
-    recorded: Option<(u64, u32, bool, [u32; 2])>,
+    recorded: Option<ScanFrameKey>,
     /// What the view fits, for the points and keyframes it was found for.
     #[rust]
     fitted: Option<(Sources, usize, Option<([f32; 3], f32)>)>,
@@ -671,45 +685,48 @@ impl FabScanView {
         }
     }
 
-    /// The surface in its own pass: the splats, lit from over the viewer's shoulder, with the
-    /// camera of `p`; the pass's picture over the view. Per frame this sets the camera's two
-    /// matrices; the draw call is recorded again only when the instances, the newest keyframe or
-    /// the size change, and no instance is written or uploaded then.
+    /// Composite the last splat picture. Record the pass again when its pixels change.
     fn draw_splats(&mut self, cx: &mut Cx2d, p: &Proj, scan: &ScanView, colour: bool, rect: Rect) {
         self.sync_splats(cx.cx.cx, scan, colour);
-        let Some((instances, count, centre, radius)) = self.built.as_ref().and_then(|b| b.instances.clone().map(|i| (i, b.count, b.centre, b.radius))) else { return };
-        if !self.initialized {
-            self.initialized = true;
+        let Some(built) = &self.built else { return };
+        let Some(instances) = &built.instances else { return };
+        if self.recorded.is_none() {
             self.color_texture = Texture::new_with_format(cx.cx.cx, TextureFormat::RenderBGRAu8 { size: TextureSize::Auto, initial: true }).label(cx.cx.cx, "fab/scan-color");
             self.depth_texture = Texture::new_with_format(cx.cx.cx, TextureFormat::DepthD32 { size: TextureSize::Auto, initial: true }).label(cx.cx.cx, "fab/scan-depth");
+            self.pass.set_color_texture(cx, &self.color_texture, DrawPassClearColor::ClearWith(vec4(0.0, 0.0, 0.0, 0.0)));
+            self.pass.set_depth_texture(cx, &self.depth_texture, DrawPassClearDepth::ClearWith(1.0));
             self.pass.set_keep_camera_matrix(cx.cx.cx, true);
             self.pass.set_pass_name(cx.cx.cx, "fab_scan");
         }
-        self.pass.set_size(cx, rect.size);
-        self.pass.set_color_texture(cx, &self.color_texture, DrawPassClearColor::ClearWith(vec4(0.0, 0.0, 0.0, 0.0)));
-        self.pass.set_depth_texture(cx, &self.depth_texture, DrawPassClearDepth::ClearWith(1.0));
         cx.make_child_pass(&self.pass);
-        cx.begin_pass(&self.pass, None);
-        // the depth holds every splat: round the view's middle, out to the far side of the points
-        let off = (0..3).map(|k| (centre[k] - p.c[k]).powi(2)).sum::<f32>().sqrt();
-        let (view, projection) = pass_camera(p, rect.size, off + radius);
-        self.pass.set_camera(cx.cx.cx, view, projection);
-        // the pass's main list is recorded every frame, so the pass paints under a new camera
-        self.pass_list.begin_always(cx);
-        let newest = scan.keyframes.len().saturating_sub(1) as u32;
-        let key = (instances.id(), newest, scan.phase.busy(), [rect.size.x as u32, rect.size.y as u32]);
-        if self.splat_list.begin_maybe(cx, self.recorded != Some(key)).is_redrawing() {
-            let vars = &mut self.draw_splat.draw_vars;
-            let accent = self.color_new;
-            vars.set_uniform(cx.cx.cx, live_id!(u_new), &[newest as f32, f32::from(u8::from(key.2)), NEW_FOR as f32, 0.0]);
-            vars.set_uniform(cx.cx.cx, live_id!(u_accent), &[accent.x, accent.y, accent.z, 1.0]);
-            vars.set_uniform(cx.cx.cx, live_id!(u_px), &[rect.size.x as f32, rect.size.y as f32, 0.75, f32::from(u8::from(!colour))]);
-            vars.area = cx.add_retained_instances_count(vars, &instances, count);
-            self.splat_list.end(cx);
+        let dpi = cx.get_delegated_dpi_factor(self.pass.draw_pass_id());
+        let off = (0..3).map(|k| (built.centre[k] - p.c[k]).powi(2)).sum::<f32>().sqrt();
+        let (view, projection) = pass_camera(p, rect.size, off + built.radius);
+        let splats = SplatKey {
+            instances: instances.id(), newest: scan.keyframes.len().saturating_sub(1) as u32, busy: scan.phase.busy(),
+            size: rect.size, colour, accent: [self.color_new.x, self.color_new.y, self.color_new.z],
+        };
+        let key = ScanFrameKey { view, projection, splats, dpi };
+        let changed = self.recorded != Some(key);
+        if changed {
+            self.pass.set_size(cx, rect.size);
+            // Passing the delegated DPI preserves the panel rect when the child pass begins.
+            cx.begin_pass(&self.pass, Some(dpi));
+            self.pass.set_camera(cx, view, projection);
+            self.pass_list.begin_maybe(cx, changed).expect_redraw();
+            if self.splat_list.begin_maybe(cx, self.recorded.is_none_or(|k| k.splats != splats)).is_redrawing() {
+                let vars = &mut self.draw_splat.draw_vars;
+                let [r, g, b] = splats.accent;
+                vars.set_uniform(cx, live_id!(u_new), &[splats.newest as f32, f32::from(u8::from(splats.busy)), NEW_FOR as f32, 0.0]);
+                vars.set_uniform(cx, live_id!(u_accent), &[r, g, b, 1.0]);
+                vars.set_uniform(cx, live_id!(u_px), &[splats.size.x as f32, splats.size.y as f32, 0.75, f32::from(u8::from(!splats.colour))]);
+                vars.area = cx.add_retained_instances_count(vars, instances, built.count);
+                self.splat_list.end(cx);
+            }
+            self.pass_list.end(cx);
+            cx.end_pass(&self.pass);
             self.recorded = Some(key);
         }
-        self.pass_list.end(cx);
-        cx.end_pass(&self.pass);
         self.draw_comp.draw_super.draw_vars.set_texture(0, &self.color_texture);
         self.draw_comp.draw_super.draw_abs(cx, rect);
     }
@@ -846,6 +863,74 @@ impl Widget for FabScanView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_splat_pass_paints_only_when_its_picture_changes() {
+        use makepad_widgets_core::makepad_draw::cx_draw::CxDraw;
+
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let view = cx.with_vm(|vm| {
+            makepad_widgets_core::script_mod_with(vm, WindowFamilies::default(), &[makepad_widgets_fab::fab_mod]);
+            makepad_xr_stream::serve_script_mod(vm);
+            crate::theme::script_mod(vm);
+            crate::ui::script_mod_kit(vm);
+            crate::tools::overlay::script_mod(vm);
+            super::script_mod(vm);
+            let value = vm.eval(script! { mod.widgets.FabScanView{} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let mut state = AppState::default();
+        state.scan.surface = Arc::new(vec![ScanPoint {
+            point: [0.0; 3], normal: [0.0, 1.0, 0.0], first: 0, size: 0.01, colour: [0.5; 3],
+        }]);
+        let pass = {
+            let mut scan_view = view.borrow_mut::<FabScanView>().unwrap();
+            scan_view.built = Some(build_splats(Sources::of(&state.scan), state.ui.scan_colour, [0.5; 3], [0.5; 3]));
+            scan_view.pass.draw_pass_id()
+        };
+        let parent = DrawPass::new(&mut cx);
+        let parent_size = dvec2(320.0, 200.0);
+        let panel_size = dvec2(160.0, 100.0);
+        let dpi = 1.0;
+        parent.set_size(&mut cx, parent_size);
+        let mut list = DrawList2d::new(&mut cx);
+        let mut draw = |cx: &mut Cx, state: &mut AppState| {
+            cx.redraw_all();
+            let event = std::mem::take(&mut cx.new_draw_event);
+            let mut draw = CxDraw::new(cx, &event);
+            let mut frame = Cx2d::new(&mut draw);
+            frame.begin_pass(&parent, Some(dpi));
+            list.begin_always(&mut frame);
+            frame.begin_root_turtle(parent_size, Layout::default());
+            frame.begin_turtle(Walk::fixed(panel_size.x, panel_size.y), Layout::default());
+            view.draw_all(&mut frame, &mut Scope::with_data(state));
+            frame.end_turtle();
+            frame.end_pass_sized_turtle();
+            list.end(&mut frame);
+            frame.end_pass(&parent);
+        };
+
+        draw(&mut cx, &mut state);
+        assert!(cx.passes[pass].paint_dirty, "the first scan draw requests a paint");
+        assert_eq!(cx.get_pass_rect(pass, dpi).map(|r| r.size), Some(panel_size), "the scan pass uses the panel size");
+        // The GPU would clear the flag after consuming the pass.
+        cx.passes[pass].paint_dirty = false;
+        draw(&mut cx, &mut state);
+        assert!(!cx.passes[pass].paint_dirty, "an unchanged scan reuses its painted texture");
+        assert!(!cx.pass_attachment_is_stale(pass), "the composite reattaches the cached scan");
+
+        view.borrow_mut::<FabScanView>().unwrap().yaw += 0.25;
+        draw(&mut cx, &mut state);
+        assert!(cx.passes[pass].paint_dirty, "orbiting the scan requests a paint");
+        cx.passes[pass].paint_dirty = false;
+        view.borrow_mut::<FabScanView>().unwrap().zoom *= 2.0;
+        draw(&mut cx, &mut state);
+        assert!(cx.passes[pass].paint_dirty, "zooming the scan requests a paint");
+        cx.passes[pass].paint_dirty = false;
+        state.scan.phase = ScanPhase::Capturing;
+        draw(&mut cx, &mut state);
+        assert!(cx.passes[pass].paint_dirty, "changing the scan's busy flag requests a paint");
+    }
 
     #[test]
     fn the_pass_camera_puts_a_point_where_proj_does() {

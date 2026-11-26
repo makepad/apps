@@ -317,6 +317,6 @@ mod tests {
         assert_eq!(found.len(), 1, "a part taller than the LED under the pipe is flagged once");
         assert!(found[0].items.contains(&Sel::Item(unit, tall)), "the finding names the tall part");
         let band = |v: Nm| format!("{:.3}", v as f64 / 1e6);
-        assert_eq!(found[0].message, format!("body 0.000-2.000 mm high reaches into the keepout's {}-{} mm band", band(lo), band(hi)), "the finding names both bands");
+        assert_eq!(found[0].message, format!("body 0.000-2.000 mm high reaches into light pipe body's {}-{} mm band", band(lo), band(hi)), "the finding names the keepout and both bands");
     }
 }

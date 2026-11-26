@@ -1,0 +1,11 @@
+# Recognises hand-drawn strokes as clean shapes (line, rectangle, ellipse, diamond, arrow) and fits
+# them. Pure std, deterministic; the board's shape cleanup calls it.
+[package]
+name = "makepad-ink-shapes"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "makepad_ink_shapes"

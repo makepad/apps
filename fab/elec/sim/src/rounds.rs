@@ -35,12 +35,12 @@
 use crate::analysis::partition::Land;
 use crate::analysis::tran::{Accepted, Restarts, Stepper};
 use crate::circuit::SimCircuit;
-use crate::dev::boundary::Table;
+use crate::dev::boundary::{FeedPoint, Table};
 use crate::livesim::Taps;
 use crate::newton::{SimDiag, Solver, Stats};
 use crate::stamp::UnkKind;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -419,23 +419,59 @@ pub struct RoundPlan {
     /// when a value read across it leaves what the circuit can hold (`Rounds::blame`).
     pub cut_nodes: BTreeMap<u32, String>,
     /// The imports that land, as (coupling, reader block), ascending (`plan_blocks`, by the plan-time
-    /// test of each import, A-K1): their jumps reach the reader as they are, never split onto its
-    /// grid (`Table::split`), and stay instants it lands on when it is on its own bound. Empty from a
-    /// planner that tests none: every import split.
+    /// test of each import, A-K1). Their jumps reach the reader at the recorded points. Events at
+    /// or over the pair's step bar stay instants it lands on. Other imports split onto its grid
+    /// (`Table::split`). Empty from a planner that tests none.
     pub lands: Vec<(u32, u32)>,
+    /// In `lands` order, the smallest step of the export's value across an event for which the
+    /// reader lands it, in volts. Under it the reader takes the event as a plain point.
+    pub land_steps: Vec<f64>,
     /// The chain shadow's trees (`plan_blocks`, `Chain`): one per export a jump is born on that
     /// some reader splits. Empty from a planner that tests none.
     pub chains: Vec<Chain>,
     /// The holder's ports (`HolderPort`, `plan_blocks`): one per return in the hub form, in its
     /// consumer's block. Empty from a planner that makes none.
     pub ports: Vec<HolderPort>,
+    /// The corrections to late voltage boundaries beside ghosts.
+    pub echoes: Vec<Echo>,
+    /// One runtime gain feed per exported echo (`Echo::gain`), in echo order. The planner and physical
+    /// circuit paths traverse `couplings` alone.
+    pub gain_couplings: Vec<GainCoupling>,
+}
+
+/// The response of the physical export `of` to a unit on its import's branch row.
+/// The round runner feeds it to the echo with the delay of that same export.
+#[derive(Clone, Debug)]
+pub struct GainCoupling {
+    pub of: u32,
+    pub branch: u32,
+    pub to: (u32, String),
+    pub initial: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Echo {
+    /// The ghost's block and the correcting boundary instance in it.
+    pub block: u32,
+    pub name: String,
+    /// The coupling feeding the ghost's far node late.
+    pub of: u32,
+    /// This block's voltage export as read on time by the block exporting `of`.
+    pub coupling: u32,
+    /// The static gain: the whole correction of a static echo (the middle of its range over the
+    /// plan's states), and an exported one's before its first gain feed (the fixed start's).
+    pub g: f64,
+    /// Its gain coupling (`RoundPlan::gain_couplings`) when the plan's screen exports it
+    /// (`analysis::round::screen_echoes`); none for a static echo, which costs no export and no
+    /// solve.
+    pub gain: Option<u32>,
 }
 
 /// A consumer's stand-in for the block that holds a node it returns its current into
 /// (`BoundaryKind::Port`, Fable's Q3 answer): fed its own return as the holder reads it, the same
 /// table at the same delay (`Rounds::feed`), so the node moves at once by what the holder will do a
 /// round later. Its impedance is the holder's driving-point impedance at the node, fitted over the
-/// map's points (`r + rb / (1 + s tau) + s l`); all zero where none fits, and the port holds the
+/// map's points (`r + rb / (1 + s tau) + rb2 / (1 + s tau2) + s l`); all zero where none fits, and the port holds the
 /// node as the holder exported it.
 ///
 /// It stands on the consumer's side only, for its own draw. The holder still reads every
@@ -449,10 +485,24 @@ pub struct HolderPort {
     pub name: String,
     /// The return's coupling, read by the holder alone.
     pub coupling: u32,
+    /// A declared supply gives this port a second RC memory, even before the fit.
+    pub second: bool,
     pub r: f64,
     pub rb: f64,
     pub tau: f64,
+    /// Resistance of the second parallel RC section, zero when unused.
+    pub rb2: f64,
+    /// Time constant in seconds of the second parallel RC section.
+    pub tau2: f64,
     pub l: f64,
+}
+
+impl HolderPort {
+    /// The impedance parameters accepted by this port's boundary.
+    pub(crate) fn params(&self) -> impl Iterator<Item = (&'static str, f64)> {
+        [("r", self.r), ("rb", self.rb), ("tau", self.tau), ("l", self.l), ("rb2", self.rb2), ("tau2", self.tau2)]
+            .into_iter().take(if self.second { 6 } else { 4 })
+    }
 }
 
 /// An export a jump is born on that some reader splits, and the tree its jumps reach (the relay
@@ -479,6 +529,20 @@ pub struct Chain {
 }
 
 impl RoundPlan {
+    /// The step bar for a landing read, or `None` for a split read.
+    fn land_step(&self, coupling: u32, reader: u32) -> Option<f64> {
+        self.lands.binary_search(&(coupling, reader)).ok().map(|i| self.land_steps[i])
+    }
+
+    /// Window identities across a replan. A gain is distinguished from the voltage and
+    /// the other entries of its inverse row by the far block's local branch unknown.
+    fn window_sources(&self) -> impl Iterator<Item = (u32, u32, Option<u32>)> + '_ {
+        self.couplings.iter().map(|c| (c.from.0, c.from.1, None)).chain(self.gain_couplings.iter().map(|g| {
+            let (far, x) = self.couplings[g.of as usize].from;
+            (far, x, Some(g.branch))
+        }))
+    }
+
     /// A stage's place in the pipeline (`slot_of` with its `unpipelined`).
     pub fn slot(&self, stage: u32) -> u32 {
         slot_of(stage, &self.unpipelined)
@@ -492,8 +556,13 @@ impl RoundPlan {
 
     /// Whether `other` cuts the circuit as this one does: the same blocks in order, at the same
     /// stages, solving the same unknowns, the same couplings (their rho aside), the same sums, the
-    /// same ghosts and the same stages unpipelined.
+    /// same ghosts, echoes (including their gains) and stages unpipelined.
     pub fn same_cut(&self, other: &RoundPlan) -> bool {
+        self.echoes == other.echoes && self.same_partition(other)
+    }
+
+    /// The partition the map judges, before the echo gains are fitted.
+    pub(crate) fn same_partition(&self, other: &RoundPlan) -> bool {
         self.blocks.len() == other.blocks.len()
             && self.blocks.iter().zip(&other.blocks).all(|(a, b)| a.name == b.name && a.stage == b.stage && a.own == b.own)
             && self.couplings.len() == other.couplings.len()
@@ -949,19 +1018,195 @@ pub(crate) fn check(plan: &RoundPlan, solvers: &[Solver], whole: &Solver) -> Res
             }
         }
     }
+    for e in &plan.echoes {
+        let pair = plan.couplings.get(e.of as usize).zip(plan.couplings.get(e.coupling as usize));
+        let Some((back, own)) = pair else { return fail(format!("{} names a missing coupling", e.name)) };
+        if back.lag != Lag::Round || !back.to.iter().any(|to| to.0 == e.block) || own.from.0 != e.block
+            || own.lag != Lag::Same || !own.to.iter().any(|to| to.0 == back.from.0) {
+            return fail(format!("{} needs an on-time export from block {} and a late voltage back from its reader", e.name, e.block));
+        }
+        let s = &solvers[e.block as usize];
+        if s.find_device(&e.name).and_then(|(b, i)| s.banks[b].param(i, "g")).is_none() {
+            return fail(format!("{} has no echo gain in block {}", e.name, e.block));
+        }
+    }
     Ok(())
 }
 
-/// What running rounds hand the rounds of a plan that cuts the run anew (`Rounds::into_parts`,
-/// `Rounds::new`): the round count with block 0's recent round ends, so late reads go on cutting
-/// where they did, and each coupling's history by its exporter (block, local unknown), for the
-/// couplings of the blocks the plan keeps; and per chain tree its born export by its exporter, its
-/// roots and members, and its counts (`Shadows::seen`), which a tree the plan keeps carries on.
+/// A node voltage, or a voltage boundary's branch current and the devices drawing it.
+enum Quantity {
+    Voltage(String),
+    Current(String, BTreeSet<String>),
+}
+
+/// The quantity exported at unknown `x`: a block exports node voltages and its voltage
+/// boundaries' branches, nothing of a device's own. The devices behind a voltage boundary include
+/// every instance touching its node, even one that only reads it as a control.
+fn quantity(s: &Solver, x: u32) -> Option<Quantity> {
+    let u = &s.unknowns[x as usize];
+    if u.kind == UnkKind::Voltage {
+        return Some(Quantity::Voltage(u.name.clone()));
+    }
+    let node = boundary_node(s, x)?;
+    let mut unks = Vec::new();
+    let mut behind = BTreeSet::new();
+    for bank in s.banks.iter().filter(|bank| bank.kind() != "boundary") {
+        for i in 0..bank.len() {
+            unks.clear();
+            bank.inst_unks(i, &mut unks);
+            if unks.contains(&node) { behind.insert(bank.inst_name(i).to_owned()); }
+        }
+    }
+    Some(Quantity::Current(u.name.clone(), behind))
+}
+
+/// The node of the voltage boundary whose branch is unknown `x` in `s`, if it is one.
+fn boundary_node(s: &Solver, x: u32) -> Option<u32> {
+    let owner = s.unknowns[x as usize].name.strip_suffix("#branch")?;
+    let boundary = s.banks.iter().find(|bank| bank.kind() == "boundary")?;
+    let mut unks = Vec::new();
+    boundary.inst_unks(boundary.find(owner)?, &mut unks);
+    // Only a voltage boundary has its branch after the node and ground.
+    (unks.get(2) == Some(&x)).then_some(unks[0])
+}
+
+/// What the devices of `s` draw through voltage boundary branch `x` at `t`, at `s.x` with each
+/// unknown's rate taken by name from `rates` (the old cut's, none for a name it lacks): minus the
+/// currents into every other instance's terminals at the boundary's node, as the node's current
+/// balance takes the branch. None where `x` is no such branch. O(the block's instances).
+fn drawn_now(s: &Solver, x: u32, rates: &BTreeMap<String, f64>, t: f64) -> Option<f64> {
+    let node = boundary_node(s, x)?;
+    let xdot: Vec<f64> = s.unknowns.iter().map(|u| rates.get(&u.name).copied().unwrap_or(0.0)).collect();
+    let mut cx = s.base_cx();
+    (cx.tran, cx.t) = (true, t);
+    let (mut unks, mut into, mut sum) = (Vec::new(), Vec::new(), 0.0);
+    for bank in &s.banks {
+        let n = bank.terminals();
+        for i in 0..bank.len() {
+            unks.clear();
+            bank.inst_unks(i, &mut unks);
+            // the boundary itself: its branch is what this finds
+            if bank.kind() == "boundary" && unks.get(2) == Some(&x) {
+                continue;
+            }
+            into.clear();
+            into.resize(n, 0.0);
+            bank.terminal_currents(i, &s.x, &xdot, &cx, &mut into);
+            sum += unks.iter().take(n).zip(&into).filter(|(u, _)| **u == node).map(|(_, i)| i).sum::<f64>();
+        }
+    }
+    Some(-sum)
+}
+
+/// A running holder port's memories at its block's newest point (`Rounds::into_parts`): its
+/// block, its name, the devices behind its boundary, and its `w` and `w2` (`port_memories`).
+struct PortMemory {
+    block: u32,
+    name: String,
+    behind: BTreeSet<String>,
+    w: [Option<f64>; 2],
+}
+
+/// Holder port `p`'s memories in its block's solver `s` (`<port>#w`, and `#w2` at a declared
+/// supply), with the devices behind its boundary (the `quantity` of its return's branch).
+fn port_memories(s: &Solver, p: &HolderPort, couplings: &[Coupling]) -> Option<(BTreeSet<String>, [Option<u32>; 2])> {
+    let branch = couplings.get(p.coupling as usize)?.from.1;
+    let Some(Quantity::Current(_, behind)) = quantity(s, branch) else { return None };
+    let w = s.unknown(&format!("{}#w", p.name))?;
+    Some((behind, [Some(w), s.unknown(&format!("{}#w2", p.name))]))
+}
+
+/// Block `b`'s holder port memories in its solver `s`, each with what it takes (`install_new`):
+/// the memory of the running port among `old` of the same name and the same devices behind its
+/// boundary (whose block the plan does not keep), else none, its equilibrium. The ports that
+/// take none go into `rested`.
+fn port_seeds<'p>(s: &Solver, b: usize, plan: &'p RoundPlan, old: &[PortMemory], kept: &BTreeSet<usize>, rested: &mut BTreeSet<&'p str>) -> Vec<(u32, Option<f64>)> {
+    let mut memories = Vec::new();
+    for p in plan.ports.iter().filter(|p| p.block as usize == b) {
+        let Some((behind, unks)) = port_memories(s, p, &plan.couplings) else { continue };
+        let same = old.iter().find(|o| !kept.contains(&(o.block as usize)) && o.name == p.name && o.behind == behind);
+        for (k, m) in unks.iter().enumerate() {
+            let Some(m) = *m else { continue };
+            let v = same.and_then(|o| o.w[k]);
+            if v.is_none() {
+                rested.insert(p.name.as_str());
+            }
+            memories.push((m, v));
+        }
+    }
+    memories
+}
+
+/// A run stepping whole's unknowns' rates at its newest point, by name (`Before::Whole`).
+pub(crate) fn whole_rates(s: &Solver, st: &Stepper) -> BTreeMap<String, f64> {
+    let xdot = &st.hist.newest().xdot;
+    s.unknowns.iter().enumerate().skip(1).map(|(l, u)| (u.name.clone(), xdot.get(l).copied().unwrap_or(0.0))).collect()
+}
+
+/// What a plan's rounds start from (`Rounds::new`).
+pub(crate) enum Before<'a> {
+    /// A run stepping whole, with its unknowns' rates at its newest point (`whole_rates`).
+    Whole(BTreeMap<String, f64>),
+    /// Running rounds: what they carry on, and per block of the plan the running block it
+    /// keeps (`Rounds::same_blocks`).
+    Rounds(Carry, &'a [Option<usize>]),
+}
+
+/// Block `r`, new at a go-in that cuts the run anew, as the go-in installs it, after its first
+/// feed (`Rounds::new`). A holder port's memories are no whole-circuit unknowns, so the plan
+/// left them as it made them: each of `memories` takes the value given, from the same running
+/// port, or with none its equilibrium with what the port reads now (`w = rb e`: the memory's row
+/// is linear in it with unit slope, so that is where the row's static part is zero). Then the
+/// stepper's first point is taken again from that state, the charges with it (`tau w`, and
+/// `-l e` behind an inductance), so the first step integrates from the go-in and not from the
+/// plan. O(the block's devices).
+fn install_new(r: &mut Run, memories: &[(u32, Option<f64>)], t: f64) {
+    let mut cx = r.s.base_cx();
+    (cx.tran, cx.t) = (true, t);
+    for &(m, v) in memories {
+        if let Some(v) = v {
+            r.s.x[m as usize] = v;
+        }
+    }
+    if memories.iter().any(|(_, v)| v.is_none()) {
+        r.s.load(&cx);
+        for &(m, _) in memories.iter().filter(|(_, v)| v.is_none()) {
+            r.s.x[m as usize] -= r.s.f[m as usize];
+        }
+    }
+    take_first_again(r, t);
+}
+
+/// Run `r`'s stepper's first point (its newest, after a resume or a restart) taken again from its
+/// solver's state at `t`, the charges with it: the first step integrates from the values the
+/// block holds now, not the ones it held when the point was taken. O(the block's devices).
+fn take_first_again(r: &mut Run, t: f64) {
+    let mut cx = r.s.base_cx();
+    (cx.tran, cx.t) = (true, t);
+    r.s.load(&cx);
+    let first = r.st.hist.pts.front_mut().expect("a stepper has its newest point");
+    first.x.copy_from_slice(&r.s.x);
+    first.q.copy_from_slice(&r.s.q);
+}
+
+/// What running rounds hand a new cut (`Rounds::into_parts`, `Rounds::new`). A kept block
+/// carries its windows by exporter (block, local unknown, and the import's branch for a gain).
+/// The other blocks take recent points through the present from old exports of the same
+/// quantity; where there is no exact match they start at the present alone, a current as its
+/// devices draw it then (`drawn_now`, at the running blocks' `rates`). Their holder ports take
+/// the running ports' memories (`ports`), else their equilibrium (`install_new`). Block 0's
+/// recent round ends go with the round count so late reads go on cutting where they did. A kept
+/// chain tree carries its counts (`Shadows::seen`) by its born export, roots and members.
 pub(crate) struct Carry {
     ctl_done: u64,
     ends: VecDeque<(u64, f64)>,
     start: f64,
-    windows: Vec<((u32, u32), Window)>,
+    windows: Vec<((u32, u32, Option<u32>), Window, Option<Quantity>)>,
+    /// Each running block's own unknowns' rates at its newest point, by name.
+    rates: BTreeMap<String, f64>,
+    /// The running holder ports' memories at their blocks' newest points.
+    ports: Vec<PortMemory>,
+    echoes: Vec<(u32, String)>,
     chains: Vec<((u32, u32), Vec<u32>, Vec<u32>, ChainJumps)>,
 }
 
@@ -969,14 +1214,123 @@ pub(crate) struct Carry {
 /// (`HolderPort`); true when it changed.
 fn port_into(s: &mut Solver, p: &HolderPort) -> bool {
     let Some((bank, i)) = s.find_device(&p.name) else { return false };
-    let z = [("r", p.r), ("rb", p.rb), ("tau", p.tau), ("l", p.l)];
-    if z.iter().all(|&(key, v)| s.banks[bank].param(i, key) == Some(v)) {
-        return false;
+    let mut changed = false;
+    for (key, v) in p.params() {
+        if s.banks[bank].param(i, key).is_some_and(|old| old != v) {
+            changed |= s.set_param(&p.name, key, v);
+        }
     }
-    for (key, v) in z {
-        s.set_param(&p.name, key, v);
+    changed
+}
+
+/// Installs the signed gain in a retained solver if it differs from the plan.
+fn echo_into(s: &mut Solver, e: &Echo) -> bool {
+    let Some((bank, i)) = s.find_device(&e.name) else { return false };
+    let exported = if e.gain.is_some() { 1.0 } else { 0.0 };
+    let g = s.banks[bank].param(i, "g") != Some(e.g) && s.set_param(&e.name, "g", e.g);
+    let read = s.banks[bank].param(i, "exported") != Some(exported) && s.set_param(&e.name, "exported", exported);
+    g || read
+}
+
+/// One echo's finite live feeds, in the far reader's time. `next` is the start of the
+/// earliest interval this echo can still need, already shifted by its own delay.
+#[derive(Clone)]
+struct EchoTrack {
+    delay: f64,
+    next: f64,
+    feeds: VecDeque<(f64, f64, Arc<Table>)>,
+    /// If the oldest time still readable was a feed's end, keep that one shared knot.
+    endpoint: Option<FeedPoint>,
+}
+
+impl EchoTrack {
+    fn table(&self, t0: f64, end: f64) -> Table {
+        let (lo, hi) = (t0 - self.delay, end - self.delay);
+        let first = self.feeds.partition_point(|f| f.1 < lo);
+        let mut covered = lo;
+        let mut out = Table::empty();
+        for (start, stop, table) in self.feeds.iter().skip(first) {
+            if *start > covered { break; }
+            let start = if *stop == lo { lo } else { *start };
+            if out.t.is_empty() {
+                if let Some(p) = self.endpoint.filter(|p| p.t == start) { out.push_feed_point(p); }
+            }
+            out.append_feed(table, start, *stop);
+            covered = *stop;
+            if covered >= hi { return out; }
+        }
+        // A partial history cannot cancel the delayed export for this round.
+        Table::empty()
     }
-    true
+}
+
+#[derive(Clone, Default)]
+struct EchoHistory {
+    tracks: Vec<EchoTrack>,
+    /// The echoes that need the table for (far reader, same-round coupling).
+    inputs: BTreeMap<(usize, u32), Vec<usize>>,
+    /// The echoes to feed in each block that has any.
+    blocks: BTreeMap<usize, Vec<usize>>,
+    oldest: f64,
+}
+
+impl EchoHistory {
+    fn new(plan: &RoundPlan, delays: &[Vec<f64>], start: f64) -> Option<Box<Self>> {
+        if plan.echoes.is_empty() { return None; }
+        let mut history = Box::new(Self::default());
+        for (i, e) in plan.echoes.iter().enumerate() {
+            let back = &plan.couplings[e.of as usize];
+            let at = back.to.iter().position(|t| t.0 == e.block).expect("echo belongs to a late reader");
+            let delay = delays[e.of as usize][at];
+            history.inputs.entry((back.from.0 as usize, e.coupling)).or_default().push(i);
+            history.blocks.entry(e.block as usize).or_default().push(i);
+            history.tracks.push(EchoTrack { delay, next: start - delay, feeds: VecDeque::new(), endpoint: None });
+        }
+        history.trim();
+        Some(history)
+    }
+
+    fn record(&mut self, b: usize, c: u32, t0: f64, end: f64, table: &Arc<Table>) {
+        // The install feed can have the first live round's t0, but spans no stepped interval.
+        if !end.is_finite() { return; }
+        if let Some(indices) = self.inputs.get(&(b, c)) {
+            for &i in indices {
+                let track = &mut self.tracks[i];
+                let feeds = &mut track.feeds;
+                if feeds.back().is_some_and(|f| f.0 == t0) {
+                    feeds.pop_back();
+                }
+                if end > self.oldest {
+                    feeds.push_back((t0, end, table.clone()));
+                } else if end == self.oldest {
+                    track.endpoint = Some(table.feed_point(end));
+                }
+            }
+        }
+    }
+
+    fn completed(&mut self, b: usize, end: f64) {
+        if let Some(indices) = self.blocks.get(&b) {
+            for &i in indices {
+                let track = &mut self.tracks[i];
+                track.next = end - track.delay;
+            }
+            self.trim();
+        }
+    }
+
+    fn trim(&mut self) {
+        self.oldest = self.tracks.iter().map(|tr| tr.next).fold(f64::INFINITY, f64::min);
+        for tr in &mut self.tracks {
+            if tr.endpoint.is_some_and(|p| p.t < self.oldest) { tr.endpoint = None; }
+            while tr.feeds.front().is_some_and(|f| f.1 <= self.oldest) {
+                let (_, end, table) = tr.feeds.pop_front().expect("feed ends at or before oldest");
+                if end == self.oldest {
+                    tr.endpoint = Some(table.feed_point(end));
+                }
+            }
+        }
+    }
 }
 
 /// What a read of a coupling's window depends on beyond the reader (`Read::table`): the pipeline,
@@ -989,30 +1343,50 @@ struct Read<'a> {
 }
 
 impl Read<'_> {
+    /// Last exporter time visible to this reader. Use the recorded round end so a helper
+    /// that has already exported another round cannot change this read.
+    fn cut(&self, m: u64, end: f64, delay: f64) -> f64 {
+        if !self.pipeline { return f64::INFINITY; }
+        let lag = (delay / self.round).round() as u64;
+        if lag == 0 { end } else { round_end(self.ends, self.start, m.saturating_sub(lag)) }
+    }
+
+    /// The inverse row is sampled at the far solver's knots. Only feed it if the
+    /// visible window spans the whole delayed interval.
+    fn gain_table(&self, w: &Window, t0: f64, end: f64, m: u64, delay: f64) -> Table {
+        if !end.is_finite() { return Table::empty(); }
+        let cut = self.cut(m, end, delay);
+        let past = w.t.partition_point(|&t| t <= cut);
+        let lo = t0 - delay;
+        if past == 0 { return Table::empty(); }
+        let (first, last) = (w.t[0], w.t[past - 1]);
+        // Shifting a shared endpoint into reader time can round onto that endpoint
+        // even when subtracting the delay rounds just outside the far window.
+        if (first > lo && first + delay > t0) || (last < end - delay && last + delay < end) {
+            return Table::empty();
+        }
+        w.table_range(w.read_from(lo).min(past - 1), past, None)
+    }
+
     /// What a reader of window `w` takes for round `m` from `t0` to `end` at `delay`: its points
     /// (through the exporter's end of the round read, in the pipeline), on the reader's `grid` its
-    /// jumps split unless the read `lands`, and with `crossings_as_data` the exporter's crossings
-    /// plain points (`Rounds::feed`); and how many jumps it split. A holder's port takes its
-    /// holder's table this way, so the two read the same. O(the points read).
+    /// jumps split unless the pair lands steps at or over `land_step`. With `crossings_as_data`
+    /// a split read takes the exporter's crossings as plain points (`Rounds::feed`). Also gives
+    /// how many jumps it split. A holder's port takes its holder's table this way. O(the points read).
     #[allow(clippy::too_many_arguments)]
-    fn table(&self, w: &Window, t0: f64, end: f64, m: u64, delay: f64, grid: f64, lands: bool, crossings_as_data: bool) -> (Table, u32) {
-        let mut points = if self.pipeline {
-            // In the pipeline an exporter may have run further: a read takes its points through its
-            // own end of the round read, this round's for a `Same` read, and for a read `l` rounds
-            // late block 0's recorded end of round m - l (which also covers shortened rounds and
-            // rounding).
-            let lag = (delay / self.round).round() as u64;
-            let cut = if lag == 0 { end } else { round_end(self.ends, self.start, m.saturating_sub(lag)) };
-            w.table_to(t0 - delay - grid, cut)
-        } else {
-            w.table(t0 - delay - grid)
-        };
+    fn table(&self, w: &Window, t0: f64, end: f64, m: u64, delay: f64, grid: f64, land_step: Option<f64>, crossings_as_data: bool) -> (Table, u32) {
+        let from = t0 - delay - grid;
+        let cut = self.pipeline.then(|| self.cut(m, end, delay));
+        let mut points = w.table(from, cut, land_step);
+        if land_step.is_some() {
+            return (points, 0);
+        }
         let mut jumps = 0;
-        if let Some((fed, n)) = points.split(grid, delay, t0, None, end, end).filter(|_| !lands) {
+        if let Some((fed, n)) = points.split(grid, delay, t0, None, end, end) {
             jumps = n;
             points = fed;
         }
-        if crossings_as_data && !lands && !points.edges.is_empty() {
+        if crossings_as_data && !points.edges.is_empty() {
             let edges = std::mem::take(&mut points.edges);
             points.events.retain(|i| edges.binary_search(i).is_err());
         }
@@ -1026,11 +1400,10 @@ impl Read<'_> {
 struct Window {
     t: Vec<f64>,
     v: Vec<f64>,
-    events: Vec<u32>,
-    /// The events that are crossings of the exporting block.
-    edges: Vec<u32>,
-    /// Points marked as events by the point after them (`mark_newest`), ascending.
-    jumps: Vec<u32>,
+    /// Recorded events, ascending: point, step to the next recorded value, and whether an edge.
+    events: Vec<(u32, f64, bool)>,
+    /// Points marked as events by the point after them (`mark_newest`) and the step to it, ascending.
+    jumps: Vec<(u32, f64)>,
     /// Edge points whose jump ran over a source edge shorter than the resolution, and its end
     /// (`Accepted::edge_end`), where the export does not relay it (`pass_on`): a read that lands
     /// the jump takes it (`landed_to`). Ascending.
@@ -1042,19 +1415,18 @@ struct Window {
 impl Window {
     /// The newest point is an event (where a value may jump), marked by the next point: a read
     /// whose points end at it never sees the mark (`table_range`).
-    fn mark_newest(&mut self) {
-        let n = self.t.len() as u32;
-        if n > 0 && self.jumps.last() != Some(&(n - 1)) {
-            self.jumps.push(n - 1);
+    fn mark_newest(&mut self, restart: f64) {
+        if let Some(&v) = self.v.last() {
+            let i = (self.v.len() - 1) as u32;
+            if self.jumps.last().is_none_or(|p| p.0 != i) {
+                self.jumps.push((i, (restart - v).abs()));
+            }
         }
     }
 
-    fn push(&mut self, t: f64, v: f64, event: bool, edge: bool) {
-        if event {
-            self.events.push(self.t.len() as u32);
-        }
-        if event && edge {
-            self.edges.push(self.t.len() as u32);
+    fn push(&mut self, t: f64, v: f64, event_step: Option<f64>, edge: bool) {
+        if let Some(step) = event_step {
+            self.events.push((self.t.len() as u32, step, edge));
         }
         self.t.push(t);
         self.v.push(v);
@@ -1063,6 +1435,31 @@ impl Window {
     /// The first point a read at `t` or later needs: the last at or before `t`.
     fn first(&self, t: f64) -> usize {
         self.t.partition_point(|&at| at <= t).saturating_sub(1)
+    }
+
+    /// The value at `t`, linear between points and held at either end.
+    fn value(&self, t: f64) -> f64 {
+        let i = self.first(t);
+        if t <= self.t[i] || i + 1 == self.t.len() { return self.v[i]; }
+        self.v[i] + (self.v[i + 1] - self.v[i]) * (t - self.t[i]) / (self.t[i + 1] - self.t[i])
+    }
+
+    /// A new cut's export through `t0`, on the union of its old exports' recent point times.
+    fn from_history(old: &[&Window], t0: f64, span: f64) -> Window {
+        let mut times = Vec::new();
+        for w in old {
+            let from = w.t.partition_point(|&t| t < t0 - span);
+            let end = w.t.partition_point(|&t| t < t0);
+            times.extend_from_slice(&w.t[from..end]);
+        }
+        times.sort_unstable_by(f64::total_cmp);
+        times.dedup();
+        times.push(t0);
+        let mut window = Window::default();
+        for t in times {
+            window.push(t, old.iter().map(|w| w.value(t)).sum(), None, false);
+        }
+        window
     }
 
     /// `first` for a read from `t`, which the trim must have left whole.
@@ -1078,31 +1475,27 @@ impl Window {
         if k > 0 {
             self.t.drain(..k);
             self.v.drain(..k);
-            self.events.retain(|&e| e as usize >= k);
-            self.events.iter_mut().for_each(|e| *e -= k as u32);
-            self.edges.retain(|&e| e as usize >= k);
-            self.edges.iter_mut().for_each(|e| *e -= k as u32);
-            self.jumps.retain(|&e| e as usize >= k);
-            self.jumps.iter_mut().for_each(|e| *e -= k as u32);
-            self.ends.retain(|e| e.0 as usize >= k);
-            self.ends.iter_mut().for_each(|e| e.0 -= k as u32);
+            self.events.retain(|e| e.0 as usize >= k);
+            self.events.iter_mut().for_each(|e| e.0 -= k as u32);
+            for marks in [&mut self.jumps, &mut self.ends] {
+                marks.retain(|e| e.0 as usize >= k);
+                marks.iter_mut().for_each(|e| e.0 -= k as u32);
+            }
         }
     }
 
     /// The points a reader can use through the exporter's round end.
     fn table_to(&self, t: f64, cut: f64) -> Table {
-        let k = self.read_from(t);
-        let e = self.t.partition_point(|&at| at <= cut).max(k + 1).min(self.t.len());
-        self.table_range(k, e)
+        self.table(t, Some(cut), None)
     }
 
     /// The window from the last point at or before `t`, as it stands: what a chain tree's shadow
     /// points follow (`Open::before`). O(its points).
     fn since(&self, t: f64) -> Window {
         let k = self.read_from(t);
-        let from = |p: &[u32]| p.iter().filter(|&&i| i as usize >= k).map(|&i| i - k as u32).collect();
-        let ends = self.ends.iter().filter(|e| e.0 as usize >= k).map(|&(i, end)| (i - k as u32, end)).collect();
-        Window { t: self.t[k..].to_vec(), v: self.v[k..].to_vec(), events: from(&self.events), edges: from(&self.edges), jumps: from(&self.jumps), ends, trimmed: self.trimmed }
+        let events = self.events.iter().filter(|e| e.0 as usize >= k).map(|&(i, step, edge)| (i - k as u32, step, edge)).collect();
+        let from = |p: &[(u32, f64)]| p.iter().filter(|e| e.0 as usize >= k).map(|&(i, v)| (i - k as u32, v)).collect();
+        Window { t: self.t[k..].to_vec(), v: self.v[k..].to_vec(), events, jumps: from(&self.jumps), ends: from(&self.ends), trimmed: self.trimmed }
     }
 
     /// `table_to` as a read that lands the window's jumps takes it: after each edge point the end
@@ -1111,7 +1504,7 @@ impl Window {
     fn landed_to(&self, t: f64, cut: f64) -> Table {
         let k = self.read_from(t);
         let e = self.t.partition_point(|&at| at <= cut).max(k + 1).min(self.t.len());
-        let mut table = self.table_range(k, e);
+        let mut table = self.table_range(k, e, None);
         for &(i, end) in self.ends.iter().rev() {
             let i = i as usize;
             if i < k || i + 1 >= e {
@@ -1129,24 +1522,37 @@ impl Window {
         table
     }
 
-    /// The points a read from `t` on takes.
-    fn table(&self, t: f64) -> Table {
-        self.table_range(self.read_from(t), self.t.len())
+    /// The points a read from `t` takes through its cut, or through the newest point without one.
+    fn table(&self, t: f64, cut: Option<f64>, land_step: Option<f64>) -> Table {
+        let k = self.read_from(t);
+        let e = cut.map_or(self.t.len(), |cut| self.t.partition_point(|&at| at <= cut).max(k + 1).min(self.t.len()));
+        self.table_range(k, e, land_step)
     }
 
     /// Points `k..e` as a table. A point's mark by the point after it counts only with that point
     /// in the table: what a read sees of its last point is fixed when the exporter reaches it, never
-    /// by how far it has run since. A marked point is an event and no edge.
-    fn table_range(&self, k: usize, e: usize) -> Table {
-        fn within(points: &[u32], k: usize, to: usize) -> impl Iterator<Item = u32> + '_ {
-            points.iter().copied().filter(move |&i| (k..to).contains(&(i as usize)))
+    /// by how far it has run since. A marked point takes the restart's step and is no edge.
+    /// A landing read takes a step under its bar as a plain data point.
+    fn table_range(&self, k: usize, e: usize, land_step: Option<f64>) -> Table {
+        let jumps = &self.jumps[self.jumps.partition_point(|p| (p.0 as usize) < k)..];
+        let jumps = &jumps[..jumps.partition_point(|p| (p.0 as usize) < e.saturating_sub(1))];
+        let under = |step| land_step.is_some_and(|bar| step < bar);
+        let mut events = Vec::new();
+        let mut edges = Vec::new();
+        for &(i, step, edge) in self.events.iter().skip_while(|p| (p.0 as usize) < k).take_while(|p| (p.0 as usize) < e) {
+            if under(step) || jumps.binary_search_by_key(&i, |p| p.0).is_ok() {
+                continue;
+            }
+            events.push(i - k as u32);
+            if edge {
+                edges.push(i - k as u32);
+            }
         }
-        let jumps: Vec<u32> = within(&self.jumps, k, e.saturating_sub(1)).collect();
-        let mut events: Vec<u32> = within(&self.events, k, e).chain(jumps.iter().copied()).collect();
-        events.sort_unstable();
-        events.dedup();
-        let edges = within(&self.edges, k, e).filter(|i| jumps.binary_search(i).is_err()).map(|i| i - k as u32).collect();
-        Table { t: self.t[k..e].to_vec(), v: self.v[k..e].to_vec(), events: events.into_iter().map(|i| i - k as u32).collect(), edges }
+        if !jumps.is_empty() {
+            events.extend(jumps.iter().filter(|p| !under(p.1)).map(|p| p.0 - k as u32));
+            events.sort_unstable();
+        }
+        Table { t: self.t[k..e].to_vec(), v: self.v[k..e].to_vec(), events, edges }
     }
 }
 
@@ -1238,7 +1644,7 @@ const CHAIN_FIRST: u64 = 8;
 const CHAIN_STALE: u64 = 64;
 
 /// A block's round as it ran (`Shadows`): its points' times, its exports point by point (in
-/// `Run::exports` order) and its own values point by point (in `Run::own` order).
+/// `Rounds::exports` order) and its own values point by point (in `Run::own` order).
 /// Its own crossings (`CROSSING`): how many, and the time of the last (minus infinity for none).
 #[derive(Clone)]
 struct Ran {
@@ -1417,12 +1823,12 @@ impl Tree {
             if !mb.feeds.is_empty() {
                 run.st.breaks_changed(&run.s);
             }
-            let exp0: Vec<f64> = run.exports.iter().map(|&l| run.s.x[l as usize]).collect();
+            let exp0 = run.exp0();
             let own0: Vec<f64> = run.own.iter().map(|&(l, _)| run.s.x[l as usize]).collect();
             run.round(end, true);
             let figures = run.failed.is_none().then(|| figures(run, t0, end, &exp0, &own0, &mb.ran, &mb.ranges, peak)).filter(|f| f.0.iter().all(|x| !x.is_nan()));
             failed = figures.is_none();
-            let n = run.exports.len();
+            let n = run.export_width();
             for &(w, j) in &mb.outs {
                 pass_on(&mut passed[w].1, &run.rec, n, j, true, edges, |_, _| {});
             }
@@ -1606,7 +2012,8 @@ fn figures(run: &Run, t0: f64, end: f64, exp0: &[f64], own0: &[f64], ran: &Ran, 
     let (span, rec) = ((end - t0).max(f64::MIN_POSITIVE), &run.rec);
     let n = exp0.len();
     let (mut exp_mean, mut exp_most) = (0.0f64, 0.0f64);
-    for (j, &v0) in exp0.iter().enumerate() {
+    // Gains travel in the records but only circuit exports are judged.
+    for (j, &v0) in exp0[..run.exports.len()].iter().enumerate() {
         let (area, most, _) = differ(t0, (v0, v0), &ran.t, &|p| ran.exp[p * n + j], &rec.t, &|p| rec.exp[p * n + j]);
         let range = ranges.get(j).map_or(0.0, |r| r.1 - r.0);
         let scale = if range > 0.0 { range } else { peak };
@@ -1817,30 +2224,31 @@ fn shift_back(t0: f64, end: f64, own0: &[f64], volt: &[bool], r: &EndRecord, c: 
 }
 
 /// A block's round's points of its export `j` (of `n`) onto that export's window, as the readers
-/// take them: a restart's point marks the one before it (the importers land on its instant, as on
-/// an edge: past it a value may jump, not follow the slope before it); an event stays one, and a
-/// point the block landed on an imported event alone (`RELAYED`) is one where the export `relays`
-/// it and the value moves to the next point. With `edges`, a crossing or a relayed switching instant
-/// is an edge; a relayed corner is a plain event. Where the export relays, the end of the source
-/// edge a jump ran over follows its edge point at that point's level,
-/// so a block that lands the jump takes its first step to there (`Bank::jump_step`). `each` sees
-/// each recorded point's time and value before it is appended. O(points).
+/// take them. Each event carries its step to the next recorded value, infinite when that point
+/// is missing. A restart marks the point before it with the step to the restart. A landing reader
+/// keeps the mark at or over its step bar. An imported event alone (`RELAYED`) passes on where
+/// the export `relays` it and the value moves to the next point. With `edges`, a crossing or a
+/// relayed switching instant is an edge and a relayed corner is a plain event. Where the export
+/// relays, the end of the source edge a jump ran over follows at the edge point's level, so a
+/// block that lands the jump takes its first step to there (`Bank::jump_step`). `each` sees each
+/// recorded point's time and value before it is appended. O(points).
 fn pass_on(w: &mut Window, rec: &Rec, n: usize, j: usize, relays: bool, edges: bool, mut each: impl FnMut(f64, f64)) {
     let mut ends = rec.ends.iter().peekable();
     for (p, &t) in rec.t.iter().enumerate() {
         let v = rec.exp[p * n + j];
         if rec.flags[p] & JUMP != 0 {
-            w.mark_newest();
+            w.mark_newest(v);
         }
-        let relayed = relays && rec.flags[p] & RELAYED != 0 && rec.exp.get((p + 1) * n + j).is_none_or(|&next| next != v);
+        let next = rec.exp.get((p + 1) * n + j);
+        let relayed = relays && rec.flags[p] & RELAYED != 0 && next.is_none_or(|&next| next != v);
         let event = rec.flags[p] & EVENT != 0 || relayed;
         let edge = edges && (rec.flags[p] & CROSSING != 0 || relayed && rec.flags[p] & RELAYED_EDGE != 0);
         each(t, v);
-        w.push(t, v, event, edge);
+        w.push(t, v, event.then(|| next.map_or(f64::INFINITY, |&next| (next - v).abs())), edge);
         if let Some(&(_, end)) = ends.next_if(|&&(q, _)| q as usize == p) {
             if end > t && rec.t.get(p + 1).is_some_and(|&next| end < next) {
                 if relays {
-                    w.push(end, v, false, false);
+                    w.push(end, v, None, false);
                 } else {
                     w.ends.push(((w.t.len() - 1) as u32, end));
                 }
@@ -2100,7 +2508,7 @@ impl Shadow {
         if !feeds.is_empty() {
             run.st.breaks_changed(&run.s);
         }
-        let exp0: Vec<f64> = run.exports.iter().map(|&l| run.s.x[l as usize]).collect();
+        let exp0 = run.exp0();
         let own0: Vec<f64> = run.own.iter().map(|&(l, _)| run.s.x[l as usize]).collect();
         run.round(end, true);
         let figures = run.failed.is_none().then(|| figures(&run, t0, end, &exp0, &own0, &ran, &ranges, peak).0).filter(|f| f.iter().all(|x| !x.is_nan()));
@@ -2302,8 +2710,9 @@ const JUMP: u8 = 4;
 const CROSSING: u8 = 8;
 /// The point was a landing on an imported event alone (`relayed`): an event only in the windows of
 /// the couplings the plan lands a jump through (`RoundPlan::lands`), and there only where the
-/// value moves to the next point. A relayed switching instant passes on as an edge (`RELAYED_EDGE`),
-/// a relayed corner as a plain event. The plan lands no such chain that closes a loop (`charge_hold`).
+/// value moves to the next point. A landing reader keeps the event at or over its step bar:
+/// a relayed switching instant as an edge (`RELAYED_EDGE`), a relayed corner as a plain event.
+/// The plan lands no such chain that closes a loop (`charge_hold`).
 const RELAYED: u8 = 16;
 /// The point landed on imported switching instants alone: where the export relays it, it passes
 /// on as an edge so its readers restart as at a switching instant.
@@ -2317,6 +2726,7 @@ struct Rec {
     /// Per point its own unknowns' values (`Run::own` order), its pins' currents and its exports.
     vals: Vec<f64>,
     pin_i: Vec<f64>,
+    /// One row per time, with the physical exports followed by the far block's gain columns.
     exp: Vec<f64>,
     /// Its edge points that carry the end of a source edge their jump ran over (`Accepted::edge_end`):
     /// the point and the end, in point order.
@@ -2449,6 +2859,55 @@ struct MergeFlight {
     rx: mpsc::Receiver<Option<MergeJob>>,
 }
 
+/// The far block's gain columns, in record order after the physical exports.
+/// One transposed solve per far node fills them after each accepted step, including in replays.
+/// The planner and circuit physics use only the physical exports.
+#[derive(Clone, Default)]
+struct GainExports {
+    nodes: Vec<u32>,
+    branches: Vec<u32>,
+    /// Indices in `nodes` and `branches` for each exported gain column.
+    entries: Vec<(usize, usize)>,
+    initial: Vec<f64>,
+    out: Vec<f64>,
+    /// One inverse row, ground-indexed.
+    z: Vec<f64>,
+}
+
+impl GainExports {
+    fn install(&mut self, node: u32, branch: u32, initial: f64) {
+        fn index(ids: &mut Vec<u32>, id: u32) -> usize {
+            ids.iter().position(|&v| v == id).unwrap_or_else(|| {
+                ids.push(id);
+                ids.len() - 1
+            })
+        }
+        let row = index(&mut self.nodes, node);
+        let col = index(&mut self.branches, branch);
+        self.entries.push((row, col));
+        self.initial.push(initial);
+        self.out.resize(self.nodes.len() * self.branches.len(), 0.0);
+    }
+
+    /// Fill every point emitted by one successful step from its returned factor.
+    fn finish_step(&mut self, s: &mut Solver, points: &mut [f64], width: usize) {
+        self.z.resize(s.n + 1, 0.0);
+        let nb = self.branches.len();
+        for (j, &node) in self.nodes.iter().enumerate() {
+            s.gain_row(node, &mut self.z);
+            for (i, &branch) in self.branches.iter().enumerate() {
+                self.out[j * nb + i] = self.z[branch as usize];
+            }
+        }
+        let first = width - self.entries.len();
+        for point in points.chunks_exact_mut(width) {
+            for (gain, &(row, col)) in point[first..].iter_mut().zip(&self.entries) {
+                *gain = self.out[row * self.branches.len() + col];
+            }
+        }
+    }
+}
+
 /// A block running: its solver beside its stepper, its map, its pins and its record.
 #[derive(Clone)]
 pub(crate) struct Run {
@@ -2463,6 +2922,7 @@ pub(crate) struct Run {
     pin_scratch: Vec<f64>,
     /// The local unknowns other blocks read, by its exports' order (`Rounds::exports`).
     exports: Vec<u32>,
+    gain_exports: Option<Box<GainExports>>,
     rec: Rec,
     /// Its wall a round, ns, smoothed: what orders it among its stage's (`Rounds::order`).
     cost: f64,
@@ -2497,7 +2957,7 @@ impl Run {
         let cost = 1e3 * own.len() as f64;
         let (changes, set) = (st.restarts.change, own.len());
         Run {
-            s, st, own, set, taps, pins: ids, pin_scratch: vec![0.0; pins], exports: Vec::new(), rec: Rec::default(), cost,
+            s, st, own, set, taps, pins: ids, pin_scratch: vec![0.0; pins], exports: Vec::new(), gain_exports: None, rec: Rec::default(), cost,
             first_ns: 0, first_n: 0, later_ns: 0, later_n: 0, worker_ns: 0, worker_rounds: 0, helper_ns: 0, helper_rounds: 0,
             changes, kink: false, edited: false, failed: None, shadow_take: false, shadow: None, hub: Vec::new(),
         }
@@ -2509,6 +2969,16 @@ impl Run {
     pub(crate) fn kept(old: Run, own: Vec<(u32, u32)>, taps: Taps, pins: usize) -> Run {
         let Run { s, st, kink, edited, .. } = old;
         Run { kink, edited, ..Run::new(s, st, own, taps, pins) }
+    }
+
+    fn export_width(&self) -> usize {
+        self.exports.len() + self.gain_exports.as_ref().map_or(0, |g| g.initial.len())
+    }
+
+    fn exp0(&self) -> Vec<f64> {
+        let mut values: Vec<_> = self.exports.iter().map(|&l| self.s.x[l as usize]).collect();
+        if let Some(g) = &self.gain_exports { values.extend_from_slice(&g.initial); }
+        values
     }
 
     /// One `Stepper::step` (at most to `t_end`), its points recorded; with hub reads (fed when
@@ -2529,8 +2999,10 @@ impl Run {
 
     /// One `Stepper::step`, its points recorded and, with `SCREEN`, the hub reads screened at each.
     fn step_with<const SCREEN: bool>(&mut self, t_end: f64) -> Result<(), SimDiag> {
-        let Run { s, st, own, taps, pins, pin_scratch, exports, rec, changes, kink, hub, .. } = self;
+        let width = self.export_width();
+        let Run { s, st, own, taps, pins, pin_scratch, exports, gain_exports, rec, changes, kink, hub, .. } = self;
         let with_pins = rec.pins;
+        let start = rec.exp.len();
         let now = st.restarts.change;
         let crossings = st.restarts.crossing;
         let stepped = st.step(s, t_end, &mut |sv: &Solver, a: &Accepted| {
@@ -2544,6 +3016,7 @@ impl Run {
             rec.flags.push((u8::from(a.event && !fed) * EVENT) | (u8::from(fed) * RELAYED) | (u8::from(fed_edge) * RELAYED_EDGE) | (u8::from(a.coarse) * COARSE) | (u8::from(jump) * JUMP));
             rec.vals.extend(own.iter().map(|&(l, _)| sv.x[l as usize]));
             rec.exp.extend(exports.iter().map(|&l| sv.x[l as usize]));
+            if let Some(g) = gain_exports.as_ref() { rec.exp.extend_from_slice(&g.initial); }
             if SCREEN {
                 HubRead::screen(hub, &sv.x, a.t);
             }
@@ -2552,6 +3025,11 @@ impl Run {
                 rec.pin_i.extend(pins.iter().map(|&p| pin_scratch[p as usize]));
             }
         });
+        if stepped.is_ok() && rec.exp.len() > start {
+            if let Some(g) = gain_exports {
+                g.finish_step(s, &mut rec.exp[start..], width);
+            }
+        }
         if st.restarts.crossing != crossings {
             if let Some(f) = rec.flags.last_mut() {
                 *f |= CROSSING;
@@ -2833,9 +3311,12 @@ pub(crate) struct Rounds {
     couplings: Vec<Coupling>,
     /// Each reader's delay in seconds, in the order of `Coupling::to`.
     delays: Vec<Vec<f64>>,
+    /// Only the live owner records here, as it feeds a tracked import.
+    echo_history: Option<Box<EchoHistory>>,
     windows: Vec<Window>,
-    /// Per block, the couplings it exports (its `Run::exports` order) and those it reads.
+    /// Per block, all window indices in record order (physical exports, then gains).
     exports: Vec<Vec<u32>>,
+    /// Physical imports only. Gain tables are fed alongside their echo histories.
     imports: Vec<Vec<u32>>,
     /// The open round's start and its end on the grid (`end_after`): block 0 steps no further.
     t0: f64,
@@ -2874,12 +3355,19 @@ pub(crate) struct Rounds {
 }
 
 impl Rounds {
-    /// The rounds of a checked plan (`check`), its blocks standing at one instant. Every boundary
-    /// source is fed its export's present value; false names one that takes no feed. With `carry`
-    /// (from the running rounds, and per block the running block it keeps: `same_blocks`), a kept
-    /// block's couplings keep their histories, and the round count goes on where block 0's kept
-    /// round ends reach the plan's latest read (else it starts again, as for a run stepping whole).
-    pub(crate) fn new(plan: &RoundPlan, mut runs: Vec<Run>, round: f64, pipeline: bool, carry: Option<(Carry, &[Option<usize>])>) -> Result<Rounds, SimDiag> {
+    /// The rounds of a checked plan (`check`), its blocks standing at one instant. From a run
+    /// stepping whole (`Before::Whole`), each export starts at the present, a boundary's branch
+    /// as its devices draw it at the run's rates, and every holder port at its equilibrium. From
+    /// running rounds, a kept block (`same_blocks`) keeps its windows whole.
+    /// A new block takes a node voltage's recent history or the sum of the old draws covering
+    /// exactly its boundary's devices, including the value at this instant. Its other exports
+    /// start at the present alone. Its holder ports take the memories of the same running port
+    /// (its name and the devices behind it), else their equilibrium, and after the first feed its
+    /// stepper's first point is taken again from that state (`install_new`). The round count goes
+    /// on where block 0's kept round ends reach the plan's latest read (else it starts again, as
+    /// for a run stepping whole).
+    /// Each boundary source gets its first feed here. A source that takes no feed is named.
+    pub(crate) fn new(plan: &RoundPlan, mut runs: Vec<Run>, round: f64, pipeline: bool, before: Before) -> Result<Rounds, SimDiag> {
         let mut stages: Vec<Vec<u32>> = Vec::new();
         for (k, b) in plan.blocks.iter().enumerate().skip(1) {
             if k == 1 || plan.blocks[k - 1].stage != b.stage {
@@ -2897,10 +3385,34 @@ impl Rounds {
         for r in &mut runs {
             r.set = r.own.len();
         }
-        // a block kept from the cut before runs on with its ports as the plan fitted them now
+        // a block kept from the cut before runs on with its ports as the plan fitted them now, its
+        // first point taken again after the first feed (`take_first_again`)
+        let mut refit = BTreeSet::new();
         for p in &plan.ports {
             let r = &mut runs[p.block as usize];
             if port_into(&mut r.s, p) {
+                r.st.restart(&r.s);
+                refit.insert(p.block as usize);
+            }
+        }
+        // A kept solver can still have a live table for an echo the new fit pruned.
+        if let Before::Rounds(old, same) = &before {
+            for (k, previous) in same.iter().enumerate() {
+                let Some(previous) = previous else { continue };
+                for (_, name) in old.echoes.iter().filter(|(b, _)| *b as usize == *previous) {
+                    if plan.echoes.iter().any(|e| e.block as usize == k && &e.name == name) { continue; }
+                    let r = &mut runs[k];
+                    let empty = Arc::new(Table::empty());
+                    r.s.feed(name, empty.clone(), 0.0);
+                    r.s.feed(&format!("{name}#gain"), empty, 0.0);
+                    r.s.set_param(name, "g", 0.0);
+                    r.st.restart(&r.s);
+                }
+            }
+        }
+        for e in &plan.echoes {
+            let r = &mut runs[e.block as usize];
+            if echo_into(&mut r.s, e) {
                 r.st.restart(&r.s);
             }
         }
@@ -2916,19 +3428,38 @@ impl Rounds {
             pins0: vec![0.0; r.pins.len()], pins: false, cur: 0,
         }).collect();
         let (mut exports, mut imports) = (vec![Vec::new(); runs.len()], vec![Vec::new(); runs.len()]);
-        let mut windows = Vec::with_capacity(plan.couplings.len());
+        let mut windows = Vec::with_capacity(plan.couplings.len() + plan.gain_couplings.len());
         for (c, k) in plan.couplings.iter().enumerate() {
             let r = &mut runs[k.from.0 as usize];
             r.exports.push(k.from.1);
             exports[k.from.0 as usize].push(c as u32);
             let mut w = Window::default();
-            w.push(r.st.t(), r.s.x[k.from.1 as usize], false, false);
+            w.push(r.st.t(), r.s.x[k.from.1 as usize], None, false);
             windows.push(w);
             for (to, _) in &k.to {
                 if !imports[*to as usize].contains(&(c as u32)) {
                     imports[*to as usize].push(c as u32);
                 }
             }
+        }
+        let exported: Vec<&Echo> = plan.echoes.iter().filter(|e| e.gain.is_some()).collect();
+        if exported.len() != plan.gain_couplings.len() || exported.iter().enumerate().any(|(i, e)| e.gain != Some(i as u32)) {
+            return Err(SimDiag::setup("round plan: each exported echo needs its own gain coupling, in echo order".into()));
+        }
+        for (gain, echo) in plan.gain_couplings.iter().zip(exported) {
+            if gain.of != echo.of || gain.to.0 != echo.block {
+                return Err(SimDiag::setup(format!("round plan: the gain for {} must follow its voltage into block {}", echo.name, echo.block)));
+            }
+            let (far, x) = plan.couplings[gain.of as usize].from;
+            let r = &mut runs[far as usize];
+            if !r.s.unknowns.get(gain.branch as usize).is_some_and(|u| u.kind == UnkKind::Current) {
+                return Err(SimDiag::setup(format!("round plan: the gain for {} needs an import branch in block {far}", echo.name)));
+            }
+            r.gain_exports.get_or_insert_with(Box::default).install(x, gain.branch, gain.initial);
+            exports[far as usize].push(windows.len() as u32);
+            let mut w = Window::default();
+            w.push(r.st.t(), gain.initial, None, false);
+            windows.push(w);
         }
         let loops = runs.iter().enumerate().map(|(k, r)| {
             let reads: Vec<&str> = plan.couplings.iter().flat_map(|c| &c.to).filter(|t| t.0 as usize == k).map(|t| t.1.as_str()).collect();
@@ -2941,7 +3472,7 @@ impl Rounds {
             close_points: 0, close_gap: [0; 3], close_same_block: 0, close_pairs: BTreeMap::new(),
             stop: f64::INFINITY,
         };
-        let delays = plan.couplings.iter().map(|k| k.to.iter().map(|&(to, _)| match k.lag {
+        let delays: Vec<Vec<f64>> = plan.couplings.iter().map(|k| k.to.iter().map(|&(to, _)| match k.lag {
             Lag::Same => 0.0,
             Lag::Round => round * plan.lag_rounds(k.from.0 as usize, to as usize, pipeline) as f64,
         }).collect()).collect();
@@ -2950,7 +3481,7 @@ impl Rounds {
         let voltage = plan.couplings.iter().map(|k| unknown(k).kind == UnkKind::Voltage).collect();
         let late_at = plan.couplings.iter().map(|k| k.to.iter().map(|&(to, _)| k.cut_of(to).and_then(|c| plan.cut_nodes.get(&c).cloned()).unwrap_or_else(|| unknown(k).name.clone())).collect()).collect();
         let readers = (0..runs.len() as u32).filter(|&b| imports[b as usize].iter().any(|&c| plan.couplings[c as usize].lag == Lag::Round)).collect();
-        let range = windows.iter().map(|w| (w.v[0], w.v[0])).collect();
+        let range = windows[..plan.couplings.len()].iter().map(|w| (w.v[0], w.v[0])).collect();
         let hub = Hub::new(&plan.ports, &runs);
         let mut rounds = Rounds {
             runs: runs.into_iter().map(|r| Some(Box::new(r))).collect(), done: vec![0; stages.len()], stages, slot,
@@ -2959,13 +3490,37 @@ impl Rounds {
             queue: VecDeque::new(), ctl_done: 0, flight: InFlight(None), ends: VecDeque::new(), start: t0, failed: None,
             round, shuffle: None, checks: None, posted: (0, false), packs_last: 0, pipeline, edges: false, hub_screen: false, own_bound: None,
             own: vec![false; plan.blocks.len()], grids: vec![0.0; plan.blocks.len()], plain: None, heard: Vec::new(), heard_by: vec![false; plan.blocks.len()].into(), n: 0,
+            echo_history: EchoHistory::new(plan, &delays, t0),
             couplings: plan.couplings.clone(), delays, windows, exports, imports, t0, end: t0,
             sums, cut: plan.clone(),
             loops, reprove: vec![false; plan.blocks.len()], marker: None, keep: None, sigs,
             hold: f64::INFINITY, breach: None, voltage, late_at, shadows: Shadows::new(readers, range, plan.chains.len()), hub,
         };
+        // per block new at the go-in, its holder ports' memories and the values they take
+        // (`install_new`, after the first feed)
+        let mut fresh: Vec<(usize, Vec<(u32, Option<f64>)>)> = Vec::new();
+        // from a run stepping whole every block is new, and a boundary's branch, no whole-circuit
+        // unknown, starts as its devices draw it at the go-in: through a capacitor, at the run's
+        // rates
+        let carry = match before {
+            Before::Rounds(carry, same) => Some((carry, same)),
+            Before::Whole(rates) => {
+                for (c, k) in plan.couplings.iter().enumerate() {
+                    let (b, x) = k.from;
+                    let r = rounds.runs[b as usize].as_mut().expect("a block is in its place between rounds");
+                    let Some(Quantity::Current(..)) = quantity(&r.s, x) else { continue };
+                    let now = drawn_now(&r.s, x, &rates, rounds.windows[c].t[0]).expect("a current quantity is a boundary's branch");
+                    (rounds.windows[c].v[0], rounds.shadows.range[c], r.s.x[x as usize]) = (now, (now, now), now);
+                }
+                for b in 0..rounds.runs.len() {
+                    let r = rounds.runs[b].as_ref().expect("a block is in its place between rounds");
+                    fresh.push((b, port_seeds(&r.s, b, plan, &[], &BTreeSet::new(), &mut BTreeSet::new())));
+                }
+                None
+            }
+        };
         if let Some((carry, same)) = carry {
-            let Carry { ctl_done, ends, start, windows, chains } = carry;
+            let Carry { ctl_done, ends, start, windows, rates, ports, chains, .. } = carry;
             // a chain tree whose born export, roots and members the plan keeps carries on its
             // counts: the first jumps are for a tree new to the run (Fable's chain-shadow answer)
             let old = |r: u32| same.get(r as usize).copied().flatten().map(|j| j as u32);
@@ -2979,13 +3534,81 @@ impl Rounds {
                     rounds.shadows.fresh = (rounds.shadows.fresh.0 + 1, rounds.shadows.fresh.1 - 1);
                 }
             }
-            for (c, k) in plan.couplings.iter().enumerate() {
-                let Some(j) = same.get(k.from.0 as usize).copied().flatten() else { continue };
-                if let Some((_, w)) = windows.iter().find(|(from, _)| *from == (j as u32, k.from.1)) {
+            for (c, (b, x, branch)) in plan.window_sources().enumerate() {
+                let Some(j) = same.get(b as usize).copied().flatten() else { continue };
+                if let Some((_, w, _)) = windows.iter().find(|(from, _, _)| *from == (j as u32, x, branch)) {
                     rounds.windows[c] = w.clone();
                 }
             }
             let latest = rounds.delays.iter().flatten().fold(0.0f64, |a, &d| a.max(d));
+            let span = latest + round;
+            let kept: BTreeSet<usize> = same.iter().flatten().copied().collect();
+            let mut voltages = BTreeMap::new();
+            let mut currents = BTreeMap::new();
+            for ((b, _, _), w, q) in &windows {
+                if kept.contains(&(*b as usize)) { continue; }
+                match q {
+                    Some(Quantity::Voltage(name)) => { voltages.entry(name.as_str()).or_insert(w); }
+                    Some(Quantity::Current(name, behind)) => {
+                        currents.entry(name.as_str()).or_insert_with(Vec::new).push((behind, w));
+                    }
+                    None => {}
+                }
+            }
+            let mut missing = BTreeSet::new();
+            for (c, k) in plan.couplings.iter().enumerate() {
+                let (b, x) = k.from;
+                if old(b).is_some() { continue; }
+                let r = rounds.runs[b as usize].as_ref().expect("a block is in its place between rounds");
+                let mut matched = Vec::new();
+                let (name, current) = match quantity(&r.s, x) {
+                    Some(Quantity::Voltage(name)) => {
+                        matched.extend(voltages.get(name.as_str()).copied());
+                        (name, false)
+                    }
+                    Some(Quantity::Current(name, mut behind)) => {
+                        if let Some(parts) = currents.get(name.as_str()) {
+                            // Each device must be taken exactly once across all the old draws.
+                            if parts.iter().all(|(devices, _)| devices.iter().all(|d| behind.remove(d))) && behind.is_empty() {
+                                matched.extend(parts.iter().map(|&(_, w)| w));
+                            }
+                        }
+                        (name, true)
+                    }
+                    None => continue,
+                };
+                let t0 = rounds.windows[c].t[0];
+                if !matched.is_empty() {
+                    rounds.windows[c] = Window::from_history(&matched, t0, span);
+                } else if current {
+                    // a branch no whole-circuit unknown is: the go-in seeded nothing there
+                    let now = drawn_now(&r.s, x, &rates, t0).expect("a current quantity is a boundary's branch");
+                    rounds.windows[c].v[0] = now;
+                    missing.insert(name);
+                } else {
+                    missing.insert(name);
+                    continue;
+                }
+                let w = &rounds.windows[c];
+                let now = w.v[w.v.len() - 1];
+                rounds.shadows.range[c] = w.v.iter().fold((now, now), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+                if current {
+                    rounds.runs[b as usize].as_mut().expect("a block is in its place between rounds").s.x[x as usize] = now;
+                }
+            }
+            if !missing.is_empty() {
+                let names = missing.into_iter().collect::<Vec<_>>().join(", ");
+                eprintln!("fab-elec live: the new cut starts {names} at the present (a current as its devices draw it): no old export of the same quantity");
+            }
+            let mut rested = BTreeSet::new();
+            for b in (0..rounds.runs.len()).filter(|&b| old(b as u32).is_none()) {
+                let r = rounds.runs[b].as_ref().expect("a block is in its place between rounds");
+                fresh.push((b, port_seeds(&r.s, b, plan, &ports, &kept, &mut rested)));
+            }
+            if !rested.is_empty() {
+                let names = rested.into_iter().collect::<Vec<_>>().join(", ");
+                eprintln!("fab-elec live: the new cut starts the memories of {names} at their equilibrium: no running port of the same consumer");
+            }
             let need = (ctl_done + 1).saturating_sub((latest / round).round() as u64);
             if !pipeline || need == 0 || ends.front().is_some_and(|e| e.0 <= need) {
                 rounds.done = vec![ctl_done; rounds.stages.len()];
@@ -2997,6 +3620,12 @@ impl Rounds {
             if let Some(name) = rounds.feed(b, t0, f64::INFINITY, rounds.ctl_done + 1, None) {
                 return Err(SimDiag::setup(format!("round plan: {name} in block {b} takes no table: not a boundary source")));
             }
+        }
+        for (b, memories) in &fresh {
+            install_new(rounds.runs[*b].as_mut().expect("a block is in its place between rounds"), memories, t0);
+        }
+        for &b in refit.iter().filter(|&&b| fresh.iter().all(|f| f.0 != b)) {
+            take_first_again(rounds.runs[b].as_mut().expect("a block is in its place between rounds"), t0);
         }
         Ok(rounds)
     }
@@ -3017,11 +3646,31 @@ impl Rounds {
                 Some(_) => 0.0,
                 None => self.grids[holder as usize],
             };
-            let lands = self.cut.lands.binary_search(&(c, holder)).is_ok();
+            let land_step = self.cut.land_step(c, holder);
             let read = Read { pipeline: self.pipeline, round: self.round, ends: &self.ends, start: self.start };
-            let (points, _) = read.table(&self.windows[c as usize], t0, end, m, delay, grid, lands, self.own[holder as usize]);
+            let (points, _) = read.table(&self.windows[c as usize], t0, end, m, delay, grid, land_step, self.own[holder as usize]);
             Some((p.name.clone(), Arc::new(points), delay))
         }).collect()
+    }
+
+    /// Replay the far block's actual reads. A gap sends an empty table to clear the echo.
+    fn echo_tables(&self, b: usize, t0: f64, end: f64, m: u64) -> Vec<(String, Arc<Table>, f64)> {
+        let Some(h) = &self.echo_history else { return Vec::new() };
+        let Some(indices) = h.blocks.get(&b) else { return Vec::new() };
+        let read = Read { pipeline: self.pipeline, round: self.round, ends: &self.ends, start: self.start };
+        let mut feeds = Vec::with_capacity(2 * indices.len());
+        for &i in indices {
+            let tr = &h.tracks[i];
+            let table = if end.is_finite() { tr.table(t0, end) } else { Table::empty() };
+            let echo = &self.cut.echoes[i];
+            feeds.push((echo.name.clone(), Arc::new(table), tr.delay));
+            let Some(gi) = echo.gain.map(|g| g as usize) else { continue };
+            let gain = &self.cut.gain_couplings[gi];
+            let w = &self.windows[self.couplings.len() + gi];
+            let table = read.gain_table(w, t0, end, m, tr.delay);
+            feeds.push((gain.to.1.clone(), Arc::new(table), tr.delay));
+        }
+        feeds
     }
 
     /// What block `b`'s feed for round `m` takes from the shadows before it reads: whether the round
@@ -3044,6 +3693,7 @@ impl Rounds {
         // a block on its own bound follows its imports: their crossings are data to it
         let crossings_as_data = self.own[b];
         let ports = self.port_tables(b, t0, end, m);
+        let echoes = self.echo_tables(b, t0, end, m);
         let run = self.runs[b].as_deref_mut().expect("a block is fed in its place");
         // a split reads a sample further back: the knots of a jump's line before the round
         let grid = if self.edges { run.st.grid() } else { 0.0 };
@@ -3057,11 +3707,19 @@ impl Rounds {
         let mut splits = Vec::new();
         // a long tree's member in a round it follows keeps what the run fed it (`follows`)
         let mut fed = Vec::new();
+        for (name, table, delay) in echoes {
+            if !run.s.feed(&name, table.clone(), delay) {
+                refused.get_or_insert_with(|| name.clone());
+            }
+            if follows {
+                fed.push((name, delay, table));
+            }
+        }
         for &c in &self.imports[b] {
             let k = &self.couplings[c as usize];
             let mut table = None;
             let mut split = false;
-            let lands = self.cut.lands.binary_search(&(c, b as u32)).is_ok();
+            let land_step = self.cut.land_step(c, b as u32);
             for ((to, name), &delay) in k.to.iter().zip(&self.delays[c as usize]) {
                 if *to as usize != b {
                     continue;
@@ -3069,12 +3727,21 @@ impl Rounds {
                 // Every source in this block reads this coupling with the same stage delay.
                 let table = table.get_or_insert_with(|| {
                     let read = Read { pipeline: self.pipeline, round: self.round, ends: &self.ends, start: self.start };
-                    let (points, jumps) = read.table(&self.windows[c as usize], t0, end, m, delay, grid, lands, crossings_as_data);
+                    let (points, jumps) = read.table(&self.windows[c as usize], t0, end, m, delay, grid, land_step, crossings_as_data);
                     split = jumps > 0;
                     Arc::new(points)
                 });
                 if !run.s.feed(name, table.clone(), delay) {
                     refused.get_or_insert_with(|| name.clone());
+                } else if let Some(h) = self.echo_history.as_mut() {
+                    h.record(b, c, t0, end, table);
+                    // The snapshot already has the feeds through mark_keep. Include later stages'
+                    // live reads up to the marked instant as those stages catch up.
+                    if let Some(keep) = self.keep.as_deref_mut().filter(|k| end <= k.t) {
+                        if let Some(snapshot) = keep.rounds.echo_history.as_mut() {
+                            snapshot.record(b, c, t0, end, table);
+                        }
+                    }
                 }
                 if self.hub_screen {
                     self.hub.read(&mut run.hub, b, name, table, delay);
@@ -3171,6 +3838,9 @@ impl Rounds {
     /// O(points).
     fn export(&mut self, b: usize, m: u64) {
         let run = self.runs[b].as_deref_mut().expect("a block exports in its place");
+        if let Some(h) = self.echo_history.as_mut() {
+            h.completed(b, run.st.t());
+        }
         let taken = run.shadow.take();
         if let Some(o) = self.shadows.open.iter_mut().find(|o| o.b as usize == b && o.m == m && o.ran.is_none()) {
             o.run = o.run.take().or(taken);
@@ -3179,7 +3849,7 @@ impl Rounds {
             // export a later stage joins to the round's tree included)
             if o.trees > 0 {
                 let from = o.t0 - self.round;
-                for &q in &self.exports[b] {
+                for &q in &self.exports[b][..run.exports.len()] {
                     if self.cut.chains.iter().any(|ch| ch.pairs.iter().any(|p| p.0 == q)) {
                         o.before.push((q, self.windows[q as usize].since(from)));
                     }
@@ -3189,10 +3859,18 @@ impl Rounds {
         if let Some(f) = self.shadows.follow.iter_mut().find(|f| f.b as usize == b && f.m == m && f.ran.is_none()) {
             f.ran = Some(Arc::new(Ran::of(&run.rec)));
         }
-        let (rec, n) = (&mut run.rec, run.exports.len());
+        let n = run.export_width();
+        let rec = &mut run.rec;
         let mut breach = None;
         for (j, &c) in self.exports[b].iter().enumerate() {
             let w = &mut self.windows[c as usize];
+            if j >= run.exports.len() {
+                let gain = &self.cut.gain_couplings[c as usize - self.couplings.len()];
+                // The same extra held knot as X when the physical export relays a short edge.
+                let relays = self.cut.lands.iter().any(|&(q, _)| q == gain.of);
+                pass_on(w, rec, n, j, relays, self.edges, |_, _| {});
+                continue;
+            }
             // a coupling the plan lands a jump through passes an imported event on
             let relays = self.cut.lands.iter().any(|&(q, _)| q == c);
             let from = w.t.last().copied().unwrap_or(f64::NEG_INFINITY);
@@ -3299,7 +3977,7 @@ impl Rounds {
                 for &(k, _) in &self.couplings[c as usize].to {
                     if !reach[k as usize] {
                         reach[k as usize] = true;
-                        todo.extend_from_slice(&self.exports[k as usize]);
+                        todo.extend(self.exports[k as usize].iter().copied().take_while(|&q| (q as usize) < self.couplings.len()));
                     }
                 }
             }
@@ -3382,21 +4060,34 @@ impl Rounds {
 
     /// A plan that cuts the run as it runs (`runs_cut`) brings its holder ports as fitted at the
     /// run's state: each block whose port it fits otherwise takes the new impedance and restarts
-    /// its step, as after an edit. Between rounds. O(ports).
+    /// its step, as after an edit, its newest point's charges taken again with the new impedance
+    /// (`take_first_again`: `tau w` and `-l e` are the port's state, which a refit does not
+    /// move). Between rounds. O(ports), and O(the block's devices) per block refitted.
     pub(crate) fn renew_ports(&mut self, ports: &[HolderPort]) {
         for p in ports {
             let b = self.runs[p.block as usize].as_deref_mut().expect("a block is in its place between rounds");
             if port_into(&mut b.s, p) {
                 b.st.restart(&b.s);
+                let t = b.st.t();
+                take_first_again(b, t);
             }
         }
         self.cut.ports = ports.to_vec();
+        // same_cut includes the echo gains, so these are the renewing plan's gains too.
+        for e in &self.cut.echoes {
+            let b = self.runs[e.block as usize].as_deref_mut().expect("a block is in its place between rounds");
+            if echo_into(&mut b.s, e) {
+                b.st.restart(&b.s);
+            }
+        }
     }
 
-    /// A plan that cuts the run as it runs (`runs_cut`) brings its proof, made from the run's
-    /// state after every edit: it replaces the one kept.
-    pub(crate) fn renew_proof(&mut self, proof: Option<Arc<crate::analysis::round::RoundProof>>) {
-        self.cut.proof = proof;
+    /// A plan that cuts the run as it runs (`runs_cut`) brings its proof and its landed pairs' step
+    /// bars, made from the run's state after every edit: they replace the ones kept. The windows
+    /// keep each event's step, so the next read screens by the new bars.
+    pub(crate) fn renew_proof(&mut self, plan: &RoundPlan) {
+        self.cut.proof = plan.proof.clone();
+        self.cut.land_steps = plan.land_steps.clone();
     }
 
     /// Every block, in block order. Between rounds every block is in its place.
@@ -3437,7 +4128,8 @@ impl Rounds {
 
     /// Whether these rounds already run `plan` with `solvers`: the same cut (`RoundPlan::same_cut`),
     /// the same imports landing (`RoundPlan::lands`: a chain landed, or an import the plan's test
-    /// lands now, is a plan that goes in) and each block's solver with the same unknowns and the
+    /// lands now, is a plan that goes in; their step bars are renewed with the proof,
+    /// `renew_proof`) and each block's solver with the same unknowns and the
     /// same instances, by name, read with the blocks anywhere (`BlockSig`). O(unknowns + instances).
     pub(crate) fn runs_cut(&self, plan: &RoundPlan, solvers: &[Solver]) -> bool {
         self.cut.same_cut(plan) && self.cut.lands == plan.lands && solvers.len() == self.sigs.len() && self.sigs.iter().zip(solvers).all(|(sig, s)| sig.matches(s))
@@ -3460,9 +4152,27 @@ impl Rounds {
     /// Taken apart for a plan that cuts the run anew: what its rounds carry on (`Carry`) and the
     /// runs, in block order, every block in its place (`settle` first).
     pub(crate) fn into_parts(self) -> (Carry, Vec<Run>) {
-        let windows = self.couplings.iter().map(|k| k.from).zip(self.windows).collect();
+        let windows = self.cut.window_sources().zip(self.windows).map(|(source, w)| {
+            let (b, x, branch) = source;
+            let r = self.runs[b as usize].as_ref().expect("a block is in its place between rounds");
+            (source, w, if branch.is_none() { quantity(&r.s, x) } else { None })
+        }).collect();
+        let mut rates = BTreeMap::new();
+        for r in self.runs.iter().flatten() {
+            let xdot = &r.st.hist.newest().xdot;
+            for &(l, _) in &r.own {
+                rates.insert(r.s.unknowns[l as usize].name.clone(), xdot.get(l as usize).copied().unwrap_or(0.0));
+            }
+        }
+        let ports = self.cut.ports.iter().filter_map(|p| {
+            let r = self.runs[p.block as usize].as_ref().expect("a block is in its place between rounds");
+            let (behind, unks) = port_memories(&r.s, p, &self.cut.couplings)?;
+            let x = r.st.newest_x();
+            Some(PortMemory { block: p.block, name: p.name.clone(), behind, w: unks.map(|u| u.map(|u| x[u as usize])) })
+        }).collect();
+        let echoes = self.cut.echoes.iter().map(|e| (e.block, e.name.clone())).collect();
         let chains = self.cut.chains.iter().zip(self.shadows.seen).map(|(ch, seen)| (self.couplings[ch.born as usize].from, ch.roots.clone(), ch.members.clone(), seen)).collect();
-        let carry = Carry { ctl_done: self.ctl_done, ends: self.ends, start: self.start, windows, chains };
+        let carry = Carry { ctl_done: self.ctl_done, ends: self.ends, start: self.start, windows, rates, ports, chains, echoes };
         (carry, self.runs.into_iter().map(|r| *r.expect("a block is in its place between rounds")).collect())
     }
 
@@ -3635,8 +4345,10 @@ impl Rounds {
             let mut feeds = Vec::new();
             for &c in self.imports[b].iter().filter(late) {
                 let k = &self.couplings[c as usize];
-                let mut points = self.windows[c as usize].table_to(t0 - grid, end);
-                let lands = self.cut.lands.binary_search(&(c, b as u32)).is_ok();
+                // screened by the reader's step bar as its live read was, so only lateness differs
+                let land_step = self.cut.land_step(c, b as u32);
+                let mut points = self.windows[c as usize].table(t0 - grid, Some(end), land_step);
+                let lands = land_step.is_some();
                 if let Some((fed, _)) = points.split(grid, 0.0, t0, None, end, end).filter(|_| !lands) {
                     points = fed;
                 }
@@ -3647,7 +4359,7 @@ impl Rounds {
                 let table = Arc::new(points);
                 feeds.extend(k.to.iter().filter(|t| t.0 as usize == b).map(|t| (t.1.clone(), table.clone())));
             }
-            let ranges = self.exports[b].iter().map(|&c| self.shadows.range[c as usize]).collect();
+            let ranges = self.exports[b].iter().take(run.exports.len()).map(|&c| self.shadows.range[c as usize]).collect();
             let peak = if self.hold.is_finite() { self.hold / crate::livesim::HOLD } else { 1.0 };
             jobs.push(Shadow { b: id, m, burst, t0, run, feeds, ran, ranges, peak, bar: self.shadow_bar(b) });
         }
@@ -3892,7 +4604,7 @@ impl Rounds {
                 }
                 let outs = windows.iter().enumerate().filter(|(_, w)| self.couplings[w.0 as usize].from.0 == r)
                     .filter_map(|(w, x)| self.exports[r as usize].iter().position(|&c| c == x.0).map(|e| (w, e))).collect();
-                let ranges = self.exports[r as usize].iter().map(|&c| self.shadows.range[c as usize]).collect();
+                let ranges = self.exports[r as usize].iter().take(run.exports.len()).map(|&c| self.shadows.range[c as usize]).collect();
                 let mut later = Vec::with_capacity(long as usize);
                 for j in 1..=long {
                     match followed(&self.shadows.follow, r, m + j) {
@@ -4773,6 +5485,26 @@ impl Rounds {
         }
     }
 
+    /// The blocks' rates at their newest points into `xdot`, by the whole circuit's unknowns as
+    /// `compose` puts their values: for a whole stepper resumed from them, whose resume starts
+    /// at zero rates. O(the blocks' unknowns).
+    pub(crate) fn compose_rates(&self, xdot: &mut [f64]) {
+        for &g in &self.sums {
+            xdot[g as usize] = 0.0;
+        }
+        for r in self.runs() {
+            let rates = &r.st.hist.newest().xdot;
+            for (j, &(l, g)) in r.own.iter().enumerate() {
+                let v = rates.get(l as usize).copied().unwrap_or(0.0);
+                if j < r.set {
+                    xdot[g as usize] = v;
+                } else {
+                    xdot[g as usize] += v;
+                }
+            }
+        }
+    }
+
     /// Marks the end of the round block 0 has finished (where the run stands at a round start)
     /// for a snapshot of every block there in `whole`, `compose`'s, bit for bit: block 0 now,
     /// each later stage as it exports that round (`pass_marker`), a stage already past it now.
@@ -4840,6 +5572,12 @@ impl Rounds {
     /// The rounds as they stand at a round start with every stage caught up, from block 0 as it
     /// is: the later stages' blocks to come (`pass_keep`), no work out, no merge side yet.
     fn skeleton(&self) -> Rounds {
+        let mut echo_history = self.echo_history.clone();
+        if let Some(h) = echo_history.as_mut() {
+            let end = self.ctl().st.t();
+            for tr in &mut h.tracks { tr.next = end - tr.delay; }
+            h.trim();
+        }
         Rounds {
             runs: self.runs.iter().enumerate().map(|(k, r)| if k == 0 { r.clone() } else { None }).collect(),
             id: self.id, side: None, pins: self.pins, merge_flight: InFlight(None), rows: MergeRows::default(),
@@ -4848,7 +5586,7 @@ impl Rounds {
             ends: self.ends.clone(), start: self.start, failed: None, round: self.round, shuffle: self.shuffle, checks: self.checks.clone(), posted: (0, false), packs_last: self.packs_last,
             pipeline: self.pipeline, edges: self.edges, hub_screen: self.hub_screen, own_bound: self.own_bound.clone(), own: self.own.clone(), grids: self.grids.clone(),
             plain: self.plain, heard: self.heard.clone(), heard_by: self.heard_by.clone(), n: self.n, couplings: self.couplings.clone(),
-            delays: self.delays.clone(), windows: self.windows.clone(), exports: self.exports.clone(),
+            delays: self.delays.clone(), echo_history, windows: self.windows.clone(), exports: self.exports.clone(),
             imports: self.imports.clone(), t0: self.t0, end: self.end, sums: self.sums.clone(), cut: self.cut.clone(),
             loops: self.loops.clone(), reprove: self.reprove.clone(), marker: self.marker.clone(), keep: None,
             sigs: self.sigs.clone(), hold: self.hold, breach: None, voltage: self.voltage.clone(), late_at: self.late_at.clone(),

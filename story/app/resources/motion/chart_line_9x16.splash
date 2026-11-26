@@ -1,0 +1,83 @@
+use mod.motion.*
+// LINE CHART, 9:16 — the portrait cut of chart_line: the plot fills the
+// safe column (x 120–920, baseline y 1120). Original notes follow.
+// LINE CHART — gridlines draw, then the line is drawn left to right on
+// ease_in_out_cubic while a soft area fill is wiped in under it on the
+// same curve. Points pop as the pen reaches them, and the last point
+// grows a value chip: the chart ends on the number to remember.
+// Why: the pen makes the trend a story told in time (the viewer watches
+// it fall), and ending on a labelled point gives the conclusion.
+// Plot: x 120–920, y = 1120 − value × 5.2 (0–100 axis).
+let values = [in(@p1), in(@p2), in(@p3), in(@p4), in(@p5), in(@p6), in(@p7)]
+let points = []
+for i in 0..7 { points.push(vec2(120 + i * 133.33, 1120 - values[i] * 5.2)) }
+// when the eased pen reaches each point (for the default data; close enough for any)
+let arrive = [0.7, 1.32, 1.48, 1.6, 1.71, 1.87, 2.5]
+let dots = []
+for i in 0..6 {
+    dots.push(Group{at: points[i] layers: [
+        Ellipse{at: vec2(-11, -11) size: vec2(22, 22) fill: in(@background) stroke: in(@accent) width: 6
+                scale: tween(0, 1, arrive[i], arrive[i] + 0.4, @ease_out_back)}
+    ]})
+}
+let area = []
+for i in 0..7 { area.push(points[i]) }
+area.push(vec2(920, 1120))
+area.push(vec2(120, 1120))
+Motion{
+    label: "Line chart 9:16"
+    brief: "A line drawn across a grid with an area fill, popping points and a final value chip; portrait."
+    tags: ["chart", "data", "line", "trend", "infographic", "9:16"]
+    size: vec2(1080, 1920) duration: 6.0
+    inputs: {
+        title: input(@text, "Render time, per minute of video", "Chart title")
+        note: input(@text, "Seconds, last seven releases", "Units and period")
+        p1: input(@number, 82, "Point 1, 0–100") p2: input(@number, 74) p3: input(@number, 77) p4: input(@number, 58)
+        p5: input(@number, 49) p6: input(@number, 36) p7: input(@number, 21, "Last point (labelled)")
+        last: input(@text, "21 s", "Chip on the last point")
+        accent: input(@color, #ff5c39, "Line, points and chip")
+        area_fill: input(@color, #ff5c3926, "Area under the line")
+        ink: input(@color, #f4f7fa, "Title")
+        muted: input(@color, #8e9aa7, "Note")
+        grid: input(@color, #ffffff14, "Gridlines")
+        background: input(@color, #0b0d12, "Ground")
+    }
+    layers: [
+        Rect{size: vec2(1080, 1920) fill: in(@background)}
+        Group{
+            opacity: tween(1, 0, 5.55, 6.0, @ease_in_cubic)
+            layers: [
+                Text{text: in(@title) font: Font{family: "Inter" weight: 700} size: 64 tracking: -0.02 color: in(@ink) at: vec2(100, 300) wrap: 840
+                     opacity: tween(0, 1, 0.0, 0.5, @ease_out_cubic) y: tween(20, 0, 0.0, 0.8, @ease_out_quint)}
+                Text{text: in(@note) font: Font{family: "Inter"} size: 32 color: in(@muted) at: vec2(100, 470) wrap: 840
+                     opacity: tween(0, 1, 0.15, 0.65, @ease_out_cubic) y: tween(20, 0, 0.15, 0.95, @ease_out_quint)}
+                Group{stagger: 0.05 layers: [
+                    Rect{at: vec2(120, 1119) size: tween(vec2(0, 2), vec2(800, 2), 0.2, 1.0, @ease_in_out_quint) fill: in(@grid)}
+                    Rect{at: vec2(120, 989) size: tween(vec2(0, 2), vec2(800, 2), 0.2, 1.0, @ease_in_out_quint) fill: in(@grid)}
+                    Rect{at: vec2(120, 859) size: tween(vec2(0, 2), vec2(800, 2), 0.2, 1.0, @ease_in_out_quint) fill: in(@grid)}
+                    Rect{at: vec2(120, 729) size: tween(vec2(0, 2), vec2(800, 2), 0.2, 1.0, @ease_in_out_quint) fill: in(@grid)}
+                    Rect{at: vec2(120, 599) size: tween(vec2(0, 2), vec2(800, 2), 0.2, 1.0, @ease_in_out_quint) fill: in(@grid)}
+                ]}
+                // the area, wiped in with the pen
+                Group{
+                    mask: Rect{at: vec2(120, 560) size: tween(vec2(0, 560), vec2(800, 560), 0.7, 2.5, @ease_in_out_cubic)}
+                    layers: [Path{points: area closed: true fill: in(@area_fill)}]
+                }
+                Path{points: points stroke: in(@accent) width: 8 cap: @round join: @round
+                     trim_end: tween(0, 1, 0.7, 2.5, @ease_in_out_cubic)}
+                Group{layers: dots}
+                // the last point: a solid dot, a ring, and the chip
+                Group{at: points[6] layers: [
+                    Ellipse{at: vec2(-17, -17) size: vec2(34, 34) fill: in(@accent) scale: tween(0, 1, 2.45, 2.95, @ease_out_back)}
+                    Ellipse{at: vec2(-60, -60) size: vec2(120, 120) stroke: in(@accent) width: 3
+                            scale: tween(0.3, 1.0, 2.5, 3.3, @ease_out_expo)
+                            opacity: keys([2.5, 0.0], [2.52, 0.8], [3.3, 0.0, @ease_out_cubic])}
+                    Text{text: in(@last) font: Font{family: "Inter" weight: 700} size: 40 color: in(@background)
+                         at: vec2(-20, -110) wrap: 300 align: @right
+                         plate: in(@accent) plate_pad: vec2(20, 10) plate_radius: 10
+                         anchor: vec2(1, 1) scale: tween(0, 1, 2.7, 3.2, @ease_out_back) opacity: tween(0, 1, 2.7, 2.85, @ease_out_cubic)}
+                ]}
+            ]
+        }
+    ]
+}

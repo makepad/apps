@@ -1,0 +1,9 @@
+use mod.scene.*
+Scene3D{ look: @ink
+  camera: Camera{position: vec3(0, 2.2, 7) target: vec3(0, 0.8, 0) fov: 40}
+  children: [
+    Mesh{geometry: TorusKnotGeometry{radius: 0.7 tube: 0.25} position: vec3(-1.6, 1.1, 0) material: MeshStandardMaterial{color: #ff5a36}}
+    Mesh{geometry: BoxGeometry{width: 1.2 height: 1.2 depth: 1.2} position: vec3(0.6, 0.6, 0) rotation: vec3(0, 30, 0) material: MeshStandardMaterial{color: #3f7cff}}
+    Mesh{geometry: SphereGeometry{radius: 0.6} position: vec3(2.2, 0.6, 0.4) material: MeshStandardMaterial{color: #f2c14e}}
+    Mesh{geometry: PlaneGeometry{width: 20 height: 20} rotation: vec3(-90, 0, 0) material: MeshStandardMaterial{color: #e8dcc0}}
+  ] }

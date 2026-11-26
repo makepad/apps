@@ -406,6 +406,9 @@ fn lower_with_packages(input: &LowerInput, generation: u64, libs: &ModelLibs, so
             if net.supply {
                 circuit.declare_supply(name);
             }
+            if net.heard {
+                circuit.declare_heard(name);
+            }
         }
         index.add_net(net.id);
         plan.nets.push(name.to_owned());

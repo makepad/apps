@@ -1,0 +1,202 @@
+use mod.motion.*; use mod.kernel
+// Plotter strokes for Draw2D layers: polylines drawn on by length, each over its own time, glowing where the pen just passed, under a 2D camera with a hand tremor — one kernel for every stroke.
+//
+// The drawing is data, built once with `strokes_data([...], {max_zoom})` from a list of strokes:
+//   {pts: [x0, y0, x1, y1, …] (world units)  t0: 1.2  t1: 2.0  (drawn on over [t0, t1])
+//    ease: @ease_out_cubic  width: 1.5  alpha: 0.8  color: #eee9df  glow: 1  (0: no pen glow)  group: 0
+//    dash: 0  (on+off period in px, 0: solid; `max_zoom` is the largest camera zoom a dashed stroke
+//    is seen at, so its pieces are short enough)}
+// The pen passes each point when the eased head reaches it, and the glow follows the pen.
+// Draw it every frame with one call; the kernel cuts each stroke at its head, colours fresh
+// segments with the pen's glow and fades the stroke's group:
+//
+//   use mod.motion.modules.strokes.*
+//   let ART = strokes_data(SKETCH, {})             // SKETCH: the list above, at load
+//   Draw2D{draw: fn(c, t, edit) {
+//       draw_strokes(c, ART, {clock: 16.6 camera: {x: 0 y: 0 zoom: 120 rot: 0} tremor: 0
+//           groups: [1.0] hot: #ff4d12 core: #ff8a3d})
+//   }}
+// `clock` is added to the layer's time (strokes timed in song seconds); `camera` maps world to
+// the frame (world y up, the frame's centre `center`, default 960 x 540); `tremor` (0..2) shakes
+// the pen by value noise (5 px at 1); `groups` the per-group alpha this frame (0..1); `hot`,
+// `core` the glow's colours (default an ember orange). `stroke_pass_time(@ease, f)` is when (0..1
+// of its time) the eased head passes f of the length; a document that walks the same strokes (a
+// pen riding them) eases with `ease(@ease, u)`, the curve the kernel draws by.
+
+// The pen's tremor at a world point: value noise over the point, moving 24 times a second, -1..1.
+let stroke_tremor = fn(x, y, now, seed) {
+    let z = now * 24.0
+    let iz = floor(z)
+    let f = z - iz
+    let a = vnoise(x + iz * 17.13, y - iz * 31.7, seed)
+    let b = vnoise(x + (iz + 1.0) * 17.13, y - (iz + 1.0) * 31.7, seed)
+    return a + (b - a) * (f * f * f * (f * (f * 6.0 - 15.0) + 10.0))
+}
+
+// One element per point: the segment from the point before it (in the same stroke), cut at the
+// stroke's head, in the frame's coordinates.
+let strokes_kernel = Kernel{
+    count: 1
+    points: kernel.input(vec4, [])        // x, y, length along the stroke, time the pen passes
+    stroke_of: kernel.input(f32, [])      // the point's stroke
+    timing: kernel.input(vec4, [])        // per stroke: t0, t1, ease (ease_id), total length
+    look: kernel.input(vec4, [])          // per stroke: width, alpha, glow, group
+    color: kernel.input(vec4, [])         // per stroke: linear rgb, dash period (px)
+    groups: kernel.input(f32, [])         // per group: alpha this frame
+    pens: kernel.input(vec4, [])          // [hot, core] linear colours
+    clock: kernel.param(0.0)
+    cam_x: kernel.param(0.0)
+    cam_y: kernel.param(0.0)
+    cam_zoom: kernel.param(1.0)
+    cam_rot: kernel.param(0.0)
+    center_x: kernel.param(960.0)
+    center_y: kernel.param(540.0)
+    tremor: kernel.param(0.0)
+    out: kernel.emit_buffer(kernel.Segment, 4)
+    element: fn(i) {
+        if i == 0 { return }
+        let s = int(stroke_of[i])
+        if int(stroke_of[i - 1]) != s { return }
+        let now = time + clock
+        let tm = timing[s]
+        let lk = look[s]
+        if now < tm.x || lk.y <= 0.0 { return }
+        let ga = groups[int(lk.w)]
+        if ga <= 0.002 { return }
+        let head = float(ease.apply_d(int(tm.z), clamp((now - tm.x) / max(0.0001, tm.y - tm.x), 0.0, 1.0), 0.0, 0.0, 0.0, 0.0, 0.0)) * tm.w
+        let p0 = points[i - 1]
+        let p1 = points[i]
+        if p0.z >= head { return }
+        var b = vec2(p1.x, p1.y)
+        var cut = p1.z
+        if p1.z > head {
+            b = mix(vec2(p0.x, p0.y), b, (head - p0.z) / max(0.000000001, p1.z - p0.z))
+            cut = head
+        }
+        // world (y up) to the frame, with the pen's tremor in px
+        let co = cos(cam_rot)
+        let si = sin(cam_rot)
+        let wa = vec2((p0.x - cam_x) * cam_zoom, (cam_y - p0.y) * cam_zoom)
+        let wb = vec2((b.x - cam_x) * cam_zoom, (cam_y - b.y) * cam_zoom)
+        var sa = vec2(center_x + co * wa.x - si * wa.y, center_y + si * wa.x + co * wa.y)
+        var sb = vec2(center_x + co * wb.x - si * wb.y, center_y + si * wb.x + co * wb.y)
+        if tremor > 0.001 {
+            let amp = tremor * 5.0
+            sa = sa + vec2(stroke_tremor(p0.x * 2.3, p0.y * 2.3, now, 1.0), stroke_tremor(p0.x * 2.3 + 7.0, p0.y * 2.3, now, 2.0)) * amp
+            sb = sb + vec2(stroke_tremor(b.x * 2.3, b.y * 2.3, now, 1.0), stroke_tremor(b.x * 2.3 + 7.0, b.y * 2.3, now, 2.0)) * amp
+        }
+        // the pen's glow: hot where it just passed, the core hotter still
+        let age = now - min(p1.w, now)
+        let h1 = lk.z * exp(-age / 0.05)
+        let h2 = lk.z * exp(-age / 0.32)
+        let base = color[s]
+        let hot = pens[0]
+        let core = pens[1]
+        let rgb = vec3(base.x, base.y, base.z) * (1.0 - h2) + vec3(hot.x, hot.y, hot.z) * (1.5 * h2) + vec3(core.x, core.y, core.z) * (2.6 * h1)
+        let alpha = min(1.0, lk.y * ga + h2 * 0.8 * ga)
+        let width = lk.x * (1.0 + 0.6 * h1)
+        let dash = base.w
+        if dash <= 0.0 {
+            emit(out, Segment{a: vec3(sa.x, sa.y, 0.0) b: vec3(sb.x, sb.y, 0.0) color: vec4(rgb, alpha) width: width})
+            return
+        }
+        // dashed: the on parts (55% of each period) along the stroke, in px
+        let px0 = p0.z * cam_zoom
+        let px1 = cut * cam_zoom
+        var k = floor(px0 / dash)
+        for j in 0..4 {
+            let on0 = max(px0, k * dash)
+            let on1 = min(px1, k * dash + dash * 0.55)
+            if on1 > on0 && px1 > px0 {
+                let u0 = (on0 - px0) / (px1 - px0)
+                let u1 = (on1 - px0) / (px1 - px0)
+                let qa = mix(sa, sb, u0)
+                let qb = mix(sa, sb, u1)
+                emit(out, Segment{a: vec3(qa.x, qa.y, 0.0) b: vec3(qb.x, qb.y, 0.0) color: vec4(rgb, alpha) width: width})
+            }
+            k = k + 1.0
+        }
+    }
+}
+
+// When the eased head reaches `target` (0..1 of the length): the ease inverted by bisection.
+let stroke_pass_time = fn(e, target) {
+    var lo = 0.0
+    var hi = 1.0
+    for k in 0..18 {
+        let m = (lo + hi) / 2.0
+        if ease(e, m) < target { lo = m } else { hi = m }
+    }
+    return hi
+}
+
+// The kernel's inputs from a list of strokes (see the header), once at load.
+let strokes_data = fn(list, o) {
+    let max_zoom = o.max_zoom ?? 1.0
+    let points = []
+    let stroke_of = []
+    let timing = []
+    let look = []
+    let color = []
+    var s = 0
+    for st in list {
+        let given = st.pts
+        let dash = st.dash ?? 0.0
+        // a dashed stroke in pieces of at most three dash periods at the largest zoom (the kernel
+        // draws up to four dashes a piece)
+        var p = given
+        if dash > 0.0 {
+            let step = 3.0 * dash / max_zoom
+            p = [given[0], given[1]]
+            for i in 1..(given.len() / 2) {
+                let ax = given[2 * i - 2]
+                let ay = given[2 * i - 1]
+                let bx = given[2 * i]
+                let by = given[2 * i + 1]
+                let pieces = max(1.0, ceil(sqrt((bx - ax) * (bx - ax) + (by - ay) * (by - ay)) / step))
+                for k in 1..(pieces + 1.0) {
+                    p.push(ax + (bx - ax) * k / pieces)
+                    p.push(ay + (by - ay) * k / pieces)
+                }
+            }
+        }
+        let n = p.len() / 2
+        let t0 = st.t0
+        let t1 = st.t1
+        var total = 0.0
+        let lengths = [0.0]
+        for i in 1..n {
+            let dx = p[2 * i] - p[2 * i - 2]
+            let dy = p[2 * i + 1] - p[2 * i - 1]
+            total = total + sqrt(dx * dx + dy * dy)
+            lengths.push(total)
+        }
+        let e = st.ease ?? @ease_out_cubic
+        for i in 0..n {
+            let f = if total > 0.0 { lengths[i] / total } else { 1.0 }
+            points.push(vec4(p[2 * i], p[2 * i + 1], lengths[i], t0 + (t1 - t0) * stroke_pass_time(e, f)))
+            stroke_of.push(s)
+        }
+        timing.push(vec4(t0, t1, ease_id(e), total))
+        look.push(vec4(st.width ?? 1.5, st.alpha ?? 1.0, st.glow ?? 1.0, st.group ?? 0.0))
+        let rgb = linear_rgb(st.color ?? #eee9df)
+        color.push(vec4(rgb.x, rgb.y, rgb.z, dash))
+        s = s + 1
+    }
+    // frozen: the kernel's inputs are flattened once, not every frame
+    return {points: points.freeze() stroke_of: stroke_of.freeze() timing: timing.freeze() look: look.freeze() color: color.freeze() count: points.len()}
+}
+
+// Draw the strokes on `c` this frame (see the header for `o`).
+let draw_strokes = fn(c, data, o) {
+    let cam = o.camera ?? {x: 0.0 y: 0.0 zoom: 1.0 rot: 0.0}
+    let center = o.center ?? vec2(960.0, 540.0)
+    let hot = linear_rgb(o.hot ?? #ff4d12)
+    let core = linear_rgb(o.core ?? #ff8a3d)
+    c.segs(strokes_kernel.out, {with: {count: data.count points: data.points stroke_of: data.stroke_of timing: data.timing
+        look: data.look color: data.color groups: o.groups ?? [1.0] pens: [vec4(hot.x, hot.y, hot.z, 1.0), vec4(core.x, core.y, core.z, 1.0)]
+        clock: o.clock ?? 0.0 cam_x: cam.x cam_y: cam.y cam_zoom: cam.zoom cam_rot: cam.rot ?? 0.0
+        center_x: center.x center_y: center.y tremor: o.tremor ?? 0.0}})
+}
+
+{stroke_pass_time: stroke_pass_time strokes_data: strokes_data draw_strokes: draw_strokes strokes_kernel: strokes_kernel}

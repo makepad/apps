@@ -17,6 +17,7 @@
 //!
 //! Each script reference compiles once and is cached by its source and parameters.
 //! Linked placements share the same compiled `Arc<Script>`; copies fork the source file.
+//! A body's build history ([`steps`]) comes from its compiled solid inputs.
 
 pub mod align;
 pub mod colour_sets;
@@ -30,14 +31,16 @@ pub mod params;
 pub mod picture;
 pub mod program;
 pub mod project;
+pub mod steps;
 mod test_prints;
 pub mod study;
+pub mod expect;
 pub mod thicken;
 pub mod volumes;
 pub mod veins;
 pub mod weave;
 
-pub use makepad_model_script::lang::edit::Edit;
+pub use makepad_model_script::lang::edit::{Anchor, Edit};
 pub use makepad_model_script::lang::{self, Diag};
 
 use eval::{Evaluated, Evaluator, Failure};
@@ -95,7 +98,7 @@ pub struct State {
 #[derive(Clone, Debug)]
 struct Step {
     state: State,
-    label: String,
+    label: Arc<str>,
     /// Its number from the window's step counter, taken at its commit.
     seq: u64,
 }
@@ -155,6 +158,9 @@ pub enum HistoryAction {
 pub enum PlaceArg {
     /// Where its model origin sits on the bed (mm); none: arranged with the free objects.
     At(Option<[f64; 2]>),
+    /// Tool edit targets in bed mm, resolved to `At` against the built footprint before applying.
+    Center([f64; 2]),
+    Corner([f64; 2]),
     /// Degrees about the printer's X, Y, Z.
     Rotate([f64; 3]),
     /// Factors along the printer's X, Y, Z of the unturned object (all three equal: a uniform
@@ -192,6 +198,8 @@ pub enum Change {
     Place { instance: String, object: String, arg: PlaceArg },
     /// The plate's global print settings: these set, those back to the profile.
     PlateSettings { set: Vec<(String, String)>, reset: Vec<String> },
+    /// Set the gap between shelf slots in mm, or remove the project's override.
+    ArrangeGap(Option<f64>),
     /// The print colour named `name`: set to `set` (added when new; a new name renames it and
     /// what names it), or removed (`None`: parts and paint naming it go back to the first).
     Color { name: String, set: Option<project::ColorDef> },
@@ -251,7 +259,27 @@ pub type ElecAssets = BTreeMap<String, Arc<[u8]>>;
 /// ([`FabModel::set_elec_memory`]).
 pub type ElecMemory = BTreeMap<String, Arc<[u8]>>;
 
+/// Project-relative files captured by the reader that put this document on the bed.
+#[derive(Debug, Default)]
+pub struct LoadedProject {
+    pub manifest: String,
+    pub files: BTreeMap<String, Arc<[u8]>>,
+}
+
+/// A committed transition on the model worker. The live model holds the new state
+/// and can render its manifest with the same units used by the project writer.
+pub enum JournalEvent<'a> {
+    Commit { seq: u64, label: &'a str },
+    History { undo: bool, before: Option<u64>, after: Option<u64> },
+}
+
+pub trait JournalSink: Send + Sync {
+    fn receive(&self, event: JournalEvent<'_>, old: &State, model: &FabModel);
+}
+
 pub struct FabModel {
+    journal: Option<Arc<dyn JournalSink>>,
+    pub opened_files: Option<LoadedProject>,
     pub name: String,
     /// The meshes scripts can import (`m.import("cat")`).
     pub assets: Arc<program::Assets>,
@@ -322,9 +350,19 @@ fn content_hash(state: &State) -> [u8; 32] {
 }
 
 /// The first problem of a script that does not evaluate.
-fn first(file: &str, diags: Vec<Diag>) -> Failure {
+fn first(file: &str, error: impl Into<lang::EvalError>) -> Failure {
+    let (diags, imports) = match error.into() {
+        lang::EvalError::Imports(d) => (d, true),
+        lang::EvalError::Document(d) => (d, false),
+    };
     let mut f = diags.first().map(Failure::program).unwrap_or(Failure { lost: None, file: String::new(), line: 1, col: 1, id: String::new(), op: String::new(), message: "the script does not evaluate".into() });
-    f.file = file.to_string();
+    if imports {
+        // The project editor's text has a one-line header before its ordered imports.
+        f.line += 1;
+        f.message = format!("project {}", f.message);
+    } else {
+        f.file = file.to_string();
+    }
     f
 }
 
@@ -337,6 +375,8 @@ fn label_of(changes: &[Change]) -> String {
         Edit::Operand { solid, code } => format!("{solid} takes {code}"),
         Edit::Remove { solid } => format!("remove {solid}"),
         Edit::Rename { solid, to } => format!("rename {solid} to {to}"),
+        Edit::Truncate { solid, to } => format!("roll back {solid} to {to}"),
+        Edit::After { solid, .. } => format!("build on {solid}"),
         Edit::Move { solid, to } => format!("move {solid} to {to}"),
         Edit::RootArg { solid, name, .. } => format!("{solid} {name}"),
         Edit::Root { kind, solid, add } => format!("{}{kind} {solid}", if *add { "" } else { "un" }),
@@ -347,7 +387,7 @@ fn label_of(changes: &[Change]) -> String {
         Change::Script { file, edit: e } => format!("{}: {}", project::stem(file), edit(e)),
         Change::Place { object, arg, .. } => {
             let what = match arg {
-                PlaceArg::At(_) => "move",
+                PlaceArg::At(_) | PlaceArg::Center(_) | PlaceArg::Corner(_) => "move",
                 PlaceArg::Rotate(_) => "turn",
                 PlaceArg::Scale(_) => "scale",
                 PlaceArg::Drop(_) => "drop",
@@ -362,6 +402,7 @@ fn label_of(changes: &[Change]) -> String {
             format!("{what} {object}")
         }
         Change::PlateSettings { .. } => "plate settings".to_string(),
+        Change::ArrangeGap(_) => "arrange gap".to_string(),
         Change::Color { name, set: Some(_) } => format!("colour {name}"),
         Change::Color { name, set: None } => format!("remove colour {name}"),
         Change::RenameColor { from, to } => format!("rename colour {from} to {to}"),
@@ -426,8 +467,13 @@ impl Scripts {
 }
 
 /// Everything a script compile reads, including only the host inputs its calls can name.
-fn script_key(file: &str, source: &str, assets: &Arc<program::Assets>, facets: &Arc<program::FacetAssets>, pictures: &Arc<picture::Pictures>, context: &program::CompileContext, env: &ScriptEnv, overrides: &[((u32, u32), f64)], scripts: &BTreeMap<String, String>, solved: &program::Solved, skip: &[String]) -> [u8; 32] {
+fn script_key(file: &str, source: &str, assets: &Arc<program::Assets>, facets: &Arc<program::FacetAssets>, pictures: &Arc<picture::Pictures>, context: &program::CompileContext, env: &ScriptEnv, overrides: &[((u32, u32), f64)], state: &State, solved: &program::Solved, skip: &[String]) -> [u8; 32] {
     let mut h = Sha256::new();
+    h.update(&(state.project.imports.len() as u64).to_le_bytes());
+    for import in state.project.imports.iter() {
+        h.update(&(import.len() as u64).to_le_bytes());
+        h.update(import.as_bytes());
+    }
     // The solids a draft builds as their input.
     for id in skip {
         h.update(&[2]);
@@ -446,7 +492,7 @@ fn script_key(file: &str, source: &str, assets: &Arc<program::Assets>, facets: &
     h.update(&[0]);
     h.update(source.as_bytes());
     // The paint files it can read.
-    for (f, t) in scripts.iter().filter(|(f, _)| program::is_paint_file(f)) {
+    for (f, t) in state.scripts.iter().filter(|(f, _)| program::is_paint_file(f)) {
         h.update(&[1]);
         h.update(f.as_bytes());
         h.update(&[0]);
@@ -535,7 +581,11 @@ impl FabModel {
     pub fn open(name: &str, mut state: State) -> FabModel {
         paint::migrate_strokes(&mut state);
         let head = Head { generation: 0, content: content_hash(&state) };
-        FabModel { name: name.into(), assets: Default::default(), facets: Default::default(), pictures: Default::default(), context: Default::default(), env: Default::default(), state, head, undo: VecDeque::new(), redo: Vec::new(), steps: Arc::new(AtomicU64::new(0)), logged: Arc::new(AtomicU64::new(0)), redo_mark: 0, receipts: VecDeque::new(), cache: Mutex::default(), solved: HashMap::new(), solved_asked: HashMap::new(), stored: HashMap::new(), docs: Arc::default(), docs_removed: BTreeMap::new(), docs_hashes: BTreeMap::new(), elec_assets: Arc::default(), elec_assets_hashes: BTreeMap::new(), elec_assets_removed: BTreeMap::new(), elec_memory: Arc::default() }
+        FabModel { journal: None, opened_files: None, name: name.into(), assets: Default::default(), facets: Default::default(), pictures: Default::default(), context: Default::default(), env: Default::default(), state, head, undo: VecDeque::new(), redo: Vec::new(), steps: Arc::new(AtomicU64::new(0)), logged: Arc::new(AtomicU64::new(0)), redo_mark: 0, receipts: VecDeque::new(), cache: Mutex::default(), solved: HashMap::new(), solved_asked: HashMap::new(), stored: HashMap::new(), docs: Arc::default(), docs_removed: BTreeMap::new(), docs_hashes: BTreeMap::new(), elec_assets: Arc::default(), elec_assets_hashes: BTreeMap::new(), elec_assets_removed: BTreeMap::new(), elec_memory: Arc::default() }
+    }
+
+    pub fn set_journal(&mut self, journal: Option<Arc<dyn JournalSink>>) {
+        self.journal = journal;
     }
 
     /// Set the window's number and logged-entry counters, shared with the electronics engine.
@@ -756,22 +806,28 @@ impl FabModel {
     }
     /// Labels of the undo steps, oldest first.
     pub fn undo_labels(&self) -> impl Iterator<Item = &str> {
-        self.undo.iter().map(|s| s.label.as_str())
+        self.undo.iter().map(|s| &*s.label)
+    }
+    /// The undo steps, oldest first: each one's number and label.
+    pub fn undo_steps(&self) -> impl DoubleEndedIterator<Item = (u64, &Arc<str>)> + ExactSizeIterator {
+        self.undo.iter().map(|s| (s.seq, &s.label))
     }
 
     /// One script with these parameter values, compiled once.
-    /// `scripts` are the state's files: the paint files a script reads come from them.
+    /// The project's imports and the paint files a script reads both come from `state`.
     /// `skip`: the solids it builds as their input ([`Self::preview`]).
-    fn script(&self, file: &str, source: &str, names: Option<Arc<lang::names::Names>>, overrides: &[((u32, u32), f64)], scripts: &BTreeMap<String, String>, skip: &[String]) -> Result<Arc<Script>, Failure> {
+    fn script(&self, file: &str, source: &str, names: Option<Arc<lang::names::Names>>, overrides: &[((u32, u32), f64)], state: &State, skip: &[String]) -> Result<Arc<Script>, Failure> {
         let solved = self.solved.get(file).cloned().unwrap_or_default();
-        let key = script_key(file, source, &self.assets, &self.facets, &self.pictures, &self.context, &self.env, overrides, scripts, &solved, skip);
+        let key = script_key(file, source, &self.assets, &self.facets, &self.pictures, &self.context, &self.env, overrides, state, &solved, skip);
         // The key holds the inputs the syntax names; a read it could not see (a library fn reading
         // one, an aliased call) is caught here, so a cached compile never outlives its inputs.
         let same = |s: &Script| s.program.inputs_read.iter().all(|k| self.env.inputs.stamp(k) == s.env.inputs.stamp(k));
         if let Some(s) = self.cache.lock().unwrap().get(&key).filter(|s| same(s)) {
             return Ok(s);
         }
-        let s = Arc::new(program::compile_with(file, source, names, &self.assets, &self.facets, &self.pictures, &self.context, &self.env, overrides.iter().copied().collect(), &solved, skip, &|f| scripts.get(f).cloned()).map_err(|d| first(file, d))?);
+        let mut env = self.env.clone();
+        env.imports = state.project.imports.clone();
+        let s = Arc::new(program::compile_document(file, source, names, &self.assets, &self.facets, &self.pictures, &self.context, env, overrides.iter().copied().collect(), &solved, skip, &HashMap::new(), &|f| state.scripts.get(f).cloned()).map_err(|d| first(file, d))?);
         if !s.program.inputs_read.is_empty() {
             let seen = input_reads(source, &self.env);
             for read in s.program.inputs_read.iter().filter(|r| self.env.gives(&r.0) && !seen.contains(r)) {
@@ -786,7 +842,7 @@ impl FabModel {
     fn compile_ref(&self, state: &State, sref: &ScriptRef, skip: &[String]) -> Result<Arc<Script>, Failure> {
         let fail = |file: &str, message: String| Failure { lost: None, file: file.to_string(), line: 1, col: 1, id: String::new(), op: String::new(), message };
         let Some(source) = state.scripts.get(&sref.file) else { return Err(fail(&sref.file, format!("'{}' is not open in the project", sref.file))) };
-        let base = self.script(&sref.file, source, None, &[], &state.scripts, skip)?;
+        let base = self.script(&sref.file, source, None, &[], state, skip)?;
         let mut overrides = Vec::with_capacity(sref.params.len());
         for (name, v) in &sref.params {
             let Some((_, loc)) = base.param(name) else {
@@ -796,7 +852,7 @@ impl FabModel {
             overrides.push((loc, *v));
         }
         overrides.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(if overrides.is_empty() { base } else { self.script(&sref.file, source, Some(base.program.names.clone()), &overrides, &state.scripts, skip)? })
+        Ok(if overrides.is_empty() { base } else { self.script(&sref.file, source, Some(base.program.names.clone()), &overrides, state, skip)? })
     }
 
     /// A state compiled: every instance's script with its values, and its placements.
@@ -952,13 +1008,13 @@ impl FabModel {
 
     pub fn compile_script(&self, file: &str) -> Result<Arc<Script>, Failure> {
         let source = self.state.scripts.get(file).ok_or_else(|| Failure { lost: None, file: file.into(), line: 1, col: 1, id: String::new(), op: String::new(), message: format!("no script '{file}'") })?;
-        self.script(file, source, None, &[], &self.state.scripts, &[])
+        self.script(file, source, None, &[], &self.state, &[])
     }
 
     /// Evaluate the current project.
     pub fn evaluate(&self, eval: &mut Evaluator, cancelled: Option<&dyn Fn() -> bool>) -> Result<(Compiled, Evaluated), Failure> {
         let c = self.compile()?;
-        eval.evaluate_compiled(c, cancelled)
+        eval.evaluate_compiled(c, self.state.project.arrange_gap, cancelled)
     }
 
     /// The project's text (`.fab.splash`), parameter values written in their scripts' units.
@@ -987,7 +1043,7 @@ impl FabModel {
         }
         // A selection or a file of placed objects is one undo step, however many parts it has.
         let deletion = changes.iter().all(|c| matches!(c, Change::RemoveInstance { .. } | Change::RemoveScript { .. } | Change::Place { arg: PlaceArg::Show(false), .. }));
-        let placement = changes.iter().all(|c| matches!(c, Change::AddInstance { .. } | Change::Place { .. } | Change::PlateSettings { .. }));
+        let placement = changes.iter().all(|c| matches!(c, Change::AddInstance { .. } | Change::Place { .. } | Change::PlateSettings { .. } | Change::ArrangeGap(_)));
         if changes.len() > MAX_BATCH && !deletion && !placement {
             return Err(ApplyError::Invalid { index: MAX_BATCH, message: format!("at most {MAX_BATCH} changes per batch") });
         }
@@ -1007,12 +1063,12 @@ impl FabModel {
                         None if program::is_paint_file(file) && matches!(edit, Edit::Program { .. }) => String::new(),
                         None => return Err(invalid(format!("no script '{file}' in the project"))),
                     };
-                    let new = if let Edit::Add { code, before } = edit {
+                    let new = if let Edit::Add { code, at } = edit {
                         added.entry(file.clone()).or_default().extend(lang::edit::defines(code));
                         let roots: Vec<&str> = program::ROOTS.iter().map(|r| r.name).collect();
-                        lang::edit::add(&source, code, before.as_deref(), &roots).map_err(invalid)?
+                        lang::edit::add(&source, code, at, &roots).map_err(invalid)?
                     } else if edit.names_solids() {
-                        let s = self.script(file, &source, None, &[], &state.scripts, &[]).map_err(|f| if index == 0 { ApplyError::Build(f) } else { invalid(format!("follows changes that leave {file} not evaluating: {f}")) })?;
+                        let s = self.script(file, &source, None, &[], &state, &[]).map_err(|f| if index == 0 { ApplyError::Build(f) } else { invalid(format!("follows changes that leave {file} not evaluating: {f}")) })?;
                         lang::edit::apply(&s.program, edit).map_err(invalid)?
                     } else {
                         match edit {
@@ -1024,7 +1080,7 @@ impl FabModel {
                                 format!("{}{text}{}", &source[..range.start], &source[range.end..])
                             }
                             other => {
-                                let s = self.script(file, &source, None, &[], &state.scripts, &[]).map_err(ApplyError::Build)?;
+                                let s = self.script(file, &source, None, &[], &state, &[]).map_err(ApplyError::Build)?;
                                 lang::edit::apply(&s.program, other).map_err(invalid)?
                             }
                         }
@@ -1058,6 +1114,7 @@ impl FabModel {
                     let p = state.project.place_link_mut(base, &object, link);
                     match arg.clone() {
                         PlaceArg::At(v) => p.at = v,
+                        PlaceArg::Center(_) | PlaceArg::Corner(_) => return Err(invalid("place the part with fab.place to resolve its footprint to at".into())),
                         PlaceArg::Rotate(v) => p.rotate = v,
                         PlaceArg::Scale(v) if v.iter().all(|&k| k > 0.0 && k <= 1000.0) => p.scale = v,
                         PlaceArg::Scale(v) => return Err(invalid(format!("scale is a positive factor along each axis, not {v:?}"))),
@@ -1163,6 +1220,7 @@ impl FabModel {
                         }
                     }
                 }
+                Change::ArrangeGap(gap) => state.project.arrange_gap = gap.map(project::checked_arrange_gap).transpose().map_err(invalid)?,
                 Change::PlateSettings { set, reset } => {
                     state.project.settings.retain(|(k, _)| !reset.contains(k) && !set.iter().any(|(s, _)| s == k));
                     for (k, v) in set {
@@ -1381,9 +1439,9 @@ impl FabModel {
                 continue;
             }
             // A script that does not build says so when the state compiles.
-            let Ok(after) = self.script(file, source, None, &[], &state.scripts, &[]) else { continue };
+            let Ok(after) = self.script(file, source, None, &[], &state, &[]) else { continue };
             let before = match was {
-                Some(was) if was != source => self.script(file, was, None, &[], &self.state.scripts, &[]).ok(),
+                Some(was) if was != source => self.script(file, was, None, &[], &self.state, &[]).ok(),
                 _ => None,
             };
             let tool = changes.iter().any(|c| matches!(c, Change::Script { file: f, edit } if f == file && !matches!(edit, Edit::Program { .. })));
@@ -1402,7 +1460,7 @@ impl FabModel {
             let mut emitted: Vec<(String, Vec<String>)> = Vec::new();
             for sref in state.project.scripts.iter().filter(|r| edited.contains(&&r.file)) {
                 let Some(source) = state.scripts.get(&sref.file) else { continue };
-                if let Ok(s) = self.script(&sref.file, source, None, &[], &state.scripts, &[]) {
+                if let Ok(s) = self.script(&sref.file, source, None, &[], &state, &[]) {
                     emitted.push((sref.name.clone(), s.objects.iter().map(|o| o.name.clone()).collect()));
                 }
             }
@@ -1425,7 +1483,7 @@ impl FabModel {
         let mut skip: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut lost = Vec::new();
         loop {
-            match eval.evaluate_compiled(c, cancelled) {
+            match eval.evaluate_compiled(c, state.project.arrange_gap, cancelled) {
                 Ok((c, mut ev)) => {
                     ev.lost = lost;
                     return Ok((state, c, ev));
@@ -1471,6 +1529,30 @@ impl FabModel {
         changes: &[Change],
         cancelled: Option<&dyn Fn() -> bool>,
     ) -> Result<(Applied, Option<(Compiled, Evaluated)>), ApplyError> {
+        self.apply_gated(eval, request_id, expected, changes, cancelled, &|_| None)
+    }
+
+    /// [`Self::apply`], refused when `refuse` finds fault with the batch's build: an AI's edit that
+    /// breaks a number the person gave (`m.expect`, [`expect::newly_failing`]). The refusal is a
+    /// build error (`refuse`'s, at its line); nothing commits and the inspection tools keep the
+    /// build before it.
+    pub fn apply_gated(
+        &mut self,
+        eval: &mut Evaluator,
+        request_id: &str,
+        expected: Head,
+        changes: &[Change],
+        cancelled: Option<&dyn Fn() -> bool>,
+        refuse: &dyn Fn(&Evaluated) -> Option<eval::Failure>,
+    ) -> Result<(Applied, Option<(Compiled, Evaluated)>), ApplyError> {
+        self.apply_gated_labeled(eval, request_id, expected, changes, cancelled, refuse, None)
+    }
+
+    /// Apply the same gated batch with a caller-supplied undo label.
+    pub fn apply_gated_labeled(
+        &mut self, eval: &mut Evaluator, request_id: &str, expected: Head, changes: &[Change],
+        cancelled: Option<&dyn Fn() -> bool>, refuse: &dyn Fn(&Evaluated) -> Option<eval::Failure>, label: Option<String>,
+    ) -> Result<(Applied, Option<(Compiled, Evaluated)>), ApplyError> {
         let fingerprint = Self::fingerprint(expected, changes);
         if let Some(r) = self.receipts.iter().find(|r| r.request_id == request_id) {
             if r.fingerprint != fingerprint {
@@ -1487,7 +1569,12 @@ impl FabModel {
         let before_compiled = self.compile().ok();
         let before: Vec<String> = before_compiled.as_ref().map(|c| parts(c)).unwrap_or_default();
         let (state, c) = self.edited(changes)?;
-        let (c, ev) = eval.evaluate_compiled(c, cancelled).map_err(ApplyError::Build)?;
+        let inspected = eval.inspected();
+        let (c, ev) = eval.evaluate_compiled(c, state.project.arrange_gap, cancelled).map_err(ApplyError::Build)?;
+        if let Some(f) = refuse(&ev) {
+            eval.put_back(inspected);
+            return Err(ApplyError::Build(f));
+        }
         let added: Vec<String> = parts(&c).into_iter().filter(|s| !before.contains(s)).collect();
         let mut changed: Vec<String> = Vec::new();
         let mut note = |id: String| {
@@ -1499,7 +1586,7 @@ impl FabModel {
             match ch {
                 Change::Script { file, edit } => {
                     let solid = match edit {
-                        Edit::Field { solid, .. } | Edit::Unset { solid, .. } | Edit::Replace { solid, .. } | Edit::Operand { solid, .. } | Edit::Remove { solid } | Edit::RootArg { solid, .. } | Edit::Root { solid, .. } => Some(solid.clone()),
+                        Edit::Field { solid, .. } | Edit::Unset { solid, .. } | Edit::Replace { solid, .. } | Edit::Operand { solid, .. } | Edit::Remove { solid } | Edit::RootArg { solid, .. } | Edit::Root { solid, .. } | Edit::After { solid, .. } => Some(solid.clone()),
                         Edit::Rename { to, .. } => Some(to.clone()),
                         Edit::Set { site, .. } => Some(site.split('.').next().unwrap_or(site).to_string()),
                         _ => None,
@@ -1556,12 +1643,12 @@ impl FabModel {
                         note(i.name.clone());
                     }
                 }
-                Change::AddInstance { .. } | Change::PlateSettings { .. } | Change::Color { .. } => {}
+                Change::AddInstance { .. } | Change::PlateSettings { .. } | Change::ArrangeGap(_) | Change::Color { .. } => {}
             }
         }
         // An edit that leaves the project as it was is no undo step.
         if state != self.state {
-            self.commit(state, label_of(changes));
+            self.commit(state, label.unwrap_or_else(|| label_of(changes)));
         }
         let reply = Applied { head: self.head, replayed: false, added, changed };
         self.receipts.push_back(Receipt { request_id: request_id.into(), fingerprint, reply: reply.clone() });
@@ -1574,13 +1661,16 @@ impl FabModel {
     fn commit(&mut self, state: State, label: String) {
         let old = std::mem::replace(&mut self.state, state);
         let seq = self.steps.fetch_add(1, SeqCst) + 1;
-        self.undo.push_back(Step { state: old, label, seq });
+        self.undo.push_back(Step { state: old, label: label.into(), seq });
         self.logged.fetch_max(seq, SeqCst);
         if self.undo.len() > MAX_HISTORY {
             self.undo.pop_front();
         }
         self.redo.clear();
         self.advance();
+        if let (Some(sink), Some(step)) = (&self.journal, self.undo.back()) {
+            sink.receive(JournalEvent::Commit { seq, label: &step.label }, &step.state, self);
+        }
     }
 
     fn advance(&mut self) {
@@ -1603,12 +1693,13 @@ impl FabModel {
         // What the state being left asks stays too, as an edit's does: going back and forth
         // compiles nothing.
         let _ = self.compile();
+        let before = self.undo_top();
         let step = match action {
             HistoryAction::Undo => self.undo.pop_back(),
             HistoryAction::Redo => self.redo.pop(),
         }
         .ok_or(ApplyError::NoHistory)?;
-        let built = self.compile_state(&step.state).and_then(|c| eval.evaluate_compiled(c, cancelled));
+        let built = self.compile_state(&step.state).and_then(|c| eval.evaluate_compiled(c, step.state.project.arrange_gap, cancelled));
         let (c, ev) = match built {
             Ok(x) => x,
             Err(f) => {
@@ -1630,6 +1721,13 @@ impl FabModel {
             HistoryAction::Redo => self.undo.push_back(Step { state: old, label, seq }),
         }
         self.advance();
+        if let Some(sink) = &self.journal {
+            let undo = matches!(action, HistoryAction::Undo);
+            let previous = if undo { self.redo.last() } else { self.undo.back() };
+            if let Some(step) = previous {
+                sink.receive(JournalEvent::History { undo, before, after: self.undo_top() }, &step.state, self);
+            }
+        }
         Ok((self.head, c, ev))
     }
 }

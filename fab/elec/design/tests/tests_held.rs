@@ -129,6 +129,94 @@ fn held_fills_converge_to_full() {
             .expect("a fill with the factory's rules is accepted");
     }
     assert_eq!(held, engines::full_with(&d, &factories), "pass A then pass B equals full after a factory change");
+
+    // The load path, board first, on the fixture with a second zone: the copper shows at once
+    // with every zone owed against a whole-board record; merges only swap fills in; an edit
+    // mid-load joins the record; after the last fill the whole-board checks are owed, a pass
+    // overtaken by an edit is dropped, and the merged pass equals full.
+    let factories = Factories::new();
+    let mut d = ledctl();
+    let b = Arc::make_mut(d.units[0].board.as_mut().expect("the fixture has a board"));
+    let mut second = b.zones.iter().find(|z| z.id == gnd_zone).expect("the fixture has its GND zone").clone();
+    second.id = b.alloc_id();
+    second.name = "GND again".into();
+    second.priority += 1;
+    let zones = [gnd_zone, second.id];
+    d.apply(&DesignOp::Board { unit: BoardId(0), op: BoardOp::Add(Item::Zone(second)) }, false).expect("a second zone adds");
+    let loaded = engines::load_held(&d, &factories);
+    let first_board = &loaded.boards[0];
+    assert!(first_board.pending.whole && first_board.pending.debt.global, "a load owes its whole board");
+    assert!(engines::violations(&loaded).iter().all(|v| first_board.drc.iter().all(|d| d.id != v.id)),
+        "a board that owes its whole-board checks lists none of its DRC findings");
+    assert_eq!(first_board.pending.zones.iter().map(|(z, _)| *z).collect::<Vec<_>>(), zones, "a load owes every zone");
+    let off_zones = |r: &BoardResults| {
+        r.drc.iter().filter(|v| {
+            !matches!(v.kind, CheckKind::Short | CheckKind::Unconnected | CheckKind::DanglingVia)
+                && !v.items.iter().any(|sel| matches!(sel, Sel::Item(unit, zone) if *unit == BoardId(0) && zones.contains(zone)))
+        }).cloned().collect::<Vec<_>>()
+    };
+    assert_eq!(off_zones(first_board), off_zones(&engines::full(&d).boards[0]), "the first board's copper-to-copper findings equal full's");
+    let fill_owed = |held: &engines::DesignResults, d: &fab_elec_design::Design, task: &FillTask| {
+        let rules = held.boards[0].rules.clone();
+        let fill = zone::fill(d.unit(task.unit).unwrap().board.as_ref().unwrap(), &rules, task.zone);
+        engines::merge_fill(held, d, task.unit, task.zone, task.generation, &rules, fill).expect("an owed fill with current inputs is accepted")
+    };
+    let tasks = engines::owed(&loaded);
+    let mut held = fill_owed(&loaded, &d, &tasks[0]);
+    let same_checks = |held: &engines::DesignResults| {
+        Arc::ptr_eq(&held.boards[0].conn, &first_board.conn) && Arc::ptr_eq(&held.boards[0].drc, &first_board.drc)
+    };
+    assert!(same_checks(&held) && held.boards[0].pending.whole, "a merge runs no connectivity or DRC under a whole-board record");
+    let applied = d.apply(&DesignOp::Board { unit: BoardId(0), op: ops[0].1.clone() }, false).expect("an edit applies mid-load");
+    let DesignApplied::Board { applied, .. } = applied else { panic!("the edit returns a board delta") };
+    held = engines::update_held(&held, &d, &[(BoardId(0), applied.delta)], &factories);
+    assert!(same_checks(&held) && held.boards[0].pending.whole, "an edit mid-load joins the whole-board record");
+    let fill_all_owed = |mut held: engines::DesignResults, d: &fab_elec_design::Design| {
+        for task in engines::owed(&held) {
+            held = fill_owed(&held, d, &task);
+        }
+        held
+    };
+    held = fill_all_owed(held, &d);
+    assert!(same_checks(&held), "the last fill's merge runs no connectivity or DRC either");
+    let run_checks = |held: &engines::DesignResults, d: &fab_elec_design::Design| {
+        let tasks = engines::owed_checks(held);
+        assert_eq!(tasks.len(), 1, "once no fill is owed, the unit owes its whole-board checks");
+        let r = &held.boards[0];
+        let (conn, drc) = engines::whole_board_checks(d.unit(tasks[0].unit).unwrap().board.as_ref().unwrap(), &r.rules, &r.fills);
+        (tasks[0].clone(), r.rules.clone(), r.fills.clone(), conn, drc)
+    };
+    let (task, rules, fills, conn, drc) = run_checks(&held, &d);
+    let (base, base_board) = (held.boards[0].clone(), d.units[0].board.clone().expect("the fixture has a board"));
+    // Edits while the checks run (a track widened, then removed, and a zone removed): the pass
+    // made before them is overtaken and does not merge as it is.
+    let edit = |d: &mut fab_elec_design::Design, held: &engines::DesignResults, op: &BoardOp| {
+        let applied = d.apply(&DesignOp::Board { unit: BoardId(0), op: op.clone() }, false).expect("an edit applies while the checks run");
+        let DesignApplied::Board { applied, .. } = applied else { panic!("the edit returns a board delta") };
+        engines::update_held(held, d, &[(BoardId(0), applied.delta)], &factories)
+    };
+    for (_, op) in [&ops[1], &ops[3], &ops[4]] {
+        held = edit(&mut d, &held, op);
+    }
+    assert!(held.boards[0].pending.whole, "edits while the checks run join the whole-board record");
+    assert!(engines::merge_checks(&held, task.unit, task.generation, &rules, &fills, conn.clone(), drc.clone()).is_none(),
+        "checks overtaken by an edit do not merge as they are");
+    // They merge under the edits since, before the edits' refills merge (those stay owed) or after
+    // (the refills join at once); either way no second pass runs and the end equals full.
+    let early = engines::rebase_checks(&held, &d, &base, &base_board, conn.clone(), drc.clone(), &factories).expect("overtaken checks rebase");
+    assert!(!early.boards[0].pending.whole && engines::owed_checks(&early).is_empty(), "a rebased unit owes no whole-board checks");
+    assert_eq!(fill_all_owed(early, &d), engines::full(&d), "checks rebased before the edits' refills, then the refills: full");
+    held = fill_all_owed(held, &d);
+    let late = engines::rebase_checks(&held, &d, &base, &base_board, conn.clone(), drc.clone(), &factories).expect("overtaken checks rebase after the refills");
+    assert!(late.boards[0].pending.zones.is_empty(), "the refills the results hold join the rebased results at once");
+    assert_eq!(late, engines::full(&d), "checks rebased after the edits' refills: full");
+    // A rules change while they run re-resolves the rules: they run again.
+    held = edit(&mut d, &held, &ops[5].1);
+    assert!(engines::rebase_checks(&held, &d, &base, &base_board, conn, drc, &factories).is_none(), "checks overtaken by a rules change do not rebase");
+    held = fill_all_owed(held, &d);
+    let (task, rules, fills, conn, drc) = run_checks(&held, &d);
+    held = engines::merge_checks(&held, task.unit, task.generation, &rules, &fills, conn, drc).expect("current checks merge");
+    assert_eq!(held, engines::full(&d), "the load path with edits during the fills and the checks equals full");
 }
 
 #[test]

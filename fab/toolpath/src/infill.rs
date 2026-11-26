@@ -1,24 +1,29 @@
 //! Sparse and surface infill per island and layer: the pattern dispatch.
 //!
 //! Each layer's fill is a pure function of its region, the layer's
-//! context and, for the cross-layer patterns (lightning, adaptive and
-//! support cubic), one read-only [`Aux`] prepared per bounded layer block, so the
-//! layers can be filled in any order and in parallel.
+//! context and any read-only [`Aux`]: a block's lightning or cubic field,
+//! or the whole part's TPMS warp. Layers can be filled in any order and in parallel.
 
 use crate::adaptive::{Field, Seeds};
 use crate::clipper::{link, Clipper, Pieces};
 use crate::fill::{self, RawSeg};
+use crate::grade;
 use crate::pattern::{Sparse, Surface};
 use crate::patterns::{self, Ctx};
+use crate::tpms::{self, Tpms};
+use crate::warp::Gradient;
 use makepad_fab_settings::machine::Job;
 use makepad_fab_slicer::clip::difference_ex;
 use makepad_fab_slicer::geom::*;
 use makepad_fab_slicer::offset::{offset_ex, DEFAULT_MITER};
 use std::f64::consts::{FRAC_PI_2, TAU};
+use std::sync::Arc;
 
 /// Settings of the sparse patterns beyond the pattern name.
 #[derive(Clone, Debug)]
 pub struct SparseOpts {
+    /// Distance grading for the part's sparse TPMS pattern.
+    pub adaptive: Option<grade::Adaptive>,
     /// `infill_shift_step` (mm per layer, crosszag).
     pub shift_step: f64,
     /// `infill_rotate_step` (radians per layer, line patterns).
@@ -37,11 +42,32 @@ pub struct SparseOpts {
     pub lock_depth: f64,
 }
 
+pub(crate) fn is_tpms(name: &str) -> bool {
+    matches!(name, "gyroid" | "tpmsd" | "tpmsfk")
+}
+
+pub(crate) fn adaptive_gradient(job: &Job) -> Option<Gradient> {
+    match job.s("adaptive_infill_gradient") {
+        "" if !job.cfg.has("adaptive_infill_gradient") => Some(Gradient::Linear),
+        "linear" => Some(Gradient::Linear),
+        "quadratic" => Some(Gradient::Quadratic),
+        "exponential" => Some(Gradient::Exponential),
+        _ => None,
+    }
+}
+
 impl SparseOpts {
     pub fn from_job(job: &Job, nozzle: f64, lw: f64) -> SparseOpts {
         let width = |k: &str| crate::line_width(job, k, nozzle, lw);
-        let locked = job.s("sparse_infill_pattern") == "lockedzag";
+        let pattern = job.s("sparse_infill_pattern");
+        let mode = job.s("adaptive_infill_mode");
+        let locked = pattern == "lockedzag";
         SparseOpts {
+            adaptive: (matches!(mode, "distance_warp" | "lobes") && is_tpms(pattern)).then(|| grade::Adaptive {
+                interior: if job.cfg.has("adaptive_infill_interior_density") { job.f("adaptive_infill_interior_density") / 100.0 } else { 0.1 },
+                gradient: adaptive_gradient(job).expect("toolpath::check the adaptive infill gradient before planning"),
+                lobes: mode == "lobes",
+            }),
             shift_step: job.f("infill_shift_step").max(0.0),
             rotate_step: job.f("infill_rotate_step").to_radians(),
             lattice: [job.f("sparse_infill_lattice_angle_1").to_radians(), job.f("sparse_infill_lattice_angle_2").to_radians()],
@@ -66,7 +92,7 @@ pub struct SparseFill {
     pub pattern: Sparse,
 }
 
-/// Cross-layer data of one sparse-infill block and its context.
+/// Cross-layer data shared by sparse infill.
 #[derive(Clone, Debug, Default)]
 pub enum Aux {
     #[default]
@@ -75,6 +101,8 @@ pub enum Aux {
     Lightning(Vec<Vec<(Pt, Pt)>>),
     /// Distance field of adaptive or support cubic.
     Field(Field),
+    /// Guarded displacement field shared by the part's TPMS layers.
+    Warp(Arc<grade::Graded>),
 }
 
 /// Prepare cross-layer data for a block window: `sparse` and `fill` are its
@@ -118,6 +146,16 @@ pub struct SparseIn<'a> {
     pub bridge_loop: bool,
     /// The layer's height (spacing of locked-zag sub-patterns).
     pub height: f64,
+}
+
+/// Full TPMS period in mm at the given bead spacing divided by sparse density.
+pub fn tpms_period(pattern: Sparse, base: f64) -> Option<f64> {
+    Some(match pattern {
+        Sparse::Gyroid => 2.0 * patterns::GYROID_PERIOD * base,
+        Sparse::TpmsD => tpms::DIAMOND_PERIOD * base,
+        Sparse::TpmsFk => tpms::FISCHER_KOCH_PERIOD * base,
+        _ => return None,
+    })
 }
 
 /// Sparse strokes of `pattern` for one island.
@@ -198,7 +236,7 @@ pub fn sparse(pattern: Sparse, o: &SparseOpts, aux: &Aux, inp: &SparseIn) -> Vec
             }
             open(curves(&pieces), &mut out);
         }
-        Sparse::Gyroid => {
+        Sparse::Gyroid if !matches!(aux, Aux::Warp(_)) => {
             let mut clip = Clipper::new(inp.region);
             let mut pieces = Pieces::default();
             patterns::gyroid(&mut clip, ctx.z, base, ctx.pivot, &mut pieces);
@@ -206,6 +244,27 @@ pub fn sparse(pattern: Sparse, o: &SparseOpts, aux: &Aux, inp: &SparseIn) -> Vec
             // up to two half-periods apart (the two branches pair up): their ends join along
             // the wall up to the longest join, so a layer prints as one run, as in the reference.
             open(fill::chain_pieces(inp.region, &pieces, inp.max, inp.anchor, None), &mut out);
+        }
+        Sparse::Gyroid | Sparse::TpmsD | Sparse::TpmsFk => {
+            let period = tpms_period(pattern, base).unwrap();
+            let (surface, z) = match pattern {
+                Sparse::Gyroid => (Tpms::Gyroid, ctx.z - period / 4.0),
+                Sparse::TpmsD => (Tpms::Diamond, ctx.z),
+                _ => (Tpms::FischerKoch, ctx.z),
+            };
+            let mut clip = Clipper::new(inp.region);
+            let (pieces, loops) = if let Aux::Warp(g) = aux {
+                surface.warped_contours(&mut clip, ctx.pivot, z, period, &g.warp.layer(ctx.z), g.stretch)
+            } else {
+                surface.contours(&mut clip, ctx.pivot, z, period)
+            };
+            open(fill::chain_pieces(inp.region, &pieces, inp.max, inp.anchor, None), &mut out);
+            for pts in loops {
+                let ring = Polygon::new(pts);
+                if ring.perimeter() >= 4.0 * w * SCALE {
+                    out.push(Stroke { pts: ring.pts, closed: true, width: w });
+                }
+            }
         }
         Sparse::Honeycomb => {
             let mut clip = Clipper::new(inp.region);

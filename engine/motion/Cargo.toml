@@ -1,0 +1,67 @@
+[package]
+name = "makepad-motion"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Motion graphics documents (EDITS.md §10.2): AI-authored Splash loaded with teaching diagnostics and evaluated as a pure function of time into a frame; no GPU, no UI (makepad-motion-draw draws the frames)"
+
+[lib]
+name = "makepad_motion"
+
+[features]
+default = ["models"]
+# Scene3D's modelled props built by Stage's model host (motion3d's
+# `models`); a player of finished documents turns the defaults off.
+models = ["makepad-stage-motion3d?/models"]
+# Scene3D documents in Motion: Seq3D lowered by motion3d, a document's
+# scene lets split out, Text3D letters measured. Brings motion3d (and
+# with it the effect pack interface) and the 3D type builder.
+scene3d = ["dep:makepad-stage-motion3d", "dep:makepad-text-mesh"]
+
+# The widget library's resources at their place in this source tree, for
+# the tests (a host registers where its build keeps them: `fonts::register_root`).
+dev-roots = ["makepad-doc-fonts/dev-roots"]
+
+[dependencies]
+# Value kinds: the one editable-values layer.
+makepad-edit-values = { path = "../../../../libs/edit_values" }
+makepad-asset-data = { path = "../../../apps/engine/asset/data" }
+# The document font table: families, files, where they are.
+makepad-doc-fonts = { path = "../fonts" }
+makepad-script = { path = "../../../../platform/script" }
+# The shared Splash stdlib (mod.shared) in every document's scope.
+makepad-script-compute = { path = "../../../../platform/script/compute", features = ["vm"] }
+# Splash modules a document imports (`import(asset(..))`, named modules).
+makepad-script-imports = { path = "../../../../platform/script/imports" }
+makepad-tween-script = { path = "../../../../libs/tween/script" }
+# run.json of app runs, for overlays bound to them (src/bind, lane M4).
+makepad-strict-json = { path = "../../../../libs/strict_json" }
+makepad-svg = { path = "../../../../libs/svg" }
+# Math layers: the TeX-subset layout (OpenType MATH tables) whose pieces are addressable.
+makepad-latex-math = { path = "../../../../libs/latex_math" }
+# The desktop styles' app identity icons (`icon("macos/mail")`), the table
+# widgets-core draws from.
+makepad-app-icons = { path = "../../../../libs/app_icons" }
+# Typography functions documents call (layout metrics, outlines, fitting,
+# single-stroke lettering): pure, no GPU.
+makepad-typography = { path = "../../../../libs/typography" }
+# Post passes, kits and motion-blur sampling (the render graph's UI-free
+# core: declarations, schedules, the kits' Splash source).
+makepad-render-graph = { path = "../../../../libs/render_graph", default-features = false }
+# CSS cubic-bezier solving (EaseGraph), lane FX2.
+makepad-tween = { path = "../../../../libs/tween" }
+# The one FFT and log-band fold (`music(@m).spectrum`).
+makepad-audio-picture = { path = "../../../../libs/audio_picture" }
+# R2's render kit without its GPU side: a layer's `effects: [...]` and the
+# camera are checked against its catalog at load.
+makepad-stage-render-kit = { path = "../render_kit", default-features = false }
+# R3's three.js-level Scene3D (the `scene3d` feature).
+makepad-stage-motion3d = { path = "../motion3d", optional = true, default-features = false }
+# Text3D layers: the per-letter 3D type builder (the `scene3d` feature).
+makepad-text-mesh = { path = "../../../../libs/text_mesh", optional = true }
+
+[dev-dependencies]
+# Tests load whole documents, Scene3D and kernels included (the Stage plates' sparks and
+# scenes), so they build with `scene3d` on.
+makepad-motion = { path = ".", features = ["dev-roots", "scene3d"] }

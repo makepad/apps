@@ -1,0 +1,23 @@
+{
+  "name": "example, edit me",
+  "date": "2026-11-24",
+  "setup": {"micros": 10000000, "currency": "USD"},
+  "prices": [
+    {"layers": 2, "max_mm2": 2500, "min_boards": 1, "each": {"micros": 2000000, "currency": "USD"}},
+    {"layers": 2, "max_mm2": 2500, "min_boards": 10, "each": {"micros": 1000000, "currency": "USD"}},
+    {"layers": 2, "max_mm2": 10000, "min_boards": 1, "each": {"micros": 5000000, "currency": "USD"}},
+    {"layers": 4, "max_mm2": 10000, "min_boards": 1, "each": {"micros": 8000000, "currency": "USD"}}
+  ],
+  "surcharges": [
+    {"name": "Small drill", "when": {"drill_below_nm": 400000}, "fee": {"micros": 3000000, "currency": "USD"}},
+    {"name": "Fine tracks", "when": {"track_below_nm": 150000}, "fee": {"micros": 5000000, "currency": "USD"}},
+    {"name": "Gold finish", "when": {"finish": "Enig"}, "fee": {"micros": 5000000, "currency": "USD"}}
+  ],
+  "assembly": {
+    "setup": 20000000, "stencil": 10000000, "billing": "joint", "rate": 10000,
+    "per_line": 500000, "outside_basic": 1000000, "second_side": 5000000, "minimum": 25000000,
+    "classes": [{"name": "standard", "ppm": 20000, "minimum": 1}, {"name": "small", "ppm": 50000, "minimum": 2}],
+    "prefixes": [{"prefix": "R_0", "class": "small"}, {"prefix": "C_0", "class": "small"}],
+    "default_class": "standard"
+  }
+}

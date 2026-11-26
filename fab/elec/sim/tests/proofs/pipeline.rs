@@ -7,8 +7,9 @@ use fab_elec_sim::circuit::{Boundary, BoundaryKind, CtlKind};
 use fab_elec_sim::cosim::{Bus, CoRun, CoSim, CoSimDevice, CoSimPin, CoState, StepTo, Watch};
 use fab_elec_sim::live::{Latest, LiveCmd, Terminal, ValuePlan};
 use fab_elec_sim::livesim::{run_live, LiveSim, LiveSpec, Replan, Snapshots};
+use fab_elec_sim::analysis::op::operating_point;
 use fab_elec_sim::analysis::partition::Land;
-use fab_elec_sim::rounds::{seed_from, Block, Chain as Tree, Coupling, Helpers, Lag, Planner, Post, RoundPlan};
+use fab_elec_sim::rounds::{seed_from, Block, Chain as Tree, Coupling, Helpers, HolderPort, Lag, Planner, Post, RoundPlan};
 use fab_elec_sim::stamp::UnknownInfo;
 use fab_elec_sim::{GpioParams, ModelKind, PinMode, PinPull, Record, SimCircuit, SimDiag, Sink, SinkState, Solver, Source, Wave};
 use std::sync::{mpsc, Arc, Mutex};
@@ -172,6 +173,7 @@ impl Planner for Landing {
         Ok(Chain.plan(ckt, whole, t)?.map(|(mut plan, solvers)| {
             if self.landed {
                 plan.lands = vec![(0, 1)];
+                plan.land_steps = vec![0.0];
             } else {
                 plan.chains = vec![Tree { born: 0, name: "i0".into(), roots: vec![1], pairs: vec![(0, 1)], labels: vec!["i0".into()], members: vec![1], cut_late: 0 }];
             }
@@ -181,6 +183,175 @@ impl Planner for Landing {
 
     fn land_chain(&mut self, land: &Land) {
         self.landed |= land.born == "i0";
+    }
+}
+
+/// `fed_back`'s load on the timing node: block 1 draws this many siemens of its control out of
+/// `i0`. Weak, so the shadow rounds accept the read back (at 1 uS a late read moves the
+/// oscillator's edges across a round's end, and the shadow refuses the cut on the crossing count).
+const FED: f64 = 2e-7;
+/// Where `fed_back`'s runs stop: a few of its periods past the plan after `EDIT`.
+const FED_STOP: f64 = 16e-3;
+
+/// What `fed_back`'s block 1 draws from the timing node, and so what a new cut can carry over.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Draw {
+    /// `ge1` draws `FED` of `l`, in block 1 under either cut: the old block's window has the
+    /// same devices behind it, and the new cut takes its history.
+    Follows,
+    /// `gx` draws `FED` of a 2.5 V source `vb`, both in block 0 until the new cut moves them into
+    /// block 1: the old window behind `bi` has fewer devices than the new one, and the new cut
+    /// seeds it from its devices at the go-in.
+    Steady,
+    /// `cb`, 50 pF from `i0`, in block 1 under either cut: its draw is its charge's rate, which
+    /// only the timing node's rate gives.
+    Charge,
+}
+
+/// Whether `fed_back`'s block 1 stands beside `i0`'s holder through a holder port (`held_port`),
+/// and so what a new cut can carry of its memory.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Port {
+    Bare,
+    /// The devices behind the port are the same under either cut: the new port takes the old
+    /// one's memory.
+    Same,
+    /// With `Draw::Steady`, whose devices the new cut moves into block 1: the devices behind the
+    /// new port are more than the old one's, and its memory starts at its equilibrium with what
+    /// it reads at the go-in. `ge1` sits in block 0, reading `l` a round late, so what block 1
+    /// hears of `i0` through its port reaches the oscillator.
+    Moved,
+}
+
+/// `Port`'s holder port in block 1: `i0`'s holder as a fit sees it, 390 k onto 10 nF, with 1 mH
+/// in series.
+fn held_port() -> HolderPort {
+    HolderPort { block: 1, name: "i0#port0".into(), rb: 390e3, tau: 3.9e-3, l: 1e-3, ..HolderPort::default() }
+}
+
+/// Block 0, a listener `l` on the timing node, a listener `m` on `l` that drives nothing, and the
+/// draw out of `i0` (with `Port::Moved`, `ge1`'s too), so the oscillator's timing hangs on a
+/// current block 0 takes back late.
+fn fed_back(draw: Draw, port: Port) -> SimCircuit {
+    let mut c = control();
+    listener(&mut c, "l", "i0", "l");
+    listener(&mut c, "m", "l", "m");
+    drawn(&mut c, draw);
+    if port == Port::Moved {
+        drawn(&mut c, Draw::Follows);
+    }
+    c
+}
+
+/// `draw`'s devices in `c`.
+fn drawn(c: &mut SimCircuit, draw: Draw) {
+    match draw {
+        Draw::Follows => {
+            c.vctl("ge1", CtlKind::Vccs, "i0", "0", "l", "0", FED);
+        }
+        Draw::Steady => {
+            c.v("vb", "vb", "0", Source::dc(2.5));
+            c.vctl("gx", CtlKind::Vccs, "i0", "0", "vb", "0", FED);
+        }
+        Draw::Charge => {
+            c.c("cb", "i0", "0", 50e-12);
+        }
+    }
+}
+
+/// `fed_back` in three blocks, one a stage: block 0 the control block, taking block 1's draw from
+/// `i0` back late at `ii0`; block 1 `l`, reading `i0` in the same round; block 2 `m`, reading `l`
+/// in the same round. Block 2 is a leaf: an edit of it reaches no loop, so the run stays in rounds
+/// through it (an edit on a loop, with this plan's no proof, takes the run out of rounds and back
+/// in fresh, which hides a go-in). A plan from a snapshot after `EDIT` puts `m` in block 1 beside
+/// `l` (and `Draw::Steady`'s devices), unless the cut is `kept`: a new block 1 at stage 1 still,
+/// whose draw block 0 reads a round or two back. With a port, the new cut's block 1 stands at an
+/// operating point at the plan's instant, as a planner that measured it leaves it: its port not
+/// yet fed, so its memory holds the whole draw.
+#[derive(Clone)]
+struct FedBack {
+    kept: bool,
+    draw: Draw,
+    port: Port,
+}
+
+impl Planner for FedBack {
+    fn plan(&mut self, ckt: &SimCircuit, whole: &Solver, t: f64) -> Result<Option<(RoundPlan, Vec<Solver>)>, SimDiag> {
+        let v = |node: &str| whole.x[whole.unknown(node).expect("the cut node is in the whole circuit") as usize];
+        let held = |c: &mut SimCircuit, name: &str, node: &str| {
+            let (v0, node) = (v(node), c.node(node));
+            c.devices.boundary.push(Boundary { name: name.into(), node, kind: BoundaryKind::Voltage, v0 });
+        };
+        let two = !self.kept && t > EDIT;
+        // `Draw::Steady`'s devices: in block 0 under the old cut, in block 1 under the new
+        let steady_in_1 = two && self.draw == Draw::Steady;
+        let mut b0 = control();
+        if self.draw == Draw::Steady && !steady_in_1 {
+            drawn(&mut b0, Draw::Steady);
+        }
+        if self.port == Port::Moved {
+            held(&mut b0, "bl0", "l");
+            drawn(&mut b0, Draw::Follows);
+        }
+        let drive = match self.draw {
+            Draw::Follows => -FED * v("l"),
+            Draw::Steady if steady_in_1 => -FED * v("vb"),
+            Draw::Steady | Draw::Charge => 0.0,
+        };
+        let node = b0.node("i0");
+        b0.devices.boundary.push(Boundary { name: "ii0".into(), node, kind: BoundaryKind::Current, v0: drive });
+        let mut b1 = SimCircuit::new();
+        held(&mut b1, "bi", "i0");
+        if self.port != Port::Bare {
+            let node = b1.node("i0");
+            b1.devices.boundary.push(Boundary { name: held_port().name, node, kind: BoundaryKind::Port { of: 0, second: false }, v0: 0.0 });
+        }
+        listener(&mut b1, "l", "i0", "l");
+        if matches!(self.draw, Draw::Follows | Draw::Charge) || steady_in_1 {
+            drawn(&mut b1, self.draw);
+        }
+        let mut b2 = SimCircuit::new();
+        if two {
+            listener(&mut b1, "m", "l", "m");
+        } else {
+            held(&mut b2, "bl", "l");
+            listener(&mut b2, "m", "l", "m");
+        }
+        let cut0: &[&str] = if self.port == Port::Moved { &["l"] } else { &[] };
+        let blocks: Vec<(SimCircuit, &[&str])> = if two { vec![(b0, cut0), (b1, &["i0"][..])] } else { vec![(b0, cut0), (b1, &["i0"][..]), (b2, &["l"][..])] };
+        let mut plan = RoundPlan::default();
+        let mut solvers = Vec::new();
+        for (k, (mut c, cut)) in blocks.into_iter().enumerate() {
+            c.opts = ckt.opts.clone();
+            let mut s = Solver::new(&c)?;
+            let mut own = seed_from(&mut s, whole);
+            own.retain(|&(l, _)| !cut.contains(&s.unknowns[l as usize].name.as_str()));
+            if k == 1 && self.port != Port::Bare {
+                let p = held_port();
+                for (key, v) in [("r", p.r), ("rb", p.rb), ("tau", p.tau), ("l", p.l)] {
+                    assert!(s.set_param(&p.name, key, v), "the port takes its {key}");
+                }
+                if two {
+                    operating_point(&mut s, false)?;
+                }
+            }
+            plan.blocks.push(Block { name: format!("block {k}"), stage: k as u32, own });
+            solvers.push(s);
+        }
+        let at = |k: usize, name: &str| solvers[k].unknown(name).unwrap_or_else(|| panic!("block {k} solves {name}"));
+        let coupling = |from: (u32, u32), to: (u32, &str), lag: Lag| Coupling { from, to: vec![(to.0, to.1.into())], lag, cuts: Vec::new(), rho: 0.0 };
+        plan.couplings.push(coupling((0, at(0, "i0")), (1, "bi"), Lag::Same));
+        if !two {
+            plan.couplings.push(coupling((1, at(1, "l")), (2, "bl"), Lag::Same));
+        }
+        if self.port == Port::Moved {
+            plan.couplings.push(coupling((1, at(1, "l")), (0, "bl0"), Lag::Round));
+        }
+        plan.couplings.push(coupling((1, at(1, "bi#branch")), (0, "ii0"), Lag::Round));
+        if self.port != Port::Bare {
+            plan.ports.push(HolderPort { coupling: plan.couplings.len() as u32 - 1, ..held_port() });
+        }
+        Ok(Some((plan, solvers)))
     }
 }
 
@@ -571,6 +742,120 @@ fn an_edit_and_a_handover_find_the_pipeline_at_one_instant() {
             assert!(behind.iter().any(|v| gain(v) > 0.9), "{how}: a publication past the edit's front with the stages behind, still the old circuit, says it was not stepped with it: {:?}",
                 behind.iter().map(|v| (v.t, gain(v))).collect::<Vec<_>>());
         }
+    }
+}
+
+/// `name`'s rising crossings of `level` after `from`, interpolated between the accepted points.
+fn rising(record: &Record, name: &str, level: f64, from: f64) -> Vec<f64> {
+    let o = record.v(name);
+    (1..record.at.len())
+        .filter(|&n| record.at[n] > from && o[n - 1] < level && o[n] >= level)
+        .map(|n| record.at[n - 1] + (record.at[n] - record.at[n - 1]) * (level - o[n - 1]) / (o[n] - o[n - 1]))
+        .collect()
+}
+
+/// A new cut reads its couplings as the old cut left them: in `fed_back`, `m`'s load halves at
+/// `EDIT` and the plan after it puts `m` in a new block 1 beside `l`, whose draw from the timing
+/// node block 0 reads back a round late (two in the pipeline). From the edit on, the oscillator's
+/// rising edges keep within 1 us of a run whose plans keep the old cut (`FedBack::kept`), the
+/// pipeline on and off, whichever the draw:
+/// - `Draw::Follows`: block 0 reads, for the rounds it reads back across the go-in, what the old
+///   block 1 drew, as through a re-cut that keeps its blocks.
+/// - `Draw::Steady`: the devices behind the new block 1's draw are more than the old one's, so no
+///   old history is that draw; block 0 reads it as the devices draw it at the go-in, never a value
+///   no block solved.
+/// - `Port::Same` and `Port::Moved`: block 1 stands beside `i0`'s holder through a port, whose
+///   memory the new block 1 takes from the old one, or with other devices behind it starts at its
+///   equilibrium, its stepper's first point taken again from that state: never the plan's state.
+#[test]
+fn a_new_cut_reads_its_couplings_as_the_old_cut_left_them() {
+    let mut figures = Vec::new();
+    for (draw, port) in [(Draw::Follows, Port::Bare), (Draw::Steady, Port::Bare), (Draw::Follows, Port::Same), (Draw::Steady, Port::Moved)] {
+        for pipeline in [true, false] {
+            let mut live = spec(SAMPLE, pipeline, true);
+            (live.replan.edit, live.replan.lead) = (1e-3, 0.5e-3);
+            let go = |kept: bool| {
+                let mut sim = LiveSim::new(fed_back(draw, port), ValuePlan::default(), 1, live.clone()).expect("the operating point converges");
+                sim.set_planner(Some(Box::new(FedBack { kept, draw, port }))).expect("the plan installs");
+                let halve = LiveCmd::SetParam { generation: 1, device: "rm".into(), key: "value".into(), value: 5e3 };
+                assert!(sim.apply(LiveCmd::At(EDIT, Box::new(halve))), "the timed edit keeps the run");
+                let mut record = Record::default();
+                record.begin(&sim.solver().unknowns);
+                while sim.t() < FED_STOP {
+                    sim.advance(FED_STOP, None, &mut record).unwrap_or_else(|d| panic!("the fed-back chain steps: {d}"));
+                }
+                (record, sim.blocks())
+            };
+            let ((cut, cut_blocks), (kept, kept_blocks)) = (go(false), go(true));
+            let (a, b) = (rising(&cut, "o0", 2.5, EDIT), rising(&kept, "o0", 2.5, EDIT));
+            let worst = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+            let what = format!("{draw:?}, {port:?}, pipeline {pipeline}");
+            eprintln!("{what}: {cut_blocks} blocks at the stop with the new cut, {kept_blocks} kept; o0 rises at {a:?} s with the new cut, {b:?} s kept: worst {:.3} us", worst * 1e6);
+            figures.push((what, cut_blocks, kept_blocks, a, b, worst));
+        }
+    }
+    for (what, cut_blocks, kept_blocks, a, b, worst) in figures {
+        assert_eq!((cut_blocks, kept_blocks), (2, 3), "{what}: the new cut goes in, the kept one runs on");
+        assert!(a.len() == b.len() && a.len() >= 3, "{what}: o0 rises as often after the edit with the new cut as kept: {a:?}, {b:?}");
+        assert!(worst < 1e-6, "{what}: o0's edges keep within 1 us of the kept cut's through the go-in: {:.3} us off", worst * 1e6);
+    }
+}
+
+/// Where `a_go_in_from_whole_stepping_reads_a_charge_as_it_flows` plans again after stepping
+/// whole: four samples into a round, on a charging ramp of `i0` further than the longest read back
+/// (two rounds) from either of its switches (o0 rises at 4.99 ms and falls at 6.48 ms).
+const GO_IN: f64 = 548.0 * SAMPLE;
+
+/// Where it plans again at the instant it leaves rounds: a round end on the same ramp.
+const AT_LEAVE: f64 = 576.0 * SAMPLE;
+
+/// A go-in from a run stepping whole reads a boundary as its devices draw it: `fed_back` with
+/// `Draw::Charge` in rounds, planned again from the run stepping whole. Either its planner is
+/// taken away at the round end before `GO_IN` (`LiveSim::set_planner`), it steps whole for four
+/// samples and it plans again at `GO_IN`; or its planner comes again at `AT_LEAVE`, in rounds,
+/// so that it leaves them and goes in at that instant, its whole stepper holding only the rates
+/// the blocks hand it as it resumes. Block 0 reads `cb`'s draw a round back (two in the
+/// pipeline). For those rounds the go-in holds the draw as it flows then, at the timing node's
+/// rate, never at the plan's 0. The oscillator's rising edges after it keep within 1 us of a run
+/// that stays in rounds, the pipeline on and off. At the plan's 0 they are 4.4 us off after the
+/// whole steps (1.9 us without the pipeline), and at the leave at a resume's zero rates 2.0 us
+/// (1.9 us). What is left (0.4 us and 0.3 us, 0.1 us without the pipeline) is the hold itself: a
+/// run stepping whole has no history for the reads back across the go-in.
+#[test]
+fn a_go_in_from_whole_stepping_reads_a_charge_as_it_flows() {
+    let mut figures = Vec::new();
+    for (whole, at) in [(true, GO_IN), (false, AT_LEAVE)] {
+        for pipeline in [true, false] {
+            let live = spec(SAMPLE, pipeline, true);
+            let go = |again: bool| {
+                let planner = || Some(Box::new(FedBack { kept: true, draw: Draw::Charge, port: Port::Bare }) as Box<dyn Planner>);
+                let mut sim = LiveSim::new(fed_back(Draw::Charge, Port::Bare), ValuePlan::default(), 1, live.clone()).expect("the operating point converges");
+                sim.set_planner(planner()).expect("the plan installs");
+                let mut record = Record::default();
+                record.begin(&sim.solver().unknowns);
+                let stops = if whole { vec![at - 12.0 * SAMPLE, at, FED_STOP] } else { vec![at, FED_STOP] };
+                for stop in stops {
+                    while sim.t() < stop {
+                        sim.advance(stop, None, &mut record).unwrap_or_else(|d| panic!("the charged chain steps: {d}"));
+                    }
+                    if again && stop < FED_STOP {
+                        sim.set_planner(if stop == at { planner() } else { None }).expect("the planner goes, and comes again");
+                    }
+                }
+                (record, sim.blocks())
+            };
+            let ((again, again_blocks), (stays, stays_blocks)) = (go(true), go(false));
+            let (a, b) = (rising(&again, "o0", 2.5, at), rising(&stays, "o0", 2.5, at));
+            let worst = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+            let how = if whole { "after four samples whole" } else { "at the leave" };
+            eprintln!("{how}, pipeline {pipeline}: {again_blocks} blocks planned again, {stays_blocks} staying; o0 rises at {a:?} s planned again, {b:?} s staying: worst {:.3} us", worst * 1e6);
+            figures.push((how, pipeline, again_blocks, stays_blocks, a, b, worst));
+        }
+    }
+    for (how, pipeline, again_blocks, stays_blocks, a, b, worst) in figures {
+        assert_eq!((again_blocks, stays_blocks), (3, 3), "{how}, pipeline {pipeline}: both runs end in the plan's rounds");
+        assert!(a.len() == b.len() && a.len() >= 3, "{how}, pipeline {pipeline}: o0 rises as often after the go-in as staying: {a:?}, {b:?}");
+        assert!(worst < 1e-6, "{how}, pipeline {pipeline}: o0's edges keep within 1 us of the run staying in rounds through a go-in from whole stepping: {:.3} us off", worst * 1e6);
     }
 }
 

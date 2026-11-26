@@ -1,0 +1,11 @@
+use mod.motion.*
+Motion{size: vec2(640, 480) duration: 2.0 fps: 20 layers: [
+    Rect{name: "behind" at: vec2(60, 50) size: vec2(260, 80) fill: #fff}
+    Text{name: "label" text: "HELLO" size: 48 at: vec2(80, 60)}
+    Rect{name: "cover" at: vec2(60, 50) size: vec2(260, 80) fill: #fff}
+    Rect{name: "translucent" at: vec2(60, 50) size: vec2(260, 80) fill: #ffffff80}
+    Rect{name: "clear" at: vec2(400, 50) size: vec2(100, 80) fill: #fff}
+    Path{name: "hole" svg: "M 0 0 H 600 V 400 H 0 Z M 40 40 H 360 V 180 H 40 Z" fill: #fff}
+    Group{opacity: 0.5 layers: [Rect{name: "faded parent" at: vec2(60, 50) size: vec2(260, 80) fill: #fff}]}
+    Group{layers: [Rect{name: "nested cover" at: vec2(80, 60) size: vec2(50, 50) fill: #fff}]}
+]}

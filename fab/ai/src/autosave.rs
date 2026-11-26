@@ -435,6 +435,7 @@ impl Snapshot {
         };
         let mut saved = Self::default();
         let mut read = Read::default();
+        let mut originals = BTreeMap::new();
         let mut names = BTreeSet::new();
         let mut changed = Vec::new();
         for line in map.lines() {
@@ -446,6 +447,7 @@ impl Snapshot {
                 return Err(format!("scripts/map names {name} twice"));
             }
             let bytes = std::fs::read(&path).map_err(|e| format!("{name} ({file}): {e}"))?;
+            if name != "meta" { originals.insert(name.clone(), Arc::<[u8]>::from(bytes.as_slice())); }
             let own = hash(&bytes) == digest;
             let content = read.take(&name, bytes).map_err(|e| if own {
                 format!("{name} ({file}): {e}")
@@ -480,6 +482,22 @@ impl Snapshot {
         if !read.elec_memory.is_empty() {
             model.set_elec_memory(Arc::new(read.elec_memory));
         }
+        let manifest = Path::new(&path).file_name().and_then(|file| file.to_str()).unwrap_or(AUTOSAVE_FILE);
+        let stem = manifest.strip_suffix(".fab.splash").unwrap_or(manifest);
+        let files = originals.into_iter().map(|(key, bytes)| {
+            let file = if key == AUTOSAVE_FILE { manifest.into() }
+                else if let Some(file) = key.strip_prefix("scripts/") { file.to_owned() }
+                else if let Some(file) = key.strip_prefix("elec/") { format!("{stem}.elec/{file}") }
+                else {
+                    let file = key.strip_prefix("current.meshes/").expect("accepted working-copy key");
+                    match file.strip_suffix(&format!(".{PICTURE_EXTENSION}")) {
+                        Some(picture) => picture.to_owned(),
+                        None => format!("{stem}.meshes/{file}"),
+                    }
+                };
+            (file, bytes)
+        }).collect();
+        model.opened_files = Some(fab_model::LoadedProject { manifest: manifest.into(), files });
         Ok(Some(Recovered { model, path: (!path.is_empty()).then(|| PathBuf::from(path)), snapshot: saved, changed }))
     }
 }

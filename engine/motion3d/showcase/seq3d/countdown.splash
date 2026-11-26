@@ -1,0 +1,3 @@
+use mod.scene.*
+// Seq3D countdown: 5 to 1 on a 90 bpm grid, then the word.
+Seq3D{template: @countdown from: 5 to: 1 text: "GO" bpm: 90}

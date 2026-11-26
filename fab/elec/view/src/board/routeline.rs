@@ -20,8 +20,8 @@ use super::theme::BoardTheme;
 use crate::snapshot::{JobEnd, RouteJobState};
 use fab_elec_board::{Board, BoardOp, Connectivity, Item, ItemKind};
 use fab_elec_circuit::Measure;
-use fab_elec_core::{CompRef, FeatureRef, ItemId, NetId, Sel, P};
-use fab_elec_route::{scope_nets, JobId, JobPhase, JobStatus, Reason};
+use fab_elec_core::{BlockId, CompId, CompRef, FeatureRef, ItemId, NetId, Sel, P};
+use fab_elec_route::{scope_nets, HandCopper, JobId, JobPhase, JobStatus, Reason};
 use makepad_widgets_core::*;
 
 script_mod! {
@@ -91,9 +91,51 @@ pub enum LineKey {
     /// No job runs: `unrouted` nets of the board, `selected` of them in the selection, and the
     /// finished job whose open nets the line names (`LeftOpen`), while the board is as it left it.
     Idle { unrouted: usize, selected: usize, left: Option<JobId> },
-    /// A route job running on the board, `organic` for the organic method. Compared by value, so
-    /// every status the worker publishes rebuilds the words.
-    Job { status: JobStatus, organic: bool },
+    /// A route job running on the board, `organic` for the organic method, and the hand-drawn
+    /// copper its shown proposal takes off. Compared by value, so every status the worker
+    /// publishes rebuilds the words.
+    Job { status: JobStatus, organic: bool, hand: HandLine },
+}
+
+/// The hand-drawn tracks and vias a running place job's proposal takes off, from how many parts,
+/// and the part when it is one: the line says so while Discard can still keep them.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub struct HandLine {
+    pub tracks: u32,
+    pub vias: u32,
+    pub parts: u32,
+    pub part: Option<CompId>,
+}
+
+impl HandLine {
+    /// From a place proposal's metrics.
+    pub fn of(hand: &[HandCopper]) -> HandLine {
+        HandLine {
+            tracks: hand.iter().map(|h| h.tracks).sum(),
+            vias: hand.iter().map(|h| h.vias).sum(),
+            parts: hand.len() as u32,
+            part: hand.first().map(|h| h.comp),
+        }
+    }
+
+    /// "Removes 3 hand-drawn tracks from U1; Discard keeps them", or None when it takes none off.
+    fn words(self, part_of: impl Fn(CompId) -> Option<String>) -> Option<String> {
+        if self.tracks + self.vias == 0 {
+            return None;
+        }
+        let count = |n: u32, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+        let what = match (self.tracks, self.vias) {
+            (t, 0) => format!("{} hand-drawn {}", t, if t == 1 { "track" } else { "tracks" }),
+            (0, v) => format!("{} hand-drawn {}", v, if v == 1 { "via" } else { "vias" }),
+            (t, v) => format!("{} and {}", count(t, "hand-drawn track", "hand-drawn tracks"), count(v, "via", "vias")),
+        };
+        let from = match self.part.and_then(part_of) {
+            Some(name) if self.parts == 1 => name,
+            _ => count(self.parts, "part", "parts"),
+        };
+        let them = if self.tracks + self.vias == 1 { "it" } else { "them" };
+        Some(format!("Removes {what} from {from}; Discard keeps {them}"))
+    }
 }
 
 /// The line's words and buttons (at most three).
@@ -304,18 +346,31 @@ pub fn still_open(left: &LeftOpen, generation: u64, conn: &Connectivity) -> Vec<
     left.nets.iter().copied().filter(|net| conn.unrouted.binary_search(net).is_ok()).collect()
 }
 
+/// A group of repeated blocks by its first copy's path, the copy's index dropped: `keys[0]` is
+/// `keys`.
+fn group_name(path: &str) -> &str {
+    path.strip_suffix(']').and_then(|p| p.rsplit_once('['))
+        .filter(|(_, ix)| !ix.is_empty() && ix.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(path, |(base, _)| base)
+}
+
 /// The words for `key`, or None when the line shows nothing. `left` holds the nets the key's
 /// finished job left open and `why` its reasons, in words, for those it gave one; `name_of` names
-/// a net of the board.
-pub fn line_text(key: LineKey, left: &[NetId], why: &[(NetId, String)], name_of: impl Fn(NetId) -> Option<String>) -> Option<LineText> {
+/// a net of the board, `part_of` a part and `block_of` a block instance by its path.
+pub fn line_text(
+    key: LineKey, left: &[NetId], why: &[(NetId, String)], name_of: impl Fn(NetId) -> Option<String>,
+    part_of: impl Fn(CompId) -> Option<String>, block_of: impl Fn(BlockId) -> Option<String>,
+) -> Option<LineText> {
     let nets = |n: u32| if n == 1 { "net" } else { "nets" };
     match key {
-        LineKey::Job { status: s, organic } => {
+        LineKey::Job { status: s, organic, hand } => {
             let open = if s.failed > 0 { format!(", {} open", s.failed) } else { String::new() };
             // an organic job's grid pass lays straight copper first: the line says what it makes
             let method = if organic { "Organic: " } else { "" };
             let line = match s.phase {
                 // The job's first status comes before the worker has counted its nets.
+                JobPhase::Replace { pass } => format!("Placing again with the case's rooms ({pass} of 2)"),
+                JobPhase::WaitCase => "Waiting for the case to see the new parts".into(),
                 JobPhase::Nets if s.total == 0 => format!("{method}Starting the route"),
                 JobPhase::Nets => match s.current.and_then(&name_of) {
                     Some(name) => format!("{method}Routing {name}: {} of {} {}{open}", s.routed, s.total, nets(s.total)),
@@ -323,6 +378,29 @@ pub fn line_text(key: LineKey, left: &[NetId], why: &[(NetId, String)], name_of:
                 },
                 JobPhase::Cleanup => format!("Cleaning up: {} of {} {} routed{open}", s.routed, s.total, nets(s.total)),
                 JobPhase::Relax { step } => format!("Relaxing the copper, step {step}: {} of {} {} routed{open}", s.routed, s.total, nets(s.total)),
+                JobPhase::Seed { round } => {
+                    let parts = if s.total == 1 { "part" } else { "parts" };
+                    let room = if s.failed > 0 { format!(", {} without room", s.failed) } else { String::new() };
+                    match round {
+                        0 => format!("Placing {} {parts}", s.total),
+                        _ => format!("Making room for the tracks, round {round}: {} of {} {parts} placed{room}", s.routed, s.total),
+                    }
+                }
+                JobPhase::Compare { seated, plain, of } => {
+                    use fab_elec_route::progress::CompareStep;
+                    let step = |s| match s {
+                        CompareStep::Waiting => "waiting".into(),
+                        CompareStep::Round(0) => "initial placement".into(),
+                        CompareStep::Round(n) => format!("demand round {n}"),
+                        CompareStep::Group(n) => format!("matching group {} of {of}", n + 1),
+                        CompareStep::Done => "finished".into(),
+                    };
+                    format!("Comparing with and without the held groups' seats (with seats: {}, without seats: {})", step(seated), step(plain))
+                }
+                JobPhase::Match { group, of, first } => match block_of(first) {
+                    Some(path) => format!("Matching repeated blocks: {} ({} of {of})", group_name(&path), group + 1),
+                    None => format!("Matching repeated blocks ({} of {of})", group + 1),
+                },
             };
             let note = match (s.phase, s.blocked_by, s.retry) {
                 (JobPhase::Nets, Some(other), _) => {
@@ -334,6 +412,7 @@ pub fn line_text(key: LineKey, left: &[NetId], why: &[(NetId, String)], name_of:
                     let mut chars = label.chars();
                     chars.next().map(|first| first.to_uppercase().chain(chars).collect()).unwrap_or_default()
                 }
+                (JobPhase::Seed { .. } | JobPhase::Match { .. } | JobPhase::Compare { .. }, ..) => hand.words(part_of).unwrap_or_default(),
                 _ => String::new(),
             };
             Some(LineText { line, note, buttons: vec![(LineButton::Stop, "Stop"), (LineButton::Discard, "Discard")] })
@@ -450,10 +529,15 @@ impl RouteLine {
 
     /// Draw the line for `key` at the top centre of `pane`; nothing for None or a key without words.
     /// `left` holds the nets the key's finished job left open; `name_of` names a net of the shown
-    /// board.
-    pub fn draw(&mut self, cx: &mut Cx2d, pane: Rect, key: Option<LineKey>, left: &[NetId], why: &[(NetId, String)], name_of: impl Fn(NetId) -> Option<String>, theme: &BoardTheme) {
+    /// board, `part_of` a part and `block_of` a block instance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(
+        &mut self, cx: &mut Cx2d, pane: Rect, key: Option<LineKey>, left: &[NetId], why: &[(NetId, String)],
+        name_of: impl Fn(NetId) -> Option<String>, part_of: impl Fn(CompId) -> Option<String>,
+        block_of: impl Fn(BlockId) -> Option<String>, theme: &BoardTheme,
+    ) {
         if self.key != key || self.left != left {
-            self.text = key.and_then(|key| line_text(key, left, why, name_of));
+            self.text = key.and_then(|key| line_text(key, left, why, name_of, part_of, block_of));
             self.key = key;
             self.left = left.to_vec();
         }
@@ -586,7 +670,9 @@ mod tests {
 
     #[test]
     fn the_line_offers_routing_the_unrouted_nets_and_the_selection() {
-        let line_text = |key| super::line_text(key, &[], &[], |n: NetId| [(NetId(3), "SCL"), (NetId(5), "GND")].iter().find(|(id, _)| *id == n).map(|(_, name)| (*name).to_owned()));
+        let line_text = |key| super::line_text(key, &[], &[], |n: NetId| [(NetId(3), "SCL"), (NetId(5), "GND")].iter().find(|(id, _)| *id == n).map(|(_, name)| (*name).to_owned()),
+            |c: CompId| (c == CompId(7)).then(|| "U1".to_owned()),
+            |b: BlockId| [(BlockId(4), "keys.keys[0]"), (BlockId(5), "snare.hiss")].iter().find(|(id, _)| *id == b).map(|(_, path)| (*path).to_owned()));
         assert_eq!(line_text(LineKey::Idle { unrouted: 0, selected: 0, left: None }), None, "a fully routed board shows no line");
         let one = line_text(LineKey::Idle { unrouted: 1, selected: 0, left: None }).expect("an unrouted net shows the line");
         assert_eq!((one.line.as_str(), one.buttons.as_slice()), ("1 net unrouted", &[(LineButton::RouteAll, "Route all")][..]),
@@ -603,7 +689,7 @@ mod tests {
             job: JobId(1), unit: BoardId(0), phase: JobPhase::Nets, current: Some(NetId(3)), routed: 4, failed: 0,
             total: 9, attempt: 0, retry: None, blocked_by: None,
         };
-        let job = |status: JobStatus| line_text(LineKey::Job { status, organic: false });
+        let job = |status: JobStatus| line_text(LineKey::Job { status, organic: false, hand: HandLine::default() });
         let running = job(status).expect("a running job has a line");
         assert_eq!((running.line.as_str(), running.note.as_str()), ("Routing SCL: 4 of 9 nets", ""), "running: the net and the progress");
         assert_eq!(running.buttons.iter().map(|(b, _)| *b).collect::<Vec<_>>(), [LineButton::Stop, LineButton::Discard],
@@ -618,12 +704,36 @@ mod tests {
         assert_eq!(job(JobStatus { total: 1, routed: 0, ..status }).unwrap().line, "Routing SCL: 0 of 1 net", "one net is singular");
         assert_eq!(job(JobStatus { total: 0, routed: 0, current: None, ..status }).unwrap().line, "Starting the route",
             "before the worker has counted its nets the line says the route starts, not 0 of 0");
-        let organic = |status: JobStatus| line_text(LineKey::Job { status, organic: true });
+        let organic = |status: JobStatus| line_text(LineKey::Job { status, organic: true, hand: HandLine::default() });
         assert_eq!(organic(JobStatus { total: 0, routed: 0, current: None, ..status }).unwrap().line, "Organic: Starting the route",
             "an organic job says so from its first moment");
         assert_eq!(organic(status).unwrap().line, "Organic: Routing SCL: 4 of 9 nets", "an organic job's grid pass says it is organic");
         assert_eq!(organic(JobStatus { phase: JobPhase::Relax { step: 7 }, current: None, ..status }).unwrap().line,
             "Relaxing the copper, step 7: 4 of 9 nets routed", "the relax says what it does");
+        let placing = |round, routed, failed| job(JobStatus { phase: JobPhase::Seed { round }, current: None, routed, failed, ..status }).unwrap();
+        assert_eq!(placing(0, 0, 0).line, "Placing 9 parts", "a place job's first seeding counts the parts in scope");
+        assert_eq!(placing(2, 8, 1).line, "Making room for the tracks, round 2: 8 of 9 parts placed, 1 without room",
+            "a demand round counts the parts placed and those without room");
+        assert_eq!(placing(1, 9, 0).buttons.iter().map(|(b, _)| *b).collect::<Vec<_>>(), [LineButton::Stop, LineButton::Discard],
+            "a place job stops and discards as a route does");
+        use fab_elec_route::progress::CompareStep;
+        let phase = JobPhase::Compare { seated: CompareStep::Group(2), plain: CompareStep::Round(1), of: 7 };
+        let comparing = job(JobStatus { phase, ..status }).unwrap();
+        assert!(comparing.line.contains("with seats: matching group 3 of 7") && comparing.line.contains("without seats: demand round 1"));
+        let matching = |group, of, first| job(JobStatus { phase: JobPhase::Match { group, of, first }, current: None, ..status }).unwrap().line;
+        assert_eq!(matching(2, 7, BlockId(4)), "Matching repeated blocks: keys.keys (3 of 7)",
+            "conform names the group it matches by its first copy, index dropped, and counts from one");
+        assert_eq!(matching(0, 2, BlockId(5)), "Matching repeated blocks: snare.hiss (1 of 2)", "a copy's path without an index is its name");
+        assert_eq!(matching(0, 1, BlockId(9)), "Matching repeated blocks (1 of 1)", "a group whose block is unknown is still counted");
+        let seed = JobStatus { phase: JobPhase::Seed { round: 1 }, current: None, ..status };
+        let hand = |hand: HandLine| line_text(LineKey::Job { status: seed, organic: false, hand }).unwrap().note;
+        assert_eq!(placing(1, 9, 0).note, "", "a place that takes no hand-drawn copper off adds no note");
+        assert_eq!(hand(HandLine::of(&[HandCopper { comp: CompId(7), tracks: 3, vias: 0 }])), "Removes 3 hand-drawn tracks from U1; Discard keeps them",
+            "the hand-drawn tracks a place takes off are counted against their part");
+        assert_eq!(hand(HandLine::of(&[HandCopper { comp: CompId(7), tracks: 1, vias: 0 }])), "Removes 1 hand-drawn track from U1; Discard keeps it",
+            "one hand-drawn track is singular");
+        assert_eq!(hand(HandLine::of(&[HandCopper { comp: CompId(7), tracks: 2, vias: 1 }, HandCopper { comp: CompId(9), tracks: 1, vias: 0 }])),
+            "Removes 3 hand-drawn tracks and 1 via from 2 parts; Discard keeps them", "several parts are counted, vias apart");
 
         let design = ledctl();
         let board = design.units.iter().find_map(|u| u.board.as_deref()).expect("ledctl has a board");
@@ -655,20 +765,20 @@ mod tests {
         let key = |left| LineKey::Idle { unrouted: 6, selected: 0, left };
         let four = [NetId(3), NetId(5), NetId(6), NetId(8)];
         let why = [(NetId(3), "no path. Blocked by GND; try clearing their routes and routing again".to_owned())];
-        assert_eq!(line_text(key(Some(JobId(4))), &four, &why, name_of).unwrap().note, "Still open after the last route: SCL, GND, VBUS and 1 more",
+        assert_eq!(line_text(key(Some(JobId(4))), &four, &why, name_of, |_| None, |_| None).unwrap().note, "Still open after the last route: SCL, GND, VBUS and 1 more",
             "the open nets are named, the first three and a count of the rest");
-        assert_eq!(line_text(key(Some(JobId(4))), &four[..1], &[], name_of).unwrap().note, "Still open after the last route: SCL", "one open net");
-        assert_eq!(line_text(key(Some(JobId(4))), &four[..1], &[], name_of).unwrap().buttons.iter().map(|(b, _)| *b).collect::<Vec<_>>(),
+        assert_eq!(line_text(key(Some(JobId(4))), &four[..1], &[], name_of, |_| None, |_| None).unwrap().note, "Still open after the last route: SCL", "one open net");
+        assert_eq!(line_text(key(Some(JobId(4))), &four[..1], &[], name_of, |_| None, |_| None).unwrap().buttons.iter().map(|(b, _)| *b).collect::<Vec<_>>(),
             [LineButton::RouteAll, LineButton::Reroute], "the nets a route left open can be re-routed");
-        assert_eq!(line_text(LineKey::Idle { unrouted: 6, selected: 1, left: Some(JobId(4)) }, &four[..1], &[], name_of).unwrap()
+        assert_eq!(line_text(LineKey::Idle { unrouted: 6, selected: 1, left: Some(JobId(4)) }, &four[..1], &[], name_of, |_| None, |_| None).unwrap()
             .buttons.iter().map(|(b, _)| *b).collect::<Vec<_>>(), [LineButton::RouteAll, LineButton::Reroute, LineButton::RouteSelected],
             "Route selected, which comes and goes with the selection, comes last, so Re-route never moves with it");
-        assert!(line_text(key(None), &four, &why, name_of).unwrap().buttons.iter().all(|(b, _)| *b != LineButton::Reroute),
+        assert!(line_text(key(None), &four, &why, name_of, |_| None, |_| None).unwrap().buttons.iter().all(|(b, _)| *b != LineButton::Reroute),
             "without nets a route left open there is nothing to re-route");
-        assert_eq!(line_text(key(Some(JobId(4))), &four[..1], &why, name_of).unwrap().note,
+        assert_eq!(line_text(key(Some(JobId(4))), &four[..1], &why, name_of, |_| None, |_| None).unwrap().note,
             "SCL: no path. Blocked by GND; try clearing their routes and routing again", "one open net with its reason says why and what to try");
-        assert_eq!(line_text(key(None), &four, &why, name_of).unwrap().note, "", "no finished job, no note");
-        assert_eq!(line_text(key(Some(JobId(4))), &[], &why, name_of).unwrap().note, "", "a job that left nothing open adds no note");
+        assert_eq!(line_text(key(None), &four, &why, name_of, |_| None, |_| None).unwrap().note, "", "no finished job, no note");
+        assert_eq!(line_text(key(Some(JobId(4))), &[], &why, name_of, |_| None, |_| None).unwrap().note, "", "a job that left nothing open adds no note");
 
         let design = ledctl();
         let board = design.units.iter().find_map(|u| u.board.as_deref()).expect("ledctl has a board");

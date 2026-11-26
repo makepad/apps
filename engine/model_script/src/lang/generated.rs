@@ -112,7 +112,7 @@ impl Lower<'_, '_, '_> {
                         *value = V::Str(name.clone());
                         panel = Some(name);
                     }
-                    V::Obj(Arc::new(Obj { ident: params.ident, part: None, proto: None, fields, items: params.items.clone(), loc: params.loc })).splash().or_else(|e| f.err(e))?
+                    V::Obj(Arc::new(Obj { ident: params.ident, part: None, proto: None, fields, items: params.items.clone(), children: params.children.clone(), loc: params.loc })).splash().or_else(|e| f.err(e))?
                 }
                 Some(_) => return f.err("parameters must be a plain object"),
             };

@@ -1,0 +1,4 @@
+use mod.scene.*
+// A Seq3D layer's scene (load/seq3d.rs): its template run for the layer, read into the `seq3d` input.
+use mod.motion.modules.seq3d.*
+seq3d_scene(in(@seq3d))

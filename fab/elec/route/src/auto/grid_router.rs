@@ -13,7 +13,8 @@
 //! have none), then from the whole tree to those, then today's query. An end no search reaches
 //! stays free, and DRC reports it; the net still connects.
 //!
-//! After the first pass, each pass tries every net left `Blocked`, in plan order: a plain
+//! At `Effort::Fast` the job ends after the first pass. At `Effort::Full`, after the first pass,
+//! each pass tries every net left `Blocked`, in plan order: a plain
 //! route first (the board may have changed), then rip its blockers, route it, and reroute the
 //! ripped nets. A net that finds itself blocked only by nets neither attempted nor ripped yet rips
 //! those too and routes on: the attempted net when it meets one blockade after another, and a
@@ -90,8 +91,9 @@ use crate::grid::lift::{lift, Lifted};
 use crate::grid::search::{search_blockers, search_widening, Costs, Query, Rip};
 use crate::grid::{Cell, Grid, GridSpec, ObstacleSource, PlaneId, Probe};
 use crate::problem::{anchor_point, class_track_width, rnet, Autorouter, RNet, RouteProblem, Terminal};
+use crate::request::Effort;
 use crate::progress::{Progress, RetryWhy};
-use crate::solution::{Kept, NetCopper, Reason, RouteSolution};
+use crate::solution::{Kept, NetCopper, Reason, RouteSolution, SearchExpansions};
 use crate::solvers;
 use crate::source::WorldSource;
 use crate::verify::{new_pieces, verify};
@@ -139,6 +141,7 @@ impl Autorouter for GridRouter {
                 sol.open.push((n.net, Reason::Terminal { at, with: None }));
             }
             sol.metrics.nets_open = sol.open.len() as u32;
+            sol.metrics.work.open_after_first_pass = sol.metrics.nets_open;
             return sol;
         };
         progress.set_total(p.nets.len() as u32);
@@ -159,7 +162,9 @@ impl Autorouter for GridRouter {
             }
             r.publish(progress, &mut before);
         }
-        if !progress.cancelled() {
+        // Cancellation can leave the last planned nets open without an offer.
+        r.sol.metrics.work.open_after_first_pass = r.sol.metrics.nets_open;
+        if p.effort == Effort::Full && !progress.cancelled() {
             r.rip_up(progress, &mut before);
         }
         r.sol
@@ -224,6 +229,8 @@ struct Router<'p> {
     next_id: u32,
     sol: RouteSolution,
     work: u64,
+    // Publish the search breakdown at the same boundary as the existing expansion total.
+    by_search: SearchExpansions,
     settled: Settled,
     stuck: Vec<Stuck>,
     contested: BTreeMap<NetId, Vec<(usize, Cell)>>,
@@ -271,6 +278,7 @@ impl<'p> Router<'p> {
             next_id: p.board.next_item,
             sol: RouteSolution::default(),
             work: 0,
+            by_search: SearchExpansions::default(),
             settled: Settled {
                 board: (*p.board).clone(),
                 fills,
@@ -295,6 +303,9 @@ impl<'p> Router<'p> {
     fn publish(&mut self, progress: &Progress, before: &mut u64) {
         self.sol.metrics.work.transactions += 1;
         self.sol.metrics.work.expansions = self.work;
+        self.sol.metrics.work.by_search = self.by_search;
+        let s = &self.by_search;
+        debug_assert_eq!(s.widening + s.blockers + s.priced_blockers + s.what_if + s.escape, self.work);
         progress.add_work(self.work - *before);
         *before = self.work;
         progress.offer(self.sol.metrics.work.transactions, &self.sol);
@@ -302,6 +313,7 @@ impl<'p> Router<'p> {
 
     /// Negotiate congestion until a whole pass cannot reduce the number of open nets.
     fn rip_up(&mut self, progress: &Progress, before: &mut u64) {
+        let first_pass_work = self.work;
         loop {
             let open_at_start = self.sol.open.len();
             let candidates: Vec<_> = self.p.nets.iter()
@@ -317,7 +329,11 @@ impl<'p> Router<'p> {
                     if progress.cancelled() {
                         return;
                     }
-                    match self.attempt(net, progress, before) {
+                    let outcome = self.attempt(net, progress, before);
+                    let counts = &self.sol.metrics.work.by_attempt;
+                    debug_assert_eq!(counts.kept + counts.rolled_back, self.work - first_pass_work,
+                        "every expansion since the first pass belongs to one completed rip-up attempt");
+                    match outcome {
                         Outcome::Failed { learned: true } => continue,
                         Outcome::Accepted | Outcome::Stop | Outcome::Failed { learned: false } => break,
                     }
@@ -340,6 +356,8 @@ impl<'p> Router<'p> {
 
     fn try_attempt(&mut self, n: NetId, progress: &Progress, before: &mut u64) -> Outcome {
         let p = self.p;
+        let started = self.work;
+        let mut unkeepable_at = None;
         let saved = Snapshot {
             settled: self.settled.clone(),
             overlay: self.world.clone().into_overlay(),
@@ -350,7 +368,7 @@ impl<'p> Router<'p> {
         let open_at_start: BTreeSet<NetId> = self.sol.open.iter().map(|(net, _)| *net).collect();
         let mut area = BBox::EMPTY;
         let Some(rn) = rnet(&self.settled.board, &p.rules, &self.settled.conn, &p.stack, n) else {
-            self.restore_attempt(&saved, area);
+            self.rollback_attempt(&saved, area, started, unkeepable_at);
             return Outcome::Stop;
         };
         self.sol.open.retain(|(net, _)| *net != n);
@@ -359,6 +377,7 @@ impl<'p> Router<'p> {
         self.contested.clear();
         self.transaction(&rn, &[], BBox::EMPTY, progress);
         if self.sol.open.len() < open_before {
+            self.sol.metrics.work.by_attempt.kept += self.work - started;
             self.keep(n, &[], &saved);
             self.publish(progress, before);
             return Outcome::Accepted;
@@ -370,7 +389,7 @@ impl<'p> Router<'p> {
                 (*at, by.clone(), cells.clone())
             }
             _ => {
-                self.restore_attempt(&saved, area);
+                self.rollback_attempt(&saved, area, started, unkeepable_at);
                 self.sol.open.iter_mut().find(|(net, _)| *net == n)
                     .expect("the snapshot has the attempted net open").1 = reason;
                 return Outcome::Stop;
@@ -390,7 +409,7 @@ impl<'p> Router<'p> {
             self.rip(n, at, &by, &contested, &mut taken, &mut area, progress, before);
             self.attempt = Some((n, taken.whole.clone()));
             if progress.cancelled() {
-                self.restore_attempt(&saved, area);
+                self.rollback_attempt(&saved, area, started, unkeepable_at);
                 self.publish(progress, before);
                 return Outcome::Stop;
             }
@@ -404,7 +423,12 @@ impl<'p> Router<'p> {
                 self.sol.metrics.nets_routed += 1;
             }
             self.publish(progress, before);
-            let Some((next_at, next_by, cells)) = self.fresh_blockers(n, n, &taken.whole) else { break };
+            let Some((next_at, next_by, cells)) = self.fresh_blockers(n, n, &taken.whole) else {
+                if self.sol.open.iter().any(|(open, _)| *open == n) {
+                    unkeepable_at = Some(self.work);
+                }
+                break;
+            };
             (at, by) = (next_at, next_by);
             contested = cells.clone();
             history.extend(cells);
@@ -419,7 +443,7 @@ impl<'p> Router<'p> {
         while let Some(&net) = queue.get(next) {
             next += 1;
             if progress.cancelled() {
-                self.restore_attempt(&saved, area);
+                self.rollback_attempt(&saved, area, started, unkeepable_at);
                 self.publish(progress, before);
                 return Outcome::Stop;
             }
@@ -436,10 +460,15 @@ impl<'p> Router<'p> {
                     self.sol.metrics.nets_routed += 1;
                 }
                 self.publish(progress, before);
-                let Some((at, by, cells)) = self.fresh_blockers(net, n, &taken.whole) else { break };
+                let Some((at, by, cells)) = self.fresh_blockers(net, n, &taken.whole) else {
+                    if unkeepable_at.is_none() && self.sol.open.iter().any(|(open, _)| *open == net) {
+                        unkeepable_at = Some(self.work);
+                    }
+                    break;
+                };
                 self.rip(net, at, &by, &cells, &mut taken, &mut area, progress, before);
                 if progress.cancelled() {
-                    self.restore_attempt(&saved, area);
+                    self.rollback_attempt(&saved, area, started, unkeepable_at);
                     self.publish(progress, before);
                     return Outcome::Stop;
                 }
@@ -459,6 +488,7 @@ impl<'p> Router<'p> {
         });
         if rejoined && self.sol.open.len() < open_before {
             // Offered as its own step, so the stream ends on the solution with its record.
+            self.sol.metrics.work.by_attempt.kept += self.work - started;
             self.keep(n, &taken.order, &saved);
             self.publish(progress, before);
             return Outcome::Accepted;
@@ -471,7 +501,7 @@ impl<'p> Router<'p> {
         }
         let pairs = self.failed.entry(n).or_default();
         let learned = culprits.into_iter().fold(false, |new, net| pairs.insert(net) | new);
-        self.restore_attempt(&saved, area);
+        self.rollback_attempt(&saved, area, started, unkeepable_at);
         for (li, cell) in history {
             self.grid.add_extra(li, cell, HISTORY);
         }
@@ -705,6 +735,16 @@ impl<'p> Router<'p> {
             .fold(lost, |area, item| area.union(item.bbox(board)))
     }
 
+    /// Charge a finished rollback, including escape floods while restoring the guard.
+    fn rollback_attempt(&mut self, saved: &Snapshot, area: BBox, started: u64, unkeepable_at: Option<u64>) {
+        self.restore_attempt(saved, area);
+        let counts = &mut self.sol.metrics.work.by_attempt;
+        counts.rolled_back += self.work - started;
+        if let Some(mark) = unkeepable_at {
+            counts.after_unkeepable += self.work - mark;
+        }
+    }
+
     /// Restore by item identity: ripping can shrink or reorder the snapshot's added items. The
     /// guard table follows the restored board.
     fn restore_attempt(&mut self, saved: &Snapshot, mut area: BBox) {
@@ -915,7 +955,10 @@ impl<'p> Router<'p> {
                     window,
                     guard: None,
                 };
-                let path = search_widening(&mut self.grid, &src, &q, &self.costs, &mut self.work)?;
+                let before = self.work;
+                let path = search_widening(&mut self.grid, &src, &q, &self.costs, &mut self.work);
+                self.by_search.widening += self.work - before;
+                let path = path?;
                 let spec = &self.grid.spec;
                 let clearance = p.rules.max_clearance() + spec.slack();
                 let w = s.w + 2 * clearance;
@@ -1081,7 +1124,10 @@ impl<'p> Router<'p> {
                 guard,
             };
             let src = WorldSource::new(&self.world, &p.rules, &p.board, &rip);
-            if let Some(path) = search_widening(&mut self.grid, &src, &q, &self.costs, &mut self.work) {
+            let before = self.work;
+            let path = search_widening(&mut self.grid, &src, &q, &self.costs, &mut self.work);
+            self.by_search.widening += self.work - before;
+            if let Some(path) = path {
                 found = Some((path, stage, stage_sources, stage_targets));
                 break;
             }
@@ -1271,7 +1317,9 @@ impl<'p> Router<'p> {
         cells.dedup();
         let input = EscapeIn { net, li, track, via: via_plane, access: cells, w, via_pad: via.pad };
         let clearance = p.rules.max_clearance() + self.grid.spec.slack();
+        let before = self.work;
         let mut found = escape(&mut self.grid, &src, &input, clearance, &mut self.work);
+        self.by_search.escape += self.work - before;
         let spec = &self.grid.spec;
         let reach = i64::from(src.max_need(&probe)) + spec.padding(&probe);
         let pitch = i64::from(spec.pitch);
@@ -1400,12 +1448,16 @@ impl<'p> Router<'p> {
                 src.owners_on(&probe, spec.layers[li], spec.centre(a), spec.centre(b), rnet.net)
             };
             let mut r = Rip { cost: &cost, owners: &mut owners };
+            let before = self.work;
             let mut found = search_blockers(&mut self.grid, &src, &all, &self.costs, &mut r, &mut self.work);
+            self.by_search.blockers += self.work - before;
             // Only an answer that names a barred net is asked again, with the barred nets priced.
             if found.as_ref().is_some_and(|b| b.nets.iter().any(|net| barred.contains(net))) {
                 let priced = |net: NetId| if barred.contains(&net) { BARRED } else { RIP_CELL };
                 let mut r = Rip { cost: &priced, owners: &mut owners };
+                let before = self.work;
                 found = search_blockers(&mut self.grid, &src, &all, &self.costs, &mut r, &mut self.work);
+                self.by_search.priced_blockers += self.work - before;
             }
             found
         };
@@ -1457,7 +1509,10 @@ impl<'p> Router<'p> {
             src.owners_on(&probe, spec.layers[li], spec.centre(a), spec.centre(b), rnet.net)
         };
         let mut r = Rip { cost: &cost, owners: &mut owners };
-        let found = search_blockers(grid, &src, &all, &self.costs, &mut r, &mut self.work)?;
+        let before = self.work;
+        let found = search_blockers(grid, &src, &all, &self.costs, &mut r, &mut self.work);
+        self.by_search.what_if += self.work - before;
+        let found = found?;
         let &(first_li, first) = found.contested.first()?;
         let mut by: Vec<Sel> = Vec::new();
         for &(li, cell) in &found.contested {
@@ -1628,10 +1683,12 @@ mod tests {
         let touched = std::mem::take(&mut r.touched);
         let kept = std::mem::take(&mut r.guard);
         let work = r.work;
+        let by_search = r.by_search;
         r.refresh_guard();
         let rebuilt = std::mem::replace(&mut r.guard, kept);
         r.touched = touched;
         r.work = work;
+        r.by_search = by_search;
         rebuilt
     }
 

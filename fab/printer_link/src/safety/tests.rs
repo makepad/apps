@@ -296,6 +296,19 @@ fn extrusions_may_not_plough_through_the_layer() {
     // Ironing goes over the surface it irons.
     let iron = format!("; FEATURE: Ironing\nG1 X150 Y160 E{}\n", e(3.0));
     check(&file(&[], &start, &layer_then("X210 Y160", &iron))).unwrap();
+
+    // A thin wall turns gently alongside two steps in an earlier wall.
+    let bends = format!(
+        "G1 X170 Y156 E{four} F1200\nG1 X170 Y158 E{two}\nG1 X174 Y158 E{four}\nG1 X174 Y156 E{two}\n\
+         G1 X178 Y156 E{four}\nG1 X178 Y158 E{two}\nG1 X182 Y158 E{four}\nG1 X182 Y156 E{two}\n\
+         G1 X186 Y156 E{four}\nG1 X166 Y158.1 F30000\n; FEATURE: Inner wall\n\
+         G1 X178 Y158.15 E{twelve} F1200\nG1 X190 Y158.1 E{twelve}\n",
+        four = e(4.0), two = e(2.0), twelve = e(12.0_f64.hypot(0.05)),
+    );
+    check(&file(&[], &start, &layer_then("X166 Y156", &bends))).unwrap();
+    // Solid infill crosses three interior wall joints on the diagonal y = x - 20.
+    let diagonal = format!("; FEATURE: Internal solid infill\nG1 X194 Y174 E{} F1200\n", e(10.0_f64.hypot(10.0)));
+    refused(&file(&[], &start, &layer_then("X204 Y184", &diagonal)), "crossing");
 }
 
 fn zip(members: &[(&str, &[u8])]) -> Vec<u8> {
@@ -665,6 +678,11 @@ fn heads_without_their_own_areas_reach_the_whole_printable_volume() {
     let first = family::FAMILIES.iter().find(|f| f.flavor == Flavor::Mask).unwrap().models[0];
     let p = MachineProfile::from_settings(&settings(first, "0"), vec![]).expect("claimed fixture");
     assert_eq!((p.extruder_areas.len(), p.extruder_heights), (0, vec![0.0]));
+    // A single-nozzle printer of the default family (a P1S, X1C, A1 or H2S: its installed profile
+    // leaves the per-nozzle keys at their defaults, no areas and height 0) reaches the whole volume.
+    let one = |k: &str| if k == "nozzle_diameter" { vec!["0.4".to_string()] } else { settings(first, "0")(k) };
+    let p = MachineProfile::from_settings(&one, vec![]).expect("claimed fixture");
+    assert_eq!((p.extruder_areas, p.extruder_heights), (vec![area.clone()], vec![40.0]), "a single nozzle of the default family reaches the whole bed");
 }
 
 #[test]

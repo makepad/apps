@@ -1,0 +1,11 @@
+use mod.scene.*; use mod.post
+// A glowing wireframe maze rising cell by cell from the centre, the camera
+// gliding over it; GlowWireMaterial on any mesh gives the same look.
+Scene3D{ background: #03040a tone_mapping: @aces
+  camera: Camera{position: tween(vec3(0, 9, 9), vec3(4, 4, 5), 0, 6, @ease_in_out_sine) target: vec3(0, 0, 0) fov: 45}
+  post: [post.Bloom{strength: 1.1 threshold: 0.6}]
+  lights: [AmbientLight{intensity: 0.2}]
+  children: [
+    Fx{preset: @wire_maze grid: 14 spacing: 0.8 height: 0.9 duration: 2.5 color: #3fd6ff color2: #1a3a7a seed: 4}
+    Mesh{geometry: IcosahedronGeometry{radius: 0.7 detail: 1} position: vec3(0, 1.4, 0) rotation: spin(vec3(20, 45, 0)) material: GlowWireMaterial{color: #ff4fa3 emissive: #ff4fa3}}
+  ] }

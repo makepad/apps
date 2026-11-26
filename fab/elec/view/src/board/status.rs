@@ -85,9 +85,11 @@ pub(super) struct BoardStatus {
     pub(super) default_track: Nm,
     default_via: Nm,
     open: Option<usize>,
+    /// The unit waits for its whole-board checks: the row says so in place of the unrouted count.
+    checking: bool,
     board: Option<(usize, u64)>,
     counts: [usize; 4],
-    shown_counts: Option<([usize; 4], Option<usize>, Option<String>)>,
+    shown_counts: Option<([usize; 4], Option<usize>, bool, Option<String>)>,
     layers: Vec<LayerId>,
     active: Option<LayerId>,
     /// The swatch's ink as written, and the style reload it was written after (a reload puts
@@ -107,14 +109,16 @@ impl BoardStatus {
             return false;
         }
         let (track, via) = rule_sizes(snap.map(Arc::as_ref), board.unit);
-        let open = unrouted(snap.map(Arc::as_ref), board, supplied.map(Arc::as_ref));
-        let changed = (self.default_track, self.default_via, self.open) != (track, via, open);
+        let checking = snap.is_some_and(|snap| snap.checking(board.unit));
+        let open = if checking { None } else { unrouted(snap.map(Arc::as_ref), board, supplied.map(Arc::as_ref)) };
+        let changed = (self.default_track, self.default_via, self.open, self.checking) != (track, via, open, checking);
         self.source_board = Some(key);
         self.snapshot = snap.map(Arc::downgrade);
         self.supplied = supplied.map(Arc::downgrade);
         self.default_track = track;
         self.default_via = via;
         self.open = open;
+        self.checking = checking;
         changed
     }
 
@@ -174,12 +178,14 @@ impl BoardStatus {
             self.counts = [pads, board.vias.len(), board.tracks.len(), board.nets.len()];
         }
         let open = self.open;
-        let shown = Some((self.counts, open, hover));
+        let shown = Some((self.counts, open, self.checking, hover));
         if self.shown_counts != shown {
             let [pads, vias, tracks, nets] = self.counts;
-            let mut text = shown.as_ref().and_then(|s| s.2.as_ref()).map_or_else(String::new, |hover| format!("{hover}   ·   "));
+            let mut text = shown.as_ref().and_then(|s| s.3.as_ref()).map_or_else(String::new, |hover| format!("{hover}   ·   "));
             text.push_str(&format!("Pads {pads}   Vias {vias}   Tracks {tracks}   Nets {nets}"));
-            if let Some(n) = open {
+            if self.checking {
+                text.push_str("   Checking…");
+            } else if let Some(n) = open {
                 text.push_str(&format!("   Unrouted {n}"));
             }
             status.label(cx, ids!(s_counts)).set_text(cx, &text);

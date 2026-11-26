@@ -12,8 +12,17 @@ pub enum By {
     Person,
     /// An AI tool dispatch, identified by its conversation turn and call.
     Ai { turn: u64, call: u64 },
+    /// A call from an outside agent, an MCP client or remote tool, outside the conversation.
+    Agent { call: u64 },
     /// A document changed on disk.
     Disk,
+}
+
+impl By {
+    /// Whether a program made the call and consumes its tool reply.
+    pub fn is_tool(&self) -> bool {
+        matches!(self, Self::Ai { .. } | Self::Agent { .. })
+    }
 }
 
 /// Put a part's footprint on a board in the same step that adds or names it.

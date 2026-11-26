@@ -1,0 +1,43 @@
+# Makepad Work: two people, each with their own local AI, finish Makepad apps together. The
+# window: the project's tasks and the persistent chat panel, with `@ai` for your own AI; the AI
+# tools (`work.*`) for that AI; the core (log, fold, queue) is makepad-work-core.
+[package]
+name = "makepad-work"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+default-run = "makepad-work"
+
+# The text macOS shows when Work first links directly to a device on the local network
+# (`cargo makepad desktop bundle`).
+[package.metadata.makepad.desktop.usage]
+local_network = "Work links to a collaborator's device when you're both on this network."
+
+[lib]
+name = "makepad_create"
+path = "src/lib.rs"
+
+[[bin]]
+name = "makepad-work"
+path = "src/main.rs"
+
+[features]
+default = ["tweaker"]
+# The design overlay (Shift+F10 with the dev overlays on); release builds go without it.
+tweaker = ["dep:makepad-widgets-tweaker", "makepad-widgets/data", "makepad-widgets/dock", "makepad-widgets/fab"]
+
+[dependencies]
+makepad-canvas = { path = "../../../../libs/canvas" }
+makepad-widgets = { path = "../../../../widgets", default-features = false, features = ["glass", "rich_text"] }
+makepad-widgets-tweaker = { path = "../../../../widgets/families/tweaker", optional = true }
+makepad-code-editor = { path = "../../../../code_editor" }
+makepad-markdown-editor = { path = "../../../../widgets/families/markdown_editor" }
+makepad-ai-services = { path = "../../../../libs/ai/services" }
+makepad-remote = { path = "../../../../libs/remote" }
+makepad-strict-json = { path = "../../../../libs/strict_json" }
+makepad-network = { path = "../../../../platform/network" }
+# The link socket tied to one network interface (MAKEPAD_WORK_LINK_IF, a developer switch).
+makepad-core-util = { path = "../../../../libs/core_util" }
+makepad-work-core = { path = "../core" }
+makepad-splash-syntax = { path = "../../libs/splash_syntax" }

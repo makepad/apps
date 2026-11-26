@@ -47,8 +47,10 @@ pub enum CloudGenus {
     Mammatus,
 }
 
-/// Phase 1's types, in chart order: the ones drawn, the Type dropdown's rows and the ones set_clouds accepts.
-pub const CLOUD_GENUS_BUILT: [CloudGenus; 9] = [
+/// Phase 1's types, in chart order: the ones drawn, the Type dropdown's rows and the ones set_clouds accepts. The
+/// Lenticular was built and taken out (the owner, 2026-11-07): a saved one loads as a type this build does not draw,
+/// kept and not drawn, its block skipped by the lenient load.
+pub const CLOUD_GENUS_BUILT: [CloudGenus; 8] = [
     CloudGenus::Cirrus,
     CloudGenus::Cirrostratus,
     CloudGenus::Altocumulus,
@@ -57,7 +59,6 @@ pub const CLOUD_GENUS_BUILT: [CloudGenus; 9] = [
     CloudGenus::Stratocumulus,
     CloudGenus::Cumulus,
     CloudGenus::Cumulonimbus,
-    CloudGenus::Lenticular,
 ];
 
 /// Each type's salt in a layer's streams (`fresh_cloud_seed`, `cloud_layer_seed`): [g] = 0x85EB_CA6B * (g + 1),
@@ -206,6 +207,8 @@ pub const CLOUD_CIRRUS_FALL_STREAKS_RANGE: (f32, f32) = (0.0, 1.0);
 pub const CLOUD_CIRRUS_PATCHINESS_RANGE: (f32, f32) = (0.0, 1.0);
 /// Cirrus: `opacity`.
 pub const CLOUD_CIRRUS_OPACITY_RANGE: (f32, f32) = (0.0, 1.0);
+/// Cirrus: `contrails` (None is 0).
+pub const CLOUD_CIRRUS_CONTRAILS_RANGE: (f32, f32) = (0.0, 1.0);
 /// Cirrostratus: `base_m`, metres (a high veil).
 pub const CLOUD_CIRROSTRATUS_BASE_RANGE: (f32, f32) = (5000.0, 13_000.0);
 /// Cirrostratus: `size_km` (a logarithmic slider): how large its mottles are.
@@ -318,24 +321,6 @@ pub const CLOUD_CUMULONIMBUS_DARKNESS_RANGE: (f32, f32) = (0.0, 1.0);
 pub const CLOUD_CUMULONIMBUS_RAIN_SHAFT_RANGE: (f32, f32) = (0.0, 1.0);
 /// Cumulonimbus: `mammatus`.
 pub const CLOUD_CUMULONIMBUS_MAMMATUS_RANGE: (f32, f32) = (0.0, 1.0);
-/// Lenticular: `base_m`, the lowest plate's underside, metres.
-pub const CLOUD_LENTICULAR_BASE_RANGE: (f32, f32) = (2000.0, 12_000.0);
-/// Lenticular: `distance_km`, from the viewer to the stack's middle.
-pub const CLOUD_LENTICULAR_DISTANCE_RANGE: (f32, f32) = (2.0, 80.0);
-/// Lenticular: `length_km`, the plates' length across the wind (a logarithmic slider).
-pub const CLOUD_LENTICULAR_LENGTH_RANGE: (f32, f32) = (1.0, 30.0);
-/// Lenticular: `width_km`, the plates' width along the wind (a logarithmic slider).
-pub const CLOUD_LENTICULAR_WIDTH_RANGE: (f32, f32) = (1.0, 15.0);
-/// Lenticular: `plates`, how many are stacked (whole plates).
-pub const CLOUD_LENTICULAR_PLATES_RANGE: (f32, f32) = (1.0, 6.0);
-/// Lenticular: `thickness_m`, a plate's thickness at its middle, metres.
-pub const CLOUD_LENTICULAR_THICKNESS_RANGE: (f32, f32) = (50.0, 800.0);
-/// Lenticular: `gap_m`, the air between two plates, metres.
-pub const CLOUD_LENTICULAR_GAP_RANGE: (f32, f32) = (50.0, 800.0);
-/// Lenticular: `smoothness`.
-pub const CLOUD_LENTICULAR_SMOOTHNESS_RANGE: (f32, f32) = (0.0, 1.0);
-/// Lenticular: `striations`.
-pub const CLOUD_LENTICULAR_STRIATIONS_RANGE: (f32, f32) = (0.0, 1.0);
 
 /// The cloud layers (`SkyParams::cloud_stack`).
 #[derive(Clone, Debug, PartialEq, SerJson, DeJson)]
@@ -396,7 +381,6 @@ pub struct CloudLayerParams {
     pub stratocumulus: Option<StratocumulusParams>,
     pub cumulus: Option<CumulusParams>,
     pub cumulonimbus: Option<CumulonimbusParams>,
-    pub lenticular: Option<LenticularParams>,
     /// Set by the lift only and never shown (design §1.2): the layer is drawn as the older code drew it until a row
     /// that code cannot draw changes (`CloudLayerParams::edited`). Always the last field.
     pub classic: Option<ClassicLook>,
@@ -426,7 +410,6 @@ impl Default for CloudLayerParams {
             stratocumulus: None,
             cumulus: None,
             cumulonimbus: None,
-            lenticular: None,
             classic: None,
         }
     }
@@ -451,11 +434,15 @@ pub struct CirrusParams {
     pub patchiness: f32,
     /// 0..=1 (0.5).
     pub opacity: f32,
+    /// 0..=1 (None: 0): aircraft trails at the layer's height (Cirrus homogenitus, cloud_sheets.rs `Trail`; the weather
+    /// lane, 2026-11-09): one at a little, four at 1, as the seed lays them, from young narrow lines to old ones the wind
+    /// has spread and frayed. Drawn at any Cover: at Cover 0 the trails cross a clear sky alone.
+    pub contrails: Option<f32>,
 }
 
 impl Default for CirrusParams {
     fn default() -> Self {
-        CirrusParams { base_m: 9000.0, size_km: 12.0, streak_length: 7.0, fineness: 0.6, hooks: 0.4, fall_streaks: 0.2, patchiness: 0.3, opacity: 0.5 }
+        CirrusParams { base_m: 9000.0, size_km: 12.0, streak_length: 7.0, fineness: 0.6, hooks: 0.4, fall_streaks: 0.2, patchiness: 0.3, opacity: 0.5, contrails: None }
     }
 }
 
@@ -711,52 +698,6 @@ impl Default for CumulonimbusParams {
     }
 }
 
-/// Lenticular (a placed lens, design §4.3): smooth lens plates stacked over each other at (azimuth, distance), their
-/// long axis across the wind.
-#[derive(Clone, Debug, PartialEq, SerJson, DeJson)]
-pub struct LenticularParams {
-    /// CLOUD_LENTICULAR_BASE_RANGE (5000), metres: the lowest plate's underside.
-    pub base_m: f32,
-    /// Where it stands, compass degrees, wrapped into 0..360 (0; "+ Cloud" puts it a quarter turn off the sun).
-    pub azimuth_deg: f32,
-    /// CLOUD_LENTICULAR_DISTANCE_RANGE (15), km to the stack's middle.
-    pub distance_km: f32,
-    /// CLOUD_LENTICULAR_LENGTH_RANGE (14), km across the wind.
-    pub length_km: f32,
-    /// CLOUD_LENTICULAR_WIDTH_RANGE (6), km along the wind.
-    pub width_km: f32,
-    /// CLOUD_LENTICULAR_PLATES_RANGE (3): drawn as whole plates (rounded).
-    pub plates: f32,
-    /// CLOUD_LENTICULAR_THICKNESS_RANGE (300), metres: a plate at its middle.
-    pub thickness_m: f32,
-    /// CLOUD_LENTICULAR_GAP_RANGE (250), metres between plates.
-    pub gap_m: f32,
-    /// 0..=1 (0.8): a softer rim and a smoother surface.
-    pub smoothness: f32,
-    /// 0..=1 (0.4): the faint concentric bands along the plates.
-    pub striations: f32,
-    /// CLOUD_DENSITY_RANGE (1).
-    pub density: f32,
-}
-
-impl Default for LenticularParams {
-    fn default() -> Self {
-        LenticularParams {
-            base_m: 5000.0,
-            azimuth_deg: 0.0,
-            distance_km: 15.0,
-            length_km: 14.0,
-            width_km: 6.0,
-            plates: 3.0,
-            thickness_m: 300.0,
-            gap_m: 250.0,
-            smoothness: 0.8,
-            striations: 0.4,
-            density: 1.0,
-        }
-    }
-}
-
 /// What the lift keeps of an older layer (design §1.2): its amounts after the kind's floor and the height whose sun
 /// lit it. A classic layer is drawn by today's code from its parts until a row that code cannot draw changes.
 #[derive(Clone, Debug, PartialEq, SerJson, DeJson)]
@@ -884,9 +825,6 @@ impl CloudLayerParams {
         if let Some(block) = self.cumulonimbus.as_mut() {
             block.clamp_fields(&join_path(prefix, "cumulonimbus"), f);
         }
-        if let Some(block) = self.lenticular.as_mut() {
-            block.clamp_fields(&join_path(prefix, "lenticular"), f);
-        }
         if let Some(block) = self.classic.as_mut() {
             block.clamp_fields(&join_path(prefix, "classic"), f);
         }
@@ -924,7 +862,6 @@ impl CloudLayerParams {
             Some(CloudGenus::Stratocumulus) => self.stratocumulus_params().base_m,
             Some(CloudGenus::Cumulus) => self.cumulus_params().base_m,
             Some(CloudGenus::Cumulonimbus) => self.cumulonimbus_params().base_m,
-            Some(CloudGenus::Lenticular) => self.lenticular_params().base_m,
             _ => 0.0,
         }
     }
@@ -969,11 +906,6 @@ impl CloudLayerParams {
         self.cumulonimbus.as_ref().map(CumulonimbusParams::clamped).unwrap_or_default()
     }
 
-    /// The Lenticular block as clamp() holds it, or its defaults.
-    pub fn lenticular_params(&self) -> LenticularParams {
-        self.lenticular.as_ref().map(LenticularParams::clamped).unwrap_or_default()
-    }
-
     /// A Type change (design §5.4): every block is kept and the new type's is made if missing, `classic` is dropped,
     /// the species name picked goes (it named a form of the old type; several types share a species' name), a Cover
     /// that is None, the old type's default or the old type's new-layer Cover becomes the new type's new-layer Cover
@@ -1014,7 +946,6 @@ impl CloudLayerParams {
             CloudGenus::Stratocumulus if self.stratocumulus.is_none() => self.stratocumulus = Some(StratocumulusParams::default()),
             CloudGenus::Cumulus if self.cumulus.is_none() => self.cumulus = Some(CumulusParams::default()),
             CloudGenus::Cumulonimbus if self.cumulonimbus.is_none() => self.cumulonimbus = Some(CumulonimbusParams::default()),
-            CloudGenus::Lenticular if self.lenticular.is_none() => self.lenticular = Some(LenticularParams::default()),
             _ => {}
         }
     }
@@ -1032,6 +963,8 @@ impl CloudLayerParams {
             "sky_light" => Some(self.sky_light.unwrap_or(1.0)),
             "lining" => Some(self.lining.unwrap_or(genus.default_lining())),
             "shade_below" => Some(self.shade_below.unwrap_or(genus.default_shade_below())),
+            // (the Cirrus' trails, an optional number of its block)
+            "contrails" if genus == CloudGenus::Cirrus => Some(self.cirrus_params().contrails.unwrap_or(0.0)),
             _ => match genus {
                 CloudGenus::Cirrus => self.cirrus_params().row(key),
                 CloudGenus::Cirrostratus => self.cirrostratus_params().row(key),
@@ -1041,7 +974,6 @@ impl CloudLayerParams {
                 CloudGenus::Stratocumulus => self.stratocumulus_params().row(key),
                 CloudGenus::Cumulus => self.cumulus_params().row(key),
                 CloudGenus::Cumulonimbus => self.cumulonimbus_params().row(key),
-                CloudGenus::Lenticular => self.lenticular_params().row(key),
                 _ => None,
             },
         }
@@ -1067,6 +999,13 @@ impl CloudLayerParams {
             *field = Some(value);
             return true;
         }
+        if key == "contrails" && genus == CloudGenus::Cirrus {
+            self.make_block(genus);
+            if let Some(block) = self.cirrus.as_mut() {
+                block.contrails = Some(value);
+            }
+            return true;
+        }
         if self.row(key).is_none() {
             return false;
         }
@@ -1080,7 +1019,6 @@ impl CloudLayerParams {
             CloudGenus::Stratocumulus => self.stratocumulus.as_mut().and_then(|block| block.row_mut(key)),
             CloudGenus::Cumulus => self.cumulus.as_mut().and_then(|block| block.row_mut(key)),
             CloudGenus::Cumulonimbus => self.cumulonimbus.as_mut().and_then(|block| block.row_mut(key)),
-            CloudGenus::Lenticular => self.lenticular.as_mut().and_then(|block| block.row_mut(key)),
             _ => None,
         };
         match field {
@@ -1127,7 +1065,6 @@ block_rows! {
     StratocumulusParams { base_m, tops_m, size_km, softness, shading, billows, rolls, density }
     CumulusParams { base_m, tops_m, size_km, puffiness, flat_base, towers, clustering, streets, lean, softness, density }
     CumulonimbusParams { base_m, tops_m, azimuth_deg, distance_km, tower_km, anvil, anvil_m, overshoot, lean_deg, puffiness, darkness, rain_shaft, mammatus, density }
-    LenticularParams { base_m, azimuth_deg, distance_km, length_km, width_km, plates, thickness_m, gap_m, smoothness, striations, density }
 }
 
 impl CirrusParams {
@@ -1141,6 +1078,9 @@ impl CirrusParams {
         f.range(prefix, "fall_streaks", &mut self.fall_streaks, CLOUD_CIRRUS_FALL_STREAKS_RANGE.0, CLOUD_CIRRUS_FALL_STREAKS_RANGE.1, d.fall_streaks);
         f.range(prefix, "patchiness", &mut self.patchiness, CLOUD_CIRRUS_PATCHINESS_RANGE.0, CLOUD_CIRRUS_PATCHINESS_RANGE.1, d.patchiness);
         f.range(prefix, "opacity", &mut self.opacity, CLOUD_CIRRUS_OPACITY_RANGE.0, CLOUD_CIRRUS_OPACITY_RANGE.1, d.opacity);
+        if let Some(contrails) = self.contrails.as_mut() {
+            f.range(prefix, "contrails", contrails, CLOUD_CIRRUS_CONTRAILS_RANGE.0, CLOUD_CIRRUS_CONTRAILS_RANGE.1, 0.0);
+        }
     }
 }
 
@@ -1251,23 +1191,6 @@ impl CumulonimbusParams {
     }
 }
 
-impl LenticularParams {
-    pub(super) fn clamp_fields(&mut self, prefix: &str, f: &mut Fixes) {
-        let d = LenticularParams::default();
-        f.range(prefix, "base_m", &mut self.base_m, CLOUD_LENTICULAR_BASE_RANGE.0, CLOUD_LENTICULAR_BASE_RANGE.1, d.base_m);
-        f.wrap360(prefix, "azimuth_deg", &mut self.azimuth_deg, d.azimuth_deg);
-        f.range(prefix, "distance_km", &mut self.distance_km, CLOUD_LENTICULAR_DISTANCE_RANGE.0, CLOUD_LENTICULAR_DISTANCE_RANGE.1, d.distance_km);
-        f.range(prefix, "length_km", &mut self.length_km, CLOUD_LENTICULAR_LENGTH_RANGE.0, CLOUD_LENTICULAR_LENGTH_RANGE.1, d.length_km);
-        f.range(prefix, "width_km", &mut self.width_km, CLOUD_LENTICULAR_WIDTH_RANGE.0, CLOUD_LENTICULAR_WIDTH_RANGE.1, d.width_km);
-        f.range(prefix, "plates", &mut self.plates, CLOUD_LENTICULAR_PLATES_RANGE.0, CLOUD_LENTICULAR_PLATES_RANGE.1, d.plates);
-        f.range(prefix, "thickness_m", &mut self.thickness_m, CLOUD_LENTICULAR_THICKNESS_RANGE.0, CLOUD_LENTICULAR_THICKNESS_RANGE.1, d.thickness_m);
-        f.range(prefix, "gap_m", &mut self.gap_m, CLOUD_LENTICULAR_GAP_RANGE.0, CLOUD_LENTICULAR_GAP_RANGE.1, d.gap_m);
-        f.range(prefix, "smoothness", &mut self.smoothness, CLOUD_LENTICULAR_SMOOTHNESS_RANGE.0, CLOUD_LENTICULAR_SMOOTHNESS_RANGE.1, d.smoothness);
-        f.range(prefix, "striations", &mut self.striations, CLOUD_LENTICULAR_STRIATIONS_RANGE.0, CLOUD_LENTICULAR_STRIATIONS_RANGE.1, d.striations);
-        f.range(prefix, "density", &mut self.density, CLOUD_DENSITY_RANGE.0, CLOUD_DENSITY_RANGE.1, d.density);
-    }
-}
-
 impl ClassicLook {
     pub(super) fn clamp_fields(&mut self, prefix: &str, f: &mut Fixes) {
         let d = ClassicLook::default();
@@ -1278,7 +1201,7 @@ impl ClassicLook {
     }
 }
 
-clamped_copy!(CloudStackParams, CloudLayerParams, CirrusParams, CirrostratusParams, AltocumulusParams, NimbostratusParams, StratusParams, StratocumulusParams, CumulusParams, CumulonimbusParams, LenticularParams, ClassicLook);
+clamped_copy!(CloudStackParams, CloudLayerParams, CirrusParams, CirrostratusParams, AltocumulusParams, NimbostratusParams, StratusParams, StratocumulusParams, CumulusParams, CumulonimbusParams, ClassicLook);
 
 /// The name "+ Cloud" gives a new layer of `genus`: "<Label> N" with the lowest N >= 1 that no layer of `layers`
 /// shows (`cloud_display_name`, so an unnamed layer's shown name counts too), in any case, as a name addresses a
@@ -1439,7 +1362,7 @@ mod tests {
     /// and the list is never truncated. The defaults are pinned and sit inside their ranges.
     #[test]
     fn a_stack_clamps_by_its_types_ranges() {
-        assert_eq!(CirrusParams::default(), CirrusParams { base_m: 9000.0, size_km: 12.0, streak_length: 7.0, fineness: 0.6, hooks: 0.4, fall_streaks: 0.2, patchiness: 0.3, opacity: 0.5 });
+        assert_eq!(CirrusParams::default(), CirrusParams { base_m: 9000.0, size_km: 12.0, streak_length: 7.0, fineness: 0.6, hooks: 0.4, fall_streaks: 0.2, patchiness: 0.3, opacity: 0.5, contrails: None });
         assert_eq!(AltocumulusParams::default(), AltocumulusParams { base_m: 4000.0, cell_m: 400.0, regularity: 0.3, rows: 0.25, turrets: 0.0, softness: 0.7 });
         assert_eq!(NimbostratusParams::default(), NimbostratusParams { base_m: 1000.0, tops_m: 5000.0, size_km: 8.0, darkness: 0.6, unevenness: 0.4, ragged_base: 0.3, scud: 0.3, scud_height_m: 500.0, rain_curtains: 0.5, volume: false, density: 1.0 });
         assert_eq!(StratusParams::default(), StratusParams { base_m: 400.0, size_km: 6.0, density: 0.35, mottling: 0.25, streaks: 0.5, ragged_edges: 0.4 });
@@ -1625,14 +1548,14 @@ mod tests {
             assert_eq!(CloudGenus::of(genus.label()), Some(genus));
             assert_eq!(CLOUD_GENUS_SALT[i], 0x85EB_CA6Bu32.wrapping_mul(i as u32 + 1));
         }
-        assert_eq!(CLOUD_GENUS_BUILT.map(CloudGenus::label), ["Cirrus", "Cirrostratus", "Altocumulus", "Nimbostratus", "Stratus", "Stratocumulus", "Cumulus", "Cumulonimbus", "Lenticular"]);
-        assert_eq!(CLOUD_GENUS_BUILT.map(CloudGenus::default_cover), [0.35, 0.9, 0.6, 1.0, 0.6, 0.6, 0.35, 1.0, 1.0]);
+        assert_eq!(CLOUD_GENUS_BUILT.map(CloudGenus::label), ["Cirrus", "Cirrostratus", "Altocumulus", "Nimbostratus", "Stratus", "Stratocumulus", "Cumulus", "Cumulonimbus"]);
+        assert_eq!(CLOUD_GENUS_BUILT.map(CloudGenus::default_cover), [0.35, 0.9, 0.6, 1.0, 0.6, 0.6, 0.35, 1.0]);
         // A new Stratus is made closed, its first species nebulosus (the owner, 2026-11-01); a saved one with no Cover
         // keeps its 0.6. Every other type is made at its default.
-        assert_eq!(CLOUD_GENUS_BUILT.map(CloudGenus::new_cover), [None, None, None, None, Some(1.0), None, None, None, None]);
+        assert_eq!(CLOUD_GENUS_BUILT.map(CloudGenus::new_cover), [None, None, None, None, Some(1.0), None, None, None]);
         // (a Stratus volume 0.6: the volumes design §2.4, a layer's lower forward share)
-        assert_eq!(CLOUD_GENUS_BUILT.map(CloudGenus::default_lining), [0.5, 1.0, 0.75, 1.0, 0.6, 0.75, 0.75, 0.75, 0.75]);
-        assert_eq!(CLOUD_GENUS_BUILT.map(CloudGenus::default_shade_below), [0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(CLOUD_GENUS_BUILT.map(CloudGenus::default_lining), [0.5, 1.0, 0.75, 1.0, 0.6, 0.75, 0.75, 0.75]);
+        assert_eq!(CLOUD_GENUS_BUILT.map(CloudGenus::default_shade_below), [0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
     }
 
     /// Design §1.1, §5.5: "<Type> N" with the lowest free N (an unnamed layer's shown name counts), fresh seeds in
@@ -1679,7 +1602,6 @@ mod tests {
                 layer.stratocumulus.is_some(),
                 layer.cumulus.is_some(),
                 layer.cumulonimbus.is_some(),
-                layer.lenticular.is_some(),
             ];
             assert_eq!(blocks.iter().filter(|&&b| b).count(), 1, "{genus:?}: its own block alone");
             assert_eq!(layer.genus(), Some(genus));
@@ -1690,7 +1612,6 @@ mod tests {
                 CloudGenus::Nimbostratus => 1000.0,
                 CloudGenus::Stratus => 400.0,
                 CloudGenus::Cumulonimbus => 1000.0,
-                CloudGenus::Lenticular => 5000.0,
                 _ => 1200.0,
             };
             assert_eq!(layer.base_m(), base, "{genus:?}");
@@ -1814,7 +1735,8 @@ mod tests {
     #[test]
     fn old_files_load_and_resave_unchanged() {
         use crate::presets::{preset, PRESET_NAMES};
-        let mut maps: Vec<(String, HdriParams)> = PRESET_NAMES.iter().map(|n| (n.to_string(), preset(n).unwrap())).collect();
+        // (the presets without layers: the cloud-type skies are made with one)
+        let mut maps: Vec<(String, HdriParams)> = PRESET_NAMES.iter().map(|n| (n.to_string(), preset(n).unwrap())).filter(|(_, p)| p.sky.cloud_stack.is_none()).collect();
         maps.extend(crate::cloud_baseline::clouds_baseline_cases().into_iter().map(|(name, p, _)| (name, p)));
         for (name, p) in &maps {
             let json = p.to_json();

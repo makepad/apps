@@ -74,6 +74,9 @@ struct Host {
     expect_reads: Vec<Instant>,
     expect_defer_after: Option<usize>,
     expect_held: Option<std::sync::mpsc::Sender<Result<ExpectSnapshot, String>>>,
+    /// `hold_edits`: a bench edit's reply is kept in `edit_held` instead of sent.
+    hold_edits: bool,
+    edit_held: Option<std::sync::mpsc::Sender<Result<Site, String>>>,
     restarts: usize,
     /// The tools' clock; `moving`: it is `moved_now`, which only this host moves.
     now: fn() -> Instant,
@@ -93,7 +96,7 @@ impl Host {
         Self { tools, _cx: cx, points: vec![(0.0, 0.0), (0.01, 1.0)], firmware: None, defer: false, held: None, shown: Vec::new(), ended: Vec::new(), edits: Vec::new(),
             expects: ExpectSnapshot { run: 0, t: 0.0, running: false, rows: Vec::new() },
             expect_runs: VecDeque::new(), expect_steps: VecDeque::new(), expect_reads: Vec::new(),
-            expect_defer_after: None, expect_held: None, restarts: 0, now, moving }
+            expect_defer_after: None, expect_held: None, hold_edits: false, edit_held: None, restarts: 0, now, moving }
     }
     fn answer(&mut self) {
         for request in self.tools.host_requests() {
@@ -123,7 +126,11 @@ impl Host {
                 HostRequest::Show(opened) => self.shown.push(opened.path.clone()),
                 HostRequest::Edit(op, reply) => {
                     self.edits.push(op);
-                    reply.send(Ok(Site { file: "main.splash".into(), line: 12 })).unwrap();
+                    if self.hold_edits {
+                        self.edit_held = Some(reply);
+                    } else {
+                        reply.send(Ok(Site { file: "main.splash".into(), line: 12 })).unwrap();
+                    }
                 }
                 HostRequest::SimCapture { channels, mut intake, ended, reply } => {
                     self.ended.push(ended);
@@ -403,6 +410,21 @@ fn expectations_run_deadline_stops_polling_and_bounds_host_replies() {
     assert!(host.expect_held.take().unwrap().send(Ok(host.expects.clone())).is_err(), "timed-out host receiver is already gone");
     object(host.request("elec.source.list", &[]), 4096);
     assert_eq!(host.expect_reads.len(), reads + 2, "deadline leaves no further host reads queued");
+    // A bench edit has no deadline of its own: the worker waits on the host however long it keeps
+    // the edit (it gave up after 10 s once, which a loaded machine reached), and takes its answer.
+    host.hold_edits = true;
+    let id = host.tools.call(call("elec.probe.add", &[("target", "VOUT"), ("label", "late")]));
+    while host.edit_held.is_none() { host.answer(); std::thread::yield_now(); }
+    PASSED.fetch_add(Duration::from_secs(600).as_nanos() as u64, Ordering::AcqRel);
+    // ten of the worker's ticks to see the moved clock: a deadline would answer in one
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(host.tools.poll().is_empty(), "the worker still waits on the held edit ten minutes on");
+    host.edit_held.take().unwrap().send(Ok(Site { file: "main.splash".into(), line: 12 })).expect("the worker still holds the edit's reply");
+    let late = loop {
+        if let Some((got, reply)) = host.tools.poll().into_iter().next() { assert_eq!(got, id); break reply; }
+        std::thread::yield_now();
+    };
+    assert_eq!(field(field(&object(late, 4096), "site"), "line").number(), Some(12.0), "the late answer is the edit's");
 }
 
 #[test]

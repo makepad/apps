@@ -139,7 +139,7 @@ fn copies_with_their_own_settings_are_not_one_plan() {
 /// Compare all path fields and their order, including the loop, flow and Z
 /// data; Debug prints floats losslessly and also covers each layer's slices.
 fn same_layers(a: &[(f64, f64, ObjectLayer)], b: &[(f64, f64, ObjectLayer)]) {
-    assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), b.len(), "the plans must return the same number of model layers");
     for (a, b) in a.iter().zip(b) {
         assert_eq!(format!("{a:?}"), format!("{b:?}"), "layer at z {}", a.0);
     }
@@ -272,6 +272,71 @@ fn windows_equal_whole_layers_through_tops_bottoms_bridges_and_every_experimenta
     let whole = check_windows(&input(false), &job(&[("fab_wall_texture", "knurl"), ("ironing_type", "top")]));
     assert!(mode_paths(&whole, exp::mode::TEXTURE) > 0, "no textured wall paths");
     assert!(mode_paths(&whole, exp::mode::IRONING) > 0, "no ironing paths");
+}
+
+/// Adaptive layers depend on the whole part. A held warp lets a window of the same cuts and
+/// grading settings produce the whole plan's layers with only their local contour reads.
+#[test]
+fn adaptive_density_windows_read_the_whole_part_and_equal_the_whole_plan() {
+    struct Cube {
+        sdf: Arc<SdfSource>,
+        key: Option<u64>,
+        planes: Option<Vec<u64>>,
+    }
+    impl ContourSource for Cube {
+        fn content_key(&self) -> Option<u64> { self.key }
+        fn bounds(&self) -> ([f64; 3], [f64; 3]) { self.sdf.bounds() }
+        fn contours(&self, zs: &[f64]) -> Vec<Vec<ExPolygon>> {
+            if let Some(planes) = &self.planes {
+                for z in zs { assert!(planes.contains(&z.to_bits()), "held window read outside its contour context at z={z}"); }
+            }
+            self.sdf.contours(zs)
+        }
+    }
+    let field = |x: f64, y: f64, z: f64| ((x - 100.0).abs() - 6.0).max((y - 100.0).abs() - 6.0).max((z - 6.0).abs() - 6.0);
+    let sdf = Arc::new(SdfSource::new(Arc::new(field), ([94.0, 94.0, 0.0], [106.0, 106.0, 12.0])));
+    let cube = |key, planes| ObjectInput { overrides: Vec::new(), name: "graded cube".into(), source: Box::new(Cube { sdf: sdf.clone(), key, planes }), filament: 0 };
+    let job = job(&[("sparse_infill_pattern", "gyroid"), ("adaptive_infill_mode", "distance_warp"), ("sparse_infill_density", "35%"),
+        ("xy_contour_compensation", "0.15"), ("brim_type", "no_brim")]);
+    // The reference goes through the grade stage and its outline hash.
+    let reference = check_windows(&cube(None, None), &job);
+    let key = 0x6375_6265;
+    let o = cube(Some(key), None);
+    let heights = plan_heights(&o, &job);
+    let p = Params::from_job(&job, 0);
+    let n = heights.len();
+    let (lo, hi) = (n / 2, n / 2 + 2);
+    assert_eq!(plan_reads(&p, lo, hi, n), (0, n), "reusing finished adaptive layers depends on every contour");
+    assert!(held_grade(&o, &job, &heights).is_none(), "a new cut key must have no held warp");
+    let zs: Vec<_> = heights.iter().map(|&(z, h)| cut_z(&p, z, h)).collect();
+    let warp = solve_grade(par::Ctl::default(), &o, &job, &heights, o.source.contours(&zs)).unwrap().expect("adaptive cube builds a warp");
+    assert!(warp.graded, "the cube must have a graded interior");
+    assert!(Arc::ptr_eq(&warp, &held_grade(&o, &job, &heights).expect("the solved warp is held")), "a lookup must return the same warp allocation");
+    let (a, b) = plan_reads_held(&p, lo, hi, n);
+    assert!(a > 0 && b < n, "the middle window's contour context must exclude both ends");
+    let window = cube(Some(key), Some(zs[a..b].iter().map(|z| z.to_bits()).collect()));
+    let got = plan_window(par::Ctl::default(), 7, &window, &job, &heights, lo, hi).unwrap();
+    same_layers(&got, &model_layers(&reference)[lo..hi]);
+
+    for (setting, value) in [("adaptive_infill_interior_density", "5%"), ("adaptive_infill_gradient", "quadratic"), ("adaptive_infill_mode", "lobes"),
+        ("sparse_infill_density", "30%"), ("sparse_infill_line_width", "0.5"), ("layer_height", "0.25"), ("raft_layers", "2"),
+        ("xy_contour_compensation", "0"), ("xy_hole_compensation", "0.1")] {
+        let mut changed = cube(Some(key), None);
+        changed.overrides.push((setting.into(), value.into()));
+        assert!(held_grade(&changed, &job, &heights).is_none(), "a part override of {setting} must invalidate the warp");
+    }
+    let mut layers = heights.clone();
+    layers[lo].1 *= 0.5;
+    assert!(held_grade(&o, &job, &layers).is_none(), "changing one layer's height must invalidate the warp");
+    assert!(held_grade(&cube(Some(key + 1), None), &job, &heights).is_none(), "changing the cut key must invalidate the warp");
+
+    // Empty layer stacks age the recent solves without building nine more cubes.
+    for other in key + 1..=key + 9 {
+        solve_grade(par::Ctl::default(), &cube(Some(other), None), &job, &[], Vec::new()).unwrap().expect("an adaptive empty stack has a warp");
+    }
+    assert!(Arc::ptr_eq(&warp, &held_grade(&o, &job, &heights).expect("a part still holds the evicted warp")), "a part's warp must survive eviction from recent solves");
+    drop(warp);
+    assert!(held_grade(&o, &job, &heights).is_none(), "an evicted warp must disappear when its last owner drops it");
 }
 
 #[test]

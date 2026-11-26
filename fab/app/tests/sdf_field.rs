@@ -99,7 +99,7 @@ fn part_x(app: &TestApp, name: &str) -> (f64, bool) {
 }
 
 fn log_lines(app: &TestApp, from: u64) -> Vec<String> {
-    app.log_since(from).map(|t| t.lines).unwrap_or_default()
+    app.log_since(from).expect("the app's log").lines
 }
 
 fn count(app: &TestApp, from: u64, needle: &str) -> usize {

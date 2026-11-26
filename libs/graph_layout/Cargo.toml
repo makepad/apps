@@ -1,0 +1,11 @@
+# Automatic layout for node-and-edge diagrams: layered (flows, state machines) and sequence layout.
+# Pure std, deterministic; the board's diagrams call it, and any graph view can.
+[package]
+name = "makepad-graph-layout"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "makepad_graph_layout"

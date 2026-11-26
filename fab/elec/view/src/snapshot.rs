@@ -19,7 +19,7 @@ use fab_elec_board::{Connectivity, RuleMatrix, ZoneFill};
 use fab_elec_cam::Export;
 use fab_elec_circuit::Violation;
 use crate::live::sim::{LiveScreen, SimLive};
-use fab_elec_core::{BoardId, CompRef, Diag, DocId, NetId, Sel};
+use fab_elec_core::{BoardId, CompId, CompRef, Diag, DocId, NetId, Sel};
 use fab_elec_design::{By, Design, DesignOp, Focus, Place, SystemNet, TextEdit, TimeCursor};
 use fab_elec_lang::sys_sim::SimSettings;
 use fab_elec_lang::{SourceMap, UnitState};
@@ -175,11 +175,26 @@ pub struct RouteJobState {
     pub open: Arc<Vec<(NetId, Reason)>>,
 }
 
+/// The case checks a snapshot's case findings come from, for one board (`Cmd::CaseFindings`):
+/// the board generation they ran on, the app's run (one per plate build it checks) and whether
+/// the plate had case parts for the board. A board without one has not been case checked.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CaseHeld {
+    pub unit: BoardId,
+    pub generation: u64,
+    pub run: u64,
+    pub cased: bool,
+}
+
 /// What every view reads.
 #[derive(Clone, Debug)]
 pub struct DesignSnapshot {
     /// The committed design (the ghost while a preview is live).
     pub design: Arc<Design>,
+    /// The engine's factories in offer order, with the same capabilities used for the board rules.
+    pub profiles: Arc<Vec<fab_elec_cam::profile_doc::ProfileDef>>,
+    /// Located errors reading the current project factory documents.
+    pub profile_diags: Arc<Vec<Diag>>,
     /// The live preview, drawn over the ghost.
     pub preview: Option<Arc<Design>>,
     /// The tag of the sample shown by the live preview.
@@ -208,9 +223,16 @@ pub struct DesignSnapshot {
     pub export: Vec<Tagged<Arc<Export>>>,
     /// Every check's findings (ERC, DRC, system ERC, the rest), sorted by id.
     pub violations: Tagged<Arc<Vec<Violation>>>,
+    /// Per case-checked board, the case checks its case findings in `violations` come from, by unit.
+    pub cases: Arc<Vec<CaseHeld>>,
     /// Ids of `violations` that await a zone's refill: they name a zone whose fill is still pending in the shown
     /// results. Views show them as pending, not as violations. Sorted.
     pub awaiting: Arc<Vec<u64>>,
+    /// Board units whose connectivity and DRC wait for their whole-board checks (a design just
+    /// loaded, a new unit): their `conn` is the board's without its pours, and `violations` holds
+    /// none of their DRC. Views show such a unit as checking, not its ratsnest or unrouted count.
+    /// Sorted; empty once every unit's checks merged.
+    pub checking: Vec<BoardId>,
     /// The newest refused edit, kept until the next accepted edit.
     pub last_refusal: Option<Arc<Refusal>>,
     pub stale: StageFlags,
@@ -234,6 +256,10 @@ impl DesignSnapshot {
     pub fn live(&self) -> &Arc<Design> {
         self.preview.as_ref().unwrap_or(&self.design)
     }
+    /// Whether `unit` waits for its whole-board checks (`checking`). O(log units).
+    pub fn checking(&self, unit: BoardId) -> bool {
+        self.checking.binary_search(&unit).is_ok()
+    }
     /// The newest per-unit result of `list` for `unit`, preferring one computed from the live state.
     pub fn of<'a, T>(&self, list: &'a [Tagged<T>], unit: BoardId) -> Option<&'a Tagged<T>> {
         let want = if self.preview.is_some() { StateOf::Preview } else { StateOf::Committed };
@@ -255,9 +281,62 @@ pub fn run_bench<'a>(benches: &'a [fab_elec_lang::BenchView], choice: Option<&st
     (!matches!(bench.out.state, UnitState::Failed(_))).then_some(bench)
 }
 
+/// The catalog spelling of a gesture, captured while its input still names the target.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Invocation {
+    pub name: &'static str,
+    pub args: Vec<(String, String)>,
+}
+
+/// Standalone electronics canvases consume the original Ops and CommitPreview actions.
+#[derive(Default)]
+pub struct CapturePlannerGestures;
+
+impl Invocation {
+    pub fn new(name: &'static str, unit: &str, fields: impl IntoIterator<Item = (&'static str, String)>) -> Self {
+        let mut args = vec![("unit".into(), unit.to_owned())];
+        args.extend(fields.into_iter().map(|(k, v)| (k.to_owned(), v)));
+        Self { name, args }
+    }
+
+    pub fn send(cx: &mut makepad_widgets_core::Cx, uid: makepad_widgets_core::WidgetUid, action: ViewAction) {
+        use makepad_widgets_core::WidgetActionCxExt;
+        let action = match action {
+            ViewAction::Planned { action, .. } if !cx.has_global::<CapturePlannerGestures>() => match *action {
+                ViewAction::PlanRefused(_) => return,
+                ViewAction::Land(_) => ViewAction::CommitPreview,
+                action => action,
+            },
+            ViewAction::PlanRefused(_) => return,
+            action => action,
+        };
+        cx.widget_action(uid, action);
+    }
+
+    pub fn attach(self, action: ViewAction) -> ViewAction {
+        ViewAction::Planned { call: self, action: Box::new(action) }
+    }
+
+    /// Use the same spelling the resolver can actually map back to this component.
+    pub fn part(unit: &fab_elec_design::Unit, id: CompId) -> Option<&str> {
+        let comp = unit.circuit.comps.get(id.ix())?;
+        [comp.refdes.as_str(), comp.path.as_str()].into_iter().find(|name| {
+            !name.is_empty() && !name.contains(|c: char| c == ',' || c.is_whitespace() || c == '"')
+                && !(name.starts_with('[') && name.ends_with(']'))
+                && unit.circuit.comps.iter().find(|c| c.refdes == *name || c.path == *name).is_some_and(|c| c.id == id)
+        })
+    }
+}
+
 /// What a view emits; the host applies it (views never touch the model or the text).
 #[derive(Clone, PartialEq, Debug)]
 pub enum ViewAction {
+    /// Keep the original pane action for hosts that operate without a journal.
+    Planned { call: Invocation, action: Box<ViewAction> },
+    /// The planner answered the press locally. Nothing is submitted to the engine.
+    PlanRefused(String),
+    /// A released schematic wire names the exact preview it is committing.
+    Land(u64),
     /// Commit edits as one undo step.
     Ops { ops: Vec<DesignOp>, place: Vec<Place>, label: String },
     /// Show edits on a scratch copy (replacing any live preview); nothing is committed.
@@ -278,6 +357,13 @@ pub enum ViewAction {
     /// `method`; a running job is stopped first. The job's progress and outcome show in the
     /// snapshot's `job`. A `reroute` may move the board's routed copper in their way.
     Route { unit: BoardId, nets: Vec<NetId>, method: fab_elec_route::Method, reroute: bool },
+    /// The person places parts of board `unit` as a place job (`elec.place` with `@place`): the
+    /// `parts` (empty: the circuit's parts the board does not place yet and those outside its
+    /// outline), or with `all` every unlocked part. The panel parts standing on the board stay
+    /// where they are (`plan::held_panel`) unless `free_panel`. A running job is stopped first;
+    /// its progress and outcome show in the snapshot's `job`, as a route's do, and Stop and
+    /// Discard work alike.
+    Place { unit: BoardId, parts: Vec<CompId>, all: bool, free_panel: bool },
     /// Stop the running route job and keep what it has routed so far as one undo step.
     StopRoute(JobId),
     /// Stop the running route job and drop what it routed: nothing is committed.
@@ -332,6 +418,21 @@ pub struct ElecLive {
     /// The unit the last Schematic or Board drew: what the Checks editor lists. Each pane writes
     /// it as it draws, only when it changes.
     pub shown_unit: Option<BoardId>,
+    /// The project's requirements, judged on the pool by the app; None while the project has no
+    /// requirements document. The same Arc until a judged input changes.
+    pub requirements: Option<Arc<ReqShown>>,
+    pub bom: Option<Arc<crate::bom::Shown>>,
+}
+
+/// The project's requirements as the Requirements editor and the bar's chip show them
+/// (`fab_elec_req::judge` over what the design, its checks and the app's producers measure).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReqShown {
+    pub report: fab_elec_req::Report,
+    /// Per row of `report`, the document it is written in and its 1-based line.
+    pub at: Vec<(Arc<str>, usize)>,
+    /// The documents' mistakes and notes in words, each led by its document and line.
+    pub mistakes: Vec<String>,
 }
 
 /// An electronics view asks its host to bring one of the electronics editors forward: a pane's
@@ -345,7 +446,7 @@ pub enum ElecPanel {
 
 impl ElecLive {
     pub fn new(snap: Arc<DesignSnapshot>) -> ElecLive {
-        ElecLive { snap, gesture: None, sim: SimLive::default(), states: Vec::new(), title: String::new(), chosen_bench: None, check: None, opened: None, traces: Arc::default(), shown_unit: None }
+        ElecLive { snap, gesture: None, sim: SimLive::default(), states: Vec::new(), title: String::new(), chosen_bench: None, check: None, opened: None, traces: Arc::default(), shown_unit: None, requirements: None, bom: None }
     }
 
     pub fn run_bench(&self) -> Option<&fab_elec_lang::BenchView> {

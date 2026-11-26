@@ -254,6 +254,12 @@ impl CoverRemap {
         }
     }
 
+    /// Its tail gate at the point p of the recipe's plane (cells): 1 where the gate is open (Cover at or over
+    /// TAIL_SHARE), else the lattice points' on-share (a deck's density takes it alone, its cut set by the threshold).
+    pub fn gate_at(&self, p_cells: Vec2f) -> f32 {
+        if self.gate.is_open() { 1.0 } else { self.gate.at(p_cells) }
+    }
+
     /// The entry's effective cover c.
     pub fn cover(&self) -> f32 {
         self.c
@@ -269,16 +275,9 @@ impl CoverRemap {
     }
 }
 
-/// Perlin's quintic fade (noise.rs's, which is private there).
-fn fade(t: f32) -> f32 {
-    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
-}
+use crate::noise::fade;
 
-/// Local copy (as in clouds.rs and atmosphere.rs), so no glob can make the name ambiguous.
-fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
-    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
+use crate::patterns::smooth as smoothstep;
 
 #[cfg(test)]
 thread_local! {

@@ -1,0 +1,45 @@
+// Harbor Hem follows a strand of light across the water. Each sung line
+// sets the type in a different part of the same harbor.
+use mod.storyboard.*
+
+let sections = Row{kind: @sections label: "Sections"}
+let lyrics = Row{kind: @lyrics label: "Lyric lines"}
+let devices = Row{kind: @devices label: "Running devices"}
+let refs = Row{kind: @refs label: "References"}
+
+let intro = Note{row: sections span: [0.0, 5.5] text: "intro: construction lines"}
+let verse1 = Note{row: sections span: [5.5, 11.5] text: "verse 1"}
+let pre1 = Note{row: sections span: [17.0, 5.5] text: "pre-chorus: harbor log"}
+let chorus1 = Note{row: sections span: [22.5, 7.0] text: "chorus 1: palette break, white and orange cards"}
+
+let l1 = Lyric{row: lyrics span: [2.5, 3.0] text: "A red thread of sun" pun: "sunlight unspools" set: "a spool on the quay" voice: @slam device: "a thread of light unwinds from the word SUN"}
+let l2 = Lyric{row: lyrics span: [5.5, 4.0] text: "on blue silk / the harbor wears its lining / bright side out" pun: "the sea turns a coat inside out" set: "the camera circles a blue sail reflected in water" voice: @mono device: "each sung word lights its reflection"}
+let l3 = Lyric{row: lyrics span: [10.0, 3.0] text: "We fold a silver road along the harbor wall" pun: "a path of moonlight folds" set: "a line chart folds down into a contour map" voice: @mono device: "the words ride the silver line downhill"}
+let l4 = Lyric{row: lyrics span: [13.5, 3.0] text: "Day hems the skyline / night pulls one seam" pun: "the horizon is a hem" set: "a row of roofs reflected in the basin" voice: @slam device: "SKYLINE slams down, then the camera rolls 180° to SEAM"}
+let l5 = Lyric{row: lyrics span: [17.0, 5.0] text: "Lanterns stitch the last boats home" pun: "the lamps sew a dotted route" set: "a harbor log above a map of the channel" voice: @mono device: "the log types a word as each lamp lights"}
+let l6 = Lyric{row: lyrics span: [22.5, 1.5] text: "One stitch more" pun: "each beat adds one stitch" set: "white cards stretched like sailcloth" voice: @slam device: "one word per beat on cards"}
+let l7 = Lyric{row: lyrics span: [24.5, 2.0] text: "till the harbor wears GOLD" pun: "the sun gilds the coat" set: "gold light spreads down a row of windows" voice: @wall device: "the O of GOLD expands into the sun"}
+let l8 = Lyric{row: lyrics span: [26.5, 3.0] text: "Dawn slips a copper needle through the coat of night" pun: "a sunbeam threads the hem" set: "a copper line crosses the dark water" voice: @mono device: "the line passes through the G of NIGHT"}
+
+let d1 = Device{row: devices span: [0.0, 5.5] name: "Tide" value: "0.04" note: "a small readout on the harbor chart"}
+let d2 = Device{row: devices span: [17.0, 5.0] name: "Harbor log" value: "East quay" note: "a lamp marks each berth"}
+let d3 = Device{row: devices span: [22.5, 2.0] name: "Tide" value: "0.15" note: "orange mono readout with a bar"}
+let d4 = Device{row: devices span: [30.0, 8.0] name: "Tide" value: "0.16 → 0.17"}
+
+let orange = Ref{row: refs span: [0.0, 38.0] media: @swatch colors: [#0b0b0b, #ff5a1f, #f4f0e6] label: "Near-black, signal orange, warm white"}
+
+let slam = Voice{label: "Slam" face: "wide heavy grotesk, caps" role: "stressed words: SKYLINE, SEAM, GOLD, NIGHT" color: #ff5a1f}
+let wall = Voice{label: "Condensed wall" face: "condensed caps, tiled edge to edge" role: "walls of words" color: #f4f0e6}
+let mono = Voice{label: "Mono UI" face: "monospace" role: "prompts, tables, footnotes, counters" color: #8fb4ff}
+let serif = Voice{label: "Serif italic" face: "serif italic" role: "the quiet, philosophical lines" color: #d6c7a1}
+let hand = Voice{label: "Handwriting" face: "handwriting" role: "corrections" color: #f0c75e}
+
+Storyboard{
+    title: "Harbor Hem"
+    duration: 38.0
+    bpm: 120
+    style: "Engineering-diagram world: near-black grid, one accent (signal orange with bloom), warm white type; every line a visual pun"
+    rows: [sections, lyrics, devices, refs]
+    voices: [slam, wall, mono, serif, hand]
+    items: [intro, verse1, pre1, chorus1, l1, l2, l3, l4, l5, l6, l7, l8, d1, d2, d3, d4, orange]
+}

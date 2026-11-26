@@ -1,0 +1,46 @@
+use mod.scene.*; use mod.post; use mod.kernel
+// A confetti burst timed to a beat (KERNELS.md §4 example 3). A kernel
+// launches 600 pieces on beat 4 (a tenth on the beat itself, the rest
+// streaming out over 0.3 s); physics runs a fixed 1/240 s step, seeded and
+// seekable, so every export and scrub gives the same flight; the pieces are
+// instances of the bodies, and a decoration kernel sparkles where they hit
+// the floor hard, reading the last 0.3 s of contacts.
+let launch = Kernel{
+    out: kernel.output(kernel.Body)
+    instance: fn(i) {
+        let a = rand01(seed, i, 0) * 6.2832
+        let out_speed = 0.4 + 2.2 * rand01(seed, i, 5)
+        let up = 6.5 + 3.0 * rand01(seed, i, 1)
+        let hue = rand01(seed, i, 3)
+        let delay = if i % 10 == 0 { 0.0 } else { rand01(seed, i, 4) * 0.3 }
+        out[i] = Body{pos: vec3(0.0, 0.3, 0.0), vel: vec3(cos(a) * out_speed, up, sin(a) * out_speed), spin: rand_dir(seed, i, 2) * 14.0, drag: 1.2, spin_drag: 0.5, delay: delay, color: vec4(0.55 + 0.45 * cos(6.2832 * hue), 0.55 + 0.45 * cos(6.2832 * (hue + 0.33)), 0.55 + 0.45 * cos(6.2832 * (hue + 0.67)), 1.0)}
+    }
+}
+let sparkles = Kernel{
+    hits: kernel.input(contacts("floor"))            // hits involving the floor
+    out: kernel.emit_buffer(kernel.Sprite, 1)
+    element: fn(i) {
+        let c = hits[i]
+        let age = time - c.time
+        if c.speed > 1.2 && age < 0.3 {
+            let k = 1.0 - age / 0.3
+            let s = Sprite{}
+            s.pos = c.pos + vec3(0.0, 0.02, 0.0)
+            s.size = 0.14 * k
+            s.color = vec4(4.0, 3.4, 2.2, k)
+            emit(out, s)
+        }
+    }
+}
+Scene3D{ background: #0b0a10 tone_mapping: @aces bpm: 120
+    camera: Camera{position: vec3(0, 2.4, 6.5) target: vec3(0, 1.4, 0) fov: 45}
+    lights: [HemisphereLight{sky_color: #ffffff ground_color: #2a2433 intensity: 0.9} DirectionalLight{position: vec3(3, 7, 4) intensity: 2.2 cast_shadow: true}]
+    post: [post.Bloom{strength: 0.7 threshold: 0.8}]
+    physics: Physics{step: 1 / 240 seed: 7 gravity: vec3(0, -9.8, 0) retain: 0.3
+        bodies: [Body{name: "floor" shape: @plane}]
+        spawn: [Spawn{at: beat(4) group: "confetti" count: 600 shape: @box size: vec3(0.05, 0.004, 0.03) from: launch}]}
+    children: [
+        Mesh{geometry: PlaneGeometry{width: 14 height: 14} rotation: vec3(-90, 0, 0) material: MeshStandardMaterial{color: #1b1824 roughness: 0.85}}
+        Instances{source: bodies("confetti") geometry: BoxGeometry{width: 0.05 height: 0.004 depth: 0.03} material: MeshStandardMaterial{color: #ffffff roughness: 0.45 side: @double}}
+        Points{source: sparkles.out size: 1 blending: @additive}
+    ] }

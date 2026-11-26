@@ -1,0 +1,44 @@
+use mod.motion.*; use mod.scene; use mod.post
+// Glass abstract loop: a thick glass knot turns over bright bands and an
+// iridescent orb; everything moves a whole number of turns in 4 s, so the
+// clip loops seamlessly.
+Motion{
+    size: vec2(1920, 1080)
+    duration: 4.0
+    layers: [
+        Scene3D{
+            background: #0d0f1a
+            environment: scene.Environment{preset: @neon intensity: 1.0 rotation: scene.spin(90)}
+            tone_mapping: @aces
+            camera: Camera{position: vec3(0, 0, 7) target: vec3(0, 0, 0) focal_length: 30}
+            post: [
+                post.Bloom{strength: 0.6 threshold: 1.1}
+                post.MotionBlur{shutter: 180 samples: 6}
+                scene.ColorGrade{contrast: 1.1 saturation: 1.1 temperature: -0.1}
+                post.Vignette{amount: 0.3}
+            ]
+            lights: [scene.DirectionalLight{position: vec3(2, 4, 5) intensity: 2}]
+            children: [
+                scene.Instances{
+                    geometry: scene.BoxGeometry{width: 0.35 height: 9 depth: 0.2}
+                    layout: scene.LineLayout{count: 14 start: vec3(-6.5, 0, -4) end: vec3(6.5, 0, -4)}
+                    rotation: vec3(0, 0, 18)
+                    position: repeat(tween(vec3(0, 0, 0), vec3(1.0, 0, 0), 0, 4), 4)
+                    color_jitter: 1.0
+                    material: scene.MeshBasicMaterial{color: #ff4f8b emissive: #ff4f8b emissive_intensity: 1.5}
+                }
+                scene.Mesh{
+                    geometry: scene.TorusKnotGeometry{radius: 1.3 tube: 0.42 tubular_segments: 300 radial_segments: 40 p: 2 q: 3}
+                    rotation: scene.spin(vec3(0, 90, 45))
+                    material: scene.MeshPhysicalMaterial{preset: @glass ior: 1.45 thickness: 0.7 iridescence: 0.3 attenuation_color: #c8e6ff}
+                }
+                scene.Mesh{
+                    geometry: scene.SphereGeometry{radius: 0.55}
+                    position: repeat(tween(vec3(2.4, 0, 1), vec3(2.4, 0, 1), 0, 4), 4)
+                    rotation: scene.spin(vec3(0, 90, 0))
+                    material: scene.MeshPhysicalMaterial{color: #ffffff metalness: 1 roughness: 0.1 iridescence: 1}
+                }
+            ]
+        }
+    ]
+}

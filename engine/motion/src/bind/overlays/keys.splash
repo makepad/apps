@@ -1,0 +1,25 @@
+use mod.motion.*
+// A keystroke badge: every shortcut the run pressed (⌘ S, ⇧ ⌘ Z, Esc), in a
+// keycap pill that pops in and fades after `hold`.
+let r = run()
+Motion{
+    label: "Keystroke badge (from the run)"
+    size: vec2(1080, 1920)
+    duration: 3600.0
+    inputs: {
+        at: input(@vec2, vec2(540, 1500), "Where the badge is centred")
+        fill: input(@color, #11151cee, "Keycap colour")
+        color: input(@color, #ffffff, "Text colour")
+    }
+    layers: [
+        Rect{name: "cap"
+            at: fn(t) { let p = in(@at) return [p.x - 150, p.y - 64] } size: vec2(300, 128) radius: 30
+            fill: in(@fill) stroke: #ffffff33 width: 2
+            scale: fn(t) { let k = r.key(t) if k.age < 0.12 { return 0.9 + k.age } return 1.0 }
+            opacity: fn(t) { return r.key(t).presence }}
+        Text{name: "label"
+            source: r.keys() show: @active
+            font: Font{family: "Inter" weight: 700} size: 64 color: in(@color) align: @center
+            at: fn(t) { let p = in(@at) return [p.x, p.y - 40] }}
+    ]
+}

@@ -1,0 +1,37 @@
+# The film bundle a browser player loads: an edit, every Motion document
+# and module it draws, the images, fonts and song they name, and the song's
+# analysis precomputed natively, each file named by its content hash
+# (`makepad-story-player-bundle`, docs in src/lib.rs).
+[package]
+name = "makepad-story-player-bundle"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "makepad_story_player_bundle"
+path = "src/lib.rs"
+
+[[bin]]
+name = "makepad-story-player-bundle"
+path = "src/main.rs"
+
+[dependencies]
+makepad-asset-data = { path = "../../../../apps/engine/asset/data" }
+makepad-asset-client = { path = "../../../../apps/engine/asset/client" }
+makepad-story-edit-render = { path = "../../libs/edit_render", default-features = false, features = ["store", "export", "models"] }
+# The edit model: Graphic nodes, the song clip and its placement.
+makepad-story-cut = { path = "../../libs/cut" }
+# Documents loaded as Stage loads them (their dependencies, modules,
+# fonts, lyrics as a voice, features as JSON). `scene3d`: Text3D layers
+# load (they measure their letters).
+makepad-motion = { path = "../../../../apps/engine/motion", features = ["scene3d"] }
+# The document font table (families, files, where they are).
+makepad-doc-fonts = { path = "../../../../apps/engine/fonts" }
+# Where the bundled fonts are (the document fonts' files).
+makepad-widgets-core = { path = "../../../../../widgets/core" }
+# The song's analysis for documents that read `music(@clip)`.
+makepad-story-audio-features = { path = "../../libs/audio_features" }
+makepad-audio-decode = { path = "../../../../../libs/audio_decode" }
+makepad-strict-json = { path = "../../../../../libs/strict_json" }

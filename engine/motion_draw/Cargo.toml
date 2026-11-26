@@ -1,0 +1,68 @@
+[package]
+name = "makepad-motion-draw"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Draws Motion frames (makepad-motion) with Makepad's GPU vector, SVG and text renderers, runtime-compiled shaders, the render kit, glTF scenes and the widget tree; installed effect and text packs' presets; Scene3D behind a feature"
+
+[lib]
+name = "makepad_motion_draw"
+
+[features]
+default = ["models"]
+# Scene3D's modelled props built by Stage's model host (motion3d's
+# `models`); a player of finished documents turns the defaults off.
+models = ["makepad-stage-motion3d?/models", "makepad-motion/models"]
+# Full Scene3D, Seq3D and Text3D layers, drawn by motion3d.
+scene3d = ["dep:makepad-stage-motion3d", "makepad-motion/scene3d"]
+
+[dependencies]
+makepad-tween = { path = "../../../../libs/tween" }
+makepad-motion = { path = "../motion", default-features = false }
+# The document font table (families, files, where they are).
+makepad-doc-fonts = { path = "../fonts" }
+makepad-asset-data = { path = "../../../apps/engine/asset/data" }
+# Effects, transitions and KineticText through the packs a host installed.
+makepad-content-packs = { path = "../content_packs" }
+# The songs' analysed pictures a kit reads at the frame's time (AudioTrack).
+makepad-audio-reactive = { path = "../../../../libs/audio_reactive" }
+# The HDR frame (`color: @hdr`): post passes, the tone map, whole-frame
+# motion blur (sub-frame accumulation).
+makepad-render-graph = { path = "../../../../libs/render_graph" }
+# Draw2D layers' segments (line batches, HDR).
+makepad-render-lines = { path = "../../../../libs/render_lines" }
+makepad-widgets = { path = "../../../../widgets", default-features = false }
+makepad-xr = { path = "../../../../xr" }
+makepad-gltf = { path = "../../../../libs/gltf" }
+makepad-svg = { path = "../../../../libs/svg" }
+# Wrapping and fitting for the text runs of `paint` (the typography library's measures).
+makepad-typography = { path = "../../../../libs/typography" }
+# The shared Splash stdlib inline shaders call (mod.shared).
+makepad-script-compute = { path = "../../../../platform/script/compute", features = ["vm"] }
+makepad-tween-script = { path = "../../../../libs/tween/script" }
+# R2's render kit: blur, feather and layer `effects: [...]`.
+makepad-stage-render-kit = { path = "../render_kit" }
+makepad-stage-motion3d = { path = "../motion3d", optional = true, default-features = false }
+
+# The frame tool: check, frames, strips, onion skins, inspect.
+[[bin]]
+name = "makepad-motion"
+path = "src/bin/makepad-motion.rs"
+required-features = ["scene3d"]
+
+[[test]]
+name = "pixels"
+required-features = ["scene3d"]
+
+[[test]]
+name = "selection_bounds"
+required-features = ["scene3d"]
+
+[[test]]
+name = "hdr_pixels"
+required-features = ["scene3d"]
+
+[dev-dependencies]
+# Decoding frames in the GPU pixel tests.
+makepad-zune-png = { path = "../../../../libs/zune/zune-png" }

@@ -171,7 +171,7 @@ impl ScopeTools {
         Self::with_clock(cx, cap, save, read, Instant::now)
     }
 
-    /// The same worker with its deadlines (each call's `timeout:` and the host-reply bound) read
+    /// The same worker with its deadlines (each call's `timeout:`) read
     /// from `now`: a test passes a clock it moves, so a deadline falls where the test puts it.
     pub fn with_clock(cx: &mut Cx, cap: usize, save: SaveWriter, read: TraceReader, now: fn() -> Instant) -> Result<Self, SpawnError> {
         let (commands, receive) = sync_channel(16);

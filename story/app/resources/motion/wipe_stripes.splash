@@ -1,0 +1,31 @@
+use mod.motion.*
+// STRIPE WIPE — eight vertical stripes drop in left to right, 35 ms apart,
+// an accent set with an ink set 80 ms behind it, so each column flashes
+// accent then goes dark. The ink covers the frame from 0.68 s to 0.8 s —
+// cut underneath at 0.72 s — then the stripes fall out through the bottom
+// in the same order, ink first, revealing the next shot. Put it on a track
+// above the cut, starting 0.72 s before it.
+// Why: the stagger gives the wipe a direction and rhythm; two colours make
+// eight rectangles feel like one designed move.
+let stripes = []
+for i in 0..8 {
+    let d = i * 0.035
+    stripes.push(Rect{at: vec2(i * 240, 0) size: tween(vec2(241, 0), vec2(241, 1080), d, d + 0.35, @ease_in_out_cubic)
+                      y: tween(0, 1080, d + 0.88, d + 1.23, @ease_in_cubic) fill: in(@lead)})
+}
+for i in 0..8 {
+    let d = i * 0.035 + 0.08
+    stripes.push(Rect{at: vec2(i * 240, 0) size: tween(vec2(241, 0), vec2(241, 1080), d, d + 0.35, @ease_in_out_cubic)
+                      y: tween(0, 1080, d + 0.72, d + 1.07, @ease_in_cubic) fill: in(@slab)})
+}
+Motion{
+    label: "Stripe wipe"
+    brief: "Staggered vertical stripes that drop in and fall away; covers the cut at 0.72 s."
+    tags: ["transition", "wipe", "stripes", "shape"]
+    duration: 1.5
+    inputs: {
+        lead: input(@color, #ff5c39, "Leading stripes")
+        slab: input(@color, #0b0d12, "Covering stripes")
+    }
+    layers: stripes
+}

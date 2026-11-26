@@ -1,0 +1,11 @@
+[package]
+name = "fab-elec-req"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Fab project requirements: the requirements document's reader and its judge against facts the checks, the bench and the slice already produce"
+
+[dependencies]
+fab-elec-core = { path = "../core" }
+makepad-script = { path = "../../../../../platform/script" }

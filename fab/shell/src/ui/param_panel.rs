@@ -20,6 +20,7 @@ use crate::ui::parts::active_part;
 use makepad_widgets_core::widget_tree::CxWidgetExt;
 use makepad_widgets_core::*;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 /// The longest a parameter row's label column is (points): the Part panel's Transform rows take
 /// the same, so every field of the panel starts at one line. A longer label ends in an ellipsis.
@@ -66,9 +67,9 @@ script_mod! {
         }
         // Every row's label column is `LABEL_W` at most, the Part panel's Transform's too, so the
         // panel's fields all start at one line.
-        Num := PropNumberRow{label +: {width: Fill{weight: 0 basis: "42%" max: #(LABEL_W)}} value +: {num +: {min: 0.0 max: 0.0 precision: 1}}}
+        Num := FabNumberRow{label +: {width: Fill{weight: 0 basis: "42%" max: #(LABEL_W)}} value +: {num +: {min: 0.0 max: 0.0 precision: 1}}}
         // A seed: its number, and a button that writes a new one.
-        Seed := PropNumberRow{
+        Seed := FabNumberRow{
             label +: {width: Fill{weight: 0 basis: "42%" max: #(LABEL_W)}}
             value +: {num +: {min: 0.0 max: 0.0 precision: 0}}
             trail +: {width: Fit reseed := mod.widgets.FabFlatButton{text: "Reseed" a11y: {label: "Reseed"}}}
@@ -306,7 +307,7 @@ impl FabProfileEditorRef {
 #[derive(Clone, Debug, PartialEq)]
 enum RowConfig {
     Group { title: String },
-    Param { template: LiveId, kind: ParamKind, label: String, unit: String, range: [f64; 4], bounded: bool, choices: Vec<String>, points: usize },
+    Param { template: LiveId, kind: ParamKind, label: String, unit: String, range: [f64; 4], bounded: bool, reach: bool, choices: Vec<String>, points: usize },
 }
 
 impl RowConfig {
@@ -318,6 +319,7 @@ impl RowConfig {
             unit: p.unit.clone(),
             range: Self::range(p),
             bounded: Self::bounded(p),
+            reach: reach_only(p),
             choices: p.choices.clone(),
             points: Self::points(p),
         }
@@ -326,9 +328,9 @@ impl RowConfig {
     /// `p` configures the row as this: compared in place, since every row asks on every frame
     /// of a drag (`of` copies the strings).
     fn shows(&self, p: &ParamView) -> bool {
-        let RowConfig::Param { template, kind, label, unit, range, bounded, choices, points } = self else { return false };
+        let RowConfig::Param { template, kind, label, unit, range, bounded, reach, choices, points } = self else { return false };
         *template == template_for(p) && *kind == p.kind && *label == p.label && *unit == p.unit && *range == Self::range(p)
-            && *bounded == Self::bounded(p) && *choices == p.choices && *points == Self::points(p)
+            && *bounded == Self::bounded(p) && *reach == reach_only(p) && *choices == p.choices && *points == Self::points(p)
     }
 
     fn shows_group(&self, group: &str) -> bool {
@@ -426,12 +428,18 @@ pub struct FabParamPanel {
     #[rust]
     shown_part: Option<String>,
     #[rust]
+    step_rows: Option<Arc<StepRows>>,
+    #[rust]
     tool_shown: bool,
     #[rust]
     pointer_inside: bool,
     /// The hover tooltip of a row's hint; never inline, so hovering moves nothing.
     #[rust]
     hint: PropHint,
+    /// The names the shown part's boxes read (its declared parameters), by the part view they
+    /// were taken from: built once per parameter model, not per frame.
+    #[rust]
+    names: Option<(usize, std::sync::Arc<[makepad_script::syntax::quantity::NamedValue]>)>,
 }
 
 impl ScriptHook for FabParamPanel {
@@ -548,10 +556,10 @@ fn not_in_effect(state: &AppState, pp: &PartParamsView, p: &ParamView) -> bool {
 /// The groups of a part's parameters in panel order (declared first), with their rows: the
 /// picked print settings volume's size and place (`volumes`: its settings are the Slicer
 /// panel's rows), or all but any volume's.
-fn grouped<'a>(state: &AppState, pp: &'a PartParamsView, volumes: bool) -> Vec<(String, Vec<&'a ParamView>)> {
+fn grouped<'a>(state: &AppState, params: &'a [ParamView], volumes: bool) -> Vec<(String, Vec<&'a ParamView>)> {
     let mut out: Vec<(String, Vec<&ParamView>)> = Vec::new();
     let picked = if volumes { picked_volume(state) } else { None };
-    let all = pp.params.iter().filter(|p| match &picked {
+    let all = params.iter().filter(|p| match &picked {
         Some(v) => p.objects.iter().any(|o| o == v) && p.setting.is_none(),
         None => !volumes && !in_volume(state, p),
     });
@@ -579,7 +587,43 @@ fn grouped<'a>(state: &AppState, pp: &'a PartParamsView, volumes: bool) -> Vec<(
     out
 }
 
+/// Prepared once when the edited step or its committed parameter model changes.
+struct StepRows {
+    part: Arc<PartParamsView>,
+    index: usize,
+    heading: String,
+    params: Vec<ParamView>,
+}
+
 impl FabParamPanel {
+    fn rows_for_step(&mut self, state: &AppState, part: &Arc<PartParamsView>) -> Option<Arc<StepRows>> {
+        let steps = &state.steps;
+        let Some(index) = steps.editing.filter(|_| !self.volumes && steps.part.as_ref() == Some(&part.object)) else {
+            self.step_rows = None;
+            return None;
+        };
+        if let Some(rows) = &self.step_rows {
+            if index == rows.index && Arc::ptr_eq(part, &rows.part) { return Some(rows.clone()); }
+        }
+        let chip = steps.chips.get(index)?;
+        let (instance, _) = part.object.split_once('/')?;
+        let feature = format!("{instance}/{}", chip.id);
+        let value = chip.value.as_ref().map(|v| format!(" {v}")).unwrap_or_default();
+        let heading = format!("Editing step {} of {}: {}{value} · Esc: done", chip.n, steps.chips.len(), chip.verb);
+        let mut params: Vec<_> = part.params.iter().filter(|p| p.objects.contains(&feature)).cloned().collect();
+        for p in params.iter_mut().filter(|p| p.declared) {
+            for other in steps.chips.iter().filter(|s| s.n != chip.n) {
+                if p.objects.iter().any(|o| o.split_once('/') == Some((instance, other.id.as_str()))) {
+                    if !p.hint.is_empty() { p.hint.push_str(" · "); }
+                    p.hint.push_str(&format!("also read by {} (step {})", other.verb, other.n));
+                }
+            }
+        }
+        let rows = Arc::new(StepRows { part: part.clone(), index, heading, params });
+        self.step_rows = Some(rows.clone());
+        Some(rows)
+    }
+
     /// Tell the view a number here is pressed or being typed in.
     fn set_input_active(cx: &mut Cx, scope: &mut Scope, active: bool) {
         if let Some(state) = scope.data.get_mut::<AppState>() {
@@ -615,6 +659,8 @@ impl FabParamPanel {
         let (min, max, step) = (p.min, p.max, p.step);
         let snapv = snap_step(p, p.value.num().unwrap_or(1.0), false);
         let bounded = p.declared && p.kind.is_numeric() && p.max > p.min;
+        // a range nothing declared scales the drag; a typed number goes past it
+        let reach = reach_only(p);
         match template_for(p) {
             t if t == live_id!(Num) || t == live_id!(Seed) => {
                 let mut num = w.widget(cx, ids!(num));
@@ -626,7 +672,7 @@ impl FabParamPanel {
                 let prec = if p.kind == ParamKind::Ratio { (prec - 2.0).max(0.0) } else { prec };
                 w.label(cx, ids!(label)).set_text(cx, &label);
                 crate::ui::print_settings::name_control(cx, &num, &label, "spin_button");
-                script_apply_eval!(cx, num, { min: #(mn) max: #(mx) step: #(st) snap: #(sn) precision: #(prec) suffix: #(suf) show_fill: #(bounded) });
+                script_apply_eval!(cx, num, { min: #(mn) max: #(mx) step: #(st) snap: #(sn) precision: #(prec) suffix: #(suf) show_fill: #(bounded) reach_only: #(reach) });
             }
             t if t == live_id!(Bool) => {
                 let mut c = w.widget(cx, ids!(check));
@@ -656,7 +702,7 @@ impl FabParamPanel {
                     let name = ["X", "Y", "Z"][i];
                     crate::ui::print_settings::name_control(cx, &num, &format!("{} {name}", p.label), "spin_button");
                     let suf = suf.clone();
-                    script_apply_eval!(cx, num, {min: #(min) max: #(max) step: #(step) snap: #(1.0) precision: #(prec) suffix: #(suf)});
+                    script_apply_eval!(cx, num, {min: #(min) max: #(max) step: #(step) snap: #(1.0) precision: #(prec) suffix: #(suf) reach_only: #(reach)});
                     num.set_visible(cx, i < n);
                 }
             }
@@ -742,7 +788,9 @@ impl FabParamPanel {
         match plate_axis(p).filter(|_| self.volumes) {
             Some(a) => {
                 let (min, max) = if a.sign < 0.0 { (-p.max, -p.min) } else { (p.min, p.max) };
-                ParamView { label: a.label, min, max, ..p.clone() }
+                let [lo, hi] = p.limits;
+                let limits = if a.sign < 0.0 { [hi.map(|x| -x), lo.map(|x| -x)] } else { [lo, hi] };
+                ParamView { label: a.label, min, max, limits, ..p.clone() }
             }
             None => p.clone(),
         }
@@ -868,7 +916,11 @@ impl Widget for FabParamPanel {
                 let state = scope.data.get::<AppState>()?;
                 if state.params.dragging.is_some() { return None; }
                 let (id, _, rect) = self.rows.iter().find(|(_, kind, _)| matches!(kind, RowKind::Param(k) if k == key))?;
-                Some((*id, *rect, Self::part(state)?.param(key)?.hint.clone()))
+                let p = match &self.step_rows {
+                    Some(rows) => rows.params.iter().find(|p| p.key == *key)?,
+                    None => pp.param(key)?,
+                };
+                Some((*id, *rect, p.hint.clone()))
             });
             match hint {
                 Some((id, rect, hint)) => self.hint.hover(cx, self.uid, Some((id, rect, hint.as_str()))),
@@ -976,9 +1028,15 @@ impl Widget for FabParamPanel {
                                 // written one)
                                 let sign = self.plate_sign(p);
                                 if let Some(v) = num.ended(&actions) {
-                                    commit(cx, ParamValue::Num(clamp_value(p, pct(sign * v))));
+                                    // (a row shown against its written sign takes numbers only: its
+                                    // formula would be written with the shown sign)
+                                    if let Some((value, code)) = typed_formula(p, actions, num.widget_uid()).filter(|_| sign > 0.0) {
+                                        cx.action(ParamAction::Link { object: object.clone(), key: key.clone(), code, value: within_limits(p, pct(sign * value)) });
+                                    } else {
+                                        commit(cx, ParamValue::Num(within_limits(p, pct(sign * v))));
+                                    }
                                 } else if let Some(v) = num.changed(&actions) {
-                                    preview(cx, ParamValue::Num(clamp_value(p, pct(sign * v))));
+                                    preview(cx, ParamValue::Num(within_limits(p, pct(sign * v))));
                                 }
                             }
                         }
@@ -1014,6 +1072,7 @@ impl Widget for FabParamPanel {
         // A ghost that is fading has done its work.
         self.tool_shown = !self.volumes && state.params.ghost.as_ref().is_some_and(|g| g.fade_from.is_none() && !g.bodies.is_empty());
         let Some(pp) = Self::part(state).cloned() else {
+            self.step_rows = None;
             cx.begin_turtle(walk, self.layout);
             cx.end_turtle_with_area(&mut self.area);
             return DrawStep::done();
@@ -1022,6 +1081,11 @@ impl Widget for FabParamPanel {
         if new_part {
             self.shown_part = Some(pp.object.clone());
         }
+        let at = std::sync::Arc::as_ptr(&pp) as usize;
+        if self.names.as_ref().is_none_or(|(was, _)| *was != at) {
+            self.names = Some((at, named_values(&pp)));
+        }
+        let names = self.names.as_ref().map(|(_, n)| n.clone()).unwrap_or_else(|| std::sync::Arc::from(Vec::new()));
         open_declared(new_part, pp.params.iter().filter(|p| p.declared).map(|p| p.group.as_str()), &mut self.seen, &mut self.open);
         // A part that declares nothing: its own object's fields.
         if new_part && !pp.params.iter().any(|p| p.declared) {
@@ -1033,8 +1097,15 @@ impl Widget for FabParamPanel {
             self.open.insert(g.to_string());
         }
         cx.begin_turtle(walk, self.layout);
-        let groups = grouped(state, &pp, self.volumes);
-        if !pp.readout.is_empty() && !self.volumes {
+        let editing = self.rows_for_step(state, &pp);
+        let groups = grouped(state, editing.as_ref().map_or(&pp.params, |rows| &rows.params), self.volumes);
+        if let Some(rows) = &editing {
+            if let Some(w) = self.item(cx, live_id!(param_edit_step), live_id!(Hint)) {
+                w.label(cx, ids!(text)).set_text(cx, &rows.heading);
+                w.draw_all(cx, &mut Scope::empty());
+                self.rows.push((live_id!(param_edit_step), RowKind::Hint, w.area().rect(cx)));
+            }
+        } else if !pp.readout.is_empty() && !self.volumes {
             if let Some(w) = self.item(cx, live_id!(param_readout), live_id!(Hint)) {
                 w.label(cx, ids!(text)).set_text(cx, &pp.readout);
                 w.draw_all(cx, &mut Scope::empty());
@@ -1042,14 +1113,14 @@ impl Widget for FabParamPanel {
             }
         }
         let grow: Vec<&str> = state.params.grow_lines.iter().filter(|l| l.object == pp.object).map(|l| l.text.as_str()).collect();
-        if !grow.is_empty() && !self.volumes {
+        if !grow.is_empty() && !self.volumes && editing.is_none() {
             if let Some(w) = self.item(cx, live_id!(param_grow), live_id!(Hint)) {
                 w.label(cx, ids!(text)).set_text(cx, &grow.join("\n"));
                 w.draw_all(cx, &mut Scope::empty());
                 self.rows.push((live_id!(param_grow), RowKind::Hint, w.area().rect(cx)));
             }
         }
-        if groups.is_empty() && !self.volumes {
+        if groups.is_empty() && !self.volumes && editing.is_none() {
             if let Some(w) = self.item(cx, live_id!(param_hint), live_id!(Hint)) {
                 w.label(cx, ids!(text)).set_text(cx, "This part has no shape parameters (an imported mesh). Ask the AI to rebuild it as a program to tune it here.");
                 w.draw_all(cx, &mut Scope::empty());
@@ -1060,7 +1131,7 @@ impl Widget for FabParamPanel {
             let gk = RowKind::Group(group.clone());
             let gid = row_id(&gk);
             // (the picked volume's one group always shows its rows)
-            let open = self.volumes || self.open.contains(&group);
+            let open = self.volumes || editing.is_some() || self.open.contains(&group);
             let Some(section) = self.item(cx, gid, live_id!(Group)) else { continue };
             if !self.applied.get(&gid).is_some_and(|c| c.shows_group(&group)) {
                 section.label(cx, ids!(hdr.title)).set_text(cx, &group);
@@ -1107,6 +1178,9 @@ impl Widget for FabParamPanel {
                     }
                     (ParamValue::Num(x), _) => {
                         let num = w.value_input(cx, ids!(num));
+                        let links = p.links && self.plate_sign(p) > 0.0;
+                        num.set_names(cx, names.clone(), links);
+                        num.set_formula(cx, p.formula.as_deref().filter(|_| links));
                         if !num.borrow().is_some_and(|n| n.is_interacting()) {
                             num.set_value(cx, if p.kind == ParamKind::Ratio { x * 100.0 } else { *x });
                         }
@@ -1137,6 +1211,7 @@ impl Widget for FabParamPanel {
                     (ParamValue::Point(c), _) => {
                         for (i, axis) in [ids!(value.x), ids!(value.y), ids!(value.z)].into_iter().enumerate() {
                             let num = w.value_input(cx, axis);
+                            num.set_names(cx, names.clone(), false);
                             if !num.borrow().is_some_and(|n| n.is_interacting()) {
                                 num.set_value(cx, c.get(i).copied().unwrap_or(0.0));
                             }
@@ -1183,7 +1258,7 @@ impl Widget for FabParamPanel {
                 }
             }
         }
-        if !self.volumes {
+        if !self.volumes && editing.is_none() {
             self.draw_mass(cx, state, &pp);
         }
         cx.end_turtle_with_area(&mut self.area);

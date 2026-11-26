@@ -8,6 +8,71 @@ use makepad_fab_slicer::clip::intersection_ex;
 use makepad_fab_toolpath::Role;
 use std::sync::mpsc;
 
+#[test]
+fn linked_copies_print_at_their_own_positions() {
+    use fab_printer_link::safety::{check_gcode, MachineProfile};
+    use makepad_fab_settings::{profiles::ProfileStore, virtual_printer};
+
+    let printer = virtual_printer::presets().into_iter().find(|p| p.name == "four-tools").unwrap();
+    let store = ProfileStore::open(&[], &[]).with_builtin(virtual_printer::builtin_presets(std::slice::from_ref(&printer)));
+    let machine = store.resolve(&printer.machine_preset_name()).unwrap();
+    let filament = store.resolve(&virtual_printer::filament_preset("PLA")).unwrap();
+    let profile = MachineProfile::from_settings(&|k| machine.values.get(k).or_else(|| filament.values.get(k))
+        .map(|v| v.as_vec()).unwrap_or_default(), Vec::new()).unwrap();
+    let setup = JobSetup {
+        machine, process: store.resolve(virtual_printer::PROCESS).unwrap(), filaments: vec![filament],
+        filament_map: vec![1], filament_colours: vec![None], nozzle_volume_type: vec!["Standard".into(); printer.heads],
+        bed_type: "Textured PEI Plate".into(), filament_map_mode: "Manual".into(),
+    };
+    let centres = [[100, 100], [112, 102], [112, 114], [100, 114]];
+    let project = r#"use mod.fab.*
+script("bar.cad.splash")
+place("bar", object: "bar", at: [100mm 100mm])
+place("bar", object: "bar", link: 1, at: [112mm 102mm])
+place("bar", object: "bar", link: 2, at: [112mm 114mm])
+place("bar", object: "bar", link: 3, at: [100mm 114mm], rotate: 90°)
+"#;
+    let script = format!("{}let bar = m.box({{size: [6mm 0.2mm 2mm]}})\nobject(bar)\n", fab_model::program::EMPTY);
+    let model = fab_model::FabModel::load("bars", project, [("bar.cad.splash".into(), script)].into()).unwrap();
+    let (_, ev, _) = crate::fab_doc::evaluate(&setup, &model, &Default::default()).unwrap();
+    let mut frames: Vec<_> = ev.frames.iter().map(|f| Frame { local: f.local.clone(), offset: f.offset, field: None }).collect();
+    // The third copy has the same plate geometry expressed in a translated local mesh.
+    Arc::make_mut(&mut frames[2].local).translate([2.0, -1.0, 0.0]);
+    frames[2].offset[0] -= 2.0;
+    frames[2].offset[1] += 1.0;
+
+    let (engine, rx) = engine();
+    for count in [2, 4] {
+        let mut plate = ev.plate.clone();
+        plate.parts.truncate(count);
+        let frames = Arc::new(frames[..count].to_vec());
+        let mut input = LiveInput::ready(count as u64, 1, setup.clone(), Arc::new(plate), Arc::new(Vec::new()));
+        input.frames = Some(frames.clone());
+        let fresh = slice_frames(&setup, &input.plate, &frames, &[], None).unwrap();
+        engine.settle(count as u64, input);
+        let live = settled(&rx, count as u64);
+
+        let check = |path: &str, moves: &mut dyn Iterator<Item = MoveRecord>, gcode: &str| {
+            let mut boxes = vec![fab_plate::Bounds::EMPTY; count];
+            for m in moves.filter(|m| m.kind == MoveKind::Extrude && m.role == Role::OuterWall) {
+                let b = &mut boxes[m.object as usize];
+                b.add_point(m.p0.map(f64::from));
+                b.add_point(m.p1.map(f64::from));
+            }
+            for (i, b) in boxes.iter().enumerate() {
+                let [x, y] = centres[i];
+                let (dx, dy) = if i == 3 { (1, 3) } else { (3, 1) };
+                // Wall centrelines sit half a bead inside these integer-mm edges.
+                let edges = [b.min[0], b.min[1], b.max[0], b.max[1]];
+                assert_eq!(edges.map(|v| v.round()), [x - dx, y - dy, x + dx, y + dy].map(f64::from),
+                    "{path}, {count} parts: copy {i} at ({x}, {y}) printed walls at {edges:?}");
+            }
+            check_gcode(gcode, &profile).unwrap_or_else(|e| panic!("{path}, {count} parts: {}", e.message()));
+        };
+        check("fresh", &mut fresh.timeline.moves().copied(), &fresh.gcode);
+        check("live", &mut live.layers.records(), &live.gcode.text().unwrap());
+    }
+}
 
 fn job(settings: &[(&str, &str)]) -> JobSetup {
     let mut job = (*setup()).clone();

@@ -1,0 +1,40 @@
+use mod.motion.*
+
+// 01, the title. A soft pool of cool light breathes behind the title (a feathered ellipse);
+// the title and its one quiet line glide in, then the chapters of the deck underneath. Ambient motion runs on live(), so the held title keeps breathing.
+let look = import("shared/motion_deck_look")
+
+let CHAPTERS = ["Type", "Shape and paths", "Characters and bones", "Math", "Transitions and camera", "AI writes these"]
+let enter = fn(at, dur) { return tween(0, 1, at, at + dur, @ease_in_out_cubic) }
+
+Motion{
+    label: "Motion, in Splash"
+    size: vec2(1920, 1080)
+    duration: 6.0
+    fps: 60
+    color: @hdr
+    background: look.INK
+    layers: [
+        Draw2D{name: "ground" size: vec2(1920, 1080) draw: fn(c, t, edit) { look.ground(c, t, live()) }}
+        Ellipse{name: "pool" size: vec2(1100, 520) fill: look.COOL feather: 320
+            opacity: fn(t) { (0.13 + 0.03 * sin(live() * 0.4)) * smoothstep(0.0, 2.0, t) }
+            at: fn(t) { vec2(410 + 40 * sin(live() * 0.11), 230 + 14 * cos(live() * 0.09)) }}
+        Text{name: "title" text: "Motion, in Splash." font: look.TITLE size: 132 color: look.BONE align: @center
+            at: vec2(960, 360) opacity: enter(0.4, 1.6) y: tween(18, 0, 0.4, 2.0, @ease_in_out_cubic)}
+        Text{name: "line" text: "Soft edges, living type, bones, blends and math, written as code and drawn live."
+            font: look.SERIF size: 40 color: look.BONE align: @center at: vec2(960, 560)
+            opacity: enter(1.4, 1.6) y: tween(14, 0, 1.4, 3.0, @ease_in_out_cubic)}
+        Draw2D{name: "chrome" size: vec2(1920, 1080) draw: fn(c, t, edit) {
+            look.folio(c, t, "01", "Motion")
+            // The chapters, in one quiet row, gliding in one after another.
+            var total = 64.0 * (CHAPTERS.len() - 1)
+            for name in CHAPTERS { total = total + c.measure(name, {px: 24 font: look.TEXT}) }
+            var x = 960.0 - total * 0.5
+            for i in 0..CHAPTERS.len() {
+                look.label(c, t, 2.4 + 0.12 * i, CHAPTERS[i], x, 930, {px: 24})
+                x = x + c.measure(CHAPTERS[i], {px: 24 font: look.TEXT}) + 64.0
+            }
+        }}
+    ]
+    post: look.post_chain(look.POST)
+}

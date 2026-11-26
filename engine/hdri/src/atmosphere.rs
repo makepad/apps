@@ -25,8 +25,13 @@
 //!
 //! A clear sky mirrors about the sun's vertical plane, so everything that
 //! depends on the view is computed once into a sky-view table indexed by the
-//! view elevation and the azimuth away from the sun; `sky()` is one bilinear
-//! lookup.
+//! view elevation and the azimuth away from the sun. The table keeps the air's,
+//! the low haze's, the stratosphere's and the multiple scattering apart and
+//! without the phase, which is the same all along a view ray; `sky()` reads the
+//! four planes bilinearly and applies the exact phase for its own direction (the
+//! low haze takes its kind's, the stratosphere's haze always the continental
+//! one), so the haze's narrow peak round the sun stays sharp however coarse the
+//! table.
 //!
 //! Units: lengths in metres, tabulated in f64 so planet-sized numbers keep
 //! their precision; radiance in the scene units fixed by `SUN_IRRADIANCE`.
@@ -68,6 +73,10 @@ use makepad_draw::*;
 use super::{dir_from_az_el, AtmosphereParams, EnvSun, SunDiscParams, SunMode, SunParams};
 use crate::sky::{noaa_solar_position, SkyDate};
 
+/// The sky from a viewer at a height of its own (`AtmosphereParams::viewer_height_m`).
+mod aerial;
+pub use aerial::AirLight;
+
 /// Top-of-atmosphere sun irradiance, in scene units per channel. The scale is
 /// arbitrary but fixed (see the module header for how it compares with the
 /// engine's presets and HDR lane): with it a clear high-sun zenith lands at a
@@ -77,6 +86,20 @@ pub const SUN_IRRADIANCE: f32 = 20.0;
 
 const PLANET_RADIUS: f64 = 6_360_000.0;
 const TOP_RADIUS: f64 = 6_420_000.0;
+/// Above the dense air (TOP_RADIUS, 60 km) the mesosphere goes on to 100 km. Its air is too thin to dim anything
+/// (0.05 % of the air lies above 60 km), so the sun's light reaches it whole unless its ray dips back into the dense
+/// air (`DepthTable::transmittance_at`), but it still scatters: once the sun is about 7 degrees down, the air still
+/// lit overhead and the nearest lit air toward the sun are up there, and their light, scattered once to the viewer
+/// and again on its way down, keeps the sky glowing until the sun is 18 degrees down. Without it the sky went black
+/// between 12 and 15 degrees down. The view march and the multiple scattering's rays cross it in MESOSPHERE_STEPS
+/// steps after the dense air's.
+const MESOSPHERE_RADIUS: f64 = 6_460_000.0;
+const MESOSPHERE_STEPS: usize = 6;
+/// The mesosphere's air is the real one (US Standard Atmosphere 1976: 2.53e-4 of the ground's density at 60 km,
+/// 1.51e-5 at 80 km, 2.8e-6 at 90 km), not the dense air's exponential carried on, which the calibration holds below
+/// 60 km and which is already twice the real density there and eight times it at 100 km.
+const MESOSPHERE_DENSITY: f64 = 2.5e-4;
+const MESOSPHERE_SCALE_HEIGHT: f64 = 7_000.0;
 /// The viewer stands 200 m up, so a level view ray clears the ground.
 const VIEWER_HEIGHT: f64 = 200.0;
 const RAYLEIGH_SCALE_HEIGHT: f64 = 8_000.0;
@@ -89,9 +112,9 @@ const MIE_SCALE_HEIGHT: f64 = 1_200.0;
 /// Chappuis band, which peaks at 600 nm and is what keeps a twilight zenith
 /// blue (Hulburt 1953). With them, a 1 deg sun's zenith and a dawn's sky
 /// came out grey-purple where real HDRIs are blue.
-const BANDS: usize = 8;
+pub(crate) const BANDS: usize = 8;
 type Spectrum = [f64; BANDS];
-const BAND_NM: Spectrum = [400.0, 440.0, 480.0, 520.0, 560.0, 600.0, 640.0, 680.0];
+pub(crate) const BAND_NM: [f64; BANDS] = [400.0, 440.0, 480.0, 520.0, 560.0, 600.0, 640.0, 680.0];
 /// CIE 1931 2 deg colour-matching functions (x, y, z), 380..700 nm every 10 nm.
 const CIE_XYZ: [[f64; 3]; 33] = [
     [0.001368, 0.000039, 0.006450], [0.004243, 0.000120, 0.020050], [0.014310, 0.000396, 0.067850],
@@ -137,12 +160,35 @@ const MIE_G_BROAD: f64 = 0.65;
 /// any day whatever the haze down low: a vertical optical depth of 0.008 at
 /// 550 nm, a tent peaking at STRAT_PEAK_HEIGHT. Lit by a sun that has set for
 /// the air below it, it scatters forward into the bright glow over the
-/// sunrise or sunset point and the purple light of civil twilight.
+/// sunrise or sunset point and the purple light of civil twilight. Its
+/// sulphate droplets keep the continental haze's colour, absorption and phase
+/// whatever the low haze's kind (`Aerosol`, which is the low haze's alone).
 const STRAT_DEPTH: f64 = 0.008;
 const STRAT_PEAK_HEIGHT: f64 = 20_000.0;
 const STRAT_HALF_WIDTH: f64 = 7_000.0;
 const MIE_G_PEAK: f64 = 0.95;
 const MIE_PEAK_SHARE: f64 = 0.25;
+/// The boundary layer (`AtmosphereParams::haze_top_m`): the haze mixed evenly from the ground up to the layer's
+/// top (the mixing height) and, over the capping inversion, the free troposphere's thin haze: FREE_HAZE_SHARE of the
+/// layer's density just over the top, falling with FREE_HAZE_SCALE_HEIGHT (lidar profiles over land: a tenth or less
+/// over the inversion, a scale height of 2-3 km above it). The Haze control keeps its column (its optical depth), so a
+/// low layer holds the same haze denser near the ground.
+const FREE_HAZE_SHARE: f64 = 0.1;
+const FREE_HAZE_SCALE_HEIGHT: f64 = 2_500.0;
+/// The sun's angular radius (0.2666 deg, its mean): seen from a point of the air, the planet's limb hides its disc
+/// gradually, so the Earth's shadow on the air has a penumbra (`DepthTable::transmittance_at`). The drawn disc's size
+/// is a look and leaves the shadow alone.
+const SUN_ANGULAR_RADIUS: f64 = 0.004_653;
+/// The disc's light across its face for the penumbra: a linear limb darkening with the visible band's mean
+/// coefficient (Neckel & Labs 1994 average about 0.6 over 450-650 nm).
+const PENUMBRA_LIMB: f64 = 0.6;
+/// The penumbra's lookup averages the transmittance over the visible face (PENUMBRA_NODES rows) while the disc's
+/// centre is within PENUMBRA_REACH radii of the limb, handing over to the centre's own from PENUMBRA_BLEND radii up: the
+/// face's mean and the centre's differ there by under half a percent, and beyond it the lookup is the centre's as it
+/// always was.
+const PENUMBRA_NODES: usize = 8;
+const PENUMBRA_BLEND: f64 = 2.0;
+const PENUMBRA_REACH: f64 = 4.0;
 /// Ozone only absorbs, in the Chappuis band (500-700 nm, peaking at 600):
 /// over the long grazing paths of twilight that is what keeps the zenith
 /// blue. Its absorption cross section in m^2, 380..700 nm every 10 nm
@@ -187,17 +233,62 @@ const EXACT_STEPS: usize = 64;
 /// sky's light bright overhead, carries the ground's light into the air and
 /// keeps the sky glowing after sunset. Our sun is fixed, so the table only
 /// spans the sun angles the view rays can meet: the viewer's own, +- the
-/// arc a ray to the top of the air crosses (under 8 deg).
+/// arc a ray to the top of the dense air crosses (under 8 deg; the far
+/// mesosphere's steps take the edge column).
 const MS_HEIGHTS: usize = 12;
-const MS_ANGLES: usize = 10;
+/// The table works out MS_ANGLES sun angles, evenly over the sun's cosine from cos(z + MS_ANGLE_REACH_DEG) to
+/// cos(z - MS_ANGLE_REACH_DEG), z the sun's angle from the viewer's vertical (1.8 deg apart near the horizon). The
+/// count is odd so that in twilight a worked-out column lies next to the viewer's own sun angle, which every step of a
+/// vertical ray reads. Next to it, not on it: the middle column sits at sin(e) cos(MS_ANGLE_REACH_DEG) for a sun e up,
+/// so it is the viewer's own only with the sun on the horizon, within 0.13 of a column of it down to -18 deg
+/// (10 columns put the zenith 0.39-0.5 of the way between two), and further off by day, where the source is smooth:
+/// 0.23 of a column at 30 deg, 2.2 at 80 (above 81 deg the span stops at the vertical: 3.7 at 85). Below a point's
+/// horizon the source falls about 3x per degree, so the table is read on MS_READ_ANGLES columns over the same span,
+/// filled between the worked-out ones along each band's logarithm (`read_columns`). Read linearly, 10 columns 2 deg
+/// apart read twilight's multiple scattering 1.3-1.75x too bright from -3 to -13 deg (nautical twilight 1.3-1.4x
+/// Koomen et al. 1952's measured sky); now it is within 1 % of a table worked out every 0.2 deg by day and
+/// down to -6 deg, and within 8 % down to -15 deg (the zenith within 0.1 % down to -6, 1 % at -9 and -12, 3 % at -15).
+const MS_ANGLES: usize = 11;
+const MS_READ_ANGLES: usize = 91;
+/// The source is interpolated over its logarithm with this floor (per unit of the sun's light above the air; the sky
+/// 18 degrees into twilight is 1e-11 of it), so a column nothing lights reads as next to nothing.
+const PSI_FLOOR: f64 = 1.0e-30;
 const MS_DIRS: usize = 32;
 const MS_STEPS: usize = 12;
 const MS_ANGLE_REACH_DEG: f64 = 9.0;
+/// A sun well below a point's horizon lights it only from a band of directions: low toward the sun, where air is still
+/// lit far off, and up through the lit mesosphere. MS_DIRS directions cannot integrate that (against 2048 directions,
+/// with the sun 15 degrees down they found a third of the light, at 18 none), so the table's columns whose sun is
+/// MS_DEEP_FROM_DEG to MS_DEEP_TO_DEG below the point's horizon blend over to MS_DEEP_DIRS directions (on average
+/// within 5 % of 2048 down to 15 degrees, 8 % at 18), and the columns above stay as they were. It costs only a sky
+/// whose sun is under about 5 degrees (the table then spans a deep column).
+const MS_DEEP_DIRS: usize = 256;
+const MS_DEEP_FROM_DEG: f64 = 4.0;
+const MS_DEEP_TO_DEG: f64 = 8.0;
 
 /// Below the horizon the horizon haze fades into the lit ground over this band.
 const GROUND_BLEND_DEG: f32 = 3.0;
-/// Linear limb-darkening coefficient of the sun in the visible.
-const LIMB_DARKENING: f32 = 0.6;
+/// The sun's limb darkening, Neckel & Labs 1994 (Solar Physics 153, 91), for 422-1100 nm: the radiance at mu (the
+/// cosine of the angle between the sun's surface normal and the line of sight) against the centre's is
+/// sum_i a_i mu^i, with a_i = A_i + B_i / lambda + C_i / lambda^5, lambda in micrometres; rows [A_i, B_i, C_i] for
+/// i = 0..5. Each a_i sums to 1 at mu = 1 at every wavelength. The limb is darker and redder than the centre: at
+/// r = 0.999 R it is 0.40, 0.33 and 0.22 of the centre at 650, 550 and 450 nm. The 400 nm band takes the formula
+/// 22 nm past its end.
+const LIMB_NL94: [[f64; 3]; DISC_LIMB_TERMS] = [
+    [0.75267, -0.265577, 0.0],
+    [0.93874, 0.265577, -0.004095],
+    [-1.89287, 0.0, 0.012582],
+    [2.42234, 0.0, -0.017117],
+    [-1.71150, 0.0, 0.011977],
+    [0.49062, 0.0, -0.003347],
+];
+/// The terms of the limb darkening's polynomial in mu (`SunDiscLook::limb`).
+pub const DISC_LIMB_TERMS: usize = 6;
+/// The disc's colour is kept at this many apparent elevations across it (`SunDiscLook::rows`).
+pub const DISC_ROWS: usize = 8;
+/// The air's refractivity n - 1 at the ground in the visible (15 C, 1013 hPa, 550 nm): with the air's scale height it
+/// sets how a ray near the horizon bends (`refracted_transmittance`).
+const REFRACTIVITY: f64 = 2.77e-4;
 
 pub struct Atmosphere {
     sun_dir: Vec3f,
@@ -205,8 +296,12 @@ pub struct Atmosphere {
     /// at the zenith, where any reference azimuth will do.
     sun_horizontal: Vec2f,
     medium: Medium,
-    /// LUT_HEIGHT rows of LUT_WIDTH texels, row 0 at the horizon.
-    lut: Vec<Vec3f>,
+    /// The sky-view table without the phase (`SkyLut`).
+    lut: SkyLut,
+    /// The sine and cosine of the sun's elevation as it is seen (`apparent_elevation`), for the view-sun cosine a
+    /// lookup applies the phase at: the glow centres on the drawn disc.
+    sun_sin: f32,
+    sun_cos: f32,
     /// Radiance of the lit ground (Lambertian, ground_color albedo).
     ground: Vec3f,
     /// The light on a level ground, the sky dome's and the sun's (`ground` is ground_color x this / pi).
@@ -215,13 +310,26 @@ pub struct Atmosphere {
     /// The sky's irradiance on a level surface (the disc excluded).
     sky_irradiance: Vec3f,
     sun_irradiance: Vec3f,
-    /// Radiance at the centre of the disc: sun irradiance / effective solid angle.
-    disc_radiance: Vec3f,
+    /// The disc as it is drawn: lifted and flattened by the air's refraction, each part coloured by the air its
+    /// light crosses, limb-darkened per wavelength (`SunDiscLook`).
+    disc: SunDiscLook,
     disc_radius: f32,
     disc_softness: f32,
-    /// Chord length (2 sin(outer / 2)) beyond which the disc is zero.
+    /// Chord length round the seen centre (`disc.dir`) beyond which the disc is zero: the outer radius, a little
+    /// over (refraction only ever brings the disc's points nearer its seen centre).
     disc_chord: f32,
     disc_visible: bool,
+    /// The viewer's height over the ground, metres: VIEWER_HEIGHT unless `AtmosphereParams::viewer_height_m` sets it.
+    viewer_m: f64,
+    /// What a viewer at a height of its own sees below level (`aerial::ViewerSky`): None (no height set) is the
+    /// older ground, blended into the horizon's haze over GROUND_BLEND_DEG.
+    below: Option<Box<aerial::ViewerSky>>,
+    /// The elevation of the horizon the sky is drawn down to, radians, 0 or below: where the disc is cut and its key
+    /// goes. Over the planet's ground seen from a viewer height it is the grazing ray, the dip below level; level
+    /// without a height, or under a floor ([`Self::with_level_horizon`]).
+    horizon: f32,
+    /// What every light this sky gives is lifted by ([`Self::lifted`]): 1 unless it was lifted.
+    lift: f32,
 }
 
 impl Atmosphere {
@@ -242,35 +350,93 @@ impl Atmosphere {
         let table = DepthTable::new(&medium);
         let sun_sin = sun.y.clamp(-1.0, 1.0);
         let multi = MultiScatter::new(&medium, &table, sun_sin as f64);
-        let lut = build_sky_lut(&medium, &table, sun_sin as f64, &multi);
-        let (ambient, sky_irradiance) = hemisphere_integrals(&lut);
-        let sun_irradiance = medium.rgb(&exact_transmittance(&medium, sun));
+        let viewer = atmo.viewer_height_m.map(|h| h as f64);
+        let viewer_m = viewer.unwrap_or(VIEWER_HEIGHT);
+        let lut = match viewer {
+            Some(h) => aerial::sky_lut(&medium, &table, sun_sin as f64, &multi, PLANET_RADIUS + h),
+            None => build_sky_lut(&medium, &table, sun_sin as f64, &multi),
+        };
+        // The sun's light arrives along the bent path from where it is seen (`refracted_transmittance`): near the
+        // horizon that path crosses less air than the straight one toward the true sun, and it still carries light
+        // while the true sun is a little below the horizon.
+        let seen = apparent_elevation(sun.y.clamp(-1.0, 1.0).asin());
+        // The table's planes are the march toward the true sun (the Earth's shadow, the light's path through the air),
+        // but the glow round the sun is mostly the low haze's scattering of light that reached it along that bent
+        // path, so a lookup applies the phase about the sun as it is seen: the glow centres on the drawn disc (0.57
+        // deg above the true sun on the horizon, under a hundredth of a degree at 57 deg).
+        let (seen_sin, seen_cos) = seen.sin_cos();
+        let (ambient, sky_irradiance) = hemisphere_integrals(&|phi, el| lut.at(phi, el, seen_sin, seen_cos));
+        let sun_irradiance = medium.rgb(&refracted_transmittance_from(&medium, seen as f64, viewer_m));
         let ground_color = vec3f(atmo.ground_color[0], atmo.ground_color[1], atmo.ground_color[2]);
-        // A Lambertian ground under the sky dome and the sun: albedo x E / pi.
-        let ground_light = sky_irradiance + sun_irradiance * sun.y.max(0.0);
+        let below = viewer.map(|h| Box::new(aerial::ViewerSky::new(&medium, &table, &multi, sun_sin as f64, PLANET_RADIUS + h, ground_color)));
+        // (from a viewer height the planet's ground meets the sky at the grazing ray)
+        let horizon = below.as_ref().map_or(0.0, |below| -below.dip());
+        // A Lambertian ground under the sky dome and the sun (from where its light arrives): albedo x E / pi.
+        let ground_light = sky_irradiance + sun_irradiance * seen.sin().max(0.0);
         let ground = ground_color * ground_light * (1.0 / std::f32::consts::PI);
         let disc_radius = (0.5 * disc.size_deg).to_radians();
         let disc_softness = disc.softness;
         let outer = disc_radius * (1.0 + 0.5 * disc_softness);
-        // Dividing by the profile's own solid angle is what keeps the disc's
-        // energy equal to the sun's irradiance at every size and softness.
-        let solid_angle = disc_solid_angle(disc_radius, disc_softness);
+        let disc_look = sun_disc_look(&medium, sun, disc_radius, disc_softness, sun_irradiance, horizon, viewer);
         Atmosphere {
             sun_dir: sun,
             sun_horizontal,
             medium,
             lut,
+            sun_sin: seen_sin,
+            sun_cos: seen_cos,
             ground,
             ground_light,
             ambient,
             sky_irradiance,
             sun_irradiance,
-            disc_radiance: sun_irradiance * (1.0 / solid_angle as f32),
+            disc: disc_look,
             disc_radius,
             disc_softness,
-            disc_chord: 2.0 * (0.5 * outer).sin(),
+            disc_chord: 2.0 * (0.5 * (outer * 1.01 + 1.0e-6)).min(1.5).sin(),
             disc_visible: disc.visible,
+            viewer_m,
+            below,
+            horizon,
+            lift: 1.0,
         }
+    }
+
+    /// This sky under a floor, whose ground runs to level and stands in front of the sky below it: the disc is cut at
+    /// level and its key goes there, as without a viewer height, not at the planet's dipped horizon. Without a height
+    /// the sky is returned as it is.
+    pub fn with_level_horizon(mut self) -> Atmosphere {
+        if self.horizon < 0.0 {
+            self.horizon = 0.0;
+            let viewer = self.below.as_ref().map(|_| self.viewer_m);
+            self.disc = sun_disc_look(&self.medium, self.sun_dir, self.disc_radius, self.disc_softness, self.sun_irradiance, 0.0, viewer);
+        }
+        self
+    }
+
+    /// This sky with every light it gives lifted by `k` (the night's adaptation, `night::adaptation`: 1 with the sun up,
+    /// up to 2^10 once it is 12 degrees down): the sky, the ground below the horizon and the air in front of any
+    /// ground, the sun's disc and its light at every height, the ambient and the irradiances. Its transmittance stays,
+    /// so a ground a caller lit by this sky is seen through the air as it was. The night layers are lifted by the same
+    /// factor, so twilight keeps its real ratio to them, and whatever this sky lights (the clouds, the floors, the key,
+    /// the dome's light) follows it. At 1 (by day) the sky is returned as it is, bit for bit.
+    pub fn lifted(mut self, k: f32) -> Atmosphere {
+        if k == 1.0 || !(k.is_finite() && k > 0.0) {
+            return self;
+        }
+        self.lift *= k;
+        self.lut.scale(k);
+        if let Some(below) = self.below.as_mut() {
+            below.scale(k);
+        }
+        self.ground *= k;
+        self.ground_light *= k;
+        self.ambient *= k;
+        self.sky_irradiance *= k;
+        self.sun_irradiance *= k;
+        // (the disc is linear in its light: `sun_disc_look` scales its rows to it)
+        self.disc.rows = self.disc.rows.map(|row| row * k);
+        self
     }
 
     /// Sky radiance from `dir` without the disc: in-scattering plus the
@@ -281,9 +447,12 @@ impl Atmosphere {
         let elevation = dir.y.atan2(horizontal);
         let phi = self.relative_azimuth(dir);
         if elevation >= 0.0 {
-            return lut_lookup(&self.lut, phi, elevation);
+            return self.lut.at(phi, elevation, self.sun_sin, self.sun_cos);
         }
-        let haze = lut_lookup(&self.lut, phi, 0.0);
+        if let Some(below) = &self.below {
+            return below.below(phi, elevation, self.sun_sin, self.sun_cos, None);
+        }
+        let haze = self.lut.at(phi, 0.0, self.sun_sin, self.sun_cos);
         let t = smoothstep(0.0, GROUND_BLEND_DEG.to_radians(), -elevation);
         haze.mix(self.ground, t)
     }
@@ -291,15 +460,19 @@ impl Atmosphere {
     /// [`Self::sky`] over a ground of albedo `albedo` instead of ground_color (the floor's far model, plan hdri-8),
     /// lit as `sky` lights its own, its blend into the horizon haze scaled by `keep` (0..1: 1 is `sky`'s blend, less
     /// leaves more of the haze, a far valley's aerial perspective). At albedo ground_color and keep 1 it is `sky`, bit
-    /// for bit. Above the horizon it is `sky`.
+    /// for bit. Above the horizon it is `sky`. With a viewer height set the ground is the planet's, of albedo
+    /// `albedo`, seen through the air by its own distance (`keep` is the older blend's and is left out).
     pub fn sky_on_ground(&self, dir: Vec3f, albedo: Vec3f, keep: f32) -> Vec3f {
         let horizontal = (dir.x * dir.x + dir.z * dir.z).sqrt();
         let elevation = dir.y.atan2(horizontal);
         let phi = self.relative_azimuth(dir);
         if elevation >= 0.0 {
-            return lut_lookup(&self.lut, phi, elevation);
+            return self.lut.at(phi, elevation, self.sun_sin, self.sun_cos);
         }
-        let haze = lut_lookup(&self.lut, phi, 0.0);
+        if let Some(below) = &self.below {
+            return below.below(phi, elevation, self.sun_sin, self.sun_cos, Some(albedo));
+        }
+        let haze = self.lut.at(phi, 0.0, self.sun_sin, self.sun_cos);
         let t = smoothstep(0.0, GROUND_BLEND_DEG.to_radians(), -elevation) * keep;
         haze.mix(self.ground_radiance(albedo), t)
     }
@@ -311,17 +484,74 @@ impl Atmosphere {
 
     /// [`Self::sky_on_ground`] over a ground of radiance `ground` (before the haze blend): the floor's planes, lit on
     /// their own (plan hdri-8 T2). `sky_on_ground(dir, a, keep)` is `sky_over(dir, ground_radiance(a), keep)`, bit for
-    /// bit.
+    /// bit. With a viewer height set `ground` is where the ray meets the planet's ground, seen through the air to
+    /// there (`keep` is left out); a floor, nearer, takes [`Self::sky_over_at`].
     pub fn sky_over(&self, dir: Vec3f, ground: Vec3f, keep: f32) -> Vec3f {
         let horizontal = (dir.x * dir.x + dir.z * dir.z).sqrt();
         let elevation = dir.y.atan2(horizontal);
         let phi = self.relative_azimuth(dir);
         if elevation >= 0.0 {
-            return lut_lookup(&self.lut, phi, elevation);
+            return self.lut.at(phi, elevation, self.sun_sin, self.sun_cos);
         }
-        let haze = lut_lookup(&self.lut, phi, 0.0);
+        if let Some(below) = &self.below {
+            return below.over(phi, elevation, self.sun_sin, self.sun_cos, ground);
+        }
+        let haze = self.lut.at(phi, 0.0, self.sun_sin, self.sun_cos);
         let t = smoothstep(0.0, GROUND_BLEND_DEG.to_radians(), -elevation) * keep;
         haze.mix(ground, t)
+    }
+
+    /// [`Self::sky_over`] over a ground `dist_m` metres away along `dir` (a floor's texel, whose distance its floor
+    /// knows). With a viewer height set (`AtmosphereParams::viewer_height_m`) the ground is seen through the air over
+    /// that distance, once: what the air scatters toward the viewer on the way plus the ground times the air's
+    /// transmittance, and `keep` (the older blend's stand-in for that air) is left out. Without one it is `sky_over`,
+    /// bit for bit.
+    pub fn sky_over_at(&self, dir: Vec3f, ground: Vec3f, keep: f32, dist_m: f32) -> Vec3f {
+        let Some(below) = &self.below else {
+            return self.sky_over(dir, ground, keep);
+        };
+        let horizontal = (dir.x * dir.x + dir.z * dir.z).sqrt();
+        let elevation = dir.y.atan2(horizontal);
+        let phi = self.relative_azimuth(dir);
+        if elevation >= 0.0 {
+            return self.lut.at(phi, elevation, self.sun_sin, self.sun_cos);
+        }
+        below.through(phi, elevation, dist_m, self.sun_sin, self.sun_cos, ground)
+    }
+
+    /// How far below level the horizon the sky is drawn down to lies, radians: the ray that grazes the planet's ground
+    /// from the viewer's height (0.45 deg from 200 m, 1.4 deg from 2000 m). The disc is cut there and the key goes
+    /// there; the night's stars, moon and glow end there. 0 without a viewer height set, whose ground meets the sky at
+    /// level, and under a floor ([`Self::with_level_horizon`]).
+    pub fn horizon_dip(&self) -> f32 {
+        0.0 - self.horizon
+    }
+
+    /// The viewer's height over the ground in metres when `AtmosphereParams::viewer_height_m` sets one; None for the
+    /// calibrated sky, whose ground below the horizon blends into its haze.
+    pub fn viewer_height(&self) -> Option<f32> {
+        self.below.as_ref().map(|_| self.viewer_m as f32)
+    }
+
+    /// The air's own light along `dir` below level seen from a viewer height (`AtmosphereParams::viewer_height_m`),
+    /// without the ground behind it: in front of the planet's ground, what [`Self::sky`] adds to that ground's light
+    /// through the air (between level and the grazing ray, where the ray meets no ground, all of `sky`), or with
+    /// `dist_m`, in front of a ground that far away ([`Self::sky_over_at`]'s). Its two parts apart ([`AirLight`]: the
+    /// sun's light scattered once, the multiple scattering); `AirLight::total` is the light `sky` adds. None without a
+    /// viewer height (the older ground blends the horizon's haze into the ground over GROUND_BLEND_DEG instead) and at or
+    /// above level.
+    pub fn air_light(&self, dir: Vec3f, dist_m: Option<f32>) -> Option<AirLight> {
+        let below = self.below.as_ref()?;
+        let horizontal = (dir.x * dir.x + dir.z * dir.z).sqrt();
+        let elevation = dir.y.atan2(horizontal);
+        if !(elevation < 0.0) {
+            return None;
+        }
+        let phi = self.relative_azimuth(dir);
+        Some(match dist_m {
+            Some(dist) => below.air_through(phi, elevation, dist, self.sun_sin, self.sun_cos),
+            None => below.air_below(phi, elevation, self.sun_sin, self.sun_cos),
+        })
     }
 
     /// The light on a level ground, the sky dome's and the sun's (irradiance; the ground's radiance is albedo x this / pi).
@@ -329,26 +559,68 @@ impl Atmosphere {
         self.ground_light
     }
 
-    /// The sun disc: zero outside it, below the horizon, or when hidden.
+    /// The sun disc: zero outside it, below the horizon ([`Self::horizon_dip`]), or when hidden.
     pub fn sun_disc(&self, dir: Vec3f) -> Vec3f {
-        if !self.disc_visible || dir.y < 0.0 {
+        // (from a viewer height over the planet's ground the horizon lies below level)
+        let cut = if self.horizon < 0.0 { self.horizon.sin() * dir.length() } else { 0.0 };
+        if !self.disc_visible || dir.y < cut {
             return Vec3f::default();
         }
         let d = dir.normalize();
-        // The chord gives the angle precisely even for a 0.27 deg radius,
-        // where acos of a dot product runs out of f32 bits.
-        let chord = (d - self.sun_dir).length();
-        if chord >= self.disc_chord {
+        // Most of the map is far from the disc: a chord round its seen centre turns it away before any refraction.
+        if !((d - self.disc.dir).length() < self.disc_chord) {
             return Vec3f::default();
         }
-        let theta = 2.0 * (0.5 * chord).min(1.0).asin();
-        self.disc_radiance * disc_profile(theta, self.disc_radius, self.disc_softness)
+        self.disc.at(d)
+    }
+
+    /// The disc's centre as seen: the sun's direction lifted by the air's refraction ([`refraction`]), 34' on the
+    /// horizon. The sun's light arrives from here: the key, its glints and the clouds' lighting take it.
+    /// [`Self::sun_dir`] stays the sun's own direction, which the sky's scattering and the night's twilight take.
+    pub fn disc_dir(&self) -> Vec3f {
+        self.disc.dir
+    }
+
+    /// The mean of `pass` over the disc as it is drawn, per channel, each point weighted by the disc's light there in
+    /// that channel (its edge, limb darkening and colour row; the horizon's cut): when `pass` is what something passes
+    /// along a direction, the share of the disc's light it lets through in each channel, even where an edge crosses
+    /// the disc (the lower limb is redder, so a cloud over it takes more green and blue than red). A sunflower spiral
+    /// of POINTS points over the disc's outer edge round its seen centre (the drawn disc lies inside it: the
+    /// refraction only flattens it), as the cloud stack's cone mean (`CloudStack::disc_transmittance`) takes; 512 keep
+    /// a cloud's edge across a 0.53 degree disc within half a percent of a fine grid. Hidden or not, the disc's shape is
+    /// used; the centre sample when no point of it is above the horizon.
+    pub fn disc_mean(&self, pass: &dyn Fn(Vec3f) -> f32) -> Vec3f {
+        const POINTS: usize = 512;
+        const GOLDEN_ANGLE: f32 = 2.399_963;
+        let centre = self.disc.dir.normalize();
+        let helper = if centre.y.abs() < 0.99 { vec3f(0.0, 1.0, 0.0) } else { vec3f(1.0, 0.0, 0.0) };
+        let right = Vec3f::cross(helper, centre).normalize();
+        let up = Vec3f::cross(centre, right);
+        let reach = self.disc.outer().min(0.5).tan();
+        let cut = self.horizon.sin();
+        let (mut sum, mut weights) = (Vec3f::default(), Vec3f::default());
+        for k in 0..POINTS {
+            let r = ((k as f32 + 0.5) / POINTS as f32).sqrt();
+            let (s, c) = (k as f32 * GOLDEN_ANGLE).sin_cos();
+            let d = (centre + right * (r * c * reach) + up * (r * s * reach)).normalize();
+            if d.y < cut {
+                continue;
+            }
+            let w = self.disc.at(d);
+            if w.is_finite() && w.max_elem() > 0.0 {
+                sum += w * pass(d);
+                weights += w;
+            }
+        }
+        let mean = |s: f32, w: f32| if w > 0.0 { s / w } else { f32::NAN };
+        let m = vec3f(mean(sum.x, weights.x), mean(sum.y, weights.y), mean(sum.z, weights.z));
+        if m.is_finite() { m } else { Vec3f::all(pass(centre)) }
     }
 
     /// Transmittance from the viewer to space along `dir`; zero when the
     /// ground is in the way.
     pub fn transmittance(&self, dir: Vec3f) -> Vec3f {
-        self.medium.rgb(&exact_transmittance(&self.medium, dir)) * (1.0 / SUN_IRRADIANCE)
+        self.medium.rgb(&exact_transmittance(&self.medium, dir, self.viewer_m)) * (1.0 / SUN_IRRADIANCE)
     }
 
     /// SUN_IRRADIANCE x transmittance along the sun: what a surface facing
@@ -362,17 +634,16 @@ impl Atmosphere {
     /// Up there the sun crosses less of the haze, which sits low, so a low
     /// sun's light on the clouds is far brighter than at the ground; and a
     /// sun just under the viewer's horizon still lights a deck high enough.
+    /// The light arrives along the bent path from where the sun is seen, as `sun_irradiance`'s (which this is at the
+    /// viewer's own height), lifted as the sky is ([`Self::lifted`]).
     pub fn sun_irradiance_at(&self, height_m: f32) -> Vec3f {
-        let h = (height_m as f64).max(VIEWER_HEIGHT);
-        match column_depth(PLANET_RADIUS + h, self.sun_dir.y.clamp(-1.0, 1.0) as f64, EXACT_STEPS) {
-            Some(column) => self.medium.rgb(&self.medium.extinction(column).map(|e| (-e).exp())),
-            None => Vec3f::default(),
-        }
+        let seen = apparent_elevation(self.sun_dir.y.clamp(-1.0, 1.0).asin()) as f64;
+        self.medium.rgb(&refracted_transmittance_from(&self.medium, seen, (height_m as f64).max(self.viewer_m))) * self.lift
     }
 
     /// Radiance at the centre of the disc (limb darkening makes it the peak).
     pub fn sun_radiance(&self) -> Vec3f {
-        self.disc_radiance * disc_profile(0.0, self.disc_radius, self.disc_softness)
+        self.disc.at(self.disc.dir)
     }
 
     /// Mean radiance over the nominal disc cone (radius size_deg / 2):
@@ -395,17 +666,10 @@ impl Atmosphere {
     }
 
     /// The disc as [`Self::sun_disc`] draws it, for a viewer that draws it
-    /// itself (`Env::sky_discs`): None when it is hidden. Its radiance at a
-    /// direction `theta` off `dir` is `radiance x disc_profile(theta, radius,
-    /// softness)`, 0 below the horizon.
+    /// itself (`Env::sky_discs`): None when it is hidden. Its radiance along a
+    /// direction is [`SunDiscLook::at`], cut at the horizon ([`Self::horizon_dip`]).
     pub fn disc_look(&self) -> Option<SunDiscLook> {
-        self.disc_visible.then(|| SunDiscLook {
-            dir: self.sun_dir,
-            radius: self.disc_radius,
-            softness: self.disc_softness,
-            limb_darkening: LIMB_DARKENING,
-            radiance: self.disc_radiance,
-        })
+        self.disc_visible.then_some(self.disc)
     }
 
     /// Mean radiance of the upper hemisphere (the disc excluded).
@@ -425,6 +689,19 @@ impl Atmosphere {
         self.sun_dir
     }
 
+    /// The sun's light at the ground band by band (`SunBands`): what a light that takes a share of each band of it
+    /// shows, a rainbow's (rainbow.rs).
+    pub(crate) fn sun_bands(&self) -> SunBands {
+        let seen = apparent_elevation(self.sun_dir.y.clamp(-1.0, 1.0).asin()) as f64;
+        let through = refracted_transmittance_from(&self.medium, seen, self.viewer_m);
+        let bands = std::array::from_fn(|k| {
+            let mut one = [0.0; BANDS];
+            one[k] = through[k];
+            self.medium.rgb_raw(&one) * self.lift
+        });
+        SunBands { bands, blue_limit: self.medium.blue_limit }
+    }
+
     /// Angle between the view's and the sun's horizontal directions, 0..pi.
     fn relative_azimuth(&self, dir: Vec3f) -> f32 {
         let along = dir.x * self.sun_horizontal.x + dir.z * self.sun_horizontal.y;
@@ -432,6 +709,25 @@ impl Atmosphere {
         // |across| folds the mirror half onto the stored one; atan2(0, 0) = 0
         // at the zenith, where every column holds the same value anyway.
         across.abs().atan2(along)
+    }
+}
+
+/// The sun's light at the ground split into the bands (`Atmosphere::sun_bands`): each band's light alone as linear
+/// Rec.709 (`rgb_raw`, its blue below zero where the matching functions' lobes put it), so they add up to the sun's
+/// light before its gamut handling.
+pub(crate) struct SunBands {
+    pub(crate) bands: [Vec3f; BANDS],
+    blue_limit: f32,
+}
+
+impl SunBands {
+    /// The light that takes the share `s[k]` of each band of the sun's: drawn inside Rec.709 as `Medium::light_rgb`
+    /// draws a light, and what still lies outside it (a band's alone, the deep red's green and the violet's, below
+    /// zero) held at zero.
+    pub(crate) fn light(&self, s: &[f32; BANDS]) -> Vec3f {
+        let raw = (0..BANDS).fold(Vec3f::default(), |sum, k| sum + self.bands[k] * s[k]);
+        let c = compress_blue(raw, self.blue_limit);
+        vec3f(c.x.max(0.0), c.y.max(0.0), c.z.max(0.0))
     }
 }
 
@@ -458,6 +754,8 @@ pub fn sun_direction(sun: &SunParams) -> Vec3f {
 /// at sea level, per band; and the bands' way back to the scene's RGB.
 #[derive(Clone, Copy)]
 struct Medium {
+    /// The low haze's kind: its colour, absorption and phase (the stratosphere's haze keeps the continental's).
+    aerosol: Aerosol,
     rayleigh: Spectrum,
     mie_scattering: Spectrum,
     mie_extinction: Spectrum,
@@ -467,17 +765,29 @@ struct Medium {
     /// The ground's albedo, for the light it bounces back into the air.
     ground: Spectrum,
     to_rgb: [Spectrum; 3],
+    /// The boundary layer's top in metres (`AtmosphereParams::haze_top_m`); None: the haze falls exponentially
+    /// with MIE_SCALE_HEIGHT.
+    haze_top: Option<f64>,
+    /// The farthest any light the bands carry lies outside Rec.709 in blue, a mix of two bands (`blue_limit`):
+    /// `compress_blue` draws it onto the gamut's edge and every light nearer than it inside.
+    blue_limit: f32,
 }
 
 impl Medium {
     /// `p` is held by clamp() (`Atmosphere::new`).
     fn new(p: &AtmosphereParams) -> Medium {
         let (air, haze, ozone) = (p.air as f64, p.haze as f64, p.ozone as f64);
+        let strat = p.stratosphere.unwrap_or(1.0) as f64;
+        let aerosol = Aerosol::named(p.aerosol.as_deref().unwrap_or("continental"));
+        let haze_top = p.haze_top_m.map(|top| top as f64);
+        // The haze's column per unit of its density at the ground, so its optical depth is the Haze control's for any
+        // profile: the exponential's scale height, or the layer plus the free troposphere over it.
+        let column = haze_top.map_or(MIE_SCALE_HEIGHT, |top| top + FREE_HAZE_SHARE * FREE_HAZE_SCALE_HEIGHT);
         let mie_extinction: Spectrum = std::array::from_fn(|k| {
-            haze * AEROSOL_DEPTH / MIE_SCALE_HEIGHT * (BAND_NM[k] / 550.0).powf(-AEROSOL_ANGSTROM)
+            haze * AEROSOL_DEPTH / column * (BAND_NM[k] / 550.0).powf(-aerosol.angstrom)
         });
         let strat_extinction: Spectrum = std::array::from_fn(|k| {
-            STRAT_DEPTH / STRAT_HALF_WIDTH * (BAND_NM[k] / 550.0).powf(-AEROSOL_ANGSTROM)
+            strat * STRAT_DEPTH / STRAT_HALF_WIDTH * (BAND_NM[k] / 550.0).powf(-AEROSOL_ANGSTROM)
         });
         let cross = band_ozone_cross_sections();
         // The ground's colour spread over the bands: blue at 440 nm, green at
@@ -494,17 +804,38 @@ impl Medium {
                 gr
             }
         });
+        let to_rgb = band_to_rgb();
         Medium {
+            aerosol,
             // Rayleigh: 1.24062e-6 / lambda^4 per metre, lambda in um (Bruneton's air).
             rayleigh: BAND_NM.map(|nm| air * 1.24062e-6 / (nm / 1000.0).powi(4)),
-            mie_scattering: mie_extinction.map(|e| e * AEROSOL_ALBEDO),
+            mie_scattering: std::array::from_fn(|k| mie_extinction[k] * aerosol.albedo[k]),
             mie_extinction,
             strat_scattering: strat_extinction.map(|e| e * AEROSOL_ALBEDO),
             strat_extinction,
             ozone: cross.map(|c| c * OZONE_PEAK_DENSITY * ozone),
             ground,
-            to_rgb: band_to_rgb(),
+            to_rgb,
+            haze_top,
+            blue_limit: blue_limit(&to_rgb),
         }
+    }
+
+    /// The relative densities over a straight step `ds` long centred at radius `r`, its direction at cosine `mu` to
+    /// the vertical there: the air's, the ozone's and the stratosphere's haze at the centre (`densities`), and the
+    /// low haze's from its profile. A boundary layer's even haze counts the share of the step under its top exactly
+    /// (`share_inside`), so a march of a few long steps keeps the layer's sharp top and its column; the free
+    /// troposphere's thin haze over it is read at the centre; `with_layer` false leaves the layer's even haze out (the
+    /// depth table takes it along each lookup's ray instead). Without a layer it is `densities` at the centre, bit for
+    /// bit.
+    fn densities_over(&self, r: f64, mu: f64, ds: f64, with_layer: bool) -> Densities {
+        let mut d = densities(r - PLANET_RADIUS);
+        if let Some(top) = self.haze_top {
+            let over = (r - PLANET_RADIUS - top).max(0.0);
+            let even = if with_layer { (1.0 - FREE_HAZE_SHARE) * share_inside(r, mu, ds, PLANET_RADIUS + top) } else { 0.0 };
+            d[1] = even + FREE_HAZE_SHARE * (-over / FREE_HAZE_SCALE_HEIGHT).exp();
+        }
+        d
     }
 
     /// Per-band extinction for (air, haze, ozone, stratospheric haze)
@@ -521,20 +852,37 @@ impl Medium {
         std::array::from_fn(|k| self.rayleigh[k] * d[0] + self.mie_scattering[k] * d[1] + self.strat_scattering[k] * d[3])
     }
 
-    /// Per-band scattering by the haze (low and stratospheric), which shares
-    /// the haze's phase.
+    /// Per-band scattering by the low haze, which takes its kind's phase (the
+    /// stratosphere's, `strat_scattering`, is kept apart: it takes the continental's).
     fn haze_scattering(&self, d: Densities) -> Spectrum {
-        std::array::from_fn(|k| self.mie_scattering[k] * d[1] + self.strat_scattering[k] * d[3])
+        std::array::from_fn(|k| self.mie_scattering[k] * d[1])
     }
 
     /// A spectrum, per unit of the sun's light at the top of the air, as the
     /// scene's linear Rec.709 RGB: SUN_IRRADIANCE per channel for the sun
     /// itself. A deeply reddened spectrum (a sun on the horizon) lies outside
     /// Rec.709 and its blue would fall below zero (the matching functions'
-    /// negative lobes); a channel is held at a millionth of the colour's sum
-    /// instead, inside the gamut and never exactly 0, which a light's colour
-    /// is divided by.
+    /// negative lobes); it is drawn inside as a camera records it
+    /// (`light_rgb`), and a channel still below a millionth of the colour's
+    /// sum is held there, never exactly 0, which a light's colour is divided by.
     fn rgb(&self, s: &Spectrum) -> Vec3f {
+        gamut_floor(self.light_rgb(s))
+    }
+
+    /// The colour of one light, `rgb_raw` drawn inside Rec.709 where its blue falls short (`compress_blue`): what a
+    /// camera records of it. A light reddened by more than about 20 air masses (a sun under 2 degrees, the haze's light
+    /// round it) lies outside Rec.709 and its blue comes out negative, -0.18 of the green for a 1 degree sun; a camera
+    /// records such a light inside, with a little blue (zwartkops sunset's unclipped 1 degree disc: b/g 0.13, b/r
+    /// 0.032; its aureole 0.5-2 degrees out b/r 0.026-0.042). Lights are drawn in one by one before they are mixed
+    /// (the sky-view table's planes, the sun): summed first, the reddened light's negative blue took the blue of the
+    /// sky's other light with it, and within 4 degrees of a low sun the glow had none.
+    fn light_rgb(&self, s: &Spectrum) -> Vec3f {
+        compress_blue(self.rgb_raw(s), self.blue_limit)
+    }
+
+    /// `rgb` as the matching functions give it, without the gamut's handling: linear in the spectrum, so a sum of
+    /// these is the sum's, and a reddened light's blue below zero.
+    fn rgb_raw(&self, s: &Spectrum) -> Vec3f {
         let c: [f64; 3] = std::array::from_fn(|c| {
             let mut sum = 0.0;
             for k in 0..BANDS {
@@ -542,8 +890,6 @@ impl Medium {
             }
             sum * SUN_IRRADIANCE as f64
         });
-        let floor = 1.0e-6 * (c[0].max(0.0) + c[1].max(0.0) + c[2].max(0.0));
-        let c = c.map(|v| v.max(floor));
         vec3f(c[0] as f32, c[1] as f32, c[2] as f32)
     }
 }
@@ -612,12 +958,34 @@ type Densities = [f64; 4];
 /// Relative densities at `height` metres above the ground.
 fn densities(height: f64) -> Densities {
     let h = height.max(0.0);
+    const MESOSPHERE_FLOOR: f64 = TOP_RADIUS - PLANET_RADIUS;
+    let air = if h > MESOSPHERE_FLOOR {
+        MESOSPHERE_DENSITY * (-(h - MESOSPHERE_FLOOR) / MESOSPHERE_SCALE_HEIGHT).exp()
+    } else {
+        (-h / RAYLEIGH_SCALE_HEIGHT).exp()
+    };
     [
-        (-h / RAYLEIGH_SCALE_HEIGHT).exp(),
+        air,
         (-h / MIE_SCALE_HEIGHT).exp(),
         (1.0 - (h - OZONE_PEAK_HEIGHT).abs() / OZONE_HALF_WIDTH).max(0.0),
         (1.0 - (h - STRAT_PEAK_HEIGHT).abs() / STRAT_HALF_WIDTH).max(0.0),
     ]
+}
+
+/// The share of a straight step `ds` long, centred at radius `r` with its direction at cosine `mu` to the vertical
+/// there, that lies inside the sphere of radius `rb`: the chord the sphere cuts from the step's line, exactly. Along
+/// the line, |p(t)|^2 = r^2 + 2 r mu t + t^2 is under rb^2 for t within -r mu +- q, q^2 = (rb - r)(rb + r) + (r mu)^2.
+fn share_inside(r: f64, mu: f64, ds: f64, rb: f64) -> f64 {
+    if !(ds > 0.0) {
+        return if r < rb { 1.0 } else { 0.0 };
+    }
+    let q2 = (rb - r) * (rb + r) + (r * mu) * (r * mu);
+    if !(q2 > 0.0) {
+        return 0.0;
+    }
+    let q = q2.sqrt();
+    let half = 0.5 * ds;
+    ((q.min(r * mu + half) - (-q).max(r * mu - half)) / ds).clamp(0.0, 1.0)
 }
 
 /// True when a ray from radius `r` with cosine `mu` against the local
@@ -629,6 +997,12 @@ fn hits_ground(r: f64, mu: f64) -> bool {
 /// Distance from radius `r` (inside the shell) along `mu` to the top.
 fn distance_to_top(r: f64, mu: f64) -> f64 {
     let disc = r * r * (mu * mu - 1.0) + TOP_RADIUS * TOP_RADIUS;
+    (-r * mu + disc.max(0.0).sqrt()).max(0.0)
+}
+
+/// Distance from radius `r` (inside the shell) along `mu` to the mesosphere's top.
+fn distance_to_mesosphere_top(r: f64, mu: f64) -> f64 {
+    let disc = r * r * (mu * mu - 1.0) + MESOSPHERE_RADIUS * MESOSPHERE_RADIUS;
     (-r * mu + disc.max(0.0).sqrt()).max(0.0)
 }
 
@@ -660,27 +1034,38 @@ fn segment(i: usize, n: usize, length: f64) -> (f64, f64) {
     (0.5 * (t0 + t1), t1 - t0)
 }
 
+/// Segment `i` of a march that takes `n` steps over the dense air's `length` (`segment`) and MESOSPHERE_STEPS more
+/// over the mesosphere's `beyond`, which follows it on the same ray.
+fn march_segment(i: usize, n: usize, length: f64, beyond: f64) -> (f64, f64) {
+    if i < n {
+        return segment(i, n, length);
+    }
+    let (t, ds) = segment(i - n, MESOSPHERE_STEPS, beyond);
+    (length + t, ds)
+}
+
 /// Integrated densities in metres from radius `r` along `mu` to space, or
 /// None when the ground is in the way.
-fn column_depth(r: f64, mu: f64, steps: usize) -> Option<Densities> {
+fn column_depth(medium: &Medium, r: f64, mu: f64, steps: usize) -> Option<Densities> {
     if hits_ground(r, mu) {
         return None;
     }
-    Some(integrate_column(r, mu, steps))
+    Some(integrate_column(medium, r, mu, steps, true))
 }
 
 /// The same integral without the ground test. The depth table needs it for
 /// its grazing column: there `hits_ground` sits exactly on its boundary and
 /// rounding could turn a ray that skims the ground into "blocked", which
 /// would store a depth of 0 (full sunlight) right at the terminator.
-fn integrate_column(r: f64, mu: f64, steps: usize) -> Densities {
+fn integrate_column(medium: &Medium, r: f64, mu: f64, steps: usize, with_layer: bool) -> Densities {
     let length = distance_to_top(r, mu);
     let mut depth = [0.0f64; 4];
     for i in 0..steps {
         let (t, ds) = segment(i, steps, length);
         // `densities` clamps the height at 0, so a skimming ray that rounds a
         // hair below the surface reads sea-level air.
-        let d = densities(radius_at(r, mu, t) - PLANET_RADIUS);
+        let rp = radius_at(r, mu, t);
+        let d = medium.densities_over(rp, (r * mu + t) / rp, ds, with_layer);
         for (acc, v) in depth.iter_mut().zip(d) {
             *acc += v * ds;
         }
@@ -688,18 +1073,124 @@ fn integrate_column(r: f64, mu: f64, steps: usize) -> Densities {
     depth
 }
 
-/// Spectral transmittance from the viewer to space along `dir`; zero when
-/// the ground is in the way.
-fn exact_transmittance(medium: &Medium, dir: Vec3f) -> Spectrum {
+/// Spectral transmittance from the viewer `height` metres up to space along `dir`; zero when the ground is in the
+/// way.
+fn exact_transmittance(medium: &Medium, dir: Vec3f, height: f64) -> Spectrum {
     let length = dir.length();
     if length.is_nan() || length <= 0.0 {
         return [0.0; BANDS];
     }
     let mu = (dir.y / length).clamp(-1.0, 1.0) as f64;
-    match column_depth(PLANET_RADIUS + VIEWER_HEIGHT, mu, EXACT_STEPS) {
+    match column_depth(medium, PLANET_RADIUS + height, mu, EXACT_STEPS) {
         Some(column) => medium.extinction(column).map(|e| (-e).exp()),
         None => [0.0; BANDS],
     }
+}
+
+/// Spectral transmittance from the viewer to space along the ray seen at apparent elevation `e` (radians), bent on
+/// its way as the air bends it (Bouguer): its curvature is the refractivity's fall with height across it, REFRACTIVITY
+/// at the ground over the air's scale height, times the air's density. Near the horizon the bent ray stays lower than
+/// the straight one along `e`, so it crosses more air, and the light seen there is that of the sun's lower limb, which
+/// the straight ray along its true direction (below the horizon, into the ground) cannot carry: a sun on the horizon
+/// crosses about 38 air masses (Kasten & Young 1989). Zero when the ray meets the ground. Away from the horizon it is
+/// `exact_transmittance` along the same direction to a few parts in ten thousand.
+fn refracted_transmittance(medium: &Medium, e: f64) -> Spectrum {
+    refracted_transmittance_from(medium, e, VIEWER_HEIGHT)
+}
+
+/// [`refracted_transmittance`] from `height` metres above the ground (the viewer's own height or more; the far
+/// ground's own, 0, for its light, `aerial::ground_light`).
+fn refracted_transmittance_from(medium: &Medium, e: f64, height: f64) -> Spectrum {
+    const STEPS: usize = 128;
+    let r0 = PLANET_RADIUS + height.max(0.0);
+    // the bent ray is a little longer than the straight one to the top
+    let length = 1.1 * distance_to_top(r0, e.sin().clamp(-1.0, 1.0));
+    let (mut p, mut v) = ([0.0f64, r0], [e.cos(), e.sin()]);
+    let mut depth = [0.0f64; 4];
+    for i in 0..STEPS {
+        let (_, ds) = segment(i, STEPS, length);
+        let q = [p[0] + v[0] * 0.5 * ds, p[1] + v[1] * 0.5 * ds];
+        let r = (q[0] * q[0] + q[1] * q[1]).sqrt();
+        if r < PLANET_RADIUS {
+            return [0.0; BANDS];
+        }
+        if r > TOP_RADIUS {
+            break;
+        }
+        let d = medium.densities_over(r, (q[0] * v[0] + q[1] * v[1]) / r, ds, true);
+        for (acc, x) in depth.iter_mut().zip(d) {
+            *acc += x * ds;
+        }
+        // Turn toward the denser air below: the refractive index's gradient across the ray.
+        let up = [q[0] / r, q[1] / r];
+        let along = up[0] * v[0] + up[1] * v[1];
+        let g = REFRACTIVITY / RAYLEIGH_SCALE_HEIGHT * d[0] * ds;
+        v = [v[0] - g * (up[0] - along * v[0]), v[1] - g * (up[1] - along * v[1])];
+        let n = (v[0] * v[0] + v[1] * v[1]).sqrt();
+        v = [v[0] / n, v[1] / n];
+        p = [q[0] + v[0] * 0.5 * ds, q[1] + v[1] * 0.5 * ds];
+    }
+    medium.extinction(depth).map(|x| (-x).exp())
+}
+
+/// How far the air's refraction lifts what is seen at apparent elevation `e` (radians), in radians: Bennett's formula
+/// (1982, Journal of Navigation 35, 255), R = cot(h + 7.31 / (h + 4.4)) arcminutes with h the apparent elevation in
+/// degrees, for 1010 hPa and 10 C: 34.5' on the horizon, 9.9' at 5 deg, 1.7' at 30 deg, 0 at the zenith. Below the
+/// horizon, where nothing is seen and the formula runs away, it holds the horizon's value.
+pub fn refraction(e: f32) -> f32 {
+    let h = e.to_degrees().clamp(0.0, 90.0);
+    let arcmin = 1.0 / (h + 7.31 / (h + 4.4)).to_radians().tan();
+    (arcmin.max(0.0) / 60.0).to_radians()
+}
+
+/// The apparent elevation of what is at true elevation `e` (radians): `refraction`'s inverse, a + refraction(a) = e
+/// solved by fixed point (refraction's slope stays under a quarter, so eight steps leave a part in 10^5).
+pub fn apparent_elevation(e: f32) -> f32 {
+    let mut a = e;
+    for _ in 0..8 {
+        a = e + refraction(a);
+    }
+    a
+}
+
+/// `v` as a unit vector that `normalize` leaves bit for bit as it is, nudged by at most one unit in the last place per
+/// component when it must be: the clouds' layers normalise the sun's direction they are given and a cloud stack
+/// normalises it once more before its layers do, and their noise is read along it, so a direction normalising does not
+/// settle would light the same layer two ways (1e-5 apart).
+fn settled_unit(v: Vec3f) -> Vec3f {
+    let v = v.normalize();
+    if v.normalize() == v {
+        return v;
+    }
+    let nudge = |x: f32, k: i32| if k == 0 || x == 0.0 { x } else { f32::from_bits((x.to_bits() as i32 + k) as u32) };
+    for kx in -1..=1 {
+        for ky in -1..=1 {
+            for kz in -1..=1 {
+                let c = vec3f(nudge(v.x, kx), nudge(v.y, ky), nudge(v.z, kz));
+                if c.normalize() == c {
+                    return c;
+                }
+            }
+        }
+    }
+    v
+}
+
+/// Unit `d` (unit length) turned in its own vertical plane to elevation `e` (radians), its azimuth kept; straight
+/// up or down stays as it is.
+fn at_elevation(d: Vec3f, e: f32) -> Vec3f {
+    let h = (d.x * d.x + d.z * d.z).sqrt();
+    if !(h > 1.0e-6) {
+        return d;
+    }
+    let (s, c) = e.sin_cos();
+    vec3f(d.x / h * c, s, d.z / h * c)
+}
+
+/// Where what is seen along unit `d` truly is: `d` lowered by the refraction at its elevation.
+pub fn unrefracted(d: Vec3f) -> Vec3f {
+    let e = d.y.clamp(-1.0, 1.0).asin();
+    at_elevation(d, e - refraction(e))
 }
 
 /// Each band's transmittance toward space over (height, angle above
@@ -707,6 +1198,12 @@ fn exact_transmittance(medium: &Medium, dir: Vec3f) -> Spectrum {
 /// blend with no exponential: the sky-view march makes over a million.
 struct DepthTable {
     transmittance: Vec<[f32; BANDS]>,
+    /// A boundary layer's even haze (`Medium::haze_top`), left out of the table and taken along each lookup's own
+    /// ray (`lookup`): the radius of its top and its extinction per metre per band. Its sharp top puts a cusp in the
+    /// transmittance over height and over angle (a ray from just under the top toward a low sun runs inside the layer
+    /// for a length that grows as the root of its depth under the top), which the table's bilinear steps blurred to
+    /// several times the light near a setting sun.
+    layer: Option<(f64, Spectrum)>,
 }
 
 impl DepthTable {
@@ -720,11 +1217,14 @@ impl DepthTable {
                 let x = i as f64 / (DEPTH_ANGLES - 1) as f64;
                 let mu = mu_graze + (1.0 - mu_graze) * x * x;
                 // Every column is at or above the grazing ray by construction.
-                let ext = medium.extinction(integrate_column(r, mu, DEPTH_STEPS));
+                let ext = medium.extinction(integrate_column(medium, r, mu, DEPTH_STEPS, false));
                 transmittance.push(ext.map(|e| (-e).exp() as f32));
             }
         }
-        DepthTable { transmittance }
+        let layer = medium.haze_top.map(|top| {
+            (PLANET_RADIUS + top, std::array::from_fn(|k| (1.0 - FREE_HAZE_SHARE) * medium.mie_extinction[k]))
+        });
+        DepthTable { transmittance, layer }
     }
 
     /// Transmittance toward space from radius `r` along `mu`. The planet's
@@ -735,10 +1235,62 @@ impl DepthTable {
 
     /// `transmittance` at a height whose part of the lookup is done: a march
     /// asks once per step for every sun direction it lights the step with.
+    /// The sun is a disc, not a point: near the planet's limb as seen from
+    /// here the limb hides part of it, and what arrives is its visible face's
+    /// light, each part through the air its own ray crosses (`penumbra`), so
+    /// the Earth's shadow on the air has a soft edge. With the disc's centre
+    /// PENUMBRA_REACH radii above the limb or more it is the centre's lookup,
+    /// as it always was; with all of it under the limb, 0.
     fn transmittance_at(&self, h: &DepthHeight, mu: f64) -> Spectrum {
-        if hits_ground(h.r, mu) {
+        // Above the dense air (the mesosphere) the sun's ray re-enters it, and the light is the table's from there,
+        // the penumbra included.
+        if h.r > TOP_RADIUS {
+            return self.transmittance_from_mesosphere(h.r, mu);
+        }
+        if mu >= h.mu_clear {
+            return self.lookup(h, mu);
+        }
+        if mu <= h.mu_hidden {
             return [0.0; BANDS];
         }
+        self.penumbra(h, mu)
+    }
+
+    /// The light of the sun's disc whose centre is at cosine `mu`, near the limb (`transmittance_at`): the share of
+    /// its light above the limb (`disc_light_below`) times the mean transmittance over its visible face, from
+    /// PENUMBRA_NODES rows of equal height, each weighted by the disc's light across it (`disc_row_light`) and lit
+    /// along its own direction. From PENUMBRA_BLEND radii above the limb the face's mean hands over to the centre's
+    /// lookup, which it is at PENUMBRA_REACH.
+    fn penumbra(&self, h: &DepthHeight, mu: f64) -> Spectrum {
+        let theta = mu.clamp(-1.0, 1.0).acos();
+        // The disc's centre above the limb, in disc radii, and the lowest row of it the limb leaves in sight (from
+        // its centre, up, in radii).
+        let above = (h.mu_graze.acos() - theta) / SUN_ANGULAR_RADIUS;
+        let lowest = (-above).clamp(-1.0, 1.0);
+        let seen = 1.0 - disc_light_below(lowest);
+        let (mut sum, mut weight) = ([0.0f64; BANDS], 0.0f64);
+        for i in 0..PENUMBRA_NODES {
+            let y = lowest + (1.0 - lowest) * (i as f64 + 0.5) / PENUMBRA_NODES as f64;
+            let w = disc_row_light(y);
+            let t = self.lookup(h, (theta - y * SUN_ANGULAR_RADIUS).cos());
+            for k in 0..BANDS {
+                sum[k] += w * t[k];
+            }
+            weight += w;
+        }
+        let face: Spectrum = std::array::from_fn(|k| if weight > 0.0 { sum[k] / weight * seen } else { 0.0 });
+        if above <= PENUMBRA_BLEND {
+            return face;
+        }
+        let centre = self.lookup(h, mu);
+        let s = ((above - PENUMBRA_BLEND) / (PENUMBRA_REACH - PENUMBRA_BLEND)).clamp(0.0, 1.0);
+        let s = s * s * (3.0 - 2.0 * s);
+        std::array::from_fn(|k| face[k] + (centre[k] - face[k]) * s)
+    }
+
+    /// The table's lookup along `mu`, at or above the limb: bilinear over (height, angle above grazing), times a
+    /// boundary layer's transmittance over the ray's own chord through it (`layer`).
+    fn lookup(&self, h: &DepthHeight, mu: f64) -> Spectrum {
         let x = ((mu - h.mu_graze) * h.inv_span).clamp(0.0, 1.0).sqrt();
         let fx = x * (DEPTH_ANGLES - 1) as f64;
         let x0 = (fx as usize).min(DEPTH_ANGLES - 2);
@@ -747,12 +1299,46 @@ impl DepthTable {
         let row1 = row0 + DEPTH_ANGLES;
         let (a, b) = (&self.transmittance[row0 + x0], &self.transmittance[row0 + x0 + 1]);
         let (c, d) = (&self.transmittance[row1 + x0], &self.transmittance[row1 + x0 + 1]);
-        std::array::from_fn(|k| {
+        let t: Spectrum = std::array::from_fn(|k| {
             let near = a[k] as f64 + (b[k] as f64 - a[k] as f64) * tx;
             let far = c[k] as f64 + (d[k] as f64 - c[k] as f64) * tx;
             near + (far - near) * ty
-        })
+        });
+        match self.layer {
+            Some((top, ext)) => {
+                let chord = chord_inside(h.r, mu, top);
+                if chord > 0.0 {
+                    std::array::from_fn(|k| t[k] * (-ext[k] * chord).exp())
+                } else {
+                    t
+                }
+            }
+            None => t,
+        }
     }
+
+    /// Transmittance toward space from radius `r` in the mesosphere (above the dense air) along `mu`: the mesosphere
+    /// dims nothing, so it is 1 unless the ray dips back into the dense air, and then the table's from where it enters
+    /// it (a straight ray keeps r x its sine).
+    fn transmittance_from_mesosphere(&self, r: f64, mu: f64) -> Spectrum {
+        let b2 = r * r * (1.0 - mu * mu);
+        if mu >= 0.0 || b2 >= TOP_RADIUS * TOP_RADIUS {
+            return [1.0; BANDS];
+        }
+        let mu_in = -(1.0 - b2 / (TOP_RADIUS * TOP_RADIUS)).max(0.0).sqrt();
+        self.transmittance(TOP_RADIUS, mu_in)
+    }
+}
+
+/// The length of the ray from radius `r` along cosine `mu` (to the vertical there) that lies inside the sphere of
+/// radius `rb`, from its start on: the chord `share_inside` cuts, for the half line t >= 0.
+fn chord_inside(r: f64, mu: f64, rb: f64) -> f64 {
+    let q2 = (rb - r) * (rb + r) + (r * mu) * (r * mu);
+    if !(q2 > 0.0) {
+        return 0.0;
+    }
+    let q = q2.sqrt();
+    (q - r * mu - (-q - r * mu).max(0.0)).max(0.0)
 }
 
 /// The height's share of a `DepthTable` lookup.
@@ -764,6 +1350,10 @@ struct DepthHeight {
     /// The first texel of the lower row, and the weight of the upper one.
     row: usize,
     ty: f64,
+    /// The sun's cosine at and above which its disc's centre is PENUMBRA_REACH radii or more above the limb (the
+    /// lookup is the centre's), and at and below which the limb hides all of the disc.
+    mu_clear: f64,
+    mu_hidden: f64,
 }
 
 impl DepthHeight {
@@ -772,17 +1362,103 @@ impl DepthHeight {
         let mu_graze = grazing_mu(r);
         let fy = y * (DEPTH_HEIGHTS - 1) as f64;
         let y0 = (fy as usize).min(DEPTH_HEIGHTS - 2);
-        DepthHeight { r, mu_graze, inv_span: 1.0 / (1.0 - mu_graze), row: y0 * DEPTH_ANGLES, ty: fy - y0 as f64 }
+        // The limb's zenith angle g: cos(g -+ x) = cos g cos x +- sin g sin x.
+        let sin_graze = (1.0 - mu_graze * mu_graze).max(0.0).sqrt();
+        let (reach_sin, reach_cos) = (PENUMBRA_REACH * SUN_ANGULAR_RADIUS).sin_cos();
+        let (radius_sin, radius_cos) = SUN_ANGULAR_RADIUS.sin_cos();
+        DepthHeight {
+            r,
+            mu_graze,
+            inv_span: 1.0 / (1.0 - mu_graze),
+            row: y0 * DEPTH_ANGLES,
+            ty: fy - y0 as f64,
+            mu_clear: mu_graze * reach_cos + sin_graze * reach_sin,
+            mu_hidden: mu_graze * radius_cos - sin_graze * radius_sin,
+        }
     }
+}
+
+/// The light of the sun's disc (radius 1, a linear limb darkening PENUMBRA_LIMB) across its row at height `y` (-1..1
+/// from its centre): over the half chord s, 2 (1 - u) s + u (pi / 2) s^2.
+fn disc_row_light(y: f64) -> f64 {
+    let s2 = (1.0 - y * y).max(0.0);
+    2.0 * (1.0 - PENUMBRA_LIMB) * s2.sqrt() + PENUMBRA_LIMB * std::f64::consts::FRAC_PI_2 * s2
+}
+
+/// The share of the disc's light (`disc_row_light`) below its row at height `y` (-1..1 from its centre): the row
+/// light's integral, over the whole disc's pi (1 - u / 3).
+fn disc_light_below(y: f64) -> f64 {
+    let y = y.clamp(-1.0, 1.0);
+    let s = (1.0 - y * y).max(0.0).sqrt();
+    let (u, half_pi) = (PENUMBRA_LIMB, std::f64::consts::FRAC_PI_2);
+    let below = (1.0 - u) * (y * s + y.asin() + half_pi) + u * half_pi * (y - y * y * y / 3.0 + 2.0 / 3.0);
+    (below / (std::f64::consts::PI * (1.0 - u / 3.0))).clamp(0.0, 1.0)
 }
 
 fn rayleigh_phase(nu: f64) -> f64 {
     3.0 / (16.0 * std::f64::consts::PI) * (1.0 + nu * nu)
 }
 
-/// The haze's phase: the broad lobe and the narrow peak (MIE_PEAK_SHARE).
-fn mie_phase(nu: f64) -> f64 {
-    (1.0 - MIE_PEAK_SHARE) * cornette_shanks(nu, MIE_G_BROAD) + MIE_PEAK_SHARE * cornette_shanks(nu, MIE_G_PEAK)
+/// The low haze's kind (`AtmosphereParams::aerosol`): how its extinction falls with wavelength (the Angstrom exponent),
+/// how much of what it takes out it scatters (its single-scattering albedo, per band), and its phase: a broad forward
+/// lobe, a narrow peak round the sun (its diffraction) and, for all but the calibrated continental haze, a small
+/// backward lobe (real particles' phase rises again toward the antisolar point, which lights the Belt of Venus).
+/// The optical depth is the Haze control's for every kind. The stratosphere's thin haze is never of the kind: it
+/// keeps the continental's (`STRAT_DEPTH`). The kinds' numbers are AERONET's climatology (Dubovik et
+/// al. 2002, "Variability of absorption and optical properties of key aerosol types observed in worldwide
+/// locations", J. Atmos. Sci. 59): urban-industrial absorbs (albedo 0.85-0.9), sea salt barely (0.98) and has a low
+/// Angstrom exponent (0.3-0.8), desert dust absorbs blue (0.92 at 440 nm, 0.97 at 670 nm, its iron oxides) with an
+/// exponent near 0.2-0.5, and the larger particles of salt and dust scatter further forward (g 0.72-0.75).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Aerosol {
+    angstrom: f64,
+    albedo: Spectrum,
+    g_broad: f64,
+    g_peak: f64,
+    peak_share: f64,
+    g_back: f64,
+    back_share: f64,
+}
+
+impl Aerosol {
+    fn named(name: &str) -> Aerosol {
+        let flat = |a: f64| [a; BANDS];
+        match name {
+            "maritime" => Aerosol { angstrom: 0.5, albedo: flat(0.985), g_broad: 0.72, g_peak: 0.96, peak_share: 0.3, g_back: -0.4, back_share: 0.04 },
+            "urban" => Aerosol { angstrom: 1.6, albedo: flat(0.86), g_broad: 0.62, g_peak: 0.95, peak_share: 0.2, g_back: -0.3, back_share: 0.03 },
+            // (400..680 nm in 40 nm bands: the dust's iron oxides take the blue)
+            "desert" => Aerosol {
+                angstrom: 0.3,
+                albedo: [0.88, 0.91, 0.935, 0.95, 0.96, 0.967, 0.97, 0.972],
+                g_broad: 0.73,
+                g_peak: 0.96,
+                peak_share: 0.3,
+                g_back: -0.4,
+                back_share: 0.05,
+            },
+            // continental: the haze the sky was calibrated with, unchanged
+            _ => Aerosol {
+                angstrom: AEROSOL_ANGSTROM,
+                albedo: flat(AEROSOL_ALBEDO),
+                g_broad: MIE_G_BROAD,
+                g_peak: MIE_G_PEAK,
+                peak_share: MIE_PEAK_SHARE,
+                g_back: 0.0,
+                back_share: 0.0,
+            },
+        }
+    }
+
+    /// The haze's phase at view-sun cosine `nu`: the broad lobe, the narrow peak and the backward lobe.
+    fn phase(&self, nu: f64) -> f64 {
+        let front = (1.0 - self.peak_share - self.back_share) * cornette_shanks(nu, self.g_broad)
+            + self.peak_share * cornette_shanks(nu, self.g_peak);
+        if self.back_share > 0.0 {
+            front + self.back_share * cornette_shanks(nu, self.g_back)
+        } else {
+            front
+        }
+    }
 }
 
 /// Cornette-Shanks phase (as in glsl-atmosphere): Henyey-Greenstein with a
@@ -798,6 +1474,7 @@ fn cornette_shanks(nu: f64, g: f64) -> f64 {
 /// sun's light above the air, over (height, cosine of the sun's zenith
 /// angle). A view sample adds scattering x this.
 struct MultiScatter {
+    /// MS_HEIGHTS rows of MS_READ_ANGLES sun angles, evenly over the sun's cosine from `mu0` to `mu1`.
     psi: Vec<Spectrum>,
     /// The sun's cosine at the first and the last column.
     mu0: f64,
@@ -805,8 +1482,9 @@ struct MultiScatter {
 }
 
 /// One step of a march whose geometry does not depend on the sun: where it
-/// is, and what it scatters toward the ray's origin per unit of light (air
-/// and haze apart, with the view transmittance and the step length in).
+/// is, and what it scatters toward the ray's origin per unit of light (air,
+/// the low haze and the stratosphere's apart, with the view transmittance and
+/// the step length in).
 #[derive(Clone, Copy)]
 struct RayStep {
     /// Position, the ray's origin at (0, r0, 0) and y up.
@@ -814,6 +1492,7 @@ struct RayStep {
     r: f64,
     air: Spectrum,
     haze: Spectrum,
+    strat: Spectrum,
     /// The step's height in the depth table and in the multiple-scattering one.
     depth: DepthHeight,
     ms_row: usize,
@@ -822,7 +1501,7 @@ struct RayStep {
 
 impl Default for RayStep {
     fn default() -> RayStep {
-        RayStep { p: [0.0; 3], r: 0.0, air: [0.0; BANDS], haze: [0.0; BANDS], depth: DepthHeight::default(), ms_row: 0, ms_ty: 0.0 }
+        RayStep { p: [0.0; 3], r: 0.0, air: [0.0; BANDS], haze: [0.0; BANDS], strat: [0.0; BANDS], depth: DepthHeight::default(), ms_row: 0, ms_ty: 0.0 }
     }
 }
 
@@ -832,7 +1511,7 @@ impl MultiScatter {
         let reach = MS_ANGLE_REACH_DEG.to_radians();
         let mu0 = (sun_theta + reach).min(std::f64::consts::PI).cos();
         let mu1 = (sun_theta - reach).max(0.0).cos();
-        let dirs = sphere_directions();
+        let dirs = sphere_directions(MS_DIRS);
         let inv_4pi = 1.0 / (4.0 * std::f64::consts::PI);
         let n = dirs.len() as f64;
         // The point sits at (0, r, 0) and the sun in the x-y plane.
@@ -842,25 +1521,38 @@ impl MultiScatter {
                 [(1.0 - mu * mu).max(0.0).sqrt(), mu]
             })
             .collect();
+        // The deep columns' share of MS_DEEP_DIRS directions (see MS_DEEP_DIRS).
+        let deep: Vec<f64> = suns.iter().map(|s| deep_share(s[1])).collect();
+        let deep_dirs = if deep.iter().any(|&d| d > 0.0) { sphere_directions(MS_DEEP_DIRS) } else { Vec::new() };
         let mut psi = vec![[0.0f64; BANDS]; MS_HEIGHTS * MS_ANGLES];
-        let mut steps = [RayStep::default(); MS_STEPS];
+        let mut steps = [RayStep::default(); MS_STEPS + MESOSPHERE_STEPS];
         let mut second = vec![[0.0f64; BANDS]; MS_ANGLES];
+        let mut second_deep = vec![[0.0f64; BANDS]; MS_ANGLES];
         for j in 0..MS_HEIGHTS {
             let y = j as f64 / (MS_HEIGHTS - 1) as f64;
             let r = PLANET_RADIUS + (TOP_RADIUS - PLANET_RADIUS) * y * y;
             second.iter_mut().for_each(|l| *l = [0.0; BANDS]);
+            second_deep.iter_mut().for_each(|l| *l = [0.0; BANDS]);
             let mut transfer = [0.0f64; BANDS];
-            for w in &dirs {
+            let mut deep_transfer = [0.0f64; BANDS];
+            // MS_DIRS directions for every column, then MS_DEEP_DIRS for the deep ones (the transfer, smooth over
+            // directions, stays the MS_DIRS directions' own).
+            for (w, deep_dir) in dirs.iter().map(|w| (w, false)).chain(deep_dirs.iter().map(|w| (w, true))) {
+                let (second, transfer) = if deep_dir { (&mut second_deep, &mut deep_transfer) } else { (&mut second, &mut transfer) };
                 let ground = hits_ground(r, w[1]);
                 let length = if ground { distance_to_ground(r, w[1]) } else { distance_to_top(r, w[1]) };
+                // A ray that leaves the dense air goes on through the mesosphere.
+                let (count, beyond) =
+                    if ground { (MS_STEPS, 0.0) } else { (MS_STEPS + MESOSPHERE_STEPS, distance_to_mesosphere_top(r, w[1]) - length) };
+                let steps = &mut steps[..count];
                 // The march is the same for every sun angle; only the light
                 // that reaches each step differs.
                 let mut depth = [0.0f64; BANDS];
                 for (s, step) in steps.iter_mut().enumerate() {
-                    let (t, ds) = segment(s, MS_STEPS, length);
+                    let (t, ds) = march_segment(s, MS_STEPS, length, beyond);
                     let p = [w[0] * t, r + w[1] * t, w[2] * t];
                     let rp = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
-                    let dens = densities(rp - PLANET_RADIUS);
+                    let dens = medium.densities_over(rp, (r * w[1] + t) / rp, ds, true);
                     let ext = medium.extinction(dens);
                     let sca = medium.scattering(dens);
                     let mut weight = [0.0f64; BANDS];
@@ -878,8 +1570,11 @@ impl MultiScatter {
                     let t: Spectrum = depth.map(|d| (-d).exp());
                     (p, rp, t)
                 });
-                for (sun, acc) in suns.iter().zip(second.iter_mut()) {
-                    for step in &steps {
+                for ((sun, acc), share) in suns.iter().zip(second.iter_mut()).zip(&deep) {
+                    if deep_dir && *share == 0.0 {
+                        continue;
+                    }
+                    for step in steps.iter() {
                         let mu_sun = (step.p[0] * sun[0] + step.p[1] * sun[1]) / step.r;
                         let sun_t = table.transmittance_at(&step.depth, mu_sun);
                         // The first scattering is taken as isotropic, as in the paper.
@@ -903,10 +1598,15 @@ impl MultiScatter {
             // share an isotropic radiance scatters again: 1 / (1 - f).
             let f: Spectrum = std::array::from_fn(|k| (transfer[k] / n).min(0.99));
             for (i, l) in second.iter().enumerate() {
-                psi[j * MS_ANGLES + i] = std::array::from_fn(|k| l[k] / n / (1.0 - f[k]));
+                psi[j * MS_ANGLES + i] = if deep[i] > 0.0 {
+                    let (d, share, n_deep) = (&second_deep[i], deep[i], MS_DEEP_DIRS as f64);
+                    std::array::from_fn(|k| ((1.0 - share) * l[k] / n + share * d[k] / n_deep) / (1.0 - f[k]))
+                } else {
+                    std::array::from_fn(|k| l[k] / n / (1.0 - f[k]))
+                };
             }
         }
-        MultiScatter { psi, mu0, mu1 }
+        MultiScatter { psi: read_columns(&psi), mu0, mu1 }
     }
 
     /// The height's share of a lookup at radius `r`: the first texel of the
@@ -915,17 +1615,17 @@ impl MultiScatter {
         let y = ((r - PLANET_RADIUS) / (TOP_RADIUS - PLANET_RADIUS)).clamp(0.0, 1.0).sqrt();
         let fy = y * (MS_HEIGHTS - 1) as f64;
         let y0 = (fy as usize).min(MS_HEIGHTS - 2);
-        (y0 * MS_ANGLES, fy - y0 as f64)
+        (y0 * MS_READ_ANGLES, fy - y0 as f64)
     }
 
     /// The source at the height `height` names, with the sun at cosine
     /// `mu_sun` to the vertical there.
     fn at(&self, (row0, ty): (usize, f64), mu_sun: f64) -> Spectrum {
         let x = if self.mu1 > self.mu0 { ((mu_sun - self.mu0) / (self.mu1 - self.mu0)).clamp(0.0, 1.0) } else { 0.0 };
-        let fx = x * (MS_ANGLES - 1) as f64;
-        let x0 = (fx as usize).min(MS_ANGLES - 2);
+        let fx = x * (MS_READ_ANGLES - 1) as f64;
+        let x0 = (fx as usize).min(MS_READ_ANGLES - 2);
         let tx = fx - x0 as f64;
-        let row1 = row0 + MS_ANGLES;
+        let row1 = row0 + MS_READ_ANGLES;
         let (a, b) = (&self.psi[row0 + x0], &self.psi[row0 + x0 + 1]);
         let (c, d) = (&self.psi[row1 + x0], &self.psi[row1 + x0 + 1]);
         std::array::from_fn(|k| {
@@ -936,12 +1636,63 @@ impl MultiScatter {
     }
 }
 
-/// MS_DIRS directions spread evenly over the sphere (a spherical Fibonacci set).
-fn sphere_directions() -> Vec<[f64; 3]> {
+/// How much of a multiple-scattering column takes the deep direction set (MS_DEEP_DIRS) for its sun at cosine
+/// `mu_sun` to the point's vertical: 0 down to MS_DEEP_FROM_DEG below the point's horizon, 1 from MS_DEEP_TO_DEG down.
+fn deep_share(mu_sun: f64) -> f64 {
+    let (from, to) = (MS_DEEP_FROM_DEG.to_radians().sin(), MS_DEEP_TO_DEG.to_radians().sin());
+    let t = ((-mu_sun - from) / (to - from)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// The multiple-scattering table `psi` as it is worked out (MS_HEIGHTS rows of MS_ANGLES sun angles, evenly over the
+/// sun's cosine) read on MS_READ_ANGLES columns over the same span: each band's logarithm (over PSI_FLOOR) through the
+/// worked-out columns, a monotone cubic between them (Fritsch & Butland 1984: each column's slope the harmonic mean of
+/// its two secants, which keeps the curve within its neighbours, and a column next to one nothing lights on its own
+/// side's slope). A source that falls by a constant factor per degree (twilight's, about 3x) is read as it is, where
+/// the linear interpolation of two columns 2 degrees apart read it up to 1.75x too bright midway; above the point's
+/// horizon, where the logarithm bends over, the cubic follows it (a straight line through the logarithm read it 3-9 %
+/// too dark from +3 to -3 deg).
+fn read_columns(psi: &[Spectrum]) -> Vec<Spectrum> {
+    let (angles, read) = (MS_ANGLES, MS_READ_ANGLES);
+    let mut out = vec![[0.0f64; BANDS]; MS_HEIGHTS * read];
+    for (j, row) in psi.chunks(angles).enumerate() {
+        for k in 0..BANDS {
+            let y: Vec<f64> = row.iter().map(|l| l[k].max(PSI_FLOOR).ln()).collect();
+            let d: Vec<f64> = y.windows(2).map(|w| w[1] - w[0]).collect();
+            let m: Vec<f64> = (0..angles)
+                .map(|i| {
+                    if i == 0 {
+                        d[0]
+                    } else if i == angles - 1 {
+                        d[angles - 2]
+                    } else if d[i - 1] * d[i] <= 0.0 {
+                        0.0
+                    } else {
+                        2.0 * d[i - 1] * d[i] / (d[i - 1] + d[i])
+                    }
+                })
+                .collect();
+            for c in 0..read {
+                let x = c as f64 / (read - 1) as f64 * (angles - 1) as f64;
+                let i = (x as usize).min(angles - 2);
+                let t = x - i as f64;
+                // the cubic Hermite basis
+                let (t2, t3) = (t * t, t * t * t);
+                let (h0, h1) = (2.0 * t3 - 3.0 * t2 + 1.0, 3.0 * t2 - 2.0 * t3);
+                let v = h0 * y[i] + h1 * y[i + 1] + (t3 - 2.0 * t2 + t) * m[i] + (t3 - t2) * m[i + 1];
+                out[j * read + c][k] = v.exp();
+            }
+        }
+    }
+    out
+}
+
+/// `n` directions spread evenly over the sphere (a spherical Fibonacci set).
+fn sphere_directions(n: usize) -> Vec<[f64; 3]> {
     let golden = std::f64::consts::PI * (3.0 - 5.0f64.sqrt());
-    (0..MS_DIRS)
+    (0..n)
         .map(|i| {
-            let y = 1.0 - 2.0 * (i as f64 + 0.5) / MS_DIRS as f64;
+            let y = 1.0 - 2.0 * (i as f64 + 0.5) / n as f64;
             let ring = (1.0 - y * y).max(0.0).sqrt();
             let phi = golden * i as f64;
             [ring * phi.cos(), y, ring * phi.sin()]
@@ -949,43 +1700,125 @@ fn sphere_directions() -> Vec<[f64; 3]> {
         .collect()
 }
 
-/// The view march along a ray at elevation sine `view_sin`. It is the same
-/// for every azimuth, so a row of the sky-view table marches once.
-fn view_steps(medium: &Medium, view_sin: f64) -> [RayStep; VIEW_STEPS] {
+/// The view march along a ray at elevation sine `view_sin`: VIEW_STEPS steps through the dense air, then
+/// MESOSPHERE_STEPS through the mesosphere above it. It is the same for every azimuth, so a row of the sky-view table
+/// marches once.
+fn view_steps(medium: &Medium, view_sin: f64) -> [RayStep; VIEW_STEPS + MESOSPHERE_STEPS] {
     let r0 = PLANET_RADIUS + VIEWER_HEIGHT;
     let length = distance_to_top(r0, view_sin);
-    let mut steps = [RayStep::default(); VIEW_STEPS];
+    let beyond = distance_to_mesosphere_top(r0, view_sin) - length;
+    let mut steps = [RayStep::default(); VIEW_STEPS + MESOSPHERE_STEPS];
     // Extinction optical depth from the viewer to the start of the current segment.
     let mut depth = [0.0f64; BANDS];
     for (i, step) in steps.iter_mut().enumerate() {
-        let (t, ds) = segment(i, VIEW_STEPS, length);
-        let r = radius_at(r0, view_sin, t);
-        let dens = densities(r - PLANET_RADIUS);
-        let ext = medium.extinction(dens);
-        let haze_sca = medium.haze_scattering(dens);
-        let (mut air, mut haze) = ([0.0f64; BANDS], [0.0f64; BANDS]);
-        for k in 0..BANDS {
-            let view_t = (-(depth[k] + 0.5 * ext[k] * ds)).exp();
-            depth[k] += ext[k] * ds;
-            air[k] = view_t * medium.rayleigh[k] * dens[0] * ds;
-            haze[k] = view_t * haze_sca[k] * ds;
-        }
-        // `p` holds (t, 0, 0): the distance along the ray is all `in_scatter` needs.
-        let (ms_row, ms_ty) = MultiScatter::height(r);
-        *step = RayStep { p: [t, 0.0, 0.0], r, air, haze, depth: DepthHeight::new(r), ms_row, ms_ty };
+        let (t, ds) = march_segment(i, VIEW_STEPS, length, beyond);
+        *step = view_step(medium, r0, view_sin, t, ds, &mut depth);
     }
     steps
 }
 
-/// Radiance reaching the viewer along a ray marched as `steps`, per unit of
-/// the sun's light above the air, with the sun at elevation sine `sun_sin`
-/// and view-sun cosine `nu`: single scattering plus the multiple-scattering
-/// source.
-fn in_scatter(table: &DepthTable, steps: &[RayStep], sun_sin: f64, nu: f64, multi: &MultiScatter) -> Spectrum {
+/// One step of a view march from radius `r0` at elevation sine `view_sin`: its middle `t` metres along the ray, `ds`
+/// long, weighed at its middle, the optical depth from the viewer to the step's start in `depth` (carried past it). The
+/// haze is read over the step (`Medium::densities_over`: a boundary layer's top cuts it exactly). The step's light
+/// is split as `in_scatter` sums it: the air's, the low haze's and the stratosphere's, each attenuated to the viewer.
+/// `aerial`'s marches take their steps from here, so a viewer at a height of its own sees the same air.
+fn view_step(medium: &Medium, r0: f64, view_sin: f64, t: f64, ds: f64, depth: &mut Spectrum) -> RayStep {
+    let r = radius_at(r0, view_sin, t);
+    let dens = medium.densities_over(r, (r0 * view_sin + t) / r, ds, true);
+    let ext = medium.extinction(dens);
+    let haze_sca = medium.haze_scattering(dens);
+    let (mut air, mut haze, mut strat) = ([0.0f64; BANDS], [0.0f64; BANDS], [0.0f64; BANDS]);
+    for k in 0..BANDS {
+        let view_t = (-(depth[k] + 0.5 * ext[k] * ds)).exp();
+        depth[k] += ext[k] * ds;
+        air[k] = view_t * medium.rayleigh[k] * dens[0] * ds;
+        haze[k] = view_t * haze_sca[k] * ds;
+        strat[k] = view_t * medium.strat_scattering[k] * dens[3] * ds;
+    }
+    // `p` holds (t, 0, 0): the distance along the ray is all `in_scatter` needs.
+    let (ms_row, ms_ty) = MultiScatter::height(r);
+    RayStep { p: [t, 0.0, 0.0], r, air, haze, strat, depth: DepthHeight::new(r), ms_row, ms_ty }
+}
+
+/// `compress_blue` leaves a light whose blue lies BLUE_THRESHOLD of the way or less from its largest channel down to
+/// zero as it is, and draws the blue of those beyond it in along the reference gamut compression's curve (Academy,
+/// ACES 1.3, 2021, "Reference Gamut Compression": its yellow threshold and power), so the farthest light the bands can
+/// carry (`blue_limit`) lands on the gamut's edge and none stays outside. A camera records light outside its gamut that
+/// way, inside with a little blue, not cut to none: the photos' 1 degree sun and its aureole keep 2.6-4.2 % of their
+/// red (`Medium::light_rgb`), the curve gives the model's 1 degree sun 2.9 %. The calibrated sky stays as it was: from
+/// 85 to 7 degrees the haze's and the air's light keep their blue over 15 % of their red (at most 0.85 of the way; the
+/// sun at 7 degrees 0.79), and only the stratosphere's faint light along the horizon, reddened across the whole air, is
+/// drawn in (the sky moves by under 0.01 % in luminance, 0.34 % in blue).
+const BLUE_THRESHOLD: f32 = 0.88;
+const BLUE_POWER: f32 = 1.2;
+
+/// How far below zero, in parts of its largest channel, the blue of the farthest light the bands can carry falls (the
+/// distance `compress_blue` measures, past 1). The distance divides by the largest channel, so it is not linear in the
+/// spectrum and a mix lies farther out than any band alone: band 560 alone 1.130, bands 560 and 600 at 1 : 0.484 (red
+/// and green equal) 1.145. With the largest channel held at 1 the deepest blue is a linear programme over the bands'
+/// amounts (red and green each at most 1), whose optimum lies on a corner: one band with its largest channel at 1, or
+/// two with red and green both at 1. The farthest corner is the limit; no light the bands carry lies beyond it.
+fn blue_limit(to_rgb: &[Spectrum; 3]) -> f32 {
+    let [r, g, b] = to_rgb;
+    let mut limit = 1.0f64;
+    for j in 0..BANDS {
+        let m = r[j].max(g[j]).max(b[j]);
+        if m > 0.0 {
+            limit = limit.max((m - b[j]) / m);
+        }
+        for k in j + 1..BANDS {
+            // the amounts of bands j and k that put red and green both at 1
+            let det = r[j] * g[k] - r[k] * g[j];
+            if det == 0.0 {
+                continue;
+            }
+            let (sj, sk) = ((g[k] - r[k]) / det, (r[j] - g[j]) / det);
+            if sj >= 0.0 && sk >= 0.0 {
+                limit = limit.max(1.0 - (b[j] * sj + b[k] * sk));
+            }
+        }
+    }
+    limit as f32
+}
+
+/// A light's colour with its blue drawn inside Rec.709: its distance from the largest channel, d = (max - b) / max (1
+/// on the gamut's edge, past it outside), left alone up to BLUE_THRESHOLD and compressed beyond it so `limit` lands
+/// on 1 (`BLUE_THRESHOLD`). A 1 degree sun's light (d 1.03) keeps a blue of 2.9 % of its red; red and green, and any
+/// light whose blue is not short, are left as they are.
+fn compress_blue(c: Vec3f, limit: f32) -> Vec3f {
+    let m = c.x.max(c.y).max(c.z);
+    if !(m > 0.0) {
+        return c;
+    }
+    let d = (m - c.z) / m;
+    let (t, p) = (BLUE_THRESHOLD, BLUE_POWER);
+    if !(d > t) || !(limit > 1.0) {
+        return c;
+    }
+    // the curve's scale, so that `limit` lands on the edge
+    let scale = (limit - t) / (((1.0 - t) / (limit - t)).powf(-p) - 1.0).powf(1.0 / p);
+    let x = (d - t) / scale;
+    let d = t + scale * x / (1.0 + x.powf(p)).powf(1.0 / p);
+    vec3f(c.x, c.y, m * (1.0 - d))
+}
+
+/// A colour held inside Rec.709: a channel that falls below a millionth of the colour's sum (a deeply reddened
+/// spectrum's blue, through the matching functions' negative lobes) is held there, never exactly 0, which a light's
+/// colour is divided by.
+fn gamut_floor(c: Vec3f) -> Vec3f {
+    let floor = 1.0e-6 * (c.x.max(0.0) + c.y.max(0.0) + c.z.max(0.0));
+    vec3f(c.x.max(floor), c.y.max(floor), c.z.max(floor))
+}
+
+/// What reaches the viewer along a ray marched as `steps`, per unit of the sun's light above the air, with the sun
+/// at elevation sine `sun_sin` and view-sun cosine `nu`, in four parts without the phase: the air's single
+/// scattering, the low haze's, the stratosphere's haze's, and the multiple-scattering source (isotropic). The phase is
+/// the same at every step of a ray (the sun is at infinity), so the radiance is air x rayleigh_phase(nu) + haze x the
+/// aerosol's phase(nu) + strat x the continental's phase(nu) + multi. The parts still depend on `nu` through the sun's
+/// transmittance at each step (the Earth's shadow), but smoothly.
+fn in_scatter(table: &DepthTable, steps: &[RayStep], sun_sin: f64, nu: f64, multi: &MultiScatter) -> [Spectrum; 4] {
     let r0 = PLANET_RADIUS + VIEWER_HEIGHT;
-    let phase_r = rayleigh_phase(nu);
-    let phase_m = mie_phase(nu);
-    let mut light = [0.0f64; BANDS];
+    let (mut air, mut haze, mut strat, mut ms) = ([0.0f64; BANDS], [0.0f64; BANDS], [0.0f64; BANDS], [0.0f64; BANDS]);
     for step in steps {
         let (t, r) = (step.p[0], step.r);
         // The sun's direction is fixed but the local vertical turns along the
@@ -994,15 +1827,78 @@ fn in_scatter(table: &DepthTable, steps: &[RayStep], sun_sin: f64, nu: f64, mult
         let sun_t = table.transmittance_at(&step.depth, mu_sun);
         let psi = multi.at((step.ms_row, step.ms_ty), mu_sun);
         for k in 0..BANDS {
-            light[k] += sun_t[k] * (phase_r * step.air[k] + phase_m * step.haze[k]) + (step.air[k] + step.haze[k]) * psi[k];
+            air[k] += sun_t[k] * step.air[k];
+            haze[k] += sun_t[k] * step.haze[k];
+            strat[k] += sun_t[k] * step.strat[k];
+            ms[k] += (step.air[k] + step.haze[k] + step.strat[k]) * psi[k];
         }
     }
-    light
+    [air, haze, strat, ms]
 }
 
-fn build_sky_lut(medium: &Medium, table: &DepthTable, sun_sin: f64, multi: &MultiScatter) -> Vec<Vec3f> {
+/// The sky-view table: LUT_HEIGHT rows of LUT_WIDTH texels (row 0 at the horizon), four planes without the phase
+/// (`in_scatter`), each one light's colour in linear Rec.709 (`Medium::light_rgb`). A lookup reads the planes
+/// bilinearly and applies the exact phase for its own direction, then the floor, so the glow round the sun, whose
+/// narrow peak spans a few of the table's texels, stays sharp at any map width (the phase-free sky-view planes of
+/// Physical Atmosphere 2, as an idea; our own code).
+struct SkyLut {
+    /// The low haze's kind, whose phase a lookup applies to its plane.
+    aerosol: Aerosol,
+    /// The kind whose phase the stratosphere's plane takes: the continental (sulphate) whatever the low haze's. None
+    /// when the low haze is of that kind too, so one phase serves both planes.
+    strat_aerosol: Option<Aerosol>,
+    air: Vec<Vec3f>,
+    haze: Vec<Vec3f>,
+    strat: Vec<Vec3f>,
+    multi: Vec<Vec3f>,
+}
+
+impl SkyLut {
+    /// The sky at relative azimuth `phi` (0..pi from the sun) and elevation `elevation` (0..pi/2), the sun at
+    /// elevation sine `sun_sin`, cosine `sun_cos`.
+    fn at(&self, phi: f32, elevation: f32, sun_sin: f32, sun_cos: f32) -> Vec3f {
+        let fx = (phi / std::f32::consts::PI).clamp(0.0, 1.0) * (LUT_WIDTH - 1) as f32;
+        let fy = (elevation / std::f32::consts::FRAC_PI_2).clamp(0.0, 1.0).sqrt() * (LUT_HEIGHT - 1) as f32;
+        let x0 = (fx as usize).min(LUT_WIDTH - 2);
+        let y0 = (fy as usize).min(LUT_HEIGHT - 2);
+        let tx = fx - x0 as f32;
+        let ty = fy - y0 as f32;
+        let row0 = y0 * LUT_WIDTH;
+        let row1 = row0 + LUT_WIDTH;
+        let read = |plane: &[Vec3f]| {
+            let near = plane[row0 + x0].mix(plane[row0 + x0 + 1], tx);
+            let far = plane[row1 + x0].mix(plane[row1 + x0 + 1], tx);
+            near.mix(far, ty)
+        };
+        let el = elevation.clamp(0.0, std::f32::consts::FRAC_PI_2);
+        let nu = (el.cos() * sun_cos * phi.cos() + el.sin() * sun_sin).clamp(-1.0, 1.0) as f64;
+        let haze_phase = self.aerosol.phase(nu) as f32;
+        let strat_phase = self.strat_aerosol.as_ref().map_or(haze_phase, |kind| kind.phase(nu) as f32);
+        gamut_floor(read(&self.air) * rayleigh_phase(nu) as f32 + read(&self.haze) * haze_phase + read(&self.strat) * strat_phase + read(&self.multi))
+    }
+
+    /// Every plane times `k` (`Atmosphere::lifted`): the sky `at` reads is k times as bright, the phases and the gamut
+    /// floor being linear in it.
+    fn scale(&mut self, k: f32) {
+        for plane in [&mut self.air, &mut self.haze, &mut self.strat, &mut self.multi] {
+            plane.iter_mut().for_each(|texel| *texel *= k);
+        }
+    }
+}
+
+fn build_sky_lut(medium: &Medium, table: &DepthTable, sun_sin: f64, multi: &MultiScatter) -> SkyLut {
     let sun_cos = (1.0 - sun_sin * sun_sin).max(0.0).sqrt();
-    let mut lut = Vec::with_capacity(LUT_WIDTH * LUT_HEIGHT);
+    let n = LUT_WIDTH * LUT_HEIGHT;
+    // The stratosphere's haze takes the continental's phase whatever the low haze's kind (`STRAT_DEPTH`).
+    let continental = Aerosol::named("continental");
+    let mut lut = SkyLut {
+        aerosol: medium.aerosol,
+        strat_aerosol: (medium.aerosol != continental).then_some(continental),
+        air: Vec::with_capacity(n),
+        haze: Vec::with_capacity(n),
+        strat: Vec::with_capacity(n),
+        multi: Vec::with_capacity(n),
+    };
     for j in 0..LUT_HEIGHT {
         let v = j as f64 / (LUT_HEIGHT - 1) as f64;
         let elevation = std::f64::consts::FRAC_PI_2 * v * v;
@@ -1012,29 +1908,19 @@ fn build_sky_lut(medium: &Medium, table: &DepthTable, sun_sin: f64, multi: &Mult
             let phi = std::f64::consts::PI * i as f64 / (LUT_WIDTH - 1) as f64;
             // The sun sits at azimuth 0 of the table's frame.
             let nu = view_cos * sun_cos * phi.cos() + view_sin * sun_sin;
-            lut.push(medium.rgb(&in_scatter(table, &steps, sun_sin, nu, multi)));
+            let [air, haze, strat, ms] = in_scatter(table, &steps, sun_sin, nu, multi);
+            lut.air.push(medium.light_rgb(&air));
+            lut.haze.push(medium.light_rgb(&haze));
+            lut.strat.push(medium.light_rgb(&strat));
+            lut.multi.push(medium.light_rgb(&ms));
         }
     }
     lut
 }
 
-fn lut_lookup(lut: &[Vec3f], phi: f32, elevation: f32) -> Vec3f {
-    let fx = (phi / std::f32::consts::PI).clamp(0.0, 1.0) * (LUT_WIDTH - 1) as f32;
-    let fy = (elevation / std::f32::consts::FRAC_PI_2).clamp(0.0, 1.0).sqrt() * (LUT_HEIGHT - 1) as f32;
-    let x0 = (fx as usize).min(LUT_WIDTH - 2);
-    let y0 = (fy as usize).min(LUT_HEIGHT - 2);
-    let tx = fx - x0 as f32;
-    let ty = fy - y0 as f32;
-    let row0 = y0 * LUT_WIDTH;
-    let row1 = row0 + LUT_WIDTH;
-    let near = lut[row0 + x0].mix(lut[row0 + x0 + 1], tx);
-    let far = lut[row1 + x0].mix(lut[row1 + x0 + 1], tx);
-    near.mix(far, ty)
-}
-
 /// Mean radiance of the upper hemisphere, and the irradiance it puts on a
 /// level surface, both from the table (the disc is not part of the sky).
-fn hemisphere_integrals(lut: &[Vec3f]) -> (Vec3f, Vec3f) {
+fn hemisphere_integrals(sky: &dyn Fn(f32, f32) -> Vec3f) -> (Vec3f, Vec3f) {
     const ROWS: usize = 32;
     const COLUMNS: usize = 32;
     let d_el = std::f32::consts::FRAC_PI_2 / ROWS as f32;
@@ -1046,7 +1932,7 @@ fn hemisphere_integrals(lut: &[Vec3f]) -> (Vec3f, Vec3f) {
         // Solid angle of the cell, doubled for the mirrored half of the sky.
         let d_omega = 2.0 * el.cos() * d_el * d_phi;
         for i in 0..COLUMNS {
-            let c = lut_lookup(lut, (i as f32 + 0.5) * d_phi, el);
+            let c = sky((i as f32 + 0.5) * d_phi, el);
             radiance_sum += c * d_omega;
             irradiance += c * (d_omega * el.sin());
         }
@@ -1054,54 +1940,194 @@ fn hemisphere_integrals(lut: &[Vec3f]) -> (Vec3f, Vec3f) {
     (radiance_sum * (1.0 / (2.0 * std::f32::consts::PI)), irradiance)
 }
 
-/// The sun's disc as `Atmosphere::sun_disc` draws it ([`Atmosphere::disc_look`]).
+/// The sun's disc as `Atmosphere::sun_disc` draws it ([`Atmosphere::disc_look`]), for a viewer that draws it itself:
+/// its radiance along a direction is [`Self::at`], cut at the horizon.
+///
+/// The disc is round where the sun truly is and is seen through the air's refraction ([`refraction`]): a direction
+/// seen at apparent elevation e comes from e - refraction(e), so the disc is lifted (34' on the horizon) and
+/// flattened, its lower limb lifted more than its upper one. Its light as seen stays the key's (`sun_disc_look`). Each
+/// part is coloured by the air its own light crosses (`rows`), so at sunset the
+/// lower limb is redder and dimmer than the upper, and the limb is darker and redder than the centre (Neckel & Labs
+/// 1994, `limb`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SunDiscLook {
-    /// The disc's centre, unit length.
+    /// The disc's centre as seen, unit length: the sun's direction lifted by the refraction.
     pub dir: Vec3f,
-    /// Its angular radius in radians: the soft edge is `softness` x radius
-    /// wide, centred on it.
+    /// Its angular radius in radians, where the sun truly is: the soft edge is `softness` x radius wide, centred on it.
     pub radius: f32,
     pub softness: f32,
-    /// Linear limb darkening: 1 - limb_darkening x (1 - sqrt(1 - (theta / outer)^2)).
-    pub limb_darkening: f32,
-    /// The radiance where the profile is 1 (the centre).
-    pub radiance: Vec3f,
+    /// Limb darkening per channel: sum_i limb[i] x mu^i, 1 at the centre, with mu = sqrt(1 - (theta / outer)^2) and
+    /// theta the true angle from the centre ([`Self::theta`]).
+    pub limb: [Vec3f; DISC_LIMB_TERMS],
+    /// The radiance where the limb darkening is 1 at DISC_ROWS apparent elevations evenly from `rows_from` to
+    /// `rows_to` (radians, the part of the disc above the horizon), each lit through the air its light crosses
+    /// (`refracted_transmittance`); between rows the logarithm is interpolated, beyond them the end row holds.
+    pub rows: [Vec3f; DISC_ROWS],
+    pub rows_from: f32,
+    pub rows_to: f32,
 }
 
-/// Relative disc brightness at angle `theta` from its centre: a smoothstep
-/// edge `softness` x radius wide, centred on the radius, times linear limb
-/// darkening.
-fn disc_profile(theta: f32, radius: f32, softness: f32) -> f32 {
-    let inner = radius * (1.0 - 0.5 * softness);
-    let outer = radius * (1.0 + 0.5 * softness);
-    if theta >= outer {
-        return 0.0;
+impl SunDiscLook {
+    /// The disc's outer edge, soft edge included: radius x (1 + softness / 2).
+    pub fn outer(&self) -> f32 {
+        self.radius * (1.0 + 0.5 * self.softness)
     }
-    let edge = if outer - inner > 1.0e-9 { 1.0 - smoothstep(inner, outer, theta) } else { 1.0 };
-    let x = theta / outer;
-    let limb = 1.0 - LIMB_DARKENING * (1.0 - (1.0 - x * x).max(0.0).sqrt());
-    edge * limb
+
+    /// The true angle (radians) between what is seen along unit `d` and the disc's centre: both taken back down
+    /// through the refraction ([`unrefracted`]), from the chord, which stays exact for a fraction of a degree.
+    pub fn theta(&self, d: Vec3f) -> f32 {
+        let chord = (unrefracted(d) - unrefracted(self.dir.normalize())).length();
+        2.0 * (0.5 * chord).min(1.0).asin()
+    }
+
+    /// The disc's shape at true angle `theta` from its centre, per channel: a smoothstep edge `softness` x radius wide
+    /// round the radius, box-filtered over `w` more (a viewer's pixel; 0 for none), times the limb darkening.
+    pub fn profile(&self, theta: f32, w: f32) -> Vec3f {
+        let outer = self.outer();
+        if !(outer > 0.0) || theta >= outer + w {
+            return Vec3f::default();
+        }
+        let inner = self.radius * (1.0 - 0.5 * self.softness);
+        let edge = if outer - inner + w > 1.0e-9 { 1.0 - smoothstep(inner - 0.5 * w, outer + 0.5 * w, theta) } else { 1.0 };
+        let x = (theta / outer).min(1.0);
+        let mu = (1.0 - x * x).max(0.0).sqrt();
+        let mut limb = self.limb[DISC_LIMB_TERMS - 1];
+        for i in (0..DISC_LIMB_TERMS - 1).rev() {
+            limb = limb * mu + self.limb[i];
+        }
+        vec3f(limb.x.max(0.0), limb.y.max(0.0), limb.z.max(0.0)) * edge
+    }
+
+    /// The radiance where the limb darkening is 1 at apparent elevation `e` (radians): `rows`, their logarithm
+    /// interpolated.
+    pub fn row(&self, e: f32) -> Vec3f {
+        let span = self.rows_to - self.rows_from;
+        let u = if span > 0.0 { ((e - self.rows_from) / span).clamp(0.0, 1.0) } else { 0.0 };
+        let f = u * (DISC_ROWS - 1) as f32;
+        let i = (f as usize).min(DISC_ROWS - 2);
+        let t = f - i as f32;
+        let (a, b) = (self.rows[i], self.rows[i + 1]);
+        let mix = |a: f32, b: f32| if a > 0.0 && b > 0.0 { (a.ln() + (b.ln() - a.ln()) * t).exp() } else { a + (b - a) * t };
+        vec3f(mix(a.x, b.x), mix(a.y, b.y), mix(a.z, b.z))
+    }
+
+    /// The disc's radiance along unit `d`, without the horizon's cut.
+    pub fn at(&self, d: Vec3f) -> Vec3f {
+        let theta = self.theta(d);
+        if !(theta < self.outer()) {
+            return Vec3f::default();
+        }
+        self.row(d.y.clamp(-1.0, 1.0).asin()) * self.profile(theta, 0.0)
+    }
+
+    /// The disc's light: its radiance summed over the whole disc where the sun truly is (no horizon, the flattening
+    /// left out), each part at the colour it is seen in. Over a sun high in the sky it is the sun's irradiance.
+    pub fn light(&self) -> Vec3f {
+        self.light_over(false)
+    }
+
+    /// The disc's radiance summed over the whole disc (no horizon), each part at the colour it is seen in: where the
+    /// sun truly is, or (`seen`) as it is seen, flattened by the refraction (each part's solid angle times
+    /// d(seen elevation) / d(true elevation) and the ratio of their cosines).
+    fn light_over(&self, seen: bool) -> Vec3f {
+        const RINGS: usize = 96;
+        const ANGLES: usize = 16;
+        let outer = self.outer();
+        if !(outer > 0.0) {
+            return Vec3f::default();
+        }
+        let centre = unrefracted(self.dir.normalize());
+        let side = if centre.y.abs() < 0.9 { vec3f(0.0, 1.0, 0.0) } else { vec3f(1.0, 0.0, 0.0) };
+        let right = Vec3f::cross(centre, side).normalize();
+        let up = Vec3f::cross(right, centre);
+        let dt = outer / RINGS as f32;
+        let dphi = std::f32::consts::TAU / ANGLES as f32;
+        let mut sum = Vec3f::default();
+        for i in 0..RINGS {
+            let theta = (i as f32 + 0.5) * dt;
+            let shape = self.profile(theta, 0.0) * (theta.sin() * dt * dphi);
+            for j in 0..ANGLES {
+                let phi = (j as f32 + 0.5) * dphi;
+                let p = centre * theta.cos() + (right * phi.cos() + up * phi.sin()) * theta.sin();
+                let e = p.y.clamp(-1.0, 1.0).asin();
+                let a = apparent_elevation(e);
+                let squeeze = if seen {
+                    // a = e + refraction(a): da / de = 1 / (1 - refraction'(a))
+                    const H: f32 = 1.0e-4;
+                    let slope = (refraction(a + H) - refraction(a - H)) / (2.0 * H);
+                    a.cos() / (e.cos().max(1.0e-6) * (1.0 - slope))
+                } else {
+                    1.0
+                };
+                sum += self.row(a) * shape * squeeze;
+            }
+        }
+        sum
+    }
 }
 
-/// Integral of `disc_profile` over the sphere, in steradians.
-fn disc_solid_angle(radius: f32, softness: f32) -> f64 {
-    const STEPS: usize = 2048;
-    let outer = (radius * (1.0 + 0.5 * softness)) as f64;
-    let dt = outer / STEPS as f64;
-    (0..STEPS)
-        .map(|i| {
-            let theta = (i as f64 + 0.5) * dt;
-            disc_profile(theta as f32, radius, softness) as f64 * 2.0 * std::f64::consts::PI * theta.sin() * dt
-        })
-        .sum()
+/// The sun's disc for the sun at unit `sun`, `radius` radians wide with a soft edge `softness` x radius wide
+/// ([`SunDiscLook`]), its light as it is seen `irradiance` (the key's, `Atmosphere::sun_irradiance`) at every size,
+/// softness and elevation: the rows keep their colours relative to one another (the lower limb redder) and are
+/// scaled together per channel. Near the horizon the key's straight path toward the true sun crosses more air than
+/// the bent path the disc is seen along, so there the scale dims the disc to the key. `horizon` is the elevation the
+/// disc is cut at (`Atmosphere::horizon_dip`, 0 or below) and `height` the viewer's height its light is seen from
+/// (None: the calibrated VIEWER_HEIGHT), so a sun under level seen from a height has rows lit through its own air.
+fn sun_disc_look(medium: &Medium, sun: Vec3f, radius: f32, softness: f32, irradiance: Vec3f, horizon: f32, height: Option<f64>) -> SunDiscLook {
+    let through = |e: f64| match height {
+        Some(h) => refracted_transmittance_from(medium, e, h),
+        None => refracted_transmittance(medium, e),
+    };
+    let outer = radius * (1.0 + 0.5 * softness);
+    let e = sun.y.clamp(-1.0, 1.0).asin();
+    let seen = apparent_elevation(e);
+    let dir = settled_unit(at_elevation(sun, seen));
+    // the rows span the part of the disc above the horizon
+    let top = apparent_elevation(e + outer);
+    let bottom = apparent_elevation(e - outer).max(horizon).min(top);
+    // Each channel's limb darkening: the bands' (Neckel & Labs 1994) weighted by what each band brings the channel
+    // in the light of the disc's centre.
+    let centre = through(seen.max(bottom).min(top) as f64);
+    let lit = centre.iter().any(|t| *t > 0.0);
+    let limb: [Vec3f; DISC_LIMB_TERMS] = std::array::from_fn(|i| {
+        let c: [f32; 3] = std::array::from_fn(|c| {
+            let (mut sum, mut weight) = (0.0f64, 0.0f64);
+            for k in 0..BANDS {
+                let w = medium.to_rgb[c][k].max(0.0) * if lit { centre[k] } else { 1.0 };
+                let um = BAND_NM[k] / 1000.0;
+                let [a, b, cc] = LIMB_NL94[i];
+                sum += w * (a + b / um + cc / um.powi(5));
+                weight += w;
+            }
+            if weight > 0.0 {
+                (sum / weight) as f32
+            } else if i == 0 {
+                1.0
+            } else {
+                0.0
+            }
+        });
+        vec3f(c[0], c[1], c[2])
+    });
+    let mut look = SunDiscLook { dir, radius, softness, limb, rows: [Vec3f::all(1.0); DISC_ROWS], rows_from: bottom, rows_to: top };
+    look.rows = std::array::from_fn(|j| {
+        let el = bottom + (top - bottom) * j as f32 / (DISC_ROWS - 1) as f32;
+        let c = medium.rgb(&through(el as f64));
+        // (kept above 0 so the rows' logarithm is finite; a row the ground hides is black to the eye)
+        vec3f(c.x.max(1.0e-30), c.y.max(1.0e-30), c.z.max(1.0e-30))
+    });
+    // The disc's light as it is seen, made the key's.
+    let seen = look.light_over(true);
+    let scale = |want: f32, got: f32| if got > 0.0 && (want / got).is_finite() { (want / got).max(0.0) } else { 0.0 };
+    let scale = vec3f(scale(irradiance.x, seen.x), scale(irradiance.y, seen.y), scale(irradiance.z, seen.z));
+    look.rows = look.rows.map(|row| {
+        let c = row * scale;
+        vec3f(c.x.max(1.0e-30), c.y.max(1.0e-30), c.z.max(1.0e-30))
+    });
+    look
 }
 
-/// Local copy (as in sky.rs), so no glob can make the name ambiguous.
-fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
-    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
+use crate::patterns::smooth as smoothstep;
 
 #[cfg(test)]
 mod tests {
@@ -1161,10 +2187,13 @@ mod tests {
         }
         assert!(brightest < 1.0e-3, "brightest direction at -18 deg: {brightest}");
         // Civil twilight still glows: the multiple-scattering term keeps the
-        // zenith from going black as soon as the ground is in shadow.
+        // zenith from going black as soon as the ground is in shadow, at the
+        // measured level (Koomen et al. 1952, JOSA 42, 353: 0.06 cd/ft2 at the
+        // zenith with the sun 6 deg down, 9.7e-5 in the sky's units of 6690 cd/m2).
         let civil = atmo_at(-6.0, 270.0);
         let zenith = luminance(civil.sky(vec3f(0.0, 1.0, 0.0)));
-        assert!(zenith > 1.0e-4, "civil twilight zenith {zenith}");
+        let measured = 0.06 * 10.764 / 6690.0;
+        assert!(zenith > 0.5 * measured && zenith < 2.0 * measured, "civil twilight zenith {zenith} vs {measured}");
         assert!(zenith > 10.0 * brightest, "-6 deg {zenith} vs -18 deg {brightest}");
     }
 
@@ -1400,10 +2429,11 @@ mod env_tests {
         let sun_dir = dir_from_az_el(200.0, 30.0);
         let day = Env::new(&sky_params(30.0, 200.0));
         let key = day.sun().expect("the sun is up, so it is the key");
-        assert!((key.dir - sun_dir).length() < 1.0e-5, "{:?}", key.dir);
+        // The key comes from where the sun is seen (the refraction lifts it 1.7' at 30 deg).
+        let atmo = Atmosphere::new(sun_dir, &AtmosphereParams::default(), &SunDiscParams::default());
+        assert!((key.dir - atmo.disc_dir()).length() < 1.0e-5, "{:?}", key.dir);
         // Radiance over the cone is the sun's irradiance at the ground (1 %:
         // cos_radius is an f32 this close to 1).
-        let atmo = Atmosphere::new(sun_dir, &AtmosphereParams::default(), &SunDiscParams::default());
         let cone = 2.0 * std::f32::consts::PI * (1.0 - key.cos_radius);
         let ratio = luminance(key.radiance * cone) / luminance(atmo.sun_irradiance());
         assert!((ratio - 1.0).abs() < 0.01, "cone irradiance ratio {ratio}");
@@ -1436,8 +2466,10 @@ mod env_tests {
         assert!(key.cos_cover < key.cos_radius, "a soft limb reaches past the nominal disc");
         // And that really is where the disc ends: lit inside the cone, black outside it.
         let outer_deg = atmo.sun_outer_radius().to_degrees();
-        let inside = dir_from_az_el(az, el + 0.9 * outer_deg);
-        let outside = dir_from_az_el(az, el + 1.1 * outer_deg);
+        // (off the disc's centre as it is seen, the key's own direction)
+        let seen = key.dir.y.asin().to_degrees();
+        let inside = dir_from_az_el(az, seen + 0.9 * outer_deg);
+        let outside = dir_from_az_el(az, seen + 1.1 * outer_deg);
         assert!(inside.dot(key.dir) > key.cos_cover && luminance(atmo.sun_disc(inside)) > 0.0);
         assert!(outside.dot(key.dir) < key.cos_cover && luminance(atmo.sun_disc(outside)) == 0.0);
         // A hard-edged disc is its own covering cone.
@@ -1457,7 +2489,8 @@ mod env_tests {
         let b = Env::new(&turned);
         let want = rotate_y(a.sun_dir().unwrap(), 40.0);
         assert!((b.sun_dir().unwrap() - want).length() < 1.0e-5);
-        assert!((b.sun().unwrap().dir - want).length() < 1.0e-5);
+        // (the key from where the sun is seen, turned the same way)
+        assert!((b.sun().unwrap().dir - rotate_y(a.sun().unwrap().dir, 40.0)).length() < 1.0e-5);
         // The cones and the facing share are about the key's own centre: the yaw leaves them.
         let (ka, kb) = (a.sun().unwrap(), b.sun().unwrap());
         assert_eq!((kb.cos_radius, kb.facing, kb.cos_cover), (ka.cos_radius, ka.facing, ka.cos_cover));

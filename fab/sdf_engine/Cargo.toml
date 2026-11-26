@@ -6,6 +6,26 @@ license = "MIT"
 publish = false
 description = "Field evaluation and GPU slicing with a bit-exact CPU twin"
 
+# Run by the mac bucket on a Mac: these targets run their kernels on the native GPU, which the
+# Linux buckets reach through Vulkan only. Metal's compiler once took a constant remainder of a
+# word's high half wrong, and only a Mac failed them (the lib and regions_ref run on the CPU).
+[package.metadata.makepad.macos-tests]
+"test:chain" = "chaining on Metal against an f64 mirror"
+"test:feature_field" = "the feature field's steps on Metal against their f64 mirror, at every job size"
+"test:gpu_rig" = "the gpu_jobs runtime's scan and counted outputs on Metal against the CPU"
+"test:grid_parity" = "a gridded kernel's evaluation on Metal against its CPU twin"
+"test:list_rank_gpu" = "list ranking on Metal against a host reference"
+"test:mesh_queries" = "mesh queries evaluated on Metal against the mesh twin"
+"test:plane_trace" = "plane tracing on Metal against the CPU twin, bit for bit"
+"test:regions_compose" = "the compose round on Metal against the f64 stand-in"
+"test:regions_concentric" = "concentric regions on Metal against the raster"
+"test:regions_label" = "packed class labels on Metal against CPU parity"
+"test:regions_overhang" = "overhang labels on Metal against the f64 reference"
+"test:rings" = "rings on Metal: outline, base and wall levels"
+"test:texture_parity" = "a textured kernel's evaluation on Metal against its CPU twin"
+"test:thin_walls" = "the thin stage on Metal: thin rings moved and turned"
+"test:wall_pieces" = "wall pieces on Metal against the f64 field mirror"
+
 [dependencies]
 makepad-draw = { path = "../../../../draw", version = "2.0.0" }
 makepad-csg-math = { path = "../../../../libs/csg/csg_math" }

@@ -1,0 +1,56 @@
+# The Stage player: a finished film (an edit's Motion plates over its song)
+# played smoothly and scrubbably, natively and in the browser (wasm). It
+# links the runtimes a film needs (Motion, its drawing, Scene3D, the render
+# graph and kits) and none of Stage's editor, store, AI or media servers.
+# A film is a bundle directory served over HTTP (or read from disk
+# natively): `manifest.json` names the plates, the song and every file.
+[package]
+name = "makepad-story-player"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "makepad-story-player"
+path = "src/main.rs"
+
+[features]
+default = ["scene3d"]
+# Scene3D, Seq3D and Text3D layers (motion3d).
+scene3d = ["makepad-motion/scene3d", "makepad-motion-draw/scene3d"]
+# One film built in: the film builder's pack (`MAKEPAD_FILM_PACK` names it)
+# embedded in the binary, read without copies; the song streams beside the
+# page.
+film = []
+
+[dependencies]
+makepad-asset-data = { path = "../../../../apps/engine/asset/data" }
+makepad-asset-client = { path = "../../../../apps/engine/asset/client" }
+makepad-widgets = { path = "../../../../../widgets", default-features = false }
+makepad-motion = { path = "../../../../apps/engine/motion", default-features = false }
+# The document font table (families, files, where they are).
+makepad-doc-fonts = { path = "../../../../apps/engine/fonts" }
+makepad-motion-draw = { path = "../../../../apps/engine/motion_draw", default-features = false }
+# Scene3D kernels compile ahead of the frame that shows them.
+makepad-stage-motion3d = { path = "../../../../apps/engine/motion3d", default-features = false }
+# Effects and KineticText through the packs a host installs (none here).
+makepad-content-packs = { path = "../../../../apps/engine/content_packs" }
+# Kernels generated as wasm and linked into this module's table (wasm32).
+makepad-script-compute = { path = "../../../../../platform/script/compute", features = ["vm"] }
+# Audio programs generated as wasm and linked the same way (wasm32).
+makepad-script-audio-aot = { path = "../../../../../platform/script/audio_aot" }
+makepad-strict-json = { path = "../../../../../libs/strict_json" }
+# `--analyse` writes the collect manifest (what the web export reads).
+makepad-web-manifest = { path = "../../../../../libs/web_manifest" }
+# The film builder's pack (`--features film`) and what its analysis
+# (`--analyse`, native) records.
+makepad-story-film-pack = { path = "../../libs/film_pack" }
+makepad-text-mesh = { path = "../../../../../libs/text_mesh" }
+# The song: decoded by Stage's own decoder and played on Stage's audio
+# engine (a deck in a small audio flow), the same on every target.
+makepad-audio-decode = { path = "../../../../../libs/audio_decode" }
+makepad-stage-audio-media = { path = "../../../../apps/engine/audio_media" }
+makepad-stage-live-audio = { path = "../../../../apps/stage/libs/live_audio" }
+# The film's edit, mixed by Stage's own mix (`edit_audio`).
+makepad-story-cut = { path = "../../libs/cut" }

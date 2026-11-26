@@ -1471,7 +1471,7 @@ path_draw!(DrawFabIssueSpot);
 path_draw!(DrawFabHead);
 path_draw!(DrawFabHeadAux);
 
-/// The preview's palette texture (one per viewport, rebuilt per preview).
+/// The preview's palette texture (one per viewport, keyed by preview and colour mode).
 #[derive(Default)]
 pub struct PrintPalette {
     texture: Option<Texture>,
@@ -1487,8 +1487,26 @@ pub struct PrintPalette {
     unmarked: Option<Texture>,
     /// The part offsets row as uploaded (`PrintPreview::part_offsets`).
     offsets: Option<(Texture, Arc<[[f32; 2]]>)>,
-    built: u64,
+    built: Option<(u64, fab_plate::ColourMode)>,
     drawn: Option<u64>,
+}
+
+impl super::FabViewport {
+    /// Repaint the retained print pass even when its playhead, plate and camera stand still.
+    pub fn set_print_colours(&mut self, cx: &mut Cx, mode: fab_plate::ColourMode) {
+        if let Some(frame) = self.print_frame.as_mut().filter(|f| f.colours != mode) {
+            let start = std::time::Instant::now();
+            frame.colours = mode;
+            self.print_palette.sync(cx, frame);
+            // The retained aux draw samples this texture. Repaint its pass and start a
+            // fresh still average; its bead instances and draw lists are already recorded.
+            cx.repaint_pass(self.aux_pass.draw_pass_id());
+            self.still_aa.reset();
+            self.area.redraw(cx);
+            log!("fab print colours: preview {} {} slots in {:.3} ms", frame.preview.id,
+                frame.preview.colours.shown(mode).len(), start.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
 }
 
 impl PrintPalette {
@@ -1502,13 +1520,17 @@ impl PrintPalette {
 
     fn sync(&mut self, cx: &mut Cx, frame: &PrintFrame) -> &Texture {
         let preview = &frame.preview;
-        if self.texture.is_none() || self.built != preview.id {
-            self.built = preview.id;
-            let data = frame.palette();
-            self.texture = Some(Texture::new_with_format(
-                cx,
-                TextureFormat::VecRGBAf32 { width: palette::WIDTH, height: 1, data: Some(data), updated: TextureUpdated::Full },
-            ));
+        let key = (preview.id, frame.colours);
+        if self.built != Some(key) {
+            self.built = Some(key);
+            let row = TextureFormat::VecRGBAf32 {
+                width: palette::WIDTH, height: 1, data: Some(frame.palette()), updated: TextureUpdated::Full,
+            };
+            if let Some(texture) = &self.texture {
+                *texture.get_format(cx) = row;
+            } else {
+                self.texture = Some(Texture::new_with_format(cx, row));
+            }
         }
         self.texture.as_ref().unwrap()
     }
@@ -1605,6 +1627,7 @@ pub enum Faded {
 
 /// What the viewport draws of the print this frame.
 pub struct PrintFrame {
+    pub colours: fab_plate::ColourMode,
     pub preview: Arc<PrintPreview>,
     /// The beads started by the playhead ([`PrintPreview::cut_at`]).
     pub cut: RunCut,
@@ -1652,6 +1675,24 @@ pub fn outline_at<'a>(state: &'a AppState, frame: Option<&PrintFrame>) -> Option
     state.print.contours().filter(|l| l.contours.layer(layer).next().is_some()).map(|l| (l, layer))
 }
 
+/// The reported-time lookups shared by a camera's picture key and its frame.
+pub(crate) struct CameraMoment {
+    pub time: f64,
+    pub cut: RunCut,
+    pub layers: [f32; 4],
+    nozzles: [[f32; 3]; 2],
+    active: usize,
+    pub visible_head: Option<usize>,
+}
+
+impl CameraMoment {
+    pub fn at(preview: &PrintPreview, time: f64) -> Self {
+        let now = preview.timeline.now(time);
+        Self { time, cut: preview.cut_at(time), layers: PrintFrame::layer_uniform(preview, 0, u32::MAX, time, 0.0),
+            nozzles: now.nozzles, active: now.active, visible_head: (time > 0.0 && time < preview.total).then_some(now.active) }
+    }
+}
+
 impl PrintFrame {
     /// `u_layers`: the lowest and highest layer shown, 1 + the layer that leads (0: none), and
     /// the highest layer drawn whole at playhead `t`: below the lowest one still printing then
@@ -1685,9 +1726,43 @@ impl PrintFrame {
         [layers[0], layers[1]]
     }
 
-    /// Shared by the desktop and XR textures: the job's materials in their trays' colours.
+    /// Shared by the desktop and XR textures: the job slots in the active colour mode.
     pub fn palette(&self) -> Vec<f32> {
-        self.preview.palette()
+        self.preview.palette(self.colours)
+    }
+
+    /// The deposited surface of a committed job at the printer's reported time.
+    pub fn camera(preview: Arc<PrintPreview>, t: f64, colours: fab_plate::ColourMode, previous: Option<PrintFrame>) -> Option<PrintFrame> {
+        let moment = CameraMoment::at(&preview, t);
+        Self::camera_at(preview, &moment, colours, previous)
+    }
+
+    pub(crate) fn camera_at(preview: Arc<PrintPreview>, moment: &CameraMoment, colours: fab_plate::ColourMode, previous: Option<PrintFrame>) -> Option<PrintFrame> {
+        debug_assert!(preview.chunks.is_empty(), "a committed camera preview has only timed beads");
+        if preview.beads.count() == 0 {
+            return None;
+        }
+        let (mut heads, mut parts, mut closed) = previous.map(|f| (f.heads, f.parts, f.closed)).unwrap_or_default();
+        let cut = moment.cut.clone();
+        let tip = moment.nozzles[moment.active.min(1)];
+        heads.clear();
+        if let Some(active) = moment.visible_head {
+            heads.extend((0..2).map(|i| Head { tip: moment.nozzles[i], nozzle: i, active: i == active }));
+        }
+        parts.clear();
+        let t = moment.time;
+        let layers = moment.layers;
+        Self::closed_parts(&preview, layers, false, &mut closed);
+        let uniforms = [
+            (live_id!(u_now), [t as f32, tip[0], tip[1], tip[2]]),
+            (live_id!(u_layers), layers),
+            (live_id!(u_mode), [SURFACE_MODE, preview.speed_range[0], preview.speed_range[1], layers[1]]),
+            (live_id!(u_live), [1e9, 0.0, 0.0, 0.0]),
+        ];
+        Some(PrintFrame {
+            colours, preview, cut, travel_count: 0, uniforms, heads, show_markers: false, hovered_marker: None,
+            compare_planar: false, show_supports: true, faded: Faded::None, parts, lit: None, closed,
+        })
     }
 
     /// Reuse the previous frame's head and part buffers.
@@ -1738,6 +1813,7 @@ impl PrintFrame {
         // The job's beads answer to the job, not to the plate's parts.
         if job { parts.clear(); } else { part_states(state, &preview.part_objects, &mut parts); }
         Some(PrintFrame {
+            colours: state.view.colours,
             preview, cut: started, travel_count, uniforms, heads,
             // An old preview must not expose issue indices from a new report.
             show_markers: !job && !state.print.hide_markers && !state.print.stale,
@@ -2263,17 +2339,62 @@ pub fn draw_print_placed(
     palette: &mut PrintPalette,
     place: PrintPlacement,
     light: &TileLight,
-    (path, far, tiers): (&mut DrawFabStrip, &mut DrawFabFar, &mut FarTiers),
+    paths: (&mut DrawFabStrip, &mut DrawFabFar, &mut FarTiers),
     head: &mut DrawFabHead,
 ) -> u32 {
-    let tex = palette.textures(cx.cx, frame);
     let eyes = cx.cx.xr_pass_eyes().map(|(eyes, eye_px)| (eyes.map(|(view, projection)| BeadView::placed(&view, &projection, place)), FarSight::of(&eyes, eye_px, place)));
-    let ranges = eyes.map(|(views, sight)| tiers.ranges(frame, &views, sight, true));
+    let eyes = eyes.as_ref().map(|(views, sight)| (views.as_slice(), *sight));
+    draw_print_forward(cx, frame, palette, place, light, paths, head, eyes, true, &[])
+}
+
+/// One display-mapped eye on a BGRA8 target. The caller sets the pass to this view and
+/// projection. With identity placement the forward shaders take printer mm (x, y, z) to
+/// Y-up metres (x, z, -y) * 0.001. Culling and tiers use that same eye and the target's pixels.
+pub fn draw_print_eye(
+    cx: &mut Cx3d,
+    frame: &PrintFrame,
+    palette: &mut PrintPalette,
+    (view, projection, pixels): (&Mat4f, &Mat4f, DVec2),
+    light: &TileLight,
+    paths: (&mut DrawFabStrip, &mut DrawFabFar, &mut FarTiers),
+    head: &mut DrawFabHead,
+) -> u32 {
+    let fab_view = Mat4f::mul(view, &super::render_from_fab());
+    let views = [BeadView::new(&fab_view, projection)];
+    let sight = FarSight::new(&fab_view, projection, pixels);
+    let light = TileLight { display: true, ..*light };
+    // Buried interior is visible only through gaps. The camera repaints often, so its far tier
+    // draws just the surface.
+    let omit_far = &[BeadStream::Core, BeadStream::Lining];
+    draw_print_forward(cx, frame, palette, PrintPlacement::IDENTITY, &light, paths, head, Some((&views, sight)), false, omit_far)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_print_forward(
+    cx: &mut Cx3d,
+    frame: &PrintFrame,
+    palette: &mut PrintPalette,
+    place: PrintPlacement,
+    light: &TileLight,
+    (path, far, tiers): (&mut DrawFabStrip, &mut DrawFabFar, &mut FarTiers),
+    head: &mut DrawFabHead,
+    eyes: Option<(&[BeadView], FarSight)>,
+    headset: bool,
+    omit_far: &[BeadStream],
+) -> u32 {
+    let tex = palette.textures(cx.cx, frame);
+    let ranges = eyes.map(|(views, sight)| {
+        let [near, mut far] = tiers.ranges(frame, views, sight, headset);
+        for &stream in omit_far {
+            far[stream as usize].clear();
+        }
+        [near, far]
+    });
     let mut calls = draw_beads(cx, frame, &tex, true, place, light, ranges.as_ref().map(|r| &r[0]), &mut path.draw_vars);
     if let Some(far_ranges) = ranges.as_ref().map(|r| &r[1]).filter(|r| r.iter().any(|s| !s.is_empty())) {
         calls += draw_beads(cx, frame, &tex, true, place, light, Some(far_ranges), &mut far.draw_vars);
     }
-    calls += draw_extras(cx, frame, eyes.as_ref().map(|(views, _)| &views[..]), &mut path.draw_vars);
+    calls += draw_extras(cx, frame, eyes.map(|(views, _)| views), &mut path.draw_vars);
     if !frame.heads.is_empty() {
         bind(&mut head.draw_vars, cx.cx, frame, &tex, true, true, place, light);
         draw_heads!(head, cx.cx, frame);
@@ -2354,6 +2475,60 @@ mod tests {
     use super::*;
     use crate::api::PlatePart;
     use crate::print::{apply, PrintAction};
+
+    #[test]
+    fn camera_shows_the_deposited_surface_at_the_printer_clock() {
+        use crate::print::{follow::tests::preview_of, PrintNow, PrintTimeline};
+        use fab_plate::ColourMode;
+
+        struct MovingHeads;
+        impl PrintTimeline for MovingHeads {
+            fn now(&self, t: f64) -> PrintNow {
+                PrintNow { nozzles: [[0.0, 1.0, 2.0], [t as f32, 3.0, 4.0]], active: 1, ..Default::default() }
+            }
+        }
+
+        assert!(PrintFrame::camera(preview_of(0), 0.0, ColourMode::Model, None).is_none(), "an empty preview has no camera frame");
+        let mut pv = preview_of(2);
+        Arc::get_mut(&mut pv).unwrap().timeline = Arc::new(MovingHeads);
+        let at = |t, previous| PrintFrame::camera(pv.clone(), t, ColourMode::Material, previous).unwrap();
+        let start = at(0.0, None);
+        assert_eq!(start.cut.count(), 0, "no bead has started before the printer routines");
+        assert!(start.heads.is_empty(), "the heads are hidden at time zero");
+
+        let t = 15.0;
+        let frame = at(t, Some(start));
+        let now = pv.timeline.now(t);
+        assert_eq!(frame.cut, pv.cut_at(t), "the bead prefix follows the reported time");
+        assert_eq!(frame.heads.len(), 2, "both heads are present mid-print");
+        for (i, head) in frame.heads.iter().enumerate() {
+            assert_eq!(head.nozzle, i, "head {i} carries its nozzle index");
+            assert_eq!(head.tip, now.nozzles[i], "head {i} is at its reported-time tip");
+            assert_eq!(head.active, i == now.active, "head {i} has the timeline's active state");
+        }
+        let uniform = |id| frame.uniforms.iter().find(|(name, _)| *name == id).unwrap().1;
+        let [x, y, z] = now.nozzles[now.active];
+        assert_eq!(uniform(live_id!(u_now)), [t as f32, x, y, z], "the partial bead ends at the active tip at the same time");
+        assert_eq!(uniform(live_id!(u_mode))[0], SURFACE_MODE, "the camera shades deposited surfaces");
+        assert_eq!(frame.layer_range(), [0.0, pv.max_layer() as f32], "the full layer range is eligible");
+        assert_eq!(frame.layers()[2], 0.0, "no layer is highlighted");
+        assert_eq!(uniform(live_id!(u_live))[1], 0.0, "the camera has no Monitor look-ahead");
+        assert!(frame.show_supports, "deposited supports are visible");
+        assert!(!frame.show_markers && frame.hovered_marker.is_none(), "issue markers are hidden");
+        assert_eq!(frame.travel_count, 0, "travel is hidden");
+        assert_eq!(frame.faded, Faded::None, "the deposited surface is unfaded");
+        assert!(frame.parts.is_empty() && frame.lit.is_none(), "editor selections are absent");
+        assert!(!frame.compare_planar, "the camera shows the printed geometry");
+        assert_eq!(frame.colours, ColourMode::Material, "the camera uses the requested global colour mode");
+
+        let mut previous = Some(frame);
+        for end in [pv.total, pv.total + 1.0] {
+            let done = at(end, previous);
+            assert_eq!(done.cut, RunCut::all(&pv.beads), "all beads are deposited at {end}");
+            assert!(done.heads.is_empty(), "no heads remain at {end}");
+            previous = Some(done);
+        }
+    }
 
     #[test]
     fn bead_aux_ids_keep_codes_and_lit_marker_distinct() {

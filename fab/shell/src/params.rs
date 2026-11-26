@@ -226,8 +226,16 @@ pub struct ParamView {
     pub kind: ParamKind,
     pub unit: String,
     pub value: ParamValue,
+    /// The expression the field follows, as written in its script.
+    pub formula: Option<String>,
+    /// The row can store a formula that reads declared parameters.
+    pub links: bool,
+    /// How far a drag reaches; where nothing was declared it scales the drag and limits nothing.
     pub min: f64,
     pub max: f64,
+    /// The bounds a value is held to (declared by the script or the builder); a side with none
+    /// takes any value.
+    pub limits: [Option<f64>; 2],
     pub step: f64,
     pub choices: Vec<String>,
     pub declared: bool,
@@ -237,7 +245,7 @@ pub struct ParamView {
     /// The objects it shapes (a small one's box is a faint hint on hover).
     pub objects: Vec<String>,
     pub handle: Option<ParamHandle>,
-    /// The literal's bytes in the program.
+    /// The value's bytes in the program.
     pub site: Option<std::ops::Range<usize>>,
     /// The print setting a region's row writes (`m.settings`): one not written (an empty
     /// `site`) shows the part's own value.
@@ -356,6 +364,24 @@ pub struct ParamState {
     /// A part's mass and balance while the panel's row for it is open or the AI read it: the
     /// panel's figures and the view's centre-of-mass marker, never shown otherwise.
     pub mass: Option<MassShown>,
+    /// A command's value at a pick (Round, Chamfer) while it lasts: its part's handles give way to
+    /// its handle.
+    pub command: Option<CommandView>,
+}
+
+/// A command's one number at a pick (Round, Chamfer): dragged at a handle there or typed in its
+/// box, shown as a parameter of the part it is on while the command lasts. Its key
+/// (`<instance>/@round`) is no site of the script: the app writes each value through the
+/// command's own change.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommandView {
+    /// The printed object it is on (`instance/object`).
+    pub object: String,
+    pub param: ParamView,
+    /// What the value does, in words by the handle.
+    pub says: String,
+    /// Moves when a command starts: its box opens once.
+    pub rev: u64,
 }
 
 /// The centre-of-mass marker the view shows: the AI's read, or the panel's while its Mass and
@@ -538,6 +564,14 @@ impl ParamState {
         self.parts.get(index)
     }
 
+    /// Part `pp`'s parameter `key`, or the command's when it is on that part.
+    pub fn param_of<'a>(&'a self, pp: &'a PartParamsView, key: &str) -> Option<&'a ParamView> {
+        match &self.command {
+            Some(c) if c.param.key == key && c.object == pp.object => Some(&c.param),
+            _ => pp.param(key),
+        }
+    }
+
     /// A value is being edited, from its press or first keystroke until its rebuild is in.
     pub fn is_editing(&self) -> bool {
         self.input_active || self.dragging.is_some() || !self.pending.is_empty() || self.rebuilding.is_some()
@@ -615,8 +649,12 @@ pub enum ParamAction {
     /// The edit: one undo step.
     /// A refused commit flashes the control at the held value without committing it.
     Commit { object: String, key: String, value: ParamValue },
+    /// A typed formula and its pending value in the row's units.
+    Link { object: String, key: String, code: String, value: f64 },
     /// A drag was cancelled: back to the committed plate.
     Cancel { object: String },
+    /// The command at a pick ends (Esc): its handle goes, its value as committed.
+    EndCommand,
     /// A feature of part `object` (`feature`, its `instance/solid`) moved, turned or scaled by
     /// the view's gizmo, from where the drag began: its placement in its script, shown live like
     /// a value while `done` is false, one undo step when let go.
@@ -784,6 +822,51 @@ pub fn clamp_value(p: &ParamView, x: f64) -> f64 {
     } else {
         x
     }
+}
+
+/// A value as the parameter takes it from a typed number or a box: a count whole, held to its
+/// declared limits only. A drag's reach (`min`, `max`) limits a drag, never a typed number.
+pub fn within_limits(p: &ParamView, x: f64) -> f64 {
+    let x = if matches!(p.kind, ParamKind::Count | ParamKind::Seed) { x.round() } else { x };
+    let [lo, hi] = p.limits;
+    x.max(lo.unwrap_or(f64::NEG_INFINITY)).min(hi.unwrap_or(f64::INFINITY))
+}
+
+/// The formula sent with an editor's Ended action when its row accepts links.
+pub(crate) fn typed_formula(p: &ParamView, actions: &makepad_widgets_core::Actions, uid: makepad_widgets_core::WidgetUid) -> Option<(f64, String)> {
+    use makepad_widgets_core::{ValueInputAction, WidgetActionsApi};
+    if !p.links { return None; }
+    actions.filter_widget_actions_cast::<ValueInputAction>(uid).filter_map(|action| match action {
+        ValueInputAction::Formula { value, script } => Some((value, script)),
+        _ => None,
+    }).last()
+}
+
+/// `p`'s `min` and `max` are only a drag's reach: its box takes a typed value past them.
+pub fn reach_only(p: &ParamView) -> bool {
+    p.max > p.min && p.limits != [Some(p.min), Some(p.max)]
+}
+
+/// The names a part's value boxes read: its declared parameters, as its script holds them
+/// (metres, radians, a fraction), so `wall * 2` typed in a box means what it means in the script.
+pub fn named_values(pp: &PartParamsView) -> Arc<[makepad_script::syntax::quantity::NamedValue]> {
+    use makepad_script::syntax::quantity::{Measure, NamedValue};
+    pp.params
+        .iter()
+        .filter(|p| p.declared)
+        .filter_map(|p| {
+            let x = p.value.num()?;
+            let name = p.key.rsplit('/').next().unwrap_or(&p.key).to_string();
+            let (value, measure) = match p.kind {
+                ParamKind::Length | ParamKind::Radius | ParamKind::Diameter => (x / 1000.0, Measure::Length),
+                ParamKind::Angle => (x.to_radians(), Measure::Angle),
+                ParamKind::Ratio => (x, Measure::Fraction),
+                ParamKind::Count | ParamKind::Number | ParamKind::Seed => (x, Measure::Plain),
+                _ => return None,
+            };
+            Some(NamedValue { name, label: p.label.clone(), value, measure })
+        })
+        .collect()
 }
 
 /// The snap points a value passes between `a` and `b` (for haptic ticks).

@@ -14,7 +14,7 @@ use fab_model::params::{self, PValue, PartParams};
 use fab_model::program::{Compiled, Script, ScriptEnv};
 use fab_model::project::write_atomic;
 use fab_model::{project, script_file, ApplyError, Change, Edit, FabModel, Head, HistoryAction, PlaceArg};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use fab_plate::machine::{nozzle_word, Machine};
 use fab_plate::{stl, threemf};
 use fab_elec_design::action::{self, ActionDef, FieldKind, Risk as ActionRisk};
@@ -27,17 +27,25 @@ use std::sync::{Arc, Mutex};
 pub mod annotate;
 mod autosave;
 pub mod camera;
+pub mod checks;
 pub mod compare;
 pub mod edits;
 pub mod img2mesh;
 pub mod import;
 pub use import::NewPart;
+pub mod fit;
 pub mod inspect;
+pub mod interference;
 pub mod layer_overhangs;
 pub mod mass;
 pub mod mech;
 pub mod out;
 pub mod picks;
+pub mod hole;
+mod hoist;
+pub mod pull;
+pub mod shell;
+pub mod round;
 pub mod overrides;
 pub mod plates;
 pub mod printable;
@@ -98,12 +106,12 @@ pub fn manifest() -> ServiceManifest {
     let board_required: Vec<_> = board.fields.iter().filter(|field| field.required).map(|field| field.name).collect();
     const SCRIPT_PROP: &str = r#""script":{"type":"string","description":"The object script's file (name.cad.splash); default: the project's only script."}"#;
     let apply_props = format!(
-        r#"{REQ_PROP},{HEAD_PROP},{SCRIPT_PROP},"edits":{{"type":"string","description":"Splash statements, each one edit of the script: set(site, value) (a site as fab.params keys it, instance/ optional: a param, part.field, a literal vector whole or one element part.field.i), field(part, name, value), unset(part, name), replace(part, code) (or a top-level let of a plain value: replace(width, param(30mm, min: 20mm, max: 40mm)) makes it a slider), operand(part, cutter), remove(part), rename(part, new_name), unobject(part); any other statement (let lid = m.box({{...}}), object(lid)) is added to the script. All or nothing."}},"dry_run":{{"type":"boolean","description":"Build the edits and report what they would do without committing them."}}"#
+        r#"{REQ_PROP},{HEAD_PROP},{SCRIPT_PROP},"edits":{{"type":"string","description":"Splash statements, each one edit of the script: set(site, value) (a site as fab.params keys it, instance/ optional: a param, part.field, a literal vector whole or one element part.field.i), field(part, name, value), unset(part, name), replace(part, code) (or a top-level let of a plain value: replace(width, param(30mm, min: 20mm, max: 40mm)) makes it a slider), operand(part, cutter), remove(part), rename(part, new_name), rollback(part, to: step) to end the part at that step and keep its name, after(part) followed by let part = code(part, ..) (the code becomes part, right after part's statement, so the part keeps its name, placement and settings; what part was is renamed by its kind, part_union, and the code and later part.face names read that: a fillet or chamfer on a body), otherwise after(name) puts added statements in order after that name's let or fn until the next before or after, unobject(part); any other statement (let lid = m.box({{...}}), object(lid)) is added to the script. All or nothing."}},"dry_run":{{"type":"boolean","description":"Build the edits and report what they would do without committing them."}}"#
     );
     let program_props = format!(r#"{REQ_PROP},{HEAD_PROP},{SCRIPT_PROP},"source":{{"type":"string","description":"The whole object script, Splash (use mod.model.*, use mod.fab.*, let m = mod.model first; object(part) for each object it puts on the plate). A new file is placed on the plate."}}"#);
     let fill_props = format!(r#"{REQ_PROP},{HEAD_PROP},{SCRIPT_PROP},"region":{{"type":"string","description":"Splash: a feature's name (holes), the object's name, or a region solid (m.box({{size: [20mm 20mm 20mm] at: [0 30mm 0]}})). Leave it out with seed for a smooth-region flood."}},"seed":{{"type":"array","items":{{"type":"number"}},"description":"A smooth-region flood instead of a region: a point on the part's surface [x y z] in mm, model frame (fab.measure / fab.inspect give surfaces). The fill spreads over the surface from it while neighbouring normals stay within angle, so it stops at creases and edges; it is recomputed on the current shape after edits."}},"angle":{{"type":"number","description":"The flood's maximum angle between neighbouring normals, degrees (default 30)."}},"albedo":{{"type":"array","items":{{"type":"number"}},"description":"The design colour [r g b], 0..1 linear."}},"color":{{"type":"string","description":"The project print colour it prints as (color(\"Blue\")); default: a colour of its own named after the albedo."}},"dry_run":{{"type":"boolean"}}"#);
     let place_props = format!(
-        r#"{REQ_PROP},{HEAD_PROP},"edits":{{"type":"string","description":"Project statements: place(\"instance\", object: \"name\", link: 2, at: [x y], rotate:, scale:, drop:, name:, color: \"Blue\", paint: [[#rrggbb \"Yellow\"]], print:, show:, settings:) sets just the arguments it gives (object: default the instance's only one); settings({{key: value}}) sets the plate's global print settings (nil: back to the profile); color(\"Blue\", rgb: #x2060d0, at: [[\"H2D\" @left \"A2\"]]) defines a print colour and the tray it prints from; a place's settings: is that object's whole set of overrides; params(\"instance\", {{name: value}}) sets the base and all its linked clones' parameter values (nil: the script's); script(\"file.cad.splash\", name: \"other\") places a script again; remove(\"instance~2\") removes a linked placement; measure(points: [[x y z] ...], kind: @distance, name: \"Gap A\") adds a ruler; rename(color: \"Colour 2\", to: \"Eyes\") renames a print colour and all that names it (placements, paint pairs, the scripts' Material{{name}}s), refused when the name is taken. All or nothing."}},"dry_run":{{"type":"boolean"}}"#
+        r#"{REQ_PROP},{HEAD_PROP},"edits":{{"type":"string","description":"Project statements: place(\"instance\", object: \"name\", link: 2, at: [x y], rotate:, scale:, drop:, name:, color: \"Blue\", paint: [[#rrggbb \"Yellow\"]], print:, show:, settings:) sets just the arguments it gives (object: default the instance's only one). Use at for the script origin, center for the footprint centre, or corner for its minimum bed X/Y, e.g. center: [200mm 160mm]. Each writes the origin to at. Use at: @free to return that object to the shelf pack. arrange(gap: 5mm) spaces free parts by their as-built slots through shape edits (before placement turns and scales), and arrange() restores the default. settings({{key: value}}) sets the plate's global print settings (nil: back to the profile); color(\"Blue\", rgb: #x2060d0, at: [[\"H2D\" @left \"A2\"]]) defines a print colour and the tray it prints from; a place's settings: is that object's whole set of overrides; params(\"instance\", {{name: value}}) sets the base and all its linked clones' parameter values (nil: the script's); script(\"file.cad.splash\", name: \"other\") places a script again; remove(\"instance~2\") removes a linked placement; measure(points: [[x y z] ...], kind: @distance, name: \"Gap A\") adds a ruler; rename(color: \"Colour 2\", to: \"Eyes\") renames a print colour and all that names it (placements, paint pairs, the scripts' Material{{name}}s), refused when the name is taken. All or nothing."}},"dry_run":{{"type":"boolean"}}"#
     );
     let manifest = ServiceManifest::new(SERVICE, "Fab", BRIEF)
         .with_tool(ToolDef::new("guide", "The CAD guide: units and frames, the three engines and when to use which, the API by example, error patterns, and a list of sections to ask for by name (project, params, edit, field, workflow, print, find, supports, force, joints, weave, printability, printer, and `vocabulary <group>` for every builder of a group). Read it before the first fab.apply.", schema(r#""section":{"type":"string","description":"A section's name; left out: the core."}"#, &[]), Risk::Read))
@@ -122,7 +130,7 @@ pub fn manifest() -> ServiceManifest {
         ))
         .with_tool(ToolDef::new(
             "colors",
-            "Each placed part's colours: index, sRGB hex, the print colour it prints as and its tool. Colour 0 is the part's own print colour.",
+            "Each placed part's colours: index, sRGB hex (as the live Model or Material colour mode shows it), the print colour it prints as and its tool. Colour 0 is the part's own print colour.",
             schema("", &[]),
             Risk::Read,
         ))
@@ -134,7 +142,7 @@ pub fn manifest() -> ServiceManifest {
         ))
         .with_tool(ToolDef::new(
             "check",
-            "Check printability of the current plate, or of the test prints while the Slicer slices them. Returns severity counts and up to 40 problems with printer-mm locations and fix hints. With slice=true, use the app's current print setup for thin_wall, cantilever, bridge, mid_air, uncovered_overhang, support_blocked, support_unreached, support_inside, support_locked, support_unremovable, support_low_hold, support_rule, empty_layer and flow checks and estimates.",
+            "Check printability of the current plate, or of the test prints while the Slicer slices them. Leads with check: @pass or @fail (an error) and not_checked: what it left out and why (unsliced: the sliced checks). Returns severity counts and up to 40 problems with printer-mm locations and fix hints. With slice=true, use the app's current print setup for thin_wall, cantilever, bridge, mid_air, uncovered_overhang, support_blocked, support_unreached, support_inside, support_locked, support_unremovable, support_low_hold, support_rule, empty_layer and flow checks and estimates.",
             schema(r#""slice":{"type":"boolean","description":"Include sliced analysis using the current Print editor setup (default false)."}"#, &[]),
             Risk::Read,
         ))
@@ -155,6 +163,12 @@ pub fn manifest() -> ServiceManifest {
             "The slice's state: Sliced (the shown slice is current), Slicing with its fraction and stage, Failed with the error, Waiting (the Slice view is open and the slice is not there yet) or Off (nothing asks for a slice: the Slice view, Monitor, Print and Export each slice when they need one). `whole` is true once the slice has every layer, no live tiles left in it: a live slice shows its tiles as they come first. `on_screen` is true once the view's last drawn frame shows this state (it follows within a frame).",
             schema(r#""drawn":{"type":"boolean","description":"Also tell what frames drew of the last revisions: each one's frames, how many of its tiles were on screen before its whole slice, and how many tiles (default false). With revision it tells that revision's tiles instead, a page at a time from from; left says how many are left."},"revision":{"type":"integer","minimum":0,"description":"With drawn, tell this revision's tiles: part, layer, revision and whole ms after the edit."},"from":{"type":"integer","minimum":0,"description":"Start at this tile of the revision (default 0)."}"#, &[]),
             Risk::Read,
+        ))
+        .with_tool(ToolDef::new(
+            "colour_mode",
+            "Read the plate viewport’s colour mode and its explanation. Supply a mode to select it for the app.",
+            schema(r#""mode":{"type":"string","enum":["model","material"]}"#, &[]),
+            Risk::Act,
         ))
         .with_tool(ToolDef::new(
             "force",
@@ -200,7 +214,7 @@ pub fn manifest() -> ServiceManifest {
         ))
         .with_tool(ToolDef::new(
             "apply",
-            "Edit an object script with Splash statements (see the edits property). Its instances rebuild and the view updates; edits that do not build commit nothing and name the file, line, column and solid. Returns the new head, what changed per part and the plate summary. dry_run builds without committing.",
+            "Edit an object script with Splash statements (see the edits property). Its instances rebuild and the view updates; edits that do not build commit nothing and name the file, line, column and solid. Returns the new head, then `built` (the plate's part and joint counts; each object it changed with its size, and each body it added or changed with its engine, size and volume, model frame: hold it against what was asked first; `expects`: the person's numbers, m.expect), `expects_changed` when the batch changed one (say so), what changed per part and the plate summary. A batch that makes one of the person's m.expect numbers fail is refused at its line. dry_run builds without committing (and reports such a failure).",
             schema(&apply_props, &["request_id", "expected", "edits"]),
             Risk::Act,
         ))
@@ -254,14 +268,14 @@ pub fn manifest() -> ServiceManifest {
         ))
         .with_tool(ToolDef::new(
             "measure",
-            "Saved rulers: action add takes points ([x,y,z] mm in plate coordinates), optional kind (default distance) and name; set takes index and optional points/name (null clears name); remove takes index. Mutations require request_id and expected and are undoable; inspect lists rulers. Without action, measure in the model frame: what=size (bounds and volume of solids), clearance (the smallest gap between solids a and b, or overlap), distance (between points or solids a and b), wall (thickness at the surface point nearest 'at' on 'object', optionally along 'dir'), angle (between the faces at points a and b of 'object'), edge (the feature edge nearest 'at' on 'object': length, and radius and centre when it is circular), faces (the faces at points a and b of 'object': their distance when parallel, else the angle), thread_fit (a threaded rod on solid a and a threaded hole on solid b: radial clearance against what this printer needs, and a verdict), mass (each printed solid, or 'object': its grams as the job prints it from the filament's density, walls, shells and infill, its centre of mass, its inertia about that centre, and whether it stands on its base as modelled, Y up, with the tilt that tips it and which way; 'outline': true adds the base's outline; the person sees the centre of mass marked in the view as you read it). Points are [x, y, z] mm.",
-            schema(&format!(r#"{REQ_PROP},{HEAD_PROP},"action":{{"type":"string","enum":["add","set","remove"]}},"index":{{"type":"integer","minimum":0}},"points":{{"type":"array","items":{{"type":"array","items":{{"type":"number"}},"minItems":3,"maxItems":3}}}},"kind":{{"type":"string"}},"name":{{"type":["string","null"]}},"dry_run":{{"type":"boolean"}},"what":{{"type":"string","enum":["size","clearance","distance","wall","angle","edge","faces","thread_fit","mass"]}},"outline":{{"type":"boolean"}},"object":{{"type":"string"}},"a":{{}},"b":{{}},"at":{{"type":"array","items":{{"type":"number"}}}},"dir":{{"type":"array","items":{{"type":"number"}}}}"#), &[]),
+            "Saved rulers: action add takes points ([x,y,z] mm in plate coordinates), optional kind (default distance) and name; set takes index and optional points/name (null clears name); remove takes index. Mutations require request_id and expected and are undoable; inspect lists rulers. Without action, measure in the model frame: what=size (bounds and volume of solids), clearance (the smallest gap between solids a and b, or overlap), distance (between points or solids a and b), wall (thickness at the surface point nearest 'at' on 'object', optionally along 'dir'), angle (between the faces at points a and b of 'object'), edge (the feature edge nearest 'at' on 'object': length, and radius and centre when it is circular), faces (the faces at points a and b of 'object': their distance when parallel, else the angle), thread_fit (a threaded rod on solid a and a threaded hole on solid b: radial clearance against what this printer needs, a check that passes when it fits, and a verdict), mass (each printed solid, or 'object': its grams as the job prints it from the filament's density, walls, shells and infill, its centre of mass, its inertia about that centre, and whether it stands on its base as modelled, Y up, with the tilt that tips it and which way; 'outline': true adds the base's outline; the person sees the centre of mass marked in the view as you read it). Use fit (a_at on a's seating face, b_at on b's mating face, optional turn in degrees about a's normal) to report b's fitted pose, overlap, side gaps and whether the faces meet. Points are [x, y, z] mm.",
+            schema(&format!(r#"{REQ_PROP},{HEAD_PROP},"action":{{"type":"string","enum":["add","set","remove"]}},"index":{{"type":"integer","minimum":0}},"points":{{"type":"array","items":{{"type":"array","items":{{"type":"number"}},"minItems":3,"maxItems":3}}}},"kind":{{"type":"string"}},"name":{{"type":["string","null"]}},"dry_run":{{"type":"boolean"}},"what":{{"type":"string","enum":["size","clearance","distance","wall","angle","edge","faces","fit","thread_fit","mass"]}},"outline":{{"type":"boolean"}},"object":{{"type":"string"}},"a":{{}},"b":{{}},"a_at":{{"type":"array","items":{{"type":"number"}},"minItems":3,"maxItems":3}},"b_at":{{"type":"array","items":{{"type":"number"}},"minItems":3,"maxItems":3}},"turn":{{"type":"number"}},"at":{{"type":"array","items":{{"type":"number"}}}},"dir":{{"type":"array","items":{{"type":"number"}}}}"#), &[]),
             Risk::Act,
         ))
         .with_tool(ToolDef::new(
             "lay_flat",
             "Lay a whole part flat using the UI's Lay flat move, then drop it onto the bed, in one undo step. Give exactly one of normal (the face's outward plate normal) or point (on its surface in plate mm); fab.surface and fab.pick return plate and plate_normal. Usually used to put print strength along the layers. Returns the plate with rotate in degrees about X, then Y, then Z, as fab.inspect does. dry_run previews without committing.",
-            schema(&format!(r#"{REQ_PROP},{HEAD_PROP},"object":{{"type":"string","description":"The part's instance/object id from fab.tree or fab.inspect."}},"normal":{{"type":"array","items":{{"type":"number"}},"minItems":3,"maxItems":3}},"point":{{"type":"array","items":{{"type":"number"}},"minItems":3,"maxItems":3}},"dry_run":{{"type":"boolean"}}"#), &["request_id", "expected", "object"]),
+            schema(&format!(r#"{REQ_PROP},{HEAD_PROP},"object":{{"type":"string","description":"A printed part: its solid id (instance/solid) or its name from object(.., name:)."}},"normal":{{"type":"array","items":{{"type":"number"}},"minItems":3,"maxItems":3}},"point":{{"type":"array","items":{{"type":"number"}},"minItems":3,"maxItems":3}},"dry_run":{{"type":"boolean"}}"#), &["request_id", "expected", "object"]),
             Risk::Act,
         ))
         .with_tool(ToolDef::new(
@@ -272,14 +286,20 @@ pub fn manifest() -> ServiceManifest {
         ))
         .with_tool(ToolDef::new(
             "check_mesh",
-            "Check printed solids' meshes (default: all): closed and manifold, separate shells and specks (boolean slivers), sliver triangles, the thinnest wall, thin features under two line widths and weak necks (a cross-section far smaller than above and below), with model-frame locations and fixes.",
+            "Check printed solids' meshes (default: all), leading with check: @pass or @fail (an error finding): closed and manifold, separate shells and specks (boolean slivers), sliver triangles, the thinnest wall, thin features under two line widths and weak necks (a cross-section far smaller than above and below), with model-frame locations and fixes.",
             schema(r#""object":{"type":"string"}"#, &[]),
             Risk::Read,
         ))
         .with_tool(ToolDef::new(
             "joints",
-            "Check every joint (m.hinge, m.ball, m.slider, m.bearing, m.chain) as printed in place: the clearance it was built with, the smallest gap between its parts and where, the in-layer gap, the area printed over the other part by empty layers (one layer or less fuses), the fused-joint risk, the limits where the parts touch, whether a ball is held, and one-line fixes. ok: every joint is free to move.",
+            "Check every joint (m.hinge, m.ball, m.slider, m.bearing, m.chain) as printed in place: the clearance it was built with, the smallest gap between its parts and where, the in-layer gap, the area printed over the other part by empty layers (one layer or less fuses), the fused-joint risk, the limits where the parts touch, whether a ball is held, and one-line fixes. check: @pass when every joint is free to move, @fail when one is not, @not_checked (with why) when no object has joints.",
             schema("", &[]),
+            Risk::Read,
+        ))
+        .with_tool(ToolDef::new(
+            interference::TOOL,
+            "Whether a jointed object's parts collide anywhere in their travel: every pair of its parts at rest, then with each joint at each end of its travel (its limits, else where fab.joints finds its parts touch; a free turn at quarter turns), the others at rest. Each overlap: the two parts, depth (mm), at (where they overlap deepest, model frame with the pose applied) and pose (\"rest\", \"lid at 90°\"). A joint's own two parts, a part and what it is bonded to are left out (skipped, with why): fab.joints checks a joint's own parts. Leads with check: @pass, @fail on any overlap, @not_checked (with why) when nothing moves. Run it after an edit to an object with joints.",
+            schema(r#""object":{"type":"string","description":"The jointed object (its instance); default: every one."}"#, &[]),
             Risk::Read,
         ))
         .with_tool(ToolDef::new(
@@ -290,7 +310,7 @@ pub fn manifest() -> ServiceManifest {
         ))
         .with_tool(ToolDef::new(
             "weave",
-            "Check every chain and chainmail (m.links, m.mail, m.drape) as printed in place from its links' exact geometry: link and interlock counts, whether it is one piece (no loose links), the smallest gap between links in a layer and across layers (one empty layer fuses) and where, the longest bridge and the leg angle, painted links, and one-line fixes. ok: every link prints free and interlocked. as_printed: true also slices the plate and checks the real beads (no bead reaches another link, nothing bridges two links).",
+            "Check every chain and chainmail (m.links, m.mail, m.drape) as printed in place from its links' exact geometry: link and interlock counts, whether it is one piece (no loose links), the smallest gap between links in a layer and across layers (one empty layer fuses) and where, the longest bridge and the leg angle, painted links, and one-line fixes. check: @pass when every link prints free and interlocked (@not_checked without a weave; not_checked lists the sliced beads unless as_printed). as_printed: true also slices the plate and checks the real beads (no bead reaches another link, nothing bridges two links).",
             schema(r#""as_printed":{"type":"boolean"}"#, &[]),
             Risk::Read,
         ))
@@ -302,9 +322,33 @@ pub fn manifest() -> ServiceManifest {
         ))
         .with_tool(ToolDef::new(
             picks::TOOL,
-            "The person's picks in the 3D view: what they pointed at (Edit shape mode), each also a chip on their chat line; set them to show what you mean (the view lights them up). Without arguments: the picks now, each with `write` (the binding to change, for a crease the statement joining the two edits, file:line and the value sites as fab.params keys them, for fab.apply), `what` (builder, size, the side pointed at, a crease's op, blend radius and angle, the wall there) and where (point and normal, model mm of `object`). Kinds: edit (the binding whose surface wins there), crease (where two edits meet: change the joining statement's blend radius, or blend a hard union/subtract), edges (an edit's own edges: its rounding rounds them all), spot (a point: a new edit goes `at:` it), feature (on a mesh part the smallest solid round the point; on an exact part the step its face comes from), body (the whole printed object); on an exact (m.brep) part face, edge (where two faces meet) and chain (an edge and those continuing it tangent), each with `select`, what a script writes for it (`b.top`, `m.edge(b.top, b.front)`, for fillet edges: and shell open:). `set` replaces the picks, `add` adds: a list of picks, each a solid's name (\"knob\"), two names for a crease ([\"body\" \"knob\"]), {solid at kind} (at: a model point, snapped onto the surface; kind defaults to spot), {solid select} (an exact part's face or edge as fab.exact writes it), or {camera x y} at the top level as fab.pick takes a render's pixel. `remove`: a pick's id. `clear`: true. A pick follows its names through edits; one whose solid is gone drops, and the next read says so.",
-            schema(r#""set":{"description":"Picks replacing the ones there: a list of a name, [name name] (a crease) or {solid at kind}."},"add":{"description":"Picks added, as set takes them."},"remove":{"description":"A pick's id (p3), or a list."},"clear":{"type":"boolean"},"camera":{"type":"object","description":"With x, y: pick what a pixel of a fab.render view shows."},"x":{"type":"number"},"y":{"type":"number"},"kind":{"type":"string","enum":["any","edit","crease","edges","spot","feature","body","face","edge","chain"],"description":"With camera: what to pick there (default any: on an exact part the edge near it, else the face; on a field part a crease near where two edits meet, an edit's edges near its own edge, else the edit)."}"#, &[]),
+            "The person's picks in the 3D view: what they pointed at (Edit shape mode), each also a chip on their chat line; set them to show what you mean (the view lights up whole-part picks). Without arguments: the picks now, each with `write` (the binding to change, for a crease the statement joining the two edits, file:line and the value sites as fab.params keys them, for fab.apply), `what` (builder, size, the side pointed at, a crease's op, blend radius and angle, the wall there) and where (point and normal, model mm of `on`, or `object` for a whole-part pick). Kinds: edit (the binding whose surface wins there), crease (where two edits meet: change the joining statement's blend radius, or blend a hard union/subtract), edges (an edit's own edges: its rounding rounds them all), spot (a point: a new edit goes `at:` it), feature (on a mesh part the smallest solid round the point; on an exact part the step its face comes from), body (the whole printed object); on an exact (m.brep) part face, edge (where two faces meet) and chain (an edge and those continuing it tangent), each with `select`, what a script writes for it (`b.top`, `m.edge(b.top, b.front)`, for fillet edges: and shell open:). `set` replaces the picks, `add` adds: a list of picks, each a solid's name (\"knob\"), two names for a crease ([\"body\" \"knob\"]), {solid at kind} (at: a model point, snapped onto the surface; kind defaults to spot), {solid select} (an exact part's face or edge as fab.exact writes it), or {camera x y} at the top level as fab.pick takes a render's pixel. Inside a named or model-point pick, `on` names an exact step of the part (eased or instance/eased) whose faces and edges you can pick there, including a face a later step removes. `remove`: a pick's id. `clear`: true. A pick follows its names through edits; one whose solid is gone drops, and the next read says so.",
+            schema(r#""set":{"description":"Picks replacing the ones there: a list of a name, [name name] (a crease) or {solid at kind} or {solid select}, optionally with on (a step name or instance/solid)."},"add":{"description":"Picks added, as set takes them."},"remove":{"description":"A pick's id (p3), or a list."},"clear":{"type":"boolean"},"camera":{"type":"object","description":"With x, y: pick what a pixel of a fab.render view shows."},"x":{"type":"number"},"y":{"type":"number"},"kind":{"type":"string","enum":["any","edit","crease","edges","spot","feature","body","face","edge","chain"],"description":"With camera: what to pick there (default any: on an exact part the edge near it, else the face; on a field part a crease near where two edits meet, an edit's edges near its own edge, else the edit)."}"#, &[]),
             Risk::Read,
+        ))
+        .with_tool(ToolDef::new(
+            round::TOOL,
+            "Round (or chamfer) what the person picked, as their Round and Chamfer commands do, by one number. An exact (m.brep) part's picked edges and chains (one part, one step): the step they were picked on (the picks' `on`; the part's body when none is named) becomes its fillet, `let body = m.brep.fillet(body_union, r, {edges: ..})` right after what it was, now named by its kind (body_union), so the step keeps its name and the later steps build on the fillet (chamfer: m.brep.chamfer, the size). A crease on a part drawn from its field: the joining statement's blend radius (a hard union or subtract becomes m.blend or m.carve). An edit's own edges on a field part: a box's radius, which rounds all its edges. Without radius: what it would write and the value now (nothing changes). With radius (mm): committed, one undo step. Once a round is written, change its value with fab.apply set(<step>.radius, v) (<step>.size for a chamfer) rather than rounding again.",
+            schema(r#""picks":{"description":"A pick's id (p3), or a list; default all the picks."},"radius":{"description":"The radius in mm (a number or \"2mm\"); a chamfer's size. Leave it out to see the plan."},"chamfer":{"type":"boolean","description":"Bevel the exact edges instead of rounding them."}"#, &[]),
+            Risk::Act,
+        ))
+        .with_tool(ToolDef::new(
+            pull::TOOL,
+            "Pull (press-pull) the face the person picked along its normal, as their Pull command does, by `by` mm (out; in below 0). It writes the values that make the face, each moved as far: a box's size on that axis and its centre `at` by half, so the opposite face stays (`at` written where there was none); a cylinder's height and centre (top, bottom) or radius (wall, with a cone's top_radius); a sphere's radius; an extrude's height (twice the travel when pulled both ways). A number is set where it is, a declared param as that param; a value worked out from others is refused, naming it. A flat face no written value moves (an extrude's side, a chamfer's face, a face a boolean cut) gets a pull step of its own: the step it was picked on (the pick's `on`; the part's body when none is named) becomes `m.brep.pull(body, {face: .. by: ..})`, keeping its name, and pulled again that step's by moves; a result that is no closed solid is refused; a curved face no value moves (a fillet's) is refused. Without by: what it would write and its range (nothing changes). With by: committed, one undo step.",
+            schema(r#""picks":{"description":"A pick's id (p3), or a list; the face picked last is pulled; default all the picks."},"by":{"description":"How far the face moves in mm (a number or \"2mm\"); in below 0. Leave it out to see the plan."}"#, &[]),
+            Risk::Act,
+        ))
+        .with_tool(ToolDef::new(
+            hole::TOOL,
+            "Drill a hole where the person picked a flat face of an exact part (the spot they pointed at, else the face's own point), as their Hole command does: the step it was picked on (the pick's `on`; the part's body when none is named) becomes `m.brep.hole(body, {on: <face> at: [x y z] diameter: d})`, keeping its name; it starts on the face wherever the face goes, and runs through the part unless `depth` is given. Counterbores and countersinks: fab.apply on that statement (kind, bore_diameter, sink_diameter). Without diameter: what it would write (nothing changes). With diameter: committed, one undo step.",
+            schema(r#""picks":{"description":"A pick's id (p3), or a list; the face picked last is drilled; default all the picks."},"diameter":{"description":"Across, in mm (a number or \"3.4mm\"). Leave it out to see the plan."},"depth":{"description":"How deep in mm; leave it out for a hole through."}"#, &[]),
+            Risk::Act,
+        ))
+        .with_tool(ToolDef::new(
+            shell::TOOL,
+            "Hollow the exact part the person picked faces of, open at those faces, as their Shell command does: the step they were picked on (the picks' `on`; the part's body when none is named) becomes `m.brep.shell(body, thickness, {open: [faces]})`, keeping its name; a step that is a shell already has its wall set. Without thickness: what it would write (nothing changes). With thickness: committed, one undo step.",
+            schema(r#""picks":{"description":"A pick's id (p3), or a list; their faces are left open; default all the picks."},"thickness":{"description":"The wall in mm (a number or \"2mm\"). Leave it out to see the plan."}"#, &[]),
+            Risk::Act,
         ))
         .with_tool(ToolDef::new(
             "annotations",
@@ -318,7 +362,7 @@ pub fn manifest() -> ServiceManifest {
             schema(r#""solid":{"type":"string","description":"A solid from fab.tree: head, or doll/head."},"near":{"type":"array","description":"A model point [x y z] in mm, or a list of them.","items":{}}"#, &["solid", "near"]),
             Risk::Read,
         ))
-        .with_tool(ToolDef::new("tree", "The part tree: every solid's id (instance/binding), builder, line, what it is made of and the object it prints in; `features`: the named features of the printed objects with their kinds and boxes (model mm), to match what a person calls them; then the tunable parameters per part.", schema("", &[]), Risk::Read))
+        .with_tool(ToolDef::new("tree", "The part tree: every solid's id (instance/binding), builder, line, what it is made of and the object it prints in; `features`: the named features of the printed objects with their kinds and boxes (model mm), to match what a person calls them; then the tunable parameters per part. `steps` lists each plate part's build history in the person's words.", schema("", &[]), Risk::Read))
         .with_tool(ToolDef::new(
             "history",
             "Undo or redo one batch.",
@@ -327,8 +371,8 @@ pub fn manifest() -> ServiceManifest {
         ))
         .with_tool(ToolDef::new(
             "render",
-            "Render the plate as image sheets for you to look at. Without arguments: eight views (four perspective volume views, front/side/near-top/underside). 'views' picks up to 8 by name (front, back, left, right, top, bottom, iso, iso_back, iso_left, iso_right, low, underside, or \"yaw,pitch\" degrees), 'object' shows one or more printed solids only. 'focus' frames every view on a region: a box [[x y z] [x y z]] or a ball {at: [x y z] radius: r} in plate mm; a solid's name (\"doll/head\", or head) frames that solid wherever its object sits; {mark: 2} frames the person's mark; {object: \"doll/head\" at: [x y z] radius: r} or {object: .. box: [[..] [..]]} is in that solid's model frame. 'distance' (mm, 1 to 5000, camera to the middle of what it frames) and 'fov' (degrees, 5 to 120; default 42) set the camera; by default it fits what it frames. 'ortho': true draws every view in parallel projection at one scale, with a scale bar and a mm grid (the label gives a view's width in mm). 'colours': \"spools\" shows the loaded trays' colours, not the design's. The picture budget goes to the views asked: one view comes back about 1000 px square, two or four 500, eight 370; each sheet's label says its views' size. The answer's 'cameras' maps a view's pixel to a ray. Field parts are traced from their fields, so a close-up shows the true surface. 'supports': true draws the planned supports. 'test_print': a piece. Example, a head close-up: {object: \"doll/figure\" views: [\"35,-15\"] focus: {at: [150 160 95] radius: 25} fov: 30}.",
-            schema(r#""views":{"type":"array","items":{"type":"string"}},"object":{},"test_print":{"description":"A test print's name, or a list: its piece alone, cut and closed, where it is on the model. While the Slicer slices test prints, a render with none of object, volume, spot and tubes shows those pieces on the bed, 'supports' too."},"on_bed":{"type":"boolean","description":"With test_print: where the pieces print."},"with_plate":{"type":"boolean","description":"With test_print: the whole plate, the piece's surface tinted."},"volume":{"description":"A print settings volume's name, or a list: the part's surface inside it comes out tinted."},"spot":{"description":"A row of the last fab.weak_spots, or a list: the part's surface there comes out tinted."},"tubes":{"type":"boolean","description":"The last fab.tubes list drawn on the part: each tube green lying flat to red standing, its axis past its ends, a ring in the layers' plane across it, and its name and angle written on the picture."},"focus":{"description":"What every view frames: [[x y z] [x y z]] or {at: [x y z], radius: mm} in plate mm; a solid's name (\"doll/head\"); or {object: solid, at: [x y z], radius: mm} / {object: solid, box: [[..] [..]]} in that solid's model frame."},"distance":{"type":"number","description":"mm from the camera to the middle of what it frames (1 to 5000); default: what fits."},"fov":{"type":"number","description":"Field of view, degrees (5 to 120); default 42."},"ortho":{"type":"boolean","description":"Parallel projection at one scale for every view, with a scale bar and a mm grid; default false."},"colours":{"type":"string","enum":["design","spools"],"description":"design (default): the model's own colours and paint; spools: the colours of the trays its print colours map to."},"supports":{"type":"boolean"},"marks":{"type":"boolean","description":"Draw the person's marks in the views (default true while there are marks); focus {mark: N} frames mark N."}"#, &[]),
+            "Render the plate as image sheets for you to look at. Without arguments: eight views (four perspective volume views, front/side/near-top/underside). 'views' picks up to 8 by name (front, back, left, right, top, bottom, iso, iso_back, iso_left, iso_right, low, underside, or \"yaw,pitch\" degrees), 'object' shows one or more printed solids only. With one object, 'step' shows it as built at that step of its fab.tree history. 'focus' frames every view on a region: a box [[x y z] [x y z]] or a ball {at: [x y z] radius: r} in plate mm; a solid's name (\"doll/head\", or head) frames that solid wherever its object sits; {mark: 2} frames the person's mark; {object: \"doll/head\" at: [x y z] radius: r} or {object: .. box: [[..] [..]]} is in that solid's model frame. 'distance' (mm, 1 to 5000, camera to the middle of what it frames) and 'fov' (degrees, 5 to 120; default 42) set the camera; by default it fits what it frames. 'ortho': true draws every view in parallel projection at one scale, with a scale bar and a mm grid (the label gives a view's width in mm). 'colours' selects model or material colours for this render. Omit it to use the live viewport mode. The picture budget goes to the views asked: one view comes back about 1000 px square, two or four 500, eight 370; each sheet's label says its views' size. The answer's 'cameras' maps a view's pixel to a ray. Field parts are traced from their fields, so a close-up shows the true surface. 'supports': true draws the planned supports. 'test_print': a piece. Example, a head close-up: {object: \"doll/figure\" views: [\"35,-15\"] focus: {at: [150 160 95] radius: 25} fov: 30}.",
+            schema(r#""views":{"type":"array","items":{"type":"string"}},"object":{"description":"A printed part: its solid id (instance/solid) or its name from object(.., name:). Accepts a list of parts."},"step":{"type":"string","description":"A step id from fab.tree for the one object to render."},"test_print":{"description":"A test print's name, or a list: its piece alone, cut and closed, where it is on the model. While the Slicer slices test prints, a render with none of object, volume, spot and tubes shows those pieces on the bed, 'supports' too."},"on_bed":{"type":"boolean","description":"With test_print: where the pieces print."},"with_plate":{"type":"boolean","description":"With test_print: the whole plate, the piece's surface tinted."},"volume":{"description":"A print settings volume's name, or a list: the part's surface inside it comes out tinted."},"spot":{"description":"A row of the last fab.weak_spots, or a list: the part's surface there comes out tinted."},"tubes":{"type":"boolean","description":"The last fab.tubes list drawn on the part: each tube green lying flat to red standing, its axis past its ends, a ring in the layers' plane across it, and its name and angle written on the picture."},"focus":{"description":"What every view frames: [[x y z] [x y z]] or {at: [x y z], radius: mm} in plate mm; a solid's name (\"doll/head\"); or {object: solid, at: [x y z], radius: mm} / {object: solid, box: [[..] [..]]} in that solid's model frame."},"distance":{"type":"number","description":"mm from the camera to the middle of what it frames (1 to 5000); default: what fits."},"fov":{"type":"number","description":"Field of view, degrees (5 to 120); default 42."},"ortho":{"type":"boolean","description":"Parallel projection at one scale for every view, with a scale bar and a mm grid; default false."},"colours":{"type":"string","enum":["model","material"],"description":"Use model or mapped spool colours for this render. Defaults to the live viewport mode."},"supports":{"type":"boolean"},"marks":{"type":"boolean","description":"Draw the person's marks in the views (default true while there are marks); focus {mark: N} frames mark N."}"#, &[]),
             Risk::Read,
         ))
         .with_tool(ToolDef::new(
@@ -340,7 +384,7 @@ pub fn manifest() -> ServiceManifest {
         .with_tool(ToolDef::new(
             tubes::TUBES_TOOL,
             "A print breaks along its layers: a tube standing up is at its weakest, lying flat at its strongest. The part's tube-like limbs, named or not, read from its layers, worst to break first: name (a feature, or 'limb near [x y z]'), axis, length, thinnest_radius, angle_to_bed (0 flat, 90 standing), carries_mm3, what lying flat would gain by the filament's model (an estimate), and a capsule target fab.settings_volume takes. After fab.orient and its slice each row says angle_before too. fab.render {tubes: true} draws them.",
-            schema(r#""object":{"type":"string"},"max_thickness":{"type":"number","description":"How thick a limb can be and still be looked for, mm. Left out: 15% of the part's longest side, and on a part with no features 6% too."}"#, &[]),
+            schema(r#""object":{"type":"string","description":"A printed part: its solid id (instance/solid) or its name from object(.., name:)."},"max_thickness":{"type":"number","description":"How thick a limb can be and still be looked for, mm. Left out: 15% of the part's longest side, and on a part with no features 6% too."}"#, &[]),
             Risk::Read,
         ))
         .with_tool(ToolDef::new(
@@ -364,13 +408,13 @@ pub fn manifest() -> ServiceManifest {
         .with_tool(ToolDef::new(
             variants::TOOL,
             "Two to six versions of the model side by side from one camera, to choose between: each a batch of fab.apply edits (set(w, 30mm), field(...), ...) built as its dry_run builds it, nothing committed. Every variant is drawn from the same views ('views': up to 2, default front; variants across, views down) and camera ('focus', 'distance', 'fov', 'ortho' as fab.render takes them; it frames all the variants together, so a bigger one looks bigger). The answer has each variant's diff against the plate as it is and its ready fab.apply call: apply the one you pick. A variant whose edits do not build is told with why. 'compare': {picture, fit, ortho, fov, background, rect, islands, shadows} reads each variant against a reference picture as fab.compare does, from the first view (or the view 'fit': true searches for once, on the plate as it is), and ranks them best match first, each with its IoU and the bands that differ most. Example: {variants: [{name: \"narrow\" edits: \"set(head_r, 9mm)\"} {name: \"wide\" edits: \"set(head_r, 12mm)\"}] views: [\"front\" \"right\"] compare: {picture: \"front.png\"}}. Guide section: compare.",
-            schema(r#""variants":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"edits":{"type":"string","description":"fab.apply's Splash statements: this variant's edits of one script."},"script":{"type":"string","description":"The script the edits are of; default: the one their set() sites name, else the project's only one."}},"required":["name","edits"]},"minItems":2,"maxItems":6},"views":{"type":"array","items":{"type":"string"},"maxItems":2,"description":"fab.render view names or \"yaw,pitch\" degrees; default front."},"object":{},"focus":{"description":"As fab.render's; default: all the variants together."},"distance":{"type":"number"},"fov":{"type":"number"},"ortho":{"type":"boolean"},"compare":{"type":"object","description":"A reference picture each variant is read against, as fab.compare takes it: picture, fit, ortho, fov, background, rect, islands, shadows, holes.","properties":{"picture":{"type":"string"},"fit":{"type":"boolean"},"ortho":{"type":"boolean"},"fov":{"type":"number"},"background":{"type":"number"},"rect":{"type":"array","items":{"type":"number"}},"islands":{"type":"boolean"},"shadows":{"type":"boolean"},"holes":{"type":"boolean"}},"required":["picture"]}"#, &["variants"]),
+            schema(r#""variants":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"edits":{"type":"string","description":"fab.apply's Splash statements: this variant's edits of one script."},"script":{"type":"string","description":"The script the edits are of; default: the one their set() sites name, else the project's only one."}},"required":["name","edits"]},"minItems":2,"maxItems":6},"views":{"type":"array","items":{"type":"string"},"maxItems":2,"description":"fab.render view names or \"yaw,pitch\" degrees; default front."},"object":{"description":"A printed part: its solid id (instance/solid) or its name from object(.., name:). Accepts a list of parts. Default: the whole plate."},"focus":{"description":"As fab.render's; default: all the variants together."},"distance":{"type":"number"},"fov":{"type":"number"},"ortho":{"type":"boolean"},"compare":{"type":"object","description":"A reference picture each variant is read against, as fab.compare takes it: picture, fit, ortho, fov, background, rect, islands, shadows, holes.","properties":{"picture":{"type":"string"},"fit":{"type":"boolean"},"ortho":{"type":"boolean"},"fov":{"type":"number"},"background":{"type":"number"},"rect":{"type":"array","items":{"type":"number"}},"islands":{"type":"boolean"},"shadows":{"type":"boolean"},"holes":{"type":"boolean"}},"required":["picture"]}"#, &["variants"]),
             Risk::Read,
         ))
         .with_tool(ToolDef::new(
             compare::TOOL,
             "Compare the model with a reference picture (a drawing or photo of what you are modelling) seen as one of fab.render's views, in numbers. The picture's figure is the largest piece a flood fill from its border over the background colour and its soft shadow leaves, holes open (the notes say what was left out; check the figure picture). The model is scaled and moved onto the figure by height, vertical middle and centre of area across, then: silhouette IoU, 16 height bands (widths in the reference and the model and the model's middle less the reference's, as shares of the figure's height and in mm, most different first) and a sheet: the reference, the model shaded, and the overlay. 'rect' [x0 y0 x1 y1] in picture fractions cuts the picture first (a screenshot's card, or the head alone); 'solid' (a name or list) cuts the model to what the view shows of those solids, to match. 'align' lays the model on a band of the figure ({band: [0 0.3] solid: \"head\"}) or on points ({points: {crown: {picture: [u v] plate: [x y z]} chin: ..}}) instead of its whole height. 'points' {name: [u v]} answers each picture spot in plate mm. 'fit': true searches yaw and pitch for the picture's view (then compare at it). 'background' (0 to 441, default 40) is how far a colour may be from the background's; 'islands': true keeps every piece, 'shadows': false the shadow. 'ortho': true for a drawing; 'fov' (degrees) matches a photo's lens. Example: {picture: \"front.png\" view: \"front\" points: {eye: [0.41 0.22]}}. Guide section: compare.",
-            schema(r#""picture":{"type":"string","description":"The name of a picture the person sent in this chat (chat.pictures lists them), or a picture file's path (PNG, JPEG, WebP, GIF or BMP)."},"view":{"type":"string","description":"A fab.render view name or \"yaw,pitch\" in degrees: the view the picture is seen from."},"fit":{"type":"boolean","description":"Search for the view instead."},"object":{"description":"A printed object, or a list of them (default: the whole plate)."},"rect":{"type":"array","items":{"type":"number"},"description":"[x0 y0 x1 y1], fractions of the picture from its top left."},"points":{"type":"object","description":"{name: [u v]}, fractions of the picture from its top left."},"background":{"type":"number"},"islands":{"type":"boolean","description":"Keep every piece of the figure, not only its largest."},"solid":{"description":"A solid's name (fab.tree lists them) or a list: the model's silhouette is what the view shows of them."},"align":{"type":"object","description":"{band: [from to] solid: name(s)}: the reference figure's rows from..to of its height (from its top) against what the view shows of the solids; or {points: {name: {picture: [u v] plate: [x y z]} ...}}: two or more picture points (fractions) onto plate points (mm)."},"shadows":{"type":"boolean","description":"false: the background's soft shadow is figure (default true: it is background)."},"holes":{"type":"boolean","description":"false: background the figure encloses is figure (default true: it is seen through, background)."},"ortho":{"type":"boolean"},"fov":{"type":"number"}"#, &["picture"]),
+            schema(r#""picture":{"type":"string","description":"The name of a picture the person sent in this chat (chat.pictures lists them), or a picture file's path (PNG, JPEG, WebP, GIF or BMP)."},"view":{"type":"string","description":"A fab.render view name or \"yaw,pitch\" in degrees: the view the picture is seen from."},"fit":{"type":"boolean","description":"Search for the view instead."},"object":{"description":"A printed part: its solid id (instance/solid) or its name from object(.., name:). Accepts a list of parts. Default: the whole plate."},"rect":{"type":"array","items":{"type":"number"},"description":"[x0 y0 x1 y1], fractions of the picture from its top left."},"points":{"type":"object","description":"{name: [u v]}, fractions of the picture from its top left."},"background":{"type":"number"},"islands":{"type":"boolean","description":"Keep every piece of the figure, not only its largest."},"solid":{"description":"A solid's name (fab.tree lists them) or a list: the model's silhouette is what the view shows of them."},"align":{"type":"object","description":"{band: [from to] solid: name(s)}: the reference figure's rows from..to of its height (from its top) against what the view shows of the solids; or {points: {name: {picture: [u v] plate: [x y z]} ...}}: two or more picture points (fractions) onto plate points (mm)."},"shadows":{"type":"boolean","description":"false: the background's soft shadow is figure (default true: it is background)."},"holes":{"type":"boolean","description":"false: background the figure encloses is figure (default true: it is seen through, background)."},"ortho":{"type":"boolean"},"fov":{"type":"number"}"#, &["picture"]),
             Risk::Read,
         ))
         .with_tool(ToolDef::new(
@@ -456,13 +500,15 @@ pub fn manifest() -> ServiceManifest {
 /// `elec_read` reads the design the editors show and the live bench; `elec_run` drives the bench
 /// as its transport does (never the design, no undo step); `elec_edit` edits the design as a
 /// person does in an editor, one undo step a call; `elec_export` writes files outside the
-/// project once the person approves the call. The board read stays `fab.board`
+/// project once the person approves the call. `elec_external` writes entries to the person's
+/// library with per-entry approval. The board read stays `fab.board`
 /// (`fab_elec_mech::read`).
-pub const ELEC_TOOLS: [(&str, &[ActionRisk], Risk); 4] = [
+pub const ELEC_TOOLS: [(&str, &[ActionRisk], Risk); 5] = [
     ("elec_read", &[ActionRisk::Read], Risk::Read),
     ("elec_run", &[ActionRisk::Run], Risk::Act),
     ("elec_edit", &[ActionRisk::Edit, ActionRisk::Preview], Risk::Act),
     ("elec_export", &[ActionRisk::External], Risk::Request),
+    ("elec_external", &[ActionRisk::Library], Risk::Request),
 ];
 
 /// The electronics tool that changes a document's text as typing in its code pane does: one
@@ -526,11 +572,12 @@ pub fn elec_action_help(def: &ActionDef) -> String {
 /// registered `ActionDef` shows up in the tool its risk maps to, with no edit here. A tool with
 /// no registered action (outside the app, which registers them) is left out. O(catalog).
 fn with_elec_tools(mut manifest: ServiceManifest) -> ServiceManifest {
-    const INTRO: [(&str, &str); 4] = [
-        ("elec_read", "Read Fab Electronics: the design its editors show and the live bench. Read elec.design.read before an edit: the edit actions name parts by reference (R1) or path (mcu.boot_r). elec.check.list says what ERC and DRC find. After an edit, elec.sim.status with wait: <its seq> answers once the run has it, so a measurement after it reads the new circuit."),
+    const INTRO: [(&str, &str); 5] = [
+        ("elec_read", "Read Fab Electronics: the design its editors show and the live bench. Read elec.design.read before an edit: the edit actions name parts by reference (R1) or path (mcu.boot_r). elec.check.list says what ERC and DRC find. elec.net.length gives routed track lengths and pair or group differences against their tolerances. After an edit, elec.sim.status with wait: <its seq> answers once the run has it, so a measurement after it reads the new circuit."),
+        ("elec_external", "Propose a dated offline price library entry with its source URL. The person reviews this individual entry in the BOM tab before it is written."),
         ("elec_export", "Write Fab Electronics' fabrication files (Gerber, drill, BOM, placement, the zip) and check each one read back against the board. The person approves the call first, and can change its arguments."),
         ("elec_run", "Drive Fab Electronics' bench as its transport does: play, pause and rate. It never changes the design and makes no undo step."),
-        ("elec_edit", "Edit Fab Electronics as a person does in its editors: each call is one undo step, the edit shows where it lands, and a playing take re-renders with it. The answer's take says what the edit does to the run: state playing, held or none; effect retune, restart or none. An edit of the board, the circuit or the system answers once every check has run on it, and its checks say what it changed for them: the new findings, errors first, and how many are gone."),
+        ("elec_edit", "Edit Fab Electronics as a person does in its editors: each call is one undo step, the edit shows where it lands, and a playing take re-renders with it. The answer's take says what the edit does to the run: state playing, held or none; effect retune, restart or none. An edit of the board, the circuit or the system answers once every check has run on it, and its checks say what it changed for them: the new findings, errors first, and how many are gone. When the project has requirements, an edit answers once they are judged on it too, with requirements: met as elec.req.list gives it, changed (each row whose status the edit moved: name, was, now, value, bound, why) and waiting (rows whose value waits for its producer to run again, with why). An edit that changes the person's requirements also answers requirements_changed: say each line to the person."),
     ];
     for (tool, _, risk) in ELEC_TOOLS {
         let defs = elec_actions(tool);
@@ -554,7 +601,7 @@ fn with_elec_tools(mut manifest: ServiceManifest) -> ServiceManifest {
     if action::find("elec.doc.read").is_some() {
         manifest = manifest.with_tool(ToolDef::new(
             ELEC_TEXT_TOOL,
-            "Change the text of a Fab Electronics document as typing in its code pane does: one call is one undo step, and the change shows where it lands. Firmware (.fw.splash), circuit (.ckt.splash), block (.blocks.splash), bench (.bench.splash) and part (.part.splash) documents; many design changes in one call are one evaluation and one undo step. Read the document with elec.doc.read first and give its rev; a document that changed since is refused with its new rev. A firmware change is compiled first, as the running bench builds it: text that does not compile is not committed, and the error lists each diagnostic's line and col. When no bench run builds that firmware, the change is committed unchecked and the answer says compiled: false and why. Any other change is evaluated first: text that adds a mistake is not committed, and the error gives its doc, line and col; the answer says evaluated: true and made: the parts and nets it defines. A circuit, block or part change answers once every check has run on it, with checks: the new findings and how many are gone. The answer gives the new rev, each edit's first and last line, and take: what the change does to the run.",
+            "Change the text of a Fab Electronics document as typing in its code pane does: one call is one undo step, and the change shows where it lands. Firmware (.fw.splash), circuit (.ckt.splash), block (.blocks.splash), bench (.bench.splash) and part (.part.splash) documents; many design changes in one call are one evaluation and one undo step. Read the document with elec.doc.read first and give its rev; a document that changed since is refused with its new rev. A firmware change is compiled first, as the running bench builds it: text that does not compile is not committed, and the error lists each diagnostic's line and col. When no bench run builds that firmware, the change is committed unchecked and the answer says compiled: false and why. Any other change is evaluated first: text that adds a mistake is not committed, and the error gives its doc, line and col; the answer says evaluated: true and made: the parts and nets it defines. A circuit, block or part change answers once every check has run on it, with checks: the new findings and how many are gone. The answer gives the new rev, each edit's first and last line, and take: what the change does to the run. With requirements in the project it waits until they are judged on the change, with requirements as fab.elec_edit's answers give it; a change of a requirements document (.req.splash) also gives requirements_changed: say each line to the person.",
             schema(r#""doc":{"type":"string","description":"The document's name, as elec.doc.list gives it."},"rev":{"type":"integer","description":"The revision elec.doc.read gave for the text the edits were made against."},"edits":{"type":"array","description":"Replacements, applied together: each old is text found exactly once in that revision (add the text around it to make it so); edits may not overlap.","items":{"type":"object","properties":{"old":{"type":"string"},"new":{"type":"string"}},"required":["old","new"]}},"text":{"type":"string","description":"The document's whole new text, in place of edits."}"#, &["doc", "rev"]),
             Risk::Act,
         ));
@@ -605,7 +652,7 @@ pub enum RenderRequest {
     Tubes(Arc<tubes::TubesJob>),
     /// `fab.strength_plan`'s weak spots and what it says with them, off the model worker.
     StrengthPlan(Arc<strength_plan::PlanJob>),
-    /// Sheets of a plate of test prints' pieces ([`test_view::plate`]).
+    /// Sheets of a supplied plate, such as test print pieces or one part at a build step.
     Pieces(Arc<test_view::PiecesJob>),
     /// Slice the call's plate with the current app print setup.
     CheckSlice,
@@ -690,6 +737,10 @@ pub(crate) fn frame_scale(m: &[[f64; 4]; 3]) -> f64 {
 /// solid frames its box on the plate, and one with an `object` is in that solid's model frame:
 /// `locate` says where a solid is.
 fn camera_arg(args: &Value, locate: &dyn Fn(&str) -> Result<Located, String>, mark_box: &dyn Fn(u32) -> Result<([f64; 3], [f64; 3]), String>) -> Result<Camera, String> {
+    camera_in_colours(args, fab_plate::ColourMode::Model, locate, mark_box)
+}
+
+fn camera_in_colours(args: &Value, live_colours: fab_plate::ColourMode, locate: &dyn Fn(&str) -> Result<Located, String>, mark_box: &dyn Fn(u32) -> Result<([f64; 3], [f64; 3]), String>) -> Result<Camera, String> {
     let number = |v: &Value| match v {
         Value::F64(f) if f.is_finite() => Some(*f),
         Value::Int(i) => Some(*i as f64),
@@ -771,11 +822,19 @@ fn camera_arg(args: &Value, locate: &dyn Fn(&str) -> Result<Located, String>, ma
             }
         }
     }
-    let colours = match args.get("colours").map(|v| v.as_str()) {
-        None => Colours::Design,
-        Some(Some("design")) => Colours::Design,
-        Some(Some("spools")) => Colours::Spools,
-        Some(_) => return Err("'colours' is \"design\" (the model's own colours, the default) or \"spools\" (the loaded trays' colours)".into()),
+    let requested = match args.get("colours") {
+        None => live_colours,
+        // Older saved tool calls used these spellings.
+        Some(v) if v.as_str() == Some("spools") => fab_plate::ColourMode::Material,
+        Some(v) if v.as_str() == Some("design") => fab_plate::ColourMode::Model,
+        Some(v) => v.as_str().and_then(fab_plate::ColourMode::from_key).ok_or(match live_colours {
+            fab_plate::ColourMode::Model => "'colours' takes 'model' (the model's own colours, the default) or 'material' (the mapped spools)",
+            fab_plate::ColourMode::Material => "'colours' takes 'model' (the model's own colours) or 'material' (the mapped spools, the default)",
+        })?,
+    };
+    let colours = match requested {
+        fab_plate::ColourMode::Model => Colours::Design,
+        fab_plate::ColourMode::Material => Colours::Spools,
     };
     Ok(Camera { focus, distance, fov, ortho, colours })
 }
@@ -902,9 +961,60 @@ impl Default for Demos {
     }
 }
 
+/// The origin of a model edit, carried from the tool or app entry through its commits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Author {
+    Person,
+    Ai,
+    /// A remote tool acting outside the conversation.
+    Agent,
+}
+
+/// The session while an app or tool call holds it. Nested calls inherit its author.
+#[must_use]
+pub struct AuthoredSession<'a> {
+    session: &'a mut Session,
+    previous: Option<Author>,
+}
+
+impl std::ops::Deref for AuthoredSession<'_> {
+    type Target = Session;
+    fn deref(&self) -> &Session { self.session }
+}
+
+impl std::ops::DerefMut for AuthoredSession<'_> {
+    fn deref_mut(&mut self) -> &mut Session { self.session }
+}
+
+impl Drop for AuthoredSession<'_> {
+    fn drop(&mut self) { self.session.author = self.previous; }
+}
+
+/// Shared by the model worker and electronics host until a demo becomes a listed plate.
+/// Working ids are never reused across processes. Only the minting session produces
+/// records in its plate-less folder.
+/// Reserving the identity performs no I/O. Only creating the plate writes its list record.
+#[derive(Default, Debug)]
+pub struct WorkingId(std::sync::OnceLock<String>);
+
+impl WorkingId {
+    pub fn id(&self) -> &str {
+        self.0.get_or_init(|| {
+            static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+            let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            format!("working-{:x}-{:x}-{serial:x}", now.as_nanos(), std::process::id())
+        })
+    }
+}
+
+
 pub struct Session {
+    pub working_id: Arc<WorkingId>,
     pub model: FabModel,
     pub eval: Evaluator,
+    /// This session owns the build on the bed. The B-rep engine evicts its accepted builds' bodies last.
+    pub holds_bodies: bool,
     /// Where the project is saved, once it is.
     pub path: Option<PathBuf>,
     /// The folder for new projects and exports.
@@ -952,6 +1062,9 @@ pub struct Session {
     /// Where a document's env comes from when it goes on the bed ([`EnvFor`]); none: every
     /// document takes the env the bed has.
     pub env_for: Option<EnvFor>,
+    /// Called on the model worker when a document takes the bed, before the
+    /// calling job can edit it (for example importing onto a new plate).
+    pub on_model_open: Option<Arc<dyn Fn(&mut Session) + Send + Sync>>,
     /// Moves whenever a document goes on the bed (a plate switched to, a demo, a file opened, a
     /// new plate): the app then shows it as it was last looked at, or frames it.
     pub switched: u64,
@@ -983,6 +1096,8 @@ pub struct Session {
     strength_head: Option<Head>,
     /// The joint checks of `last` (by content hash and instance).
     joint_checks: Option<([u8; 32], String, Arc<Vec<makepad_csg_mech::JointCheck>>)>,
+    /// The current call's author. Outside a call, direct edits belong to the person.
+    author: Option<Author>,
     /// The files of plates' working copies read back this session that were not as Fab wrote
     /// them, each taken as it reads (by plate id; one line naming each): the plate list says so.
     pub outside_edits: BTreeMap<String, Vec<String>>,
@@ -994,6 +1109,7 @@ pub struct Session {
 
 /// One document with what goes with it: what [`Session::take`] swaps in and out.
 struct Doc {
+    working_id: Arc<WorkingId>,
     model: FabModel,
     path: Option<PathBuf>,
     saved: Option<[u8; 32]>,
@@ -1091,12 +1207,14 @@ fn issue_value(i: &fab_printability::Issue) -> S {
     ])
 }
 
-/// Answer-first, bounded tool output; the report itself is never truncated.
+/// Answer-first, bounded tool output; the report itself is never truncated. It leads with its
+/// check: pass with no errors, else fail.
 pub fn check_value(report: &fab_printability::Report) -> S {
     let [errors, warnings, info] = report.counts();
     let mut issues: Vec<_> = report.issues.iter().collect();
     issues.sort_by_key(|i| i.severity);
     obj(vec![
+        checks::Check::of(errors == 0).fields().remove(0),
         ("errors", int(errors)),
         ("warnings", int(warnings)),
         ("info", int(info)),
@@ -1191,7 +1309,6 @@ pub fn objects_value(ev: &Evaluated, sliced: Option<&[f64]>) -> Option<S> {
 /// has no mesh: its size, volume and field say what changed.
 pub fn plate_diff(before: &Evaluated, after: &Evaluated) -> S {
     let size = |p: &fab_plate::Part| p.bounds().size();
-    let key = |ev: &Evaluated, i: usize| ev.fields.get(i).and_then(Option::as_ref).map(|f| f.key);
     let mut added = Vec::new();
     let mut changed = Vec::new();
     for (i, p) in after.plate.parts.iter().enumerate() {
@@ -1201,11 +1318,7 @@ pub fn plate_diff(before: &Evaluated, after: &Evaluated) -> S {
                 let q = &before.plate.parts[j];
                 let (sp, sq) = (size(p), size(q));
                 let (vp, vq) = (part_volume(after, i), part_volume(before, j));
-                let volume_moved = match (vp, vq) {
-                    (Some(Some(vp)), Some(Some(vq))) => (vp - vq).abs() > 1e-3,
-                    _ => vp != vq,
-                };
-                if (0..3).any(|i| (sp[i] - sq[i]).abs() > 1e-3) || volume_moved || p.mesh.triangles.len() != q.mesh.triangles.len() || key(after, i) != key(before, j) {
+                if checks::part_moved(before, j, after, i) {
                     let mut fields = vec![("part", s(&p.object)), ("size", mm3(sp)), ("size_delta", mm3(std::array::from_fn(|i| sp[i] - sq[i])))];
                     if let Some(vp) = vp {
                         fields.push(("volume_mm3", volume_value(vp)));
@@ -1286,11 +1399,21 @@ fn palette_value(c: &Compiled, ev: &Evaluated) -> S {
 }
 
 fn colors_text(ev: &Evaluated) -> String {
-    // a colour shows its tray's filament once the printer reports one: say so where the design
-    // asks another
+    // A colour's hex is what the live colour mode shows: the design's own colour (Model) or its
+    // linked tray's filament (Material). Where the other one differs, say it too.
+    let tray = |name: &str| if ev.printer_linked { ev.mapped.inks.get(name).copied().map(color_hex) } else { None };
     let asks = |name: &str, shown: [f32; 3]| {
+        let shown = color_hex(shown);
         let asked = ev.colors.iter().find(|c| c.name == name).filter(|c| c.rgb.is_none()).and_then(|c| c.design).map(color_hex);
-        asked.filter(|a| *a != color_hex(shown)).map_or_else(String::new, |a| format!(" (its tray's filament; the design asks {a})"))
+        match ev.colour_mode {
+            fab_plate::ColourMode::Material => match (asked, tray(name)) {
+                (Some(a), Some(_)) if a != shown => format!(" (its tray's filament; the design asks {a})"),
+                (Some(a), None) => format!(" (no linked tray holds it; the design asks {a})"),
+                _ => String::new(),
+            },
+            fab_plate::ColourMode::Model => tray(name).filter(|t| *t != shown)
+                .map_or_else(String::new, |t| format!(" (the design's colour; its tray's filament is {t})")),
+        }
     };
     let mut lines = Vec::new();
     for (i, part) in ev.plate.parts.iter().enumerate() {
@@ -1344,6 +1467,81 @@ fn colors_text(ev: &Evaluated) -> String {
         }
     }
     if lines.is_empty() { "No placed parts.".into() } else { lines.join("\n") }
+}
+
+/// The per-part machine issues that printability reports as `outside_bed` errors, at the
+/// center of the same checked bounds. Excluded placements have no printability report.
+fn off_bed_parts(ev: &Evaluated) -> impl Iterator<Item = (&fab_plate::Part, &fab_plate::machine::PartReport, &fab_plate::machine::Issue)> {
+    use fab_plate::machine::Issue;
+    ev.plate.placed_parts().zip(&ev.reports).filter_map(|(part, report)| {
+        let issue = report.issues.iter().find(|i| matches!(i, Issue::OffBed | Issue::BelowPlate { .. } | Issue::KeepOut { .. }))?;
+        Some((part, report, issue))
+    })
+}
+
+fn newly_off_bed(before: Option<&Evaluated>, next: &Evaluated) -> Option<fab_model::eval::Failure> {
+    let mut outside = off_bed_parts(next).peekable();
+    outside.peek()?;
+    // Match by placed name. If two placements share a label, their instance/solid IDs
+    // distinguish them so an existing error cannot excuse a new one on its namesake.
+    let mut ambiguous = HashSet::new();
+    for ev in before.into_iter().chain([next]) {
+        let mut seen = HashSet::new();
+        for part in ev.plate.placed_parts() {
+            if !seen.insert(part.name.as_str()) {
+                ambiguous.insert(part.name.as_str());
+            }
+        }
+    }
+    fn key<'a>(part: &'a fab_plate::Part, ambiguous: &HashSet<&str>) -> (&'a str, Option<&'a str>) {
+        (&part.name, ambiguous.contains(part.name.as_str()).then_some(part.object.as_str()))
+    }
+    let previous: HashSet<_> = before.into_iter().flat_map(off_bed_parts)
+        .map(|(part, _, _)| key(part, &ambiguous)).collect();
+    let (part, report, issue) = outside.find(|(part, _, _)| !previous.contains(&key(part, &ambiguous)))?;
+    let [x, y, z] = report.bounds.center();
+    let bed = &next.machine.bed;
+    let (width, depth) = (bed.width(), bed.depth());
+    let hint = match [(x, width), (y, depth), (z, next.machine.max_height)].into_iter().find(|(at, size)| at.abs() > 10.0 * size) {
+        Some((at, _)) => format!("lengths need a unit (for example {}); a bare number is metres", out::text(&mm(at / 1000.0))),
+        None => {
+            let action = match issue {
+                fab_plate::machine::Issue::BelowPlate { .. } => "drop its base onto",
+                fab_plate::machine::Issue::KeepOut { .. } => "move it clear of the keep-out zone on",
+                _ => "move the whole part inside",
+            };
+            format!("{action} the {width} × {depth} mm bed")
+        }
+    };
+    Some(fab_model::eval::Failure {
+        file: String::new(), line: 1, col: 1, id: part.object.clone(), op: "place".into(), lost: None,
+        message: format!("place would put {} off the bed, at [{x:.2} {y:.2} {z:.2}] mm: {hint}", part.name),
+    })
+}
+
+/// Resolve a printed part once, before a tool uses its solid id or plate index.
+fn printed_part_index(parts: &[fab_plate::Part], object: &str) -> Result<usize, String> {
+    if let Some(index) = parts.iter().position(|p| p.object == object) {
+        return Ok(index);
+    }
+    let mut named = parts.iter().enumerate().filter(|(_, p)| !p.name.is_empty() && p.name == object);
+    if let Some((index, first)) = named.next() {
+        if let Some((_, second)) = named.next() {
+            let mut ids = vec![first.object.as_str(), second.object.as_str()];
+            ids.extend(named.map(|(_, p)| p.object.as_str()));
+            return Err(format!("'{object}' names several printed parts: {}", ids.join(", ")));
+        }
+        return Ok(index);
+    }
+    let labels: Vec<String> = parts.iter().map(|p| {
+        let solid = fab_model::program::split_id(&p.object).map_or(p.object.as_str(), |(_, solid)| solid);
+        if p.name.is_empty() || p.name == solid || p.name == p.object {
+            p.object.clone()
+        } else {
+            format!("{} ({})", p.object, p.name)
+        }
+    }).collect();
+    Err(format!("'{object}' is not on the plate (printed objects: {})", labels.join(", ")))
 }
 
 /// The plate as the AI reads it.
@@ -1466,6 +1664,44 @@ pub fn solids_value(c: &Compiled) -> S {
     arr(c.instances.iter().map(|i| obj(vec![("instance", s(&i.name)), ("script", s(&i.script.file)), ("solids", script_solids(&i.script))])))
 }
 
+fn step_value(step: fab_model::steps::Step) -> S {
+    let mut fields = vec![("n", int(step.n)), ("id", s(step.id)), ("verb", s(step.verb))];
+    if let Some(value) = step.value {
+        fields.push(("value", s(value)));
+    }
+    fields.push(("line", int(step.line)));
+    if !step.uses.is_empty() {
+        fields.push(("uses", arr(step.uses.iter().map(|b| s(b.to_string())))));
+    }
+    if step.off {
+        fields.push(("off", flag(true)));
+    }
+    if let Some(function) = step.made_in {
+        fields.push(("made_in", s(function)));
+    }
+    if !step.shared_with.is_empty() {
+        fields.push(("shared_with", arr(step.shared_with.into_iter().map(s))));
+    }
+    out::line(obj(fields))
+}
+
+fn steps_value(c: &Compiled, ev: &Evaluated) -> S {
+    let mut parts: HashMap<_, _> = ev.plate.placed_parts().map(|p| (p.object.as_str(), Vec::new())).collect();
+    for inst in &c.instances {
+        let part = |i: usize| fab_model::program::part_id(&inst.name, &inst.script.program.solids[i].id);
+        let bodies = inst.placed.iter().filter(|b| parts.contains_key(part(b.solid).as_str())).map(|b| (b.solid, b.object.as_str()));
+        for (i, steps) in fab_model::steps::body_steps(&inst.script, bodies) {
+            if let Some(list) = parts.get_mut(part(i).as_str()) {
+                *list = steps;
+            }
+        }
+    }
+    arr(ev.plate.placed_parts().map(|p| {
+        let steps = parts.remove(p.object.as_str()).unwrap_or_default();
+        obj(vec![("part", s(&p.object)), ("steps", arr(steps.into_iter().map(step_value)))])
+    }))
+}
+
 /// The scripts as the AI reads them: file, the objects each emits, its base instances,
 /// their linked clone ids and (`source`) its text and solids.
 pub fn scripts_value(model: &FabModel, source: bool) -> S {
@@ -1511,6 +1747,42 @@ fn safe_stem(name: &str) -> String {
 
 fn str_arg<'a>(args: &'a Value, k: &str) -> Option<&'a str> {
     args.get(k).and_then(Value::as_str)
+}
+
+/// Report surviving bare copies using the instance names on the resulting plate.
+fn place_again(before: &project::Project, edits: &[Change], after: &project::Project) -> Vec<S> {
+    let mut known_names: HashSet<_> = before.scripts.iter().map(|script| script.name.as_str()).collect();
+    let mut files: BTreeMap<&str, (Option<&str>, Vec<&str>)> = BTreeMap::new();
+    for change in edits {
+        match change {
+            Change::AddInstance { file, source: None, name: None, .. } => { files.entry(file.as_str()).or_default(); }
+            // A bare addition that reuses a name added and removed in this batch can hide a note.
+            Change::AddInstance { name: Some(name), .. } => { known_names.insert(name.as_str()); }
+            _ => {}
+        }
+    }
+    for script in &after.scripts {
+        let Some((existing, added)) = files.get_mut(script.file.as_str()) else { continue };
+        if known_names.contains(script.name.as_str()) {
+            existing.get_or_insert(script.name.as_str());
+        } else {
+            added.push(script.name.as_str());
+        }
+    }
+    let mut notes = Vec::new();
+    for (file, (existing, added)) in files {
+        let mut added = added.into_iter();
+        let Some(existing) = existing.or_else(|| added.next()) else { continue };
+        let existing = out::quote(existing);
+        for new in added {
+            let new = out::quote(new);
+            notes.push(s(format!(
+                "With {file} already on the plate as {existing}, script({}) adds another instance, {new} (use remove({new}) to take it off or place({existing}, at: ..) alone to move the existing one).",
+                out::quote(file),
+            )));
+        }
+    }
+    notes
 }
 
 fn point_arg<const N: usize>(value: &Value) -> Result<[f64; N], String> {
@@ -1648,7 +1920,16 @@ impl Session {
         let mut eval = Evaluator::new(machine);
         // the calibrated filament sets kept (one that cannot be read, fab.colour_read names)
         eval.calibrated = Arc::new(fab_model::colour_sets::load_all(&documents).0);
-        Session { test_mode: false, test_bed: None, marks: Default::default(), picks: Default::default(), volume_bases: BTreeMap::new(), weak_memo: Arc::default(), strength_before: None, tubes_memo: Arc::default(), plan_memo: Arc::default(), orient_was: None, strength_head: None, model: FabModel::new("Untitled"), eval, path: None, documents, last: None, compiled: None, draft: None, serial: 0, params: None, autosaved: autosave::Snapshot::default(), store: None, plate: None, demo: None, thumb: None, thumb_autosaved: false, saved: None, made_waiting: None, made_last: None, plates_rev: 0, demos: Demos::default(), env_for: None, switched: 0, kept: Vec::new(), built_head: None, print_setup: None, support_memo: Default::default(), slices: None, joint_checks: None, outside_edits: BTreeMap::new() }
+        Session { holds_bodies: false, test_mode: false, working_id: Default::default(), test_bed: None, marks: Default::default(), picks: Default::default(), volume_bases: BTreeMap::new(), weak_memo: Arc::default(), strength_before: None, tubes_memo: Arc::default(), plan_memo: Arc::default(), orient_was: None, strength_head: None, model: FabModel::new("Untitled"), eval, path: None, documents, last: None, compiled: None, draft: None, serial: 0, params: None, autosaved: autosave::Snapshot::default(), store: None, plate: None, demo: None, thumb: None, thumb_autosaved: false, saved: None, made_waiting: None, made_last: None, plates_rev: 0, demos: Demos::default(), env_for: None, on_model_open: None, switched: 0, kept: Vec::new(), built_head: None, print_setup: None, support_memo: Default::default(), slices: None, joint_checks: None, author: None, outside_edits: BTreeMap::new() }
+    }
+
+    /// The accepted build's meshes stay in this session's evaluator; the bed's also tells the
+    /// process's B-rep engine, which every session shares.
+    fn keep_bodies(&mut self) {
+        self.eval.keep_meshes(self.compiled.as_deref());
+        if self.holds_bodies {
+            fab_model::eval::keep_exact_bodies(self.compiled.as_deref());
+        }
     }
 
     fn keep(&mut self, c: Compiled, ev: Evaluated) -> (Arc<Compiled>, Arc<Evaluated>) {
@@ -1657,6 +1938,7 @@ impl Session {
         self.last = Some(ev.clone());
         self.draft = None;
         self.built_head = Some(self.model.head().content);
+        self.keep_bodies();
         (c, ev)
     }
 
@@ -1697,6 +1979,27 @@ impl Session {
         }
         let sliced = self.slices.as_ref().and_then(|s| s.made(ev)).map(|p| p.volumes());
         objects_value(ev, sliced.as_deref())
+    }
+
+    fn render_step(&mut self, ev: &Evaluated, objects: &[String], id: &str, views: Vec<String>, camera: Camera) -> Result<RenderRequest, String> {
+        let [object] = objects else { return Err("render with a step needs exactly one object".into()) };
+        let part = printed_part_index(&ev.plate.parts, object)?;
+        let compiled = self.compiled.as_ref().ok_or("the plate is not built yet")?;
+        let steps = fab_model::steps::part_steps(compiled, object);
+        let step = steps.iter().find(|s| s.id == id).ok_or_else(|| {
+            let ids: Vec<_> = steps.iter().map(|s| s.id.as_str()).collect();
+            format!("no step '{id}' on {object}: its steps are [{}]", ids.join(", "))
+        })?;
+        let inst = fab_model::program::split_id(object).and_then(|(i, _)| compiled.instance(i)).ok_or("the part has no script instance")?;
+        let frame = ev.placed_frame(part).ok_or("the part has no placed frame")?;
+        let render = self.eval.step_render(&inst.script, step.solid, frame, None)?;
+        // A Pieces request draws its entire supplied plate. Keep just this part, in place,
+        // then give it the strip's mesh and clear its whole-part field and paint.
+        let one = ev.of_pieces(vec![fab_model::eval::ShownPiece {
+            of: part, part: ev.plate.parts[part].clone(), render: Default::default(), field: None,
+            to_bed: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
+        }]);
+        Ok(RenderRequest::Pieces(Arc::new(test_view::PiecesJob { ev: Arc::new(one.with_step(0, render)), views, camera, extra: None })))
     }
 
     /// The parameter model of the current plate: every tunable value of every part, with its
@@ -1744,7 +2047,30 @@ impl Session {
     /// Set one parameter as one undo step: the part panel, the view's handles and the headset
     /// all commit through here (the same change path the AI uses).
     pub fn set_param(&mut self, key: &str, value: &PValue) -> Reply {
-        match self.param_edit(key, value) {
+        self.set_param_at_step(key, value, None)
+    }
+
+    /// A step editor supplies the feature's name. Use the value being committed here
+    /// so a capped drag records its held value in history.
+    pub fn set_param_at_step(&mut self, key: &str, value: &PValue, step: Option<&str>) -> Reply {
+        let change = match self.param_edit(key, value) {
+            Ok(change) => change,
+            Err(e) => return Reply::err(e),
+        };
+        // param_edit resolved the key against this committed parameter model.
+        let label = step.and_then(|step| {
+            let p = self.params.as_ref()?.1.iter().flat_map(|part| &part.params).find(|p| p.key == key)?;
+            let old = fab_model::steps::value_text(p, &p.value, false);
+            let new = fab_model::steps::value_text(p, value, true);
+            Some(format!("{step}: {old} → {new}"))
+        });
+        self.commit_labeled("param", vec![change], label)
+    }
+
+    /// Link a field to declared parameters as one undo step.
+    pub fn link_param(&mut self, key: &str, code: &str) -> Reply {
+        let change = self.params().and_then(|parts| params::link(self.compiled.as_ref().unwrap(), &parts, key, code));
+        match change {
             Ok(c) => self.commit("param", vec![c]),
             Err(e) => Reply::err(e),
         }
@@ -1802,6 +2128,7 @@ impl Session {
             }
         }
         let mut reset: Vec<_> = self.model.project().scripts.iter().map(|s| Change::RemoveInstance { instance: s.name.clone() }).collect();
+        if self.model.project().arrange_gap.is_some() { reset.push(Change::ArrangeGap(None)); }
         reset.push(Change::PlateSettings { set: Vec::new(), reset: self.model.project().settings.iter().map(|(k, _)| k.clone()).collect() });
         reset.extend(changes);
         Ok(reset)
@@ -1876,7 +2203,7 @@ impl Session {
                 Err(e) => return (Reply::err(e), None),
             }
         }
-        match self.model.apply(&mut self.eval, &request_id, head, &changes, None) {
+        match self.commit_changes(&request_id, head, &changes, None, true) {
             Ok((applied, built)) => (self.commit_reply(vec![("head", s(applied.head.text())), ("changed", arr(applied.changed.iter().map(s)))], built), None),
             Err(e) => {
                 let p = Self::source_problem(file, &e);
@@ -2161,7 +2488,7 @@ impl Session {
         if let Some(facets) = self.model.facets.get(name) {
             own.model.facets = Arc::new(HashMap::from([(name.to_string(), facets.clone())]));
         }
-        let reply = own.commit("image", changes);
+        let reply = own.as_author(self.commit_author()).commit("image", changes);
         if !reply.ok {
             return Err(reply.text);
         }
@@ -2174,11 +2501,25 @@ impl Session {
         Ok(())
     }
 
-    /// Commit `changes` as one undo step (the app's direct edits).
+    /// Bind the originating author to every commit made while the job holds the session.
+    pub fn as_author(&mut self, author: Author) -> AuthoredSession<'_> {
+        let previous = self.author.replace(author);
+        AuthoredSession { session: self, previous }
+    }
+
+    fn commit_author(&self) -> Author {
+        self.author.unwrap_or(Author::Person)
+    }
+
+    /// Commit `changes` as one undo step with the current author.
     pub fn commit(&mut self, what: &str, changes: Vec<Change>) -> Reply {
+        self.commit_labeled(what, changes, None)
+    }
+
+    fn commit_labeled(&mut self, what: &str, changes: Vec<Change>, label: Option<String>) -> Reply {
         let request_id = self.next_request_id(what);
         let head = self.model.head();
-        match self.model.apply(&mut self.eval, &request_id, head, &changes, None) {
+        match self.commit_changes_labeled(&request_id, head, &changes, None, true, label) {
             Ok((applied, built)) => self.commit_reply(vec![("head", s(applied.head.text())), ("changed", arr(applied.changed.iter().map(s)))], built),
             Err(e) => self.apply_error(e),
         }
@@ -2257,6 +2598,16 @@ impl Session {
     /// makes of a build (its scene) is worth keeping while the build is here.
     pub fn builds(&self) -> impl Iterator<Item = &Arc<Evaluated>> {
         self.last.iter().chain(self.kept.iter().filter_map(|d| d.built.as_ref().map(|b| &b.1)))
+    }
+
+    /// Set the display mode for future builds and recolour the one on the bed.
+    pub fn set_colour_view(&mut self, mode: fab_plate::ColourMode, linked: bool) -> Option<Arc<Evaluated>> {
+        self.eval.colour_mode = mode;
+        self.eval.printer_linked = linked;
+        let ev = self.last.as_mut()?;
+        if ev.colour_mode == mode && ev.printer_linked == linked { return None; }
+        Arc::make_mut(ev).set_colour_view(mode, linked);
+        Some(ev.clone())
     }
 
     /// The app's colour mapping for the plate on the bed: its parts and paint take it without a
@@ -2393,6 +2744,15 @@ impl Session {
         autosave::keep_texts_aside(&dir, docs, why)
     }
 
+    fn adopt_working_id(&self, store: &plates::PlateStore, file: Option<PathBuf>, origin: plates::Origin) -> Result<plates::Plate, String> {
+        let id = self.working_id.id().to_owned();
+        std::fs::create_dir_all(store.dir(&id)).map_err(|e| e.to_string())?;
+        let plate = plates::Plate { id, name: self.model.name.clone(), file, saved: String::new(), origin,
+            edited: makepad_civil_time::now_secs(), modified: false, printer: String::new(), removed: false };
+        store.write(&plate)?;
+        Ok(plate)
+    }
+
     /// Commit the plate's working copy, then its settled picture and its record. A document
     /// that is no plate yet becomes one here (see [`Self::forks`]): a demo's first edit makes
     /// the person's own plate, the demo stays as it ships. An empty plate's working copy is
@@ -2404,7 +2764,7 @@ impl Session {
                 return Ok(());
             }
             let origin = self.demo.as_ref().map_or(plates::Origin::Plate, |(key, _)| plates::Origin::Demo(key.clone()));
-            let plate = store.create(&self.model.name, None, String::new(), origin)?;
+            let plate = self.adopt_working_id(&store, None, origin)?;
             store.set_current(Some(&plates::Current::Plate(plate.id.clone())))?;
             self.plate = Some(plate.id);
             self.demo = None;
@@ -2489,6 +2849,7 @@ impl Session {
         // the bed's build as it is, for a switch that does not happen
         let was = (self.compiled.clone(), self.last.clone(), self.built_head, self.eval.mapped.clone(), self.eval.inspected());
         let previous = Doc {
+            working_id: std::mem::replace(&mut self.working_id, doc.working_id),
             model: std::mem::replace(&mut self.model, doc.model),
             path: std::mem::replace(&mut self.path, doc.path),
             saved: std::mem::replace(&mut self.saved, doc.saved),
@@ -2499,7 +2860,10 @@ impl Session {
             built,
         };
         let shown = match reuse {
-            Some((c, ev, _)) => {
+            Some((c, mut ev, _)) => {
+                if ev.colour_mode != self.eval.colour_mode || ev.printer_linked != self.eval.printer_linked {
+                    Arc::make_mut(&mut ev).set_colour_view(self.eval.colour_mode, self.eval.printer_linked);
+                }
                 // in its own colours, as they were last mapped for it, not the plate's before it:
                 // the app maps this plate's next and sends the mapping only when it has moved
                 self.eval.mapped = ev.mapped.clone();
@@ -2517,6 +2881,7 @@ impl Session {
                 self.compiled = Some(c);
                 self.last = Some(ev.clone());
                 self.built_head = Some(self.model.head().content);
+                self.keep_bodies();
                 Ok(ev)
             }
             None => self.rebuild(),
@@ -2541,7 +2906,7 @@ impl Session {
                 }
                 // the plate (or demo) put aside keeps its history and its build for a switch back
                 // (just autosaved, it is its working copy)
-                let bed = Doc { model: FabModel::new(""), path: None, saved: None, plate: self.plate.clone(), demo: self.demo.clone(), autosaved: autosave::Snapshot::default(), thumb: None, built: None };
+                let bed = Doc { working_id: self.working_id.clone(), model: FabModel::new(""), path: None, saved: None, plate: self.plate.clone(), demo: self.demo.clone(), autosaved: autosave::Snapshot::default(), thumb: None, built: None };
                 if (previous.plate.is_some() || previous.demo.is_some()) && !previous.same(&bed) {
                     self.kept.retain(|d| !d.same(&previous));
                     self.kept.insert(0, previous);
@@ -2550,6 +2915,7 @@ impl Session {
                         d.built = None;
                     }
                 }
+                if let Some(opened) = self.on_model_open.clone() { opened(self); }
                 self.switched += 1;
                 self.plates_rev += 1;
                 Ok(ev)
@@ -2561,6 +2927,7 @@ impl Session {
                     _ => None,
                 };
                 let doc = Doc {
+                    working_id: std::mem::replace(&mut self.working_id, previous.working_id),
                     model: std::mem::replace(&mut self.model, previous.model),
                     path: std::mem::replace(&mut self.path, previous.path),
                     saved: std::mem::replace(&mut self.saved, previous.saved),
@@ -2572,6 +2939,7 @@ impl Session {
                 };
                 let (compiled, last, built_head, mapped, inspected) = was;
                 (self.compiled, self.last, self.built_head, self.eval.mapped) = (compiled, last, built_head, mapped);
+                self.keep_bodies();
                 self.eval.put_back(inspected);
                 if let Some(at) = kept {
                     self.kept.insert(at.min(self.kept.len()), doc);
@@ -2601,7 +2969,7 @@ impl Session {
             },
             None => (None, false),
         };
-        let r = self.take(Doc { model, path, saved, plate: plate.clone(), demo: None, autosaved: autosave::Snapshot::default(), thumb: None, built: None }, None);
+        let r = self.take(Doc { working_id: Default::default(), model, path, saved, plate: plate.clone(), demo: None, autosaved: autosave::Snapshot::default(), thumb: None, built: None }, None);
         // A plate made for a document that does not build is no plate.
         if let (Err(_), Some(store), Some(id), true) = (&r, &self.store, &plate, made) {
             store.forget_new(id);
@@ -2616,7 +2984,7 @@ impl Session {
         let at = self.kept.iter().position(|d| d.plate.is_none() && d.demo.as_ref().is_some_and(|(k, _)| k == key));
         let doc = at.map(|i| self.kept.remove(i)).unwrap_or_else(|| {
             let head = model.head();
-            Doc { model, path: None, saved: None, plate: None, demo: Some((key.to_string(), head)), autosaved: autosave::Snapshot::default(), thumb: None, built: None }
+            Doc { working_id: Default::default(), model, path: None, saved: None, plate: None, demo: Some((key.to_string(), head)), autosaved: autosave::Snapshot::default(), thumb: None, built: None }
         });
         self.take(doc, at)
     }
@@ -2646,7 +3014,7 @@ impl Session {
                     model.name = plate.name.clone();
                 }
                 let thumb = std::fs::read(store.picture(id)).ok().map(Arc::from);
-                Doc { model, path: plate.file.clone(), saved, plate: Some(plate.id.clone()), demo: None, autosaved, thumb, built: None }
+                Doc { working_id: Default::default(), model, path: plate.file.clone(), saved, plate: Some(plate.id.clone()), demo: None, autosaved, thumb, built: None }
             }
             None => {
                 let (model, saved) = match &plate.file {
@@ -2658,7 +3026,7 @@ impl Session {
                     Some(file) => return Err(format!("{} is gone", file.display())),
                     None => (FabModel::new(&plate.name), None),
                 };
-                Doc { model, path: plate.file.clone(), saved, plate: Some(plate.id.clone()), demo: None, autosaved: autosave::Snapshot::default(), thumb: None, built: None }
+                Doc { working_id: Default::default(), model, path: plate.file.clone(), saved, plate: Some(plate.id.clone()), demo: None, autosaved: autosave::Snapshot::default(), thumb: None, built: None }
             }
         } };
         let ev = self.take(doc, at)?;
@@ -2735,7 +3103,7 @@ impl Session {
             // a demo or a fresh document saved is a plate from now on
             let store = self.store.clone().expect("a store");
             let origin = self.demo.take().map_or(plates::Origin::Plate, |(key, _)| plates::Origin::Demo(key));
-            let plate = store.create(&self.model.name, Some(path.clone()), String::new(), origin)?;
+            let plate = self.adopt_working_id(&store, Some(path.clone()), origin)?;
             store.set_current(Some(&plates::Current::Plate(plate.id.clone())))?;
             self.plate = Some(plate.id);
         }
@@ -2753,7 +3121,7 @@ impl Session {
         }
         let model = project::load(&path, self.model.env())?;
         let saved = Some(model.content());
-        self.take(Doc { model, path: Some(path), saved, plate: self.plate.clone(), demo: None, autosaved: autosave::Snapshot::default(), thumb: None, built: None }, None)
+        self.take(Doc { working_id: Default::default(), model, path: Some(path), saved, plate: self.plate.clone(), demo: None, autosaved: autosave::Snapshot::default(), thumb: None, built: None }, None)
     }
 
     /// Open what an earlier run had on the bed ([`Self::left_on_bed`], its writes flushed, then
@@ -3024,6 +3392,73 @@ impl Session {
         }
     }
 
+    /// Apply one batch to the model. Only history restores a build by another path.
+    /// `one_shot` selects the refusal wording for tools that cannot also edit the expect.
+    fn commit_changes(
+        &mut self, request_id: &str, expected: Head, changes: &[Change], cancelled: Option<&dyn Fn() -> bool>, one_shot: bool,
+    ) -> Result<(fab_model::Applied, Option<(Compiled, Evaluated)>), ApplyError> {
+        self.commit_changes_labeled(request_id, expected, changes, cancelled, one_shot, None)
+    }
+
+    fn commit_changes_labeled(
+        &mut self, request_id: &str, expected: Head, changes: &[Change], cancelled: Option<&dyn Fn() -> bool>, one_shot: bool, label: Option<String>,
+    ) -> Result<(fab_model::Applied, Option<(Compiled, Evaluated)>), ApplyError> {
+        let author = self.commit_author();
+        let before = self.last.as_deref();
+        let expects_gate = |next: &Evaluated| match author {
+            Author::Person => None,
+            Author::Ai | Author::Agent => fab_model::expect::newly_failing(before, next, one_shot).or_else(|| newly_off_bed(before, next)),
+        };
+        self.model.apply_gated_labeled(&mut self.eval, request_id, expected, changes, cancelled, &expects_gate, label)
+    }
+
+    /// A placement report has no source span. On a refusal, point into the submitted script
+    /// or edits when its statement can be identified. Edits have their own line numbering.
+    fn placement_source(&self, failure: &mut fab_model::eval::Failure, args: &Value, changes: &[Change]) {
+        use makepad_script::syntax::{self, Kind};
+        let Some((instance, solid)) = fab_model::program::split_id(&failure.id) else { return };
+        let input = str_arg(args, "edits");
+        let (file, text) = match (input, changes) {
+            (Some(edits), _) => ("edits", edits),
+            (None, [Change::Script { file, edit: Edit::Program { source } } | Change::AddInstance { file, source: Some(source), .. }]) => (file.as_str(), source.as_str()),
+            _ => return,
+        };
+        if input.is_none() {
+            failure.file = file.to_string();
+            if let Some(old) = self.model.source(file) {
+                // A replacement of existing source: where its edit starts, including when the
+                // changed length came from a parameter on another line than the part itself.
+                let at = text.chars().zip(old.chars()).take_while(|(a, b)| a == b).map(|(c, _)| c.len_utf8()).sum();
+                (failure.line, failure.col) = makepad_model_script::lang::names::Names::line_col_of(text, at);
+                return;
+            }
+        }
+        let Ok(tree) = syntax::parse(text) else { return };
+        let object = self.compiled.as_ref().and_then(|c| c.object(&failure.id)).map_or(solid, |(_, o)| o.name.as_str());
+        let mut matches = tree.statements().iter().filter(|stmt| {
+            if input.is_none() {
+                return stmt.let_name() == Some(solid);
+            }
+            if tree.statements().len() == 1 { return true; }
+            let Some(args) = stmt.call("place") else { return false };
+            let field = |key| args.iter().find_map(|arg| match &arg.kind {
+                Kind::Entry { name, value, .. } if name == key => Some(value.as_ref()),
+                _ => None,
+            });
+            let (base, link) = fab_model::program::split_link(instance);
+            let target = args.first().and_then(|arg| arg.string());
+            let same_instance = match field("link") {
+                None => target == Some(instance),
+                Some(value) => target == Some(base) && value.number() == Some(f64::from(link)),
+            };
+            same_instance && field("object").is_none_or(|arg| arg.string() == Some(object))
+        });
+        if let (Some(stmt), None) = (matches.next(), matches.next()) {
+            failure.file = file.to_string();
+            (failure.line, failure.col) = makepad_model_script::lang::names::Names::line_col_of(text, stmt.span.start);
+        }
+    }
+
     fn apply_error(&self, e: ApplyError) -> Reply {
         let mut fields = vec![("error", s(e.to_string())), ("head", s(self.model.head().text()))];
         if let ApplyError::Build(f) = &e {
@@ -3052,6 +3487,14 @@ impl Session {
             }
             (c, ev)
         });
+        // what it built leads, so the AI reads it first; then what it changed of the person's numbers
+        if let Some((c, ev)) = &built {
+            fields.insert(fields.len().min(1), ("built", checks::built_value(self.last.as_deref(), ev, false)));
+            let changed = self.compiled.as_deref().map(|before| checks::expects_changed(before, c)).unwrap_or_default();
+            if !changed.is_empty() {
+                fields.insert(fields.len().min(2), ("expects_changed", arr(changed.into_iter().map(s))));
+            }
+        }
         let update = built.map(|(c, ev)| self.keep(c, ev));
         if let Some(ev) = &self.last {
             fields.push(("plate", plate_value(ev)));
@@ -3167,13 +3610,83 @@ impl Session {
                 Err(e) => self.apply_error(e),
             };
         }
-        match self.model.apply(&mut self.eval, request_id, expected, &changes, cancelled) {
+        match self.commit_changes(request_id, expected, &changes, cancelled, false) {
             Ok((applied, built)) => self.commit_reply(vec![
                 ("head", s(applied.head.text())), ("replayed", flag(applied.replayed)),
                 ("changed", arr(applied.changed.iter().map(s))),
             ], built),
             Err(e) => self.apply_error(e),
         }
+    }
+
+    /// Resolve tool-only positions once, on the plate as this batch shapes it. A translation
+    /// leaves the offset from the origin to either footprint anchor unchanged.
+    fn resolve_place_anchors(&mut self, edits: &mut [Change], cancelled: Option<&dyn Fn() -> bool>) -> Result<Vec<S>, Reply> {
+        let anchored = |c: &Change| matches!(c, Change::Place { arg: PlaceArg::Center(_) | PlaceArg::Corner(_), .. });
+        if !edits.iter().any(anchored) { return Ok(Vec::new()); }
+
+        let preview = self.built_head != Some(self.model.head().content) || self.last.is_none() || edits.iter().any(|c| match c {
+            Change::AddInstance { .. } | Change::RemoveInstance { .. } | Change::Param { .. } => true,
+            Change::Place { arg: PlaceArg::Rotate(_) | PlaceArg::Scale(_) | PlaceArg::Show(_), .. } => true,
+            Change::Place { instance, .. } if anchored(c) => self.compiled.as_ref().and_then(|c| c.instance(instance)).is_none(),
+            _ => false,
+        });
+        let draft;
+        let (compiled, ev) = if preview {
+            // As in place_dropped, build the bodies once in their provisional positions. The
+            // final placement reuses them. Restore the inspected geometry even if the edit fails.
+            let mut provisional = edits.to_vec();
+            for change in &mut provisional {
+                if anchored(change) {
+                    if let Change::Place { arg, .. } = change { *arg = PlaceArg::At(None); }
+                }
+            }
+            let inspected = self.eval.inspected();
+            let result = self.model.preview(&mut self.eval, &provisional, cancelled);
+            self.eval.put_back(inspected);
+            draft = result.map_err(|e| self.apply_error(e))?;
+            (&draft.1, &draft.2)
+        } else {
+            (self.compiled.as_deref().unwrap(), self.last.as_deref().unwrap())
+        };
+
+        let parts: HashMap<_, _> = ev.plate.placed_parts().enumerate().map(|(i, p)| (p.object.as_str(), i)).collect();
+        let bounds = |i: usize| ev.reports.get(i).map_or_else(|| ev.placed_part(i).bounds(), |r| r.bounds);
+        let mut written = Vec::new();
+        for change in edits {
+            let Change::Place { instance, object, arg } = change else { continue };
+            let (key, target) = match *arg {
+                PlaceArg::Center(xy) => ("center", xy),
+                PlaceArg::Corner(xy) => ("corner", xy),
+                _ => continue,
+            };
+            let inst = compiled.instance(instance).ok_or_else(|| Reply::err(format!("no instance '{instance}'; place it first")))?;
+            let emitted = if object.is_empty() {
+                match inst.script.objects.as_slice() {
+                    [one] => Some(one),
+                    _ => inst.script.object(&inst.script_instance),
+                }.ok_or_else(|| Reply::err(format!("place: name the object '{instance}' should move")))?
+            } else {
+                inst.script.object(object).ok_or_else(|| Reply::err(format!("'{instance}' emits no object '{object}'")))?
+            };
+            if let Some(insert) = &emitted.insert {
+                return Err(Reply::err(format!("'{}' rides in '{}'; place its host", emitted.name, insert.into)));
+            }
+            // One placement moves every body the object emits. Include excluded placements.
+            let mut bodies = emitted.bodies.iter().filter_map(|&b| {
+                let id = fab_model::program::part_id(instance, &inst.script.program.solids[b].id);
+                parts.get(id.as_str()).copied()
+            });
+            let id = fab_model::program::part_id(instance, &emitted.name);
+            let Some(first) = bodies.next() else { return Err(Reply::err(format!("'{id}' has no footprint on the bed; place it first"))) };
+            let b = bodies.fold(bounds(first), |b, i| b.union(&bounds(i)));
+            let f = ev.placed_frame(first).expect("every placed part has its frame");
+            let anchor = if key == "center" { b.center() } else { b.min };
+            let at = std::array::from_fn(|k| target[k] + (f[k][3] - anchor[k]));
+            *arg = PlaceArg::At(Some(at));
+            written.push(obj(vec![("object", s(id)), (key, mm2(target)), ("at", mm2(at))]));
+        }
+        Ok(written)
     }
 
     /// A move's changes. `settle`: a tilted single mesh lies down on its nearest face, as a person's
@@ -3252,12 +3765,17 @@ impl Session {
         if args.get("normal").is_some() == args.get("point").is_some() {
             return Reply::err("give exactly one of 'normal' or 'point'; both or neither is invalid");
         }
-        let Some(object) = str_arg(args, "object") else { return Reply::err("missing 'object': the part's instance/object id from fab.inspect") };
+        let Some(object) = str_arg(args, "object") else { return Reply::err("missing 'object': the part's solid id or printed name from fab.inspect") };
         let Some(ev) = self.last.clone() else { return Reply::err("the plate is not built yet") };
-        if !ev.plate.placed_parts().any(|p| p.object == object) {
-            let names = ev.plate.placed_parts().map(|p| p.object.as_str()).collect::<Vec<_>>().join(", ");
-            return Reply::err(format!("unknown part '{object}'; the available parts are: {names}. Use an instance/object id from fab.inspect"));
-        }
+        // Lay flat also accepts the qualified id of a placement excluded from printing.
+        let object = if ev.plate.excluded.iter().any(|p| p.part.object == object) {
+            object
+        } else {
+            match printed_part_index(&ev.plate.parts, object) {
+                Ok(i) => &ev.plate.parts[i].object,
+                Err(e) => return Reply::err(e),
+            }
+        };
         let normal = match args.get("normal") {
             Some(value) => match point_arg::<3>(value) {
                 Ok(n) => n,
@@ -3319,8 +3837,15 @@ impl Session {
         }
     }
 
-    /// Answer one tool call (`tool` is the short name: `apply`, `render`, ...).
+    /// Answer a tool call. Standalone callers enter as AI. The app's jobs carry their author.
     pub fn call(&mut self, tool: &str, args: &Value, cancelled: Option<&dyn Fn() -> bool>) -> Reply {
+        match self.author {
+            Some(_) => self.dispatch(tool, args, cancelled),
+            None => self.as_author(Author::Ai).dispatch(tool, args, cancelled),
+        }
+    }
+
+    fn dispatch(&mut self, tool: &str, args: &Value, cancelled: Option<&dyn Fn() -> bool>) -> Reply {
         if !matches!(tool, "guide" | "board" | "printer" | "print" | "slice" | "force" | "new" | "save" | "import" | "plates" | "workspace" | "workspace_edit" | "show") && (self.last.is_none() || self.compiled.is_none()) {
             if let Err(e) = self.rebuild() {
                 if !matches!(tool, "inspect" | "apply" | "script" | "history") {
@@ -3335,6 +3860,10 @@ impl Session {
             "annotations" => self.annotations_tool(args),
             "annotate" => self.annotate_tool(args),
             picks::TOOL => self.select_tool(args),
+            round::TOOL => self.round_tool(args),
+            pull::TOOL => self.pull_tool(args),
+            hole::TOOL => self.hole_tool(args),
+            shell::TOOL => self.shell_tool(args),
             volumes::TOOL => self.settings_volume_tool(args, cancelled),
             volumes::FIT_TOOL => self.fit_tool(args, cancelled),
             "make_printable" => match str_arg(args, "object") {
@@ -3348,12 +3877,45 @@ impl Session {
                 };
                 let report = fab_printability::analyse_plate(&ev.machine, &ev.plate, &self.eval.materials);
                 let mut answer = check_value(&report);
+                let sliced = args.get("slice").and_then(Value::as_bool) == Some(true);
+                let mut skipped: Vec<(String, String)> = Vec::new();
                 // The mesh's own findings: specks, thin features, weak necks (model frame). A test
                 // print's are its model's: it has no mesh of its own to read them from.
                 let lw = self.eval.materials.line_width;
                 if let Some((findings, _)) = (!self.test_mode).then(|| inspect::mesh_findings(&Value::Obj(Vec::new()), &ev, &mut self.eval, lw, false).ok()).flatten() {
+                    if checks::has_error(&findings) {
+                        checks::lead(&mut answer, checks::Check::Fail.fields());
+                    }
                     if let (S::Object(_, fields), false) = (&mut answer, findings.is_empty()) {
                         fields.push(("mesh_findings".into(), arr(findings)));
+                    }
+                }
+                // the person's numbers: a failing one fails the check, one not read is left out
+                if let Some(rows) = checks::expects_value(&ev, true) {
+                    if ev.expects.iter().any(|j| j.verdict() == fab_model::expect::Verdict::Fail) {
+                        checks::lead(&mut answer, checks::Check::Fail.fields());
+                    }
+                    for j in &ev.expects {
+                        if let fab_model::expect::Verdict::NotChecked(why) = j.verdict() {
+                            skipped.push((format!("m.expect \"{}\" ({})", j.expect.name, j.instance), why));
+                        }
+                    }
+                    if let S::Object(_, fields) = &mut answer {
+                        fields.push(("expects".into(), rows));
+                    }
+                }
+                // what this answer did not check: the slice's checks, and the field parts the
+                // mesh findings leave to them
+                if !sliced {
+                    let fields: Vec<&str> = ev.plate.parts.iter().enumerate().filter(|(i, _)| ev.fields.get(*i).is_some_and(Option::is_some)).map(|(_, p)| p.object.as_str()).collect();
+                    if !fields.is_empty() && !self.test_mode {
+                        skipped.push((format!("mesh findings of {}", fields.join(", ")), "a field part is checked on its slice: fab.check {slice: true}".into()));
+                    }
+                    skipped.push(("sliced checks (thin walls, bridges, cantilevers, mid-air, supports, empty layers, flow)".into(), "they read a slice: fab.check {slice: true}".into()));
+                }
+                if !skipped.is_empty() {
+                    if let S::Object(_, fields) = &mut answer {
+                        fields.insert(1, ("not_checked".into(), checks::not_checked(&skipped)));
                     }
                 }
                 Reply { images: Vec::new(), ok: true, text: out::text(&answer), update: None, render: if args.get("slice").and_then(Value::as_bool) == Some(true) { Some(RenderRequest::CheckSlice) } else { None } }
@@ -3405,14 +3967,7 @@ impl Session {
                 if cancelled.is_some_and(|c| c()) {
                     return Reply::err("cancelled");
                 }
-                let checks = match &self.joint_checks {
-                    Some((content, instance, checks)) if *content == ev.content && *instance == mech_state.instance => checks.clone(),
-                    _ => {
-                        let checks = Arc::new(mech_state.check(&|| false));
-                        self.joint_checks = Some((ev.content, mech_state.instance.clone(), checks.clone()));
-                        checks
-                    }
-                };
+                let checks = self.joint_checks_of(&ev, &mech_state);
                 if tool == "joints" {
                     return Reply::ok(mech::check_value(Some(&mech_state), &checks));
                 }
@@ -3523,7 +4078,7 @@ impl Session {
                         let objects = self.objects(&ev).map(|o| format!("objects: {} ", out::text(&o))).unwrap_or_default();
                         // a test print is a feature of the model it lives on, with no code of its own
                         let tests = out::text(&arr(self.model.project().test_prints.iter().map(|t| obj(vec![("name", s(&t.name)), ("kind", s("test print")), ("object", s(t.part()))]))));
-                        Reply { images: Vec::new(), ok: true, text: format!("{{solids: {} features: {} {objects}test_prints: {tests} params: {}}}", out::text(&solids_value(&c)), out::text(&volumes::features_value(&c, &ev)), params::model_text(&model, &ev, false)), update: None, render: None }
+                        Reply { images: Vec::new(), ok: true, text: format!("{{solids: {} features: {} {objects}test_prints: {tests} steps: {} params: {}}}", out::text(&solids_value(&c)), out::text(&volumes::features_value(&c, &ev)), out::text(&steps_value(&c, &ev)), params::model_text(&model, &ev, false)), update: None, render: None }
                     }
                 }
             }
@@ -3535,6 +4090,9 @@ impl Session {
                     ("can_undo", flag(self.model.can_undo())),
                     ("can_redo", flag(self.model.can_redo())),
                 ];
+                if let Some(ev) = &self.last {
+                    fields.push(("built", checks::built_value(None, ev, true)));
+                }
                 if let Some(p) = &self.path {
                     fields.push(("path", s(p.display().to_string())));
                 }
@@ -3586,6 +4144,7 @@ impl Session {
                     Ok(h) => h,
                     Err(r) => return r,
                 };
+                let mut placements = Vec::new();
                 let edits = match tool {
                     "duplicate" => match self.duplicate_change(args) {
                         Ok(change) => vec![change],
@@ -3690,8 +4249,14 @@ impl Session {
                     "place" => {
                         let Some(text) = str_arg(args, "edits") else { return Reply::err("missing 'edits': project statements") };
                         match project::changes(text) {
-                            Ok(c) if c.is_empty() => return Reply::err("no edits: place(\"vase\", at: [100mm 100mm]), params(\"vase\", {height: 80mm}), script(\"lid.cad.splash\"), remove(\"lid\")"),
-                            Ok(c) => c,
+                            Ok(c) if c.is_empty() => return Reply::err("no edits: place(\"vase\", at: [100mm 100mm]), params(\"vase\", {height: 80mm}), script(\"lid.cad.splash\", name: \"lid_2\"), remove(\"lid_2\")"),
+                            Ok(mut c) => {
+                                placements = match self.resolve_place_anchors(&mut c, cancelled) {
+                                    Ok(written) => written,
+                                    Err(reply) => return reply,
+                                };
+                                c
+                            }
                             Err(d) => return Reply::err(d.iter().map(|d| format!("edits {d}")).collect::<Vec<_>>().join("; ")),
                         }
                     }
@@ -3703,11 +4268,25 @@ impl Session {
                         }
                     }
                 };
+                let place_before = (tool == "place" && edits.iter().any(|change| matches!(change, Change::AddInstance { name: None, source: None, .. })))
+                    .then(|| self.model.project().clone());
+                let add_notes = |fields: &mut Vec<(&str, S)>, project: &project::Project| {
+                    if let Some(before) = &place_before {
+                        let notes = place_again(before, &edits, project);
+                        if !notes.is_empty() { fields.push(("again", arr(notes))); }
+                    }
+                };
                 let before = self.last.clone();
                 if args.get("dry_run").and_then(Value::as_bool) == Some(true) {
                     return match self.model.preview(&mut self.eval, &edits, cancelled) {
-                        Ok((_, _, ev)) => {
-                            let mut fields = vec![("dry_run", flag(true)), ("committed", flag(false))];
+                        Ok((state, c, ev)) => {
+                            let mut fields = vec![("dry_run", flag(true)), ("committed", flag(false)), ("built", checks::built_value(before.as_deref(), &ev, false))];
+                            add_notes(&mut fields, &state.project);
+                            if !placements.is_empty() { fields.push(("placements", arr(placements))); }
+                            let changed = self.compiled.as_deref().map(|was| checks::expects_changed(was, &c)).unwrap_or_default();
+                            if !changed.is_empty() {
+                                fields.push(("expects_changed", arr(changed.into_iter().map(s))));
+                            }
                             if let Some(b) = &before {
                                 fields.push(("diff", plate_diff(b, &ev)));
                             }
@@ -3717,7 +4296,7 @@ impl Session {
                         Err(e) => self.apply_error(e),
                     };
                 }
-                match self.model.apply(&mut self.eval, request_id, expected, &edits, cancelled) {
+                match self.commit_changes(request_id, expected, &edits, cancelled, false) {
                     Ok((applied, built)) => {
                         let mut fields = vec![
                             ("head", s(applied.head.text())),
@@ -3725,10 +4304,17 @@ impl Session {
                             ("added", arr(applied.added.iter().map(s))),
                             ("changed", arr(applied.changed.iter().map(s))),
                         ];
+                        add_notes(&mut fields, self.model.project());
+                        if !placements.is_empty() { fields.push(("placements", arr(placements))); }
                         if let (Some(b), Some((_, e))) = (&before, &built) {
                             fields.push(("diff", plate_diff(b, e)));
                         }
                         self.commit_reply(fields, built)
+                    }
+                    // the off-bed gate's refusal has no source position yet: find its statement
+                    Err(ApplyError::Build(mut f)) if f.op == "place" && f.file.is_empty() => {
+                        self.placement_source(&mut f, args, &edits);
+                        self.apply_error(ApplyError::Build(f))
                     }
                     Err(e) => self.apply_error(e),
                 }
@@ -3759,9 +4345,9 @@ impl Session {
                 }
             }
             "render" => {
-                if self.last.as_ref().map_or(true, |e| e.plate.parts.is_empty()) {
+                let Some(ev) = self.last.clone().filter(|e| !e.plate.parts.is_empty()) else {
                     return Reply::err("nothing on the plate to render yet");
-                }
+                };
                 let list = |k: &str| -> Vec<String> {
                     match args.get(k) {
                         Some(Value::Str(s)) => vec![s.clone()],
@@ -3779,25 +4365,26 @@ impl Session {
                         return Reply::err(format!("unknown view '{v}': {} or \"yaw,pitch\" in degrees", VIEW_NAMES.join(", ")));
                     }
                 }
-                let objects = list("object");
-                if let Some(ev) = &self.last {
-                    for o in &objects {
-                        if !ev.plate.parts.iter().any(|p| &p.object == o) {
-                            let names: Vec<&str> = ev.plate.parts.iter().map(|p| p.object.as_str()).collect();
-                            return Reply::err(format!("'{o}' is not on the plate (printed objects: {})", names.join(", ")));
-                        }
-                    }
-                }
-                let camera = match camera_arg(args, &|name| self.locate(name), &|n| self.mark_box(n)) {
+                let objects = match compare::objects_arg(&ev, args) {
+                    Ok(objects) => objects,
+                    Err(e) => return Reply::err(e),
+                };
+                let camera = match camera_in_colours(args, self.eval.colour_mode, &|name| self.locate(name), &|n| self.mark_box(n)) {
                     Ok(camera) => camera,
                     Err(e) => return Reply::err(e),
                 };
+                if let Some(step) = args.get("step") {
+                    let Some(id) = step.as_str() else { return Reply::err("'step' takes a step id from fab.tree") };
+                    return match self.render_step(&ev, &objects, id, views, camera) {
+                        Ok(render) => Reply { images: Vec::new(), ok: true, text: String::new(), update: None, render: Some(render) },
+                        Err(e) => Reply::err(e),
+                    };
+                }
                 let names = list("test_print");
                 let tubes = args.get("tubes").and_then(Value::as_bool) == Some(true);
                 if !names.is_empty() || (self.test_mode && objects.is_empty() && !tubes && list("volume").is_empty() && list("spot").is_empty()) {
                     return self.render_pieces(&names, args, views, camera).unwrap_or_else(Reply::err);
                 }
-                let ev = self.last.clone().expect("the plate was checked above");
                 if tubes {
                     return match self.tubes_look(&ev, &objects, views) {
                         Ok(look) => Reply { images: Vec::new(), ok: true, text: look.answer.clone(), update: None, render: Some(RenderRequest::Look(Arc::new(look))) },
@@ -3816,6 +4403,7 @@ impl Session {
             tubes::ORIENT_TOOL => self.orient_tool(args, cancelled),
             strength_plan::TOOL => self.strength_plan_tool(args, cancelled),
             strengthen::TOOL => self.strengthen_tool(args, cancelled),
+            interference::TOOL => self.interference_tool(args, cancelled),
             supports::VIEW_TOOL => self.overhang_view_tool(args, cancelled),
             "supports" => self.supports_tool(args, cancelled),
             compare::TOOL => compare::tool(self, args),
@@ -3890,10 +4478,19 @@ impl Session {
                 };
                 let bytes = match format {
                     "stl" => stl::plate_to_stl(&ev.plate),
-                    _ => match threemf::plate_to_3mf(&ev.plate, &threemf::Info { title: self.model.name.clone(), designer: String::new() }) {
-                        Ok(b) => b,
-                        Err(e) => return Reply::err(e.to_string()),
-                    },
+                    _ => {
+                        let mut plate = std::borrow::Cow::Borrowed(&ev.plate);
+                        for (i, name) in ev.part_colors.iter().take(ev.plate.parts.len()).enumerate() {
+                            let rgb = fab_model::eval::shown_color(&ev.colors, &ev.mapped.inks, name);
+                            if plate.parts[i].color[..3] != rgb {
+                                plate.to_mut().parts[i].color[..3].copy_from_slice(&rgb);
+                            }
+                        }
+                        match threemf::plate_to_3mf(&plate, &threemf::Info { title: self.model.name.clone(), designer: String::new() }) {
+                            Ok(b) => b,
+                            Err(e) => return Reply::err(e.to_string()),
+                        }
+                    }
                 };
                 if let Some(dir) = path.parent() {
                     let _ = std::fs::create_dir_all(dir);
@@ -3927,7 +4524,15 @@ impl Session {
 #[cfg(test)]
 #[test]
 fn the_manifest_holds() {
-    manifest().validate().expect("the fab service's manifest");
+    let manifest = manifest();
+    manifest.validate().expect("the fab service's manifest");
+    for (tool, argument) in [("colour_mode", "mode"), ("render", "colours")] {
+        let definition = manifest.tools.iter().find(|t| t.name == tool).unwrap();
+        let schema = makepad_model::json::parse(definition.parameters.as_bytes()).unwrap();
+        let choices = schema.get("properties").unwrap().get(argument).unwrap().get("enum").unwrap().as_arr().unwrap();
+        assert_eq!(choices.iter().filter_map(Value::as_str).collect::<Vec<_>>(), ["model", "material"]);
+        assert!(schema.get("required").unwrap().as_arr().unwrap().iter().all(|v| v.as_str() != Some(argument)));
+    }
 }
 
 #[cfg(test)]

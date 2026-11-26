@@ -43,7 +43,7 @@ fn material(b: &mut DocumentBuilder, name: &str, color: [f32; 4], roughness: f32
     b.add_material(m)
 }
 
-/// A placed part takes its tint, transmission and roughness from a translucent print swatch.
+/// A translucent print swatch gives the placed part its transmission and roughness.
 /// Other colours keep the placement's display colour; inserts keep their fade. A part shown
 /// without printing keeps its own material: the views draw it as a ghost, and Mechanics' closed
 /// box solid in its case.
@@ -54,10 +54,8 @@ fn part_material(b: &mut DocumentBuilder, ev: &Evaluated, i: usize, mut color: [
     }
     let name = ev.part_color(i).unwrap_or("Part");
     if let Some(swatch) = fab_materials::swatch::swatch(name).filter(|s| s.colour.translucency > 0.0) {
-        let [red, green, blue] = swatch.colour.srgb;
-        let tint = makepad_render::srgb_to_linear(makepad_widgets::vec3f(red, green, blue));
         let mut m = PbrMaterial::new(MaterialId::default(), name);
-        m.base_color = [tint.x, tint.y, tint.z, 1.0];
+        m.base_color = color;
         m.transmission = swatch.colour.translucency;
         m.ior = 1.5;
         m.roughness = swatch.roughness.unwrap_or(FILAMENT_ROUGHNESS);
@@ -330,6 +328,25 @@ pub fn build_loose(ev: &Evaluated, name: &str, pieces: &[(String, &fab_loose::me
 /// repeats: they draw in the ghosts' own pass and take their part's draw priority.
 pub fn build_ghosts(ev: &Evaluated, name: &str, pieces: &[(String, &fab_loose::mesh::PieceMesh, [f32; 4])], copies: &[(String, String)], skip: &[String]) -> Arc<Scene> {
     build_with(ev, name, None, false, false, None, pieces, copies, "Joint check", skip, &[], &[], None, &mut |_, _| {})
+}
+
+/// The name of the whole part's ghost piece in a step's scene (`<part>~whole`).
+pub fn whole_name(part: &str) -> String {
+    format!("{part}~whole")
+}
+
+/// The scene of a plate whose placed part `part` shows an earlier step of its build (`shown`, as
+/// [`Evaluated::with_step`] made it): the plate's, and the whole part's own display mesh `whole`
+/// again as a piece named [`whole_name`], a copy of the part's element, which the view draws
+/// see-through. A part drawn from its field has an empty display mesh: it gets no ghost.
+/// Nothing is reused from the plate's scene: the overlap analysis it keeps is of the whole part.
+pub fn build_step(shown: &Evaluated, name: &str, part: usize, whole: &fab_plate::RenderMesh) -> Arc<Scene> {
+    let Some(p) = shown.plate.parts.get(part).filter(|_| !whole.indices.is_empty()) else {
+        return build(shown, name);
+    };
+    let piece = fab_loose::mesh::PieceMesh { positions: whole.positions.clone(), normals: whole.normals.clone(), indices: whole.indices.clone() };
+    let ghost = whole_name(&p.object);
+    build_with(shown, name, None, false, false, None, &[(ghost.clone(), &piece, p.color)], &[(ghost, p.object.clone())], "Step", &[], &[], &[], None, &mut |_, _| {})
 }
 
 /// The scene of a resin printer's slice: the plate's, and the supports its parts stand on

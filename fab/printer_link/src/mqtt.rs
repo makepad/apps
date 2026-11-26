@@ -225,6 +225,7 @@ pub(crate) struct Session<S: ByteStream> {
 
 impl<S: ByteStream> Session<S> {
     pub(crate) fn connect(mut stream: S, serial: &str, code: &Secret, now: Instant) -> Result<Self, Error> {
+        crate::entries::MQTT_CONNECT.enter();
         if serial.is_empty() || !serial.bytes().all(|b| b.is_ascii_alphanumeric()) { return Err(Error::Protocol); }
         let mut body = Vec::new();
         string(&mut body, b"MQTT")?;

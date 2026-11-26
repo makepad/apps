@@ -26,5 +26,6 @@ mod regex_lite;
 pub mod spellings;
 pub mod trees;
 pub mod template;
+pub mod virtual_printer;
 
 pub use config::{Config, Value};

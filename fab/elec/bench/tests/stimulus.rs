@@ -14,7 +14,7 @@ fn net(id: u32) -> NetRef {
 fn resistor_input(b: u32, sources: Vec<BenchSource>) -> LowerInput {
     LowerInput {
         nets: ["0", "a", "b"].into_iter().enumerate()
-            .map(|(i, name)| LowerNet { id: net(i as u32), name: name.into(), supply: false }).collect(),
+            .map(|(i, name)| LowerNet { id: net(i as u32), name: name.into(), supply: false, heard: false }).collect(),
         ground: net(0),
         parts: vec![LowerPart {
             id: CompRef { board: BoardId(0), comp: CompId(0) },

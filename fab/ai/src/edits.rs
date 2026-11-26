@@ -11,6 +11,8 @@
 //! replace(width, param(30mm, min: 20mm, max: 40mm))   // a top-level `let` of a plain value
 //! remove(lid)
 //! rename(lid, cover)
+//! after(body)                            // a following `let body = code` builds on body, otherwise additions go after body's definition in order
+//! let body = m.brep.fillet(body, 2mm, {edges: m.edge(body.top, body.front)})   // what body was is now body_<kind>
 //! set(fill#2.material, red)              // a fill, by number in script order (fab.params lists them)
 //! remove(fill#1)
 //! move(fill#3, fill#1)                   // fill#3 takes fill#1's place: fills paint in order, the last on top
@@ -25,7 +27,7 @@
 //! Values and code are taken as the nodes they are written as (their exact
 //! text), never assembled from pieces.
 
-use fab_model::Edit;
+use fab_model::{Anchor, Edit};
 use makepad_script::syntax::{self, Kind, Node};
 
 fn arg_text<'a>(src: &'a str, n: &Node) -> &'a str {
@@ -60,6 +62,19 @@ impl Word<'_> {
             _ => &src[self.span.clone()],
         }
     }
+
+    /// A solid id, optionally introduced by a named argument such as `to:`.
+    fn solid_id(&self, src: &str, keyword: Option<&str>) -> Option<String> {
+        let first = match &self.nodes.first()?.kind {
+            Kind::Entry { name, op, value, .. } if Some(name.as_str()) == keyword && op == ":" => value.as_ref(),
+            _ => &self.nodes[0],
+        };
+        match &first.kind {
+            Kind::Str(name) if self.nodes.len() == 1 && !name.is_empty() => Some(name.clone()),
+            Kind::Ident(_) | Kind::Index { .. } => Some(src[first.span.start..self.span.end].split_whitespace().collect()),
+            _ => None,
+        }
+    }
 }
 
 fn words<'n>(args: &'n [Node]) -> Vec<Word<'n>> {
@@ -82,9 +97,10 @@ pub fn parse(text: &str) -> Result<Vec<Edit>, String> {
     })?;
     let src = tree.source();
     let mut out = Vec::new();
-    // `before(name)`: where the statements added after it go (else each finds its own place).
-    let mut anchor: Option<(String, bool)> = None;
-    for (i, stmt) in tree.statements().iter().enumerate() {
+    let mut anchor = Anchor::Auto;
+    let mut unused_before = false;
+    let mut statements = tree.statements().iter().enumerate().peekable();
+    while let Some((i, stmt)) = statements.next() {
         let at = |m: String| {
             let (line, col) = makepad_model_script::lang::names::Names::line_col_of(src, stmt.span.start);
             format!("edit {} ({line}:{col}): {m}", i + 1)
@@ -104,24 +120,53 @@ pub fn parse(text: &str) -> Result<Vec<Edit>, String> {
             Some("remove") => Edit::Remove { solid: need(0, "(solid)")?.path(src) },
             Some("move") => Edit::Move { solid: need(0, "(what, to): move(fill#3, fill#1)")?.path(src), to: need(1, "(what, to): move(fill#3, fill#1)")?.path(src) },
             Some("rename") => Edit::Rename { solid: need(0, "(solid, new_name)")?.path(src), to: need(1, "(solid, new_name)")?.path(src) },
+            Some("rollback") => {
+                let usage = || at("rollback takes a part and a step: rollback(bracket, to: eased)".into());
+                let [part, to] = args.as_slice() else { return Err(usage()) };
+                Edit::Truncate { solid: part.solid_id(src, None).ok_or_else(usage)?, to: to.solid_id(src, Some("to")).ok_or_else(usage)? }
+            }
             Some("unobject") => Edit::Root { kind: "object".into(), solid: need(0, "(solid)")?.path(src), add: false },
             Some("place" | "unplace") => return Err(at("where an object prints is the project's: fab.place with place(\"instance\", at: [..])".into())),
             Some("before") => {
-                anchor = Some((need(0, "(name): the statements added after it go before that name's `let` or `fn`")?.path(src), false));
+                anchor = Anchor::Before(need(0, "(name): the statements added after it go before that name's `let` or `fn`")?.path(src));
+                unused_before = true;
                 continue;
             }
-            _ => Edit::Add {
-                code: stmt.text(src).to_string(),
-                before: anchor.as_mut().map(|(name, used)| {
-                    *used = true;
-                    name.clone()
-                }),
-            },
+            Some("after") => {
+                let [arg] = args.as_slice() else { return Err(at("after takes one name: after(name)".into())) };
+                let name = arg.path(src);
+                if name.contains(['.', '[', '#', '@']) {
+                    return Err(at(format!("after({name}): an inline step has no `let` to build on: rename it first in the same batch: rename({name}, <name>) then after(<name>) and `let <name> = ...`")));
+                }
+                match statements.peek().map(|(_, next)| &next.kind) {
+                    Some(Kind::Let { keyword, names, pattern_span, value: Some(value) }) if keyword == "let" && names.len() == 1 && src[pattern_span.clone()] == *name => {
+                        if let Anchor::Before(before) = &anchor {
+                            return Err(at(format!("after cannot follow before({before}) while it places this batch's added statements and `let {name}` would build on {name}")));
+                        }
+                        out.push(Edit::After { solid: name, code: value.text(src).to_string() });
+                        statements.next();
+                        anchor = Anchor::Auto;
+                    }
+                    _ => anchor = Anchor::After { name, nth: 0 },
+                }
+                unused_before = false;
+                continue;
+            }
+            _ => {
+                let edit = Edit::Add { code: stmt.text(src).to_string(), at: anchor.clone() };
+                unused_before = false;
+                if let Anchor::After { nth, .. } = &mut anchor {
+                    *nth += 1;
+                }
+                edit
+            }
         };
         out.push(edit);
     }
-    if let Some((name, false)) = anchor {
-        return Err(format!("before({name}) places the statements added after it: none follows"));
+    match anchor {
+        Anchor::Before(name) if unused_before => return Err(format!("before({name}) places the statements added after it: none follows")),
+        Anchor::After { name, nth: 0 } => return Err(format!("after({name}) takes either `let {name} = code` to build on {name} or statements to add after {name}: none follows")),
+        _ => {}
     }
     if out.is_empty() {
         return Err("no edits: write Splash statements (set(height, 80mm), let lid = m.box({..}), object(lid), ...)".into());

@@ -1,0 +1,5 @@
+use mod.motion.*
+
+let INK = #bee3db
+let FACE = Font{family: "Inter" weight: 500}
+{INK: INK FACE: FACE}

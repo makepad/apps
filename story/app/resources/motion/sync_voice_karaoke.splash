@@ -1,0 +1,28 @@
+use mod.motion.*
+// VOICE KARAOKE — speech-synced kinetic type from the voiceover's own word
+// timings. The line being spoken sits large in the middle;
+// words already said turn ink, the word being said is lit in the accent
+// and pops 25% as it starts, words to come wait at 35%. When the voice
+// moves to its next line, the next line replaces this one.
+// Why: the viewer reads along at the speaker's pace, so emphasis in the
+// voice becomes emphasis on screen for free; re-timing the voice re-syncs
+// the graphic with no edit.
+// Host: bind @vo to the edit's voiceover node (Graphic params).
+Motion{
+    label: "Voice karaoke"
+    brief: "The spoken line, large, lighting and popping each word as the voiceover says it."
+    tags: ["kinetic-type", "voice-sync", "karaoke", "captions", "speech"]
+    duration: 4.8
+    inputs: {
+        ink: input(@color, #f4f7fa, "Spoken words")
+        accent: input(@color, #ff5c39, "The word being said")
+        background: input(@color, #0b0d12, "Ground; #00000000 over footage")
+    }
+    layers: [
+        Rect{size: vec2(1920, 1080) fill: in(@background)}
+        Text{source: voice(@vo) show: @line highlight: @active highlight_color: in(@accent) pop: @on_word
+             font: Font{family: "Inter" weight: 800} size: 120 tracking: -0.03 line_height: 1.1
+             at: vec2(960, 400) wrap: 1600 align: @center
+             color: fn(t, i, edit) { if voice(@vo).progress(i, edit) < 0 { rgba(0.957, 0.969, 0.98, 0.35) } else { in(@ink) } }}
+    ]
+}

@@ -5,7 +5,7 @@ use fab_elec_sim::cosim::{Bus, CoRun, CoSim, CoSimDevice, CoSimPin, CoState, Ste
 use fab_elec_sim::live::{Latest, LiveCmd, ValuePlan};
 use fab_elec_sim::livesim::{run_live, LiveSim, LiveSpec, Replan, Snapshots};
 use fab_elec_sim::circuit::{Boundary, BoundaryKind, CtlKind};
-use fab_elec_sim::rounds::{end_shift, seed_from, Block, Coupling, EndRecord, EndShift, Helpers, Lag, Planner, Post, RoundPlan, Warm, SHADOW_ACT, SHADOW_FIGURES};
+use fab_elec_sim::rounds::{end_shift, seed_from, Block, Coupling, EndRecord, EndShift, Helpers, HolderPort, Lag, Planner, Post, RoundPlan, Warm, SHADOW_ACT, SHADOW_FIGURES};
 use fab_elec_sim::analysis::partition::{Land, PartOpts};
 use fab_elec_sim::analysis::round::{plan_blocks, plan_blocks_kept, warm_plan, BlockPlan, BlockPlanner, RoundMap};
 use fab_elec_sim::analysis::states::StateCache;
@@ -1000,7 +1000,7 @@ fn rail() -> SimCircuit {
     c
 }
 
-const RAIL_OPTS: PartOpts = PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: 1e-3, hub_tol: 0.1, fmin: 10.0, fmax: 48e3, band: f64::INFINITY, per_octave: 4, min_island: 1, control: Vec::new(), supplies: Vec::new(), round: 32.0 / 96e3 };
+const RAIL_OPTS: PartOpts = PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: 1e-3, hub_tol: 0.1, fmin: 10.0, fmax: 48e3, band: f64::INFINITY, per_octave: 4, min_island: 1, control: Vec::new(), supplies: Vec::new(), heard: Vec::new(), round: 32.0 / 96e3 };
 
 /// The block planner's plan (`plan_blocks`).
 #[derive(Clone)]
@@ -1061,17 +1061,22 @@ fn rail_crosstalk_between_blocks_is_right_in_size_and_one_round_late() {
     }
 }
 
-/// Three voices on one supply: 5 V behind 10 ohm with 22 uF on the rail, declared a supply. Each
-/// voice is a Schmitt-trigger RC oscillator (rf onto 10 nF, its timing node starting empty) and a
-/// second section buffering the oscillator's output into 10 kohm; both sections' switches draw
-/// from the rail.
-fn shared_rail_voices() -> SimCircuit {
+/// Three voices on one supply: 5 V behind 10 ohm, declared a supply. With `bulk` the rail holds
+/// 22 uF and a bulk 100 uF behind 4.7 ohm (two RC sections as the holder stands, at about 64 us and
+/// 1.6 ms); without, the rail is flat, 10 ohm at every frequency. Each voice is a Schmitt-trigger
+/// RC oscillator (rf onto 10 nF, its timing node starting empty) and a second section buffering
+/// the oscillator's output into 10 kohm; both sections' switches draw from the rail.
+fn shared_rail_voices(bulk: bool) -> SimCircuit {
     let mut c = SimCircuit::new();
     c.model("lo", ModelKind::Sw, &[("vt", 2.35), ("vh", 0.5), ("ron", 50.0), ("roff", 1e9)]);
     c.model("hi", ModelKind::Sw, &[("vt", -2.35), ("vh", 0.5), ("ron", 50.0), ("roff", 1e9)]);
     c.v("vs", "vs", "0", Source::dc(5.0));
     c.r("rs", "vs", "rail", 10.0);
-    c.c("crail", "rail", "0", 22e-6);
+    if bulk {
+        c.c("crail", "rail", "0", 22e-6);
+        c.r("rbulk", "rail", "bulk", 4.7);
+        c.c("cbulk", "bulk", "0", 100e-6);
+    }
     c.declare_supply("rail");
     for k in 0..3 {
         let n = |s: &str| format!("{s}{k}");
@@ -1091,7 +1096,7 @@ fn shared_rail_voices() -> SimCircuit {
 
 /// The block planner at the host's listening settings: a band to 24 kHz, islands under 8 unknowns
 /// joining their single reader.
-const LISTEN_OPTS: PartOpts = PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: 1e-3, hub_tol: 0.1, fmin: 10.0, fmax: 24e3, band: f64::INFINITY, per_octave: 4, min_island: 8, control: Vec::new(), supplies: Vec::new(), round: 32.0 / 48e3 };
+const LISTEN_OPTS: PartOpts = PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: 1e-3, hub_tol: 0.1, fmin: 10.0, fmax: 24e3, band: f64::INFINITY, per_octave: 4, min_island: 8, control: Vec::new(), supplies: Vec::new(), heard: Vec::new(), round: 32.0 / 48e3 };
 
 #[derive(Clone)]
 struct Listening;
@@ -1107,13 +1112,19 @@ impl Planner for Listening {
 /// buffer's block's draw, returned a round late, not a read of the oscillator by the rail's block.
 /// - The plan: the rail alone in block 0, and each voice (its oscillator and its buffer) a block
 ///   apart from the others, with nothing merged by the round map.
+/// - The rail's holder stands beside each voice as two RC sections (`HolderPort::second`, a
+///   declared supply), leaving at most 0.5 % of its impedance.
+/// - Each port is the holder's 10 ohm at DC within 1 %, and a pair's time constants are no
+///   slower than the band's lowest point. So too on a flat rail (no capacitors, 10 ohm at every
+///   frequency), which stays in block 0: there the pair has nothing to fit, and the band's lowest
+///   point is all that bounds its search.
 /// - In Fast at the live settings, each oscillator's period in rounds is the whole run's within
 ///   0.1 %, and the run names the block each net is solved in (`LiveSim::block_of`) as the plan.
 #[test]
 fn voices_whose_switches_draw_from_a_shared_supply_each_run_in_a_block_of_their_own() {
-    let mut whole = Solver::new(&shared_rail_voices()).expect("the voices build");
+    let mut whole = Solver::new(&shared_rail_voices(true)).expect("the voices build");
     fab_elec_sim::analysis::op::operating_point(&mut whole, false).expect("the voices have an operating point");
-    let plan = plan_blocks(&shared_rail_voices(), &whole, 0.0, &LISTEN_OPTS).expect("the voices plan").expect("the voices split");
+    let plan = plan_blocks(&shared_rail_voices(true), &whole, 0.0, &LISTEN_OPTS).expect("the voices plan").expect("the voices split");
     let report = &plan.report;
     let block_of = |name: &str| plan.plan.blocks.iter().position(|b| b.own.iter().any(|&(_, g)| whole.unknowns[g as usize].name == name))
         .unwrap_or_else(|| panic!("a block solves {name}: {report}"));
@@ -1125,8 +1136,33 @@ fn voices_whose_switches_draw_from_a_shared_supply_each_run_in_a_block_of_their_
     }
     assert!(voices[0] != voices[1] && voices[1] != voices[2] && voices[0] != voices[2] && plan.plan.blocks.len() == 4 && plan.map.merges == 0,
         "each voice is a block of its own, with nothing merged: {voices:?}, {report}");
-    let (whole_run, one) = run(shared_rail_voices(), None, None, 9, spec(SAMPLE, SAMPLE), None, None);
-    let (split, sim) = run(shared_rail_voices(), Some(Box::new(Listening)), None, 9, spec(SAMPLE, SAMPLE), None, None);
+    let ports: Vec<&HolderPort> = plan.plan.ports.iter().filter(|p| p.name.starts_with("rail#port")).collect();
+    assert!(ports.len() == 3 && ports.iter().all(|p| p.second && p.rb > 0.0 && p.rb2 > 0.0 && p.tau < p.tau2),
+        "each voice stands beside the rail's holder as two RC sections: {:?}, {report}", ports.iter().map(|p| (p.r, p.rb, p.tau, p.rb2, p.tau2, p.l)).collect::<Vec<_>>());
+    let left: f64 = report.lines().find(|l| l.contains("the holder of rail")).and_then(|l| l.split("leaving at most ").nth(1)).and_then(|l| l.split(" %").next())
+        .and_then(|v| v.trim().parse().ok()).unwrap_or_else(|| panic!("the report says what the rail's port leaves: {report}"));
+    assert!(left <= 0.5, "the rail's two-section port leaves at most 0.5 % of its holder's impedance: {left} %, {report}");
+    // at DC the capacitors are open and the holder is the supply's 10 ohm; a pair's sections are
+    // no slower than the band's lowest point
+    let slowest = 1.0 / (2.0 * std::f64::consts::PI * LISTEN_OPTS.fmin);
+    let pinned = |ports: &[&HolderPort], rail: &str, report: &str| {
+        for p in ports {
+            assert!(((p.r + p.rb + p.rb2) / 10.0 - 1.0).abs() < 0.01 && (p.tau2 == 0.0 || (p.tau <= slowest && p.tau2 <= slowest)),
+                "the {rail} rail's port is its holder's 10 ohm at DC within 1 %, a pair's time constants up to {slowest:.3e} s: {:?}, {report}",
+                (p.r, p.rb, p.tau, p.rb2, p.tau2, p.l));
+        }
+    };
+    pinned(&ports, "bulk", report);
+    let mut flat = Solver::new(&shared_rail_voices(false)).expect("the flat rail's voices build");
+    fab_elec_sim::analysis::op::operating_point(&mut flat, false).expect("the flat rail's voices have an operating point");
+    let plan = plan_blocks(&shared_rail_voices(false), &flat, 0.0, &LISTEN_OPTS).expect("the flat rail's voices plan").expect("the flat rail's voices split");
+    let report = &plan.report;
+    let rail = plan.plan.blocks.iter().position(|b| b.own.iter().any(|&(_, g)| flat.unknowns[g as usize].name == "rail"));
+    let ports: Vec<&HolderPort> = plan.plan.ports.iter().filter(|p| p.name.starts_with("rail#port")).collect();
+    assert!(rail == Some(0) && ports.len() == 3, "the flat rail is block 0, with a port beside each voice: {rail:?}, {report}");
+    pinned(&ports, "flat", report);
+    let (whole_run, one) = run(shared_rail_voices(true), None, None, 9, spec(SAMPLE, SAMPLE), None, None);
+    let (split, sim) = run(shared_rail_voices(true), Some(Box::new(Listening)), None, 9, spec(SAMPLE, SAMPLE), None, None);
     assert_eq!(sim.blocks(), 4, "the run steps the rail and the three voices apart");
     // the run says where it solves each net (`LiveSim::block_of`) as the plan does
     assert_eq!((one.block_of("rail"), sim.block_of("rail"), sim.block_of("no such net")), (None, Some(0), None),
@@ -1392,7 +1428,7 @@ fn a_hub_readers_late_term_is_its_draws_step_through_the_pad() {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum RelaySource { Pad, Switched }
+enum RelaySource { Pad, Switched, WeakSwitch }
 
 /// A pad `pa` (5 V) rising at `at` and high for a millisecond in two, read by `reader`: a diode
 /// into a capacitor charged within a tenth of a sample and held (10 M), or a resistor into a
@@ -1403,10 +1439,12 @@ enum RelaySource { Pad, Switched }
 fn relayed_pad(reader: &str, source: RelaySource, buffered: bool, at: f64) -> SimCircuit {
     let mut c = SimCircuit::new();
     c.v("supply", "vdd", "0", Source::dc(5.0));
-    let params = if source == RelaySource::Switched { GpioParams { t_edge: 1e-3, ..PARAMS } } else { PARAMS };
+    let params = if source == RelaySource::Pad { PARAMS } else { GpioParams { t_edge: 1e-3, ..PARAMS } };
     c.gpio("pa", "a", "vdd", "0", params, PinMode::Pwm { period: 2e-3, high: 1e-3, origin: at });
-    let export = if source == RelaySource::Switched {
-        c.model("hi", ModelKind::Sw, &[("vt", 2.0), ("vh", 0.25), ("ron", 1.0), ("roff", 1e9)]);
+    let export = if source != RelaySource::Pad {
+        // The weak switch drives the same 25 ohm load through 25 M: at 5 V its output is at most 5 uV.
+        let ron = if source == RelaySource::WeakSwitch { 25e6 } else { 1.0 };
+        c.model("hi", ModelKind::Sw, &[("vt", 2.0), ("vh", 0.25), ("ron", ron), ("roff", 1e9)]);
         c.sw("sdrive", "vdd", "swout", "a", "0", "hi", false);
         c.r("rpull", "swout", "0", 25.0);
         "swout"
@@ -1435,7 +1473,7 @@ const SAMPLE48: f64 = 1.0 / 48e3;
 
 fn relayed_opts() -> PartOpts {
     PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: fab_elec_sim::analysis::round::CUT_TOL, hub_tol: 0.1, fmin: 10.0, fmax: 0.5 / SAMPLE48, band: f64::INFINITY, per_octave: 4, min_island: 1, control: Vec::new(),
-        supplies: Vec::new(), round: 8.0 * SAMPLE48 }
+        supplies: Vec::new(), heard: Vec::new(), round: 8.0 * SAMPLE48 }
 }
 
 /// A jump relayed through a block lands along its whole path, and passes on as an event (the relay
@@ -1443,7 +1481,11 @@ fn relayed_opts() -> PartOpts {
 /// - planned: the pad's import into the buffer's block charges nothing, but the buffer's export
 ///   into the diode's block would be held, so both land; the buffer's test is kept by its matrices,
 ///   and with a linear reader after it instead, the next plan takes that test from before and
-///   lands nothing: a verdict is made again every plan, never kept with a test;
+///   lands nothing by its charge: a verdict is made again every plan, never kept with a test. The
+///   buffer's pair still lands there, by the band figure alone (`round::band_figure`): its
+///   transfer to its export prices a split at the band's top over the bar. The final linear
+///   reader's import lands by band only when its own node is declared heard. Probing it during
+///   a run changes that landing when the plan made behind the sound goes in;
 /// - run in rounds, the pad rising at two places in a sample: the diode's block lands on the jump
 ///   the buffer passes on, and its node's peak is the one it takes straight from the pad, within a
 ///   millivolt (split, or landed with no event passed on, it overshoots by up to 2.7 V more);
@@ -1454,40 +1496,104 @@ fn relayed_opts() -> PartOpts {
 /// - the buffer relays the pad's corner as a plain event. When the pad drives a switch, naming
 ///   `swout` to `x` lands the diode block's import and it restarts at the relayed instant as at
 ///   an edge. Naming `swout` to itself counts one born pair by name. The diode's import then
-///   lands only if its own weighted figure exceeds its bar.
+///   lands only if its own weighted charge or band figure exceeds its bar. A weak switch still
+///   crosses, but its relayed step under the diode reader's step bar causes no edge restart.
 #[test]
 fn a_jump_relayed_through_a_block_lands_along_its_path() {
-    use RelaySource::{Pad, Switched};
+    use RelaySource::{Pad, Switched, WeakSwitch};
     let cache = StateCache::default();
-    let plan = |reader: &str| {
-        let c = relayed_pad(reader, Pad, true, 10.0 * SAMPLE48);
+    let plan = |reader: &str, heard: bool| {
+        let mut c = relayed_pad(reader, Pad, true, 10.0 * SAMPLE48);
+        if heard {
+            c.declare_heard("n");
+        }
         let sim = LiveSim::new(c.clone(), ValuePlan::default(), 1, spec(SAMPLE48, SAMPLE48)).expect("the rig's operating point converges");
         plan_blocks_kept(&c, sim.solver(), sim.t(), &relayed_opts(), &cache, None, None).expect("the rig plans").expect("the rig splits")
     };
-    let diode = plan("diode");
+    let diode = plan("diode", false);
     let reader = (0..diode.solvers.len()).find(|&k| diode.solvers[k].unknown("n").is_some()).expect("a block holds the diode's node");
     let born: Vec<_> = diode.tested.iter().filter(|x| x.jumps).collect();
     assert!(diode.plan.blocks.len() == 3 && born.len() == 1 && born[0].reader != reader, "three blocks, the pad born into the buffer's block: {}", diode.report);
     assert!(born[0].lands && born[0].figure < born[0].bar && diode.tested.iter().any(|x| x.reader == reader && !x.jumps && x.lands && x.amp * x.figure > x.bar) && diode.plan.lands.len() == 2,
         "the relayed pair lands on its own figure, the born one for it: {}", diode.report);
-    let linear = plan("linear");
+    let linear = plan("linear", false);
     let born: Vec<_> = linear.tested.iter().filter(|x| x.jumps).collect();
     assert!(born.len() == 1 && !born[0].made, "the buffer's test is taken from before, its matrices the same: {}", linear.report);
-    assert!(linear.plan.lands.is_empty() && linear.tested.iter().all(|x| !x.lands), "with a linear reader after the buffer nothing lands: the verdict is made again, not kept with the test: {}", linear.report);
+    assert!(linear.tested.iter().all(|x| !x.lands || x.by_band), "with a linear reader after the buffer nothing lands by its charge: the verdict is made again, not kept with the test: {}", linear.report);
+    assert!(born[0].lands && born[0].by_band, "with a linear reader after the buffer, the pad's jump lands in the buffer by the band figure alone: {}", linear.report);
+    let heard_linear = plan("linear", true);
+    for (p, heard) in [(&linear, false), (&heard_linear, true)] {
+        let import = p.tested.iter().find(|x| !x.jumps && x.amp > 0.0 && p.solvers[x.reader].unknown("n").is_some())
+            .expect("the relayed jump reaches the linear reader that owns n");
+        assert_eq!((import.lands, import.by_band), (heard, heard),
+            "the final linear reader should land by band exactly when n is declared heard (heard={heard}): {}", p.report);
+    }
+    // Keep the probe's plan queued while the old cut plays. Returning the job makes the next
+    // round start deterministic without tying the proof to the speed of a helper.
+    let mut c = relayed_pad("linear", Pad, true, 10.0 * SAMPLE48);
+    c.declare_heard("vdd");
+    let signals = ValuePlan { nets: vec!["0".into(), "vdd".into(), "n".into()], pins: vec![Vec::new()], pin_net: vec![None], ..ValuePlan::default() };
+    let node = signals.nets.iter().position(|name| name == "n").expect("the linear reader's node has a net signal");
+    let mut rows = vec![true; signals.nets.len() + signals.pins.len()];
+    rows[node] = false;
+    let live_spec = LiveSpec { heard: true, playing: true, sample_rate: 48e3, round: 8,
+        replan: Replan { edit: SAMPLE48, lead: SAMPLE48, slow: f64::INFINITY, ..Replan::default() }, ..spec(SAMPLE48, SAMPLE48) };
+    let mut live = LiveSim::new(c, signals, 1, live_spec).expect("the live linear rig starts");
+    let (queue, queued) = mpsc::channel();
+    live.set_checks(Some(Helpers { count: 1, post: Arc::new(move |job| {
+        if fab_elec_sim::rounds::behind() { queue.send(job).expect("the proof keeps the behind queue open"); } else { job(); }
+    }) }), false);
+    live.set_planner(Some(Box::new(BlockPlanner { opts: relayed_opts(), states: StateCache::default(), pool: None }))).expect("the live linear rig plans");
+    let lands = |sim: &LiveSim| {
+        let plan = sim.round_plan().expect("the linear rig stays in rounds");
+        let reader = sim.block_of("n").expect("a live block owns the linear reader's node") as u32;
+        let q = plan.couplings.iter().position(|c| c.from.0 != 0 && c.to.iter().any(|(r, _)| *r == reader))
+            .expect("the live linear reader imports the buffer's export");
+        plan.lands.binary_search(&(q as u32, reader)).is_ok()
+    };
+    let mut record = Record::default();
+    record.begin(&live.solver().unknowns);
+    let round = live.round_len();
+    let first = live.stats().plans;
+    live.apply(LiveCmd::SetWhole(rows.clone().into()));
+    advance(&mut live, 2.0 * round, &mut record);
+    assert_eq!(live.stats().plans, first, "probing ground, a declared output and a pin row must leave the plan in force");
+    assert!(!lands(&live), "the unprobed linear reader must start with its relayed import split");
+    rows[node] = true;
+    live.apply(LiveCmd::SetWhole(rows.into()));
+    advance(&mut live, 6.0 * round, &mut record);
+    assert!(!lands(&live), "the old cut must keep playing while the probe's plan is queued");
+    let job = queued.try_recv().expect("the live probe must post its plan behind the sound even after a cheap plan");
+    job();
+    advance(&mut live, 7.0 * round, &mut record);
+    assert!(lands(&live), "the installed probe plan must land the relayed import into the linear reader");
+    assert_eq!(live.stats().plans_helped, 1, "the checker must make the probe plan");
+    live.apply(LiveCmd::SetWhole(Arc::from([])));
+    assert!(live.circuit().nodes.iter().any(|n| n.name == "vdd" && n.heard), "clearing the views must keep the design's declared output heard");
+    advance(&mut live, 10.0 * round, &mut record);
+    let job = queued.try_recv().expect("clearing the probe must re-judge the linear reader behind the sound");
+    job();
+    advance(&mut live, 11.0 * round, &mut record);
+    assert!(!lands(&live), "the live linear reader must split again after its probe is cleared");
+
     // the node's peak in rounds, and how its block restarted
     let run = |source: RelaySource, buffered: bool, at: f64| {
         let spec = LiveSpec { rate: f64::INFINITY, playing: false, max_step: SAMPLE48, res: SAMPLE48, trace: false, pipeline: false, edge_restarts: true, ..LiveSpec::default() };
-        let c = relayed_pad("diode", source, buffered, at);
+        let mut c = relayed_pad("diode", source, buffered, at);
+        if source == WeakSwitch {
+            c.declare_heard("bo");
+        }
         let mut sim = LiveSim::new(c.clone(), ValuePlan::default(), 1, spec).expect("the operating point converges");
         let mut planner = BlockPlanner { opts: relayed_opts(), states: Default::default(), pool: None };
-        if source == Switched {
+        let mut weak_bar = None;
+        if source != Pad {
             // Keep the switch output with its pad. The diode block imports x and solves bo locally.
             planner.opts.control.push("swout".into());
-            planner.opts.land.push(Land { born: "swout".into(), to: "x".into() });
-            let mut born_only = planner.opts.clone();
-            born_only.land[0].to = "swout".into();
-            for opts in [&planner.opts, &born_only] {
-                let p = plan_blocks_kept(&c, sim.solver(), sim.t(), opts, &planner.states, None, None).expect("the switch rig plans").expect("the switch rig splits");
+            // The run uses the last target: the weak switch names only its born pair.
+            let targets: &[&str] = if source == WeakSwitch { &["swout"] } else { &["swout", "x"] };
+            for &to in targets {
+                planner.opts.land = vec![Land { born: "swout".into(), to: to.into() }];
+                let p = plan_blocks_kept(&c, sim.solver(), sim.t(), &planner.opts, &planner.states, None, None).expect("the switch rig plans").expect("the switch rig splits");
                 assert!(p.solvers.len() == 3 && p.solvers[0].find_device("sdrive").is_some(),
                     "the switched rig must split into three blocks with the switch in block 0: {}", p.report);
                 let import = |boundary: &str| p.tested.iter().find(|x| p.plan.couplings[x.coupling].to.iter()
@@ -1500,14 +1606,18 @@ fn a_jump_relayed_through_a_block_lands_along_its_path() {
                 assert!(!relayed.jumps && p.solvers[relayed.reader].find_device("dd").is_some(),
                     "the diode's block must read x as the buffer's relayed export: {}", p.report);
                 let named = p.relay.by_name.contains(&(relayed.coupling, relayed.reader));
-                if opts.land[0].to == "x" {
+                if to == "x" {
                     assert!(relayed.lands && named, "swout to x must land the diode's relayed pair by name: {}", p.report);
                 } else {
                     assert!(!named, "swout to itself must stop before the diode's relayed pair: {}", p.report);
-                    assert_eq!(relayed.lands, relayed.amp * relayed.figure > relayed.bar,
-                        "with only swout named, the diode's relayed pair must land exactly when its own figure is over its bar: {}", p.report);
+                    assert_eq!(relayed.lands, relayed.amp * relayed.figure > relayed.bar || relayed.amp * relayed.band > relayed.bar,
+                        "with only swout named, the diode's relayed pair must land exactly when its own charge or band figure is over its bar: {}", p.report);
                     assert!(p.report.lines().any(|line| line.starts_with("fast charge, slow hold:") && line.contains(", 1 by name)")),
                         "the plan line must count the born swout pair once by name: {}", p.report);
+                    if source == WeakSwitch {
+                        assert!(relayed.lands, "the heard buffer output must make the diode's import a landing read: {}", p.report);
+                        weak_bar = Some(relayed.step);
+                    }
                 }
             }
         }
@@ -1516,9 +1626,18 @@ fn a_jump_relayed_through_a_block_lands_along_its_path() {
         record.begin(&sim.solver().unknowns);
         // a round's points reach the record a round late
         advance(&mut sim, at + 32.0 * SAMPLE48, &mut record);
+        if let Some(bar) = weak_bar {
+            let x = record.v("x");
+            let span = x.iter().copied().fold(f64::NEG_INFINITY, f64::max) - x.iter().copied().fold(f64::INFINITY, f64::min);
+            assert!(0.0 < span && span < bar, "the relayed export must move within the diode reader's step bar: {span:e} V against {bar:e} V");
+        }
         let restarts = sim.block_work().map(|(_, _, work)| {
-            if source == Switched {
+            if source != Pad {
                 assert!(work[0].restarts.crossing > 0, "the switch makes a crossing in the source block: {:?}", work[0].restarts);
+            }
+            if source == WeakSwitch {
+                let buffer = sim.block_of("x").expect("a block exports the buffer input");
+                assert!(work[buffer].restarts.corner_edge > 0, "the named born pair must land the weak crossing before the buffer passes it on");
             }
             work[sim.block_of("n").expect("a block solves the diode's node")].restarts
         });
@@ -1544,6 +1663,9 @@ fn a_jump_relayed_through_a_block_lands_along_its_path() {
     let (_, r) = run(Switched, true, 0.0);
     let r = r.expect("the buffered switch runs in rounds");
     assert!(r.corner > 0 && r.corner_edge == r.corner, "the diode lands every relayed switching instant as an edge: {r:?}");
+    let (_, r) = run(WeakSwitch, true, 0.0);
+    let r = r.expect("the buffered weak switch runs in rounds");
+    assert_eq!(r.corner_edge, 0, "the diode must take a relayed switching step under its bar as data: {r:?}");
 }
 
 /// The block planner, the gains each plan's round map proved recorded.

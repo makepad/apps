@@ -139,7 +139,7 @@ fn run(c: &Compiled, until: u64, low: std::ops::Range<u64>) -> Trace {
         let e = &c.lowered.entries[ran.entry as usize];
         let mut scratch = vec![0; e.program.scratch_words()];
         let mut mem = ir::Mem { ctx: &mut [], state: &mut state, shared: ir::Shared::Read(&c.lowered.shared_init), bufs: &[] };
-        let mut io = ir::Io { ins: [&[], &[]], outs: [&mut [], &mut []] };
+        let mut io = ir::Io::default();
         ir::run_ports(&e.program, &mut scratch, &mut mem, &mut io, 1, &mut replay);
         assert_eq!(&state, want, "state words after `{}` at {} ns", e.name, ran.start);
         assert!(ran.ops <= e.cost, "`{}` ran {} ops; its bound is {}", e.name, ran.ops, e.cost);

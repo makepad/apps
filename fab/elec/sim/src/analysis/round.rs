@@ -17,6 +17,18 @@
 //!   test picks which way is read in the same round: the one whose late read forces the smaller
 //!   error (the stiff side's `tau` against the soft side's `gain`). The other way is read one round
 //!   late.
+//!
+//!   An echo corrects a ghost's late far-node voltage `X(t-D)` as the local voltage `x_s(t)`
+//!   moves away from the value `u_far` the far block read. The ghost sees
+//!   `X(t-D) + g (x_s(t) - u_far(t-D))`. At each accepted step the far block exports `g`
+//!   from the inverse row for `X`, at the column of its voltage import's branch. The echo reads
+//!   that gain `D` late. A gap in the far block's read history or gain table clears the correction
+//!   for the round.
+//!   An echo the size screen would export at a reader whose own crossings set a pitch corrects a
+//!   cut that pitch hears. Once the plan passes its round map, such a cut's reader and far block
+//!   merge instead (`merge_pitch_cuts`, Fable's Q22 option (c)); the plan is then taken again from
+//!   there. The echo corrects the reader's late copy for its own moves, not for the far block's: an
+//!   event there (a switch, a gate) reaches the reader late and moves its crossings for good.
 //! - Reading a branch current across islands cannot be a boundary voltage, and a same-round cycle
 //!   cannot be ordered: such islands merge, and the report says why.
 //! - Block 0 is the control island (every GPIO pad), alone at stage 0: nothing it reads is late.
@@ -36,7 +48,9 @@
 //!   and it names none), and a group of small blocks the link's blocks hold is unbinned; the
 //!   rest settle again from where settling began, and the plan is mapped once more. A link that
 //!   touches nothing settled is the start's own: the plan goes back to where settling began, is
-//!   mapped and merged there until it passes, and settles again. A settled plan of a single
+//!   mapped and merged there until it passes, and settles again; when the start had passed, the
+//!   failure is in what settled, and every settled item comes out (a run logs it when the link is
+//!   a return's carried path, which names no supply). A settled plan of a single
 //!   stage takes every settled item out. A shape that passed its map is never mapped again.
 //! - The round map proves the plan's loops; accuracy is the held step's per-cut tests. A per-cut
 //!   rho does not see a loop that closes through another block's gain. Each value read a round
@@ -59,7 +73,10 @@
 //!   Otherwise the entry `(i, j)` of the failing map that maximises `w_i |M_ij| x_j` (`x = A^n 1`,
 //!   `w = 1^T A^n`), the heaviest link of the dominant loop, names the late value `j` whose two
 //!   blocks (where it is solved and where it comes in) merge, and the map is taken again; one
-//!   block always passes. The largest row sum of `|M|` (sensitivity) and each late value's largest
+//!   block always passes. A return into a hub node is carried by the port its block holds for the
+//!   node, unless most of the entry reaches that block through a boundary that reads another
+//!   block's export in the same round (`carried`): that block passes the return on within the
+//!   round, so it and the return's block merge instead. The largest row sum of `|M|` (sensitivity) and each late value's largest
 //!   entry from a return in the hub form (it follows that node with that gain) are printed and
 //!   gate nothing.
 //! - The held step takes its cuts at the present state and tests them in other states made from a
@@ -75,6 +92,13 @@
 //!   where that round is estimated no slower than merging (`round_estimate`); otherwise its two
 //!   blocks merge. The plan is then built once and mapped once; a cut the built plan reads later
 //!   than its places said (`late_cuts`) merges too, counted as an anomaly.
+//! - The imports' test (`charge_hold`, A-K1) lands a jump when its charge times hold or the cost
+//!   of a step-wide ramp at the top of the judged band exceeds the import's bar at that amplitude.
+//!   A landing reader keeps an event when the export steps by at least the voltage those figures
+//!   require. Named landings and unjudged figures keep every event.
+//!   The band figure uses the reader's voltage exports and the nets it owns that the design's
+//!   output parts or bench voltage probes read. A live probe adds its net to the test when the
+//!   run re-plans behind the sound.
 
 use crate::analysis::held::{accuracy_band, bar_failed, held_states, in_band, judge, late_wrong, recirculated, weight, Bar, Held, Others, Seed, STABILITY};
 use crate::analysis::states::{self, StateCache};
@@ -82,7 +106,7 @@ use crate::analysis::partition::{hz, Land, PartOpts};
 use crate::circuit::{Boundary, BoundaryKind, SimCircuit};
 use crate::newton::{SimDiag, Solver};
 use crate::num::C64;
-use crate::rounds::{fan_out, flipped, hold_switches, lag_rounds, seed_from, slot_of, switches, Block, CarriedPlan, CarryRefused, Chain, Coupling, Fanned, Helpers, HolderPort, Lag, Planner, RoundPlan, Unit, Warm};
+use crate::rounds::{fan_out, flipped, hold_switches, lag_rounds, seed_from, slot_of, switches, Block, CarriedPlan, CarryRefused, Chain, Coupling, Echo, Fanned, GainCoupling, Helpers, HolderPort, Lag, Planner, RoundPlan, Unit, Warm};
 use crate::sparse::Layout;
 use crate::stamp::{EvalCx, Stamps, UnkKind};
 use std::cell::RefCell;
@@ -126,6 +150,7 @@ pub struct Carry {
     zero: Option<usize>,
     unpipelined: Vec<u32>,
     lands: Vec<(u32, u32)>,
+    land_steps: Vec<f64>,
     chains: Vec<Chain>,
     tested: Vec<ChargeHold>,
     relay: Relay,
@@ -166,7 +191,7 @@ impl BlockPlanner {
     /// under `CUT_TOL` and a return into block 0 under a tenth of the block's swing, islands of at
     /// least 8 unknowns; no pool until the host gives one.
     pub fn for_run(sim: &crate::livesim::LiveSim, band: f64) -> BlockPlanner {
-        BlockPlanner { opts: PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: CUT_TOL, hub_tol: 0.1, fmin: 10.0, fmax: 0.5 / sim.step_cap(), band, per_octave: 4, min_island: 8, control: Vec::new(), supplies: Vec::new(), round: sim.round_len() }, states: StateCache::default(), pool: None }
+        BlockPlanner { opts: PartOpts { never_cut: Vec::new(), land: Vec::new(), cut_tol: CUT_TOL, hub_tol: 0.1, fmin: 10.0, fmax: 0.5 / sim.step_cap(), band, per_octave: 4, min_island: 8, control: Vec::new(), supplies: Vec::new(), heard: Vec::new(), round: sim.round_len() }, states: StateCache::default(), pool: None }
     }
 }
 
@@ -369,7 +394,7 @@ struct Placed {
 }
 
 /// A boundary source of a block: its name, kind, local node and branch (0 for a current; a holder
-/// port's is its voltage boundary's), and a port's memory `w` (0 for the others).
+/// port's is its voltage boundary's), and its port memories (0 for each absent memory).
 #[derive(Clone)]
 struct Bound {
     name: String,
@@ -377,6 +402,7 @@ struct Bound {
     node: u32,
     branch: u32,
     w: u32,
+    w2: u32,
 }
 
 /// A built plan before its round map.
@@ -401,8 +427,8 @@ fn find(root: &mut [usize], mut i: usize) -> usize {
 }
 
 /// Cuts `ckt`, as `whole` holds it at time `t`, into blocks. `None` for Exact, or when the plan
-/// that passes the round map has a single stage. `opts.control` gains every GPIO pad and
-/// `opts.supplies` every node the circuit declares a supply.
+/// that passes the round map has a single stage. `circuit_opts` adds the circuit's control nodes,
+/// declared supplies and heard nets to the plan options.
 pub fn plan_blocks(ckt: &SimCircuit, whole: &Solver, t: f64, opts: &PartOpts) -> Result<Option<BlockPlan>, SimDiag> {
     plan_blocks_kept(ckt, whole, t, opts, &StateCache::default(), None, None)
 }
@@ -541,7 +567,10 @@ fn plan_in_states(ckt: &SimCircuit, whole: &Solver, t: f64, opts: &PartOpts, cac
     let mut groups: Vec<Vec<usize>> = Vec::new();
     type ShapeKey = (Vec<usize>, Option<usize>, Vec<(usize, usize)>);
     let mut proven: Option<(ShapeKey, Built, RoundMap, RoundProof)> = None;
-    let (built, taken, proof) = loop {
+    // the plan-time test of each import (A-K1 revisit) on each plan that passes its map, which the
+    // pitch rule reads (`merge_pitch_cuts`)
+    let mut table_ms = 0.0;
+    let (built, taken, proof, table, relay) = loop {
         let (placed, stages) = placed_stages(whole, &devs, &island, &cuts, &mut root, zero, &h, &mut log);
         if stages.len() < 2 {
             let Some((r, z, n, j)) = settled.take() else { return Ok(None) };
@@ -611,7 +640,14 @@ fn plan_in_states(ckt: &SimCircuit, whole: &Solver, t: f64, opts: &PartOpts, cac
         if proven.as_ref().is_some_and(|(key, ..)| *key == shape_key(&mut root)) {
             let (_, built, taken, proof) = proven.take().expect("this shape passed");
             map.states = taken.states;
-            break (built, taken, proof);
+            let table_start = Instant::now();
+            let (table, relay) = charge_hold(&built, whole, &others, t, 0.5 / o.fmax, &o, &own, cache, key);
+            table_ms += table_start.elapsed().as_secs_f64() * 1e3;
+            if merge_pitch_cuts(&mut root, &h, &built, &relay, &mut log) {
+                settled = None;
+                continue;
+            }
+            break (built, taken, proof, table, relay);
         }
         let mut built = build(ckt, whole, t, &cuts, &devs, &island, &mut root, &placed, &stages)?;
         // the blocks are built from the circuit as lowered: the values set since, as the run has them
@@ -632,7 +668,7 @@ fn plan_in_states(ckt: &SimCircuit, whole: &Solver, t: f64, opts: &PartOpts, cac
         let (present, present_failed, proof) = round_map(&built, t, &points, o.fmin / 100.0, &h, !keyed, pool)?;
         map.maps += 1;
         let (mut taken, mut failed) = if keyed {
-            let (mut taken, failed) = key_maps(&built, whole, &others, &points, o.fmin / 100.0, &h, if in_force.is_some_and(|p| p.same_cut(&built.plan)) { KEEP } else { 1.0 }, pool, &mut map)?;
+            let (mut taken, failed) = key_maps(&built, whole, &others, &points, o.fmin / 100.0, &h, if in_force.is_some_and(|p| p.same_partition(&built.plan)) { KEEP } else { 1.0 }, pool, &mut map)?;
             taken.include_above(&present, "the present state");
             let (hub, ordinary) = (present.wrong.0 / o.hub_tol, present.wrong_ordinary.0 / o.cut_tol);
             taken.present = if hub >= ordinary { (hub, present.wrong.1.clone()) } else { (ordinary, format!("{}, through ordinary late values", present.wrong_ordinary.1)) };
@@ -650,7 +686,7 @@ fn plan_in_states(ckt: &SimCircuit, whole: &Solver, t: f64, opts: &PartOpts, cac
         taken.late_rounds = late_rounds;
         if let (None, Some(l)) = (&failed, late) {
             map.anomalies += 1;
-            failed = Some(Fail { from: l.from, other: l.to, why: format!("{} (an anomaly: re-weighed before the build, it passed)", l.why), cuts: Vec::new() });
+            failed = Some(Fail { from: l.from, other: l.to, why: format!("{} (an anomaly: re-weighed before the build, it passed)", l.why), cuts: Vec::new(), carried: false });
         }
         // and with those switches flipped, stability only (where a device may saturate): a press
         // keeps the proof
@@ -689,10 +725,16 @@ fn plan_in_states(ckt: &SimCircuit, whole: &Solver, t: f64, opts: &PartOpts, cac
                 }
             }
             let mut unbin: Vec<_> = groups.iter().filter(|g| [ra, rb].contains(&find(&mut root, g[0]))).collect();
-            if keep_out.is_empty() && unbin.is_empty() && proven.is_some() {
-                // the start passed, so the failure is in what settled
+            // the start passed, so the failure is in what settled; a pair carried along a return's
+            // path names neither the supply nor the group, so all of them come out (it costs speed,
+            // never the proof): logged, so a board that meets it is seen
+            let all = keep_out.is_empty() && unbin.is_empty() && proven.is_some();
+            if all {
                 keep_out.extend(&supplies);
                 unbin.extend(&groups);
+            }
+            if all && f.carried && (!supplies.is_empty() || !groups.is_empty()) {
+                eprintln!("fab-elec plan: at t = {t:.4} s every supply stays out of block 0 and every group of small blocks is unbinned: the settled plan's map fails on a pair carried along a return's path, which names none of them ({})", f.why);
             }
             ahead = !keep_out.is_empty() || !unbin.is_empty();
             let action = if ahead {
@@ -717,14 +759,19 @@ fn plan_in_states(ckt: &SimCircuit, whole: &Solver, t: f64, opts: &PartOpts, cac
             ahead = true;
             continue;
         }
-        break (built, taken, proof);
+        let table_start = Instant::now();
+        let (table, relay) = charge_hold(&built, whole, &others, t, 0.5 / o.fmax, &o, &own, cache, key);
+        table_ms += table_start.elapsed().as_secs_f64() * 1e3;
+        // a pitch reader's echo the screen would export: its cut merges, and the settled plan stands
+        // (a later failure merges its pair)
+        if merge_pitch_cuts(&mut root, &h, &built, &relay, &mut log) {
+            (settled, proven) = (None, None);
+            continue;
+        }
+        break (built, taken, proof, table, relay);
     };
     map = RoundMap { merges: map.merges, maps: map.maps, ms: map.ms, joins: map.joins, reweighed: map.reweighed, anomalies: map.anomalies,
         states: map.states, key_maps: map.key_maps, kept: map.kept, guard_merges: map.guard_merges, ..taken };
-    // the plan-time test of each import (A-K1 revisit): which land, which split
-    let table_start = Instant::now();
-    let (table, relay) = charge_hold(&built, whole, &others, t, 0.5 / o.fmax, &o, &own, cache, key);
-    let table_ms = table_start.elapsed().as_secs_f64() * 1e3;
     let total = start.elapsed().as_secs_f64() * 1e3;
     let mut report = report(&h, &built, &cuts, &log, &map, [held_ms, total - held_ms - map.ms - table_ms, map.ms, table_ms], &states_line, &table);
     report.push_str(&charge_hold_report(&built, &table, &relay));
@@ -732,22 +779,24 @@ fn plan_in_states(ckt: &SimCircuit, whole: &Solver, t: f64, opts: &PartOpts, cac
     let trees = chains(&built.plan, &built.labels, &table, &relay.steps);
     let born_late = table.iter().filter(|x| x.jumps && !x.lands && built.plan.couplings[x.coupling].lag != Lag::Same).count();
     report.push_str(&chains_report(&built, born_late, &trees));
-    let Built { mut plan, solvers, .. } = built;
+    let Built { mut plan, mut solvers, .. } = built;
     // an import whose jump would be held where its reader charges fast lands (A-K1), and every
     // pair before it on the jump's path: its jumps are not split, and pass on as events
-    plan.lands = table.iter().filter(|x| x.lands).map(|x| (x.coupling as u32, x.reader as u32)).collect();
-    plan.lands.sort_unstable();
+    let mut landed: Vec<_> = table.iter().filter(|x| x.lands).map(|x| ((x.coupling as u32, x.reader as u32), x.step)).collect();
+    landed.sort_unstable_by_key(|&(pair, _)| pair);
+    (plan.lands, plan.land_steps) = landed.into_iter().unzip();
     plan.chains = trees;
     plan.switches = if other.is_some() { user } else { Vec::new() };
     plan.late_tol = proof.late_tol();
     plan.hub_tol = Some(proof.hub_tol());
     plan.proof = Some(Arc::new(proof));
     name_cuts(&mut plan, &h, &cuts);
+    fit_echoes(&mut plan, &mut solvers, &relay, &mut report);
     // a plan made in the key's states: the next with the key pays no miss, and its cut is kept to
     // build again at other part values
     others.planned.store(true, std::sync::atomic::Ordering::Release);
     let carry = others.base().is_some().then(|| Arc::new(Carry {
-        h: h.clone(), cuts, island, root, zero, unpipelined: plan.unpipelined.clone(), lands: plan.lands.clone(), chains: plan.chains.clone(),
+        h: h.clone(), cuts, island, root, zero, unpipelined: plan.unpipelined.clone(), lands: plan.lands.clone(), land_steps: plan.land_steps.clone(), chains: plan.chains.clone(),
         tested: table.clone(), relay: relay.clone(), land: o.land.clone(),
     }));
     if let Some(c) = &carry {
@@ -800,6 +849,7 @@ pub fn build_carried(ckt: &SimCircuit, whole: &Solver, t: f64, opts: &PartOpts, 
     }
     built.plan.unpipelined = carry.unpipelined.clone();
     built.plan.lands = carry.lands.clone();
+    built.plan.land_steps = carry.land_steps.clone();
     built.plan.chains = carry.chains.clone();
     built.plan.switches = if other.is_some() { user.clone() } else { Vec::new() };
     name_cuts(&mut built.plan, h, cuts);
@@ -829,7 +879,7 @@ pub fn build_carried(ckt: &SimCircuit, whole: &Solver, t: f64, opts: &PartOpts, 
     }
     map.maps += 1;
     map.ms = start.elapsed().as_secs_f64() * 1e3;
-    let Built { mut plan, solvers, .. } = built;
+    let Built { mut plan, mut solvers, .. } = built;
     plan.late_tol = proof.late_tol();
     plan.hub_tol = Some(proof.hub_tol());
     plan.proof = Some(Arc::new(proof));
@@ -841,11 +891,12 @@ pub fn build_carried(ckt: &SimCircuit, whole: &Solver, t: f64, opts: &PartOpts, 
     for line in &fits {
         let _ = writeln!(report, "  {line}");
     }
+    fit_echoes(&mut plan, &mut solvers, &carry.relay, &mut report);
     Ok(Carried::Plan(Box::new(BlockPlan { plan, solvers, map, report, held: h.clone(), tested: carry.tested.clone(), relay: carry.relay.clone(), carry: None })))
 }
 
 /// `opts` with the circuit's own facts added: every GPIO pad and timing cell output to `control`,
-/// every node it declares a supply to `supplies`.
+/// every declared supply to `supplies` and every declared heard net to `heard`.
 pub fn circuit_opts(ckt: &SimCircuit, opts: &PartOpts) -> PartOpts {
     let mut o = opts.clone();
     for node in ckt.devices.gpio.iter().map(|g| g.pad).chain(ckt.devices.cell.iter().map(|c| c.out)) {
@@ -854,9 +905,12 @@ pub fn circuit_opts(ckt: &SimCircuit, opts: &PartOpts) -> PartOpts {
             o.control.push(name.clone());
         }
     }
-    for node in ckt.nodes.iter().filter(|n| n.supply) {
-        if !o.supplies.contains(&node.name) {
+    for node in &ckt.nodes {
+        if node.supply && !o.supplies.contains(&node.name) {
             o.supplies.push(node.name.clone());
+        }
+        if node.heard && !o.heard.contains(&node.name) {
+            o.heard.push(node.name.clone());
         }
     }
     o
@@ -1263,6 +1317,25 @@ fn build(ckt: &SimCircuit, whole: &Solver, t: f64, cuts: &[Cut], devs: &[Dev], i
     }
     let name_of = |u: u32| whole.unknowns[u as usize].name.clone();
     let names: Vec<String> = order.iter().map(|&r| name_of(first(r, root) as u32)).collect();
+    // One coupling per exported voltage, read on time only when every importer runs later.
+    // Echoes use these indices before the solvers supply the exporter-local unknowns.
+    let mut by_export: BTreeMap<u32, (Coupling, String)> = BTreeMap::new();
+    for (k, imp) in imports.iter().enumerate() {
+        for (&u, &cut) in imp {
+            let from = owner[u as usize];
+            let (coupling, _) = by_export.entry(u).or_insert_with(|| (Coupling { from: (from as u32, 0), to: Vec::new(), lag: Lag::Same, cuts: Vec::new(), rho: 0.0 }, name_of(u)));
+            coupling.to.push((k as u32, format!("{}#in", name_of(u))));
+            // each reader across its own cut: one value's readers can each have one
+            if let Some(c) = cut {
+                coupling.cuts.push((k as u32, c));
+                coupling.rho = coupling.rho.max(cuts[c as usize].rho);
+            }
+            if stages[&order[from]] >= stages[&order[k]] {
+                coupling.lag = Lag::Round;
+            }
+        }
+    }
+    let mut echoes = Vec::new();
     let mut subs = Vec::with_capacity(order.len());
     let mut ghosts: BTreeMap<String, Vec<(u32, String)>> = BTreeMap::new();
     for k in 0..order.len() {
@@ -1288,18 +1361,37 @@ fn build(ckt: &SimCircuit, whole: &Solver, t: f64, cuts: &[Cut], devs: &[Dev], i
             let node = sub.node(&name);
             sub.devices.boundary.push(Boundary { name: format!("{name}#in"), node, kind: BoundaryKind::Voltage, v0: whole.x[u as usize] });
         }
+        if !ghosts_of[k].is_empty() {
+            let far: BTreeSet<u32> = ghosts_of[k].iter().flat_map(|&d| devs[d].loaded.iter().copied())
+                .filter(|u| imports[k].contains_key(u)).collect();
+            // The voltage couplings come first in this order, followed by the hub returns.
+            for (of, (&f, (back, far_name))) in by_export.iter().enumerate() {
+                if back.lag == Lag::Same || !far.contains(&f) || !back.to.iter().any(|to| to.0 as usize == k) { continue; }
+                let input = format!("{far_name}#in");
+                let boundary = sub.devices.boundary.iter().position(|b| b.name == input && b.kind == BoundaryKind::Voltage).expect("ghost imports its far node");
+                for (q, (&u, (c, own))) in by_export.iter().enumerate() {
+                    if c.from.0 as usize != k || c.lag != Lag::Same || !c.to.iter().any(|to| to.0 == back.from.0) { continue; }
+                    let node = sub.node(own);
+                    let name = format!("{far_name}#echo{node}");
+                    sub.devices.boundary.push(Boundary { name: name.clone(), node, kind: BoundaryKind::Echo { of: boundary as u32 }, v0: whole.x[u as usize] });
+                    echoes.push(Echo { block: k as u32, name, of: of as u32, coupling: q as u32, g: 0.0, gain: None });
+                }
+            }
+        }
         subs.push(sub);
     }
     // each hub consumer's holder port at the node it returns its current into (`HolderPort`):
     // inert until it is fitted (`fit_ports`), its first value the return's
-    let mut ports: Vec<(usize, String, usize, u32)> = Vec::new();
+    let mut ports = Vec::new();
     for (k, taken) in returns.iter().enumerate() {
         for &(c, j) in taken {
             let name = name_of(cuts[c as usize].node);
             let Some(of) = subs[j].devices.boundary.iter().position(|b| b.name == format!("{name}#in")) else { continue };
             let node = subs[j].devices.boundary[of].node;
-            subs[j].devices.boundary.push(Boundary { name: format!("{name}#port{k}"), node, kind: BoundaryKind::Port { of: of as u32 }, v0: 0.0 });
-            ports.push((j, format!("{name}#port{k}"), k, c));
+            let second = ckt.find_node(&name).is_some_and(|n| ckt.nodes[n as usize].supply);
+            let port = HolderPort { block: j as u32, name: format!("{name}#port{k}"), second, ..HolderPort::default() };
+            subs[j].devices.boundary.push(Boundary { name: port.name.clone(), node, kind: BoundaryKind::Port { of: of as u32, second }, v0: 0.0 });
+            ports.push((k, c, port));
         }
     }
     // the solvers, each block after the blocks whose returns it takes, so each return's first value
@@ -1328,28 +1420,17 @@ fn build(ckt: &SimCircuit, whole: &Solver, t: f64, cuts: &[Cut], devs: &[Dev], i
             subs[k].devices.boundary.push(Boundary { name: format!("{name}#ret{j}"), node, kind: BoundaryKind::Current, v0 });
             return_from.push((j, br, format!("{name}#ret{j}"), c));
         }
+        // Append the gain feeds after the physical boundaries so their instance indices stay fixed.
+        let boundaries = &mut subs[k].devices.boundary;
+        let gains: Vec<_> = boundaries.iter().enumerate().filter(|(_, b)| matches!(b.kind, BoundaryKind::Echo { .. }))
+            .map(|(i, b)| Boundary { name: format!("{}#gain", b.name), node: 0, kind: BoundaryKind::EchoGain { echo: i as u32 }, v0: 0.0 }).collect();
+        boundaries.extend(gains);
         solvers[k] = Some(make(k, &subs[k], &mut owns)?);
     }
     let solvers: Vec<Solver> = solvers.into_iter().map(|s| s.expect("every block built")).collect();
     let blocks: Vec<Block> = order.iter().enumerate().map(|(k, r)| Block { name: names[k].clone(), stage: stages[r], own: std::mem::take(&mut owns[k]) }).collect();
-    // couplings: one per exported unknown, to every block that imports it; read in the same round
-    // only when every importer runs at a later stage
-    let mut by_export: BTreeMap<u32, (Coupling, String)> = BTreeMap::new();
-    for (k, imp) in imports.iter().enumerate() {
-        for (&u, &cut) in imp {
-            let from = owner[u as usize];
-            let local = solvers[from].unknown(&name_of(u)).unwrap_or(0);
-            let (coupling, _) = by_export.entry(u).or_insert_with(|| (Coupling { from: (from as u32, local), to: Vec::new(), lag: Lag::Same, cuts: Vec::new(), rho: 0.0 }, name_of(u)));
-            coupling.to.push((k as u32, format!("{}#in", name_of(u))));
-            // each reader across its own cut: one value's readers can each have one
-            if let Some(c) = cut {
-                coupling.cuts.push((k as u32, c));
-                coupling.rho = coupling.rho.max(cuts[c as usize].rho);
-            }
-            if blocks[from].stage >= blocks[k].stage {
-                coupling.lag = Lag::Round;
-            }
-        }
+    for (&u, (coupling, _)) in &mut by_export {
+        coupling.from.1 = solvers[coupling.from.0 as usize].unknown(&name_of(u)).unwrap_or(0);
     }
     // the late values, and which are currents returned in the hub form
     let (mut couplings, mut labels): (Vec<Coupling>, Vec<String>) = by_export.into_values().unzip();
@@ -1360,8 +1441,8 @@ fn build(ckt: &SimCircuit, whole: &Solver, t: f64, cuts: &[Cut], devs: &[Dev], i
         let consumer = order[j];
         let rho = cuts[c as usize].soft.iter().filter(|&(&s, _)| find(root, s) == consumer).map(|(_, &r)| r).fold(0.0, f64::max);
         couplings.push(Coupling { from: (j as u32, br), to: vec![(holder as u32, name)], lag: Lag::Round, cuts: vec![(holder as u32, c)], rho });
-        if let Some((_, port, _, _)) = ports.iter().find(|p| p.0 == j && p.2 == holder && p.3 == c) {
-            plan_ports.push(HolderPort { block: j as u32, name: port.clone(), coupling: (couplings.len() - 1) as u32, ..HolderPort::default() });
+        if let Some((_, _, port)) = ports.iter().find(|(k, cut, p)| *k == holder && *cut == c && p.block as usize == j) {
+            plan_ports.push(HolderPort { coupling: (couplings.len() - 1) as u32, ..port.clone() });
         }
         labels.push(format!("the return at {} from block {j} ({})", name_of(cuts[c as usize].node), names[j]));
         hub.push(Some(name_of(cuts[c as usize].node)));
@@ -1378,18 +1459,19 @@ fn build(ckt: &SimCircuit, whole: &Solver, t: f64, cuts: &[Cut], devs: &[Dev], i
             sums.push((u, shares));
         }
     }
-    let bounds = subs.iter().zip(&solvers).map(|(sub, s)| sub.devices.boundary.iter().map(|b| Bound {
+    let bounds = subs.iter().zip(&solvers).map(|(sub, s)| sub.devices.boundary.iter().filter(|b| !matches!(b.kind, BoundaryKind::EchoGain { .. })).map(|b| Bound {
         name: b.name.clone(),
         kind: b.kind,
         node: s.unknown(&sub.nodes[b.node as usize].name).unwrap_or(0),
         branch: match b.kind {
             BoundaryKind::Voltage => s.unknown(&format!("{}#branch", b.name)).unwrap_or(0),
-            BoundaryKind::Port { of } => s.unknown(&format!("{}#branch", sub.devices.boundary[of as usize].name)).unwrap_or(0),
-            BoundaryKind::Current => 0,
+            BoundaryKind::Port { of, .. } => s.unknown(&format!("{}#branch", sub.devices.boundary[of as usize].name)).unwrap_or(0),
+            BoundaryKind::Current | BoundaryKind::Echo { .. } | BoundaryKind::EchoGain { .. } => 0,
         },
         w: if matches!(b.kind, BoundaryKind::Port { .. }) { s.unknown(&format!("{}#w", b.name)).unwrap_or(0) } else { 0 },
+        w2: if matches!(b.kind, BoundaryKind::Port { second: true, .. }) { s.unknown(&format!("{}#w2", b.name)).unwrap_or(0) } else { 0 },
     }).collect()).collect();
-    Ok(Built { plan: RoundPlan { blocks, couplings, sums, ghosts, switches: Vec::new(), proof: None, late_tol: Vec::new(), hub_tol: None, unpipelined: Vec::new(), cuts: Vec::new(), cut_nodes: BTreeMap::new(), lands: Vec::new(), chains: Vec::new(), ports: plan_ports }, solvers, roots: order, bounds, hub, labels })
+    Ok(Built { plan: RoundPlan { blocks, couplings, sums, ghosts, echoes, gain_couplings: Vec::new(), switches: Vec::new(), proof: None, late_tol: Vec::new(), hub_tol: None, unpipelined: Vec::new(), cuts: Vec::new(), cut_nodes: BTreeMap::new(), lands: Vec::new(), land_steps: Vec::new(), chains: Vec::new(), ports: plan_ports }, solvers, roots: order, bounds, hub, labels })
 }
 
 /// The round map's points: the held step's band, then the matrix a step at the band's top solves
@@ -1579,8 +1661,168 @@ fn round_map(b: &Built, t: f64, points: &[(C64, String)], dc_alt: f64, h: &Held,
 /// (`fit_ports`).
 const PORT_FIT: f64 = 0.1;
 
+/// A static echo's bar in a reader with switches of the circuit's own (it sets a pitch), as a
+/// share of `cut_tol`: the pitch proof's 0.002 c at the scale drum16 measured, where its hats'
+/// mid-range static echoes, 2.07e-5 summed at an oscillator, move the pitch about 0.03 c. Too
+/// tight only exports more gain rows, which costs speed and never accuracy.
+pub const ECHO_PITCH_SHARE: f64 = 1.0 / 2000.0;
+
+/// The bar a reader's static echoes are judged against together (`screen_echoes`): `cut_tol`,
+/// or `ECHO_PITCH_SHARE` of it where the reader holds a switch of the circuit's own.
+pub fn echo_bar(cut_tol: f64, crossings: bool) -> f64 {
+    if crossings { cut_tol * ECHO_PITCH_SHARE } else { cut_tol }
+}
+
+/// Fable's rule 1 prices a split that crosses a jump as a ramp a step wide. The ramp costs
+/// `(w h)^2 / 8` of the jump's content at angular frequency `w`, with transfer `t` to the export.
+pub fn band_figure(t: f64, f_top: f64, h: f64) -> f64 {
+    t * ((2.0 * PI * f_top * h).powi(2) / 8.0)
+}
+
+/// The size screen (Fable's Q22 follow-up 2): per echo its reader, its bar (`echo_bar`) and its
+/// size, `(g_hi - g_lo) / 2 x S`: what a mid-range constant gain can leave wrong at the ghost's far
+/// node, per volt of the followed export's swing, times `S`, the reader's own export's response to
+/// that node. Per reader, from the smallest up, an echo is static while the sizes taken stay under
+/// the reader's bar with it, else exported. A constant gain is size 0, always static. In order of
+/// `sizes`; O(echoes log echoes).
+pub fn screen_echoes(sizes: &[(u32, f64, f64)]) -> Vec<bool> {
+    let mut order: Vec<usize> = (0..sizes.len()).collect();
+    order.sort_by(|&a, &b| sizes[a].0.cmp(&sizes[b].0).then(sizes[a].2.total_cmp(&sizes[b].2)).then(a.cmp(&b)));
+    let mut out = vec![false; sizes.len()];
+    let (mut reader, mut taken) = (None, 0.0);
+    for i in order {
+        let (r, bar, size) = sizes[i];
+        if reader != Some(r) {
+            (reader, taken) = (Some(r), 0.0);
+        }
+        if taken + size <= bar {
+            taken += size;
+            out[i] = true;
+        }
+    }
+    out
+}
+
+/// One echo as the size screen judges it (`screen`): its index in `RoundPlan::echoes`, its gain's
+/// range over the plan's states, its reader's bar and its size, and whether it is static.
+struct Screened {
+    echo: usize,
+    r: EchoResponse,
+    bar: f64,
+    size: f64,
+    stat: bool,
+}
+
+/// The size screen (`screen_echoes`) on `plan`'s echoes from the import tests' figures (`Relay`):
+/// an echo whose gain stays under 1e-3 in every state is dropped, and one with no reader
+/// response is exported. In the order of `plan.echoes`.
+fn screen(plan: &RoundPlan, relay: &Relay) -> Vec<Screened> {
+    let mut kept = Vec::new();
+    for (i, e) in plan.echoes.iter().enumerate() {
+        let (q, of) = (e.coupling as usize, e.of as usize);
+        let far = plan.couplings[of].from.0 as usize;
+        let r = relay.echo_responses.get(&(q, far, of)).copied().unwrap_or_default();
+        // Even a zero static fit can have an appreciable gain in another state.
+        if r.min.abs().max(r.max.abs()) < 1e-3 {
+            continue;
+        }
+        let sense = relay.echo_sense.get(&(of, e.block as usize, q)).copied();
+        let (bar, size) = match sense {
+            Some((s, bar)) => (bar, 0.5 * (r.max - r.min).abs() * s.min.abs().max(s.max.abs())),
+            None => (0.0, f64::INFINITY),
+        };
+        kept.push((i, r, bar, size));
+    }
+    let sizes: Vec<(u32, f64, f64)> = kept.iter().map(|&(i, _, bar, size)| (plan.echoes[i].block, bar, size)).collect();
+    kept.into_iter().zip(screen_echoes(&sizes)).map(|((echo, r, bar, size), stat)| Screened { echo, r, bar, size, stat }).collect()
+}
+
+/// Install each ghost's gain from its own export through the far reader to its late import, and
+/// screen it (`screen`): a static echo keeps the middle of its gain's range over the plan's
+/// states, with no export and no solve; an exported one is fed the far block's gain at each step,
+/// and the fixed start's until its first feed.
+fn fit_echoes(plan: &mut RoundPlan, solvers: &mut [Solver], relay: &Relay, report: &mut String) {
+    let screened = screen(plan, relay);
+    let mut echoes: Vec<Option<Echo>> = std::mem::take(&mut plan.echoes).into_iter().map(Some).collect();
+    for Screened { echo, r, bar, size, stat } in screened {
+        let mut e = echoes[echo].take().expect("each echo is screened once");
+        let (k, of, q) = (e.block as usize, e.of as usize, e.coupling as usize);
+        let back = &plan.couplings[of];
+        let far = back.from.0 as usize;
+        let node = &solvers[k].unknowns[plan.couplings[q].from.1 as usize].name;
+        let (_, input) = back.to.iter().find(|to| to.0 == e.block).expect("echo corrects its own import");
+        let lag = plan.lag_rounds(far, k, true);
+        let how = if stat { "static" } else { "exported" };
+        let judged = if size.is_finite() { format!("size {size:.1e} against {bar:.0e}") } else { "no reader response".to_string() };
+        let _ = writeln!(report, "  {} on {input} in block {k} follows {node} with g {:.3e}..{:.3e} over {} states (fixed start {:.3e}), {judged}: {how}, read {lag} rounds late",
+            e.name, r.min, r.max, r.states, r.static_g);
+        e.g = if stat { 0.5 * (r.min + r.max) } else { r.static_g };
+        if e.g != 0.0 {
+            solvers[k].set_param(&e.name, "g", e.g);
+        }
+        if stat {
+            solvers[k].set_param(&e.name, "exported", 0.0);
+        } else {
+            let (_, boundary) = plan.couplings[q].to.iter().find(|to| to.0 as usize == far).expect("echo follows an import of the far block");
+            let branch = solvers[far].unknown(&format!("{boundary}#branch")).expect("voltage import has a branch row");
+            e.gain = Some(plan.gain_couplings.len() as u32);
+            plan.gain_couplings.push(GainCoupling { of: e.of, branch, to: (e.block, format!("{}#gain", e.name)), initial: e.g });
+        }
+        plan.echoes.push(e);
+    }
+}
+
+/// The pitch rule (Fable's Q22 option (c)), on a plan `b` that passed its round map: an echo the
+/// size screen would export (`screen`) at a reader holding a switch of the circuit's own, whose
+/// crossings set a pitch (`Relay::switching`), corrects a cut that pitch hears, so its reader's
+/// and its far block's islands merge instead. The echo corrects the reader's late copy of the far
+/// node for the reader's own moves; an event of the far block reaches it late and moves its
+/// crossings for good (drum16 at 48 kHz: a hit stepped the hats 15 to 26 us). The merged block
+/// steps at the reader's crossings, which no static price sees, even where it is the plan's
+/// longest. The echoes group by the blocks they would join and each group merges into `root`;
+/// `log` says which. Whether any merged. O(echoes).
+fn merge_pitch_cuts(root: &mut [usize], h: &Held, b: &Built, relay: &Relay, log: &mut Vec<String>) -> bool {
+    let nb = b.plan.blocks.len();
+    let mut group: Vec<usize> = (0..nb).collect();
+    let (mut count, mut far_of) = (vec![0usize; nb], vec![false; nb]);
+    for s in screen(&b.plan, relay).iter().filter(|s| !s.stat) {
+        let e = &b.plan.echoes[s.echo];
+        let (k, far) = (e.block as usize, b.plan.couplings[e.of as usize].from.0 as usize);
+        if !relay.switching.get(k).copied().unwrap_or(false) {
+            continue;
+        }
+        let (x, y) = (find(&mut group, k), find(&mut group, far));
+        group[x.max(y)] = x.min(y);
+        count[k] += 1;
+        far_of[far] = true;
+    }
+    // per group (by its smallest block): its blocks, its pitch readers, their exported echoes and
+    // the far blocks they follow
+    let mut groups: BTreeMap<usize, (Vec<usize>, Vec<usize>, usize, Vec<usize>)> = BTreeMap::new();
+    for k in 0..nb {
+        let e = groups.entry(find(&mut group, k)).or_default();
+        e.0.push(k);
+        if count[k] > 0 {
+            e.1.push(k);
+            e.2 += count[k];
+        }
+        if far_of[k] {
+            e.3.push(k);
+        }
+    }
+    groups.retain(|_, g| g.0.len() > 1);
+    let named = |ks: &[usize]| ks.iter().map(|&k| b.plan.blocks[k].name.as_str()).collect::<Vec<_>>().join(", ");
+    for (blocks, pitch, echoes, far) in groups.values() {
+        log.push(format!("{echoes} echoes the size screen would export at {} (whose crossings set a pitch), following {}: merged", named(pitch), named(far)));
+        for w in blocks.windows(2) {
+            merge(root, b.roots[w[0]], b.roots[w[1]], "the pitch rule, as above", h, log);
+        }
+    }
+    !groups.is_empty()
+}
+
 /// Fits each holder port of `b` (`HolderPort`) to its holder's driving-point impedance at the
-/// node, over the map's band and the step's matrix (`fit_port`), and sets it in the port's block
+/// node, at DC, in the band and at the step's matrix (`fit_port`), and sets it in the port's block
 /// and the plan. The impedance is taken where the plan's map is judged: from a fixed start at the
 /// key's base (`base`: its seed and the whole circuit), so a plan made again on the key fits the
 /// same ports and keeps its maps (`Others::maps`); else at the state the blocks were built in. The holders go in an order where a
@@ -1619,53 +1861,88 @@ fn fit_ports(b: &mut Built, t: f64, base: Option<(&Seed, &Solver)>, points: &[(C
         };
         let resp = shape.respond(k, &load, 0..points.len());
         // one fit a node: every return into it sees the same impedance
-        let mut done: Vec<(String, Option<(f64, f64, f64, f64, f64, usize)>)> = Vec::new();
+        let mut done: Vec<(String, Option<(PortZ, f64, usize)>)> = Vec::new();
         for i in 0..b.plan.ports.len() {
             let Some((_, hj)) = at[i].filter(|a| a.0 == k) else { continue };
             let node = b.hub[b.plan.ports[i].coupling as usize].clone().unwrap_or_default();
             let fitted = match done.iter().find(|d| d.0 == node) {
                 Some(d) => d.1,
                 None => {
+                    // A holder singular at DC has no DC impedance to fit. Use its band and step points.
                     let fit: Vec<(usize, C64)> = (0..points.len()).filter(|&p| port_point(points, p, shape.band))
-                        .filter_map(|p| Some((p, resp[p].as_ref()?[hj].as_ref()?.drive))).filter(|(_, z)| z.norm() > 0.0 && z.norm().is_finite()).collect();
-                    let found = fit_port(&fit.iter().map(|&(p, z)| (points[p].0, z)).collect::<Vec<_>>(), step).map(|(r, rb, tau, l, worst, w)| (r, rb, tau, l, worst, fit[w].0));
+                        .filter_map(|p| Some((p, resp[p].as_ref()?[hj].as_ref().filter(|r| !r.floor)?.drive)))
+                        .filter(|(_, z)| z.norm() > 0.0 && z.norm().is_finite()).collect();
+                    let slowest = fit.iter().map(|&(p, _)| points[p].0)
+                        .filter(|s| s.re == 0.0 && s.im > 0.0).map(|s| s.im)
+                        .min_by(f64::total_cmp).map_or(f64::INFINITY, f64::recip);
+                    let second = b.plan.ports[i].second;
+                    let found = fit_port(&fit.iter().map(|&(p, z)| (points[p].0, z)).collect::<Vec<_>>(), step, second, slowest)
+                        .map(|(z, worst, w)| (z, worst, fit[w].0));
                     let consumers = b.plan.ports.iter().zip(&at).filter(|(p, a)| a.is_some_and(|a| a.0 == k) && b.hub[p.coupling as usize].as_deref() == Some(node.as_str())).count();
                     log.push(match found {
-                        Some((r, rb, tau, l, worst, p)) if worst <= PORT_FIT => format!("the holder of {node} (block {k}) stands beside its {consumers} consumers as {}, leaving at most {:.1} % of its impedance (at {})",
-                            one_port(r, rb, tau, l), worst * 100.0, points[p].1),
-                        Some((r, rb, tau, l, worst, p)) => format!("the holder of {node} (block {k}) fits no one-port within {PORT_FIT} (the nearest, {}, leaves {:.0} % at {}): its {consumers} consumers' returns are read bare",
-                            one_port(r, rb, tau, l), worst * 100.0, points[p].1),
+                        Some((z, worst, p)) if worst <= PORT_FIT => {
+                            let mut line = format!("the holder of {node} (block {k}) stands beside its {consumers} consumers as {}, leaving at most {:.1} % of its impedance (at {})",
+                                one_port(z), worst * 100.0, points[p].1);
+                            if second && z.rb2 == 0.0 {
+                                if slowest.is_finite() {
+                                    let _ = write!(line, "; one section: no second within the band's lowest point (a time constant up to {slowest:.3e} s) fits better");
+                                } else {
+                                    line.push_str("; one section: no second fits better with the available points");
+                                }
+                            }
+                            line
+                        }
+                        Some((z, worst, p)) => format!("the holder of {node} (block {k}) fits no one-port within {PORT_FIT} (the nearest, {}, leaves {:.0} % at {}): its {consumers} consumers' returns are read bare",
+                            one_port(z), worst * 100.0, points[p].1),
                         None => format!("the holder of {node} (block {k}) has no impedance to fit: its {consumers} consumers' returns are read bare"),
                     });
-                    let kept = found.filter(|f| f.4 <= PORT_FIT);
+                    let kept = found.filter(|f| f.1 <= PORT_FIT);
                     done.push((node, kept));
                     kept
                 }
             };
-            let Some((r, rb, tau, l, _, _)) = fitted else { continue };
+            let Some((z, _, _)) = fitted else { continue };
             let port = &mut b.plan.ports[i];
-            (port.r, port.rb, port.tau, port.l) = (r, rb, tau, l);
+            (port.r, port.rb, port.tau, port.rb2, port.tau2, port.l) = (z.r, z.rb, z.tau, z.rb2, z.tau2, z.l);
             let (block, name) = (port.block as usize, port.name.clone());
-            for (key, v) in [("r", r), ("rb", rb), ("tau", tau), ("l", l)] {
+            for (key, v) in port.params() {
                 b.solvers[block].set_param(&name, key, v);
             }
             if let Some(j) = b.bounds[block].iter().position(|x| x.name == name) {
-                shape.port_z[block][j] = Some((r, rb, l));
+                shape.port_z[block][j] = Some(z);
             }
         }
     }
 }
 
 /// Whether a holder port is fitted at point `p` of the map's `points` (`fit_ports`): the step's
-/// matrix (the last) and the band's points but DC.
+/// matrix (the last), the band's points, and DC.
 fn port_point(points: &[(C64, String)], p: usize, band: f64) -> bool {
-    p + 1 == points.len() || (p > 0 && in_band(points[p].0, band))
+    p + 1 == points.len() || in_band(points[p].0, band)
 }
 
-/// A holder port's impedance at `s`: `r + rb / (1 + s tau) + s l`.
-fn port_z(s: C64, r: f64, rb: f64, tau: f64, l: f64) -> C64 {
+/// The fitted impedance shared by the holder's consumers and checked again on a re-proof.
+#[derive(Clone, Copy, Default)]
+struct PortZ {
+    r: f64,
+    rb: f64,
+    tau: f64,
+    rb2: f64,
+    tau2: f64,
+    l: f64,
+}
+
+impl From<&HolderPort> for PortZ {
+    fn from(p: &HolderPort) -> Self {
+        PortZ { r: p.r, rb: p.rb, tau: p.tau, rb2: p.rb2, tau2: p.tau2, l: p.l }
+    }
+}
+
+/// A holder port's impedance at `s`: `r + rb / (1 + s tau) + rb2 / (1 + s tau2) + s l`.
+fn port_z(s: C64, p: PortZ) -> C64 {
     let one = C64::new(1.0, 0.0);
-    C64::new(r, 0.0) + C64::new(rb, 0.0) / (one + s.scale(tau)) + s.scale(l)
+    let z = C64::new(p.r, 0.0) + C64::new(p.rb, 0.0) / (one + s.scale(p.tau)) + s.scale(p.l);
+    if p.rb2 > 0.0 { z + C64::new(p.rb2, 0.0) / (one + s.scale(p.tau2)) } else { z }
 }
 
 /// `fit_ports` for a plan from the run or a fixed start: from a fixed start the fit at the key's
@@ -1685,8 +1962,8 @@ fn fit_ports_keyed(b: &mut Built, t: f64, others: &Others, whole: &Solver, point
     let key = structure_of(&b.plan);
     let kept = others.ports.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
     if let Some((ports, lines)) = kept {
-        for p in ports.iter().filter(|p| p.r + p.rb + p.l > 0.0) {
-            for (k, v) in [("r", p.r), ("rb", p.rb), ("tau", p.tau), ("l", p.l)] {
+        for p in ports.iter().filter(|p| p.r + p.rb + p.rb2 + p.l > 0.0) {
+            for (k, v) in p.params() {
                 b.solvers[p.block as usize].set_param(&p.name, k, v);
             }
         }
@@ -1699,25 +1976,35 @@ fn fit_ports_keyed(b: &mut Built, t: f64, others: &Others, whole: &Solver, point
     others.ports.lock().unwrap_or_else(|e| e.into_inner()).insert(key, (b.plan.ports.clone(), log[from..].to_vec()));
 }
 
-/// A fitted one-port in words: `r + rb || C` or `r + L`.
-fn one_port(r: f64, rb: f64, tau: f64, l: f64) -> String {
-    if l > 0.0 {
-        format!("{r:.3e} ohm and {l:.3e} H in series")
-    } else if rb > 0.0 {
-        format!("{r:.3e} ohm and {rb:.3e} ohm || {:.3e} F in series", tau / rb)
-    } else {
-        format!("{r:.3e} ohm")
+/// A fitted one-port in words, with each parallel RC section expressed in ohms and farads.
+fn one_port(p: PortZ) -> String {
+    let mut words = format!("{:.3e} ohm", p.r);
+    for (rb, tau) in [(p.rb, p.tau), (p.rb2, p.tau2)] {
+        if rb > 0.0 {
+            let _ = write!(words, " and {rb:.3e} ohm || {:.3e} F", tau / rb);
+        }
     }
+    if p.l > 0.0 { let _ = write!(words, " and {:.3e} H", p.l); }
+    if p.rb > 0.0 || p.rb2 > 0.0 || p.l > 0.0 { words.push_str(" in series"); }
+    words
 }
 
-/// A passive one-port fitted to a driving-point impedance `z` at points `s` (the map's band and
-/// the step's matrix), weighed to `|z|`: `r + rb / (1 + s tau)` with `r, rb >= 0` and the memory
+/// A passive one-port fitted to a driving-point impedance `z` at DC (when available), the band's
+/// points and the step's matrix, weighed to `|z|`: `r + rb / (1 + s tau)` with `r, rb >= 0` and the memory
 /// no faster than the `step` (a faster one rings under the trapezoid), or `r + s l` with
-/// `r, l >= 0` (a rail behind a buffer: an inductance in the band). Each is a least-squares fit in
-/// its two values, the first over a grid of `tau` from the step up, 20 a decade over twelve
-/// decades. The form that leaves least at its worst point wins: `(r, rb, tau, l)`, that worst share
-/// of `|z|`, and its point's index in `s`. None with no point. O(points x the grid).
-fn fit_port(fit: &[(C64, C64)], step: f64) -> Option<(f64, f64, f64, f64, f64, usize)> {
+/// `r, l >= 0` (a rail behind a buffer: an inductance in the band); at a declared supply
+/// (`second`) also `r + rb / (1 + s tau) + rb2 / (1 + s tau2)`, with `rb, rb2 >= 0` (a rail's
+/// local and bulk capacitance, each behind its own resistance). Each is a least-squares fit in its
+/// linear values, its time constants searched from the step up: one `tau` over a grid of 20 a
+/// decade over twelve decades; a pair over every pair of every eighth of those, then by a pattern
+/// search from the best (a pair's local minimum is not the single `tau`'s: that one sits between
+/// the pair's). Both time constants of a pair are bounded by `slowest`, the reciprocal of the
+/// lowest fitted positive angular frequency. The band cannot resolve a slower section. With DC
+/// pinned, it could only correct DC on a time scale too long for the run.
+/// The form that leaves least at its worst point wins: its impedance, that worst
+/// share of `|z|`, and its point's index in `s`. None with no point. O(points x (the grid + the
+/// coarse grid's pairs)).
+fn fit_port(fit: &[(C64, C64)], step: f64, second: bool, slowest: f64) -> Option<(PortZ, f64, usize)> {
     if fit.is_empty() {
         return None;
     }
@@ -1743,9 +2030,9 @@ fn fit_port(fit: &[(C64, C64)], step: f64) -> Option<(f64, f64, f64, f64, f64, u
         }
         (b >= 0.0 && a.is_finite() && b.is_finite()).then_some((a, b))
     };
-    let mut best: Option<(f64, f64, f64, f64, f64, usize)> = None;
-    let mut take = |cand: (f64, f64, f64, f64, f64, usize)| {
-        if best.is_none_or(|b| cand.4 < b.4) {
+    let mut best: Option<(PortZ, f64, usize)> = None;
+    let mut take = |cand: (PortZ, f64, usize)| {
+        if best.is_none_or(|b| cand.1 < b.1) {
             best = Some(cand);
         }
     };
@@ -1753,24 +2040,111 @@ fn fit_port(fit: &[(C64, C64)], step: f64) -> Option<(f64, f64, f64, f64, f64, u
         let tau = step * 10f64.powf(k as f64 / 20.0);
         let g = move |s: C64| C64::new(1.0, 0.0) / (C64::new(1.0, 0.0) + s.scale(tau));
         if let Some((r, rb)) = solve(&g) {
-            let (w, at) = worst(&|s| port_z(s, r, rb, tau, 0.0));
-            take((r, rb, tau, 0.0, w, at));
+            let z = PortZ { r, rb, tau, ..PortZ::default() };
+            let (w, at) = worst(&|s| port_z(s, z));
+            take((z, w, at));
         }
     }
     if let Some((r, l)) = solve(&|s| s) {
-        let (w, at) = worst(&|s| port_z(s, r, 0.0, 0.0, l));
-        take((r, 0.0, 0.0, l, w, at));
+        let z = PortZ { r, l, ..PortZ::default() };
+        let (w, at) = worst(&|s| port_z(s, z));
+        take((z, w, at));
+    }
+    if second {
+        let one = C64::new(1.0, 0.0);
+        // least squares in (r, rb, rb2) of `z ~ r + rb / (1 + s t1) + rb2 / (1 + s t2)`, rows
+        // weighed by 1/|z|; a negative `r` refitted as zero; None for a negative section or a
+        // singular pair
+        let pair = |t1: f64, t2: f64| -> Option<(PortZ, f64, usize)> {
+            let (mut a, mut b) = ([[0.0f64; 3]; 3], [0.0f64; 3]);
+            for &(s, z) in fit {
+                let w2 = 1.0 / (z.norm() * z.norm());
+                let f = [one, one / (one + s.scale(t1)), one / (one + s.scale(t2))];
+                for i in 0..3 {
+                    for j in 0..3 {
+                        a[i][j] += w2 * (f[i].re * f[j].re + f[i].im * f[j].im);
+                    }
+                    b[i] += w2 * (f[i].re * z.re + f[i].im * z.im);
+                }
+            }
+            let mut x = solve3(a, b)?;
+            if x[0] < 0.0 {
+                let d = a[1][1] * a[2][2] - a[1][2] * a[2][1];
+                if !(d.abs() > 1e-12 * a[1][1] * a[2][2]) {
+                    return None;
+                }
+                x = [0.0, (b[1] * a[2][2] - b[2] * a[1][2]) / d, (a[1][1] * b[2] - a[2][1] * b[1]) / d];
+            }
+            if !(x[1] >= 0.0 && x[2] >= 0.0 && x.iter().all(|v| v.is_finite())) {
+                return None;
+            }
+            let z = PortZ { r: x[0], rb: x[1], tau: t1, rb2: x[2], tau2: t2, l: 0.0 };
+            let (w, at) = worst(&|s| port_z(s, z));
+            Some((z, w, at))
+        };
+        // every pair of a coarse grid, every eighth time constant of the one-section grid; then
+        // a pattern search from the best, each time constant moved up or down by a factor that
+        // starts at the coarse grid's step and is square-rooted where neither moves, to 1.001
+        let coarse: Vec<f64> = (0..=240).step_by(8).map(|k| step * 10f64.powf(k as f64 / 20.0)).filter(|&tau| tau <= slowest).collect();
+        let mut found: Option<((PortZ, f64, usize), f64, f64)> = None;
+        for (i, &t1) in coarse.iter().enumerate() {
+            for &t2 in &coarse[i + 1..] {
+                if let Some(f) = pair(t1, t2).filter(|f| found.is_none_or(|b| f.1 < b.0 .1)) {
+                    found = Some((f, t1, t2));
+                }
+            }
+        }
+        if let Some(mut b) = found {
+            let mut factor = 10f64.powf(8.0 / 20.0);
+            while factor > 1.001 {
+                let mut moved = false;
+                for which in 0..2 {
+                    for d in [factor, 1.0 / factor] {
+                        let (t1, t2) = if which == 0 { (b.1 * d, b.2) } else { (b.1, b.2 * d) };
+                        if t1 >= t2 || t1 < step || t2 > slowest {
+                            continue;
+                        }
+                        if let Some(f) = pair(t1, t2).filter(|f| f.1 < b.0 .1) {
+                            (b, moved) = ((f, t1, t2), true);
+                        }
+                    }
+                }
+                if !moved {
+                    factor = factor.sqrt();
+                }
+            }
+            take(b.0);
+        }
     }
     best
+}
+
+/// `a x = b` for three unknowns by Cramer's rule; None where `a` is singular to its diagonal.
+fn solve3(a: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
+    let det = |m: &[[f64; 3]; 3]| m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    let d = det(&a);
+    if !(d.abs() > 1e-12 * a[0][0] * a[1][1] * a[2][2]) {
+        return None;
+    }
+    let mut x = [0.0; 3];
+    for (k, x) in x.iter_mut().enumerate() {
+        let mut m = a;
+        for i in 0..3 {
+            m[i][k] = b[i];
+        }
+        *x = det(&m) / d;
+    }
+    Some(x)
 }
 
 /// What a map found, and failing, the two blocks to merge and why (`Shape::fold`).
 type Found = (RoundMap, Option<Fail>);
 
 /// A failed map: the two blocks to merge (where the late value is solved and where it
-/// comes in), why, and the cuts the heaviest link's two late values are read across.
+/// comes in, or a return's block and the block whose export carries it there: `carried`), why,
+/// and the cuts the heaviest link's two late values are read across.
 #[derive(Clone, Debug)]
-pub(crate) struct Fail { from: usize, other: usize, why: String, cuts: Vec<u32> }
+pub(crate) struct Fail { from: usize, other: usize, why: String, cuts: Vec<u32>, carried: bool }
 
 /// A block's solver with where its unknowns and devices are in the whole circuit's solver, to put
 /// it in a state taken there (`Seed::put`): (local, whole) unknowns, and per device of the whole
@@ -1805,12 +2179,13 @@ impl Seedable {
     }
 }
 
-/// The hash of a plan's structure as built, before its proof: its blocks, couplings, sums, ghosts
-/// and unpipelined stages (`Others::maps`).
+/// The fields populated by build, stage placement and port fitting, before the proof.
+/// The gain transports attached to a finished plan have no part in shape reuse.
 fn structure_of(plan: &RoundPlan) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    format!("{plan:?}").hash(&mut h);
+    let shape = (&plan.blocks, &plan.couplings, &plan.sums, &plan.ghosts, &plan.unpipelined, &plan.ports, &plan.echoes);
+    format!("{shape:?}").hash(&mut h);
     h.finish()
 }
 
@@ -1924,6 +2299,8 @@ fn key_maps(b: &Built, whole: &Solver, others: &Arc<Others>, points: &[(C64, Str
 struct Resp {
     drive: C64,
     out: Vec<C64>,
+    /// True when the block's matrix was singular at DC and the band's floor supplied this response.
+    floor: bool,
 }
 
 /// A block's responses over the map's points: at each, None where its matrix is singular, else
@@ -2021,11 +2398,12 @@ impl RoundProof {
         // an edited holder still within its ports' fit bar, else the plan is made again with a
         // fresh fit (`fit_ports`)
         let points = &self.shape.points;
-        for &(k, j, (r, rb, tau, l), ref node) in &self.shape.port_fits {
+        for &(k, j, port, ref node) in &self.shape.port_fits {
             let Some(e) = edited.iter().position(|x| x.0 == k) else { continue };
             let worst = (0..n).filter(|&p| port_point(points, p, self.shape.band)).filter_map(|p| {
-                let z = fresh[e][p].as_ref()?[j].as_ref()?.drive;
-                (z.norm() > 0.0 && z.norm().is_finite()).then(|| ((z - port_z(points[p].0, r, rb, tau, l)).norm() / z.norm(), p))
+                // A holder singular at DC has no DC impedance to check. Re-prove its band and step points.
+                let z = fresh[e][p].as_ref()?[j].as_ref().filter(|r| !r.floor)?.drive;
+                (z.norm() > 0.0 && z.norm().is_finite()).then(|| ((z - port_z(points[p].0, port)).norm() / z.norm(), p))
             }).fold((0.0f64, 0usize), |m, x| if x.0 > m.0 { x } else { m });
             if worst.0 > PORT_FIT {
                 return Err(format!("the holder of {node} (block {k}) no longer fits its port within {PORT_FIT}: it leaves {:.0} % at {}; the plan is made again with a fresh fit", worst.0 * 100.0, points[worst.1].1));
@@ -2117,7 +2495,9 @@ struct PointGains {
     wrongs_above: Option<[f64; 2]>,
     sensitivity: f64,
     follows: Vec<(f64, usize)>,
-    worst: Option<(f64, usize, f64, f64, (usize, usize, f64), String)>,
+    /// A failure here: its figure over its bar, the test, the gain, what it gets wrong, the
+    /// heaviest link, its row's largest terms, and the blocks a return's path names (`carried`).
+    worst: Option<(f64, usize, f64, f64, (usize, usize, f64), String, Option<(usize, usize, usize)>)>,
 }
 
 /// What `Shape::point` works in, kept by each thread that maps (a pool's worker, a helper or the
@@ -2174,13 +2554,13 @@ struct Shape {
     mine: Vec<Vec<(u32, usize)>>,
     /// Per row of `M` that is a returned current: the (block, boundary) it is taken at.
     drives: Vec<Vec<(usize, usize)>>,
-    /// Per block, per boundary: a holder port's impedance `(r, rb, l)` as the plan fitted it
+    /// Per block, per boundary: a holder port's impedance as the plan fitted it
     /// (`RoundPlan::ports`), what a unit of its value moves its rows by (`respond`).
-    port_z: Vec<Vec<Option<(f64, f64, f64)>>>,
+    port_z: Vec<Vec<Option<PortZ>>>,
     /// Each fitted holder port's holder, the boundary its returns are taken at, its impedance
-    /// `(r, rb, tau, l)` and its node: what a re-proof checks the holder against again
+    /// and its node: what a re-proof checks the holder against again
     /// (`RoundProof::reprove`).
-    port_fits: Vec<(usize, usize, (f64, f64, f64, f64), String)>,
+    port_fits: Vec<(usize, usize, PortZ, String)>,
 }
 
 impl Shape {
@@ -2219,14 +2599,14 @@ impl Shape {
             feed.insert((p.block, p.name.as_str()), p.coupling as usize);
         }
         let port_z = b.bounds.iter().enumerate().map(|(k, bounds)| bounds.iter().map(|x| {
-            b.plan.ports.iter().find(|p| p.block as usize == k && p.name == x.name).map(|p| (p.r, p.rb, p.l))
+            b.plan.ports.iter().find(|p| p.block as usize == k && p.name == x.name).map(PortZ::from)
         }).collect()).collect();
-        let mut port_fits: Vec<(usize, usize, (f64, f64, f64, f64), String)> = Vec::new();
-        for p in b.plan.ports.iter().filter(|p| p.r + p.rb + p.l > 0.0) {
+        let mut port_fits: Vec<(usize, usize, PortZ, String)> = Vec::new();
+        for p in b.plan.ports.iter().filter(|p| p.r + p.rb + p.rb2 + p.l > 0.0) {
             let Some((holder, name)) = couplings[p.coupling as usize].to.first() else { continue };
             let Some(j) = b.bounds[*holder as usize].iter().position(|x| x.name == *name) else { continue };
             if !port_fits.iter().any(|f| (f.0, f.1) == (*holder as usize, j)) {
-                port_fits.push((*holder as usize, j, (p.r, p.rb, p.tau, p.l), b.hub[p.coupling as usize].clone().unwrap_or_default()));
+                port_fits.push((*holder as usize, j, PortZ::from(p), b.hub[p.coupling as usize].clone().unwrap_or_default()));
             }
         }
         let mut export: HashMap<(u32, u32), usize> = HashMap::new();
@@ -2271,7 +2651,8 @@ impl Shape {
         let mut x = vec![C64::ZERO_C; load.n + 1];
         points.map(|p| {
             let sp = self.points[p].0;
-            if lu.factor(&load.at[p]).is_err() && !(sp.re == 0.0 && sp.im == 0.0 && lu.factor(&load.floor).is_ok()) {
+            let floor = lu.factor(&load.at[p]).is_err();
+            if floor && !(sp.re == 0.0 && sp.im == 0.0 && lu.factor(&load.floor).is_ok()) {
                 return None;
             }
             Some(self.bounds[k].iter().zip(&self.wants[k]).zip(&self.port_z[k]).map(|((bound, &want), port)| {
@@ -2281,18 +2662,20 @@ impl Shape {
                 x.fill(C64::ZERO_C);
                 match (bound.kind, *port) {
                     (BoundaryKind::Voltage, _) => x[bound.branch as usize] = C64::new(1.0, 0.0),
-                    // a unit of the port's value: `+(r + s l)` on the branch row, `+rb` on the
-                    // memory's, as the residuals take it
-                    (BoundaryKind::Port { .. }, Some((r, rb, l))) => {
-                        x[bound.branch as usize] = -(C64::new(r, 0.0) + sp.scale(l));
-                        x[bound.w as usize] = C64::new(-rb, 0.0);
+                    // A unit of the port's value adds r + s l to the branch residual and
+                    // the section's resistance to each memory residual.
+                    (BoundaryKind::Port { .. }, Some(z)) => {
+                        x[bound.branch as usize] = -(C64::new(z.r, 0.0) + sp.scale(z.l));
+                        x[bound.w as usize] = C64::new(-z.rb, 0.0);
+                        if bound.w2 != 0 { x[bound.w2 as usize] = C64::new(-z.rb2, 0.0); }
                     }
                     (BoundaryKind::Port { .. }, None) => {}
+                    (BoundaryKind::Echo { .. } | BoundaryKind::EchoGain { .. }, _) => return None,
                     (BoundaryKind::Current, _) => x[bound.node as usize] = C64::new(1.0, 0.0),
                 }
                 lu.solve(&mut x[1..]);
                 x[0] = C64::ZERO_C;
-                Some(Resp { drive: x[bound.node as usize], out: self.mine[k].iter().map(|&(u, _)| x[u as usize]).collect() })
+                Some(Resp { drive: x[bound.node as usize], out: self.mine[k].iter().map(|&(u, _)| x[u as usize]).collect(), floor })
             }).collect())
         }).collect()
     }
@@ -2428,9 +2811,41 @@ impl Shape {
             let mut row: Vec<(usize, f64)> = m[link.0 * r..(link.0 + 1) * r].iter().enumerate().map(|(j, v)| (j, v.norm())).filter(|&(_, a)| a > 0.0).collect();
             row.sort_by(|a, c| c.1.total_cmp(&a.1));
             let top = row.iter().take(3).map(|&(j, a)| format!("{} {a:.1e}", self.labels[lagged[j]])).collect::<Vec<_>>().join(", ");
-            out.worst = Some((ratio, test, *g, wrong, link, top));
+            let path = if hub[link.0] { self.carried(at, ev, scale, r, (link.0, link.1)) } else { None };
+            out.worst = Some((ratio, test, *g, wrong, link, top, path));
         }
         out
+    }
+
+    /// Where most of entry `(i, j)` of `M` reaches the block that exports row `i`, a return into a
+    /// hub node: the boundary of that block whose term in the entry is the largest. When that
+    /// boundary reads another block's export in the same round, that block passes the late value on
+    /// within the round (it reads the node and drives what the return's block reads), and no port
+    /// at the node carries it: (the return's block, that block, the export's coupling). For the
+    /// node's own read it is the holder, which merges as any late value's two blocks do. None when
+    /// the largest part is the late value itself (the port's term) or no boundary carries it.
+    /// O(the block's boundaries).
+    fn carried(&self, at: &[&Vec<Option<Resp>>], ev: &[C64], scale: &[f64], r: usize, (i, j): (usize, usize)) -> Option<(usize, usize, usize)> {
+        let q = self.lagged[i];
+        let k = self.couplings[q].from.0 as usize;
+        let a = self.mine[k].iter().position(|&(_, e)| e == self.export_of[q])?;
+        let mut best: Option<(f64, usize)> = None;
+        for (b, fed) in self.fed[k].iter().enumerate() {
+            let Some(q2) = *fed else { continue };
+            let input = match self.row[q2] {
+                Some(i2) if i2 == j => C64::new(1.0 / scale[i2], 0.0),
+                Some(_) => continue,
+                None => ev[self.export_of[q2] * r + j],
+            };
+            let Some(resp) = at[k][b].as_ref() else { continue };
+            let term = (resp.out[a] * input).norm() * scale[i];
+            if best.is_none_or(|x| term > x.0) {
+                best = Some((term, q2));
+            }
+        }
+        let (_, q2) = best?;
+        let by = self.couplings[q2].from.0 as usize;
+        (self.row[q2].is_none() && by != k).then_some((k, by, q2))
     }
 
     /// The map of its points in order (`point`): the largest gains and where, the followers, and
@@ -2450,7 +2865,7 @@ impl Shape {
         let mut follows: Vec<(f64, usize, usize)> = vec![(0.0, 0, 0); r];
         // the worst failure: (its figure over its bar, the test, the point, the gain, what it gets
         // wrong, the link, its row's terms)
-        let mut worst: Option<(f64, usize, usize, f64, f64, (usize, usize, f64), String)> = None;
+        let mut worst: Option<(f64, usize, usize, f64, f64, (usize, usize, f64), String, Option<(usize, usize, usize)>)> = None;
         for (p, out) in outs.enumerate() {
             let Some(out) = out else {
                 map.singular += 1;
@@ -2480,9 +2895,9 @@ impl Shape {
                     *g = (at, p);
                 }
             }
-            if let Some((ratio, test, g, wrong, link, top)) = out.worst {
+            if let Some((ratio, test, g, wrong, link, top, path)) = out.worst {
                 if !worst.as_ref().is_some_and(|w| w.0 >= ratio) {
-                    worst = Some((ratio, test, p, g, wrong, link, top));
+                    worst = Some((ratio, test, p, g, wrong, link, top, path));
                 }
             }
         }
@@ -2494,23 +2909,30 @@ impl Shape {
             .map(|i| (self.labels[lagged[i]].clone(), self.hub[lagged[follows[i].1]].clone().unwrap_or_default(), follows[i].0, points[follows[i].2].1.clone())).collect();
         followers.sort_by(|a, c| c.2.total_cmp(&a.2));
         map.followers = followers;
-        let Some((_, test, p, g, wrong, (i, j, a), top)) = worst else { return (map, None) };
+        let Some((_, test, p, g, wrong, (i, j, a), top, path)) = worst else { return (map, None) };
         // the late value `j`'s two blocks: where it is solved and where it comes in, so that it is read
-        // late no more
+        // late no more; or, for a return whose path names them (`carried`), its block and the block
+        // whose export carries it there
         let late = &couplings[lagged[j]];
-        let from = late.from.0 as usize;
-        let other = late.to.first().map_or(from, |t| t.0 as usize);
+        let (from, other) = match path {
+            Some((k, b, _)) => (k, b),
+            None => (late.from.0 as usize, late.to.first().map_or(late.from.0 as usize, |t| t.0 as usize)),
+        };
         let what = match test {
             0 => format!("the loop gain {g:.2e} a round at {}, over the stability bar {STABILITY}", points[p].1),
             1 => format!("the loop gain {g:.2e} a round at {}, wrong by {wrong:.1e} read late, over the bar {:.0e}", points[p].1, self.hub_tol),
             _ => format!("the loop gain through ordinary late values {g:.2e} a round at {}, wrong by {wrong:.1e} read late, over the bar {:.0e}", points[p].1, self.cut_tol),
         };
-        let why = format!("the round map: {what}; the heaviest link: {} takes {a:.1e} of {} in a round; that row's largest terms: {top}",
+        let mut why = format!("the round map: {what}; the heaviest link: {} takes {a:.1e} of {} in a round; that row's largest terms: {top}",
             self.labels[lagged[i]], self.labels[lagged[j]]);
-        let mut cuts: Vec<u32> = couplings[lagged[i]].cuts.iter().chain(&late.cuts).map(|r| r.1).collect();
+        if let Some((_, _, q)) = path {
+            let _ = write!(why, "; most of it reaches the return's block through {}, read in the same round: the two blocks merge", self.labels[q]);
+        }
+        let through = path.map(|(_, _, q)| &couplings[q].cuts);
+        let mut cuts: Vec<u32> = couplings[lagged[i]].cuts.iter().chain(through.unwrap_or(&late.cuts)).map(|r| r.1).collect();
         cuts.sort_unstable();
         cuts.dedup();
-        (map, Some(Fail { from, other, why, cuts }))
+        (map, Some(Fail { from, other, why, cuts, carried: path.is_some() }))
     }
 }
 
@@ -2608,11 +3030,19 @@ pub struct ChargeHold {
     /// and the import's bar.
     pub figure: f64,
     pub bar: f64,
+    /// The import's largest transfer to a voltage export or heard net of its reader, zero for an untested reader.
+    pub t: f64,
+    /// The import's own band figure before carry, volts per volt of the jump.
+    pub band: f64,
     /// The largest amplitude a born jump reaches this import with along a path that passes no block
     /// twice, volts per volt born (1 where it is born, 0 where no path reaches it); and the verdict
     /// (`RoundPlan::lands`) after the relay rule, named landings and late-loop splits.
     pub amp: f64,
     pub lands: bool,
+    /// The smallest export step this pair lands, in volts. Zero for split, named or unjudged pairs.
+    pub step: f64,
+    /// Whether this pair lands only by the band figure, including a figure carried back to it.
+    pub by_band: bool,
 }
 
 /// The relay rule's count over a plan (`charge_hold`): per tested block, each voltage import's
@@ -2624,6 +3054,16 @@ pub struct ChargeHold {
 #[derive(Clone, Debug, Default)]
 pub struct Relay {
     pub transfers: Vec<(usize, usize, usize, f64)>,
+    /// The top of the judged band in Hz and the split's factor there (`band_figure` at unit transfer).
+    pub band_at: (f64, f64),
+    /// Echo candidates' signed responses, keyed by (input coupling, far reader, output coupling).
+    pub echo_responses: BTreeMap<(usize, usize, usize), EchoResponse>,
+    /// Each echo's reader: its own export's signed response to the ghost's import, keyed by (ghost
+    /// coupling, reader, followed export), and the reader's bar for its static echoes (`echo_bar`).
+    pub echo_sense: BTreeMap<(usize, usize, usize), (EchoResponse, f64)>,
+    /// Per block: whether it holds a switch of the circuit's own, whose crossings set a pitch
+    /// (`echo_bar`, `merge_pitch_cuts`).
+    pub switching: Vec<bool>,
     pub followed: usize,
     pub cut: usize,
     pub blocks: usize,
@@ -2731,30 +3171,30 @@ fn can_jump(b: &Built, o: &PartOpts, switching: &[bool], q: usize) -> bool {
 ///   unit charge put on the node, followed `HOLD_STEPS` backward Euler steps: what the node still
 ///   holds;
 /// - the figure: per import, the largest charge times the largest hold on its node;
-/// - the transfer `T` of each import to each voltage export: the export's grid values from rest,
+/// - the transfer `T` of each import to each voltage export or owned heard net: its grid values from rest,
 ///   through the ramp and three flat steps, half their summed absolute second differences, at its
 ///   largest over the states (an ideal buffer of gain g: |g|; an RC much slower than the step:
 ///   about h / tau).
 /// From each import a jump is born on (`can_jump`) at amplitude 1, the paths: through a block, an
 /// import's amplitude times its transfer to an export reaches that export's readers, never a block
 /// twice, followed while at least a thousandth of the next import's bar. A block is tested when a
-/// path reaches it. Each reached pair starts with `G = figure / bar`; each backward pass takes the
-/// larger of its G and, for each step out of it into a pair that lands, the step's transfer times
-/// that pair's G, until no G grows or once a block. A pair lands where `amp x G > 1` and passes the
-/// jump on as an event (`Run::step`'s `RELAYED`): a pair before a landed one lands only when the
-/// jump it carries is strong enough to need to, and every pair this lands the old rule (every pair
-/// before a landed one) lands too, since only a landed pair's G is carried back. Once
-/// the rule finishes, a chain a run landed (`PartOpts::land`) adds its born pairs and the pairs
+/// path reaches it. Each reached pair starts with two figures divided by its bar, charge times hold
+/// and `band_figure` at its largest transfer to an export or heard net. Each carries back independently
+/// from a downstream pair where amplitude times that figure exceeds one. The upstream pair takes the larger of its
+/// figure and the step's transfer times the downstream figure, until no figure grows or once a block.
+/// Only a same-round downstream import carries the band figure back. A pair lands where its amplitude
+/// times either figure exceeds one and passes the jump on as an event (`Run::step`'s `RELAYED`).
+/// Once the rule finishes, a chain a run landed (`PartOpts::land`) adds its born pairs and the pairs
 /// on same-round paths from them to the coupling the held member read. A landed pair read a
 /// round late whose reader reaches its exporter through landed pairs would return its event
 /// every round: it is split, and counted.
 /// A state whose linearisation of the block is another's to the bit is that one's test, taken
 /// once (the first state named). In states kept by key (a fixed start), a block's test is kept by
 /// everything it reads (`ReaderTable`, `StateCache::table`): its distinct linearisations, its
-/// shape, its imports and exports and the step; a plan whose block has them all takes it,
+/// shape, its imports, export and heard rows, and the step; a plan whose block has them all takes it,
 /// whatever else changed. The amplitudes and verdicts are made again every plan.
 /// Planning only. Per block tested: a linearisation a state; per distinct one not kept, one
-/// factorisation and two solves an import (four with exports), then one more factorisation and
+/// factorisation and two solves an import (four with export or heard rows), then one more factorisation and
 /// `HOLD_STEPS` solves a charged node.
 fn charge_hold(b: &Built, whole: &Solver, others: &Others, t: f64, h: f64, o: &PartOpts, own: &[String], cache: &StateCache, key: u64) -> (Vec<ChargeHold>, Relay) {
     let switching: Vec<bool> = b.solvers.iter().map(|s| own.iter().any(|d| s.find_device(d).is_some())).collect();
@@ -2766,6 +3206,11 @@ fn charge_hold(b: &Built, whole: &Solver, others: &Others, t: f64, h: f64, o: &P
     let exports: Vec<Vec<(usize, usize)>> = (0..nb).map(|r| b.plan.couplings.iter().enumerate()
         .filter(|(_, c)| c.from.0 as usize == r && b.solvers[r].unknowns[c.from.1 as usize].kind == UnkKind::Voltage)
         .map(|(q, c)| (q, c.from.1 as usize - 1)).collect()).collect();
+    let heard_names: BTreeSet<&str> = o.heard.iter().map(String::as_str).collect();
+    let heard: Vec<bool> = whole.unknowns.iter().map(|u| u.kind == UnkKind::Voltage && heard_names.contains(u.name.as_str())).collect();
+    let heard_rows: Vec<Vec<usize>> = b.plan.blocks.iter().map(|block| {
+        block.own.iter().filter(|&&(_, global)| heard[global as usize]).map(|&(local, _)| local as usize - 1).collect()
+    }).collect();
     let bar = |q: usize| if b.hub[q].is_some() { o.hub_tol } else { o.cut_tol };
     let mut tested: Vec<Option<Tested>> = (0..nb).map(|_| None).collect();
     // the paths from each born jump, deepest first: (block, its import, amplitude, the blocks passed)
@@ -2789,7 +3234,7 @@ fn charge_hold(b: &Built, whole: &Solver, others: &Others, t: f64, h: f64, o: &P
             continue;
         }
         amp[r][i] = a;
-        let x = tested[r].get_or_insert_with(|| test_block(b, whole, others, t, h, r, &imports[r], &exports[r], cache, key));
+        let x = tested[r].get_or_insert_with(|| test_block(b, whole, others, t, h, r, &imports[r], &exports[r], &heard_rows[r], cache, key));
         let transfer = &x.table.transfer[i];
         for (e, &(q2, _)) in exports[r].iter().enumerate() {
             let a2 = a * transfer[e];
@@ -2814,35 +3259,47 @@ fn charge_hold(b: &Built, whole: &Solver, others: &Others, t: f64, h: f64, o: &P
         }
     }
     let figure = |r: usize, i: usize| tested[r].as_ref().map_or(0.0, |x| if x.table.unjudged { f64::INFINITY } else { x.table.imports[i].figure });
+    let f_top = o.band.min(o.fmax);
+    let factor = band_figure(1.0, f_top, h);
+    relay.band_at = (f_top, factor);
+    let peak_transfer = |r: usize, i: usize| tested[r].as_ref().map_or(0.0, |x| x.table.transfer[i].iter().copied().fold(0.0, f64::max));
     let mut gain: Vec<Vec<f64>> = imports.iter().enumerate().map(|(r, imps)| {
         imps.iter().enumerate().map(|(i, &(_, q))| {
             if amp[r][i] > 0.0 { figure(r, i) / bar(q) } else { 0.0 }
         }).collect()
     }).collect();
-    // Read the previous pass so each pass extends the downstream figure by one step.
-    let mut previous = Vec::new();
-    for _ in 0..nb {
-        previous.clone_from(&gain);
-        let mut changed = false;
-        for (&((r, i), (r2, i2)), &transfer) in steps.iter().zip(&step_transfers) {
-            // only a pair that lands carries its G back: a pair split at its own amplitude passes
-            // nothing on, even to a pair a stronger path reached (one it could not go on from)
-            if amp[r2][i2] * previous[r2][i2] <= 1.0 {
-                continue;
+    let mut band: Vec<Vec<f64>> = imports.iter().enumerate().map(|(r, imps)| {
+        imps.iter().enumerate().map(|(i, &(_, q))| {
+            if amp[r][i] > 0.0 { peak_transfer(r, i) * factor / bar(q) } else { 0.0 }
+        }).collect()
+    }).collect();
+    // Each figure carries independently. Only the band pass stops at a late coupling.
+    for (values, same_round_only) in [(&mut gain, false), (&mut band, true)] {
+        // Read the previous pass so each pass extends the downstream figure by one step.
+        let mut previous = Vec::new();
+        for _ in 0..nb {
+            previous.clone_from(values);
+            let mut changed = false;
+            for (&((r, i), (r2, i2)), &transfer) in steps.iter().zip(&step_transfers) {
+                // Only a pair that lands at its own amplitude carries this figure back.
+                if amp[r2][i2] * previous[r2][i2] <= 1.0 || (same_round_only && b.plan.couplings[imports[r2][i2].1].lag != Lag::Same) {
+                    continue;
+                }
+                let carried = transfer * previous[r2][i2];
+                // A zero transfer into an infinite figure gives NaN and cannot raise this pair's figure.
+                if carried > values[r][i] {
+                    values[r][i] = carried;
+                    changed = true;
+                }
             }
-            let carried = transfer * previous[r2][i2];
-            // A zero transfer into an infinite figure gives NaN and cannot raise this pair's G.
-            if carried > gain[r][i] {
-                gain[r][i] = carried;
-                changed = true;
+            if !changed {
+                break;
             }
-        }
-        if !changed {
-            break;
         }
     }
-    let mut lands: Vec<Vec<bool>> = amp.iter().zip(&gain).map(|(amps, gains)| {
-        amps.iter().zip(gains).map(|(&a, &g)| a * g > 1.0).collect()
+    let by_charge = |r: usize, i: usize| amp[r][i] * gain[r][i] > 1.0;
+    let mut lands: Vec<Vec<bool>> = amp.iter().enumerate().map(|(r, amps)| {
+        amps.iter().enumerate().map(|(i, &a)| by_charge(r, i) || a * band[r][i] > 1.0).collect()
     }).collect();
     // A conviction adds the born pairs and every same-round path from them to its target.
     let coupling = |(r, i): (usize, usize)| imports[r][i].1;
@@ -2893,6 +3350,9 @@ fn charge_hold(b: &Built, whole: &Solver, others: &Others, t: f64, h: f64, o: &P
             relay.by_name.insert((imports[r][i].1, r));
         }
     }
+    let by_band: Vec<Vec<bool>> = imports.iter().enumerate().map(|(r, imps)| {
+        imps.iter().enumerate().map(|(i, &(_, q))| lands[r][i] && !by_charge(r, i) && !relay.by_name.contains(&(q, r))).collect()
+    }).collect();
     // a landed pair read a round late that closes a loop through landed pairs: split
     let from = |q: usize| b.plan.couplings[q].from.0 as usize;
     loop {
@@ -2926,8 +3386,14 @@ fn charge_hold(b: &Built, whole: &Solver, others: &Others, t: f64, h: f64, o: &P
     let mut out = Vec::new();
     for (r, imps) in imports.iter().enumerate() {
         for (i, &(_, q)) in imps.iter().enumerate() {
+            let t = peak_transfer(r, i);
+            let step = if lands[r][i] && !relay.by_name.contains(&(q, r)) && gain[r][i].is_finite() && band[r][i].is_finite() {
+                1.0 / gain[r][i].max(band[r][i])
+            } else {
+                0.0
+            };
             let row = ChargeHold { coupling: q, reader: r, jumps: can_jump(b, o, &switching, q), made: false, q: 0.0, node: String::new(), q_in: String::new(), hold: 0.0,
-                hold_in: String::new(), figure: 0.0, bar: bar(q), amp: amp[r][i], lands: lands[r][i] };
+                hold_in: String::new(), figure: 0.0, bar: bar(q), t, band: t * factor, amp: amp[r][i], lands: lands[r][i], step, by_band: lands[r][i] && by_band[r][i] };
             out.push(match &tested[r] {
                 None => row,
                 Some(x) => {
@@ -2947,7 +3413,28 @@ fn charge_hold(b: &Built, whole: &Solver, others: &Others, t: f64, h: f64, o: &P
             }
         }
     }
+    // A ghost can follow a block that no born jump reached. Rehearse it for the echoes
+    // after the landing decisions, reusing the test wherever the relay already made it.
+    for e in &b.plan.echoes {
+        let (q, of) = (e.coupling as usize, e.of as usize);
+        let r = b.plan.couplings[of].from.0 as usize;
+        let x = tested[r].get_or_insert_with(|| test_block(b, whole, others, t, h, r, &imports[r], &exports[r], &heard_rows[r], cache, key));
+        let i = imports[r].iter().position(|&(_, c)| c == q).expect("echo follows a voltage import");
+        let j = exports[r].iter().position(|&(c, _)| c == of).expect("echo corrects a voltage export");
+        relay.echo_responses.insert((q, r, of), x.table.gains[i][j]);
+    }
+    // and each echo's reader, for the size screen: its own export's response to its ghost's import
+    for e in &b.plan.echoes {
+        let (q, of, k) = (e.coupling as usize, e.of as usize, e.block as usize);
+        let x = tested[k].get_or_insert_with(|| test_block(b, whole, others, t, h, k, &imports[k], &exports[k], &heard_rows[k], cache, key));
+        let i = imports[k].iter().position(|&(_, c)| c == of);
+        let j = exports[k].iter().position(|&(c, _)| c == q);
+        if let Some(g) = i.zip(j).and_then(|(i, j)| x.table.gains.get(i)?.get(j)) {
+            relay.echo_sense.insert((of, k, q), (*g, echo_bar(o.cut_tol, switching[k])));
+        }
+    }
     relay.steps = steps.iter().map(|&((r, i), (r2, i2))| ((imports[r][i].1, r), (imports[r2][i2].1, r2))).collect();
+    relay.switching = switching;
     (out, relay)
 }
 
@@ -2959,10 +3446,10 @@ struct Tested {
     names: Vec<String>,
 }
 
-/// Block `r`'s import test (`charge_hold`) on its voltage `imports` (boundary, coupling) and
-/// `exports` (coupling, row), in the states that reach it: taken from `cache` by its key where the
-/// states are kept, made otherwise.
-fn test_block(b: &Built, whole: &Solver, others: &Others, t: f64, h: f64, r: usize, imports: &[(usize, usize)], exports: &[(usize, usize)], cache: &StateCache, key: u64) -> Tested {
+/// Block `r`'s import test (`charge_hold`) on its voltage `imports` (boundary, coupling),
+/// `exports` (coupling, row) and owned heard rows, in the states that reach it. When the states
+/// are kept the reader's key can take its table from `cache`.
+fn test_block(b: &Built, whole: &Solver, others: &Others, t: f64, h: f64, r: usize, imports: &[(usize, usize)], exports: &[(usize, usize)], heard_rows: &[usize], cache: &StateCache, key: u64) -> Tested {
     // the run's states move with the run: a test in them is made every time
     let keep = others.base_seed().is_some();
     let s0 = &b.solvers[r];
@@ -3012,9 +3499,10 @@ fn test_block(b: &Built, whole: &Solver, others: &Others, t: f64, h: f64, r: usi
     }
     let nodes: Vec<usize> = (0..s0.n).filter(|&i| s0.unknowns[i + 1].kind == UnkKind::Voltage).collect();
     let branches: Vec<usize> = imports.iter().map(|&(j, _)| b.bounds[r][j].branch as usize).collect();
-    let rows: Vec<usize> = exports.iter().map(|&(_, row)| row).collect();
+    // Path steps and echo gains index the exports at the front. The band figure takes all rows.
+    let rows: Vec<usize> = exports.iter().map(|&(_, row)| row).chain(heard_rows.iter().copied()).collect();
     // everything else the test reads: the shape, the step, the nodes, the imports' branches and
-    // the exports' rows
+    // the export and heard rows
     let coords = s0.layout.coords();
     key_bits.u64(s0.n as u64);
     key_bits.u64(h.to_bits());
@@ -3023,12 +3511,14 @@ fn test_block(b: &Built, whole: &Solver, others: &Others, t: f64, h: f64, r: usi
     key_bits.u64s(nodes.iter().map(|&u| u as u64));
     key_bits.u64s(branches.iter().map(|&j| j as u64));
     key_bits.u64s(rows.iter().map(|&j| j as u64));
+    let echo_gains = !b.plan.echoes.is_empty();
+    if echo_gains { key_bits.u64(1); }
     let reader_key = key_bits.key();
     let kept = if keep { cache.table(reader_key, key) } else { None };
     let made = kept.is_none();
     let table = kept.unwrap_or_else(|| {
         let held: Vec<bool> = first.iter().map(|&k| states[k].2).collect();
-        let made = Arc::new(test_reader(s0, &coords, &lins, &held, &nodes, &branches, &rows, h));
+        let made = Arc::new(test_reader(s0, &coords, &lins, &held, &nodes, &branches, &rows, h, echo_gains));
         if keep {
             cache.put_table(reader_key, key, made.clone());
         }
@@ -3039,13 +3529,14 @@ fn test_block(b: &Built, whole: &Solver, others: &Others, t: f64, h: f64, r: usi
 
 /// One block's import test (`charge_hold`) on its distinct linearisations `lins` (`held`: whether
 /// the hold is read in each), its voltage nodes, the branches of its imports and the rows of its
-/// exports, in order.
-fn test_reader(s0: &Solver, coords: &(Vec<u32>, Vec<u32>), lins: &[(Vec<f64>, Vec<f64>)], held: &[bool], nodes: &[usize], branches: &[usize], rows: &[usize], h: f64) -> ReaderTable {
+/// exports followed by its owned heard rows.
+fn test_reader(s0: &Solver, coords: &(Vec<u32>, Vec<u32>), lins: &[(Vec<f64>, Vec<f64>)], held: &[bool], nodes: &[usize], branches: &[usize], rows: &[usize], h: f64, echo_gains: bool) -> ReaderTable {
     let n = s0.n;
     // per import and node: the largest charge and its linearisation; per node: the largest hold and its
     let mut charge: Vec<Vec<(f64, usize)>> = vec![vec![(0.0, 0); n]; branches.len()];
     let mut hold: Vec<(f64, usize)> = vec![(0.0, 0); n];
     let mut transfer: Vec<Vec<f64>> = vec![vec![0.0; rows.len()]; branches.len()];
+    let mut gains = if echo_gains { vec![vec![EchoResponse::default(); rows.len()]; branches.len()] } else { Vec::new() };
     let mut unjudged = false;
     let mut judged = vec![true; lins.len()];
     let mut trap = s0.layout.lu::<f64>();
@@ -3092,6 +3583,14 @@ fn test_reader(s0: &Solver, coords: &(Vec<u32>, Vec<u32>), lins: &[(Vec<f64>, Ve
             for (o, &row) in rows.iter().enumerate() {
                 let v: Vec<f64> = [0.0, 0.0].into_iter().chain(grid.iter().map(|x| x[row])).collect();
                 let tr = 0.5 * (1..v.len() - 1).map(|m| (v[m + 1] - 2.0 * v[m] + v[m - 1]).abs()).sum::<f64>();
+                if echo_gains {
+                    let g = &mut gains[i][o];
+                    let response = v[v.len() - 1];
+                    if tr > transfer[i][o] { g.static_g = response; }
+                    g.min = if g.states == 0 { response } else { g.min.min(response) };
+                    g.max = if g.states == 0 { response } else { g.max.max(response) };
+                    g.states += 1;
+                }
                 transfer[i][o] = transfer[i][o].max(tr);
             }
         }
@@ -3130,17 +3629,28 @@ fn test_reader(s0: &Solver, coords: &(Vec<u32>, Vec<u32>), lins: &[(Vec<f64>, Ve
             u => Judged { q: charge[i][u].0, node: u, q_at: charge[i][u].1, hold: hold[u].0, hold_at: hold[u].1, figure: best.0 },
         }
     }).collect();
-    ReaderTable { imports, transfer, unjudged }
+    ReaderTable { imports, transfer, gains, unjudged }
 }
 
 /// One block's import test as kept (`StateCache::table`, `charge_hold`): per voltage import, in
 /// order, the figure's parts, each state by its place among the block's distinct linearisations,
-/// and its transfer to each voltage export; and whether a state could not judge it.
+/// and its transfer to each voltage export and owned heard net; and whether a state could not judge it.
 #[derive(Debug)]
 pub(crate) struct ReaderTable {
     imports: Vec<Judged>,
     transfer: Vec<Vec<f64>>,
+    gains: Vec<Vec<EchoResponse>>,
     unjudged: bool,
+}
+
+/// An import's signed final response at one export. The static fit is the response
+/// at peak transient transfer. The extrema cover all successfully rehearsed linearisations.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EchoResponse {
+    pub static_g: f64,
+    pub min: f64,
+    pub max: f64,
+    pub states: usize,
 }
 
 /// One import's figure in a reader's test (`ReaderTable`): its charge, node and the linearisation
@@ -3199,7 +3709,7 @@ impl Bits {
 }
 
 /// The plan-time test's lines in a plan's report (`charge_hold`): the blocks a born jump's paths
-/// reach, the pairs that land (and of them those that land for a landed pair after them or by name), the largest
+/// reach, the pairs that land (including those that land for a later pair, by band or by name), the largest
 /// hazard split; the pairs that land and the largest split, with their figure's parts; the largest
 /// transfers.
 fn charge_hold_report(b: &Built, table: &[ChargeHold], relay: &Relay) -> String {
@@ -3209,9 +3719,11 @@ fn charge_hold_report(b: &Built, table: &[ChargeHold], relay: &Relay) -> String 
     let born = reached.iter().filter(|x| x.jumps).count();
     let lands = reached.iter().filter(|x| x.lands).count();
     let named = relay.by_name.len();
-    let passed = reached.iter().filter(|x| x.lands && hazard(x) <= 1.0 && !relay.by_name.contains(&(x.coupling, x.reader))).count();
+    let passed = reached.iter().filter(|x| x.lands && !x.by_band && hazard(x) <= 1.0 && !relay.by_name.contains(&(x.coupling, x.reader))).count();
+    let by_band = reached.iter().filter(|x| x.lands && x.by_band).count();
+    let (f_top, factor) = relay.band_at;
     let split = reached.iter().filter(|x| !x.lands).max_by(|a, c| hazard(a).total_cmp(&hazard(c)));
-    let _ = writeln!(out, "fast charge, slow hold: {} imports into {} blocks tested ({born} born, {} reached along {} path steps, {} cut under a thousandth of the bar); {lands} land ({passed} for a landed pair after them, {named} by name), {} split, {} split for a late loop; {} imports not reached; largest amp x figure split: {}",
+    let _ = writeln!(out, "fast charge, slow hold: {} imports into {} blocks tested ({born} born, {} reached along {} path steps, {} cut under a thousandth of the bar); {lands} land ({passed} for a landed pair after them, {by_band} by the band figure, {named} by name), {} split, {} split for a late loop; band figure at {f_top:.0} Hz, factor {factor:.3}; {} imports not reached; largest amp x figure split: {}",
         reached.len(), relay.blocks, reached.len() - born, relay.followed, relay.cut, reached.len() - lands, relay.loops, table.len() - reached.len(),
         split.map_or("none".into(), |x| format!("{:.2e} against {:.0e} ({} into block {} {})", x.amp * x.figure, x.bar, b.labels[x.coupling], x.reader, b.plan.blocks[x.reader].name)));
     if !relay.named.is_empty() || !relay.absent.is_empty() {
@@ -3224,9 +3736,10 @@ fn charge_hold_report(b: &Built, table: &[ChargeHold], relay: &Relay) -> String 
     }
     reached.sort_by(|a, c| c.lands.cmp(&a.lands).then(hazard(c).total_cmp(&hazard(a))));
     for x in reached.iter().take(lands.max(12)) {
-        let _ = writeln!(out, "  {} into block {} {}{}: amp {:.2e} x figure {:.2e} = {:.2e} V/V against {:.0e} ({}); charge {:.2e} C/V at {} ({}), hold {:.2e} V/C ({})",
+        let step = if x.lands { format!("; lands steps over {:.1e} V", x.step) } else { String::new() };
+        let _ = writeln!(out, "  {} into block {} {}{}: amp {:.2e} x figure {:.2e} = {:.2e} V/V against {:.0e} ({}); band T {:.2e} x amp = {:.2e}{step}; charge {:.2e} C/V at {} ({}), hold {:.2e} V/C ({})",
             b.labels[x.coupling], x.reader, b.plan.blocks[x.reader].name, if x.jumps { " (born)" } else { "" }, x.amp, x.figure, x.amp * x.figure, x.bar,
-            if x.lands { "lands" } else { "split" }, x.q, x.node, x.q_in, x.hold, x.hold_in);
+            if x.lands { "lands" } else { "split" }, x.t, x.amp * x.band, x.q, x.node, x.q_in, x.hold, x.hold_in);
     }
     let mut transfers: Vec<&(usize, usize, usize, f64)> = relay.transfers.iter().collect();
     transfers.sort_by(|a, c| c.3.total_cmp(&a.3));

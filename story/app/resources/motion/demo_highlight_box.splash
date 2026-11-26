@@ -1,0 +1,44 @@
+use mod.motion.*
+// HIGHLIGHT BOX — frames one control. The outline draws itself around the
+// target clockwise from the top-left (a pen, not a fade), a faint accent
+// wash fills in behind it, the box "breathes" once (104% → 100%) to pull
+// the eye, and a small label tab pops out under it (right-aligned to the
+// box, or left-aligned with `label_left`). Transparent overlay.
+// Why: drawing the outline gives the eye a path to the target; the single
+// breath is the "look here" moment without a looping pulse that nags.
+Motion{
+    label: "Highlight box"
+    brief: "An outline that draws around a control, with a wash, a breath and a label tab."
+    tags: ["demo", "overlay", "highlight", "annotation", "product"]
+    duration: 3.5
+    inputs: {
+        target: input(@vec2, vec2(1640, 56), "Centre of the control, px")
+        target_size: input(@vec2, vec2(180, 64), "Size of the control, px")
+        label: input(@text, "Saves every change", "Tab text; \"\" for none")
+        label_left: input(@bool, false, "Align the tab to the box's left edge")
+        accent: input(@color, #ff5c39, "Outline and tab")
+        wash: input(@color, #ff5c391f, "Fill inside the box")
+        tab_ink: input(@color, #0b0d12, "Tab text")
+    }
+    layers: [
+        Group{
+            at: in(@target)
+            scale: keys([0.75, 1.0], [0.95, 1.04, @ease_out_cubic], [1.35, 1.0, @ease_in_out_cubic])
+            opacity: tween(1, 0, 3.15, 3.5, @ease_in_cubic)
+            layers: [
+                Rect{at: (in(@target_size) + vec2(28, 28)) * -0.5 size: in(@target_size) + vec2(28, 28) radius: 18
+                     fill: in(@wash) opacity: tween(0, 1, 0.5, 0.9, @ease_out_cubic)}
+                Rect{at: (in(@target_size) + vec2(28, 28)) * -0.5 size: in(@target_size) + vec2(28, 28) radius: 18
+                     stroke: in(@accent) width: 5 cap: @round
+                     trim_end: tween(0, 1, 0.1, 0.8, @ease_in_out_cubic)}
+            ]
+        }
+        Text{text: in(@label) font: Font{family: "Inter" weight: 700} size: 28 color: in(@tab_ink)
+             at: in(@target) + in(@target_size) * vec2(if in(@label_left) { -0.5 } else { 0.5 }, 0.5)
+                 + vec2(if in(@label_left) { -14 } else { 14 }, 32)
+             wrap: 600 align: if in(@label_left) { @left } else { @right }
+             plate: in(@accent) plate_pad: vec2(16, 8) plate_radius: 8
+             y: tween(-10, 0, 0.8, 1.2, @ease_out_back)
+             opacity: keys([0.8, 0], [0.95, 1, @ease_out_cubic], [3.15, 1], [3.45, 0, @ease_in_cubic])}
+    ]
+}

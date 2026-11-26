@@ -113,14 +113,14 @@ pub fn align_answer(design: &Design, ev: &Evaluated, script_of: &dyn Fn(&str) ->
     let mut out = format!("{{board: {:?} part: {:?} on: {} of: {} tolerance: {}mm holes: [", a.board, a.part_name, a.fit.on, a.holes.len(), num(TOL));
     let mut misses = Vec::new();
     for ((name, at), h) in a.holes.iter().zip(&a.fit.holes) {
-        write!(out, "{{name: {name:?} at: [{} {}]", num(at[0]), num(at[1])).unwrap();
+        write!(out, "{{name: {name:?} at: [{}, {}]", num(at[0]), num(at[1])).unwrap();
         let Some(k) = h.boss else {
             out.push_str(" boss: nil} ");
             misses.push(format!("{name} has no boss left to sit on"));
             continue;
         };
         let b = a.bosses[k].axis;
-        write!(out, " boss: [{} {} {}] residual: {} off: [{} {}] gap: {}}} ", num(b[0]), num(b[1]), num(b[2]), num(h.residual), num(h.off[0]), num(h.off[1]), num(h.gap)).unwrap();
+        write!(out, " boss: [{}, {}, {}] residual: {} off: [{}, {}] gap: {}}} ", num(b[0]), num(b[1]), num(b[2]), num(h.residual), num(h.off[0]), num(h.off[1]), num(h.gap)).unwrap();
         if h.residual > TOL {
             // The boss's move in the part's model frame: from its axis to where the hole lands.
             let p = apply(&a.fit.pose, [at[0], at[1], 0.0]);
@@ -138,8 +138,9 @@ pub fn align_answer(design: &Design, ev: &Evaluated, script_of: &dyn Fn(&str) ->
     let mut note = None;
     match (a.mount, script_of(instance)) {
         (Some((at, turn)), Some((file, source))) => {
-            let mount = format!("board_mount(board({:?}), {{at: [{}mm, {}mm, {}mm] turn: {}deg}})", a.board, num(at[0]), num(at[1]), num(at[2]), num(turn));
-            write!(out, " mount: {{at: [{}mm {}mm {}mm] turn: {}deg}} script: {file:?}", num(at[0]), num(at[1]), num(at[2]), num(turn)).unwrap();
+            let pose = format!("{{at: [{}mm, {}mm, {}mm] turn: {}deg}}", num(at[0]), num(at[1]), num(at[2]), num(turn));
+            let mount = format!("board_mount(board({:?}), {pose})", a.board);
+            write!(out, " mount: {pose} script: {file:?}").unwrap();
             let edits = if source.lines().any(|l| l.trim_start().starts_with(&format!("let {let_name} ="))) {
                 Some(format!("replace({let_name}, {mount})"))
             } else if a.now.is_some() && source.contains(&format!("board({:?})", a.board)) {

@@ -150,7 +150,7 @@ const DRAGS_PER_ROW: usize = 6;
 /// instances whose parts took a stroke (`bracket` for `bracket/bracket`), and the drags that
 /// reached no part.
 fn brushed(app: &TestApp, mark: u64) -> (Vec<String>, usize) {
-    let lines = app.log_since(mark).map(|t| t.lines).unwrap_or_default();
+    let lines = app.log_since(mark).expect("the app's log").lines;
     let on = lines.iter().filter_map(|l| l.split_once("fab paint: stroke of ")?.1.split_once(" points on ")).map(|(_, o)| o.split('/').next().unwrap_or(o).to_string()).collect();
     (on, lines.iter().filter(|l| l.contains("fab paint: the drag reached no part")).count())
 }
@@ -167,7 +167,7 @@ fn brush_and_land(app: &TestApp, rows: &[f64], dabs_per_row: usize) -> (Vec<Stri
         (on.len() + missed >= drags).then_some(on)
     });
     let sources = wait(app, &format!("the strokes on {on:?} in their scripts"), || {
-        let lines = app.log_since(mark).map(|t| t.lines).unwrap_or_default();
+        let lines = app.log_since(mark).expect("the app's log").lines;
         if let Some(refused) = lines.iter().find(|l| l.contains("fab: paint edit refused")) {
             panic!("the brush's stroke was refused: {refused}");
         }
@@ -263,7 +263,7 @@ fn the_brush_paints_mesh_field_and_exact_parts_and_a_flood_and_noise_show(app: T
     let reply = call(&app, "fill", &format!(r#"{{"request_id":"flood","expected":"{head}","script":"vase.cad.splash","seed":[0,23.8,21],"angle":30,"albedo":[0.05,0.2,0.85]}}"#)).expect("fab.fill");
     assert!(!text(&reply).contains("error:"), "{}", text(&reply));
     // until the flood's paint is baked for the views
-    wait(&app, "the flood baked", || app.log_since(from).map(|t| t.lines).unwrap_or_default().iter().find(|l| l.contains("fab vp paint: baked")).map(|_| ()));
+    wait(&app, "the flood baked", || app.log_since(from).expect("the app's log").lines.iter().find(|l| l.contains("fab vp paint: baked")).map(|_| ()));
     let blue = wait(&app, "the flood on screen", || {
         let blue = new_blue(&before, &still_grab(&app));
         (blue > 0.05).then_some(blue)

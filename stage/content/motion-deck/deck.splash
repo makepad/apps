@@ -1,0 +1,190 @@
+use mod.flow.*
+use mod.cut.*
+use mod.deck.*
+
+// Slides are ordered here; each picture lives in its named slides/ file.
+// Present mode releases beats with Next. The DECK editor selects elements.
+
+Deck{
+    title: "Motion"
+    // What a sketch slide's default layout is styled with.
+    look: "shared/motion_deck_look"
+    output: {width: 1920 height: 1080}
+    // Every change is one continuous swipe: forward right-to-left, back left-to-right.
+    transition: transition(0.35, "105_trans_push", {p1: 0.3})
+    slides: [
+        Slide{
+            name: @title
+            graphic: "slides/title_motion"
+            duration: 6.0
+            play: @hold
+            enter: transition(0.35, "105_trans_push", {p1: 0.3})
+            exit: transition(0.35, "105_trans_push", {p1: 0.3 p2: 1.0})
+            notes: "This deck is the new motion work, shown live: soft edges, living type, paths at scale, bones and blends, math, the camera and transitions, and what a local model writes with them. Every slide is a Splash document in content/motion-deck."
+            target_seconds: 75.0
+        }
+        // ---- Type ----
+        Slide{
+            name: @type_ranges
+            graphic: "slides/type_ranges"
+            duration: 4.0
+            play: @hold
+            enter: transition(0.35, "105_trans_push", {p1: 0.3})
+            exit: transition(0.35, "105_trans_push", {p1: 0.3 p2: 1.0})
+            notes: "Text ranges. A range selects part of a text, by letter, word or line, with soft edges, and blends targets into it: offset, scale, opacity, colour and variable-font axes. Top: the weight travels through the letters. Middle: one word at a time takes the light. Bottom: whole lines widen on the width axis and step aside."
+            target_seconds: 129.0
+        }
+        // ---- Shape and paths ----
+        Slide{
+            name: @feather
+            graphic: "slides/feather_soft_edges"
+            duration: 4.0
+            play: @hold
+            enter: transition(0.35, "105_trans_push", {p1: 0.3})
+            exit: transition(0.35, "105_trans_push", {p1: 0.3 p2: 1.0})
+            notes: "Feathering is one coverage model now: any fill, stroke or letter gets a true soft edge. The cases that used to break: a concave star, a ring with a hole, an open stroke, type. Three sides: both (half on the edge), inner (inside only), outer (crisp with a halo). The feather breathes while we talk."
+            target_seconds: 131.0
+        }
+        Slide{
+            name: @paths_at_scale
+            graphic: "slides/paths_at_scale"
+            duration: 600.0
+            play: @hold
+            enter: transition(0.35, "105_trans_push", {p1: 0.3})
+            exit: transition(0.35, "105_trans_push", {p1: 0.3 p2: 1.0})
+            notes: "Two thousand outlines, every one morphing every frame. A frame now carries each path's geometry, so a morph is arithmetic on points instead of parsing path text. That made dense vector work cheap enough to run live."
+            target_seconds: 113.0
+        }
+        Slide{
+            name: @shape_morphs
+            graphic: "slides/shape_morphs"
+            duration: 600.0
+            play: @hold
+            enter: transition(0.35, "105_trans_push", {p1: 0.3})
+            exit: transition(0.35, "105_trans_push", {p1: 0.3 p2: 1.0})
+            notes: "Any outline into any other: contours are paired and split to equal counts, and the start point and winding are chosen so the points travel least, even into a shape with a hole. The onion skin shows the travel. Right: the same move under six rate shapers."
+            target_seconds: 113.0
+        }
+        // ---- Characters and bones ----
+        Slide{
+            name: @bones
+            graphic: "slides/bones_rig"
+            duration: 600.0
+            play: @hold
+            enter: transition(0.35, "105_trans_push", {p1: 0.3})
+            exit: transition(0.35, "105_trans_push", {p1: 0.3 p2: 1.0})
+            notes: "Bones bend plain vector shapes. Forward bones: each bone a little later than its parent. Follow a path: every bone of the ribbon rides the same circle. Two-bone IK: the arm reaches for a drifting point. Weights come from the rest pose; nothing is painted."
+            target_seconds: 131.0
+        }
+        Slide{
+            name: @reach
+            graphic: "slides/character_reach"
+            duration: 600.0
+            play: @hold
+            enter: transition(0.35, "105_trans_push", {p1: 0.3})
+            exit: transition(0.35, "105_trans_push", {p1: 0.3 p2: 1.0})
+            notes: "The bundled characters use the same IK: a hand or a foot takes a target, after pose, walk and grounding, so feet stay planted while the arm bends to the light."
+            target_seconds: 94.0
+        }
+        Slide{
+            name: @blends
+            graphic: "slides/pose_blends"
+            duration: 600.0
+            play: @hold
+            enter: transition(0.35, "105_trans_push", {p1: 0.3})
+            exit: transition(0.35, "105_trans_push", {p1: 0.3 p2: 1.0})
+            notes: "Blends mix any value or any pose between stops. Here the pointer drives them: x rounds the tiles and moves the character from idle to wave to cheer, y turns the tiles, and the colour mixes across both. Without pointer inputs from the host, an autopilot moves the virtual pointer."
+            target_seconds: 113.0
+        }
+        // ---- Math ----
+        Slide{
+            name: @math_typeset
+            graphic: "slides/math_typeset"
+            duration: 10.0
+            beats: [2.5, 5.1, 7.7]
+            play: @hold
+            enter: transition(0.35, "105_trans_push", {p1: 0.3})
+            exit: transition(0.35, "105_trans_push", {p1: 0.3 p2: 1.0})
+            notes: "TeX becomes paths in the math face. Named parts keep their colour and travel between steps: click, the square opens into the product; click, it settles as the expansion. Click, the definition of the derivative writes in."
+            target_seconds: 131.0
+        }
+        Slide{
+            name: @math_derivative
+            graphic: "slides/math_derivative"
+            duration: 10.0
+            beats: [2.5, 6.5]
+            play: @hold
+            enter: transition(0.35, "105_trans_push", {p1: 0.3})
+            exit: transition(0.35, "105_trans_push", {p1: 0.3 p2: 1.0})
+            notes: "Plots in data coordinates. The cubic draws on. Click: a tangent rides along it. Click: the curve itself morphs into its derivative while a faint copy of f stays behind, and the formula rewrites itself."
+            target_seconds: 131.0
+        }
+        Slide{
+            name: @math_plane_map
+            graphic: "slides/math_plane_map"
+            duration: 9.0
+            beats: [2.5, 5.3]
+            play: @hold
+            enter: transition(0.35, "105_trans_push", {p1: 0.3})
+            exit: transition(0.35, "105_trans_push", {p1: 0.3 p2: 1.0})
+            notes: "A map moves the whole plane: grid, axes, curves and points together. Click: a matrix shears and turns the left plane. Click: the complex map z to z squared over three folds the right one; lines subdivide as they bend."
+            target_seconds: 113.0
+        }
+        Slide{
+            name: @math_fourier
+            graphic: "slides/math_fourier"
+            duration: 9.0
+            beats: [2.9, 6.1]
+            play: @hold
+            enter: transition(0.35, "105_trans_push", {p1: 0.3})
+            exit: transition(0.35, "105_trans_push", {p1: 0.3 p2: 1.0})
+            notes: "A chain of circles draws a closed curve. The Fourier coefficients are computed at load, in Splash. Three circles give a rough loop; click, nine; click, forty-one, and the heart is sharp."
+            target_seconds: 113.0
+        }
+
+        // ---- Transitions and camera ----
+        Slide{
+            name: @camera
+            graphic: "slides/camera_dolly"
+            duration: 12.0
+            beats: [2.9, 6.1, 9.3]
+            play: @hold
+            enter: transition(0.35, "105_trans_push", {p1: 0.3})
+            exit: transition(0.35, "105_trans_push", {p1: 0.3 p2: 1.0})
+            notes: "The 2D camera is a value like any other. Each click starts one long eased dolly to the next station of the same world: lines glide in, a route draws on, cards fade in. The last click pulls back over the whole world."
+            target_seconds: 113.0
+        }
+        Slide{
+            name: @transitions
+            graphic: "slides/transitions.cut.splash"
+            beats: [2.4, 4.9, 7.4, 9.9, 12.4]
+            play: @hold
+            enter: transition(0.35, "105_trans_push", {p1: 0.3})
+            exit: transition(0.35, "105_trans_push", {p1: 0.3 p2: 1.0})
+            notes: "The transitions DECK and CUT use, all smooth and seekable: each click brings the next card in by the transition it names. Push, slide over, motion blur, directional, dissolve."
+            target_seconds: 113.0
+        }
+        // ---- AI writes these ----
+        Slide{
+            name: @ai
+            graphic: "slides/ai_writes_these"
+            duration: 14.0
+            play: [2.0, 14.0]
+            enter: transition(0.35, "105_trans_push", {p1: 0.3})
+            exit: transition(0.35, "105_trans_push", {p1: 0.3 p2: 1.0})
+            notes: "A 27B model on our own network wrote each of these documents from the single sentence under it and the guide section of the feature. They are placed here exactly as written and replay on their own clocks: text ranges, bones with IK, and an outer feather."
+            target_seconds: 131.0
+        }
+        // ---- Close ----
+        Slide{
+            name: @close
+            graphic: "slides/close_write_it"
+            duration: 6.0
+            play: @hold
+            enter: transition(0.35, "105_trans_push", {p1: 0.3})
+            exit: transition(0.35, "105_trans_push", {p1: 0.3 p2: 1.0})
+            notes: "Every slide in this deck is a Splash document: open deck.splash or any slide and change it, and it moves."
+            target_seconds: 56.0
+        }
+    ]
+}

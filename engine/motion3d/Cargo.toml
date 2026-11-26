@@ -1,0 +1,81 @@
+# 3D motion graphics (the Scene3D layer): a Splash-authored scene graph
+# evaluated as a pure function of `t` — groups and cameras, procedural and
+# extruded geometry, 3D type, instancing, particles and fat lines, PBR /
+# physical / toon / matcap / custom shader materials, lights with soft
+# shadows and image-based lighting, GLB skeletal and morph animation — and
+# drawn frame-exact on Makepad's GPU pipeline with its post chain (bloom,
+# SSAO, depth of field, temporal motion blur, outline, tone mapping). A
+# library the Motion Scene3D layer drives, plus `makepad-motion3d`: pixel
+# tests, benchmarks and the showcase strips.
+[package]
+name = "makepad-stage-motion3d"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "makepad_stage_motion3d"
+
+[[bin]]
+name = "makepad-motion3d"
+path = "src/main.rs"
+
+[features]
+default = ["models"]
+# Modelled props and characters (`mod.model`, `Model{src: crate("c")}`)
+# built by Stage's model host into its store. Without it a scene that
+# places a built model loads and draws without it (a player of finished
+# documents).
+models = ["dep:makepad-stage-model-host"]
+
+[dependencies]
+# The VM (the forms module names it directly; the widget library re-exports it).
+makepad-script = { path = "../../../../platform/script" }
+makepad-script-compute-sched = { path = "../../../../platform/script/compute_sched" }
+# Kernels: document functions compiled ahead of time (per vertex, per
+# element), KERNELS.md §3.5.
+makepad-script-compute = { path = "../../../../platform/script/compute", features = ["vm"] }
+# Splash modules a document imports (`import(asset(..))`, named modules).
+makepad-script-imports = { path = "../../../../platform/script/imports" }
+makepad-tween-script = { path = "../../../../libs/tween/script" }
+makepad-widgets = { path = "../../../../widgets", default-features = false }
+# GLB models: the document, accessors and embedded images.
+makepad-gltf = { path = "../../../../libs/gltf" }
+# Eases: the documents' named eases and their curves.
+makepad-tween = { path = "../../../../libs/tween" }
+# SVG path data and whole SVG documents for extruded shapes.
+makepad-svg = { path = "../../../../libs/svg" }
+# Constrained triangulation of extruded caps (shapes with holes).
+makepad-csg-boolean = { path = "../../../../libs/csg/csg_boolean" }
+# The procedural engines (EngineGeometry) of the effect pack the host installed.
+makepad-content-packs = { path = "../content_packs" }
+# Meshes, primitives, shapes, curves, noise; the glyph extruder and 3D letters.
+makepad-geom3d = { path = "../../../../libs/geom3d" }
+# Image-based lighting (the environment maps and their prefilter).
+makepad-render-material = { path = "../../../../libs/render_material" }
+# The shared-renderer path (shared.rs): the scene lanes, the World, fat lines.
+makepad-render = { path = "../../../../libs/render" }
+# The HDRI generator: Scene3D's `@hdri_*` environments are its presets.
+makepad-hdri-engine = { path = "../../../apps/engine/hdri" }
+makepad-scene = { path = "../../../../libs/scene" }
+makepad-render-lines = { path = "../../../../libs/render_lines" }
+# The render graph: Splash post passes and kits, locked-time sub-frame
+# accumulation (adaptive motion blur).
+makepad-render-graph = { path = "../../../../libs/render_graph" }
+# Effect physics and stateful kernels (KERNELS.md §3.6): `Physics{}`,
+# `Spawn{}`, `bodies()`, `contacts()`, `Sim{}`.
+makepad-effect-sim = { path = "../../../../libs/effect_sim" }
+makepad-render-kernels = { path = "../../../../libs/render_kernels" }
+makepad-text-mesh = { path = "../../../../libs/text_mesh" }
+# Modelling (KERNELS.md §3.10): `mod.model` is the builder Sandbox's games
+# use, and Stage's model host builds and caches its programs in Stage's store.
+makepad-model-script = { path = "../../../apps/engine/model_script" }
+makepad-stage-model-host = { path = "../model_host", optional = true }
+# Strips and pixel-test failures are written as PNG.
+makepad-zune-png = { path = "../../../../libs/zune/zune-png", version = "0.5.2" }
+
+[dev-dependencies]
+makepad-text-mesh = { path = "../../../../libs/text_mesh", features = ["dev-fonts"] }
+# The clip-time test builds a character-lab character itself.
+makepad-model = { path = "../../../../libs/model" }

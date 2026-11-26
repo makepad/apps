@@ -1,0 +1,42 @@
+# makepad-story-doc-player: one Stage document (a film's cut, a Motion
+# document or a presentation deck) played full-window with its sound, by the
+# engines Stage draws and mixes it with (the cut renderer's engine and
+# compositor, Motion, kinetic type, the audio engine, the script VM) and none of Stage's editor, library, store, AI or chrome.
+#
+# Deterministic mode (`--deterministic`) steps the clock along the timeline
+# one frame at a time and draws every frame exactly (locked time, every asset
+# and glyph loaded), as Stage's render does: the entry point a tracer drives
+# (open, play to the end, exit with a status). See src/main.rs.
+#
+# Every crate here ends up in the web export: keep the graph minimal (the
+# engines are taken without their store, export and model-host features).
+[package]
+name = "makepad-story-doc-player"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "makepad-story-doc-player"
+path = "src/main.rs"
+
+[dependencies]
+makepad-widgets = { path = "../../../../../widgets", default-features = false }
+makepad-asset-data = { path = "../../../../apps/engine/asset/data" }
+makepad-story-cut = { path = "../../libs/cut" }
+makepad-motion = { path = "../../../../apps/engine/motion", default-features = false }
+makepad-story-deck = { path = "../../libs/deck", default-features = false }
+# The cut engine and compositor, the slide mixer and the mixdown; no store,
+# encoder or model host.
+makepad-story-edit-render = { path = "../../libs/edit_render", default-features = false }
+# Effects and KineticText through the packs a host installs (none here).
+makepad-content-packs = { path = "../../../../apps/engine/content_packs" }
+# The audio engine the sound plays through (an AudioDeck into the device).
+makepad-stage-live-audio = { path = "../../../../apps/stage/libs/live_audio" }
+# The documents' font table (the browser fetches their faces with them).
+makepad-doc-fonts = { path = "../../../../apps/engine/fonts" }
+# The clip the viewer's deck plays (the cut's whole sound).
+makepad-stage-audio-media = { path = "../../../../apps/engine/audio_media" }
+# `--shutter-max`: a coverage run's cap on motion blur's sub-frames.
+makepad-render-graph = { path = "../../../../../libs/render_graph", default-features = false }

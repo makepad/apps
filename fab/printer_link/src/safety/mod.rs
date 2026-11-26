@@ -425,10 +425,14 @@ fn areas(v: &str) -> Vec<Vec<[f64; 2]>> {
 }
 
 /// Each nozzle's printable area and height. A second-family printer whose heads all reach the
-/// whole bed lists none (its height list is empty or a single 0): each nozzle then has the
-/// printable area and height. Every other list is kept as stated.
+/// whole bed lists none (its height list is empty or a single 0), and neither does a
+/// single-nozzle printer of the first family (its profile leaves the per-nozzle keys at their
+/// defaults): each nozzle then has the printable area and height, as the slicer reads them. A
+/// first-family printer with several nozzles must state each one's area, and every other list
+/// is kept as stated.
 fn per_nozzle(flavor: Flavor, areas: Vec<Vec<[f64; 2]>>, heights: Vec<f64>, area: &[[f64; 2]], height: f64, nozzles: usize) -> (Vec<Vec<[f64; 2]>>, Vec<f64>) {
-    if flavor != Flavor::Named || !areas.is_empty() || !(heights.is_empty() || heights == [0.0]) || area.is_empty() {
+    let whole_bed = flavor == Flavor::Named || nozzles == 1;
+    if !whole_bed || !areas.is_empty() || !(heights.is_empty() || heights == [0.0]) || area.is_empty() {
         return (areas, heights);
     }
     (vec![area.to_vec(); nozzles], vec![height; nozzles])

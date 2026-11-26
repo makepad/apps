@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 fn answer(source: ProposalSource, base_hash: ContentHash, ops: Vec<BoardOp>, label: &str) -> Arc<RouteProposal> {
     Arc::new(RouteProposal {
+        pair: None,
         id: ProposalId(0),
         source,
         unit: BoardId(0),

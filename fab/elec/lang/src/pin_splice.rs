@@ -586,60 +586,138 @@ fn unmark(tree: &Syntax, map: &SourceMap, unit: BoardId, at: &SourceRange, compo
     remove_nc(tree, at, &list.value, &[component.part.pins[pin.ix()].name.as_str()])
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OptionChange<'a> {
+    Dnp(bool),
+    Field(&'a str, Option<&'a str>),
+}
+
+/// Resolve each expression's complete set of instances before producing any text edits.
+/// One call may receive several field changes (an alternate swap). Apply them to a
+/// private copy of that call so insertions and removals never overlap in the source.
+pub(crate) fn assembly_edits(sources: &Sources, map: &SourceMap, design: &Design, ops: &[fab_elec_design::DesignOp]) -> Result<Vec<TextEdit>, Diag> {
+    use fab_elec_circuit::CircuitOp;
+    use fab_elec_design::DesignOp;
+    use std::collections::BTreeMap;
+    let mut calls = BTreeMap::<_, BTreeMap<CompRef, Vec<OptionChange>>>::new();
+    for op in ops {
+        let DesignOp::Circuit { unit, op } = op else { continue };
+        let (comp, change) = match op {
+            CircuitOp::SetDnp { comp, dnp } => (*comp, OptionChange::Dnp(*dnp)),
+            CircuitOp::SetField { comp, key, text } => (*comp, OptionChange::Field(key, text.as_deref())),
+            _ => continue,
+        };
+        let (at, _, _) = mapped_comp(sources, map, design, *unit, comp)?;
+        calls.entry((at.doc, at.span.start, at.span.end)).or_default()
+            .entry(CompRef { board: *unit, comp }).or_default().push(change);
+    }
+    if calls.is_empty() { return Ok(Vec::new()); }
+    let shared_calls = crate::splice::SharedCalls::new(design, map);
+    let mut edits = Vec::with_capacity(calls.len());
+    for ((doc, start, end), members) in calls {
+        let at = SourceRange { doc, span: start..end };
+        let (&part, changes) = members.first_key_value().unwrap();
+        let all = shared_calls.group(part).len().max(1);
+        if members.len() != all { return Err(shared(&at, all)); }
+        if members.values().any(|other| other != changes) {
+            return Err(located(doc, at.span, "these instances need different field values at one shared expression: split the expression in the code"));
+        }
+        let original = &document(sources, &at)?.text[start as usize..end as usize];
+        let path = &design.unit(part.board).unwrap().circuit.comps[part.comp.ix()].path;
+        let mut updated = original.to_string();
+        for change in changes {
+            let tree = syntax::parse_with(&updated, &circuit_units()).map_err(|e| located(doc, at.span.clone(), e.message))?;
+            let call = call_at(&tree, &SourceRange { doc, span: 0..updated.len() as u32 })
+                .ok_or_else(|| located(doc, at.span.clone(), "the component's mapped call is missing"))?;
+            let pos = options_position(maker_name(call), map, part)
+                .ok_or_else(|| located(doc, at.span.clone(), format!("{path}: cannot edit options on this generated component")))?;
+            let (span, value) = match change {
+                OptionChange::Dnp(dnp) => write_dnp(&tree, call, pos, &at, *dnp)?,
+                OptionChange::Field(key, value) => write_field(&tree, call, pos, &at, path, key, *value)?,
+            };
+            updated.replace_range(span, &value);
+        }
+        // Keep the unaffected prefix and suffix out of the edit and its inverse.
+        let left: usize = original.chars().zip(updated.chars()).take_while(|(a,b)| a == b).map(|(a,_)| a.len_utf8()).sum();
+        let right: usize = original[left..].chars().rev().zip(updated[left..].chars().rev())
+            .take_while(|(a,b)| a == b).map(|(a,_)| a.len_utf8()).sum();
+        edits.push(edit(doc, start as usize + left..end as usize - right, updated[left..updated.len()-right].to_owned()));
+    }
+    Ok(edits)
+}
+
+fn write_dnp(tree: &Syntax, call: &Node, pos: usize, at: &SourceRange, dnp: bool) -> Result<(Range<usize>, String), Diag> {
+    let fail = |why| located(at.doc, at.span.clone(), why);
+    let Kind::Call { args, open, close, .. } = &call.kind else { unreachable!() };
+    let maker = maker_name(call);
+    let (span, text) = match crate::circuit::comp_options_arg(args, pos) {
+        Some((index, opts)) => {
+            let Kind::Object { fields, open: left, close: right, .. } = &opts.kind else { return Err(fail("DNP needs a literal options object")) };
+            if dnp {
+                object_edit(&tree, opts, "dnp", "true").expect("literal object")
+            } else {
+                let i = fields.iter().position(|f| f.name.as_deref() == Some("dnp")).ok_or_else(|| fail("the DNP option is absent"))?;
+                if fields.len() == 1 && maker != Some("led") && index + 1 == args.len() {
+                    entry_removal(tree.source(), *open, *close, &args.iter().map(|a| a.span.clone()).collect::<Vec<_>>(), index, index)
+                } else {
+                    entry_removal(tree.source(), *left, *right, &fields.iter().map(|f| f.span.clone()).collect::<Vec<_>>(), i, i)
+                }
+            }
+        }
+        None if dnp => {
+            let key = if args.len() == pos { "" } else if pos == 4 { "rest: " } else { "opts: " };
+            let sep = if args.is_empty() { "" } else { ", " };
+            (*close..*close, format!("{sep}{key}{{dnp: true}}"))
+        }
+        None => return Err(fail("the DNP option is absent")),
+    };
+    Ok((span, text))
+}
+
 /// Write (`Some`) or remove (`None`) the component's own text field `key` in the options of the
 /// call that makes it: the `fields: {key: "text"}` of `e.part`, `e.r`, `e.c` or `e.led`. Missing
 /// options and a missing `fields` object are added. Removing the last field removes `fields`, and
 /// options left empty go too when they are the call's last argument (`e.led` keeps its own).
-pub(crate) fn set_field(
-    sources: &Sources, map: &SourceMap, design: &Design, unit: BoardId,
-    comp: CompId, key: &str, text: Option<&str>,
-) -> Result<Vec<TextEdit>, Diag> {
-    let (at, _, component) = mapped_comp(sources, map, design, unit, comp)?;
-    let tree = parse(document(sources, &at)?)?;
+fn write_field(tree: &Syntax, call: &Node, index: usize, at: &SourceRange, path: &str, key: &str, text: Option<&str>) -> Result<(Range<usize>, String), Diag> {
     let fail = |message: String| located(at.doc, at.span.clone(), message);
-    let call = call_at(&tree, &at).ok_or_else(|| fail("the component's mapped call is missing".to_string()))?;
-    check_shared(map, &at)?;
-    let label = format!("{} field {key}", component.path);
-    let Kind::Call { args, open, close, .. } = &call.kind else { unreachable!("call_at finds only calls") };
+    let label = format!("{path} field {key}");
+    let Kind::Call { args, open, close, .. } = &call.kind else { unreachable!() };
     let maker = maker_name(call);
-    let index = options_position(maker, map, CompRef { board: unit, comp })
-        .ok_or_else(|| fail(format!("{label}: only e.part, e.r, e.c and e.led calls write a component's fields")))?;
     let value = text.map(|text| syntax::write::write(&syntax::write::Value::Str(text.to_string()))).transpose().map_err(fail)?;
     let entry = |value: &str| syntax::write::key(key).map(|key| format!("{key}: {value}")).map_err(fail);
     let unset = || fail(format!("{label} is not set"));
     let literal = || fail(format!("{label}: the options are not a literal object: edit them by hand"));
     let source = tree.source();
-    let Some(opts) = args.get(index) else {
+    let Some((arg_index, opts)) = crate::circuit::comp_options_arg(args, index) else {
         let value = value.ok_or_else(unset)?;
-        if args.len() != index {
-            return Err(fail(format!("{label}: the call has fewer arguments than its options need")));
-        }
-        return Ok(vec![edit(at.doc, *close..*close, format!(", {{fields: {{{}}}}}", entry(&value)?))]);
+        let name = if args.len() == index { "" } else if index == 4 { "rest: " } else { "opts: " };
+        let sep = if args.is_empty() { "" } else { ", " };
+        return Ok((*close..*close, format!("{sep}{name}{{fields: {{{}}}}}", entry(&value)?)));
     };
     let Kind::Object { fields: options, open: options_open, close: options_close, .. } = &opts.kind else { return Err(literal()) };
     let Some(fields) = opts.field("fields") else {
         let value = value.ok_or_else(unset)?;
         let (span, text) = object_edit(&tree, opts, "fields", &format!("{{{}}}", entry(&value)?)).ok_or_else(literal)?;
-        return Ok(vec![edit(at.doc, span, text)]);
+        return Ok((span, text));
     };
     let Kind::Object { fields: entries, open: fields_open, close: fields_close, .. } = &fields.value.kind else { return Err(literal()) };
     let Some(value) = value else {
         let i = entries.iter().position(|f| f.name.as_deref() == Some(key)).ok_or_else(unset)?;
         let removal = |open: usize, close: usize, spans: Vec<Range<usize>>, i: usize| {
             let (span, text) = entry_removal(source, open, close, &spans, i, i);
-            vec![edit(at.doc, span, text)]
+            (span, text)
         };
         if entries.len() > 1 {
             return Ok(removal(*fields_open, *fields_close, entries.iter().map(|f| f.span.clone()).collect(), i));
         }
-        if options.len() == 1 && maker != Some("led") && index + 1 == args.len() {
-            return Ok(removal(*open, *close, args.iter().map(|a| a.span.clone()).collect(), index));
+        if options.len() == 1 && maker != Some("led") && arg_index + 1 == args.len() {
+            return Ok(removal(*open, *close, args.iter().map(|a| a.span.clone()).collect(), arg_index));
         }
         let j = options.iter().position(|f| f.name.as_deref() == Some("fields")).expect("the fields entry was found above");
         return Ok(removal(*options_open, *options_close, options.iter().map(|f| f.span.clone()).collect(), j));
     };
     let (span, text) = object_edit(&tree, &fields.value, key, &value).ok_or_else(literal)?;
-    Ok(vec![edit(at.doc, span, text)])
+    Ok((span, text))
 }
 
 fn pin_entries(component: &Component, pins: &[(PinIx, &str)], at: &SourceRange) -> Result<Vec<String>, Diag> {
@@ -1119,4 +1197,35 @@ fn removal_span(source: &str, stmt: &Range<usize>) -> Range<usize> {
 
 fn edit(doc: DocId, span: Range<usize>, text: String) -> TextEdit {
     TextEdit { doc, span: span.start as u32..span.end as u32, text }
+}
+
+#[cfg(test)]
+mod bom_tests {
+    use crate::{evaluate, splice, std_libs, Sources};
+    use fab_elec_circuit::CircuitOp;
+    use fab_elec_design::DesignOp;
+
+    #[test]
+    fn dnp_round_trips_through_component_options() {
+        let text = "let e = mod.elec\nlet a = e.net()\nlet b = e.net()\nlet r = e.r(1kohm, a, b)\n";
+        let mut sources = Sources::new();
+        let doc = sources.add("board.ckt.splash", text).unwrap();
+        let libs = std_libs();
+        for dnp in [true, false] {
+            let ev = evaluate(&sources, &libs).unwrap();
+            let unit = &ev.design.units[0];
+            let part = unit.circuit.comp("r").unwrap();
+            assert_ne!(part.dnp, dnp);
+            let change = splice(&sources, &ev.map, &ev.design, &[DesignOp::Circuit {
+                unit: unit.id, op: CircuitOp::SetDnp { comp: part.id, dnp },
+            }]).unwrap();
+            sources.apply(&change.edits).unwrap();
+            assert_eq!(sources.doc(doc).unwrap().text.contains("dnp: true"), dnp);
+        }
+        assert_eq!(&*sources.doc(doc).unwrap().text, text);
+        assert!(!evaluate(&sources, &libs).unwrap().design.units[0].circuit.comp("r").unwrap().dnp);
+        let mut invalid = Sources::new();
+        invalid.add("board.ckt.splash", text.replace("1kohm, a, b)", "1kohm, a, b, {dnp: 1})")).unwrap();
+        assert!(evaluate(&invalid, &libs).err().unwrap().iter().any(|e| e.message.contains("dnp: expected true or false")));
+    }
 }

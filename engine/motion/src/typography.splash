@@ -1,0 +1,627 @@
+use mod.motion.*
+// Text animators: `Text{text: "…" animate: @fade_up}` in one line (typography.rs applies them in the document's VM).
+//
+// Each animator is its look and the layers it suits, and make(t, o): t is the author's Text, o
+// {start speed size text doc_width}: `start` (a time; 0.2 by default) and `speed` (1 = the look's
+// own pace; 2 twice as fast) are the Text's own, `size` its number size (72 by default). make
+// returns what the Text becomes: the Text with the look's fields set where the author set nothing
+// (`ty_text`), or the layers that draw the look (a Group of Texts). Times are seconds from
+// `start`, which may be a time reference (`beat(4)`): `ty_at(start, by)` moves either.
+
+// A time `by` seconds after `start` (a number, or a time reference's offset).
+let ty_at = fn(start, by) {
+    if start.is_number() { return start + by }
+    return start{offset: (start.offset ?? 0.0) + by}
+}
+let ty_tween = fn(from, to, start, dur, ease) { Tween{from: from to: to start: start end: ty_at(start, dur) ease: ease} }
+// Keys of [t (seconds from `start`), value, ease?] moved to `start`.
+let ty_keys = fn(start, points) {
+    let out = []
+    for p in points {
+        if p.len() > 2 { out.push([ty_at(start, p[0]), p[1], p[2]]) } else { out.push([ty_at(start, p[0]), p[1]]) }
+    }
+    Keys{points: out}
+}
+// `out[key] = value` where the author set nothing.
+let ty_default = fn(out, key, value) {
+    if (out[key] ?? nil) == nil { out[key] = value }
+}
+// Whether the id `k` is in `list`.
+let ty_in = fn(k, list) {
+    for x in list { if k == x { return true } }
+    false
+}
+// A new Text with the author's fields (its own and its prototypes' up to Text) but those in
+// `drop`.
+let ty_copy = fn(t, drop) {
+    let chain = []
+    var o = t
+    while o != nil && o.is_object() && o.gc_id() != Text.gc_id() {
+        chain.push(o)
+        o = o.proto() ?? nil
+    }
+    let out = Text{}
+    for i in 0..chain.len() {
+        // The furthest prototype first, so nearer fields win.
+        for k, v in chain[chain.len() - 1 - i] {
+            if !ty_in(k, drop) { out[k] = v }
+        }
+    }
+    out
+}
+let TY_OWN = [@animate, @start, @speed]
+// The author's Text without the animator's own fields (and `more`).
+let ty_text = fn(t) { ty_copy(t, TY_OWN) }
+// The Text without what moves to the look's Group (span, opacity, …), without its place unless
+// `keep_place`, and without `more`.
+let ty_bare_but = fn(t, keep_place, more) {
+    let drop = [@animate, @start, @speed, @span, @opacity, @blend, @blur, @effects, @visible, @locked, @name]
+    if !keep_place { for k in [@at, @x, @y, @scale, @rotate, @anchor] { drop.push(k) } }
+    for k in more { drop.push(k) }
+    ty_copy(t, drop)
+}
+let ty_bare = fn(t, keep_place) { ty_bare_but(t, keep_place, []) }
+// The Group a look draws in: the Text's own name, span, opacity and the like.
+let ty_group = fn(t, layers, mask, mode) {
+    let g = Group{layers: layers}
+    if t != nil {
+        for k in [@name, @span, @opacity, @blend, @blur, @effects, @visible, @locked] {
+            if (t[k] ?? nil) != nil { g[k] = (t[k] ?? nil) }
+        }
+    }
+    if mask != nil {
+        g.mask = mask
+        g.mask_mode = mode
+    }
+    g
+}
+// The common layer fields of `t` on a Group of `layers` (the place too).
+let ty_common = fn(t, layers) {
+    let g = Group{layers: layers}
+    for k in [@data_layer, @name, @at, @x, @y, @scale, @rotate, @anchor, @opacity, @blend, @span, @blur, @effects, @visible, @locked, @hard_cut, @exit, @exit_at, @exit_duration, @exit_to, @onion, @slices, @tear, @droste] {
+        if (t[k] ?? nil) != nil { g[k] = (t[k] ?? nil) }
+    }
+    g
+}
+// A Text of one word with the author's look (font, colour, …).
+let ty_word = fn(t, text) {
+    let w = Text{text: text}
+    for k in [@font, @color, @tracking, @line_height, @plate, @plate_pad, @plate_radius, @feather, @feather_side] {
+        if (t[k] ?? nil) != nil { w[k] = (t[k] ?? nil) }
+    }
+    w
+}
+let ty_words = fn(text) {
+    let words = []
+    for w in text.replace("\n", " ").replace("\t", " ").replace("\r", " ").split(" ") {
+        if w != "" { words.push(w) }
+    }
+    words
+}
+// A ring of `n` copies of `make(dx, dy)` at radius r.
+let ty_ring = fn(n, r, make) {
+    let out = []
+    for k in 0..n {
+        let a = k / n * 6.283185307179586
+        out.push(make(r * cos(a), r * sin(a)))
+    }
+    out
+}
+// A keyed value moved by `by` (every key's value).
+let ty_offset = fn(track, by) {
+    let points = []
+    for p in track.points {
+        if p.len() > 2 { points.push([p[0], p[1] + by, p[2]]) } else { points.push([p[0], p[1] + by]) }
+    }
+    Keys{points: points}
+}
+
+let type_animators = {
+    fade_up: {about: "words fade in rising, one after another" suits: "subtitles, explainers, calm statements"
+        make: fn(t, o) {
+            let out = ty_text(t)
+            ty_default(out, @by, @word)
+            ty_default(out, @stagger, 0.07 / o.speed)
+            ty_default(out, @opacity, ty_tween(0, 1, o.start, 0.45 / o.speed, @ease_out))
+            ty_default(out, @y, ty_tween(o.size * 0.45, 0, o.start, 0.6 / o.speed, @ease_out_cubic))
+            out
+        }}
+    rise: {about: "lines slide up into place in turn" suits: "headlines of several lines, editorial"
+        make: fn(t, o) {
+            let out = ty_text(t)
+            ty_default(out, @by, @line)
+            ty_default(out, @stagger, 0.14 / o.speed)
+            ty_default(out, @opacity, ty_tween(0, 1, o.start, 0.3 / o.speed, @ease_out))
+            ty_default(out, @y, ty_tween(o.size * 1.1, 0, o.start, 0.7 / o.speed, @ease_out_expo))
+            out
+        }}
+    wipe: {about: "letters appear left to right in a soft wipe" suits: "labels, names, understated reveals"
+        make: fn(t, o) {
+            let out = ty_text(t)
+            ty_default(out, @by, @letter)
+            ty_default(out, @stagger, 0.018 / o.speed)
+            ty_default(out, @opacity, ty_tween(0, 1, o.start, 0.18 / o.speed, @linear))
+            ty_default(out, @x, ty_tween(0.0 - o.size * 0.12, 0, o.start, 0.25 / o.speed, @ease_out))
+            out
+        }}
+    typewriter: {about: "characters typed on with a blinking caret" suits: "code, quotes, terminal and product copy"
+        make: fn(t, o) {
+            // `cps`: characters a second (16 by default).
+            let cps = if (t.cps ?? nil) != nil && (t.cps ?? nil) > 0.0 { (t.cps ?? nil) } else { 16.0 }
+            let out = ty_copy(t, [@animate, @start, @speed, @cps])
+            ty_default(out, @reveal, ty_tween(0, 1, o.start, max(o.text.to_chars().len(), 1) / cps / o.speed, @linear))
+            ty_default(out, @caret, Loop{inner: Keys{points: [[0, 1], [0.5, 0, @hold], [1, 1, @hold]]} period: 1 mode: @restart count: nil})
+            out
+        }}
+    pop: {about: "letters spring in from nothing, overshooting" suits: "playful titles, kids, social"
+        make: fn(t, o) {
+            let out = ty_text(t)
+            ty_default(out, @by, @letter)
+            ty_default(out, @stagger, 0.035 / o.speed)
+            ty_default(out, @scale, ty_tween(0, 1, o.start, 0.7 / o.speed, Spring{k: 170 d: 11}))
+            out
+        }}
+    elastic: {about: "letters drop in and bounce" suits: "energetic hooks, gaming"
+        make: fn(t, o) {
+            let out = ty_text(t)
+            ty_default(out, @by, @letter)
+            ty_default(out, @stagger, 0.045 / o.speed)
+            ty_default(out, @opacity, ty_tween(0, 1, o.start, 0.12 / o.speed, @linear))
+            ty_default(out, @y, ty_tween(0.0 - o.size * 1.2, 0, o.start, 1.1 / o.speed, @ease_out_bounce))
+            out
+        }}
+    blur_in: {about: "words sharpen out of a blur" suits: "cinematic titles, trailers"
+        make: fn(t, o) {
+            let out = ty_text(t)
+            ty_default(out, @by, @word)
+            ty_default(out, @stagger, 0.09 / o.speed)
+            ty_default(out, @opacity, ty_tween(0, 1, o.start, 0.5 / o.speed, @ease_out))
+            ty_default(out, @blur, ty_tween(o.size * 0.25, 0, o.start, 0.7 / o.speed, @ease_out_cubic))
+            out
+        }}
+    tracking: {about: "letter spacing closes in from wide" suits: "luxury, film titles"
+        make: fn(t, o) {
+            // The letter spacing itself closes in (the glyphs keep their size, so nothing is
+            // rasterised again per frame).
+            let base = if (t.tracking ?? nil) != nil && (t.tracking ?? nil).is_number() { (t.tracking ?? nil) } else { 0.0 }
+            let out = ty_copy(t, [@animate, @start, @speed, @tracking])
+            ty_default(out, @opacity, ty_tween(0, 1, o.start, 0.6 / o.speed, @ease_out))
+            ty_default(out, @tracking, ty_tween(base + o.size * 0.45, base, o.start, 1.6 / o.speed, @ease_out_cubic))
+            out
+        }}
+    sag: {about: "letters droop below the line one after another, then fall away (letting go)" suits: "drooping shapes, 'rain bows the reed low'"
+        make: fn(t, o) {
+            // Hold, droop, then fall and fade: later letters a beat behind.
+            let s = o.speed
+            let out = ty_text(t)
+            ty_default(out, @by, @letter)
+            ty_default(out, @stagger, 0.07 / s)
+            ty_default(out, @y, ty_keys(o.start, [[0, 0, @linear], [0.35 / s, 0, @linear], [1.0 / s, o.size * 0.35, @ease_in_out_sine], [1.9 / s, o.size * 3.2, @ease_in_quad]]))
+            ty_default(out, @rotate, ty_keys(o.start, [[0.35 / s, 0, @linear], [1.0 / s, 9, @ease_in_out_sine], [1.9 / s, 28, @ease_in_quad]]))
+            ty_default(out, @opacity, ty_keys(o.start, [[1.3 / s, 1, @linear], [1.9 / s, 0, @ease_in_quad]]))
+            out
+        }}
+    break_through: {about: "each line punches through the one before, which drops back to a hollow outline" suits: "stacked shouted lines, escalation"
+        make: fn(t, o) {
+            let lines = o.text.split("\n")
+            let step = (if (t.stagger ?? nil) != nil && (t.stagger ?? nil).is_number() { (t.stagger ?? nil) } else { 0.45 }) / o.speed
+            let r = max(o.size * 0.03, 1.5)
+            let color = t.color ?? #ffffff
+            var first_char = 0
+            let layers = []
+            let n = lines.len()
+            for i in 0..n {
+                let only = [first_char]
+                first_char = first_char + lines[i].to_chars().len() + 1
+                let at = ty_at(o.start, step * i)
+                let next = ty_at(o.start, step * (i + 1))
+                let base = ty_bare(t, true){by: @line stagger: 0 only: only}
+                // The hollow ghost it becomes: copies round a ring minus the text.
+                if i + 1 < n {
+                    let ghost = ty_group(nil, ty_ring(10, r, fn(dx, dy) { base{x: dx y: dy color: color} }), base{color: #ffffff}, @inverse)
+                    ghost.opacity = Tween{from: 0 to: 0.55 start: next end: ty_at(next, 0.12) ease: @linear}
+                    layers.push(ghost)
+                }
+                let visible = if i + 1 < n {
+                    Keys{points: [[at, 0], [ty_at(at, 0.03), 1], [next, 1], [ty_at(next, 0.12), 0]]}
+                } else {
+                    Tween{from: 0 to: 1 start: at end: ty_at(at, 0.03) ease: @linear}
+                }
+                layers.push(base{scale: ty_tween(1.45, 1, at, 0.22 / o.speed, @ease_out_expo) blur: ty_tween(o.size * 0.06, 0, at, 0.2 / o.speed, @ease_out_cubic) opacity: visible})
+            }
+            ty_group(t, layers, nil, nil)
+        }}
+    fill_frame: {about: "the text tiled edge to edge in rows until the frame is packed, then crushed into one thin line (`collapse:` time)" suits: "density, overload, 'windows warm the fog'"
+        make: fn(t, o) {
+            let text = o.text.replace("\n", " ")
+            let em = o.size * 4.0 / 3.0
+            let pitch = em
+            let rows = if (t.rows ?? nil) != nil && (t.rows ?? nil).is_number() { max(floor((t.rows ?? nil)), 1) } else { 9 }
+            // Enough repeats to overrun the width.
+            let chars = max(text.to_chars().len(), 1)
+            let repeats = max(ceil(o.doc_width / (chars * em * 0.5)) + 1, 2)
+            var row_text = text
+            for i in 1..repeats { row_text = row_text + "  " + text }
+            let color = t.color ?? #ffffff
+            let collapse = t.collapse ?? ty_at(o.start, 1.6 / o.speed)
+            let layers = []
+            for i in 0..rows {
+                let at = ty_at(o.start, 0.06 / o.speed * i)
+                let row_color = if (t.highlight_color ?? nil) != nil && i % 3 == 1 { (t.highlight_color ?? nil) } else { color }
+                layers.push(ty_bare_but(t, false, [@collapse, @rows, @highlight_color, @wrap, @fit, @align, @valign]){
+                    text: row_text color: row_color line_height: 1
+                    // Odd rows run the other way, offset by half a word.
+                    at: vec2(if i % 2 == 0 { 0.0 - em * 0.3 } else { 0.0 - em * chars * 0.25 }, pitch * i)
+                    opacity: Tween{from: 0 to: 1 start: at end: ty_at(at, 0.05) ease: @linear}
+                    x: ty_tween(if i % 2 == 0 { em * 0.6 } else { 0.0 - em * 0.6 }, 0, at, 0.3 / o.speed, @ease_out_cubic)})
+            }
+            let g = ty_group(t, layers, nil, nil)
+            g.size = vec2(o.doc_width, pitch * rows)
+            g.anchor = vec2(0.5, 0.5)
+            g.scale = ty_tween(vec2(1, 1), vec2(1, 0.012), collapse, 0.35 / o.speed, @ease_in_expo)
+            g
+        }}
+    unmask: {about: "every word starts as a [MASK] pill that flips over to reveal it, one after another" suits: "AI, redaction, reveals"
+        make: fn(t, o) {
+            let s = o.speed
+            let step = (if (t.stagger ?? nil) != nil && (t.stagger ?? nil).is_number() { (t.stagger ?? nil) } else { 0.18 }) / s
+            let pill = t.plate ?? #f2efe8
+            let later = ty_at(o.start, 0.09 / s)
+            // The pills close (squash to nothing) word by word …
+            let masks = ty_bare(t, true){by: @word stagger: step color: pill plate: pill plate_each: true plate_pad: vec2(o.size * 0.18, o.size * 0.08) plate_radius: o.size * 0.4
+                scale: Keys{points: [[o.start, vec2(1, 1)], [ty_at(o.start, 0.09 / s), vec2(1, 0), @ease_in_quad]]}}
+            // … and each word opens out of the same squash.
+            let words = ty_bare(t, true){by: @word stagger: step scale: Keys{points: [[later, vec2(1, 0)], [ty_at(later, 0.1 / s), vec2(1, 1), @ease_out_back]]}}
+            ty_group(t, [masks, words], nil, nil)
+        }}
+    mirror: {about: "the text flips over into its mirror image (and `mirror: @vertical` upside down)" suits: "backward, reversal, reflection"
+        make: fn(t, o) {
+            // A flip over its middle (scale through zero), held mirrored.
+            let vertical = (t.mirror ?? nil) == @vertical
+            let out = ty_copy(t, [@animate, @start, @speed, @mirror])
+            ty_default(out, @scale, ty_tween(vec2(1, 1), if vertical { vec2(1, -1) } else { vec2(-1, 1) }, o.start, 0.45 / o.speed, @ease_in_out_cubic))
+            out
+        }}
+    spark: {about: "a spark runs along the text, lighting each letter white-hot, then the accent (`highlight_color`)" suits: "fuses, progress, a word catching fire"
+        make: fn(t, o) {
+            // A letter a moment: white-hot as the spark reaches it, then the accent.
+            let s = o.speed
+            let accent = t.highlight_color ?? #ff5a1f
+            let base = t.color ?? #f2efe8
+            let ghost = if base.is_color() { rgba(base.r, base.g, base.b, 64.0 / 255.0) } else { base }
+            let out = ty_copy(t, [@animate, @start, @speed, @color, @highlight_color])
+            ty_default(out, @by, @letter)
+            ty_default(out, @stagger, 0.06 / s)
+            ty_default(out, @color, ty_keys(o.start, [[0, ghost, @linear], [0.02 / s, #ffffff, @linear], [0.3 / s, accent, @ease_out_quad]]))
+            ty_default(out, @scale, ty_keys(o.start, [[0, 1, @linear], [0.05 / s, 1.18, @ease_out_quad], [0.25 / s, 1, @ease_in_out_sine]]))
+            out
+        }}
+    sfx: {about: "an onomatopoeia: brush letters in a thick ink outline pop in, overshoot and shake (`stroke` is the outline colour)" suits: "comic hits, BAM / RING RING / POW, reactions"
+        make: fn(t, o) {
+            let s = o.speed
+            let ink = t.stroke ?? #111111
+            let fill = t.color ?? #ffd400
+            let tilt = if (t.rotate ?? nil) != nil && (t.rotate ?? nil).is_number() { (t.rotate ?? nil) } else { -8.0 }
+            let pop = ty_keys(o.start, [[0, 0, @linear], [0.12 / s, 1.35, @ease_out_cubic], [0.22 / s, 0.94, @ease_in_out_sine], [0.3 / s, 1, @ease_out_sine]])
+            // The shake: a few decaying jolts once it lands.
+            let jolt = fn(axis) {
+                let points = [[0, 0, @linear], [0.24 / s, 0, @linear]]
+                for k in 0..6 {
+                    let sign = if k % 2 == 0 { 1.0 } else { -1.0 }
+                    points.push([(0.24 + 0.04 * (k + 1)) / s, o.size * 0.05 * (1.0 - k / 6.0) * sign * axis, @linear])
+                }
+                points.push([0.52 / s, 0, @ease_out_sine])
+                ty_keys(o.start, points)
+            }
+            let shake_x = jolt(1.0)
+            let shake_y = jolt(-0.6)
+            let copy = fn(color, dx, dy) {
+                let c = ty_bare_but(t, true, [@stroke, @rotate, @x, @y, @scale]){x: ty_offset(shake_x, dx) y: ty_offset(shake_y, dy) scale: pop color: color}
+                c.rotate = tilt
+                if (t.font ?? nil) == nil {
+                    c.font = Font{family: "LXGW WenKai" weight: 700}
+                }
+                c
+            }
+            let r = max(o.size * 0.07, 2.0)
+            let layers = ty_ring(12, r, fn(dx, dy) { copy(ink, dx, dy + r * 0.35) })
+            layers.push(copy(fill, 0, 0))
+            ty_group(t, layers, nil, nil)
+        }}
+    zoom_slam: {about: "the word slams down from 250% (past the frame), blurred by its own speed, in a quarter second" suits: "hooks, punch words, drops"
+        make: fn(t, o) {
+            // From 250%, past the frame, down to size in a quarter second; the blur follows the
+            // scale's speed (fastest at the start).
+            let dur = 0.25 / o.speed
+            let blur_max = o.size * 0.12
+            let points = []
+            for u in [0.0, 0.08, 0.16, 0.25, 0.4, 0.6, 1.0] {
+                points.push([dur * u, blur_max * pow(2.0, -10.0 * u) * (1.0 - u * u), @linear])
+            }
+            let out = ty_text(t)
+            ty_default(out, @scale, ty_tween(2.5, 1, o.start, dur, @ease_out_expo))
+            ty_default(out, @opacity, ty_tween(0.4, 1, o.start, dur, @ease_out_quad))
+            ty_default(out, @blur, ty_keys(o.start, points))
+            out
+        }}
+    tracking_slam: {about: "letters spread past the frame snap together to their spacing in a quarter second" suits: "reveals, payoffs, end words"
+        make: fn(t, o) {
+            // Spread past the frame, snapping to its spacing in a quarter second, a little large
+            // and settling.
+            let base = if (t.tracking ?? nil) != nil && (t.tracking ?? nil).is_number() { (t.tracking ?? nil) } else { 0.0 }
+            let out = ty_copy(t, [@animate, @start, @speed, @tracking])
+            ty_default(out, @tracking, ty_tween(base + o.size * 1.2, base, o.start, 0.25 / o.speed, @ease_out_expo))
+            ty_default(out, @scale, ty_tween(1.25, 1, o.start, 0.3 / o.speed, @ease_out_cubic))
+            ty_default(out, @opacity, ty_tween(0, 1, o.start, 0.06 / o.speed, @linear))
+            out
+        }}
+    breathe: {about: "the width swells and settles, looping (a variable-width look)" suits: "music loops, living logos"
+        make: fn(t, o) {
+            let d = 2.4 / o.speed
+            let out = ty_text(t)
+            ty_default(out, @wdth, Loop{inner: Keys{points: [[0, 92], [d * 0.5, 118, @ease_in_out_sine], [d, 92, @ease_in_out_sine]]} period: d mode: @restart count: nil})
+            out
+        }}
+    mask_up: {about: "each line slides up into view inside its own line (a true line matte)" suits: "headlines, editorial reveals"
+        make: fn(t, o) { ty_line_mask(t, o, true) }}
+    mask_down: {about: "each line drops into view inside its own line" suits: "headlines, stepping down a list"
+        make: fn(t, o) { ty_line_mask(t, o, false) }}
+    outline_fill: {about: "letters draw as outlines, then fill in" suits: "logos, titles with weight"
+        make: fn(t, o) {
+            // The outline is the text dilated (copies nudged round a small circle) with the text
+            // itself cut out of it (an inverse matte); both appear letter by letter, the fill
+            // following the outline.
+            let s = o.speed
+            let r = max(o.size * 0.035, 1.5)
+            let stroke = t.stroke ?? (t.color ?? #ffffff)
+            // The look draws the outline itself: its copies are plain letters.
+            let plain = ty_bare_but(t, true, [@stroke, @width])
+            let letters = fn(at, color, dx, dy) { plain{color: color by: @letter stagger: 0.05 / s opacity: ty_tween(0, 1, at, 0.25 / s, @ease_out) x: dx y: dy} }
+            let outline = ty_group(nil, ty_ring(12, r, fn(dx, dy) { letters(o.start, stroke, dx, dy) }), plain{color: #ffffff}, @inverse)
+            let fill = letters(ty_at(o.start, 0.6 / s + 0.05 / s * o.text.to_chars().len() * 0.5), t.color ?? #ffffff, 0, 0)
+            ty_group(t, [outline, fill], nil, nil)
+        }}
+    neon: {about: "hollow neon tubes that sputter on letter by letter and hum with a glow" suits: "signs, nightlife, arenas, retro titles"
+        make: fn(t, o) { ty_neon(t, o, false) }}
+    neon_fail: {about: "neon tubes with one letter that keeps failing (`fail: <letter index>`, the last by default)" suits: "run-down signs, tension, comedy beats"
+        make: fn(t, o) { ty_neon(t, o, true) }}
+    highlight: {about: "a marker box sweeps behind each line" suits: "key phrases, quotes, data callouts"
+        make: fn(t, o) {
+            let out = ty_text(t)
+            ty_default(out, @plate, #ffd40099)
+            ty_default(out, @plate_reveal, ty_tween(0, 1, ty_at(o.start, 0.2 / o.speed), 0.6 / o.speed, @ease_in_out_cubic))
+            ty_default(out, @plate_pad, vec2(o.size * 0.15, o.size * 0.05))
+            out
+        }}
+    underline: {about: "an underline sweeps under each line" suits: "links, emphasis, product names"
+        make: fn(t, o) {
+            let out = ty_text(t)
+            ty_default(out, @plate, #ffd400ff)
+            ty_default(out, @plate_reveal, ty_tween(0, 1, ty_at(o.start, 0.2 / o.speed), 0.6 / o.speed, @ease_in_out_cubic))
+            ty_default(out, @plate_style, @underline)
+            ty_default(out, @plate_pad, 0)
+            out
+        }}
+    on_path: {about: "letters ride a path (`path: \"M…\"`), sliding along it" suits: "logos, playful copy, maps"
+        make: fn(t, o) {
+            if (t.path ?? nil) == nil { return "`animate: @on_path` needs the path its letters ride: `path: \"M 0 300 C 400 0, 800 600, 1200 300\"`" }
+            let out = ty_text(t)
+            ty_default(out, @by, @letter)
+            ty_default(out, @path_offset, ty_tween(1, 0, o.start, 2.0 / o.speed, @ease_out_cubic))
+            out
+        }}
+    word_swap: {about: "one slot cycles through `words: […]`, each rising in and out" suits: "\"Made for makers / teams / you\" hero lines"
+        make: fn(t, o) {
+            // `words: ["fast", "simple", "yours"] hold: 1.4`.
+            let words = []
+            if (t.words ?? nil) != nil && (t.words ?? nil).is_array() {
+                for w in (t.words ?? nil) { if w.is_string() { words.push(w) } }
+            } else {
+                for w in o.text.split("|") { if w.trim() != "" { words.push(w.trim()) } }
+            }
+            let pace = 1.0 / o.speed
+            let hold = (if (t.hold ?? nil) != nil && (t.hold ?? nil).is_number() { (t.hold ?? nil) } else { 1.4 }) * pace
+            let align = t.align ?? @left
+            let n = words.len()
+            let layers = []
+            for i in 0..n {
+                let t0 = ty_at(o.start, hold * i)
+                let last = i + 1 == n
+                let out_at = ty_at(o.start, hold * (i + 1) - 0.35)
+                let y = [[t0, o.size * 0.8], [ty_at(t0, 0.45), 0, @ease_out_expo]]
+                let op = [[t0, 0], [ty_at(t0, 0.25), 1, @ease_out]]
+                if !last {
+                    y.push([out_at, 0])
+                    y.push([ty_at(out_at, 0.35), 0.0 - o.size * 0.8, @ease_in_cubic])
+                    op.push([ty_at(out_at, 0.1), 1])
+                    op.push([ty_at(out_at, 0.35), 0, @ease_in])
+                }
+                layers.push(ty_word(t, words[i]){size: o.size align: align valign: @center y: Keys{points: y} opacity: Keys{points: op}})
+            }
+            ty_common(t, layers)
+        }}
+    stack: {about: "the words stacked, each filling the box width, rising in" suits: "big-type editorial covers, posters"
+        make: fn(t, o) { ty_editorial(t, o, @stack) }}
+    grid: {about: "the words on a grid of big cells" suits: "manifestos, festival posters"
+        make: fn(t, o) { ty_editorial(t, o, @grid) }}
+    rotated: {about: "big words, alternate ones turned on their side" suits: "fashion and sports editorial"
+        make: fn(t, o) { ty_editorial(t, o, @rotated) }}
+    scramble: {about: "junk characters decode into the text (the 343_scramble_decode kit)" suits: "tech reveals, passwords, hacker looks"
+        make: fn(t, o) { ty_kinetic(t, o, "343_scramble_decode") }}
+    split_flap: {about: "letters flip into place like a departures board (the 318_letter_flip kit)" suits: "announcements, lists, travel"
+        make: fn(t, o) { ty_kinetic(t, o, "318_letter_flip") }}
+    ticker: {about: "a scrolling news ticker (the 329_ticker_tape kit)" suits: "headlines, running text"
+        make: fn(t, o) { ty_kinetic(t, o, "329_ticker_tape") }}
+    led_ticker: {about: "a scrolling LED board (the 369_led_ticker kit)" suits: "scores, stadiums, retro"
+        make: fn(t, o) { ty_kinetic(t, o, "369_led_ticker") }}
+}
+
+// True line-mask reveals: the lines move into place inside a matte made of the same text's line
+// boxes (its plates, the glyphs themselves transparent), so each line appears out of nothing at
+// its own edge. Every line group holds the whole text, laid out once with the author's
+// `line_height`, `wrap` and `fit`, showing only its own line; its matte is that line's plate,
+// padded past the glyphs' ink by an em-based margin. Each line its own group and matte, so a line
+// moving in never shows through the next line's box.
+let ty_line_mask = fn(t, o, up) {
+    let lines = o.text.split("\n")
+    // The em is 4/3 of the size (points to document units).
+    let em = o.size * 4.0 / 3.0
+    let pad = vec2(em * 0.2, em * 0.28)
+    // Clear of the padded box before the reveal starts.
+    let travel = em * 1.2 + em * 0.28 * 2.0 + em * 0.1
+    let from = if up { travel } else { 0.0 - travel }
+    var first_char = 0
+    let groups = []
+    for i in 0..lines.len() {
+        let only = [first_char]
+        first_char = first_char + lines[i].to_chars().len() + 1
+        let at = ty_at(o.start, 0.12 / o.speed * i)
+        let moving = ty_bare(t, true){by: @line stagger: 0 only: only y: ty_tween(from, 0, at, 0.75 / o.speed, @ease_out_expo)}
+        let matte = ty_bare(t, true){by: @line stagger: 0 only: only color: #ffffff00 plate: #ffffffff plate_each: true plate_pad: pad}
+        groups.push(ty_group(nil, [moving], matte, @alpha))
+    }
+    ty_group(t, groups, nil, nil)
+}
+
+// Neon tubes: the letters as hollow tubes (the text dilated, the text itself cut out), a thin
+// white-hot core inside each tube, lit letter by letter with a sputter, flickering (`flicker`,
+// and the `fail` letters dropping out), under a glow. `@neon_fail` fails the last letter unless
+// the author names one.
+let ty_neon = fn(t, o, fail) {
+    let s = o.speed
+    let tube = t.color ?? #5cff7a
+    let flicker = t.flicker ?? 0.25
+    var fail_field = (t.fail ?? nil)
+    if fail_field == nil && fail {
+        // The last letter that is not white space (`to_chars()` gives character codes).
+        let chars = o.text.to_chars()
+        for i in 0..chars.len() {
+            if chars[i] != 32 && chars[i] != 10 && chars[i] != 9 && chars[i] != 13 { fail_field = i }
+        }
+    }
+    let ignite = ty_keys(o.start, [[0, 0], [0.03 / s, 1], [0.07 / s, 0.1], [0.11 / s, 0.9], [0.15 / s, 0.2], [0.22 / s, 1]])
+    let ring = fn(r, color, copies) {
+        let tubes = ty_ring(copies, r, fn(dx, dy) {
+            let c = ty_bare(t, true){color: color by: @letter stagger: 0.09 / s opacity: ignite flicker: flicker x: dx y: dy}
+            if fail_field != nil { c.fail = fail_field }
+            c
+        })
+        ty_group(nil, tubes, ty_bare(t, true){color: #ffffff}, @inverse)
+    }
+    let r = max(o.size * 0.045, 1.5)
+    let g = ty_group(t, [ring(r, tube, 12), ring(max(r * 0.35, 0.8), #f4fff4e6, 8)], nil, nil)
+    if (t.effects ?? nil) == nil {
+        g.effects = [Effect{name: @glow threshold: 0.15 radius: max(o.size * 0.3, 8.0) intensity: 1.6}]
+    }
+    g
+}
+
+// Big-type editorial layouts of the text's words in a box (`size: vec2(w, h)`, default the safe
+// width by 60% of it): @stack one word a line, each filling the width; @grid two columns;
+// @rotated like stack, every other word turned on its side.
+let ty_editorial = fn(t, o, layout) {
+    let words = ty_words(o.text)
+    let sized = (t.size ?? nil) != nil && (t.size ?? nil).is_object() == false && (t.size ?? nil).is_number() == false
+    let w = if sized { (t.size ?? nil).x } else { o.doc_width * 0.88 }
+    let h = if sized { (t.size ?? nil).y } else { o.doc_width * 0.5 }
+    let n = max(words.len(), 1)
+    let gap = 0.06
+    let odd = floor(words.len() / 2)
+    let even = words.len() - odd
+    let strip = w * 0.26
+    let layers = []
+    for i in 0..words.len() {
+        let at = ty_at(o.start, 0.12 / o.speed * i)
+        // (x, y, cell width, cell height, turned): the text sits in its cell, vertically
+        // centred; a turned one runs down its strip.
+        var x = 0.0
+        var y = 0.0
+        var cw = w
+        var ch = h / n
+        var turn = false
+        if layout == @grid {
+            let rows = ceil(n / 2)
+            ch = h / rows
+            x = (i % 2) * w * 0.5
+            y = floor(i / 2) * ch
+            cw = w * 0.5 * (1.0 - gap)
+            ch = ch * (1.0 - gap)
+        } else if layout == @rotated && odd > 0 {
+            if i % 2 == 0 {
+                ch = h / even
+                y = floor(i / 2) * ch
+                cw = w - strip * min(odd, 2) - w * gap
+                ch = ch * (1.0 - gap)
+            } else {
+                let k = floor(i / 2)
+                let sw = strip * min(odd, 2) / odd
+                x = w - sw * (odd - k)
+                cw = h
+                ch = sw * (1.0 - gap)
+                turn = true
+            }
+        } else {
+            y = i * ch
+            ch = ch * (1.0 - gap)
+        }
+        // Big type: the cell's height sets the size, `fit` holds the width. (A turned word's
+        // line box, about 1.2 of its size, fills its strip.)
+        let size = if turn { ch * 0.78 } else { ch * 0.9 }
+        // Turned a quarter clockwise about its top-left corner, placed at the strip's top-right:
+        // it reads downwards along the strip.
+        let place = if turn { vec2(x + ch / (1.0 - gap), y) } else { vec2(x, y + ch * 0.5) }
+        layers.push(ty_word(t, words[i].to_upper()){size: size fit: cw at: place valign: if turn { @top } else { @center } rotate: if turn { 90 } else { 0 } anchor: vec2(0, 0)
+            opacity: ty_tween(0, 1, at, 0.3 / o.speed, @ease_out)
+            y: ty_tween(ch * 0.35, 0, at, 0.6 / o.speed, @ease_out_expo)})
+    }
+    let g = ty_common(t, layers)
+    g.size = vec2(w, h)
+    g
+}
+
+// The looks the kinetic type kits already do: a KineticText on that kit with the Text's common
+// fields (and its box size).
+let ty_kinetic = fn(t, o, kit) {
+    let k = KineticText{preset: kit text: o.text}
+    for f in [@data_layer, @name, @at, @x, @y, @scale, @rotate, @anchor, @opacity, @blend, @span, @blur, @feather, @feather_side, @effects, @visible, @locked, @hard_cut, @exit, @exit_at, @exit_duration, @exit_to, @onion, @slices, @tear, @droste] {
+        if (t[f] ?? nil) != nil { k[f] = (t[f] ?? nil) }
+    }
+    if (t.size ?? nil) != nil && !(t.size ?? nil).is_number() { k.size = (t.size ?? nil) }
+    k
+}
+
+// `Text{… inside: <layer>}`: the text as a matte, the layer showing through its letters (footage
+// inside type); with `window: 3` only that letter is a window onto the layer, every other letter
+// stays the text.
+let type_inside = fn(t) {
+    let text = ty_copy(t, [@inside, @window])
+    let matte = ty_bare(text, true){color: #ffffff}
+    if (t.window ?? nil) == nil || !(t.window ?? nil).is_number() {
+        return ty_group(t, [(t.inside ?? nil)], matte, @alpha)
+    }
+    let letter = max(floor((t.window ?? nil)), 0)
+    let count = (t.text ?? "").to_chars().len()
+    let others = []
+    for i in 0..count { if i != letter { others.push(i) } }
+    let body = ty_bare(text, true){by: @letter only: others}
+    let window = ty_group(nil, [(t.inside ?? nil)], matte{by: @letter only: [letter]}, @alpha)
+    ty_group(t, [body, window], nil, nil)
+}
+
+// What the Text `t` with `animate: name` becomes in a document `doc_width` wide: a layer, an
+// error message (text), or nil for no such animator.
+let type_animate = fn(name, t, doc_width) {
+    var a = nil
+    for k, v in type_animators { if k.to_string() == name.to_string() { a = v } }
+    if a == nil { return nil }
+    let o = {
+        start: t.start ?? 0.2
+        speed: if (t.speed ?? nil) != nil && (t.speed ?? nil).is_number() && (t.speed ?? nil) > 0.0 { (t.speed ?? nil) } else { 1.0 }
+        size: if (t.size ?? nil) != nil && (t.size ?? nil).is_number() { (t.size ?? nil) } else { 72.0 }
+        text: if (t.text ?? nil) != nil && (t.text ?? nil).is_string() { (t.text ?? nil) } else { "" }
+        doc_width: doc_width
+    }
+    a.make(t, o)
+}
+
+{type_animators: type_animators type_animate: type_animate type_inside: type_inside}

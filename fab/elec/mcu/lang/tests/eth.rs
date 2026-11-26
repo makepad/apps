@@ -73,7 +73,7 @@ impl Core {
         let entry = &c.lowered.entries[ran.entry as usize];
         let mut scratch = vec![0; entry.program.scratch_words()];
         let mut mem = ir::Mem { ctx: &mut [], state: &mut self.state, shared: ir::Shared::Read(&c.lowered.shared_init), bufs: &bufs };
-        let mut io = ir::Io { ins: [&[], &[]], outs: [&mut [], &mut []] };
+        let mut io = ir::Io::default();
         let mut ports = CorePorts { bufs: &bufs, pending: &mut self.pending, hal: &mut self.hal };
         ir::run_ports(&entry.program, &mut scratch, &mut mem, &mut io, 1, &mut ports);
         assert_eq!(dev.state(), self.state, "{}: all state words match the language interpreter", entry.name);

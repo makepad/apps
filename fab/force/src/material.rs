@@ -224,7 +224,8 @@ impl Infill {
             "triangles" | "tri-hexagon" => Infill::Triangles,
             "honeycomb" => Infill::Honeycomb,
             "cubic" | "adaptivecubic" | "supportcubic" | "2dlattice" | "3dhoneycomb" => Infill::Cubic,
-            "gyroid" => Infill::Gyroid,
+            // All three are TPMS sheets; use the gyroid law for each.
+            "gyroid" | "tpmsd" | "tpmsfk" => Infill::Gyroid,
             "lightning" => Infill::Lightning,
             "hilbertcurve" | "archimedeanchords" | "octagramspiral" | "concentric" => Infill::Curves,
             _ => return None,

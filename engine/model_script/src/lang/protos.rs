@@ -193,6 +193,13 @@ impl Group {
             Group::Study => "study",
         }
     }
+
+    pub fn aliases(self) -> &'static [&'static str] {
+        match self {
+            Group::Brep => &["brep"],
+            _ => &[],
+        }
+    }
 }
 
 /// One prototype.
@@ -290,7 +297,26 @@ const WEAVE_SIDES: Field = f("sides", "Sides", Kind::Count, false, 6.0, 32.0, 1.
 
 /// The module's calls that build no part: they answer values (`m.metric`, `m.heat_set`, `m.screw`) or the
 /// part they were given, tagged (`m.link`, `m.optics`, `m.keepouts`).
-pub const VALUE_CALLS: &[&str] = &["metric", "heat_set", "screw", "link", "optics", "keepouts", "edge"];
+pub const VALUE_CALLS: &[&str] = &["metric", "heat_set", "screw", "link", "optics", "keepouts", "host_call", "edge"];
+
+// The two drill operations take the same dimensions. An exact hole also accepts a face.
+macro_rules! hole_fields {
+    ($direction:literal $(, $on:expr)?) => { &[
+        SOURCE,
+        o("kind", "Kind", Kind::Choice(&["simple", "counterbore", "countersink", "tapped"]), false, "hole shape"),
+        f("diameter", "Diameter", Kind::Diameter, true, 0.3 * MM, 200.0 * MM, 0.1 * MM, ""),
+        f("depth", "Depth", Kind::Length, false, 0.1 * MM, 1000.0 * MM, 0.5 * MM, "default: through"),
+        o("at", "Where", Kind::Points, true, "[x y z] on the surface, or a list of them"),
+        o("dir", "Direction", Kind::Point, false, $direction),
+        f("bore_diameter", "Bore diameter", Kind::Diameter, false, 0.5 * MM, 300.0 * MM, 0.1 * MM, "counterbore"),
+        f("bore_depth", "Bore depth", Kind::Length, false, 0.1 * MM, 300.0 * MM, 0.1 * MM, "counterbore"),
+        f("sink_diameter", "Sink diameter", Kind::Diameter, false, 0.5 * MM, 300.0 * MM, 0.1 * MM, "countersink"),
+        f("angle", "Sink angle", Kind::Angle, false, 60.0 * DEG, 120.0 * DEG, 1.0 * DEG, "countersink, default 90°"),
+        f("pitch", "Pitch", Kind::Length, false, 0.2 * MM, 8.0 * MM, 0.05 * MM, "tapped"),
+        f("clearance", "Clearance", Kind::Length, false, 0.0, 1.0 * MM, 0.05 * MM, "tapped, default 0.15mm"),
+        $($on,)?
+    ] };
+}
 
 pub const PROTOS: &[Proto] = &[
     Proto { name: "Panel", call: "panel", args: &["base"], group: Group::Combine, help: "A body that takes additions and cuts from host-generated parts, in the model frame. Inherits its base's frame unless it declares its own.", fields: &[
@@ -364,11 +390,20 @@ pub const PROTOS: &[Proto] = &[
         f("thickness", "Wall", Kind::Length, true, 0.1 * MM, 100.0 * MM, 0.1 * MM, ""),
         o("open", "Open", Kind::Choice(&["top", "bottom", "closed"]), false, "@top (default), @bottom, @closed, or faces by name: body.front or [body.top body.front]"),
     ], example: "m.brep.shell(body, 2mm, {open: @top})" },
+    Proto { name: "BrepPull", call: "pull", args: &["source"], group: Group::Brep, help: "Moves a flat face of a body along its normal by `by`, as a press-pull: the face's outline (its holes too) swept out and joined on, or swept in and cut away below 0. The moved face keeps the face's names; the rest keep theirs; a result that is no closed solid is refused.", fields: &[
+        SOURCE,
+        o("face", "Face", Kind::Faces, true, "the flat face, by name: body.top"),
+        f("by", "By", Kind::Length, true, -500.0 * MM, 500.0 * MM, 0.1 * MM, "out of the material; into it below 0"),
+    ], example: "m.brep.pull(body, {face: body.top by: 5mm})" },
+    Proto { name: "BrepHole", call: "hole", args: &["source"], group: Group::Brep, help: "Drills an exact body at each point, to depth or through. Use @simple, @counterbore or @countersink. With on, each point follows the named face along the drill direction. The narrow wall is h.wall and the bottom of a blind hole is h.floor.", fields: hole_fields!(
+        "into the material, default inward from on or [0, -1, 0] without a face",
+        o("on", "On", Kind::Faces, false, "the flat face it starts on, by name: body.top (it follows the face)")
+    ), example: "m.brep.hole(body, {on: body.top at: [5mm 10mm 0] diameter: 4mm depth: 6mm})" },
     Proto { name: "BrepOffset", call: "offset", args: &["source", "distance"], group: Group::Brep, help: "Grows a body by distance along its normals; negative shrinks it.", fields: &[
         SOURCE,
         f("distance", "Distance", Kind::Length, true, -100.0 * MM, 100.0 * MM, 0.1 * MM, ""),
     ], example: "m.brep.offset(body, 1mm)" },
-    Proto { name: "BrepMirror", call: "mirror", args: &["source"], group: Group::Brep, help: "The exact mirror image across a plane through center: @yz flips X, @xz flips Y, @xy flips Z; keep (default true) joins it with the original.", fields: &[
+    Proto { name: "BrepMirror", call: "mirror", args: &["source"], group: Group::Brep, help: "The exact mirror image across a plane through center: @yz flips X, @xz flips Y, @xy flips Z; keep (default true) joins it with the original; keep: false gives the image alone, its faces named as its source's (img.top).", fields: &[
         SOURCE,
         o("plane", "Mirror plane", Kind::Choice(&["yz", "xz", "xy"]), false, ""),
         o("center", "Through", Kind::Point, false, "[x y z]"),
@@ -617,20 +652,7 @@ pub const PROTOS: &[Proto] = &[
         f("size", "Size", Kind::Length, true, 0.05 * MM, 100.0 * MM, 0.1 * MM, ""),
         EDGES,
     ], example: "m.chamfer(plate, 0.6mm, {edges: {bottom: true}})" },
-    Proto { name: "Hole", call: "hole", args: &["source"], group: Group::Modify, help: "Drills holes into a solid from each point of at, along dir (into the material, default down), to depth or through: kind @simple, @counterbore, @countersink or @tapped.", fields: &[
-        SOURCE,
-        o("kind", "Kind", Kind::Choice(&["simple", "counterbore", "countersink", "tapped"]), false, "hole shape"),
-        f("diameter", "Diameter", Kind::Diameter, true, 0.3 * MM, 200.0 * MM, 0.1 * MM, ""),
-        f("depth", "Depth", Kind::Length, false, 0.1 * MM, 1000.0 * MM, 0.5 * MM, "default: through"),
-        o("at", "Where", Kind::Points, true, "[x y z] on the surface, or a list of them"),
-        o("dir", "Direction", Kind::Point, false, "into the material, default [0, -1, 0]"),
-        f("bore_diameter", "Bore diameter", Kind::Diameter, false, 0.5 * MM, 300.0 * MM, 0.1 * MM, "counterbore"),
-        f("bore_depth", "Bore depth", Kind::Length, false, 0.1 * MM, 300.0 * MM, 0.1 * MM, "counterbore"),
-        f("sink_diameter", "Sink diameter", Kind::Diameter, false, 0.5 * MM, 300.0 * MM, 0.1 * MM, "countersink"),
-        f("angle", "Sink angle", Kind::Angle, false, 60.0 * DEG, 120.0 * DEG, 1.0 * DEG, "countersink, default 90°"),
-        f("pitch", "Pitch", Kind::Length, false, 0.2 * MM, 8.0 * MM, 0.05 * MM, "tapped"),
-        f("clearance", "Clearance", Kind::Length, false, 0.0, 1.0 * MM, 0.05 * MM, "tapped, default 0.15mm"),
-    ], example: "m.hole(plate, {kind: @counterbore diameter: 3.4mm bore_diameter: 6.5mm bore_depth: 3mm at: [[-32mm 8mm 22mm] [32mm 8mm 22mm]]})" },
+    Proto { name: "Hole", call: "hole", args: &["source"], group: Group::Modify, help: "Drills holes into a solid from each point of at, along dir (into the material, default down), to depth or through: kind @simple, @counterbore, @countersink or @tapped.", fields: hole_fields!("into the material, default [0, -1, 0]"), example: "m.hole(plate, {kind: @counterbore diameter: 3.4mm bore_diameter: 6.5mm bore_depth: 3mm at: [[-32mm 8mm 22mm] [32mm 8mm 22mm]]})" },
     Proto { name: "HoleRow", call: "hole_row", args: &[], group: Group::Lighten, help: "A row of equal holes to cut away (m.subtract): count holes centred evenly from `from` to `to`, each `length` long along axis. A hole whose axis is level (across `up`, the print's up) gets a 45° roof: a teardrop prints without support.", fields: &[
         o("from", "First centre", Kind::Point, true, "the first hole's centre [x y z]"),
         o("to", "Last centre", Kind::Point, false, "the last hole's centre (default: from)"),
@@ -828,10 +850,10 @@ pub const PROTOS: &[Proto] = &[
         f("shift", "Profile shift", Kind::Number, false, -1.0, 1.0, 0.05, ""),
         f("angle", "Angle", Kind::Angle, false, -360.0 * DEG, 360.0 * DEG, 1.0 * DEG, "turns the teeth"), AT2,
     ], example: "Gear2D{module: 1.5mm teeth: 17}" },
-    Proto { name: "Path", call: "", args: &[], group: Group::Shape, help: "A closed outline drawn segment by segment from `from`.", fields: &[
+    Proto { name: "Path", call: "", args: &[], group: Group::Shape, help: "A closed outline drawn from `from`. Write segments as children in order, named with := if wanted, or supply a segs list.", fields: &[
         o("from", "Start", Kind::Point2, false, "default [0 0]"),
-        o("segs", "Segments", Kind::Segments, true, "[LineTo{to} ArcTo{to r} RoundCorner{r} ...]"), AT2,
-    ], example: "Path{from: [0 0] segs: [LineTo{to: [30mm 0]} RoundCorner{r: 3mm} LineTo{to: [30mm 20mm]} ArcTo{to: [0 20mm] r: 15mm}]}" },
+        o("segs", "Segments", Kind::Segments, false, "[LineTo{to} ArcTo{to r} RoundCorner{r} ...]"), AT2,
+    ], example: "Path{from: [0 0] base := LineTo{to: [30mm 0]} RoundCorner{r: 3mm} right := LineTo{to: [30mm 20mm]} ArcTo{to: [0 20mm] r: 15mm}}" },
     Proto { name: "LineTo", call: "", args: &[], group: Group::Segment, help: "A line to a point.", fields: &[o("to", "To", Kind::Point2, true, "")], example: "LineTo{to: [10mm 0]}" },
     Proto { name: "LineBy", call: "", args: &[], group: Group::Segment, help: "A line by an offset.", fields: &[o("by", "By", Kind::Point2, true, "")], example: "LineBy{by: [10mm 0]}" },
     Proto { name: "Horizontal", call: "", args: &[], group: Group::Segment, help: "Horizontally by d.", fields: &[f("d", "Distance", Kind::Length, true, -1000.0 * MM, 1000.0 * MM, 0.5 * MM, "")], example: "Horizontal{d: 10mm}" },

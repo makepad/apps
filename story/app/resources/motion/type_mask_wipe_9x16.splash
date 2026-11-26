@@ -1,0 +1,52 @@
+use mod.motion.*
+// MASK WIPE, 9:16 — the portrait cut of type_mask_wipe: two left-aligned
+// lines at 120 px on the safe column's left edge, the wipe running the
+// column's width. Same accent-leading-edge trick.
+// Why: a left edge is the strongest alignment in a narrow frame; centred
+// lines of different lengths look ragged at this size.
+Motion{
+    label: "Mask wipe 9:16"
+    brief: "Two left-aligned lines uncovered by a soft wipe with an accent leading edge; portrait."
+    tags: ["kinetic-type", "headline", "clean", "mask", "wipe", "9:16"]
+    size: vec2(1080, 1920) duration: 4.5
+    inputs: {
+        line1: input(@text, "Say less.", "First line, about 12 characters")
+        line2: input(@text, "Show more.", "Second line (set in the accent)")
+        ink: input(@color, #f4f7fa, "Type colour")
+        accent: input(@color, #ff5c39, "Accent colour")
+        background: input(@color, #0b0d12, "Ground")
+    }
+    layers: [
+        Rect{size: vec2(1080, 1920) fill: in(@background)}
+        Group{
+            mask: Rect{at: vec2(60, 610) size: tween(vec2(0, 160), vec2(900, 160), 0.2, 1.1, @ease_in_out_cubic) feather: 50
+                       x: tween(0, 900, 3.8, 4.3, @ease_in_cubic)}
+            layers: [Text{text: in(@line1) font: Font{family: "Inter" weight: 800} size: 120 tracking: -0.035 color: in(@accent)
+                          at: vec2(100, 618) x: tween(40, 0, 0.2, 1.3, @ease_out_quint)}]
+        }
+        Group{
+            mask: Rect{at: vec2(60, 610) size: tween(vec2(0, 160), vec2(900, 160), 0.32, 1.22, @ease_in_out_cubic) feather: 50
+                       x: tween(0, 900, 3.8, 4.3, @ease_in_cubic)}
+            layers: [
+                Rect{at: vec2(60, 610) size: vec2(1000, 160) fill: in(@background)}
+                Text{text: in(@line1) font: Font{family: "Inter" weight: 800} size: 120 tracking: -0.035 color: in(@ink)
+                     at: vec2(100, 618) x: tween(40, 0, 0.2, 1.3, @ease_out_quint)}
+            ]
+        }
+        Group{
+            mask: Rect{at: vec2(60, 770) size: tween(vec2(0, 160), vec2(900, 160), 0.35, 1.25, @ease_in_out_cubic) feather: 50
+                       x: tween(0, 900, 3.9, 4.4, @ease_in_cubic)}
+            layers: [Text{text: in(@line2) font: Font{family: "Inter" weight: 800} size: 120 tracking: -0.035 color: in(@ink)
+                          at: vec2(100, 778) x: tween(40, 0, 0.35, 1.45, @ease_out_quint)}]
+        }
+        Group{
+            mask: Rect{at: vec2(60, 770) size: tween(vec2(0, 160), vec2(900, 160), 0.47, 1.37, @ease_in_out_cubic) feather: 50
+                       x: tween(0, 900, 3.9, 4.4, @ease_in_cubic)}
+            layers: [
+                Rect{at: vec2(60, 770) size: vec2(1000, 160) fill: in(@background)}
+                Text{text: in(@line2) font: Font{family: "Inter" weight: 800} size: 120 tracking: -0.035 color: in(@accent)
+                     at: vec2(100, 778) x: tween(40, 0, 0.35, 1.45, @ease_out_quint)}
+            ]
+        }
+    ]
+}

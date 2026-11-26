@@ -2661,7 +2661,9 @@ mod tests {
     use makepad_csg_sdf::SdfOp;
 
     /// The tests that hold every worker of the process's one pool take it in turn: two at once
-    /// would each hold part of it, waiting for the rest.
+    /// would each hold part of it, waiting for the rest. A test that gives its own rounds a
+    /// deadline takes it too: beside one that holds every worker, its rounds wait for as long as
+    /// that one holds them, and the deadline times the other test.
     static WHOLE_POOL: Mutex<()> = Mutex::new(());
 
     /// The pool's workers to this test, as far as the others that hold them all go; a red one
@@ -3042,6 +3044,7 @@ mod tests {
     /// tracer's tiles.
     #[test]
     fn a_still_view_at_rest_is_asked_for_nothing() {
+        let _whole = whole_pool();
         let pool = makepad_draw::makepad_platform::Cx::new(Box::new(|_, _| {})).task_pool();
         let cam = view([35.0, -90.0, 40.0], [0.0; 3]);
         let shape = Arc::new(SdfShape { root: bracket(), min: [-20.0, -4.0, -15.0], max: [20.0, 4.0, 15.0], materials: Vec::new() });
@@ -3136,14 +3139,20 @@ mod tests {
         pool.submit_named(Class::Visible, "a load", move || load.store(true, Ordering::Release)).unwrap().detach();
         let waiting = Instant::now();
         while !started.load(Ordering::Acquire) {
-            assert!(waiting.elapsed() < Duration::from_secs(60), "the load found no worker while the head moved");
+            assert!(waiting.elapsed() < Duration::from_secs(60), "the load found no worker while the head moved; {}", pool.summary());
             turn_head(&mut parts);
         }
         // the next looks' pieces still come
         let revs: Vec<u64> = parts.iter().map(Tiles::drawn_rev).collect();
         let going = Instant::now();
         while parts.iter().zip(&revs).any(|(t, rev)| t.drawn_rev() == *rev) {
-            assert!(going.elapsed() < Duration::from_secs(120), "the head's looks stopped at the load");
+            assert!(
+                going.elapsed() < Duration::from_secs(120),
+                "the head's looks stopped at the load ({} of {} parts wait for a new look); {}",
+                parts.iter().zip(&revs).filter(|(t, rev)| t.drawn_rev() == **rev).count(),
+                parts.len(),
+                pool.summary()
+            );
             turn_head(&mut parts);
         }
         // a camera that keeps moving, its looks at a person's job's class
@@ -3157,7 +3166,13 @@ mod tests {
         let revs: Vec<u64> = parts.iter().map(Tiles::drawn_rev).collect();
         let moving = Instant::now();
         while parts.iter().zip(&revs).any(|(t, rev)| t.drawn_rev() == *rev) {
-            assert!(moving.elapsed() < Duration::from_secs(120), "the moving camera's looks never came");
+            assert!(
+                moving.elapsed() < Duration::from_secs(120),
+                "the moving camera's looks never came ({} of {} parts wait for a new look); {}",
+                parts.iter().zip(&revs).filter(|(t, rev)| t.drawn_rev() == **rev).count(),
+                parts.len(),
+                pool.summary()
+            );
             turn_camera(&mut parts);
         }
         let started = Arc::new(AtomicBool::new(false));
@@ -3165,13 +3180,19 @@ mod tests {
         pool.submit_named(Class::Interactive, "a person's job", move || job.store(true, Ordering::Release)).unwrap().detach();
         let waiting = Instant::now();
         while !started.load(Ordering::Acquire) {
-            assert!(waiting.elapsed() < Duration::from_secs(60), "a person's job found no worker while the camera moved");
+            assert!(waiting.elapsed() < Duration::from_secs(60), "a person's job found no worker while the camera moved; {}", pool.summary());
             turn_camera(&mut parts);
         }
         let revs: Vec<u64> = parts.iter().map(Tiles::drawn_rev).collect();
         let going = Instant::now();
         while parts.iter().zip(&revs).any(|(t, rev)| t.drawn_rev() == *rev) {
-            assert!(going.elapsed() < Duration::from_secs(120), "the camera's looks stopped at the job");
+            assert!(
+                going.elapsed() < Duration::from_secs(120),
+                "the camera's looks stopped at the job ({} of {} parts wait for a new look); {}",
+                parts.iter().zip(&revs).filter(|(t, rev)| t.drawn_rev() == **rev).count(),
+                parts.len(),
+                pool.summary()
+            );
             turn_camera(&mut parts);
         }
     }

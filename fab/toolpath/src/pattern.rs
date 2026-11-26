@@ -49,6 +49,10 @@ pub enum Sparse {
     SupportCubic,
     /// "gyroid": sections of the gyroid surface.
     Gyroid,
+    /// "tpmsd": sections of the Schwarz diamond surface.
+    TpmsD,
+    /// "tpmsfk": sections of the Fischer-Koch S surface.
+    TpmsFk,
     /// "honeycomb": hexagon prisms.
     Honeycomb,
     /// "3dhoneycomb": stacked truncated-octahedron-like cells: trapezoid
@@ -67,7 +71,7 @@ pub enum Sparse {
 }
 
 impl Sparse {
-    pub const ALL: [(&'static str, Sparse); 22] = [
+    pub const ALL: [(&'static str, Sparse); 24] = [
         ("zig-zag", Sparse::Rectilinear),
         ("alignedrectilinear", Sparse::AlignedRectilinear),
         ("line", Sparse::Line),
@@ -83,6 +87,8 @@ impl Sparse {
         ("adaptivecubic", Sparse::AdaptiveCubic),
         ("supportcubic", Sparse::SupportCubic),
         ("gyroid", Sparse::Gyroid),
+        ("tpmsd", Sparse::TpmsD),
+        ("tpmsfk", Sparse::TpmsFk),
         ("honeycomb", Sparse::Honeycomb),
         ("3dhoneycomb", Sparse::Honeycomb3d),
         ("lightning", Sparse::Lightning),

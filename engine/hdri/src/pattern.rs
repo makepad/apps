@@ -126,6 +126,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use super::params::{LightParams, PatternParams, PatternSource, SpaceParams, PATTERN_COUNT_MAX, SPACE_NEAR_M, SPACE_SIZE_RANGE_M};
+use super::room::Housing;
 use super::shape::CullCone;
 use super::shaped::{box_x_sign, ShapeSample};
 use super::space::{space_frame, space_half, to_3d};
@@ -338,6 +339,64 @@ pub fn fit_face(light: &mut LightParams) {
         space.width_m = w.max(lo).min(hi);
     }
     hold_face(light);
+}
+
+/// A housing's size round its tube, in tube widths: how far it reaches past
+/// a straight open tube's ends (past its light, which ends there), beside
+/// the tube each side, and how deep it is behind the face. A 0.18 m tube
+/// sits in a body 0.31 m wide, its length plus 0.18 m, 0.11 m deep: a road
+/// tunnel's or an underpass's luminaire.
+const HOUSING_END_TUBES: f32 = 0.5;
+const HOUSING_SIDE_TUBES: f32 = 0.35;
+const HOUSING_DEPTH_TUBES: f32 = 0.6;
+
+/// The housings of `pattern`'s tubes on the face `space` (`PatternParams::housing`;
+/// none without it): one box round each line a generator lays, its front
+/// face on the light's face and the rest behind it. A straight open line's
+/// box lies along it, reaching HOUSING_END_TUBES past its ends; any other
+/// line's (a hexagon, a chevron, a frame) is its box on the face's own axes
+/// grown by half a tube. Each is as wide as the tube and HOUSING_SIDE_TUBES
+/// either side and HOUSING_DEPTH_TUBES deep. A drawn SVG's tubes have none
+/// yet. Per build, a box per line.
+pub fn housings(pattern: &PatternParams, space: &SpaceParams) -> Vec<Housing> {
+    let p = pattern.clamped();
+    let Some(albedo) = p.housing else { return Vec::new() };
+    if p.source() == PatternSource::Svg {
+        return Vec::new();
+    }
+    let Some([w, h]) = natural_size_m(&p) else { return Vec::new() };
+    let k = space.width_m / w.max(1.0e-6);
+    let frame = space_frame(space);
+    let middle = frame.center * space.distance().max(SPACE_NEAR_M);
+    let front = frame.front();
+    let sx = box_x_sign();
+    let tube = p.tube_m * k;
+    let depth = HOUSING_DEPTH_TUBES * tube;
+    // A point of the generator's drawing (metres, y down) on the face, as `PatternLight::for_each_texel` lays it.
+    let on_face = |q: [f32; 2]| middle + frame.right * (sx * (q[0] - 0.5 * w) * k) + frame.up * ((0.5 * h - q[1]) * k);
+    let mut out = Vec::new();
+    for (pts, closed) in generator_lines(&p) {
+        let points: Vec<Vec3f> = pts.iter().map(|&q| on_face(q)).collect();
+        let straight = !closed && points.len() == 2 && (points[1] - points[0]).length() > 1.0e-6;
+        let (along, grow) = if straight {
+            ((points[1] - points[0]).normalize(), HOUSING_END_TUBES * tube)
+        } else {
+            (frame.right, (0.5 + HOUSING_SIDE_TUBES) * tube)
+        };
+        let across = Vec3f::cross(front, along).normalize();
+        let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+        for q in &points {
+            let r = *q - middle;
+            for (i, axis) in [along, across].iter().enumerate() {
+                lo[i] = lo[i].min(r.dot(*axis));
+                hi[i] = hi[i].max(r.dot(*axis));
+            }
+        }
+        let centre = middle + along * (0.5 * (lo[0] + hi[0])) + across * (0.5 * (lo[1] + hi[1])) - front * (0.5 * depth);
+        let half = vec3f(0.5 * (hi[0] - lo[0]) + grow, 0.5 * (hi[1] - lo[1]) + (0.5 + HOUSING_SIDE_TUBES) * tube, 0.5 * depth);
+        out.push(Housing { centre, axes: [along, across, front], half, albedo });
+    }
+    out
 }
 
 /// The SVG text the pattern draws: a generator's (`generate_svg`) or the
@@ -1360,6 +1419,8 @@ struct Look {
     mount_px: f32,
     mount_dim: f32,
     corner_dim: f32,
+    /// The tubes sit in housings (`PatternParams::housing`): their light ends square at their lines' ends.
+    housed: bool,
 }
 
 /// A tube's cross-section through the look, box-filtered over one texel
@@ -1496,7 +1557,11 @@ impl Seg {
         if look.look < 1.0 {
             f *= 1.0 + NEON_UNEVEN * (1.0 - look.look) * noise1(s / (NEON_UNEVEN_PERIOD * tube).max(1.0), self.seed);
         }
-        if self.open && look.look > 0.0 {
+        if self.open && look.housed {
+            // In a housing the light ends square at the line's ends, over a texel; past them are its end plates.
+            let s_line = self.s0 + t * self.len;
+            f *= step01(-0.5, 0.5, s_line.min(self.total - s_line));
+        } else if self.open && look.look > 0.0 {
             // Past an open end (t outside the piece) is the cap's own end.
             let from_end = if t < 0.0 && self.s0 == 0.0 {
                 0.0
@@ -1640,6 +1705,7 @@ impl PatternRaster {
             mount_px: pattern.mount_spacing_m * px_per_m,
             mount_dim: pattern.mount_dim,
             corner_dim: pattern.corner_dim,
+            housed: pattern.housing.is_some(),
         };
         // Only the face is drawn: the viewBox is the viewport.
         let (draw_w, draw_h) = ((wf.ceil() as usize).min(w), (hf.ceil() as usize).min(h));
@@ -2116,6 +2182,7 @@ impl Crisp {
             mount_px: pattern.mount_spacing_m * wa / metres_wide.max(1.0e-6),
             mount_dim: pattern.mount_dim,
             corner_dim: pattern.corner_dim,
+            housed: pattern.housing.is_some(),
         };
         // The same in raster texels, for tubes drawn into a picture.
         let texel_look = Look { mount_px: look.mount_px / scale, ..look };
@@ -2477,6 +2544,8 @@ pub struct PatternLight {
     blend: Blend,
     /// Half the tubes' width in the plane's units: the depth the light's softness would take.
     depth: f32,
+    /// Its tubes' housings (`housings`), which a room draws.
+    housings: Vec<Housing>,
 }
 
 impl PatternLight {
@@ -2513,6 +2582,7 @@ impl PatternLight {
         for v in [pattern.look, pattern.mount_spacing_m, pattern.mount_dim, pattern.corner_dim, wf, hf, wa, ha, if pattern.mount_spacing_m > 0.0 { metres_wide } else { 0.0 }] {
             v.to_bits().hash(&mut hasher);
         }
+        pattern.housing.is_some().hash(&mut hasher);
         let raster = kept_raster(hasher.finish(), || match source {
             PatternSource::Svg => PatternRaster::build(&pattern.svg, &pattern, (wf, hf), (wa, ha), metres_wide),
             _ => PatternRaster::build(&generate_svg(&pattern), &pattern, (wf, hf), (wa, ha), metres_wide),
@@ -2532,6 +2602,7 @@ impl PatternLight {
             cull: CullCone::new(frame.center, cos.acos()),
             blend: light.blend(),
             depth: 0.5 * pattern.tube_m * scale / d,
+            housings: housings(&pattern, space),
         })
     }
 
@@ -2633,6 +2704,11 @@ impl PatternLight {
     /// The frame and half extents the face is drawn in.
     pub fn face(&self) -> (LightFrame, Vec2f) {
         (self.frame, self.half)
+    }
+
+    /// Its tubes' housings (`housings`; none without `PatternParams::housing`).
+    pub fn housings(&self) -> &[Housing] {
+        &self.housings
     }
 }
 

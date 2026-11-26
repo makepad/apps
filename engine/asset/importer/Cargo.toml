@@ -1,0 +1,56 @@
+# Makepad Asset Worker — the headless coordinator beside the Asset Server:
+# claims generation jobs, dispatches them to the GPU fleet, publishes the
+# verified results, and (in `--import-ai-library` mode) idempotently
+# publishes an existing ai-content library into the catalog.
+#
+# Credentials never leave the server host: this process reads its bearer
+# token from a local file and every fleet/network call happens here, not in
+# any UI client.
+
+[package]
+name = "makepad-asset-importer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "makepad_asset_importer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "makepad-asset-importer"
+path = "src/main.rs"
+
+[dependencies]
+makepad-asset-data = { path = "../../../../apps/engine/asset/data" }
+makepad-asset-client = { path = "../client" }
+# GLB inspection (measured metrics) for the importer.
+makepad-render = { path = "../../../../../libs/render" }
+makepad-gltf = { path = "../../../../../libs/gltf" }
+# Own MP3 / Ogg Vorbis decoders: waveform thumbnails and duration for the
+# music formats the library actually ships, without a platform codec.
+makepad-audio-decode = { path = "../../../../../libs/audio_decode" }
+# The picture recipes (spectrogram, antialiased wave strip, composite),
+# shared with the preview widgets so a baked thumbnail and a live preview
+# are the same picture rather than two drifting copies.
+makepad-audio-picture = { path = "../../../../../libs/audio_picture" }
+makepad-fast-inflate = { path = "../../../../../libs/fast_inflate" }
+makepad-zune-png = { path = "../../../../../libs/zune/zune-png" }
+# The app's one picture decoder: thumbnails, covers and embedded textures.
+makepad-image-decode = { path = "../../../../../libs/image_decode" }
+# Gaussian-splat PLY validation (the splat payload the importer publishes).
+makepad-splat = { path = "../../../../../libs/splat" }
+# Thumbnail encoding (vendored, no_std-friendly).
+jpeg-encoder = { path = "../../../../../libs/jpeg-encoder" }
+# Base64 for relaying a catalog input into a fleet generate request.
+makepad-base64 = { path = "../../../../../libs/base64" }
+# Hardware mp4 decode for representative first-frame thumbnails + measured
+# durations (standalone seam; no Cx, no window).
+makepad-platform = { path = "../../../../../platform" }
+# Reads the bundled games' own git history: a store head byte-identical to a
+# committed version of a bundled game is an unedited bundled copy.
+makepad-git = { path = "../../../../../libs/git" }
+
+[dev-dependencies]
+# The real coordinator e2e runs against an actual AssetServer instance.
+makepad-asset-store = { path = "../store" }

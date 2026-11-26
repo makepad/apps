@@ -1,0 +1,60 @@
+use mod.motion.*
+
+// Math 2: a graph and its derivative. The plot draws on, f(x) = x^3/2 - 3x/2 traces in, a
+// tangent rides along it with its point (beat 1), then the curve itself morphs into
+// f'(x) = 3x^2/2 - 3/2 while a faint copy of f stays behind and the label rewrites (beat 2).
+// Functions are Splash code; the Plot bakes their geometry at load.
+let look = import("shared/motion_deck_look")
+
+let f = fn(x) { 0.5 * x * x * x - 1.5 * x }
+let fp = fn(x) { 1.5 * x * x - 1.5 }
+let DRAW_AT = 0.9
+let TANGENT_AT = 2.6
+let MORPH_AT = 6.6
+let MORPH_LEN = 2.0
+// 0 -> 1 over the morph (on the morph plot's own clock, which starts at MORPH_AT), eased;
+// the graph between is the straight mix of f and f'.
+let morph = fn(t) { ease(@ease_in_out_cubic, clamp(t / MORPH_LEN, 0, 1)) }
+let X = [-2.6, 2.6, 1]
+let Y = [-2.5, 6.0, 1]
+let BOX_AT = vec2(700, 320)
+let BOX = vec2(1080, 620)
+
+Motion{
+    label: "A graph and its derivative"
+    size: vec2(1920, 1080)
+    duration: 10.0
+    fps: 60
+    color: @hdr
+    background: look.INK
+    layers: [
+        Draw2D{name: "ground" size: vec2(1920, 1080) draw: fn(c, t, edit) { look.ground(c, t, live()) }}
+        Plot{name: "plot" x: X y: Y at: BOX_AT size: BOX
+            grid: @plane color: look.ASH grid_color: #8d919a22 labels: false x_label: "x" y_label: "y" reveal: [0.4, 1.0]
+            layers: [
+                // f draws on, then stays behind as a faint copy while the live curve becomes f'.
+                Graph{name: "f" f: f from: -2.2 to: 2.2 color: look.COOL width: 5
+                    trim_end: tween(0, 1, DRAW_AT, DRAW_AT + 1.6, @ease_in_out_cubic)
+                    opacity: keys([0, 1], [MORPH_AT, 1], [MORPH_AT + 0.8, 0.28, @ease_in_out_cubic])}
+                Tangent{name: "tangent" f: f x: tween(-2.0, 2.0, TANGENT_AT, TANGENT_AT + 3.4, @ease_in_out_sine) length: 1.6
+                    color: look.BONE width: 3 dot: true
+                    opacity: keys([0, 0], [TANGENT_AT, 0], [TANGENT_AT + 0.6, 1, @ease_in_out_cubic], [MORPH_AT - 0.2, 1], [MORPH_AT + 0.4, 0, @ease_in_out_cubic])}
+            ]}
+        // The same plane, undecorated, from MORPH_AT on: the curve that becomes f' (it starts as f,
+        // exactly over the faint copy).
+        Plot{name: "morph plot" x: X y: Y at: BOX_AT size: BOX grid: @none labels: false span: [MORPH_AT, 10.0]
+            layers: [Graph{name: "curve" f: fn(x, t) { mix(f(x), fp(x), morph(t)) } from: -2.2 to: 2.2 color: look.COOL width: 5}]}
+        MatchMorph{name: "label" math: true by: @char size: 46 color: look.BONE at: vec2(180, 420)
+            steps: ["f(x)=\\tfrac{1}{2}x^3-\\tfrac{3}{2}x", "f'(x)=\\tfrac{3}{2}x^2-\\tfrac{3}{2}"]
+            times: [MORPH_AT] durations: [MORPH_LEN]
+            opacity: tween(0, 1, DRAW_AT + 0.4, DRAW_AT + 1.8, @ease_in_out_cubic)}
+        Draw2D{name: "chrome" size: vec2(1920, 1080) draw: fn(c, t, edit) {
+            look.folio(c, t, "10", "Math")
+            look.heading(c, t, "A curve becomes its derivative.", "Graphs, tangents and planes in data coordinates; the curve itself morphs into f'.")
+            look.label(c, t, TANGENT_AT + 0.4, "the tangent's slope", 180, 610, {})
+            look.label(c, t, MORPH_AT + 0.6, "becomes the new curve", 180, 646, {})
+            look.syntax(c, t, 2.0, "Graph{f: fn(x, t) { mix(f(x), fp(x), k(t)) }}   Tangent{f x: tween(...)}")
+        }}
+    ]
+    post: look.post_chain(look.POST)
+}

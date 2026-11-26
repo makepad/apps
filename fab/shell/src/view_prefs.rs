@@ -377,6 +377,7 @@ mod tests {
 
         // Nothing chosen: the view starts as it always did.
         assert_eq!(load_shading(), None);
+        assert_eq!(load_colours(), None);
         assert_eq!(load_overlays(), None);
         let mut fresh = AppState::default();
         fresh.apply_view_prefs();
@@ -387,11 +388,15 @@ mod tests {
         // starts from nothing but this file.
         let overlays = Overlays { grid: false, cavity: false, nav_gizmo: false, ..Overlays::default() };
         fresh.apply_core(&ShellAction::SetShading(Shading::Solid));
+        assert_eq!(fresh.view.colours, fab_plate::ColourMode::Model);
+        fresh.apply_core(&ShellAction::SetColourMode(fab_plate::ColourMode::Material));
         fresh.apply_core(&ShellAction::SetOverlays(overlays));
         let mut next = AppState::default();
         next.apply_view_prefs();
         assert_eq!(next.view.shading, Shading::Solid);
         assert_eq!(next.view.overlays, overlays);
+        assert_eq!(next.view.colours, fab_plate::ColourMode::Material);
+        next.apply_core(&ShellAction::SetColourMode(fab_plate::ColourMode::Model));
         assert_eq!(load_look(), Some(PartLook::Field), "the shading keeps the look");
         // Picked back, it comes back too: a saved Realtime is not "nothing chosen".
         next.apply_core(&ShellAction::SetShading(Shading::Realtime));
@@ -399,6 +404,7 @@ mod tests {
         let mut last = AppState::default();
         last.apply_view_prefs();
         assert_eq!(last.view.shading, Shading::Realtime);
+        assert_eq!(last.view.colours, fab_plate::ColourMode::Model);
         assert_eq!(last.view.overlays, Overlays::default());
         // View › Sliced Detail: Fast until Exact is picked, and a pick comes back on the next run
         // (the far tier's beads as quads or every bead whole, as the person left them).
@@ -462,6 +468,14 @@ pub fn load_board_lighting() -> Option<Lighting> {
 /// Keeps the board view's lighting independently of the other workspaces.
 pub fn save_board_lighting(lighting: Lighting) {
     save("board_lighting", lighting.key());
+}
+
+pub fn load_colours() -> Option<fab_plate::ColourMode> {
+    fab_plate::ColourMode::from_key(&load("colours")?)
+}
+
+pub fn save_colours(mode: fab_plate::ColourMode) {
+    save("colours", mode.key());
 }
 
 /// The shading as chosen on this machine, if it was.

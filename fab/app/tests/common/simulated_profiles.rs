@@ -40,8 +40,9 @@ pub fn install(home: &Path) {
             "machine_max_acceleration_travel": ["1000"],
             "machine_max_jerk_x": ["10"], "machine_max_jerk_y": ["10"],
             "machine_max_jerk_z": ["1"], "machine_max_jerk_e": ["5"],
-            "retraction_length": ["0.5"], "retract_lift_above": ["0"],
+            "retraction_length": ["0.5"], "retract_length_toolchange": ["0.5"], "retract_lift_above": ["0"],
             "machine_start_gcode": "G90\nM83\nG28\nT[initial_tool]\nG1 Z1 F600\nM140 S50\nM104 S200\nM190 S50\nM109 S200\n",
+            "change_filament_gcode": "T[next_extruder]\n",
             "machine_end_gcode": "M104 S0\nM140 S0\nM107\n"
         }"#),
         ("process", r#"{

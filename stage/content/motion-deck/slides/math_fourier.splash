@@ -1,0 +1,147 @@
+use mod.motion.*
+
+// Math 4: Fourier epicycles. A closed curve (the classic heart, x = 16 sin^3 s, y = 13 cos s -
+// 5 cos 2s - 2 cos 3s - cos 4s) is sampled, its discrete Fourier coefficients are computed at
+// load, and a chain of turning circles draws it: each circle one frequency, in the order
+// 0, 1, -1, 2, -2, ... Beats add frequencies (3, then 9, then 41 circles); new circles grow in
+// from nothing and the traced curve sharpens. The pen runs on live(), so it keeps drawing.
+let look = import("shared/motion_deck_look")
+
+let TAU = 6.283185307179586
+let M = 256
+let SCALE = 19.0
+let CENTRE = vec2(1260, 590)
+let PERIOD = 10.0
+let LEVELS = [3, 9, 41]
+let B1 = 3.0
+let B2 = 6.2
+let GROW = 1.6
+let TRACE_SAMPLES = 360
+
+// The curve, sampled once (document units, y down).
+let sample_curve = fn() {
+    let pts = []
+    for m in 0..M {
+        let s = TAU * m / M
+        let x = 16.0 * pow(sin(s), 3.0)
+        let y = 13.0 * cos(s) - 5.0 * cos(2.0 * s) - 2.0 * cos(3.0 * s) - cos(4.0 * s)
+        pts.push(vec2(x, -y))
+    }
+    return pts
+}
+let SAMPLES = sample_curve()
+// Frequency of the j-th circle: 0, 1, -1, 2, -2, ...
+let freq = fn(j) { if j == 0 { 0 } elif mod(j, 2) == 1 { (j + 1) / 2 } else { -(j / 2) } }
+let coefficients = fn() {
+    let list = []
+    for j in 0..LEVELS[LEVELS.len() - 1] {
+        let k = freq(j)
+        var re = 0.0
+        var im = 0.0
+        for m in 0..M {
+            let a = -TAU * k * m / M
+            let p = SAMPLES[m]
+            re = re + p.x * cos(a) - p.y * sin(a)
+            im = im + p.x * sin(a) + p.y * cos(a)
+        }
+        list.push({k: k re: re / M im: im / M})
+    }
+    return list
+}
+let COEFS = coefficients()
+// The curve the first n circles draw, sampled at TRACE_SAMPLES points, as [x, y] in pixels.
+let trace = fn(n) {
+    let pts = []
+    for i in 0..(TRACE_SAMPLES + 1) {
+        let s = i / TRACE_SAMPLES
+        var x = 0.0
+        var y = 0.0
+        for j in 0..n {
+            let c = COEFS[j]
+            let a = TAU * c.k * s
+            x = x + c.re * cos(a) - c.im * sin(a)
+            y = y + c.re * sin(a) + c.im * cos(a)
+        }
+        pts.push([CENTRE.x + SCALE * x, CENTRE.y + SCALE * y])
+    }
+    return pts
+}
+let TRACES = [trace(LEVELS[0]), trace(LEVELS[1]), trace(LEVELS[2])]
+
+// How much of circle j shows at story time t: the first level at once, later ones grow in.
+let weight = fn(j, t) {
+    if j < LEVELS[0] { return 1.0 }
+    if j < LEVELS[1] { return ease(@ease_in_out_cubic, prog(t, B1, B1 + GROW)) }
+    return ease(@ease_in_out_cubic, prog(t, B2, B2 + GROW))
+}
+let level_mix = fn(t) {
+    return [1.0 - ease(@ease_in_out_cubic, prog(t, B1, B1 + GROW)),
+        ease(@ease_in_out_cubic, prog(t, B1, B1 + GROW)) * (1.0 - ease(@ease_in_out_cubic, prog(t, B2, B2 + GROW))),
+        ease(@ease_in_out_cubic, prog(t, B2, B2 + GROW))]
+}
+
+let draw = fn(c, t, edit) {
+    let ambient = live()
+    look.ground(c, t, ambient)
+    let show = ease(@ease_in_out_cubic, prog(t, 0.6, 2.0))
+    let s = fract(ambient / PERIOD)
+    // The traced curves, cross-faded between levels; a brighter comet over the last fifth.
+    let mixes = level_mix(t)
+    for l in 0..3 {
+        if mixes[l] > 0.001 {
+            c.stroke(TRACES[l], 2, look.COOL, 0.35 * mixes[l] * show)
+            let head = int(s * TRACE_SAMPLES)
+            let tail = []
+            for i in 0..72 {
+                let k = head - 71 + i
+                tail.push(TRACES[l][if k < 0 { k + TRACE_SAMPLES } else { k }])
+            }
+            c.stroke(tail, 3, look.BONE, 0.8 * mixes[l] * show)
+        }
+    }
+    // The chain of circles.
+    var x = CENTRE.x
+    var y = CENTRE.y
+    for j in 0..LEVELS[2] {
+        let w = weight(j, t)
+        if w <= 0.0 { continue }
+        let cj = COEFS[j]
+        let a = TAU * cj.k * s
+        let dx = SCALE * w * (cj.re * cos(a) - cj.im * sin(a))
+        let dy = SCALE * w * (cj.re * sin(a) + cj.im * cos(a))
+        let r = sqrt(dx * dx + dy * dy)
+        if j > 0 && r > 1.0 {
+            let ring = []
+            for i in 0..49 { ring.push([x + r * cos(i * TAU / 48), y + r * sin(i * TAU / 48)]) }
+            c.stroke(ring, 1, look.ASH, 0.32 * show)
+            c.stroke([[x, y], [x + dx, y + dy]], 1.4, look.BONE, 0.55 * show)
+        }
+        x = x + dx
+        y = y + dy
+    }
+    c.circle(x, y, 6, look.BONE, show)
+
+    look.folio(c, t, "12", "Math")
+    look.heading(c, t, "Circles draw any curve.", "Its Fourier coefficients, computed at load in Splash, turn a chain of circles.")
+    look.label(c, t, 1.4, "each circle is one frequency", look.LEFT, 520, {})
+    look.label(c, t, 1.6, "beats add more of them", look.LEFT, 556, {})
+    look.syntax(c, t, 2.0, "c_k = sum(z_m e^(-2 pi i k m / M)) / M   in a load-time fn")
+}
+
+Motion{
+    label: "Circles draw any curve"
+    size: vec2(1920, 1080)
+    duration: 9.0
+    fps: 60
+    color: @hdr
+    background: look.INK
+    layers: [
+        Draw2D{name: "epicycles" size: vec2(1920, 1080) draw: draw}
+        Math{name: "series" tex: "z(s)=\\sum_{k} c_k\\,e^{2\\pi i k s}" size: 40 color: look.BONE at: vec2(96, 350)
+            opacity: tween(0, 1, 1.0, 2.4, @ease_in_out_cubic)}
+        MatchMorph{name: "count" math: true by: @char size: 40 color: look.COOL at: vec2(96, 640)
+            steps: ["N = 3", "N = 9", "N = 41"] times: [B1, B2] durations: [GROW, GROW]
+            opacity: tween(0, 1, 1.2, 2.6, @ease_in_out_cubic)}
+    ]
+    post: look.post_chain(look.POST)
+}

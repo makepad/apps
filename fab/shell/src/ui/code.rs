@@ -22,6 +22,8 @@
 
 use crate::api::*;
 use crate::print::trays::DrawFabChip;
+use crate::ui::popover::{menu_picked, open_menu, ui_actions, FabUiAction, MenuItem, MenuPlace};
+use makepad_widgets_core::tip::{TipAction, TipRequest};
 use makepad_code_editor::code_view::CodeView;
 use makepad_code_editor::text::Position;
 use makepad_code_values::{CodeValues, ValueKind, ValueSite};
@@ -41,39 +43,36 @@ script_mod! {
         show_bg: true
         draw_bg +: { color: fab.color_editor }
         draw_mark: mod.draw.DrawFabChip{}
+        // the shadow under the toolbar while the code is scrolled down
+        draw_shade: mod.draw.FabScrollShade{}
         draw_mark_text: mod.draw.DrawText{
             color: fab.color_text
             text_style: theme.font_regular{ font_size: fab.font_size_small }
         }
         color_error: fab.color_error
+        // the documents' tabs, on the toolbar: no strip and no faces, the shown one's name lit
         tabs: mod.widgets.TabBarFlat{
             height: 26
+            draw_bg +: { pixel: fn() { return vec4(0.0, 0.0, 0.0, 0.0) } }
             PermanentTab := mod.widgets.TabFlat{
                 closeable: false
                 height: 26
                 padding: Inset{left: 10 right: 10 top: 0 bottom: 0}
+                draw_bg +: { pixel: fn() { return vec4(0.0, 0.0, 0.0, 0.0) } }
                 draw_text +: {
                     text_style: theme.font_regular{font_size: fab.font_size_small}
                     color: fab.color_text_dim
+                    color_hover: fab.color_text_hover
                     color_active: fab.color_text_active
                 }
             }
         }
-        // the file tabs start past the area's nub in the corner (38 wide) and its fillet (8)
-        tab_strip := View{width: Fill height: 26 margin: Inset{left: 46}}
-        head := View{
-            width: Fill
-            height: 30
-            flow: Right
-            align: Align{x: 0.0 y: 0.5}
-            padding: Inset{left: 10 right: 10 top: 0 bottom: 0}
-            spacing: 8
-            show_bg: true
-            draw_bg +: { color: fab.color_header }
-            title := mod.widgets.FabLabel{ text: "Script" draw_text +: { text_style: theme.font_bold{ font_size: fab.font_size_ui } } }
+        // the toolbar, as every editor's: the area's editor selector, then the code's documents
+        // as tabs (drawn into `tab_strip`: `draw_walk`), its build state and the scrub hint
+        editor_bar := mod.widgets.FabEditorBar{
+            tab_strip := View{width: Fill height: 26}
             state := mod.widgets.FabLabelSmall{ text: "" }
-            View{ width: Fill height: 1 }
-            mod.widgets.FabLabelSmall{ text: #(format!("{} a number to scrub it", crate::ui::keymap::shortcut(crate::ui::keymap::ShortcutId::CodeScrub))) }
+            hint := mod.widgets.FabLabelSmall{ text: #(format!("{} a number to scrub it", crate::ui::keymap::shortcut(crate::ui::keymap::ShortcutId::CodeScrub))) }
         }
         code := CodeView{
             editor +: {
@@ -105,18 +104,27 @@ script_mod! {
         rename_input: mod.widgets.FabInput{ height: 22 a11y: {label: "Feature name"} }
         draw_op: mod.draw.DrawText{
             color: fab.color_text_dim
-            text_style: theme.font_code{ font_size: fab.font_size_small }
+            text_style: theme.font_regular{ font_size: fab.font_size_small }
         }
         draw_name: mod.draw.DrawText{
             color: fab.color_text
             text_style: theme.font_regular{ font_size: fab.font_size_ui }
         }
         color_selected: fab.color_selection_bg
-        color_hover: fab.color_row_hover
+        // the name's ink under the pointer (the row's ground stays; only the name lights)
+        color_hover: fab.color_text_hover
         color_error: fab.color_error
-        color_cut: fab.color_error
+        // the role marks after the names: a solid disc, its sign in `color_mark_ink`
+        color_cut: fab.color_warning
+        color_join: fab.color_accent
+        color_mark_ink: fab.color_editor
         color_check: fab.color_warning
         color_readonly: fab.color_text_dim
+        // the kind before a name ("cylinder"): quieter than the name and the row's icons
+        color_kind: fab.color_text_muted
+        // the dragged row's chip, as the app's tooltips look
+        draw_tip: mod.draw.FabTipChip{}
+        draw_tip_text: mod.draw.FabTipText{}
     }
 
     mod.widgets.FabFeaturesPanelBase = #(FabFeaturesPanel::register_widget(vm))
@@ -132,12 +140,8 @@ script_mod! {
                 return Pal.premul(self.color)
             }
         }
-        bar := View{
-            width: Fill
-            height: 30
-            flow: Right
-            align: Align{x: 0.0 y: 0.5}
-            padding: Inset{left: 8 right: 6 top: 0 bottom: 0}
+        // the toolbar: the area's editor selector, then Add and the feature tools
+        bar := mod.widgets.FabEditorBar{
             spacing: 2
             FabTip{ text: "Add a feature: a primitive, a sketch, a modifier on the picked feature, a pattern, a gear, text"
                 add := mod.widgets.FabDropdownButton{
@@ -236,6 +240,9 @@ pub struct FeatureRow {
     pub off: bool,
     /// Emitted roots cannot be toggled here.
     pub root: bool,
+    /// Its role in its boolean can be changed (join, cut, intersect): an editable operand, not
+    /// the base, of a plain `m.union` / `m.subtract` / `m.intersect`.
+    pub can_role: bool,
     /// A fixture or load, not a solid.
     pub study: Option<StudyRow>,
 }
@@ -287,6 +294,9 @@ pub struct SourceState {
     pub rev: u64,
     /// The committed program's features.
     pub features: Vec<FeatureRow>,
+    /// Every placed instance's tree by instance name, made with each committed program: the
+    /// Parts outliner shows a part's tree under it. The selected script's is `features`.
+    pub trees: std::collections::HashMap<String, Arc<Vec<FeatureRow>>>,
     /// The selected script's problem, also marked in the feature tree.
     pub problem: Option<(Option<usize>, String)>,
     /// The panel's text differs from the committed program (a preview shows, or none builds).
@@ -338,6 +348,9 @@ pub enum SourceAction {
     Hover(Option<String>),
     /// Select a row; only tree-originated selections reveal its code.
     Select { id: String, reveal: bool },
+    /// Make this instance the one the tree's edits and the code follow: a part of it is
+    /// selected (a press in an outliner tree of another part comes first with this).
+    Focus(String),
     /// Go to the source a derived row's host key names
     FollowLink(String),
     Fold(String),
@@ -350,6 +363,9 @@ pub enum SourceAction {
     Rename { id: String, to: String },
     /// Omit or restore a boolean operand.
     Bypass { id: String, off: bool },
+    /// Make a boolean operand joined (`+`), cut away (`-`) or intersected (`&`), keeping the
+    /// order the operands apply in.
+    SetRole { id: String, role: &'static str },
     Remove(String),
 }
 
@@ -474,6 +490,9 @@ fn parse_hex(s: &str) -> Option<[f32; 4]> {
 pub struct FabCodePanel {
     #[deref]
     view: View,
+    /// The shadow under the toolbar while the code is scrolled down (`widgets::draw_scroll_shade`).
+    #[live]
+    draw_shade: DrawQuad,
     #[live]
     tabs: TabBar,
     #[live]
@@ -728,9 +747,9 @@ impl Widget for FabCodePanel {
             }
             None => (None, None, None, None, String::new()),
         };
-        self.view.label(cx, ids!(head.state)).set_text(cx, &word);
+        self.view.label(cx, ids!(editor_bar.state)).set_text(cx, &word);
+        // the document shown (its tab names it)
         let title = scope.data.get::<AppState>().and_then(|st| st.source.viewed.clone()).unwrap_or_else(|| "Program".to_string());
-        self.view.label(cx, ids!(head.title)).set_text(cx, &title);
         let code = self.view.widget(cx, ids!(code));
         if let Some((rev, text)) = reload {
             if let Some(mut view) = code.borrow_mut::<CodeView>() {
@@ -761,12 +780,18 @@ impl Widget for FabCodePanel {
         while self.view.draw_walk(cx, scope, walk).is_step() {}
         if let Some(state) = scope.data.get::<AppState>() {
             let active = state.source.tabs.iter().position(|t| Some(&t.file) == state.source.viewed.as_ref());
-            let rect = self.view.widget(cx, ids!(tab_strip)).area().rect(cx);
+            let rect = self.view.widget(cx, ids!(editor_bar.tab_strip)).area().rect(cx);
             self.tabs.begin(cx, active, true, Walk::abs_rect(rect));
             for tab in &state.source.tabs {
                 self.tabs.draw_tab(cx, LiveId::from_str(&tab.file), &tab.name, live_id!(PermanentTab));
             }
             self.tabs.end(cx);
+        }
+        // scrolled down, a shadow along the code's top, under the toolbar (as every editor's)
+        if let Some(view) = code.borrow::<CodeView>() {
+            let rect = view.editor.area().rect(cx);
+            let scrolled = view.editor.scroll_pos().y;
+            crate::ui::widgets::draw_scroll_shade(cx, &mut self.draw_shade, rect, 0, -scrolled);
         }
         let Some(view) = code.borrow::<CodeView>() else { return DrawStep::done() };
         let Some(session) = view.session.as_ref() else { return DrawStep::done() };
@@ -845,6 +870,40 @@ impl Widget for FabFeaturesPanel {
 }
 
 const ROW: f64 = 24.0;
+/// The fold chevron's column.
+const INDENT: f64 = 18.0;
+/// A tree level's indent, the Parts outliner's (`parts::TREE_STEP`).
+const STEP: f64 = 12.0;
+/// How long a fold takes to open or close (s), in the tree and in the Parts outliner (a fn, not
+/// a const: a live session patches a fn's new value in, a const's needs a restart).
+pub fn fold_s() -> f64 {
+    0.1
+}
+
+/// A fold's travel 0..1, eased: it starts and ends softly.
+pub fn fold_ease(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// A loop's row: its copies (`holes[0]`..) start folded under it (its kind says what each is, how
+/// many there are is in its tooltip); unfolded they show, each to hover (its ghost in the view)
+/// or pick. In `SourceState::collapsed` a loop's id means unfolded, the other way round from every
+/// other row, so a loop nobody opened stays folded. A pick of a copy (in the view) lights the loop's
+/// row while it is folded, and a mark on a copy shows on it then.
+fn is_loop(f: &FeatureRow) -> bool {
+    f.group && f.op != "call"
+}
+
+/// A group row's tooltip: what its children are, in place of a count on the row.
+fn group_tip(f: &FeatureRow) -> Option<String> {
+    if !f.group { return None; }
+    Some(if is_loop(f) {
+        format!("{} {}{}, made by a loop", f.children, f.op, if f.children == 1 { "" } else { "s" })
+    } else {
+        format!("A function call: {}", f.detail)
+    })
+}
 
 /// Hit regions and source identity of a visible row.
 #[derive(Clone)]
@@ -852,6 +911,8 @@ struct FeatureHit {
     rect: Rect,
     name: Rect,
     fold: Option<Rect>,
+    /// Whether the row's children are folded away (as drawn), for a fold drag to set it.
+    folded: bool,
     eye: Option<Rect>,
     link: Option<Rect>,
     key: String,
@@ -861,6 +922,45 @@ struct FeatureHit {
     editable: bool,
     bypass: bool,
     off: bool,
+    /// The role disc after the name, and whether a press on it opens the role menu.
+    mark: Option<Rect>,
+    role: &'static str,
+    can_role: bool,
+}
+
+/// A fold drag in the parts tree: a press on a chevron (a part row's or a feature row's), dragged
+/// on, sets every row the pointer reaches to the state the pressed one went to (`open`), and every
+/// row between it and the last one set (`last`), in their order on screen: folding moves the rows
+/// below past the pointer between two moves, and the order catches them. One drag runs across the
+/// part rows and their features (each keeps its rows: `p<key>`, `f<id>`). It ends on release.
+#[derive(Default)]
+pub(crate) struct TreeFold {
+    pub(crate) open: Option<bool>,
+    pub(crate) done: Vec<String>,
+    pub(crate) last: Option<String>,
+}
+
+impl TreeFold {
+    /// A press on `key`'s chevron that turned it to `open`.
+    pub(crate) fn start(cx: &mut Cx, open: bool, key: String) {
+        *cx.global::<TreeFold>() = TreeFold { open: Some(open), done: vec![key.clone()], last: Some(key) };
+    }
+
+    /// The rows (keys, in their order on screen) a move to row `h` sets: `h` and those since the
+    /// last one set, when that is among these rows; each once per drag. Records `h` as the last.
+    pub(crate) fn reach(cx: &mut Cx, keys: &[String], h: usize) -> Vec<usize> {
+        let fold = cx.global::<TreeFold>();
+        let from = fold.last.as_ref().and_then(|l| keys.iter().position(|k| k == l)).unwrap_or(h);
+        let mut out = Vec::new();
+        for i in from.min(h)..=from.max(h) {
+            if !fold.done.contains(&keys[i]) {
+                fold.done.push(keys[i].clone());
+                out.push(i);
+            }
+        }
+        fold.last = Some(keys[h].clone());
+        out
+    }
 }
 
 /// A row held by the pointer and its current sibling destination.
@@ -909,11 +1009,21 @@ pub struct FabFeatureTree {
     color_error: Vec4f,
     #[live]
     color_cut: Vec4f,
+    #[live]
+    color_join: Vec4f,
+    #[live]
+    color_mark_ink: Vec4f,
     /// A row the selector report asks to check.
     #[live]
     color_check: Vec4f,
     #[live]
     color_readonly: Vec4f,
+    #[live]
+    color_kind: Vec4f,
+    #[live]
+    draw_tip: DrawFabChip,
+    #[live]
+    draw_tip_text: DrawText,
     #[rust]
     rows: Vec<FeatureHit>,
     #[rust]
@@ -928,11 +1038,136 @@ pub struct FabFeatureTree {
     hover: Option<usize>,
     #[rust]
     selected: Option<String>,
+    /// The instance whose tree this shows (the Parts outliner sets it per part); none: the
+    /// selected script's.
+    #[rust]
+    pub instance: Option<String>,
+    /// It shows the selected script's tree, the one edits apply to; another instance's is
+    /// focused (made the selected one) before a press's edit.
+    #[rust]
+    current: bool,
+    /// The row the context menu is up for.
+    #[rust]
+    menu_row: Option<String>,
+    /// Each fold's openness as drawn (0 folded .. 1 open) and the one it heads for; while one
+    /// moves the tree draws again every frame and its rows under it close up or open out.
+    #[rust]
+    folds: std::collections::HashMap<String, (f64, f64)>,
+    #[rust]
+    fold_frame: NextFrame,
+    #[rust]
+    fold_last: Option<f64>,
+    /// How far the Parts outliner has this tree open (0..1, eased here); none: all of it.
+    #[rust]
+    reveal: Option<f64>,
     #[rust]
     area: Area,
 }
 
 impl FabFeatureTree {
+    /// Show `instance`'s tree, its rows starting `indent` in (the Parts outliner, under its part).
+    pub fn show_instance(&mut self, instance: &str, indent: f64, reveal: f64) {
+        if self.instance.as_deref() != Some(instance) {
+            self.instance = Some(instance.to_string());
+            self.rename = None;
+            self.drag = None;
+            self.hover = None;
+            self.folds.clear();
+        }
+        self.walk.margin.left = indent;
+        self.reveal = Some(reveal);
+    }
+
+    /// A source action of a press in this tree: on another instance's tree, that instance is
+    /// focused first, so the action applies to its script.
+    /// A fold drag (`TreeFold`) moved to `p`: the rows it reaches here, with a fold, take its
+    /// state.
+    fn fold_drag(&mut self, cx: &mut Cx, p: DVec2) {
+        let Some(open) = cx.global::<TreeFold>().open else { return };
+        let Some(h) = self.rows.iter().position(|r| r.rect.contains(p)) else { return };
+        let keys: Vec<String> = self.rows.iter().map(|r| format!("f{}", r.id)).collect();
+        for i in TreeFold::reach(cx, &keys, h) {
+            let hit = &self.rows[i];
+            // (folded and to open, or open and to fold: it turns)
+            if hit.fold.is_some() && hit.folded == open {
+                let id = hit.id.clone();
+                self.act(cx, SourceAction::Fold(id));
+            }
+        }
+    }
+
+    fn act(&self, cx: &mut Cx, action: SourceAction) {
+        if let (false, Some(instance)) = (self.current, &self.instance) {
+            cx.action(SourceAction::Focus(instance.clone()));
+        }
+        cx.action(action);
+    }
+
+    fn menu_id(&self) -> LiveId {
+        LiveId::from_str(&format!("fab_feature_menu:{:?}", self.uid))
+    }
+
+    fn role_menu_id(&self) -> LiveId {
+        LiveId::from_str(&format!("fab_feature_role:{:?}", self.uid))
+    }
+
+    /// The rows this tree shows: the selected script's, or its instance's.
+    fn feature_rows<'a>(&self, s: &'a SourceState) -> &'a [FeatureRow] {
+        if self.current { &s.features } else { self.instance.as_ref().and_then(|i| s.trees.get(i)).map_or(&[], |t| t.as_slice()) }
+    }
+
+    /// Why a disc's role cannot change here, said in its menu (every disc opens one).
+    fn role_note(&self, s: &SourceState, hit: &FeatureHit) -> Option<String> {
+        if hit.can_role { return None; }
+        let rows = self.feature_rows(s);
+        let parent = hit.parent.as_ref().and_then(|id| rows.iter().find(|f| f.id == *id));
+        Some(match parent {
+            Some(p) if p.group && p.op != "call" => format!("A copy made by {}: change the role of {} ×{} instead", p.name(), p.name(), p.children),
+            _ if !hit.editable => "Made inside a function: change its role where the function is written".into(),
+            Some(p) => format!("A {}'s operands keep their roles: change it in the code", p.op),
+            None => "Its role cannot change here: change it in the code".into(),
+        })
+    }
+
+    /// The role disc's menu: join, cut or intersect, the current one checked; where the role
+    /// cannot change, the same items unavailable under the reason.
+    /// A smooth boolean's operand (a blend's or a carve's): it joins or cuts with the boolean's
+    /// radius, and nothing intersects smoothly.
+    fn smooth_operand(&self, s: &SourceState, hit: &FeatureHit) -> bool {
+        let rows = self.feature_rows(s);
+        hit.parent.as_ref().and_then(|id| rows.iter().find(|f| f.id == *id)).is_some_and(|p| p.op == "blend" || p.op == "carve")
+    }
+
+    fn open_role_menu(&mut self, cx: &mut Cx, hit: &FeatureHit, under: Rect, note: Option<String>, smooth: bool) {
+        self.menu_row = Some(hit.id.clone());
+        let can = note.is_none();
+        let mut items = Vec::new();
+        if let Some(note) = note {
+            items.push(MenuItem::new(live_id!(role_note), &note).disabled());
+            items.push(MenuItem::sep());
+        }
+        items.extend([
+            MenuItem::new(live_id!(role_join), if smooth { "Join smoothly (+)" } else { "Join (+)" }).checked(hit.role == "+").enabled_if(can),
+            MenuItem::new(live_id!(role_cut), if smooth { "Cut away smoothly (−)" } else { "Cut away (−)" }).checked(hit.role == "-").enabled_if(can),
+            MenuItem::new(live_id!(role_intersect), if smooth { "Intersect (not with a smooth edge)" } else { "Intersect (∩)" }).checked(hit.role == "&").enabled_if(can && !smooth),
+        ]);
+        open_menu(cx, self.role_menu_id(), items, under, MenuPlace::Below);
+    }
+
+    /// The row's menu: what the Features panel's bar held (move, delete) and rename.
+    fn open_row_menu(&mut self, cx: &mut Cx, hit: &FeatureHit, at: DVec2) {
+        self.menu_row = Some(hit.id.clone());
+        let items = vec![
+            MenuItem::new(live_id!(feature_rename), "Rename").enabled_if(hit.editable),
+            MenuItem::sep(),
+            MenuItem::new(live_id!(feature_up), "Move up (built earlier)").enabled_if(hit.editable),
+            MenuItem::new(live_id!(feature_down), "Move down (built later)").enabled_if(hit.editable),
+            MenuItem::sep(),
+            MenuItem::new(live_id!(feature_remove), "Delete").enabled_if(hit.editable),
+        ];
+        open_menu(cx, self.menu_id(), items, Rect { pos: at, size: dvec2(0.0, 0.0) }, MenuPlace::At);
+    }
+
     /// Edit the binding in place; only Enter sends an edit.
     fn begin_rename(&mut self, cx: &mut Cx, id: String) {
         if !self.rows.iter().any(|r| r.id == id && r.editable) {
@@ -987,22 +1222,48 @@ impl Widget for FabFeatureTree {
         let Some(key) = cx.a11y.action_part_key(request.node) else { return ActionResult::Unhandled };
         let Some(hit) = self.rows.get((key as usize).wrapping_sub(1)) else { return ActionResult::Unsupported };
         cx.set_key_focus(self.area);
-        cx.action(SourceAction::Select { id: hit.id.clone(), reveal: true });
+        let id = hit.id.clone();
+        self.act(cx, SourceAction::Select { id, reveal: true });
         ActionResult::Handled
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        match event {
+            Event::MouseUp(_) => cx.global::<TreeFold>().open = None,
+            Event::MouseMove(e) => self.fold_drag(cx, e.abs),
+            _ => {}
+        }
+        if let Event::NextFrame(ne) = event {
+            if ne.set.contains(&self.fold_frame) {
+                let dt = self.fold_last.map_or(0.0, |t| (ne.time - t).clamp(0.0, 0.05));
+                self.fold_last = Some(ne.time);
+                let step = dt / fold_s();
+                let mut moving = false;
+                for (now, to) in self.folds.values_mut() {
+                    if now != to {
+                        *now = if *to > *now { (*now + step).min(*to) } else { (*now - step).max(*to) };
+                        moving |= now != to;
+                    }
+                }
+                if moving { self.fold_frame = cx.new_next_frame(); } else { self.fold_last = None; }
+                self.area.redraw(cx);
+            }
+        }
         if self.rename.is_some() {
             let actions = cx.capture_actions(|cx| self.rename_input.handle_event(cx, event, scope));
             let input = self.rename_input.as_text_input();
             let later = match event { Event::Actions(a) => Some(a), _ => None };
             let escaped = input.escaped(&actions) || later.is_some_and(|a| input.escaped(a));
             let returned = input.returned(&actions).or_else(|| later.and_then(|a| input.returned(a)));
-            if escaped || returned.is_some() {
-                if let (Some(id), Some((to, _))) = (self.rename.take(), returned) {
-                    if id != to { cx.action(SourceAction::Rename { id, to }); }
+            // a press elsewhere takes the focus: the name typed is kept, as Return keeps it
+            let lost = !escaped && returned.is_none() && (input.key_focus_lost(&actions) || later.is_some_and(|a| input.key_focus_lost(a)));
+            let typed = returned.map(|(to, _)| to).or_else(|| lost.then(|| input.text()));
+            if escaped || typed.is_some() {
+                if let (Some(id), Some(to)) = (self.rename.take(), typed) {
+                    let to = to.trim().to_string();
+                    if !to.is_empty() && id != to { self.act(cx, SourceAction::Rename { id, to }); }
                 }
-                cx.set_key_focus(self.area);
+                if !lost { cx.set_key_focus(self.area); }
                 self.area.redraw(cx);
             }
             cx.extend_actions(actions);
@@ -1023,20 +1284,63 @@ impl Widget for FabFeatureTree {
                 if h != self.hover {
                     self.hover = h;
                     self.area.redraw(cx);
-                    cx.action(SourceAction::HoverFeature(h.and_then(|i| self.rows.get(i)).map(|r| r.id.clone())));
+                    let tip = h.and_then(|i| self.rows.get(i)).and_then(|hit| {
+                        let state = scope.data.get::<AppState>()?;
+                        let f = self.feature_rows(&state.source).iter().find(|f| f.id == hit.id)?;
+                        Some((group_tip(f)?, hit.rect))
+                    });
+                    let uid = self.widget_uid();
+                    cx.widget_action(uid, match tip {
+                        Some((text, rect)) => TipAction::HoverInWith(TipRequest { wrap_width: 320.0, ..TipRequest::plain(text, rect) }),
+                        None => TipAction::HoverOut,
+                    });
+                    if self.current {
+                        cx.action(SourceAction::HoverFeature(h.and_then(|i| self.rows.get(i)).map(|r| r.id.clone())));
+                    }
                 }
             }
             Hit::FingerHoverOut(_) => {
                 if self.hover.take().is_some() {
                     self.area.redraw(cx);
-                    cx.action(SourceAction::HoverFeature(None));
+                    let uid = self.widget_uid();
+                    cx.widget_action(uid, TipAction::HoverOut);
+                    if self.current {
+                        cx.action(SourceAction::HoverFeature(None));
+                    }
                 }
             }
             Hit::FingerDown(fe) if fe.device.is_primary_hit() => {
                 cx.set_key_focus(self.area);
                 if let Some(hit) = self.rows.iter().find(|r| r.rect.contains(fe.abs)).cloned() {
-                    if !hit.fold.is_some_and(|r| r.contains(fe.abs)) && !hit.eye.is_some_and(|r| r.contains(fe.abs)) && !hit.link.is_some_and(|r| r.contains(fe.abs)) && hit.editable {
-                        self.drag = Some(FeatureDrag { id: hit.id, parent: hit.parent, start: fe.abs, at: fe.abs, moved: false, to: None });
+                    // the eye and the role disc act as they are pressed
+                    if hit.eye.is_some_and(|r| r.contains(fe.abs)) {
+                        if hit.bypass {
+                            self.act(cx, SourceAction::Bypass { id: hit.id, off: !hit.off });
+                        }
+                        return;
+                    }
+                    // a fold folds as it is pressed, and a drag on from it folds or unfolds the rows
+                    // it crosses the same way (`TreeFold`)
+                    if hit.fold.is_some_and(|r| r.contains(fe.abs)) {
+                        TreeFold::start(cx, hit.folded, format!("f{}", hit.id));
+                        self.act(cx, SourceAction::Fold(hit.id));
+                        return;
+                    }
+                    if let Some(mark) = hit.mark.filter(|r| r.contains(fe.abs)) {
+                        let (note, smooth) = scope.data.get::<AppState>().map_or((None, false), |state| (self.role_note(&state.source, &hit), self.smooth_operand(&state.source, &hit)));
+                        self.act(cx, SourceAction::Select { id: hit.id.clone(), reveal: false });
+                        self.open_role_menu(cx, &hit, mark, note, smooth);
+                        return;
+                    }
+                    let on_control = hit.fold.is_some_and(|r| r.contains(fe.abs)) || hit.link.is_some_and(|r| r.contains(fe.abs));
+                    if !on_control {
+                        // a row is picked as it is pressed (a drag of it moves it after)
+                        self.act(cx, SourceAction::Select { id: hit.id.clone(), reveal: true });
+                        if fe.tap_count == 2 && hit.name.contains(fe.abs) {
+                            self.begin_rename(cx, hit.id.clone());
+                        } else if hit.editable {
+                            self.drag = Some(FeatureDrag { id: hit.id, parent: hit.parent, start: fe.abs, at: fe.abs, moved: false, to: None });
+                        }
                         self.redraw_drag(cx);
                     }
                 }
@@ -1055,29 +1359,61 @@ impl Widget for FabFeatureTree {
             Hit::FingerUp(fe) => {
                 let drag = self.drag.take();
                 self.redraw_drag(cx);
+                if !fe.cancelled && fe.is_over && fe.device.mouse_button().is_some_and(|b| b.is_secondary()) {
+                    if let Some(hit) = self.rows.iter().find(|r| r.rect.contains(fe.abs)).cloned() {
+                        let id = hit.id.clone();
+                        self.act(cx, SourceAction::Select { id, reveal: false });
+                        self.open_row_menu(cx, &hit, fe.abs);
+                    }
+                    return;
+                }
                 if fe.cancelled || !fe.is_over || !fe.device.is_primary_hit() { return; }
                 if let Some(drag) = drag.filter(|d| d.moved) {
                     if let Some(hit) = self.rows.iter().find(|r| r.rect.contains(fe.abs) && r.editable && r.id != drag.id && r.parent == drag.parent) {
-                        cx.action(SourceAction::Reorder { id: drag.id, to: hit.id.clone() });
+                        let to = hit.id.clone();
+                        self.act(cx, SourceAction::Reorder { id: drag.id, to });
                     }
                     return;
                 }
                 if let Some(hit) = self.rows.iter().find(|r| r.rect.contains(fe.abs)).cloned() {
                     if hit.link.is_some_and(|r| r.contains(fe.abs)) {
                         cx.action(SourceAction::FollowLink(hit.key));
-                    } else if hit.fold.is_some_and(|r| r.contains(fe.abs)) {
-                        cx.action(SourceAction::Fold(hit.id));
-                    } else if hit.eye.is_some_and(|r| r.contains(fe.abs)) {
-                        if hit.bypass {
-                            cx.action(SourceAction::Bypass { id: hit.id, off: !hit.off });
-                        }
-                    } else {
-                        cx.action(SourceAction::Select { id: hit.id.clone(), reveal: true });
-                        if fe.tap_count == 2 && hit.name.contains(fe.abs) { self.begin_rename(cx, hit.id); }
                     }
                 }
             }
             _ => {}
+        }
+        if let Event::Actions(actions) = event {
+            // A press that dismissed an open menu and landed on a role disc opens that disc's menu
+            // on the same press, unless it is the disc whose menu it closed (that press was the
+            // toggle). The close and its click-away come in the same actions.
+            let closed_ours = ui_actions(actions).any(|a| matches!(a, FabUiAction::MenuClosed { owner } if *owner == self.role_menu_id()));
+            let away = ui_actions(actions).find_map(|a| match a { FabUiAction::MenuClickAway { at } => Some(*at), _ => None });
+            if let Some(at) = away {
+                if let Some(hit) = self.rows.iter().find(|r| r.mark.is_some_and(|m| m.contains(at))).cloned() {
+                    let toggled = closed_ours && self.menu_row.as_deref() == Some(hit.id.as_str());
+                    if !toggled {
+                        let (note, smooth) = scope.data.get::<AppState>().map_or((None, false), |state| (self.role_note(&state.source, &hit), self.smooth_operand(&state.source, &hit)));
+                        self.act(cx, SourceAction::Select { id: hit.id.clone(), reveal: false });
+                        self.open_role_menu(cx, &hit, hit.mark.unwrap_or(hit.rect), note, smooth);
+                        return;
+                    }
+                }
+            }
+            // (the row is let go only by this menu's own pick)
+            if let Some((pick, id)) = menu_picked(actions, self.role_menu_id()).and_then(|pick| Some((pick, self.menu_row.take()?))) {
+                let role = if pick == live_id!(role_join) { "+" } else if pick == live_id!(role_cut) { "-" } else { "&" };
+                self.act(cx, SourceAction::SetRole { id, role });
+            }
+            if let Some((pick, id)) = menu_picked(actions, self.menu_id()).and_then(|pick| Some((pick, self.menu_row.take()?))) {
+                if pick == live_id!(feature_rename) {
+                    self.begin_rename(cx, id);
+                } else if pick == live_id!(feature_up) || pick == live_id!(feature_down) {
+                    self.act(cx, SourceAction::Move { id, up: pick == live_id!(feature_up) });
+                } else if pick == live_id!(feature_remove) {
+                    self.act(cx, SourceAction::Remove(id));
+                }
+            }
         }
     }
 
@@ -1085,45 +1421,79 @@ impl Widget for FabFeatureTree {
         self.rows.clear();
         let Some(state) = scope.data.get::<AppState>() else { return DrawStep::done() };
         let s = &state.source;
-        self.selected = s.selected.clone();
-        if self.rename.as_ref().is_some_and(|id| s.selected.as_ref() != Some(id) || s.feature(id).is_none()) {
+        // The selected script's tree is the one edits apply to, with its picks, folds and marks;
+        // another instance's shows its rows as built (function calls folded), unpicked.
+        let current = self.instance.as_ref().is_none_or(|i| *i == s.instance);
+        self.current = current;
+        let features: &[FeatureRow] = if current {
+            &s.features
+        } else {
+            self.instance.as_ref().and_then(|i| s.trees.get(i)).map_or(&[], |t| t.as_slice())
+        };
+        let is_folded = |f: &FeatureRow| if current { s.collapsed.contains(&f.id) != is_loop(f) } else { f.group };
+        // a copy of a folded loop picked (in the view): its loop's row shows it
+        let selected = if current { s.selected.clone() } else { None }.map(|id| {
+            let parent = features.iter().find(|f| f.id == id).and_then(|f| f.parent.as_ref()).and_then(|p| features.iter().find(|f| f.id == *p));
+            parent.filter(|p| is_loop(p) && is_folded(p)).map_or(id, |p| p.id.clone())
+        });
+        self.selected = selected.clone();
+        if self.rename.as_ref().is_some_and(|id| !features.iter().any(|f| f.id == *id)) {
             self.rename = None;
         }
-        let mut hidden = None;
-        let visible: Vec<_> = s.features.iter().filter(|f| {
-            if hidden.is_some_and(|depth| f.depth > depth) {
-                return false;
-            }
-            hidden = s.collapsed.contains(&f.id).then_some(f.depth);
-            true
-        }).collect();
+        // Each row with how open its folds above it are (1: all open; between: a fold moving, the
+        // row's height that share of a row's). A loop's copies never show.
+        let mut visible: Vec<(&FeatureRow, f64)> = Vec::new();
+        let mut stack: Vec<(usize, f64)> = Vec::new();
+        let mut moving = false;
+        for f in features {
+            while stack.last().is_some_and(|(d, _)| *d >= f.depth) { stack.pop(); }
+            let above = stack.last().map_or(1.0, |(_, k)| *k);
+            if above > 0.0 { visible.push((f, above)); }
+            let open = if f.children > 0 {
+                let to = if is_folded(f) { 0.0 } else { 1.0 };
+                let fold = self.folds.entry(f.id.clone()).or_insert((to, to));
+                fold.1 = to;
+                moving |= fold.0 != fold.1;
+                fold_ease(fold.0)
+            } else {
+                1.0
+            };
+            stack.push((f.depth, above * open));
+        }
+        if moving { self.fold_frame = cx.new_next_frame(); }
+        let full: f64 = visible.iter().map(|(_, k)| ROW * k).sum::<f64>() + 8.0;
         let mut walk = walk;
-        walk.height = Size::Fixed(visible.len() as f64 * ROW + 8.0);
+        walk.height = Size::Fixed((full * fold_ease(self.reveal.unwrap_or(1.0))).round());
         let rect = cx.walk_turtle(walk);
         cx.add_rect_area(&mut self.area, rect);
-        let failing = s.problem.as_ref().and_then(|(l, _)| *l);
+        // (the outliner opening it: what is not open yet is cut off)
+        cx.begin_turtle(Walk::abs_rect(rect), Layout::default().with_clip(true, true));
+        let mut top = rect.pos.y + 4.0;
+        let failing = s.problem.as_ref().and_then(|(l, _)| *l).filter(|_| current);
         let name_color = self.draw_name.color;
         let dim_color = self.draw_op.color;
         let mut rename_rect = None;
-        for (n, f) in visible.into_iter().enumerate() {
-            let r = Rect { pos: dvec2(rect.pos.x + 4.0, rect.pos.y + 4.0 + n as f64 * ROW), size: dvec2(rect.size.x - 8.0, ROW - 2.0) };
-            let on = s.selected.as_ref() == Some(&f.id);
+        for (n, (f, k)) in visible.into_iter().enumerate() {
+            let r = Rect { pos: dvec2(rect.pos.x + 4.0, top), size: dvec2(rect.size.x - 8.0, ROW - 2.0) };
+            // a row of a fold that is moving: its share of a row's height, the rest cut off
+            let slot = Rect { pos: dvec2(rect.pos.x, top), size: dvec2(rect.size.x, ROW * k) };
+            top += ROW * k;
+            let partial = k < 1.0;
+            if partial { cx.begin_turtle(Walk::abs_rect(slot), Layout::default().with_clip(true, true)); }
+            let on = selected.as_ref() == Some(&f.id);
             let bad = failing == Some(f.line);
             // a draft's statement that lost its selector, or the selector report: a selection of
             // this solid took something else than before
-            let lost = s.lost.iter().find(|(file, id, _)| *file == s.file && *id == f.id).map(|(_, _, what)| format!("{what}: pick it"));
-            let drift = s.drifted.iter().find(|(part, _)| part.strip_prefix(s.instance.as_str()).and_then(|p| p.strip_prefix('/')) == Some(f.id.as_str())).map(|(_, what)| format!("check: {what}"));
+            // (a folded loop's row carries its copies' marks, which show nowhere else then)
+            let rolled = is_loop(f) && is_folded(f);
+            let names = |id: &str| id == f.id || (rolled && features.iter().any(|c| c.id == id && c.parent.as_deref() == Some(f.id.as_str())));
+            let lost = s.lost.iter().filter(|_| current).find(|(file, id, _)| *file == s.file && names(id)).map(|(_, _, what)| format!("{what}: pick it"));
+            let drift = s.drifted.iter().filter(|_| current).find(|(part, _)| part.strip_prefix(s.instance.as_str()).and_then(|p| p.strip_prefix('/')).is_some_and(|id| names(id))).map(|(_, what)| format!("check: {what}"));
             let (mark, mark_color) = match (lost, drift) {
                 (Some(l), _) => (Some(l), self.color_error),
                 (None, d) => (d, self.color_check),
             };
-            let fill = if on {
-                self.color_selected
-            } else if self.hover == Some(n) {
-                self.color_hover
-            } else {
-                vec4(0.0, 0.0, 0.0, 0.0)
-            };
+            let fill = if on { self.color_selected } else { vec4(0.0, 0.0, 0.0, 0.0) };
             self.draw_row.fill = fill;
             self.draw_row.ring = if bad { self.color_error } else if mark.is_some() { mark_color } else { vec4(0.0, 0.0, 0.0, 0.0) };
             self.draw_row.spool = 0.0;
@@ -1144,11 +1514,14 @@ impl Widget for FabFeatureTree {
                 self.draw_link.draw_abs(cx, Rect { pos: link.pos + dvec2(3.0, 4.0), size: dvec2(14.0, 14.0) });
             }
             let text_end = link.map_or(r.pos.x + r.size.x - 24.0, |link| link.pos.x - 2.0);
-            let x = r.pos.x + 6.0 + f.depth as f64 * 10.0;
-            let fold = (f.children > 0).then_some(Rect { pos: dvec2(x, r.pos.y), size: dvec2(14.0, r.size.y) });
+            // The Parts outliner's grid: a level is 18 wide, a fold's slot is the level's first 18
+            // (its 10-wide chevron centred in it) and the kind starts 6 after it, so a part's
+            // top rows fold under its swatch and their kinds start where its name does.
+            let x = r.pos.x + 6.0 + f.depth as f64 * STEP;
+            let fold = (f.children > 0).then_some(Rect { pos: dvec2(x, r.pos.y), size: dvec2(INDENT, r.size.y) });
             if let Some(fold) = fold {
-                let icon = Rect { pos: fold.pos + dvec2(0.0, 4.0), size: dvec2(14.0, 14.0) };
-                if s.collapsed.contains(&f.id) {
+                let icon = Rect { pos: fold.pos + dvec2((INDENT - 10.0) * 0.5, (fold.size.y - 10.0) * 0.5), size: dvec2(10.0, 10.0) };
+                if is_folded(f) {
                     self.draw_folded.draw_abs(cx, icon);
                 } else {
                     self.draw_open.draw_abs(cx, icon);
@@ -1160,50 +1533,91 @@ impl Widget for FabFeatureTree {
                 "&" => ("∩", "intersected"),
                 _ => ("", "base"),
             };
-            self.draw_op.color = if f.role == "-" { self.color_cut } else { dim_color };
-            if f.off { self.draw_op.color.w *= 0.4; }
+            // after the fold's column: a print settings box's icon, then the kind
+            let mut kx = x + INDENT + 6.0;
             if settings {
-                self.draw_settings.draw_abs(cx, Rect { pos: dvec2(x + 11.0, r.pos.y + 4.0), size: dvec2(14.0, 14.0) });
-            } else {
-                self.draw_op.draw_abs(cx, dvec2(x + 14.0, r.pos.y + 6.0), glyph);
+                self.draw_settings.draw_abs(cx, Rect { pos: dvec2(kx, r.pos.y + 4.0), size: dvec2(14.0, 14.0) });
+                kx += 18.0;
             }
-            self.draw_op.color = dim_color;
-            if f.off { self.draw_op.color.w *= 0.4; }
-            // the kind column is as wide as the kind's own text, capped at 74 and 0.4 of the row
-            let kind_w = self.draw_op.prepare_single_line_run(cx, &f.verb).map_or(74.0, |run| run.width_in_lpxs as f64 + 1.0);
-            let op_w = kind_w.min(74.0).min((text_end - x - 26.0).max(0.0) * 0.4);
-            cx.begin_turtle(Walk::abs_rect(Rect { pos: dvec2(x + 26.0, r.pos.y), size: dvec2(op_w, r.size.y) }), Layout::default().with_clip(true, true));
-            self.draw_op.draw_abs(cx, dvec2(x + 26.0, r.pos.y + 6.0), &f.verb);
-            cx.end_turtle();
+            // The name first, then its kind (quieter), its role disc and its detail; all of it cut
+            // off where the row's icons start.
             let name = f.study.as_ref().map_or_else(|| f.name().to_string(), |s| s.on.clone());
-            // a gap after the clipped kind, so a long one never runs into the name
-            let at = dvec2(x + 26.0 + op_w + 6.0, r.pos.y + 5.0);
+            let mut mark_rect = None;
+            let at = dvec2(kx, r.pos.y + 5.0);
             let name_rect = Rect { pos: dvec2(at.x, r.pos.y), size: dvec2((text_end - at.x).max(0.0), r.size.y) };
-            self.draw_name.color = if f.editable || f.detail == TEST_PRINT { name_color } else { self.color_readonly };
+            let editable = f.editable || f.detail == TEST_PRINT;
+            self.draw_name.color = if !editable { self.color_readonly } else if self.hover == Some(n) { self.color_hover } else { name_color };
             if f.off { self.draw_name.color.w *= 0.4; }
             if self.rename.as_ref() == Some(&f.id) {
                 rename_rect = Some(name_rect);
             } else {
                 cx.begin_turtle(Walk::abs_rect(name_rect), Layout::default().with_clip(true, true));
                 self.draw_name.draw_abs(cx, at, &name);
-            }
-            // a box's kind says what it is; a lost or drifted selection what it needs
-            let detail = mark.as_deref().unwrap_or(&f.detail);
-            if self.rename.as_ref() != Some(&f.id) && !detail.is_empty() && !settings {
-                if let Some(run) = self.draw_name.prepare_single_line_run(cx, &name) {
+                let mut after = at.x + self.draw_name.prepare_single_line_run(cx, &name).map_or(0.0, |run| run.width_in_lpxs as f64) + 6.0;
+                // its kind ("cylinder"), in the quietest ink
+                if !f.verb.is_empty() {
+                    self.draw_op.color = self.color_kind;
+                    if f.off { self.draw_op.color.w *= 0.4; }
+                    self.draw_op.draw_abs(cx, dvec2(after, r.pos.y + 6.0), &f.verb);
+                    self.draw_op.color = dim_color;
+                    after += self.draw_op.prepare_single_line_run(cx, &f.verb).map_or(0.0, |run| run.width_in_lpxs as f64) + 6.0;
+                }
+                // How it takes part in its parent, in a disc after the kind: − cut away, + joined,
+                // ∩ intersected; the base has none.
+                if !glyph.is_empty() {
+                    mark_rect = Some(Rect { pos: dvec2(after - 2.0, r.pos.y), size: dvec2(17.0, r.size.y) });
+                    // a solid disc: yellow for a cut, blue for a join, grey for an intersection
+                    let mut disc = match f.role { "-" => self.color_cut, "+" => self.color_join, _ => dim_color };
+                    let mut ink = self.color_mark_ink;
+                    if f.off { disc.w *= 0.4; ink.w *= 0.4; }
+                    let d = 13.0;
+                    let ring = Rect { pos: dvec2(after, r.pos.y + (r.size.y - d) * 0.5), size: dvec2(d, d) };
+                    // the ring in the fill's colour: a clear ring's soft edge would eat into a
+                    // shape this small (the bars came out faint)
+                    self.draw_row.fill = disc;
+                    self.draw_row.ring = disc;
+                    self.draw_row.radius = (d * 0.5) as f32;
+                    self.draw_row.draw_abs(cx, ring);
+                    // + and − as bars on the disc's centre (a glyph's ink sits off it)
+                    let c = ring.pos + ring.size * 0.5;
+                    let (len, thick) = (7.0, 2.0);
+                    self.draw_row.fill = ink;
+                    self.draw_row.ring = ink;
+                    self.draw_row.radius = 0.5;
+                    if f.role == "-" || f.role == "+" {
+                        self.draw_row.draw_abs(cx, Rect { pos: dvec2(c.x - len * 0.5, c.y - thick * 0.5), size: dvec2(len, thick) });
+                    }
+                    if f.role == "+" {
+                        self.draw_row.draw_abs(cx, Rect { pos: dvec2(c.x - thick * 0.5, c.y - len * 0.5), size: dvec2(thick, len) });
+                    }
+                    if f.role == "&" {
+                        self.draw_op.color = ink;
+                        let gw = self.draw_op.prepare_single_line_run(cx, glyph).map_or(6.0, |run| run.width_in_lpxs as f64);
+                        self.draw_op.draw_abs(cx, dvec2(c.x - gw * 0.5, r.pos.y + 6.0), glyph);
+                        self.draw_op.color = dim_color;
+                    }
+                    self.draw_row.radius = 3.0;
+                    after = ring.pos.x + d + 6.0;
+                }
+                // a box's kind says what it is; a lost or drifted selection what it needs
+                // (a group's count is in its tooltip)
+                let detail = mark.as_deref().unwrap_or(if f.group { "" } else { f.detail.as_str() });
+                if !detail.is_empty() && !settings {
                     self.draw_name.color = if mark.is_some() { mark_color } else { dim_color };
                     if f.off { self.draw_name.color.w *= 0.4; }
-                    self.draw_name.draw_abs(cx, at + dvec2(run.width_in_lpxs as f64 + 8.0, 0.0), detail);
+                    self.draw_name.draw_abs(cx, dvec2(after, at.y), detail);
                 }
+                cx.end_turtle();
             }
-            if self.rename.as_ref() != Some(&f.id) { cx.end_turtle(); }
             if let Some((_, after)) = self.drag.as_ref().filter(|d| d.moved).and_then(|d| d.to.as_ref()).filter(|(to, _)| *to == f.id) {
                 self.draw_row.fill = name_color;
                 self.draw_row.ring = vec4(0.0, 0.0, 0.0, 0.0);
                 self.draw_row.draw_abs(cx, Rect { pos: dvec2(x, if *after { r.pos.y + ROW - 2.0 } else { r.pos.y - 2.0 }), size: dvec2((r.pos.x + r.size.x - x).max(0.0), 2.0) });
             }
-            self.rows.push(FeatureHit { rect: r, name: name_rect, fold, eye, link, key: f.link.clone(), label: format!("{role} {} {} level {}{}{}{}", f.verb, f.name(), f.depth + 1, if f.off { " bypassed" } else { "" }, if f.link.is_empty() { "" } else { " linked" }, mark.as_ref().map(|what| format!(", {what}")).unwrap_or_default()), id: f.id.clone(), parent: f.parent.clone(), editable: f.editable, bypass: f.editable && !f.root && f.op != "call" && !settings, off: f.off });
+            if partial { cx.end_turtle(); }
+            self.rows.push(FeatureHit { rect: r, name: name_rect, fold, folded: is_folded(f), eye, link, key: f.link.clone(), label: format!("{role} {} {} level {}{}{}{}", f.verb, f.name(), f.depth + 1, if f.off { " bypassed" } else { "" }, if f.link.is_empty() { "" } else { " linked" }, mark.as_ref().map(|what| format!(", {what}")).unwrap_or_default()), id: f.id.clone(), parent: f.parent.clone(), editable: f.editable, bypass: f.editable && !f.root && f.op != "call" && !settings, off: f.off, mark: mark_rect, role: f.role, can_role: f.can_role });
         }
+        cx.end_turtle();
         self.draw_name.color = name_color;
         self.draw_op.color = dim_color;
         if let Some(rect) = rename_rect {
@@ -1221,11 +1635,10 @@ impl Widget for FabFeatureTree {
             let pass = cx.current_pass_size();
             cx.begin_root_turtle(pass, Layout::flow_down());
             let shift = if let Some(drag) = &self.drag {
-                let w = self.draw_name.prepare_single_line_run(cx, &drag.id).map_or(0.0, |r| r.width_in_lpxs as f64) + 16.0;
-                self.draw_row.fill = self.color_selected;
-                self.draw_row.ring = name_color;
-                self.draw_row.draw_abs(cx, Rect { pos: dvec2(0.0, 0.0), size: dvec2(w, ROW) });
-                self.draw_name.draw_abs(cx, dvec2(8.0, 5.0), &drag.id);
+                // the row's name in a tooltip's bubble (the app's one look for what rides the pointer)
+                let w = self.draw_tip_text.prepare_single_line_run(cx, &drag.id).map_or(0.0, |r| r.width_in_lpxs as f64) + 16.0;
+                self.draw_tip.draw_abs(cx, Rect { pos: dvec2(0.0, 0.0), size: dvec2(w, 24.0) });
+                self.draw_tip_text.draw_abs(cx, dvec2(8.0, 6.0), &drag.id);
                 drag.at + dvec2(12.0, 12.0) - rect.pos
             } else { DVec2::default() };
             cx.end_pass_sized_turtle_with_shift(self.area, shift);

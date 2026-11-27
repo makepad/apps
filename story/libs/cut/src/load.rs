@@ -824,10 +824,11 @@ impl<'a> Loader<'a> {
         let node = at.node;
         spec.device = match param(node, "device") {
             None | Some(Literal::Null) => CameraDevice::First,
+            Some(Literal::Id(id)) if id == "test_pattern" => CameraDevice::TestPattern,
             Some(Literal::Str(name)) if !name.trim().is_empty() => CameraDevice::Name(name.trim().to_string()),
             Some(Literal::Num(index)) if *index >= 0.0 && index.fract() == 0.0 && *index < 64.0 => CameraDevice::Index(*index as u32),
             Some(_) => {
-                self.push(DiagnosticKind::InvalidParam, at, Some("device"), format!("`{id}.device` is part of the camera's name (\"OBSBOT\"), its number (0, 1, ...) or nil for the first"));
+                self.push(DiagnosticKind::InvalidParam, at, Some("device"), format!("`{id}.device` is part of the camera's name (\"OBSBOT\"), its number (0, 1, ...), @test_pattern for generated colour bars, or nil for the first camera"));
                 CameraDevice::First
             }
         };

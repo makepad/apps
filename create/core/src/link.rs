@@ -21,9 +21,9 @@
 //!         Versions { count, accepted versions }
 //! ```
 //!
-//! - **Two devices, no rooms.** A link belongs to a pair of devices and carries every room the two
-//!   share; nothing about rooms crosses here. A first contact pins two devices and founds
-//!   nothing. Events are bound to their room by their own signatures.
+//! - **Two devices, no towns.** A link belongs to a pair of devices and carries every town the two
+//!   share; nothing about towns crosses here. A first contact pins two devices and founds
+//!   nothing. Events are bound to their town by their own signatures.
 //! - **The gate.** Each side proves it holds the gate key before the other shows any key. On
 //!   first contact the gate key comes from the two invites read aloud. On reconnect it comes from
 //!   the link secret of the two device keys. A stranger, or a relay that terminates TLS, gets two
@@ -45,8 +45,9 @@ use makepad_network::tunnel::hmac_sha256;
 use std::sync::Arc;
 
 /// The link protocol's version.
-pub const VERSION: u16 = 5;
-const RECOGNISED: &[u16] = &[1, 2, 3, 4];
+pub const VERSION: u16 = 15;
+// Recognised so an older peer gets a version notice. Only VERSION can complete the proof.
+const RECOGNISED: std::ops::Range<u16> = 1..VERSION;
 
 /// The labels of the link proof and of the link around it ([`crate::connect`]), in the same form
 /// as [`crate::key::label`] and kept apart from those by the same test.
@@ -121,7 +122,7 @@ pub struct Reconnect {
     /// Who may be at the other end. A client names the one device it dials. A server names the
     /// devices whose probe tag punched this path (normally one), all above its own id, and the
     /// client's gate picks one. Who may be a candidate is the caller's rule: contacts, its own
-    /// devices and members of its closed rooms, never the members of a wider room.
+    /// devices and members of its closed towns, never the members of a wider town.
     pub peers: Vec<Pin>,
 }
 
@@ -136,9 +137,9 @@ pub enum Refusal {
     /// A message that breaks the format, comes out of order or repeats, or an application byte
     /// before the proof ends.
     Format(&'static str),
-    /// The devices need a common Work version at least as new as this pair has used.
+    /// The devices need a common Town version at least as new as this pair has used.
     /// A peer's Versions notice reports the same refusal.
-    Version,
+    Version { peer_newest: Option<u16> },
     /// The gate MAC didn't verify: not a device we pinned, not the invite as read, or someone is
     /// between the two sides. On reconnect a device with a new key ends here too, and, with more
     /// than two people, one that hasn't yet learnt of us: the caller words it by its history.
@@ -351,7 +352,7 @@ impl Proof {
     /// `random` is 64 bytes from the OS: our nonce, then our key contribution. The role follows
     /// from the mode (the lower id serves); the caller opens TLS in that role.
     pub fn new(mode: Mode, cert_hash: [u8; 32], random: [u8; 64]) -> Result<Proof, Refusal> {
-        Self::start(mode, cert_hash, random, [&[VERSION][..], RECOGNISED].concat())
+        Self::start(mode, cert_hash, random, std::iter::once(VERSION).chain(RECOGNISED).collect())
     }
 
     #[cfg(test)]
@@ -373,6 +374,21 @@ impl Proof {
     #[cfg(test)]
     fn version_four(mode: Mode, cert_hash: [u8; 32], random: [u8; 64]) -> Result<Proof, Refusal> {
         Self::start(mode, cert_hash, random, vec![4, 1, 2, 3])
+    }
+
+    #[cfg(test)]
+    fn version_five(mode: Mode, cert_hash: [u8; 32], random: [u8; 64]) -> Result<Proof, Refusal> {
+        Self::start(mode, cert_hash, random, vec![5, 1, 2, 3, 4])
+    }
+
+    #[cfg(test)]
+    fn version_six(mode: Mode, cert_hash: [u8; 32], random: [u8; 64]) -> Result<Proof, Refusal> {
+        Self::start(mode, cert_hash, random, vec![6, 1, 2, 3, 4, 5])
+    }
+
+    #[cfg(test)]
+    fn version_seven(mode: Mode, cert_hash: [u8; 32], random: [u8; 64]) -> Result<Proof, Refusal> {
+        Self::start(mode, cert_hash, random, vec![7, 1, 2, 3, 4, 5, 6])
     }
 
     fn start(mode: Mode, cert_hash: [u8; 32], random: [u8; 64], offered: Vec<u16>) -> Result<Proof, Refusal> {
@@ -455,7 +471,7 @@ impl Proof {
 
     fn refuse(&mut self, reason: Refusal, received: u8) -> Refusal {
         self.output.clear();
-        if reason == Refusal::Version && received != VERSIONS {
+        if matches!(reason, Refusal::Version { .. }) && received != VERSIONS {
             let [hi, lo] = self.offered[0].to_be_bytes();
             frame(&mut self.output, VERSIONS, &[1, hi, lo]);
         }
@@ -495,9 +511,10 @@ impl Proof {
         let mut r = Reader(body);
         if kind == VERSIONS {
             let count = r.u8()? as usize;
-            r.take(2 * count)?;
+            let versions = r.take(2 * count)?;
             r.end()?;
-            return Err(Refusal::Version);
+            let peer_newest = versions.as_chunks::<2>().0.iter().copied().map(u16::from_be_bytes).max();
+            return Err(Refusal::Version { peer_newest });
         }
         if kind != self.expected() {
             return Err(Refusal::Format("unexpected message"));
@@ -514,7 +531,7 @@ impl Proof {
                 let min = self.pin().map_or(0, |pin| pin.min_version);
                 let version = self.offered[0];
                 if version < min || !versions.contains(&version) {
-                    return Err(Refusal::Version);
+                    return Err(Refusal::Version { peer_newest: versions.iter().copied().max() });
                 }
                 let (t0, k_gate) = self.keyed(0, version, &versions, nonce_s, self.nonce)?;
                 (self.version, self.t0, self.k_gate) = (version, t0, k_gate);
@@ -533,11 +550,11 @@ impl Proof {
                     return Err(Refusal::Format("version not offered"));
                 }
                 if version != self.offered[0] {
-                    return Err(Refusal::Version);
+                    return Err(Refusal::Version { peer_newest: Some(version) });
                 }
                 self.pick(version, nonce_c, &mac_c)?;
                 if version < self.pin().map_or(0, |pin| pin.min_version) {
-                    return Err(Refusal::Version);
+                    return Err(Refusal::Version { peer_newest: Some(version) });
                 }
                 let auth = self.auth_key().public();
                 self.auth_s = Some(auth);

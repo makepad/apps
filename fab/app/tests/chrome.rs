@@ -1,9 +1,8 @@
 //! The window's first frame, from one native GPU grab at dpi 1:
 //!
-//! 1. Ink-centre of boxed chrome labels (the caption's `Design`, `Mechanics` and `Monitor`
-//!    workspace tabs, each name after its key number). Same contract as
-//!    `examples/text_center/tests/ui.rs`: the cap-height band of a one-line label sits within
-//!    0.5 logical px of the widget box centre.
+//! 1. Ink-centre of the current workspace's name in the caption's All workspaces button. Same
+//!    contract as `examples/text_center/tests/ui.rs`: the cap-height band of a one-line label
+//!    sits within 0.5 logical px of the widget box centre.
 //! 2. A viewport's composite stays inside its own walk rect, and its rect is never empty. The
 //!    bug this pins: the composite quad was drawn before any `DrawList` had been begun inside
 //!    the offscreen composite pass, so it landed in the window's draw list at pass-local (0,0)
@@ -188,9 +187,7 @@ fn fill_value(frame: &Frame, r: &DevRect) -> f64 {
 }
 
 /// How far (logical px) a label's ink centre sits from its box centre.
-/// `past_key`: the label starts with a key number in a smaller face (a workspace tab's), so the
-/// name measured is the ink after the number's.
-fn ink_offset(frame: &Frame, snap: &NodeMatch, dpi: f64, past_key: bool) -> f64 {
+fn ink_offset(frame: &Frame, snap: &NodeMatch, dpi: f64) -> f64 {
     let rect = DevRect {
         x0: (snap.x() as f64 * dpi).round() as usize,
         y0: (snap.y() as f64 * dpi).round() as usize,
@@ -212,17 +209,12 @@ fn ink_offset(frame: &Frame, snap: &NodeMatch, dpi: f64, past_key: bool) -> f64 
         .collect();
     assert!(!text_rows.is_empty(), "widget {} has no legible ink over fill {fill}", snap.path);
     let window = (text_rows[0].saturating_sub(2))..=(text_rows[text_rows.len() - 1] + 2).min(frame.height - 1);
-    // The stem: each label starts with a capital (`D`, `M`) whose left stem runs flat from the
-    // cap line to the baseline, the `H` of `text_center`. The column of most ink anywhere in the
-    // word can be an `i` (its dot, a gap, its stem) or a descender, neither of which is the cap
-    // band. So: the first glyph's column with the longest unbroken run of ink, the flattest of
-    // equal runs (a stem's own antialiased edge, not where a bar joins it).
+    // The cap-height band of the first glyph, as the `H` of `text_center`. The column of most
+    // ink anywhere in the word can be an `i` (its dot, a gap, its stem) or a descender, neither
+    // of which is the cap band. So: the first glyph's column with the longest unbroken run of
+    // ink, the flattest of equal runs (a stem's own antialiased edge, not where a bar joins it).
     let inked = |x: usize| window.clone().any(|y| (frame.at(x, y) - fill).abs() > 40.0);
-    let mut first = columns.clone().find(|x| inked(*x)).unwrap_or_else(|| panic!("widget {} has no ink column", snap.path));
-    if past_key {
-        let key_end = columns.clone().skip_while(|x| *x <= first).find(|x| !inked(*x)).unwrap_or(columns.end);
-        first = (key_end..columns.end).find(|x| inked(*x)).unwrap_or_else(|| panic!("widget {} has no name after its key", snap.path));
-    }
+    let first = columns.clone().find(|x| inked(*x)).unwrap_or_else(|| panic!("widget {} has no ink column", snap.path));
     let glyph = first..columns.clone().skip_while(|x| *x <= first).find(|x| !inked(*x)).unwrap_or(columns.end);
     let run = |x: usize| {
         let (mut best, mut start) = ((0usize, 0.0f64), None);
@@ -258,7 +250,7 @@ fn distinct_inset(frame: &Frame, x0: usize, y0: usize, x1: usize, y1: usize) -> 
 
 #[makepad_test]
 fn the_first_frame_centres_its_labels_and_keeps_composites_in_their_rects(app: TestApp) {
-    app.locator(workspace_row::tab("Design")).wait_visible();
+    workspace_row::wait_shown(&app, "3D modeling");
     // `main` is the shell's root view: its rect is the window's content area,
     // in the same layout points every widget rect below uses.
     let shell = app.locator(Selector::id("main")).wait_visible().snapshot();
@@ -275,12 +267,10 @@ fn the_first_frame_centres_its_labels_and_keeps_composites_in_their_rects(app: T
     let dpi = (frame.width as f64 / shell.width() as f64).round().max(1.0);
     let to_px = |v: i64| ((v as f64) * dpi).round().max(0.0) as usize;
 
-    // ---- 1. the workspace tabs' labels are ink-centred ---------------------
-    for id in ["Design", "Monitor", "Mechanics"] {
-        let snap = app.locator(workspace_row::tab(id)).snapshot();
-        let delta = ink_offset(&frame, &snap, dpi, true);
-        assert!(delta.abs() <= TOLERANCE_LPX, "label centring: `{id}`'s ink sits {delta:+.3} logical px off the box center (tolerance {TOLERANCE_LPX}); see {path:?}");
-    }
+    // The caption draws the current workspace name inside the All workspaces button.
+    let caption = app.locator(Selector::role(makepad_test::Role::Button).name("All workspaces")).snapshot();
+    let delta = ink_offset(&frame, &caption, dpi);
+    assert!(delta.abs() <= TOLERANCE_LPX, "label centring: the current workspace's ink sits {delta:+.3} logical px off the box center (tolerance {TOLERANCE_LPX}); see {path:?}");
 
     // ---- 2a. the chrome above the viewports is still chrome ----------------
     // A misplaced composite is an opaque quad at pass-local (0,0), the window

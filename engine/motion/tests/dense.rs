@@ -1,6 +1,7 @@
 //! Dense vector work: Repeat, Vector, Pattern, Chart, icons and morphs
 //! between any outlines.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::*;
 
 fn load(source: &str) -> MotionDoc {
@@ -21,7 +22,7 @@ fn a_repeat_lays_out_its_copies_each_with_its_index_and_delay() {
     // Copy 4 sits in row 1, column 1; copy 5's colour is its index.
     let origin = |i: usize| children[i].world.apply([0.0, 0.0]);
     assert!((origin(4)[0] - 100.0).abs() < 1e-6 && (origin(4)[1] - 50.0).abs() < 1e-6, "{:?}", origin(4));
-    let ItemKind::Rect { fill: Some(fill), .. } = &children[5].kind else { panic!() };
+    let ItemKind::Primitive(PrimitiveFrame::Rect { fill: Some(fill), .. }) = &children[5].kind else { panic!() };
     assert!((fill[0] - 1.0).abs() < 1e-6, "{fill:?}");
     // The delay: copy 0 has faded in, copy 5 (0.5 s later) not yet.
     assert!(children[0].opacity > 0.99 && children[5].opacity < 0.01);
@@ -52,7 +53,7 @@ fn any_two_outlines_morph_and_icons_give_paths() {
     ]}"#);
     for t in [0.0, 0.5, 1.0] {
         for item in &doc.eval(t).items {
-            let ItemKind::Path { path, .. } = &item.kind else { panic!() };
+            let ItemKind::Primitive(PrimitiveFrame::Path { path, .. }) = &item.kind else { panic!() };
             assert!(matches!(path.cmds.first(), Some(geometry::PathCmd::MoveTo(..))) && path.cmds.len() > 2, "{path:?}");
             assert!(geometry::bounds(path).is_some_and(|b| b.iter().all(|n| n.is_finite())), "{path:?}");
         }
@@ -71,7 +72,7 @@ fn path_frames_share_static_geometry_and_interpolate_svg_operands() {
     let mid = doc.eval(0.5);
     let last = doc.eval(1.0);
     let get = |frame: &MotionFrame, index: usize| match &frame.items[index].kind {
-        ItemKind::Path { path, .. } => path.clone(),
+        ItemKind::Primitive(PrimitiveFrame::Path { path, .. }) => path.clone(),
         _ => panic!(),
     };
     assert!(std::sync::Arc::ptr_eq(&get(&first, 0), &get(&mid, 0)));
@@ -95,7 +96,7 @@ fn a_pattern_is_an_inline_shader_and_a_chart_a_group_of_layers() {
     assert!(matches!(frame.items[0].kind, ItemKind::Shader { .. }));
     let ItemKind::Group { children, .. } = &frame.items[1].kind else { panic!() };
     // Bar "b" has landed at its value: the tallest bar fills the plot.
-    let bars: Vec<f64> = children.iter().filter_map(|c| match &c.kind { ItemKind::Rect { size, .. } if size[0] > 50.0 && size[1] > 20.0 => Some(size[1]), _ => None }).collect();
+    let bars: Vec<f64> = children.iter().filter_map(|c| match &c.kind { ItemKind::Primitive(PrimitiveFrame::Rect { size, .. }) if size[0] > 50.0 && size[1] > 20.0 => Some(size[1]), _ => None }).collect();
     assert_eq!(bars.len(), 3, "{bars:?}");
     assert!(bars[1] > bars[2] && bars[2] > bars[0]);
     let diags = MotionDoc::load(r#"use mod.motion.*; Motion{size: vec2(800, 600) duration: 1.0 layers: [Chart{type: @barz data: [1]}]}"#).unwrap_err();

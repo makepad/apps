@@ -1,3 +1,4 @@
+use crate::plain::PrimitiveFrame;
 use super::lipsync::{self, Viseme};
 use super::pose::{self, Joint};
 use super::*;
@@ -328,7 +329,7 @@ fn costumes_floats_emotes_and_crowd_variants() {
     let frame = doc.eval(1.0);
     let torso_fill = |copy: usize| {
         frame.walk().into_iter().find(|(_, i)| i.path.contains(&format!("#{copy}")) && i.path.contains(".torso.0")).map(|(_, i)| match &i.kind {
-            crate::frame::ItemKind::Path { fill, .. } => fill.unwrap(),
+            crate::frame::ItemKind::Primitive(PrimitiveFrame::Path { fill, .. }) => fill.unwrap(),
             _ => panic!(),
         })
     };

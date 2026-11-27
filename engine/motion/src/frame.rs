@@ -4,130 +4,11 @@
 //! only what needs a font or a decoded file (text layout, an image's own
 //! size) is left to the drawing side.
 
+use crate::plain::PrimitiveFrame;
 use crate::model::*;
 use std::sync::Arc;
 
-/// A 2D affine map: `x' = a x + c y + e`, `y' = b x + d y + f`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Affine {
-    pub a: f64,
-    pub b: f64,
-    pub c: f64,
-    pub d: f64,
-    pub e: f64,
-    pub f: f64,
-}
-
-impl Default for Affine {
-    fn default() -> Self {
-        Self::IDENTITY
-    }
-}
-
-impl Affine {
-    pub const IDENTITY: Affine = Affine { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 };
-
-    pub fn translate(x: f64, y: f64) -> Affine {
-        Affine { e: x, f: y, ..Self::IDENTITY }
-    }
-
-    pub fn scale(x: f64, y: f64) -> Affine {
-        Affine { a: x, d: y, ..Self::IDENTITY }
-    }
-
-    /// Clockwise by `degrees` (y points down).
-    pub fn rotate(degrees: f64) -> Affine {
-        let (s, c) = degrees.to_radians().sin_cos();
-        Affine { a: c, b: s, c: -s, d: c, e: 0.0, f: 0.0 }
-    }
-
-    /// `self` after `other`: a point goes through `other` first.
-    pub fn then(&self, other: &Affine) -> Affine {
-        // self * other
-        Affine {
-            a: self.a * other.a + self.c * other.b,
-            b: self.b * other.a + self.d * other.b,
-            c: self.a * other.c + self.c * other.d,
-            d: self.b * other.c + self.d * other.d,
-            e: self.a * other.e + self.c * other.f + self.e,
-            f: self.b * other.e + self.d * other.f + self.f,
-        }
-    }
-
-    pub fn apply(&self, p: [f64; 2]) -> [f64; 2] {
-        [self.a * p[0] + self.c * p[1] + self.e, self.b * p[0] + self.d * p[1] + self.f]
-    }
-
-    /// Whether the map only translates and scales (axis-aligned).
-    pub fn is_axis_aligned(&self) -> bool {
-        self.b.abs() < 1e-12 && self.c.abs() < 1e-12
-    }
-
-    /// How much the map scales lengths, on average.
-    pub fn mean_scale(&self) -> f64 {
-        ((self.a * self.d - self.b * self.c).abs()).sqrt()
-    }
-
-    /// The map about a pivot: translate to it, `local`, and back.
-    pub fn about(pivot: [f64; 2], local: &Affine) -> Affine {
-        Affine::translate(pivot[0], pivot[1]).then(local).then(&Affine::translate(-pivot[0], -pivot[1]))
-    }
-}
-
-/// A layer's own scale and rotation, about `anchor` (a fraction of its box).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Local {
-    pub anchor: [f64; 2],
-    pub scale: [f64; 2],
-    /// Degrees, clockwise.
-    pub rotate: f64,
-}
-
-impl Local {
-    pub fn is_identity(&self) -> bool {
-        self.scale == [1.0, 1.0] && self.rotate == 0.0
-    }
-
-    pub fn affine(&self, box_size: [f64; 2]) -> Affine {
-        if self.is_identity() {
-            return Affine::IDENTITY;
-        }
-        let pivot = [self.anchor[0] * box_size[0], self.anchor[1] * box_size[1]];
-        Affine::about(pivot, &Affine::rotate(self.rotate).then(&Affine::scale(self.scale[0], self.scale[1])))
-    }
-}
-
-/// One text unit (a letter, word, line or syllable, or the whole text) as
-/// the frame shows it.
-#[derive(Clone, Debug, PartialEq)]
-pub struct TextUnit {
-    /// Byte range of the unit in the item's text.
-    pub range: std::ops::Range<usize>,
-    /// Offset from where layout puts it, in document units.
-    pub offset: [f64; 2],
-    /// Scale and rotation about the unit's own centre.
-    pub scale: [f64; 2],
-    pub rotate: f64,
-    pub opacity: f64,
-    pub color: Color,
-    /// Blur in document units.
-    pub blur: f64,
-    /// This unit's stepped font axes; empty inherits the item's axes.
-    pub axes: Vec<(String, f64)>,
-}
-
-/// A Text's plate at this moment.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PlateFrame {
-    pub color: Color,
-    pub pad: [f64; 2],
-    pub radius: f64,
-    pub stroke: Option<Color>,
-    pub width: f64,
-    pub reveal: f64,
-    pub each: bool,
-    pub underline: bool,
-}
+pub use makepad_motion_plain::frame::{Affine, Local, PlateFrame, TextUnit};
 
 /// A KineticText's words at this moment: the document's own text, or the
 /// voiceover's line being said, the next one, and how far it is sung.
@@ -145,24 +26,7 @@ pub struct KineticFrame {
     pub since: f64,
 }
 
-/// A render-kit effect at one moment.
-#[derive(Clone, Debug, PartialEq)]
-pub struct EffectFrame {
-    pub name: String,
-    pub params: Vec<(String, EffectValue)>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum EffectValue {
-    Num(f64),
-    Vec2([f64; 2]),
-    Vec3([f64; 3]),
-    Color(Color),
-    Bool(bool),
-    Choice(String),
-    Text(String),
-    Points(Vec<[f64; 2]>),
-}
+pub use makepad_motion_plain::frame::{EffectFrame, EffectValue};
 
 /// A Scene3D's camera at this moment.
 #[derive(Clone, Debug, PartialEq)]
@@ -219,42 +83,8 @@ pub struct ImageMesh {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ItemKind {
-    Rect { size: [f64; 2], radius: f64, fill: Option<Color>, stroke: Option<Color>, width: f64, trim: [f64; 2], cap: Cap },
-    Ellipse { size: [f64; 2], fill: Option<Color>, stroke: Option<Color>, width: f64, trim: [f64; 2], cap: Cap },
-    /// Absolute path geometry. `trim` is the drawn part of the stroke's length, 0..1.
-    Path { path: Arc<makepad_svg::VectorPath>, fill: Option<Color>, stroke: Option<Color>, width: f64, trim: [f64; 2], cap: Cap, join: Join },
+    Primitive(PrimitiveFrame),
     Svg { src: Media, size: Option<[f64; 2]> },
-    /// `units` cover the text in order; a unit's `offset`, `scale`,
-    /// `rotate`, `opacity` and `color` are its own on top of the item's.
-    Text {
-        text: String,
-        font: String,
-        weight: f64,
-        /// Variable-font axis values the font is read at, stepped
-        /// (`eval::axis_step`), by tag.
-        axes: Vec<(String, f64)>,
-        italic: bool,
-        size: f64,
-        align: Align,
-        valign: VAlign,
-        line_height: f64,
-        tracking: f64,
-        wrap: Option<f64>,
-        /// See `LayerKind::Text::fit`.
-        fit: Option<f64>,
-        /// Text on a path: its geometry and where along it (0..1) the text starts.
-        path: Option<(Arc<makepad_svg::VectorPath>, f64)>,
-        by: TextBy,
-        units: Vec<TextUnit>,
-        plate: Option<PlateFrame>,
-        /// Characters shown (a typewriter); `None`: all.
-        reveal: Option<usize>,
-        /// The caret after the last shown character: opacity and colour.
-        caret: Option<(f64, Color, bool)>,
-        /// `stroke`: the letters' outlines, colour and width (document
-        /// units).
-        outline: Option<(Color, f64)>,
-    },
     Image { src: Media, size: Option<[f64; 2]>, fit: Fit, zoom: f64, focus: Option<[f64; 2]>, mesh: Option<Arc<ImageMesh>> },
     Video { src: Media, size: Option<[f64; 2]>, fit: Fit, source_time: f64 },
     Group { children: Vec<Item>, mask: Option<Box<Item>>, mask_mode: MaskMode, size: Option<[f64; 2]> },
@@ -301,7 +131,7 @@ pub enum ItemKind {
 }
 
 /// One visible layer at one moment.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Item {
     /// The layer's path in the document (`layers[2].layers[0]`).
     pub path: String,
@@ -326,6 +156,29 @@ pub struct Item {
     pub kind: ItemKind,
 }
 
+// The frame hash uses the original variant names, including in nested groups.
+impl std::fmt::Debug for Item {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind: &dyn std::fmt::Debug = match &self.kind {
+            ItemKind::Primitive(shape) => shape,
+            other => other,
+        };
+        f.debug_struct("Item")
+            .field("path", &self.path)
+            .field("world", &self.world)
+            .field("local", &self.local)
+            .field("opacity", &self.opacity)
+            .field("blur", &self.blur)
+            .field("feather", &self.feather)
+            .field("feather_side", &self.feather_side)
+            .field("effects", &self.effects)
+            .field("blend", &self.blend)
+            .field("is_static", &self.is_static)
+            .field("kind", kind)
+            .finish()
+    }
+}
+
 impl Item {
     /// The full map from the layer's own coordinates (its box from (0, 0))
     /// to document units, given the box's size.
@@ -336,11 +189,11 @@ impl Item {
     /// The layer's box size when it is known without drawing.
     pub fn box_size(&self) -> Option<[f64; 2]> {
         match &self.kind {
-            ItemKind::Rect { size, .. } | ItemKind::Ellipse { size, .. } => Some(*size),
+            ItemKind::Primitive(PrimitiveFrame::Rect { size, .. }) | ItemKind::Primitive(PrimitiveFrame::Ellipse { size, .. }) => Some(*size),
             ItemKind::Svg { size, .. } | ItemKind::Image { size, .. } | ItemKind::Video { size, .. } => *size,
             ItemKind::Group { size, .. } => Some(size.unwrap_or([0.0, 0.0])),
             ItemKind::Shader { size, .. } | ItemKind::Scene3D { size, .. } | ItemKind::Widget { size, .. } | ItemKind::Draw2d { size, .. } | ItemKind::Scene3dDoc { size, .. } | ItemKind::Vector { size, .. } => Some(*size),
-            ItemKind::Path { .. } | ItemKind::Text { .. } | ItemKind::Fly { .. } | ItemKind::Anchored { .. } => None,
+            ItemKind::Primitive(PrimitiveFrame::Path { .. }) | ItemKind::Primitive(PrimitiveFrame::Text { .. }) | ItemKind::Fly { .. } | ItemKind::Anchored { .. } => None,
         }
     }
 }
@@ -377,15 +230,7 @@ impl MotionFrame {
     /// A stable hash of everything the frame draws: equal frames hash equal
     /// across runs and builds (a 64-bit FNV-1a of a canonical rendering).
     pub fn hash(&self) -> u64 {
-        let text = format!("{:?}|{:?}|{:?}", self.size, self.background, self.items);
-        // Text without an outline hashes as it did before texts had one.
-        let text = text.replace(", outline: None }", " }");
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for byte in text.bytes() {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        hash
+        makepad_motion_plain::frame::picture_hash(self.size, self.background, &self.items)
     }
 
     /// Every item, depth first, with its depth: the frame's, then its data
@@ -424,14 +269,19 @@ impl MotionFrame {
     /// can be reused.
     pub fn static_key(&self) -> u64 {
         let n = self.static_prefix();
-        let text = format!("{:?}|{:?}|{:?}", self.size, self.background, &self.items[..n]);
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for byte in text.bytes() {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        hash
+        static_prefix_key(self.size, self.background, &self.items[..n])
     }
+}
+
+/// Cache identity of a document's static bottom layers.
+pub fn static_prefix_key(size: [f64; 2], background: Option<Color>, items: &[impl std::fmt::Debug]) -> u64 {
+    let text = format!("{:?}|{:?}|{:?}", size, background, items);
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 #[cfg(test)]

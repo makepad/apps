@@ -632,6 +632,7 @@ impl Widget for BomPane {
                             let mut info = Vec::new();
                             if let Some(why) = &row.read_only { info.push(why.clone()); }
                             info.extend(row.checks.iter().map(|c| (*c).to_string()));
+                            if row.approved { info.push("approved".into()); }
                             let inherited = row.inherited.iter().filter(|k| EDITABLE.iter().any(|(key, _)| k.eq_ignore_ascii_case(key))).cloned().collect::<Vec<_>>();
                             if !inherited.is_empty() { info.push(format!("Library: {}", inherited.join(", "))); }
                             let detail = info.join(" · ");
@@ -671,6 +672,7 @@ mod tests {
         sheet.rows[first].cells[4..8].clone_from_slice(&["MPN-42".into(), String::new(), "P-7".into(), String::new()]);
         let sheet = Arc::new(sheet);
         let mut live = ElecLive::new(Arc::new(DesignSnapshot {
+            proposals: Default::default(),
             profiles: Arc::default(), profile_diags: Arc::default(),
             design: design.clone(), preview: None, preview_tag: None, preview_by: None, created: vec![],
             last_commit: None, sheets: vec![], proposal: None, job: None, conn: vec![], rules: vec![], fills: vec![],

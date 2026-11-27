@@ -31,8 +31,9 @@ canon_struct!(Violation { id, unit, kind, severity, at, items, actual, required,
 pub enum Measure {
     Len(Nm),
     Qty(Quantity),
+    VRange(fab_elec_parts::VRange),
 }
-canon_enum!(Measure { 0 => Len(v), 1 => Qty(q) });
+canon_enum!(Measure { 0 => Len(v), 1 => Qty(q), 2 => VRange(r) });
 
 /// What kind of finding.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -47,6 +48,7 @@ pub enum CheckKind {
     MissingFootprint,
     VoltageDomain,
     RailBudget,
+    OpenPort,
     // DRC (E1 4.3)
     Clearance,
     EdgeClearance,
@@ -98,6 +100,7 @@ pub enum CheckKind {
 impl Canon for CheckKind {
     fn canon(&self, w: &mut Writer) {
         match self {
+            CheckKind::OpenPort => w.tag(254),
             CheckKind::Custom(s) => {
                 w.tag(255);
                 s.canon(w)

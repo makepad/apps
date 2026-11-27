@@ -13,6 +13,9 @@ pub trait TextPack: Send + Sync {
     fn script_mod(&self, vm: &mut ScriptVm);
     /// Whether the pack has a kit of this preset name.
     fn has_kit(&self, name: &str) -> bool;
+    /// The preset names of the pack's kits, in the pack's order: what a
+    /// KineticText's `preset:` can name.
+    fn kits(&self) -> Vec<&'static str>;
     /// Dials a kit takes at most (p1..pN).
     fn max_dials(&self) -> usize;
     /// A view of the kit `name`; a name with no kit gives a view that
@@ -61,6 +64,11 @@ pub trait TextView {
 /// The installed pack with a kit of this name.
 pub fn pack_of(name: &str) -> Option<Arc<dyn TextPack>> {
     crate::text_packs().into_iter().find(|pack| pack.has_kit(name))
+}
+
+/// The preset names of every installed pack's kits, pack by pack.
+pub fn kits() -> Vec<&'static str> {
+    crate::text_packs().iter().flat_map(|pack| pack.kits()).collect()
 }
 
 /// What a host says when a KineticText needs a text pack it did not install.

@@ -194,6 +194,7 @@ pub struct Motion {
     #[live] pub tags: Field<kind::Any>,
     #[live] pub size: Field<kind::Vec2>,
     #[live] pub duration: Field<kind::Num>,
+    #[live] pub stops: Field<kind::Any>,
     #[live] pub fps: Field<kind::Num>,
     #[live] pub bpm: Field<kind::Num>,
     #[live] pub background: Field<kind::Color>,

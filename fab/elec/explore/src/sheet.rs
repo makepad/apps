@@ -26,9 +26,17 @@ use std::ops::ControlFlow;
 /// A box: min x, min y, max x, max y.
 pub type Bx = [i32; 4];
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SheetMode {
+    #[default]
+    Schematic,
+    Blocks,
+}
+
 /// Spacing, grid steps.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Opts {
+    pub mode: SheetMode,
     /// The smallest gap between two layers' boxes.
     pub layer_gap: i32,
     /// Free space above and below each anchor.
@@ -46,7 +54,7 @@ pub struct Opts {
 
 impl Default for Opts {
     fn default() -> Self {
-        Self { layer_gap: 5, margin: 1, pad: 2, title: 2, array_gap: 2, aspect: 1.5 }
+        Self { mode: SheetMode::Schematic, layer_gap: 5, margin: 1, pad: 2, title: 2, array_gap: 2, aspect: 1.5 }
     }
 }
 
@@ -79,11 +87,16 @@ pub struct FramePort {
     pub at: Pt,
     pub side: Side,
     pub bus: bool,
+    pub kind: PortKind,
+    pub ground: bool,
+    pub open: bool,
 }
 
 /// A block's frame. The root's frame is the whole sheet.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Frame {
+    pub planned: bool,
+    pub role: Option<String>,
     pub rect: Bx,
     /// The block's arrange origin in world coordinates, before frame padding and the title.
     pub origin: Pt,
@@ -1461,6 +1474,222 @@ impl<'a> Ctx<'a> {
 // ---------------------------------------------------------------------------------------------
 // One block.
 
+/// An opaque frame is shared by the architecture sheet and an unbuilt block on a schematic.
+fn block_box(g: &LayoutGraph, b: u32, bundles: Option<&[bool]>) -> Piece {
+    let block = &g.blocks[b as usize];
+    let mut lines = vec![block.path.clone()];
+    if let Some(title) = &block.title { lines.push(title.clone()); }
+    if block.planned { lines.push("planned".into()); }
+    if let Some(role) = &block.role { lines.push(role.clone()); }
+    let band = 2 * lines.len() as i32;
+    let mut width = lines.iter().map(|t| text_w(t, TEXT_TITLE).ceil() as i32 + 2).max().unwrap_or(2);
+    let mut edges: [Vec<_>; 3] = Default::default();
+    for p in &block.ports {
+        let edge = if p.ground { 2 } else if matches!(p.kind, PortKind::PowerOut | PortKind::Out | PortKind::Bidi) { 1 } else { 0 };
+        let bus = p.nets.first().and_then(|&n| g.nets[n as usize].bus)
+            .filter(|&bus| p.nets.len() > 1 && g.buses[bus as usize].nets == p.nets
+                && bundles.is_none_or(|bundle| bundle[bus as usize]));
+        if bus.is_none() && p.nets.len() > 1 {
+            for (bit, &n) in p.nets.iter().enumerate() {
+                edges[edge].push((p, format!("{}[{bit}]", p.name), Some(n)));
+            }
+        } else {
+            edges[edge].push((p, p.name.clone(), bus.map(|id| BUS + id).or_else(|| p.nets.first().copied())));
+        }
+    }
+    for edge in &mut edges[..2] {
+        edge.sort_by_key(|(p, _, _)| !matches!(p.kind, PortKind::PowerIn | PortKind::PowerOut));
+    }
+    let name_width = |name: &str| text_w(name, TEXT_NET).ceil() as i32 + 2;
+    let side_width: i32 = edges[..2].iter().map(|ps| ps.iter().map(|(_, name, _)| name_width(name)).max().unwrap_or(0)).sum();
+    width = width.max(side_width + 2).max(edges[2].iter().map(|(_, name, _)| name_width(name)).sum());
+    let height = band + 2 * edges[0].len().max(edges[1].len()) as i32 + 3;
+    let rect = [0, -height, width, 0];
+    let mut pc = Piece { bx: rect, ..Piece::default() };
+    let mut frame = Frame { rect, title: band, planned: block.planned, role: block.role.clone(), placed: true, ..Frame::default() };
+    let label = |pc: &mut Piece, text: &str, role, x: f64, top: f64, h: f64| {
+        pc.labels.push(Label { owner: Owner::Block(b), lines: vec![(text.into(), role)],
+            bx: [x, top - h, x + text_w(text, h), top], leader: None });
+    };
+    for (i, text) in lines.iter().enumerate() {
+        label(&mut pc, text, TextRole::Title, 1.0, -0.3 - 2.0 * i as f64, TEXT_TITLE);
+    }
+    let mut ground_x = 0;
+    for (edge, ports) in edges.iter().enumerate() {
+        for (i, (p, name, net)) in ports.iter().enumerate() {
+            let y = -band - 1 - 2 * i as i32;
+            let (side, at, x, top) = match edge {
+                0 => (Side::Left, [0, y], 1.0, f64::from(y) + 0.4),
+                1 => (Side::Right, [width, y], f64::from(width - 1) - text_w(name, TEXT_NET), f64::from(y) + 0.4),
+                _ => {
+                    let w = name_width(name);
+                    ground_x += w;
+                    (Side::Bottom, [ground_x - w / 2, -height], f64::from(ground_x - w + 1), f64::from(2 - height))
+                }
+            };
+            frame.ports.push(FramePort { name: name.clone(), at, side, kind: p.kind, ground: p.ground, open: p.open, bus: p.nets.len() > 1 });
+            label(&mut pc, name, TextRole::Net, x, top, TEXT_NET);
+            if let Some(net) = *net {
+                if net >= BUS {
+                    pc.ports.push(PPort { at, side, net, kind: p.kind });
+                    continue;
+                }
+                let n = &g.nets[net as usize];
+                if p.ground || n.kind == NetKind::Ground || bundles.is_none() && n.kind == NetKind::Power {
+                    let dir = side_dir(side);
+                    let end = add(at, dir);
+                    pc.wire(net, vec![at, end]);
+                    pc.tag(if p.ground || n.kind == NetKind::Ground { TagKind::Ground } else { TagKind::Power }, Some(net), end, dir, n.name.clone());
+                } else {
+                    pc.ports.push(PPort { at, side, net, kind: p.kind });
+                }
+            }
+        }
+    }
+    pc.frames.push((b, frame));
+    pc
+}
+
+fn rail_label(net: &crate::graph::GNet) -> String {
+    let mut parts = vec![net.name.clone()];
+    let Some(r) = &net.rail else { return net.name.clone() };
+    let number = |v: f64| format!("{v:.6}").trim_end_matches('0').trim_end_matches('.').to_owned();
+    let amps = |v: f64| if v == 0.0 { "0mA".into() } else if v.abs() < 0.001 { format!("{}uA", number(v * 1e6)) }
+        else if v.abs() < 1.0 { format!("{}mA", number(v * 1e3)) } else { format!("{}A", number(v)) };
+    if r.volts_conflict { parts.push("voltage conflict".into()); }
+    else if let Some((lo, hi)) = r.volts {
+        parts.push(if lo == hi { format!("{}V", number(lo)) } else { format!("{}–{}V", number(lo), number(hi)) });
+    }
+    if r.source_conflict { parts.push("multiple sources".into()); }
+    else if let Some(cap) = r.budget { parts.push(format!("{}/{}", amps(r.demand), amps(cap))); }
+    else if r.has_demand { parts.push(amps(r.demand)); }
+    parts.join(" · ")
+}
+
+/// Direct children are single placement nodes. Index terminals by net and channel once.
+/// A net spanning several channels crosses above the frames on its own row.
+fn blocks_layout(g: &LayoutGraph, o: &Opts) -> SheetLayout {
+    use std::collections::BTreeMap;
+    let mut sheet = SheetLayout {
+        parts: vec![PartPlace::default(); g.nodes.len()],
+        frames: vec![Frame::default(); g.blocks.len()],
+        movers: vec![Mover::Itself; g.nodes.len()],
+        block_movable: vec![false; g.blocks.len()],
+        ..Default::default()
+    };
+    let mut boxes = Vec::new();
+    let mut graph = LGraph::default();
+    let mut nets: BTreeMap<u32, Vec<(u32, u32)>> = BTreeMap::new();
+    let children = || g.blocks.iter().filter(|b| b.parent == Some(0));
+    // Carry a bus as one wire only when every visible terminal binds the whole bus.
+    let mut bundles = vec![true; g.buses.len()];
+    for p in children().flat_map(|b| &b.ports) {
+        let whole = p.nets.first().and_then(|&net| g.nets[net as usize].bus)
+            .filter(|&bus| g.buses[bus as usize].nets == p.nets);
+        if whole.is_none() {
+            for &n in &p.nets {
+                if let Some(bus) = g.nets[n as usize].bus { bundles[bus as usize] = false; }
+            }
+        }
+    }
+    for block in children() {
+        let piece = block_box(g, block.key, Some(&bundles));
+        let b = piece.bx;
+        let node = boxes.len() as u32;
+        let ports = piece.ports.iter().enumerate().map(|(i, p)| {
+            nets.entry(p.net).or_default().push((node, i as u32));
+            LPort { side: p.side, offset: b[3] - p.at[1] }
+        }).collect();
+        graph.nodes.push(LNode { size: [b[2] - b[0], b[3] - b[1] + o.margin], ports, order: block.order, layer: None, at: None });
+        boxes.push(piece);
+    }
+    if boxes.is_empty() { return sheet; }
+    for ts in nets.values() {
+        let side = |&(n, p): &(u32, u32)| boxes[n as usize].ports[p as usize].side;
+        let east = ts.iter().find(|p| side(p) == Side::Right);
+        let west = ts.iter().find(|p| side(p) == Side::Left);
+        if let (Some(&e), Some(&w)) = (east, west) {
+            for &t in ts {
+                let (from, to) = if side(&t) == Side::Right { (t, w) } else if t != w { (e, t) } else { continue };
+                if from.0 != to.0 { graph.edges.push(LEdge { from, to, weight: 1, drawn: true }); }
+            }
+        } else if ts.len() > 1 { graph.turns.push(ts.clone()); }
+    }
+    let placed = layered::place(&graph, &LOpts { layer_gap: o.layer_gap, node_gap: o.margin + 1, per_edge: 1 });
+    for (piece, at) in boxes.iter_mut().zip(&placed.pos) {
+        piece.shift([at[0] - piece.bx[0], -at[1] - piece.bx[3]]);
+    }
+    let cols = &placed.columns;
+    let channels: Vec<_> = (0..=cols.len()).map(|c| {
+        let x0 = if c == 0 { cols[0][0] - o.layer_gap } else { cols[c-1][0] + cols[c-1][1] };
+        Channel { x0, x1: cols.get(c).map_or(x0 + o.layer_gap, |col| col[0]) }
+    }).collect();
+    let mut root = Piece::new();
+    let mut top = boxes.iter().map(|p| p.bx[3]).max().unwrap_or(0);
+    let mut groups = Vec::new();
+    for (net, ts) in nets {
+        let mut by_channel: BTreeMap<u32, Vec<Term>> = BTreeMap::new();
+        for (n, p) in ts {
+            let port = boxes[n as usize].ports[p as usize];
+            let east = port.side == Side::Right;
+            by_channel.entry(placed.layer[n as usize] + u32::from(east)).or_default().push(Term { at: port.at, face: if east { Face::East } else { Face::West } });
+        }
+        if by_channel.len() > 1 {
+            top += 2;
+            let mut previous = None;
+            for (&c, terms) in &mut by_channel {
+                let x = channels[c as usize].x0 + 1;
+                let at = [x, top];
+                terms.push(Term { at, face: Face::East });
+                if let Some(last) = previous { root.wire(net, vec![last, at]); }
+                previous = Some(at);
+            }
+        }
+        groups.extend(by_channel.into_iter().map(|(channel, terms)| Group { net, channel, terms, weight: 1 }));
+    }
+    let routed = channels::route(&channels, &groups, &ROpts::default());
+    for w in routed.wires { root.wire(w.net, w.pts); }
+    root.junctions = routed.junctions.into_iter().filter(|(n, _)| *n < BUS).collect();
+    for piece in boxes { root.absorb(piece); }
+
+    let mut anchors = BTreeMap::new();
+    let mut obstacles: Vec<_> = root.frames.iter().map(|(_, f)| Obstacle::Box { b: f.rect.map(f64::from), owner: u32::MAX }).collect();
+    for wire in &root.wires {
+        for seg in wire.pts.windows(2) {
+            let [a, b] = [seg[0], seg[1]];
+            obstacles.push(Obstacle::Seg { a: a.map(f64::from), b: b.map(f64::from), half: 0.05, owner: wire.net });
+            if g.nets[wire.net as usize].kind != NetKind::Ground {
+                let length = (a[0]-b[0]).abs() + (a[1]-b[1]).abs();
+                let anchor = anchors.entry(wire.net).or_insert((0, a));
+                if length > anchor.0 { *anchor = (length, [(a[0]+b[0])/2, (a[1]+b[1])/2]); }
+            }
+        }
+    }
+    let mut requests = Vec::new();
+    let mut names = Vec::new();
+    for (net, (_, [x,y])) in anchors {
+        let text = rail_label(&g.nets[net as usize]);
+        requests.push(LabelReq { anchor: [x,y,x,y].map(f64::from), size: [text_w(&text, TEXT_NET), TEXT_NET],
+            spots: vec![Spot::Above, Spot::Below], priority: 0, owner: net, optional: false });
+        names.push((net, text));
+    }
+    let labels = labels::place_labels(&requests, &obstacles, &LabelOpts::default());
+    for (i,(net,text)) in names.into_iter().enumerate() {
+        let bx = labels.boxes[i];
+        root.bx = bx_union(root.bx, [bx[0].floor() as i32, bx[1].floor() as i32, bx[2].ceil() as i32, bx[3].ceil() as i32]);
+        root.labels.push(Label { owner: Owner::Net(net), lines: vec![(text, TextRole::Net)], bx, leader: labels.leader[i] });
+    }
+    sheet.bounds = root.bx;
+    sheet.frames[0] = Frame { placed: true, rect: root.bx, ..Frame::default() };
+    for (b,f) in root.frames { sheet.frames[b as usize] = f; }
+    sheet.labels = root.labels;
+    sheet.wires = root.wires;
+    sheet.buses = root.buses;
+    sheet.junctions = root.junctions;
+    sheet.tags = root.tags;
+    sheet
+}
+
 /// An item to place in a block: a piece and where it came from.
 struct Item {
     piece: Piece,
@@ -1504,6 +1733,9 @@ impl<'a> Ctx<'a> {
         let g = self.g;
         let o = self.o;
         let blk = &g.blocks[b as usize];
+        if b != 0 && blk.planned && self.children[b as usize].is_empty() && self.parts_of[b as usize].is_empty() {
+            return block_box(g, b, None);
+        }
         let mut items: Vec<Item> = Vec::new();
         // Child blocks, arrays of like siblings first gathered into one item.
         for members in self.kid_items(b) {
@@ -1647,7 +1879,7 @@ impl<'a> Ctx<'a> {
         // that fits the content's width, else the segment over the title. The frame widens, and
         // its band deepens, only as far as the text needs. Sized before the ports, which sit on
         // the final edges.
-        let title = {
+        let mut title = {
             let parent = blk.parent.filter(|&p| p != 0).map(|p| g.blocks[p as usize].path.as_str());
             let own = parent.and_then(|p| blk.path.strip_prefix(p)?.strip_prefix('.')).filter(|s| !s.is_empty())
                 .unwrap_or(&blk.path);
@@ -1660,6 +1892,8 @@ impl<'a> Ctx<'a> {
                 _ => vec![one],
             }
         };
+        if blk.planned { title.push("planned".into()); }
+        if let Some(role) = &blk.role { title.push(role.clone()); }
         let title_w = title.iter().map(|t| text_w(t, TEXT_TITLE)).fold(0.0, f64::max);
         let title_h = TEXT_TITLE * title.len() as f64 + LINE_GAP * TEXT_TITLE * (title.len() - 1) as f64;
         let band = o.title + (title_h - TEXT_TITLE).ceil() as i32;
@@ -1694,7 +1928,7 @@ impl<'a> Ctx<'a> {
             let low = ends.iter().map(|p| p.1[1]).min().unwrap_or(0) - 2;
             rect[2] = rect[2].max(x + o.pad);
             pc.wire(BUS + bus, vec![[x, low], [rect[2], low]]);
-            ports.push((FramePort { name: name.clone(), at: [rect[2], low], side: Side::Right, bus: true }, BUS + bus, PortKind::Bidi));
+            ports.push((FramePort { name: name.clone(), at: [rect[2], low], side: Side::Right, bus: true, kind: PortKind::Bidi, ground: false, open: false }, BUS + bus, PortKind::Bidi));
         }
         // Left and right port items: a wire from the item to the frame edge.
         let items_ports: Vec<PPort> = pc.ports.clone();
@@ -1706,7 +1940,7 @@ impl<'a> Ctx<'a> {
             let (edge, side) = if p.side == Side::Right { (rect[0], Side::Left) } else { (rect[2], Side::Right) };
             pc.wire(p.net, vec![[edge, p.at[1]], p.at]);
             let name = blk.ports.iter().find(|bp| bp.nets.contains(&p.net)).map(|bp| bp.name.clone()).unwrap_or_default();
-            ports.push((FramePort { name, at: [edge, p.at[1]], side, bus: false }, p.net, p.kind));
+            ports.push((FramePort { name, at: [edge, p.at[1]], side, bus: false, kind: p.kind, ground: false, open: false }, p.net, p.kind));
         }
         for (name, n, side) in drops.iter().filter(|(_, n, _)| !inside.contains(n)) {
             if let Some(t) = own_drop(&pc.tags, *n) {
@@ -1727,7 +1961,7 @@ impl<'a> Ctx<'a> {
                         at[0]
                     }
                 };
-                ports.push((FramePort { name: name.clone(), at: [x, edge], side: *side, bus: false }, *n, PortKind::Bidi));
+                ports.push((FramePort { name: name.clone(), at: [x, edge], side: *side, bus: false, kind: PortKind::Bidi, ground: false, open: false }, *n, PortKind::Bidi));
             }
         }
         pc.labels.push(Label {
@@ -1738,8 +1972,16 @@ impl<'a> Ctx<'a> {
         });
         pc.bx = rect;
         pc.ports = ports.iter().map(|(fp, net, kind)| PPort { at: fp.at, side: fp.side, net: *net, kind: *kind }).collect();
-        let ports = ports.into_iter().map(|(fp, _, _)| fp).collect();
-        pc.frames.push((b, Frame { rect, origin: [0, 0], ports, placed: true, title: band }));
+        let declared: std::collections::HashMap<_, _> = blk.ports.iter().map(|p| (p.name.as_str(), p)).collect();
+        let ports = ports.into_iter().map(|(mut fp, _, _)| {
+            if let Some(p) = declared.get(fp.name.as_str()) {
+                fp.kind = p.kind;
+                fp.ground = p.ground;
+                fp.open = p.open;
+            }
+            fp
+        }).collect();
+        pc.frames.push((b, Frame { rect, origin: [0, 0], ports, placed: true, title: band, planned: blk.planned, role: blk.role.clone() }));
         pc
     }
 
@@ -2768,6 +3010,7 @@ impl<'a> Ctx<'a> {
 
 /// The sheet of a graph. Pure: the same graph and options give the same sheet.
 pub fn layout_graph(g: &LayoutGraph, o: &Opts) -> SheetLayout {
+    if o.mode == SheetMode::Blocks { return blocks_layout(g, o); }
     let ctx = Ctx::new(g, o);
     if g.nodes.iter().enumerate().any(|(n, node)| node.pin_at.is_some() && !ctx.can_pin(n as u32)) {
         eprintln!("fab.explore: position hint on a molecule member ignored; molecules are rigid");
@@ -2789,7 +3032,7 @@ pub fn layout_graph(g: &LayoutGraph, o: &Opts) -> SheetLayout {
         }
     }
     let rect = [root.bx[0] - o.pad, root.bx[1] - o.pad, root.bx[2] + o.pad, root.bx[3] + o.pad];
-    sheet.frames[0] = Frame { rect, origin: [0, 0], ports: Vec::new(), placed: true, title: 0 };
+    sheet.frames[0] = Frame { rect, origin: [0, 0], ports: Vec::new(), placed: true, ..Frame::default() };
     for (n, p) in root.parts {
         sheet.parts[n as usize] = p;
     }
@@ -3204,4 +3447,98 @@ pub fn overlaps(s: &SheetLayout) -> Vec<(String, String)> {
 
 pub fn overlap_count(s: &SheetLayout) -> usize {
     overlaps(s).len()
+}
+
+#[cfg(test)]
+mod architecture {
+    use super::*;
+    use fab_elec_lang::{evaluate, std_libs, Sources};
+
+    fn architecture(second: bool) -> LayoutGraph {
+        let mut src = Sources::new();
+        let mut text = r#"use mod.std.*
+let e = mod.elec
+let load = e.block({name: "Load" planned: true role: "Controller" ports: {
+    v: e.port(@power_in, {current: 900mA}) g: e.port(@ground) io: e.port(@in)}})
+let input = e.net({name: "5V" kind: @power volts: 5V})
+let output = e.net({name: "3V3" kind: @power volts: 3.3V})
+let gnd = e.net({name: "GND" kind: @ground})
+let reg = ldo({vin: input vout: output gnd: gnd})
+let ctl = load({v: output g: gnd})
+let data = e.bus("DATA", 2)
+let driver = e.block({name: "Sender" planned: true ports: {tx: e.port(@out, {width: 2})}})
+let sender = driver({tx: data})
+"#.to_owned();
+        if second {
+            text.push_str(r#"let other = ldo({vin: input vout: output gnd: gnd})
+let receiver = e.block({name: "Receiver" planned: true ports: {a: e.port(@in) b: e.port(@in)}})
+let sink = receiver({a: data[0] b: data[1]})
+"#);
+        } else {
+            text.push_str(r#"let receiver = e.block({name: "Receiver" planned: true ports: {rx: e.port(@in, {width: 2})}})
+let sink = receiver({rx: data})
+"#);
+        }
+        src.add("device.ckt.splash", text).unwrap();
+        let ev = evaluate(&src, &std_libs()).expect("the realized regulator and planned load must evaluate");
+        crate::adapt::graph_of(&ev.design.units[0].circuit, &Default::default())
+    }
+
+    #[test]
+    fn blocks_mode_lays_out_planned_frames_ports_and_rail_budgets_deterministically() {
+        let opts = Opts { mode: SheetMode::Blocks, ..Opts::default() };
+        for second in [false, true] {
+            let g = architecture(second);
+            let sheet = layout_graph(&g, &opts);
+            assert_eq!(sheet, layout_graph(&g, &opts), "identical architecture must lay out identically");
+            assert!(sheet.parts.iter().all(|p| !p.placed), "opaque blocks must hide their components");
+            let frames: Vec<_> = sheet.frames.iter().skip(1).filter(|f| f.placed).collect();
+            assert_eq!(frames.len(), if second { 5 } else { 4 }, "each direct child must have a frame");
+            for (i, f) in frames.iter().enumerate() {
+                let [l,b,r,t] = f.rect;
+                assert!(l < r && b < t, "every block must occupy a box");
+                assert!(frames[..i].iter().all(|other| !bx_hit(f.rect, other.rect)), "block frames must stay apart");
+                if f.ports.iter().any(|p| p.ground) {
+                    assert_eq!(f.ports.len(), 3, "the regulator and load must retain all power, signal and ground ports");
+                }
+                for p in &f.ports {
+                    assert!(match p.side { Side::Left => p.at[0] == l, Side::Right => p.at[0] == r, Side::Bottom => p.at[1] == b, Side::Top => p.at[1] == t },
+                        "{} must lie on its frame edge", p.name);
+                    assert!(!p.ground || p.side == Side::Bottom, "ground must leave by the bottom");
+                }
+            }
+            let label = if second { "3V3 · 3.3V · multiple sources" } else { "3V3 · 3.3V · 900mA/600mA" };
+            assert!(sheet.labels.iter().flat_map(|l| &l.lines).any(|(text, _)| text == label),
+                "the routed rail must show the same physical sources and budget as ERC: {label}");
+            let n = g.nets.iter().position(|n| n.name == "3V3").unwrap() as u32;
+            let data = g.buses.iter().find(|bus| bus.name == "DATA").expect("the signal bus must survive adaptation");
+            let terminal = |name: &str| frames.iter().flat_map(|f| &f.ports).find(|p| p.name == name).unwrap().at;
+            if second {
+                for (i, name) in ["a", "b"].iter().enumerate() {
+                    for at in [terminal(&format!("tx[{i}]")), terminal(name)] {
+                        assert!(sheet.wires.iter().any(|w| w.net == data.nets[i] && w.pts.contains(&at)),
+                            "a bus split at the receiver must connect bit {i} at both frames");
+                    }
+                }
+            } else {
+                for at in [terminal("tx"), terminal("rx")] {
+                    assert!(sheet.buses.iter().any(|w| w.pts.contains(&at)), "a whole bus must connect both frame ports");
+                }
+            }
+            for f in frames.into_iter().filter(|f| f.ports.iter().any(|p| p.ground)) {
+                let port = f.ports.iter().find(|p| p.name == "vout" || p.name == "v").unwrap();
+                assert!(sheet.wires.iter().any(|w| w.net == n && w.pts.contains(&port.at)), "the rail must touch each supply and load");
+            }
+        }
+    }
+
+    #[test]
+    fn schematic_mode_gives_planned_block_non_zero_frame() {
+        let g = architecture(false);
+        let sheet = layout_graph(&g, &Opts::default());
+        let frame = sheet.frames.iter().find(|f| f.planned).expect("the schematic must keep the planned load");
+        assert!(frame.placed && frame.rect[0] < frame.rect[2] && frame.rect[1] < frame.rect[3], "an unbuilt block must occupy a visible frame");
+        assert!(frame.ports.iter().any(|p| p.name == "io" && p.open), "an unbound signal port must stay on its frame");
+        assert!(sheet.parts.iter().any(|p| p.placed), "realized blocks must still show their components");
+    }
 }

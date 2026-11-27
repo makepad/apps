@@ -26,6 +26,9 @@ pub enum PlannerEdit {
 
 /// Ordered edits and control messages for the engine strand.
 pub enum Cmd {
+    Propose { slot: String, set: Vec<DocSet>, label: String, by: crate::ProposalAuthor, ticket: Ticket },
+    Decide { id: crate::ProposalId, shown: u64, accept: bool, ticket: Option<Ticket> },
+    CheckProposal { id: crate::ProposalId, ticket: Option<Ticket> },
     /// A view's identified planner press. The strand checks the proposed invocation against
     /// the actual edit (or the exact released sample) before linking the journal.
     Planner { call: fab_elec_view::snapshot::Invocation, edit: PlannerEdit, ticket: Ticket },
@@ -166,6 +169,13 @@ pub enum CircuitChange {
 
 /// The engine's answer to a ticketed command.
 pub enum Outcome {
+    Proposed {
+        id: crate::ProposalId,
+        shown: u64,
+        checks: Option<Arc<crate::ProposalChecks>>,
+        requirements: Option<Arc<fab_elec_view::snapshot::ReqSummary>>,
+    },
+    Declined { id: crate::ProposalId },
     /// The logged edit, its author and any newly created items or affected source sites (a
     /// text commit's sites are the ranges it wrote, in the text after it). `targets` are what
     /// its ops edit in place and keep (a value's part, a moved item): the cue's exact sites.

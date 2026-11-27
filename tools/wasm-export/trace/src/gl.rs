@@ -231,28 +231,26 @@ impl Gl {
         self.buffer_bytes += b.len() as u64;
         self.upload(2, m.buffer_id, &b);
     }
-    pub fn retained_buffer(&mut self, m: FromWasmRetainedArrayBuffer) {
-        let b = f32s(&m.data);
-        self.buffer_bytes += b.len() as u64;
-        self.hash.u64(m.first_slot as u64);
-        self.upload(3, m.buffer_id, &b);
-    }
-    pub fn retained_update(&mut self, m: FromWasmRetainedArrayUpdate) {
-        self.hash.u64(4);
-        self.hash.u64(m.buffer_id as u64);
-        self.hash.u64(m.slot_count as u64);
+    /// An instance slab's backing: its identity and capacity (nothing is uploaded yet).
+    pub fn create_slab(&mut self, m: FromWasmCreateInstanceSlab) {
+        self.hash.u64(3);
+        self.hash.u64(m.slab_slot as u64);
+        self.hash.u64(m.backing_generation as u64);
         self.hash.u64(m.capacity_bytes as u64);
-        self.hash.u64(m.replace as u64);
-        for c in &m.copies {
-            self.hash.u64(c.source_slot as u64);
-            self.hash.u64(c.destination_slot as u64);
-            self.hash.u64(c.slot_count as u64);
+    }
+    /// One region's instance rows: its place in the slab, and the bytes of its parts in order.
+    pub fn write_region(&mut self, m: FromWasmWriteInstanceRegion) {
+        self.hash.u64(4);
+        for v in [m.backing_generation, m.region.index, m.region.gen] {
+            self.hash.u64(v as u64);
         }
-        for w in &m.writes {
-            let b = f32s(&w.data);
-            self.buffer_bytes += b.len() as u64;
-            self.upload(5, w.destination_slot, &b);
+        self.hash.u64(m.byte_off as u64);
+        let mut b = Vec::with_capacity(m.byte_len);
+        for part in &m.parts {
+            b.extend(u8s(part));
         }
+        self.buffer_bytes += b.len() as u64;
+        self.upload(5, m.slab_slot as usize, &b);
     }
     pub fn index_buffer(&mut self, m: FromWasmAllocIndexBuffer) {
         let mut b = u32s(&m.data);
@@ -263,7 +261,13 @@ impl Gl {
     }
     pub fn vao(&mut self, m: FromWasmAllocVao) {
         self.hash.u64(7);
-        for v in [m.vao_id, m.shader_id, m.geom_ib_id, m.geom_vb_id, m.inst_vb_id] {
+        for v in [m.vao_id, m.shader_id, m.geom_ib_id, m.geom_vb_id] {
+            self.hash.u64(v as u64);
+        }
+        for v in [m.slab_slot, m.backing_generation, m.region.index, m.region.gen] {
+            self.hash.u64(v as u64);
+        }
+        for v in [m.byte_off, m.byte_len, m.instance_byte_offset] {
             self.hash.u64(v as u64);
         }
     }
@@ -277,6 +281,11 @@ impl Gl {
             for v in l {
                 self.hash.u64(*v as u64);
             }
+        }
+        self.hash.u64(m.instance_slabs.len() as u64);
+        for slab in &m.instance_slabs {
+            self.hash.u64(slab.slab_slot as u64);
+            self.hash.u64(slab.backing_generation as u64);
         }
     }
     pub fn texture(&mut self, kind: u64, id: usize, w: usize, h: usize, bytes: Vec<u8>) {

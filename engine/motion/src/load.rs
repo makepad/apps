@@ -6,11 +6,12 @@
 //! what it got and what it takes, and where a name is misspelt, suggests
 //! the nearest ones.
 
+use crate::plain::{GroupProps, PathProps, RepeatProps, TextProps};
 use crate::Ease;
 use crate::model::*;
 use crate::timing::{parse_time_fields, Length, TimeArg, TimeExpr, TimeValue};
 use crate::obj::{self, Look};
-use crate::value::{evaluate, fmt_num, truncate, SourceMap};
+use crate::value::{evaluate, fmt_num, SourceMap};
 use makepad_script::*;
 use std::sync::Arc;
 
@@ -362,7 +363,7 @@ fn bind_text_path(layers: &mut [Layer], text: &str, name: &str, series: Option<&
             let o = offset(layer);
             let here = [base[0] + o[0], base[1] + o[1]];
             let named = layer.name.as_deref() == Some(name);
-            if let LayerKind::Path { data: PathShape::Static(data), .. } = &layer.kind {
+            if let LayerKind::Path(PathProps { data: PathShape::Static(data), .. }) = &layer.kind {
                 let is_series = layer.name.as_deref().is_some_and(|n| match series {
                     Some(s) => n == format!("line {s}"),
                     None => n.starts_with("line "),
@@ -547,21 +548,24 @@ fn compile(source: DocSource, params: &[(LiveId, InputValue)], context: Arc<Moti
         brief: String::new(),
         tags: Vec::new(),
         camera: None,
-        size: [1920.0, 1080.0],
-        duration: 1.0,
-        fps: 60.0,
-        bpm: 120.0,
-        background: None,
+        plain: crate::LoadedLayers {
+            size: [1920.0, 1080.0],
+            duration: 1.0,
+            fps: 60.0,
+            bpm: 120.0,
+            background: None,
+            stops: Vec::new(),
+            inputs: Vec::new(),
+            input_values: Vec::new(),
+            layers: Vec::new(),
+            context,
+        },
         hdr: false,
         post: Vec::new(),
         motion_blur: None,
-        inputs: Vec::new(),
-        input_values: Vec::new(),
         structural: Vec::new(),
         own: Arc::new(Vec::new()),
-        layers: Vec::new(),
         warnings: Vec::new(),
-        context,
         has_functions: false,
         _literals: literals,
         run: Arc::new(crate::value::Run::new(vm.clone(), root, Vec::new(), Vec::new(), Vec::new())),
@@ -1408,7 +1412,7 @@ impl<'a, 'v> Reader<'a, 'v> {
     fn track<const N: usize>(&mut self, at: &At, field: &str, value: &Look) -> Option<Track<N>> {
         let obj = value.obj()?;
         let kind = value.anim().unwrap_or("").to_string();
-        let track = match kind.as_str() {
+        let (keys, repeat, before, after) = match kind.as_str() {
             "Tween" => {
                 let get = |name: &str| self.get(obj, name).unwrap_or(Look::Nil);
                 let (from_v, to_v, start, end, ease_v) = (get("from"), get("to"), get("start"), get("end"), get("ease"));
@@ -1427,7 +1431,8 @@ impl<'a, 'v> Reader<'a, 'v> {
                     }
                 }
                 let ease = self.ease(at, field, &ease_v);
-                Track { keys: vec![Key { t: start, v: from, ease: Ease::Linear, bez: None }, Key { t: end, v: to, ease, bez: None }], repeat: None, before: Extrap::Constant, after: Extrap::Constant }
+                let keys = vec![Key { t: start, v: from, ease: Ease::Linear, bez: None }, Key { t: end, v: to, ease, bez: None }];
+                (keys, None, Extrap::Constant, Extrap::Constant)
             }
             "Keys" => {
                 let Some(Look::Arr(mut points)) = self.get(obj, "points") else { return None };
@@ -1469,7 +1474,7 @@ impl<'a, 'v> Reader<'a, 'v> {
                     };
                     keys.push(Key { t, v, ease, bez });
                 }
-                Track { keys, repeat: None, before, after }
+                (keys, None, before, after)
             }
             "Sequence" => {
                 let Some(Look::Arr(steps)) = self.get(obj, "steps") else {
@@ -1506,20 +1511,23 @@ impl<'a, 'v> Reader<'a, 'v> {
                     }
                     elapsed += dur;
                     let ease = parts.get(2).map_or(Ease::Linear, |ease| self.ease(at, field, ease));
-                    // Keys hold the offset from the sequence's start; the
-                    // start (possibly a musical time) is added on resolve.
-                    let t = Time { expr: offset_expr(&start.expr, elapsed), value: 0.0 };
+                    // A sequence starting at a musical reference keeps that
+                    // reference and each step's offset until time resolution.
+                    let t = match offset_expr(&start.expr, elapsed) {
+                        TimeExpr::Seconds(s) => Time::seconds(s),
+                        expr => Time { expr, value: 0.0 },
+                    };
                     keys.push(Key { t, v, ease, bez: None });
                 }
                 if keys.is_empty() {
                     self.err(at, field, format!("`sequence()` has no steps"), None);
                     return None;
                 }
-                Track { keys, repeat: None, before: Extrap::Constant, after: Extrap::Constant }
+                (keys, None, Extrap::Constant, Extrap::Constant)
             }
             "Loop" => {
                 let inner = self.get(obj, "inner").unwrap_or(Look::Nil);
-                let mut track = self.track::<N>(at, field, &inner).or_else(|| {
+                let track = self.track::<N>(at, field, &inner).or_else(|| {
                     self.err(at, field, format!("`repeat(anim, …)` repeats a tween, keys or sequence, not {}", inner.kind()), None);
                     None
                 })?;
@@ -1548,8 +1556,7 @@ impl<'a, 'v> Reader<'a, 'v> {
                 };
                 // Without a period the loop is the keys' own length.
                 let period = period.unwrap_or(Dur { expr: Length::Seconds(-1.0), value: -1.0 });
-                track.repeat = Some(Repeat { period, mode, count });
-                track
+                (track.keys, Some(Repeat { period, mode, count }), track.before, track.after)
             }
             other => {
                 self.err(at, field, format!("`{other}` is not an animation; use tween, keys, sequence or repeat"), None);
@@ -1557,7 +1564,7 @@ impl<'a, 'v> Reader<'a, 'v> {
             }
         };
         // Plain seconds can be checked now.
-        if let Some(pair) = track.keys.windows(2).find(|pair| match (&pair[0].t.expr, &pair[1].t.expr) {
+        if let Some(pair) = keys.windows(2).find(|pair| match (&pair[0].t.expr, &pair[1].t.expr) {
             (TimeExpr::Seconds(a), TimeExpr::Seconds(b)) => b <= a,
             _ => false,
         }) {
@@ -1568,11 +1575,19 @@ impl<'a, 'v> Reader<'a, 'v> {
             self.err(at, field, format!("key times must increase: {} s comes after {} s", fmt_num(b), fmt_num(a)), Some("sort the keys by time; two keys at one time make a jump only with a tiny gap (0.001)"));
             return None;
         }
-        let last = track.keys.iter().filter_map(|key| match key.t.expr { TimeExpr::Seconds(s) => Some(s), _ => None }).fold(f64::MIN, f64::max);
+        let last = keys.iter().filter_map(|key| match key.t.expr { TimeExpr::Seconds(s) => Some(s), _ => None }).fold(f64::MIN, f64::max);
         if self.duration > 0.0 && last > self.duration + 1e-9 && at.path.matches('.').count() < 1 && !self.fields(at.obj).iter().any(|(k, _)| k == "span") {
             self.warn(at, field, format!("a key at {} s is after the document's end at {} s; it is never reached", fmt_num(last), fmt_num(self.duration)), None);
         }
-        Some(track)
+        // The resolver supplies local seconds for references and computes
+        // implicit periods from the resolved endpoints.
+        if keys.iter().any(|key| key.t.expr.is_musical())
+            || repeat.as_ref().is_some_and(|r| matches!(r.period.expr, Length::Beats(_)) || r.period.value <= 0.0)
+        {
+            return Some(Track { keys, repeat, before, after });
+        }
+        Track::new(keys, repeat, before, after)
+            .map_err(|message| self.err(at, field, message, None)).ok()
     }
 
     /// `svg: keys([t, "M…"], …)` or `svg: tween("M…", "M…", start, end,
@@ -2077,7 +2092,7 @@ impl<'a, 'v> Reader<'a, 'v> {
             #[cfg(not(feature = "scene3d"))]
             "Seq3D" => {
                 self.err(&at, "", "Seq3D needs makepad-motion's `scene3d` feature (motion3d lowers it)".to_string(), None);
-                LayerKind::Group { layers: Vec::new(), mask: None, mask_mode: MaskMode::Alpha, stagger: crate::model::Stagger::none(), size: None, post: Default::default(), glyphs: false }
+                LayerKind::Group { layers: Vec::new(), mask: None, props: GroupProps { mask_mode: MaskMode::Alpha, stagger: crate::model::Stagger::none(), size: None }, post: Default::default(), glyphs: false }
             }
             "Vector" => crate::layers::Vector::script_from_value(self.vm, obj.into()).read(self, &at),
             "Repeat" => match crate::layers::Repeat::script_from_value(self.vm, obj.into()).read(self, &at, path) {
@@ -2150,35 +2165,7 @@ fn points_of(value: &Look) -> Option<Vec<[f64; 2]>> {
     items.iter().map(|item| vec_n::<2>(item)).collect()
 }
 
-/// SVG path data through `points`: lines, or a Catmull-Rom curve through
-/// them (`smooth`), closed back to the first point (`closed`).
-pub fn points_path(points: &[[f64; 2]], closed: bool, smooth: bool) -> String {
-    use std::fmt::Write;
-    let mut out = String::new();
-    let n = points.len();
-    if n == 0 {
-        return out;
-    }
-    let _ = write!(out, "M{} {}", points[0][0], points[0][1]);
-    let segments = if closed { n } else { n - 1 };
-    for i in 0..segments {
-        let p1 = points[i];
-        let p2 = points[(i + 1) % n];
-        if smooth {
-            let p0 = if i == 0 && !closed { p1 } else { points[(i + n - 1) % n] };
-            let p3 = if i + 2 >= n && !closed { p2 } else { points[(i + 2) % n] };
-            let c1 = [p1[0] + (p2[0] - p0[0]) / 6.0, p1[1] + (p2[1] - p0[1]) / 6.0];
-            let c2 = [p2[0] - (p3[0] - p1[0]) / 6.0, p2[1] - (p3[1] - p1[1]) / 6.0];
-            let _ = write!(out, " C{} {} {} {} {} {}", c1[0], c1[1], c2[0], c2[1], p2[0], p2[1]);
-        } else {
-            let _ = write!(out, " L{} {}", p2[0], p2[1]);
-        }
-    }
-    if closed {
-        out.push_str(" Z");
-    }
-    out
-}
+pub use makepad_motion_plain::geometry::points_path;
 
 /// Uniform names every inline shader has.
 pub const RESERVED_UNIFORMS: &[&str] = &["time", "beat", "size", "below", "data", "opacity"];
@@ -2191,26 +2178,19 @@ fn offset_expr(start: &TimeExpr, by: f64) -> TimeExpr {
 }
 
 /// Whether anything about a layer changes over its span.
-fn animated(layer: &Layer) -> bool {
+pub(crate) fn animated(layer: &Layer) -> bool {
     let t = &layer.transform;
-    let mut any = t.at.is_animated() || t.x.is_animated() || t.y.is_animated() || t.scale.is_animated() || t.rotate.is_animated() || layer.opacity.is_animated()
-        || layer.blur.is_animated() || layer.feather.is_animated() || t.along.as_ref().is_some_and(|a| a.progress.is_animated())
+    let mut any = t.is_animated() || layer.opacity.is_animated() || layer.blur.is_animated() || layer.feather.is_animated()
         || layer.effects.iter().any(|e| e.params.iter().any(|(_, a)| a.is_animated()) || matches!(e.name.as_str(), "motion_blur" | "echo" | "noise" | "grain" | "particles" | "turbulence" | "slices"));
     let opt4 = |p: &Option<Prop<4>>| p.as_ref().is_some_and(Prop::is_animated);
     any |= match &layer.kind {
-        LayerKind::Rect { size, radius, fill, stroke, width, trim_start, trim_end, .. } => {
-            size.is_animated() || radius.is_animated() || opt4(fill) || opt4(stroke) || width.is_animated() || trim_start.is_animated() || trim_end.is_animated()
-        }
-        LayerKind::Ellipse { size, fill, stroke, width, trim_start, trim_end, .. } => {
-            size.is_animated() || opt4(fill) || opt4(stroke) || width.is_animated() || trim_start.is_animated() || trim_end.is_animated()
-        }
-        LayerKind::Path { data, fill, stroke, width, trim_start, trim_end, .. } => {
-            matches!(data, PathShape::Morph { .. }) || opt4(fill) || opt4(stroke) || width.is_animated() || trim_start.is_animated() || trim_end.is_animated()
-        }
+        LayerKind::Rect(props) => props.is_animated(),
+        LayerKind::Ellipse(props) => props.is_animated(),
+        LayerKind::Path(props) => props.is_animated(),
         LayerKind::Svg { size, .. } => size.as_ref().is_some_and(Prop::is_animated),
         // A backdrop shows whatever is under it.
         LayerKind::Image { src, size, zoom, focus, .. } => *src == Media::Backdrop || size.as_ref().is_some_and(Prop::is_animated) || zoom.is_animated() || focus.as_ref().is_some_and(Prop::is_animated),
-        LayerKind::Text { source, size, color, plate, reveal, caret, axes, ranges, path, flicker, tracking, stroke, .. } => {
+        LayerKind::Text { source, props: TextProps { size, color, reveal, tracking, .. }, plate, caret, axes, ranges, path, flicker, stroke, .. } => {
             path.as_ref().is_some_and(|(_, offset)| offset.is_animated()) ||
             matches!(source, TextSource::Voice(_)) || matches!(source, TextSource::Number { value, clock, .. } if value.is_animated() || clock.is_some())
                 || size.is_animated() || color.is_animated() || axes.iter().any(|(_, a)| a.is_animated())
@@ -2231,7 +2211,7 @@ fn animated(layer: &Layer) -> bool {
         LayerKind::Anchored { .. } => true,
         // A video's frame changes with time.
         LayerKind::Video { .. } => true,
-        LayerKind::Group { layers, mask, size, .. } => layers.iter().any(|l| l.animated) || mask.as_ref().is_some_and(|m| m.animated) || size.as_ref().is_some_and(Prop::is_animated),
+        LayerKind::Group { layers, mask, props: GroupProps { size, .. }, .. } => layers.iter().any(|l| l.animated) || mask.as_ref().is_some_and(|m| m.animated) || size.as_ref().is_some_and(Prop::is_animated),
         // Shaders run on time (and effects on the frame below).
         LayerKind::Shader { .. } => true,
         LayerKind::Scene3D { camera, lights, nodes, materials, background, exposure, .. } => {
@@ -2251,7 +2231,7 @@ fn animated(layer: &Layer) -> bool {
         LayerKind::Vector { size, parts, draw_on, fill, stroke, .. } => size.as_ref().is_some_and(Prop::is_animated) || draw_on.as_ref().is_some_and(Prop::is_animated) || opt4(fill) || opt4(stroke)
             || parts.iter().any(|(_, p)| p.opacity.is_animated() || p.x.is_animated() || p.y.is_animated() || p.scale.is_animated() || p.rotate.is_animated()
                 || opt4(&p.fill) || opt4(&p.stroke) || p.width.as_ref().is_some_and(Prop::is_animated) || p.draw_on.as_ref().is_some_and(Prop::is_animated)),
-        LayerKind::Repeat { layer, items, delay, .. } => std::iter::once(layer.as_ref()).chain(items).any(|layer| layer.animated || (*delay != 0.0 && layer.span.is_some())),
+        LayerKind::Repeat { layer, items, props: RepeatProps { delay, .. }, .. } => std::iter::once(layer.as_ref()).chain(items).any(|layer| layer.animated || (*delay != 0.0 && layer.span.is_some())),
     };
     any
 }
@@ -2297,9 +2277,7 @@ fn type_of(value: &InputValue) -> InputType {
     }
 }
 
-pub(crate) fn unpack(c: u32) -> Color {
-    [((c >> 24) & 0xff) as f64 / 255.0, ((c >> 16) & 0xff) as f64 / 255.0, ((c >> 8) & 0xff) as f64 / 255.0, (c & 0xff) as f64 / 255.0]
-}
+pub(crate) use makepad_motion_plain::unpack;
 
 pub(crate) fn pack(c: Color) -> u32 {
     let b = |v: f64| ((v.clamp(0.0, 1.0) * 255.0).round() as u32) & 0xff;
@@ -2323,26 +2301,11 @@ fn vec_n<const N: usize>(value: &Look) -> Option<[f64; N]> {
     Some(out)
 }
 
-/// Whether SVG path data parses: commands and the numbers they take.
-pub fn check_path_data(data: &str) -> Result<(), String> {
-    let trimmed = data.trim();
-    if trimmed.is_empty() {
-        return Err("`svg` path data is empty".into());
-    }
-    let first = trimmed.chars().next().unwrap();
-    if !matches!(first, 'M' | 'm') {
-        return Err(format!("path data starts with a move (`M x y`), not `{}`", truncate(trimmed, 12)));
-    }
-    for c in trimmed.chars() {
-        if !(c.is_ascii_digit() || c.is_ascii_whitespace() || "MmLlHhVvCcSsQqTtAaZz.,-+eE".contains(c)) {
-            return Err(format!("`{c}` is not part of SVG path data (commands M L H V C S Q T A Z and numbers)"));
-        }
-    }
-    Ok(())
-}
+pub use makepad_motion_plain::geometry::check_path_data;
 
 #[cfg(test)]
 mod tests {
+    use crate::plain::{PrimitiveFrame, RectProps};
     use super::*;
     use crate::{ItemKind, MotionFrame};
 
@@ -2350,7 +2313,7 @@ mod tests {
     fn a_document_computes_with_its_inputs_given_or_defaulted() {
         let source = "use mod.motion.*; Motion{size: vec2(100, 100) duration: 1 inputs: {w: input(@number, 40)}\n  layers: [Rect{size: vec2(in(@w) * 0.5, 10)}]}";
         let size = |doc: &MotionDoc| match &doc.layers[0].kind {
-            LayerKind::Rect { size: Prop::Const(s), .. } => s[0],
+            LayerKind::Rect(RectProps { size: Prop::Const(s), .. }) => s[0],
             other => panic!("{other:?}"),
         };
         let defaulted = MotionDoc::load(source).unwrap();
@@ -2375,7 +2338,7 @@ mod tests {
             vm.fn_image(f.as_object().unwrap()).unwrap()
         };
         let size = |doc: &MotionDoc| match &doc.layers[0].kind {
-            LayerKind::Rect { size: Prop::Const(s), .. } => s[0],
+            LayerKind::Rect(RectProps { size: Prop::Const(s), .. }) => s[0],
             other => panic!("{other:?}"),
         };
         let w = LiveId::from_str("w");
@@ -2413,7 +2376,7 @@ mod tests {
     fn documents_of_one_vm_survive_collection_and_each_other() {
         let body = "use mod.motion.*; Motion{size: vec2(100, 100) duration: 1 inputs: {w: input(@number, 40) k: 1.0}\n  layers: [Rect{size: vec2(in(@w) * 0.5, 10) x: fn(t) { in(@k) * 10.0 }}]}";
         let size = |frame: &MotionFrame| match &frame.items[0].kind {
-            ItemKind::Rect { size, .. } => size[0],
+            ItemKind::Primitive(PrimitiveFrame::Rect { size, .. }) => size[0],
             other => panic!("{other:?}"),
         };
         let gc = |doc: &MotionDoc| doc.vm.with(|e| e.with_vm(|vm| vm.gc()));

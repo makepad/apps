@@ -396,7 +396,7 @@ pub enum HostAction {
     Done(Box<Done>),
     /// An electronics write left the model worker (landed, or kept aside over an outside change),
     /// after every status of an earlier job: the writes before it can no longer be on the bed.
-    DocsLanded { bed: u64, docs: Arc<fab_model::Docs> },
+    DocsLanded { bed: u64, docs: Arc<fab_model::Docs>, all: Arc<fab_model::Docs> },
     /// The plate with its display meshes as the view shows them (exact parts' detail, the Mesh
     /// look), and its scene: what shows changes, nothing else.
     Shown(Box<(Arc<Evaluated>, Arc<Scene>)>),
@@ -1537,6 +1537,38 @@ fn job_call_id(job: &Job) -> Option<u64> {
     }
 }
 
+/// The answer a job owes whoever waits on it, for when it panics before it sends one
+/// ([`HostState::crashed`]). A quit's answer needs none: its [`QuitReply`] answers as it drops.
+#[derive(Clone, Copy, Debug)]
+enum Owed {
+    Nothing,
+    /// A call's answer: the app service's caller waits for it however long it takes.
+    Call(u64),
+    Fit(u64),
+    Sheets(u64),
+    Round(u64),
+}
+
+impl Owed {
+    fn of(job: &Job) -> Self {
+        match job {
+            Job::Fit { id, .. } => Owed::Fit(*id),
+            Job::EncodeSheets { id, .. } => Owed::Sheets(*id),
+            Job::RoundPlan { id, .. } => Owed::Round(*id),
+            _ => job_call_id(job).map_or(Owed::Nothing, Owed::Call),
+        }
+    }
+}
+
+/// Runs a job on the model worker. One that panics answers its waiter with an error
+/// ([`HostState::crashed`]) instead of leaving it waiting; the host goes on with the next job.
+fn run_answering(state: &mut HostState, owed: Owed, run: impl FnOnce(&mut HostState)) {
+    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(state))) {
+        let why = panic.downcast_ref::<String>().cloned().or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "a panic".into());
+        state.crashed(owed, &why);
+    }
+}
+
 /// A job a failure can sensibly be retried for, to queue again: a file that could not be
 /// read or written may be there now. A failed edit or build is not retried: the same
 /// input fails the same way.
@@ -1577,6 +1609,67 @@ pub fn job_reason(text: &str) -> String {
         Some((place, _)) if place.rsplitn(3, ':').nth(1).is_some_and(|line| !line.is_empty() && line.bytes().all(|b| b.is_ascii_digit())) => format!("{why} ({place})"),
         _ => why,
     }
+}
+
+/// Runs on the model strand. Only the first Trash call commits the retirement:
+/// a failed removed flag or successor must leave the current opening recording.
+pub(crate) fn delete_saved_plate(session: &mut Session, id: &str, own_pid: u32,
+    trash: &dyn Fn(&std::path::Path) -> Result<(), String>) -> Result<Option<Arc<Evaluated>>, String> {
+    use crate::journal;
+    use std::cell::Cell;
+    use std::io::ErrorKind;
+
+    const OPEN: &str = "This plate is open in another Fab window. Close it there first.";
+    let store = session.store.as_ref().ok_or("this session keeps no plates")?;
+    if !journal::reader::literal(id) { return Err("Invalid plate id.".into()) }
+    let plate = store.dir(id);
+    if !std::fs::symlink_metadata(&plate).is_ok_and(|m| m.is_dir()) { return Err(format!("no plate {id}")) }
+    let others = journal::other_presence_holders(&plate, own_pid)
+        .map_err(|_| "Fab couldn't check whether this plate is open in another window. It is kept.")?;
+    if others != 0 { return Err(OPEN.into()) }
+
+    // (busy only while another Delete of this plate holds it)
+    let pause = journal::pause_plate(&plate).map_err(|_| "Fab couldn't prepare this plate's journal for the Trash. It is kept.")?;
+    let lock = match journal::delete_lock(&plate) {
+        Ok(lock) => Some(lock),
+        Err(e) if e.kind() == ErrorKind::WouldBlock => { pause.resume(); return Err(OPEN.into()) }
+        Err(e) => {
+            log!("journal: {}: {:?}", plate.display(), e.kind());
+            None
+        }
+    };
+    let prepared = Cell::new(Some(pause.prepare().map_err(|e| e.to_string())?));
+    let retired = Cell::new(None);
+    #[cfg(windows)]
+    let (lock, moving) = (Cell::new(lock), Cell::new(None));
+    let moved = Cell::new(false);
+    let result = session.delete_plate(id, &|path| {
+        if path != plate { return trash(path) }
+        if let Some(ready) = prepared.take() {
+            retired.set(Some(ready.commit().map_err(|e| e.to_string())?));
+            journal::release_presence(path);
+            #[cfg(windows)]
+            {
+                drop(lock.take());
+                moving.set(Some(journal::reader::MovingPlate::begin(path).map_err(|e| e.to_string())?));
+            }
+        }
+        trash(path)?;
+        moved.set(true);
+        Ok(())
+    });
+    #[cfg(windows)]
+    drop(moving.take());
+    drop(lock);
+    drop(prepared);
+    if moved.get() {
+        if let Err(e) = journal::finish_delete_notes(&plate, trash) {
+            log!("journal: could not move fallback for {}: {:?}", plate.display(), e.kind());
+        }
+    }
+    // Discovery can acquire a new gate for this directory only after cleanup.
+    drop(retired);
+    result
 }
 
 /// A document put on the bed: built, or the bed as it was when it does not build (or the build
@@ -1903,6 +1996,33 @@ impl HostState {
                 (wanted && seen.insert(key)).then(|| crate::plate_paint::Order { key: d.key.to_string(), out: picture, subject: crate::plate_paint::Subject::Demo(d), machine: session.eval.machine.clone(), alone: false })
             })
         })
+    }
+
+    /// A job panicked (the panic itself is in the log): whoever waits on it gets an error now,
+    /// and the worker no longer says it is busy with it. Its job card ended failed as the panic
+    /// dropped its handle. The plate stays as the job left it, and the next job runs on it.
+    fn crashed(&mut self, owed: Owed, why: &str) {
+        let what = format!("the model worker crashed on this job: {why}");
+        log!("fab: {what}");
+        self.words.lock().unwrap_or_else(|e| e.into_inner()).set(None, None);
+        let text = format!("{{error: {}}}", fab_ai::out::quote(&what));
+        Cx::post_action(match owed {
+            Owed::Nothing => return,
+            Owed::Call(id) => {
+                let person = self.journal.person();
+                // A failed Done, so the window's waiters on the call end as on any failed job;
+                // its status is the plate's now. A status that cannot be read either still
+                // answers the call, without one.
+                let shown = self.session.as_mut().and_then(|s| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| status(s))).ok());
+                match shown {
+                    Some(status) => HostAction::Done(Box::new(Done { person, images: Vec::new(), id, ok: false, text, review: Mutex::new(None), update: None, status, model_changed: false, check_slice: None, source_files: None, source_problem: None, capped: None })),
+                    None => HostAction::Answered { id, ok: false, text, person },
+                }
+            }
+            Owed::Fit(id) => HostAction::Fit { id, result: Err(what) },
+            Owed::Sheets(id) => HostAction::Sheets { id, result: Err(what), made: None },
+            Owed::Round(id) => HostAction::RoundPlan { id, plan: Box::new(Err(what)) },
+        });
     }
 
     fn run(&mut self, queued: Queued, ticket: Ticket) {
@@ -2394,7 +2514,7 @@ impl HostState {
                             }
                         }
                     }
-                    Cx::post_action(HostAction::DocsLanded { bed, docs: landed });
+                    Cx::post_action(HostAction::DocsLanded { bed, docs: landed, all: session.model.docs().clone() });
                 } else {
                     let switched = session.switched;
                     let why = format!("electronics documents for another plate (bed {bed}, now {switched}) reached the model");
@@ -2950,13 +3070,8 @@ impl HostState {
             }
             Job::DeletePlate { id, plate } => {
                 let trash_home = makepad_fab_settings::home::user_home();
-                let store_dir = session.store.as_ref().map(|s| s.dir(&plate));
-                let trash = |path: &std::path::Path| {
-                    // this window's presence file sits inside the folder about to move
-                    if store_dir.as_deref() == Some(path) { crate::journal::release_presence(path); }
-                    fab_ai::plates::move_to_trash(&trash_home, path)
-                };
-                (id, match session.delete_plate(&plate, &trash) {
+                let trash = |path: &std::path::Path| fab_ai::plates::move_to_trash(&trash_home, path);
+                (id, match delete_saved_plate(session, &plate, std::process::id(), &trash) {
                     Ok(Some(ev)) => {
                         let what = session.model.name.clone();
                         on_bed(&mut session, &what, Ok(ev))
@@ -3473,7 +3588,8 @@ impl ModelHost {
                     h.cancelled();
                 }
             } else {
-                state.journal.clone().during(work, || state.run((job, handle, author), ticket));
+                let owed = Owed::of(&job);
+                state.journal.clone().during(work, || run_answering(state, owed, |state| state.run((job, handle, author), ticket)));
             }
             state.switched_now.store(state.session.as_ref().map_or(0, |s| s.switched), Ordering::Release);
             if replacing {
@@ -4180,7 +4296,7 @@ mod scene_tests {
                 let s = state.session.as_ref().expect("a session");
                 tx.send((s.plate.clone(), s.switched, s.model.elec_memory().get(FILE).cloned())).unwrap();
             }).detach();
-            rx.recv_timeout(Duration::from_secs(60)).expect("the model host gets through its queue")
+            rx.recv().expect("the model host gets through its queue")
         };
         let plate_docs = docs.clone();
         let (made, plates) = std::sync::mpsc::channel();
@@ -4196,7 +4312,7 @@ mod scene_tests {
             state.session = Some(s);
             made.send((a, b)).unwrap();
         }).detach();
-        let (a, b) = plates.recv_timeout(Duration::from_secs(60)).expect("the plates are made");
+        let (a, b) = plates.recv().expect("the plates are made");
         let (_, bed, _) = on_bed(&host);
         let mut elec = crate::elec_host::ElecHost::start(&mut cx, bed, Some(a.clone()), docs, Arc::default(),
             Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
@@ -4628,6 +4744,53 @@ mod person_first {
         assert_eq!(answers.try_iter().collect::<Vec<_>>(), [id]);
         // The job board removes a fleeting success from its history.
         assert!(jobs::board().get(job_id).is_none_or(|j| matches!(j.end, jobs::JobEnd::Done { next: None })));
+    }
+
+    /// Runs `f` on the model host's worker, on its state, and gives back what it returns.
+    fn on_worker<T: Send + 'static>(host: &ModelHost, f: impl FnOnce(&mut HostState) -> T + Send + 'static) -> T {
+        let (done, ran) = std::sync::mpsc::channel();
+        host.strand.submit(Class::Interactive, Ticket::none(), move |state| done.send(f(state)).unwrap()).detach();
+        ran.recv().unwrap()
+    }
+
+    /// Why: a job that panicked on the model worker left whoever waited on it waiting for good
+    /// (the strand keeps the panic in a handle nobody holds), and a call through the app service
+    /// waits for its answer however long it takes. Its caller gets an error: with a plate open
+    /// as a failed Done (the window's failed-job path), without one as a bare answer. Its job
+    /// card ends failed, the worker stops saying it is busy with it, and the next job runs.
+    #[test]
+    fn a_job_that_panics_answers_its_caller_with_an_error() {
+        let _cx = crate::cx_owned();
+        let (send, answers) = std::sync::mpsc::channel();
+        let mut cx = Cx::new(Box::new(move |_, event| {
+            if let Event::Actions(actions) = event {
+                for action in actions {
+                    match action.downcast_ref::<HostAction>() {
+                        Some(HostAction::Done(done)) => send.send(("done", done.id, done.ok, done.text.clone())).unwrap(),
+                        Some(HostAction::Answered { id, ok, text, .. }) => send.send(("answered", *id, *ok, text.clone())).unwrap(),
+                        _ => (),
+                    }
+                }
+            }
+        }));
+        let mut host = ModelHost::start(&cx, false);
+        // with the session the host started with
+        let open = host.reserve_call_id();
+        on_worker(&host, move |state| run_answering(state, Owed::Call(open), |_| panic!("a bug in a job")));
+        // without one, a call's own run panics on the way every job takes
+        on_worker(&host, |state| state.session = None);
+        let bare = host.reserve_call_id();
+        let handle = JobSpec::new("Inspecting the plate").start();
+        let job_id = handle.id();
+        host.queue_with(Job::Call { id: bare, tool: "inspect".into(), args: Value::Null }, Some(handle), Author::Person, None);
+        let busy = on_worker(&host, |state| state.words.lock().unwrap().doing.clone());
+        assert_eq!(busy, None, "the worker still says it is busy with the job that crashed");
+        cx.handle_action_receiver();
+        let got: Vec<_> = answers.try_iter().filter(|a| a.1 == open || a.1 == bare).collect();
+        let crashed = |text: &String| text.contains("crashed on this job");
+        assert!(matches!(&got[..], [("done", a, false, t), ("answered", b, false, u)] if *a == open && *b == bare && crashed(t) && crashed(u)),
+            "each caller gets an error, a failed Done with a plate open and a bare answer without: {got:?}");
+        assert!(jobs::board().get(job_id).is_some_and(|j| matches!(j.end, jobs::JobEnd::Failed { .. })), "the crashed job's card ends failed");
     }
 
     /// Why: a quit dropped every edit still queued behind a long job (the pool's close drops a

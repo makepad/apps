@@ -306,17 +306,14 @@ pub fn strip_view(state: &AppState, pane: PaneId, mut view: Rect) -> Rect {
     view
 }
 
-/// The kind filter's strip in the view while picks are made: each kind's box (window points)
-/// along the view's bottom left, right of the tool rail and the Edit shape strip.
-pub fn strip(view: Rect) -> Vec<(Rect, PickKind)> {
-    let widths = PickKind::ALL.iter().map(|k| pill_width(k.label().chars().count()));
-    flow(view, view.pos.x + 104.0, view.pos.y + view.size.y - 36.0, widths).into_iter().zip(PickKind::ALL.iter().copied()).collect()
-}
+/// Where the pick commands' strip starts: along the view's bottom left, right of the tool rail.
+/// (The kind filter lives in the plate view's tool row, `stage.rs`.)
+const STRIP_LEFT: f64 = 58.0;
 
 /// Boxes of `widths` laid left to right from `x` on the row at `y`, a row up where one would
 /// pass the view's right edge: the strip wraps as the view narrows.
 fn flow(view: Rect, mut x: f64, mut y: f64, widths: impl Iterator<Item = f64>) -> Vec<Rect> {
-    let left = view.pos.x + 104.0;
+    let left = view.pos.x + STRIP_LEFT;
     let right = view.pos.x + view.size.x - 8.0;
     widths
         .map(|w| {
@@ -331,17 +328,16 @@ fn flow(view: Rect, mut x: f64, mut y: f64, widths: impl Iterator<Item = f64>) -
         .collect()
 }
 
-/// Whether `pos` is on the kind filter's strip or a command's box: a press there is theirs, not
-/// the view's.
+/// Whether `pos` is on a command's box: a press there is the box's, not the view's.
 pub fn on_strip(view: Rect, picks: &[PickView], pos: DVec2) -> bool {
-    strip(view).iter().any(|(r, _)| r.contains(pos)) || commands(view, picks).iter().any(|(r, ..)| r.contains(pos))
+    commands(view, picks).iter().any(|(r, ..)| r.contains(pos))
 }
 
-/// The commands that act on the picks there are, right of the kind filter's strip: each one's box
+/// The commands that act on the picks there are, along the view's bottom left: each one's box
 /// and its palette command. Round for an exact part's edges or chains, a crease or an edit's
 /// edges; Chamfer for exact edges alone; Pull, Hole and Shell for an exact part's faces.
 pub fn commands(view: Rect, picks: &[PickView]) -> Vec<(Rect, &'static str, &'static str)> {
-    let (x, y) = strip(view).last().map_or((view.pos.x + 104.0, view.pos.y + view.size.y - 36.0), |(r, _)| (r.pos.x + r.size.x + 16.0, r.pos.y));
+    let (x, y) = (view.pos.x + STRIP_LEFT, view.pos.y + view.size.y - 36.0);
     let on: Vec<_> = PICK_COMMANDS.iter().filter(|entry| entry.strip && entry.takes(picks)).collect();
     flow(view, x, y, on.iter().map(|entry| pill_width(entry.label.chars().count())))
         .into_iter().zip(on).map(|(r, entry)| (r, entry.label, entry.command)).collect()

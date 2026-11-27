@@ -366,8 +366,28 @@ pub fn lerp_camera(a: &Camera, b: &Camera, f: f32) -> Camera {
     let ha = a.ortho_height.max(1e-4);
     let hb = b.ortho_height.max(1e-4);
     c.ortho_height = (ha.ln() + (hb.ln() - ha.ln()) * f).exp();
+    // One projection to the other: on the way, a perspective camera that narrows its view (or
+    // widens it) as it backs off (or closes in), the height it shows at the target eased between
+    // the two ends, so the switch at the end (or the start) changes next to nothing on screen.
+    if a.ortho != b.ortho {
+        let shown = |cam: &Camera| if cam.ortho { cam.ortho_height } else { 2.0 * cam.distance() * (cam.fov_y_deg.to_radians() * 0.5).tan() };
+        let (sa, sb) = (shown(a).max(1e-4), shown(b).max(1e-4));
+        let height = (sa.ln() + (sb.ln() - sa.ln()) * f).exp();
+        let wide = if a.ortho { b.fov_y_deg } else { a.fov_y_deg }.max(PROJECTION_NARROW_DEG);
+        // how far toward parallel: 0 at the perspective end, 1 at the orthographic one
+        let parallel = if b.ortho { f } else { 1.0 - f };
+        let fov = (wide.ln() + (PROJECTION_NARROW_DEG.ln() - wide.ln()) * parallel).exp();
+        c.ortho = false;
+        c.fov_y_deg = fov;
+        let dist = height / (2.0 * (fov.to_radians() * 0.5).tan());
+        c.eye = c.target + dir * dist;
+    }
     c
 }
+
+/// The narrowest view a projection change passes through on its way to (or from) orthographic:
+/// near enough to parallel that the switch at its end is not seen.
+const PROJECTION_NARROW_DEG: f32 = 1.5;
 
 /// One camera move in flight. Ends *exactly* on `to` so a preset view lands
 /// on the nose rather than a smoothstep's worth of epsilon away.

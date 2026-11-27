@@ -47,6 +47,8 @@
 //!
 //! HAL offscreen (`MAKEPAD_HAL_BACKEND=offscreen`), native GPU, no window.
 
+#[path = "common/render_mode.rs"]
+mod render_mode;
 use makepad_strict_json::Value;
 use makepad_test::{run_with_config, KeyCode, Selector, TestApp, TestConfig};
 use makepad_zune_png::makepad_zune_core::bytestream::ZCursor;
@@ -524,8 +526,7 @@ fn even_layers_read_even_and_a_proud_layer_reads_uneven() {
         }
         let batch = format!(r#"{{"request_id":"p","expected":{head:?},"edits":{}}}"#, Value::Str(PLATE.to_string()).to_json());
         call(&app, "place", &batch).expect("place");
-        app.locator(Selector::id("rm_slice")).wait_visible().click();
-        app.locator(Selector::id("rm_slice")).wait_checked(true);
+        render_mode::pick(&app, "Sliced");
         wait_until(&app, "the slice", || call(&app, "slice", "{}").is_ok_and(|t| t.contains("Sliced")));
         // The shading read alone: the screen AO off till the last picture.
         screen_ao(&app, false);

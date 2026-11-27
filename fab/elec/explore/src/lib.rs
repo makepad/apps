@@ -46,7 +46,7 @@ pub mod wiretree;
 
 pub use graph::LayoutGraph;
 use graph::Pt;
-pub use sheet::{block_origin, to_local, to_world, Bx, Mover, Opts, SheetLayout};
+pub use sheet::{block_origin, to_local, to_world, Bx, Mover, Opts, SheetLayout, SheetMode};
 
 use fab_elec_circuit::{Circuit, SheetHint, SheetHints};
 use fab_elec_core::SchPt;

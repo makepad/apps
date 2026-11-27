@@ -19,13 +19,15 @@ pub use makepad_render::env_map::{detect_sun, remove_sun, rows_near, GeneratedEn
 
 /// Bakes `params` into an engine environment map `width` x `width / 2`
 /// (texel centres, ibl's equirect) and reports its key light. `run`
-/// spreads the rows as for [`Env::bake_par`]: `pool.fan_out` inside a
-/// Heavy job, a plain loop on the UI thread. The sun is [`Env::sun`]:
+/// spreads the work as for [`Env::new_for_width_par`] and then
+/// [`Env::bake_par`] (the Env's rasters and cloud volumes, then the rows),
+/// so it is called more than once: `pool.fan_out` inside a Heavy job, a
+/// plain loop on the UI thread. The map is the same whichever spreads it. The sun is [`Env::sun`]:
 /// world space, the rotation applied, already x 2^intensity_ev.
 pub fn bake_env_map(
     params: &HdriParams,
     width: usize,
-    run: impl FnOnce(usize, &(dyn Fn(usize) + Sync)),
+    run: impl Fn(usize, &(dyn Fn(usize) + Sync)),
 ) -> (EnvMap, Option<EnvSun>) {
     let (map, sun, _) = bake_env_map_with_daylight(params, width, run);
     (map, sun)
@@ -39,12 +41,12 @@ pub fn bake_env_map(
 pub fn bake_env_map_with_daylight(
     params: &HdriParams,
     width: usize,
-    run: impl FnOnce(usize, &(dyn Fn(usize) + Sync)),
+    run: impl Fn(usize, &(dyn Fn(usize) + Sync)),
 ) -> (EnvMap, Option<EnvSun>, Option<Vec3f>) {
     // A shadow caster's bloom is rastered at this bake's width (R5).
-    let env = Env::new_for_width(params, &ImageSet::default(), width, &|| false).expect("an Env nothing cancels is built");
+    let env = Env::new_for_width_par(params, &ImageSet::default(), width, &|| false, &run).expect("an Env nothing cancels is built");
     let (sun, daylight) = (env.sun(), env.sun_dir());
-    (env.bake_par(width, run), sun, daylight)
+    (env.bake_par(width, &run), sun, daylight)
 }
 
 

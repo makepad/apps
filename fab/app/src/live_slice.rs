@@ -1614,6 +1614,16 @@ pub fn revisions() -> Option<(u64, u64)> {
     HUB.get().map(|h| h.engine.revisions())
 }
 
+/// Tests: blocks until the shown slice's engine runs no driver, so its [`revisions`] rest. The
+/// engine answers a settle before it marks the revision served. A wait on the engine's own change
+/// notification, not on the clock.
+#[cfg(test)]
+pub(crate) fn wait_idle() {
+    if let Some(h) = HUB.get() {
+        h.engine.wait_idle();
+    }
+}
+
 /// The whole live slice's print times once edits rest: the time model without G-code text,
 /// in the background, answered as `PrintEvent::Estimated` (a preview that plays). A shape
 /// change stops it.
@@ -1668,7 +1678,13 @@ pub fn input_for(plate_id: u64, setup: &CheckSetup, plate: Arc<Plate>, machine: 
     // Non-planar tops plan with the installed head, else the placeholder: they slice and
     // preview either way, and the print check refuses them until a measured head is installed.
     let np_head = Some(Arc::new(crate::head::boxes(&crate::head::for_slicing())));
-    LiveInput { plate_id, settings_id: setup.id_for(&plate), setup: Arc::new(move |kept| resolve.job_setup_of(&p, &m, kept)), plate, paint: Arc::new(Vec::new()), frames, machine, np_head, pieces: None }
+    LiveInput { plate_id, settings_id: setup.id_for(&plate), setup: Arc::new(move |kept| resolve.job_setup_of(&p, &m, kept)), plate, overlaps: None, paint: Arc::new(Vec::new()), frames, machine, np_head, pieces: None }
+}
+
+/// `input` with `ev`'s overlap issues ([`Evaluated::overlaps`]), bound to `ev`'s own
+/// plate id: an input built for an edit of it carries another id and checks its own.
+pub fn with_overlaps_of(input: LiveInput, ev: &Evaluated) -> LiveInput {
+    input.with_overlaps(ev.overlaps.clone(), plate_id(ev))
 }
 
 /// A model part's field as the slicer's, in the part's frame (its mesh before the plate
@@ -1725,7 +1741,9 @@ pub(super) fn send_live_plate(ev: &Arc<Evaluated>, setup: CheckSetup) -> Result<
     let inserts = ev.plate.excluded.iter().enumerate().filter_map(|(i, p)| p.insert.as_ref().map(|_| i)).collect();
     drop(hub().insert_plate.set(Arc::new(InsertPlate { id, evaluated: ev.clone(), inserts })));
     let ev = ev.clone();
-    hub().engine.set_input_with(id, settings, parts, Arc::new(move || input_for(plate_id(&ev), &setup, Arc::new(ev.plate.printable()), ev.machine.clone(), Some(&ev.frames), Some(&ev.fields))));
+    hub().engine.set_input_with(id, settings, parts, Arc::new(move || {
+        with_overlaps_of(input_for(id, &setup, Arc::new(ev.plate.printable()), ev.machine.clone(), Some(&ev.frames), Some(&ev.fields)), &ev)
+    }));
     Ok(())
 }
 
@@ -2151,7 +2169,7 @@ impl AiSlices {
 impl fab_ai::supports::SliceSource for AiSlices {
     fn input(&self, ev: &Evaluated) -> Result<(LiveInput, String), String> {
         if let Some(why) = self.setup.plate_waits(ev) { return Err(why.into()); }
-        let input = input_for(plate_id(ev), &self.setup, Arc::new(ev.plate.printable()), ev.machine.clone(), Some(&ev.frames), Some(&ev.fields));
+        let input = with_overlaps_of(input_for(plate_id(ev), &self.setup, Arc::new(ev.plate.printable()), ev.machine.clone(), Some(&ev.frames), Some(&ev.fields)), ev);
         let name = format!("the app's print setup: {} / {}", self.setup.calibration_names().0, self.setup.process());
         Ok((input, name))
     }
@@ -2307,6 +2325,12 @@ pub(crate) mod gates {
         let (go, wait) = channel();
         ARMED.lock().unwrap().push((at, came, wait));
         (arrived, go)
+    }
+
+    /// Take `at` down if no thread reached it: its receiver then ends at once (a thread that
+    /// finished or panicked without coming there), instead of waiting for an arrival.
+    pub(crate) fn disarm(at: &'static str) {
+        ARMED.lock().unwrap().retain(|g| g.0 != at);
     }
 
     /// This thread stops at the armed places (no other thread does).
@@ -3420,7 +3444,8 @@ pub(crate) fn cpu_engine() -> (LiveEngine, std::sync::mpsc::Receiver<LiveEvent>)
 #[cfg(test)]
 pub(crate) fn sliced(ev: &Evaluated) -> Arc<makepad_fab_slice::live::PlatePaths> {
     let (engine, rx) = cpu_engine();
-    engine.set_input(input_for(plate_id(ev), &CheckSetup::fab_defaults(), Arc::new(ev.plate.printable()), ev.machine.clone(), Some(&ev.frames), Some(&ev.fields)));
+    let input = input_for(plate_id(ev), &CheckSetup::fab_defaults(), Arc::new(ev.plate.printable()), ev.machine.clone(), Some(&ev.frames), Some(&ev.fields));
+    engine.set_input(with_overlaps_of(input, ev));
     rx.iter().find_map(|e| match e {
         LiveEvent::Toolpaths { toolpaths, .. } => Some(toolpaths),
         LiveEvent::Failed { error, .. } => panic!("the plate does not slice: {error}"),
@@ -3726,7 +3751,6 @@ mod tests {
     /// parks, rather than leaving it for a next event (none comes once a slice is done).
     #[test]
     fn a_take_while_the_owner_holds_what_it_applied_gets_it_out() {
-        const STUCK: std::time::Duration = std::time::Duration::from_secs(5);
         let owner = LiveOwner::new();
         let published = std::sync::atomic::AtomicUsize::new(0);
         // a part's layer is applied; a message for now publishes on its own (as the checks' do)
@@ -3746,11 +3770,20 @@ mod tests {
         let state = owner.inbox.lock().unwrap().state.take().expect("the state is parked");
         let (arrived, go) = gates::arm("owner holds");
         std::thread::scope(|scope| {
-            scope.spawn(|| {
+            // An owner that ends or panics without holding takes the gate down: the wait below
+            // fails at once. One that never gets there (a stalled build of its code) is the
+            // runner's hang cut, whose stacks show this named thread where it waits.
+            struct Disarm;
+            impl Drop for Disarm {
+                fn drop(&mut self) { gates::disarm("owner holds"); }
+            }
+            std::thread::Builder::new().name("live owner under test".into()).spawn_scoped(scope, || {
+                let _disarm = Disarm;
                 gates::mark();
                 owner.run(state, vec![Msg::Part(event_of((2, 11, 1, 0, 0, 0))), Msg::StartView], true, &work);
-            });
-            arrived.recv_timeout(STUCK).expect("the owner holds the layer it applied");
+            }).expect("the owner's thread");
+            // No deadline: the owner applies one layer first, whose code a loaded box may still be building.
+            arrived.recv().expect("the owner holds the layer it applied");
             assert!(!owner.took(), "the view takes the newest with nothing held yet: it asks for nothing");
             drop(go);
         });
@@ -3910,8 +3943,9 @@ mod tests {
         use makepad_fab_slice::live::{Estimate, Streamed};
         let _hub = HUB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let _cx = crate::cx_shared();
-        // Only a failure waits this long: on the pass path nothing waits on the clock.
-        const STUCK: std::time::Duration = std::time::Duration::from_secs(5);
+        // No wait here has a deadline. A deadlock like #3620's never returns: the runner's hang
+        // cut is its detector, and its stacks show each named thread at its gate or lock. A thread
+        // that ends without reaching its gate takes the gate down, so that wait fails at once.
         init_for_tests();
         // A live view is on and the engine off: the edits go the real way in, and no slice of
         // theirs fails or publishes in the middle of the test.
@@ -3999,7 +4033,8 @@ mod tests {
         let answered = |observed: &std::sync::mpsc::Receiver<(std::time::Instant, String, Option<Arc<PrintPreview>>, Option<Arc<LiveResult>>)>, live: bool| {
             let (mut sliced, mut published) = (0, !live);
             while sliced < 2 || !published {
-                let o = observed.recv_timeout(STUCK).unwrap_or_else(|_| panic!("{sliced} of the Print editor's 2 slices answered, the publication {}out", if published { "" } else { "not " }));
+                // (the observer's sender is the hub's: a missing answer hangs here, after `sliced` of 2)
+                let o = observed.recv().unwrap_or_else(|_| panic!("{sliced} of the Print editor's 2 slices answered, the publication {}out", if published { "" } else { "not " }));
                 sliced += (o.1 == "sliced false") as usize;
                 published |= o.1 == "live" && o.3.is_some();
             }
@@ -4022,13 +4057,17 @@ mod tests {
             preview(records_taker(1, None).expect("the view has a machine"));
         }).join().expect("every party once");
         let (finished, done) = std::sync::mpsc::channel::<(&'static str, bool)>();
-        let run = |name: &'static str, work: Box<dyn FnOnce() + Send>| {
+        // Each party on a thread named for it. One stopped at a gate that ends without reaching
+        // it (it panicked, or took another path) takes its gate down before it reports, so the
+        // round's wait for that gate fails at once and a later round's gate is never touched.
+        let run = |name: &'static str, gate: Option<&'static str>, work: Box<dyn FnOnce() + Send>| {
             let finished = finished.clone();
-            std::thread::spawn(move || {
+            std::thread::Builder::new().name(name.into()).spawn(move || {
                 gates::mark();
                 let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_ok();
+                if let Some(at) = gate { gates::disarm(at); }
                 let _ = finished.send((name, ok));
-            });
+            }).expect("a party's thread");
         };
         // Once here. The stress rig runs it FAB_GUARD_ROUNDS times, letting the two stopped ones
         // go on in either order.
@@ -4037,9 +4076,8 @@ mod tests {
         for round in 0..rounds {
             // The owner job the Print editor's answers started has parked the state: the
             // publication below takes it on its own thread.
-            let t = std::time::Instant::now();
+            // (follows the owner: it parks the state once its job ends)
             while hub().owner.inbox.lock().unwrap().state.is_none() {
-                assert!(t.elapsed() < STUCK, "round {round}: the live state's owner never parks it");
                 std::thread::yield_now();
             }
             while observed.try_recv().is_ok() {}
@@ -4048,37 +4086,41 @@ mod tests {
             let taker = records_taker(1, None).expect("the view has a machine");
             // The publisher, stopped owning the live state, before it reads the view.
             let (published, publishing) = gates::arm("publication");
-            run("the publication", Box::new(move || post_live(Msg::Part(contours()))));
-            published.recv_timeout(STUCK).unwrap_or_else(|_| panic!("round {round}: the publication starts"));
+            run("the publication", Some("publication"), Box::new(move || post_live(Msg::Part(contours()))));
+            published.recv().unwrap_or_else(|_| panic!("round {round}: the publication starts"));
             // The estimate preview, stopped once it has the view's colours, before the plate's objects.
             let (looked, looking) = gates::arm("estimate look");
-            run("the estimate preview", Box::new(move || preview(taker)));
-            looked.recv_timeout(STUCK).unwrap_or_else(|_| panic!("round {round}: the estimate preview looks at what it shows"));
+            run("the estimate preview", Some("estimate look"), Box::new(move || preview(taker)));
+            looked.recv().unwrap_or_else(|_| panic!("round {round}: the estimate preview looks at what it shows"));
             // The edit returns while both are stopped, and so do the Print editor's calls.
             let (input, edit, calls) = (input.clone(), job.clone(), job.clone());
-            run("the edit", Box::new(move || {
+            run("the edit", None, Box::new(move || {
                 set_input(&input, &edit, std::time::Instant::now());
             }));
-            match done.recv_timeout(STUCK) {
-                Ok(("the edit", true)) => {}
-                Ok(other) => panic!("round {round}: {other:?} ended first: only the edit can, the others are stopped"),
-                Err(_) => panic!("round {round}: the edit waits on a lock the estimate preview or the publisher holds (#3620: the preview held the view and waited for the live state, the publisher held the live state and waited for the view)"),
+            // #3620's property: the edit returns while both are stopped. If it waits on a lock the
+            // estimate preview or the publisher holds (in #3620 the preview held the view and waited
+            // for the live state, the publisher held the live state and waited for the view), this
+            // never returns and the hang cut's stacks show "the edit" where it waits.
+            match done.recv().expect("the test holds a sender") {
+                ("the edit", true) => {}
+                other => panic!("round {round}: {other:?} ended first: only the edit can, the others are stopped"),
             }
             {
                 let _closed = ViewClosed::new();
                 let print_calls = print_calls.clone();
-                run("the Print editor's calls", Box::new(move || print_calls(&calls)));
-                match done.recv_timeout(STUCK) {
-                    Ok(("the Print editor's calls", true)) => {}
-                    Ok(other) => panic!("round {round}: {other:?} ended before the Print editor's calls: the others are stopped"),
-                    Err(_) => panic!("round {round}: a superseded or cancelled Print editor slice waits for the publisher (its answer let the preview go, which took the live state the publisher held)"),
+                run("the Print editor's calls", None, Box::new(move || print_calls(&calls)));
+                // A superseded or cancelled Print editor slice must not wait for the publisher (its
+                // answer let the preview go, which took the live state the publisher held).
+                match done.recv().expect("the test holds a sender") {
+                    ("the Print editor's calls", true) => {}
+                    other => panic!("round {round}: {other:?} ended before the Print editor's calls: the others are stopped"),
                 }
             }
-            run("the UI's calls", Box::new(ui_calls.clone()));
-            match done.recv_timeout(STUCK) {
-                Ok(("the UI's calls", true)) => {}
-                Ok(other) => panic!("round {round}: {other:?} ended before the UI's calls: the others are stopped"),
-                Err(_) => panic!("round {round}: a call of the view or the UI waits for the stopped publisher or estimate preview"),
+            run("the UI's calls", None, Box::new(ui_calls.clone()));
+            // No call of the view or the UI may wait for the stopped publisher or estimate preview.
+            match done.recv().expect("the test holds a sender") {
+                ("the UI's calls", true) => {}
+                other => panic!("round {round}: {other:?} ended before the UI's calls: the others are stopped"),
             }
             // What came out while they were stopped is not theirs.
             while observed.try_recv().is_ok() {}
@@ -4095,8 +4137,9 @@ mod tests {
                 drop(publishing);
             }
             let mut ended = Vec::new();
+            // Once let on, the publication and the estimate preview must not wait on each other.
             for _ in 0..2 {
-                ended.push(done.recv_timeout(STUCK).unwrap_or_else(|_| panic!("round {round} (publication let on first: {publication_first}): the publication and the estimate preview wait on each other once let on: only {ended:?} finished")));
+                ended.push(done.recv().expect("the test holds a sender"));
             }
             assert!(ended.iter().all(|e| e.1), "round {round}: each finishes without a panic: {ended:?}");
             // The stopped publication came out, and the owner answered both slices after it.
@@ -4118,7 +4161,9 @@ mod tests {
             let setup = setup(&ev);
             let make: makepad_fab_slice::live::MakeInput = {
                 let (ev, setup) = (ev.clone(), setup.clone());
-                Arc::new(move || input_for(plate_id(&ev), &setup, Arc::new(ev.plate.printable()), ev.machine.clone(), Some(&ev.frames), Some(&ev.fields)))
+                Arc::new(move || {
+                    with_overlaps_of(input_for(plate_id(&ev), &setup, Arc::new(ev.plate.printable()), ev.machine.clone(), Some(&ev.frames), Some(&ev.fields)), &ev)
+                })
             };
             let input = SliceInput { plate_id: plate_id(&ev), settings_id: setup.id_for(&ev.plate), parts: ev.plate.parts.len(), make };
             let job = PrintJob { gen: 0, settings: fab::print::PrintSettings::default(), colours: vec![[0.8; 4]], model_colours: vec![[0.8; 4]], shared_tools: Vec::new(), machine: ev.machine.clone(), name: "lost".into(), objects: Arc::from(["block".to_string()]), check: None, fallback: None, catalog: None, tests: None, melts: Vec::new() };

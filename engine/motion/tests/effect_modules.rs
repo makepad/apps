@@ -2,6 +2,7 @@
 //! what the hand-written code they stand for records, imported as a
 //! document imports them.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::draw2d::Draw2dList;
 use makepad_motion::frame::ItemKind;
 use makepad_motion::*;
@@ -125,7 +126,7 @@ fn a_document_imports_a_pinned_library_module() {
     let context = MotionContext { modules, ..Default::default() };
     let src = "use mod.motion.*; let g = import(asset(\"grain_lib\", \"r3\"))\nMotion{duration: 1.0 layers: [Rect{size: vec2(g.twice(10.0), 4) fill: #ffffff}]}";
     let doc = MotionDoc::load_with(src, &[], context).unwrap_or_else(|d| panic!("{d:?}"));
-    let ItemKind::Rect { size, .. } = &doc.eval(0.0).items[0].kind else { panic!("not a rect") };
+    let ItemKind::Primitive(PrimitiveFrame::Rect { size, .. }) = &doc.eval(0.0).items[0].kind else { panic!("not a rect") };
     assert_eq!(size[0], 30.0);
     // Without the host's module, the load says what to do.
     let missing = MotionDoc::load(src).unwrap_err();
@@ -152,7 +153,7 @@ fn a_folder_import_without_its_folder_is_one_error() {
     }
     let context = MotionContext { modules: modules::Modules(std::sync::Arc::new(Folder)), ..Default::default() };
     let doc = MotionDoc::load_with(src, &[], context).unwrap_or_else(|d| panic!("in its folder the plate loads: {d:?}"));
-    let ItemKind::Rect { size, .. } = &doc.eval(0.0).items[0].kind else { panic!("not a rect") };
+    let ItemKind::Primitive(PrimitiveFrame::Rect { size, .. }) = &doc.eval(0.0).items[0].kind else { panic!("not a rect") };
     assert_eq!(size[0], 3.0, "the imported module's value");
 }
 
@@ -205,7 +206,7 @@ fn song_timing_lookups() {
         lines: [{words: [{w: \"Our\" start: 1.0 end: 1.2}, {w: \"harbor\" start: 1.2 end: 1.8 syl: [{start: 1.2 end: 1.4}, {start: 1.4 end: 1.8}]}]}]}";
     let probe = |expr: &str| -> f64 {
         let doc = MotionDoc::load(&format!("use mod.motion.*; use mod.motion.modules.song.*\nlet S = {data}\nMotion{{duration: 1.0 layers: [Rect{{size: vec2({expr}, 1) fill: #ffffff}}]}}")).unwrap_or_else(|d| panic!("{expr}: {d:?}"));
-        let ItemKind::Rect { size, .. } = &doc.eval(0.0).items[0].kind else { panic!("not a rect") };
+        let ItemKind::Primitive(PrimitiveFrame::Rect { size, .. }) = &doc.eval(0.0).items[0].kind else { panic!("not a rect") };
         size[0]
     };
     for t in [0.2, 1.25, 1.99, 3.1] {
@@ -248,7 +249,7 @@ fn stepped_value_is_the_hand_written_instrument() {
         }";
     let value = |prelude: &str, expr: &str| -> f64 {
         let doc = MotionDoc::load(&format!("use mod.motion.*; use mod.motion.modules.numbers.*\n{prelude}\nMotion{{duration: 1.0 layers: [Rect{{size: vec2(1000.0 * {expr}, 1) fill: #ffffff}}]}}")).unwrap_or_else(|d| panic!("{expr}: {d:?}"));
-        let ItemKind::Rect { size, .. } = &doc.eval(0.0).items[0].kind else { panic!("not a rect") };
+        let ItemKind::Primitive(PrimitiveFrame::Rect { size, .. }) = &doc.eval(0.0).items[0].kind else { panic!("not a rect") };
         size[0]
     };
     let steps = "let STEPS = [[-1.0, 0.02], [23.66, 0.15], [60.02, 0.42], [96.38, 0.81], [125.46, 0.99]]";

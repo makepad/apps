@@ -1,5 +1,6 @@
 //! `Shape`: children's outlines combined by a boolean operation into one Path.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::frame::ItemKind;
 use makepad_motion::*;
 
@@ -12,7 +13,7 @@ fn load(source: &str) -> MotionDoc {
 /// The outline the Shape made, as contours, and its signed area (y down).
 fn contours(doc: &MotionDoc) -> Vec<Vec<[f64; 2]>> {
     let frame = doc.eval(0.5);
-    let ItemKind::Path { path: data, .. } = &frame.items[0].kind else { panic!("not a Path: {:?}", frame.items[0].kind) };
+    let ItemKind::Primitive(PrimitiveFrame::Path { path: data, .. }) = &frame.items[0].kind else { panic!("not a Path: {:?}", frame.items[0].kind) };
     geometry::flatten(data, 0.1).into_iter().map(|(c, _)| c).collect()
 }
 

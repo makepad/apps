@@ -5,6 +5,13 @@
 
 pub use makepad_widgets;
 
+/// Releases the evaluation reserve on allocation failure so a runaway can report a memory error and the app can keep running.
+/// On wasm with atomics, the platform installs the guard around its thread-caching allocator.
+#[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
+#[global_allocator]
+static ALLOC: makepad_widgets::makepad_platform::alloc_guard::Guarded<std::alloc::System> =
+    makepad_widgets::makepad_platform::alloc_guard::Guarded(std::alloc::System);
+
 use makepad_widgets::*;
 
 mod about;

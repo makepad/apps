@@ -1201,6 +1201,8 @@ pub struct PrintState {
     pub profiles: PrintProfiles,
     /// Available links and the controls for the selected virtual printer.
     pub links: PrinterPicker,
+    /// Session navigation for Monitor and XR. None follows the plate target.
+    pub shown: Option<PrinterChoice>,
     pub status: SliceStatus,
     /// The parts of the plate being sliced that won't fit the selected printer (off its bed, or
     /// out of a nozzle's reach): they slice anyway, and this says so beside the slice.
@@ -1244,7 +1246,7 @@ pub struct PrintState {
     pub head_moves: Vec<colours::Moved>,
     /// The Print button was pressed: the confirm card shows (nothing is sent yet) until Cancel,
     /// Start print or Stop.
-    pub confirm_print: bool,
+    pub confirm_print: Option<PrintConfirm>,
     /// Counts the presses of Print: each one brings the confirm card back into view.
     pub confirm_asked: u64,
     /// While the confirm card shows: what stops Start print now, whatever the slice is doing
@@ -1253,16 +1255,16 @@ pub struct PrintState {
     /// The confirm card's "Print anyway" tick: the slice (its preview id) whose printability
     /// errors the person accepted. Off on every opening of the card; a new slice is another id.
     pub accept_errors: Option<u64>,
-    /// The job whose package is being made for the printer (Start print was pressed).
-    pub sending: Option<String>,
+    /// Jobs whose package or queued recheck is in progress, with the printer each was admitted for.
+    pub sending: Vec<Sending>,
     /// The destination whose Stop confirmation is open.
     pub confirm_stop: Option<ControlDestination>,
     pub print_options: fab_printer_link::PrintOptions,
     /// The print safety check of the shown slice (Ok: what passed; Err: why it is refused).
     /// Start print is offered only after a pass.
     pub print_check: Option<Result<String, String>>,
-    /// Why the last Print could not go out, said at the top of the panel.
-    pub print_blocked: Option<String>,
+    /// Each printer's most recent refusal, shown on its panel or job card.
+    pub print_blocked: PrintRefusals,
     /// The layer the slice view looks at (the layer slider's top): a live
     /// slicer slices around it first.
     pub focus_layer: Option<u32>,
@@ -1319,6 +1321,34 @@ impl StreamedIssues {
 }
 
 impl PrintState {
+    pub fn ticket_for(&self, printer: &PrinterChoice) -> Option<PrintTicket> {
+        Some(PrintTicket {
+            printer: printer.clone(),
+            virtual_printer: self.printer_of(printer)?.virtual_printer,
+            epoch: self.printers.epoch_of(printer)?,
+        })
+    }
+
+    /// A card opened before the first report binds once, while it still has the same target.
+    pub fn bind_print_ticket(&mut self) {
+        if let Some(PrintConfirm::AwaitingReport(id)) = &self.confirm_print {
+            if id == &self.links.picked {
+                if let Some(ticket) = self.ticket_for(id) {
+                    self.confirm_print = Some(PrintConfirm::Filament(ticket));
+                }
+            }
+        }
+    }
+
+    pub fn sending_for(&self, printer: &PrinterChoice) -> Option<&Sending> {
+        self.sending.iter().find(|send| &send.printer == printer)
+    }
+
+    pub fn take_sending(&mut self, job: &str) -> Option<Sending> {
+        let at = self.sending.iter().position(|send| send.job == job)?;
+        Some(self.sending.remove(at))
+    }
+
     /// The latest snapshot of the printer the plate is prepared for.
     pub fn target_printer(&self) -> Option<&Arc<fab_printer_link::Snapshot>> {
         self.printer_of(&self.links.picked)
@@ -1329,9 +1359,14 @@ impl PrintState {
         self.printers.get_mut(&self.links.picked)
     }
 
-    /// The latest snapshot of the printer Monitor shows, the target until M3.
+    /// The printer Monitor shows.
+    pub fn shown_choice(&self) -> &PrinterChoice {
+        self.shown.as_ref().unwrap_or(&self.links.picked)
+    }
+
+    /// The latest snapshot of the printer Monitor shows.
     pub fn shown_printer(&self) -> Option<&Arc<fab_printer_link::Snapshot>> {
-        self.target_printer()
+        self.printer_of(self.shown_choice())
     }
 
     /// The latest snapshot reported by this printer.
@@ -1701,7 +1736,7 @@ impl PrintState {
 }
 
 /// A link is independent of the machine profile used for slicing.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum PrinterChoice {
     #[default]
     None,
@@ -1709,30 +1744,151 @@ pub enum PrinterChoice {
     Virtual(String),
 }
 
-/// The latest snapshots by printer choice, in insertion order.
+/// The filament link that owned the report shown on the confirmation card.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrintTicket {
+    pub printer: PrinterChoice,
+    pub virtual_printer: bool,
+    pub epoch: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrintConfirm {
+    AwaitingReport(PrinterChoice),
+    Filament(PrintTicket),
+    Resin,
+}
+
+pub struct Sending {
+    pub job: String,
+    pub printer: PrinterChoice,
+}
+
 #[derive(Default)]
-pub struct Printers(Vec<(PrinterChoice, Arc<fab_printer_link::Snapshot>)>);
+pub struct PrintRefusals(Vec<(PrinterChoice, String)>);
+
+impl PrintRefusals {
+    pub fn get(&self, printer: &PrinterChoice) -> Option<&str> {
+        self.0.iter().find(|(id, _)| id == printer).map(|(_, why)| why.as_str())
+    }
+
+    pub fn set(&mut self, printer: &PrinterChoice, why: Option<String>) {
+        self.0.retain(|(id, _)| id != printer);
+        if let Some(why) = why { self.0.push((printer.clone(), why)); }
+    }
+}
+
+/// Immutable geometry and feed paths of one catalogue preset, prepared by the profiles worker.
+#[derive(Debug)]
+pub struct BoundMachine {
+    pub geometry: Arc<fab_plate::machine::Machine>,
+    pub model: String,
+    pub diameters: Vec<f64>,
+    pub layout: colours::Offline,
+    pub default_plate: String,
+}
+
+#[derive(Debug, Default)]
+pub enum MachineBinding {
+    Available { machine: Arc<BoundMachine>, automatic: Arc<BoundMachine>, choices: Arc<[String]>, explicit: Option<String> },
+    #[default]
+    UnknownModel,
+    NoCatalogue,
+    Resin,
+    MissingPreset(String),
+}
+
+impl MachineBinding {
+    pub fn machine(&self) -> Option<&Arc<BoundMachine>> {
+        match self { Self::Available { machine, .. } => Some(machine), _ => None }
+    }
+}
+
+#[derive(Default)]
+struct PrinterEntry {
+    id: PrinterChoice,
+    virtual_printer: bool,
+    epoch: u64,
+    report: Option<PrinterReport>,
+    heard: Option<(usize, f64)>,
+    clock: Option<follow::JobClock>,
+    terminal: Option<String>,
+    binding: Arc<MachineBinding>,
+}
+
+struct PrinterReport {
+    snapshot: Arc<fab_printer_link::Snapshot>,
+    handed: Option<(String, u64)>,
+}
+
+/// Installed incarnations, their latest reports and unacknowledged Print commands.
+#[derive(Default)]
+pub struct Printers(Vec<PrinterEntry>);
 
 impl Printers {
+    fn installed(&self, choice: &PrinterChoice) -> Option<&PrinterEntry> {
+        self.0.iter().find(|e| &e.id == choice)
+    }
+
+    fn entry(&self, choice: &PrinterChoice) -> Option<&PrinterReport> {
+        self.installed(choice)?.report.as_ref()
+    }
+
+    fn report_mut(&mut self, choice: &PrinterChoice) -> Option<&mut PrinterReport> {
+        self.0.iter_mut().find(|e| &e.id == choice)?.report.as_mut()
+    }
+
     pub fn get(&self, choice: &PrinterChoice) -> Option<&Arc<fab_printer_link::Snapshot>> {
-        self.0.iter().find(|(id, _)| id == choice).map(|(_, snapshot)| snapshot)
+        Some(&self.entry(choice)?.snapshot)
     }
 
     pub fn get_mut(&mut self, choice: &PrinterChoice) -> Option<&mut Arc<fab_printer_link::Snapshot>> {
-        self.0.iter_mut().find(|(id, _)| id == choice).map(|(_, snapshot)| snapshot)
+        Some(&mut self.report_mut(choice)?.snapshot)
     }
 
-    pub fn set(&mut self, choice: &PrinterChoice, snapshot: Arc<fab_printer_link::Snapshot>) {
-        if let Some(previous) = self.get_mut(choice) {
-            *previous = snapshot;
+    pub fn epoch_of(&self, choice: &PrinterChoice) -> Option<u64> {
+        Some(self.installed(choice)?.epoch)
+    }
+
+    pub fn binding(&self, choice: &PrinterChoice) -> Option<&Arc<MachineBinding>> {
+        Some(&self.installed(choice)?.binding)
+    }
+
+    pub fn set_binding(&mut self, choice: &PrinterChoice, binding: Arc<MachineBinding>) {
+        if let Some(entry) = self.0.iter_mut().find(|e| &e.id == choice) { entry.binding = binding; }
+    }
+
+    pub fn handed(&self, choice: &PrinterChoice) -> Option<&(String, u64)> {
+        self.entry(choice)?.handed.as_ref()
+    }
+
+    pub fn hand_to(&mut self, choice: &PrinterChoice, job: String, link_send: u64) {
+        self.report_mut(choice).expect("dispatch requires a current report").handed = Some((job, link_send));
+    }
+
+    /// Bind even controls drawn before the first report to this particular link.
+    pub fn install(&mut self, choice: &PrinterChoice, epoch: u64, virtual_printer: bool) {
+        self.remove(choice);
+        self.0.push(PrinterEntry { id: choice.clone(), epoch, virtual_printer, ..Default::default() });
+    }
+
+    pub fn set(&mut self, choice: &PrinterChoice, epoch: u64, snapshot: Arc<fab_printer_link::Snapshot>) {
+        if let Some(entry) = self.0.iter_mut().find(|e| &e.id == choice) {
+            if entry.epoch != epoch {
+                *entry = PrinterEntry { id: choice.clone(), epoch, ..Default::default() };
+            }
+            let handed = entry.report.take().and_then(|r| r.handed)
+                .filter(|(_, send)| snapshot.job_sends < *send);
+            entry.virtual_printer = snapshot.virtual_printer;
+            entry.report = Some(PrinterReport { snapshot, handed });
         } else {
-            self.0.push((choice.clone(), snapshot));
+            self.0.push(PrinterEntry { id: choice.clone(), epoch, virtual_printer: snapshot.virtual_printer, report: Some(PrinterReport { snapshot, handed: None }), ..Default::default() });
         }
     }
 
     pub fn remove(&mut self, choice: &PrinterChoice) -> Option<Arc<fab_printer_link::Snapshot>> {
-        let index = self.0.iter().position(|(id, _)| id == choice)?;
-        Some(self.0.remove(index).1)
+        let index = self.0.iter().position(|e| &e.id == choice)?;
+        Some(self.0.remove(index).report?.snapshot)
     }
 
     pub fn clear(&mut self) {
@@ -1751,19 +1907,80 @@ impl PrinterChoice {
     }
 }
 
+/// Which printer a surface addresses while Monitor watches another printer.
+pub mod ownership {
+    use super::{PrinterChoice, PrintState};
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum Scope {
+        #[default]
+        Target,
+        Shown,
+    }
+
+    impl Scope {
+        pub(super) fn choice(self, state: &PrintState) -> &PrinterChoice {
+            match self {
+                Self::Target => &state.links.picked,
+                Self::Shown => state.shown_choice(),
+            }
+        }
+
+        pub(super) fn matches(self, state: &PrintState, choice: &PrinterChoice) -> bool {
+            choice == self.choice(state)
+        }
+    }
+}
+pub use ownership::Scope as PrinterScope;
+
+/// The surface and incarnation an edit was drawn for. An offline pick has no installed link.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EditOwner {
+    pub scope: PrinterScope,
+    pub choice: PrinterChoice,
+    pub epoch: Option<u64>,
+    virtual_printer: Option<bool>,
+}
+
+impl EditOwner {
+    pub fn new(scope: PrinterScope, state: &PrintState) -> Self {
+        let choice = scope.choice(state);
+        let entry = state.printers.installed(choice);
+        Self { scope, choice: choice.clone(), epoch: entry.map(|e| e.epoch), virtual_printer: entry.map(|e| e.virtual_printer) }
+    }
+
+    pub fn matches(&self, state: &PrintState) -> bool {
+        let entry = state.printers.installed(&self.choice);
+        self.scope.matches(state, &self.choice) && self.epoch == entry.map(|e| e.epoch)
+            && self.virtual_printer == entry.map(|e| e.virtual_printer)
+    }
+
+    fn capture(&mut self, scope: PrinterScope, state: &PrintState) {
+        if self.scope != scope || !self.matches(state) { *self = Self::new(scope, state); }
+    }
+}
+
 /// The printer shown when a control was drawn. A configured printer can report in either mode.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ControlDestination {
-    Filament { choice: PrinterChoice, virtual_printer: bool },
+    Filament { scope: PrinterScope, choice: PrinterChoice, virtual_printer: bool, epoch: u64 },
     ResinJob { printer: String, stack: Option<u64>, started: Option<f64> },
 }
 
 impl ControlDestination {
-    pub fn filament(state: &PrintState) -> Option<Self> {
-        let report = state.shown_printer()?;
-        (state.links.picked != PrinterChoice::None).then(|| Self::Filament {
-            choice: state.links.picked.clone(), virtual_printer: report.virtual_printer,
-        })
+    pub fn filament(scope: PrinterScope, state: &PrintState) -> Option<Self> {
+        let choice = scope.choice(state);
+        if *choice == PrinterChoice::None { return None; }
+        let report = state.printer_of(choice)?;
+        Some(Self::Filament { scope, choice: choice.clone(), virtual_printer: report.virtual_printer, epoch: state.printers.epoch_of(choice)? })
+    }
+
+    pub fn from_ticket(ticket: &PrintTicket) -> Self {
+        Self::Filament { scope: PrinterScope::Target, choice: ticket.printer.clone(), virtual_printer: ticket.virtual_printer, epoch: ticket.epoch }
+    }
+
+    pub fn pause_or_resume(&self, paused: bool) -> PrintAction {
+        PrintAction::PrinterControl(self.clone(), if paused { PrinterControl::Resume } else { PrinterControl::Pause })
     }
 
     pub fn resin(job: &resin::ResinJob) -> Self {
@@ -1772,8 +1989,9 @@ impl ControlDestination {
 
     pub fn matches(&self, state: &PrintState) -> bool {
         match self {
-            Self::Filament { choice, virtual_printer } => choice != &PrinterChoice::None && choice == &state.links.picked
-                && state.shown_printer().is_some_and(|s| s.virtual_printer == *virtual_printer),
+            Self::Filament { scope, choice, virtual_printer, epoch } => choice != &PrinterChoice::None && scope.matches(state, choice)
+                && state.printers.epoch_of(choice) == Some(*epoch)
+                && state.printer_of(choice).is_some_and(|s| s.virtual_printer == *virtual_printer),
             Self::ResinJob { printer, stack, started } => state.resin_job.as_ref().is_some_and(|j|
                 !j.ended() && &j.printer == printer && &j.stack == stack && &j.started == started),
         }
@@ -1807,15 +2025,17 @@ pub struct PrinterPicker {
 /// app's (it owns the slicer); playback is [`apply`]'s.
 #[derive(Clone, Debug)]
 pub enum PrintAction {
-    /// Switch which printer reports to this panel.
-    LinkPrinter(PrinterChoice),
+    /// Show a held printer in Monitor and XR. None follows the plate target.
+    ShowPrinter(Option<PrinterChoice>),
+    /// Switch the plate target from the picker that opened this menu.
+    LinkPrinter(EditOwner, PrinterChoice),
     /// Choose a configured printer’s link mode.
-    PrinterMode(String, bool),
-    MakeTwin(String),
+    PrinterMode(EditOwner, bool),
+    MakeTwin(EditOwner, String),
     /// Change the feed paths of the linked virtual printer.
-    VirtualLayout { kind: makepad_fab_settings::virtual_printer::Kind, heads: usize, trays: usize, tpu: bool },
+    VirtualLayout { owner: EditOwner, kind: makepad_fab_settings::virtual_printer::Kind, heads: usize, trays: usize, tpu: bool },
     /// Restore a factory layout and its loaded spools to the linked virtual printer.
-    ResetVirtual(String),
+    ResetVirtual(EditOwner, String),
     /// Whole plate (false) or the ticked test prints (true): what the Slicer shows, slices and prints.
     TestMode(bool),
     Overhangs(bool),
@@ -1831,7 +2051,7 @@ pub enum PrintAction {
     Slice,
     Export,
     UseInstalled(bool),
-    SetMachine(String),
+    SetMachine(EditOwner, Option<String>),
     SetPlate(String),
     SetProcess(String),
     // ---- playback ----
@@ -1873,15 +2093,17 @@ pub enum PrintAction {
     /// The resin printer's orientation test: saved to the stick (the app's).
     SaveOrientationTest,
     /// Confirmed: upload the sliced plate and start it (the app's).
-    SendToPrinter,
+    SendToPrinter { ticket: PrintTicket, preview: u64 },
+    /// The resin card confirms its own layer stack.
+    SendResin { stack: u64 },
     /// Cancel while the package is being made: nothing goes to the printer.
-    CancelSend,
+    CancelSend(String),
     /// Monitor's list: show this job (None: the printer's, or the last).
     PickJob(Option<String>),
     /// A queued job's Start: ask about the plate first (None: not now).
     AskStartJob(Option<String>),
     /// Start this queued job now: the plate is clear.
-    StartJob(String),
+    StartJob { id: String, ticket: PrintTicket },
     /// Take this queued job out of the queue, off the disk too.
     RemoveJob(String),
     /// The job is over and read: its card goes.
@@ -1889,12 +2111,12 @@ pub enum PrintAction {
     /// Pause, resume, stop (confirmed), clear the error, list the storage (the app's).
     PrinterControl(ControlDestination, PrinterControl),
     /// How fast a virtual printer runs its job (the app's: it tells the held link).
-    SetVirtualSpeed(fab_printer_link::Speed),
+    SetVirtualSpeed(ControlDestination, fab_printer_link::Speed),
     /// Monitor follows the printer's job (on by default); manual playback turns it off.
     FollowPrinter(bool),
     /// Set what a tray of the offline loadout holds (the app's; a reporting printer's trays
     /// are its reports).
-    EditTray(colours::Position, colours::TrayEdit),
+    EditTray(EditOwner, colours::Position, colours::TrayEdit),
     /// Pick a branch of the shown slice's supports (its tree's place in [`PrintState::trees`],
     /// its lowest disc), or none.
     PickBranch(Option<(usize, u32)>),
@@ -1916,6 +2138,7 @@ pub enum PrinterControl { Pause, Resume, Stop, ClearError, CheckStorage }
 
 /// The playback half of [`PrintAction`]. Returns true when the view changed.
 pub fn apply(state: &mut PrintState, action: &PrintAction) -> bool {
+    if matches!(action, PrintAction::ShowPrinter(_)) { return false; } // Printing owns navigation and the camera.
     if let PrintAction::PickBranch(at) = action {
         let picked = at.and_then(|(i, low)| Some((state.trees.get(i)?, low))).filter(|(t, low)| (*low as usize) < t.discs.len())
             .map(|(t, low)| (t.object.clone(), t.branch_tips(low))).filter(|(_, tips)| !tips.is_empty());
@@ -2104,21 +2327,28 @@ fn apply_play(state: &mut PrintState, action: &PrintAction) -> bool {
             state.confirm_stop = None;
             if *on {
                 // Already open: it stays as it is (a tick on the plate check too), back in view.
-                if !state.confirm_print {
+                if state.confirm_print.is_none() || state.resin.is_some() != matches!(state.confirm_print, Some(PrintConfirm::Resin)) {
+                    state.confirm_print = Some(if state.resin.is_some() {
+                        PrintConfirm::Resin
+                    } else {
+                        PrintConfirm::AwaitingReport(state.links.picked.clone())
+                    });
+                    state.bind_print_ticket();
                     state.print_options.plate_clear = false;
                     state.accept_errors = None;
                     if let Some(r) = state.resin.as_mut() {
                         r.accepted = None;
                     }
                 }
-                state.print_blocked = None;
+                state.print_blocked.set(&state.links.picked, None);
                 state.confirm_asked += 1;
+            } else {
+                state.confirm_print = None;
             }
-            state.confirm_print = *on;
         }
         PrintAction::AskStop(dest, true) if dest.matches(state) => {
             state.confirm_stop = Some(dest.clone());
-            state.confirm_print = false;
+            state.confirm_print = None;
         }
         PrintAction::AskStop(dest, false) | PrintAction::PrinterControl(dest, PrinterControl::Stop)
             if state.confirm_stop.as_ref() == Some(dest) => state.confirm_stop = None,
@@ -2143,11 +2373,21 @@ fn apply_play(state: &mut PrintState, action: &PrintAction) -> bool {
             PrintOption::Timelapse => state.print_options.timelapse = *on,
             PrintOption::PlateClear => state.print_options.plate_clear = *on,
         },
-        PrintAction::SendToPrinter => { state.confirm_print = false; state.print_options.plate_clear = false; }
-        PrintAction::CancelSend => {}
+        PrintAction::SendToPrinter { ticket, .. } => {
+            if matches!(&state.confirm_print, Some(PrintConfirm::Filament(card)) if ticket == card) {
+                state.confirm_print = None;
+                state.print_options.plate_clear = false;
+            }
+        }
+        PrintAction::SendResin { .. } if state.confirm_print == Some(PrintConfirm::Resin) => {
+            state.confirm_print = None;
+            state.print_options.plate_clear = false;
+        }
+        PrintAction::CancelSend(_) => {}
         PrintAction::CloseJob => {
             let held = state.monitor_holds();
-            state.print_blocked = None;
+            let shown = state.shown_choice().clone();
+            state.print_blocked.set(&shown, None);
             state.follow.picked = None;
             state.follow.confirm_start = None;
             state.follow.closed = true;
@@ -2168,7 +2408,10 @@ fn apply_play(state: &mut PrintState, action: &PrintAction) -> bool {
             follow::place(state, Cx::time_now());
         }
         PrintAction::AskStartJob(id) => state.follow.confirm_start = id.clone(),
-        PrintAction::StartJob(_) => state.follow.confirm_start = None,
+        PrintAction::StartJob { id, ticket } if state.follow.confirm_start.as_ref() == Some(id) => {
+            state.follow.confirm_start = None;
+            if ticket.printer != state.links.picked { return true; }
+        }
         PrintAction::RemoveJob(_) => {}
         _ => return false,
     }
@@ -2233,8 +2476,9 @@ pub fn script_mod(vm: &mut ScriptVm) {
     job_card::script_mod(vm);
     job_stats::script_mod(vm);
     job_list::script_mod(vm);
-    panel::script_mod(vm);
+    // the calibration steps before the Printers editor, which shows them
     calibrate::script_mod(vm);
+    panel::script_mod(vm);
     resin::script_mod(vm);
 }
 

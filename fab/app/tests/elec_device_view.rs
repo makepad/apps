@@ -31,6 +31,8 @@
 //! converter's version), and KiCad's model sources are off.
 //! HAL offscreen (`MAKEPAD_HAL_BACKEND=offscreen`), native GPU, no window.
 
+#[path = "common/render_mode.rs"]
+mod render_mode;
 use fab_elec_import::library::Source;
 use fab_elec_import::{glb::write_glb, Material, MeshBuilder, Normals};
 use makepad_strict_json::Value;
@@ -371,9 +373,8 @@ fn the_device_view_holds_still_keeps_its_case_and_shows_models_as_they_arrive() 
 
         // 2. Design with its whole slice shown, then Mechanics, then back.
         let fresh = case_of(&closed_report(&app));
-        workspace(&app, "Design");
-        app.locator(Selector::id("rm_slice")).wait_visible().click();
-        app.locator(Selector::id("rm_slice")).wait_checked(true);
+        workspace(&app, "3D modeling");
+        render_mode::pick(&app, "Sliced");
         wait_until(&app, "the whole slice", || whole_slice(&app));
         workspace(&app, "Mechanics");
         app.locator(Selector::id("viewport")).wait_visible();

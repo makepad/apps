@@ -736,21 +736,31 @@ fn physics_frames_match_in_any_order(src: &str, times: &[f32]) {
     }
 }
 
+/// The confetti showcase, small: 48 pieces, not 600, launched on beat 1
+/// (0.5 s), not beat 4. Seeking, the burst, the floor contacts and the
+/// sparkles they make are the showcase's; only the work is smaller.
+fn small_confetti() -> String {
+    let src = include_str!("../showcase/physics/beat_confetti.splash");
+    assert!(src.contains("count: 600") && src.contains("at: beat(4)"), "the showcase's burst changed: update small_confetti");
+    src.replace("count: 600", "count: 48").replace("at: beat(4)", "at: beat(1)")
+}
+
 #[test]
 fn physics_confetti_seeks_like_it_plays() {
-    let src = include_str!("../showcase/physics/beat_confetti.splash");
-    // 20 times over the burst (beat 4 = 2 s) and the landing, off the step
+    let src = small_confetti();
+    let src = src.as_str();
+    // 8 times over the burst (beat 1 = 0.5 s) and the landing, off the step
     // grid, sub-frame times among them.
-    let times: Vec<f32> = (0..20).map(|k| 1.9 + k as f32 * 0.137 + if k % 3 == 0 { 0.0021 } else { 0.0 }).collect();
+    let times: Vec<f32> = (0..8).map(|k| 0.4 + k as f32 * 0.21 + if k % 3 == 0 { 0.0021 } else { 0.0 }).collect();
     physics_frames_match_in_any_order(src, &times);
     // The pieces are there after the beat, not before.
     let mut doc = load(src);
-    let before = eval(&mut doc, 1.99);
-    let after = eval(&mut doc, 2.6);
+    let before = eval(&mut doc, 0.49);
+    let after = eval(&mut doc, 1.1);
     let bodies = |f: &SceneFrame| f.meshes.iter().map(|m| m.instances.len()).max().unwrap_or(0);
     assert!(bodies(&after) > bodies(&before), "{} vs {}", bodies(&after), bodies(&before));
     // Sparkles once they land.
-    let late = eval(&mut doc, 3.45);
+    let late = eval(&mut doc, 1.95);
     assert!(late.points.iter().any(|p| !p.points.is_empty()), "sparkles at the floor hits");
 }
 
@@ -783,21 +793,23 @@ fn physics_mistakes_teach() {
 
 #[test]
 fn physics_preview_catches_up_without_blocking() {
-    let src = include_str!("../showcase/physics/beat_confetti.splash");
+    let src = small_confetti();
+    let src = src.as_str();
     let mut locked = load(src);
-    let want = eval(&mut locked, 4.0);
+    let want = eval(&mut locked, 2.5);
     let mut preview = load(src);
     preview.set_physics_budget(Some(std::time::Duration::from_millis(2)));
-    // A jump 4 s ahead: each evaluation steps at most ~2 ms and shows the
-    // newest state it has; it reaches the locked frame in the end.
+    // A jump 2.5 s ahead (600 steps, 2 s of them with the pieces flying):
+    // each evaluation steps at most ~2 ms and shows the newest state it
+    // has; it reaches the locked frame in the end.
     let t0 = std::time::Instant::now();
-    let first = eval(&mut preview, 4.0);
+    let first = eval(&mut preview, 2.5);
     assert!(t0.elapsed() < std::time::Duration::from_millis(500), "{:?}", t0.elapsed());
     let same = |a: &SceneFrame, b: &SceneFrame| a.meshes.iter().zip(b.meshes.iter()).all(|(x, y)| x.instances == y.instances) && a.meshes.len() == b.meshes.len();
-    assert!(!same(&first, &want), "the first preview frame cannot have stepped 4 s in 2 ms");
+    assert!(!same(&first, &want), "the first preview frame cannot have stepped 2.5 s in 2 ms");
     let mut n = 0;
     loop {
-        let f = eval(&mut preview, 4.0);
+        let f = eval(&mut preview, 2.5);
         n += 1;
         if same(&f, &want) {
             break;

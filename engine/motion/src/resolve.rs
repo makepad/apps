@@ -4,6 +4,7 @@
 //! evaluation reads plain seconds. Resolving again with another context
 //! (the music re-analysed, a take regenerated) re-syncs the document.
 
+use crate::plain::{EllipseProps, GroupProps, PathProps, RectProps, TextProps};
 use crate::model::*;
 use crate::timing::{Length, TimeExpr};
 
@@ -168,7 +169,7 @@ impl Resolver<'_> {
             }
         }
         match &mut layer.kind {
-            LayerKind::Rect { size, radius, fill, stroke, width, trim_start, trim_end, .. } => {
+            LayerKind::Rect(RectProps { size, radius, fill, stroke, width, trim_start, trim_end, .. }) => {
                 self.prop(size, origin, loc, &path);
                 self.prop(radius, origin, loc, &path);
                 self.opt4(fill, origin, loc, &path);
@@ -177,7 +178,7 @@ impl Resolver<'_> {
                 self.prop(trim_start, origin, loc, &path);
                 self.prop(trim_end, origin, loc, &path);
             }
-            LayerKind::Ellipse { size, fill, stroke, width, trim_start, trim_end, .. } => {
+            LayerKind::Ellipse(EllipseProps { size, fill, stroke, width, trim_start, trim_end, .. }) => {
                 self.prop(size, origin, loc, &path);
                 self.opt4(fill, origin, loc, &path);
                 self.opt4(stroke, origin, loc, &path);
@@ -185,7 +186,7 @@ impl Resolver<'_> {
                 self.prop(trim_start, origin, loc, &path);
                 self.prop(trim_end, origin, loc, &path);
             }
-            LayerKind::Path { data, fill, stroke, width, trim_start, trim_end, .. } => {
+            LayerKind::Path(PathProps { data, fill, stroke, width, trim_start, trim_end, .. }) => {
                 if let PathShape::Morph { track, .. } = data {
                     let mut prop = Prop::Track(track.clone());
                     self.prop(&mut prop, origin, loc, &path);
@@ -270,7 +271,7 @@ impl Resolver<'_> {
                     }
                 }
             }
-            LayerKind::Text { source, size, color, stagger, ranges, plate, reveal, caret, axes, path: on_path, flicker, tracking, .. } => {
+            LayerKind::Text { source, props: TextProps { size, color, stagger, reveal, tracking, .. }, ranges, plate, caret, axes, path: on_path, flicker, .. } => {
                 if let Some((amount, _)) = flicker {
                     self.prop(amount, origin, loc, &path);
                 }
@@ -350,7 +351,7 @@ impl Resolver<'_> {
                     self.layer(item, origin);
                 }
             }
-            LayerKind::Group { layers, mask, stagger, size, post, .. } => {
+            LayerKind::Group { layers, mask, props: GroupProps { stagger, size, .. }, post, .. } => {
                 self.post(&mut post.0, origin, loc, &path);
                 self.dur(&mut stagger.step, origin);
                 if let Some(size) = size {
@@ -469,7 +470,7 @@ pub fn uses_musical_time(doc: &MotionDoc) -> bool {
             || prop(&layer.transform.at) || prop(&layer.transform.x) || prop(&layer.transform.y) || prop(&layer.transform.scale)
             || prop(&layer.transform.rotate) || prop(&layer.opacity) || prop(&layer.feather)
             || match &layer.kind {
-                LayerKind::Text { stagger, source, ranges, .. } => matches!(stagger.step.expr, Length::Beats(_)) || matches!(source, TextSource::Voice(_))
+                LayerKind::Text { props: TextProps { stagger, .. }, source, ranges, .. } => matches!(stagger.step.expr, Length::Beats(_)) || matches!(source, TextSource::Voice(_))
                     || ranges.iter().any(|r| [&r.from, &r.to, &r.slide, &r.soft].into_iter().any(prop)
                         || [&r.x, &r.y, &r.rotate, &r.blur, &r.opacity].into_iter().any(|p| p.as_ref().is_some_and(prop))
                         || r.scale.as_ref().is_some_and(prop) || r.color.as_ref().is_some_and(prop)
@@ -481,7 +482,7 @@ pub fn uses_musical_time(doc: &MotionDoc) -> bool {
                     || ch.pose_blend.as_ref().is_some_and(|b| prop(&b.x) || b.y.as_ref().is_some_and(prop)),
                 LayerKind::Crowd(crowd) => crowd.member.as_ref().is_some_and(|ch| ch.reach.iter().any(|(_, p)| prop(p))
                     || ch.pose_blend.as_ref().is_some_and(|b| prop(&b.x) || b.y.as_ref().is_some_and(prop))),
-                LayerKind::Group { stagger, .. } => matches!(stagger.step.expr, Length::Beats(_)),
+                LayerKind::Group { props: GroupProps { stagger, .. }, .. } => matches!(stagger.step.expr, Length::Beats(_)),
                 _ => false,
             }
     })

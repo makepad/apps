@@ -60,5 +60,5 @@ pub use map::{BenchKey, BenchSite, Input, Origin, PinSite, SourceMap, SourceRang
 pub use pin_splice::{part_template, part_templates, PartTemplates};
 pub use source::{load_dir, part_assets, Doc, DocKind, Libs, Sources, SYSTEM_DOC};
 pub use splice::{splice, SpanEdit};
-pub use verify::{Verified, splice_verified, text_verified, with_files};
+pub use verify::{Verified, docs_verified, splice_verified, text_verified, with_files};
 pub use write::write;

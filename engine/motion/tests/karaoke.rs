@@ -2,6 +2,7 @@
 //! unsung → sung → cooled at its own time, warms before its word starts
 //! and never runs ahead of the voice.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::lyrics::voice_from_lyrics;
 use makepad_motion::*;
 
@@ -18,7 +19,7 @@ fn colours(doc: &MotionDoc, t: f64) -> Vec<(String, [f64; 4])> {
     let frame = doc.eval(t);
     assert!(frame.errors.is_empty(), "{:?}", frame.errors);
     match &frame.items[0].kind {
-        ItemKind::Text { text, units, .. } => units.iter().map(|u| (text[u.range.clone()].to_string(), u.color)).collect(),
+        ItemKind::Primitive(PrimitiveFrame::Text { text, units, .. }) => units.iter().map(|u| (text[u.range.clone()].to_string(), u.color)).collect(),
         _ => panic!("a text"),
     }
 }

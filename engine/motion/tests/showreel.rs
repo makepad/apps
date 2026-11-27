@@ -3,6 +3,7 @@
 //! HUD, clocks and time formats, playhead binding, labels, typewriter
 //! rate, onomatopoeia and the `edit(s)` time.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::*;
 
 fn load(source: &str) -> MotionDoc {
@@ -41,12 +42,12 @@ fn leaves(items: &[Item]) -> Vec<Item> {
 fn text_items(d: &MotionDoc, t: f64) -> Vec<Item> {
     let frame = d.eval(t);
     assert!(frame.errors.is_empty(), "{:?}", frame.errors);
-    leaves(&frame.items).into_iter().filter(|i| matches!(i.kind, ItemKind::Text { .. })).collect()
+    leaves(&frame.items).into_iter().filter(|i| matches!(i.kind, ItemKind::Primitive(PrimitiveFrame::Text { .. }))).collect()
 }
 
 fn text_of(item: &Item) -> String {
     match &item.kind {
-        ItemKind::Text { text, .. } => text.clone(),
+        ItemKind::Primitive(PrimitiveFrame::Text { text, .. }) => text.clone(),
         _ => String::new(),
     }
 }
@@ -60,7 +61,7 @@ fn slams_start_big_blurred_or_wide_and_land() {
     assert!((b.local.scale[0] - 1.0).abs() < 0.02 && b.blur < 0.5, "lands in a quarter second");
     let d = doc(r#"Text{text: "FINISHED." size: 180 tracking: 4 at: vec2(960, 540) animate: @tracking_slam start: 0.5}"#);
     let tracking = |t: f64| match &text_items(&d, t)[0].kind {
-        ItemKind::Text { tracking, .. } => *tracking,
+        ItemKind::Primitive(PrimitiveFrame::Text { tracking, .. }) => *tracking,
         _ => 0.0,
     };
     assert!(tracking(0.5) > 180.0, "spread past the frame");
@@ -99,7 +100,7 @@ fn freezes_and_polaroids_compose_with_exits() {
         assert!(frame.errors.is_empty());
         assert_eq!(format!("{:?}", frame.items), format!("{:?}", d.eval(t).items), "exact at {t}");
     }
-    let ellipses = leaves(&d.eval(2.0).items).iter().filter(|i| matches!(i.kind, ItemKind::Ellipse { .. })).count();
+    let ellipses = leaves(&d.eval(2.0).items).iter().filter(|i| matches!(i.kind, ItemKind::Primitive(PrimitiveFrame::Ellipse { .. }))).count();
     assert!(ellipses >= 3, "the live sun, the full-frame freeze and the photo's: {ellipses}");
 }
 
@@ -123,7 +124,7 @@ fn a_glyph_window_and_a_fly_through() {
     // The text without its window letter, and the matte with only it.
     let texts = text_items(&d, 0.5);
     let shown = |item: &Item| match &item.kind {
-        ItemKind::Text { units, .. } => units.iter().filter(|u| u.opacity > 0.0).count(),
+        ItemKind::Primitive(PrimitiveFrame::Text { units, .. }) => units.iter().filter(|u| u.opacity > 0.0).count(),
         _ => 0,
     };
     let mut counts: Vec<usize> = texts.iter().map(shown).collect();
@@ -139,7 +140,7 @@ fn letters(d: &MotionDoc, t: f64) -> Vec<[f64; 4]> {
         .into_iter()
         .filter(|i| i.opacity > 0.01)
         .filter_map(|i| match &i.kind {
-            ItemKind::Path { path, .. } => {
+            ItemKind::Primitive(PrimitiveFrame::Path { path, .. }) => {
                 let b = geometry::bounds(path)?;
                 let o = i.world.apply([0.0, 0.0]);
                 Some([o[0] + b[0], o[1] + b[1], o[0] + b[0] + b[2], o[1] + b[1] + b[3]])
@@ -218,7 +219,7 @@ fn clocks_formats_hud_and_playheads() {
     assert!(at1.iter().any(|t| t == "120 BPM"));
     assert!(at1.iter().any(|t| t == "0.5 / 2.0 s"), "the playhead of the clip: {at1:?}");
     assert!(texts(2.5).iter().any(|t| t == "02/02  TYPOGRAPHY"));
-    let bar = |t: f64| d.eval(t).items.iter().find(|i| matches!(i.kind, ItemKind::Rect { size, .. } if size[0] == 1000.0)).map(|i| i.local.scale[0]).unwrap();
+    let bar = |t: f64| d.eval(t).items.iter().find(|i| matches!(i.kind, ItemKind::Primitive(PrimitiveFrame::Rect { size, .. }) if size[0] == 1000.0)).map(|i| i.local.scale[0]).unwrap();
     assert!((bar(2.0) - 0.5).abs() < 1e-9 && (bar(0.5) - 0.0).abs() < 1e-9 && (bar(3.5) - 1.0).abs() < 1e-9);
     assert!(MotionDoc::load(r#"use mod.motion.*; Motion{size: vec2(100, 100) duration: 1.0 layers: [Text{number: playhead("nope")}]}"#).is_err());
 }
@@ -230,10 +231,10 @@ fn labels_typewriters_and_onomatopoeia() {
         Text{text: "RING RING" animate: @sfx at: vec2(960, 540) align: @center start: 1.0}"#);
     let items = text_items(&d, 0.25);
     let label = items.iter().find(|i| text_of(i) == "SHOWREEL '26").expect("upper-cased label");
-    assert!(matches!(&label.kind, ItemKind::Text { font, .. } if font == "JetBrains Mono") && (label.opacity - 0.6).abs() < 1e-9);
+    assert!(matches!(&label.kind, ItemKind::Primitive(PrimitiveFrame::Text { font, .. }) if font == "JetBrains Mono") && (label.opacity - 0.6).abs() < 1e-9);
     let typed = items.iter().find(|i| text_of(i).starts_with("make")).unwrap();
     // 19 characters at 40 a second: 10 shown by 0.25 s.
-    assert!(matches!(&typed.kind, ItemKind::Text { reveal: Some(n), caret: Some((_, _, true)), .. } if (9..=11).contains(n)), "{:?}", typed.kind);
+    assert!(matches!(&typed.kind, ItemKind::Primitive(PrimitiveFrame::Text { reveal: Some(n), caret: Some((_, _, true)), .. }) if (9..=11).contains(n)), "{:?}", typed.kind);
     let sfx: Vec<Item> = text_items(&d, 1.5).into_iter().filter(|i| text_of(i) == "RING RING").collect();
     assert_eq!(sfx.len(), 13, "twelve outline copies and the fill");
     assert!(text_items(&d, 1.0).iter().filter(|i| text_of(i) == "RING RING").all(|i| i.local.scale[0] < 0.01), "pops from nothing");

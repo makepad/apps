@@ -24,6 +24,10 @@
 //!
 //! Each step's picture is kept (`DEVHUB_KEEP`). HAL offscreen, native GPU, no window.
 
+#[path = "common/view_options.rs"]
+mod view_options;
+#[path = "common/render_mode.rs"]
+mod render_mode;
 use makepad_strict_json::Value;
 use makepad_test::{run_with_config, KeyCode, Selector, TestApp, TestConfig};
 use makepad_widgets::{vec3, vec4, Vec3f};
@@ -360,8 +364,7 @@ fn an_orthographic_view_shows_and_slices_the_whole_part_close_in() {
         let sky = |g: &Grab| -> Vec<[u8; 3]> { (0..by1 + 1).map(|row| g.at(bx0.saturating_sub(8), row)).collect() };
         let normal_sky = sky(&normal);
         let outline_normal = normal.unlike(bx0, by0, bx1, by1, |row| normal_sky[row]);
-        app.locator(Selector::id("rm_slice")).wait_visible().click();
-        app.locator(Selector::id("rm_slice")).wait_checked(true);
+        render_mode::pick(&app, "Sliced");
         wait_until(&app, "the slice", || call(&app, "slice", "{}").is_ok_and(|t| whole_slice(&t)));
         let sliced = finished_grab(&app, "5-sliced-orthographic");
         let sliced_sky = sky(&sliced);
@@ -398,15 +401,16 @@ fn an_orthographic_view_shows_and_slices_the_whole_part_close_in() {
             failed.push(format!("orthographic: from the top the sliced post's top is not its top surface (red {surface:.2} times green or blue)"));
         }
 
-        // The view bar's button: perspective and back, each kept.
+        // The view bar's View options tile: perspective and back, each kept.
+        view_options::toggle(&app);
         for (on, word) in [(false, "0"), (true, "1")] {
-            if app.locator(Selector::id("ortho")).try_wait_visible().is_err() {
-                failed.push("no projection button in the view bar".into());
+            if app.locator(view_options::tile("Orthographic")).try_wait_visible().is_err() {
+                failed.push("no Orthographic tile in the view bar's View options".into());
                 break;
             }
-            app.locator(Selector::id("ortho")).click();
+            app.locator(view_options::tile("Orthographic")).click();
             wait_until(&app, "the button's projection", || camera(&app).ortho == on);
-            app.locator(Selector::id("ortho")).wait_checked(on);
+            app.locator(view_options::tile("Orthographic")).wait_checked(on);
             if pref(&prefs, "ortho").as_deref() != Some(word) {
                 failed.push(format!("the button left the view prefs {:?}", std::fs::read_to_string(&prefs)));
             }

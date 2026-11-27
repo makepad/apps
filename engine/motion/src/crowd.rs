@@ -4,6 +4,7 @@
 //! no tessellation. Every member is a pure function of its index, the
 //! seed and the time: locked-time renders are exact.
 
+use crate::plain::PrimitiveFrame;
 use crate::frame::{Affine, Item, ItemKind, Local, TextUnit};
 use crate::model::{Align, Blend, Cap, Color, Crowd, TextBy, VAlign};
 
@@ -61,11 +62,11 @@ fn shape(path: String, world: Affine, rotate: f64, anchor: [f64; 2], opacity: f6
 }
 
 fn rect(size: [f64; 2], radius: f64, fill: Color, stroke: Option<Color>, width: f64) -> ItemKind {
-    ItemKind::Rect { size, radius: radius.min(size[0].min(size[1]) * 0.5), fill: Some(fill), stroke, width, trim: [0.0, 1.0], cap: Cap::Butt }
+    ItemKind::Primitive(PrimitiveFrame::Rect { size, radius: radius.min(size[0].min(size[1]) * 0.5), fill: Some(fill), stroke, width, trim: [0.0, 1.0], cap: Cap::Butt })
 }
 
 fn ellipse(size: [f64; 2], fill: Color, stroke: Option<Color>, width: f64) -> ItemKind {
-    ItemKind::Ellipse { size, fill: Some(fill), stroke, width, trim: [0.0, 1.0], cap: Cap::Butt }
+    ItemKind::Primitive(PrimitiveFrame::Ellipse { size, fill: Some(fill), stroke, width, trim: [0.0, 1.0], cap: Cap::Butt })
 }
 
 /// The crowd's items, back row first, placed by `placed` (the layer's
@@ -182,7 +183,7 @@ pub fn items(path: &str, placed: &Affine, m: &mut Moment) -> Vec<Item> {
                 out.push(shape(id("sign"), card, tilt, [0.5, 1.0], e, rect([cw, ch], s * 0.03, c.sign_color, Some(c.sign_ink), width)));
                 let label = feet.then(&Affine::translate(0.0, top + ch * 0.5));
                 let size = ch * 0.5;
-                out.push(shape(id("sign_text"), label, tilt, [0.5, 0.5], e, ItemKind::Text {
+                out.push(shape(id("sign_text"), label, tilt, [0.5, 0.5], e, ItemKind::Primitive(PrimitiveFrame::Text {
                     text: c.sign.clone(),
                     font: "Anton".into(),
                     weight: 400.0,
@@ -202,7 +203,7 @@ pub fn items(path: &str, placed: &Affine, m: &mut Moment) -> Vec<Item> {
                     reveal: None,
                     caret: None,
                     outline: None,
-                }));
+                })));
             }
             // Body (running off below the row) and head.
             let body = feet.then(&Affine::translate(-body_w * 0.5, -body_h));

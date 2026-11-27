@@ -2,6 +2,7 @@
 //! camera, lights, nodes and materials, or a full Splash scene (an object of
 //! the document's own VM, which motion3d reads there).
 
+use crate::plain::GroupProps;
 use super::{At, Reader};
 use crate::layers::Scene3D;
 use crate::model::*;
@@ -41,7 +42,7 @@ impl Scene3D {
         }
         let Some(doc_vm) = c.doc_vm.clone() else {
             c.err(at, "", "a Scene3D is read from the document's VM".into(), None);
-            return LayerKind::Group { layers: Vec::new(), mask: None, mask_mode: MaskMode::Alpha, stagger: Stagger::none(), size: None, post: Default::default(), glyphs: false };
+            return LayerKind::Group { layers: Vec::new(), mask: None, props: GroupProps { mask_mode: MaskMode::Alpha, stagger: Stagger::none(), size: None }, post: Default::default(), glyphs: false };
         };
         let assets = super::scene_assets(c.vm, at.obj);
         let scene = SceneSource::Object(makepad_stage_motion3d::doc::SceneObject::new(doc_vm, at.obj, c.map.prefix_cols));
@@ -51,7 +52,7 @@ impl Scene3D {
     #[cfg(not(feature = "scene3d"))]
     fn full_scene(&self, c: &mut Reader, at: &At) -> LayerKind {
         c.err(at, "", "a Scene3D with more than a `model` needs makepad-motion's `scene3d` feature (motion3d reads it)".to_string(), None);
-        LayerKind::Group { layers: Vec::new(), mask: None, mask_mode: MaskMode::Alpha, stagger: Stagger::none(), size: None, post: Default::default(), glyphs: false }
+        LayerKind::Group { layers: Vec::new(), mask: None, props: GroupProps { mask_mode: MaskMode::Alpha, stagger: Stagger::none(), size: None }, post: Default::default(), glyphs: false }
     }
 
     /// The glTF scene: `model`, `camera`, `lights`, `nodes`, `materials`.

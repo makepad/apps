@@ -50,7 +50,7 @@ pub(crate) fn content_roots() -> &'static [(PathBuf, bool)] {
 /// Story's local settings file of extra content roots: one absolute folder
 /// per line, `#` starts a comment.
 pub(crate) fn settings_roots() -> PathBuf {
-    makepad_ai_hub::home::makepad_home().join("story").join("content-roots.txt")
+    makepad_widgets::makepad_platform::home::app_state_home().join("story").join("content-roots.txt")
 }
 
 /// The checkout roots of a build whose package is at `manifest` (`<repo>/story/app`),

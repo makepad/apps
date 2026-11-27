@@ -10,6 +10,7 @@ use fab_elec_explore::{edit::Toward, layout, rows::SheetRows, Opts};
 /// Snapshot has no constructor or Default here; mirror the host's explicit empty-result setup.
 pub(in crate::explorer) fn snapshot(design: Arc<Design>) -> DesignSnapshot {
     DesignSnapshot {
+        proposals: Default::default(),
         profiles: Arc::default(), profile_diags: Arc::default(),
         design, preview: None, preview_tag: None, preview_by: None, created: vec![], last_commit: None,
         sheets: vec![], proposal: None, job: None, conn: vec![], rules: vec![], fills: vec![], sysnets: None,

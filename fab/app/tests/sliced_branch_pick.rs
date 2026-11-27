@@ -9,6 +9,8 @@
 //!
 //! HAL offscreen (`MAKEPAD_HAL_BACKEND=offscreen`), native GPU.
 
+#[path = "common/render_mode.rs"]
+mod render_mode;
 mod common;
 #[path = "common/picture.rs"]
 mod picture;
@@ -240,8 +242,7 @@ fn a_branch_in_sliced_is_clicked_to_pick_it_and_a_press_on_it_still_orbits() {
         app.locator(Selector::role(Role::TreeItem).name("Mushroom")).wait_visible().click();
         app.locator(Selector::role(Role::Button).name("View")).wait_visible().press();
         app.locator(Selector::role(Role::MenuItem).name("Frame Selected")).wait_visible().press();
-        app.locator(Selector::id("rm_slice")).wait_visible().click();
-        app.locator(Selector::id("rm_slice")).wait_checked(true);
+        render_mode::pick(&app, "Sliced");
         wait_until(&app, "the slice", || common::slice_state(&app) == "Sliced");
         let front = looking(&camera_at_rest(&app, "the framed front view"));
         // Frame Selected comes while View: Front may still glide: it frames along where the glide

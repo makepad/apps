@@ -75,18 +75,20 @@ class Gl {
         const b=Buffer.concat([Buffer.from(bytes(m.data,4)),Buffer.from(bytes(m.byte_data,1))]);
         upload(index?6:2,m.buffer_id,b);break;
       }
-      case 'FromWasmRetainedArrayBuffer':
-        u(m.first_slot,'first_slot');upload(3,m.buffer_id,bytes(m.data,4));break;
-      case 'FromWasmRetainedArrayUpdate':
-        u(4,'kind');fields(m,'buffer_id slot_count capacity_bytes replace');
-        m.copies.forEach((c,i)=>fields(c,'source_slot destination_slot slot_count',`copies[${i}].`));
-        m.writes.forEach((w,i)=>upload(5,w.destination_slot,bytes(w.data,4),`writes[${i}].data`));break;
+      case 'FromWasmCreateInstanceSlab':
+        u(3,'kind');fields(m,'slab_slot backing_generation capacity_bytes');break;
+      case 'FromWasmWriteInstanceRegion':
+        u(4,'kind');fields(m,'backing_generation');fields(m.region,'index gen','region.');fields(m,'byte_off');
+        upload(5,m.slab_slot,Buffer.concat(m.parts.map(p=>Buffer.from(bytes(p,1)))),'parts');break;
       case 'FromWasmAllocVao':
-        u(7,'kind');fields(m,'vao_id shader_id geom_ib_id geom_vb_id inst_vb_id');break;
+        u(7,'kind');fields(m,'vao_id shader_id geom_ib_id geom_vb_id slab_slot backing_generation');
+        fields(m.region,'index gen','region.');fields(m,'byte_off byte_len instance_byte_offset');break;
       case 'FromWasmFreeWebGLResources':
         u(8,'kind');for(const key of ['array_buffer_ids','index_buffer_ids','vao_ids','texture_ids','framebuffer_ids']) {
           u(m[key].length,`${key}.length`);m[key].forEach((v,i)=>u(v,`${key}[${i}]`));
-        }break;
+        }
+        u(m.instance_slabs.length,'instance_slabs.length');
+        m.instance_slabs.forEach((s,i)=>fields(s,'slab_slot backing_generation',`instance_slabs[${i}].`));break;
       case 'FromWasmAllocTextureImage2D_BGRAu8_32':
       case 'FromWasmAllocTextureImage2D_Ru8':
       case 'FromWasmAllocTextureImage2D_RGBAf32':

@@ -1,6 +1,7 @@
 //! Problems are reported where they are written, name the property, and
 //! teach the fix.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::*;
 
 fn errors(source: &str) -> Vec<Diagnostic> {
@@ -149,7 +150,7 @@ fn inputs_compute_with_splash_vectors_and_math() {
         layers: [Rect{at: in(@target) - in(@box) * 0.5 size: in(@box) * in(@gain) / 3 fill: #fff rotate: sin(0.5) * 0}]}"#).unwrap();
     let frame = doc.eval(0.0);
     assert_eq!(frame.items[0].world.apply([0.0, 0.0]), [80.0, 40.0]);
-    let ItemKind::Rect { size, .. } = &frame.items[0].kind else { panic!() };
+    let ItemKind::Primitive(PrimitiveFrame::Rect { size, .. }) = &frame.items[0].kind else { panic!() };
     assert_eq!(*size, [40.0, 20.0]);
     let moved = doc.with_inputs(&[(LiveId::from_str("target"), InputValue::Vec2([10.0, 10.0]))]).unwrap();
     assert_eq!(moved.eval(0.0).items[0].world.apply([0.0, 0.0]), [-10.0, 0.0]);

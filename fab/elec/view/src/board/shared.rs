@@ -39,14 +39,14 @@ use super::pick::ScenePick;
 use super::scene::{scene_of, scene_of_fill_region, scene_of_items, DrawScene};
 use super::tiles::TileId;
 use crate::live::segs::{TreeIn, TreeOwner};
-use crate::snapshot::ElecLive;
+use crate::snapshot::{DesignSnapshot, ElecLive, ProposalId};
 use fab_elec_bench::ValueIndex;
 use fab_elec_circuit::Circuit;
 use fab_elec_board::{zone, Board, BoardDelta, ZoneFill};
 use fab_elec_core::{BBox, BoardId, ItemId, LayerId, Nm};
 use makepad_widgets_core::{makepad_platform::retained_instances::{InstanceSegment, RetainedInstances}, *};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// One stream's publication (the instance rows the frame builder uploads), if it has rows.
 pub type Publication = Option<RetainedInstances>;
@@ -104,14 +104,26 @@ pub struct DrawTiming {
     pub edited: usize,
 }
 
+/// Picture and geometry revisions within one slot. A delta is valid only against the
+/// preceding picture of that slot. Crossing from a proposal to Live invalidates all tiles.
+#[derive(Clone)]
+pub struct DrawRevision {
+    /// Rises with each new picture.
+    pub gen: u64,
+    /// Rises when the pick and check geometry changes.
+    pub geom_gen: u64,
+    /// Board-nm boxes changed since the previous picture. None invalidates the whole board.
+    pub changed: Option<Arc<[BBox]>>,
+}
+
 /// One board's drawing (module docs).
 #[derive(Clone)]
 pub struct BoardDraw {
     pub unit: BoardId,
-    /// Rises with every new picture, full or incremental.
-    pub gen: u64,
-    /// Rises with every new `geom`.
-    pub geom_gen: u64,
+    built: DrawRevision,
+    /// Set once on adoption so every holder keeps the exact drawing and Live consumers see
+    /// a new generation even when the two slots happened to have the same generation.
+    adopted: OnceLock<DrawRevision>,
     pub board: Arc<Board>,
     pub fills: Arc<Vec<ZoneFill>>,
     /// The simulation rows used by these instances; empty without a live bench.
@@ -128,11 +140,11 @@ pub struct BoardDraw {
     /// Of `geom.board`: `board`, or for a moment after an incremental edit the board before it.
     pub geom: Arc<BoardGeom>,
     pub timing: DrawTiming,
-    /// The board-nm boxes where this drawing may differ from drawing `gen - 1`: an incremental
-    /// picture's edited items at their old and new places and its fill regions. `None` after a
-    /// full build (all of it). A consumer that last drew `gen - 1` may redraw only these; one
-    /// that missed a drawing redraws everything.
-    pub changed: Option<Arc<[BBox]>>,
+}
+
+impl std::ops::Deref for BoardDraw {
+    type Target = DrawRevision;
+    fn deref(&self) -> &DrawRevision { self.adopted.get().unwrap_or(&self.built) }
 }
 
 /// A board's copper trees as registered with the host's segment rows, and the rows they got.
@@ -148,6 +160,14 @@ struct Want {
     board: Arc<Board>,
     fills: Arc<Vec<ZoneFill>>,
     at: f64,
+    /// The picture on which this job based its tile delta.
+    base_gen: Option<u64>,
+}
+
+impl Want {
+    fn new(board: Arc<Board>, fills: Arc<Vec<ZoneFill>>) -> Self {
+        Self { board, fills, at: Cx::monotonic_now(), base_gen: None }
+    }
 }
 
 struct Picture {
@@ -181,18 +201,74 @@ enum Built {
     Picture(Picture),
 }
 
-struct Slot {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BoardSource {
+    Live,
+    Proposal(ProposalId),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DrawKey {
+    source: BoardSource,
     unit: BoardId,
+}
+
+struct Slot {
+    key: DrawKey,
     want: Option<Want>,
     current: Option<Arc<BoardDraw>>,
     job: Option<(TaskHandle<Built>, Want)>,
     geom_job: Option<TaskHandle<BoardGeom>>,
 }
 
+impl Slot {
+    fn finish_picture(&self, want: &Want, picture: Picture) -> Arc<BoardDraw> {
+        let now = Cx::monotonic_now();
+        let timing = DrawTiming {
+            requested: want.at,
+            installed: now,
+            picture_ms: picture.ms,
+            wires_ms: picture.wires_ms,
+            trees_ms: picture.trees_ms,
+            incremental: picture.edited.is_some(),
+            edited: picture.edited.unwrap_or(0),
+        };
+        let (gen, geom_gen) = self.current.as_ref().map_or((0, 0), |c| (c.gen, c.geom_gen));
+        let need_geom = picture.geom.is_none();
+        let geom = match (picture.geom, self.current.as_ref()) {
+            (Some(g), _) => Arc::new(g),
+            (None, Some(cur)) => cur.geom.clone(),
+            (None, None) => unreachable!("an incremental picture has a previous drawing"),
+        };
+        Arc::new(BoardDraw {
+            unit: self.key.unit,
+            built: DrawRevision { gen: gen + 1, geom_gen: geom_gen + (!need_geom) as u64,
+                changed: picture.changed.filter(|_| want.base_gen == Some(gen)).map(Arc::from) },
+            adopted: OnceLock::new(),
+            board: want.board.clone(),
+            fills: want.fills.clone(),
+            live: picture.live,
+            index: picture.index,
+            _wires: picture.wires,
+            trees: picture.trees,
+            batch: Arc::new(picture.batch),
+            pubs: picture.pubs,
+            geom,
+            timing,
+        })
+    }
+
+    fn publish(&mut self, draw: Arc<BoardDraw>, changed: &mut Vec<BoardId>) -> Option<Arc<BoardDraw>> {
+        if self.key.source == BoardSource::Live { changed.push(self.key.unit); }
+        self.current.replace(draw)
+    }
+}
+
 /// The shared board drawings of this process (a `Cx` global; module docs).
 #[derive(Default)]
 pub struct BoardDraws {
     slots: Vec<Slot>,
+    changed: Vec<BoardId>,
     templates: Option<Templates>,
     /// Drawings let go of, waiting until this is their last reference to be dropped on the pool.
     retired: Vec<Arc<BoardDraw>>,
@@ -223,35 +299,92 @@ impl BoardDraws {
     /// Draw this board (keyed by `board.unit`). Handing in the board and fills that are already
     /// wanted or drawn (the same `Arc`s) does nothing, so every view of a board may call it.
     pub fn set_board(cx: &mut Cx, board: Arc<Board>, fills: Arc<Vec<ZoneFill>>) {
+        Self::set_source(cx, BoardSource::Live, board, fills);
+    }
+
+    pub(super) fn set_source(cx: &mut Cx, source: BoardSource, board: Arc<Board>, fills: Arc<Vec<ZoneFill>>) {
         let me = cx.global::<BoardDraws>();
-        let unit = board.unit;
-        let slot = match me.slots.iter().position(|s| s.unit == unit) {
-            Some(i) => &mut me.slots[i],
-            None => {
-                me.slots.push(Slot { unit, want: None, current: None, job: None, geom_job: None });
-                me.slots.last_mut().unwrap()
-            }
-        };
+        let key = DrawKey { source, unit: board.unit };
+        let slot = Self::slot(&mut me.slots, key);
         let same = |b: &Arc<Board>, f: &Arc<Vec<ZoneFill>>| Arc::ptr_eq(b, &board) && Arc::ptr_eq(f, &fills);
         let known = slot.want.as_ref().map(|w| same(&w.board, &w.fills))
             .or_else(|| slot.job.as_ref().map(|(_, w)| same(&w.board, &w.fills)))
             .or_else(|| slot.current.as_ref().map(|c| same(&c.board, &c.fills)))
             .unwrap_or(false);
         if !known {
-            if let Some(old) = slot.want.replace(Want { board, fills, at: Cx::monotonic_now() }) {
+            if let Some(old) = slot.want.replace(Want::new(board, fills)) {
                 me.discarded.push(Box::new(old));
             }
             Self::pump(cx);
         }
     }
 
+    fn slot(slots: &mut Vec<Slot>, key: DrawKey) -> &mut Slot {
+        if let Some(i) = slots.iter().position(|s| s.key == key) { return &mut slots[i]; }
+        slots.push(Slot { key, want: None, current: None, job: None, geom_job: None });
+        slots.last_mut().unwrap()
+    }
+
     /// Forget a board (its unit went away).
     pub fn remove(cx: &mut Cx, unit: BoardId) {
-        if cx.has_global::<ElecLive>() {
-            cx.get_global::<ElecLive>().sim.trees.remove(TreeOwner::Copper(unit));
+        Self::remove_key(cx, DrawKey { source: BoardSource::Live, unit });
+    }
+
+    /// End other comparisons. An exact picture moves into the Live slot immediately.
+    /// The next poll refreshes its simulation index, wires and trees as for any Live picture.
+    pub fn keep_preview(cx: &mut Cx, id: Option<ProposalId>, snap: &DesignSnapshot) {
+        if !cx.has_global::<BoardDraws>() { return; }
+        let me = cx.get_global::<BoardDraws>();
+        for i in (0..me.slots.len()).rev() {
+            let key = me.slots[i].key;
+            if !matches!(key.source, BoardSource::Proposal(old) if Some(old) != id) { continue; }
+            let mut proposal = me.slots.remove(i);
+            if let Some((job, _)) = &proposal.job { job.cancel(); }
+            if let Some(draw) = proposal.current.take() {
+                let matches = snap.live().unit(key.unit).and_then(|u| u.board.as_ref())
+                    .is_some_and(|b| Arc::ptr_eq(b, &draw.board))
+                    && snap.of(&snap.fills, key.unit).is_some_and(|f| Arc::ptr_eq(&f.value, &draw.fills));
+                if matches {
+                    me.adopt(draw, proposal.geom_job.take());
+                } else {
+                    me.retired.push(draw);
+                }
+            }
+            if let Some(job) = &proposal.geom_job { job.cancel(); }
+            me.discarded.push(Box::new(proposal));
+        }
+        Self::sweep(cx);
+    }
+
+    fn adopt(&mut self, draw: Arc<BoardDraw>, geom_job: Option<TaskHandle<BoardGeom>>) {
+        let live = Self::slot(&mut self.slots, DrawKey { source: BoardSource::Live, unit: draw.unit });
+        // Every Live request comes from a snapshot no newer than the one this drawing matches
+        // (the host hands its boards over after the drain that ends the comparison), so any
+        // other build is stale: finishing it would put the earlier design back over this one.
+        if let Some((job, want)) = live.job.take() {
+            job.cancel();
+            self.discarded.push(Box::new((job, want)));
+        }
+        if let Some(want) = live.want.take() {
+            self.discarded.push(Box::new(want));
+        }
+        if let Some(job) = live.geom_job.take() {
+            job.cancel();
+            self.discarded.push(Box::new(job));
+        }
+        live.geom_job = geom_job;
+        let (gen, geom_gen) = live.current.as_ref().map_or((1, 1), |c| (c.gen + 1, c.geom_gen + 1));
+        draw.adopted.get_or_init(|| DrawRevision { gen, geom_gen, changed: None });
+        self.retired.extend(live.publish(draw, &mut self.changed));
+        SignalToUI::set_ui_signal();
+    }
+
+    fn remove_key(cx: &mut Cx, key: DrawKey) {
+        if key.source == BoardSource::Live && cx.has_global::<ElecLive>() {
+            cx.get_global::<ElecLive>().sim.trees.remove(TreeOwner::Copper(key.unit));
         }
         let me = cx.global::<BoardDraws>();
-        if let Some(i) = me.slots.iter().position(|s| s.unit == unit) {
+        if let Some(i) = me.slots.iter().position(|s| s.key == key) {
             let mut slot = me.slots.remove(i);
             me.retired.extend(slot.current.take());
             me.discarded.push(Box::new(slot));
@@ -262,7 +395,14 @@ impl BoardDraws {
     /// Hand back a drawing a view no longer draws (instead of dropping it): the last reference to
     /// any drawing is dropped on the pool, never on the UI thread.
     pub fn retire(cx: &mut Cx, draw: Arc<BoardDraw>) {
-        cx.global::<BoardDraws>().retired.push(draw);
+        let me = cx.global::<BoardDraws>();
+        if !me.slots.iter().any(|s| s.current.as_ref().is_some_and(|current| Arc::ptr_eq(current, &draw)))
+            && !me.retired.iter().any(|old| Arc::ptr_eq(old, &draw)) {
+            me.retired.push(draw);
+        } else {
+            drop(draw);
+        }
+        Self::sweep(cx);
     }
 
     /// Free replaced pane data on the pool alongside discarded board inputs and results.
@@ -299,7 +439,12 @@ impl BoardDraws {
 
     /// The board's current drawing, if one is in.
     pub fn current(cx: &mut Cx, unit: BoardId) -> Option<Arc<BoardDraw>> {
-        cx.global::<BoardDraws>().slots.iter().find(|s| s.unit == unit).and_then(|s| s.current.clone())
+        Self::current_source(cx, BoardSource::Live, unit)
+    }
+
+    pub(super) fn current_source(cx: &mut Cx, source: BoardSource, unit: BoardId) -> Option<Arc<BoardDraw>> {
+        let key = DrawKey { source, unit };
+        cx.global::<BoardDraws>().slots.iter().find(|s| s.key == key).and_then(|s| s.current.clone())
     }
 
     /// Takes finished jobs and starts the next ones; returns the boards whose drawing changed.
@@ -307,7 +452,6 @@ impl BoardDraws {
     /// second caller in the same event finds nothing left to take.
     pub fn poll(cx: &mut Cx) -> Vec<BoardId> {
         let live = cx.has_global::<ElecLive>();
-        let mut changed = Vec::new();
         let mut geoms = Vec::new();
         let mut wired = Vec::new();
         let me = cx.global::<BoardDraws>();
@@ -320,9 +464,8 @@ impl BoardDraws {
                             if let Some(cur) = slot.current.as_ref().filter(|cur| Arc::ptr_eq(&geom.board, &cur.board)) {
                                 let mut next = BoardDraw::clone(cur);
                                 next.geom = Arc::new(geom);
-                                next.geom_gen += 1;
-                                me.retired.extend(slot.current.replace(Arc::new(next)));
-                                changed.push(slot.unit);
+                                next.adopted.get_mut().unwrap_or(&mut next.built).geom_gen += 1;
+                                me.retired.extend(slot.publish(Arc::new(next), &mut me.changed));
                             } else {
                                 // An older geometry finishing after a newer full build is freed on the pool.
                                 me.discarded.push(Box::new(geom));
@@ -337,47 +480,15 @@ impl BoardDraws {
             let (_, want) = slot.job.take().unwrap();
             match result {
                 Ok(Built::Wires(w)) => {
-                    wired.push((slot.unit, want, slot.current.clone(), w));
+                    wired.push((slot.key, want, slot.current.clone(), w));
                 }
                 Ok(Built::Picture(picture)) => {
-                    let now = Cx::monotonic_now();
-                    let timing = DrawTiming {
-                        requested: want.at,
-                        installed: now,
-                        picture_ms: picture.ms,
-                        wires_ms: picture.wires_ms,
-                        trees_ms: picture.trees_ms,
-                        incremental: picture.edited.is_some(),
-                        edited: picture.edited.unwrap_or(0),
-                    };
-                    let (gen, geom_gen) = slot.current.as_ref().map_or((0, 0), |c| (c.gen, c.geom_gen));
                     let need_geom = picture.geom.is_none();
-                    let geom = match (picture.geom, slot.current.as_ref()) {
-                        (Some(g), _) => Arc::new(g),
-                        (None, Some(cur)) => cur.geom.clone(),
-                        (None, None) => unreachable!("an incremental picture has a previous drawing"),
-                    };
-                    let old = slot.current.replace(Arc::new(BoardDraw {
-                        unit: slot.unit,
-                        gen: gen + 1,
-                        geom_gen: geom_gen + (!need_geom) as u64,
-                        board: want.board.clone(),
-                        fills: want.fills.clone(),
-                        live: picture.live,
-                        index: picture.index,
-                        _wires: picture.wires,
-                        trees: picture.trees,
-                        batch: Arc::new(picture.batch),
-                        pubs: picture.pubs,
-                        geom,
-                        timing,
-                        changed: picture.changed.map(Arc::from),
-                    }));
-                    me.retired.extend(old);
+                    let draw = slot.finish_picture(&want, picture);
+                    me.retired.extend(slot.publish(draw, &mut me.changed));
                     if need_geom {
-                        geoms.push((slot.unit, want.board, want.fills));
+                        geoms.push((slot.key, want.board, want.fills));
                     }
-                    changed.push(slot.unit);
                 }
                 Err(e) => {
                     me.discarded.push(Box::new(want));
@@ -385,7 +496,8 @@ impl BoardDraws {
                 }
             }
         }
-        for (unit, want, old, Wired { wires, trees, kept, same, ms: wires_ms }) in wired {
+        for (key, mut want, old, Wired { wires, trees, kept, same, ms: wires_ms }) in wired {
+            let unit = key.unit;
             // A wires job starts only with this global, which stays installed in Cx.
             let sim = &mut cx.get_global::<ElecLive>().sim;
             let t0 = Cx::monotonic_now();
@@ -410,6 +522,7 @@ impl BoardDraws {
             }
             let templates = me.templates.clone().unwrap();
             let circuit = cx.get_global::<ElecLive>().snap.live().unit(unit).map(|u| u.circuit.clone());
+            want.base_gen = old.as_ref().map(|d| d.gen);
             let (board, fills) = (want.board.clone(), want.fills.clone());
             let job = move || {
                 let t0 = Cx::monotonic_now();
@@ -427,7 +540,7 @@ impl BoardDraws {
             };
             let submitted = cx.task_pool().submit(Class::Interactive, job);
             let me = cx.global::<BoardDraws>();
-            let slot = me.slots.iter_mut().find(|s| s.unit == unit).unwrap();
+            let slot = me.slots.iter_mut().find(|s| s.key == key).unwrap();
             match submitted {
                 Ok(handle) => slot.job = Some((handle, want)),
                 Err(e) => {
@@ -441,12 +554,12 @@ impl BoardDraws {
                 }
             }
         }
-        for (unit, board, fills) in geoms {
+        for (key, board, fills) in geoms {
             let job = move || geom_of(board, &fills);
             match cx.task_pool().submit(Class::Interactive, job) {
                 Ok(handle) => {
                     let me = cx.global::<BoardDraws>();
-                    if let Some(slot) = me.slots.iter_mut().find(|s| s.unit == unit) {
+                    if let Some(slot) = me.slots.iter_mut().find(|s| s.key == key) {
                         if let Some(old) = slot.geom_job.replace(handle) {
                             me.discarded.push(Box::new(old));
                         }
@@ -458,11 +571,11 @@ impl BoardDraws {
         if live {
             let index = cx.get_global::<ElecLive>().sim.index.clone();
             for slot in &mut cx.global::<BoardDraws>().slots {
-                if slot.want.is_none() && slot.job.is_none() {
+                if slot.key.source == BoardSource::Live && slot.want.is_none() && slot.job.is_none() {
                     if let Some(cur) = &slot.current {
                         if !cur.index.as_ref().is_some_and(|old| Arc::ptr_eq(old, &index)) {
                             // Bypass set_board's same-Arc shortcut: this lowering renumbered rows.
-                            slot.want = Some(Want { board: cur.board.clone(), fills: cur.fills.clone(), at: Cx::monotonic_now() });
+                            slot.want = Some(Want::new(cur.board.clone(), cur.fills.clone()));
                         }
                     }
                 }
@@ -470,7 +583,7 @@ impl BoardDraws {
         }
         Self::pump(cx);
         Self::sweep(cx);
-        changed
+        std::mem::take(&mut cx.global::<BoardDraws>().changed)
     }
 
     /// Starts a wires or picture job for every wanted board with no job running.
@@ -482,15 +595,16 @@ impl BoardDraws {
         for slot in &mut me.slots {
             if slot.job.is_none() {
                 if let Some(want) = slot.want.take() {
-                    start.push((slot.unit, want, slot.current.clone()));
+                    start.push((slot.key, want, slot.current.clone()));
                 }
             }
         }
-        for (unit, want, old) in start {
+        for (key, mut want, old) in start {
+            want.base_gen = old.as_ref().map(|d| d.gen);
             let (board, fills, t) = (want.board.clone(), want.fills.clone(), templates.clone());
             let prev = old.as_ref().and_then(|o| o.trees.as_ref().map(|rec| rec.trees.clone()));
             let job = move || {
-                if live {
+                if live && key.source == BoardSource::Live {
                     let t0 = Cx::monotonic_now();
                     let wires = Arc::new(net_wires(&board, &fills));
                     let trees = trees_in(&board, &wires);
@@ -504,7 +618,7 @@ impl BoardDraws {
                 }
             };
             let submitted = cx.task_pool().submit(Class::Interactive, job);
-            let Some(slot) = cx.global::<BoardDraws>().slots.iter_mut().find(|s| s.unit == unit) else { continue };
+            let Some(slot) = cx.global::<BoardDraws>().slots.iter_mut().find(|s| s.key == key) else { continue };
             match submitted {
                 Ok(handle) => slot.job = Some((handle, want)),
                 Err(e) => {
@@ -726,5 +840,91 @@ fn publish(kind: &KindBatch) -> Publication {
             log!("fab.board: a stream of {} instances is not drawn: {e}", kind.count);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::{tests::snapshot, StateOf, Tagged};
+    use super::super::inst::{StrokeTemplate, TriTemplate};
+
+    #[test]
+    fn proposal_slot_retires_independently_of_the_live_board() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut design = fab_elec_fixtures::ledctl();
+        let unit = design.units[0].id;
+        let board = Arc::new(Board::new(unit, "power"));
+        design.units[0].board = Some(board.clone());
+        let fills: Arc<Vec<ZoneFill>> = Arc::default();
+        let mut snap = snapshot(Arc::new(design));
+        snap.fills.push(Tagged { unit: Some(unit), of: StateOf::Committed, generation: 0, value: fills.clone() });
+        let templates = Templates { stroke: StrokeTemplate::packed(), pad: PadTemplate::packed(), tri: TriTemplate::packed() };
+        let finish = |cx: &mut Cx, source, b: &Arc<Board>, f: &Arc<Vec<ZoneFill>>| {
+            BoardDraws::set_source(cx, source, b.clone(), f.clone());
+            let me = cx.get_global::<BoardDraws>();
+            let slot = BoardDraws::slot(&mut me.slots, DrawKey { source, unit });
+            let want = slot.want.take().unwrap();
+            let pic = picture(None, b.clone(), f.clone(), &templates, Arc::new(LiveIx::none()), None);
+            let draw = slot.finish_picture(&want, pic);
+            me.retired.extend(slot.publish(draw.clone(), &mut me.changed));
+            draw
+        };
+        let old_board = Arc::new((*board).clone());
+        let old = finish(&mut cx, BoardSource::Live, &old_board, &fills);
+        BoardDraws::poll(&mut cx);
+        BoardDraws::set_board(&mut cx, board.clone(), fills.clone());
+        let id = ProposalId(4);
+        let source = BoardSource::Proposal(id);
+        for (b, f) in [(&old_board, &fills), (&board, &Arc::default())] {
+            let different = finish(&mut cx, source, b, f);
+            BoardDraws::keep_preview(&mut cx, Some(id), &snap);
+            assert_eq!(cx.global::<BoardDraws>().slots.len(), 2, "both pictures coexist while the comparison is selected");
+            BoardDraws::keep_preview(&mut cx, None, &snap);
+            let me = cx.global::<BoardDraws>();
+            let [live] = me.slots.as_slice() else { panic!("ending the comparison removes its slot") };
+            let want = live.want.as_ref().unwrap();
+            assert!(Arc::ptr_eq(live.current.as_ref().unwrap(), &old) && Arc::ptr_eq(&want.board, &board)
+                && Arc::ptr_eq(&want.fills, &fills), "a board or fills mismatch leaves the Live picture and its request intact");
+            assert!(me.retired.iter().any(|d| Arc::ptr_eq(d, &different)) && me.changed.is_empty(),
+                "a mismatched comparison retires without publishing a Live change");
+        }
+        let ready = finish(&mut cx, source, &board, &fills);
+        BoardDraws::set_templates(&mut cx, templates.clone());
+        let token = cx.get_global::<BoardDraws>().slots.iter().find(|s| s.key.source == BoardSource::Live)
+            .unwrap().job.as_ref().unwrap().0.token();
+        BoardDraws::keep_preview(&mut cx, None, &snap);
+        assert!(Arc::ptr_eq(&BoardDraws::current(&mut cx, unit).unwrap(), &ready), "Live adopts the finished drawing itself");
+        let [live] = cx.get_global::<BoardDraws>().slots.as_slice() else { panic!("adoption leaves only the Live slot") };
+        assert!(token.is_cancelled() && live.want.is_none() && live.job.is_none(), "the adopted picture cancels its duplicate Live build");
+        assert!(ready.gen == old.gen + 1 && ready.geom_gen == old.geom_gen + 1 && ready.changed.is_none(),
+            "adoption is a full Live publication even when the source slots had the same generation");
+        assert_eq!(BoardDraws::poll(&mut cx), [unit], "poll reports the adopted unit through the Live completion path");
+
+        // A request from an earlier snapshot is queued when a second comparison ends. Pause
+        // submission so the test can inspect the queue and the real index refresh without racing a worker.
+        cx.get_global::<BoardDraws>().templates = None;
+        let next = finish(&mut cx, source, &board, &fills);
+        BoardDraws::set_board(&mut cx, old_board.clone(), fills.clone());
+        cx.set_global(ElecLive::new(Arc::new(snap.clone())));
+        BoardDraws::keep_preview(&mut cx, None, &snap);
+        let live = &cx.get_global::<BoardDraws>().slots[0];
+        assert!(Arc::ptr_eq(live.current.as_ref().unwrap(), &next) && live.want.is_none(),
+            "a stale Live request is dropped: building it would put the earlier design back over the adopted one");
+        BoardDraws::poll(&mut cx);
+        let refresh = cx.get_global::<BoardDraws>().slots[0].want.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&refresh.board, &board) && Arc::ptr_eq(&refresh.fills, &fills),
+            "the Live index refresh requests wires and trees for the adopted picture");
+
+        let last = finish(&mut cx, source, &board, &fills);
+        BoardDraws::set_board(&mut cx, old_board.clone(), fills.clone());
+        BoardDraws::set_templates(&mut cx, templates.clone());
+        let token = cx.get_global::<BoardDraws>().slots.iter().find(|s| s.key.source == BoardSource::Live)
+            .unwrap().job.as_ref().unwrap().0.token();
+        BoardDraws::keep_preview(&mut cx, None, &snap);
+        let live = &cx.get_global::<BoardDraws>().slots[0];
+        assert!(Arc::ptr_eq(live.current.as_ref().unwrap(), &last) && token.is_cancelled()
+            && live.job.is_none() && live.want.is_none(),
+            "a stale Live build in flight is cancelled: finishing it would put the earlier design back over the adopted one");
     }
 }

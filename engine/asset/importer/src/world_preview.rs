@@ -648,6 +648,7 @@ mod tests {
             lightmap_uvs: None,
             detail_png: None,
             detail_scale: [1.0; 2],
+            material_bytes: None,
         }
     }
 

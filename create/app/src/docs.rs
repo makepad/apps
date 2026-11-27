@@ -1,8 +1,8 @@
 //! The open Markdown buffer and the history of the person's signed text edits.
 use crate::model::{Action, Model, Origin};
 use makepad_code_editor::{text::Text, CodeDocument};
-use makepad_work_core::doc;
-use makepad_work_core::event::{kind, Actor, Content, Id};
+use makepad_town_core::doc;
+use makepad_town_core::event::{kind, Actor, Content, Id};
 use std::collections::HashSet;
 
 #[derive(Default)]

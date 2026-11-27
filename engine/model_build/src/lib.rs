@@ -57,7 +57,7 @@ pub trait BuildHost: Send + Sync + 'static {
     /// Bytes of built products kept in memory in front of the store, and the working memory each
     /// build may hold beside its document (its share).
     fn memory_budget(&self) -> usize;
-    /// Bytes of working memory a follow-up may hold when its share refused it and it runs alone:
+    /// Bytes of working memory a build or follow-up may hold when its share refused it and it runs alone:
     /// the app's whole budget for generated models.
     fn alone_budget(&self) -> usize { self.memory_budget() }
     /// The cache's store client root (single owner).
@@ -156,15 +156,31 @@ pub struct Finished { pub request: ScriptModelRequest, pub started: Instant, pub
 /// A fresh product goes to the store after the app has it (the lock is held until then).
 /// `replaces_detail`: the product of a model with a full-detail row, retired once this saves.
 struct PublishLater { lock: cache::BuildLock, session: Option<StoreSession>, glb: Arc<[u8]>, replaces_detail: bool }
-struct Running { request: ScriptModelRequest, cancel: Arc<AtomicBool>, receiver: Receiver<Result<Product, String>>, started: Instant, cached: bool }
+/// Keep the original store inputs and publication callback across a memory wait.
+struct PrimaryJob {
+    request: ScriptModelRequest,
+    session: Option<StoreSession>,
+    variant: Option<String>,
+    after: Option<Box<dyn FnOnce(Arc<[u8]>) + Send>>,
+    started: Instant,
+}
+impl PrimaryJob {
+    fn new(request: ScriptModelRequest) -> Self {
+        let (session, variant) = host().store();
+        let after = host().after_build(&request, session.clone());
+        Self { request, session, variant, after, started: Instant::now() }
+    }
+}
+struct Running { request: ScriptModelRequest, cancel: Arc<AtomicBool>, receiver: Receiver<Result<Primary<Product, (PrimaryJob, String)>, String>>, started: Instant, cached: bool }
 #[derive(Default)]
 struct Builds {
     /// When the service started (compiles wait briefly for the store).
     started: StartInstant,
     pool: Option<TaskPool>,
     waiting: VecDeque<ScriptModelRequest>,
+    waiting_alone: VecDeque<(PrimaryJob, String)>,
     running: Vec<Running>,
-    /// A follow-up runs alone: new compiles wait until it is done.
+    /// A primary or follow-up runs alone: new compiles wait until it is done.
     alone: bool,
 }
 #[derive(Clone, Copy)]
@@ -231,19 +247,23 @@ fn auto_lod_ops(doc: &makepad_model::Document) -> Vec<Operation> {
     if doc.skeleton().is_some() { return Vec::new(); }
     let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
     let mut parts = Vec::new();
-    for (name, mesh) in doc.objects() {
+    for (name, geometry) in doc.geometries() {
         let world = match doc.scene().world_matrix(name) {
             Ok(world) => world,
             Err(error) => { log!("automatic LOD part '{}': {}", name, error); continue; }
         };
         let (mut part_lo, mut part_hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
-        for v in mesh.vertices() {
-            let position = transform_point(world, v.position);
+        let mut include = |p| {
+            let position = transform_point(world, p);
             for d in 0..3 { part_lo[d] = part_lo[d].min(position[d]); part_hi[d] = part_hi[d].max(position[d]); }
+        };
+        match geometry {
+            makepad_model::ObjectGeometry::Editable(m) => m.vertices().iter().for_each(|v| include(v.position)),
+            makepad_model::ObjectGeometry::Baked(m) => m.positions.iter().for_each(|p| include(p.map(f64::from))),
         }
         if part_lo.iter().chain(&part_hi).any(|v| !v.is_finite()) { continue; }
         for d in 0..3 { lo[d] = lo[d].min(part_lo[d]); hi[d] = hi[d].max(part_hi[d]); }
-        if name.starts_with("__") { continue; }
+        if matches!(geometry, makepad_model::ObjectGeometry::Baked(_)) || name.starts_with("__") { continue; }
         let hide = match doc.scene().lods.get(name).map(Vec::as_slice) {
             Some([level]) if level.target_faces == 0 => Some(level),
             Some(_) => continue,
@@ -295,16 +315,21 @@ fn next_material(doc: &makepad_model::Document) -> u32 {
 /// radius in the XY plane, uvs = corner x radius (libs/render impostor.rs;
 /// the shader turns the quad toward the camera and picks the frames).
 fn impostor_ops(b: &makepad_render::impostor::ImpostorBake, distance: f64, material: u32, limits: &makepad_model::Limits) -> Result<Vec<Operation>, String> {
-    use makepad_model::{mesh::Polygon, Material, RgbaImage, SurfaceAlpha, SurfaceChannel, SurfaceLayer, SurfaceMaterial, SurfaceOperation};
+    use makepad_model::{BakedMesh, Material, RgbaImage, SurfaceAlpha, SurfaceChannel, SurfaceLayer, SurfaceMaterial, SurfaceOperation};
     let image = |px: &[u8]| { let side = ((px.len() / 4) as f64).sqrt() as u32; RgbaImage { width: side, height: side, pixels: px.to_vec() } };
-    let [cx, cy, cz] = b.center.map(|v| v as f64);
-    let r = b.radius as f64;
+    let [cx, cy, cz] = b.center;
+    let r = b.radius;
     let crown = if b.crown { 1.0 } else { 0.0 };
     let shading = makepad_gltf::GlbShading { wind: 0.0, clearcoat: 0.0, flake: 0.0, impostor: distance, rim: 0.0, crown, plate: 0.0, lamp: None, ..Default::default() };
     let surface = SurfaceMaterial { base_color: [1.0; 4], metallic: 0.0, roughness: 0.9, alpha: SurfaceAlpha::Mask, alpha_cutoff: 0.5, double_sided: true, shading: Some(shading), ..SurfaceMaterial::default() };
     let layer = |channel: SurfaceChannel, name: &str, px: &[u8]| Operation::Surface(SurfaceOperation::Layer { material, channel, layer: SurfaceLayer::new(name, image(px)) });
     let mips = |channel: SurfaceChannel, name: &str| Operation::Surface(SurfaceOperation::Mips { material, channel, layer: name.into() });
-    let quad = Polygon { vertices: vec![0, 1, 2, 3], uvs: vec![[-r, -r], [r, -r], [r, r], [-r, r]], material };
+    let quad = Operation::Baked { object: "impostor-quad".into(), mesh: Arc::new(BakedMesh {
+        positions: vec![[cx-r, cy+r, cz], [cx-r, cy-r, cz], [cx+r, cy-r, cz], [cx+r, cy+r, cz]],
+        normals: vec![[0., 0., 1.]; 4], uvs: Some(vec![[-r,r], [-r,-r], [r,-r], [r,r]]),
+        material_bytes: None, indices: vec![0, 1, 2, 2, 3, 0], runs: vec![(material, 0..6)],
+    }) };
+    quad.check(limits).map_err(|e| e.to_string())?;
     Ok(vec![
         Operation::SetMaterial { material, value: Material { color: [1.0; 3], base_color_png: Vec::new() } },
         Operation::Surface(SurfaceOperation::Material { material, value: surface }),
@@ -315,38 +340,78 @@ fn impostor_ops(b: &makepad_render::impostor::ImpostorBake, distance: f64, mater
         // No authored mips: the loader's Data16 mips average the 16-bit
         // depth whole and the occlusion byte (material_surface.rs).
         layer(SurfaceChannel::Occlusion, "impostor-depth", &b.depth),
-        Operation::polygon_mesh("impostor-quad", &[[cx - r, cy - r, cz], [cx + r, cy - r, cz], [cx + r, cy + r, cz], [cx - r, cy + r, cz]], &[quad], limits).map_err(|e| e.to_string())?,
+        quad,
     ])
 }
 
-enum CachedBuild { Complete(Vec<u8>), Detail(cache::StoredDetail) }
+enum CachedBuild { Complete(Arc<[u8]>), Detail(cache::StoredDetail) }
+
+enum Primary<T, W = String> { Built(T), WaitAlone(W) }
+
+#[derive(Clone, Copy)]
+enum BuildLimit { Share(usize), Alone(usize), Uncapped }
+impl BuildLimit {
+    fn limits(self) -> makepad_model::Limits {
+        let max_bytes = match self { Self::Share(bytes) | Self::Alone(bytes) => bytes, Self::Uncapped => usize::MAX };
+        makepad_model::Limits { mesh: makepad_model::mesh::Limits { max_bytes }, ..Default::default() }
+    }
+}
+
+fn compile_primary(alias: &str, ops: &[ProgramOp], mut limit: BuildLimit, fetch: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>, cancelled: &dyn Fn() -> bool)
+    -> Result<Primary<(makepad_model::BuiltProgram, makepad_model::CompileCache)>, String> {
+    loop {
+        let mut compiled = makepad_model::CompileCache::default();
+        match makepad_model::build_program_with_cache(ops, limit.limits(), fetch, Some(cancelled), &mut compiled) {
+            Ok(built) => return Ok(Primary::Built((built, compiled))),
+            Err(error) if error.memory_refusal => match limit {
+                BuildLimit::Share(bytes) => {
+                    log!("script model '{alias}' waits to run alone, over a build's share of {:.1} MiB ({error})", mib(bytes));
+                    return Ok(Primary::WaitAlone(error.to_string()));
+                }
+                BuildLimit::Alone(bytes) => {
+                    log!("script model '{alias}' runs uncapped, over the whole budget of {:.1} MiB ({error})", mib(bytes));
+                    limit = BuildLimit::Uncapped;
+                }
+                BuildLimit::Uncapped => return Err(error.to_string()),
+            },
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
 
 /// Worker body: a cached product (memory, then the asset store) or a fresh
 /// compile, then the host's preparation. Public for headless tools (one
 /// build off the queue, after `set_host` and `initialize`).
 pub fn build(request: &ScriptModelRequest, session: Option<StoreSession>, variant: Option<String>, cancel: &AtomicBool) -> Result<Product, String> {
+    POOL.get().ok_or("model build pool is not initialized")?;
+    match build_with_limit(request, session, variant, cancel, BuildLimit::Alone(host().alone_budget()), None)? {
+        Primary::Built(product) => Ok(product),
+        Primary::WaitAlone(_) => unreachable!("only a shared compile waits to run alone"),
+    }
+}
+
+fn build_with_limit(request: &ScriptModelRequest, session: Option<StoreSession>, variant: Option<String>, cancel: &AtomicBool,
+    limit: BuildLimit, cached_glb: Option<Arc<[u8]>>) -> Result<Primary<Product>, String> {
     let build_started = Instant::now();
     let mut detail = makepad_model::ProgramBuildDetail::default();
     let image_timing_scope = cache::LoadReadyTimingScope::new();
-    POOL.get().ok_or("model build pool is not initialized")?;
     let host = host();
-    let review_wanted = host.wants_review();
+    let review_wanted = cached_glb.is_none() && host.wants_review();
     let cancelled = || cancel.load(Ordering::Acquire) || makepad_platform::thread::checkpoint_when_due().is_err();
     let mut warnings = Vec::new();
     let mut review = None;
     let mut timing = String::new();
-    let limits = makepad_model::Limits { mesh: makepad_model::mesh::Limits { max_bytes: host.memory_budget() }, ..Default::default() };
     // Memory, then the complete row, then the full-detail row; a hit stops
     // there. What the probe batch just answered is not asked again: on a busy
     // store those resolves were 0.3-1 s of every cold build. Review bypasses all.
     let lookup = |probe: Option<cache::Probe>| -> Option<CachedBuild> {
         if review_wanted { return None; }
-        if let Some(glb) = cache::memory_get(&request.hash) { return Some(CachedBuild::Complete(glb.to_vec())); }
+        if let Some(glb) = cache::memory_get(&request.hash).or_else(|| cached_glb.clone()) { return Some(CachedBuild::Complete(glb)); }
         if probe == Some(cache::Probe::Miss) { return None; }
         let session = session.as_ref()?;
         if probe != Some(cache::Probe::Detail) {
             match cache::store_get(session, &request.hash) {
-                Ok(Some(glb)) => return Some(CachedBuild::Complete(glb)),
+                Ok(Some(glb)) => return Some(CachedBuild::Complete(glb.into())),
                 Ok(None) => {}
                 Err(error) => log!("script model '{}': {error}", request.alias),
             }
@@ -354,7 +419,9 @@ pub fn build(request: &ScriptModelRequest, session: Option<StoreSession>, varian
         cache::store_get_detail(session, &request.hash).unwrap_or_else(|error| { log!("script model '{}': {error}", request.alias); None }).map(CachedBuild::Detail)
     };
     let mut lock = None;
-    let mut found = lookup(cache::probe_state(&request.hash));
+    // A peer could have published while a refused compile waited with its lock released.
+    let probe = if matches!(limit, BuildLimit::Share(_)) { cache::probe_state(&request.hash) } else { None };
+    let mut found = lookup(probe);
     while !matches!(found, Some(CachedBuild::Complete(_))) && lock.is_none() {
         match cache::BuildLock::acquire(&request.hash) {
             Ok(held) => lock = Some(held),
@@ -368,7 +435,7 @@ pub fn build(request: &ScriptModelRequest, session: Option<StoreSession>, varian
     let mut restored = None;
     if let Some(CachedBuild::Detail(stored)) = &found {
         let started = Instant::now();
-        let decoded = cache::glb_metrics(&stored.glb).and_then(|_| makepad_model::Document::from_bytes(&stored.source, limits.clone(), Some(&cancelled)).map_err(|e| e.to_string()));
+        let decoded = cache::glb_metrics(&stored.glb).and_then(|_| makepad_model::Document::from_bytes(&stored.source, limit.limits(), Some(&cancelled)).map_err(|e| e.to_string()));
         if cancelled() { return Err("superseded by a newer revision".into()); }
         match decoded {
             Ok(document) => {
@@ -385,7 +452,7 @@ pub fn build(request: &ScriptModelRequest, session: Option<StoreSession>, varian
     let mut publish = None;
     let mut follow_up = None;
     let (glb, cached) = match found {
-        Some(CachedBuild::Complete(bytes)) => (Arc::<[u8]>::from(bytes), true),
+        Some(CachedBuild::Complete(bytes)) => (bytes, true),
         Some(CachedBuild::Detail(stored)) => {
             let document = restored.expect("a detail hit has a decoded document");
             let lock = lock.take().expect("a detail hit holds its build lock");
@@ -409,9 +476,12 @@ pub fn build(request: &ScriptModelRequest, session: Option<StoreSession>, varian
             // `m.impostor`: not a model op (the program skips it); baked after this
             // product is out (`BuildLater`).
             let impostor = impostor_request(&request.program);
-            let mut compiled = makepad_model::CompileCache::default();
             let program_started = Instant::now();
-            let built = makepad_model::build_program_with_cache(&request.program, limits.clone(), &mut fetch, Some(&cancelled), &mut compiled).map_err(|e| e.to_string())?;
+            let (built, compiled) = match compile_primary(&request.alias, &request.program, limit, &mut fetch, &cancelled)? {
+                Primary::Built(work) => work,
+                // The lock drops here on the worker, before any row is published or the request queues again.
+                Primary::WaitAlone(why) => return Ok(Primary::WaitAlone(why)),
+            };
             let t_program = program_started.elapsed();
             step_done();
             makepad_platform::thread::checkpoint().map_err(|_| "superseded by a newer revision")?;
@@ -456,7 +526,7 @@ pub fn build(request: &ScriptModelRequest, session: Option<StoreSession>, varian
     if build_started.elapsed() > std::time::Duration::from_millis(300) {
         log!("model build detail '{}': {}", request.alias, build_detail(&detail, &request.texture_timings, &image_timings, cached));
     }
-    Ok(Product { glb, prepared, cached, warnings, review, timing, settled: follow_up.is_none(), publish, follow_up })
+    Ok(Primary::Built(Product { glb, prepared, cached, warnings, review, timing, settled: follow_up.is_none(), publish, follow_up }))
 }
 
 /// Formatting and its allocations happen only once a successful build is slow.
@@ -510,13 +580,13 @@ impl LastCompile {
     /// storage is refused beside what the document holds (the rest of the limit).
     fn refusal(&self, error: &makepad_model::Error) -> Option<String> {
         use makepad_model::{Error, mesh::MeshError};
-        match error {
-            Error::WorkingBytes { .. } => Some(error.to_string()),
-            Error::Mesh(MeshError::Budget { resource: "bytes", requested, limit }) => Some(format!("mesh work: needs {:.1} MiB, limit {:.1} MiB",
-                mib(self.limit.saturating_sub(*limit as usize).saturating_add(*requested as usize)), mib(self.limit))),
-            Error::Budget(what) => Some(format!("{what}: over the limit of {:.1} MiB", mib(self.limit))),
-            _ => None,
-        }
+        if !error.is_memory_refusal() { return None; }
+        Some(match error {
+            Error::Mesh(MeshError::Budget { requested, limit, .. }) => format!("mesh work: needs {:.1} MiB, limit {:.1} MiB",
+                mib(self.limit.saturating_sub(*limit as usize).saturating_add(*requested as usize)), mib(self.limit)),
+            Error::Budget(what) => format!("{what}: over the limit of {:.1} MiB", mib(self.limit)),
+            _ => error.to_string(),
+        })
     }
 }
 
@@ -646,7 +716,10 @@ fn begin_follow_up(request: &ScriptModelRequest, later: BuildLater, cancel: &Ato
     }
     let bake = t0.elapsed();
     step_done();
-    Ok(Derive { work: LastCompile::new(document, lods), compiled, warnings, bake, lock: later.lock, session: later.session })
+    let mut work = LastCompile::new(document, lods);
+    // A primary that needed the whole budget (or more) gives the follow-up its own share.
+    work.set_limit(host().memory_budget());
+    Ok(Derive { work, compiled, warnings, bake, lock: later.lock, session: later.session })
 }
 
 /// The follow-up's last compile and its product, or the work back with what it needed when its
@@ -676,7 +749,7 @@ fn finish_follow_up(request: &ScriptModelRequest, mut derive: Derive, cancel: &A
     Ok(Ok((Product { glb, prepared, cached: false, warnings, review: None, timing, settled: true, publish: None, follow_up: None }, publish)))
 }
 
-fn submit(pool: &TaskPool, request: ScriptModelRequest, cancel: Arc<AtomicBool>) -> Result<Running, ScriptModelRequest> {
+fn submit(pool: &TaskPool, job: PrimaryJob, limit: BuildLimit, cached_glb: Option<Arc<[u8]>>) -> Result<Running, ScriptModelRequest> {
     // The lane says who waits for the product.
     // - A product the memory front holds only prepares: Interactive, so it never queues behind
     //   compiles. (A headset has one heavy worker: a cached car sat 5 min behind three tree
@@ -687,30 +760,41 @@ fn submit(pool: &TaskPool, request: ScriptModelRequest, cancel: Arc<AtomicBool>)
     //   quiet and 64.7 s under 16 default-QoS threads, against 30.6 s with the same threads at the
     //   build's own QoS.
     // - Any other compile, and the follow-up of every compile: Background.
-    let cached = cache::memory_get(&request.hash).is_some();
+    // Pin a prepare-only job's bytes so eviction cannot turn it into a concurrent compile.
+    let cached = cached_glb.is_some();
+    let request = job.request.clone();
+    let started = job.started;
     let lane = if cached { Class::Interactive } else if host().waited_on(&request) { Class::Visible } else { Class::Background };
-    let (session, variant) = host().store();
     let (sender, receiver) = sync_channel(1);
-    let job = request.clone(); let flag = cancel.clone();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let flag = cancel.clone();
     let submitted = Instant::now();
-    let after = host().after_build(&request, session.clone());
     let follow_pool = pool.clone();
     pool.submit(lane, move || {
+        let send = |reply| {
+            let _ = sender.try_send(reply);
+            makepad_platform::thread::SignalToUI::set_ui_signal();
+        };
         let queued = submitted.elapsed();
-        let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(&job, session, variant, &flag)))
-            .unwrap_or_else(|_| Err("model build panicked".into()))
-            .map(|mut output| { output.timing = format!("queued {} ms on {lane:?}, {}", queued.as_millis(), output.timing); output });
-        let publish = result.as_mut().ok().and_then(|output| output.publish.take());
-        let follow_up = result.as_mut().ok().and_then(|output| output.follow_up.take());
-        let named = result.as_ref().ok().map(|output| output.glb.clone());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_with_limit(&job.request, job.session.clone(), job.variant.clone(), &flag, limit, cached_glb)))
+            .unwrap_or_else(|_| Err("model build panicked".into()));
+        let mut output = match result {
+            Ok(Primary::Built(output)) => output,
+            Ok(Primary::WaitAlone(why)) => return send(Ok(Primary::WaitAlone((job, why)))),
+            Err(error) => return send(Err(error)),
+        };
+        output.timing = format!("queued {} ms on {lane:?}, {}", queued.as_millis(), output.timing);
+        let PrimaryJob { request: job, after, .. } = job;
+        let publish = output.publish.take();
+        let follow_up = output.follow_up.take();
+        let named = Some(output.glb.clone());
         // Counted before the product goes out: whoever installs it sees its follow-up coming.
         if follow_up.is_some() {
             FOLLOW_UP_ALIASES.lock().unwrap_or_else(|e| e.into_inner()).push(job.alias.clone());
             FOLLOW_UPS_PENDING.fetch_add(1, Ordering::AcqRel);
             follow_up_load().building += 1;
         }
-        let _ = sender.try_send(result);
-        makepad_platform::thread::SignalToUI::set_ui_signal();
+        send(Ok(Primary::Built(output)));
         let Some(later) = follow_up else { return hand_over(&job, publish, named, after) };
         // Full detail is out. Its distance representations are no one's wait: at Background,
         // on this worker when it is a Background one, else as their own Background job, which
@@ -718,7 +802,7 @@ fn submit(pool: &TaskPool, request: ScriptModelRequest, cancel: Arc<AtomicBool>)
         let follow = move || run_follow_up(FollowUp { job, flag, publish, named, after }, Stage::Begin(later), None);
         if lane == Class::Background { follow() } else { at_background(&follow_pool, follow) }
     }).map_err(|_| request.clone())?.detach();
-    Ok(Running { request, cancel, receiver, started: Instant::now(), cached })
+    Ok(Running { request, cancel, receiver, started, cached })
 }
 
 /// The product is out. What is left waits on the store's answers: no CPU permit is held
@@ -809,17 +893,18 @@ pub fn poll() -> (bool, Vec<Finished>) {
             }
         }
         FOLLOW_UPS_PENDING.fetch_sub(follow_ups.len(), Ordering::AcqRel);
-        if b.alone && follow_up_load().building == 0 { b.alone = false; }
         b.running.retain_mut(|running| match running.receiver.try_recv() {
             Ok(result) => { finished.push((running.request.clone(), running.started, result)); false }
             Err(TryRecvError::Empty) => true,
             Err(TryRecvError::Disconnected) => { finished.push((running.request.clone(), running.started, Err("model build worker stopped".into()))); false }
         });
+        // A primary counts its follow-up before sending the first product.
+        if b.alone && b.running.iter().all(|r| r.cached) && follow_up_load().building == 0 { b.alone = false; }
         // Drain initial products first: a quick follow-up may already be here,
         // and must never be overwritten by its earlier single-level product.
         for (request, started, result) in follow_ups {
             match result {
-                Ok(product) => finished.push((request, started, Ok(product))),
+                Ok(product) => finished.push((request, started, Ok(Primary::Built(product)))),
                 Err(error) => {
                     // Full detail remains installed and ready if optional
                     // distance representations fail; do not fail that revision.
@@ -835,7 +920,8 @@ pub fn poll() -> (bool, Vec<Finished>) {
             // Only the revision the latest eval asked for installs.
             let current = verbs::script_model_wanted(&request.alias).as_deref() == Some(request.hash.as_str());
             match result {
-                Ok(product) if current => ready.push(Finished { request, started, product }),
+                Ok(Primary::Built(product)) if current => ready.push(Finished { request, started, product }),
+                Ok(Primary::WaitAlone(waiting)) if current => b.waiting_alone.push_back(waiting),
                 Ok(_) => {}
                 Err(error) if current => {
                     log!("script model '{}' failed: {error}", request.alias);
@@ -869,10 +955,10 @@ pub fn poll() -> (bool, Vec<Finished>) {
         // Products the memory front holds (store hits) only prepare: they
         // start at once instead of queueing behind heavy compiles.
         let mut index = 0;
-        while index < b.waiting.len() {
-            if !review_wanted && cache::memory_get(&b.waiting[index].hash).is_some() {
+        while !review_wanted && index < b.waiting.len() {
+            if let Some(glb) = cache::memory_get(&b.waiting[index].hash) {
                 let request = b.waiting.remove(index).unwrap();
-                match submit(&pool, request, Arc::new(AtomicBool::new(false))) {
+                match submit(&pool, PrimaryJob::new(request), BuildLimit::Share(host().memory_budget()), Some(glb)) {
                     Ok(running) => { b.running.push(running); changed = true; }
                     Err(request) => { verbs::mark_script_model_failed(&request.alias, &request.hash, "model worker pool is closed"); changed = true; }
                 }
@@ -893,7 +979,7 @@ pub fn poll() -> (bool, Vec<Finished>) {
                 _ => false,
             }) else { break };
             let request = b.waiting.remove(position).unwrap();
-            match submit(&pool, request, Arc::new(AtomicBool::new(false))) {
+            match submit(&pool, PrimaryJob::new(request), BuildLimit::Share(host().memory_budget()), None) {
                 Ok(running) => { b.running.push(running); changed = true; }
                 Err(request) => {
                     verbs::mark_script_model_failed(&request.alias, &request.hash, "model worker pool is closed");
@@ -901,21 +987,35 @@ pub fn poll() -> (bool, Vec<Finished>) {
                 }
             }
         }
-        // A follow-up its share refused runs alone, under the whole budget: once nothing compiles,
-        // waits to, or follows up. New compiles wait meanwhile (products the memory front holds
-        // only prepare, and go on). One that is no longer wanted ends as superseded.
+        // A refused compile runs alone once ordinary compiles and active follow-ups drain.
+        // A first product goes first, unless a waiting follow-up holds that hash's build lock.
+        b.waiting_alone.retain(|(job, _)| verbs::script_model_wanted(&job.request.alias).as_deref() == Some(job.request.hash.as_str()));
         if !b.alone && b.waiting.is_empty() && b.running.iter().all(|r| r.cached) {
             let mut load = follow_up_load();
-            let next = if load.building == 0 { load.waiting.pop_front() } else { None };
-            if let Some((follow, derive)) = next {
-                load.building += 1;
-                drop(load);
-                b.alone = true;
-                let whole = host().alone_budget();
-                if verbs::script_model_wanted(&follow.job.alias).as_deref() == Some(follow.job.hash.as_str()) {
-                    log!("script model '{}' follow-up runs alone, under the whole budget of {:.1} MiB", follow.job.alias, mib(whole));
-                } else { follow.flag.store(true, Ordering::Release); }
-                at_background(&pool, move || run_follow_up(follow, Stage::Derive(derive), Some(whole)));
+            if load.building == 0 {
+                let follow_index = match b.waiting_alone.front() {
+                    Some((job, _)) => load.waiting.iter().position(|(f, _)| f.job.hash == job.request.hash),
+                    None => Some(0),
+                };
+                if let Some((follow, derive)) = follow_index.and_then(|i| load.waiting.remove(i)) {
+                    load.building += 1;
+                    drop(load);
+                    b.alone = true;
+                    let whole = host().alone_budget();
+                    if verbs::script_model_wanted(&follow.job.alias).as_deref() == Some(follow.job.hash.as_str()) {
+                        log!("script model '{}' follow-up runs alone, under the whole budget of {:.1} MiB", follow.job.alias, mib(whole));
+                    } else { follow.flag.store(true, Ordering::Release); }
+                    at_background(&pool, move || run_follow_up(follow, Stage::Derive(derive), Some(whole)));
+                } else if let Some((job, why)) = b.waiting_alone.pop_front() {
+                    drop(load);
+                    let whole = host().alone_budget();
+                    log!("script model '{}' runs alone, under the whole budget of {:.1} MiB ({why})", job.request.alias, mib(whole));
+                    match submit(&pool, job, BuildLimit::Alone(whole), None) {
+                        Ok(running) => { b.alone = true; b.running.push(running); }
+                        Err(request) => verbs::mark_script_model_failed(&request.alias, &request.hash, "model worker pool is closed"),
+                    }
+                    changed = true;
+                }
             }
         }
         verbs::set_script_models_running(b.running.iter().map(|r| r.request.alias.clone()).collect());
@@ -1376,19 +1476,31 @@ mod auto_lod_tests {
         assert!(super::FollowUpPlan::new(&small.document, None, false).is_some(), "small parts receive automatic levels");
     }
 
-    /// A follow-up its share refuses hands back its work with what it needed, then runs alone:
-    /// under the whole budget, or past that uncapped. Either way it makes the product it makes
-    /// under no limit at all, byte for byte.
+    /// Primary and follow-up compiles hand back a share refusal and produce identical bytes
+    /// when they run alone, including when the whole budget also refuses them.
     #[test]
     fn a_follow_up_its_share_refuses_waits_then_runs_alone_to_the_same_bytes() {
         use makepad_model::{CompileCache, ProgramOp};
+        use super::{BuildLimit, Primary, compile_primary};
         let ops = [ProgramOp::Mesh(makepad_model::MeshPrimitive::Sphere { object: "ball".into(), radius: 1.0, segments: 16, rings: 8, smooth: true })];
         let mut fetch = |_: &str| -> Result<Vec<u8>, String> { Err("no fetch".into()) };
-        let built = makepad_model::build_program_with_cache(&ops, makepad_model::Limits::default(), &mut fetch, None, &mut CompileCache::default()).map_err(|e| e.message).unwrap();
+        let whole = makepad_model::Limits::default().mesh.max_bytes;
+        let built = makepad_model::build_program_with_cache(&ops, BuildLimit::Uncapped.limits(), &mut fetch, None, &mut CompileCache::default()).map_err(|e| e.message).unwrap();
+        let Primary::WaitAlone(why) = compile_primary("ball", &ops, BuildLimit::Share(1), &mut fetch, &|| false).expect("a share refusal hands the primary back") else {
+            panic!("one byte cannot build the primary");
+        };
+        // A fetcher can return the exact same text as a memory refusal.
+        let image = ProgramOp::ImageLayer { material: 0, channel: makepad_model::SurfaceChannel::BaseColor, layer: "paint".into(), image: "paint.png".into() };
+        let fetched = compile_primary("ball", &[image], BuildLimit::Share(1), &mut |_| Err(why.clone()), &|| false);
+        assert!(matches!(fetched, Err(message) if message.ends_with(&why)), "a fetch error fails with its original diagnostic");
         let plan = super::FollowUpPlan::new(&built.document, None, false).expect("the sphere gets automatic levels");
         let expected = super::LastCompile::new(built.document.clone(), plan.lods.clone()).compile(&mut CompileCache::default(), &|| false).unwrap().glb;
-        let whole = built.document.limits().mesh.max_bytes;
         for alone in [whole, 1] {
+            let Primary::Built((primary, _)) = compile_primary("ball", &ops, BuildLimit::Alone(alone), &mut fetch, &|| false).unwrap() else {
+                panic!("an exclusive primary must finish under {alone} bytes or uncapped");
+            };
+            assert!(primary.compiled.glb == built.compiled.glb, "the primary that waited makes the uncapped GLB under {alone} bytes");
+            assert_eq!(primary.document.limits().mesh.max_bytes, if alone == 1 { usize::MAX } else { whole }, "only the refused whole budget escalates");
             let mut work = super::LastCompile::new(built.document.clone(), plan.lods.clone());
             work.set_limit(1);
             let mut compiled = CompileCache::default();
@@ -1453,7 +1565,13 @@ mod auto_lod_tests {
             assert_eq!(picks, [level; 2], "{what}: each copy draws the same level");
         }
         // Variant k is the level drawn from distances[k] (level k + 1).
-        let far = StaticModel::parse_glb(&plan.variant_glb(last - 1, 64 << 20).unwrap()).unwrap();
+        let far_glb = plan.variant_glb(last - 1, 64 << 20).unwrap();
+        let loaded = makepad_gltf::load_gltf_from_bytes(&far_glb, None).unwrap();
+        let stand_in = loaded.document.meshes_slice().iter().position(|m| m.name.as_deref() == Some("impostor-quad")).unwrap();
+        let quad = makepad_gltf::decode_mesh_primitive(&loaded, stand_in, 0).unwrap();
+        let r = bake.radius;
+        assert_eq!(quad.texcoords0.unwrap(), [[-r,r], [-r,-r], [r,-r], [r,r]], "far TEXCOORD_0 keeps signed sphere radius");
+        let far = StaticModel::parse_glb(&far_glb).unwrap();
         assert!(far.draw_layers.iter().any(|l| l.pbr.surface.as_ref().is_some_and(|s| s.impostor > 0.0)), "the far level draws the stand-in");
     }
 
@@ -1490,5 +1608,30 @@ mod auto_lod_tests {
         let resumed = super::LastCompile::new(restored.clone(), plan.lods).compile(&mut CompileCache::default(), &|| false).unwrap().glb;
         assert!(String::from_utf8_lossy(&fresh).contains("MSFT_lod"), "the fixture gets automatic levels");
         assert!(fresh == resumed, "a resumed build makes the fresh build's product, byte for byte ({} vs {} B)", fresh.len(), resumed.len());
+        let bake = makepad_render::impostor::ImpostorBake {
+            albedo: [60, 120, 40, 255].repeat(4), normal: vec![128, 128, 255, 255], depth: vec![128, 0, 128, 255],
+            size: 2, center: [0.; 3], radius: 3., crown: false,
+        };
+        let mut quad = super::impostor_ops(&bake, 100., 0, &Limits::default()).unwrap().pop().unwrap();
+        let key = |op| {
+            let (_, captured) = super::verbs::capture_programs(|| super::verbs::request_builtin_model("stand-in", "prop", vec![ProgramOp::Op(op)]));
+            super::cache::product_key(&captured[0].hash)
+        };
+        let original = key(quad.clone());
+        let Operation::Baked { mesh, .. } = &mut quad else { panic!("stand-in geometry") };
+        let x = &mut std::sync::Arc::make_mut(mesh).positions[0][0];
+        *x = f32::from_bits(x.to_bits() ^ 1);
+        assert_ne!(key(quad), original, "one position byte changes the store product key");
+        let with_quad = |mut doc: Document, cache: &mut CompileCache| {
+            let ops = super::impostor_ops(&bake, 100., super::next_material(&doc), doc.limits()).unwrap();
+            doc.apply(makepad_model::Transaction { expected: doc.head(), request_id: "stand-in".into(), operations: ops }, None).unwrap();
+            assert!(doc.geometries().any(|(n, g)| n == "impostor-quad" && matches!(g, makepad_model::ObjectGeometry::Baked(_))));
+            let lods = super::auto_lod_ops(&doc);
+            assert!(matches!(&lods[..], [Operation::Scene(makepad_model::SceneOperation::Lods { object, levels })]
+                if object == "tyre" && levels[0].distance > 45.), "the stand-in affects distances but only the tyre gets levels");
+            super::LastCompile::new(doc, lods).compile(cache, &|| false).unwrap().glb
+        };
+        let fresh = with_quad(built.document, &mut cache);
+        assert_eq!(fresh, with_quad(restored, &mut CompileCache::default()), "the resumed stand-in and its material match the fresh one");
     }
 }

@@ -1,5 +1,5 @@
 //! The data-page vocabulary used for printing and reading constructor and property names.
-use makepad_work_core::{entity::{field, kind}, event::Key};
+use makepad_town_core::{entity::{field, kind}, event::Key};
 
 #[derive(Clone, Copy)]
 pub enum Vocabulary { Board }
@@ -8,7 +8,16 @@ pub struct Schema {
     pub root: Constructor,
     pub kinds: &'static [Constructor],
     pub item_fields: &'static [Field],
+    /// A step of the board's presenting path: a child of the board, printed after its items in
+    /// `path: [...]`, and never an item on the canvas.
+    pub step: Constructor,
 }
+
+/// The named kind of a presenting step.
+pub const STEP: &str = "Step";
+
+/// The board root's field that lists its presenting path.
+pub const PATH: &str = "path";
 
 pub struct Constructor {
     /// Slice 1 stores these constructors under numeric entity kinds. Later kinds can be named only.
@@ -24,10 +33,10 @@ pub struct Field {
 }
 
 #[derive(Clone, Copy)]
-pub enum Literal { Reference, Units, Color, Text, Enum, Bool, Anchor, Children }
+pub enum Literal { Bytes, Reference, Units, Color, Text, Enum, Bool, Anchor, Children }
 
 #[derive(Clone)]
-pub enum Source { Register(Key), Identity, RootTitle, Body, Children }
+pub enum Source { Register(Key), Writer(Key), DesignPreset, Identity, RootTitle, Body, Children }
 
 const fn register(name: &'static str, form: Literal, key: Key) -> Field {
     Field { name, form, source: Source::Register(key) }
@@ -38,6 +47,11 @@ const fn constructor(id: u16, name: &'static str, fields: &'static [Field]) -> C
 }
 
 const ITEMS: Field = Field { name: "items", form: Literal::Children, source: Source::Children };
+
+static APP_FIELDS: [Field; 2] = [
+    register("session", Literal::Bytes, field::SESSION),
+    register("sharer", Literal::Bytes, field::SHARER),
+];
 
 const BOARD: Schema = Schema {
     root: constructor(kind::BOARD, "Board", &[
@@ -54,6 +68,11 @@ const BOARD: Schema = Schema {
         constructor(kind::SECTION, "Section", &[ITEMS]),
         constructor(kind::STROKE, "Stroke", &[]),
         constructor(kind::INLINE_APP, "InlineApp", &[]),
+        constructor(kind::APP, "App", &APP_FIELDS),
+        constructor(kind::DESIGN, "Design", &[
+            Field { name: "preset", form: Literal::Enum, source: Source::DesignPreset },
+            Field { name: "src", form: Literal::Reference, source: Source::Writer(field::SRC) },
+        ]),
     ],
     // Slice 1 allows style fields on any item. Absent optional registers have no literal.
     item_fields: &[
@@ -67,6 +86,12 @@ const BOARD: Schema = Schema {
         register("from", Literal::Reference, field::FROM), register("to", Literal::Reference, field::TO),
         register("anchor", Literal::Anchor, field::ANCHOR), register("label", Literal::Text, field::LABEL),
     ],
+    // The target is the item (or section, or the board itself) the step brings into view. The
+    // order key orders the path, so two people's reorders merge as list order does.
+    step: Constructor { entity_kind: None, name: STEP, fields: &[
+        Field { name: "id", form: Literal::Reference, source: Source::Identity },
+        register("target", Literal::Reference, field::TO), register("title", Literal::Text, field::TITLE),
+    ] },
 };
 
 impl Vocabulary {
@@ -92,5 +117,17 @@ impl Schema {
 
     pub(crate) fn item(&self, kind: u16) -> Option<&Constructor> {
         self.kinds.iter().find(|c| c.entity_kind == Some(kind))
+    }
+
+    /// Whether the board page prints a field `name` for an entity of `kind` (the board, a step
+    /// or an item). An open register of that name would print the field twice.
+    pub fn prints(&self, kind: &Key, name: &str) -> bool {
+        let named = |fields: &[Field]| fields.iter().any(|f| f.name == name);
+        match kind {
+            Key::Number(id) if self.root.entity_kind == Some(*id) => named(self.root.fields) || name == PATH,
+            Key::Number(id) => self.item(*id).is_some_and(|c| named(self.item_fields) || named(c.fields)),
+            Key::Name(n) if n == STEP => named(self.step.fields),
+            Key::Name(_) => named(self.item_fields),
+        }
     }
 }

@@ -2900,6 +2900,7 @@ pub mod code {
 
 #[cfg(test)]
 mod tests {
+    use crate::plain::PrimitiveFrame;
     use super::*;
 
     const DOC: &str = "use mod.motion.*\nlet accent = #ff5a36\nMotion{\n    duration: 4.0\n    inputs: {title: input(@text, \"Hello\", \"Title\") tint: input(@color, #102030)}\n    layers: [\n        Rect{at: vec2(10, 20) fill: accent radius: 4}\n        Group{layers: [\n            Text{text: \"Make\\nit move\" font: Font{family: \"Inter\"} size: 48 align: @center color: in(@tint)\n                 opacity: tween(0, 1, 0.0, 0.4, @ease_out_cubic) y: keys([0, 30], [0.6, 0, @ease_out_back]) x: 2 * 3}\n        ]}\n    ]\n}\n";
@@ -3303,7 +3304,7 @@ mod tests {
         let src = "use mod.motion.*\nlet K = 0.5\nlet LOOK = {alpha: 0.55 travel: 0.025 / K}\nlet wide = fn() { LOOK.alpha * 100.0 }\nMotion{size: vec2(100, 100) duration: 1.0 layers: [\n    Rect{size: fn(t) { vec2(wide(), 10) } fill: #ffffff}\n]}";
         let doc = crate::value::editable(|| crate::MotionDoc::load(src)).expect("loads");
         let width = || match &doc.eval(0.0).items[0].kind {
-            crate::ItemKind::Rect { size, .. } => size[0],
+            crate::ItemKind::Primitive(PrimitiveFrame::Rect { size, .. }) => size[0],
             _ => panic!("not a rect"),
         };
         let reach = |needle: &str, len: usize| {

@@ -365,7 +365,7 @@ struct SlowDone {
 }
 
 fn slow_dir(name: &str) -> std::path::PathBuf {
-    makepad_ai_hub::home::makepad_home().join("stage-product").join("studio-api").join(name)
+    makepad_widgets::makepad_platform::home::app_state_home().join("stage-product").join("studio-api").join(name)
 }
 
 fn run_slow(client: &mut Option<AssetClient>, (ticket, job): (u64, SlowJob)) -> SlowDone {
@@ -1640,17 +1640,18 @@ fn demo_steps(list: &[Json]) -> Result<Vec<makepad_story_deck::ops::StepSpec>, T
     Ok(steps)
 }
 
-/// The `Camera` a tool call describes: `device` (part of a name, or a
-/// number), `width`, `height`, `fps`, `crop` [x, y, w, h], `rotate`,
+/// The `Camera` a tool call describes: `device` (part of a name, an index,
+/// "@test_pattern", or omitted for the first camera), `width`, `height`, `fps`, `crop` [x, y, w, h], `rotate`,
 /// `mirror`, `adjust` {brightness, contrast, saturation}, `fit`.
 fn camera_spec(args: &Json) -> Result<makepad_story_cut::CameraSpec, ToolError> {
     use makepad_story_cut::{CameraDevice, CameraSpec, Fit};
     let mut spec = CameraSpec::default();
     spec.device = match args.get("device") {
         None | Some(Json::Null) => CameraDevice::First,
+        Some(Json::Str(name)) if name.trim() == "@test_pattern" => CameraDevice::TestPattern,
         Some(Json::Str(name)) if !name.trim().is_empty() => CameraDevice::Name(name.trim().to_string()),
         Some(Json::Int(index)) if (0..64).contains(index) => CameraDevice::Index(*index as u32),
-        Some(_) => return Err(ToolError::invalid("`device` is part of the camera's name (\"OBSBOT\"), or its number (0, 1, ...); omit it for the first camera")),
+        Some(_) => return Err(ToolError::invalid("`device` is part of the camera's name (\"OBSBOT\"), its number (0, 1, ...), or \"@test_pattern\" for generated colour bars. Omit it for the first camera")),
     };
     let whole = |key: &str, slot: &mut u32| -> Result<(), ToolError> {
         match number(args, key) {

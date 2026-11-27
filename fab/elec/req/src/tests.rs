@@ -18,7 +18,7 @@ fn reads_every_statement_form_and_locates_each_mistake() {
     assert!(errors.is_empty(), "the fixture reads cleanly: {errors:?}");
     assert_eq!((doc.requirements.len(), doc.waivers.len()), (11, 1), "every require and waive statement");
     let r = |name: &str| doc.requirements.iter().find(|r| r.name == name).unwrap_or_else(|| panic!("{name} read"));
-    assert_eq!(r("fits a 60 x 40 case").measure, Measure::BoardSize("ledctl".into()));
+    assert_eq!(r("fits a 60 x 40 case").measure, Measure::BoardSize(Some("ledctl".into())));
     assert_eq!(r("fits a 60 x 40 case").bound, Bound::Range { min: None, max: Some(Value::Size([0.06, 0.04])) }, "a size bound in metres");
     assert_eq!(r("DRC clean").measure, Measure::Checks { family: Family::Drc, unit: Some("ledctl".into()), count: CountOf::Errors });
     assert_eq!(r("sits in its case").bound, Bound::Holds, "a pass measure takes no bound");
@@ -32,7 +32,16 @@ fn reads_every_statement_form_and_locates_each_mistake() {
     assert_eq!(doc.waivers[0].reason, "first prototype: time is no concern");
 
     // Each mistake is an error at what is wrong, saying how to write it.
+    let (words, notes) = read(DocId(7), "wish(\" warm \")\nbrief(\" keep this\\nline \")\nwish(\"warm\")\nbrief(\"other\")");
+    assert_eq!(words.brief.unwrap().words, " keep this\nline ", "the first brief keeps its decoded whitespace");
+    assert!(words.wishes.iter().map(|w| w.words.as_str()).eq(["warm", "warm"]), "wishes trim their ends and can repeat");
+    assert_eq!(notes.len(), 1, "only the second brief is rejected");
     let cases: &[(&str, &str, &str)] = &[
+        ("wish(\"  \")", "a wish is empty: write it in the person's words", "\"  \""),
+        ("brief(\"\")", "a brief is empty: write the person's brief", "\"\""),
+        ("brief(\"one\")\nbrief(\"two\")", "a requirements document holds one brief(..)", "brief(\"two\")"),
+        ("wish(3)", "takes one string", "3"),
+        ("brief(\"one\", \"two\")", "takes one string", "brief(\"one\", \"two\")"),
         ("require(\"a\", board(\"x\").colour, {max: 1})", "not colour", "board(\"x\").colour"),
         ("require(\"a\", wattage, {max: 1})", "not a measure", "wattage"),
         ("require(\"a\", print.time, {max: 3mm})", "a time", "3mm"),
@@ -62,6 +71,92 @@ fn reads_every_statement_form_and_locates_each_mistake() {
     assert_eq!(errors.len(), 1, "one syntax error: {errors:?}");
     assert!(errors[0].message.starts_with("syntax:"), "{errors:?}");
     assert_eq!(doc.requirements.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["a", "c"], "the other lines read");
+}
+
+#[test]
+fn named_arguments_are_located_and_show_positional_syntax() {
+    for (args, first, labels, fix) in [
+        (r#""a", measure: board.size, max: [60mm 40mm]"#, "measure: board.size", "measure:, max:", "drop the labels and put the bound in {..}"),
+        (r#""a", board.size, max: [60mm 40mm]"#, "max: [60mm 40mm]", "max:", "put the bound in {..}"),
+        (r#""a", board.size, bound: {max: [60mm 40mm]}"#, "bound: {max: [60mm 40mm]}", "bound:", "write require(name, measure, bound) without labels"),
+        (r#"name: "a", measure: board.size, max: [60mm 40mm]"#, r#"name: "a""#, "name:, measure:, max:", "drop the labels and put the bound in {..}"),
+        (r#""a", measure: board.size, min: [20mm 20mm], max: [60mm 40mm]"#, "measure: board.size", "measure:, min:, max:", "drop the labels and put the bound in {..}"),
+    ] {
+        let (msg, span) = first_error(&format!("require({args})"));
+        assert_eq!(span, first, "the first named argument must be located in {args}");
+        assert_eq!(msg, format!(r#""a": require(..) takes positional arguments, not {labels}; {fix}, e.g. {REQUIRE_EXAMPLE}"#), "the repair must name every label and show the positional form");
+    }
+    for (text, first, labels) in [
+        (r#"wish(words: "x")"#, r#"words: "x""#, "words:"),
+        (r#"brief(words: "x")"#, r#"words: "x""#, "words:"),
+        (r#"waive(name: "a", reason: "r")"#, r#"name: "a""#, "name:, reason:"),
+        (r#"require("a", board(unit: "u").size, {max: [60mm 40mm]})"#, r#"unit: "u""#, "unit:"),
+        (r#"require("a", checks(family: @erc).errors, {max: 0})"#, "family: @erc", "family:"),
+    ] {
+        let (msg, span) = first_error(text);
+        assert_eq!(span, first, "the offending argument must be located in {text}");
+        assert!(msg.contains("positional arguments") && msg.contains(labels) && !msg.contains("is not a measure"), "expected a positional repair in {text}: {msg}");
+    }
+}
+
+#[test]
+fn unitless_board_and_case_measures_bind_to_only_board() {
+    let text = r#"require("size", board.size, {max: [60mm 40mm]})
+require("layers", board.layers, {is: 2})
+require("parts", board.parts, {min: 30})
+require("unplaced", board.unplaced, {max: 0})
+require("unrouted", board.unrouted, {max: 0})
+require("case", case.fits)"#;
+    let (doc, errors) = read(DocId(1), text);
+    assert!(errors.is_empty(), "all six unitless measures must read: {errors:?}");
+    let docs = [doc];
+    let mut facts = facts();
+    facts.cases[0].current = true;
+    let explicit = text.replace("board.", r#"board("ledctl")."#).replace("case.fits", r#"case("ledctl").fits"#);
+    let named = judge(&[read(DocId(1), &explicit).0], &facts);
+    facts.units.push(UnitFacts { unit: "boardless".into(), board: None });
+    let implicit = judge(&docs, &facts);
+    assert_eq!(implicit.rows.len(), 6, "each measure must produce a verdict");
+    for (row, named) in implicit.rows.iter().zip(&named.rows) {
+        assert!(matches!(row.status, Status::Pass | Status::Fail), "{} must bind even alongside a boardless circuit", row.name);
+        assert_eq!((&row.status, &row.focus, &row.findings), (&named.status, &named.focus, &named.findings), "{} must give the named board's verdict and evidence", row.name);
+    }
+    assert_eq!(implicit.rows[0].focus, Focus::Unit("ledctl".into()), "board evidence must focus the resolved unit");
+    assert_eq!(implicit.rows[5].focus, Focus::Case("ledctl".into()), "case evidence must focus the resolved case");
+    facts.units[0].unit = "power".into();
+    facts.units[1] = UnitFacts { unit: "ui".into(), board: facts.units[0].board.clone() };
+    for row in judge(&docs, &facts).rows {
+        let call = if row.name == "case" { "case" } else { "board" };
+        assert_eq!(row.status, Status::Unknown(format!("the design has 2 boards (power, ui): name one in {call}(\"unit\")")), "ambiguous {} must identify the choices", row.name);
+    }
+    facts.units = vec![UnitFacts { unit: "ledctl".into(), board: None }];
+    for why in ["ledctl has no board", "the design has no board yet"] {
+        for row in judge(&docs, &facts).rows {
+            assert_eq!(row.status, Status::Unknown(why.into()), "{} must explain the absent board", row.name);
+        }
+        facts.units.clear();
+    }
+    for (call, field) in [("board", "size"), ("case", "fits")] {
+        let expr = format!("{call}().{field}");
+        let (msg, span) = first_error(&format!(r#"require("a", {expr})"#));
+        assert_eq!(span, expr, "an empty unit call must locate the whole measure");
+        assert!(msg.contains(&format!("write {call}.{field} for the device's only board, or {call}(\"unit\").{field} to name one")), "the empty unit call needs both valid spellings: {msg}");
+    }
+}
+
+#[test]
+fn unknown_measure_diag_omits_measures_list() {
+    let bad = ["voltage", "current", "power"];
+    let text = bad.map(|m| format!(r#"require("{m}", {m}, {{max: 1}})"#)).join("\n");
+    let (_, errors) = read(DocId(1), &text);
+    assert_eq!(errors.len(), 3, "all three unknown measures need diagnostics");
+    for (err, measure) in errors.iter().zip(bad) {
+        assert!(is_unknown_measure(&err.message) && !err.message.contains(MEASURES), "each diagnostic must identify the unknown measure without repeating the catalog");
+        assert!(matches!(err.sel.as_slice(), [Sel::Source { start, end, .. }] if &text[*start as usize..*end as usize] == measure), "each diagnostic must locate its measure");
+    }
+    let old = r#"require("old", old_measure, {max: 0})"#;
+    let refusal = write::add(old, &read(DocId(1), old).0, "new", "new_measure", None).unwrap_err();
+    assert!(refusal.ends_with(r#""new": new_measure is not a measure"#), "Add must report the new diagnostic even when earlier mistakes exist: {refusal}");
 }
 
 /// Facts in which the ledctl fixture's rows land in every status.
@@ -151,6 +246,28 @@ fn judges_pass_fail_unknown_waived_and_stale() {
     assert!(matches!(&unsliced.row("under 40 g of filament").unwrap().status, Status::Unknown(why) if why.contains("not sliced yet")), "with the slicer and no slice, says to slice");
     assert!(!empty.met());
 
+    let wishes = read(DocId(8), "wish(\"warm light\")").0;
+    let only = judge(std::slice::from_ref(&wishes), &facts());
+    assert!(only.rows.is_empty() && !only.met() && only.met_count() == (0, 0)
+        && (only.pass, only.fail, only.unknown, only.waived) == (0, 0, 0, 0), "wishes alone are listed outside every verdict and count");
+    let first = read(DocId(9), "brief(\"original\")\nwish(\"solid\")").0;
+    let second = read(DocId(10), "brief(\"repeat\")").0;
+    let combined = judge(&[first, wishes, second], &facts());
+    assert!(combined.wishes.iter().map(|w| (w.doc, w.words.as_str())).eq([(DocId(9), "solid"), (DocId(8), "warm light")]),
+        "wishes keep document order and source identity");
+    assert!(combined.brief.unwrap().words == "original" && matches!(combined.notes.as_slice(), [note]
+        if note.message == "the project has one brief: this one repeats it" && matches!(note.sel.as_slice(), [Sel::Source { doc: DocId(10), start: 0, .. }])),
+        "the first project brief wins and the repeated brief has a located error");
+    let mut no_units = facts();
+    no_units.checks.as_mut().unwrap().findings.clear();
+    assert_eq!(judge(&docs, &no_units).row("ERC clean").unwrap().status, Status::Pass, "current empty findings pass with a circuit");
+    no_units.units.clear();
+    let empty_plate = judge(&docs, &no_units);
+    for name in ["ERC clean", "DRC clean"] {
+        assert_eq!(empty_plate.row(name).unwrap().status, Status::Unknown("nothing to check yet: the project has no circuit".into()),
+            "{name} cannot count even current empty findings without a circuit, scoped or unscoped");
+    }
+
     // Checks still running: their rows are unknown and stale; a fixed DRC then passes.
     let mut running = facts();
     let checks = running.checks.as_mut().unwrap();
@@ -196,6 +313,22 @@ fn writes_each_statement_as_one_edit() {
         doc
     };
     let ledctl = doc(LEDCTL);
+    let wished = write::wish(LEDCTL, &ledctl, "  warm LEDs  ").unwrap();
+    assert!(doc(&wished).wishes[0].words == "warm LEDs" && wished.find("wish(") < wished.find("waive("),
+        "a wish keeps the person's words and uses Add's insertion point before the waiver");
+    let words = "  Backslash \\, a \"quote\"\nand a second line.  ";
+    let with_brief = write::brief(&wished, &doc(&wished), words).unwrap();
+    assert!(with_brief.starts_with("brief(") && with_brief.ends_with(&wished)
+        && doc(&with_brief).brief.unwrap().words.as_bytes() == words.as_bytes(), "the first statement round-trips every byte of the brief");
+    let middle = format!("// heading\n{with_brief}");
+    let replaced = write::brief(&middle, &doc(&middle), "new words").unwrap();
+    assert!(replaced.starts_with("// heading\nbrief(") && replaced.ends_with(&wished) && doc(&replaced).brief.unwrap().words == "new words",
+        "replacing an existing brief preserves the surrounding text");
+    let removed = write::brief(&replaced, &doc(&replaced), " \n ").unwrap();
+    assert_eq!(removed, format!("// heading\n{wished}"), "clearing the brief removes just that statement");
+    assert_eq!(write::brief(&removed, &doc(&removed), "").unwrap(), removed, "clearing a missing brief leaves every byte alone");
+    assert!(write::add(LEDCTL, &ledctl, "x", "print.time, {max: 3h})\nwish(\"extra\"", None).is_err(),
+        "Add cannot inject a second statement of the new grammar");
     let names = |d: &ReqDoc| d.requirements.iter().map(|r| r.name.clone()).collect::<Vec<_>>();
 
     let added = write::add(LEDCTL, &ledctl, "under 25 g", "board(\"ledctl\").layers", Some("{max: 4}")).unwrap();

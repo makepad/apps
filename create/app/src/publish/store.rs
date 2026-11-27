@@ -3,7 +3,7 @@ use super::{
     post::{Kind, Media},
     Scratch,
 };
-use makepad_work_core::{hex, home::write_private};
+use makepad_town_core::hex;
 use makepad_network::digest::Sha256;
 use makepad_strict_json::{obj, parse, s, Value};
 use std::{
@@ -166,7 +166,7 @@ impl Store {
             ),
             ("media", media.json()),
         ]);
-        write_private(&self.index().join(format!("{id}.json")), row.to_json().as_bytes())?;
+        super::write_private_bg(&self.index().join(format!("{id}.json")), row.to_json().as_bytes())?;
         Ok(Entry { id, author, media })
     }
 

@@ -1,9 +1,9 @@
 use super::{string, Board};
 use makepad_ai_services::wire::MAX_RESULT_BYTES;
-use makepad_work_core::entity::field;
-use makepad_work_core::event::Id;
-use makepad_work_core::fold::State;
-use makepad_work_core::{hex, parse_id};
+use makepad_town_core::entity::field;
+use makepad_town_core::event::Id;
+use makepad_town_core::fold::State;
+use makepad_town_core::{hex, parse_id};
 use makepad_network::digest::sha256_hash;
 use makepad_strict_json as json;
 
@@ -80,7 +80,7 @@ impl Board<'_> {
 
     fn fragment(&self, part: Part, cursor: Option<(Id, usize)>, with_title: bool) -> Result<String, String> {
         let (id, source, last, end, kind, env) = match part {
-            Part::Title if self.root.open_fields().next().is_some() => {
+            Part::Title if self.root_extras() => {
                 let source = self.header(true) + &self.footer(true);
                 (self.root.id, source, self.root.id, 0, "root", Envelope::new(self, self.root.id))
             }
@@ -110,12 +110,12 @@ impl Board<'_> {
         let worst = u64::MAX; // The wire split is identical on 32- and 64-bit peers.
         let overhead = env.reply("", Some(&continuation(worst)), &metadata(worst, worst)).len()
             + (worst.to_string().len() - self.nodes.len().to_string().len());
-        let room = BUDGET - overhead;
+        let town = BUDGET - overhead;
         let mut bounds = vec![0];
         let mut bytes = 0;
         for (offset, c) in source.char_indices() {
             let width = encoded_char_len(c);
-            if bytes + width > room { bounds.push(offset); bytes = 0; }
+            if bytes + width > town { bounds.push(offset); bytes = 0; }
             bytes += width;
         }
         bounds.push(source.len());
@@ -181,7 +181,7 @@ impl Board<'_> {
                 let separator = usize::from(last.is_some());
                 if overhead + bytes + separator + size > BUDGET {
                     if last.is_some() { break }
-                    if first && (self.root.open_fields().next().is_some() || overhead + encoded_len(&self.header(false)) + size + 2 <= BUDGET) {
+                    if first && (self.root_extras() || overhead + encoded_len(&self.header(false)) + size + 2 <= BUDGET) {
                         return Ok(self.title_page())
                     }
                     return self.fragment(Part::Node { at, source: subtree }, None, first)

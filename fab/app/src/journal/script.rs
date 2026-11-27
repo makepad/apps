@@ -3,8 +3,7 @@
 use super::*;
 use crate::journal::replay::{apply, Positions};
 use std::borrow::Cow;
-use fab::ui::journal_panel::{DiffRowKind, DiffRowSpec, JournalDiff, JournalDiffUpdate};
-use makepad_git::diff::{diff_lines_bounded, DiffOp};
+use fab::ui::journal_panel::{JournalDiff, JournalDiffUpdate, TextDiffError};
 use std::collections::BTreeSet;
 
 fn field<'a>(row: &'a Value, key: &str) -> io::Result<&'a Value> { row.get(key).ok_or_else(invalid) }
@@ -13,7 +12,7 @@ fn array<'a>(row: &'a Value, key: &str) -> io::Result<&'a [Value]> { field(row, 
 
 struct Selection<'a> {
     index: &'a Index,
-    file: BufReader<File>,
+    file: BufReader<ReadingLog>,
     dir: PathBuf,
     end: u64,
     positions: Option<Arc<Positions>>,
@@ -174,33 +173,10 @@ fn prepare_diff(name: &str, before: Option<&[u8]>, after: Option<&[u8]>, current
         let hash = |bytes: Option<&[u8]>| bytes.map(crate::journal::sha256_hex).unwrap_or_else(|| "absent".into());
         return Ok(JournalDiff::note(format!("{operation} {name}\nBefore: {}\nAfter: {}", hash(before), hash(after))))
     };
-    let diff = diff_lines_bounded(before, after, &Default::default(), &|| !current());
-    if !current() { return Err(io::ErrorKind::Interrupted.into()) }
-    let mut rows = Vec::new();
-    let mut hunk = 0;
-    let mut changed = false;
-    for op in diff.ops {
-        let equal = matches!(op, DiffOp::Equal { .. });
-        if !equal && !changed { hunk += 1; }
-        changed = !equal;
-        let (kind, old, new, len) = match op {
-            DiffOp::Equal { old_index, new_index, len } => (DiffRowKind::Equal, Some(old_index), Some(new_index), len),
-            DiffOp::Delete { old_index, len } => (DiffRowKind::Removed, Some(old_index), None, len),
-            DiffOp::Insert { new_index, len } => (DiffRowKind::Added, None, Some(new_index), len),
-        };
-        for line in 0..len {
-            let number = |i: usize| u32::try_from(i + line).map_err(|_| invalid());
-            rows.push(DiffRowSpec { kind, old_line: old.map(number).transpose()?, new_line: new.map(number).transpose()?, hunk: if equal { 0 } else { hunk } });
-        }
-    }
-    let mut prepared = JournalDiff::prepare(name, &rows, before, after).map_err(|_| invalid())?;
-    if diff.unavailable.is_some() {
-        prepared.label.push_str(" · ");
-        prepared.label.push_str(makepad_git::diff::Exhaustion::LABEL);
-    } else if hunk == 0 && before != after {
-        prepared.label.push_str(" · Line endings changed");
-    }
-    Ok(prepared)
+    JournalDiff::text(name, before, after, current).map_err(|error| match error {
+        TextDiffError::Cancelled => io::ErrorKind::Interrupted.into(),
+        TextDiffError::Invalid => invalid(),
+    })
 }
 
 impl Selection<'_> {
@@ -372,6 +348,9 @@ fn invocation(call: Option<&Value>, done: Option<&Value>) -> (String, bool) {
         Some(outcome @ ("refused" | "cancelled")) => return (format!("# {outcome} {name}"), false),
         None => return (format!("# {name} has no recorded outcome"), false),
         _ => return (format!("# Malformed outcome for {name}"), false),
+    }
+    if call.get("replay").and_then(Value::as_bool) == Some(false) {
+        return (format!("# {name}: the person's decision, copied as its edits"), false);
     }
     if wrapper && name == outer { return (format!("# Malformed arguments for {outer}"), false); }
     let args = if wrapper {

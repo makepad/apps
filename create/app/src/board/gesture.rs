@@ -1,11 +1,11 @@
 //! Local board input. Only completing a gesture produces a model action.
 use super::{BoardItem, BoardView, Rect};
 use crate::model::{Action, ItemStyle};
-use makepad_work_core::{
+use makepad_town_core::{
     entity::{field, kind},
     event::{Change, Id, Key, Value},
 };
-use makepad_widgets::{dvec2, log, DVec2, KeyCode, MouseCursor};
+use makepad_widgets::{dvec2, log, DVec2, KeyCode, KeyModifiers, MouseCursor};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[derive(Default, Clone, PartialEq)]
@@ -32,8 +32,8 @@ impl Selection {
 // and distances between two i64 positions can be wider than an individual field.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FixedRect {
-    lo: [i128; 2],
-    hi: [i128; 2],
+    pub(super) lo: [i128; 2],
+    pub(super) hi: [i128; 2],
 }
 
 impl FixedRect {
@@ -124,6 +124,24 @@ pub enum Transform {
     Resize { from: FixedRect, to: FixedRect },
 }
 
+impl Transform {
+    pub(super) fn item_rect(self, item: &BoardItem) -> Rect {
+        self.rect(item.rect, FixedRect::item(item))
+    }
+
+    fn rect(self, rect: Rect, fixed: FixedRect) -> Rect {
+        match self {
+            Self::Move { dx, dy } => {
+                let x = dx as f64 / 64.;
+                let y = dy as f64 / 64.;
+                Rect::new(rect.x0 + x, rect.y0 + y, rect.x1 + x, rect.y1 + y)
+            }
+            Self::Resize { from, to } if from == to => rect,
+            Self::Resize { from, to } => Preview::resized(fixed, from, to).world(),
+        }
+    }
+}
+
 pub struct CapturedItem {
     pub rect: Rect,
     fixed: FixedRect,
@@ -159,17 +177,244 @@ fn lines(rect: Rect, axis: usize) -> [f64; 3] {
     [a, (a + b) * 0.5, b]
 }
 
-// One query for both axes. Only the edge held by a resize handle can pull
-// that axis; a move (and a placement) can use either edge or the centre.
-fn snap(view: &BoardView, moving: Rect, items: &BTreeMap<Id, CapturedItem>, handle: Option<Handle>,
-    zoom: f64, alt: bool) -> Snap {
-    if alt { return Snap::default() }
-    let limit = 6. / zoom;
-    let neighbours = snap_neighbours(view, moving, limit);
-    let targets = neighbours.iter().filter(|id| !items.contains_key(*id)).filter_map(|id| view.get(id).map(|i| i.rect));
-    snap_to(moving, targets, handle, limit)
+fn extent(rect: Rect, axis: usize) -> (f64, f64) {
+    if axis == 0 { (rect.x0, rect.x1) } else { (rect.y0, rect.y1) }
 }
 
+type Segment = (DVec2, DVec2);
+
+fn segment(axis: usize, start: f64, end: f64, cross: f64) -> Segment {
+    if axis == 0 { (dvec2(start, cross), dvec2(end, cross)) }
+    else { (dvec2(cross, start), dvec2(cross, end)) }
+}
+
+impl Guide {
+    pub(super) fn segment(self, axis: usize) -> Segment {
+        segment(1 - axis, self.start, self.end, self.line)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Match {
+    Line(Guide),
+    Gaps { run: [Rect; 3], moving: usize },
+    Size(Rect),
+}
+
+impl Match {
+    fn segments(self, axis: usize, bounds: Rect) -> [Option<Segment>; 2] {
+        // Shift, minimum sizes and rounding to board ticks can change the winning edge.
+        const HALF_TICK: f64 = 0.5 / 64.;
+        match self {
+            Self::Line(mut g) => {
+                if (lines(bounds, axis)[g.edge] - g.line).abs() > HALF_TICK { return [None; 2] }
+                let (lo, hi) = extent(bounds, 1 - axis);
+                g.start = g.start.min(lo);
+                g.end = g.end.max(hi);
+                [Some(g.segment(axis)), None]
+            }
+            Self::Size(target) => {
+                let side = |r| {
+                    let (lo, hi) = extent(r, axis);
+                    segment(axis, lo, hi, extent(r, 1 - axis).0)
+                };
+                let (lo, hi) = extent(bounds, axis);
+                let (a, b) = extent(target, axis);
+                if ((hi - lo) - (b - a)).abs() > HALF_TICK { return [None; 2] }
+                [Some(side(bounds)), Some(side(target))]
+            }
+            Self::Gaps { mut run, moving } => {
+                run[moving] = bounds;
+                let gap = |a, b| {
+                    let (a0, a1) = extent(a, 1 - axis);
+                    let (b0, b1) = extent(b, 1 - axis);
+                    segment(axis, extent(a, axis).1, extent(b, axis).0, (a0.max(b0) + a1.min(b1)) * 0.5)
+                };
+                [Some(gap(run[0], run[1])), Some(gap(run[1], run[2]))]
+            }
+        }
+    }
+}
+
+// In edge order, find the last item before a boundary that overlaps M on the other axis.
+// Each root adds one item in order of its cross-axis start. Its tree stores the greatest
+// cross-axis end in each range of edge ranks. Two binary searches select a prefix and a
+// root; descending the tree skips whole ranges of non-mates, even among overlapping cards.
+#[derive(Clone, Copy)]
+struct MateNode {
+    children: [usize; 2],
+    end: f64,
+}
+
+struct MateIndex {
+    edges: Vec<(f64, Rect)>,
+    roots: Vec<(f64, usize)>,
+    nodes: Vec<MateNode>,
+}
+
+impl MateIndex {
+    fn new(rects: &[Rect], axis: usize, before: bool) -> Self {
+        let mut edges: Vec<_> = rects.iter().copied().filter(|&r| {
+            let (a, b) = extent(r, 1 - axis);
+            a < b
+        }).map(|r| {
+            let (lo, hi) = extent(r, axis);
+            (if before { hi } else { -lo }, r)
+        }).collect();
+        edges.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut order: Vec<_> = edges.iter().enumerate().map(|(rank, &(_, r))| {
+            (extent(r, 1 - axis), rank)
+        }).collect();
+        order.sort_unstable_by(|((a, _), _), ((b, _), _)| a.total_cmp(b));
+        let mut index = Self { edges, roots: Vec::with_capacity(order.len()),
+            nodes: vec![MateNode { children: [0; 2], end: f64::NEG_INFINITY }] };
+        let mut root = 0;
+        for ((start, end), rank) in order {
+            root = index.insert(root, 0, index.edges.len(), rank, end);
+            index.roots.push((start, root));
+        }
+        index
+    }
+
+    fn insert(&mut self, old: usize, lo: usize, hi: usize, rank: usize, end: f64) -> usize {
+        let mut node = self.nodes[old];
+        node.end = node.end.max(end);
+        if hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            let right = usize::from(rank >= mid);
+            let (a, b) = if right == 0 { (lo, mid) } else { (mid, hi) };
+            node.children[right] = self.insert(node.children[right], a, b, rank, end);
+        }
+        self.nodes.push(node);
+        self.nodes.len() - 1
+    }
+
+    fn last(&self, node: usize, lo: usize, hi: usize, limit: usize, start: f64) -> Option<usize> {
+        if lo >= limit || self.nodes[node].end <= start { return None }
+        if hi - lo == 1 { return Some(lo) }
+        let mid = lo + (hi - lo) / 2;
+        let [left, right] = self.nodes[node].children;
+        self.last(right, mid, hi, limit, start).or_else(|| self.last(left, lo, mid, limit, start))
+    }
+
+    fn neighbour(&self, edge: f64, cross: (f64, f64)) -> Option<Rect> {
+        let count = self.roots.partition_point(|&(start, _)| start < cross.1);
+        let &(_, root) = self.roots.get(count.checked_sub(1)?)?;
+        let limit = self.edges.partition_point(|&(value, _)| value <= edge);
+        self.last(root, 0, self.edges.len(), limit, cross.0).map(|i| self.edges[i].1)
+    }
+}
+
+struct AxisTargets {
+    lines: Vec<Guide>,
+    sizes: Vec<(f64, Rect)>,
+    mates: Option<[MateIndex; 2]>,
+}
+
+fn nearest<T>(entries: &[T], at: f64, value: impl Fn(&T) -> f64) -> &[T] {
+    let i = entries.partition_point(|e| value(e) < at);
+    &entries[i.saturating_sub(1)..entries.len().min(i + 1)]
+}
+
+impl AxisTargets {
+    fn new(rects: &[Rect], axis: usize, resize: bool) -> Self {
+        let mut guides = Vec::with_capacity(3 * rects.len());
+        let mut sizes = Vec::with_capacity(rects.len());
+        for &r in rects {
+            let (start, end) = extent(r, 1 - axis);
+            guides.extend(lines(r, axis).map(|line| Guide { line, start, end, edge: 0 }));
+            let (lo, hi) = extent(r, axis);
+            sizes.push((hi - lo, r));
+        }
+        guides.sort_by(|a, b| a.line.total_cmp(&b.line));
+        guides.dedup_by(|next, prev| {
+            if next.line != prev.line { return false }
+            prev.start = prev.start.min(next.start);
+            prev.end = prev.end.max(next.end);
+            true
+        });
+        sizes.sort_by(|a, b| a.0.total_cmp(&b.0));
+        Self { lines: guides, sizes, mates: (!resize).then(|| [
+            MateIndex::new(rects, axis, true), MateIndex::new(rects, axis, false),
+        ]) }
+    }
+
+    fn gaps(&self, m: Rect, axis: usize, mut offer: impl FnMut(f64, Match)) {
+        let Some([before, after]) = &self.mates else { return };
+        let (lo, hi) = extent(m, axis);
+        let cross = extent(m, 1 - axis);
+        if cross.0 >= cross.1 { return }
+        let l = before.neighbour(lo, cross);
+        let r = after.neighbour(-hi, cross);
+        if let (Some(l), Some(r)) = (l, r) {
+            let a = lo - extent(l, axis).1;
+            let b = extent(r, axis).0 - hi;
+            if a + b > 0. {
+                offer((b - a) * 0.5, Match::Gaps { run: [l, m, r], moving: 1 });
+            }
+        }
+        if let Some(l) = l {
+            let (start, end) = extent(l, axis);
+            if let Some(ll) = before.neighbour(start, cross) {
+                let gap = start - extent(ll, axis).1;
+                if gap > 0. { offer(gap - (lo - end), Match::Gaps { run: [ll, l, m], moving: 2 }); }
+            }
+        }
+        if let Some(r) = r {
+            let (start, end) = extent(r, axis);
+            if let Some(rr) = after.neighbour(-end, cross) {
+                let gap = extent(rr, axis).0 - end;
+                if gap > 0. { offer(start - hi - gap, Match::Gaps { run: [m, r, rr], moving: 0 }); }
+            }
+        }
+    }
+
+    fn pull(&self, m: Rect, axis: usize, handle: Option<Handle>, limit: f64) -> (f64, Option<Match>) {
+        let side = handle.map(|h| h.0[axis]);
+        if side == Some(0) { return (0., None) }
+        let mut best = (0_f64, None);
+        // Offer in tie order. Equal pulls keep the earlier match.
+        let mut offer = |delta: f64, mark| {
+            if delta.abs() <= limit && (best.1.is_none() || delta.abs() < best.0.abs()) {
+                best = (delta, Some(mark));
+            }
+        };
+        for (edge, value) in lines(m, axis).into_iter().enumerate() {
+            if side.is_some_and(|s| edge as i8 != s + 1) { continue }
+            for &g in nearest(&self.lines, value, |g| g.line) {
+                offer(g.line - value, Match::Line(Guide { edge, ..g }));
+            }
+        }
+        if let Some(side) = side {
+            let (lo, hi) = extent(m, axis);
+            let span = hi - lo;
+            for &(size, target) in nearest(&self.sizes, span, |s| s.0) {
+                offer((size - span) * f64::from(side), Match::Size(target));
+            }
+        } else {
+            self.gaps(m, axis, offer);
+        }
+        best
+    }
+}
+
+struct SnapTargets([AxisTargets; 2]);
+
+impl SnapTargets {
+    fn capture(view: &BoardView, viewport: Option<Rect>, preview: &Preview, resize: bool) -> Self {
+        let visible = viewport.map(|r| view.visible(r)).unwrap_or_default();
+        let rects: Vec<_> = visible.iter().filter(|id| !preview.items.contains_key(*id))
+            .filter_map(|id| view.get(id).map(|item| item.rect)).collect();
+        Self(std::array::from_fn(|axis| AxisTargets::new(&rects, axis, resize)))
+    }
+
+    fn snap(&self, rect: Rect, handle: Option<Handle>, zoom: f64, alt: bool) -> [(f64, Option<Match>); 2] {
+        if alt { return [(0., None); 2] }
+        std::array::from_fn(|axis| self.0[axis].pull(rect, axis, handle, 6. / zoom))
+    }
+}
+
+// A new item's placement also queries enclosing sections. It uses local lines from that query.
 fn snap_neighbours(view: &BoardView, r: Rect, limit: f64) -> Vec<Id> {
     view.visible(Rect::new(r.x0 - limit, r.y0 - limit, r.x1 + limit, r.y1 + limit))
 }
@@ -263,7 +508,12 @@ impl Preview {
         let mut r = to;
         for axis in 0..2 {
             if from.span(axis) == 0 { continue }
-            let map = |v| to.lo[axis] + proportion(v - from.lo[axis], to.span(axis), from.span(axis));
+            // Another seat's copy can be outside the captured selection after a concurrent edit.
+            let map = |v: i128| {
+                let offset = v - from.lo[axis];
+                let scaled = proportion(offset.abs(), to.span(axis), from.span(axis));
+                to.lo[axis].saturating_add(if offset < 0 { -scaled } else { scaled })
+            };
             r.lo[axis] = map(item.lo[axis]).min(to.hi[axis] - 512);
             r.hi[axis] = map(item.hi[axis]).max(r.lo[axis] + 512);
         }
@@ -320,16 +570,7 @@ impl Preview {
 
     pub fn rect(&self, id: &Id) -> Option<Rect> {
         let item = self.items.get(id)?;
-        match self.transform {
-            Transform::Move { dx, dy } => {
-                let r = item.rect;
-                let x = dx as f64 / 64.;
-                let y = dy as f64 / 64.;
-                Some(Rect::new(r.x0 + x, r.y0 + y, r.x1 + x, r.y1 + y))
-            }
-            Transform::Resize { from, to } if from == to => Some(item.rect),
-            Transform::Resize { from, to } => Some(Self::resized(item.fixed, from, to).world()),
-        }
+        Some(self.transform.rect(item.rect, item.fixed))
     }
 
     fn finish(self, view: &BoardView) -> Option<Action> {
@@ -390,8 +631,8 @@ enum Phase {
         marquee: bool,
         locked: bool,
     },
-    Moving { start: DVec2 },
-    Resizing { screen: DVec2, handle: Handle, base: FixedRect },
+    Moving { start: DVec2, targets: SnapTargets },
+    Resizing { start: DVec2, handle: Handle, base: FixedRect, targets: SnapTargets },
     Marquee { start: DVec2, rect: Rect, before: Selection, shift: bool },
     Panning { screen: DVec2, pan: DVec2 },
     Nudging { held: u8 },
@@ -404,16 +645,18 @@ pub struct Gesture {
     pub preview: Option<Preview>,
     pub space: bool,
     pub handle: Option<Handle>,
-    pub guides: [Option<Guide>; 2],
+    marks: [Option<Match>; 2],
+    viewport: Option<Rect>,
     phase: Phase,
 }
 
 impl Gesture {
-    pub fn cursor(&self, view: &BoardView) -> MouseCursor {
+    /// `hand`: the Hand tool is armed, so a press anywhere pans.
+    pub fn cursor(&self, view: &BoardView, hand: bool) -> MouseCursor {
         match self.phase {
             Phase::Panning { .. } => MouseCursor::Grabbing,
             Phase::Pressed { locked: true, .. } => MouseCursor::NotAllowed,
-            _ if self.space => MouseCursor::Grab,
+            _ if self.space || hand => MouseCursor::Grab,
             Phase::Resizing { handle, .. } => handle.cursor(),
             Phase::Idle if self.handle.is_some() => self.handle.unwrap().cursor(),
             Phase::Moving { .. } => MouseCursor::Hand,
@@ -428,6 +671,31 @@ impl Gesture {
 
     pub fn pointer_active(&self) -> bool {
         !matches!(self.phase, Phase::Idle | Phase::Nudging { .. })
+    }
+
+    pub(super) fn moving(&self) -> Option<&Preview> {
+        match self.phase {
+            Phase::Moving { .. } | Phase::Resizing { .. } => self.preview.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub(super) fn set_viewport(&mut self, view: &BoardView, viewport: Rect) {
+        if self.viewport == Some(viewport) { return }
+        self.viewport = Some(viewport);
+        let Some(p) = &self.preview else { return };
+        match &mut self.phase {
+            Phase::Moving { targets, .. } => *targets = SnapTargets::capture(view, self.viewport, p, false),
+            Phase::Resizing { targets, .. } => *targets = SnapTargets::capture(view, self.viewport, p, true),
+            _ => {}
+        }
+    }
+
+    pub(super) fn snap_segments(&self) -> impl Iterator<Item = Segment> + '_ {
+        let bounds = self.moving().map(Preview::bounds_at);
+        self.marks.iter().enumerate().flat_map(move |(axis, mark)| {
+            mark.zip(bounds).map_or([None; 2], |(m, b)| m.segments(axis, b)).into_iter().flatten()
+        })
     }
 
     /// A press that still selects one item on release, without a drag or Shift-toggle.
@@ -456,14 +724,15 @@ impl Gesture {
         }).min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, h)| h)
     }
 
-    pub fn press_handle(&mut self, view: &BoardView, handle: Handle, screen: DVec2) {
+    pub fn press_handle(&mut self, view: &BoardView, handle: Handle, world: DVec2) {
         if !matches!(self.phase, Phase::Idle) { return }
         let mut p = Preview::capture(view, &self.selection, false);
         if p.items.is_empty() { return }
         let base = p.bounds;
         p.transform = Transform::Resize { from: base, to: base };
+        let targets = SnapTargets::capture(view, self.viewport, &p, true);
         self.preview = Some(p);
-        self.phase = Phase::Resizing { screen, handle, base };
+        self.phase = Phase::Resizing { start: world, handle, base, targets };
         self.handle = Some(handle);
     }
 
@@ -532,7 +801,7 @@ impl Gesture {
     }
 
     pub fn motion(&mut self, view: &BoardView, world: DVec2, screen: DVec2, zoom: f64, alt: bool, shift: bool) -> Option<DVec2> {
-        self.guides = [None; 2];
+        self.marks = [None; 2];
         if let Phase::Pressed { start, screen: down, before, shift, marquee, locked, .. } = &self.phase {
             if (screen - *down).length() <= 3. || *locked {
                 return None;
@@ -545,28 +814,28 @@ impl Gesture {
                     shift: *shift,
                 }
             } else {
-                Phase::Moving { start: *start }
+                Phase::Moving { start: *start, targets: SnapTargets::capture(view, self.viewport, self.preview.as_ref()?, false) }
             };
         }
         match &mut self.phase {
-            Phase::Moving { start } => {
+            Phase::Moving { start, targets } => {
                 if let Some(preview) = &mut self.preview {
                     let delta = world - *start;
                     let Some((dx, dy)) = ticks(delta.x).zip(ticks(delta.y)) else {
                         return self.cancel_out_of_range();
                     };
                     preview.transform = Transform::Move { dx, dy };
-                    let snapped = snap(view, preview.bounds_at(), &preview.items, None, zoom, alt);
-                    let offsets = ticks(snapped.delta[0]).zip(ticks(snapped.delta[1]));
+                    let snapped = targets.snap(preview.bounds_at(), None, zoom, alt);
+                    let offsets = ticks(snapped[0].0).zip(ticks(snapped[1].0));
                     let Some((dx, dy)) = offsets.and_then(|(x, y)| dx.checked_add(x).zip(dy.checked_add(y))) else {
                         return self.cancel_out_of_range();
                     };
                     preview.transform = Transform::Move { dx, dy };
-                    self.guides = snapped.guides;
+                    self.marks = snapped.map(|(_, mark)| mark);
                 }
             }
-            Phase::Resizing { screen: down, handle, base } => {
-                let delta = (screen - *down) / zoom;
+            Phase::Resizing { start, handle, base, targets } => {
+                let delta = world - *start;
                 let Some((x, y)) = ticks(delta.x).zip(ticks(delta.y)) else { return self.cancel_out_of_range() };
                 let p = self.preview.as_mut()?;
                 if x == 0 && y == 0 {
@@ -576,15 +845,15 @@ impl Gesture {
                 let Some(raw) = p.resize(*base, *handle, [x.into(), y.into()], shift, None) else {
                     return self.cancel_out_of_range();
                 };
-                let snapped = snap(view, raw.world(), &p.items, Some(*handle), zoom, alt);
+                let snapped = targets.snap(raw.world(), Some(*handle), zoom, alt);
                 let mut to = raw;
-                if let Some(axis) = (0..2).filter(|&i| snapped.guides[i].is_some())
-                    .min_by(|&a, &b| snapped.delta[a].abs().total_cmp(&snapped.delta[b].abs())) {
+                if let Some(axis) = (0..2).filter(|&i| snapped[i].1.is_some())
+                    .min_by(|&a, &b| snapped[a].0.abs().total_cmp(&snapped[b].0.abs())) {
                     // With Shift a snap fixes one edge; derive the other dimension
                     // from that snapped size so the preview keeps its aspect ratio.
                     let mut adjusted = [0; 2];
                     for i in 0..2 {
-                        let Some(offset) = ticks(snapped.delta[i]) else { return self.cancel_out_of_range() };
+                        let Some(offset) = ticks(snapped[i].0) else { return self.cancel_out_of_range() };
                         adjusted[i] = i128::from(handle.0[i]) * (raw.span(i) - base.span(i)) + i128::from(offset);
                     }
                     let Some(resized) = p.resize(*base, *handle, adjusted, shift, Some(axis)) else {
@@ -593,7 +862,7 @@ impl Gesture {
                     to = resized;
                 }
                 p.transform = Transform::Resize { from: *base, to };
-                self.guides = snapped.guides;
+                self.marks = snapped.map(|(_, mark)| mark);
             }
             Phase::Marquee { start, rect, before, shift } => {
                 *rect = Rect::new(start.x, start.y, world.x, world.y);
@@ -605,25 +874,11 @@ impl Gesture {
             Phase::Panning { screen: start, pan } => return Some(*pan + (screen - *start)),
             _ => {}
         }
-        if let Some(p) = &self.preview {
-            let bounds = p.bounds_at();
-            for (axis, guide) in self.guides.iter_mut().enumerate() {
-                if let Some(g) = guide {
-                    if (lines(bounds, axis)[g.edge] - g.line).abs() > 0.5 / 64. {
-                        *guide = None;
-                    } else {
-                        let extent = lines(bounds, 1 - axis);
-                        g.start = g.start.min(extent[0]);
-                        g.end = g.end.max(extent[2]);
-                    }
-                }
-            }
-        }
         None
     }
 
     pub fn release(&mut self, view: &BoardView) -> Option<Action> {
-        self.guides = [None; 2];
+        self.marks = [None; 2];
         let phase = std::mem::take(&mut self.phase);
         match phase {
             Phase::Moving { .. } | Phase::Resizing { .. } => return self.preview.take()?.finish(view),
@@ -648,7 +903,7 @@ impl Gesture {
     }
 
     pub fn cancel(&mut self) {
-        self.guides = [None; 2];
+        self.marks = [None; 2];
         self.handle = None;
         match std::mem::take(&mut self.phase) {
             Phase::Pressed { before, .. } | Phase::Marquee { before, .. } => self.selection = before,
@@ -686,7 +941,7 @@ impl Gesture {
             }
         }
         if removed {
-            self.guides = [None; 2];
+            self.marks = [None; 2];
             if let Some(p) = &mut self.preview {
                 if matches!(p.transform, Transform::Move { .. }) { p.measure(); }
             }
@@ -777,7 +1032,41 @@ impl Gesture {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum BoardTool { #[default] Select, Sticky, Text, Shape, Section }
+pub enum BoardTool { #[default] Select, Hand, Sticky, Text, Shape, Section }
+
+/// What a scroll does to the board's camera.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ScrollNav {
+    /// Move the camera by this many screen points.
+    Pan(DVec2),
+    /// Multiply the zoom by this, about the pointer.
+    Zoom(f64),
+}
+
+/// A wheel's zoom per screen point it turns: a 32-point notch (macOS) zooms by about 1.17.
+const WHEEL_ZOOM: f64 = 0.005;
+/// A trackpad's zoom per point, with Command or Control held.
+const PAD_ZOOM: f64 = 0.012;
+/// How much finer Alt makes a wheel's zoom.
+const FINE_ZOOM: f64 = 0.25;
+
+/// The board's scroll navigation. `scroll` is in screen points. `wheel`: the event came from a
+/// wheel (no precise delta, no gesture phase), which zooms toward the pointer; a trackpad's two
+/// fingers pan, and its pinch zooms as an event of its own. Command or Control turns either into
+/// a zoom. Shift turns a wheel sideways, and a tilt wheel's sideways turn pans.
+pub fn scroll_nav(scroll: DVec2, wheel: bool, mods: &KeyModifiers) -> ScrollNav {
+    let command = mods.control || mods.logo;
+    if wheel && mods.shift && !command {
+        // macOS already turns Shift+wheel sideways; Windows and X11 deliver it vertical.
+        let x = if scroll.x != 0. { scroll.x } else { scroll.y };
+        return ScrollNav::Pan(dvec2(-x, 0.));
+    }
+    if (wheel || command) && scroll.y != 0. {
+        let rate = if wheel { WHEEL_ZOOM } else { PAD_ZOOM } * if wheel && mods.alt { FINE_ZOOM } else { 1. };
+        return ScrollNav::Zoom((-scroll.y * rate).exp());
+    }
+    ScrollNav::Pan(-scroll)
+}
 
 /// How far, in screen points, a press moves before it becomes a drag.
 pub(super) const DRAG_SLOP: f64 = 3.;
@@ -792,9 +1081,14 @@ pub(super) struct Placement {
 impl BoardTool {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Select => "Select", Self::Sticky => "Sticky", Self::Text => "Text",
+            Self::Select => "Select", Self::Hand => "Hand", Self::Sticky => "Sticky", Self::Text => "Text",
             Self::Shape => "Shape", Self::Section => "Section",
         }
+    }
+
+    /// Whether the tool puts a new item on the board.
+    pub fn places(self) -> bool {
+        !matches!(self, Self::Select | Self::Hand)
     }
 
     /// `start` is the press point of a drag that has passed [`DRAG_SLOP`]. Without it this is a
@@ -802,7 +1096,7 @@ impl BoardTool {
     pub(super) fn preview(self, view: Option<&BoardView>, start: Option<DVec2>, p: DVec2,
         zoom: f64, alt: bool) -> Option<Placement> {
         let (kind, width, height) = match self {
-            Self::Select => return None,
+            Self::Select | Self::Hand => return None,
             Self::Sticky => (kind::STICKY, 220., 160.),
             Self::Text => (kind::TEXT_BLOCK, 180., 40.),
             Self::Shape => (kind::SHAPE, 144., 96.),
@@ -937,25 +1231,123 @@ mod tests {
     use makepad_widgets::dvec2;
 
     #[test]
+    fn a_wheel_zooms_a_trackpad_pans_and_modifiers_turn_or_refine_them() {
+        let mods = |f: fn(&mut KeyModifiers)| { let mut m = KeyModifiers::default(); f(&mut m); m };
+        let none = KeyModifiers::default();
+        let zoom = |nav| match nav { ScrollNav::Zoom(f) => f, other => panic!("expected a zoom, got {other:?}") };
+        let notch = zoom(scroll_nav(dvec2(0., 32.), true, &none));
+        assert!(notch < 1. && notch > 0.8, "a wheel notch toward the person zooms out a step: {notch}");
+        assert!((zoom(scroll_nav(dvec2(0., -32.), true, &none)) * notch - 1.).abs() < 1e-12, "and back is the inverse");
+        let fine = zoom(scroll_nav(dvec2(0., 32.), true, &mods(|m| m.alt = true)));
+        assert!(fine > notch && fine < 1., "Alt makes the wheel's step finer: {fine} vs {notch}");
+        assert_eq!(scroll_nav(dvec2(0., 32.), true, &mods(|m| m.shift = true)), ScrollNav::Pan(dvec2(-32., 0.)),
+            "Shift turns a vertical wheel sideways");
+        assert_eq!(scroll_nav(dvec2(20., 0.), true, &mods(|m| m.shift = true)), ScrollNav::Pan(dvec2(-20., 0.)),
+            "macOS's own sideways Shift+wheel pans the same way");
+        assert_eq!(scroll_nav(dvec2(12., 0.), true, &none), ScrollNav::Pan(dvec2(-12., 0.)), "a tilt wheel pans sideways");
+        assert_eq!(scroll_nav(dvec2(6., -9.), false, &none), ScrollNav::Pan(dvec2(-6., 9.)),
+            "two fingers pan both ways, Alt or not");
+        assert_eq!(scroll_nav(dvec2(6., -9.), false, &mods(|m| m.alt = true)), ScrollNav::Pan(dvec2(-6., 9.)));
+        for command in [mods(|m| m.logo = true), mods(|m| m.control = true)] {
+            assert!(zoom(scroll_nav(dvec2(0., -10.), false, &command)) > 1., "Command or Control with two fingers zooms");
+        }
+        assert!(zoom(scroll_nav(dvec2(0., -10.), true, &mods(|m| { m.shift = true; m.logo = true }))) > 1.,
+            "Command keeps a Shift+wheel a zoom");
+    }
+
+    #[test]
     fn snapping_uses_independent_axes_centres_zoom_and_modifiers() {
-        let mut history = History::new();
-        let board = history.board();
-        let target = history.push(item(kind::STICKY, board, [20, 10, 20, 20], None)).0;
-        let view = BoardView::build(&history.state, board);
-        let items = BTreeMap::new();
+        let mut h = History::new();
+        let board = h.board();
+        let section = h.push(item(kind::SECTION, board, [0, 0, 20, 30], None)).0;
+        let child = h.push(item(kind::STICKY, section, [12, 4, 5, 6], None)).0;
+        h.push(item(kind::STICKY, board, [160, 10, 30, 80], None));
+        h.push(item(kind::STICKY, board, [230, 10, 30, 80], None));
+        let view = BoardView::build(&h.state, board);
+        let mut g = Gesture::default();
+        g.set_viewport(&view, Rect::new(0., 0., 120., 120.));
+        let origin = dvec2(0., 0.);
+        g.press(&view, Some(section), origin, origin, false, None, false);
+        let move_to = |g: &mut Gesture, y, zoom, alt| {
+            let p = dvec2(12., y);
+            g.motion(&view, p, p * zoom, zoom, alt, false);
+            g.moving().unwrap().rect(&section).unwrap()
+        };
+        assert_eq!(move_to(&mut g, 4., 1., false), Rect::new(12., 4., 32., 34.),
+            "off-screen neighbours, the selection and its carried child cannot pull the preview");
+        assert_eq!(g.snap_segments().count(), 0, "excluded items cannot produce marks");
+        g.set_viewport(&view, Rect::new(150., 0., 270., 120.));
+        for zoom in [1., 2.] {
+            let y = 10. - 6. / zoom;
+            assert_eq!(move_to(&mut g, y, zoom, false).y0, 10.,
+                "a visible neighbour across a gap pulls the top edge from six screen pixels at zoom {zoom}");
+            assert_eq!(g.snap_segments().collect::<Vec<_>>(), [(dvec2(12., 10.), dvec2(260., 10.))],
+                "the guide reaches the dragged item and every neighbour on the winning line");
+            assert_eq!(g.moving().unwrap().rect(&child).unwrap().y0, 14.,
+                "the live preview carries the section member by the snapped offset");
+            let outside = y - 1. / 64.;
+            assert_eq!(move_to(&mut g, outside, zoom, false).y0, outside,
+                "one tick past six screen pixels is outside the threshold at zoom {zoom}");
+            assert_eq!(move_to(&mut g, y, zoom, true).y0, y, "Alt bypasses line snapping at zoom {zoom}");
+        }
+        assert_eq!(move_to(&mut g, 34., 1., false).y0, 35.,
+            "a side-by-side neighbour pulls the vertical centre independently of the horizontal axis");
+        assert_eq!(g.snap_segments().next(), Some((dvec2(12., 50.), dvec2(260., 50.))),
+            "the centre guide is at the neighbours' shared centre");
+        g.cancel();
+
+        for (side, dx, expected) in [(1, 7., (0., 30.)), (-1, -13., (-10., 20.))] {
+            g.press_handle(&view, Handle([side, 0]), origin);
+            let p = dvec2(dx, 17.);
+            g.motion(&view, p, p, 1., false, false);
+            let r = g.moving().unwrap().rect(&section).unwrap();
+            assert_eq!((r.x0, r.x1, r.y0, r.y1), (expected.0, expected.1, 0., 30.),
+                "matching width moves only the held edge on side {side}");
+            let bars: Vec<_> = g.snap_segments().collect();
+            assert_eq!(bars[0], (dvec2(r.x0, 0.), dvec2(r.x1, 0.)), "the preview's bar spans its matched width");
+            assert_eq!(bars[1].1 - bars[1].0, dvec2(30., 0.), "the matching neighbour has the same width bar");
+            g.motion(&view, p, p, 1., false, true);
+            let r = g.moving().unwrap().rect(&section).unwrap();
+            assert_eq!(r.y1 - r.y0, 45., "Shift derives the height from the matched width");
+            g.motion(&view, p, p, 1., true, false);
+            assert_eq!(g.snap_segments().count(), 0, "Alt also disables size matches");
+            g.cancel();
+        }
+
         let moving = Rect::new(2., 15., 15., 23.);
-        let s = snap(&view, moving, &items, None, 1., false);
-        assert_eq!(s.delta, [5., 1.], "right edge and vertical centre find different offsets");
-        assert_eq!(s.guides[0].unwrap().line, 20.);
-        assert_eq!(s.guides[1].unwrap().line, 20.);
-        assert!(snap(&view, moving, &items, None, 2., false).guides.iter().all(Option::is_none));
-        assert!(snap(&view, moving, &items, None, 1., true).guides.iter().all(Option::is_none));
-        let s = snap(&view, moving, &items, Some(Handle([1, 0])), 1., false);
-        assert!(s.guides[0].is_some() && s.guides[1].is_none(), "a side handle snaps only its moving edge");
-        let mut selection = Selection::default();
-        selection.add(target);
-        let p = Preview::capture(&view, &selection, false);
-        assert!(snap(&view, moving, &p.items, None, 1., false).guides.iter().all(Option::is_none));
+        let axes = SnapTargets(std::array::from_fn(|axis| AxisTargets::new(&[Rect::new(20., 10., 40., 30.)], axis, false)));
+        let offsets = |zoom| axes.snap(moving, None, zoom, false).map(|(delta, _)| delta);
+        assert_eq!(offsets(1.), [5., 1.], "the two axes can choose different pulls");
+        assert_eq!(offsets(2.), [0., 1.], "one axis leaving the threshold does not disable the other");
+
+        let run = [Rect::new(0., 0., 20., 20.), Rect::new(50., 0., 70., 20.), Rect::new(86., 40., 92., 60.)];
+        let targets = AxisTargets::new(&run, 0, false);
+        for (x, goal, bars) in [
+            (103., 100., [(20., 50.), (70., 100.)]),
+            (-52., -50., [(-30., 0.), (20., 50.)]),
+            (27., 25., [(20., 25.), (45., 50.)]),
+        ] {
+            let rect = |left| Rect::new(left, 0., left + 20., 20.);
+            let (delta, mark) = targets.pull(rect(x), 0, None, 6.);
+            assert_eq!(x + delta, goal, "the nearest row-mates give the equal-gap position for x={x}");
+            assert!(matches!(mark, Some(Match::Gaps { .. })), "equal spacing wins at x={x}");
+            assert_eq!(mark.unwrap().segments(0, rect(goal)), bars.map(|(a, b)| Some((dvec2(a, 10.), dvec2(b, 10.)))),
+                "both equal gaps get bars between their actual endpoints for x={x}");
+        }
+        let column = [Rect::new(0., 0., 20., 20.), Rect::new(0., 35., 20., 66.), Rect::new(0., 50., 20., 70.)];
+        let m = Rect::new(0., 103., 20., 123.);
+        let (delta, mark) = AxisTargets::new(&column, 1, false).pull(m, 1, None, 6.);
+        assert!(delta == -3. && matches!(mark, Some(Match::Gaps { .. })),
+            "the next column-mate beyond the nearest one must leave a positive gap");
+        let axes = SnapTargets(std::array::from_fn(|axis| AxisTargets::new(&column, axis, false)));
+        assert!(axes.snap(m, None, 1., true).iter().all(|(d, mark)| *d == 0. && mark.is_none()),
+            "Alt suppresses equal spacing and its feedback");
+        let tied = AxisTargets::new(&[run[0], run[1], Rect::new(106., 40., 126., 60.)], 0, false);
+        let (delta, mark) = tied.pull(Rect::new(103., 0., 123., 20.), 0, None, 6.);
+        assert!(delta == 3. && matches!(mark, Some(Match::Line(_))), "a line wins a tie with a gap");
+        let tied = AxisTargets::new(&[Rect::new(30., 0., 54., 20.)], 0, true);
+        let (delta, mark) = tied.pull(Rect::new(0., 0., 27., 20.), 0, Some(Handle([1, 0])), 6.);
+        assert!(delta == 3. && matches!(mark, Some(Match::Line(_))), "a line wins a tie with a size");
     }
 
     #[test]
@@ -967,6 +1359,7 @@ mod tests {
         let other = h.push(item(kind::TEXT_BLOCK, board, [30, 20, 10, 10], None)).0;
         let v = BoardView::build(&h.state, board);
         let mut g = Gesture::default();
+        g.set_viewport(&v, Rect::new(-50., -50., 100., 100.));
         g.selection.ids = [section, other].into();
         let start = dvec2(40., 30.);
         let end = dvec2(80., 60.);
@@ -998,7 +1391,8 @@ mod tests {
         let near = start + dvec2(19., 6.);
         g.motion(&v, near, near, 1., false, true);
         assert_eq!(g.preview.as_ref().unwrap().rect(&section), Some(Rect::new(0., 0., 40., 20.)));
-        assert!(g.guides.iter().all(Option::is_some), "a snapped corner still preserves the aspect ratio");
+        assert!(g.marks.iter().all(|m| matches!(m, Some(Match::Line(_)))) && g.snap_segments().count() == 2,
+            "both lines still coincide with the corner after preserving the aspect ratio");
         g.cancel();
         g.press_handle(&v, Handle([-1, -1]), start);
         g.motion(&v, end, end, 1., true, false);
@@ -1051,7 +1445,7 @@ mod tests {
         assert!(g.release(&v).is_none());
         assert_eq!(g.selection.ids, [a, b, lock].into(), "shift-marquee adds content but not a partly enclosed section");
         press(&mut g, Some(lock), false);
-        assert_eq!(g.cursor(&v), MouseCursor::NotAllowed);
+        assert_eq!(g.cursor(&v, false), MouseCursor::NotAllowed);
         g.motion(&v, dvec2(9., 0.), dvec2(9., 0.), 1., true, false);
         assert!(g.release(&v).is_none());
         click(&mut g, None, false);

@@ -60,23 +60,51 @@ impl Presence {
                 Err(TryLockError::Error(e)) => return Err(e),
             }
         }
-        let mut live = 0;
-        for entry in fs::read_dir(&self.dir)? {
-            let path = entry?.path();
-            if path == self.path { continue }
-            let Some(file) = open_regular(&path).ok().flatten() else { continue };
-            match file.try_lock() {
-                Err(TryLockError::WouldBlock) => live += 1,
-                Ok(()) => {
-                    let _ = file.unlock();
-                    drop(file);
-                    let _ = fs::remove_file(&path);
-                }
-                Err(TryLockError::Error(e)) => return Err(e),
-            }
-        }
-        Ok(live)
+        live_holders(&self.dir, std::process::id(), Some(&self.path))
     }
+}
+
+pub(crate) fn other_presence_holders(plate: &Path, own_pid: u32) -> io::Result<usize> {
+    live_holders(&plate.join(DIR), own_pid, None)
+}
+
+/// A presence watch excludes only its own file and sweeps stale names. Delete
+/// samples existing holders without sweeping, excluding all files of its process.
+pub(super) fn live_holders(dir: &Path, own_pid: u32, watch: Option<&Path>) -> io::Result<usize> {
+    let prefix = format!("{own_pid}-");
+    match fs::symlink_metadata(dir) {
+        Ok(meta) if meta.is_dir() => (),
+        Ok(_) => return Err(invalid()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    }
+    let mut live = 0;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let own = match watch {
+            Some(own) => path == own,
+            None => entry.file_name().to_str().is_some_and(|name| name.starts_with(&prefix)),
+        };
+        if own { continue }
+        let file = match open_regular(&path) {
+            Ok(Some(file)) => file,
+            Ok(None) => continue,
+            Err(_) if watch.is_some() => continue,
+            Err(e) => return Err(e),
+        };
+        match file.try_lock() {
+            Err(TryLockError::WouldBlock) => live += 1,
+            Ok(()) if watch.is_some() => {
+                let _ = file.unlock();
+                drop(file);
+                let _ = fs::remove_file(&path);
+            }
+            Ok(()) => (),
+            Err(TryLockError::Error(e)) => return Err(e),
+        }
+    }
+    Ok(live)
 }
 
 impl Drop for Presence {

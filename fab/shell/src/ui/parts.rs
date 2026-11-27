@@ -1,12 +1,13 @@
 //! The user's parts: [`FabPartsPanel`] lists every placed part of the plate
 //! (never the printer's own geometry) with its filament colour, size and a
 //! warning when it cannot print; [`FabPartPanel`] edits the selected part:
-//! name, position, turn, scale, print colour, and the plate tools
-//! (drop to the plate, duplicate, delete).
+//! position, turn, scale, its parameters, print colour, and the plate tools
+//! (drop to the plate, frame it).
 //!
 //! Parts and annotations edit through [`PartAction`]s and [`MeasureAction`]s;
 //! the app makes each edit one undoable model transaction.
 
+use crate::ui::code::TreeFold;
 use crate::api::*;
 use crate::ui::keymap::{self, ShortcutId as Key};
 use crate::model::state::{part_axes, pose_stretch_about, pose_turn_shift, Pose};
@@ -21,6 +22,8 @@ use makepad_widgets_core::widget_tree::CxWidgetExt;
 const ADD_MENU: LiveId = live_id!(fab_parts_add);
 const PART_MENU: LiveId = live_id!(fab_parts_context);
 const ORIGIN_FIELD_MAX: f64 = 400.0;
+/// How far a row of the parts tree sits in per level.
+const TREE_STEP: f64 = 12.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowKind {
@@ -194,7 +197,11 @@ fn measurement_group(measurements: &[Measurement]) -> AnnotationGroup {
 pub fn tree_rows(plate: &PlateInfo, annotations: &[AnnotationGroup]) -> Vec<Row> {
     let mut groups: Vec<Vec<usize>> = Vec::new();
     let mut scripts = HashMap::new();
-    for (i, p) in plate.parts.iter().enumerate() {
+    // in their declared order: the plate lists its printed parts first, so a part switched off
+    // would otherwise drop to the end (ties, a placed object's several bodies, as listed)
+    let mut order: Vec<usize> = (0..plate.parts.len()).collect();
+    order.sort_by_key(|&i| (plate.parts[i].order, i));
+    for (i, p) in order.into_iter().map(|i| (i, &plate.parts[i])) {
         let script = if p.script.is_empty() { p.object.split('/').next().unwrap_or(&p.object) } else { &p.script };
         let group = *scripts.entry(script).or_insert_with(|| {
             groups.push(Vec::new());
@@ -378,6 +385,22 @@ script_mod! {
 
     let EyeIcon = ToolIcon{}
 
+    // A row's fold chevron, the feature tree's: right while folded, down while open. The whole
+    // 18 x 22 slot takes the press; only the small chevron draws (no face on hover or press).
+    let FoldIcon = mod.widgets.FabIconButton{
+        width: 18
+        height: 22
+        icon_walk: Walk{width: 10 height: 10}
+        draw_bg +: {pixel: fn() { return vec4(0.0) }}
+        draw_icon +: {color: fab.color_text_dim}
+    }
+
+    // A Transform number row: its label column the Parameters rows' (`param_panel::LABEL_W`), so
+    // the Part panel's fields all start at one line.
+    let TransformRow = PropNumberRow{
+        label +: {width: #(crate::ui::param_panel::LABEL_W)}
+    }
+
     mod.widgets.FabPartsPanelBase = #(FabPartsPanel::register_widget(vm))
     mod.widgets.FabPartsPanel = set_type_default() do mod.widgets.FabPartsPanelBase{
         width: Fill
@@ -385,34 +408,14 @@ script_mod! {
         flow: Down
         show_bg: true
         draw_bg +: { color: fab.color_editor }
-        tools := View{
-            width: Fill
-            height: Fit
-            flow: Down
-            padding: Inset{left: 8 right: 8 top: 4 bottom: 4}
-            spacing: 2
-            View{width: Fill height: Fit flow: Right{wrap: true} spacing: 2 align: Align{y: 0.5}
-                FabTip{ text: "Add a shape or import a model"
-                    add := mod.widgets.FabDropdownButton{ a11y: {label: "Add"}
-                        tag: @fab_parts_add
-                        owner: @fab_parts_add
-                        height: 26
-                        label +: { text: "Add" }
-                    }
-                }
-                FabTip{ text: #(keymap::tooltip(Key::FrameAll))
-                    frame := ToolIcon{ a11y: {label: "Frame plate"} draw_icon +: { svg: crate_resource("self://resources/icons/fit.svg") } }
-                }
-            }
-            pack_gap := FabNumberRow{
-                height: 24
-                label +: {text: "Gap"}
-                value +: {num +: {a11y: {label: "Arrange gap"} min: 0.0 max: 0.0 step: 0.5 precision: 1 suffix: " mm"}}
-                trail +: {width: 26
-                    FabTip{ text: "Arrange every part on the plate"
-                        arrange := ToolIcon{ a11y: {label: "Arrange plate"} draw_icon +: { svg: crate_resource("self://resources/icons/arrange.svg") } }
-                    }
-                }
+        draw_shade: mod.draw.FabScrollShade{}
+        // the toolbar: the area's editor selector, then the filter
+        tools := mod.widgets.FabEditorBar{
+            // narrows the list to the parts whose names hold every word typed (Add, Feature and
+            // Shape stand in the 3D view's bar)
+            filter := mod.widgets.FabSearch{
+                width: Fill{min: 60}
+                row +: { input +: { empty_text: "Filter" a11y: {label: "Filter parts"} } }
             }
         }
         mod.widgets.FabHr{}
@@ -428,6 +431,10 @@ script_mod! {
             height: Fill
             flow: Down
             auto_tail: false
+            // A press picks a row; the list scrolls with the wheel and its bar, never by a drag.
+            drag_scrolling: false
+            // An open part's boolean tree, right under its row (the outliner's features).
+            Features := mod.widgets.FabFeatureTree{ margin: Inset{right: 2} }
             Row := View{
                 width: Fill
                 height: 34
@@ -440,12 +447,14 @@ script_mod! {
                 draw_bg +: {
                     selected: instance(0.0)
                     hover: instance(0.0)
+                    // selection as the feature rows show it: a rounded box inset in the row (hover
+                    // lights the name instead, `text.title.name`'s `hot`)
                     pixel: fn() {
                         let sdf = Sdf2d.viewport(self.pos * self.rect_size)
                         sdf.rect(0.0, 0.0, self.rect_size.x, self.rect_size.y)
-                        sdf.fill(fab.color_editor.mix(fab.color_row_hover, self.hover * 0.6).mix(fab.color_selection_bg, self.selected))
-                        sdf.rect(0.0, 0.0, 2.0 * self.selected, self.rect_size.y)
-                        sdf.fill(fab.color_accent)
+                        sdf.fill(fab.color_editor)
+                        sdf.box(4.0, 1.0, self.rect_size.x - 8.0, self.rect_size.y - 2.0, 3.0)
+                        sdf.fill(vec4(fab.color_selection_bg.xyz, 0.0).mix(fab.color_selection_bg, self.selected))
                         return sdf.result
                     }
                 }
@@ -454,50 +463,98 @@ script_mod! {
                         default: @off
                         off: AnimatorState{
                             from: {all: Forward {duration: fab.anim_fast}}
-                            apply: { draw_bg: {hover: 0.0} }
+                            apply: { draw_bg: {hover: 0.0} text: {title: {name: {draw_text: {hot: 0.0}}}} }
                         }
                         on: AnimatorState{
                             from: {all: Snap}
-                            apply: { draw_bg: {hover: 1.0} }
+                            apply: { draw_bg: {hover: 1.0} text: {title: {name: {draw_text: {hot: 1.0}}}} }
                         }
                     }
                 }
-                branch := mod.widgets.FabButton{ width: 22 height: 24 padding: 0 text: "" visible: false a11y: {label: "Toggle tree group"} }
+                // The fold's slot is kept on every row, so the swatches line up.
+                fold := View{
+                    width: 18 height: Fill flow: Overlay align: Align{x: 0.5 y: 0.5}
+                    branch := FoldIcon{ visible: false a11y: {label: "Expand"} draw_icon +: {svg: crate_resource("self://resources/icons/chevron_right.svg")} }
+                    branch_open := FoldIcon{ visible: false a11y: {label: "Collapse"} draw_icon +: {svg: crate_resource("self://resources/icons/chevron_down.svg")} }
+                }
                 linked := View{
                     width: 14 height: 14 visible: false
                     FabIconSmall{ icon_walk: Walk{width: 14 height: 14} draw_icon +: {svg: crate_resource("self://resources/icons/link.svg")} }
-                }
-                // The part's colour, its edges on device pixels, with its nozzle's letter.
-                swatch := View{
-                    width: 18
-                    height: 18
-                    show_bg: true
-                    draw_bg +: {
-                        color: instance(vec4(0.8, 0.5, 0.2, 1.0))
-                        pixel: fn() {
-                            let dpi = self.draw_pass.dpi_factor
-                            let lo = floor(self.rect_pos * dpi + 0.5) / dpi - self.rect_pos
-                            let hi = floor((self.rect_pos + self.rect_size) * dpi + 0.5) / dpi - self.rect_pos
-                            let sdf = Sdf2d.viewport_px(self.pos * self.rect_size, dpi)
-                            sdf.box(lo.x, lo.y, hi.x - lo.x, hi.y - lo.y, fab.radius)
-                            sdf.fill(self.color)
-                            return sdf.result
-                        }
-                    }
-                    align: Align{x: 0.5 y: 0.5}
-                    slot := mod.widgets.FabLabelSmall{ text: "1" draw_text +: { color: #xffffffd0 } }
                 }
                 text := View{
                     width: Fill
                     height: Fit
                     flow: Down
                     spacing: 2
-                    name := mod.widgets.FabLabel{ width: Fill text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis
-                        draw_text +: { row_alpha: instance(1.0) get_color: fn() { return vec4(self.color.rgb, self.color.a * self.row_alpha) } }
+                    // The name and its rename field share one line of fixed height, the field's
+                    // text where the name's was, so renaming moves nothing in the row.
+                    title := View{
+                        width: Fill
+                        height: 16
+                        flow: Overlay
+                        align: Align{y: 0.5}
+                        // a part's name in bold: the parts stand apart from the features under them
+                        name := mod.widgets.FabLabel{ width: Fill text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis
+                            draw_text +: { text_style: theme.font_bold{font_size: fab.font_size_ui} row_alpha: instance(1.0) hot: instance(0.0) get_color: fn() { return vec4(mix(self.color.rgb, theme.color_text_hover.rgb, self.hot), self.color.a * self.row_alpha) } }
+                        }
+                        rename := mod.widgets.FabInput{
+                            width: Fill height: Fill visible: false
+                            margin: Inset{left: -4}
+                            padding: Inset{left: 4 right: 4 top: 0 bottom: 0}
+                        }
                     }
-                    rename := mod.widgets.FabInput{ width: Fill height: 24 visible: false }
+                    // the dimensions, quieter than the name
                     size := mod.widgets.FabLabelSmall{ width: Fill text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis
-                        draw_text +: { row_alpha: instance(1.0) get_color: fn() { return vec4(self.color.rgb, self.color.a * self.row_alpha) } }
+                        draw_text +: { color: fab.color_text_muted row_alpha: instance(1.0) get_color: fn() { return vec4(self.color.rgb, self.color.a * self.row_alpha) } }
+                    }
+                }
+                // The engine that builds the part (Exact, Field, Mesh) as a pill; its tip says what
+                // that engine is good at (`PartEngine::tip`).
+                engine_tip := FabTip{
+                    engine := View{
+                        width: Fit
+                        height: 18
+                        padding: Inset{left: 5 right: 5}
+                        align: Align{x: 0.5 y: 0.5}
+                        cursor: MouseCursor.Hand
+                        show_bg: true
+                        draw_bg +: {
+                            pixel: fn() {
+                                let dpi = self.draw_pass.dpi_factor
+                                let lo = floor(self.rect_pos * dpi + 0.5) / dpi - self.rect_pos
+                                let hi = floor((self.rect_pos + self.rect_size) * dpi + 0.5) / dpi - self.rect_pos
+                                let sdf = Sdf2d.viewport_px(self.pos * self.rect_size, dpi)
+                                sdf.box(lo.x, lo.y, hi.x - lo.x, hi.y - lo.y, fab.radius)
+                                sdf.fill(theme.prop_field)
+                                return sdf.result
+                            }
+                        }
+                        label := mod.widgets.FabLabelSmall{ text: "" draw_text +: { color: fab.color_text_muted } }
+                    }
+                }
+                // The part's colour, its edges on device pixels, with its nozzle's letter, left of the eye;
+                // its tip says which nozzle and tray that is (`RowDisplay::tip`).
+                swatch_tip := FabTip{
+                    swatch := View{
+                        width: 18
+                        height: 18
+                        // (a cursor of its own claims the pointer, which the tip around it needs)
+                        cursor: MouseCursor.Hand
+                        show_bg: true
+                        draw_bg +: {
+                            color: instance(vec4(0.8, 0.5, 0.2, 1.0))
+                            pixel: fn() {
+                                let dpi = self.draw_pass.dpi_factor
+                                let lo = floor(self.rect_pos * dpi + 0.5) / dpi - self.rect_pos
+                                let hi = floor((self.rect_pos + self.rect_size) * dpi + 0.5) / dpi - self.rect_pos
+                                let sdf = Sdf2d.viewport_px(self.pos * self.rect_size, dpi)
+                                sdf.box(lo.x, lo.y, hi.x - lo.x, hi.y - lo.y, fab.radius)
+                                sdf.fill(self.color)
+                                return sdf.result
+                            }
+                        }
+                        align: Align{x: 0.5 y: 0.5}
+                        slot := mod.widgets.FabLabelSmall{ text: "1" draw_text +: { color: #xffffffd0 } }
                     }
                 }
                 eye := EyeIcon{
@@ -517,10 +574,6 @@ script_mod! {
                         icon_walk: Walk{ width: 14 height: 14 }
                         draw_icon +: { color: fab.color_warning svg: crate_resource("self://resources/icons/warning.svg") }
                     }
-                }
-                delete := ToolIcon{
-                    a11y: {label: "Delete part"}
-                    draw_icon +: {svg: crate_resource("self://resources/icons/trash.svg")}
                 }
             }
         }
@@ -577,7 +630,17 @@ script_mod! {
         show_bg: true
         draw_bg +: { color: fab.color_editor }
         // Nothing selected: the plate at a glance.
+        // the toolbar: the area's editor selector (and this editor's tools, when it has any); as
+        // the Plate view's sidebar (`stage`'s `part_side`): its title, the filter and its close
+        editor_bar := mod.widgets.FabEditorBar{
+            title := mod.widgets.FabLabel{ visible: false text: "Part" draw_text +: { text_style: theme.font_bold{font_size: fab.font_size_ui} } }
+            // filters the rows below by name (a section's title shows it whole)
+            search := mod.widgets.FabSearch{width: Fill{min: 80} row +: {input +: {empty_text: "Filter"}}}
+            side_close := ToolIcon{ visible: false a11y: {label: "Close part"} draw_icon +: { svg: crate_resource("self://resources/icons/close.svg") } }
+        }
         none := PropSection{
+            // (one section alone: nothing to move it among)
+            grip: false
             margin: Inset{left: theme.prop_pad right: theme.prop_pad bottom: theme.prop_section_gap}
             header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/grid.svg")}} title +: {text: "Plate"}}}
             body +: {
@@ -587,115 +650,53 @@ script_mod! {
         }
         body := mod.widgets.FabScroll{
             visible: false
-            padding: Inset{left: theme.prop_pad right: theme.prop_pad}
+            padding: Inset{left: theme.prop_pad right: theme.prop_pad top: #(crate::ui::widgets::PANEL_TOP)}
             // The sections draw in lists of their own: a section records again only when what
-            // it shows changed (its setters, or the panel's key of `rest`). The part's shape
-            // parameters are the Parameters editor's: while no area shows it, a button under the
-            // part's name brings it forward.
-            View{width: Fill height: Fit flow: Down new_batch: true
-                ident := PropSection{
-                    header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/object.svg")}} title +: {text: "Part"}}}
-                    body +: {
-                        PropRow{
-                            label +: {text: "Name"}
-                            value +: {name := PropTextInput{}}
-                        }
-                        PropRow{
-                            label +: {text: "Size"}
-                            value +: {
-                                align: Align{y: 0.5} padding: Inset{left: theme.prop_pad + 2.0}
-                                size := mod.widgets.FabLabelSmall{width: Fill text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis}
-                            }
-                        }
-                    }
-                }
-                params_row := View{
-                    visible: false
-                    width: Fill height: Fit flow: Right
-                    padding: Inset{left: 10 right: 6 top: 2 bottom: 6}
-                    FabTip{text: "The part's shape parameters, in the Parameters editor"
-                        show_params := mod.widgets.FabButton{
-                            text: "Parameters" a11y: {label: "Parameters"}
-                            height: theme.prop_row_height padding: Inset{left: 6 right: 8} spacing: 4
-                            icon_walk: Walk{width: 14 height: Fill margin: Inset{top: 3 bottom: 3}}
-                            draw_icon +: {svg: crate_resource("self://resources/icons/shape.svg") color: fab.color_text}
-                        }
-                    }
-                }
-            }
+            // it shows changed (its setters, or the panel's key of `rest`). The part's name and
+            // size are the parts list's (rename there).
             rest := View{width: Fill height: Fit flow: Down new_batch: true
-                transform := PropSection{
-                    header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/move.svg")}} title +: {text: "Position"}}}
-                    body +: {
-                        anchor_row := PropRow{
-                            label +: {text: "Anchor"}
-                            value +: {anchor := PropDropDown{width: Fill labels: ["Origin" "Centre" "Corner"] a11y: {label: "Position anchor"}}}
-                        }
-                        xy := PropStack{
-                            x := FabNumberRow{
-                                label +: {text: "Position X"}
-                                value +: {num +: {a11y: {label: "X"} min: -50.0 max: #(ORIGIN_FIELD_MAX) step: 0.5 snap: 5.0 precision: 1 suffix: " mm"}}
+                // its slot: the box the section moves in when dragged by its grip (`section_reorder`)
+                transform_slot := View{width: Fill height: Fit
+                    transform := PropSection{
+                        header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/move.svg")}} title +: {text: "Transform"}}}
+                        body +: {
+                            // what Position measures from
+                            anchor_row := TransformRow{
+                                label +: {text: "Anchor"}
+                                value +: {num +: {visible: false} anchor := PropDropDown{width: Fill labels: ["Origin" "Centre" "Corner"] a11y: {label: "Position anchor"}}}
                             }
-                            y := FabNumberRow{
-                                label +: {text: "Y"}
-                                value +: {num +: {a11y: {label: "Y"} min: -50.0 max: #(ORIGIN_FIELD_MAX) step: 0.5 snap: 5.0 precision: 1 suffix: " mm"}}
-                            }
-                        }
-                        rs := View{width: Fill height: Fit flow: Down spacing: theme.prop_row_gap
-                            rot := FabNumberRow{
-                                label +: {text: "Turn"}
-                                value +: {num +: {a11y: {label: "Turn"} min: -360.0 max: 360.0 step: 1.0 snap: 15.0 precision: 0 suffix: "°"}}
-                            }
-                            // One block, like Position's: the three fields share the lock's column and
-                            // move under their labels together.
-                            sxyz := PropStack{
-                                scale := FabNumberRow{
-                                    label +: {text: "Scale X"}
-                                    value +: {num +: {a11y: {label: "Scale X"} min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}}
-                                    trail +: {width: 26 lock := mod.widgets.FabIconCheck{ a11y: {label: "Keep proportions"} width: 24 height: 22 padding: Inset{left: 4 right: 4 top: 3 bottom: 3} draw_icon +: { svg: crate_resource("self://resources/icons/link.svg") } }}
-                                }
-                                scale_y := FabNumberRow{
-                                    label +: {text: "Y"}
-                                    value +: {num +: {a11y: {label: "Scale Y"} min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}}
-                                    trail +: {width: 26}
-                                }
-                                scale_z := FabNumberRow{
-                                    label +: {text: "Z"}
-                                    value +: {num +: {a11y: {label: "Scale Z"} min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}}
-                                    trail +: {width: 26}
+                            // X and Y side by side, each its axis inside its field
+                            xy := TransformRow{
+                                margin: Inset{top: theme.prop_row_gap}
+                                label +: {text: "Position" visible: false width: 0} gap +: {width: 0}
+                                value +: {
+                                    flow: Right spacing: 4
+                                    num +: {a11y: {label: "X"} label: "Position X" min: -50.0 max: #(ORIGIN_FIELD_MAX) step: 0.5 snap: 5.0 precision: 1 suffix: " mm"}
+                                    num_y := ValueInput{width: Fill height: Fill min_height: 0 a11y: {label: "Y"} label: "Y" min: -50.0 max: #(ORIGIN_FIELD_MAX) step: 0.5 snap: 5.0 precision: 1 suffix: " mm"}
                                 }
                             }
-                        }
-                        // The part's actions as a light strip; Delete keeps to the far end. The other
-                        // actions wrap onto more lines when the panel narrows, so none drops off.
-                        buttons := View{
-                            width: Fill height: Fit flow: Right spacing: 2 margin: Inset{top: 4}
-                            align: Align{x: 0.0 y: 0.0}
-                            View{width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 2
-                                FabTip{text: "Drop to plate"
-                                    drop := mod.widgets.FabActionButton{
-                                        a11y: {label: "Drop to plate"}
-                                        draw_icon +: {svg: crate_resource("self://resources/icons/drop.svg")}
-                                    }
+                            rs := View{width: Fill height: Fit flow: Down spacing: theme.prop_row_gap margin: Inset{top: theme.prop_row_gap}
+                                rot := TransformRow{
+                                    label +: {text: "Turn" visible: false width: 0} gap +: {width: 0}
+                                    value +: {num +: {a11y: {label: "Turn"} label: "Turn" min: -360.0 max: 360.0 step: 1.0 snap: 15.0 precision: 0 suffix: "°"}}
                                 }
-                                FabTip{text: #(keymap::tooltip(Key::DuplicateLinked))
-                                    duplicate_linked := mod.widgets.FabActionButton{
-                                        a11y: {label: "Duplicate linked"}
-                                        draw_icon +: {svg: crate_resource("self://resources/icons/duplicate_linked.svg")}
+                                // X, Y and Z side by side, the proportions lock after them
+                                scale := TransformRow{
+                                    label +: {text: "Scale" visible: false width: 0} gap +: {width: 0}
+                                    value +: {
+                                        flow: Right spacing: 4
+                                        num +: {a11y: {label: "Scale X"} label: "Scale X" min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}
+                                        num_y := ValueInput{width: Fill height: Fill min_height: 0 a11y: {label: "Scale Y"} label: "Y" min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}
+                                        num_z := ValueInput{width: Fill height: Fill min_height: 0 a11y: {label: "Scale Z"} label: "Z" min: 1.0 max: 1000.0 step: 1.0 snap: 10.0 precision: 1 suffix: " %"}
                                     }
+                                    trail +: {width: 30 padding: Inset{left: 4} lock := mod.widgets.FabIconCheck{ a11y: {label: "Keep proportions"} width: Fill height: Fill padding: Inset{left: 4 right: 4 top: 3 bottom: 3} draw_icon +: { svg: crate_resource("self://resources/icons/link.svg") } }}
                                 }
-                                FabTip{text: #(keymap::tooltip(Key::DuplicateCopy))
-                                    duplicate_copy := mod.widgets.FabActionButton{
-                                        a11y: {label: "Duplicate"}
-                                        draw_icon +: {svg: crate_resource("self://resources/icons/duplicate.svg")}
-                                    }
-                                }
-                                FabTip{text: "Frame in view"
-                                    frame := mod.widgets.FabActionButton{
-                                        a11y: {label: "Frame in view"}
-                                        draw_icon +: {svg: crate_resource("self://resources/icons/fit.svg")}
-                                    }
-                                }
+                            }
+                            // The part's actions as a light strip (duplicate and delete are the parts list's menu;
+                            // Drop to plate and Frame selected are the 3D view's toolbar's).
+                            buttons := View{
+                                width: Fill height: Fit flow: Right spacing: 2 margin: Inset{top: 4}
+                                align: Align{x: 0.0 y: 0.5}
                                 FabTip{text: "Make printable"
                                     make_printable := mod.widgets.FabActionButton{
                                         visible: false
@@ -704,25 +705,71 @@ script_mod! {
                                     }
                                 }
                             }
-                            FabTip{text: "Delete"
-                                delete := mod.widgets.FabActionButton{
-                                    a11y: {label: "Delete"}
-                                    draw_icon +: {svg: crate_resource("self://resources/icons/trash.svg")}
-                                }
-                            }
                         }
                     }
                 }
-                colours := PropSection{
-                    header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/palette.svg")}} title +: {text: "Colours"}}}
-                    body +: {rows := mod.widgets.FabColorRows{}}
+                // The part's shape parameters, then each feature's fields, in groups that fold
+                // ([`crate::ui::param_panel::FabParamPanel`], which was the Parameters editor's).
+                // its slot: the box the section moves in when dragged by its grip (`section_reorder`)
+                params_slot := View{width: Fill height: Fit
+                    params := PropSection{
+                        header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/shape.svg")}} title +: {text: "Parameters"}}}
+                        // (its groups keep the sections' gap between them: no room of its own)
+                        body +: {padding: Inset{left: theme.prop_pad right: theme.prop_pad top: 0 bottom: 0} panel := mod.widgets.FabParamPanel{}}
+                    }
                 }
-                issues := PropSection{
-                    visible: false
-                    header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/printer.svg")}} title +: {text: "Printability"}}}
-                    body +: {list := mod.widgets.FabLabel{width: Fill text: "" draw_text +: {color: fab.color_warning}}}
+                // its slot: the box the section moves in when dragged by its grip (`section_reorder`)
+                colours_slot := View{width: Fill height: Fit
+                    colours := PropSection{
+                        header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/palette.svg")}} title +: {text: "Colours"}}}
+                        body +: {rows := mod.widgets.FabColorRows{}}
+                    }
+                }
+                // its slot: the box the section moves in when dragged by its grip (`section_reorder`)
+                issues_slot := View{width: Fill height: Fit
+                    issues := PropSection{
+                        visible: false
+                        header +: {hdr +: {icon +: {visible: true draw_icon +: {svg: crate_resource("self://resources/icons/printer.svg")}} title +: {text: "Printability"}}}
+                        body +: {list := mod.widgets.FabLabel{width: Fill text: "" draw_text +: {color: fab.color_warning}}}
+                    }
                 }
             }
+        }
+    }
+}
+
+/// The plate's Add menu (its button stands in the 3D view's bar): new parts (the primitives, an
+/// import, from a picture). The demos are the Plates grid's; what changes a part is Modify's. Handled for the
+/// app (`main`), wherever the button is, so a second 3D view raises no second menu.
+pub fn part_add_menu(cx: &mut Cx, actions: &Actions) {
+    if let Some(anchor) = dropdown_clicked(actions, ADD_MENU) {
+        let items = vec![
+            MenuItem::new(live_id!(add_box), "Box").svg("self://resources/icons/add_box.svg"),
+            MenuItem::new(live_id!(add_cylinder), "Cylinder").svg("self://resources/icons/add_cylinder.svg"),
+            MenuItem::new(live_id!(add_sphere), "Sphere").svg("self://resources/icons/add_sphere.svg"),
+            MenuItem::new(live_id!(add_cone), "Cone").svg("self://resources/icons/add_cylinder.svg"),
+            MenuItem::new(live_id!(add_torus), "Torus").svg("self://resources/icons/radio_off.svg"),
+            MenuItem::sep(),
+            // tiles: short labels (the import's formats and key are in its dialog and the keymap)
+            MenuItem::new(live_id!(add_import), "Import…").svg("self://resources/icons/import.svg"),
+            MenuItem::new(live_id!(add_picture), "Colour picture…").svg("self://resources/icons/palette.svg"),
+            MenuItem::new(live_id!(add_image), "From image…").svg("self://resources/icons/spark.svg"),
+        ];
+        open_menu(cx, ADD_MENU, items, anchor, MenuPlace::Below);
+    }
+    if let Some(pick) = menu_picked(actions, ADD_MENU) {
+        let shape = [(live_id!(add_box), "box"), (live_id!(add_cylinder), "cylinder"), (live_id!(add_sphere), "sphere"), (live_id!(add_cone), "cone"), (live_id!(add_torus), "torus")]
+            .iter()
+            .find(|(id, _)| *id == pick)
+            .map(|(_, s)| *s);
+        if let Some(shape) = shape {
+            cx.action(PartAction::Add { shape: shape.into() });
+        } else if pick == live_id!(add_import) {
+            cx.action(ShellAction::ImportDialog);
+        } else if pick == live_id!(add_picture) {
+            cx.action(ShellAction::ColourPictureDialog);
+        } else if pick == live_id!(add_image) {
+            cx.action(ShellAction::ImageToPartDialog);
         }
     }
 }
@@ -803,6 +850,11 @@ struct RowDisplay {
     eye: Option<bool>,
     color: [f32; 4],
     slot: String,
+    /// The swatch's tooltip: the nozzle and tray its colour prints from.
+    tip: String,
+    /// The engine pill's word and tooltip (bodies built by different engines: "Mixed").
+    engine: &'static str,
+    engine_tip: &'static str,
     rect: Option<Rect>,
     /// The row as drawn, which its node stands where it shows ([`Widget::semantics_part_area`]).
     area: Area,
@@ -817,6 +869,9 @@ enum RenameTarget {
 pub struct FabPartsPanel {
     #[deref]
     view: View,
+    /// The shadow under the toolbar while the list is scrolled down.
+    #[live]
+    draw_shade: DrawQuad,
     #[rust]
     revision: Option<u64>,
     #[rust]
@@ -833,6 +888,32 @@ pub struct FabPartsPanel {
     rows: Vec<RowDisplay>,
     #[rust]
     collapsed: HashSet<u64>,
+    /// An eye or a fold was pressed (it toggles on the press): the click that ends that press is no second
+    /// toggle, whichever row's eye it lands on (a hidden part moves in the list under the
+    /// pointer); a click without a press (a semantic press) toggles.
+    #[rust]
+    eye_pressed: Option<u64>,
+    /// The filter as typed: a row shows when its name, or one of its group's or its children's,
+    /// holds every word (folds are ignored meanwhile, so no match hides).
+    #[rust]
+    filter: String,
+    /// Part rows whose feature tree the person closed (every tree starts open).
+    #[rust]
+    closed_trees: HashSet<u64>,
+    /// A part's tree opening or closing: how far it is open (0..1) and where it heads; a tree
+    /// still closing keeps its place in the list until it is shut.
+    #[rust]
+    reveal: HashMap<u64, (f64, f64)>,
+    #[rust]
+    reveal_frame: NextFrame,
+    #[rust]
+    reveal_last: Option<f64>,
+    /// Part rows with a feature tree, and the instance it is of (as last drawn).
+    #[rust]
+    tree_of: HashMap<u64, String>,
+    /// The list's items: a row of `tree` (its index), or an open part's feature tree (`true`).
+    #[rust]
+    items: Vec<(usize, bool)>,
     #[rust]
     focused: Option<u64>,
     #[rust]
@@ -882,6 +963,8 @@ impl FabPartsPanel {
             }
         } else { elements };
         cx.action(ShellAction::SelectSet(ids));
+        // the part is the selection now: a feature picked in its tree is let go
+        cx.action(crate::ui::code::SourceAction::Select { id: String::new(), reveal: false });
     }
 
     fn begin_rename(&mut self, cx: &mut Cx, scope: &mut Scope, row: &Row) {
@@ -908,9 +991,55 @@ impl FabPartsPanel {
         self.view.redraw(cx);
     }
 
+    /// A fold drag (`TreeFold`) moved to `p`: the part rows it reaches here, with children, take
+    /// its state.
+    fn fold_drag(&mut self, cx: &mut Cx, p: DVec2) {
+        let Some(open) = cx.global::<TreeFold>().open else { return };
+        let list = self.view.portal_list(cx, ids!(list));
+        // the part rows shown, in their order down the list (an open part's tree is its own)
+        let mut rows: Vec<(usize, Rect)> = Vec::new();
+        for &pos in &self.visible_rows {
+            let Some(&(i, false)) = self.items.get(pos) else { continue };
+            if let Some((_, item)) = list.get_item(pos) {
+                rows.push((i, item.area().rect(cx)));
+            }
+        }
+        rows.sort_by(|a, b| a.1.pos.y.total_cmp(&b.1.pos.y));
+        let Some(h) = rows.iter().position(|(_, r)| r.contains(p)) else { return };
+        let keys: Vec<String> = rows.iter().map(|(i, _)| format!("p{}", self.tree[*i].key)).collect();
+        for k in TreeFold::reach(cx, &keys, h) {
+            let i = rows[k].0;
+            if self.expanded(&self.tree[i]) == Some(!open) {
+                let key = self.tree[i].key;
+                self.toggle_row(cx, key);
+            }
+        }
+    }
+
     fn toggle_row(&mut self, cx: &mut Cx, key: u64) {
-        if !self.collapsed.remove(&key) { self.collapsed.insert(key); }
+        if self.tree_of.contains_key(&key) && !row_of(&self.tree, key).is_some_and(Row::is_branch) {
+            // closed: it opens; open: it closes
+            let open = self.closed_trees.remove(&key);
+            if !open { self.closed_trees.insert(key); }
+            // it slides open or shut from where it is now
+            let to = if open { 1.0 } else { 0.0 };
+            self.reveal.entry(key).or_insert((1.0 - to, to)).1 = to;
+            self.reveal_frame = cx.new_next_frame();
+        } else if !self.collapsed.remove(&key) {
+            self.collapsed.insert(key);
+        }
         self.view.redraw(cx);
+    }
+
+    /// Whether `row`'s children (a branch's rows, a part's feature tree) show.
+    fn expanded(&self, row: &Row) -> Option<bool> {
+        if row.is_branch() {
+            Some(!self.collapsed.contains(&row.key))
+        } else if self.tree_of.contains_key(&row.key) {
+            Some(!self.closed_trees.contains(&row.key))
+        } else {
+            None
+        }
     }
 
     fn open_row_menu(&mut self, cx: &mut Cx, scope: &mut Scope, row: &Row, anchor: Rect) {
@@ -1023,10 +1152,10 @@ impl Widget for FabPartsPanel {
             node.states.set(a11y_tree::States::SELECTED, shown.selected);
             node.states.set(a11y_tree::States::FOCUSED, self.focused == Some(row.key) && cx.keyboard.key_focus() == self.view.area());
             node.states.set(a11y_tree::States::OFFSCREEN, shown.rect.is_none());
-            if row.is_branch() {
+            if let Some(open) = self.expanded(row) {
                 node.actions = node.actions | a11y_tree::Actions::EXPAND | a11y_tree::Actions::COLLAPSE;
-                node.states.set(a11y_tree::States::EXPANDED, !self.collapsed.contains(&row.key));
-                node.states.set(a11y_tree::States::COLLAPSED, self.collapsed.contains(&row.key));
+                node.states.set(a11y_tree::States::EXPANDED, open);
+                node.states.set(a11y_tree::States::COLLAPSED, !open);
             }
             out.push((row.key, row.parent, node));
         }
@@ -1034,7 +1163,7 @@ impl Widget for FabPartsPanel {
 
     fn semantics_part_area(&self, key: u64) -> Area {
         // a drawn row: one the list scrolled past an edge is offscreen
-        self.visible_rows.iter().filter_map(|&pos| self.order.get(pos)).find(|&&i| self.tree[i].key == key).map_or(Area::Empty, |&i| self.rows[i].area)
+        self.visible_rows.iter().filter_map(|&pos| self.items.get(pos)).filter(|(_, tree)| !tree).find(|(i, _)| self.tree[*i].key == key).map_or(Area::Empty, |(i, _)| self.rows[*i].area)
     }
 
     fn handle_action(&mut self, cx: &mut Cx, request: &a11y_tree::ActionRequest, scope: &mut Scope) -> a11y_tree::ActionResult {
@@ -1048,10 +1177,8 @@ impl Widget for FabPartsPanel {
             self.focus_row(cx, scope, key);
         } else if request.action == Actions::SHOW_MENU {
             self.open_row_menu(cx, scope, &row, self.rows[i].rect.unwrap_or_default());
-        } else if row.is_branch() && (request.action == Actions::EXPAND || request.action == Actions::COLLAPSE) {
-            if request.action == Actions::COLLAPSE { self.collapsed.insert(key); }
-            else { self.collapsed.remove(&key); }
-            self.view.redraw(cx);
+        } else if self.expanded(&row).is_some() && (request.action == Actions::EXPAND || request.action == Actions::COLLAPSE) {
+            if self.expanded(&row) != Some(request.action == Actions::EXPAND) { self.toggle_row(cx, key); }
         } else {
             return ActionResult::Unhandled;
         }
@@ -1060,6 +1187,11 @@ impl Widget for FabPartsPanel {
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
+        match event {
+            Event::MouseUp(_) => cx.global::<TreeFold>().open = None,
+            Event::MouseMove(e) => self.fold_drag(cx, e.abs),
+            _ => {}
+        }
         if let Event::KeyDown(e) = event {
             if e.key_code == KeyCode::F2 && !e.is_repeat && cx.keyboard.key_focus() == self.view.area() {
                 if let Some(row) = self.tree.iter().find(|r| Some(r.key) == self.focused).cloned() {
@@ -1067,11 +1199,36 @@ impl Widget for FabPartsPanel {
                 }
             }
         }
+        if let Event::NextFrame(ne) = event {
+            if ne.set.contains(&self.reveal_frame) && !self.reveal.is_empty() {
+                let dt = self.reveal_last.map_or(0.0, |t| (ne.time - t).clamp(0.0, 0.05));
+                self.reveal_last = Some(ne.time);
+                let step = dt / crate::ui::code::fold_s();
+                for (now, to) in self.reveal.values_mut() {
+                    *now = if *to > *now { (*now + step).min(*to) } else { (*now - step).max(*to) };
+                }
+                // a tree that got where it was going needs no entry (closed_trees says the rest)
+                self.reveal.retain(|_, (now, to)| now != to);
+                if self.reveal.is_empty() { self.reveal_last = None; } else { self.reveal_frame = cx.new_next_frame(); }
+                self.view.redraw(cx);
+            }
+        }
+        // An eye's press-time toggle skips the click that ends that press, and only that one: the
+        // mark lasts through the release's own actions (`RELEASED`), then goes, so a release
+        // that clicks nothing (its button hid as it toggled) leaves no skip behind.
+        const RELEASED: u64 = u64::MAX;
+        match event {
+            Event::Actions(_) => {}
+            Event::MouseUp(_) if self.eye_pressed.is_some() => self.eye_pressed = Some(RELEASED),
+            _ if self.eye_pressed == Some(RELEASED) => self.eye_pressed = None,
+            _ => {}
+        }
         let Event::Actions(actions) = event else { return };
         let list = self.view.portal_list(cx, ids!(list));
         for visible in 0..self.visible_rows.len() {
             let pos = self.visible_rows[visible];
-            let Some(&i) = self.order.get(pos) else { continue };
+            // an open part's tree handles its own events (the list hands them on)
+            let Some(&(i, false)) = self.items.get(pos) else { continue };
             let key = self.tree[i].key;
             if let Some((_, item)) = list.get_item(pos) {
                 let input = item.text_input(cx, ids!(text.rename));
@@ -1095,27 +1252,37 @@ impl Widget for FabPartsPanel {
                         self.view.redraw(cx);
                     }
                 }
-                if item.button(cx, ids!(branch)).clicked(actions) {
+                let fold_pressed = item.button(cx, ids!(branch)).pressed(actions) || item.button(cx, ids!(branch_open)).pressed(actions);
+                let fold_clicked = item.button(cx, ids!(branch)).clicked(actions) || item.button(cx, ids!(branch_open)).clicked(actions);
+                // a fold toggles as it is pressed (its click after is skipped, as an eye's is)
+                if fold_pressed || (fold_clicked && self.eye_pressed.take().is_none()) {
+                    if fold_pressed { self.eye_pressed = Some(key); }
                     self.focus_row(cx, scope, key);
                     self.toggle_row(cx, key);
-                } else if item.button(cx, ids!(delete)).clicked(actions) {
-                    self.focus_row(cx, scope, key);
-                    if let Some(state) = scope.data.get::<AppState>() {
-                        let objects = self.tree[i].parts.iter().filter_map(|i| state.plate.parts.get(*i)).map(|p| p.object.clone()).collect::<Vec<_>>();
-                        part_menu_action(cx, state, &objects, live_id!(part_delete));
+                    // a drag on from the press folds or unfolds the rows it crosses the same way
+                    if fold_pressed {
+                        let open = self.expanded(&self.tree[i]).unwrap_or(true);
+                        TreeFold::start(cx, open, format!("p{key}"));
                     }
-                } else if item.button(cx, ids!(eye)).clicked(actions) || item.button(cx, ids!(eye_off)).clicked(actions) {
+                } else if item.button(cx, ids!(eye)).pressed(actions) || item.button(cx, ids!(eye_off)).pressed(actions)
+                    || ((item.button(cx, ids!(eye)).clicked(actions) || item.button(cx, ids!(eye_off)).clicked(actions)) && self.eye_pressed.take().is_none())
+                {
+                    // the eye toggles as it is pressed
+                    if item.button(cx, ids!(eye)).pressed(actions) || item.button(cx, ids!(eye_off)).pressed(actions) {
+                        self.eye_pressed = Some(key);
+                    }
                     if let Some(state) = scope.data.get::<AppState>() {
                         if !state.slice_blocks_edits() && !state.ui.in_mode(PlateMode::Mechanics) {
                             if let Some(action) = self.tree[i].eye_action(&state.plate) { cx.action(action); }
                         }
                     }
+                } else if let Some(down) = item.as_view().finger_down(actions).filter(|d| d.device.is_primary_hit()) {
+                    // a row is picked as it is pressed
+                    let row = self.tree[i].clone();
+                    self.select_row(cx, scope, &row, down.modifiers.shift || down.modifiers.is_primary());
+                    if down.tap_count == 2 { self.begin_rename(cx, scope, &row); }
                 } else if let Some(up) = item.as_view().finger_up(actions) {
-                    if !up.cancelled && up.is_over && up.device.is_primary_hit() {
-                        let row = self.tree[i].clone();
-                        self.select_row(cx, scope, &row, up.modifiers.shift || up.modifiers.is_primary());
-                        if up.tap_count == 2 { self.begin_rename(cx, scope, &row); }
-                    } else if !up.cancelled && up.is_over && !up.is_sweep
+                    if !up.cancelled && up.is_over && !up.is_sweep
                         && up.device.mouse_button().is_some_and(|b| b.is_secondary())
                         && (up.abs - up.abs_start).length() < crate::nav::DRAG_THRESHOLD_PT
                     {
@@ -1124,6 +1291,9 @@ impl Widget for FabPartsPanel {
                     }
                 }
             }
+        }
+        if self.eye_pressed == Some(RELEASED) {
+            self.eye_pressed = None;
         }
         if let Some(pick) = menu_picked(actions, PART_MENU) {
             if pick == live_id!(part_rename) {
@@ -1142,69 +1312,51 @@ impl Widget for FabPartsPanel {
                 part_menu_action(cx, state, &self.context_objects, pick);
             }
         }
-        if let Some(anchor) = dropdown_clicked(actions, ADD_MENU) {
-            let items = vec![
-                MenuItem::new(live_id!(add_box), "Box"),
-                MenuItem::new(live_id!(add_cylinder), "Cylinder"),
-                MenuItem::new(live_id!(add_sphere), "Sphere"),
-                MenuItem::new(live_id!(add_cone), "Cone"),
-                MenuItem::new(live_id!(add_torus), "Torus"),
-                MenuItem::sep(),
-                // a box over the picked part: none picked, off
-                MenuItem::new(live_id!(add_settings_here), crate::ui::code::SETTINGS_HERE)
-                    .enabled_if(scope.data.get::<AppState>().is_some_and(|state| active_part(state).is_some())),
-                MenuItem::sep(),
-                MenuItem::new(live_id!(add_import), "Import STL, 3MF or glTF…").key(&keymap::shortcut(Key::Import)),
-                MenuItem::new(live_id!(add_picture), "Colour picture…"),
-                MenuItem::new(live_id!(add_image), "From image… (AI hub)"),
-                MenuItem::new(live_id!(add_demo), "Demo bracket"),
-                MenuItem::new(live_id!(add_demo_mount), "Demo motor mount (exact B-rep)"),
-                MenuItem::new(live_id!(add_chain), "Demo chain"),
-                MenuItem::new(live_id!(add_chainmail), "Demo chainmail"),
-                MenuItem::new(live_id!(add_knob), "Demo knurled knob"),
-            ];
-            open_menu(cx, ADD_MENU, items, anchor, MenuPlace::Below);
-        }
-        if let Some(pick) = menu_picked(actions, ADD_MENU) {
-            let shape = [(live_id!(add_box), "box"), (live_id!(add_cylinder), "cylinder"), (live_id!(add_sphere), "sphere"), (live_id!(add_cone), "cone"), (live_id!(add_torus), "torus"), (live_id!(add_chain), "chain"), (live_id!(add_chainmail), "chainmail"), (live_id!(add_knob), "knurled_knob")]
-                .iter()
-                .find(|(id, _)| *id == pick)
-                .map(|(_, s)| *s);
-            if let Some(shape) = shape {
-                cx.action(PartAction::Add { shape: shape.into() });
-            } else if pick == live_id!(add_settings_here) {
-                if let Some(state) = scope.data.get::<AppState>() {
-                    crate::ui::stage::settings_here(cx, state, None);
-                }
-            } else if pick == live_id!(add_import) {
-                cx.action(ShellAction::ImportDialog);
-            } else if pick == live_id!(add_picture) {
-                cx.action(ShellAction::ColourPictureDialog);
-            } else if pick == live_id!(add_image) {
-                cx.action(ShellAction::ImageToPartDialog);
-            } else if pick == live_id!(add_demo) {
-                cx.action(ShellAction::OpenDemo("demo".into()));
-            } else if pick == live_id!(add_demo_mount) {
-                cx.action(ShellAction::OpenDemo("motor_mount".into()));
-            }
-        }
-        if let Some(gap) = self.view.value_input(cx, ids!(tools.pack_gap.value.num)).ended(actions) {
-            cx.action(PartAction::SetArrangeGap(gap));
-        }
-        if self.view.button(cx, ids!(tools.arrange)).clicked(actions) {
-            cx.action(PartAction::Arrange);
-        }
-        if self.view.button(cx, ids!(tools.frame)).clicked(actions) {
-            cx.action(ShellAction::FrameAll);
+        if let Some(text) = self.view.text_input(cx, ids!(tools.filter.row.input)).changed(actions) {
+            self.filter = text;
+            self.view.redraw(cx);
         }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         let Some(state) = scope.data.get::<AppState>() else { return self.view.draw_walk(cx, scope, walk) };
-        self.view.value_input(cx, ids!(tools.pack_gap.value.num)).set_value(cx, state.plate.arrange_gap.unwrap_or(8.0));
         self.sync_tree(state);
         self.order.clear();
-        self.order.extend(self.tree.iter().enumerate().filter(|(_, r)| !folded(&self.tree, &self.collapsed, r)).map(|(i, _)| i));
+        if self.filter.trim().is_empty() {
+            self.order.extend(self.tree.iter().enumerate().filter(|(_, r)| !folded(&self.tree, &self.collapsed, r)).map(|(i, _)| i));
+        } else {
+            // a row that matches keeps its groups above it and its rows under it: O(rows · depth)
+            let words: Vec<String> = self.filter.split_whitespace().map(|w| w.to_lowercase()).collect();
+            let hit = |r: &Row| { let name = r.name.to_lowercase(); words.iter().all(|w| name.contains(w.as_str())) };
+            let mut keep: HashSet<u64> = HashSet::new();
+            for r in self.tree.iter().filter(|r| hit(r)) {
+                keep.insert(r.key);
+                keep.extend(std::iter::successors(r.parent, |&k| row_of(&self.tree, k).and_then(|p| p.parent)));
+            }
+            let under_hit = |r: &Row| std::iter::successors(r.parent, |&k| row_of(&self.tree, k).and_then(|p| p.parent)).any(|k| row_of(&self.tree, k).is_some_and(|p| hit(p)));
+            self.order.extend(self.tree.iter().enumerate().filter(|(_, r)| keep.contains(&r.key) || under_hit(r)).map(|(i, _)| i));
+        }
+        // A part's feature tree: its instance's (an object's bodies are one instance: its row
+        // has none, nor have they), when that instance has rows.
+        self.tree_of.clear();
+        for row in &self.tree {
+            if row.kind != RowKind::Part || row.parent.and_then(|k| row_of(&self.tree, k)).is_some_and(|p| p.kind == RowKind::Object) { continue; }
+            let Some(p) = state.plate.parts.get(row.rename) else { continue };
+            let Some((instance, _)) = p.object.split_once('/') else { continue };
+            let has = if instance == state.source.instance { !state.source.features.is_empty() } else { state.source.trees.get(instance).is_some_and(|t| !t.is_empty()) };
+            if has { self.tree_of.insert(row.key, instance.to_string()); }
+        }
+        // (a part whose tree is being read again keeps it closed: kept while its row stays)
+        let rows: HashSet<u64> = self.tree.iter().map(|r| r.key).collect();
+        self.closed_trees.retain(|key| rows.contains(key));
+        self.reveal.retain(|key, _| self.tree_of.contains_key(key));
+        self.items.clear();
+        for &i in &self.order {
+            self.items.push((i, false));
+            let key = self.tree[i].key;
+            let open = self.tree_of.contains_key(&key) && !self.closed_trees.contains(&key);
+            if open || self.reveal.get(&key).is_some_and(|(now, _)| *now > 0.0) { self.items.push((i, true)); }
+        }
         let parts = &state.plate.parts;
         let revision = ((state.plate.revision, state.field_loop_marks), state.print.revision);
         if self.display_revision.is_none_or(|r| r.0 != revision.0) {
@@ -1218,6 +1370,7 @@ impl Widget for FabPartsPanel {
                 }
                 let p = &parts[row.rename];
                 let [r, g, b] = crate::ui::popover::display_rgb([p.color[0], p.color[1], p.color[2]]);
+                let mixed = row.parts.iter().any(|i| parts[*i].engine != p.engine);
                 RowDisplay {
                     size: row.detail_text(&state.plate),
                     selected: false,
@@ -1226,6 +1379,9 @@ impl Widget for FabPartsPanel {
                     eye: row.eye_state(&state.plate),
                     color: [r, g, b, 1.0],
                     slot: String::new(),
+                    tip: String::new(),
+                    engine: if mixed { "Mixed" } else { p.engine.label() },
+                    engine_tip: if mixed { "Its bodies are built by different engines: each body's pill names its own" } else { p.engine.tip() },
                     rect: None,
                     area: Area::Empty,
                 }
@@ -1249,11 +1405,21 @@ impl Widget for FabPartsPanel {
                     shown.slot.clear();
                     shown.slot.push_str(&slot);
                 }
+                shown.tip = if slot == "-" {
+                    "Its bodies print in more than one colour: see each in the Part panel's Colours".to_string()
+                } else {
+                    // its colour, then the nozzle and tray it prints from
+                    colour_tip(state, &p.print_color)
+                };
             }
         }
+        // A feature picked in a part's open tree is what is selected: its part's row does not show
+        // it too (folded, the part's row is all that can show it).
+        let feature_picked = state.source.selected.is_some();
         for (row, shown) in self.tree.iter().zip(&mut self.rows) {
             shown.selected = if row.is_part() {
-                row.parts.iter().all(|i| parts[*i].element.is_some_and(|e| state.scene_state.selection.contains(e)))
+                let in_tree = feature_picked && !self.closed_trees.contains(&row.key) && self.tree_of.get(&row.key).is_some_and(|i| *i == state.source.instance);
+                !in_tree && row.parts.iter().all(|i| parts[*i].element.is_some_and(|e| state.scene_state.selection.contains(e)))
             } else {
                 row.annotation_selected(state)
             };
@@ -1265,20 +1431,33 @@ impl Widget for FabPartsPanel {
         while let Some(step) = self.view.draw_walk(cx, scope, walk).step() {
             let list_ref = step.as_portal_list();
             let Some(mut list) = list_ref.borrow_mut() else { continue };
-            list.set_item_range(cx, 0, self.order.len());
+            list.set_item_range(cx, 0, self.items.len());
             while let Some(pos) = list.next_visible_item(cx) {
-                let Some(&i) = self.order.get(pos) else { continue };
-                let (row, shown) = (&self.tree[i], &mut self.rows[i]);
+                let Some(&(i, tree)) = self.items.get(pos) else { continue };
                 self.visible_rows.push(pos);
+                if tree {
+                    // under its part's text: the row's indent, past the swatch
+                    let indent = 10.0 + TREE_STEP * depth(&self.tree, &self.tree[i]) as f64 + 14.0;
+                    let item = list.item(cx, pos, live_id!(Features));
+                    let key = self.tree[i].key;
+                    let open = self.reveal.get(&key).map_or(if self.closed_trees.contains(&key) { 0.0 } else { 1.0 }, |(now, _)| *now);
+                    if let (Some(instance), Some(mut t)) = (self.tree_of.get(&key), item.borrow_mut::<crate::ui::code::FabFeatureTree>()) {
+                        t.show_instance(instance, indent, open);
+                    }
+                    item.draw_all(cx, scope);
+                    continue;
+                }
+                let (row, shown) = (&self.tree[i], &mut self.rows[i]);
                 let item = list.item(cx, pos, live_id!(Row));
                 let sel = if shown.selected { 1.0 } else { 0.0 };
-                let indent = 10.0 + 18.0 * depth(&self.tree, row) as f64;
+                let indent = 10.0 + TREE_STEP * depth(&self.tree, row) as f64;
                 if let Some(mut view) = item.as_view().borrow_mut() {
                     view.layout.padding.left = indent;
                     view.draw_bg.set_dyn_instance(cx, live_id!(selected), &[sel]);
                 }
-                item.widget(cx, ids!(branch)).set_visible(cx, row.is_branch());
-                item.button(cx, ids!(branch)).set_text(cx, if self.collapsed.contains(&row.key) { ">" } else { "v" });
+                let open = if row.is_branch() { Some(!self.collapsed.contains(&row.key)) } else if self.tree_of.contains_key(&row.key) { Some(!self.closed_trees.contains(&row.key)) } else { None };
+                item.widget(cx, ids!(branch)).set_visible(cx, open == Some(false));
+                item.widget(cx, ids!(branch_open)).set_visible(cx, open == Some(true));
                 item.view(cx, ids!(linked)).set_visible(cx, row.is_part() && linked(&self.tree, row));
                 let [r, g, b, _] = shown.color;
                 let sw = item.view(cx, ids!(swatch));
@@ -1287,6 +1466,14 @@ impl Widget for FabPartsPanel {
                     sw.draw_bg.set_dyn_instance(cx, live_id!(color), &[r, g, b, 1.0]);
                 }
                 item.label(cx, ids!(swatch.slot)).set_text(cx, &shown.slot);
+                item.widget(cx, ids!(engine_tip)).set_visible(cx, row.is_part());
+                item.label(cx, ids!(engine.label)).set_text(cx, shown.engine);
+                if let Some(mut tip) = item.widget(cx, ids!(engine_tip)).borrow_mut::<makepad_widgets_core::tip::Tip>() {
+                    if tip.text != shown.engine_tip { tip.text = shown.engine_tip.to_string(); }
+                }
+                if let Some(mut tip) = item.widget(cx, ids!(swatch_tip)).borrow_mut::<makepad_widgets_core::tip::Tip>() {
+                    tip.text.clone_from(&shown.tip);
+                }
                 let alpha = if shown.excluded { 0.4 } else { 1.0 };
                 for path in [ids!(text.name), ids!(text.size)] {
                     if let Some(mut label) = item.label(cx, path).borrow_mut() {
@@ -1298,7 +1485,6 @@ impl Widget for FabPartsPanel {
                 item.view(cx, ids!(warn)).set_visible(cx, shown.issue);
                 item.widget(cx, ids!(eye)).set_visible(cx, shown.eye == Some(true));
                 item.widget(cx, ids!(eye_off)).set_visible(cx, shown.eye == Some(false));
-                item.widget(cx, ids!(delete)).set_visible(cx, row.is_part());
                 let renaming = self.rename.as_ref().is_some_and(|(key, _, _)| *key == row.key);
                 item.widget(cx, ids!(text.name)).set_visible(cx, !renaming);
                 if renaming {
@@ -1325,6 +1511,10 @@ impl Widget for FabPartsPanel {
         if let Some(state) = scope.data.get_mut::<AppState>() {
             state.ui.refresh_plate_keys(old_area, self.view.area());
         }
+        // the list scrolled down: a shadow along its top, under the toolbar
+        let list = self.view.portal_list(cx, ids!(list));
+        let (first_id, first_scroll) = (list.first_id(), list.scroll_position());
+        crate::ui::widgets::draw_scroll_shade(cx, &mut self.draw_shade, list.area().rect(cx), first_id, first_scroll);
         DrawStep::done()
     }
 }
@@ -1462,6 +1652,12 @@ pub struct FabPaintPalette {
     #[rust] area: Area,
 }
 
+/// After a pick: the plate view's paint row draws in a list of its own that the view's redraws
+/// reuse, so the swatch ring, the brush dial's disc and the support toggles redraw only when asked.
+fn repaint_brush_row(cx: &mut Cx) {
+    crate::ui::redraw(cx, &[ids!(model_ui.context.paint_bar)]);
+}
+
 impl Widget for FabPaintPalette {
     fn semantics(&self, _cx: &Cx, node: &mut a11y_tree::Node) {
         node.role = a11y_tree::Role::RadioGroup;
@@ -1488,6 +1684,7 @@ impl Widget for FabPaintPalette {
         let Some(key) = cx.a11y.action_part_key(request.node) else { return ActionResult::Unhandled };
         let Some((_, index)) = key.checked_sub(1).and_then(|i| self.chips.get(i as usize)) else { return ActionResult::Unsupported };
         cx.action(crate::ui::stage::StageAction::PaintColor(*index));
+        repaint_brush_row(cx);
         ActionResult::Handled
     }
 
@@ -1510,6 +1707,7 @@ impl Widget for FabPaintPalette {
                 if let Some((_, index)) = self.chips.iter().find(|(r, _)| r.contains(fe.abs)) {
                     self.hint.clear(cx, uid);
                     cx.action(crate::ui::stage::StageAction::PaintColor(*index));
+                    repaint_brush_row(cx);
                 }
             }
             _ => {}
@@ -1535,10 +1733,15 @@ impl Widget for FabPaintPalette {
         let chip = self.chip;
         let gap = (chip * 0.22).round();
         let cell_h = chip + 11.0;
-        let width = cx.turtle().next_walk_width(walk.width, walk.margin);
+        // A Fit width (a row of tools across the view) takes every swatch in one row.
+        let fit = walk.width.is_fit();
+        let width = if fit { colors.len().max(1) as f64 * (chip + gap) - gap + 4.0 } else { cx.turtle().next_walk_width(walk.width, walk.margin) };
         let columns = (((width + gap) / (chip + gap)).floor().max(1.0) as usize).min(colors.len().max(1));
         let grid_w = columns as f64 * (chip + gap) - gap;
         let mut walk = walk;
+        if fit {
+            walk.width = Size::Fixed(width);
+        }
         walk.height = Size::Fixed(colors.len().div_ceil(columns) as f64 * (cell_h + gap) + 1.0);
         let rect = cx.walk_turtle(walk);
         // clear of the active swatch's outline on the left
@@ -1930,10 +2133,6 @@ pub struct FabPartPanel {
     #[deref]
     view: View,
     #[rust]
-    shown: Option<(String, u64)>,
-    #[rust]
-    anchor: PositionAnchor,
-    #[rust]
     position_shown: Option<(usize, u64, PositionAnchor, Pose)>,
     #[rust]
     shown_xy: [f64; 2],
@@ -1944,7 +2143,7 @@ pub struct FabPartPanel {
     rest_shown: Option<(String, u64, crate::print::colours::Mapping)>,
 }
 
-#[derive(Clone, Copy, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum PositionAnchor {
     #[default]
     Origin,
@@ -1991,42 +2190,37 @@ impl Widget for FabPartPanel {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if !self.view.visible() { return; }
+        if let Event::Actions(actions) = event {
+            if self.view.text_input(cx, ids!(editor_bar.search.row.input)).changed(actions).is_some() {
+                self.view.redraw(cx);
+            }
+        }
+        // a section held by its grip moves with the pointer, the others sliding aside
+        // (`section_reorder`): first, and with its animation's frames too
+        if matches!(event, Event::MouseDown(_) | Event::MouseMove(_) | Event::MouseUp(_) | Event::NextFrame(_)) {
+            let order: Vec<(LiveId, WidgetRef, WidgetRef)> = [(live_id!(transform_slot), live_id!(transform)), (live_id!(params_slot), live_id!(params)), (live_id!(colours_slot), live_id!(colours)), (live_id!(issues_slot), live_id!(issues))]
+                .into_iter().map(|(slot, id)| (slot, self.view.widget(cx, &[id]), self.view.widget(cx, &[slot]))).collect();
+            crate::ui::widgets::section_reorder(cx, event, live_id!(part_sections), &order, self.view.area());
+        }
+        // the headers first: a press reads the fold it is about to turn
+        if matches!(event, Event::MouseMove(_) | Event::MouseDown(_) | Event::MouseUp(_) | Event::MouseLeave(_) | Event::ClearHover) {
+            let sections = [ids!(none), ids!(transform), ids!(params), ids!(colours), ids!(issues)].map(|path| self.view.widget(cx, path));
+            crate::ui::widgets::section_headers(cx, event, &sections);
+        }
         self.view.handle_event(cx, event, scope);
         let Event::Actions(actions) = event else { return };
         let Some(state) = scope.data.get_mut::<AppState>() else { return };
-        let input = self.view.text_input(cx, ids!(body.ident.name));
-        if input.escaped(actions) {
-            if let Some(p) = self.shown.as_ref().and_then(|(object, _)| state.plate.parts.iter().find(|p| &p.object == object)) {
-                input.set_text(cx, &p.name);
-            }
-        } else if input.returned(actions).is_some() || input.key_focus_lost(actions) {
-            // Commit to the object whose name is in the field, even if selection moved.
-            if let Some(p) = self.shown.as_ref().and_then(|(object, _)| state.plate.parts.iter().find(|p| &p.object == object)) {
-                let name = input.text().trim().to_string();
-                if !name.is_empty() && name != p.name {
-                    cx.action(PartAction::Rename { object: p.object.clone(), name: name.clone() });
-                }
-                if !cx.has_key_focus(input.area()) {
-                    input.set_text(cx, if name.is_empty() { &p.name } else { &name });
-                }
-            }
-        }
-        if !state.ui.on_screen(crate::ui::editors::Editor::Part) {
-            // off screen (a name typed above still commits): none of its controls can be pressed
+        if !state.ui.on_screen(crate::ui::editors::Editor::Part) && !state.ui.part_side_shown {
+            // off screen: none of its controls can be pressed
             return;
-        }
-        if self.view.button(cx, ids!(body.show_params)).clicked(actions) {
-            cx.action(crate::ui::shell::ShowPanel(crate::ui::editors::Editor::Parameters));
         }
         let Some(index) = active_part(state) else { return };
         let p = &state.plate.parts[index];
         let object = &p.object;
         let v = &self.view;
-        if v.button(cx, ids!(body.transform.buttons.frame)).clicked(actions) {
-            cx.action(ShellAction::FrameSelected);
-        }
         if state.slice_blocks_edits() { return; }
-        if v.radio_button(cx, ids!(body.transform.rs.sxyz.scale.trail.lock)).clicked(actions) {
+        if v.radio_button(cx, ids!(body.transform.rs.scale.trail.lock)).clicked(actions) {
             state.ui.scale_locked = !state.ui.scale_locked;
             crate::ui::redraw(cx, &[ids!(tab_part)]);
         }
@@ -2034,20 +2228,20 @@ impl Widget for FabPartPanel {
             cx.action(PartAction::MakePrintable { object: object.clone() });
         }
         let o = p.origin;
-        let x = v.value_input(cx, ids!(body.transform.xy.x.value.num));
-        let y = v.value_input(cx, ids!(body.transform.xy.y.value.num));
+        let x = v.value_input(cx, ids!(body.transform.xy.value.num));
+        let y = v.value_input(cx, ids!(body.transform.xy.value.num_y));
         let scales = [
-            v.value_input(cx, ids!(body.transform.rs.sxyz.scale.value.num)),
-            v.value_input(cx, ids!(body.transform.rs.sxyz.scale_y.value.num)),
-            v.value_input(cx, ids!(body.transform.rs.sxyz.scale_z.value.num)),
+            v.value_input(cx, ids!(body.transform.rs.scale.value.num)),
+            v.value_input(cx, ids!(body.transform.rs.scale.value.num_y)),
+            v.value_input(cx, ids!(body.transform.rs.scale.value.num_z)),
         ];
         // While a number scrubs, the part follows through the placement preview.
         let about = mm_to_world([o[0], o[1], p.min_mm[2]]);
         let zero = vec3(0.0, 0.0, 0.0);
         let pose = if let Some(nx) = x.changed(actions) {
-            Some(pose_turn_shift(zero, 0.0, mm_to_world([nx - self.anchor.xy(p)[0], 0.0, 0.0])))
+            Some(pose_turn_shift(zero, 0.0, mm_to_world([nx - state.ui.part_anchor.xy(p)[0], 0.0, 0.0])))
         } else if let Some(ny) = y.changed(actions) {
-            Some(pose_turn_shift(zero, 0.0, mm_to_world([0.0, ny - self.anchor.xy(p)[1], 0.0])))
+            Some(pose_turn_shift(zero, 0.0, mm_to_world([0.0, ny - state.ui.part_anchor.xy(p)[1], 0.0])))
         } else if let Some(r) = v.value_input(cx, ids!(body.transform.rs.rot.value.num)).changed(actions) {
             Some(pose_turn_shift(about, (r - p.rotate) as f32, zero))
         } else {
@@ -2064,20 +2258,13 @@ impl Widget for FabPartPanel {
         }
         let p = &state.plate.parts[index];
         if let Some(nx) = x.ended(actions) {
-            cx.action(self.anchor.place_field(p, 0, nx));
+            cx.action(state.ui.part_anchor.place_field(p, 0, nx));
         }
         if let Some(ny) = y.ended(actions) {
-            cx.action(self.anchor.place_field(p, 1, ny));
+            cx.action(state.ui.part_anchor.place_field(p, 1, ny));
         }
         if let Some(choice) = v.drop_down(cx, ids!(body.transform.anchor)).changed(actions) {
-            self.anchor = match choice { 1 => PositionAnchor::Centre, 2 => PositionAnchor::Corner, _ => PositionAnchor::Origin };
-            // A footprint may extend beyond the origin field's range. Equal limits give
-            // ValueInput an unbounded coordinate with the same scrub step and snap.
-            for field in [x, y] {
-                if let Some(mut f) = field.borrow_mut() {
-                    f.max = if self.anchor == PositionAnchor::Origin { ORIGIN_FIELD_MAX } else { f.min };
-                }
-            }
+            state.ui.part_anchor = match choice { 1 => PositionAnchor::Centre, 2 => PositionAnchor::Corner, _ => PositionAnchor::Origin };
             crate::ui::redraw(cx, &[ids!(tab_part)]);
         }
         if let Some(r) = v.value_input(cx, ids!(body.transform.rs.rot.value.num)).ended(actions) {
@@ -2088,21 +2275,12 @@ impl Widget for FabPartPanel {
                 cx.action(PartAction::Scale { object: object.clone(), scale: scale_by_field(p.scale, axis, value, state.ui.scale_locked) });
             }
         }
-        if v.button(cx, ids!(body.transform.buttons.drop)).clicked(actions) {
-            cx.action(PartAction::Drop { object: object.clone() });
-        }
-        if v.button(cx, ids!(body.transform.buttons.duplicate_linked)).clicked(actions) {
-            duplicate_selected(cx, state, false);
-        }
-        if v.button(cx, ids!(body.transform.buttons.duplicate_copy)).clicked(actions) {
-            duplicate_selected(cx, state, true);
-        }
-        if v.button(cx, ids!(body.transform.buttons.delete)).clicked(actions) {
-            delete_selected(cx, state);
-        }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        // the sections in the order they were dragged into
+        let rest = self.view.widget(cx, ids!(rest));
+        crate::ui::widgets::apply_section_order(cx, live_id!(part_sections), &rest);
         if let Some(state) = scope.data.get::<AppState>() {
             // As it shows now: a part being placed reads where it is, not where it was.
             let part = active_part(state).map(|i| (i, shown_part(state, &state.plate.parts[i])));
@@ -2110,42 +2288,38 @@ impl Widget for FabPartPanel {
             if part.is_none() {
                 self.view.label(cx, ids!(none.plate_summary)).set_text(cx, &plate_summary(state));
             }
-            self.view.view(cx, ids!(body)).set_visible(cx, part.is_some());
+            // (a widget, not a View: the body is a scroll box with a shadow, `FabScroll`)
+            self.view.widget(cx, ids!(body)).set_visible(cx, part.is_some());
             if let Some((index, p)) = part {
                 let v = &self.view;
-                let key = (p.object.clone(), state.plate.revision);
-                let fresh = self.shown.as_ref() != Some(&key);
-                if fresh {
-                    let input = v.text_input(cx, ids!(body.ident.name));
-                    if !cx.has_key_focus(input.area()) {
-                        input.set_text(cx, &p.name);
-                        self.shown = Some(key);
+                v.button(cx, ids!(body.transform.buttons.make_printable)).set_visible(cx, p.imported_mesh);
+                let can_edit = !state.slice_blocks_edits();
+                for id in [ids!(body.transform.xy), ids!(body.transform.rs), ids!(body.transform.anchor_row)] {
+                    v.widget(cx, id).set_visible(cx, can_edit);
+                }
+                let position = (index, state.plate.revision, state.ui.part_anchor, state.scene_state.nudge_of(p.element));
+                if self.position_shown.is_none_or(|(_, _, anchor, _)| anchor != state.ui.part_anchor) {
+                    v.drop_down(cx, ids!(body.transform.anchor)).set_selected_item(cx, state.ui.part_anchor as usize);
+                    // A footprint may extend beyond the origin field's range. Equal limits give
+                    // ValueInput an unbounded coordinate with the same scrub step and snap.
+                    for field in [ids!(body.transform.xy.value.num), ids!(body.transform.xy.value.num_y)] {
+                        if let Some(mut f) = v.value_input(cx, field).borrow_mut() {
+                            f.max = if state.ui.part_anchor == PositionAnchor::Origin { ORIGIN_FIELD_MAX } else { f.min };
+                        }
                     }
                 }
-                v.widget(cx, ids!(body.params_row)).set_visible(cx, !state.ui.on_screen(crate::ui::editors::Editor::Parameters));
-                v.button(cx, ids!(body.transform.buttons.make_printable)).set_visible(cx, p.imported_mesh);
-                let can_dup = !state.slice_blocks_edits();
-                for id in [ids!(body.transform.xy), ids!(body.transform.rs), ids!(body.transform.anchor_row)] {
-                    v.widget(cx, id).set_visible(cx, can_dup);
-                }
-                v.button(cx, ids!(body.transform.buttons.drop)).set_enabled(cx, can_dup);
-                v.button(cx, ids!(body.transform.buttons.delete)).set_enabled(cx, can_dup);
-                v.button(cx, ids!(body.transform.buttons.duplicate_linked)).set_enabled(cx, can_dup);
-                v.button(cx, ids!(body.transform.buttons.duplicate_copy)).set_enabled(cx, can_dup);
-                v.label(cx, ids!(body.ident.size)).set_text(cx, &if p.triangles == 0 { format!("{} · SDF", size_text(&p)) } else { format!("{} · {} triangles", size_text(&p), p.triangles) });
-                let position = (index, state.plate.revision, self.anchor, state.scene_state.nudge_of(p.element));
                 if self.position_shown != Some(position) {
-                    self.shown_xy = self.anchor.xy(&p);
+                    self.shown_xy = state.ui.part_anchor.xy(&p);
                     self.position_shown = Some(position);
                 }
                 // Each setter leaves a field being edited alone and takes the value on release.
-                v.value_input(cx, ids!(body.transform.xy.x.value.num)).set_value(cx, self.shown_xy[0]);
-                v.value_input(cx, ids!(body.transform.xy.y.value.num)).set_value(cx, self.shown_xy[1]);
+                v.value_input(cx, ids!(body.transform.xy.value.num)).set_value(cx, self.shown_xy[0]);
+                v.value_input(cx, ids!(body.transform.xy.value.num_y)).set_value(cx, self.shown_xy[1]);
                 v.value_input(cx, ids!(body.transform.rs.rot.value.num)).set_value(cx, p.rotate);
-                v.value_input(cx, ids!(body.transform.rs.sxyz.scale.value.num)).set_value(cx, p.scale[0] * 100.0);
-                v.value_input(cx, ids!(body.transform.rs.sxyz.scale_y.value.num)).set_value(cx, p.scale[1] * 100.0);
-                v.value_input(cx, ids!(body.transform.rs.sxyz.scale_z.value.num)).set_value(cx, p.scale[2] * 100.0);
-                let lock = v.radio_button(cx, ids!(body.transform.rs.sxyz.scale.trail.lock));
+                v.value_input(cx, ids!(body.transform.rs.scale.value.num)).set_value(cx, p.scale[0] * 100.0);
+                v.value_input(cx, ids!(body.transform.rs.scale.value.num_y)).set_value(cx, p.scale[1] * 100.0);
+                v.value_input(cx, ids!(body.transform.rs.scale.value.num_z)).set_value(cx, p.scale[2] * 100.0);
+                let lock = v.radio_button(cx, ids!(body.transform.rs.scale.trail.lock));
                 if lock.active(cx) != state.ui.scale_locked {
                     lock.set_active(cx, state.ui.scale_locked, Animate::No);
                 }
@@ -2162,6 +2336,10 @@ impl Widget for FabPartPanel {
                 }
             }
         }
+        // the toolbar's search filters the sections' rows (`filter_sections`)
+        let query = self.view.text_input(cx, ids!(editor_bar.search.row.input)).text();
+        let sections = [ids!(transform), ids!(params), ids!(colours), ids!(issues)].map(|path| self.view.widget(cx, path));
+        crate::ui::widgets::filter_sections(cx, LiveId(self.view.widget_uid().0), &query, &sections);
         self.view.draw_walk(cx, scope, walk)
     }
 }
@@ -2199,6 +2377,19 @@ mod tree_tests {
     fn part(script: &str, link: u32, name: &str) -> PlatePart {
         let instance = if link == 0 { script.to_string() } else { format!("{script}~{link}") };
         PlatePart { printed: true, object: format!("{instance}/body"), script: script.into(), link, file: format!("{script}.cad.splash"), name: name.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn the_tree_keeps_the_declared_order_whatever_prints() {
+        // the plate lists its printed parts first: "wheel", switched off, comes after "body"
+        let mut wheel = part("wheel", 0, "Wheel");
+        wheel.order = (0, 0);
+        wheel.printed = false;
+        let mut body = part("body", 0, "Body");
+        body.order = (1, 0);
+        let plate = PlateInfo { parts: vec![body, wheel], ..Default::default() };
+        let names: Vec<String> = tree_rows(&plate, &[]).into_iter().map(|r| r.name).collect();
+        assert_eq!(names, ["Wheel", "Body"], "declared order, not printed first");
     }
 
     #[test]

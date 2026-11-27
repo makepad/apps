@@ -68,6 +68,20 @@ impl Motion {
             None => c.err(at, "duration", "a Motion document declares its `duration` in seconds".into(), Some("`duration: 6.0`")),
         }
         c.duration = doc.duration;
+        if let Some(value) = c.get(at.obj, "stops") {
+            const HINT: &str = "`stops` lists the seconds where a presentation holds, increasing and within the duration: `stops: [2.0 5.5 9.0]`";
+            let stops = match value {
+                Look::Arr(values) if self.stops.0.as_array().is_some() => {
+                    values.iter().map(Look::num).collect::<Option<Vec<_>>>()
+                }
+                _ => None,
+            };
+            match stops {
+                Some(stops) if stops.iter().all(|s| (0.0..=doc.duration).contains(s))
+                    && stops.windows(2).all(|pair| pair[0] < pair[1]) => doc.stops = stops,
+                _ => c.err(at, "stops", "`stops` needs a strictly increasing list of seconds in the document's duration".into(), Some(HINT)),
+            }
+        }
         if let Some(value) = self.fps.look(c) {
             match value.num() {
                 Some(fps) if fps > 0.0 && fps <= 1000.0 => doc.fps = fps,

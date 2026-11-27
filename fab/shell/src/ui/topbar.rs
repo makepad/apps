@@ -6,16 +6,12 @@
 //! custom widget would read as one big control. The app runs it through
 //! [`handle_actions`] and [`sync`].
 //!
-//! Left: the cube, the app's menus (File, Edit, View, Help), the document's name and
-//! state and undo / redo, followed by the person's workspace tabs (Cmd+1-9) and the
-//! temporary layout's tab ([`crate::ui::workspace_tabs`]). Right: requirements, the job strip, a
-//! reserved slot for the second-window icon (a plate also open in another Fab window; the slot is
-//! always there, so the icon coming and going never moves the tab row), the headset,
-//! the code toggle, the AI column and Print. The trailing controls draw first. One rect read
-//! drives every fold once the scrolling tabs reach their minimum. The chip shows its count,
-//! the document state hides, the workspace tabs show icons, and the menus share one button.
-//! The job line then shortens to its status mark. Last, the document name takes the remaining
-//! width and ellipsizes, with its full name in the tooltip.
+//! Left: the cube and the app's menus (File, Edit, View, Help). Centre: the document's name and
+//! state (the full name in a tooltip). Right: the requirements chip, the job strip (or the save
+//! status while quitting), a reserved slot for the second-window icon (a plate also open in
+//! another Fab window), the headset, undo / redo, the workspace menu (it names the shown
+//! workspace and lists them all, Cmd+1-9; [`crate::ui::workspace_tabs`]), the AI
+//! column and Print. (The code is an editor like any other: its area's selector, or ` to show it.)
 //!
 //! The slice is a render mode of the plate view (`stage`), not a workspace. Print
 //! only opens the printer panel's confirm row (and shows the slice, which slices
@@ -27,17 +23,15 @@ use crate::ui::job_strip::JOB_LINE_CHARS;
 use crate::print::PrintAction;
 use crate::ui::menus::{action_for as menu_action_for, edit_menu, file_menu, help_menu, view_menu};
 use crate::ui::popover::{menu_picked, open_menu, ui_actions, FabUiAction, MenuItem, MenuPlace};
-use crate::ui::dropdown::FabDropdownButton;
 use crate::ui::editors::Editor;
 use crate::ui::shell::ShowPanel;
 use crate::ui::workspace_tabs::{FabWorkspaceTabs, WorkspaceTabAction};
 use crate::workspaces::{ListOp, Origin, ShownBy, WorkspaceId};
 use fab_elec_view::ReqShown;
-use makepad_widgets_core::{job_strip::JobStrip, popover::Popover, tip::{TipAction, TipWidgetRefExt}};
-use makepad_widgets_core::width_override::WidthOverride;
+use makepad_widgets_core::{job_strip::JobStrip, tip::{TipAction, TipWidgetRefExt}};
 use makepad_widgets_core::*;
 
-/// The caption's menus: owner id and items.
+/// The caption's menus: owner id, title and items.
 fn menus() -> [(LiveId, &'static str, fn(&AppState) -> Vec<MenuItem>); 4] {
     [
         (live_id!(fab_menu_file), "File", file_menu),
@@ -51,13 +45,15 @@ script_mod! {
     use mod.prelude.fab.*
     use mod.widgets.*
 
-    // Caption glyphs in the quiet ink, the full ink under the pointer.
+    // Caption glyphs in the body's ink, lit under the pointer.
     let CapIcon = mod.widgets.FabIconButton{
         width: 28
         height: 26
         padding: Inset{left: 6 right: 6 top: 5 bottom: 5}
-        draw_icon +: {color: fab.color_text_dim}
+        draw_icon +: {color: fab.color_text}
     }
+    // Between the caption's groups (history, the workspaces, the tools, Print).
+    let CapRule = mod.widgets.FabVRule{height: 16 margin: Inset{left: 6 right: 6}}
 
     // A well in the caption: the field colour, no frame, its edges on device pixels.
     let Well = View{
@@ -75,35 +71,53 @@ script_mod! {
         }
     }
 
-    let CaptionFit = #(FabCaptionFit::register_widget(vm))
-    let JobLineFit = #(FabJobLineFit::register_widget(vm))
-    let RequirementSpace = #(FabRequirementSpace::register_widget(vm))
-    let control_gap = 2
+    let JobsSlot = #(FabJobsSlot::register_widget(vm))
 
     mod.widgets.FabTopBar = View{
         width: Fill
         height: Fill
         flow: Overlay
 
-        // The right side first, against the caption's right end: the workspaces' row ends where
-        // it starts (`FabWorkspaceTabs::follow`), so a job on the strip takes its room from the
-        // row, never from the window's edge.
+        // The right side, against the caption's right end: the job strip, XR, undo and redo, the
+        // workspace menu, then the assistant and Print.
         ends := View{
             width: Fill
             height: Fill
             flow: Right
             align: Align{x: 1.0 y: 0.5}
             padding: Inset{right: 8}
-            requirement_space := RequirementSpace{width: Fit height: Fit margin: Inset{right: control_gap}}
             right := View{
                 width: Fit
                 height: Fill
                 flow: Right
                 align: Align{x: 1.0 y: 0.5}
-                spacing: control_gap
-                // Keep the normal gap between the job strip (drawn against this edge) and the icons.
-                View{width: 0 height: 0}
-                // Always this size, icon or not, so the tab row never moves when it comes and goes.
+                spacing: 2
+                // What the project requires, met of all: shown while a project has requirements.
+                requirements_tip := FabTip{
+                    requirements := mod.widgets.FabButton{
+                        visible: false height: 24
+                        draw_text +: {
+                            failing: instance(0.0) unknown: instance(0.0)
+                            get_color: fn() {
+                                return fab.color_ok.mix(fab.color_warning, self.unknown).mix(fab.color_error, self.failing)
+                            }
+                        }
+                    }
+                }
+                // The job strip, its line in a tooltip; while the app saves on quit, the save's
+                // status holds the slot instead.
+                jobs := JobsSlot{
+                    width: Fit height: Fill
+                    align: Align{y: 0.5}
+                    jobs_tip := FabTip{wrap_width: 360 height: Fill flow: Right align: Align{y: 0.5}
+                        quit_line := Label{
+                            visible: false width: Fit height: Fit
+                            draw_text +: {color: fab.color_text text_style: theme.font_regular{font_size: fab.font_size_small}}
+                        }
+                        strip := mod.widgets.FabJobStrip{max_chars: #(JOB_LINE_CHARS)}
+                    }
+                }
+                // Always this size, icon or not, so nothing moves when it comes and goes.
                 also_slot := View{width: 28 height: 26
                     also_tip := FabTip{ text: "This plate is also open in another Fab window."
                         also := mod.widgets.FabIcon{
@@ -116,57 +130,56 @@ script_mod! {
                 }
                 // Always available: starts the XR server and pairs a device by its PIN.
                 xr_caption := mod.widgets.XrCaptionButton{app: "fab" margin: Inset{left: 0 right: 0}}
-                FabTip{ text: "The code beside the view (`)"
-                    code_toggle := mod.widgets.FabIconCheck{ a11y: {label: "Code"} width: 28 height: 26 padding: Inset{left: 6 right: 6 top: 5 bottom: 5} draw_icon +: { svg: crate_resource("self://resources/icons/code.svg") } }
+                // history | the workspace menu (it names the shown one) and its + | the assistant |
+                // Print (the printer camera is the Printers editor's)
+                FabTip{ text: #(keymap::tooltip(Key::Undo))
+                    undo := CapIcon{ a11y: {label: "Undo"} draw_icon +: { svg: crate_resource("self://resources/icons/undo.svg") } }
                 }
+                FabTip{ text: #(keymap::tooltip(Key::Redo))
+                    redo := CapIcon{ a11y: {label: "Redo"} draw_icon +: { svg: crate_resource("self://resources/icons/redo.svg") } }
+                }
+                CapRule{}
+                workspaces := mod.widgets.FabWorkspaceTabs{}
+                CapRule{}
                 FabTip{ text: #(keymap::tooltip(Key::Chat))
                     chat := CapIcon{ a11y: {label: "AI assistant"} draw_icon +: { svg: crate_resource("self://resources/icons/spark.svg") } }
                 }
+                // Fab's own settings (how the 3D views take the mouse, ...) in their flyout
+                FabTip{ text: "Settings: how the 3D views take the mouse"
+                    settings := CapIcon{ a11y: {label: "Settings"} draw_icon +: { svg: crate_resource("self://resources/icons/cog.svg") } }
+                }
+                CapRule{}
                 FabTip{ text: "Print the sliced plate (asks first)"
                     print := mod.widgets.FabButtonAccent{ text: "Print" height: 24 padding: Inset{left: 14 right: 14} }
                 }
             }
         }
 
-        // Fit reads the trailing controls once. The chip ends just before them.
-        fit := CaptionFit{
-            jobs_tip := FabTip{wrap_width: 360 height: Fill flow: Right align: Align{y: 0.5}
-                // Quit owns the strip's line while the save waits, even when
-                // an unrelated job would normally be selected for this slot.
-                quit_line := Label{
-                    visible: false width: Fit height: Fit
-                    draw_text +: {color: fab.color_text text_style: theme.font_regular{font_size: fab.font_size_small}}
+        // The document's name and state at the centre of the window, under the two sides (it
+        // takes no presses: the caption around it still drags the window).
+        middle := View{
+            width: Fill
+            height: Fill
+            align: Align{x: 0.5 y: 0.5}
+            // centred on the window, not the bar: the bar starts 40 in (past the traffic lights'
+            // room), so as much is kept on its right
+            padding: Inset{right: 40}
+            title := View{
+                width: Fit
+                height: Fit
+                flow: Right
+                spacing: 6
+                align: Align{y: 0.5}
+                doc_name := mod.widgets.FabLabel{
+                    text: "Untitled" max_lines: 1 text_overflow: Ellipsis flow: Right
+                    hover_actions_enabled: true
+                    draw_text +: { text_style: theme.font_bold{ font_size: fab.font_size_title } }
                 }
-                strip := mod.widgets.FabJobStrip{
-                    max_chars: #(JOB_LINE_CHARS)
-                    line_fit := JobLineFit{width: 0 height: 0}
-                    pop +: {line +: {draw_text +: {
-                        normal_ink: mod.widgets.ButtonFlat.draw_text.get_color
-                        mark: instance(0.0) failed_mark: instance(0.0)
-                        get_color: fn() {
-                            return self.normal_ink().mix(fab.color_accent.mix(fab.color_error, self.failed_mark), self.mark)
-                        }
-                    }}}
-                }
-            }
-        }
-        chip_row := View{
-            width: Fit height: Fill flow: Right align: Align{x: 1.0 y: 0.5}
-            requirements_tip := FabTip{
-                requirements := mod.widgets.FabButton{
-                    visible: false height: 24
-                    draw_text +: {
-                        failing: instance(0.0) unknown: instance(0.0)
-                        get_color: fn() {
-                            return fab.color_ok.mix(fab.color_warning, self.unknown).mix(fab.color_error, self.failing)
-                        }
-                    }
-                }
+                doc_state := mod.widgets.FabLabelSmall{ text: "" }
             }
         }
 
-        // The document and history, then the workspaces right after them (as in Blender); the
-        // rest up to the right side drags the window.
+        // The menus; the rest up to the right side drags the window.
         starts := View{
             width: Fill
             height: Fill
@@ -188,7 +201,7 @@ script_mod! {
                         color: fab.color_accent
                     }
                 }
-                // The app menus share a button only after the tabs have folded.
+                // The app's menus, always in sight (the caption is the app's own).
                 menus := View{
                     width: Fit height: Fill flow: Right align: Align{y: 0.5} spacing: 0
                     m_file := mod.widgets.FabMenuButton{ tag: @fab_menu_file owner: @fab_menu_file height: 24 label +: { text: "File" } }
@@ -196,269 +209,35 @@ script_mod! {
                     m_view := mod.widgets.FabMenuButton{ tag: @fab_menu_view owner: @fab_menu_view height: 24 label +: { text: "View" } }
                     m_help := mod.widgets.FabMenuButton{ tag: @fab_menu_help owner: @fab_menu_help height: 24 label +: { text: "Help" } }
                 }
-                compact_menu := mod.widgets.FabMenuButton{ visible: false owner: @fab_menu_all height: 24 label +: {text: "Menu"} }
-                title := View{
-                    width: Fit
-                    height: Fit
-                    flow: Right
-                    spacing: 6
-                    align: Align{y: 0.5}
-                    margin: Inset{left: 4 right: 6}
-                    doc_name := mod.widgets.FabLabel{
-                        text: "Untitled" max_lines: 1 text_overflow: Ellipsis flow: Right
-                        hover_actions_enabled: true
-                        draw_text +: { text_style: theme.font_bold{ font_size: fab.font_size_title } }
-                    }
-                    doc_state := mod.widgets.FabLabelSmall{ text: "" }
-                }
-                FabTip{ text: #(keymap::tooltip(Key::Undo))
-                    undo := CapIcon{ a11y: {label: "Undo"} draw_icon +: { svg: crate_resource("self://resources/icons/undo.svg") } }
-                }
-                FabTip{ text: #(keymap::tooltip(Key::Redo))
-                    redo := CapIcon{ a11y: {label: "Redo"} draw_icon +: { svg: crate_resource("self://resources/icons/redo.svg") } }
-                }
-            }
-
-            // the workspaces: the person's row, the shown one lit
-            workspaces := mod.widgets.FabWorkspaceTabs{}
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, PartialOrd)]
-enum CaptionFold {
-    Full,
-    Count,
-    HideState,
-    Icons,
-    Menu,
-}
-
-/// Room after the fixed controls and the minimum scrolling row, before the optional pieces.
-fn caption_fold(room: f64, full: f64, count: f64, state: f64, temp: f64, icon: f64) -> CaptionFold {
-    if state + temp + full <= room {
-        CaptionFold::Full
-    } else if state + temp + count <= room {
-        CaptionFold::Count
-    } else if temp + count <= room {
-        CaptionFold::HideState
-    } else if icon + count <= room {
-        CaptionFold::Icons
-    } else {
-        CaptionFold::Menu
-    }
-}
-
-/// Intrinsic width of this caption's expanded left row, independent of its current fold.
-/// Its Fit containers are horizontal views and the menu titles' label-and-padding views.
-fn expanded_width(cx: &mut Cx2d, widget: &WidgetRef) -> f64 {
-    fn row(cx: &mut Cx2d, view: &View) -> f64 {
-        let mut widths = view.children.iter().filter(|(id, child)| {
-            *id != id!(compact_menu) && (*id == id!(menus) || *id == id!(doc_state) || child.visible())
-        }).map(|(_, child)| expanded_width(cx, child));
-        let first = widths.next().unwrap_or_default();
-        view.walk.margin.width() + view.layout.padding.width() + first
-            + widths.map(|width| view.layout.spacing + width).sum::<f64>()
-    }
-    if let Some(view) = widget.borrow::<View>() {
-        return row(cx, &view);
-    }
-    if let Some(menu) = widget.borrow::<FabDropdownButton>() {
-        return row(cx, &menu);
-    }
-    widget.measure_width(cx, Some(&WidthOverride { visible: Some(true), ..Default::default() })).unwrap_or_default()
-}
-
-/// Walk the full chip's width before the job strip. This preserves the original drawing
-/// origin of the trailing icons (their SVGs snap to pixels before the group is aligned).
-/// The single interactive chip draws later, against the end of this space.
-#[derive(Script, ScriptHook, Widget)]
-struct FabRequirementSpace {
-    #[uid] uid: WidgetUid,
-    #[source] source: ScriptObjectRef,
-    #[walk] walk: Walk,
-    #[redraw] #[rust] area: Area,
-    #[rust] chip: WidgetRef,
-    #[rust] full: WidthOverride,
-    #[rust] width: f64,
-}
-
-impl Widget for FabRequirementSpace {
-    fn handle_event(&mut self, _: &mut Cx, _: &Event, _: &mut Scope) {}
-
-    fn draw_walk(&mut self, cx: &mut Cx2d, _: &mut Scope, walk: Walk) -> DrawStep {
-        self.width = self.chip.measure_width(cx, Some(&self.full)).unwrap_or_default();
-        if self.width > 0.0 {
-            cx.walk_turtle(Walk { width: Size::Fixed(self.width), height: Size::Fixed(0.0), ..walk });
-        }
-        DrawStep::done()
-    }
-}
-
-/// JobStrip selects and dresses its controls just before its view draws. This zero-walk
-/// child runs between those operations, when the line, count and × all belong to this draw.
-#[derive(Script, ScriptHook, Widget)]
-struct FabJobLineFit {
-    #[uid] uid: WidgetUid,
-    #[source] source: ScriptObjectRef,
-    #[walk] walk: Walk,
-    #[redraw] #[rust] area: Area,
-    #[rust] pop: WidgetRef,
-    #[rust] budget: f64,
-    #[rust] natural_width: f64,
-    #[rust] unfolded: Option<String>,
-    #[rust] hid_more: bool,
-}
-
-impl FabJobLineFit {
-    fn prepare(&mut self, cx: &mut Cx, budget: f64) {
-        self.budget = budget;
-        self.natural_width = 0.0;
-        // Give JobStrip its own text back for its change detection, without queuing a redraw.
-        if let Some(text) = self.unfolded.take() {
-            if let Some(mut line) = self.pop.child(id!(line)).borrow_mut::<Button>() {
-                line.text.set(&text);
             }
         }
-        if self.hid_more {
-            self.pop.child(id!(more)).set_visible(cx, true);
-            self.hid_more = false;
-        }
     }
 }
 
-impl Widget for FabJobLineFit {
-    fn handle_event(&mut self, _: &mut Cx, _: &Event, _: &mut Scope) {}
-
-    fn draw_walk(&mut self, cx: &mut Cx2d, _: &mut Scope, _: Walk) -> DrawStep {
-        if !self.pop.visible() { return DrawStep::done() }
-        let line = self.pop.child(id!(line));
-        let more = self.pop.child(id!(more));
-        let cancel = self.pop.child(id!(cancel));
-        let gap = self.pop.borrow::<Popover>().unwrap().layout.spacing;
-        let controls: f64 = [&more, &cancel].into_iter().filter(|w| w.visible())
-            .map(|w| w.measure_width(cx, None).unwrap_or_default() + gap).sum();
-        let width = line.measure_width(cx, None).unwrap_or_default();
-        self.natural_width = width + controls;
-        let Some(mut button) = line.borrow_mut::<Button>() else { return DrawStep::done() };
-        let mut mark = false;
-        if self.natural_width > self.budget {
-            let original = button.text();
-            let chars: Vec<char> = original.chars().collect();
-            let prefix = |n: usize| chars[..n].iter().copied().chain(['…']).collect::<String>();
-            let fits = |cx: &mut Cx2d, btn: &mut Button, n: usize| {
-                btn.measure_width(cx, Some(&WidthOverride { text: Some(prefix(n)), ..Default::default() }))
-                    .is_some_and(|w| w + controls <= self.budget)
-            };
-            // Twelve readable characters justify a line. Price the real glyphs in the job's font.
-            let mut lo = 12.min(chars.len().saturating_sub(1));
-            mark = lo < 12 || !fits(cx, &mut button, lo);
-            let label = if mark {
-                let mut failed = [0.0];
-                button.draw_bg.get_instance(cx, id!(failed), &mut failed);
-                button.draw_text.set_dyn_instance(cx, id!(failed_mark), &failed);
-                if more.visible() {
-                    // Its old hit area is gone in this draw. Restoring the model visibility before
-                    // the next JobStrip update must not schedule another frame for that old area.
-                    more.borrow_mut::<Button>().unwrap().draw_bg.draw_vars.area = Area::Empty;
-                    more.set_visible(cx, false);
-                    self.hid_more = true;
-                }
-                "●".to_owned()
-            } else {
-                let mut hi = chars.len();
-                while lo + 1 < hi {
-                    let mid = lo + (hi - lo) / 2;
-                    if fits(cx, &mut button, mid) { lo = mid } else { hi = mid }
-                }
-                prefix(lo)
-            };
-            button.text.set(&label);
-            self.unfolded = Some(original);
-        }
-        button.draw_text.set_dyn_instance(cx, id!(mark), &[u8::from(mark) as f32]);
-        DrawStep::done()
-    }
-}
-
-/// Draw the job strip once against the measured trailing controls, then place the chip and tabs.
+/// The job strip's slot: its tooltip names the shown job (its whole line), unless the save's
+/// status holds the slot while the app quits (`quit_status`).
 #[derive(Script, ScriptHook, Widget)]
-struct FabCaptionFit {
+struct FabJobsSlot {
     #[deref] view: View,
-    #[rust] starts: WidgetRef,
-    #[rust] chip_row: WidgetRef,
-    #[rust] space: WidgetRef,
-    #[rust] count: WidthOverride,
     #[rust] tip_version: Option<(Option<jobs::JobId>, u64)>,
 }
 
-impl Widget for FabCaptionFit {
+impl Widget for FabJobsSlot {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
     }
 
-    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, _: Walk) -> DrawStep {
-        let workspaces = self.starts.child(id!(workspaces));
-        let Some(mut tabs) = workspaces.borrow_mut::<FabWorkspaceTabs>() else { return DrawStep::done() };
-        let bar = cx.turtle().rect();
-        let right = tabs.trailing_start(cx, bar);
-        let chip = self.chip_row.child(id!(requirements_tip)).child(id!(requirements));
-        let Some(space) = self.space.borrow::<FabRequirementSpace>() else { return DrawStep::done() };
-        let full = space.width;
-        let chip_end = if full > 0.0 { right - space.walk.margin.right } else { right };
-        let count = chip.measure_width(cx, Some(&self.count)).unwrap_or_default();
-        let left = self.starts.child(id!(left));
-        let title = left.child(id!(title));
-        let state = title.child(id!(doc_state));
-        let state_width = expanded_width(cx, &state) + title.borrow::<View>().unwrap().layout.spacing;
-        let starts = self.starts.borrow::<View>().unwrap();
-        let tabs_at = bar.pos.x + starts.layout.padding.left + expanded_width(cx, &left) + starts.layout.spacing;
-        let (minimum, temp, icon) = tabs.prepare_widths(cx);
-        let room = chip_end - tabs_at + state_width - minimum;
-        let strip = self.view.widget(cx, ids!(strip));
-        let line_fit = strip.child(id!(line_fit));
-        let menus = left.child(id!(menus));
-        let compact_menu = left.child(id!(compact_menu));
-        let menu_saving = expanded_width(cx, &menus) - expanded_width(cx, &compact_menu);
-        let job_budget = room + menu_saving - count - icon;
-        line_fit.borrow_mut::<FabJobLineFit>().unwrap().prepare(cx, job_budget);
-        let jobs_tip = self.view.widget(cx, ids!(jobs_tip));
-        cx.begin_turtle(Walk::fixed((right - bar.pos.x).max(0.0), bar.size.y),
-            Layout { flow: Flow::right(), align: Align { x: 1.0, y: 0.5 }, ..Default::default() });
-        let quit_line = jobs_tip.child(id!(quit_line));
-        jobs_tip.draw_all(cx, scope);
-        let job_width = cx.turtle().used_width();
-        cx.end_turtle();
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let tip = self.view.widget(cx, ids!(jobs_tip));
+        let strip = tip.child(id!(strip));
         let job = strip.borrow::<JobStrip>().and_then(|s| s.shown_job());
         let version = (job, jobs::board().seq());
-        if !quit_line.visible() && self.tip_version != Some(version) {
+        if !tip.child(id!(quit_line)).visible() && self.tip_version != Some(version) {
             let text = job.and_then(|id| jobs::board().get(id)).map_or_else(String::new, |j| j.line());
-            jobs_tip.as_tip().set_text(&text);
+            tip.as_tip().set_text(&text);
             self.tip_version = Some(version);
         }
-        let chip_end = chip_end - job_width;
-        // The job budget already reserves the full name with every other control compact.
-        // Any remaining deficit comes out of the name. A capped Fit still measures at its
-        // natural width, so the next draw can give the name and the earlier folds room again.
-        if let Some(mut name) = title.child(id!(doc_name)).borrow_mut::<Label>() {
-            let max = (job_width > job_budget).then(|| {
-                let natural = name.measure_width(cx, None).unwrap_or_default();
-                FitBound::Abs((natural + job_budget - job_width).max(0.0))
-            });
-            name.walk.width = Size::Fit { min: None, max };
-        }
-        let natural_job = if !quit_line.visible() { line_fit.borrow::<FabJobLineFit>().unwrap().natural_width } else { job_width };
-        let fold = caption_fold(room - natural_job, full, count, state_width, temp, icon);
-        let (width, label) = if fold == CaptionFold::Full { (full, &space.full) } else { (count, &self.count) };
-        tabs.fit(chip_end - width, fold >= CaptionFold::Icons);
-        if let Some(text) = &label.text {
-            chip.set_text(cx, text);
-        }
-        state.set_visible(cx, fold < CaptionFold::HideState);
-        menus.set_visible(cx, fold != CaptionFold::Menu);
-        compact_menu.set_visible(cx, fold == CaptionFold::Menu);
-        self.chip_row.borrow_mut::<View>().unwrap().walk.width = Size::Fixed((chip_end - bar.pos.x).max(0.0));
-        DrawStep::done()
+        self.view.draw_walk(cx, scope, walk)
     }
 }
 
@@ -466,20 +245,20 @@ impl Widget for FabCaptionFit {
 /// `FabTopBar` view).
 pub fn handle_actions(cx: &mut Cx, bar: &WidgetRef, actions: &Actions, state: &AppState) {
     // A plain label can report hover and still let its part of the caption drag the window.
-    let name = bar.label(cx, ids!(left.title.doc_name));
+    let name = bar.label(cx, ids!(middle.title.doc_name));
     if let Some(rect) = name.hover_in(actions) {
         cx.widget_action(name.widget_uid(), TipAction::HoverIn(name.text(), rect));
     } else if name.hover_out(actions) {
         cx.widget_action(name.widget_uid(), TipAction::HoverOut);
     }
     workspace_actions(cx, bar, actions, state);
-    if bar.button(cx, ids!(left.undo)).clicked(actions) {
+    if bar.button(cx, ids!(right.undo)).clicked(actions) {
         cx.action(ShellAction::Command("undo".into()));
     }
-    if bar.button(cx, ids!(left.redo)).clicked(actions) {
+    if bar.button(cx, ids!(right.redo)).clicked(actions) {
         cx.action(ShellAction::Command("redo".into()));
     }
-    if bar.button(cx, ids!(chip_row.requirements)).clicked(actions) {
+    if bar.button(cx, ids!(right.requirements)).clicked(actions) {
         cx.action(ShowPanel(Editor::Requirements));
     }
     if bar.button(cx, ids!(right.print)).clicked(actions) {
@@ -491,11 +270,20 @@ pub fn handle_actions(cx: &mut Cx, bar: &WidgetRef, actions: &Actions, state: &A
         }
         cx.action(PrintAction::AskPrint(true));
     }
-    if bar.radio_button(cx, ids!(right.code_toggle)).clicked(actions) {
-        cx.action(ShellAction::ShowCode(!state.ui.code_shown()));
-    }
     if bar.button(cx, ids!(right.chat)).clicked(actions) {
         cx.action(ShellAction::Command("toggle chat".into()));
+    }
+    // Settings: its flyout under the cog, and what is picked there
+    let cog = bar.widget(cx, ids!(right.settings));
+    if bar.button(cx, ids!(right.settings)).clicked(actions) {
+        open_menu(cx, SETTINGS_MENU, settings_menu(state), cog.area().rect(cx), MenuPlace::Below);
+    }
+    if let Some(pick) = menu_picked(actions, SETTINGS_MENU) {
+        if let Some(scheme) = NavScheme::ALL.into_iter().find(|s| nav_row(*s) == pick) {
+            cx.action(crate::ui::stage::StageAction::Nav(scheme));
+        } else if pick == live_id!(settings_invert_wheel) {
+            cx.action(crate::ui::stage::StageAction::InvertWheel(!state.ui.invert_wheel));
+        }
     }
     for action in ui_actions(actions) {
         if let FabUiAction::MenuBarOpen { owner, anchor, press } = action {
@@ -514,6 +302,24 @@ pub fn handle_actions(cx: &mut Cx, bar: &WidgetRef, actions: &Actions, state: &A
             cx.action(action);
         }
     }
+}
+
+/// The owner of the caption's Settings flyout.
+const SETTINGS_MENU: LiveId = live_id!(fab_settings);
+
+/// A 3D navigation scheme's row in Settings.
+fn nav_row(scheme: NavScheme) -> LiveId {
+    LiveId::from_str(&format!("settings_nav_{}", scheme.key()))
+}
+
+/// Settings: how the 3D views take the mouse, as other 3D programs do (each scheme's gestures
+/// beside its name), and the wheel's zoom the other way. O(schemes).
+fn settings_menu(state: &AppState) -> Vec<MenuItem> {
+    let mut items = vec![MenuItem::heading("3D navigation")];
+    items.extend(NavScheme::ALL.into_iter().map(|s| MenuItem::new(nav_row(s), s.name()).radio(state.ui.nav == s).note(s.summary())));
+    items.push(MenuItem::sep());
+    items.push(MenuItem::new(live_id!(settings_invert_wheel), "Invert zoom wheel").checked(state.ui.invert_wheel));
+    items
 }
 
 /// The owners of the workspaces' menus: a tab's, `+`'s and `⌄`'s.
@@ -668,12 +474,13 @@ impl Caption {
 /// The app compares report Arc pointers in its caption update after non-draw events.
 /// Only a different report or a reapplied caption changes this button and its tooltip.
 pub fn sync_requirements(cx: &mut Cx, bar: &WidgetRef, shown: Option<&ReqShown>) {
-    let chip = bar.button(cx, ids!(chip_row.requirements));
+    let chip = bar.button(cx, ids!(right.requirements));
     chip.set_visible(cx, shown.is_some());
     if let Some(shown) = shown {
         let report = &shown.report;
         let (met, total) = report.met_count();
-        set_requirement_counts(cx, bar, met, total);
+        chip.set_text(cx, &format!("Requirements {met}/{total}"));
+        bar.tip(cx, ids!(right.requirements_tip)).set_text(&format!("What the project requires: {met} of {total} met"));
         if let Some(mut button) = chip.borrow_mut() {
             button.draw_text.set_dyn_instance(cx, id!(failing), &[u8::from(report.fail > 0) as f32]);
             button.draw_text.set_dyn_instance(cx, id!(unknown), &[u8::from(report.unknown > 0) as f32]);
@@ -682,22 +489,12 @@ pub fn sync_requirements(cx: &mut Cx, bar: &WidgetRef, shown: Option<&ReqShown>)
     }
 }
 
-fn set_requirement_counts(cx: &mut Cx, bar: &WidgetRef, met: usize, total: usize) {
-    if let Some(mut space) = bar.widget(cx, ids!(requirement_space)).borrow_mut::<FabRequirementSpace>() {
-        space.full.text = Some(format!("Requirements {met}/{total}"));
-    }
-    if let Some(mut fit) = bar.child(id!(fit)).borrow_mut::<FabCaptionFit>() {
-        fit.count.text = Some(format!("{met}/{total}"));
-    }
-    bar.tip(cx, ids!(chip_row.requirements_tip)).set_text(&format!("What the project requires: {met} of {total} met"));
-}
-
 /// Pin the save status in the caption's job slot. Clearing it restores
 /// the strip's ordinary job selection and tooltip.
 pub fn quit_status(cx: &mut Cx, bar: &WidgetRef, text: Option<&str>) {
-    let fit = bar.child(id!(fit));
-    let Some(mut fit) = fit.borrow_mut::<FabCaptionFit>() else { return };
-    let tip = fit.view.widget(cx, ids!(jobs_tip));
+    let slot = bar.widget(cx, ids!(right.jobs));
+    let Some(mut slot) = slot.borrow_mut::<FabJobsSlot>() else { return };
+    let tip = slot.view.widget(cx, ids!(jobs_tip));
     let line = tip.child(id!(quit_line));
     line.set_visible(cx, text.is_some());
     tip.child(id!(strip)).set_visible(cx, text.is_none());
@@ -705,229 +502,25 @@ pub fn quit_status(cx: &mut Cx, bar: &WidgetRef, text: Option<&str>) {
         line.set_text(cx, text);
         tip.as_tip().set_text(text);
     } else {
-        fit.tip_version = None;
+        slot.tip_version = None;
     }
-    drop(fit);
+    drop(slot);
     bar.redraw(cx);
 }
 
 /// Bring the caption up to date with its model (before a draw).
 pub fn sync(cx: &mut Cx, bar: &WidgetRef, caption: &Caption) {
-    bar.label(cx, ids!(left.title.doc_name)).set_text(cx, &caption.title);
-    bar.label(cx, ids!(left.title.doc_state)).set_text(cx, &caption.info);
+    bar.label(cx, ids!(middle.title.doc_name)).set_text(cx, &caption.title);
+    bar.label(cx, ids!(middle.title.doc_state)).set_text(cx, &caption.info);
     bar.widget(cx, ids!(also)).set_visible(cx, caption.also_open);
-    let space = bar.widget(cx, ids!(requirement_space));
-    let chip = bar.widget(cx, ids!(requirements));
-    if let Some(mut slot) = space.borrow_mut::<FabRequirementSpace>() {
-        slot.chip = chip;
-    }
-    if let Some(mut fit) = bar.child(id!(fit)).borrow_mut::<FabCaptionFit>() {
-        let strip = fit.view.widget(cx, ids!(strip));
-        let line_fit = strip.child(id!(line_fit));
-        line_fit.borrow_mut::<FabJobLineFit>().unwrap().pop = strip.child(id!(pop));
-        if let Some(mut strip) = strip.borrow_mut::<JobStrip>() {
-            // The inherited popover is the first child until Fab adds its pre-draw measurement.
-            if let Some(index) = strip.child_index(&line_fit) {
-                strip.swap_child(0, index);
-            }
-        }
-        fit.space = space;
-        fit.starts = bar.child(id!(starts));
-        fit.chip_row = bar.child(id!(chip_row));
-    }
-    let right = bar.widget(cx, ids!(right));
     if let Some(mut tabs) = bar.widget(cx, ids!(workspaces)).borrow_mut::<FabWorkspaceTabs>() {
-        tabs.follow(right);
         tabs.set(cx, caption.tabs.clone(), caption.current, caption.temp.clone());
-    }
-    let code = bar.radio_button(cx, ids!(right.code_toggle));
-    code.set_visible(cx, caption.design);
-    if code.active(cx) != caption.code {
-        code.set_active(cx, caption.code, Animate::No);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ledctl_caption_folds_only_as_far_as_it_needs() {
-        use makepad_widgets_core::makepad_draw::cx_draw::CxDraw;
-        let mut cx = Cx::new(Box::new(|_, _| {}));
-        let root = cx.with_vm(|vm| {
-            makepad_widgets_core::script_mod_with(vm, WindowFamilies::default(), &[makepad_widgets_fab::fab_mod]);
-            makepad_xr_stream::serve_script_mod(vm);
-            crate::theme::script_mod(vm);
-            crate::ui::script_mod_kit(vm);
-            crate::ui::workspace_tabs::script_mod(vm);
-            crate::ui::job_strip::script_mod(vm);
-            super::script_mod(vm);
-            // Same space outside Fab's caption as the live macOS window (traffic lights and JIT ring).
-            let value = vm.eval(script! {
-                use mod.prelude.widgets_internal.*
-                use mod.widgets.*
-                View{width: Fill height: 38 flow: Right padding: Inset{left: 72 right: 32} caption := FabTopBar{}}
-            });
-            WidgetRef::script_from_value(vm, value)
-        });
-        let bar = root.widget(&cx, ids!(caption));
-        let chip = bar.widget(&cx, ids!(requirements));
-        chip.set_visible(&mut cx, true);
-        set_requirement_counts(&mut cx, &bar, 6, 11);
-        let mut caption = Caption::of(&AppState::default());
-        caption.info = "3 parts · 1 board · 60 solids".into();
-        caption.design = false;
-        let pass = DrawPass::new(&mut cx);
-        let mut list = DrawList2d::new(&mut cx);
-        let overlay = makepad_widgets_core::makepad_draw::overlay::Overlay { draw_list: DrawList::new(&mut cx) };
-        let mut draw_caption = |cx: &mut Cx, width| {
-            let size = dvec2(width, 38.0);
-            pass.set_size(cx, size);
-            cx.redraw_all();
-            let event = std::mem::take(&mut cx.new_draw_event);
-            let mut draw = CxDraw::new(cx, &event);
-            let mut frame = Cx2d::new(&mut draw);
-            frame.text_runs = Some(Default::default());
-            frame.begin_pass(&pass, Some(1.0));
-            list.begin_always(&mut frame);
-            overlay.begin(&mut frame);
-            frame.begin_root_turtle(size, makepad_widgets_core::Layout::flow_down());
-            root.draw_all(&mut frame, &mut Scope::empty());
-            overlay.end(&mut frame);
-            frame.end_pass_sized_turtle();
-            list.end(&mut frame);
-            frame.end_pass(&pass);
-            frame.text_runs.take().unwrap()
-        };
-        let failure = "method no_such_shape not found while rebuilding the enclosure and its mounting plate";
-        let mut failed_job = None;
-        let long_name = "ledctl enclosure";
-        let mut compact_controls = None;
-        let name_uid = bar.widget(&cx, ids!(doc_name)).widget_uid().0;
-        for (width, temporary, job, name) in [
-            (640.0, false, false, "ledctl"), (640.0, true, false, "ledctl"), (1600.0, true, false, "ledctl"),
-            (640.0, false, true, "ledctl"), (640.0, true, true, "ledctl"), (640.0, true, true, long_name),
-            (1600.0, true, true, long_name), (1600.0, false, true, "ledctl"), (640.0, false, false, "ledctl"),
-        ] {
-            if job && failed_job.is_none() {
-                let rebuild = jobs::JobSpec::new("AI: Rebuilding the plate").start();
-                failed_job = Some(rebuild.id());
-                rebuild.fail(failure, false);
-            } else if !job {
-                if let Some(id) = failed_job.take() { jobs::board().dismiss(id); }
-            }
-            // Design's code toggle beside the temporary tab leaves room for the status mark and ×.
-            caption.design = job && temporary;
-            caption.title = name.into();
-            caption.temp = temporary.then(|| TempTab {
-                id: WorkspaceId(99), title: if caption.design { "Design" } else { "Schematic" }.into(), ai: false,
-            });
-            sync(&mut cx, &bar, &caption);
-            let runs = draw_caption(&mut cx, width);
-            let drawn_name = runs.runs.iter().find(|run| run.owner == name_uid).expect("document name was drawn");
-            assert_eq!(drawn_name.truncated, width == 640.0 && name == long_name, "{name} at {width}");
-            let narrow = width == 640.0;
-            assert_eq!(chip.text(), if narrow { "6/11" } else { "Requirements 6/11" });
-            assert_eq!(bar.widget(&cx, ids!(doc_state)).visible(), !narrow);
-            let row = bar.widget(&cx, ids!(workspaces));
-            let left = row.area().rect(&cx);
-            let right = chip.area().rect(&cx);
-            assert!(left.size.x > 0.0 && right.size.x > 0.0 && left.pos.x + left.size.x <= right.pos.x,
-                "width {width}, temporary {temporary}: workspace row {left:?}, chip {right:?}");
-            let trailing = bar.widget(&cx, ids!(right)).area().rect(&cx);
-            assert!(right.pos.x + right.size.x <= trailing.pos.x + 0.001, "chip {right:?}, trailing controls {trailing:?}");
-            if job && temporary {
-                let title = bar.label(&cx, ids!(doc_name));
-                let title_rect = title.area().rect(&cx);
-                if narrow {
-                    let controls = [id!(cube), id!(compact_menu), id!(undo), id!(redo)]
-                        .map(|id| bar.widget(&cx, &[id]).area().rect(&cx));
-                    let [cube, menu, undo, redo] = controls;
-                    let mut end = 0.0;
-                    for rect in [cube, menu, title_rect, undo, redo, left, right] {
-                        assert!(rect.size.x > 0.0 && end <= rect.pos.x + 0.001, "{name}: {rect:?} after x={end}");
-                        end = rect.pos.x + rect.size.x;
-                    }
-                    let widths = controls.map(|rect| rect.size.x);
-                    if name == long_name {
-                        assert_eq!(compact_controls, Some(widths), "the name alone gives up width");
-                        let hover = Event::MouseMove(MouseMoveEvent {
-                            abs: title_rect.pos + title_rect.size * 0.5, lock_delta: Default::default(),
-                            window_id: WindowId(1, 1), modifiers: Default::default(), time: 1.0, handled: Default::default(),
-                        });
-                        let actions = cx.capture_actions(|cx| root.handle_event(cx, &hover, &mut Scope::empty()));
-                        let tips = cx.capture_actions(|cx| handle_actions(cx, &bar, &actions, &AppState::default()));
-                        assert_eq!(tips.find_widget_action_cast::<TipAction>(title.widget_uid()),
-                            TipAction::HoverIn(long_name.into(), title_rect));
-                    } else {
-                        compact_controls = Some(widths);
-                    }
-                }
-            }
-            if job {
-                let line = bar.widget(&cx, ids!(strip.pop.line));
-                let cancel = bar.widget(&cx, ids!(strip.pop.cancel));
-                let line_rect = line.area().rect(&cx);
-                let cancel_rect = cancel.area().rect(&cx);
-                assert!(line_rect.size.x > 0.0 && right.pos.x + right.size.x <= line_rect.pos.x + 0.001,
-                    "chip {right:?}, job line {line_rect:?}");
-                assert!(cancel.visible() && line_rect.pos.x + line_rect.size.x <= cancel_rect.pos.x + 0.001
-                    && cancel_rect.pos.x + cancel_rect.size.x <= trailing.pos.x + 0.001,
-                    "line {line_rect:?}, × {cancel_rect:?}, trailing controls {trailing:?}");
-                if narrow && temporary {
-                    assert_eq!(line.text(), "●", "only the status mark fits");
-                } else {
-                    assert!(line.text().ends_with('…'), "long job line has an ellipsis");
-                    if narrow { assert!(line.text().chars().count() < JOB_LINE_CHARS); }
-                }
-                let tip = bar.tip(&cx, ids!(jobs_tip));
-                assert_eq!(tip.borrow().unwrap().text, format!("AI: Rebuilding the plate failed: {failure}"));
-                assert!(tip.area().rect(&cx).contains(line_rect.pos + line_rect.size * 0.5), "the job mark is inside its tooltip");
-            }
-            if temporary {
-                let tabs = row.borrow::<FabWorkspaceTabs>().unwrap();
-                let tab = tabs.semantics_part_area(live_id!(fab_workspace_temp).0).rect(&cx);
-                assert!(tab.size.x > 0.0 && (tab.size.x <= left.size.y) == narrow, "temporary tab {tab:?}");
-                let close = tabs.semantics_part_area(live_id!(fab_workspace_temp_close).0);
-                assert_eq!(close.is_empty(), narrow, "only the sparkle is drawn in the compact temporary tab");
-            }
-            // The second-window icon has a reserved slot: nothing else in the caption changes
-            // when it comes and goes, so every text run keeps its owner, place and size.
-            let kept_tabs = caption.tabs.clone();
-            caption.tabs = (1..=4).map(|n| (WorkspaceId(n), format!("Workspace {n}"))).collect();
-            sync(&mut cx, &bar, &caption);
-            draw_caption(&mut cx, width);
-            let off_runs = draw_caption(&mut cx, width);
-            let places = |runs: &makepad_widgets_core::makepad_draw::cx_2d::TextRunSink| -> Vec<(u64, f64, f64, f64, f64, bool)> {
-                runs.runs.iter().map(|r| (r.owner, r.rect.pos.x, r.rect.pos.y, r.rect.size.x, r.rect.size.y, r.truncated)).collect()
-            };
-            let also = bar.widget(&cx, ids!(also));
-            let slot = bar.widget(&cx, ids!(also_slot));
-            let slot_off = slot.area().rect(&cx);
-            assert!(!also.visible() && slot_off.size.x == 28.0 && slot_off.size.y == 26.0, "{width}: the slot is reserved with the icon off ({slot_off:?})");
-            assert!(off_runs.runs.len() > 4, "{width}: the caption drew its text");
-            caption.also_open = true;
-            sync(&mut cx, &bar, &caption);
-            draw_caption(&mut cx, width);
-            let on_runs = draw_caption(&mut cx, width);
-            assert!(also.visible(), "{width}, job {job}: the icon shows while the plate is also open elsewhere");
-            assert_eq!(slot.area().rect(&cx), slot_off, "{width}, job {job}: the slot changed size or place with the icon on");
-            assert!(!also.area().rect(&cx).size.x.is_nan() && also.area().rect(&cx).size.x > 0.0, "{width}: the icon draws inside its slot");
-            assert_eq!(places(&on_runs), places(&off_runs), "{width}, temporary {temporary}, job {job}: a text run moved or changed when the icon came");
-            caption.tabs = kept_tabs;
-            caption.also_open = false;
-            sync(&mut cx, &bar, &caption);
-        }
-        let line = bar.widget(&cx, ids!(jobs_tip.quit_line));
-        let line_id = line.widget_uid().0;
-        for text in [Some("Saving the plate… 4 s"), Some("Model host stopped. Last edits unsaved. Journal entries kept."), None] {
-            quit_status(&mut cx, &bar, text);
-            let runs = draw_caption(&mut cx, 1600.0);
-            assert_eq!(runs.runs.iter().any(|run| run.owner == line_id), text.is_some());
-            if let Some(text) = text { assert_eq!(line.text(), text); }
-        }
-    }
 
     #[test]
     fn caption_changes_with_each_displayed_input() {

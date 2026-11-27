@@ -181,7 +181,7 @@ pub fn why_open(board: &Board, reason: &Reason) -> String {
         Reason::NoRoom { layer, need, have, between, by, .. } => {
             let track = match need {
                 Measure::Len(w) => format!("its {} track", mm(*w)),
-                Measure::Qty(_) => "its track".to_owned(),
+                Measure::Qty(_) | Measure::VRange(_) => "its track".to_owned(),
             };
             let (a, b) = (sel_words(board, &between[0]), sel_words(board, &between[1]));
             if !by.is_empty() {

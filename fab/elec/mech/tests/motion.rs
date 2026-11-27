@@ -17,7 +17,7 @@ fn fields(pairs: &[(&str, &str)]) -> Fields {
 fn comp(id: u32, refdes: &str, footprint: &Arc<Footprint>, part_fields: Fields, own: Fields) -> Component {
     let part = Arc::new(PartDef {
         name: "imu".into(), kind: PartKind::of_name("imu"), symbol: Symbol::default(),
-        footprint: Some(footprint.clone()), body: None, pins: Vec::new(), fields: part_fields, emitter: None, gpio: None,
+        footprint: Some(footprint.clone()), body: None, pins: Vec::new(), fields: part_fields, emitter: None, gpio: None, lifecycle: None, approved: false,
     });
     Component {
         id: CompId(id), path: refdes.to_lowercase(), refdes: refdes.into(), ref_kind: Default::default(), part, value: None,

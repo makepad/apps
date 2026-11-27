@@ -96,6 +96,18 @@ script_mod! {
         }
     }
 
+    // A marquee being dragged: a faint accent wash, its edge in the accent.
+    mod.draw.DrawToolMarquee = mod.draw.DrawToolPanel{
+        color: vec4(0.3, 0.6, 1.0, 1.0)
+        pixel: fn() {
+            let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+            sdf.rect(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0)
+            sdf.fill_keep(vec4(self.color.xyz, 0.12))
+            sdf.stroke(vec4(self.color.xyz, 0.85), 1.0)
+            return sdf.result
+        }
+    }
+
     mod.widgets.FabToolOverlayBase = #(FabToolOverlay::register_widget(vm))
     mod.widgets.FabToolOverlay = set_type_default() do mod.widgets.FabToolOverlayBase{
         width: Fill
@@ -113,6 +125,7 @@ script_mod! {
         draw_line: mod.draw.DrawToolLine{}
         draw_marker: mod.draw.DrawToolMarker{}
         draw_panel: mod.draw.DrawToolPanel{}
+        draw_marquee: mod.draw.DrawToolMarquee{ color: fab.color_accent }
         draw_text: mod.draw.DrawText{
             text_style: theme.font_bold{
                 font_size: fab.font_size_small
@@ -239,6 +252,8 @@ pub struct FabToolOverlay {
     #[live]
     draw_panel: DrawToolPanel,
     #[live]
+    draw_marquee: DrawToolPanel,
+    #[live]
     draw_text: DrawText,
     #[live]
     draw_text_small: DrawText,
@@ -319,16 +334,10 @@ impl FabToolOverlay {
     fn draw_picks(&mut self, cx: &mut Cx2d, state: &AppState, proj: &ViewProjector, rect: Rect) {
         use crate::tools::picks::on_plate;
         let picks = &state.picks;
-        // the kind filter, while picks are made
+        // the commands the picks take (Round, Chamfer), while picks are made: the one running lit.
+        // The kind filter is the plate view's tool row's (`stage.rs`), not drawn here.
         if crate::tools::picks::active(state) {
             let controls = picks::strip_view(state, self.pane, rect);
-            for (r, kind) in crate::tools::picks::strip(controls) {
-                let on = kind == picks.filter;
-                self.draw_panel.color = if on { vec4(self.color_accent.x, self.color_accent.y, self.color_accent.z, 0.9) } else { vec4(0.06, 0.06, 0.07, 0.8) };
-                self.draw_panel.draw_abs(cx, r);
-                self.small_text(cx, r.pos + dvec2(9.0, 5.0), kind.label(), if on { vec4(1.0, 1.0, 1.0, 1.0) } else { self.color_measure });
-            }
-            // the commands the picks take (Round, Chamfer): the one running lit
             let running = state.params.command.as_ref().map(|c| c.param.label.as_str());
             let blocked = state.pick_tool_block_reason().is_some();
             for (r, label, _) in crate::tools::picks::commands(controls, &picks.list) {
@@ -451,14 +460,10 @@ impl FabToolOverlay {
     /// that row or closes the list, Esc closes it.
     fn other_event(&mut self, cx: &mut Cx, event: &Event, state: &mut AppState) {
         use crate::tools::picks::PickAction;
-        // a press on the kind filter's strip sets it
+        // a press on a pick command's box runs it
         if let Event::MouseDown(e) = event {
             if crate::tools::picks::active(state) {
                 let controls = picks::strip_view(state, self.pane, self.area.rect(cx));
-                if let Some((_, kind)) = crate::tools::picks::strip(controls).into_iter().find(|(r, _)| r.contains(e.abs)) {
-                    cx.action(PickAction::Filter(kind));
-                    return;
-                }
                 if let Some((.., command)) = crate::tools::picks::commands(controls, &state.picks.list).into_iter().find(|(r, ..)| r.contains(e.abs)) {
                     cx.action(crate::api::ShellAction::Command(command.into()));
                     return;
@@ -1239,6 +1244,12 @@ impl Widget for FabToolOverlay {
                 } else {
                     self.draw_marks(cx, state, &proj, rect);
                     self.draw_picks(cx, state, &proj, rect);
+                    // a marquee being dragged in this view
+                    if let Some((_, a, b)) = state.ui.marquee.filter(|(pane, _, _)| *pane == self.pane) {
+                        let lo = dvec2(a.x.min(b.x), a.y.min(b.y));
+                        let hi = dvec2(a.x.max(b.x), a.y.max(b.y));
+                        self.draw_marquee.draw_abs(cx, Rect { pos: lo, size: hi - lo });
+                    }
                     self.draw_mass(cx, state, &proj);
                     let readout = self.draw_brush(cx, state, &proj);
                     wants_frames = readout || session::with(|s| s.wants_frames());

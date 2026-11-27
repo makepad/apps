@@ -1,0 +1,7 @@
+[package]
+name = "makepad-doc-font-names"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Document font family names and their aliases"

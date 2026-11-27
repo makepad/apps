@@ -5,6 +5,8 @@
 //! row, moves its files to the Trash. The home is seeded the way an earlier version left it (a
 //! recent list, an image-to-mesh result) with plain box-script plates, one with a picture.
 
+#[path = "common/render_mode.rs"]
+mod render_mode;
 #[path = "common/wait.rs"]
 mod idle_wait;
 use idle_wait::wait_poll;
@@ -74,19 +76,23 @@ fn wait_for(app: &TestApp, what: &str, mut done: impl FnMut() -> bool) {
     app.wait_until(|| (!done()).then(|| what.to_string()));
 }
 
-/// The left column's tab bar, under the Plates tab.
-fn left_bar(app: &TestApp) -> makepad_test::Rect {
-    let nodes = app.widget_snapshot().nodes();
-    let plates = nodes.iter().find(|w| w.visible() && w.node.role == Role::Tab && w.node.name == "Plates").map(|w| w.node.bounds).expect("the Plates tab");
-    nodes.iter().filter(|w| w.visible() && w.node.role == Role::TabList).map(|w| w.node.bounds).find(|b| b.h < 60.0 && b.x <= plates.x && plates.x < b.x + b.w).expect("the left column's tab bar")
+/// The left column's tab bar owns the Plates tab, at either column width.
+fn left_bar(nodes: &[makepad_test::NodeMatch]) -> &makepad_test::NodeMatch {
+    let plates = nodes.iter().find(|w| w.visible() && w.role == Role::Tab && w.name == "Plates").expect("the Plates tab");
+    nodes.iter().find(|w| w.visible() && w.role == Role::TabList && w.children.contains(&plates.id)).expect("the left column's tab bar")
 }
 
-/// Plates, Parts, Features and the Slice view's tab, each whole in the left column's bar.
+/// Every visible tab of the left stack fits, including the Slice editor brought forward here.
 fn left_tabs_whole(app: &TestApp, when: &str) {
-    let bar = left_bar(app);
     let nodes = app.widget_snapshot().nodes();
-    for name in ["Plates", "Parts", "Features", "Slice"] {
-        let tab = nodes.iter().find(|w| w.visible() && w.node.role == Role::Tab && w.node.name == name).map(|w| w.node.bounds).unwrap_or_else(|| panic!("no {name} tab {when}"));
+    let owner = left_bar(&nodes);
+    let bar = owner.bounds;
+    let tabs: Vec<_> = nodes.iter().filter(|w| w.visible() && w.role == Role::Tab && owner.children.contains(&w.id)).collect();
+    for name in ["Plates", "Parts", "Slice"] {
+        assert!(tabs.iter().any(|w| w.name == name), "no {name} tab in the left bar {when}");
+    }
+    for w in tabs {
+        let (name, tab) = (&w.name, w.bounds);
         assert!(tab.y == bar.y && tab.x >= bar.x - 0.5 && tab.x + tab.w <= bar.x + bar.w + 0.5, "the {name} tab shows whole {when}: {tab:?} in the bar {bar:?}");
     }
 }
@@ -290,7 +296,8 @@ fn the_plates_panel_lists_opens_makes_finds_renames_removes_and_trashes_plates()
         app.locator(Selector::id("doc_name").name("Untitled")).wait_visible();
 
         // The search keeps the plates and demos whose names hold what is typed.
-        app.locator(Selector::id("input").name("Search plates")).click();
+        app.locator(Selector::role(Role::Button).name("Search plates")).wait_visible().press();
+        app.locator(Selector::role(Role::TextField).name("Search plates")).wait_visible();
         app.type_text("lat");
         wait_for(&app, "the search narrows the list", || listed(&app, "lattice") && !listed(&app, "saved") && !listed(&app, "Noise vase"));
         for _ in 0..3 {
@@ -324,15 +331,14 @@ fn the_plates_panel_lists_opens_makes_finds_renames_removes_and_trashes_plates()
 
         // The left tabs, the Slice view's among them, show whole at the column's width and with
         // the column dragged as narrow as it goes.
-        app.locator(Selector::id("rm_slice")).click();
-        app.locator(Selector::id("rm_slice")).wait_checked(true);
+        render_mode::pick(&app, "Sliced");
         app.locator(Selector::role(Role::Tab).name("Slice")).wait_visible();
         left_tabs_whole(&app, "at the column's width");
-        let bar = left_bar(&app);
+        let bar = left_bar(&app.widget_snapshot().nodes()).bounds;
         let mut drag = app.press_at((bar.x + bar.w) as f64 + 1.5, bar.y as f64 + 300.0);
         drag.move_by(-400.0, 0.0);
         drag.release();
-        wait_for(&app, "the column narrows", || left_bar(&app).w < bar.w - 10.0);
+        wait_for(&app, "the column narrows", || left_bar(&app.widget_snapshot().nodes()).bounds.w < bar.w - 10.0);
         left_tabs_whole(&app, "with the column as narrow as it goes");
     });
     std::fs::remove_dir_all(&home).expect("remove seeded test home after the owned app exits");

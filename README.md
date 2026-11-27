@@ -44,7 +44,7 @@ kit (`libs/explore_kit`) and the studio registry (`libs/studio_api`).
 
 ## Story's engine
 
-The engine Story shares with Stage and Makepad Work:
+The engine Story shares with Stage and Makepad Town:
 
 - **Motion** (`engine/motion`): motion graphics as Splash documents drawn on the GPU (kinetic type,
   shapes and SVG draw-ons, shader backgrounds, charts, UI mockups, voice- and beat-synced animation),
@@ -88,6 +88,18 @@ git pull
 
 The crates' path dependencies point into the surrounding checkout (`../../` from this
 repository's root), so the clone must sit at `apps/<dir>` of a Makepad checkout.
+
+### Makepad Town, kept up to date
+
+```sh
+cargo run -p makepad-run --release -- run makepad-town   # makepad run (JIT)
+```
+
+Under `makepad run`, Town keeps both checkouts (Makepad's and this one) on their upstream
+branches. When a peer runs a newer version, Town fetches each checkout's own upstream,
+fast-forwards both and reloads, or restarts if a change needs it. A call, share or recording
+always finishes first. A checkout with local changes or commits of its own is never moved, and
+Town says why it stopped following.
 
 ## License
 

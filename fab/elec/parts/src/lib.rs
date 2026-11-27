@@ -45,11 +45,16 @@ pub struct PartDef {
     pub emitter: Option<Emitter>,
     /// A part's pad electrics; `None` takes the simulator's generic profile.
     pub gpio: Option<GpioCard>,
+    /// Where the part is in its maker's life (`lifecycle: @nrnd`); `None` when unstated.
+    pub lifecycle: Option<Lifecycle>,
+    /// The person approved the part for designs (`approved: true`); only the person sets it.
+    pub approved: bool,
 }
-// Additive: `gpio` is written only when set, so a part without a card keeps its hash.
+// Additive: `gpio`, `lifecycle` and `approved` are written only when set, each behind its own tag
+// (`gpio`'s `Option` writes `1`), so a part without them keeps its hash.
 impl fab_elec_core::canon::Canon for PartDef {
     fn canon(&self, w: &mut fab_elec_core::canon::Writer) {
-        let PartDef { name, kind, symbol, footprint, body, pins, fields, emitter, gpio } = self;
+        let PartDef { name, kind, symbol, footprint, body, pins, fields, emitter, gpio, lifecycle, approved } = self;
         name.canon(w);
         kind.canon(w);
         symbol.canon(w);
@@ -61,6 +66,45 @@ impl fab_elec_core::canon::Canon for PartDef {
         if gpio.is_some() {
             gpio.canon(w);
         }
+        if let Some(lc) = lifecycle {
+            w.tag(2);
+            lc.canon(w);
+        }
+        if *approved {
+            w.tag(3);
+        }
+    }
+}
+
+/// A part's production lifecycle: active, not recommended for new designs, or obsolete.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Lifecycle {
+    Active,
+    Nrnd,
+    Obsolete,
+}
+canon_tags!(Lifecycle);
+
+impl Lifecycle {
+    const NAMED: [(&'static str, Lifecycle); 3] = [("active", Lifecycle::Active), ("nrnd", Lifecycle::Nrnd), ("obsolete", Lifecycle::Obsolete)];
+    /// The lifecycle a name gives (`"nrnd"`, as `@nrnd` or a string); `None` for any other name.
+    pub fn of_name(name: &str) -> Option<Self> {
+        Self::NAMED.iter().find(|(n, _)| *n == name).map(|(_, l)| *l)
+    }
+    /// The name (`of_name`'s inverse).
+    pub fn name(self) -> &'static str {
+        Self::NAMED.iter().find(|(_, l)| *l == self).map_or("", |(n, _)| n)
+    }
+}
+
+/// How far down a search a lifecycle puts a part: active first, then unstated, then not
+/// recommended, then obsolete.
+pub fn lifecycle_rank(lifecycle: Option<Lifecycle>) -> u8 {
+    match lifecycle {
+        Some(Lifecycle::Active) => 0,
+        None => 1,
+        Some(Lifecycle::Nrnd) => 2,
+        Some(Lifecycle::Obsolete) => 3,
     }
 }
 

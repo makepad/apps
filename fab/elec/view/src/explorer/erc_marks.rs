@@ -16,6 +16,7 @@ use std::collections::HashSet;
 pub(super) fn erc_marks(
     pins: &[PinHit],
     parts: impl Iterator<Item = (u32, [f64; 4])>,
+    frames: impl Iterator<Item = (u32, [f64; 4])>,
     wires: impl Iterator<Item = (Option<u32>, [f64; 2], [f64; 2])>,
     violations: &[Violation],
     unit: BoardId,
@@ -23,6 +24,7 @@ pub(super) fn erc_marks(
 ) -> Vec<LineInst> {
     let mut named = HashSet::new();
     let mut lone_nets = HashSet::new();
+    let mut blocks = HashSet::new();
     let mut comps = HashSet::new();
     let mut nets = HashSet::new();
     for finding in violations.iter().filter(|v| v.unit == Some(unit) && v.at.is_none()) {
@@ -31,6 +33,7 @@ pub(super) fn erc_marks(
                 Sel::Pin(pin) if pin.board == unit => { named.insert((pin.comp.0, u32::from(pin.pin.0))); }
                 Sel::Net(net) if net.board == unit && finding.kind == CheckKind::SinglePinNet => { lone_nets.insert(net.net.0); }
                 Sel::Net(net) if net.board == unit => { nets.insert(net.net.0); }
+                Sel::Block(board, id) if *board == unit => { blocks.insert(id.0); }
                 Sel::Comp(comp) if comp.board == unit => { comps.insert(comp.comp.0); }
                 _ => {}
             }
@@ -63,6 +66,10 @@ pub(super) fn erc_marks(
         if !comps.remove(&node) { continue; }
         // its lower left vertex on the body's top right corner, as a pin's touches its box
         triangle(&mut line, body[2] as f32 + 1.0, body[3] as f32);
+    }
+    for (id, frame) in frames {
+        if blocks.is_empty() { break; }
+        if blocks.remove(&id) { triangle(&mut line, frame[2] as f32, frame[3] as f32); }
     }
     for (net, a, b) in wires {
         if nets.is_empty() { break; }
@@ -101,7 +108,7 @@ mod tests {
         let finding = |kind, board, items| Violation::new(kind, Severity::Error, Some(board), items, "erc", String::new());
         let placed = finding(CheckKind::UnconnectedPin, unit, vec![pin(unit, 3)]);
         let tokens = Tokens::for_theme(false);
-        let marks = |findings: &[Violation]| erc_marks(&pins, std::iter::empty(), std::iter::empty(), findings, unit, tokens);
+        let marks = |findings: &[Violation]| erc_marks(&pins, std::iter::empty(), std::iter::empty(), std::iter::empty(), findings, unit, tokens);
         let one = marks(std::slice::from_ref(&placed));
         assert_eq!(one.len(), 9, "a placed pin gets a box, a triangle and an exclamation mark");
         assert!(one.iter().all(|line| line.c.ink == tokens.warning), "every stroke uses warning ink");
@@ -124,19 +131,21 @@ mod tests {
         assert!(marks(&[placed.at(P::ZERO)]).is_empty(), "a board finding leaves the sheet clear");
         let lone = |net| finding(CheckKind::SinglePinNet, unit, vec![Sel::Net(NetRef { board: unit, net: NetId(net) })]);
         let on_net = [PinHit { net: Some(5), ..pins[0].clone() }];
-        let on_net_marks = |findings: &[Violation]| erc_marks(&on_net, std::iter::empty(), std::iter::empty(), findings, unit, tokens);
+        let on_net_marks = |findings: &[Violation]| erc_marks(&on_net, std::iter::empty(), std::iter::empty(), std::iter::empty(), findings, unit, tokens);
         assert_eq!(on_net_marks(&[lone(5)]), one, "a net with one pin marks that pin");
         assert!(on_net_marks(&[lone(6)]).is_empty(), "another net's single pin leaves this pin clear");
 
         // A small sheet: part 2's body, net 7 drawn as two pieces (a level, then an upright), net 8 as one.
         let parts = [(2, [0.0, 0.0, 3.0, 2.0])];
         let wires = [(Some(7), [0.0, 4.0], [4.0, 4.0]), (Some(7), [4.0, 4.0], [4.0, 7.0]), (Some(8), [10.0, 0.0], [12.0, 0.0])];
-        let sheet = |findings: &[Violation]| erc_marks(&[], parts.iter().copied(), wires.iter().copied(), findings, unit, tokens);
+        let sheet = |findings: &[Violation]| erc_marks(&[], parts.iter().copied(), std::iter::once((2, [0., 0., 4., 6.])), wires.iter().copied(), findings, unit, tokens);
         let near = |a: &[f32], b: [f32; 2]| (a[0] - b[0]).abs() < 1e-5 && (a[1] - b[1]).abs() < 1e-5;
         let badge = |marks: &[LineInst], right: f32, base: f32| marks.len() == 5
             && marks.iter().all(|line| line.dash == [0.0; 2] && line.c.ink == tokens.warning)
             && marks.iter().any(|line| near(&line.seg[..2], [right, base]) && near(&line.seg[2..], [right - 1.0, base]));
         let net = |kind, net| finding(kind, unit, vec![Sel::Net(NetRef { board: unit, net: NetId(net) })]);
+        assert_eq!(sheet(&[finding(CheckKind::OpenPort, unit, vec![Sel::Block(unit, fab_elec_core::BlockId(2))])]).len(), 5,
+            "a finding on a placed block must draw its frame badge");
         let undriven = sheet(&[net(CheckKind::PowerNotDriven, 7)]);
         assert!(badge(&undriven, 2.0 + 1.3, 4.0 + 0.3),
             "a net finding badges the net's first wire piece once, above and right of its middle: {undriven:?}");

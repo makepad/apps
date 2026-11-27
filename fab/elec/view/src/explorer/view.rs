@@ -31,6 +31,9 @@ use crate::canvas::{
 };
 use crate::live::mini::MiniSubs;
 use crate::live::sim::SimAction;
+use crate::req_list::ReqDraft;
+use fab_elec_explore::SheetMode;
+use makepad_widgets_core::tip::TipWidgetRefExt;
 use crate::live::flags::ProbeFlags;
 use crate::live::probe::{host_bench, probe_label, probe_on_click, probe_target, ProbeGesture};
 use crate::canvas::tools::{draw_bar, draw_float, draw_strip, over_strip, Armed, ToolClicks};
@@ -65,6 +68,8 @@ use std::sync::Arc;
 mod card;
 pub use card::ShowModelSources;
 mod follow;
+mod review;
+use review::SheetLayers;
 mod paste;
 mod probe_flags;
 use card::{starts_value, Card};
@@ -160,12 +165,14 @@ impl CanvasItems for WireItems<'_> {
 }
 
 script_mod! {
+    #(crate::canvas::pane::review_chip::script_mod(vm))
     use mod.prelude.widgets.*
 
     mod.widgets.ExplorerView = set_type_default() do #(ExplorerView::register_widget(vm)) {
         width: Fill
         height: Fill
         flags: mod.widgets.ProbeFlags{}
+        review_chip: mod.widgets.ProposalChip{}
         // The host's tool strip (`explorer::tools` names its parts); none by default.
         tools: View{width: Fit height: Fit visible: false}
         // The host's Library float (`explorer::tools` names its parts); none by default.
@@ -519,6 +526,16 @@ pub struct ExplorerView {
     /// A host feeds this view (`set_design`); until one does, it follows `ElecLive`.
     #[rust]
     pinned: bool,
+    #[live]
+    review_chip: WidgetRef,
+    #[rust]
+    review: Option<review::Comparison>,
+    /// Last static picture while a pane first opened in comparison awaits its live unit.
+    #[rust]
+    return_picture: Option<(review::StaticSheet, CanvasLive)>,
+    /// A source switch keeps a placed camera through the next live layout.
+    #[rust]
+    keep_camera_gen: Option<u64>,
     /// The button a pointer holds down in the playing run (a live press), released with the
     /// pointer; the click that ends it does not pick the part.
     #[rust]
@@ -604,6 +621,12 @@ pub struct ExplorerView {
     #[rust]
     strip_shown: Option<Armed<CircuitTool>>,
     #[rust]
+    sheet_mode: SheetMode,
+    #[rust]
+    laid_mode: SheetMode,
+    #[rust]
+    arch_draft: Option<ReqDraft>,
+    #[rust]
     sheet_probes: probe_flags::SheetProbes,
     /// A probe carried over the sheet: the flag its drop would make, drawn before the drop.
     #[rust]
@@ -664,7 +687,7 @@ pub struct ExplorerView {
     #[rust]
     state: SceneState,
     #[rust]
-    lines: CanvasLayer,
+    ink: SheetLayers,
     /// Pin warnings for the current sheet and findings generation.
     #[rust]
     erc_marks: CanvasLayer,
@@ -689,8 +712,6 @@ pub struct ExplorerView {
     bridge_warm: CanvasLayer,
     #[rust]
     pin_warm: CanvasLayer,
-    #[rust]
-    boxes: CanvasLayer,
     /// Block backgrounds move below the light, including when their whole subtree is dragged.
     #[rust]
     frame_rows: Vec<BoxInst>,
@@ -701,12 +722,6 @@ pub struct ExplorerView {
     glow_rows: Vec<BoxInst>,
     #[rust]
     glows: CanvasLayer,
-    #[rust]
-    arcs: CanvasLayer,
-    #[rust]
-    bridges: CanvasLayer,
-    #[rust]
-    leaders: CanvasLayer,
     #[rust]
     chip: CanvasLayer,
     #[rust]
@@ -961,6 +976,12 @@ impl ExplorerView {
     /// The holder calls this before dropping the view because Drop has no Cx.
     /// Calling it twice is harmless.
     pub fn release(&mut self, cx: &mut Cx) {
+        if let Some(mut review) = self.review.take() { review.release(cx); }
+        self.return_picture = None;
+        self.release_live(cx);
+    }
+
+    fn release_live(&mut self, cx: &mut Cx) {
         let _ = self.marquee.finish(cx);
         if let Some(cmd) = self.live_press.up() { cx.action(SimAction::Cmd(cmd)); }
         if let Some(mut states) = self.press_states.take() { states.release(cx); }
@@ -987,16 +1008,16 @@ impl ExplorerView {
     /// `rows` must index `design.units[unit].circuit`. The host feeds the view from now on.
     pub fn set_design(&mut self, cx: &mut Cx, design: Arc<Design>, unit: usize, rows: RowIndex) {
         self.pinned = true;
-        self.load(cx, design, unit, rows);
+        self.load(cx, design, unit, rows, false, None);
     }
 
-    fn load(&mut self, cx: &mut Cx, design: Arc<Design>, unit: usize, rows: RowIndex) {
+    fn load(&mut self, cx: &mut Cx, design: Arc<Design>, unit: usize, rows: RowIndex, returning: bool, prepared: Option<Laid>) {
         self.close_value_edit(cx);
         self.copied = None;
         let previous = self.design.as_ref().and_then(|design| design.units.get(self.unit)).map(|unit| (unit.id, &unit.name));
         let next = design.units.get(unit).map(|unit| (unit.id, &unit.name));
         if previous != next {
-            self.release(cx);
+            if returning { self.release_live(cx); } else { self.release(cx); }
             self.selected.clear();
             self.card = None;
             self.card_press = None;
@@ -1011,7 +1032,9 @@ impl ExplorerView {
         self.rows = Arc::new(rows);
         self.unit = unit;
         self.rebind_selection(cx);
-        self.forget_sheet(cx);
+        self.forget_sheet(cx, returning);
+        if returning { self.keep_camera_gen = Some(self.gen); }
+        if self.install_prepared(cx, prepared) { return; }
         let opts = self.layout_opts();
         self.layout_jobs.request(cx, design, unit, SheetHints::default(), None, None, Keep::default(), self.gen, opts);
         self.draw_bg.redraw(cx);
@@ -1033,12 +1056,12 @@ impl ExplorerView {
         self.followed = None;
         self.rows = Arc::default();
         self.unit = 0;
-        self.forget_sheet(cx);
+        self.forget_sheet(cx, false);
         self.draw_bg.redraw(cx);
     }
 
     /// Forget everything laid out, revealed, hovered or held on the sheet shown before.
-    fn forget_sheet(&mut self, cx: &mut Cx) {
+    fn forget_sheet(&mut self, cx: &mut Cx, keep_camera: bool) {
         self.sheet_design = None;
         self.probe_lit = None;
         self.sheet_rows = Arc::default();
@@ -1049,7 +1072,7 @@ impl ExplorerView {
         self.drop_reveal_live(cx);
         self.pending_reveal = None;
         self.fit_after_home = false;
-        self.pane = CanvasPane::with_max_ppu(SHEET_MAX_PPU);
+        if !keep_camera { self.pane = CanvasPane::with_max_ppu(SHEET_MAX_PPU); }
         self.scene = Scene::default();
         self.legible = 1.0;
         self.legible_pending = true;
@@ -1091,6 +1114,19 @@ impl ExplorerView {
     /// Re-layout without resetting navigation, focus, hover or the assembly clock.
     /// `rows` belongs to this design's displayed unit, not the preceding sheet.
     pub fn update_design(&mut self, cx: &mut Cx, design: Arc<Design>, rows: RowIndex) {
+        self.change_design(cx, design, rows, false, None);
+    }
+
+    fn install_prepared(&mut self, cx: &mut Cx, prepared: Option<Laid>) -> bool {
+        if let Some(mut laid) = prepared {
+            laid.gen = self.gen;
+            self.apply_layout(cx, laid);
+            return true;
+        }
+        false
+    }
+
+    fn change_design(&mut self, cx: &mut Cx, design: Arc<Design>, rows: RowIndex, returning: bool, prepared: Option<Laid>) {
         if self.value_edit.as_ref().is_some_and(|edit| {
             let previous = self.design.as_ref().and_then(|d| d.units.get(self.unit))
                 .filter(|unit| unit.id == edit.unit).and_then(|unit| unit.circuit.comps.get(edit.comp.0 as usize));
@@ -1125,6 +1161,8 @@ impl ExplorerView {
         self.drag.design_updated(self.gen);
         self.reveal_gen += 1;
         self.pending_reveal = None;
+        if returning { self.keep_camera_gen = Some(self.gen); }
+        if self.install_prepared(cx, prepared) { return; }
         let kept = self.carry_layout(&design);
         let keep = Keep { shift: self.shift, block: self.drag.anchor() };
         let opts = self.layout_opts();
@@ -1155,7 +1193,7 @@ impl ExplorerView {
     /// Layout options for the pane as last drawn.
     fn layout_opts(&self) -> Opts {
         let opts = Opts::default();
-        Opts { aspect: if self.pane_aspect > 0.0 { self.pane_aspect } else { opts.aspect }, ..opts }
+        Opts { mode: self.sheet_mode, aspect: if self.pane_aspect > 0.0 { self.pane_aspect } else { opts.aspect }, ..opts }
     }
 
     /// A sheet whose unconnected parts were packed for another pane shape is laid out again for
@@ -1172,6 +1210,10 @@ impl ExplorerView {
         {
             return;
         }
+        self.relayout_sheet(cx);
+    }
+
+    fn relayout_sheet(&mut self, cx: &mut Cx) {
         let Some(design) = self.design.clone() else { return };
         self.gen += 1;
         self.drag.design_updated(self.gen);
@@ -1181,6 +1223,40 @@ impl ExplorerView {
         let keep = Keep { shift: self.shift, block: None };
         let opts = self.layout_opts();
         self.layout_jobs.request(cx, design, self.unit, SheetHints::default(), None, None, keep, self.gen, opts);
+    }
+
+    fn toggle_blocks(&mut self, cx: &mut Cx) {
+        self.sheet_mode = if self.sheet_mode == SheetMode::Blocks { SheetMode::Schematic } else { SheetMode::Blocks };
+        self.tools.radio_button(cx, ids!(a_blocks)).set_active(cx, self.sheet_mode == SheetMode::Blocks, Animate::No);
+        if self.reveal.is_some() { self.leave_reveal(cx, false); }
+        self.relayout_sheet(cx);
+        self.draw_bg.redraw(cx);
+    }
+
+    fn sync_arch_button(&mut self, cx: &mut Cx) {
+        let new = cx.get_global_ref::<ReqDraft>();
+        if self.arch_draft.is_some() && self.arch_draft.as_ref() == new { return; }
+        let draft = new.cloned().unwrap_or_default();
+        if self.arch_draft.as_ref() == Some(&draft) { return; }
+        let working = draft.view.as_ref().is_some_and(|v| !v.done);
+        let note = if draft.slot == Some("architecture") { draft.view.as_ref().map(|v| v.text.as_str()) }
+            else if working { Some("Another stage is being drafted") } else { None };
+        self.tools.button(cx, ids!(a_arch)).set_enabled(cx, !working && draft.admit.is_ok());
+        self.tools.tip(cx, ids!(a_arch_tip)).set_text(note.or(draft.admit.err()).unwrap_or("Draft architecture"));
+        self.arch_draft = Some(draft);
+    }
+
+    fn layout_result(&mut self, cx: &mut Cx, result: LayoutResult) {
+        match result {
+            LayoutResult::Layout(laid) => self.apply_layout(cx, laid),
+            LayoutResult::Reveal(revealed) => self.apply_reveal(cx, revealed),
+            LayoutResult::Drop(Dropped { token, drop }) => {
+                if let Some(tag) = self.drag.dropped(cx, self.uid, token, drop, &mut self.scene) {
+                    self.hold_drag(cx, tag);
+                }
+            }
+            LayoutResult::Kept(Kept { token, hints }) => self.kept(cx, token, hints),
+        }
     }
 
     fn apply_layout(&mut self, cx: &mut Cx, laid: Laid) {
@@ -1194,7 +1270,8 @@ impl ExplorerView {
             self.pending_sheet = Some(laid);
             return;
         }
-        let Laid { gen, sheet, kept, trees, pieces, shift, ms, aspect } = laid;
+        let Laid { gen, sheet, kept, trees, pieces, shift, ms, aspect, mode } = laid;
+        self.laid_mode = mode;
         self.laid_aspect = aspect;
         let first = self.applied_gen < self.design_gen;
         self.applied_gen = gen;
@@ -1237,7 +1314,7 @@ impl ExplorerView {
             self.ghost_take = true;
         }
         let bounds_before = self.sheet.bounds;
-        self.sheet = Arc::new(sheet);
+        self.sheet = sheet;
         self.sheet_design = self.design.clone();
         self.shown_keep = kept;
         self.sheet_rows = self.rows.clone();
@@ -1253,14 +1330,15 @@ impl ExplorerView {
         self.dirty = true;
         log!("fab.explorer: layout {} parts in {:.2} ms (worker)",
             self.sheet.parts.iter().filter(|p| p.placed).count(), ms);
-        if first {
+        let returning = self.keep_camera_gen.take_if(|g| gen >= *g).is_some();
+        if first && !returning {
             self.replay_assemble(cx);
         }
         // A relayout for the pane's shape refits; so does any new layout that moves the sheet's
         // bounds while the camera keeps its fit (a design update after the first fit), unless the
         // person's own edit is under way or just landed (a paste stays under the pointer).
         let follow = self.pane.keeps_fit && self.sheet.bounds != bounds_before && !editing;
-        if (self.refit_after_layout || follow) && gen == self.gen && !self.field_open() {
+        if !returning && (self.refit_after_layout || follow) && gen == self.gen && !self.field_open() {
             self.refit_after_layout = false;
             if self.opening_view.is_none() {
                 self.fit(cx);
@@ -2342,7 +2420,7 @@ impl ExplorerView {
                         StripAction::Rail(name) => self.rail(name),
                         StripAction::PowerFlag => power_flag_entry(cx)
                             .map(|entry| Carried::Part(Arc::new(template_of(entry)), "Power flag".into(), EntryKey { name: entry.name.clone(), lib: entry.lib.clone() })),
-                        StripAction::PowerMenu { .. } => None,
+                        StripAction::PowerMenu { .. } | StripAction::DraftArchitecture => None,
                     })
                 });
                 if let Some(carried) = carried {
@@ -3422,7 +3500,7 @@ impl ExplorerView {
         let Some(templates) = &self.templates else { return };
         let mut lines = Vec::with_capacity(self.scene.lines.len() * templates.line.slots());
         for row in &self.scene.lines { templates.line.append(&mut lines, row); }
-        self.lines.set(templates.line.slots(), lines);
+        self.ink.lines.set(templates.line.slots(), lines);
         let mut minis = Vec::with_capacity(self.scene.minis.len() * templates.mini.slots());
         for row in &self.scene.minis { templates.mini.append(&mut minis, row); }
         self.minis.set(templates.mini.slots(), minis);
@@ -3514,31 +3592,11 @@ impl ExplorerView {
         self.frame_rows = self.scene.boxes.drain(..grounds).collect();
         self.scene.glow_range = 0..0;
         self.drag.rebuild(&mut self.scene, templates, tokens);
-        let mut lines = Vec::with_capacity(self.scene.lines.len() * templates.line.slots());
-        let mut boxes = Vec::with_capacity(self.scene.boxes.len() * templates.boxes.slots());
-        let mut arcs = Vec::with_capacity(self.scene.arcs.len() * templates.arc.slots());
-        let mut bridges = Vec::with_capacity(self.scene.bridges.len() * templates.bridge.slots());
-        let mut leaders = Vec::with_capacity(self.scene.leaders.len() * templates.line.slots());
+        self.ink.publish(&self.scene, templates);
         let mut minis = Vec::with_capacity(self.scene.minis.len() * templates.mini.slots());
         let mut pins = Vec::with_capacity(self.scene.pins.len() * templates.pin.slots());
-        for row in &self.scene.lines {
-            templates.line.append(&mut lines, row);
-        }
-        for row in &self.scene.boxes { templates.boxes.append(&mut boxes, row); }
-        for row in &self.scene.arcs {
-            templates.arc.append(&mut arcs, row);
-        }
-        for row in &self.scene.bridges { templates.bridge.append(&mut bridges, row); }
-        for row in &self.scene.leaders {
-            templates.line.append(&mut leaders, row);
-        }
         for row in &self.scene.minis { templates.mini.append(&mut minis, row); }
         for row in &self.scene.pins { templates.pin.append(&mut pins, row); }
-        self.lines.set(templates.line.slots(), lines);
-        self.boxes.set(templates.boxes.slots(), boxes);
-        self.arcs.set(templates.arc.slots(), arcs);
-        self.bridges.set(templates.bridge.slots(), bridges);
-        self.leaders.set(templates.line.slots(), leaders);
         self.minis.set(templates.mini.slots(), minis);
         self.pins.set(templates.pin.slots(), pins);
         self.publish_drag_pins();
@@ -3571,11 +3629,7 @@ impl ExplorerView {
 
     fn texts(&mut self, cx: &mut Cx2d, now: f64, overlay: bool) {
         if !overlay {
-            let raw = TEXT_FLOOR_POINTS / text_points(sheet::TEXT_REFDES, self.pane.cam.px_per_unit);
-            // Steps of 2^(1/8) (about 9%), rounded up: a zoom always gets the same labels whatever
-            // the way there (a fit's flight relabels on its way), never under the floor, and a
-            // continuous zoom relabels once a step.
-            let want = if raw <= 1.0 || raw > FLOOR_MAX_SCALE { 1.0 } else { ((raw.log2() * 8.0).ceil() / 8.0).exp2() };
+            let want = label_scale(&self.pane.cam);
             if self.legible_pending || want != self.legible {
                 let start = Cx::monotonic_now();
                 let labels = legible_labels(&self.sheet, want);
@@ -3606,12 +3660,7 @@ impl ExplorerView {
                 Some(turn) => turn.begin(cx, list),
             }
             if let Some(scene) = scene {
-                for text in scene.texts.iter().filter(|text| !text.is_value || Some(text.item) != scrub_item) {
-                    let offset = text.owner.map_or([0.0; 2], |node| scene.offset(node, now));
-                    let ghost = if !overlay && text.owner.is_some_and(|node| self.drag.member(node)) { 0.33 } else { 1.0 };
-                    draw_text(cx, &mut self.draw_text, &self.pane.cam, text,
-                        [text.at[0] + offset[0], text.at[1] + offset[1]], text.alpha(now) * layer_alpha * ghost, up);
-                }
+                draw_scene_text(cx, &mut self.draw_text, &self.pane.cam, scene, now, layer_alpha, scrub_item, (!overlay).then_some(&self.drag), up);
             }
             if overlay {
                 if let Some(text) = self.gesture_text.as_ref().or(self.scrub.as_ref().map(|active| &active.text))
@@ -3627,8 +3676,30 @@ impl ExplorerView {
     }
 }
 
+fn label_scale(cam: &Camera2d) -> f64 {
+    let raw = TEXT_FLOOR_POINTS / text_points(sheet::TEXT_REFDES, cam.px_per_unit);
+    // Steps of 2^(1/8) (about 9%), rounded up: a zoom always gets the same labels whatever
+    // the way there (a fit's flight relabels on its way), never under the floor, and a
+    // continuous zoom relabels once a step.
+    if raw <= 1.0 || raw > FLOOR_MAX_SCALE { 1.0 } else { ((raw.log2() * 8.0).ceil() / 8.0).exp2() }
+}
+
+fn draw_scene_text(cx: &mut Cx2d, draw: &mut DrawText, cam: &Camera2d, scene: &Scene, now: f64, layer_alpha: f32,
+    scrub_item: Option<u32>, drag: Option<&Drag>, up: Option<UpTurn>) {
+    for text in scene.texts.iter().filter(|text| !text.is_value || Some(text.item) != scrub_item) {
+        let offset = text.owner.map_or([0.0; 2], |node| scene.offset(node, now));
+        let ghost = if drag.is_some_and(|d| text.owner.is_some_and(|n| d.member(n))) { 0.33 } else { 1.0 };
+        draw_text(cx, draw, cam, text,
+            [text.at[0] + offset[0], text.at[1] + offset[1]], text.alpha(now) * layer_alpha * ghost, up);
+    }
+}
+
 impl Widget for ExplorerView {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if self.comparison_paused(cx) {
+            self.comparison_event(cx, event, scope);
+            return;
+        }
         if matches!(event, Event::Signal) {
             self.key_refusal(cx);
             self.card_refusal(cx);
@@ -3650,6 +3721,8 @@ impl Widget for ExplorerView {
         if self.value_combo_event(cx, event, scope) { return; }
         // The tool strip is over the sheet: its presses, hovers and scrolls are its own.
         let actions = cx.capture_actions(|cx| self.tools.handle_event(cx, event, scope));
+        if self.tools.radio_button(cx, ids!(a_blocks)).clicked(&actions) { self.toggle_blocks(cx); }
+        if self.tools.button(cx, ids!(a_arch)).clicked(&actions) { cx.action(StripAction::DraftArchitecture); }
         for tool in strip_presses(cx, &self.tools, &actions) {
             if self.name_edit.is_some() { self.close_value_edit(cx); }
             let double = self.tool_clicks.click(tool, cx.seconds_since_app_start());
@@ -3740,17 +3813,7 @@ impl Widget for ExplorerView {
             return;
         }
         if matches!(event, Event::Signal) && self.layout_jobs.busy() {
-            match self.layout_jobs.poll(cx) {
-                Some(LayoutResult::Layout(laid)) => self.apply_layout(cx, laid),
-                Some(LayoutResult::Reveal(revealed)) => self.apply_reveal(cx, revealed),
-                Some(LayoutResult::Drop(Dropped { token, drop })) => {
-                    if let Some(tag) = self.drag.dropped(cx, self.uid, token, drop, &mut self.scene) {
-                        self.hold_drag(cx, tag);
-                    }
-                }
-                Some(LayoutResult::Kept(Kept { token, hints })) => self.kept(cx, token, hints),
-                None => {}
-            }
+            if let Some(result) = self.layout_jobs.poll(cx) { self.layout_result(cx, result); }
         }
         // Whoever runs the bench drives its frames; the explorer only looks, and draws again
         // when the bench has published (never per display frame while it plays).
@@ -3931,9 +3994,14 @@ impl Widget for ExplorerView {
 
     /// One node for the pane (a schematic publishes no item nodes): its unit and an O(1)
     /// summary. Parts are reached through `semantics_lookup`.
-    fn semantics(&self, _cx: &Cx, node: &mut a11y_tree::Node) {
+    fn semantics(&self, cx: &Cx, node: &mut a11y_tree::Node) {
         node.role = a11y_tree::Role::Group;
         makepad_platform::a11y::set_string(&mut node.role_description, "schematic");
+        if self.comparison_paused(cx) {
+            makepad_platform::a11y::set_string(&mut node.name, "Schematic");
+            if let Some(review) = &self.review { makepad_platform::a11y::set_string(&mut node.value, &review.caption); }
+            return;
+        }
         let unit = self.design.as_ref().and_then(|design| design.units.get(self.unit));
         let name = unit.map(|unit| unit.name.as_str()).filter(|name| !name.is_empty()).unwrap_or("Schematic");
         makepad_platform::a11y::set_string(&mut node.name, name);
@@ -3954,6 +4022,7 @@ impl Widget for ExplorerView {
 
     /// The parts a query names, built only on a frame that asks; the pane's frames carry none.
     fn semantics_lookup(&self, cx: &Cx, lookup: &SemanticLookup, out: &mut Vec<(u64, Option<u64>, a11y_tree::Node)>) {
+        if self.comparison_paused(cx) { return; }
         let (query, key) = match lookup {
             SemanticLookup::Terms(q) => (Some(*q), q.id_term()
                 .filter(|id| cx.a11y.action_owner(*id).uid() == self.uid.0)
@@ -3969,6 +4038,7 @@ impl Widget for ExplorerView {
     /// key (exact at any zoom); scroll-into-view brings it into plain sight in one frame.
     fn handle_action(&mut self, cx: &mut Cx, request: &a11y_tree::ActionRequest, _scope: &mut Scope) -> a11y_tree::ActionResult {
         use a11y_tree::{ActionResult, Actions};
+        if self.comparison_paused(cx) { return ActionResult::Unhandled; }
         if request.action != Actions::PRESS && request.action != Actions::SCROLL_INTO_VIEW {
             return ActionResult::Unhandled;
         }
@@ -4010,12 +4080,13 @@ impl Widget for ExplorerView {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        self.follow(cx);
-        self.sync_live(cx);
         let rect = cx.walk_turtle(walk);
         if rect.size.x > 0.0 && rect.size.y > 0.0 {
             self.pane_aspect = rect.size.x / rect.size.y;
         }
+        let comparing = self.review.is_some() || self.return_picture.is_some();
+        self.follow(cx);
+        if self.review.is_none() { self.sync_live(cx); }
         let tokens = Tokens::for_theme(self.dark);
         if !self.capture_attempted {
             self.capture_attempted = true;
@@ -4044,7 +4115,10 @@ impl Widget for ExplorerView {
                     at: [0.0; 2], dir: [1.0, 0.0], size: 0.22, live_pin: -1.0,
                 });
                 self.pin_warm.set(templates.pin.slots(), rows);
-                let live = self.live.get_or_insert_with(|| CanvasLive::off(cx));
+                let live = match &self.review {
+                    Some(review) => &review.off,
+                    None => self.live.get_or_insert_with(|| CanvasLive::off(cx)),
+                };
                 let warm = CanvasUniforms {
                     cam: [rect.pos.x as f32 - 16.0, rect.pos.y as f32 - 16.0, 1.0, 1.0],
                     motion_t: 0.0, hover_item: -1.0, hover_mix: 0.0,
@@ -4058,8 +4132,15 @@ impl Widget for ExplorerView {
                 warm.with(tokens, |u| self.pin_warm.draw(cx, &mut self.draw_pin.draw_vars, u, live));
             }
         }
+        if self.review.is_some() || self.return_picture.is_some() && (self.sheet_design.is_none() || self.assemble_pending) {
+            self.draw_comparison(cx, scope, rect, tokens);
+            return DrawStep::done();
+        }
+        self.return_picture = None;
+        self.sync_arch_button(cx);
         if self.design.is_none() || self.applied_gen < self.design_gen {
             self.draw_bg.draw_grid(cx, rect, None, tokens);
+            self.strip_at = draw_strip(cx, scope, self.uid, &self.tools, rect);
             return DrawStep::done();
         }
         // The first camera fit must use the arriving sheet, not empty loading bounds.
@@ -4075,7 +4156,7 @@ impl Widget for ExplorerView {
             self.opening_view = None;
             self.refit_after_layout = false;
         }
-        self.pane.place(cx, rect, Some(bounds));
+        if comparing { self.pane.place_comparison(cx, rect, bounds); } else { self.pane.place(cx, rect, Some(bounds)); }
         self.draw_bg.draw_grid(cx, rect, Some(&self.pane.cam), tokens);
         self.relayout_for_pane(cx);
         if self.templates.is_none() || self.assemble_pending {
@@ -4146,6 +4227,7 @@ impl Widget for ExplorerView {
                 let unit = self.sheet_design.as_ref().and_then(|design| design.units.get(self.unit));
                 let marks = unit.map_or_else(Vec::new, |unit|
                     super::erc_marks::erc_marks(&self.scene.hits.pins, self.scene.part_bodies(),
+                        self.sheet.frames.iter().enumerate().skip(1).filter(|(_, f)| f.placed).map(|(i,f)| (i as u32, f.rect.map(f64::from))),
                         self.scene.hits.wires.iter().map(|wire| (wire.net, wire.a, wire.b)), &violations.value, unit.id, tokens));
                 let mut rows = Vec::with_capacity(marks.len() * line.slots());
                 for mark in &marks { line.append(&mut rows, mark); }
@@ -4191,15 +4273,15 @@ impl Widget for ExplorerView {
             self.ghost_lines.draw(cx, &mut self.draw_line.draw_vars, u, &live);
             self.ghost_arcs.draw(cx, &mut self.draw_arc.draw_vars, u, &live);
             self.ghost_pins.draw(cx, &mut self.draw_pin.draw_vars, u, &live);
-            self.boxes.draw(cx, &mut self.draw_box.draw_vars, u, &live);
-            self.lines.draw(cx, &mut self.draw_line.draw_vars, u, &live);
+            self.ink.boxes.draw(cx, &mut self.draw_box.draw_vars, u, &live);
+            self.ink.lines.draw(cx, &mut self.draw_line.draw_vars, u, &live);
             self.name_lines.draw(cx, &mut self.draw_line.draw_vars, u, &live);
-            self.arcs.draw(cx, &mut self.draw_arc.draw_vars, u, &live);
-            self.bridges.draw(cx, &mut self.draw_bridge.draw_vars, u, &live);
+            self.ink.arcs.draw(cx, &mut self.draw_arc.draw_vars, u, &live);
+            self.ink.bridges.draw(cx, &mut self.draw_bridge.draw_vars, u, &live);
             self.pins.draw(cx, &mut self.draw_pin.draw_vars, u, &live);
             // Re-placed (enlarged) labels left their layout spots, so the layout's leaders would point at nothing.
             if self.legible == 1.0 && text_points(sheet::TEXT_NET, self.pane.cam.px_per_unit) >= TEXT_MIN_POINTS {
-                self.leaders.draw(cx, &mut self.draw_line.draw_vars, u, &live);
+                self.ink.leaders.draw(cx, &mut self.draw_line.draw_vars, u, &live);
             }
             self.erc_marks.draw(cx, &mut self.draw_line.draw_vars, u, &live);
         });

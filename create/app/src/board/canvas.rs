@@ -1,28 +1,54 @@
 //! The board and its local interaction overlay. Fold events materialize text and shape handles alongside
 //! the spatial view. Drawing only borrows this projection and the camera.
-use super::gesture::{AlignTo, BoardTool, Gesture, Handle, NewItem, Placement, Preview, Transform, DRAG_SLOP};
+use super::gesture::{scroll_nav, AlignTo, BoardTool, Gesture, Handle, NewItem, Placement, Preview, ScrollNav, Transform, DRAG_SLOP};
+use super::live::{Incoming, Outbox};
+use super::look::{self, Body, Lift, Look, Place, Surface, STEPS};
+use super::tree::step_kind;
+use super::view::{Present, Step, Target};
 use super::{BoardItem, BoardView, Rect as Bounds, RectIndex};
+use crate::tweak::overlay::{self, Selections};
 use crate::model::{Action as ModelAction, ItemStyle, RestackTo};
 use makepad_canvas::{
-    remap_event, sync_handled, Camera, CameraState, CanvasLayer, DrawCanvasCard, DrawCanvasGrid, MAX_ZOOM,
-    MIN_ZOOM,
+    remap_event, sync_handled, Camera, CameraState, CanvasLayer, DrawCanvasCard, DrawCanvasGrid,
+    DrawCanvasShadow, MAX_ZOOM, MIN_ZOOM,
 };
-use makepad_work_core::entity::{field, kind};
-use makepad_work_core::event::{Id, Key, Value};
-use makepad_work_core::fold::State;
+use makepad_town_core::entity::{field, kind};
+use makepad_town_core::event::{Id, Key, Value};
+use makepad_town_core::fold::State;
 use makepad_widgets::{
     drag_visual::CxDragVisualExt,
-    event::{EditModifier, TouchState, TAP_COUNT_TIME},
+    event::{EditModifier, ScrollPhase, TouchState, TAP_COUNT_TIME},
     text::{font_family::FontFamilyId, layouter::LaidoutText},
     *,
 };
-use std::{collections::HashMap, ops::Range, rc::Rc};
+use std::{collections::{BTreeSet, HashMap}, ops::Range, rc::Rc};
 
 script_mod! {
     use mod.prelude.workspace.*
     use mod.widgets.*
+    let ZoomButton = PanelButton{
+        height: 25 padding: Inset{left: 8 right: 8} align: Align{x: 0.5 y: 0.5} grab_key_focus: false
+        draw_bg +: {color: palette.panel border_size: 0}
+    }
     mod.widgets.BoardCanvas = #(BoardCanvas::register_widget(vm)){
         width: Fill height: Fill
+        // The board's colours, under the names of Town's skin tokens so a skin sets them: items
+        // without a colour of their own, the selection, frames and shadows. Inks are worked out
+        // against the ground (the grid's `color_a`).
+        sticky_1: #xF6DC86
+        shape_fill: #x5AA2E0
+        shape_line: #x487FAE
+        section_fill: #x8FA9BD24
+        section_line: #x8FA9BD66
+        board_ink: palette.text
+        board_selection: palette.accent
+        frame_color: palette.panel
+        frame_line: palette.line
+        caption_color: palette.muted
+        shadow_color: #x000000
+        shadow_strength: 1.0
+        shadow_softness: 1.0
+        title +: {text_style: theme.font_bold{font_size: 10.5}}
         grid +: {
             color_a: palette.bg color_b: palette.line
             pixel: fn() {
@@ -41,13 +67,26 @@ script_mod! {
             draw_text +: {get_color: fn() { return self.color } text_style: theme.font_regular{font_size: 10.5}}
             draw_cursor +: {color: palette.accent}
         }
-        card +: {border_size: 0.0 shadow_offset: vec2(0.0, 0.0)}
+        // Shadows draw in their own pass under each layer, so cards cast none of their own.
+        card +: {border_size: 0.0 shadow_radius: 0.0}
+        share_label +: {text_style: theme.font_regular{font_size: 9}}
         label +: {text_style: theme.font_regular{font_size: 10.5}}
+        nav: RoundedView{
+            width: Fit height: Fit flow: Right spacing: 2 padding: 3
+            draw_bg +: {color: palette.panel border_size: 1 border_color: palette.line border_radius: 5}
+            zoom_out := ZoomButton{text: "−"}
+            zoom_level := ZoomButton{text: "100 %" width: 54}
+            zoom_in := ZoomButton{text: "+"}
+        }
     }
 }
 
-const SHADOW: f64 = 4.0;
-const PADDING: f64 = 4.0;
+/// The zoom cluster's distance from the board's corner.
+const NAV_MARGIN: f64 = 11.0;
+/// How far the cluster's buttons and the zoom keys step.
+const ZOOM_STEP: f64 = 2.0;
+/// New text fits a board draw lays out; the rest waits for the next frames, without text.
+const FITS_PER_DRAW: usize = 96;
 
 fn rect(b: Bounds) -> Rect {
     Rect { pos: dvec2(b.x0, b.y0), size: dvec2(b.x1 - b.x0, b.y1 - b.y0) }
@@ -59,12 +98,11 @@ fn total_bounds() -> Bounds {
 
 fn painted(item: &BoardItem) -> Bounds {
     let b = item.rect;
-    let pad = match item.kind {
-        Key::Number(kind::STICKY) => SHADOW,
-        Key::Number(kind::SHAPE) => 1.0,
-        _ => 0.0,
-    };
-    Bounds::new(b.x0 - pad, b.y0 - pad, b.x1 + pad, b.y1 + pad)
+    // A layer's shadows draw beneath all its cards, so a shadow never splits a layer. Only a
+    // stroke's edge and a frame's caption widen what an item paints.
+    let pad = if item.kind == kind::SHAPE { 1.0 } else { 0.0 };
+    let top = if body_of(&item.kind, "").caption_above() { look::caption_reach(b.x1 - b.x0) } else { pad };
+    Bounds::new(b.x0 - pad, b.y0 - top, b.x1 + pad, b.y1 + pad)
 }
 
 fn painter_layers(view: &BoardView, ids: &[Id], preview: Option<&Preview>) -> Vec<Range<usize>> {
@@ -132,6 +170,18 @@ struct MetricsKey {
     font: FontFamilyId,
     size: f32,
     spacing: f32,
+    centre: bool,
+    family_generation: u64,
+}
+
+/// What a fitted text size depends on.
+#[derive(PartialEq)]
+struct FitKey {
+    inner: (f32, f32),
+    cap: f32,
+    fixed: bool,
+    centre: bool,
+    font: FontFamilyId,
     family_generation: u64,
 }
 
@@ -143,6 +193,8 @@ struct Face {
     open_writers: HashMap<String, Id>,
     layout: Option<(MetricsKey, Rc<LaidoutText>)>,
     detail: Detail,
+    /// The font size, in points, the text fits its item at, and what it was fitted to.
+    fit: Option<(FitKey, f32)>,
 }
 
 impl Face {
@@ -156,7 +208,7 @@ impl Face {
                 if let Err(errors) = makepad_splash_syntax::read_value(src) {
                     for (offset, reason) in errors {
                         eprintln!("board item {} property {name} at byte {offset}: {reason}; drawing default",
-                            makepad_work_core::hex(&e.id));
+                            makepad_town_core::hex(&e.id));
                     }
                 }
             }
@@ -166,7 +218,13 @@ impl Face {
             text = e.text(field::TITLE);
         }
         let fallback;
-        if let Key::Name(name) = &item.kind {
+        if item.kind == kind::DESIGN {
+            fallback = super::design::label(e);
+            text = &fallback;
+        } else if item.kind == kind::APP {
+            fallback = crate::tweak::app_caption(e, |_, _| None);
+            text = &fallback;
+        } else if let Key::Name(name) = &item.kind {
             fallback = format!("unknown kind {name}");
             text = &fallback;
         }
@@ -174,6 +232,7 @@ impl Face {
         if self.text != text {
             text.clone_into(&mut self.text);
             self.layout = None;
+            self.fit = None;
         }
         let shape = e.text(field::SHAPE);
         if self.shape != shape {
@@ -182,26 +241,74 @@ impl Face {
         changed
     }
 
-    fn layout(&mut self, cx: &mut Cx2d, label: &DrawText, width: f32) -> &LaidoutText {
+    fn layout(&mut self, cx: &mut Cx2d, label: &DrawText, width: f32, centre: bool) -> &LaidoutText {
         let style = &label.text_style;
         let key = MetricsKey {
             width,
             font: style.font_family_id(),
             size: style.font_size,
             spacing: style.line_spacing,
+            centre,
             family_generation: cx.fonts.borrow().font_family_generation(),
         };
         if self.layout.as_ref().is_none_or(|(old, _)| old != &key) {
-            let layout = label.layout(cx, 0., 0., Some(width), true, Align::default(), &self.text);
+            let align = Align { x: if centre { 0.5 } else { 0. }, y: 0. };
+            let layout = label.layout(cx, 0., 0., Some(width), true, align, &self.text);
             self.layout = Some((key, layout));
         }
         &self.layout.as_ref().unwrap().1
+    }
+
+    /// The font size, in points, the text takes in `place`: the cap's step when the size is
+    /// fixed, else the largest step up to the cap whose layout fits the box (the smallest step
+    /// when none does). It is laid out again only when the text, the box or the fonts change,
+    /// never on a pan or zoom. `None` when a new fit is due and this draw's `budget` is spent.
+    fn fit(&mut self, cx: &mut Cx2d, label: &mut DrawText, place: &Place, budget: &mut usize) -> Option<f32> {
+        let key = FitKey {
+            inner: (place.inner.size.x as f32, place.inner.size.y as f32),
+            cap: place.cap as f32,
+            fixed: place.fixed,
+            centre: place.centre_x,
+            font: label.text_style.font_family_id(),
+            family_generation: cx.fonts.borrow().font_family_generation(),
+        };
+        if let Some((old, size)) = &self.fit {
+            if *old == key {
+                return Some(*size);
+            }
+        }
+        if *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        let top = look::step_at_most(place.cap);
+        let size = if place.fixed || self.text.is_empty() {
+            STEPS[top]
+        } else {
+            let (w, h) = (key.inner.0 + 0.5, key.inner.1 + 0.5);
+            let (mut lo, mut hi) = (0, top);
+            while lo < hi {
+                let mid = (lo + hi + 1) / 2;
+                label.text_style.font_size = STEPS[mid];
+                let size = self.layout(cx, label, key.inner.0, place.centre_x).size_in_lpxs;
+                if size.width <= w && size.height <= h { lo = mid } else { hi = mid - 1 }
+            }
+            STEPS[lo]
+        };
+        self.fit = Some((key, size));
+        Some(size)
+    }
+
+    fn fitted(&self) -> Option<f32> {
+        self.fit.as_ref().map(|(_, size)| *size)
     }
 }
 
 struct Scene {
     id: Id,
     view: BoardView,
+    /// The board's presenting path, refreshed when a step or a step's target changes.
+    path: Vec<Step>,
     faces: HashMap<Id, Face>,
     query: Option<Bounds>,
     visible: Vec<Id>,
@@ -217,6 +324,7 @@ impl Scene {
         let view = BoardView::build(state, id);
         let mut scene = Self {
             id,
+            path: view.path(state),
             view,
             faces: HashMap::new(),
             query: None,
@@ -278,7 +386,8 @@ impl Scene {
             let x = (p.x - r.pos.x) / r.size.x * 2. - 1.;
             let y = (p.y - r.pos.y) / r.size.y * 2. - 1.;
             match self.faces[id].shape.as_str() {
-                "ellipse" | "circle" => x * x + y * y <= 1.,
+                "ellipse" => x * x + y * y <= 1.,
+                "circle" => dvec2(x * r.size.x, y * r.size.y).length() <= r.size.x.min(r.size.y),
                 "diamond" => x.abs() + y.abs() <= 1.,
                 "triangle" => x.abs() <= (y + 1.) * 0.5,
                 _ => true,
@@ -317,6 +426,27 @@ impl Scene {
             .reduce(|a, b| Bounds::new(a.x0.min(b.x0), a.y0.min(b.y0), a.x1.max(b.x1), a.y1.max(b.y1)))
             .map(rect)
     }
+
+    /// What Present shows at each step of the path. A path with nothing to show presents one
+    /// step: the selection, else the whole board.
+    fn present_targets(&self, selection: &BTreeSet<Id>) -> Vec<(Id, Option<Bounds>)> {
+        let targets = self.view.present_targets(&self.path);
+        if targets.iter().any(|(_, rect)| rect.is_some()) {
+            return targets;
+        }
+        let union = |a: Bounds, b: Bounds| Bounds::new(a.x0.min(b.x0), a.y0.min(b.y0), a.x1.max(b.x1), a.y1.max(b.y1));
+        let chosen = selection.iter().filter_map(|id| self.view.get(id)).map(|item| item.rect).reduce(union)
+            .or_else(|| self.view.present_targets(&[Step { id: self.id, target: Target::Board, title: String::new() }])[0].1);
+        vec![(self.id, chosen)]
+    }
+
+    /// Whether `id` is a step of this path or what one leads to.
+    fn on_path(&self, id: Id) -> bool {
+        self.path.iter().any(|step| step.id == id || match step.target {
+            Target::Item(t) | Target::Gone(t) | Target::Unknown(Some(t)) => t == id,
+            Target::Board | Target::Unknown(None) => false,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -335,6 +465,10 @@ struct TextEdit {
     initial: String,
 }
 
+/// A click completed on a live App picture. The window routes the pick to this item's session.
+#[derive(Clone, Debug)]
+pub struct AppPick { pub item: Id, pub at: crate::tweak::At }
+
 #[derive(Script, ScriptHook, Widget)]
 pub struct BoardCanvas {
     #[uid]
@@ -346,11 +480,42 @@ pub struct BoardCanvas {
     #[live]
     card: DrawCanvasCard,
     #[live]
+    shadow: DrawCanvasShadow,
+    #[live]
     outline: DrawColor,
     #[live]
-    vector: DrawVector,
-    #[live]
     label: DrawText,
+    #[live]
+    share_label: DrawText,
+    /// Section titles, in bold.
+    #[live]
+    title: DrawText,
+    #[live]
+    sticky_1: Vec4f,
+    #[live]
+    shape_fill: Vec4f,
+    #[live]
+    shape_line: Vec4f,
+    #[live]
+    section_fill: Vec4f,
+    #[live]
+    section_line: Vec4f,
+    #[live]
+    board_ink: Vec4f,
+    #[live]
+    board_selection: Vec4f,
+    #[live]
+    frame_color: Vec4f,
+    #[live]
+    frame_line: Vec4f,
+    #[live]
+    caption_color: Vec4f,
+    #[live]
+    shadow_color: Vec4f,
+    #[live]
+    shadow_strength: f32,
+    #[live]
+    shadow_softness: f32,
     #[redraw]
     #[rust]
     area: Area,
@@ -364,6 +529,16 @@ pub struct BoardCanvas {
     camera: Camera,
     #[rust]
     scene: Option<Scene>,
+    #[rust]
+    app_presence: HashMap<Id, Selections>,
+    #[rust]
+    live_in: Incoming,
+    #[rust]
+    live_out: Outbox,
+    #[rust]
+    live_frame: NextFrame,
+    #[rust]
+    drag_pointer: Option<(DVec2, KeyModifiers)>,
     #[rust]
     fit_pending: bool,
     #[rust]
@@ -383,6 +558,13 @@ pub struct BoardCanvas {
     #[find]
     #[live]
     editor: WidgetRef,
+    /// The zoom cluster in the board's corner: out, the level (a press fits the board), in.
+    #[find]
+    #[live]
+    nav: WidgetRef,
+    /// Whether the cluster was drawn on the last frame, so it takes the pointer before the board.
+    #[rust]
+    nav_shown: bool,
     #[rust]
     editing: Option<TextEdit>,
     #[rust]
@@ -404,6 +586,11 @@ pub struct BoardCanvas {
     /// The last board draw's cost in frame budgets; 0 before the first draw.
     #[rust]
     last_load: f64,
+    /// Presenting along the board's path, for this view only; the board is read-only meanwhile.
+    #[rust]
+    present: Option<Present>,
+    #[rust]
+    next_frame: NextFrame,
 }
 
 impl BoardCanvas {
@@ -422,9 +609,11 @@ impl BoardCanvas {
         if self.scene.as_ref().map(|s| s.id) == selected {
             return;
         }
+        self.end_live(cx, false);
         self.finish_text(cx, true);
         self.last_click = None;
         self.scene = selected.map(|id| Scene::new(state, id));
+        self.present = None;
         self.fit_pending = true;
         self.placement_start = None;
         self.ghost = None;
@@ -441,9 +630,19 @@ impl BoardCanvas {
     }
 
     pub fn applied(&mut self, cx: &mut Cx, state: &State, ids: &[Id], shown: bool) {
+        if self.live_in.reconcile(state, self.board_id()) { self.request_overlay(cx); }
         let Some(scene) = &mut self.scene else { return };
+        let path_changed = ids.iter().any(|&id| scene.on_path(id) || state.entities.get(&id).is_some_and(|e| step_kind(&e.kind)));
+        if path_changed {
+            scene.path = scene.view.path(state);
+        }
         let was_empty = scene.faces.is_empty();
-        if scene.apply(state, ids, &mut self.gesture) {
+        if !scene.apply(state, ids, &mut self.gesture) {
+            // A presented step's target can change without any face changing.
+            if path_changed && self.present.is_some() {
+                if shown { self.request(cx) } else { self.repaint_pending = true }
+            }
+        } else {
             scene.lift(self.gesture.preview.as_ref());
             let lost_item = self.editing.as_ref().is_some_and(|e| scene.view.get(&e.item).is_none_or(|i| i.locked));
             self.fit_pending |= was_empty && !scene.faces.is_empty();
@@ -454,11 +653,13 @@ impl BoardCanvas {
                 self.repaint_pending = true;
             }
         }
+        self.update_live(cx, false);
     }
 
     // The link currently publishes one refolded State for a batch, without event ids.
     // Reconcile only when that batch arrives. The input and draw paths keep their index.
     pub fn peer_snapshot(&mut self, cx: &mut Cx, state: &State, shown: bool) {
+        if self.live_in.reconcile(state, self.board_id()) { self.request_overlay(cx); }
         let Some(scene) = &mut self.scene else { return };
         let next = BoardView::build(state, scene.id);
         let ids = next.visible(total_bounds());
@@ -479,7 +680,10 @@ impl BoardCanvas {
             }
         }
         scene.view = next;
-        if changed.is_empty() && ids == previous {
+        let path = scene.view.path(state);
+        let path_changed = path != scene.path;
+        scene.path = path;
+        if changed.is_empty() && ids == previous && !(path_changed && self.present.is_some()) {
             return;
         }
         self.fit_pending |= previous.is_empty() && !ids.is_empty();
@@ -493,6 +697,7 @@ impl BoardCanvas {
         } else {
             self.repaint_pending = true;
         }
+        self.update_live(cx, false);
     }
 
     fn fit(&self, view: Rect) -> Option<Camera> {
@@ -504,13 +709,37 @@ impl BoardCanvas {
             .zoom_about(fitted.local_to_screen(fitted.world_to_local(world.center())), fitted.scale.min(1.))
     }
 
+    fn fit_board(&mut self, cx: &mut Cx) {
+        if let Some(fit) = self.fit(self.camera.view) {
+            self.change_camera(cx, fit);
+        }
+    }
+
+    /// A zoom about the board's centre, as the cluster's buttons and the keys step it.
+    fn zoom_step(&mut self, cx: &mut Cx, by: f64) {
+        self.zoom(cx, self.camera.view.center(), self.camera.scale * by);
+    }
+
     fn change_camera(&mut self, cx: &mut Cx, next: Camera) {
         if next.scale == self.camera.scale && next.pan == self.camera.pan {
             return;
         }
         self.camera = next;
+        self.refresh_drag();
+        self.update_live(cx, false);
         self.fit_pending = false;
         self.request(cx);
+    }
+
+    fn refresh_drag(&mut self) {
+        let Some(scene) = &self.scene else { return };
+        let camera = self.camera;
+        self.gesture.set_viewport(&scene.view, camera_bounds(camera));
+        if let Some((screen, mods)) = self.drag_pointer {
+            if self.gesture.moving().is_some() {
+                self.gesture.motion(&scene.view, camera.world_at(screen), screen, camera.scale, mods.alt, mods.shift);
+            }
+        }
     }
 
     fn zoom(&mut self, cx: &mut Cx, anchor: DVec2, scale: f64) {
@@ -527,27 +756,59 @@ impl BoardCanvas {
     }
 }
 
-fn item_colour(item: &BoardItem) -> Vec4f {
-    let n = item.colour.unwrap_or(match item.kind {
-        Key::Number(kind::STICKY) => 0xf1d996,
-        Key::Number(kind::TEXT_BLOCK) => 0xe3e5e8,
-        Key::Number(kind::SECTION) => 0x435966,
-        _ => 0x93b6c9,
-    });
-    Vec4f::from_u32(if n > 0xffffff { n } else { (n << 8) | 255 })
+fn body_of(kind: &Key, shape: &str) -> Body {
+    if *kind == kind::APP { Body::Frame } else { Body::of(kind, shape) }
 }
 
-fn text_ink(item: &BoardItem) -> Vec4f {
-    let colour = item_colour(item);
-    if item.kind == kind::TEXT_BLOCK {
-        colour
-    } else if item.kind == kind::SECTION
-        || colour.x * 0.299 + colour.y * 0.587 + colour.z * 0.114 < 0.48
-    {
-        vec4(1., 1., 1., 1.)
-    } else {
-        vec4(0.09, 0.1, 0.12, 1.)
+fn item_colour(item: &BoardItem, look: &Look) -> Vec4f {
+    if item.kind == kind::DESIGN {
+        return look.frame;
     }
+    match item.colour {
+        Some(n) => Vec4f::from_u32(if n > 0xffffff { n } else { (n << 8) | 255 }),
+        None => match item.kind {
+            Key::Number(kind::STICKY) => look.sticky,
+            Key::Number(kind::TEXT_BLOCK) => look.ink,
+            Key::Number(kind::SECTION) => look.section,
+            _ => look.shape,
+        },
+    }
+}
+
+/// The solid chip a section's title sits on: its colour, or the skin's section line.
+fn section_chip(item: &BoardItem, look: &Look) -> Vec4f {
+    look::opaque(if item.colour.is_some() { item_colour(item, look) } else { look.section_line })
+}
+
+/// The ink of an item's text: a text block's own colour made readable on the board, a frame's
+/// caption colour, a section title's ink on its chip, else an ink that reads on the item's fill.
+fn text_ink(item: &BoardItem, look: &Look) -> Vec4f {
+    let colour = item_colour(item, look);
+    match item.kind {
+        Key::Number(kind::TEXT_BLOCK) => look::readable_on(colour, look.ground),
+        Key::Number(kind::DESIGN | kind::APP) => look.caption,
+        Key::Number(kind::SECTION) => look::ink_on(section_chip(item, look), look.ground),
+        _ => look::ink_on(colour, look.ground),
+    }
+}
+
+/// An item's surface. Shapes and sections without a colour of their own take the skin's lines.
+fn item_surface(item: &BoardItem, body: Body, colour: Vec4f, size: DVec2, look: &Look) -> Surface {
+    let preset = if body == Body::Frame { super::design::preset_for((item.w, item.h)) } else { "" };
+    let mut s = look::surface(body, colour, size, preset, look);
+    match body {
+        _ if item.colour.is_some() => {}
+        Body::Shape(_) => s.border_color = look.shape_line,
+        Body::Section => s.border_color = look.section_line,
+        _ => {}
+    }
+    s
+}
+
+fn camera_bounds(camera: Camera) -> Bounds {
+    let a = camera.world_at(camera.view.pos);
+    let b = camera.world_at(camera.view.pos + camera.view.size);
+    Bounds::new(a.x, a.y, b.x, b.y)
 }
 
 fn local_rect(camera: &Camera, b: Bounds) -> Rect {
@@ -556,7 +817,7 @@ fn local_rect(camera: &Camera, b: Bounds) -> Rect {
 }
 
 fn supported(kind: &Key) -> bool {
-    matches!(kind, Key::Name(_) | Key::Number(kind::STICKY | kind::SHAPE | kind::SECTION | kind::TEXT_BLOCK))
+    matches!(kind, Key::Name(_) | Key::Number(kind::STICKY | kind::SHAPE | kind::SECTION | kind::TEXT_BLOCK | kind::DESIGN | kind::APP))
 }
 
 #[derive(Default)]
@@ -575,24 +836,63 @@ impl Tint {
     }
 }
 
-fn card(draw: &mut DrawCanvasCard, cx: &mut Cx2d, r: Rect, colour: Vec4f, shadow: bool) {
+fn card(draw: &mut DrawCanvasCard, cx: &mut Cx2d, r: Rect, colour: Vec4f, s: &Surface) {
     draw.color = colour;
-    draw.border_radius = if shadow { 3. } else { 0. };
-    draw.shadow_radius = if shadow { SHADOW as f32 } else { 0. };
-    draw.shadow_color = vec4(0., 0., 0., if shadow { 0.32 } else { 0. });
+    draw.shape = s.shape.code();
+    draw.border_radius = s.radius;
+    draw.shade = s.shade;
+    draw.rim = s.rim;
+    draw.border_size = s.border;
+    draw.border_color = s.border_color;
+    draw.draw_abs(cx, r);
+}
+
+/// The shadow of a card with surface `s` in `r`, cut away from `hole` pixels inside its outline.
+fn cast(draw: &mut DrawCanvasShadow, cx: &mut Cx2d, r: Rect, s: &Surface, l: Lift, look: &Look, hole: f32) {
+    draw.color = vec4(look.shadow.x, look.shadow.y, look.shadow.z, l.alpha * look.shadow_strength);
+    draw.shape = s.shape.code();
+    draw.radius = s.radius;
+    draw.blur = (l.blur * look.shadow_softness).max(0.75);
+    draw.offset = vec2(0., l.offset);
+    draw.contact = l.contact * look.shadow_strength;
+    draw.contact_blur = (l.contact_blur * look.shadow_softness).max(0.75);
+    draw.hole = hole;
     draw.draw_abs(cx, r);
 }
 
 impl BoardCanvas {
-    fn draw_board(&mut self, cx: &mut Cx2d, camera: Camera, clip: Rect, lifted: bool) {
+    fn look(&self) -> Look {
+        Look {
+            sticky: self.sticky_1,
+            shape: self.shape_fill,
+            shape_line: self.shape_line,
+            section: self.section_fill,
+            section_line: self.section_line,
+            ink: self.board_ink,
+            ground: self.grid.color_a,
+            frame: self.frame_color,
+            frame_line: self.frame_line,
+            caption: self.caption_color,
+            shadow: self.shadow_color,
+            shadow_strength: self.shadow_strength,
+            shadow_softness: self.shadow_softness.clamp(0., 1.),
+        }
+    }
+
+    /// Draws the board, or its lifted items. Whether some text still waits for its fit.
+    fn draw_board(&mut self, cx: &mut Cx2d, camera: Camera, clip: Rect, lifted: bool) -> bool {
         let a = camera.world_at(clip.pos);
         let b = camera.world_at(clip.pos + clip.size);
-        let bounds = Bounds::new(a.x, a.y, b.x, b.y);
-        let local = local_rect(&camera, bounds);
+        let local = local_rect(&camera, Bounds::new(a.x, a.y, b.x, b.y));
         if !lifted {
             cx.add_aligned_rect_area(&mut self.local_area, local);
         }
-        let Some(scene) = &mut self.scene else { return };
+        // Items just off screen still cast their shadows into it.
+        let reach = Lift::REACH;
+        let bounds = Bounds::new(a.x - reach, a.y - reach, b.x + reach, b.y + reach);
+        let look = self.look();
+        self.outline.color = self.board_selection;
+        let Some(scene) = &mut self.scene else { return false };
         let preview = self.gesture.preview.as_ref();
         if !lifted {
             scene.cull(bounds, preview);
@@ -620,6 +920,8 @@ impl BoardCanvas {
         let mut sections = HashMap::<Id, Tint>::new();
         let mut cells = HashMap::<(i64, i64), Tint>::new();
         let cell_size = 8. / pixels;
+        let mut budget = FITS_PER_DRAW;
+        let mut waiting = false;
         for id in ids {
             let item = scene.view.get(id).unwrap();
             if !supported(&item.kind) {
@@ -628,101 +930,148 @@ impl BoardCanvas {
             if lifted && !geometry(item).intersects(bounds) {
                 continue;
             }
-            let size = rect(geometry(item)).size;
+            let r = rect(geometry(item));
             let face = scene.faces.get_mut(id).unwrap();
-            let d = &mut face.detail;
+            let body = body_of(&item.kind, &face.shape);
             // At the font's native pixel size a person's words must remain readable
             // after the editor closes. In an overview, cards can still lose detail.
             let label_is_content = item.kind == kind::TEXT_BLOCK || matches!(item.kind, Key::Name(_))
                 || (pixels >= 1. && !face.text.is_empty());
             let detail_pressure = if label_is_content { 1. } else { pressure };
-            d.body = readable(size.x.max(size.y) * pixels, 3. * detail_pressure.sqrt(), d.body);
-            d.text = d.body
-                && readable(self.label.text_style.font_size as f64 * 96. / 72. * pixels, 4. * detail_pressure, d.text);
-            d.decoration = d.body && readable(size.x.min(size.y) * pixels, 24. * pressure, d.decoration);
+            let shown = readable(r.size.x.max(r.size.y) * pixels, 3. * detail_pressure.sqrt(), face.detail.body);
+            // Text is fitted only where its largest size could be read; the fit decides.
+            let place = look::place(body, r);
+            let px = |pt: f32| pt as f64 * look::PX_PER_PT * pixels;
+            let text_threshold = 4. * detail_pressure;
+            let could_read = shown && !face.text.is_empty()
+                && readable(px(STEPS[look::step_at_most(place.cap)]), text_threshold, face.detail.text);
+            let label = if place.bold { &mut self.title } else { &mut self.label };
+            let text = could_read && match face.fit(cx, label, &place, &mut budget) {
+                Some(pt) => readable(px(pt), text_threshold, face.detail.text),
+                None => {
+                    waiting = true;
+                    false
+                }
+            };
+            let d = &mut face.detail;
+            d.body = shown;
+            d.text = text;
+            d.decoration = shown && readable(r.size.x.min(r.size.y) * pixels, 24. * pressure, d.decoration);
         }
         for id in ids {
             let item = scene.view.get(id).unwrap();
-            if !supported(&item.kind) || scene.faces[id].detail.body || !geometry(item).intersects(bounds) {
+            if item.kind == kind::APP || !supported(&item.kind) || scene.faces[id].detail.body || !geometry(item).intersects(bounds) {
                 continue;
             }
             if let Some(section) = item.parent_section.filter(|p| {
                 scene.faces.get(p).is_some_and(|f| f.detail.body)
                     && scene.view.get(p).is_some_and(|parent| parent.rect.intersects(bounds))
             }) {
-                sections.entry(section).or_default().add(item_colour(item));
+                sections.entry(section).or_default().add(item_colour(item, &look));
             } else {
                 let p = rect(geometry(item)).center();
                 cells
                     .entry(((p.x / cell_size).floor() as i64, (p.y / cell_size).floor() as i64))
                     .or_default()
-                    .add(item_colour(item));
+                    .add(item_colour(item, &look));
             }
         }
         for ((x, y), tint) in cells {
             let mut c = tint.colour();
             c.w = (0.28 + 0.12 * (tint.count as f32).ln_1p()).min(0.9);
             let pos = camera.world_to_local(dvec2(x as f64 * cell_size, y as f64 * cell_size));
-            card(&mut self.card, cx, Rect { pos, size: dvec2(cell_size, cell_size) }, c, false);
+            card(&mut self.card, cx, Rect { pos, size: dvec2(cell_size, cell_size) }, c, &Surface::FLAT);
         }
+        // Lifted items float higher: their shadows spread and drop further.
+        let (blur, drop) = if lifted { (2.2, 2.4) } else { (1., 1.) };
         let mut locks = Vec::new();
         for layer in layers {
             // The draw append search cannot cross a different parent base. Quad
             // and text use the enclosing (penultimate) parent for their lanes.
             cx.push_draw_call_parent();
             cx.push_draw_call_parent();
-            self.vector.begin();
+            // A layer's shadows all lie beneath its cards. Its items never overlap, so they
+            // sit side by side at one height, and a neighbour's shadow falls on the board.
             for id in &ids[layer.clone()] {
                 let item = scene.view.get(id).unwrap();
                 let face = &scene.faces[id];
-                if !face.detail.body || !supported(&item.kind) || !geometry(item).intersects(bounds) {
+                if item.kind == kind::APP || !face.detail.decoration || !supported(&item.kind) || !geometry(item).intersects(bounds) {
+                    continue;
+                }
+                let body = body_of(&item.kind, &face.shape);
+                let Some(l) = look::lift(body) else { continue };
+                let r = local_rect(&camera, geometry(item));
+                let s = item_surface(item, body, item_colour(item, &look), r.size, &look);
+                cast(&mut self.shadow, cx, r, &s, l.raised(blur, drop), &look, 1.);
+            }
+            for id in &ids[layer.clone()] {
+                let item = scene.view.get(id).unwrap();
+                let face = scene.faces.get_mut(id).unwrap();
+                if item.kind == kind::APP || !face.detail.body || !supported(&item.kind) || !geometry(item).intersects(bounds) {
                     continue;
                 }
                 let r = local_rect(&camera, geometry(item));
-                let mut c = item_colour(item);
-                let shape = if item.kind == kind::SHAPE { face.shape.as_str() } else { "" };
-                if item.kind == kind::SECTION {
-                    if let Some(tint) = sections.get(id) {
-                        c = c * 0.6 + tint.colour() * 0.4;
-                    }
-                    c.w *= 0.45;
-                }
-                match shape {
-                    "ellipse" | "circle" | "diamond" | "triangle" => {
-                        let (x, y) = (r.pos.x as f32, r.pos.y as f32);
-                        let (w, h) = (r.size.x as f32, r.size.y as f32);
-                        self.vector.clear();
-                        self.vector.set_color(c.x, c.y, c.z, c.w);
-                        if matches!(shape, "ellipse" | "circle") {
-                            self.vector.ellipse(x + w * 0.5, y + h * 0.5, w * 0.5, h * 0.5);
-                        } else {
-                            self.vector.move_to(x + w * 0.5, y);
-                            if shape == "diamond" {
-                                self.vector.line_to(x + w, y + h * 0.5);
-                                self.vector.line_to(x + w * 0.5, y + h);
-                                self.vector.line_to(x, y + h * 0.5);
-                            } else {
-                                self.vector.line_to(x + w, y + h);
-                                self.vector.line_to(x, y + h);
+                let body = body_of(&item.kind, &face.shape);
+                let c = item_colour(item, &look);
+                let s = item_surface(item, body, c, r.size, &look);
+                match body {
+                    Body::Section => {
+                        let fill = match sections.get(id) {
+                            // Its members are too small to draw: the zone takes on their colour.
+                            Some(tint) => {
+                                let t = look::mix(look::opaque(c), tint.colour(), 0.5);
+                                vec4(t.x, t.y, t.z, 0.5)
                             }
-                            self.vector.close();
+                            None if item.colour.is_some() => vec4(c.x, c.y, c.z, c.w * 0.14),
+                            None => c,
+                        };
+                        card(&mut self.card, cx, r, fill, &s);
+                        if let (true, Some(pt)) = (face.detail.text, face.fitted()) {
+                            // The title's chip, as wide as the title. The text pass reuses its layout.
+                            let px = pt as f64 * look::PX_PER_PT;
+                            self.title.text_style.font_size = pt;
+                            let width = look::place(body, r).inner.size.x as f32;
+                            let title = face.layout(cx, &self.title, width, false);
+                            let town = r.size - dvec2(2. * look::CHIP_INSET, 2. * look::CHIP_INSET);
+                            let size = dvec2(title.size_in_lpxs.width as f64 + 2. * look::CHIP_PAD.0 * px,
+                                title.size_in_lpxs.height as f64 + 2. * look::CHIP_PAD.1 * px);
+                            let chip = Rect { pos: r.pos + dvec2(look::CHIP_INSET, look::CHIP_INSET),
+                                size: dvec2(size.x.min(town.x), size.y.min(town.y)) };
+                            let pill = Surface { radius: (chip.size.y * 0.5) as f32, ..Surface::FLAT };
+                            card(&mut self.card, cx, chip, section_chip(item, &look), &pill);
                         }
-                        self.vector.fill();
                     }
-                    _ if item.kind != kind::TEXT_BLOCK || !face.detail.text => {
-                        card(&mut self.card, cx, r, c, face.detail.decoration && item.kind == kind::STICKY);
+                    Body::Text if face.detail.text => {}
+                    Body::Text => {
+                        // Too small to read: a greeked line per line of text, in its ink.
+                        let ink = text_ink(item, &look);
+                        let pt = face.fitted().unwrap_or(STEPS[look::step_at_most(look::place(body, r).cap)]);
+                        let line = (pt as f64 * look::PX_PER_PT).min(r.size.y);
+                        let fits = ((r.size.y / (line * 1.3)).floor() as usize).max(1);
+                        let rows = match &face.layout {
+                            Some((_, l)) if face.fitted().is_some() => l.rows.len(),
+                            _ => (face.text.chars().count() as f64 * line * 0.5 / r.size.x.max(1.)).ceil() as usize,
+                        }.clamp(1, fits);
+                        let top = r.pos.y + (r.size.y - rows as f64 * line * 1.3) * 0.5 + line * 0.3;
+                        let bar = Surface { radius: (line * 0.3) as f32, ..Surface::FLAT };
+                        for row in 0..rows {
+                            let width = if row + 1 == rows && rows > 1 { 0.6 } else { 0.9 };
+                            let pos = dvec2(r.pos.x, top + row as f64 * line * 1.3);
+                            card(&mut self.card, cx, Rect { pos, size: dvec2(r.size.x * width, line * 0.6) },
+                                vec4(ink.x, ink.y, ink.z, ink.w * 0.3), &bar);
+                        }
                     }
-                    _ => {}
+                    _ => card(&mut self.card, cx, r, c, &s),
                 }
                 if item.locked && face.detail.decoration {
                     locks.push(camera.local_to_screen(dvec2(r.pos.x + r.size.x, r.pos.y)));
                 }
             }
-            self.vector.end(cx);
             for corner in locks.drain(..) {
                 draw_lock(cx, &mut self.outline, self.grid.color_a, corner, Some(&camera));
             }
             self.label.begin_deferred_slug_flush();
+            self.title.begin_deferred_slug_flush();
             for id in &ids[layer.clone()] {
                 let item = scene.view.get(id).unwrap();
                 let face = scene.faces.get_mut(id).unwrap();
@@ -730,23 +1079,31 @@ impl BoardCanvas {
                 if !supported(&item.kind) || !face.detail.text || face.text.is_empty() || !geometry(item).intersects(bounds) {
                     continue;
                 }
+                let Some(pt) = face.fitted() else { continue };
                 let r = local_rect(&camera, geometry(item));
-                let padding = if item.kind == kind::TEXT_BLOCK { 0. } else { PADDING };
-                let size = r.size - dvec2(2. * padding, 2. * padding);
-                if size.x <= 0. || size.y <= 0. {
+                let place = look::place(body_of(&item.kind, &face.shape), r);
+                if place.inner.size.x <= 0. || place.inner.size.y <= 0. {
                     continue;
                 }
-                let inner = Rect { pos: r.pos + dvec2(padding, padding), size };
-                self.label.color = text_ink(item);
-                let laidout = face.layout(cx, &self.label, size.x as f32);
-                cx.push_clip_rect(inner);
-                self.label.draw_walk_laidout(cx, Walk::abs_rect(inner), laidout);
+                let label = if place.bold { &mut self.title } else { &mut self.label };
+                label.color = text_ink(item, &look);
+                label.text_style.font_size = pt;
+                let laidout = face.layout(cx, label, place.inner.size.x as f32, place.centre_x);
+                let height = laidout.size_in_lpxs.height as f64;
+                let mut at = place.inner;
+                if place.centre_y && height < at.size.y {
+                    at.pos.y += (at.size.y - height) * 0.5;
+                }
+                cx.push_clip_rect(place.inner);
+                label.draw_walk_laidout(cx, Walk::abs_rect(at), laidout);
                 cx.pop_clip_rect();
             }
+            self.title.end_deferred_slug_flush(cx);
             self.label.end_deferred_slug_flush(cx);
             cx.pop_draw_call_parent();
             cx.pop_draw_call_parent();
         }
+        waiting
     }
 }
 
@@ -809,6 +1166,11 @@ impl BoardCanvas {
         let Some(item) = scene.view.get(&id) else { return };
         if item.locked || !matches!(item.kind, Key::Number(kind::STICKY | kind::TEXT_BLOCK | kind::SHAPE | kind::SECTION)) { return }
         let Some(face) = scene.faces.get(&id) else { return };
+        // The editor sets its text where the item shows it.
+        let place = look::place(body_of(&item.kind, &face.shape), rect(item.rect));
+        let (ax, ay) = (if place.centre_x { 0.5 } else { 0. }, if place.centre_y { 0.5 } else { 0. });
+        let mut editor = self.editor.clone();
+        script_apply_eval!(cx, editor, {label_align: Align{x: #(ax) y: 0.0} align: Align{x: 0.0 y: #(ay)}});
         self.last_click = None;
         self.editor.set_visible(cx, true);
         self.editor.set_text(cx, &face.text);
@@ -859,21 +1221,72 @@ impl BoardCanvas {
             }
             return
         };
-        let Some(item) = self.scene.as_ref().and_then(|s| s.view.get(&edit.item)) else { return };
-        let mut r = self.item_screen_rect(item);
-        let pad = if item.kind == kind::TEXT_BLOCK { 0. } else { PADDING * self.camera.scale };
-        r.pos += dvec2(pad, pad);
-        r.size = dvec2((r.size.x - 2. * pad).max(1.), (r.size.y - 2. * pad).max(1.));
+        let Some(scene) = self.scene.as_ref() else { return };
+        let (Some(item), Some(face)) = (scene.view.get(&edit.item), scene.faces.get(&edit.item)) else { return };
+        // The text box and size the item draws its text at.
+        let place = look::place(body_of(&item.kind, &face.shape), rect(item.rect));
+        let pt = face.fitted().unwrap_or(STEPS[look::step_at_most(place.cap)]);
+        let scale = self.camera.scale;
+        let r = Rect {
+            pos: self.camera.local_to_screen(self.camera.world_to_local(place.inner.pos)),
+            size: dvec2((place.inner.size.x * scale).max(1.), (place.inner.size.y * scale).max(1.)),
+        };
+        let ink = text_ink(item, &self.look());
         if let Some(mut input) = self.editor.borrow_mut::<TextInput>() {
-            input.set_font_size(cx, self.label.text_style.font_size * self.camera.scale as f32);
+            input.set_font_size(cx, pt * scale as f32);
             // The caret takes the item's ink, so it shows on light and dark notes alike.
-            let ink = text_ink(item);
             input.draw_text.color = ink;
             input.draw_cursor.draw_vars.set_uniform(cx, live_id!(color), &[ink.x, ink.y, ink.z, ink.w]);
         }
         cx.push_clip_rect(clip);
         self.editor.draw_walk_all(cx, scope, Walk::abs_rect(r));
         cx.pop_clip_rect();
+    }
+
+    /// The zoom cluster in the bottom-right corner, over a board with something on it; Present
+    /// shows the board alone.
+    fn draw_nav(&mut self, cx: &mut Cx2d, scope: &mut Scope, clip: Rect) {
+        self.nav_shown = self.present.is_none() && !self.is_empty();
+        if !self.nav_shown { return }
+        self.nav.button(cx, ids!(zoom_level)).set_text(cx, &format!("{:.0} %", self.camera.scale * 100.));
+        let layout = Layout { align: Align { x: 1., y: 1. }, padding: Inset { left: NAV_MARGIN, right: NAV_MARGIN,
+            top: NAV_MARGIN, bottom: NAV_MARGIN }, ..Layout::flow_down() };
+        cx.begin_turtle(Walk::abs_rect(clip), layout);
+        self.nav.draw_all(cx, scope);
+        cx.end_turtle();
+    }
+
+    /// The cluster takes the pointer events over it, and its buttons step or fit the zoom.
+    /// Whether the event was the cluster's.
+    fn nav_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) -> bool {
+        if !self.nav_shown { return false }
+        let actions = cx.capture_actions(|cx| self.nav.handle_event(cx, event, scope));
+        let pressed = |path| self.nav.button(cx, path).clicked(&actions);
+        let step = if pressed(ids!(zoom_in)) {
+            Some(Some(ZOOM_STEP))
+        } else if pressed(ids!(zoom_out)) {
+            Some(Some(1. / ZOOM_STEP))
+        } else if pressed(ids!(zoom_level)) {
+            Some(None)
+        } else {
+            None
+        };
+        if let Some(step) = step {
+            match step {
+                Some(by) => self.zoom_step(cx, by),
+                None => self.fit_board(cx),
+            }
+            // The board keeps the keys: Space, H and the zoom keys go on working.
+            cx.set_key_focus_from_user(self.area);
+        }
+        let at = match event {
+            Event::MouseDown(e) => e.abs,
+            Event::MouseMove(e) => e.abs,
+            Event::Scroll(e) => e.abs,
+            _ => return false,
+        };
+        // A drag the board holds goes on across the cluster.
+        self.nav.area().clipped_rect(cx).contains(at) && !cx.fingers.is_area_captured(self.local_area)
     }
 
     fn editor_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) -> bool {
@@ -904,11 +1317,11 @@ impl BoardCanvas {
     }
 
     pub fn show_invitation(&self) -> bool {
-        self.is_empty() && self.tool == BoardTool::Select && self.toolbar_drag.is_none()
+        self.is_empty() && !self.tool.places() && self.toolbar_drag.is_none()
     }
 
     pub fn drag_tool(&mut self, cx: &mut Cx, tool: BoardTool, toolbar: WidgetRef) {
-        if self.toolbar_drag.is_some() || tool == BoardTool::Select { return }
+        if self.toolbar_drag.is_some() || !tool.places() { return }
         let chip = cx.with_vm(|vm| WidgetRef::script_from_value(vm, self.tool_chip.as_object().into()));
         chip.label(cx, ids!(label)).set_text(cx, tool.label());
         let payload = DragItem::String { value: tool.label().into(), internal_id: Some(live_id!(board_creation_tool)) };
@@ -1005,12 +1418,161 @@ impl BoardCanvas {
         }
     }
 
+    fn schedule_live(&mut self, cx: &mut Cx) {
+        if self.live_frame.0 == 0 { self.live_frame = cx.new_next_frame(); }
+    }
+
+    fn end_live(&mut self, cx: &mut Cx, dropped: bool) {
+        if let Some(board) = self.board_id() {
+            if self.live_out.end(cx, board, dropped) { self.schedule_live(cx); }
+        }
+        self.drag_pointer = None;
+    }
+
+    fn update_live(&mut self, cx: &mut Cx, dropped: bool) {
+        let Some((screen, _)) = self.drag_pointer else { return };
+        let pointer = self.camera.world_at(screen);
+        if let (Some(board), Some(preview)) = (self.board_id(), self.gesture.moving()) {
+            if self.live_out.moving(cx, board, preview, pointer) { self.schedule_live(cx); }
+        } else {
+            self.end_live(cx, dropped);
+        }
+    }
+
+    pub(super) fn poll_live(&mut self, cx: &mut Cx, event: &Event, model: &crate::model::Model,
+        relay: Option<&mut impl crate::tweak::Relay>, messages: Vec<(crate::tweak::Seat, Vec<u8>)>) {
+        let board = self.board_id();
+        if self.live_out.beat(event, board) { self.schedule_live(cx); }
+        let mut redraw = self.live_in.expire(cx, event, board);
+        for (seat, body) in messages {
+            redraw |= self.live_in.receive(cx, &model.state, seat, &body, board);
+        }
+        if redraw { self.request_overlay(cx); }
+        if matches!(event, Event::NextFrame(frame) if frame.set.contains(&self.live_frame)) {
+            self.live_frame = NextFrame::default();
+            self.live_out.frame(model, relay);
+        }
+    }
+
+    fn draw_live(&mut self, cx: &mut Cx2d, clip: Rect) {
+        if self.live_in.ghosts.is_empty() { return }
+        let Some(scene) = &self.scene else { return };
+        let camera = self.camera;
+        let screen = |p| camera.local_to_screen(camera.world_to_local(p));
+        let previous = (self.outline.color, self.share_label.color);
+        cx.push_clip_rect(clip);
+        for ((_, board), ghost) in &mut self.live_in.ghosts {
+            if *board != scene.id { continue }
+            let start = makepad_platform::monotonic_seconds();
+            let ring = Surface { border: 2., border_color: ghost.colour, ..Surface::FLAT };
+            for id in &ghost.motion.ids {
+                let Some(item) = scene.view.get(id) else { continue };
+                let r = rect(ghost.motion.transform.item_rect(item));
+                let at = Rect { pos: screen(r.pos), size: r.size * camera.scale };
+                if at.intersects(clip) { card(&mut self.card, cx, at, vec4(0., 0., 0., 0.), &ring); }
+            }
+            let point = screen(ghost.motion.pointer);
+            if clip.contains(point) {
+                self.outline.color = ghost.colour;
+                // A small crosshair stays the same size as the camera zooms.
+                for (offset, size) in [(dvec2(-5., -1.), dvec2(11., 2.)), (dvec2(-1., -5.), dvec2(2., 11.))] {
+                    self.outline.draw_abs(cx, Rect { pos: point + offset, size });
+                }
+                let text = self.share_label.layout(cx, 0., 0., None, false, Align::default(), &ghost.name);
+                let size = dvec2(text.size_in_lpxs.width as f64, text.size_in_lpxs.height as f64)
+                    * self.share_label.font_scale as f64 + dvec2(6., 2.);
+                let pos = dvec2((point.x + 7.).min(clip.pos.x + clip.size.x - size.x).max(clip.pos.x),
+                    (point.y + 7.).min(clip.pos.y + clip.size.y - size.y).max(clip.pos.y));
+                self.outline.draw_abs(cx, Rect { pos, size });
+                let c = ghost.colour;
+                self.share_label.color = if 0.2126*c.x + 0.7152*c.y + 0.0722*c.z > 0.52 {
+                    vec4(0., 0., 0., 1.)
+                } else { vec4(1., 1., 1., 1.) };
+                self.share_label.draw_walk_laidout(cx, Walk::abs_rect(Rect { pos: pos + dvec2(3., 1.), size }), &text);
+            }
+            ghost.drew(start);
+        }
+        cx.pop_clip_rect();
+        (self.outline.color, self.share_label.color) = previous;
+    }
+
+    /// Refresh on a presence/window change. The overlay can repaint without rebuilding the board recording.
+    pub fn set_app_presence(&mut self, cx: &mut Cx, item: Id, window: usize, size: [f64; 2], view: &crate::tweak::SeatView, state: &State) {
+        let next = Selections::new(window, size, view, state);
+        if self.app_presence.get(&item) != Some(&next) {
+            self.app_presence.insert(item, next);
+            self.request_overlay(cx);
+        }
+    }
+
+    pub fn clear_app_presence(&mut self, cx: &mut Cx, item: Id) {
+        if self.app_presence.remove(&item).is_some() { self.request_overlay(cx); }
+    }
+
+    /// A click on the displayed share uses the same letterbox transform as the selection overlay.
+    pub fn app_pick_at(&self, item: Id, screen: DVec2) -> Option<crate::tweak::At> {
+        let presence = self.app_presence.get(&item)?;
+        let point = overlay::board_window_point(self.app_view_rect(item)?, presence.window_size, screen)?;
+        overlay::pick_at(presence.window, point, presence.window_size)
+    }
+
+    fn app_view_rect(&self, id: Id) -> Option<Rect> {
+        let item = self.scene.as_ref()?.view.get(&id)?;
+        let r = rect(self.gesture.preview.as_ref().and_then(|p| p.rect(&id)).unwrap_or(item.rect));
+        Some(Rect { pos: self.camera.local_to_screen(self.camera.world_to_local(r.pos)), size: r.size * self.camera.scale })
+    }
+
+    fn draw_app_selections(&mut self, cx: &mut Cx2d, clip: Rect) {
+        cx.push_clip_rect(clip);
+        for (id, presence) in &self.app_presence {
+            if let Some(view) = self.app_view_rect(*id).filter(|r| r.intersects(clip)) {
+                overlay::draw_selections(cx, view, presence, &mut self.outline, &mut self.share_label);
+            }
+        }
+        cx.pop_clip_rect();
+    }
+
     fn draw_outlines(&mut self, cx: &mut Cx2d, clip: Rect) {
+        let look = self.look();
+        let accent = self.board_selection;
+        self.outline.color = accent;
         let scene = self.scene.as_ref();
         let g = &self.gesture;
         let camera = self.camera;
         let dpi = cx.current_dpi_factor();
         cx.push_clip_rect(clip);
+        // A rounded ring a little outside each selected or hovered item, and under the pointer an
+        // object rises: a wider shadow outside its outline. Neither moves anything.
+        for &id in g.selection.ids.iter().chain(g.hover.iter().filter(|id| !g.selection.ids.contains(*id))) {
+            let Some(scene) = scene else { break };
+            let (Some(item), Some(face)) = (scene.view.get(&id), scene.faces.get(&id)) else { continue };
+            let selected = g.selection.ids.contains(&id);
+            let r = rect(g.preview.as_ref().and_then(|p| p.rect(&id)).unwrap_or(item.rect));
+            let body = body_of(&item.kind, &face.shape);
+            let s = item_surface(item, body, item_colour(item, &look), r.size, &look);
+            let k = camera.scale as f32;
+            let at = Rect { pos: camera.local_to_screen(camera.world_to_local(r.pos)), size: r.size * camera.scale };
+            if g.preview.is_none() && g.hover.iter().any(|h| *h == id) {
+                if let Some(l) = look::lift(body) {
+                    let up = l.raised(1.6, 1.6);
+                    let up = Lift { blur: up.blur * k, offset: up.offset * k, alpha: up.alpha * 0.6, contact: 0., ..up };
+                    cast(&mut self.shadow, cx, at, &Surface { radius: s.radius * k, ..s }, up, &look, 0.);
+                }
+            }
+            let pen = if selected { 2. } else { 1.5 };
+            let reach = 3. + pen;
+            let ring = Surface {
+                radius: s.radius * k + reach as f32,
+                border: pen as f32,
+                border_color: if selected { accent } else { vec4(accent.x, accent.y, accent.z, accent.w * 0.55) },
+                ..Surface::FLAT
+            };
+            let pos = snap_to_pixel(at.pos - dvec2(reach, reach), dpi);
+            card(&mut self.card, cx, Rect { pos, size: at.size + dvec2(2. * reach, 2. * reach) }, vec4(0., 0., 0., 0.), &ring);
+            if item.locked {
+                draw_lock(cx, &mut self.outline, self.grid.color_a, dvec2(at.pos.x + at.size.x, at.pos.y), None);
+            }
+        }
         let mut outline = |r: Bounds, weight: f64, locked: bool, marquee: bool| {
             let point = |x, y| snap_to_pixel(camera.local_to_screen(camera.world_to_local(dvec2(x, y))), dpi);
             let top_left = point(r.x0, r.y0);
@@ -1039,12 +1601,6 @@ impl BoardCanvas {
                 draw_lock(cx, &mut self.outline, self.grid.color_a, dvec2(bottom_right.x, top_left.y), None);
             }
         };
-        for &id in g.selection.ids.iter().chain(g.hover.iter().filter(|id| !g.selection.ids.contains(*id))) {
-            if let Some(item) = scene.and_then(|s| s.view.get(&id)) {
-                let r = g.preview.as_ref().and_then(|p| p.rect(&id)).unwrap_or(item.rect);
-                outline(r, if g.selection.ids.contains(&id) { 2. } else { 1. }, item.locked, false);
-            }
-        }
         if let Some(preview) = &g.preview {
             for id in preview.pinned.difference(&g.selection.ids) {
                 if let Some(item) = scene.and_then(|s| s.view.get(id)) {
@@ -1066,32 +1622,112 @@ impl BoardCanvas {
             outline(ghost.rect, 1., false, true);
         }
         let screen = |p| snap_to_pixel(camera.local_to_screen(camera.world_to_local(p)), dpi);
-        for (axis, guide) in self.ghost.as_ref().map_or(&g.guides, |p| &p.guides).iter().enumerate() {
-            if let Some(g) = guide {
-                let (a, b) = if axis == 0 {
-                    (dvec2(g.line, g.start), dvec2(g.line, g.end))
-                } else {
-                    (dvec2(g.start, g.line), dvec2(g.end, g.line))
-                };
-                let pos = screen(a);
-                let size = screen(b) - pos;
-                self.outline.draw_abs(cx, Rect { pos, size: dvec2(size.x.max(1.), size.y.max(1.)) });
+        let mut draw_segment = |(a, b)| {
+            let pos = screen(a);
+            let size = screen(b) - pos;
+            self.outline.draw_abs(cx, Rect { pos, size: dvec2(size.x.max(1.), size.y.max(1.)) });
+        };
+        if let Some(ghost) = &self.ghost {
+            for (axis, guide) in ghost.guides.iter().enumerate() {
+                if let Some(g) = guide { draw_segment(g.segment(axis)); }
             }
+        } else {
+            g.snap_segments().for_each(draw_segment);
         }
         if let Some(b) = bounds {
-            let accent = self.outline.color;
+            let knob = Surface { radius: 2.5, border: 1.5, border_color: accent, ..Surface::FLAT };
             for handle in Handle::ALL {
-                let pos = screen(handle.point(b, camera.scale)) - dvec2(4., 4.);
-                self.outline.draw_abs(cx, Rect { pos, size: dvec2(8., 8.) });
-                self.outline.color = self.grid.color_a;
-                self.outline.draw_abs(cx, Rect { pos: pos + dvec2(2., 2.), size: dvec2(4., 4.) });
-                self.outline.color = accent;
+                let pos = screen(handle.point(b, camera.scale)) - dvec2(4.5, 4.5);
+                card(&mut self.card, cx, Rect { pos, size: dvec2(9., 9.) }, look.ink, &knob);
             }
         }
         cx.pop_clip_rect();
     }
 
+    /// Whether the board is being presented.
+    pub fn presenting(&self) -> bool {
+        self.present.is_some()
+    }
+
+    /// Present the board along its path, starting from the first step that can be shown. With
+    /// no such step it presents the selection, else the whole board. Esc ends it and puts the
+    /// camera back. Returns whether it is presenting.
+    pub fn present(&mut self, cx: &mut Cx) -> bool {
+        if self.present.is_some() {
+            return true;
+        }
+        let Some(scene) = &self.scene else { return false };
+        let targets = scene.present_targets(&self.gesture.selection.ids);
+        let now = makepad_platform::monotonic_seconds();
+        let mut present = Present::start(self.camera);
+        if !present.next(&targets, now) {
+            return false;
+        }
+        self.finish_text(cx, true);
+        self.placement_start = None;
+        self.ghost = None;
+        self.toolbar_drag = None;
+        self.gesture.cancel();
+        self.end_live(cx, false);
+        self.present = Some(present);
+        self.overlay_pending = true;
+        cx.set_key_focus_from_user(self.area);
+        self.glide_frame(cx, now);
+        true
+    }
+
+    /// Stop presenting: the camera goes back to where it was before.
+    pub fn end_present(&mut self, cx: &mut Cx) {
+        if let Some(present) = self.present.take() {
+            let view = self.camera.view;
+            self.camera = present.end();
+            self.camera.view = view;
+            self.overlay_pending = true;
+            self.request(cx);
+        }
+    }
+
+    fn present_move(&mut self, cx: &mut Cx, forward: bool) {
+        let (Some(scene), Some(present)) = (&self.scene, &mut self.present) else { return };
+        let targets = scene.present_targets(&self.gesture.selection.ids);
+        let now = makepad_platform::monotonic_seconds();
+        if if forward { present.next(&targets, now) } else { present.previous(&targets, now) } {
+            self.glide_frame(cx, now);
+        }
+    }
+
+    // The presented camera at `now`, with frames requested while it glides.
+    fn glide_frame(&mut self, cx: &mut Cx, now: f64) {
+        let Some(present) = &self.present else { return };
+        self.camera = present.camera(now);
+        if present.gliding(now) {
+            self.next_frame = cx.new_next_frame();
+        }
+        self.request(cx);
+    }
+
+    // While presenting, the board takes only the keys and clicks that move along the path.
+    fn present_input(&mut self, cx: &mut Cx, event: &Event) {
+        match event.hits(cx, self.area) {
+            Hit::KeyDown(k) if !k.modifiers.logo && !k.modifiers.control && !k.modifiers.alt => match k.key_code {
+                KeyCode::ArrowRight | KeyCode::ArrowDown | KeyCode::PageDown | KeyCode::Space | KeyCode::ReturnKey => {
+                    self.present_move(cx, true)
+                }
+                KeyCode::ArrowLeft | KeyCode::ArrowUp | KeyCode::PageUp | KeyCode::Backspace => self.present_move(cx, false),
+                KeyCode::Escape => self.end_present(cx),
+                _ => {}
+            },
+            Hit::FingerDown(d) if d.is_primary_hit() => self.present_move(cx, true),
+            _ => {}
+        }
+    }
+
     fn input(&mut self, cx: &mut Cx, event: &Event) {
+        // Space lifts the hand wherever the key focus is, so a later drag never pans by mistake.
+        if matches!(event, Event::KeyUp(k) if k.key_code == KeyCode::Space) && self.gesture.space {
+            self.gesture.space = false;
+            cx.set_cursor(MouseCursor::Default);
+        }
         let camera = self.camera;
         self.drag_event(cx, event);
         if camera.scale <= 0. {
@@ -1117,10 +1753,10 @@ impl BoardCanvas {
             let scene = self.scene.as_ref();
             let world = |point| camera.world_at(camera.local_to_screen(point));
             match hit {
-                Hit::FingerDown(d) if d.is_primary_hit() || d.mouse_button().is_some_and(|b| b.is_middle()) => {
+                Hit::FingerDown(d) if d.is_primary_hit() || d.mouse_button().is_some_and(|b| b.is_middle() || b.is_secondary()) => {
                     cx.set_key_focus_from_user(self.area);
                     let space = cx.keyboard.is_key_down(KeyCode::Space) || self.gesture.space;
-                    if self.tool != BoardTool::Select && !space && d.is_primary_hit() {
+                    if self.tool.places() && !space && d.is_primary_hit() {
                         let screen = camera.local_to_screen(d.abs);
                         // Nothing is drawn on press: click or drag is decided by the first
                         // move past the slop, or by the release.
@@ -1130,6 +1766,7 @@ impl BoardCanvas {
                         redraw = true;
                     } else if let Some(scene) = scene {
                         let p = world(d.abs);
+                        self.gesture.set_viewport(&scene.view, camera_bounds(camera));
                         let id = scene.pick(p);
                         let interior = id.and_then(|id| scene.view.get(&id)).is_some_and(|i| {
                             let b = i.rect;
@@ -1137,11 +1774,13 @@ impl BoardCanvas {
                             i.kind == kind::SECTION && p.x > b.x0 + edge && p.x < b.x1 - edge
                                 && p.y > b.y0 + 20. / camera.scale && p.y < b.y1 - edge
                         });
-                        let pan = space || d.mouse_button().is_some_and(|b| b.is_middle());
+                        let pan = space || self.tool == BoardTool::Hand
+                            || d.mouse_button().is_some_and(|b| b.is_middle() || b.is_secondary());
                         let screen = camera.local_to_screen(d.abs);
                         let handle = self.gesture.hit_handle(&scene.view, p, camera.scale);
                         if let Some(handle) = handle.filter(|_| !pan) {
-                            self.gesture.press_handle(&scene.view, handle, screen);
+                            self.gesture.press_handle(&scene.view, handle, p);
+                            self.drag_pointer = Some((screen, d.modifiers));
                         } else {
                             self.gesture.handle = None;
                             self.gesture.press(&scene.view, id, p, screen, d.modifiers.shift, pan.then_some(camera.pan), interior);
@@ -1169,7 +1808,9 @@ impl BoardCanvas {
                 }
                 Hit::FingerMove(m) if self.gesture.pointer_active() => {
                     if let Some(scene) = scene {
-                        let pan = self.gesture.motion(&scene.view, world(m.abs), camera.local_to_screen(m.abs),
+                        let screen = camera.local_to_screen(m.abs);
+                        self.drag_pointer = Some((screen, m.modifiers));
+                        let pan = self.gesture.motion(&scene.view, world(m.abs), screen,
                             camera.scale, m.modifiers.alt, m.modifiers.shift);
                         if let Some(pan) = pan {
                             self.pan(cx, pan);
@@ -1187,13 +1828,20 @@ impl BoardCanvas {
                         // motion already checked the drag distance in screen pixels.
                         let clicked = self.gesture.clicked_item()
                             .filter(|_| !u.has_long_press_occurred && u.time - u.capture_time < TAP_COUNT_TIME);
+                        // A release may be the event that first crosses the drag threshold.
+                        if let Some(preview) = self.gesture.moving() {
+                            self.live_out.moving(cx, scene.id, preview, world(u.abs));
+                            self.drag_pointer = Some((camera.local_to_screen(u.abs), u.modifiers));
+                        }
                         action = self.gesture.release(&scene.view).map(BoardCanvasAction::Act);
                         self.gesture.handle = if u.is_over {
                             self.gesture.hit_handle(&scene.view, world(u.abs), camera.scale)
                         } else { None };
                         self.gesture.hover = if u.is_over { scene.pick(world(u.abs)) } else { None };
                         if let Some(id) = clicked.filter(|id| self.gesture.hover == Some(*id)) {
-                            if u.tap_count >= 2 && previous_click == Some(id) {
+                            if let Some(at) = self.app_pick_at(id, camera.local_to_screen(u.abs)) {
+                                cx.widget_action(self.widget_uid(), AppPick { item: id, at });
+                            } else if u.tap_count >= 2 && previous_click == Some(id) {
                                 self.open_text(cx, id, false);
                             } else {
                                 self.last_click = Some(id);
@@ -1220,11 +1868,15 @@ impl BoardCanvas {
                     redraw = self.gesture.hover.take().is_some();
                 }
                 Hit::FingerScroll(s) => {
-                    let delta = s.scroll * camera.scale;
-                    if s.modifiers.control || s.modifiers.logo {
-                        self.zoom(cx, camera.local_to_screen(s.abs), camera.scale * (-delta.y * 0.012).exp());
-                    } else {
-                        self.pan(cx, camera.pan - delta);
+                    if let Some((_, mods)) = &mut self.drag_pointer { *mods = s.modifiers; }
+                    // A wheel reports neither a precise delta nor a gesture phase.
+                    let wheel = match event {
+                        Event::Scroll(e) => e.is_mouse || e.phase == ScrollPhase::None,
+                        _ => true,
+                    };
+                    match scroll_nav(s.scroll * camera.scale, wheel, &s.modifiers) {
+                        ScrollNav::Zoom(by) => self.zoom(cx, camera.local_to_screen(s.abs), camera.scale * by),
+                        ScrollNav::Pan(by) => self.pan(cx, camera.pan + by),
                     }
                     if let Event::Scroll(e) = &mapped {
                         e.handled_x.set(true);
@@ -1275,14 +1927,19 @@ impl BoardCanvas {
                             self.gesture.space = true;
                             cursor = true;
                         }
-                        KeyCode::KeyF | KeyCode::Key0 => {
-                            if let Some(fit) = self.fit(camera.view) {
-                                self.change_camera(cx, fit);
-                            }
+                        KeyCode::KeyH if !k.modifiers.any() && !k.is_repeat => {
+                            self.arm(cx, if self.tool == BoardTool::Hand { BoardTool::Select } else { BoardTool::Hand });
+                            cursor = true;
                         }
-                        KeyCode::Key1 => self.zoom(cx, camera.view.center(), 1.),
-                        KeyCode::Equals => self.zoom(cx, camera.view.center(), camera.scale * 2.),
-                        KeyCode::Minus => self.zoom(cx, camera.view.center(), camera.scale * 0.5),
+                        KeyCode::KeyF if !k.modifiers.any() => self.fit_board(cx),
+                        KeyCode::Key1 if k.modifiers.shift && !command => self.fit_board(cx),
+                        KeyCode::F5 if !k.is_repeat && !had_preview && !self.gesture.pointer_active() => {
+                            self.present(cx);
+                        }
+                        KeyCode::Key0 if command => self.zoom(cx, camera.view.center(), 1.),
+                        KeyCode::Key1 if !k.modifiers.any() => self.zoom(cx, camera.view.center(), 1.),
+                        KeyCode::Equals | KeyCode::NumpadAdd => self.zoom_step(cx, ZOOM_STEP),
+                        KeyCode::Minus | KeyCode::NumpadSubtract => self.zoom_step(cx, 1. / ZOOM_STEP),
                         KeyCode::KeyZ if command && !k.is_repeat && !had_preview => {
                             action = Some(if k.modifiers.shift { BoardCanvasAction::Redo } else { BoardCanvasAction::Undo });
                         }
@@ -1340,6 +1997,15 @@ impl BoardCanvas {
                 _ => {}
             }
         }
+        if let Event::KeyDown(k) | Event::KeyUp(k) = event {
+            if let Some((_, mods)) = &mut self.drag_pointer {
+                if mods.alt != k.modifiers.alt || mods.shift != k.modifiers.shift {
+                    *mods = k.modifiers;
+                    self.refresh_drag();
+                    redraw = true;
+                }
+            }
+        }
         if self.placement_start.is_some() && (!cx.fingers.is_area_captured(self.local_area)
             || matches!(event, Event::WindowLostFocus(_))) {
             self.placement_start = None;
@@ -1351,13 +2017,14 @@ impl BoardCanvas {
             redraw = true;
             cursor = true;
         }
-        if cursor && self.tool != BoardTool::Select && !self.gesture.space {
+        if cursor && self.tool.places() && !self.gesture.space {
             cx.set_cursor(MouseCursor::Crosshair);
         } else if cursor {
             if let Some(scene) = &self.scene {
-                cx.set_cursor(self.gesture.cursor(&scene.view));
+                cx.set_cursor(self.gesture.cursor(&scene.view, self.tool == BoardTool::Hand));
             }
         }
+        self.update_live(cx, matches!(action, Some(BoardCanvasAction::Act(_))));
         if had_preview != self.gesture.preview.is_some() {
             if let Some(scene) = &mut self.scene {
                 scene.lift(self.gesture.preview.as_ref());
@@ -1389,14 +2056,28 @@ impl Widget for BoardCanvas {
         }
         if !recording.begin_maybe(cx, changed).is_not_redrawing() {
             self.repaint_pending = false;
+            let previous = self.camera;
             self.camera.view = view;
-            if self.camera.scale == 0. || self.fit_pending {
+            if let Some(present) = &mut self.present {
+                // The window may have resized, or the shown step's target moved.
+                let now = makepad_platform::monotonic_seconds();
+                let targets = self.scene.as_ref().map(|s| s.present_targets(&self.gesture.selection.ids)).unwrap_or_default();
+                present.refit(&targets, view, now);
+                self.camera = present.camera(now);
+                if present.gliding(now) {
+                    self.next_frame = cx.new_next_frame();
+                }
+            } else if self.camera.scale == 0. || self.fit_pending {
                 self.camera = self
                     .fit(view)
                     .unwrap_or_else(|| Camera::new(view, CameraState { pan_x: 0., pan_y: 0., zoom: 1. }));
                 self.fit_pending = false;
             }
             let camera = self.camera;
+            if previous.view != camera.view || previous.scale != camera.scale || previous.pan != camera.pan {
+                self.refresh_drag();
+                self.update_live(cx, false);
+            }
             // Keep the dots legible as the camera crosses a zoom octave.
             let grid_cell = 18. * 2f64.powf((1. / camera.scale).log2().round()) * camera.scale;
             self.grid.cell = grid_cell as f32;
@@ -1407,7 +2088,7 @@ impl Widget for BoardCanvas {
             self.grid.draw_abs(cx, clip);
             let mut layer = self.layer.take().unwrap_or_else(|| CanvasLayer::new(cx));
             let scope = layer.begin(cx, &camera, clip);
-            self.draw_board(cx, camera, clip, false);
+            let waiting = self.draw_board(cx, camera, clip, false);
             scope.end(cx);
             self.layer = Some(layer);
             self.recording.as_mut().unwrap().end(cx);
@@ -1420,7 +2101,8 @@ impl Widget for BoardCanvas {
             }
             self.pressure = next;
             self.last_load = load;
-            if again {
+            // Text still waiting for its fit gets it over the next frames.
+            if again || waiting {
                 self.repaint_pending = true;
                 cx.redraw_area_in_draw(self.area);
             }
@@ -1431,19 +2113,34 @@ impl Widget for BoardCanvas {
             if self.gesture.preview.is_some() {
                 let mut layer = self.preview_layer.take().unwrap_or_else(|| CanvasLayer::new(cx));
                 let scope = layer.begin(cx, &self.camera, clip);
-                self.draw_board(cx, self.camera, clip, true);
+                if self.draw_board(cx, self.camera, clip, true) {
+                    self.overlay_pending = true;
+                    cx.redraw_area_in_draw(self.area);
+                }
                 scope.end(cx);
                 self.preview_layer = Some(layer);
             }
-            self.draw_outlines(cx, clip);
+            self.draw_app_selections(cx, clip);
+            self.draw_live(cx, clip);
+            if self.present.is_none() {
+                self.draw_outlines(cx, clip);
+            }
             self.overlay.as_mut().unwrap().end(cx);
         }
         self.draw_editor(cx, scope, clip);
+        self.draw_nav(cx, scope, clip);
         DrawStep::done()
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        if !self.editor_event(cx, event, scope) { self.input(cx, event); }
+        if self.next_frame.is_event(event).is_some() {
+            self.glide_frame(cx, makepad_platform::monotonic_seconds());
+        }
+        if self.present.is_some() {
+            self.present_input(cx, event);
+        } else if !self.nav_event(cx, event, scope) && !self.editor_event(cx, event, scope) {
+            self.input(cx, event);
+        }
     }
 }
 

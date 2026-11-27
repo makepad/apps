@@ -10,16 +10,17 @@
 //! formats: MOD, S3M, XM, IT, SID, NSF, SPC, VGM, GBS). The library's tools
 //! for the chat are here too.
 
-use crate::desk::run::Answer;
+use crate::desk::run::{Answer, RequestJob};
 use crate::desk::Desk;
 use crate::library::Document;
 use crate::writer::AiWriter;
 use makepad_midi_library::chip::zophar;
 use makepad_midi_library::import::{self, About, Options};
 use makepad_midi_library::{arranger, index, tools};
-use makepad_music_iter::gen::TurnMonitor;
+use makepad_music_iter::gen::{TurnMonitor, Writer};
 use makepad_strict_json::{self as json, Value as Json};
 use makepad_widgets::makepad_platform::file_dialogs::{FileDialog, FileDialogAction};
+use makepad_widgets::makepad_platform::thread::SubmitError;
 use makepad_widgets::*;
 use std::path::{Path, PathBuf};
 use makepad_score_live::PrepareControl;
@@ -158,16 +159,24 @@ impl OpenMusic {
 
 struct Arranging {
     title: String,
-    job: SongJob<(String, String)>,
+    job: RequestJob<Result<(String, String), String>>,
     progress: Receiver<String>,
-    cancel: PrepareControl,
     monitor: TurnMonitor,
 }
 
-impl Drop for Arranging {
-    fn drop(&mut self) {
-        self.cancel.cancel();
-        self.job.cancel();
+impl Arranging {
+    fn start(cx: &Cx, title: &str, control: PrepareControl, writer: impl Writer + 'static, monitor: TurnMonitor,
+        open: impl FnOnce() -> Result<(makepad_midi_library::arrangement::Arrangement, String), String> + Send + 'static,
+    ) -> Result<Self, SubmitError> {
+        let (say, progress) = channel();
+        let job = RequestJob::submit_in(cx, Class::Background, control, move |flag| async move {
+            let (arrangement, source) = open()?;
+            let arranged = arranger::arrange_async(&writer, &arrangement, &source, &flag, &|p| {
+                let _ = say.send(p.to_string());
+            }).await?;
+            Ok((arranged.similarity.line(), arranged.source))
+        })?;
+        Ok(Self { title: title.into(), job, progress, monitor })
     }
 }
 
@@ -335,8 +344,7 @@ impl SongLibrary {
             ui.modal(cx, ids!(song_library_panel)).close(cx);
         }
         if ui.button(cx, ids!(songs_stop)).clicked(actions) && self.arranging.is_some() {
-            self.arranging = None;
-            self.status = "Arranging stopped.".into();
+            self.stop_arranging();
             ui.label(cx, ids!(songs_status)).set_text(cx, &self.status);
             ui.button(cx, ids!(songs_stop)).set_visible(cx, false);
         }
@@ -450,22 +458,18 @@ impl SongLibrary {
         desk.music_open_failed(error);
     }
 
+    fn stop_arranging(&mut self) {
+        self.arranging = None;
+        self.status = "Arranging stopped.".into();
+    }
+
     fn start_arranging(&mut self, cx: &mut Cx, ui: &WidgetRef, entry: index::Entry) {
         self.arranging = None;
-        let (say, progress) = channel();
         let title = entry.label();
         let writer = AiWriter::default();
         let monitor = writer.monitor.clone();
-        let cancel = PrepareControl::default();
-        let flag = cancel.clone();
-        let job = match cx.task_pool().submit_frame_job(Class::Background, move || {
-            let (arrangement, source) = open_entry(&entry)?;
-            let arranged = arranger::arrange(&writer, &arrangement, &source, &flag, &|p| {
-                let _ = say.send(p.to_string());
-            })?;
-            Ok((arranged.similarity.line(), arranged.source))
-        }) {
-            Ok(job) => job,
+        let arranging = match Arranging::start(cx, &title, PrepareControl::default(), writer, monitor, move || open_entry(&entry)) {
+            Ok(arranging) => arranging,
             Err(error) => {
                 self.status = format!("{title} was not arranged: {error}");
                 ui.label(cx, ids!(songs_status)).set_text(cx, &self.status);
@@ -474,7 +478,7 @@ impl SongLibrary {
             }
         };
         self.status = format!("Arranging {title}…");
-        self.arranging = Some(Arranging { title, job, progress, cancel, monitor });
+        self.arranging = Some(arranging);
         self.run(cx);
         ui.label(cx, ids!(songs_status)).set_text(cx, &self.status);
         ui.button(cx, ids!(songs_stop)).set_visible(cx, true);
@@ -529,7 +533,7 @@ impl SongLibrary {
             self.status = format!("Arranging {title}: {line}");
         }
         let quiet = arranging.monitor.not_responding();
-        let done = take_result(&mut arranging.job);
+        let done = arranging.job.try_take().map(|done| done.map_err(|error| error.to_string()).and_then(|result| result));
         if let Some(result) = done {
             self.arranging = None;
             match result {
@@ -565,20 +569,29 @@ pub fn tool(cx: &mut Cx, _ui: &WidgetRef, desk: &mut Desk, name: &str, args: &Js
     }
     let args = args.clone();
     desk.frame = cx.new_next_frame();
-    let control = makepad_score_live::PrepareControl::default();
-    desk.jobs.submit_tool(cx, "edit", Some(desk.revision), Some(control.clone()), move || {
+    submit_import(cx, desk, move || {
         let entries = index::load(&index::index_path()).map_err(|e| format!("the song library is not installed on this machine ({e}): install it from Resources"))?;
         let (entry, bytes) = tools::song(&entries, args.get("song").and_then(Json::as_str).unwrap_or(""))?;
         let presets = args.get("presets").and_then(Json::as_bool).unwrap_or(false);
         let imported = import::import(&bytes, &tools::about(&entry), &Options { presets, ..Options::default() })?;
-        let problems = crate::desk::run::check(&imported.source, &control)?;
+        Ok((entry.label(), imported))
+    })
+}
+
+// Finish decoding before awaiting the score so a suspended request holds no MIDI data.
+pub(crate) fn submit_import(cx: &Cx, desk: &mut Desk,
+    import: impl FnOnce() -> Result<(String, import::Imported), String> + Send + 'static,
+) -> Answer {
+    desk.jobs.submit_tool(cx, "edit", Some(desk.revision), PrepareControl::default(), move |control| async move {
+        let (title, import::Imported { source, parts, sections, .. }) = import()?;
+        let problems = crate::desk::run::check_async(&source, &control).await?;
         if !problems.is_empty() {
             return Err(format!("the imported score does not load:\n{}", problems.join("\n")));
         }
-        let parts = imported.parts.iter().map(|p| json::obj(vec![("name", json::s(p.name.clone())), ("role", json::s(p.role.name())), ("voice", json::s(p.voice.about())), ("notes", Json::Int(p.notes as i64))])).collect();
-        let sections = imported.sections.iter().map(|s| json::obj(vec![("name", json::s(s.name.clone())), ("bars", Json::Int((s.to - s.from) as i64))])).collect();
-        Ok(crate::desk::run::PreparedTool::Edit { source: imported.source, title: Some(entry.label()),
-            fields: vec![("song".into(), json::s(entry.label())), ("parts".into(), Json::Arr(parts)), ("sections".into(), Json::Arr(sections))] })
+        let parts = parts.iter().map(|p| json::obj(vec![("name", json::s(p.name.clone())), ("role", json::s(p.role.name())), ("voice", json::s(p.voice.about())), ("notes", Json::Int(p.notes as i64))])).collect();
+        let sections = sections.iter().map(|s| json::obj(vec![("name", json::s(s.name.clone())), ("bars", Json::Int((s.to - s.from) as i64))])).collect();
+        let fields = vec![("song".into(), json::s(title.clone())), ("parts".into(), Json::Arr(parts)), ("sections".into(), Json::Arr(sections))];
+        Ok(crate::desk::run::PreparedTool::Edit { source, title: Some(title), fields })
     })
 }
 
@@ -619,5 +632,40 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert!(import_file(Path::new("/nowhere/x.txt")).is_err());
         assert!(!is_music_file(Path::new("notes.txt")));
+
+        // Stop after the scripted model replies, while Songs is checking that turn's score.
+        use makepad_widgets::makepad_platform::thread::frame_jobs_new_frame;
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.use_closed_task_pool();
+        cx.use_inline_frame_jobs();
+        let pending_turn = || {
+            let word = PrepareControl::default();
+            let model_word = word.clone();
+            let writer = makepad_music_iter::gen::Scripted(move |_: &str, _: &[String]| {
+                assert!(!model_word.is_cancelled(), "Songs Stop must prevent the next model turn");
+                Ok("```splash\nuse mod.score.*\nvar sum = 0\nfor i in 0..1000000 { sum = sum + i }\nScore{}\n```".into())
+            });
+            let bytes = smf.clone();
+            let mut turn = Arranging::start(&cx, &title, word.clone(), writer, TurnMonitor::default(), move || {
+                let imported = import::import(&bytes, &About::default(), &Options::default())?;
+                Ok((imported.arrangement, imported.source))
+            }).unwrap();
+            frame_jobs_new_frame();
+            assert!(turn.job.try_take().is_none() && word.script_running(), "Songs must own the turn's suspended evaluation");
+            (turn, word)
+        };
+        let (turn, word) = pending_turn();
+        let mut songs = SongLibrary::default();
+        songs.arranging = Some(turn);
+        songs.stop_arranging();
+        assert!(songs.arranging.is_none() && word.is_cancelled() && !word.script_running(), "Songs Stop retires the job and releases its VM");
+
+        // Stop drops the handle. Retain a second one to inspect the arranger's reply to the same signal.
+        let (mut turn, word) = pending_turn();
+        word.cancel();
+        frame_jobs_new_frame();
+        assert!(matches!(turn.job.try_take(), Some(Ok(Err(why))) if why == "the arrangement was cancelled"),
+            "the next poll must answer cancelled");
+        assert!(!word.script_running(), "the cancelled reply must release the VM");
     }
 }

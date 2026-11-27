@@ -18,8 +18,10 @@ script_mod! {
     mod.widgets.FabLibraryPanelBase = #(FabLibraryPanel::register_widget(vm))
     mod.widgets.FabLibraryPanel = set_type_default() do mod.widgets.FabLibraryPanelBase{
         width: Fill height: Fill flow: Down
-        padding: Inset{top: 6 bottom: 4}
+        padding: Inset{top: 0 bottom: 4}
         show_bg: true draw_bg +: { color: fab.color_editor }
+        // the toolbar: the area's editor selector (and this editor's tools, when it has any)
+        editor_bar := mod.widgets.FabEditorBar{}
         library := mod.widgets.LibraryPanel{}
     }
 }

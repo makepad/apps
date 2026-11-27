@@ -189,10 +189,20 @@ pub struct Row {
     pub proposed: Option<String>,
 }
 
+/// Unmeasured words and the source statement that supplied them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WishRow {
+    pub doc: DocId,
+    pub words: String,
+    pub span: Range<u32>,
+}
+
 /// Every requirement of the project, judged, in document order.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Report {
     pub rows: Vec<Row>,
+    pub wishes: Vec<WishRow>,
+    pub brief: Option<WishRow>,
     /// Located mistakes across documents: a name used twice, a waiver of no requirement.
     pub notes: Vec<Diag>,
     pub pass: usize,
@@ -206,7 +216,7 @@ pub struct Report {
 impl Report {
     /// Every requirement passes or is waived: nothing fails and nothing is unknown.
     pub fn met(&self) -> bool {
-        self.fail == 0 && self.unknown == 0
+        !self.rows.is_empty() && self.fail == 0 && self.unknown == 0
     }
 
     /// Rows that pass or are waived, of all rows.
@@ -247,16 +257,30 @@ impl Measured {
 
 /// Judge every requirement of `docs` against `facts`. O(requirements x findings + facts).
 pub fn judge(docs: &[ReqDoc], facts: &Facts) -> Report {
+    judge_with_unavailable(docs, facts, |_| None)
+}
+
+/// Judge with a reason for each measure whose producer has no current evidence for this
+/// design. The ordinary cross-document naming and waiver rules apply to those rows too.
+pub fn judge_with_unavailable<'a>(docs: &[ReqDoc], facts: &Facts, unavailable: impl Fn(&Measure) -> Option<&'a str>) -> Report {
     let mut report = Report::default();
     let mut seen: Vec<&str> = Vec::new();
     for doc in docs {
+        report.wishes.extend(doc.wishes.iter().map(|w| WishRow { doc: doc.doc, words: w.words.clone(), span: w.span.clone() }));
+        if let Some(b) = &doc.brief {
+            if report.brief.is_some() {
+                report.notes.push(Diag::error("the project has one brief: this one repeats it", vec![source(doc.doc, &b.span)]));
+            } else {
+                report.brief = Some(WishRow { doc: doc.doc, words: b.words.clone(), span: b.span.clone() });
+            }
+        }
         for r in &doc.requirements {
             if seen.contains(&r.name.as_str()) {
                 report.notes.push(Diag::error(format!("two requirements are named {:?}: give each its own words", r.name), vec![source(doc.doc, &r.span)]));
                 continue;
             }
             seen.push(&r.name);
-            report.rows.push(row(doc.doc, r, facts));
+            report.rows.push(row(doc.doc, r, facts, unavailable(&r.measure)));
         }
     }
     for doc in docs {
@@ -296,10 +320,11 @@ fn source(doc: DocId, span: &Range<u32>) -> Sel {
     Sel::Source { doc, start: span.start, end: span.end }
 }
 
-fn row(doc: DocId, r: &Requirement, facts: &Facts) -> Row {
+fn row(doc: DocId, r: &Requirement, facts: &Facts, unavailable: Option<&str>) -> Row {
     let dim = r.measure.dim();
     let m = measure(&r.measure, facts);
-    let (status, value) = match &m.got {
+    let got = unavailable.map_or(m.got, |why| Got::Unknown(why.to_owned()));
+    let (status, value) = match &got {
         Got::Unknown(why) => (Status::Unknown(why.clone()), None),
         Got::Value(v) => {
             let shown = show(*v, dim);
@@ -338,8 +363,22 @@ fn unit<'f>(facts: &'f Facts, name: &str) -> Result<&'f UnitFacts, String> {
     })
 }
 
-fn board<'f>(facts: &'f Facts, name: &str) -> Result<&'f BoardMeasures, String> {
-    unit(facts, name)?.board.as_ref().ok_or_else(|| format!("{name} has no board"))
+fn resolve_board<'f>(facts: &'f Facts, name: Option<&str>, call: &str) -> Result<(&'f str, &'f BoardMeasures), String> {
+    if let Some(name) = name {
+        let unit = unit(facts, name)?;
+        let board = unit.board.as_ref().ok_or_else(|| format!("{name} has no board"))?;
+        return Ok((&unit.unit, board));
+    }
+    let boards: Vec<_> = facts.units.iter().filter_map(|u| Some((u.unit.as_str(), u.board.as_ref()?))).collect();
+    match boards.as_slice() {
+        [only] => Ok(*only),
+        [] if facts.units.len() == 1 => Err(format!("{} has no board", facts.units[0].unit)),
+        [] => Err("the design has no board yet".into()),
+        many => {
+            let names: Vec<_> = many.iter().map(|(unit, _)| *unit).collect();
+            Err(format!("the design has {} boards ({}): name one in {call}(\"unit\")", many.len(), names.join(", ")))
+        }
+    }
 }
 
 fn checks_stale(c: &CheckFacts) -> Option<String> {
@@ -349,36 +388,40 @@ fn checks_stale(c: &CheckFacts) -> Option<String> {
 fn measure(m: &Measure, facts: &Facts) -> Measured {
     let count = |n: u32| Got::Value(Value::Scalar(n as f64));
     match m {
-        Measure::BoardSize(u) => match board(facts, u) {
-            Ok(b) => match b.size {
-                Some(size) => Measured::new(Got::Value(Value::Size(size)), "board outline", Focus::Unit(u.clone())),
-                None => Measured::unknown(format!("{u}'s board has no outline yet"), "board outline", Focus::Unit(u.clone())),
+        Measure::BoardSize(u) => match resolve_board(facts, u.as_deref(), "board") {
+            Ok((u, b)) => match b.size {
+                Some(size) => Measured::new(Got::Value(Value::Size(size)), "board outline", Focus::Unit(u.into())),
+                None => Measured::unknown(format!("{u}'s board has no outline yet"), "board outline", Focus::Unit(u.into())),
             },
-            Err(why) => Measured::unknown(why, "board outline", Focus::Unit(u.clone())),
+            Err(why) => Measured::unknown(why, "board outline", u.clone().map_or(Focus::Findings, Focus::Unit)),
         },
-        Measure::BoardLayers(u) | Measure::BoardParts(u) | Measure::BoardUnplaced(u) => match board(facts, u) {
-            Ok(b) => {
+        Measure::BoardLayers(u) | Measure::BoardParts(u) | Measure::BoardUnplaced(u) => match resolve_board(facts, u.as_deref(), "board") {
+            Ok((u, b)) => {
                 let n = match m {
                     Measure::BoardLayers(_) => b.layers,
                     Measure::BoardParts(_) => b.parts,
                     _ => b.unplaced,
                 };
-                Measured::new(count(n), "board", Focus::Unit(u.clone()))
+                Measured::new(count(n), "board", Focus::Unit(u.into()))
             }
-            Err(why) => Measured::unknown(why, "board", Focus::Unit(u.clone())),
+            Err(why) => Measured::unknown(why, "board", u.clone().map_or(Focus::Findings, Focus::Unit)),
         },
         Measure::BoardUnrouted(u) => {
-            if let Err(why) = board(facts, u) {
-                return Measured::unknown(why, "checks", Focus::Unit(u.clone()));
-            }
+            let (u, _) = match resolve_board(facts, u.as_deref(), "board") {
+                Ok(board) => board,
+                Err(why) => return Measured::unknown(why, "checks", u.clone().map_or(Focus::Findings, Focus::Unit)),
+            };
             let Some(c) = &facts.checks else { return Measured::unknown("the checks have not run yet", "checks", Focus::Findings) };
-            let ids: Vec<u64> = c.findings.iter().filter(|f| f.unconnected && f.unit.as_deref() == Some(u.as_str())).map(|f| f.id).collect();
+            let ids: Vec<u64> = c.findings.iter().filter(|f| f.unconnected && f.unit.as_deref() == Some(u)).map(|f| f.id).collect();
             let mut out = Measured::new(count(ids.len() as u32), "checks", Focus::Findings);
             out.stale = checks_stale(c);
             out.findings = ids;
             out
         }
         Measure::Checks { family, unit: only, count: of } => {
+            if facts.units.is_empty() {
+                return Measured::unknown("nothing to check yet: the project has no circuit", "checks", Focus::Findings);
+            }
             if let Some(u) = only {
                 if let Err(why) = unit(facts, u) {
                     return Measured::unknown(why, "checks", Focus::Findings);
@@ -398,22 +441,23 @@ fn measure(m: &Measure, facts: &Facts) -> Measured {
             out
         }
         Measure::CaseFits(u) => {
-            if let Err(why) = board(facts, u) {
-                return Measured::unknown(why, "case checks", Focus::Case(u.clone()));
-            }
+            let (u, _) = match resolve_board(facts, u.as_deref(), "case") {
+                Ok(board) => board,
+                Err(why) => return Measured::unknown(why, "case checks", u.clone().map_or(Focus::Findings, Focus::Case)),
+            };
             if !facts.producers.cases {
-                return Measured::unknown("the case checks are not read here", "case checks", Focus::Case(u.clone()));
+                return Measured::unknown("the case checks are not read here", "case checks", Focus::Case(u.into()));
             }
-            match facts.cases.iter().find(|c| c.unit == *u) {
-                None => Measured::unknown(format!("the case checks have not run on {u} yet"), "case checks", Focus::Case(u.clone())),
-                Some(c) if !c.has_case => Measured::unknown(format!("{u} has no case on this plate"), "case checks", Focus::Case(u.clone())),
+            match facts.cases.iter().find(|c| c.unit == u) {
+                None => Measured::unknown(format!("the case checks have not run on {u} yet"), "case checks", Focus::Case(u.into())),
+                Some(c) if !c.has_case => Measured::unknown(format!("{u} has no case on this plate"), "case checks", Focus::Case(u.into())),
                 Some(c) => {
                     let shown = match c.errors.len() {
                         0 => "no case errors".to_owned(),
                         1 => "1 case error".to_owned(),
                         n => format!("{n} case errors"),
                     };
-                    let mut out = Measured::new(Got::Holds { ok: c.errors.is_empty(), shown }, "case checks", Focus::Case(u.clone()));
+                    let mut out = Measured::new(Got::Holds { ok: c.errors.is_empty(), shown }, "case checks", Focus::Case(u.into()));
                     out.stale = (!c.current).then(|| c.failed.as_ref().map_or_else(
                         || "the case checks have not run on the newest edit".to_owned(),
                         |why| format!("the case could not be rebuilt: {why}")));

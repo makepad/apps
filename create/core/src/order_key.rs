@@ -89,7 +89,7 @@ mod tests {
     }
 
     #[test]
-    fn adjacent_digits_and_prefixes_leave_room() {
+    fn adjacent_digits_and_prefixes_leave_town() {
         for (left, right) in [(&[8, 254][..], &[9][..]), (&[8], &[8, 1, 1, 2])] {
             let key = try_between(Some(left), Some(right)).unwrap();
             assert!(left < key.as_slice() && key.as_slice() < right, "room between {left:?} and {right:?}");

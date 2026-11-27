@@ -811,6 +811,7 @@ pub fn planned_input(whole: &LiveInput, tests: &[TestPrint], plan: &TestPlan) ->
             })
         },
         plate: Arc::new(Plate { excluded: Vec::new(), parts, settings: plate.settings.clone() }),
+        overlaps: None,
         paint: Arc::new(paint),
         frames: frames.map(Arc::new),
         machine: whole.machine.clone(),

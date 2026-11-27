@@ -38,6 +38,8 @@ script_mod! {
         flow: Down
         show_bg: true
         draw_bg +: { color: fab.color_editor }
+        // the toolbar: the area's editor selector (and this editor's tools, when it has any)
+        editor_bar := mod.widgets.FabEditorBar{}
         body := mod.widgets.FabScroll{
             flow: Down padding: 10 spacing: 6
             // the part and what it prints in, or why there is none; the link opens the Job tab's
@@ -145,7 +147,9 @@ impl Widget for FabForcePanel {
         let Event::Actions(actions) = event else { return };
         let v = &self.view;
         if v.button(cx, ids!(to_job)).clicked(actions) {
-            cx.action(ShowPanel(Editor::Settings));
+            // the job: the Printers editor's Jobs tab
+            cx.action(ShowPanel(Editor::Printer));
+            cx.action(crate::print::panel::ShowJobTab);
         }
         if let Some(anchor) = dropdown_clicked(actions, STUDY_AS_MENU) {
             let names = scope.data.get::<AppState>().map(|s| s.force.filaments.clone()).unwrap_or_default();

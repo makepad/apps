@@ -151,6 +151,11 @@ impl Docs {
         self.rev.iter().sum::<u64>() + self.asset_rev
     }
 
+    /// True when `texts()` would contain no files. Stops at the first present file without allocating.
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.sources.all_docs().iter().any(|d| d.present && d.is_file())
+    }
+
     /// The project documents by file name, as the plate stores them: O(documents) Arc clones. An
     /// empty system document is no file (the plate's load adds one back).
     pub fn texts(&self) -> Arc<BTreeMap<String, Arc<str>>> {
@@ -280,11 +285,11 @@ impl Docs {
         Ok(())
     }
 
-    /// Apply another writer's document changes as one undo step; assets are handled by the engine.
-    /// All or nothing, including revisions and the source map.
-    /// Cost per Cmd::Docs: O(documents + edited text + map entries), plus one Sources clone
-    /// (Arc texts, O(documents)); nothing per frame.
-    pub fn doc_set(&mut self, set: &[DocSet]) -> Result<(TextStep, TextStep), Diag> {
+    /// Plan a writer's document changes for a verifier. The returned sources already include
+    /// the text edits and presence changes. [`Docs::doc_set`] plans here, then installs.
+    /// Cost: one Sources clone (shared text), document lookups and circuit-board scans for
+    /// the changes, and a pass over the replaced texts.
+    pub fn plan_set(&self, set: &[DocSet]) -> Result<(Sources, SpanEdit), Diag> {
         let mut names = HashSet::new();
         for change in set {
             let name = match change {
@@ -297,13 +302,12 @@ impl Docs {
         }
         let mut sources = self.sources.clone();
         let mut edit = SpanEdit::default();
-        let mut present = Vec::new();
         let mut touched = HashSet::new();
         for change in set {
             match change {
                 DocSet::Add { name, text } => {
                     let doc = sources.add(name.clone(), text.clone())?;
-                    present.push((doc, true));
+                    edit.present.push((doc, true));
                 }
                 DocSet::Replace { name, base_rev, .. } | DocSet::Remove { name, base_rev } => {
                     let id = self.sources.find(name).ok_or_else(|| Diag::error(format!("no document named {name}"), vec![]))?;
@@ -320,7 +324,7 @@ impl Docs {
                             edit.edits.push(TextEdit::trimmed(id, &doc.text, text));
                         }
                     } else {
-                        present.push((id, false));
+                        edit.present.push((id, false));
                         if doc.kind == DocKind::Circuit {
                             for board in self.units.iter().filter(|unit| unit.docs.first() == Some(&id))
                                 .flat_map(|unit| &unit.docs).filter_map(|id| self.sources.doc(*id))
@@ -329,7 +333,7 @@ impl Docs {
                                 if !touched.insert(board.id) {
                                     return Err(Diag::error("one change per document", vec![Sel::Source { doc: board.id, start: 0, end: 0 }]));
                                 }
-                                present.push((board.id, false));
+                                edit.present.push((board.id, false));
                             }
                         }
                     }
@@ -338,10 +342,21 @@ impl Docs {
             }
         }
         sources.apply(&edit.edits)?;
-        for &(doc, value) in &present {
+        for &(doc, value) in &edit.present {
             sources.set_present(doc, value)?;
         }
-        edit.reevaluate = !edit.edits.is_empty() || !present.is_empty();
+        edit.reevaluate = !edit.edits.is_empty() || !edit.present.is_empty();
+        Ok((sources, edit))
+    }
+
+    /// Apply another writer's document changes as one undo step; assets are handled by the engine.
+    /// All or nothing, including revisions and the source map.
+    /// Cost per Cmd::Docs: O(documents + edited text + map entries), plus one Sources clone
+    /// (Arc texts, O(documents)); nothing per frame.
+    pub fn doc_set(&mut self, set: &[DocSet]) -> Result<(TextStep, TextStep), Diag> {
+        let (sources, mut edit) = self.plan_set(set)?;
+        // Document sets record presence in plan order in both directions.
+        let present = std::mem::take(&mut edit.present);
         let mut inverse = TextStep::from(edit.inverse(&self.sources, &self.map));
         inverse.present = present.iter().map(|&(doc, value)| (doc, !value)).collect();
         self.sources = sources;

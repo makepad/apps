@@ -996,10 +996,16 @@ fn a_stop_anywhere_in_the_plate_checks_tells_nothing() {
 #[test]
 fn objects_whose_bodies_meet_overlap_and_touching_ones_do_not() {
     let at = |x: f64, y: f64, z: f64, s: [f64; 3]| box_mesh([100.0 + x, 100.0 + y, z], s);
+    fn messages(report: &Report) -> Vec<String> {
+        report.issues.iter().filter(|i| i.kind == "overlap").map(|i| {
+            assert_eq!(i.severity, Severity::Error, "an overlap is a printability error");
+            i.message.clone()
+        }).collect()
+    }
     fn overlaps<'f>(parts: Vec<Part>, field: &dyn Fn(usize) -> Option<PartField<'f>>) -> Vec<String> {
         let plate = Plate { excluded: Vec::new(), settings: Vec::new(), parts };
         let r = analyse_plate_with(&Machine::dual_nozzle_350(), &plate, &Materials::default(), field, &|| false).unwrap();
-        r.issues.iter().filter(|i| i.kind == "overlap").map(|i| { assert_eq!(i.severity, Severity::Error); i.message.clone() }).collect()
+        messages(&r)
     }
     let none = |_: usize| None;
     let block = || part("Block", at(0.0, 0.0, 0.0, [20.0, 20.0, 10.0]));
@@ -1009,7 +1015,21 @@ fn objects_whose_bodies_meet_overlap_and_touching_ones_do_not() {
     let n = l.positions.len() as u32;
     l.positions.extend(wall.positions);
     l.triangles.extend(wall.triangles.iter().map(|t| t.map(|v| v + n)));
-    assert_eq!(overlaps(vec![block(), part("Peg", at(15.0, 5.0, 0.0, [20.0, 10.0, 10.0]))], &none), ["Block and Peg overlap: their bodies take the same space"], "a side pushed 5 mm into another");
+    let plate = Plate { excluded: Vec::new(), settings: Vec::new(), parts: vec![block(), part("Peg", at(15.0, 5.0, 0.0, [20.0, 10.0, 10.0]))] };
+    let (machine, materials) = (Machine::dual_nozzle_350(), Materials::default());
+    let report = analyse_plate_with(&machine, &plate, &materials, &none, &|| false).unwrap();
+    let expected = ["Block and Peg overlap: their bodies take the same space"];
+    assert_eq!(messages(&report), expected, "a side pushed 5 mm into another");
+    let (fresh, mut known) = analyse_plate_known(&machine, &plate, &materials, &none, None, &|| false).unwrap();
+    assert_eq!(format!("{:?}", fresh.issues), format!("{:?}", report.issues), "recording overlaps preserves every issue in order");
+    std::sync::Arc::make_mut(&mut known).issues.clear();
+    let (reused, _) = analyse_plate_known(&machine, &plate, &materials, &none, Some(&known), &|| false).unwrap();
+    assert!(messages(&reused).is_empty(), "the same plate reuses its cleared overlap issues");
+    let peg = |x: f64, y: f64, z: f64| ((x - 125.0).abs() - 10.0).max((y - 110.0).abs() - 5.0).max((z - 5.0).abs() - 5.0);
+    let field = |k: usize| (k == 1).then_some(&peg as PartField<'_>);
+    assert!(!known.judged_alike(&plate, &field), "Peg's field changes how its mesh was judged");
+    let (rechecked, _) = analyse_plate_known(&machine, &plate, &materials, &field, Some(&known), &|| false).unwrap();
+    assert_eq!(messages(&rechecked), expected, "judging Peg by its field finds the overlap again");
     assert_eq!(overlaps(vec![block(), part("Nut", at(5.0, 5.0, 2.0, [5.0, 5.0, 5.0]))], &none).len(), 1, "a part inside another, no surface crossing");
     assert_eq!(overlaps(vec![part("Large block", at(0.0, 0.0, 0.0, [40.0, 40.0, 20.0])), part("Nested cube", at(18.0, 18.0, 8.0, [4.0, 4.0, 4.0]))], &none).len(), 1, "a fully nested 4 mm cube at least 8 mm from the block's surface overlaps");
     assert_eq!(overlaps(vec![block(), part("Thin plate", at(5.0, 9.85, 2.0, [10.0, 0.3, 6.0]))], &none).len(), 1, "a thin plate wholly inside a block, at least 2 mm from every face, overlaps");

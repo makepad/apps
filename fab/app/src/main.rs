@@ -23,6 +23,7 @@ mod elec_mic;
 mod elec_net;
 mod elec_screen;
 mod elec_host;
+mod req_draft;
 mod elec_export;
 mod live_slice;
 mod marks;
@@ -191,7 +192,8 @@ script_mod! {
                         }
                     }
                     // Offscreen review passes for fab.render (1x1, invisible).
-                    review := mod.widgets.FabReviewRenderer{}
+                    // A lookup by `review` would find the shell's strip first.
+                    review_renderer := mod.widgets.FabReviewRenderer{}
                     // The headset's view, in a process that serves one (1x1, invisible).
                     xr := mod.widgets.FabXr{}
                 }
@@ -1015,6 +1017,33 @@ impl App {
         changed
     }
 
+    fn check_elec_plate_action(has_docs: bool, action: &str) -> Result<(), &'static str> {
+        if !has_docs && !matches!(action, "elec.req.list" | "elec.req.add" | "elec.req.wish"
+            | "elec.step.list" | "elec.step.propose" | "elec.doc.list" | "elec.doc.read" | "elec.design.read") {
+            return Err("This plate has no electronics: it has no electronics documents.");
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn check_elec_plate(docs: &fab_model::Docs, action: &str) -> Result<(), &'static str> {
+        Self::check_elec_plate_action(!elec_host::electronics(docs).is_empty(), action)
+    }
+
+    fn plate_has_elec(&self) -> bool {
+        if let Some(has) = self.elec.as_ref().filter(|e| e.bed() == self.status.switched).and_then(elec_host::ElecHost::has_docs) {
+            return has;
+        }
+        !elec_host::electronics(&self.status.docs).is_empty()
+    }
+
+    fn refuse_tool_call(&mut self, id: u64, error: &str) {
+        if let Some(draft) = self.elec.as_mut().and_then(|e| e.draft.as_mut()) {
+            draft.answered(id, false, error);
+        }
+        self.calls.finish(id, chat::Answer { ok: false, text: format!("{{error: {}}}", fab_ai::out::quote(error)), images: Vec::new() });
+    }
+
     /// `fab.elec_read` / `fab.elec_edit` call `id`: its `action` with its `args` run through
     /// the electronics host as the caller (`ElecHost::run_action`), the path a person's command takes
     /// too. `help` answers an action's entry from the catalog. The answer comes through
@@ -1025,21 +1054,18 @@ impl App {
         }
         let offered = fab_ai::elec_actions(tool);
         let names = || offered.iter().map(|def| def.name).collect::<Vec<_>>().join(", ");
-        let refuse = |calls: &mut chat::Calls, error: String| {
-            calls.finish(id, chat::Answer { ok: false, text: format!("{{error: {}}}", fab_ai::out::quote(&error)), images: Vec::new() });
-        };
         let Some(action) = args.get("action").and_then(Value::as_str) else {
-            return refuse(&mut self.calls, format!("fab.{tool} takes action: one of {}, or help", names()));
+            return self.refuse_tool_call(id, &format!("fab.{tool} takes action: one of {}, or help", names()));
         };
         let fields: Vec<(String, String)> = match args.get("args") {
             None | Some(Value::Null) => Vec::new(),
             Some(Value::Obj(fields)) => fields.iter().map(|(name, value)| (name.clone(), splash_arg(value))).collect(),
-            Some(_) => return refuse(&mut self.calls, "args is an object of the action's fields by name".into()),
+            Some(_) => return self.refuse_tool_call(id, "args is an object of the action's fields by name"),
         };
         if action == "help" {
             let of = fields.iter().find(|(name, _)| name == "of").map(|(_, value)| value.as_str());
             let Some(def) = of.and_then(fab_elec_design::action::find) else {
-                return refuse(&mut self.calls, format!("help takes of: an action's name; fab.{tool} has {}", names()));
+                return self.refuse_tool_call(id, &format!("help takes of: an action's name; fab.{tool} has {}", names()));
             };
             let help = fab_ai::elec_action_help(def);
             let text = if def.name == fab_elec_mech::read::ACTIONS[0].name {
@@ -1053,13 +1079,13 @@ impl App {
         }
         if !offered.iter().any(|def| def.name == action) {
             let elsewhere = fab_elec_design::action::find(action).and_then(|def| fab_ai::elec_tool_of(def.risk));
-            return refuse(&mut self.calls, match elsewhere {
+            return self.refuse_tool_call(id, &match elsewhere {
                 Some(other) => format!("{action} is offered by fab.{other}, not fab.{tool}"),
                 None => format!("fab.{tool} has no action {action}; it has {}", names()),
             });
         }
-        if self.status.docs.is_empty() {
-            return refuse(&mut self.calls, "This plate has no electronics: it has no electronics documents.".into());
+        if let Err(why) = Self::check_elec_plate_action(self.plate_has_elec(), action) {
+            return self.refuse_tool_call(id, why);
         }
         // What the person typed lands first, as before a bed switch.
         self.send_typing();
@@ -1076,37 +1102,34 @@ impl App {
     /// `{old new}` or the whole `text`.
     fn elec_text_call(&mut self, cx: &mut Cx, id: u64, args: &Value) {
         use fab_elec_host::doc_actions::TextChange;
-        let refuse = |calls: &mut chat::Calls, error: &str| {
-            calls.finish(id, chat::Answer { ok: false, text: format!("{{error: {}}}", fab_ai::out::quote(error)), images: Vec::new() });
-        };
         let Some(doc) = args.get("doc").and_then(Value::as_str) else {
-            return refuse(&mut self.calls, "doc: the document's name, as elec.doc.list gives it");
+            return self.refuse_tool_call(id, "doc: the document's name, as elec.doc.list gives it");
         };
         let rev = match args.get("rev") {
             Some(Value::Int(rev)) if *rev >= 0 => *rev as u64,
             Some(Value::F64(rev)) if *rev >= 0.0 && rev.fract() == 0.0 => *rev as u64,
             Some(Value::Str(rev)) if rev.trim().parse::<u64>().is_ok() => rev.trim().parse().unwrap_or_default(),
-            _ => return refuse(&mut self.calls, "rev: the revision elec.doc.read gave, a whole number"),
+            _ => return self.refuse_tool_call(id, "rev: the revision elec.doc.read gave, a whole number"),
         };
         let change = match (args.get("edits"), args.get("text")) {
-            (Some(_), Some(_)) => return refuse(&mut self.calls, "give edits or text, not both"),
+            (Some(_), Some(_)) => return self.refuse_tool_call(id, "give edits or text, not both"),
             (None, Some(Value::Str(text))) => TextChange::Whole(text.clone()),
-            (None, Some(_)) => return refuse(&mut self.calls, "text: the document's whole new text, a string"),
+            (None, Some(_)) => return self.refuse_tool_call(id, "text: the document's whole new text, a string"),
             (Some(Value::Arr(edits)), None) => {
                 let mut pairs = Vec::with_capacity(edits.len());
                 for (at, edit) in edits.iter().enumerate() {
                     let (Some(old), Some(new)) = (edit.get("old").and_then(Value::as_str), edit.get("new").and_then(Value::as_str)) else {
-                        return refuse(&mut self.calls, &format!("edit {}: an edit is {{old new}}, both strings", at + 1));
+                        return self.refuse_tool_call(id, &format!("edit {}: an edit is {{old new}}, both strings", at + 1));
                     };
                     pairs.push((old.to_string(), new.to_string()));
                 }
                 TextChange::Replace(pairs)
             }
-            (Some(_), None) => return refuse(&mut self.calls, "edits: an array of {old new}"),
-            (None, None) => return refuse(&mut self.calls, "give edits: [{old new}], or the whole text"),
+            (Some(_), None) => return self.refuse_tool_call(id, "edits: an array of {old new}"),
+            (None, None) => return self.refuse_tool_call(id, "give edits: [{old new}], or the whole text"),
         };
-        if self.status.docs.is_empty() {
-            return refuse(&mut self.calls, "This plate has no electronics: it has no electronics documents.");
+        if let Err(why) = Self::check_elec_plate_action(self.plate_has_elec(), fab_ai::ELEC_TEXT_TOOL) {
+            return self.refuse_tool_call(id, why);
         }
         // What the person typed lands first: the call's revision is checked against it.
         self.send_typing();
@@ -1522,7 +1545,6 @@ impl App {
         if !ke.is_repeat {
             let action = match ke.key_code {
                 KeyCode::F1 => Some(ShellAction::ShowKeymapHelp(!self.state.ui.keymap_help_open)),
-                KeyCode::F3 if m.shift => Some(ShellAction::TogglePerf),
                 KeyCode::F3 => Some(ShellAction::ToggleCommandPalette),
                 KeyCode::KeyS if m.is_primary() => {
                     self.model_command("save", &[], false);
@@ -1711,7 +1733,9 @@ impl App {
                 KeyCode::KeyH if m.alt && !m.shift => tools::isolate::unhide_all(cx),
                 KeyCode::KeyH if m.shift && !m.alt => tools::isolate::isolate_selected(cx),
                 KeyCode::KeyH if plain => tools::isolate::hide_selected(cx),
-                KeyCode::Slash if plain => {
+                // (and the numpad's `/`: where `/` is Shift+7, QWERTZ and the Nordic layouts, no
+                // bare key names `/`)
+                KeyCode::Slash | KeyCode::NumpadDivide if plain => {
                     let hint = tools::isolate::toggle_solo(cx, &self.state);
                     tools::session::with(|s| s.hint = hint.into());
                 }
@@ -1761,10 +1785,15 @@ impl App {
             }
             return true;
         }
+        // Q: the view pie around the pointer, in the Plate view under it
+        if ke.key_code == KeyCode::KeyQ && plain && !ke.is_repeat {
+            cx.action(fab::ui::stage::StageAction::ViewPie);
+            return true;
+        }
         let gizmo = match ke.key_code {
             KeyCode::KeyB if plain && model_keys => Some(GizmoMode::Paint),
             KeyCode::KeyK if plain && self.state.ui.in_mode(PlateMode::Design) => Some(GizmoMode::Sculpt),
-            KeyCode::KeyQ if plain && model_keys => Some(GizmoMode::Off),
+            KeyCode::KeyW if plain && model_keys => Some(GizmoMode::Off),
             KeyCode::KeyG if plain && model_keys => Some(GizmoMode::Move),
             KeyCode::KeyR if plain && model_keys => Some(GizmoMode::Rotate),
             KeyCode::KeyS if plain && model_keys => Some(GizmoMode::Scale),
@@ -2683,6 +2712,7 @@ impl App {
             tools::measure::install(&mut self.state, measurements);
             if program.is_some() {
                 self.program = program;
+                self.publish_trees();
             }
             // Values set and now built stop being pending; newer ones set meanwhile stay.
             self.state.params.pending.retain(|(key, value)| {
@@ -3241,7 +3271,7 @@ impl App {
     /// The code panel and the feature tree.
     fn source_action(&mut self, cx: &mut Cx, a: &fab::ui::code::SourceAction) {
         use fab::ui::code::SourceAction as S;
-        if matches!(a, S::Edited { .. } | S::Move { .. } | S::Reorder { .. } | S::Rename { .. } | S::Bypass { .. } | S::Remove(_)) {
+        if matches!(a, S::Edited { .. } | S::Move { .. } | S::Reorder { .. } | S::Rename { .. } | S::Bypass { .. } | S::SetRole { .. } | S::Remove(_)) {
             self.startup_monitor_done = true;
         }
         match a {
@@ -3304,6 +3334,7 @@ impl App {
                 });
                 self.param_action(cx, &fab::params::ParamAction::Hover(key));
             }
+            S::Focus(instance) => self.focus_instance(cx, instance),
             S::Fold(id) => {
                 if !self.state.source.collapsed.remove(id) {
                     self.state.source.collapsed.insert(id.clone());
@@ -3311,6 +3342,14 @@ impl App {
                 self.ui.redraw(cx);
             }
             S::Select { id, reveal } => {
+                // no id: the picked feature is let go (a part's row was picked)
+                if id.is_empty() {
+                    if self.state.source.selected.take().is_some() {
+                        self.drop_ghost();
+                        self.ui.redraw(cx);
+                    }
+                    return;
+                }
                 let Some(f) = self.state.source.feature(id).cloned() else { return };
                 let test_print = f.detail == fab::ui::code::TEST_PRINT;
                 if test_print {
@@ -3325,10 +3364,15 @@ impl App {
                     self.drop_ghost();
                 }
                 self.state.source.selected = Some(f.id.clone());
+                // its folds open to show it; a loop is left as it is (a copy picked in the view shows
+                // on the loop's row while it is folded, and a loop's id in `collapsed` means open)
                 let mut parent = f.parent.clone();
                 while let Some(id) = parent {
-                    self.state.source.collapsed.remove(&id);
-                    parent = self.state.source.feature(&id).and_then(|f| f.parent.clone());
+                    let up = self.state.source.feature(&id).map(|f| (f.parent.clone(), f.group && f.op != "call"));
+                    if !up.as_ref().is_some_and(|(_, is_loop)| *is_loop) {
+                        self.state.source.collapsed.remove(&id);
+                    }
+                    parent = up.and_then(|(p, _)| p);
                 }
                 // Its part picked with it, its handles shown, as a pick in the view does: the
                 // plate part of the row's object or of the nearest row above it that is one, else
@@ -3395,6 +3439,31 @@ impl App {
                     host.edit(edits);
                 }
             }
+            S::SetRole { id, role } => {
+                let Some(inst) = self.program.as_ref().and_then(|(p, _)| p.instance(&self.state.source.instance)) else { return };
+                let edits = code_edit::role_changed(&self.state.source, inst, id, role).and_then(|edits| {
+                    // the rewrite must still parse and evaluate before it goes to the plate
+                    for c in &edits {
+                        if let fab_model::Change::Script { edit, .. } = c {
+                            makepad_model_script::lang::edit::apply(&inst.script.program, edit)?;
+                        }
+                    }
+                    Ok(edits)
+                });
+                match edits {
+                    Ok(edits) if edits.is_empty() => {}
+                    Ok(edits) => {
+                        if let Some(host) = &mut self.host {
+                            host.edit(edits);
+                            self.select_after = Some(id.clone());
+                        }
+                    }
+                    Err(message) => {
+                        self.state.ui.notices.say(NoticeView::Plate, message);
+                        self.ui.redraw(cx);
+                    }
+                }
+            }
             S::Remove(id) => {
                 if let Some(edits) = code_edit::removed(&self.state.source, id) {
                     if let Some(host) = &mut self.host {
@@ -3459,7 +3528,7 @@ impl App {
     fn poll_quit(&mut self, cx: &mut Cx) {
         let now = std::time::Instant::now();
         if let Some(line) = self.journal_quit.saving_line(now) {
-            let bar = self.ui.widget(cx, ids!(caption));
+            let bar = self.ui.widget(cx, ids!(caption_label.caption));
             fab::ui::topbar::quit_status(cx, &bar, Some(&line));
         }
         if self.journal_quit.ready(cx, now) { cx.quit(); }
@@ -3759,7 +3828,7 @@ impl App {
         self.printing.live_input(&mut self.state.print, Some(&ev), swaps.into(), None);
         self.state.print.bump();
         // Live fields affect the viewport and the panels which show slice status or summaries.
-        fab::ui::redraw_now(cx, &self.ui, &[ids!(tab_viewport), ids!(tab_part), ids!(tab_slice), ids!(tab_settings), ids!(tab_printer), ids!(caption), ids!(xr)]);
+        fab::ui::redraw_now(cx, &self.ui, &[ids!(tab_viewport), ids!(tab_part), ids!(tab_slice), ids!(tab_settings), ids!(tab_printer), ids!(caption_label.caption), ids!(xr)]);
     }
 
     /// A preview plate resliced (its draft meshes), the layer the view shows first. Every step
@@ -3957,14 +4026,14 @@ impl App {
         self.plate.as_ref().is_some_and(|ev| ev.machine.resin_screen().is_some())
     }
 
-    /// Something shows slices: the Slice render mode, or Monitor without a slice of its job (a
-    /// job the printer runs is matched to Fab's slice).
+    /// Monitor uses the plate's live slice only when it has no saved job to show. Reading that
+    /// job's preview from disk does not change demand for the plate's slicer.
     fn slice_shown(&self) -> bool {
         if self.resin_printer() {
             return false;
         }
         if self.state.ui.in_mode(PlateMode::Monitor) {
-            return self.state.print.monitor_preview().is_none();
+            return self.state.print.shown_choice() == &self.state.print.links.picked && self.state.print.follow.shown().is_none();
         }
         self.state.print.play.active
     }
@@ -4613,6 +4682,16 @@ impl App {
 
     fn print_action(&mut self, cx: &mut Cx, a: &fab::print::PrintAction) -> bool {
         use fab::print::PrintAction as A;
+        if matches!(a, A::ShowPrinter(_)) {
+            let wanted = self.slice_wanted();
+            self.printing.action(&mut self.state.print, a, self.plate.as_ref());
+            // Changing Monitor's view can change slice visibility. Only a plate/workspace
+            // action may turn that change into a request to start or stop the plate's slice.
+            let now_wanted = self.slice_wanted();
+            if now_wanted != wanted { self.slice_was_wanted = now_wanted; }
+            self.follow_printer(cx);
+            return true;
+        }
         if let A::TestMode(on) = a {
             self.state.print.test_mode = *on;
             if let Some(host) = &mut self.host {
@@ -4638,7 +4717,7 @@ impl App {
             return true;
         }
         if Self::resin_print_action(&mut self.state.print, &mut self.resin, a, sla::ResinView::control) {
-            if matches!(a, A::SendToPrinter) {
+            if matches!(a, A::SendResin { .. }) {
                 cx.action(ShellAction::SetWorkspace(Workspace::Monitor));
             }
             cx.redraw_all();
@@ -4648,14 +4727,15 @@ impl App {
             // A live input settles verbatim; otherwise slice the committed plate.
             self.focus_slice();
         }
-        if matches!(a, A::SendToPrinter) {
+        if matches!(a, A::SendToPrinter { .. }) {
             self.printing.plate_scripts = self.scripts.clone();
         }
+        let before = self.state.print.sending.len();
         let mut changed = self.printing.action(&mut self.state.print, a, self.plate.as_ref());
         if changed { self.state.print.bump(); }
-        let printer_only = matches!(a, A::AskPrint(_) | A::AskStop(..) | A::SetPrintOption(..) | A::SendToPrinter | A::CancelSend | A::CloseJob | A::PrinterControl(..) | A::PickJob(_) | A::AskStartJob(_) | A::StartJob(_) | A::RemoveJob(_));
+        let printer_only = matches!(a, A::AskPrint(_) | A::AskStop(..) | A::SetPrintOption(..) | A::SendToPrinter { .. } | A::SendResin { .. } | A::CancelSend(_) | A::CloseJob | A::PrinterControl(..) | A::PickJob(_) | A::AskStartJob(_) | A::StartJob { .. } | A::RemoveJob(_));
         // Start print went: Monitor shows it from here on.
-        if matches!(a, A::SendToPrinter) && self.state.print.sending.is_some() {
+        if matches!(a, A::SendToPrinter { .. }) && self.state.print.sending.len() > before {
             cx.action(ShellAction::SetWorkspace(Workspace::Monitor));
         }
         if changed && !printer_only && !matches!(a, A::Slice | A::Export) {
@@ -4676,6 +4756,10 @@ impl App {
             }
         }
         changed |= fab::print::apply(&mut self.state.print, a);
+        if matches!(a, A::StartJob { ticket, .. } if ticket.printer != self.state.print.links.picked) {
+            cx.redraw_all();
+            return changed;
+        }
         if let fab::print::PrintAction::Overhangs(on) = a {
             if let Some(host) = &mut self.host { host.overhangs(*on); }
         }
@@ -4708,7 +4792,8 @@ impl App {
             A::AskPrint(false) | A::AcceptErrors(_) | A::PickStick(_) if on_resin || job => {}
             A::AskStop(ControlDestination::ResinJob { .. }, _) => {}
             A::SaveOrientationTest if on_resin => resin.ask_test(),
-            A::SendToPrinter if on_resin => resin.ask_print(),
+            A::SendResin { stack } if matches!(state.confirm_print, Some(fab::print::PrintConfirm::Resin))
+                && state.resin.as_ref().is_some_and(|r| r.stack == *stack) => resin.ask_print(),
             A::PrinterControl(dest @ ControlDestination::ResinJob { .. }, control) => {
                 if dest.matches(state) {
                     send_control(resin, *control);
@@ -4770,7 +4855,7 @@ impl App {
 
     /// Run the review renderer: start a queued request, collect frames.
     fn pump_review(&mut self, cx: &mut Cx) {
-        let widget = self.ui.widget(cx, ids!(review));
+        let widget = self.ui.widget(cx, ids!(review_renderer));
         let Some(mut renderer) = widget.borrow_mut::<review::FabReviewRenderer>() else { return };
         if let Some(captured) = renderer.poll(cx) {
             match captured.result {
@@ -4873,6 +4958,10 @@ impl App {
     /// Only a changed viewport/list selection resets tab focus. The feature tree keeps
     /// following that selection even while the editor shows the plate or another file.
     fn follow_selection(&mut self, cx: &mut Cx) {
+        // trees missing with a program built (a restart that kept the program): made once
+        if self.state.source.trees.is_empty() && self.program.is_some() {
+            self.publish_trees();
+        }
         let selected = self.selected_objects();
         let changed = selected != self.source_selection;
         self.source_selection = selected;
@@ -4971,7 +5060,7 @@ impl App {
         self.printing.live_input(&mut self.state.print, self.plate.as_ref(), Arc::from([]), Some((part, m)));
         self.state.print.bump();
         // Live placement affects the view, placement/slice summaries and slicing status.
-        fab::ui::redraw_now(cx, &self.ui, &[ids!(tab_viewport), ids!(tab_part), ids!(tab_slice), ids!(tab_settings), ids!(tab_printer), ids!(caption), ids!(xr)]);
+        fab::ui::redraw_now(cx, &self.ui, &[ids!(tab_viewport), ids!(tab_part), ids!(tab_slice), ids!(tab_settings), ids!(tab_printer), ids!(caption_label.caption), ids!(xr)]);
     }
 
     /// One batch of model operations as one undoable transaction, against
@@ -5323,6 +5412,29 @@ impl App {
         cx.redraw_all();
     }
 
+    /// Every placed instance's feature tree, for the Parts outliner: O(solids) per committed
+    /// program, never per frame.
+    fn publish_trees(&mut self) {
+        self.state.source.trees = self.program.as_ref().map_or_else(Default::default, |(p, _)| {
+            p.instances.iter().map(|i| (i.name.clone(), Arc::new(code_edit::rows(i)))).collect()
+        });
+    }
+
+    /// An outliner tree of another part pressed: a part of its instance is selected (unless one
+    /// is), so the tree and the code follow that script before the press's own edit applies.
+    fn focus_instance(&mut self, cx: &mut Cx, instance: &str) {
+        if self.state.source.instance == instance {
+            return;
+        }
+        let ours = |o: &str| fab_model::program::split_id(o).is_some_and(|(i, _)| i == instance);
+        // the tree follows the first selected object: it must be one of this instance
+        if !self.selected_objects().first().is_some_and(|o| ours(o)) {
+            let Some(e) = self.state.plate.parts.iter().find(|p| ours(&p.object)).and_then(|p| p.element) else { return };
+            self.dispatch(cx, &ShellAction::SelectOnly(e));
+        }
+        self.follow_selection(cx);
+    }
+
     /// A marked area clicked in the Sliced view: a part of its script is selected (the tree
     /// shows that script) and its row picked, as a click on the row picks it.
     fn pick_area(&mut self, cx: &mut Cx, object: &str) {
@@ -5419,7 +5531,8 @@ impl MatchEvent for App {
                 changed |= self.dispatch(cx, a);
                 follow |= shows_workspace(a);
             }
-            follow |= action.downcast_ref::<fab::print::PrintAction>().is_some() || action.downcast_ref::<print::PrintEvent>().is_some();
+            follow |= action.downcast_ref::<fab::print::PrintAction>().is_some_and(|a|
+                !matches!(a, fab::print::PrintAction::StartJob { ticket, .. } if ticket.printer != self.state.print.links.picked));
             if let Some(FileDialogAction::FileSelected { id, paths }) = action.downcast_ref::<FileDialogAction>() {
                 if *id == live_id!(fab_import) {
                     for path in paths { cx.action(ShellAction::ImportFile(path.clone())); }
@@ -5651,9 +5764,13 @@ impl MatchEvent for App {
                     }
                     self.calls.finish(*id, chat::Answer { ok: error.is_none(), text: fab_ai::out::text(&value), images: Vec::new() });
                 }
-                if self.printing.event(&mut self.state.print, ev) {
+                let outcome = self.printing.event(&mut self.state.print, ev);
+                follow |= outcome == print::PrintOutcome::Target || !matches!(ev, print::PrintEvent::Packaged { .. } | print::PrintEvent::JobChecked { .. });
+                if matches!(outcome, print::PrintOutcome::JobRows | print::PrintOutcome::JobPreview) {
+                    cx.redraw_all();
+                } else if matches!(outcome, print::PrintOutcome::Target | print::PrintOutcome::RestoredTarget) {
                     self.state.print.bump();
-                    if matches!(ev, print::PrintEvent::Catalog(_) | print::PrintEvent::ProfilesImported { .. }) {
+                    if outcome == print::PrintOutcome::RestoredTarget || matches!(ev, print::PrintEvent::Catalog(_) | print::PrintEvent::ProfilesImported { .. }) {
                         if let Some(host) = &mut self.host { host.print_setup(self.printing.check_setup(&self.state.print)); }
                         live_slice::set_print_setup(self.printing.check_setup(&self.state.print));
                         self.request_reslice();
@@ -5723,14 +5840,14 @@ impl MatchEvent for App {
                 cx.redraw_all();
                 if self.live_view.is_none() && self.printing.live_toolpaths(&mut self.state.print, *revision) {
                     self.state.print.bump();
-                    fab::ui::redraw_now(cx, &self.ui, &[ids!(tab_slice), ids!(tab_settings), ids!(tab_printer), ids!(caption)]);
+                    fab::ui::redraw_now(cx, &self.ui, &[ids!(tab_slice), ids!(tab_settings), ids!(tab_printer), ids!(caption_label.caption)]);
                 }
             }
             if let Some(live_slice::LiveAction::Failed { revision, error }) = action.downcast_ref::<live_slice::LiveAction>() {
                 self.printing.live_failed(&mut self.state.print, *revision, error);
                 self.state.print.bump();
                 // Slice failure is shown by the stage, slice/job/printer panels and caption.
-                fab::ui::redraw_now(cx, &self.ui, &[ids!(tab_viewport), ids!(tab_slice), ids!(tab_settings), ids!(tab_printer), ids!(caption)]);
+                fab::ui::redraw_now(cx, &self.ui, &[ids!(tab_viewport), ids!(tab_slice), ids!(tab_settings), ids!(tab_printer), ids!(caption_label.caption)]);
             }
             if let Some(a) = action.downcast_ref::<xr::FabXrAction>() {
                 self.xr_action(cx, a);
@@ -5747,7 +5864,7 @@ impl MatchEvent for App {
                                 self.journal_quit.answered();
                                 None
                             };
-                            let bar = self.ui.widget(cx, ids!(caption));
+                            let bar = self.ui.widget(cx, ids!(caption_label.caption));
                             fab::ui::topbar::quit_status(cx, &bar, status);
                             self.poll_quit(cx);
                         }
@@ -5860,7 +5977,10 @@ impl MatchEvent for App {
                             host.grown_settled(settled.clone());
                         }
                     }
-                    HostAction::DocsLanded { bed, docs } => {
+                    HostAction::DocsLanded { bed, docs, all } => {
+                        if *bed == self.status.switched {
+                            self.status.docs = all.clone();
+                        }
                         if let Some(elec) = self.elec.as_mut() {
                             elec.docs_landed(*bed, docs);
                         }
@@ -5964,26 +6084,28 @@ impl MatchEvent for App {
                 makepad_widgets::JobAction::Next(job) => self.next_step(cx, *job),
             }
         }
-        let caption = self.ui.widget(cx, ids!(caption));
+        let caption = self.ui.widget(cx, ids!(caption_label.caption));
         fab::ui::topbar::handle_actions(cx, &caption, actions, &self.state);
-        // The Design workspace's Add menu (the feature tree's bar).
-        let add_menu = live_id!(fab_add_feature);
-        if let Some(anchor) = fab::ui::popover::dropdown_clicked(actions, add_menu) {
-            fab::ui::popover::open_menu(cx, add_menu, code_edit::add_menu(), anchor, fab::ui::popover::MenuPlace::Below);
+        // The plate's Add menu, then the selected part's Modify menu (the 3D view's bar).
+        fab::ui::parts::part_add_menu(cx, actions);
+        // Modify: a feature, a shape edit or a print settings box on the selected part.
+        let modify = live_id!(fab_modify);
+        if let Some(anchor) = fab::ui::popover::dropdown_clicked(actions, modify) {
+            let has_part = fab::ui::parts::active_part(&self.state).is_some();
+            fab::ui::popover::open_menu(cx, modify, code_edit::modify_menu(has_part), anchor, fab::ui::popover::MenuPlace::Below);
         }
-        if let Some(pick) = fab::ui::popover::menu_picked(actions, add_menu).and_then(code_edit::add_pick) {
-            self.add_feature(cx, pick);
-        }
-        let shape_menu = live_id!(fab_shape_edit);
-        if let Some(anchor) = fab::ui::popover::dropdown_clicked(actions, shape_menu) {
-            fab::ui::popover::open_menu(cx, shape_menu, code_edit::shape_menu(), anchor, fab::ui::popover::MenuPlace::Below);
-        }
-        if let Some(op) = fab::ui::popover::menu_picked(actions, shape_menu).and_then(code_edit::shape_pick) {
-            if let Some(object) = fab::ui::parts::active_part(&self.state).map(|i| self.state.plate.parts[i].object.clone()) {
-                self.part_action(cx, &PartAction::Shape { object, op });
-            } else {
-                self.state.ui.notices.say(NoticeView::Plate, "Select a part first".into());
-                self.ui.redraw(cx);
+        if let Some(pick) = fab::ui::popover::menu_picked(actions, modify) {
+            if let Some(feature) = code_edit::add_pick(pick) {
+                self.add_feature(cx, feature);
+            } else if let Some(op) = code_edit::shape_pick(pick) {
+                if let Some(object) = fab::ui::parts::active_part(&self.state).map(|i| self.state.plate.parts[i].object.clone()) {
+                    self.part_action(cx, &PartAction::Shape { object, op });
+                } else {
+                    self.state.ui.notices.say(NoticeView::Plate, "Select a part first".into());
+                    self.ui.redraw(cx);
+                }
+            } else if pick == LiveId::from_str("modify_settings_here") {
+                fab::ui::stage::settings_here(cx, &self.state, None);
             }
         }
         shell_chat::handle_actions(self, cx, actions);
@@ -6149,14 +6271,32 @@ fn electronics_actor(caller: ChatCaller, call: u64) -> fab_elec_design::By {
     }
 }
 
-/// A tool argument as the Splash text an electronics action reads: a string as it is, a number
-/// or a flag as its text, a list as `[a b]` of its items.
+/// A tool argument as the text an electronics action reads: a string verbatim (Splash or
+/// plain text), any other JSON value (number, bool, null, array, object) as strict JSON.
 fn splash_arg(value: &Value) -> String {
     match value {
         Value::Str(text) => text.clone(),
-        Value::Arr(items) => format!("[{}]", items.iter().map(splash_arg).collect::<Vec<_>>().join(" ")),
         other => other.to_json(),
     }
+}
+
+#[test]
+fn splash_arg_preserves_strings_and_serializes_arrays_as_json() {
+    use makepad_strict_json::{obj, parse, s};
+    for text in ["[12mm 30mm]", r#"ledctl.mcu.dbg.pin("1")"#, "{v: 3.3V width: 1ms}"] {
+        assert_eq!(splash_arg(&s(text)), text, "top-level Splash source must pass through verbatim");
+    }
+    assert_eq!(splash_arg(&Value::Arr(vec![s("x y"), s("3V3")])), r#"["x y","3V3"]"#,
+        "net names must keep their quotes and item boundaries");
+    let numbers = |values: &[i64]| Value::Arr(values.iter().copied().map(Value::Int).collect());
+    assert_eq!(splash_arg(&numbers(&[10, 0, -8])), "[10,0,-8]", "a negative coordinate must remain a separate item");
+    assert_eq!(splash_arg(&Value::Arr(vec![numbers(&[10, 20]), numbers(&[30, 40])])), "[[10,20],[30,40]]",
+        "each waypoint must keep its coordinates and its position in the list");
+    let edits = Value::Arr(vec![
+        obj(vec![("doc", s("a.req.splash")), ("op", s("create")), ("text", s("brief(\"a\")\n"))]),
+        obj(vec![("doc", s("b.req.splash")), ("op", s("replace")), ("text", s("wish(\"b\")\n"))]),
+    ]);
+    assert_eq!(parse(splash_arg(&edits).as_bytes()), Ok(edits), "both edits must retain the exact document text, quotes and newlines");
 }
 
 /// An AI call that puts another document on the bed.
@@ -6244,6 +6384,22 @@ impl AppMain for App {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
+        // A rebound shortcut (the Keymap reference): its press is handled as the action's own
+        // chord, and the chord it was moved off answers no more. Not while typing, nor while the
+        // reference listens for a new chord.
+        if let Event::KeyDown(ke) | Event::KeyUp(ke) = event {
+            if !cx.key_focus_takes_text() && !fab::ui::keymap::capturing() {
+                match fab::ui::keymap::remap(ke) {
+                    fab::ui::keymap::Remap::Pass => {}
+                    fab::ui::keymap::Remap::Swallow => return,
+                    fab::ui::keymap::Remap::As(as_pressed) => {
+                        let again = if matches!(event, Event::KeyDown(_)) { Event::KeyDown(as_pressed) } else { Event::KeyUp(as_pressed) };
+                        self.handle_event(cx, &again);
+                        return;
+                    }
+                }
+            }
+        }
         self.state.drain_released_panes();
         self.hand.event(event);
         // Stop before widget dispatch: typing may still be an uncommitted draft, and a
@@ -6259,7 +6415,7 @@ impl AppMain for App {
             self.state.print.stale = self.state.print.preview.is_some();
             self.state.print.stale_parts = None;
             self.state.print.bump();
-            fab::ui::redraw_now(cx, &self.ui, &[ids!(tab_slice), ids!(tab_settings), ids!(tab_printer), ids!(caption)]);
+            fab::ui::redraw_now(cx, &self.ui, &[ids!(tab_slice), ids!(tab_settings), ids!(tab_printer), ids!(caption_label.caption)]);
         }
         // The system's audio devices: Listen opens the default output while anything is heard.
         if let Event::AudioDevices(devices) = event {
@@ -6389,6 +6545,12 @@ impl AppMain for App {
         if let Event::Startup | Event::WindowGotFocus(_) = event {
             fab::theme::follow_host_appearance(cx);
         }
+        // A mouse drag never scrolls a list or a panel (the wheel, the trackpad and the bar do):
+        // a drag in Fab moves a section, folds headers, drags a value or a part. A touch still
+        // scrolls.
+        if let Event::Startup = event {
+            cx.set_mouse_drag_scrolling(false);
+        }
         if !self.started {
             if let Event::Startup | Event::Draw(_) = event {
                 self.started = true;
@@ -6451,8 +6613,9 @@ impl AppMain for App {
             makepad_ai_services::engine::local_model::stop_hub_find();
             makepad_csg_math::shutdown();
         }
+        // (while the Keymap reference listens for a new chord, a press is that chord, not a shortcut)
         if let Event::KeyDown(ke) = event {
-            if self.global_key(cx, ke) {
+            if !fab::ui::keymap::capturing() && self.global_key(cx, ke) {
                 return;
             }
         }
@@ -6580,18 +6743,20 @@ impl AppMain for App {
         switch_watch::mark("before the app's actions");
         self.match_event(cx, event);
         switch_watch::mark("the app's actions");
-        if self.printing.poll_printer(&mut self.state.print) {
+        let polled = self.printing.poll_printer(&mut self.state.print);
+        if polled.target {
             self.state.print.bump();
             self.remap();
-            self.follow_printer(cx);
-            cx.redraw_all();
         }
+        if polled.target || polled.shown { self.follow_printer(cx); }
+        if polled.target || polled.others { cx.redraw_all(); }
         self.resume_monitor(cx);
         self.printing.sync_jobs(&mut self.state.print);
         self.frame_shown_job(cx);
         // The confirm card says what stops Start print as it is now, before this event's draw (a
         // resin printer's card asks its own).
-        if self.state.print.confirm_print && self.state.print.resin.is_none() {
+        if self.state.print.confirm_print.is_some() && self.state.print.resin.is_none() {
+            self.state.print.bind_print_ticket();
             if self.printing.confirm_slice(&mut self.state.print, self.plate.as_ref()) {
                 self.state.print.bump();
                 cx.redraw_all();
@@ -6628,7 +6793,19 @@ impl AppMain for App {
                 xr.set_voice(row);
             }
             self.release_held_layout(cx);
+            if let Some(elec) = &mut self.elec {
+                if let Some(spec) = elec.take_draft_say() {
+                    let receipt = self.chat.outbox().say_tracked(spec.prompt.into());
+                    elec.start_draft(spec, receipt);
+                }
+            }
             shell_chat::pump(self, cx);
+            if let Some(elec) = &mut self.elec {
+                let panel = self.chat.panel(cx, &self.ui);
+                let chat = panel.as_ref().and_then(|p| p.borrow::<makepad_app_aichat::AiChatPanel>());
+                let state = chat.as_ref().and_then(|c| c.state());
+                elec.sync_draft(cx, req_draft::admit(state), state.map(|s| (&s.status, s.model_secs)));
+            }
             self.pump_review(cx);
             self.pump_xr(cx);
         }
@@ -6647,11 +6824,11 @@ impl AppMain for App {
                 || requirements.map(Arc::as_ptr) != self.caption_requirements.as_ref().map(Arc::as_ptr);
             if report_changed {
                 self.caption_requirements = requirements.cloned();
-                let bar = self.ui.widget(cx, ids!(caption));
+                let bar = self.ui.widget(cx, ids!(caption_label.caption));
                 fab::ui::topbar::sync_requirements(cx, &bar, self.caption_requirements.as_deref());
             }
             if self.caption.as_ref() != Some(&caption) {
-                let bar = self.ui.widget(cx, ids!(caption));
+                let bar = self.ui.widget(cx, ids!(caption_label.caption));
                 fab::ui::topbar::sync(cx, &bar, &caption);
                 self.caption = Some(caption);
             }
@@ -7122,7 +7299,7 @@ impl App {
         }
         if let Err(refused) = fab_ai::check_arguments(&tool, &args) {
             self.calls.pending.insert(id, tool);
-            self.calls.finish(id, chat::Answer { ok: false, text: format!("{{error: {}}}", fab_ai::out::quote(&refused)), images: Vec::new() });
+            self.refuse_tool_call(id, &refused);
             return;
         }
         // Another document for the bed: what the person typed or is dragging lands on this one first.
@@ -7337,6 +7514,11 @@ impl ChatHost for App {
         let id = host.reserve_call_id();
         if let Some(plate) = &self.status.journal { plate.attach(&cx.thread_spawner()); }
         self.calls.begin(self.status.journal.as_ref(), electronics_actor(caller, id), id, tool, &args);
+        if let (ChatCaller::Turn(turn), Some(draft)) = (caller, self.elec.as_mut().and_then(|e| e.draft.as_mut())) {
+            let propose = chat::short_tool(tool) == "elec_edit"
+                && args.get("action").and_then(Value::as_str) == Some(fab_elec_host::step_actions::PROPOSE.name);
+            draft.call(id, turn, propose);
+        }
         self.dispatch_tool(cx, id, tool, args);
         self.chat_caller = previous;
         if weighs {
@@ -7349,7 +7531,14 @@ impl ChatHost for App {
         id
     }
 
-    fn chat_turn_started(&mut self, cx: &mut Cx, _turn: u64) {
+    fn chat_said(&mut self, _cx: &mut Cx, receipt: u64, said: shell_chat::ChatSaid) {
+        if let Some(draft) = self.elec.as_mut().and_then(|e| e.draft.as_mut()).filter(|d| d.receipt() == receipt) {
+            draft.said(said);
+        }
+    }
+
+    fn chat_turn_started(&mut self, cx: &mut Cx, turn: u64) {
+        if let Some(draft) = self.elec.as_mut().and_then(|e| e.draft.as_mut()) { draft.turn_started(turn); }
         self.mass_turn_started(cx);
         // the line took what the person changed: the next one tells what comes after
         self.since.mark(&self.status.steps, true);
@@ -7391,6 +7580,7 @@ impl ChatHost for App {
     fn chat_cancel(&mut self, _cx: &mut Cx, id: u64) {
         self.calls.cancel(id);
         if let Some(elec) = &mut self.elec {
+            if let Some(draft) = &mut elec.draft { draft.cancelled(id); }
             if elec.cancel_call(id) {
                 self.elec_answers();
             }
@@ -7520,7 +7710,7 @@ impl ChatHost for App {
                 NoticeView::Plate => "Plate",
                 NoticeView::Board => "Board",
                 NoticeView::Circuit => "Schematic",
-                NoticeView::Device => "3D view",
+                NoticeView::Device => "Product",
                 NoticeView::Scope => "Scope",
             });
             target.context.push_str(": ");

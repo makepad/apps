@@ -1,6 +1,7 @@
 //! The structural layers: Group, Repeat, Freeze, FlyThrough, Draw2D,
 //! read from their components.
 
+use crate::plain::{GroupProps, RepeatProps};
 use super::{check_path_data, did_you_mean, At, Reader};
 use crate::layers::{Draw2D, FlyThrough, Freeze, Group, Repeat};
 use crate::model::*;
@@ -35,9 +36,11 @@ impl Group {
         LayerKind::Group {
             layers,
             mask,
-            mask_mode: self.mask_mode.pick(c, at, "mask_mode", MaskMode::Alpha),
-            stagger: self.stagger.stagger(c, at, "stagger"),
-            size: self.size.size(c, at, "size"),
+            props: GroupProps {
+                mask_mode: self.mask_mode.pick(c, at, "mask_mode", MaskMode::Alpha),
+                stagger: self.stagger.stagger(c, at, "stagger"),
+                size: self.size.size(c, at, "size"),
+            },
             post: GroupPost(c.post_passes(at, self.post.0)),
             glyphs: self.glyphs.flag(c, at, "glyphs", false),
         }
@@ -134,7 +137,7 @@ impl Repeat {
         let step = c.repeat_step(at, "step", self.step.look(c));
         let jitter = c.repeat_step(at, "jitter", self.jitter.look(c));
         let delay = self.delay.length(c, at, "delay").map_or(0.0, |d| d.value);
-        Some(LayerKind::Repeat { layer: Box::new(template), items, count, layout, delay, step, jitter, seed: self.seed.konst(c, at, "seed", 1.0) as u32 })
+        Some(LayerKind::Repeat { layer: Box::new(template), items, props: RepeatProps { count, layout, delay, step, jitter, seed: self.seed.konst(c, at, "seed", 1.0) as u32 } })
     }
 }
 

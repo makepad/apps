@@ -167,7 +167,7 @@ fn the_device_view_takes_each_press_and_turn_and_the_board_toggle_hides_the_boar
     config.env.insert("FAB_VIEW_PREFS".into(), prefs.display().to_string());
     let result = run_with_config(config, |app: TestApp| {
         app.locator(Selector::role(Role::Window)).wait_visible();
-        workspace(&app, "Design");
+        workspace(&app, "3D modeling");
 
         // Design: the board in place, its toggle on; off hides it, on shows it again.
         wait_until(&app, "viewport", "the board drawn with its toggle on", || board_toggle(&app) == Some(true) && boards_drawn(&app) == Some(true));

@@ -1,5 +1,6 @@
 //! The Plates panel, the first tab on the left: New plate and a search at the top, then every
-//! plate, the most recently edited first, each with its picture, its name (a `*` while its
+//! plate as a card in a grid (as many columns as the panel's width holds), the most recently
+//! edited first, each with its picture, its name (a `*` while its
 //! edits are not in its file), its printer, when it was last edited and where it came from;
 //! then the demos. A click puts a plate on the bed (the one it replaces keeps every edit); a
 //! demo opens as it ships and its first edit makes the person's own plate. A plate's menu
@@ -68,6 +69,47 @@ fn lines(list: &PlateList, query: &str) -> Vec<Line> {
     out
 }
 
+/// The narrowest a card is drawn, the gap between cards and the grid's side padding (points),
+/// and the most cards a grid row holds (its template's slots).
+const TILE_MIN: f64 = 104.0;
+const GAP: f64 = 8.0;
+const PAD: f64 = 8.0;
+const SLOTS: usize = 6;
+
+/// How many cards a row of a panel `width` wide holds.
+fn columns(width: f64) -> usize {
+    (((width - 2.0 * PAD + GAP) / (TILE_MIN + GAP)).floor().max(1.0) as usize).min(SLOTS)
+}
+
+/// One item of the list as drawn: a head, a group or a note line, or a row of cards (their lines).
+#[derive(Clone, Debug, PartialEq)]
+enum Disp {
+    Line(usize),
+    Cards(Vec<usize>),
+}
+
+/// The lines laid out in rows of `cols` cards; heads, groups and notes stand on their own.
+fn grid(lines: &[Line], cols: usize) -> Vec<Disp> {
+    let mut out = Vec::new();
+    let mut run: Vec<usize> = Vec::new();
+    for (l, line) in lines.iter().enumerate() {
+        if matches!(line, Line::Card(_)) {
+            run.push(l);
+            if run.len() == cols { out.push(Disp::Cards(std::mem::take(&mut run))); }
+        } else {
+            if !run.is_empty() { out.push(Disp::Cards(std::mem::take(&mut run))); }
+            out.push(Disp::Line(l));
+        }
+    }
+    if !run.is_empty() { out.push(Disp::Cards(run)); }
+    out
+}
+
+/// A card slot's name in a grid row.
+fn slot(k: usize) -> &'static [LiveId; 1] {
+    [ids!(t0), ids!(t1), ids!(t2), ids!(t3), ids!(t4), ids!(t5)][k.min(SLOTS - 1)]
+}
+
 /// The second line of a card: its printer, when it was last edited, where it came from.
 fn info(card: &PlateCard) -> String {
     [card.printer.as_str(), card.when.as_str(), card.note.as_str()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ")
@@ -102,6 +144,94 @@ script_mod! {
         draw_icon +: {color: fab.color_text_dim}
     }
 
+    // A plate's card: its picture (or a quiet cube until it has one) with its menu in the
+    // corner, its name and its line. The plate on the bed is outlined in the accent.
+    let Tile = View{
+        width: 120
+        height: Fit
+        flow: Down
+        padding: Inset{left: 5 right: 5 top: 5 bottom: 6}
+        spacing: 3
+        cursor: MouseCursor.Hand
+        show_bg: true
+        draw_bg +: {
+            selected: instance(0.0)
+            hover: instance(0.0)
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, fab.radius_lg)
+                sdf.fill_keep(fab.color_editor.mix(fab.color_row_hover, self.hover * 0.6).mix(fab.color_selection_bg, self.selected))
+                sdf.stroke(vec4(fab.color_accent.xyz, self.selected), 1.0)
+                return sdf.result
+            }
+        }
+        animator: Animator{
+            hover: {
+                default: @off
+                off: AnimatorState{
+                    from: {all: Forward {duration: fab.anim_fast}}
+                    apply: { draw_bg: {hover: 0.0} }
+                }
+                on: AnimatorState{
+                    from: {all: Snap}
+                    apply: { draw_bg: {hover: 1.0} }
+                }
+            }
+        }
+        pic := View{
+            width: Fill
+            height: 80
+            flow: Overlay
+            align: Align{x: 0.5 y: 0.5}
+            show_bg: true
+            draw_bg +: {
+                pixel: fn() {
+                    let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                    sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, fab.radius)
+                    sdf.fill_keep(fab.color_input)
+                    sdf.stroke(fab.color_border, 1.0)
+                    return sdf.result
+                }
+            }
+            none := mod.widgets.FabIconMuted{
+                width: 22
+                height: 22
+                icon_walk: Walk{ width: 22 height: 22 }
+                draw_icon +: { svg: crate_resource("self://resources/icons/cube.svg") }
+            }
+            thumb := Image{
+                width: Fill
+                height: Fill
+                fit: ImageFit.CropToFill
+                // its corners rounded as the well it fills
+                draw_bg +: { border_radius: fab.radius }
+            }
+            corner := View{
+                width: Fill
+                height: Fill
+                align: Align{x: 1.0 y: 0.0}
+                padding: Inset{top: 2 right: 2}
+                more := ToolIcon{
+                    a11y: {label: "Plate menu"}
+                    draw_icon +: {svg: crate_resource("self://resources/icons/dots.svg")}
+                }
+            }
+        }
+        name := mod.widgets.FabLabel{ width: Fill text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis }
+        rename := mod.widgets.FabInput{ width: Fill height: 22 visible: false a11y: {label: "Rename plate"} }
+        // cut short, it shows in full in its tooltip (the panel's: see `hover_tip`)
+        info := mod.widgets.FabLabelSmall{ width: Fill text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis }
+        confirm := View{
+            width: Fill
+            height: Fit
+            visible: false
+            flow: Down
+            spacing: 3
+            trash := mod.widgets.FabButton{ width: Fill text: "Move to Trash" }
+            keep := mod.widgets.FabButton{ width: Fill text: "Cancel" }
+        }
+    }
+
     mod.widgets.FabPlatesPanelBase = #(FabPlatesPanel::register_widget(vm))
     mod.widgets.FabPlatesPanel = set_type_default() do mod.widgets.FabPlatesPanelBase{
         width: Fill
@@ -109,13 +239,9 @@ script_mod! {
         flow: Down
         show_bg: true
         draw_bg +: { color: fab.color_editor }
-        tools := View{
-            width: Fill
-            height: 36
-            flow: Right
-            align: Align{x: 0.0 y: 0.5}
-            padding: Inset{left: 8 right: 8 top: 0 bottom: 0}
-            spacing: 6
+        draw_shade: mod.draw.FabScrollShade{}
+        // the toolbar: the area's editor selector, then New plate and the search
+        tools := mod.widgets.FabEditorBar{
             new := mod.widgets.FabButtonAccent{ text: "New plate" a11y: {label: "New plate"} }
             search := mod.widgets.FabSearch{
                 width: Fill{min: 60}
@@ -148,92 +274,20 @@ script_mod! {
                 padding: Inset{left: 10 right: 10 top: 6 bottom: 8}
                 text := mod.widgets.FabLabelDim{ width: Fill text: "" }
             }
-            Row := View{
+            // A row of plate cards: as many slots as the panel's width holds show, each sized to
+            // its share of the width.
+            Grid := View{
                 width: Fill
-                height: 58
+                height: Fit
                 flow: Right
-                align: Align{x: 0.0 y: 0.5}
-                padding: Inset{left: 8 right: 6 top: 0 bottom: 0}
-                spacing: 8
-                cursor: MouseCursor.Hand
-                show_bg: true
-                draw_bg +: {
-                    selected: instance(0.0)
-                    hover: instance(0.0)
-                    pixel: fn() {
-                        let sdf = Sdf2d.viewport(self.pos * self.rect_size)
-                        sdf.rect(0.0, 0.0, self.rect_size.x, self.rect_size.y)
-                        sdf.fill(fab.color_editor.mix(fab.color_row_hover, self.hover * 0.6).mix(fab.color_selection_bg, self.selected))
-                        sdf.rect(0.0, 0.0, 2.0 * self.selected, self.rect_size.y)
-                        sdf.fill(fab.color_accent)
-                        return sdf.result
-                    }
-                }
-                animator: Animator{
-                    hover: {
-                        default: @off
-                        off: AnimatorState{
-                            from: {all: Forward {duration: fab.anim_fast}}
-                            apply: { draw_bg: {hover: 0.0} }
-                        }
-                        on: AnimatorState{
-                            from: {all: Snap}
-                            apply: { draw_bg: {hover: 1.0} }
-                        }
-                    }
-                }
-                // The plate's picture, or a quiet cube until it has one.
-                pic := View{
-                    width: 64
-                    height: 46
-                    flow: Overlay
-                    align: Align{x: 0.5 y: 0.5}
-                    show_bg: true
-                    draw_bg +: {
-                        pixel: fn() {
-                            let sdf = Sdf2d.viewport(self.pos * self.rect_size)
-                            sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, fab.radius)
-                            sdf.fill_keep(fab.color_input)
-                            sdf.stroke(fab.color_border, 1.0)
-                            return sdf.result
-                        }
-                    }
-                    none := mod.widgets.FabIconMuted{
-                        width: 18
-                        height: 18
-                        icon_walk: Walk{ width: 18 height: 18 }
-                        draw_icon +: { svg: crate_resource("self://resources/icons/cube.svg") }
-                    }
-                    thumb := Image{
-                        width: Fill
-                        height: Fill
-                        fit: ImageFit.CropToFill
-                    }
-                }
-                text := View{
-                    width: Fill
-                    height: Fit
-                    flow: Down
-                    spacing: 3
-                    name := mod.widgets.FabLabel{ width: Fill text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis }
-                    rename := mod.widgets.FabInput{ width: Fill height: 24 visible: false a11y: {label: "Rename plate"} }
-                    // cut short, it shows in full in its tooltip (the panel's: see `hover_tip`)
-                    info := mod.widgets.FabLabelSmall{ width: Fill text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis }
-                    confirm := View{
-                        width: Fill
-                        height: Fit
-                        visible: false
-                        flow: Right
-                        align: Align{x: 0.0 y: 0.5}
-                        spacing: 4
-                        trash := mod.widgets.FabButton{ text: "Move to Trash" }
-                        keep := mod.widgets.FabButton{ text: "Cancel" }
-                    }
-                }
-                more := ToolIcon{
-                    a11y: {label: "Plate menu"}
-                    draw_icon +: {svg: crate_resource("self://resources/icons/dots.svg")}
-                }
+                spacing: #(GAP)
+                padding: Inset{left: #(PAD) right: #(PAD) top: 4 bottom: 4}
+                t0 := Tile{}
+                t1 := Tile{}
+                t2 := Tile{}
+                t3 := Tile{}
+                t4 := Tile{}
+                t5 := Tile{}
             }
         }
     }
@@ -262,6 +316,9 @@ impl Shown {
 pub struct FabPlatesPanel {
     #[deref]
     view: View,
+    /// The shadow under the toolbar while the list is scrolled down.
+    #[live]
+    draw_shade: DrawQuad,
     /// The search, as typed.
     #[rust]
     query: String,
@@ -294,6 +351,19 @@ pub struct FabPlatesPanel {
 }
 
 impl FabPlatesPanel {
+    /// The grid's columns at the list's width as last drawn (as its draw laid them out).
+    fn cols(&self, cx: &mut Cx) -> usize {
+        columns(self.view.portal_list(cx, ids!(list)).area().rect(cx).size.x)
+    }
+
+    /// Where card line `line` is drawn: its grid row's list position and its slot there.
+    fn locate(&self, cols: usize, line: usize) -> Option<(usize, usize)> {
+        grid(&self.lines, cols).iter().enumerate().find_map(|(pos, d)| match d {
+            Disp::Cards(ls) => ls.iter().position(|&l| l == line).map(|k| (pos, k)),
+            _ => None,
+        })
+    }
+
     fn card(&self, line: usize) -> Option<&PlateCard> {
         match self.lines.get(line)? {
             Line::Card(i) => self.cards.get(*i),
@@ -459,11 +529,14 @@ impl Widget for FabPlatesPanel {
         }
         let Some(state) = scope.data.get::<AppState>() else { return };
         let list = self.view.portal_list(cx, ids!(list));
+        let cols = self.cols(cx);
         for &line in &self.visible.clone() {
             let Some(card) = self.card(line).cloned() else { continue };
-            let Some((_, item)) = list.get_item(line) else { continue };
+            let Some((pos, k)) = self.locate(cols, line) else { continue };
+            let Some((_, row)) = list.get_item(pos) else { continue };
+            let item = row.widget(cx, slot(k));
             if !card.demo && self.rename.as_ref().is_some_and(|(id, _)| *id == card.id) {
-                let input = item.text_input(cx, ids!(text.rename));
+                let input = item.text_input(cx, ids!(rename));
                 if input.escaped(actions) {
                     self.rename = None;
                     self.view.redraw(cx);
@@ -478,20 +551,20 @@ impl Widget for FabPlatesPanel {
                 continue;
             }
             if self.confirm.as_deref() == Some(card.id.as_str()) && !card.demo {
-                if item.button(cx, ids!(text.confirm.trash)).clicked(actions) {
+                if item.button(cx, ids!(confirm.trash)).clicked(actions) {
                     self.confirm = None;
                     cx.action(ShellAction::DeletePlate(card.id.clone()));
                     self.view.redraw(cx);
                     continue;
                 }
-                if item.button(cx, ids!(text.confirm.keep)).clicked(actions) {
+                if item.button(cx, ids!(confirm.keep)).clicked(actions) {
                     self.confirm = None;
                     self.view.redraw(cx);
                     continue;
                 }
             }
-            if item.button(cx, ids!(more)).clicked(actions) {
-                let r = item.widget(cx, ids!(more)).area().rect(cx);
+            if item.button(cx, ids!(pic.corner.more)).clicked(actions) {
+                let r = item.widget(cx, ids!(pic.corner.more)).area().rect(cx);
                 self.open_menu_for(cx, &card, Rect { pos: r.pos + dvec2(0.0, r.size.y), size: dvec2(0.0, 0.0) });
                 continue;
             }
@@ -525,64 +598,100 @@ impl Widget for FabPlatesPanel {
         while let Some(step) = self.view.draw_walk(cx, scope, walk).step() {
             let list_ref = step.as_portal_list();
             let Some(mut list) = list_ref.borrow_mut() else { continue };
-            list.set_item_range(cx, 0, self.lines.len());
+            // the grid at the list's width as it draws now
+            let width = cx.turtle().inner_rect().size.x;
+            let cols = columns(width);
+            let tile_w = ((width - 2.0 * PAD - (cols as f64 - 1.0) * GAP) / cols as f64).max(TILE_MIN.min(width - 2.0 * PAD).max(40.0));
+            let disp = grid(&self.lines, cols);
+            list.set_item_range(cx, 0, disp.len());
             while let Some(pos) = list.next_visible_item(cx) {
-                let Some(line) = self.lines.get(pos).cloned() else { continue };
-                self.visible.push(pos);
-                match line {
-                    Line::Head(title) => {
-                        let item = list.item(cx, pos, live_id!(Head));
-                        item.label(cx, ids!(title)).set_text(cx, title);
-                        item.draw_all(cx, &mut Scope::empty());
-                    }
-                    Line::Group(title) => {
-                        let item = list.item(cx, pos, live_id!(Group));
-                        item.label(cx, ids!(title)).set_text(cx, &title);
-                        item.draw_all(cx, &mut Scope::empty());
-                    }
-                    Line::Note(text) => {
-                        let item = list.item(cx, pos, live_id!(Note));
-                        item.label(cx, ids!(text)).set_text(cx, text);
-                        item.draw_all(cx, &mut Scope::empty());
-                    }
-                    Line::Card(i) => {
-                        let Some(card) = self.cards.get(i) else { continue };
-                        let item = list.item(cx, pos, live_id!(Row));
-                        let on_bed = bed.0.as_deref() == Some(card.id.as_str()) && bed.1 == card.demo;
-                        if let Some(mut view) = item.as_view().borrow_mut() {
-                            view.draw_bg.set_dyn_instance(cx, live_id!(selected), &[if on_bed { 1.0 } else { 0.0 }]);
+                let Some(d) = disp.get(pos).cloned() else { continue };
+                match d {
+                    Disp::Line(l) => {
+                        self.visible.push(l);
+                        match self.lines.get(l).cloned() {
+                            Some(Line::Head(title)) => {
+                                let item = list.item(cx, pos, live_id!(Head));
+                                item.label(cx, ids!(title)).set_text(cx, title);
+                                item.draw_all(cx, &mut Scope::empty());
+                            }
+                            Some(Line::Group(title)) => {
+                                let item = list.item(cx, pos, live_id!(Group));
+                                item.label(cx, ids!(title)).set_text(cx, &title);
+                                item.draw_all(cx, &mut Scope::empty());
+                            }
+                            Some(Line::Note(text)) => {
+                                let item = list.item(cx, pos, live_id!(Note));
+                                item.label(cx, ids!(text)).set_text(cx, text);
+                                item.draw_all(cx, &mut Scope::empty());
+                            }
+                            _ => {}
                         }
-                        item.label(cx, ids!(text.name)).set_text(cx, &card.title());
-                        item.label(cx, ids!(text.info)).set_text(cx, &info(card));
-                        let renaming = self.rename.as_ref().filter(|(id, _)| *id == card.id && !card.demo).map(|(_, focus)| *focus);
-                        let confirming = !card.demo && self.confirm.as_deref() == Some(card.id.as_str());
-                        item.widget(cx, ids!(text.name)).set_visible(cx, renaming.is_none());
-                        item.widget(cx, ids!(text.rename)).set_visible(cx, renaming.is_some());
-                        item.widget(cx, ids!(text.info)).set_visible(cx, !confirming);
-                        item.widget(cx, ids!(text.confirm)).set_visible(cx, confirming);
-                        item.widget(cx, ids!(more)).set_visible(cx, !card.demo);
-                        if renaming == Some(true) {
-                            item.text_input(cx, ids!(text.rename)).set_text(cx, &card.name);
-                        }
-                        let thumb = item.image(cx, ids!(pic.thumb));
-                        item.widget(cx, ids!(pic.none)).set_visible(cx, card.picture.is_none());
-                        match &card.picture {
-                            Some(png) => {
-                                thumb.set_visible(cx, true);
-                                // a picture is loaded again only for another card or a new picture
-                                let mark = (card.id.clone(), Arc::as_ptr(png) as *const u8 as usize);
-                                if self.loaded.get(&thumb.widget_uid()) != Some(&mark) && thumb.load_png_from_data(cx, png).is_ok() {
-                                    self.loaded.insert(thumb.widget_uid(), mark);
+                    }
+                    Disp::Cards(ls) => {
+                        let row = list.item(cx, pos, live_id!(Grid));
+                        let mut focus_line = None;
+                        for k in 0..SLOTS {
+                            let item = row.widget(cx, slot(k));
+                            let Some(&line) = ls.get(k) else {
+                                item.set_visible(cx, false);
+                                continue;
+                            };
+                            let Some(Line::Card(i)) = self.lines.get(line).cloned() else { continue };
+                            let Some(card) = self.cards.get(i) else { continue };
+                            self.visible.push(line);
+                            item.set_visible(cx, true);
+                            if let Some(mut view) = item.borrow_mut::<View>() {
+                                view.walk.width = Size::Fixed(tile_w);
+                            }
+                            if let Some(mut pic) = item.view(cx, ids!(pic)).borrow_mut() {
+                                pic.walk.height = Size::Fixed(((tile_w - 10.0) * 0.72).round());
+                            }
+                            let on_bed = bed.0.as_deref() == Some(card.id.as_str()) && bed.1 == card.demo;
+                            if let Some(mut view) = item.borrow_mut::<View>() {
+                                view.draw_bg.set_dyn_instance(cx, live_id!(selected), &[if on_bed { 1.0 } else { 0.0 }]);
+                            }
+                            item.label(cx, ids!(name)).set_text(cx, &card.title());
+                            item.label(cx, ids!(info)).set_text(cx, &info(card));
+                            let renaming = self.rename.as_ref().filter(|(id, _)| *id == card.id && !card.demo).map(|(_, focus)| *focus);
+                            let confirming = !card.demo && self.confirm.as_deref() == Some(card.id.as_str());
+                            item.widget(cx, ids!(name)).set_visible(cx, renaming.is_none());
+                            item.widget(cx, ids!(rename)).set_visible(cx, renaming.is_some());
+                            item.widget(cx, ids!(info)).set_visible(cx, !confirming);
+                            item.widget(cx, ids!(confirm)).set_visible(cx, confirming);
+                            item.widget(cx, ids!(pic.corner.more)).set_visible(cx, !card.demo);
+                            if renaming == Some(true) {
+                                item.text_input(cx, ids!(rename)).set_text(cx, &card.name);
+                                focus_line = Some(k);
+                            }
+                            let thumb = item.image(cx, ids!(pic.thumb));
+                            item.widget(cx, ids!(pic.none)).set_visible(cx, card.picture.is_none());
+                            match &card.picture {
+                                Some(png) => {
+                                    thumb.set_visible(cx, true);
+                                    // a picture is loaded again only for another card or a new picture
+                                    let mark = (card.id.clone(), Arc::as_ptr(png) as *const u8 as usize);
+                                    if self.loaded.get(&thumb.widget_uid()) != Some(&mark) && thumb.load_png_from_data(cx, png).is_ok() {
+                                        self.loaded.insert(thumb.widget_uid(), mark);
+                                    }
+                                }
+                                None => {
+                                    thumb.set_visible(cx, false);
+                                    self.loaded.remove(&thumb.widget_uid());
                                 }
                             }
-                            None => {
-                                thumb.set_visible(cx, false);
-                                self.loaded.remove(&thumb.widget_uid());
+                        }
+                        row.draw_all(cx, &mut Scope::empty());
+                        for (k, &line) in ls.iter().enumerate() {
+                            let item = row.widget(cx, slot(k));
+                            let confirming = self.card(line).is_some_and(|c| !c.demo && self.confirm.as_deref() == Some(c.id.as_str()));
+                            if let Some(shown) = self.shown.get_mut(line) {
+                                shown.row = item.area();
+                                shown.line = if confirming { Area::Empty } else { item.widget(cx, ids!(info)).area() };
                             }
                         }
-                        item.draw_all(cx, &mut Scope::empty());
-                        if renaming == Some(true) {
-                            let input = item.text_input(cx, ids!(text.rename));
+                        if let Some(k) = focus_line {
+                            let input = row.widget(cx, slot(k)).text_input(cx, ids!(rename));
                             input.set_key_focus(cx);
                             if let Some(mut input) = input.borrow_mut() {
                                 input.select_all(cx);
@@ -591,12 +700,14 @@ impl Widget for FabPlatesPanel {
                                 *focus = false;
                             }
                         }
-                        self.shown[pos].row = item.area();
-                        self.shown[pos].line = if confirming { Area::Empty } else { item.widget(cx, ids!(text.info)).area() };
                     }
                 }
             }
         }
+        // the list scrolled down: a shadow along its top, under the toolbar
+        let list = self.view.portal_list(cx, ids!(list));
+        let (first_id, first_scroll) = (list.first_id(), list.scroll_position());
+        crate::ui::widgets::draw_scroll_shade(cx, &mut self.draw_shade, list.area().rect(cx), first_id, first_scroll);
         DrawStep::done()
     }
 }

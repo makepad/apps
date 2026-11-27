@@ -448,6 +448,10 @@ pub struct Evaluated {
     /// One per plate part, same order: how its `place(...)` call reads.
     pub handles: Vec<PartHandles>,
     pub printability: Arc<fab_printability::Report>,
+    /// The overlap issues its build found on `plate`, judged with `fields`: every later check of this
+    /// plate reuses them. None where nothing judged them. Code that edits `plate`'s parts in place
+    /// (their meshes, boxes, names or objects) sets it to None.
+    pub overlaps: Option<Arc<fab_printability::Overlaps>>,
     /// The hash of the sources the plate is made from: its scripts with their parameters and
     /// placements, the strokes files they read and the print colours.
     pub content: [u8; 32],
@@ -1225,12 +1229,16 @@ impl PartField {
 /// facet inside another of its group's parts hints nothing; two objects whose bodies meet are an
 /// error, a field part without a mesh judged by its field.
 pub fn analyse_plate(machine: &Machine, plate: &Plate, fields: &[Option<PartField>], materials: &fab_printability::Materials) -> fab_printability::Report {
+    analyse_plate_known(machine, plate, fields, materials, None).0
+}
+
+fn analyse_plate_known(machine: &Machine, plate: &Plate, fields: &[Option<PartField>], materials: &fab_printability::Materials, known: Option<&Arc<fab_printability::Overlaps>>) -> (fab_printability::Report, Arc<fab_printability::Overlaps>) {
     let grouped: Vec<usize> = plate.groups().into_iter().flatten().collect();
     // A field part with no mesh has no facets to judge by it either way: its field is its only
     // solid, for the overlap check.
     let solid = |i: usize| grouped.contains(&i) || plate.parts.get(i).is_some_and(|p| p.mesh.triangles.is_empty());
     let solids: Vec<_> = fields.iter().enumerate().map(|(i, f)| f.as_ref().filter(|_| solid(i)).and_then(PartField::on_plate)).collect();
-    fab_printability::analyse_plate_with(machine, plate, materials, &|i| solids.get(i)?.as_ref().map(|f| f as fab_printability::PartField<'_>), &|| false).expect("nothing stops it")
+    fab_printability::analyse_plate_known(machine, plate, materials, &|i| solids.get(i)?.as_ref().map(|f| f as fab_printability::PartField<'_>), known, &|| false).expect("nothing stops it")
 }
 
 /// What changed in one plate part since the previous evaluation, by object
@@ -1264,7 +1272,7 @@ pub struct Bounds2 {
 impl Evaluated {
     /// This plate's printability with `materials` ([`analyse_plate`]).
     pub fn analyse(&self, materials: &fab_printability::Materials) -> fab_printability::Report {
-        analyse_plate(&self.machine, &self.plate, &self.fields, materials)
+        analyse_plate_known(&self.machine, &self.plate, &self.fields, materials, self.overlaps.as_ref()).0
     }
 
     /// Update the printer mapping, including the tools that slice each named colour.
@@ -3115,7 +3123,7 @@ impl Evaluator {
         if let Some(step) = &plate_step {
             step.stage("checking it prints", None, Some(0.8));
         }
-        let mut printability = analyse_plate(&self.machine, &plate, &fields, &self.materials);
+        let (mut printability, overlaps) = analyse_plate_known(&self.machine, &plate, &fields, &self.materials, None);
         // A texture finer than a line or shallower than a layer: warned, still sliced.
         for (part, field) in plate.parts.iter().zip(&fields) {
             let Some(f) = field else { continue };
@@ -3140,6 +3148,7 @@ impl Evaluator {
             shapes: kept_shapes.into_iter().chain(excluded_shapes).collect(),
             handles,
             printability: Arc::new(printability),
+            overlaps: Some(overlaps),
             content: content.finish(),
             plate,
             render,
@@ -4740,6 +4749,7 @@ impl Evaluated {
             arrange_gap: self.arrange_gap,
             handles: vec![PartHandles::default(); n],
             printability: Arc::new(fab_printability::Report::default()),
+            overlaps: None,
             content: self.content,
             plate: Plate { excluded: Vec::new(), parts, settings: self.plate.settings.clone() },
             render,

@@ -5,7 +5,6 @@ use super::{
     store::Store,
     Scratch,
 };
-use makepad_work_core::home::write_private;
 use makepad_strict_json::{obj, parse, s, Value};
 use makepad_widgets::makepad_platform::thread::{Class, SubmitError, TaskHandle, TaskPool};
 use std::{
@@ -330,7 +329,7 @@ impl Upload {
                 ("hashes", Value::Arr(self.post.media.iter().map(|m| s(&m.sha256)).collect())),
                 ("time", s(utc(SystemTime::now())?)),
             ]));
-            write_private(&path, Value::Arr(rows).to_json().as_bytes())?;
+            super::write_private_bg(&path, Value::Arr(rows).to_json().as_bytes())?;
         }
         Ok(())
     }

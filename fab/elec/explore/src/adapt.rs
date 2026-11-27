@@ -5,10 +5,11 @@
 //!
 //! Cost: linear in components, pins and connections.
 
-use crate::graph::{Flow, GBlock, GBlockPort, GBus, GNet, GNode, GPort, LayoutGraph, NetKind, NetStyle, PortKind, Refit, Role};
+use crate::graph::{Flow, GBlock, GBlockPort, GBus, GNet, GNode, GPort, GRailSummary, LayoutGraph, NetKind, NetStyle, PortKind, Refit, Role};
 use crate::layered::Side;
 use fab_elec_circuit::{self as circuit, Circuit, Intent, SheetHints, Target};
-use fab_elec_core::{CompId, SchPt};
+use fab_elec_core::SchPt;
+use std::collections::HashMap;
 use fab_elec_parts::{PartDef, PartKind, PinDir, PinKind, SymGraphic, SymPin, SymbolUnit};
 
 /// The role a part plays, from what its definition says it is (`PartDef::kind`), never from
@@ -291,14 +292,27 @@ pub fn graph_of(c: &Circuit, hints: &SheetHints) -> LayoutGraph {
 /// `graph_of` with the part or block a drag moves (by path) as the lead: pinned parts and blocks
 /// it runs into make room for it (`LayoutGraph::lead`, `lead_block`).
 pub fn graph_led(c: &Circuit, hints: &SheetHints, lead: Option<&str>) -> LayoutGraph {
-    let hint = |path: &str| {
-        hints.parts.iter().rev().chain(c.hints.parts.iter().rev()).find(|(p, _)| p == path).map(|(_, h)| h)
-    };
+    // Overlay hints win over document hints; later entries win within each set.
+    let part_hints: HashMap<_, _> = c.hints.parts.iter().chain(&hints.parts)
+        .map(|(path, h)| (path.as_str(), h)).collect();
+    let net_styles: HashMap<_, _> = c.hints.nets.iter().chain(&hints.nets)
+        .map(|(name, s)| (name.as_str(), s)).collect();
+    let mut near = HashMap::new();
+    for intent in &c.intents {
+        if let Intent::Near { a: Target::Comp(a), b, .. } = intent {
+            let target = match b {
+                Target::Comp(b) if a != b => (b.0, None),
+                Target::Pin(b, pin) if a != b => (b.0, Some(pin.0 as u32)),
+                _ => continue,
+            };
+            near.entry(a.0).or_insert(target);
+        }
+    }
     let lead_block = lead.filter(|lead| !lead.is_empty()).and_then(|lead| c.tree.iter().position(|b| b.path == lead));
     let lead = lead.and_then(|lead| c.comps.iter().position(|comp| comp.path == lead));
     let mut g = LayoutGraph { lead: lead.map(|n| n as u32), lead_block: lead_block.map(|b| b as u32), ..LayoutGraph::default() };
     for (i, comp) in c.comps.iter().enumerate() {
-        let h = hint(&comp.path);
+        let h = part_hints.get(comp.path.as_str()).copied();
         // A hint's turn decides which fit the sheet draws; the other one waits for a reveal's turn.
         let quarter = h.is_some_and(|h| h.turn & 1 == 1);
         let (body, mut ports) = symbol_geometry(&comp.part, quarter);
@@ -311,15 +325,6 @@ pub fn graph_led(c: &Circuit, hints: &SheetHints, lead: Option<&str>) -> LayoutG
                 p.nc = true;
             }
         }
-        let me = CompId(i as u32);
-        let near = c.intents.iter().find_map(|intent| match intent {
-            Intent::Near { a: Target::Comp(a), b, .. } if *a == me => match b {
-                Target::Comp(b) if *b != me => Some((b.0, None)),
-                Target::Pin(b, pin) if *b != me => Some((b.0, Some(pin.0 as u32))),
-                _ => None,
-            },
-            _ => None,
-        });
         g.nodes.push(GNode {
             key: i as u32,
             role: role_of(&comp.part),
@@ -333,19 +338,14 @@ pub fn graph_led(c: &Circuit, hints: &SheetHints, lead: Option<&str>) -> LayoutG
             turn: h.map(|h| h.turn),
             mirror: h.is_some_and(|h| h.mirror),
             free: h.is_some_and(|h| h.free && h.at.is_some()),
-            near,
+            near: near.get(&(i as u32)).copied(),
             quarter,
             refit,
         });
     }
+    let rails = circuit::erc::rail_summaries(c);
     for (i, net) in c.nets.iter().enumerate() {
-        let style = hints
-            .nets
-            .iter()
-            .rev()
-            .chain(c.hints.nets.iter().rev())
-            .find(|(n, _)| *n == net.name)
-            .map(|(_, s)| match s {
+        let style = net_styles.get(net.name.as_str()).map(|s| match s {
                 circuit::NetStyle::Wire => NetStyle::Wire,
                 circuit::NetStyle::Label => NetStyle::Label,
             });
@@ -358,6 +358,12 @@ pub fn graph_led(c: &Circuit, hints: &SheetHints, lead: Option<&str>) -> LayoutG
                 circuit::NetKind::Ground => NetKind::Ground,
             },
             volts: net.volts.map(|v| 0.5 * (v.min + v.max)),
+            rail: (net.kind != circuit::NetKind::Ground).then(|| &rails[i])
+                .filter(|r| net.kind == circuit::NetKind::Power || !r.sources.is_empty() || r.has_demand)
+                .map(|r| GRailSummary {
+                    volts: r.volts.map(|v| (v.min, v.max)), volts_conflict: r.volts_conflict,
+                    demand: r.demand, has_demand: r.has_demand, budget: r.budget, source_conflict: r.sources.len() > 1,
+                }),
             pins: Vec::new(),
             bus: None,
             style,
@@ -379,6 +385,22 @@ pub fn graph_led(c: &Circuit, hints: &SheetHints, lead: Option<&str>) -> LayoutG
         }
         g.buses.push(GBus { name: bus.name.clone(), nets });
     }
+    let mut planned = vec![false; c.tree.len()];
+    let mut endpoints = vec![0usize; c.nets.len()];
+    for b in &c.tree {
+        planned[b.id.ix()] = b.parent.is_some_and(|p| planned[p.ix()])
+            || b.def.is_some_and(|d| c.block_defs[d.0 as usize].planned);
+        if planned[b.id.ix()] {
+            for (_, nets) in &b.ports {
+                for net in nets { endpoints[net.ix()] += 1; }
+            }
+        }
+    }
+    for comp in &c.comps {
+        if planned.get(comp.block.ix()) != Some(&true) {
+            for (_, n) in &comp.conns { endpoints[n.ix()] += 1; }
+        }
+    }
     let mut sibling = vec![0u32; c.tree.len()];
     for (i, b) in c.tree.iter().enumerate() {
         let def = b.def.and_then(|d| c.block_defs.get(d.0 as usize));
@@ -390,25 +412,35 @@ pub fn graph_led(c: &Circuit, hints: &SheetHints, lead: Option<&str>) -> LayoutG
             }
             None => 0,
         };
+        let sides: HashMap<_, _> = def.into_iter().flat_map(|d| &d.sheet.sides)
+            .map(|(name, side)| (name, side_of(*side))).collect();
         let ports = b
             .ports
             .iter()
-            .map(|(name, nets)| {
-                let pdef = def.and_then(|d| d.ports.iter().find(|p| p.name == *name));
-                let side = def.and_then(|d| d.sheet.sides.iter().find(|(n, _)| n == name)).map(|(_, s)| side_of(*s));
+            .enumerate().map(|(i, (name, nets))| {
+                let pdef = def.and_then(|d| d.ports.get(i));
+                let side = sides.get(name).copied();
+                let kind = pdef.map(|p| block_port_kind(&p.kind)).unwrap_or(PortKind::Passive);
+                let ground = pdef.is_some_and(|p| p.kind == circuit::PortKind::Ground);
                 GBlockPort {
                     name: name.clone(),
                     side,
-                    kind: pdef.map(|p| block_port_kind(&p.kind)).unwrap_or(PortKind::Passive),
+                    kind, ground,
+                    volts: pdef.and_then(|p| p.volts).map(|r| (r.min, r.max)),
+                    current: pdef.and_then(|p| p.current),
+                    open: nets.is_empty() || planned[b.id.ix()] && !matches!(kind, PortKind::PowerOut | PortKind::PowerIn)
+                        && nets.iter().any(|n| endpoints[n.ix()] < 2),
                     nets: nets.iter().map(|n| n.0).collect(),
                 }
             })
             .collect();
-        let h = hint(&b.path);
+        let h = part_hints.get(b.path.as_str()).copied();
         g.blocks.push(GBlock {
             key: i as u32,
             parent: b.parent.map(|p| p.0),
             path: b.path.clone(),
+            planned: def.is_some_and(|d| d.planned),
+            role: def.and_then(|d| d.role.clone()),
             title: def.map(|d| d.name.clone()),
             flow: h.and_then(|h| h.flow).map(flow_of).or(def.map(|d| flow_of(d.sheet.flow))).unwrap_or_default(),
             ports,

@@ -11,6 +11,10 @@
 //!
 //! HAL offscreen (`MAKEPAD_HAL_BACKEND=offscreen`), native GPU, no window.
 
+#[path = "common/export_print.rs"]
+mod export_print;
+#[path = "common/render_mode.rs"]
+mod render_mode;
 mod common;
 #[path = "common/wait.rs"]
 mod idle_wait;
@@ -174,8 +178,7 @@ fn a_resin_printers_slice_is_layer_images_the_slider_walks() {
         let batch = format!(r#"{{"request_id":"resin-place","expected":{head:?},"edits":"place(\"block\", name: \"Block\")"}}"#);
         let head = head_of("place", &text(&call(&app, "place", &batch).expect("place")));
 
-        app.locator(Selector::id("rm_slice")).select();
-        app.locator(Selector::id("rm_slice")).wait_checked(true);
+        render_mode::pick(&app, "Sliced");
         let full = 200 * 200;
         // the top layer at first, the block whole under it: the block stands on its supports,
         // 6 mm up (5 mm over a 1 mm pad), so its 5 mm are layers 121 to 220
@@ -261,7 +264,7 @@ fn a_resin_printers_slice_is_layer_images_the_slider_walks() {
         let head = head_of("script", &text(&call(&app, "script", &batch).expect("script")));
         let batch = format!(r#"{{"request_id":"resin-place-cage","expected":{head:?},"edits":"place(\"cage\", at: [95mm 40mm], name: \"Cage\")"}}"#);
         call(&app, "place", &batch).expect("place");
-        let printability = || app.widget_snapshot().nodes().into_iter().find(|w| w.visible() && w.node.name == "Printability").map(|w| w.node.value);
+        let printability = || app.locator(Selector::widget_type("FabIssueSummary").name("Printability")).try_snapshot().ok().map(|w| w.node.value);
         app.try_wait_until_within(HANG, || (!printability().is_some_and(|v| v.contains("Unconnected island, 1 (error)"))).then(|| "waiting for Printability to name the ball".to_string())).unwrap_or_else(|why| {
             let said: Vec<String> = app.log_since(0).map(|l| l.lines.into_iter().filter(|l| l.contains("fab resin")).collect()).unwrap_or_default();
             let status: Vec<String> = names(&app).into_iter().filter(|n| n.contains("supports")).collect();
@@ -270,8 +273,8 @@ fn a_resin_printers_slice_is_layer_images_the_slider_walks() {
 
         // Export writes the stack: a greyscale PNG per layer as the screen shows it (the simulated
         // screen unturned, 2400 x 1600), and the manifest names them all
-        app.locator(Selector::role(Role::Tab).name("Job")).select();
-        app.locator(Selector::id("export")).wait_visible().click();
+        app.locator(Selector::role(Role::Tab).name("Slice")).select();
+        export_print::request(&app);
         let wrote = wait_poll(&app, || {
             if let Some(s) = names(&app).into_iter().find(|n| n.contains(" Wrote ") || n.contains("Export failed")) {
                 return Ok(s);

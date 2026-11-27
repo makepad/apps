@@ -1,11 +1,12 @@
 //! The slice view's controls, drawn over the plate:
 //!
-//! * [`FabLayerSlider`] — the vertical layer range beside the view: drag the
-//!   top handle to look at any layer (the print is shown up to it), the
-//!   bottom one to cut the lower layers away. While the print plays the top
-//!   handle rides with the layer being printed.
 //! * [`FabMoveSlider`] — the moves within the current layer, left to right:
 //!   drag to put the nozzle anywhere along the layer's path.
+//! * [`FabSlicePad`] — the playback's pad, a Kaoss pad's square: up it the layers (layer 1 at the
+//!   foot), across it the moves within the layer; a press or a drag puts the playhead at any
+//!   moment of the print, a glowing point where it is. The round handle on its rail sets the
+//!   lowest layer shown; amber lines mark the pauses for items placed in. A resin printer's
+//!   stack walks up it alone (its layers cure at once).
 //! * [`FabSliceLegend`] — what the colours mean in the current colour mode,
 //!   with the totals: time and path length per feature, print time, the
 //!   filament each slot uses and its cost when known.
@@ -140,16 +141,88 @@ script_mod! {
         }
     }
 
-    mod.widgets.FabLayerSliderBase = #(FabLayerSlider::register_widget(vm))
-    mod.widgets.FabLayerSlider = set_type_default() do mod.widgets.FabLayerSliderBase{
-        width: 28
-        height: Fill
-        draw_bar: mod.draw.DrawFabRange{ vertical: 1.0 }
-        draw_tag: mod.draw.DrawFabChip{ radius: 2.5 }
-        draw_text: mod.draw.DrawText{
-            color: fab.color_text_active
-            text_style: theme.font_regular{ font_size: fab.font_size_small }
+    mod.draw.DrawFabPad = mod.std.set_type_default() do #(DrawFabPad::script_shader(vm)){
+        ..mod.draw.DrawQuad
+        // the point (fractions: across the layer's moves, up the layers), the floor (the lowest
+        // layer shown, its handle on the rail at the right), a press, the pointer over the pad and
+        // over the floor's handle, the rail's width, and a resin stack (layers only: no moves)
+        px: 0.0
+        py: 0.0
+        lo: 0.0
+        down: 0.0
+        hover: 0.0
+        floor_hot: 0.0
+        rail: 18.0
+        resin: 0.0
+        pixel: fn() {
+            let p = self.pos * self.rect_size
+            let sdf = Sdf2d.viewport(p)
+            let w = self.rect_size.x - self.rail
+            let h = self.rect_size.y
+            let a = fab.color_accent
+            // the well, a step darker than the card
+            sdf.box(0.5, 0.5, w - 1.0, h - 1.0, 5.0)
+            sdf.fill_keep(vec4(0.0, 0.0, 0.0, 0.32))
+            sdf.stroke(vec4(1.0, 1.0, 1.0, 0.06 + 0.06 * self.hover), 1.0)
+            let inset = 6.0
+            let iw = w - inset * 2.0
+            let ih = h - inset * 2.0
+            // the layers cut away below the floor, shaded
+            sdf.rect(inset, inset + ih * (1.0 - self.lo), iw, ih * self.lo)
+            sdf.fill(vec4(0.0, 0.0, 0.0, 0.25))
+            // a quarter grid
+            let g = vec4(1.0, 1.0, 1.0, 0.045)
+            sdf.rect(inset + iw * 0.25, inset, 1.0, ih)
+            sdf.fill(g)
+            sdf.rect(inset + iw * 0.5, inset, 1.0, ih)
+            sdf.fill(g)
+            sdf.rect(inset + iw * 0.75, inset, 1.0, ih)
+            sdf.fill(g)
+            sdf.rect(inset, inset + ih * 0.25, iw, 1.0)
+            sdf.fill(g)
+            sdf.rect(inset, inset + ih * 0.5, iw, 1.0)
+            sdf.fill(g)
+            sdf.rect(inset, inset + ih * 0.75, iw, 1.0)
+            sdf.fill(g)
+            // the printed share of the layer, and the crosshair through the point (a resin layer
+            // cures at once: its line alone)
+            let x = mix(inset + iw * self.px, inset + iw * 0.5, self.resin)
+            let y = inset + ih * (1.0 - self.py)
+            sdf.rect(inset, y - 1.0, mix(x - inset, iw, self.resin), 2.0)
+            sdf.fill(vec4(a.xyz, 0.55))
+            sdf.rect(x - 0.5, inset, 1.0, ih)
+            sdf.fill(vec4(a.xyz, 0.22 * (1.0 - self.resin)))
+            sdf.rect(inset, y - 0.5, iw, 1.0)
+            sdf.fill(vec4(a.xyz, 0.22))
+            // the point's glow, wider while pressed
+            sdf.circle(x, y, 16.0 + 8.0 * self.down)
+            sdf.fill(vec4(a.xyz, 0.08 + 0.08 * self.down))
+            sdf.circle(x, y, 9.0 + 3.0 * self.down)
+            sdf.fill(vec4(a.xyz, 0.18 + 0.12 * self.down))
+            sdf.circle(x, y, 5.0)
+            sdf.fill_keep(fab.color_text_active)
+            sdf.stroke(vec4(0.0, 0.0, 0.0, 0.5), 1.0)
+            // the floor's rail at the right, its round handle at the lowest layer shown
+            let rx = w + self.rail * 0.5
+            sdf.box(rx - 1.5, inset, 3.0, ih, 1.5)
+            sdf.fill(vec4(0.0, 0.0, 0.0, 0.35))
+            let fy = inset + ih * (1.0 - self.lo)
+            sdf.box(rx - 1.5, inset + ih * (1.0 - self.py), 3.0, ih * max(self.py - self.lo, 0.0), 1.5)
+            sdf.fill(vec4(a.xyz, 0.45))
+            sdf.circle(rx, fy, 5.5 + 1.0 * self.floor_hot)
+            sdf.fill_keep(mix(fab.color_text_dim, fab.color_text_active, self.floor_hot))
+            sdf.stroke(vec4(0.0, 0.0, 0.0, 0.5), 1.0)
+            return sdf.result
         }
+    }
+
+    mod.widgets.FabSlicePadBase = #(FabSlicePad::register_widget(vm))
+    mod.widgets.FabSlicePad = set_type_default() do mod.widgets.FabSlicePadBase{
+        width: Fill
+        height: 132
+        draw_pad: mod.draw.DrawFabPad{}
+        // the pauses' marks across the pad, in amber
+        draw_mark: mod.draw.DrawFabChip{ radius: 1.0 }
     }
 
     mod.widgets.FabMoveSliderBase = #(FabMoveSlider::register_widget(vm))
@@ -232,6 +305,29 @@ pub struct DrawFabRange {
 
 #[derive(Script, ScriptHook, Debug)]
 #[repr(C)]
+pub struct DrawFabPad {
+    #[deref]
+    draw_super: DrawQuad,
+    #[live]
+    px: f32,
+    #[live]
+    py: f32,
+    #[live]
+    lo: f32,
+    #[live]
+    down: f32,
+    #[live]
+    hover: f32,
+    #[live]
+    floor_hot: f32,
+    #[live]
+    rail: f32,
+    #[live]
+    resin: f32,
+}
+
+#[derive(Script, ScriptHook, Debug)]
+#[repr(C)]
 pub struct DrawFabJobBar {
     #[deref]
     draw_super: DrawQuad,
@@ -261,152 +357,6 @@ pub fn shown_top_layer(p: &PrintState, pv: &PrintPreview) -> u32 {
 /// The time span of layer `layer`.
 pub fn layer_span(pv: &PrintPreview, layer: u32) -> (f64, f64) {
     pv.layers.iter().find(|l| l.layer == layer).map(|l| (l.t_start, l.t_end)).unwrap_or((0.0, pv.total))
-}
-
-// ===========================================================================
-// Layer slider
-// ===========================================================================
-
-#[derive(Clone, Copy, PartialEq)]
-enum Grab {
-    Top,
-    Bottom,
-}
-
-#[derive(Script, ScriptHook, Widget)]
-pub struct FabLayerSlider {
-    #[uid]
-    uid: WidgetUid,
-    #[walk]
-    walk: Walk,
-    #[redraw]
-    #[live]
-    draw_bar: DrawFabRange,
-    #[live]
-    draw_tag: DrawFabChip,
-    #[live]
-    draw_text: DrawText,
-    #[rust]
-    grab: Option<Grab>,
-}
-
-/// The layers the slider walks: the top one, the one shown on top and its height (mm). A
-/// slice's layers, or a resin printer's.
-fn slider_layers(state: &AppState) -> Option<(u32, u32, f32)> {
-    if let Some(r) = state.print.resin_shown() {
-        let max = r.count.saturating_sub(1);
-        let top = state.print.play.layer_hi.min(max);
-        return Some((max, top, r.top_of(top) as f32));
-    }
-    let pv = state.print.showing()?;
-    let top = shown_top_layer(&state.print, pv);
-    Some((pv.max_layer(), top, pv.layers.iter().find(|l| l.layer == top).map(|l| l.z).unwrap_or(0.0)))
-}
-
-impl FabLayerSlider {
-    fn layer_at(&self, cx: &Cx, abs: DVec2, max: u32) -> u32 {
-        let r = self.draw_bar.area().rect(cx);
-        let f = 1.0 - ((abs.y - r.pos.y - 10.0) / (r.size.y - 20.0).max(1.0)).clamp(0.0, 1.0);
-        (f * max as f64).round() as u32
-    }
-}
-
-impl Widget for FabLayerSlider {
-    fn semantics(&self, _cx: &Cx, node: &mut a11y_tree::Node) {
-        node.role = a11y_tree::Role::Slider;
-        makepad_platform::a11y::set_string(&mut node.name, "Top layer");
-        node.range = Some(a11y_tree::RangeValue { min: 0.0, max: 1.0, now: self.draw_bar.hi as f64, step: 0.0 });
-        node.actions.insert(a11y_tree::Actions::SET_VALUE);
-    }
-
-    fn handle_action(&mut self, cx: &mut Cx, request: &a11y_tree::ActionRequest, scope: &mut Scope) -> a11y_tree::ActionResult {
-        use a11y_tree::{ActionArg, ActionResult, Actions};
-        if request.action != Actions::SET_VALUE { return ActionResult::Unhandled; }
-        let value = match &request.arg {
-            ActionArg::Number(value) => Some(*value),
-            ActionArg::Text(value) => value.parse::<f64>().ok(),
-            _ => None,
-        };
-        let Some(value) = value.filter(|v| v.is_finite()) else { return ActionResult::Unsupported };
-        let Some((max, _, _)) = scope.data.get::<AppState>().and_then(slider_layers) else { return ActionResult::Disabled };
-        cx.action(PrintAction::SetTopLayer((value.clamp(0.0, 1.0) * max as f64).round() as u32));
-        ActionResult::Handled
-    }
-
-    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        let Some(state) = scope.data.get::<AppState>() else { return };
-        let Some((max, top, _)) = slider_layers(state) else { return };
-        match event.hits(cx, self.draw_bar.area()) {
-            Hit::FingerHoverIn(_) => cx.set_cursor(MouseCursor::NsResize),
-            Hit::FingerDown(fe) if fe.device.is_primary_hit() => {
-                let l = self.layer_at(cx, fe.abs, max);
-                let lo = state.print.play.layer_lo;
-                // The nearer handle; the bottom one only when the press is clearly below the middle of the range.
-                let grab = if l + 1 < lo + (top.saturating_sub(lo)) / 4 + 1 && top > lo + 2 { Grab::Bottom } else { Grab::Top };
-                let grab = if l < lo { Grab::Bottom } else { grab };
-                self.grab = Some(grab);
-                cx.action(match grab {
-                    Grab::Top => PrintAction::SetTopLayer(l),
-                    Grab::Bottom => PrintAction::SetBottomLayer(l),
-                });
-            }
-            Hit::FingerMove(fe) => {
-                if let Some(grab) = self.grab {
-                    let l = self.layer_at(cx, fe.abs, max);
-                    cx.action(match grab {
-                        Grab::Top => PrintAction::SetTopLayer(l),
-                        Grab::Bottom => PrintAction::SetBottomLayer(l.min(state.print.play.layer_hi)),
-                    });
-                }
-            }
-            Hit::FingerUp(_) => self.grab = None,
-            _ => {}
-        }
-    }
-
-    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        let Some(state) = scope.data.get::<AppState>() else { return DrawStep::done() };
-        let Some((max, top, z)) = slider_layers(state) else { return DrawStep::done() };
-        let max = max.max(1) as f32;
-        self.draw_bar.hi = top as f32 / max;
-        self.draw_bar.lo = (state.print.play.layer_lo as f32 / max).min(self.draw_bar.hi);
-        let rect = cx.walk_turtle(walk);
-        self.draw_bar.draw_abs(cx, rect);
-        // The stops for items placed into the print: a mark across the track at the layer each
-        // pauses after, and the top tag names what goes in there.
-        let pauses = state.print.showing().filter(|_| state.print.resin_shown().is_none()).map_or(&[][..], |pv| pv.pauses.as_slice());
-        for p in pauses {
-            let y = rect.pos.y + 10.0 + (rect.size.y - 20.0) * (1.0 - (p.layer.saturating_sub(1) as f64 / max as f64).min(1.0));
-            // Amber, apart from the track's accent.
-            self.draw_tag.fill = vec4(0.98, 0.70, 0.18, 1.0);
-            self.draw_tag.ring = vec4(0.0, 0.0, 0.0, 0.5);
-            self.draw_tag.spool = 0.0;
-            self.draw_tag.draw_abs(cx, Rect { pos: dvec2(rect.pos.x + rect.size.x * 0.5 - 9.0, y - 2.0), size: dvec2(18.0, 4.0) });
-        }
-        // The top layer's number and height, in a tag left of its handle.
-        let mut text = format!("{}  ·  {:.2} mm", top + 1, z);
-        if let Some(p) = pauses.iter().find(|p| p.layer == top + 1) {
-            text.push_str(&format!("  ·  pause: place {}", p.items.join(", ")));
-        }
-        let tw = self.draw_text.prepare_single_line_run(cx, &text).map(|r| r.width_in_lpxs as f64).unwrap_or(60.0);
-        let y = rect.pos.y + 10.0 + (rect.size.y - 20.0) * (1.0 - self.draw_bar.hi as f64);
-        self.draw_tag.fill = vec4(0.0, 0.0, 0.0, 0.62);
-        self.draw_tag.ring = vec4(1.0, 1.0, 1.0, 0.08);
-        self.draw_tag.spool = 0.0;
-        let tag = Rect { pos: dvec2(rect.pos.x - tw - 18.0, y - 10.0), size: dvec2(tw + 12.0, 20.0) };
-        self.draw_tag.draw_abs(cx, tag);
-        self.draw_text.draw_abs(cx, dvec2(tag.pos.x + 6.0, y - 6.0), &text);
-        if state.print.play.layer_lo > 0 {
-            let lo = state.print.play.layer_lo;
-            let text = format!("{}", lo + 1);
-            let tw = self.draw_text.prepare_single_line_run(cx, &text).map(|r| r.width_in_lpxs as f64).unwrap_or(20.0);
-            let y = rect.pos.y + 10.0 + (rect.size.y - 20.0) * (1.0 - self.draw_bar.lo as f64);
-            let tag = Rect { pos: dvec2(rect.pos.x - tw - 18.0, y - 9.0), size: dvec2(tw + 12.0, 18.0) };
-            self.draw_tag.draw_abs(cx, tag);
-            self.draw_text.draw_abs(cx, dvec2(tag.pos.x + 6.0, y - 5.0), &text);
-        }
-        DrawStep::done()
-    }
 }
 
 // ===========================================================================
@@ -500,6 +450,258 @@ impl Widget for FabMoveSlider {
             .unwrap_or(0.0);
         self.draw_bar.head = head.clamp(0.0, 1.0);
         self.draw_bar.draw_walk(cx, walk);
+        DrawStep::done()
+    }
+}
+
+// ===========================================================================
+// The playback pad
+// ===========================================================================
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct FabSlicePad {
+    #[uid]
+    uid: WidgetUid,
+    #[walk]
+    walk: Walk,
+    #[redraw]
+    #[live]
+    draw_pad: DrawFabPad,
+    #[live]
+    draw_mark: DrawFabChip,
+    /// What the held press moves: the playhead (the pad) or the floor (its handle on the rail).
+    #[rust]
+    grab: Option<PadGrab>,
+    /// The pause whose mark the pointer is on (its tip shows).
+    #[rust]
+    tip_pause: Option<usize>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PadGrab {
+    Head,
+    Floor,
+}
+
+/// The pad's well inside its rect: the point travels within it.
+const PAD_INSET: f64 = 6.0;
+/// How near a pause's mark the pointer raises its tip (points).
+const PAUSE_REACH: f64 = 4.0;
+
+/// What the pad shows: the top layer (its index of `max`), the point across its moves (none for a
+/// resin stack, whose layer cures at once), the floor and the pauses (the layer each comes before,
+/// its words). A slice's layers or a resin printer's. O(layers + pauses).
+struct PadState {
+    max: u32,
+    top: u32,
+    across: Option<f32>,
+    lo: u32,
+    pauses: Vec<(u32, String)>,
+}
+
+fn pad_state(state: &AppState) -> Option<PadState> {
+    let p = &state.print;
+    if let Some(r) = p.resin_shown() {
+        let max = r.count.saturating_sub(1);
+        return Some(PadState { max, top: p.play.layer_hi.min(max), across: None, lo: p.play.layer_lo.min(max), pauses: Vec::new() });
+    }
+    let pv = p.showing()?;
+    let top = shown_top_layer(p, pv);
+    let (a, b) = layer_span(pv, top);
+    let across = ((p.play.time - a) / (b - a).max(1e-9)) as f32;
+    let pauses = pv.pauses.iter().map(|q| (q.layer, q.step())).collect();
+    Some(PadState { max: pv.max_layer(), top, across: Some(across.clamp(0.0, 1.0)), lo: p.play.layer_lo, pauses })
+}
+
+impl FabSlicePad {
+    /// The pad's well (where the point travels) and the rail beside it, in window points.
+    fn wells(&self, cx: &Cx) -> (Rect, Rect) {
+        let r = self.draw_pad.area().rect(cx);
+        let rail = self.draw_pad.rail as f64;
+        let well = Rect { pos: r.pos + dvec2(PAD_INSET, PAD_INSET), size: dvec2((r.size.x - rail - PAD_INSET * 2.0).max(1.0), (r.size.y - PAD_INSET * 2.0).max(1.0)) };
+        let rail = Rect { pos: dvec2(r.pos.x + r.size.x - rail, r.pos.y), size: dvec2(rail, r.size.y) };
+        (well, rail)
+    }
+
+    /// The layer at `abs`'s height and the share across the well. O(1).
+    fn at(&self, cx: &Cx, abs: DVec2, max: u32) -> (u32, f64) {
+        let (well, _) = self.wells(cx);
+        let fx = ((abs.x - well.pos.x) / well.size.x).clamp(0.0, 1.0);
+        let fy = 1.0 - ((abs.y - well.pos.y) / well.size.y).clamp(0.0, 1.0);
+        ((fy * max as f64).round() as u32, fx)
+    }
+
+    /// A press or a drag at `abs` with `grab`: the floor to its layer, or that layer on top and
+    /// (a slice's) the playhead across its moves.
+    fn pick(&self, cx: &mut Cx, abs: DVec2, state: &AppState, grab: PadGrab) {
+        let Some(ps) = pad_state(state).filter(|_| !state.print.making_preview()) else { return };
+        let (layer, fx) = self.at(cx, abs, ps.max);
+        match grab {
+            PadGrab::Floor => cx.action(PrintAction::SetBottomLayer(layer.min(ps.top))),
+            PadGrab::Head => {
+                let layer = layer.max(ps.lo);
+                cx.action(PrintAction::SetTopLayer(layer));
+                if let (Some(_), Some(pv)) = (ps.across, state.print.showing()) {
+                    let (a, b) = layer_span(pv, layer);
+                    cx.action(PrintAction::Scrub(a + (b - a) * fx));
+                }
+            }
+        }
+    }
+
+    /// The fraction of the way up the well a layer sits at.
+    fn up(layer: f32, max: u32) -> f32 {
+        (layer / max.max(1) as f32).clamp(0.0, 1.0)
+    }
+}
+
+/// The pad's parts to a reader: the layer on top and the floor (its handle on the rail), each a
+/// slider of its own; the pad itself is the moves across the layer.
+const PART_TOP: u64 = 1;
+const PART_FLOOR: u64 = 2;
+
+impl Widget for FabSlicePad {
+    fn semantics(&self, _cx: &Cx, node: &mut a11y_tree::Node) {
+        node.role = a11y_tree::Role::Slider;
+        makepad_platform::a11y::set_string(&mut node.name, "Moves in the layer");
+        node.range = Some(a11y_tree::RangeValue { min: 0.0, max: 1.0, now: self.draw_pad.px as f64, step: 0.0 });
+        node.actions.insert(a11y_tree::Actions::SET_VALUE);
+    }
+
+    fn semantics_parts(&self, _cx: &Cx, out: &mut Vec<(u64, Option<u64>, a11y_tree::Node)>) {
+        for (key, name, now) in [(PART_TOP, "Top layer", self.draw_pad.py), (PART_FLOOR, "Bottom layer", self.draw_pad.lo)] {
+            let mut node = a11y_tree::Node {
+                role: a11y_tree::Role::Slider,
+                actions: a11y_tree::Actions::SET_VALUE,
+                range: Some(a11y_tree::RangeValue { min: 0.0, max: 1.0, now: now as f64, step: 0.0 }),
+                ..Default::default()
+            };
+            makepad_platform::a11y::set_string(&mut node.name, name);
+            out.push((key, None, node));
+        }
+    }
+
+    fn semantics_part_area(&self, _key: u64) -> Area {
+        self.draw_pad.area()
+    }
+
+    fn handle_action(&mut self, cx: &mut Cx, request: &a11y_tree::ActionRequest, scope: &mut Scope) -> a11y_tree::ActionResult {
+        use a11y_tree::{ActionArg, ActionResult, Actions};
+        if request.action != Actions::SET_VALUE { return ActionResult::Unhandled; }
+        let value = match &request.arg {
+            ActionArg::Number(value) => Some(*value),
+            ActionArg::Text(value) => value.parse::<f64>().ok(),
+            _ => None,
+        };
+        let Some(value) = value.filter(|v| v.is_finite()).map(|v| v.clamp(0.0, 1.0)) else { return ActionResult::Unsupported };
+        let Some(state) = scope.data.get::<AppState>() else { return ActionResult::Disabled };
+        let Some(ps) = pad_state(state) else { return ActionResult::Disabled };
+        let layer = (value * ps.max as f64).round() as u32;
+        match cx.a11y.action_part_key(request.node) {
+            Some(PART_TOP) => cx.action(PrintAction::SetTopLayer(layer)),
+            Some(PART_FLOOR) => cx.action(PrintAction::SetBottomLayer(layer.min(ps.top))),
+            Some(_) => return ActionResult::Unhandled,
+            None => {
+                let Some(pv) = state.print.showing().filter(|_| !state.print.making_preview()) else { return ActionResult::Disabled };
+                let (a, b) = layer_span(pv, shown_top_layer(&state.print, pv));
+                cx.action(PrintAction::Scrub(a + (b - a) * value));
+            }
+        }
+        ActionResult::Handled
+    }
+
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        let Some(state) = scope.data.get::<AppState>() else { return };
+        let on_rail = |cx: &Cx, abs: DVec2| self.wells(cx).1.contains(abs);
+        match event.hits(cx, self.draw_pad.area()) {
+            Hit::FingerHoverIn(fe) | Hit::FingerHoverOver(fe) => {
+                let rail = on_rail(cx, fe.abs);
+                cx.set_cursor(if rail { MouseCursor::NsResize } else { MouseCursor::Crosshair });
+                let hot = if rail { 1.0 } else { 0.0 };
+                if self.draw_pad.hover != 1.0 || self.draw_pad.floor_hot != hot {
+                    self.draw_pad.hover = 1.0;
+                    self.draw_pad.floor_hot = hot;
+                    self.draw_pad.redraw(cx);
+                }
+                // a pause's mark under the pointer: what goes in there, in its tip
+                let (well, _) = self.wells(cx);
+                let near = pad_state(state).and_then(|ps| ps.pauses.iter().position(|(layer, _)| {
+                    let up = Self::up(*layer as f32 - 0.5, ps.max) as f64;
+                    let y = well.pos.y + well.size.y * (1.0 - up);
+                    (fe.abs.y - y).abs() <= PAUSE_REACH && fe.abs.x <= well.pos.x + well.size.x
+                }).map(|i| (i, ps)));
+                let now = near.as_ref().map(|(i, _)| *i);
+                if now != self.tip_pause {
+                    self.tip_pause = now;
+                    match near {
+                        Some((i, ps)) => {
+                            let up = Self::up(ps.pauses[i].0 as f32 - 0.5, ps.max) as f64;
+                            let y = well.pos.y + well.size.y * (1.0 - up);
+                            let mut request = TipRequest::plain(ps.pauses[i].1.clone(), Rect { pos: dvec2(well.pos.x, y - 2.0), size: dvec2(well.size.x, 4.0) });
+                            request.place = TipPlace::Right;
+                            request.wrap_width = 260.0;
+                            cx.widget_action(self.uid, TipAction::HoverInWith(request));
+                        }
+                        None => cx.widget_action(self.uid, TipAction::HoverOut),
+                    }
+                }
+            }
+            Hit::FingerHoverOut(_) => {
+                self.draw_pad.hover = 0.0;
+                self.draw_pad.floor_hot = 0.0;
+                self.draw_pad.redraw(cx);
+                if self.tip_pause.take().is_some() {
+                    cx.widget_action(self.uid, TipAction::HoverOut);
+                }
+            }
+            Hit::FingerDown(fe) if fe.device.is_primary_hit() => {
+                let grab = if on_rail(cx, fe.abs) { PadGrab::Floor } else { PadGrab::Head };
+                self.grab = Some(grab);
+                self.draw_pad.down = if grab == PadGrab::Head { 1.0 } else { 0.0 };
+                if self.tip_pause.take().is_some() {
+                    cx.widget_action(self.uid, TipAction::HoverOut);
+                }
+                self.pick(cx, fe.abs, state, grab);
+                self.draw_pad.redraw(cx);
+            }
+            Hit::FingerMove(fe) => {
+                if let Some(grab) = self.grab {
+                    self.pick(cx, fe.abs, state, grab);
+                }
+            }
+            Hit::FingerUp(_) => {
+                self.grab = None;
+                self.draw_pad.down = 0.0;
+                self.draw_pad.redraw(cx);
+            }
+            _ => {}
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let ps = scope.data.get::<AppState>().and_then(pad_state);
+        let (x, y, lo, resin) = ps.as_ref().map_or((0.0, 0.0, 0.0, 0.0), |ps| {
+            (ps.across.unwrap_or(0.5), Self::up(ps.top as f32, ps.max), Self::up(ps.lo as f32, ps.max), if ps.across.is_none() { 1.0 } else { 0.0 })
+        });
+        self.draw_pad.px = x;
+        self.draw_pad.py = y;
+        self.draw_pad.lo = lo;
+        self.draw_pad.resin = resin;
+        let rect = cx.walk_turtle(walk);
+        self.draw_pad.draw_abs(cx, rect);
+        // the pauses: an amber line across the well at the layer each comes before
+        if let Some(ps) = ps.filter(|ps| !ps.pauses.is_empty()) {
+            let rail = self.draw_pad.rail as f64;
+            let well = Rect { pos: rect.pos + dvec2(PAD_INSET, PAD_INSET), size: dvec2((rect.size.x - rail - PAD_INSET * 2.0).max(1.0), (rect.size.y - PAD_INSET * 2.0).max(1.0)) };
+            self.draw_mark.fill = vec4(0.98, 0.70, 0.18, 0.9);
+            self.draw_mark.ring = vec4(0.0, 0.0, 0.0, 0.0);
+            self.draw_mark.spool = 0.0;
+            for (layer, _) in &ps.pauses {
+                let up = Self::up(*layer as f32 - 0.5, ps.max) as f64;
+                let y = well.pos.y + well.size.y * (1.0 - up);
+                self.draw_mark.draw_abs(cx, Rect { pos: dvec2(well.pos.x, y - 1.0), size: dvec2(well.size.x, 2.0) });
+            }
+        }
         DrawStep::done()
     }
 }
@@ -601,6 +803,11 @@ pub struct FabSliceLegend {
     color_error: Vec4f,
     #[rust]
     hint: PropHint,
+    /// Which of it this one draws: 0 all of it; 1 the colours' key and the print time (the
+    /// Legend's first nested section), 2 the materials and the filament (its second). The parts
+    /// leave out the key's heading word, their section's title says it.
+    #[live]
+    part: u32,
     #[rust]
     area: Area,
     /// Material row hit rectangles and their full design-to-spool explanations.
@@ -689,7 +896,40 @@ fn metres(mm: f64) -> String {
     }
 }
 
-fn legend_rows(s: &AppState) -> Vec<Row> {
+/// The legend's rows, or one part of them (see [`FabSliceLegend::part`]).
+fn legend_rows(s: &AppState, part: u32) -> Vec<Row> {
+    let mut out = all_legend_rows(s);
+    if part == 0 {
+        // whole, the materials' heading only over their table
+        out.retain(|r| !matches!(r, Row::Head(name, cols) if name == "MATERIAL" && cols.is_empty()));
+        return out;
+    }
+    let split = out.iter().position(|r| matches!(r, Row::Head(_, _)) && material_head(r)).unwrap_or(out.len());
+    let mut rows: Vec<Row> = if part == 1 { out.drain(..split).collect() } else { out.drain(split..).collect() };
+    // the heading word is the section's title: a heading keeps its columns' names, or goes
+    rows.retain(|r| !matches!(r, Row::Head(_, cols) if cols.is_empty()));
+    for r in rows.iter_mut() {
+        if let Row::Head(name, _) = r {
+            name.clear();
+        }
+    }
+    while matches!(rows.first(), Some(Row::Gap)) {
+        rows.remove(0);
+    }
+    rows
+}
+
+/// Where the materials begin: their table's heading, or the totals' first material line.
+fn material_head(r: &Row) -> bool {
+    matches!(r, Row::Head(name, _) if name == "MATERIAL")
+}
+
+/// The Legend's Material section has rows: a preview with its materials (not the overhang key).
+pub fn legend_has_materials(s: &AppState) -> bool {
+    !legend_rows(s, 2).is_empty()
+}
+
+fn all_legend_rows(s: &AppState) -> Vec<Row> {
     let p = &s.print;
     let mut out = Vec::new();
     if p.overhangs && !p.play.active {
@@ -773,9 +1013,8 @@ fn legend_rows(s: &AppState) -> Vec<Row> {
     let plate = pv.printability.plate.as_ref();
     let cost_of = |slot: usize| plate.and_then(|p| p.filaments.iter().find(|f| f.filament as usize == slot + 1)).map(|f| f.cost).filter(|c| *c > 0.0);
     // Each material's print, then what the changes purge of them all, on its own row.
-    if !pv.filament_use.is_empty() {
-        out.push(Row::Head("MATERIAL".into(), "PRINTS    TIME      COST".into()));
-    }
+    // (always a heading: it is where the Legend's Material section begins)
+    out.push(Row::Head("MATERIAL".into(), if pv.filament_use.is_empty() { String::new() } else { "PRINTS    TIME      COST".into() }));
     let (mut purge_grams, mut purge_cost) = (0.0, None::<f64>);
     for u in &pv.filament_use {
         let color = palette.get(u.slot).copied();
@@ -839,7 +1078,7 @@ impl Widget for FabSliceLegend {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        let rows = scope.data.get::<AppState>().map(legend_rows).unwrap_or_default();
+        let rows = scope.data.get::<AppState>().map(|s| legend_rows(s, self.part)).unwrap_or_default();
         self.text.clear();
         self.hits.clear();
         for r in &rows {
@@ -969,6 +1208,10 @@ impl Widget for FabSliceLegend {
 pub struct FabIssueSummary {
     #[uid]
     uid: WidgetUid,
+    /// In a section titled for it: no PRINTABILITY heading row, only a "Checking n/m" line while
+    /// the checks run.
+    #[live]
+    headless: bool,
     #[walk]
     walk: Walk,
     #[redraw]
@@ -1019,6 +1262,14 @@ struct IssueKind {
 
 /// The report's kinds of issue as the list shows them, each with its issues in the order its
 /// row steps through them: the worst severity first, then as the report lists them.
+/// Whether the issue summary shows anything: something sliced, or something found (the Slice
+/// editor hides its Printability section otherwise).
+pub(crate) fn issues_shown(p: &crate::print::PrintState) -> bool {
+    p.showing().is_some()
+        || !issue_kinds(&p.report()).is_empty()
+        || p.support_pieces.iter().flatten().any(|piece| piece.light == crate::api::MechLight::Red)
+}
+
 fn issue_kinds(report: &fab_printability::Report) -> Vec<IssueKind> {
     let mut out: Vec<(&'static str, IssueKind)> = Vec::new();
     for (i, issue) in report.issues.iter().enumerate() {
@@ -1196,7 +1447,8 @@ impl Widget for FabIssueSummary {
         }
         // Nothing sliced and nothing found: the section has nothing to say.
         let shown = !kinds.is_empty() || p.showing().is_some();
-        let rows = if shown { 1 + kinds.len().max(1) } else { 0 };
+        let head_row = !self.headless || checking.is_some();
+        let rows = if shown { head_row as usize + kinds.len().max(1) } else { 0 };
         let rect = cx.walk_turtle(Walk { height: Size::Fixed(rows as f64 * ISSUE_ROW_H), ..walk });
         self.lines.clear();
         self.text.clear();
@@ -1208,13 +1460,16 @@ impl Widget for FabIssueSummary {
         self.draw_hit.ring = vec4(0.0, 0.0, 0.0, 0.0);
         self.draw_hit.draw_abs(cx, rect);
         self.area = self.draw_hit.area();
-        let mut head = "PRINTABILITY".to_string();
-        if let Some((done, total)) = checking {
-            head.push_str(&format!(" · checking {done}/{total}"));
+        if head_row {
+            let head = match (self.headless, checking) {
+                (true, Some((done, total))) => format!("Checking {done}/{total}"),
+                (_, Some((done, total))) => format!("PRINTABILITY · checking {done}/{total}"),
+                (_, None) => "PRINTABILITY".to_string(),
+            };
+            self.draw_head.draw_abs(cx, dvec2(rect.pos.x, rect.pos.y + 3.0), &head);
         }
-        self.draw_head.draw_abs(cx, dvec2(rect.pos.x, rect.pos.y + 3.0), &head);
         let right = rect.pos.x + rect.size.x;
-        let mut y = rect.pos.y + ISSUE_ROW_H;
+        let mut y = rect.pos.y + if head_row { ISSUE_ROW_H } else { 0.0 };
         if kinds.is_empty() {
             self.draw_dim.draw_abs(cx, dvec2(rect.pos.x + 16.0, y + 3.0), "No issues");
             self.text.push_str("No issues");

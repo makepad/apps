@@ -8357,6 +8357,7 @@ mod tests {
                 lightmap_uvs: None,
                 detail_png: None,
                 detail_scale: [1.0, 1.0],
+                material_bytes: None,
             }
         }
         let glb = makepad_gltf::write_glb_mesh_textured_parts(

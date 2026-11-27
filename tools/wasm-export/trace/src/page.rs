@@ -258,7 +258,7 @@ from_wasm_names!(
     FromWasmStorageStat, FromWasmStorageEstimate, FromWasmOpenUrl, FromWasmBrowserUpdateUrl, FromWasmBrowserHistoryGo,
     FromWasmShowTextIME, FromWasmHideTextIME, FromWasmSetVirtualFileLimits, FromWasmSelectFileDialog, FromWasmHTTPRequest,
     FromWasmCancelHTTPRequest, FromWasmCheckPermission, FromWasmRequestPermission, FromWasmSpreadFirstDraws,
-    FromWasmCompileWebGLShader, FromWasmAllocArrayBuffer, FromWasmRetainedArrayBuffer, FromWasmRetainedArrayUpdate,
+    FromWasmCompileWebGLShader, FromWasmAllocArrayBuffer, FromWasmCreateInstanceSlab, FromWasmWriteInstanceRegion,
     FromWasmAllocIndexBuffer, FromWasmAllocVao, FromWasmFreeWebGLResources, FromWasmPollGpuCompletion,
     FromWasmAllocTextureImage2D_BGRAu8_32, FromWasmAllocTextureImage2D_Ru8, FromWasmAllocTextureImage2D_RGBAf32,
     FromWasmAllocTextureCube_BGRAu8_32, FromWasmBeginRenderTexture, FromWasmRequestRenderTextureCapture,
@@ -547,8 +547,8 @@ impl Page {
                 if self.gl.parallel_compile { self.request_frame(); }
             }
             "FromWasmAllocArrayBuffer" => self.gl.array_buffer(read!(FromWasmAllocArrayBuffer)),
-            "FromWasmRetainedArrayBuffer" => self.gl.retained_buffer(read!(FromWasmRetainedArrayBuffer)),
-            "FromWasmRetainedArrayUpdate" => self.gl.retained_update(read!(FromWasmRetainedArrayUpdate)),
+            "FromWasmCreateInstanceSlab" => self.gl.create_slab(read!(FromWasmCreateInstanceSlab)),
+            "FromWasmWriteInstanceRegion" => self.gl.write_region(read!(FromWasmWriteInstanceRegion)),
             "FromWasmAllocIndexBuffer" => self.gl.index_buffer(read!(FromWasmAllocIndexBuffer)),
             "FromWasmAllocVao" => self.gl.vao(read!(FromWasmAllocVao)),
             "FromWasmFreeWebGLResources" => self.gl.free(read!(FromWasmFreeWebGLResources)),

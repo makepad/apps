@@ -71,8 +71,10 @@ script_mod! {
     mod.widgets.FabOverridesPanel = set_type_default() do mod.widgets.FabOverridesPanelBase{
         width: Fill height: Fill flow: Down
         show_bg: true draw_bg +: { color: fab.color_editor }
+        // the toolbar: the area's editor selector (and this editor's tools, when it has any)
+        editor_bar := mod.widgets.FabEditorBar{}
         body := mod.widgets.FabScroll{
-            padding: Inset{left: theme.prop_pad right: theme.prop_pad top: 6 bottom: 6}
+            padding: Inset{left: theme.prop_pad right: theme.prop_pad top: #(crate::ui::widgets::PANEL_TOP) bottom: 6}
             list := mod.widgets.FabOverrideList{}
             add_row := View{
                 width: Fill height: Fit flow: Right

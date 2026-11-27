@@ -12,6 +12,7 @@ mod foreign;
 #[path = "../../motion/src/forms.rs"]
 pub mod forms;
 pub mod frame;
+pub mod frame_tool;
 pub mod glb;
 pub mod kits;
 pub mod kernels;

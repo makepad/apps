@@ -155,7 +155,7 @@ impl layers::Bones {
                     if size.is_none() && rigid.is_none() { c.err(&child_at, "size", "a skinned Image needs size: vec2(width, height) in document units".into(), None); }
                     if mesh.is_none() { *mesh = Some(Arc::new(MeshGrid::new(8, 8))); }
                 }
-                if rigid.is_none() && !matches!(layer.kind, LayerKind::Path { .. } | LayerKind::Rect { .. } | LayerKind::Ellipse { .. } | LayerKind::Image { .. }) {
+                if rigid.is_none() && !matches!(layer.kind, LayerKind::Path(_) | LayerKind::Rect(_) | LayerKind::Ellipse(_) | LayerKind::Image { .. }) {
                     c.err(&child_at, "rigid", "Bones skins Image, Path, Rect and Ellipse; other children need rigid: \"bone\"".into(), None);
                 }
                 skins.push(Skin::bind(&layer, &rest, rigid));

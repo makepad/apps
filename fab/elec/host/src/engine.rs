@@ -1,5 +1,9 @@
 //! The strand's state and its apply, held-results, and completed-fill passes.
 
+#[path = "proposal.rs"]
+mod proposal;
+use proposal::{Candidate, Held, ProposalJob};
+use crate::{ProposalAuthor, ProposalId, ProposalState};
 use crate::docs::Docs;
 use crate::inbox::PlannerEdit;
 use crate::eval::place_ops;
@@ -65,6 +69,9 @@ type GestureReply = Box<dyn FnOnce(Result<u64, String>) + Send + Sync>;
 pub trait JournalSink: Send + Sync {
     /// Bind a verified person invocation and supply its completion. Effect-only sinks can omit it.
     fn gesture(&self, _ticket: Ticket, _name: &str, _args: &[(String, String)]) -> Option<GestureReply> { None }
+    /// Bind a person's decision on held work. The journal records the call but never replays it.
+    /// Copy as script writes its effects as patches.
+    fn decision(&self, _ticket: Ticket, _name: &str, _args: &[(String, String)]) -> Option<GestureReply> { None }
     fn receive(&self, event: JournalEvent<'_>);
 }
 
@@ -90,6 +97,8 @@ pub struct Engine {
     profile_inputs: Vec<(DocId, u64)>,
     profile_view: Weak<fab_elec_view::DocsView>,
     factory_checks: std::cell::RefCell<BTreeMap<BoardId, FactoryChecks>>,
+    proposals: Vec<Held>,
+    proposal_job: Option<ProposalJob>,
     preview: Option<Live>,
     /// One circuit/bench preview runs independently of committed evaluation.
     preview_job: Option<PreviewJob>,
@@ -187,6 +196,12 @@ struct PreviewJob {
     sources: Sources,
     libs: Arc<Libs>,
     asked: Instant,
+}
+
+struct ResolvedProfiles {
+    factories: Arc<Factories>,
+    profiles: Arc<Vec<ProfileDef>>,
+    diags: Arc<Vec<fab_elec_core::Diag>>,
 }
 
 struct FactoryChecks {
@@ -514,6 +529,21 @@ pub struct Written {
     pub assets: Arc<BTreeMap<String, Option<Arc<[u8]>>>>,
 }
 
+fn still_sharp(design: &Design, note: &Violation) -> bool {
+    let ([Sel::Item(unit, id)], Some(at)) = (note.items.as_slice(), note.at) else { return false };
+    let Some(board) = design.unit(*unit).and_then(|u| u.board.as_ref()) else { return false };
+    let Some((ItemKind::Track, i)) = board.index.get(*id) else { return false };
+    let Some(track) = board.tracks.get(i).filter(|t| t.id == *id) else { return false };
+    track.path.segs.windows(2).enumerate().any(|(i, legs)| {
+        let [Seg::Line(corner), Seg::Line(end)] = legs else { return false };
+        if *corner != at { return false; }
+        let start = if i == 0 { track.path.start } else { track.path.segs[i - 1].end() };
+        let (ax, ay) = (at.x as f64 - start.x as f64, at.y as f64 - start.y as f64);
+        let (bx, by) = (end.x as f64 - at.x as f64, end.y as f64 - at.y as f64);
+        ax * bx + ay * by < 0.0
+    })
+}
+
 /// One warning per track in the sample's router notes, located at its first reported corner.
 fn sharp_notes(sample: &Sample) -> Option<(BoardId, Vec<Violation>)> {
     let mut tracks = BTreeMap::new();
@@ -674,6 +704,7 @@ impl Engine {
             journal: None, design: Arc::new(design), results, routed: BTreeMap::new(), base_factories: factories.clone(), factories,
             profiles: Arc::default(), profile_diags: Arc::default(), profile_inputs: Vec::new(), profile_view: Weak::new(), factory_checks: Default::default(), preview: None, log: OpLog::default(),
             waiting_for_fills: VecDeque::new(), fill_wait_notice: None, jobs: 0, waiting_route: None, brings: HashMap::new(),
+            proposals: Vec::new(), proposal_job: None,
             preview_job: None, preview_next: None, preview_tickets: BTreeMap::new(), gesture_replies: HashMap::new(), gesture_landings: HashMap::new(), answer_notes: HashMap::new(), refused_preview: None,
             last_refusal: None, last_commit: None, refusals: 0,
             preview_seq: Arc::new(AtomicU64::new(0)), resolvers: Vec::new(),
@@ -733,6 +764,15 @@ impl Engine {
         if !base_changed && inputs.clone().eq(self.profile_inputs.iter().copied()) { return false; }
         self.profile_inputs = inputs.collect();
 
+        let resolved = self.resolve_profiles(documents.map(|t| (t.doc, &*t.text)), base_changed);
+        self.factory_deltas(&self.design, &resolved.factories, deltas);
+        self.factories = resolved.factories;
+        self.profiles = resolved.profiles;
+        self.profile_diags = resolved.diags;
+        true
+    }
+
+    fn resolve_profiles<'a>(&self, documents: impl Iterator<Item = (DocId, &'a str)>, base_changed: bool) -> ResolvedProfiles {
         let mut profiles = Vec::new();
         let mut factories = (*self.base_factories).clone();
         for def in profile_doc::builtins() {
@@ -749,13 +789,13 @@ impl Engine {
         }
         let mut names: HashSet<_> = profiles.iter().map(|p| p.name.to_ascii_lowercase()).collect();
         let mut diags = Vec::new();
-        for text in documents {
-            let (defs, errors) = profile_doc::read(text.doc, &text.text);
+        for (doc, text) in documents {
+            let (defs, errors) = profile_doc::read(doc, text);
             diags.extend(errors);
             for mut def in defs {
                 if !names.insert(def.name.to_ascii_lowercase()) {
                     diags.push(fab_elec_core::Diag::error(format!("factory profile {:?} is already defined", def.name),
-                        vec![Sel::Source { doc: text.doc, start: def.span.start, end: def.span.end }]));
+                        vec![Sel::Source { doc, start: def.span.start, end: def.span.end }]));
                     continue;
                 }
                 if let Some(old) = self.factories.get(&def.name).filter(|c| **c == def.caps) {
@@ -765,7 +805,14 @@ impl Engine {
                 profiles.push(def);
             }
         }
-        for unit in &self.design.units {
+        ResolvedProfiles {
+            factories: if base_changed || factories != *self.factories { Arc::new(factories) } else { self.factories.clone() },
+            profiles: Arc::new(profiles), diags: Arc::new(diags),
+        }
+    }
+
+    fn factory_deltas(&self, design: &Design, factories: &Factories, deltas: &mut BTreeMap<BoardId, BoardDelta>) {
+        for unit in &design.units {
             let (Some(name), Some(board)) = (&unit.factory, &unit.board) else { continue };
             if self.factories.get(name).map(Arc::as_ptr) != factories.get(name).map(Arc::as_ptr) {
                 engines::merge_delta(deltas.entry(unit.id).or_default(), &BoardDelta {
@@ -773,10 +820,6 @@ impl Engine {
                 });
             }
         }
-        if base_changed || factories != *self.factories { self.factories = Arc::new(factories); }
-        self.profiles = Arc::new(profiles);
-        self.profile_diags = Arc::new(diags);
-        true
     }
 
     /// Keep the plate's registered mesh keys for every later circuit adoption.
@@ -816,7 +859,7 @@ impl Engine {
             .with_resolver("elec.part.add", crate::sheet_actions::part_add)
             .with_resolver("elec.part.remove", crate::sheet_actions::part_remove)
             .with_resolver("elec.part.rename", crate::sheet_actions::part_rename)
-            .with_resolver("elec.part.field", crate::sheet_actions::part_field)
+            .register("elec.part.field", ActionResolver::Authored(crate::sheet_actions::part_field))
             .with_resolver("elec.net.connect", crate::sheet_actions::net_connect)
             .with_resolver("elec.net.disconnect", crate::sheet_actions::net_disconnect)
             .with_resolver("elec.net.rename", crate::sheet_actions::net_rename)
@@ -830,7 +873,7 @@ impl Engine {
 
     pub fn with_bom_tools(self) -> Engine {
         use crate::bom_actions::*;
-        self.with_resolver(FIELD_SET.name, field_set).with_resolver(DNP_SET.name, dnp_set)
+        self.register(FIELD_SET.name, ActionResolver::Authored(field_set)).with_resolver(DNP_SET.name, dnp_set)
             .with_resolver(ALT_USE.name, alt_use).register(ALT_ADD.name, ActionResolver::Authored(alt_add))
     }
 
@@ -955,11 +998,15 @@ impl Engine {
         let mut checks_merged = false;
         let mut evaluated = false;
         let mut preview_changed = false;
+        let mut proposals_changed = false;
         // Adoption precedes commands and fills, so held commands can run in this step.
         for result in results {
             match result {
                 TaskResult::Eval(done) => {
-                    if self.preview_job.as_ref().is_some_and(|job| job.id == done.id && done.preview == Some(job.sample.seq)) {
+                    if self.proposal_job.as_ref().is_some_and(|job| job.job == done.id) {
+                        self.finish_proposal(*done, &mut queue, &mut rejected, &mut outcomes);
+                        proposals_changed = true;
+                    } else if self.preview_job.as_ref().is_some_and(|job| job.id == done.id && done.preview == Some(job.sample.seq)) {
                         preview_changed |= self.finish_preview(*done, &mut evals, &mut rejected, &mut outcomes);
                     } else if self.eval.as_ref().is_some_and(|job| job.id == done.id) {
                         evaluated = true;
@@ -1005,6 +1052,7 @@ impl Engine {
         // Committed results already include all changes up to a preview adoption or fill-dependent action.
         let mut carried = false;
         let mut refreshed = false;
+        let mut committed_fills_changed = false;
         let mut merge_committed = |engine: &mut Self| {
             let mut applied = false;
             for (unit, zone, generation, rules, fill) in committed.drain(..) {
@@ -1016,6 +1064,7 @@ impl Engine {
                     applied = true;
                 }
             }
+            committed_fills_changed |= applied;
             applied
         };
         let mut profiles_changed = false;
@@ -1045,14 +1094,15 @@ impl Engine {
                 Cmd::Undo | Cmd::Redo | Cmd::DiscardJob { .. } => !self.held.is_empty() || self.eval_blocked(),
                 Cmd::Commit { ops, .. } => !self.held.is_empty() || (self.needs_verify(ops) && self.eval_blocked()),
                 Cmd::Text { .. } => !self.held.is_empty(),
-                Cmd::CheckedText { .. } => !self.held.is_empty() || self.eval_blocked(),
+                Cmd::Propose { .. } | Cmd::CheckProposal { .. } | Cmd::Decide { accept: true, .. }
+                | Cmd::CheckedText { .. } => !self.held.is_empty() || self.eval_blocked(),
                 Cmd::Docs { set, .. } => !self.held.is_empty() && set.iter().any(|change| !matches!(change, DocSet::Asset { .. })),
                 // A tool resolves on the design its predecessors leave: its plan names parts by
                 // the circuit it reads, so it waits behind them like an undo (a burst of circuit
                 // edits would otherwise stamp each on a circuit the one before replaces).
                 Cmd::Invoke { .. } => !self.held.is_empty() || self.eval_blocked(),
                 Cmd::Planner { edit: PlannerEdit::Direct { edit, .. }, .. } => !self.held.is_empty() || (self.needs_verify(&edit.ops) && self.eval_blocked()),
-                Cmd::Planner { .. } | Cmd::RouteBase { .. } | Cmd::CommitPreview { .. } | Cmd::CancelPreview { .. } | Cmd::RefusePreview { .. }
+                Cmd::Decide { accept: false, .. } | Cmd::Planner { .. } | Cmd::RouteBase { .. } | Cmd::CommitPreview { .. } | Cmd::CancelPreview { .. } | Cmd::RefusePreview { .. }
                 | Cmd::CaseOutcome { .. } | Cmd::SetFactories(_) | Cmd::CaseFindings { .. } | Cmd::CaseKeepouts { .. } | Cmd::LibraryModels(_) | Cmd::LibraryDrop(_) => false,
             };
             if waits {
@@ -1186,6 +1236,22 @@ impl Engine {
                             refusal_changed = true;
                         }
                     }
+                }
+                Cmd::Propose { slot, set, label, by, ticket } => {
+                    self.propose(slot, set, label, by, ticket, &mut rejected, &mut outcomes);
+                    proposals_changed = true;
+                }
+                Cmd::CheckProposal { id, ticket } => {
+                    self.check_proposal(id, ticket, &mut rejected, &mut outcomes);
+                    proposals_changed = true;
+                }
+                Cmd::Decide { id, shown, accept, ticket } => {
+                    if self.decide(id, shown, accept, ticket, &mut rejected, &mut outcomes) {
+                        changed = true;
+                        carried = true;
+                        deltas.clear();
+                    }
+                    proposals_changed = true;
                 }
                 Cmd::Invoke { tool, args, preview: want_preview, by, ticket } => {
                     let resolved = match resolver {
@@ -1727,24 +1793,10 @@ impl Engine {
 
         // Commit (including preview), undo and redo all prune against the committed design.
         if changed {
-            let still_sharp = |note: &Violation| {
-                let ([Sel::Item(unit, id)], Some(at)) = (note.items.as_slice(), note.at) else { return false };
-                let Some(board) = self.design.unit(*unit).and_then(|u| u.board.as_ref()) else { return false };
-                let Some((ItemKind::Track, i)) = board.index.get(*id) else { return false };
-                let Some(track) = board.tracks.get(i).filter(|t| t.id == *id) else { return false };
-                track.path.segs.windows(2).enumerate().any(|(i, legs)| {
-                    let [Seg::Line(corner), Seg::Line(end)] = legs else { return false };
-                    if *corner != at { return false; }
-                    let start = if i == 0 { track.path.start } else { track.path.segs[i - 1].end() };
-                    let (ax, ay) = (at.x as f64 - start.x as f64, at.y as f64 - start.y as f64);
-                    let (bx, by) = (end.x as f64 - at.x as f64, end.y as f64 - at.y as f64);
-                    ax * bx + ay * by < 0.0
-                })
-            };
             let mut dropped = HashSet::new();
             self.notes.retain(|_, notes| {
                 notes.retain(|note| {
-                    let keep = still_sharp(note);
+                    let keep = still_sharp(&self.design, note);
                     if !keep { dropped.insert(note.id); }
                     keep
                 });
@@ -1902,6 +1954,9 @@ impl Engine {
         }
 
         merged |= merge_committed(self);
+        if !self.proposals.is_empty() && (committed_fills_changed || checks_merged || case_changed) {
+            proposals_changed |= self.merged_proposal_checks(case_changed);
+        }
         if merged || checks_merged {
             publish(self.make_snapshot(StageFlags::NONE));
         }
@@ -1954,7 +2009,13 @@ impl Engine {
                 noted = !Arc::ptr_eq(&view, docs.view());
             }
         }
-        if noted || eval_before != self.eval_blocked() || preview_eval_before != self.preview_job.is_some()
+        if !self.proposals.is_empty() && (proposals_changed || evaluated || rebase || profiles_changed || self.docs.as_ref().map(Docs::revision) != revision) {
+            proposals_changed |= self.refresh_proposals(&mut rejected, &mut outcomes);
+            if self.held.is_empty() && !self.eval_blocked() {
+                self.schedule_proposal(&mut evals);
+            }
+        }
+        if proposals_changed || noted || eval_before != self.eval_blocked() || preview_eval_before != self.preview_job.is_some()
             || self.docs.as_ref().map(Docs::revision) != revision {
             publish(self.make_snapshot(StageFlags::NONE));
         }
@@ -2036,6 +2097,7 @@ impl Engine {
             if let Some(reply) = self.gesture_replies.remove(ticket) {
                 match outcome {
                     Outcome::Done { seq, .. } => reply(Ok(*seq)),
+                    Outcome::Proposed { .. } | Outcome::Declined { .. } => reply(Err("the proposal made no edit".into())),
                     Outcome::Refused(r) => reply(Err(r.text.clone())),
                     // A press commits its edit; a preview is not its answer, so it keeps waiting.
                     Outcome::Previewed { .. } => { self.gesture_replies.insert(*ticket, reply); }
@@ -2107,7 +2169,7 @@ impl Engine {
         let docs = self.docs.as_ref().expect("evaluation has documents");
         self.evals += 1;
         let mut job = EvalJob {
-            id: self.evals, preview: None, sources: docs.sources().clone(), libs: docs.libs().clone(),
+            plan: None, id: self.evals, preview: None, sources: docs.sources().clone(), libs: docs.libs().clone(),
             prev: Arc::new(docs.prev(&self.design)), benches: docs.bench_views().clone(),
             verify: verify.as_ref().filter(|verify| verify.text.is_none()).map(|verify| verify.ops.clone()),
             text: verify.as_ref().and_then(|verify| verify.text.as_ref().map(|(_, _, edits)| edits.clone())),
@@ -2154,7 +2216,7 @@ impl Engine {
         let docs = self.docs.as_ref().expect("a circuit preview has documents");
         self.evals += 1;
         let job = EvalJob {
-            id: self.evals, preview: Some(sample.seq), sources: docs.sources().clone(), libs: docs.libs().clone(),
+            plan: None, id: self.evals, preview: Some(sample.seq), sources: docs.sources().clone(), libs: docs.libs().clone(),
             prev: Arc::new(docs.prev(&self.design)), benches: docs.bench_views().clone(), verify: Some(sample.ops.clone()), text: None,
             place: sample.place.clone(),
         };
@@ -2195,7 +2257,40 @@ impl Engine {
         })
     }
 
-    /// Per result: O(documents) base check, changed-board pass A, and O(changed circuit rows) sync.
+    /// Prepare the shared design, results and undo carry for a gesture or document proposal.
+    fn verified_candidate(
+        &self, mut verified: fab_elec_lang::Verified, inverse: TextStep, sources_before: Sources,
+        libs: Arc<Libs>, benches: Arc<Vec<BenchView>>, same_boards: &[BoardId], placed: Vec<Sel>, proposal: bool,
+    ) -> (Candidate, Vec<(BoardId, BoardDelta)>) {
+        let docs = self.docs.as_ref().expect("verification has documents");
+        let (mut created, sites) = created_in(docs.map(), &verified.evaluated.map, &verified.edit.written, &self.design, &verified.evaluated.design);
+        created.extend(placed);
+        let keys = with_assets(&self.mesh_keys, &verified.edit.assets);
+        let (design, deltas, replaced) = swap_evaluated(
+            &self.design, std::mem::take(&mut verified.evaluated.design),
+            |id, name| docs.board_document(id).is_some() || has_board_doc(&verified.sources, name), same_boards, [&*keys, &self.library_keys],
+        );
+        // A proposal may itself edit the factory definitions used to check its boards.
+        let profile_change = proposal && verified.edit.edits.iter().map(|e| e.doc)
+            .chain(verified.edit.present.iter().map(|p| p.0))
+            .any(|id| verified.sources.all_docs()[id.ix()].kind == DocKind::Profile);
+        let profiles = profile_change.then(|| self.resolve_profiles(verified.sources.all_docs().iter()
+            .filter(|d| d.present && d.kind == DocKind::Profile).map(|d| (d.id, &*d.text)), false));
+        let factories = profiles.as_ref().map_or(&self.factories, |p| &p.factories);
+        let deltas = if Arc::ptr_eq(factories, &self.factories) { deltas } else {
+            let mut deltas = deltas.into_iter().collect();
+            self.factory_deltas(&design, factories, &mut deltas);
+            deltas.into_iter().collect()
+        };
+        let results = engines::update_held(&self.results, &design, &deltas, factories);
+        let sheets = self.preview_sheets(&design);
+        let carry = Carry {
+            sources_before, libs, factories: self.factories.clone(), sources: verified.sources,
+            edit: verified.edit.into(), inverse, evaluated: verified.evaluated, benches, replaced, sites,
+        };
+        (Candidate { carry, design, results, sheets, created, profiles }, deltas)
+    }
+
     fn finish_preview(&mut self, done: EvalDone, evals: &mut Vec<EvalJob>, rejected: &mut Vec<(String, String)>, outcomes: &mut Vec<(Ticket, Outcome)>) -> bool {
         let job = self.preview_job.take().expect("the result matches the preview job");
         let docs = self.docs.as_ref().expect("a circuit preview has documents");
@@ -2209,16 +2304,10 @@ impl Engine {
                 let site = docs.site_of(&diag);
                 self.refuse_preview(job.sample, Refused { text: diag.message, site }, rejected, outcomes);
             }
-            EvalOut::Verified(Ok((mut verified, inverse))) => {
-                let (mut created, sites) = created_in(docs.map(), &verified.evaluated.map, &verified.edit.written, &self.design, &verified.evaluated.design);
-                created.extend(done.placed);
-                let keys = with_assets(&self.mesh_keys, &verified.edit.assets);
-                let (design, deltas, replaced) = swap_evaluated(
-                    &self.design, std::mem::take(&mut verified.evaluated.design),
-                    |id, name| docs.board_document(id).is_some() || has_board_doc(&verified.sources, name), &done.same_boards, [&*keys, &self.library_keys],
+            EvalOut::Verified(Ok((verified, inverse))) => {
+                let (Candidate { design, results, sheets, created, carry, .. }, deltas) = self.verified_candidate(
+                    verified, inverse, job.sources, job.libs, done.benches, &done.same_boards, done.placed, false,
                 );
-                let results = engines::update_held(&self.results, &design, &deltas, &self.factories);
-                let sheets = self.preview_sheets(&design);
                 let seq = job.sample.seq;
                 if let Some((ticket, _)) = self.preview_tickets.remove(&job.sample.tag) {
                     outcomes.push((ticket, Outcome::Previewed { tag: job.sample.tag }));
@@ -2226,10 +2315,7 @@ impl Engine {
                 self.preview = Some(Live {
                     sample: job.sample, created, base: self.design.clone(), deltas, design, results,
                     from: BTreeMap::new(), merged: BTreeSet::new(), sheets,
-                    carry: Some(Carry {
-                        sources_before: job.sources, libs: job.libs, factories: self.factories.clone(), sources: verified.sources,
-                        edit: verified.edit.into(), inverse, evaluated: verified.evaluated, benches: done.benches, replaced, sites,
-                    }),
+                    carry: Some(carry),
                 });
                 self.last_refusal = None;
                 makepad_widgets_core::log!("electronics: circuit preview {seq} shown {:.1} ms after its sample", job.asked.elapsed().as_secs_f64() * 1000.0);
@@ -2791,22 +2877,23 @@ impl Engine {
 
     /// Board-wide factory checks share the snapshot merge with DRC. A fresh board or
     /// capability set costs one outline walk, the profile's offered sizes, and four minima.
-    fn factory_findings(&self) -> Vec<Violation> {
-        let design = self.preview.as_ref().map_or(&self.design, |p| &p.design);
+    fn factory_findings(&self, design: &Design, sources: Option<&Sources>, resolved: Option<&ResolvedProfiles>) -> Vec<Violation> {
+        let factories = resolved.map_or(&self.factories, |p| &p.factories);
+        let profiles = resolved.map_or(&self.profiles, |p| &p.profiles);
         let mut cache = self.factory_checks.borrow_mut();
         cache.retain(|id, _| design.unit(*id).is_some_and(|u| u.factory.is_some() && u.board.is_some()));
         let mut out = Vec::new();
         for unit in &design.units {
             let (Some(board), Some(name)) = (&unit.board, &unit.factory) else { continue };
-            let caps = self.factories.get(name);
+            let caps = factories.get(name);
             let doc = if caps.is_none() {
-                match self.preview.as_ref().and_then(|p| p.carry.as_ref()) {
-                    Some(carry) => carry.sources.find(&format!("{}.pcb.splash", unit.name)).and_then(|id| carry.sources.doc(id)),
+                match sources {
+                    Some(sources) => sources.find(&format!("{}.pcb.splash", unit.name)).and_then(|id| sources.doc(id)),
                     None => self.docs.as_ref().and_then(|docs| docs.board_document(unit.id)).filter(|d| d.present),
                 }
             } else { None };
             let current = cache.get(&unit.id).filter(|c| c.board.as_ptr() == Arc::as_ptr(board)
-                && c.profile == *name && c.factories.as_ptr() == Arc::as_ptr(&self.factories)
+                && c.profile == *name && c.factories.as_ptr() == Arc::as_ptr(factories)
                 && match (&c.source, doc) {
                     (Some((id, text)), Some(d)) => *id == d.id && std::ptr::eq(text.as_ptr(), Arc::as_ptr(&d.text)),
                     (None, None) => true, _ => false,
@@ -2817,7 +2904,7 @@ impl Engine {
                     findings.extend(fab_elec_cam::caps::raised_rules(board, caps, name));
                     findings
                 } else {
-                    let known = self.profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ");
+                    let known = profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ");
                     let site = doc.and_then(|d| fab_elec_lang::board_doc::factory_site(d.id, &d.text)).unwrap_or(Sel::Unit(unit.id));
                     vec![Violation::new(CheckKind::Custom("factory.unknown".into()), Severity::Error,
                         Some(unit.id), vec![site], &format!("factory:{name}:unknown"),
@@ -2825,13 +2912,65 @@ impl Engine {
                         .hint("choose a listed factory or correct the profile document")]
                 };
                 cache.insert(unit.id, FactoryChecks { board: Arc::downgrade(board), profile: name.clone(),
-                    factories: Arc::downgrade(&self.factories), source: doc.map(|d| (d.id, Arc::downgrade(&d.text))), findings });
+                    factories: Arc::downgrade(factories), source: doc.map(|d| (d.id, Arc::downgrade(&d.text))), findings });
                 &cache[&unit.id]
             };
             out.extend_from_slice(&held.findings);
         }
         out.sort_by_key(|v| v.id);
         out
+    }
+
+    fn shown_findings(&self, design: &Design, sources: Option<&Sources>, results: &DesignResults, live_notes: &[Violation], resolved: Option<&ResolvedProfiles>, proposal: bool) -> (Vec<Violation>, Vec<u64>) {
+        // A board that owes its whole-board checks shows none of its findings yet (`engines::violations`).
+        let mut awaiting: Vec<_> = results.boards.iter().filter(|b| !b.pending.whole).flat_map(|b| {
+            b.drc.iter().filter(move |v| engines::awaits_refill(b, v)).map(|v| v.id)
+        }).collect();
+        awaiting.sort_unstable();
+        awaiting.dedup();
+        let checks = engines::violations(results);
+        // Checks win ties. A live note for the same track shows its newest corner.
+        let factory = self.factory_findings(design, sources, resolved);
+        // A candidate uses the same case waivers and surviving corner notes as its commit.
+        let notes;
+        let (case_notes, corner_notes) = if proposal {
+            let mut cases = self.case.iter().filter_map(|(unit, (_, findings))| {
+                let board = design.unit(*unit)?.board.as_ref()?;
+                let waived: HashSet<_> = board.rules.waivers.iter().map(|w| w.violation).collect();
+                Some(findings.iter().filter(move |v| !waived.contains(&v.id)).cloned())
+            }).flatten().collect::<Vec<_>>();
+            cases.sort_by_key(|v| v.id);
+            cases.dedup_by_key(|v| v.id);
+            notes = self.notes_sorted.iter().filter(|v| still_sharp(design, v)).cloned().collect::<Vec<_>>();
+            (std::borrow::Cow::Owned(cases), notes.as_slice())
+        } else {
+            (std::borrow::Cow::Borrowed(self.case_sorted.as_slice()), self.notes_sorted.as_slice())
+        };
+        let mut extra = [factory.as_slice(), case_notes.as_ref(), live_notes, corner_notes];
+        let count: usize = extra.iter().map(|list| list.len()).sum();
+        let violations = if count == 0 {
+            checks
+        } else {
+            let mut out = Vec::with_capacity(checks.len() + count);
+            let mut checks = checks.into_iter().peekable();
+            while let Some(finding) = extra.iter().filter_map(|list| list.first()).min_by_key(|v| v.id) {
+                let id = finding.id;
+                while let Some(check) = checks.next_if(|check| check.id < id) {
+                    out.push(check);
+                }
+                if checks.peek().is_none_or(|check| check.id != id) {
+                    out.push(finding.clone());
+                }
+                for list in &mut extra {
+                    if list.first().is_some_and(|v| v.id == id) {
+                        *list = &list[1..];
+                    }
+                }
+            }
+            out.extend(checks);
+            out
+        };
+        (violations, awaiting)
     }
 
     /// Merge checks, case findings and session notes in linear time once the live notes are sorted.
@@ -2869,43 +3008,14 @@ impl Engine {
             }
         }
         let (of, results) = self.preview.as_ref().map_or((StateOf::Committed, &self.results), |p| (StateOf::Preview, &p.results));
-        // A board that owes its whole-board checks shows none of its findings yet (`engines::violations`).
-        let mut awaiting: Vec<_> = results.boards.iter().filter(|b| !b.pending.whole).flat_map(|b| {
-            b.drc.iter().filter(move |v| engines::awaits_refill(b, v)).map(|v| v.id)
-        }).collect();
-        let checking = results.boards.iter().filter(|b| b.pending.whole).map(|b| b.unit).collect();
-        awaiting.sort_unstable();
-        awaiting.dedup();
-        let checks = engines::violations(results);
+        let design = self.preview.as_ref().map_or(&self.design, |p| &p.design);
+        let sources = self.preview.as_ref().and_then(|p| p.carry.as_ref()).map(|c| &c.sources);
         let live = self.preview.as_ref().and_then(|p| sharp_notes(&p.sample));
-        // Checks win ties. A live note for the same track shows its newest corner.
-        let factory = self.factory_findings();
-        let mut extra = [factory.as_slice(), self.case_sorted.as_slice(), live.as_ref().map_or(&[][..], |(_, notes)| notes.as_slice()),
-            self.notes_sorted.as_slice()];
-        let count: usize = extra.iter().map(|list| list.len()).sum();
-        let violations = if count == 0 {
-            checks
-        } else {
-            let mut out = Vec::with_capacity(checks.len() + count);
-            let mut checks = checks.into_iter().peekable();
-            while let Some(finding) = extra.iter().filter_map(|list| list.first()).min_by_key(|v| v.id) {
-                let id = finding.id;
-                while let Some(check) = checks.next_if(|check| check.id < id) {
-                    out.push(check);
-                }
-                if checks.peek().is_none_or(|check| check.id != id) {
-                    out.push(finding.clone());
-                }
-                for list in &mut extra {
-                    if list.first().is_some_and(|v| v.id == id) {
-                        *list = &list[1..];
-                    }
-                }
-            }
-            out.extend(checks);
-            out
-        };
+        let (violations, awaiting) = self.shown_findings(design, sources, results, live.as_ref().map_or(&[], |(_, notes)| notes.as_slice()), None, false);
+        let checking = results.boards.iter().filter(|b| b.pending.whole).map(|b| b.unit).collect();
+        let docs = self.docs.as_ref().filter(|d| !d.is_empty());
         Arc::new(DesignSnapshot {
+            proposals: Arc::new(self.proposals.iter().map(|p| p.view.clone()).collect()),
             profiles: self.profiles.clone(), profile_diags: self.profile_diags.clone(),
             design: self.design.clone(),
             preview: self.preview.as_ref().map(|p| p.design.clone()),
@@ -2931,10 +3041,10 @@ impl Engine {
             last_refusal: self.last_refusal.clone(),
             export: vec![], proposal: self.preview.as_ref().and_then(|p| p.sample.proposal.clone()), head: self.head.clone(), stale,
             job: None,
-            source_map: self.docs.as_ref().map(|d| d.map().clone()),
-            benches: self.docs.as_ref().map_or_else(Default::default, |d| d.bench_views().clone()),
-            docs: self.docs.as_ref().map(|d| d.view().clone()),
-            catalog: self.docs.as_ref().map(|d| d.catalog().clone()),
+            source_map: docs.map(|d| d.map().clone()),
+            benches: docs.map_or_else(Default::default, |d| d.bench_views().clone()),
+            docs: docs.map(|d| d.view().clone()),
+            catalog: docs.map(|d| d.catalog().clone()),
         })
     }
 }

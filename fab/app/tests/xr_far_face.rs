@@ -9,6 +9,8 @@
 //! The test sets the variables itself and starts its own synthetic headset on the native GPU, its
 //! stream's AA and render scale pinned ([`pin_stream`]).
 
+#[path = "common/render_mode.rs"]
+mod render_mode;
 #[path = "common/wait.rs"]
 mod idle_wait;
 use idle_wait::wait_poll;
@@ -159,7 +161,7 @@ fn far_face(name: &str) -> Face {
         let head = head_of(&text(&call(&app, "script", &batch).expect("script")));
         let edits = Value::Str(r#"place("bracket", at: [175mm 160mm])"#.to_string()).to_json();
         call(&app, "place", &format!(r#"{{"request_id":"face-place","expected":{head:?},"edits":{edits}}}"#)).expect("place");
-        app.locator(Selector::id("rm_slice")).wait_visible().click();
+        render_mode::pick(&app, "Sliced");
         wait_poll(&app, || whole_slice(&app));
         // written on a worker, then said in the log
         let mut seq = 0;

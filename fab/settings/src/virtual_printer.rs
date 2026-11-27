@@ -2,7 +2,7 @@
 //! profile from that layout, or uses the catalogue machine that the printer stands in for.
 
 use crate::{family, machine::PLATES, profiles::RawPreset};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write as _};
@@ -28,7 +28,7 @@ pub struct Slot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Source {
     Generated,
-    Twin { preset: String, model: String },
+    Twin { preset: String, model: String, source: Option<String> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,7 +141,7 @@ impl VirtualPrinter {
         kind.check_heads(heads)?;
         let printer = Self {
             name, title: format!("{preset} (virtual)"), kind, heads, slots: stock, configured_for: None,
-            source: Source::Twin { preset: preset.into(), model: model.into() },
+            source: Source::Twin { preset: preset.into(), model: model.into(), source: None },
         };
         Ok(printer.with_slots(kind, heads, places))
     }
@@ -282,10 +282,12 @@ pub struct Saved {
     pub picked: Option<String>,
     /// Separate from the record so a missing twin still keeps its printer disconnected.
     pub disconnected: BTreeSet<String>,
+    /// Explicit machine choices, keyed by the configured printer id. Absence means automatic.
+    pub bindings: BTreeMap<String, String>,
 }
 
 impl Default for Saved {
-    fn default() -> Self { Self { printers: presets(), picked: None, disconnected: BTreeSet::new() } }
+    fn default() -> Self { Self { printers: presets(), picked: None, disconnected: BTreeSet::new(), bindings: BTreeMap::new() } }
 }
 
 fn valid_name(name: &str) -> bool {
@@ -320,11 +322,14 @@ impl Saved {
         let mut text = String::new();
         if let Some(pick) = &self.picked { writeln!(text, "picked\t{pick}").unwrap(); }
         for config in &self.disconnected { writeln!(text, "disconnected\t{config}").unwrap(); }
+        for (id, preset) in &self.bindings { writeln!(text, "binding\t{id}\t{preset}").unwrap(); }
         for printer in &self.printers {
             let kind = match printer.kind { Kind::Nozzles => "nozzles", Kind::Toolchanger => "toolchanger" };
             writeln!(text, "printer\t{}\t{}\t{kind}\t{}", printer.name, printer.title, printer.heads).unwrap();
-            if let Source::Twin { preset, model } = &printer.source {
-                writeln!(text, "twin\t{preset}\t{model}").unwrap();
+            if let Source::Twin { preset, model, source } = &printer.source {
+                write!(text, "twin\t{preset}\t{model}").unwrap();
+                if let Some(id) = source { write!(text, "\t{id}").unwrap(); }
+                text.push('\n');
             }
             if let Some(config) = &printer.configured_for { writeln!(text, "configured\t{config}").unwrap(); }
             for slot in &printer.slots {
@@ -337,7 +342,7 @@ impl Saved {
     }
 
     pub fn parse(text: &str) -> Result<Self, String> {
-        let mut saved = Self { printers: Vec::new(), picked: None, disconnected: BTreeSet::new() };
+        let mut saved = Self { printers: Vec::new(), picked: None, disconnected: BTreeSet::new(), bindings: BTreeMap::new() };
         let mut unit_heads = HashMap::new();
         let mut trays = std::collections::HashSet::new();
         let mut configs = HashSet::new();
@@ -366,6 +371,12 @@ impl Saved {
                         return Err(bad("invalid or repeated disconnected printer"));
                     }
                 }
+                ["binding", id, preset] => {
+                    if !id.strip_prefix("printer:").is_some_and(valid_config) || !valid_config(preset)
+                        || saved.bindings.insert((*id).into(), (*preset).into()).is_some() {
+                        return Err(bad("invalid or repeated machine binding"));
+                    }
+                }
                 ["configured", config] => {
                     let p = saved.printers.last_mut().ok_or_else(|| bad("configured before twin"))?;
                     if p.source == Source::Generated || p.configured_for.is_some() || !valid_config(config) || !configs.insert(*config) {
@@ -387,12 +398,18 @@ impl Saved {
                     unit_heads.clear();
                     trays.clear();
                 }
-                ["twin", preset, model] => {
+                ["twin", preset, model, origin @ ..] => {
                     let printer = saved.printers.last_mut().ok_or_else(|| bad("twin before printer"))?;
                     if preset.trim().is_empty() || model.trim().is_empty() || printer.source != Source::Generated {
                         return Err(bad("expected one machine preset and model for the twin"));
                     }
-                    printer.source = Source::Twin { preset: (*preset).into(), model: (*model).into() };
+                    let source = match origin {
+                        [] => None,
+                        [id] if id.strip_prefix("printer:").is_some_and(valid_config)
+                            || id.strip_prefix("virtual:").is_some_and(valid_name) => Some((*id).into()),
+                        _ => return Err(bad("invalid twin source")),
+                    };
+                    printer.source = Source::Twin { preset: (*preset).into(), model: (*model).into(), source };
                 }
                 ["slot", head, tray, path, material, colour] => {
                     let printer = saved.printers.last_mut().ok_or_else(|| bad("slot before printer"))?;
@@ -597,6 +614,7 @@ mod tests {
         let original = Saved::parse(legacy).unwrap();
         assert_eq!(original.printers[0].source, Source::Generated);
         assert_eq!(original.to_text(), legacy);
+        assert!(original.bindings.is_empty(), "old settings leave every binding automatic");
 
         let model = family::FAMILIES[1].models[0];
         let stock = vec![Slot { head: 0, tray: "A1".into(), path: SlotPath::Own, material: None, colour: None }];
@@ -625,6 +643,23 @@ mod tests {
         }
         assert!(Saved::parse("disconnected\tFixture\ndisconnected\tFixture\n").is_err());
         assert!(Saved::parse(&format!("{legacy}configured\tFixture\n")).is_err());
+        assert!(!saved.to_text().contains("binding\t"), "automatic choices write no binding record");
+        saved.bindings.insert("printer:P".into(), "Missing profile".into());
+        let old_twin = saved.printers.last().unwrap().clone();
+        assert!(matches!(old_twin.source, Source::Twin { source: None, .. }), "old twin records have no origin");
+        for name in ["P", "Q"] {
+            let mut twin = old_twin.clone();
+            twin.name = format!("twin-{}", name.to_lowercase());
+            twin.title = format!("{} ({name})", twin.title);
+            if let Source::Twin { source, .. } = &mut twin.source { *source = Some(format!("printer:{name}")); }
+            saved.printers.push(twin);
+        }
+        let read = Saved::parse(&saved.to_text()).unwrap();
+        assert_eq!(read.bindings.get("printer:P").map(String::as_str), Some("Missing profile"), "the exact explicit pick survives an absent preset");
+        assert!(!read.bindings.contains_key("printer:Q"), "another printer remains automatic");
+        let twins = &read.printers[read.printers.len() - 2..];
+        assert_ne!(twins[0].source, twins[1].source, "same-preset twins of P and Q have distinct origins");
+        assert_eq!(read, saved, "bindings and both twin origins round-trip");
         save_to(&path, &saved).unwrap();
         saved.picked = Some("virtual:twin-1".into());
         save_to(&path, &saved).unwrap();

@@ -1,0 +1,14 @@
+[package]
+name = "makepad-motion-plain"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Motion presentation data, reader and frame sampling"
+
+[dependencies]
+makepad-splash-syntax = { path = "../../libs/splash_syntax" }
+makepad-tween = { path = "../../../../libs/tween" }
+makepad-live-id = { path = "../../../../libs/live_id" }
+makepad-svg = { path = "../../../../libs/svg" }
+makepad-doc-font-names = { path = "../font_names" }

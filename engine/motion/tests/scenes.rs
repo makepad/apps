@@ -1,6 +1,7 @@
 //! Crowds, neon tubes, comic pages and photo freezes: they load, are pure
 //! functions of time (the same frame twice), and react as documented.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::templates::comic_boxes;
 use makepad_motion::*;
 
@@ -53,7 +54,7 @@ fn a_crowd_is_seeded_exact_and_reacts() {
     assert!((8..=40).contains(&signs), "about a tenth hold signs: {signs}");
     // Eyes by side: orange on the left, green on the right.
     let eye = |item: &Item| match &item.kind {
-        ItemKind::Ellipse { fill: Some(c), .. } => Some((item.world.apply([0.0, 0.0])[0], *c)),
+        ItemKind::Primitive(PrimitiveFrame::Ellipse { fill: Some(c), .. }) => Some((item.world.apply([0.0, 0.0])[0], *c)),
         _ => None,
     };
     let eyes: Vec<(f64, Color)> = calm.iter().filter(|i| i.path.ends_with(".eye")).filter_map(eye).collect();
@@ -62,7 +63,7 @@ fn a_crowd_is_seeded_exact_and_reacts() {
     // `variants` shares shapes; `start` pops the crowd up; @ring is 3D only.
     let few = load(&CROWD.replace("seed: 7", "seed: 7 variants: 4 start: 1.0"));
     let heads = |t: f64| items(&few, t).iter().filter(|i| i.path.ends_with(".head")).map(|i| match &i.kind {
-        ItemKind::Rect { size, .. } | ItemKind::Ellipse { size, .. } => (size[1] / size[0] * 1e6).round() as i64,
+        ItemKind::Primitive(PrimitiveFrame::Rect { size, .. }) | ItemKind::Primitive(PrimitiveFrame::Ellipse { size, .. }) => (size[1] / size[0] * 1e6).round() as i64,
         _ => 0,
     }).collect::<Vec<_>>();
     assert!(heads(0.5).is_empty(), "nobody before `start`");
@@ -71,7 +72,7 @@ fn a_crowd_is_seeded_exact_and_reacts() {
     assert!(MotionDoc::load(&CROWD.replace("seed: 7", "seed: 7 shape: @ring")).is_err());
     // Members differ: not every head is the same size.
     let sizes: std::collections::BTreeSet<i64> = calm.iter().filter(|i| i.path.ends_with(".head")).map(|i| match &i.kind {
-        ItemKind::Rect { size, .. } | ItemKind::Ellipse { size, .. } => (size[0] * 10.0) as i64,
+        ItemKind::Primitive(PrimitiveFrame::Rect { size, .. }) | ItemKind::Primitive(PrimitiveFrame::Ellipse { size, .. }) => (size[0] * 10.0) as i64,
         _ => 0,
     }).collect();
     assert!(sizes.len() > 50, "seeded variety: {} head sizes", sizes.len());
@@ -84,7 +85,7 @@ fn neon_letters_flicker_and_the_failing_one_fails() {
     let opacities = |t: f64| -> Vec<f64> {
         let mut out = vec![0.0; 4];
         for item in items(&doc, t) {
-            if let ItemKind::Text { units, .. } = &item.kind {
+            if let ItemKind::Primitive(PrimitiveFrame::Text { units, .. }) = &item.kind {
                 for (k, u) in units.iter().enumerate().take(4) {
                     out[k] = f64::max(out[k], u.opacity);
                 }
@@ -122,7 +123,7 @@ fn comic_pages_lay_out_and_load() {
     }
     let doc = load(r#"use mod.motion.*; Motion{size: vec2(1080, 1920) duration: 4.0 layers: [Comic{layout: @hero panels: [
         {time: 0.2 caption: "hero"} {time: 0.8 caption: "two" burst: "RING RING"} {time: 1.4 burst: "ERROR"}]}]}"#);
-    let at = |t: f64| items(&doc, t).iter().filter(|i| i.opacity > 0.0 && matches!(i.kind, ItemKind::Path { .. })).count();
+    let at = |t: f64| items(&doc, t).iter().filter(|i| i.opacity > 0.0 && matches!(i.kind, ItemKind::Primitive(PrimitiveFrame::Path { .. }))).count();
     assert_eq!(at(0.5), 0, "no burst before its time");
     assert_eq!(at(3.0), 2, "both bursts after");
     let err = MotionDoc::load(r#"use mod.motion.*; Motion{size: vec2(1080, 1920) duration: 4.0 layers: [Comic{panels: [{time: 0.2 colour: #ff0000}]}]}"#).unwrap_err();
@@ -139,7 +140,7 @@ fn a_freeze_holds_the_picture_under_it_at_its_time() {
     let sun_in_freeze = |t: f64| -> [f64; 2] {
         let frame = doc.eval(t);
         let ItemKind::Group { children, .. } = &frame.items[2].kind else { panic!() };
-        children.iter().find(|i| matches!(i.kind, ItemKind::Ellipse { .. })).map(|i| i.world.apply([0.0, 0.0])).unwrap()
+        children.iter().find(|i| matches!(i.kind, ItemKind::Primitive(PrimitiveFrame::Ellipse { .. }))).map(|i| i.world.apply([0.0, 0.0])).unwrap()
     };
     // The live sun moves; the frozen one stays where the sun was at 1 s,
     // at half size inside the box.
@@ -166,7 +167,7 @@ fn a_freeze_with_a_moving_time_shows_the_picture_at_each_frames_time() {
     let sun = |t: f64, root: usize| -> f64 {
         let frame = doc.eval(t);
         let item = match &frame.items[root].kind {
-            ItemKind::Group { children, .. } => children.iter().find(|i| matches!(i.kind, ItemKind::Ellipse { .. })).unwrap().clone(),
+            ItemKind::Group { children, .. } => children.iter().find(|i| matches!(i.kind, ItemKind::Primitive(PrimitiveFrame::Ellipse { .. }))).unwrap().clone(),
             _ => frame.items[root].clone(),
         };
         item.world.apply([0.0, 0.0])[0]

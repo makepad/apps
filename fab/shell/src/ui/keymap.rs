@@ -4,10 +4,14 @@
 //! It is drawn with our own rows rather than `Markdown` on purpose: the
 //! markdown path pulled the mono font in mid-frame and the shared glyph atlas
 //! came back with holes — whole words vanished from every panel in the app.
-//! A `PortalList` of two labels and a key cap has no such appetite.
+//! The rows sit in foldable sections, one per context, built before the modal
+//! draws (a list stepped from the modal's draw never got its turn: it showed
+//! empty). A rebindable chord is changed on its key cap; the rebindings are
+//! kept in the view prefs and applied at the app's door (`remap`).
 
 use crate::api::*;
 use makepad_widgets_core::*;
+use std::collections::HashMap;
 
 /// Where a binding is routed; context can further restrict the active tool or panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,6 +23,8 @@ pub enum KeyScope {
 
 pub struct KeymapEntry {
     pub id: ShortcutId,
+    /// The action's stable name (its `ShortcutId`), what a rebinding is saved under.
+    pub name: &'static str,
     pub chord: &'static str,
     pub action: &'static str,
     pub context: &'static str,
@@ -31,7 +37,7 @@ macro_rules! keymap {
         pub enum ShortcutId { $($id),* }
 
         pub const KEYMAP: &[KeymapEntry] = &[
-            $(KeymapEntry { id: ShortcutId::$id, chord: $chord, action: $action, context: $context, scope: KeyScope::$scope }),*
+            $(KeymapEntry { id: ShortcutId::$id, name: stringify!($id), chord: $chord, action: $action, context: $context, scope: KeyScope::$scope }),*
         ];
     };
 }
@@ -59,7 +65,8 @@ keymap! {
     FrameAll => ("Home", "Frame all", "Navigation", Viewport),
     FrameSelected => (".", "Frame selected", "Navigation", Viewport),
     OrbitSelection => ("O", "Orbit Around Selection", "Navigation", Viewport),
-    Select => ("Q", "Select", "Design / Monitor", Global),
+    ViewPie => ("Q", "View pie: the views around the pointer (release Q on one, or click it)", "Navigation", Viewport),
+    Select => ("W", "Select", "Design / Monitor", Global),
     Move => ("G", "Move on the plate", "Design / Monitor", Global),
     Rotate => ("R", "Turn about Z", "Design / Monitor (outside Sculpt)", Global),
     Scale => ("S", "Scale", "Design / Monitor", Global),
@@ -70,7 +77,7 @@ keymap! {
     Hide => ("H", "Hide selected", "Design / Monitor", Global),
     Isolate => ("Shift+H", "Isolate selected", "Design / Monitor", Global),
     Unhide => ("Alt+H", "Unhide all", "Design / Monitor", Global),
-    Solo => ("/", "Solo the selection", "Design / Monitor", Global),
+    Solo => ("/", "Solo the selection (the numpad's / too)", "Design / Monitor", Global),
     Xray => ("Alt+Z", "X-ray", "Design / Monitor", Global),
     Measure => ("M", "Measure (cycle distance, area, angle, edge, radius, faces, fit)", "Design / Monitor", Global),
     Section => ("C", "Clip: a cross-section through the parts", "Design / Monitor (outside Sculpt)", Global),
@@ -152,7 +159,6 @@ keymap! {
     Slice => ("Cmd/Ctrl+R", "Slice the plate", "App", Global),
     Chat => ("Cmd/Ctrl+K", "Ask the AI", "App", Global),
     Palette => ("F3", "Command palette", "App", Global),
-    Perf => ("Shift+F3", "Performance graph", "App", Global),
     Open => ("Cmd/Ctrl+O", "Open", "App", Global),
     Import => ("Cmd/Ctrl+I", "Import meshes", "App", Global),
     Plates => ("Cmd/Ctrl+Shift+M", "Browse plates", "App", Global),
@@ -169,21 +175,184 @@ pub fn entry(id: ShortcutId) -> &'static KeymapEntry {
     &KEYMAP[id as usize]
 }
 
+/// The chord `id` answers to now: the person's rebinding, else the table's.
+pub fn chord(id: ShortcutId) -> String {
+    overrides().get(&id).cloned().unwrap_or_else(|| entry(id).chord.to_string())
+}
+
 /// Each alternative is a complete chord; the primary modifier is always `Cmd/Ctrl`.
 pub fn shortcut(id: ShortcutId) -> String {
-    entry(id).chord.split(" / ").map(makepad_widgets_core::kbd::shortcut_label).collect::<Vec<_>>().join(" / ")
+    chord(id).split(" / ").map(makepad_widgets_core::kbd::shortcut_label).collect::<Vec<_>>().join(" / ")
+}
+
+// ---- rebinding ---------------------------------------------------------------------------
+
+/// A keyboard chord: a key and its modifiers (`primary` the platform's Cmd/Ctrl, `ctrl` Control
+/// where that is another key: on a Mac).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Chord {
+    pub key: KeyCode,
+    pub primary: bool,
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+}
+
+/// The keys a chord may end in, by the names the table writes them with.
+const KEY_NAMES: &[(KeyCode, &str)] = &[
+    (KeyCode::KeyA, "A"), (KeyCode::KeyB, "B"), (KeyCode::KeyC, "C"), (KeyCode::KeyD, "D"), (KeyCode::KeyE, "E"),
+    (KeyCode::KeyF, "F"), (KeyCode::KeyG, "G"), (KeyCode::KeyH, "H"), (KeyCode::KeyI, "I"), (KeyCode::KeyJ, "J"),
+    (KeyCode::KeyK, "K"), (KeyCode::KeyL, "L"), (KeyCode::KeyM, "M"), (KeyCode::KeyN, "N"), (KeyCode::KeyO, "O"),
+    (KeyCode::KeyP, "P"), (KeyCode::KeyQ, "Q"), (KeyCode::KeyR, "R"), (KeyCode::KeyS, "S"), (KeyCode::KeyT, "T"),
+    (KeyCode::KeyU, "U"), (KeyCode::KeyV, "V"), (KeyCode::KeyW, "W"), (KeyCode::KeyX, "X"), (KeyCode::KeyY, "Y"),
+    (KeyCode::KeyZ, "Z"), (KeyCode::Key0, "0"), (KeyCode::Key1, "1"), (KeyCode::Key2, "2"), (KeyCode::Key3, "3"),
+    (KeyCode::Key4, "4"), (KeyCode::Key5, "5"), (KeyCode::Key6, "6"), (KeyCode::Key7, "7"), (KeyCode::Key8, "8"),
+    (KeyCode::Key9, "9"), (KeyCode::F1, "F1"), (KeyCode::F2, "F2"), (KeyCode::F3, "F3"), (KeyCode::F4, "F4"),
+    (KeyCode::F5, "F5"), (KeyCode::F6, "F6"), (KeyCode::F7, "F7"), (KeyCode::F8, "F8"), (KeyCode::F9, "F9"),
+    (KeyCode::F10, "F10"), (KeyCode::F11, "F11"), (KeyCode::F12, "F12"), (KeyCode::Delete, "Delete"),
+    (KeyCode::Backspace, "Backspace"), (KeyCode::Home, "Home"), (KeyCode::End, "End"), (KeyCode::PageUp, "PageUp"),
+    (KeyCode::PageDown, "PageDown"), (KeyCode::Space, "Space"), (KeyCode::Escape, "Esc"), (KeyCode::ReturnKey, "Enter"),
+    (KeyCode::Tab, "Tab"), (KeyCode::ArrowUp, "Up"), (KeyCode::ArrowDown, "Down"), (KeyCode::ArrowLeft, "Left"),
+    (KeyCode::ArrowRight, "Right"), (KeyCode::Period, "."), (KeyCode::Comma, ","), (KeyCode::Slash, "/"),
+    (KeyCode::LBracket, "["), (KeyCode::RBracket, "]"), (KeyCode::Backtick, "`"), (KeyCode::Minus, "-"),
+    (KeyCode::Equals, "="), (KeyCode::Semicolon, ";"), (KeyCode::Quote, "'"), (KeyCode::Backslash, "\\"),
+    (KeyCode::Numpad0, "Numpad 0"), (KeyCode::Numpad1, "Numpad 1"), (KeyCode::Numpad2, "Numpad 2"),
+    (KeyCode::Numpad3, "Numpad 3"), (KeyCode::Numpad4, "Numpad 4"), (KeyCode::Numpad5, "Numpad 5"),
+    (KeyCode::Numpad6, "Numpad 6"), (KeyCode::Numpad7, "Numpad 7"), (KeyCode::Numpad8, "Numpad 8"),
+    (KeyCode::Numpad9, "Numpad 9"), (KeyCode::NumpadDivide, "Numpad /"),
+];
+
+/// One chord as the table writes it ("Cmd/Ctrl+Shift+D"); none for a mouse gesture, a modifier
+/// alone or a range ("Cmd/Ctrl+1 … 9"): those are not rebound.
+pub fn parse_chord(text: &str) -> Option<Chord> {
+    let mut chord = Chord { key: KeyCode::Unknown, primary: false, ctrl: false, shift: false, alt: false };
+    let mut rest = text.trim();
+    loop {
+        if let Some(r) = rest.strip_prefix("Cmd/Ctrl+") { chord.primary = true; rest = r; }
+        else if let Some(r) = rest.strip_prefix("Ctrl+") { chord.ctrl = true; rest = r; }
+        else if let Some(r) = rest.strip_prefix("Shift+") { chord.shift = true; rest = r; }
+        else if let Some(r) = rest.strip_prefix("Alt+") { chord.alt = true; rest = r; }
+        else { break; }
+    }
+    chord.key = KEY_NAMES.iter().find(|(_, name)| *name == rest)?.0;
+    Some(chord)
+}
+
+/// A chord as the table writes it.
+pub fn chord_text(c: Chord) -> String {
+    let mut out = String::new();
+    if c.primary { out.push_str("Cmd/Ctrl+"); }
+    if c.ctrl { out.push_str("Ctrl+"); }
+    if c.shift { out.push_str("Shift+"); }
+    if c.alt { out.push_str("Alt+"); }
+    out.push_str(KEY_NAMES.iter().find(|(k, _)| *k == c.key).map_or("?", |(_, n)| n));
+    out
+}
+
+/// The chord a key press is. On a Mac Control is its own modifier; elsewhere it is the primary.
+pub fn chord_of(ke: &KeyEvent) -> Chord {
+    let m = &ke.modifiers;
+    Chord { key: ke.key_code, primary: m.is_primary(), ctrl: m.control && !m.is_primary(), shift: m.shift, alt: m.alt }
+}
+
+/// A key press as the chord `c` (the same press, other keys held).
+fn as_press(ke: &KeyEvent, c: Chord) -> KeyEvent {
+    let mut out = ke.clone();
+    out.key_code = c.key;
+    let primary_is_logo = cfg!(target_vendor = "apple");
+    out.modifiers.shift = c.shift;
+    out.modifiers.alt = c.alt;
+    out.modifiers.logo = c.primary && primary_is_logo;
+    out.modifiers.control = c.ctrl || (c.primary && !primary_is_logo);
+    out
+}
+
+/// Whether `id` can be rebound: every alternative of its chord is a keyboard chord.
+pub fn rebindable(id: ShortcutId) -> bool {
+    entry(id).chord.split(" / ").all(|c| parse_chord(c).is_some())
+}
+
+/// The person's rebindings, loaded from the view prefs the first time they are asked for.
+fn overrides() -> std::sync::MutexGuard<'static, HashMap<ShortcutId, String>> {
+    static OVERRIDES: std::sync::OnceLock<std::sync::Mutex<HashMap<ShortcutId, String>>> = std::sync::OnceLock::new();
+    OVERRIDES
+        .get_or_init(|| {
+            let saved = crate::view_prefs::load_keymap();
+            let map = saved.into_iter()
+                .filter_map(|(name, chord)| KEYMAP.iter().find(|e| e.name == name).map(|e| (e.id, chord)))
+                .filter(|(id, chord)| rebindable(*id) && parse_chord(chord).is_some())
+                .collect();
+            std::sync::Mutex::new(map)
+        })
+        .lock()
+        .unwrap()
+}
+
+/// Whether `id` is rebound.
+pub fn rebound(id: ShortcutId) -> bool {
+    overrides().contains_key(&id)
+}
+
+/// Rebind `id` to `chord` (`None`, or its own chord: back to the table's), and keep it.
+pub fn rebind(id: ShortcutId, chord: Option<Chord>) {
+    let text = chord.map(chord_text);
+    {
+        let mut map = overrides();
+        match text {
+            Some(t) if t != entry(id).chord => { map.insert(id, t); }
+            _ => { map.remove(&id); }
+        }
+    }
+    let pairs: Vec<(String, String)> = KEYMAP.iter().filter_map(|e| overrides().get(&e.id).map(|c| (e.name.to_string(), c.clone()))).collect();
+    crate::view_prefs::save_keymap(&pairs);
+}
+
+/// Whether the Keymap reference is listening for a new chord: then no press is a shortcut.
+static CAPTURING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn capturing() -> bool {
+    CAPTURING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// What a key press means with the rebindings: itself, the chord of the action it was rebound
+/// for (the handlers know the table's chords), or nothing (the table's chord of an action
+/// rebound away from it).
+pub enum Remap {
+    Pass,
+    As(KeyEvent),
+    Swallow,
+}
+
+pub fn remap(ke: &KeyEvent) -> Remap {
+    let map = overrides();
+    if map.is_empty() { return Remap::Pass; }
+    let pressed = chord_of(ke);
+    // rebound to this chord: the action's own (first) chord, as the handlers know it
+    if let Some((id, _)) = map.iter().find(|(_, c)| parse_chord(c) == Some(pressed)) {
+        if let Some(own) = entry(*id).chord.split(" / ").next().and_then(parse_chord) {
+            return if own == pressed { Remap::Pass } else { Remap::As(as_press(ke, own)) };
+        }
+    }
+    // the table's chord of an action rebound away from it answers no more
+    if map.keys().any(|id| entry(*id).chord.split(" / ").filter_map(parse_chord).any(|c| c == pressed)) {
+        return Remap::Swallow;
+    }
+    Remap::Pass
 }
 
 pub fn tooltip(id: ShortcutId) -> String {
     format!("{} ({})", entry(id).action, shortcut(id))
 }
 
-/// The rows the panel draws: section headers interleaved with entries.
+/// The table as section headers interleaved with entries (what the sections are built from, for
+/// the tests).
+#[cfg(test)]
 enum HelpRow {
     Section(String),
     Entry(ShortcutId),
 }
 
+#[cfg(test)]
 fn help_rows() -> Vec<HelpRow> {
     let mut out = Vec::new();
     let mut last = None;
@@ -201,6 +370,43 @@ fn help_rows() -> Vec<HelpRow> {
 script_mod! {
     use mod.prelude.fab.*
     use mod.widgets.*
+
+    // The keymap's sections: one per context (Navigation, Design / Monitor, App …), each a row
+    // per action, its chord on a key cap; a rebindable one's cap listens for a new chord when
+    // pressed (`FabKeymapSections`).
+    mod.widgets.FabKeymapSectionsBase = #(FabKeymapSections::register_widget(vm))
+    mod.widgets.FabKeymapSections = set_type_default() do mod.widgets.FabKeymapSectionsBase{
+        width: Fill
+        height: Fit
+        flow: Down
+        padding: Inset{left: theme.prop_pad right: theme.prop_pad}
+        Section := PropSection{
+            grip: false
+            body: View{
+                width: Fill height: Fit flow: Down
+                padding: Inset{top: 4 bottom: 6}
+                content := View{width: Fill height: Fit flow: Down spacing: 2}
+            }
+        }
+        Row := View{
+            width: Fill
+            height: theme.prop_row_height
+            flow: Right
+            align: Align{x: 0.0 y: 0.5}
+            spacing: 8
+            padding: Inset{left: 8 right: 4}
+            name := Label{
+                width: Fill height: Fit
+                text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis
+                draw_text +: {
+                    color: fab.color_text
+                    text_style: theme.font_regular{font_size: theme.prop_font_size line_spacing: 1.0}
+                }
+            }
+            cap := mod.widgets.FabKeyCap{ cap +: { text: "" } }
+            reset := mod.widgets.FabLabelMuted{ visible: false text: "↺" }
+        }
+    }
 
     mod.widgets.FabKeymapHelpBase = #(FabKeymapHelp::register_widget(vm))
     mod.widgets.FabKeymapHelp = set_type_default() do mod.widgets.FabKeymapHelpBase{
@@ -234,37 +440,16 @@ script_mod! {
                         spacing: 8
                         mod.widgets.FabTitleLabel{ text: "Keymap" }
                         Filler{}
-                        mod.widgets.FabLabelMuted{ text: #(format!("{} closes", shortcut(ShortcutId::Help))) }
+                        mod.widgets.FabLabelMuted{ text: #(format!("{} closes · click a key to change it", shortcut(ShortcutId::Help))) }
                     }
-                    mod.widgets.FabHr{}
-                    list := PortalList{
-                        width: Fill
+                    // the toolbar: the filter, as every editor's
+                    bar := View{
+                        width: Fill height: 36 flow: Right align: Align{y: 0.5}
+                        search := mod.widgets.FabSearch{width: Fill{min: 80} row +: {input +: {empty_text: "Filter"}}}
+                    }
+                    body := mod.widgets.FabScroll{
                         height: 520
-                        flow: Down
-                        auto_tail: false
-                        Section := View{
-                            width: Fill
-                            height: 26
-                            flow: Right
-                            align: Align{x: 0.0 y: 1.0}
-                            padding: Inset{left: 2 right: 2 top: 8 bottom: 2}
-                            head := mod.widgets.FabHeaderLabel{ text: "" }
-                        }
-                        Entry := View{
-                            width: Fill
-                            height: theme.prop_row_height
-                            flow: Right
-                            align: Align{x: 0.0 y: 0.5}
-                            padding: Inset{left: 2 right: 2 top: 0 bottom: 0}
-                            spacing: 10
-                            keys := View{
-                                width: 190
-                                height: Fit
-                                flow: Right
-                                cap := mod.widgets.FabKeyCap{ cap +: { text: "" } }
-                            }
-                            what := mod.widgets.FabLabel{ width: Fill text: "" }
-                        }
+                        sections := mod.widgets.FabKeymapSections{}
                     }
                     View{
                         width: Fill
@@ -282,8 +467,6 @@ script_mod! {
 
 #[derive(Script, ScriptHook, Widget)]
 pub struct FabKeymapHelp {
-    #[rust]
-    rows: Vec<HelpRow>,
     #[deref]
     view: View,
     #[rust]
@@ -298,6 +481,9 @@ impl Widget for FabKeymapHelp {
             if modal.dismissed(actions) || self.view.button(cx, ids!(modal.close)).clicked(actions) {
                 cx.action(ShellAction::ShowKeymapHelp(false));
             }
+            if self.view.text_input(cx, ids!(modal.bar.search.row.input)).changed(actions).is_some() {
+                self.view.redraw(cx);
+            }
         }
     }
 
@@ -306,38 +492,195 @@ impl Widget for FabKeymapHelp {
             if state.ui.keymap_help_open != self.shown {
                 self.shown = state.ui.keymap_help_open;
                 let modal = self.view.modal(cx, ids!(modal));
-                if self.shown {
-                    if self.rows.is_empty() { self.rows = help_rows(); }
-                    modal.open(cx);
-                } else {
-                    modal.close(cx);
-                }
+                if self.shown { modal.open(cx); } else { modal.close(cx); }
             }
         }
-        let rows = &self.rows;
-        while let Some(step) = self.view.draw_walk(cx, scope, walk).step() {
-            let list_ref = step.as_portal_list();
-            let Some(mut list) = list_ref.borrow_mut() else {
-                continue;
-            };
-            list.set_item_range(cx, 0, rows.len());
-            while let Some(i) = list.next_visible_item(cx) {
-                match rows.get(i) {
-                    Some(HelpRow::Section(name)) => {
-                        let item = list.item(cx, i, live_id!(Section));
-                        item.label(cx, ids!(head)).set_text(cx, name);
-                        item.draw_all(cx, &mut Scope::empty());
+        let query = self.view.text_input(cx, ids!(modal.bar.search.row.input)).text();
+        if let Some(mut sections) = self.view.widget(cx, ids!(modal.body.sections)).borrow_mut::<FabKeymapSections>() {
+            sections.query = query;
+        }
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+/// The keymap as sections: one per context of the table, in its order, each a row per action.
+/// A rebindable action's key cap, pressed, listens for a new chord (Esc keeps the old one); a
+/// rebound one shows ↺ to go back to the table's. The toolbar's filter narrows the rows
+/// (`widgets::filter_sections`), and the headers fold as every editor's.
+#[derive(Script, Widget)]
+pub struct FabKeymapSections {
+    #[uid]
+    uid: WidgetUid,
+    #[source]
+    source: ScriptObjectRef,
+    #[walk]
+    walk: Walk,
+    #[layout]
+    layout: Layout,
+    #[rust]
+    templates: HashMap<LiveId, ScriptObjectRef>,
+    #[rust]
+    items: ComponentMap<LiveId, WidgetRef>,
+    /// The sections in order, by their context.
+    #[rust]
+    sections: Vec<(LiveId, &'static str)>,
+    /// The filter's words.
+    #[rust]
+    pub query: String,
+    /// The action whose cap listens for a new chord.
+    #[rust]
+    listening: Option<ShortcutId>,
+    #[redraw]
+    #[rust]
+    area: Area,
+}
+
+impl ScriptHook for FabKeymapSections {
+    fn on_before_apply(&mut self, _vm: &mut ScriptVm, apply: &Apply, _scope: &mut Scope, _value: ScriptValue) {
+        if apply.is_reload() {
+            self.templates.clear();
+        }
+    }
+
+    fn on_after_apply(&mut self, vm: &mut ScriptVm, apply: &Apply, _scope: &mut Scope, value: ScriptValue) {
+        if !apply.is_eval() {
+            if let Some(obj) = value.as_object() {
+                vm.vec_with(obj, |vm, vec| {
+                    for kv in vec {
+                        if let (Some(id), Some(t)) = (kv.key.as_id(), kv.value.as_object()) {
+                            self.templates.insert(id, vm.new_object_ref(t));
+                        }
                     }
-                    Some(HelpRow::Entry(id)) => {
-                        let item = list.item(cx, i, live_id!(Entry));
-                        item.label(cx, ids!(keys.cap.cap)).set_text(cx, &shortcut(*id));
-                        item.label(cx, ids!(what)).set_text(cx, entry(*id).action);
-                        item.draw_all(cx, &mut Scope::empty());
-                    }
-                    None => {}
-                }
+                });
             }
         }
+        if apply.is_reload() {
+            self.items.clear();
+            self.sections.clear();
+        }
+    }
+}
+
+/// The filter and section-order key of the keymap's sections.
+const KEYMAP_KEY: LiveId = live_id!(keymap_sections);
+
+fn row_id(id: ShortcutId) -> LiveId {
+    LiveId::from_str(&format!("key:{}", entry(id).name))
+}
+
+impl FabKeymapSections {
+    fn item(&mut self, cx: &mut Cx, id: LiveId, template: LiveId) -> Option<WidgetRef> {
+        if let Some(w) = self.items.get(&id) {
+            return Some(w.clone());
+        }
+        let value: ScriptValue = self.templates.get(&template)?.as_object().into();
+        let w = cx.with_vm(|vm| WidgetRef::script_from_value(vm, value));
+        cx.widget_tree_insert_child(self.uid, id, w.clone());
+        self.items.insert(id, w.clone());
+        Some(w)
+    }
+
+    /// The sections and their rows as the table and the rebindings have them now.
+    fn build(&mut self, cx: &mut Cx) {
+        self.sections.clear();
+        let mut contexts: Vec<&'static str> = Vec::new();
+        for e in KEYMAP {
+            if !contexts.contains(&e.context) { contexts.push(e.context); }
+        }
+        for context in contexts {
+            let sid = LiveId::from_str(&format!("context:{context}"));
+            let Some(section) = self.item(cx, sid, live_id!(Section)) else { continue };
+            section.label(cx, ids!(hdr.title)).set_text(cx, context);
+            let mut rows = Vec::new();
+            for e in KEYMAP.iter().filter(|e| e.context == context) {
+                let rid = row_id(e.id);
+                let Some(row) = self.item(cx, rid, live_id!(Row)) else { continue };
+                row.label(cx, ids!(name)).set_text(cx, e.action);
+                let cap = if self.listening == Some(e.id) { "Press keys…".to_string() } else { shortcut(e.id) };
+                row.label(cx, ids!(cap.cap)).set_text(cx, &cap);
+                row.widget(cx, ids!(reset)).set_visible(cx, rebound(e.id));
+                rows.push((rid, row));
+            }
+            crate::ui::widgets::section_rows(cx, &section, rows);
+            self.sections.push((sid, context));
+        }
+    }
+
+    fn sections(&self) -> Vec<WidgetRef> {
+        self.sections.iter().filter_map(|(id, _)| self.items.get(id).cloned()).collect()
+    }
+
+    fn listen(&mut self, cx: &mut Cx, id: Option<ShortcutId>) {
+        self.listening = id;
+        CAPTURING.store(id.is_some(), std::sync::atomic::Ordering::Relaxed);
+        if id.is_some() {
+            cx.set_key_focus(self.area);
+        }
+        self.area.redraw(cx);
+    }
+}
+
+impl Widget for FabKeymapSections {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
+        let sections = self.sections();
+        crate::ui::widgets::section_headers(cx, event, &sections);
+        for s in &sections {
+            s.handle_event(cx, event, &mut Scope::empty());
+        }
+        match event {
+            Event::MouseDown(e) if e.button.is_primary() => {
+                // a press on a cap listens for its action's new chord; on ↺, back to the table's
+                for entry in KEYMAP {
+                    let Some(row) = self.items.get(&row_id(entry.id)).cloned() else { continue };
+                    if !row.visible() { continue; }
+                    let cap = row.widget(cx, ids!(cap)).area();
+                    let reset = row.widget(cx, ids!(reset));
+                    if reset.visible() && reset.area().is_valid(cx) && reset.area().rect(cx).contains(e.abs) {
+                        rebind(entry.id, None);
+                        self.listen(cx, None);
+                        return;
+                    }
+                    if cap.is_valid(cx) && cap.rect(cx).contains(e.abs) {
+                        if rebindable(entry.id) {
+                            self.listen(cx, Some(entry.id));
+                        }
+                        return;
+                    }
+                }
+                if self.listening.is_some() {
+                    self.listen(cx, None);
+                }
+            }
+            Event::KeyDown(ke) if self.listening.is_some() => {
+                let id = self.listening.unwrap();
+                match ke.key_code {
+                    // a modifier alone is part of the chord being pressed
+                    KeyCode::Control | KeyCode::Alt | KeyCode::Shift | KeyCode::Logo => {}
+                    KeyCode::Escape if !ke.modifiers.shift && !ke.modifiers.alt && !ke.modifiers.control && !ke.modifiers.logo => self.listen(cx, None),
+                    _ => {
+                        let chord = chord_of(ke);
+                        if KEY_NAMES.iter().any(|(k, _)| *k == chord.key) {
+                            rebind(id, Some(chord));
+                            self.listen(cx, None);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.build(cx);
+        let sections = self.sections();
+        crate::ui::widgets::filter_sections(cx, KEYMAP_KEY, &self.query, &sections);
+        cx.begin_turtle(walk, self.layout);
+        for s in &sections {
+            if s.visible() {
+                s.draw_all(cx, &mut Scope::empty());
+            }
+        }
+        cx.end_turtle_with_area(&mut self.area);
         DrawStep::done()
     }
 }
@@ -366,12 +709,34 @@ mod tests {
         assert_eq!(KEYMAP.iter().filter(|e| e.chord.ends_with("+D")).count(), 2);
     }
 
+    /// A rebinding is kept as the table's own text, so each keyboard chord in the table reads
+    /// back as itself, and a mouse gesture or a range is never offered for rebinding.
+    #[test]
+    fn keyboard_chords_read_back_and_gestures_are_not_rebound() {
+        for e in KEYMAP {
+            for alt in e.chord.split(" / ") {
+                if let Some(c) = parse_chord(alt) {
+                    assert_eq!(chord_text(c), alt, "{} reads back", e.name);
+                }
+            }
+        }
+        assert!(rebindable(ShortcutId::Undo) && rebindable(ShortcutId::Hide) && rebindable(ShortcutId::Delete));
+        assert!(!rebindable(ShortcutId::Orbit) && !rebindable(ShortcutId::Zoom) && !rebindable(ShortcutId::Workspaces));
+        assert_eq!(parse_chord("Cmd/Ctrl+Shift+D"), Some(Chord { key: KeyCode::KeyD, primary: true, ctrl: false, shift: true, alt: false }));
+    }
+
     #[test]
     fn every_entry_has_a_section() {
+        let mut section = None;
         for row in help_rows() {
-            if let HelpRow::Entry(id) = row {
-                let e = entry(id);
-                assert!(!e.chord.is_empty() && !e.action.is_empty() && !e.context.is_empty());
+            match row {
+                HelpRow::Section(title) => section = Some(title),
+                HelpRow::Entry(id) => {
+                    let e = entry(id);
+                    assert!(!e.chord.is_empty() && !e.action.is_empty() && !e.context.is_empty());
+                    let title = section.as_deref().unwrap_or_else(|| panic!("{} comes before any section header", e.action));
+                    assert!(title.starts_with(e.context), "{} sits under {title:?}, not its own context {}", e.action, e.context);
+                }
             }
         }
     }

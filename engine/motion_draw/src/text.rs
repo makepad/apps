@@ -7,6 +7,8 @@
 //! typewriter `reveal` cuts the text at a character, and a caret stands
 //! after the last shown one.
 
+use super::PaintItem;
+use makepad_motion::plain::PrimitiveFrame;
 use super::MotionDraw;
 use makepad_motion::frame::{Affine, Item, ItemKind, PlateFrame};
 use makepad_motion::geometry;
@@ -272,8 +274,8 @@ pub(crate) fn set_face(md: &mut MotionDraw, cx: &mut Cx, font: &str, weight: f64
     true
 }
 
-pub(super) fn layout(md: &mut MotionDraw, cx: &mut Cx, item: &Item) -> Option<TextLayout> {
-    let ItemKind::Text { text, font, weight, italic, axes, size, align, valign, line_height, tracking, wrap, fit, units, .. } = &item.kind else { return None };
+pub(super) fn layout(md: &mut MotionDraw, cx: &mut Cx, item: &dyn PaintItem) -> Option<TextLayout> {
+    let Some(PrimitiveFrame::Text { text, font, weight, italic, axes, size, align, valign, line_height, tracking, wrap, fit, units, .. }) = item.primitive() else { return None };
     let af = match align {
         TextAlign::Left => 0.0,
         TextAlign::Center => 0.5,
@@ -415,9 +417,9 @@ pub(super) fn layout(md: &mut MotionDraw, cx: &mut Cx, item: &Item) -> Option<Te
 /// Where the camera flies into letter `letter` (a character index) of a
 /// Text item: its left stem (so a round letter's counter does not take
 /// the frame), half way down its line, in pass pixels.
-pub(super) fn letter_point(md: &mut MotionDraw, cx: &mut Cx2d, item: &Item, letter: usize) -> Option<[f64; 2]> {
+pub(super) fn letter_point(md: &mut MotionDraw, cx: &mut Cx2d, item: &dyn PaintItem, letter: usize) -> Option<[f64; 2]> {
     let layout = layout(md, cx, item)?;
-    let ItemKind::Text { text, .. } = &item.kind else { return None };
+    let Some(PrimitiveFrame::Text { text, .. }) = item.primitive() else { return None };
     let byte = text.char_indices().nth(letter).map(|(b, _)| b)?;
     let k = layout.starts.iter().position(|s| s.0 == byte)?;
     let (x0, row) = (layout.starts[k].1, layout.starts[k].2);
@@ -428,22 +430,22 @@ pub(super) fn letter_point(md: &mut MotionDraw, cx: &mut Cx2d, item: &Item, lett
 }
 
 /// The map from the text's own box to pass pixels.
-fn text_box(md: &MotionDraw, item: &Item, layout: &TextLayout) -> Affine {
+fn text_box(md: &MotionDraw, item: &dyn PaintItem, layout: &TextLayout) -> Affine {
     md.base
-        .then(&item.world)
+        .then(item.world())
         .then(&Affine::translate(layout.shift[0], layout.shift[1]))
-        .then(&item.local.affine(layout.size))
+        .then(&item.local().affine(layout.size))
 }
 
 /// Each unit's pixel map: from its own box (0..w, 0..h) to pass pixels.
-fn unit_maps(md: &MotionDraw, item: &Item, layout: &TextLayout) -> Vec<Affine> {
-    let ItemKind::Text { units, path, .. } = &item.kind else { return Vec::new() };
+fn unit_maps(md: &MotionDraw, item: &dyn PaintItem, layout: &TextLayout) -> Vec<Affine> {
+    let Some(PrimitiveFrame::Text { units, path, .. }) = item.primitive() else { return Vec::new() };
     // Text on a path: each unit's centre rides the path at its distance
     // along the line, turned to the path's direction.
     if let Some((data, offset)) = path {
         let line = makepad_motion::Polyline::from_path(data);
         let total = line.length().max(1e-9);
-        let base = md.base.then(&item.world);
+        let base = md.base.then(item.world());
         return units.iter().zip(&layout.units).map(|(unit, b)| {
             let s = offset * total + b.x + b.w * 0.5;
             // Letters not on the path yet (or past its end) are not drawn.
@@ -494,7 +496,7 @@ pub(super) fn warm(md: &mut MotionDraw, cx: &mut Cx, items: &[Item]) -> usize {
     let mut laid = 0;
     for item in items {
         match &item.kind {
-            ItemKind::Text { .. } => laid += layout(md, cx, item).is_some() as usize,
+            ItemKind::Primitive(PrimitiveFrame::Text { .. }) => laid += layout(md, cx, item).is_some() as usize,
             ItemKind::Group { children, mask, .. } => {
                 laid += warm(md, cx, children);
                 if let Some(mask) = mask {
@@ -509,9 +511,9 @@ pub(super) fn warm(md: &mut MotionDraw, cx: &mut Cx, items: &[Item]) -> usize {
 }
 
 /// Rasterise the units that turn, stretch or blur.
-pub(super) fn prepare(md: &mut MotionDraw, cx: &mut Cx2d, item: &Item) {
+pub(super) fn prepare(md: &mut MotionDraw, cx: &mut Cx2d, item: &dyn PaintItem) {
     let Some(layout) = layout(md, cx, item) else { return };
-    let ItemKind::Text { text, font, weight, italic, axes, units, reveal, .. } = &item.kind else { return };
+    let Some(PrimitiveFrame::Text { text, font, weight, italic, axes, units, reveal, .. }) = item.primitive() else { return };
     let size = &layout.font_size;
     let end = revealed_end(text, *reveal);
     let maps = unit_maps(md, item, &layout);
@@ -521,14 +523,14 @@ pub(super) fn prepare(md: &mut MotionDraw, cx: &mut Cx2d, item: &Item) {
             continue;
         }
         let s = m.mean_scale().max(1e-6);
-        let pad = size * PAD_EMS + unit.blur * 3.0 + item.feather * 1.5;
+        let pad = size * PAD_EMS + unit.blur * 3.0 + item.feather() * 1.5;
         let (content, px) = unit_target_px(b, pad, s);
         let index = md.target(cx, px, "motion_text");
         md.pool[index].begin(cx, vec4(0.0, 0.0, 0.0, 0.0));
         let axes = if unit.axes.is_empty() { axes.as_slice() } else { unit.axes.as_slice() };
         // In the unit's colour at full alpha; the quad applies its alpha.
         let color = [unit.color[0], unit.color[1], unit.color[2], 1.0];
-        if item.feather > 0.0 {
+        if item.feather() > 0.0 {
             let placed = Affine::scale(s, s).then(&Affine::translate(pad, pad));
             outline_unit(md, cx, &layout, item, axes, &range, b, &placed, color, None, 1.0);
             md.flush_vector(cx);
@@ -549,7 +551,7 @@ pub(super) fn prepare(md: &mut MotionDraw, cx: &mut Cx2d, item: &Item) {
         let texture = md.pool[index].texture.clone();
         let texture = if unit.blur > 0.0 { md.blurred(cx, &texture, px, unit.blur * s) } else { texture };
         let _ = content;
-        md.prepared.insert((item.path.clone(), k + 1), texture);
+        md.prepared.insert((item.path().to_owned(), k + 1), texture);
     }
 }
 
@@ -613,9 +615,9 @@ fn plate(md: &mut MotionDraw, cx: &mut Cx2d, m: &Affine, rect: [f64; 4], plate: 
     box_under(md, cx, m, [rect[0] - plate.pad[0], rect[1] - plate.pad[1], w, h], plate.radius, plate.color, plate.stroke, plate.width, opacity);
 }
 
-pub(super) fn draw(md: &mut MotionDraw, cx: &mut Cx2d, item: &Item, opacity: f64) {
+pub(super) fn draw(md: &mut MotionDraw, cx: &mut Cx2d, item: &dyn PaintItem, opacity: f64) {
     let Some(layout) = layout(md, cx, item) else { return };
-    let ItemKind::Text { text, font, weight, italic, axes, units, plate: plate_frame, reveal, caret, outline, .. } = &item.kind else { return };
+    let Some(PrimitiveFrame::Text { text, font, weight, italic, axes, units, plate: plate_frame, reveal, caret, outline, .. }) = item.primitive() else { return };
     let size = &layout.font_size;
     let end = revealed_end(text, *reveal);
     let maps = unit_maps(md, item, &layout);
@@ -650,7 +652,7 @@ pub(super) fn draw(md: &mut MotionDraw, cx: &mut Cx2d, item: &Item, opacity: f64
         }
         if direct(m) && unit.blur <= 0.0 {
             let axes = if unit.axes.is_empty() { axes.as_slice() } else { unit.axes.as_slice() };
-            if item.feather > 0.0 {
+            if item.feather() > 0.0 {
                 outline_unit(md, cx, &layout, item, axes, &range, b, m, unit.color, None, unit.opacity * opacity);
                 continue;
             }
@@ -663,10 +665,10 @@ pub(super) fn draw(md: &mut MotionDraw, cx: &mut Cx2d, item: &Item, opacity: f64
                 let p = m.apply(at);
                 md.draws.text.draw_abs(cx, dvec2(p[0], p[1]), &text[piece]);
             }
-        } else if let Some(texture) = md.prepared.get(&(item.path.clone(), k + 1)).cloned() {
+        } else if let Some(texture) = md.prepared.get(&(item.path().to_owned(), k + 1)).cloned() {
             // Earlier units' filled outlines must land below this quad.
             md.flush_vector(cx);
-            let pad = size * PAD_EMS + unit.blur * 3.0 + item.feather * 1.5;
+            let pad = size * PAD_EMS + unit.blur * 3.0 + item.feather() * 1.5;
             // The unit fills the top left of its (size-stepped) target.
             let (content, px) = unit_target_px(b, pad, m.mean_scale().max(1e-6));
             let uv = [0.0, 0.0, content.0 as f64 / px.0 as f64, content.1 as f64 / px.1 as f64];
@@ -696,8 +698,8 @@ pub(super) fn draw(md: &mut MotionDraw, cx: &mut Cx2d, item: &Item, opacity: f64
 /// wide in document units: traced at the layout's size and placed where
 /// the piece's glyphs stand. Both use the item's edge coverage.
 #[allow(clippy::too_many_arguments)]
-fn outline_unit(md: &mut MotionDraw, cx: &mut Cx2d, layout: &TextLayout, item: &Item, axes: &[(String, f64)], range: &std::ops::Range<usize>, b: &UnitBox, m: &Affine, color: [f64; 4], width: Option<f64>, opacity: f64) {
-    let ItemKind::Text { text, font, weight, italic, .. } = &item.kind else { return };
+fn outline_unit(md: &mut MotionDraw, cx: &mut Cx2d, layout: &TextLayout, item: &dyn PaintItem, axes: &[(String, f64)], range: &std::ops::Range<usize>, b: &UnitBox, m: &Affine, color: [f64; 4], width: Option<f64>, opacity: f64) {
+    let Some(PrimitiveFrame::Text { text, font, weight, italic, .. }) = item.primitive() else { return };
     if width.is_some_and(|width| width <= 0.0) || color[3] * opacity <= 0.0 {
         return;
     }
@@ -708,8 +710,8 @@ fn outline_unit(md: &mut MotionDraw, cx: &mut Cx2d, layout: &TextLayout, item: &
         local: makepad_motion::frame::Local { anchor: [0.0, 0.0], scale: [1.0, 1.0], rotate: 0.0 },
         opacity,
         blur: 0.0,
-        feather: item.feather,
-        feather_side: item.feather_side,
+        feather: item.feather(),
+        feather_side: item.feather_side(),
         effects: Vec::new(),
         blend: makepad_motion::model::Blend::Normal,
         is_static: false,

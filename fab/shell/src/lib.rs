@@ -45,6 +45,8 @@ pub fn script_mod(vm: &mut ScriptVm) {
     viewport::script_mod(vm);
     nav::script_mod(vm);
     tools::script_mod(vm);
+    // the printer camera before the print panels: the Printers editor shows it
+    ui::camera::script_mod(vm);
     print::script_mod(vm);
     ui::script_mod(vm);
 }

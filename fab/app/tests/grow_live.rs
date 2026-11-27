@@ -6,6 +6,8 @@
 //!
 //! HAL offscreen (`MAKEPAD_HAL_BACKEND=offscreen`), native GPU, no window.
 
+#[path = "common/part_editor.rs"]
+mod part_editor;
 #[path = "common/picture.rs"]
 mod picture;
 #[path = "common/wait.rs"]
@@ -107,8 +109,31 @@ fn still_grab(app: &TestApp) -> Grab {
     grab_of(app, &picture::finished_screenshot(app))
 }
 
+/// The view's finished picture once it holds. The view can say it is finished while a picture is
+/// still on its way. When two finished grabs in a row agree in pixels and in what the view says of
+/// its picture, the picture that held is the one the shape draws.
+fn settled_grab(app: &TestApp) -> Grab {
+    let mut last = still_grab(app);
+    let mut alike = None;
+    app.try_wait_until_within(HANG, || {
+        let next = still_grab(app);
+        if next.px == last.px && picture_state(&next.said) == picture_state(&last.said) {
+            alike = Some(next);
+            return None;
+        }
+        let why = format!("waiting for two finished stills alike: the last two differ in {} pixels ({} -> {})",
+            changed(&last.px, &next.px), picture_state(&last.said), picture_state(&next.said));
+        last = next;
+        Some(why)
+    })
+    .unwrap_or_else(|e| panic!("{}", e.message()));
+    alike.expect("the wait ended on two stills alike")
+}
+
 /// The view's part of a grab of the window.
 struct Grab {
+    /// The whole window as grabbed, kept as PNG bytes for a failure's evidence.
+    png: Vec<u8>,
     /// RGBA rows, `width` pixels each.
     px: Vec<u8>,
     width: usize,
@@ -131,7 +156,29 @@ fn grab_of(app: &TestApp, grab: &std::path::Path) -> Grab {
     let (x0, y0) = (view.x().max(0) as usize, view.y().max(0) as usize);
     let (x1, y1) = ((view.x() + view.width()) as usize, (view.y() + view.height()) as usize);
     let px = (y0..y1).flat_map(|y| &px[(y * width + x0) * 4..(y * width + x1) * 4]).copied().collect();
-    Grab { px, width: x1 - x0, said: view.description.to_string() }
+    Grab { png: bytes, px, width: x1 - x0, said: view.description.to_string() }
+}
+
+/// What the view says of its picture, without the per-frame counters. A restart of the still
+/// image between grabs shows in `records.still`.
+fn picture_state(said: &str) -> String {
+    let Ok(view) = makepad_strict_json::parse_depth(said.as_bytes(), 8) else {
+        return said.to_string();
+    };
+    let mut fields = Vec::new();
+    for key in ["camera", "parts_drawn", "settled", "at_rest", "traced", "still_samples", "screen_ao", "floor", "pointer", "hover", "selected"] {
+        if let Some(value) = view.get(key) {
+            fields.push(format!("{key} {}", value.to_json()));
+        }
+    }
+    if let Some(records) = view.get("records") {
+        for key in ["scene", "still", "comp"] {
+            if let Some(value) = records.get(key) {
+                fields.push(format!("records.{key} {}", value.to_json()));
+            }
+        }
+    }
+    fields.join(", ")
 }
 
 /// A log line's place past `from` that has all of `words`.
@@ -182,8 +229,9 @@ fn changed(a: &[u8], b: &[u8]) -> usize {
 /// message only: the pixels that differ (where, by how much, the first few either side), whether a
 /// grab 3 s on still differs (a picture on its way, or another one), what the view said of itself
 /// at each grab, and the view's and the part's events from the let-go (`let_go`) to the settle's
-/// grab (`there`), from there to the back's grab, and in the 3 s after it.
-fn why_back_differs(app: &TestApp, settled: &Grab, back: &Grab, let_go: u64, there: u64) -> String {
+/// grab (`there`), from there to the back's grab, and in the 3 s after it. The failure keeps all
+/// four pictures in the test's artifacts folder.
+fn why_back_differs(app: &TestApp, before: &Grab, settled: &Grab, back: &Grab, let_go: u64, there: u64, artifacts: &std::path::Path) -> String {
     type Px = (usize, usize, [u8; 3], [u8; 3]);
     let differ: Vec<Px> = settled.px.chunks(4).zip(back.px.chunks(4)).enumerate()
         .filter(|(_, (a, b))| a[..3] != b[..3])
@@ -205,6 +253,22 @@ fn why_back_differs(app: &TestApp, settled: &Grab, back: &Grab, let_go: u64, the
     std::thread::sleep(Duration::from_secs(3));
     let later = still_grab(app);
     let after = numbered(&app.log_since(tail.last_seq).expect("the app's log"));
+    let pictures = match std::fs::create_dir_all(artifacts) {
+        Ok(()) => {
+            let mut errors = Vec::new();
+            for (name, grab) in [("before.png", before), ("settled.png", settled), ("back.png", back), ("later.png", &later)] {
+                if let Err(e) = std::fs::write(artifacts.join(name), &grab.png) {
+                    errors.push(format!("{name}: {e}"));
+                }
+            }
+            if errors.is_empty() {
+                format!("the pictures (the whole window as grabbed): before.png, settled.png, back.png, later.png in {}", artifacts.display())
+            } else {
+                format!("could not write pictures in {}: {}", artifacts.display(), errors.join(", "))
+            }
+        }
+        Err(e) => format!("could not create the pictures' folder {}: {e}", artifacts.display()),
+    };
     // the view's and the part's lines among them, the last 60 of each stretch
     fn events<'a>(what: &str, lines: impl Iterator<Item = &'a (u64, String)>) -> String {
         // (without the line's level and source place)
@@ -215,12 +279,13 @@ fn why_back_differs(app: &TestApp, settled: &Grab, back: &Grab, let_go: u64, the
     }
     let view = |g: &Grab| {
         let r = makepad_strict_json::parse_depth(g.said.as_bytes(), 8).unwrap_or(Value::Null);
-        ["camera", "parts_drawn", "settled", "traced", "still_samples", "screen_ao", "floor", "pointer", "hover", "selected"]
+        ["camera", "parts_drawn", "settled", "at_rest", "traced", "still_samples", "screen_ao", "floor", "records", "pointer", "hover", "selected"]
             .iter().map(|k| format!("{k} {}", r.get(k).map_or("-".to_string(), Value::to_json))).collect::<Vec<_>>().join(", ")
     };
     [
         format!("{} differ in x {x0}..{x1}, y {y0}..{y1} of a view {} wide; {faint} by at most 2 a channel, the largest step {largest}; the first: {}", differ.len(), back.width, first.join(" ")),
         format!("3 s on: {} differ from the settle, {} from the back", changed(&settled.px, &later.px), changed(&back.px, &later.px)),
+        pictures,
         format!("the view at the settle: {}", view(settled)),
         format!("the view at the back:   {}", view(back)),
         format!("the view 3 s on:        {}", view(&later)),
@@ -371,6 +436,7 @@ fn a_grown_part_refines_to_what_its_member_asks() {
         let mark = app.log_since(0).expect("the app's log").last_seq;
         place_grown(&app, &script(0.0));
         app.locator(Selector::role(Role::TreeItem).name("Grown")).wait_visible().click();
+        part_editor::open(&app);
         panel_says(&app, "part: settled 3 mm");
         // it settled at the level its member asks for
         said(&app, mark, "fab: part settled at 3 mm", Instant::now());
@@ -396,13 +462,15 @@ fn a_drag_follows_at_the_coarse_levels_and_refines_on_release() {
     let hub = LocalHub::start("drag");
     let mut config = TestConfig::current_package(env!("CARGO_MANIFEST_DIR"), env!("CARGO_PKG_NAME"), "a_drag_follows_at_the_coarse_levels_and_refines_on_release").expect("the test's package");
     config.env.insert("MAKEPAD_HOME".into(), hub.home.display().to_string());
+    let artifacts = config.artifacts_dir.clone();
     run_with_config(config, |app| {
         place_grown(&app, &steered());
         app.locator(Selector::role(Role::Tab).name("Parts")).click();
         app.locator(Selector::role(Role::TreeItem).name("Grown")).wait_visible().click();
+        part_editor::open(&app);
         app.locator(Selector::id("t_shape")).wait_visible().click();
         panel_says(&app, "part: settled 3 mm");
-        let before = still(&app);
+        let before = still_grab(&app);
 
         let mark = app.log_since(0).expect("the app's log").last_seq;
         let t = Instant::now();
@@ -417,7 +485,7 @@ fn a_drag_follows_at_the_coarse_levels_and_refines_on_release() {
         println!("the drag answers at the coarse levels after {:.0} ms", said(&app, mark, "part shape for its change", t));
         let mut dragged = 0;
         app.try_wait_until_within(HANG, || {
-            dragged = differing(&before, &pixels(&app));
+            dragged = differing(&before.px, &pixels(&app));
             (dragged <= 200).then(|| format!("the shape follows the drag: {dragged} pixels"))
         })
         .unwrap_or_else(|e| panic!("{}", e.message()));
@@ -432,8 +500,8 @@ fn a_drag_follows_at_the_coarse_levels_and_refines_on_release() {
         println!("let go, it settles after {:.0} ms", said(&app, let_go, "fab: part settled at 3 mm", t));
         panel_says(&app, "part: settled 3 mm");
         let shape = faded_to(&app, let_go);
-        let settled = still_grab(&app);
-        assert!(differing(&before, &settled.px) > 200, "the settled shape answers the value let go at");
+        let settled = settled_grab(&app);
+        assert!(differing(&before.px, &settled.px) > 200, "the settled shape answers the value let go at");
 
         // There and back: what it had is the answer, at once.
         let there = app.log_since(0).expect("the app's log").last_seq;
@@ -450,10 +518,10 @@ fn a_drag_follows_at_the_coarse_levels_and_refines_on_release() {
         back_on(&app, &shape);
         let log = app.log_since(there).expect("the app's log");
         assert!(!log.lines.iter().any(|l| l.contains("fab: part settled at")), "nothing to refine");
-        let back_grab = still_grab(&app);
+        let back_grab = settled_grab(&app);
         let back = changed(&settled.px, &back_grab.px);
         // (the message, and its why, are worked out only on a failure)
-        assert_eq!(back, 0, "the same shape traced to the end draws the same pixels, whatever way the view came to it: {back} differ\n{}", why_back_differs(&app, &settled, &back_grab, let_go, there));
+        assert_eq!(back, 0, "the same shape traced to the end draws the same pixels, whatever way the view came to it: {back} differ\n{}", why_back_differs(&app, &before, &settled, &back_grab, let_go, there, &artifacts));
     })
     .unwrap();
     drop(hub);
@@ -471,6 +539,7 @@ fn a_slender_part_says_its_solve_did_not_finish() {
         place_grown(&app, &plate);
         app.locator(Selector::role(Role::Tab).name("Parts")).click();
         app.locator(Selector::role(Role::TreeItem).name("Grown")).wait_visible().click();
+        part_editor::open(&app);
         app.locator(Selector::id("t_shape")).wait_visible().click();
         panel_says(&app, "Its force solve did not finish");
     })
@@ -515,6 +584,7 @@ fn a_saved_part_opens_as_it_settled() {
         app.locator(Selector::role(Role::Window)).wait_visible();
         app.locator(Selector::role(Role::Tab).name("Parts")).click();
         app.locator(Selector::role(Role::TreeItem).name("Grown")).wait_visible().click();
+        part_editor::open(&app);
         app.locator(Selector::id("t_shape")).wait_visible().click();
     };
 
@@ -579,6 +649,7 @@ fn with_no_ai_hub_a_grown_part_says_so() {
     run_with_config(config, |app| {
         place_grown(&app, &script(0.0));
         app.locator(Selector::role(Role::TreeItem).name("Grown")).wait_visible().click();
+        part_editor::open(&app);
         panel_says(&app, "No AI hub is running");
     })
     .unwrap();
@@ -596,6 +667,7 @@ fn a_run_that_fails_says_why_in_the_panel() {
         let far = script(0.0).replace("m.fixed(Face{at: [-96mm, 69mm, 0]})", "let nowhere = m.box({size: [1mm 1mm 1mm] at: [900mm 0 0]})\nm.fixed(nowhere)");
         place_grown(&app, &far);
         app.locator(Selector::role(Role::TreeItem).name("Grown")).wait_visible().click();
+        part_editor::open(&app);
         panel_says(&app, "could not grow");
     })
     .unwrap();

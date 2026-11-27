@@ -24,10 +24,8 @@ pub mod checks_panel;
 pub mod requirements_panel;
 pub mod bom_panel;
 pub mod board_controls;
-pub mod paint_panel;
-pub mod jobs_panel;
 pub mod journal_panel;
-pub mod perf_panel;
+pub mod review_strip;
 pub mod area_notch;
 pub mod areas;
 pub mod mech_actions;
@@ -84,7 +82,6 @@ pub fn script_mod(vm: &mut ScriptVm) {
     print_settings::script_mod(vm);
     parts::script_mod(vm);
     plates::script_mod(vm);
-    camera::script_mod(vm);
     mechanics::script_mod(vm);
     arm::script_mod(vm);
     scan::script_mod(vm);
@@ -104,10 +101,8 @@ pub fn script_mod(vm: &mut ScriptVm) {
     requirements_panel::script_mod(vm);
     bom_panel::script_mod(vm);
     board_controls::script_mod(vm);
-    paint_panel::script_mod(vm);
-    jobs_panel::script_mod(vm);
     journal_panel::script_mod(vm);
-    perf_panel::script_mod(vm);
+    review_strip::script_mod(vm);
     area_notch::script_mod(vm);
     shell::script_mod(vm);
 }
@@ -148,6 +143,16 @@ pub fn redraw_now(cx: &mut Cx, root: &WidgetRef, paths: &[&[LiveId]]) {
         }
         if let Some(editor) = editors::Editor::all().find(|editor| path.len() == 1 && editor.tab() == path[0]) {
             let dock = root.dock(cx, ids!(dock));
+            // the Part's editor is the Plate views' sidebar: each Plate body's
+            if editor == editors::Editor::Part {
+                let plate = editors::Editor::Viewport.kind();
+                let bodies: Vec<WidgetRef> = dock.borrow_mut().map(|mut dock| {
+                    dock.items().values().filter(|(kind, _)| *kind == plate).map(|(_, body)| body.clone()).collect()
+                }).unwrap_or_default();
+                for body in bodies {
+                    body.widget(cx, ids!(part_side)).redraw(cx);
+                }
+            }
             if editor.repeatable() {
                 let tabs: Vec<LiveId> = dock.borrow_mut().map(|mut dock| {
                     dock.items().iter().filter(|(_, (kind, _))| *kind == editor.kind()).map(|(tab, _)| *tab).collect()

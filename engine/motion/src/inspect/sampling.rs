@@ -1,3 +1,4 @@
+use crate::plain::{EllipseProps, GroupProps, PathProps, RectProps, RepeatProps, TextProps};
 use crate::{Layer, LayerKind, MotionDoc, PathShape, Prop};
 
 /// Coarse samples on the output frame grid, plus resolved spans and keys
@@ -48,7 +49,7 @@ fn layer_times(layer: &Layer, origin: f64, end: f64, out: &mut Vec<f64>) {
     props!(&tr.at, &tr.x, &tr.y, &tr.scale, &tr.rotate, &layer.opacity, &layer.blur);
     if let Some(along) = &tr.along { props!(&along.progress); }
     match &layer.kind {
-        LayerKind::Text { size, color, tracking, reveal, axes, path, by, source, stagger, .. } => {
+        LayerKind::Text { props: TextProps { size, color, tracking, reveal, by, stagger, .. }, axes, path, source, .. } => {
             props!(size, color, tracking);
             if let Some(reveal) = reveal { props!(reveal); }
             for (_, p) in axes { props!(p); }
@@ -65,21 +66,21 @@ fn layer_times(layer: &Layer, origin: f64, end: f64, out: &mut Vec<f64>) {
                 }
             }
         }
-        LayerKind::Rect { size, fill, stroke, width, trim_start, trim_end, .. } | LayerKind::Ellipse { size, fill, stroke, width, trim_start, trim_end, .. } => {
+        LayerKind::Rect(RectProps { size, fill, stroke, width, trim_start, trim_end, .. }) | LayerKind::Ellipse(EllipseProps { size, fill, stroke, width, trim_start, trim_end, .. }) => {
             props!(size, width, trim_start, trim_end);
             for p in [fill, stroke].into_iter().flatten() { props!(p); }
         }
-        LayerKind::Path { data, fill, stroke, width, trim_start, trim_end, .. } => {
+        LayerKind::Path(PathProps { data, fill, stroke, width, trim_start, trim_end, .. }) => {
             props!(width, trim_start, trim_end);
             for p in [fill, stroke].into_iter().flatten() { props!(p); }
             if let PathShape::Morph { track, .. } = data { for key in &track.keys { out.push(start + key.t.value); } }
         }
-        LayerKind::Group { layers, mask, stagger, size, .. } => {
+        LayerKind::Group { layers, mask, props: GroupProps { stagger, size, .. }, .. } => {
             if let Some(size) = size { props!(size); }
             for (i, child) in layers.iter().enumerate() { layer_times(child, start + stagger.delay(i, layers.len()), end, out); }
             if let Some(mask) = mask { layer_times(mask, start, end, out); }
         }
-        LayerKind::Repeat { layer, items, count, delay, .. } => {
+        LayerKind::Repeat { layer, items, props: RepeatProps { count, delay, .. }, .. } => {
             for i in 0..*count { layer_times(items.get(i).unwrap_or(layer), start + i as f64 * delay, end, out); }
         }
         LayerKind::FlyThrough { layers, time, duration, .. } => {

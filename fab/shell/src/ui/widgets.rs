@@ -128,7 +128,7 @@ script_mod! {
             color_hover: fab.color_text_active
             color_down: fab.color_text_active
             color_focus: fab.color_text
-            color_disabled: fab.color_text_muted
+            color_disabled: fab.color_disabled_ink
             text_style: theme.font_regular{
                 font_size: fab.font_size_ui
             }
@@ -202,8 +202,12 @@ script_mod! {
             color_down: fab.color_accent_dim
             color_focus: fab.color_accent
         }
+        // its words on the accent's bright face: black, under the pointer and pressed too
         draw_text +: {
             color: fab.color_text_on_accent
+            color_hover: fab.color_text_on_accent
+            color_down: fab.color_text_on_accent
+            color_focus: fab.color_text_on_accent
         }
     }
 
@@ -231,7 +235,7 @@ script_mod! {
             color_hover: fab.color_text_active
             color_down: fab.color_text_active
             color_focus: fab.color_text
-            color_disabled: fab.color_text_muted
+            color_disabled: fab.color_disabled_ink
             text_style: theme.font_regular{
                 font_size: fab.font_size_ui
             }
@@ -312,6 +316,8 @@ script_mod! {
         icon_walk: Walk{ width: fab.icon_size height: fab.icon_size }
         draw_bg +: {
             color: vec4(0.0, 0.0, 0.0, 0.0)
+            // off: no face of its own, its icon dimmed (`draw_icon`'s color_disabled)
+            color_disabled: vec4(0.0, 0.0, 0.0, 0.0)
             color_hover: fab.color_button_hover
             color_down: fab.color_button_down
             color_focus: vec4(0.0, 0.0, 0.0, 0.0)
@@ -325,7 +331,7 @@ script_mod! {
             color: fab.color_text
             color_hover: fab.color_text_active
             color_down: fab.color_text_active
-            color_disabled: fab.color_text_muted
+            color_disabled: fab.color_disabled_ink
             get_color: fn() {
                 return self.color
                     .mix(self.color_hover, self.hover)
@@ -463,7 +469,7 @@ script_mod! {
             color_down: fab.color_text_active
             color_active: fab.color_text
             color_focus: fab.color_text_dim
-            color_disabled: fab.color_text_muted
+            color_disabled: fab.color_disabled_ink
             text_style: theme.font_regular{
                 font_size: fab.font_size_ui
             }
@@ -477,7 +483,7 @@ script_mod! {
             color: fab.color_text_dim
             color_hover: fab.color_text_active
             color_active: fab.color_text
-            color_disabled: fab.color_text_muted
+            color_disabled: fab.color_disabled_ink
             // premultiplied with the glyph's coverage, as DrawSvg's own colour is (the inks carry
             // alpha)
             get_color: fn() {
@@ -578,6 +584,28 @@ script_mod! {
     // Icon toggle (shading modes, x-ray, overlays, lock, tools).
     // 16 px glyph in a 24×20 well: centre with padding, never turtle-align
     // (DrawSvg is DrawVector).
+    // A toolbar's tab (the Printers editor's Printers / Jobs): no face, its name half-lit at rest and lit under the pointer, the chosen
+    // one in the full ink over an accent underline.
+    mod.widgets.FabUnderlineTab = mod.widgets.FabSegmentTab{
+        height: 24
+        padding: Inset{left: 10 right: 10 top: 0 bottom: 0}
+        draw_bg +: {
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                sdf.box(6.0, self.rect_size.y - 2.0, self.rect_size.x - 12.0, 2.0, 0.5)
+                sdf.fill(vec4(fab.color_accent.xyz, fab.color_accent.w * self.active))
+                return sdf.result
+            }
+        }
+        draw_text +: {
+            color: mix(fab.color_text_dim, fab.color_text, 0.5)
+            color_hover: fab.color_text
+            color_down: fab.color_text
+            color_active: fab.color_text_active
+            // (the one just clicked keeps the keyboard: it reads as chosen, not as rest)
+            color_focus: fab.color_text_active
+        }
+    }
     mod.widgets.FabIconToggle = RadioButtonTab{
         width: 24
         height: theme.prop_row_height
@@ -612,8 +640,9 @@ script_mod! {
             color: fab.color_text
             color_hover: fab.color_text_active
             color_down: fab.color_text_active
+            // on the accent's bright face, while on: black (the sheet's ink on the accent)
             color_active: fab.color_text_on_accent
-            color_disabled: fab.color_text_muted
+            color_disabled: fab.color_disabled_ink
             get_color: fn() {
                 return self.color
                     .mix(self.color_active, self.active)
@@ -731,20 +760,56 @@ script_mod! {
     // strips are one widget, each with its own tool list.
     // =====================================================================
 
+    // A floating card's ground (the tool strips, the plate view's tool rows, menus and
+    // popovers): its fill and outline, and a soft drop shadow round it. The quad grows past the
+    // card by the shadow's reach, so the shadow falls outside its rect; presses still take the
+    // card's rect alone. `fade` dims all of it (a closing menu).
+    mod.draw.FabFloatBg = mod.draw.DrawQuad{
+        color: uniform(fab.color_float)
+        border_color: uniform(fab.color_float_border)
+        radius: uniform(fab.radius_lg)
+        shadow_color: uniform(fab.color_float_shadow)
+        shadow_radius: uniform(10.0)
+        shadow_offset: uniform(vec2(0.0, 3.0))
+        fade: instance(1.0)
+        vertex: fn() {
+            let lo = min(self.shadow_offset, vec2(0.0, 0.0)) - vec2(self.shadow_radius, self.shadow_radius)
+            let hi = max(self.shadow_offset, vec2(0.0, 0.0)) + vec2(self.shadow_radius, self.shadow_radius)
+            let pos = self.rect_pos + lo
+            let size = self.rect_size + hi - lo
+            // the card's own clip (its rect, when it clips its content) grown by the shadow's
+            // reach, so the shadow shows round it; the view's clip still holds
+            let clipped = clamp(
+                clamp(self.geom.pos * size + pos, self.draw_clip.xy + lo, self.draw_clip.zw + hi)
+                + self.draw_list.view_shift,
+                self.draw_list.view_clip.xy,
+                self.draw_list.view_clip.zw
+            )
+            self.pos = (clipped - pos) / size
+            self.world = self.draw_list.view_transform * vec4(clipped.x, clipped.y, self.draw_depth + self.draw_call.zbias, 1.0)
+            return self.draw_pass.camera_projection * (self.draw_pass.camera_view * self.world)
+        }
+        pixel: fn() {
+            let lo = min(self.shadow_offset, vec2(0.0, 0.0)) - vec2(self.shadow_radius, self.shadow_radius)
+            let hi = max(self.shadow_offset, vec2(0.0, 0.0)) + vec2(self.shadow_radius, self.shadow_radius)
+            // this pixel in the card's own points (0,0 its top left)
+            let p = self.pos * (self.rect_size + hi - lo) + lo
+            let shade = GaussShadow.rounded_box_shadow(self.shadow_offset, self.rect_size + self.shadow_offset, p, self.shadow_radius * 0.5, self.radius)
+            let sdf = Sdf2d.viewport(p)
+            sdf.clear(self.shadow_color * shade)
+            sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, self.radius)
+            sdf.fill_keep(self.color)
+            sdf.stroke(self.border_color, 1.0)
+            return sdf.result * self.fade
+        }
+    }
+
     mod.widgets.FabFloat = View{
         width: Fit
         height: Fit
         cursor: MouseCursor.Default
         show_bg: true
-        draw_bg +: {
-            pixel: fn() {
-                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
-                sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, fab.radius_lg)
-                sdf.fill_keep(vec4(fab.color_float.xyz, 0.94))
-                sdf.stroke(fab.color_float_border, 1.0)
-                return sdf.result
-            }
-        }
+        draw_bg: mod.draw.FabFloatBg{}
     }
     mod.widgets.FabTool = mod.widgets.FabIconToggle{
         width: 32
@@ -754,7 +819,9 @@ script_mod! {
     mod.widgets.FabToolSep = View{ width: 20 height: 1 margin: Inset{left: 6 top: 4 bottom: 4} show_bg: true draw_bg +: { color: fab.color_border_light } }
 
     // =====================================================================
-    // Checkbox — Fab's inset well with a white tick.
+    // Checkbox — a text field's well: a #00000020 fill, its outline #00000040 at rest, #ffffff20
+    // under the pointer and with focus; the tick in the text's ink, lit under the pointer.
+    // The property kit's PropCheckBox (the slicer's rows, Global, Advanced) draws the same.
     // =====================================================================
 
     mod.widgets.FabCheckBox = CheckBox{
@@ -766,39 +833,111 @@ script_mod! {
         align: Align{x: 0.0 y: 0.5}
         padding: Inset{left: 0 right: 0 top: 0 bottom: 0}
         margin: Inset{top: 0 bottom: 0 left: 0 right: 0}
-        label_walk: Walk{ width: Fit height: Fit margin: Inset{left: 18 right: 0 top: 0 bottom: 0} }
+        label_walk: Walk{ width: Fit height: Fit margin: Inset{left: 19 right: 0 top: 0 bottom: 0} }
         draw_bg +: {
             size: uniform(13.0)
-            border_size: uniform(1.0)
-            border_radius: uniform(fab.radius)
-            color: fab.color_toggle_off
-            color_hover: fab.color_input_hover
-            color_down: fab.color_input_active
-            color_active: fab.color_toggle_on
-            color_focus: fab.color_toggle_off
-            color_disabled: fab.color_editor_alt
-            border_color: fab.color_border
-            border_color_hover: fab.color_border_light
-            border_color_down: fab.color_border
-            border_color_active: fab.color_border
-            border_color_focus: fab.color_focus_ring
-            border_color_disabled: fab.color_border
-            mark_color: vec4(0.0, 0.0, 0.0, 0.0)
-            mark_color_hover: vec4(0.0, 0.0, 0.0, 0.0)
-            mark_color_down: vec4(0.0, 0.0, 0.0, 0.0)
-            mark_color_active: fab.color_toggle_mark
-            mark_color_active_hover: fab.color_toggle_mark
-            mark_color_focus: vec4(0.0, 0.0, 0.0, 0.0)
-            mark_color_disabled: fab.color_text_muted
+            border_radius: uniform(1.5)
+            mark_at_end: uniform(0.0)
+            color: uniform(theme.prop_field)
+            border_color: uniform(#x00000000)
+            border_color_hover: uniform(#xffffff20)
+            border_color_focus: uniform(#xffffff20)
+            mark_color_active: uniform(fab.color_text)
+            mark_color_hover: uniform(fab.color_text_hover)
+            mark_color_disabled: uniform(fab.color_text_dim)
+            pixel: fn() {
+                let dpi = self.draw_pass.dpi_factor
+                let px = 1.0 / dpi
+                let origin = self.rect_pos + vec2((self.rect_size.x - self.size) * self.mark_at_end, (self.rect_size.y - self.size) * 0.5 + self.mark_box_offset_y)
+                let lo = floor(origin * dpi + 0.5) / dpi - self.rect_pos
+                let hi = floor((origin + vec2(self.size)) * dpi + 0.5) / dpi - self.rect_pos
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                // The well and its 1 pt outline, as a text field's, covered per device pixel: the
+                // SDF's own soft edge would leave a 1 pt line at half strength.
+                let q = self.pos * self.rect_size
+                let r = self.border_radius
+                let e = max(lo - q, q - hi) + vec2(r, r)
+                let d = length(max(e, vec2(0.0, 0.0))) + min(max(e.x, e.y), 0.0) - r
+                let outer = clamp(0.5 - d * dpi, 0.0, 1.0)
+                let ring = outer - clamp(0.5 - (d + 1.0) * dpi, 0.0, 1.0)
+                let f = self.color * (1.0 - self.disabled * 0.5)
+                let line = self.border_color.mix(self.border_color_hover, self.hover).mix(self.border_color_focus, max(self.focus, self.down)).mix(self.border_color, self.disabled)
+                let well = vec4(f.rgb * f.a, f.a) * outer
+                sdf.result = vec4(line.rgb * line.a, line.a) * ring + well * (1.0 - line.a * ring)
+                let c = (lo + hi) * 0.5
+                let ink = self.mark_color_active.mix(self.mark_color_hover, self.hover).mix(self.mark_color_disabled, self.disabled)
+                // The tick (or a mixed dash) is 1.5 pt wide, in the text's ink.
+                if self.mixed > 0.5 {
+                    sdf.move_to(lo.x + 3.0, c.y)
+                    sdf.line_to(hi.x - 3.0, c.y)
+                    sdf.stroke(ink, 0.75)
+                } else if self.active > 0.5 {
+                    sdf.move_to(c.x - 3.0, c.y)
+                    sdf.line_to(c.x - 1.0, c.y + 2.0)
+                    sdf.line_to(c.x + 3.0, c.y - 2.0)
+                    sdf.stroke(ink, 0.75)
+                }
+                return sdf.result
+            }
         }
         draw_text +: {
             ink_centered: true
             color: fab.color_text
-            color_hover: fab.color_text_active
+            color_hover: fab.color_text_hover
             color_active: fab.color_text
-            color_disabled: fab.color_text_muted
+            color_disabled: fab.color_text_dim
             text_style: theme.font_regular{
                 font_size: fab.font_size_ui
+            }
+        }
+    }
+
+    mod.widgets.PropCheckBox = mod.widgets.PropCheckBox{
+        label_walk: Walk{width: Fill height: Fit margin: Inset{left: 19}}
+        draw_bg +: {
+            size: uniform(13.0)
+            border_radius: uniform(1.5)
+            mark_at_end: uniform(0.0)
+            color: uniform(theme.prop_field)
+            border_color: uniform(#x00000000)
+            border_color_hover: uniform(#xffffff20)
+            border_color_focus: uniform(#xffffff20)
+            mark_color_active: uniform(fab.color_text)
+            mark_color_hover: uniform(fab.color_text_hover)
+            mark_color_disabled: uniform(fab.color_text_dim)
+            pixel: fn() {
+                let dpi = self.draw_pass.dpi_factor
+                let px = 1.0 / dpi
+                let origin = self.rect_pos + vec2((self.rect_size.x - self.size) * self.mark_at_end, (self.rect_size.y - self.size) * 0.5 + self.mark_box_offset_y)
+                let lo = floor(origin * dpi + 0.5) / dpi - self.rect_pos
+                let hi = floor((origin + vec2(self.size)) * dpi + 0.5) / dpi - self.rect_pos
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                // The well and its 1 pt outline, as a text field's, covered per device pixel: the
+                // SDF's own soft edge would leave a 1 pt line at half strength.
+                let q = self.pos * self.rect_size
+                let r = self.border_radius
+                let e = max(lo - q, q - hi) + vec2(r, r)
+                let d = length(max(e, vec2(0.0, 0.0))) + min(max(e.x, e.y), 0.0) - r
+                let outer = clamp(0.5 - d * dpi, 0.0, 1.0)
+                let ring = outer - clamp(0.5 - (d + 1.0) * dpi, 0.0, 1.0)
+                let f = self.color * (1.0 - self.disabled * 0.5)
+                let line = self.border_color.mix(self.border_color_hover, self.hover).mix(self.border_color_focus, max(self.focus, self.down)).mix(self.border_color, self.disabled)
+                let well = vec4(f.rgb * f.a, f.a) * outer
+                sdf.result = vec4(line.rgb * line.a, line.a) * ring + well * (1.0 - line.a * ring)
+                let c = (lo + hi) * 0.5
+                let ink = self.mark_color_active.mix(self.mark_color_hover, self.hover).mix(self.mark_color_disabled, self.disabled)
+                // The tick (or a mixed dash) is 1.5 pt wide, in the text's ink.
+                if self.mixed > 0.5 {
+                    sdf.move_to(lo.x + 3.0, c.y)
+                    sdf.line_to(hi.x - 3.0, c.y)
+                    sdf.stroke(ink, 0.75)
+                } else if self.active > 0.5 {
+                    sdf.move_to(c.x - 3.0, c.y)
+                    sdf.line_to(c.x - 1.0, c.y + 2.0)
+                    sdf.line_to(c.x + 3.0, c.y - 2.0)
+                    sdf.stroke(ink, 0.75)
+                }
+                return sdf.result
             }
         }
     }
@@ -810,6 +949,8 @@ script_mod! {
     // The row sets the height, as for the property kit's fields: a desktop sheet gives a
     // TextInput a field's height of its own, which stood the field taller than its row (a button
     // beside it, a tree row it renames in) and put the text below the row's middle.
+    // A text field: a #00000020 fill; its outline #00000040 at rest, #ffffff20 under the
+    // pointer and with focus.
     mod.widgets.FabInput = TextInput{
         height: theme.prop_row_height
         min_height: 0
@@ -818,8 +959,18 @@ script_mod! {
         margin: Inset{top: 0 bottom: 0 left: 0 right: 0}
         empty_text: ""
         draw_bg +: {
-            color: fab.color_input
-            border_radius: fab.radius
+            color: theme.prop_field
+            color_hover: uniform(theme.prop_field_hover)
+            color_focus: uniform(theme.prop_field_hover)
+            color_down: uniform(theme.prop_field_hover)
+            color_empty: uniform(theme.prop_field)
+            color_2: uniform(vec4(-1.0, -1.0, -1.0, -1.0))
+            border_radius: theme.prop_radius
+            border_color: uniform(#x00000000)
+            border_color_hover: uniform(#xffffff20)
+            border_color_focus: uniform(#xffffff20)
+            border_color_down: uniform(#xffffff20)
+            border_color_empty: uniform(#x00000000)
         }
         draw_text +: {
             ink_centered: true
@@ -835,51 +986,119 @@ script_mod! {
     // shares its top and bottom. The input is the library's WellInput: the
     // chrome-less input a well holds, which no desktop sheet gives a field height of its own (a
     // TextInput takes the sheet's, and stood taller than the well with its line centred low).
-    mod.widgets.FabSearch = View{
+    // A section's row as the Part editor's are: its name (`name`) right-aligned in the label column
+    // every editor's rows share (`param_panel::LABEL_W`), in the body ink, then its fields (the
+    // row's other children). The Job and Slice editors' rows.
+    mod.widgets.FabFieldRow = View{
         width: Fill
         height: theme.prop_row_height
-        flow: Overlay
-        bg := View{
-            width: Fill
-            height: Fill
-            show_bg: true
-            draw_bg +: {
-                pixel: fn() {
-                    let sdf = Sdf2d.viewport(self.pos * self.rect_size)
-                    // a FabButton's face: its box, kept its border_size back from the rect
-                    sdf.box(1.0, 1.0, self.rect_size.x - 2.0, self.rect_size.y - 2.0, fab.radius)
-                    sdf.fill(fab.color_border)
-                    // the well, inside a one-point border
-                    sdf.box(2.0, 2.0, self.rect_size.x - 4.0, self.rect_size.y - 4.0, max(fab.radius - 1.0, 0.0))
-                    sdf.fill(fab.color_input)
-                    return sdf.result
-                }
+        flow: Right
+        align: Align{x: 0.0 y: 0.5}
+        spacing: theme.prop_label_gap
+        // (a property row's label: fit to its words, centred by their ink)
+        name := Label{
+            width: Fill{weight: 0 basis: "42%" max: #(crate::ui::param_panel::LABEL_W)}
+            height: Fit padding: Inset{} align: Align{x: 1.0 y: 0.5}
+            text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis
+            draw_text +: {
+                ink_centered: true
+                color: fab.color_text
+                text_style: theme.font_regular{font_size: theme.prop_font_size line_spacing: 1.0}
             }
         }
+    }
+
+    // A toolbar's vertical rule, between groups of its tools (a light line: the theme's separator
+    // inks sit on the panel's own value). A View's quad paints nothing of itself, so the rule says
+    // how.
+    mod.widgets.FabVRule = View{width: 1 height: 20 show_bg: true draw_bg +: {
+        color: uniform(#xffffff1a)
+        pixel: fn() { return vec4(self.color.xyz * self.color.w, self.color.w) }
+    }}
+
+    // A panel editor's toolbar: the row across its top whose left end is its area's editor
+    // selector (the notch layer draws that chip there: `area_notch::TOOLBAR_SLOT`), then the
+    // editor's own tools (its toggles and actions), its search always last. Every panel editor
+    // starts with one, so the tab bar above holds only the area's tabs.
+    // A row of tools that scrolls sideways once it is wider than its room: a drag (from a button
+    // too) or the mouse wheel moves it, with no bar drawn. `mask` covers its side padding with
+    // the editor ground, so tools scrolled under the area's selector or close button go under.
+    mod.widgets.FabToolScrollBase = #(FabToolScroll::register_widget(vm))
+    mod.widgets.FabToolScroll = set_type_default() do mod.widgets.FabToolScrollBase{
+        width: Fill height: Fit flow: Right
+        scroll_bars: mod.widgets.ScrollBars{
+            show_scroll_x: true show_scroll_y: false
+            scroll_bar_x.drag_scrolling: true
+            scroll_bar_x.use_vertical_finger_scroll: true
+            scroll_bar_x.show_handle: false
+        }
+        draw_mask +: {
+            color: uniform(fab.color_toolbar)
+            pixel: fn() { return vec4(self.color.xyz * self.color.w, self.color.w) }
+        }
+    }
+
+    mod.widgets.FabEditorBar = mod.widgets.FabToolScroll{
+        mask: true
+        width: Fill height: #(crate::ui::area_notch::TOOLBAR_H)
+        flow: Right align: Align{y: 0.5} spacing: 6
+        // its ground (a shade above the panel's) and a subtle line along its foot, a whole point
+        // on device pixels
+        show_bg: true
+        draw_bg +: {
+            color: uniform(fab.color_toolbar)
+            line: uniform(0.15)
+            pixel: fn() {
+                let foot = step(self.rect_size.y - 1.0, self.pos.y * self.rect_size.y) * self.line
+                let g = self.color
+                return vec4(g.xyz * g.w * (1.0 - foot), g.w + foot * (1.0 - g.w))
+            }
+        }
+        // (the right end is the tab's close button's, drawn by the notch layer)
+        padding: Inset{left: #(crate::ui::area_notch::TOOLBAR_SLOT) right: #(crate::ui::area_notch::TOOLBAR_END)}
+        // a rule after the selector: what follows is this editor's own
+        rule := mod.widgets.FabVRule{}
+    }
+
+    // A search field (a toolbar's): at rest only its magnifier, a button at the toolbar's right
+    // end; pressed, it opens leftward into the field (`FabSearch`). The input is the box (a
+    // #00000020 fill; its outline #00000040 at rest, #ffffff20 under the pointer and with
+    // focus), the magnifier over its left end; a toolbar's field's height (28: room above and
+    // below the words), wherever it is.
+    mod.widgets.FabSearchBase = #(FabSearch::register_widget(vm))
+    mod.widgets.FabSearch = set_type_default() do mod.widgets.FabSearchBase{
+        width: Fill
+        height: 28
+        flow: Overlay
         row := View{
             width: Fill
             height: Fill
-            flow: Right
+            flow: Overlay
             align: Align{x: 0.0 y: 0.5}
-            padding: Inset{left: 6 right: 4 top: 0 bottom: 0}
-            spacing: 4
-            glyph_slot := View{
-                width: fab.icon_size_sm
-                height: Fill
-                align: Align{x: 0.5 y: 0.5}
-                glyph := mod.widgets.FabIconMuted{
-                    width: fab.icon_size_sm
-                    height: fab.icon_size_sm
-                    icon_walk: Walk{ width: fab.icon_size_sm height: fab.icon_size_sm }
-                    draw_icon +: {
-                        svg: crate_resource("self://resources/icons/search.svg")
-                    }
-                }
-            }
-            input := mod.widgets.WellInput{
+            input := TextInput{
                 width: Fill
                 height: Fill
+                min_height: 0
+                margin: 0.0
+                // the words start past the magnifier
+                padding: Inset{left: 10 + 16 right: 6 top: 0 bottom: 0}
                 empty_text: "Search"
+                draw_bg +: {
+                    border_radius: theme.prop_radius
+                    border_size: 1.0
+                    color: theme.prop_field
+                    color_hover: uniform(theme.prop_field_hover)
+                    color_focus: uniform(theme.prop_field_hover)
+                    color_down: uniform(theme.prop_field_hover)
+                    color_empty: uniform(theme.prop_field)
+                    color_2: uniform(vec4(-1.0, -1.0, -1.0, -1.0))
+                    border_color: uniform(#x00000000)
+                    border_color_hover: uniform(#xffffff20)
+                    border_color_focus: uniform(#xffffff20)
+                    border_color_down: uniform(#xffffff20)
+                    border_color_empty: uniform(#x00000000)
+                    border_color_2: uniform(vec4(-1.0, -1.0, -1.0, -1.0))
+                }
                 draw_text +: {
                     ink_centered: true
                     color: fab.color_text
@@ -888,6 +1107,21 @@ script_mod! {
                     color_empty_focus: fab.color_text_dim
                     text_style: theme.font_regular{
                         font_size: fab.font_size_ui
+                    }
+                }
+            }
+            // the magnifier, as big as the toolbars' icons, centred in the search at rest (28)
+            glyph_slot := View{
+                width: Fit
+                height: Fill
+                padding: Inset{left: 6}
+                align: Align{x: 0.0 y: 0.5}
+                glyph := mod.widgets.FabIconMuted{
+                    width: 16
+                    height: 16
+                    icon_walk: Walk{ width: 16 height: 16 }
+                    draw_icon +: {
+                        svg: crate_resource("self://resources/icons/search.svg")
                     }
                 }
             }
@@ -1007,6 +1241,94 @@ script_mod! {
         }
     }
 
+    // The input rows' names ("Position", "Layer height", a feature's "Width") in the body ink: a
+    // parameter's name is what the row is, not a caption to it. Defined again here, after the
+    // shared sheet and before every panel, so all of the app's rows take it.
+    mod.widgets.PropRow = mod.widgets.PropRow{ label +: { draw_text +: { color: fab.color_text } } }
+    mod.widgets.PropNumberRow = mod.widgets.PropNumberRow{ label +: { draw_text +: { color: fab.color_text } } }
+    mod.widgets.PropDropDownRow = mod.widgets.PropDropDownRow{ label +: { draw_text +: { color: fab.color_text } } }
+    mod.widgets.PropSegmentedRow = mod.widgets.PropSegmentedRow{ label +: { draw_text +: { color: fab.color_text } } }
+    // A section has no plate: its header alone carries a shade under the panel
+    // (`fab.color_section`), square, no line, and answers the pointer with its title, not a lit
+    // box (lit by `section_headers`). The bar is inset as the rows are (`prop_pad` each side), so
+    // it spans the labels to the fields' end, its chevron a gap in from its start (a nested
+    // section's bar starts further in: `param_panel`'s Group). Its title is bold, so the sections
+    // read apart from their rows; its rows have room above and below; twice the theme's gap below
+    // each.
+    // A number field's (a slider's) fill: a faint white over its well (#ffffff10), brighter under the
+    // pointer and brighter still while pressed or dragged. Fab's own fields and the property
+    // kit's number rows (`PropNumberRow`'s field, made before Fab) alike.
+    mod.widgets.ValueInput = mod.widgets.ValueInput{
+        // the room at each end for the hover chevrons (5 pt in, 4 pt wide): an axis label or a
+        // value starts just past them, not the library's wider 14 pt in
+        arrow_zone: 10.0
+        // the name inside the field (a number's, an axis's): at its left in the first voice, the
+        // value at its right in the second; a value that is not the field's own (mixed,
+        // inherited, read-only) quieter still
+        draw_label +: {color: fab.color_text text_style: theme.font_regular{font_size: theme.prop_font_size line_spacing: 1.0}}
+        labelled_value_color: fab.color_text_dim
+        muted_color: fab.color_text_muted
+        draw_bg +: {
+            fill_color: uniform(#xffffff10)
+            fill_color_hover: uniform(#xffffff28)
+            fill_color_drag: uniform(#xffffff40)
+            outline_color: uniform(#xffffff20)
+            pixel: fn() {
+                let sdf = Sdf2d.viewport_px(self.pos * self.rect_size, self.draw_pass.dpi_factor)
+                let w = self.rect_size.x
+                let h = self.rect_size.y
+                let hairline = 1.0 / self.draw_pass.dpi_factor
+                let inset = hairline * 0.5
+                let top = self.radius * self.round_top
+                let bottom = self.radius * self.round_bottom
+                let base = self.color.mix(self.color_hover, self.hover).mix(self.color_drag, self.drag)
+                sdf.box_y(inset, inset, w - hairline, h - hairline, top, bottom)
+                let reveal = mix(1.0, max(self.hover, max(self.drag, self.focus)), self.flat)
+                sdf.fill_keep(vec4(base.rgb, base.a * reveal))
+                if self.fill >= 0.0 {
+                    // The fill's edge on a device pixel: a crisp line at any scale, never a soft column.
+                    let fill_x = floor((1.0 + (w - 2.0) * self.fill) * self.draw_pass.dpi_factor + 0.5) / self.draw_pass.dpi_factor
+                    let ink = self.fill_color.mix(self.fill_color_hover, self.hover).mix(self.fill_color_drag, self.drag)
+                    let wash = vec4(ink.xyz, ink.w * step(self.pos.x * w, fill_x))
+                    sdf.fill_keep(wash)
+                }
+                sdf.fill_keep(vec4(self.color_marked.rgb, self.color_marked.a * self.marked * 0.18))
+                // the outline every field shows under the pointer and while focused (a text
+                // field's too: `FabInput`); SDF strokes take a half-width
+                if max(self.hover, self.focus) > 0.5 {
+                    sdf.stroke_keep(self.outline_color, hairline * 0.5)
+                }
+                if self.invalid > 0.0 {
+                    sdf.stroke(vec4(self.color_invalid.rgb, self.color_invalid.a * self.invalid), 1.5)
+                }
+                return sdf.result
+            }
+        }
+    }
+    mod.widgets.PropNumberRow = mod.widgets.PropNumberRow{
+        value +: {
+            num := mod.widgets.ValueInput{width: Fill height: Fill min_height: 0}
+        }
+    }
+
+    mod.widgets.PropSection = mod.widgets.PropSection{
+        margin: Inset{bottom: theme.prop_section_gap * 2.0}
+        // a grip at the header's right end: a drag on it moves the section among its editor's
+        // others (`section_reorder`); a section whose place is fixed turns it off
+        grip: true
+        draw_bg +: {color: #x00000000}
+        // room above and below the rows, so they stand clear of the bars
+        body +: {padding: Inset{top: 6 bottom: 8 left: theme.prop_pad right: theme.prop_pad}}
+        header +: {hdr +: {
+            margin: Inset{left: theme.prop_pad right: theme.prop_pad}
+            padding: Inset{left: theme.prop_label_gap right: theme.prop_pad}
+            draw_bg +: {color: fab.color_section color_hover: fab.color_section radius: 0.0}
+            title +: {draw_text +: {text_style: theme.font_bold{font_size: theme.prop_font_size}}}
+            grip +: {cursor: MouseCursor.Move}
+        }}
+    }
+    mod.widgets.PropCheckRow = mod.widgets.PropCheckRow{ label +: { draw_text +: { color: fab.color_text } } }
+
     // Fab's number rows: their fields carry units, so a field keeps room for `-360.0 mm`
     // between its arrow zones before its row puts it under the label.
     mod.widgets.FabNumberRow = mod.widgets.PropNumberRow{value_min: 84}
@@ -1119,13 +1441,40 @@ script_mod! {
     }
 
     // The scroll body every editor uses.
-    mod.widgets.FabScroll = ScrollYView{
+    // A panel's scrolling body. Scrolled down, a shadow comes up along its top edge (under the
+    // editor's toolbar), so the toolbar reads as above the content passing under it; at the top
+    // there is none. It ramps in over the first stretch scrolled (`fade_ramp`) rather than
+    // switching on. The same shade as a list's (`draw_scroll_shade`).
+    mod.widgets.FabScroll = ScrollShadowView{
         width: Fill
         height: Fill
         flow: Down
-        scroll_bars +: {
+        // a baseline gap under the editor's toolbar, so its first row never touches it (a body
+        // that sets its own padding keeps at least this at its top)
+        padding: Inset{top: #(PANEL_TOP)}
+        fade_size: #(SCROLL_SHADE_H)
+        fade_ramp: #(SCROLL_SHADE_RAMP)
+        fade_top: true
+        fade_bottom: false
+        fade_left: false
+        fade_right: false
+        bars: mod.widgets.ScrollBars{
             show_scroll_x: false
             show_scroll_y: true
+            scroll_bar_y.drag_scrolling: true
+            // a mouse drag that starts on a control (a section's header: its fold drag) is that
+            // control's, never a scroll; the wheel, the bar and a touch still scroll
+            scroll_bar_y.mouse_drags_from_widgets: false
+        }
+        draw_fade +: {color: uniform(fab.color_scroll_shade) falloff: uniform(1.6)}
+    }
+
+    // A list's shadow along its top edge, scrolled down (`draw_scroll_shade`): FabScroll's look.
+    mod.draw.FabScrollShade = mod.draw.DrawQuad{
+        weight: instance(0.0)
+        pixel: fn() {
+            let a = pow(clamp(1.0 - self.pos.y, 0.0, 1.0), 1.6) * self.weight * fab.color_scroll_shade.w
+            return vec4(fab.color_scroll_shade.xyz * a, a)
         }
     }
 }
@@ -1174,4 +1523,724 @@ pub(crate) fn section_rows(cx: &mut Cx, section: &WidgetRef, rows: Vec<(LiveId, 
         view.redraw(cx);
     }
     cx.widget_tree_mark_dirty(uid);
+}
+
+/// The section titles lit now (their widgets' uids), and a fold drag under way: one shared state,
+/// so each panel lights and folds only its own headers, a drag runs on across panels (Transform
+/// into the parameter groups), and nothing needs a field of its own.
+#[derive(Default)]
+struct Headers {
+    lit: Vec<WidgetUid>,
+    drag: Option<FoldDrag>,
+    /// A section held by its grip, moving with the pointer, or settling into its place.
+    moving: Option<SectionMove>,
+}
+
+/// How wide the press zone at a header's right end is that holds the section (its grip and the
+/// room around it): a grip alone is too small a target.
+const GRIP_ZONE: f64 = 28.0;
+
+/// A section moving: held by its grip it follows the pointer, drawn last so it lies over the
+/// others, while they slide (animated) to open the place it would land in; released, it settles
+/// into that place and the editor keeps the order (`SectionOrder`). The stack's layout never
+/// changes while it moves: each section's offset is its slot's top margin, given back by its
+/// bottom margin, so nothing after it moves with it.
+struct SectionMove {
+    key: LiveId,
+    id: LiveId,
+    /// The pointer's height below the held section's top at the press, and the pointer now.
+    grab: f64,
+    pointer: f64,
+    /// The room the held section takes (its top to the next one's).
+    room: f64,
+    /// The others in order: where each sits with the held one out of the stack (its top), and
+    /// its room.
+    others: Vec<(LiveId, f64, f64)>,
+    /// Where the stack lays the held section out while it is held (last).
+    natural: f64,
+    /// How high and how low its top may go: within its stack (a subsection never leaves the
+    /// section it is in), from the first one's top to the last place's.
+    lo: f64,
+    hi: f64,
+    /// Where it would land: how many of the others go before it.
+    slot: usize,
+    /// The others' offsets: now, and where each is going.
+    offsets: std::collections::HashMap<LiveId, (f64, f64)>,
+    /// Released: the held section's own offset as it settles (to 0); the move ends at rest.
+    settle: Option<f64>,
+    frame: NextFrame,
+    last: Option<f64>,
+    /// What to redraw as it moves (the editor).
+    redraw: Area,
+}
+
+impl SectionMove {
+    /// The held section's top as the pointer holds it, kept within its stack.
+    fn held_top(&self) -> f64 {
+        (self.pointer - self.grab).clamp(self.lo, self.hi.max(self.lo))
+    }
+}
+
+/// Each editor's order of its sections, as the person dragged them (by the editor's key; the
+/// section ids in order). An editor shows its sections in this order, any it does not name after
+/// in their own order. For this run of the app.
+#[derive(Default)]
+struct SectionOrder(std::collections::HashMap<LiveId, Vec<LiveId>>);
+
+/// Where `id` stands in editor `key`'s order (`usize::MAX` when it was never moved), for an
+/// editor that lays its sections out itself to sort them by.
+pub(crate) fn section_rank(cx: &mut Cx, key: LiveId, id: LiveId) -> usize {
+    cx.global::<SectionOrder>().0.get(&key).and_then(|order| order.iter().position(|o| *o == id)).unwrap_or(usize::MAX)
+}
+
+/// The section of editor `key` held by its grip now (not one settling), to draw last.
+pub(crate) fn held_section(cx: &mut Cx, key: LiveId) -> Option<LiveId> {
+    cx.global::<Headers>().moving.as_ref().filter(|m| m.key == key && m.settle.is_none()).map(|m| m.id)
+}
+
+/// The offset section `id` of editor `key` is drawn at this frame (its slot's top margin; its
+/// bottom margin gives it back): 0 unless a section is moving.
+pub(crate) fn section_offset(cx: &mut Cx, key: LiveId, id: LiveId) -> f64 {
+    let Some(m) = cx.global::<Headers>().moving.as_ref().filter(|m| m.key == key) else { return 0.0 };
+    if m.id == id {
+        return m.settle.unwrap_or(m.held_top() - m.natural);
+    }
+    m.offsets.get(&id).map_or(0.0, |(now, _)| *now)
+}
+
+/// Lay out `container`'s sections (its children named in editor `key`'s order) in that order, the
+/// held one last, each at its offset (`section_offset`, as its slot's margins: the slots are
+/// plain boxes round the sections). Call before the editor draws. O(children).
+pub(crate) fn apply_section_order(cx: &mut Cx, key: LiveId, container: &WidgetRef) {
+    let order = cx.global::<SectionOrder>().0.get(&key).cloned();
+    let held = held_section(cx, key);
+    let ids: Vec<LiveId> = with_children(container, |children| {
+        if let Some(order) = &order {
+            let slots: Vec<usize> = (0..children.len()).filter(|i| order.contains(&children[*i].0)).collect();
+            let mut placed: Vec<(LiveId, WidgetRef)> = slots.iter().map(|i| children[*i].clone()).collect();
+            placed.sort_by_key(|(id, _)| order.iter().position(|o| o == id).unwrap_or(usize::MAX));
+            for (i, child) in slots.iter().zip(placed) {
+                children[*i] = child;
+            }
+        }
+        // the held section last: drawn over the others
+        if let Some(held) = held {
+            if let Some(i) = children.iter().position(|(id, _)| *id == held) {
+                let child = children.remove(i);
+                children.push(child);
+            }
+        }
+        children.iter().map(|(id, _)| *id).collect()
+    })
+    .unwrap_or_default();
+    for id in ids {
+        let offset = section_offset(cx, key, id);
+        let slot = container.widget(cx, &[id]);
+        if let Some(mut view) = slot.borrow_mut::<View>() {
+            if view.walk.margin.top != offset {
+                view.walk.margin.top = offset;
+                view.walk.margin.bottom = -offset;
+            }
+        };
+    }
+}
+
+/// A box's children, a plain one's or a scrolling one's (`FabScroll`).
+fn with_children<R>(w: &WidgetRef, f: impl FnOnce(&mut SmallVec<[(LiveId, WidgetRef); 2]>) -> R) -> Option<R> {
+    if let Some(mut view) = w.borrow_mut::<View>() {
+        return Some(f(&mut view.children));
+    }
+    if let Some(mut view) = w.borrow_mut::<ScrollShadowView>() {
+        return Some(f(&mut view.children));
+    }
+    None
+}
+
+/// The grips of editor `key`'s `sections` (each its id, the section, and the slot it is laid out
+/// in: a plain box round it, or the section itself where the editor draws them): a press at a
+/// header's right end (`GRIP_ZONE`) holds its section, which follows the pointer while the others
+/// slide aside (`SectionMove`). Call from the editor's `handle_event` with every event (its
+/// animation runs on its frames), before `section_headers` and before the sections get it: the
+/// press is the grip's, so its header neither folds nor starts a fold drag. `redraw` is the
+/// editor's area. O(sections) per event.
+pub(crate) fn section_reorder(cx: &mut Cx, event: &Event, key: LiveId, sections: &[(LiveId, WidgetRef, WidgetRef)], redraw: Area) {
+    match event {
+        Event::MouseDown(e) if e.button.is_primary() && cx.global::<Headers>().moving.is_none() => {
+            // the sections shown, top to bottom, and which one's grip the press is on
+            let mut shown: Vec<(LiveId, Rect, Option<Area>)> = Vec::new();
+            for (id, section, slot) in sections {
+                if !section.visible() { continue; }
+                let hdr = section.as_prop_section().header().widget(cx, ids!(hdr)).area();
+                let rect = slot.area().rect(cx);
+                if !hdr.is_valid(cx) || rect.size.y <= 0.0 { continue; }
+                let h = hdr.rect(cx);
+                let zone = Rect { pos: dvec2(h.pos.x + h.size.x - GRIP_ZONE, h.pos.y), size: dvec2(GRIP_ZONE, h.size.y) };
+                let on = section.as_prop_section().header().widget(cx, ids!(hdr.grip)).visible() && zone.contains(e.abs);
+                shown.push((*id, rect, on.then_some(hdr)));
+            }
+            shown.sort_by(|a, b| a.1.pos.y.total_cmp(&b.1.pos.y));
+            let Some(k) = shown.iter().position(|s| s.2.is_some()) else { return };
+            if let Some(hdr) = shown[k].2 {
+                e.handled.set(hdr);
+            }
+            // each one's room: its top to the next one's (the last, its height and the gap)
+            let gap = if shown.len() >= 2 { (shown[1].1.pos.y - shown[0].1.pos.y - shown[0].1.size.y).max(0.0) } else { 0.0 };
+            let rooms: Vec<f64> = (0..shown.len())
+                .map(|i| if i + 1 < shown.len() { shown[i + 1].1.pos.y - shown[i].1.pos.y } else { shown[i].1.size.y + gap })
+                .collect();
+            let room = rooms[k];
+            let top = shown[k].1.pos.y;
+            let bottom = shown.last().map_or(top + room, |s| s.1.pos.y) + rooms[shown.len() - 1];
+            let mut others = Vec::new();
+            let mut offsets = std::collections::HashMap::new();
+            for (i, (id, rect, _)) in shown.iter().enumerate() {
+                if i == k { continue; }
+                // out of the stack, the held one leaves a gap the ones after it close (their
+                // offset holds them where they were until it moves)
+                let after = i > k;
+                others.push((*id, rect.pos.y - if after { room } else { 0.0 }, rooms[i]));
+                let at = if after { room } else { 0.0 };
+                offsets.insert(*id, (at, at));
+            }
+            cx.global::<Headers>().moving = Some(SectionMove {
+                key, id: shown[k].0, grab: e.abs.y - top, pointer: e.abs.y, room, others,
+                natural: bottom - room, lo: shown[0].1.pos.y, hi: bottom - room, slot: k, offsets, settle: None,
+                frame: cx.new_next_frame(), last: None, redraw,
+            });
+            cx.redraw_area(redraw);
+        }
+        Event::MouseMove(e) => {
+            let Some(m) = cx.global::<Headers>().moving.as_mut().filter(|m| m.key == key && m.settle.is_none()) else { return };
+            m.pointer = e.abs.y;
+            // it lands where its middle is among the others' middles
+            let middle = m.held_top() + m.room * 0.5;
+            let slot = m.others.iter().filter(|(_, top, room)| top + room * 0.5 < middle).count();
+            if slot != m.slot {
+                m.slot = slot;
+                for (j, (id, _, _)) in m.others.iter().enumerate() {
+                    if let Some(o) = m.offsets.get_mut(id) {
+                        o.1 = if j >= slot { m.room } else { 0.0 };
+                    }
+                }
+            }
+            let (redraw, frame) = (m.redraw, m.frame);
+            let _ = frame;
+            cx.set_cursor(MouseCursor::Move);
+            let next = cx.new_next_frame();
+            if let Some(m) = cx.global::<Headers>().moving.as_mut() { m.frame = next; }
+            cx.redraw_area(redraw);
+        }
+        Event::MouseUp(_) => {
+            let Some(m) = cx.global::<Headers>().moving.as_mut().filter(|m| m.key == key && m.settle.is_none()) else { return };
+            // the order kept: the others, the held one at its place
+            let mut order: Vec<LiveId> = m.others.iter().map(|(id, _, _)| *id).collect();
+            order.insert(m.slot.min(order.len()), m.id);
+            // laid out in its place now: it settles there from where it was dropped, and the
+            // ones after it, laid out a room lower, settle from where they were drawn
+            let place = m.others.get(m.slot).map_or(m.natural, |(_, top, _)| *top);
+            m.settle = Some(m.held_top() - place);
+            for (j, (id, _, _)) in m.others.iter().enumerate() {
+                if let Some(o) = m.offsets.get_mut(id) {
+                    if j >= m.slot { o.0 -= m.room; }
+                    o.1 = 0.0;
+                }
+            }
+            let redraw = m.redraw;
+            let next = cx.new_next_frame();
+            if let Some(m) = cx.global::<Headers>().moving.as_mut() { m.frame = next; }
+            cx.global::<SectionOrder>().0.insert(key, order);
+            cx.redraw_area(redraw);
+        }
+        Event::NextFrame(ne) => {
+            let Some(m) = cx.global::<Headers>().moving.as_mut().filter(|m| m.key == key && ne.set.contains(&m.frame)) else { return };
+            let dt = m.last.map_or(1.0 / 60.0, |t| (ne.time - t).clamp(0.0, 0.05));
+            m.last = Some(ne.time);
+            // eased toward where each is going (about 80 ms to all but there)
+            let k = 1.0 - (-dt / 0.035).exp();
+            let mut moving = false;
+            for (now, to) in m.offsets.values_mut() {
+                *now += (*to - *now) * k;
+                if (*to - *now).abs() < 0.5 { *now = *to; } else { moving = true; }
+            }
+            if let Some(s) = &mut m.settle {
+                *s -= *s * k;
+                if s.abs() < 0.5 { *s = 0.0; } else { moving = true; }
+            }
+            let redraw = m.redraw;
+            let done = m.settle.is_some() && !moving;
+            if done {
+                cx.global::<Headers>().moving = None;
+            } else if moving || m.settle.is_none() {
+                let next = cx.new_next_frame();
+                if let Some(m) = cx.global::<Headers>().moving.as_mut() { m.frame = next; }
+            }
+            cx.redraw_area(redraw);
+        }
+        _ => {}
+    }
+}
+
+/// A press on a section's header, dragged on: every header the pointer then reaches takes the
+/// state the pressed one went to (`open`), once per header per drag, and so does every header
+/// between it and the one set last (`last`), in their order on screen. Folding moves what is below
+/// up (and a scrolled panel back down) between two moves, so a header can pass the pointer without
+/// ever being under it; the order catches it. Only the state is kept, not the pressed section: it
+/// can hold the panel handling the move (Parameters holds its groups), and is busy then.
+struct FoldDrag {
+    open: bool,
+    done: Vec<WidgetUid>,
+    last: WidgetUid,
+}
+
+/// The section headers' pointer behaviour beyond a click, for the PropSections in `sections`
+/// (call from the panel's `handle_event` with every event, before the sections get it: a press
+/// reads the state the section will leave):
+/// - the header under the pointer lights its title in the hover ink (no lit ground);
+/// - a press on a header dragged over others folds or unfolds them all with that one gesture.
+/// O(sections log sections) per mouse event; other events return at once.
+pub(crate) fn section_headers<'a>(cx: &mut Cx, event: &Event, sections: impl IntoIterator<Item = &'a WidgetRef>) {
+    let at = match event {
+        Event::MouseMove(e) => Some(e.abs),
+        Event::MouseDown(e) if e.button.is_primary() => Some(e.abs),
+        Event::MouseUp(_) => {
+            cx.global::<Headers>().drag = None;
+            return;
+        }
+        Event::MouseLeave(_) | Event::ClearHover => None,
+        _ => return,
+    };
+    // the headers shown, in their order down the panel
+    let all: Vec<WidgetRef> = sections.into_iter().cloned().collect();
+    let mut heads: Vec<(WidgetRef, Rect)> = all
+        .iter()
+        .filter_map(|section| {
+            let area = section.as_prop_section().header().widget(cx, ids!(hdr)).area();
+            area.is_valid(cx).then(|| (section.clone(), area.rect(cx)))
+        })
+        .collect();
+    heads.sort_by(|a, b| a.1.pos.y.total_cmp(&b.1.pos.y));
+    let under = at.and_then(|p| heads.iter().position(|(_, r)| r.contains(p)));
+    match (event, under) {
+        // a press starts a drag from this header: the section toggles itself on the press, after
+        // this, so the drag's state is the one it is leaving, turned
+        (Event::MouseDown(e), Some(h)) if e.handled.get().is_empty() => {
+            let (section, _) = &heads[h];
+            let open = !section.as_prop_section().is_open(cx);
+            let uid = section.widget_uid();
+            cx.global::<Headers>().drag = Some(FoldDrag { open, done: vec![uid], last: uid });
+        }
+        // dragged onto a header: it and every header between it and the last one set take the
+        // drag's state (the last one may be another panel's: then this one alone)
+        (Event::MouseMove(_), Some(h)) => {
+            if let Some(drag) = &cx.global::<Headers>().drag {
+                let (open, last) = (drag.open, drag.last);
+                let from = heads.iter().position(|(s, _)| s.widget_uid() == last).unwrap_or(h);
+                for i in from.min(h)..=from.max(h) {
+                    let (section, _) = &heads[i];
+                    let uid = section.widget_uid();
+                    let Some(drag) = &mut cx.global::<Headers>().drag else { break };
+                    if drag.done.contains(&uid) { continue; }
+                    drag.done.push(uid);
+                    if section.as_prop_section().is_open(cx) != open {
+                        section.as_prop_section().set_is_open(cx, open, Animate::Yes);
+                        cx.widget_action(uid, if open { FoldHeaderAction::Opening } else { FoldHeaderAction::Closing });
+                    }
+                }
+                if let Some(drag) = &mut cx.global::<Headers>().drag { drag.last = heads[h].0.widget_uid(); }
+            }
+        }
+        _ => {}
+    }
+    // the title under the pointer lit, the others put back (a hidden one too)
+    let hot = under.map(|h| heads[h].0.widget_uid());
+    for section in &all {
+        let want = hot == Some(section.widget_uid());
+        let mut title = section.as_prop_section().header().widget(cx, ids!(hdr.title));
+        let uid = title.widget_uid();
+        let lit = cx.global::<Headers>().lit.contains(&uid);
+        if want == lit { continue; }
+        let lit = &mut cx.global::<Headers>().lit;
+        if want { lit.push(uid); } else { lit.retain(|u| *u != uid); }
+        script_apply_eval!(cx, title, {draw_text +: {color: if #(want) {mod.theme.color_text_hover} else {mod.theme.color_text}}});
+        title.redraw(cx);
+    }
+}
+
+/// The gap at the top of an editor's body, under its toolbar ([`FabScroll`]'s and every body's).
+pub const PANEL_TOP: f64 = 8.0;
+
+/// The shadow under an editor's toolbar while its content is scrolled down: how deep it is, and
+/// how far the content must be scrolled for it to reach full strength.
+pub(crate) const SCROLL_SHADE_H: f64 = 10.0;
+pub(crate) const SCROLL_SHADE_RAMP: f64 = 24.0;
+
+/// A list's shadow along the top of `rect` (a `PortalList`'s), `scrolled` points down it (its
+/// first row's index and offset: past the first row is all the way): the shade `FabScroll` draws
+/// for a scrolled body, none at the top. Call after the list draws, so it lies over the rows.
+pub(crate) fn draw_scroll_shade(cx: &mut Cx2d, draw: &mut DrawQuad, rect: Rect, first_id: usize, first_scroll: f64) {
+    let scrolled = if first_id > 0 { SCROLL_SHADE_RAMP } else { (-first_scroll).max(0.0) };
+    let weight = (scrolled / SCROLL_SHADE_RAMP).clamp(0.0, 1.0) as f32;
+    if weight <= 0.0 || rect.size.x <= 0.0 {
+        return;
+    }
+    draw.set_dyn_instance(cx, live_id!(weight), &[weight]);
+    draw.draw_abs(cx, Rect { pos: rect.pos, size: dvec2(rect.size.x, SCROLL_SHADE_H) });
+}
+
+/// What each editor's filter hid (by the editor's key), to show again when it no longer matches
+/// out: only what the filter hid comes back, never what the editor hid itself.
+#[derive(Default)]
+struct Filtered(std::collections::HashMap<LiveId, Vec<WidgetRef>>);
+
+/// Filter editor `key`'s `sections` by `query` (its toolbar's search): a section whose title
+/// holds every word shows whole; else each row (a box with a `label` or `name` label) shows only
+/// when its name holds every word, a parameter panel filters its own drawn rows
+/// ([`crate::ui::param_panel::FabParamPanel::set_filter`]), and a section (or a group in it) with
+/// no row left hides. An
+/// empty query shows all it hid. Call in the editor's `draw_walk` after it set its own
+/// visibilities. Visibility is touched only where it changes. O(widgets in the sections).
+pub(crate) fn filter_sections(cx: &mut Cx, key: LiveId, query: &str, sections: &[WidgetRef]) {
+    let words: Vec<String> = query.split_whitespace().map(|w| w.to_lowercase()).collect();
+    let before = cx.global::<Filtered>().0.remove(&key).unwrap_or_default();
+    let was = |w: &WidgetRef| before.iter().any(|b| b.widget_uid() == w.widget_uid());
+    let mut hide: Vec<WidgetRef> = Vec::new();
+    // (also with no words: a panel that filters its own rows hears the search was cleared)
+    for section in sections {
+        filter_tree(cx, section, &words, false, &was, &mut hide);
+    }
+    let now = |w: &WidgetRef| hide.iter().any(|h| h.widget_uid() == w.widget_uid());
+    for w in &before {
+        if !now(w) && !w.visible() {
+            w.set_visible(cx, true);
+        }
+    }
+    for w in &hide {
+        if w.visible() {
+            w.set_visible(cx, false);
+        }
+    }
+    cx.global::<Filtered>().0.insert(key, hide);
+}
+
+/// Whether anything under `w` matches `words` (every one), marking what to hide in `hide`: a
+/// section (a PropSection) by its title, a row by its name; `whole` shows a matched section's
+/// rows. Only what shows (or the filter itself hid, `was`) is marked.
+fn filter_tree(cx: &mut Cx, w: &WidgetRef, words: &[String], whole: bool, was: &dyn Fn(&WidgetRef) -> bool, hide: &mut Vec<WidgetRef>) -> bool {
+    let shown = |w: &WidgetRef| w.visible() || was(w);
+    let holds = |text: &str| { let t = text.to_lowercase(); words.iter().all(|w| t.contains(w.as_str())) };
+    // a parameter panel draws its rows itself: it filters them, and says whether any matched
+    if let Some(mut panel) = w.borrow_mut::<crate::ui::param_panel::FabParamPanel>() {
+        return panel.set_filter(cx, if whole { &[] } else { words }) || whole;
+    }
+    let mut children: Vec<(LiveId, WidgetRef)> = Vec::new();
+    w.children(&mut |id, c| children.push((id, c)));
+    if w.borrow::<PropSection>().is_some() {
+        if !shown(w) { return false; }
+        let title = w.as_prop_section().header().widget(cx, ids!(hdr.title)).text();
+        let whole = whole || holds(&title);
+        let mut any = false;
+        for (_, c) in &children {
+            any |= filter_tree(cx, c, words, whole, was, hide);
+        }
+        if !(any || whole) { hide.push(w.clone()); }
+        return any || whole;
+    }
+    // a row: a box whose name is its `label` or `name` label
+    let name = children.iter().find(|(id, c)| (*id == live_id!(label) || *id == live_id!(name)) && c.borrow::<Label>().is_some()).map(|(_, c)| c.text());
+    if let Some(name) = name {
+        if !shown(w) { return false; }
+        let keep = whole || holds(&name);
+        if !keep { hide.push(w.clone()); }
+        return keep;
+    }
+    let mut any = false;
+    for (_, c) in &children {
+        any |= filter_tree(cx, c, words, whole, was, hide);
+    }
+    any
+}
+
+/// How long a search takes to open or close, in seconds.
+const SEARCH_OPEN_S: f64 = 0.16;
+
+/// A toolbar's search that rests as its magnifier alone and opens into the field when pressed:
+/// it grows leftward from the toolbar's right end (eased), the field taking the keyboard as it
+/// opens; it closes again on a press outside it or when the field lets go of the keyboard,
+/// either empty, or on Escape (which clears it). A search with words in it stays open. Its
+/// field is `row.input`, as before.
+/// A row of tools that scrolls sideways when it is clipped ([`FabToolScroll`] in the script):
+/// the app turns a mouse drag's scrolling off everywhere (a drag selects, folds or moves), and
+/// this row turns it back on for the presses that start in it, so a drag that starts on a
+/// button scrolls the row (a click still clicks). The wheel scrolls it as well.
+#[derive(Script, ScriptHook, Widget)]
+pub struct FabToolScroll {
+    #[deref]
+    view: View,
+    /// Its side padding covered with the editor ground, drawn over what scrolled under it.
+    #[live]
+    mask: bool,
+    #[live]
+    draw_mask: DrawQuad,
+}
+
+impl Widget for FabToolScroll {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        let ours = matches!(event, Event::MouseDown(e) if self.view.area().clipped_rect(cx).contains(e.abs));
+        if ours {
+            cx.set_mouse_drag_scrolling(true);
+        }
+        self.view.handle_event(cx, event, scope);
+        if ours {
+            cx.set_mouse_drag_scrolling(false);
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        while self.view.draw_walk(cx, scope, walk).is_step() {}
+        if self.mask {
+            let rect = self.view.area().rect(cx);
+            let pad = self.view.layout.padding;
+            // (above the foot line, which stays)
+            let h = (rect.size.y - 1.0).max(0.0);
+            self.draw_mask.new_draw_call(cx);
+            for (x, w) in [(rect.pos.x, pad.left), (rect.pos.x + rect.size.x - pad.right, pad.right)] {
+                if w > 0.0 {
+                    self.draw_mask.draw_abs(cx, Rect { pos: dvec2(x, rect.pos.y), size: dvec2(w, h) });
+                }
+            }
+        }
+        DrawStep::done()
+    }
+}
+
+#[derive(Script, Widget)]
+pub struct FabSearch {
+    #[deref]
+    view: View,
+    /// How open it is (0 the magnifier alone, 1 the whole field), and where it is going.
+    #[rust]
+    open: f64,
+    #[rust]
+    to: f64,
+    #[rust]
+    frame: NextFrame,
+    #[rust]
+    last: Option<f64>,
+    #[rust]
+    label_text: String,
+    #[rust]
+    focus_on_draw: bool,
+}
+
+impl ScriptHook for FabSearch {
+    fn on_before_apply(&mut self, _vm: &mut ScriptVm, apply: &Apply, _scope: &mut Scope, _value: ScriptValue) {
+        if apply.is_reload() {
+            self.label_text.clear();
+        }
+    }
+}
+
+impl FabSearch {
+    fn input(&self, cx: &Cx) -> TextInputRef {
+        self.view.text_input(cx, ids!(row.input))
+    }
+
+    fn is_open(&self) -> bool {
+        self.open > 0.0 || self.to > 0.5
+    }
+
+    fn open_search(&mut self, cx: &mut Cx) {
+        self.go(cx, 1.0);
+        let input = self.input(cx);
+        input.set_visible(cx, true);
+        // On the first press the field has never drawn and has no focus area yet.
+        self.focus_on_draw = !input.area().is_valid(cx);
+        if !self.focus_on_draw {
+            input.set_key_focus(cx);
+        }
+        self.view.redraw(cx);
+    }
+
+    fn go(&mut self, cx: &mut Cx, to: f64) {
+        if self.to != to {
+            self.to = to;
+            self.last = None;
+            self.frame = cx.new_next_frame();
+        }
+    }
+}
+
+impl Widget for FabSearch {
+    fn semantics(&self, _cx: &Cx, node: &mut a11y_tree::Node) {
+        use a11y_tree::{Actions, Role, States};
+        makepad_platform::a11y::set_string(&mut node.name, if self.label_text.is_empty() { "Search" } else { &self.label_text });
+        if self.is_open() {
+            node.role = Role::Group;
+            node.states = States::empty();
+            node.actions = Actions::empty();
+        } else {
+            node.role = Role::Button;
+            node.states = States::FOCUSABLE;
+            node.actions = Actions::PRESS | Actions::FOCUS;
+        }
+    }
+
+    fn handle_action(&mut self, cx: &mut Cx, request: &a11y_tree::ActionRequest, _scope: &mut Scope) -> a11y_tree::ActionResult {
+        if !self.is_open() && request.action == a11y_tree::Actions::PRESS {
+            self.open_search(cx);
+            return a11y_tree::ActionResult::Handled;
+        }
+        a11y_tree::ActionResult::Unhandled
+    }
+
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if let Event::NextFrame(ne) = event {
+            if ne.set.contains(&self.frame) {
+                let dt = self.last.map_or(1.0 / 60.0, |t| (ne.time - t).clamp(0.0, 0.05));
+                self.last = Some(ne.time);
+                let step = dt / SEARCH_OPEN_S;
+                self.open = if self.to > self.open { (self.open + step).min(self.to) } else { (self.open - step).max(self.to) };
+                if self.open != self.to {
+                    self.frame = cx.new_next_frame();
+                }
+                self.view.redraw(cx);
+            }
+        }
+        // open, a press anywhere outside it lets its field go of the keyboard (unless what was
+        // pressed took it already) and, the field empty, closes it; with words in it, it stays
+        // open, so a filter in force always shows
+        if let Event::MouseDown(e) = event {
+            let area = self.view.area();
+            if self.to > 0.5 && area.is_valid(cx) && !area.rect(cx).contains(e.abs) {
+                let input = self.input(cx);
+                if cx.has_key_focus(input.area()) {
+                    cx.set_key_focus(Area::Empty);
+                }
+                if input.text().trim().is_empty() {
+                    self.go(cx, 0.0);
+                }
+            }
+        }
+        // at rest, a press anywhere on it opens it and gives its field the keyboard
+        if self.to < 0.5 {
+            match event.hits(cx, self.view.area()) {
+                Hit::FingerHoverIn(_) | Hit::FingerHoverOver(_) => cx.set_cursor(MouseCursor::Hand),
+                Hit::FingerDown(fe) if fe.is_primary_hit() => {
+                    self.open_search(cx);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        self.view.handle_event(cx, event, scope);
+        if let Event::Actions(actions) = event {
+            let input = self.input(cx);
+            if input.escaped(actions) {
+                input.set_text(cx, "");
+                cx.widget_action(input.widget_uid(), TextInputAction::Changed(String::new()));
+                self.go(cx, 0.0);
+            } else if input.key_focus_lost(actions) && input.text().trim().is_empty() {
+                self.go(cx, 0.0);
+            }
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let input = self.input(cx);
+        if self.label_text.is_empty() {
+            if let Some(field) = input.borrow() {
+                let mut node = a11y_tree::Node::default();
+                makepad_widgets_core::semantics::apply_overrides(&*field, None, cx, &mut node);
+                self.label_text = node.name;
+                if self.label_text.is_empty() {
+                    self.label_text.push_str(field.empty_text());
+                }
+            }
+            if self.label_text.is_empty() {
+                self.label_text.push_str("Search");
+            }
+        }
+        // a search with words in it (set from outside, or kept) shows open
+        if self.to < 0.5 && !input.text().is_empty() {
+            self.to = 1.0;
+            self.open = 1.0;
+        }
+        let full = cx.peek_walk_turtle(walk).size.x.max(0.0);
+        // at rest it is square: its height wide
+        let rest = SEARCH_REST.min(full);
+        let eased = 1.0 - (1.0 - self.open).powi(3);
+        let width = rest + (full - rest) * eased;
+        if input.visible() != self.is_open() {
+            input.set_visible(cx, self.is_open());
+        }
+        let mut walk = walk;
+        walk.margin.left += full - width;
+        walk.width = Size::Fixed(width);
+        let step = self.view.draw_walk(cx, scope, walk);
+        if self.focus_on_draw && !step.is_step() {
+            self.focus_on_draw = false;
+            if self.to > 0.5 {
+                input.set_key_focus(cx);
+            }
+        }
+        step
+    }
+}
+
+/// A search at rest: its magnifier's square, the toolbar field's height.
+const SEARCH_REST: f64 = 28.0;
+
+#[cfg(test)]
+#[test]
+fn fab_search_closed_is_named_button_and_press_opens_text_field() {
+    use makepad_widgets_core::makepad_draw::cx_draw::CxDraw;
+    use a11y_tree::{ActionArg, ActionRequest, ActionResult, Actions, Node, NodeId, Role, States};
+
+    let mut cx = Cx::new(Box::new(|_, _| {}));
+    let fields = cx.with_vm(|vm| {
+        makepad_widgets_core::script_mod_with(vm, WindowFamilies::default(), &[makepad_widgets_fab::fab_mod]);
+        crate::theme::script_mod(vm);
+        crate::ui::script_mod_kit(vm);
+        let labelled = vm.eval(script! { mod.widgets.FabSearch{row +: {input +: {empty_text: "Filter" a11y: {label: "Search plates"}}}} });
+        let placeholder = vm.eval(script! { mod.widgets.FabSearch{row +: {input +: {empty_text: "Filter"}}} });
+        let unnamed = vm.eval(script! { mod.widgets.FabSearch{row +: {input +: {empty_text: ""}}} });
+        [labelled, placeholder, unnamed].map(|value| WidgetRef::script_from_value(vm, value))
+    });
+    let pass = DrawPass::new(&mut cx);
+    let mut list = DrawList2d::new(&mut cx);
+    let size = dvec2(160.0, 40.0);
+    pass.set_size(&mut cx, size);
+    let mut draw = |cx: &mut Cx, field: &WidgetRef| {
+        let event = DrawEvent::default();
+        let mut drawing = CxDraw::new(cx, &event);
+        let mut frame = Cx2d::new(&mut drawing);
+        frame.begin_pass(&pass, None);
+        list.begin_always(&mut frame);
+        frame.begin_root_turtle(size, Layout::flow_overlay());
+        field.draw_all(&mut frame, &mut Scope::empty());
+        frame.end_pass_sized_turtle();
+        list.end(&mut frame);
+        frame.end_pass(&pass);
+    };
+    for (field, name) in fields.iter().zip(["Search plates", "Filter", "Search"]) {
+        draw(&mut cx, field);
+        let input = field.text_input(&cx, ids!(row.input));
+        let mut node = Node::default();
+        field.borrow::<FabSearch>().unwrap().semantics(&cx, &mut node);
+        assert_eq!((node.role, node.name.as_str()), (Role::Button, name));
+        assert_eq!(node.states, States::FOCUSABLE);
+        assert!(node.actions.contains(Actions::PRESS));
+        assert!(!input.visible());
+        let press = ActionRequest { req: 1, node: NodeId::NONE, action: Actions::PRESS, arg: ActionArg::None };
+        assert_eq!(field.borrow_mut::<FabSearch>().unwrap().handle_action(&mut cx, &press, &mut Scope::empty()), ActionResult::Handled);
+        assert!(field.borrow::<FabSearch>().unwrap().is_open() && input.visible());
+        draw(&mut cx, field);
+        assert!(input.visible(), "the first frame after the press shows the field");
+        field.borrow::<FabSearch>().unwrap().semantics(&cx, &mut node);
+        assert_eq!((node.role, node.actions, node.states), (Role::Group, Actions::empty(), States::empty()));
+        input.borrow().unwrap().semantics(&cx, &mut node);
+        assert_eq!(node.role, Role::TextField);
+        field.icon(&cx, ids!(row.glyph_slot.glyph)).borrow().unwrap().semantics(&cx, &mut node);
+        assert_eq!(node.role, Role::Image);
+    }
 }

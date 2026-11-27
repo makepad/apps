@@ -529,7 +529,7 @@ tone mapping. px are at 1080p. Output is premultiplied sRGB; 2D grades and LUTs 
 
 `MAKEPAD_HIDE_WINDOWS=1 makepad-motion3d` `check <doc>` (errors and warnings with lines) · `render <doc> --at 0,1.5,3 --out dir
 [--size 1920x1080]` · `strip <doc> --out strip.png [--frames 8 --cols 4 --size 480x270] [--edit-times
-e,e --edit-offset s]` · `bench <doc> [--size 3840x2160 --frames 30]` · `pixeltest [--only name]
-[--dump dir]`; `--music synthetic[:bpm]` (stand-in beats), `--library dir` (ids →
+e,e --edit-offset s]` · `bench <doc> [--size 3840x2160 --frames 30]`. The GPU pixel tests run in the `pixels` test target.
+Common options include `--music synthetic[:bpm]` (stand-in beats), `--library dir` (ids →
 `<dir>/<id>.<ext>`), `--media id=file`, `--input name=value`. A Motion file draws its first `Scene3D`
 (or `--layer n`) full frame.

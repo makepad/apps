@@ -1,10 +1,10 @@
 //! Canonical Splash projection of a folded board. Positions are integers until written.
 use super::schema::{Field, Literal, Source, Vocabulary};
 use super::tree::{live, BoardTree};
-use makepad_work_core::entity::{field, Entity};
-use makepad_work_core::event::{Anchor, Id, Key, Value};
-use makepad_work_core::fold::State;
-use makepad_work_core::{blob, hex};
+use makepad_town_core::entity::{field, Entity};
+use makepad_town_core::event::{Anchor, Id, Key, Value};
+use makepad_town_core::fold::State;
+use makepad_town_core::{blob, hex};
 use makepad_network::digest::Sha256;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -45,6 +45,16 @@ fn reference(out: &mut String, id: &Id) { out.push('@'); out.push_str(&hex(id));
 fn literal(out: &mut String, field: &Field, item: &Entity, state: &State) -> bool {
     let key = match &field.source {
         Source::Register(key) => key,
+        Source::Writer(key) => {
+            let Some(register) = item.fields.get(key) else { return false };
+            reference(out, &register.writer);
+            return true
+        }
+        Source::DesignPreset => {
+            out.push('@');
+            out.push_str(super::design::preset(item));
+            return true
+        }
         Source::Identity => { reference(out, &item.id); return true }
         Source::Children => { out.push('['); return true }
         Source::RootTitle => { string(out, item.text(field::TITLE)); return true }
@@ -56,6 +66,7 @@ fn literal(out: &mut String, field: &Field, item: &Entity, state: &State) -> boo
         }
     };
     match (field.form, item.value(key.clone())) {
+        (Literal::Bytes, Some(Value::Key(bytes))) => string(out, &hex(bytes)),
         (Literal::Units, _) => units(out, coord(item, key.clone())),
         (Literal::Text, Some(Value::Text(s))) => string(out, s),
         (Literal::Color, Some(Value::Int(n))) => {
@@ -138,6 +149,8 @@ struct Board<'a> {
     state: &'a State,
     root: &'a Entity,
     nodes: Vec<Node<'a>>,
+    // The presenting path, printed after the items on the first page.
+    steps: Vec<&'a Entity>,
     // Includes nonintersecting items so a cursor moved out of the rectangle can resume.
     after: HashMap<Id, usize>,
     revision: String,
@@ -202,7 +215,9 @@ impl<'a> Board<'a> {
                 stack.push((e.id, child_parent, close, kids.into_iter()));
             }
         }
-        Ok(Self { state, root, nodes, after, revision: hex(&hash.finalise()) })
+        let steps = super::tree::steps(state, id);
+        for step in &steps { stamp(step, id); }
+        Ok(Self { state, root, nodes, after, steps, revision: hex(&hash.finalise()) })
     }
 
     fn header(&self, title: bool) -> String {
@@ -214,8 +229,22 @@ impl<'a> Board<'a> {
 
     fn footer(&self, properties: bool) -> String {
         let mut out = String::from("]");
+        if properties && !self.steps.is_empty() {
+            let step = &Vocabulary::Board.schema().step;
+            write!(out, " {}: [", super::schema::PATH).unwrap();
+            for (i, e) in self.steps.iter().enumerate() {
+                if i > 0 { out.push(' '); }
+                constructor(&mut out, step.name, step.fields.iter(), e, self.state, true);
+            }
+            out.push(']');
+        }
         close_constructor(&mut out, self.root, properties);
         out
+    }
+
+    /// Whether the root prints more than its title and items: its open properties or a path.
+    fn root_extras(&self) -> bool {
+        self.root.open_fields().next().is_some() || !self.steps.is_empty()
     }
 
     fn append(&self, out: &mut String, open: &mut Vec<usize>, i: usize, base_depth: usize) {

@@ -1255,6 +1255,7 @@ fn with_opacity(frame: &mut makepad_motion::MotionFrame, opacity: f64) {
 
 #[cfg(test)]
 mod tests {
+    use makepad_motion::plain::PrimitiveFrame;
     #[test]
     fn pointer_keys_only_for_declaring_documents() {
         use super::{pointer_current, pointer_key};
@@ -1383,7 +1384,7 @@ mod tests {
         let context = MotionContext { modules: module_host(&assets.modules), ..Default::default() };
         let plate = &assets.sources[&AssetRef { id: "ast_plateaaaaaaaaaaaaaaaaaaaaa".into(), rev: A_REV.into() }];
         let loaded = MotionDoc::load_with(plate, &[], context).unwrap_or_else(|d| panic!("{d:?}"));
-        let makepad_motion::ItemKind::Rect { size, .. } = &loaded.eval(0.0).items[0].kind else { panic!("not a rect") };
+        let makepad_motion::ItemKind::Primitive(PrimitiveFrame::Rect { size, .. }) = &loaded.eval(0.0).items[0].kind else { panic!("not a rect") };
         assert_eq!(size[0], 10.0);
     }
 }

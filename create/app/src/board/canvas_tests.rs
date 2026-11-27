@@ -29,14 +29,14 @@ fn settled_canvas_culls_and_requests_only_one_frame_for_an_item_change() {
     let (mut model, _) = Model::open(&dir).unwrap();
     let project = model.project().id;
     let board = model.act(Action::AddBoard { title: "Study".into(), project }, Origin::Tool).unwrap();
-    let mut add = |x: i64| {
+    let mut add = |x: i64, y: i64| {
         model
             .act(
                 Action::AddItem {
                     board,
                     kind: Key::Number(kind::STICKY),
                     x: x * 64,
-                    y: 0,
+                    y: y * 64,
                     w: 36 * 64,
                     h: 32 * 64,
                     parent: None,
@@ -46,9 +46,9 @@ fn settled_canvas_culls_and_requests_only_one_frame_for_an_item_change() {
             )
             .unwrap()
     };
-    let a = add(0);
-    let b = add(41);
-    let distant = add(300);
+    let a = add(0, 0);
+    let b = add(41, 0);
+    let distant = add(300, 8);
     let mut cx = test_cx::checkout_test_cx(|vm| {
         makepad_widgets::script_mod(vm);
         crate::script_mod(vm);
@@ -64,7 +64,7 @@ fn settled_canvas_culls_and_requests_only_one_frame_for_an_item_change() {
     let scene = canvas.scene.as_ref().unwrap();
     assert_eq!(scene.visible, [a, b], "rect query admits only the two on-screen cards");
     assert_eq!(scene.view.layers(&scene.visible), [0..2], "the bodies have a gap");
-    assert_eq!(scene.layers, [0..1, 1..2], "the shadows cross that gap");
+    assert_eq!(scene.layers, [0..2], "shadows lie under their layer's cards, so they never split it");
     assert!(scene.faces[&distant].layout.is_none(), "off-screen text was never laid out");
     let first = scene.faces[&a].layout.as_ref().unwrap().1.clone();
     let start = cx.frame_requests();
@@ -135,6 +135,21 @@ fn settled_canvas_culls_and_requests_only_one_frame_for_an_item_change() {
         assert_eq!(cx.draw_lists[base].recording_gen, base_gen, "drag motion reused the board recording");
         assert_ne!(cx.draw_lists[overlay].recording_gen, gen, "only the overlay was recorded");
     }
+    let pointer = start + dvec2(12., 10.);
+    canvas.input(&mut cx, &Event::MouseMove(MouseMoveEvent {
+        abs: pointer, lock_delta: Default::default(), window_id: win, modifiers: Default::default(),
+        time: 1.2, handled: Default::default(),
+    }));
+    let top = |c: &BoardCanvas| c.gesture.moving().unwrap().rect(&a).unwrap().y0;
+    assert_eq!(top(&canvas), 5., "the distant card cannot pull the top while outside the camera");
+    let original = canvas.camera;
+    canvas.pan(&mut cx, original.pan - dvec2(540., 0.));
+    assert_eq!(top(&canvas), 8., "panning during the drag snaps to the newly visible neighbour without a mouse move");
+    canvas.change_camera(&mut cx, original);
+    assert_eq!(top(&canvas), 5., "panning back removes the former neighbour's pull");
+    canvas.zoom(&mut cx, pointer, 0.2);
+    assert_eq!(top(&canvas), 8., "zooming out admits the neighbour and preserves the world point held at the pointer");
+    canvas.change_camera(&mut cx, original);
     cx.fingers.first_mouse_button = None;
     let actions = cx.capture_actions(|cx| {
         canvas.input(cx, &Event::MouseUp(MouseUpEvent {
@@ -193,7 +208,7 @@ fn settled_canvas_culls_and_requests_only_one_frame_for_an_item_change() {
     });
     let edits: Vec<_> = actions.iter().filter_map(|a| a.as_widget_action()?.action.downcast_ref::<BoardCanvasAction>()).collect();
     let [BoardCanvasAction::Act(action @ Action::SetFields { .. })] = edits.as_slice() else { panic!("one resize edit") };
-    let count = |m: &Model| makepad_work_core::log::Log::open(&m.home.room_log_path(&m.open_id())).unwrap().0.events().len();
+    let count = |m: &Model| makepad_town_core::log::Log::open(&m.home.town_log_path(&m.open_id())).unwrap().0.events().len();
     let n = count(&model);
     model.act(action.clone(), Origin::Ui).unwrap();
     assert_eq!(count(&model), n + 1, "the resize writes exactly one event");
@@ -204,7 +219,7 @@ fn settled_canvas_culls_and_requests_only_one_frame_for_an_item_change() {
 #[test]
 fn a_future_constructor_has_a_readable_card_with_default_geometry() {
     use crate::board::tests::History;
-    use makepad_work_core::{entity::field, event::{Content, Value}};
+    use makepad_town_core::{entity::field, event::{Content, Value}};
     let mut h = History::new();
     let board = h.board();
     let mut scene = Scene::new(&h.state, board);
@@ -238,12 +253,32 @@ fn a_future_constructor_has_a_readable_card_with_default_geometry() {
         "a readable text block still shows its text under frame pressure");
     assert!(canvas.scene.as_ref().unwrap().faces[&sticky].detail.text,
         "a sticky keeps its saved text at reading size after the editor closes");
+
+    let (design, touched) = h.push(Content::Entity { kind: Key::Number(kind::DESIGN), derive: None, project: None,
+        fields: vec![(field::PARENT, Value::Id(board)), (field::Z, Value::Key(vec![2])), (field::W, Value::Int(390 * 64)),
+            (field::H, Value::Int(844 * 64)), (field::TITLE, Value::Text("Welcome".into())),
+            (field::SRC, Value::Text("arbitrary unfinished Splash{".into()))] });
+    canvas.applied(&mut cx, &h.state, &touched, true);
+    draw(&mut cx, &mut canvas);
+    let scene = canvas.scene.as_ref().unwrap();
+    let face = &scene.faces[&design];
+    assert!(face.detail.body && face.layout.is_some(), "the design frame and its label draw");
+    assert_eq!(face.text, "Welcome · phone");
+    let p = dvec2(130., 50.);
+    let hit = scene.pick(p);
+    assert_eq!(hit, Some(design), "the frame interior can be picked");
+    canvas.gesture.press(&scene.view, hit, p, p, false, None, false);
+    assert!(canvas.gesture.selection.ids.contains(&design));
+    let to = p + dvec2(14., 7.);
+    canvas.gesture.motion(&scene.view, to, to, 1., true, false);
+    assert!(matches!(canvas.gesture.release(&scene.view), Some(Action::MoveItems { moves, .. })
+        if moves == [(design, 14 * 64, 7 * 64)]), "dragging a design emits an ordinary move");
 }
 
 #[test]
 fn canvas_draws_arriving_section_children_and_a_child_surviving_its_section() {
     use crate::board::tests::{change, item, set, History};
-    use makepad_work_core::event::{Content, Value};
+    use makepad_town_core::event::{Content, Value};
 
     let mut h = History::new();
     let source = h.board();
@@ -459,10 +494,10 @@ fn toolbar_drop_uses_the_preview_and_cancel_discards_it() {
 #[test]
 fn a_stickys_editor_owns_typing_and_its_one_undo_on_both_devices() {
     use crate::board::gesture::BoardHistory;
-    use crate::model::tests::{exchange, shared_space};
+    use crate::model::tests::{exchange, shared_town};
     use makepad_platform::studio::StudioToApp;
 
-    let (_homes, mut a, mut b) = shared_space("board-typing");
+    let (_homes, mut a, mut b) = shared_town("board-typing");
     let project = a.project().id;
     let mut history = BoardHistory::default();
     let mut cx = test_cx::checkout_test_cx(|vm| {
@@ -521,7 +556,8 @@ fn a_stickys_editor_owns_typing_and_its_one_undo_on_both_devices() {
         (colour, [ink.x, ink.y, ink.z, ink.w])
     };
     let (colour, ink) = caret(&canvas, &mut cx);
-    assert!(colour == ink && colour[..3].iter().sum::<f32>() < 0.6, "a dark caret in the light default sticky: {colour:?}");
+    let on_sticky = look::contrast(vec4(colour[0], colour[1], colour[2], 1.), look::opaque(canvas.sticky_1));
+    assert!(colour == ink && on_sticky >= 7., "the caret takes the default sticky's ink, at {on_sticky:.1}:1: {colour:?}");
     let events = vec![text(" the demo"), key(KeyCode::ReturnKey), key(KeyCode::Backspace), key(KeyCode::Escape)];
     let actions = send(&mut canvas, &mut cx, events);
     let [BoardCanvasAction::CommitText { board: owner, action }] = &actions[..] else { panic!("only a text edit was expected") };
@@ -578,7 +614,7 @@ fn a_stickys_editor_owns_typing_and_its_one_undo_on_both_devices() {
 fn double_click_and_return_reopen_only_writable_unlocked_items() {
     use crate::board::tests::{change, item, set, History};
     use makepad_platform::studio::{RemoteMouseDown, RemoteMouseUp, StudioToApp};
-    use makepad_work_core::event::Value;
+    use makepad_town_core::event::Value;
 
     let mut h = History::new();
     let board = h.board();
@@ -660,4 +696,277 @@ fn double_click_and_return_reopen_only_writable_unlocked_items() {
         key(&mut cx, KeyCode::ReturnKey);
         assert_eq!(editing(), None, "Return respects locks and write access");
     }
+}
+
+#[test]
+fn present_frames_each_step_in_turn_stays_read_only_and_escape_returns_the_camera() {
+    use crate::board::tests::{item, step, History};
+    let mut h = History::new();
+    let board = h.board();
+    let a = h.push(item(kind::STICKY, board, [0, 0, 200, 100], None)).0;
+    let b = h.push(item(kind::STICKY, board, [2000, 1000, 400, 200], None)).0;
+    let mut cx = test_cx::checkout_test_cx(|vm| {
+        makepad_widgets::script_mod(vm);
+        crate::script_mod(vm);
+    });
+    let mut canvas = cx.with_vm(|vm| BoardCanvas::script_new_with_default(vm));
+    canvas.select_board(&mut cx, &h.state, Some(board), true);
+    let mut draw = draw_pass(&mut cx, dvec2(800., 600.), 1.);
+    draw(&mut cx, &mut canvas);
+    let before = canvas.camera;
+    // Every glide has landed by then.
+    let later = makepad_platform::monotonic_seconds() + 600.;
+    let landed = |canvas: &BoardCanvas| canvas.present.as_ref().expect("presenting").camera(later);
+    let centre = |camera: Camera, world: DVec2| camera.local_to_screen(camera.world_to_local(world));
+    let near = |a: DVec2, b: DVec2| (a - b).length() < 0.01;
+    let at = |canvas: &BoardCanvas| canvas.present.as_ref().and_then(|p| p.step());
+
+    assert!(canvas.present(&mut cx), "an empty path presents the board");
+    let shown = landed(&canvas);
+    assert!(near(centre(shown, dvec2(1200., 600.)), shown.view.center()), "the whole board is framed");
+    canvas.end_present(&mut cx);
+    assert!(!canvas.presenting() && canvas.camera.pan == before.pan && canvas.camera.scale == before.scale,
+        "ending puts the camera back");
+
+    canvas.gesture.selection.ids.insert(a);
+    assert!(canvas.present(&mut cx));
+    let shown = landed(&canvas);
+    assert!(near(centre(shown, dvec2(100., 50.)), shown.view.center()) && (shown.scale - 752. / 200.).abs() < 1e-9,
+        "with no path the selection is framed, inside the margin: {}", shown.scale);
+    canvas.end_present(&mut cx);
+    canvas.gesture.selection.ids.clear();
+
+    let add = |h: &mut History, canvas: &mut BoardCanvas, cx: &mut Cx, target: Id, order: u8| {
+        let (id, touched) = h.push(step(board, target, vec![order], None));
+        canvas.applied(cx, &h.state, &touched, true);
+        id
+    };
+    let s1 = add(&mut h, &mut canvas, &mut cx, b, 2);
+    add(&mut h, &mut canvas, &mut cx, [9; 32], 4);
+    let s3 = add(&mut h, &mut canvas, &mut cx, a, 6);
+    assert!(canvas.present(&mut cx));
+    assert_eq!(at(&canvas), Some(s1), "presenting starts at the first step");
+    assert!(near(centre(landed(&canvas), dvec2(2200., 1100.)), landed(&canvas).view.center()));
+
+    // A click advances, past the step with nothing to show, and selects nothing.
+    let win = WindowId(1, 1);
+    cx.fingers.first_mouse_button = Some((MouseButton::PRIMARY, win));
+    let click = centre(canvas.camera, dvec2(2200., 1100.));
+    let actions = cx.capture_actions(|cx| {
+        canvas.handle_event(cx, &Event::MouseDown(MouseDownEvent {
+            abs: click, button: MouseButton::PRIMARY, window_id: win, modifiers: Default::default(),
+            handled: Default::default(), time: 1.,
+        }), &mut Scope::empty());
+        cx.fingers.first_mouse_button = None;
+        canvas.handle_event(cx, &Event::MouseUp(MouseUpEvent {
+            abs: click, button: MouseButton::PRIMARY, window_id: win, modifiers: Default::default(), time: 1.05,
+        }), &mut Scope::empty());
+    });
+    assert_eq!(at(&canvas), Some(s3), "the unknown target is skipped");
+    assert!(actions.is_empty() && canvas.gesture.selection.ids.is_empty(), "presenting is read-only");
+    canvas.present_move(&mut cx, true);
+    assert_eq!(at(&canvas), Some(s3), "at the end it holds");
+
+    // A step added meanwhile is reachable, and a resize keeps the step framed.
+    let s4 = add(&mut h, &mut canvas, &mut cx, board, 8);
+    canvas.present_move(&mut cx, true);
+    assert_eq!(at(&canvas), Some(s4));
+    canvas.present_move(&mut cx, false);
+    let mut small = draw_pass(&mut cx, dvec2(600., 400.), 1.);
+    small(&mut cx, &mut canvas);
+    let shown = landed(&canvas);
+    assert_eq!(shown.view.size, dvec2(600., 400.));
+    assert!(near(centre(shown, dvec2(100., 50.)), shown.view.center()), "the resized window still frames the step");
+
+    canvas.end_present(&mut cx);
+    assert!(canvas.camera.pan == before.pan && canvas.camera.scale == before.scale && canvas.camera.view.size == dvec2(600., 400.),
+        "Esc's camera is the one from before, in the window as it is now");
+}
+
+fn draw_page(cx: &mut Cx, size: DVec2) -> impl FnMut(&mut Cx, &WidgetRef) {
+    let pass = DrawPass::new(cx);
+    let mut list = DrawList2d::new(cx);
+    pass.set_size(cx, size);
+    move |cx, page| {
+        let event = DrawEvent::default();
+        let mut draw = CxDraw::new(cx, &event);
+        let mut cx = Cx2d::new(&mut draw);
+        cx.begin_pass(&pass, None);
+        list.begin_always(&mut cx);
+        cx.begin_root_turtle(size, Layout::flow_down());
+        page.draw_all(&mut cx, &mut Scope::empty());
+        cx.end_pass_sized_turtle();
+        list.end(&mut cx);
+        cx.end_pass(&pass);
+    }
+}
+
+/// Through the board page as the app builds it and the input path the platform delivers: a
+/// wheel zooms toward the pointer, a trackpad pans and pinches, right-drag, Space-drag and the
+/// Hand tool pan without touching the item under them, and the corner cluster and the keys
+/// step and fit the zoom.
+#[test]
+fn the_board_page_navigates_by_wheel_trackpad_drags_hand_cluster_and_keys() {
+    use crate::board::tests::{item, History};
+    use makepad_platform::studio::{
+        PinchPhase, RemoteKeyModifiers, RemoteMouseDown, RemoteMouseMove, RemoteMouseUp, RemotePinch, RemoteScroll,
+        StudioToApp,
+    };
+
+    let mut h = History::new();
+    let board = h.board();
+    h.push(item(kind::STICKY, board, [200, 150, 120, 80], None));
+    let mut page = WidgetRef::empty();
+    let target = page.clone();
+    // The dispatch hands the page's actions back to the app as `Event::Actions`: count the
+    // board edits there, as the app hears them.
+    let acts = std::rc::Rc::new(std::cell::Cell::new(0));
+    let heard = acts.clone();
+    let mut cx = Cx::new(Box::new(move |cx, event| {
+        if let Event::Actions(actions) = event {
+            heard.set(heard.get() + actions.iter().filter(|a| matches!(a.as_widget_action().and_then(|w| w.action.downcast_ref()),
+                Some(BoardCanvasAction::Act(_)))).count());
+        }
+        target.handle_event(cx, event, &mut Scope::empty())
+    }));
+    cx.init_cx_os();
+    cx.with_vm(|vm| {
+        makepad_widgets::script_mod(vm);
+        crate::script_mod(vm);
+        let template = script_eval!(vm, {mod.widgets.WhiteboardPage{}});
+        page.script_apply(vm, &Apply::New, &mut Scope::empty(), template);
+    });
+    let surface = page.widget(&cx, ids!(surface));
+    {
+        let mut canvas = surface.borrow_mut::<BoardCanvas>().unwrap();
+        canvas.select_board(&mut cx, &h.state, Some(board), true);
+        canvas.edit_context(&mut cx, true, true);
+    }
+    // The app shows the empty board's invitation only while the board is empty.
+    page.widget(&cx, ids!(board_empty)).set_visible(&mut cx, false);
+    let mut draw = draw_page(&mut cx, dvec2(640., 480.));
+    draw(&mut cx, &page);
+    let camera = || surface.borrow::<BoardCanvas>().unwrap().camera;
+    let fitted = camera();
+    assert!(fitted.scale > 0., "the first frame fits the board");
+    let on_screen = |world: DVec2| { let c = camera(); c.local_to_screen(c.world_to_local(world)) };
+    let world_at = |screen: DVec2| camera().world_at(screen);
+
+    let win = WindowId(1, 1);
+    let time = std::cell::Cell::new(10.);
+    let now = || { time.set(time.get() + 1.); time.get() };
+    // How many board edits the input asked for: a pan asks for none.
+    let edits = |cx: &mut Cx, msgs: Vec<StudioToApp>| {
+        let before = acts.get();
+        for msg in msgs { cx.dispatch_studio_msg(msg, win, DVec2::default()); }
+        acts.get() - before
+    };
+    let drag = |cx: &mut Cx, button: MouseButton, from: DVec2, to: DVec2| {
+        let (button_raw_bits, t) = (button.bits(), now());
+        let mid = (from + to) * 0.5;
+        edits(cx, vec![
+            StudioToApp::MouseDown(RemoteMouseDown { x: from.x, y: from.y, time: t, button_raw_bits, modifiers: Default::default() }),
+            StudioToApp::MouseMove(RemoteMouseMove { x: mid.x, y: mid.y, time: t + 0.05, modifiers: Default::default() }),
+            StudioToApp::MouseMove(RemoteMouseMove { x: to.x, y: to.y, time: t + 0.1, modifiers: Default::default() }),
+            StudioToApp::MouseUp(RemoteMouseUp { x: to.x, y: to.y, time: t + 0.15, button_raw_bits, modifiers: Default::default() }),
+        ])
+    };
+    let scroll = |cx: &mut Cx, at: DVec2, by: DVec2, is_mouse, phase, modifiers| {
+        edits(cx, vec![StudioToApp::Scroll(RemoteScroll { time: now(), sx: by.x, sy: by.y, x: at.x, y: at.y, is_mouse, modifiers, phase })]);
+    };
+    let key = |cx: &mut Cx, key_code, modifiers: KeyModifiers| {
+        let k = KeyEvent { key_code, modifiers, ..Default::default() };
+        edits(cx, vec![StudioToApp::KeyDown(k.clone()), StudioToApp::KeyUp(k)]);
+    };
+    let near = |a: DVec2, b: DVec2| (a - b).length() < 1e-6;
+    let empty = dvec2(560., 400.);
+
+    // A wheel zooms about the pointer: the point under it stays put.
+    let anchor = world_at(empty);
+    scroll(&mut cx, empty, dvec2(0., 32.), true, ScrollPhase::None, RemoteKeyModifiers::default());
+    assert!(camera().scale < fitted.scale, "a wheel turned toward the person zooms out");
+    assert!(near(world_at(empty), anchor), "the wheel zooms toward the pointer");
+
+    // A trackpad's two fingers pan, momentum included, and its pinch zooms.
+    let before = camera();
+    for (phase, by) in [(ScrollPhase::Began, dvec2(0., 0.)), (ScrollPhase::Changed, dvec2(10., -20.)),
+        (ScrollPhase::Ended, dvec2(0., 0.)), (ScrollPhase::Momentum, dvec2(2., -4.)), (ScrollPhase::MomentumEnded, dvec2(0., 0.))] {
+        scroll(&mut cx, empty, by, false, phase, RemoteKeyModifiers::default());
+    }
+    assert!(near(camera().pan, before.pan + dvec2(-12., 24.)) && camera().scale == before.scale,
+        "two fingers pan with the fingers, momentum included, without zooming");
+    let pinch = |scale, phase| StudioToApp::Pinch(RemotePinch { time: now(), x: empty.x, y: empty.y, scale, phase,
+        modifiers: Default::default() });
+    edits(&mut cx, vec![pinch(1., PinchPhase::Begin), pinch(1.5, PinchPhase::Update), pinch(1., PinchPhase::End)]);
+    assert!((camera().scale / before.scale - 1.5).abs() < 1e-9, "a pinch zooms");
+
+    // Right-drag pans everywhere, over an item too; so does Space-drag and the Hand tool. Each
+    // press follows the frame the last camera change asked for, as in the app.
+    draw(&mut cx, &page);
+    let card = on_screen(dvec2(260., 190.));
+    let before = camera();
+    assert_eq!(drag(&mut cx, MouseButton::SECONDARY, card, card + dvec2(30., 20.)), 0, "right-drag over a card leaves it");
+    assert!(near(camera().pan, before.pan + dvec2(30., 20.)), "right-drag pans with the pointer");
+    draw(&mut cx, &page);
+    let card = on_screen(dvec2(260., 190.));
+    let space = KeyEvent { key_code: KeyCode::Space, ..Default::default() };
+    edits(&mut cx, vec![StudioToApp::KeyDown(space.clone())]);
+    let before = camera();
+    assert_eq!(drag(&mut cx, MouseButton::PRIMARY, card, card - dvec2(25., 5.)), 0, "Space-drag over a card leaves it");
+    assert!(near(camera().pan, before.pan - dvec2(25., 5.)), "Space-drag pans");
+    edits(&mut cx, vec![StudioToApp::KeyUp(space)]);
+    assert!(!surface.borrow::<BoardCanvas>().unwrap().gesture.space, "releasing Space lifts the hand");
+    key(&mut cx, KeyCode::KeyH, KeyModifiers::default());
+    assert_eq!(surface.borrow::<BoardCanvas>().unwrap().tool, BoardTool::Hand, "H arms the Hand tool");
+    draw(&mut cx, &page);
+    let card = on_screen(dvec2(260., 190.));
+    let before = camera();
+    assert_eq!(drag(&mut cx, MouseButton::PRIMARY, card, card + dvec2(-8., 16.)), 0, "the Hand tool leaves the card");
+    assert!(near(camera().pan, before.pan + dvec2(-8., 16.)), "the Hand tool pans with a left drag");
+    key(&mut cx, KeyCode::KeyH, KeyModifiers::default());
+    assert_eq!(surface.borrow::<BoardCanvas>().unwrap().tool, BoardTool::Select, "H again returns to Select");
+
+    // The cluster steps the zoom and its level fits the board; a press on it is not the board's.
+    draw(&mut cx, &page);
+    let press = |cx: &mut Cx, path: &[LiveId]| {
+        let at = page.widget(cx, path).area().clipped_rect(cx).center();
+        let (button_raw_bits, t) = (MouseButton::PRIMARY.bits(), now());
+        edits(cx, vec![
+            StudioToApp::MouseDown(RemoteMouseDown { x: at.x, y: at.y, time: t, button_raw_bits, modifiers: Default::default() }),
+            StudioToApp::MouseUp(RemoteMouseUp { x: at.x, y: at.y, time: t + 0.05, button_raw_bits, modifiers: Default::default() }),
+        ]);
+    };
+    let before = camera();
+    press(&mut cx, ids!(surface.zoom_in));
+    assert!((camera().scale / before.scale - ZOOM_STEP).abs() < 1e-9, "+ zooms in a step");
+    draw(&mut cx, &page);
+    press(&mut cx, ids!(surface.zoom_out));
+    assert!((camera().scale / before.scale - 1.).abs() < 1e-9, "− zooms back out");
+    draw(&mut cx, &page);
+    press(&mut cx, ids!(surface.zoom_level));
+    assert_eq!((camera().scale, camera().pan), (fitted.scale, fitted.pan), "the level fits the board");
+    assert!(surface.borrow::<BoardCanvas>().unwrap().gesture.marquee().is_none(), "the cluster's press is not a marquee");
+    draw(&mut cx, &page);
+    assert_eq!(page.button(&cx, ids!(surface.zoom_level)).text(), format!("{:.0} %", fitted.scale * 100.),
+        "the level shows the zoom");
+
+    // The keys: Command with = and − steps, Command 0 is 100 %, Shift 1 and F fit.
+    let command = KeyModifiers { logo: true, ..Default::default() };
+    key(&mut cx, KeyCode::Key0, command);
+    assert_eq!(camera().scale, 1., "Command 0 is 100 %");
+    key(&mut cx, KeyCode::Equals, command);
+    assert_eq!(camera().scale, ZOOM_STEP, "Command = zooms in");
+    key(&mut cx, KeyCode::Minus, command);
+    assert_eq!(camera().scale, 1., "Command − zooms out");
+    key(&mut cx, KeyCode::Equals, command);
+    key(&mut cx, KeyCode::Key1, KeyModifiers { shift: true, ..Default::default() });
+    assert_eq!((camera().scale, camera().pan), (fitted.scale, fitted.pan), "Shift 1 fits");
+    key(&mut cx, KeyCode::Equals, command);
+    key(&mut cx, KeyCode::KeyF, KeyModifiers::default());
+    assert_eq!((camera().scale, camera().pan), (fitted.scale, fitted.pan), "F fits");
+
+    // The control: a plain left-drag over the card does move it.
+    draw(&mut cx, &page);
+    let card = on_screen(dvec2(260., 190.));
+    assert_eq!(drag(&mut cx, MouseButton::PRIMARY, card, card + dvec2(30., 0.)), 1, "Select's drag moves the card");
 }

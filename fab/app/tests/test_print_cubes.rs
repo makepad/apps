@@ -6,6 +6,8 @@
 //! that one alone. Its tick, its name and its delete write the project; `fab.tree` lists it. It
 //! moves with its part.
 
+#[path = "common/render_mode.rs"]
+mod render_mode;
 #[path = "common/picture.rs"]
 mod picture;
 use fab::ui::print_settings::control_name;
@@ -177,7 +179,7 @@ fn a_test_cube_is_added_edited_and_picked_like_a_settings_box_one_undo_step_each
     assert!(near(cube.size, [20.0; 3], 1e-3), "a true cube: {cube:?}");
     wait(&app, "its row, lit", || (rows(&app) == [("Test 1".to_string(), true)]).then_some(()));
     wait(&app, "its handles", || handle(&app, SIZE_X).then_some(()));
-    app.locator(Selector::id("rm_slice")).wait_checked(false);
+    render_mode::wait_not_shown(&app, "Sliced");
 
     // A feature of the block in the tree, listed by fab.tree; not in the Parts list.
     let tree = call(&app, "tree", "{}").expect("tree");
@@ -306,8 +308,7 @@ fn part_with_a_cube(app: &TestApp, source: &str) {
     test_prints_tab(app);
     app.locator(Selector::role(Role::Button).name("Add test cube")).wait_visible().press();
     wait(app, "the cube", || listed(app).into_iter().next());
-    app.locator(Selector::id("rm_slice")).wait_visible().click();
-    app.locator(Selector::id("rm_slice")).wait_checked(true);
+    render_mode::pick(app, "Sliced");
 }
 
 /// The cube set to a true cube of `side` by the tool, and on the list so.
@@ -399,8 +400,7 @@ fn the_slicer_switches_to_test_prints_and_back_with_no_fresh_slice_until_somethi
     assert_ne!(fresh, whole, "the plate slices anew under the new settings");
 
     // In Normal nothing slices, so no later slice covers for a kept one: unchanged, each shows again ...
-    app.locator(Selector::id("rm_normal")).wait_visible().click();
-    app.locator(Selector::id("rm_normal")).wait_checked(true);
+    render_mode::pick(&app, "Normal");
     choose(&app, true);
     assert_eq!(num_of(&read(&app), "slice_id"), Some(tests_now), "the test print's slice left shows in Normal too");
     choose(&app, false);
@@ -548,8 +548,7 @@ fn a_test_prints_piece_lays_flat_by_tool_and_by_hand_and_undo_gives_its_gcode_ba
 
     // By hand, on the piece in place in Normal: Lay flat, then a click on it in the view's middle.
     choose(&app, false);
-    app.locator(Selector::id("rm_normal")).wait_visible().click();
-    app.locator(Selector::id("rm_normal")).wait_checked(true);
+    render_mode::pick(&app, "Normal");
     app.locator(Selector::role(Role::ListItem).name("Test 1")).wait_visible().click();
     wait(&app, "its handles", || handle(&app, SIZE_X).then_some(()));
     app.locator(Selector::role(Role::Button).name("Test print lay flat")).wait_visible().press();
@@ -669,7 +668,7 @@ fn a_picked_test_cube_cuts_the_view_to_its_piece_and_leaves_the_bed_whole(app: T
     call(&app, "test_print", &set).expect("the small cube");
     wait(&app, "the small cube", || listed(&app).first().filter(|t| near(t.size, [6.0; 3], 1e-3)).cloned());
     wait(&app, "its handles", || handle(&app, SIZE_X).then_some(()));
-    app.locator(Selector::id("rm_slice")).wait_checked(false);
+    render_mode::wait_not_shown(&app, "Sliced");
     let (_, _, cut, path) = picture_cut_to(&app, corner, 6.0);
     let same = |x0: usize, y0: usize, x1: usize, y1: usize| {
         let at = |x: usize, y: usize| (y * w + x) * n;
@@ -720,8 +719,7 @@ fn pieces_in_their_scene(app: &TestApp) -> Option<(Vec<(bool, [[f64; 3]; 2])>, S
 fn test_prints_show_on_the_bed_in_normal_and_whole_plate_brings_the_plate_back(app: TestApp) {
     block_with_a_cube(&app);
     cube_side(&app, 8.0);
-    app.locator(Selector::id("rm_normal")).wait_visible().click();
-    app.locator(Selector::id("rm_normal")).wait_checked(true);
+    render_mode::pick(&app, "Normal");
     // The block picked, framed: the plate shows whole, nothing cut.
     app.locator(Selector::role(Role::Tab).name("Parts")).click();
     app.locator(Selector::role(Role::TreeItem).name("Block")).wait_visible().click();
@@ -742,7 +740,7 @@ fn test_prints_show_on_the_bed_in_normal_and_whole_plate_brings_the_plate_back(a
     for k in 0..3 {
         assert!(hi[k] - lo[k] <= 8.0 + 1e-6, "no more of the block than its cube: {lo:?} {hi:?}");
     }
-    app.locator(Selector::id("rm_normal")).wait_checked(true);
+    render_mode::wait_shown(&app, "Normal");
     let (_, _, tests, path) = settled_picture(&app);
     // The pixels of the view two pictures differ at: how many, and the box they lie in.
     let moved = |a: &[u8], b: &[u8]| {
@@ -777,7 +775,7 @@ fn test_prints_show_on_the_bed_in_normal_and_whole_plate_brings_the_plate_back(a
     // Back: the plate, the same picture (the block picked again), in the same render mode.
     choose(&app, false);
     wait(&app, "the plate", || view_pieces(&app).is_none().then_some(()));
-    app.locator(Selector::id("rm_normal")).wait_checked(true);
+    render_mode::wait_shown(&app, "Normal");
     let (_, _, back, path) = settled_picture(&app);
     // Back, the plate's parts are drawn afresh, and their finished picture is the first one, pixel
     // for pixel: anything left of the pieces, a part drawn otherwise or the block's pick lost shows.

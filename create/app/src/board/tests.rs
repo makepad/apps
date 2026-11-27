@@ -1,16 +1,16 @@
 use super::*;
-use makepad_work_core::entity::{field, kind};
-use makepad_work_core::event::{Actor, Change, Content, Draft, Event, Id, Key, Member, Value, Via};
-use makepad_work_core::fold::State;
-use makepad_work_core::key::DeviceKey;
+use makepad_town_core::entity::{field, kind};
+use makepad_town_core::event::{Actor, Change, Content, Draft, Event, Id, Key, Member, Value, Via};
+use makepad_town_core::fold::State;
+use makepad_town_core::key::DeviceKey;
 use std::collections::HashMap;
 use std::time::Instant;
 
 pub(super) struct History {
     key: DeviceKey,
     pub(super) peer: DeviceKey,
-    room: Id,
-    latest: HashMap<makepad_work_core::key::PublicKey, Id>,
+    town: Id,
+    latest: HashMap<makepad_town_core::key::PublicKey, Id>,
     events: HashMap<Id, Event>,
     tip: Option<Id>,
     pub(super) state: State,
@@ -20,8 +20,8 @@ impl History {
     pub(super) fn new() -> Self {
         let key = DeviceKey::generate().unwrap();
         let peer = DeviceKey::generate().unwrap();
-        let (room, genesis) = Event::found(&key, 2, 0, 0, [0; 16]).unwrap();
-        let mut h = Self { key, peer, room, latest: HashMap::new(), events: HashMap::new(), tip: None, state: State::default() };
+        let (town, genesis) = Event::found(&key, 2, 0, 0, [0; 16]).unwrap();
+        let mut h = Self { key, peer, town, latest: HashMap::new(), events: HashMap::new(), tip: None, state: State::default() };
         h.record(genesis);
         let entry = h.push(Content::Member(Member::Invite { subject: h.peer.public(), role: 0 })).0;
         let accept = h.branch(&h.peer, Content::Member(Member::Accept { entry }));
@@ -40,7 +40,7 @@ impl History {
             actor: Actor::Human, via: Via::Ui, wall_ms: 0,
             parents, content: &bytes,
         };
-        Event::create(key, self.room, draft, (self.events.len() as u128).to_le_bytes()).unwrap()
+        Event::create(key, self.town, draft, (self.events.len() as u128).to_le_bytes()).unwrap()
     }
 
     pub(super) fn push(&mut self, content: Content) -> (Id, Vec<Id>) {
@@ -406,13 +406,13 @@ fn values_read_by_splash_pass_the_log_literal_check() {
                 "View { width: Fill height: 1 }", "f (1)", "f/*arg*/(1)", "return {title: \"a\"}",
                 "struct // comment\n { x: 3 }", r#"Sticky{text: "a \" } b"}"#] {
         assert!(makepad_splash_syntax::read_value(src).is_ok(), "reader fixture: {src:?}");
-        assert!(makepad_work_core::literal::is_literal(src), "a reader value must fold: {src:?}");
+        assert!(makepad_town_core::literal::is_literal(src), "a reader value must fold: {src:?}");
     }
 }
 
 #[test]
 fn page_print_is_equal_from_shuffled_arrival() {
-    use makepad_work_core::hex;
+    use makepad_town_core::hex;
     use makepad_widgets::makepad_script::tokenizer::{lex, ScriptToken};
 
     let mut h = History::new();
@@ -480,7 +480,7 @@ fn named_constructors_and_open_registers_print_losslessly_after_schema_fields() 
             (name("dash"), source("[4  2] // note")), (field::LABEL, Value::Text("v".into()))] });
     h.push(set(vec![change(board, name("theme"), source("dark"))]));
     let printed = page::print(&h.state, board).unwrap();
-    assert!(printed.contains(&format!("FutureDiagram{{id: @{}", makepad_work_core::hex(&id))));
+    assert!(printed.contains(&format!("FutureDiagram{{id: @{}", makepad_town_core::hex(&id))));
     assert!(printed.ends_with("label: \"v\" dash: [4  2] // note\n spec: Diagram{ data: [4  2] }}] footer: accent}] theme: dark}"));
     assert_eq!(board_page(&h.state, board, None).unwrap().get("splash").unwrap().as_str(), Some(printed.as_str()));
     let view = BoardView::build(&h.state, board);
@@ -497,7 +497,7 @@ fn board_page(state: &State, board: Id, cursor: Option<&str>) -> Result<makepad_
 
 #[test]
 fn oversized_node_and_title_fragments_follow_their_own_bytes() {
-    use makepad_work_core::hex;
+    use makepad_town_core::hex;
 
     let mut h = History::new();
     let board = h.board();
@@ -554,7 +554,7 @@ fn oversized_node_and_title_fragments_follow_their_own_bytes() {
 
 #[test]
 fn sections_page_as_whole_subtrees() {
-    use makepad_work_core::hex;
+    use makepad_town_core::hex;
 
     let mut h = History::new();
     let board = h.board();
@@ -600,9 +600,9 @@ fn window_section_capture_survives_peer_edits_and_undo() {
 
     // Each model signs its own branch. Deliver the real sync messages between gestures,
     // so my release names the received event in its past, just as on a linked device.
-    use crate::model::tests::{exchange as deliver, shared_space};
+    use crate::model::tests::{exchange as deliver, shared_town};
 
-    let (_homes, mut me, mut peer) = shared_space("board-move");
+    let (_homes, mut me, mut peer) = shared_town("board-move");
     let board = me.act(Action::AddBoard { project: me.project().id, title: "Plan".into() }, Origin::Ui).unwrap();
     let add = |m: &mut Model, kind, parent, x: i64| {
         m.act(Action::AddItem {
@@ -647,7 +647,7 @@ fn window_section_capture_survives_peer_edits_and_undo() {
     };
     assert_eq!(moves.len(), 2, "a doubly selected child is moved once");
     assert_eq!(*captured, [child].into(), "late, pinned and deleted children are excluded");
-    let count = |m: &Model| makepad_work_core::log::Log::open(&m.home.room_log_path(&m.open_id())).unwrap().0.events().len();
+    let count = |m: &Model| makepad_town_core::log::Log::open(&m.home.town_log_path(&m.open_id())).unwrap().0.events().len();
     let before = count(&me);
     let moved = me.act(action, Origin::Ui).unwrap();
     assert_eq!(count(&me), before + 1);
@@ -679,9 +679,9 @@ fn arrange_keeps_locks_and_peer_order_across_equal_and_keyless_bounds() {
     use crate::model::{Action, ItemStyle, Model, Origin, RestackTo};
     use crate::tools::{self, Request};
 
-    use crate::model::tests::{exchange, shared_space};
+    use crate::model::tests::{exchange, shared_town};
 
-    let (_homes, mut me, mut peer) = shared_space("arrange");
+    let (_homes, mut me, mut peer) = shared_town("arrange");
     let board = me.act(Action::AddBoard { project: me.project().id, title: "Arrange".into() }, Origin::Ui).unwrap();
     let add = |m: &mut Model, x| m.act(Action::AddItem {
         board, kind: Key::Number(kind::STICKY), parent: None, x, y: 0, w: 1024, h: 1024, style: ItemStyle::default(),
@@ -696,17 +696,17 @@ fn arrange_keeps_locks_and_peer_order_across_equal_and_keyless_bounds() {
         change(b, field::LOCKED, Value::Bool(true))]);
     let stack = |m: &Model| BoardView::build(&m.state, board).visible(all());
     let original = stack(&me);
-    let count = |m: &Model| makepad_work_core::log::Log::open(&m.home.room_log_path(&m.open_id())).unwrap().0.events().len();
+    let count = |m: &Model| makepad_town_core::log::Log::open(&m.home.town_log_path(&m.open_id())).unwrap().0.events().len();
     let n = count(&me);
     let refused = me.act(Action::Restack { items: vec![mover], to: RestackTo::Backward }, Origin::Ui).unwrap_err();
     assert!(refused.contains("already as far back") && count(&me) == n, "no byte key goes below a keyless item");
 
     let args = format!(r#"{{"items":["{}","{}"],"to":"forward"}}"#,
-        makepad_work_core::hex(&mover), makepad_work_core::hex(&b));
-    let Request::Do(action) = tools::read("item_restack", &args).unwrap() else { panic!("expected restack") };
+        makepad_town_core::hex(&mover), makepad_town_core::hex(&b));
+    let Request::Do { action, .. } = tools::read_in_test_town(me.open_id(), "item_restack", &args).unwrap() else { panic!("expected restack") };
     let event = me.act(action, Origin::Tool).unwrap();
     let reply = tools::action_reply(&me, &event, "item_restack");
-    assert!(reply.contains("locked item stayed") && reply.contains(&makepad_work_core::hex(&b)));
+    assert!(reply.contains("locked item stayed") && reply.contains(&makepad_town_core::hex(&b)));
     assert_eq!(touched_by(me.event(&event).unwrap(), |id| me.event(id)), [mover]);
     assert_eq!(count(&me), n + 1);
     let mut above = original.clone();
@@ -758,8 +758,8 @@ fn restack_preserves_subsequences_and_crosses_only_reachable_runs() {
         board, kind: Key::Number(kind::STICKY), parent: None, x: 0, y: 0, w: 12 * 64, h: 12 * 64,
         style: ItemStyle::default(),
     }, Origin::Ui).unwrap()).collect();
-    let log = m.home.room_log_path(&m.open_id());
-    let count = || makepad_work_core::log::Log::open(&log).unwrap().0.events().len();
+    let log = m.home.town_log_path(&m.open_id());
+    let count = || makepad_town_core::log::Log::open(&log).unwrap().0.events().len();
     let mut seed = 17u32;
     let mut random = || {
         seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
@@ -850,12 +850,12 @@ fn restack_preserves_subsequences_and_crosses_only_reachable_runs() {
 }
 
 #[test]
-fn first_placement_undo_and_redo_cross_the_shared_space_as_one_step() {
+fn first_placement_undo_and_redo_cross_the_shared_town_as_one_step() {
     use super::gesture::{BoardHistory, NewItem};
-    use crate::model::{tests::{exchange, shared_space}, Action, Model, Origin};
-    use makepad_work_core::fold::project_entities;
+    use crate::model::{tests::{exchange, shared_town}, Action, Model, Origin};
+    use makepad_town_core::fold::project_entities;
 
-    let (_homes, mut me, mut peer) = shared_space("first-board-placement");
+    let (_homes, mut me, mut peer) = shared_town("first-board-placement");
     let project = me.project().id;
     let boards = |model: &Model| project_entities(&model.state, Some(project), Some(kind::BOARD))
         .into_iter().map(|e| e.id).collect::<Vec<_>>();
@@ -910,9 +910,9 @@ fn first_placement_undo_and_redo_cross_the_shared_space_as_one_step() {
 #[test]
 fn picker_tracks_live_boards_and_keeps_the_choice_per_project() {
     use super::gesture::{BoardHistory, NewItem};
-    use crate::model::{tests::{exchange, shared_space}, Action, Model, Origin};
+    use crate::model::{tests::{exchange, shared_town}, Action, Model, Origin};
 
-    let (_homes, mut m, mut peer) = shared_space("board-picker");
+    let (_homes, mut m, mut peer) = shared_town("board-picker");
     let project = m.project().id;
     let mut picker = BoardPicker::default();
     assert_eq!(picker.refresh(&m.state, Some(project)), None);
@@ -921,7 +921,7 @@ fn picker_tracks_live_boards_and_keeps_the_choice_per_project() {
     let first_item = *step.last().unwrap();
     assert_eq!(picker.refresh(&m.state, Some(project)), Some(0));
     assert_eq!(picker.labels, ["Board"], "the first item's implicit board is a named tab");
-    let second = m.act(Action::AddBoard { project, title: picker.next_title() }, Origin::Ui).unwrap();
+    let second = m.act(Action::AddBoard { project, title: "Board 2".into() }, Origin::Ui).unwrap();
     picker.choose(project, second);
     let (_, step) = sticky.place(project, Some(second), |action| m.act(action, Origin::Ui).ok()).unwrap();
     let [second_item] = step[..] else { panic!("placement on an existing board is one event") };
@@ -931,18 +931,17 @@ fn picker_tracks_live_boards_and_keeps_the_choice_per_project() {
     };
     assert_eq!(visible(&mut picker, &m), [second_item]);
     assert_eq!(picker.labels, ["Board", "Board 2"]);
-    check_tab_clicks(&picker);
     picker.choose(project, first);
     assert_eq!(visible(&mut picker, &m), [first_item], "switching restores just that board's items");
 
     let mut history = BoardHistory::default();
-    history.record(m.act(picker.rename(first, "Plans").unwrap(), Origin::Ui).unwrap());
+    history.record(m.act(m.rename_action(first, "Plans").unwrap().unwrap(), Origin::Ui).unwrap());
     exchange(&mut m, &mut peer);
     for home in [&m, &peer] {
         assert_eq!(visible(&mut picker, home), [first_item]);
         assert_eq!(picker.boards, [first, second], "a rename keeps both tabs in place");
         assert_eq!(picker.labels, ["Plans", "Board 2"]);
-        assert!(picker.rename(first, " Plans ").is_none() && picker.rename(first, " ").is_none());
+        assert!(home.rename_action(first, " Plans ").unwrap().is_none() && home.rename_action(first, " ").is_err());
     }
     history.step(false, |action| m.act(action, Origin::Ui).ok());
     exchange(&mut m, &mut peer);
@@ -952,7 +951,7 @@ fn picker_tracks_live_boards_and_keeps_the_choice_per_project() {
     }
     let other = m.act(Action::AddProject { title: "Other project".into() }, Origin::Ui).unwrap();
     assert_eq!(picker.refresh(&m.state, Some(other)), None);
-    let other_board = m.act(Action::AddBoard { project: other, title: picker.next_title() }, Origin::Ui).unwrap();
+    let other_board = m.act(Action::AddBoard { project: other, title: "Board".into() }, Origin::Ui).unwrap();
     assert_eq!(picker.refresh(&m.state, Some(other)), Some(0));
     assert_eq!(picker.boards, [other_board]);
     assert_eq!(picker.refresh(&m.state, Some(project)), Some(0));
@@ -967,81 +966,182 @@ fn picker_tracks_live_boards_and_keeps_the_choice_per_project() {
     assert_eq!(picker.boards[index], first);
 }
 
-fn check_tab_clicks(picker: &BoardPicker) {
-    use super::tabs::{BoardTabs, TabAction};
-    use makepad_widgets::{cx_draw::CxDraw, makepad_platform::studio::{RemoteMouseDown, RemoteMouseUp, StudioToApp}, *};
-    use std::{cell::Cell, rc::Rc};
+pub(super) fn step(board: Id, target: Id, order: Vec<u8>, title: Option<&str>) -> Content {
+    let mut fields = vec![(field::PARENT, Value::Id(board)), (field::TO, Value::Id(target)), (field::ORDER, Value::Key(order))];
+    if let Some(title) = title { fields.push((field::TITLE, Value::Text(title.into()))); }
+    Content::Entity { kind: Key::Name(schema::STEP.into()), project: None, derive: None, fields }
+}
 
-    let chosen = Rc::new(Cell::new(None));
-    let selected = chosen.clone();
-    let mut page = WidgetRef::empty();
-    let root = page.clone();
-    let mut cx = Cx::new(Box::new(move |cx, event| {
-        let tabs = root.widget(cx, ids!(board_tabs));
-        let actions = cx.capture_actions(|cx| tabs.handle_event(cx, event, &mut Scope::empty()));
-        if let Some(mut strip) = tabs.borrow_mut::<BoardTabs>() {
-            for command in strip.actions(cx, &actions) {
-                if let TabAction::Choose(board) = command { selected.set(Some(board)); }
-            }
-        };
-    }));
-    cx.init_cx_os();
-    cx.with_vm(|vm| {
-        makepad_widgets::script_mod(vm);
-        crate::script_mod(vm);
-        let template = script_eval!(vm, {mod.widgets.WhiteboardPage{}});
-        page.script_apply(vm, &Apply::New, &mut Scope::empty(), template);
-    });
-    cx.widget_tree().set_root_widget(page.clone());
-    let tabs = page.widget(&cx, ids!(board_tabs));
-    let list = tabs.portal_list(&cx, ids!(list));
-    let pass = DrawPass::new(&mut cx);
-    let size = dvec2(500., 40.);
-    pass.set_size(&mut cx, size);
-    let mut draw_list = DrawList2d::new(&mut cx);
-    let mut draw = |cx: &mut Cx, current, writable| {
-        let mut strip = tabs.borrow_mut::<BoardTabs>().unwrap();
-        strip.show(cx, picker, Some(current));
-        strip.edit_context(cx, writable);
-        let event = DrawEvent::default();
-        let mut draw = CxDraw::new(cx, &event);
-        let mut cx = Cx2d::new(&mut draw);
-        cx.begin_pass(&pass, None);
-        draw_list.begin_always(&mut cx);
-        cx.begin_root_turtle(size, Layout::flow_down());
-        let _ = strip.draw_walk(&mut cx, &mut Scope::empty(), Walk::fixed(size.x, size.y));
-        cx.end_pass_sized_turtle();
-        draw_list.end(&mut cx);
-        cx.end_pass(&pass);
+#[test]
+fn the_path_converges_across_reorders_and_present_skips_what_it_cannot_show() {
+    use makepad_canvas::{Camera, CameraState, MAX_ZOOM};
+    use makepad_widgets::{dvec2, Rect as View};
+    use view::Target;
+
+    let mut h = History::new();
+    let board = h.board();
+    let a = h.push(placed(kind::STICKY, board, board, 10)).0;
+    let b = h.push(placed(kind::STICKY, board, board, 20)).0;
+    let section = h.push(placed(kind::SECTION, board, board, 30)).0;
+    let c = h.push(placed(kind::STICKY, board, section, 40)).0;
+    let other = h.board();
+    let elsewhere = h.push(placed(kind::STICKY, other, other, 50)).0;
+    let s1 = h.push(step(board, a, vec![2], Some("Intro"))).0;
+    let s2 = h.push(step(board, b, vec![4], None)).0;
+    let s3 = h.push(step(board, c, vec![6], None)).0;
+    let s4 = h.push(step(board, board, vec![8], Some("All"))).0;
+    let s5 = h.push(step(board, elsewhere, vec![10], None)).0;
+    let view = BoardView::build(&h.state, board);
+    assert_eq!(view.visible(all()), [a, b, section, c], "steps are never board items");
+
+    // One member moves the third step first and the second step late; the other moves the
+    // first step last, moves the second step early and deletes its target.
+    let left = h.branch(&h.key, set(vec![change(s3, field::ORDER, Value::Key(vec![1, 2])), change(s2, field::ORDER, Value::Key(vec![9]))]));
+    let right = h.branch(&h.peer, set(vec![change(s1, field::ORDER, Value::Key(vec![12])),
+        change(s2, field::ORDER, Value::Key(vec![5])), change(b, field::DELETED, Value::Bool(true))]));
+    let mut first = None;
+    for events in [[&left, &right], [&right, &left]] {
+        let mut state = h.state.clone();
+        let mut view = BoardView::build(&state, board);
+        for event in events {
+            state.receive(event);
+            apply_delta(&mut view, &state, &touched_by(event, |_| None));
+        }
+        let steps = view.path(&state);
+        let order: Vec<_> = steps.iter().map(|s| (s.id, s.target)).collect();
+        assert_eq!((order[0], order[4]), ((s3, Target::Item(c)), (s1, Target::Item(a))), "each member's move lands");
+        assert!(order.contains(&(s2, Target::Gone(b))) && order.contains(&(s4, Target::Board))
+            && order.contains(&(s5, Target::Unknown(Some(elsewhere)))), "every step stays in the path: {order:?}");
+        assert_eq!(steps[4].title, "Intro");
+        let targets = view.present_targets(&steps);
+        assert_eq!(targets, BoardView::build(&state, board).present_targets(&steps), "the incremental view shows the same targets");
+        match &first {
+            Some(expected) => assert_eq!(expected, &(order, targets), "both arrival orders converge"),
+            None => first = Some((order, targets)),
+        }
+    }
+    let (order, targets) = first.unwrap();
+    let shown: Vec<_> = targets.iter().filter(|t| t.1.is_some()).map(|t| t.0).collect();
+    let board_step = order.iter().find(|s| s.1 == Target::Board).unwrap().0;
+    assert_eq!(shown.len(), 3, "the deleted and the foreign targets have nothing to show");
+    assert_eq!(targets.iter().find(|t| t.0 == board_step).unwrap().1, Some(Rect::new(10.0, 0.0, 45.0, 5.0)),
+        "the board step shows every live item");
+
+    let view = View { pos: dvec2(0.0, 0.0), size: dvec2(1000.0, 800.0) };
+    let before = Camera::new(view, CameraState { pan_x: 7.0, pan_y: -3.0, zoom: 0.5 });
+    let mut present = view::Present::start(before);
+    let mut now = 100.0;
+    let mut visited = Vec::new();
+    while present.next(&targets, now) {
+        assert!(present.gliding(now) && !present.gliding(now + 10.0), "a step glides there and arrives");
+        now += 10.0;
+        let step = present.step().unwrap();
+        visited.push(step);
+        let camera = present.camera(now);
+        let rect = targets.iter().find(|t| t.0 == step).unwrap().1.unwrap();
+        let screen = |x, y| camera.local_to_screen(camera.world_to_local(dvec2(x, y)));
+        let (lo, hi) = (screen(rect.x0, rect.y0), screen(rect.x1, rect.y1));
+        assert!(lo.x >= 0.0 && lo.y >= 0.0 && hi.x <= 1000.0 && hi.y <= 800.0, "the target is in view on arrival");
+        assert!(camera.scale <= MAX_ZOOM, "a small target zooms no further than the canvas can");
+    }
+    assert_eq!(visited, shown, "Next visits only what can be shown, in path order");
+    assert_eq!(present.camera(now).scale, MAX_ZOOM, "the last step is a 5 unit sticky, held at the top zoom");
+    assert!(!present.next(&targets, now) && present.step() == Some(s1), "the end holds");
+    assert!(present.previous(&targets, now) && present.step() == Some(shown[1]), "Previous walks back over what can't be shown");
+
+    // A peer deletes the step being shown: Next and Previous go on from where it was.
+    h.receive(left);
+    h.record(right);
+    h.record(h.branch(&h.peer, set(vec![change(shown[1], field::DELETED, Value::Bool(true))])));
+    let view = BoardView::build(&h.state, board);
+    let targets = view.present_targets(&view.path(&h.state));
+    assert_eq!(targets.len(), 4);
+    let mut ahead = present.clone();
+    assert!(ahead.next(&targets, now) && ahead.step() == Some(s1), "Next from a deleted step goes on from its place");
+    assert!(present.previous(&targets, now) && present.step() == Some(shown[0]), "Previous from a deleted step");
+    assert!(present.next(&targets, now) && present.step() == Some(s1), "Next steps over the deleted step's place");
+    let back = present.end();
+    assert_eq!((back.pan, back.scale), (before.pan, before.scale), "Esc restores the camera from before");
+}
+
+#[test]
+fn design_page_names_the_source_writer_and_only_a_revision_checked_write_can_replace_it() {
+    use crate::model::{tests::{exchange, shared_town}, Action, Origin};
+    use makepad_town_core::hex;
+
+    let (_homes, mut me, mut peer) = shared_town("design-source");
+    let board = me.act(Action::AddBoard { project: me.project().id, title: "Study".into() }, Origin::Ui).unwrap();
+    let src = "View{label := Label{text: \"Start\"}}";
+    let item = me.act(Action::AddDesign { board, x: -80, y: 0, preset: "phone".into(),
+        title: "Welcome".into(), src: src.into() }, Origin::Ui).unwrap();
+    let page = board_page(&me.state, board, None).unwrap();
+    let splash = page.get("splash").unwrap().as_str().unwrap();
+    assert!(splash.contains(&format!("Design{{id: @{} x: -1.25 y: 0 w: 390 h: 844 title: \"Welcome\" preset: @phone src: @{}}}",
+        hex(&item), hex(&item))), "{splash}");
+    assert!(!splash.contains(src), "the page only includes the source reference");
+    for (key, value) in [(field::SRC, Value::Text("replacement".into())),
+                         (Key::Name("src".into()), Value::Literal("@replacement".into()))] {
+        assert!(me.act(Action::SetFields { changes: vec![change(item, key, value)], label: None }, Origin::Tool).is_err());
+    }
+    assert_eq!(me.state.entities[&item].text(field::SRC), src);
+    exchange(&mut me, &mut peer);
+    let write = |src: &str| Action::WriteDesign { item, src: src.into(), revision: item };
+    let mine = me.act(write("View{}"), Origin::Ui).unwrap();
+    let theirs = peer.act(write("Button{}"), Origin::Tool).unwrap();
+    exchange(&mut me, &mut peer);
+    let winner = me.state.entities[&item].fields[&field::SRC].writer;
+    assert_eq!(peer.state.entities[&item].fields[&field::SRC].writer, winner);
+    let (model, previous) = if winner == mine { (&mut me, "Button{}") } else {
+        assert_eq!(winner, theirs);
+        (&mut peer, "View{}")
     };
-    let face = |cx: &Cx, i| list.get_item(i).unwrap().1.button(cx, ids!(choose)).area().rect(cx);
-    let click = |cx: &mut Cx, x, time| {
-        let win = WindowId(1, 1);
-        let button_raw_bits = MouseButton::PRIMARY.bits();
-        cx.dispatch_studio_msg(StudioToApp::MouseDown(RemoteMouseDown {
-            x, y: 20., time, button_raw_bits, modifiers: Default::default(),
-        }), win, DVec2::default());
-        cx.dispatch_studio_msg(StudioToApp::MouseUp(RemoteMouseUp {
-            x, y: 20., time: time + 0.02, button_raw_bits, modifiers: Default::default(),
-        }), win, DVec2::default());
-    };
+    let undo = model.act(Action::Undo { of: winner }, Origin::Ui).unwrap();
+    assert_eq!(model.state.entities[&item].text(field::SRC), previous, "undo restores the other whole source");
+    assert!(page::print(&model.state, board).unwrap().contains(&format!("src: @{}", hex(&undo))));
+}
 
-    draw(&mut cx, 1, true);
-    let first = face(&cx, 0);
-    let second = face(&cx, 1);
-    let x = second.pos.x + 0.2;
-    click(&mut cx, first.pos.x + first.size.x - 0.2, 1.);
-    assert_eq!(chosen.take(), Some(picker.boards[0]), "one click chooses the inactive board");
-    draw(&mut cx, 0, true);
-    assert_eq!(face(&cx, 1), second, "switching keeps each tab under the pointer");
-    click(&mut cx, x, 1.1);
-    assert_eq!(chosen.take(), Some(picker.boards[1]), "nearby clicks on different tabs only switch");
-    draw(&mut cx, 1, true);
-    click(&mut cx, x, 1.2);
-    assert_eq!(list.get_item(1).unwrap().0, id!(Editing), "the second click opens the same board's field");
+#[test]
+fn board_read_prints_the_path_in_order_and_it_reads_back() {
+    use makepad_town_core::hex;
 
-    draw(&mut cx, 1, false);
-    click(&mut cx, x, 2.);
-    click(&mut cx, x, 2.1);
-    assert_eq!(list.get_item(1).unwrap().0, id!(Current), "a read-only board can only be selected");
+    let mut h = History::new();
+    let board = h.board();
+    let a = h.push(placed(kind::STICKY, board, board, 10)).0;
+    let title = "The \"whole\" board";
+    let whole = h.push(step(board, board, vec![4], Some(title))).0;
+    let intro = h.push(step(board, a, vec![2], None)).0;
+    let deleted = h.push(step(board, a, vec![3], None)).0;
+    h.push(set(vec![change(deleted, field::DELETED, Value::Bool(true))]));
+    let printed = page::print(&h.state, board).unwrap();
+    assert!(printed.ends_with(&format!("] path: [Step{{id: @{} target: @{}}} Step{{id: @{} target: @{} title: \"The \\\"whole\\\" board\"}}]}}",
+        hex(&intro), hex(&a), hex(&whole), hex(&board))), "the path prints after the items, in order: {printed}");
+    let page = board_page(&h.state, board, None).unwrap();
+    assert_eq!(page.get("splash").unwrap().as_str(), Some(printed.as_str()));
+    assert_eq!(page.get("total").unwrap().as_u64(), Some(1), "steps are not counted as items");
+
+    h.push(set(vec![change(whole, field::ORDER, Value::Key(vec![1, 2]))]));
+    let moved = board_page(&h.state, board, None).unwrap();
+    assert_ne!(moved.get("revision").and_then(|r| r.as_str()), page.get("revision").and_then(|r| r.as_str()), "reordering the path changes the revision");
+    let printed = page::print(&h.state, board).unwrap();
+    assert!(printed.find(&hex(&whole)) < printed.find(&format!("id: @{}", hex(&intro))), "the moved step prints first");
+
+    // A path too long for one reply reads back through root fragments, then the items follow.
+    for i in 0..120 { h.push(step(board, a, vec![10 + i], None)); }
+    let printed = page::print(&h.state, board).unwrap();
+    let tail = &printed[printed.find("] path: [").unwrap()..];
+    let mut reply = board_page(&h.state, board, None).unwrap();
+    let mut joined = String::new();
+    loop {
+        assert_eq!(reply.get("fragment").unwrap().get("kind").unwrap().as_str(), Some("root"));
+        joined.push_str(reply.get("splash").unwrap().as_str().unwrap());
+        let next = reply.get("next").unwrap().as_str().unwrap().to_owned();
+        if next == hex(&board) {
+            let items = board_page(&h.state, board, Some(&next)).unwrap();
+            let head = format!("Board{{items: [Sticky{{id: @{} ", hex(&a));
+            assert!(items.get("splash").unwrap().as_str().unwrap().starts_with(&head), "the items page follows the path");
+            break
+        }
+        reply = board_page(&h.state, board, Some(&next)).unwrap();
+    }
+    assert_eq!(joined, format!("Board{{title: \"\" items: [{tail}"), "the fragments rebuild the exact path");
 }

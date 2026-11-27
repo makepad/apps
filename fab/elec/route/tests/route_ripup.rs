@@ -319,6 +319,140 @@ fn setup(board: Board) -> RouteProblem {
     problem(&base, world, &nets, Style::FortyFive, Effort::default())
 }
 
+/// The router passes where its padded plane says nothing can: its search takes the exact step rule,
+/// so a 0.70 mm opening that every padded cell calls hard still routes. And a via pad, legal under a
+/// keepout that forbids only tracks, joins copper on both sides of it, and the router's stubs off
+/// that pad stay legal once the board snaps them to its centre. (Both boards disproved a capacity
+/// bound that claimed these nets must stay open.)
+#[test]
+fn a_route_crosses_an_opening_the_padded_plane_calls_hard_and_a_track_keepout_by_a_via_pad() {
+    use fab_elec_route::grid::{Cell, Grid, GridSpec, Occ, Probe};
+    use fab_elec_route::{World, WorldSource};
+
+    let narrow = ClassId(1);
+    let mut board = one_layer("narrow gate", P::mm(24.0, 16.8), [("signal", narrow); 3]);
+    board.nets.truncate(1);
+    // The right wall has a 0.70 mm opening centred on a grid row.
+    let ring = wall(&[
+        (P::mm(8.4, 4.8), P::mm(7.8, 0.6)),
+        (P::mm(8.4, 12.0), P::mm(7.8, 0.6)),
+        (P::mm(4.8, 8.4), P::mm(0.6, 7.2)),
+        (P::mm(12.0, 6.425), P::mm(0.6, 3.25)),
+        (P::mm(12.0, 10.375), P::mm(0.6, 3.25)),
+    ]);
+    place(&mut board, vec![
+        pin("U1", P::mm(8.4, 8.4), M1),
+        pin("J1", P::mm(18.9, 8.4), M1),
+        ("WALL", P::ZERO, ring, vec![None; 5]),
+    ]);
+    board.reindex();
+    let mut p = setup(board);
+    p.effort = Effort::Fast;
+    let [net] = &p.nets[..] else { panic!("exactly one net crosses the ring") };
+    let probe = Probe { class: net.class, w: net.w[0], drill: None };
+    let key = fab_elec_board::RuleKey { class: net.class, item: fab_elec_board::RuleItem::Track };
+    let pitch = GridSpec::pitch_for(probe.w + p.rules.clearance(key, key, LayerId::F_CU));
+    let spec = GridSpec::covering(p.board.outline_bbox(), pitch, p.stack.layers.clone());
+    assert_eq!(pitch, mm(0.15), "the gate lies on the router's grid");
+    let world = World::new(&p.base);
+    let owned = |it: &fab_elec_route::RItem| p.owned(it);
+    let source = WorldSource::new(&world, &p.rules, &p.board, &owned);
+    let low = spec.cell_at(P::mm(4.8, 4.8));
+    let high = spec.cell_at(P::mm(12.0, 12.0));
+    let gap = spec.cell_at(P::mm(12.0, 8.4));
+    let mut grid = Grid::new(spec);
+    let plane = grid.plane(probe);
+    for i in low.x..=high.x {
+        for cell in [Cell { x: i, y: low.y }, Cell { x: i, y: high.y }, Cell { x: low.x, y: i }, Cell { x: high.x, y: i }] {
+            assert_eq!(grid.state(&source, plane, 0, cell).fixed, Occ::HARD.fixed,
+                "even the opening is hard in the padded plane, closing the 8-neighbour cut at {cell:?}");
+        }
+    }
+    assert_eq!(grid.step(&source, plane, 0, gap, gap).fixed, Occ::FREE.fixed,
+        "the exact track centre in the opening clears the fixed wall");
+    let sol = GridRouter::default().route(&p, &Progress::new());
+    assert!(sol.open.is_empty(), "the router can pass through the opening: {:?}", sol.open);
+    let (_, conn) = apply_clean(&p, &sol);
+    assert!(conn.unrouted.is_empty(), "the verified route connects the terminals across the padded cut");
+
+    // A ring can forbid tracks yet permit a via's annular copper. Its disc can join copper
+    // on opposite sides even though no track centreline can cross the ring on either layer.
+    let mut board = one_layer("via annulus across a track keepout", P::mm(21.0, 18.0), [("signal", narrow); 3]);
+    board.nets.truncate(1);
+    board.stackup = fab_elec_board::Stackup::standard_2_layer();
+    let size = ViaSize { pad: mm(9.0), drill: mm(0.4) };
+    board.classes[narrow.ix()].rules.via = Some(size);
+    place(&mut board, vec![
+        square_pin("U1", P::mm(10.5, 9.0), M1, 0.3),
+        square_pin("J1", P::mm(10.5, 9.0), M1, 0.3),
+        square_pin("J2", P::mm(13.95, 9.0), M1, 0.3),
+    ]);
+    board.placed[1].side = Side::Bottom;
+    let outer = BBox::new(P::mm(8.88, 7.38), P::mm(12.12, 10.62));
+    let inner = BBox::new(P::mm(9.72, 8.22), P::mm(11.28, 9.78));
+    let id = board.alloc_id();
+    board.keepouts.push(fab_elec_board::BoardKeepout {
+        id, area: PolySet::rect(outer).difference(&PolySet::rect(inner)), layers: board.copper_set(),
+        forbid: fab_elec_parts::Forbid::TRACKS, reason: String::new(), origin: Origin::Authored, z: None,
+    });
+    board.reindex();
+    let mut p = setup(board);
+    p.effort = Effort::Fast;
+    // Its stubs leave the via from the centre, where the board puts an anchored end, so the
+    // applied copper is the copper the router checked (apply_clean runs DRC on it).
+    let route = GridRouter::default().route(&p, &Progress::new());
+    let (_, connected) = apply_clean(&p, &route);
+    assert!(connected.unrouted.is_empty(), "the router's via pad joins all three terminals across the track keepout: {:?}", route.open);
+    assert!(route.open.is_empty(), "the router reports the net joined by its via pad as routed: {:?}", route.open);
+    assert_eq!(route.metrics.nets_open as usize, route.open.len(), "the open-net count matches the via-pad result");
+}
+
+
+/// A zone island that touches no copper of its net is discarded until the router's tracks reach it:
+/// the refill then keeps it, and it conducts across a ring that forbids tracks and vias but not
+/// zone copper. The settled board is connected and passes DRC.
+#[test]
+fn a_refill_keeps_the_island_the_routed_tracks_reach_across_a_keepout() {
+    let narrow = ClassId(1);
+    let mut board = one_layer("retained copper across a routing keepout", P::mm(16.0, 15.0), [("signal", narrow); 3]);
+    board.nets.truncate(1);
+    place(&mut board, vec![
+        pin("U1", P::mm(6.0, 6.0), M1), pin("U2", P::mm(6.0, 9.0), M1),
+        pin("J1", P::mm(13.2, 6.0), M1), pin("J2", P::mm(13.2, 9.0), M1),
+    ]);
+    let outer = PolySet::rect(BBox::new(P::mm(3.0, 4.5), P::mm(9.0, 10.5)));
+    let inner = PolySet::rect(BBox::new(P::mm(3.8, 5.3), P::mm(8.2, 9.7)));
+    let id = board.alloc_id();
+    board.keepouts.push(fab_elec_board::BoardKeepout {
+        id, area: outer.difference(&inner), layers: board.copper_set(),
+        forbid: fab_elec_parts::Forbid::TRACKS.with(fab_elec_parts::Forbid::VIAS),
+        reason: String::new(), origin: Origin::Authored, z: None,
+    });
+    let zone = board.alloc_id();
+    board.zones.push(Zone {
+        id: zone, net: Some(M1), name: "signal".into(), layers: board.copper_set(),
+        area: Area::Poly(PolySet::rect(BBox::new(P::mm(4.5, 7.0), P::mm(14.4, 8.0)))),
+        priority: 0, settings: ZoneSettings::default(), locked: false, origin: Origin::Authored,
+    });
+    board.reindex();
+    let mut p = setup(board);
+    p.effort = Effort::Fast;
+    assert!(p.nets[0].terminals.iter().all(|t| t.items.iter().all(|ci| !matches!(ci, ConnItem::Zone { .. }))),
+        "the island starts discarded, so no terminal includes it");
+    let sol = GridRouter::default().route(&p, &Progress::new());
+    let (after, conn) = apply_clean(&p, &sol);
+    let fills = fill_all(&after, &p.rules);
+    let in_wall = P::mm(8.6, 7.5);
+    assert!(p.fills[0].is_empty() && fills[0].layer(LayerId::F_CU).unwrap().kept().any(|(_, poly)| poly.contains(in_wall)),
+        "refilling keeps copper inside the track-and-via keepout that the first fill discarded");
+    assert!(conn.unrouted.is_empty(), "the retained island electrically connects the router's tracks on both sides");
+    assert!(sol.open.is_empty(), "the router reports the net joined by the refilled island as routed: {:?}", sol.open);
+    assert_eq!(sol.metrics.nets_open as usize, sol.open.len(), "the open-net count matches the refilled result");
+    assert_eq!(sol.metrics.nets_routed, 1, "the routed-net count includes the net joined by the refill");
+    let drc = drc(&after, &conn, &p.rules, &fills, None);
+    assert!(drc.violations.is_empty(), "the complete refilled board passes DRC: {:?}", drc.violations);
+}
+
 fn has_copper(sol: &RouteSolution, net: NetId) -> bool {
     sol.add.iter().any(|item| match item {
         Item::Track(track) => track.net == net,

@@ -28,6 +28,7 @@
 
 use crate::ui::popover::{display_rgb, FabUiAction, MenuIcon, MenuItem, MenuPlace, MenuRegion, MenuSwatch, OpenPopup, PopupChange};
 use makepad_widgets_core::*;
+use std::collections::HashMap;
 use std::ops::Range;
 
 /// Row metrics. The layer sizes itself from the strings — text is not measured
@@ -52,9 +53,46 @@ const SWATCH: f64 = 14.0;
 const SWATCH_COL: f64 = SWATCH + 8.0;
 /// Gap after the tag column.
 const TAG_GAP: f64 = 8.0;
-/// How long the pointer rests on a row before it takes over from an open flyout's row, or opens
-/// its own flyout (s).
+/// A grid menu's tiles (`Level::lay_out_grid`): the box, the gap between boxes, the icon's
+/// side and its inset from the tile's top, and the label band's top.
+const TILE_W: f64 = 92.0;
+const TILE_H: f64 = 62.0;
+const TILE_GAP: f64 = 2.0;
+const TILE_ICON: f64 = 22.0;
+const TILE_ICON_TOP: f64 = 10.0;
+const TILE_LABEL_TOP: f64 = 38.0;
+
+/// How long a grid menu takes to slide from one set of tiles to another (s).
+const MORPH: f64 = 0.22;
+
+/// The id of the row a grid menu shows above a group's tiles: it slides back to the tiles the
+/// group was picked from (`FabMenuLayer::back`).
+fn back_id() -> LiveId {
+    live_id!(fab_menu_back)
+}
+
+/// True when the list draws as tiles: every row carries an icon and none is a heading or
+/// sits in a column. Separators break the grid into bands.
+pub(crate) fn is_grid(items: &[MenuItem]) -> bool {
+    items.iter().any(|it| !it.separator && it.id != back_id())
+        && items.iter().all(|it| it.separator || it.id == back_id() || (it.svg.is_some() && !it.heading && it.region == MenuRegion::Main))
+}
+
+/// Columns of a grid band: a short band is one row, a long one three or four wide.
+fn grid_columns(items: &[MenuItem]) -> usize {
+    let longest = items.split(|it| it.separator).map(|band| band.iter().filter(|it| it.id != back_id()).count()).max().unwrap_or(1);
+    match longest {
+        0..=5 => longest.max(1),
+        6..=9 => 3,
+        _ => 4,
+    }
+}
+
+/// How long the pointer, on its way into an open flyout, rests on a row it crosses before that
+/// row takes over (s).
 const REST: f64 = 0.2;
+/// How long a closed menu takes to fade out (s).
+const FADE_OUT: f64 = 0.12;
 /// The most of a rest one frame counts (s): a longer frame is a hitch.
 const HITCH: f64 = 0.05;
 
@@ -269,7 +307,7 @@ struct RegionRows {
 /// Estimate the bubble size before wrapping to a window. Linear in the rows and their text
 /// for a list in column reading order.
 pub fn measure(items: &[MenuItem]) -> Vec2d {
-    if items.iter().any(|it| it.region != MenuRegion::Main) {
+    if is_grid(items) || items.iter().any(|it| it.region != MenuRegion::Main) {
         let placement = Placement::Root { anchor: Rect::default(), place: MenuPlace::At };
         return Level::new(LiveId(0), items.to_vec(), placement).rect.size;
     }
@@ -294,6 +332,31 @@ struct Level {
     hi: Option<usize>,
     /// Row currently held down.
     press: Option<usize>,
+    /// Drawn as tiles (`is_grid`).
+    grid: bool,
+    /// The tiles a grid menu came from, newest last, each with the tile picked there: a group
+    /// opens in place of them (`FabMenuLayer::drill`).
+    trail: Vec<(Vec<MenuItem>, usize)>,
+    /// The slide from the previous tiles to these, while it runs.
+    morph: Option<Morph>,
+}
+
+/// A grid menu sliding from one set of tiles to another: the old tiles and where they were, the
+/// bubble's old size, the way it slides (1 in to a group, -1 back) and how far it is (0 to 1).
+struct Morph {
+    items: Vec<MenuItem>,
+    boxes: Vec<Rect>,
+    from_size: Vec2d,
+    dir: f64,
+    t: f64,
+    start: Option<f64>,
+}
+
+impl Morph {
+    /// Eased: quick, then settling.
+    fn eased(&self) -> f64 {
+        1.0 - (1.0 - self.t).powi(3)
+    }
 }
 
 impl Level {
@@ -318,7 +381,9 @@ impl Level {
             start = rows.end;
             RegionRows { region: group[0].region, rows, tag_w: 0.0 }
         }).collect();
+        let grid = is_grid(&items);
         let mut level = Self {
+            grid, trail: Vec::new(), morph: None,
             row_boxes: vec![Rect::default(); items.len()],
             label_offsets: Vec::with_capacity(items.len()),
             owner, items, rect: Rect::default(), placement, regions,
@@ -330,6 +395,12 @@ impl Level {
 
     /// Size each region from its own strings and marks once per open or draw.
     fn size_regions(&mut self, room_w: f64, mut measure: impl FnMut(&[MenuItem]) -> (f64, Vec<f64>, f64)) {
+        if self.grid {
+            self.label_offsets.clear();
+            self.label_offsets.resize(self.items.len(), LEFT_PAD);
+            self.lay_out_grid();
+            return;
+        }
         let mut col_widths = Vec::new();
         let mut main_w = MENU_MIN_W;
         self.label_offsets.clear();
@@ -390,6 +461,65 @@ impl Level {
         self.rect.size = dvec2(width, bottom + MENU_PAD);
     }
 
+    /// Place the tiles row by row, a separator starting a new band under a rule. Once per
+    /// open or draw.
+    fn lay_out_grid(&mut self) {
+        let cols = grid_columns(&self.items);
+        let width = MENU_PAD * 2.0 + cols as f64 * TILE_W + (cols - 1) as f64 * TILE_GAP;
+        let (mut col, mut y) = (0usize, MENU_PAD);
+        for i in 0..self.items.len() {
+            if self.items[i].id == back_id() {
+                // the way back: a full-width row over the tiles
+                self.row_boxes[i] = Rect { pos: dvec2(MENU_PAD, y), size: dvec2(width - MENU_PAD * 2.0, ROW_H) };
+                y += ROW_H + TILE_GAP;
+                col = 0;
+                continue;
+            }
+            if self.items[i].separator {
+                if col > 0 {
+                    y += TILE_H;
+                    col = 0;
+                }
+                self.row_boxes[i] = Rect { pos: dvec2(MENU_PAD, y), size: dvec2(width - MENU_PAD * 2.0, SEP_H) };
+                y += SEP_H;
+                continue;
+            }
+            if col == cols {
+                col = 0;
+                y += TILE_H + TILE_GAP;
+            }
+            let x = MENU_PAD + col as f64 * (TILE_W + TILE_GAP);
+            self.row_boxes[i] = Rect { pos: dvec2(x, y), size: dvec2(TILE_W, TILE_H) };
+            col += 1;
+        }
+        if col > 0 {
+            y += TILE_H;
+        }
+        self.footer_rule = None;
+        self.rect.size = dvec2(width, y + MENU_PAD);
+    }
+
+    /// The nearest tile up (`dir` < 0) or down from `from` in a grid; the first or last
+    /// choice when nothing is highlighted. O(rows) per key.
+    fn step_vertical(&self, from: Option<usize>, dir: isize) -> Option<usize> {
+        let Some(from) = from else { return self.step(None, dir) };
+        let at = self.row_boxes[from].center();
+        (0..self.items.len())
+            .filter(|&i| i != from && self.selectable(i))
+            .filter(|&i| {
+                let dy = self.row_boxes[i].center().y - at.y;
+                if dir > 0 { dy > 1.0 } else { dy < -1.0 }
+            })
+            .min_by(|&a, &b| {
+                let key = |i: usize| {
+                    let c = self.row_boxes[i].center();
+                    ((c.y - at.y).abs(), (c.x - at.x).abs())
+                };
+                key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .or(Some(from))
+    }
+
     fn from_row(&self) -> Option<usize> {
         match self.placement {
             Placement::Flyout { row, .. } => Some(row),
@@ -407,6 +537,10 @@ impl Level {
 
     /// How far the rows can scroll: 0 unless the bubble was cut to fit the window.
     fn max_scroll(&self) -> f64 {
+        // a sliding grid is short of its tiles only until it has grown to them
+        if self.morph.is_some() {
+            return 0.0;
+        }
         (self.content_h() - self.rect.size.y).max(0.0)
     }
 
@@ -444,7 +578,7 @@ impl Level {
     /// Hit-test the visible bubble in content coordinates. Menus have at most a few dozen
     /// rows, so a linear scan per pointer move also covers gaps and partially filled bands.
     fn row_at(&self, p: Vec2d) -> Option<usize> {
-        if !self.rect.contains(p) {
+        if !self.rect.contains(p) || self.morph.is_some() {
             return None;
         }
         let local = p - self.rect.pos + dvec2(0.0, self.scroll);
@@ -544,6 +678,7 @@ script_mod! {
         swatch: vec4(0.0, 0.0, 0.0, 0.0)
         edge: 0.0
         current: 0.0
+        fade: 1.0
 
         pixel: fn() {
             let sdf = Sdf2d.viewport(self.pos * self.rect_size)
@@ -561,7 +696,7 @@ script_mod! {
                 sdf.line_to(cx, ty + dir * 1.5)
                 sdf.line_to(cx + 3.5, ty - dir * 2.0)
                 sdf.stroke(fab.color_text_dim, 1.3)
-                return sdf.result
+                return sdf.result * self.fade
             }
             sdf.box(0.0, 0.0, self.rect_size.x, self.rect_size.y, fab.radius)
             if self.current > 0.0 {
@@ -591,6 +726,14 @@ script_mod! {
                     sdf.stroke(fab.color_text, 1.5)
                 }
             }
+            if self.arrow < -0.5 {
+                // a grid menu's way back (`back_id`)
+                let bx = 14.0
+                sdf.move_to(bx + 1.75, cy - 3.5)
+                sdf.line_to(bx - 1.75, cy)
+                sdf.line_to(bx + 1.75, cy + 3.5)
+                sdf.stroke(fab.color_text_dim, 1.2)
+            }
             if self.arrow > 0.5 {
                 let ax = self.rect_size.x - 12.0
                 sdf.move_to(ax, cy - 3.5)
@@ -598,7 +741,7 @@ script_mod! {
                 sdf.line_to(ax, cy + 3.5)
                 sdf.stroke(fab.color_text_dim, 1.2)
             }
-            return sdf.result
+            return sdf.result * self.fade
         }
     }
 
@@ -606,19 +749,17 @@ script_mod! {
     mod.widgets.FabMenuLayer = set_type_default() do mod.widgets.FabMenuLayerBase{
         width: Fill
         height: Fill
-        draw_bg +: {
-            pixel: fn() {
-                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
-                sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, fab.radius_lg)
-                sdf.fill_keep(fab.color_popover)
-                sdf.stroke(fab.color_popover_border, 1.0)
-                return sdf.result
-            }
-        }
+        // the floating cards' ground and shadow; `fade` is a closing menu's (`FabMenuLayer::fading`)
+        draw_bg: mod.draw.FabFloatBg{ color: uniform(fab.color_popover) border_color: uniform(fab.color_popover_border) }
         label_color: fab.color_text
         shortcut_color: fab.color_text_dim
         disabled_color: fab.color_text_muted
         draw_row +: { }
+        // a grid menu's tile icon (`tile_icon`)
+        TileIcon := mod.widgets.FabIcon{
+            width: 22 height: 22
+            icon_walk: Walk{ width: 22 height: 22 }
+        }
         draw_sep +: {
             color: fab.color_menu_sep
         }
@@ -663,6 +804,9 @@ pub struct DrawMenuRow {
     edge: f32,
     #[live]
     current: f32,
+    /// A closing menu's fade: 1 drawn as it is, 0 gone.
+    #[live]
+    fade: f32,
 }
 
 struct PressOpen {
@@ -678,7 +822,7 @@ impl PressOpen {
     }
 }
 
-#[derive(Script, ScriptHook, Widget)]
+#[derive(Script, Widget)]
 pub struct FabMenuLayer {
     #[uid]
     uid: WidgetUid,
@@ -707,6 +851,16 @@ pub struct FabMenuLayer {
     area: Area,
     #[rust]
     levels: Vec<Level>,
+    /// The menus just closed: drawn fading out for `FADE_OUT`, deaf to input and unseen by the
+    /// semantics, then dropped. Their fade (1 to 0), its start and its frames.
+    #[rust]
+    fading: Vec<Level>,
+    #[rust]
+    fade_alpha: f32,
+    #[rust]
+    fade_from: Option<f64>,
+    #[rust]
+    fade_frame: NextFrame,
     #[live]
     label_color: Vec4f,
     #[live]
@@ -748,6 +902,92 @@ pub struct FabMenuLayer {
     /// the popup buttons and the menu bar to mirror.
     #[rust]
     popup: OpenPopup,
+    /// A grid menu's tile icon (the `TileIcon` template) and the icons made from it, one per
+    /// file and enabled state.
+    /// The frames of a grid menu's slide (`Morph`).
+    #[rust]
+    morph_frame: NextFrame,
+    #[rust]
+    tile_template: Option<ScriptObjectRef>,
+    #[rust]
+    tile_icons: HashMap<(&'static str, bool), WidgetRef>,
+}
+
+impl FabMenuLayer {
+    /// Draw a grid menu's tiles, their boxes laid out from `origin`, skipping those outside
+    /// `view`: each tile's ground, icon and label, and a group's way back as a row. O(tiles).
+    #[allow(clippy::too_many_arguments)]
+    fn draw_tiles(&mut self, cx: &mut Cx2d, items: &[MenuItem], boxes: &[Rect], origin: Vec2d, view: Rect, hi: Option<usize>, press: Option<usize>, label_on: Vec4f, disabled: Vec4f) {
+        for (i, item) in items.iter().enumerate() {
+            let r = boxes[i].translate(origin);
+            if r.pos.y + r.size.y < view.pos.y || r.pos.y > view.pos.y + view.size.y || r.pos.x > view.pos.x + view.size.x || r.pos.x + r.size.x < view.pos.x {
+                continue;
+            }
+            if item.separator {
+                self.draw_sep.draw_abs(cx, separator_line(r));
+                continue;
+            }
+            let back = item.id == back_id();
+            // the tile's ground is the row shader's, without the row's text
+            let row = &mut self.draw_row;
+            row.hover = if hi == Some(i) && item.enabled { 1.0 } else { 0.0 };
+            row.down = if press == Some(i) && item.enabled { 1.0 } else { 0.0 };
+            row.current = if item.current { 1.0 } else { 0.0 };
+            row.disabled = if item.enabled { 0.0 } else { 1.0 };
+            row.mark = 0.0;
+            row.arrow = if back { -1.0 } else if item.submenu.is_empty() { 0.0 } else { 1.0 };
+            row.swatch = vec4(0.0, 0.0, 0.0, 0.0);
+            row.draw_abs(cx, r);
+            row.arrow = 0.0;
+            if back {
+                self.draw_label.color = label_on;
+                let text = Rect { pos: dvec2(r.pos.x + MARK_COL, r.pos.y), size: dvec2(r.size.x - MARK_COL - RIGHT_PAD, r.size.y) };
+                self.draw_label.draw_walk(cx, Walk::abs_rect(text), Align { x: 0.0, y: 0.5 }, &item.label);
+                continue;
+            }
+            if let Some(icon) = item.svg.and_then(|svg| tile_icon(cx, &mut self.tile_icons, self.tile_template.as_ref(), svg, item.enabled)) {
+                let at = Rect { pos: dvec2(r.pos.x + (r.size.x - TILE_ICON) * 0.5, r.pos.y + TILE_ICON_TOP), size: dvec2(TILE_ICON, TILE_ICON) };
+                let _ = icon.draw_walk(cx, &mut Scope::empty(), Walk::abs_rect(at));
+            }
+            self.draw_shortcut.color = if item.enabled { label_on } else { disabled };
+            let band = Rect { pos: dvec2(r.pos.x + 4.0, r.pos.y + TILE_LABEL_TOP), size: dvec2(r.size.x - 8.0, r.size.y - TILE_LABEL_TOP - 6.0) };
+            self.draw_shortcut.draw_walk(cx, Walk::abs_rect(band), Align { x: 0.5, y: 0.5 }, &item.label);
+        }
+    }
+}
+
+impl ScriptHook for FabMenuLayer {
+    fn on_after_apply(&mut self, vm: &mut ScriptVm, apply: &Apply, _scope: &mut Scope, value: ScriptValue) {
+        if !apply.is_eval() {
+            if let Some(obj) = value.as_object() {
+                vm.vec_with(obj, |vm, vec| {
+                    for kv in vec {
+                        if kv.key.as_id() == Some(live_id!(TileIcon)) {
+                            if let Some(t) = kv.value.as_object() {
+                                self.tile_template = Some(vm.new_object_ref(t));
+                            }
+                        }
+                    }
+                });
+            }
+        }
+        if apply.is_reload() {
+            self.tile_icons.clear();
+        }
+    }
+}
+
+/// The tile icon for `svg`, made from the template on first use; a disabled tile's is dimmed.
+fn tile_icon(cx: &mut Cx, icons: &mut HashMap<(&'static str, bool), WidgetRef>, template: Option<&ScriptObjectRef>, svg: &'static str, enabled: bool) -> Option<WidgetRef> {
+    if let Some(w) = icons.get(&(svg, enabled)) {
+        return Some(w.clone());
+    }
+    let value: ScriptValue = template?.as_object().into();
+    let mut w = cx.with_vm(|vm| WidgetRef::script_from_value(vm, value));
+    let opacity = if enabled { 1.0 } else { 0.35 };
+    script_apply_eval!(cx, w, { draw_icon +: { svg: mod.res.crate_resource(#(svg)) opacity: #(opacity) } });
+    icons.insert((svg, enabled), w.clone());
+    Some(w)
 }
 
 impl FabMenuLayer {
@@ -791,7 +1031,14 @@ impl FabMenuLayer {
         self.swallow_up |= self.press_open.take().is_some()
             || self.levels.iter().any(|level| level.press.is_some());
         self.cancel_pending();
-        self.levels.clear();
+        // what was up fades out (a menu that was fading already goes)
+        self.fading = std::mem::take(&mut self.levels);
+        for level in &mut self.fading {
+            level.press = None;
+        }
+        self.fade_alpha = 1.0;
+        self.fade_from = None;
+        self.fade_frame = cx.new_next_frame();
         self.last_pointer = None;
         if !self.swallow_up {
             self.unlock_input(cx);
@@ -829,6 +1076,12 @@ impl FabMenuLayer {
         self.levels[level].rect.size.y = full.min(room);
         let max = self.levels[level].max_scroll();
         self.levels[level].scroll = self.levels[level].scroll.min(max);
+        if let Some(m) = &self.levels[level].morph {
+            // a grid menu sliding to other tiles grows or shrinks to them as it goes
+            let e = m.eased();
+            let to = self.levels[level].rect.size;
+            self.levels[level].rect.size = m.from_size + (to - m.from_size) * e;
+        }
         let size = self.levels[level].rect.size;
         let pos = match self.levels[level].placement {
             Placement::Root { anchor, place } => match place {
@@ -966,7 +1219,7 @@ impl FabMenuLayer {
     fn point_at(&mut self, cx: &mut Cx, level: usize, row: usize) {
         self.cancel_pending();
         self.highlight(cx, level, Some(row));
-        if self.levels[level].selectable(row) && !self.levels[level].items[row].submenu.is_empty() {
+        if self.levels[level].selectable(row) && !self.levels[level].items[row].submenu.is_empty() && !self.drills(level, row) {
             self.open_flyout(cx, level, row);
         } else if self.levels.len() > level + 1 {
             self.levels.truncate(level + 1);
@@ -974,18 +1227,21 @@ impl FabMenuLayer {
         }
     }
 
-    /// Keep the current flyout while crossing its aim triangle. Otherwise a row takes over
-    /// after resting on it; a plain row without an open flyout highlights immediately.
+    /// The row under the pointer takes over at once: its highlight, and its flyout opens (or
+    /// the open one closes). Only a move heading into the open flyout, across the rows between
+    /// (its aim triangle), keeps that flyout; the row there takes over if the pointer rests on it.
     fn hover_row(&mut self, cx: &mut Cx, level: usize, row: usize, aiming: bool) {
         let flyout_row = self.levels.get(level + 1).and_then(Level::from_row);
-        let opens = self.levels[level].selectable(row) && !self.levels[level].items[row].submenu.is_empty();
-        if flyout_row.is_none() || flyout_row == Some(row) {
-            self.highlight(cx, level, Some(row));
-        }
-        if flyout_row == Some(row) || (flyout_row.is_none() && !opens) {
+        if flyout_row == Some(row) {
             self.cancel_pending();
-        } else if self.pending_row != Some((level, row)) || aiming {
+            self.highlight(cx, level, Some(row));
+        } else if aiming {
             self.start_rest(cx, level, row);
+        } else {
+            let opens = self.levels[level].selectable(row) && !self.levels[level].items[row].submenu.is_empty() && !self.drills(level, row);
+            if self.levels[level].hi != Some(row) || flyout_row.is_some() || opens {
+                self.point_at(cx, level, row);
+            }
         }
     }
 
@@ -995,6 +1251,14 @@ impl FabMenuLayer {
             return false;
         }
         let id = self.levels[level].items[row].id;
+        if id == back_id() {
+            self.back(cx, level);
+            return false;
+        }
+        if self.drills(level, row) {
+            self.drill(cx, level, row);
+            return false;
+        }
         let opens = !self.levels[level].items[row].submenu.is_empty();
         self.point_at(cx, level, row);
         if opens {
@@ -1010,6 +1274,53 @@ impl FabMenuLayer {
         self.close(cx);
         cx.action(FabUiAction::MenuPicked { owner, id });
         true
+    }
+
+    /// True when a grid tile's group opens in place of the tiles instead of in a flyout: its
+    /// rows are tiles too.
+    fn drills(&self, level: usize, row: usize) -> bool {
+        let lv = &self.levels[level];
+        lv.grid && lv.items.get(row).is_some_and(|it| is_grid(&it.submenu))
+    }
+
+    /// Open tile `row`'s group in place: its tiles slide in, under a row back to these.
+    fn drill(&mut self, cx: &mut Cx, level: usize, row: usize) {
+        let item = self.levels[level].items[row].clone();
+        let mut items = vec![MenuItem::new(back_id(), &item.label)];
+        items.extend(item.submenu);
+        let from = self.morph_to(cx, level, items, 1.0);
+        self.levels[level].trail.push((from, row));
+    }
+
+    /// Slide back to the tiles the shown group was picked from, that tile highlighted.
+    fn back(&mut self, cx: &mut Cx, level: usize) {
+        let Some((items, row)) = self.levels[level].trail.pop() else { return };
+        self.morph_to(cx, level, items, -1.0);
+        self.levels[level].hi = Some(row);
+    }
+
+    /// Show `items` in `level` in place of its tiles, sliding `dir`; returns the tiles it had.
+    fn morph_to(&mut self, cx: &mut Cx, level: usize, items: Vec<MenuItem>, dir: f64) -> Vec<MenuItem> {
+        self.cancel_pending();
+        self.levels.truncate(level + 1);
+        let room_w = self.window.size.x - WINDOW_MARGIN * 2.0;
+        let lv = &mut self.levels[level];
+        let from_size = lv.rect.size;
+        let boxes = std::mem::take(&mut lv.row_boxes);
+        let old = std::mem::replace(&mut lv.items, items);
+        let n = lv.items.len();
+        lv.regions = vec![RegionRows { region: MenuRegion::Main, rows: 0..n, tag_w: 0.0 }];
+        lv.row_boxes = vec![Rect::default(); n];
+        lv.grid = is_grid(&lv.items);
+        lv.hi = None;
+        lv.press = None;
+        lv.scroll = 0.0;
+        lv.size_regions(room_w, estimate_region);
+        lv.morph = Some(Morph { items: old.clone(), boxes, from_size, dir, t: 0.0, start: None });
+        self.morph_frame = cx.new_next_frame();
+        self.position_level(level);
+        self.redraw_menus(cx);
+        old
     }
 
     fn hit(&self, p: Vec2d) -> Option<(usize, usize)> {
@@ -1044,7 +1355,11 @@ impl FabMenuLayer {
             KeyCode::ArrowDown | KeyCode::ArrowUp => {
                 let dir = if key == KeyCode::ArrowDown { 1 } else { -1 };
                 let from = self.levels[last].hi;
-                self.levels[last].hi = self.levels[last].step(from, dir);
+                self.levels[last].hi = if self.levels[last].grid {
+                    self.levels[last].step_vertical(from, dir)
+                } else {
+                    self.levels[last].step(from, dir)
+                };
                 if let Some(hi) = self.levels[last].hi {
                     self.levels[last].reveal(hi);
                 }
@@ -1056,19 +1371,35 @@ impl FabMenuLayer {
                 let has_sub = hi
                     .and_then(|i| self.levels[last].items.get(i))
                     .map_or(false, |it| !it.submenu.is_empty() && it.enabled);
-                if has_sub {
+                if self.levels[last].grid {
+                    // tiles: right moves along the grid; Return opens a tile's flyout
+                    self.levels[last].hi = self.levels[last].step(hi, 1);
+                    self.levels.truncate(last + 1);
+                    self.redraw_menus(cx);
+                } else if has_sub {
                     self.activate(cx, last, hi.unwrap());
                 } else if self.levels[last].step_region(1) {
                     self.redraw_menus(cx);
                 }
             }
             KeyCode::ArrowLeft => {
-                if last > 0 {
+                let hi = self.levels[last].hi;
+                let first_col = hi.is_none_or(|i| self.levels[last].row_boxes[i].pos.x <= MENU_PAD + 0.5);
+                if self.levels[last].grid && first_col && !self.levels[last].trail.is_empty() {
+                    self.back(cx, last);
+                } else if self.levels[last].grid && !(first_col && last > 0) {
+                    self.levels[last].hi = self.levels[last].step(hi, -1);
+                    self.levels.truncate(last + 1);
+                    self.redraw_menus(cx);
+                } else if last > 0 {
                     self.levels.truncate(last);
                     self.redraw_menus(cx);
                 } else if self.levels[last].step_region(-1) {
                     self.redraw_menus(cx);
                 }
+            }
+            KeyCode::Backspace if !self.levels[last].trail.is_empty() => {
+                self.back(cx, last);
             }
             KeyCode::ReturnKey | KeyCode::NumpadEnter => {
                 if let Some(i) = self.levels[last].hi {
@@ -1160,7 +1491,7 @@ impl Widget for FabMenuLayer {
         let window = cx.turtle().rect();
         cx.end_turtle_with_area(&mut self.area);
         self.window = window;
-        if self.levels.is_empty() {
+        if self.levels.is_empty() && self.fading.is_empty() {
             return DrawStep::done();
         }
 
@@ -1183,7 +1514,17 @@ impl Widget for FabMenuLayer {
         let pass = cx.current_pass_size();
         cx.begin_root_turtle(pass, Layout::flow_down());
 
-        for level in &self.levels {
+        // the closing menus under the open ones, each drawn at its fade
+        let fading = std::mem::take(&mut self.fading);
+        let live = std::mem::take(&mut self.levels);
+        let base_sep = self.draw_sep.color;
+        for (levels, a) in [(&fading, self.fade_alpha), (&live, 1.0)] {
+        let faded = |c: Vec4f| vec4(c.x, c.y, c.z, c.w * a);
+        let (label_on, side_on, disabled) = (faded(label_on), faded(side_on), faded(disabled));
+        self.draw_row.fade = a;
+        self.draw_bg.set_dyn_instance(cx, live_id!(fade), &[a]);
+        self.draw_sep.color = faded(base_sep);
+        for level in levels {
             let rect = level.rect;
             self.draw_bg.draw_abs(cx, rect);
             let max_scroll = level.max_scroll();
@@ -1195,6 +1536,21 @@ impl Widget for FabMenuLayer {
                 let r = rule.translate(rect.pos - dvec2(0.0, level.scroll));
                 self.draw_sep.draw_abs(cx, separator_line(r));
             }
+            if level.grid {
+                let origin = rect.pos - dvec2(0.0, level.scroll);
+                if let Some(m) = &level.morph {
+                    // the old tiles slide out one way as the new ones slide in after them
+                    let e = m.eased();
+                    let w = rect.size.x.max(m.from_size.x);
+                    cx.push_clip_rect(Rect { pos: dvec2(rect.pos.x + 1.0, rect.pos.y + 1.0), size: dvec2(rect.size.x - 2.0, rect.size.y - 2.0) });
+                    self.draw_tiles(cx, &m.items, &m.boxes, origin - dvec2(m.dir * e * w, 0.0), rect, None, None, label_on, disabled);
+                    self.draw_tiles(cx, &level.items, &level.row_boxes, origin + dvec2(m.dir * (1.0 - e) * w, 0.0), rect, None, None, label_on, disabled);
+                    cx.pop_clip_rect();
+                } else {
+                    self.draw_tiles(cx, &level.items, &level.row_boxes, origin, rect, level.hi, level.press, label_on, disabled);
+                }
+                self.draw_shortcut.color = side_on;
+            } else {
             let mut ink = RowInk { row: &mut self.draw_row, label: &mut self.draw_label, side: &mut self.draw_shortcut, label_on, side_on, disabled };
             for group in &level.regions {
                 for i in group.rows.clone() {
@@ -1213,6 +1569,7 @@ impl Widget for FabMenuLayer {
                         ink.paint(cx, r, &level.items, i, group.tag_w, level.label_offsets[i], hover, down);
                     }
                 }
+            }
             }
             if cut {
                 cx.pop_clip_rect();
@@ -1234,6 +1591,11 @@ impl Widget for FabMenuLayer {
                 }
             }
         }
+        }
+        self.draw_sep.color = base_sep;
+        self.draw_row.fade = 1.0;
+        self.fading = fading;
+        self.levels = live;
 
         cx.end_pass_sized_turtle_with_shift(self.area, dvec2(0.0, 0.0) - window.pos);
         self.draw_list.end(cx);
@@ -1241,6 +1603,40 @@ impl Widget for FabMenuLayer {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
+        if let Event::NextFrame(ne) = event {
+            if ne.set.contains(&self.morph_frame) {
+                let mut running = false;
+                for lv in &mut self.levels {
+                    if let Some(m) = &mut lv.morph {
+                        let start = *m.start.get_or_insert(ne.time);
+                        m.t = ((ne.time - start) / MORPH).clamp(0.0, 1.0);
+                        if m.t >= 1.0 {
+                            lv.morph = None;
+                        } else {
+                            running = true;
+                        }
+                    }
+                }
+                if running {
+                    self.morph_frame = cx.new_next_frame();
+                }
+                self.draw_list.redraw(cx);
+            }
+            if ne.set.contains(&self.fade_frame) && !self.fading.is_empty() {
+                let from = *self.fade_from.get_or_insert(ne.time);
+                let t = ((ne.time - from) / FADE_OUT).clamp(0.0, 1.0);
+                if t >= 1.0 {
+                    self.fading.clear();
+                    self.fade_from = None;
+                } else {
+                    // eased: it leaves softly, then quickly
+                    let f = 1.0 - t;
+                    self.fade_alpha = (f * f * (3.0 - 2.0 * f)) as f32;
+                    self.fade_frame = cx.new_next_frame();
+                }
+                self.draw_list.redraw(cx);
+            }
+        }
         if let Event::Actions(actions) = event {
             let mut request = None;
             for a in actions.iter() {

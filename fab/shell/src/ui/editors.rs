@@ -16,11 +16,15 @@ pub enum Editor {
     /// Every plate and the demos: the first tab on the left.
     Plates,
     Parts,
+    /// Retired: the selected part's editor is a sidebar of the Plate view in Design (`stage`'s
+    /// `part_side`). Kept so a saved layout that names it still reads.
     Part,
     Slicer,
     Settings,
     Printer,
     Calibrate,
+    /// Retired: the printer's camera floats over the window (the title bar's camera button).
+    /// Kept so a saved layout that names it still reads.
     Camera,
     Features,
     /// The selected part's build as a row of steps, under the plate view.
@@ -58,6 +62,8 @@ pub enum Editor {
     /// What would break first, from the slice, and the fixes that help, as one undo step.
     Strength,
     /// The selected part's shape parameters.
+    /// Retired: the part's parameters are a section of the Part editor. Kept so a saved layout
+    /// that names it still reads; [`Editor::retired`] editors leave a layout as it loads.
     Parameters,
     /// The electronics library: search, pin and place parts (the Schematic's float is its quick
     /// open while no area shows it).
@@ -66,11 +72,13 @@ pub enum Editor {
     Checks,
     /// The run board's keys and knobs (the Transport's controls header brings it forward).
     BoardControls,
-    /// The paint brush's colour and settings (the plate's rail keeps the paint tools).
+    /// Retired: the paint brush's colour and settings are in the plate view's row of the
+    /// chosen tool's tools. Kept so a saved layout that names it still reads.
     Paint,
     /// Saved print jobs and the printer's progress.
     Jobs,
-    /// The frame profiler graph.
+    /// Retired: the frame profiler graph, a debugging tool. Kept so a saved layout that names it
+    /// still reads.
     Performance,
     /// Where the 3D models of electronics parts may come from, and every external resource's
     /// licence.
@@ -78,6 +86,8 @@ pub enum Editor {
     /// The project's targets and the evidence for each verdict.
     Requirements,
     Bom,
+    /// Retired: the plate journal's records, a debugging view (the journal itself is still
+    /// written). Kept so a saved layout that names it still reads.
     Journal,
 }
 
@@ -99,9 +109,9 @@ pub enum Family {
 /// Experimental's editors are offered only while View › Experimental has their family on.
 pub const MENU: [(&str, &[Editor]); 7] = [
     ("3D views", &[Editor::Viewport, Editor::Device]),
-    ("Plate data", &[Editor::Plates, Editor::Parts, Editor::Part, Editor::Parameters, Editor::Paint, Editor::Features, Editor::Steps, Editor::Code, Editor::Journal]),
-    ("Print", &[Editor::Slicer, Editor::Overrides, Editor::TestPrints, Editor::Settings, Editor::Printer, Editor::Calibrate, Editor::Camera, Editor::Jobs]),
-    ("Analysis", &[Editor::Slice, Editor::Strength, Editor::Force, Editor::Mechanics, Editor::Performance]),
+    ("Plate data", &[Editor::Plates, Editor::Parts, Editor::Steps, Editor::Code]),
+    ("Print", &[Editor::Slicer, Editor::Overrides, Editor::Printer]),
+    ("Analysis", &[Editor::Slice, Editor::Strength, Editor::Force, Editor::Mechanics]),
     ("Electronics", &[Editor::Circuit, Editor::Board, Editor::Library, Editor::Checks, Editor::Requirements, Editor::Bom, Editor::Bench, Editor::BoardControls, Editor::Scope, Editor::Transport, Editor::Firmware]),
     ("Experimental", &[Editor::Arm, Editor::ArmCell, Editor::ArmCompare, Editor::Scan, Editor::ScanView]),
     ("Settings", &[Editor::ModelSources]),
@@ -129,13 +139,13 @@ const fn def(editor: Editor, tab: LiveId, kind: LiveId, name: &'static str, titl
 /// Every editor, in [`Editor`]'s order.
 pub const EDITORS: [EditorDef; 41] = [
     def(Editor::Viewport, live_id!(tab_viewport), live_id!(Viewport), "Plate", "Plate", true),
-    def(Editor::Device, live_id!(tab_device), live_id!(Device), "3D view", "3D view", false),
+    def(Editor::Device, live_id!(tab_device), live_id!(Device), "Product", "Product", false),
     def(Editor::Plates, live_id!(tab_plates), live_id!(Plates), "Plates", "Plates", false),
     def(Editor::Parts, live_id!(tab_parts), live_id!(Parts), "Parts", "Parts", false),
     def(Editor::Part, live_id!(tab_part), live_id!(Part), "Part", "Part", false),
     def(Editor::Slicer, live_id!(tab_slicer), live_id!(Slicer), "Slicer", "Slicer", false),
     def(Editor::Settings, live_id!(tab_settings), live_id!(Settings), "Job", "Job", false),
-    def(Editor::Printer, live_id!(tab_printer), live_id!(Printer), "Printer", "Printer", false),
+    def(Editor::Printer, live_id!(tab_printer), live_id!(Printer), "Printers", "Printers", false),
     def(Editor::Calibrate, live_id!(tab_calibrate), live_id!(Calibrate), "Calibrate", "Calibrate", false),
     def(Editor::Camera, live_id!(tab_camera), live_id!(Camera), "Camera", "Camera", false),
     def(Editor::Features, live_id!(tab_features), live_id!(Features), "Features", "Features", false),
@@ -215,11 +225,18 @@ impl Editor {
         self == Editor::Circuit
     }
 
-    /// Its body keeps the top-left corner clear for its area's nub: alone in an area it shows no
-    /// tab bar, only the nub. Every other editor alone keeps a tab bar of one, the nub at its
-    /// left end, so the nub covers none of it.
+    /// Its body keeps the top-left corner clear for its area's nub: a view, not a list. Every
+    /// other editor alone keeps a tab bar of one, the nub at its left end, so the nub covers none
+    /// of it.
     pub fn keeps_corner(self) -> bool {
         matches!(self, Editor::Viewport | Editor::Code | Editor::Device | Editor::Board | Editor::Circuit | Editor::Bench | Editor::Scope | Editor::Transport | Editor::Firmware)
+    }
+
+    /// Alone in an area it shows no tab bar, only the nub: a view that keeps the corner clear and
+    /// has no toolbar of its own (the Plate view's, the Program's and the Product view's nub is
+    /// their toolbar's first button, under a tab bar as every panel's).
+    pub fn bare_alone(self) -> bool {
+        self.keeps_corner() && !matches!(self, Editor::Viewport | Editor::Code | Editor::Device)
     }
 
     /// The editor whose bodies are of `kind`.
@@ -234,6 +251,11 @@ impl Editor {
             | Editor::Library | Editor::Checks | Editor::Requirements | Editor::Bom | Editor::BoardControls => Some(Family::Electronics),
             _ => None,
         }
+    }
+
+    /// An editor no area shows any more (it went into another), kept for the layouts that name it.
+    pub fn retired(self) -> bool {
+        matches!(self, Editor::Part | Editor::Parameters | Editor::Paint | Editor::Camera | Editor::Calibrate | Editor::Jobs | Editor::Settings | Editor::TestPrints | Editor::Performance | Editor::Journal)
     }
 
     pub fn of_kind(kind: LiveId) -> Option<Editor> {

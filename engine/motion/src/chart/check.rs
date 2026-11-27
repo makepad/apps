@@ -3,6 +3,7 @@
 //! Text is measured with the chart's own estimate (Inter's advances), so
 //! the checks run without a GPU.
 
+use crate::plain::PrimitiveFrame;
 use super::scale::text_box;
 use super::TEXT_ROLES;
 use crate::frame::{Item, ItemKind};
@@ -35,7 +36,7 @@ pub struct ChartIssue {
 
 /// A chart text's box in document units: `[x0, y0, x1, y1]`.
 fn text_bounds(item: &Item, opacity: f64) -> Option<[f64; 4]> {
-    let ItemKind::Text { text, size, weight, align, valign, line_height, wrap, fit, plate, reveal, .. } = &item.kind else { return None };
+    let ItemKind::Primitive(PrimitiveFrame::Text { text, size, weight, align, valign, line_height, wrap, fit, plate, reveal, .. }) = &item.kind else { return None };
     if opacity < 0.6 || text.trim().is_empty() || reveal == &Some(0) {
         return None;
     }

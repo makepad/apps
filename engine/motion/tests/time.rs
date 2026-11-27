@@ -1,6 +1,7 @@
 //! Animation over time: tracks, loops, staggers, spans, property functions,
 //! musical and spoken time, time domains and both signal providers.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::*;
 
 fn load(body: &str) -> MotionDoc {
@@ -62,7 +63,7 @@ fn property_functions_see_local_time_the_unit_and_inputs() {
     let frame = doc.eval(1.5);
     assert!(frame.errors.is_empty(), "{:?}", frame.errors);
     assert_eq!(frame.items[0].world.e, 1.5);
-    let ItemKind::Text { units, .. } = &frame.items[1].kind else { panic!() };
+    let ItemKind::Primitive(PrimitiveFrame::Text { units, .. }) = &frame.items[1].kind else { panic!() };
     assert_eq!(units.iter().map(|u| u.offset[1]).collect::<Vec<_>>(), vec![0.0, 10.0, 20.0]);
     assert_eq!(units[0].color, [0.0, 1.0, 0.0, 1.0]);
     // A failing function keeps the default and says why, at the function.
@@ -77,7 +78,7 @@ fn musical_time_resolves_against_the_grid_and_resyncs() {
     let doc = load("Rect{size: vec2(1, 1) fill: #fff x: tween(0, 10, beat(2), bar(1, 0)) span: [downbeat(1), beats(8)]}");
     // No grid: the document's 120 bpm, with a warning.
     assert!(doc.warnings.iter().any(|w| w.message.contains("no beat grid")), "{:?}", doc.warnings);
-    let LayerKind::Rect { .. } = &doc.layers[0].kind else { panic!() };
+    let LayerKind::Rect(_) = &doc.layers[0].kind else { panic!() };
     let span = doc.layers[0].span.clone().unwrap();
     assert_eq!((span.start.value, span.length.value), (2.0, 4.0));
     // Keys are on the layer's clock: beat 2 (1 s) is -1 s local, bar 1 (2 s) is 0.
@@ -133,7 +134,7 @@ fn voice_bound_text_follows_the_words() {
     let doc = load("Text{source: voice(@vo) show: @spoken highlight: @active highlight_color: #ffcc00 pop: @on_word y: tween(20, 0, 0, 0.2)}");
     let doc = doc.with_context(MotionContext::analyzed(features, None, 0.0)).unwrap().0;
     let frame = doc.eval(1.6);
-    let ItemKind::Text { text, units, .. } = &frame.items[0].kind else { panic!() };
+    let ItemKind::Primitive(PrimitiveFrame::Text { text, units, .. }) = &frame.items[0].kind else { panic!() };
     assert_eq!(text, "say it on the beat");
     assert_eq!(units.len(), 5);
     // Word 1 ("it") starts at 1.5: spoken, lit and popping; 2.. upcoming (hidden).

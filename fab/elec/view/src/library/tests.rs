@@ -41,13 +41,33 @@ fn standard_library_row_symbols_and_details() {
     let mut bare = (**entry("r 10kohm 0402").part.as_ref().unwrap()).clone();
     bare.symbol.units.clear();
     assert!(symbol::symbol_svg(&bare).is_none(), "even a familiar family needs a symbol unit");
+
+    // The person's badges follow the detail; a part that states neither keeps its detail.
+    let marked = |approved: bool, lifecycle: Option<fab_elec_parts::Lifecycle>| {
+        let mut e = entry("r 10kohm 0402").clone();
+        let part = Arc::make_mut(e.part.as_mut().unwrap());
+        part.approved = approved;
+        part.lifecycle = lifecycle;
+        entry_detail(&e)
+    };
+    use fab_elec_parts::Lifecycle::{Active, Nrnd, Obsolete};
+    for (approved, lifecycle, detail) in [
+        (false, None, "0402, 10k"),
+        (false, Some(Active), "0402, 10k"),
+        (true, None, "0402, 10k, approved"),
+        (true, Some(Active), "0402, 10k, approved"),
+        (false, Some(Nrnd), "0402, 10k, NRND"),
+        (true, Some(Obsolete), "0402, 10k, approved, obsolete"),
+    ] {
+        assert_eq!(marked(approved, lifecycle), detail, "approved {approved}, lifecycle {lifecycle:?}");
+    }
 }
 
 #[test]
 fn library_tree_shortcuts_categories_and_ranked_search() {
     let part = |name: &str, kind| Arc::new(PartDef {
         name: name.into(), kind, symbol: Default::default(), footprint: None, body: None,
-        pins: Vec::new(), fields: Default::default(), emitter: None, gpio: None,
+        pins: Vec::new(), fields: Default::default(), emitter: None, gpio: None, lifecycle: None, approved: false,
     });
     let entry = |name: &str, kind, part| CatalogEntry {
         lib: "test".into(), name: name.into(), kind, title: name.into(), summary: String::new(),

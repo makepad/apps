@@ -184,7 +184,7 @@ fn devices_pin_each_other_and_relink() {
     let all = [a.keys.stream_send, a.keys.stream_recv, a.keys.datagram_send, a.keys.datagram_recv];
     assert!((0..4).all(|i| (i + 1..4).all(|j| all[i] != all[j])), "four distinct keys");
     assert!(a.leftover.is_empty(), "no application bytes after the proof");
-    assert_eq!((a.version, b.version), (5, 5), "both devices linked at version 5");
+    assert_eq!((a.version, b.version), (VERSION, VERSION), "both devices linked at the current version");
     let first_stream = a.keys.stream_send;
 
     // Reconnects: each pair of three devices proves itself with no words, one link per pair.
@@ -201,7 +201,7 @@ fn devices_pin_each_other_and_relink() {
         runs.push(("reconnect", r, vec![devices[i].public(), devices[j].public()]));
     }
 
-    // No room id crosses in the proof: every frame of both modes is exactly its listed fields,
+    // No town id crosses in the proof: every frame of both modes is exactly its listed fields,
     // and the only keys in them are the two sides' own.
     for (mode, r, keys) in &runs {
         let a_serves = r.a_sent.first() == Some(&HELLO);
@@ -450,20 +450,26 @@ fn link_versions_below_the_pair_are_refused() {
     let (server_key, client_key) = if a.public() < b.public() { (a, b) } else { (b, a) };
     let r = run(Proof::new(again(server_key, client_key, 1), [1; 32], random(1)).unwrap(),
                 Proof::new(again(client_key, server_key, VERSION + 1), [1; 32], random(2)).unwrap());
-    assert!(matches!(r.b, Outcome::Refused(Refusal::Version)), "a client whose pair used a newer version: {:?}", r.b);
+    assert!(matches!(r.b, Outcome::Refused(Refusal::Version { .. })), "a client whose pair used a newer version: {:?}", r.b);
     let r = run(Proof::new(again(server_key, client_key, VERSION + 1), [1; 32], random(1)).unwrap(),
                 Proof::new(again(client_key, server_key, 1), [1; 32], random(2)).unwrap());
-    assert!(matches!(r.a, Outcome::Refused(Refusal::Version)), "a server whose pair used a newer version: {:?}", r.a);
+    assert!(matches!(r.a, Outcome::Refused(Refusal::Version { .. })), "a server whose pair used a newer version: {:?}", r.a);
     let mut client = Proof::new(again(client_key, server_key, 1), [1; 32], random(2)).unwrap();
-    let hello = [&[1][..], &7u16.to_be_bytes(), &[0; 32]].concat();
-    assert_eq!(client.feed(&framed(HELLO, &hello)).unwrap_err(), Refusal::Version, "an unknown version");
+    let hello = [&[1][..], &(VERSION + 1).to_be_bytes(), &[0; 32]].concat();
+    assert_eq!(client.feed(&framed(HELLO, &hello)).unwrap_err(), Refusal::Version { peer_newest: Some(VERSION + 1) }, "an unknown version");
 }
 
 #[test]
 fn incompatible_versions_notify_the_other_proof() {
     let f = fixture();
     type Constructor = fn(Mode, [u8; 32], [u8; 64]) -> Result<Proof, Refusal>;
-    for old in [Proof::version_one as Constructor, Proof::version_two, Proof::version_three, Proof::version_four] {
+    let mut hello_versions = vec![(1 + RECOGNISED.len()) as u8];
+    hello_versions.extend(VERSION.to_be_bytes());
+    for version in RECOGNISED { hello_versions.extend(version.to_be_bytes()); }
+    let [hi, lo] = VERSION.to_be_bytes();
+    for (index, old) in [Proof::version_one as Constructor, Proof::version_two, Proof::version_three, Proof::version_four,
+                Proof::version_five, Proof::version_six, Proof::version_seven].into_iter().enumerate() {
+        let previous = Refusal::Version { peer_newest: Some(index as u16 + 1) };
         for old_server in [true, false] {
             let server = if old_server { old } else { Proof::new };
             let client = if old_server { Proof::new } else { old };
@@ -471,27 +477,27 @@ fn incompatible_versions_notify_the_other_proof() {
             let mut client = client(first(&f.b, &f.a.invite, "Bob"), [1; 32], random(2)).unwrap();
             let hello = server.take_output();
             let (sender, receiver) = if old_server {
-                assert_eq!(client.feed(&hello).unwrap_err(), Refusal::Version, "our client refuses the older Hello");
+                assert_eq!(client.feed(&hello).unwrap_err(), previous, "our client refuses the older Hello");
                 (&mut client, &mut server)
             } else {
-                assert_eq!(&hello[3..14], &[5, 0, 5, 0, 1, 0, 2, 0, 3, 0, 4], "our Hello offers v5, then recognises v1 through v4");
+                assert_eq!(&hello[3..3 + hello_versions.len()], hello_versions, "our Hello offers the current version, then the recognised versions");
                 client.feed(&hello).unwrap();
                 let mut gate = client.take_output();
                 *gate.last_mut().unwrap() ^= 1;
-                assert_eq!(server.feed(&gate).unwrap_err(), Refusal::Version, "our server refuses the older version before checking its MAC");
+                assert_eq!(server.feed(&gate).unwrap_err(), previous, "our server refuses the older version before checking its MAC");
                 (&mut server, &mut client)
             };
             let notice = sender.take_output();
-            assert_eq!(notice, framed(VERSIONS, &[1, 0, 5]), "only the accepted version crosses after refusal");
+            assert_eq!(notice, framed(VERSIONS, &[1, hi, lo]), "only the accepted version crosses after refusal");
             receiver.feed(&notice[..1]).unwrap();
-            assert_eq!(receiver.feed(&notice[1..]).unwrap_err(), Refusal::Version, "the other proof recognises a fragmented notice");
+            assert_eq!(receiver.feed(&notice[1..]).unwrap_err(), Refusal::Version { peer_newest: Some(VERSION) }, "the other proof recognises a fragmented notice");
             assert!(receiver.take_output().is_empty(), "a received notice is never echoed");
         }
     }
 
     let mut server = Proof::new(first(&f.a, &f.b.invite, "Ada"), [1; 32], random(1)).unwrap();
     let mut gate = [0; 66];
-    gate[1] = 7;
+    gate[..2].copy_from_slice(&(VERSION + 1).to_be_bytes());
     assert_eq!(server.feed(&framed(GATE, &gate)).unwrap_err(), Refusal::Format("version not offered"), "an unoffered Gate is malformed");
     assert!(server.take_output().is_empty(), "a format refusal discloses nothing");
 }
@@ -499,14 +505,14 @@ fn incompatible_versions_notify_the_other_proof() {
 #[test]
 fn builds_that_share_no_version_both_end_with_a_version_refusal() {
     let f = fixture();
-    let current = [&[VERSION][..], RECOGNISED].concat();
+    let current: Vec<_> = std::iter::once(VERSION).chain(RECOGNISED).collect();
     for far_is_a in [true, false] {
         let (offered_a, offered_b) = if far_is_a { (vec![VERSION + 1], current.clone()) } else { (current.clone(), vec![VERSION + 1]) };
         let a = Proof::start(first(&f.a, &f.b.invite, "Ada"), [1; 32], random(1), offered_a).unwrap();
         let b = Proof::start(first(&f.b, &f.a.invite, "Bob"), [1; 32], random(2), offered_b).unwrap();
         let r = run(a, b);
-        assert!(matches!(r.a, Outcome::Refused(Refusal::Version)), "side a (far_is_a {far_is_a}): {:?}", r.a);
-        assert!(matches!(r.b, Outcome::Refused(Refusal::Version)), "side b (far_is_a {far_is_a}): {:?}", r.b);
+        assert!(matches!(r.a, Outcome::Refused(Refusal::Version { .. })), "side a (far_is_a {far_is_a}): {:?}", r.a);
+        assert!(matches!(r.b, Outcome::Refused(Refusal::Version { .. })), "side b (far_is_a {far_is_a}): {:?}", r.b);
     }
 
     // An older peer that predates the notice never sends one. What it sends instead is a message

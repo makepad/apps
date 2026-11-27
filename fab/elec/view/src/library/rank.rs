@@ -3,9 +3,18 @@
 use super::{default_text, package_code, quantity_text};
 use fab_elec_lang::{CatalogEntry, CatalogKind};
 use fab_elec_parts::PartKind;
+pub use fab_elec_parts::lifecycle_rank;
 
-/// Matching catalog indices, best first; equal scores keep catalog order.
-/// Every query word must match a field, and the weakest word sets the rank.
+/// Where the person's preference puts an entry among equal matches: approved parts first, then
+/// by lifecycle (active, unstated, NRND, obsolete).
+fn preference(entry: &CatalogEntry) -> (bool, u8) {
+    let (approved, lifecycle) = entry.part.as_ref().map_or((false, None), |part| (part.approved, part.lifecycle));
+    (!approved, lifecycle_rank(lifecycle))
+}
+
+/// Matching catalog indices, best first; equal scores prefer approved, then active parts, and
+/// otherwise keep catalog order. Every query word must match a field (`approved`, `active`,
+/// `nrnd` and `obsolete` among them), and the weakest word sets the rank. O(n log n) in matches.
 pub fn rank(entries: &[CatalogEntry], query: &str) -> Vec<usize> {
     let query = query.trim().to_lowercase();
     let words: Vec<_> = query.split_whitespace().collect();
@@ -13,9 +22,11 @@ pub fn rank(entries: &[CatalogEntry], query: &str) -> Vec<usize> {
         !entry.part.as_ref().is_some_and(|part| part.kind == PartKind::PowerFlag)
     });
     if words.is_empty() {
-        return offered.map(|(index, _)| index).collect();
+        let mut all: Vec<usize> = offered.map(|(index, _)| index).collect();
+        all.sort_by_key(|&index| preference(&entries[index]));
+        return all;
     }
-    // Three buckets keep ties stable without a sort over the catalog.
+    // Three buckets keep match quality first; a stable sort orders each by preference.
     let mut ranked: [Vec<usize>; 3] = Default::default();
     for (index, entry) in offered {
         let kind = match entry.kind {
@@ -28,6 +39,14 @@ pub fn rank(entries: &[CatalogEntry], query: &str) -> Vec<usize> {
             .chain(entry.pins.iter().map(|pin| pin.name.as_str()))
             .map(str::to_lowercase)
             .collect();
+        if let Some(part) = &entry.part {
+            if part.approved {
+                fields.push("approved".into());
+            }
+            if let Some(lc) = part.lifecycle {
+                fields.push(lc.name().into());
+            }
+        }
         if let Some(fp) = entry.part.as_ref().and_then(|part| part.footprint.as_ref()) {
             fields.push(fp.name.to_lowercase());
             if let Some(code) = package_code(&fp.name) {
@@ -59,6 +78,9 @@ pub fn rank(entries: &[CatalogEntry], query: &str) -> Vec<usize> {
             ranked[score].push(index);
         }
     }
+    for bucket in &mut ranked {
+        bucket.sort_by_key(|&index| preference(&entries[index]));
+    }
     ranked.into_iter().flatten().collect()
 }
 
@@ -66,7 +88,44 @@ pub fn rank(entries: &[CatalogEntry], query: &str) -> Vec<usize> {
 mod tests {
     use super::*;
     use fab_elec_lang::CatalogPin;
-    use fab_elec_parts::PinKind;
+    use fab_elec_parts::{Lifecycle, PartDef, PinKind};
+    use std::sync::Arc;
+
+    #[test]
+    fn ranking_prefers_approved_and_active_over_unapproved_nrnd_and_obsolete() {
+        let entry = |name: &str, approved: bool, lifecycle: Option<Lifecycle>| CatalogEntry {
+            lib: String::new(), name: name.into(), kind: CatalogKind::Part, title: name.into(), summary: String::new(),
+            pins: Vec::new(), stmt: String::new(), stem: String::new(), defaults: Vec::new(), hash: 0,
+            part: Some(Arc::new(PartDef {
+                name: name.into(), kind: PartKind::Ic, symbol: Default::default(), footprint: None, body: None,
+                pins: Vec::new(), fields: Default::default(), emitter: None, gpio: None, lifecycle, approved,
+            })),
+        };
+        // Catalog order is the reverse of the preferred order, so only preference can sort them.
+        let entries = vec![
+            entry("mcu_obsolete", false, Some(Lifecycle::Obsolete)),
+            entry("mcu_nrnd", false, Some(Lifecycle::Nrnd)),
+            entry("mcu_plain", false, None),
+            entry("mcu_active", false, Some(Lifecycle::Active)),
+            entry("mcu_approved", true, None),
+            entry("mcu_approved_active", true, Some(Lifecycle::Active)),
+        ];
+        assert_eq!(rank(&entries, "mcu"), vec![5, 4, 3, 2, 1, 0],
+            "approved+active < approved < active < unstated < NRND < obsolete among equal matches");
+        assert_eq!(rank(&entries, ""), vec![5, 4, 3, 2, 1, 0], "the whole catalog is in preferred order too");
+        assert_eq!(rank(&entries, "approved"), vec![5, 4], "approved is searchable");
+        assert_eq!(rank(&entries, "active"), vec![5, 3], "active is searchable, approved first");
+        assert_eq!(rank(&entries, "nrnd"), vec![1], "nrnd is searchable");
+        assert_eq!(rank(&entries, "obsolete"), vec![0], "obsolete is searchable");
+        let mut exact = entries.clone();
+        exact.push(entry("mcu", false, Some(Lifecycle::Obsolete)));
+        assert_eq!(rank(&exact, "mcu"), vec![6, 5, 4, 3, 2, 1, 0], "an exact match still beats preferred prefix matches");
+        let mut ties = entries.clone();
+        ties.push(entry("mcu_twin", true, Some(Lifecycle::Active)));
+        assert_eq!(rank(&ties, "mcu")[..2], [5, 6], "equal preference keeps catalog order");
+        let unmarked = vec![entry("b", false, None), entry("a", false, None), entry("c", false, None)];
+        assert_eq!(rank(&unmarked, ""), vec![0, 1, 2], "unmarked parts keep catalog order");
+    }
 
     #[test]
     fn library_search_ranks_exact_then_prefix_then_contains() {

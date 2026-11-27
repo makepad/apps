@@ -4,7 +4,7 @@
 //! Cost: one parse of the text (a second, line by line, only when the whole text does not parse)
 //! and O(statements) after it.
 
-use crate::{Bound, CountOf, Dim, Family, Measure, ReqDoc, Requirement, Value, Waiver};
+use crate::{Bound, Brief, CountOf, Dim, Family, Measure, ReqDoc, Requirement, Value, Waiver, Wish};
 use fab_elec_core::{Diag, DocId, Sel};
 use makepad_script::syntax::{self, Field, Kind, Node};
 use makepad_script::units::UnitTable;
@@ -22,12 +22,18 @@ pub fn units() -> UnitTable {
         .with("kg", 1000.0, 1.0)
 }
 
-const MEASURES: &str = "board(\"unit\").size|layers|parts|unplaced|unrouted, checks(@erc|@drc|@system|@case|@custom|@all).errors|warnings, case(\"unit\").fits, bench(\"bench\"), bench(\"bench\").expect(\"name\"), print.time, print.filament";
+pub const MEASURES: &str = "board.size|layers|parts|unplaced|unrouted (or board(\"unit\").*), checks(@erc|@drc|@system|@route|@case|@custom|@all).errors|warnings, case.fits (or case(\"unit\").fits), bench(\"bench\"), bench(\"bench\").expect(\"name\"), print.time, print.filament";
+
+pub const REQUIRE_EXAMPLE: &str = r#"require("fits", board.size, {max: [60mm 40mm]})"#;
+
+pub fn is_unknown_measure(message: &str) -> bool {
+    message.ends_with(" is not a measure")
+}
 
 /// Read a requirements document. Statements that read are kept even when others do not; the
 /// errors are located in `doc`. Names repeated in this document are errors at the second.
 pub fn read(doc: DocId, text: &str) -> (ReqDoc, Vec<Diag>) {
-    let mut out = ReqDoc { doc, requirements: Vec::new(), waivers: Vec::new() };
+    let mut out = ReqDoc { doc, ..ReqDoc::default() };
     let mut errors = Vec::new();
     let units = units();
     match syntax::parse_with(text, &units) {
@@ -82,6 +88,12 @@ impl Read<'_> {
         None
     }
 
+    fn diagnostic<T>(&mut self, (at, message): Fail, prefix: &str) -> Option<T> {
+        let span = self.offset + at.start as u32..self.offset + at.end as u32;
+        self.errors.push(located(self.doc, span, format!("{prefix}{message}")));
+        None
+    }
+
     fn statement(&mut self, n: &Node, out: &mut ReqDoc) {
         match n.as_call() {
             Some(("require", args)) => {
@@ -104,8 +116,36 @@ impl Read<'_> {
                     }
                 }
             }
+            Some((word @ ("brief" | "wish"), args)) => {
+                if let Err(e) = positional(args, word) {
+                    self.diagnostic::<()>(e, "");
+                    return;
+                }
+                let [arg] = args else {
+                    self.error::<()>(n, format!("{word} takes one string"));
+                    return;
+                };
+                let Some(words) = arg.string() else {
+                    self.error::<()>(arg, format!("{word} takes one string"));
+                    return;
+                };
+                let span = self.span(n);
+                if word == "wish" {
+                    if words.trim().is_empty() {
+                        self.error::<()>(arg, "a wish is empty: write it in the person's words");
+                    } else {
+                        out.wishes.push(Wish { words: words.trim().into(), span });
+                    }
+                } else if out.brief.is_some() {
+                    self.error::<()>(n, "a requirements document holds one brief(..)");
+                } else if words.trim().is_empty() {
+                    self.error::<()>(arg, "a brief is empty: write the person's brief");
+                } else {
+                    out.brief = Some(Brief { words: words.into(), span });
+                }
+            }
             _ => {
-                self.error::<()>(n, "a requirements document holds require(name, measure, bound), waive(name, reason) and propose_waiver(name, reason) statements");
+                self.error::<()>(n, "a requirements document holds require(name, measure, bound), waive(name, reason), propose_waiver(name, reason), wish(words) and brief(words) statements");
             }
         }
     }
@@ -119,13 +159,32 @@ impl Read<'_> {
     }
 
     fn require(&mut self, n: &Node, args: &[Node]) -> Option<Requirement> {
+        if let Some((first, _)) = entries(args).next() {
+            let name = match &args[0].kind {
+                Kind::Entry { name, value, .. } if name == "name" => value.string(),
+                _ => args[0].string(),
+            };
+            let prefix = name.filter(|s| !s.is_empty()).map_or_else(String::new, |s| format!("{s:?}: "));
+            let mut has_bound = false;
+            let mut has_other = false;
+            let labels: Vec<_> = entries(args).map(|(_, key)| {
+                if matches!(key, "min" | "max" | "is" | "tol") { has_bound = true; } else { has_other = true; }
+                format!("{key}:")
+            }).collect();
+            let fix = match (has_bound, has_other) {
+                (true, true) => "drop the labels and put the bound in {..}",
+                (true, false) => "put the bound in {..}",
+                _ => "write require(name, measure, bound) without labels",
+            };
+            return self.error(first, format!("{prefix}require(..) takes positional arguments, not {}; {fix}, e.g. {REQUIRE_EXAMPLE}", labels.join(", ")));
+        }
         if !(2..=3).contains(&args.len()) {
             return self.error(n, "require takes a name, a measure and a bound: require(\"fits\", board(\"main\").size, {max: [60mm 40mm]})");
         }
         let name = self.name(&args[0], "the requirement's name")?;
         let measure = match measure(&args[1], self.text) {
             Ok(m) => m,
-            Err(e) => return self.error(&args[1], format!("{name:?}: {e}")),
+            Err(e) => return self.diagnostic(e, &format!("{name:?}: ")),
         };
         let dim = measure.dim();
         let bound = match (args.get(2), dim) {
@@ -134,11 +193,7 @@ impl Read<'_> {
             (None, _) => return self.error(n, format!("{name:?}: give a bound: {{max: ..}}, {{min: ..}}, both, or {{is: ..}}")),
             (Some(b), dim) => match bound(b, self.text, dim) {
                 Ok(bound) => bound,
-                Err((at, e)) => {
-                    let span = self.offset + at.start as u32..self.offset + at.end as u32;
-                    self.errors.push(located(self.doc, span, format!("{name:?}: {e}")));
-                    return None;
-                }
+                Err(e) => return self.diagnostic(e, &format!("{name:?}: ")),
             },
         };
         Some(Requirement {
@@ -152,6 +207,7 @@ impl Read<'_> {
     }
 
     fn waive(&mut self, n: &Node, args: &[Node], word: &str, proposed: bool) -> Option<Waiver> {
+        if let Err(e) = positional(args, word) { return self.diagnostic(e, ""); }
         if args.len() != 2 {
             return self.error(n, format!("{word} takes the requirement's name and the reason: {word}(\"fits\", \"why\")"));
         }
@@ -161,87 +217,112 @@ impl Read<'_> {
     }
 }
 
+fn entries(args: &[Node]) -> impl Iterator<Item = (&Node, &str)> {
+    args.iter().filter_map(|arg| match &arg.kind {
+        Kind::Entry { name, .. } => Some((arg, name.as_str())),
+        _ => None,
+    })
+}
+
+fn positional(args: &[Node], call: &str) -> Result<(), Fail> {
+    if let Some((first, _)) = entries(args).next() {
+        let labels: Vec<_> = entries(args).map(|(_, key)| format!("{key}:")).collect();
+        return Err((first.span.clone(), format!("{call}(..) takes positional arguments, not {}; drop the labels", labels.join(", "))));
+    }
+    Ok(())
+}
+
 /// A string argument, the only one a call of the catalog takes.
-fn one_string(args: &[Node], call: &str) -> Result<String, String> {
+fn one_string(n: &Node, args: &[Node], call: &str) -> Result<String, Fail> {
+    positional(args, call)?;
     match args {
-        [n] => n.string().map(str::to_owned).filter(|s| !s.is_empty()).ok_or_else(|| format!("{call}(..) takes a name as a string")),
-        _ => Err(format!("{call}(..) takes one name as a string")),
+        [arg] => arg.string().map(str::to_owned).filter(|s| !s.is_empty()).ok_or_else(|| (n.span.clone(), format!("{call}(..) takes a name as a string"))),
+        _ => Err((n.span.clone(), format!("{call}(..) takes one name as a string"))),
     }
 }
 
 /// A measure of the catalog, from its call chain.
-fn measure(n: &Node, text: &str) -> Result<Measure, String> {
-    let unknown = || format!("{} is not a measure; the measures are {MEASURES}", n.text(text));
+fn measure(n: &Node, text: &str) -> Result<Measure, Fail> {
+    let fail = |message| (n.span.clone(), message);
+    let unknown = || fail(format!("{} is not a measure", n.text(text)));
+    let field_measure = |call, field: &str, unit| match (call, field) {
+        ("board", "size") => Ok(Measure::BoardSize(unit)),
+        ("board", "layers") => Ok(Measure::BoardLayers(unit)),
+        ("board", "parts") => Ok(Measure::BoardParts(unit)),
+        ("board", "unplaced") => Ok(Measure::BoardUnplaced(unit)),
+        ("board", "unrouted") => Ok(Measure::BoardUnrouted(unit)),
+        ("board", _) => Err(fail(format!("a board has size, layers, parts, unplaced and unrouted, not {field}"))),
+        ("case", "fits") => Ok(Measure::CaseFits(unit)),
+        ("case", _) => Err(fail(format!("a case has fits, not {field}"))),
+        _ => Err(unknown()),
+    };
     match &n.kind {
         Kind::Ident(path) => match path.as_str() {
             "print.time" => Ok(Measure::PrintTime),
             "print.filament" => Ok(Measure::PrintFilament),
-            _ => Err(unknown()),
+            _ => match path.split_once('.') {
+                Some((call, field)) => field_measure(call, field, None),
+                None => Err(unknown()),
+            },
         },
         Kind::Member { base, name, .. } => {
             let Some((call, args)) = base.as_call() else { return Err(unknown()) };
             match (call, name.as_str()) {
-                ("board", field) => {
-                    let unit = one_string(args, "board")?;
-                    match field {
-                        "size" => Ok(Measure::BoardSize(unit)),
-                        "layers" => Ok(Measure::BoardLayers(unit)),
-                        "parts" => Ok(Measure::BoardParts(unit)),
-                        "unplaced" => Ok(Measure::BoardUnplaced(unit)),
-                        "unrouted" => Ok(Measure::BoardUnrouted(unit)),
-                        _ => Err(format!("a board has size, layers, parts, unplaced and unrouted, not {field}")),
+                ("board", field) | ("case", field @ "fits") => {
+                    if args.is_empty() {
+                        return Err(fail(format!("write {call}.{field} for the device's only board, or {call}(\"unit\").{field} to name one")));
                     }
+                    field_measure(call, field, Some(one_string(n, args, call)?))
                 }
+                ("case", field) => field_measure(call, field, None),
                 ("checks", field) => {
                     let count = match field {
                         "errors" => CountOf::Errors,
                         "warnings" => CountOf::Warnings,
-                        _ => return Err(format!("checks(..) counts errors or warnings, not {field}")),
+                        _ => return Err(fail(format!("checks(..) counts errors or warnings, not {field}"))),
                     };
-                    let (family, unit) = checks_args(args)?;
+                    let (family, unit) = checks_args(n, args)?;
                     Ok(Measure::Checks { family, unit, count })
                 }
-                ("case", "fits") => Ok(Measure::CaseFits(one_string(args, "case")?)),
-                ("case", field) => Err(format!("a case has fits, not {field}")),
                 _ => Err(unknown()),
             }
         }
-        Kind::Call { callee, args, .. } => {
-            match &callee.kind {
-                Kind::Ident(name) if name == "bench" => Ok(Measure::Bench(one_string(args, "bench")?)),
-                Kind::Member { base, name, .. } if name == "expect" => match base.as_call() {
-                    Some(("bench", bench_args)) => Ok(Measure::BenchExpect { bench: one_string(bench_args, "bench")?, expect: one_string(args, "expect")? }),
-                    _ => Err(unknown()),
-                },
+        Kind::Call { callee, args, .. } => match &callee.kind {
+            Kind::Ident(name) if name == "bench" => Ok(Measure::Bench(one_string(n, args, "bench")?)),
+            Kind::Member { base, name, .. } if name == "expect" => match base.as_call() {
+                Some(("bench", bench_args)) => Ok(Measure::BenchExpect { bench: one_string(n, bench_args, "bench")?, expect: one_string(n, args, "expect")? }),
                 _ => Err(unknown()),
-            }
-        }
+            },
+            _ => Err(unknown()),
+        },
         _ => Err(unknown()),
     }
 }
 
 /// `checks(@family)` or `checks(@family, {unit: "u"})`.
-fn checks_args(args: &[Node]) -> Result<(Family, Option<String>), String> {
+fn checks_args(n: &Node, args: &[Node]) -> Result<(Family, Option<String>), Fail> {
+    positional(args, "checks")?;
+    let fail = |message| (n.span.clone(), message);
     let family_of = |n: &Node| {
         n.name().and_then(|s| Family::SPELLINGS.iter().find(|(f, _)| *f == s).map(|(_, f)| *f))
-            .ok_or_else(|| "checks(..) takes a family: @erc, @drc, @system, @route, @case, @custom or @all".to_owned())
+            .ok_or_else(|| fail("checks(..) takes a family: @erc, @drc, @system, @route, @case, @custom or @all".to_owned()))
     };
     match args {
         [f] => Ok((family_of(f)?, None)),
         [f, opts] => {
             let family = family_of(f)?;
-            let Kind::Object { ty: None, fields, .. } = &opts.kind else { return Err("checks(..)'s options are an object: {unit: \"main\"}".into()) };
+            let Kind::Object { ty: None, fields, .. } = &opts.kind else { return Err(fail("checks(..)'s options are an object: {unit: \"main\"}".into())) };
             let mut unit = None;
             for field in fields {
                 match (field.name.as_deref(), field.value.string()) {
                     (Some("unit"), Some(s)) if unit.is_none() && !s.is_empty() => unit = Some(s.to_owned()),
-                    (Some("unit"), _) => return Err("checks(..)'s unit is one unit's name, given once".into()),
-                    (other, _) => return Err(format!("checks(..) takes only unit, not {}", other.unwrap_or("a nameless field"))),
+                    (Some("unit"), _) => return Err(fail("checks(..)'s unit is one unit's name, given once".into())),
+                    (other, _) => return Err(fail(format!("checks(..) takes only unit, not {}", other.unwrap_or("a nameless field")))),
                 }
             }
             Ok((family, unit))
         }
-        _ => Err("checks(..) takes a family and optionally {unit: \"main\"}".into()),
+        _ => Err(fail("checks(..) takes a family and optionally {unit: \"main\"}".into())),
     }
 }
 

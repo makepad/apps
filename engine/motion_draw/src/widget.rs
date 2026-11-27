@@ -48,6 +48,9 @@ const UI_PRELUDE: &str = "use mod.prelude.widgets.*\nnil\n";
 /// A layer's `ui` (the document's fn) as a fn of this VM, moved here by its
 /// tokens under the widget prelude.
 pub fn widget_ui(vm: &mut ScriptVm, ui: &makepad_render_graph::pass::PassFn) -> Result<ScriptValue, String> {
+    if super::PLAIN_RECORDING.get() {
+        return Err("a widget cannot be built while drawing a picture read as data".into());
+    }
     let scope = match vm.end_scope_of(UI_SCOPE_FILE) {
         Some(scope) => scope,
         None => {
@@ -108,6 +111,9 @@ fn take_errors(vm: &mut ScriptVm, value: ScriptValue, what: &str) -> Result<(), 
 /// Build (when the props changed) and draw a widget item into its own
 /// target at `scale` pixels per unit.
 pub(super) fn render(md: &mut MotionDraw, cx: &mut Cx2d, item: &Item, scale: f64) -> Option<Texture> {
+    if md.refuse_plain_item(item) {
+        return None;
+    }
     let ItemKind::Widget { ui: Some(ui), size, props } = &item.kind else { return None };
     let source = ui.image.hash();
     let key = LiveId(source).bytes_append(&props_key(props).to_le_bytes()).0;

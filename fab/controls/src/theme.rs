@@ -28,9 +28,10 @@ use makepad_widgets_core::*;
 /// Body text, the second voice (kinds, counts, captions, inactive tabs) and
 /// the quietest one (hints, shortcuts, chevrons, disabled controls), as
 /// `0xRRGGBBAA`: the theme's own inks where they already read, else moved
-/// toward white or black until they do. All three are words somebody reads,
-/// so all three are held to `READABLE` (WCAG AA, 4.5:1) on each ground
-/// below; they stay apart because each starts from its own theme ink.
+/// toward white or black until they do. Body and second inks are held to
+/// `READABLE` (WCAG AA, 4.5:1) on each ground below, the quietest to `QUIET`
+/// (3:1), so it reads as a step back; they stay apart because each starts
+/// from its own theme ink.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Inks {
     pub text: u32,
@@ -57,7 +58,13 @@ impl Inks {
         let text = read("color_text").unwrap_or(0xffffffff);
         let dim = read("color_on_surface_variant").unwrap_or(text);
         let muted = read("color_text_disabled").unwrap_or(dim);
-        Self::fit(&grounds, text, dim, muted)
+        let fitted = Self::fit(&grounds, text, dim, muted);
+        // Fab's own tones (`toned`) are chosen values: kept as they are, not lifted to the contrast
+        // floors as a sheet's own inks would be.
+        match (Some(text) == hex_rgba(TEXT_REST), hex_rgba(TEXT_DIM)) {
+            (true, Some(dim)) => Self { text, dim, muted: dim },
+            _ => fitted,
+        }
     }
 
     /// The inks for these (opaque) grounds.
@@ -65,10 +72,16 @@ impl Inks {
         Self {
             text: ink_reading(grounds, text, READABLE),
             dim: ink_reading(grounds, dim, READABLE),
-            muted: ink_reading(grounds, muted, READABLE),
+            muted: ink_reading(grounds, muted, QUIET),
         }
     }
 }
+
+/// The quietest ink's floor: 3:1 (WCAG's for large text and for the parts of controls), under
+/// the body and second inks' 4.5:1, so the words that only qualify another (a feature's kind, a
+/// part's dimensions, a field's placeholder) stand a step back from the second voice instead of
+/// being lifted to it.
+const QUIET: f64 = 3.0;
 
 /// `ink`, or the nearest step from it toward the plain end (white on a dark
 /// panel, black on a light one) that reads at `need` on every ground.
@@ -79,6 +92,59 @@ fn ink_reading(grounds: &[u32], ink: u32, need: f64) -> u32 {
         .map(|step| mix_rgba(ink, end, step as f64 / 20.0))
         .find(|c| grounds.iter().all(|g| reads_on(*g, *c) >= need))
         .unwrap_or(end)
+}
+
+/// Fab's words on a dark sheet: at rest a step under white (`TEXT_REST`), the dimmed ones at
+/// `TEXT_DIM`, so plain white is left for what the pointer is on: every text and label ink's
+/// hover and press state lights to `TEXT_HOT`. Appended to the host's sheet before Fab wears it, so the library's own widgets
+/// (buttons, fields, tabs) take them as Fab's do. A light sheet's dark inks are left as they are.
+const TEXT_REST: &str = "#aaaaaa";
+/// Every dimmed word (labels, counts, kinds, dimensions, placeholders, inactive tabs).
+const TEXT_DIM: &str = "#666666";
+const TEXT_HOT: &str = "#ffffff";
+/// Words and marks on the accent's bright face (the Print button, an active toggle).
+const TEXT_ON_ACCENT: &str = "#x000000";
+
+/// How much brighter the editors' toolbars (and the shown tab over each) are than the sheet's
+/// `color_surface_container`.
+const TOOLBAR_LIFT: f64 = 1.15 * 1.10;
+/// How much brighter the tab bars are than the sheet's `color_surface_container_high`.
+const TAB_LIFT: f64 = 1.10;
+/// How much brighter the panels' ground is: a step under their toolbars, which it parts from.
+const PANEL_LIFT: f64 = 1.08 * 0.95;
+
+/// `0xRRGGBBAA` with each colour channel times `by` (capped at full), its alpha kept.
+fn brighter(c: u32, by: f64) -> u32 {
+    let ch = |shift: u32| ((((c >> shift) & 0xff) as f64 * by).round().min(255.0) as u32) << shift;
+    ch(24) | ch(16) | ch(8) | (c & 0xff)
+}
+
+/// `"#rrggbb"` as `0xRRGGBBAA` (opaque).
+fn hex_rgba(hex: &str) -> Option<u32> {
+    u32::from_str_radix(hex.strip_prefix('#')?, 16).ok().map(|rgb| (rgb << 8) | 0xff)
+}
+
+fn toned(mut sheet: StyleSheet) -> StyleSheet {
+    let light_ink = sheet.theme_color("color_text").is_some_and(|c| reads_on(0x000000ff, c) > reads_on(0xffffffff, c));
+    if light_ink {
+        let mut tones = String::from("\n// Fab: resting text under white, white on hover and press (fab::theme::toned)\n");
+        for ink in ["color_text", "color_label_inner", "color_label_outer", "color_label"] {
+            for (state, tone) in [("", TEXT_REST), ("_focus", TEXT_REST), ("_active", TEXT_REST), ("_hover", TEXT_HOT), ("_down", TEXT_HOT)] {
+                tones.push_str(&format!("mod.theme.{ink}{state} = {tone}\n"));
+            }
+        }
+        // on the accent's bright face (a primary button, an active toggle): black
+        tones.push_str(&format!("mod.theme.color_text_on_accent = {TEXT_ON_ACCENT}\n"));
+        for ink in ["color_on_surface_variant", "color_text_meta", "color_text_disabled", "color_label_inner_disabled", "color_label_outer_disabled", "color_label_disabled"] {
+            tones.push_str(&format!("mod.theme.{ink} = {TEXT_DIM}\n"));
+        }
+        // The property kit's fields (number fields and sliders, dropdowns, segmented choices): a
+        // shade under whatever ground they sit on (#0000002b, the section headers' were), a
+        // little less under the pointer.
+        tones.push_str("mod.theme.prop_field = #x0000002b\nmod.theme.prop_field_hover = #x0000001c\n");
+        sheet.theme.push_str(&tones);
+    }
+    sheet
 }
 
 /// The sheet Fab put on itself standalone, so an appearance change moves it
@@ -107,7 +173,7 @@ pub fn wear_host_sheet(vm: &mut ScriptVm) {
     }
     let dark = makepad_platform::host_dark().unwrap_or(true);
     let entry = host_family(vm.cx()).sheet(dark);
-    desktop_style::install(vm, StyleSheet::load(entry));
+    desktop_style::install(vm, toned(StyleSheet::load(entry)));
     *WORN_BY_FAB.lock().unwrap() = Some(entry.id);
 }
 
@@ -121,7 +187,7 @@ pub fn follow_host_appearance(cx: &mut Cx) {
     if want.id == worn || cx.with_vm(desktop_style::current_name).as_deref() != Some(worn) {
         return;
     }
-    cx.with_vm(|vm| desktop_style::install(vm, StyleSheet::load(want)));
+    cx.with_vm(|vm| desktop_style::install(vm, toned(StyleSheet::load(want))));
     *WORN_BY_FAB.lock().unwrap() = Some(want.id);
     cx.request_style_reload();
 }
@@ -131,18 +197,33 @@ pub fn script_mod(vm: &mut ScriptVm) {
     let text = ScriptValue::from_color(inks.text);
     let dim = ScriptValue::from_color(inks.dim);
     let muted = ScriptValue::from_color(inks.muted);
+    // the panels' ground (the lists and editors under their tabs) a step above the sheet's own
+    // rung: its colour, `PANEL_LIFT` up
+    let (panel, toolbar, header) = {
+        let theme = vm.module(id!(theme));
+        // (nil when the sheet has no such rung: the plain rung then, below)
+        let rung = vm.value(theme, id!(color_surface_container)).as_color();
+        let high = vm.value(theme, id!(color_surface_container_high)).as_color();
+        let lift = |rung: Option<u32>, by| rung.map_or(ScriptValue::NIL, |c| ScriptValue::from_color(brighter(c, by)));
+        (lift(rung, PANEL_LIFT), lift(rung, TOOLBAR_LIFT), lift(high, TAB_LIFT))
+    };
     script_eval!(vm, {
         use mod.prelude.widgets.*
 
         mod.fab = {
             // ---- surfaces ----
-            // The shell ground the docked panels and lists show, then the
-            // tab bars, caption and editor bars one rung up (opaque ladder).
-            color_area: theme.color_surface_container
-            color_editor: theme.color_surface_container
-            color_editor_alt: mix(theme.color_surface_container, theme.color_surface_container_high, 0.5)
-            color_header: theme.color_surface_container_high
-            color_panel: theme.color_surface_container
+            // The shell ground the docked panels and lists show (the sheet's
+            // container rung, `PANEL_LIFT` brighter), then the tab bars,
+            // caption and editor bars one rung up (opaque ladder).
+            color_area: #(panel) ?? theme.color_surface_container
+            color_editor: #(panel) ?? theme.color_surface_container
+            color_editor_alt: mix(#(panel) ?? theme.color_surface_container, theme.color_surface_container_high, 0.5)
+            // the tab bars (`TAB_LIFT` over the sheet's high rung)
+            color_header: #(header) ?? theme.color_surface_container_high
+            // the editors' toolbars (under their area's tabs) and the shown tab over each: a
+            // shade above the panel ground
+            color_toolbar: #(toolbar) ?? theme.color_surface_container
+            color_panel: #(panel) ?? theme.color_surface_container
             color_panel_sub: theme.color_inset
             color_popover: theme.color_surface_container_high
             color_popover_border: theme.color_bevel_outset_2
@@ -151,6 +232,9 @@ pub fn script_mod(vm: &mut ScriptVm) {
             color_border: theme.color_bevel_inset_2
             color_border_light: theme.color_bevel_outset_1
             color_row_hover: theme.color_outset_hover
+            // a foldable section's header: a faint white over the panel (#ffffff10, the fields'
+            // were)
+            color_section: #xffffff10
             color_input: theme.color_inset
             color_input_hover: theme.color_inset_hover
             color_input_active: theme.color_inset_active
@@ -160,14 +244,19 @@ pub fn script_mod(vm: &mut ScriptVm) {
             color_button_active: theme.color_ctrl_selected
 
             // ---- text ----
-            // Measured against every ground they are drawn on (`Inks`), all
-            // at 4.5:1. `dim` is the second voice (feature kinds, counts,
-            // captions, inactive tabs); `muted` the quietest (hints,
-            // shortcuts, chevrons, disabled controls).
+            // Measured against every ground they are drawn on (`Inks`): text
+            // and dim at 4.5:1, muted at 3:1. `dim` is the second voice
+            // (labels, counts, captions, inactive tabs); `muted` the quietest
+            // (feature kinds, dimensions, placeholders, hints, shortcuts,
+            // chevrons, disabled controls).
             color_text: #(text)
             color_text_dim: #(dim)
             color_text_muted: #(muted)
+            // a disabled button's text and icon: a dark wash over its ground, not a dimmed ink
+            color_disabled_ink: #x00000066
             color_text_active: #(text)
+            // what the pointer is on lights to the sheet's hover ink (white over Fab's resting ink)
+            color_text_hover: theme.color_text_hover
             color_text_header: #(text)
             color_text_on_accent: theme.color_text_on_accent
 
@@ -175,7 +264,9 @@ pub fn script_mod(vm: &mut ScriptVm) {
             color_accent: theme.color_focus
             color_accent_hover: theme.color_focus
             color_accent_dim: theme.color_bg_highlight
-            color_selection_bg: theme.color_bg_highlight
+            // a picked list row: the section headers' lighter grey (`color_section` over the panel
+            // ground), opaque, so a row that mixes into it from its ground reads as that grey
+            color_selection_bg: mix(#(panel) ?? theme.color_surface_container, #xffffff, 0.063)
             color_focus_ring: theme.color_focus
             color_warning: #xe0a020
             color_error: #xe04040
@@ -198,8 +289,14 @@ pub fn script_mod(vm: &mut ScriptVm) {
 
             // ---- chrome extras ----
             // Floating chrome over the view (the tool strip, the cards, chips).
-            color_float: theme.color_surface_container
+            // (one look for everything that floats: a toolbar over the view is a flyout's fill
+            // and outline, as the menus and popovers)
+            color_float: theme.color_surface_container_high
             color_float_border: theme.color_bevel_outset_2
+            // the soft drop shadow under every floating card (toolbars, flyouts, menus)
+            color_float_shadow: #x00000070
+            // the shadow along a scrolled panel's top edge, under its toolbar
+            color_scroll_shade: #x0000004d
             // Checkboxes / toggles, Fab's inset well and its filled state.
             color_toggle_off: theme.color_inset
             color_toggle_on: theme.color_ctrl_selected

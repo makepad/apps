@@ -111,8 +111,163 @@ pub fn rows(inst: &Instance) -> Vec<FeatureRow> {
         row.parent = parents.last().cloned();
         parents.push(row.id.clone());
     }
+    // An operand's role can change where its boolean is a plain union, subtract or intersect
+    // (a loop's row: its instances share one parent). O(rows).
+    let first_member = |out: &[FeatureRow], k: usize| -> Option<String> {
+        if !out[k].group { return Some(out[k].id.clone()); }
+        out[k + 1..].iter().take_while(|r| r.depth > out[k].depth).find(|r| r.depth == out[k].depth + 1).map(|r| r.id.clone())
+    };
+    for k in 0..out.len() {
+        if out[k].role.is_empty() || !out[k].editable { continue; }
+        let parent = first_member(&out, k).and_then(|id| solid_index(p, &id)).and_then(|i| p.solids[i].parent);
+        out[k].can_role = parent.is_some_and(|j| family(p.solids[j].proto).is_some());
+    }
     study_rows(inst, &tree, &mut out);
     out
+}
+
+fn solid_index(p: &makepad_model_script::lang::Program, id: &str) -> Option<usize> {
+    p.solids.iter().position(|s| s.id == id)
+}
+
+/// The booleans a role change rewrites: the plain ones (`m.union(a, b)`, `m.subtract(a, b)`,
+/// `m.intersect(a, b)`) and the smooth ones of a distance field (`m.blend([a b ..], radius)`,
+/// `m.carve(a, b, radius)`; none intersects). Its family (smooth or not) and the role its
+/// operands after the first take.
+fn family(proto: &str) -> Option<(bool, &'static str)> {
+    match proto {
+        "Union" | "BrepUnion" => Some((false, "+")),
+        "Difference" | "BrepDifference" => Some((false, "-")),
+        "Intersect" | "BrepIntersect" => Some((false, "&")),
+        "Blend" => Some((true, "+")),
+        "Carve" => Some((true, "-")),
+        _ => None,
+    }
+}
+
+/// How a call of the family takes its operands.
+#[derive(Clone, Copy, PartialEq)]
+enum Shape {
+    /// `call(a, b)`
+    Ab,
+    /// `call(a, b, radius)`
+    AbR,
+    /// `call([a b ..], radius)`
+    OfR,
+}
+
+/// The call a role is written with in a family, and its shape.
+fn role_call(smooth: bool, role: &str) -> Option<(&'static str, Shape)> {
+    match (smooth, role) {
+        (false, "+") => Some(("union", Shape::Ab)),
+        (false, "-") => Some(("subtract", Shape::Ab)),
+        (false, "&") => Some(("intersect", Shape::Ab)),
+        (true, "+") => Some(("blend", Shape::OfR)),
+        (true, "-") => Some(("carve", Shape::AbR)),
+        _ => None,
+    }
+}
+
+/// A call of `shape` on `base` and `ops` (one, or a list), its radius `extra` when it takes one.
+fn call_code(prefix: &str, call: &str, shape: Shape, base: &str, ops: &[&str], extra: &str) -> String {
+    let list = if ops.len() == 1 { ops[0].to_string() } else { format!("[{}]", ops.join(" ")) };
+    match shape {
+        Shape::Ab => format!("{prefix}{call}({base}, {list})"),
+        Shape::AbR => format!("{prefix}{call}({base}, {list}, {extra})"),
+        Shape::OfR => format!("{prefix}{call}([{base} {}], {extra})", ops.join(" ")),
+    }
+}
+
+/// The top-level arguments of a call's text (`m.subtract(body, [a b])` -> `body`, `[a b]`),
+/// or none when the brackets do not balance.
+fn call_args(text: &str, open: usize) -> Option<Vec<&str>> {
+    let inner = text.get(open + 1..text.len().checked_sub(1)?)?;
+    if !text.ends_with(')') { return None; }
+    let (mut depth, mut start, mut args) = (0i32, 0, Vec::new());
+    for (i, ch) in inner.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => { args.push(inner[start..i].trim()); start = i + 1; }
+            _ => {}
+        }
+        if depth < 0 { return None; }
+    }
+    args.push(inner[start..].trim());
+    (depth == 0).then_some(args)
+}
+
+/// The edit that makes operand `id` (a solid, or a loop's row) of its boolean joined (`+`),
+/// cut away (`-`) or intersected (`&`), the operands applying in the same order: the boolean
+/// splits there, its own call on the base and the operands before, then the new role's call
+/// with this operand, then its own call on that and the operands after (`m.subtract(body,
+/// [holes bores])`, holes joined: `m.subtract(m.union(body, holes), bores)`; a smooth one keeps
+/// its radius on every part). One edit of the boolean's code; only a call written with its
+/// operands (and radius) alone is rewritten.
+pub fn role_changed(state: &SourceState, inst: &Instance, id: &str, role: &str) -> Result<Vec<Change>, String> {
+    let p = &inst.script.program;
+    let src = inst.script.source();
+    let row = state.feature(id).ok_or("That feature is gone")?;
+    // the solids the row stands for
+    let members: Vec<usize> = if row.group {
+        state.features.iter().filter(|f| f.parent.as_deref() == Some(id)).filter_map(|f| solid_index(p, &f.id)).collect()
+    } else {
+        solid_index(p, id).into_iter().collect()
+    };
+    let first = *members.first().ok_or("That feature has no solid")?;
+    let pi = p.solids[first].parent.ok_or("It is no operand of a boolean")?;
+    if members.iter().any(|m| p.solids[*m].parent != Some(pi)) {
+        return Err("Its solids are operands of different booleans".into());
+    }
+    let parent = &p.solids[pi];
+    let (smooth, own) = family(parent.proto).ok_or("Only the operands of a union, subtract, intersect, blend or carve change role")?;
+    if own == role { return Ok(Vec::new()); }
+    let (old, old_shape) = role_call(smooth, own).ok_or("This boolean's operands keep their roles")?;
+    let (new, new_shape) = role_call(smooth, role).ok_or("A smooth boolean (blend, carve) has no intersect")?;
+    let span = parent.span.clone().ok_or("The boolean is not written in the script")?;
+    let text = src.get(span.clone()).ok_or("The boolean is not written in the script")?;
+    let open = text.find('(').ok_or("The boolean's call is not written as a call")?;
+    let prefix = text[..open].strip_suffix(old).ok_or("The boolean's call is written in a form this cannot rewrite")?;
+    let args = call_args(text, open).ok_or("The boolean's call is written in a form this cannot rewrite")?;
+    let want = match old_shape { Shape::Ab | Shape::OfR => 2, Shape::AbR => 3 };
+    if args.len() != want {
+        return Err("The boolean's call has more than its operands and radius: change it in the code".into());
+    }
+    let extra = if smooth { args[want - 1].to_string() } else { String::new() };
+    // each operand as written: inline code its own text, a named solid (or a loop's) its name
+    let code_of = |i: usize| -> String {
+        let s = &p.solids[i];
+        if let Some(r) = s.span.as_ref().filter(|r| r.start >= span.start && r.end <= span.end) {
+            return src[r.clone()].to_string();
+        }
+        match s.id.split_once('[') {
+            Some((head, _)) if p.names.syntax.find_let(head).is_some() => head.to_string(),
+            _ => s.id.clone(),
+        }
+    };
+    let (base, rest) = parent.children.split_first().ok_or("The boolean has no operands")?;
+    if members.contains(base) { return Err("The base of a boolean has no role to change".into()); }
+    // the operands after the base, a loop's instances (one name) as one
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for &c in rest {
+        let code = code_of(c);
+        match groups.last_mut() {
+            Some((last, solids)) if *last == code => solids.push(c),
+            _ => groups.push((code, vec![c])),
+        }
+    }
+    let k = groups.iter().position(|(_, solids)| solids.contains(&first)).ok_or("It is no operand of its boolean")?;
+    if members.iter().any(|m| !groups[k].1.contains(m)) || groups[k].1.len() != members.len() {
+        return Err("Change the role of the whole loop, not one of its instances".into());
+    }
+    fn names(gs: &[(String, Vec<usize>)]) -> Vec<&str> {
+        gs.iter().map(|g| g.0.as_str()).collect()
+    }
+    let base = code_of(*base);
+    let left = if k == 0 { base } else { call_code(prefix, old, old_shape, &base, &names(&groups[..k]), &extra) };
+    let mid = call_code(prefix, new, new_shape, &left, &[groups[k].0.as_str()], &extra);
+    let code = if k + 1 < groups.len() { call_code(prefix, old, old_shape, &mid, &names(&groups[k + 1..]), &extra) } else { mid };
+    Ok(vec![Change::Script { file: state.file.clone(), edit: Edit::Replace { solid: parent.id.clone(), code } }])
 }
 
 /// The force study's rows after the solids, in source order: one per `m.fixed` / `m.force` /
@@ -374,18 +529,47 @@ pub fn param_key(params: &fab::params::ParamState, key: &str) -> Option<String> 
 /// The Add menu's primitives (as plate parts) and the vocabulary by its groups.
 const PRIMITIVES: [(&str, &str); 5] = [("box", "Box"), ("cylinder", "Cylinder"), ("sphere", "Sphere"), ("cone", "Cone"), ("torus", "Torus")];
 
+/// The Add and Modify grids' icons: a primitive's own, and (`group_icon`) a group's tile that
+/// its types share until they get their own.
+fn icon(name: &'static str) -> &'static str {
+    match name {
+        "box" => "self://resources/icons/add_box.svg",
+        "cylinder" | "cone" => "self://resources/icons/add_cylinder.svg",
+        "sphere" => "self://resources/icons/add_sphere.svg",
+        "torus" => "self://resources/icons/radio_off.svg",
+        _ => "self://resources/icons/cube.svg",
+    }
+}
+
+fn group_icon(g: Group) -> &'static str {
+    match g {
+        Group::Generator => "self://resources/icons/extrude.svg",
+        Group::Brep => "self://resources/icons/cube.svg",
+        Group::Combine => "self://resources/icons/duplicate_linked.svg",
+        Group::Modify => "self://resources/icons/round.svg",
+        Group::Mechanical => "self://resources/icons/gear.svg",
+        Group::Text => "self://resources/icons/label.svg",
+        Group::Field => "self://resources/icons/sculpt.svg",
+        Group::Joint => "self://resources/icons/link.svg",
+        Group::Weave => "self://resources/icons/weave.svg",
+        Group::Lighten => "self://resources/icons/grid.svg",
+        _ => "self://resources/icons/shape.svg",
+    }
+}
+
 const MENU_GROUPS: [(Group, &str); 10] = [(Group::Generator, "From a sketch"), (Group::Brep, "Exact (B-rep)"), (Group::Combine, "Combine"), (Group::Modify, "Modify"), (Group::Mechanical, "Mechanical"), (Group::Text, "Text"), (Group::Field, "Field"), (Group::Joint, "Joint"), (Group::Weave, "Weave"), (Group::Lighten, "Lighten")];
 
 /// The Design workspace's Add menu: a flyout per group of the vocabulary, each type by its name.
 pub fn add_menu() -> Vec<fab::ui::popover::MenuItem> {
     use fab::ui::popover::MenuItem;
     use makepad_widgets::LiveId;
-    let mut menu = vec![MenuItem::new(LiveId::from_str("add_group_primitive"), "Primitives")
-        .flyout(PRIMITIVES.iter().map(|(shape, label)| MenuItem::new(LiveId::from_str(&format!("add_shape_{shape}")), label)).collect())];
+    let mut menu = vec![MenuItem::new(LiveId::from_str("add_group_primitive"), "Primitives").svg(icon("box"))
+        .flyout(PRIMITIVES.iter().map(|(shape, label)| MenuItem::new(LiveId::from_str(&format!("add_shape_{shape}")), label).svg(icon(shape))).collect())];
     for (g, label) in MENU_GROUPS {
-        let items: Vec<MenuItem> = PROTOS.iter().filter(|p| p.group == g).map(|p| MenuItem::new(LiveId::from_str(&format!("add_op_{}", p.name)), p.name)).collect();
+        let svg = group_icon(g);
+        let items: Vec<MenuItem> = PROTOS.iter().filter(|p| p.group == g).map(|p| MenuItem::new(LiveId::from_str(&format!("add_op_{}", p.name)), p.name).svg(svg)).collect();
         if !items.is_empty() {
-            menu.push(MenuItem::new(LiveId::from_str(&format!("add_group_{}", g.name())), label).flyout(items));
+            menu.push(MenuItem::new(LiveId::from_str(&format!("add_group_{}", g.name())), label).svg(svg).flyout(items));
         }
     }
     menu
@@ -420,10 +604,32 @@ const SHAPE_EDITS: [(&str, &str, fab::api::ShapeOp); 9] = {
     ]
 };
 
-/// The shape edits on the picked node.
-pub fn shape_menu() -> Vec<fab::ui::popover::MenuItem> {
-    SHAPE_EDITS.iter().map(|(id, label, _)| fab::ui::popover::MenuItem::new(makepad_widgets::LiveId::from_str(id), label)).collect()
+/// The Modify menu (the 3D view's bar): what changes the selected part. A feature of the
+/// vocabulary (the Add menu's groups but its primitives, which are new parts), a primitive cut
+/// away or joined, a flat or a plane cut, a split, a print settings box over it. Off with no part
+/// selected. Its picks are the feature menu's and the shape edits' ids ([`add_pick`],
+/// [`shape_pick`]) and `modify_settings_here`.
+pub fn modify_menu(has_part: bool) -> Vec<fab::ui::popover::MenuItem> {
+    use fab::ui::popover::MenuItem;
+    use makepad_widgets::LiveId;
+    let features: Vec<MenuItem> = add_menu().into_iter().filter(|m| m.id != LiveId::from_str("add_group_primitive")).collect();
+    let prims = |verb: &str, svgs: [&'static str; 3]| -> Vec<MenuItem> {
+        [("box", "Box"), ("cylinder", "Cylinder"), ("sphere", "Sphere")].iter().zip(svgs).map(|((p, label), svg)| MenuItem::new(LiveId::from_str(&format!("shape_{verb}_{p}")), label).svg(svg)).collect()
+    };
+    let cuts = ["self://resources/icons/cut_box.svg", "self://resources/icons/cut_cylinder.svg", "self://resources/icons/cut_sphere.svg"];
+    let joins = [icon("box"), icon("cylinder"), icon("sphere")];
+    vec![
+        MenuItem::new(LiveId::from_str("modify_feature"), "Add feature").svg("self://resources/icons/plus.svg").flyout(features).enabled_if(has_part),
+        MenuItem::new(LiveId::from_str("modify_cut"), "Cut away").svg(cuts[0]).flyout(prims("subtract", cuts)).enabled_if(has_part),
+        MenuItem::new(LiveId::from_str("modify_join"), "Join").svg("self://resources/icons/add.svg").flyout(prims("add", joins)).enabled_if(has_part),
+        MenuItem::sep(),
+        MenuItem::new(LiveId::from_str("shape_cut_bottom"), "Cut bottom flat").svg("self://resources/icons/cut_bottom.svg").enabled_if(has_part),
+        MenuItem::new(LiveId::from_str("shape_cut_plane"), "Plane cut").svg("self://resources/icons/cut_plane.svg").enabled_if(has_part),
+        MenuItem::new(LiveId::from_str("shape_split"), "Split + pins").svg("self://resources/icons/split_pins.svg").enabled_if(has_part),
+        MenuItem::new(LiveId::from_str("modify_settings_here"), "Settings here").svg("self://resources/icons/settings_here.svg").enabled_if(has_part),
+    ]
 }
+
 
 /// The operation of a Shape menu pick.
 pub fn shape_pick(id: makepad_widgets::LiveId) -> Option<fab::api::ShapeOp> {

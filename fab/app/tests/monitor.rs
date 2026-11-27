@@ -12,9 +12,9 @@
 //! - jobs on the disk and an empty plate: Monitor comes back on the printer's running job, its
 //!   layer, its elapsed time and its look-ahead; its end reaches the disk, the queued job stays
 //!   queued, and after another start it waits for a press, which asks about the plate first;
-//! - the Calibrate tab makes the clearance test part, which becomes the plate and slices (the
-//!   slice's layers show), and a result entered for it is stored for the printer and filament
-//!   (`FAB_CALIBRATION_DIR`);
+//! - calibration in the printer's Settings makes the clearance test part, which becomes the
+//!   plate and slices (the slice's layers show), and a result entered for it is stored for the
+//!   printer and filament (`FAB_CALIBRATION_DIR`);
 //! - in another session, every press of the top bar's Print answers: the confirm card opens at
 //!   the top of the Printer panel from each workspace, says how far the slice is and what stops
 //!   Start print as the printer's reports change, and only Cancel closes it; printability errors
@@ -27,6 +27,8 @@ mod common;
 #[path = "common/simulated_profiles.rs"]
 mod simulated_profiles;
 
+#[path = "common/render_mode.rs"]
+mod render_mode;
 #[path = "common/workspace_row.rs"]
 mod workspace_row;
 use fab::print::jobs::wall_now;
@@ -35,6 +37,25 @@ use makepad_test::{run_with_config, Role, Selector, TestApp, TestConfig};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+fn calibration_item(app: &TestApp, selector: Selector) -> makepad_test::Locator {
+    let panel = app.locator(Selector::role(Role::TabPanel).name("Printers")).snapshot().bounds;
+    let query = selector.as_query();
+    let item = app.locator(selector);
+    app.wait_until(|| {
+        if item.try_snapshot().is_ok() { return None; }
+        app.scroll_at(f64::from(panel.x + panel.w * 0.5), f64::from(panel.y + panel.h * 0.5), 0.0, f64::from(panel.h * 0.5), None);
+        Some(format!("scrolling the printer's Settings to {query}"))
+    });
+    // The other steps have the same buttons in their folded bodies. Act on the exact
+    // control we found on screen in the open step.
+    app.locator(Selector::path(item.snapshot().node.path))
+}
+
+fn open_clearance(app: &TestApp) {
+    calibration_item(app, Selector::role(Role::DisclosureButton).name("Settings")).expand();
+    calibration_item(app, Selector::role(Role::DisclosureButton).name("Clearance")).expand();
+}
 
 fn call(app: &TestApp, tool: &str, args: &str) -> Result<String, String> {
     let client = makepad_remote::Client::connect(&app.remote_endpoint()).map_err(|e| format!("connect: {e:?}"))?;
@@ -191,12 +212,12 @@ object(block)
 
 fn monitor(app: TestApp, sim: &Path, results: &Path) {
     app.locator(Selector::role(Role::Window)).wait_visible();
-    workspace_row::press(&app, "Design");
+    workspace_row::press(&app, "3D modeling");
     place_block(&app, tools_up(&app));
 
     // Slice (the Slice render mode slices and shows it): the plate's slice, Design's business. The
     // job the simulated printer runs is the committed one on the disk ("block").
-    app.locator(Selector::id("rm_slice")).click();
+    render_mode::pick(&app, "Sliced");
     wait_for_within(&app, Duration::from_secs(120), || match sliced(&app) {
         true => Ok(()),
         false => Err(format!("the block never sliced: {:?}", names(&app))),
@@ -249,7 +270,7 @@ fn monitor(app: TestApp, sim: &Path, results: &Path) {
     app.locator(top_layer.clone()).set_value("0.5");
     wait_name(&app, "Looking back at layer");
     let looked = wait_layer(&app, None);
-    workspace_row::press(&app, "Design");
+    workspace_row::press(&app, "3D modeling");
     assert_eq!(wait_layer(&app, Some(plate_count)), (plate_count, plate_count), "Design's slider was not moved");
     let head = tools_up(&app);
     let taller = r##"use mod.model.*
@@ -280,8 +301,8 @@ object(block)
 
     // ---- Calibrate (the printer idle again): the clearance part becomes the plate and slices ----
     report(sim, IDLE);
-    app.locator(Selector::role(Role::Tab).name("Calibrate")).wait_visible().click();
-    app.locator(Selector::role(Role::Button).name("Make test part")).wait_visible().press();
+    open_clearance(&app);
+    calibration_item(&app, Selector::role(Role::Button).name("Make test part")).press();
     wait_for_within(&app, Duration::from_secs(60), || match call(&app, "inspect", r#"{"program":false}"#).map(|l| text(&l)).expect("inspect").contains("block/block") {
         true => Err("the test part never became the plate".to_string()),
         false => Ok(()),
@@ -293,15 +314,19 @@ object(block)
     });
     // Back in Monitor: the check text, the numbered variants, and the answer.
     workspace_row::press(&app, "Monitor");
-    app.locator(Selector::role(Role::Tab).name("Calibrate")).wait_visible().click();
+    open_clearance(&app);
+    calibration_item(&app, Selector::role(Role::StaticText).text_contains("Hold each hub"));
     wait_name(&app, "Hold each hub");
     // the answer field stands at the row height, as the button under it does (a desktop sheet
     // gave a text input a field's height of its own, taller than Fab's rows)
-    let field = app.locator(Selector::role(Role::TextField)).wait_visible().snapshot().node.bounds;
-    let save = app.locator(Selector::role(Role::Button).name("Save result")).wait_visible().snapshot().node.bounds;
+    let answer = calibration_item(&app, Selector::id("first.input"));
+    let field = answer.snapshot().node.bounds;
+    let save_button = calibration_item(&app, Selector::role(Role::Button).name("Save result"));
+    let save = save_button.snapshot().node.bounds;
     assert_eq!(field.h, save.h, "the answer field {field:?} and Save result {save:?} stand at one row height");
-    app.locator(Selector::role(Role::TextField)).wait_visible().fill("5");
-    app.locator(Selector::role(Role::Button).name("Save result")).press();
+    answer.fill("5");
+    save_button.press();
+    calibration_item(&app, Selector::role(Role::StaticText).text_contains("Saved for Mechanics"));
     wait_name(&app, "Saved for Mechanics");
     let files: Vec<PathBuf> = std::fs::read_dir(results).unwrap().flatten().flat_map(|d| std::fs::read_dir(d.path()).into_iter().flatten().flatten().map(|f| f.path())).collect();
     assert_eq!(files.len(), 1, "one results file: {files:?}");
@@ -383,10 +408,10 @@ fn comes_back(app: TestApp, sim: &Path, jobs_dir: &Path) {
     // The queued job is listed and stays where it is when the first ends.
     wait_name(&app, "next: Queued");
     // Leaving Monitor is final for this run, even when another busy report arrives.
-    workspace_row::press(&app, "Design");
+    workspace_row::press(&app, "3D modeling");
     report(sim, &on_the_job("RUNNING", 0, 6, 50, 19));
     wait_report(&app, 6);
-    workspace_row::assert_shown(&app, "Design");
+    workspace_row::assert_shown(&app, "3D modeling");
     workspace_row::press(&app, "Monitor");
     report(sim, &on_the_job("FINISH", -1, JOB_LAYERS, 100, 0));
     wait_name(&app, "block: Finished");
@@ -468,7 +493,7 @@ fn print_button(app: TestApp, sim: &Path) {
     wait_no_name(&app, QUESTION);
 
     // From every workspace.
-    for ws in ["Mechanics", "Monitor", "Design"] {
+    for ws in ["Mechanics", "Monitor", "3D modeling"] {
         workspace_row::press(&app, ws);
         app.locator(print.clone()).click();
         wait_name(&app, QUESTION);
@@ -685,7 +710,7 @@ fn ticked_test_prints_commit_as_one_job_named_for_them() {
         let head = tools_up(&app);
         let batch = format!(r#"{{"request_id":"test-prints-mode-{head}","expected":{head:?},"action":"mode","tests":true}}"#);
         call(&app, "test_print", &batch).expect("choose Test prints");
-        app.locator(Selector::id("rm_slice")).click();
+        render_mode::pick(&app, "Sliced");
 
         let mut previous_slice = None;
         for (index, expected_names) in [&["Left", "Right"][..], &["Left"][..]].into_iter().enumerate() {
@@ -729,7 +754,7 @@ fn ticked_test_prints_commit_as_one_job_named_for_them() {
                 wait_name(&app, &format!("{}: Finished", meta.name));
                 std::fs::remove_file(fab_printer_link::sim::started_path(&sim)).unwrap();
                 report(&sim, IDLE);
-                workspace_row::press(&app, "Design");
+                workspace_row::press(&app, "3D modeling");
                 let head = tools_up(&app);
                 let batch = format!(r#"{{"request_id":"test-prints-untick-{head}","expected":{head:?},"action":"set","name":"Right","on":false}}"#);
                 call(&app, "test_print", &batch).expect("untick Right for the next print");
@@ -791,7 +816,7 @@ fn installed_profile_prints_queued_and_accepted_jobs_and_monitor_resumes() {
         wait_name(&app, &format!("{}: Finished", meta.name));
         std::fs::remove_file(fab_printer_link::sim::started_path(&sim)).unwrap();
         report(&sim, IDLE);
-        workspace_row::press(&app, "Design");
+        workspace_row::press(&app, "3D modeling");
         small_plate(&app, true);
         wait_for_within(&app, Duration::from_secs(120), || named(&app, "Not printable: floating island"));
         assert!(!names(&app).iter().any(|n| n == "Start print"), "the problem blocks printing until accepted");
@@ -887,15 +912,15 @@ fn a_committed_job_comes_back_after_a_restart_and_the_next_one_waits_for_its_pre
                 }
                 "workspace" => {
                     workspace_row::press(&app, "Mechanics");
-                    workspace_row::press(&app, "Design");
+                    workspace_row::press(&app, "3D modeling");
                 }
                 "edit" => place_block(&app, head),
                 _ => unreachable!(),
             }
-            workspace_row::assert_shown(&app, "Design");
+            workspace_row::assert_shown(&app, "3D modeling");
             report(&sim, &on_the_job("RUNNING", 0, 7, 60, 18).replace("\"msg\":1", "\"msg\":0"));
             wait_report(&app, 7);
-            workspace_row::assert_shown(&app, "Design");
+            workspace_row::assert_shown(&app, "3D modeling");
         });
     }
     let _ = std::fs::remove_dir_all(&dir);

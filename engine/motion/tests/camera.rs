@@ -1,4 +1,5 @@
 //! Camera and inset geometry through the unchanged frame evaluator.
+use makepad_motion::plain::{GroupProps, PrimitiveFrame};
 use makepad_motion::*;
 
 fn load(source: &str) -> MotionDoc {
@@ -36,7 +37,7 @@ fn camera_centers_zoom_and_clockwise_view_roll() {
         // a point ten world units to the right ends twenty pixels above centre.
         point(map.apply([10.0, 0.0]), expected);
         assert_eq!(doc.layers[0].transform.anchor, [0.0, 0.0]);
-        assert!(matches!(&doc.layers[0].kind, LayerKind::Group { size: None, .. }));
+        assert!(matches!(&doc.layers[0].kind, LayerKind::Group { props: GroupProps { size: None, .. }, .. }));
     }
     let doc = document(r#"Camera{center: vec2(1200, 300) screen: vec2(300, 200) zoom: 2 layers: [
         Rect{name: "point" at: vec2(1200, 300) size: vec2(10, 10) fill: #fff}
@@ -118,7 +119,7 @@ fn camera_keeps_common_fields_and_children_use_their_own_clock() {
 }
 
 fn rect_bounds(item: &Item) -> [[f64; 2]; 2] {
-    let ItemKind::Rect { size, .. } = &item.kind else { panic!("expected rectangle") };
+    let ItemKind::Primitive(PrimitiveFrame::Rect { size, .. }) = &item.kind else { panic!("expected rectangle") };
     let map = item.transform(*size);
     [map.apply([0.0, 0.0]), map.apply(*size)]
 }
@@ -137,7 +138,7 @@ fn zoomed_rect_fills_the_inset_and_has_a_box_mask() {
     assert_eq!(rect_bounds(copies[1]), [[1000.0, 200.0], [1400.0, 440.0]]);
     let ItemKind::Group { mask: Some(mask), .. } = &named(&doc, &frame, "zoom clip")[0].kind else { panic!("box mask") };
     assert_eq!(rect_bounds(mask), [[1000.0, 200.0], [1400.0, 440.0]]);
-    assert!(matches!(&mask.kind, ItemKind::Rect { radius, .. } if *radius == 12.0));
+    assert!(matches!(&mask.kind, ItemKind::Primitive(PrimitiveFrame::Rect { radius, .. }) if *radius == 12.0));
     assert_eq!(named(&doc, &frame, "zoom border").len(), 1);
 }
 
@@ -224,7 +225,7 @@ fn plot_and_named_data_items_can_be_copied_before_or_after_lowering() {
             let curves = named(&doc, &frame, "curve");
             assert_eq!(curves.len(), 2);
             let copy = curves[usize::from(!forward)];
-            let ItemKind::Path { path: data, .. } = &copy.kind else { panic!("lowered curve") };
+            let ItemKind::Primitive(PrimitiveFrame::Path { path: data, .. }) = &copy.kind else { panic!("lowered curve") };
             let contours = geometry::flatten(data, 0.01);
             point(copy.world.apply(contours[0].0[0]), [1000.0, 600.0]);
             point(copy.world.apply(*contours[0].0.last().unwrap()), [1400.0, 200.0]);
@@ -273,7 +274,7 @@ fn connectors_use_near_corners_and_do_not_cross_the_boxes() {
         Zoomed{of: "source" region: [200, 200, 100, 100] at: vec2(600, 150) size: vec2(200, 200)}
     "#);
     let frame = doc.eval(0.0);
-    let ItemKind::Path { path: data, .. } = &named(&doc, &frame, "zoom connectors")[0].kind else { panic!("connector path") };
+    let ItemKind::Primitive(PrimitiveFrame::Path { path: data, .. }) = &named(&doc, &frame, "zoom connectors")[0].kind else { panic!("connector path") };
     let lines = geometry::flatten(data, 0.01);
     assert_eq!(lines.len(), 2);
     assert_eq!(lines[0].0, vec![[300.0, 200.0], [600.0, 150.0]]);

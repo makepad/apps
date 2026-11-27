@@ -90,7 +90,18 @@ const DESIGN_READ: ActionDef = ActionDef {
     placed: bool  on its unit's board
   nets: [{..}]  a part or prefix keeps the nets touching the selected parts, with all their pins
     net: text
-    pins: [text]  each as ref.pin",
+    pins: [text]  each as ref.pin
+  blocks: [{..}]  on a whole-unit read when the circuit has block instances
+    path: text
+    def: text  block definition name
+    planned: bool
+    role: text  when declared
+    ports: [{..}]
+      name: text
+      kind: text
+      volts: [num V]  voltage range when declared
+      current: num A  current demand or capacity when declared
+      nets: [text]  bound net names in port order",
     fields: &[
         FieldDef { help: "Read only this named unit.", ..UNIT },
         FieldDef {
@@ -192,6 +203,7 @@ pub fn register_actions() {
     fab_elec_design::action::register(crate::board_actions::ACTIONS);
     fab_elec_design::action::register(crate::model_actions::ACTIONS);
     fab_elec_design::action::register(crate::doc_actions::ACTIONS);
+    fab_elec_design::action::register(crate::step_actions::ACTIONS);
     fab_elec_design::action::register(crate::sheet_actions::ACTIONS);
     fab_elec_design::action::register(crate::bench_actions::ACTIONS);
     fab_elec_design::action::register(crate::req_actions::ACTIONS);
@@ -470,6 +482,34 @@ pub fn design_read(design: &Design, args: &[(String, String)]) -> Result<String,
             }
             out.push_str("]} ");
         }
+        let c = &unit.circuit;
+        if c.tree.len() > 1 && matches!(filter, Filter::All) {
+            out.push_str("] blocks: [");
+            for b in c.tree.iter().filter(|b| b.parent.is_some()) {
+                let def = b.def.and_then(|id| c.block_defs.get(id.0 as usize));
+                write!(out, "{{path: {} def: {} planned: {}", quote(&b.path),
+                    quote(def.map_or("", |d| &d.name)), def.is_some_and(|d| d.planned)).unwrap();
+                if let Some(role) = def.and_then(|d| d.role.as_deref()) { write!(out, " role: {}", quote(role)).unwrap(); }
+                out.push_str(" ports: [");
+                for (i, (name, nets)) in b.ports.iter().enumerate() {
+                    use fab_elec_circuit::PortKind;
+                    let port = def.and_then(|d| d.ports.get(i));
+                    let kind = match port.map(|p| &p.kind) {
+                        Some(PortKind::PowerIn) => "power_in", Some(PortKind::PowerOut) => "power_out",
+                        Some(PortKind::Ground) => "ground", Some(PortKind::In) => "in", Some(PortKind::Out) => "out",
+                        Some(PortKind::Bidi) => "bidi", Some(PortKind::Passive) => "passive", Some(PortKind::Pair) => "pair",
+                        Some(PortKind::Bus { .. }) => "bus", Some(PortKind::Protocol(p)) => p, None => "unspecified",
+                    };
+                    write!(out, "{{name: {} kind: {}", quote(name), quote(kind)).unwrap();
+                    if let Some(v) = port.and_then(|p| p.volts) { write!(out, " volts: [{}V {}V]", v.min, v.max).unwrap(); }
+                    if let Some(a) = port.and_then(|p| p.current) { write!(out, " current: {a}A").unwrap(); }
+                    out.push_str(" nets: [");
+                    for n in nets { write!(out, "{} ", quote(&c.nets[n.ix()].name)).unwrap(); }
+                    out.push_str("]} ");
+                }
+                out.push_str("]} ");
+            }
+        }
         out.push_str("]} ");
     }
     if let Filter::Prefix(text) = filter {
@@ -491,7 +531,7 @@ pub(crate) fn check_family(kind: &CheckKind) -> &'static str {
     use CheckKind::*;
     match kind {
         PinConflict | UndrivenInput | PowerNotDriven | UnconnectedPin | SinglePinNet | DuplicateRefdes
-        | MissingFootprint | VoltageDomain | RailBudget => "erc",
+        | MissingFootprint | VoltageDomain | RailBudget | OpenPort => "erc",
         Mech | LinkPinMap | LinkMismatch | SystemVolts | SystemSource => "system",
         SharpCorner => "route",
         Custom(_) => "custom",
@@ -523,6 +563,8 @@ fn mm_text(nm: i64) -> String {
 
 fn measure_text(measure: Measure) -> String {
     match measure {
+        Measure::VRange(r) if r.min == r.max => format!("{}V", r.min),
+        Measure::VRange(r) => format!("{} to {}V", r.min, r.max),
         Measure::Len(nm) => mm_text(nm.into()),
         Measure::Qty(qty) => {
             let unit = match qty.unit {
@@ -547,6 +589,8 @@ fn measure_text(measure: Measure) -> String {
 fn sel_text(design: &Design, sel: &Sel) -> String {
     let comp = |c: &CompRef| design.unit(c.board).and_then(|unit| unit.circuit.comps.get(c.comp.ix()));
     match sel {
+        Sel::Block(unit, id) => design.unit(*unit).and_then(|u| u.circuit.tree.get(id.ix()))
+            .map_or_else(|| "a block".into(), |b| b.path.clone()),
         Sel::Unit(id) => design.unit(*id).map_or_else(|| "a unit".to_owned(), |unit| unit.name.clone()),
         Sel::Comp(c) | Sel::Feature(FeatureRef::Part(c) | FeatureRef::Body(c) | FeatureRef::Port(c, _)) => {
             comp(c).map_or_else(|| "a part".to_owned(), |comp| comp.refdes.clone())

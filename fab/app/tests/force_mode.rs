@@ -15,6 +15,8 @@
 //!
 //! HAL offscreen (`MAKEPAD_HAL_BACKEND=offscreen`), native GPU, no window.
 
+#[path = "common/render_mode.rs"]
+mod render_mode;
 mod common;
 #[path = "common/picture.rs"]
 mod picture;
@@ -227,9 +229,9 @@ fn force_while_the_slicer_runs(app: TestApp) {
     app.type_text("Export the Print");
     app.press_key(KeyCode::ReturnKey);
     wait_until(&app, "the slice to start", || slice_state(&app).ends_with('%'));
-    let (_, orange, _) = shares(&app, "Part");
+    let (_, orange, _) = shares(&app, "Slicer");
 
-    shown(&app, Selector::role(Role::Radio).name("Force").nth(0)).select();
+    render_mode::pick(&app, "Force");
     let opened = Instant::now();
     // the study's state: the part read, waiting for its fixtures and loads
     let status = "Add a fixture and a load";
@@ -308,7 +310,7 @@ fn place_bracket(app: &TestApp, extra: &str) -> String {
     let head = head_of(&text(&call(app, "script", &batch).expect("script")));
     let batch = format!(r#"{{"request_id":"force-bracket-place","expected":{head:?},"edits":{}}}"#, Value::Str("place(\"bracket\", at: [150mm 165mm], name: \"Shelf bracket\")".to_string()).to_json());
     let head = head_of(&text(&call(app, "place", &batch).expect("place")));
-    shown(app, Selector::role(Role::Radio).name("Force").nth(0)).select();
+    render_mode::pick(app, "Force");
     head
 }
 
@@ -392,9 +394,9 @@ fn the_demo_bracket(app: TestApp) {
     println!("force study: {estimated}");
     // Force slices nothing itself: Sliced slices the plate on demand, and back in Force the study
     // reads the bracket's walls and skins from that slice and solves again from the estimate's answer
-    shown(&app, Selector::id("rm_slice")).select();
+    render_mode::pick(&app, "Sliced");
     wait_until(&app, "the plate to be sliced", || slice_state(&app) == "Sliced");
-    shown(&app, Selector::role(Role::Radio).name("Force").nth(0)).select();
+    render_mode::pick(&app, "Force");
     wait_poll(&app, || {
         lines = texts(&app);
         if !(lines.iter().any(|t| t.starts_with("Done in")) && lines.iter().any(|t| t.contains("As sliced (slice of "))) { Err(format!("the study did not read the bracket's slice: CPU budget {} s exhausted or the app sat idle (the slice at {}); texts {lines:?}", HANG.as_secs(), slice_state(&app))) } else { Ok(()) }

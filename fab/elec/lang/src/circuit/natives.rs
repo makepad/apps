@@ -16,7 +16,7 @@ use fab_elec_circuit::{
     value_unit, BlockDefId, BlockSheet, Edge, Flow, PortDef, PortKind, PortSide, QtyUnit, Quantity, ViaSize,
 };
 use fab_elec_core::{Angle, Contour, LayerSet, Nm, Path, PolySet, Shape, Side, Xform3, P};
-use fab_elec_parts::{Body3d, BodyColour, BodyPort, BodyPortKind, BodySource, BodySurface, Emitter, EmitterFace, FpMount, GpioCard, Light, Limits, PackageKind, PadKind, PadShape, PartKind, PinDef, Tol};
+use fab_elec_parts::{Body3d, BodyColour, BodyPort, BodyPortKind, BodySource, BodySurface, Emitter, EmitterFace, FpMount, GpioCard, Lifecycle, Light, Limits, PackageKind, PadKind, PadShape, PartKind, PinDef, Tol};
 use fab_materials::{Colour, FinishId, MaterialId, Surface};
 
 type Native = Box<dyn Fn(&mut ScriptVm, ScriptObject) -> ScriptValue>;
@@ -684,7 +684,7 @@ fn define_part(c: &mut Ctx, name: &str, spec: &V, h: &Here, at: &mut Here) -> Re
         return Err("a part with this name is defined already".into());
     }
     let Some(o) = spec.obj() else { return Err(format!("the definition must be an object, got {}", spec.describe())) };
-    check_opts_at(o, &["kind", "symbol", "footprint", "body", "emitter", "pads", "limits", "prefix", "fields", "gpio"], c, h, 1, &[], at)?;
+    check_opts_at(o, &["kind", "symbol", "footprint", "body", "emitter", "pads", "limits", "prefix", "fields", "gpio", "lifecycle", "approved"], c, h, 1, &[], at)?;
     let Some(Handle::Sym(s)) = o.get("symbol").and_then(V::handle) else {
         return Err("needs a symbol (symbol: f.ic_symbol(..) or f.two_terminal(..))".into());
     };
@@ -792,6 +792,26 @@ fn define_part(c: &mut Ctx, name: &str, spec: &V, h: &Here, at: &mut Here) -> Re
             Some(gpio_of(v, c, h, at)?)
         }
     };
+    let lifecycle = match o.get("lifecycle") {
+        None | Some(V::Nil) => None,
+        Some(v) => match v.text_or_id().and_then(Lifecycle::of_name) {
+            Some(lc) => Some(lc),
+            None => {
+                *at = option_here(c, h, 1, &["lifecycle"]);
+                return Err(format!("lifecycle: expected @active, @nrnd or @obsolete, got {}", v.describe()));
+            }
+        },
+    };
+    let approved = match o.get("approved") {
+        None | Some(V::Nil) => false,
+        Some(v) => match v.bool() {
+            Some(b) => b,
+            None => {
+                *at = option_here(c, h, 1, &["approved"]);
+                return Err(format!("approved: expected true or false, got {}", v.describe()));
+            }
+        },
+    };
     *at = h.clone();
     let body = match o.get("body") {
         None | Some(V::Nil) => None,
@@ -819,6 +839,8 @@ fn define_part(c: &mut Ctx, name: &str, spec: &V, h: &Here, at: &mut Here) -> Re
         fields,
         emitter,
         gpio: card,
+        lifecycle,
+        approved,
     };
     let def = apply_body_override(c, Arc::new(def));
     let ix = c.parts.len();
@@ -1971,9 +1993,19 @@ fn block(c: Shared) -> Native {
         let raw = arg(vm, args, id_lut!(spec)).as_object();
         let mut cx = c.borrow_mut();
         let h = here(vm, &cx);
-        let made = (|| -> Result<(BlockDef, ScriptValue, Option<ScriptObject>), String> {
+        let made = (|| -> Result<(BlockDef, Option<ScriptValue>, Option<ScriptObject>), String> {
             let Some(o) = spec.obj() else { return Err(format!("e.block takes {{name ports params build sheet}}, got {}", spec.describe())) };
-            check_opts(o, &["name", "ports", "params", "build", "sheet"])?;
+            check_opts(o, &["name", "ports", "params", "build", "sheet", "planned", "role"])?;
+            let planned = match o.get("planned") {
+                None => false,
+                Some(V::Bool(v)) => *v,
+                Some(v) => return Err(format!("planned: expected a boolean, got {}", v.describe())),
+            };
+            let role = match o.get("role") {
+                None => None,
+                Some(V::Str(s)) if !s.trim().is_empty() => Some(s.clone()),
+                Some(_) => return Err("role: expected a non-empty string".into()),
+            };
             let name = o.get("name").and_then(V::text).map(str::to_string).ok_or("name: a block needs a name string")?;
             let mut ports = Vec::new();
             if let Some(p) = o.get("ports") {
@@ -2026,20 +2058,24 @@ fn block(c: Shared) -> Native {
             }
             let Some(spec_obj) = raw else { return Err("e.block: expected an object".into()) };
             let build = field(vm, spec_obj, id_lut!(build));
-            if !build.as_object().is_some_and(|b| vm.bx.heap_ref().is_fn(b)) {
+            let build = if planned && build.is_nil() {
+                None
+            } else if build.as_object().is_some_and(|b| vm.bx.heap_ref().is_fn(b)) {
+                Some(build)
+            } else {
                 return Err(format!("{name}: build: expected fn(p, o) {{ .. }}"));
-            }
+            };
             let params_obj = field(vm, spec_obj, id_lut!(params)).as_object();
             // The id is issued at the first instance (`used`), so a library block nobody makes
             // never enters the circuit.
-            Ok((BlockDef { id: BlockDefId(u32::MAX), name, ports, params, sheet, template: None }, build, params_obj))
+            Ok((BlockDef { id: BlockDefId(u32::MAX), name, ports, params, sheet, template: None, planned, role }, build, params_obj))
         })();
         let (def, build, params_obj) = match made {
             Ok(x) => x,
             Err(m) => return fail(&mut cx, &h, m),
         };
         let i = cx.defs.len();
-        if let Some(b) = build.as_object() {
+        if let Some(b) = build.and_then(|v| v.as_object()) {
             let r = vm.new_object_ref(b);
             cx.keep.push(r);
         }
@@ -2064,7 +2100,7 @@ fn instance(c: &Shared, def: usize, vm: &mut ScriptVm, args: ScriptObject) -> Sc
     let h = here(vm, &cx);
     let path = item_path(&mut cx, &h, "block");
     let d = &cx.defs[def];
-    let (build, params_obj) = (d.build, d.params);
+    let (build, params_obj, planned) = (d.build, d.params, d.def.planned);
     let port_defs: Vec<String> = d.def.ports.iter().map(|p| p.name.clone()).collect();
     let defaults = d.def.params.clone();
     let block_name = d.def.name.clone();
@@ -2075,7 +2111,12 @@ fn instance(c: &Shared, def: usize, vm: &mut ScriptVm, args: ScriptObject) -> Sc
     };
     let mut ports = Vec::new();
     for p in &port_defs {
-        let Some((_, v)) = fields.iter().find(|(k, _)| k == p) else {
+        let value = fields.iter().find(|(k, _)| k == p).map(|(_, v)| v);
+        if planned && matches!(value, None | Some(V::Nil)) {
+            ports.push((p.clone(), Vec::new()));
+            continue;
+        }
+        let Some(v) = value else {
             return fail(&mut cx, &h, format!("{path}: port {p} of {block_name} is not connected"));
         };
         match port_nets(&mut cx, v) {
@@ -2106,6 +2147,9 @@ fn instance(c: &Shared, def: usize, vm: &mut ScriptVm, args: ScriptObject) -> Sc
     let parent = cx.build.inst();
     let inst = cx.build.insts.len();
     cx.build.insts.push(InstRec { path, def: Some(used), rec: Some(def), parent: Some(parent), ports, params, here: Some(h) });
+    let Some(build) = build else {
+        return handle(vm, id_lut!(Inst), inst).into();
+    };
     cx.build.stack.push(inst);
     let param_names: Vec<String> = defaults.iter().map(|(n, _)| n.clone()).collect();
     drop(cx);

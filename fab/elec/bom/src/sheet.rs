@@ -4,6 +4,7 @@ use fab_elec_cam::tables::{assembly_view, bom_from_board, bom_from_circuit};
 use fab_elec_circuit::{Circuit, Component};
 use fab_elec_core::{BoardId, CompId};
 use fab_elec_design::Design;
+use fab_elec_parts::Lifecycle;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub struct SheetView {
@@ -68,6 +69,12 @@ pub struct BomRow {
     pub fields: BTreeMap<String, BTreeSet<String>>,
     /// Keys supplied by the part library on at least one member of this row.
     pub inherited: BTreeSet<String>,
+    /// The worst lifecycle of the row's components (a component's `lifecycle` field over its
+    /// part's); `None` when none states one.
+    pub lifecycle: Option<Lifecycle>,
+    /// Every component of the row is on a part the person approved; `false` for a row without
+    /// circuit components.
+    pub approved: bool,
 }
 
 /// One distinct sourcing option on this line. Its member paths may be a subset of the fitted row.
@@ -165,13 +172,25 @@ pub fn sheet(design: &Design, unit: BoardId, view: &SheetView) -> Result<BomShee
             }
         }
         let key = line_key(&unit.name, &built.paths);
+        // The worst stated lifecycle (`Obsolete > Nrnd > Active`); approval only when every
+        // circuit component's part is approved.
+        let lifecycle = comps.iter().filter_map(|id| {
+            let c = &unit.circuit.comps[id.ix()];
+            c.fields.get("lifecycle").filter(|v| !v.is_empty()).and_then(Lifecycle::of_name).or(c.part.lifecycle)
+        }).max();
+        let approved = !comps.is_empty() && comps.iter().all(|id| unit.circuit.comps[id.ix()].part.approved);
+        match lifecycle {
+            Some(Lifecycle::Nrnd) => { checks.insert("NRND"); }
+            Some(Lifecycle::Obsolete) => { checks.insert("obsolete"); }
+            _ => {}
+        }
         let alternates = alternatives.into_iter().map(|((number, mpn, supplier, supplier_part, note, ai, _), parts)| {
             let paths = parts.iter().map(|(_, _, p)| p.clone()).collect::<Vec<_>>();
             Alternate { number, mpn, supplier, supplier_part, note, ai, key: line_key(&unit.name, &paths),
                 refs: parts.iter().map(|(_, r, _)| r.clone()).collect(), comps: parts.into_iter().map(|(c, _, _)| c).collect(), read_only: None }
         }).collect();
         BomRow { members, alternates, read_only: None, cells: built.row.cells, refs: built.row.refs, qty: built.paths.len(), paths: built.paths,
-            comps, dnp, key, checks, fields, inherited }
+            comps, dnp, key, checks, fields, inherited, lifecycle, approved }
     }).collect();
     let mut lines = Vec::new();
     for (i, row) in rows.iter().enumerate() {
@@ -189,4 +208,71 @@ pub fn line_members(key: &str) -> Result<(String, Vec<String>), String> {
     if paths.is_empty() { return Err("empty BOM line".into()); }
     Ok((unit.as_str().ok_or("invalid unit")?.into(),
         paths.iter().map(|v| v.as_str().map(str::to_owned).ok_or("invalid member path")).collect::<Result<_, _>>()?))
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn bom_sheet_surfaces_approved_and_warns_on_nrnd_and_obsolete() {
+        let mut design = fab_elec_fixtures::ledctl();
+        let id = design.units[0].id;
+        let before = sheet(&design, id, &SheetView::default()).unwrap();
+        assert!(before.rows.iter().all(|r| !r.approved && r.lifecycle.is_none()), "the fixture states no lifecycle or approval");
+        assert!(before.rows.iter().all(|r| !r.checks.contains("NRND") && !r.checks.contains("obsolete")));
+        let with_comps: Vec<usize> = (0..before.rows.len()).filter(|&i| !before.rows[i].comps.is_empty()).collect();
+        let pair = *with_comps.iter().find(|&&i| before.rows[i].comps.len() >= 2).expect("the fixture groups a line of two parts");
+        let singles: Vec<usize> = with_comps.iter().copied().filter(|&i| i != pair).take(3).collect();
+        assert_eq!(singles.len(), 3, "the fixture has three more lines with components");
+        let (approved_row, nrnd_row, field_row) = (singles[0], singles[1], singles[2]);
+
+        let circuit = Arc::make_mut(&mut design.units[0].circuit);
+        let mut part = |cid: CompId, f: &dyn Fn(&mut fab_elec_parts::PartDef)| f(Arc::make_mut(&mut circuit.comps[cid.ix()].part));
+        // Every member approved and active: an approved, active line with no lifecycle check.
+        for &cid in &before.rows[approved_row].comps {
+            part(cid, &|p| { p.approved = true; p.lifecycle = Some(Lifecycle::Active); });
+        }
+        // Every member NRND (and approved): an approved line with an NRND check.
+        for &cid in &before.rows[nrnd_row].comps {
+            part(cid, &|p| { p.approved = true; p.lifecycle = Some(Lifecycle::Nrnd); });
+        }
+        // Mixed approval in a grouped line: not approved; an obsolete member makes it obsolete.
+        let (first, second) = (before.rows[pair].comps[0], before.rows[pair].comps[1]);
+        part(first, &|p| { p.approved = true; p.lifecycle = Some(Lifecycle::Active); });
+        part(second, &|p| p.lifecycle = Some(Lifecycle::Obsolete));
+        // A component's own `lifecycle` field wins over its part's.
+        for &cid in &before.rows[field_row].comps {
+            part(cid, &|p| p.lifecycle = Some(Lifecycle::Active));
+        }
+        let field_comp = before.rows[field_row].comps[0];
+        circuit.comps[field_comp.ix()].fields.0.push(("lifecycle".into(), "obsolete".into()));
+
+        let after = sheet(&design, id, &SheetView::default()).unwrap();
+        assert_eq!(after.rows.len(), before.rows.len(), "lifecycle and approval change no row count");
+        for (a, b) in after.rows.iter().zip(&before.rows) {
+            assert_eq!((&a.key, &a.refs, &a.comps), (&b.key, &b.refs, &b.comps), "lifecycle and approval change no grouping");
+        }
+        let row = &after.rows[approved_row];
+        assert!(row.approved, "every member approved makes the line approved");
+        assert_eq!(row.lifecycle, Some(Lifecycle::Active));
+        assert!(!row.checks.contains("NRND") && !row.checks.contains("obsolete"), "an active line has no lifecycle check");
+        let row = &after.rows[nrnd_row];
+        assert!(row.approved && row.lifecycle == Some(Lifecycle::Nrnd));
+        assert!(row.checks.contains("NRND") && !row.checks.contains("obsolete"), "an NRND line warns NRND: {:?}", row.checks);
+        let row = &after.rows[pair];
+        assert!(!row.approved, "mixed approval is not approved");
+        assert_eq!(row.lifecycle, Some(Lifecycle::Obsolete), "the worst member's lifecycle is the line's");
+        assert!(row.checks.contains("obsolete") && !row.checks.contains("NRND"), "{:?}", row.checks);
+        let row = &after.rows[field_row];
+        assert!(!row.approved, "unapproved parts make no approved line");
+        assert_eq!(row.lifecycle, Some(Lifecycle::Obsolete), "the component field wins over the part's lifecycle");
+        assert!(row.checks.contains("obsolete"));
+        for (i, row) in after.rows.iter().enumerate() {
+            if ![approved_row, nrnd_row, pair, field_row].contains(&i) {
+                assert!(!row.approved && row.lifecycle.is_none(), "untouched lines stay as they were");
+            }
+        }
+    }
 }

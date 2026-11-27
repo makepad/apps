@@ -290,11 +290,11 @@ fn source_type(doc: &ScoreDoc, node: &str) -> Option<String> {
 
 /// What the instrument switch offers beyond the built-ins: the instruments
 /// of the person's saved scores (each once). Off the UI thread.
-fn library_instruments(control: &PrepareControl) -> Result<makepad_score_live::instruments::Available, LoadError> {
+async fn library_instruments(control: &PrepareControl) -> Result<makepad_score_live::instruments::Available, LoadError> {
     use makepad_score_live::instruments::{self, Available};
     let mut available = Available::default();
     let mut seen = std::collections::HashSet::new();
-    for (title, path) in crate::library::saved_scores(control)? {
+    for (title, path) in crate::library::saved_scores(control).await? {
         if control.is_cancelled() { return Err(LoadError::Cancelled); }
         let Ok(source) = std::fs::read_to_string(&path) else { continue };
         for choice in instruments::instruments_of(&source, &title) {
@@ -319,7 +319,7 @@ impl Desk {
         // thread, for the instrument switch.
         if !self.panel.library_read {
             self.panel.library_read = true;
-            match RequestJob::submit(cx, PrepareControl::default(), library_instruments) {
+            match RequestJob::submit(cx, PrepareControl::default(), |control| async move { library_instruments(&control).await }) {
                 Ok(job) => self.panel.library_job = Some(job),
                 Err(error) => log!("library instruments: {error}"),
             }
@@ -775,13 +775,13 @@ impl Desk {
         let start = makepad_score_live::audition::first_beat(doc, &[node.to_string()]);
         let (node, name, choices) = (node.to_string(), gen.to_string(), choices.to_vec());
         let control = makepad_score_live::PrepareControl::default();
-        let job = RequestJob::submit(cx, control, move |control| {
+        let job = RequestJob::submit(cx, control, move |control| async move {
             let edits = generate::generate(&source, &node, &name, &choices)?;
-            let next = generate::apply(&source, &node, &edits, control)?;
+            let next = generate::apply_async(&source, &node, &edits, &control).await?;
             let code = edits.iter().map(|e| format!("{}: {}", e.field, e.value.as_deref().unwrap_or("(removed)"))).collect::<Vec<_>>().join("\n");
             if write { return Ok((code, Generated::Write(next))); }
             let solo = source::set_field(&next, &node, "solo", "true").and_then(|s| apply_splices(&next, 0, &[s])).unwrap_or(next);
-            let (left, right, rate) = makepad_score_live::audition::render_in_place(&solo, start, seconds, 48_000.0, control)?;
+            let (left, right, rate) = makepad_score_live::audition::render_in_place_async(&solo, start, seconds, 48_000.0, &control).await?;
             let peak = left.iter().chain(&right).fold(0.0f32, |m, x| m.max(x.abs()));
             let rms = (left.iter().chain(&right).map(|x| (*x as f64).powi(2)).sum::<f64>() / (left.len() + right.len()).max(1) as f64).sqrt() as f32;
             let db = |x: f32| if x > 1e-9 { (20.0 * x.log10() * 10.0).round() / 10.0 } else { -180.0 };

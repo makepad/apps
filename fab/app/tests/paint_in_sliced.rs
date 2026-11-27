@@ -2,6 +2,8 @@
 //! colour reaches the slice and only the layers it paints are planned again; Export after it
 //! writes the new paint; an undo takes it out of both.
 
+#[path = "common/render_mode.rs"]
+mod render_mode;
 mod common;
 #[path = "common/wait.rs"]
 mod idle_wait;
@@ -175,8 +177,7 @@ fn a_stroke_in_sliced_reslices_around_the_brush_and_export_writes_it(app: TestAp
     app.locator(Selector::role(Role::TreeItem).name("Vase")).wait_visible().click();
     app.locator(Selector::role(Role::Button).name("View")).wait_visible().press();
     app.locator(Selector::role(Role::MenuItem).name("Frame Selected")).wait_visible().press();
-    app.locator(Selector::id("rm_slice")).wait_visible().click();
-    app.locator(Selector::id("rm_slice")).wait_checked(true);
+    render_mode::pick(&app, "Sliced");
     wait(&app, "the first slice", || (common::slice_state(&app) == "Sliced").then_some(()));
     app.locator(Selector::id("t_paint")).click();
 

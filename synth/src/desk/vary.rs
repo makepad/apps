@@ -97,10 +97,10 @@ fn same_kind(left: &Option<VaryAction>, right: &Option<VaryAction>) -> bool {
     }
 }
 
-fn prepare_action(control: &makepad_score_live::PrepareControl, source: &str, shaders: &Arc<CompiledShaders>, node: &str, action: Option<VaryAction>,
+async fn prepare_action(control: &makepad_score_live::PrepareControl, source: &str, shaders: &Arc<CompiledShaders>, node: &str, action: Option<VaryAction>,
     previous: Option<Part>, cards: Vec<Part>, seed: u64, region: Option<(f64, f64)>, requested_region: Option<(f64, f64)>,
 ) -> Result<(Part, PreparedAction), String> {
-    let loaded = shaders.evaluate_controlled(source, control).map_err(|error| error.describe(|errors| errors.into_iter().map(|d| d.message).collect::<Vec<_>>().join("; ")))?;
+    let loaded = shaders.evaluate(source, control).await.map_err(|error| error.describe(|errors| errors.into_iter().map(|d| d.message).collect::<Vec<_>>().join("; ")))?;
     let original = vary::part_from(loaded, node)?;
     let same = previous.as_ref().is_some_and(|part| same_notes(part, &original));
     let cards = if same { &cards[..] } else { &[] };
@@ -114,18 +114,18 @@ fn prepare_action(control: &makepad_score_live::PrepareControl, source: &str, sh
             PreparedAction::Cards(made)
         }
         Some(VaryAction::Audition(Some(i))) => {
-            let next = if i == 0 { None } else { Some(vary::apply_prepared(source, node, card(i)?, Some(shaders), control)?) };
+            let next = if i == 0 { None } else { Some(vary::apply_prepared_async(source, node, card(i)?, Some(shaders), control).await?) };
             PreparedAction::Audition(i, next)
         }
         Some(VaryAction::Apply(i)) => {
             let part = card(i)?.clone();
-            let next = vary::apply(source, node, &part, control)?;
+            let next = vary::apply_async(source, node, &part, control).await?;
             PreparedAction::Write(part, next)
         }
         Some(VaryAction::Merge(picks)) => {
             let parts: Vec<_> = std::iter::once(&original).chain(cards.iter()).collect();
             let merged = vary::merge(&parts, &picks);
-            let next = vary::apply(source, node, &merged, control)?;
+            let next = vary::apply_async(source, node, &merged, control).await?;
             PreparedAction::Write(merged, next)
         }
         Some(action) => PreparedAction::Controls(action),
@@ -141,7 +141,7 @@ pub struct VaryDesk {
     pub tracks: Vec<Track>,
     pub(super) tracks_rev: u64,
     requests: VecDeque<VariationRequest>,
-    tracks_job: Option<(u64, RequestJob<Result<Vec<Track>, LoadError>>)>,
+    pub(super) tracks_job: Option<(u64, RequestJob<Result<Vec<Track>, LoadError>>)>,
     /// The card the composer plays in place: (voice, card), and whether
     /// the audition started the song (it stops it again).
     pub live: Option<(String, usize)>,
@@ -149,6 +149,18 @@ pub struct VaryDesk {
 }
 
 impl VaryDesk {
+    /// Inspect the completed edit before applying it would persist a draft.
+    #[cfg(test)]
+    pub(super) fn take_prepared_write(&mut self, id: u64) -> Option<String> {
+        let request = self.requests.front_mut().expect("variation: the edit is queued");
+        assert_eq!(request.reply, Some(id), "variation: the edit belongs to this request");
+        let (_, action) = request.job.as_mut().expect("variation: the edit was submitted")
+            .try_take()?.expect("variation: the job completes").expect("variation: the rewrite validates");
+        self.requests.pop_front();
+        let PreparedAction::Write(_, next) = action else { panic!("variation: Apply prepares an edit") };
+        Some(next)
+    }
+
     pub(super) fn reply_word(&self, id: u64) -> Option<&PrepareControl> {
         self.requests.iter().find(|request| request.reply == Some(id)).map(|request| &request.word)
     }
@@ -197,8 +209,13 @@ impl VaryDesk {
 }
 
 /// The voices of a score as the tree shows them (cycle notes included).
-fn tracks_of(source: &str, shaders: &CompiledShaders, control: &PrepareControl) -> Result<Vec<Track>, LoadError> {
-    let loaded = shaders.evaluate_controlled(source, control)?;
+#[cfg(test)]
+pub(super) fn tracks_of(source: &str, shaders: &CompiledShaders, control: &PrepareControl) -> Result<Vec<Track>, LoadError> {
+    makepad_score_live::drive(tracks_of_async(source, shaders, control))
+}
+
+async fn tracks_of_async(source: &str, shaders: &CompiledShaders, control: &PrepareControl) -> Result<Vec<Track>, LoadError> {
+    let loaded = shaders.evaluate(source, control).await?;
     let doc = loaded.doc.clone();
     let cycles = makepad_score_live::render::cycle_notes_of(loaded);
     let bar = doc.beats_per_bar();
@@ -255,7 +272,7 @@ impl Desk {
         if desk.tracks_rev != revision && desk.tracks_job.is_none() {
             let Some(shaders) = self.loads.shaders.clone() else { return };
             let source = applied.source.clone();
-            match RequestJob::submit(cx, PrepareControl::default(), move |word| tracks_of(&source, &shaders, word)) {
+            match RequestJob::submit(cx, PrepareControl::default(), move |word| async move { tracks_of_async(&source, &shaders, &word).await }) {
                 Ok(job) => desk.tracks_job = Some((revision, job)),
                 Err(error) => log!("score tracks: {error}"),
             }
@@ -267,6 +284,7 @@ impl Desk {
                 Ok(Ok(tracks)) => { desk.tracks = tracks; makepad_editor_panel::changed(); }
                 Ok(Err(LoadError::Problems(_))) => { desk.tracks.clear(); makepad_editor_panel::changed(); }
                 Ok(Err(LoadError::Cancelled)) => {}
+                Ok(Err(error @ (LoadError::Unfinished { .. } | LoadError::Memory { .. }))) => makepad_widgets::log!("score tracks: {error}"),
                 Err(error) => log!("score tracks: {error}"),
             }
         }
@@ -313,8 +331,8 @@ impl Desk {
                         let previous = voice.original.clone();
                         let cards = voice.cards.iter().map(|c| c.1.clone()).collect();
                         let (seed, region, requested_region) = (voice.seed, voice.region, request.region);
-                        RequestJob::submit(cx, request.word.clone(), move |control| {
-                            prepare_action(control, &source, &shaders, &node, action, previous, cards, seed, region, requested_region)
+                        RequestJob::submit(cx, request.word.clone(), move |control| async move {
+                            prepare_action(&control, &source, &shaders, &node, action, previous, cards, seed, region, requested_region).await
                         }).map_err(|error| error.to_string())
                     }
                     _ => Err("the current score has not loaded".to_string()),

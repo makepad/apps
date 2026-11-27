@@ -69,6 +69,15 @@ script_mod! {
         }
     }
 
+    // The app's tooltip look (the `TipLayer` bubble's fill and corner, its text), for what rides
+    // the pointer as a tip would: a drag's chip (a feature row, a file, a tab). Its ring is its
+    // fill, so the edge is the fill's (a clear ring would lighten it).
+    mod.draw.FabTipChip = mod.draw.DrawFabChip{ radius: 4.0 fill: #x10141bf2 ring: #x10141bf2 }
+    mod.draw.FabTipText = mod.draw.DrawText{
+        color: #xdfe6ec
+        text_style: theme.font_regular{ font_size: 9 }
+    }
+
     mod.widgets.FabTrayGridBase = #(FabTrayGrid::register_widget(vm))
     mod.widgets.FabTrayGrid = set_type_default() do mod.widgets.FabTrayGridBase{
         width: Fill
@@ -145,7 +154,22 @@ pub struct FabTrayGrid {
     /// The drawn grid receives presses on virtual spools.
     #[rust] area: Area,
     /// A menu pick applies to the cell that opened it.
-    #[rust] editing: Option<colours::Position>,
+    #[rust] editing: Option<(EditOwner, colours::Position)>,
+    #[rust] owner: EditOwner,
+}
+
+/// The virtual report contains every head and its tray assignments from the link's own profile.
+pub(super) fn editable_layout(p: &PrintState) -> Option<colours::Layout> {
+    let report = p.shown_printer().filter(|r| r.virtual_printer)?;
+    let count = report.state.extruders.len();
+    let profile = colours::Offline {
+        heads: (0..count).map(|i| fab_plate::machine::nozzle_name(count, i)).collect(),
+        printer: report.name.clone(),
+        slots: Vec::new(),
+    };
+    let mut layout = colours::layout(Some((&report.name, &report.state)), None, &profile, &|_| None);
+    colours::drop_missing_heads(&mut layout);
+    Some(layout)
 }
 
 const SPOOL: f64 = 34.0;
@@ -171,26 +195,30 @@ impl Widget for FabTrayGrid {
         use crate::ui::popover::{menu_picked, open_menu, MenuPlace};
         let Some(state) = scope.data.get::<AppState>() else { return };
         let p = &state.print;
-        if !p.target_printer().is_some_and(|p| p.virtual_printer) { return; }
         let menu = LiveId::from_str(&format!("fab_grid_tray:{:?}", self.uid));
         if let Event::Actions(actions) = event {
             if let Some(edit) = menu_picked(actions, menu).and_then(colours::tray_edit_pick) {
-                if let Some(pos) = self.editing.take() { cx.action(PrintAction::EditTray(pos, edit)); }
+                if let Some((owner, pos)) = self.editing.take() { cx.action(PrintAction::EditTray(owner, pos, edit)); }
             }
         }
+        if !self.owner.matches(p) || !p.shown_printer().is_some_and(|s| s.virtual_printer) { return; }
         if let Hit::FingerUp(fe) = event.hits(cx, self.area) {
             if !fe.is_over || fe.cancelled { return; }
             let Some((_, rect, Some(id))) = self.items.iter().find(|(_, r, _)| r.contains(fe.abs)) else { return };
-            if let Some(tray) = p.colors.layout.trays.iter().find(|t| t.pos.tray == *id) {
-                self.editing = Some(tray.pos);
-                open_menu(cx, menu, colours::tray_edit_menu(tray, &p.colors.layout.heads), *rect, MenuPlace::Below);
+            let Some(layout) = editable_layout(p) else { return };
+            if let Some(tray) = layout.trays.iter().find(|t| t.pos.tray == *id) {
+                self.editing = Some((self.owner.clone(), tray.pos));
+                open_menu(cx, menu, colours::tray_edit_menu(tray, &layout.heads), *rect, MenuPlace::Below);
             }
         }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         self.items.clear();
-        let Some(printer) = scope.data.get::<AppState>().and_then(|s| s.print.target_printer().cloned()) else {
+        let Some(printer) = scope.data.get::<AppState>().and_then(|s| {
+            self.owner.capture(PrinterScope::Shown, &s.print);
+            s.print.shown_printer().cloned()
+        }) else {
             cx.walk_turtle(Walk { height: Size::Fixed(0.0), ..walk });
             return DrawStep::done();
         };
@@ -220,23 +248,40 @@ impl Widget for FabTrayGrid {
             fab_printer_link::model::LoadedSlot::Tray(id) => Some(id),
             fab_printer_link::model::LoadedSlot::NoneOrExternal => None,
         });
-        let header_h = 18.0;
-        let h = rows.iter().map(|_| header_h + CELL_H + 6.0).sum::<f64>();
+        // One spool per group (each tool of a toolchanger, each head): one grid of them all, each
+        // cell named by its group. Otherwise each unit's trays under its name.
+        let single = rows.len() > 1 && rows.iter().all(|(_, trays)| trays.len() <= 1);
+        let tags: Vec<String> = if single { rows.iter().filter(|(_, t)| !t.is_empty()).map(|(name, _)| name.clone()).collect() } else { Vec::new() };
+        if single {
+            let all = rows.iter().flat_map(|(_, trays)| trays.iter().copied()).collect();
+            rows = vec![(String::new(), all)];
+        }
+        // a grid: as many trays to a row as the width takes, wrapping onto more rows
+        let header_h = if single { 0.0 } else { 18.0 };
+        let width = cx.peek_walk_turtle(walk).size.x;
+        let columns = ((width + 6.0) / CELL_W).floor().max(1.0) as usize;
+        let lines = |n: usize| n.div_ceil(columns).max(1) as f64;
+        let h = rows.iter().map(|(_, trays)| header_h + lines(trays.len()) * CELL_H + 6.0).sum::<f64>();
         let rect = cx.walk_turtle(Walk { height: Size::Fixed(h.max(0.0)), ..walk });
         cx.add_aligned_rect_area(&mut self.area, rect);
         let mut y = rect.pos.y;
         for (name, trays) in &rows {
-            self.draw_small.draw_abs(cx, dvec2(rect.pos.x, y + 2.0), name);
+            if !name.is_empty() {
+                self.draw_small.draw_abs(cx, dvec2(rect.pos.x, y + 2.0), name);
+            }
             y += header_h;
             for (i, tray) in trays.iter().enumerate() {
-                let x = rect.pos.x + i as f64 * CELL_W;
-                // The cell's card.
-                self.draw_chip.spool = 0.0;
-                self.draw_chip.fill = vec4(0.0, 0.0, 0.0, 0.18);
+                let x = rect.pos.x + (i % columns) as f64 * CELL_W;
+                let y = y + (i / columns) as f64 * CELL_H;
+                // no plate behind a tray; the one feeding the nozzle that prints is ringed
                 let printing = feeding.is_some() && tray.id == feeding;
-                self.draw_chip.ring = if printing { vec4(1.0, 1.0, 1.0, 0.75) } else { vec4(1.0, 1.0, 1.0, 0.06) };
-                self.draw_chip.radius = 3.0;
-                self.draw_chip.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(CELL_W - 6.0, CELL_H) });
+                if printing {
+                    self.draw_chip.spool = 0.0;
+                    self.draw_chip.fill = vec4(0.0, 0.0, 0.0, 0.0);
+                    self.draw_chip.ring = vec4(1.0, 1.0, 1.0, 0.75);
+                    self.draw_chip.radius = 3.0;
+                    self.draw_chip.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(CELL_W - 6.0, CELL_H - 6.0) });
+                }
                 let empty = tray.present == Some(false) || (tray.material.is_none() && tray.colour.is_none());
                 self.draw_chip.spool = 1.0;
                 self.draw_chip.empty = if empty { 1.0 } else { 0.0 };
@@ -246,22 +291,38 @@ impl Widget for FabTrayGrid {
                 self.draw_chip.spool = 0.0;
                 self.draw_chip.empty = 0.0;
                 let material = if empty { "Empty".to_string() } else { tray.material.clone().unwrap_or_else(|| "?".into()) };
-                let label = if s.numbered_heads { material } else { format!("{} {}", tray_label(tray.id), material) };
+                // in one grid of single spools: the group's name, the material under it
+                let tag = tags.get(i).cloned();
+                let label = match &tag {
+                    Some(tag) => tag.clone(),
+                    None if s.numbered_heads => material.clone(),
+                    None => format!("{} {}", tray_label(tray.id), material),
+                };
                 let tw = self.draw_name.prepare_single_line_run(cx, &label).map(|r| r.width_in_lpxs as f64).unwrap_or(40.0);
                 self.draw_name.draw_abs(cx, dvec2(x + ((CELL_W - 6.0 - tw) * 0.5).max(2.0), y + SPOOL + 9.0), &label);
                 let colour = tray.colour.map(|c| { let [r, g, b, _] = c.0; format!(" colour #{:02x}{:02x}{:02x}", (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8) }).unwrap_or_default();
                 let left = tray.remain.filter(|r| *r >= 0.0 && !empty && !s.numbered_heads && !tray.id.is_some_and(|i| matches!(i.ams, 254 | 255))).map(|r| format!(", {r:.0}% left")).unwrap_or_default();
                 let printing = if printing { " feeding the nozzle that prints" } else { "" };
-                self.items.push((format!("{name} {label}{colour}{left}{printing}"), Rect { pos: dvec2(x, y), size: dvec2(CELL_W - 6.0, CELL_H) }, tray.id));
+                // Spoken as drawn, group first: "Tool 1 PLA", or the unit's name then its tray (a single
+                // grid has no row name, so its cells carry their group).
+                let said = match &tag {
+                    Some(tag) => format!("{tag} {material}"),
+                    None if name.is_empty() => label.clone(),
+                    None => format!("{name} {label}"),
+                };
+                self.items.push((format!("{said}{colour}{left}{printing}"), Rect { pos: dvec2(x, y), size: dvec2(CELL_W - 6.0, CELL_H) }, tray.id));
                 // An external spool has no tag to read what is left from (it reports 0).
                 let external = tray.id.is_some_and(|i| matches!(i.ams, 254 | 255));
-                if let Some(r) = tray.remain.filter(|r| *r >= 0.0 && !empty && !external && !s.numbered_heads) {
+                if tag.is_some() {
+                    let tw = self.draw_small.prepare_single_line_run(cx, &material).map(|r| r.width_in_lpxs as f64).unwrap_or(20.0);
+                    self.draw_small.draw_abs(cx, dvec2(x + ((CELL_W - 6.0 - tw) * 0.5).max(2.0), y + SPOOL + 24.0), &material);
+                } else if let Some(r) = tray.remain.filter(|r| *r >= 0.0 && !empty && !external && !s.numbered_heads) {
                     let t = format!("{r:.0}%");
                     let tw = self.draw_small.prepare_single_line_run(cx, &t).map(|r| r.width_in_lpxs as f64).unwrap_or(20.0);
                     self.draw_small.draw_abs(cx, dvec2(x + (CELL_W - 6.0 - tw) * 0.5, y + SPOOL + 24.0), &t);
                 }
             }
-            y += CELL_H + 6.0;
+            y += lines(trays.len()) * CELL_H + 6.0;
         }
         DrawStep::done()
     }

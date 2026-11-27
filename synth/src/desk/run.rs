@@ -12,6 +12,7 @@ use makepad_widgets::makepad_platform::thread::{SubmitError, TaskError};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::future::Future;
 
 /// A tool's answer: now, or when job `id` is done.
 pub enum Answer {
@@ -45,22 +46,29 @@ fn f64_arg(args: &Json, key: &str) -> Option<f64> {
 
 type JobResult = Result<Json, String>;
 
-/// A retained frame job. The worker and its owner share the score request's word.
-pub(super) struct RequestJob<T> {
+/// A retained frame job. The future and its owner share the score request's Stop word.
+pub(crate) struct RequestJob<T> {
     frame: FrameJob<T>,
     control: Option<PrepareControl>,
 }
 
 impl<T> RequestJob<T> {
-    pub(super) fn submit(cx: &Cx, control: PrepareControl,
-        work: impl FnOnce(&PrepareControl) -> T + Send + 'static,
-    ) -> Result<Self, SubmitError> where T: Send + 'static {
+    pub(crate) fn submit<Fut>(cx: &Cx, control: PrepareControl,
+        start: impl FnOnce(PrepareControl) -> Fut + Send + 'static,
+    ) -> Result<Self, SubmitError> where Fut: Future<Output = T> + 'static, T: Send + 'static {
+        Self::submit_in(cx, Class::Visible, control, start)
+    }
+
+    /// The same doorway for work that waits behind what the person is looking at.
+    pub(crate) fn submit_in<Fut>(cx: &Cx, class: Class, control: PrepareControl,
+        start: impl FnOnce(PrepareControl) -> Fut + Send + 'static,
+    ) -> Result<Self, SubmitError> where Fut: Future<Output = T> + 'static, T: Send + 'static {
         let worker = control.clone();
-        let frame = cx.task_pool().submit_frame_job(Class::Visible, move || work(&worker))?;
+        let frame = cx.task_pool().submit_stepped_frame_job(class, move || start(worker))?;
         Ok(Self { frame, control: Some(control) })
     }
 
-    pub(super) fn try_take(&mut self) -> Option<Result<T, TaskError>> {
+    pub(crate) fn try_take(&mut self) -> Option<Result<T, TaskError>> {
         let result = self.frame.try_take()?;
         self.control = None;
         Some(result)
@@ -116,8 +124,13 @@ struct PendingTool {
     job: RequestJob<Result<PreparedTool, String>>,
 }
 
+#[cfg(test)]
 fn validate(source: &str, control: &makepad_score_live::PrepareControl) -> Result<(), String> {
-    let problems = check(source, control)?;
+    makepad_score_live::drive(validate_async(source, control))
+}
+
+async fn validate_async(source: &str, control: &PrepareControl) -> Result<(), String> {
+    let problems = check_async(source, control).await?;
     if problems.is_empty() { Ok(()) } else { Err(format!("the score does not load:\n{}", problems.join("\n"))) }
 }
 
@@ -223,11 +236,10 @@ impl Jobs {
     }
 
     /// The same reply ID owns this read until it is answered or cancelled.
-    fn submit_score_read(&mut self, cx: &Cx, kind: &'static str, revision: Option<u64>,
-        read: impl FnOnce(&PrepareControl) -> Result<PreparedTool, String> + Send + 'static,
-    ) -> Answer {
-        let control = PrepareControl::default();
-        self.submit_tool(cx, kind, revision, Some(control.clone()), move || read(&control))
+    fn submit_score_read<Fut>(&mut self, cx: &Cx, kind: &'static str, revision: Option<u64>,
+        start: impl FnOnce(PrepareControl) -> Fut + Send + 'static,
+    ) -> Answer where Fut: Future<Output = Result<PreparedTool, String>> + 'static {
+        self.submit_tool(cx, kind, revision, PrepareControl::default(), start)
     }
 
     fn word(&self, id: u64) -> Option<&PrepareControl> {
@@ -256,16 +268,16 @@ impl Jobs {
         true
     }
 
-    pub(crate) fn submit_tool(&mut self, cx: &Cx, kind: &'static str, revision: Option<u64>, control: Option<PrepareControl>,
-        work: impl FnOnce() -> Result<PreparedTool, String> + Send + 'static,
-    ) -> Answer {
+    pub(crate) fn submit_tool<Fut>(&mut self, cx: &Cx, kind: &'static str, revision: Option<u64>, control: PrepareControl,
+        start: impl FnOnce(PrepareControl) -> Fut + Send + 'static,
+    ) -> Answer where Fut: Future<Output = Result<PreparedTool, String>> + 'static {
         if let Some(index) = self.tools.iter().position(|pending| pending.kind == kind) {
             let mut old = self.tools.remove(index);
             old.job.cancel();
             self.panel_answer(old.id, Err("superseded".into()));
         }
-        let job = match cx.task_pool().submit_frame_job(Class::Visible, work) {
-            Ok(frame) => RequestJob { frame, control },
+        let job = match RequestJob::submit(cx, control, start) {
+            Ok(job) => job,
             Err(error) => return refused(error.to_string()),
         };
         let id = self.panel_request();
@@ -300,10 +312,21 @@ impl Jobs {
     }
 
 
-    pub fn spawn(&mut self, cx: &Cx, class: Class, control: Option<PrepareControl>, work: impl FnOnce() -> JobResult + Send + 'static) -> u64 {
+    pub fn spawn(&mut self, cx: &Cx, class: Class, work: impl FnOnce() -> JobResult + Send + 'static) -> u64 {
+        let job = cx.task_pool().submit_frame_job(class, work).map(|frame| RequestJob { frame, control: None });
+        self.register_job(job)
+    }
+
+    pub(crate) fn start_job<Fut>(&mut self, cx: &Cx, control: PrepareControl,
+        start: impl FnOnce(PrepareControl) -> Fut + Send + 'static,
+    ) -> u64 where Fut: Future<Output = JobResult> + 'static {
+        self.register_job(RequestJob::submit(cx, control, start))
+    }
+
+    fn register_job(&mut self, job: Result<RequestJob<JobResult>, SubmitError>) -> u64 {
         let id = self.panel_request();
-        match cx.task_pool().submit_frame_job(class, work) {
-            Ok(frame) => self.pending.push((id, RequestJob { frame, control })),
+        match job {
+            Ok(job) => self.pending.push((id, job)),
             Err(error) => self.finish_job(id, Err(error.to_string())),
         }
         id
@@ -362,9 +385,15 @@ impl Jobs {
 }
 
 /// Render the WAV and its timing in memory before the writer receives them.
+#[cfg(test)]
 fn prepare_wav(src: &str, seconds: Option<f64>, seed: Option<u64>, control: &makepad_score_live::PrepareControl) -> Result<(Vec<u8>, Json), String> {
-    let rendered = makepad_score_live::render(src, &RenderOpts { rate: 48_000.0, seconds, seed, params: Vec::new(), start: None, held: Vec::new() }, &NoSamples, control)
-        .map_err(|e| e.describe(|diags| diags.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("; ")))?;
+    makepad_score_live::drive(prepare_wav_async(src, seconds, seed, control))
+}
+
+async fn prepare_wav_async(src: &str, seconds: Option<f64>, seed: Option<u64>, control: &PrepareControl) -> Result<(Vec<u8>, Json), String> {
+    let describe = |e: makepad_score_live::LoadError| e.describe(|diags| diags.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("; "));
+    let loaded = makepad_score_live::load(src, control).await.map_err(describe)?;
+    let rendered = makepad_score_live::render::render_loaded(loaded, &RenderOpts { rate: 48_000.0, seconds, seed, params: Vec::new(), start: None, held: Vec::new() }, &NoSamples, control, &mut |_, _| {}).map_err(describe)?;
     let wav = makepad_audio_synth::wav::stereo_wav_16(&rendered.left, &rendered.right, 48_000);
     Ok((wav, json::obj(vec![
         ("seconds", num(rendered.seconds())),
@@ -461,12 +490,149 @@ pub fn changed_lines(before: &str, after: &str, context: usize) -> String {
 
 /// The problems that keep `source_text` from being written: the library's
 /// `score_check` (its loops run for 8 bars).
+#[cfg(test)]
 pub fn check(source_text: &str, control: &makepad_score_live::PrepareControl) -> Result<Vec<String>, String> {
-    Ok(tools::check_diags(source_text, control).map_err(|e| e.to_string())?.iter().map(|d| d.to_string()).collect())
+    makepad_score_live::drive(check_async(source_text, control))
+}
+
+pub async fn check_async(source_text: &str, control: &PrepareControl) -> Result<Vec<String>, String> {
+    Ok(tools::check_diags_async(source_text, control).await.map_err(|e| e.to_string())?.iter().map(|d| d.to_string()).collect())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_new_revision_cancels_a_sliced_map_callback() {
+        use super::Desk;
+        use makepad_score_live::model::LoadResult;
+        use std::{task::Poll, time::Duration};
+
+        let mut desk = Desk::default();
+        desk.loads.submit(1, "[1].map(fn(v) { loop {} })\n", |job| job.cancel());
+        // Drive the desk's worker closure one slice at a time, as a page without workers does.
+        let mut worker = None;
+        desk.loads.start(|request| {
+            worker = Some(Desk::revision_steps(request, Duration::ZERO));
+            None
+        });
+        let mut step = worker.unwrap();
+        for _ in 0..4 {
+            assert!(step().is_pending() && desk.loads.pending(), "the callback keeps the desk revision loading between polls");
+        }
+        desk.loads.submit(2, "Score{}\n", |job| job.cancel());
+        assert!(matches!(step(), Poll::Ready(LoadResult::Cancelled)), "superseding the revision stops its suspended evaluation on the next poll");
+    }
+
+    #[test]
+    fn transport_stop_cancels_the_visible_evaluation_and_keeps_the_applied_score() {
+        use super::*;
+        use crate::desk::{LoadActivity, LoadCaption, LoadResult, INIT_STATUS_DELAY};
+        use std::{sync::mpsc::channel, task::Poll, time::{Duration, Instant}};
+
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut view = cx.with_vm(View::script_new);
+        let label = WidgetRef::new_with_inner(Box::new(cx.with_vm(Label::script_new)));
+        let badge = WidgetRef::new_with_inner(Box::new(cx.with_vm(Label::script_new)));
+        view.children.push((live_id!(score_init), label.clone()));
+        view.children.push((live_id!(score_state), badge.clone()));
+        let ui = WidgetRef::new_with_inner(Box::new(view));
+        set_ui_root(&mut cx, &ui);
+        let mut desk = Desk::default();
+        desk.slot = makepad_score_live::node::slot("test_desk_stop");
+        let pool = cx.task_pool();
+        desk.load_pool = Some(pool.clone());
+        let timeout = Duration::from_secs(10);
+        let edit = |desk: &mut Desk, source: &str| {
+            desk.revision += 1;
+            desk.source = source.into();
+            assert!(desk.loads.submit(desk.revision, source, |job| job.cancel()), "a new edit gets its own word");
+        };
+        let apply = |desk: &mut Desk, cx: &mut Cx| {
+            let deadline = Instant::now() + timeout;
+            while !desk.poll_load(cx) {
+                assert!(desk.loads.pending(), "the finite score must be valid: {:?}", desk.loads.diags);
+                assert!(Instant::now() < deadline, "the finite edit must load and apply");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        edit(&mut desk, "use mod.score.*\nlet clock = Clock{}\nScore{label: \"First\" clock}");
+        apply(&mut desk, &mut cx);
+        let good = desk.revision;
+        let shaders = desk.loads.shaders.clone().unwrap();
+        desk.note_fields.push(("pad".into(), "amp".into(), "wired".into()));
+        desk.pump_caption(&mut cx, &ui);
+        assert!(badge.text().starts_with("Loaded"), "plan notes badge the applied revision");
+        desk.sync_tracker_model(&mut cx, &ui);
+        assert!(desk.tracker.rx.is_some(), "the applied revision gets its played parts");
+
+        let runaway = "[1].map(fn(v) { loop {} })";
+        edit(&mut desk, runaway);
+        desk.sync_tracker_model(&mut cx, &ui);
+        assert!(desk.tracker.rx.is_none(), "a draft that has not loaded starts no second evaluation of its own");
+        desk.document.title = "Draft".into();
+        let (entered, inside) = channel();
+        let (release, resume) = channel();
+        let (finished, outcome) = channel();
+        let mut token = None;
+        desk.loads.start(|request| {
+            desk.loading = Some(request.clone());
+            let job = pool.submit_frame_job(Class::Visible, move || {
+                let mut step = Desk::revision_steps(request, Duration::ZERO);
+                assert!(step().is_pending(), "the runaway yields a slice");
+                entered.send(()).unwrap();
+                resume.recv_timeout(timeout).expect("the test releases the suspended revision");
+                let Poll::Ready(result) = step() else { panic!("Stop must end the very next slice") };
+                finished.send(matches!(result, LoadResult::Cancelled)).unwrap();
+                result
+            }).unwrap();
+            token = Some(job.token());
+            Some(job)
+        });
+        inside.recv_timeout(timeout).expect("the evaluation started");
+        desk.update_audio_status(&mut cx, &ui, 0.0);
+        desk.stop(&mut cx, &ui);
+        assert!(desk.loads.pending(), "Stop during the caption delay leaves the evaluation alone");
+        desk.show_load_caption(&mut cx, &ui, Some(LoadCaption::Running(LoadActivity::Initialising)));
+        desk.stop(&mut cx, &ui);
+        assert!(desk.loads.pending(), "an init caption is not a document Stop");
+        desk.update_audio_status(&mut cx, &ui, INIT_STATUS_DELAY);
+        assert_eq!(label.text(), "Still evaluating…", "the transport sees the running document's caption");
+        desk.transport(true);
+        desk.stop(&mut cx, &ui);
+        release.send(()).unwrap();
+        assert!(outcome.recv_timeout(timeout).unwrap(), "the document answers Cancelled");
+        assert!(token.unwrap().is_cancelled() && !desk.loads.pending() && desk.loading.is_none(), "Stop clears the job and the wanted revision together");
+        assert!(!desk.engine.playing(), "the same Stop still stops playback");
+        desk.send();
+        assert!(!desk.loads.pending() && !desk.poll_load(&mut cx), "an incidental send cannot restart or apply the stopped revision");
+        assert_eq!(label.text(), "Evaluation stopped", "the status belongs to the stopped draft");
+        assert_eq!(desk.source, runaway, "Stop keeps the typed source");
+        assert_eq!(desk.loads.applied.as_ref().unwrap().revision, good, "the applied revision stays accepted");
+        assert_eq!(desk.doc.as_ref().unwrap().label, "First", "the accepted document stays installed");
+        assert_eq!(desk.applied_title, "First", "the draft's title never becomes the applied title");
+        assert!(Arc::ptr_eq(&shaders, desk.loads.shaders.as_ref().unwrap()), "the accepted shader programs stay installed");
+        assert_eq!(desk.note_fields[0].2, "wired", "the playing generation keeps its plan notes");
+        desk.pump_caption(&mut cx, &ui);
+        assert!(!badge.text().contains("Loaded"), "the old plan notes cannot badge the stopped draft as loaded");
+
+        edit(&mut desk, runaway);
+        let mut refused = None;
+        desk.loads.start(|request| { refused = Some(request); None });
+        // The previous frame's evaluation can still be visible when the new submission is refused.
+        desk.show_load_caption(&mut cx, &ui, Some(LoadCaption::Running(LoadActivity::Evaluating)));
+        desk.stop(&mut cx, &ui);
+        let mut step = Desk::revision_steps(refused.unwrap(), Duration::ZERO);
+        assert!(matches!(step(), Poll::Ready(LoadResult::Cancelled)), "Stop reaches a wanted word even before admission");
+        desk.loads.start(|_| panic!("a stopped submission must never retry"));
+
+        edit(&mut desk, "use mod.score.*\nlet clock = Clock{}\nScore{label: \"Next\" clock}");
+        apply(&mut desk, &mut cx);
+        desk.update_audio_status(&mut cx, &ui, Cx::time_now());
+        assert!(desk.shown_activity.is_none(), "the next edit clears the stopped caption");
+        assert_eq!(desk.loads.applied.as_ref().unwrap().revision, desk.revision, "the next revision applies normally");
+        assert_eq!(desk.applied_title, "Next", "the title advances with the new score");
+    }
+
     #[test]
     fn replacing_and_dropping_jobs_cancels_their_score_words() {
         use super::*;
@@ -475,13 +641,13 @@ mod tests {
         let old = PrepareControl::default();
         let current = PrepareControl::default();
         let listen = PrepareControl::default();
-        let reply = || Ok(PreparedTool::Reply(Json::Null));
+        let reply = |_| async { Ok(PreparedTool::Reply(Json::Null)) };
 
-        let Answer::Later(old_id) = jobs.submit_tool(&cx, "check", None, Some(old.clone()), reply) else {
+        let Answer::Later(old_id) = jobs.submit_tool(&cx, "check", None, old.clone(), reply) else {
             panic!("the first check should start")
         };
-        jobs.spawn(&cx, Class::Visible, Some(listen.clone()), || Ok(Json::Null));
-        assert!(matches!(jobs.submit_tool(&cx, "check", None, Some(current.clone()), reply), Answer::Later(_)));
+        jobs.start_job(&cx, listen.clone(), |_| async { Ok(Json::Null) });
+        assert!(matches!(jobs.submit_tool(&cx, "check", None, current.clone(), reply), Answer::Later(_)));
         assert!(old.is_cancelled(), "replacing the check stops its score work");
         assert!(jobs.done.remove(&old_id).unwrap().unwrap_err().contains("superseded"), "the replaced check answers its caller");
         assert!(!current.is_cancelled(), "the replacement owns a fresh word");
@@ -493,8 +659,8 @@ mod tests {
         // Replies get jobs of their own: `take` polls, and a poll would collect the listen once the pool finished it.
         let mut replies = Desk::default();
         let other = PrepareControl::default();
-        assert!(matches!(replies.jobs.submit_tool(&cx, "check", None, Some(other.clone()), reply), Answer::Later(_)));
-        let Answer::Later(id) = replies.jobs.submit_score_read(&cx, "score_text", None, |_| Ok(PreparedTool::Reply(Json::Null))) else {
+        assert!(matches!(replies.jobs.submit_tool(&cx, "check", None, other.clone(), reply), Answer::Later(_)));
+        let Answer::Later(id) = replies.jobs.submit_score_read(&cx, "score_text", None, reply) else {
             panic!("the transcription should start")
         };
         let word = replies.jobs.tools.iter().find(|tool| tool.id == id).unwrap().job.control.clone().unwrap();
@@ -524,6 +690,324 @@ mod tests {
         let diff = super::changed_lines("a\nb\nc\nd\ne", "a\nb\nX\nd\ne", 1);
         assert_eq!(diff, "@@ line 2 @@\n b\n-c\n+X\n d");
         assert_eq!(super::changed_lines("a", "a", 2), "");
+    }
+
+    #[test]
+    fn inline_score_requests_yield_stop_and_accept_the_next_score() {
+        use super::*;
+        use makepad_core_util::ui_thread::thread_hits;
+        use makepad_widgets::makepad_platform::thread::frame_jobs_new_frame;
+        use std::time::{Duration, Instant};
+
+        const ENDLESS: &str = "loop {}";
+        const MUSIC: &str = "use mod.score.*\nlet clock = Clock{bpm: 240 sig: [1 4]}\n\
+            let lead = Shader{code: \"fn voice() { gate }\"}\n\
+            let line = Loop{play: lead beats: 1 code: fn(i) { play(60) sleep(1) }}\n\
+            Score{label: \"Stepped\" clock lead line}";
+
+        fn finish<T>(path: &str, mut poll: impl FnMut() -> Option<T>) -> T {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                frame_jobs_new_frame();
+                if let Some(value) = poll() { return value; }
+                assert!(Instant::now() < deadline, "{path}: the finite request must complete");
+            }
+        }
+
+        // Submit in an occupied frame when the test needs the ready value before the UI consumes it.
+        fn reserve_frame(cx: &Cx, path: &str) {
+            frame_jobs_new_frame();
+            let mut turn = cx.task_pool().submit_frame_job(Class::Visible, || ()).unwrap();
+            assert!(matches!(turn.try_take(), Some(Ok(()))), "{path}: reserve the submission frame");
+        }
+
+        fn admitted(path: &str, answer: Answer) -> u64 {
+            match answer {
+                Answer::Later(id) => id,
+                Answer::Done(_) => panic!("{path}: the request must be admitted as a job"),
+            }
+        }
+
+        fn start(desk: &mut Desk, cx: &mut Cx, ui: &WidgetRef, path: &str, source: &'static str) -> u64 {
+            let args = json::obj(vec![("source", text(source)), ("bars", Json::Int(1))]);
+            let answer = match path {
+                "midi_open" => crate::song_library::submit_import(cx, desk, move || {
+                    use makepad_midi_library::import::{import, About, Options};
+                    let one_note = b"MThd\0\0\0\x06\0\0\0\x01\0\x60MTrk\0\0\0\x0c\0\x90\x3c\x64\x60\x80\x3c\0\0\xff\x2f\0";
+                    let mut song = import(one_note, &About::default(), &Options::default())?;
+                    if source == ENDLESS { song.source = source.into(); }
+                    Ok(("Imported".into(), song))
+                }),
+                "score_text" | "score_text (reuse)" => {
+                    desk.source = if path == "score_text" { String::new() } else { source.into() };
+                    desk.midi_tool(cx, "score_text", &args)
+                }
+                "score_patch" => {
+                    desk.source = "old source".into();
+                    let edits = Json::Arr(vec![json::obj(vec![("old", text("old source")), ("new", text(source))])]);
+                    desk.tool(cx, ui, path, &json::obj(vec![("edits", edits)]))
+                }
+                _ => desk.tool(cx, ui, path, &args),
+            };
+            admitted(path, answer)
+        }
+
+        fn poll_tool(desk: &mut Desk, path: &str, id: u64) -> Option<PreparedTool> {
+            let result = if path == "score_listen" {
+                desk.jobs.take(id)?.map(PreparedTool::Reply)
+            } else {
+                let (reply, result) = desk.jobs.next_tool(desk.revision, false)?;
+                assert_eq!(reply, id, "{path}: the result belongs to its request");
+                result
+            };
+            Some(result.unwrap_or_else(|e| panic!("{path}: {e}")))
+        }
+
+        // Warm the trusted palette before measuring, then exercise the guard on a different UI thread.
+        std::thread::spawn(|| {
+            makepad_score_live::palette::sounds::sounds();
+            makepad_core_util::ui_thread::mark_ui_thread();
+            validate(MUSIC, &PrepareControl::default()).expect("the reference score must validate");
+            assert_eq!(thread_hits("a score evaluation"), 1, "the guard detects the blocking reference read");
+        }).join().unwrap();
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.use_closed_task_pool();
+        cx.use_inline_frame_jobs();
+        let ui = WidgetRef::default();
+        let mut desk = Desk::default();
+        desk.load_pool = Some(cx.task_pool());
+        desk.revision = 1;
+        desk.loads.submit(desk.revision, MUSIC, |job| job.cancel());
+        desk.start_load();
+        desk.doc = Some(finish("applied revision", || {
+            desk.loads.take(|job| Some(job.try_take()?.expect("the reference revision must run")))
+        }));
+        let guard = |path: &str| assert_eq!(thread_hits("a score evaluation"), 0, "{path}: the page called a blocking reader");
+        for path in ["score_write", "score_patch", "midi_open", "score_text", "score_text (reuse)", "score_check", "score_listen"] {
+            let id = start(&mut desk, &mut cx, &ui, path, ENDLESS);
+            let word = desk.jobs.word(id).unwrap().clone();
+            for _ in 0..2 {
+                frame_jobs_new_frame();
+                assert!(poll_tool(&mut desk, path, id).is_none(), "{path}: the endless read must yield");
+                assert!(word.script_running(), "{path}: the pending VM must be registered on the reply");
+            }
+            let editing = matches!(path, "score_write" | "score_patch" | "midi_open");
+            let next = if editing {
+                start(&mut desk, &mut cx, &ui, path, MUSIC) // replaces the old edit
+            } else {
+                desk.cancel_reply(id, "stopped");
+                start(&mut desk, &mut cx, &ui, path, MUSIC)
+            };
+            frame_jobs_new_frame();
+            let stopped = desk.jobs.take(id).expect("the stopped reply").unwrap_err();
+            assert_eq!(stopped, if editing { "superseded" } else { "stopped" }, "{path}: return the owner's stop");
+            assert!(word.is_cancelled() && !word.script_running(), "{path}: stopping releases the suspended VM");
+            let answer = finish(path, || poll_tool(&mut desk, path, next));
+            match answer {
+                PreparedTool::Edit { source, title, fields } if path == "midi_open" => {
+                    assert_eq!(title.as_deref(), Some("Imported"), "{path}: keep the decoded title");
+                    assert!(source.contains("Score{") && fields.iter().any(|(k, v)| k == "parts" && v.as_arr().is_some_and(|parts| !parts.is_empty())), "{path}: return the imported part and score");
+                }
+                PreparedTool::Edit { source, .. } => assert!(editing && source == MUSIC, "{path}: the replacement edit carries its source"),
+                PreparedTool::Reply(value) if path.starts_with("score_text") => assert!(value.get("text").and_then(Json::as_str).is_some_and(|s| !s.is_empty()), "{path}: transcribe the replacement"),
+                PreparedTool::Reply(value) => assert_eq!(value.get("ok").and_then(Json::as_bool), Some(true), "{path}: accept the replacement score"),
+                _ => panic!("{path}: unexpected reply"),
+            }
+            guard(path);
+        }
+
+        // Poll the actual file jobs through preparation, before any writer can touch the renders folder.
+        desk.revision += 1;
+        for (path, label) in [("WAV label", true), ("WAV preparation", false)] {
+            for source in [ENDLESS, MUSIC] {
+                desk.source = source.into();
+                let destination = (!label).then(|| PathBuf::from("explicit.wav"));
+                let id = admitted(path, desk.file_request(&mut cx, destination, false, false, Some(0.01), None, true));
+                let file = desk.jobs.files.last_mut().unwrap();
+                let word = match &file.state {
+                    FileState::Preparing(job) => job.word().unwrap().clone(),
+                    _ => panic!("{path}: a new request must be preparing"),
+                };
+                let mut poll = || {
+                    if label {
+                        file.name_job.as_mut().unwrap().try_take().map(|done| {
+                            assert_eq!(done.unwrap().unwrap(), wav_path("Stepped"), "WAV label: use the evaluated label");
+                        })
+                    } else {
+                        let FileState::Preparing(job) = &mut file.state else { panic!("WAV preparation: expected a pending render") };
+                        job.try_take().map(|done| {
+                            let (bytes, _) = done.unwrap().unwrap();
+                            assert!(bytes.starts_with(b"RIFF"), "WAV preparation: the replacement renders to WAV");
+                        })
+                    }
+                };
+                if source == ENDLESS {
+                    for _ in 0..2 {
+                        frame_jobs_new_frame();
+                        assert!(poll().is_none() && word.script_running(), "{path}: the endless read yields with the request registered");
+                    }
+                    desk.cancel_reply(id, "stopped");
+                    frame_jobs_new_frame();
+                    assert_eq!(desk.jobs.take(id).unwrap().unwrap_err(), "stopped", "{path}: report the file cancellation");
+                    assert!(word.is_cancelled() && !word.script_running(), "{path}: stopping discards the suspended VM");
+                } else {
+                    finish(path, poll);
+                    desk.jobs.files.pop();
+                }
+            }
+            guard(path);
+        }
+
+        let shaders = desk.loads.shaders.clone().unwrap();
+        let (played, tracks, applied_card) = std::thread::spawn(move || {
+            let word = PrepareControl::default();
+            let part = makepad_score_live::vary::part_of_controlled(MUSIC, "line", &word).unwrap();
+            let applied_card = makepad_score_live::vary::apply(MUSIC, "line", &part, &word).unwrap();
+            (crate::desk::tracker_model::played_parts(MUSIC, &word).unwrap(), crate::desk::vary::tracks_of(MUSIC, &shaders, &word).unwrap(), applied_card)
+        }).join().unwrap();
+        // Install the two sources as applied revisions to exercise the derived readers themselves.
+        for path in ["tracker", "tracks"] {
+            let tracker = path == "tracker";
+            let pump = |desk: &mut Desk, cx: &mut Cx| {
+                if tracker { desk.sync_tracker_model(cx, &ui); } else { desk.pump_tracks(cx); }
+            };
+            desk.revision += 1;
+            let applied = desk.loads.applied.as_mut().unwrap();
+            applied.revision = desk.revision;
+            applied.source = ENDLESS.into();
+            desk.source = ENDLESS.into();
+            frame_jobs_new_frame();
+            pump(&mut desk, &mut cx);
+            let word = if tracker {
+                desk.tracker.rx.as_ref().unwrap().1.word()
+            } else {
+                desk.vary.tracks_job.as_ref().unwrap().1.word()
+            }.unwrap().clone();
+            // The tracker submits on its first pump and polls on the next one.
+            pump(&mut desk, &mut cx);
+            assert!(word.script_running(), "{path}: the first slice leaves a registered evaluation");
+            frame_jobs_new_frame();
+            pump(&mut desk, &mut cx);
+            assert!(word.script_running(), "{path}: the second slice is still pending");
+            desk.revision += 1;
+            let applied = desk.loads.applied.as_mut().unwrap();
+            applied.revision = desk.revision;
+            applied.source = MUSIC.into();
+            desk.source = MUSIC.into();
+            frame_jobs_new_frame();
+            pump(&mut desk, &mut cx);
+            assert!(word.is_cancelled() && !word.script_running(), "{path}: the revision change retires the suspended reader");
+            finish(path, || {
+                pump(&mut desk, &mut cx);
+                let ready = if tracker { desk.tracker.played.0 } else { desk.vary.tracks_rev };
+                (ready == desk.revision).then_some(())
+            });
+            if tracker {
+                assert_eq!(desk.tracker.played.1, played, "tracker: the applied revision plays the same notes as the native reader");
+            } else {
+                assert_eq!(desk.vary.tracks, tracks, "tracks: the applied revision produces the same tracks as the native reader");
+            }
+            guard(path);
+        }
+
+        // A key builds its own score from the instrument. The switch either solos
+        // the open score or plays the choice's phrase when the node is absent.
+        let route = makepad_score_live::audition::bus::route();
+        desk.preview_main = true;
+        desk.status.bpm = desk.doc.as_ref().unwrap().clock.bpm;
+        let choice = makepad_score_live::instruments::instruments_of(MUSIC, "Stepped").pop().unwrap();
+        let endless_code = "[1].map(fn(v) { loop {} })";
+        for path in ["key audition", "switch in place", "switch phrase"] {
+            for endless in [true, false] {
+                reserve_frame(&cx, path);
+                desk.source = MUSIC.into();
+                if path == "key audition" {
+                    if endless {
+                        desk.source = MUSIC.replace("\"fn voice() { gate }\"", endless_code);
+                    }
+                    desk.panel.key = Some(("lead".into(), 60.0));
+                } else {
+                    let mut choice = choice.clone();
+                    if endless { choice.fields = vec![("code".into(), endless_code.into())]; }
+                    let node = if path == "switch phrase" { "absent" } else { "lead" };
+                    // The choice has already rested for the picker's debounce interval.
+                    desk.audition = Some((choice.key(), Cx::time_now() - 1.0));
+                    desk.auditioned = None;
+                    desk.panel.preview = Some((node.into(), choice));
+                }
+                desk.pump_audition(&mut cx);
+                let (_, job) = desk.audition_job.as_mut().unwrap_or_else(|| panic!("{path}: submit the audition"));
+                let word = job.word().unwrap().clone();
+                if endless {
+                    for _ in 0..2 {
+                        frame_jobs_new_frame();
+                        assert!(job.try_take().is_none() && word.script_running(), "{path}: the audition yields on its own control");
+                    }
+                    if path == "key audition" { desk.revision += 1; } else { desk.panel.preview = None; }
+                    frame_jobs_new_frame();
+                    desk.pump_audition(&mut cx);
+                    assert!(desk.audition_job.is_none() && word.is_cancelled() && !word.script_running(),
+                        "{path}: changing revision or leaving the picker discards the suspended audition");
+                } else {
+                    let (_, clip) = finish(path, || job.try_take()).expect("the audition job must finish");
+                    let (left, right, _, _) = clip.unwrap_or_else(|e| panic!("{path}: {e}"));
+                    assert!(!left.is_empty() && left.len() == right.len(), "{path}: the next audition produces stereo PCM");
+                    desk.audition_job = None;
+                }
+                guard(path);
+            }
+        }
+        makepad_score_live::audition::bus::set_route(route);
+        desk.preview_main = false;
+
+        for path in ["score_generate", "score_vary_status", "score_vary"] {
+            let args = if path == "score_generate" {
+                json::obj(vec![("node", text("line")), ("generator", text("arp"))])
+            } else {
+                json::obj(vec![("voice", text("line")), ("action", text("apply"))])
+            };
+            for endless in [true, false] {
+                // Keep the authored loop for the generator's splice and the variation's rewrite.
+                desk.source = if endless { MUSIC.replace("Score{", "loop {}\nScore{") } else { MUSIC.into() };
+                let applied = desk.loads.applied.as_mut().unwrap();
+                applied.revision = desk.revision;
+                applied.source = desk.source.clone().into();
+                let id = admitted(path, desk.tool(&mut cx, &ui, path, &args));
+                let word = desk.reply_evaluation(id).unwrap().word;
+                let poll = |desk: &mut Desk, cx: &mut Cx| {
+                    match path {
+                        "score_generate" => desk.pump_generation(cx, &ui),
+                        "score_vary" => desk.pump_panel_actions(cx, &ui),
+                        _ => return poll_tool(desk, path, id),
+                    }
+                    desk.jobs.take(id).map(|result| PreparedTool::Reply(result.unwrap_or_else(|e| panic!("{path}: {e}"))))
+                };
+                if endless {
+                    for _ in 0..2 {
+                        frame_jobs_new_frame();
+                        assert!(poll(&mut desk, &mut cx).is_none() && word.script_running(), "{path}: the reply owns a suspended evaluation");
+                    }
+                    desk.cancel_reply(id, "stopped");
+                    frame_jobs_new_frame();
+                    assert_eq!(desk.jobs.take(id).unwrap().unwrap_err(), "stopped", "{path}: return the reply's stop");
+                    assert!(word.is_cancelled() && !word.script_running(), "{path}: stopping releases the VM");
+                } else if path == "score_vary" {
+                    reserve_frame(&cx, path);
+                    desk.pump_panel_actions(&mut cx, &ui);
+                    let rewrite = finish(path, || desk.vary.take_prepared_write(id));
+                    assert_eq!(rewrite, applied_card, "{path}: Apply prepares the same edit as the native reader");
+                } else {
+                    let PreparedTool::Reply(reply) = finish(path, || poll(&mut desk, &mut cx)) else { panic!("{path}: expected a reply") };
+                    if path == "score_generate" {
+                        assert_eq!(reply.get("written").and_then(Json::as_bool), Some(false), "Hear: preview the generated part");
+                        assert!(reply.get("edits").and_then(Json::as_str).is_some_and(|s| !s.is_empty()), "Hear: report the edits that played");
+                    } else {
+                        assert!(reply.get("live_notes").and_then(Json::as_str).is_some_and(|s| !s.is_empty()), "{path}: return the played part");
+                    }
+                }
+                guard(path);
+            }
+        }
     }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -608,11 +1092,11 @@ impl Desk {
         if name == "score_text" {
             let open = self.source.clone();
             let programs = self.loads.shaders.clone().filter(|_| self.loads.diags.is_empty() && self.loads.applied.as_ref().is_some_and(|r| r.revision == self.revision));
-            return self.jobs.submit_score_read(cx, name, None, move |control| {
-                makepad_midi_library::tools::score_text_controlled(&args, Some(&open), programs.as_deref(), control).map(PreparedTool::Reply)
+            return self.jobs.submit_score_read(cx, name, None, move |control| async move {
+                makepad_midi_library::tools::score_text(&args, Some(&open), programs.as_deref(), &control).await.map(PreparedTool::Reply)
             });
         }
-        self.jobs.submit_tool(cx, name, None, None, move || {
+        self.jobs.submit_score_read(cx, name, None, move |_| async move {
             makepad_midi_library::tools::call_library(name, &args).map(PreparedTool::Reply)
         })
     }
@@ -637,8 +1121,8 @@ impl Desk {
                 path = Some(wav_path(self.doc.as_ref().map_or("", |d| d.label.as_str())));
             } else {
                 let text = source.clone();
-                name_job = match RequestJob::submit(cx, control.clone(), move |control| {
-                    match makepad_score_live::model::evaluated_label_controlled(&text, control) {
+                name_job = match RequestJob::submit(cx, control.clone(), move |control| async move {
+                    match makepad_score_live::model::evaluated_label(&text, &control).await {
                         Ok(label) => Ok(wav_path(label.as_deref().unwrap_or(""))),
                         Err(makepad_score_live::LoadError::Problems(_)) => Ok(wav_path("")),
                         Err(cancelled) => Err(cancelled),
@@ -654,13 +1138,13 @@ impl Desk {
             }
         }
         let src = source.clone();
-        let job = match RequestJob::submit(cx, control, move |control| {
+        let job = match RequestJob::submit(cx, control, move |control| async move {
             if save {
                 // Saving a draft also preserves scores with diagnostics.
                 Ok((src.as_bytes().to_vec(), Json::Obj(Vec::new())))
             } else {
-                validate(&src, control)?;
-                prepare_wav(&src, seconds, seed, control)
+                validate_async(&src, &control).await?;
+                prepare_wav_async(&src, seconds, seed, &control).await
             }
         }) {
             Ok(job) => job,
@@ -793,8 +1277,8 @@ impl Desk {
         }
         self.frame = cx.new_next_frame();
         let control = makepad_score_live::PrepareControl::default();
-        self.jobs.submit_tool(cx, "edit", Some(self.revision), Some(control.clone()), move || {
-            validate(&next, &control)?;
+        self.jobs.submit_tool(cx, "edit", Some(self.revision), control, move |control| async move {
+            validate_async(&next, &control).await?;
             Ok(PreparedTool::Edit { source: next, title, fields: Vec::new() })
         })
     }
@@ -804,11 +1288,14 @@ impl Desk {
         let base = args.get("base_revision").and_then(Json::as_i64);
         match name {
             "score_check" => {
-                let open = self.source.clone();
-                let args = args.clone();
+                let source = match tools::source_of(args, Some(&self.source)) {
+                    Ok(source) => source,
+                    Err(error) => return refused(error),
+                };
                 self.frame = cx.new_next_frame();
-                let control = makepad_score_live::PrepareControl::default();
-                self.jobs.submit_tool(cx, "check", None, Some(control.clone()), move || tools::call("score_check", &args, Some(&open), &control).map(PreparedTool::Reply))
+                self.jobs.submit_score_read(cx, "check", None, move |word| async move {
+                    tools::check_async(&source, &word).await.map(PreparedTool::Reply).map_err(|error| error.to_string())
+                })
             }
             "score_guide" | "instrument_search" | "morph_params" | "tandem_params" | "tandem_patches" | "preset_search" => match tools::metadata_only(name, args) {
                 Ok(value) => ok(value),
@@ -838,7 +1325,7 @@ impl Desk {
                 let mut next = self.source.clone();
                 self.frame = cx.new_next_frame();
                 let control = makepad_score_live::PrepareControl::default();
-                self.jobs.submit_tool(cx, "edit", Some(self.revision), Some(control.clone()), move || {
+                self.jobs.submit_tool(cx, "edit", Some(self.revision), control, move |control| async move {
                     for (i, edit) in edits.iter().enumerate() {
                         let (Some(old), Some(new)) = (edit.get("old").and_then(Json::as_str), edit.get("new").and_then(Json::as_str)) else {
                             return Err(format!("edit {}: `old` and `new`", i + 1));
@@ -849,7 +1336,7 @@ impl Desk {
                             n => return Err(format!("edit {}: `old` is in the score {n} times: give more of it", i + 1)),
                         }
                     }
-                    validate(&next, &control)?;
+                    validate_async(&next, &control).await?;
                     Ok(PreparedTool::Edit { source: next, title: None, fields: Vec::new() })
                 })
             }
@@ -925,11 +1412,16 @@ impl Desk {
                 ]))
             }
             "score_listen" => {
+                let source = match tools::source_of(args, Some(&self.source)) {
+                    Ok(source) => source,
+                    Err(error) => return refused(error),
+                };
                 let args = args.clone();
-                let open = self.source.clone();
                 self.frame = cx.new_next_frame();
-                let control = makepad_score_live::PrepareControl::default();
-                Answer::Later(self.jobs.spawn(cx, Class::Visible, Some(control.clone()), move || tools::listen_args(&args, Some(&open), &control).map(|(value, _)| value)))
+                Answer::Later(self.jobs.start_job(cx, PrepareControl::default(), move |word| async move {
+                    let loaded = makepad_score_live::load(&source, &word).await;
+                    tools::listen_args_after_load(&args, &source, loaded, &word).map(|(value, _)| value)
+                }))
             }
             "score_set" => {
                 let Some(live) = &self.live else { return refused("the score is not loaded") };
@@ -960,18 +1452,20 @@ impl Desk {
             }
             "score_library" => {
                 self.frame = cx.new_next_frame();
-                self.jobs.submit_score_read(cx, "library", None, |control| Ok(PreparedTool::Reply(json::obj(vec![
-                    ("scores", Json::Arr(library::saved_scores(control).map_err(|e| e.to_string())?.into_iter().map(|(title, path)| {
+                self.jobs.submit_score_read(cx, "library", None, |control| async move {
+                    let scores = library::saved_scores(&control).await.map_err(|e| e.to_string())?;
+                    let rows = scores.into_iter().map(|(title, path)| {
                         json::obj(vec![("title", text(title)), ("name", text(path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()))])
-                    }).collect()))
-                ]))))
+                    }).collect();
+                    Ok(PreparedTool::Reply(json::obj(vec![("scores", Json::Arr(rows))])))
+                })
             }
             "score_open" => {
                 let Some(name) = args.get("name").and_then(Json::as_str) else { return refused("`name`: a score of score_library") };
                 let name = name.to_owned();
                 self.frame = cx.new_next_frame();
-                self.jobs.submit_score_read(cx, "edit", Some(self.revision), move |control| {
-                    let path = library::find(&name, control).map_err(|e| e.to_string())?.ok_or_else(|| format!("no score `{name}` in the library"))?;
+                self.jobs.submit_score_read(cx, "edit", Some(self.revision), move |control| async move {
+                    let path = library::find(&name, &control).await.map_err(|e| e.to_string())?.ok_or_else(|| format!("no score `{name}` in the library"))?;
                     let (doc, source) = Document::open_file(&path)?;
                     Ok(PreparedTool::Open(doc, source))
                 })
@@ -1061,14 +1555,14 @@ impl Desk {
                 let node = node.to_string();
                 let playing_part = view.playing.and_then(|i| parts.get(i).cloned());
                 self.frame = cx.new_next_frame();
-                self.jobs.submit_score_read(cx, "vary_status", None, move |control| {
+                self.jobs.submit_score_read(cx, "vary_status", None, move |control| async move {
                     let cards: Vec<Json> = view.cards.iter().zip(&parts).enumerate().map(|(i, (card, part))| {
                         json::obj(vec![("card", Json::Int(i as i64)), ("label", text(card.label.clone())),
                             ("kept", Json::Bool(card.kept)), ("beats", num(part.beats)),
                             ("first_cycle", Json::Int(part.first as i64)), ("notes", text(part.text()))])
                     }).collect();
                     let live_part = if valid {
-                        match programs.evaluate_controlled(&played, control) {
+                        match programs.evaluate(&played, &control).await {
                             Ok(loaded) => makepad_score_live::vary::part_from(loaded, &node).ok(),
                             Err(makepad_score_live::LoadError::Problems(_)) => None,
                             Err(cancelled) => return Err(cancelled.to_string()),

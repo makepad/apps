@@ -44,7 +44,7 @@ fn bind_part(
                 unit: 0, limits: None, alternates: Vec::new(), delay: None,
             }).collect(),
             fields: make_fields(part_fields),
-            gpio: None,
+            gpio: None, lifecycle: None, approved: false,
         }),
         value: None,
         conns: pins.iter().enumerate().map(|(i, _)| (PinIx(i as u16), NetId(0))).collect(),

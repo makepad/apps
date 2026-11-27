@@ -497,6 +497,32 @@ mod tests {
     }
 
     #[test]
+    fn headless_req_checks_planned_block_erc_clean() {
+        let dir = std::env::temp_dir().join(format!("fab-architecture-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let path = dir.join("device.fab.splash");
+        let docs = project::elec_dir(&path);
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(&path, "use mod.fab.*\n").unwrap();
+        fs::write(docs.join("device.req.splash"), r#"require("ERC clean", checks(@erc).errors, {max: 0})"#).unwrap();
+        for (cap, wanted) in [(20, 1), (30, 0)] {
+            let text = r#"let e = mod.elec
+let reg = e.block({name: "Source" planned: true ports: {out: e.port(@power_out, {current: CAPmA})}})
+let load = e.block({name: "Load" planned: true ports: {v: e.port(@power_in, {current: 30mA})}})
+let rail = e.net({name: "VDD" kind: @power})
+let src = reg({out: rail})
+let device = load({v: rail})
+"#.replace("CAP", &cap.to_string());
+            fs::write(docs.join("device.ckt.splash"), text).unwrap();
+            let (code, stdout, stderr) = command(&path, &["--check", "--req"]);
+            assert_eq!(code, wanted, "the headless exit code must reflect the {cap} mA rail's ERC result: {stdout} {stderr}");
+            assert!(stdout.contains(if wanted == 0 { "1 of 1 met" } else { "0 of 1 met" }),
+                "the requirements report must judge the architecture: {stdout} {stderr}");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn saved_plate_reports_its_committed_findings_without_writing() {
         struct Scratch(PathBuf);
         impl Drop for Scratch {

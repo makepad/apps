@@ -5,12 +5,14 @@
 use crate::edit_actions::check_family;
 use fab_elec_circuit::{CheckKind, Violation};
 use fab_elec_core::{Diag, DocId, Sel, Severity};
+use fab_elec_design::Design;
 use fab_elec_design::action::{ActionDef, FieldDef, FieldKind, Risk};
 use fab_elec_lang::DocKind;
 use fab_elec_req::{BenchFacts, BenchRun, BoardMeasures, CaseFacts, CheckFacts, Facts, Family, FindingFact, Outcome, PrintFacts, Producers, ReqDoc, Report, Status, UnitFacts, Verdict};
 use fab_elec_view::instruments::bench_setup::BenchCheck;
 use fab_elec_view::{DesignSnapshot, DocsView, ReqShown};
 use makepad_widgets_core::makepad_script::syntax::write::quote;
+use std::collections::HashSet;
 use std::fmt::Write;
 use std::sync::Arc;
 
@@ -45,7 +47,16 @@ requirements: [{..}]  in document order
   proposed: text  the reason of a waiver proposed for the person to accept or decline; it waives nothing yet
   was: choice pass|fail|unknown  a waived requirement's status without its waiver
   doc: text  its document
-  line: int  where it is written",
+  line: int  where it is written
+units: [text]  circuit unit names, absent when none
+wishes: [{..}]  the person's wishes, listed and never judged; absent when none
+  words: text
+  doc: text
+  line: int
+brief: {..}  the person's brief, verbatim; absent when none
+  words: text
+  doc: text
+  line: int",
     fields: &[FieldDef {
         name: "from", kind: FieldKind::Int { min: 0, max: i64::MAX }, required: false, default: "0",
         help: "The first requirement of the page: a reply's next.",
@@ -77,13 +88,29 @@ pub const REQ_ADD: ActionDef = ActionDef {
         NAME,
         FieldDef {
             name: "measure", kind: FieldKind::Text, required: true, default: "",
-            help: "What Fab measures, as Splash: board(\"u\").size | .layers | .parts | .unplaced | .unrouted; checks(@erc|@drc|@system|@route|@case|@custom|@all, {unit: \"u\"}).errors | .warnings (the unit optional); case(\"u\").fits; bench(\"b\"); bench(\"b\").expect(\"e\"); print.time; print.filament.",
+            help: "What Fab measures, as Splash: board.size | .layers | .parts | .unplaced | .unrouted (board(\"u\").* to name a board); checks(@erc|@drc|@system|@route|@case|@custom|@all, {unit: \"u\"}).errors | .warnings (the unit optional); case.fits (case(\"u\").fits to name a board); bench(\"b\"); bench(\"b\").expect(\"e\"); print.time; print.filament.",
         },
         FieldDef {
             name: "bound", kind: FieldKind::Text, required: false, default: "",
-            help: "The bound, as Splash: {max: 2}, {min: 3.0V}, {max: [60mm 40mm]}, {max: 3h}, {max: 40g}. None for case fits and benches, which hold or not.",
+            help: "The bound, as Splash: {max: 2}, {is: 2}, {max: [60mm 40mm]}, {max: 3h}, {max: 40g}. None for case fits and benches, which hold or not. Put electrical targets without a bench in wish(..), or use bench(\"b\").expect(\"e\") once the bench exists.",
         },
     ],
+    inputs: &[], risk: Risk::Edit, keys: "",
+};
+
+pub const REQ_WISH: ActionDef = ActionDef {
+    name: "elec.req.wish", label: "Add wish", group: "Requirements",
+    help: "Write one of the person's wishes in their words: what they want that Fab does not measure. It is listed and never judged. Never turn a wish into a requirement with a bound the person did not give.",
+    returns: EDIT_RETURNS,
+    fields: &[FieldDef { name: "words", kind: FieldKind::Text, required: true, default: "", help: "The wish in the person's words." }],
+    inputs: &[], risk: Risk::Edit, keys: "",
+};
+
+pub const REQ_BRIEF: ActionDef = ActionDef {
+    name: "elec.req.brief", label: "Save brief", group: "Requirements",
+    help: "The person's brief, in their words, written from the Requirements tab. Only the person writes it: from a tool it is refused.",
+    returns: EDIT_RETURNS,
+    fields: &[FieldDef { name: "words", kind: FieldKind::Text, required: true, default: "", help: "The person's brief verbatim. Empty words remove it." }],
     inputs: &[], risk: Risk::Edit, keys: "",
 };
 
@@ -120,11 +147,11 @@ pub const REQ_UNWAIVE: ActionDef = ActionDef {
     inputs: &[], risk: Risk::Edit, keys: "",
 };
 
-pub static ACTIONS: &[ActionDef] = &[REQ_LIST, REQ_ADD, REQ_REMOVE, REQ_WAIVE, REQ_UNWAIVE];
+pub static ACTIONS: &[ActionDef] = &[REQ_LIST, REQ_ADD, REQ_WISH, REQ_BRIEF, REQ_REMOVE, REQ_WAIVE, REQ_UNWAIVE];
 
 /// Whether `action` is one of the requirement edits [`req_edit`] writes.
 pub fn is_req_edit(action: &str) -> bool {
-    [REQ_ADD.name, REQ_REMOVE.name, REQ_WAIVE.name, REQ_UNWAIVE.name].contains(&action)
+    [REQ_ADD.name, REQ_WISH.name, REQ_BRIEF.name, REQ_REMOVE.name, REQ_WAIVE.name, REQ_UNWAIVE.name].contains(&action)
 }
 
 /// One undoable requirement edit: replace an existing document's text, or add a document.
@@ -135,36 +162,44 @@ pub enum ReqEdit {
 }
 
 /// Write the named requirement's document, or add to the first requirements document. The
-/// first circuit names a project's first requirements document. Only a person grants a waiver.
+/// first circuit names a project's first requirements document, or `device` on a plate without a circuit.
+/// Only a person grants a waiver.
 pub fn req_edit(docs: &DocsView, action: &str, args: &[(String, String)], person: bool) -> Result<ReqEdit, String> {
     use fab_elec_req::write;
     let arg = |key: &str| args.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+    let brief = action == REQ_BRIEF.name;
+    if brief && !person { return Err("the brief is the person's own words: they write it in the Requirements tab".into()); }
     let name = arg("name").unwrap_or("").trim();
-    let add = |text: &str, doc: &ReqDoc| write::add(text, doc, name, arg("measure").unwrap_or(""), arg("bound"));
+    let appends = action == REQ_ADD.name || action == REQ_WISH.name;
+    let write = |text: &str, doc: &ReqDoc| match action {
+        "elec.req.brief" => write::brief(text, doc, arg("words").ok_or("words: required field is missing")?),
+        "elec.req.wish" => write::wish(text, doc, arg("words").unwrap_or("")),
+        "elec.req.add" => write::add(text, doc, name, arg("measure").unwrap_or(""), arg("bound")),
+        "elec.req.remove" => write::remove(text, doc, name),
+        "elec.req.waive" => write::waive(text, doc, name, arg("reason").unwrap_or(""), !person),
+        "elec.req.unwaive" => write::unwaive(text, doc, name),
+        _ => Err(format!("{action} is not a requirements edit")),
+    };
     let texts: Vec<_> = docs.texts.iter().filter(|t| DocKind::of_name(&t.name) == Some(DocKind::Requirements)).collect();
     let Some(&first) = texts.first() else {
-        if action != REQ_ADD.name { return Err("the project has no requirements document yet".into()); }
+        if !appends && !brief { return Err("the project has no requirements document yet".into()); }
+        if brief && arg("words").is_some_and(|s| s.trim().is_empty()) { return Err("there is no brief to save".into()); }
         let stem = docs.texts.iter().find_map(|t| t.name.strip_suffix(DocKind::Circuit.suffix()))
-            .ok_or("the project has no circuit document to name its requirements document")?;
+            .unwrap_or("device");
         let doc = format!("{stem}{}", DocKind::Requirements.suffix());
         let empty = ReqDoc::default();
-        let text = add("", &empty)?;
+        let text = write("", &empty)?;
         check_text(empty.doc, &doc, "", &text, !person)?;
         return Ok(ReqEdit::New { doc, text });
     };
     let read = |t: &fab_elec_view::DocText| fab_elec_req::read(t.doc, &t.text).0;
-    let target = match action == REQ_ADD.name {
-        true => first,
-        false => texts.iter().copied().find(|t| read(t).requirements.iter().any(|r| r.name == name)).unwrap_or(first),
+    let target = if appends { first } else {
+        texts.iter().copied().find(|t| {
+            let doc = read(t);
+            if brief { doc.brief.is_some() } else { doc.requirements.iter().any(|r| r.name == name) }
+        }).unwrap_or(first)
     };
-    let doc = read(target);
-    let text = match action {
-        "elec.req.add" => add(&target.text, &doc),
-        "elec.req.remove" => write::remove(&target.text, &doc, name),
-        "elec.req.waive" => write::waive(&target.text, &doc, name, arg("reason").unwrap_or(""), !person),
-        "elec.req.unwaive" => write::unwaive(&target.text, &doc, name),
-        _ => Err(format!("{action} is not a requirements edit")),
-    }?;
+    let text = write(&target.text, &read(target))?;
     Ok(ReqEdit::Text { doc: target.name.clone(), rev: target.rev, text })
 }
 
@@ -186,9 +221,22 @@ pub fn requirements(docs: &DocsView) -> (Vec<ReqDoc>, Vec<Diag>) {
 /// What the design and its checks measure, from the shown state (the preview's when one is live),
 /// as `elec.check.list` reads it. The case, bench and slice producers are the app's: this marks
 /// none of them read, and lists the benches by name only ([`app_facts`] adds them).
-/// O(units + findings + benches).
+/// One pass over benches in addition to the board measures and findings below.
 pub fn design_facts(snap: &DesignSnapshot) -> Facts {
-    let design = snap.live();
+    // A finding that waits for a pour's refill is not shown yet: the checks are not current
+    // until it is, so no requirement passes on a list that may still grow.
+    let mut pending: Vec<String> = crate::edit_actions::pending_checks(snap.stale).into_iter().map(str::to_owned).collect();
+    if !snap.awaiting.is_empty() {
+        pending.push("pour refills".into());
+    }
+    let mut facts = measured_facts(snap.live(), &snap.violations.value, &snap.awaiting, pending);
+    facts.benches = snap.benches.iter().map(|bench| BenchFacts { bench: bench.out.name.clone(), run: None }).collect();
+    facts
+}
+
+/// Board measures and current, scoped findings for exactly this design. Walk each board's
+/// outline, placements and components once. Each finding looks up its unit and refill status.
+pub(crate) fn measured_facts(design: &Design, violations: &[Violation], awaiting: &[u64], pending: Vec<String>) -> Facts {
     let units = design.units.iter().map(|unit| UnitFacts {
         unit: unit.name.clone(),
         board: unit.board.as_ref().map(|board| {
@@ -197,23 +245,20 @@ pub fn design_facts(snap: &DesignSnapshot) -> Facts {
                 (f64::from(outline.max.x) - f64::from(outline.min.x)) * 1e-9,
                 (f64::from(outline.max.y) - f64::from(outline.min.y)) * 1e-9,
             ]);
+            let placed: HashSet<_> = board.placed.iter().map(|p| p.comp).collect();
+            let unplaced = unit.circuit.comps.iter()
+                .filter(|c| c.part.kind != fab_elec_parts::PartKind::PowerFlag && !placed.contains(&c.id)).count();
             BoardMeasures {
                 size,
                 layers: u32::from(board.copper_count()),
                 parts: board.placed.len() as u32,
-                unplaced: fab_elec_view::board::tray::unplaced(design, unit.id).len() as u32,
+                unplaced: unplaced as u32,
             }
         }),
     }).collect();
-    // A finding that waits for a pour's refill is not shown yet: the checks are not current
-    // until it is, so no requirement passes on a list that may still grow.
-    let mut pending: Vec<String> = crate::edit_actions::pending_checks(snap.stale).into_iter().map(str::to_owned).collect();
-    if !snap.awaiting.is_empty() {
-        pending.push("pour refills".into());
-    }
     let unit_of = |v: &Violation| v.unit.or_else(|| v.items.iter().find_map(Sel::unit)).and_then(|id| design.unit(id)).map(|u| u.name.clone());
-    let findings = snap.violations.value.iter()
-        .filter(|v| snap.awaiting.binary_search(&v.id).is_err())
+    let findings = violations.iter()
+        .filter(|v| awaiting.binary_search(&v.id).is_err())
         .map(|v| FindingFact {
             id: v.id,
             unit: unit_of(v),
@@ -233,7 +278,6 @@ pub fn design_facts(snap: &DesignSnapshot) -> Facts {
     Facts {
         units,
         checks: Some(CheckFacts { current: pending.is_empty(), pending, findings }),
-        benches: snap.benches.iter().map(|bench| BenchFacts { bench: bench.out.name.clone(), run: None }).collect(),
         ..Facts::default()
     }
 }
@@ -320,15 +364,18 @@ pub fn shown(docs: &DocsView, facts: &Facts) -> Option<ReqShown> {
     if documents == 0 {
         return None;
     }
-    let at = report.rows.iter().map(|row| {
-        let (doc, line) = located(docs, &[Sel::Source { doc: row.doc, start: row.span.start, end: row.span.end }]);
-        (Arc::from(doc), line)
-    }).collect();
+    let position = |doc, start| {
+        let (name, line) = source_line(docs, doc, start);
+        (Arc::from(name), line)
+    };
+    let at = report.rows.iter().map(|r| position(r.doc, r.span.start)).collect();
+    let wish_at = report.wishes.iter().map(|w| position(w.doc, w.span.start)).collect();
+    let brief_at = report.brief.as_ref().map(|b| position(b.doc, b.span.start));
     let mistakes = report.notes.iter().map(|note| {
         let (doc, line) = located(docs, &note.sel);
         if doc.is_empty() { note.message.clone() } else { format!("{doc}:{line}: {}", note.message) }
     }).collect();
-    Some(ReqShown { report, at, mistakes })
+    Some(ReqShown { report, at, wish_at, brief_at, mistakes })
 }
 
 /// `elec.req.list` over `facts`: totals, the documents' mistakes and one page of rows.
@@ -341,7 +388,7 @@ pub fn req_list(docs: &DocsView, facts: &Facts, args: &[(String, String)]) -> Re
     let total = report.rows.len();
     let mut out = String::new();
     write!(out, "{{met: {} documents: {documents} pass: {} fail: {} unknown: {} waived: {} total: {total}",
-        total > 0 && report.met(), report.pass, report.fail, report.unknown, report.waived).unwrap();
+        report.met(), report.pass, report.fail, report.unknown, report.waived).unwrap();
     if report.proposed > 0 {
         write!(out, " proposed: {}", report.proposed).unwrap();
     }
@@ -358,6 +405,14 @@ pub fn req_list(docs: &DocsView, facts: &Facts, args: &[(String, String)]) -> Re
         }
         out.push(']');
     }
+    let words = |w: &fab_elec_req::WishRow| {
+        let (doc, line) = source_line(docs, w.doc, w.span.start);
+        format!("{{words: {} doc: {} line: {line}}}", quote(&w.words), quote(doc))
+    };
+    if !report.wishes.is_empty() {
+        write!(out, " wishes: [{}]", report.wishes.iter().map(words).collect::<Vec<_>>().join(" ")).unwrap();
+    }
+    if let Some(b) = &report.brief { write!(out, " brief: {}", words(b)).unwrap(); }
     out.push_str(" requirements: [");
     for row in report.rows.get(from..end).unwrap_or_default() {
         write!(out, "{{name: {} status: {}", quote(&row.name), row.status.word()).unwrap();
@@ -384,7 +439,12 @@ pub fn req_list(docs: &DocsView, facts: &Facts, args: &[(String, String)]) -> Re
         let (doc, line) = located(docs, &[Sel::Source { doc: row.doc, start: row.span.start, end: row.span.end }]);
         write!(out, " doc: {} line: {line}}} ", quote(doc)).unwrap();
     }
-    out.push_str("]}");
+    out.push(']');
+    if !facts.units.is_empty() {
+        let names: Vec<_> = facts.units.iter().map(|u| quote(&u.unit)).collect();
+        write!(out, " units: [{}]", names.join(" ")).unwrap();
+    }
+    out.push('}');
     Ok(out)
 }
 
@@ -466,6 +526,18 @@ pub fn requirements_changed(before: &str, after: &str) -> Vec<String> {
     let (now, _) = fab_elec_req::read(DocId(0), after);
     let stated = |r: &fab_elec_req::Requirement| if r.bound_text.is_empty() { r.measure_text.clone() } else { format!("{} {}", r.measure_text, r.bound_text) };
     let mut lines = Vec::new();
+    let mut wishes = |new: &[fab_elec_req::Wish], old: &[fab_elec_req::Wish], action: &str| {
+        let mut remaining = std::collections::HashMap::new();
+        for w in old { *remaining.entry(w.words.as_str()).or_insert(0usize) += 1; }
+        for w in new {
+            match remaining.get_mut(w.words.as_str()) {
+                Some(n) if *n > 0 => *n -= 1,
+                _ => lines.push(format!("{action} `{}`", w.words)),
+            }
+        }
+    };
+    wishes(&now.wishes, &was.wishes, "added the wish");
+    wishes(&was.wishes, &now.wishes, "took out the person's wish");
     for r in &now.requirements {
         match was.requirements.iter().find(|w| w.name == r.name) {
             None => lines.push(format!("added the requirement `{}`: {}", r.name, stated(r))),
@@ -495,6 +567,13 @@ pub fn check_text(doc: DocId, name: &str, before: &str, after: &str, ai: bool) -
     let (new_doc, now) = fab_elec_req::read(doc, after);
     // Only the person waives: an AI's text may propose a waiver, take one out, or leave them be.
     if ai {
+        let old = old_doc.brief.as_ref().map(|b| &before[b.span.start as usize..b.span.end as usize]);
+        let new = new_doc.brief.as_ref().map(|b| &after[b.span.start as usize..b.span.end as usize]);
+        if old != new {
+            let line = new_doc.brief.as_ref().map(|b| line_of(after, b.span.start as usize))
+                .or_else(|| old_doc.brief.as_ref().map(|b| line_of(before, b.span.start as usize))).unwrap();
+            return Err(format!("{name}:{line}: the brief is the person's own words: leave brief(..) as it is"));
+        }
         let granted = |d: &ReqDoc| d.waivers.iter().filter(|w| !w.proposed).map(|w| (w.name.clone(), w.reason.clone())).collect::<Vec<_>>();
         let before = granted(&old_doc);
         if let Some(w) = new_doc.waivers.iter().find(|w| !w.proposed && !before.contains(&(w.name.clone(), w.reason.clone()))) {
@@ -503,12 +582,13 @@ pub fn check_text(doc: DocId, name: &str, before: &str, after: &str, ai: bool) -
         }
     }
     let mut old: Vec<&str> = was.iter().map(|d| d.message.as_str()).collect();
-    let added: Vec<String> = now.iter().filter(|d| {
+    let added_diags: Vec<&Diag> = now.iter().filter(|d| {
         match old.iter().position(|m| *m == d.message) {
             Some(at) => { old.swap_remove(at); false }
             None => true,
         }
-    }).map(|d| {
+    }).collect();
+    let mut added: Vec<String> = added_diags.iter().map(|d| {
         let line = d.sel.iter().find_map(|sel| match sel {
             Sel::Source { start, .. } => Some(line_of(after, *start as usize)),
             _ => None,
@@ -518,6 +598,9 @@ pub fn check_text(doc: DocId, name: &str, before: &str, after: &str, ai: bool) -
             None => format!("{name}: {}", d.message),
         }
     }).collect();
+    if added_diags.iter().any(|d| fab_elec_req::is_unknown_measure(&d.message)) {
+        added.push(format!("measures: {}", fab_elec_req::MEASURES));
+    }
     if added.is_empty() { Ok(()) } else { Err(added.join("\n")) }
 }
 
@@ -527,6 +610,10 @@ pub fn located<'a>(docs: &'a DocsView, sel: &[Sel]) -> (&'a str, usize) {
         Sel::Source { doc, start, .. } => docs.texts.iter().find(|text| text.doc == *doc).map(|text| (text.name.as_str(), line_of(&text.text, *start as usize))),
         _ => None,
     }).unwrap_or(("", 0))
+}
+
+fn source_line(docs: &DocsView, doc: DocId, start: u32) -> (&str, usize) {
+    located(docs, &[Sel::Source { doc, start, end: start }])
 }
 
 fn line_of(text: &str, at: usize) -> usize {
@@ -552,6 +639,33 @@ mod tests {
 
     fn status<'a>(report: &'a Report, name: &str) -> &'a Status {
         &report.row(name).unwrap_or_else(|| panic!("{name} is listed")).status
+    }
+
+    #[test]
+    fn check_text_lists_measures_once_per_refusal_and_keeps_lines_located() {
+        use fab_elec_req::{MEASURES, REQUIRE_EXAMPLE};
+        let name = "device.req.splash";
+        let unknown = ["voltage", "current", "power"].map(|m| format!(r#"require("{m}", {m}, {{max: 1}})"#)).join("\n");
+        let refusal = check_text(DocId(9), name, "", &unknown, true).unwrap_err();
+        assert_eq!(refusal.matches(MEASURES).count(), 1, "unknown measures must share one catalog");
+        for (i, measure) in ["voltage", "current", "power"].iter().enumerate() {
+            assert_eq!(refusal.lines().nth(i), Some(format!(r#"{name}:{}: "{measure}": {measure} is not a measure"#, i + 1).as_str()), "unknown measure {measure} must retain its line");
+        }
+
+        let named = r#"require("Board at most 60 x 40 mm", measure: board("u").size, max: [60mm 40mm])
+require("2-layer board", measure: board("u").layers, max: 2)
+require("ERC clean", measure: checks(@erc).errors, max: 0)"#;
+        let refusal = check_text(DocId(9), name, "", named, true).unwrap_err();
+        assert_eq!(refusal.matches(MEASURES).count(), 0, "known measures with named arguments need no catalog");
+        let expected: Vec<_> = ["Board at most 60 x 40 mm", "2-layer board", "ERC clean"].iter().enumerate().map(|(i, title)|
+            format!(r#"{name}:{}: "{title}": require(..) takes positional arguments, not measure:, max:; drop the labels and put the bound in {{..}}, e.g. {REQUIRE_EXAMPLE}"#, i + 1)).collect();
+        assert_eq!(refusal, expected.join("\n"), "each bad line must say where and how to repair its positional syntax");
+
+        let mut facts = Facts::default();
+        let docs = docs("");
+        assert!(!req_list(&docs, &facts, &[]).unwrap().contains(" units:"), "a brief-only design must not advertise unit names");
+        facts.units.push(UnitFacts { unit: "ledctl".into(), board: None });
+        assert!(req_list(&docs, &facts, &[]).unwrap().ends_with(r#"requirements: [] units: ["ledctl"]}"#), "the requirements list must include circuit names after its rows");
     }
 
     /// Why: `elec.req.list` holds each requirement against what the design and its checks
@@ -711,7 +825,56 @@ mod tests {
         assert_eq!(req_edit(&project, REQ_ADD.name, &target, false),
             Ok(ReqEdit::New { doc: "ledctl.req.splash".into(), text: "require(\"two layers\", board(\"ledctl\").layers, {max: 2})\n".into() }),
             "the first circuit names the new document, containing the requested statement alone");
-        assert!(req_edit(&DocsView::default(), REQ_ADD.name, &target, true).unwrap_err().contains("no circuit document"),
-            "without a circuit, Add explains why it cannot name the document");
+        assert!(matches!(req_edit(&DocsView::default(), REQ_ADD.name, &target, true), Ok(ReqEdit::New { doc, .. }) if doc == "device.req.splash"),
+            "without a circuit, Add creates device.req.splash");
+        let wish = args(&[("words", " warm light ")]);
+        let (name, _, wished) = edit(req_edit(&docs, REQ_WISH.name, &wish, false).unwrap());
+        assert!(name == NAME && requirements_changed(fab_elec_fixtures::LEDCTL_REQ, &wished) == ["added the wish `warm light`"],
+            "Wish appends to the existing document and narrates the addition");
+        let Ok(ReqEdit::New { doc, text }) = req_edit(&project, REQ_WISH.name, &wish, true) else { panic!("Wish can create the first document") };
+        assert!(doc == NAME && fab_elec_req::read(DocId(9), &text).0.wishes[0].words == "warm light",
+            "Wish uses Add's first-circuit naming rule and trims the words");
+        assert!(req_edit(&docs, REQ_WISH.name, &args(&[("words", " ")]), true).is_err(), "an empty wish is refused");
+        assert_eq!(requirements_changed(&text.repeat(2), &text), ["took out the person's wish `warm light`"],
+            "removing one of two identical wishes is narrated once");
+        let original = "// start\nbrief(\"  Warm light  \")\n";
+        let brief_args = |s: &str| args(&[("words", s)]);
+        let words = "  Warm \"desk\" light\nwith a switch.  ";
+        let save = |docs: &DocsView, s, person| req_edit(docs, REQ_BRIEF.name, &brief_args(s), person);
+        let Ok(ReqEdit::New { doc: file, text: new }) = save(&DocsView::default(), words, true) else { panic!("the first brief creates a requirements file") };
+        assert!(file == "device.req.splash" && fab_elec_req::read(DocId(0), &new).0.brief.unwrap().words == words,
+            "the empty plate stores the person's quotes, newline and surrounding spaces verbatim");
+        assert_eq!(save(&DocsView::default(), " \n", true).unwrap_err(), "there is no brief to save", "an empty brief creates no file");
+        let (file, _, inserted) = edit(save(&docs, words, true).unwrap());
+        assert!(file == NAME && inserted == format!("{new}{}", fab_elec_fixtures::LEDCTL_REQ),
+            "a brief goes before the first requirements document's existing statements");
+        let mut two = docs.clone();
+        two.texts.push(DocText { doc: DocId(10), name: "other.req.splash".into(), text: original.into(), rev: 7 });
+        let (file, rev, replaced) = edit(save(&two, words, true).unwrap());
+        assert!(file == "other.req.splash" && rev == 7 && replaced == format!("// start\n{new}"),
+            "replacing the existing brief edits its own document and preserves the surrounding text");
+        assert_eq!(edit(save(&two, " \n", true).unwrap()), ("other.req.splash".into(), 7, "// start\n".into()),
+            "whitespace-only words remove the existing brief in place");
+        assert_eq!(save(&two, words, false).unwrap_err(), "the brief is the person's own words: they write it in the Requirements tab",
+            "a tool cannot write the person's brief");
+        for (before, after) in [("// start\n", original), (original, "// start\n"),
+            (original, "// start\nbrief(\"Cold light\")\n"), (original, "// start\nbrief( \"  Warm light  \")\n")] {
+            assert_eq!(check_text(DocId(9), NAME, before, after, true).unwrap_err(),
+                format!("{NAME}:2: the brief is the person's own words: leave brief(..) as it is"),
+                "adding, removing or rewriting the brief is refused at its source line");
+        }
+        let with_req = format!("require(\"layers\", board(\"ledctl\").layers, {{max: 2}})\n{original}{text}");
+        assert!(check_text(DocId(9), NAME, original, &with_req, true).is_ok(),
+            "moving an unchanged brief while adding a requirement is allowed");
+        let list = req_list(&self::docs(&with_req), &design_facts(&snap), &args(&[("from", "1")])).unwrap();
+        let reply = makepad_widgets_core::makepad_script::syntax::parse_value(&list).unwrap();
+        let brief = &reply.field("brief").unwrap().value;
+        let [wish] = reply.field("wishes").unwrap().value.items().unwrap() else { panic!("one wish on every page") };
+        for (row, words, line) in [(brief, "  Warm light  ", 3.), (wish, "warm light", 4.)] {
+            assert!(row.field("words").unwrap().value.string() == Some(words) && row.field("doc").unwrap().value.string() == Some(NAME)
+                && row.field("line").unwrap().value.number() == Some(line), "the unpaged words retain their text, document and line");
+        }
+        assert!(reply.field("total").unwrap().value.number() == Some(1.) && reply.field("requirements").unwrap().value.items().unwrap().is_empty(),
+            "paging counts only measured requirements");
     }
 }

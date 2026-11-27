@@ -12,6 +12,7 @@
 //! records say which code draws at a moment ([`activity`]): the time
 //! strip's ribbons and the "drawing now" glow.
 
+use makepad_motion::plain::PrimitiveFrame;
 use super::session::MotionSession;
 use makepad_motion::draw2d::{Draw2dList, Op};
 use makepad_motion::schema::{text_op_box, CodeFile};
@@ -245,7 +246,7 @@ pub fn pickables(session: &MotionSession, doc: &MotionDoc, frame: &MotionFrame, 
                 let layer_words = session.outline.all().into_iter().filter(|l| item.path == l.path || item.path.starts_with(&format!("{}#", l.path))).max_by_key(|l| l.path.len())
                     .and_then(|l| session.value_site(&l.path, "text")).and_then(|site| session.resolved(site).words());
                 let (content, label, words) = match &item.kind {
-                    ItemKind::Text { text, .. } => (true, format!("text “{}”", text.chars().take(24).collect::<String>()), Some(text.clone())),
+                    ItemKind::Primitive(PrimitiveFrame::Text { text, .. }) => (true, format!("text “{}”", text.chars().take(24).collect::<String>()), Some(text.clone())),
                     _ if layer_words.is_some() => (true, format!("text “{}”", layer_words.as_deref().unwrap_or("").chars().take(24).collect::<String>()), layer_words.clone()),
                     ItemKind::Group { .. } | ItemKind::Shader { .. } | ItemKind::Scene3D { .. } | ItemKind::Scene3dDoc { .. } => (false, "layer".to_string(), None),
                     _ => (item.opacity > 0.05 && area < frame_area * 0.6, "shape".to_string(), None),

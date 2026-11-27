@@ -12,6 +12,7 @@ mod legal_plan;
 mod docs;
 mod driver;
 pub mod doc_actions;
+pub mod step_actions;
 pub mod edit_actions;
 pub mod model_actions;
 pub mod sheet_actions;
@@ -31,3 +32,5 @@ pub use engine::{CheckJob, Engine, FillJob, JournalEvent, JournalSink, JournalSt
 pub use eval::{EvalJob, EvalDone, EvalOut, MISTAKE};
 pub use inbox::{circuits_named, CircuitChange, Cmd, DocSet, Inbox, Mailbox, Outcome, Sample, TaskResult, Ticket, CASE_KEEPOUT};
 pub use plan::{route_plan, Job, Plan, Resolver, RouteStart};
+
+pub use fab_elec_view::snapshot::{ProposalAuthor, ProposalChecks, ProposalDoc, ProposalId, ProposalState, ProposalView};

@@ -529,7 +529,19 @@ impl Scene {
                 fill: tokens.block_fill,
             };
             scene.boxes.push(BoxInst { stroke: [0.0; 2], ..frame_box });
-            foreground.push(BoxInst { fill: [0.0; 4], ..frame_box });
+            if frame.planned {
+                let [l, b, r, t] = frame.rect.map(|v| v as f32);
+                for seg in [[l,b,r,b], [r,b,r,t], [r,t,l,t], [l,t,l,b]] {
+                    scene.lines.push(LineInst { c, seg, width: [1.0, 0.0], dash: [3.0, 2.0], ..Default::default() });
+                }
+            } else {
+                foreground.push(BoxInst { fill: [0.0; 4], ..frame_box });
+            }
+            for port in &frame.ports {
+                let [x, y] = port.at.map(|v| v as f32);
+                foreground.push(BoxInst { c, rect: [x, y, 0.2, 0.2], corner: 0.2,
+                    stroke: [1.0, 0.0], fill: if port.open { tokens.block_fill } else { c.ink } });
+            }
             let path = circuit.tree.get(b).map_or(String::new(), |block| block.path.clone());
             if pinned_paths.contains(path.as_str()) {
                 let mut fill = tokens.selection;

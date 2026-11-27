@@ -270,7 +270,7 @@ mod tests {
         let led = c.comps[r.ix()].block;
         let def = BlockDefId(0);
         c.block_defs.push(BlockDef {
-            id: def, name: "indicator".into(), params: vec![], sheet: Default::default(), template: None,
+            id: def, name: "indicator".into(), params: vec![], sheet: Default::default(), template: None, planned: false, role: None,
             ports: vec![PortDef { name: "debug".into(), kind: PortKind::In, volts: None, current: None, default: None }],
         });
         c.tree[led.ix()].def = Some(def);

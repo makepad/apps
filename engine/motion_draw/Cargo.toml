@@ -51,18 +51,15 @@ name = "makepad-motion"
 path = "src/bin/makepad-motion.rs"
 required-features = ["scene3d"]
 
+# The GPU pixel test: the frame tool's batch in one hidden window.
 [[test]]
 name = "pixels"
-required-features = ["scene3d"]
-
-[[test]]
-name = "selection_bounds"
-required-features = ["scene3d"]
-
-[[test]]
-name = "hdr_pixels"
-required-features = ["scene3d"]
+harness = false
 
 [dev-dependencies]
+makepad-core-util = { path = "../../../../libs/core_util" }
+# The GPU pixel tests draw Scene3D and run the frame tool: every test build
+# turns `scene3d` on, so a plain test run runs them.
+makepad-motion-draw = { path = ".", features = ["scene3d"] }
 # Decoding frames in the GPU pixel tests.
 makepad-zune-png = { path = "../../../../libs/zune/zune-png" }

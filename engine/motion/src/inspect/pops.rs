@@ -10,6 +10,7 @@
 //! after is the edit's), and a layer marked `hard_cut: true` (or inside one)
 //! cuts in and out by intent: a beat hit, a flash.
 
+use crate::plain::GroupProps;
 use super::{issue, measure, LayoutIssue, Presence};
 use crate::{Layer, LayerKind, MotionDoc};
 use std::collections::HashMap;
@@ -91,7 +92,7 @@ fn clocks(layers: &[Layer], origin: f64, out: &mut HashMap<String, f64>) {
         let start = origin + layer.span.as_ref().map_or(0.0, |span| span.start.value);
         out.insert(layer.path.clone(), start);
         match &layer.kind {
-            LayerKind::Group { layers, mask, stagger, .. } => {
+            LayerKind::Group { layers, mask, props: GroupProps { stagger, .. }, .. } => {
                 for (i, child) in layers.iter().enumerate() {
                     clocks(std::slice::from_ref(child), start + stagger.delay(i, layers.len()), out);
                 }

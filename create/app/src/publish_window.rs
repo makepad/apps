@@ -22,7 +22,7 @@ impl App {
 
     pub(super) fn show_publish(&self, cx: &mut Cx) {
         let Some(state) = &self.view.publish else { return };
-        self.ui.button(cx, ids!(open_publish)).set_visible(cx, state.enabled());
+        self.ui.button(cx, ids!(rail_publish)).set_visible(cx, state.enabled() && self.view.page != Page::Publish);
         let error = self.ui.label(cx, ids!(publish_config_error));
         error.set_visible(cx, state.config_problem.is_some());
         if let Some(problem) = &state.config_problem { error.set_text(cx, problem); }
@@ -62,6 +62,7 @@ impl App {
         if !state.enabled() || state.sending() || files.is_empty() { return }
         state.import(&cx.task_pool(), files);
         self.view.page = Page::Publish;
+        self.view.show_pane(Pane::Page);
         self.publish_clock(cx);
         self.update_page(cx);
     }
@@ -71,7 +72,7 @@ impl App {
             if self.view.publish.as_mut().is_some_and(LocalPublish::poll) { self.show_publish(cx); }
             self.publish_clock(cx);
         }
-        if !self.view.publish.as_ref().is_some_and(|p| p.enabled() && !p.sending()) || cx.injected_by().is_some() { return }
+        if !self.publish_takes_drops() || cx.injected_by().is_some() { return }
         let items = match event {
             Event::Drag(e) => &e.items,
             Event::Drop(e) => &e.items,
@@ -104,14 +105,17 @@ impl App {
         }
         let Some(state) = &mut self.view.publish else { return };
         if !state.enabled() { return }
-        if self.view.page == Page::Share && self.ui.button(cx, ids!(open_publish)).clicked(actions) {
-            self.view.page = Page::Publish;
-            self.update_page(cx);
+        if self.ui.button(cx, ids!(rail_publish)).clicked(actions) {
+            if self.flush_doc(cx).is_ok() {
+                self.view.page = Page::Publish;
+                self.view.show_pane(Pane::Page);
+                self.update_page(cx);
+            }
             return
         }
         if self.view.page != Page::Publish { return }
         if self.ui.button(cx, ids!(publish_back)).clicked(actions) {
-            self.view.page = Page::Share;
+            self.view.page = Page::Home;
             self.update_page(cx);
             return
         }
@@ -133,7 +137,14 @@ impl App {
                 }
             }
         }
-        if !state.pending() && self.ui.button(cx, ids!(publish_clear)).clicked(actions) { state.clear(); changed = true; }
+        if !state.pending() && self.ui.button(cx, ids!(publish_clear)).clicked(actions) {
+            // Discarding ends the draft: the page empties, then closes the way Back closes it.
+            state.clear();
+            self.show_publish(cx);
+            self.view.page = Page::Home;
+            self.update_page(cx);
+            return
+        }
         if changed { self.show_publish(cx); }
     }
 }

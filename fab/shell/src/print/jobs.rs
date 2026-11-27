@@ -16,7 +16,8 @@
 
 use super::*;
 use fab_printer_link::model::TrayId;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -308,6 +309,14 @@ pub enum JobState {
 }
 
 impl JobState {
+    fn list_section(&self) -> u8 {
+        match self {
+            Self::Preparing | Self::Sent => 0,
+            Self::Queued => 1,
+            _ => 2,
+        }
+    }
+
     pub fn ended(&self) -> bool {
         matches!(self, Self::Finished | Self::Failed(_) | Self::Stopped | Self::EndedUnseen)
     }
@@ -452,6 +461,10 @@ pub struct CommittedJob {
 }
 
 impl CommittedJob {
+    fn has_or_loads_preview(&self) -> bool {
+        self.preview.is_some() || self.loading
+    }
+
     /// A job read from disk, its clock on this run's (`now`: `Cx::time_now`, `wall`: [`wall_now`]).
     pub fn restored(meta: JobMeta, saved: SavedState, now: f64, wall: f64) -> Self {
         let here = |t: f64| now - (wall - t);
@@ -476,6 +489,148 @@ impl CommittedJob {
             started: (!matches!(self.state, JobState::Queued | JobState::Preparing)).then(|| there(self.sent_at)),
             ended: self.ended_at.map(there),
             reached: self.reached,
+        }
+    }
+}
+
+/// Committed jobs in newest-first order. A job's id stays with its on-disk package.
+#[derive(Clone, Debug, Default)]
+pub struct History {
+    jobs: Vec<CommittedJob>,
+    index: HashMap<String, usize>,
+    previews: Previewed,
+    rev: u64,
+}
+
+/// Dense ids for sync_jobs to visit, with a slot for constant-time removal.
+#[derive(Clone, Debug, Default)]
+struct Previewed {
+    ids: Vec<String>,
+    slots: HashMap<String, usize>,
+}
+
+impl Previewed {
+    fn insert(&mut self, id: &str) {
+        self.slots.insert(id.to_owned(), self.ids.len());
+        self.ids.push(id.to_owned());
+    }
+
+    fn remove(&mut self, id: &str) {
+        if let Some(i) = self.slots.remove(id) {
+            self.ids.swap_remove(i);
+            if let Some(moved) = self.ids.get(i) {
+                *self.slots.get_mut(moved).unwrap() = i;
+            }
+        }
+    }
+}
+
+impl Deref for History {
+    type Target = [CommittedJob];
+    fn deref(&self) -> &Self::Target { &self.jobs }
+}
+
+impl From<Vec<CommittedJob>> for History {
+    fn from(jobs: Vec<CommittedJob>) -> Self {
+        let mut history = Self { jobs, ..Self::default() };
+        history.reindex();
+        history
+    }
+}
+
+impl History {
+    // A widget can see a replacement history, or two histories cloned at the same revision.
+    fn next_revision() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn reindex(&mut self) {
+        self.index.clear();
+        self.previews = Previewed::default();
+        for (i, job) in self.jobs.iter().enumerate() {
+            self.index.insert(job.meta.id.clone(), i);
+            if job.has_or_loads_preview() { self.previews.insert(&job.meta.id); }
+        }
+        self.rev = Self::next_revision();
+    }
+
+    pub fn rev(&self) -> u64 { self.rev }
+    pub fn previewed(&self) -> &[String] { &self.previews.ids }
+    pub fn position(&self, id: &str) -> Option<usize> { self.index.get(id).copied() }
+    pub fn get(&self, id: &str) -> Option<&CommittedJob> { self.position(id).map(|i| &self.jobs[i]) }
+    pub fn get_mut(&mut self, id: &str) -> Option<JobMut<'_>> {
+        self.position(id).map(|i| self.at_mut(i))
+    }
+
+    pub fn at_mut(&mut self, i: usize) -> JobMut<'_> {
+        let job = &mut self.jobs[i];
+        JobMut { section: job.state.list_section(), previewed: job.has_or_loads_preview(), job, rev: &mut self.rev, previews: &mut self.previews }
+    }
+
+    pub fn insert_newest(&mut self, job: CommittedJob) {
+        for i in self.index.values_mut() { *i += 1; }
+        self.index.insert(job.meta.id.clone(), 0);
+        if job.has_or_loads_preview() { self.previews.insert(&job.meta.id); }
+        self.jobs.insert(0, job);
+        self.rev = Self::next_revision();
+    }
+
+    pub fn push(&mut self, job: CommittedJob) {
+        self.index.insert(job.meta.id.clone(), self.jobs.len());
+        if job.has_or_loads_preview() { self.previews.insert(&job.meta.id); }
+        self.jobs.push(job);
+        self.rev = Self::next_revision();
+    }
+
+    pub fn remove(&mut self, id: &str) -> Option<CommittedJob> {
+        let i = self.index.remove(id)?;
+        let removed = self.jobs.remove(i);
+        for job in &self.jobs[i..] { *self.index.get_mut(&job.meta.id).unwrap() -= 1; }
+        self.previews.remove(id);
+        self.rev = Self::next_revision();
+        Some(removed)
+    }
+
+    pub fn merge(&mut self, jobs: Vec<CommittedJob>) {
+        self.jobs.extend(jobs);
+        self.jobs.sort_by(|a, b| b.meta.created.total_cmp(&a.meta.created));
+        self.reindex();
+    }
+
+    pub fn clear(&mut self) {
+        if self.jobs.is_empty() { return; }
+        self.jobs.clear();
+        self.reindex();
+    }
+}
+
+pub struct JobMut<'a> {
+    job: &'a mut CommittedJob,
+    rev: &'a mut u64,
+    previews: &'a mut Previewed,
+    section: u8,
+    previewed: bool,
+}
+
+impl Deref for JobMut<'_> {
+    type Target = CommittedJob;
+    fn deref(&self) -> &CommittedJob { self.job }
+}
+
+impl DerefMut for JobMut<'_> {
+    fn deref_mut(&mut self) -> &mut CommittedJob { self.job }
+}
+
+impl Drop for JobMut<'_> {
+    fn drop(&mut self) {
+        if self.job.state.list_section() != self.section {
+            *self.rev = History::next_revision();
+        }
+        let previewed = self.job.has_or_loads_preview();
+        if previewed != self.previewed {
+            if previewed { self.previews.insert(&self.job.meta.id); }
+            else { self.previews.remove(&self.job.meta.id); }
         }
     }
 }
@@ -545,7 +700,7 @@ mod tests {
             p.links.picked = choice.clone();
             let state = PrinterState { gcode_state: Some(gcode.into()), job_name: name.map(str::to_string), total_layers: layers, ..Default::default() };
             let job = tracker.map(|stage| JobStatus { name: "cube".into(), file: String::new(), stage });
-            p.printers.set(choice, Arc::new(Snapshot { state: Arc::new(state), model: model.into(), job, job_sends: 1, virtual_printer: matches!(choice, PrinterChoice::Virtual(_)), ..Default::default() }));
+            p.printers.set(choice, 1, Arc::new(Snapshot { state: Arc::new(state), model: model.into(), job, job_sends: 1, virtual_printer: matches!(choice, PrinterChoice::Virtual(_)), ..Default::default() }));
             follow::printer_changed(p, 10.0);
         };
         let report = |p: &mut PrintState, choice: &PrinterChoice, gcode: &str, tracker| publish(p, choice, gcode, "H2D", Some("cube"), Some(4), tracker);
@@ -565,7 +720,7 @@ mod tests {
 
         report(&mut p, &a, "RUNNING", None);
         let before = p.follow.jobs[0].saved(10.0, 10.0);
-        follow::unlink_printer(&mut p, None, 10.0);
+        follow::unlink_printer(&mut p, &a, None, 10.0);
         assert_eq!(p.follow.jobs[0].saved(10.0, 10.0), before, "switching away preserves A's saved state");
         p.follow.jobs.push(CommittedJob { meta: Arc::new(newer), state: JobState::Sent, link_send: 1, ..Default::default() });
         report(&mut p, &a, "FINISH", Some(JobStage::Finished));
@@ -574,7 +729,7 @@ mod tests {
         assert_eq!(p.follow.jobs[0].link_send, 0, "unlink clears the old send number");
         report(&mut p, &a, "FINISH", Some(JobStage::Finished));
         assert_eq!(p.follow.jobs[0].state, JobState::Sent, "a repeated terminal report still belongs to the new send");
-        follow::unlink_printer(&mut p, None, 10.0);
+        follow::unlink_printer(&mut p, &a, None, 10.0);
 
         let absent = JobMeta { id: "absent".into(), name: "bracket".into(), ..old.clone() };
         p.follow.jobs.push(CommittedJob::restored(old, sent.clone(), 10.0, 10.0));

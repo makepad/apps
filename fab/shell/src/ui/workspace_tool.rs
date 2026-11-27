@@ -398,7 +398,7 @@ impl<'a> Args<'a> {
 
     fn editor(&mut self) -> Result<Editor, String> {
         let name = self.editor_name()?;
-        EDITORS.iter().find(|d| name.eq_ignore_ascii_case(d.name) || name.eq_ignore_ascii_case(d.title))
+        EDITORS.iter().filter(|d| !d.editor.retired()).find(|d| name.eq_ignore_ascii_case(d.name) || name.eq_ignore_ascii_case(d.title))
             .map(|d| d.editor).ok_or_else(|| format!("unknown editor {}. See the fab.workspace catalog", quote(&name)))
     }
 

@@ -10,6 +10,7 @@ mod tests;
 use crate::ElecLive;
 use fab_elec_circuit::Circuit;
 use fab_elec_lang::{Catalog, CatalogEntry, CatalogKind};
+use fab_elec_parts::Lifecycle;
 use makepad_widgets_core::{view::ViewAction as RowAction, *};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -441,10 +442,36 @@ fn entry_detail(entry: &CatalogEntry) -> String {
             None => quantity_text(value).unwrap_or_else(|| value.to_string()),
         })
     }).unwrap_or_else(pins);
-    match package {
+    let detail = match package {
         Some(code) => format!("{code}, {fact}"),
         None => fact,
+    };
+    with_badges(detail, entry, ", ")
+}
+
+/// The person's badges for an entry's part: `approved`, then `NRND` or `obsolete`. Empty for a
+/// block and for a part that states neither. O(1).
+fn badges(entry: &CatalogEntry) -> Vec<&'static str> {
+    let Some(part) = &entry.part else { return Vec::new() };
+    let mut out = Vec::new();
+    if part.approved {
+        out.push("approved");
     }
+    match part.lifecycle {
+        Some(Lifecycle::Nrnd) => out.push("NRND"),
+        Some(Lifecycle::Obsolete) => out.push("obsolete"),
+        _ => {}
+    }
+    out
+}
+
+/// `text` with the entry's badges after it, joined by `sep`; `text` itself without badges.
+fn with_badges(text: String, entry: &CatalogEntry, sep: &str) -> String {
+    let badges = badges(entry);
+    if badges.is_empty() {
+        return text;
+    }
+    format!("{text}{sep}{}", badges.join(sep))
 }
 
 /// The first four-digit package token, borrowed from the footprint name.
@@ -554,7 +581,7 @@ impl LibraryPanel {
         }
         let text = match (entry, self.hovered) {
             (Some(entry), Some(index)) => {
-                let about = if entry.summary.is_empty() { self.row_details.get(index).cloned().unwrap_or_default() } else { entry.summary.clone() };
+                let about = if entry.summary.is_empty() { self.row_details.get(index).cloned().unwrap_or_default() } else { with_badges(entry.summary.clone(), entry, " · ") };
                 format!("{}\n{about}", entry.title)
             }
             _ => "Hover a part to see its symbol. Drag it onto the sheet, or click it and then click the sheet.".to_string(),

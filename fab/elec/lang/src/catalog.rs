@@ -239,6 +239,12 @@ pub fn blocks_alone(src: &CatalogSource, entries: &[&CatalogEntry]) -> Vec<Resul
     ctx.borrow_mut().docs.retain(|doc| doc.id == empty.id || src.libs.doc(doc.id).is_some_and(is_definition));
     circuit::load_libraries(&mut vm, &ctx);
     circuit::load_project_docs(&mut vm, &ctx, src.docs.iter(), &src.assets);
+    // This VM is only for miniatures. Planned blocks show their ports, even if a builder exists.
+    for rec in &mut ctx.borrow_mut().defs {
+        if rec.def.planned {
+            rec.build = None;
+        }
+    }
     // A definition document's own mistakes are the catalog's diagnostics; a miniature reports only
     // what its block's build says, so one broken document does not blank every tile.
     ctx.borrow_mut().diags.clear();

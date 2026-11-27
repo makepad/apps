@@ -1,3 +1,4 @@
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::*;
 use std::path::PathBuf;
 
@@ -43,18 +44,18 @@ fn the_kinetic_title_moves_letter_by_letter() {
     assert_eq!(doc.inputs.len(), 3);
     let at = |t: f64| doc.eval(t);
     let headline = |frame: &MotionFrame| frame.items.iter().find(|item| item.path == "layers[1]").cloned().unwrap();
-    let ItemKind::Text { units, text, .. } = headline(&at(0.3)).kind else { panic!() };
+    let ItemKind::Primitive(PrimitiveFrame::Text { units, text, .. }) = headline(&at(0.3)).kind else { panic!() };
     assert_eq!(text, "Notes, instantly");
     assert_eq!(units.len(), "Notes,instantly".chars().count(), "letters, spaces skipped");
     // Staggered: an early letter is further along than a late one.
     assert!(units[0].opacity > units[10].opacity, "{} vs {}", units[0].opacity, units[10].opacity);
     assert!(units[0].offset[1] < units[10].offset[1]);
     // Settled mid-way: every letter in place.
-    let ItemKind::Text { units, .. } = headline(&at(3.0)).kind else { panic!() };
+    let ItemKind::Primitive(PrimitiveFrame::Text { units, .. }) = headline(&at(3.0)).kind else { panic!() };
     assert!(units.iter().all(|u| u.opacity == 1.0 && u.offset[1].abs() < 1e-9 && u.rotate.abs() < 1e-9));
     // The bar draws itself between 0.9 s and 1.7 s.
     let bar = |t: f64| match at(t).items.iter().find(|i| i.path == "layers[2]").unwrap().kind.clone() {
-        ItemKind::Path { trim, .. } => trim,
+        ItemKind::Primitive(PrimitiveFrame::Path { trim, .. }) => trim,
         _ => panic!(),
     };
     assert_eq!(bar(0.5), [0.0, 0.0]);
@@ -64,9 +65,9 @@ fn the_kinetic_title_moves_letter_by_letter() {
     assert!(doc.layers.iter().all(|l| l.animated));
     // Inputs fill in.
     let other = doc.with_inputs(&[(LiveId::from_str("headline"), InputValue::Text("Hi".into())), (LiveId::from_str("accent"), InputValue::Color([0.0, 1.0, 0.0, 1.0]))]).unwrap();
-    let ItemKind::Text { text, .. } = other.eval(1.0).items[1].kind.clone() else { panic!() };
+    let ItemKind::Primitive(PrimitiveFrame::Text { text, .. }) = other.eval(1.0).items[1].kind.clone() else { panic!() };
     assert_eq!(text, "Hi");
-    let ItemKind::Path { stroke, .. } = other.eval(1.0).items[2].kind.clone() else { panic!() };
+    let ItemKind::Primitive(PrimitiveFrame::Path { stroke, .. }) = other.eval(1.0).items[2].kind.clone() else { panic!() };
     assert_eq!(stroke, Some([0.0, 1.0, 0.0, 1.0]));
 }
 
@@ -87,7 +88,7 @@ fn the_logo_reveal_springs_its_squares_in_turn() {
     // The prototype's fields reach its instances.
     let frame = doc.eval(3.0);
     let ItemKind::Group { children, .. } = &frame.items[1].kind else { panic!() };
-    assert!(matches!(children[0].kind, ItemKind::Rect { size: [56.0, 56.0], radius: 10.0, .. }));
+    assert!(matches!(children[0].kind, ItemKind::Primitive(PrimitiveFrame::Rect { size: [56.0, 56.0], radius: 10.0, .. })));
     // The ring's group turns from -90 degrees: its children carry the turn.
     let ItemKind::Group { children, .. } = &doc.eval(0.0).items[0].kind else { panic!() };
     let p = children[0].world.apply([100.0, 0.0]);
@@ -121,7 +122,7 @@ fn the_built_in_title_centres_its_text_on_the_position() {
     ]).unwrap();
     assert_eq!(doc.size, [640.0, 360.0]);
     let frame = doc.eval(10.0);
-    let ItemKind::Text { text, size, align, valign, .. } = &frame.items[0].kind else { panic!() };
+    let ItemKind::Primitive(PrimitiveFrame::Text { text, size, align, valign, .. }) = &frame.items[0].kind else { panic!() };
     assert_eq!((text.as_str(), *size, *align, *valign), ("Hi", 28.0, Align::Center, VAlign::Center));
     assert_eq!(frame.items[0].world.apply([0.0, 0.0]), [320.0, 300.0]);
 }

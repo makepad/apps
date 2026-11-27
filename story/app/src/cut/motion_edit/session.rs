@@ -8,6 +8,7 @@
 //! evaluated here; loading the model is the checker's job), in time linear
 //! in the document's length.
 
+use makepad_motion::plain::{EllipseProps, GroupProps, PathProps, RectProps, TextProps};
 use makepad_motion::patch::{self, LayerOutline, Outline, PropForm};
 use makepad_motion::schema::{self, Owner, Site};
 use makepad_motion::{sample_track, Layer, LayerKind, MotionDoc, Prop};
@@ -799,16 +800,16 @@ fn prop_ref<'a>(layer: &'a Layer, name: &str) -> Option<PropRef<'a>> {
         "rotate" => PropRef::One(&transform.rotate),
         "opacity" => PropRef::One(&layer.opacity),
         _ => match (&layer.kind, name) {
-            (LayerKind::Rect { size, .. } | LayerKind::Ellipse { size, .. }, "size") => PropRef::Two(size),
-            (LayerKind::Rect { radius, .. }, "radius") => PropRef::One(radius),
-            (LayerKind::Rect { fill: Some(fill), .. } | LayerKind::Ellipse { fill: Some(fill), .. } | LayerKind::Path { fill: Some(fill), .. }, "fill") => PropRef::Four(fill),
-            (LayerKind::Rect { stroke: Some(stroke), .. } | LayerKind::Ellipse { stroke: Some(stroke), .. } | LayerKind::Path { stroke: Some(stroke), .. }, "stroke") => PropRef::Four(stroke),
-            (LayerKind::Rect { width, .. } | LayerKind::Ellipse { width, .. } | LayerKind::Path { width, .. }, "width") => PropRef::One(width),
-            (LayerKind::Path { trim_start, .. }, "trim_start") => PropRef::One(trim_start),
-            (LayerKind::Path { trim_end, .. }, "trim_end") => PropRef::One(trim_end),
-            (LayerKind::Text { size, .. }, "size") => PropRef::One(size),
-            (LayerKind::Text { color, .. }, "color") => PropRef::Four(color),
-            (LayerKind::Svg { size: Some(size), .. } | LayerKind::Image { size: Some(size), .. } | LayerKind::Video { size: Some(size), .. } | LayerKind::Group { size: Some(size), .. } | LayerKind::Shader { size: Some(size), .. }, "size") => PropRef::Two(size),
+            (LayerKind::Rect(RectProps { size, .. }) | LayerKind::Ellipse(EllipseProps { size, .. }), "size") => PropRef::Two(size),
+            (LayerKind::Rect(RectProps { radius, .. }), "radius") => PropRef::One(radius),
+            (LayerKind::Rect(RectProps { fill: Some(fill), .. }) | LayerKind::Ellipse(EllipseProps { fill: Some(fill), .. }) | LayerKind::Path(PathProps { fill: Some(fill), .. }), "fill") => PropRef::Four(fill),
+            (LayerKind::Rect(RectProps { stroke: Some(stroke), .. }) | LayerKind::Ellipse(EllipseProps { stroke: Some(stroke), .. }) | LayerKind::Path(PathProps { stroke: Some(stroke), .. }), "stroke") => PropRef::Four(stroke),
+            (LayerKind::Rect(RectProps { width, .. }) | LayerKind::Ellipse(EllipseProps { width, .. }) | LayerKind::Path(PathProps { width, .. }), "width") => PropRef::One(width),
+            (LayerKind::Path(PathProps { trim_start, .. }), "trim_start") => PropRef::One(trim_start),
+            (LayerKind::Path(PathProps { trim_end, .. }), "trim_end") => PropRef::One(trim_end),
+            (LayerKind::Text { props: TextProps { size, .. }, .. }, "size") => PropRef::One(size),
+            (LayerKind::Text { props: TextProps { color, .. }, .. }, "color") => PropRef::Four(color),
+            (LayerKind::Svg { size: Some(size), .. } | LayerKind::Image { size: Some(size), .. } | LayerKind::Video { size: Some(size), .. } | LayerKind::Group { props: GroupProps { size: Some(size), .. }, .. } | LayerKind::Shader { size: Some(size), .. }, "size") => PropRef::Two(size),
             (LayerKind::Shader { params, .. }, name) => PropRef::One(&params.iter().find(|(param, _)| param == name)?.1),
             _ => return None,
         },

@@ -1,5 +1,6 @@
 //! The shapes: Rect, Ellipse, Path, Svg, Vector, read from their components.
 
+use crate::plain::{EllipseProps, PathProps, RectProps};
 use super::{check_path_data, points_of, points_path, At, Reader};
 use crate::layers::{kind, Ellipse, Field, Path, Rect, Svg, Vector};
 use crate::model::*;
@@ -8,7 +9,7 @@ use crate::obj::Look;
 impl Rect {
     pub(super) fn read(&self, c: &mut Reader, at: &At, path: &str) -> LayerKind {
         let (fill, stroke) = paint(c, at, path, &self.fill, &self.stroke, "Rect");
-        LayerKind::Rect {
+        LayerKind::Rect(RectProps {
             size: size(c, at, &self.size, "Rect"),
             radius: self.radius.prop(c, at, "radius", 0.0),
             fill,
@@ -17,14 +18,14 @@ impl Rect {
             trim_start: self.trim_start.prop(c, at, "trim_start", 0.0),
             trim_end: self.trim_end.prop(c, at, "trim_end", 1.0),
             cap: self.cap.pick(c, at, "cap", Cap::Butt),
-        }
+        })
     }
 }
 
 impl Ellipse {
     pub(super) fn read(&self, c: &mut Reader, at: &At, path: &str) -> LayerKind {
         let (fill, stroke) = paint(c, at, path, &self.fill, &self.stroke, "Ellipse");
-        LayerKind::Ellipse {
+        LayerKind::Ellipse(EllipseProps {
             size: size(c, at, &self.size, "Ellipse"),
             fill,
             stroke,
@@ -32,7 +33,7 @@ impl Ellipse {
             trim_start: self.trim_start.prop(c, at, "trim_start", 0.0),
             trim_end: self.trim_end.prop(c, at, "trim_end", 1.0),
             cap: self.cap.pick(c, at, "cap", Cap::Butt),
-        }
+        })
     }
 }
 
@@ -105,7 +106,7 @@ impl Path {
                 c.warn(at, "stroke", "this Path has neither `fill` nor `stroke`, so it draws nothing".into(), Some("`stroke: #ffffff width: 6`"));
             }
         }
-        LayerKind::Path {
+        LayerKind::Path(PathProps {
             data: data.into(),
             fill,
             stroke,
@@ -114,7 +115,7 @@ impl Path {
             trim_end: self.trim_end.prop(c, at, "trim_end", 1.0),
             cap: self.cap.pick(c, at, "cap", Cap::Round),
             join: self.join.pick(c, at, "join", Join::Round),
-        }
+        })
     }
 }
 

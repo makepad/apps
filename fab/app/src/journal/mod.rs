@@ -17,9 +17,11 @@ mod live;
 mod presence;
 pub(crate) mod remove;
 pub(crate) use live::recover_loss_notes;
+pub(crate) use loss::finish_delete as finish_delete_notes;
 pub(crate) use live::{arguments, Binding, Call, Electronics, Plate, Quit, Work};
-pub use live::writer_progress;
+pub use live::{pause_plate, writer_progress};
 pub(crate) use live::release_presence;
+pub(crate) use presence::other_presence_holders;
 pub(crate) use live::{watch_settlement, SettleNotice};
 #[cfg(test)]
 pub(crate) use live::text_args;
@@ -185,6 +187,22 @@ fn require_same(file: &File, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Saved plates may acquire their first lifetime lock at Delete. Never
+/// follow an existing sidecar link or create a missing plate directory.
+pub(crate) fn delete_lock(plate: &Path) -> io::Result<File> {
+    let path = plate.join(LIFETIME);
+    let file = match OpenOptions::new().read(true).write(true).create_new(true).open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            open_regular_with(&path, OpenOptions::new().read(true).write(true))?.ok_or(io::ErrorKind::NotFound)?
+        }
+        Err(e) => return Err(e),
+    };
+    file.try_lock()?;
+    require_same(&file, &path)?;
+    Ok(file)
+}
+
 fn create_directory(path: &Path) -> io::Result<()> {
     match fs::create_dir(path) {
         Ok(()) => loss::sync_dir(path.parent().ok_or_else(invalid)?),
@@ -198,7 +216,7 @@ fn time_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_def
 
 pub(crate) enum Record {
     Checkpoint { manifest: Option<String>, files: Arc<Files> },
-    Call { reference: String, actor: Value, action: String, args: Value },
+    Call { reference: String, actor: Value, action: String, args: Value, replay: bool },
     Done { call: u64, outcome: &'static str, reply: String, seqs: Vec<u64>, elsewhere: BTreeMap<String, Vec<u64>> },
     Effect { call: Option<u64>, foreign: Option<(String, String)>, seq: u64, actor: Value, label: String, action: Option<Value>, changes: Vec<Change> },
     History { undo: bool, before: Option<u64>, after: Option<u64>, changes: Vec<Change> },
@@ -263,7 +281,7 @@ impl Ordered {
                 if let Some(name) = manifest { fields.push(("manifest", s(name))); }
                 ("checkpoint", fields)
             }
-            Record::Call { reference, actor, action, args } => ("call", vec![("id", absolute(self.reservation.order)?), ("ref", s(reference)),
+            Record::Call { reference, actor, action, args, .. } => ("call", vec![("id", absolute(self.reservation.order)?), ("ref", s(reference)),
                 ("actor", actor.clone()), ("action", s(action)), ("args", args.clone())]),
             Record::Done { call, outcome, reply, seqs, .. } => ("done", vec![("id", absolute(*call)?), ("outcome", s(*outcome)),
                 ("reply", s(reply)), ("seqs", Value::Arr(seqs.iter().copied().map(number).collect()))]),
@@ -274,6 +292,7 @@ impl Ordered {
             Record::Reload(docs) => ("reload", vec![("changes", changes(docs)?)]),
         };
         match &self.record {
+            Record::Call { replay: false, .. } => fields.push(("replay", Value::Bool(false))),
             Record::Effect { foreign: Some((reference, journal)), .. } => {
                 fields.push(("call_ref", s(reference)));
                 fields.push(("call_journal", s(journal)));
@@ -411,6 +430,7 @@ struct Orders {
     segments: Arc<Segments>,
     incarnation: Option<Incarnation>,
     cut_without_prefix: bool,
+    quit_cut: Option<(u64, Arc<loss::Attempt>)>,
 }
 
 pub struct Progress {
@@ -457,6 +477,10 @@ impl Drop for RowLock {
 struct Writer {
     lifetime: RefCell<Option<Lifetime>>,
     handles: OnceCell<Handles>,
+    opened: Cell<Option<FileId>>,
+    gate: Option<Arc<live::Gate>>,
+    // Drop after the file handles, so an acknowledged pause can rename on Windows.
+    recovery_writer: OnceCell<live::RecoveryWriter>,
     create_plate: bool,
     marker_pending: Cell<bool>,
     counter: Arc<AtomicU64>,
@@ -606,7 +630,7 @@ impl Journal {
         let backlog = Arc::new(Mutex::new(Backlog { records: VecDeque::new(), reported: false }));
         let progress = Arc::new(Progress { orders: Mutex::default(), pending: 0.into(), write_error: false.into(), health: Mutex::new(Health::Ok), lock_waits: 0.into(), durable_end: u64::MAX.into() });
         (Self { counter: counter.clone(), progress: progress.clone(), sender: Arc::new(Sender { tx, backlog: backlog.clone(), count }) }, Writer { dir, rx, backlog, progress, settings: None, counter,
-            lifetime: RefCell::default(), handles: OnceCell::new(), create_plate: true,
+            lifetime: RefCell::default(), handles: OnceCell::new(), opened: Cell::new(None), gate: None, recovery_writer: OnceCell::new(), create_plate: true,
             marker_pending: Cell::new(false),
             block_bits: LIFE_BITS, life: Cell::new(None), warned_life: Cell::new(false), warned_lock: Cell::new(false),
             incarnation_changed: Cell::new(false), warned_incarnation: Cell::new(false),
@@ -629,7 +653,13 @@ impl Journal {
 }
 
 impl Writer {
+    fn close_handles(&mut self) {
+        self.handles.take();
+        self.lifetime.take();
+    }
+
     fn report_failure(&self, error: &io::Error, log: &mut impl FnMut(String)) {
+        if error.kind() == io::ErrorKind::Interrupted && self.gate.as_ref().is_some_and(|g| g.paused()) { return }
         if let Some(kind) = self.rollback_failed.take() {
             if !self.warned_rollback.replace(true) {
                 log(format!("journal: {}: rollback failed: {kind:?}; the next append repairs the tail", self.dir.join(LOG).display()));
@@ -763,7 +793,16 @@ impl Writer {
             Ok(()) => Ok(()),
             Err(fs::TryLockError::WouldBlock) => {
                 self.progress.lock_waits.fetch_add(1, Ordering::Release);
-                file.lock()
+                if let Some(gate) = self.gate.as_ref().or_else(|| self.recovery_writer.get().map(|w| &w.0)) {
+                    loop {
+                        gate.wait_for_row()?;
+                        match try_lock() {
+                            Ok(()) => break Ok(()),
+                            Err(fs::TryLockError::WouldBlock) => (),
+                            Err(fs::TryLockError::Error(e)) => break Err(e),
+                        }
+                    }
+                } else { file.lock() }
             }
             Err(fs::TryLockError::Error(e)) => Err(e),
         };
@@ -817,14 +856,19 @@ impl Writer {
             if let Ok(meta) = fs::symlink_metadata(&path) {
                 if !meta.is_file() { return Err(invalid()) }
             }
-            let file = OpenOptions::new().read(true).append(true).create(true).open(&path)?;
+            let file = OpenOptions::new().read(true).append(true).create(self.opened.get().is_none()).open(&path)?;
+            let id = FileId::of(&file)?;
+            if self.opened.get().is_some_and(|original| original != id) {
+                return Err(io::Error::other(Failure::IncarnationChanged))
+            }
             prove(require_same(&file, &path))?;
             #[cfg(test)]
             tests::probe("validated log")?;
             prove(verify().and_then(|_| require_same(&file, &path)))?;
-            Ok(file)
+            Ok((file, id))
         };
-        let file = prepare()?;
+        let (file, id) = prepare()?;
+        self.opened.set(Some(id));
         self.handles.set(Handles { row, log: file }).map_err(|_| invalid())?;
         Ok(Some(lock))
     }
@@ -946,6 +990,14 @@ impl Writer {
     }
 
     fn recover_notes(&self, log: &mut impl FnMut(String)) -> io::Result<()> {
+        if self.recovery_writer.get().is_none() {
+            let permit = live::RecoveryWriter::enter(&self.dir)?;
+            self.recovery_writer.set(permit).map_err(|_| invalid())?;
+        }
+        self.recover_unpaused(log)
+    }
+
+    fn recover_unpaused(&self, log: &mut impl FnMut(String)) -> io::Result<()> {
         // Discovery cannot create a lock through a linked store or plate.
         for dir in self.dir.ancestors().take(3) {
             match fs::symlink_metadata(dir) {
@@ -1141,6 +1193,7 @@ impl Writer {
     fn run(self) {
         while let Ok(first) = self.rx.recv() { self.batch(first); }
     }
+    #[cfg(test)]
     fn batch(&self, first: Ordered) {
         // Take ownership in constant time. A producer never waits for a backlog
         // to be copied, freed, serialized or written under its queue lock.

@@ -282,7 +282,7 @@ fn named_file(resolved: &makepad_story_edit_render::ResolvedMedia) -> Result<std
         makepad_asset_data::MediaType::Jpeg => "jpg",
         other => return Err(format!("no player for {other:?}")),
     };
-    let dir = makepad_ai_hub::home::makepad_home().join("stage-product").join("edit-cache");
+    let dir = makepad_widgets::makepad_platform::home::app_state_home().join("stage-product").join("edit-cache");
     let revision = resolved.revision.revision.to_string();
     let named = dir.join(format!("{}-{}.{ext}", resolved.revision.asset_id, &revision[revision.len().saturating_sub(12)..]));
     if !named.exists() {

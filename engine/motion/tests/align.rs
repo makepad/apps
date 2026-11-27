@@ -1,6 +1,7 @@
 //! Aligned path morphs: a square into a circle into a glyph, two contours
 //! into one, and `mix_paths` / `align_paths` on point lists from Splash.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::*;
 
 fn load(source: &str) -> MotionDoc {
@@ -8,7 +9,7 @@ fn load(source: &str) -> MotionDoc {
 }
 
 fn data_at(doc: &MotionDoc, t: f64) -> String {
-    let ItemKind::Path { path, .. } = &doc.eval(t).items[0].kind else { panic!() };
+    let ItemKind::Primitive(PrimitiveFrame::Path { path, .. }) = &doc.eval(t).items[0].kind else { panic!() };
     icons::path_data(path)
 }
 

@@ -14,12 +14,12 @@ use crate::{Docs, Plan};
 use fab_elec_circuit::{Circuit, CircuitOp, Component, End, Net, RefKind};
 use fab_elec_core::{CompId, Diag, PinIx};
 use fab_elec_design::action::{ActionDef, FieldDef, FieldKind, Risk};
-use fab_elec_design::{Design, DesignOp, Resolved, Unit};
+use fab_elec_design::{By, Design, DesignOp, Resolved, Unit};
 use fab_elec_explore::edit::{Target, Toward};
 use fab_elec_explore::plan::{delete_parts, plan, Gesture, Planned};
 use fab_elec_explore::sheet::TagKind;
 use fab_elec_lang::{Catalog, CatalogEntry, CatalogKind};
-use fab_elec_parts::PinKind;
+use fab_elec_parts::{lifecycle_rank, Lifecycle, PinKind};
 use makepad_widgets_core::makepad_script::syntax::write::quote;
 use std::fmt::Write;
 
@@ -60,7 +60,10 @@ entries: [{..}]
   title: text
   summary: text
   pins: [text]  in order, each as name:kind
-  defaults: text  the values it starts with",
+  defaults: text  the values it starts with
+  footprint: text  its footprint's name; empty without one
+  lifecycle: choice active|nrnd|obsolete  when the part states one
+  approved: bool  true when the person approved the part; absent otherwise",
     fields: &[
         FieldDef {
             name: "find", kind: FieldKind::Text, required: false, default: "",
@@ -323,9 +326,17 @@ pub fn library_list(catalog: Option<&Catalog>, args: &Args) -> Result<String, Di
     let catalog = catalog.ok_or_else(|| Diag::error("the plate has no electronics documents, so no Library", vec![]))?;
     let find = arg(args, "find").map(|text| text.trim().to_lowercase()).filter(|text| !text.is_empty());
     let from = arg(args, "from").map_or(Ok(0), |text| text.trim().parse::<usize>().map_err(|_| error("from", "expected an entry number from 0")))?;
-    let found: Vec<&CatalogEntry> = catalog.entries.iter().filter(|entry| find.as_ref().is_none_or(|find| {
+    let mut found: Vec<&CatalogEntry> = catalog.entries.iter().filter(|entry| find.as_ref().is_none_or(|find| {
         [&entry.name, &entry.title, &entry.summary, &entry.lib].iter().any(|text| text.to_lowercase().contains(find.as_str()))
     })).collect();
+    // The person's approved, active parts first.
+    found.sort_by(|a, b| {
+        let key = |e: &&CatalogEntry| {
+            let (approved, lifecycle) = e.part.as_ref().map_or((false, None), |p| (p.approved, p.lifecycle));
+            (!approved, lifecycle_rank(lifecycle))
+        };
+        key(a).cmp(&key(b)).then_with(|| a.lib.cmp(&b.lib)).then_with(|| a.name.cmp(&b.name))
+    });
     let mut out = format!("{{total: {} entries: [", found.len());
     for entry in found.iter().skip(from).take(LIBRARY_PAGE) {
         let kind = match entry.kind {
@@ -335,8 +346,18 @@ pub fn library_list(catalog: Option<&Catalog>, args: &Args) -> Result<String, Di
         };
         let pins: Vec<String> = entry.pins.iter().map(|pin| quote(&format!("{}:{}", pin.name, pin_kind(pin.kind)))).collect();
         let defaults: Vec<String> = entry.defaults.iter().map(|(name, value)| format!("{name}: {value}")).collect();
-        write!(out, "{{part: {} lib: {} kind: {kind} title: {} summary: {} pins: [{}] defaults: {}}} ",
-            quote(&entry.name), quote(&entry.lib), quote(&entry.title), quote(&entry.summary), pins.join(" "), quote(&defaults.join(", "))).unwrap();
+        let footprint = entry.part.as_ref().and_then(|p| p.footprint.as_ref()).map_or("", |fp| fp.name.as_str());
+        write!(out, "{{part: {} lib: {} kind: {kind} title: {} summary: {} pins: [{}] defaults: {} footprint: {}",
+            quote(&entry.name), quote(&entry.lib), quote(&entry.title), quote(&entry.summary), pins.join(" "), quote(&defaults.join(", ")), quote(footprint)).unwrap();
+        if let Some(part) = &entry.part {
+            if let Some(lifecycle) = part.lifecycle {
+                write!(out, " lifecycle: {}", lifecycle.name()).unwrap();
+            }
+            if part.approved {
+                out.push_str(" approved: true");
+            }
+        }
+        out.push_str("} ");
     }
     out.push(']');
     if from + LIBRARY_PAGE < found.len() {
@@ -465,8 +486,9 @@ pub fn part_rename(design: &Design, _docs: Option<&Docs>, tool: &str, args: &Arg
     }))
 }
 
-/// `elec.part.field`: one of the part's own text fields, written or removed. O(parts + fields).
-pub fn part_field(design: &Design, _docs: Option<&Docs>, tool: &str, args: &Args) -> Result<Plan, Diag> {
+/// `elec.part.field`: one of the part's own text fields, written or removed. `approved` is the
+/// person's alone, and a `lifecycle` is one `Lifecycle::of_name` takes. O(parts + fields).
+pub fn part_field(design: &Design, _docs: Option<&Docs>, tool: &str, args: &Args, by: By) -> Result<Plan, Diag> {
     check_tool(tool, &PART_FIELD, args)?;
     let (unit, comp) = required_part(design, args, "part")?;
     let key = arg(args, "key").expect("required field checked").trim();
@@ -474,6 +496,7 @@ pub fn part_field(design: &Design, _docs: Option<&Docs>, tool: &str, args: &Args
         return Err(error("key", "a field's name is letters, digits and _"));
     }
     let text = arg(args, "text");
+    check_part_field(key, text, by)?;
     let current = comp.fields.0.iter().find(|(name, _)| name == key).map(|(_, text)| text.as_str());
     let refdes = &comp.refdes;
     let label = match (text, current) {
@@ -487,6 +510,23 @@ pub fn part_field(design: &Design, _docs: Option<&Docs>, tool: &str, args: &Args
         place: vec![],
         label,
     }))
+}
+
+/// The checks the field actions share (`elec.part.field`, `elec.bom.field.set`): `approved` is
+/// the person's, set on the part definition, as `brief` and `waive` are; a `lifecycle` override
+/// is one `Lifecycle::of_name` takes. O(1).
+pub(crate) fn check_part_field(key: &str, text: Option<&str>, by: By) -> Result<(), Diag> {
+    if key.eq_ignore_ascii_case("approved") && by != By::Person {
+        return Err(error("key", "approved is set by the person on the part definition"));
+    }
+    if key.eq_ignore_ascii_case("lifecycle") {
+        if let Some(text) = text.filter(|text| !text.is_empty()) {
+            if Lifecycle::of_name(text).is_none() {
+                return Err(error("text", format_args!("a lifecycle is active, nrnd or obsolete, got {}", quote(text))));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `elec.net.connect`: a wire dragged from the pin to another pin or onto a net, or a name typed
@@ -554,4 +594,90 @@ pub fn pin_nc(design: &Design, _docs: Option<&Docs>, tool: &str, args: &Args) ->
     }
     let target = Target::Pin { comp: comp.id, pin, toward: Toward::Across };
     planned("pin", plan(&unit.circuit, &Gesture::NoConnect(target)), String::new)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fab_elec_design::action::check_returns;
+    use std::sync::Arc;
+
+    fn args(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// The `(part, lib)` of each entry a library page lists, in order.
+    fn listed(out: &str) -> Vec<(String, String)> {
+        out.split("{part: ").skip(1).map(|entry| {
+            let (part, rest) = entry.split_once(" lib: ").expect("an entry names its library");
+            let (lib, _) = rest.split_once(" kind: ").expect("an entry names its kind");
+            (part.to_string(), lib.to_string())
+        }).collect()
+    }
+
+    #[test]
+    fn library_list_and_bom_read_report_lifecycle_and_approved() {
+        check_returns(LIBRARY_LIST.returns).expect("elec.library.list's returns stay valid");
+        let bom_read_def = crate::bom_actions::ACTIONS.iter().find(|a| a.name == "elec.bom.read").expect("elec.bom.read is a BOM action");
+        check_returns(bom_read_def.returns).expect("elec.bom.read's returns stay valid");
+
+        let (design, docs) = Docs::from_evaluated(fab_elec_fixtures::docs("ledctl").unwrap(), fab_elec_fixtures::ledctl_eval());
+        let mut catalog = (**docs.catalog()).clone();
+        let parts: Vec<usize> = (0..catalog.entries.len()).filter(|&i| catalog.entries[i].part.is_some()).collect();
+        assert!(parts.len() >= 6, "the fixture's Library has parts to mark");
+        let plain = listed(&library_list(Some(&catalog), &[]).unwrap());
+        assert!(!plain.is_empty());
+        // Marked from the back, so that catalog order alone would not put them first.
+        let marks = [
+            (true, Some(Lifecycle::Active)),
+            (true, None),
+            (false, Some(Lifecycle::Active)),
+            (false, Some(Lifecycle::Nrnd)),
+            (false, Some(Lifecycle::Obsolete)),
+        ];
+        let mut marked = Vec::new();
+        for (&ix, (approved, lifecycle)) in parts.iter().rev().zip(marks) {
+            let entry = &mut catalog.entries[ix];
+            let part = Arc::make_mut(entry.part.as_mut().unwrap());
+            part.approved = approved;
+            part.lifecycle = lifecycle;
+            marked.push((quote(&entry.name), quote(&entry.lib)));
+        }
+        let total = catalog.entries.len();
+        let first = library_list(Some(&catalog), &[]).unwrap();
+        assert!(first.starts_with(&format!("{{total: {total} ")), "{first}");
+        let order = listed(&first);
+        assert_eq!(order[..3], marked[..3], "approved active, then approved, then active parts lead the list");
+        let from = (total - 2).to_string();
+        let last = listed(&library_list(Some(&catalog), &args(&[("from", &from)])).unwrap());
+        assert_eq!(last, marked[3..], "NRND and then obsolete parts end the list");
+        let entry_text = |out: &str, (part, lib): &(String, String)| {
+            let start = out.find(&format!("{{part: {part} lib: {lib} ")).expect("the entry is listed");
+            out[start..].split_once("} ").expect("the entry closes").0.to_string()
+        };
+        let top = entry_text(&first, &marked[0]);
+        assert!(top.contains(" footprint: ") && top.contains(" lifecycle: active") && top.ends_with(" approved: true"), "{top}");
+        let approved_only = entry_text(&first, &marked[1]);
+        assert!(!approved_only.contains("lifecycle:") && approved_only.ends_with(" approved: true"), "{approved_only}");
+        let tail = library_list(Some(&catalog), &args(&[("from", &from)])).unwrap();
+        let nrnd = entry_text(&tail, &marked[3]);
+        assert!(nrnd.ends_with(" lifecycle: nrnd") && !nrnd.contains("approved:"), "{nrnd}");
+        assert!(entry_text(&tail, &marked[4]).ends_with(" lifecycle: obsolete"));
+        assert!(!library_list(Some(&**docs.catalog()), &[]).unwrap().contains("approved:"), "an unmarked Library approves nothing");
+
+        // The BOM reads the parts' approval and the worst lifecycle on each line.
+        let plain_bom = crate::bom_actions::bom_read(&design, &[]).unwrap();
+        assert!(!plain_bom.contains(" approved: ") && !plain_bom.contains(" lifecycle: "), "{plain_bom}");
+        let mut marked_design = design.clone();
+        let sheet = fab_elec_bom::sheet(&design, design.units[0].id, &fab_elec_bom::SheetView::default()).unwrap();
+        let row = sheet.rows.iter().find(|r| !r.comps.is_empty()).expect("a line with parts");
+        let circuit = Arc::make_mut(&mut marked_design.units[0].circuit);
+        for id in &row.comps {
+            let part = Arc::make_mut(&mut circuit.comps[id.ix()].part);
+            part.approved = true;
+            part.lifecycle = Some(Lifecycle::Nrnd);
+        }
+        let line = crate::bom_actions::bom_read(&marked_design, &args(&[("only", &row.key)])).unwrap();
+        assert!(line.contains(" lifecycle: nrnd approved: true}") && line.contains("\"NRND\""), "{line}");
+    }
 }

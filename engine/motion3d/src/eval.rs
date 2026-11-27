@@ -1091,6 +1091,10 @@ impl<'a, 'b> Walk<'a, 'b> {
                 self.frame.hemisphere = Some((color, [g[0] * i, g[1] * i, g[2] * i]));
             }
             LightKind::Directional | LightKind::Point | LightKind::Spot => {
+                // A light that emits nothing cannot supply the key light or cast shadows.
+                if color == [0.0; 3] {
+                    return;
+                }
                 let direction = match &l.direction {
                     Some(d) => normalize_or_up(transform_dir(world, self.a3(d, t))),
                     None => {

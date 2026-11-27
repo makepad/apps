@@ -21,6 +21,7 @@
 //! face ([`drawn_family`]), said once a session ([`missing_notices`]).
 //! Nothing here downloads: this is the table and where the files are.
 
+use makepad_doc_font_names as names;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
@@ -134,8 +135,8 @@ macro_rules! plex_face {
 /// it did), then the downloadable ones.
 pub const FAMILIES: &[Family] = &[
     Family {
-        name: "Inter",
-        aliases: &["sans", "sans-serif", "default"],
+        name: names::INTER.name,
+        aliases: names::INTER.aliases,
         bundled: true,
         ascent: -0.1,
         symbols: false,
@@ -146,8 +147,8 @@ pub const FAMILIES: &[Family] = &[
         files: &[face!("makepad_widgets:resources/Inter.ttf", (100.0, 900.0), false)],
     },
     Family {
-        name: "Roboto Flex",
-        aliases: &["roboto"],
+        name: names::ROBOTO_FLEX.name,
+        aliases: names::ROBOTO_FLEX.aliases,
         bundled: true,
         ascent: -0.1,
         symbols: true,
@@ -158,8 +159,8 @@ pub const FAMILIES: &[Family] = &[
         files: &[face!("makepad_widgets:resources/RobotoFlex.ttf", (100.0, 1000.0), false)],
     },
     Family {
-        name: "IBM Plex Sans",
-        aliases: &["plex", "ibmplex"],
+        name: names::IBM_PLEX_SANS.name,
+        aliases: names::IBM_PLEX_SANS.aliases,
         bundled: true,
         ascent: -0.1,
         symbols: true,
@@ -175,8 +176,8 @@ pub const FAMILIES: &[Family] = &[
         ],
     },
     Family {
-        name: "Noto Sans",
-        aliases: &[],
+        name: names::NOTO_SANS.name,
+        aliases: names::NOTO_SANS.aliases,
         bundled: true,
         ascent: -0.1,
         symbols: true,
@@ -187,8 +188,8 @@ pub const FAMILIES: &[Family] = &[
         files: &[face!("makepad_widgets:resources/NotoSans-Regular.ttf", (400.0, 400.0), false)],
     },
     Family {
-        name: "JetBrains Mono",
-        aliases: &["mono", "monospace"],
+        name: names::JETBRAINS_MONO.name,
+        aliases: names::JETBRAINS_MONO.aliases,
         bundled: true,
         ascent: 0.0,
         symbols: true,
@@ -199,8 +200,8 @@ pub const FAMILIES: &[Family] = &[
         files: &[face!("makepad_widgets:resources/jetbrains_mono_variable.ttf", (100.0, 800.0), false)],
     },
     Family {
-        name: "Liberation Mono",
-        aliases: &[],
+        name: names::LIBERATION_MONO.name,
+        aliases: names::LIBERATION_MONO.aliases,
         bundled: true,
         ascent: 0.0,
         symbols: true,
@@ -211,8 +212,8 @@ pub const FAMILIES: &[Family] = &[
         files: &[face!("makepad_widgets:resources/LiberationMono-Regular.ttf", (400.0, 400.0), false)],
     },
     Family {
-        name: "New Computer Modern",
-        aliases: &["serif", "roman", "newcm", "computermodern"],
+        name: names::NEW_COMPUTER_MODERN.name,
+        aliases: names::NEW_COMPUTER_MODERN.aliases,
         bundled: true,
         ascent: 0.0,
         symbols: false,
@@ -223,8 +224,8 @@ pub const FAMILIES: &[Family] = &[
         files: &[face!("makepad_widgets:resources/NewCMMath-Regular.otf", (400.0, 400.0), false)],
     },
     Family {
-        name: "LXGW WenKai",
-        aliases: &["wenkai", "handwritten", "script"],
+        name: names::LXGW_WENKAI.name,
+        aliases: names::LXGW_WENKAI.aliases,
         bundled: true,
         ascent: 0.0,
         symbols: true,
@@ -238,8 +239,8 @@ pub const FAMILIES: &[Family] = &[
         ],
     },
     Family {
-        name: "Playfair Display",
-        aliases: &["display-serif", "playfair"],
+        name: names::PLAYFAIR_DISPLAY.name,
+        aliases: names::PLAYFAIR_DISPLAY.aliases,
         bundled: true,
         ascent: 0.0,
         symbols: true,
@@ -253,8 +254,8 @@ pub const FAMILIES: &[Family] = &[
         ],
     },
     Family {
-        name: "Cormorant Garamond",
-        aliases: &["editorial", "cormorant", "garamond"],
+        name: names::CORMORANT_GARAMOND.name,
+        aliases: names::CORMORANT_GARAMOND.aliases,
         bundled: true,
         ascent: 0.0,
         symbols: true,
@@ -265,8 +266,8 @@ pub const FAMILIES: &[Family] = &[
         files: &[face!("makepad_doc_fonts:resources/fonts/cormorant-garamond/CormorantGaramond-Variable.ttf", (300.0, 700.0), false)],
     },
     Family {
-        name: "Anton",
-        aliases: &["condensed", "display-condensed", "anton-regular"],
+        name: names::ANTON.name,
+        aliases: names::ANTON.aliases,
         bundled: true,
         ascent: 0.0,
         symbols: true,
@@ -277,8 +278,8 @@ pub const FAMILIES: &[Family] = &[
         files: &[face!("makepad_doc_fonts:resources/fonts/anton/Anton-Regular.ttf", (400.0, 400.0), false)],
     },
     Family {
-        name: "STIX Two Math",
-        aliases: &["math", "stix", "stix-two-math", "stixtwomath"],
+        name: names::STIX_TWO_MATH.name,
+        aliases: names::STIX_TWO_MATH.aliases,
         bundled: true,
         ascent: 0.0,
         symbols: true,
@@ -289,8 +290,8 @@ pub const FAMILIES: &[Family] = &[
         files: &[face!("makepad_doc_fonts:resources/fonts/stix-two-math/STIXTwoMath-Regular.otf", (400.0, 400.0), false)],
     },
     Family {
-        name: "Lexend Zetta",
-        aliases: &["wide", "expanded", "extended", "display-wide", "lexend", "zetta"],
+        name: names::LEXEND_ZETTA.name,
+        aliases: names::LEXEND_ZETTA.aliases,
         bundled: true,
         ascent: 0.0,
         symbols: true,
@@ -301,8 +302,8 @@ pub const FAMILIES: &[Family] = &[
         files: &[face!("makepad_doc_fonts:resources/fonts/lexend-zetta/LexendZetta-Variable.ttf", (100.0, 900.0), false)],
     },
     Family {
-        name: "Archivo",
-        aliases: &[],
+        name: names::ARCHIVO.name,
+        aliases: names::ARCHIVO.aliases,
         bundled: false,
         ascent: 0.0,
         symbols: true,
@@ -326,8 +327,8 @@ pub const FAMILIES: &[Family] = &[
         ],
     },
     Family {
-        name: "IBM Plex Mono",
-        aliases: &["plex mono"],
+        name: names::IBM_PLEX_MONO.name,
+        aliases: names::IBM_PLEX_MONO.aliases,
         bundled: false,
         ascent: 0.0,
         symbols: true,
@@ -359,8 +360,8 @@ pub const FAMILIES: &[Family] = &[
         ],
     },
     Family {
-        name: "Cormorant",
-        aliases: &[],
+        name: names::CORMORANT.name,
+        aliases: names::CORMORANT.aliases,
         bundled: false,
         ascent: 0.0,
         symbols: true,
@@ -384,8 +385,8 @@ pub const FAMILIES: &[Family] = &[
         ],
     },
     Family {
-        name: "Montserrat",
-        aliases: &[],
+        name: names::MONTSERRAT.name,
+        aliases: names::MONTSERRAT.aliases,
         bundled: false,
         ascent: 0.0,
         symbols: true,
@@ -409,8 +410,8 @@ pub const FAMILIES: &[Family] = &[
         ],
     },
     Family {
-        name: "Bebas Neue",
-        aliases: &["bebas"],
+        name: names::BEBAS_NEUE.name,
+        aliases: names::BEBAS_NEUE.aliases,
         bundled: false,
         ascent: 0.0,
         symbols: true,
@@ -430,8 +431,8 @@ pub const FAMILIES: &[Family] = &[
         ],
     },
     Family {
-        name: "Poppins",
-        aliases: &[],
+        name: names::POPPINS.name,
+        aliases: names::POPPINS.aliases,
         bundled: false,
         ascent: 0.0,
         symbols: true,
@@ -475,8 +476,8 @@ pub const FAMILIES: &[Family] = &[
         ],
     },
     Family {
-        name: "Oswald",
-        aliases: &[],
+        name: names::OSWALD.name,
+        aliases: names::OSWALD.aliases,
         bundled: false,
         ascent: 0.0,
         symbols: true,
@@ -496,8 +497,8 @@ pub const FAMILIES: &[Family] = &[
         ],
     },
     Family {
-        name: "League Spartan",
-        aliases: &["spartan"],
+        name: names::LEAGUE_SPARTAN.name,
+        aliases: names::LEAGUE_SPARTAN.aliases,
         bundled: false,
         ascent: 0.0,
         symbols: true,
@@ -517,8 +518,8 @@ pub const FAMILIES: &[Family] = &[
         ],
     },
     Family {
-        name: "Open Sans",
-        aliases: &["opensans"],
+        name: names::OPEN_SANS.name,
+        aliases: names::OPEN_SANS.aliases,
         bundled: false,
         ascent: 0.0,
         symbols: true,
@@ -543,21 +544,10 @@ pub const FAMILIES: &[Family] = &[
     },
 ];
 
-fn key(s: &str) -> String {
-    s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase()
-}
-
-/// The family a name means: its name spelled exactly, else its name or an
-/// alias without case, spaces or dashes (the bundled families first: a name
-/// a bundled family answers to keeps meaning it, so `cormorant` stays
-/// Cormorant Garamond while `"Cormorant"` spelled so is the downloadable
-/// family).
+/// The catalog entry for the document family or alias `name`.
 pub fn family(name: &str) -> Option<&'static Family> {
-    if let Some(exact) = FAMILIES.iter().find(|f| f.name == name.trim()) {
-        return Some(exact);
-    }
-    let wanted = key(name);
-    FAMILIES.iter().find(|f| key(f.name) == wanted || f.aliases.iter().any(|a| key(a) == wanted))
+    let canonical = names::family(name)?.name;
+    FAMILIES.iter().find(|family| family.name == canonical)
 }
 
 /// The bundled families' names.
@@ -847,6 +837,9 @@ mod tests {
 
     #[test]
     fn families_resolve_by_name_and_alias() {
+        assert!(FAMILIES.iter().map(|f| (f.name, f.aliases))
+            .eq(names::FAMILIES.iter().map(|f| (f.name, f.aliases))),
+            "each document family has its catalog entry in lookup order");
         assert_eq!(family("archivo").map(|f| f.name), Some("Archivo"));
         assert_eq!(family("IBM-Plex Mono").map(|f| f.name), Some("IBM Plex Mono"));
         assert_eq!(family("plex mono").map(|f| f.name), Some("IBM Plex Mono"));

@@ -33,12 +33,6 @@ script_mod! {
     }
     let Setting = View{width: Fill height: Fit flow: Down spacing: theme.prop_row_gap}
 
-    mod.widgets.FabSlicerToolsBase = #(FabSlicerTools::register_widget(vm))
-    mod.widgets.FabSlicerTools = set_type_default() do mod.widgets.FabSlicerToolsBase{
-        width: Fill height: theme.prop_row_height flow: Right spacing: 4
-        align: Align{y: 0.5}
-    }
-
     mod.widgets.FabSlicerRowsBase = #(FabSlicerRows::register_widget(vm))
     mod.widgets.FabSlicerRows = set_type_default() do mod.widgets.FabSlicerRowsBase{
         width: Fill height: Fit flow: Down spacing: 0
@@ -46,7 +40,8 @@ script_mod! {
         Head := PropSection{
             body: View{
                 width: Fill height: Fit flow: Down
-                padding: Inset{top: 2 bottom: 6}
+                // room above and below the rows, as every section has (`widgets::PropSection`)
+                padding: Inset{top: 6 bottom: 8}
                 content := View{width: Fill height: Fit flow: Down spacing: theme.prop_row_gap margin: Inset{left: theme.prop_pad right: theme.prop_pad}}
             }
         }
@@ -109,110 +104,66 @@ script_mod! {
     mod.widgets.FabSlicerPanelBase = #(FabSlicerPanel::register_widget(vm))
     mod.widgets.FabSlicerPanel = set_type_default() do mod.widgets.FabSlicerPanelBase{
         width: Fill height: Fill flow: Down
-        show_bg: true draw_bg +: { color: fab.color_editor }
+ show_bg: true draw_bg +: { color: fab.color_editor }
+        // the toolbar: the area's editor selector; Global first (the plate's own settings rather
+        // than the selected objects' overrides; shown while objects are selected); what the rows
+        // edit (an object's name, All objects, a box) with Advanced, Reset all and Copy to…; and
+        // the search, last as in every toolbar
+        bar := mod.widgets.FabEditorBar{
+            FabTip{text: "Edit the global settings (every object), not the selected objects' own"
+                global := PropCheckBox{
+                    width: Fit text: "Global"
+                    label_walk +: {width: Fit}
+                    a11y: {label: "Global settings"}
+                }
+            }
+            // Global apart from what follows (it changes what the rest edit)
+            global_rule := mod.widgets.FabVRule{}
+            title := mod.widgets.FabLabel{width: Fit text: "" max_lines: 1 draw_text +: {text_style: theme.font_bold{font_size: fab.font_size_ui}}}
+            FabTip{text: "Show advanced settings"
+                advanced := PropCheckBox{
+                    width: Fit text: "Advanced"
+                    label_walk +: {width: Fit}
+                    a11y: {label: "Advanced"}
+                }
+            }
+            FabTip{text: "Every setting here back to what it inherits"
+                // a text button: no face or frame of its own, its words light under the pointer
+                clear := mod.widgets.FabButton{
+                    text: "Reset all" a11y: {label: "Reset all"}
+                    height: theme.prop_row_height padding: Inset{left: 2 right: 2} spacing: 4
+                    icon_walk: Walk{width: 14 height: Fill margin: Inset{top: 3 bottom: 3}}
+                    draw_icon +: {svg: crate_resource("self://resources/icons/refresh.svg") color: fab.color_text}
+                    draw_bg +: {
+                        color: #x00000000 color_hover: #x00000000 color_down: #x00000000 color_focus: #x00000000
+                        border_color_focus: #x00000000
+                    }
+                }
+            }
+            FabTip{text: "Give other objects this object's settings"
+                copy := mod.widgets.FabDropdownButton{
+                    a11y: {label: "Copy settings to"} tag: @fab_slicer_copy owner: @fab_slicer_copy
+                    height: theme.prop_row_height padding: Inset{left: 2 right: 2} spacing: 4
+                    label := View{width: Fit height: Fill flow: Right align: Align{y: 0.5}
+                        word := mod.widgets.FabLabel{text: "Copy to…"}
+                    }
+                    chevron_slot +: {
+                        width: theme.prop_chevron padding: Inset{top: 6 bottom: 6}
+                        chevron +: {width: theme.prop_chevron height: theme.prop_chevron icon_walk: Walk{width: theme.prop_chevron height: theme.prop_chevron}}
+                    }
+                }
+            }
+            // the search last, as in every toolbar
+            search := mod.widgets.FabSearch{width: Fill{min: 80}}
+        }
         head := View{
             width: Fill height: Fit flow: Down spacing: 4
-            padding: Inset{left: theme.prop_pad right: theme.prop_pad top: 8 bottom: 8}
-            scope := PropSegmented{
-                options: ["Global" "Object"]
-                option_names: ["Global settings" "Object settings"]
-            }
-            title := mod.widgets.FabLabel{width: Fill text: "" draw_text +: {text_style: theme.font_bold{font_size: fab.font_size_ui}}}
+            padding: Inset{left: theme.prop_pad right: theme.prop_pad top: 2 bottom: 8}
             note := mod.widgets.FabLabelSmall{width: Fill text: ""}
-            tools := mod.widgets.FabSlicerTools{
-                search := mod.widgets.FabSearch{
-                    width: Fill{min: 80}
-                    row +: {padding: Inset{left: 6 right: 6} input +: {min_height: 0}}
-                }
-                FabTip{text: "Show advanced settings"
-                    advanced := PropCheckBox{
-                        width: Fit text: "Advanced"
-                        label_walk +: {width: Fit}
-                        a11y: {label: "Advanced"}
-                    }
-                }
-                FabTip{text: "Give other objects this object's settings"
-                    copy := mod.widgets.FabDropdownButton{
-                        a11y: {label: "Copy settings to"} tag: @fab_slicer_copy owner: @fab_slicer_copy
-                        height: theme.prop_row_height padding: Inset{left: 6 right: 6} spacing: 4
-                        label := View{width: Fit height: Fill flow: Right align: Align{y: 0.5}
-                            word := mod.widgets.FabLabel{text: "Copy to…"}
-                            glyph := View{visible: false width: 14 height: Fill padding: Inset{top: 3 bottom: 3}
-                                mod.widgets.FabIcon{
-                                    width: 14 height: 14 icon_walk: Walk{width: 14 height: 14}
-                                    draw_icon +: {svg: crate_resource("self://resources/icons/duplicate.svg")}
-                                }
-                            }
-                        }
-                        chevron_slot +: {
-                            width: theme.prop_chevron padding: Inset{top: 6 bottom: 6}
-                            chevron +: {width: theme.prop_chevron height: theme.prop_chevron icon_walk: Walk{width: theme.prop_chevron height: theme.prop_chevron}}
-                        }
-                    }
-                }
-                FabTip{text: "Every setting here back to what it inherits"
-                    clear := mod.widgets.FabButton{
-                        text: "Reset all" a11y: {label: "Reset all"}
-                        height: theme.prop_row_height padding: Inset{left: 6 right: 6} spacing: 4
-                        icon_walk: Walk{width: 14 height: Fill margin: Inset{top: 3 bottom: 3}}
-                        draw_icon +: {svg: crate_resource("self://resources/icons/refresh.svg") color: fab.color_text}
-                    }
-                }
-            }
         }
         body := mod.widgets.FabScroll{
             rows := mod.widgets.FabSlicerRows{}
         }
-    }
-}
-
-#[derive(Script, Widget)]
-pub struct FabSlicerTools {
-    #[deref]
-    view: View,
-    #[rust]
-    compact: Option<bool>,
-}
-
-impl ScriptHook for FabSlicerTools {
-    fn on_after_apply(&mut self, _vm: &mut ScriptVm, apply: &Apply, _scope: &mut Scope, _value: ScriptValue) {
-        if !apply.is_eval() { self.compact = None; }
-    }
-}
-
-impl Widget for FabSlicerTools {
-    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        self.view.handle_event(cx, event, scope);
-    }
-
-    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        let width = cx.peek_walk_turtle(walk).size.x;
-        let copy = self.view.widget(cx, ids!(copy));
-        let clear = self.view.widget(cx, ids!(clear));
-        let full = width_override::WidthOverride { visible: Some(true), ..Default::default() };
-        // Price the full faces even while compact, so widening restores their words.
-        let needed = (|| {
-            let mut needed = 80.0 + 4.0 + self.view.widget(cx, ids!(advanced)).measure_width(cx, None)?;
-            if copy.visible() {
-                let label = copy.widget(cx, ids!(label.word)).measure_width(cx, Some(&full))?;
-                let chevron = copy.widget(cx, ids!(chevron_slot)).measure_width(cx, None)?;
-                needed += 4.0 + label + 12.0 + 4.0 + chevron;
-            }
-            if clear.visible() {
-                let full = width_override::WidthOverride { text: Some("Reset all".into()), ..full };
-                needed += 4.0 + clear.measure_width(cx, Some(&full))?;
-            }
-            Some(needed)
-        })();
-        let compact = needed.is_none_or(|needed| needed > width);
-        if self.compact != Some(compact) {
-            copy.widget(cx, ids!(label.word)).set_visible(cx, !compact);
-            copy.widget(cx, ids!(label.glyph)).set_visible(cx, compact);
-            clear.set_text(cx, if compact { "" } else { "Reset all" });
-            self.compact = Some(compact);
-        }
-        // View defers the search Fill until the following Fit faces are measured.
-        self.view.draw_walk(cx, scope, walk)
     }
 }
 
@@ -239,6 +190,17 @@ fn setting_ids() -> &'static [SettingIds] {
         mode: (!s.mode.is_empty() && (i == 0 || PRINT_SETTINGS[i - 1].mode != s.mode)).then(|| LiveId::from_str(&format!("setting-mode:{}", s.mode))),
         name: control_name(s),
     }).collect())
+}
+
+/// The Slicer's key in the sections' order (`widgets::section_reorder`).
+const SLICER_ORDER: LiveId = live_id!(slicer_sections);
+
+/// The setting groups in the order the person dragged them into (the table's order before any
+/// drag, and for any group never moved).
+fn ordered_groups(cx: &mut Cx) -> Vec<SettingGroup> {
+    let mut groups: Vec<SettingGroup> = SettingGroup::ALL.into_iter().collect();
+    groups.sort_by_key(|g| crate::ui::widgets::section_rank(cx, SLICER_ORDER, head_id(*g)));
+    groups
 }
 
 fn head_id(group: SettingGroup) -> LiveId {
@@ -422,25 +384,30 @@ impl FabSlicerPanel {
                     [one] => state.plate.parts.get(*one).map(|p| p.name.clone()).unwrap_or_default(),
                     many => format!("{} objects", many.len()),
                 };
-                (title, if total == 0 { "Follows the global settings.".to_string() } else { format!("{} of the global settings: each is under Overrides.", plural(total, "override")) })
+                (title, if total == 0 { "No overrides: the global settings apply.".to_string() } else { format!("{} of the global settings: each is under Overrides.", plural(total, "override")) })
             }
         };
         let v = &self.view;
-        v.label(cx, ids!(head.title)).set_text(cx, &title);
+        v.label(cx, ids!(bar.title)).set_text(cx, &title);
         v.label(cx, ids!(head.note)).set_text(cx, &note);
         let is_box = boxed.is_some();
-        v.widget(cx, ids!(head.scope)).set_visible(cx, !selected.is_empty() && !is_box);
+        let scoped = !selected.is_empty() && !is_box;
+        v.widget(cx, ids!(bar.global)).set_visible(cx, scoped);
+        v.widget(cx, ids!(bar.global_rule)).set_visible(cx, scoped);
         let global = matches!(edit, Editing::Global);
-        v.segmented_control(cx, ids!(head.scope)).set_selected(cx, if global { 0 } else { 1 });
+        let toggle = v.check_box(cx, ids!(bar.global));
+        if toggle.active(cx) != global {
+            toggle.set_active(cx, global, Animate::No);
+        }
         let any = match &edit {
             Editing::Global => !state.plate.settings.is_empty(),
             Editing::Parts(parts) => parts.iter().filter_map(|i| state.plate.parts.get(*i)).any(|p| fab_plate::own_settings(&p.print).next().is_some()),
             Editing::Box { .. } => false,
         };
-        v.widget(cx, ids!(head.tools.clear)).set_visible(cx, any && !is_box);
+        v.widget(cx, ids!(bar.clear)).set_visible(cx, any && !is_box);
         // Copying takes one object with something to copy, and another object to take it.
         let can_copy = matches!(&edit, Editing::Parts(p) if p.len() == 1) && state.plate.parts.len() > 1;
-        v.widget(cx, ids!(head.tools.copy)).set_visible(cx, can_copy && !is_box);
+        v.widget(cx, ids!(bar.copy)).set_visible(cx, can_copy && !is_box);
         if let Some(mut rows) = v.widget(cx, ids!(body.rows)).borrow_mut::<FabSlicerRows>() {
             rows.filter = Filter { edit, query: self.query.clone(), advanced: self.advanced };
         }
@@ -454,6 +421,18 @@ impl Widget for FabSlicerPanel {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        // a group held by its grip moves with the pointer, the others sliding aside
+        // (`section_reorder`): here, outside the scroll box, so the press is the grip's first
+        if matches!(event, Event::MouseDown(_) | Event::MouseMove(_) | Event::MouseUp(_) | Event::NextFrame(_)) {
+            let groups = ordered_groups(cx);
+            let order: Vec<(LiveId, WidgetRef, WidgetRef)> = match self.view.widget(cx, ids!(body.rows)).borrow::<FabSlicerRows>() {
+                Some(rows) => groups.into_iter()
+                    .filter_map(|g| rows.items.get(&head_id(g)).map(|(w, _)| (head_id(g), w.clone(), w.clone())))
+                    .collect(),
+                None => Vec::new(),
+            };
+            crate::ui::widgets::section_reorder(cx, event, SLICER_ORDER, &order, self.view.area());
+        }
         self.view.handle_event(cx, event, scope);
         let Event::Actions(actions) = event else { return };
         // an override's row picked (in the Overrides editor): its setting's field scrolled into
@@ -472,20 +451,20 @@ impl Widget for FabSlicerPanel {
         }
         let Some(state) = scope.data.get::<AppState>() else { return };
         let v = &self.view;
-        if let Some(i) = v.segmented_control(cx, ids!(head.scope)).selected(actions) {
-            self.show_global = i == 0;
+        if let Some(on) = v.check_box(cx, ids!(bar.global)).changed(actions) {
+            self.show_global = on;
             self.view.redraw(cx);
         }
-        if let Some(text) = self.view.text_input(cx, ids!(head.tools.search.row.input)).changed(actions) {
+        if let Some(text) = self.view.text_input(cx, ids!(bar.search.row.input)).changed(actions) {
             self.query = text.trim().to_lowercase();
             self.view.redraw(cx);
         }
-        if let Some(on) = self.view.check_box(cx, ids!(head.tools.advanced)).changed(actions) {
+        if let Some(on) = self.view.check_box(cx, ids!(bar.advanced)).changed(actions) {
             self.advanced = on;
             self.view.redraw(cx);
         }
         let edit = editing(state, self.show_global);
-        if self.view.button(cx, ids!(head.tools.clear)).clicked(actions) {
+        if self.view.button(cx, ids!(bar.clear)).clicked(actions) {
             match &edit {
                 Editing::Global => cx.action(PartAction::ClearPlateSettings),
                 Editing::Parts(parts) => cx.action(PartAction::ClearPrintSettings { objects: parts.iter().filter_map(|i| state.plate.parts.get(*i)).map(|p| p.object.clone()).collect() }),
@@ -1026,6 +1005,7 @@ impl Widget for FabSlicerRows {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        crate::ui::widgets::section_headers(cx, event, self.items.iter().filter(|(_, (_, t))| *t == live_id!(Head)).map(|(_, (w, _))| w));
         let claimed_before = event.pointer_claimed_area();
         for group in SettingGroup::ALL {
             if let Some((w, _)) = self.items.get(&head_id(group)) {
@@ -1094,10 +1074,23 @@ impl Widget for FabSlicerRows {
         let Some(state) = scope.data.get::<AppState>() else { return DrawStep::done() };
         self.sync(cx, state);
         cx.begin_turtle(walk, self.layout);
-        for group in SettingGroup::ALL {
-            if let Some((w, _)) = self.items.get(&head_id(group)) {
-                if w.visible() { w.draw_all(cx, &mut Scope::empty()); }
-            }
+        // the groups in the order they were dragged into, one held by its grip last (over the
+        // others), each at its offset while one moves (`section_reorder`)
+        let held = crate::ui::widgets::held_section(cx, SLICER_ORDER);
+        let mut groups = ordered_groups(cx);
+        if let Some(i) = groups.iter().position(|g| Some(head_id(*g)) == held) {
+            let g = groups.remove(i);
+            groups.push(g);
+        }
+        for group in groups {
+            let id = head_id(group);
+            let Some((w, _)) = self.items.get(&id).cloned() else { continue };
+            if !w.visible() { continue; }
+            let offset = crate::ui::widgets::section_offset(cx, SLICER_ORDER, id);
+            let mut walk = w.walk(cx);
+            walk.margin.top += offset;
+            walk.margin.bottom -= offset;
+            w.draw_walk_all(cx, &mut Scope::empty(), walk);
         }
         cx.end_turtle_with_area(&mut self.area);
         DrawStep::done()

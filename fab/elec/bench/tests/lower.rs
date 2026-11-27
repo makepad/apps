@@ -334,7 +334,7 @@ fn firmware_chip_uses_component_then_part_model_and_diagnoses_absence() {
         id: CompId(id), path: path.into(), refdes: path.into(), ref_kind: Default::default(),
         part: Arc::new(PartDef {
             name: path.into(), kind, symbol: Default::default(), footprint: None,
-            body: None, emitter: None, gpio: None, fields: Fields::default(),
+            body: None, emitter: None, gpio: None, lifecycle: None, approved: false, fields: Fields::default(),
             pins: pins.iter().map(|&(name, _)| PinDef {
                 name: name.into(), pads: Vec::new(), unit: 0, limits: None, alternates: Vec::new(), delay: None,
                 kind: if ["VCC", "GND"].contains(&name) { PinKind::PowerIn } else { PinKind::Bidi },

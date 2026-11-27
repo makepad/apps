@@ -178,14 +178,14 @@ pub fn samples() -> Vec<PathBuf> {
 pub const FILE_REV: &str = "file";
 
 /// A library score by its file name (with or without `.score`) or title.
-pub fn find(name: &str, control: &PrepareControl) -> Result<Option<PathBuf>, LoadError> {
+pub async fn find(name: &str, control: &PrepareControl) -> Result<Option<PathBuf>, LoadError> {
     let want = name.trim().trim_end_matches(".score");
-    Ok(saved_scores(control)?.into_iter().find(|(title, path)| path.file_stem().is_some_and(|s| s == want) || title.eq_ignore_ascii_case(want)).map(|(_, p)| p))
+    Ok(saved_scores(control).await?.into_iter().find(|(title, path)| path.file_stem().is_some_and(|s| s == want) || title.eq_ignore_ascii_case(want)).map(|(_, p)| p))
 }
 
 /// A score's title: its `label`, else its file's name.
-pub fn title_of(source: &str, path: &Path, control: &PrepareControl) -> Result<String, LoadError> {
-    match makepad_score_live::model::evaluated_label_controlled(source, control) {
+pub async fn title_of(source: &str, path: &Path, control: &PrepareControl) -> Result<String, LoadError> {
+    match makepad_score_live::model::evaluated_label(source, control).await {
         Ok(Some(label)) => Ok(label),
         Ok(None) | Err(LoadError::Problems(_)) => Ok(file_title(path)),
         Err(cancelled) => Err(cancelled),
@@ -205,16 +205,29 @@ pub fn score_files() -> Vec<PathBuf> {
     files.into_iter().map(|(_, path)| path).collect()
 }
 
-pub fn saved_scores(control: &PrepareControl) -> Result<Vec<(String, PathBuf)>, LoadError> {
-    titles(score_files(), control)
+pub async fn saved_scores(control: &PrepareControl) -> Result<Vec<(String, PathBuf)>, LoadError> {
+    titles(score_files(), control).await
 }
 
-pub fn titles(paths: Vec<PathBuf>, control: &PrepareControl) -> Result<Vec<(String, PathBuf)>, LoadError> {
+/// Instructions per saved document read for a library title or instrument list.
+const TITLE_INSTRUCTION_BUDGET: u64 = 4_000_000;
+
+pub async fn titles(paths: Vec<PathBuf>, control: &PrepareControl) -> Result<Vec<(String, PathBuf)>, LoadError> {
     if control.is_cancelled() { return Err(LoadError::Cancelled); }
-    paths.into_iter().map(|p| {
-        let text = std::fs::read_to_string(&p).unwrap_or_default();
-        Ok((title_of(&text, &p, control)?, p))
-    }).collect()
+    let control = control.with_instruction_budget(TITLE_INSTRUCTION_BUDGET);
+    let mut rows = Vec::with_capacity(paths.len());
+    for path in paths {
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let title = match title_of(&text, &path, &control).await {
+            Err(error @ (LoadError::Unfinished { .. } | LoadError::Memory { .. })) => {
+                makepad_widgets::log!("{}: {error}", path.display());
+                file_title(&path)
+            }
+            result => result?,
+        };
+        rows.push((title, path));
+    }
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -226,10 +239,22 @@ mod tests {
         let word = PrepareControl::default();
         let blank = makepad_score_live::templates::template("techno").unwrap();
         let label = makepad_score_live::ScoreDoc::load_controlled(blank, &word).unwrap().label.clone();
-        assert_eq!(title_of(blank, Path::new("x.score"), &word).unwrap(), if label.is_empty() { "x".to_string() } else { label });
-        assert_eq!(title_of("not a score", Path::new("/a/night_drive.score"), &word).unwrap(), "night drive");
+        assert_eq!(makepad_score_live::drive(title_of(blank, Path::new("x.score"), &word)).unwrap(), if label.is_empty() { "x".to_string() } else { label });
+        assert_eq!(makepad_score_live::drive(title_of("not a score", Path::new("/a/night_drive.score"), &word)).unwrap(), "night drive");
+        let dir = std::env::temp_dir().join(new_id());
+        std::fs::create_dir(&dir).unwrap();
+        let slow = dir.join("long_piece.score");
+        let finite = dir.join("short.score");
+        let iterations = 128;
+        std::fs::write(&slow, format!("use mod.score.*\nlet n = 0\nfor i in 0..{iterations} {{ n += i }}\nScore{{label: \"Hidden\"}}")).unwrap();
+        std::fs::write(&finite, "use mod.score.*\nScore{label: \"Found\"}").unwrap();
+        let scan = word.with_instruction_budget(iterations);
+        let files = vec![slow.clone(), finite.clone()];
+        let rows = makepad_score_live::drive(titles(files, &scan)).unwrap();
+        assert_eq!(rows, [(file_title(&slow), slow), ("Found".into(), finite)], "a budget hit leaves the file visible and the next score supplies its own label");
+        std::fs::remove_dir_all(dir).unwrap();
         word.cancel();
-        assert_eq!(title_of(blank, Path::new("x.score"), &word), Err(LoadError::Cancelled), "a cancelled read cannot supply a file-name fallback");
+        assert_eq!(makepad_score_live::drive(title_of(blank, Path::new("x.score"), &word)), Err(LoadError::Cancelled), "a cancelled read cannot supply a file-name fallback");
     }
 
     #[test]

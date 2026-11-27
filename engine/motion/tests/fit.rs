@@ -1,6 +1,7 @@
 //! `fit:` and `wrap: @safe` (text kept inside the frame's side margins) and
 //! the bundled serif and handwritten faces.
 
+use makepad_motion::plain::PrimitiveFrame;
 use makepad_motion::*;
 
 fn load(source: &str) -> MotionDoc {
@@ -15,7 +16,7 @@ fn fit_and_wrap_take_a_width_or_the_safe_width() {
     ]}"#);
     let frame = doc.eval(0.5);
     let fits: Vec<(Option<f64>, Option<f64>)> = frame.items.iter().map(|item| match &item.kind {
-        ItemKind::Text { fit, wrap, .. } => (*fit, *wrap),
+        ItemKind::Primitive(PrimitiveFrame::Text { fit, wrap, .. }) => (*fit, *wrap),
         _ => panic!(),
     }).collect();
     assert_eq!(fits, vec![(Some(1080.0 * SAFE_WIDTH), Some(900.0)), (Some(700.0), Some(1080.0 * SAFE_WIDTH))]);
@@ -41,7 +42,7 @@ fn serif_display_and_handwritten_faces_are_reachable_by_name() {
     ]}"#);
     let frame = doc.eval(0.5);
     let fonts: Vec<String> = frame.items.iter().map(|item| match &item.kind {
-        ItemKind::Text { font, .. } => font.to_string(),
+        ItemKind::Primitive(PrimitiveFrame::Text { font, .. }) => font.to_string(),
         _ => panic!(),
     }).collect();
     assert_eq!(fonts, vec!["New Computer Modern", "LXGW WenKai", "Playfair Display", "Cormorant Garamond", "Anton"]);

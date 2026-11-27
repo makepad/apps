@@ -14,7 +14,7 @@ use std::{
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
     num::NonZeroU64,
     path::{Component, Path, PathBuf},
-    sync::{atomic::{AtomicU64, Ordering}, mpsc, Arc, Mutex},
+    sync::{atomic::{AtomicU64, Ordering}, mpsc, Arc, Condvar, Mutex, Weak},
     time::Duration,
 };
 
@@ -82,7 +82,7 @@ pub enum Answer {
 
 pub struct Reply { pub target: Target, pub answer: Answer }
 
-pub(super) fn literal(folder: &str) -> bool {
+pub(crate) fn literal(folder: &str) -> bool {
     folder != fab_ai::plates::REMOVED_SESSIONS && !folder.contains(['/', '\\', ':', '\0']) &&
         matches!(Path::new(folder).components().next(), Some(Component::Normal(_)))
 }
@@ -95,12 +95,99 @@ fn missing<T>(result: io::Result<T>) -> io::Result<Option<T>> {
     }
 }
 
+// Count reads per journal, including the lifetime of their open handles. A
+// move waits only for reads of this folder; new readers see it as missing.
+#[derive(Default)]
+struct Readers {
+    active: usize,
+    moving: bool,
+    handed_off: Vec<Weak<Mutex<Option<File>>>>,
+}
+
+static READERS: Mutex<BTreeMap<PathBuf, Readers>> = Mutex::new(BTreeMap::new());
+static READ_ENDED: Condvar = Condvar::new();
+
+pub(super) struct ReadPermit(PathBuf);
+
+impl ReadPermit {
+    pub(super) fn take(dir: &Path) -> io::Result<Self> {
+        let mut folders = READERS.lock().unwrap();
+        let readers = folders.entry(dir.to_owned()).or_default();
+        if readers.moving { return Err(io::ErrorKind::NotFound.into()) }
+        readers.active += 1;
+        Ok(Self(dir.to_owned()))
+    }
+}
+
+fn forget_idle(dir: &Path, folders: &mut BTreeMap<PathBuf, Readers>) {
+    if let Some(readers) = folders.get_mut(dir) {
+        readers.handed_off.retain(|file| file.strong_count() != 0);
+        if !readers.moving && readers.active == 0 && readers.handed_off.is_empty() { folders.remove(dir); }
+    }
+}
+
+impl Drop for ReadPermit {
+    fn drop(&mut self) {
+        let mut folders = READERS.lock().unwrap();
+        if let Some(readers) = folders.get_mut(&self.0) {
+            readers.active -= 1;
+            if readers.active == 0 { READ_ENDED.notify_all(); }
+        }
+        forget_idle(&self.0, &mut folders);
+    }
+}
+
+pub struct MovingPlate(PathBuf);
+
+impl MovingPlate {
+    /// The model worker holds this guard until the plate-folder rename returns.
+    pub fn begin(plate: &Path) -> io::Result<Self> {
+        let dir = plate.join("journal");
+        let mut folders = READERS.lock().unwrap();
+        let readers = folders.entry(dir.clone()).or_default();
+        if readers.moving { return Err(io::ErrorKind::WouldBlock.into()) }
+        readers.moving = true;
+        #[cfg(test)]
+        let _ = super::tests::probe("waiting for journal reads");
+        let mut folders = READ_ENDED.wait_while(folders, |all| all.get(&dir).is_some_and(|r| r.active != 0)).unwrap();
+        // A validated replay can still be queued on the pool. Close its idle
+        // clone here; a later job cannot reopen the replacement by path.
+        if let Some(readers) = folders.get_mut(&dir) {
+            for file in readers.handed_off.drain(..).filter_map(|f| f.upgrade()) {
+                file.lock().unwrap().take();
+            }
+        }
+        Ok(Self(dir))
+    }
+}
+
+impl Drop for MovingPlate {
+    fn drop(&mut self) {
+        let mut folders = READERS.lock().unwrap();
+        folders.remove(&self.0);
+    }
+}
+
+// The handle must drop before its permit wakes a waiting move.
+struct ReadingLog { file: File, permit: ReadPermit }
+impl std::ops::Deref for ReadingLog {
+    type Target = File;
+    fn deref(&self) -> &File { &self.file }
+}
+impl Read for ReadingLog {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> { self.file.read(bytes) }
+}
+impl Seek for ReadingLog {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> { self.file.seek(pos) }
+}
+
 /// The root comes from the plate store. Only literal directory entries and regular
 /// files under that root can supply a journal (including for foreign call lookups).
-fn log_file(root: &Path, folder: &str) -> io::Result<Option<(File, FileId)>> {
+fn log_file(root: &Path, folder: &str) -> io::Result<Option<(ReadingLog, FileId)>> {
     if !literal(folder) { return Ok(None) }
     let plate = root.join(folder);
     let journal = plate.join("journal");
+    let Some(permit) = missing(ReadPermit::take(&journal))? else { return Ok(None) };
     for path in [&plate, &journal] {
         if !missing(fs::symlink_metadata(path))?.is_some_and(|m| m.is_dir()) { return Ok(None) }
     }
@@ -110,7 +197,7 @@ fn log_file(root: &Path, folder: &str) -> io::Result<Option<(File, FileId)>> {
     let id = FileId::from_metadata(&metadata);
     #[cfg(not(unix))]
     let id = { let _ = metadata; FileId::of(&file)? };
-    Ok(Some((file, id)))
+    Ok(Some((ReadingLog { file, permit }, id)))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -156,11 +243,33 @@ impl Binding {
 /// The replay pool receives the handle verified by the reader. It never resolves
 /// the record key against another log at the same path.
 pub(crate) struct VerifiedLog {
-    pub(super) file: File,
+    file: Arc<Mutex<Option<File>>>,
+    dir: PathBuf,
     binding: Binding,
 }
 
+impl Drop for VerifiedLog {
+    fn drop(&mut self) {
+        // Keep this clone discoverable until its handle has actually closed.
+        // Removing the weak entry first would leave a Windows rename racing
+        // the subsequent implicit field drop.
+        {
+            let mut held = self.file.lock().unwrap();
+            drop(held.take());
+        }
+        let mut folders = READERS.lock().unwrap();
+        if let Some(readers) = folders.get_mut(&self.dir) {
+            readers.handed_off.retain(|f| f.as_ptr() != Arc::as_ptr(&self.file));
+        }
+        forget_idle(&self.dir, &mut folders);
+    }
+}
+
 impl VerifiedLog {
+    pub(super) fn file(&self) -> io::Result<File> {
+        self.file.lock().unwrap().as_ref().ok_or(io::ErrorKind::NotFound)?.try_clone()
+    }
+
     pub(super) fn require_current(&self, dir: &Path) -> io::Result<()> {
         if read_incarnation(dir)? != self.binding.incarnation || self.binding.file.matches_path(&dir.join(LOG))? == Some(false) {
             return Err(io::ErrorKind::NotFound.into())
@@ -313,7 +422,7 @@ impl Index {
 
     fn token(&self) -> Option<u64> { self.binding.map(|b| b.token) }
 
-    fn open_log(&self, root: &Path, folder: &str) -> io::Result<File> {
+    fn open_log(&self, root: &Path, folder: &str) -> io::Result<ReadingLog> {
         let binding = self.binding.ok_or(io::ErrorKind::NotFound)?;
         let (file, id) = log_file(root, folder)?.ok_or(io::ErrorKind::NotFound)?;
         if id != binding.file { return Err(io::ErrorKind::NotFound.into()) }
@@ -412,7 +521,7 @@ impl Index {
         filter.kind.is_none_or(|k| k == entry.kind) && filter.actor.is_none_or(|a| Some(a) == self.actor(entry))
     }
 
-    fn record(&self, input: &mut BufReader<File>, pos: Position) -> io::Result<Value> {
+    fn record(&self, input: &mut BufReader<ReadingLog>, pos: Position) -> io::Result<Value> {
         if let Position::Diagnostic(offset) = pos {
             return Ok(obj(vec![("kind", s("diagnostic")), ("offset", super::number(offset)), ("reason", s("Damaged journal record"))]))
         }
@@ -503,6 +612,7 @@ impl Store {
                 None => Partner::NotFound,
             }
         } else if let Some((folder, reference)) = index.foreign.get(&key.position).cloned() {
+            drop(input);
             partner = Partner::NotFound;
             // Match the literal directory entry as well as checking its type. This matters on a
             // case-insensitive filesystem: a differently spelled ref must never bind to a plate.
@@ -556,7 +666,13 @@ impl Browse<'_> {
         let index = self.store.folders.get(&key.folder).ok_or_else(missing)?;
         if !index.entries.contains_key(&key.position) { return Err(missing()) }
         let file = index.open_log(self.root, &key.folder)?;
-        let log = VerifiedLog { file: file.try_clone()?, binding: index.binding.ok_or_else(missing)? };
+        let held = Arc::new(Mutex::new(Some(file.try_clone()?)));
+        let dir = file.permit.0.clone();
+        let mut folders = READERS.lock().unwrap();
+        let readers = folders.get_mut(&dir).ok_or_else(missing)?;
+        readers.handed_off.push(Arc::downgrade(&held));
+        drop(folders);
+        let log = VerifiedLog { file: held, dir, binding: index.binding.ok_or_else(missing)? };
         Ok((index.record(&mut BufReader::new(file), key.position)?, log))
     }
 

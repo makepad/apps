@@ -43,16 +43,50 @@ script_mod! {
             ink_centered: true
             text_style: theme.font_bold{ font_size: fab.font_size_small }
         }
-        Editor := View{
-            width: Fill height: Fit flow: Down spacing: 6
-            padding: Inset{left: 0 right: 0 top: 2 bottom: 8}
-            title := mod.widgets.FabLabelSmall{ width: Fill text: "" }
-            picker := mod.widgets.ColorPicker{ width: Fill popover: false with_alpha: false }
-            buttons := View{
-                width: Fill height: Fit flow: Right spacing: 6
-                material := mod.widgets.FabButton{ text: "Use the design colour" }
-                Filler{}
-                done := mod.widgets.FabButton{ text: "Done" }
+        // The design colour's editor: a popover under the swatch, in the window's overlay. It
+        // draws through a texture so the whole card fades as one (`fade`, the `open` states).
+        Editor := CachedView{
+            width: 260 height: Fit
+            draw_bg +: {
+                fade: instance(0.0)
+                pixel: fn() {
+                    return self.image.sample(self.pos * self.scale + self.shift) * self.fade
+                }
+            }
+            animator: Animator{
+                open: {
+                    default: @off
+                    off: AnimatorState{
+                        from: {all: Forward {duration: 0.12}}
+                        apply: {draw_bg: {fade: 0.0}}
+                    }
+                    on: AnimatorState{
+                        from: {all: Forward {duration: 0.16}}
+                        apply: {draw_bg: {fade: 1.0}}
+                    }
+                }
+            }
+            card := View{
+                width: Fill height: Fit flow: Down spacing: 6
+                padding: Inset{left: 8 right: 8 top: 8 bottom: 8}
+                show_bg: true
+                draw_bg +: {
+                    pixel: fn() {
+                        let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                        sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, fab.radius_lg)
+                        sdf.fill_keep(fab.color_popover)
+                        sdf.stroke(fab.color_popover_border, 1.0)
+                        return sdf.result
+                    }
+                }
+                title := mod.widgets.FabLabelSmall{ width: Fill text: "" }
+                picker := mod.widgets.ColorPicker{ width: Fill popover: false with_alpha: false }
+                buttons := View{
+                    width: Fill height: Fit flow: Right spacing: 6
+                    material := mod.widgets.FabButton{ text: "Use the design colour" }
+                    Filler{}
+                    done := mod.widgets.FabButton{ text: "Done" }
+                }
             }
         }
     }
@@ -146,13 +180,29 @@ pub struct FabColorLink {
     /// The colour whose design colour the editor changes.
     #[rust]
     editing: Option<String>,
-    /// The colour whose tray menu is up.
+    /// The editor is fading out: still drawn, no longer handed events, until `close_timer`.
     #[rust]
-    menu_for: Option<String>,
+    closing: bool,
+    #[rust]
+    close_timer: Timer,
+    /// The overlay the editor draws in, over every panel, and its card's rect there.
+    #[rust]
+    overlay: Option<DrawList2d>,
+    #[rust]
+    panel_rect: Rect,
+    /// The pointer lock the open editor holds, on the row's area (renewed as the row redraws), so
+    /// the widgets under the popover take no hovers or presses through it.
+    #[rust]
+    lock_area: Area,
+    /// The target and colour whose tray menu is up.
+    #[rust]
+    menu_for: Option<(EditOwner, String)>,
     /// The tray whose contents menu is up (a right-click on the slot while the printer does
     /// not report).
     #[rust]
-    tray_editing: Option<super::colours::Position>,
+    tray_editing: Option<(EditOwner, super::colours::Position)>,
+    #[rust]
+    owner: EditOwner,
     /// Each drawn spot: its rect, row (colour name) and kind.
     #[rust]
     spots: Vec<(Rect, String, Spot)>,
@@ -180,7 +230,20 @@ impl ScriptHook for FabColorLink {
             }
         }
         if apply.is_reload() {
+            // A reloaded template builds a new editor: the open one goes, closed. Its pointer
+            // lock names an area the row draws again, which the window then lets go of.
             self.editor = None;
+            self.editing = None;
+            self.closing = false;
+        }
+    }
+}
+
+impl Drop for FabColorLink {
+    /// A row dropped with its editor up hands its pointer lock to the window to release.
+    fn drop(&mut self) {
+        if !self.lock_area.is_empty() {
+            makepad_widgets_core::family_api::orphan_sweep_locks(&[self.lock_area]);
         }
     }
 }
@@ -321,6 +384,11 @@ fn tip(state: &AppState, row: &Row, spot: Spot) -> String {
     }
 }
 
+/// Capture the plate destination when its colour map is drawn. Open tray menus retain a copy.
+pub fn capture_tray_owner(owner: &mut EditOwner, state: &PrintState) {
+    owner.capture(PrinterScope::Target, state);
+}
+
 impl FabColorLink {
     fn menu_id(&self) -> LiveId {
         LiveId::from_str(&format!("fab_color_tray:{:?}", self.uid))
@@ -341,25 +409,98 @@ impl FabColorLink {
         self.editor.clone()
     }
 
+    /// Open the design colour's editor for `row`: it fades in under the swatch.
+    fn open_editor(&mut self, cx: &mut Cx, row: &Row) {
+        self.editing = Some(row.name.clone());
+        self.closing = false;
+        cx.stop_timer(self.close_timer);
+        if let Some(e) = self.editor(cx) {
+            e.label(cx, ids!(title)).set_text(cx, &format!("{}: model colour", row.name));
+            e.color_picker(cx, ids!(picker)).set_color(cx, to_srgb(row.design));
+            e.button(cx, ids!(buttons.material)).set_enabled(cx, row.over.is_some());
+            e.as_view().animator_play(cx, ids!(open.on));
+        }
+        self.relock(cx);
+        self.redraw_overlay(cx);
+    }
+
+    /// Close the editor: with `fade` it fades out (drawn until the fade ends, deaf meanwhile),
+    /// else it goes at once.
+    fn close_editor(&mut self, cx: &mut Cx, fade: bool) {
+        if self.editing.take().is_none() {
+            return;
+        }
+        self.unlock(cx);
+        if let Some(e) = &self.editor {
+            if fade {
+                e.as_view().animator_play(cx, ids!(open.off));
+            } else {
+                e.as_view().animator_cut(cx, ids!(open.off));
+            }
+        }
+        cx.stop_timer(self.close_timer);
+        self.closing = fade;
+        if fade {
+            self.close_timer = cx.start_timeout(0.14);
+        } else {
+            self.panel_rect = Rect::default();
+        }
+        self.redraw_overlay(cx);
+    }
+
+    /// The overlay and the row (the swatch's ring) again; the whole window when the overlay
+    /// goes, so what it covered draws again.
+    fn redraw_overlay(&mut self, cx: &mut Cx) {
+        if let Some(list) = &self.overlay {
+            list.redraw(cx);
+        }
+        cx.redraw_area(self.area);
+        if self.editing.is_none() && !self.closing {
+            cx.redraw_all();
+        }
+    }
+
+    /// Hold the pointer lock on the row's area as it is now (a redraw hands the row a new one,
+    /// and the window lets go of a lock on an area that was drawn again).
+    fn relock(&mut self, cx: &mut Cx) {
+        if self.area.is_empty() || self.lock_area == self.area {
+            return;
+        }
+        if !self.lock_area.is_empty() {
+            cx.sweep_unlock(self.lock_area);
+        }
+        cx.sweep_lock(self.area);
+        self.lock_area = self.area;
+    }
+
+    fn unlock(&mut self, cx: &mut Cx) {
+        if !self.lock_area.is_empty() {
+            cx.sweep_unlock(self.lock_area);
+            self.lock_area = Area::Empty;
+        }
+    }
+
+    /// Whether this row's lock is the innermost one: a menu opened over the editor takes the
+    /// pointer from it, and it must not take it back.
+    fn lock_on_top(&self, cx: &Cx) -> bool {
+        cx.sweep_lock_area() == Some(self.lock_area)
+    }
+
     fn press(&mut self, cx: &mut Cx, state: &AppState, name: &str, spot: Spot, rect: Rect) {
         let m = &state.print.colors;
         let Some(row) = m.row(name).cloned() else { return };
         match spot {
             Spot::Swatch => {
                 if self.editing.as_deref() == Some(name) {
-                    self.editing = None;
+                    self.close_editor(cx, true);
                 } else {
-                    self.editing = Some(name.to_string());
-                    if let Some(e) = self.editor(cx) {
-                        e.label(cx, ids!(title)).set_text(cx, &format!("{}: model colour", row.name));
-                        e.color_picker(cx, ids!(picker)).set_color(cx, to_srgb(row.design));
-                        e.button(cx, ids!(buttons.material)).set_enabled(cx, row.over.is_some());
-                    }
+                    self.open_editor(cx, &row);
                 }
-                cx.redraw_area(self.area);
             }
             Spot::Mapping | Spot::Tray | Spot::Differs | Spot::Warn => {
-                self.menu_for = Some(row.name.clone());
+                if !self.owner.matches(&state.print) { return; }
+                self.close_editor(cx, true);
+                self.menu_for = Some((self.owner.clone(), row.name.clone()));
                 open_menu(cx, self.menu_id(), tray_menu(m, row.pos), rect, MenuPlace::Below);
             }
         }
@@ -412,8 +553,39 @@ impl Widget for FabColorLink {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if self.close_timer.is_event(event).is_some() {
+            self.closing = false;
+            self.panel_rect = Rect::default();
+            self.redraw_overlay(cx);
+        }
         if let (Some(e), Some(_)) = (self.editor.clone(), &self.editing) {
+            if matches!(event, Event::KeyDown(ke) if ke.key_code == KeyCode::Escape) && self.lock_on_top(cx) {
+                self.close_editor(cx, true);
+                return;
+            }
+            // A press outside the card and the swatch closes the editor and is the editor's:
+            // nothing under it takes the press.
+            if let Event::MouseDown(me) = event {
+                let on_swatch = self.spots.iter().any(|(r, _, spot)| *spot == Spot::Swatch && r.contains(me.abs));
+                if !self.panel_rect.contains(me.abs) && !on_swatch {
+                    let on_top = self.lock_on_top(cx);
+                    self.close_editor(cx, true);
+                    if on_top && me.handled.get().is_empty() {
+                        me.handled.set(self.area);
+                    }
+                    return;
+                }
+            }
+            // The card's controls hit-test with no lock of their own: the lock is lifted while
+            // they are handed the event, and taken again after (only when it is the innermost).
+            let held = self.lock_on_top(cx);
+            if held {
+                cx.sweep_unlock(self.lock_area);
+            }
             e.handle_event(cx, event, scope);
+            if held && self.editing.is_some() {
+                cx.sweep_lock(self.lock_area);
+            }
         }
         let uid = self.uid;
         if let Event::MouseMove(e) = event {
@@ -439,10 +611,11 @@ impl Widget for FabColorLink {
                     return;
                 }
                 let Some(state) = scope.data.get::<AppState>() else { return };
+                if !self.owner.matches(&state.print) { return; }
                 let m = &state.print.colors;
                 let tray = self.spots.iter().find(|(r, _, spot)| *spot == Spot::Mapping && r.contains(fe.abs)).and_then(|(_, name, _)| m.row(name)).and_then(|row| row.pos).filter(|_| !m.layout.live || state.print.target_printer().is_some_and(|p| p.virtual_printer)).and_then(|pos| m.layout.tray(pos));
                 if let Some(t) = tray {
-                    self.tray_editing = Some(t.pos);
+                    self.tray_editing = Some((self.owner.clone(), t.pos));
                     self.hint.clear(cx, uid);
                     open_menu(cx, self.tray_edit_id(), super::colours::tray_edit_menu(t, &m.layout.heads), Rect { pos: fe.abs, size: dvec2(0.0, 0.0) }, MenuPlace::At);
                 }
@@ -460,12 +633,13 @@ impl Widget for FabColorLink {
         let Event::Actions(actions) = event else { return };
         let Some(state) = scope.data.get::<AppState>() else { return };
         if let Some(pick) = menu_picked(actions, self.tray_edit_id()) {
-            if let (Some(pos), Some(edit)) = (self.tray_editing.take(), super::colours::tray_edit_pick(pick)) {
-                cx.action(super::PrintAction::EditTray(pos, edit));
+            if let (Some((owner, pos)), Some(edit)) = (self.tray_editing.take(), super::colours::tray_edit_pick(pick)) {
+                cx.action(super::PrintAction::EditTray(owner, pos, edit));
             }
         }
         if let Some(pick) = menu_picked(actions, self.menu_id()) {
-            if let (Some(name), Some(pos)) = (self.menu_for.take(), tray_pick(&state.print.colors, pick)) {
+            let menu = self.menu_for.take().filter(|(owner, _)| owner.matches(&state.print));
+            if let (Some((_, name)), Some(pos)) = (menu, tray_pick(&state.print.colors, pick)) {
                 cx.action(match &self.part {
                     Some(part) => crate::ui::parts::assign_tray(state, part.objects.clone(), pos, part.paint.clone()),
                     None => PartAction::MapColor { color: name, printer: state.print.colors.layout.printer.clone(), at: Some((super::colours::head_word(&state.print.colors.layout.heads, pos.head), pos.tray_text())) },
@@ -482,11 +656,9 @@ impl Widget for FabColorLink {
             }
             if e.button(cx, ids!(buttons.material)).clicked(actions) {
                 cx.action(PartAction::SetColorRgb { color: name, rgb: None });
-                self.editing = None;
-                cx.redraw_area(self.area);
+                self.close_editor(cx, true);
             } else if e.button(cx, ids!(buttons.done)).clicked(actions) {
-                self.editing = None;
-                cx.redraw_area(self.area);
+                self.close_editor(cx, true);
             }
         }
     }
@@ -495,10 +667,11 @@ impl Widget for FabColorLink {
         self.spots.clear();
         self.text.clear();
         let Some(state) = scope.data.get::<AppState>() else { return DrawStep::done() };
+        capture_tray_owner(&mut self.owner, &state.print);
         let heads = &state.print.colors.layout.heads;
         let row = self.row.clone();
         if self.editing.as_ref().is_some_and(|n| row.as_ref().is_none_or(|r| r.name != *n)) {
-            self.editing = None;
+            self.close_editor(cx, false);
         }
         cx.begin_turtle(walk, Layout::flow_down());
         if let Some(row) = row {
@@ -628,13 +801,35 @@ impl Widget for FabColorLink {
             if self.base {
                 self.text.push_str(" (the part's base colour)");
             }
-            if self.editing.is_some() {
-                if let Some(e) = self.editor.clone() {
-                    e.draw_all(cx, scope);
-                }
-            }
         }
         cx.end_turtle_with_area(&mut self.area);
+        if self.editing.is_some() || self.closing {
+            if let (Some(e), Some(sw)) = (self.editor.clone(), self.spots.iter().find(|(_, _, s)| *s == Spot::Swatch).map(|(r, _, _)| *r)) {
+                if self.editing.is_some() {
+                    self.relock(cx);
+                }
+                let list = self.overlay.get_or_insert_with(|| DrawList2d::new(cx));
+                list.begin_overlay_reuse(cx);
+                let pass = cx.current_pass_size();
+                cx.begin_root_turtle(pass, Layout::flow_down());
+                // Under the swatch, its left edge with the swatch's; above it when the card would
+                // run off the window's foot. Kept inside the window.
+                let width = 260.0;
+                let height = if self.panel_rect.size.y > 0.0 { self.panel_rect.size.y } else { 340.0 };
+                let mut pos = dvec2(sw.pos.x - 4.0, sw.pos.y + sw.size.y + 6.0);
+                if pos.y + height > pass.y {
+                    pos.y = (sw.pos.y - height - 6.0).max(0.0);
+                }
+                pos.x = pos.x.clamp(0.0, (pass.x - width).max(0.0));
+                let mut walk = Walk::fit();
+                walk.abs_pos = Some(pos);
+                walk.width = Size::Fixed(width);
+                e.draw_walk_all(cx, scope, walk);
+                self.panel_rect = e.area().rect(cx);
+                cx.end_pass_sized_turtle();
+                self.overlay.as_mut().unwrap().end(cx);
+            }
+        }
         DrawStep::done()
     }
 }

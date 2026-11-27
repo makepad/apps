@@ -2029,15 +2029,14 @@ pub(crate) mod tests {
         assert!(w.resets().is_empty(), "the engine reset it: {:?}", w.resets());
     }
 
-    /// The marionette (its build test runs this on its build's jointed piece) loads as it printed, the jester on its
-    /// back beside the control and every string slack.
+    /// A fresh simulation of the shared marionette assembly starts as it printed, with the jester
+    /// on its back beside the control and every string slack.
     /// Hang lifts the control, and the jester comes up on its strings and hangs upright, its lowest point at
     /// least 5 mm over the bed (the lift stops 10 mm clear) and its back string taut. A pointer then carries the
     /// control 100 mm across and 30 mm up in half a second: on every step the held point is under the
     /// pointer (sub-mm), and the back string leaves the control where that snapshot has it, as the view draws
     /// it. Let go, the control stays where it was let go, and the engine never reset.
-    pub(crate) fn the_marionette_hangs_on_its_strings_and_follows_the_hand(mech: &fab_model::mech::Mech) {
-        let built = jointed(mech, &[]).unwrap();
+    pub(crate) fn the_marionette_hangs_on_its_strings_and_follows_the_hand(built: &Built) {
         let asm = &built.asm;
         let part = |name: &str| asm.bodies.iter().position(|b| b.name.ends_with(name)).unwrap_or_else(|| panic!("no part {name}"));
         let (control, leg_bar, torso, head) = (part("/control"), part("/leg_bar"), part("/torso_shape"), part("/head_shape"));
@@ -2095,13 +2094,12 @@ pub(crate) mod tests {
         assert!(s.resets.is_empty(), "the engine reset it: {:?}", s.resets);
     }
 
-    /// The marionette's arms (its build test runs this on its build's jointed piece) print with their hulls sunk
-    /// 2.2 mm into the torso's, and turning an arm one way sinks
+    /// In the shared marionette assembly, the arms print with their hulls sunk 2.2 mm into the
+    /// torso's, and turning an arm one way sinks
     /// it a little deeper before it comes clear. With the jester upright as it hangs on its strings (head up, clear of
     /// the bed) and its torso held still, a hand walks an arm's far end round the shoulder at 40 degrees a second, and
     /// the arm goes past a right angle each way.
-    pub(crate) fn the_marionettes_arms_turn_out_of_their_print_overlap(mech: &fab_model::mech::Mech) {
-        let built = jointed(mech, &[]).unwrap();
+    pub(crate) fn the_marionettes_arms_turn_out_of_their_print_overlap(built: &Built) {
         let asm = &built.asm;
         let part = |name: &str| asm.bodies.iter().position(|b| b.name.ends_with(name)).unwrap_or_else(|| panic!("no part {name}"));
         let torso = part("/torso_shape");
@@ -2269,17 +2267,16 @@ pub(crate) mod tests {
         r.latest()
     }
 
-    /// A demo's jointed piece (its build test runs this on its build: [`JOINTED_DEMOS`]), as the demo builds on
-    /// Fab's default printer, opens in Mechanics, live as
-    /// Mechanics runs it (one step at a time here), on the dynamics engine (a flexing one too). Left alone on the
+    /// For each of the [`JOINTED_DEMOS`], the build test supplies the assembly as printed on Fab's
+    /// default printer. A fresh Mechanics simulation runs it one step at a time on the dynamics
+    /// engine (a flexing piece too). Left alone on the
     /// bed it stays where it printed, 1 mm at most. A hand
     /// takes its part farthest out by its farthest point, pulls it on out across gravity at 300 mm/s for half
     /// a second, holds it half a second and lets go: within three seconds a piece on the bed is at rest (no part
     /// faster than 1 mm/s for a quarter second), the engine never reset, a piece it put back at its print pose
     /// looks at rest, and no joint ever opened (its pivot as each of its parts carries it, 0.01 mm apart at
     /// most).
-    pub(crate) fn grabbed_released_comes_to_rest(key: &str, mech: &fab_model::mech::Mech) {
-        let built = jointed(mech, &[]).unwrap_or_else(|e| panic!("{key}: {e}"));
+    pub(crate) fn grabbed_released_comes_to_rest(key: &str, built: &Built) {
         let asm = built.asm.clone();
         assert!(makepad_csg_mech::runner::on_dynamics(&asm), "{key}: a jointed piece runs on the dynamics engine, a flexing one too");
         let mut r = Runner::start_with(asm.clone(), built.gravity, Options { floor: built.floor, pool: None, ..Options::default() }, || {});

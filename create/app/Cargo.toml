@@ -1,25 +1,27 @@
-# Makepad Work: two people, each with their own local AI, finish Makepad apps together. The
+# Makepad Town: people and their AIs build Makepad apps together, peer to peer, in shared spaces.
 # window: the project's tasks and the persistent chat panel, with `@ai` for your own AI; the AI
-# tools (`work.*`) for that AI; the core (log, fold, queue) is makepad-work-core.
+# tools (`town.*`) for that AI; the core (log, fold, queue) is makepad-town-core.
 [package]
-name = "makepad-work"
+name = "makepad-town"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 publish = false
-default-run = "makepad-work"
+default-run = "makepad-town"
 
-# The text macOS shows when Work first links directly to a device on the local network
+# The text macOS shows when Town first links directly to a device on the local network
 # (`cargo makepad desktop bundle`).
 [package.metadata.makepad.desktop.usage]
-local_network = "Work links to a collaborator's device when you're both on this network."
+microphone = "Town uses your microphone only during a call you start or answer."
+speech_recognition = "Town turns your own words into text only while you have Transcribe on in a call."
+local_network = "Town links to a collaborator's computer when you're both on this network."
 
 [lib]
 name = "makepad_create"
 path = "src/lib.rs"
 
 [[bin]]
-name = "makepad-work"
+name = "makepad-town"
 path = "src/main.rs"
 
 [features]
@@ -28,8 +30,16 @@ default = ["tweaker"]
 tweaker = ["dep:makepad-widgets-tweaker", "makepad-widgets/data", "makepad-widgets/dock", "makepad-widgets/fab"]
 
 [dependencies]
+# Voice media and the audio ports for calls over the link.
+makepad-call = { path = "../../../../libs/call" }
+makepad-ai-hub = { path = "../../../../libs/ai/hub", default-features = false, features = ["speech"] }
+# Encode shared windows and read the duration of finalized clips.
+makepad-mp4-index = { path = "../../../../libs/mp4_index" }
+makepad-platform-video = { path = "../../../../platform/video" }
+# A recording's poster.
+jpeg-encoder = { path = "../../../../libs/jpeg-encoder" }
 makepad-canvas = { path = "../../../../libs/canvas" }
-makepad-widgets = { path = "../../../../widgets", default-features = false, features = ["glass", "rich_text"] }
+makepad-widgets = { path = "../../../../widgets", default-features = false, features = ["glass", "rich_text", "media", "fab", "pickers"] }
 makepad-widgets-tweaker = { path = "../../../../widgets/families/tweaker", optional = true }
 makepad-code-editor = { path = "../../../../code_editor" }
 makepad-markdown-editor = { path = "../../../../widgets/families/markdown_editor" }
@@ -37,7 +47,10 @@ makepad-ai-services = { path = "../../../../libs/ai/services" }
 makepad-remote = { path = "../../../../libs/remote" }
 makepad-strict-json = { path = "../../../../libs/strict_json" }
 makepad-network = { path = "../../../../platform/network" }
-# The link socket tied to one network interface (MAKEPAD_WORK_LINK_IF, a developer switch).
+# The link socket tied to one network interface (MAKEPAD_TOWN_LINK_IF, a developer switch).
 makepad-core-util = { path = "../../../../libs/core_util" }
-makepad-work-core = { path = "../core" }
+makepad-town-core = { path = "../core" }
 makepad-splash-syntax = { path = "../../libs/splash_syntax" }
+
+[dev-dependencies]
+makepad-town-core = { path = "../core", features = ["test-hooks"] }

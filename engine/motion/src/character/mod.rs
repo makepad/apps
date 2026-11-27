@@ -18,6 +18,7 @@
 //! for the limbs and heads, a few paths for the face, so the drawing side
 //! needs nothing of its own.
 
+use crate::plain::PrimitiveFrame;
 pub mod emote;
 pub mod face;
 pub mod kit;
@@ -713,14 +714,14 @@ pub fn items(rig: &Rig, solved: &Solved, path: &str, placed: &Affine) -> Vec<Ite
         for (k, shape) in part.shapes.iter().enumerate() {
             let (fill, stroke) = (color(shape.fill), color(shape.stroke));
             let (world, kind) = match &shape.geom {
-                Geom::Path(path) => (map, ItemKind::Path { path: path.clone(), fill, stroke, width: shape.width, trim: [0.0, 1.0], cap: shape.cap, join: shape.join }),
+                Geom::Path(path) => (map, ItemKind::Primitive(PrimitiveFrame::Path { path: path.clone(), fill, stroke, width: shape.width, trim: [0.0, 1.0], cap: shape.cap, join: shape.join })),
                 Geom::Ellipse { center, radius } => (
                     map.then(&Affine::translate(center[0] - radius[0], center[1] - radius[1])),
-                    ItemKind::Ellipse { size: [radius[0] * 2.0, radius[1] * 2.0], fill, stroke, width: shape.width, trim: [0.0, 1.0], cap: shape.cap },
+                    ItemKind::Primitive(PrimitiveFrame::Ellipse { size: [radius[0] * 2.0, radius[1] * 2.0], fill, stroke, width: shape.width, trim: [0.0, 1.0], cap: shape.cap }),
                 ),
                 Geom::Rect { pos, size, radius } => (
                     map.then(&Affine::translate(pos[0], pos[1])),
-                    ItemKind::Rect { size: *size, radius: radius.min(size[0].min(size[1]) * 0.5), fill, stroke, width: shape.width, trim: [0.0, 1.0], cap: shape.cap },
+                    ItemKind::Primitive(PrimitiveFrame::Rect { size: *size, radius: radius.min(size[0].min(size[1]) * 0.5), fill, stroke, width: shape.width, trim: [0.0, 1.0], cap: shape.cap }),
                 ),
                 Geom::Capsule { a, b, width } => {
                     let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
@@ -730,7 +731,7 @@ pub fn items(rig: &Rig, solved: &Solved, path: &str, placed: &Affine) -> Vec<Ite
                     let r = width * 0.5;
                     (
                         map.then(&Affine::translate(a[0], a[1])).then(&Affine::rotate(angle)).then(&Affine::translate(-r, -r)),
-                        ItemKind::Rect { size: [length + *width, *width], radius: r, fill, stroke, width: shape.width, trim: [0.0, 1.0], cap: shape.cap },
+                        ItemKind::Primitive(PrimitiveFrame::Rect { size: [length + *width, *width], radius: r, fill, stroke, width: shape.width, trim: [0.0, 1.0], cap: shape.cap }),
                     )
                 }
             };

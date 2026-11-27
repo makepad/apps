@@ -390,7 +390,9 @@ pub(crate) mod tests {
     /// piece's in Mechanics ([`crate::mechanics::tests::grabbed_released_comes_to_rest`] and the
     /// marionette's own), a showpiece's ([`showpiece_checks_free_and_moves`]) and the athlete's.
     /// One build a demo: they were tests of their own, each building the demo again in another
-    /// process of the land gate's tests (the marionette's 25 s build four times).
+    /// process of the land gate's tests (the marionette's 25 s build four times). The jointed
+    /// piece's checks share one assembly, each running a simulation of its own on it; the
+    /// athlete's and a showpiece's build theirs with the piece's checks.
     fn builds_and_slices(key: &str) {
         use makepad_fab_slice::live::LiveEvent;
         let DemoBuild { model: m, evaluator: mut e, compiled: c, ev, filed } = build(key);
@@ -423,11 +425,12 @@ pub(crate) mod tests {
         assert_eq!(too_big_for_resin(&c, &ev), rows, "{key}: the placements too big for the resin printer's bed");
         assert_eq!(!ev.mech.is_empty(), crate::mechanics::tests::JOINTED_DEMOS.contains(&key), "{key}: the demos with a jointed piece, and only they, are Mechanics' jointed demos");
         if let Some(mech) = ev.mech.first() {
-            crate::mechanics::tests::grabbed_released_comes_to_rest(key, mech);
+            let built = crate::mechanics::jointed(mech, &[]).unwrap_or_else(|e| panic!("{key}: {e}"));
+            crate::mechanics::tests::grabbed_released_comes_to_rest(key, &built);
             match key {
                 "marionette" => {
-                    crate::mechanics::tests::the_marionette_hangs_on_its_strings_and_follows_the_hand(mech);
-                    crate::mechanics::tests::the_marionettes_arms_turn_out_of_their_print_overlap(mech);
+                    crate::mechanics::tests::the_marionette_hangs_on_its_strings_and_follows_the_hand(&built);
+                    crate::mechanics::tests::the_marionettes_arms_turn_out_of_their_print_overlap(&built);
                 }
                 "poseable_athlete" => {
                     the_poseable_athletes_parts_are_each_one_piece(&ev, &mut e);
@@ -460,7 +463,8 @@ pub(crate) mod tests {
         assert!(tools <= 9, "{key}: prints with {tools} filaments");
         let setup = crate::print::slice_bench::setup(&ev);
         let (engine, rx) = crate::live_slice::cpu_engine();
-        engine.set_input(crate::live_slice::input_for(crate::live_slice::plate_id(&ev), &setup, Arc::new(ev.plate.printable()), ev.machine.clone(), Some(&ev.frames), Some(&ev.fields)));
+        let input = crate::live_slice::input_for(crate::live_slice::plate_id(&ev), &setup, Arc::new(ev.plate.printable()), ev.machine.clone(), Some(&ev.frames), Some(&ev.fields));
+        engine.set_input(crate::live_slice::with_overlaps_of(input, &ev));
         let report = rx.iter().find_map(|e| match e {
             LiveEvent::Issues { report, done, total, .. } if done == total && total > 0 => Some(report),
             LiveEvent::Failed { error, .. } => panic!("{key}: does not slice: {error}"),
@@ -667,7 +671,8 @@ pub(crate) mod tests {
     fn settled_on(engine: &makepad_fab_slice::live::LiveEngine, rx: &std::sync::mpsc::Receiver<makepad_fab_slice::live::LiveEvent>, ev: &std::sync::Arc<fab_model::eval::Evaluated>) -> Result<(std::sync::Arc<makepad_fab_slice::live::Settled>, usize), String> {
         use makepad_fab_slice::live::LiveEvent;
         use std::sync::Arc;
-        engine.settle(1, crate::live_slice::input_for(crate::live_slice::plate_id(ev), &crate::print::slice_bench::setup(ev), Arc::new(ev.plate.printable()), ev.machine.clone(), Some(&ev.frames), Some(&ev.fields)));
+        let input = crate::live_slice::input_for(crate::live_slice::plate_id(ev), &crate::print::slice_bench::setup(ev), Arc::new(ev.plate.printable()), ev.machine.clone(), Some(&ev.frames), Some(&ev.fields));
+        engine.settle(1, crate::live_slice::with_overlaps_of(input, ev));
         let mut slices = 0;
         for e in rx.iter() {
             match e {

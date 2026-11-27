@@ -17,8 +17,10 @@ fn select(reader: &mut Reader, folder: &str) {
 }
 
 fn receive(reader: &mut Reader) -> Reply {
+    // Every wait follows a command the flush has handed over, so the reply comes
+    // when the worker reaches it: no deadline.
     reader.flush().unwrap();
-    reader.replies.recv_timeout(Duration::from_secs(5)).expect("journal worker replies")
+    reader.replies.recv().expect("journal worker replies")
 }
 
 fn ask(reader: &mut Reader, request: Request) -> Answer {
@@ -387,7 +389,7 @@ fn switching_plate_during_scan_discards_the_old_generation() {
         })
     });
     let first = reader.select("first").unwrap();
-    scanning.recv_timeout(Duration::from_secs(5)).unwrap(); // One line indexed; the scan is held before the next.
+    scanning.recv().unwrap(); // One line indexed; the scan is held before the next.
     reader.request(Request::Count(Filter::default())).unwrap();
     let second = reader.select("second").unwrap();
     assert_ne!(first.generation, second.generation);
@@ -693,6 +695,74 @@ fn journal_source_opens_refuse_linked_blobs_logs_and_repairs() {
 }
 
 #[test]
+fn journal_copies_an_accepted_proposal_as_its_document_patches() {
+    use crate::journal::{replay, Change};
+    use fab_elec_design::By;
+    let root = test_dir();
+    let folder: Arc<str> = "plate".into();
+    let dir = root.join(&*folder).join("journal");
+    let before = "use mod.elec.*\n";
+    let after = "use mod.elec.*\nlet sense = mod.elec.net({name: \"SENSE\"})\n";
+    let circuit = "probe.elec/probe.ckt.splash";
+    let requirements = "probe.elec/brief.req.splash";
+    let brief = "// measure the sense voltage\n";
+    let docs = [("probe.ckt.splash".into(), before.into())].into();
+    let plate = Plate::testing(&dir, "probe.fab.splash", &docs);
+    let writer = plate.take_writer();
+    let accept = "elec.step.accept";
+    let call = Call::decision(&plate, accept, &[("proposal".into(), "7".into()), ("slot".into(), "schematic".into()),
+        ("label".into(), "Add sense".into()), ("author".into(), "ai".into())]);
+    plate.effect(Some(&call), 1, By::Ai { turn: 1, call: 1 }, "Add sense", vec![
+        Change::whole(requirements.into(), None, Some(Arc::from(brief.as_bytes()))),
+        Change::text(circuit.into(), before, after),
+    ]);
+    call.done("ok", "{seq: 1}".into());
+    Call::begin(&plate, By::Person, "elec.check.list", obj(vec![])).done("ok", "[]".into());
+    drain(&writer);
+
+    let log = fs::read_to_string(dir.join(LOG)).unwrap();
+    let call_line = |name: &str| log.lines().find(|line| {
+        let row = makepad_strict_json::parse(line.as_bytes()).unwrap();
+        row.get("action").and_then(Value::as_str) == Some(name)
+    }).expect("the call is present on disk");
+    let decision = call_line(accept);
+    assert!(decision.contains(r#""replay":false"#), "the durable decision explicitly disables replay");
+    assert!(!call_line("elec.check.list").contains(r#""replay":"#), "a replayable call retains its original row format");
+    let row = makepad_strict_json::parse(decision.as_bytes()).unwrap();
+    assert_eq!(row.get("actor").and_then(|a| a.get("kind")).and_then(Value::as_str), Some("person"),
+        "the decision call credits the person who pressed Accept");
+    let order = row.get("order").and_then(Value::as_u64).unwrap();
+    let mut store = Store::default();
+    let target = Target { folder: folder.clone(), generation: 1 };
+    store.folders.entry(folder.clone()).or_default().refresh(&root, &folder, &|| true).unwrap();
+    let browse = Browse { root: &root, target: &target, store: &mut store, current: &|| true };
+    let key = |position| Key { folder: folder.clone(), journal: browse.journal().unwrap(), position: Position::Order(position) };
+    let script = browse.script(&key(order), &key(order + 2), Filter::default(), browse.complete_end()).unwrap();
+    assert!(script.lines().any(|line| line == "# elec.step.accept: the person's decision, copied as its edits"),
+        "the copied decision explains how its edits are represented");
+    assert!(!script.lines().any(|line| line.starts_with("elec.step.accept ")), "the script cannot invoke a transient proposal id");
+    let patches: Vec<_> = script.lines().filter_map(|line| line.strip_prefix("patch "))
+        .map(|args| makepad_strict_json::parse(args.as_bytes()).unwrap()).collect();
+    assert!(patches.iter().any(|p| p.get("doc").and_then(Value::as_str) == Some(requirements)
+        && p.get("op").and_then(Value::as_str) == Some("create") && p.get("text").and_then(Value::as_str) == Some(brief)),
+        "the creation patch contains the proposed requirements text");
+    assert!(patches.iter().any(|p| p.get("doc").and_then(Value::as_str) == Some(circuit)
+        && p.get("edits").and_then(Value::as_arr).is_some_and(|edits| !edits.is_empty())),
+        "the circuit patch contains the edits to the checkpoint text");
+
+    let copy = root.join("replayed");
+    let mut decision_outcome = None;
+    let report = replay::replay(replay::Request { journal: &dir, upto: Some(order + 2), into: &copy, mode: replay::Mode::Calls },
+        &mut |step| if step.order == order { decision_outcome = Some(step.outcome.clone()); }).unwrap();
+    assert!(matches!(decision_outcome, Some(replay::Outcome::NotReplayable { reason })
+        if reason == "a person's decision; its edits are recorded as its effects"), "Calls replay identifies the person's decision before dispatch");
+    assert!(report.stopped.is_none() && fs::read_to_string(copy.join(circuit)).unwrap() == after
+        && fs::read_to_string(copy.join(requirements)).unwrap() == brief, "replay restores both accepted documents from the effect");
+    drop((call, plate, writer));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn journal_unsaved_session_browse_copy_recover_and_tool_isolation() {
     use crate::chat::{journal::Browser, Calls};
     use fab::ui::journal_panel::{JournalAction as Act, JournalPage, RecordKey};
@@ -726,14 +796,13 @@ fn journal_unsaved_session_browse_copy_recover_and_tool_isolation() {
     let mut page = JournalPage::default();
     let mut calls = Calls::default();
     browser.select(&mut cx, Some(&plate), "Current plate", &mut calls, &mut page);
+    // No deadline: each update delivers what the worker has finished.
     macro_rules! until {
         ($condition:expr) => {{
-            let start = std::time::Instant::now();
             loop {
                 page.drawn = true;
                 browser.update(true, true, &mut page, &mut calls);
                 if $condition { break }
-                assert!(start.elapsed() < Duration::from_secs(5), "worker did not deliver {}", stringify!($condition));
                 thread::yield_now();
             }
         }};
@@ -825,14 +894,13 @@ fn journal_tab_removes_and_empties_only_confirmed_sessions_and_relists() {
     let mut page = JournalPage::default();
     let mut calls = Calls::default();
     browser.select(&mut cx, Some(&plate), "Current plate", &mut calls, &mut page);
+    // No deadline: each update delivers what the worker has finished.
     macro_rules! until {
         ($condition:expr) => {{
-            let start = std::time::Instant::now();
             loop {
                 page.drawn = true;
                 browser.update(true, true, &mut page, &mut calls);
                 if $condition { break }
-                assert!(start.elapsed() < Duration::from_secs(5), "worker did not deliver {}", stringify!($condition));
                 thread::yield_now();
             }
         }};
@@ -909,5 +977,77 @@ fn journal_tab_removes_and_empties_only_confirmed_sessions_and_relists() {
         "deleting the confirmed list must relist silently, including the new arrival");
     assert!(!archives.join(other).exists() && archives.join(late).join(LOG).is_file());
     drop(browser);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn moving_plate_reads_as_missing_and_releases_the_queued_replay_handle() {
+    let root = test_dir();
+    let folder = "saved";
+    let plate = root.join(folder);
+    let dir = plate.join("journal");
+    open_and_record(&dir, "plate.fab.splash");
+    let mut store = Store { folders: Default::default() };
+    let target = Target { folder: folder.into(), generation: 1 };
+    store.refresh(&root, &target, &|| true).unwrap();
+    let browse = Browse { root: &root, target: &target, store: &mut store, current: &|| true };
+    let key = browse.page(Filter::default(), None, 1).unwrap().0.pop().unwrap().key;
+    let (_, abandoned) = browse.replay_record(&key).unwrap();
+    let observed = abandoned.file.clone();
+    drop(abandoned);
+    assert!(observed.lock().unwrap().is_none(), "abandoning a replay must close its handle before unregistering it");
+    let (_, queued) = browse.replay_record(&key).unwrap();
+    let read = log_file(&root, folder).unwrap().unwrap();
+    let p = plate.clone();
+    let (draining, seen) = mpsc::channel();
+    let moving = thread::spawn(move || crate::journal::tests::with_probe(move |point| {
+        if point == "waiting for journal reads" { draining.send(()).unwrap(); }
+        Ok(())
+    }, || MovingPlate::begin(&p).unwrap()));
+    seen.recv().unwrap();
+    assert!(!moving.is_finished(), "a move must wait for the open read");
+    drop(read);
+    let moving = moving.join().unwrap();
+    assert!(matches!(store.refresh(&root, &target, &|| true).unwrap(), Refresh::Replaced));
+    assert!(log_file(&root, folder).unwrap().is_none(), "a moving plate is missing on every reopen");
+    assert!(queued.file().is_err_and(|e| e.kind() == io::ErrorKind::NotFound), "a queued replay must surrender its verified handle");
+    let bin = root.join("trash");
+    fs::rename(&plate, &bin).unwrap();
+    fs::rename(bin, &plate).unwrap();
+    drop(moving);
+    store.refresh(&root, &target, &|| true).unwrap();
+    assert_eq!(store.folders[&target.folder].token(), Some(key.journal), "releasing the move makes the original journal readable again");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn model_host_delete_moves_a_plate_with_a_reader_sample() {
+    let root = test_dir();
+    let (mut session, opening, plate) = crate::journal::tests::saved_opening(&root);
+    let store = session.store.clone().unwrap();
+    let id = session.plate.clone().unwrap();
+    opening.send(crate::journal::tests::call());
+    opening.measured_writer()();
+    let (sample, _) = log_file(&store.root, &id).unwrap().unwrap();
+    let (release, proceed) = mpsc::channel();
+    let reader = thread::spawn(move || { proceed.recv().unwrap(); drop(sample); });
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    #[cfg(windows)]
+    let draining = release.clone();
+    crate::journal::tests::with_probe(move |_point| {
+        #[cfg(windows)]
+        if _point == "waiting for journal reads" { draining.send(()).unwrap(); }
+        Ok(())
+    }, || crate::model_host::delete_saved_plate(&mut session, &id, std::process::id(), &|path| {
+        fs::rename(path, bin.join(path.file_name().unwrap())).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        if path == plate { release.send(()).unwrap(); }
+        Ok(())
+    })).unwrap();
+    drop(release);
+    reader.join().unwrap();
+    assert!(bin.join(&id).join("journal").join(LOG).is_file() && !plate.exists(),
+        "an in-process sample must allow the plate-folder rename");
     fs::remove_dir_all(root).unwrap();
 }

@@ -1,20 +1,20 @@
-//! Makepad Create's core, without UI: what two people (and their AIs) share, and the rules that
+//! Makepad Town's core, without UI: what two people (and their AIs) share, and the rules that
 //! decide what each AI may see.
 //!
 //! - [`event`]: the signed event format (v1). Ids hash the signed header only, so a second valid
 //!   signature never makes a "new" event; the body is separate and salted, so it can be erased
 //!   (redaction) while the chain still verifies; bytes are kept as received, never re-encoded.
-//! - [`key`]: this device's own P-256 key (Create's, never the fleet key) and the one function
+//! - [`key`]: this device's own P-256 key (Town's, never the fleet key) and the one function
 //!   every signature goes through, with a domain per purpose.
 //! - [`log`]: the append-only log of raw events on disk.
 //! - [`doc`]: shared Unicode text, stable character and block ids, and Markdown diffs.
 //! - [`entity`]: shared objects, their numbered and named fields, and queries for a project or its links.
 //! - [`order_key`]: fractional byte keys for ordered fields.
 //! - [`fold`]: one deterministic replay of the log in a canonical order (height, author, id) into
-//!   the state the app shows, and `ai_visible`, the chat a person's own AI may read.
+//!   the displayed state. During its person's turn, an AI may read a filtered view of the town timeline.
 //! - [`queue`]: the durable local queue of what waits for my AI (not shared).
-//! - [`peers`]: this device's private record of linked devices and rooms.
-//! - [`home`]: the directory one Create instance owns (its lock, key, log and endpoint file).
+//! - [`peers`]: this device's private record of linked devices and towns.
+//! - [`home`]: the directory one Town instance owns (its lock, key, log and endpoint file).
 
 pub mod blob;
 pub mod connect;
@@ -23,6 +23,8 @@ pub mod entity;
 pub mod event;
 pub mod fold;
 pub mod home;
+pub mod home_writer;
+pub mod hub;
 pub mod key;
 pub mod link;
 pub mod literal;
@@ -32,6 +34,7 @@ pub mod peers;
 pub mod queue;
 pub mod share;
 pub mod sync;
+pub mod tlv;
 
 /// Lower-case hex of `bytes` (event ids in tool input and output).
 pub fn hex(bytes: &[u8]) -> String {

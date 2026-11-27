@@ -5,6 +5,10 @@
 //! shows before the plate the last run left on the bed is built, and a plate opened from it
 //! meanwhile goes on the bed in its place.
 
+#[path = "common/part_editor.rs"]
+mod part_editor;
+#[path = "common/render_mode.rs"]
+mod render_mode;
 #[path = "common/wait.rs"]
 mod idle_wait;
 use idle_wait::wait_poll;
@@ -251,8 +255,7 @@ fn a_plate_switched_back_to_in_the_slice_view_is_not_sliced_again() {
         app.locator(Selector::role(Role::Window)).wait_visible();
         let from = log_mark(&app);
         open(&app, "alpha");
-        app.locator(Selector::id("rm_slice")).click();
-        app.locator(Selector::id("rm_slice")).wait_checked(true);
+        render_mode::pick(&app, "Sliced");
         let first = slice_cost_after(&app, from, 2);
         assert!(first.iter().all(|l| !l.contains("traced 0 ")), "alpha is sliced in the Slice view: {first:?}");
 
@@ -309,6 +312,7 @@ fn an_ai_switch_waits_for_a_value_drag_and_the_drag_lands_on_its_own_plate() {
         app.locator(Selector::role(Role::Window)).wait_visible();
         open(&app, "alpha");
         app.locator(Selector::role(Role::TreeItem).name("alpha part")).click();
+        part_editor::open(&app);
         assert_eq!(param_mm(&app, "alpha/s"), 10.0, "alpha starts at 10 mm");
         let beta = plate_id(&app, "beta");
 

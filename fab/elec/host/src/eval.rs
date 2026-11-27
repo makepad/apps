@@ -1,4 +1,4 @@
-//! Pure evaluation work for the pool; the strand adopts only results of its current documents.
+//! Evaluation work for the pool; the strand adopts only results of its current documents.
 
 use crate::TaskResult;
 use fab_elec_board::BoardOp;
@@ -7,10 +7,11 @@ use fab_elec_core::{Angle, BoardId, Canon, CompRef, Diag, Sel, Side};
 use fab_elec_design::{Design, DesignOp, PartRef, Place, TextEdit, TextStep};
 use fab_elec_lang::{bench_views, catalog, evaluate_from, splice_verified, text_verified, BenchView, EvalError, Evaluated, Libs, Sources, SpanEdit, Verified, NO_CANCEL};
 use fab_elec_view::board::{plan::placement_labels, tray::placement_op};
+use fab_elec_view::snapshot::RunClock;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// A pure pool task: evaluate the documents again, or splice and verify a canvas commit against them.
+/// A pool task: evaluate the documents again, or splice and verify a canvas commit against them.
 #[derive(Clone)]
 pub struct EvalJob {
     /// The engine's job identity, so late results can be ignored.
@@ -30,6 +31,8 @@ pub struct EvalJob {
     pub verify: Option<Vec<DesignOp>>,
     /// A checked text change (`Cmd::CheckedText`) to apply and verify instead.
     pub text: Option<Vec<TextEdit>>,
+    /// A document set already planned against `sources`, with the clock shared by its row.
+    pub plan: Option<(Sources, SpanEdit, Arc<RunClock>)>,
     /// Footprints resolved after verification has added the sample's or commit's parts.
     pub place: Vec<Place>,
 }
@@ -63,20 +66,27 @@ pub enum EvalOut {
 }
 
 impl EvalJob {
-    /// Run the pure task. Cost: evaluation of changed units (and a splice for verification),
+    /// Mark a proposal running as the pool enters the job. Cost: evaluation of changed units (and a splice for verification),
     /// plus O(board) hashing per changed unit, the bench views and the Library panel's catalog
     /// (one enumeration VM when a definition document changed, else one cache read), all on the pool.
     pub fn run(&self) -> TaskResult {
+        if let Some((_, _, clock)) = &self.plan { clock.start(); }
         let mut placed = Vec::new();
-        let out = match (&self.verify, &self.text) {
-            (_, Some(edits)) => EvalOut::Verified(text_verified(&self.sources, &self.libs, &self.prev, edits.clone(), &NO_CANCEL)
+        let out = match (&self.verify, &self.text, &self.plan) {
+            (_, _, Some((sources, edit, _))) => EvalOut::Verified(
+                fab_elec_lang::docs_verified(sources.clone(), &self.libs, &self.prev, edit.clone(), &NO_CANCEL)
+                    .map(|verified| {
+                        let inverse = verified.edit.inverse(&self.sources, &self.prev.map).into();
+                        (verified, inverse)
+                    }).map_err(first_mistake)),
+            (_, Some(edits), None) => EvalOut::Verified(text_verified(&self.sources, &self.libs, &self.prev, edits.clone(), &NO_CANCEL)
                 .map(|verified| {
                     let inverse = verified.edit.inverse(&self.sources, &self.prev.map).into();
                     (verified, inverse)
                 })
                 .map_err(first_mistake)),
-            (None, None) => EvalOut::Evaluated(evaluate_from(Some(&self.prev), &self.sources, &self.libs, &NO_CANCEL).map_err(EvalError::into_diags)),
-            (Some(ops), None) => EvalOut::Verified(self.verify(ops).map(|(verified, items)| {
+            (None, None, None) => EvalOut::Evaluated(evaluate_from(Some(&self.prev), &self.sources, &self.libs, &NO_CANCEL).map_err(EvalError::into_diags)),
+            (Some(ops), None, None) => EvalOut::Verified(self.verify(ops).map(|(verified, items)| {
                 // A commit that adds a document and edits it (a part's first e.body, in a new
                 // models document) inverts against the text with that document added.
                 let inverse = if ops.iter().any(|op| matches!(op, DesignOp::File(_))) {

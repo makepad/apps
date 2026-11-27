@@ -84,7 +84,7 @@ pub fn guide_section(name: Option<&str>) -> Result<String, String> {
         .ok_or_else(|| format!("no guide section '{name}'"))
 }
 
-const BRIEF: &str = "Fab is a 3D modeler for printing. A project places object scripts (name.cad.splash) on the plate; a script is a Splash program that builds parts, one builder call each (m.box, m.extrude, m.subtract, m.blend, SDF fields written as Splash distance functions), each bound by a let in millimetres, Y up, and emits its objects with object(part). Every change rebuilds live in the view. Read fab.guide once, then: fab.inspect for the head, the project and the scripts, fab.script for a new object, fab.apply with edits of a script written as Splash statements, fab.place to move objects and set their print settings and parameter values, fab.render to look, fix, repeat. Fab lays the objects out on a 350 x 320 mm dual-nozzle bed and reports out-of-reach parts.";
+const BRIEF: &str = "Fab is a 3D modeler for printing. A project places object scripts (name.cad.splash) on the plate; a script is a Splash program that builds parts, one builder call each (m.box, m.extrude, m.subtract, m.blend, SDF fields written as Splash distance functions), each bound by a let in millimetres, Y up, and emits its objects with object(part). Every change rebuilds live in the view. Read fab.guide once, then: fab.inspect for the head, the project and the scripts, fab.script for a new object, fab.apply with edits of a script written as Splash statements, fab.place to move objects and set their print settings and parameter values, fab.render to look, fix, repeat. Fab lays the objects out on a 350 x 320 mm dual-nozzle bed and reports out-of-reach parts. A part that must fit a real product or standard part (a mount, case, adapter, spare): first ask the person which exact one with chat.ask when it comes in versions, then research its mating dimensions online, then build from those numbers with print clearance and pin them with m.expect (fab.guide section fit).";
 
 fn schema(props: &str, required: &[&str]) -> String {
     let req: Vec<String> = required.iter().map(|r| format!("\"{r}\"")).collect();
@@ -577,7 +577,7 @@ fn with_elec_tools(mut manifest: ServiceManifest) -> ServiceManifest {
         ("elec_external", "Propose a dated offline price library entry with its source URL. The person reviews this individual entry in the BOM tab before it is written."),
         ("elec_export", "Write Fab Electronics' fabrication files (Gerber, drill, BOM, placement, the zip) and check each one read back against the board. The person approves the call first, and can change its arguments."),
         ("elec_run", "Drive Fab Electronics' bench as its transport does: play, pause and rate. It never changes the design and makes no undo step."),
-        ("elec_edit", "Edit Fab Electronics as a person does in its editors: each call is one undo step, the edit shows where it lands, and a playing take re-renders with it. The answer's take says what the edit does to the run: state playing, held or none; effect retune, restart or none. An edit of the board, the circuit or the system answers once every check has run on it, and its checks say what it changed for them: the new findings, errors first, and how many are gone. When the project has requirements, an edit answers once they are judged on it too, with requirements: met as elec.req.list gives it, changed (each row whose status the edit moved: name, was, now, value, bound, why) and waiting (rows whose value waits for its producer to run again, with why). An edit that changes the person's requirements also answers requirements_changed: say each line to the person."),
+        ("elec_edit", "Edit Fab Electronics as a person does in its editors: each direct edit is one undo step, the edit shows where it lands, and a playing take re-renders with it. The answer's take says what the edit does to the run: state playing, held or none; effect retune, restart or none. An edit of the board, the circuit or the system answers once every check has run on it, and its checks say what it changed for them: the new findings, errors first, and how many are gone. When the project has requirements, an edit answers once they are judged on it too, with requirements: met as elec.req.list gives it, changed (each row whose status the edit moved: name, was, now, value, bound, why) and waiting (rows whose value waits for its producer to run again, with why). An edit that changes the person's requirements also answers requirements_changed: say each line to the person."),
     ];
     for (tool, _, risk) in ELEC_TOOLS {
         let defs = elec_actions(tool);
@@ -601,7 +601,7 @@ fn with_elec_tools(mut manifest: ServiceManifest) -> ServiceManifest {
     if action::find("elec.doc.read").is_some() {
         manifest = manifest.with_tool(ToolDef::new(
             ELEC_TEXT_TOOL,
-            "Change the text of a Fab Electronics document as typing in its code pane does: one call is one undo step, and the change shows where it lands. Firmware (.fw.splash), circuit (.ckt.splash), block (.blocks.splash), bench (.bench.splash) and part (.part.splash) documents; many design changes in one call are one evaluation and one undo step. Read the document with elec.doc.read first and give its rev; a document that changed since is refused with its new rev. A firmware change is compiled first, as the running bench builds it: text that does not compile is not committed, and the error lists each diagnostic's line and col. When no bench run builds that firmware, the change is committed unchecked and the answer says compiled: false and why. Any other change is evaluated first: text that adds a mistake is not committed, and the error gives its doc, line and col; the answer says evaluated: true and made: the parts and nets it defines. A circuit, block or part change answers once every check has run on it, with checks: the new findings and how many are gone. The answer gives the new rev, each edit's first and last line, and take: what the change does to the run. With requirements in the project it waits until they are judged on the change, with requirements as fab.elec_edit's answers give it; a change of a requirements document (.req.splash) also gives requirements_changed: say each line to the person.",
+            "Change the text of a Fab Electronics document as typing in its code pane does: one call is one undo step, and the change shows where it lands. Firmware (.fw.splash), circuit (.ckt.splash), block (.blocks.splash), bench (.bench.splash) and part (.part.splash) documents; many design changes in one call are one evaluation and one undo step. Read the document with elec.doc.read first and give its rev; a document that changed since is refused with its new rev. A firmware change is compiled first, as the running bench builds it: text that does not compile is not committed, and the error lists each diagnostic's line and col. When no bench run builds that firmware, the change is committed unchecked and the answer says compiled: false and why. Any other change is evaluated first: text that adds a mistake is not committed, and the error gives its doc, line and col; the answer says evaluated: true and made: the parts and nets it defines. A circuit, block or part change answers once every check has run on it, with checks: the new findings and how many are gone. The answer gives the new rev, each edit's first and last line, and take: what the change does to the run. With requirements in the project it waits until they are judged on the change, with requirements as fab.elec_edit's answers give it; a change of a requirements document (.req.splash) also gives requirements_changed: say each line to the person.\n\nFor a staged build, propose the stage's documents together with elec.step.propose. The person reviews and accepts in the Review strip. Read its state with elec.step.list. Fix a not usable proposal by proposing again in the same slot. Never edit those documents with fab.elec_text while their proposal is pending.",
             schema(r#""doc":{"type":"string","description":"The document's name, as elec.doc.list gives it."},"rev":{"type":"integer","description":"The revision elec.doc.read gave for the text the edits were made against."},"edits":{"type":"array","description":"Replacements, applied together: each old is text found exactly once in that revision (add the text around it to make it so); edits may not overlap.","items":{"type":"object","properties":{"old":{"type":"string"},"new":{"type":"string"}},"required":["old","new"]}},"text":{"type":"string","description":"The document's whole new text, in place of edits."}"#, &["doc", "rev"]),
             Risk::Act,
         ));
@@ -3275,8 +3275,22 @@ impl Session {
     pub fn delete_plate(&mut self, id: &str, trash: &dyn Fn(&Path) -> Result<(), String>) -> Result<Option<Arc<Evaluated>>, String> {
         let store = self.store.clone().ok_or("this session keeps no plates")?;
         let on_bed = self.plate.as_deref() == Some(id);
+        let record_path = store.dir(id).join("plate");
+        let record = if on_bed {
+            Some(std::fs::read(&record_path).map_err(|e| format!("{}: {e}", record_path.display()))?)
+        } else { None };
         store.remove(id)?;
-        let bed = if on_bed { Some(self.next_on_bed()?) } else { None };
+        let bed = if let Some(record) = record {
+            match self.next_on_bed() {
+                Ok(bed) => Some(bed),
+                Err(error) => {
+                    // Keep even fields this build did not interpret in the original record.
+                    project::write_atomic(&record_path, &record).map_err(|restore|
+                        format!("{error}; the plate record could not be restored: {restore}"))?;
+                    return Err(error)
+                }
+            }
+        } else { None };
         self.kept.retain(|d| d.plate.as_deref() != Some(id));
         store.delete(id, trash)?;
         self.plates_rev += 1;

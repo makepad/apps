@@ -14,6 +14,9 @@
 
 use crate::api::*;
 use crate::print::trays::DrawFabChip;
+use crate::ui::review_strip::ReviewStrip;
+use fab_elec_view::snapshot::{ElecLive, ProposalId, ProposalView};
+use std::sync::{Arc, Weak};
 use crate::ui::device3d::FabDevice3d;
 use crate::ui::keymap::{self, ShortcutId as Key};
 use crate::ui::popover::{menu_picked, open_menu, MenuItem, MenuPlace};
@@ -25,8 +28,11 @@ use fab_elec_view::instruments::logic_view::LogicScope;
 use fab_elec_view::live::controls_strip::{ControlsStripAction, ElecControlsStrip};
 use fab_elec_view::live::views::{EditOrigin, ElecEditor, ElecOutsideEdit};
 use crate::workspaces::{ListOp, ShownBy, WorkspaceDef, WorkspaceId, Workspaces};
-use crate::ui::areas::{present, AreaId, AreaTree, DockMap, DropAt, Instance, Moving, Present, Side, WorkspaceOp, GHOST_TAB};
+#[cfg(test)]
+use crate::ui::areas::present;
+use crate::ui::areas::{ AreaId, AreaTree, DockMap, DropAt, Instance, Moving, Present, Side, WorkspaceOp, GHOST_TAB};
 use crate::ui::editors::{Editor, MENU};
+use crate::ui::stage::{StageAction, PART_SIDE_HYST, PART_SIDE_MIN_VIEW};
 use crate::ui::elec_layouts as layouts;
 use crate::ui::area_notch::{Corner, CornerPhase, FabAreaNotches, NotchedArea, NubAction, DRAG_DISTANCE};
 use makepad_widgets_core::*;
@@ -87,8 +93,8 @@ script_mod! {
         }
     }
 
-    // A dock tab: the panel's name, dim at rest, bright with an accent
-    // underline when it is the shown one.
+    // A dock tab: the panel's name, half-way between the dim and the body ink at rest (a name to
+    // read, not a caption), bright with an accent underline when it is the shown one.
     mod.widgets.FabPanelTab = mod.widgets.TabFlat{
         closeable: false
         height: 28
@@ -96,7 +102,7 @@ script_mod! {
         margin: 0.
         draw_text +: {
             text_style: theme.font_regular{ font_size: fab.font_size_ui }
-            color: fab.color_text_dim
+            color: mix(fab.color_text_dim, fab.color_text, 0.5)
             color_hover: fab.color_text
             color_active: fab.color_text_active
         }
@@ -104,7 +110,7 @@ script_mod! {
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
                 sdf.rect(0.0, 0.0, self.rect_size.x, self.rect_size.y)
-                sdf.fill(fab.color_header.mix(fab.color_editor, self.active))
+                sdf.fill(fab.color_header.mix(fab.color_toolbar, self.active))
                 let w = self.rect_size.x - 12.0
                 sdf.box(6.0, self.rect_size.y - 2.0, w, 2.0, 0.5)
                 sdf.fill(vec4(fab.color_accent.xyz, fab.color_accent.w * self.active))
@@ -113,18 +119,17 @@ script_mod! {
         }
     }
 
+    // The dock's tab bar: its ground, and a dark line along its foot, a whole point on device
+    // pixels (the shown tab, drawn over it, stays open to its panel).
     mod.widgets.FabPanelTabBar = mod.widgets.TabBarFlat{
         height: 28
         CloseableTab := mod.widgets.FabPanelTab{closeable: true}
         PermanentTab := mod.widgets.FabPanelTab{closeable: false}
         draw_bg +: {
             pixel: fn() {
-                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
-                sdf.rect(0.0, 0.0, self.rect_size.x, self.rect_size.y)
-                sdf.fill(fab.color_header)
-                sdf.rect(0.0, self.rect_size.y - 1.0, self.rect_size.x, 1.0)
-                sdf.fill(fab.color_border)
-                return sdf.result
+                let y = self.pos.y * self.rect_size.y
+                let line = step(self.rect_size.y - 1.0, y)
+                return vec4(mix(fab.color_header.xyz, fab.color_header.xyz * 0.6, line), 1.0)
             }
         }
     }
@@ -138,12 +143,10 @@ script_mod! {
         draw_bg +: {
             color: fab.color_area
         }
-        draw_chip: mod.draw.DrawFabChip{ radius: 4.0 fill: fab.color_float ring: fab.color_float_border }
-        draw_chip_text: mod.draw.DrawText{
-            color: fab.color_text
-            text_style: theme.font_regular{ font_size: fab.font_size_ui }
-        }
-        color_chip_text: fab.color_text
+        // a drag's chip looks like the app's tooltips
+        draw_chip: mod.draw.FabTipChip{}
+        draw_chip_text: mod.draw.FabTipText{}
+        color_chip_text: #xdfe6ec
         color_chip_warn: fab.color_warning
         main := View{
             a11y: {role: "group" label: "Workspace"}
@@ -177,19 +180,25 @@ script_mod! {
                 keep := mod.widgets.FabButton{text: "Keep" height: 22 a11y: {label: "Keep this layout"}}
                 back := mod.widgets.FabButton{text: "Back" height: 22 a11y: {label: "Back to your workspace"}}
             }
+            review_area := ScrollYView{
+                visible: false width: Fill height: Fit{max: FitBound.Rel{base: Base.Full factor: 0.5}}
+                flow: Down
+                review := mod.widgets.ReviewStrip{}
+            }
             dock := Dock{
                 width: Fill
                 height: Fill
                 padding: Inset{left: 0 top: 0 right: 0 bottom: 0}
-                // the bar leaves room at its left end for its area's nub (`FabAreaNotches`)
-                tab_bar: mod.widgets.FabPanelTabBar{ margin: Inset{left: 38} }
+                // the bar holds only the area's tabs: the area's nub is in its editor's toolbar
+                // (`FabEditorBar`) or corner (`FabAreaNotches`)
+                tab_bar: mod.widgets.FabPanelTabBar{}
                 round_corner +: { border_radius: 0. }
                 // one-editor areas show no tab bar and still take a drag's drop
                 drop_on_hidden_tab_bars: true
                 // Every pane edge is a sash: a hairline, lit after a short rest of the pointer.
                 splitter: mod.widgets.Sash{
                     size: fab.splitter_size
-                    // The left column is never narrower than its tabs (Plates, Parts, Features and
+                    // The left column is never narrower than its tabs (Plates, Parts and
                     // the Slice view's): the floor of a side-by-side split's first pane.
                     min_vertical: #(FIRST_PANE_WIDTH)
                     max_vertical: #(SECOND_PANE_FLOOR)
@@ -228,27 +237,18 @@ script_mod! {
                 Viewport := FabStage{}
                 Device := FabDevice3d{}
                 Plates := FabPlatesPanel{}
-                Journal := FabJournalPanel{}
                 Parts := FabPartsPanel{}
                 Part := FabPartPanel{}
                 Slicer := FabSlicerPanel{}
                 Overrides := FabOverridesPanel{}
-                TestPrints := FabTestPrintsPanel{}
                 Strength := FabStrengthPanel{}
-                Parameters := FabParametersPanel{}
                 Library := FabLibraryPanel{}
                 Checks := FabChecksPanel{}
                 Requirements := FabRequirementsPanel{}
                 Bom := FabBomPanel{}
                 BoardControls := FabBoardControlsPanel{}
-                Paint := FabPaintPanel{}
-                Jobs := FabJobsPanel{}
-                Performance := FabPerfPanel{}
                 ModelSources := FabModelSources{}
-                Settings := FabSettingsPanel{}
                 Printer := FabPrinterPanel{}
-                Calibrate := FabCalibratePanel{}
-                Camera := FabCameraPanel{}
                 Mechanics := FabMechanicsPanel{}
                 Features := FabFeaturesPanel{}
                 Steps := FabStepsPanel{}
@@ -523,6 +523,12 @@ script_mod! {
                                 }
                             }
                             mod.widgets.FabToolSep{ width: Fill margin: Inset{top: 3 bottom: 3} }
+                            a_blocks_tip := FabTip{ place: TipPlace.Right text: "Blocks mode"
+                                a_blocks := mod.widgets.FabIconCheck{ a11y: {label: "Blocks mode"} width: 32 height: 32 padding: Inset{left: 8 right: 8 top: 8 bottom: 8} draw_icon +: {svg: crate_resource("self://resources/icons/area_schematic.svg")} }
+                            }
+                            a_arch_tip := FabTip{ place: TipPlace.Right text: "Draft architecture"
+                                a_arch := StripAct{ a11y: {label: "Draft architecture"} draw_icon +: {svg: crate_resource("self://resources/icons/spark.svg")} }
+                            }
                             FabTip{ place: TipPlace.Right text: "Place a part (A): opens the Library with the cursor in its search"
                                 a_place := StripAct{ a11y: {label: "Place part"} draw_icon +: { svg: crate_resource("self://resources/icons/add.svg") } }
                             }
@@ -654,6 +660,8 @@ script_mod! {
         // bar's left end (a layer of the shell, so the workspace's flow never moves it; it takes
         // presses before the dock).
         area_nubs := mod.widgets.FabAreaNotches{}
+        // the printer camera floating over the window (the Camera panel's Floating)
+        camera_float := mod.widgets.FabCameraFloat{}
         keymap_help := FabKeymapHelp{}
         about := FabAbout{}
         command_palette := FabCommandPalette{}
@@ -670,6 +678,8 @@ const RECORDER_H: f64 = 55.0;
 
 /// The owner id of an area's menu, and its rows past the editors.
 const AREA_MENU: LiveId = live_id!(area_menu);
+/// The owner id of a tab bar's new-tab menu (the editors, by group).
+const ADD_MENU: LiveId = live_id!(area_add_menu);
 const TOOLS: LiveId = live_id!(area_tools);
 const SPLIT_RIGHT: LiveId = live_id!(area_split_right);
 const SPLIT_DOWN: LiveId = live_id!(area_split_down);
@@ -688,6 +698,60 @@ const COMPACT: f64 = 520.0;
 const FIRST_PANE_WIDTH: f64 = 216.0;
 const FIRST_PANE_HEIGHT: f64 = 28.0;
 const SECOND_PANE_FLOOR: f64 = 50.0;
+
+/// The sash width in Fab's Dock theme.
+const DOCK_SPLITTER_W: f64 = 3.0;
+
+/// First visible stack with the lowest rank. Walks the tree without cloning its stacks.
+fn preferred_area(tree: &AreaTree, alone: Option<AreaId>,
+                  rank: &impl Fn(AreaId, &[Instance], usize) -> u8) -> Option<(u8, AreaId)> {
+    match tree {
+        AreaTree::Area { id, tabs, selected } => {
+            alone.is_none_or(|a| a == *id).then(|| (rank(*id, tabs, *selected), *id))
+        }
+        AreaTree::Split { a, b, .. } => {
+            let left = preferred_area(a, alone, rank);
+            if left.is_some_and(|(r, _)| r == 0) { return left; }
+            let right = preferred_area(b, alone, rank);
+            match (left, right) {
+                (Some((l, _)), Some((r, _))) if r < l => right,
+                _ => left.or(right),
+            }
+        }
+    }
+}
+
+fn part_host_area(tree: &AreaTree, alone: Option<AreaId>) -> Option<AreaId> {
+    preferred_area(tree, alone, &|_, tabs, selected| {
+        if tabs.iter().any(|i| i.editor == Editor::Parts) { 0 }
+        else if tabs.iter().any(|i| i.editor == Editor::Plates) { 1 }
+        else if tabs.get(selected).is_some_and(|i| i.editor != Editor::Viewport) { 2 }
+        else { 3 }
+    }).map(|(_, id)| id)
+}
+
+struct PartPlacement {
+    offered: bool,
+    want_tab: bool,
+    host: Option<AreaId>,
+    forward: bool,
+    open_sidebar: bool,
+}
+
+fn part_placement(tree: &AreaTree, width: f64, narrow: bool, alone: Option<AreaId>,
+                  mode: Option<PlateMode>, test_mode: bool, page: Option<Editor>,
+                  was_offered: bool, was_side_shown: bool, was_part_front: bool) -> PartPlacement {
+    let design = mode == Some(PlateMode::Design) && page.is_none()
+        && !tree.any_instance(&|i| i.editor == Editor::Part);
+    let threshold = if was_offered { PART_SIDE_MIN_VIEW - PART_SIDE_HYST } else { PART_SIDE_MIN_VIEW };
+    let offered = design && !test_mode && tree.lead_plate_area(alone).and_then(|area| {
+        tree.area_width(area, width, narrow, alone, DOCK_SPLITTER_W, (FIRST_PANE_WIDTH, SECOND_PANE_FLOOR))
+    }).is_some_and(|w| w >= threshold);
+    let want_tab = design && !offered;
+    let host = if want_tab { part_host_area(tree, alone) } else { None };
+    PartPlacement { offered, want_tab, host, forward: want_tab && was_side_shown,
+        open_sidebar: offered && was_part_front }
+}
 
 /// Which panels a node map shows.
 #[cfg(test)]
@@ -820,9 +884,6 @@ pub struct FabShell {
     /// The Board pane and unit that opened the Arrange menu.
     #[rust]
     arrange_from: Option<(WidgetUid, fab_elec_core::BoardId)>,
-    /// Whether the shell has enabled the frame monitor for the Performance editor.
-    #[rust]
-    perf_shown: bool,
     /// The editor shown alone over the workspace ([`crate::api::UiState::page`]), as laid out.
     #[rust]
     page: Option<Editor>,
@@ -876,6 +937,9 @@ pub struct FabShell {
     /// The area whose menu is open.
     #[rust]
     area_menu: Option<AreaId>,
+    /// The area whose new-tab menu is open.
+    #[rust]
+    add_menu: Option<AreaId>,
     /// The dock's shown editors changed since the state last heard ([`Self::publish_screen`]).
     #[rust]
     screen_stale: bool,
@@ -888,6 +952,12 @@ pub struct FabShell {
     /// The temporary layout's strip as last synced: its words and whether the AI opened it.
     #[rust]
     temp_strip: Option<(String, bool)>,
+    #[rust]
+    review_elec: bool,
+    #[rust]
+    review_proposals: Option<Weak<Vec<Arc<ProposalView>>>>,
+    #[rust]
+    review_notice: Option<Arc<str>>,
     /// At a phone's width, an editor asked for that no area held yet: the area its Reveal puts
     /// it in becomes the one in use.
     #[rust]
@@ -907,7 +977,13 @@ pub struct FabShell {
     /// The mode's editor that came forward when its mode came on, until another tab of its
     /// stack is pressed.
     #[rust]
-    extra_front: Option<Editor>,
+    extra_front: Vec<(AreaId, Editor)>,
+    #[rust]
+    part_side_offered: bool,
+    #[rust]
+    part_tab_shown: bool,
+    #[rust]
+    part_host: Option<AreaId>,
     /// View › Experimental's Arm and Scan, as the area menu offers their editors.
     #[rust]
     experimental: (bool, bool),
@@ -1268,17 +1344,32 @@ impl FabShell {
     }
 
     /// The modes' editors as the stacks show them: Slice beside the parts while the slice is
-    /// on, Force beside the part while the forces show, each in front from when its mode came on
+    /// on, Force beside the slicer while the forces show, each in front from when its mode came on
     /// until another tab of its stack is pressed.
-    fn mode_extras(&self) -> Vec<(Editor, Editor, bool)> {
+    fn mode_extras(&self, tree: &AreaTree) -> Vec<(Editor, Editor, bool)> {
         let mut out = Vec::new();
-        if self.slice_shown {
-            out.push((Editor::Parts, Editor::Slice, self.extra_front == Some(Editor::Slice)));
-        }
-        if self.force_shown {
-            out.push((Editor::Part, Editor::Force, self.extra_front == Some(Editor::Force)));
+        for (shown, beside, editor) in [(self.slice_shown, Editor::Parts, Editor::Slice),
+                                        (self.force_shown, Editor::Slicer, Editor::Force)] {
+            if shown {
+                let forward = tree.showing(beside).is_some_and(|area| self.extra_front.contains(&(area, editor)));
+                out.push((beside, editor, forward));
+            }
         }
         out
+    }
+
+    fn front_extra(&mut self, area: AreaId, editor: Editor) {
+        self.extra_front.retain(|(a, e)| *a != area && *e != editor);
+        self.extra_front.push((area, editor));
+    }
+
+    fn mode_changed(&mut self, tree: &AreaTree, beside: Editor, editor: Editor, on: bool) {
+        self.extra_front.retain(|(_, e)| *e != editor);
+        if on && !tree.any_instance(&|i| i.editor == editor) {
+            if let Some(area) = tree.showing(beside) {
+                self.front_extra(area, editor);
+            }
+        }
     }
 
     /// `tree` as the dock shows it now (the modes' editors, the window's width, the area
@@ -1287,26 +1378,146 @@ impl FabShell {
         self.repeat_scopes.extend(tree.instances().into_iter().filter_map(|(_, i)| {
             (i.editor == Editor::Scope && i.n != 0).then_some(i.n)
         }));
-        let extra = self.mode_extras();
+        let extra = self.mode_extras(tree);
         let narrow = (self.narrow && self.width > 0.0).then_some(self.width);
-        present(tree, &Present { extra: &extra, ghost, narrow, maximized: self.alone(tree), page: self.page })
+        let part = self.part_host.map(|area| (area, Editor::Part, self.extra_front.contains(&(area, Editor::Part))));
+        Present { extra: &extra, ghost, narrow, maximized: self.alone(tree), page: self.page }.with_area_extra(tree, part)
     }
 
     /// The area shown alone: at a phone's width the one in use (the last pressed or picked in
     /// Areas here, else the maximized one, else the first a view fronts, else the first), else
     /// the maximized one. O(areas).
     fn alone(&self, tree: &AreaTree) -> Option<AreaId> {
-        if !self.compact {
-            return self.maximized;
+        self.alone_for(tree, self.shown.map(|(id, _)| id), self.maximized, None)
+    }
+
+    fn alone_for(&self, tree: &AreaTree, ws: Option<WorkspaceId>, maximized: Option<AreaId>,
+                 follow: Option<Editor>) -> Option<AreaId> {
+        if !self.compact { return maximized; }
+        let pressed = follow.and_then(|e| tree.showing(e)).or_else(|| {
+            self.pressed_area.filter(|(id, _)| Some(*id) == ws).map(|(_, area)| area)
+        });
+        preferred_area(tree, None, &|id, tabs, selected| {
+            if Some(id) == pressed { 0 }
+            else if Some(id) == maximized { 1 }
+            else if tabs.get(selected).is_some_and(|i| i.editor == Editor::Viewport) { 2 }
+            else if tabs.get(selected).is_some_and(|i| i.editor.keeps_corner()) { 3 }
+            else { 4 }
+        }).map(|(_, area)| area)
+    }
+
+    /// Set placement before any layout load so the dock constructs the final tab sets once.
+    /// A width-only change uses the returned flag to edit just the existing tab bar.
+    fn update_part_placement(&mut self, state: &mut AppState, upcoming: Option<&WorkspaceDef>) -> bool {
+        let fresh = upcoming.is_some_and(|d| self.shown.is_none_or(|(id, _)| id != d.id));
+        let (tree, alone) = if let Some(d) = upcoming {
+            (&d.tree, self.alone_for(&d.tree, Some(d.id), d.maximized, self.follow))
+        } else if let Some(tree) = &self.areas {
+            (tree, self.alone(tree))
+        } else {
+            return false;
+        };
+        let was_front = self.part_host.is_some_and(|a| self.extra_front.contains(&(a, Editor::Part)));
+        let next = part_placement(tree, self.width, self.narrow, alone, state.ui.mode(), state.print.test_mode,
+            self.page, !fresh && self.part_side_offered, !fresh && state.ui.part_side_shown, !fresh && was_front);
+        self.part_side_offered = next.offered;
+        state.ui.part_side_offered = next.offered;
+        if !next.offered { state.ui.part_side_shown = false; }
+        if next.open_sidebar { state.ui.part_sidebar = true; }
+        let changed = next.want_tab != self.part_tab_shown || next.host != self.part_host;
+        if changed || fresh {
+            self.extra_front.retain(|(_, e)| *e != Editor::Part);
+            if let Some(area) = next.host.filter(|_| next.forward || (!fresh && was_front)) {
+                self.front_extra(area, Editor::Part);
+            }
         }
-        let areas = tree.areas();
-        let pressed = self.pressed_area.filter(|(ws, _)| self.shown.is_some_and(|(shown, _)| shown == *ws)).map(|(_, area)| area);
-        pressed
-            .or(self.maximized)
-            .filter(|area| areas.iter().any(|(a, _)| a == area))
-            .or_else(|| areas.iter().find(|(_, i)| i.editor.keeps_corner() && i.editor.family() == Some(Family::Plate)).map(|(a, _)| *a))
-            .or_else(|| areas.iter().find(|(_, i)| i.editor.keeps_corner()).map(|(a, _)| *a))
-            .or_else(|| areas.first().map(|(a, _)| *a))
+        self.part_host = next.host;
+        self.part_tab_shown = next.want_tab;
+        changed
+    }
+
+    /// Keep the existing tab bar and every sash alive, including the one under the pointer.
+    fn sync_part_placement(&mut self, cx: &mut Cx, state: &mut AppState) {
+        if !self.update_part_placement(state, None) { return; }
+        let Some(tree) = &self.areas else { return };
+        let dock = self.view.dock(cx, ids!(main.dock));
+        let part = Editor::Part.tab();
+        if let Some(set) = self.set_of_tab(part) {
+            let area = self.area_of_set(set);
+            let underlying = area.and_then(|a| tree.instance(a));
+            if let Some(DockItem::Tabs { tabs, selected, hide_tab_bar, .. }) = self.layout.get_mut(&set) {
+                let front = tabs[*selected];
+                dock.close_tab_preserving_item(cx, part);
+                tabs.retain(|t| *t != part);
+                let restore = if front == part { underlying.map(Instance::tab) } else { Some(front) };
+                if let Some(k) = restore.and_then(|tab| tabs.iter().position(|t| *t == tab)) {
+                    *selected = k;
+                    if front == part { dock.select_tab(cx, tabs[k]); }
+                }
+                let hidden = tabs.len() == 1 && underlying.is_some_and(|i| i.editor.bare_alone());
+                if *hide_tab_bar != hidden {
+                    *hide_tab_bar = hidden;
+                    dock.set_tab_bar_hidden(cx, set, hidden);
+                }
+            }
+            self.layout.remove(&part);
+        }
+        if let Some(area) = self.part_host {
+            let set = if self.alone(tree) == Some(area) || tree.id() == area { live_id!(root) } else { area.area_live_id() };
+            if let Some(DockItem::Tabs { tabs, selected, hide_tab_bar, .. }) = self.layout.get_mut(&set) {
+                let after = tabs.iter().position(|t| *t == Editor::Parts.tab());
+                let at = after.map_or(tabs.len(), |k| k + 1);
+                let kind = Editor::Part.kind();
+                let template = live_id!(PermanentTab);
+                let name = Editor::Part.name().to_owned();
+                dock.create_tab(cx, set, part, kind, name.clone(), template, after);
+                tabs.insert(at, part);
+                if self.extra_front.contains(&(area, Editor::Part)) {
+                    *selected = at;
+                    dock.select_tab(cx, part);
+                } else if at <= *selected {
+                    *selected += 1;
+                }
+                if *hide_tab_bar {
+                    *hide_tab_bar = false;
+                    dock.set_tab_bar_hidden(cx, set, false);
+                }
+                self.layout.insert(part, DockItem::Tab { kind, name, template });
+            }
+        }
+        self.screen_stale = true;
+        self.nubs(cx);
+        dock.redraw(cx);
+    }
+
+    /// A signal can reach a layout without a viewport to invalidate. Request a draw then,
+    /// and bind changed rows only as they are drawn. Unchanged identities cost O(1).
+    fn sync_review(&mut self, cx: &mut Cx, drawing: bool) {
+        let live = cx.get_global_ref::<ElecLive>().filter(|_| self.review_elec);
+        let proposals = live.filter(|l| !l.proposals_reloading && !l.snap.proposals.is_empty()).map(|l| &l.snap.proposals);
+        let notice = live.and_then(|l| l.ended_proposals.as_ref());
+        if proposals.map(Arc::as_ptr) == self.review_proposals.as_ref().map(Weak::as_ptr)
+            && notice.map(Arc::as_ptr) == self.review_notice.as_ref().map(Arc::as_ptr) {
+            return;
+        }
+        if !drawing {
+            self.view.area().redraw(cx);
+            return;
+        }
+        let was_visible = self.review_proposals.is_some() || self.review_notice.is_some();
+        let proposals = proposals.cloned();
+        self.review_proposals = proposals.as_ref().map(Arc::downgrade);
+        self.review_notice = notice.cloned();
+        let area = self.view.view(cx, ids!(main.review_area));
+        let visible = proposals.is_some() || self.review_notice.is_some();
+        if visible != was_visible {
+            area.set_visible(cx, visible);
+            self.view.area().redraw(cx);
+        }
+        let widget = area.widget(cx, ids!(review));
+        if let Some(mut strip) = widget.borrow_mut::<ReviewStrip>() {
+            strip.sync(cx, proposals.as_ref().map_or(&[], |p| p.as_slice()), self.review_notice.clone());
+        };
     }
 
     /// The temporary layout's strip shown with `strip`'s words (the spark in the AI's colour when
@@ -1353,6 +1564,7 @@ impl FabShell {
             self.pressed_area = Some((def.id, area));
         }
         self.areas = Some(def.tree.clone());
+        self.review_elec = self.shows_elec();
         let map = self.present_now(&def.tree, &[]);
         self.apply_layout(cx, map);
     }
@@ -1484,7 +1696,8 @@ impl FabShell {
         }
         let Some(tree) = &self.areas else { return };
         let bench = tree.showing(Editor::Bench).is_some();
-        let strip = body.widget(cx, ids!(controls));
+        // The tab's own header strip, its direct child: the recorder below it has `controls` too.
+        let strip = body.child(id!(controls));
         let Some(mut strip) = strip.borrow_mut::<ElecControlsStrip>() else { return };
         strip.set_hidden(cx, bench);
         let Some(area) = tree.showing(Editor::Transport) else { return };
@@ -1574,13 +1787,17 @@ impl FabShell {
         let dock = self.view.dock(cx, ids!(main.dock));
         // a page over the workspace has Back, not an area's nub
         let layout = if self.page.is_some() { &DockMap::new() } else { &self.layout };
+        // a tab may close where its area has another, or there is another area ("Close tab")
+        let area_count = layout.values().filter(|item| matches!(item, DockItem::Tabs { .. })).count();
         let mut areas: Vec<(LiveId, NotchedArea)> = layout.iter().filter_map(|(set, item)| match item {
             DockItem::Tabs { tabs, selected, hide_tab_bar, .. } => {
                 let tab = *tabs.get(*selected)?;
                 match layout.get(&tab) {
                     Some(DockItem::Tab { kind, .. }) if tab != GHOST_TAB => {
                         let strip = self.plate_strip && *kind == Editor::Viewport.kind();
-                        Some((*set, NotchedArea { tab, kind: *kind, bar: !hide_tab_bar, strip }))
+                        let closable = (tabs.len() > 1 || area_count > 1) && !self.is_transient_tab(tab);
+                        let last = tabs.last().copied().filter(|_| !hide_tab_bar);
+                        Some((*set, NotchedArea { tab, kind: *kind, bar: !hide_tab_bar, strip, closable, last }))
                     }
                     _ => None,
                 }
@@ -1644,10 +1861,32 @@ impl FabShell {
         if !footer.is_empty() {
             footer.push(MenuItem::sep());
         }
-        footer.push(MenuItem::new(CLOSE_TAB, "Close tab").enabled_if(tabs.len() > 1 || areas > 1));
+        footer.push(MenuItem::new(CLOSE_TAB, "Close tab").enabled_if((tabs.len() > 1 || areas > 1) && !self.is_transient_tab(tab)));
         footer.push(MenuItem::new(CLOSE_AREA, "Close area").enabled_if(areas > 1));
         self.area_menu = Some(area);
         crate::ui::popover::open_menu_columns(cx, AREA_MENU, columns, footer, anchor, MenuPlace::Below);
+    }
+
+    /// A tab bar's new-tab menu: every editor the area menu offers, by its groups; those the
+    /// area holds are marked (picking one brings it forward).
+    fn open_add_menu(&mut self, cx: &mut Cx, tab: LiveId, anchor: Rect) {
+        let Some(area) = self.area_of_shown_tab(tab) else { return };
+        let Some(tree) = &self.areas else { return };
+        let Some((tabs, _)) = tree.stack_of(area) else { return };
+        let (arm, scan) = self.experimental;
+        let offered = |e: &Editor| match e.family() {
+            Some(Family::Arm) => arm,
+            Some(Family::Scan) => scan,
+            _ => true,
+        };
+        let columns: Vec<(String, Vec<MenuItem>)> = MENU.iter().filter_map(|(heading, editors)| {
+            let rows: Vec<_> = editors.iter().filter(|e| offered(e))
+                .map(|e| MenuItem::new(e.tab(), e.title()).current(tabs.iter().any(|i| i.editor == *e)))
+                .collect();
+            (!rows.is_empty()).then(|| ((*heading).to_owned(), rows))
+        }).collect();
+        self.add_menu = Some(area);
+        crate::ui::popover::open_menu_columns(cx, ADD_MENU, columns, Vec::new(), anchor, MenuPlace::Below);
     }
 
     /// A row of an area menu picked.
@@ -1693,6 +1932,11 @@ impl FabShell {
         cx.action(ShellAction::EditAreas(op));
     }
 
+    fn is_transient_tab(&self, tab: LiveId) -> bool {
+        [Editor::Part, Editor::Slice, Editor::Force].into_iter().any(|e| e.tab() == tab)
+            && self.areas.as_ref().is_some_and(|tree| !tree.any_instance(&|i| i.tab() == tab))
+    }
+
     /// A tab pressed: it is in front of its area (the tree keeps it, the file once the hand lets
     /// go); a mode's editor stays in front until another tab of its stack is pressed.
     fn tab_pressed(&mut self, cx: &mut Cx, tab: LiveId) {
@@ -1703,22 +1947,20 @@ impl FabShell {
                 }
             }
         }
-        let extra = [Editor::Slice, Editor::Force].into_iter().find(|e| e.tab() == tab && self.mode_extras().iter().any(|(_, x, _)| x == e));
-        match extra {
-            Some(editor) => self.extra_front = Some(editor),
-            None => {
-                let held = self.areas.as_ref().and_then(|tree| Some((tree.area_of_tab(tab)?, tree.instance_of_tab(tab)?)));
-                if let Some((area, instance)) = held {
-                    if self.extra_front.is_some_and(|e| self.area_of_shown_tab(e.tab()) == Some(area)) {
-                        self.extra_front = None;
-                    }
+        if let Some(area) = self.area_of_shown_tab(tab) {
+            self.extra_front.retain(|(a, _)| *a != area);
+            if self.is_transient_tab(tab) {
+                if let Some(editor) = [Editor::Part, Editor::Slice, Editor::Force].into_iter().find(|e| e.tab() == tab) {
+                    self.front_extra(area, editor);
+                }
+            } else if let Some(tree) = &mut self.areas {
+                if let Some(instance) = tree.instance_of_tab(tab) {
                     let op = WorkspaceOp::Select { area, instance };
-                    if self.areas.as_mut().is_some_and(|tree| tree.apply(op).is_ok()) {
-                        cx.action(ShellAction::EditAreas(op));
-                    }
+                    if tree.apply(op).is_ok() { cx.action(ShellAction::EditAreas(op)); }
                 }
             }
         }
+        self.screen_stale = true;
         self.nubs(cx);
     }
 
@@ -1744,12 +1986,46 @@ impl FabShell {
         if let Some(id) = menu_picked(actions, AREA_MENU) {
             self.area_menu_picked(cx, id, workspaces);
         }
+        // a tab bar's new-tab menu: the editor picked opens as a new tab of that area
+        if let Some(id) = menu_picked(actions, ADD_MENU) {
+            if let (Some(area), Some(editor)) = (self.add_menu.take(), Editor::all().find(|e| e.tab() == id)) {
+                cx.action(ShellAction::EditAreas(WorkspaceOp::AddTab { area, editor }));
+            }
+        }
+        // a plate view's toolbar Tools toggle: its tool rails on or off, as its area menu's Tools
+        if let Some(ws) = workspaces {
+            let dock = self.view.dock(cx, ids!(main.dock));
+            let plates = self.areas.as_ref().map(|tree| tree.instances()).unwrap_or_default();
+            for plate in plates.into_iter().map(|(_, i)| i).filter(|i| i.editor == Editor::Viewport) {
+                let body = dock.item(plate.tab());
+                // (the plate's View options, or Mechanics' bar's toggle)
+                let asked = actions.iter().any(|a| a.downcast_ref::<crate::ui::stage::ToolRailsAsked>().is_some_and(|t| t.0 == plate));
+                if asked || body.radio_button(cx, ids!(mechanics_ui.mech_tools)).clicked(actions) {
+                    cx.action(ShellAction::EditWorkspaces(ListOp::Region {
+                        instance: plate, tools: Some(!ws.instance_state(plate).tools), left: None,
+                    }));
+                }
+            }
+        }
         let nubs = self.view.widget(cx, ids!(area_nubs));
         let pressed = nubs.borrow::<FabAreaNotches>().and_then(|n| n.pressed(cx, actions));
         if let Some((tab, chip)) = pressed {
             self.open_area_menu(cx, tab, chip, workspaces);
         }
-        let strip = self.view.dock(cx, ids!(main.dock)).item(Editor::Transport.tab()).widget(cx, ids!(controls)).widget_uid();
+        let added = nubs.borrow::<FabAreaNotches>().and_then(|n| n.add_pressed(cx, actions));
+        if let Some((tab, button)) = added {
+            self.open_add_menu(cx, tab, button);
+        }
+        // a toolbar's close button: its area's front tab closes, as the area menu's Close tab
+        let closed = nubs.borrow::<FabAreaNotches>().and_then(|n| n.closed(cx, actions));
+        if let Some(tab) = closed {
+            if let Some(area) = self.area_of_shown_tab(tab) {
+                if let Some(instance) = self.areas.as_ref().and_then(|tree| tree.instance(area)) {
+                    cx.action(ShellAction::EditAreas(WorkspaceOp::CloseTab { area, instance }));
+                }
+            }
+        }
+        let strip = self.view.dock(cx, ids!(main.dock)).item(Editor::Transport.tab()).child(id!(controls)).widget_uid();
         if let Some(ControlsStripAction::Pressed) = actions.find_widget_action(strip).map(|a| a.cast()) {
             self.show_panel(cx, Editor::BoardControls);
         }
@@ -1760,6 +2036,9 @@ impl FabShell {
                     let split = self.areas.as_ref().and_then(|tree| tree.split_of_live_id(panel_id));
                     if let (Some(split), Some(tree)) = (split, self.areas.as_mut()) {
                         if tree.apply(WorkspaceOp::Resize { split, align }).is_ok() {
+                            if let Some(DockItem::Splitter { align: stored, .. }) = self.layout.get_mut(&panel_id) {
+                                *stored = align;
+                            }
                             cx.action(ShellAction::EditAreas(WorkspaceOp::Resize { split, align }));
                             // the nubs follow their areas' corners
                             self.view.widget(cx, ids!(area_nubs)).redraw(cx);
@@ -1775,6 +2054,7 @@ impl FabShell {
     /// A tab's drag began: what it moves, the tab (a mode's editor as its first instance). At a
     /// phone's width the drag only carries its ghost: nothing takes its drop.
     fn drag_tab(&mut self, tab: LiveId) {
+        if tab == Editor::Part.tab() && self.is_transient_tab(tab) { return; }
         let Some(tree) = &self.areas else { return };
         let instance = tree.instance_of_tab(tab).or_else(|| Editor::all().find(|e| e.tab() == tab).map(Instance::first));
         self.drag = instance.filter(|_| !self.compact).map(|i| AreaDrag::new(Moving::Tab(i), vec![i]));
@@ -1785,6 +2065,10 @@ impl FabShell {
     fn drag_area(&mut self, cx: &mut Cx, tab: LiveId) {
         if self.compact {
             return;
+        }
+        // the chip's press opened the area's menu: a drag moves the area instead
+        if let Some(mut layer) = self.view.widget(cx, ids!(menu_layer)).borrow_mut::<crate::ui::menu::FabMenuLayer>() {
+            layer.close(cx);
         }
         let Some(area) = self.area_of_shown_tab(tab) else { return };
         let Some((mut tabs, selected)) = self.areas.as_ref().and_then(|tree| tree.stack_of(area)) else { return };
@@ -2043,6 +2327,10 @@ impl FabShell {
     /// At a phone's width the area holding it becomes the one in use, or, held by none, the area
     /// its Reveal puts it in.
     pub fn show_panel(&mut self, cx: &mut Cx, panel: Editor) {
+        if panel == Editor::Part && !self.part_tab_shown {
+            if self.part_side_offered { cx.action(StageAction::PartSidebar(true)); }
+            return;
+        }
         if self.set_of_tab(panel.tab()).is_some() {
             self.view.dock(cx, ids!(main.dock)).select_tab(cx, panel.tab());
             self.screen_stale = true;
@@ -2065,15 +2353,6 @@ impl FabShell {
         }
         let from = self.pressed_area.filter(|(ws, _)| self.shown.is_some_and(|(shown, _)| shown == *ws)).map(|(_, area)| area);
         cx.action(ShellAction::EditAreas(WorkspaceOp::Reveal { editor: panel, from }));
-    }
-
-    /// Close the editor's tab when it is on screen or bring it forward. O(instances) per toggle.
-    fn toggle_editor(&mut self, cx: &mut Cx, state: &AppState, editor: Editor) {
-        let held = self.areas.as_ref().and_then(|tree| tree.instances().into_iter().find(|(_, i)| i.editor == editor));
-        match held {
-            Some((area, instance)) if state.ui.on_screen(editor) => cx.action(ShellAction::EditAreas(WorkspaceOp::CloseTab { area, instance })),
-            _ => self.show_panel(cx, editor),
-        }
     }
 
     /// Keeps the area a press lands in (a tab's, or the body's under it), for a Reveal the press
@@ -2208,6 +2487,9 @@ fn open_dropped_files(cx: &mut Cx, items: &[DragItem]) {
 #[derive(Clone, Copy, Debug)]
 pub struct ShowPanel(pub Editor);
 
+#[derive(Clone, Copy, Debug)]
+pub struct RevealProposal(pub ProposalId);
+
 /// Bring a panel of a workspace forward once that workspace's layout shows: at once when it shows
 /// now, else right after the switch (which loads its own layout first). The newest wins.
 #[derive(Clone, Copy, Debug)]
@@ -2228,6 +2510,7 @@ pub struct LightEditors(pub Vec<Editor>);
 
 impl Widget for FabShell {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if matches!(event, Event::Signal) { self.sync_review(cx, false); }
         if let Event::Actions(actions) = event {
             if self.nub_actions(cx, actions) {
                 return;
@@ -2256,6 +2539,12 @@ impl Widget for FabShell {
             self.outside_edits(cx, state, actions);
             for a in actions.iter().filter_map(|a| a.downcast_ref::<ShowPanel>()) {
                 self.show_panel(cx, a.0);
+            }
+            for reveal in actions.iter().filter_map(|a| a.downcast_ref::<RevealProposal>()) {
+                let area = self.view.view(cx, ids!(main.review_area));
+                let widget = area.widget(cx, ids!(review));
+                let y = widget.borrow_mut::<ReviewStrip>().and_then(|mut strip| strip.reveal(cx, reveal.0));
+                if let Some(y) = y { area.set_scroll_pos(cx, dvec2(0.0, y)); }
             }
             // an electronics view's ask for one of its editors
             for a in actions.iter().filter_map(|a| a.downcast_ref::<fab_elec_view::ElecPanel>()) {
@@ -2305,11 +2594,6 @@ impl Widget for FabShell {
             }
             if actions.iter().any(|a| matches!(a.downcast_ref::<ShellAction>(), Some(ShellAction::ShowPlates))) {
                 self.show_panel(cx, Editor::Plates);
-            }
-            if actions.iter().any(|a| matches!(a.downcast_ref::<ShellAction>(), Some(ShellAction::TogglePerf))) {
-                if let Some(state) = scope.data.get::<AppState>() {
-                    self.toggle_editor(cx, state, Editor::Performance);
-                }
             }
             // An electronics view's focus, plain or from its widget: the board pane answers it.
             for a in actions.iter() {
@@ -2369,25 +2653,21 @@ impl Widget for FabShell {
                 self.cameras_frame = Some(cx.drawing_id());
             }
             let current = state.ui.workspaces.current();
-            // the modes' editors come and go in the stacks beside the parts and the part
+            if self.shown.is_none_or(|(id, _)| id != current.id) { self.extra_front.clear(); }
+            // the modes' editors come and go beside Parts and Slicer
             let slice = state.print.play.active;
             if self.slice_shown != slice {
                 self.slice_shown = slice;
-                self.extra_front = if slice { Some(Editor::Slice) } else { self.extra_front.filter(|e| *e != Editor::Slice) };
+                self.mode_changed(&current.tree, Editor::Parts, Editor::Slice, slice);
                 relay = true;
             }
             let force = state.force_shown();
             if self.force_shown != force {
                 self.force_shown = force;
-                self.extra_front = if force { Some(Editor::Force) } else { self.extra_front.filter(|e| *e != Editor::Force) };
+                self.mode_changed(&current.tree, Editor::Slicer, Editor::Force, force);
                 relay = true;
             }
             self.experimental = (state.ui.arm_shown, state.ui.scan_shown);
-            let perf = state.ui.on_screen(Editor::Performance);
-            if self.perf_shown != perf {
-                self.perf_shown = perf;
-                cx.perf_monitor.set_enabled(perf);
-            }
             // the temporary layout's strip comes, goes or changes its words: O(1) per draw
             let temp = state.ui.workspaces.temp.as_ref().filter(|t| t.def.id == state.ui.workspaces.current).map(|t| match t.by {
                 ShownBy::Ai => (format!("Shown by the AI: {}", t.def.name), true),
@@ -2421,6 +2701,13 @@ impl Widget for FabShell {
                 self.compact = compact;
                 self.narrow = narrow;
                 relay = true;
+            }
+        }
+        if let Some(state) = scope.data.get_mut::<AppState>() {
+            if relay || want_ws.is_some() {
+                self.update_part_placement(state, want_ws.as_ref());
+            } else {
+                self.sync_part_placement(cx, state);
             }
         }
         if let Some(def) = want_ws {
@@ -2459,6 +2746,7 @@ impl Widget for FabShell {
         if self.corner.is_none() {
             self.fit_transport(cx);
         }
+        self.sync_review(cx, true);
         let step = self.view.draw_walk(cx, scope, walk);
         if step.is_step() {
             return step;
@@ -2532,6 +2820,17 @@ impl FabShell {
             }
         }
         if screen != state.ui.screen {
+            // A Product view the dock stops showing (its tab behind another) parks, as one a
+            // layout leaves off screen does: an unparked one would keep the shared layers (the
+            // traced field parts) on the device's poses, so a part dragged on the plate would show
+            // where it was until the drop.
+            let device = 1u64 << Editor::Device as u64;
+            if state.ui.screen & device != 0 && screen & device == 0 {
+                for &(panel, park) in ELECTRONICS_PARK {
+                    let body = dock.borrow_mut().and_then(|mut dock| dock.items().get(&panel.tab()).map(|(_, body)| body.clone()));
+                    if let Some(body) = body { park(&body, cx); }
+                }
+            }
             state.ui.screen = screen;
             dock.redraw(cx);
         }
@@ -2661,6 +2960,141 @@ mod tests {
         shell.sync_with(cx, state);
     }
 
+    /// The dock and the shell must agree even on tab order, selection and hidden bars.
+    fn check_dock(cx: &mut Cx, shell: &FabShell) {
+        use makepad_widgets_core::makepad_micro_serde::SerRon;
+        let dock = shell.view.dock(cx, ids!(main.dock)).clone_state().unwrap();
+        assert_eq!(dock.len(), shell.layout.len());
+        for (id, item) in &shell.layout {
+            assert_eq!(dock[id].serialize_ron(), item.serialize_ron(), "dock item {id}");
+        }
+    }
+
+    fn front_of(shell: &FabShell, editor: Editor) -> LiveId {
+        let set = shell.set_of_tab(editor.tab()).expect("editor has a tab set");
+        let DockItem::Tabs { tabs, selected, .. } = &shell.layout[&set] else { unreachable!() };
+        tabs[*selected]
+    }
+
+    #[test]
+    fn part_editor_switches_between_sidebar_and_tab_with_hysteresis_and_exclusion() {
+        let (mut cx, mut shell, mut state, _) = electronics_shell();
+        show(&mut cx, &mut shell, &mut state, Origin::Design);
+        let saved = state.ui.workspaces.to_ron();
+        for (width, offered, was_shown, front) in [
+            (1594.0, false, false, Editor::Parts), (1654.0, true, false, Editor::Parts),
+            (1644.0, true, false, Editor::Parts), (1634.0, false, false, Editor::Parts),
+            (1654.0, true, false, Editor::Parts), (1634.0, false, true, Editor::Part),
+        ] {
+            shell.width = width;
+            state.ui.part_side_shown = was_shown;
+            shell.sync_part_placement(&mut cx, &mut state);
+            assert_eq!(state.ui.part_side_offered, offered, "shell width {width}");
+            assert_eq!(shell.layout.contains_key(&Editor::Part.tab()), !offered);
+            assert_eq!(front_of(&shell, Editor::Parts), front.tab());
+            if !offered {
+                let set = shell.set_of_tab(Editor::Parts.tab()).unwrap();
+                assert!(matches!(&shell.layout[&set], DockItem::Tabs { tabs, .. }
+                    if tabs == &[Editor::Plates.tab(), Editor::Parts.tab(), Editor::Part.tab()]));
+                assert!(!state.ui.part_side_shown);
+            }
+            check_dock(&mut cx, &shell);
+            assert_eq!(state.ui.workspaces.to_ron(), saved, "placement never edits the saved layout");
+            assert!(!saved.split(|c: char| !c.is_alphanumeric()).any(|word| word == "Part"));
+            assert!(!state.ui.workspaces.unsaved);
+        }
+    }
+
+    #[test]
+    fn part_tab_fallback_covers_test_prints_compact_and_custom_layout_without_parts() {
+        let (mut cx, mut shell, mut state, _) = electronics_shell();
+        show(&mut cx, &mut shell, &mut state, Origin::Design);
+        shell.width = 1920.0;
+        for tests in [false, true, false] {
+            state.print.test_mode = tests;
+            shell.sync_part_placement(&mut cx, &mut state);
+            assert_eq!(state.ui.part_side_offered, !tests);
+            assert_eq!(shell.layout.contains_key(&Editor::Part.tab()), tests);
+            if tests { assert_eq!(shell.part_host, shell.area_of_shown_tab(Editor::Parts.tab())); }
+            check_dock(&mut cx, &shell);
+        }
+        shell.width = 560.0;
+        shell.narrow = true;
+        for (tree, host) in [
+            (AreaTree::beside(AreaTree::area(Editor::Viewport), AreaTree::area(Editor::Slicer), 0.5), Editor::Slicer),
+            (AreaTree::area(Editor::Viewport), Editor::Viewport),
+        ] {
+            let mut def = state.ui.workspaces.current().clone();
+            def.tree = tree.numbered();
+            shell.update_part_placement(&mut state, Some(&def));
+            shell.show_workspace(&mut cx, &def);
+            assert_eq!(shell.part_host, def.tree.showing(host));
+            let set = shell.set_of_tab(Editor::Part.tab()).unwrap();
+            assert!(matches!(&shell.layout[&set], DockItem::Tabs { tabs, hide_tab_bar: false, .. }
+                if tabs == &[host.tab(), Editor::Part.tab()]));
+            check_dock(&mut cx, &shell);
+        }
+        shell.compact = true;
+        shell.width = 480.0;
+        let def = state.ui.workspaces.current().clone();
+        shell.update_part_placement(&mut state, Some(&def));
+        shell.show_workspace(&mut cx, &def);
+        assert!(!state.ui.part_side_offered);
+        assert_eq!(shell.set_of_tab(Editor::Part.tab()), Some(live_id!(root)));
+        for origin in [Origin::Mechanics, Origin::Monitor] {
+            show(&mut cx, &mut shell, &mut state, origin);
+            shell.sync_part_placement(&mut cx, &mut state);
+            assert!(!state.ui.part_side_offered && !shell.layout.contains_key(&Editor::Part.tab()));
+            check_dock(&mut cx, &shell);
+        }
+    }
+
+    #[test]
+    fn part_tab_and_force_extra_front_are_independent_and_transient() {
+        use crate::ui::popover::{ui_actions, FabUiAction};
+        let (mut cx, mut shell, mut state, _) = electronics_shell();
+        show(&mut cx, &mut shell, &mut state, Origin::Design);
+        shell.width = 1594.0;
+        shell.force_shown = true;
+        shell.mode_changed(&state.ui.workspaces.current().tree, Editor::Slicer, Editor::Force, true);
+        shell.relayout(&mut cx);
+        shell.sync_part_placement(&mut cx, &mut state);
+        shell.drag_tab(Editor::Part.tab());
+        assert!(shell.drag.is_none());
+        let actions = cx.capture_actions(|cx| shell.show_panel(cx, Editor::Part));
+        assert!(shell_actions(&actions).next().is_none());
+        assert_eq!(front_of(&shell, Editor::Parts), Editor::Part.tab());
+        assert_eq!(front_of(&shell, Editor::Slicer), Editor::Force.tab());
+        let menu = cx.capture_actions(|cx| shell.open_area_menu(cx, Editor::Part.tab(), Rect::default(), Some(&state.ui.workspaces)));
+        assert!(ui_actions(&menu).any(|a| matches!(a, FabUiAction::OpenMenu { owner, items, .. }
+            if *owner == AREA_MENU && items.iter().any(|row| row.id == CLOSE_TAB && !row.enabled))));
+        shell.slice_shown = true;
+        shell.mode_changed(&state.ui.workspaces.current().tree, Editor::Parts, Editor::Slice, true);
+        shell.relayout(&mut cx);
+        for editor in [Editor::Force, Editor::Slice, Editor::Part] {
+            shell.view.dock(&mut cx, ids!(main.dock)).select_tab(&mut cx, editor.tab());
+            shell.tab_pressed(&mut cx, editor.tab());
+            assert_eq!(front_of(&shell, editor), editor.tab());
+            assert_eq!(front_of(&shell, Editor::Slicer), Editor::Force.tab());
+        }
+        // Removing Part while Slice is to its right must restore the real selected tab.
+        state.ui.part_sidebar = false;
+        shell.width = 1654.0;
+        shell.sync_part_placement(&mut cx, &mut state);
+        assert!(state.ui.part_sidebar);
+        assert_eq!(front_of(&shell, Editor::Parts), Editor::Parts.tab());
+        check_dock(&mut cx, &shell);
+        let actions = cx.capture_actions(|cx| shell.show_panel(cx, Editor::Part));
+        assert!(actions.iter().any(|a| matches!(a.downcast_ref::<StageAction>(), Some(StageAction::PartSidebar(true)))));
+        assert!(shell_actions(&actions).next().is_none());
+        shell.slice_shown = false;
+        shell.mode_changed(&state.ui.workspaces.current().tree, Editor::Parts, Editor::Slice, false);
+        shell.relayout(&mut cx);
+        assert!(!shell.layout.contains_key(&Editor::Slice.tab()));
+        assert_eq!(front_of(&shell, Editor::Slicer), Editor::Force.tab());
+        check_dock(&mut cx, &shell);
+    }
+
     #[test]
     fn electronics_device_body_controls_its_leased_pane_and_kit() {
         use makepad_widgets_core::radio_button::RadioButtonAction;
@@ -2704,7 +3138,7 @@ mod tests {
         let dock = shell.view.dock(&cx, ids!(main.dock));
         let transport = dock.item(Editor::Transport.tab());
         assert!(transport.widget(&cx, ids!(recorder)).borrow::<fab_elec_view::live::transport::ElecTransport>().is_some()
-            && transport.widget(&cx, ids!(controls)).borrow::<ElecControlsStrip>().is_some(),
+            && transport.child(id!(controls)).borrow::<ElecControlsStrip>().is_some(),
             "the Transport editor holds the recorder under the controls header");
         assert!(dock.item(Editor::Circuit.tab()).widget(&cx, ids!(lib_open.library)).borrow::<fab_elec_view::library::LibraryPanel>().is_some(),
             "the Schematic's Library float holds the electronics library panel");
@@ -2980,20 +3414,19 @@ mod tests {
         let circuit = sheet.showing(Editor::Circuit).expect("the sheet");
         assert!(sheet.parent_split(circuit).map(|(split, ..)| split) == sheet.showing(Editor::Checks).and_then(|a| sheet.parent_split(a)).map(|(split, ..)| split),
             "Checks opens beside the sheet");
-        // Design without its lower stack (an old file's): no area shows Parameters, so the Part
-        // panel offers it; its press (in the Part's area) brings Parameters into the Part's
-        // stack, in front
+        // Design without its lower stack (an old file's): no area shows Overrides; asked for from
+        // the Slicer's area, it comes into the Slicer's stack, in front
         show(&mut cx, &mut shell, &mut state, Origin::Design);
-        let below = tree(&shell).showing(Editor::Parameters).expect("Design shows Parameters");
+        let below = tree(&shell).showing(Editor::Overrides).expect("Design shows Overrides");
         run(&mut cx, &mut shell, &mut state, |cx, _, _| cx.action(ShellAction::EditAreas(WorkspaceOp::Close { area: below })));
         shell.publish_screen(&mut cx, &mut state);
-        assert!(!state.ui.on_screen(Editor::Parameters) && state.ui.on_screen(Editor::Part), "no area shows Parameters: the Part panel offers it");
-        let part = tree(&shell).showing(Editor::Part).expect("the Part's area");
+        assert!(!state.ui.on_screen(Editor::Overrides) && state.ui.on_screen(Editor::Slicer), "no area shows Overrides");
+        let part = tree(&shell).showing(Editor::Slicer).expect("the Slicer's area");
         shell.pressed_area = shell.shown.map(|(ws, _)| (ws, part));
-        act(&mut cx, &mut shell, &mut state, vec![Box::new(ShowPanel(Editor::Parameters)) as Box<dyn ActionTrait>]);
+        act(&mut cx, &mut shell, &mut state, vec![Box::new(ShowPanel(Editor::Overrides)) as Box<dyn ActionTrait>]);
         shell.publish_screen(&mut cx, &mut state);
-        assert!(tree(&shell).showing(Editor::Parameters) == Some(part) && front(&tree(&shell), Editor::Part) == Some(Editor::Parameters) && state.ui.on_screen(Editor::Parameters),
-            "the press brings Parameters into the Part's stack, in front");
+        assert!(tree(&shell).showing(Editor::Overrides) == Some(part) && front(&tree(&shell), Editor::Slicer) == Some(Editor::Overrides) && state.ui.on_screen(Editor::Overrides),
+            "the press brings Overrides into the Slicer's stack, in front");
 
         // a Plate the dock holds but does not show is published hidden and lets go of the scene
         // host, which the Plate on screen takes with the shared studio work; it stays unparked
@@ -3094,6 +3527,37 @@ mod tests {
 
     /// The area menu's edits: another Scope opens beside one, an editor on screen swaps places, a
     /// split shows the first editor not on screen, and the last area does not close.
+    #[test]
+    fn the_new_tab_button_adds_a_tab_brings_one_forward_or_moves_a_lone_editor() {
+        use crate::ui::areas::OpError;
+        let mut tree = layouts::defaults()[1].1.clone();
+        let area_of = |t: &AreaTree, e: Editor| t.showing(e).expect("the editor has an area");
+        let scope_area = area_of(&tree, Editor::Scope);
+        let stack = |t: &AreaTree, a| t.stack_of(a).map(|(tabs, k)| (tabs.to_vec(), k)).expect("the area's stack");
+        let (before, _) = stack(&tree, scope_area);
+        // a repeatable editor the area shows: another instance, as a new tab in front
+        tree.apply(WorkspaceOp::AddTab { area: scope_area, editor: Editor::Scope }).expect("a second Scope opens");
+        let (tabs, k) = stack(&tree, scope_area);
+        assert!(tabs.len() == before.len() + 1 && tabs[k].editor == Editor::Scope && tabs[k].tab() != Editor::Scope.tab(), "another Scope, in front: {tabs:?}");
+        let before = tabs;
+        // a lone editor another area holds moves here, as a new tab in front
+        let board_area = area_of(&tree, Editor::Board);
+        tree.apply(WorkspaceOp::AddTab { area: scope_area, editor: Editor::Board }).expect("the Board moves here");
+        let (tabs, k) = stack(&tree, scope_area);
+        assert!(tabs.len() == before.len() + 1 && tabs[k].editor == Editor::Board, "the Board is a new tab, in front: {tabs:?}");
+        assert!(tree.area_of_tab(Editor::Board.tab()) != Some(board_area), "it left the area it was in");
+        // one no area holds: a new tab of it, in front
+        tree.apply(WorkspaceOp::AddTab { area: scope_area, editor: Editor::Slice }).expect("Slice opens here");
+        let (tabs, k) = stack(&tree, scope_area);
+        assert_eq!(tabs[k].editor, Editor::Slice, "the new tab is in front");
+        assert_eq!(tabs.last().map(|i| i.editor), Some(Editor::Slice), "after the others");
+        // one the area holds, behind: it comes forward, no tab added
+        tree.apply(WorkspaceOp::AddTab { area: scope_area, editor: Editor::Board }).expect("the Board comes forward");
+        let (again, k) = stack(&tree, scope_area);
+        assert!(again.len() == tabs.len() && again[k].editor == Editor::Board, "brought forward, not added");
+        assert_eq!(tree.apply(WorkspaceOp::AddTab { area: scope_area, editor: Editor::Board }).err(), Some(OpError::Unchanged), "already in front");
+    }
+
     #[test]
     fn area_menu_edits_put_swap_split_and_close() {
         use crate::ui::areas::OpError;

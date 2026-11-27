@@ -12,7 +12,7 @@ script_mod! {
         line: #x2f343a      text: #xe3e5e8      muted: #x9aa2ab
         faint: #x6d757e     accent: #x8fb0c6    onaccent: #x10171c
         textsel: #x34608c   textsel_inactive: #x40464e
-        good: #x8fb59a      warn: #xcdb06a
+        good: #x8fb59a      warn: #xcdb06a      danger: #xd98b80
         you: #x8fb0c6       yourai: #xa9c3b5    peer: #xc8a07c
         peerai: #xb5a3c2    onseat: #x14171a    onpeer: #x1c140c
     }
@@ -88,4 +88,26 @@ script_mod! {
             color_2_disabled: palette.textsel_inactive
         }
     }
+    // Town's drop-down menus wear the app's look: the card and its line, the card radius, Town's
+    // text and its selection colour for the row under the pointer. The chat's context menu
+    // (`MenuLayer` in main.rs) uses the same colours. Every drop-down Town makes takes these.
+    mod.widgets.PopupMenuItem = mod.widgets.PopupMenuItem{
+        draw_text +: {
+            color: palette.text color_hover: palette.text color_active: palette.text
+            color_disabled: palette.faint
+            text_style: theme.font_body_m
+        }
+        draw_bg +: {
+            color: #0000 color_hover: palette.sel color_active: palette.sel color_disabled: #0000
+            border_color: #0000 border_color_hover: #0000 border_color_active: #0000 border_color_disabled: #0000
+            border_color_2_hover: #0000 border_color_2_active: #0000 border_color_2_disabled: #0000
+            border_radius: 4.0
+            mark_color_active: palette.accent mark_color_disabled: palette.faint
+        }
+    }
+    mod.widgets.PopupMenu = mod.widgets.PopupMenu{
+        menu_item: mod.widgets.PopupMenuItem{}
+        draw_bg +: {color: palette.card border_color: palette.line border_size: 1.0 border_radius: 6.0}
+    }
+    mod.widgets.DropDown = mod.widgets.DropDown{popup_menu: mod.widgets.PopupMenu{}}
 }

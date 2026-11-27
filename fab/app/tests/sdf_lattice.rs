@@ -11,6 +11,8 @@
 //!
 //! HAL offscreen (`MAKEPAD_HAL_BACKEND=offscreen`), native GPU, no window.
 
+#[path = "common/render_mode.rs"]
+mod render_mode;
 #[path = "common/wait.rs"]
 mod idle_wait;
 use idle_wait::wait_poll;
@@ -136,7 +138,7 @@ fn a_kernel_part_levels_its_detail_and_its_handle_drags_it_live(app: TestApp) {
     let batch = format!(r#"{{"request_id":"lattice-place","expected":{head:?},"edits":{}}}"#, Value::Str(edits.to_string()).to_json());
     let head = head_of(&text(&call(&app, "place", &batch).expect("place")));
     wait_until(&app, "the lattice drawn by the engine", || !lines(&app, from, "drawn by the engine").is_empty());
-    app.locator(Selector::id("rm_normal")).wait_checked(true);
+    render_mode::wait_shown(&app, "Normal");
 
     // Far out, the part a few pixels wide (each wheel step dollies 1.4x out; framed it is about
     // 30 px, and under a pixel no ray need land on it): few tiles. Home frames the plate: many again.
@@ -180,8 +182,7 @@ fn a_kernel_part_levels_its_detail_and_its_handle_drags_it_live(app: TestApp) {
     assert!(fails.is_empty(), "live drag: a field could not be drawn: {fails:?}");
 
     // Sliced keeps the shape handles; Move replaces them with its own grips.
-    app.locator(Selector::id("rm_slice")).wait_visible().click();
-    app.locator(Selector::id("rm_slice")).wait_checked(true);
+    render_mode::pick(&app, "Sliced");
     app.locator(Selector::id("t_select")).wait_checked(true);
     wait_until(&app, "handles in Sliced: visible shape handles in Select", || !handles(&app).is_empty());
     app.locator(Selector::id("t_move")).wait_visible().click();

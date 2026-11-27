@@ -19,14 +19,13 @@ use makepad_stage_motion3d::doc::{MediaResolver, Scene3dDoc};
 use makepad_stage_motion3d::eval::EvalCache;
 use makepad_stage_motion3d::layer::{FrameTime, Scene3dLayer};
 use makepad_stage_motion3d::scene::{NodeDef, NodeKind};
-use makepad_stage_motion3d::script::{InputValue as M3Input, MediaRef};
+use makepad_stage_motion3d::script::{Diagnostic, InputValue as M3Input, Loc, MediaRef};
 use makepad_widgets::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 pub(crate) struct Scene {
-    key: u64,
     /// What its load read (see [`LoadKey`]): it goes back to [`LOADED`]
     /// under this when it leaves.
     load: LoadKey,
@@ -58,6 +57,12 @@ const SCENE_IDLE_FRAMES: u32 = 3;
 #[derive(Default)]
 pub(crate) struct Scenes3d {
     scenes: HashMap<String, RefCell<Scene>>,
+    /// Loads this renderer submitted, by item path (its start or source line
+    /// may change while the previous load is still running).
+    jobs: HashMap<String, Vec<SceneJob>>,
+    /// Paths drawn before their document was ready in this recording.
+    waiting: HashSet<String>,
+    submit_error_logged: bool,
     /// Containers of scenes that went, their textures released, for the
     /// next scene (their passes stay in the pass tree).
     spare: Vec<RenderTarget>,
@@ -87,6 +92,11 @@ struct LoadKey {
     edit_offset: u64,
 }
 
+struct SceneJob {
+    load: Arc<LoadKey>,
+    job: FrameJob<SceneLoaded>,
+}
+
 thread_local! {
     /// Scene documents loaded and not drawing: a layer that leaves (its draw
     /// dropped, or idle) puts its document back here, and [`preload`] loads
@@ -97,11 +107,11 @@ thread_local! {
     /// inputs replaces it. A kept renderer holds only its static meshes'
     /// geometry, while the host keeps it ([`keep_geometry`]).
     static LOADED: RefCell<HashMap<(String, u32, u64), Kept>> = RefCell::new(HashMap::new());
-    /// Scenes (reload keys) whose preload failed: not tried again ahead
-    /// (their draw loads them and reports why).
-    static FAILED: RefCell<std::collections::HashSet<u64>> = RefCell::new(std::collections::HashSet::new());
-    /// Scenes (slots) loading on a worker: not asked for again meanwhile.
-    static LOADING: RefCell<std::collections::HashSet<(String, u32, u64)>> = RefCell::new(std::collections::HashSet::new());
+    /// Failures at the line and path the worker loaded.
+    static FAILED: RefCell<HashMap<LoadKey, Vec<Diagnostic>>> = RefCell::new(HashMap::new());
+    /// A preload or draw owns the slot until adoption. If a host drops its
+    /// preload or its result, a subsequent draw can claim the slot again.
+    static LOADING: RefCell<HashMap<(String, u32, u64), Weak<LoadKey>>> = RefCell::new(HashMap::new());
 }
 
 /// A kept scene document: its reload key, source id and inputs.
@@ -139,12 +149,37 @@ fn slot(key: &LoadKey) -> (String, u32, u64) {
     (key.path.clone(), key.first_line, key.edit_offset)
 }
 
+/// A load's failure, the only one its slot keeps (an edit that fails again
+/// replaces it), so a long session's failed edits do not pile up.
+fn failed(load: &LoadKey, diagnostics: Vec<Diagnostic>) {
+    FAILED.with(|f| {
+        let mut f = f.borrow_mut();
+        f.retain(|k, _| slot(k) != slot(load));
+        f.insert(load.clone(), diagnostics);
+    });
+}
+
+fn loading(key: &LoadKey) -> bool {
+    LOADING.with(|l| l.borrow().get(&slot(key)).is_some_and(|owner| owner.strong_count() != 0))
+}
+
+fn mark_loading(key: &Arc<LoadKey>) {
+    LOADING.with(|l| {
+        let mut slots = l.borrow_mut();
+        // Reclaim abandoned preloads before the slot table grows.
+        if slots.len() == slots.capacity() {
+            slots.retain(|_, owner| owner.strong_count() != 0);
+        }
+        slots.insert(slot(key), Arc::downgrade(key));
+    });
+}
+
 /// The kept document of this layer when it shows `inputs` (given to it).
 fn loaded_take(key: &LoadKey, source_id: u64, inputs: &HashMap<String, M3Input>) -> Option<Scene3dLayer> {
     LOADED.with(|l| {
         let mut l = l.borrow_mut();
         let slot = slot(key);
-        let fits = l.get_mut(&slot).is_some_and(|kept| kept.key == key.key || kept.source_id == source_id && take_inputs(&mut kept.layer, &kept.inputs, inputs));
+        let fits = l.get_mut(&slot).is_some_and(|kept| !kept.layer.models_changed() && (kept.key == key.key || kept.source_id == source_id && take_inputs(&mut kept.layer, &kept.inputs, inputs)));
         if fits {
             return l.remove(&slot).map(|kept| kept.layer);
         }
@@ -153,7 +188,7 @@ fn loaded_take(key: &LoadKey, source_id: u64, inputs: &HashMap<String, M3Input>)
 }
 
 fn loaded_has(key: &LoadKey, source_id: u64, inputs: &HashMap<String, M3Input>) -> bool {
-    LOADED.with(|l| l.borrow().get(&slot(key)).is_some_and(|kept| kept.key == key.key || kept.source_id == source_id && kept.layer.doc.takes_inputs(&kept.inputs, inputs)))
+    LOADED.with(|l| l.borrow().get(&slot(key)).is_some_and(|kept| !kept.layer.models_changed() && (kept.key == key.key || kept.source_id == source_id && kept.layer.doc.takes_inputs(&kept.inputs, inputs))))
 }
 
 /// Keep a layer's document for the next layer of its key; of its renderer
@@ -235,12 +270,6 @@ fn scene_identity(keys: &mut HashMap<String, (Arc<str>, String, u64, u64)>, path
     }
 }
 
-/// Load a scene's document (a template's modules through the document's
-/// resolver).
-fn load_scene(path: &str, request: &SceneRequest, files: &HashMap<String, Arc<Vec<u8>>>) -> Result<Scene3dLayer, Vec<makepad_stage_motion3d::script::Diagnostic>> {
-    request.load(path, &Files(files)).map(|doc| Scene3dLayer::from_doc(doc, Default::default()))
-}
-
 /// A scene document that left (with its evaluation cache): many MB of
 /// script heap, for the host to drop off the UI thread.
 pub struct SceneDoc(pub Scene3dDoc, pub EvalCache);
@@ -249,7 +278,7 @@ pub struct SceneDoc(pub Scene3dDoc, pub EvalCache);
 /// first evaluation, for a worker ([`SceneLoad::run`]); the UI thread then
 /// adopts it ([`crate::MotionDraw::adopt_scene`]).
 pub struct SceneLoad {
-    load: LoadKey,
+    load: Arc<LoadKey>,
     source_id: u64,
     shown: HashMap<String, M3Input>,
     request: SceneRequest,
@@ -260,25 +289,35 @@ pub struct SceneLoad {
 
 /// A scene loaded on a worker, for the UI thread to adopt.
 pub struct SceneLoaded {
-    load: LoadKey,
+    load: Arc<LoadKey>,
     source_id: u64,
     shown: HashMap<String, M3Input>,
-    /// The document and what its first evaluation built; None: it failed
-    /// (its draw loads it and says why).
-    doc: Option<(Scene3dDoc, EvalCache)>,
+    /// The document and its first evaluation, or its load diagnostics.
+    doc: Result<(Scene3dDoc, EvalCache), Vec<Diagnostic>>,
 }
 
 impl SceneLoad {
+    fn new(
+        load: LoadKey, source_id: u64, shown: HashMap<String, M3Input>, request: SceneRequest,
+        files: &HashMap<String, Arc<Vec<u8>>>, local_time: f64, size: [f64; 2],
+    ) -> Self {
+        Self {
+            load: Arc::new(load), source_id, shown, request, files: files.clone(),
+            input_t: local_time as f32,
+            aspect: (size[0] / size[1].max(1e-9)) as f32,
+        }
+    }
+
     /// Load the document and evaluate it once: its meshes and hulls are
     /// built into its cache and its kernels run once (their first calls are
     /// the slow ones). Off the UI thread: the document's VM is used under
-    /// its lock. The environment is not prepared here: the renderer
-    /// prepares it off the UI thread on the first draw.
+    /// its lock. The load makes the environment map outside that lock.
+    /// The renderer prepares its lighting textures on the first draw.
     pub fn run(self) -> SceneLoaded {
         let SceneLoad { load, source_id, shown, request, files, input_t, aspect } = self;
         let edit_offset = request.edit_offset;
         let signals = request.signals.clone();
-        let doc = request.load(&load.path, &Files(&files)).ok().map(|mut doc| {
+        let doc = request.load(&load.path, &Files(&files)).map(|mut doc| {
             let mut cache = EvalCache::default();
             let _ = doc.eval(&makepad_stage_motion3d::eval::EvalInput { t: input_t, aspect, audio: &Audio(&*signals), edit_offset: edit_offset as f32 }, &mut cache);
             (doc, cache)
@@ -291,10 +330,12 @@ impl SceneLoad {
 /// drawing: their loads, for workers (see [`LOADED`]); their models' files
 /// are those given with [`crate::MotionDraw::set_file`].
 pub(crate) fn scene_loads(md: &MotionDraw, frame: &makepad_motion::MotionFrame) -> Vec<SceneLoad> {
+    if md.plain {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     for (_, item) in frame.walk() {
         let ItemKind::Scene3dDoc { scene, first_line, size, local_time, edit_offset, bpm, .. } = &item.kind else { continue };
-        let Some(request) = SceneRequest::of(&item.kind) else { continue };
         let mut keys = HashMap::new();
         let (key, source_id, shown) = scene_identity(&mut keys, &item.path, scene, *bpm);
         let load = LoadKey { key, path: item.path.clone(), first_line: *first_line, edit_offset: offset_key(*edit_offset) };
@@ -302,18 +343,13 @@ pub(crate) fn scene_loads(md: &MotionDraw, frame: &makepad_motion::MotionFrame) 
             let s = s.borrow();
             s.load == load || s.load.path == load.path && s.load.first_line == load.first_line && s.load.edit_offset == load.edit_offset && s.source_id == source_id && s.layer.as_ref().is_some_and(|l| l.doc.takes_inputs(&s.inputs, &shown))
         });
-        if loaded_has(&load, source_id, &shown) || drawing || FAILED.with(|f| f.borrow().contains(&key)) || !LOADING.with(|l| l.borrow_mut().insert(slot(&load))) {
+        if loaded_has(&load, source_id, &shown) || drawing || FAILED.with(|f| f.borrow().contains_key(&load)) || loading(&load) {
             continue;
         }
-        out.push(SceneLoad {
-            load,
-            source_id,
-            shown,
-            request,
-            files: md.scenes3d.files.clone(),
-            input_t: *local_time as f32,
-            aspect: (size[0] / size[1].max(1e-9)) as f32,
-        });
+        let Some(request) = SceneRequest::of(&item.kind) else { continue };
+        let job = SceneLoad::new(load, source_id, shown, request, &md.scenes3d.files, *local_time, *size);
+        mark_loading(&job.load);
+        out.push(job);
     }
     out
 }
@@ -326,11 +362,12 @@ pub(crate) fn scene_loads(md: &MotionDraw, frame: &makepad_motion::MotionFrame) 
 pub(crate) fn adopt_loaded(loaded: SceneLoaded) -> Option<Box<dyn FnOnce() + Send>> {
     let SceneLoaded { load, source_id, shown, doc } = loaded;
     LOADING.with(|l| l.borrow_mut().remove(&slot(&load)));
-    let Some((doc, cache)) = doc else {
-        FAILED.with(|f| f.borrow_mut().insert(load.key));
-        return None;
-    };
-    loaded_put(load, source_id, shown, Scene3dLayer::from_doc(doc, cache));
+    // A slot's older failure goes with any newer result.
+    FAILED.with(|f| f.borrow_mut().retain(|k, _| slot(k) != slot(&load)));
+    match doc {
+        Ok((doc, cache)) => loaded_put((*load).clone(), source_id, shown, Scene3dLayer::from_doc(doc, cache)),
+        Err(diagnostics) => failed(&load, diagnostics),
+    }
     None
 }
 
@@ -338,6 +375,10 @@ pub(crate) fn adopt_loaded(loaded: SceneLoaded) -> Option<Box<dyn FnOnce() + Sen
 /// renderers go (the platform retires the dropped handles).
 impl Drop for Scenes3d {
     fn drop(&mut self) {
+        for SceneJob { load, job } in self.jobs.values().flatten() {
+            job.cancel();
+            LOADING.with(|l| l.borrow_mut().remove(&slot(load)));
+        }
         for (_, scene) in self.scenes.drain() {
             let scene = scene.into_inner();
             if let Some(layer) = scene.layer {
@@ -386,6 +427,7 @@ impl AudioSource for Audio<'_> {
 
 impl Scenes3d {
     pub fn begin_frame(&mut self, cx: &mut Cx) {
+        self.waiting.clear();
         let drawn: HashSet<String> = self.drawn.drain(..).collect();
         let mut gone = Vec::new();
         for (path, scene) in self.scenes.iter_mut() {
@@ -401,6 +443,32 @@ impl Scenes3d {
         }
         for path in gone {
             self.remove(cx, &path);
+        }
+    }
+
+    pub(super) fn waiting_document(&self) -> Option<&str> {
+        self.waiting.iter().next().map(String::as_str)
+    }
+
+    fn submit_load(&mut self, cx: &mut Cx, load: SceneLoad) {
+        let key = load.load.clone();
+        // Threaded pool jobs publish the result and then raise the UI signal,
+        // including when the job panics.
+        match cx.task_pool().submit_frame_job(Class::Background, move || load.run()) {
+            Ok(job) => {
+                mark_loading(&key);
+                self.jobs.entry(key.path.clone()).or_default().push(SceneJob { load: key, job });
+                #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+                cx.new_next_frame();
+            }
+            Err(error) => {
+                if !self.submit_error_logged {
+                    makepad_widgets::log!("{}: scene load could not be queued ({error}), retrying on the next draw", key.path);
+                    self.submit_error_logged = true;
+                }
+                // The retry is on the next draw: ask for one.
+                cx.redraw_all();
+            }
         }
     }
 
@@ -475,6 +543,22 @@ impl Scenes3d {
         out
     }
 
+    pub fn loading(&self) -> bool {
+        !self.jobs.is_empty()
+    }
+
+    pub(super) fn hash_progress(&self, mark: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        for path in &self.drawn {
+            let Some(scene) = self.scenes.get(path) else { continue };
+            if let Some(layer) = &scene.borrow().layer {
+                path.hash(mark);
+                layer.renderer.sub_frames_recorded().hash(mark);
+                layer.models_changed().hash(mark);
+            }
+        }
+    }
+
     /// A scene the last frame drew waits for a model it places (building
     /// in Stage's model host).
     pub fn waiting_for_models(&self) -> bool {
@@ -502,6 +586,17 @@ impl Scenes3d {
     pub fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         if !matches!(event, Event::Signal | Event::NextFrame(_)) {
             return;
+        }
+        if matches!(event, Event::Signal) || cfg!(all(target_arch = "wasm32", not(target_feature = "atomics"))) {
+            self.jobs.retain(|_, jobs| {
+                poll_loads(cx, jobs);
+                !jobs.is_empty()
+            });
+            // Workerless pages run at most one deferred job per display frame.
+            #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+            if !self.jobs.is_empty() {
+                cx.new_next_frame();
+            }
         }
         let places_models = self.scenes.values().any(|scene| scene.borrow().layer.as_ref().is_some_and(|l| !l.doc.models.is_empty()));
         if places_models && makepad_stage_motion3d::models::pump(cx) {
@@ -562,6 +657,27 @@ impl Scenes3d {
     }
 }
 
+fn poll_loads(cx: &mut Cx, jobs: &mut Vec<SceneJob>) {
+    jobs.retain_mut(|SceneJob { load, job }| {
+        // On a page without workers try_take executes the deferred load here.
+        // On threaded hosts it only checks for a published result.
+        let Some(result) = job.try_take() else { return true };
+        match result {
+            Ok(loaded) => {
+                let _ = adopt_loaded(loaded);
+            }
+            Err(error) => {
+                LOADING.with(|l| l.borrow_mut().remove(&slot(load)));
+                let loc = Loc { line: load.first_line.max(1), col: 1 };
+                let diagnostic = Diagnostic::error(loc, "", format!("the Scene3D load's worker failed: {error:?}"));
+                failed(load, vec![diagnostic]);
+            }
+        }
+        cx.redraw_all();
+        false
+    });
+}
+
 #[derive(PartialEq)]
 enum Parent {
     Xr,
@@ -611,13 +727,23 @@ fn adopt(cx: &mut Cx2d, owned: &HashSet<DrawPassId>, container: DrawPassId) {
 /// Record a motion3d scene item into its container; the container's
 /// texture, or `None` (the reason is in the errors).
 pub(super) fn render(md: &mut MotionDraw, cx: &mut Cx2d, item: &Item, scale: f64) -> Option<Texture> {
+    if md.refuse_plain_item(item) {
+        return None;
+    }
     let ItemKind::Scene3dDoc { scene, first_line, size, local_time, edit_offset, fps, bpm, signals, textures, videos, layers, .. } = &item.kind else { return None };
+    // Some hosts only draw. Adopt this path's completed loads there too.
+    if let Some(jobs) = md.scenes3d.jobs.get_mut(&item.path) {
+        poll_loads(cx, jobs);
+        if jobs.is_empty() {
+            md.scenes3d.jobs.remove(&item.path);
+        }
+    }
+    md.scenes3d.placed.insert(item.path.clone(), (item.transform(*size), *size));
     let px = ((size[0] * scale).ceil().max(1.0) as u32, (size[1] * scale).ceil().max(1.0) as u32);
     // The document's tempo, so `beat(n)` in the scene is the document's beat
     // (a `bpm:` in the scene itself still wins).
     let (key, source_id, shown_inputs) = scene_identity(&mut md.scenes3d.keys, &item.path, scene, *bpm);
     let load = LoadKey { key, path: item.path.clone(), first_line: *first_line, edit_offset: offset_key(*edit_offset) };
-    let request = SceneRequest::of(&item.kind)?;
     {
         let scenes = &mut md.scenes3d;
         // A model the scene places landed since it loaded: load it again.
@@ -626,43 +752,49 @@ pub(super) fn render(md: &mut MotionDraw, cx: &mut Cx2d, item: &Item, scale: f64
         if !models_changed {
             if let Some(scene) = scenes.scenes.get_mut(&item.path) {
                 let scene = scene.get_mut();
-                if scene.key != key && scene.source_id == source_id && scene.load.first_line == *first_line && scene.load.edit_offset == offset_key(*edit_offset) {
+                if scene.load.key != key && scene.source_id == source_id && scene.load.first_line == *first_line && scene.load.edit_offset == load.edit_offset {
                     if scene.layer.as_mut().is_some_and(|layer| take_inputs(layer, &scene.inputs, &shown_inputs)) {
-                        scene.key = key;
                         scene.load.key = key;
                         scene.inputs = shown_inputs.clone();
                     }
                 }
             }
         }
-        let fresh = models_changed || scenes.scenes.get(&item.path).is_none_or(|scene| scene.borrow().key != key);
+        let fresh = models_changed || scenes.scenes.get(&item.path).is_none_or(|scene| scene.borrow().load.key != key);
         if fresh {
-            // A document loaded ahead (or left by an earlier draw), else loaded
-            // now (a template with the Splash modules it imports, through its
-            // document's resolver).
-            let kept = if models_changed { None } else { loaded_take(&load, source_id, &shown_inputs) };
-            let loaded = match kept {
-                Some(layer) => Ok(layer),
-                None => load_scene(&item.path, &request, &scenes.files),
-            };
-            let layer = match loaded {
-                Ok(layer) => Some(layer),
-                Err(diags) => {
-                    for diag in diags {
-                        let message = if diag.message.trim().is_empty() { "the Scene3D did not load (its loader gave no reason)" } else { diag.message.as_str() };
-                        let error = format!("{}: {}:{}: {message}", item.path, diag.loc.line, diag.loc.col);
-                        if !scenes.errors.contains(&error) {
-                            scenes.errors.push(error);
+            let loaded = loaded_take(&load, source_id, &shown_inputs).map(Ok)
+                .or_else(|| FAILED.with(|f| f.borrow().get(&load).cloned().map(Err)));
+            if let Some(loaded) = loaded {
+                let layer = match loaded {
+                    Ok(layer) => Some(layer),
+                    Err(diags) => {
+                        for diag in diags {
+                            let message = if diag.message.trim().is_empty() { "the Scene3D did not load (its loader gave no reason)" } else { diag.message.as_str() };
+                            let error = format!("{}: {}:{}: {message}", item.path, diag.loc.line, diag.loc.col);
+                            if !scenes.errors.contains(&error) {
+                                scenes.errors.push(error);
+                            }
                         }
+                        None
                     }
-                    None
+                };
+                let container = match scenes.scenes.remove(&item.path) {
+                    Some(old) => old.into_inner().container,
+                    None => scenes.spare.pop().unwrap_or_else(|| RenderTarget::new(cx, "motion_scene3d")),
+                };
+                scenes.scenes.insert(item.path.clone(), RefCell::new(Scene { load, source_id, inputs: shown_inputs, idle: 0, layer, container, owned: HashSet::new(), resampled_at: None, signals: None }));
+            } else {
+                scenes.waiting.insert(item.path.clone());
+                if !loading(&load) {
+                    let request = SceneRequest::of(&item.kind)?;
+                    let job = SceneLoad::new(load, source_id, shown_inputs, request, &scenes.files, *local_time, *size);
+                    scenes.submit_load(cx, job);
                 }
-            };
-            let container = match scenes.scenes.remove(&item.path) {
-                Some(old) => old.into_inner().container,
-                None => scenes.spare.pop().unwrap_or_else(|| RenderTarget::new(cx, "motion_scene3d")),
-            };
-            scenes.scenes.insert(item.path.clone(), RefCell::new(Scene { key, load, source_id, inputs: shown_inputs, idle: 0, layer, container, owned: HashSet::new(), resampled_at: None, signals: None }));
+                // Keep recording the current layer while its replacement loads.
+                if scenes.scenes.get(&item.path).is_none_or(|s| s.borrow().layer.is_none()) {
+                    return None;
+                }
+            }
         }
     }
     // 2D layers the scene shows as textures: each drawn at this moment into
@@ -761,7 +893,8 @@ pub(super) fn render(md: &mut MotionDraw, cx: &mut Cx2d, item: &Item, scale: f64
     }
     let scene = md.scenes3d.scenes.get_mut(&item.path).unwrap().get_mut();
     scene.container.end(cx);
-    md.note_kind(&format!("scene3d {key:016x}"));
+    let drawn_key = scene.load.key;
+    md.note_kind(&format!("scene3d {drawn_key:016x}"));
     let (id, out) = {
         let scene = md.scenes3d.scenes[&item.path].borrow();
         (scene.container.pass.draw_pass_id(), scene.container.texture.clone())
@@ -794,10 +927,6 @@ impl Scenes3d {
         let a = scene.layer.as_ref()?.anchors().iter().find(|a| a.name == node)?.clone();
         let (m, size) = self.placed.get(path)?;
         Some((m.apply([a.screen[0] as f64 * size[0], a.screen[1] as f64 * size[1]]), a.in_front))
-    }
-
-    pub(super) fn place(&mut self, path: &str, m: Affine, size: [f64; 2]) {
-        self.placed.insert(path.to_string(), (m, size));
     }
 }
 

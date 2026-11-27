@@ -13,9 +13,13 @@
 //! it out; the box is a print settings feature of the block in the Features tree and takes a
 //! name there; a row's delete puts a setting back on what it inherits or takes the box away;
 //! and undo takes each back, one step each. The view's
-//! right-click menu and the Parts tab's Add menu each put one volume over the whole block, one
+//! right-click menu and the plate view's Modify menu each put one volume over the whole block, one
 //! undo step.
 
+#[path = "common/render_mode.rs"]
+mod render_mode;
+#[path = "common/toolbar_search.rs"]
+mod toolbar_search;
 mod common;
 
 use makepad_script::syntax::{self, Kind, Node};
@@ -200,13 +204,23 @@ fn removable(app: &TestApp, name: &str) -> bool {
 /// The lit rows: the Overrides list's, the Parts list's.
 fn lit(app: &TestApp) -> (Vec<String>, Vec<String>) {
     let list = override_rows(app).into_iter().filter(|r| r.2).map(|r| r.0).collect();
-    let tree = shown(app, Role::TreeItem).into_iter().filter(|w| w.node.states.contains(States::SELECTED)).map(|w| w.node.name.to_string()).collect();
+    let nodes = app.widget_snapshot().nodes();
+    let features = nodes.iter().find(|w| w.visible() && w.role == Role::List && w.name == "Features");
+    let tree = nodes.iter().filter(|w| w.visible() && w.states.contains(States::SELECTED)
+        && (w.role == Role::TreeItem || features.is_some_and(|f| f.children.contains(&w.id))))
+        .map(|w| w.name.clone()).collect();
     (list, tree)
 }
 
 /// The Slicer panel's search text.
 fn search_text(app: &TestApp) -> String {
-    shown(app, Role::TextField).into_iter().find(|w| w.node.path.contains("search")).map(|w| w.node.value.to_string()).expect("the Slicer panel's search")
+    let search = app.locator(Selector::path("bar.search").name("Search")).try_snapshot()
+        .ok().filter(NodeMatch::visible).unwrap_or_else(|| toolbar_search::slicer_end(app));
+    match search.role {
+        Role::Button => String::new(),
+        Role::Group => app.locator(Selector::path("bar.search.row.input")).wait_visible().snapshot().node.value,
+        role => panic!("unexpected Slicer search role {role:?}"),
+    }
 }
 
 /// A setting's field, shown (scrolled into view: a row out of the panel's clip is not in the
@@ -332,8 +346,7 @@ fn the_overrides_rows_name_each_override_and_a_drawn_volume_edits_and_deletes_on
     frame(&app);
 
     let from = seq(&app);
-    app.locator(Selector::id("rm_slice")).wait_visible().click();
-    app.locator(Selector::id("rm_slice")).wait_checked(true);
+    render_mode::pick(&app, "Sliced");
     let first = planned(&app, from, "the first plan");
     wait(&app, "the slice's layers", || (common::slice_state(&app) == "Sliced").then_some(()));
     let plain = source(&app);
@@ -426,7 +439,7 @@ fn the_overrides_rows_name_each_override_and_a_drawn_volume_edits_and_deletes_on
     assert_eq!(search_text(&app), "", "a row's click types nothing into the search");
     // The box's row: the box's panel again, it alone lit.
     let (_, tree) = pick_row(&app, "Print settings box 1: Density 100 %");
-    assert_eq!(tree, ["Block"], "the Parts list lights the box's block alone");
+    assert_eq!(tree, [BOX_FEATURE], "the Parts tree lights the box's feature alone");
     let path = wait(&app, "the box's Density field again", || box_density(&app));
     let density = || app.locator(Selector::path(path.as_str()));
 
@@ -459,7 +472,6 @@ fn the_overrides_rows_name_each_override_and_a_drawn_volume_edits_and_deletes_on
 
     // The box is the block's print settings feature in the Features tree, picked there as in
     // the Overrides list; it takes a name there: its binding and its uses, one undo step.
-    app.locator(Selector::role(Role::Tab).name("Features")).click();
     let row = app.locator(Selector::role(Role::ListItem).name(BOX_FEATURE)).wait_visible().snapshot();
     assert!(row.node.states.contains(States::SELECTED), "the picked box's Features row is not picked");
     app.locator(Selector::role(Role::ListItem).name(BOX_FEATURE)).select();
@@ -519,16 +531,16 @@ fn the_overrides_rows_name_each_override_and_a_drawn_volume_edits_and_deletes_on
     undo(&app);
     wait(&app, "one undo to take the right-click menu's volume back", || (source(&app) == plain).then_some(()));
 
-    // The Parts tab's Add menu with the block picked: the same, one step.
+    // The plate view's Modify menu with the block picked: the same, one step.
     app.locator(Selector::role(Role::Tab).name("Parts")).click();
     app.locator(Selector::role(Role::TreeItem).name("Block")).wait_visible().click();
-    edits_and_plans_again(&app, "the Add menu's volume", r, || {
-        app.locator(Selector::role(Role::Button).name("Add")).wait_visible().press();
-        app.locator(Selector::role(Role::MenuItem).name("Print settings here")).wait_visible().press();
+    edits_and_plans_again(&app, "the Modify menu's volume", r, || {
+        app.locator(Selector::role(Role::Button).name("Modify")).wait_visible().press();
+        app.locator(Selector::role(Role::MenuItem).name("Settings here")).wait_visible().press();
     }, over_the_block);
     undo(&app);
-    wait(&app, "one undo to take the Add menu's volume back", || (source(&app) == plain).then_some(()));
-    println!("[settings-here] the right-click and Add menus each put one volume over the block, one undo step each");
+    wait(&app, "one undo to take the Modify menu's volume back", || (source(&app) == plain).then_some(()));
+    println!("[settings-here] the right-click and Modify menus each put one volume over the block, one undo step each");
 }
 
 /// One mouse event of `button` (0 the primary, 1 the secondary) at `(x, y)` through the app's
@@ -649,7 +661,7 @@ fn a_box_is_drawn_while_picked_follows_its_fields_and_a_click_on_the_model_picks
     app.locator(Selector::role(Role::Tab).name("Overrides")).click();
     wait(&app, "Add box on with the part picked", || add().enabled().then_some(()));
     frame(&app);
-    app.locator(Selector::id("rm_normal")).wait_visible().wait_checked(true);
+    render_mode::wait_shown(&app, "Normal");
     assert!(drawn_box(&app).is_none(), "a box is drawn with none on the plate");
 
     // In Normal, the rail's tool across the block: the view stays Normal, the box is picked
@@ -659,8 +671,8 @@ fn a_box_is_drawn_while_picked_follows_its_fields_and_a_click_on_the_model_picks
     app.locator(Selector::id("viewport")).wait_visible().drag_by_and_hold(160.0, 120.0);
     let drawn = wait(&app, "the drawn box in the script", || Some(source(&app)).filter(|s| s.contains("m.settings(settings1, {sparse_infill_density: \"100%\"})")));
     assert!(drawn.starts_with(&plain), "the box goes after the block's own lines:\n{drawn}");
-    assert_eq!(app.locator(Selector::id("rm_normal")).snapshot().checked(), Some(true), "the box's tool left the Normal view");
-    assert_eq!(app.locator(Selector::id("rm_slice")).snapshot().checked(), Some(false), "the box's tool went to the Sliced view");
+    assert!(render_mode::shown(&app, "Normal"), "the box's tool left the Normal view");
+    assert!(!render_mode::shown(&app, "Sliced"), "the box's tool went to the Sliced view");
     wait(&app, "the box's row, picked", || Some(override_row(&app, "Print settings box 1: Density 100 %")).filter(|r| r.2));
     wait(&app, "the picked box drawn", || drawn_box(&app));
     assert_eq!(app.locator(Selector::id("t_select")).snapshot().checked(), Some(true), "the box drawn, the tool is the Select one");
@@ -803,7 +815,6 @@ fn a_box_picked_in_either_list_is_drawn_and_follows_its_parts_move_and_scale(app
     assert!(drawn_box(&app).is_none(), "a box is drawn while none is picked");
 
     // Picked in the Features tree: drawn, and its Overrides row is the one picked.
-    app.locator(Selector::role(Role::Tab).name("Features")).click();
     app.locator(Selector::role(Role::ListItem).name(BOX_FEATURE)).wait_visible().select();
     wait(&app, "the box picked in the Features tree, drawn", || drawn_box(&app));
     app.locator(Selector::role(Role::Tab).name("Overrides")).click();
@@ -819,7 +830,7 @@ fn a_box_picked_in_either_list_is_drawn_and_follows_its_parts_move_and_scale(app
     let (row, _, _) = override_row(&app, "Print settings box 1");
     app.locator(Selector::role(Role::ListItem).name(row.as_str())).press();
     wait(&app, "the box picked in the Overrides list, drawn", || drawn_box(&app));
-    app.locator(Selector::role(Role::Tab).name("Features")).click();
+    app.locator(Selector::role(Role::Tab).name("Parts")).click();
     // (the tree's rows, each named with its level)
     let picked = wait(&app, "its Features row, picked", || Some(shown(&app, Role::ListItem).into_iter().filter(|w| w.node.name.contains(" level ") && w.node.states.contains(States::SELECTED)).map(|w| w.node.name.to_string()).collect::<Vec<_>>()).filter(|p| !p.is_empty()));
     assert_eq!(picked, [BOX_FEATURE], "one pick, the box's");

@@ -41,7 +41,7 @@ fn component(id: u32, path: &str, sim: &str, pins: &[(&str, u32)]) -> Component 
         id: CompId(id), path: path.into(), refdes: path.into(), ref_kind: Default::default(),
         part: Arc::new(PartDef {
             name: path.into(), kind: PartKind::Ic, symbol: Symbol::default(), footprint: None,
-            body: None, emitter: None, gpio: None, fields: Fields(vec![("sim".into(), sim.into())]),
+            body: None, emitter: None, gpio: None, lifecycle: None, approved: false, fields: Fields(vec![("sim".into(), sim.into())]),
             pins: pins.iter().map(|&(name, _)| PinDef {
                 name: name.into(), pads: Vec::new(), unit: 0, limits: None, alternates: Vec::new(), delay: None,
                 kind: if ["VDD", "GND"].contains(&name) { PinKind::PowerIn } else { PinKind::Bidi },

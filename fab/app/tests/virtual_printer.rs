@@ -10,6 +10,20 @@ use makepad_strict_json::Value;
 use makepad_test::{run_with_config, Locator, Role, Selector, TestApp, TestConfig};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Scroll the Printers editor until the named control or message is on screen.
+fn scroll_to_printer_item(app: &TestApp, selector: Selector, down: bool) -> Locator {
+    let panel = app.locator(Selector::role(Role::TabPanel).name("Printers")).snapshot().bounds;
+    let query = selector.as_query();
+    let item = app.locator(selector);
+    let distance = f64::from(panel.h) * if down { 0.5 } else { -0.5 };
+    app.wait_until(|| {
+        if item.try_snapshot().is_ok() { return None; }
+        app.scroll_at(f64::from(panel.x + panel.w * 0.5), f64::from(panel.y + panel.h * 0.5), 0.0, distance, None);
+        Some(format!("scrolling the Printers editor to {query}"))
+    });
+    item
+}
+
 /// Read the same mapping that the printer panel's colour list shows.
 fn printer(app: &TestApp) -> Value {
     let lines = app.call_tool(Duration::from_secs(30), "fab.printer", "{}");
@@ -98,7 +112,7 @@ insert(m.box({size: [2mm 1mm 2mm] at: [0mm 5mm 0mm]}), name: "Pin", into: "block
     config.env.insert("MAKEPAD_TEST_HOME".into(), dir.display().to_string());
     let result = run_with_config(config, |app| {
         workspace_row::press(&app, "Monitor");
-        app.locator(Selector::id("name").name("Four-tool toolchanger")).wait_visible();
+        app.locator(Selector::role(Role::DisclosureButton).name("Four-tool toolchanger (virtual)")).wait_visible();
         app.locator(Selector::all().name("Ready")).wait_visible();
         app.wait_until(|| {
             let p = printer(&app);
@@ -207,7 +221,7 @@ fn a_filament_twin_sends_the_same_package_without_entering_a_real_link() {
         let before = entries(&app);
         assert!(before.get("mqtt").and_then(Value::as_u64).unwrap() > 0, "real interval reached MQTT CONNECT");
 
-        app.locator(Selector::id("picker")).wait_visible().press();
+        app.locator(Selector::role(Role::Button).name("Add printer")).wait_visible().press();
         app.locator(Selector::role(Role::MenuItem).name("Virtual twin of…")).wait_visible().press();
         app.locator(Selector::role(Role::MenuItem).name(simulated_profiles::MACHINE)).wait_visible().press();
         let quiet = || {
@@ -215,12 +229,12 @@ fn a_filament_twin_sends_the_same_package_without_entering_a_real_link() {
             assert_eq!(after.get("start"), before.get("start"), "the twin entered PrinterLink::start");
             assert_eq!(after, before, "the twin entered a transport or credential boundary");
         };
-        let title = format!("{} (virtual)", simulated_profiles::MACHINE);
+        let title = format!("{} (virtual of Simulated printer)", simulated_profiles::MACHINE);
         app.wait_until(|| {
             quiet();
             (printer(&app).get("name").and_then(Value::as_str) != Some(title.as_str())).then(|| "waiting for the twin report".to_string())
         });
-        app.locator(Selector::id("name").name(&title)).wait_visible();
+        app.locator(Selector::role(Role::DisclosureButton).name(&title)).wait_visible();
         let snapshot = printer(&app);
         assert_eq!(snapshot.get("name").and_then(Value::as_str), Some(title.as_str()));
         assert_eq!(snapshot.get("model").and_then(Value::as_str), Some(simulated_profiles::model().as_str()));
@@ -268,7 +282,7 @@ fn configured_printer_starts_disconnected_and_only_connects_on_request() {
     let mut twin = saved.printers.iter().find(|p| p.name == "dual-nozzle").unwrap().clone();
     twin.name = "configured-twin".into();
     twin.title = format!("{} (virtual)", simulated_profiles::MACHINE);
-    twin.source = Source::Twin { preset: simulated_profiles::MACHINE.into(), model: model.clone() };
+    twin.source = Source::Twin { preset: simulated_profiles::MACHINE.into(), model: model.clone(), source: Some(format!("printer:{CONFIG}")) };
     twin.configured_for = Some(CONFIG.into());
     for slot in &mut twin.slots {
         slot.colour = match slot.tray.as_str() { "A1" => Some(0xF4F4F0), "B1" => Some(0x161616), _ => None };
@@ -328,9 +342,9 @@ fn configured_printer_starts_disconnected_and_only_connects_on_request() {
         assert_eq!(snapshot.get("model").and_then(Value::as_str), Some(model.as_str()));
         assert_eq!(snapshot.get("virtual_printer").and_then(Value::as_bool), Some(true));
         assert_eq!(snapshot.get("serial_suffix"), Some(&Value::Null));
-        app.locator(Selector::all().name(&format!("{CONFIG} (Virtual)"))).wait_visible();
-        app.locator(Selector::all().name("Virtual mode")).wait_visible();
-        app.locator(Selector::id("storage")).wait_visible().press();
+        app.locator(Selector::role(Role::DisclosureButton).name(format!("{CONFIG} (Virtual)"))).wait_visible();
+        scroll_to_printer_item(&app, Selector::all().name("Virtual mode"), true);
+        scroll_to_printer_item(&app, Selector::role(Role::Button).name("Storage"), false).press();
         app.wait_until(|| {
             let status = printer(&app);
             let error = status.get("storage_files").and_then(|s| s.get("error")).and_then(Value::as_str);
@@ -341,8 +355,8 @@ fn configured_printer_starts_disconnected_and_only_connects_on_request() {
         let start = prepare_two_spools(&app);
         app.locator(Selector::id("speed_row.speed_end").name("Speed to the end")).wait_visible().click();
         start.press();
-        app.locator(Selector::all().name("Connected mode")).press();
-        app.locator(Selector::all().name("A job is being prepared for this printer. Wait before switching modes.")).wait_visible();
+        scroll_to_printer_item(&app, Selector::all().name("Connected mode"), true).press();
+        scroll_to_printer_item(&app, Selector::all().name("A job is being prepared for this printer. Wait before switching modes."), false);
         quiet();
         app.command(Duration::from_secs(30), &["printer-release-packages"], &[]);
         wait_job(JobState::Finished, 1);
@@ -363,7 +377,7 @@ fn configured_printer_starts_disconnected_and_only_connects_on_request() {
         app.locator(Selector::role(Role::Button).name("Stop print")).wait_visible().press();
         wait_job(JobState::Stopped, 2);
 
-        app.locator(Selector::all().name("Connected mode")).press();
+        scroll_to_printer_item(&app, Selector::all().name("Connected mode"), true).press();
         app.wait_until(|| (entries(&app).get("mqtt").and_then(Value::as_u64).unwrap() == 0)
             .then(|| "waiting for the Connected simulator's MQTT CONNECT".into()));
         app.wait_until(|| {

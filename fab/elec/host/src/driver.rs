@@ -158,9 +158,10 @@ pub struct Driver<X: Send + 'static> {
     fills: HashMap<(BoardId, ItemId, bool), (TaskHandle<()>, CancellationToken)>,
     /// Per unit, the whole-board checks task and the generation it checks.
     checks: HashMap<BoardId, (u64, TaskHandle<()>)>,
-    /// Independent commit and preview evaluations; IDs keep late results from clearing newer handles.
+    /// Independent commit, preview and proposal evaluations. IDs identify their pool results.
     eval_task: Option<(u64, TaskHandle<()>)>,
     preview_task: Option<(u64, TaskHandle<()>)>,
+    proposal_task: Option<(u64, TaskHandle<()>)>,
     /// Held commands or evaluation can still move the shared undo tops.
     waiting: bool,
     /// A late result must not remove a newer task's handle. Weak rules keep disposal on the worker.
@@ -219,6 +220,7 @@ impl<X: Send + 'static> Driver<X> {
             checks: HashMap::new(),
             eval_task: None,
             preview_task: None,
+            proposal_task: None,
             waiting: false,
             fill_inputs: HashMap::new(),
             preview_seq: Arc::new(AtomicU64::new(0)),
@@ -322,7 +324,7 @@ impl<X: Send + 'static> Driver<X> {
         }));
     }
 
-    /// Cancel fills and evaluation, retire the shown snapshot and replace the channel before
+    /// Cancel fills, checks and all three evaluation tasks, retire the shown snapshot and replace the channel before
     /// reloading. The returned inbox belongs to the load job, so its contents drop on the strand.
     /// Cost: O(fill jobs + pending replies) per reset.
     pub fn reset(&mut self) -> Inbox {
@@ -347,6 +349,9 @@ impl<X: Send + 'static> Driver<X> {
             task.cancel();
         }
         if let Some((_, task)) = self.preview_task.take() {
+            task.cancel();
+        }
+        if let Some((_, task)) = self.proposal_task.take() {
             task.cancel();
         }
         self.waiting = false;
@@ -668,13 +673,18 @@ impl<X: Send + 'static> Driver<X> {
                     }
                     for job in step.evals {
                         let id = job.id;
-                        let preview = job.preview.is_some();
+                        let slot = if job.plan.is_some() {
+                            &mut self.proposal_task
+                        } else if job.preview.is_some() {
+                            &mut self.preview_task
+                        } else {
+                            &mut self.eval_task
+                        };
                         let tx = self.rx.sender();
                         match cx.task_pool().submit_named(Class::Visible, "elec evaluation", move || {
                             let _ = tx.send(Msg::Fill(job.run()));
                         }) {
                             Ok(task) => {
-                                let slot = if preview { &mut self.preview_task } else { &mut self.eval_task };
                                 if let Some((_, old)) = slot.replace((id, task)) {
                                     old.cancel();
                                 }
@@ -698,9 +708,11 @@ impl<X: Send + 'static> Driver<X> {
                             }
                         }
                         TaskResult::Eval(done) => {
-                            let slot = if done.preview.is_some() { &mut self.preview_task } else { &mut self.eval_task };
-                            if slot.as_ref().is_some_and(|(id, _)| *id == done.id) {
-                                *slot = None;
+                            for slot in [&mut self.eval_task, &mut self.preview_task, &mut self.proposal_task] {
+                                if slot.as_ref().is_some_and(|(id, _)| *id == done.id) {
+                                    *slot = None;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -726,7 +738,7 @@ impl<X: Send + 'static> Driver<X> {
 
     /// Queue a command for the next kick.
     pub fn push(&mut self, cmd: Cmd) {
-        if matches!(&cmd, Cmd::Commit { .. } | Cmd::Text { .. } | Cmd::Docs { .. } | Cmd::Invoke { .. }
+        if matches!(&cmd, Cmd::Commit { .. } | Cmd::Text { .. } | Cmd::Docs { .. } | Cmd::Decide { .. } | Cmd::Invoke { .. }
             | Cmd::SetFactories(_) | Cmd::Undo | Cmd::Redo) {
             self.keep_job();
         }
@@ -777,6 +789,17 @@ impl<X: Send + 'static> Driver<X> {
         self.replies.insert(ticket, reply);
         self.tools.insert(ticket, label.clone());
         self.mailbox.push(Cmd::Docs { set, label, by, ticket: Some(ticket) });
+        self.kick();
+    }
+
+    /// Queue a local document proposal and route its verification outcome to its caller.
+    /// O(label bytes) plus expected O(1) to retain the ticket until the check answers.
+    pub fn propose(&mut self, slot: String, label: String, set: Vec<DocSet>, by: By, reply: Sender<Outcome>) {
+        self.tickets += 1;
+        let ticket = Ticket(self.tickets);
+        self.replies.insert(ticket, reply);
+        self.tools.insert(ticket, label.clone());
+        self.push(Cmd::Propose { slot, label, set, by: crate::ProposalAuthor::Local(by), ticket });
         self.kick();
     }
 
@@ -947,6 +970,11 @@ impl<X: Send + 'static> Driver<X> {
     pub fn act(&mut self, action: ViewAction) -> Option<ViewAction> {
         let mut host_action = None;
         match action {
+            ViewAction::ProposalDecision { id, shown, accept } => {
+                self.tickets += 1;
+                self.push(Cmd::Decide { id, shown, accept, ticket: Some(Ticket(self.tickets)) });
+            }
+            ViewAction::CheckProposal(id) => self.push(Cmd::CheckProposal { id, ticket: None }),
             ViewAction::Planned { call, action } => {
                 let edit = match *action {
                     ViewAction::Ops { ops, place, label } => {
@@ -1431,16 +1459,39 @@ e.match_length([n,x], {tol: 0.02mm})
         let text = before.docs.as_ref().unwrap().texts.iter().find(|d| d.name == "tune.ckt.splash").unwrap();
         let end = text.text.len() as u32;
         let edit = TextEdit { doc: text.doc, span: end..end, text: "let spare = e.r(1kohm, p, x)\n".into() };
-        let (reply, _rx) = mpsc::channel();
+
+        // Queue both strand steps before dispatching their pool jobs. Keep the pool replies
+        // on the live channel until both handles are installed, regardless of worker speed.
+        let live = std::mem::take(&mut driver.rx);
+        let (reply, proposed) = mpsc::channel();
+        let ticket = driver.next_ticket();
+        driver.propose("brief".into(), "Draft brief".into(),
+            vec![DocSet::Add { name: "brief.req.splash".into(), text: "// draft".into() }], By::Person, reply);
+        let job = driver.job.take().expect("the proposal schedules a strand step");
+        std::thread::spawn(move || job.join()).join().unwrap().expect("the proposal step queues its verification");
+        let (reply, committed) = mpsc::channel();
         driver.text(text.doc, text.rev, vec![edit], "Add spare pin".into(), By::Person, reply);
+        let steps = std::mem::replace(&mut driver.rx, live);
+        let replies = std::mem::replace(&mut driver.rx.receiver, steps.receiver);
+        finish(&mut driver, &mut cx);
+        driver.rx.receiver = replies;
+        assert!(driver.proposal_task.is_some() && driver.eval_task.is_some(),
+            "dispatching the committed evaluation preserves the in-flight proposal task");
         let deadline = Instant::now() + HANG;
         loop {
             driver.event(&mut cx, &mut |_, _, _| false);
-            if driver.snap().unwrap().design.units[0].circuit.comp("spare").is_some() { break; }
-            assert!(Instant::now() < deadline, "the unplaced part evaluates");
+            let snap = driver.snap().unwrap();
+            if snap.design.units[0].circuit.comp("spare").is_some()
+                && snap.proposals.iter().any(|p| p.state == crate::ProposalState::Ready)
+                && !driver.replies.contains_key(&ticket) { break; }
+            assert!(Instant::now() < deadline, "the committed part evaluates and the proposal reaches Ready and answers its caller");
             std::thread::yield_now();
         }
         let snap = driver.snap().unwrap();
+        assert!(matches!(committed.try_recv(), Ok(Outcome::Done { .. })), "the circuit edit answers its commit ticket");
+        assert!(matches!(proposed.try_recv(), Ok(Outcome::Proposed { id, shown, .. })
+            if snap.proposals.iter().any(|p| p.id == id && p.shown == shown && p.state == crate::ProposalState::Ready)),
+            "the proposal ticket identifies the ready proposal after the committed evaluation");
         let pins = snap.design.units[0].circuit.comps.iter().flat_map(|c| &c.conns).filter(|(_, n)| *n == track.net).count();
         assert_eq!(pins, 3);
         assert_eq!(snap.design.units[0].board.as_ref().unwrap().content_hash(), board.content_hash());

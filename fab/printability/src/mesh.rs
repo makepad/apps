@@ -1,7 +1,7 @@
-use crate::{Footprint, Issue, Materials, ObjectStats, Report, Severity};
+use crate::{overlaps, Footprint, Issue, Materials, ObjectStats, Overlaps, Report, Severity};
 use fab_plate::{machine::{self, Machine}, Bounds, Part, PartMesh, Plate};
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use makepad_fab_slicer::{
     geom::{ExPolygon, Pt, orient},
     grid::SegGrid,
@@ -146,15 +146,25 @@ pub type PartField<'a> = &'a (dyn Fn(f64, f64, f64) -> f64 + Sync);
 /// `stop` is asked between the steps of a part's checks and every [`STOP_EVERY`] facets or
 /// vertices within one: once it is true the checks end with None, telling nothing they found.
 pub fn analyse_plate_with<'f>(machine: &Machine, plate: &Plate, materials: &Materials, field: &dyn Fn(usize) -> Option<PartField<'f>>, stop: &dyn Fn() -> bool) -> Option<Report> {
+    analyse_plate_known(machine, plate, materials, field, None, stop).map(|(report, _)| report)
+}
+
+/// [`analyse_plate_with`] with reusable overlap issues. The caller vouches that
+/// `known` is from these same parts, unmoved, with the same exact surfaces where supplied.
+pub fn analyse_plate_known<'f>(machine: &Machine, plate: &Plate, materials: &Materials, field: &dyn Fn(usize) -> Option<PartField<'f>>, known: Option<&Arc<Overlaps>>, stop: &dyn Fn() -> bool) -> Option<(Report, Arc<Overlaps>)> {
     let covers = Covers::of(plate, field);
     let parts: Vec<PartAnalysis> = plate.parts.iter().enumerate().map(|(i, p)| {
         let covered = |q: [f64; 3]| covers.covered(i, q);
         analyse_part_with(machine, p, materials, field(i), covers.grouped(i).then_some(&covered as &dyn Fn([f64; 3]) -> bool), stop)
     }).collect::<Option<_>>()?;
     let mut report = combine_plate(machine, plate, materials, parts.iter());
-    report.issues.extend(crate::overlap::overlap_issues(plate, field, stop)?);
+    let overlaps = match known.filter(|o| o.judged_alike(plate, field)) {
+        Some(known) => Arc::clone(known),
+        None => Arc::new(overlaps(plate, field, stop)?),
+    };
+    report.issues.extend(overlaps.issues.iter().cloned());
     report.sort();
-    Some(report)
+    Some((report, overlaps))
 }
 
 /// How far (mm) inside a part's exact surface a point lies to count as inside it.
@@ -216,10 +226,25 @@ pub(crate) struct MeshSolid<'a> {
     cell: f64,
     nx: usize,
     ny: usize,
-    /// Per cell, the facets whose XY box meets it.
-    cells: Vec<Vec<u32>>,
+    /// Per facet with a nonzero XY area, the coefficients of its crossing test as `holds` takes them.
+    rows: Vec<CrossingFacet>,
+    /// Per cell, the rows of the facets whose XY box meets it with their highest vertex z, highest first.
+    entries: Vec<(f64, u32)>,
+    /// Where each cell's entries start, and a final end.
+    offsets: Vec<usize>,
+    /// How far under a point a facet's highest vertex can be and still be tried (see `holds`).
+    pad: f64,
     tree: OnceLock<FacetTree>,
     shells: OnceLock<Vec<usize>>,
+}
+
+/// A facet's crossing test, its differences taken once: `k1 = b.y - c.y`, `k2 = c.x - b.x`,
+/// `k3 = c.y - a.y`, `k4 = a.x - c.x`, its doubled signed XY area `d`, `c`'s x and y, and the
+/// three vertices' z.
+struct CrossingFacet {
+    k1: f64, k2: f64, k3: f64, k4: f64,
+    d: f64, c0: f64, c1: f64,
+    az: f64, bz: f64, cz: f64,
 }
 
 impl<'a> MeshSolid<'a> {
@@ -230,21 +255,44 @@ impl<'a> MeshSolid<'a> {
         // about one facet's footprint a cell, no more cells than facets
         let cell = (w * h / n).sqrt().max(1e-3);
         let (nx, ny) = ((w / cell).ceil() as usize + 1, (h / cell).ceil() as usize + 1);
+        let pad = (1.0 / (1u32 << 30) as f64) * bounds.min[2].abs().max(bounds.max[2].abs()).max(1.0);
+        let mut rows = Vec::new();
+        let mut tops = Vec::new();
         let mut cells = vec![Vec::new(); nx * ny];
         if !bounds.is_empty() {
             let at = |v: f64, lo: f64, n: usize| (((v - lo) / cell).floor().max(0.0) as usize).min(n - 1);
-            for (t, tri) in mesh.triangles.iter().enumerate() {
+            for tri in &mesh.triangles {
                 let p = tri.map(|v| mesh.positions[v as usize]);
+                let [a, bb, c] = p;
+                let (k1, k2) = (bb[1] - c[1], c[0] - bb[0]);
+                let (k3, k4) = (c[1] - a[1], a[0] - c[0]);
+                // (bb[1] - c[1]) * (a[0] - c[0]) + (c[0] - bb[0]) * (a[1] - c[1])
+                let d = k1 * k4 + k2 * (a[1] - c[1]);
+                if d == 0.0 {
+                    continue;
+                }
+                let row = rows.len() as u32;
+                rows.push(CrossingFacet { k1, k2, k3, k4, d, c0: c[0], c1: c[1], az: a[2], bz: bb[2], cz: c[2] });
+                tops.push(a[2].max(bb[2]).max(c[2]));
                 let (x0, x1) = (p.iter().map(|q| q[0]).fold(f64::INFINITY, f64::min), p.iter().map(|q| q[0]).fold(f64::NEG_INFINITY, f64::max));
                 let (y0, y1) = (p.iter().map(|q| q[1]).fold(f64::INFINITY, f64::min), p.iter().map(|q| q[1]).fold(f64::NEG_INFINITY, f64::max));
                 for y in at(y0, bounds.min[1], ny)..=at(y1, bounds.min[1], ny) {
                     for x in at(x0, bounds.min[0], nx)..=at(x1, bounds.min[0], nx) {
-                        cells[y * nx + x].push(t as u32);
+                        cells[y * nx + x].push(row);
                     }
                 }
             }
         }
-        MeshSolid { mesh, bounds, cell, nx, ny, cells, tree: OnceLock::new(), shells: OnceLock::new() }
+        let mut entries = Vec::with_capacity(cells.iter().map(Vec::len).sum());
+        let mut offsets = Vec::with_capacity(cells.len() + 1);
+        offsets.push(0);
+        for cell_rows in cells {
+            let start = entries.len();
+            entries.extend(cell_rows.into_iter().map(|row| (tops[row as usize], row)));
+            entries[start..].sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+            offsets.push(entries.len());
+        }
+        MeshSolid { mesh, bounds, cell, nx, ny, rows, entries, offsets, pad, tree: OnceLock::new(), shells: OnceLock::new() }
     }
 
     /// Whether any facet lies within `r` of `c`, including facets outside a pair's meeting box.
@@ -272,19 +320,27 @@ impl<'a> MeshSolid<'a> {
         let cx = (((x - b.min[0]) / self.cell).floor().max(0.0) as usize).min(self.nx - 1);
         let cy = (((y - b.min[1]) / self.cell).floor().max(0.0) as usize).min(self.ny - 1);
         let mut crossings = 0;
-        for &t in &self.cells[cy * self.nx + cx] {
-            let [a, bb, c] = self.mesh.triangles[t as usize].map(|v| self.mesh.positions[v as usize]);
-            let d = (bb[1] - c[1]) * (a[0] - c[0]) + (c[0] - bb[0]) * (a[1] - c[1]);
-            if d == 0.0 {
-                continue;
+        let cell = cy * self.nx + cx;
+        // A crossing's nonnegative weights sum to one within a few ulps. Its z can
+        // exceed the highest vertex by at most rounding noise (< 8 * 2^-53 of the
+        // mesh z scale), well inside the 2^-30 pad.
+        let cutoff = q[2] - self.pad;
+        for &(zmax, row) in &self.entries[self.offsets[cell]..self.offsets[cell + 1]] {
+            if zmax < cutoff {
+                break;
             }
-            let l1 = ((bb[1] - c[1]) * (x - c[0]) + (c[0] - bb[0]) * (y - c[1])) / d;
-            let l2 = ((c[1] - a[1]) * (x - c[0]) + (a[0] - c[0]) * (y - c[1])) / d;
+            // No XY box prune: a sliver's rounded d can have the wrong sign and count points outside its box.
+            let r = &self.rows[row as usize];
+            let (dx, dy) = (x - r.c0, y - r.c1);
+            // ((bb[1] - c[1]) * (x - c[0]) + (c[0] - bb[0]) * (y - c[1])) / d
+            let l1 = (r.k1 * dx + r.k2 * dy) / r.d;
+            // ((c[1] - a[1]) * (x - c[0]) + (a[0] - c[0]) * (y - c[1])) / d
+            let l2 = (r.k3 * dx + r.k4 * dy) / r.d;
             let l3 = 1.0 - l1 - l2;
             if l1 < 0.0 || l2 < 0.0 || l3 < 0.0 {
                 continue;
             }
-            if l1 * a[2] + l2 * bb[2] + l3 * c[2] > q[2] {
+            if l1 * r.az + l2 * r.bz + l3 * r.cz > q[2] {
                 crossings += 1;
             }
         }

@@ -469,7 +469,7 @@ fn finish(c: &mut Channel) {
 }
 
 /// The model of `doc` (loaded from `src`). Read-only parts come in later
-/// from [`played_parts`] through [`TrackModel::set_played`].
+/// from [`played_parts_async`] through [`TrackModel::set_played`].
 pub fn build(doc: &ScoreDoc, src: &str) -> TrackModel {
     let outline = source::outline(src);
     let toks = &outline.tokens;
@@ -664,9 +664,14 @@ fn list_event(n: &makepad_score_live::model::ListNote, drums: bool) -> Ev {
 /// run over the song once, without sound. Off the UI thread.
 pub type Played = HashMap<String, Vec<(f64, f32, f32, f32, bool)>>;
 
+#[cfg(test)]
 pub fn played_parts(source: &str, control: &PrepareControl) -> Result<Played, LoadError> {
+    makepad_score_live::drive(played_parts_async(source, control))
+}
+
+pub async fn played_parts_async(source: &str, control: &PrepareControl) -> Result<Played, LoadError> {
     use makepad_score_live::compose::Composer;
-    let loaded = makepad_score_live::load_controlled(source, control)?;
+    let loaded = makepad_score_live::load(source, control).await?;
     let fixed: Vec<String> = loaded.doc.loops.iter().filter(|l| l.code.is_some()).map(|l| l.name.clone()).collect();
     let mut out = Played::default();
     if fixed.is_empty() {

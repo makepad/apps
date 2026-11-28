@@ -34,6 +34,7 @@ use super::SweepEntity;
 use crate::blend::hcr::{Hcr, HcrOptions};
 use crate::boolean::merge::p4::{notification_key, KernelManifoldIntersector};
 use crate::curve::curve::Curve;
+use crate::error::sweep::SweepFailure;
 use crate::error::{EntityRef, Result, SolidError};
 use crate::geom::attribute::{
     ids, Attribute, AttributeStore, AttributeValue, Behavior, ObjectKey, TagData,
@@ -519,7 +520,7 @@ impl<'a> SweepStore<'a> {
         self.attributes.absorb(own, &|key| {
             crate::topology::loopuse::entity_of_notify_key(key)
                 .map(|e| identities.object(namespace, e).key)
-                .ok_or(invalid("attribute list names no object"))
+                .ok_or_else(|| invalid("attribute list names no object"))
         })
     }
 
@@ -633,7 +634,12 @@ impl<'a> SweepStore<'a> {
                 use_existing_topology,
                 create_new_breps_for_faces,
             )?
-            .ok_or_else(|| SolidError::null_pointer(OP))
+            .ok_or_else(|| {
+                SolidError::sweep_null_defect(
+                    OP,
+                    "the piecewise merge keeps its result operand; only an extraction into separate bodies clears it, and this merge does none",
+                )
+            })
         })
     }
 
@@ -658,7 +664,12 @@ impl<'a> SweepStore<'a> {
                 use_existing_topology,
                 create_new_breps_for_faces,
             )?
-            .ok_or_else(|| SolidError::null_pointer(OP))
+            .ok_or_else(|| {
+                SolidError::sweep_null_defect(
+                    OP,
+                    "the piecewise merge keeps its result operand; only an extraction into separate bodies clears it, and this merge does none",
+                )
+            })
         })
     }
 
@@ -784,7 +795,9 @@ impl<'a> SweepStore<'a> {
             .edge(edge.1)?
             .curve
             .as_ref()
-            .ok_or_else(|| SolidError::null_pointer(OP))?;
+            .ok_or_else(|| {
+                SolidError::sweep(OP, SweepFailure::EdgeWithoutCurve { edge: edge.1 })
+            })?;
         if let Some(provider) = self.identities.0 {
             return Ok(provider.curve(edge.0, edge.1, curve));
         }
@@ -1085,7 +1098,7 @@ impl SweepAccess for SweepStore<'_> {
                 .ok_or_else(|| invalid("unknown context"))?
                 .kernel;
             if let Body::Hcr(hcr) = &mut e.body {
-                crate::error::ignore_status(hcr.compute_global_visibility(k))?;
+                hcr.compute_global_visibility(k)?;
             }
             Ok(super::access::SweepScene { brep: scene })
         })();
@@ -1602,6 +1615,49 @@ mod tests {
         }
     }
 
+    /// `sweep_edges_higher` is public and runs no `tag_profile` of its own: with tagging on,
+    /// a caller's untagged edge (not a silhouette edge) is the caller's input.
+    #[test]
+    fn a_direct_tagging_edge_sweep_refuses_an_untagged_edge_as_input() {
+        use crate::curve::line::Line;
+        use crate::error::sweep::SweepFailure;
+        use crate::error::ErrorKind;
+        use crate::nurbs::b_spline_surface_n_lib::p2::OrientType;
+        let mut store = SweepStore::owned();
+        let c = store.insert_kernel(Kernel::default()).unwrap();
+        let source = store.create_brep(c).unwrap();
+        let dest = store.create_brep(c).unwrap();
+        let start = point(&mut store, source, Vec3::ZERO);
+        let source_region = store.infinite_region(source).unwrap();
+        let curve = Curve::from(Line::from_points(Vec3::ZERO, Vec3::X, 3));
+        let interval = curve.natural_interval();
+        let (edge, _) = store
+            .make_wire_edge_vertex(
+                (source, source_region),
+                (source, start),
+                curve,
+                interval,
+                OrientType::Same,
+                Vec3::X,
+            )
+            .unwrap();
+        let region = store.infinite_region(dest).unwrap();
+        let mut sweep = TopologySweep {
+            do_tagging: true,
+            do_stitching: false,
+            ..TopologySweep::default()
+        };
+        let e = sweep
+            .sweep_edges_higher(&mut store, &translation(), (dest, region), &[Some(edge)])
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e}");
+        assert_eq!(
+            e.sweep_failure(),
+            Some(&SweepFailure::UntaggedEdge { edge: edge.1 })
+        );
+        assert_eq!(e.upstream_status(), Some(crate::error::SM_ERR_NULL_POINTER));
+    }
+
     #[test]
     fn higher_vertex_sweep_constructs_the_real_wire_and_preserves_contexts() {
         let mut store = SweepStore::owned();
@@ -1883,7 +1939,7 @@ mod tests {
         assert_eq!(store.curve_tag((b, edge)).unwrap(), Some(curve_tag));
         assert_eq!(store.tag(SweepEntity::Edge(b, edge)).unwrap(), None);
         assert!(store
-            .insert_brep(c, store.brep(b).unwrap().clone())
+            .insert_brep(c, store.brep(b).unwrap().clone_standing_for_self().unwrap())
             .is_err());
         store.remove_brep(b).unwrap();
         assert!(!store.attributes.is_live(h));

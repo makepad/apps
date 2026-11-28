@@ -270,6 +270,66 @@ fn a_background_build_gives_way_to_a_preview() {
     background.join().unwrap();
 }
 
+#[test]
+fn give_way_then_real_cancel() {
+    use makepad_csg_brep_model::engine::Engine;
+    use makepad_csg_graph::{BrepEngine, BrepOp, BrepStep};
+    use std::cell::Cell;
+    use std::sync::mpsc::channel;
+
+    let engine = Engine::default();
+    let (background_key, preview_key, next_key) = ([1; 32], [2; 32], [3; 32]);
+    let sphere = |key, radius| vec![BrepStep { key, op: BrepOp::Sphere { radius }, inputs: vec![] }];
+    std::thread::scope(|scope| {
+        let (started, ready) = channel();
+        let engine = &engine;
+        let background = scope.spawn(move || {
+            makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
+            let started = Cell::new(Some(started));
+            let cancel = || {
+                // Start the preview while the worker is meshing the background sphere.
+                if engine.built(&[background_key]) {
+                    if let Some(started) = started.take() {
+                        started.send(()).unwrap();
+                    }
+                }
+                // Only the worker building the preview can publish this key. The
+                // background request is back in the queue while the preview meshes.
+                engine.built(&[preview_key])
+            };
+            engine.mesh(sphere(background_key, 25.0), 0.01, Some(&cancel))
+        });
+        ready.recv().expect("the background sphere must start meshing");
+        let preview = engine.mesh(sphere(preview_key, 15.0), 0.02, None).expect("the preview must get a fresh kernel token");
+        assert!(!preview.triangles.is_empty());
+        let failure = background.join().unwrap().expect_err("the requeued background build was cancelled");
+        assert_eq!(failure.message, BrepError::Cancelled.to_string());
+        assert_eq!(failure.step, None, "a queued cancel does not fail a modeling step");
+    });
+    let next = vec![BrepStep { key: next_key, op: BrepOp::Box { size: [2.0; 3] }, inputs: vec![] }];
+    let volume = engine.measure(next).expect("the worker must serve the next job").volume;
+    assert!((volume - 8.0).abs() < 1e-6);
+}
+
+#[test]
+fn upstream_fixes_at_the_pin() {
+    use makepad_csg_brep::kernel::UpstreamFixes;
+    // The pin's nine flags plus Fab's tangent open-face bridge from patch 0003.
+    assert_eq!(UpstreamFixes::NAMES, [
+        "closed_smooth_pole_tangent_limit",
+        "edgeuse_convexity_propagates_step_off_failure",
+        "fillet_chamfer_cone_on_arc",
+        "fillet_exact_round_classes",
+        "fillet_knife_edge_rounds",
+        "fillet_patch_keeps_fillet_edges",
+        "fillet_trace_reaches_rails",
+        "keep_exact_pcurves",
+        "linear_sweep_arc_is_cylinder",
+        "shell_tangent_open_face_bridge",
+    ]);
+    assert!(new_kernel().fixes.flags().all(|(_, enabled)| enabled));
+}
+
 /// How far a point is from a mesh's surface.
 fn nearest(m: &makepad_csg_mesh::mesh::TriMesh, p: makepad_csg_math::Vec3d) -> f64 {
     m.triangles.iter().map(|t| {
@@ -465,10 +525,11 @@ fn a_shell_of_smooth_corners_keeps_exact_corner_walls_and_its_derived_volume() {
             const VERTICES: usize = 2 * 3 * 8;
             const EDGES: usize = 2 * (3 + 2) * 8;
             const FACES: usize = 2 * (8 + 8 + 1) + 1; // walls, fillets and roof per skin, plus the rim
-            const FACE_KINDS: [(&str, usize); 4] = [
+            // A cylinder is a cone of the kernel's: the quarter-arc walls are exact cylinders,
+            // and so is their inward offset.
+            const FACE_KINDS: [(&str, usize); 3] = [
                 ("plane", 2 * (4 + 1) + 1), // four flat walls and a roof per skin, plus the annular rim
-                ("extrusion", 2 * 4),       // the four quarter-arc walls on each skin
-                ("cone", 2 * 4),            // cylindrical fillets along the four straight top edges
+                ("cone", 2 * (4 + 4)),      // per skin: the four quarter-arc walls, and the fillets along the four straight top edges
                 ("revolution", 2 * 4),      // a circular fillet revolved around each corner
             ];
 
@@ -559,13 +620,14 @@ fn a_shell_of_smooth_corners_keeps_exact_corner_walls_and_its_derived_volume() {
                 let corner_area = (PI / 2.0) * inner_radius * STRAIGHT_HEIGHT;
                 for sx in [-1.0, 1.0] {
                     for sz in [-1.0, 1.0] {
-                        // The two arc centroids lie on this corner's bisector. The smaller
-                        // radius puts the inner centroid closer to the square of corner centres.
-                        let mut arcs: Vec<_> = faces.iter().filter(|f| f.kind == "extrusion"
+                        // The two arc walls' centroids lie on this corner's bisector, past the
+                        // square of corner centres on both axes (a straight top fillet's is
+                        // inside it on one). The smaller radius puts the inner centroid closer.
+                        let mut arcs: Vec<_> = faces.iter().filter(|f| f.kind == "cone"
                             && sx * f.centroid[0] > RUN / 2.0 && sz * f.centroid[2] > RUN / 2.0).collect();
                         arcs.sort_by(|a, b| a.centroid[0].abs().total_cmp(&b.centroid[0].abs()));
                         let [inner, outer] = arcs.as_slice() else {
-                            panic!("{wall} mm wall, corner ({sx}, {sz}) needs two extrusions, found {}", arcs.len());
+                            panic!("{wall} mm wall, corner ({sx}, {sz}) needs two arc walls, found {}", arcs.len());
                         };
                         assert!((inner.area - corner_area).abs() <= 1e-6 * corner_area,
                             "{wall} mm wall, inner corner ({sx}, {sz}) area {} mm², expected {corner_area}", inner.area);

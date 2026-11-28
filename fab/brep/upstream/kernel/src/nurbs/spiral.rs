@@ -46,9 +46,10 @@
 //!   allocation error above the ceiling even if an overcommitting allocator would
 //!   accept the reservation.
 
+use crate::math::det;
 use std::f64::consts::TAU;
 
-use crate::error::{NlibCode, Result, SolidError};
+use crate::error::{nurbs::NurbsFailure, Result, SolidError};
 use crate::math::Vec3;
 use crate::nurbs::crv_basic::Curve;
 use crate::nurbs::crv_fit::p1::ParamMethod;
@@ -149,8 +150,8 @@ impl Spiral {
         } else {
             theta
         };
-        let cos_theta = theta.cos();
-        let sin_theta = theta.sin();
+        let cos_theta = det::cos(theta);
+        let sin_theta = det::sin(theta);
         Vec3::new(
             self.radius_at(theta) * cos_theta,
             self.rl * self.radius_at(theta) * sin_theta,
@@ -166,8 +167,8 @@ impl Spiral {
         } else {
             theta
         };
-        let cos_theta = theta.cos();
-        let sin_theta = theta.sin();
+        let cos_theta = det::cos(theta);
+        let sin_theta = det::sin(theta);
         Vec3::new(
             -self.radius_at(theta) * sin_theta + self.rdfun * cos_theta,
             self.rl * (self.radius_at(theta) * cos_theta + self.rdfun * sin_theta),
@@ -186,7 +187,7 @@ impl Spiral {
 ///
 /// # Errors
 ///
-/// [`NlibCode::Input`] for `height < NL_MTOL`, a radius below `-NL_MTOL`, both radii
+/// [`NurbsFailure::Input`] for `height < NL_MTOL`, a radius below `-NL_MTOL`, both radii
 /// (near) zero, `num_turns < NL_MTOL`, or a single interpolation point (fewer than
 /// `1/8` turn when fitting); errors of the cubic interpolation and evaluation;
 /// `InvalidInput` when the point arrays cannot be allocated.
@@ -204,10 +205,10 @@ pub fn approx_spiral(spec: &SpiralSpec) -> Result<ApproxSpiral> {
 
     // Check for input errors.
     if height < MODEL_TOL {
-        return Err(SolidError::nlib(OP, NlibCode::Input));
+        return Err(SolidError::nurbs(OP, NurbsFailure::Input));
     }
     if (rad0 < -MODEL_TOL) || (rad1 < -MODEL_TOL) {
-        return Err(SolidError::nlib(OP, NlibCode::Input));
+        return Err(SolidError::nurbs(OP, NurbsFailure::Input));
     }
     if rad0 < MODEL_TOL {
         rad0 = 0.;
@@ -216,10 +217,10 @@ pub fn approx_spiral(spec: &SpiralSpec) -> Result<ApproxSpiral> {
         rad1 = 0.;
     }
     if (rad0 + rad1) < MODEL_TOL {
-        return Err(SolidError::nlib(OP, NlibCode::Input));
+        return Err(SolidError::nurbs(OP, NurbsFailure::Input));
     }
     if num_turns < MODEL_TOL {
-        return Err(SolidError::nlib(OP, NlibCode::Input));
+        return Err(SolidError::nurbs(OP, NurbsFailure::Input));
     }
     if tol < 10.0 * MODEL_TOL {
         tol = 10.0 * MODEL_TOL;
@@ -247,7 +248,7 @@ pub fn approx_spiral(spec: &SpiralSpec) -> Result<ApproxSpiral> {
 
     loop {
         let count = usize::try_from(n_spans.saturating_add(1))
-            .map_err(|_| SolidError::nlib(OP, NlibCode::Input))?;
+            .map_err(|_| SolidError::nurbs(OP, NurbsFailure::Input))?;
         let mut pnts: Vec<Vec3> = Vec::new();
         if !crate::limits::try_reserve_total(&mut pnts, count) {
             return Err(SolidError::InvalidInput {
@@ -509,7 +510,7 @@ mod tests {
     #[test]
     fn input_errors() {
         let err = |s: SpiralSpec| approx_spiral(&s).unwrap_err();
-        let nl = SolidError::nlib(OP, NlibCode::Input);
+        let nl = SolidError::nurbs(OP, NurbsFailure::Input);
         assert_eq!(
             err(SpiralSpec {
                 height: 0.0,
@@ -544,11 +545,9 @@ mod tests {
             err(SpiralSpec {
                 num_turns: 1e-4,
                 ..spec(0, 1e-3)
-            }),
-            SolidError::Nlib {
-                code: NlibCode::Input,
-                ..
-            }
+            })
+            .nurbs_failure(),
+            Some(NurbsFailure::Input)
         ));
     }
 

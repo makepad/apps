@@ -13,7 +13,7 @@ use makepad_csg_brep::curve::curve::Curve;
 use makepad_csg_brep::geom::attribute::ObjectKey;
 use makepad_csg_brep::geom::axis2_placement::Axis2Placement;
 use makepad_csg_brep::geom::object::ObjectRef;
-use makepad_csg_brep::kernel::{Kernel, UpstreamFixes};
+use makepad_csg_brep::kernel::{Kernel, KernelOptions};
 use makepad_csg_brep::math::{Point3, Vec3};
 use makepad_csg_brep::nurbs::b_spline_curve::BSplineCurve;
 use makepad_csg_brep::nurbs::crv_fit::p1::ParamMethod;
@@ -40,14 +40,33 @@ pub enum BoolMode {
     Intersection,
 }
 
-/// A kernel with every correction to its reference behaviour switched on: a clear
-/// failure beats a body that is not a solid.
+/// A kernel configured with the fixes Fab uses at its pinned revision.
 pub fn new_kernel() -> Kernel {
-    let mut k = Kernel::default();
-    k.fixes = UpstreamFixes::all();
-    // Remakes a shell's inner edges as analytic curves, on a path that needs surface caches
-    // bound to faces the simple shell does not bind: marched edges are within tolerance.
-    k.fixes.shell_edges_on_analytics_exact = false;
+    crate::stack::probe();
+    let mut k = Kernel::new(&KernelOptions::default());
+    k.cancel = crate::guard::current_token();
+    k.fixes.closed_smooth_pole_tangent_limit = true;
+    k.fixes.edgeuse_convexity_propagates_step_off_failure = true;
+    k.fixes.fillet_chamfer_cone_on_arc = true;
+    k.fixes.fillet_exact_round_classes = true;
+    k.fixes.fillet_knife_edge_rounds = true;
+    k.fixes.fillet_patch_keeps_fillet_edges = true;
+    k.fixes.fillet_trace_reaches_rails = true;
+    k.fixes.keep_exact_pcurves = true;
+    k.fixes.linear_sweep_arc_is_cylinder = true;
+    k.fixes.shell_tangent_open_face_bridge = true;
+    k
+}
+
+/// Starts a private kernel for a step or a read: the same tolerances, memo setting and fixes,
+/// the current guarded call's token, its draws from `seed`. A body carries no marks, so the
+/// fresh context's mark counters need not go on from `previous`'s.
+pub(crate) fn renewed(previous: &Kernel, seed: u64) -> Kernel {
+    crate::stack::probe();
+    let mut k = Kernel::new(&KernelOptions { tolerances: previous.tolerances, seed });
+    k.cancel = crate::guard::current_token();
+    k.memoize_curve_caches = previous.memoize_curve_caches;
+    k.fixes = previous.fixes;
     k
 }
 
@@ -66,6 +85,7 @@ fn input(m: impl Into<String>) -> BrepError {
 /// A copy that fillets and booleans as the original does (a plain `Clone` loses the
 /// owners of its geometry).
 pub fn copy_body(k: &mut Kernel, b: &Body, serial: u64) -> Result<Body, BrepError> {
+    crate::guard::check_entry(k, "copy_body")?;
     let named = |entity, domain: u64| {
         let r = p3::topology_ref(0, entity);
         ObjectRef { type_code: r.type_code, key: ObjectKey(domain + r.type_code as u64 * 1_000_000 + (r.key.0 & 0xffff_ffff)) }
@@ -79,6 +99,7 @@ pub fn copy_body(k: &mut Kernel, b: &Body, serial: u64) -> Result<Body, BrepErro
 
 /// Moves a body: rotation in degrees about X, then Y, then Z, then a translation.
 pub fn place(k: &mut Kernel, b: &mut Body, at: [f64; 3], rotate: [f64; 3]) -> Result<(), BrepError> {
+    crate::guard::check_entry(k, "place")?;
     let (sx, cx) = rotate[0].to_radians().sin_cos();
     let (sy, cy) = rotate[1].to_radians().sin_cos();
     let (sz, cz) = rotate[2].to_radians().sin_cos();
@@ -93,18 +114,21 @@ pub fn place(k: &mut Kernel, b: &mut Body, at: [f64; 3], rotate: [f64; 3]) -> Re
 /// Moves a body by a frame: X to `x`, Y to `y`, Z to their cross product (`x`, `y` unit and
 /// square), then to `at`.
 pub fn place_frame(k: &mut Kernel, b: &mut Body, at: [f64; 3], x: [f64; 3], y: [f64; 3]) -> Result<(), BrepError> {
+    crate::guard::check_entry(k, "place_frame")?;
     p5::transform(k, b, &Axis2Placement::new(p3d(at), v3d(x), v3d(y)), None, false)?;
     Ok(())
 }
 
 /// Scales a body about the origin by (x, y, z), uniform or not.
 pub fn scale(k: &mut Kernel, b: &mut Body, factor: [f64; 3]) -> Result<(), BrepError> {
+    crate::guard::check_entry(k, "scale")?;
     p5::transform(k, b, &Axis2Placement::IDENTITY, Some(v3d(factor)), true)?;
     Ok(())
 }
 
 /// Mirrors a body in the plane through `center` with this normal.
 pub fn mirrored(k: &mut Kernel, b: &mut Body, center: [f64; 3], normal: [f64; 3]) -> Result<(), BrepError> {
+    crate::guard::check_entry(k, "mirrored")?;
     let n = normal;
     let helper = if n[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
     let x = [helper[1] * n[2] - helper[2] * n[1], helper[2] * n[0] - helper[0] * n[2], helper[0] * n[1] - helper[1] * n[0]];
@@ -116,6 +140,7 @@ pub fn mirrored(k: &mut Kernel, b: &mut Body, center: [f64; 3], normal: [f64; 3]
 
 /// A box centred on the origin.
 pub fn make_box(k: &mut Kernel, size: [f64; 3]) -> Result<Body, BrepError> {
+    crate::guard::check_entry(k, "make_box")?;
     if size.iter().any(|s| *s <= 0.0) {
         return Err(input("a box needs a positive size"));
     }
@@ -123,6 +148,7 @@ pub fn make_box(k: &mut Kernel, size: [f64; 3]) -> Result<Body, BrepError> {
 }
 
 pub fn make_sphere(k: &mut Kernel, radius: f64) -> Result<Body, BrepError> {
+    crate::guard::check_entry(k, "make_sphere")?;
     if radius <= 0.0 {
         return Err(input("a sphere needs a positive radius"));
     }
@@ -131,6 +157,7 @@ pub fn make_sphere(k: &mut Kernel, radius: f64) -> Result<Body, BrepError> {
 
 /// Along Y, centred.
 pub fn make_cylinder(k: &mut Kernel, radius: f64, height: f64) -> Result<Body, BrepError> {
+    crate::guard::check_entry(k, "make_cylinder")?;
     if radius <= 0.0 || height <= 0.0 {
         return Err(input("a cylinder needs a positive radius and height"));
     }
@@ -142,6 +169,7 @@ pub fn make_cylinder(k: &mut Kernel, radius: f64, height: f64) -> Result<Body, B
 
 /// Along Y, centred; `top` is the radius at +Y.
 pub fn make_cone(k: &mut Kernel, radius: f64, top: f64, height: f64) -> Result<Body, BrepError> {
+    crate::guard::check_entry(k, "make_cone")?;
     if radius < 0.0 || top < 0.0 || (radius == 0.0 && top == 0.0) || height <= 0.0 {
         return Err(input("a cone needs a positive height and a positive radius at one end"));
     }
@@ -152,6 +180,7 @@ pub fn make_cone(k: &mut Kernel, radius: f64, top: f64, height: f64) -> Result<B
 
 /// In the XZ plane.
 pub fn make_torus(k: &mut Kernel, radius: f64, tube: f64) -> Result<Body, BrepError> {
+    crate::guard::check_entry(k, "make_torus")?;
     if tube <= 0.0 || radius <= tube {
         return Err(input("a torus needs radius > tube > 0"));
     }
@@ -170,6 +199,7 @@ fn flat(chains: Vec<Vec<Curve>>) -> Vec<Curve> {
 
 /// Extrudes a sketch placed on `frame` along `dir` (unit) by `height`.
 pub fn extrude(k: &mut Kernel, sketch: &Sketch, frame: &Frame, dir: [f64; 3], height: f64) -> Result<Body, BrepError> {
+    crate::guard::check_entry(k, "extrude")?;
     if height <= 0.0 {
         return Err(input("an extrude needs a positive height"));
     }
@@ -181,6 +211,7 @@ pub fn extrude(k: &mut Kernel, sketch: &Sketch, frame: &Frame, dir: [f64; 3], he
 /// face's outline (every loop, so a face with holes keeps them) swept along its outward normal,
 /// with that normal and a point on the face.
 pub fn pull_prisms(k: &mut Kernel, b: &mut Body, faces: &[FaceId], by: f64) -> Result<Vec<(Body, [f64; 3], [f64; 3])>, BrepError> {
+    crate::guard::check_entry(k, "pull_prisms")?;
     use makepad_csg_brep::nurbs::b_spline_curve_n_lib::TrimMode;
     use makepad_csg_brep::topology::{edge, face};
     if by == 0.0 || !by.is_finite() {
@@ -197,7 +228,7 @@ pub fn pull_prisms(k: &mut Kernel, b: &mut Body, faces: &[FaceId], by: f64) -> R
             let mut interval = edge::interval(b, e)?;
             // (the kernel's own status of a trim to the edge is ignored, as its sweeps do)
             if let Err(e) = copy.trim(k, &mut interval, TrimMode::Silent) {
-                if e.is_unported() {
+                if e.root_cause().is_cancelled() || e.is_unported() {
                     return Err(e.into());
                 }
             }
@@ -213,6 +244,7 @@ pub fn pull_prisms(k: &mut Kernel, b: &mut Body, faces: &[FaceId], by: f64) -> R
 /// Pulls flat faces `faces` of `b` along their outward normals by `by` (into the body below 0):
 /// each face's prism joined on, or cut away. A result that is not a closed solid is refused.
 pub fn pull(k: &mut Kernel, mut b: Body, faces: &[FaceId], by: f64) -> Result<Body, BrepError> {
+    crate::guard::check_entry(k, "pull")?;
     let prisms = pull_prisms(k, &mut b, faces, by)?;
     let mode = if by > 0.0 { BoolMode::Union } else { BoolMode::Difference };
     let mut out = b;
@@ -270,6 +302,7 @@ fn drill_tool(k: &mut Kernel, kind: HoleKind, diameter: f64, depth: f64) -> Resu
 /// Build the tool once, then place one copy at each drill point. Naming uses the simple tool
 /// for every kind because only the narrow shaft and its blind far cap supply names.
 pub(super) fn hole_cutters(k: &mut Kernel, b: &Body, kind: HoleKind, diameter: f64, depth: Option<f64>, at: &[[f64; 3]], dir: [f64; 3]) -> Result<Vec<Body>, BrepError> {
+    crate::guard::check_entry(k, "hole_cutters")?;
     let (last, rest) = at.split_last().ok_or_else(|| input("a hole needs at least one point in 'at'"))?;
     if !at.iter().flatten().all(|x| x.is_finite()) {
         return Err(input("a hole needs finite coordinates in 'at'"));
@@ -297,6 +330,7 @@ pub(super) fn hole_cutters(k: &mut Kernel, b: &Body, kind: HoleKind, diameter: f
 
 /// Drill all points with a single difference against the union of their cutters.
 pub fn hole(k: &mut Kernel, b: Body, kind: HoleKind, diameter: f64, depth: Option<f64>, at: &[[f64; 3]], dir: [f64; 3]) -> Result<Body, BrepError> {
+    crate::guard::check_entry(k, "hole")?;
     let mut cutters = hole_cutters(k, &b, kind, diameter, depth, at, dir)?.into_iter();
     let first = cutters.next().ok_or_else(|| input("a hole needs at least one point in 'at'"))?;
     let tool = cutters.try_fold(first, |a, b| boolean(k, BoolMode::Union, a, b))?;
@@ -305,6 +339,7 @@ pub fn hole(k: &mut Kernel, b: Body, kind: HoleKind, diameter: f64, depth: Optio
 
 /// Revolves a sketch (u the radius, v the height, in the XY plane) about Y by `angle` degrees.
 pub fn revolve(k: &mut Kernel, sketch: &Sketch, angle: f64) -> Result<Body, BrepError> {
+    crate::guard::check_entry(k, "revolve")?;
     let frame = Frame { origin: [0.0; 3], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0] };
     let curves = flat(sketch_curves(k, sketch, &frame)?);
     Ok(create_rotational_sweep(k, &refs(&curves), p3d([0.0; 3]), v3d([0.0, 1.0, 0.0]), angle, true)?)
@@ -314,6 +349,7 @@ pub fn revolve(k: &mut Kernel, sketch: &Sketch, angle: f64) -> Result<Body, Brep
 /// size at `path[i]` (empty: its own size all the way). The path is centripetal: cubic through
 /// four or more points, a parabola through three, a line through two.
 pub fn sweep(k: &mut Kernel, sketch: &Sketch, path: &[[f64; 3]], scale: &[f64]) -> Result<Body, BrepError> {
+    crate::guard::check_entry(k, "sweep")?;
     if path.len() < 2 {
         return Err(input("a sweep's path needs two points"));
     }
@@ -373,13 +409,14 @@ fn through(points: &[Point3], params: &[f64]) -> Result<BSplineCurve, BrepError>
 
 /// A solid through sketches each at its own frame, of `degree` along the loft.
 pub fn loft(k: &mut Kernel, sections: &[(Sketch, Frame)], degree: usize) -> Result<Body, BrepError> {
+    crate::guard::check_entry(k, "loft")?;
     if sections.len() < 2 {
         return Err(input("a loft needs two sections"));
     }
     let mut counts = Vec::with_capacity(sections.len());
     let mut all = Vec::new();
     for (i, (s, f)) in sections.iter().enumerate() {
-        let curves = flat(sketch_curves(k, s, f).map_err(|e| input(format!("section {i}: {e}")))?);
+        let curves = flat(sketch_curves(k, s, f).map_err(|e| e.input_context(format_args!("section {i}")))?);
         counts.push(curves.len());
         all.extend(curves);
     }
@@ -391,6 +428,7 @@ pub fn loft(k: &mut Kernel, sections: &[(Sketch, Frame)], degree: usize) -> Resu
 
 /// A boolean. Both inputs are taken.
 pub fn boolean(k: &mut Kernel, mode: BoolMode, a: Body, b: Body) -> Result<Body, BrepError> {
+    crate::guard::check_entry(k, "boolean")?;
     let out = match mode {
         BoolMode::Union => boolean_union(k, a, b)?,
         BoolMode::Difference => boolean_difference(k, a, b)?,
@@ -441,7 +479,7 @@ fn blend(k: &mut Kernel, b: &mut Body, edges: &[EdgeId], size: f64, generator: F
 /// (the kernel's own status alone is a bare "upstream status 1001").
 fn blend_failure<O>(e: makepad_csg_brep::SolidError, info: &makepad_csg_brep::blend::fillet_executive::p3::ErrorInfo<O>, size: f64, bevel: bool) -> BrepError {
     use makepad_csg_brep::blend::fillet_geom::p1::FilletErrorType as T;
-    if e.is_unported() {
+    if e.root_cause().is_cancelled() || e.is_unported() {
         return e.into();
     }
     let what = if bevel { "chamfer" } else { "fillet" };
@@ -462,6 +500,7 @@ fn blend_failure<O>(e: makepad_csg_brep::SolidError, info: &makepad_csg_brep::bl
 
 /// Rounds these edges.
 pub fn fillet(k: &mut Kernel, b: &mut Body, edges: &[EdgeId], radius: f64) -> Result<(), BrepError> {
+    crate::guard::check_entry(k, "fillet")?;
     if radius <= 0.0 {
         return Err(input("a fillet needs a positive radius"));
     }
@@ -471,6 +510,7 @@ pub fn fillet(k: &mut Kernel, b: &mut Body, edges: &[EdgeId], radius: f64) -> Re
 
 /// Bevels these edges by `size` on each side.
 pub fn chamfer(k: &mut Kernel, b: &mut Body, edges: &[EdgeId], size: f64) -> Result<(), BrepError> {
+    crate::guard::check_entry(k, "chamfer")?;
     if size <= 0.0 {
         return Err(input("a chamfer needs a positive size"));
     }
@@ -487,13 +527,14 @@ pub fn chamfer(k: &mut Kernel, b: &mut Body, edges: &[EdgeId], size: f64) -> Res
 /// Cost of the checks, on the B-rep worker: one exact volume and area of the shell, and
 /// [`crossed`]'s tessellation and nearest-face searches.
 pub fn shell(k: &mut Kernel, b: &Body, thickness: f64, open: &[FaceId]) -> Result<Body, BrepError> {
+    crate::guard::check_entry(k, "shell")?;
     if thickness <= 0.0 {
         return Err(input("a shell needs a positive thickness"));
     }
     let options = ShellOptions { offset: OffsetOptions { distance: -thickness, extend_convex_edges: false, merge_results: true }, ..ShellOptions::default() };
     let mut out = match shell_brep_simple(k, b, options, open) {
         Ok(out) => out,
-        Err(e) if e.is_unported() => return Err(e.into()),
+        Err(e) if e.root_cause().is_cancelled() || e.is_unported() => return Err(e.into()),
         Err(e) => {
             // a wall past half the part's thinnest extent is too thick wherever it is; any other
             // failure is the offset's own
@@ -605,6 +646,7 @@ fn shell_refused(k: &Kernel, b: &Body, open: &[FaceId], t: f64, wrong: ShellWron
 /// The body offset by `distance` (negative shrinks). An offset whose faces would run past each
 /// other is refused, with where ([`crossed`]).
 pub fn offset(k: &mut Kernel, b: &mut Body, distance: f64) -> Result<Body, BrepError> {
+    crate::guard::check_entry(k, "offset")?;
     let options = OffsetOptions { distance, extend_convex_edges: false, merge_results: true };
     let mut out = offset_brep_simple(k, b, options)?;
     check_solid(&out, "offset")?;
@@ -645,6 +687,7 @@ fn point(p: [f64; 3]) -> String {
 /// each, most rejected by their box); with open faces, the rim's edges sampled once and one
 /// distance to them per sample nearer than `t`.
 pub fn crossed(k: &mut Kernel, b: &Body, open: &[FaceId], out: &mut Body, t: f64) -> Result<Option<[f64; 3]>, BrepError> {
+    crate::guard::check_entry(k, "crossed")?;
     Ok(crossing(k, b, open, out, t)?.map(|(at, _)| at))
 }
 
@@ -654,7 +697,7 @@ fn crossing(k: &mut Kernel, b: &Body, open: &[FaceId], out: &mut Body, t: f64) -
     use makepad_csg_brep::topology::brep::p1;
     let chord = (t / 10.0).clamp(0.01, 0.2);
     let slack = 2.0 * chord + 1e-6;
-    let mut copy = b.clone();
+    let mut copy = b.clone_standing_for_self()?;
     let mesh = crate::tess::tessellate(k, &mut copy, &crate::tess::TessOptions { chord, ..crate::tess::TessOptions::default() })?;
     let open: Vec<u32> = open.iter().map(|f| f.index() as u32).collect();
     let mut samples = Vec::new();
@@ -669,7 +712,7 @@ fn crossing(k: &mut Kernel, b: &Body, open: &[FaceId], out: &mut Body, t: f64) -
     // the rims: each flat open face's edges with a wall, as segments, with its outward normal
     let mut rims: Vec<([f64; 3], [f64; 3], [f64; 3])> = Vec::new();
     if !open.is_empty() {
-        let mut copy = b.clone();
+        let mut copy = b.clone_standing_for_self()?;
         let flat: Vec<(u32, [f64; 3])> = crate::query::faces(k, &mut copy)?.into_iter().filter_map(|f| Some((f.id.index() as u32, f.normal?))).filter(|(f, _)| open.contains(f)).collect();
         for e in p1::edges(b, None)? {
             let faces: Vec<u32> = crate::names::edge_faces(b, e)?.into_iter().map(|f| f.index() as u32).collect();

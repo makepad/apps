@@ -47,7 +47,8 @@ use crate::blend::fillet_standard_solver::p1::{BoundaryTrimmingType, SurfaceSurf
 use crate::blend::fillet_standard_solver::surface_surface::{BaseBodies, SurfaceSurfaceContext};
 use crate::curve::curve::p8::CurveIntersectOptions;
 use crate::curve::curve::Curve;
-use crate::error::{Result, SolidError};
+use crate::error::blend::BlendFailure;
+use crate::error::{EntityRef, Failure, Result, SolidError, SM_ERR_NULL_POINTER};
 use crate::geom::vector2d::Vec2;
 use crate::kernel::Kernel;
 use crate::math::PI;
@@ -63,12 +64,30 @@ fn deg_to_rad(deg: f64) -> f64 {
     deg * (PI / 180.0)
 }
 
-/// Entry `i` of an intersection's UV curve list (`SM_ERR_NULL_POINTER` for a null
-/// curve, which upstream dereferences).
+/// Entry `i` of an intersection's UV curve list (a [`BlendFailure::Defect`] with
+/// `SM_ERR_NULL_POINTER` for a null curve, which upstream dereferences).
 fn uv(list: &[Option<Curve>], i: usize) -> Result<&Curve> {
-    list.get(i)
-        .and_then(Option::as_ref)
-        .ok_or_else(|| SolidError::null_pointer(OP))
+    list.get(i).and_then(Option::as_ref).ok_or_else(|| {
+        Failure::new(
+            OP,
+            BlendFailure::Defect {
+                why: "the offset surfaces' intersection has no UV curve for a curve it found: \
+                      the intersection is asked for both surfaces' UV curves, one per curve",
+            },
+        )
+        .with_status(SM_ERR_NULL_POINTER)
+        .into_error()
+    })
+}
+
+/// A face given to the surface fillet without a surface
+/// ([`BlendFailure::FaceHasNoSurface`] at the face; status `SM_ERR_NULL_POINTER`, upstream
+/// `NER` of `GetSurface()`).
+fn face_without_surface(face: FaceId) -> SolidError {
+    Failure::new(OP, BlendFailure::FaceHasNoSurface)
+        .with_status(SM_ERR_NULL_POINTER)
+        .at(EntityRef::Face(face))
+        .into_error()
 }
 
 /// The objects `SmSurfaceSurfaceFS::CalcFilletGeom` reaches in a live session.
@@ -120,6 +139,15 @@ impl RailClassificationContext for SurfaceSurfaceSession<'_> {
         }
         .corner_type(corner)
     }
+    fn corner_blend_tests(
+        &self,
+        corner: crate::blend::fillet_geom::p1::FilletCornerId,
+    ) -> Result<(bool, bool)> {
+        classification::Context {
+            corners: self.corners,
+        }
+        .corner_blend_tests(corner)
+    }
     fn corners(&self) -> crate::blend::fillet_geom::p1::CornerLookup<'_> {
         crate::blend::fillet_geom::p1::CornerLookup::table(self.corners)
     }
@@ -150,6 +178,7 @@ impl SurfaceSurfaceContext for SurfaceSurfaceSession<'_> {
                 pseudo,
                 second: Some(second),
                 classified: FilletBody::SecondBase,
+                free: [None, None],
             };
             crate::query::face::p2::curve_on_classify_cached(
                 k, second, face, &objects, true, cc, true, false, true, &mut cache,
@@ -169,12 +198,13 @@ impl SurfaceSurfaceContext for SurfaceSurfaceSession<'_> {
     ) -> Result<()> {
         // The classifications only read the rails' curves and the base topology,
         // which the split leaves as they are: resolve them in a copy of the pseudo body.
-        let snapshot = pseudo.brep().clone();
+        let snapshot = pseudo.brep().clone_standing_for_self()?;
         let objects = classification::Objects {
             target: bases.target,
             pseudo: &snapshot,
             second: bases.second.as_deref(),
             classified: FilletBody::Target,
+            free: [None, None],
         };
         solver.split_and_trim_fillet_surface_with(
             k,
@@ -230,7 +260,7 @@ impl SessionObjects<'_> {
                 .face(face)?
                 .surface
                 .clone()
-                .ok_or_else(|| SolidError::null_pointer(OP))?;
+                .ok_or_else(|| face_without_surface(face))?;
             surfaces.push((surface, SurfaceId::Face(face)));
         }
         let [s1, s2]: [(Surface, SurfaceId); 2] = surfaces
@@ -293,7 +323,7 @@ impl FilletSession<'_> {
                 .face(face)?
                 .surface
                 .clone()
-                .ok_or_else(|| SolidError::null_pointer(OP))
+                .ok_or_else(|| face_without_surface(face))
         };
         let [face1, face2] = faces;
         let sur1 = surface_of(self, 0, face1)?;
@@ -354,7 +384,13 @@ impl FilletSession<'_> {
                     )?;
                     // Self-intersecting fillets are not yet handled
                     if !solutions.is_empty() {
-                        return Err(SolidError::sm_err(OP));
+                        return Err(SolidError::blend(
+                            OP,
+                            BlendFailure::FilletCrossesItself {
+                                first: ii,
+                                second: jjj,
+                            },
+                        ));
                     }
                 }
             }
@@ -490,7 +526,7 @@ impl FilletSession<'_> {
                 .objects
                 .calc_solver_geometry(k, id, &mut self.executive)
             {
-                Err(error) if error.is_unported() => return Err(error),
+                Err(error) if error.is_unported_or_cancelled() => return Err(error),
                 Err(_) => continue,
                 Ok(()) => {}
             }
@@ -501,7 +537,7 @@ impl FilletSession<'_> {
         // status is not read (void upstream)
         let zone = crate::geom::tol::zone_tol3d(k, tol);
         match self.objects.faces_set_tolerance(k, fillet, zone) {
-            Err(error) if error.is_unported() => return Err(error),
+            Err(error) if error.is_unported_or_cancelled() => return Err(error),
             _ => {}
         }
 
@@ -533,7 +569,7 @@ impl FilletSession<'_> {
                 .objects
                 .stitch_attribute(edge, self.executive.edge_attribute)
             {
-                Err(error) if error.is_unported() => return Err(error),
+                Err(error) if error.is_unported_or_cancelled() => return Err(error),
                 _ => {}
             }
         }
@@ -605,8 +641,23 @@ impl FilletSession<'_> {
     }
 
     /// Take the fillet B-rep [`Self::surface_surface_fillet`] built (upstream
-    /// `GetFilletBrep()`, whose ownership the caller takes).
+    /// `GetFilletBrep()`, whose ownership the caller takes). It carries the attributes
+    /// its objects hold, less `SM_AI_ALL_FILLET_EDGES`, which `~SmFilletExecutive`
+    /// removes from its users.
     pub fn take_fillet_brep(&mut self) -> Option<Brep> {
-        self.objects.intermediate.take()
+        let mut body = self.objects.intermediate.take()?;
+        if let Some(serial) = body.notify_serial() {
+            let mut store = self.objects.attributes.clone();
+            let edge_attribute = match self.executive.edge_attribute {
+                Some(FilletObject::Attribute(handle)) => store.destroy(handle),
+                _ => Ok(()),
+            };
+            if let Ok(store) =
+                edge_attribute.and_then(|()| super::body_attributes(&store, &body, serial))
+            {
+                body.set_attributes(store);
+            }
+        }
+        Some(body)
     }
 }

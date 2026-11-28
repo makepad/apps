@@ -15,7 +15,8 @@ use super::{invalid, FilletBody, FilletObject, SessionObjects, SolverObject};
 use crate::blend::fillet_corner::topology::NxNTopologyEnv;
 use crate::blend::fillet_executive::p3::FilletExecutive;
 use crate::blend::fillet_geom::p1::FilletCornerId;
-use crate::error::{EntityRef, Result, SolidError};
+use crate::error::blend::BlendFailure;
+use crate::error::{EntityRef, Failure, Result, SM_ERR_NULL_POINTER};
 use crate::kernel::Kernel;
 
 impl SessionObjects<'_> {
@@ -30,7 +31,8 @@ impl SessionObjects<'_> {
             .corners
             .get(id.0 as usize)
             .ok_or_else(|| invalid("corner is not live"))?;
-        // Determine if this is a setback corner
+        // Determine if this is a setback corner (kept, where the fork's dc757a6 drops it:
+        // `asked_setback_not_built`)
         if corner.set_back_dist > corner.approx_tol_3d * 100.0 {
             // Let SmFilletConvexNxNCorner handle setbacks
             return self.make_convex_nxn_corner_topology(k, id, executive);
@@ -44,7 +46,18 @@ impl SessionObjects<'_> {
             let object = FilletObject::Topology(FilletBody::Target, EntityRef::Edgeuse(eu));
             match executive.fillet_solver_of_edgeuse(object) {
                 Some(FilletObject::Solver(solver)) => solver_ids.push(solver),
-                None => return Err(SolidError::null_pointer(NATIVE)),
+                None => {
+                    return Err(Failure::new(
+                        NATIVE,
+                        BlendFailure::Defect {
+                            why: "an outward edge use of a concave N x N corner has no fillet \
+                                  solver: the corner is made concave N x N only when every \
+                                  outward edge use has one",
+                        },
+                    )
+                    .with_status(SM_ERR_NULL_POINTER)
+                    .into_error())
+                }
                 Some(_) => return Err(invalid("edge use does not name an actual solver")),
             }
         }

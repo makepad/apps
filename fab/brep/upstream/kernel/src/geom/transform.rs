@@ -38,6 +38,7 @@
 //! | [`Transform::is_curve_in_param_domain_simple`]    | `IsCurveInParamDomainSimple`                          |
 //! | [`Transform::has_discontinuities_simple`]         | `HasDiscontinuitiesSimple`                            |
 //! | [`Transform::read_from_db`]                       | `ReadFromDB`                                          |
+//! | [`Transform::write_rows_to_db`]                   | `WriteToDB` (the matrix rows, before the base data)   |
 //! | [`Transform::TYPE`], [`Transform::type_code`], [`Transform::type_string`], [`Transform::class_string`] | `GetType`, `GetTypeString`, `GetClassString` (`SM_COMMON`) |
 //! | [`Transform::is_kind_of`]                         | `IsKindOf`                                            |
 //!
@@ -58,6 +59,10 @@
 //!   outputs' previous state matters). A requested output without a parameter
 //!   pseudo box is [`SolidError::InvalidInput`] (upstream dereferences the null
 //!   pointer, `plan/findings.md`).
+//! - **WR-8.** [`Transform::evaluate_bounding_box_simple`] maps the exact box image of
+//!   an aligned basis, where upstream's interval formula (`scale(1 / |axis|)`,
+//!   `translate(o · axis)`, and axis-to-basis permutation) does not
+//!   (`plan/upstream-issues/WR-8--addendum-2026-10-31-aligned-bbox-image.md`).
 //! - Out-params become return values. `InvTransformPoint`, `InvTransformVector`
 //!   and `InvEvaluateGuessPointSimple` return `Err` (upstream `SM_ERR`, code 1001)
 //!   for a singular axes sub-matrix, where upstream leaves the output unset.
@@ -75,6 +80,7 @@
 //!   `RotateAboutAxis*`, `DecomposeToAngles`, ... listed in
 //!   `harness/callgraph/unused_functions.txt`) are not part of this unit.
 
+use crate::error::geom::GeomFailure;
 use crate::error::{Result, SolidError};
 use crate::geom::axis2_placement::Axis2Placement;
 use crate::geom::extent1d::Extent1d;
@@ -90,7 +96,7 @@ use crate::surface::volume::p1::{
     is_kind_of as volume_is_kind_of, Discontinuities3d, Volume, VolumeKind,
 };
 use crate::surface::volume::p2::ignore_read;
-use crate::topology::database_io::{DatabaseReader, FileType};
+use crate::topology::database_io::{DatabaseReader, DatabaseWriter, FileType};
 
 /// `GW_MAX_DERIV`: the highest derivative `EvaluateSimple` accepts.
 pub const MAX_DERIV: usize = 5;
@@ -293,7 +299,9 @@ impl Transform {
     pub fn inv_transform_point(&self, p: Point3) -> Result<Point3> {
         let mid = p - self.to_disp();
         self.inv_transform_vector(mid)
-            .map_err(|_| SolidError::sm_err("geom::transform::Transform::inv_transform_point"))
+            .map_err(SolidError::geom_call(
+                "geom::transform::Transform::inv_transform_point",
+            ))
     }
 
     /// Maps a projection-space vector back to parameter space through the inverse
@@ -308,7 +316,9 @@ impl Transform {
             &self.to_y_axis().to_array(),
             &self.to_z_axis().to_array(),
         )
-        .map_err(|_| SolidError::sm_err("geom::transform::Transform::inv_transform_vector"))?;
+        .map_err(SolidError::geom_call(
+            "geom::transform::Transform::inv_transform_vector",
+        ))?;
         let [i0, i1, i2] = inv.map(Vec3::from_array);
         let t_inv = Self::new(Vec3::ZERO, i0, i1, Some(i2));
         Ok(t_inv.transform_vector(v))
@@ -408,8 +418,9 @@ impl Transform {
     ///
     /// `SM_ERR` when the matrix is singular; the transform is then unchanged.
     pub fn invert_simple(&mut self) -> Result<()> {
-        self.m = inverse_4x4(&self.m)
-            .map_err(|_| SolidError::sm_err("geom::transform::Transform::invert_simple"))?;
+        self.m = inverse_4x4(&self.m).map_err(SolidError::geom_call(
+            "geom::transform::Transform::invert_simple",
+        ))?;
         Ok(())
     }
 
@@ -465,29 +476,34 @@ impl Transform {
     ///
     /// The output pseudo box takes the basis of `param_pseudo_box` mapped through the
     /// transform (kept as is when that basis is rejected). When `param_pseudo_box` is
-    /// aligned with the parameter axes the intervals are the parameter intervals
-    /// scaled by `1/|axis|` and shifted by `origin·axis` (upstream's formula, see
-    /// `plan/findings.md`), permuted/negated to the pseudo box's basis order, and
-    /// `proj_box` circumscribes the result. For an unaligned pseudo box and an
-    /// unbounded `param_box` both outputs are made unbounded (the pseudo box keeps
-    /// its previous basis, as upstream); for a bounded `param_box` both outputs
-    /// grow by the images of its corners under `evaluate_point` (the volume's
-    /// compounding `SmVolume::EvaluatePoint`, whose failures leave the undefined
-    /// point). With neither output requested nothing happens.
+    /// aligned with the parameter axes on a non-singular transform, the box is the exact
+    /// image (WR-8): each parameter interval is multiplied by `|axis|` and translated by
+    /// `o_param * |axis|` (where `o_param` is [`Self::to_origin`] expressed in the
+    /// transform's axis basis), parameter axis `idx` goes into basis slot
+    /// `|axis_map[idx]| - 1` (negated when `axis_map[idx] < 0`), and `proj_box`
+    /// circumscribes the result by basis (WR-5). Otherwise, for an unbounded
+    /// `param_box` both outputs are made unbounded (the pseudo box keeps its previous
+    /// basis, as upstream); for a bounded `param_box` both outputs grow by the images
+    /// of its corners under `evaluate_point` (the volume's compounding
+    /// `SmVolume::EvaluatePoint`, whose failures leave the undefined point). With
+    /// neither output requested nothing happens.
     ///
     /// # Errors
     ///
     /// [`SolidError::InvalidInput`] when an output is requested without
     /// `param_pseudo_box` (upstream dereferences the null pointer);
     /// [`SolidError::Unported`] from `evaluate_point`.
-    pub fn evaluate_bounding_box_simple(
+    pub fn evaluate_bounding_box_simple<F>(
         &self,
         param_box: &Extent3d,
         param_pseudo_box: Option<&PseudoBox>,
         mut proj_box: Option<&mut Extent3d>,
         mut proj_pseudo_box: Option<&mut PseudoBox>,
-        mut evaluate_point: impl FnMut(Point3) -> Result<Point3>,
-    ) -> Result<()> {
+        mut evaluate_point: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Point3) -> Result<Point3>,
+    {
         // no work - no output
         if proj_box.is_none() && proj_pseudo_box.is_none() {
             return Ok(());
@@ -513,44 +529,42 @@ impl Transform {
             self.transform_vector(b2),
         );
         // upstream ignores the status
-        let _ = this_proj_pb.set_basis(sx, sy, sz);
+        let basis_ok = this_proj_pb.set_basis(sx, sy, sz).is_ok();
         this_proj_pb.init();
 
         let axis_map = PseudoBox::new().are_aligned(param_pb);
-        if let Some(axis_map) = axis_map {
-            // get Ivls of mapping ParamBox directly to ProjSpace
-            let o = self.to_origin();
-            let x = self.to_x_axis();
-            let x_length = x.length();
-            let y = self.to_y_axis();
-            let y_length = y.length();
-            let z = self.to_z_axis();
-            let z_length = z.length();
+        let aligned_origin = if basis_ok && axis_map.is_some() {
+            self.inv_transform_vector(self.to_origin()).ok()
+        } else {
+            None
+        };
+        if let (Some(axis_map), Some(o_param)) = (axis_map, aligned_origin) {
+            let x_length = self.to_x_axis().length();
+            let y_length = self.to_y_axis().length();
+            let z_length = self.to_z_axis().length();
 
             let mut ivls = [
                 *param_box
                     .u_interval()
-                    .scale(1. / x_length)
-                    .translate(o.dot(x)),
+                    .scale(x_length)
+                    .translate(o_param.x * x_length),
                 *param_box
                     .v_interval()
-                    .scale(1. / y_length)
-                    .translate(o.dot(y)),
+                    .scale(y_length)
+                    .translate(o_param.y * y_length),
                 *param_box
                     .w_interval()
-                    .scale(1. / z_length)
-                    .translate(o.dot(z)),
+                    .scale(z_length)
+                    .translate(o_param.z * z_length),
             ];
 
-            // when the bases need to be swapped and/or negated to match the param
-            // pseudo box basis orientations
             if axis_map != [1, 2, 3] {
                 let mut tmps = [Extent1d::new(); 3];
-                for (tmp, m) in tmps.iter_mut().zip(axis_map) {
-                    let i = (m.unsigned_abs() as usize).wrapping_sub(1);
-                    if let Some(ivl) = ivls.get_mut(i) {
-                        // upstream's Negate() also negates ivls[i] in place
-                        *tmp = if m > 0 { *ivl } else { *ivl.negate() };
+                for (src_ivl, m) in ivls.into_iter().zip(axis_map) {
+                    let slot = (m.unsigned_abs() as usize).wrapping_sub(1);
+                    if let Some(dst) = tmps.get_mut(slot) {
+                        let mut v = src_ivl;
+                        *dst = if m > 0 { v } else { *v.negate() };
                     }
                 }
                 ivls = tmps;
@@ -586,7 +600,7 @@ impl Transform {
                         // EvaluatePoint (status ignored: a fresh, undefined point)
                         let xyz = match evaluate_point(uvw) {
                             Ok(p) => p,
-                            Err(e) if e.is_unported() => return Err(e),
+                            Err(e) if e.is_unported_or_cancelled() => return Err(e),
                             Err(_) => Vec3::UNDEF,
                         };
                         if let Some(b) = proj_box.as_deref_mut() {
@@ -631,8 +645,11 @@ impl Transform {
         solutions.set_size(1);
         let res = self.inv_transform_point(proj_point);
         let Some(sol) = solutions.get_mut(0) else {
-            return Err(SolidError::sm_err(
+            return Err(SolidError::geom(
                 "geom::transform::Transform::global_point_solve_simple",
+                GeomFailure::Defect {
+                    why: "the solution array has no slot 0 right after SolutionArray::set_size(1), which always makes one",
+                },
             ));
         };
         match res {
@@ -668,7 +685,12 @@ impl Transform {
         let mut solutions = SolutionArray::new();
         self.global_point_solve_simple(proj_point, &mut solutions, this)?;
         solutions.get(0).copied().ok_or_else(|| {
-            SolidError::sm_err("geom::transform::Transform::local_point_solve_simple")
+            SolidError::geom(
+                "geom::transform::Transform::local_point_solve_simple",
+                GeomFailure::Defect {
+                    why: "global_point_solve_simple succeeded but left no solution in slot 0, which it sizes to one and fills on success",
+                },
+            )
         })
     }
 
@@ -732,6 +754,28 @@ impl Transform {
         Ok(volume)
     }
 
+    /// The part of `WriteToDB` before the volume base data, the rows
+    /// [`Transform::read_from_db`] reads: the X, Y, Z and displacement rows of the
+    /// matrix, four values each.
+    pub fn write_rows_to_db(&self, db: &mut DatabaseWriter) {
+        let names = [
+            " Transform X row \n",
+            " Transform Y row \n",
+            " Transform Z row \n",
+            " Transform Disp row \n",
+        ];
+        if db.file_type() == FileType::Ascii {
+            for (row, name) in self.m.iter().zip(names) {
+                db.out_reals(row);
+                db.out_str(name);
+            }
+        } else {
+            for row in &self.m {
+                db.write_doubles(row);
+            }
+        }
+    }
+
     /// `SmTransform_TYPE` (`GetType`).
     #[must_use]
     pub const fn type_code(&self) -> i64 {
@@ -762,6 +806,7 @@ impl Transform {
 mod tests {
     use super::*;
     use crate::geom::solution_array::ObjectKind;
+    use crate::kernel::Kernel;
 
     #[derive(Debug, Clone, Copy, PartialEq)]
     struct Vol;
@@ -774,6 +819,28 @@ mod tests {
 
     fn v(x: f64, y: f64, z: f64) -> Vec3 {
         Vec3::new(x, y, z)
+    }
+
+    fn map_point(t: &Transform, p: Point3) -> Point3 {
+        t.evaluate_simple(p, 0).unwrap()[0]
+    }
+
+    fn assert_corner_sets_match(actual: &[Point3; 8], expected: &[Point3; 8], tol: f64) {
+        let mut used = [false; 8];
+        for a in actual {
+            let idx = (0..8)
+                .find(|&i| !used[i] && (expected[i] - *a).length() < tol)
+                .expect("every pseudo-box corner should match a mapped corner");
+            used[idx] = true;
+        }
+    }
+
+    fn aabb_of_points(pts: &[Point3; 8]) -> Extent3d {
+        let mut b = Extent3d::new();
+        for p in pts {
+            b.add_point(*p);
+        }
+        b
     }
 
     #[test]
@@ -875,5 +942,240 @@ mod tests {
             proj_pb.interval(0).map(|i| i.max()),
             Some(INFINITE_PARAMETER)
         );
+    }
+
+    #[test]
+    fn wr8_non_uniform_scale_and_translation() {
+        let t = Transform::new(
+            v(10.0, -5.0, 3.0),
+            v(2.0, 0.0, 0.0),
+            v(0.0, 3.0, 0.0),
+            Some(v(0.0, 0.0, 4.0)),
+        );
+        let param_box = Extent3d::from_bounds(1.0, -1.0, 0.0, 2.0, 1.0, 0.5);
+        let param_pb = PseudoBox::new();
+
+        // The exact affine image `[12, 14] x [-8, -2] x [3, 5]`.
+        let mut opt_box = Extent3d::new();
+        let mut opt_pb = PseudoBox::new();
+        t.evaluate_bounding_box_simple(
+            &param_box,
+            Some(&param_pb),
+            Some(&mut opt_box),
+            Some(&mut opt_pb),
+            |p| Ok(map_point(&t, p)),
+        )
+        .unwrap();
+        assert!((opt_box.min() - v(12.0, -8.0, 3.0)).length() < 1e-12);
+        assert!((opt_box.max() - v(14.0, -2.0, 5.0)).length() < 1e-12);
+        assert!(opt_pb
+            .interval(0)
+            .unwrap()
+            .are_equal_bounds(12.0, 14.0, 1e-12));
+        assert!(opt_pb
+            .interval(1)
+            .unwrap()
+            .are_equal_bounds(-8.0, -2.0, 1e-12));
+        assert!(opt_pb
+            .interval(2)
+            .unwrap()
+            .are_equal_bounds(3.0, 5.0, 1e-12));
+        let expected_corners = param_box.corners().map(|c| map_point(&t, c));
+        assert_corner_sets_match(&opt_pb.corners(), &expected_corners, 1e-12);
+    }
+
+    #[test]
+    fn wr8_three_cycle_param_basis_and_three_cycle_transform() {
+        // (a) 3-cycle and negated 3-cycle parameter PseudoBox bases under scale + translation.
+        let t = Transform::new(
+            v(4.0, -3.0, 2.0),
+            v(2.0, 0.0, 0.0),
+            v(0.0, 5.0, 0.0),
+            Some(v(0.0, 0.0, 3.0)),
+        );
+        let param_box = Extent3d::from_bounds(1.0, 2.0, -1.0, 3.0, 4.0, 2.0);
+        let expected_corners = param_box.corners().map(|c| map_point(&t, c));
+        let expected_aabb = aabb_of_points(&expected_corners);
+        assert_eq!(expected_aabb.min(), v(6.0, 7.0, -1.0));
+        assert_eq!(expected_aabb.max(), v(10.0, 17.0, 8.0));
+
+        for basis in [[Vec3::Y, Vec3::Z, Vec3::X], [-Vec3::Y, Vec3::Z, -Vec3::X]] {
+            let mut param_pb = PseudoBox::new();
+            param_pb.set_basis(basis[0], basis[1], basis[2]).unwrap();
+
+            let mut opt_box = Extent3d::new();
+            let mut opt_pb = PseudoBox::new();
+            t.evaluate_bounding_box_simple(
+                &param_box,
+                Some(&param_pb),
+                Some(&mut opt_box),
+                Some(&mut opt_pb),
+                |p| Ok(map_point(&t, p)),
+            )
+            .unwrap();
+            assert_corner_sets_match(&opt_pb.corners(), &expected_corners, 1e-12);
+            assert!((opt_box.min() - expected_aabb.min()).length() < 1e-12);
+            assert!((opt_box.max() - expected_aabb.max()).length() < 1e-12);
+        }
+
+        // (b) Canonical `param_pb` under a 3-cycle rotation + translation transform:
+        // `opt_box` circumscribes `this_proj_pb` (`basis = [Y, Z, X]`) by basis.
+        let t_rot = Transform::new(
+            v(10.0, -5.0, 7.0),
+            Vec3::Y * 2.0,
+            Vec3::Z * 3.0,
+            Some(Vec3::X * 4.0),
+        );
+        let rot_corners = param_box.corners().map(|c| map_point(&t_rot, c));
+        let rot_aabb = aabb_of_points(&rot_corners);
+        let mut rot_box = Extent3d::new();
+        let mut rot_pb = PseudoBox::new();
+        t_rot
+            .evaluate_bounding_box_simple(
+                &param_box,
+                Some(&PseudoBox::new()),
+                Some(&mut rot_box),
+                Some(&mut rot_pb),
+                |p| Ok(map_point(&t_rot, p)),
+            )
+            .unwrap();
+        assert_corner_sets_match(&rot_pb.corners(), &rot_corners, 1e-12);
+        assert!((rot_box.min() - rot_aabb.min()).length() < 1e-12);
+        assert!((rot_box.max() - rot_aabb.max()).length() < 1e-12);
+    }
+
+    #[test]
+    fn wr8_shear_with_translation() {
+        // Non-orthogonal linear map: columns have non-zero pairwise dot products, so
+        // `o · axis != o_param * |axis|^2`.
+        let t = Transform::new(
+            v(3.0, -2.0, 5.0),
+            v(2.0, 1.0, 0.0),
+            v(0.0, 3.0, 1.0),
+            Some(v(1.0, 0.0, 4.0)),
+        );
+        let param_box = Extent3d::from_bounds(-1.0, 0.5, -2.0, 2.0, 2.5, 1.0);
+        let expected_corners = param_box.corners().map(|c| map_point(&t, c));
+        let expected_aabb = aabb_of_points(&expected_corners);
+
+        for basis in [[Vec3::X, Vec3::Y, Vec3::Z], [-Vec3::Z, Vec3::X, -Vec3::Y]] {
+            let mut param_pb = PseudoBox::new();
+            param_pb.set_basis(basis[0], basis[1], basis[2]).unwrap();
+
+            let mut opt_box = Extent3d::new();
+            let mut opt_pb = PseudoBox::new();
+            t.evaluate_bounding_box_simple(
+                &param_box,
+                Some(&param_pb),
+                Some(&mut opt_box),
+                Some(&mut opt_pb),
+                |p| Ok(map_point(&t, p)),
+            )
+            .unwrap();
+            assert!(!opt_pb.is_orthogonal_basis());
+            assert_corner_sets_match(&opt_pb.corners(), &expected_corners, 1e-12);
+            assert!((opt_box.min() - expected_aabb.min()).length() < 1e-12);
+            assert!((opt_box.max() - expected_aabb.max()).length() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn wr8_partially_unbounded_and_singular_and_volume_dispatch() {
+        let k_on = Kernel::default();
+
+        // 1. Partially unbounded `param_box`.
+        let t_scale = Transform::new(
+            v(5.0, -1.0, 2.0),
+            v(2.0, 0.0, 0.0),
+            v(0.0, 3.0, 0.0),
+            Some(v(0.0, 0.0, 4.0)),
+        );
+        let partial_box =
+            Extent3d::from_bounds(-INFINITE_PARAMETER, 1.0, -1.0, 2.0, 3.0, INFINITE_PARAMETER);
+        let mut p_box = Extent3d::new();
+        let mut p_pb = PseudoBox::new();
+        t_scale
+            .evaluate_bounding_box_simple(
+                &partial_box,
+                Some(&PseudoBox::new()),
+                Some(&mut p_box),
+                Some(&mut p_pb),
+                |p| Ok(map_point(&t_scale, p)),
+            )
+            .unwrap();
+        assert_eq!(p_box.u_min(), -INFINITE_PARAMETER);
+        assert!((p_box.u_max() - 9.0).abs() < 1e-12);
+        assert!((p_box.v_min() - 2.0).abs() < 1e-12);
+        assert!((p_box.v_max() - 8.0).abs() < 1e-12);
+        assert!((p_box.w_min() + 2.0).abs() < 1e-12);
+        assert_eq!(p_box.w_max(), INFINITE_PARAMETER);
+        assert_eq!(p_pb.interval(0).unwrap().min(), -INFINITE_PARAMETER);
+        assert!((p_pb.interval(0).unwrap().max() - 9.0).abs() < 1e-12);
+        assert!(p_pb.interval(1).unwrap().are_equal_bounds(2.0, 8.0, 1e-12));
+        assert!((p_pb.interval(2).unwrap().min() + 2.0).abs() < 1e-12);
+        assert_eq!(p_pb.interval(2).unwrap().max(), INFINITE_PARAMETER);
+
+        // 2. Singular transform (`rank < 3`): falls back to corner sampling on bounded boxes
+        // and to unbounded on unbounded boxes without `NaN` or division by zero.
+        let t_sing = Transform::new(v(1.0, 2.0, 3.0), v(2.0, 0.0, 0.0), v(4.0, 0.0, 0.0), None);
+        let bounded_box = Extent3d::from_bounds(-1.0, 0.5, -2.0, 3.0, 1.5, 4.0);
+        let sing_vol = Volume::new(VolumeKind::Transform(t_sing));
+        let mut sing_box = Extent3d::new();
+        let mut sing_pb = PseudoBox::new();
+        sing_vol
+            .evaluate_bounding_box_simple(
+                &k_on,
+                &bounded_box,
+                Some(&PseudoBox::new()),
+                Some(&mut sing_box),
+                Some(&mut sing_pb),
+            )
+            .unwrap();
+        assert!((sing_box.min() - v(1.0, 2.0, 3.0)).length() < 1e-12);
+        assert!((sing_box.max() - v(13.0, 2.0, 3.0)).length() < 1e-12);
+        assert!(sing_pb
+            .interval(0)
+            .unwrap()
+            .are_equal_bounds(1.0, 13.0, 1e-12));
+        assert!(sing_pb
+            .interval(1)
+            .unwrap()
+            .are_equal_bounds(2.0, 2.0, 1e-12));
+        assert!(sing_pb
+            .interval(2)
+            .unwrap()
+            .are_equal_bounds(3.0, 3.0, 1e-12));
+
+        let mut sing_unb_box = Extent3d::new();
+        let mut sing_unb_pb = PseudoBox::new();
+        sing_vol
+            .evaluate_bounding_box_simple(
+                &k_on,
+                &partial_box,
+                Some(&PseudoBox::new()),
+                Some(&mut sing_unb_box),
+                Some(&mut sing_unb_pb),
+            )
+            .unwrap();
+        assert_eq!(sing_unb_box.u_min(), -INFINITE_PARAMETER);
+        assert_eq!(sing_unb_box.w_max(), INFINITE_PARAMETER);
+        assert_eq!(sing_unb_pb.interval(1).unwrap().max(), INFINITE_PARAMETER);
+
+        // 3. `Volume` dispatch.
+        let vol = Volume::new(VolumeKind::Transform(t_scale));
+        let mut vol_opt_box = Extent3d::new();
+        let mut vol_opt_pb = PseudoBox::new();
+        vol.evaluate_bounding_box_simple(
+            &k_on,
+            &bounded_box,
+            Some(&PseudoBox::new()),
+            Some(&mut vol_opt_box),
+            Some(&mut vol_opt_pb),
+        )
+        .unwrap();
+        assert!((vol_opt_box.min() - v(3.0, 0.5, -6.0)).length() < 1e-12);
+        assert!((vol_opt_box.max() - v(11.0, 3.5, 18.0)).length() < 1e-12);
+        let expected_vol_corners = bounded_box.corners().map(|c| map_point(&t_scale, c));
+        assert_corner_sets_match(&vol_opt_pb.corners(), &expected_vol_corners, 1e-12);
     }
 }

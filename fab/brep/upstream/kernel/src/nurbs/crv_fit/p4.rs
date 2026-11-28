@@ -15,18 +15,23 @@
 //!   `l` are their lengths); the curve and the knot vector are return values (so
 //!   `N_CrvSizeArrays` cannot fail); work arrays and banded matrices are row-major
 //!   blocks indexed as upstream, with accesses outside a whole block returning
-//!   [`SolidError::InvalidInput`]; errors are [`SolidError::Nlib`] values; the
+//!   [`SolidError::InvalidInput`]; errors are [`SolidError::Failed`] values (a [`NurbsFailure`] reason); the
 //!   `NL_STACKS` arguments, `N_InitNurbs` / `N_EndNurbs` and the routine-name strings
 //!   have no counterpart.
 //! - `ROUND(x)` is `(NL_INDEX)(x + 0.5)`, a truncation toward zero, as upstream.
+//! - The caller counts `n`, `p`, `k` and `l`, which upstream adds as `NL_INDEX` values,
+//!   are added checked with the `fit_arrays` `add` where their sums drive allocation
+//!   and subtraction: a `k + l` or `n + p + 1` sum that overflows gives
+//!   [`SolidError::InvalidInput`] where upstream's signed arithmetic is undefined
+//!   behaviour. Every count that fits keeps the upstream sum and behaviour.
 
-use crate::error::{NlibCode, Result, SolidError};
+use crate::error::{nurbs::NurbsFailure, Result, SolidError};
 use crate::math::Vec3;
 use crate::nurbs::basis_basic::basis_derivs;
 use crate::nurbs::crv_basic::Curve;
 use crate::nurbs::crv_fit::p1::{param_values, ParamMethod};
 use crate::nurbs::fit_arrays::{
-    alloc, at, at_mut, banded, basis, curve, idx, mget, mset, out_of_range, put, sg, Block,
+    add, alloc, at, at_mut, banded, basis, curve, idx, mget, mset, out_of_range, put, sg, Block,
 };
 use crate::nurbs::knots::{KnotVector, Side};
 use crate::nurbs::math::{blend_pt, float_op_is_bad, CPoint, FloatOp};
@@ -59,8 +64,9 @@ fn scale_pt(alpha: f64, p: Vec3) -> Vec3 {
 ///
 /// # Errors
 ///
-/// [`NlibCode::Input`] when `n > m` (also for empty `u`) or `n <= k + l`;
-/// `InvalidInput` for an access outside upstream's arrays.
+/// [`NurbsFailure::Input`] when `n > m` (also for empty `u`) or `n <= k + l`;
+/// `InvalidInput` for an access outside upstream's arrays, or for a `k + l` or
+/// `n + p + 1` sum that overflows the signed index (undefined behaviour upstream).
 pub fn knots_end_derivs(u: &[f64], n: usize, p: usize, k: usize, l: usize) -> Result<Vec<f64>> {
     const OP: &str = OP_KNOTS;
     // highest index (-1 without parameters: the `n > m` check rejects it, as upstream)
@@ -69,14 +75,15 @@ pub fn knots_end_derivs(u: &[f64], n: usize, p: usize, k: usize, l: usize) -> Re
 
     // Initialize
     if n > m {
-        return Err(SolidError::nlib(OP, NlibCode::Input));
+        return Err(SolidError::nurbs(OP, NurbsFailure::Input));
     }
-    if n <= k + l {
-        return Err(SolidError::nlib(OP, NlibCode::Input));
+    let kl = add(k, l, OP)?;
+    if n <= kl {
+        return Err(SolidError::nurbs(OP, NurbsFailure::Input));
     }
-    let nc = n - k - l;
+    let nc = n - kl;
 
-    let mut uu = alloc(n + p + 1, 0.0, OP)?;
+    let mut uu = alloc(add(add(n, p, OP)?, 1, OP)?, 0.0, OP)?;
     for i in 0..=p {
         put(&mut uu, i, at(u, 0, OP)?, OP)?;
         put(&mut uu, n + i + 1, at(u, m, OP)?, OP)?;
@@ -134,11 +141,11 @@ pub fn knots_end_derivs(u: &[f64], n: usize, p: usize, k: usize, l: usize) -> Re
 ///
 /// # Errors
 ///
-/// [`NlibCode::Input`] when `p > n`, `k >= p`, `l >= p`, `m < n` or `n <= k + l`;
-/// [`NlibCode::Numerical`] for a zero leading derivative basis value; errors of
+/// [`NurbsFailure::Input`] when `p > n`, `k >= p`, `l >= p`, `m < n` or `n <= k + l`;
+/// [`NurbsFailure::Numerical`] for a zero leading derivative basis value; errors of
 /// [`param_values`], [`knots_end_derivs`], [`basis_derivs`],
 /// [`KnotVector::basis_i_eval`], [`KnotVector::basis_eval`], of the LU decomposition
-/// and of the solve (no points: `m = -1 < n`, [`NlibCode::Input`]); `InvalidInput` for
+/// and of the solve (no points: `m = -1 < n`, [`NurbsFailure::Input`]); `InvalidInput` for
 /// an access outside upstream's arrays.
 #[allow(clippy::too_many_lines)]
 pub fn approx_end_derivs(
@@ -162,16 +169,16 @@ pub fn approx_end_derivs(
 
     // Check for error and curve memory
     if p > n {
-        return Err(SolidError::nlib(OP, NlibCode::Input));
+        return Err(SolidError::nurbs(OP, NurbsFailure::Input));
     }
     if k >= p || l >= p {
-        return Err(SolidError::nlib(OP, NlibCode::Input));
+        return Err(SolidError::nurbs(OP, NurbsFailure::Input));
     }
     if k < 0 || l < 0 {
-        return Err(SolidError::nlib(OP, NlibCode::Input));
+        return Err(SolidError::nurbs(OP, NurbsFailure::Input));
     }
     if m < n || n <= k + l {
-        return Err(SolidError::nlib(OP, NlibCode::Input));
+        return Err(SolidError::nurbs(OP, NurbsFailure::Input));
     }
     let mut pw = alloc(n, CPoint::default(), OP)?;
 
@@ -196,7 +203,7 @@ pub fn approx_end_derivs(
 
         let ndii = nd_at(&nd, i, i, OP)?;
         if float_op_is_bad(1.0, ndii, FloatOp::Division) {
-            return Err(SolidError::nlib(OP, NlibCode::Numerical));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Numerical));
         }
         let fac = 1.0 / ndii;
 
@@ -222,7 +229,7 @@ pub fn approx_end_derivs(
 
         let ndpi = nd_at(&nd, i, p - i, OP)?;
         if float_op_is_bad(1.0, ndpi, FloatOp::Division) {
-            return Err(SolidError::nlib(OP, NlibCode::Numerical));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Numerical));
         }
         let fac = 1.0 / ndpi;
 
@@ -353,12 +360,13 @@ pub fn approx_end_derivs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::det;
 
     fn arc(n: usize) -> Vec<Vec3> {
         (0..n)
             .map(|i| {
                 let t = i as f64 / (n - 1) as f64 * 1.5;
-                Vec3::new(t.cos(), t.sin(), 0.1 * t)
+                Vec3::new(det::cos(t), det::sin(t), 0.1 * t)
             })
             .collect()
     }
@@ -386,21 +394,9 @@ mod tests {
     #[test]
     fn no_points_is_an_input_error() {
         let e = approx_end_derivs(&[], &[], &[], 3, 3, ParamMethod::Uniform).unwrap_err();
-        assert!(matches!(
-            e,
-            SolidError::Nlib {
-                code: NlibCode::Input,
-                ..
-            }
-        ));
+        assert!(matches!(e.nurbs_failure(), Some(NurbsFailure::Input)));
         let e = knots_end_derivs(&[], 0, 3, 0, 0).unwrap_err();
-        assert!(matches!(
-            e,
-            SolidError::Nlib {
-                code: NlibCode::Input,
-                ..
-            }
-        ));
+        assert!(matches!(e.nurbs_failure(), Some(NurbsFailure::Input)));
     }
 
     #[test]
@@ -410,5 +406,37 @@ mod tests {
         assert!(approx_end_derivs(&a, &[], &[], 6, 3, ParamMethod::Uniform).is_err());
         let d = [Vec3::new(1.0, 0.0, 0.0)];
         assert!(approx_end_derivs(&a, &d, &d, 2, 2, ParamMethod::Uniform).is_err());
+    }
+
+    /// `i64::MAX` as a `usize` where `usize` is wide enough; on a 32-bit target every
+    /// `usize` fits the signed index, so the size check or the allocation rejects it
+    /// instead of the sum.
+    fn huge_count() -> usize {
+        usize::try_from(i64::MAX).unwrap_or(usize::MAX)
+    }
+
+    #[test]
+    fn huge_counts_are_rejected_without_overflow() {
+        // `k + l` and `n + p + 1` are caller counts; the checked sums must not panic.
+        assert!(knots_end_derivs(&[0.0, 1.0], 1, huge_count(), 0, 0).is_err());
+        assert!(knots_end_derivs(&[0.0, 1.0], 1, 1, huge_count(), huge_count()).is_err());
+        // `usize::MAX` itself is a safe error on every target width.
+        assert!(knots_end_derivs(&[0.0, 1.0], 1, usize::MAX, 0, 0).is_err());
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert!(matches!(
+                knots_end_derivs(&[0.0, 1.0], 1, huge_count(), 0, 0),
+                Err(SolidError::InvalidInput { .. })
+            ));
+            assert!(matches!(
+                knots_end_derivs(&[0.0, 1.0], 1, 1, huge_count(), huge_count()),
+                Err(SolidError::InvalidInput { .. })
+            ));
+        }
+        // A count that fits the index but not the allocation still fails softly.
+        assert!(matches!(
+            knots_end_derivs(&[0.0, 1.0], 1, 1 << 30, 0, 0),
+            Err(ref e) if matches!(e.nurbs_failure(), Some(NurbsFailure::Memory))
+        ));
     }
 }

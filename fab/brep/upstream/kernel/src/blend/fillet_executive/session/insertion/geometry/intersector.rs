@@ -156,7 +156,10 @@ impl ti::IntersectorBrep<FilletObject> for InsertionGeometry<'_> {
                 brep::p9::CurveIdentity::Actual(&brep::p9::issue_curve_identity),
             )?;
             if !output.split {
-                return Err(SolidError::sm_err(super::OP));
+                return Err(SolidError::blend(
+                    super::OP,
+                    crate::error::blend::BlendFailure::EdgeSplitDeclined { parameter },
+                ));
             }
             let [a, z] = output
                 .edges
@@ -191,6 +194,12 @@ impl ti::IntersectorBrep<FilletObject> for InsertionGeometry<'_> {
                 EntityRef::Brep(crate::topology::BrepId::from_index(0)),
             )
         }))
+    }
+    fn vertex_update_edge_intervals(&mut self, k: &Kernel, vertex: FilletObject) -> Result<()> {
+        let (role, id) = vid(vertex)?;
+        self.with_edit(role, |b, env| {
+            brep::p1::update_vertex_edge_intervals(k, b, env, id)
+        })
     }
     fn set_vertex_point(&mut self, _k: &Kernel, object: FilletObject, point: Point3) -> Result<()> {
         let (role, id) = vid(object)?;

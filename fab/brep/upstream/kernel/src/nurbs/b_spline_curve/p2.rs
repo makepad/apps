@@ -11,7 +11,7 @@
 //! | [`BSplineCurve::calculate_bounding_box`], [`BoundingBoxRequest`], [`BoundingBoxes`] | `CalculateBoundingBox` |
 //! | [`BSplineCurve::is_planar`], [`Planar`]     | `SmCurve::IsPlanar`                    |
 //! | [`BSplineCurve::create_analytic_curve`], [`AnalyticCurve`] | `CreateAnalyticCurve`         |
-//! | [`BSplineCurve::create_by_joining`]               | `CreateByJoining`                      |
+//! | [`BSplineCurve::create_by_joining`], [`BSplineCurve::create_by_joining_with_breaks`] | `CreateByJoining` |
 //! | [`BSplineCurve::create_point_curve`]              | `CreatePointCurve`                     |
 //! | [`BSplineCurve::create_simple_offset`]            | `CreateSimpleOffset`                   |
 //! | [`BSplineCurve::has_repeated_end_control_points`] | `HasRepeatedEndControlPoints`          |
@@ -43,9 +43,12 @@
 //!   `p1`). `CalculateBoundingBox`'s unused `bExpandBox` flag is dropped and the boxes
 //!   asked for come back in [`BoundingBoxes`] (fresh boxes, as a caller passing new
 //!   `SmExtent3d` / `SmPseudoBox` / `SmPolarBox` objects gets).
+//! - **Join breaks** (not upstream). [`BSplineCurve::create_by_joining_with_breaks`]
+//!   also returns the knot at which each segment ends, read off the knot vector as it is
+//!   built (the skin's face sources, tangency-labs/solidcore#3139).
 //! - **Missing NURB.** Where upstream dereferences the `NULL` NURB of a curve built
 //!   without one (`GetOrCreateGwNurbPointer` cannot make it for a plain B-spline), the
-//!   port returns `SM_ERR` ([`SolidError::Upstream`]). That includes
+//!   port returns `SM_ERR` ([`BSplineFailure::NoNurbsForm`]). That includes
 //!   `CalculateBoundingBox`'s sampling fallback for derived types, whose `Evaluate`
 //!   calls have no NURB to evaluate either.
 //! - **Analytics.** `CreateAnalyticCurve` (with `USE_ANALYTICS`, defined in
@@ -83,14 +86,20 @@
 //!   `SmCircle` (`curve.ellipse_p1`) and calls `SmCurve::IsArc`
 //!   (`curve.curve_p5`, [`crate::curve::curve::p5::is_arc_base`]); `CreateSimpleOffset`
 //!   calls `SmCurve::IsArc` too. It approximates an [`OffsetCurve`] with
-//!   `SmCurve::ApproximateCurve` ([`Curve::approximate_curve`]), passing the
-//!   caller's `bOptMatchParameterization` as `bOptCreateAnalytics` and `FALSE` for
-//!   matching, as upstream.
+//!   `SmCurve::ApproximateCurve` ([`Curve::approximate_curve`]).
+//! - **`CreateSimpleOffset` matches the parameterization** (not upstream, WR-37, #2141):
+//!   it passes `false` for `ApproximateCurve`'s `bOptCreateAnalytics` and forwards the
+//!   caller's `bOptMatchParameterization` in its own slot, where upstream passes it as
+//!   `bOptCreateAnalytics` and `FALSE` for matching.
+//! - **Statuses passed on (WR-663).** `CreateAnalyticCurve`'s knot insertion and
+//!   `CreateSimpleOffset`'s frame are passed on where upstream ignores them, and
+//!   `IsDegenerate` is `false` without a NURB, as the fork (tangency-labs/smlib 8843967).
 
 use crate::curve::curve::{Curve, CurveKind};
 use crate::curve::ellipse::{Ellipse, EllipseOptions};
 use crate::curve::line::{BoundedLineOptions, Line};
 use crate::curve::offset_curve::OffsetCurve;
+use crate::error::nurbs::BSplineFailure;
 use crate::error::{ignored, Result, SolidError};
 use crate::geom::axis2_placement::Axis2Placement;
 use crate::geom::extent1d::Extent1d;
@@ -251,7 +260,7 @@ fn curve_is_arc(
 }
 
 /// `SmOffsetCurve(3, curve, ivl, normal, dist)` approximated with
-/// `ApproximateCurve(ctx, {ivl.min, ivl.max}, tol, gap, approx, bMatch, FALSE)`: the
+/// `ApproximateCurve(ctx, {ivl.min, ivl.max}, tol, gap, approx, ...)`: the
 /// approximation and its maximum gap.
 fn offset_curve_approximation(
     k: &Kernel,
@@ -280,10 +289,11 @@ fn offset_curve_approximation(
     )
 }
 
-/// `SmCurve::ApproximateCurve(ctx, breaks, tol, gap, approx, bMatch, FALSE)` of
-/// `curve`: the approximation and its maximum gap. Upstream passes the caller's
-/// `bOptMatchParameterization` in the `bOptCreateAnalytics` slot and `FALSE` for
-/// matching the parameterization; kept.
+/// `SmCurve::ApproximateCurve(ctx, breaks, tol, gap, approx, ...)` of `curve`: the
+/// approximation and its maximum gap, with `bOptCreateAnalytics` `false` and
+/// `match_parameterization` in its own slot (not upstream, WR-37: upstream passes the
+/// caller's `bOptMatchParameterization` in the `bOptCreateAnalytics` slot and `FALSE`
+/// for matching the parameterization).
 fn approximate_curve(
     k: &Kernel,
     curve: &Curve,
@@ -293,8 +303,8 @@ fn approximate_curve(
 ) -> Result<(BSplineCurve, f64)> {
     const OP: &str = "nurbs::b_spline_curve::p2::approximate_curve";
     let opts = crate::curve::curve::p1::ApproximateCurveOptions {
-        create_analytics: match_parameterization,
-        match_parameterization: false,
+        create_analytics: false,
+        match_parameterization,
         just_copy_bsplines: false,
     };
     let r = curve.approximate_curve(k, breaks, approx_tol_3d, &opts)?;
@@ -508,13 +518,15 @@ impl BSplineCurve {
                 (0, n + 1)
             } else {
                 // use control polygon which contributes to the included spans
-                let knt = cur.knot_vector().map_err(SolidError::nl_ser(OP_BBOX))?;
+                let knt = cur
+                    .knot_vector()
+                    .map_err(SolidError::nurbs_routine(OP_BBOX))?;
                 let start_span = knt
                     .find_span(p, target.min(), Side::Left)
-                    .map_err(SolidError::nl_ser(OP_BBOX))?;
+                    .map_err(SolidError::nurbs_routine(OP_BBOX))?;
                 let end_span = knt
                     .find_span(p, target.max(), Side::Right)
-                    .map_err(SolidError::nl_ser(OP_BBOX))?;
+                    .map_err(SolidError::nurbs_routine(OP_BBOX))?;
                 let start = start_span
                     .checked_sub(p)
                     .ok_or_else(|| invalid(OP_BBOX, "span below the degree"))?;
@@ -526,7 +538,10 @@ impl BSplineCurve {
             };
 
         if num_points < 1 {
-            return Err(SolidError::sm_err(OP_BBOX));
+            return Err(SolidError::b_spline(
+                OP_BBOX,
+                BSplineFailure::IntervalSelectsNoControlPoints,
+            ));
         }
 
         let cpt = |i: usize| {
@@ -791,8 +806,9 @@ impl BSplineCurve {
                             .get(i)
                             .copied()
                             .ok_or_else(|| invalid(OP_ANALYTIC, "knot index out of range"))?;
-                        // (status ignored upstream)
-                        let _ = c.insert_one_knot(knot, 1);
+                        // (status ignored upstream; passed on as the fork,
+                        // tangency-labs/smlib 8843967)
+                        c.insert_one_knot(knot, 1)?;
                     }
                 }
 
@@ -848,6 +864,44 @@ impl BSplineCurve {
     /// different dimension or degree; `SM_ERR` without a NURB, for a zero end weight or
     /// when degree elevation or the canonical construction fails.
     pub fn create_by_joining(segments: &mut [Self], senses: Option<&[bool]>) -> Result<Self> {
+        Self::join(segments, senses, None)
+    }
+
+    /// [`BSplineCurve::create_by_joining`], also returning where each segment lies in
+    /// the joined curve: the joined curve's first knot, then each segment's last knot,
+    /// in segment order (`segments.len() + 1` values). Segment `i` spans
+    /// `[breaks[i], breaks[i + 1]]`. Each value is one of the joined curve's knots, the
+    /// very value its knot vector holds. The curve is the one
+    /// [`BSplineCurve::create_by_joining`] makes.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`BSplineCurve::create_by_joining`].
+    pub fn create_by_joining_with_breaks(
+        segments: &mut [Self],
+        senses: Option<&[bool]>,
+    ) -> Result<(Self, Vec<f64>)> {
+        let mut breaks = Vec::new();
+        let joined = Self::join(segments, senses, Some(&mut breaks))?;
+        Ok((joined, breaks))
+    }
+
+    /// Whether a segment ending at `last` and one starting at `first` are end to end as
+    /// [`BSplineCurve::create_by_joining`] requires: no further apart than
+    /// `1000 * sqrt(SM_EFF_ZERO) * (1 + max|last|)`. A caller that chains pieces for the
+    /// join tests them with this, so it never hands the join a pair it refuses.
+    pub(crate) fn ends_meet_for_join(last: Point3, first: Point3) -> bool {
+        let scaled_zero = EFF_ZERO_SQRT * 1000.0 * (1.0 + last.max_dimension());
+        // (written so a NaN distance does not meet)
+        last.distance(first) <= scaled_zero
+    }
+
+    /// `CreateByJoining`, recording the segments' breaks in `breaks` when asked.
+    fn join(
+        segments: &mut [Self],
+        senses: Option<&[bool]>,
+        mut breaks: Option<&mut Vec<f64>>,
+    ) -> Result<Self> {
         let mut ctrl_pts: Vec<Point3> = Vec::new();
         let mut weights: Vec<f64> = Vec::new();
         let mut knot_mult: Vec<usize> = Vec::new();
@@ -946,6 +1000,9 @@ impl BSplineCurve {
                 }
                 ctrl_pts.push(last_point);
                 knots.push(first_of(&seg_knots)?);
+                if let Some(b) = breaks.as_mut() {
+                    b.push(first_of(&seg_knots)?);
+                }
                 knot_mult.push(
                     *seg_knot_mult
                         .first()
@@ -1006,8 +1063,7 @@ impl BSplineCurve {
                 }
             }
             // Make sure end-points are the same
-            let scaled_zero = EFF_ZERO_SQRT * 1000.0 * (1.0 + last_point.max_dimension());
-            if last_point.distance(first_pt) > scaled_zero {
+            if !Self::ends_meet_for_join(last_point, first_pt) {
                 return Err(invalid(OP_JOIN, "segments not end to end"));
             }
 
@@ -1016,7 +1072,10 @@ impl BSplineCurve {
                 let w0 = first_of(&seg_weights)?;
                 if !is_zero(last_weight - w0) {
                     if last_weight.abs() < EFF_ZERO || w0.abs() < EFF_ZERO {
-                        return Err(SolidError::sm_err(OP_JOIN));
+                        return Err(SolidError::b_spline(
+                            OP_JOIN,
+                            BSplineFailure::JoinEndWeightZero,
+                        ));
                     }
 
                     // Scale the weights
@@ -1063,6 +1122,13 @@ impl BSplineCurve {
                 }
                 ctrl_pts.push(pt);
             }
+            if let Some(b) = breaks.as_mut() {
+                b.push(
+                    *knots
+                        .last()
+                        .ok_or_else(|| invalid(OP_JOIN, "empty joined data"))?,
+                );
+            }
         }
 
         // Clamp that last knot
@@ -1101,6 +1167,10 @@ impl BSplineCurve {
     /// within `approx_tol_3d`, and the maximum gap of the approximation
     /// (`CreateSimpleOffset`). Arcs in the offset plane are offset exactly (a radius
     /// below the tolerance gives a point curve).
+    ///
+    /// `match_parameterization` is forwarded to `ApproximateCurve` in its own slot, with
+    /// `false` for analytic arc creation (not upstream, WR-37: upstream passes it in the
+    /// `bOptCreateAnalytics` slot and `FALSE` for parameterisation matching).
     ///
     /// # Errors
     ///
@@ -1169,8 +1239,9 @@ impl BSplineCurve {
                 if radius < 0.0 {
                     radius *= -1.0;
                     let (origin, x_axis, y_axis) = frame.canonical();
-                    // (status ignored upstream)
-                    let _ = frame.set_canonical(origin, -x_axis, -y_axis);
+                    // (status ignored upstream; passed on as the fork,
+                    // tangency-labs/smlib 8843967)
+                    frame.set_canonical(origin, -x_axis, -y_axis)?;
                 }
                 if radius < approx_tol_3d {
                     // Offset is a degenerate curve.
@@ -1402,8 +1473,12 @@ impl BSplineCurve {
             return curve_is_degenerate(k, self, tol3d, interval);
         }
 
-        // ensure existence of m_pNurb (a plain B-spline cannot make one)
-        let cur = self.nurb_ref()?;
+        // ensure existence of m_pNurb (a plain B-spline cannot make one; a curve without
+        // one is not shown degenerate, as the fork, tangency-labs/smlib 8843967)
+        let cur = match self.nurb_ref() {
+            Err(e) if !e.is_unported_or_cancelled() => return Ok(false),
+            r => r?,
+        };
 
         // pass the call along
         is_ncrv_degenerate(cur, tol3d)
@@ -1418,8 +1493,9 @@ impl BSplineCurve {
     ///
     /// # Errors
     ///
-    /// `InvalidInput` for `start > end`, `end > n`, a stride below the point size or a
-    /// dimension below 2; `SM_ERR` without a NURB.
+    /// `InvalidInput` for `start > end`, `end > n`, a stride below the point size, a
+    /// dimension below 2 or an output (`stride` values per point) above
+    /// [`crate::limits::MAX_ALLOC_BYTES`]; `SM_ERR` without a NURB.
     pub fn control_points_expert(
         &self,
         form: ControlPointForm,
@@ -1446,11 +1522,10 @@ impl BSplineCurve {
         let len = stride
             .checked_mul(count)
             .ok_or_else(|| invalid(OP_EXPERT, "output too large"))?;
-        // the caller's output array upstream: allocated fallibly here
-        let mut out = Vec::new();
-        out.try_reserve_exact(len)
-            .map_err(|_| invalid(OP_EXPERT, "output too large"))?;
-        out.resize(len, 0.0);
+        // the caller's output array upstream: allocated within limits::MAX_ALLOC_BYTES
+        // here, so a huge stride fails at once instead of zero-filling it
+        let mut out = crate::limits::try_filled(len, 0.0)
+            .ok_or_else(|| invalid(OP_EXPERT, "output too large"))?;
         let mut address = 0usize;
         let three_d = dim > 2;
 
@@ -1579,13 +1654,15 @@ impl BSplineCurve {
             (0, n + 1)
         } else {
             // use control polygon which contributes to the included spans
-            let knt = cur.knot_vector().map_err(SolidError::nl_ser(OP_POLYGON))?;
+            let knt = cur
+                .knot_vector()
+                .map_err(SolidError::nurbs_routine(OP_POLYGON))?;
             let start_span = knt
                 .find_span(p, interval.min(), Side::Left)
-                .map_err(SolidError::nl_ser(OP_POLYGON))?;
+                .map_err(SolidError::nurbs_routine(OP_POLYGON))?;
             let end_span = knt
                 .find_span(p, interval.max(), Side::Right)
-                .map_err(SolidError::nl_ser(OP_POLYGON))?;
+                .map_err(SolidError::nurbs_routine(OP_POLYGON))?;
             let start = start_span
                 .checked_sub(p)
                 .ok_or_else(|| invalid(OP_POLYGON, "span below the degree"))?;
@@ -1615,7 +1692,13 @@ impl BSplineCurve {
         let other_pts = other.control_points()?;
         let our_pts = self.nurb_ref_mut()?.cpts_mut();
         if other_pts.len() != our_pts.len() {
-            return Err(SolidError::sm_err(OP_MATCH));
+            return Err(SolidError::b_spline(
+                OP_MATCH,
+                BSplineFailure::ControlPointCountsDiffer {
+                    ours: our_pts.len(),
+                    theirs: other_pts.len(),
+                },
+            ));
         }
 
         for (ours, theirs) in our_pts.iter_mut().zip(other_pts) {
@@ -1641,7 +1724,13 @@ impl BSplineCurve {
         // no work - no degree increase needed
         let degree = self.degree()?;
         if new_degree < degree {
-            return Err(SolidError::sm_err(OP_ELEVATE));
+            return Err(SolidError::b_spline(
+                OP_ELEVATE,
+                BSplineFailure::DegreeBelowCurrent {
+                    given: new_degree,
+                    current: degree,
+                },
+            ));
         }
         if new_degree == degree {
             return Ok(());
@@ -1651,7 +1740,7 @@ impl BSplineCurve {
         let cur = self
             .nurb_ref()?
             .elevate_degree(increment)
-            .map_err(SolidError::nl_ser(OP_ELEVATE))?;
+            .map_err(SolidError::nurbs_routine(OP_ELEVATE))?;
 
         // Swap Nurbs with this
         self.nurb = Self::from_gw_nurb(self.dim, &cur).nurb;
@@ -1672,7 +1761,7 @@ impl BSplineCurve {
 
         self.nurb_ref_mut()?
             .reverse()
-            .map_err(SolidError::nl_ser(OP_REVERSE))?;
+            .map_err(SolidError::nurbs_routine(OP_REVERSE))?;
 
         let new_ivl = self.natural_interval();
         let (a, b) = (new_ivl.evaluate(t_new_min), new_ivl.evaluate(t_new_max));
@@ -1721,7 +1810,13 @@ impl BSplineCurve {
     ) -> Result<()> {
         let pw = self.nurb_ref_mut()?.cpts_mut();
         if index >= pw.len() {
-            return Err(SolidError::sm_err(OP_SET_CP));
+            return Err(SolidError::b_spline(
+                OP_SET_CP,
+                BSplineFailure::ControlPointIndex {
+                    index,
+                    count: pw.len(),
+                },
+            ));
         }
 
         let mut control_point = point;
@@ -1745,14 +1840,14 @@ impl BSplineCurve {
         }
 
         let rational = pw.first().is_some_and(|c| c.w != NOW);
-        let cpt = pw
-            .get_mut(index)
-            .ok_or_else(|| SolidError::sm_err(OP_SET_CP))?;
-        cpt.x = control_point.x;
-        cpt.y = control_point.y;
-        cpt.z = control_point.z;
-        if rational {
-            cpt.w = weight;
+        // `index` is below `pw.len()` (checked above, and nothing since changes the count).
+        if let Some(cpt) = pw.get_mut(index) {
+            cpt.x = control_point.x;
+            cpt.y = control_point.y;
+            cpt.z = control_point.z;
+            if rational {
+                cpt.w = weight;
+            }
         }
         Ok(())
     }
@@ -1777,7 +1872,11 @@ impl BSplineCurve {
                 if !ivl.contains_value(param, tol) {
                     match self.create_extended_curve(param, ContinuityType::CInfinity, true) {
                         Ok(Some(ext)) if ext.nurb.is_some() => self.nurb = ext.nurb,
-                        Err(e @ SolidError::Unported { .. }) => return Err(e),
+                        Err(
+                            e @ (SolidError::Unported { .. }
+                            | SolidError::Cancelled { .. }
+                            | SolidError::OutOfFuel { .. }),
+                        ) => return Err(e),
                         _ => {}
                     }
                 }
@@ -1856,7 +1955,7 @@ impl BSplineCurve {
         // [1, NL_MAXDEG].
         if p < 1 || i64::from(p) > MAX_DEGREE as i64 {
             return Err(bad(
-                "NURBS curve degree is outside the supported range 1 to NL_MAXDEG",
+                "NURBS curve degree is outside 1 to the largest degree the NURBS routines handle",
             ));
         }
 
@@ -2079,6 +2178,14 @@ mod tests {
     }
 
     #[test]
+    fn issue_2009_curve_without_nurb_is_not_shown_degenerate() {
+        // tangency-labs/smlib 8843967 (SmBSplineCurve::IsDegenerate): no NURB form, no
+        // degeneracy shown (FALSE), where upstream reads a NULL NURB.
+        let c = BSplineCurve::new(3);
+        assert!(!c.is_degenerate(&Kernel::default(), 1e-6, None).unwrap());
+    }
+
+    #[test]
     fn line_is_line() {
         let c = line(Point3::new(0.0, 0.0, 0.0), Point3::new(2.0, 0.0, 0.0));
         let (p, v) = c.is_line(3, 1e-9).unwrap().unwrap();
@@ -2115,7 +2222,14 @@ mod tests {
         let mut c = line(Point3::new(0.0, 0.0, 0.0), Point3::new(3.0, 0.0, 0.0));
         c.degree_elevate(3).unwrap();
         assert_eq!(c.degree().unwrap(), 3);
-        assert!(c.degree_elevate(2).is_err());
+        let e = c.degree_elevate(2).unwrap_err();
+        assert_cause(
+            &e,
+            BSplineFailure::DegreeBelowCurrent {
+                given: 2,
+                current: 3,
+            },
+        );
         let ivl = c.natural_interval();
         let r = c.reverse_parameterization(&ivl).unwrap();
         assert_eq!(r, ivl);
@@ -2199,14 +2313,43 @@ mod tests {
             c.control_points().unwrap()[1],
             CPoint::new(2.0, 2.0, 2.0, 2.0)
         );
-        assert!(c
+        let before = c.control_points().unwrap().to_vec();
+        let e = c
             .set_control_point(
-                ControlPointForm::NonRational,
+                ControlPointForm::EuclideanRational,
                 9,
                 Point3::new(0.0, 0.0, 0.0),
-                1.0
+                1.0,
             )
-            .is_err());
+            .unwrap_err();
+        assert_cause(&e, BSplineFailure::ControlPointIndex { index: 9, count: 5 });
+        // refused before any weight is touched
+        assert_eq!(c.control_points().unwrap(), &before[..]);
+    }
+
+    /// `e` is a B-spline failure with `cause`, keeping the status `SM_ERR` it had as a phrase
+    /// and the class the cause names.
+    fn assert_cause(e: &SolidError, cause: BSplineFailure) {
+        use crate::error::nurbs::NurbsFailure;
+        assert_eq!(
+            e.nurbs_failure(),
+            Some(&NurbsFailure::BSpline(cause)),
+            "{e:?}"
+        );
+        assert_eq!(e.upstream_status(), Some(crate::error::SM_ERR), "{e:?}");
+        assert_eq!(e.kind(), cause.kind(), "{e:?}");
+    }
+
+    #[test]
+    fn match_weights_takes_curves_with_as_many_control_points() {
+        let mut c = cubic();
+        let other = line(Point3::new(0.0, 0.0, 0.0), Point3::new(3.0, 0.0, 0.0));
+        let e = c.match_weights(&other).unwrap_err();
+        assert_cause(
+            &e,
+            BSplineFailure::ControlPointCountsDiffer { ours: 5, theirs: 2 },
+        );
+        assert_eq!(e.kind(), crate::error::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -2246,10 +2389,22 @@ mod tests {
     #[test]
     fn control_points_expert_absurd_stride_is_an_error() {
         // fuzz regression (nurbs.b_spline_curve_p2 fuzz00841): a 2^32 stride aborted
-        // the output allocation
+        // the output allocation, and a 2^31 stride over two points (32 GiB, which an
+        // overcommitting reservation grants) was zero-filled for 30 s
         let c = cubic();
         let r = c.control_points_expert(ControlPointForm::NonRational, 0, 4, 1 << 62);
         assert!(r.is_err());
+        let r = c.control_points_expert(ControlPointForm::NonRational, 0, 1, 1 << 31);
+        assert!(
+            matches!(
+                r,
+                Err(SolidError::InvalidInput {
+                    reason: "output too large",
+                    ..
+                })
+            ),
+            "{r:?}"
+        );
         assert!(c
             .control_points_expert(ControlPointForm::NonRational, 0, 4, usize::MAX)
             .is_err());
@@ -2259,5 +2414,124 @@ mod tests {
                 .len(),
             15
         );
+    }
+
+    fn wr37_nonuniform_planar_cubic() -> BSplineCurve {
+        let cpts = vec![
+            CPoint::new(0.0, 0.0, 0.0, NOW),
+            CPoint::new(1.2, 0.0, 0.0, NOW),
+            CPoint::new(6.5, 0.0, 0.0, NOW),
+            CPoint::new(7.2, 0.0, 0.0, NOW),
+            CPoint::new(8.0, 0.0, 0.0, NOW),
+            CPoint::new(10.0, 2.0, 0.0, NOW),
+        ];
+        let u = vec![0.0, 0.0, 0.0, 0.0, 0.1, 0.6, 1.0, 1.0, 1.0, 1.0];
+        BSplineCurve::from_nurb(Curve::new(cpts, 3, u).unwrap(), 3, false)
+    }
+
+    fn wr37_exact_offset_point(c: &BSplineCurve, t: f64, normal: Vec3, dist: f64) -> Point3 {
+        let pv = c.evaluate(t, 1, true, true).unwrap();
+        let binorm = pv[1].cross(normal).unitize().unwrap();
+        pv[0] + dist * binorm
+    }
+
+    #[test]
+    fn wr37_bspline_simple_offset_matches_parameterization() {
+        let c = wr37_nonuniform_planar_cubic();
+        let k = Kernel::default();
+
+        let tol = 1e-4;
+        let normal = Vec3::Z;
+        let dist = 0.5;
+
+        let (min_cont, _) = c.calculate_continuities(&k, ANG_TOL_DEG).unwrap();
+        assert!((min_cont as i32) > (ContinuityType::C0 as i32));
+        assert!(curve_is_arc(&k, &c, 11, tol / 100.0).unwrap().is_none());
+
+        let (off, gap) = c.create_simple_offset(&k, tol, normal, dist, true).unwrap();
+        assert!(gap <= tol);
+
+        // The parameterization is matched across the natural interval [0, 1] (WR-37:
+        // upstream drops it and passes [0, 0.5] as one Hermite span on the straight
+        // y = -dist locus, more than 0.1 from the offset point at t = 0.25).
+        assert_eq!(off.form(), BSplineCurveForm::Unspecified);
+        let p_exact = wr37_exact_offset_point(&c, 0.25, normal, dist);
+        assert!(off.evaluate_point(0.25).unwrap().distance(p_exact) <= tol);
+        for i in 0_u32..=100 {
+            let t = f64::from(i) / 100.0;
+            let p = off.evaluate_point(t).unwrap();
+            let p_ref = wr37_exact_offset_point(&c, t, normal, dist);
+            assert!(p.distance(p_ref) <= 1.5 * tol);
+        }
+    }
+
+    /// Without `match_parameterization` the call is upstream's (`bOptCreateAnalytics` and
+    /// matching both `false`, as upstream passes them for `false`): the offset lies within
+    /// the tolerance of the exact offset locus, though not at matching parameters.
+    #[test]
+    fn wr37_bspline_simple_offset_unmatched_lies_on_the_offset() {
+        let c = wr37_nonuniform_planar_cubic();
+        let k = Kernel::default();
+        let tol = 1e-4;
+        let (dist, normal) = (0.5, Vec3::Z);
+        let (off, gap) = c
+            .create_simple_offset(&k, tol, normal, dist, false)
+            .unwrap();
+        assert!(gap <= tol);
+        // the exact offset locus as a polyline of 10 000 chords (each under 0.004 long:
+        // the cubic's speed is at most 36, its control polygon's first leg over 0.1), whose
+        // sag is far below the tolerance
+        let locus: Vec<Point3> = (0_u32..=10_000)
+            .map(|i| wr37_exact_offset_point(&c, f64::from(i) / 10_000.0, normal, dist))
+            .collect();
+        let to_chord = |p: Point3, a: Point3, b: Point3| {
+            let ab = b - a;
+            let s = ((p - a).dot(ab) / ab.dot(ab)).clamp(0.0, 1.0);
+            p.distance(a + s * ab)
+        };
+        for i in 0_u32..=100 {
+            let p = off.evaluate_point(f64::from(i) / 100.0).unwrap();
+            let d = locus
+                .windows(2)
+                .map(|w| to_chord(p, w[0], w[1]))
+                .fold(f64::INFINITY, f64::min);
+            assert!(d <= 1.5 * tol, "t = {}: {d}", f64::from(i) / 100.0);
+        }
+    }
+
+    #[test]
+    fn wr37_linear_bspline_and_ellipse_simple_offset_with_match_parameterization() {
+        let k = Kernel::default();
+        let tol = 1e-4;
+
+        // A linear B-spline produces a single-span cubic Hermite B-spline (not an arc).
+        let l = line(Point3::new(0.0, 0.0, 0.0), Point3::new(4.0, 0.0, 0.0));
+        assert_eq!(l.form(), BSplineCurveForm::PolylineForm);
+        let (l_off, l_gap) = l.create_simple_offset(&k, tol, Vec3::Z, 1.0, true).unwrap();
+        assert_eq!(l_gap, 0.0);
+        assert_eq!(l_off.form(), BSplineCurveForm::Unspecified);
+        assert_eq!(l_off.degree().unwrap(), 3);
+        assert_eq!(l_off.number_control_points().unwrap(), 4);
+        for i in 0_u32..=4 {
+            let t = f64::from(i) / 4.0;
+            let expected = Point3::new(4.0 * t, -1.0, 0.0);
+            assert!(l_off.evaluate_point(t).unwrap().distance(expected) < 1e-12);
+        }
+
+        // Non-circular Ellipse::create_simple_offset delegates to BSplineCurve.
+        let frame = Axis2Placement::IDENTITY;
+        let deg_ivl = Extent1d::from_min_max(0.0, 180.0);
+        let ell = Ellipse::create_canonical(&k, &frame, 6.0, 1.0, Some(&deg_ivl), None);
+        let ell = ell.unwrap();
+        let r_ell = ell.create_simple_offset(&k, tol, Vec3::Z, 0.25, true);
+        let (ell_off, ell_gap) = r_ell.unwrap();
+        assert!(ell_gap <= tol);
+        let ivl = ell.base().natural_interval();
+        for i in 0_u32..=40 {
+            let t = ivl.evaluate(f64::from(i) / 40.0);
+            let p_off = ell_off.evaluate_point(&k, t).unwrap();
+            let p_ref = wr37_exact_offset_point(ell.base(), t, Vec3::Z, 0.25);
+            assert!(p_off.distance(p_ref) <= 2.0 * tol);
+        }
     }
 }

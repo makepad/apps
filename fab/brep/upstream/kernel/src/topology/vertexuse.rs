@@ -18,6 +18,7 @@
 //! | [`init_vertex_face_gap`]                    | `SmVertexuse::InitVertexFaceGap`                 |
 //! | [`is_connected_to`]                         | `SmVertexuse::IsConnectedTo`                     |
 //! | [`is_strut_vertexuse`], [`is_on_pole`]      | `SmVertexuse::IsStrutVertexuse`, `IsOnPole`      |
+//! | [`is_on_seam_of_face`]                      | none (not upstream, below)                       |
 //! | [`is_sector_missing_seam`], [`MissingSeam`] | `SmVertexuse::IsSectorMissingSeam`               |
 //! | [`compute_uv_point`]                        | `SmVertexuse::ComputeUVPoint`                    |
 //! | [`compute_uv_sector`], [`UvSectorIo`], [`UvSector`] | `SmVertexuse::ComputeUVSector`, `SmUVSectorIO` |
@@ -35,7 +36,7 @@
 //!   without loop use, an edge vertex use without edge use, a sector without end edge
 //!   use, a vertex use without vertex, ...) the port returns
 //!   [`SolidError::InvalidInput`]. `NER` / `SER` returns are
-//!   [`SolidError::Upstream`] with the upstream code. `SM_ASSERT`s, `SM_DBG_WARN`s and
+//!   a [`TopologyFailure`](crate::error::topology::TopologyFailure) with the upstream code. `SM_ASSERT`s, `SM_DBG_WARN`s and
 //!   the `SM_DEBUG_CODE` blocks are compiled out of the reference build and are not
 //!   ported (so `SmTol::IsZeroSpeed` of the sector speeds and `SmEdge::IsSeam` are
 //!   never called).
@@ -49,6 +50,17 @@
 //!   [`SolidError::Unported`] still propagates. The edge curve and surface
 //!   evaluations of `ComputeUVSector`, whose failure leaves uninitialised locals
 //!   upstream, propagate their error instead.
+//! - **Not upstream: kept UV points.** [`compute_uv_sector`] and [`is_sector_missing_seam`]
+//!   have crate variants (`compute_uv_sector_with`, `is_sector_missing_seam_with`) that
+//!   reuse a UV point solved earlier for the same vertex use while the B-rep is unwritten
+//!   (`UvPoints`); the vertex check passes one through its uses' sector tests.
+//! - **Not upstream: an edge vertex use's UV point on its trims' side of a seam.**
+//!   `ComputeUVPoint`'s guess is its trims' end; on a closed surface the drop of a vertex
+//!   off the surface can cross the seam where it stops on the domain's bound, and land a
+//!   whole period from the guess (the same surface point). The answer is moved by those
+//!   periods back to the guess's side (the seam wrap of `face::p1`, WR-491), so a face
+//!   that ends on its seam keeps its vertices, and the trims moved onto them
+//!   (`sm_FixUVTrimCurves`), in its domain.
 //! - **`IsKindOf(SmFilletVertex_TYPE)`** in `HasVertexFaceGap` is always false for a
 //!   vertex use (`SmFilletVertex` derives from `SmVertex`) and is dropped.
 //! - **Notify.** The vertex use part (clearing the cached gaps) is applied to the
@@ -70,15 +82,19 @@
 //!   cache, so `m_bProcessBoundaryCurves` has nothing to act on. A cache already in use
 //!   by an enclosing caller is not fetched again and no point is tested (upstream
 //!   reaches it mostly while its tree is built, with point testing off).
+//! - **Not upstream: [`is_on_seam_of_face`].** Whether the vertex's two edges on a face
+//!   touch a seam of the face's surface there from one side: the vertex is dropped onto the
+//!   surface, not read from the cached vertex/face gap, so the query leaves the B-rep as it
+//!   was. `SmVertex::IsTopologicalVertex` keeps such a vertex with it (`vertex.rs`).
 //! - `GetTurningAngDeg`, `ComputeTPoint`, `GetBrep`, the fresh-gap checks,
 //!   `GetVertexFaceTrimCurveGap`, `RefreshGaps`, `IsOnSeam`,
 //!   `IsSectorGapFreeAndOriented`, `AssertValid`, `Draw*` and the `Dump`s are not
 //!   part of this unit.
 
-use crate::error::{EntityRef, Result, SolidError, SM_ERR_NULL_POINTER};
+use crate::error::topology::TopologyFailure;
+use crate::error::{EntityRef, Failure, Result, SolidError, SM_ERR_NULL_POINTER};
 use crate::geom::attribute::AttributeStore;
-#[cfg(test)]
-use crate::geom::attribute::ObjectKey;
+
 use crate::geom::context::Context;
 use crate::geom::extent2d::Extent2d;
 use crate::geom::global_solver::{SolutionRequested, SolverOperation};
@@ -95,8 +111,7 @@ use crate::nurbs::knots::Side;
 use crate::surface::surface::p7::drop_vectors_at;
 use crate::surface::surface::{Surface, SurfaceKind};
 use crate::topology::edgeuse::p1 as eu1;
-#[cfg(test)]
-use crate::topology::topology::Topology;
+
 use crate::topology::topology::{self as topo};
 use crate::topology::vertex;
 use crate::topology::{
@@ -139,29 +154,12 @@ fn null(reason: &'static str) -> SolidError {
     SolidError::invalid_input(OP, reason)
 }
 
-/// `NER(ptr)` on a null pointer: `SM_ERR_NULL_POINTER`.
-fn ner(entity: VertexuseId) -> SolidError {
-    SolidError::Upstream {
-        operation: OP,
-        code: SM_ERR_NULL_POINTER,
-        entity: Some(EntityRef::Vertexuse(entity)),
-    }
-}
-
-/// `SER(SM_ERR)` / `return SM_ERR`.
-fn sm_err(entity: VertexuseId) -> SolidError {
-    SolidError::Upstream {
-        operation: OP,
-        code: crate::error::SM_ERR,
-        entity: Some(EntityRef::Vertexuse(entity)),
-    }
-}
-
-/// Ignores a status upstream ignores, letting [`SolidError::Unported`] through.
+/// Ignores an ordinary upstream status; unported dependencies, cancellation and
+/// unavailable face trims propagate.
 fn ignored<T>(r: Result<T>) -> Result<Option<T>> {
     match r {
         Ok(v) => Ok(Some(v)),
-        Err(e) if e.is_unported() => Err(e),
+        Err(e) if e.is_unported_or_cancelled() => Err(e),
         Err(_) => Ok(None),
     }
 }
@@ -172,7 +170,9 @@ fn ignored<T>(r: Result<T>) -> Result<Option<T>> {
 fn ignored_status<T>(r: Result<T>) -> Result<Option<T>> {
     match r {
         Ok(v) => Ok(Some(v)),
-        Err(e @ (SolidError::Unported { .. } | SolidError::InvalidInput { .. })) => Err(e),
+        Err(e) if e.is_unported_or_cancelled() || matches!(e, SolidError::InvalidInput { .. }) => {
+            Err(e)
+        }
         Err(_) => Ok(None),
     }
 }
@@ -243,9 +243,23 @@ pub fn compute_t_point(b: &Brep, vu: VertexuseId) -> Result<f64> {
     // for edgeuse type vertexuses
     if !is_edge_vertexuse(b, vu)? {
         // no TPoint to compute
-        return Err(sm_err(vu));
+        return Err(Failure::new(OP, TopologyFailure::NotAnEdgeVertexUse)
+            .at(EntityRef::Vertexuse(vu))
+            .into_error());
     }
-    let eu = edgeuse(b, vu)?.ok_or_else(|| ner(vu))?;
+    let eu = edgeuse(b, vu)?.ok_or_else(|| {
+        Failure::new(
+            OP,
+            TopologyFailure::Defect {
+                why: "the vertex use is of the edge kind but names no edge use; the \
+                    kernel sets the kind and the edge use together when it puts a \
+                    vertex use at an edge use's start",
+            },
+        )
+        .at(EntityRef::Vertexuse(vu))
+        .with_status(SM_ERR_NULL_POINTER)
+        .into_error()
+    })?;
     let e = eu1::edge(b, eu)?.ok_or_else(|| null("ComputeTPoint: edge use without edge"))?;
     let ivl = b.edge(e)?.interval;
 
@@ -741,33 +755,219 @@ fn loopuse_orientation(b: &Brep, lu: LoopuseId) -> Result<OrientType> {
     crate::topology::loopuse::orientation(b, lu)
 }
 
+/// The B-rep [`compute_uv_point`] and [`compute_uv_sector`] run on: one they may change
+/// ([`Changing`], upstream's calls), or one they only read ([`Reading`]), where they give
+/// up (`None`) instead of a step that could change it. Only the steps here take the B-rep
+/// mutably; everything else reads it through `Deref`.
+trait SectorBrep: core::ops::Deref<Target = Brep> {
+    /// The surface of face `f` the computation reads; `None` where it may not read it.
+    fn surface(&self, f: FaceId) -> Option<Result<&Surface>>;
+
+    /// `pEdgeuse->NormalizedEvaluate(t, TRUE, ..)` in UV space; `None` where it could make
+    /// a UV trim curve on a B-rep only read.
+    fn normalized_evaluate(
+        &mut self,
+        k: &Kernel,
+        eu: EdgeuseId,
+        t: f64,
+        want_first_deriv: bool,
+        ok_to_make: bool,
+    ) -> Option<Result<crate::topology::edgeuse::p3::NormalizedEval>>;
+
+    /// [`global_point_solve`]; `None` on a B-rep only read (the solve builds the face's
+    /// surface cache, which can change the B-rep).
+    #[allow(clippy::too_many_arguments)]
+    fn global_point_solve(
+        &mut self,
+        k: &Kernel,
+        f: FaceId,
+        domain: &Extent2d,
+        op: SolverOperation,
+        point: Point3,
+        tol: f64,
+        request: SolutionRequested,
+        point_test: bool,
+    ) -> Option<Result<Vec<PointDrop>>>;
+}
+
+/// A B-rep the UV point and sector computations may change: every step runs.
+struct Changing<'a>(&'a mut Brep);
+
+impl core::ops::Deref for Changing<'_> {
+    type Target = Brep;
+    fn deref(&self) -> &Brep {
+        self.0
+    }
+}
+
+impl SectorBrep for Changing<'_> {
+    fn surface(&self, f: FaceId) -> Option<Result<&Surface>> {
+        Some(face_surface(self.0, f))
+    }
+
+    fn normalized_evaluate(
+        &mut self,
+        k: &Kernel,
+        eu: EdgeuseId,
+        t: f64,
+        want_first_deriv: bool,
+        ok_to_make: bool,
+    ) -> Option<Result<crate::topology::edgeuse::p3::NormalizedEval>> {
+        Some(crate::topology::edgeuse::p3::normalized_evaluate(
+            k,
+            self.0,
+            eu,
+            t,
+            true,
+            want_first_deriv,
+            ok_to_make,
+        ))
+    }
+
+    fn global_point_solve(
+        &mut self,
+        k: &Kernel,
+        f: FaceId,
+        domain: &Extent2d,
+        op: SolverOperation,
+        point: Point3,
+        tol: f64,
+        request: SolutionRequested,
+        point_test: bool,
+    ) -> Option<Result<Vec<PointDrop>>> {
+        Some(global_point_solve(
+            k, self.0, f, domain, op, point, tol, request, point_test,
+        ))
+    }
+}
+
+/// A B-rep the UV point and sector computations only read: a step that could change it
+/// gives the computation up. It reads the surface of one face, the vertex use's, from a
+/// copy that stands for it as the face surfaces of
+/// [`Brep::clone_sharing_surface_caches`] do ([`Brep::stand_surface_for`]), so what the
+/// computation makes on the surface from `&self` (a NURB a cone makes on first use) stays
+/// on the copy, as it stayed on the B-rep's copy, and never reaches the B-rep. Another
+/// face's surface gives the computation up.
+struct Reading<'a> {
+    b: &'a Brep,
+    surface: Option<(FaceId, Surface)>,
+}
+
+impl<'a> Reading<'a> {
+    /// The reading of `b` for vertex use `vu`: with a copy of the surface of its face, when
+    /// it has one.
+    fn for_vertexuse(b: &'a Brep, vu: VertexuseId) -> Self {
+        let face = faceuse(b, vu)
+            .ok()
+            .flatten()
+            .and_then(|fu| b.faceuse(fu).ok().and_then(|r| r.face));
+        let surface = face.and_then(|f| {
+            let original = b.face(f).ok()?.surface.as_ref()?;
+            let mut copy = original.clone();
+            Brep::stand_surface_for(&mut copy, original);
+            Some((f, copy))
+        });
+        Self { b, surface }
+    }
+}
+
+impl core::ops::Deref for Reading<'_> {
+    type Target = Brep;
+    fn deref(&self) -> &Brep {
+        self.b
+    }
+}
+
+impl Reading<'_> {
+    /// The copy of face `f`'s surface; `None` for another face.
+    fn surface_copy(&self, f: FaceId) -> Option<&Surface> {
+        match &self.surface {
+            Some((face, copy)) if *face == f => Some(copy),
+            _ => None,
+        }
+    }
+}
+
+impl SectorBrep for Reading<'_> {
+    fn surface(&self, f: FaceId) -> Option<Result<&Surface>> {
+        self.surface_copy(f).map(Ok)
+    }
+
+    fn normalized_evaluate(
+        &mut self,
+        k: &Kernel,
+        eu: EdgeuseId,
+        t: f64,
+        want_first_deriv: bool,
+        ok_to_make: bool,
+    ) -> Option<Result<crate::topology::edgeuse::p3::NormalizedEval>> {
+        if ok_to_make {
+            return None;
+        }
+        let this = &*self;
+        crate::topology::edgeuse::p3::normalized_evaluate_reading(
+            k,
+            this.b,
+            eu,
+            t,
+            true,
+            want_first_deriv,
+            &|f| this.surface_copy(f).map(Some),
+        )
+        .transpose()
+    }
+
+    fn global_point_solve(
+        &mut self,
+        _k: &Kernel,
+        _f: FaceId,
+        _domain: &Extent2d,
+        _op: SolverOperation,
+        _point: Point3,
+        _tol: f64,
+        _request: SolutionRequested,
+        _point_test: bool,
+    ) -> Option<Result<Vec<PointDrop>>> {
+        None
+    }
+}
+
+/// The result of a [`SectorBrep`] step, or `Ok(None)` from the enclosing computation
+/// when the step gave it up.
+macro_rules! or_give_up {
+    ($step:expr) => {
+        match $step {
+            Some(r) => r,
+            None => return Ok(None),
+        }
+    };
+}
+
 /// `pEdgeuse->NormalizedEvaluate(t, TRUE, rUVPnt, &rUVTan, bOKToMakeUVTrimCurve)`: the
 /// UV point and UV tangent of the edge use at normalised parameter `t` (making a UV
 /// trim curve when allowed and missing).
-fn normalized_evaluate(
+fn normalized_evaluate<B: SectorBrep>(
     k: &Kernel,
-    b: &mut Brep,
+    b: &mut B,
     eu: EdgeuseId,
     t: f64,
     ok_to_make: bool,
-) -> Result<(Point3, Vec3)> {
-    let r = crate::topology::edgeuse::p3::normalized_evaluate(k, b, eu, t, true, true, ok_to_make)?;
-    Ok((r.point, r.first_deriv.unwrap_or(Vec3::UNDEF)))
+) -> Option<Result<(Point3, Vec3)>> {
+    let r = b.normalized_evaluate(k, eu, t, true, ok_to_make)?;
+    Some(r.map(|r| (r.point, r.first_deriv.unwrap_or(Vec3::UNDEF))))
 }
 
 /// `pEdgeuse->NormalizedEvaluate(t, TRUE, rUVPnt, NULL, bOKToMakeUVTrimCurve)`: the UV
 /// point only.
-fn normalized_evaluate_point(
+fn normalized_evaluate_point<B: SectorBrep>(
     k: &Kernel,
-    b: &mut Brep,
+    b: &mut B,
     eu: EdgeuseId,
     t: f64,
     ok_to_make: bool,
-) -> Result<Point3> {
-    Ok(
-        crate::topology::edgeuse::p3::normalized_evaluate(k, b, eu, t, true, false, ok_to_make)?
-            .point,
-    )
+) -> Option<Result<Point3>> {
+    let r = b.normalized_evaluate(k, eu, t, false, ok_to_make)?;
+    Some(r.map(|r| r.point))
 }
 
 /// A point solve's start end (`m_vStart`): the surface parameters and the solution
@@ -825,6 +1025,9 @@ fn global_point_solve(
     use crate::intersect::point_class::{PointClassType, PointClassification};
     use crate::query::face::p2::{face_surface_cache, point_classify, PointClassifyOptions};
 
+    // a face without loop uses has no trim boundaries: no test (asked of the face,
+    // not of when its cache was built)
+    let has_loopuses = crate::topology::face::p4::has_loopuses(b, f)?;
     let surface = face_surface(b, f)?.clone_for_evaluation()?;
     let lease = if surface.trim_cache_in_use() {
         None
@@ -832,6 +1035,7 @@ fn global_point_solve(
         Some(face_surface_cache(k, b, f)?)
     };
     let test_on = point_test
+        && has_loopuses
         && lease.as_ref().is_some_and(|l| {
             l.trimmed && l.cache.base().point_test_enabled && !l.cache.base().face_was_modified
         });
@@ -852,14 +1056,11 @@ fn global_point_solve(
                 ..PointClassifyOptions::default()
             },
         );
-        match status {
-            Err(e) if e.is_unported() => Err(e),
-            Err(_) => Ok(false),
-            Ok(()) => Ok(matches!(
+        Ok(ignored(status)?.is_some()
+            && matches!(
                 pc.point_class(),
                 PointClassType::Face | PointClassType::Edge | PointClassType::Vertex
-            )),
-        }
+            ))
     };
     let solutions = surface
         .global_point_solve_face_tested::<crate::surface::surface::p4::NoObject>(
@@ -903,6 +1104,8 @@ fn is_singularity(
         | SurfaceKind::Sphere(_)
         | SurfaceKind::Torus(_)
         | SurfaceKind::BSpline(_)
+        | SurfaceKind::ProceduralBlend(_)
+        | SurfaceKind::BallPatch(_)
         | SurfaceKind::CurveBounded(_)
         | SurfaceKind::SurfOfRevolution(_)
         | SurfaceKind::SurfOfExtrusion(_)
@@ -925,6 +1128,8 @@ fn is_on_seam(k: &Kernel, surface: &Surface, uv: Point2) -> Result<(bool, SurfPa
         | SurfaceKind::Sphere(_)
         | SurfaceKind::Torus(_)
         | SurfaceKind::BSpline(_)
+        | SurfaceKind::ProceduralBlend(_)
+        | SurfaceKind::BallPatch(_)
         | SurfaceKind::CurveBounded(_)
         | SurfaceKind::SurfOfRevolution(_)
         | SurfaceKind::SurfOfExtrusion(_)
@@ -979,36 +1184,94 @@ pub fn compute_uv_point(
     vu: VertexuseId,
     ok_to_make: bool,
 ) -> Result<Point2> {
+    uv_point_in(k, &mut Changing(b), vu, ok_to_make)?.ok_or_else(|| {
+        SolidError::port_invariant(OP, "ComputeUVPoint gave up on a B-rep it may change")
+    })
+}
+
+/// [`compute_uv_point`] on `b`; `None` when a step that could change a B-rep only read
+/// gave it up.
+fn uv_point_in<B: SectorBrep>(
+    k: &Kernel,
+    b: &mut B,
+    vu: VertexuseId,
+    ok_to_make: bool,
+) -> Result<Option<Point2>> {
     // Vertex and Face locals
     let v = vertex(b, vu)?.ok_or_else(|| null("ComputeUVPoint: vertex use without vertex"))?;
     let (vertex_pnt, vertex_tol) = {
         let r = b.vertex(v)?;
         (r.point, r.tolerance)
     };
-    let fu = faceuse(b, vu)?.ok_or_else(|| ner(vu))?;
-    let f = b.faceuse(fu)?.face.ok_or_else(|| ner(vu))?;
+    // `GetFaceuse` (as [`faceuse`]), keeping the edge use it reads: only an edge vertex
+    // use with its edge use carries one
+    let (fu, eu) = match b.vertexuse(vu)?.owner {
+        // no face for shell vertices; NERN of a null edge use; unknown
+        // m_tVertexuseType (SE only)
+        VertexuseOwner::Shell(_) | VertexuseOwner::Edgeuse(None) | VertexuseOwner::Unknown => {
+            (None, None)
+        }
+        // for Edgeuse_type - return vertexuse->edgeuse->faceuse
+        VertexuseOwner::Edgeuse(Some(eu)) => (eu1::faceuse(b, eu)?, Some(eu)),
+        // for Loopuse_type - return vertexuse->loopuse->faceuse
+        VertexuseOwner::Loopuse(lu) => (loopuse_faceuse(b, lu)?, None),
+    };
+    // a shell or wire vertex use has no face use: the caller's vertex use is not on a face
+    let fu = fu.ok_or_else(|| {
+        Failure::new(OP, TopologyFailure::VertexUseNotOnFace)
+            .at(EntityRef::Vertexuse(vu))
+            .into_error()
+    })?;
+    let f = b.faceuse(fu)?.face.ok_or_else(|| {
+        Failure::new(
+            OP,
+            TopologyFailure::Defect {
+                why: "the face use the vertex use lies on names no face; the kernel \
+                    makes a face's two face uses with the face and never unlinks \
+                    one from it",
+            },
+        )
+        .at(EntityRef::Vertexuse(vu))
+        .with_status(SM_ERR_NULL_POINTER)
+        .into_error()
+    })?;
     if b.face(f)?.surface.is_none() {
-        return Err(ner(vu));
+        return Err(Failure::new(OP, TopologyFailure::FaceWithoutSurface)
+            .at(EntityRef::Vertexuse(vu))
+            .into_error());
     }
     let uv_domain = face_uv_domain(b, f)?;
-    let nat_domain = face_surface(b, f)?.natural_uv_domain_with_nurb(k)?;
+    let nat_domain = or_give_up!(b.surface(f))?.natural_uv_domain_with_nurb(k)?;
 
-    let sol = if is_edge_vertexuse(b, vu)? {
+    let sol = if let Some(eu) = eu {
         // Edgeuse locals - thisEdgeuse->StartPt == CWEdgeuse->EndPt (with tolerances)
-        let eu = edgeuse(b, vu)?.ok_or_else(|| ner(vu))?;
-        let prev = b.edgeuse(eu)?.cw.ok_or_else(|| ner(vu))?;
+        let prev = b.edgeuse(eu)?.cw.ok_or_else(|| {
+            Failure::new(
+                OP,
+                TopologyFailure::Defect {
+                    why: "the edge use of a face's loop has no clockwise neighbour; the \
+                        kernel links every edge use of a loop into a closed ring, in \
+                        which a lone edge use is its own neighbour",
+                },
+            )
+            .at(EntityRef::Vertexuse(vu))
+            .with_status(SM_ERR_NULL_POINTER)
+            .into_error()
+        })?;
 
         // try quick solution based on this (and prev) Vertexuse->Edgeuse->UVTrimCurve data
         // get this SurfaceUV for ThisEdgeuse start point from UVTrimCurve
-        let (this_uv_pnt, mut this_uv_tan) = normalized_evaluate(k, b, eu, 0.0, ok_to_make)?;
+        let (this_uv_pnt, mut this_uv_tan) =
+            or_give_up!(normalized_evaluate(k, b, eu, 0.0, ok_to_make))?;
         let mut uv_guess = xy(this_uv_pnt);
 
         // get SurfaceUV for PrevEdgeuse end point from UVTrimCurve
-        let (prev_uv_pnt, mut prev_uv_tan) = normalized_evaluate(k, b, prev, 1.0, ok_to_make)?;
+        let (prev_uv_pnt, mut prev_uv_tan) =
+            or_give_up!(normalized_evaluate(k, b, prev, 1.0, ok_to_make))?;
 
         // when PrevUV and ThisUV UVTrimCurve EndPts are far apart - check for
         // singularities and seams
-        let surface = face_surface(b, f)?;
+        let surface = or_give_up!(b.surface(f))?;
         let surf_uv_domain = surface.natural_uv_domain_with_nurb(k)?;
         let dist_u = (this_uv_pnt.x - prev_uv_pnt.x).abs();
         let dist_v = (this_uv_pnt.y - prev_uv_pnt.y).abs();
@@ -1126,7 +1389,7 @@ pub fn compute_uv_point(
         // try to project vertex point down onto surface
         let (mut found, mut s) = local_point_solve(
             k,
-            face_surface(b, f)?,
+            or_give_up!(b.surface(f))?,
             &uv_domain,
             SolverOperation::Minimize,
             vertex_pnt,
@@ -1145,9 +1408,8 @@ pub fn compute_uv_point(
         // If local solve fails then go back and do a global closest point
         if !found || s.value > vertex_tol + face_tolerance(b, f)? {
             let face_tol = face_tolerance(b, f)?;
-            let sols = global_point_solve(
+            let sols = or_give_up!(b.global_point_solve(
                 k,
-                b,
                 f,
                 &uv_domain,
                 SolverOperation::Minimize,
@@ -1155,14 +1417,16 @@ pub fn compute_uv_point(
                 vertex_tol + face_tol,
                 SolutionRequested::Single,
                 ok_to_make,
-            )?;
+            ))?;
             let Some(&first) = sols.first() else {
-                return Err(sm_err(vu));
+                return Err(Failure::new(OP, TopologyFailure::NoFootOnSurface)
+                    .at(EntityRef::Vertexuse(vu))
+                    .into_error());
             };
 
             // Use UVTrimCurves to choose the right drop point [B678]
             if sols.len() > 1 {
-                let this_uv = normalized_evaluate_point(k, b, eu, 0.0, ok_to_make)?;
+                let this_uv = or_give_up!(normalized_evaluate_point(k, b, eu, 0.0, ok_to_make))?;
                 let guess = xy(this_uv);
                 let mut min_dist = crate::math::BIG_DOUBLE;
                 for x in &sols {
@@ -1176,15 +1440,37 @@ pub fn compute_uv_point(
                 s = first;
             }
         }
+        // Not upstream: the solution on the side of a seam the guess is on. A vertex off a
+        // closed surface whose drop stops on the domain's bound with a gap crosses the seam
+        // there and lands a whole period from the guess, the trims' own end: the same
+        // surface point, outside a face that ends on its seam (WR-491's seam wrap).
+        let gap = Vec3::new(s.uv.x - uv_guess.x, s.uv.y - uv_guess.y, 0.0);
+        let mut periods = [None, None];
+        for (slot, (along, length, direction)) in periods.iter_mut().zip([
+            (gap.x, nat_domain.x_length(), SurfParamType::U),
+            (gap.y, nat_domain.y_length(), SurfParamType::V),
+        ]) {
+            if length.is_finite()
+                && along.abs() > length / 2.0
+                && or_give_up!(b.surface(f))?
+                    .is_closed(k, &nat_domain, direction, None, false)?
+                    .0
+            {
+                *slot = Some(length);
+            }
+        }
+        let wrap = crate::topology::face::p1::seam_wrap_of_gap(gap, periods);
         // a projection distance larger than the tolerance is only reported (SE)
-        s.uv
-    } else if is_loop_vertexuse(b, vu)? {
+        Point2::new(s.uv.x + wrap.x, s.uv.y + wrap.y)
+    } else {
+        // a loop vertex use: the owner match above gave a face use only to it and to an
+        // edge vertex use with its edge use, so the shell vertex use upstream's default
+        // case expects never gets here
         // project point down to face's surface
         let face_tol = face_tolerance(b, f)?;
 
-        let mut sols = global_point_solve(
+        let mut sols = or_give_up!(b.global_point_solve(
             k,
-            b,
             f,
             &uv_domain,
             SolverOperation::Intersect,
@@ -1192,12 +1478,11 @@ pub fn compute_uv_point(
             vertex_tol + face_tol,
             SolutionRequested::All,
             true,
-        )?;
+        ))?;
         // If that failed, try again with Minimize. [090827]
         if sols.is_empty() {
-            sols = global_point_solve(
+            sols = or_give_up!(b.global_point_solve(
                 k,
-                b,
                 f,
                 &uv_domain,
                 SolverOperation::Minimize,
@@ -1205,16 +1490,19 @@ pub fn compute_uv_point(
                 vertex_tol + face_tol,
                 SolutionRequested::All,
                 true,
-            )?;
+            ))?;
         }
         // return only solution when just 1, or any solution when many (on a pole or seam)
-        sols.first().ok_or_else(|| sm_err(vu))?.uv
-    } else {
-        // default case: must be a ShellVertexuse
-        return Err(sm_err(vu));
+        sols.first()
+            .ok_or_else(|| {
+                Failure::new(OP, TopologyFailure::NoFootOnSurface)
+                    .at(EntityRef::Vertexuse(vu))
+                    .into_error()
+            })?
+            .uv
     };
 
-    Ok(sol)
+    Ok(Some(sol))
 }
 
 /// The length of the edge use's UV trim curve's natural interval, or of its edge's
@@ -1323,9 +1611,107 @@ pub fn compute_uv_sector(
     vu: VertexuseId,
     ok_to_make: bool,
 ) -> Result<UvSector> {
+    compute_uv_sector_with(k, b, vu, ok_to_make, &mut UvPoints::default())
+}
+
+/// Not upstream: the UV points ([`compute_uv_point`]) a run of sector computations has
+/// solved, keyed by vertex use and `ok_to_make`. One vertex's check solves each of its
+/// uses' points twice, as a sector's own use and as the end use of a neighbouring use's
+/// sector. A kept point is given back only while the B-rep's [`Brep::write_stamps`] equal
+/// those it was solved under, and only a solve that wrote nothing (made no UV trim curve,
+/// built no surface cache) is kept. The solve reads only the kernel and the B-rep, so a
+/// kept point is the one it would return. Errors are not kept: the solve runs again and
+/// returns its error again.
+#[derive(Debug, Default)]
+pub(crate) struct UvPoints {
+    /// The stamps the kept points were solved under.
+    stamps: Option<crate::topology::WriteStamps>,
+    /// The kept points: vertex use, `ok_to_make`, the point.
+    kept: Vec<(VertexuseId, bool, Point2)>,
+}
+
+impl UvPoints {
+    /// [`uv_point_in`] on `b`, reusing the point kept for `vu` and `ok_to_make` while the
+    /// B-rep is unwritten.
+    fn solve<B: SectorBrep>(
+        &mut self,
+        k: &Kernel,
+        b: &mut B,
+        vu: VertexuseId,
+        ok_to_make: bool,
+    ) -> Result<Option<Point2>> {
+        let stamps = b.write_stamps();
+        if self.stamps.as_ref() != Some(&stamps) {
+            self.kept.clear();
+            self.stamps = None;
+        }
+        if let Some(&(_, _, p)) = self.kept.iter().find(|x| x.0 == vu && x.1 == ok_to_make) {
+            return Ok(Some(p));
+        }
+        let p = uv_point_in(k, b, vu, ok_to_make)?;
+        if let Some(p) = p {
+            if b.write_stamps() == stamps {
+                self.stamps = Some(stamps);
+                self.kept.push((vu, ok_to_make, p));
+            }
+        }
+        Ok(p)
+    }
+}
+
+/// [`compute_uv_sector`] reusing the UV points `points` kept (see [`UvPoints`]).
+///
+/// # Errors
+///
+/// As [`compute_uv_sector`].
+pub(crate) fn compute_uv_sector_with(
+    k: &Kernel,
+    b: &mut Brep,
+    vu: VertexuseId,
+    ok_to_make: bool,
+    points: &mut UvPoints,
+) -> Result<UvSector> {
+    uv_sector_in(k, &mut Changing(b), vu, ok_to_make, points)?.ok_or_else(|| {
+        SolidError::port_invariant(OP, "ComputeUVSector gave up on a B-rep it may change")
+    })
+}
+
+/// [`compute_uv_sector`] without making anything (`ok_to_make` false), on a B-rep it only
+/// reads; `None` when the computation reaches a step that could change the B-rep (a
+/// global point solve, which builds the face's surface cache). Where it gives an answer,
+/// that answer is [`compute_uv_sector`]'s on the same B-rep, which leaves the B-rep
+/// unchanged then; a caller holding the B-rep only to read it runs
+/// [`compute_uv_sector`] on a copy when this gives up.
+///
+/// # Errors
+///
+/// As [`compute_uv_sector`].
+pub fn compute_uv_sector_read_only(
+    k: &Kernel,
+    b: &Brep,
+    vu: VertexuseId,
+) -> Result<Option<UvSector>> {
+    uv_sector_in(
+        k,
+        &mut Reading::for_vertexuse(b, vu),
+        vu,
+        false,
+        &mut UvPoints::default(),
+    )
+}
+
+/// [`compute_uv_sector`] on `b`; `None` when a step that could change a B-rep only read
+/// gave it up.
+fn uv_sector_in<B: SectorBrep>(
+    k: &Kernel,
+    b: &mut B,
+    vu: VertexuseId,
+    ok_to_make: bool,
+    points: &mut UvPoints,
+) -> Result<Option<UvSector>> {
     // init output
     let mut io = UvSectorIo::new(Some(vu));
-    let fail = |io: UvSectorIo| Ok(UvSector { success: false, io });
+    let fail = |io: UvSectorIo| Ok(Some(UvSector { success: false, io }));
 
     // no work - no sector
     if is_shell_vertexuse(b, vu)? {
@@ -1354,7 +1740,7 @@ pub fn compute_uv_sector(
     let uv_domain = face_uv_domain(b, f)?;
 
     // compute the UV point - pass the call along (status ignored)
-    if let Some(p) = ignored_status(compute_uv_point(k, b, vu, ok_to_make))? {
+    if let Some(p) = ignored_status(or_give_up!(points.solve(k, b, vu, ok_to_make).transpose()))? {
         io.beg_edge_uv_point = p;
     }
 
@@ -1392,7 +1778,10 @@ pub fn compute_uv_sector(
             let end_edge = b.edgeuse(end)?.edge;
 
             // compute EndSector UVPoint (status ignored)
-            if let Some(p) = ignored_status(compute_uv_point(k, b, end_vu, ok_to_make))? {
+            if let Some(p) = ignored_status(or_give_up!(points
+                .solve(k, b, end_vu, ok_to_make)
+                .transpose()))?
+            {
                 io.end_edge_uv_point = p;
             }
 
@@ -1441,7 +1830,7 @@ pub fn compute_uv_sector(
                 end_tan = -end_tan;
             }
 
-            let surface = face_surface(b, f)?;
+            let surface = or_give_up!(b.surface(f))?;
 
             // IsBegVertexUV on a Surface Singularity
             let (on_pole, singular_dir) =
@@ -1557,7 +1946,7 @@ pub fn compute_uv_sector(
             }
 
             // Is BegVertexUV on a Surface->Seam
-            let surface = face_surface(b, f)?;
+            let surface = or_give_up!(b.surface(f))?;
             let (on_seam, seam_dir) = is_on_seam(k, surface, io.beg_edge_uv_point)?;
             let seam_u = seam_dir == SurfParamType::U || seam_dir == SurfParamType::Both;
             let seam_v = seam_dir == SurfParamType::V || seam_dir == SurfParamType::Both;
@@ -1596,7 +1985,7 @@ pub fn compute_uv_sector(
             }
 
             // all done
-            Ok(UvSector { success: true, io })
+            Ok(Some(UvSector { success: true, io }))
         }
         // vertexuse is in an uninitialized state
         VertexuseOwner::Shell(_) | VertexuseOwner::Unknown => fail(io),
@@ -1627,7 +2016,22 @@ pub fn is_sector_missing_seam(
     vu: VertexuseId,
     uv_space_okay: bool,
 ) -> Result<MissingSeam> {
-    let s = compute_uv_sector(k, b, vu, uv_space_okay)?;
+    is_sector_missing_seam_with(k, b, vu, uv_space_okay, &mut UvPoints::default())
+}
+
+/// [`is_sector_missing_seam`] reusing the UV points `points` kept (see [`UvPoints`]).
+///
+/// # Errors
+///
+/// As [`compute_uv_sector`].
+pub(crate) fn is_sector_missing_seam_with(
+    k: &Kernel,
+    b: &mut Brep,
+    vu: VertexuseId,
+    uv_space_okay: bool,
+    points: &mut UvPoints,
+) -> Result<MissingSeam> {
+    let s = compute_uv_sector_with(k, b, vu, uv_space_okay, points)?;
     Ok(MissingSeam {
         missing: s.io.sector_missing_seam_u || s.io.sector_missing_seam_v,
         u: s.io.sector_missing_seam_u,
@@ -1674,6 +2078,124 @@ pub fn is_on_pole(k: &Kernel, b: &mut Brep, vu: VertexuseId) -> Result<bool> {
     Ok(on_pole)
 }
 
+/// Not upstream: whether the vertex is where its two edges on this face touch a seam of the
+/// face's surface: the vertex, dropped onto the surface, lies on the seam, and both edges
+/// leave the seam there to the same side of it. The cached vertex/face gap is not read
+/// (computing it would change the B-rep). Joined into one edge, they would meet the seam at a point inside
+/// the edge, which the seam test of the face's check (`SmFace` test 29,
+/// `CurveClassification::is_crossed_by_edge`) counts as a crossing. Edges that run along the
+/// seam, or cross it (their sides differ, and a crossing needs a seam edge rather than a
+/// vertex), are not a touch. A surface closed in neither direction has no seam, and nothing
+/// is dropped onto it.
+///
+/// # Errors
+///
+/// [`SolidError::NotFound`] for a dangling id; those of the surface's
+/// `IsClosed`, `IsOnSeam` and `DropPoint`, and the edges' curve evaluation;
+/// [`SolidError::Unported`].
+pub fn is_on_seam_of_face(k: &Kernel, b: &mut Brep, vu: VertexuseId) -> Result<bool> {
+    let f = match faceuse(b, vu)? {
+        Some(fu) => b.faceuse(fu)?.face,
+        None => None,
+    };
+    let Some(f) = f else { return Ok(false) };
+    let Some(eu) = edgeuse(b, vu)? else {
+        return Ok(false);
+    };
+    {
+        let Some(surface) = b.face(f)?.surface.as_ref() else {
+            return Ok(false);
+        };
+        let domain = surface.natural_uv_domain_with_nurb(k)?;
+        let closed_u = surface
+            .is_closed(k, &domain, SurfParamType::U, None, false)?
+            .0;
+        let closed_v = surface
+            .is_closed(k, &domain, SurfParamType::V, None, false)?
+            .0;
+        if !closed_u && !closed_v {
+            return Ok(false);
+        }
+    }
+    // The vertex dropped onto the surface. The vertex use's cached gap is not read: computing
+    // it would leave the gap on the B-rep, which a query must not change.
+    let Some(v) = vertex(b, vu)? else {
+        return Ok(false);
+    };
+    let surface = face_surface(b, f)?;
+    let domain = surface.natural_uv_domain_with_nurb(k)?;
+    let at = surface
+        .drop_point::<crate::surface::surface::p4::NoObject>(
+            k,
+            vertex::point(b, v)?,
+            &domain,
+            &crate::surface::surface::p5::DropPointOptions::default(),
+        )?
+        .result_uv;
+    let seam = surface.is_on_seam(k, at, None)?;
+    if !seam.on_seam {
+        return Ok(false);
+    }
+    // The vertex's two edges on this face: this use's, and the one before it in the loop,
+    // which ends at the vertex. A point of each edge's 3D curve a tenth of its interval in
+    // from its end at the vertex, dropped onto the surface, is on the side of the seam the
+    // edge leaves on. The edge uses' UV trim curves are not read: a boolean asks before it
+    // makes them.
+    let Some(prev) = eu1::cw_edgeuse(b, eu)? else {
+        return Ok(false);
+    };
+    let mut leaves = Vec::new();
+    for use_ in [eu, prev] {
+        let Some(e) = b.edgeuse(use_)?.edge else {
+            return Ok(false);
+        };
+        let edge = b.edge(e)?;
+        let Some(curve) = edge.curve.as_ref() else {
+            return Ok(false);
+        };
+        let ivl = edge.interval;
+        let step = ivl.length() / 10.0;
+        let t = if crate::topology::edge::start_vertex(b, e)? == Some(v) {
+            ivl.min() + step
+        } else {
+            ivl.max() - step
+        };
+        let p = curve.evaluate_point(k, t)?;
+        let dropped = surface.drop_point::<crate::surface::surface::p4::NoObject>(
+            k,
+            p,
+            &domain,
+            &crate::surface::surface::p5::DropPointOptions::default(),
+        )?;
+        // an edge that runs along the seam does not leave it
+        if is_on_seam(k, surface, dropped.result_uv)?.0 {
+            return Ok(false);
+        }
+        leaves.push(dropped.result_uv);
+    }
+    let (Some(a), Some(c)) = (leaves.first(), leaves.get(1)) else {
+        return Ok(false);
+    };
+    // Each point's side of a seam: nearer the domain's start or its end in the seam's
+    // direction. Both edges on one side touch the seam there and need the vertex; on two
+    // sides they cross it, which needs a seam edge (`SplitAtSeam`), not a vertex.
+    let lower = |p: &Point2, u: bool| {
+        let (x, lo, hi) = if u {
+            (p.x, domain.min().x, domain.max().x)
+        } else {
+            (p.y, domain.min().y, domain.max().y)
+        };
+        x - lo < hi - x
+    };
+    let same = |u: bool| lower(a, u) == lower(c, u);
+    Ok(match seam.seam_dir {
+        SurfParamType::U => same(true),
+        SurfParamType::V => same(false),
+        SurfParamType::Both => same(true) && same(false),
+        _ => false,
+    })
+}
+
 // ---- maintenance ----------------------------------------------------------------------
 
 /// `Notify`: clears the cached gaps on `PostEdit`, `SplitInBrep`, `ChangeGeometry` and
@@ -1710,218 +2232,5 @@ pub fn notify(
     topo::notify(records, attributes, context, operation, this, d1, d2, d3)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::geom::extent1d::Extent1d;
-    use crate::topology::{Edge, Edgeuse, Loopuse, Region, Shell, Vertex};
 
-    /// A wire edge from v0 to v1: two shell edge uses and their vertex uses, plus a
-    /// shell vertex use of a third vertex.
-    fn wire() -> (Brep, [VertexuseId; 3], [EdgeuseId; 2]) {
-        let mut b = Brep::new();
-        let r = b
-            .add_region_record(Region {
-                in_brep: true,
-                ..Region::default()
-            })
-            .unwrap();
-        let s = b
-            .add_shell_record(Shell {
-                faces: Vec::new(),
-                region: Some(r),
-                ..Shell::default()
-            })
-            .unwrap();
-        let v: Vec<VertexId> = (0..3)
-            .map(|i| {
-                b.add_vertex_record(Vertex {
-                    point: Vec3::new(f64::from(i), 0.0, 0.0),
-                    tolerance: ZONE_TOL_3D,
-                    ..Vertex::default()
-                })
-                .unwrap()
-            })
-            .collect();
-        let e = b
-            .add_edge_record(Edge {
-                vertices: [v[0], v[1]],
-                edgeuses: vec![EdgeuseId::from_index(0), EdgeuseId::from_index(1)],
-                interval: Extent1d::from_min_max(0.0, 1.0),
-                tolerance: ZONE_TOL_3D,
-                curve: None,
-            })
-            .unwrap();
-        let eus: Vec<EdgeuseId> = (0..2)
-            .map(|i| {
-                b.add_edgeuse_record(Edgeuse {
-                    edge: Some(e),
-                    owner: EdgeuseOwner::Shell(Some(s)),
-                    vertexuse: Some(VertexuseId::from_index(i)),
-                    orientation: if i == 0 {
-                        OrientType::Same
-                    } else {
-                        OrientType::Opposite
-                    },
-                    ..Edgeuse::default()
-                })
-                .unwrap()
-            })
-            .collect();
-        let vus: Vec<VertexuseId> = (0..2)
-            .map(|i| {
-                b.add_vertexuse_record(crate::topology::Vertexuse {
-                    vertex: Some(v[i]),
-                    owner: VertexuseOwner::Edgeuse(Some(eus[i])),
-                    ..crate::topology::Vertexuse::default()
-                })
-                .unwrap()
-            })
-            .collect();
-        let svu = b
-            .add_vertexuse_record(crate::topology::Vertexuse {
-                vertex: Some(v[2]),
-                owner: VertexuseOwner::Shell(Some(s)),
-                ..crate::topology::Vertexuse::default()
-            })
-            .unwrap();
-        b.region_mut(r).unwrap().shells.push(s);
-        b.shell_mut(s).unwrap().shell_type = crate::topology::shell::ShellType::Wire;
-        b.shell_mut(s).unwrap().members = crate::topology::shell::ShellMembers::Edgeuse(eus[0]);
-        for (vertex, vertexuse) in v.iter().zip([vus[0], vus[1], svu]) {
-            b.vertex_mut(*vertex).unwrap().vertexuses.push(vertexuse);
-        }
-        (b, [vus[0], vus[1], svu], [eus[0], eus[1]])
-    }
-
-    #[test]
-    fn kinds_and_owners() {
-        let (b, vu, eu) = wire();
-        assert_eq!(vertexuse_type(&b, vu[0]).unwrap(), EDGEUSE_TYPE);
-        assert_eq!(vertexuse_type(&b, vu[2]).unwrap(), SHELL_TYPE);
-        assert!(is_edge_vertexuse(&b, vu[0]).unwrap());
-        assert!(is_shell_vertexuse(&b, vu[2]).unwrap());
-        assert_eq!(edgeuse(&b, vu[0]).unwrap(), Some(eu[0]));
-        assert_eq!(edgeuse(&b, vu[2]).unwrap(), None);
-        assert_eq!(faceuse(&b, vu[0]).unwrap(), None);
-        assert_eq!(loopuse(&b, vu[0]).unwrap(), None);
-        assert_eq!(shell(&b, vu[0]).unwrap(), Some(ShellId::from_index(0)));
-        assert_eq!(shell(&b, vu[2]).unwrap(), Some(ShellId::from_index(0)));
-        assert!(!is_strut_vertexuse(&b, vu[0]).unwrap());
-        assert!(!has_vertex_edge_gap(&b, vu[0]).unwrap());
-        assert!(!has_vertex_face_gap(&b, vu[0]).unwrap());
-        assert!(!has_vertex_face_gap(&b, vu[2]).unwrap());
-        assert!(edge_is_wire(&b, EdgeId::from_index(0)).unwrap());
-        assert!(is_kind_of(TYPE) && is_kind_of(topo::TYPE) && !is_kind_of(16005));
-        let d = crate::topology::Vertexuse::default();
-        assert_eq!(d.uv_point, Point2::new(1.0e20, 1.0e20));
-        assert!(!d.vertex_edge_gap.is_init() && !d.vertex_face_gap.is_init());
-    }
-
-    #[test]
-    fn connections() {
-        let (b, vu, eu) = wire();
-        let t = |e| is_connected_to(&b, vu[0], Some(e)).unwrap();
-        assert!(is_connected_to(&b, vu[0], None).unwrap());
-        assert!(t(EntityRef::Vertexuse(vu[0])));
-        assert!(!t(EntityRef::Vertexuse(vu[1])));
-        assert!(t(EntityRef::Vertex(VertexId::from_index(0))));
-        assert!(t(EntityRef::Edge(EdgeId::from_index(0))));
-        assert!(t(EntityRef::Edgeuse(eu[0])));
-        assert!(!t(EntityRef::Edgeuse(eu[1])));
-        assert!(!t(EntityRef::Face(FaceId::from_index(0))));
-        assert!(t(EntityRef::Shell(ShellId::from_index(0))));
-        assert!(t(EntityRef::Region(crate::topology::RegionId::from_index(
-            0
-        ))));
-        assert!(t(EntityRef::Brep(crate::topology::BrepId::from_index(0))));
-    }
-
-    #[test]
-    fn gaps_and_null_paths() {
-        let k = Kernel::default();
-        let (mut b, vu, _) = wire();
-        b.vertexuse_mut(vu[0]).unwrap().vertex_edge_gap.vertexuse = Some(vu[0]);
-        // no curve: the cache is cleared and nothing is evaluated
-        let g = calc_vertex_edge_gap(&Kernel::default(), &mut b, vu[0], true, true).unwrap();
-        assert_eq!(g, Some(VertexEdgeGap::new()));
-        assert!(!b.vertexuse(vu[0]).unwrap().vertex_edge_gap.is_init());
-        assert_eq!(
-            vertex_edge_gap(&Kernel::default(), &mut b, vu[0], true).unwrap(),
-            None
-        );
-        assert_eq!(vertex_face_gap(&k, &mut b, vu[0], true).unwrap(), None);
-        assert_eq!(
-            calc_vertex_face_gap(&k, &mut b, vu[2], true, true).unwrap(),
-            Some(VertexFaceGap::new())
-        );
-        // shell and wire vertex uses have no face: NER
-        for x in [vu[0], vu[2]] {
-            assert!(matches!(
-                compute_uv_point(&k, &mut b, x, true),
-                Err(SolidError::Upstream {
-                    code: SM_ERR_NULL_POINTER,
-                    ..
-                })
-            ));
-            assert!(!compute_uv_sector(&k, &mut b, x, true).unwrap().success);
-            assert!(!is_on_pole(&k, &mut b, x).unwrap());
-            assert!(!is_sector_missing_seam(&k, &mut b, x, true).unwrap().missing);
-        }
-        // a loop vertex use without loop use: upstream dereferences null
-        let lvu = b
-            .add_vertexuse_record(crate::topology::Vertexuse {
-                vertex: Some(VertexId::from_index(2)),
-                owner: VertexuseOwner::Loopuse(None),
-                ..crate::topology::Vertexuse::default()
-            })
-            .unwrap();
-        assert!(matches!(
-            faceuse(&b, lvu),
-            Err(SolidError::InvalidInput { .. })
-        ));
-        assert_eq!(shell(&b, lvu).unwrap(), None);
-        let lu = b.add_loopuse_record(Loopuse::default()).unwrap();
-        b.vertexuse_mut(lvu).unwrap().owner = VertexuseOwner::Loopuse(Some(lu));
-        assert_eq!(faceuse(&b, lvu).unwrap(), None);
-        assert_eq!(loopuse(&b, lvu).unwrap(), Some(lu));
-        assert!(matches!(
-            shell(&b, lvu),
-            Err(SolidError::InvalidInput { .. })
-        ));
-    }
-
-    #[test]
-    fn notify_clears_gaps() {
-        let (mut b, vu, _) = wire();
-        let mut records = crate::topology::topology::NotifyRecords::new();
-        let this = ObjectRef {
-            type_code: TYPE,
-            key: ObjectKey(7),
-        };
-        records.insert(this.key, Topology::new());
-        let mut attrs = AttributeStore::default();
-        for (op, cleared) in [
-            (NotifyOperation::PreEdit, false),
-            (NotifyOperation::Split, true),
-        ] {
-            let r = b.vertexuse_mut(vu[0]).unwrap();
-            r.vertex_edge_gap.vertexuse = Some(vu[0]);
-            r.vertex_face_gap.vertexuse = Some(vu[0]);
-            notify(
-                &mut b,
-                vu[0],
-                &mut records,
-                &mut attrs,
-                None,
-                op,
-                this,
-                [None; 3],
-            )
-            .unwrap();
-            let r = b.vertexuse(vu[0]).unwrap();
-            assert_eq!(r.vertex_edge_gap.is_init(), !cleared);
-            assert_eq!(r.vertex_face_gap.is_init(), !cleared);
-        }
-    }
-}
+// Modified for Makepad by fab/brep/sync/tool (fab/brep/SYNC.md): S1, O1.

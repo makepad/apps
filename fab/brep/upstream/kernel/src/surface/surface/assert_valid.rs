@@ -1,6 +1,6 @@
 //! The surface validity checks (`AssertValid`): the base class `SmSurface` and its
 //! virtual dispatch over the B-spline, plane, cone, cylinder, sphere, torus,
-//! surface-of-revolution and surface-of-extrusion overrides, with the predicates only
+//! surface-of-revolution, surface-of-extrusion and curve-bounded overrides, with the predicates only
 //! they use.
 //!
 //! Upstream: `source/SMLib/src/SmSurface.cpp`, `source/SMLib/src/SmBSplineSurface.cpp`,
@@ -8,12 +8,13 @@
 //! `source/SMLib/src/SmCone.cpp`, `source/SMLib/src/SmCylinder.cpp`,
 //! `source/SMLib/src/SmSphere.cpp`, `source/SMLib/src/SmTorus.cpp`,
 //! `source/SMLib/src/SmSurfOfRevolution.cpp`, `source/SMLib/src/SmSurfOfExtrusion.cpp`,
-//! `source/SMLib/src/SmAxis2Placement.cpp`,
+//! `source/SMLib/src/SmAxis2Placement.cpp`, `source/SMLib/src/SmCurveBoundedSurface.cpp`,
 //! `source/SMLib/src/SmPointSet.cpp`, `source/SMLib/inc/SmAssertArray.h`.
 //!
 //! | Rust                                  | Upstream                                              |
 //! |---------------------------------------|-------------------------------------------------------|
 //! | [`Surface::assert_valid`]             | `SmSurface::AssertValid` (virtual)                    |
+//! | [`Surface::assert_valid_with_face_context`] | `SmSurface::AssertValid` of a face's surface (`GetFace()` reached by its solves) |
 //! | `surface_assert_valid` (private)      | `SmSurface::AssertValid`                              |
 //! | `assert_test_surface1` .. `6` (private) | `sm_AssertTestSurface1`, `4`, `5`, `6`              |
 //! | `b_spline_surface_assert_valid` (private) | `SmBSplineSurface::AssertValid`                   |
@@ -24,6 +25,7 @@
 //! | `torus_assert_valid` (private)        | `SmTorus::AssertValid`                                |
 //! | `surf_of_revolution_assert_valid` (private) | `SmSurfOfRevolution::AssertValid`               |
 //! | `surf_of_extrusion_assert_valid` (private) | `SmSurfOfExtrusion::AssertValid`                 |
+//! | `curve_bounded_surface_assert_valid` (private) | `SmCurveBoundedSurface::AssertValid`             |
 //! | [`axis2_placement_assert_valid`]      | `SmAxis2Placement::AssertValid`                       |
 //! | [`has_knot_multiplicity_greater_than_degree`] | `SmBSplineSurface::HasKnotMultiplicityGreaterThanDegree`, `sm_HasKnotMultiplicityGreaterThanDegree` |
 //! | [`has_internal_pole`]                 | `SmBSplineSurface::HasInternalPole`                   |
@@ -31,8 +33,12 @@
 //! | `has_same_parameterization` (private) | `SmBSplineSurface::HasSameParameterization` (curve)   |
 //! | [`grid_has_non_monotonic_points`]     | `SmPointGrid(...)`, `SmPointGrid::SetUpMonotonic`, `HasNonMonotonicPoints` |
 //! | [`LEVEL_GIVEN`]                       | `SM_LEVEL_GIVEN`                                      |
+//! | `wrapped` (private module)            | `SmOffsetSurface::AssertValid`, `SmSrfInVolume::AssertValid` |
 //!
 //! Deviations:
+//! - **Closed control nets (#2683).** Both monotonicity walks compare their last
+//!   direction with their first, completing the cycle upstream leaves open. The
+//!   rounding-aware walk also closes across steps that carry no direction (WR-737).
 //! - **Levels.** `level` is the `SmAssertTestLevel` value (`SM_LEVEL_0` .. `SM_LEVEL_2`,
 //!   [`LEVEL_GIVEN`]). As the release build's report macros do, a test runs when
 //!   `level >= ` its test level and `pTestRequests` is ignored; [`LEVEL_GIVEN`] skips
@@ -43,7 +49,8 @@
 //!   class. The placement's reports (`m_vPosition.AssertValid`, its own object
 //!   upstream) also name `key`: their reporting type differs, so they never collide
 //!   with the surface's.
-//! - **Context tests** (`SmSurfOfRevolution` 0, 1, `SmSurfOfExtrusion` 27) always
+//! - **Context tests** (`SmSurfOfRevolution` 0, 1, `SmSurfOfExtrusion` 27 and
+//!   `SmCurveBoundedSurface` 3..5) always
 //!   hold: one kernel is the only context.
 //! - **Generator owner** (`SmSurfOfRevolution` 14, `SmSurfOfExtrusion` 26): the
 //!   generator is held by value, so it is owned by the surface unless its owner handle
@@ -57,6 +64,9 @@
 //!   solution found (`no_tangent_along`).
 //! - **Warnings.** `SmBSplineSurface::AssertValid`'s repeated-end-control-point
 //!   check only issues a `WARN`, so `HasRepeatedEndControlPoints` is not run.
+//! - **Interior poles (WR-788).** Both knot walks decide from the active control
+//!   points. Upstream's U-only Greville check can lie off the knot line and miss
+//!   an iso span whose control points coincide exactly.
 //! - **Undefined behaviour.** Index arithmetic of `HasInternalPole` that leaves the
 //!   control net (unclamped knot vectors), the first/last polar angle of an empty
 //!   table, missing iso boundaries and a continuity output `CalculateContinuities`
@@ -69,21 +79,47 @@
 //!   these tests; the port propagates their errors (as `validation.rs` does; except
 //!   the extrusion's `GlobalPropertyAnalysis`, see **Angles**), and a
 //!   failed `MakeNurb` is ignored, as upstream.
-//! - **Extrusion origin zero (WR-511, #1508).** Test 8 uses the pinned unscaled
-//!   `SM_EFF_ZERO` by default; `Kernel::fixes.extrusion_origin_scaled_zero` uses
-//!   `SM_EFF_ZERO * (1 + origin.max_dimension())` for that solve only.
-//! - **Unported overrides.** `SmCurveBoundedSurface`, `SmSrfInVolume` and
-//!   `SmOffsetSurface` have their own `AssertValid`, not ported here; they return
-//!   [`SolidError::Unported`]. `SmSTEPSurface` has none and
-//!   runs the base check.
-//! - No recursion.
+//! - **Extrusion origin zero (WR-511, #1508).** Test 8 point-solves the origin with
+//!   `SM_EFF_ZERO * (1 + origin.max_dimension())`, where upstream uses an unscaled
+//!   `SM_EFF_ZERO`; that solve only.
+//! - `SmSTEPSurface` has no override and runs the base check.
+//! - **Contained checks.** Curve-bounded basis checks carry an explicit nesting
+//!   counter bounded by `MAX_GEOMETRY_NESTING` (32; fixtures reach at most 3).
+//!   Contained report keys are assigned in traversal order, distinct from the root
+//!   even when its key is `u64::MAX`; callers accumulating checks can supply a
+//!   contained-key resolver when accumulating independent geometry checks.
+//!   Boundary curves are exact evaluation copies
+//!   for the existing mutable virtual curve validator; lazily made NURBs on those
+//!   copies are not retained by this const surface check.
+//! - **Curve-bounded labels.** Upstream declares a six-entry table but omits this
+//!   class from `SM_GetAssertLabelList`: failed test 0 uses the one-entry default
+//!   table, and a failed test 1..5 with a report list reads past it. The port keeps
+//!   that lookup for test 0 and labels tests 1..5 from the class's own table
+//!   (`labels::CURVE_BOUNDED_SURFACE`, UB-273). With no report list,
+//!   failed boundary checks return false normally, as upstream. At levels 0..2,
+//!   the inherited base continuity test reads an unwritten output: this class uses
+//!   the generic failing `GetKnots`. Continuities that cannot be computed fail test 4
+//!   (WR-663, as the fork); `LEVEL_GIVEN` skips that base call.
+//! - **Wrapping surfaces.** `SmOffsetSurface` and `SmSrfInVolume` are in the `wrapped`
+//!   submodule (its own deviations); the latter calls `Volume::assert_valid`.
+//! - **Face context.** Upstream's solves reach a face-owned surface's face through the
+//!   surface (`smsurf_GetSurfaceCache` and `GetFace()`). The port's surfaces cannot,
+//!   so a check of a face's surface takes the caller's face-aware cache context
+//!   ([`Surface::assert_valid_with_face_context`]) and the solves of this surface
+//!   (`SmOffsetSurface` test 2) run through it; contained surfaces (bases, a basis)
+//!   are not face-owned and run without it.
+//! - **Recursion.** A surface in a volume also recurses (into its base surface), after
+//!   checking its owned geometry nests at most `MAX_GEOMETRY_NESTING` (32) deep.
 
+use crate::math::det;
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 
 use crate::curve::curve::p1::GlobalPointSolveOptions;
 use crate::curve::curve::p2::TANGENT_FIELD_TYPE;
 use crate::curve::curve::p7::PropertyAnalysisOptions;
 use crate::curve::curve::{Curve, CurveKind, CurvePropertyType};
+use crate::error::nurbs::NurbsFailure;
 use crate::error::{ignore_status, Result, SolidError};
 use crate::geom::a_object;
 use crate::geom::assert_array::labels::{
@@ -106,7 +142,6 @@ use crate::geom::tol::{
     is_zero_to_tol, tol3d, xsect_tol_3d_from_zones, zone_tol_3d_of_curve, SmallTopoType,
     ANG_TOL_DEG, ZONE_TOL_3D,
 };
-use crate::geom::vector3d::acos as sm_acos;
 use crate::geom::vector3d::asin as sm_asin;
 use crate::kernel::Kernel;
 use crate::math::{
@@ -114,9 +149,11 @@ use crate::math::{
     EFF_ZERO_SQ, EFF_ZERO_SQRT, PI, UNDEF_DOUBLE,
 };
 use crate::nurbs::b_spline_curve::BSplineCurve;
+use crate::nurbs::b_spline_surface::p1::ControlPointNet;
 use crate::nurbs::b_spline_surface::{BSplineSurface, SurfParamType};
 use crate::nurbs::b_spline_surface_n_lib::p2::EvaluateFlags;
 use crate::nurbs::knots::Side;
+use crate::nurbs::math::{gamma, UNIT};
 use crate::surface::cone::Cone;
 use crate::surface::plane::Plane;
 use crate::surface::sphere::Sphere;
@@ -124,7 +161,13 @@ use crate::surface::surf_of_extrusion::{CurveOrientType, SurfOfExtrusion};
 use crate::surface::surf_of_revolution::SurfOfRevolution;
 use crate::surface::torus::Torus;
 
+use crate::topology::brep_cache::CacheObject;
+
+use super::p1::SurfaceSolveContext;
+use super::p2::{CURVE_BOUNDED_SURFACE_TYPE, MAX_GEOMETRY_NESTING};
 use super::{Surface, SurfaceKind};
+
+mod wrapped;
 
 /// `SM_LEVEL_GIVEN`: run the tests of the called class only (base classes skipped).
 pub const LEVEL_GIVEN: u8 = 4;
@@ -145,7 +188,17 @@ struct Reporter<'a> {
     key: ObjectKey,
     level: u8,
     class_string: &'static str,
+    /// The face-aware cache context of a face's surface and the handle naming the
+    /// surface in it (see the module docs, **Face context**); `None` for a surface
+    /// without face.
+    face: Option<FaceSolve<'a>>,
 }
+
+/// The caller's face-aware cache context and the handle of the checked surface in it.
+type FaceSolve<'a> = (
+    &'a mut (dyn SurfaceSolveContext<CacheObject> + 'a),
+    CacheObject,
+);
 
 impl Reporter<'_> {
     /// Whether the base-class call runs (`eTestLevel != SM_LEVEL_GIVEN`).
@@ -242,6 +295,32 @@ impl Reporter<'_> {
     }
 }
 
+/// Per-call identities and depth for checks on owned geometry. No addresses or
+/// global state participate in the identities of reports.
+struct ContainedChecks<'a> {
+    allocate: &'a mut dyn FnMut(u64) -> Result<ObjectKey>,
+    root: ObjectKey,
+    assigned: BTreeSet<ObjectKey>,
+    ordinal: u64,
+    depth: usize,
+}
+
+impl ContainedChecks<'_> {
+    fn key(&mut self) -> Result<ObjectKey> {
+        self.ordinal = self
+            .ordinal
+            .checked_add(1)
+            .ok_or_else(|| invalid("contained report key space exhausted"))?;
+        let key = (self.allocate)(self.ordinal)?;
+        if key == self.root || !self.assigned.insert(key) {
+            return Err(invalid(
+                "contained report key duplicates another geometry key",
+            ));
+        }
+        Ok(key)
+    }
+}
+
 impl Surface {
     /// `AssertValid` (virtual, `SM_NO_WALK`; the walk argument is unused by every
     /// surface): the checks of this surface's class and, unless `level` is
@@ -251,10 +330,13 @@ impl Surface {
     /// # Errors
     ///
     /// [`SolidError::Unported`] for the surface kinds with their own unported check
-    /// (curve bounded, surface in volume, offset) and from callees; the
+    /// (curve bounded) and from callees; the
     /// errors of the evaluations and queries the tests run (statuses upstream
     /// ignores); [`SolidError::InvalidInput`] where upstream's behaviour is undefined
     /// (see the module docs).
+    /// For a compound surface, contained keys are `key + ordinal` (wrapping),
+    /// in traversal order. Reserve that range when accumulating independent checks,
+    /// or use [`Surface::assert_valid_with_keys`] with the caller's identity map.
     pub fn assert_valid(
         &self,
         k: &Kernel,
@@ -262,14 +344,93 @@ impl Surface {
         level: u8,
         key: ObjectKey,
     ) -> Result<bool> {
+        self.assert_valid_with_keys(k, list, level, key, &mut |ordinal| {
+            Ok(ObjectKey(key.0.wrapping_add(ordinal)))
+        })
+    }
+
+    /// Runs [`Surface::assert_valid`] with identities for contained geometry.
+    ///
+    /// `contained_key` receives each contained object's one-based traversal ordinal.
+    /// It must return a distinct key for each ordinal, separate from `key` and the
+    /// keys of other objects in the accumulating report list. Repeated checks of
+    /// the same surface should resolve an ordinal to the same key. A curve's
+    /// embedded polar converter also reserves an ordinal.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Surface::assert_valid`], the key callback, or `InvalidInput` for
+    /// a repeated contained key or input-driven validity nesting deeper than 32.
+    pub fn assert_valid_with_keys(
+        &self,
+        k: &Kernel,
+        list: Option<&mut AssertArray>,
+        level: u8,
+        key: ObjectKey,
+        contained_key: &mut dyn FnMut(u64) -> Result<ObjectKey>,
+    ) -> Result<bool> {
+        let mut walk = ContainedChecks {
+            allocate: contained_key,
+            root: key,
+            assigned: BTreeSet::new(),
+            ordinal: 0,
+            depth: 0,
+        };
+        self.assert_valid_with_walk(k, list, level, key, &mut walk, None)
+    }
+
+    /// [`Surface::assert_valid_with_keys`] of a face's surface: the solves of the
+    /// checks (`SmOffsetSurface` test 2's self-intersection) build their caches
+    /// through `context`, in which `handle` names this surface, so they reach the
+    /// face that owns it (upstream's `GetFace()`).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Surface::assert_valid_with_keys`] and of the context's cache
+    /// preparation.
+    pub fn assert_valid_with_face_context(
+        &self,
+        k: &Kernel,
+        list: Option<&mut AssertArray>,
+        level: u8,
+        key: ObjectKey,
+        contained_key: &mut dyn FnMut(u64) -> Result<ObjectKey>,
+        context: &mut dyn SurfaceSolveContext<CacheObject>,
+        handle: CacheObject,
+    ) -> Result<bool> {
+        let mut walk = ContainedChecks {
+            allocate: contained_key,
+            root: key,
+            assigned: BTreeSet::new(),
+            ordinal: 0,
+            depth: 0,
+        };
+        self.assert_valid_with_walk(k, list, level, key, &mut walk, Some((context, handle)))
+    }
+
+    fn assert_valid_with_walk<'a>(
+        &self,
+        k: &Kernel,
+        list: Option<&'a mut AssertArray>,
+        level: u8,
+        key: ObjectKey,
+        walk: &mut ContainedChecks<'_>,
+        face: Option<FaceSolve<'a>>,
+    ) -> Result<bool> {
+        if walk.depth > MAX_GEOMETRY_NESTING {
+            return Err(invalid("contained surface validity nesting exceeds 32"));
+        }
         let mut r = Reporter {
             list,
             key,
             level,
             class_string: self.class_string(),
+            face,
         };
         match self.kind() {
-            SurfaceKind::BSpline(_) => b_spline_surface_assert_valid(k, self, &mut r),
+            SurfaceKind::BSpline(_)
+            | SurfaceKind::ProceduralBlend(_)
+            | SurfaceKind::BallPatch(_) => b_spline_surface_assert_valid(k, self, &mut r),
             SurfaceKind::Plane(_) => plane_assert_valid(k, self, &mut r),
             SurfaceKind::Cone(c) if c.is_cylinder_class() => cylinder_assert_valid(k, self, &mut r),
             SurfaceKind::Cone(_) => cone_assert_valid(k, self, &mut r),
@@ -278,29 +439,97 @@ impl Surface {
             SurfaceKind::SurfOfRevolution(_) => surf_of_revolution_assert_valid(k, self, &mut r),
             SurfaceKind::Step(_) => surface_assert_valid(k, self, &mut r),
             SurfaceKind::CurveBounded(_) => {
-                // UNPORTED(surface.curve_bounded_surface): SmCurveBoundedSurface::AssertValid
-                Err(SolidError::unported(
-                    "SmCurveBoundedSurface::AssertValid",
-                    "surface.curve_bounded_surface",
-                ))
+                curve_bounded_surface_assert_valid(k, self, &mut r, walk)
             }
-            SurfaceKind::SrfInVolume(_) => {
-                // UNPORTED(surface.srf_in_volume): SmSrfInVolume::AssertValid
-                Err(SolidError::unported(
-                    "SmSrfInVolume::AssertValid",
-                    "surface.srf_in_volume",
-                ))
-            }
-            SurfaceKind::OffsetSurface(_) => {
-                // UNPORTED(surface.offset_surface): SmOffsetSurface::AssertValid
-                Err(SolidError::unported(
-                    "SmOffsetSurface::AssertValid",
-                    "surface.offset_surface",
-                ))
-            }
+            SurfaceKind::SrfInVolume(_) => wrapped::srf_in_volume_assert_valid(k, self, &mut r),
+            SurfaceKind::OffsetSurface(_) => wrapped::offset_surface_assert_valid(k, self, &mut r),
             SurfaceKind::SurfOfExtrusion(_) => surf_of_extrusion_assert_valid(k, self, &mut r),
         }
     }
+}
+
+/// `SmCurveBoundedSurface::AssertValid`, retaining the order of the contained
+/// checks and the separate context reports. Its declared label table is not used
+/// by upstream's global label dispatcher; `Reporter` uses the same default table.
+fn curve_bounded_surface_assert_valid(
+    k: &Kernel,
+    s: &Surface,
+    r: &mut Reporter<'_>,
+    walk: &mut ContainedChecks<'_>,
+) -> Result<bool> {
+    let SurfaceKind::CurveBounded(bounded) = s.kind() else {
+        return Err(invalid(
+            "curve-bounded validity requires a curve-bounded surface",
+        ));
+    };
+    let mut rtn = if r.bases() {
+        surface_assert_valid(k, s, r)?
+    } else {
+        true
+    };
+
+    let basis_key = walk.key()?;
+    let depth = walk.depth;
+    walk.depth = depth + 1;
+    let basis_result = bounded.basis().assert_valid_with_walk(
+        k,
+        r.list.as_deref_mut(),
+        r.level,
+        basis_key,
+        walk,
+        None,
+    );
+    walk.depth = depth;
+    let basis_ok = basis_result?;
+    rtn &= curve_bounded_report(r, 0, basis_ok)?;
+    // Every owned value is evaluated through the same kernel context.
+    rtn &= curve_bounded_report(r, 3, true)?;
+
+    for (curves, test, context_test) in [
+        (bounded.boundaries_3d(), 1, 4),
+        (bounded.boundaries_uv(), 2, 5),
+    ] {
+        for curve in curves {
+            let key = walk.key()?;
+            let polar_key = walk.key()?;
+            let mut curve = curve.clone_for_evaluation()?;
+            let ok = crate::topology::brep::validation::standalone_curve_assert_valid(
+                k,
+                &mut curve,
+                r.list.as_deref_mut(),
+                r.level,
+                key,
+                polar_key,
+            )?;
+            rtn &= curve_bounded_report(r, test, ok)?;
+            rtn &= curve_bounded_report(r, context_test, true)?;
+        }
+    }
+    Ok(rtn)
+}
+
+/// `SM_ASSERT_BOOLEAN_REPORT(test, SM_LEVEL_0, passed)` of `SmCurveBoundedSurface`.
+/// Upstream's label lookup gives the class [`DEFAULT`](crate::geom::assert_array::labels::DEFAULT),
+/// one entry long: test 0 is labelled from it, as upstream; a later test, which upstream
+/// reads past its end, takes its label from the class's own
+/// `sAssertCurveBoundedSurface_list` (not upstream).
+fn curve_bounded_report(r: &mut Reporter<'_>, test: u64, passed: bool) -> Result<bool> {
+    let upstream = assert_label_list(CURVE_BOUNDED_SURFACE_TYPE, 0);
+    if usize::try_from(test).is_ok_and(|t| t < upstream.len()) {
+        return r.report(CURVE_BOUNDED_SURFACE_TYPE, test, 0, passed, UNDEF, UNDEF);
+    }
+    let class_string = r.class_string;
+    r.report_from(
+        crate::geom::assert_array::labels::CURVE_BOUNDED_SURFACE,
+        CURVE_BOUNDED_SURFACE_TYPE,
+        CURVE_BOUNDED_SURFACE_TYPE,
+        class_string,
+        test,
+        0,
+        passed,
+        UNDEF,
+        UNDEF,
+    )
 }
 
 // ---- SmSurface ----------------------------------------------------------------------
@@ -375,20 +604,23 @@ fn assert_test_surface1(k: &Kernel, s: &Surface) -> Result<(bool, f64, f64)> {
 
 /// `sm_AssertTestSurface4`: at least G1 across every knot in both directions.
 fn assert_test_surface4(k: &Kernel, s: &Surface) -> Result<bool> {
-    // Surface continuities across U and V knots (statuses ignored: a failed call
-    // leaves the minimum it had reached)
-    let cont = |dir| -> Result<ContinuityType> {
+    // Surface continuities across U and V knots
+    // (continuities that cannot be computed fail the test, as the fork does, WR-663,
+    // tangency-labs/smlib 21dcf69: `None`)
+    let cont = |dir| -> Result<Option<ContinuityType>> {
         let mut reached = None;
         match s.calculate_continuities_reached(k, dir, &mut reached) {
-            Ok((c, _)) => Ok(c),
-            Err(e) if e.is_unported() => Err(e),
-            Err(_) => reached.ok_or_else(|| {
-                invalid("continuity output never written (upstream reads it uninitialised)")
-            }),
+            Ok((c, _)) => Ok(Some(c)),
+            Err(e) if e.is_unported_or_cancelled() => Err(e),
+            Err(_) => Ok(None),
         }
     };
-    let cont_u = cont(SurfParamType::U)?;
-    let cont_v = cont(SurfParamType::V)?;
+    let Some(cont_u) = cont(SurfParamType::U)? else {
+        return Ok(false);
+    };
+    let Some(cont_v) = cont(SurfParamType::V)? else {
+        return Ok(false);
+    };
 
     // Good Surfaces have at least G1 continuity across every knot IsoParam curve
     let g1 = ContinuityType::G1 as i32;
@@ -435,10 +667,13 @@ fn assert_test_surface6(k: &Kernel, s: &Surface) -> Result<bool> {
         }
 
         // Get iso parameter boundaries
-        // (a failed CreateIsoBoundaries leaves the curves uninitialised upstream)
+        // (a failed CreateIsoBoundaries leaves the curves uninitialised upstream;
+        // boundaries that cannot be built or compared fail the test, as the fork does,
+        // WR-663, tangency-labs/smlib 21dcf69)
         let (crv1, crv2) = match s.create_iso_boundaries(k, dir, a_tol) {
             Ok(Some(c)) => c,
-            Err(e) if e.is_unported() => return Err(e),
+            Err(e) if e.is_unported_or_cancelled() => return Err(e),
+            Err(_) => return Ok(false),
             _ => {
                 return Err(invalid(
                     "no iso boundaries (upstream reads uninitialised curves)",
@@ -458,7 +693,7 @@ fn assert_test_surface6(k: &Kernel, s: &Surface) -> Result<bool> {
         );
         let ivl1 = crv1.natural_interval();
         let ivl2 = crv2.natural_interval();
-        let found = crv1.global_coincidence_checker(
+        let found = match crv1.global_coincidence_checker(
             k,
             &ivl1,
             &crv2,
@@ -469,7 +704,11 @@ fn assert_test_surface6(k: &Kernel, s: &Surface) -> Result<bool> {
                 Some(OperandObject::Curve(0, ivl1)),
                 Some(OperandObject::Curve(1, ivl2)),
             ],
-        )?;
+        ) {
+            Ok(f) => f,
+            Err(e) if !e.is_unported_or_cancelled() => return Ok(false),
+            Err(e) => return Err(e),
+        };
 
         // Range of Values implies G0 discontinuous non-seam closure of surface
         if found
@@ -498,6 +737,10 @@ fn b_spline_part(s: &Surface) -> Option<&BSplineSurface> {
         SurfaceKind::Torus(t) => Some(t.base().base()),
         SurfaceKind::SurfOfRevolution(sr) => Some(sr.base()),
         SurfaceKind::SurfOfExtrusion(e) => Some(e.base()),
+        // (the fork's SmProceduralBlend inherits SmBSplineSurface::AssertValid: its net)
+        SurfaceKind::ProceduralBlend(pb) => Some(pb.net()),
+        // (the fork's SmBallPatch inherits SmBSplineSurface::AssertValid: its net)
+        SurfaceKind::BallPatch(bp) => Some(bp.net()),
         _ => None,
     }
 }
@@ -520,6 +763,25 @@ fn make_nurb<'a>(k: &Kernel, s: &'a Surface) -> Result<Option<Cow<'a, BSplineSur
             b_spline_part(s).map(Cow::Borrowed)
         }
     })
+}
+
+/// (not upstream) Whether `s` fails `SmBSplineSurface` test #2 as [`Surface::assert_valid`]
+/// runs it: degree + 1 control points of a span of its net coincident within the test's
+/// tolerance, `ZONE_TOL_3D / 10` ([`has_internal_pole`]). A surface whose net is one point or
+/// one curve (where the test is not run) never fails it.
+///
+/// # Errors
+///
+/// Those of the NURB's making, the degeneracy tests and [`has_internal_pole`].
+pub(crate) fn fails_internal_pole_test(k: &Kernel, s: &Surface) -> Result<bool> {
+    let Some(part) = make_nurb(k, s)? else {
+        return Ok(false);
+    };
+    let tol = ZONE_TOL_3D / 10.0;
+    if s.is_degenerate_point(k, tol, None)? || s.is_degenerate_curve(k, EFF_ZERO_DEG, None, tol)? {
+        return Ok(false);
+    }
+    has_internal_pole(k, s, &part, tol)
 }
 
 /// `SmBSplineSurface::AssertValid`.
@@ -581,12 +843,159 @@ fn b_spline_surface_assert_valid(k: &Kernel, s: &Surface, r: &mut Reporter<'_>) 
 
         // (bClosedRow is passed as the grid's bClosedCol and bClosedCol as its
         // bClosedRow, as upstream)
+        // a step within the rounding of the two control points it is between is no step;
+        // upstream's monotonicity pass skips a step only below an absolute SM_EFF_ZERO,
+        // which one ulp of a coordinate is above past about 8192 mm from the origin, so
+        // it reads a collapsed pole row carrying one ulp of noise as a zigzag that
+        // reverses at every point (WR-737, #2560)
+        let non_monotonic = grid_has_non_monotonic_points_to_rounding(
+            &net.points,
+            net.v_count,
+            closed_row,
+            closed_col,
+        )?;
         let non_monotonic =
-            grid_has_non_monotonic_points(&net.points, net.v_count, closed_row, closed_col)?;
+            non_monotonic && (closed_row || closed_col || !certify_monotone_net(&part, &net)?);
         rtn &= r.report(B_SPLINE_SURFACE_TYPE, 5, 0, !non_monotonic, UNDEF, UNDEF)?;
     }
 
     Ok(rtn)
+}
+
+/// With positive weights a control line whose successive points advance along
+/// its chord has a monotone projection. Require a margin for the Euclidean
+/// conversion, the two differences and their dot product.
+fn advancing_control_lines(net: &ControlPointNet, interior: bool) -> Result<bool> {
+    let (nu, nv) = (net.u_count, net.v_count);
+    if nv == 0 {
+        return Err(invalid("control line stride is zero"));
+    }
+    if nu < 2 || nv < 2 {
+        return Ok(false);
+    }
+    let advances = |start: usize, stride: usize, count: usize| {
+        let point = |i: usize| net.points.get(i.checked_mul(stride)?.checked_add(start)?);
+        let Some((&a, &b)) = point(0).zip(point(count - 1)) else {
+            return false;
+        };
+        let chord = b - a;
+        let length = chord.length();
+        let line = || (0..count).map_while(point);
+        let mut previous_step = None;
+        line().zip(line().skip(1)).all(|(&p, &q)| {
+            let step = q - p;
+            // Every step that passes the projection bound exceeds its rounding.
+            // Keep test #5's turns on the original interior lines.
+            if interior
+                && previous_step
+                    .replace(step)
+                    .is_some_and(|last| turns_back(step, last))
+            {
+                return false;
+            }
+            step.dot(chord)
+                > step_within_rounding(p, q) * length
+                    + step.length() * step_within_rounding(a, b)
+                    + gamma(5) * step.length() * length
+        })
+    };
+    let skip = usize::from(interior);
+    Ok((skip..nu - skip).all(|u| {
+        u.checked_mul(nv)
+            .is_some_and(|start| advances(start, 1, nv))
+    }) && (skip..nv - skip).all(|v| advances(v, nv, nu)))
+}
+
+/// Knot insertion preserves the surface and its parameterization. A high-degree
+/// control polygon may zigzag although the curve it controls is strictly monotone.
+/// Only accept the second representation when every open control line advances
+/// strictly along its chord and passes the original turns test.
+fn certify_monotone_net(part: &BSplineSurface, original: &ControlPointNet) -> Result<bool> {
+    const MAX_POINTS: usize = 32_768;
+    // Only exterior control lines are boundary curves of a clamped patch.
+    // A reversal in an interior control line retains the original rejection.
+    if original.points.len() > MAX_POINTS
+        || original.weights.iter().any(|w| !w.is_finite() || *w <= 0.0)
+        || !advancing_control_lines(original, true)?
+    {
+        return Ok(false);
+    }
+    for direction in [SurfParamType::U, SurfParamType::V] {
+        let (_, multiplicities) = part.knots(direction, None)?;
+        let end = Some(part.degree(direction) + 1);
+        if multiplicities.first().copied() != end || multiplicities.last().copied() != end {
+            return Ok(false);
+        }
+    }
+    let mut refined = part.clone();
+    for (direction, transverse) in [
+        (SurfParamType::V, SurfParamType::U),
+        (SurfParamType::U, SurfParamType::V),
+    ] {
+        let degree = refined.degree(direction);
+        if degree < 3 {
+            continue;
+        }
+        for _ in 0..3 {
+            let (knots, _) = refined.knots(direction, None)?;
+            let along = refined.number_control_points(direction);
+            let across = refined.number_control_points(transverse);
+            let extra = knots.len().saturating_sub(1).saturating_mul(degree);
+            if along.saturating_add(extra).saturating_mul(across) > MAX_POINTS {
+                break;
+            }
+            let mut insert = Vec::new();
+            for pair in knots.windows(2) {
+                let &[lo, hi] = pair else { continue };
+                let mid = lo + (hi - lo) * 0.5;
+                if lo < mid && mid < hi {
+                    insert.extend(std::iter::repeat_n(mid, degree));
+                }
+            }
+            if insert.is_empty() {
+                break;
+            }
+            if !insert_refinement_knots(&mut refined, direction, &insert)? {
+                return Ok(false);
+            }
+            let net = refined.control_point_net()?;
+            if net.weights.iter().any(|w| !w.is_finite() || *w <= 0.0) {
+                return Ok(false);
+            }
+            if advancing_control_lines(&net, false)?
+                && !grid_has_non_monotonic_points_to_rounding(
+                    &net.points,
+                    net.v_count,
+                    false,
+                    false,
+                )?
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// A parameter on or outside a knot endpoint refuses this refinement. Other
+/// insertion failures retain their operation and cause.
+fn insert_refinement_knots(
+    surface: &mut BSplineSurface,
+    direction: SurfParamType,
+    knots: &[f64],
+) -> Result<bool> {
+    match surface.insert_knots(direction, knots) {
+        Ok(()) => Ok(true),
+        Err(e)
+            if matches!(
+                e.root_cause().nurbs_failure(),
+                Some(NurbsFailure::Parameter)
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// `SmBSplineSurface::HasKnotMultiplicityGreaterThanDegree`
@@ -639,22 +1048,23 @@ fn count(v: usize) -> Result<i64> {
     i64::try_from(v).map_err(|_| invalid("count out of range"))
 }
 
-fn index(v: i64) -> Result<usize> {
-    usize::try_from(v).map_err(|_| invalid("index before the start of the net"))
-}
-
 /// `SmBSplineSurface::HasInternalPole`: some interior knot line has a patch boundary
 /// span whose control points all lie within `tol` (`<= 0`: `SM_ZONE_TOL_3D`) of one
-/// another (for the u lines, also a singularity, `IsSingularity` of `s`).
-/// `false` without NURB. The row tested at each interior knot is upstream's unless
-/// [`UpstreamFixes::internal_pole_row_through_knot`](crate::kernel::UpstreamFixes::internal_pole_row_through_knot)
-/// (WR-505, #1515) is on.
+/// reference point. Coincident active control points prove that the iso span
+/// collapses; no singularity query away from the knot is needed. `false` without NURB.
+///
+/// At each interior knot it tests the rows whose basis functions are nonzero at the
+/// knot, starting at the row through the knot, where upstream moves one row further for
+/// each repeated copy of the knot (WR-505; tangency-labs/smlib#41). A knot repeated more
+/// than degree + 1 times is skipped. At a full break (multiplicity degree + 1) it tests
+/// both rows there, the left piece's end row and the right piece's start row: a span of
+/// either whose points coincide is a pole, with no singularity check (#17028, WR-788).
 ///
 /// # Errors
 ///
-/// Those of the knot, Greville and singularity queries; [`SolidError::InvalidInput`]
+/// Those of the knot and control-net queries; [`SolidError::InvalidInput`]
 /// where upstream's index arithmetic leaves the control net.
-pub fn has_internal_pole(k: &Kernel, s: &Surface, b: &BSplineSurface, tol: f64) -> Result<bool> {
+pub fn has_internal_pole(_k: &Kernel, _s: &Surface, b: &BSplineSurface, tol: f64) -> Result<bool> {
     // init return
     let mut rtn = false;
 
@@ -688,13 +1098,44 @@ pub fn has_internal_pole(k: &Kernel, s: &Surface, b: &BSplineSurface, tol: f64) 
 
         // one additional basis function becomes zero for each multiplicity at sMults[ii]
         let row_cnt_u = degree_u - (mult(&mults_u, ii)? - 1);
-        // upstream moves one row further for each repeated copy of the knot; with the opt-in
-        // the row through the knot (WR-505, #1515; source fork#41)
-        let cp_index_u = if k.fixes.internal_pole_row_through_knot {
-            knt_cnt_u - 1 - degree_u
-        } else {
-            knt_cnt_u - row_cnt_u - 1
-        };
+        // Not upstream (WR-505): a knot repeated more than degree + 1 times leaves no row to
+        // compare (the coincidence loop below would not run and the knot would be taken
+        // for a pole untested), so it is skipped; test 1 reports its multiplicity. Upstream's
+        // row index leaves the net there.
+        if row_cnt_u < 0 {
+            ii += 1;
+            continue;
+        }
+        // Not upstream (WR-505; tangency-labs/smlib#41): the row through the knot, where
+        // upstream's `kntCntU - rowCntU - 1` moves one row further for each repeated copy
+        let cp_index_u = knt_cnt_u - 1 - degree_u;
+
+        // Not upstream (#17028): at a full break (multiplicity degree + 1) the patch loop
+        // below would compare nothing. The knot has two rows, the left piece's end row
+        // `cp_index_u - 1` and the right piece's start row `cp_index_u`; a pole is a span
+        // of either row whose degree_v + 1 points coincide (that piece's iso line at the
+        // knot is then one point over the span)
+        if row_cnt_u == 0 {
+            for row in [cp_index_u - 1, cp_index_u] {
+                let mut knt_cnt_v = 0;
+                let mut jj = 0;
+                while jj + 1 < unique_v.len() && !rtn {
+                    knt_cnt_v += mult(&mults_v, jj)?;
+                    let cp_index_v = (knt_cnt_v - 1) - degree_v;
+                    let p = pt(row, cp_index_v)?;
+                    let mut collapsed = true;
+                    let mut ll = degree_v;
+                    while ll > 0 && collapsed {
+                        collapsed &= p.closer_than(tolerance, pt(row, cp_index_v + ll)?);
+                        ll -= 1;
+                    }
+                    rtn |= collapsed;
+                    jj += 1;
+                }
+            }
+            ii += 1;
+            continue;
+        }
 
         // for every V direction knot span - seek patch arrays of coincident control points
         let mut knt_cnt_v = 0;
@@ -709,28 +1150,20 @@ pub fn has_internal_pole(k: &Kernel, s: &Surface, b: &BSplineSurface, tol: f64) 
             let mut test = true;
 
             // for every UDir neighbor ControlPoint - check for coincidence
+            // Not upstream (#17056 review): every row's first point (ll == 0) is compared
+            // too, except the reference point itself; upstream stops at ll == 1 in each row,
+            // so a row whose first point differs still passed
             let mut kk = row_cnt_u - 1;
             while kk >= 0 && test {
                 let mut ll = degree_v;
-                while ll > 0 && test {
+                let last = i64::from(kk == 0);
+                while ll >= last && test {
                     // check neighbor ControlPoint for Coincidence
                     let next = pt(cp_index_u + kk, cp_index_v + ll)?;
                     test &= p.closer_than(tolerance, next);
                     ll -= 1;
                 }
                 kk -= 1;
-            }
-
-            // These tests don't guarantee a singularity: check the point.  [B597]
-            if test {
-                // Get uv for the first control point tested.
-                let uv = Point2::new(
-                    b.greville_abscissa(SurfParamType::U, index(cp_index_u + row_cnt_u - 1)?)?,
-                    b.greville_abscissa(SurfParamType::V, index(cp_index_v + degree_v)?)?,
-                );
-                if !s.is_singularity(k, uv, tolerance, false)?.singular {
-                    test = false;
-                }
             }
 
             // remember when patch is degenerate
@@ -747,12 +1180,37 @@ pub fn has_internal_pole(k: &Kernel, s: &Surface, b: &BSplineSurface, tol: f64) 
         knt_cnt_v += mult(&mults_v, ii)?;
 
         let row_cnt_v = degree_v - (mult(&mults_v, ii)? - 1);
-        // as the U walk: the row through the knot with the opt-in (WR-505, #1515)
-        let cp_index_v = if k.fixes.internal_pole_row_through_knot {
-            knt_cnt_v - 1 - degree_v
-        } else {
-            knt_cnt_v - row_cnt_v - 1
-        };
+        // as the U walk: a knot repeated more than degree + 1 times is skipped (WR-505)
+        if row_cnt_v < 0 {
+            ii += 1;
+            continue;
+        }
+        // as the U walk: the row through the knot (WR-505)
+        let cp_index_v = knt_cnt_v - 1 - degree_v;
+
+        // as the U walk (#17028): at a full break, a span of the left piece's end column or
+        // the right piece's start column whose degree_u + 1 points coincide
+        if row_cnt_v == 0 {
+            for col in [cp_index_v - 1, cp_index_v] {
+                let mut knt_cnt_u = 0;
+                let mut jj = 0;
+                while jj + 1 < unique_u.len() && !rtn {
+                    knt_cnt_u += mult(&mults_u, jj)?;
+                    let cp_index_u = (knt_cnt_u - 1) - degree_u;
+                    let p = pt(cp_index_u, col)?;
+                    let mut collapsed = true;
+                    let mut ll = degree_u;
+                    while ll > 0 && collapsed {
+                        collapsed &= p.closer_than(tolerance, pt(cp_index_u + ll, col)?);
+                        ll -= 1;
+                    }
+                    rtn |= collapsed;
+                    jj += 1;
+                }
+            }
+            ii += 1;
+            continue;
+        }
 
         // for every U direction knot span - seek patch arrays of coincident control points
         let mut knt_cnt_u = 0;
@@ -767,10 +1225,12 @@ pub fn has_internal_pole(k: &Kernel, s: &Surface, b: &BSplineSurface, tol: f64) 
             let mut test = true;
 
             // for every VDir neighbor ControlPoint - check for coincidence
+            // Not upstream (#17056 review): as the U walk, every column's first point too
             let mut kk = row_cnt_v - 1;
             while kk >= 0 && test {
                 let mut ll = degree_u;
-                while ll > 0 && test {
+                let last = i64::from(kk == 0);
+                while ll >= last && test {
                     // check neighbor ControlPoint for Coincidence
                     let next = pt(cp_index_u + ll, cp_index_v + kk)?;
                     test &= p.closer_than(tolerance, next);
@@ -863,6 +1323,15 @@ pub fn has_degenerate_control_point_row(b: &BSplineSurface, tol: f64) -> Result<
 /// neighbouring differences (coincident pairs skipped). As upstream, a failing column
 /// clears the row flag.
 ///
+/// Closed rows and columns compare the final difference with the closing difference
+/// as well (#2683); upstream omits that last turn.
+///
+/// A pair counts as coincident below an absolute `SM_EFF_ZERO`, as upstream. Test #5 of
+/// `AssertValid` takes [`grid_has_non_monotonic_points_to_rounding`] instead, which counts
+/// a step within the rounding of the two points it is between; this entry point is left
+/// for the curved Setback fill's net certificate (#2366), whose own criterion is #2243's
+/// question.
+///
 /// # Errors
 ///
 /// [`SolidError::InvalidInput`] for a zero row size (upstream divides by zero) or
@@ -872,6 +1341,110 @@ pub fn grid_has_non_monotonic_points(
     row_size: usize,
     closed_col: bool,
     closed_row: bool,
+) -> Result<bool> {
+    grid_non_monotonic(points, row_size, closed_col, closed_row, Zero::Absolute)
+}
+
+/// [`grid_has_non_monotonic_points`] taking a step for no step when it is within the
+/// rounding of the two control points it is between ([`step_within_rounding`]), instead
+/// of upstream's absolute `SM_EFF_ZERO`, and keeping the last step that had a direction
+/// as the one the next is compared against. This is what `AssertValid` test #5 asks, so
+/// it is solidcore's result for a B-spline surface; the difference from
+/// `SmPointGrid::SetUpMonotonic` is recorded in `plan/upstream-issues/WR-737`.
+///
+/// A direction is what the pass reads off a step, and a step shorter than the rounding of
+/// its own endpoints has none: the two points are one point as far as the numbers can
+/// say. Upstream tests an absolute `SM_EFF_ZERO` instead, and one ulp of a coordinate is
+/// above 1e-12 past about 8192 mm from the origin, so a collapsed or repeated row that
+/// carries one-ulp noise there reads as a zigzag reversing at every point, where the whole
+/// row is one point to rounding (WR-737, #2560). A width fixed in millimetres is not the
+/// criterion either: a net whose steps really are that short would hide a reversal behind
+/// it. The bound grows with the coordinates instead, and stays exact at any distance from
+/// the origin.
+///
+/// Upstream replaces the last difference with the skipped one, which costs nothing at an
+/// absolute `SM_EFF_ZERO` but here would make the step after a passed-over one be passed
+/// over too, so a reversal across a step of rounding would go unseen. A step within
+/// rounding carries no direction, so it is passed over instead and the last one that had a
+/// direction is kept (#2560).
+/// For a closed line this includes the comparison between the last and first steps
+/// carrying a direction, across any coincident steps at the seam (#2683).
+///
+/// # Errors
+///
+/// Those of [`grid_has_non_monotonic_points`].
+pub fn grid_has_non_monotonic_points_to_rounding(
+    points: &[Point3],
+    row_size: usize,
+    closed_col: bool,
+    closed_row: bool,
+) -> Result<bool> {
+    grid_non_monotonic(points, row_size, closed_col, closed_row, Zero::Rounding)
+}
+
+/// A bound on the rounding of the step from `p0` to `p1`, both Euclidean control points of
+/// a net: within it the step is no step.
+///
+/// The bound is the one the pole classifier of the layer split certifies, `eval::collapse`
+/// (`crates/solidcore/src/eval/collapse.rs`); both use the shared `u` and `gamma_k` from
+/// [`crate::nurbs::math`]:
+/// `Hom::euclid` returns each Euclidean point `P = x / w` with a bound
+/// `e = (sqrt(3) ex + |P| ew) / (|w| - ew) + 2 u |P|` on its rounding, from the error
+/// `(ex, ew)` of the homogeneous point it comes from, and a step is zero when
+/// `|P1 - P0| <= e0 + e1 + gamma_3 (|P0| + |P1|)`, the last term covering the subtraction.
+/// A net read off a surface (`GetControlPointNet`) divides the stored homogeneous points,
+/// which are exact as stored, so `ex = ew = 0` and `e = 2 u |P|` per point: the
+/// homogeneous half of `Hom::euclid` has nothing to contribute here. The weight is
+/// in the bound through `|P| = |x| / |w|`, which a bound on the coordinates alone misses
+/// (a sphere's pole rows carry `w = sqrt(2) / 2`).
+fn step_within_rounding(p0: Point3, p1: Point3) -> f64 {
+    let (l0, l1) = (p0.length(), p1.length());
+    2.0 * UNIT * (l0 + l1) + gamma(3) * (l0 + l1)
+}
+
+/// How the monotonicity pass recognises a step too short to carry a direction, and what
+/// becomes of it.
+#[derive(Clone, Copy)]
+enum Zero {
+    /// Upstream: shorter than an absolute `SM_EFF_ZERO`, and carried forward as the
+    /// difference the next step is compared against.
+    Absolute,
+    /// Within the rounding of the two points it is between
+    /// ([`step_within_rounding`]), and passed over, so that the last step that had a
+    /// direction stays the one the next is compared against.
+    Rounding,
+}
+
+impl Zero {
+    /// Whether the `step` from `p0` to `p1` is too short to carry a direction.
+    fn is_zero(self, step: Vec3, p0: Point3, p1: Point3) -> bool {
+        match self {
+            Zero::Absolute => step.length_squared() < EFF_ZERO_SQ,
+            Zero::Rounding => step.length() <= step_within_rounding(p0, p1),
+        }
+    }
+
+    /// Whether such a step becomes the difference the next step is compared against.
+    fn carries_forward(self) -> bool {
+        matches!(self, Zero::Absolute)
+    }
+}
+
+/// Test #5's turn between two successive differences that carry a direction.
+fn turns_back(v1: Vec3, v0: Vec3) -> bool {
+    let ang_rad = v1.angle_between(v0).unwrap_or(0.0); // out: 0 to Pi
+    rad_to_deg(ang_rad) > 170.0
+}
+
+/// [`grid_has_non_monotonic_points`] over a way of recognising a step that carries no
+/// direction (`zero`), passing over such a step instead of making it the last difference
+/// where `zero` says so.
+fn grid_non_monotonic(
+    points: &[Point3],
+    row_size: usize,
+    closed_col: bool,
+    closed_row: bool,
+    zero: Zero,
 ) -> Result<bool> {
     if row_size == 0 {
         return Err(invalid("point grid row size is zero"));
@@ -888,12 +1461,6 @@ pub fn grid_has_non_monotonic_points(
     let monotonic_col = true;
     let mut monotonic_row = true;
 
-    // turn test between two successive differences
-    let turns_back = |v1: Vec3, v0: Vec3| -> bool {
-        let ang_rad = v1.angle_between(v0).unwrap_or(0.0); // out: 0 to Pi
-        rad_to_deg(ang_rad) > 170.0
-    };
-
     // First the rows (constant i, varying j)
     let mut idx = 0;
     let mut ii = 0;
@@ -907,7 +1474,8 @@ pub fn grid_has_non_monotonic_points(
 
         // get first point pair difference
         let mut vec0 = at(j1)? - at(j0)?;
-        let mut len_sq0 = vec0.length_squared();
+        let mut zero0 = zero.is_zero(vec0, at(j0)?, at(j1)?);
+        let mut first_direction = (!zero0).then_some(vec0);
 
         // next row start
         idx += row_size;
@@ -917,12 +1485,23 @@ pub fn grid_has_non_monotonic_points(
         j0 = j1 - 1;
         while j1 < idx {
             let vec1 = at(j1)? - at(j0)?;
-            let len_sq1 = vec1.length_squared();
+            let zero1 = zero.is_zero(vec1, at(j0)?, at(j1)?);
 
             // skip coincident control points
-            if len_sq0 < EFF_ZERO_SQ || len_sq1 < EFF_ZERO_SQ {
-                vec0 = vec1;
-                len_sq0 = len_sq1;
+            if zero0 || zero1 {
+                // A directionless closing step must not prevent the rounding walk
+                // from closing against the first real direction it encounters.
+                if !zero.carries_forward() && !zero1 && first_direction.is_none() {
+                    first_direction = Some(vec1);
+                }
+                // a step that carries no direction does not become the difference the
+                // next step is compared against unless `zero` carries it forward
+                // (upstream does, and a reversal across it goes unseen); until a step
+                // with a direction has been seen there is nothing to keep
+                if zero.carries_forward() || zero0 {
+                    vec0 = vec1;
+                    zero0 = zero1;
+                }
                 j1 += 1;
                 j0 = j1 - 1;
                 continue;
@@ -935,8 +1514,12 @@ pub fn grid_has_non_monotonic_points(
             }
 
             vec0 = vec1;
+            zero0 = zero1;
             j1 += 1;
             j0 = j1 - 1;
+        }
+        if closed_row && !zero0 && first_direction.is_some_and(|first| turns_back(first, vec0)) {
+            monotonic_row = false;
         }
         ii += 1;
     }
@@ -954,7 +1537,8 @@ pub fn grid_has_non_monotonic_points(
 
         // get first point pair difference
         let mut vec0 = at(i1)? - at(i0)?;
-        let mut len_sq0 = vec0.length_squared();
+        let mut zero0 = zero.is_zero(vec0, at(i0)?, at(i1)?);
+        let mut first_direction = (!zero0).then_some(vec0);
 
         // next col start
         idx += 1;
@@ -964,12 +1548,17 @@ pub fn grid_has_non_monotonic_points(
         i0 = i1 - row_size;
         while i1 < size {
             let vec1 = at(i1)? - at(i0)?;
-            let len_sq1 = vec1.length_squared();
+            let zero1 = zero.is_zero(vec1, at(i0)?, at(i1)?);
 
-            // skip coincident control points
-            if len_sq0 < EFF_ZERO_SQ || len_sq1 < EFF_ZERO_SQ {
-                vec0 = vec1;
-                len_sq0 = len_sq1;
+            // skip coincident control points (as in the row pass above)
+            if zero0 || zero1 {
+                if !zero.carries_forward() && !zero1 && first_direction.is_none() {
+                    first_direction = Some(vec1);
+                }
+                if zero.carries_forward() || zero0 {
+                    vec0 = vec1;
+                    zero0 = zero1;
+                }
                 i1 += row_size;
                 i0 = i1 - row_size;
                 continue;
@@ -983,8 +1572,12 @@ pub fn grid_has_non_monotonic_points(
             }
 
             vec0 = vec1;
+            zero0 = zero1;
             i1 += row_size;
             i0 = i1 - row_size;
+        }
+        if closed_col && !zero0 && first_direction.is_some_and(|first| turns_back(first, vec0)) {
+            monotonic_row = false;
         }
         jj += 1;
     }
@@ -1121,6 +1714,7 @@ pub fn axis2_placement_assert_valid(
         key,
         level: 0,
         class_string: "SmAxis2Placement",
+        face: None,
     };
     placement_assert_valid(p, &mut r)
 }
@@ -1238,6 +1832,17 @@ fn rev_of(s: &Surface) -> Result<&SurfOfRevolution> {
     }
 }
 
+/// The tolerance on a cone generator's line scale against `1/cos(half angle)`, the half
+/// angle in radians. The cone keeps its half angle in degrees, so `1/cos` of it carries the
+/// angle's own rounding: a few ulps of the angle, times `d(1/cos)/d(angle) = sin/cos^2`.
+/// That is far below the relative `EFF_ZERO` until the cone is nearly flat (half angle near
+/// 90 degrees, where cos is tiny), and then it is the larger term.
+fn generator_scale_tolerance(line_scale: f64, half_angle: f64) -> f64 {
+    let angle_rounding = 4.0 * f64::EPSILON * half_angle.abs();
+    let conditioning = det::sin(half_angle).abs() / (det::cos(half_angle) * det::cos(half_angle));
+    (1.0 + line_scale) * EFF_ZERO + conditioning * angle_rounding
+}
+
 fn cone_of(s: &Surface) -> Result<&Cone> {
     match s.kind() {
         SurfaceKind::Cone(c) => Ok(c),
@@ -1259,14 +1864,9 @@ fn torus_of(s: &Surface) -> Result<&Torus> {
     }
 }
 
-/// `GetInsideOut` of a curve derived from `SmBSplineCurve` (only lines and conics
-/// have the bit).
+/// `GetInsideOut` of a curve derived from `SmBSplineCurve` ([`Curve::inside_out_bit`]).
 fn curve_inside_out(c: &Curve) -> bool {
-    match c.kind() {
-        CurveKind::Line(l) => l.inside_out(),
-        CurveKind::Ellipse(e) => e.inside_out(),
-        _ => false,
-    }
+    c.inside_out_bit()
 }
 
 /// `GetInsideOut` of the surface (cone, sphere and torus have the bit).
@@ -1465,8 +2065,8 @@ fn surf_of_revolution_assert_valid(k: &Kernel, s: &Surface, r: &mut Reporter<'_>
         let uv_domain = s.natural_uv_domain_with_nurb(k)?;
         let ivl = gen.natural_interval();
         let anal_min_x = anal.min().x;
-        let cos = (anal_min_x * PI / 180.0).cos();
-        let sin = (anal_min_x * PI / 180.0).sin();
+        let cos = det::cos(anal_min_x * PI / 180.0);
+        let sin = det::sin(anal_min_x * PI / 180.0);
         let pos = rev.position();
         let o = pos.origin();
         let x = pos.x_axis();
@@ -1505,16 +2105,12 @@ fn surf_of_revolution_assert_valid(k: &Kernel, s: &Surface, r: &mut Reporter<'_>
     }
 
     /* 13 */
-    // Analytic U Direction Domain too large (reported as test 2, as upstream; as 13, its
-    // label, with WR-538's `torus_check_reads_v_interval`)
+    // Analytic U Direction Domain too large (reported as 13, its label; upstream reports
+    // it as test 2, WR-538)
     let ivl_u = anal.u_interval();
     rtn &= r.report(
         CLASS,
-        if k.fixes.torus_check_reads_v_interval {
-            13
-        } else {
-            2
-        },
+        13,
         0,
         ivl_u.length() <= 360.0 + EFF_ZERO_DEG,
         EFF_ZERO_DEG,
@@ -1595,7 +2191,7 @@ fn no_tangent_along(k: &Kernel, gen: &Curve, extrusion_vec: Vec3, tol: f64) -> R
         &opts,
     ) {
         Ok(found) => Ok(found.solutions.is_empty()),
-        Err(e) if e.is_unported() => Err(e),
+        Err(e) if e.is_unported_or_cancelled() => Err(e),
         Err(_) => Ok(true),
     }
 }
@@ -1726,11 +2322,9 @@ fn surf_of_extrusion_assert_valid(k: &Kernel, s: &Surface, r: &mut Reporter<'_>)
     // 4. check that m_vOrigin is a point on m_pGenCurve
     let gen_ivl = gen.natural_interval();
     let origin = ext.origin();
-    let origin_tol = if k.fixes.extrusion_origin_scaled_zero {
-        EFF_ZERO * (1.0 + origin.max_dimension())
-    } else {
-        EFF_ZERO
-    };
+    // Not upstream (WR-511, #1508; tangency-labs/smlib#31): a coordinate-aware zero, where
+    // upstream's unscaled SM_EFF_ZERO misses an origin on the curve at coordinates of ~10
+    let origin_tol = EFF_ZERO * (1.0 + origin.max_dimension());
     let solutions = gen.global_point_solve(
         k,
         &gen_ivl,
@@ -1889,13 +2483,17 @@ fn cone_assert_valid(k: &Kernel, s: &Surface, r: &mut Reporter<'_>) -> Result<bo
     rtn &= r.report(CLASS, 4, 0, line.is_some(), UNDEF, UNDEF)?;
     if let Some(line) = line {
         let line_scale = line.line_scale();
-        let cone_scale = 1.0 / (cone.semi_angle_deg() * (PI / 180.0)).cos();
-        let tol = (1.0 + line_scale) * EFF_ZERO;
+        let half_angle = cone.semi_angle_deg() * (PI / 180.0);
+        let cone_scale = 1.0 / det::cos(half_angle);
+        let tol = generator_scale_tolerance(line_scale, half_angle);
+        // A tolerance at least as large as the scale it checks means the stored angle no
+        // longer fixes even the magnitude of `1/cos` (it may have rounded to 90 degrees), so
+        // the comparison would accept any line scale: refuse instead.
         rtn &= r.report(
             CLASS,
             5,
             0,
-            are_same_to_tol(line_scale, cone_scale, tol),
+            tol < cone_scale && are_same_to_tol(line_scale, cone_scale, tol),
             tol,
             line_scale - cone_scale,
         )?;
@@ -2060,12 +2658,11 @@ fn sphere_assert_valid(k: &Kernel, s: &Surface, r: &mut Reporter<'_>) -> Result<
     Ok(rtn)
 }
 
-/// `SmTorus::AssertValid` (pinned upstream: test 4 reads the U interval, and the U
-/// and V tests report as 2 and 3; with `Kernel::fixes.torus_check_reads_v_interval`,
-/// WR-538, they read U and V and report as 3 and 4. A spindle torus's self-intersection
-/// test clears the result with no report and tests the U interval against an `acos`
-/// range; with `Kernel::fixes.torus_check_spindle_apex`, WR-539, it reports test 5 for an
-/// apex inside the V interval).
+/// `SmTorus::AssertValid` (the U and V tests read U and V and report as 3 and 4, their
+/// labels, where pinned upstream reads the U interval twice and reports them as 2 and 3,
+/// WR-538. A spindle torus reports test 5 for an apex inside the V interval, WR-539,
+/// where upstream clears the result with no report and tests the U interval against an
+/// `acos` range).
 fn torus_assert_valid(k: &Kernel, s: &Surface, r: &mut Reporter<'_>) -> Result<bool> {
     const CLASS: i64 = TORUS_TYPE;
     let mut rtn = true;
@@ -2084,67 +2681,54 @@ fn torus_assert_valid(k: &Kernel, s: &Surface, r: &mut Reporter<'_>) -> Result<b
 
     let anal = t.base().step_uv_domain();
     if major < minor {
-        if k.fixes.torus_check_spindle_apex {
-            /*  5 */
-            // Not upstream (WR-539, the fork's source fork@daba678): a spindle
-            // torus's minor circles cross the axis where R + r cos(V) = 0, at the apexes
-            // V = +-(90 + asin(R/r)) degrees; like a sphere's poles (its tests 4 and 5),
-            // an apex may bound the V domain but not lie inside it.
-            let apex_deg = 90.0 + sm_asin(major / minor) * 180.0 / PI;
-            let apex_ivl_v = anal.v_interval();
-            for apex in [apex_deg, -apex_deg] {
-                let c = apex_ivl_v.contains_periodic_value(apex, 360.0, EFF_ZERO_DEG);
-                // (test 5 is the fork's: labelled from the extended table, so the
-                // class's `SM_GetAssertLabelList` table stays upstream's)
-                let class_string = r.class_string;
-                rtn &= r.report_from(
-                    TORUS_WITH_SPINDLE_APEX,
-                    CLASS,
-                    CLASS,
-                    class_string,
-                    5,
-                    0,
-                    !c.contained
-                        || is_zero_to_tol(c.dist_to_min, EFF_ZERO_DEG)
-                        || is_zero_to_tol(c.dist_to_max, EFF_ZERO_DEG),
-                    EFF_ZERO_DEG,
-                    min2(c.dist_to_min, c.dist_to_max),
-                )?;
-            }
-        } else {
-            let angle_limit_deg = 90.0 + sm_acos(major / minor) * 180.0 / PI;
-            let self_intersect = Extent1d::from_min_max(angle_limit_deg, 360.0 - angle_limit_deg);
-            if !self_intersect.are_disjoint_periodic(&anal.u_interval(), 360.0, -1.0) {
-                rtn &= false;
-            }
+        /*  5 */
+        // Not upstream (WR-539, the fork's tangency-labs/smlib@daba678): a spindle
+        // torus's minor circles cross the axis where R + r cos(V) = 0, at the apexes
+        // V = +-(90 + asin(R/r)) degrees; like a sphere's poles (its tests 4 and 5),
+        // an apex may bound the V domain but not lie inside it.
+        let apex_deg = 90.0 + sm_asin(major / minor) * 180.0 / PI;
+        let apex_ivl_v = anal.v_interval();
+        for apex in [apex_deg, -apex_deg] {
+            let c = apex_ivl_v.contains_periodic_value(apex, 360.0, EFF_ZERO_DEG);
+            // (test 5 is the fork's: labelled from the extended table, so the
+            // class's `SM_GetAssertLabelList` table stays upstream's)
+            let class_string = r.class_string;
+            rtn &= r.report_from(
+                TORUS_WITH_SPINDLE_APEX,
+                CLASS,
+                CLASS,
+                class_string,
+                5,
+                0,
+                !c.contained
+                    || is_zero_to_tol(c.dist_to_min, EFF_ZERO_DEG)
+                    || is_zero_to_tol(c.dist_to_max, EFF_ZERO_DEG),
+                EFF_ZERO_DEG,
+                min2(c.dist_to_min, c.dist_to_max),
+            )?;
         }
     }
 
     let same = generator_has_same_parameterization(k, s)?;
     rtn &= r.report(CLASS, 2, 0, same, EFF_ZERO, UNDEF)?;
 
-    // Not upstream (WR-538, the fork's source fork@0cd9d08, #482): the U and V
+    // Not upstream (WR-538, the fork's tangency-labs/smlib@0cd9d08, #482): the U and V
     // tests report as 3 and 4 (their labels), and the V test reads the V interval
-    let fixed_ids = k.fixes.torus_check_reads_v_interval;
+    // (upstream reads the U interval again)
     let ivl_u = anal.u_interval();
     rtn &= r.report(
         CLASS,
-        if fixed_ids { 3 } else { 2 },
+        3,
         0,
         ivl_u.length() <= 360.0 + EFF_ZERO_DEG,
         EFF_ZERO_DEG,
         ivl_u.length() - 360.0,
     )?;
 
-    // (upstream reads the U interval again)
-    let ivl_v = if fixed_ids {
-        anal.v_interval()
-    } else {
-        anal.u_interval()
-    };
+    let ivl_v = anal.v_interval();
     rtn &= r.report(
         CLASS,
-        if fixed_ids { 4 } else { 3 },
+        4,
         0,
         ivl_v.length() <= 360.0 + EFF_ZERO_DEG,
         EFF_ZERO_DEG,
@@ -2182,6 +2766,7 @@ mod tests {
     use crate::curve::curve::Curve;
     use crate::geom::extent2d::Extent2d;
     use crate::geom::vector2d::Vec2;
+    use crate::nurbs::b_spline_curve::p2::ControlPointForm;
     use crate::nurbs::crv_basic::Curve as NlCurve;
     use crate::surface::sphere::SphereOptions;
     use crate::surface::torus::TorusOptions;
@@ -2404,37 +2989,28 @@ mod tests {
         Surface::from(Torus::new(&Kernel::default(), O, X, Y, d, major, minor, opts).unwrap())
     }
 
-    /// WR-538 (the fork's source fork@0cd9d08, #482): a torus whose V interval
-    /// runs past a turn. Upstream tests the U interval twice and never the V one; with
-    /// `torus_check_reads_v_interval` the V test (4) fails.
+    /// WR-538 (the fork's tangency-labs/smlib@0cd9d08, #482): a torus whose V interval
+    /// runs past a turn. Upstream tests the U interval twice and never the V one; the V
+    /// test (4) fails.
     #[test]
     fn wr_538_torus_check_reads_its_v_interval() {
         let s = torus_over(0.0, 400.0, 5.0, 1.0);
-        let mut k = Kernel::default();
-        let (_, upstream) = failed_tests(&k, &s);
-        assert!(!upstream.contains(&(TORUS_TYPE, 4)), "{upstream:?}");
-        k.fixes.torus_check_reads_v_interval = true;
+        let k = Kernel::default();
         let (ok, fixed) = failed_tests(&k, &s);
         assert!(!ok);
         assert!(fixed.contains(&(TORUS_TYPE, 4)), "{fixed:?}");
         assert!(!fixed.contains(&(TORUS_TYPE, 3)), "{fixed:?}");
     }
 
-    /// WR-539 (the fork's source fork@daba678): the spindle torus R 1, r 2 has its
+    /// WR-539 (the fork's tangency-labs/smlib@daba678): the spindle torus R 1, r 2 has its
     /// apexes at V = +-120. Upstream fails every spindle torus with a whole turn of U and
-    /// reports nothing; with `torus_check_spindle_apex` V [0, 360] reports test 5 and the
-    /// outer sheet V [-120, 120] passes.
+    /// reports nothing; here V [0, 360] reports test 5 and the outer sheet V [-120, 120]
+    /// passes.
     #[test]
     fn wr_539_spindle_torus_reports_an_apex_inside() {
         let whole = torus_over(0.0, 360.0, 1.0, 2.0);
         let outer = torus_over(-120.0, 120.0, 1.0, 2.0);
-        let mut k = Kernel::default();
-        for s in [&whole, &outer] {
-            let (ok, upstream) = failed_tests(&k, s);
-            assert!(!ok);
-            assert!(!upstream.contains(&(TORUS_TYPE, 5)), "{upstream:?}");
-        }
-        k.fixes.torus_check_spindle_apex = true;
+        let k = Kernel::default();
         let (ok, fixed) = failed_tests(&k, &whole);
         assert!(!ok);
         assert!(fixed.contains(&(TORUS_TYPE, 5)), "{fixed:?}");
@@ -2444,10 +3020,10 @@ mod tests {
         assert_eq!(assert_label_list(TORUS_TYPE, 0).len(), 5);
     }
 
-    /// source issue #1515 (WR-505): a horn torus (major radius = minor radius)
+    /// tangency-labs/solidcore#1515 (WR-505): a horn torus (major radius = minor radius)
     /// touches its axis, where the corner rows of its NURB coincide. Upstream's
     /// `HasInternalPole` tests one row one step too far at each repeated knot and reports
-    /// a pole there; with `internal_pole_row_through_knot` it finds none.
+    /// a pole there; testing the row through the knot finds none.
     #[test]
     fn issue_1515_horn_torus_has_no_internal_pole() {
         use crate::geom::axis2_placement::Axis2Placement;
@@ -2469,14 +3045,12 @@ mod tests {
             has_internal_pole(k, &s, &part, ZONE_TOL_3D / 10.0).unwrap()
         };
 
-        let mut k = Kernel::default();
-        assert!(horn(&k), "upstream reports a pole on the horn torus");
-        k.fixes.internal_pole_row_through_knot = true;
+        let k = Kernel::default();
         assert!(!horn(&k), "no internal pole on the horn torus");
     }
 
     /// A real pole at a double knot (row 2 of a 5 x 3 net, collapsed to one point at the
-    /// knot 0.5) is found with the opt-in. Upstream tests the corner row one step further
+    /// knot 0.5) is found. Upstream tests the corner row one step further
     /// (row 3) at that knot, so it misses the pole (WR-505, #1515).
     #[test]
     fn issue_1515_real_pole_at_a_double_knot_is_found() {
@@ -2496,14 +3070,403 @@ mod tests {
             &[0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
             &pts,
         );
-        let pole = |flag: bool| {
-            let mut k = Kernel::default();
-            k.fixes.internal_pole_row_through_knot = flag;
-            let part = make_nurb(&k, &s).unwrap().unwrap();
-            has_internal_pole(&k, &s, &part, ZONE_TOL_3D / 10.0).unwrap()
+        let k = Kernel::default();
+        let part = make_nurb(&k, &s).unwrap().unwrap();
+        assert!(
+            has_internal_pole(&k, &s, &part, ZONE_TOL_3D / 10.0).unwrap(),
+            "the pole at the double knot is found"
+        );
+    }
+
+    /// The goldens' `ovf0263` net (degree 3 by 1, 5 x 5): its V knot 0.25 is repeated 3
+    /// times, more than degree + 1, so the walk has no row to compare there. The knot is
+    /// skipped (no pole is reported without a coincidence test), test 1 reports the
+    /// multiplicity, and upstream's row index (one past the net) is not read. With no
+    /// pole, test 5 then runs, as in upstream's order. The test proves only the pole skip.
+    #[test]
+    fn a_knot_repeated_past_degree_plus_one_is_not_a_pole() {
+        let xs = [
+            0.619_092_368_149_524_5,
+            0.773_865_460_186_905_6,
+            0.928_638_552_224_286_8,
+            1.083_411_644_261_668,
+            0.619_092_368_149_524_5,
+        ];
+        let ys = [
+            0.309_546_184_074_762_25,
+            0.464_319_276_112_143_4,
+            0.619_092_368_149_524_5,
+            0.773_865_460_186_905_6,
+            0.928_638_552_224_286_8,
+        ];
+        let zs = [
+            [
+                -0.069_466_878_423_028_26,
+                -0.158_859_253_527_507_32,
+                -0.057_906_515_715_139_88,
+                0.164_432_402_001_120_6,
+                -0.185_682_426_738_735_83,
+            ],
+            [
+                -0.141_088_819_553_874_67,
+                0.091_056_928_588_417_02,
+                0.148_379_971_858_609_74,
+                -0.017_864_641_637_210_046,
+                0.102_006_149_419_652_04,
+            ],
+            [
+                0.057_604_537_359_578_44,
+                0.037_936_554_061_692_315,
+                0.178_585_131_715_707_3,
+                -0.057_522_390_266_957_63,
+                -0.143_358_338_095_772_42,
+            ],
+            [
+                0.025_494_854_024_519_058,
+                -0.147_183_825_340_435_34,
+                0.148_141_842_382_298_52,
+                0.182_980_335_462_639_92,
+                -0.091_400_093_294_920_9,
+            ],
+            [
+                -0.069_466_878_423_028_26,
+                -0.158_859_253_527_507_32,
+                -0.057_906_515_715_139_88,
+                0.164_432_402_001_120_6,
+                -0.185_682_426_738_735_83,
+            ],
+        ];
+        let mut pts = Vec::new();
+        for (x, row) in xs.iter().zip(zs) {
+            for (y, z) in ys.iter().zip(row) {
+                pts.push([*x, *y, z]);
+            }
+        }
+        let s = bspline(
+            3,
+            1,
+            &[0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0],
+            &[0.0, 0.0, 0.25, 0.25, 0.25, 1.0, 1.0],
+            &pts,
+        );
+        let k = Kernel::default();
+        let part = make_nurb(&k, &s).unwrap().unwrap();
+        assert!(!has_internal_pole(&k, &s, &part, 0.0).unwrap());
+        let mut list = AssertArray::new();
+        let ok = s
+            .assert_valid(&k, Some(&mut list), 2, ObjectKey(1))
+            .unwrap();
+        let failed: Vec<_> = list
+            .reports()
+            .iter()
+            .filter(|r| !r.ok)
+            .map(|r| (r.reporting_type, r.test_index))
+            .collect();
+        assert!(!ok);
+        // test 5 runs once no internal pole is found (upstream's order). Why it fails is
+        // MEASURED, not asserted here: the net closes in U (its last U row repeats its first),
+        // and test 5's 170-degree turn-back check trips only on the V = 4 column of poles,
+        // at 172.9 degrees between P2->P3 and P3->P4
+        assert_eq!(
+            failed,
+            [
+                (SURFACE_TYPE, 4),
+                (B_SPLINE_SURFACE_TYPE, 1),
+                (B_SPLINE_SURFACE_TYPE, 5)
+            ]
+        );
+    }
+
+    /// The knots of a degree-2 direction with a full break at 0.5 (6 rows: the left piece's
+    /// rows 0 to 2, the right piece's rows 3 to 5), and of a single degree-2 span (3 rows).
+    const FULL_BREAK: [f64; 9] = [0.0, 0.0, 0.0, 0.5, 0.5, 0.5, 1.0, 1.0, 1.0];
+
+    /// A degree 2 x 2 surface with a full break at u = 0.5 (`u_break`) or v = 0.5, on the
+    /// grid `(i, j, 0)` of its 6 x 3 (or 3 x 6) net, after `edit` changes the net (indexed
+    /// along the break's direction first).
+    fn full_break(u_break: bool, edit: impl Fn(&mut [[f64; 3]], usize)) -> bool {
+        let mut along: Vec<[f64; 3]> = Vec::new();
+        for i in 0..6 {
+            for j in 0..3 {
+                along.push([f64::from(i), f64::from(j), 0.0]);
+            }
+        }
+        edit(&mut along, 3);
+        let s = if u_break {
+            bspline(2, 2, &FULL_BREAK, &BEZ2, &along)
+        } else {
+            // transposed: net point (j, i) is along[i][j], with x and y swapped
+            let mut pts = vec![[0.0; 3]; 18];
+            for i in 0..6 {
+                for j in 0..3 {
+                    let p = along[i * 3 + j];
+                    pts[j * 6 + i] = [p[1], p[0], p[2]];
+                }
+            }
+            bspline(2, 2, &BEZ2, &FULL_BREAK, &pts)
         };
-        assert!(!pole(false), "upstream misses the pole at the double knot");
-        assert!(pole(true), "the opt-in finds the pole at the double knot");
+        let k = Kernel::default();
+        let part = make_nurb(&k, &s).unwrap().unwrap();
+        has_internal_pole(&k, &s, &part, ZONE_TOL_3D / 10.0).unwrap()
+    }
+
+    const BEZ2: [f64; 6] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+
+    /// #17028: a full break (multiplicity degree + 1) on a plain grid has no pole, along U
+    /// or V. Each row is three distinct points, so no piece's iso line at the knot is a
+    /// point. Before, the V walk compared no points there and reported one.
+    #[test]
+    fn a_full_break_on_a_plain_grid_is_not_a_pole() {
+        assert!(!full_break(true, |_, _| {}));
+        assert!(!full_break(false, |_, _| {}));
+    }
+
+    /// #17028: the right piece's rows 3 and 4 equal (each still three distinct points) is
+    /// no pole: no row collapses.
+    #[test]
+    fn equal_rows_at_a_full_break_are_not_a_pole() {
+        let copy_row = |pts: &mut [[f64; 3]], n: usize| {
+            for j in 0..n {
+                pts[4 * n + j] = pts[3 * n + j];
+            }
+        };
+        assert!(!full_break(true, copy_row));
+        assert!(!full_break(false, copy_row));
+    }
+
+    /// #17028: the left piece's end row (row 2) collapsed to one point makes that piece's
+    /// iso line at u = 0.5 the point `sum N_j(v) P = P`, a pole inside the surface.
+    /// Before, the walk never looked at that row.
+    #[test]
+    fn a_collapsed_left_end_row_at_a_full_break_is_a_pole() {
+        let collapse = |pts: &mut [[f64; 3]], n: usize| {
+            for j in 0..n {
+                pts[2 * n + j] = [2.0, 1.0, 0.0];
+            }
+        };
+        assert!(full_break(true, collapse));
+        assert!(full_break(false, collapse));
+    }
+
+    /// #17028: the right piece's start row (row 3) collapsed to one point is a pole the
+    /// same way.
+    #[test]
+    fn a_collapsed_right_start_row_at_a_full_break_is_a_pole() {
+        let collapse = |pts: &mut [[f64; 3]], n: usize| {
+            for j in 0..n {
+                pts[3 * n + j] = [3.0, 1.0, 0.0];
+            }
+        };
+        assert!(full_break(true, collapse));
+        assert!(full_break(false, collapse));
+    }
+
+    /// The knots of a degree-2 direction with one simple interior knot at 0.5 (4 rows; at
+    /// 0.5 only rows 1 and 2 have nonzero basis functions).
+    const SIMPLE_KNOT: [f64; 7] = [0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0];
+
+    /// As [`full_break`] with a simple knot at 0.5 instead (a 4 x 3 or 3 x 4 net).
+    fn simple_knot(u_break: bool, edit: impl Fn(&mut [[f64; 3]], usize)) -> bool {
+        let mut along: Vec<[f64; 3]> = Vec::new();
+        for i in 0..4 {
+            for j in 0..3 {
+                along.push([f64::from(i), f64::from(j), 0.0]);
+            }
+        }
+        edit(&mut along, 3);
+        let s = if u_break {
+            bspline(2, 2, &SIMPLE_KNOT, &BEZ2, &along)
+        } else {
+            let mut pts = vec![[0.0; 3]; 12];
+            for i in 0..4 {
+                for j in 0..3 {
+                    let p = along[i * 3 + j];
+                    pts[j * 4 + i] = [p[1], p[0], p[2]];
+                }
+            }
+            bspline(2, 2, &BEZ2, &SIMPLE_KNOT, &pts)
+        };
+        let k = Kernel::default();
+        let part = make_nurb(&k, &s).unwrap().unwrap();
+        has_internal_pole(&k, &s, &part, ZONE_TOL_3D / 10.0).unwrap()
+    }
+
+    /// Rows 1 and 2 (the two rows nonzero at the simple knot 0.5) collapsed to one point.
+    fn collapse_simple_knot_rows(pts: &mut [[f64; 3]], n: usize) {
+        for i in 1..3 {
+            for j in 0..n {
+                pts[i * n + j] = [1.5, 1.0, 0.0];
+            }
+        }
+    }
+
+    /// A simple knot on a plain grid is no pole, along U or V.
+    #[test]
+    fn a_simple_knot_on_a_plain_grid_is_not_a_pole() {
+        assert!(!simple_knot(true, |_, _| {}));
+        assert!(!simple_knot(false, |_, _| {}));
+    }
+
+    /// #17056 review: rows 1 and 2 collapsed to one point `P` make the iso line at the
+    /// simple v knot 0.5 the point `(N_1 + N_2)(0.5) P = P`, a pole, and the V walk finds
+    /// it. A singularity check at v = greville(2) = 0.75, off the knot line, would
+    /// reject it despite the coincident active control points.
+    #[test]
+    fn a_collapsed_span_at_a_simple_v_knot_is_a_pole() {
+        assert!(simple_knot(false, collapse_simple_knot_rows));
+    }
+
+    /// At the simple U knot, only rows 1 and 2 contribute, so the whole iso line
+    /// equals their common point. The Greville parameter 0.75 is off that knot.
+    #[test]
+    fn a_collapsed_span_at_a_simple_u_knot_is_a_pole() {
+        assert!(simple_knot(true, collapse_simple_knot_rows));
+    }
+
+    /// The #17056 review case: degree 2 by 4, one clamped span by the double knot 0.5
+    /// (3 x 7 net). The columns nonzero at 0.5 are 2 to 4; all are `P` except row 0's
+    /// columns 3 and 4, `Q` and `R`, not collinear with `P`. Row 0's point on the iso line
+    /// at the knot is `N_2 P + N_3 Q + N_4 R != P`, so the iso line
+    /// `N_0(u) C + (N_1 + N_2)(u) P` is no point and there is no pole. The patch loop used
+    /// to skip each column's first point, `(0, 3)` and `(0, 4)`, and reported one.
+    /// `u_break` transposes the net, so the knot is in U.
+    fn first_points_differ(u_break: bool) -> bool {
+        const DOUBLE4: [f64; 12] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let mut across: Vec<[f64; 3]> = Vec::new();
+        for i in 0..3 {
+            for j in 0..7 {
+                across.push([f64::from(i), f64::from(j), 0.0]);
+            }
+        }
+        for i in 0..3 {
+            for j in 2..5 {
+                across[i * 7 + j] = [1.0, 3.0, 0.0];
+            }
+        }
+        across[3] = [0.0, 3.0, 1.0];
+        across[4] = [0.0, 4.0, 2.0];
+        let s = if u_break {
+            let mut pts = vec![[0.0; 3]; 21];
+            for i in 0..3 {
+                for j in 0..7 {
+                    let p = across[i * 7 + j];
+                    pts[j * 3 + i] = [p[1], p[0], p[2]];
+                }
+            }
+            bspline(4, 2, &DOUBLE4, &BEZ2, &pts)
+        } else {
+            bspline(2, 4, &BEZ2, &DOUBLE4, &across)
+        };
+        let k = Kernel::default();
+        let part = make_nurb(&k, &s).unwrap().unwrap();
+        has_internal_pole(&k, &s, &part, ZONE_TOL_3D / 10.0).unwrap()
+    }
+
+    /// #17056 review: a span whose rows agree except at their first points
+    /// is no pole, along V or U.
+    #[test]
+    fn a_patch_whose_first_points_differ_is_not_a_pole() {
+        assert!(!first_points_differ(false));
+        assert!(!first_points_differ(true));
+    }
+
+    #[test]
+    fn a_zero_control_line_stride_returns_invalid_input() {
+        let net = ControlPointNet {
+            u_count: 2,
+            v_count: 0,
+            points: Vec::new(),
+            weights: Vec::new(),
+        };
+        assert!(matches!(
+            advancing_control_lines(&net, false),
+            Err(SolidError::InvalidInput {
+                operation: OP,
+                reason: "control line stride is zero",
+            })
+        ));
+    }
+
+    #[test]
+    fn refinement_refuses_an_end_knot_and_preserves_other_errors() {
+        let surface = bspline(3, 3, &BEZ3, &BEZ3, &bicubic_points());
+        let mut part = make_nurb(&Kernel::default(), &surface)
+            .unwrap()
+            .unwrap()
+            .into_owned();
+        let direction = SurfParamType::V;
+        assert!(!insert_refinement_knots(&mut part, direction, &[0.0]).unwrap());
+        let expected = part.insert_knots(direction, &[]).unwrap_err();
+        let error = insert_refinement_knots(&mut part, direction, &[]).unwrap_err();
+        assert_eq!(
+            error.root_cause().nurbs_failure(),
+            Some(&NurbsFailure::Input)
+        );
+        assert_eq!(error, expected);
+    }
+
+    #[test]
+    fn an_interior_control_line_turn_is_retained_in_either_direction() {
+        let k = Kernel::default();
+        for along_u in [false, true] {
+            let (nu, nv) = if along_u { (4, 3) } else { (3, 4) };
+            let mut points = Vec::new();
+            for u in 0..nu {
+                for v in 0..nv {
+                    let (row, column) = if along_u { (v, u) } else { (u, v) };
+                    // The central line turns through 171.4°, yet each step
+                    // advances along its chord. Across it the turn is only 168.6°.
+                    let z = match (row, column) {
+                        (1, 1) => 10.0,
+                        (1, 2) => -10.0,
+                        _ => 0.0,
+                    };
+                    points.push([f64::from(u), f64::from(v), z]);
+                }
+            }
+            let surface = if along_u {
+                bspline(3, 2, &BEZ3, &BEZ2, &points)
+            } else {
+                bspline(2, 3, &BEZ2, &BEZ3, &points)
+            };
+            let part = make_nurb(&k, &surface).unwrap().unwrap();
+            let net = part.control_point_net().unwrap();
+            assert!(grid_has_non_monotonic_points_to_rounding(
+                &net.points,
+                net.v_count,
+                false,
+                false
+            )
+            .unwrap());
+            assert!(!certify_monotone_net(&part, &net).unwrap());
+        }
+    }
+
+    #[test]
+    fn boundary_control_polygon_can_reverse_on_a_monotone_curve() {
+        let k = Kernel::default();
+        // In v the last row is a cubic. For the first polygon the derivative
+        // has positive minimum at its middle. The second truly turns back.
+        for (ys, valid) in [([0.0, 0.6, 0.4, 1.0], true), ([0.0, 2.0, -1.0, 1.0], false)] {
+            let points: Vec<_> = [0.0, 1.0]
+                .into_iter()
+                .flat_map(|x| {
+                    let y = if x == 0.0 { [0.0, 0.3, 0.7, 1.0] } else { ys };
+                    y.map(move |v| [x, v, 0.0])
+                })
+                .collect();
+            let s = bspline(1, 3, &[0.0, 0.0, 1.0, 1.0], &BEZ3, &points);
+            let part = make_nurb(&k, &s).unwrap().unwrap();
+            let net = part.control_point_net().unwrap();
+            assert!(grid_has_non_monotonic_points_to_rounding(
+                &net.points,
+                net.v_count,
+                false,
+                false
+            )
+            .unwrap());
+            assert_eq!(certify_monotone_net(&part, &net).unwrap(), valid);
+        }
     }
 
     #[test]
@@ -2522,6 +3485,329 @@ mod tests {
                 "SmBSplineSurface Control Net doubles back on itself probably making a self intersecting surface",
             )],
         );
+    }
+
+    /// The sphere of tangency-labs/solidcore#2560: radius 2.5 centred `(0, 0, 5) + t`,
+    /// its net the net of the sphere at `(0, 0, 5)` moved through its homogeneous control
+    /// points (`[x w + w t, w]`, as a rigid move of a record does). Dividing by `w` again
+    /// rounds differently for `w = 1` and `w = sqrt(2) / 2`, so the Euclidean points of
+    /// each collapsed pole row alternate by one ulp of the coordinate.
+    fn sphere_moved_homogeneously(k: &Kernel, t: [f64; 3]) -> Surface {
+        let build = |origin: Point3| {
+            let d = Extent2d::from_bounds(0.0, -90.0, 360.0, 90.0);
+            let opts = SphereOptions {
+                swap_uv: false,
+                inside_out: false,
+                circle_nurb: None,
+            };
+            let s = Surface::from(Sphere::new(k, origin, X, Y, d, 2.5, opts).unwrap());
+            s.kind_with_nurb(k).unwrap();
+            s
+        };
+        let at_origin = build(Point3::new(0.0, 0.0, 5.0));
+        let (nu, nv, cps) = b_spline_part(&at_origin).unwrap().control_points().unwrap();
+        // the analytic sphere is built at the moved centre, so only the net carries the noise
+        let mut moved = build(Point3::new(t[0], t[1], 5.0 + t[2]));
+        let SurfaceKind::Sphere(sp) = moved.kind_mut() else {
+            unreachable!("built as a sphere")
+        };
+        let b = sp.base_mut().base_mut();
+        for i in 0..nu {
+            for j in 0..nv {
+                let p = cps[i * nv + j];
+                let w = if p.w == NOW { 1.0 } else { p.w };
+                let q = Point3::new(p.x + w * t[0], p.y + w * t[1], p.z + w * t[2]);
+                b.set_control_point(ControlPointForm::HomogeneousRational, i, j, q, w)
+                    .unwrap();
+            }
+        }
+        moved
+    }
+
+    /// tangency-labs/solidcore#2560: a sphere's net has a collapsed row of control points
+    /// at each pole, and consecutive points of a collapsed row are exactly equal, so test
+    /// #5 passes over their zero-length steps. One ulp of noise along such a row is a
+    /// zigzag whose steps reverse at every point. Past about 8192 mm from the origin one
+    /// ulp is above `EFF_ZERO`, which is where upstream's absolute zero stops recognising
+    /// such a step and the check reads a 180-degree turn at every point of the pole
+    /// column. The step is noise: the row is collapsed to within one ulp, 1/2,750,000 of
+    /// `SM_ZONE_TOL_3D`.
+    #[test]
+    fn issue_2560_one_ulp_noise_along_a_pole_row_is_not_a_reversal() {
+        const T: [f64; 3] = [1.0e5, -7.0e4, 3.0e4];
+        let k = Kernel::default();
+
+        let moved = sphere_moved_homogeneously(&k, T);
+        assert_eq!(
+            failed_tests(&k, &moved),
+            (true, vec![]),
+            "the moved sphere's net is the sphere to rounding"
+        );
+
+        // at the origin the pole rows stay bit-identical, so the row has no steps at all
+        let near = sphere_moved_homogeneously(&k, [0.0, 0.0, 0.0]);
+        assert_eq!(failed_tests(&k, &near), (true, vec![]));
+    }
+
+    /// A net that really doubles back is still refused: its steps are far longer than the
+    /// rounding of their own endpoints, so none of them is passed over
+    /// (#2560; the planar G2 Setback patches of
+    /// `plan/findings/blend.blend_corner--planar-g2-setback-patch-net-doubles-back.md`
+    /// turn back between steps of 3.3e-2 and 5.3e-1).
+    #[test]
+    fn issue_2560_a_real_reversal_is_still_refused() {
+        let mut pts = bicubic_points();
+        pts[2 * 4 + 1] = [0.2, 1.0, 0.0];
+        pts[2 * 4 + 2] = [0.2, 2.0, 0.0];
+        let s = bspline(3, 3, &BEZ3, &BEZ3, &pts);
+        let k = Kernel::default();
+        let (ok, failed) = failed_tests(&k, &s);
+        assert!(!ok);
+        assert_eq!(failed, vec![(B_SPLINE_SURFACE_TYPE, 5)], "{failed:?}");
+    }
+
+    /// A grid whose one line walks `back` along x while its neighbour walks `straight`,
+    /// laid out twice: down a column (row size 2, so no row holds two steps to compare)
+    /// and along a row (two rows of four, so no column holds two). Only the pass along
+    /// `back` can report a turn.
+    fn one_line_grids(
+        back: [f64; 4],
+        straight: [f64; 4],
+    ) -> [(&'static str, Vec<Point3>, usize); 2] {
+        let p = |x: f64, y: f64| Point3::new(x, y, 0.0);
+        let col: Vec<Point3> = back
+            .iter()
+            .zip(straight.iter())
+            .flat_map(|(&b, &s)| [p(b, 0.0), p(s, 1.0)])
+            .collect();
+        let row: Vec<Point3> = back
+            .iter()
+            .map(|&x| p(x, 0.0))
+            .chain(straight.iter().map(|&x| p(x, 1.0)))
+            .collect();
+        [("column", col, 2), ("row", row, 4)]
+    }
+
+    /// A step within rounding carries no direction, so it may not become the step the
+    /// next one is compared against: upstream replaces the last difference with the
+    /// skipped one, which lets the step after it be skipped too and hides a reversal
+    /// across the short step. Along `0, 1, 1 + one ulp, 0` the 180-degree turn is real
+    /// and has to be refused, although upstream passes over it; a separator of 5e-7, far
+    /// above the rounding of a coordinate of 1, is not passed over by either (#2560).
+    #[test]
+    fn issue_2560_a_reversal_after_a_step_of_rounding_is_refused() {
+        // a plain monotonic neighbour, so only the doubling-back pass can fail
+        const STRAIGHT: [f64; 4] = [0.0, 1.0, 2.0, 3.0];
+        // a real reversal whose two long steps are separated by a short one
+        let ulp: [f64; 4] = [0.0, 1.0, 1.0 + f64::EPSILON, 0.0];
+        let micron: [f64; 4] = [0.0, 1.0, 1.0 + 5.0e-7, 0.0];
+
+        for (separator, back, upstream_sees_it) in [("one ulp", ulp, false), ("5e-7", micron, true)]
+        {
+            for (what, points, row_size) in one_line_grids(back, STRAIGHT) {
+                assert_eq!(
+                    grid_has_non_monotonic_points(&points, row_size, false, false).unwrap(),
+                    upstream_sees_it,
+                    "{what}, separator {separator}: upstream carries a skipped step forward"
+                );
+                assert!(
+                    grid_has_non_monotonic_points_to_rounding(&points, row_size, false, false)
+                        .unwrap(),
+                    "{what}, separator {separator}: a step of rounding may not replace the \
+                     last step that had a direction"
+                );
+            }
+        }
+    }
+
+    /// The bound is the rounding of the two points a step is between, so a reversal of
+    /// real length is reported however short it is: 1e-7 mm, a tenth of the distance the
+    /// check's own tests #2 and #3 take two points for coincident at, is refused both at
+    /// the origin and at 1e5 mm from it, where one ulp of a coordinate is 1.5e-11 and the
+    /// bound is 1.1e-10 (#2560; a bound fixed at `SM_ZONE_TOL_3D / 10` would accept it).
+    #[test]
+    fn issue_2560_a_reversal_of_a_tenth_of_a_micron_is_refused() {
+        const STEP: f64 = 1.0e-7;
+
+        for base in [0.0, 1.0e5] {
+            let back = [base, base + STEP, base, base + STEP];
+            let straight = [base, base + 1.0, base + 2.0, base + 3.0];
+            for (what, points, row_size) in one_line_grids(back, straight) {
+                assert!(
+                    grid_has_non_monotonic_points_to_rounding(&points, row_size, false, false)
+                        .unwrap(),
+                    "{what} at {base}: a 1e-7 mm reversal is a reversal"
+                );
+            }
+        }
+    }
+
+    /// A closed row's closing step — its last point back to its first — is the difference
+    /// the walk starts with. Far from the origin that step can be pure rounding and still
+    /// be longer than an absolute `SM_EFF_ZERO`, and then the seam of a plain triangle is
+    /// reported: its three real steps turn by 90 and 45 degrees, and only the 1e-11
+    /// closing step looks like a reversal against the first. The bound at these
+    /// coordinates is 1.1e-10, so that step carries no direction and the seam is clean
+    /// (#2560; the same fix as at a pole, in a closed row).
+    #[test]
+    fn issue_2560_a_closed_seam_step_of_rounding_is_not_a_reversal() {
+        const B: f64 = 1.0e5;
+        // above EFF_ZERO (1e-12), inside the bound at these coordinates (1.1e-10)
+        const NOISE: f64 = 1.0e-11;
+
+        let p = |x: f64, y: f64| Point3::new(x, y, 0.0);
+        // row 0 is the triangle, its closing step NOISE long; row 1 is a clean square, so
+        // only the first row's seam can be reported (the columns hold one step each)
+        let points = vec![
+            p(B, 0.0),
+            p(B - 1.0, 0.0),
+            p(B - 1.0, 1.0),
+            p(B - NOISE, 1.0e-13),
+            p(B, 10.0),
+            p(B + 1.0, 10.0),
+            p(B + 1.0, 11.0),
+            p(B, 11.0),
+        ];
+
+        // the grid's closed row is upstream's bClosedCol, the fourth argument
+        assert!(
+            grid_has_non_monotonic_points(&points, 4, false, true).unwrap(),
+            "upstream reads a direction off the rounding-sized closing step"
+        );
+        assert!(
+            !grid_has_non_monotonic_points_to_rounding(&points, 4, false, true).unwrap(),
+            "the closing step is within the rounding of its own two points"
+        );
+    }
+
+    /// Put the same closed line along rows and columns. The other direction has only
+    /// one step, so it cannot account for either result.
+    fn expect_closed_grid_line(line: &[Point3], absolute: bool, rounding: bool) {
+        for closed_col in [false, true] {
+            let lifted = |p: Point3| p + Vec3::new(0.0, 0.0, 10.0);
+            let points: Vec<_> = if closed_col {
+                line.iter().flat_map(|&p| [p, lifted(p)]).collect()
+            } else {
+                line.iter()
+                    .copied()
+                    .chain(line.iter().copied().map(lifted))
+                    .collect()
+            };
+            let row_size = if closed_col { 2 } else { line.len() };
+            assert_eq!(
+                grid_has_non_monotonic_points(&points, row_size, closed_col, !closed_col).unwrap(),
+                absolute,
+                "absolute criterion, closed_col={closed_col}, line={line:?}"
+            );
+            assert_eq!(
+                grid_has_non_monotonic_points_to_rounding(
+                    &points,
+                    row_size,
+                    closed_col,
+                    !closed_col
+                )
+                .unwrap(),
+                rounding,
+                "rounding criterion, closed_col={closed_col}, line={line:?}"
+            );
+        }
+    }
+
+    /// The only reversal is at (2, 0): the incoming step (1, 0) turns 180 degrees
+    /// against the closing step (-2, 0). Every other turn is at most 135 degrees.
+    #[test]
+    fn issue_2683_closed_seam_reversal_is_found_from_every_start() {
+        for base in [0.0, 1.0e5] {
+            let p = |x, y| Point3::new(base + x, y, 0.0);
+            let line = [p(0.0, 0.0), p(0.0, 1.0), p(1.0, 0.0), p(2.0, 0.0)];
+            for reverse in [false, true] {
+                let mut line = line.to_vec();
+                if reverse {
+                    line.reverse();
+                }
+                for _ in 0..line.len() {
+                    expect_closed_grid_line(&line, true, true);
+                    line.rotate_left(1);
+                }
+            }
+        }
+    }
+
+    /// A repeated seam carries no direction. The rounding walk must compare the
+    /// first and last real steps across it, even with repeated points at both ends.
+    #[test]
+    fn issue_2683_closed_seam_reversal_across_coincident_points_is_found() {
+        let p = |x, y| Point3::new(x, y, 0.0);
+        let coincident = vec![
+            p(0.0, 0.0),
+            p(0.0, 0.0),
+            p(-1.0, 0.0),
+            p(-1.0, 1.0),
+            p(-2.0, 0.0),
+            p(0.0, 0.0),
+            p(0.0, 0.0),
+        ];
+        let rounding = vec![
+            p(1.0e5, 0.0),
+            p(1.0e5 + 1.0e-11, 0.0),
+            p(1.0e5 - 1.0, 0.0),
+            p(1.0e5 - 1.0, 1.0),
+            p(1.0e5 - 2.0, 0.0),
+            p(1.0e5 - 1.0e-11, 0.0),
+            p(1.0e5, 0.0),
+        ];
+        for (line, absolute) in [(coincident, false), (rounding, true)] {
+            for reverse in [false, true] {
+                let mut line = line.clone();
+                if reverse {
+                    line.reverse();
+                }
+                for _ in 0..line.len() {
+                    // The absolute criterion still skips pairs adjacent to a zero step.
+                    expect_closed_grid_line(&line, absolute, true);
+                    line.rotate_left(1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn issue_2683_open_line_does_not_gain_a_closing_step() {
+        let line = [O, Y, X, X * 2.0];
+        let lifted = |p: Point3| p + Vec3::new(0.0, 0.0, 10.0);
+        let rows: Vec<_> = line
+            .into_iter()
+            .chain(line.into_iter().map(lifted))
+            .collect();
+        let cols: Vec<_> = line.into_iter().flat_map(|p| [p, lifted(p)]).collect();
+        for (points, row_size) in [(rows, 4), (cols, 2)] {
+            assert!(!grid_has_non_monotonic_points(&points, row_size, false, false).unwrap());
+            assert!(
+                !grid_has_non_monotonic_points_to_rounding(&points, row_size, false, false)
+                    .unwrap()
+            );
+        }
+    }
+
+    /// Completing the cycle must still accept a square, an entirely collapsed line
+    /// and #2560's triangle whose closing step is only coordinate rounding.
+    #[test]
+    fn issue_2683_closed_lines_without_a_real_reversal_are_accepted() {
+        let p = |x, y| Point3::new(x, y, 0.0);
+        let square = vec![p(0.0, 0.0), p(0.0, 1.0), p(1.0, 1.0), p(1.0, 0.0)];
+        let collapsed = vec![p(1.0e5, 0.0); 4];
+        let noisy_seam = vec![
+            p(1.0e5, 0.0),
+            p(1.0e5 - 1.0, 0.0),
+            p(1.0e5 - 1.0, 1.0),
+            p(1.0e5 - 1.0e-11, 1.0e-13),
+        ];
+        for (mut line, absolute) in [(square, false), (collapsed, false), (noisy_seam, true)] {
+            for _ in 0..line.len() {
+                expect_closed_grid_line(&line, absolute, false);
+                line.rotate_left(1);
+            }
+        }
     }
 
     #[test]
@@ -2556,6 +3842,89 @@ mod tests {
             "SmBSplineSurface Control Net doubles back on itself probably making a self intersecting surface",
         );
         expect(&with_nurb(cone(-1.0)), 2, &[fold, radius, pole]);
+    }
+
+    /// A ring of radial width 2.65 a hair off flat (heights 1.3e-5 and 2.1e-5, a revolved
+    /// line a few 1e-4 degrees off perpendicular to the axis) is a cone of half angle about
+    /// 89.9997 degrees. Its generator scale, length/height, is right; only 1/cos of the
+    /// half angle in degrees is rounded, by more than a relative `EFF_ZERO` of a scale of 2e5.
+    #[test]
+    fn nearly_flat_cone_passes_the_generator_scale_check() {
+        for height in [1.3e-5, 2.1e-5] {
+            let s = Surface::from(Cone::new_bounded(
+                O,
+                X,
+                Y,
+                1.0,
+                1.0 + 2.65,
+                0.0,
+                360.0,
+                height,
+                false,
+                false,
+                false,
+            ));
+            assert_clean(&s);
+        }
+    }
+
+    /// Radial width 2.65e10 over height 1e-6: the line scale is 2.65e16 but the half angle rounds
+    /// to 90 degrees (1/cos 1.6e16), so the angle cannot represent the cone and test 5 refuses.
+    #[test]
+    fn cone_whose_angle_rounds_to_flat_is_refused() {
+        let s = Surface::from(Cone::new_bounded(
+            O,
+            X,
+            Y,
+            1.0,
+            1.0 + 2.65e10,
+            0.0,
+            360.0,
+            1e-6,
+            false,
+            false,
+            false,
+        ));
+        let (ok, failed) = failures(&s, 0);
+        assert!(
+            !ok && failed.iter().any(|f| (f.0, f.1) == (CONE_TYPE, 5)),
+            "{failed:?}"
+        );
+    }
+
+    /// Radial width 1000 over height 1000 * tan(1e-6 degrees): a consistent cone at 89.999999
+    /// degrees, where the propagated tolerance is about 1e-7 of the scale, not a refusal.
+    #[test]
+    fn consistent_cone_at_89_999999_degrees_is_accepted() {
+        let height = 1000.0 * det::tan((1e-6_f64).to_radians());
+        let s = Surface::from(Cone::new_bounded(
+            O,
+            X,
+            Y,
+            1.0,
+            1.0 + 1000.0,
+            0.0,
+            360.0,
+            height,
+            false,
+            false,
+            false,
+        ));
+        assert_clean(&s);
+    }
+
+    #[test]
+    fn generator_scale_tolerance_still_refuses_a_wrong_scale() {
+        let half_angle = det::atan2(2.65_f64, 1.3e-5);
+        let scale = 1.0 / det::cos(half_angle);
+        let tol = generator_scale_tolerance(scale, half_angle);
+        // the rounding of the angle is covered ...
+        assert!(tol > 1e-6 && tol < 1e-4, "{tol}");
+        // ... a scale off by 1e-6 of itself, or by 1e-9 on a gentle cone, is not
+        assert!(scale * 1e-6 > tol);
+        let gentle = 0.3_f64;
+        let tol = generator_scale_tolerance(1.0 / det::cos(gentle), gentle);
+        assert!(1e-9 > tol, "{tol}");
     }
 
     #[test]
@@ -2650,5 +4019,178 @@ mod tests {
                 "m_vOrigin is a point on m_pGenCurve",
             )],
         );
+    }
+}
+
+#[cfg(test)]
+mod curve_bounded_tests {
+    use super::*;
+    use crate::curve::composite_curve::CompositeCurve;
+    use crate::geom::extent2d::Extent2d;
+    use crate::geom::object::ObjectRef;
+    use crate::geom::vector2d::Vec2;
+    use crate::surface::curve_bounded_surface::CurveBoundedSurface;
+
+    fn plane(scale: f64) -> Surface {
+        Surface::from(Plane::new(
+            Point3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec2::new(scale, 1.0),
+            &Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0),
+        ))
+    }
+
+    fn wrap(basis: Surface, curves3d: Vec<Curve>, curvesuv: Vec<Curve>) -> Surface {
+        Surface::from(CurveBoundedSurface::new(basis, curves3d, curvesuv, true).unwrap())
+    }
+
+    #[test]
+    fn curve_bounded_given_is_defined_and_base_continuity_fails_test_4() {
+        let k = Kernel::default();
+        let surface = wrap(wrap(plane(1.0), vec![], vec![]), vec![], vec![]);
+        let mut list = AssertArray::new();
+        assert!(surface
+            .assert_valid(&k, Some(&mut list), LEVEL_GIVEN, ObjectKey(1))
+            .unwrap());
+        assert!(list.is_empty());
+        assert!(!list.last_add());
+        // The inherited base check reaches `sm_AssertTestSurface4`, whose
+        // `CalculateContinuities` fails here (a curve-bounded surface's generic `GetKnots`
+        // fails) without writing its output. Upstream reads that output uninitialised;
+        // the fork fails test 4 instead (tangency-labs/smlib 21dcf69, WR-663), so the
+        // surface is reported invalid.
+        for level in [0, 1, 2] {
+            assert!(!surface.assert_valid(&k, None, level, ObjectKey(1)).unwrap());
+        }
+    }
+
+    #[test]
+    fn curve_bounded_failing_basis_retains_default_label_and_distinct_identities() {
+        let k = Kernel::default();
+        let surface = wrap(
+            wrap(wrap(plane(-1.0), vec![], vec![]), vec![], vec![]),
+            vec![],
+            vec![],
+        );
+        let mut list = AssertArray::new();
+        assert!(!surface
+            .assert_valid(&k, Some(&mut list), LEVEL_GIVEN, ObjectKey(u64::MAX))
+            .unwrap());
+        assert_eq!(list.len(), 4);
+        let nested = list
+            .reports()
+            .iter()
+            .filter(|r| r.reporting_type == CURVE_BOUNDED_SURFACE_TYPE)
+            .collect::<Vec<_>>();
+        assert_eq!(nested.len(), 3);
+        assert!(nested
+            .iter()
+            .all(|r| r.test_index == 0 && r.name == "Unknown_Assert"));
+        assert_eq!(
+            nested
+                .iter()
+                .map(|r| r.reporter)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            3
+        );
+        assert!(!list.last_add());
+    }
+
+    #[test]
+    fn curve_bounded_checks_both_boundary_lists_without_reports() {
+        let k = Kernel::default();
+        for uv in [false, true] {
+            let dim = if uv { 2 } else { 3 };
+            let mut curve =
+                Curve::from(CompositeCurve::with_curves(dim, vec![], false, None, None).unwrap());
+            curve.set_owner(
+                Some(ObjectRef {
+                    type_code: PLANE_TYPE,
+                    key: crate::geom::attribute::ObjectKey(99),
+                }),
+                None,
+            );
+            let (curves3d, curvesuv) = if uv {
+                (vec![], vec![curve])
+            } else {
+                (vec![curve], vec![])
+            };
+            let surface = wrap(plane(1.0), curves3d, curvesuv);
+            {
+                let level = LEVEL_GIVEN;
+                assert!(!surface.assert_valid(&k, None, level, ObjectKey(1)).unwrap());
+                // The failed boundary check (test 1 or 2) is labelled from
+                // `sAssertCurveBoundedSurface_list`; upstream's label lookup has no case
+                // for the class and reads its one-entry default list out of bounds.
+                let mut list = AssertArray::new();
+                assert!(!surface
+                    .assert_valid(&k, Some(&mut list), level, ObjectKey(1))
+                    .unwrap());
+                let test = if uv { 2 } else { 1 };
+                let report = list
+                    .reports()
+                    .iter()
+                    .find(|r| r.reporting_type == CURVE_BOUNDED_SURFACE_TYPE)
+                    .unwrap();
+                assert_eq!(report.test_index, test);
+                assert_eq!(report.name, "UNKNOWN");
+                let boundaries = if uv { "UVBoundaries" } else { "3DBoundaries" };
+                assert_eq!(
+                    report.message.as_deref(),
+                    Some(
+                        format!("Contained {boundaries} curve must pass its AssertValid tests")
+                            .as_str()
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn curve_bounded_identity_callback_keeps_accumulated_roots_separate() {
+        let k = Kernel::default();
+        let surface = wrap(wrap(plane(-1.0), vec![], vec![]), vec![], vec![]);
+        let mut list = AssertArray::new();
+        let mut next = 1000;
+        for root in [1, 2] {
+            let mut allocate = |_| {
+                let key = ObjectKey(next);
+                next += 1;
+                Ok(key)
+            };
+            assert!(!surface
+                .assert_valid_with_keys(
+                    &k,
+                    Some(&mut list),
+                    LEVEL_GIVEN,
+                    ObjectKey(root),
+                    &mut allocate
+                )
+                .unwrap());
+        }
+        assert_eq!(list.len(), 6);
+        let mut invalid_keys = |_| Ok(ObjectKey(1));
+        assert!(surface
+            .assert_valid_with_keys(&k, None, LEVEL_GIVEN, ObjectKey(1), &mut invalid_keys)
+            .is_err());
+    }
+
+    #[test]
+    fn curve_bounded_validity_depth_is_explicitly_bounded() {
+        let k = Kernel::default();
+        let surface = plane(1.0);
+        let mut allocate = |_| Ok(ObjectKey(2));
+        let mut walk = ContainedChecks {
+            allocate: &mut allocate,
+            root: ObjectKey(1),
+            assigned: BTreeSet::new(),
+            ordinal: 0,
+            depth: MAX_GEOMETRY_NESTING + 1,
+        };
+        assert!(surface
+            .assert_valid_with_walk(&k, None, 0, ObjectKey(1), &mut walk, None)
+            .is_err());
     }
 }

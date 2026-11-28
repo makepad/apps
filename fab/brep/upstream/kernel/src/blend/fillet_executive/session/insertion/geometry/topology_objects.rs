@@ -26,7 +26,6 @@ use crate::intersect::topology_solver::p1::TopologyObjects;
 use crate::math::Point3;
 use crate::topology::brep::p3::topology_ref;
 use crate::topology::{Brep, FaceId};
-use crate::SolidError;
 
 const ROLES: [InsertionBody; 3] = [
     InsertionBody::Target,
@@ -97,7 +96,7 @@ impl InsertionGeometry<'_> {
                 for (eu, record) in body.edgeuses().iter() {
                     let canonical = topology_ref(serial, EntityRef::Edgeuse(eu)) == link;
                     let named = *scope == Some(role)
-                        && crate::topology::edgeuse::p1::owner_ref_in(body, eu) == Some(link);
+                        && crate::topology::edgeuse::p1::owner_ref_in(body, eu) == link;
                     if (canonical || named)
                         && !take(
                             Some(role),
@@ -192,7 +191,10 @@ impl TopologyObjects<FilletObject> for InsertionGeometry<'_> {
     fn face_surface(&self, face: FilletObject) -> Result<FilletObject> {
         InsertionGeometry::face_surface(self, face)
             .ok_or_else(|| invalid("not an actual Face handle"))?
-            .ok_or_else(|| SolidError::null_pointer(super::OP))
+            .ok_or_else(|| match InsertionGeometry::topology(face) {
+                Some((_, EntityRef::Face(id))) => super::face_without_surface(id),
+                _ => invalid("not an actual Face handle"),
+            })
     }
     fn surface(&self, object: FilletObject) -> Result<&Surface> {
         if let FilletObject::Surface(binding) = object {
@@ -339,8 +341,10 @@ mod tests {
         // A UV trim curve named by its B-rep's naming scheme (`SetUVTrimCurve`): the
         // intermediate box has an edge use of the same index and notify identity, so
         // the name resolves only in the walked curve's own body.
-        let named = crate::topology::edgeuse::p1::owner_ref(NamingScheme::Notify, eu);
-        assert!(named.is_some());
+        let named = Some(crate::topology::scheme_owner_identity(
+            NamingScheme::Notify,
+            EntityRef::Edgeuse(eu),
+        ));
         assert_ne!(named, Some(eu_ref));
         view.target.edgeuse_mut(eu).unwrap().uv_trim_curve = Some(line_owned_by(named));
         assert_eq!(

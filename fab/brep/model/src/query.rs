@@ -26,6 +26,7 @@ pub struct Measure {
 
 /// Exact volume, area, centroid and bounds (mm³, mm², mm).
 pub fn measure(k: &Kernel, b: &mut Body) -> Result<Measure, BrepError> {
+    crate::guard::check_entry(k, "measure")?;
     let store = AttributeStore::default();
     let attrs = PropertyAttributes { store: &store, key_of: &|_| ObjectKey(0) };
     let (volume, area) = volume_area(k, b, ACCURACY)?;
@@ -47,6 +48,7 @@ pub fn measure(k: &Kernel, b: &mut Body) -> Result<Measure, BrepError> {
 /// Volume and area alone (mm³, mm²), integrated to `accuracy` ([`measure`]'s are to 1e-6),
 /// without [`measure`]'s mass properties, bounds and counts.
 pub fn volume_area(k: &Kernel, b: &mut Body, accuracy: f64) -> Result<(f64, f64), BrepError> {
+    crate::guard::check_entry(k, "volume_area")?;
     let store = AttributeStore::default();
     let attrs = PropertyAttributes { store: &store, key_of: &|_| ObjectKey(0) };
     Ok((brep_volume(k, b, accuracy, &attrs)?, brep_area(k, b, accuracy)?))
@@ -108,6 +110,7 @@ fn circle3(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> Option<([f64; 3], f64)> {
 /// Edge `id` at `n` + 1 even steps of its curve's parameter, ends included; None for an edge
 /// without a curve.
 pub fn sampled(k: &Kernel, b: &Body, id: EdgeId, n: usize) -> Result<Option<Vec<[f64; 3]>>, BrepError> {
+    crate::guard::check_entry(k, "sampled")?;
     let range = edge_parameter_range(b, id)?;
     let Some(curve) = edge::curve(b, id)? else { return Ok(None) };
     let (lo, hi) = (range.min(), range.max());
@@ -123,6 +126,7 @@ pub const OUTLINE: usize = 32;
 
 /// Every edge of the body, sampled.
 pub fn edges(k: &Kernel, b: &mut Body) -> Result<Vec<EdgeInfo>, BrepError> {
+    crate::guard::check_entry(k, "edges")?;
     const SAMPLES: usize = 8;
     let ids = makepad_csg_brep::topology::brep::p1::edges(b, None)?;
     let mut out = Vec::with_capacity(ids.len());
@@ -165,6 +169,7 @@ pub struct FaceInfo {
 
 /// Every face of the body.
 pub fn faces(k: &Kernel, b: &mut Body) -> Result<Vec<FaceInfo>, BrepError> {
+    crate::guard::check_entry(k, "faces")?;
     let ids = makepad_csg_brep::topology::brep::p1::faces(b, None)?;
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {

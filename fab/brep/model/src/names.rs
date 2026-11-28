@@ -74,6 +74,7 @@ pub fn edge_faces(b: &Body, e: EdgeId) -> Result<Vec<FaceId>, BrepError> {
 
 /// The names of a generator step's fresh body (`key` its step), face by face in the body's order.
 pub fn classify(k: &Kernel, b: &mut Body, key: Key, op: &BrepOp) -> Result<Vec<Names>, BrepError> {
+    crate::guard::check_entry(k, "classify")?;
     let faces = faces_of(b)?;
     // An extrude's or revolve's sketch curves, in the frame its sides were made in.
     let sides = match op {
@@ -203,7 +204,11 @@ fn mesh_distance(m: &TessMesh, face: u32, p: [f64; 3]) -> f64 {
 fn lies_on(k: &Kernel, body: &mut Body, g: FaceId, p: [f64; 3], offset: f64, tol: f64) -> Result<Option<bool>, BrepError> {
     let found = {
         let Some(surface) = body.face(g)?.surface.as_ref() else { return Ok(None) };
-        surface_closest_point(k, surface, Point3::new(p[0], p[1], p[2])).ok()
+        match surface_closest_point(k, surface, Point3::new(p[0], p[1], p[2])) {
+            Ok(cp) => Some(cp),
+            Err(e) if e.root_cause().is_cancelled() => return Err(e.into()),
+            Err(_) => None,
+        }
     };
     let Some(cp) = found else { return Ok(None) };
     if (cp.closest.distance - offset).abs() > tol {
@@ -219,6 +224,7 @@ fn lies_on(k: &Kernel, body: &mut Body, g: FaceId, p: [f64; 3], offset: f64, tol
         let c = match face_classify_uv(k, body, g, *uv) {
             Ok(c) => c,
             // The classifier is not ported for every surface: the face's own triangles then.
+            Err(e) if e.root_cause().is_cancelled() => return Err(e.into()),
             Err(_) => {
                 let mesh = tessellate(k, body, &TessOptions { chord: 0.005, ..TessOptions::default() })?;
                 if mesh_distance(&mesh, g.index() as u32, p) < 0.02 { PointClassType::Face } else { PointClassType::Nothing }
@@ -254,8 +260,10 @@ fn samples(k: &Kernel, b: &mut Body) -> Result<Vec<Vec<[f64; 3]>>, BrepError> {
             let (a, bb, c) = (v(t[0]), v(t[1]), v(t[2]));
             let centre = [(a[0] + bb[0] + c[0]) / 3.0, (a[1] + bb[1] + c[1]) / 3.0, (a[2] + bb[2] + c[2]) / 3.0];
             let Some(surface) = b.face(f)?.surface.as_ref() else { continue };
-            if let Ok(cp) = surface_closest_point(k, surface, Point3::new(centre[0], centre[1], centre[2])) {
-                pts.push(p3(cp.closest.point));
+            match surface_closest_point(k, surface, Point3::new(centre[0], centre[1], centre[2])) {
+                Ok(cp) => pts.push(p3(cp.closest.point)),
+                Err(e) if e.root_cause().is_cancelled() => return Err(e.into()),
+                Err(_) => {}
             }
         }
         out.push(pts);
@@ -323,6 +331,7 @@ fn carriers(
 /// The names of a pull's prism (`normal` and `on` the pulled face's, moved `by`), face by face:
 /// its far cap, where the moved face lies, takes the pulled face's names `pulled`; the rest none.
 pub fn pull_caps(k: &Kernel, prism: &mut Body, normal: [f64; 3], on: [f64; 3], by: f64, pulled: &Names) -> Result<Vec<Names>, BrepError> {
+    crate::guard::check_entry(k, "pull_caps")?;
     let faces = faces_of(prism)?;
     let mut out = Vec::with_capacity(faces.len());
     for f in faces {
@@ -339,6 +348,7 @@ pub fn pull_caps(k: &Kernel, prism: &mut Body, normal: [f64; 3], on: [f64; 3], b
 /// Only the narrow cylinder carries names into the drilled body. Its far cap faces along
 /// the drill direction, and supplies the floor of a blind hole.
 pub fn hole_faces(k: &Kernel, shaft: &mut Body, key: Key, dir: [f64; 3], blind: bool) -> Result<Vec<Names>, BrepError> {
+    crate::guard::check_entry(k, "hole_faces")?;
     let mut out = Vec::new();
     for f in faces_of(shaft)? {
         let (_, normal) = face_kind(k, shaft, f)?;
@@ -361,6 +371,7 @@ pub struct Picked {
 
 /// The edges `ids` of a body with names `names`, as a blend step records them.
 pub fn picked(k: &Kernel, b: &mut Body, names: &[Names], ids: &[EdgeId]) -> Result<Vec<Picked>, BrepError> {
+    crate::guard::check_entry(k, "picked")?;
     let infos = query::edges(k, b)?;
     let faces = faces_of(b)?;
     let mut out = Vec::with_capacity(ids.len());
@@ -404,6 +415,7 @@ pub(crate) fn polyline_distance(points: &[[f64; 3]], p: [f64; 3]) -> f64 {
 /// The names of a modifying step's output body (`inputs` as the step took them, `in_names`
 /// theirs), face by face in the body's order.
 pub fn carry(k: &Kernel, out: &mut Body, inputs: &mut [Body], in_names: &[Vec<Names>], step: &Step) -> Result<Vec<Names>, BrepError> {
+    crate::guard::check_entry(k, "carry")?;
     let faces = faces_of(out)?;
     let pts = samples(k, out)?;
     let mut names: Vec<Names> = vec![Names::new(); faces.len()];

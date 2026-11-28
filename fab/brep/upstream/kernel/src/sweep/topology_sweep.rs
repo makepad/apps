@@ -29,14 +29,22 @@
 pub mod access;
 pub mod engine;
 pub mod geometry;
+mod regularize;
 pub mod store;
 
 use std::collections::BTreeMap;
 
+use crate::error::sweep::{SweepFailure, SweepRecord};
 use crate::error::{Result, SolidError};
 use crate::topology::{BrepId, EdgeId, FaceId, RegionId, VertexId};
 
 const OP: &str = "sweep::topology_sweep";
+
+/// [`SweepFailure::MergeOfTwoSweptEntities`]: both entities a stitch would merge carry
+/// `record`.
+fn merge_of_two_swept(record: SweepRecord) -> SolidError {
+    SolidError::sweep(OP, SweepFailure::MergeOfTwoSweptEntities { record })
+}
 
 use crate::geom::tol::ZONE_TOL_3D;
 
@@ -270,7 +278,7 @@ impl TopologySweep {
         let from1 = self.get_from_same(first);
         let from2 = self.get_from_same(second);
         if to1.is_some() && to2.is_some() {
-            return Err(SolidError::sm_err(OP));
+            return Err(merge_of_two_swept(SweepRecord::SweptImage));
         }
         if to2.is_some() && to1.is_none() {
             if to2 == first {
@@ -292,7 +300,7 @@ impl TopologySweep {
             return Ok(());
         }
         if from1.is_some() && from2.is_some() {
-            return Err(SolidError::sm_err(OP));
+            return Err(merge_of_two_swept(SweepRecord::ImageOfSwept));
         }
         if from1.is_none() && from2.is_some() {
             *keep_first = false;
@@ -306,7 +314,7 @@ impl TopologySweep {
         let lower1 = self.get_from_lower(first);
         let lower2 = self.get_from_lower(second);
         if lower1.is_some() && lower2.is_some() {
-            return Err(SolidError::sm_err(OP));
+            return Err(merge_of_two_swept(SweepRecord::FromLowerSweep));
         }
         if lower1.is_some() {
             *keep_first = true;
@@ -316,7 +324,7 @@ impl TopologySweep {
             let higher1 = self.get_to_higher(first);
             let higher2 = self.get_to_higher(second);
             if higher1.is_some() && higher2.is_some() {
-                return Err(SolidError::sm_err(OP));
+                return Err(merge_of_two_swept(SweepRecord::HigherSweptImage));
             }
             if higher1.is_some() {
                 *keep_first = true;

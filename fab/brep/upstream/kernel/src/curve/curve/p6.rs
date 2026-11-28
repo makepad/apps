@@ -9,6 +9,7 @@
 //! | Rust                                                    | Upstream                              |
 //! |---------------------------------------------------------|---------------------------------------|
 //! | [`Curve::calculate_bounding_box`], [`calculate_bounding_box_base`] | `SmCurve::CalculateBoundingBox` (and its dispatch, with the `SmCrvOnSurf` override) |
+//! | [`Curve::certified_bounding_box`] | not upstream: a box that bounds the curve, never a sampled one |
 //! | [`Curve::is_planar`]                                    | `SmCurve::IsPlanar`                   |
 //! | [`Curve::drop_point`], [`Curve::drop_point_base`], [`DroppedPoint`] | `DropPoint` (virtual: the `SmCrvOnSurf` override), `SmCurve::DropPoint` |
 //! | [`Curve::global_point_solve_step`]                      | `SmCurve::GlobalPointSolveSTEP` (and its dispatch) |
@@ -57,8 +58,8 @@
 //!   tripled per split) keeps the two curves' caches for its whole recursion instead
 //!   (`Curve::global_point_solve_cached`), built at the first global solve as
 //!   upstream's; the build is deterministic, so the solutions are those of a fresh
-//!   cache. [`Curve::drop_point_in`] keeps the caches of a caller's curves in a
-//!   [`DropPointCaches`] (`IsPointOnCurve` in `FindInteriorCurves`). Other
+//!   cache. `Curve::drop_point_in` keeps the caches of a caller's curves in a
+//!   `DropPointCaches` (`IsPointOnCurve` in `FindInteriorCurves`). Other
 //!   `DropPoint` callers still build one per call.
 //! - **Recursion.** `GlobalCoincidenceChecker` splits closed and half closed curves
 //!   recursively; past [`MAX_COINCIDENCE_DEPTH`] nested splits it fails with
@@ -68,12 +69,34 @@
 //!   (`1e300` control points split 15 to 30 levels deep and ran for minutes, fuzz
 //!   `curve.curve_p8` fuzz01456; upstream fixtures and the committed difftest cases
 //!   make at most 15,139 calls and split 32 levels deep).
+//!   A curve whose box reaches past [`crate::limits::MAX_COORDINATE_MAGNITUDE`]
+//!   (`1e150`, below `sqrt(f64::MAX)`) fails with `InvalidInput` before any split: its polar boxes overflow, so every check would
+//!   run to the call cap (a swung primitive scaled by `f64::MAX` merged with itself
+//!   ran past 600 s, upstream past 120 s; issue from the #2490 fuzz).
 //! - **Seam test.** `sm_IsPointSolutionAcrossClosedSeamBoundary` (unit
 //!   `curve.curve_p5`) is told whether the solution's first object is its `this`
 //!   curve: the split solutions name `[this, other]`, so it is when the coincidence
 //!   check split the other curve, or `this` and the other are the same curve.
+//! - **Crossings are decided on the merged range (WR-647).**
+//!   [`Curve::simple_coincidence_checker`] returns upstream's range for one span pair.
+//!   Whether a range is a crossing or touch of two distinct curves seen through the
+//!   tolerance is decided after `GlobalCurveIntersect` merges the span ranges (unit
+//!   `curve.curve_p8`),
+//!   where it shows whether the range ends where the curves part or where one of them
+//!   stops; on one span pair a fitted copy of a curve (its separation tolerance-scale
+//!   noise) looks the same as a grazing crossing. A face/face contact at an edge's end
+//!   vertex is made one point by the tangency witness
+//!   (`crate::intersect::curve_class::witness`), from the surfaces.
+//! - **Statuses passed on (WR-663).** The statuses SMLib drops are passed on, as the
+//!   fork (tangency-labs/smlib 8311f8e):`CalculateBoundingBox`'s samples, interval and
+//!   boxes, `CurveMaxDistanceBetween`'s knots, `DeformToEndPointTargets`' drops (a target
+//!   that does not drop is `SM_ERR`) and `ConvertTo2D` (before the UV curve is replaced);
+//!   `IsPlanar` is `FALSE` without its box.
+//! - **Single-sample midpoint (WR-36).** [`Curve::curve_max_distance_between`] with
+//!   `num_samples == 1` (when not overridden to two samples by the single-span
+//!   line/line check) samples the interval midpoints (`per = 0.5`) instead of dividing
+//!   `0 / 0 = NaN` as upstream does.
 
-use crate::curve::curve::knots_ignoring_status;
 use crate::curve::curve::p1::{ApproximateCurveOptions, GlobalPointSolveOptions};
 use crate::curve::curve::p2::{
     at, snap_sol_to_specified_endpoint, Curve, CurveKind, CurvePropertyType,
@@ -83,6 +106,7 @@ use crate::curve::curve::p5::{
     is_point_solution_across_closed_seam_boundary, local_property_analysis,
 };
 use crate::curve::curve_cache::CurveCache;
+use crate::error::curve::CurveFailure;
 use crate::error::{ignore_status, ignored, Result, SolidError};
 use crate::geom::extent1d::Extent1d;
 use crate::geom::extent3d::Extent3d;
@@ -191,6 +215,14 @@ impl<'t, O: SolutionObject + 't> GlobalSolve<'t, O> for MergeSolver<'t, O> {
 #[derive(Debug, Default)]
 pub(crate) struct DropPointCaches(Vec<Option<CurveCache<CurveHandle>>>);
 
+impl DropPointCaches {
+    /// Drops the caches of slots `len..`, for a caller whose curves from `len` on were
+    /// removed (a slot must not outlive its curve).
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.0.truncate(len);
+    }
+}
+
 // ---- CalculateBoundingBox --------------------------------------------------------------
 
 /// The base-class `SmCurve::CalculateBoundingBox` of `curve` over `interval`: the
@@ -229,12 +261,13 @@ pub fn calculate_bounding_box_base(
     let mut rel_t1 = 0.0;
     let num_derivs = usize::from(want_tangents);
     let mut pt_der = [Vec3::UNDEF, Vec3::UNDEF];
+    // (the statuses below are ignored upstream and passed on as the fork,
+    // tangency-labs/smlib 8311f8e)
     let sample = |t: f64, pt_der: &mut [Vec3; 2]| -> Result<()> {
-        // nonZeroTangent values (status ignored)
-        if let Some(v) = ignored(curve.evaluate(k, t, num_derivs, false, true))? {
-            for (dst, src) in pt_der.iter_mut().zip(v) {
-                *dst = src;
-            }
+        // nonZeroTangent values
+        let v = curve.evaluate(k, t, num_derivs, false, true)?;
+        for (dst, src) in pt_der.iter_mut().zip(v) {
+            *dst = src;
         }
         Ok(())
     };
@@ -256,7 +289,7 @@ pub fn calculate_bounding_box_base(
         if ii >= NUM_SPANS - 1 {
             rel_t1 = 1.0;
         }
-        ignored(sub_ivl.set_min_max(interval.evaluate(rel_t0), interval.evaluate(rel_t1)))?;
+        sub_ivl.set_min_max(interval.evaluate(rel_t0), interval.evaluate(rel_t1))?;
 
         let pt0 = pt1;
         sample(sub_ivl.max(), &mut pt_der)?;
@@ -290,7 +323,7 @@ pub fn calculate_bounding_box_base(
                     stat_ok = true;
                     found
                 }
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 Err(_) => {
                     stat_ok = false;
                     // Quit and try something different.
@@ -362,7 +395,7 @@ pub fn calculate_bounding_box_base(
     let mut bbox = Extent3d::new();
     if req.normal {
         let p0 = point(0)?;
-        ignored(bbox.set_min_max(p0, p0))?;
+        bbox.set_min_max(p0, p0)?;
     }
 
     // init pseudobox
@@ -393,7 +426,7 @@ pub fn calculate_bounding_box_base(
             // use basis vectors based on selected sample points
             let v2 = point(l3)? - point(l2)?;
             let [b1, b2, b3] = v1.make_unit_ortho_vectors(Some(v2))?;
-            ignored(pseudo.set_basis(b1, b2, b3))?;
+            pseudo.set_basis(b1, b2, b3)?;
         }
     }
 
@@ -546,22 +579,94 @@ impl Curve {
         }
     }
 
+    /// A box that provably holds every point of the curve over `interval`, or `None` when
+    /// none is known (not upstream; for clearance proofs, where a sampled box proves
+    /// nothing). The B-spline and conic boxes come from the control points of the spans
+    /// covered, cut down to the box of the control points of the piece over `interval`
+    /// alone where that piece is certain ([`Curve::piece_hull_points`]), so they shrink
+    /// with the interval inside a span too; a line's from its ends, a Hermite curve's
+    /// from its Bezier polygon (over the whole curve), a composite's from its segments'
+    /// certified boxes (none when a segment has none). A curve on a surface or a
+    /// tangent-field curve has none: its box is its approximation's, whose gap from the
+    /// curve is measured at sample points. Every other kind would fall back to
+    /// [`calculate_bounding_box_base`], which samples, so it has none.
+    ///
+    /// # Errors
+    ///
+    /// Those of the boxes and of the curve-on-surface approximation.
+    pub fn certified_bounding_box(
+        &self,
+        k: &Kernel,
+        interval: &Extent1d,
+    ) -> Result<Option<Extent3d>> {
+        let req = BoundingBoxRequest {
+            normal: true,
+            pseudo: false,
+            polar: false,
+        };
+        let spans = match self.kind() {
+            CurveKind::BSpline(c) => c.calculate_bounding_box(interval, req)?.normal,
+            CurveKind::Hyperbola(c) => c.base().calculate_bounding_box(interval, req)?.normal,
+            CurveKind::Ellipse(c) => c.base().calculate_bounding_box(interval, req)?.normal,
+            CurveKind::Parabola(c) => c.base().calculate_bounding_box(interval, req)?.normal,
+            CurveKind::Line(c) => c.calculate_bounding_box(interval, req).normal,
+            CurveKind::Hermite(c) => {
+                let mut normal = Extent3d::new();
+                c.calculate_bounding_box(Some(&mut normal), None, None)?;
+                Some(normal)
+            }
+            CurveKind::Composite(c) => c.certified_bounding_box(k, interval)?,
+            // a curve on a surface and a tangent-field curve: their approximation's gap is
+            // measured at sample points; every other kind: the base class's sampled box
+            _ => None,
+        }
+        .filter(Extent3d::is_defined);
+        // The spans' box stops shrinking once `interval` lies in one span. The curve over
+        // `interval` is in the box of its own piece too, so in what the two share.
+        let piece = match self.kind() {
+            CurveKind::BSpline(_)
+            | CurveKind::Hyperbola(_)
+            | CurveKind::Ellipse(_)
+            | CurveKind::Parabola(_) => self.piece_hull_points(interval).and_then(|points| {
+                let slack = points.iter().fold(0.0_f64, |m, &(_, e)| m.max(e));
+                let mut bounds =
+                    crate::nurbs::nurbs_crv::points_box(points.iter().map(|&(p, _)| p))?;
+                bounds.expand_absolute(slack);
+                Some(bounds)
+            }),
+            _ => None,
+        };
+        Ok(match (spans, piece) {
+            (Some(spans), Some(piece)) => Some(spans.intersect(&piece).unwrap_or(spans)),
+            (spans, _) => spans,
+        })
+    }
+
     /// `IsPlanar`: [`PseudoBox::is_planar`] of the pseudo box of the curve over its
     /// natural interval (`tol == EFF_ZERO` lets the box pick its scaled zero).
     ///
     /// # Errors
     ///
     /// [`SolidError::Unported`] from [`Curve::calculate_bounding_box`] (whose other
-    /// failures leave the default box, as upstream ignores the status).
+    /// failures show the curve not planar, as the fork; upstream ignores the status).
     pub fn is_planar(&self, k: &Kernel, tol: f64) -> Result<Planar> {
         let req = BoundingBoxRequest {
             normal: false,
             pseudo: true,
             polar: false,
         };
-        let pseudo = ignored(self.calculate_bounding_box(k, &self.natural_interval(), req, true))?
-            .and_then(|b| b.pseudo)
-            .unwrap_or_else(PseudoBox::new);
+        let boxes = ignored(self.calculate_bounding_box(k, &self.natural_interval(), req, true))?;
+        // as the fork, a curve that cannot be boxed is not shown planar; its outputs are
+        // not written (tangency-labs/smlib 8311f8e)
+        let Some(boxes) = boxes else {
+            return Ok(Planar {
+                is_planar: false,
+                point: Vec3::UNDEF,
+                normal: Vec3::UNDEF,
+                deviation: crate::math::UNDEF_DOUBLE,
+            });
+        };
+        let pseudo = boxes.pseudo.unwrap_or_else(PseudoBox::new);
         Ok(pseudo.is_planar(tol))
     }
 
@@ -962,8 +1067,10 @@ impl Curve {
     /// of `other` dropped onto this curve by local solves (global solves for
     /// unborrowed B-splines when they fail). `num_samples == 0` samples by the knot
     /// counts and refines the largest gap with a local curve/curve maximisation; two
-    /// lines take two samples. With `max_needed` the search stops at the first gap
-    /// larger than it. The same curve over the same interval has no gap.
+    /// lines take two samples. With `num_samples == 1` on non-line pairs, upstream
+    /// divides `0 / 0 = NaN` (WR-36); this samples the interval
+    /// midpoints (`per = 0.5`) instead. With `max_needed` the search stops at the first
+    /// gap larger than it. The same curve over the same interval has no gap.
     ///
     /// # Errors
     ///
@@ -1005,12 +1112,13 @@ impl Curve {
         // there are a large number of knots.
         if num_samples == 0 {
             do_precise = true;
-            let knots = knots_ignoring_status(self.knots_with_status(k, None))?
-                .0
-                .len();
-            let other_knots = knots_ignoring_status(other.knots_with_status(k, None))?
-                .0
-                .len();
+            // (statuses ignored upstream; passed on as the fork, tangency-labs/smlib
+            // 8311f8e)
+            let mine = self.knots_with_status(k, None)?;
+            mine.status?;
+            let theirs = other.knots_with_status(k, None)?;
+            theirs.status?;
+            let (knots, other_knots) = (mine.knots.len(), theirs.knots.len());
             num_samples = 22 + knots as u64 + other_knots as u64;
         }
 
@@ -1038,7 +1146,11 @@ impl Curve {
 
         // Uniformly sample OtherCurve from beginning to end
         for ii in 0..num_samples {
-            let per = ii as f64 / (num_samples - 1) as f64;
+            let per = if num_samples == 1 {
+                0.5
+            } else {
+                ii as f64 / (num_samples - 1) as f64
+            };
             let t_guess1 = interval.evaluate(per);
             let mut t_guess2 = if orientation > 0.0 {
                 other_interval.evaluate(per)
@@ -1413,7 +1525,6 @@ impl Curve {
         let mut ivl_t2 = Extent1d::from_value(first.1);
         ivl_t2.add_value(last.1);
         let max_degree = self.degree()?.max(other.degree()?);
-
         // degenerate intervals are never coincidentIntervals
         if are_same(ivl_t1.max(), ivl_t1.min()) || are_same(ivl_t2.max(), ivl_t2.min()) {
             found_coincidence = false;
@@ -1428,7 +1539,6 @@ impl Curve {
                 max_degree as u64 + 3,
                 Some(tol),
             )?;
-
             // when maxDistance is greater than tolerance
             if gap.distance > tol {
                 found_coincidence = false;
@@ -1444,8 +1554,66 @@ impl Curve {
             ]);
         }
 
-        // add 1 coincident intersection to solution array
+        // add 1 coincident intersection to solution array (whether a range found here is a
+        // crossing seen through the tolerance is decided on the merged range, in
+        // `GlobalCurveIntersect`: one span pair cannot tell, see WR-647 in the header)
         Ok(vec![pair_solution(objects, first, Some(last))])
+    }
+
+    /// Not upstream (case 3e, WR-647): whether a stretch of this curve over which `other`
+    /// stays within tolerance is an approach rather than a coincidence. The stretch runs
+    /// from the parameter pair `first` to `last` (this curve's, then `other`'s), and
+    /// `distance_between` is the largest distance between the curves over it. An approach
+    /// keeps one side without vanishing: the separation across this curve does not change
+    /// sides between the two ends, and the largest distance is above numeric zero. A
+    /// separation that changes sides is a crossing seen through the tolerance, and one that
+    /// vanishes has no side. The side is taken across this curve, with its tangent's
+    /// component removed. Where an end of one curve runs past the other's end, it drops
+    /// onto that end. The pair's difference then points along the curves, forward at one
+    /// end and back at the other, for two curves that lie on each other, and upstream took
+    /// that for a crossing.
+    ///
+    /// The face/face tangency witness ([`crate::intersect::curve_class::witness`]) asks it
+    /// of a merged range's own ends.
+    ///
+    /// # Errors
+    ///
+    /// Those of the evaluations.
+    pub(crate) fn approaches_without_crossing(
+        &self,
+        k: &Kernel,
+        other: &Self,
+        first: (f64, f64),
+        last: (f64, f64),
+        distance_between: f64,
+    ) -> Result<bool> {
+        let this_a = self.evaluate_point(k, first.0)?;
+        let this_b = self.evaluate_point(k, last.0)?;
+        let other_a = other.evaluate_point(k, first.1)?;
+        let other_b = other.evaluate_point(k, last.1)?;
+        let separation_a = self.across_tangent(k, first.0, other_a - this_a)?;
+        let separation_b = self.across_tangent(k, last.0, other_b - this_b)?;
+        let scaled_zero = EFF_ZERO * (1.0 + max2(this_a.max_dimension(), this_b.max_dimension()));
+        let changes_sides = separation_a.length() > scaled_zero
+            && separation_b.length() > scaled_zero
+            && separation_a.dot(separation_b) < 0.0;
+        Ok(!changes_sides && distance_between > scaled_zero)
+    }
+
+    /// `v` without its component along this curve's tangent at `t`; `v` itself where the
+    /// tangent vanishes.
+    pub(crate) fn across_tangent(&self, k: &Kernel, t: f64, v: Vec3) -> Result<Vec3> {
+        let d = self.evaluate(k, t, 1, false, true)?;
+        let Some(&tangent) = d.get(1) else {
+            return Ok(v);
+        };
+        let len = tangent.length();
+        // (a NaN length, from an undefined tangent, also keeps `v`)
+        if len.is_nan() || len <= EFF_ZERO {
+            return Ok(v);
+        }
+        let u = tangent * (1.0 / len);
+        Ok(v - u * v.dot(u))
     }
 
     /// `GlobalCoincidenceChecker` (the pre `SM_TOLERANT_XSECT` version): the coincident
@@ -1463,8 +1631,10 @@ impl Curve {
     /// # Errors
     ///
     /// Those of the evaluations, box, closure, degeneracy and drop computations;
-    /// `InvalidInput` past [`MAX_COINCIDENCE_DEPTH`] nested splits or
-    /// [`MAX_COINCIDENCE_CALLS`] calls; those of the seam test of split solutions.
+    /// `InvalidInput` past [`MAX_COINCIDENCE_DEPTH`] nested splits,
+    /// [`MAX_COINCIDENCE_CALLS`] calls or a box coordinate past
+    /// [`crate::limits::MAX_COORDINATE_MAGNITUDE`]; those of the seam test of split
+    /// solutions.
     pub fn global_coincidence_checker<O: SolutionObject>(
         &self,
         k: &Kernel,
@@ -1583,6 +1753,9 @@ impl Curve {
         out: &mut Coincidence<O>,
     ) -> Result<()> {
         *calls += 1;
+        if (*calls & 15) == 1 {
+            k.check_cancelled(OP_COINCIDENCE)?;
+        }
         if depth > MAX_COINCIDENCE_DEPTH {
             return Err(SolidError::invalid_input(
                 OP_COINCIDENCE,
@@ -1623,6 +1796,13 @@ impl Curve {
                     ignored(other.calculate_bounding_box(k, other_interval, req, true))?
                 {
                     if let (Some(a), Some(b)) = (this_box.normal, other_box.normal) {
+                        // Not upstream: see the module deviations (box coordinates past 1e150)
+                        if !is_measurable_box(&a) || !is_measurable_box(&b) {
+                            return Err(SolidError::invalid_input(
+                                OP_COINCIDENCE,
+                                "coincidence check of a curve with a coordinate beyond 1e150",
+                            ));
+                        }
                         if a.are_disjoint(&b, tol) {
                             return Ok(());
                         }
@@ -2154,10 +2334,16 @@ impl Curve {
                         guess_uv: Some(crate::math::Vec2::new(current.x, current.y)),
                         ..Default::default()
                     };
-                    let uv = ignored(surface.drop_point::<crate::surface::surface::p4::NoObject>(
+                    // (status ignored upstream; as the fork a failed drop is passed on
+                    // and a target that does not drop onto the surface has no UV
+                    // point, SM_ERR, tangency-labs/smlib 8311f8e)
+                    let dropped = surface.drop_point::<crate::surface::surface::p4::NoObject>(
                         k, target, &domain, &options,
-                    ))?
-                    .map_or(crate::math::Vec2::UNDEF, |result| result.result_uv);
+                    )?;
+                    if !dropped.success {
+                        return Err(SolidError::curve(OP_DEFORM, CurveFailure::TargetDidNotDrop));
+                    }
+                    let uv = dropped.result_uv;
                     Ok(Some(Point3::new(uv.x, uv.y, 0.0)))
                 };
                 let start = drop_target(tgt_start, ends.start)?;
@@ -2187,7 +2373,10 @@ impl Curve {
                     InValueType::Same,
                 )?;
                 if let Some(mut replacement) = replacement {
-                    ignore_status(replacement.convert_to_2d(k))?;
+                    // (status ignored upstream; passed on as the fork before the UV
+                    // curve is replaced, so a failure leaves it as it was,
+                    // tangency-labs/smlib 8311f8e)
+                    replacement.convert_to_2d(k)?;
                     curve.set_uv_curve(replacement)?;
                 }
                 return Ok(None);
@@ -2292,6 +2481,15 @@ impl Curve {
     }
 }
 
+/// Whether every corner coordinate of `b` is a number within
+/// [`crate::limits::MAX_COORDINATE_MAGNITUDE`].
+pub(crate) fn is_measurable_box(b: &Extent3d) -> bool {
+    let (min, max) = (b.min(), b.max());
+    [min.x, min.y, min.z, max.x, max.y, max.z]
+        .iter()
+        .all(|v| v.abs() <= crate::limits::MAX_COORDINATE_MAGNITUDE)
+}
+
 /// `interval` split at 37.5% and 62.5% (`sIvl1`, `sIvl2`, `sIvl3`).
 fn split_in_three(interval: &Extent1d) -> [Extent1d; 3] {
     [
@@ -2305,6 +2503,7 @@ fn split_in_three(interval: &Extent1d) -> [Extent1d; 3] {
 mod tests {
     use super::*;
     use crate::curve::hermite_curve::HermiteCurve;
+    use crate::math::det;
 
     /// A full circle of radius 2 in the XY plane (rational quadratic B-spline).
     fn circle_of_radius_two(start_deg: f64, end_deg: f64) -> Curve {
@@ -2327,6 +2526,68 @@ mod tests {
     /// earlier drop filled gives exactly the result of a fresh slot for that drop alone
     /// (no reuse at all), and lands where it should. Points on and just off the circle
     /// at 48 angles, so the global solve runs on the pre-filled slot.
+    #[test]
+    fn issue_2009_unboxable_curve_is_not_shown_planar() {
+        // tangency-labs/smlib 8311f8e (SmCurve::IsPlanar, CalculateBoundingBox): a
+        // curve that cannot be boxed is not shown planar; the box passes on its
+        // evaluations. Upstream reads the default box, which is planar.
+        let c = Curve::from(BSplineCurve::new(3));
+        let on = Kernel::default();
+        assert!(!c.is_planar(&on, EFF_ZERO).unwrap().is_planar);
+    }
+
+    /// The certified box of a circle (as a B-spline and as the circle kind) over an interval
+    /// inside one quarter is the box of the piece over that interval: it holds the piece,
+    /// stays out of the quarter's far corner, and shrinks with the interval. Over the whole
+    /// curve it is the spans' box, bit for bit.
+    #[test]
+    fn a_certified_box_shrinks_with_its_interval_inside_a_span() {
+        use crate::curve::ellipse::Ellipse;
+        use crate::geom::axis2_placement::Axis2Placement;
+
+        let k = Kernel::default();
+        let frame = Axis2Placement::IDENTITY;
+        let circle = Ellipse::create_canonical_circle(&k, &frame, 2.0, None, None).unwrap();
+        for c in [circle_of_radius_two(0.0, 360.0), Curve::from(circle)] {
+            let natural = c.natural_interval();
+            let req = BoundingBoxRequest {
+                normal: true,
+                pseudo: false,
+                polar: false,
+            };
+            let spans = c.b_spline_base().unwrap();
+            let whole = c.certified_bounding_box(&k, &natural).unwrap().unwrap();
+            let before = spans.calculate_bounding_box(&natural, req).unwrap().normal;
+            assert_eq!(Some(whole), before);
+            assert!(whole.contains_point(Vec3::new(2.0, 2.0, 0.0), 0.0));
+
+            // from 9 to 18 degrees, inside the first quarter
+            let quarter = natural.length() / 4.0;
+            let (lo, hi) = (natural.min() + 0.1 * quarter, natural.min() + 0.2 * quarter);
+            let mut cell = Extent1d::from_min_max(lo, hi);
+            let in_span = spans.calculate_bounding_box(&cell, req).unwrap().normal;
+            assert!(in_span
+                .unwrap()
+                .contains_point(Vec3::new(2.0, 2.0, 0.0), 0.0));
+            let mut last = f64::INFINITY;
+            for _ in 0..12 {
+                let bx = c.certified_bounding_box(&k, &cell).unwrap().unwrap();
+                for i in 0..=8 {
+                    let t = cell.min() + cell.length() * f64::from(i) / 8.0;
+                    let p = c.evaluate_point(&k, t).unwrap();
+                    assert!(bx.contains_point(p, 1e-13), "cell {cell:?} p={p:?}");
+                }
+                assert!(bx.is_contained_by(&whole, 0.0), "cell {cell:?}");
+                assert!(!bx.contains_point(Vec3::new(2.0, 2.0, 0.0), 1.0));
+                let size = bx.size().length();
+                assert!(size < 0.75 * last, "cell {cell:?}: {size} after {last}");
+                last = size;
+                cell = Extent1d::from_min_max(cell.min(), 0.5 * (cell.min() + cell.max()));
+            }
+            assert!(last < 1e-3, "{last}");
+        }
+    }
+
     #[test]
     fn drop_with_prefilled_cache_slot_matches_fresh_slot_per_drop() {
         let k = Kernel::default();
@@ -2352,9 +2613,9 @@ mod tests {
         assert!(shared.is_some());
         for i in 0..48 {
             let a = (f64::from(i) + 0.25) * std::f64::consts::TAU / 48.0;
-            let on = Vec3::new(2.0 * a.cos(), 2.0 * a.sin(), 0.0);
+            let on = Vec3::new(2.0 * det::cos(a), 2.0 * det::sin(a), 0.0);
             for r in [2.0, 2.0 + 0.5 * tol] {
-                let p = Vec3::new(r * a.cos(), r * a.sin(), 0.0);
+                let p = Vec3::new(r * det::cos(a), r * det::sin(a), 0.0);
                 let fresh = drop_at(p, &mut None);
                 let reused = drop_at(p, &mut shared);
                 // `Debug` prints every float exactly: equal strings are equal bits
@@ -2417,7 +2678,7 @@ mod tests {
                 let q = half.evaluate_point(&k, e.param(1).unwrap()).unwrap();
                 assert!(p.distance(q) < tol, "{p:?} vs {q:?}");
                 assert!(p.y > -tol && (p.length() - 2.0).abs() < tol, "{p:?}");
-                *angle = p.y.max(0.0).atan2(p.x);
+                *angle = det::atan2(p.y.max(0.0), p.x);
             }
             let [a, b] = angles;
             spans.push((a.min(b), a.max(b)));
@@ -2627,5 +2888,111 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(e, SolidError::InvalidInput { .. }));
+    }
+
+    #[test]
+    fn wr36_curve_max_distance_single_sample_hermite_midpoint() {
+        let on = Kernel::default();
+
+        // `P(t) = (t, 0, 0)` on `[0, 1]` as a cubic Hermite (not degree 1, and not an
+        // unborrowed B-spline, so failed local solves do not fall back to global solve).
+        let base = Curve::from(HermiteCurve::new(
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            3,
+        ));
+        // `Q(t) = (t, 0, 2t(1 - t))`: agrees at the ends, peaks at `Q(0.5) = (0.5, 0, 0.5)`.
+        let arch = Curve::from(HermiteCurve::new(
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 2.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, -2.0),
+            3,
+        ));
+        // `S(t) = (t, 0, 3)`: constant gap of `3.0` everywhere.
+        let shifted = Curve::from(HermiteCurve::new(
+            Vec3::new(0.0, 0.0, 3.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 3.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            3,
+        ));
+        let ivl = Extent1d::from_min_max(0.0, 1.0);
+
+        // `per = 0.5` evaluates the midpoint gap for both orientations.
+        for (start, end) in [(0.0, 1.0), (1.0, 0.0)] {
+            let arch_on = base
+                .curve_max_distance_between(&on, &ivl, &arch, start, end, 1, None)
+                .unwrap();
+            assert!((arch_on.distance - 0.5).abs() < 1.0e-12, "{arch_on:?}");
+            assert!((arch_on.this_t - 0.5).abs() < 1.0e-12, "{arch_on:?}");
+            assert!((arch_on.other_t - 0.5).abs() < 1.0e-12, "{arch_on:?}");
+            assert_eq!(arch_on.incorrect_dir, Some(false));
+        }
+
+        let shifted_on = base
+            .curve_max_distance_between(&on, &ivl, &shifted, 0.0, 1.0, 1, None)
+            .unwrap();
+        assert!(
+            (shifted_on.distance - 3.0).abs() < 1.0e-12,
+            "{shifted_on:?}"
+        );
+        assert!((shifted_on.this_t - 0.5).abs() < 1.0e-12, "{shifted_on:?}");
+        assert!((shifted_on.other_t - 0.5).abs() < 1.0e-12, "{shifted_on:?}");
+
+        // `max_needed` early-exit triggers at the midpoint (`incorrect_dir: None`).
+        let limited_on = base
+            .curve_max_distance_between(&on, &ivl, &arch, 0.0, 1.0, 1, Some(0.25))
+            .unwrap();
+        assert!(
+            (limited_on.distance - 0.5).abs() < 1.0e-12,
+            "{limited_on:?}"
+        );
+        assert_eq!(limited_on.incorrect_dir, None);
+    }
+
+    #[test]
+    fn wr36_curve_max_distance_single_sample_bspline_midpoint() {
+        let on = Kernel::default();
+
+        // `base` is an unborrowed degree-1 B-spline `(t, 0, 0)` on `[0, 1]`; `arch` is
+        // degree 3 `(t, 0, 2t(1 - t))`, so the line/line override does not apply.
+        let base = Curve::from(
+            BSplineCurve::create_line_segment(
+                3,
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+            )
+            .unwrap(),
+        );
+        let arch = Curve::from(HermiteCurve::new(
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 2.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, -2.0),
+            3,
+        ));
+        let ivl = Extent1d::from_min_max(0.0, 1.0);
+
+        // Samples the midpoint `0.5` -> gap `0.5`.
+        for (start, end) in [(0.0, 1.0), (1.0, 0.0)] {
+            let d_on = base
+                .curve_max_distance_between(&on, &ivl, &arch, start, end, 1, None)
+                .unwrap();
+            assert!((d_on.distance - 0.5).abs() < 1.0e-12, "{d_on:?}");
+            assert!((d_on.this_t - 0.5).abs() < 1.0e-12, "{d_on:?}");
+            assert!((d_on.other_t - 0.5).abs() < 1.0e-12, "{d_on:?}");
+        }
+
+        // Sub-interval `[0.0, 0.5]`: midpoint is `0.25`, where `2 * 0.25 * 0.75 = 0.375`.
+        let sub = Extent1d::from_min_max(0.0, 0.5);
+        let sub_on = base
+            .curve_max_distance_between(&on, &sub, &arch, 0.0, 0.5, 1, None)
+            .unwrap();
+        assert!((sub_on.distance - 0.375).abs() < 1.0e-12, "{sub_on:?}");
+        assert!((sub_on.this_t - 0.25).abs() < 1.0e-12, "{sub_on:?}");
+        assert!((sub_on.other_t - 0.25).abs() < 1.0e-12, "{sub_on:?}");
     }
 }

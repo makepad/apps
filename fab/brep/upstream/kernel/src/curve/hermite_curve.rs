@@ -41,7 +41,7 @@
 //! - `Evaluate` returns `num_derivs + 1` vectors. Upstream zeroes derivatives
 //!   `4..num_derivs` (exclusive) and leaves entry `num_derivs` (for
 //!   `num_derivs >= 4`) as the caller had it; the port returns zero there too
-//!   (`plan/findings.md`).
+//!   (WR-26).
 //! - `ReadFromDB` always builds a new curve (upstream's "fill the curve passed in"
 //!   branch and its `IsKindOf` check have no counterpart; its type, dimension,
 //!   context and version arguments are unused upstream and dropped). The new curve
@@ -62,17 +62,161 @@
 
 use crate::curve::curve::p2::HERMITE_CURVE_TYPE;
 use crate::error::Result;
+use crate::geom::assert_array::ObjectKey;
 use crate::geom::extent1d::Extent1d;
 use crate::geom::extent3d::Extent3d;
 use crate::geom::geom_utility::p1::segment_point_distance;
 use crate::geom::geom_utility::p2::ContinuityType;
 use crate::geom::polar_box::PolarBox;
 use crate::geom::pseudo_box::PseudoBox;
-use crate::geom::tol::is_zero;
+use crate::geom::tol::{context_zone_tol_3d, is_zero, SmallTopoType};
 use crate::geom::vector2d::{Point2, Vec2};
 use crate::geom::vector3d::{Point3, Vec3};
+use crate::kernel::Kernel;
 use crate::math::{max2, EFF_ZERO, EFF_ZERO_SQ};
+use crate::nurbs::b_spline_curve::p1::BSplineCurve;
+use crate::nurbs::crv_basic::Curve as NurbCurve;
+use crate::nurbs::math::{gamma, CPoint, NOW};
 use crate::topology::database_io::{DatabaseReader, DatabaseWriter, FileType};
+
+/// Bound the distance of an entire cubic Bezier from its finite endpoint segment.
+/// The convex hull property puts every curve point within the larger distance of
+/// the two inner controls to the segment. Unlike distance to the infinite line,
+/// this also bounds overshoot and cubics whose endpoints coincide.
+/// Coordinates must be finite and small enough for segment distance arithmetic.
+#[must_use]
+pub fn cubic_chord_bound([a, c, d, b]: [Point3; 4]) -> f64 {
+    let (c_distance, _) = segment_point_distance(a, b, c);
+    let (d_distance, _) = segment_point_distance(a, b, d);
+    max2(c_distance, d_distance)
+}
+
+/// What a cubic Bezier curve on `[0, 1]`, the curve a profile cubic is built as, stands as in
+/// the model ([`classify_cubic`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CubicStanding {
+    /// The whole curve lies within the model's zone tolerance of the segment between its ends:
+    /// the model cannot tell it from that segment.
+    Chord,
+    /// A curve that passes the B-spline curve check.
+    Curve,
+    /// A curve the B-spline curve check refuses (a speed or a radius of curvature below its
+    /// tolerance, for example), which no body could keep.
+    Refused,
+}
+
+/// [`CubicStanding`] of the cubic Bezier curve through `points` on `[0, 1]`: its chord where
+/// [`cubic_chord_bound`] is at most the model's zone tolerance (the kernel's absolute linear
+/// tolerance, [`ZONE_TOL_3D`](crate::geom::tol::ZONE_TOL_3D) unless the session sets another),
+/// else the verdict of [`BSplineCurve::assert_valid`] on the curve.
+///
+/// # Errors
+///
+/// Those of building the curve and of its check's analyses.
+pub fn classify_cubic(k: &Kernel, points: [Point3; 4]) -> Result<CubicStanding> {
+    if cubic_chord_bound(points) <= context_zone_tol_3d(k, None, SmallTopoType::NormalSize) {
+        return Ok(CubicStanding::Chord);
+    }
+    let poles = points
+        .iter()
+        .map(|p| CPoint::new(p.x, p.y, p.z, NOW))
+        .collect();
+    let nurb = NurbCurve::new(poles, 3, vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0])?;
+    let curve = BSplineCurve::from_nurb(nurb, 3, false);
+    Ok(if curve.assert_valid(k, None, false, ObjectKey(0))? {
+        CubicStanding::Curve
+    } else {
+        CubicStanding::Refused
+    })
+}
+
+/// One piece of a cubic Bezier curve on `[0, 1]` ([`cubic_pieces`]): the cubic Bezier curve
+/// through `points` on `[0, 1]` and what it stands as ([`classify_cubic`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CubicPiece {
+    /// Its four control points.
+    pub points: [Point3; 4],
+    /// What it stands as in the model.
+    pub standing: CubicStanding,
+}
+
+/// The two halves of the cubic Bezier curve through `points`, split at parameter 1/2 by de
+/// Casteljau's construction: together they are the same curve, each again a cubic Bezier
+/// curve on `[0, 1]`.
+fn halve_cubic([a, b, c, d]: [Point3; 4]) -> ([Point3; 4], [Point3; 4]) {
+    let ab = 0.5 * (a + b);
+    let bc = 0.5 * (b + c);
+    let cd = 0.5 * (c + d);
+    let abc = 0.5 * (ab + bc);
+    let bcd = 0.5 * (bc + cd);
+    let mid = 0.5 * (abc + bcd);
+    ([a, ab, abc, mid], [mid, bcd, cd, d])
+}
+
+/// Whether the cubic Bezier curve through `points` runs forward along its chord all the way:
+/// the projections of its control points on the chord direction strictly increase from start to
+/// end. Its derivative along the chord is then a quadratic whose Bernstein coefficients (the
+/// steps between those projections) are all positive, so the curve never stops or turns back,
+/// and the next piece cannot fold back over it.
+fn runs_along_chord([a, b, c, d]: [Point3; 4]) -> bool {
+    let along = d - a;
+    let (pb, pc, pd) = ((b - a).dot(along), (c - a).dot(along), (d - a).dot(along));
+    0.0 < pb && pb < pc && pc < pd
+}
+
+/// The cubic Bezier curve through `points` on `[0, 1]` as pieces the model can keep, in order
+/// from its start: the whole curve when [`classify_cubic`] does not refuse it. A curve the
+/// B-spline curve check refuses (#16190: a bend whose radius is below the check's tolerance,
+/// which is relative to the curve's own size) is split exactly at parameter 1/2, and each refused
+/// half again, until every piece is either a curve the check passes or lies within the zone
+/// tolerance of its chord ([`CubicStanding::Chord`]). The pieces are the same curve, except that
+/// a chord piece is its chord, as the model cannot tell them apart.
+///
+/// The whole curve is returned as [`CubicStanding::Refused`] when no such split exists: when a
+/// chord piece has its ends within the zone tolerance of each other (a point, which cannot be an
+/// edge: a curve refused at a zero-speed end keeps a refused piece there at every split down to
+/// that size), when a chord piece does not run forward along its chord ([`runs_along_chord`]: a
+/// curve that stops and turns back would become lines folded over each other), or when a piece
+/// would be split more often than a parameter on `[0, 1]` resolves
+/// (`f64::MANTISSA_DIGITS` halvings).
+///
+/// # Errors
+///
+/// Those of [`classify_cubic`] on the curve or a piece.
+pub fn cubic_pieces(k: &Kernel, points: [Point3; 4]) -> Result<Vec<CubicPiece>> {
+    let standing = classify_cubic(k, points)?;
+    let whole = vec![CubicPiece { points, standing }];
+    if standing != CubicStanding::Refused {
+        return Ok(whole);
+    }
+    let zone = context_zone_tol_3d(k, None, SmallTopoType::NormalSize);
+    let mut pieces = Vec::new();
+    // The pieces still to classify, with their number of halvings; the next one last.
+    let (first, second) = halve_cubic(points);
+    let mut pending = vec![(second, 1u32), (first, 1u32)];
+    while let Some((piece, depth)) = pending.pop() {
+        let standing = classify_cubic(k, piece)?;
+        let [start, _, _, end] = piece;
+        match standing {
+            CubicStanding::Refused => {
+                if depth >= f64::MANTISSA_DIGITS {
+                    return Ok(whole);
+                }
+                let (first, second) = halve_cubic(piece);
+                pending.push((second, depth + 1));
+                pending.push((first, depth + 1));
+            }
+            CubicStanding::Chord if (end - start).length() <= zone || !runs_along_chord(piece) => {
+                return Ok(whole)
+            }
+            CubicStanding::Chord | CubicStanding::Curve => pieces.push(CubicPiece {
+                points: piece,
+                standing,
+            }),
+        }
+    }
+    Ok(pieces)
+}
 
 /// A cubic Hermite curve on `[0, 1]` (`SmHermiteCurve`):
 ///
@@ -297,8 +441,16 @@ impl HermiteCurve {
     /// `1.1 * EFF_ZERO * (1 + max |coordinate of the position|)` is replaced by the
     /// second derivative scaled to that length (negated in the upper half of the
     /// domain), when the second derivative is longer than that.
-    #[must_use]
-    pub fn evaluate(&self, param: f64, num_derivs: usize, non_zero_tangents: bool) -> Vec<Vec3> {
+    ///
+    /// # Errors
+    /// Returns invalid input when the derivative order exceeds the curve evaluation bound.
+    pub fn evaluate(
+        &self,
+        param: f64,
+        num_derivs: usize,
+        non_zero_tangents: bool,
+    ) -> Result<Vec<Vec3>> {
+        crate::curve::check_eval_derivs(num_derivs, "curve::hermite_curve::evaluate")?;
         // Derivatives above the third stay zero.
         let mut out = vec![Vec3::ZERO; num_derivs.saturating_add(1)];
 
@@ -341,7 +493,7 @@ impl HermiteCurve {
                     // make sure 2nd order derivatives are available
                     if num_derivs < 2 {
                         // recurse so the next section sets the 1st derivative
-                        let vals = self.evaluate(param, 2, true);
+                        let vals = self.evaluate(param, 2, true)?;
 
                         // save the 1st derivative
                         if let (Some(o), Some(v)) = (out.get_mut(1), vals.get(1)) {
@@ -370,7 +522,7 @@ impl HermiteCurve {
                 }
             }
         }
-        out
+        Ok(out)
     }
 
     /// The point at `param` (`EvaluatePoint`).
@@ -384,6 +536,62 @@ impl HermiteCurve {
         a + u * (b + u * (c + u * d))
     }
 
+    /// Not upstream: the error bound of each coordinate of [`Self::evaluate_point`] at
+    /// `param`. Each coordinate is a Horner evaluation of a cubic (six roundings), off by
+    /// at most `γ_6 (|a| + |u| |b| + u^2 |c| + |u|^3 |d|)` (Higham, Horner's rule); with
+    /// `|.|` the largest coordinate, widened to `γ_8` for the bound's own roundings.
+    /// `None` for numbers not finite.
+    #[must_use]
+    pub(crate) fn point_error(&self, param: f64) -> Option<f64> {
+        let size = |v: Vec3| v.x.abs().max(v.y.abs()).max(v.z.abs());
+        let u = param.abs();
+        let e = gamma(8)
+            * (size(self.p1) + u * (size(self.d1) + u * (size(self.c) + u * size(self.d))));
+        e.is_finite().then_some(e)
+    }
+
+    /// Not upstream: an upper bound on the speed `|H'(t)|` for `t` in `interval`, from the
+    /// power basis (no sampling). `H' = q(t) = D1 + 2 C t + 3 D t^2` is a quadratic: on
+    /// `[lo, hi]` its Bernstein coefficients are `q(lo)`, `q(lo) + (hi - lo) q'(lo) / 2`
+    /// and `q(hi)` (`q' = 2 C + 6 D t`), and `q` lies in their convex hull, so the largest
+    /// norm bounds `|H'|`. Rounding: each coefficient is a short sum of products (at most
+    /// twelve roundings per coordinate), so it is within `γ_12` of the sum of its terms'
+    /// magnitudes, `T = |D1| + 2 |C| M + 3 |D| M^2 + (hi - lo) (|C| + 3 |D| M)` with `M =
+    /// max(|lo|, |hi|)`; a norm is within `√3 < 2` times a coordinate's error, so `2 γ_12
+    /// T` is added. `None` for numbers not finite.
+    #[must_use]
+    pub(crate) fn speed_bound(&self, interval: &Extent1d) -> Option<f64> {
+        let (lo, hi) = (interval.min(), interval.max());
+        let q = |t: f64| self.d1 + 2.0 * t * self.c + 3.0 * t * t * self.d;
+        let dq = |t: f64| 2.0 * self.c + 6.0 * t * self.d;
+        let b0 = q(lo);
+        let b1 = b0 + 0.5 * (hi - lo) * dq(lo);
+        let b2 = q(hi);
+        let m = lo.abs().max(hi.abs());
+        let (c, d) = (self.c.length(), self.d.length());
+        let terms =
+            self.d1.length() + 2.0 * c * m + 3.0 * d * m * m + (hi - lo) * (c + 3.0 * d * m);
+        let b = b0.length().max(b1.length()).max(b2.length()) + 2.0 * gamma(12) * terms;
+        (b.is_finite() && lo <= hi).then_some(b * (1.0 + gamma(4)))
+    }
+
+    /// Not upstream: an upper bound on the acceleration `|H''(t)|` for `t` in `interval`,
+    /// from the power basis (no sampling). `H'' = 2 C + 6 D t` is affine in `t`, so its
+    /// norm is largest at an end of `interval` (a norm is convex). Rounding: each
+    /// coordinate is a sum of two products (three roundings), within `γ_3 (2 |C| + 6 |D|
+    /// M)` with `M = max(|lo|, |hi|)`; a norm is within `√3 < 2` times a coordinate's
+    /// error, and the norm's own rounding is covered by widening by `1 + γ_4`. `None` for
+    /// numbers not finite.
+    #[must_use]
+    pub(crate) fn accel_bound(&self, interval: &Extent1d) -> Option<f64> {
+        let (lo, hi) = (interval.min(), interval.max());
+        let a = |t: f64| 2.0 * self.c + 6.0 * t * self.d;
+        let m = lo.abs().max(hi.abs());
+        let slack = 2.0 * gamma(3) * (2.0 * self.c.length() + 6.0 * self.d.length() * m);
+        let b = (a(lo).length().max(a(hi).length()) * (1.0 + gamma(4)) + slack) * (1.0 + gamma(4));
+        (b.is_finite() && lo <= hi).then_some(b)
+    }
+
     /// Largest distance from the chord to the inner Bezier control points, or the
     /// control polygon length for a closed curve (`ComputeChordHeight`).
     #[must_use]
@@ -393,9 +601,7 @@ impl HermiteCurve {
         if self.p1.distance_squared(self.p2) < EFF_ZERO_SQ {
             self.p1.distance(pnt1) + pnt1.distance(pnt2) + pnt2.distance(self.p2)
         } else {
-            let (dist, _) = segment_point_distance(self.p1, self.p2, pnt1);
-            let (dist2, _) = segment_point_distance(self.p1, self.p2, pnt2);
-            max2(dist, dist2)
+            cubic_chord_bound([self.p1, pnt1, pnt2, self.p2])
         }
     }
 
@@ -533,7 +739,73 @@ impl HermiteCurve {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cubic_chord_bound_covers_closed_and_overshooting_control_hulls() {
+        let p = |x, y, z| Point3::new(x, y, z);
+        assert_eq!(
+            cubic_chord_bound([p(0., 0., 0.), p(1., 2., 0.), p(2., -1., 0.), p(3., 0., 0.)]),
+            2.
+        );
+        assert_eq!(
+            cubic_chord_bound([p(0., 0., 0.), p(-2., 0., 0.), p(4., 0., 0.), p(3., 0., 0.)]),
+            2.
+        );
+        assert_eq!(
+            cubic_chord_bound([p(0., 0., 0.), p(0., 3., 0.), p(0., 0., 4.), p(0., 0., 0.)]),
+            4.
+        );
+        assert_eq!(cubic_chord_bound([p(1., 2., 3.); 4]), 0.);
+    }
+
+    #[test]
+    fn hermite_trait_rejects_order_above_evaluation_bound() {
+        use crate::curve::curve::p2::CurveEvaluate;
+        let h = HermiteCurve::new(Vec3::ZERO, Vec3::X, Vec3::X, Vec3::X, 3);
+        let result = CurveEvaluate::evaluate(&h, &Kernel::default(), 0.5, 65, false, false);
+        assert!(matches!(
+            result,
+            Err(crate::error::SolidError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
+    fn hermite_direct_bound_and_values() {
+        use crate::error::SolidError;
+        let k = Kernel::default();
+        for tangent in [Vec3::X, Vec3::ZERO] {
+            let h = HermiteCurve::new(Vec3::ZERO, tangent, Vec3::new(2.0, 3.0, 4.0), Vec3::X, 3);
+            for nonzero in [false, true] {
+                let full = h.evaluate(0.0, 64, nonzero).unwrap();
+                assert_eq!(full.len(), 65);
+                assert!(full[4..].iter().all(|v| *v == Vec3::ZERO));
+                for n in [0, 1, 2, 3, 5] {
+                    let values = h.evaluate(0.0, n, nonzero).unwrap();
+                    for (a, b) in values.iter().zip(&full) {
+                        assert_eq!(
+                            (a.x.to_bits(), a.y.to_bits(), a.z.to_bits()),
+                            (b.x.to_bits(), b.y.to_bits(), b.z.to_bits())
+                        );
+                    }
+                }
+                for n in [65, usize::MAX] {
+                    assert!(matches!(
+                        h.evaluate(0.0, n, nonzero),
+                        Err(SolidError::InvalidInput { .. })
+                    ));
+                    assert!(matches!(
+                        Curve::from(h).evaluate(&k, 0.0, n, false, nonzero),
+                        Err(SolidError::InvalidInput {
+                            operation: "curve::curve::p2::Curve::evaluate",
+                            ..
+                        })
+                    ));
+                }
+            }
+        }
+    }
     use super::*;
+    use crate::curve::curve::Curve;
+    use crate::kernel::Kernel;
 
     fn sample() -> HermiteCurve {
         HermiteCurve::new(
@@ -575,9 +847,9 @@ mod tests {
         let h = sample();
         assert_eq!(h.evaluate_point(0.0), h.start_point());
         assert_eq!(h.evaluate_point(1.0), h.end_point());
-        let e = h.evaluate(1.0, 1, false);
+        let e = h.evaluate(1.0, 1, false).unwrap();
         assert_eq!(e[1], h.end_derivative());
-        let e = h.evaluate(0.0, 5, false);
+        let e = h.evaluate(0.0, 5, false).unwrap();
         assert_eq!(e.len(), 6);
         assert_eq!(e[1], h.start_derivative());
         assert_eq!(e[4], Vec3::ZERO);
@@ -618,9 +890,9 @@ mod tests {
     fn zero_tangent_is_fixed() {
         // D1 = 0: the tangent at 0 is replaced by a tiny vector along H''(0).
         let h = HermiteCurve::new(Vec3::ZERO, Vec3::ZERO, Vec3::X, Vec3::X, 3);
-        let e = h.evaluate(0.0, 1, true);
+        let e = h.evaluate(0.0, 1, true).unwrap();
         assert!(e[1].length() > 0.0 && e[1].x > 0.0);
-        assert_eq!(h.evaluate(0.0, 1, false)[1], Vec3::ZERO);
+        assert_eq!(h.evaluate(0.0, 1, false).unwrap()[1], Vec3::ZERO);
     }
 
     #[test]
@@ -658,5 +930,85 @@ mod tests {
         assert_eq!(h.start_point(), Vec3::new(1.0, 2.0, 3.0));
         assert_eq!(h.power_basis().1, Vec3::new(3.0, 3.0, 3.0));
         assert_eq!(h.dim(), 3);
+    }
+
+    #[test]
+    fn wr26_evaluate_zeroes_all_higher_derivative_slots_including_last() {
+        let p1 = Vec3::new(1.0, -2.0, 0.5);
+        let d1 = Vec3::new(2.5, 1.0, -3.0);
+        let p2 = Vec3::new(-1.5, 4.0, 2.0);
+        let d2 = Vec3::new(-0.5, 3.0, 1.25);
+        let h = HermiteCurve::new(p1, d1, p2, d2, 3);
+        let (c, d) = h.power_basis();
+        assert!(c.x != 0.0 && c.y != 0.0 && c.z != 0.0);
+        assert!(d.x != 0.0 && d.y != 0.0 && d.z != 0.0);
+
+        for u in [0.0, 0.35, 0.7, 1.0] {
+            let expected_0 = p1 + u * (d1 + u * (c + u * d));
+            let expected_1 = d1 + u * (2.0 * c + 3.0 * u * d);
+            let expected_2 = 2.0 * c + 6.0 * u * d;
+            let expected_3 = 6.0 * d;
+
+            for num_derivs in [4, 5, 6, 10] {
+                for non_zero_tangents in [false, true] {
+                    let out = h.evaluate(u, num_derivs, non_zero_tangents).unwrap();
+                    assert_eq!(out.len(), num_derivs + 1);
+                    assert_eq!(out[0], expected_0);
+                    assert_eq!(out[1], expected_1);
+                    assert_eq!(out[2], expected_2);
+                    assert_eq!(out[3], expected_3);
+                    assert_eq!(out[num_derivs], Vec3::ZERO);
+                    for (k, &deriv) in out.iter().enumerate().skip(4) {
+                        assert_eq!(deriv, Vec3::ZERO, "non-zero derivative at order {k}");
+                    }
+                }
+            }
+        }
+
+        // Zero start tangent at u = 0 with non_zero_tangents = true exercises the
+        // second-derivative fallback branch while still zero-filling orders 4..=num_derivs.
+        let h_zero_start = HermiteCurve::new(p1, Vec3::ZERO, p2, d2, 3);
+        let (c0, d0) = h_zero_start.power_basis();
+        let scaled_zero = EFF_ZERO * (1.0 + p1.max_dimension());
+        let new_len = 1.1 * scaled_zero;
+        let second = 2.0 * c0;
+        let expected_fixed_d1 = (new_len / second.length()) * second;
+        for num_derivs in [4, 5, 6, 10] {
+            let out = h_zero_start.evaluate(0.0, num_derivs, true).unwrap();
+            assert_eq!(out.len(), num_derivs + 1);
+            assert_eq!(out[0], p1);
+            assert_eq!(out[1], expected_fixed_d1);
+            assert!(out[1].length() > 0.0);
+            assert_eq!(out[2], second);
+            assert_eq!(out[3], 6.0 * d0);
+            assert_eq!(out[num_derivs], Vec3::ZERO);
+            for (k, &deriv) in out.iter().enumerate().skip(4) {
+                assert_eq!(deriv, Vec3::ZERO, "non-zero derivative at order {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn wr26_curve_dispatch_preserves_zero_last_slot() {
+        let h = HermiteCurve::new(
+            Vec3::new(1.0, -2.0, 0.5),
+            Vec3::new(2.5, 1.0, -3.0),
+            Vec3::new(-1.5, 4.0, 2.0),
+            Vec3::new(-0.5, 3.0, 1.25),
+            3,
+        );
+        let curve = Curve::from(h);
+        let k = Kernel::default();
+        let out = curve.evaluate(&k, 0.4, 5, true, false).unwrap();
+        assert_eq!(out.len(), 6);
+        assert_eq!(&out[..4], h.evaluate(0.4, 3, false).unwrap().as_slice());
+        assert_eq!(out[4], Vec3::ZERO);
+        assert_eq!(out[5], Vec3::ZERO);
+
+        let mut buf = [Vec3::UNDEF; 6];
+        curve.evaluate_into(&k, 0.4, true, false, &mut buf).unwrap();
+        assert_eq!(buf.as_slice(), out.as_slice());
+        assert_eq!(buf[4], Vec3::ZERO);
+        assert_eq!(buf[5], Vec3::ZERO);
     }
 }

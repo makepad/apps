@@ -29,7 +29,7 @@
 //!
 //! Deviations:
 //! - `SmStatus` returns become `Result<()>`: `SM_ERR` is
-//!   `SolidError::Upstream { code: 1001 }`, `SM_ERR_INVALID_INPUT` is
+//!   a [`GeomFailure`](crate::error::geom::GeomFailure) with status 1001, `SM_ERR_INVALID_INPUT` is
 //!   [`SolidError::InvalidInput`]. [`PeriodicExtent1d::add_interval`] leaves the extent
 //!   unchanged on error (as upstream). [`PeriodicExtent1d::set_min_max`] updates the
 //!   extent even when it returns `InvalidInput`, exactly as upstream does.
@@ -41,15 +41,16 @@
 //! - Only the functions owned by unit `geom.periodic_extent1d` are ported; the rest of
 //!   the class (`Invert`, `AddValue`, `Union`, `Intersect`, `Subtract`, the 3-argument
 //!   constructor, ...) is unused upstream.
+//! - `add_interval` adding to an empty extent sets `min = from`, `max = to` and
+//!   `full_period = false` unless the interval spans the full period (WR-6); upstream
+//!   reads the empty extent's own `max - min` and takes the full period.
 
 use core::cmp::Ordering;
 
+use crate::error::geom::GeomFailure;
 use crate::error::{Result, SolidError};
 use crate::geom::tol::{self, ScaledZero};
 use crate::math::BIG_DOUBLE;
-
-/// Upstream `SM_ERR` (generic error status).
-const SM_ERR: i32 = 1001;
 
 /// An interval on the periodic domain `[0, period]` (`SmPeriodicExtent1d`).
 ///
@@ -85,15 +86,6 @@ enum SeamCase {
 fn is_contained(c: f64, a: f64, b: f64) -> bool {
     let tz = tol::scaled_zero2(&a, &b);
     ((a <= c + tz) && (c - tz <= b)) || ((b <= c + tz) && (c - tz <= a))
-}
-
-/// `SM_ERR` from `operation`.
-fn sm_err(operation: &'static str) -> SolidError {
-    SolidError::Upstream {
-        operation,
-        code: SM_ERR,
-        entity: None,
-    }
 }
 
 impl PeriodicExtent1d {
@@ -227,11 +219,12 @@ impl PeriodicExtent1d {
 
     /// Extends the extent to include the span from `from` to `to`, moving forward
     /// (increasing, across the seam if needed) when `forward`, else backward
-    /// (`AddInterval`).
+    /// (`AddInterval`). Adding to an empty extent sets `min = from`, `max = to` and
+    /// `full_period = false` (WR-6) unless the interval already spans the full period.
     ///
     /// # Errors
     ///
-    /// `SolidError::Upstream { code: 1001 }` (`SM_ERR`) when `from` or `to` is outside
+    /// a [`GeomFailure`](crate::error::geom::GeomFailure) with status 1001 (`SM_ERR`) when `from` or `to` is outside
     /// `[0, period]`, or when the span is disjoint from the extent (the union is not an
     /// interval). The extent is unchanged then.
     pub fn add_interval(&mut self, from: f64, to: f64, forward: bool) -> Result<()> {
@@ -240,7 +233,14 @@ impl PeriodicExtent1d {
 
         // check input
         if !is_contained(from, 0.0, self.period) || !is_contained(to, 0.0, self.period) {
-            return Err(sm_err(OP));
+            return Err(SolidError::geom(
+                OP,
+                GeomFailure::SpanOutsidePeriod {
+                    from,
+                    to,
+                    period: self.period,
+                },
+            ));
         }
 
         // when forward is false, swap [from to] to make all cases forward
@@ -261,14 +261,9 @@ impl PeriodicExtent1d {
 
         // empty sets
         if self.is_empty() {
-            self.full_period = (self.period - (self.max - self.min).abs()) < sz;
-            if self.full_period {
-                self.min = 0.0;
-                self.max = self.period;
-            } else {
-                self.min = from;
-                self.max = to;
-            }
+            self.min = from;
+            self.max = to;
+            self.full_period = false;
             return Ok(());
         }
 
@@ -293,7 +288,13 @@ impl PeriodicExtent1d {
             SeamCase::Neither => {
                 // disjoint cases
                 if (to < self.min - sz) || (from > self.max + sz) {
-                    return Err(sm_err(OP));
+                    return Err(SolidError::geom(
+                        OP,
+                        GeomFailure::Disjoint {
+                            a: [self.min, self.max],
+                            b: [from, to],
+                        },
+                    ));
                 }
                 if from < self.min {
                     self.min = from;
@@ -305,11 +306,20 @@ impl PeriodicExtent1d {
             SeamCase::SpanOnly => {
                 // disjoint case
                 if (from > self.max + sz) && (to < self.min - sz) {
+                    // the extent and the span as the caller gave them (case 2 swapped them)
+                    let (extent, span) = if swapped {
+                        ([from, to], [self.min, self.max])
+                    } else {
+                        ([self.min, self.max], [from, to])
+                    };
                     if swapped {
                         self.min = from;
                         self.max = to;
                     }
-                    return Err(sm_err(OP));
+                    return Err(SolidError::geom(
+                        OP,
+                        GeomFailure::Disjoint { a: extent, b: span },
+                    ));
                 }
                 // full case
                 if (from < self.max + sz) && (to > self.min - sz) {
@@ -606,10 +616,11 @@ mod tests {
         let mut e = pe(0.2, 0.4);
         e.add_interval(0.0, 1.0, true).unwrap();
         assert!(e.is_full_period());
-        // empty extent becomes full (upstream quirk)
+        // an empty extent takes the interval (WR-6; upstream: the full period)
         let mut e = empty(1.0);
         e.add_interval(0.2, 0.3, true).unwrap();
-        assert!(e.is_full_period());
+        assert!(!e.is_full_period());
+        assert_eq!((e.min(), e.max()), (0.2, 0.3));
     }
 
     #[test]
@@ -643,5 +654,44 @@ mod tests {
         assert!((pe(0.8, 0.1).mid() - 0.95).abs() < 1e-15);
         assert!((pe(0.9, 0.2).mid() - 0.05).abs() < 1e-15);
         assert_eq!(empty(1.0).mid(), 0.0);
+    }
+
+    #[test]
+    fn wr6_empty_add_interval_sets_exact_interval() {
+        let mut e = empty(1.0);
+        e.add_interval(0.2, 0.3, true).unwrap();
+        assert!(!e.is_full_period());
+        assert!(!e.is_empty());
+        assert_eq!((e.min(), e.max()), (0.2, 0.3));
+
+        e.add_interval(0.3, 0.6, true).unwrap();
+        assert_eq!((e.min(), e.max()), (0.2, 0.6));
+    }
+
+    #[test]
+    fn wr6_empty_add_interval_crossing_seam() {
+        let mut e = empty(1.0);
+        e.add_interval(0.8, 0.2, true).unwrap();
+        assert!(!e.is_full_period());
+        assert!(!e.is_empty());
+        assert!(e.crosses_seam());
+        assert_eq!((e.min(), e.max()), (0.8, 0.2));
+    }
+
+    #[test]
+    fn wr6_empty_add_interval_backward() {
+        let mut e = empty(1.0);
+        e.add_interval(0.5, 0.2, false).unwrap();
+        assert!(!e.is_full_period());
+        assert!(!e.is_empty());
+        assert_eq!((e.min(), e.max()), (0.2, 0.5));
+    }
+
+    #[test]
+    fn wr6_empty_add_interval_full_period_span() {
+        let mut e = empty(1.0);
+        e.add_interval(0.0, 1.0, true).unwrap();
+        assert!(e.is_full_period());
+        assert_eq!((e.min(), e.max()), (0.0, 1.0));
     }
 }

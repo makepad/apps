@@ -43,7 +43,7 @@
 //!   not checked; where upstream then dereferences a null pointer (a loop without loop
 //!   use, a loop use without face use or mate, an edge use without edge or curve, ...)
 //!   the port returns [`SolidError::InvalidInput`]. `NER` / `SER` returns are
-//!   [`SolidError::Upstream`] (`SM_ERR_NULL_POINTER`, `SM_ERR`). `FlipLoopOrientation`
+//!   a [`TopologyFailure`](crate::error::topology::TopologyFailure) (`SM_ERR_NULL_POINTER`, `SM_ERR`). `FlipLoopOrientation`
 //!   reads the mate's start as the same kind as the loop use's own (an edge use read
 //!   as a vertex use, or the reverse, is undefined behaviour upstream) and swaps the
 //!   owner of vertex uses that are loop vertex uses; any other combination is
@@ -57,16 +57,19 @@
 //!   after visiting more edge uses than the B-rep holds (upstream loops forever on a
 //!   CCW chain that does not return to its start). `CollectEdgeuses` keeps upstream's
 //!   own bound (`SM_ERR` after 100000 steps).
-//! - **`IsClosed3d`** computes `dOverTol = XSectTol3d - Gap`, which is negative for a
-//!   gap over tolerance, and keeps it only when it exceeds `0.0`: no gap ever counts as
-//!   over tolerance, the loop is always reported closed (with the largest gap), and
-//!   `bCheckAllGaps == FALSE` only stops the scan at the first gap over tolerance.
-//!   Ported as is (`plan/upstream-issues.md`). The tolerances keep the
-//!   `SmZoneTol3d` / `SmXSectTol3d` value semantics (`fabs`, `SM_USE_DEFAULT`; see
-//!   [`tol::zone_tol3d`]), which is why it takes the [`Kernel`]. The edge curve evaluations' statuses
-//!   are ignored as upstream (a failed evaluation keeps the previous point, initially
-//!   [`Vec3::UNDEF`]); [`SolidError::Unported`] still propagates. `SmLoop::IsClosed3d`
-//!   of a loop without loop use returns `None` (closed, outputs not written).
+//! - **`IsClosed3d` (WR-93).** Upstream computes `dOverTol = XSectTol3d - Gap`, which
+//!   is negative for a gap over tolerance, and keeps it only when it exceeds `0.0`:
+//!   no gap ever counts as over tolerance, so the loop is always reported closed (with
+//!   the largest gap). The port computes `Gap - XSectTol3d`, so an
+//!   over-tolerance gap is reported open with its edge use, actual gap and tolerance;
+//!   `bCheckAllGaps == FALSE` still stops the scan at the first over-tolerance gap,
+//!   while `TRUE` keeps the largest tolerance exceedance (the first on a tie). The
+//!   tolerances keep the `SmZoneTol3d` / `SmXSectTol3d` value semantics (`fabs`,
+//!   `SM_USE_DEFAULT`; see [`tol::zone_tol3d`]), which is why it takes the [`Kernel`].
+//!   The edge curve evaluations' statuses are ignored as upstream (a failed evaluation
+//!   keeps the previous point, initially [`Vec3::UNDEF`]); [`SolidError::Unported`]
+//!   still propagates. `SmLoop::IsClosed3d` of a loop without loop use returns `None`
+//!   (closed, outputs not written).
 //! - **`IsMissingSeamAtVertices`** ignores `ComputeUVSector`'s status, as upstream, and
 //!   reads the missing-seam flags of the sector it returns.
 //! - **`SmFace::Notify`** (the `PRE_EDIT` / `POST_EDIT` around `FlipLoopOrientation` of
@@ -83,11 +86,15 @@
 //! - **Prepared queries.** The shared UV-corner walk can also borrow prepared topology
 //!   without mutation. It reports [`SolidError::Unported`] only if a trim curve needs
 //!   creating at the point where the mutable walk would create it.
-//! - **UV-corner failures (WR-262, #521).** By default `GetUVCornerBoundaries` ignores
-//!   failed endpoint evaluations and point drops, as upstream (an edge use can reuse
-//!   the preceding one's endpoints). With the opt-in
-//!   `Kernel::fixes.topology_failed_evaluations_propagate` they propagate and an
-//!   unsuccessful drop returns `SM_ERR`.
+//! - **Local vertex zones (WR-381, not upstream).** `IsClosed3d` includes the
+//!   uncertainty of a shared
+//!   junction vertex when both curve ends meet that vertex within their own zones.
+//!   An unrelated vertex or an endpoint outside those bounds cannot close a gap.
+//! - **UV-corner failures (WR-262, #521).** `GetUVCornerBoundaries` does as the fork
+//!   (tangency-labs/smlib 7a35f33): a trim curve that cannot be made is none (the 3D
+//!   ends are dropped), an edge use whose ends cannot be evaluated adds no boundary,
+//!   and failed drops stay ignored. Upstream ignores the failed endpoint evaluations
+//!   as well, so there an edge use can reuse the preceding one's endpoints.
 //! - The `std::unordered_set` overloads of `GetEdges` / `GetVertices`,
 //!   `GetEdgeusesAndVertexuses`, `CalculateBoundingBox`, `GetTurningAngDeg`,
 //!   `SmLoop::GetMaxSameDimGap3d`, `IsLamina`, `IsManifold`,
@@ -98,7 +105,8 @@ use std::collections::BTreeSet;
 use std::ops::Deref;
 
 use crate::curve::curve::Curve;
-use crate::error::{EntityRef, Result, SolidError};
+use crate::error::topology::TopologyFailure;
+use crate::error::{EntityRef, Failure, Result, SolidError, SM_ERR_NULL_POINTER};
 use crate::geom::attribute::{AttributeStore, ObjectKey};
 use crate::geom::extent1d::Extent1d;
 use crate::geom::extent2d::{Extent2d, SS_NONE};
@@ -186,7 +194,7 @@ fn prepared_trim(
     Ok(b.edgeuse(eu)?
         .drop_curve_fail
         .as_deref()
-        .is_none_or(|f| f.fail_status == crate::intersect::surface_drop_lib::p1::SM_SUCCESS))
+        .is_none_or(|f| f.fail_status == crate::error::SM_SUCCESS))
 }
 
 /// `SmLoopuse_TYPE` (`TOPO_BASE_TYPE + 4`).
@@ -381,7 +389,7 @@ pub fn shell(b: &Brep, lu: LoopuseId) -> Result<Option<ShellId>> {
 ///
 /// # Errors
 ///
-/// [`SolidError::Upstream`] (`SM_ERR`) as above; [`SolidError::NotFound`] for a
+/// a [`TopologyFailure`](crate::error::topology::TopologyFailure) (`SM_ERR`) as above; [`SolidError::NotFound`] for a
 /// dangling id.
 pub fn set_edgeuse(b: &mut Brep, lu: LoopuseId, eu: Option<EdgeuseId>) -> Result<()> {
     if is_edge_loopuse(b, lu)? {
@@ -392,7 +400,10 @@ pub fn set_edgeuse(b: &mut Brep, lu: LoopuseId, eu: Option<EdgeuseId>) -> Result
             }
         }
     }
-    Err(SolidError::sm_err(OP))
+    Err(SolidError::topology(
+        OP,
+        TopologyFailure::EdgeUseNotOnLoopUse,
+    ))
 }
 
 /// `CollectEdgeuses`: makes the loop use an edge loop use starting at `eu` and walks
@@ -401,12 +412,12 @@ pub fn set_edgeuse(b: &mut Brep, lu: LoopuseId, eu: Option<EdgeuseId>) -> Result
 ///
 /// # Errors
 ///
-/// [`SolidError::Upstream`] `SM_ERR_NULL_POINTER` for a null `eu` or a CCW list that
+/// a [`TopologyFailure`](crate::error::topology::TopologyFailure) `SM_ERR_NULL_POINTER` for a null `eu` or a CCW list that
 /// ends (the edge uses walked so far stay updated) and `SM_ERR` after
 /// 100000 steps; [`SolidError::NotFound`] for a dangling id.
 pub fn collect_edgeuses(b: &mut Brep, lu: LoopuseId, eu: Option<EdgeuseId>) -> Result<()> {
     // check state - input must be NonNULL
-    let start = eu.ok_or_else(|| SolidError::null_pointer(OP))?;
+    let start = eu.ok_or_else(|| SolidError::topology(OP, TopologyFailure::NoStartEdgeUse))?;
 
     // local
     let mut count: u64 = 0;
@@ -419,7 +430,16 @@ pub fn collect_edgeuses(b: &mut Brep, lu: LoopuseId, eu: Option<EdgeuseId>) -> R
     loop {
         // check state - Edgeuse must be NonNULL
         let Some(this) = cur else {
-            return Err(SolidError::null_pointer(OP));
+            return Err(Failure::new(
+                OP,
+                TopologyFailure::Defect {
+                    why: "an edge use reached on the walk round the loop has no \
+                        counter-clockwise neighbour; the kernel links the edge uses of \
+                        a loop into a closed ring before it collects them",
+                },
+            )
+            .with_status(SM_ERR_NULL_POINTER)
+            .into_error());
         };
 
         // set pEdgeuse useType to SmLoopuse_TYPE and its BackPtr to this Loopuse
@@ -437,7 +457,12 @@ pub fn collect_edgeuses(b: &mut Brep, lu: LoopuseId, eu: Option<EdgeuseId>) -> R
         // reality check - error past 100k edges
         count += 1;
         if count > MAX_COLLECT_STEPS {
-            return Err(SolidError::sm_err(OP));
+            return Err(SolidError::topology(
+                OP,
+                TopologyFailure::LoopTooLong {
+                    limit: MAX_COLLECT_STEPS,
+                },
+            ));
         }
     }
 
@@ -669,15 +694,68 @@ fn edgeuse_end_point(
     let t = if same == start { ivl.min() } else { ivl.max() };
     match curve.evaluate_point(k, t) {
         Ok(p) => Ok(p),
-        Err(e) if e.is_unported() => Err(e),
+        Err(e) if e.is_unported_or_cancelled() => Err(e),
         Err(_) => Ok(prev),
     }
 }
 
+/// The vertex shared by the end of `previous` and the start of `next`.
+pub(crate) fn junction_vertex(
+    b: &Brep,
+    previous: EdgeuseId,
+    next: EdgeuseId,
+) -> Result<Option<VertexId>> {
+    let Some(mate) = eu1::mate(b, previous)? else {
+        return Ok(None);
+    };
+    let Some(end_use) = eu1::vertexuse(b, mate)? else {
+        return Ok(None);
+    };
+    let Some(start_use) = eu1::vertexuse(b, next)? else {
+        return Ok(None);
+    };
+    let end = vu1::vertex(b, end_use)?;
+    let start = vu1::vertex(b, start_use)?;
+    Ok(end.filter(|v| Some(*v) == start))
+}
+
+/// The edge/edge bound, enlarged only when both endpoints meet their shared
+/// vertex within their individual edge and vertex zones.
+pub(crate) fn junction_tolerance(
+    k: &Kernel,
+    b: &Brep,
+    previous: EdgeuseId,
+    next: EdgeuseId,
+    endpoints: [Point3; 2],
+    zones: [f64; 2],
+) -> Result<f64> {
+    let [end, start] = endpoints;
+    let [end_zone, start_zone] = zones;
+    let edge_limit = tol::xsect_tol_3d_from_zones(k, end_zone, start_zone);
+    let shared_vertex = if end.distance_squared(start) > edge_limit * edge_limit {
+        junction_vertex(b, previous, next)?
+    } else {
+        None
+    };
+    if let Some(v) = shared_vertex {
+        let vertex = b.vertex(v)?;
+        let radius = tol::zone_tol3d(k, vertex.tolerance);
+        if end.distance(vertex.point) <= radius + end_zone
+            && start.distance(vertex.point) <= radius + start_zone
+        {
+            return Ok(edge_limit + 2.0 * radius);
+        }
+    }
+    Ok(edge_limit)
+}
+
 /// `IsClosed3d`: whether every gap between an edge use's end and its CCW neighbour's
 /// start is within their cross-section tolerance (`ZoneTol3d + ZoneTol3d`), with the
-/// gap reported; `true` for a vertex loop use (outputs zero). See the module docs for
-/// upstream's over-tolerance test, which never fires.
+/// gap reported; `true` for a vertex loop use (outputs zero). The local vertex zone
+/// also bounds a junction when both ends meet the same vertex within their individual
+/// edge and vertex zones (WR-381). No stored tolerance is changed. The over-tolerance
+/// test is `Gap - XSectTol3d > 0` and an over-tolerance gap is reported open; upstream's
+/// `XSectTol3d - Gap > 0` never fires and so always reports closed (WR-93).
 ///
 /// # Errors
 ///
@@ -727,8 +805,17 @@ pub fn is_closed_3d(k: &Kernel, b: &Brep, lu: LoopuseId, check_all_gaps: bool) -
         // ThisEndPoint to NextStartPoint gap
         let gap_3d_sq = this_end_point.distance_squared(next_start_point);
 
-        // EdgeEnd/EdgeEnd tolerance
-        let xsect_tol_3d = tol::xsect_tol_3d_from_zones(k, this_zone_tol_3d, next_zone_tol_3d);
+        // The triangle inequality bounds a shared junction by both edge zones
+        // plus twice the vertex zone, provided each endpoint meets that vertex, as
+        // `CheckLoop` does (WR-381); upstream takes the edge/edge limit alone.
+        let xsect_tol_3d = junction_tolerance(
+            k,
+            b,
+            this_eu,
+            next_eu,
+            [this_end_point, next_start_point],
+            [this_zone_tol_3d, next_zone_tol_3d],
+        )?;
         let xsect_tol_3d_sq = tol::tol3d(xsect_tol_3d * xsect_tol_3d);
 
         // When Gap is largest - save maxGap values
@@ -740,7 +827,9 @@ pub fn is_closed_3d(k: &Kernel, b: &Brep, lu: LoopuseId, check_all_gaps: bool) -
 
         // When gap is bigger than XSectTol3d(ThisEdgeuse, NextEdgeuse)
         if gap_3d_sq > xsect_tol_3d_sq {
-            let over_tol = xsect_tol_3d - gap_3d_sq.sqrt();
+            // WR-93: upstream computes `tol - gap`, which is negative here and never
+            // exceeds the zero initial maximum, so no gap is reported open.
+            let over_tol = gap_3d_sq.sqrt() - xsect_tol_3d;
 
             // when OverTol is largest - save MaxOvertTol vals
             if over_tol > max_over_tol {
@@ -917,7 +1006,7 @@ pub fn loop_loopuse(b: &Brep, l: LoopId) -> Result<Option<LoopuseId>> {
 
 /// The primary loop use, which upstream dereferences.
 fn primary(b: &Brep, l: LoopId) -> Result<LoopuseId> {
-    loop_loopuse(b, l)?.ok_or_else(|| null("SmLoop: loop without loop use"))
+    loop_loopuse(b, l)?.ok_or_else(|| null("loop without loop use"))
 }
 
 /// `GetFace`: the face of the primary loop use's face use.
@@ -927,7 +1016,7 @@ fn primary(b: &Brep, l: LoopId) -> Result<LoopuseId> {
 /// [`SolidError::InvalidInput`] for a loop without loop use or a loop use without face
 /// use; [`SolidError::NotFound`] for a dangling id.
 pub fn loop_face(b: &Brep, l: LoopId) -> Result<Option<FaceId>> {
-    let fu = faceuse(b, primary(b, l)?)?.ok_or_else(|| null("SmLoop::GetFace: no face use"))?;
+    let fu = faceuse(b, primary(b, l)?)?.ok_or_else(|| null("loop face: no face use"))?;
     eu1::faceuse_face(b, fu)
 }
 
@@ -969,9 +1058,11 @@ pub fn loop_edgeuses(b: &Brep, l: LoopId) -> Result<Vec<EdgeuseId>> {
     edgeuses(b, primary(b, l)?, None, None)
 }
 
-/// The identity a topology entity is notified under by [`face_notify_edit`]: its type
-/// code and arena index (the B-rep keeps no attributes for it to select).
-pub(crate) fn notify_ref(e: EntityRef) -> ObjectRef {
+/// The identity a topology entity is notified under by `face_notify_edit`: its type
+/// code and arena index (the B-rep keeps no attributes for it to select). Public so a
+/// caller that builds bodies itself (an importer) names their entities exactly as
+/// solidcore's Euler operators and primitives do (#1766).
+pub fn notify_ref(e: EntityRef) -> ObjectRef {
     let (type_code, kind, index) = match e {
         EntityRef::Brep(x) => (16011, 0u64, x.index()),
         EntityRef::Region(x) => (16012, 1, x.index()),
@@ -1081,13 +1172,23 @@ pub(crate) fn face_notify_as(
 /// # Errors
 ///
 /// [`SolidError::InvalidInput`] for a loop without loop use or mates of different
-/// kinds (see the module docs); [`SolidError::Upstream`] `SM_ERR_NULL_POINTER` for a
+/// kinds (see the module docs); a [`TopologyFailure`](crate::error::topology::TopologyFailure) `SM_ERR_NULL_POINTER` for a
 /// missing mate or start; those of [`collect_edgeuses`]; [`SolidError::Unported`] for
 /// a loop on a face (the post-edit notification, `topology.face_p4`);
 /// [`SolidError::NotFound`] for a dangling id.
 pub fn flip_loop_orientation(b: &mut Brep, l: LoopId) -> Result<()> {
     let (lu1, lu2) = loop_loopuses(b, l)?;
-    let lu2 = lu2.ok_or_else(|| SolidError::null_pointer(OP))?;
+    let lu2 = lu2.ok_or_else(|| {
+        Failure::new(
+            OP,
+            TopologyFailure::Defect {
+                why: "the loop's loop use has no mate; the kernel makes a loop's two \
+                    loop uses as a mated pair, one on each of the face's face uses",
+            },
+        )
+        .with_status(SM_ERR_NULL_POINTER)
+        .into_error()
+    })?;
     let face = match faceuse(b, lu1)? {
         Some(fu) => eu1::faceuse_face(b, fu)?,
         None => None,
@@ -1100,11 +1201,30 @@ pub fn flip_loop_orientation(b: &mut Brep, l: LoopId) -> Result<()> {
     let start2 = b.loopuse(lu2)?.start;
     if let LoopuseStart::Vertexuse(vu1) = start1 {
         // get Vertexuses for both mated Loopuses
-        let vu1 = vu1.ok_or_else(|| SolidError::null_pointer(OP))?;
+        let vu1 = vu1.ok_or_else(|| {
+            Failure::new(
+                OP,
+                TopologyFailure::Defect {
+                    why: "the loop use is of the vertex kind but names no vertex use; \
+                        the kernel sets a loop use's kind and its vertex use together",
+                },
+            )
+            .with_status(SM_ERR_NULL_POINTER)
+            .into_error()
+        })?;
         let vu2 = match start2 {
             LoopuseStart::Vertexuse(Some(vu)) => vu,
             LoopuseStart::Vertexuse(None) | LoopuseStart::Edgeuse(None) | LoopuseStart::Unknown => {
-                return Err(SolidError::null_pointer(OP));
+                return Err(Failure::new(
+                    OP,
+                    TopologyFailure::Defect {
+                        why: "the mate of a vertex loop use names no vertex use; the kernel \
+                            makes the two loop uses of a vertex loop each with its vertex \
+                            use",
+                    },
+                )
+                .with_status(SM_ERR_NULL_POINTER)
+                .into_error());
             }
             LoopuseStart::Edgeuse(Some(_)) => {
                 return Err(null("FlipLoopOrientation: mate is not a vertex loop use"));
@@ -1127,12 +1247,30 @@ pub fn flip_loop_orientation(b: &mut Brep, l: LoopId) -> Result<()> {
     } else {
         // get first Edgeuses for both mated Loopuses
         let LoopuseStart::Edgeuse(Some(eu1_)) = start1 else {
-            return Err(SolidError::null_pointer(OP));
+            return Err(Failure::new(
+                OP,
+                TopologyFailure::Defect {
+                    why: "the loop use is not a vertex loop use and names no first edge \
+                        use; the kernel gives a loop use its first edge use when it \
+                        collects the loop's edge uses",
+                },
+            )
+            .with_status(SM_ERR_NULL_POINTER)
+            .into_error());
         };
         let eu2_ = match start2 {
             LoopuseStart::Edgeuse(Some(eu)) => eu,
             LoopuseStart::Edgeuse(None) | LoopuseStart::Vertexuse(None) | LoopuseStart::Unknown => {
-                return Err(SolidError::null_pointer(OP));
+                return Err(Failure::new(
+                    OP,
+                    TopologyFailure::Defect {
+                        why: "the mate of an edge loop use names no first edge use; the \
+                            kernel collects the edge uses of a loop's two loop uses \
+                            together",
+                    },
+                )
+                .with_status(SM_ERR_NULL_POINTER)
+                .into_error());
             }
             LoopuseStart::Vertexuse(Some(_)) => {
                 return Err(null("FlipLoopOrientation: mate is not an edge loop use"));
@@ -1217,12 +1355,12 @@ pub fn loop_is_connected_to(b: &Brep, l: LoopId, target: Option<EntityRef>) -> R
     };
     let this = EntityRef::Loop(l);
     let face_uses = |b: &Brep| -> Result<[Option<FaceuseId>; 2]> {
-        let f = loop_face(b, l)?.ok_or_else(|| null("SmLoop::IsConnectedTo: no face"))?;
+        let f = loop_face(b, l)?.ok_or_else(|| null("loop connection: no face"))?;
         let (a, c) = crate::topology::face::p2::faceuses(b, f)?;
         Ok([a, c])
     };
     let shell_of = |b: &Brep, fu: Option<FaceuseId>| -> Result<Option<ShellId>> {
-        let fu = fu.ok_or_else(|| null("SmLoop::IsConnectedTo: no face use"))?;
+        let fu = fu.ok_or_else(|| null("loop connection: no face use"))?;
         eu1::faceuse_shell(b, fu)
     };
     match target {
@@ -1241,7 +1379,7 @@ pub fn loop_is_connected_to(b: &Brep, l: LoopId, target: Option<EntityRef>) -> R
         EntityRef::Region(r) => {
             let [fu1, fu2] = face_uses(b)?;
             let region_of = |fu| -> Result<Option<crate::topology::RegionId>> {
-                let s = shell_of(b, fu)?.ok_or_else(|| null("SmLoop::IsConnectedTo: no shell"))?;
+                let s = shell_of(b, fu)?.ok_or_else(|| null("loop connection: no shell"))?;
                 eu1::shell_region(b, s)
             };
             Ok(region_of(fu1)? == Some(r) || region_of(fu2)? == Some(r))
@@ -1268,14 +1406,18 @@ pub struct UvCorners {
     pub on_params: Vec<f64>,
 }
 
-/// `pEdgeuse->GetOrCreateUVTrimCurve(pUVTrimCurve)`: the curve after the call (its status
-/// is ignored upstream; `None` when it could not be made).
+/// `pEdgeuse->GetOrCreateUVTrimCurve(pUVTrimCurve)`: the curve after the call, `None`
+/// when it could not be made. A failing status is no curve, as the fork has it
+/// (tangency-labs/smlib 7a35f33), so the walk drops the 3D ends instead; upstream
+/// ignores the status and its pointer keeps the previous edge use's curve.
 fn get_or_create_uv_trim_curve(
     k: &Kernel,
     b: &mut QueryTopology<'_>,
     eu: EdgeuseId,
 ) -> Result<Option<Curve>> {
-    let _ = b.ensure_trim_curve(k, eu)?;
+    if !b.ensure_trim_curve(k, eu)? {
+        return Ok(None);
+    }
     Ok(crate::topology::edgeuse::p1::uv_trim_curve(b, eu)?
         .0
         .cloned())
@@ -1289,22 +1431,10 @@ fn get_or_create_uv_trim_curve(
 /// With no guess and no solution array, `DropPoint` writes `rResultUV` only when it
 /// ends with `rbSuccess` set (its failed `GlobalPointSolve` returns before any write).
 ///
-/// With the opt-in [`crate::kernel::UpstreamFixes::topology_failed_evaluations_propagate`]
-/// (WR-262) only a successful drop supplies a corner: a failed one is an error, and an
-/// unsuccessful one `SM_ERR`.
+/// The fork keeps these drops' statuses ignored too (`SE`, tangency-labs/smlib 7a35f33).
 fn drop_point(k: &Kernel, s: &Surface, dom: &Extent2d, p: Point3) -> Result<Option<Point2>> {
     let opts = crate::surface::surface::p5::DropPointOptions::default();
     let r = s.drop_point::<crate::surface::surface::p4::NoObject>(k, p, dom, &opts);
-    if k.fixes.topology_failed_evaluations_propagate {
-        let r = r?;
-        return if r.success {
-            Ok(Some(r.result_uv))
-        } else {
-            Err(SolidError::sm_err(
-                "topology::loopuse::uv_corner_boundaries",
-            ))
-        };
-    }
     let r = ignored(r)?;
     Ok(r.filter(|d| d.success).map(|d| d.result_uv))
 }
@@ -1313,18 +1443,8 @@ fn drop_point(k: &Kernel, s: &Surface, dom: &Extent2d, p: Point3) -> Result<Opti
 fn ignored<T>(r: Result<T>) -> Result<Option<T>> {
     match r {
         Ok(v) => Ok(Some(v)),
-        Err(e) if e.is_unported() => Err(e),
+        Err(e) if e.is_unported_or_cancelled() => Err(e),
         Err(_) => Ok(None),
-    }
-}
-
-/// [`ignored`], or with the opt-in
-/// [`crate::kernel::UpstreamFixes::topology_failed_evaluations_propagate`] every error.
-fn evaluated<T>(k: &Kernel, r: Result<T>) -> Result<Option<T>> {
-    if k.fixes.topology_failed_evaluations_propagate {
-        r.map(Some)
-    } else {
-        ignored(r)
     }
 }
 
@@ -1336,9 +1456,7 @@ fn evaluated<T>(k: &Kernel, r: Result<T>) -> Result<Option<T>> {
 /// # Errors
 ///
 /// [`SolidError::Unported`] for a loop with edge uses (`GetOrCreateUVTrimCurve`);
-/// those of [`edgeuses`]; [`SolidError::NotFound`] for a dangling id. With the opt-in
-/// `Kernel::fixes.topology_failed_evaluations_propagate`, also those of the curve
-/// evaluations and point drops, and `SM_ERR` when a point drop does not converge.
+/// those of [`edgeuses`]; [`SolidError::NotFound`] for a dangling id.
 pub fn uv_corner_boundaries(
     k: &Kernel,
     b: &mut Brep,
@@ -1368,12 +1486,9 @@ pub(crate) fn uv_corner_boundaries_with_topology(
         return Ok(out);
     };
 
-    // locals (carried from one edge use to the next where upstream ignores a failed
-    // evaluation; with the opt-in fix a failure returns instead)
+    // locals (carried from one edge use to the next where a point drop fails)
     let mut uv_pnt_beg = Point2::UNDEF;
     let mut uv_pnt_end = Point2::UNDEF;
-    let mut uv_beg = Vec3::UNDEF;
-    let mut uv_end = Vec3::UNDEF;
 
     // for every edgeuse - classify the end points
     for eu in edgeuses(b, lu, None, None)? {
@@ -1384,12 +1499,14 @@ pub(crate) fn uv_corner_boundaries_with_topology(
         if let Some(trim) = trim {
             // end points
             ivl = trim.natural_interval();
-            if let Some(p) = evaluated(k, trim.evaluate_point(k, ivl.evaluate(0.0)))? {
-                uv_beg = p;
-            }
-            if let Some(p) = evaluated(k, trim.evaluate_point(k, ivl.evaluate(1.0)))? {
-                uv_end = p;
-            }
+            // an edge use whose ends cannot be evaluated adds no boundary (the fork's
+            // `continue`, tangency-labs/smlib 7a35f33)
+            let Some(uv_beg) = ignored(trim.evaluate_point(k, ivl.evaluate(0.0)))? else {
+                continue;
+            };
+            let Some(uv_end) = ignored(trim.evaluate_point(k, ivl.evaluate(1.0)))? else {
+                continue;
+            };
             uv_pnt_beg = Point2::new(uv_beg.x, uv_beg.y);
             uv_pnt_end = Point2::new(uv_end.x, uv_end.y);
         } else {
@@ -1408,8 +1525,12 @@ pub(crate) fn uv_corner_boundaries_with_topology(
                 .as_ref()
                 .ok_or_else(|| null("GetUVCornerBoundaries: no curve"))?;
             ivl = edge.interval;
-            let beg = evaluated(k, c.evaluate_point(k, ivl.min()))?.unwrap_or(Vec3::UNDEF);
-            let end = evaluated(k, c.evaluate_point(k, ivl.max()))?.unwrap_or(Vec3::UNDEF);
+            let Some(beg) = ignored(c.evaluate_point(k, ivl.min()))? else {
+                continue;
+            };
+            let Some(end) = ignored(c.evaluate_point(k, ivl.max()))? else {
+                continue;
+            };
             if let Some(p) = drop_point(k, s, &dom, beg)? {
                 uv_pnt_beg = p;
             }
@@ -1522,6 +1643,48 @@ pub fn is_loopuse_side_in_surface(
     Ok(out)
 }
 
+/// The box of loop `l` in its face's surface parameters: the union of the tight boxes of its
+/// first loop use's edge uses' UV trim curves (made where the face has none yet), each the
+/// trim's 3D box's first two coordinates. `None` when a trim curve can't be made or bounded
+/// (an upstream status), or the box isn't finite with some width both ways.
+///
+/// # Errors
+///
+/// Those of the loop and edge use lookups, other than an upstream status.
+pub fn loop_uv_span(k: &Kernel, b: &mut Brep, l: LoopId) -> Result<Option<Extent2d>> {
+    use crate::topology::edgeuse::p3::get_or_create_uv_trim_curve;
+    let upstream = |e: &SolidError| e.sm_status().is_some();
+    let (lu, _) = loop_loopuses(b, l)?;
+    let mut span: Option<Extent2d> = None;
+    for eu in eu1::loopuse_edgeuses(b, lu)? {
+        let fetched = match get_or_create_uv_trim_curve(k, b, eu, false, false, true) {
+            Ok(f) => f,
+            Err(e) if upstream(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if fetched.status.is_err() {
+            return Ok(None);
+        }
+        let (Some(uv), _) = eu1::uv_trim_curve(b, eu)? else {
+            return Ok(None);
+        };
+        let e = match uv.calculate_tight_bounding_box(k, &uv.natural_interval()) {
+            Ok(e) => e,
+            Err(e) if upstream(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let e = Extent2d::from_bounds(e.min().x, e.min().y, e.max().x, e.max().y);
+        span = Some(match span {
+            Some(s) => s.union(&e),
+            None => e,
+        });
+    }
+    Ok(span.filter(|s| {
+        let (lo, hi) = (s.min(), s.max());
+        [lo.x, lo.y, hi.x, hi.y].iter().all(|x| x.is_finite()) && hi.x > lo.x && hi.y > lo.y
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1540,6 +1703,19 @@ mod tests {
         ];
         let nl = NlCurve::new(pw, 1, vec![0.0, 0.0, 1.0, 1.0]).unwrap();
         Curve::from(BSplineCurve::from_nurb(nl, 3, false))
+    }
+
+    /// The 3D end of an edge use on its edge curve, read from its orientation.
+    fn curve_end(b: &Brep, k: &Kernel, use_: EdgeuseId, start: bool) -> Point3 {
+        let u = b.edgeuse(use_).unwrap();
+        let e = b.edge(u.edge.unwrap()).unwrap();
+        let c = e.curve.as_ref().unwrap();
+        let t = if (u.orientation == OrientType::Same) == start {
+            e.interval.min()
+        } else {
+            e.interval.max()
+        };
+        c.evaluate_point(k, t).unwrap()
     }
 
     fn eu(i: u32) -> EdgeuseId {
@@ -1737,12 +1913,13 @@ mod tests {
         assert!(c.closed);
         assert_eq!(c.max_gap, 0.0);
         assert_eq!(c.edgeuse, None);
-        // a gap over tolerance still reports closed (module docs), with the gap
+        // a gap over tolerance (0.5 > 2e-4) reports open, with the gap (WR-93); the
+        // open output is `(gap - tol) + tol`, which need not be bit-exact
         let b = square(0.5);
         let c = is_closed_3d(&k, &b, lu(0), false).unwrap();
-        assert!(c.closed);
+        assert!(!c.closed);
         assert_eq!(c.edgeuse, Some(eu(2)));
-        assert_eq!(c.max_gap, 0.5);
+        assert!((c.max_gap - 0.5).abs() <= 1e-9 * 0.5);
         assert_eq!(c.xsect_tol_3d, 2e-4);
         // a broken CCW chain
         let mut b = square(0.0);
@@ -1760,6 +1937,181 @@ mod tests {
             Err(SolidError::InvalidInput { .. })
         ));
         assert!(loop_is_closed_3d(&k, &b, LoopId::from_index(0), true).is_err());
+    }
+
+    #[test]
+    fn local_vertex_zone_closes_only_a_shared_bounded_junction() {
+        let k = Kernel::default();
+        let corner = VertexId::from_index(2);
+        let mut b = square(3e-4);
+        assert!(!is_closed_3d(&k, &b, lu(0), true).unwrap().closed);
+        b.vertex_mut(corner).unwrap().tolerance = 2.6e-4;
+        for side in [lu(0), lu(1)] {
+            assert!(is_closed_3d(&k, &b, side, true).unwrap().closed);
+        }
+        assert_eq!(b.vertex(corner).unwrap().tolerance, 2.6e-4);
+
+        // Identical points with different topology do not supply a shared vertex.
+        let duplicate = b
+            .add_vertex_record(Vertex {
+                point: b.vertex(corner).unwrap().point,
+                tolerance: 2.6e-4,
+                ..Vertex::default()
+            })
+            .unwrap();
+        let start = VertexuseId::from_index(4);
+        b.vertexuse_mut(start).unwrap().vertex = Some(duplicate);
+        assert!(!is_closed_3d(&k, &b, lu(0), true).unwrap().closed);
+        b.vertexuse_mut(start).unwrap().vertex = Some(corner);
+
+        // Each endpoint must lie within the vertex and its own edge's zones.
+        b.vertex_mut(corner).unwrap().point.z += 1e-3;
+        assert!(!is_closed_3d(&k, &b, lu(0), true).unwrap().closed);
+    }
+
+    #[test]
+    fn surface_loop_and_curve_closure_share_bounded_vertex_junctions() {
+        let k = Kernel::default();
+        let corner = VertexId::from_index(2);
+        let gap = 6e-4;
+        let mut b = square(gap);
+        b.vertex_mut(corner).unwrap().tolerance = 2.6e-4;
+        b.vertex_mut(corner).unwrap().point.x += gap * 0.5;
+        let surface = Surface::from(Plane::new(
+            Vec3::ZERO,
+            Vec3::X,
+            Vec3::Y,
+            crate::geom::vector2d::Vec2::new(1.0, 1.0),
+            &Extent2d::from_bounds(-2.0, -2.0, 2.0, 2.0),
+        ));
+        // Keep UV ends tied to the geometric curves, independently of the
+        // vertex positions being tested. Without trims the UV ends use vertices.
+        for i in 0..8 {
+            let trim = b.edge(EdgeId::from_index(i / 2)).unwrap().curve.clone();
+            b.edgeuse_mut(eu(i)).unwrap().uv_trim_curve = trim;
+        }
+
+        let check = |b: &mut Brep, expected: bool| {
+            for side in [lu(0), lu(1)] {
+                b.loop_mut(LoopId::from_index(0)).unwrap().loopuse = Some(side);
+                let curve = is_closed_3d(&k, b, side, true).unwrap();
+                assert_eq!(curve.closed, expected);
+                let closure = crate::topology::trimming_tools::check_loop(
+                    &k,
+                    b,
+                    &surface,
+                    LoopId::from_index(0),
+                    1e-5,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(closure, if expected { 0 } else { 3 });
+            }
+        };
+        // Each endpoint is 3e-4 from the vertex (within 1e-4 + 2.6e-4).
+        // Their 6e-4 gap needs both vertex radii, beyond max(edge limit, radius).
+        check(&mut b, true);
+        assert_eq!(b.vertex(corner).unwrap().tolerance, 2.6e-4);
+
+        // The gap still fits the expanded bound, but one endpoint misses its zone.
+        b.vertex_mut(corner).unwrap().point.x += 1e-4;
+        check(&mut b, false);
+        // Both endpoints outside the vertex zone must also be rejected.
+        b.vertex_mut(corner).unwrap().point.z += 1e-3;
+        check(&mut b, false);
+    }
+
+    #[test]
+    fn is_closed_3d_reports_open_gaps() {
+        // WR-93: upstream's `XSectTol3d - Gap` is negative for an over-tolerance gap,
+        // so it never exceeds 0 and the loop is always reported closed.
+        let k = Kernel::default();
+
+        // A 0.5 gap over the edges' 2e-4 cross-section tolerance: open on both scans.
+        let b = square(0.5);
+        let gap = curve_end(&b, &k, eu(2), false).distance(curve_end(&b, &k, eu(4), true));
+        for check_all in [false, true] {
+            let c = is_closed_3d(&k, &b, lu(0), check_all).unwrap();
+            assert!(!c.closed);
+            assert_eq!(c.edgeuse, Some(eu(2)));
+            assert_eq!(c.xsect_tol_3d, 2e-4);
+            // The open output is `(gap - tol) + tol`, which need not be bit-exact.
+            assert!((c.max_gap - gap).abs() <= 1e-9 * gap.max(c.max_gap));
+        }
+
+        // A gap under the tolerance stays closed (1e-4 < 2e-4).
+        let b = square(1e-4);
+        let gap = curve_end(&b, &k, eu(2), false).distance(curve_end(&b, &k, eu(4), true));
+        let c = is_closed_3d(&k, &b, lu(0), true).unwrap();
+        assert!(c.closed);
+        assert_eq!(c.xsect_tol_3d, 2e-4);
+        assert!((c.max_gap - gap).abs() <= 1e-9 * gap.max(c.max_gap));
+
+        // A closed square has no gap.
+        let b = square(0.0);
+        let c = is_closed_3d(&k, &b, lu(0), true).unwrap();
+        assert!(c.closed);
+        assert_eq!(c.edgeuse, None);
+        assert_eq!(c.max_gap, 0.0);
+
+        // A vertex loop use is closed with zero outputs.
+        let mut b = square(0.0);
+        b.loopuse_mut(lu(0)).unwrap().start =
+            LoopuseStart::Vertexuse(Some(VertexuseId::from_index(0)));
+        b.vertexuse_mut(VertexuseId::from_index(0)).unwrap().owner =
+            VertexuseOwner::Loopuse(Some(lu(0)));
+        let c = is_closed_3d(&k, &b, lu(0), true).unwrap();
+        assert!(c.closed);
+        assert_eq!(c.edgeuse, None);
+        assert_eq!(c.max_gap, 0.0);
+        assert_eq!(c.xsect_tol_3d, 0.0);
+    }
+
+    #[test]
+    fn is_closed_3d_picks_first_or_largest_exceedance() {
+        let k = Kernel::default();
+
+        // Two gaps in CCW order: 0.2 at edge use 2, then 0.5 at edge use 4, both over
+        // the 2e-4 cross-section tolerance.
+        let mut b = square(0.2);
+        b.edge_mut(EdgeId::from_index(2)).unwrap().curve =
+            Some(line(Vec3::new(1.0, 1.0, 0.0), Vec3::new(0.0, 1.5, 0.0)));
+
+        // `check_all_gaps == FALSE` stops at the first over-tolerance gap.
+        let c = is_closed_3d(&k, &b, lu(0), false).unwrap();
+        assert!(!c.closed);
+        assert_eq!(c.edgeuse, Some(eu(2)));
+        assert_eq!(c.xsect_tol_3d, 2e-4);
+        let gap = curve_end(&b, &k, eu(2), false).distance(curve_end(&b, &k, eu(4), true));
+        assert!((c.max_gap - gap).abs() <= 1e-9 * gap.max(c.max_gap));
+
+        // `TRUE` keeps the largest tolerance exceedance, the later 0.5 gap.
+        let c = is_closed_3d(&k, &b, lu(0), true).unwrap();
+        assert!(!c.closed);
+        assert_eq!(c.edgeuse, Some(eu(4)));
+        assert_eq!(c.xsect_tol_3d, 2e-4);
+        let gap = curve_end(&b, &k, eu(4), false).distance(curve_end(&b, &k, eu(6), true));
+        assert!((c.max_gap - gap).abs() <= 1e-9 * gap.max(c.max_gap));
+
+        // Selection uses the exceedance, not the absolute gap: 0.2 over 0.01 exceeds by
+        // 0.19, 0.5 over 0.4 by 0.1, so the earlier, smaller gap is reported.
+        b.edge_mut(EdgeId::from_index(1)).unwrap().tolerance = 0.01;
+        b.edge_mut(EdgeId::from_index(2)).unwrap().tolerance = 0.0;
+        b.edge_mut(EdgeId::from_index(3)).unwrap().tolerance = 0.4;
+        let c = is_closed_3d(&k, &b, lu(0), true).unwrap();
+        assert!(!c.closed);
+        assert_eq!(c.edgeuse, Some(eu(2)));
+        assert_eq!(c.xsect_tol_3d, 0.01);
+        let gap = curve_end(&b, &k, eu(2), false).distance(curve_end(&b, &k, eu(4), true));
+        assert!((c.max_gap - gap).abs() <= 1e-9 * gap.max(c.max_gap));
+
+        // Equal exceedances keep the first (strict `>`).
+        let mut b = square(0.25);
+        b.edge_mut(EdgeId::from_index(2)).unwrap().curve =
+            Some(line(Vec3::new(1.0, 1.0, 0.0), Vec3::new(0.0, 1.25, 0.0)));
+        let c = is_closed_3d(&k, &b, lu(0), true).unwrap();
+        assert!(!c.closed);
+        assert_eq!(c.edgeuse, Some(eu(2)));
     }
 
     #[test]
@@ -1803,10 +2155,8 @@ mod tests {
             eu_or_vu(&b, lu(0)).unwrap(),
             Some(EntityRef::Edgeuse(eu(4)))
         );
-        assert!(matches!(
-            set_edgeuse(&mut b, lu(0), Some(eu(1))),
-            Err(SolidError::Upstream { code: 1001, .. })
-        ));
+        assert!(set_edgeuse(&mut b, lu(0), Some(eu(1)))
+            .is_err_and(|e| e.upstream_status() == Some(1001)));
         assert!(set_edgeuse(&mut b, lu(0), None).is_err());
         // CollectEdgeuses re-owns the CCW list
         collect_edgeuses(&mut b, lu(1), Some(eu(0))).unwrap();
@@ -1814,10 +2164,9 @@ mod tests {
             b.edgeuse(eu(6)).unwrap().owner,
             EdgeuseOwner::Loopuse(Some(lu(1)))
         );
-        assert!(matches!(
-            collect_edgeuses(&mut b, lu(1), None),
-            Err(SolidError::Upstream { code: 1006, .. })
-        ));
+        assert!(
+            collect_edgeuses(&mut b, lu(1), None).is_err_and(|e| e.upstream_status() == Some(1006))
+        );
         set_orientation(&mut b, lu(0), OrientType::Opposite).unwrap();
         assert_eq!(orientation(&b, lu(0)).unwrap(), OrientType::Opposite);
         set_loop(&mut b, lu(0), None).unwrap();
@@ -1845,9 +2194,10 @@ mod tests {
     }
 
     #[test]
-    fn issue_521_uv_corners_refuse_failed_trim_evaluation_after_valid_edge() {
-        let mut k = Kernel::default();
-        k.fixes.topology_failed_evaluations_propagate = true;
+    fn issue_521_uv_corners_skip_an_edgeuse_whose_ends_fail() {
+        // tangency-labs/smlib 7a35f33 (SmLoop::GetUVCornerBoundaries): an edge use whose
+        // trim curve's ends cannot be evaluated adds no boundary; upstream carries the
+        // previous edge use's ends on (or unset ones) and classifies those.
         let dom = Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0);
         for bad in [0, 2] {
             let mut b = square(0.0);
@@ -1855,28 +2205,13 @@ mod tests {
                 b.edgeuse_mut(eu(2 * i)).unwrap().uv_trim_curve =
                     b.edge(EdgeId::from_index(i)).unwrap().curve.clone();
             }
-            let empty = Curve::from(BSplineCurve::new(2));
-            let expected = empty.evaluate_point(&k, 0.0).unwrap_err();
-            b.edgeuse_mut(eu(bad)).unwrap().uv_trim_curve = Some(empty);
-            assert_eq!(
-                uv_corner_boundaries(&k, &mut b, LoopId::from_index(0), &dom, 1e-6),
-                Err(expected),
-            );
+            b.edgeuse_mut(eu(bad)).unwrap().uv_trim_curve = Some(Curve::from(BSplineCurve::new(2)));
+            let bad_edge = eu1::edge(&b, eu(bad)).unwrap();
+            let k = Kernel::default();
+            let on = uv_corner_boundaries(&k, &mut b, LoopId::from_index(0), &dom, 1e-6).unwrap();
+            assert!(!on.on_edges.contains(&bad_edge), "bad={bad}: {on:?}");
+            assert_eq!(on.on_edges.len(), 6, "bad={bad}: {on:?}");
         }
-    }
-
-    #[test]
-    fn uv_corners_ignore_failed_trim_evaluation_by_default() {
-        // WR-262: upstream ignores the failed evaluation and keeps the previous ends.
-        let k = Kernel::default();
-        let dom = Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0);
-        let mut b = square(0.0);
-        for i in 0..4 {
-            b.edgeuse_mut(eu(2 * i)).unwrap().uv_trim_curve =
-                b.edge(EdgeId::from_index(i)).unwrap().curve.clone();
-        }
-        b.edgeuse_mut(eu(2)).unwrap().uv_trim_curve = Some(Curve::from(BSplineCurve::new(2)));
-        assert!(uv_corner_boundaries(&k, &mut b, LoopId::from_index(0), &dom, 1e-6).is_ok());
     }
 
     #[test]

@@ -10,7 +10,9 @@ use crate::geom::attribute::ObjectKey;
 use crate::geom::object::ObjectRef;
 use crate::nurbs::b_spline_surface_n_lib::p2::OrientType;
 use crate::surface::plane::Plane;
-use crate::topology::{Edgeuse, EdgeuseOwner, Faceuse, Loopuse, ShellId, Vertexuse};
+use crate::topology::{
+    Edgeuse, EdgeuseOwner, Faceuse, Loopuse, ShellId, Vertexuse, VertexuseOwner,
+};
 
 fn plane() -> Surface {
     Plane::from_normal(Point3::ZERO, Vec3::Z).into()
@@ -50,6 +52,7 @@ fn rail(k: &Kernel, fb: &mut FilletBrep, ends: &[f64], unknown: bool) -> EdgeId 
                 ..Edgeuse::default()
             })
             .unwrap();
+        fb.brep_mut().vertexuse_mut(vu).unwrap().owner = VertexuseOwner::Edgeuse(Some(eu));
         fb.insert_fillet_edgeuse(eu, FilletEdgeuse::default());
         eus.push(eu);
     }
@@ -104,7 +107,8 @@ struct Fixture {
     corners: TestCorners,
 }
 
-/// The corner store of the fixture: every corner has type `.0` (`None`: never asked).
+/// The corner store of the fixture: every corner has type `.0` (`None`: never asked); a
+/// blend corner (`NByTwo`) is one closed blend meeting itself.
 struct TestCorners(Option<FilletCornerType>);
 
 impl SplitCorners for TestCorners {
@@ -122,6 +126,9 @@ impl SplitCorners for TestCorners {
     }
     fn corner_type(&self, _: FilletCornerId) -> Result<FilletCornerType> {
         Ok(self.0.expect("the corner type is not asked"))
+    }
+    fn meets_itself(&self, id: FilletCornerId) -> Result<bool> {
+        Ok(self.corner_type(id)? == FilletCornerType::NByTwo)
     }
 }
 
@@ -213,6 +220,8 @@ struct Script {
     stalled: bool,
     fail: Option<&'static str>,
     find_count: usize,
+    /// The status `corner_vertex` leaves the end in (`Processed` where `None`)
+    corner_status: Option<FilStatus>,
 }
 impl Script {
     fn call(&mut self, name: &'static str) -> Result<()> {
@@ -376,7 +385,12 @@ impl RecoveryOps for Script {
 
     fn corner_vertex(&mut self, c: &mut Recovery<'_>, v: VertexId, _: FilletGeomId) -> Result<()> {
         assert_eq!(c.fillets.fillet_vertex(v)?.status(), FilStatus::Unprocessed);
-        self.call("corner")
+        self.call("corner")?;
+        // as `CalcRailIntEdgeuse` leaves the end it solved, or found no side edge for
+        c.fillets
+            .fillet_vertex_mut(v)?
+            .set_status(self.corner_status.unwrap_or(FilStatus::Processed));
+        Ok(())
     }
     fn recalc(
         &mut self,
@@ -406,7 +420,7 @@ impl RecoveryOps for Script {
     fn trim_rails(&mut self, _: &mut Recovery<'_>, _: FilletGeomId) -> Result<()> {
         self.call("trim")
     }
-    fn tangent(&mut self, _: &mut Recovery<'_>, _: EdgeId) -> Result<bool> {
+    fn tangent(&mut self, _: &mut Recovery<'_>, _: EdgeId, _: Point3) -> Result<bool> {
         self.call("tangent")?;
         Ok(true)
     }
@@ -421,7 +435,7 @@ fn both_full_rollovers_execute_in_order_and_preserve_first_mutation_on_error() {
         ..Script::default()
     };
     let mut adjusted = vec![FilletCornerId(9)];
-    f.corners = TestCorners(Some(FilletCornerType::OneByOne));
+    f.corners = TestCorners(Some(FilletCornerType::NByTwo));
     assert!(f.context().process(id, &mut adjusted, &mut script).is_err());
     assert_eq!(script.calls, ["full0", "full1"]);
     assert!(f.fb.geom(id).unwrap().need_split);
@@ -438,7 +452,7 @@ fn failed_first_full_rollover_stops_before_second() {
     }
     let mut f = Fixture::new([&[1.0], &[1.0]], true);
     let id = f.geom;
-    f.corners = TestCorners(Some(FilletCornerType::OneByOne));
+    f.corners = TestCorners(Some(FilletCornerType::NByTwo));
     assert_eq!(
         f.context().process(id, &mut vec![], &mut Failing),
         Err(SolidError::sm_err("first"))
@@ -464,6 +478,9 @@ fn tangent_split_rebuilds_both_segments_and_restores_offset_identity_and_orienta
             "split_geom",
             "copy_offset",
             "rail_x_edge",
+            // #15767: both rail starts are unmated ends at corner 41, each on its own side
+            // edge; the second is solved again from the first's ball after the roll-over
+            "corner",
             "corner",
             "recalc",
             "trim",
@@ -485,6 +502,70 @@ fn tangent_split_rebuilds_both_segments_and_restores_offset_identity_and_orienta
     assert_eq!(
         f.fb.geom(id).unwrap().geom_type,
         FilletGeomType::TangentRollover
+    );
+}
+/// #15767: a rolled rail end that finds no side edge (`NoIntRailEu`) does not seed the other
+/// unmated end at the corner: that end keeps its point from before the roll-over and is not
+/// solved again (one `corner`, where a solved end gives two).
+#[test]
+fn a_rolled_end_without_a_side_edge_does_not_seed_the_other_end() {
+    let mut f = Fixture::new([&[0.4, 1.0], &[1.0]], true);
+    let id = f.geom;
+    let mut script = Script {
+        side: Some(f.side),
+        tangent: true,
+        corner_status: Some(FilStatus::NoIntRailEu),
+        ..Script::default()
+    };
+    let mut adjusted = vec![FilletCornerId(41), FilletCornerId(41)];
+    f.context().process(id, &mut adjusted, &mut script).unwrap();
+    assert_eq!(
+        script.calls.iter().filter(|c| *c == "corner").count(),
+        1,
+        "{:?}",
+        script.calls
+    );
+}
+/// #15767: a rail end with a mate at the corner is solved once (its mate is reset by the
+/// mate's own solve), as upstream: only an unmated end leaves the other rail's end to be
+/// solved again.
+#[test]
+fn tangent_split_solves_a_mated_rail_end_once() {
+    let mut f = Fixture::new([&[0.4, 1.0], &[1.0]], true);
+    let id = f.geom;
+    let ends: Vec<VertexId> = (0..2)
+        .map(|which| {
+            let rail = f.fb.geom(id).unwrap().rail(which).unwrap();
+            f.fb.brep().edge(rail).unwrap().vertices[0]
+        })
+        .collect();
+    f.fb.fillet_vertex_mut(ends[0])
+        .unwrap()
+        .set_mate(0, Some(ends[1]));
+    let mut script = Script {
+        side: Some(f.side),
+        tangent: true,
+        ..Script::default()
+    };
+    let mut adjusted = vec![FilletCornerId(41), FilletCornerId(41)];
+    f.context().process(id, &mut adjusted, &mut script).unwrap();
+    assert_eq!(
+        script.calls,
+        [
+            "convex",
+            "find0",
+            "split_geom",
+            "copy_offset",
+            "rail_x_edge",
+            "corner",
+            "recalc",
+            "trim",
+            "find1",
+            "tangent",
+            "rail_x_edge",
+            "recalc",
+            "trim"
+        ]
     );
 }
 #[test]
@@ -635,8 +716,10 @@ fn failed_end_connection_retains_completed_mutations_and_stops_the_walk() {
     assert_eq!(fb.fillet_edge(r).unwrap().curve_class().unwrap().size(), 2);
 }
 
+/// The bare `Copy`'s status is returned (fork 66b02de `SER`, WR-661; upstream ignores it
+/// and uses the copy): nothing after the copy runs.
 #[test]
-fn ignored_copy_status_does_not_discard_its_completed_output() {
+fn a_failed_copy_status_is_returned() {
     let mut f = Fixture::new([&[0.4, 1.0], &[1.0]], true);
     let id = f.geom;
     let mut script = Script {
@@ -645,14 +728,11 @@ fn ignored_copy_status_does_not_discard_its_completed_output() {
         fail: Some("copy_offset"),
         ..Script::default()
     };
-    f.context().process(id, &mut vec![], &mut script).unwrap();
     assert_eq!(
-        f.fb.geom(FilletGeomId(1)).unwrap().off_surfs[0]
-            .as_ref()
-            .unwrap()
-            .offset_distance(),
-        0.25
+        f.context().process(id, &mut vec![], &mut script),
+        Err(SolidError::sm_err("regression"))
     );
+    assert_eq!(script.calls.last().map(String::as_str), Some("copy_offset"));
 }
 
 #[test]
@@ -882,13 +962,11 @@ fn public_split_helper_rejects_a_missing_infinite_region_after_partial_edits() {
     assert!(f.fb.brep().infinite_region().is_some());
     f.fb.brep_mut().set_infinite_region_record(None);
     let outcome = super::super::super::p1::split_rail(&f.k, &mut f.fb, &mut f.owners, id, rail);
-    assert!(matches!(
-        outcome,
-        Err(SolidError::Upstream {
-            code: crate::error::SM_ERR_NULL_POINTER,
-            ..
-        })
-    ));
+    // a typed blend failure keeps the status of the bare `Upstream` (#13790)
+    assert_eq!(
+        outcome.unwrap_err().upstream_status(),
+        Some(SM_ERR_NULL_POINTER)
+    );
     assert_ne!(f.context().end(rail).unwrap(), old_end);
     assert!(f.fb.brep().vertex(old_end).unwrap().vertexuses.is_empty());
     assert!(f.owners.notifications.is_empty());
@@ -1017,7 +1095,7 @@ fn public_support_helper_uses_the_real_surface_intersection() {
 fn rollover_trim_uses_the_live_solver_at_its_nonzero_id() {
     let mut f = Fixture::new([&[1.0], &[1.0]], false);
     let id = f.geom;
-    let solver_id = crate::blend::fillet_geom::p1::FilletSolverId(37);
+    let solver_id = FilletSolverId(37);
     f.fb.geom_mut(id).unwrap().solver = Some(solver_id);
     f.fb.geom_mut(id).unwrap().set_fillet_surface(Some(
         Plane::new(
@@ -1045,13 +1123,7 @@ fn rollover_trim_uses_the_live_solver_at_its_nonzero_id() {
         );
     }
     assert!(matches!(
-        f.fb.trim_rail_curves_with_solver(
-            &f.k,
-            id,
-            crate::blend::fillet_geom::p1::FilletSolverId(0),
-            &f.solver,
-            &f.target
-        ),
+        f.fb.trim_rail_curves_with_solver(&f.k, id, FilletSolverId(0), &f.solver, &f.target),
         Err(SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. })
     ));
 }
@@ -1060,25 +1132,20 @@ fn rollover_trim_uses_the_live_solver_at_its_nonzero_id() {
 fn rollover_corner_vertex_delegates_to_the_available_geom_port() {
     let mut f = Fixture::new([&[1.0], &[1.0]], false);
     let id = f.geom;
-    f.fb.geom_mut(id).unwrap().solver = Some(crate::blend::fillet_geom::p1::FilletSolverId(37));
+    f.fb.geom_mut(id).unwrap().solver = Some(FilletSolverId(37));
     let rail = f.fb.geom(id).unwrap().rail(0).unwrap();
     let start = f.context().start(rail).unwrap();
     let r = Missing.corner_vertex(&mut f.context(), start, id);
     // the fixture's corner table is empty: the vertex's corner is not in it
-    assert!(matches!(
-        r,
-        Err(SolidError::Upstream {
-            code: crate::error::SM_ERR_NULL_POINTER,
-            ..
-        })
-    ));
+    // a typed blend failure keeps the status of the bare `Upstream` (#13790)
+    assert_eq!(r.unwrap_err().upstream_status(), Some(SM_ERR_NULL_POINTER));
 }
 
 #[test]
 fn rollover_topology_split_preserves_actual_solver_id_and_partial_edits() {
     let mut f = Fixture::new([&[1.0], &[1.0]], false);
     let id = f.geom;
-    let solver_id = crate::blend::fillet_geom::p1::FilletSolverId(37);
+    let solver_id = FilletSolverId(37);
     f.fb.geom_mut(id).unwrap().solver = Some(solver_id);
     f.solver.executive = Some(crate::blend::fillet_solver::p1::FilletExecutiveRef);
     for rail in f.fb.geom(id).unwrap().rails.into_iter().flatten() {
@@ -1095,8 +1162,7 @@ fn rollover_topology_split_preserves_actual_solver_id_and_partial_edits() {
                 .unwrap()
                 .vertexuses
                 .push(vu);
-            f.fb.brep_mut().vertexuse_mut(vu).unwrap().owner =
-                crate::topology::VertexuseOwner::Edgeuse(Some(eu));
+            f.fb.brep_mut().vertexuse_mut(vu).unwrap().owner = VertexuseOwner::Edgeuse(Some(eu));
             f.fb.insert_fillet_vertexuse(vu, crate::blend::fillet_geom::p1::FilletVertexuse::new());
         }
     }
@@ -1104,14 +1170,15 @@ fn rollover_topology_split_preserves_actual_solver_id_and_partial_edits() {
     let end_use = f.fb.brep().edge(rail).unwrap().edgeuses[1];
     let count = f.fb.geoms().len();
     let err = Missing.topology_split(&mut f.context(), id).unwrap_err();
-    assert!(
-        matches!(
-            err,
-            SolidError::Upstream {
-                operation: "blend::fillet_geom::p5::FilletBrep::make_rail_edgeuse",
-                code: crate::error::SM_ERR_NULL_POINTER,
-                ..
-            }
+    // a defect with its reason (#15034) that keeps the bare `Upstream`'s status (#13790)
+    assert_eq!(
+        (err.operation(), err.blend_failure(), err.upstream_status()),
+        (
+            "blend::fillet_geom::p5::FilletBrep::make_rail_edgeuse",
+            Some(&BlendFailure::Defect {
+                why: crate::blend::fillet_geom::p5::SOLVER_NO_EU
+            }),
+            Some(SM_ERR_NULL_POINTER)
         ),
         "{err:?}"
     );
@@ -1127,23 +1194,22 @@ fn rollover_topology_split_preserves_actual_solver_id_and_partial_edits() {
 fn rollover_recalc_uses_the_real_solver_and_reports_missing_edge_curve() {
     let mut f = Fixture::new([&[1.0], &[1.0]], false);
     let id = f.geom;
-    f.fb.geom_mut(id).unwrap().solver = Some(crate::blend::fillet_geom::p1::FilletSolverId(37));
+    f.fb.geom_mut(id).unwrap().solver = Some(FilletSolverId(37));
     let err = Missing
         .recalc(&mut f.context(), id, false, Some(Vec3::Y))
         .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            SolidError::Upstream {
-                code: crate::error::SM_ERR_NULL_POINTER,
-                ..
-            }
+    assert_eq!(
+        (
+            err.operation(),
+            err.kind() == crate::error::ErrorKind::StageFailed && err.is_defect(),
+            err.upstream_status()
+        ),
+        (
+            "blend::fillet_geom::p3::FilletBrep::re_calc_fillet_geom",
+            true,
+            Some(SM_ERR_NULL_POINTER)
         ),
         "{err:?}"
-    );
-    assert_eq!(
-        err.operation(),
-        "blend::fillet_geom::p3::FilletBrep::re_calc_fillet_geom"
     );
 }
 
@@ -1178,7 +1244,10 @@ fn landed_p3_refinement_is_a_noop_without_small_intervals_and_restores_errors() 
         .unwrap_err();
     assert_eq!(
         error,
-        SolidError::sm_err("blend::fillet_solver::p3::refine_rail_curve_classification")
+        SolidError::blend_solver(
+            "blend::fillet_solver::p3::refine_rail_curve_classification",
+            crate::error::blend::SolverFailure::ShortIntervalsNotRemoved { count: 1 }
+        )
     );
     let cc = f.fb.fillet_edge(rail).unwrap().curve_class().unwrap();
     assert_eq!(cc.size(), 3);
@@ -1200,7 +1269,69 @@ fn landed_p3_rail_intersection_reports_the_actual_missing_face_use() {
         .unwrap_err();
     assert_eq!(
         error,
-        SolidError::null_pointer("blend::fillet_solver::p3::calc_rail_x_edge")
+        SolidError::blend_solver(
+            "blend::fillet_solver::p3::calc_rail_x_edge",
+            crate::error::blend::SolverFailure::SideEdgeNotOnRailFace
+        )
     );
     assert!(f.owners.notifications.is_empty());
+}
+
+#[test]
+fn a_rail_without_classification_is_the_callers_input() {
+    let mut f = Fixture::new([&[1.0], &[1.0]], false);
+    let rail = f.fb.geom(f.geom).unwrap().rail(1).unwrap();
+    f.fb.fillet_edge_mut(rail).unwrap().set_curve_class(None);
+    let id = f.geom;
+    let mut script = Script::default();
+    let error = f
+        .context()
+        .process(id, &mut vec![], &mut script)
+        .unwrap_err();
+    assert_eq!(
+        error,
+        SolidError::blend_solver(OP, Solver::RailNotClassified { which: 1 })
+    );
+    assert_eq!(error.kind(), crate::error::ErrorKind::InvalidInput);
+    assert!(!error.is_defect(), "{error:?}");
+    assert_eq!(error.upstream_status(), Some(SM_ERR_NULL_POINTER));
+    assert!(script.calls.is_empty());
+}
+
+#[test]
+fn an_edge_bounding_no_material_has_no_concavity() {
+    let mut f = Fixture::new([&[1.0], &[1.0]], false);
+    let a = f.target.add_vertex(Vec3::ZERO).unwrap();
+    let b = f.target.add_vertex(Vec3::X).unwrap();
+    let wire = f.target.add_edge(a, b).unwrap();
+    assert!(!super::super::edge_bounds_material(&f.target, wire).unwrap());
+    let error = super::super::is_concave_edge(&f.k, &mut f.target, wire).unwrap_err();
+    assert_eq!(
+        error,
+        SolidError::blend_solver(OP, Solver::EdgeBoundsNoMaterial { edge: wire })
+    );
+    assert_eq!(error.kind(), crate::error::ErrorKind::Unsupported);
+    assert!(!error.is_defect(), "{error:?}");
+    assert_eq!(error.upstream_status(), Some(crate::error::SM_ERR));
+}
+
+#[test]
+fn a_crossing_that_does_not_drop_and_one_too_far_off_keep_one_status_and_split_the_cause() {
+    // end_sections_fit's single upstream test `!success || distance > 10 tol` became two
+    // causes: the failed drop (checked first) and the drop that lands too far off.
+    let missed = SolidError::blend_solver(OP, Solver::CrossingDoesNotDropOnEndSection);
+    let far = SolidError::blend_solver(
+        OP,
+        Solver::CrossingOffEndSection {
+            distance: 2e-4,
+            limit: 1e-4,
+        },
+    );
+    assert_eq!(missed.kind(), crate::error::ErrorKind::NotFound);
+    assert_eq!(far.kind(), crate::error::ErrorKind::NotWithinTolerance);
+    for e in [&missed, &far] {
+        assert!(!e.is_defect(), "{e:?}");
+        assert_eq!(e.upstream_status(), Some(crate::error::SM_ERR));
+    }
+    assert_ne!(missed, far);
 }

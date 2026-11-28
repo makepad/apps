@@ -48,12 +48,20 @@
 //! - The point-set type of a set built without a normal is
 //!   [`PointSetType::Unknown`] until classified (uninitialised upstream; it is never
 //!   read before then).
-//! - `SetUpCentroid` never marks the centroid cached and, when the point count is a
-//!   positive multiple of 50, sums one empty block and drops the last 50 points
-//!   (see `plan/findings.md`); both are kept.
-//! - `SetUpTightPseudoBox` calls the const `ProjectPointToPlane` on its boundary and
-//!   neighbour points and discards the results, so the angles are measured between
-//!   the unprojected points; kept (see `plan/findings.md`).
+//! - `SetUpCentroid` sums all blocks and caches the result (WR-15), unlike
+//!   upstream which drops the last block at positive multiples of 50.
+//! - `SetUpAxes` calls `smgu_BestFitPlaneToPoints`, whose best-fit line is the
+//!   least-squares line (`WR-10`), so collinear sets are [`PointSetType::Linear`].
+//!   `SetUpBBoxes` runs `SetUpTightPseudoBox`'s hull-edge alignment for Linear sets as
+//!   well as Planar ones: pinned v1.0.1 ran it only for Planar sets, and reached
+//!   collinear sets only because its skewed line misclassified them as Planar. The
+//!   alignment keeps a rotated box only when its base area is smaller, so it never
+//!   loosens the box.
+//! - `SetUpTightPseudoBox` calls the `const` `ProjectPointToPlane` on its boundary and
+//!   candidate points and discards the results (`WR-14`). The port uses the projections,
+//!   so the hull chords lie in the box plane. `CCWAngleBetween` projects as well, but
+//!   for points far off the plane the unprojected chords' roundoff can decide an exact
+//!   tie between two rotations the wrong way.
 //! - The tolerance member `m_dDistTol3d` is an `SmTol3d`: the constructors store
 //!   `|tol3d|` ([`crate::geom::tol::tol3d`]) as upstream's conversion does.
 //! - `SM_DEBUG_CODE` blocks and `SM_DBG_WARN` messages are omitted.
@@ -225,8 +233,8 @@ impl PointSet3d {
         &self.points
     }
 
-    /// The geometric centre of the points (`GetCentroid`): the best-fit centroid when
-    /// the axes were computed from the points, else the block-wise average.
+    /// The geometric centre: the cached best-fit centroid if axes were computed,
+    /// otherwise the block-wise average, with every point included (WR-15).
     pub fn centroid(&mut self) -> Point3 {
         self.set_up_centroid();
         self.centroid
@@ -367,9 +375,9 @@ impl PointSet3d {
         // init centroid
         self.centroid = Vec3::ZERO;
 
-        // for every block - first the extras, then blocks of BLOCK_SIZE
+        // First the partial block, if any, then full blocks of 50.
         let mut idx = 0;
-        let mut count = extras;
+        let mut count = if extras == 0 { BLOCK_SIZE } else { extras };
         for _ in 0..iters {
             let mut block_sum = Vec3::ZERO;
             for p in self.points.iter().skip(idx).take(count) {
@@ -380,6 +388,8 @@ impl PointSet3d {
             self.centroid += block_sum / size_f;
             count = BLOCK_SIZE;
         }
+
+        self.cache.set(Cache::CENTROID);
     }
 
     /// `SetUpBBoxes`: builds the boxes when needed and, for
@@ -391,7 +401,7 @@ impl PointSet3d {
         }
         let want_bboxes = reason == DataRequest::BBoxes;
         let want_refine = reason == DataRequest::RefinePBox;
-        let basis2 = self.pbox.basis()[2];
+        let [_, _, basis2] = *self.pbox.basis();
         let z_matches = pbox_z
             .as_deref()
             .is_none_or(|z| z.closer_than(EFF_ZERO, basis2));
@@ -436,9 +446,14 @@ impl PointSet3d {
 
         // when asked and if needed - refine PBox
         if !self.cache.has(Cache::PBOX_REFINED) && want_refine {
-            let planar = self.cache.has(Cache::POINT_SET_TYPE)
-                && self.point_set_type == PointSetType::Planar;
-            self.set_up_tight_pseudo_box(planar, pbox_z)?;
+            // Upstream aligns the box with a hull edge only for Planar sets; a Linear
+            // set's hull is its segment, which the alignment finds as well (WR-10).
+            let align = self.cache.has(Cache::POINT_SET_TYPE)
+                && matches!(
+                    self.point_set_type,
+                    PointSetType::Planar | PointSetType::Linear
+                );
+            self.set_up_tight_pseudo_box(align, pbox_z)?;
         }
         Ok(())
     }
@@ -464,6 +479,7 @@ impl PointSet3d {
         // ensure the pseudo box is built
         self.set_up_bboxes(DataRequest::BBoxes, pbox_z)?;
 
+        let plane_point = self.pbox.evaluate(0.5, 0.5, 0.5);
         let [mut plane_x, mut plane_y, mut plane_z] = *self.pbox.basis();
         let plane_normal = plane_x.cross(plane_y).unitize_or_z();
         let mut area = self.pbox.xy_area();
@@ -527,11 +543,12 @@ impl PointSet3d {
         // update the pseudobox coordinate vectors
         [plane_x, plane_y, plane_z] = *self.pbox.basis();
 
-        // Upstream means to project the points along basis[2] onto the plane through the
-        // box centre before testing angles, but discards the results of the const
-        // `ProjectPointToPlane` calls: the raw points are used (see plan/findings.md),
-        // and the box centre (`sPlanePoint`) is not needed.
-        let point_at = |i: usize| self.points.get(i).copied().unwrap_or(Vec3::ZERO);
+        // Upstream (`SmPointSet.cpp:777-780, 790`) calls the `const`
+        // `ProjectPointToPlane(sPlanePoint, sPlaneZ)` on the four boundary points and
+        // each candidate point and discards its return value (`WR-14`); the port uses
+        // the projections, so the chords lie in the box plane.
+        let project = |p: Point3| p.project_point_to_plane(plane_point, plane_z);
+        let point_at = |i: usize| project(self.points.get(i).copied().unwrap_or(Vec3::ZERO));
         let beg_pt0 = point_at(beg_index0);
         let end_pt0 = point_at(end_index0);
         let beg_pt1 = point_at(beg_index1);
@@ -542,12 +559,13 @@ impl PointSet3d {
         let (mut end_ang1, mut end_min1, mut end_max1) = (0.0, BIG_DOUBLE, -BIG_DOUBLE);
 
         // find the neighbour points with the smallest angles from the boundary planes
-        for (ii, &this_pt) in self.points.iter().enumerate() {
+        for (ii, &raw_pt) in self.points.iter().enumerate() {
             // skip the bound points
             if beg_index0 == ii || end_index0 == ii || beg_index1 == ii || end_index1 == ii {
                 continue;
             }
 
+            let this_pt = project(raw_pt);
             let beg_vec0 = this_pt - beg_pt0;
             let end_vec0 = this_pt - end_pt0;
             let beg_vec1 = this_pt - beg_pt1;
@@ -786,6 +804,7 @@ impl PointSequence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::det;
 
     fn square() -> Vec<Point3> {
         vec![
@@ -847,16 +866,12 @@ mod tests {
         assert!(pb.xy_area() <= 4.0 + 1e-9);
     }
 
+    /// A constant 100-point set has that same point as its mean (WR-15).
     #[test]
-    fn centroid_drops_last_block_at_multiples_of_50() {
-        let pts: Vec<Point3> = (0..50).map(|i| Vec3::new(f64::from(i), 1.0, 0.0)).collect();
-        let mut set = PointSet3d::new(pts, 1e-9, None);
-        // upstream quirk: one empty block, the 50 points are never summed
-        assert_eq!(set.centroid(), Vec3::ZERO);
-        let pts: Vec<Point3> = (0..51).map(|_| Vec3::new(1.0, 2.0, 3.0)).collect();
-        let mut set = PointSet3d::new(pts, 1e-9, None);
-        let c = set.centroid();
-        assert!((c.x - 1.0).abs() < 1e-12 && (c.z - 3.0).abs() < 1e-12);
+    fn wr15_default_centroid_includes_every_full_block() {
+        let point = Vec3::new(2.0, 4.0, 6.0);
+        let mut set = PointSet3d::new(vec![point; 100], 1e-9, None);
+        assert_eq!(set.centroid(), point);
     }
 
     #[test]
@@ -877,5 +892,275 @@ mod tests {
         let mut z = Vec3::new(0.0, 0.0, 5.0);
         let _ = set.tight_pbox(Some(&mut z)).unwrap();
         assert_eq!(z, Vec3::Z);
+    }
+
+    /// Constructs symmetric planar pairs about a known centre.
+    fn planar_paired_points(half_count: u32, center: Point3) -> Vec<Point3> {
+        let mut pts = Vec::with_capacity((half_count * 2) as usize);
+        for i in 0..half_count {
+            let t = f64::from(i) + 1.0;
+            let delta = if i % 2 == 0 {
+                Vec3::new(t, 0.0, 0.0)
+            } else {
+                Vec3::new(0.0, t, 0.0)
+            };
+            pts.push(center + delta);
+        }
+        for i in 0..half_count {
+            let t = f64::from(i) + 1.0;
+            let delta = if i % 2 == 0 {
+                Vec3::new(t, 0.0, 0.0)
+            } else {
+                Vec3::new(0.0, t, 0.0)
+            };
+            pts.push(center - delta);
+        }
+        pts
+    }
+
+    /// Empty and partial blocks preserve their closed-form means and cache state.
+    #[test]
+    fn wr15_empty_and_non_multiple_block_sizes() {
+        let mut empty = PointSet3d::new(Vec::new(), 1e-9, None);
+        assert_eq!(empty.centroid(), Vec3::ZERO);
+        assert!(empty.cache.has(Cache::CENTROID));
+        for (count, expected) in [
+            (49_u32, Vec3::new(24.0, 43.0, 3.5)),
+            (51, Vec3::new(25.0, 45.0, 3.5)),
+        ] {
+            let pts = (0..count)
+                .map(|i| Vec3::new(f64::from(i), 2.0 * f64::from(i) - 5.0, 3.5))
+                .collect();
+            let mut set = PointSet3d::new(pts, 1e-9, None);
+            let first = set.centroid();
+            assert!((first - expected).length() < 1e-12);
+            assert!(set.cache.has(Cache::CENTROID));
+            assert_eq!(set.centroid(), first);
+            set.clear_cache();
+            assert!(!set.cache.has(Cache::CENTROID));
+            assert_eq!(set.centroid(), first);
+        }
+    }
+
+    /// Full blocks and inherited sequence queries use analytic arithmetic means.
+    #[test]
+    fn wr15_multiples_of_50_points_50_100_150() {
+        for count in [50_u32, 100, 150] {
+            let pts: Vec<_> = (1..=count)
+                .map(|i| Vec3::new(f64::from(i), -2.0 * f64::from(i), 4.0))
+                .collect();
+            let mean = (f64::from(count) + 1.0) / 2.0;
+            let expected = Vec3::new(mean, -2.0 * mean, 4.0);
+            let mut set = PointSet3d::new(pts.clone(), 1e-9, None);
+            assert!((set.centroid() - expected).length() < 1e-12);
+            assert!(set.cache.has(Cache::CENTROID));
+            let mut seq = PointSequence::new(pts, 1e-9, true, None);
+            assert!((seq.centroid() - expected).length() < 1e-12);
+            assert!(seq.cache.has(Cache::CENTROID));
+        }
+    }
+
+    /// Normal and box queries preserve the known centre on symmetric planar inputs.
+    #[test]
+    fn wr15_call_order_before_and_after_normal_and_bbox() {
+        let center = Vec3::new(7.0, -2.0, 1.5);
+        for half_count in [25, 50] {
+            let pts = planar_paired_points(half_count, center);
+            for given in [false, true] {
+                for bbox_first in [false, true] {
+                    let mut normal = Vec3::Z;
+                    let mut set = PointSet3d::new(pts.clone(), 1e-9, given.then_some(&mut normal));
+                    if !bbox_first {
+                        assert!((set.centroid() - center).length() < 1e-12);
+                    }
+                    let n = set.normal().unwrap();
+                    assert!((n.z.abs() - 1.0).abs() < 1e-12);
+                    set.bbox(None).unwrap();
+                    assert!((set.centroid() - center).length() < 1e-12);
+                    set.clear_cache();
+                    assert!((set.centroid() - center).length() < 1e-12);
+                }
+                let mut normal = Vec3::Z;
+                let mut set = PointSet3d::new(pts.clone(), 1e-9, given.then_some(&mut normal));
+                set.bbox(None).unwrap();
+                assert!((set.centroid() - center).length() < 1e-12);
+            }
+        }
+    }
+
+    /// Non-finite coordinates continue through the existing IEEE arithmetic path.
+    #[test]
+    fn wr15_nonfinite_coordinates_follow_existing_arithmetic() {
+        let mut set = PointSet3d::new(vec![Vec3::new(f64::INFINITY, 2.0, 4.0)], 1e-9, None);
+        let c = set.centroid();
+        assert_eq!(c.x, f64::INFINITY);
+        assert_eq!(c.y, 2.0);
+        assert_eq!(c.z, 4.0);
+    }
+
+    /// WR-10: axis-aligned collinear points are Linear (pinned v1.0.1: Planar), with
+    /// `x_axis` along the line and a degenerate tight box.
+    #[test]
+    fn wr10_point_set_collinear_axes() {
+        let pts_x = vec![
+            Vec3::new(-3.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(3.0, 0.0, 0.0),
+        ];
+
+        let mut set = PointSet3d::new(pts_x.clone(), 1e-6, None);
+        let n = set.normal().unwrap();
+        assert_eq!(set.point_set_type, PointSetType::Linear);
+        assert!(set.x_axis.dot(Vec3::X).abs() > 1.0 - 1e-12);
+        assert!(set.y_axis.dot(Vec3::X).abs() < 1e-12);
+        assert!(n.dot(Vec3::X).abs() < 1e-12);
+        assert!((set.x_axis.cross(set.y_axis) - n).length() < 1e-12);
+        assert!(set.max_dev <= 1e-15);
+
+        let bb = set.bbox(None).unwrap();
+        assert_eq!(bb.min_at(0), -3.0);
+        assert_eq!(bb.max_at(0), 3.0);
+        assert_eq!(bb.min_at(1), 0.0);
+        assert_eq!(bb.max_at(1), 0.0);
+        assert_eq!(bb.min_at(2), 0.0);
+        assert_eq!(bb.max_at(2), 0.0);
+
+        let pb = set.tight_pbox(None).unwrap();
+        assert!(pb.xy_area() <= 1e-24);
+
+        // A user-given normal is kept and the set stays Planar.
+        let mut user_n = Vec3::new(0.0, 0.0, 4.0);
+        let mut set_given = PointSet3d::new(pts_x.clone(), 1e-6, Some(&mut user_n));
+        assert_eq!(set_given.normal().unwrap(), Vec3::Z);
+        assert_eq!(set_given.point_set_type, PointSetType::Planar);
+
+        let mut seq = PointSequence::new(pts_x, 1e-6, true, None);
+        assert!(seq.area().unwrap().abs() <= 1e-15);
+        assert_eq!(seq.point_set_type, PointSetType::Linear);
+        assert_eq!(
+            seq.point_containment(Vec3::new(1.0, 0.0, 0.0)).unwrap(),
+            PointContainment::OnBoundary
+        );
+        assert_eq!(
+            seq.point_containment(Vec3::new(1.0, 1.0, 0.0)).unwrap(),
+            PointContainment::Outside
+        );
+    }
+
+    /// WR-10 tight boxes (golden `geom.point_set` `gen0034`): six collinear points
+    /// along an oblique line, classified Linear, boxed about an explicit `+z`. Only
+    /// the 15-degree rotation search ran for Linear sets, leaving a 12.7 area box
+    /// (pinned v1.0.1 misclassified the set as Planar and its hull-edge alignment
+    /// found the line, area ~1e-13). The alignment now runs for Linear sets too: the
+    /// box lies along the line's projection and still holds every point.
+    #[test]
+    fn wr10_linear_set_tight_box_aligns_with_the_line() {
+        let pts = vec![
+            Vec3::new(21.80485446950501, 2.127459047116308, -16.137096725968778),
+            Vec3::new(7.345372386578687, -0.9303172661055201, -20.022576112649997),
+            Vec3::new(12.803349297106683, 0.22389229820735135, -18.5559359759414),
+            Vec3::new(6.7065268606288875, -1.065415238899695, -20.19424347307935),
+            Vec3::new(7.529993876510043, -0.8912749812168781, -19.972965553340014),
+            Vec3::new(14.860701819016317, 0.6589648529063028, -18.003094541568345),
+        ];
+        let mut seq = PointSequence::new(pts.clone(), 1e-6, true, None);
+        seq.normal().unwrap();
+        assert_eq!(seq.point_set_type, PointSetType::Linear);
+        let mut z = Vec3::Z;
+        let pb = seq.tight_pbox(Some(&mut z)).unwrap();
+        // The line's projection onto z = 0 is 15.4 long; its box has no width.
+        let along = Vec3::new(pts[0].x - pts[3].x, pts[0].y - pts[3].y, 0.0);
+        assert!(pb.basis()[0].cross(along).length() < 1e-9 * along.length());
+        assert!(pb.xy_area() < 1e-9, "area {}", pb.xy_area());
+        for &p in &pts {
+            assert!(pb.contains_point(p, 1e-9));
+        }
+    }
+
+    /// Builds a 6-point convex footprint in the `(nx, ny)` frame rotated by `theta = 0.08`
+    /// rad with a `chamfer_ang` upper-right chamfer, lifted along `nz` by `ws`.
+    fn wr14_tilted_hull_points(
+        nx: Vec3,
+        ny: Vec3,
+        nz: Vec3,
+        chamfer_ang: f64,
+        ws: [f64; 6],
+    ) -> Vec<Point3> {
+        let theta = 0.08_f64;
+        let (c, s) = (det::cos(theta), det::sin(theta));
+        let rot2 = |u: f64, v: f64| (u * c - v * s, u * s + v * c);
+        let d = rot2(-10.0, 1.0); // beg0 (min x)
+        let b = rot2(10.0, -1.0); // end0 (max x)
+        let a = rot2(-10.0, -1.0); // beg1 (min y)
+        let top = (5.0, 2.0); // end1 (max y)
+        let p4 = rot2(0.0, -1.0); // on long bottom edge A -> B (+0.08 rad from beg1)
+        let p5 = (5.0 + det::cos(chamfer_ang), 2.0 - det::sin(chamfer_ang)); // chamfer from end1
+        let coords_2d = [d, b, a, top, p4, p5];
+        coords_2d
+            .into_iter()
+            .zip(ws)
+            .map(|((u, v), w)| nx * u + ny * v + nz * w)
+            .collect()
+    }
+
+    /// WR-14: the tight box measures hull-chord angles between points projected onto
+    /// the box plane (upstream discards the projections). Planar sets at any elevation
+    /// select the `+0.08` rad hull edge. For points up to 4e5 off the plane, the
+    /// unprojected chords tie the `+0.08` rad edge with the `-0.08` rad chamfer and
+    /// roundoff picks the chamfer, whose rotated box is rejected (area > 75); the
+    /// projected chords select the long edge, a box about 30% smaller.
+    #[test]
+    fn wr14_tight_box_on_projected_points() {
+        // Planar set in `z = 0` with `normal = None` (best-fit plane).
+        let pts_xy0 = wr14_tilted_hull_points(Vec3::X, Vec3::Y, Vec3::Z, 0.06, [0.0; 6]);
+        let mut set_xy0 = PointSet3d::new(pts_xy0.clone(), 1e-9, None);
+        let pb_xy0 = set_xy0.tight_pbox(None).unwrap();
+        for &p in &pts_xy0 {
+            assert!(pb_xy0.contains_point(p, 1e-12));
+        }
+
+        // The same footprint at `z = 3.5` with an explicit `+Z` normal gives the same
+        // rotation.
+        let pts_elev = wr14_tilted_hull_points(Vec3::X, Vec3::Y, Vec3::Z, 0.06, [3.5; 6]);
+        let mut z = Vec3::new(0.0, 0.0, 2.0);
+        let mut set_elev = PointSet3d::new(pts_elev.clone(), 1e-9, Some(&mut z));
+        let pb_elev = set_elev.tight_pbox(None).unwrap();
+        assert!((pb_elev.xy_area() - pb_xy0.xy_area()).abs() < 1e-11);
+        for &p in &pts_elev {
+            assert!(pb_elev.contains_point(p, 1e-12));
+        }
+
+        // Oblique planar set (`w = 7.5` along `nz` for `n0 = (1, 2, 3)`): the box turns
+        // onto the `+0.08` rad hull edge.
+        let n0 = Vec3::new(1.0, 2.0, 3.0);
+        let [nz, nx, ny] = n0.make_unit_ortho_vectors(None).unwrap();
+        let pts_obl = wr14_tilted_hull_points(nx, ny, nz, 0.06, [7.5; 6]);
+        let mut n_obl = n0;
+        let mut set_obl = PointSet3d::new(pts_obl.clone(), 1e-9, Some(&mut n_obl));
+        let pb_obl = set_obl.tight_pbox(None).unwrap();
+        let rot = nx.angle_between(pb_obl.basis()[0]).unwrap();
+        assert!((rot - 0.08).abs() < 1e-10);
+        assert!((pb_obl.xy_area() - pb_xy0.xy_area()).abs() < 1e-11);
+        for &p in &pts_obl {
+            assert!(pb_obl.contains_point(p, 1e-9));
+        }
+
+        // Points far off the box plane: the long hull edge is selected.
+        let ws = [2.0e5, -2.0e5, -3.0e5, 4.0e5, 3.0e5, -4.0e5];
+        let pts_far = wr14_tilted_hull_points(nx, ny, nz, 0.08, ws);
+        let mut n_far = n0;
+        let mut set_far = PointSet3d::new(pts_far.clone(), 1e-9, Some(&mut n_far));
+        let pb_far = set_far.tight_pbox(None).unwrap();
+        let rot_far = nx.angle_between(pb_far.basis()[0]).unwrap();
+        assert!((rot_far - 0.08).abs() < 1e-10, "rotation {rot_far}");
+        assert!(pb_far.xy_area() < 53.0, "area {}", pb_far.xy_area());
+        assert!(pb_far.volume() < 4.2e7, "volume {}", pb_far.volume());
+        let mut z_far = n0;
+        let pb_far_z = set_far.tight_pbox(Some(&mut z_far)).unwrap();
+        assert!(pb_far_z.xy_area() < 53.0, "area {}", pb_far_z.xy_area());
+        for &p in &pts_far {
+            assert!(pb_far.contains_point(p, 1e-7));
+            assert!(pb_far_z.contains_point(p, 1e-7));
+        }
     }
 }

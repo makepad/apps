@@ -1,0 +1,2 @@
+`SmOffsetExecutive::BuildOffsetOfEdgeuses` pairs the mapped uses of an inset wall and a copied open face across a tangent edge. The open face maps from the opposite face use to the one its inset neighbour maps from. When the radial partner has no mapped offset, its mate supplies the copied face's mapped use. This lets `EdgeuseOffset` close the gap with the ruled strip from the inner round's edge to the rim of the open face (not upstream; Fab's patch 0003).
+<!-- Modified for Makepad by fab/brep/sync/tool (fab/brep/SYNC.md): patch 0003. -->

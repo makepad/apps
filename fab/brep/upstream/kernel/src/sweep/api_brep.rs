@@ -14,7 +14,7 @@
 //! | [`create_pipe_sweep`]                        | `SmApiCreatePipeSweep`                         |
 //! | [`create_sweep_along_planar_path`]           | `SmApiCreateSweepAlongPlanarPath`              |
 //! | [`create_curve_sweep`], [`CurveSweep`]       | `SmApiCreateCurveSweep`                        |
-//! | [`create_curve_sweep_with_placements`], [`PlacedCurveSweep`] | `SmApiCreateCurveSweep` with the source fork's `pOptPlacements` |
+//! | [`create_curve_sweep_with_placements`], [`PlacedCurveSweep`] | `SmApiCreateCurveSweep` with the SolidCraft fork's `pOptPlacements` |
 //! | [`create_curve_sweep_from_faces`]            | `SmApiCreateCurveSweepFromFaces`               |
 //! | [`create_curve_sweep_from_edges`]            | `SmApiCreateCurveSweepFromEdges`               |
 //! | [`create_taper_extrude`]                     | `SmApiCreateTaperExtrude`                      |
@@ -72,33 +72,51 @@
 //!   [`PrimitiveModel`]. Path and scale curves become their `SmBSplineCurve` part.
 //!   The faces and edges of the curve sweeps are `(&Brep, id)` pairs: upstream
 //!   objects reach their own B-rep.
-//! - **source fork (source fork 5d3939e, WR-523, #1450).** The fork's
+//! - **SolidCraft fork (tangency-labs/smlib 5d3939e, WR-523, #1450).** The fork's
 //!   optional `pOptPlacements` output of `SmApiCreateCurveSweep` is the sibling
 //!   [`create_curve_sweep_with_placements`], so [`create_curve_sweep`] keeps its
 //!   signature and does no extra work; the fork's `bProfileAtPathStart` is
 //!   [`SweepOptions::profile_at_path_start`] (WR-522), off by default.
+//! - Cancellation: a sweep under a fired cancel token (#2136, #2372) returns `Cancelled`, not `Ok`.
+//! - **A pipe past a bend's centre (WR-774, tangency-labs/solidcraft#13766).**
+//!   [`create_pipe_sweep`] refuses, as `InvalidInput`, a radius that reaches the centre of a
+//!   bend in its path. Upstream checks only that the radius is above zero, and builds that
+//!   pipe with its wall folded through itself.
+//! - **A face swept into its own body (tangency-labs/solidcraft#21673).**
+//!   [`non_manifold_sweep`] sweeps into the B-rep's infinite region, so it refuses, as
+//!   [`SweepFailure::FaceSweptIntoBody`] (`brep` unchanged), a selected planar face of a
+//!   solid that the translation carries against its outward normal, into the body.
+//!   Upstream sweeps it anyway and returns success with a slab inside the body whose side
+//!   faces lie on the body's own faces (`TestSmNonManifoldSweep` sweeps a box's face
+//!   `z = 0` along `+z`).
 
 use crate::curve::curve::p2::CurveKind;
 use crate::curve::curve::Curve;
+use crate::error::sweep::SweepFailure;
 use crate::error::{EntityRef, Result, SolidError};
 use crate::geom::axis2_placement::Axis2Placement;
 use crate::geom::tol::ZONE_TOL_3D;
 use crate::geom::vector3d::{Point3, Vec3};
 use crate::kernel::Kernel;
 use crate::nurbs::b_spline_curve::p1::BSplineCurve;
+use crate::nurbs::b_spline_surface_n_lib::p2::OrientType;
+use crate::nurbs::knots::Side;
 use crate::primitive::primitive_creation::model::PrimitiveModel;
 use crate::primitive::primitive_creation::p1::PrimitiveCreation;
 use crate::primitive::primitive_creation::p3::RepeatedSweepOptions;
 use crate::primitive::primitive_creation::SweepOptions;
+use crate::surface::surface::{Surface, SurfaceKind};
 use crate::sweep::rotational_sweep_geometry::RotationalSweepGeometry;
 use crate::sweep::topology_sweep::engine::SweepTargets;
 use crate::sweep::topology_sweep::geometry::SweepGeometry;
 use crate::sweep::topology_sweep::{TopologySweep, TopologySweepOptions};
 use crate::sweep::trans_sweep_geometry::TranslationalSweepGeometry;
 use crate::topology::brep::p1::is_live_topology_member;
+use crate::topology::face::p2 as face;
 use crate::topology::{Brep, EdgeId, FaceId, VertexId};
 
 const OP_COPY: &str = "sweep::api_brep::copy_curves_for_consuming_sweep";
+const OP_SWEEP: &str = "sweep::api_brep";
 const OP_PIPE: &str = "sweep::api_brep::create_pipe_sweep";
 const OP_PLANAR_PATH: &str = "sweep::api_brep::create_sweep_along_planar_path";
 const OP_CURVE_SWEEP: &str = "sweep::api_brep::create_curve_sweep";
@@ -115,7 +133,7 @@ const OP_NON_MANIFOLD: &str = "sweep::api_brep::non_manifold_sweep";
 pub use crate::curve::composite_curve::OffsetCornerType;
 
 /// Why a draft corner was refused, and where (`SmTaperCornerRefusal`,
-/// `pOptRefusedCorner`; source change).
+/// `pOptRefusedCorner`; SolidCraft change).
 pub use crate::primitive::primitive_creation::p2::{CornerRefusal, TaperCornerRefusal};
 
 /// The result of [`create_taper_extrude_with_corner`]: the solid, or the corner the
@@ -131,7 +149,7 @@ pub enum TaperExtrude {
 }
 
 /// A swept solid and its faces (the outputs of the curve sweeps).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct CurveSweep {
     /// `rpResult`: the swept solid.
     pub brep: Brep,
@@ -144,8 +162,8 @@ pub struct CurveSweep {
 }
 
 /// A curve sweep and where it placed the profile (the outputs of
-/// [`create_curve_sweep_with_placements`]; the source fork's `pOptPlacements`).
-#[derive(Debug, Clone)]
+/// [`create_curve_sweep_with_placements`]; the SolidCraft fork's `pOptPlacements`).
+#[derive(Debug)]
 pub struct PlacedCurveSweep {
     /// The swept solid and its faces, as [`create_curve_sweep`] returns them.
     pub sweep: CurveSweep,
@@ -191,6 +209,7 @@ pub fn create_linear_sweep(
     sweep_dist: f64,
     cap_ends: bool,
 ) -> Result<Brep> {
+    crate::profile::profile_scope!(k, "sweep::linear");
     // Sweep copies of the inputs: CreateLinearSweep consumes the curves.
     let curve_copies = copy_curves_for_consuming_sweep(k, curves_to_sweep)?;
 
@@ -224,6 +243,7 @@ pub fn create_rotational_sweep(
     angle_deg: f64,
     cap_ends: bool,
 ) -> Result<Brep> {
+    crate::profile::profile_scope!(k, "sweep::rotational");
     // Sweep copies of the inputs: CreateRotationalSweep consumes the curves.
     let curve_copies = copy_curves_for_consuming_sweep(k, curves_to_sweep)?;
 
@@ -293,8 +313,10 @@ pub fn create_draft_sweep(
 ///
 /// # Errors
 ///
-/// `InvalidInput` for no path curve or a radius `<= 0` (a NaN radius passes, as
-/// upstream); [`SolidError::Unported`] otherwise
+/// `InvalidInput` for no path curve, a radius `<= 0` (a NaN radius passes, as
+/// upstream), or a radius found to reach the centre of a bend in the path
+/// ([`bend_found_within`]; not upstream, which builds that pipe with its wall folded
+/// through itself, WR-774); [`SolidError::Unported`] otherwise
 /// (`SmBrep::SmBrep`, until the B-rep constructor is ported).
 pub fn create_pipe_sweep(
     k: &mut Kernel,
@@ -302,6 +324,7 @@ pub fn create_pipe_sweep(
     path_curve: Option<&Curve>,
     cap_ends: bool,
 ) -> Result<Brep> {
+    crate::profile::profile_scope!(k, "sweep::pipe");
     let Some(path_curve) = path_curve else {
         return Err(SolidError::invalid_input(OP_PIPE, "no path curve"));
     };
@@ -310,6 +333,15 @@ pub fn create_pipe_sweep(
     }
 
     let path = bspline_of(path_curve, OP_PIPE)?;
+    // Refusal only: a bend found refuses the pipe; none found proves nothing, and the pipe
+    // is built unchecked, as upstream builds it (definitions-and-certificates.md §7.6).
+    if bend_found_within(&path, pipe_radius).is_some() {
+        return Err(SolidError::invalid_input(
+            OP_PIPE,
+            "the pipe radius reaches the centre of a bend in the path, so the pipe's wall \
+             would fold through itself",
+        ));
+    }
     let approx_tol = 0.0;
     let translational_sweep = false;
     build(k, |pc, model| {
@@ -326,6 +358,59 @@ pub fn create_pipe_sweep(
             &mut side,
             &mut end,
         )
+    })
+}
+
+/// The samples per knot span, both span ends included, at which [`bend_found_within`]
+/// looks for a bend tighter than a pipe. A span is one polynomial or rational piece, whose
+/// curvature rises and falls only a few times, so 16 samples find a bend well inside the
+/// pipe at a cost that is small beside the sweep itself. A bend tighter than the pipe that
+/// lies between two samples is not found, and that pipe is built as before.
+const PIPE_BEND_SAMPLES_PER_SPAN: u32 = 16;
+
+/// A parameter at which `path` bends with a radius of at most `radius`, that is, with
+/// curvature at least `1 / radius`, if one is found. A pipe of that radius folds its wall
+/// through itself on the inside of such a bend: the circles of neighbouring sections cross
+/// there, so the swept surface is singular (Maekawa, Patrikalakis, Sakkalis and Yu,
+/// "Analysis and applications of pipe surfaces", CAGD 15(5), 1998).
+///
+/// **Refusal only.** The path's curvature is evaluated at [`PIPE_BEND_SAMPLES_PER_SPAN`]
+/// samples per knot span. A `Some` is proved by the sample that found the bend, so it may
+/// refuse a pipe. A `None` proves nothing: it is not a certificate that the path bends no
+/// tighter than `radius` anywhere (definitions-and-certificates.md §7.6, "a check at sample
+/// points proves nothing"), and no caller may accept a construction on it. A certified
+/// check, a lower bound on the radius of curvature over each knot span enclosed on the
+/// Bernstein form of the curvature's numerator and denominator, is open work (#15038).
+/// A sample whose curvature cannot be computed (a zero-length tangent) proves nothing and
+/// is skipped. A pipe that crosses itself between distant parts of its path is not looked
+/// for here.
+fn bend_found_within(path: &BSplineCurve, radius: f64) -> Option<f64> {
+    let nurb = path.nurb.as_ref()?;
+    // A clamped curve's spans run between knots[degree] and knots[n + 1].
+    let span_knots = nurb.knots().get(nurb.degree()..=nurb.n() + 1)?;
+    let reaches = |u: f64, side: Side| {
+        nurb.eval_curvature(u, side, false)
+            .is_ok_and(|c| c.kappa * radius >= 1.0)
+    };
+    span_knots.windows(2).find_map(|ends| {
+        let &[start, end] = ends else {
+            return None;
+        };
+        // A repeated knot spans nothing.
+        if end <= start {
+            return None;
+        }
+        (0..=PIPE_BEND_SAMPLES_PER_SPAN).find_map(|i| {
+            let at = f64::from(i) / f64::from(PIPE_BEND_SAMPLES_PER_SPAN);
+            // At its end knot a span is evaluated from its own side, not the next span's.
+            let side = if i == PIPE_BEND_SAMPLES_PER_SPAN {
+                Side::Right
+            } else {
+                Side::Left
+            };
+            let u = start + at * (end - start);
+            reaches(u, side).then_some(u)
+        })
     })
 }
 
@@ -402,6 +487,7 @@ pub fn create_curve_sweep(
     scale_curve: Option<&Curve>,
     options: Option<&SweepOptions>,
 ) -> Result<CurveSweep> {
+    crate::profile::profile_scope!(k, "sweep::curve");
     let Some(path_curve) = path_curve.filter(|_| !profile_curves.is_empty()) else {
         return Err(SolidError::invalid_input(
             OP_CURVE_SWEEP,
@@ -436,8 +522,8 @@ pub fn create_curve_sweep(
 }
 
 /// [`create_curve_sweep`] that also says where it placed the profile
-/// (`SmApiCreateCurveSweep` with the source fork's `pOptPlacements`,
-/// source fork 5d3939e, WR-523, #1450): the rigid motions carrying the profile
+/// (`SmApiCreateCurveSweep` with the SolidCraft fork's `pOptPlacements`,
+/// tangency-labs/smlib 5d3939e, WR-523, #1450): the rigid motions carrying the profile
 /// curves as given onto the first, middle and last sections the sweep placed. Each
 /// placement maps the global system onto the motion's image (`transform_point` of a
 /// profile point is that point on the section). The solid and faces are the same as
@@ -492,6 +578,12 @@ pub fn create_curve_sweep_with_placements(
 /// The solid swept by the boundaries of `faces` (each with its B-rep) along
 /// `path_curve` (`SmApiCreateCurveSweepFromFaces`), scaled and optioned as
 /// [`create_curve_sweep`]. The faces and their curves are not changed.
+///
+/// Only the faces' edge curves are swept, so the result is closed into a solid only
+/// with [`SweepOptions::cap_ends`] set (upstream `bCapEndsArg`, default false). With
+/// `options` `None` or uncapped, as upstream, a box face swept along a straight path
+/// gives the open tube of its 4 side faces (no start or end face, volume 0); capped,
+/// the 6-face prism.
 ///
 /// # Errors
 ///
@@ -594,9 +686,8 @@ pub fn create_curve_sweep_from_edges(
 ///
 /// # Errors
 ///
-/// `InvalidInput` for no curves or a `None` curve, or for a corner refused under
-/// `fixes.taper_tangent_corner_planes` (WR-521; [`create_taper_extrude_with_corner`]
-/// reports why and where); the error of a failing curve copy; [`SolidError::Unported`]
+/// `InvalidInput` for no curves or a `None` curve, or for a refused tangent corner
+/// (WR-521; [`create_taper_extrude_with_corner`] reports why and where); the error of a failing curve copy; [`SolidError::Unported`]
 /// otherwise (`SmBrep::SmBrep`, until the B-rep constructor is ported).
 pub fn create_taper_extrude(
     k: &mut Kernel,
@@ -620,19 +711,19 @@ pub fn create_taper_extrude(
 }
 
 /// [`create_taper_extrude`] with the corner rule as an argument and a refused corner
-/// as part of the result (source change, source fork 54148db: the fork's
+/// as part of the result (SolidCraft change, tangency-labs/smlib 54148db: the fork's
 /// `SmApiCreateTaperExtrude(..., eCorner, rpResult, pOptRefusal, pOptRefusedCorner)`).
 ///
-/// - [`OffsetCornerType::LinearExtension`]: tangent lines across a corner's gap; with
-///   `fixes.taper_tangent_corner_planes` (WR-521, off by default) a profile of lines
-///   and circular arcs with a sharp corner continues its walls as their tangent planes
-///   instead (two lines meet at a corner edge) and may be refused.
+/// - [`OffsetCornerType::LinearExtension`]: tangent lines across a corner's gap; a
+///   profile of lines and circular arcs with a sharp corner continues its walls as their
+///   tangent planes instead (two lines meet at a corner edge, WR-521) and may be refused.
 /// - [`OffsetCornerType::FilletCorner`]: an arc about the corner.
 /// - [`OffsetCornerType::CurveExtension`]: each wall continues as itself (a line's
 ///   plane, an arc's cone) to meet its neighbour along their exact seam; a profile with
 ///   a curve that is neither a line nor an arc is refused at a sharp corner
 ///   ([`TaperCornerRefusal::NotExact`]), and so is a corner whose walls do not meet or
-///   a wall that closes before the far end. Without a sharp corner it is
+///   a wall that cannot close before the far end (a section that shrinks to one point,
+///   a pyramid's apex or a ridge's end, closes there). Without a sharp corner it is
 ///   `LinearExtension`.
 /// - [`OffsetCornerType::LinearChamfer`]: as the C++ passes it on to the offsetter.
 ///
@@ -807,6 +898,58 @@ fn selection_is_owned_by(brep: &Brep, selection: &SweepSelection<'_>) -> bool {
         && owned(brep, selection.vertices, EntityRef::Vertex)
 }
 
+/// The first of `faces` that a translation by `sweep_vec` carries into its own body (not
+/// upstream, #21673), with how far, and the tolerance it was measured against.
+///
+/// A face is checked when its surface is a plane and exactly one of its face uses bounds
+/// the infinite region (a face of a solid: a sheet's face, bounded by the infinite region
+/// on both sides, sweeps into it either way). That face use's normal, the plane's normal
+/// signed by its orientation, points out of the body, and the translation's component
+/// along it is exact up to one rounding of a dot product: a component below `-tolerance`
+/// moves the whole face into the body. One within the tolerance slides the face in its
+/// own plane, which this check leaves to the sweep.
+fn face_swept_into_body(
+    brep: &Brep,
+    faces: Option<&[Option<FaceId>]>,
+    sweep_vec: Vec3,
+) -> Result<Option<(FaceId, f64, f64)>> {
+    let Some(infinite) = brep.infinite_region() else {
+        // the sweep refuses a B-rep without infinite region itself
+        return Ok(None);
+    };
+    let tolerance = brep.tolerance();
+    for f in faces.unwrap_or_default().iter().flatten().copied() {
+        let Some(SurfaceKind::Plane(plane)) = brep.face(f)?.surface.as_ref().map(Surface::kind)
+        else {
+            continue;
+        };
+        let (Some(up), Some(mate)) = face::faceuses(brep, f)? else {
+            continue;
+        };
+        let outside = |fu| -> Result<bool> {
+            Ok(match brep.faceuse(fu)?.shell {
+                Some(shell) => brep.shell(shell)?.region == Some(infinite),
+                None => false,
+            })
+        };
+        let outer = match (outside(up)?, outside(mate)?) {
+            (true, false) => up,
+            (false, true) => mate,
+            _ => continue,
+        };
+        let sign = match brep.faceuse(outer)?.orientation {
+            OrientType::Same => 1.0,
+            OrientType::Opposite => -1.0,
+            OrientType::Unknown => continue,
+        };
+        let along = sweep_vec.dot(plane.evaluate_normal() * sign);
+        if along < -tolerance {
+            return Ok(Some((f, -along, tolerance)));
+        }
+    }
+    Ok(None)
+}
+
 /// `SmTopologySweep sSweep(sSweepGeom, bDoStitching, FALSE, FALSE, bDoMerge)` and
 /// `DoSweep(pBrepToSweep, pBrepToSweep->GetInfiniteRegion(), pOptFaces, pOptEdges,
 /// pOptVertices, NULL, NULL, NULL)` on `brep` in place.
@@ -858,7 +1001,9 @@ fn non_manifold_sweep_with(
 ///
 /// [`SolidError::InvalidInput`] (`brep` unchanged) for a [`RegionBrep::Other`] region,
 /// a selection entry that is `None` or not live topology of `brep`, and for a
-/// zero-length `sweep_dir`; those of the sweep.
+/// zero-length `sweep_dir`; [`SweepFailure::FaceSweptIntoBody`] (`brep` unchanged) for a
+/// selected planar face of a solid the sweep carries into the body rather than into its
+/// infinite region (not upstream, #21673); those of the sweep.
 #[allow(clippy::too_many_arguments)] // upstream's arguments
 pub fn non_manifold_sweep(
     k: &mut Kernel,
@@ -884,7 +1029,21 @@ pub fn non_manifold_sweep(
         .unitize()
         .map_err(|_| SolidError::invalid_input(OP_NON_MANIFOLD, "zero sweep direction"))?
         * sweep_dist;
-    let geometry = SweepGeometry::Translation(TranslationalSweepGeometry::new(sweep_vec));
+    // (not upstream, #21673) the destination is the infinite region: a face of a solid
+    // swept into the body would build a slab inside it on the body's own faces
+    if let Some((face, depth, tolerance)) = face_swept_into_body(brep, selection.faces, sweep_vec)?
+    {
+        return Err(SolidError::sweep(
+            OP_NON_MANIFOLD,
+            SweepFailure::FaceSweptIntoBody {
+                face,
+                depth,
+                tolerance,
+            },
+        ));
+    }
+    let translation = TranslationalSweepGeometry::new(sweep_vec);
+    let geometry = SweepGeometry::Translation(translation);
     non_manifold_sweep_with(k, brep, &geometry, do_stitching, do_merge, selection)
 }
 
@@ -917,12 +1076,8 @@ pub fn non_manifold_rotational_sweep(
             "selection entry not live topology of the B-rep",
         ));
     }
-    let geometry = SweepGeometry::Rotation(RotationalSweepGeometry::new(
-        base_pt,
-        axis,
-        angle_deg,
-        ZONE_TOL_3D,
-    ));
+    let rotation = RotationalSweepGeometry::new(base_pt, axis, angle_deg, ZONE_TOL_3D);
+    let geometry = SweepGeometry::Rotation(rotation);
     non_manifold_sweep_with(k, brep, &geometry, do_stitching, do_merge, selection)
 }
 
@@ -931,11 +1086,15 @@ fn build(
     k: &mut Kernel,
     body: impl FnOnce(&mut PrimitiveCreation, &mut PrimitiveModel<'_>) -> Result<()>,
 ) -> Result<Brep> {
-    PrimitiveModel::build_new(k, body).map(|(mut brep, ())| {
+    let brep = PrimitiveModel::build_new(k, body).map(|(mut brep, ())| {
         // (not upstream: the port's cached topology fields, true for the caller)
         brep.refresh_cached_topology();
         brep
-    })
+    })?;
+    // (not upstream, #2136 / #2372: a cancel a status-ignoring helper absorbed still
+    // ends the sweep as `Cancelled`, never `Ok`)
+    k.check_cancelled(OP_SWEEP)?;
+    Ok(brep)
 }
 
 /// The start, side and end faces of a curve sweep.
@@ -962,6 +1121,8 @@ fn curve_sweep_with<R>(
         })?;
     // (not upstream: the port's cached topology fields, true for the caller)
     brep.refresh_cached_topology();
+    // (not upstream, #2136 / #2372: as in `build`)
+    k.check_cancelled(OP_SWEEP)?;
     Ok((
         CurveSweep {
             brep,
@@ -1009,6 +1170,7 @@ mod tests {
     use super::*;
     use crate::curve::hermite_curve::HermiteCurve;
     use crate::geom::axis2_placement::Axis2Placement;
+    use crate::math::det;
     use crate::primitive::api_curves;
 
     fn circle() -> Curve {
@@ -1044,21 +1206,39 @@ mod tests {
         let ok = [Some(&c), Some(&l)];
         let z = Vec3::new(0.0, 0.0, 1.0);
         let o = Point3::new(0.0, 0.0, 0.0);
-        // the copies are made and the sweep runs (topology.brep_p4 is ported)
-        let b = create_linear_sweep(&mut k, &ok, z, 10.0, true).expect("linear sweep");
-        assert_eq!(
-            (
-                b.face_list().len(),
-                b.edge_list().len(),
-                b.vertex_list().len()
-            ),
-            (2, 7, 6)
-        );
-        // no profile curves: a successful empty sweep, as upstream
-        let b = create_linear_sweep(&mut k, &[], z, 10.0, true).expect("empty sweep");
-        assert!(b.face_list().is_empty());
-        assert!(b.edge_list().is_empty());
-        assert!(b.vertex_list().is_empty());
+        // the copies are made and the sweep runs (topology.brep_p4 is ported). The circle and
+        // the line bound no planar region, so the start cap cannot be made: upstream went on
+        // to the two open walls, the fork returns the cap's failure (c8f6a31, the curve
+        // `CreateLinearSweep`'s `SER( pBrep->CreatePlanarFacesWith3DCurves(m_pRegion,
+        // cr3DCurves, dTol, sStartFaces) )`). The capped body asked for does not exist: the
+        // line is open (its ends differ) and lies inside the circle, so its swept wall is a
+        // fin with a free edge inside the cylinder that no cap closes off. Main returned the
+        // two uncapped walls (2, 7, 6) as a success.
+        // (both centred on the origin: the circle's radius is its start's distance from it)
+        let tolerance = crate::topology::brep::p3::new_brep(
+            &mut k,
+            crate::geom::tol::USE_DEFAULT,
+            crate::geom::tol::USE_DEFAULT,
+        )
+        .expect("brep")
+        .tolerance();
+        let radius = c
+            .evaluate_point(&k, c.natural_interval().min())
+            .expect("circle start")
+            .length();
+        let ends = l.natural_interval();
+        let start = l.evaluate_point(&k, ends.min()).expect("start");
+        let end = l.evaluate_point(&k, ends.max()).expect("end");
+        assert!((end - start).length() > tolerance, "an open line");
+        for p in [start, end] {
+            assert!(p.length() < radius - tolerance, "{p:?} inside the circle");
+        }
+        let e = create_linear_sweep(&mut k, &ok, z, 10.0, true).expect_err("no cap");
+        assert_eq!(e.sm_status(), Some(1001), "{e:?}");
+        // no profile curves and caps: no cap can be made either; upstream returned a
+        // successful empty sweep, the fork returns the cap's failure (the same `SER`)
+        let e = create_linear_sweep(&mut k, &[], z, 10.0, true).expect_err("empty sweep");
+        assert_eq!(e.sm_status(), Some(1001), "{e:?}");
         assert!(invalid(&create_linear_sweep(
             &mut k,
             &[Some(&c), None],
@@ -1095,13 +1275,7 @@ mod tests {
         // SM_ERR of the Hermite curve's base Copy, before the later NULL is seen
         let err =
             create_rotational_sweep(&mut k, &[Some(&h), None], o, z, 90.0, false).unwrap_err();
-        assert!(matches!(
-            err,
-            SolidError::Upstream {
-                code: crate::error::SM_ERR,
-                ..
-            }
-        ));
+        assert_eq!(err.upstream_status(), Some(crate::error::SM_ERR), "{err:?}");
         assert!(invalid(&create_taper_extrude(
             &mut k,
             &[],
@@ -1135,10 +1309,14 @@ mod tests {
             2,
             false
         )));
-        // capped repeated sweeps need exactly one repetition: SM_ERR
+        // capped repeated sweeps need at least one repetition: SM_ERR, the caller's input
         assert!(
-            create_linear_sweep_with_repetitions(&mut k, &ok, z, 5.0, 0, true)
-                .is_err_and(|e| !e.is_unported())
+            create_linear_sweep_with_repetitions(&mut k, &ok, z, 5.0, 0, true).is_err_and(|e| {
+                e.primitive_failure()
+                    == Some(&crate::error::primitive::PrimitiveFailure::CappedSweepNoRepetition)
+                    && e.upstream_status() == Some(crate::error::SM_ERR)
+                    && e.kind() == crate::error::ErrorKind::InvalidInput
+            })
         );
         assert!(invalid(&create_rotational_sweep_with_repetitions(
             &mut k,
@@ -1154,6 +1332,32 @@ mod tests {
         )));
     }
 
+    /// A pipe whose radius reaches the centre of a bend in its path would fold its wall
+    /// through itself on the inside of that bend, so it is refused (#13766). The ellipse
+    /// with semi-axes 2 and 4 bends tightest at the ends of its long axis, with radius
+    /// 2² / 4 = 1; the circle bends with radius 2 everywhere. Each refused radius is
+    /// beyond the bend's, and each built one within it, by at least 1%.
+    #[test]
+    fn a_pipe_reaching_past_a_bend_centre_is_refused() {
+        let mut k = Kernel::default();
+        let ellipse = Curve::from(
+            api_curves::create_ellipse(&k, Point3::new(0.0, 0.0, 0.0), 2.0, 4.0).expect("ellipse"),
+        );
+        for radius in [1.01, 1.5, 3.0, 5.0] {
+            assert!(
+                invalid(&create_pipe_sweep(&mut k, radius, Some(&ellipse), true)),
+                "radius {radius}"
+            );
+        }
+        let inside = create_pipe_sweep(&mut k, 0.99, Some(&ellipse), true).expect("pipe");
+        assert!(crate::topology::brep::p2::is_manifold_solid(&inside).unwrap());
+
+        let c = circle();
+        assert!(invalid(&create_pipe_sweep(&mut k, 2.02, Some(&c), true)));
+        let inside = create_pipe_sweep(&mut k, 1.98, Some(&c), true).expect("pipe");
+        assert!(crate::topology::brep::p2::is_manifold_solid(&inside).unwrap());
+    }
+
     #[test]
     fn pipe_and_planar_path_validate_then_run_or_defer() {
         let mut k = Kernel::default();
@@ -1161,11 +1365,12 @@ mod tests {
         assert!(invalid(&create_pipe_sweep(&mut k, 1.0, None, true)));
         assert!(invalid(&create_pipe_sweep(&mut k, 0.0, Some(&p), true)));
         assert!(invalid(&create_pipe_sweep(&mut k, -1.0, Some(&p), false)));
-        // a NaN radius passes the API's validation; upstream returns an empty B-rep
-        let b = create_pipe_sweep(&mut k, f64::NAN, Some(&p), false).expect("nan pipe");
-        assert!(b.face_list().is_empty());
-        assert!(b.edge_list().is_empty());
-        assert!(b.vertex_list().is_empty());
+        // a NaN radius passes the API's validation, and the profile circle refuses it:
+        // upstream swept the missing circle to an empty B-rep, the fork returns the
+        // circle's failure (c8f6a31, `CreatePipeSweep`'s `SER( SmCircle::CreateCanonical(
+        // *pContext, sPlace, dPipeRadius, pCircle, &sDomain ) )`)
+        let e = create_pipe_sweep(&mut k, f64::NAN, Some(&p), false).expect_err("nan pipe");
+        assert_eq!(e.sm_status(), Some(1001), "{e:?}");
         let b = create_pipe_sweep(&mut k, 1.0, Some(&p), false).expect("pipe");
         assert_eq!(b.face_list().len(), 1);
         let capped = create_pipe_sweep(&mut k, 1.0, Some(&p), true).expect("capped pipe");
@@ -1295,8 +1500,8 @@ mod tests {
 
     #[test]
     fn a_whole_turn_of_a_profile_gives_each_curve_its_analytic_face() {
-        // Not upstream (WR-448, #545, `fixes.revolve_analytic_profile_faces`): upstream
-        // makes an SmSurfOfRevolution of every curve of a profile longer than one curve
+        // Not upstream (WR-448, #545): upstream makes an SmSurfOfRevolution of every
+        // curve of a profile longer than one curve
         let mut k = Kernel::default();
         let seg =
             |a: Vec3, b: Vec3| Curve::from(BSplineCurve::create_line_segment(3, a, b).unwrap());
@@ -1322,23 +1527,16 @@ mod tests {
         // a torus from two half circles
         let outer = arc(Vec3::new(5.0, 0.0, 0.0), -Vec3::Z, Vec3::X, 1.0, 0.0, 180.0);
         let inner = arc(Vec3::new(5.0, 0.0, 0.0), Vec3::Z, -Vec3::X, 1.0, 0.0, 180.0);
-        // by default (the fix off), upstream's surfaces of revolution
-        for (fix, expected) in [
-            (false, ["revolution", "revolution"]),
-            (true, ["cylinder", "cone"]),
-        ] {
-            k.fixes.revolve_analytic_profile_faces = fix;
-            let b = create_rotational_sweep(
-                &mut k,
-                &[Some(&wall), Some(&point)],
-                Vec3::ZERO,
-                Vec3::Z,
-                360.0,
-                false,
-            )
-            .unwrap();
-            assert_eq!(face_kinds(&b), expected);
-        }
+        let b = create_rotational_sweep(
+            &mut k,
+            &[Some(&wall), Some(&point)],
+            Vec3::ZERO,
+            Vec3::Z,
+            360.0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(face_kinds(&b), ["cylinder", "cone"]);
         for (curves, expected) in [
             ([Some(&dome), Some(&rim)], ["sphere", "plane"]),
             ([Some(&outer), Some(&inner)], ["torus", "torus"]),
@@ -1353,10 +1551,8 @@ mod tests {
     /// A quarter disc of radius 20 turned a whole turn about z: a dome. Its arc is a
     /// sketch's arc through (20, 0), a rounded (14.142136, 14.142136) and (0, 20), whose
     /// centre (c, 0, c), c = 1.28e-6, is off the axis by far less than the B-rep
-    /// tolerance (source rig shell/4847, #1123).
-    fn rounded_quarter_disc(k: &mut Kernel, fix: bool) -> Brep {
-        k.fixes.revolve_analytic_profile_faces = true;
-        k.fixes.revolve_arc_centre_near_axis_is_sphere = fix;
+    /// tolerance (SolidCraft rig shell/4847, #1123).
+    fn rounded_quarter_disc(k: &mut Kernel) -> Brep {
         let (c, r, a0) = (
             1.2846627950203038e-06,
             19.99999871533725,
@@ -1399,9 +1595,9 @@ mod tests {
             store: &store,
             key_of: &key_of,
         };
-        for fix in [false, true] {
+        {
             let mut k = Kernel::default();
-            let mut b = rounded_quarter_disc(&mut k, fix);
+            let mut b = rounded_quarter_disc(&mut k);
             let dome = *b.face_list().last().unwrap();
             let surface = b.face(dome).unwrap().surface.as_ref().unwrap();
             let d = surface.natural_uv_domain_if_built();
@@ -1420,22 +1616,213 @@ mod tests {
                 .iter()
                 .map(|&v| crate::topology::vertex::point(&b, v).unwrap())
                 .filter(|p| p.z > 10.0)
-                .map(|p| p.x.hypot(p.y))
+                .map(|p| det::hypot(p.x, p.y))
                 .fold(0.0, f64::max);
+            // the rim vertex's distance from the axis
+            let rim = crate::topology::brep::p1::vertices(&b, None)
+                .unwrap()
+                .iter()
+                .map(|&v| crate::topology::vertex::point(&b, v).unwrap())
+                .filter(|p| p.z <= 10.0)
+                .map(|p| det::hypot(p.x, p.y))
+                .fold(0.0, f64::max);
+            // the fork's c4209ab test: of the NURB's rows at the ends of v, the one at the
+            // top (z 20), its points' farthest from its first
+            let surface = b.face(dome).unwrap().surface.as_ref().unwrap();
+            let spread = match surface.kind() {
+                SurfaceKind::Sphere(s) => {
+                    let nurb = s.base().base().gw_nurb().unwrap();
+                    let point = |i, j| {
+                        let c = nurb.cpt(i, j).unwrap();
+                        if c.w == crate::nurbs::math::NOW {
+                            Vec3::new(c.x, c.y, c.z)
+                        } else {
+                            Vec3::new(c.x / c.w, c.y / c.w, c.z / c.w)
+                        }
+                    };
+                    let j = if point(0, 0).z > 10.0 { 0 } else { nurb.m() };
+                    (1..=nurb.n())
+                        .map(|i| (point(i, j) - point(0, j)).length())
+                        .fold(0.0, f64::max)
+                }
+                _ => f64::INFINITY,
+            };
             let volume = brep_volume(&k, &mut b, 1e-8, &attributes).unwrap();
             // 2/3 pi 20^3
             let want = 2.0 / 3.0 * std::f64::consts::PI * 8000.0;
-            if fix {
-                assert_eq!(face_kinds(&b), ["plane", "sphere"]);
-                assert!(stray <= 1e-9, "dome strays {stray} from its sphere");
-                assert!(pole_off <= 1e-12, "pole {pole_off} off the axis");
-                assert!((volume - want).abs() <= 1e-6 * want, "{volume} vs {want}");
-                assert!(crate::topology::brep::p2::is_manifold_solid(&b).unwrap());
-            } else {
-                // the arc's own circle: a torus 1.28e-6 about the axis, off the sphere
-                assert_eq!(face_kinds(&b), ["plane", "torus"]);
-                assert!(stray > 1e-7, "{stray}");
-            }
+            // (upstream: the arc's own circle, a torus 1.28e-6 about the axis, off the sphere)
+            assert_eq!(face_kinds(&b), ["plane", "sphere"]);
+            assert!(stray <= 1e-9, "dome strays {stray} from its sphere");
+            assert!(spread <= 1e-12, "pole row spread {spread}");
+            assert!(pole_off <= 1e-12, "pole {pole_off} off the axis");
+            assert!((rim - 20.0).abs() <= 1e-12, "rim radius {rim}");
+            assert!((volume - want).abs() <= 1e-6 * want, "{volume} vs {want}");
+            assert!(crate::topology::brep::p2::is_manifold_solid(&b).unwrap());
         }
+    }
+
+    /// WR-471 (the fork's c4209ab): a half circle of radius 5 whose centre, and so both
+    /// ends, are 3e-7 off the axis (more than the fit tolerance, less than the B-rep
+    /// tolerance 1e-6, so the sweep takes both ends to be on the axis), turned a whole
+    /// turn.
+    fn wr471_whole_sphere() -> (Kernel, Brep) {
+        let mut k = Kernel::default();
+        let off = 3e-7;
+        let half = Curve::from(
+            BSplineCurve::create_circle_segment(
+                3,
+                &Axis2Placement::new(Vec3::new(off, 0.0, 0.0), -Vec3::Z, Vec3::X),
+                5.0,
+                0.0,
+                180.0,
+                crate::nurbs::b_spline_curve::NurbCircleParam::Quadratic,
+            )
+            .unwrap(),
+        );
+        let b = create_rotational_sweep(&mut k, &[Some(&half)], Vec3::ZERO, Vec3::Z, 360.0, false)
+            .unwrap();
+        (k, b)
+    }
+
+    /// The half circle of `wr471_whole_sphere`: as the fork does, the face is the sphere
+    /// through the ends with its poles on the axis, not the B-spline surface of revolution
+    /// with a 3e-7 parallel at each end. Its volume is checked apart, in
+    /// `wr471_whole_sphere_volume`.
+    #[test]
+    fn wr471_half_circle_ending_within_tolerance_of_the_axis_is_a_whole_sphere() {
+        use crate::mass::integrator::properties::brep_area;
+        use crate::surface::surface::SurfaceKind;
+        let (k, mut b) = wr471_whole_sphere();
+        assert_eq!(face_kinds(&b), ["sphere"]);
+        let counts = (
+            b.face_list().len(),
+            b.edge_list().len(),
+            crate::topology::brep::p1::vertices(&b, None).unwrap().len(),
+        );
+        assert_eq!(counts, (1, 1, 2));
+        let face = *b.face_list().first().unwrap();
+        let surface = b.face(face).unwrap().surface.as_ref().unwrap();
+        let SurfaceKind::Sphere(sphere) = surface.kind() else {
+            panic!("a sphere")
+        };
+        let d = sphere.step_uv_domain();
+        assert_eq!((d.min().y, d.max().y), (-90.0, 90.0));
+        // the surface's poles (its natural corners) on the axis
+        let n = surface.natural_uv_domain_if_built();
+        for (u, v) in [(0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (1.0, 1.0)] {
+            let p = surface.evaluate_point(&k, n.evaluate(u, v)).unwrap();
+            assert!(det::hypot(p.x, p.y) <= 1e-12, "pole {p:?} off the axis");
+        }
+        // the two vertices are the poles
+        for v in crate::topology::brep::p1::vertices(&b, None).unwrap() {
+            let p = crate::topology::vertex::point(&b, v).unwrap();
+            assert!(det::hypot(p.x, p.y) <= 1e-12, "vertex {p:?} off the axis");
+            assert!(
+                (p.z.abs() - 5.0).abs() <= 1e-12,
+                "vertex {p:?} not at a pole"
+            );
+        }
+        assert!(crate::topology::brep::p2::is_manifold_solid(&b).unwrap());
+        let area = brep_area(&k, &mut b, 1e-8).unwrap();
+        // 4 pi 5^2
+        let want = 4.0 * std::f64::consts::PI * 25.0;
+        assert!((area - want).abs() <= 1e-6 * want, "{area} vs {want}");
+    }
+
+    /// The volume of `wr471_whole_sphere`, 4/3 pi 5^3. WR-472's body-length error scale
+    /// converges on the face at 1e-8 and 1e-10. This is separate from WR-471's placement of
+    /// the sphere's poles.
+    #[test]
+    fn wr471_whole_sphere_volume() {
+        use crate::geom::attribute::{AttributeStore, ObjectKey};
+        use crate::mass::integrator::properties::{brep_volume, PropertyAttributes};
+        let store = AttributeStore::default();
+        let key_of = |_| ObjectKey(0);
+        let attributes = PropertyAttributes {
+            store: &store,
+            key_of: &key_of,
+        };
+        for accuracy in [1e-8, 1e-10] {
+            let (k, mut b) = wr471_whole_sphere();
+            let volume = brep_volume(&k, &mut b, accuracy, &attributes).unwrap();
+            let want = 4.0 / 3.0 * std::f64::consts::PI * 125.0;
+            assert!(
+                (volume - want).abs() <= accuracy * want,
+                "accuracy={accuracy}: {volume} vs {want}"
+            );
+        }
+    }
+
+    /// #21673: the box `[0,10]³`'s face 0 is the plane `z = 0`, whose outward side is
+    /// `-z`. A non-manifold sweep of it along `+z` (upstream's `TestSmNonManifoldSweep`,
+    /// with direction `(0,0,1)` and `(0,0,3)`) would run 5 into the box, not into its
+    /// infinite region, and build the slab `[0,10]² × [0,5]` whose four sides lie on the
+    /// box's own side faces: it is refused, the box unchanged, with or without merging
+    /// (merging builds the same 11-face body), and so is an oblique sweep into the box. Swept the other way, along
+    /// its outward normal, the face builds the slab `[0,10]² × [-5,0]` on the box: 11
+    /// faces, bounding box `[0,10]² × [-5,10]`, and the two solids' volumes add to
+    /// 1000 + 500.
+    #[test]
+    fn issue_21673_a_face_swept_into_its_box_is_refused() {
+        use crate::primitive::api_primitives::create_box;
+        let mut k = Kernel::default();
+        let origin = Point3::new(0.0, 0.0, 0.0);
+        let sweep = |k: &mut Kernel, b: &mut Brep, dir: Vec3, dist: f64, merge: bool| {
+            let face = Some(b.face_list()[0]);
+            let faces = [face];
+            let selection = SweepSelection {
+                faces: Some(&faces),
+                ..SweepSelection::default()
+            };
+            non_manifold_sweep(k, b, None, dir, dist, true, merge, selection)
+        };
+        for (dir, dist, merge) in [
+            (Vec3::new(0.0, 0.0, 1.0), 5.0, false),
+            (Vec3::new(0.0, 0.0, 3.0), 5.0, false),
+            (Vec3::new(0.0, 0.0, -1.0), -5.0, false),
+            (Vec3::new(0.0, 0.0, 1.0), 5.0, true),
+            (Vec3::new(1.0, 0.0, 1.0), 5.0, false),
+        ] {
+            let mut b = create_box(&mut k, origin, 10.0, 10.0, 10.0).unwrap();
+            let face = b.face_list()[0];
+            let r = sweep(&mut k, &mut b, dir, dist, merge);
+            let Err(e) = &r else {
+                panic!("{dir:?} {dist} {merge}: {r:?}")
+            };
+            let Some(&SweepFailure::FaceSweptIntoBody {
+                face: refused,
+                depth,
+                tolerance,
+            }) = e.sweep_failure()
+            else {
+                panic!("{dir:?} {dist} {merge}: {e}")
+            };
+            assert_eq!(refused, face);
+            let want = 5.0 * dir.z.abs() / dir.length();
+            assert!((depth - want).abs() <= 1e-12, "{depth} vs {want}");
+            assert!(tolerance > 0.0 && tolerance < 1e-3);
+            assert_eq!(e.kind(), crate::error::ErrorKind::InvalidInput);
+            assert_eq!(b.face_list().len(), 6, "the box is unchanged");
+        }
+        // the outward control
+        let mut b = create_box(&mut k, origin, 10.0, 10.0, 10.0).unwrap();
+        sweep(&mut k, &mut b, Vec3::new(0.0, 0.0, 1.0), -5.0, false).unwrap();
+        assert_eq!(b.face_list().len(), 11);
+        let bbox = crate::query::brep::calculate_bounding_box(
+            &k,
+            &mut b,
+            crate::query::brep::BoundingBoxOptions::default(),
+        )
+        .unwrap();
+        for (got, want) in [
+            (bbox.min(), Point3::new(0.0, 0.0, -5.0)),
+            (bbox.max(), Point3::new(10.0, 10.0, 10.0)),
+        ] {
+            // (the box is padded by the B-rep's tolerance)
+            assert!((got - want).length() <= 1e-4, "{got:?} vs {want:?}");
+        }
+        let volume =
+            crate::mass::integrator::properties::brep_volume_default(&k, &mut b, 1e-9).unwrap();
+        assert!((volume - 1500.0).abs() <= 1e-6, "{volume}");
     }
 }

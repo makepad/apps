@@ -35,6 +35,7 @@
 //! | [`UnbendVolume::is_line_in_param_domain_simple`]  | `IsLineInParamDomainSimple`                    |
 //! | [`UnbendVolume::is_curve_in_param_domain_simple`] | `IsCurveInParamDomainSimple`                   |
 //! | [`UnbendVolume::read_from_db`]                    | `ReadFromDB`                                   |
+//! | [`UnbendVolume::write_to_db`]                     | `WriteToDB` (the members, before the base data) |
 //! | [`UnbendVolume::make_exact_b_spline_1st_out_surface`] | `MakeExactBSpline1stOutSurface` (in no unit in units.json; called by `SrfInVolume::make_exact_b_spline_if_possible_with`) |
 //! | [`UnbendVolume::make_exact_b_spline_1st_out_curve`] | `MakeExactBSpline1stOutCurve` (in no unit in units.json; called by `CrvInVolume::make_exact_b_spline_if_possible_with`) |
 //! | [`UNBEND_VOLUME_TYPE`], [`is_kind_of`], [`Volume::type_code`] and friends | `GetType`, `GetTypeString`, `GetClassString` (`SM_COMMON`), `IsKindOf` |
@@ -109,6 +110,7 @@ use crate::curve::curve::p2::Curve;
 use crate::curve::curve::p4::has_plane_crossings;
 use crate::curve::curve::p6::calculate_bounding_box_base;
 use crate::curve::line::Line;
+use crate::error::surface::SurfaceFailure;
 use crate::error::{ignored, Result, SolidError};
 use crate::geom::extent1d::Extent1d;
 use crate::geom::extent2d::Extent2d;
@@ -123,6 +125,7 @@ use crate::geom::transform::Transform;
 use crate::geom::vector2d::{Point2, Vec2};
 use crate::geom::vector3d::{Point3, Vec3};
 use crate::kernel::Kernel;
+use crate::math::det;
 use crate::math::{
     max2, BIG_DOUBLE, EFF_ZERO, EFF_ZERO_DEG, EFF_ZERO_RAD, EFF_ZERO_SQ, INFINITE_PARAMETER,
     UNDEF_DOUBLE,
@@ -135,7 +138,7 @@ use crate::surface::volume::p1::{
     concat_evals, is_kind_of as volume_is_kind_of, EvalOptions, Volume, VolumeKind,
 };
 use crate::surface::volume::p2::ignore_read;
-use crate::topology::database_io::{DatabaseReader, FileType};
+use crate::topology::database_io::{DatabaseReader, DatabaseWriter, FileType};
 
 /// `lSmpSize` of `MakeExactBSpline1stOutSurface`: the sample grid is
 /// `(SMP_SIZE + 1) x (SMP_SIZE + 1)`.
@@ -358,7 +361,7 @@ impl UnbendVolume {
         let dr2 = du * du + dv * dv; // (u**2 + v**2)
         let dr1 = dr2.sqrt(); // (u**2 + v**2)**(1/2)
 
-        let datan = dv.atan2(du);
+        let datan = det::atan2(dv, du);
 
         let mid = volume.unbend_mid_dir();
         let bin = volume.unbend_binormal();
@@ -483,7 +486,7 @@ impl UnbendVolume {
         let dr2 = du * du + dv * dv; // (u**2 + v**2)
         let dr1 = dr2.sqrt(); // (u**2 + v**2)**(1/2)
 
-        let datan = dv.atan2(du);
+        let datan = det::atan2(dv, du);
 
         // init output array
         let mut d = vec![Vec3::ZERO; eval_size(n)];
@@ -736,8 +739,8 @@ impl UnbendVolume {
         let theta = proj_point.y / dd;
 
         // the inverse map from ProjSpace to ParamSpace
-        let du = dr * theta.cos();
-        let dv = dr * theta.sin();
+        let du = dr * det::cos(theta);
+        let dv = dr * det::sin(theta);
         let dw = proj_point.z;
         Vec3::new(du, dv, dw)
     }
@@ -767,12 +770,22 @@ impl UnbendVolume {
 
         // check - crProjPoint must be in a valid domain
         if !volume.is_point_in_param_domain(proj_point, true)? {
-            return Err(SolidError::sm_err(OP_GLOBAL));
+            return Err(SolidError::surface(
+                OP_GLOBAL,
+                SurfaceFailure::PointOutsideVolumeDomain {
+                    point: [proj_point.x, proj_point.y, proj_point.z],
+                },
+            ));
         }
 
         // check - crProjPoint must be in OptParamDomain
         if param_domain.is_some_and(|d| !d.contains_point(proj_point, EFF_ZERO)) {
-            return Err(SolidError::sm_err(OP_GLOBAL));
+            return Err(SolidError::surface(
+                OP_GLOBAL,
+                SurfaceFailure::PointOutsideGivenDomain {
+                    point: [proj_point.x, proj_point.y, proj_point.z],
+                },
+            ));
         }
 
         // inverted ParamPoint
@@ -1148,8 +1161,8 @@ impl UnbendVolume {
             // check orientation of surface (positive = SrfNormals pt in CCW direction about
             // UnbendAxis
             let inspace_ang_rad = mid_dir_ang_rad_range.mid();
-            positive = (inspace_ang_rad.cos() * input_binormal
-                - inspace_ang_rad.sin() * input_mid_dir)
+            positive = (det::cos(inspace_ang_rad) * input_binormal
+                - det::sin(inspace_ang_rad) * input_mid_dir)
                 .dot(input_surface_normal)
                 > 0.0;
 
@@ -1395,6 +1408,23 @@ impl UnbendVolume {
         // read base class data (status ignored)
         ignore_read(volume.read_base_from_db(db, version))?;
         Ok(volume)
+    }
+
+    /// The part of `WriteToDB` before the volume base data, the members
+    /// [`UnbendVolume::read_from_db`] reads: `unbend_neutral_dist` and `singularity_tol` (ASCII: each value
+    /// followed directly by its label, as upstream).
+    pub fn write_to_db(&self, db: &mut DatabaseWriter) {
+        if db.file_type() == FileType::Ascii {
+            db.out_f64(self.unbend_neutral_dist);
+            db.out_str("UnbendVolume Unbend NeutralDistance \n");
+            db.out_f64(self.singularity_tol);
+            db.out_str(
+                "UnbendVolume SingularityTol: min legal distance from singularity at U = 0\n",
+            );
+        } else {
+            db.write_double(self.unbend_neutral_dist);
+            db.write_double(self.singularity_tol);
+        }
     }
 }
 

@@ -98,12 +98,13 @@
 //!   flags and rejects a face-owned trimmed build without a [`CacheFace`](crate::surface::trim_srf_cache::CacheFace)
 //!   adapter, instead of silently building a plain cache. [`SurfaceCache::subdivide_node`]
 //!   does not call `GetTree` (it needs a built tree and fails without one).
-//! - **Cache slot.** Filling the continuity arrays (`BuildTreeBase`) also marks the
-//!   cache slot of the cache's surface built
-//!   ([`CacheTreeState::Built`](crate::surface::surface::CacheTreeState)), so that a
-//!   later cache made for the same surface object shows its continuities as upstream's
-//!   reused cache does.
+//! - **Continuity arrays.** `BuildTreeBase` takes them from the surface's memo
+//!   ([`Surface::continuities`]). The readers that call no `GetTree` upstream
+//!   (`GetDomainWithContinuity`, `LiftCurve`, `FindBoundaryStartPoints`) read that memo
+//!   instead of a cache's arrays, which stay empty until the tree is built, as
+//!   upstream's.
 
+use crate::error::surface::SurfaceFailure;
 use crate::error::{Result, SolidError};
 use crate::geom::extent2d::Extent2d;
 use crate::geom::tol::ZONE_TOL_3D;
@@ -117,7 +118,8 @@ use crate::nurbs::b_spline_surface::{BSplineSurface, BoundingBoxRequest, SurfPar
 use crate::nurbs::nurbs_srf::split_srf;
 use crate::nurbs::srf_basic::Direction;
 use crate::nurbs::srf_basic::Surface as NurbSurface;
-use crate::surface::surface::{CacheTreeState, Surface, SurfaceKind};
+use crate::surface::procedural_blend::NetScope;
+use crate::surface::surface::{Surface, SurfaceKind};
 
 use crate::geom::geom_utility::p2::ContinuityType;
 
@@ -414,6 +416,8 @@ impl<O: Copy + PartialEq> SurfaceCache<O> {
         direction: SurfParamType,
         only_aux_data: bool,
     ) -> Result<Option<(NodeId, NodeId)>> {
+        // the cache is built on blends' nets (the fork's 729f893; `SmBlendNetScope`)
+        let _net = NetScope::new(k);
         let mut only_aux_data = only_aux_data;
         // Upstream starts with GetTree(), which builds the tree when there is none or
         // rebuilds it for a face-owned plain cache outside a build (m_bHaveTSurfaceCache
@@ -710,7 +714,13 @@ impl<O: Copy + PartialEq> SurfaceCache<O> {
             let h = self
                 .new_subdivision_handle()
                 .ok_or_else(|| invalid(OP_NODE, "cache cannot name new subdivision surfaces"))?;
-            let is_bspline = matches!(half.kind(), SurfaceKind::BSpline(_));
+            // (SM_CAST_PTR(SmBSplineSurface, ..): the fork's SmProceduralBlend halves too)
+            let is_bspline = matches!(
+                half.kind(),
+                SurfaceKind::BSpline(_)
+                    | SurfaceKind::ProceduralBlend(_)
+                    | SurfaceKind::BallPatch(_)
+            );
             self.subdivision_surfaces_mut().push((h, half));
             *slot = is_bspline.then_some(h);
         }
@@ -750,6 +760,15 @@ impl<O: Copy + PartialEq> SurfaceCache<O> {
             };
             if let Some(b) = bbox {
                 self.tree_mut_or(OP_NODE)?.node_mut(child)?.bbox = b;
+            }
+            // (the fork's 729f893: a blend by its definition lies within its net's bound of
+            // the net)
+            let grow = definition_bound(self.surface());
+            if grow > 0.0 {
+                self.tree_mut_or(OP_NODE)?
+                    .node_mut(child)?
+                    .bbox
+                    .expand_absolute(grow);
             }
         }
         Ok(split_param)
@@ -846,6 +865,8 @@ impl<O: Copy + PartialEq> SurfaceCache<O> {
         depth: u32,
         tester: &mut ToleranceTester<'_, O>,
     ) -> Result<()> {
+        // the cache is built on blends' nets (the fork's 729f893; `SmBlendNetScope`)
+        let _net = NetScope::new(k);
         // performance only: the outermost call memoises the singularity test's pole
         // data for the splits below it (see the deviations of `surface_cache::p1`)
         let owns_memo = self.begin_pole_memo();
@@ -869,6 +890,7 @@ impl<O: Copy + PartialEq> SurfaceCache<O> {
                 "subdivision deeper than MAX_SUBDIVISION_DEPTH",
             ));
         }
+        k.check_cancelled(OP_TOL)?;
 
         // test to see if subdivision is required and pick a split direction
         let test = tester(self, k, node)?;
@@ -965,6 +987,8 @@ impl<O: Copy + PartialEq> SurfaceCache<O> {
         k: &Kernel,
         tester: &mut ToleranceTester<'_, O>,
     ) -> Result<TreeBase> {
+        // the cache is built on blends' nets (the fork's 729f893; `SmBlendNetScope`)
+        let _net = NetScope::new(k);
         // store an allocated and empty decomposition tree
         let mut tree: Tree<O> = Tree::new(Some(TreeOwner::SurfaceCache));
         tree.set_owner_surface(self.surface_handle());
@@ -975,6 +999,14 @@ impl<O: Copy + PartialEq> SurfaceCache<O> {
         // when it has none, as GetOrCreateGwNurbPointer)
         let bspline: Option<std::borrow::Cow<'_, BSplineSurface>> = match self.surface().kind() {
             SurfaceKind::BSpline(b) => Some(std::borrow::Cow::Borrowed(b)),
+            SurfaceKind::ProceduralBlend(pb) => {
+                let b = pb.net();
+                Some(std::borrow::Cow::Borrowed(b))
+            }
+            SurfaceKind::BallPatch(bp) => {
+                let b = bp.net();
+                Some(std::borrow::Cow::Borrowed(b))
+            }
             SurfaceKind::Plane(p) => Some(p.base_with_nurb()?),
             // GetOrCreateGwNurbPointer: SmSurfOfRevolution::MakeNurb when it has none,
             // kept on the surface (`Surface::kind_with_nurb`, status ignored)
@@ -1020,30 +1052,9 @@ impl<O: Copy + PartialEq> SurfaceCache<O> {
         self.auxs_mut().clear();
 
         // set the continuities (continuity is in the opposite direction to the query)
-        let u_conts = calculate_continuities(k, self.surface(), SurfParamType::U)?;
-        let v_conts = calculate_continuities(k, self.surface(), SurfParamType::V)?;
-        self.set_continuities(u_conts, v_conts);
-        // the surface's cache now has its continuity arrays (its cache slot, shared
-        // with the surface the cache was made from)
-        self.surface().set_cache_tree_state(CacheTreeState::Built);
+        let conts = self.surface().continuities(k)?;
+        self.set_continuities(conts.u.clone(), conts.v.clone());
         self.build_tree_base_nodes(k, u_count, v_count, tester)
-    }
-
-    /// Sets the continuity arrays a cache of this surface already has when its tree
-    /// was built before (the surface's cache slot is
-    /// [`CacheTreeState::Built`](crate::surface::surface::CacheTreeState)) but this cache
-    /// is made without building one (during a Boolean operation): upstream reuses the
-    /// built cache, whose `BuildTreeBase` computed them from the same surface.
-    ///
-    /// # Errors
-    ///
-    /// Those of `SmSurface::CalculateContinuities` ([`SolidError::Unported`] for kinds
-    /// without iso curves).
-    pub fn restore_continuities(&mut self, k: &Kernel) -> Result<()> {
-        let u_conts = calculate_continuities(k, self.surface(), SurfParamType::U)?;
-        let v_conts = calculate_continuities(k, self.surface(), SurfParamType::V)?;
-        self.set_continuities(u_conts, v_conts);
-        Ok(())
     }
 
     /// The rest of [`SurfaceCache::build_tree_base`] once the continuities are set.
@@ -1166,6 +1177,8 @@ impl<O: Copy + PartialEq> SurfaceCache<O> {
         for_derived_cache: bool,
         tester: &mut ToleranceTester<'_, O>,
     ) -> Result<()> {
+        // the cache is built on blends' nets (the fork's 729f893; `SmBlendNetScope`)
+        let _net = NetScope::new(k);
         // to prevent bad recursion back into BuildTree - turn off point testing
         let saved_point_test = self.point_test_enabled;
         let saved_containment = self.face_containment_done;
@@ -1233,8 +1246,9 @@ impl<O: Copy + PartialEq> SurfaceCache<O> {
                 let built = self.build_tree(k, false);
                 self.face_containment_done = saved;
                 built?;
+                // (point testing is left on: a surface without a face keeps every
+                // point, `SurfaceCache::point_test_with`)
                 self.process_boundary_curves = true;
-                self.point_test_enabled = false;
                 self.have_t_surface_cache = false;
             } else {
                 self.build_tree(k, false)?;
@@ -1245,8 +1259,8 @@ impl<O: Copy + PartialEq> SurfaceCache<O> {
 }
 
 /// `CalculateBoundingBox(domain, &box, NULL, NULL, NULL, NULL)` of a split half (the
-/// B-spline override, boxes expanded by the zone tolerance); the base body's `SM_ERR`
-/// for other kinds.
+/// B-spline override, boxes expanded by the zone tolerance, and a procedural blend's,
+/// grown by its bound); the base body's `SM_ERR` for other kinds.
 fn half_box(
     k: &Kernel,
     half: &Surface,
@@ -1265,18 +1279,26 @@ fn half_box(
             )?
             .normal
             .ok_or_else(|| invalid(OP_NODE, "no bounding box")),
-        _ => Err(SolidError::sm_err(OP_NODE)),
+        // (the fork's SmProceduralBlend::CalculateBoundingBox: the net's, grown by the
+        // bound)
+        SurfaceKind::ProceduralBlend(pb) => pb
+            .calculate_bounding_box(
+                k,
+                domain,
+                &BoundingBoxRequest {
+                    normal: true,
+                    expand_by_zone_tol: true,
+                    ..BoundingBoxRequest::default()
+                },
+                half,
+            )?
+            .normal
+            .ok_or_else(|| invalid(OP_NODE, "no bounding box")),
+        _ => Err(SolidError::surface(
+            OP_NODE,
+            SurfaceFailure::UnsupportedSurfaceKind,
+        )),
     }
-}
-
-/// `SmSurface::CalculateContinuities(eSurfParam, ..)`: the continuity at every unique
-/// knot of the surface in `dir`.
-fn calculate_continuities(
-    k: &Kernel,
-    surface: &Surface,
-    dir: SurfParamType,
-) -> Result<Vec<ContinuityType>> {
-    Ok(surface.calculate_continuities(k, dir)?.1)
 }
 
 /// `sm_InitNurbSurfaceMemory` with the sizes of `like` on zero-filled block memory.
@@ -1297,8 +1319,17 @@ fn zeroed_like(like: &NurbSurface) -> Result<NurbSurface> {
 fn ignore<T>(r: Result<T>) -> Result<Option<T>> {
     match r {
         Ok(v) => Ok(Some(v)),
-        Err(e) if e.is_unported() => Err(e),
+        Err(e) if e.is_unported_or_cancelled() => Err(e),
         Err(_) => Ok(None),
+    }
+}
+
+/// `sm_DefinitionBound` (the fork's 729f893): how far a surface may be off its net, a blend
+/// by its definition's certified bound, 0 for any other surface (its net is it).
+pub(crate) fn definition_bound(surface: &Surface) -> f64 {
+    match surface.kind() {
+        SurfaceKind::ProceduralBlend(p) => p.bound(),
+        _ => 0.0,
     }
 }
 
@@ -1590,5 +1621,57 @@ mod tests {
         cache
             .build_tree_base(&k)
             .expect("a finite tolerance must still build");
+    }
+
+    /// A split procedural blend's halves are kept as subdivision surfaces and boxed by
+    /// the blend's own `CalculateBoundingBox` (the fork's virtual call, fork 0136260):
+    /// the net's box grown by the zone tolerance and then the bound; before, the halves
+    /// were not boxed (`SM_ERR`).
+    #[test]
+    fn a_procedural_blend_half_is_boxed_as_the_blend() {
+        use crate::geom::vector3d::Point3;
+        use crate::nurbs::b_spline_curve::BSplineCurve;
+        use crate::surface::procedural_blend::{BlendDefinitionInput, ProceduralBlend};
+        let k = Kernel::default();
+        let square = |z: f64| {
+            BSplineSurface::create_bilinear_surface(
+                Point3::new(0.0, 0.0, z),
+                Point3::new(1.0, 0.0, z),
+                Point3::new(0.0, 1.0, z),
+                Point3::new(1.0, 1.0, z),
+            )
+            .unwrap()
+        };
+        let line = || {
+            BSplineCurve::create_line_segment(
+                3,
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(1.0, 0.0, 0.0),
+            )
+            .unwrap()
+        };
+        let (s0, s1) = (Surface::from(square(0.0)), Surface::from(square(1.0)));
+        let (leader, seed) = (line(), line());
+        let input = BlendDefinitionInput {
+            supports: [&s0, &s1],
+            sides: [1.0, -1.0],
+            offsets: [0.5, 0.5],
+            law: None,
+            order: 1,
+            thumbweight: 0.0,
+            leader: &leader,
+            seeds: [&seed, &seed],
+            bound: 1e-3,
+            chamfer: None,
+        };
+        let pb = Surface::from(
+            ProceduralBlend::create(&k, &square(0.5), &input, |_, w| w < 1.0).unwrap(),
+        );
+        let (l, _) = pb.split_at(&k, 0.4, SurfParamType::U).unwrap();
+        let dom = l.natural_uv_domain_with_nurb(&k).unwrap();
+        let b = half_box(&k, &l, &dom).unwrap();
+        let grow = ZONE_TOL_3D + 1e-3;
+        assert!((b.min() - Point3::new(-grow, -grow, 0.5 - grow)).length() < 1e-15);
+        assert!((b.max() - Point3::new(0.4 + grow, 1.0 + grow, 0.5 + grow)).length() < 1e-15);
     }
 }

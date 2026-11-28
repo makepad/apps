@@ -21,7 +21,7 @@ use crate::nurbs::b_spline_surface_n_lib::p2::OrientType;
 use crate::offset::offset_geometry_creation::{
     FaceOffsetBrep, LocalOperationGeometryCreation, OffsetGeometryCreation, SsiData,
 };
-use crate::surface::surface::Surface;
+use crate::surface::surface::{Surface, SurfaceKind};
 use crate::topology::{edgeuse::p1 as faceuse_ops, face::p2 as face_ops, Brep, FaceId, FaceuseId};
 
 const OP: &str = "offset::offset_executive::face";
@@ -181,7 +181,20 @@ pub(super) fn build_local(
 ) -> Result<(Option<Surface>, SsiData<Curve>)> {
     let mut backend = FaceBrep {
         original,
-        surfaces: surfaces.iter().cloned().map(Some).collect(),
+        // (not upstream) a bare B-spline net keeps its exact data: a fresh, unowned
+        // surface over an exact copy, not the copy constructor's near-coincident knot
+        // fix-up (the local operation's own-frame move promises knots unchanged). Any
+        // other provided surface takes the ordinary copy as it did.
+        surfaces: surfaces
+            .iter()
+            .map(|surface| match surface.kind() {
+                SurfaceKind::BSpline(net) if surface.procedural_definition().is_none() => {
+                    Surface::from(net.clone_exact())
+                }
+                _ => surface.clone(),
+            })
+            .map(Some)
+            .collect(),
         curves: Vec::new(),
     };
     let creator = LocalOperationGeometryCreation::from_handles(
@@ -202,6 +215,7 @@ mod tests {
     use crate::geom::attribute::ObjectKey;
     use crate::geom::object::ObjectRef;
     use crate::geom::vector2d::Point2;
+    use crate::math::det;
     use crate::math::Vec3;
     use crate::nurbs::b_spline_curve::BSplineCurve;
     use crate::nurbs::b_spline_surface::BSplineSurface;
@@ -430,9 +444,9 @@ mod tests {
         assert!(surface.is_none() && ssi.curves_3d.is_empty());
     }
 
-    /// source issue #1072 (WR-464): the collapse threshold of the cylinder,
-    /// cone, sphere and torus. Past it the offset has no surface and the flag does not
-    /// turn that into a failure; short of it the offset is a surface.
+    /// tangency-labs/solidcore#1072 (WR-464): the collapse threshold of the cylinder,
+    /// cone, sphere and torus. Past it the offset has no surface (not a failure); short of
+    /// it the offset is a surface.
     #[test]
     fn collapse_thresholds_of_the_analytic_surfaces() {
         use crate::geom::axis2_placement::Axis2Placement;
@@ -443,7 +457,7 @@ mod tests {
         let k0 = Kernel::default();
         let frame = Axis2Placement::IDENTITY;
         let cone = Cone::create_canonical(&k0, &frame, 2.0, 1.0, 3.0, false, false).unwrap();
-        let cone_cos = (cone.semi_angle_deg() * std::f64::consts::PI / 180.0).cos();
+        let cone_cos = det::cos(cone.semi_angle_deg() * std::f64::consts::PI / 180.0);
         let cylinder = Cone::create_canonical_cylinder(&k0, &frame, 1.5).unwrap();
         let sphere = Sphere::create_canonical(&k0, &frame, 2.0).unwrap();
         let torus =
@@ -455,27 +469,24 @@ mod tests {
             (Surface::from(sphere), -1.9, -2.1),
             (Surface::from(torus), -0.4, -0.6),
         ];
-        for fixes in [false, true] {
-            let mut kernel = Kernel::default();
-            kernel.fixes.offset_missing_surface_fails = fixes;
-            for (surface, short, past) in &cases {
-                let (original, _, faceuse) = source(surface.clone(), OrientType::Same);
-                for (d, collapses) in [(*short, false), (*past, true)] {
-                    assert_eq!(
-                        surface.offset_collapses(&kernel, d, 1e-7).unwrap(),
-                        collapses
-                    );
-                    let mut backend = backend(&original);
-                    let made = OffsetGeometryCreation::new(d, 1e-6)
-                        .faceuse_offset_with_backend(
-                            &kernel,
-                            &mut backend,
-                            Handle::SourceFaceuse(faceuse),
-                            true,
-                        )
-                        .unwrap();
-                    assert_eq!(made.0.is_none(), collapses, "{d}");
-                }
+        let kernel = Kernel::default();
+        for (surface, short, past) in &cases {
+            let (original, _, faceuse) = source(surface.clone(), OrientType::Same);
+            for (d, collapses) in [(*short, false), (*past, true)] {
+                assert_eq!(
+                    surface.offset_collapses(&kernel, d, 1e-7).unwrap(),
+                    collapses
+                );
+                let mut backend = backend(&original);
+                let made = OffsetGeometryCreation::new(d, 1e-6)
+                    .faceuse_offset_with_backend(
+                        &kernel,
+                        &mut backend,
+                        Handle::SourceFaceuse(faceuse),
+                        true,
+                    )
+                    .unwrap();
+                assert_eq!(made.0.is_none(), collapses, "{d}");
             }
         }
     }

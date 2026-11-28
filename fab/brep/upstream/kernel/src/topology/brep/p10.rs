@@ -15,8 +15,12 @@
 //! | [`remove_all_topology_notified`]  | `SmBrep::RemoveAllTopology` (caller's records)  |
 //! | [`test_closure_split_region`]     | `SmBrep::TestClosureSplitRegion(SmBoolean, SmEdge*, ...)` |
 //! | [`HEALER_VERSION`]                | `SM_HEALER_VERSION`                              |
+//! | [`subdivide_face_at_discontinuities`] | `SmBrep::SubdivideFaceAtDiscontinuities`     |
 //!
 //! Deviations:
+//! - **A failed side projection refuses the trim.** `ProjectAndTrim`'s face votes read
+//!   every failure of `sm_FindSideOfCurve` as a point on the curve; a point whose
+//!   projection onto the curve has no solution is refused here instead (#13679).
 //! - **Out-params -> return values.** `rpNewShells` / `rpNewRegions` are returned in a
 //!   [`ClosureSplit`].
 //! - **Arena model.** Upstream stores the new objects' addresses in the B-rep data
@@ -44,7 +48,12 @@
 //!   identities of the geometry copies (their attributes are listed under them in
 //!   [`TopologyEnv::attributes`]). Each B-rep data curve or surface gets its copy as
 //!   owner, as upstream; the copy is found again through a local table (a data
-//!   object owned by anything else is [`SolidError::InvalidInput`]).
+//!   object owned by anything else is [`SolidError::InvalidInput`]). An address is
+//!   distinct and its object's type is known, so identities that do not name each
+//!   built object distinctly under its own type code are refused with
+//!   [`SolidError::InvalidInput`] before healing: the geometry owners would name no
+//!   edge, face or edge use, and every later owner lookup (a solve's `GetEdge`,
+//!   `GetFace`) would find nothing.
 //! - **Notifications.** The `SM_NO_COPY` of an analytic edge curve and the
 //!   `SM_NO_CHANGE_OWNER` of `SetOwner` go to the kernel's context; the
 //!   construction and destruction notifications of new and deleted temporary objects
@@ -69,18 +78,37 @@
 //!   (upstream dereferences it) is [`SolidError::InvalidInput`].
 //! - **UV trim curves.** `m_pUVTrimCurve = SM_CAST_PTR(SmBSplineCurve, pNewUV)`: a copy
 //!   that is not a B-spline curve is made and owned but not stored.
+//! - **`SubdivideFaceAtDiscontinuities`.** The V pass of the iso-line loop counts the V
+//!   knots, where upstream takes the U knot count (`SmBrep.cpp:18483`, WR-589: upstream
+//!   leaves V knots past the U count uncut, cuts none in V when there are no U knots,
+//!   and reads past its V knots when there are more U knots). Not upstream: a fixed
+//!   defect, on the default path, since no upstream caller reaches the function. A failed
+//!   `CreateLineOnSurf` (its status is ignored upstream) is
+//!   [`SolidError::InvalidInput`] (not compared). The null-segment clean-up loop
+//!   revisits an edge whose trim changed its knot count, as upstream, and stops with
+//!   [`SolidError::InvalidInput`] once its edge list grows past
+//!   [`MAX_NULL_SEGMENT_REVISITS`] entries beyond the face's edges (upstream would not
+//!   end). The curve trims there notify nothing beyond the curve itself (the edge
+//!   owning it is not told). The UV trim curves the merge makes are bound to their edge
+//!   uses afterwards, as in [`project_and_trim`].
 
 use crate::curve::curve::p2::{BSPLINE_CURVE_TYPE, LINE_TYPE};
 use crate::curve::curve::Curve;
-use crate::error::{ignored, EntityRef, Result, SolidError};
+use crate::error::topology::TopologyFailure;
+use crate::error::{
+    ignore_status, ignored, EntityRef, Failure, Result, SolidError, SM_ERR_NULL_POINTER,
+};
 use crate::geom::a_object;
 use crate::geom::attribute::{AttributeHandle, AttributeStore, ObjectKey};
+use crate::geom::extent1d::Extent1d;
 use crate::geom::extent2d::Extent2d;
 use crate::geom::extent3d::Extent3d;
 use crate::geom::geom_utility::p1::line_closest_point;
+use crate::geom::geom_utility::p2::ContinuityType;
 use crate::geom::global_solver::{SolutionRequested, SolverOperation};
 use crate::geom::object::{NotifyOperation, ObjectRef, Shape};
 use crate::geom::solution_array::Solution;
+use crate::geom::tol::{are_same, ZONE_TOL_3D};
 use crate::heal::face_props::HealerOpType;
 use crate::intersect::curve_class::p5::ClassGeometryMut;
 use crate::intersect::curve_class::p6::{MergeContext, MergeIntervalBrep};
@@ -88,8 +116,9 @@ use crate::intersect::point_class::ClassGeometry;
 use crate::intersect::topology_solver::p1::{CurveRef, TopologySolver};
 use crate::intersect::topology_solver::p2::TopologySolveOptions;
 use crate::kernel::Kernel;
-use crate::math::{max2, Point3, Vec3, BIG_DOUBLE, EFF_ZERO};
+use crate::math::{max2, Point2, Point3, Vec3, BIG_DOUBLE, EFF_ZERO};
 use crate::nurbs::b_spline_curve::BSplineCurve;
+use crate::nurbs::b_spline_curve_n_lib::TrimMode;
 use crate::nurbs::b_spline_surface_n_lib::p2::OrientType;
 use crate::query::brep::{self as qbrep, BoundingBoxOptions};
 use crate::query::face::p2::{CurveOnClassifyBrep, CurveOnClassifyObjects, FaceBrep};
@@ -97,6 +126,7 @@ use crate::surface::surface::Surface;
 use crate::topology::brep::p1;
 use crate::topology::brep::p4;
 use crate::topology::brep::p6;
+use crate::topology::brep::p9;
 use crate::topology::brep_cache::{make_brep_cache, CacheObject, CacheSource};
 use crate::topology::brep_data::{BrepData, TopologyData, NO_OBJECT, UNSURE};
 use crate::topology::edge::NotifyEnv;
@@ -166,7 +196,10 @@ pub struct TopologyEnv<'a> {
     /// The attribute lists of the B-rep data's curves and surfaces (by their
     /// [`crate::topology::brep_data::Keyed::key`]) and of the copies made from them.
     pub attributes: &'a mut AttributeStore,
-    /// The identity (an upstream address) of each topology entity of the B-rep.
+    /// The identity (an upstream address) of each topology entity of the B-rep: distinct
+    /// per entity and carrying the entity's own type code (`SmEdge_TYPE` for an edge, ...),
+    /// as [`crate::topology::loopuse::notify_ref`] makes them. [`make_topology_from_data`]
+    /// refuses identities that are not.
     pub key_of: &'a dyn Fn(EntityRef) -> ObjectRef,
     /// The `SmTopology` records (flags, user values) of the topology objects, by
     /// identity; one is added for each object built.
@@ -192,14 +225,14 @@ fn index(i: u64, len: usize, what: &'static str) -> Result<usize> {
     usize::try_from(i)
         .ok()
         .filter(|&i| i < len)
-        .ok_or(SolidError::invalid_input(OP_MAKE, what))
+        .ok_or_else(|| SolidError::invalid_input(OP_MAKE, what))
 }
 
 fn at<T: Copy>(v: &[Option<T>], i: usize, what: &'static str) -> Result<T> {
     v.get(i)
         .copied()
         .flatten()
-        .ok_or(SolidError::invalid_input(OP_MAKE, what))
+        .ok_or_else(|| SolidError::invalid_input(OP_MAKE, what))
 }
 
 /// `sm_AddAttributes` (unit `topology.brep_p1`): adds the attributes listed by index
@@ -483,6 +516,7 @@ fn make_topology(
     fill_shells(b, env, data, &built, &shell_map)?;
     link_loops(b, data, &built)?;
     set_primary_edgeuses(b, data, &built)?;
+    check_identities(b, env.key_of)?;
 
     // Set isManifold after all objects are created and connected to one another
     if calculate_is_manifold {
@@ -493,22 +527,124 @@ fn make_topology(
     // When requested and needed - find and heal common AssertValid problems
     let heal_this_brep = data.healer_version() < HEALER_VERSION;
     if options.healer_enabled && (heal_this_brep || options.always_heal) {
-        // Run the Assert/Heal sequences as needed (status ignored upstream)
-        p1::heal_brep(
-            k,
-            b,
-            HealerOpType::All,
-            None,
-            None,
-            None,
-            options.make_uv_trim_curves,
-        )?;
-        // UV trim curves created inside the healer (Make_UVTrimCurves and
-        // ClassifyLoops' snapshot write-back) have no caller owner yet; bind them to
-        // their edge uses as upstream's SetUVTrimCurve(this) does.
-        bind_uv_trim_owners(b, env.key_of)?;
+        heal_made(k, b, env.key_of, options.make_uv_trim_curves)?;
     }
     let _ = options.check_uv_trim_curves; // SM_REF1: not used
+    Ok(())
+}
+
+/// The healing [`make_topology_from_data`] runs on the B-rep it made from data (all the
+/// Assert/Heal sequences, `HealBrep(SM_HO_ALL)`), for a caller that makes the B-rep with the
+/// healer off and heals it after, to see what the healer changed (the conversion's record
+/// order: entities the healer removes or adds are no longer the data's).
+///
+/// # Errors
+///
+/// [`SolidError::InvalidInput`] for identities that do not name each object of `b`
+/// distinctly under its own type code (as [`make_topology_from_data`] refuses them);
+/// those of the healer and of binding the UV trims it makes.
+pub fn heal_made(
+    k: &mut Kernel,
+    b: &mut Brep,
+    key_of: &dyn Fn(EntityRef) -> ObjectRef,
+    make_uv_trim_curves: bool,
+) -> Result<()> {
+    // the healer resolves geometry owners through these identities
+    check_identities(b, key_of)?;
+    // Run the Assert/Heal sequences as needed (status ignored upstream)
+    p1::heal_brep(
+        k,
+        b,
+        HealerOpType::All,
+        None,
+        None,
+        None,
+        make_uv_trim_curves,
+    )?;
+    // UV trim curves created inside the healer (Make_UVTrimCurves and
+    // ClassifyLoops' snapshot write-back) have no caller owner yet; bind them to
+    // their edge uses as upstream's SetUVTrimCurve(this) does.
+    bind_uv_trim_owners(b, key_of)
+}
+
+/// Refuses identities that cannot stand for upstream's addresses: every topology object
+/// of `b` must be named distinctly and under its own type code. The geometry owners the
+/// build recorded are these identities, and `GetEdge` / `GetFace` resolve an owner by its
+/// type code and then by identity; a curve owned by a non-edge identity names no edge, so
+/// every point-edge solve on it (the healer's ray fires among them) has no edge to solve
+/// on, and a key two objects share resolves to the wrong one.
+///
+/// # Errors
+///
+/// [`SolidError::InvalidInput`] for an identity whose type code is not its object's or
+/// one two objects share.
+fn check_identities(b: &Brep, key_of: &dyn Fn(EntityRef) -> ObjectRef) -> Result<()> {
+    use crate::geom::assert_array::labels as l;
+    let entities = b
+        .regions()
+        .ids()
+        .map(|id| (EntityRef::Region(id), l::REGION_TYPE))
+        .chain(
+            b.shells()
+                .ids()
+                .map(|id| (EntityRef::Shell(id), l::SHELL_TYPE)),
+        )
+        .chain(
+            b.faceuses()
+                .ids()
+                .map(|id| (EntityRef::Faceuse(id), l::FACEUSE_TYPE)),
+        )
+        .chain(
+            b.faces()
+                .ids()
+                .map(|id| (EntityRef::Face(id), l::FACE_TYPE)),
+        )
+        .chain(
+            b.loopuses()
+                .ids()
+                .map(|id| (EntityRef::Loopuse(id), l::LOOPUSE_TYPE)),
+        )
+        .chain(
+            b.loops()
+                .ids()
+                .map(|id| (EntityRef::Loop(id), l::LOOP_TYPE)),
+        )
+        .chain(
+            b.edgeuses()
+                .ids()
+                .map(|id| (EntityRef::Edgeuse(id), l::EDGEUSE_TYPE)),
+        )
+        .chain(
+            b.edges()
+                .ids()
+                .map(|id| (EntityRef::Edge(id), l::EDGE_TYPE)),
+        )
+        .chain(
+            b.vertexuses()
+                .ids()
+                .map(|id| (EntityRef::Vertexuse(id), l::VERTEXUSE_TYPE)),
+        )
+        .chain(
+            b.vertices()
+                .ids()
+                .map(|id| (EntityRef::Vertex(id), l::VERTEX_TYPE)),
+        );
+    let mut seen = std::collections::BTreeSet::new();
+    for (entity, type_code) in entities {
+        let identity = key_of(entity);
+        if identity.type_code != type_code {
+            return Err(SolidError::invalid_input(
+                OP_MAKE,
+                "an object identity does not carry its object's type code",
+            ));
+        }
+        if !seen.insert(identity) {
+            return Err(SolidError::invalid_input(
+                OP_MAKE,
+                "two objects share one identity",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -564,7 +700,15 @@ fn build_regions(
     if data.manifold == 1 && data.regions.len() == 1 {
         // smiges_ReadIges: a single solid region; the infinite region and the void
         // regions are implied.
-        let rr = data.regions.first().ok_or(SolidError::sm_err(OP_MAKE))?;
+        let rr = data.regions.first().ok_or_else(|| {
+            SolidError::topology(
+                OP_MAKE,
+                TopologyFailure::Defect {
+                    why: "the single region record is not there, though the list was just \
+                          counted to hold one",
+                },
+            )
+        })?;
         let solid = new_region(b, env, Region::default())?;
         add_attributes(env, EntityRef::Region(solid), &rr.topology.attributes)?;
         set_topology(env, EntityRef::Region(solid), &rr.topology);
@@ -659,7 +803,12 @@ fn build_regions(
                 *slot = Some(s);
             }
             if rs.shell_type > 2 {
-                return Err(SolidError::sm_err(OP_MAKE));
+                return Err(SolidError::topology(
+                    OP_MAKE,
+                    TopologyFailure::UnknownShellType {
+                        shell_type: rs.shell_type,
+                    },
+                ));
             }
             b.shell_mut(s)?.shell_type = match rs.shell_type {
                 0 => ShellType::Faceuse,
@@ -841,11 +990,17 @@ fn face_surface(
                 OP_MAKE,
                 "data surface owned outside this B-rep",
             ))?;
-    let owner = b
-        .face(owner_face)?
-        .surface
-        .as_ref()
-        .ok_or(SolidError::null_pointer(OP_MAKE))?;
+    let owner = b.face(owner_face)?.surface.as_ref().ok_or_else(|| {
+        Failure::new(
+            OP_MAKE,
+            TopologyFailure::Defect {
+                why: "the owner face has no surface, though a face is listed as an owner \
+                          only once its surface is made",
+            },
+        )
+        .with_status(SM_ERR_NULL_POINTER)
+        .into_error()
+    })?;
     let mut copy = owner.copy(k)?;
     let key = env.new_key()?;
     let copy_ref = ObjectRef {
@@ -1096,11 +1251,17 @@ fn edge_curve(
                 OP_MAKE,
                 "data curve owned outside this B-rep",
             ))?;
-    let owner = b
-        .edge(owner_edge)?
-        .curve
-        .as_ref()
-        .ok_or(SolidError::null_pointer(OP_MAKE))?;
+    let owner = b.edge(owner_edge)?.curve.as_ref().ok_or_else(|| {
+        Failure::new(
+            OP_MAKE,
+            TopologyFailure::Defect {
+                why: "the owner edge has no curve, though an edge is listed as an owner \
+                          only once its curve is made",
+            },
+        )
+        .with_status(SM_ERR_NULL_POINTER)
+        .into_error()
+    })?;
     let mut curve = owner.copy(k)?;
     let key = env.new_key()?;
     let curve_ref = ObjectRef {
@@ -1144,7 +1305,10 @@ fn build_edgeuses(
             // NER(pNewVU), NER(pNewVU->m_pNext): the next use of a non-empty
             // circular list is never null
             if list.is_empty() {
-                return Err(SolidError::null_pointer(OP_MAKE));
+                return Err(SolidError::topology(
+                    OP_MAKE,
+                    TopologyFailure::VertexWithoutUses,
+                ));
             }
             continue;
         }
@@ -1555,7 +1719,11 @@ fn link_loops(b: &mut Brep, data: &BrepData, built: &Built) -> Result<()> {
             }
         }
         let Some((mut last1, mut last2)) = last else {
-            return Err(SolidError::sm_err(OP_MAKE)); // Big problems here
+            // Big problems here
+            return Err(SolidError::topology(
+                OP_MAKE,
+                TopologyFailure::LoopRecordWithoutEdgeuse,
+            ));
         };
 
         let mut first = true;
@@ -1653,7 +1821,7 @@ fn set_primary_edgeuses(b: &mut Brep, data: &BrepData, built: &Built) -> Result<
 
         // This takes care of next/last pointers.
         match edge::reset_primary_edgeuse(b, e, prim) {
-            Err(err) if err.is_unported() => return Err(err),
+            Err(err) if err.is_unported_or_cancelled() => return Err(err),
             Err(
                 err @ (SolidError::InvalidInput { .. }
                 | SolidError::PortInvariant { .. }
@@ -2142,6 +2310,7 @@ fn project_and_trim_body(
     mut tol: f64,
 ) -> Result<()> {
     // Process each surface
+    let mut imprinted: Vec<EdgeId> = Vec::new();
     for (ii, &face) in projected.faces.iter().enumerate() {
         let c3 = projected.curves_3d.get(ii).cloned();
         let uv = projected.uv_curves.get(ii).cloned().flatten();
@@ -2159,8 +2328,9 @@ fn project_and_trim_body(
             }
         }
         let curve_ref = |e: EdgeId, _type_code: i64| (env.keys)(CacheObject::Curve(e));
-        let _ =
+        let (_, edges) =
             merge_curves_on_surface(k, b, notify, &curve_ref, face, tol, &c3, Some(&uv), false)?;
+        imprinted.extend(edges);
     }
 
     // If we're just Splitting, then we're done.
@@ -2171,12 +2341,70 @@ fn project_and_trim_body(
     // Turn off editing for classification.
     let editing = b.editing_enabled();
     b.set_editing_enabled(false);
-    let to_delete = faces_to_delete(k, b, env, curve, direction, reference, trim_type, tol);
+    let to_delete = faces_to_delete(
+        k, b, env, curve, direction, reference, trim_type, tol, &imprinted,
+    );
     b.set_editing_enabled(editing);
     let to_delete = to_delete?;
 
     // Remove the indicated Faces.
     remove_faces(k, b, notify, &to_delete)
+}
+
+/// The vote of one point of a face on the face's side of the projected curve: `Some`
+/// with the side, `None` where the side is open (the point is on the curve, or the
+/// query failed with a status upstream drops).
+///
+/// # Errors
+///
+/// [`SolidError::Unsupported`] when the point's projection onto the curve has no
+/// solution. Upstream reads that as a point on the curve, and a face whose every
+/// vote fails that way is then taken to lie opposite the reference point, whichever
+/// side it is on (#13679). The classification is refused instead, before any face is
+/// removed.
+fn side_vote(
+    k: &Kernel,
+    curve: &Curve,
+    point: Point3,
+    direction: Vec3,
+    tol: f64,
+) -> Result<Option<i32>> {
+    match ignored(p1::side_of_curve(k, curve, point, direction, tol))? {
+        Some(p1::SideOfCurve::Right(right)) => Ok(Some(i32::from(right))),
+        Some(p1::SideOfCurve::Undecided(_)) | None => Ok(None),
+        Some(p1::SideOfCurve::NoProjection) => Err(SolidError::Unsupported {
+            operation: OP_PROJECT,
+            reason:
+                "a point of a face has no projection onto the curve, so the face's side is unknown",
+        }),
+    }
+}
+
+/// Whether the projected curve ends inside `face` (not upstream, #13697, WR-781): one
+/// of the edges the projection imprinted is used twice by one loop of the face, once in
+/// each direction, so the face lies on both sides of it. An edge that cuts the face in
+/// two is used once by each part. An imprinted edge that a later imprint merged away is
+/// skipped.
+fn ends_inside(b: &Brep, face: FaceId, imprinted: &[EdgeId]) -> Result<bool> {
+    for &edge in imprinted {
+        let Ok(record) = b.edge(edge) else {
+            continue;
+        };
+        let mut loops = Vec::new();
+        for &eu in &record.edgeuses {
+            if eu1::face(b, eu)? != Some(face) {
+                continue;
+            }
+            let Some(lu) = eu1::loopuse(b, eu)? else {
+                continue;
+            };
+            if loops.contains(&lu) {
+                return Ok(true);
+            }
+            loops.push(lu);
+        }
+    }
+    Ok(false)
 }
 
 /// Classifies each face against the plane of the projected curve: by the votes of
@@ -2191,6 +2419,7 @@ fn faces_to_delete(
     reference: Point3,
     trim_type: TrimType,
     tol: f64,
+    imprinted: &[EdgeId],
 ) -> Result<Vec<FaceId>> {
     let mut to_delete = Vec::new();
     let mut edges: Vec<EdgeId> = Vec::new();
@@ -2212,7 +2441,7 @@ fn faces_to_delete(
         for &v in &vertices {
             let rec = b.vertex(v)?;
             let tol1 = 5.0 * (rec.tolerance + tol);
-            if let Some(side) = ignored(find_side_of_curve(k, curve, rec.point, direction, tol1))? {
+            if let Some(side) = side_vote(k, curve, rec.point, direction, tol1)? {
                 if side == 1 {
                     right_votes += 1;
                 } else if side == 0 {
@@ -2227,13 +2456,12 @@ fn faces_to_delete(
             edges = face_edges(b, face)?;
             for &e in &edges {
                 let rec = b.edge(e)?;
-                let c = rec
-                    .curve
-                    .as_ref()
-                    .ok_or(SolidError::null_pointer(OP_PROJECT))?;
+                let c = rec.curve.as_ref().ok_or_else(|| {
+                    SolidError::topology(OP_PROJECT, TopologyFailure::EdgeWithoutCurve)
+                })?;
                 let tol1 = 5.0 * (rec.tolerance + tol);
                 let p = c.evaluate_point(k, rec.interval.evaluate(0.5))?;
-                if let Some(side) = ignored(find_side_of_curve(k, curve, p, direction, tol1))? {
+                if let Some(side) = side_vote(k, curve, p, direction, tol1)? {
                     if side != 0 {
                         right_votes += 1;
                     } else {
@@ -2245,8 +2473,19 @@ fn faces_to_delete(
 
         let mut face_right_side = i32::from(right_votes >= left_votes);
 
-        if right_votes == left_votes {
-            // Make a face shape with the face and its edges and vertices.
+        // (not upstream, #13697, WR-781) A face the curve ends inside is not cut in
+        // two, and neither is one with votes on both sides. Upstream gives such a face
+        // to the side with more votes, so the count of its corners decides, and the face
+        // under the reference point can go to the other side. It is judged like a tie,
+        // by its point nearest the reference point.
+        let uncut = (right_votes > 0 && left_votes > 0) || ends_inside(b, face, imprinted)?;
+        if right_votes == left_votes || uncut {
+            // Make a face shape with the face and its edges and vertices. The edges
+            // were collected only for a face without a vertex vote; upstream's list
+            // otherwise still holds the edges of an earlier face (not upstream, WR-781).
+            if right_votes > 0 || left_votes > 0 {
+                edges = face_edges(b, face)?;
+            }
             let edge_keys: Vec<_> = edges.iter().map(|&e| (env.brep_id, e)).collect();
             let vertex_keys: Vec<_> = vertices.iter().map(|&v| (env.brep_id, v)).collect();
             let shape = Shape::new(
@@ -2305,7 +2544,7 @@ fn faces_to_delete(
             };
             let p = point_from_solution(k, b, first, 1)?;
             let tol1 = 5.0 * (b.face(face)?.tolerance + tol);
-            match ignored(find_side_of_curve(k, curve, p, direction, tol1))? {
+            match side_vote(k, curve, p, direction, tol1)? {
                 Some(side) => face_right_side = side,
                 // Surface is on opposite side as point: the closest point is under
                 // the curve.
@@ -2358,7 +2597,10 @@ fn delete_vertex(k: &mut Kernel, b: &mut Brep, env: &mut NotifyEnv<'_>, v: Verte
 pub fn remove_all_topology(k: &mut Kernel, b: &mut Brep) -> Result<()> {
     // check state - m_bEditingEnabled must be on
     if !b.editing_enabled() {
-        return Err(SolidError::sm_err(OP_REMOVE));
+        return Err(SolidError::topology(
+            OP_REMOVE,
+            TopologyFailure::EditingDisabled,
+        ));
     }
     crate::topology::brep::p3::with_kernel_callbacks(k, b, remove_all_topology_notified)
 }
@@ -2377,7 +2619,10 @@ pub fn remove_all_topology_notified(
 ) -> Result<()> {
     // check state - m_bEditingEnabled must be on
     if !b.editing_enabled() {
-        return Err(SolidError::sm_err(OP_REMOVE));
+        return Err(SolidError::topology(
+            OP_REMOVE,
+            TopologyFailure::EditingDisabled,
+        ));
     }
 
     let faces = brep_faces(b)?;
@@ -2387,12 +2632,12 @@ pub fn remove_all_topology_notified(
 
     for e in brep_wire_edges(b)? {
         // status ignored upstream
-        ignored(delete_edge(k, b, env, e))?;
+        delete_edge(k, b, env, e)?;
     }
 
     for v in brep_shell_vertices(b)? {
         // status ignored upstream
-        ignored(delete_vertex(k, b, env, v))?;
+        delete_vertex(k, b, env, v)?;
     }
     Ok(())
 }
@@ -2435,7 +2680,7 @@ fn test_closure_split_region_at_faceuse(
         fu,
     ) {
         Ok(v) => Ok(Some(v)),
-        Err(SolidError::Upstream { .. }) => Ok(None),
+        Err(e) if e.upstream_status().is_some() => Ok(None),
         Err(e) => Err(e),
     }
 }
@@ -2469,22 +2714,297 @@ fn find_and_set_infinite_region(
     status
 }
 
+// ---- subdividing a face at its surface's discontinuities ---------------------------
+
+/// How many entries the edge list of [`subdivide_face_at_discontinuities`]'s
+/// null-segment clean-up may gain beyond the face's edges (an edge is listed again
+/// after a trim changed its knot count, the two halves after a split). Far above
+/// what a face's edges need: each null segment is cut once.
+pub const MAX_NULL_SEGMENT_REVISITS: usize = 65_536;
+
+const OP_SUBDIVIDE: &str = "topology::brep::p10::subdivide_face_at_discontinuities";
+
+/// `SmBrep::SubdivideFaceAtDiscontinuities(pFace, rResultingFaces, eContinuity)`: splits
+/// `face` along the iso lines of its surface's knots of `continuity` or less
+/// (`FindKnotsByMaxContinuity(eContinuity, FALSE, ..)`), first cutting the null
+/// segments (spans whose curve maps to a point) out of the face's edge curves. Returns
+/// `[face]` when the surface has no such knots, else the new faces of the merge
+/// (`MergeCurvesOnSurface` at `SM_ZONE_TOL_3D` with projection; the face itself is not
+/// listed). Editing is enabled meanwhile; edits notify through `env`, new edge curves
+/// named by `curve_ref`.
+///
+/// # Errors
+///
+/// [`SolidError::InvalidInput`] for a face without surface or an edge without curve
+/// (upstream dereferences them), a failed iso line and a
+/// clean-up past [`MAX_NULL_SEGMENT_REVISITS`]; `SM_ERR` for a refused edge split;
+/// those of the knot search, the curve edits, [`p9::make_vertex_split_edge`] and
+/// [`merge_curves_on_surface`].
+pub fn subdivide_face_at_discontinuities(
+    k: &mut Kernel,
+    b: &mut Brep,
+    env: &mut NotifyEnv<'_>,
+    curve_ref: &dyn Fn(EdgeId, i64) -> ObjectRef,
+    face: FaceId,
+    continuity: ContinuityType,
+) -> Result<Vec<FaceId>> {
+    // enable Brep editing during this method
+    let editing = b.editing_enabled();
+    b.set_editing_enabled(true);
+    let result = surface_of_face(b, face)
+        .and_then(|s| s.find_knots_by_max_continuity(k, continuity, false))
+        .and_then(|(u, v)| subdivide_face_body(k, b, env, curve_ref, face, &u, &v));
+    b.set_editing_enabled(editing);
+    result
+}
+
+/// Not upstream (#16651): [`subdivide_face_at_discontinuities`] along the iso lines at
+/// the given knots of the face's surface, `u_knots` and `v_knots`, instead of those its
+/// knot search finds (a chamfer's creases, [`crate::surface::procedural_blend::ProceduralBlend::chord_creases`]).
+/// Only the knots strictly inside the surface's natural domain are taken, as the knot
+/// search finds only interior knots.
+///
+/// # Errors
+///
+/// Those of [`subdivide_face_at_discontinuities`].
+pub fn subdivide_face_at_knots(
+    k: &mut Kernel,
+    b: &mut Brep,
+    env: &mut NotifyEnv<'_>,
+    curve_ref: &dyn Fn(EdgeId, i64) -> ObjectRef,
+    face: FaceId,
+    u_knots: &[f64],
+    v_knots: &[f64],
+) -> Result<Vec<FaceId>> {
+    let domain = surface_of_face(b, face)?.natural_uv_domain_with_nurb(k)?;
+    let inside = |knots: &[f64], lo: f64, hi: f64| -> Vec<f64> {
+        knots
+            .iter()
+            .copied()
+            .filter(|&t| lo < t && t < hi)
+            .collect()
+    };
+    let u_knots = inside(u_knots, domain.min().x, domain.max().x);
+    let v_knots = inside(v_knots, domain.min().y, domain.max().y);
+    let editing = b.editing_enabled();
+    b.set_editing_enabled(true);
+    let result = subdivide_face_body(k, b, env, curve_ref, face, &u_knots, &v_knots);
+    b.set_editing_enabled(editing);
+    result
+}
+
+fn subdivide_face_body(
+    k: &mut Kernel,
+    b: &mut Brep,
+    env: &mut NotifyEnv<'_>,
+    curve_ref: &dyn Fn(EdgeId, i64) -> ObjectRef,
+    face: FaceId,
+    u_knots: &[f64],
+    v_knots: &[f64],
+) -> Result<Vec<FaceId>> {
+    // locals
+    let surface = surface_of_face(b, face)?;
+    let domain = surface.natural_uv_domain_with_nurb(k)?;
+
+    // no work - no discontinuities
+    if u_knots.is_empty() && v_knots.is_empty() {
+        return Ok(vec![face]);
+    }
+
+    // inform the public - Editing Brep
+    face_pre_edit(b, env, face)?;
+
+    // First remove NULL segments from boundary curves: an edge cleaned up more than
+    // once is listed again at the end
+    let mut edges = face_edges(b, face)?;
+    let bound = edges.len().saturating_add(MAX_NULL_SEGMENT_REVISITS);
+    let mut ii = 0;
+    while let Some(&e) = edges.get(ii) {
+        ii += 1;
+        if edges.len() > bound {
+            return Err(SolidError::invalid_input(
+                OP_SUBDIVIDE,
+                "null segment clean-up does not end",
+            ));
+        }
+        let segments = curve_of_edge(b, e)?.null_segments(k)?;
+
+        // When BSpline curve has an interval that maps to a point in 3 space
+        let (Some(&first), Some(&second)) = (segments.first(), segments.get(1)) else {
+            continue;
+        };
+        let mut edge_ivl = edge::interval(b, e)?;
+        if !(edge_ivl.contains_value(first, 0.0) && edge_ivl.contains_value(second, 0.0)) {
+            continue;
+        }
+        let last = segments.last().copied().unwrap_or(second);
+        if are_same(edge_ivl.min(), first) {
+            // Null segment at beginning of curve: trim it out of the edge interval,
+            // then reparameterize to the edge's interval
+            let _ = edge_ivl.set_min_max(second, edge_ivl.max());
+            trim_null_segment(k, b, e, edge_ivl, &mut edges)?;
+        } else if are_same(edge_ivl.max(), last) {
+            // Null segment at end of curve
+            let before_last = segments
+                .len()
+                .checked_sub(2)
+                .and_then(|n| segments.get(n))
+                .copied()
+                .unwrap_or(first);
+            let _ = edge_ivl.set_min_max(edge_ivl.min(), before_last);
+            trim_null_segment(k, b, e, edge_ivl, &mut edges)?;
+        } else {
+            // Null segment at interior of curve: split the edge, both halves inspected
+            let split = p9::make_vertex_split_edge(k, b, e, first, env, curve_ref)?;
+            if !split.split {
+                return Err(SolidError::topology(
+                    OP_SUBDIVIDE,
+                    TopologyFailure::EdgeNotSplit,
+                ));
+            }
+            let [e1, e2] = split.edges.ok_or(SolidError::invalid_input(
+                OP_SUBDIVIDE,
+                "split without edges",
+            ))?;
+            edges.push(e1);
+            edges.push(e2);
+        }
+    }
+
+    // for U and V directions - build the iso lines to split the face along (the V pass
+    // over the V knots: WR-589, upstream counts the U knots there)
+    let mut curves_3d: Vec<Curve> = Vec::new();
+    let iso_lines = u_knots
+        .iter()
+        .map(|&u| {
+            (
+                Point2::new(u, domain.min().y),
+                Point2::new(u, domain.max().y),
+            )
+        })
+        .chain(v_knots.iter().map(|&v| {
+            (
+                Point2::new(domain.min().x, v),
+                Point2::new(domain.max().x, v),
+            )
+        }));
+    for (start, end) in iso_lines {
+        // create IsoLineCrvOnSurf (status ignored upstream; a failure is not compared)
+        let line = required_subdivision_iso_line(
+            surface_of_face(b, face)?.create_line_on_surf(k, start, end),
+        )?;
+        curves_3d.push(Curve::from(line));
+    }
+
+    // split the face at all the split isoparam lines
+    face_pre_edit(b, env, face)?;
+    let merged = merge_curves_on_surface(
+        k,
+        b,
+        env,
+        curve_ref,
+        face,
+        ZONE_TOL_3D,
+        &curves_3d,
+        None,
+        true,
+    );
+    // the UV trim curves the merge made, owned by their edge uses
+    let bound = bind_uv_trim_owners(b, env.key_of);
+    let (new_faces, _) = merged?;
+    bound?;
+    Ok(new_faces)
+}
+
+/// `pCurve->Trim(sEdgeIvl)` then `pCurve->EditParameterization(pEdge->GetInterval())`
+/// (status ignored) of edge `e`'s curve; the edge is listed again when the trim
+/// changed the curve's number of knots.
+fn trim_null_segment(
+    k: &Kernel,
+    b: &mut Brep,
+    e: EdgeId,
+    mut edge_ivl: Extent1d,
+    edges: &mut Vec<EdgeId>,
+) -> Result<()> {
+    let num_knots = curve_of_edge(b, e)?.number_natural_knots(k)?;
+    // SmTol::GetZoneTol3d(curve) follows its edge
+    let tol = b.edge(e)?.tolerance;
+    curve_of_edge_mut(b, e)?.trim_with_zone_tol(k, &mut edge_ivl, TrimMode::Notify, tol)?;
+    let edge_ivl = edge::interval(b, e)?;
+    ignore_status(curve_of_edge_mut(b, e)?.edit_parameterization(k, &edge_ivl))?;
+    if curve_of_edge(b, e)?.number_natural_knots(k)? != num_knots {
+        edges.push(e);
+    }
+    Ok(())
+}
+
+/// `pFace->GetSurface()`, dereferenced upstream.
+fn surface_of_face(b: &Brep, f: FaceId) -> Result<&Surface> {
+    b.face(f)?.surface.as_ref().ok_or(SolidError::invalid_input(
+        OP_SUBDIVIDE,
+        "face without surface",
+    ))
+}
+
+/// `pEdge->GetCurve()`, dereferenced upstream.
+fn curve_of_edge(b: &Brep, e: EdgeId) -> Result<&Curve> {
+    edge::curve(b, e)?.ok_or(SolidError::invalid_input(
+        OP_SUBDIVIDE,
+        "edge without curve",
+    ))
+}
+
+fn curve_of_edge_mut(b: &mut Brep, e: EdgeId) -> Result<&mut Curve> {
+    b.edge_mut(e)?
+        .curve
+        .as_mut()
+        .ok_or(SolidError::invalid_input(
+            OP_SUBDIVIDE,
+            "edge without curve",
+        ))
+}
+
+/// `pFace->Notify(SM_NO_PRE_EDIT, pFace, this, NULL)` (status ignored upstream).
+fn face_pre_edit(b: &mut Brep, env: &mut NotifyEnv<'_>, f: FaceId) -> Result<()> {
+    let data = [
+        Some((env.key_of)(EntityRef::Face(f))),
+        Some(super::p2::brep_ref(b)),
+        None,
+    ];
+    ignore_status(crate::topology::face::p3::notify(
+        b,
+        f,
+        env,
+        None,
+        NotifyOperation::PreEdit,
+        data,
+    ))
+}
+
 /// Completes the native `SetUVTrimCurve` owner binding (`pUVTrimCurve->SetOwner(eu)`)
 /// under the caller's names `key_of` for the UV trim curves the B-rep's own routines
 /// left without owner (a B-rep under [`crate::topology::NamingScheme::Caller`]: lazy
-/// face queries, edge splits). Existing owners are kept so a foreign or incorrect
-/// owner remains detectable. An edge use the B-rep's routines added (edge splits) gets
+/// face queries, edge splits), or named by the default identity of an edge use without
+/// a recorded key (`Brep::owner_identity`, the same owner). Other existing owners are
+/// kept so a foreign or incorrect owner remains detectable. An edge use the B-rep's routines added (edge splits) gets
 /// its caller key recorded (`Brep::geometry_owner_key`) so trims made later are named
 /// alike.
 fn bind_uv_trim_owners(b: &mut Brep, key_of: &dyn Fn(EntityRef) -> ObjectRef) -> Result<()> {
     for edge in p1::edges(b, None)? {
         for id in b.edge(edge)?.edgeuses.clone() {
             let entity = EntityRef::Edgeuse(id);
-            if b.geometry_owner_key(entity).is_none() {
+            // a trim bound before the key was recorded is named by the edge use's
+            // default identity (`Brep::owner_identity`); it is the same owner
+            let unrecorded = b
+                .geometry_owner_key(entity)
+                .is_none()
+                .then(|| b.owner_identity(entity));
+            if unrecorded.is_some() {
                 b.set_geometry_owner_key(entity, Some(key_of(entity)));
             }
             if let Some(curve) = b.edgeuse_mut(id)?.uv_trim_curve.as_mut() {
-                if curve.owner().is_none() {
+                if curve.owner().is_none() || (unrecorded.is_some() && curve.owner() == unrecorded)
+                {
                     curve.set_owner(Some(key_of(EntityRef::Edgeuse(id))), None);
                 }
             }
@@ -2621,437 +3141,15 @@ pub fn test_closure_split_region(
     Ok(out)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::geom::attribute::AttributeStore;
-    use crate::topology::brep_data::{
-        EdgeData, EuData, FaceData, FaceuseData, Keyed, LoopData, RegionData, ShellData, VertexData,
-    };
-
-    fn key_of(e: EntityRef) -> ObjectRef {
-        let (t, i) = match e {
-            EntityRef::Face(f) => (16002, u64::from(f.index())),
-            EntityRef::Edge(x) => (16016, u64::from(x.index())),
-            EntityRef::Edgeuse(x) => (16005, u64::from(x.index())),
-            EntityRef::Vertex(x) => (16021, u64::from(x.index())),
-            EntityRef::Vertexuse(x) => (16006, u64::from(x.index())),
-            EntityRef::Loop(x) => (16003, u64::from(x.index())),
-            EntityRef::Loopuse(x) => (16004, u64::from(x.index())),
-            EntityRef::Faceuse(x) => (16022, u64::from(x.index())),
-            EntityRef::Shell(x) => (16013, u64::from(x.index())),
-            EntityRef::Region(x) => (16012, u64::from(x.index())),
-            EntityRef::Brep(_) => (16011, 0),
-        };
-        ObjectRef {
-            type_code: t,
-            key: ObjectKey(1_000_000 + t as u64 * 100_000 + i),
-        }
-    }
-
-    fn line(a: Point3, b: Point3) -> Curve {
-        Curve::from(BSplineCurve::create_line_segment(3, a, b).unwrap())
-    }
-
-    fn plane_surface() -> Surface {
-        use crate::nurbs::b_spline_surface::BSplineSurface;
-        Surface::from(
-            BSplineSurface::create_bilinear_surface(
-                Point3::new(0.0, 0.0, 0.0),
-                Point3::new(1.0, 0.0, 0.0),
-                Point3::new(0.0, 1.0, 0.0),
-                Point3::new(1.0, 1.0, 0.0),
-            )
-            .unwrap(),
-        )
-    }
-
-    /// A single square sheet face: 4 vertices, 4 edges, one loop, manifold flag `mf`.
-    fn square(mf: i32) -> BrepData {
-        let mut d = BrepData::new(mf, crate::topology::brep_data::DataSourceType::Unknown);
-        d.healer_version = HEALER_VERSION;
-        d.regions.push(RegionData {
-            start_shell: 0,
-            num_shells: 1,
-            is_void: 1,
-            ..RegionData::zeroed()
-        });
-        d.shells.push(ShellData {
-            shell_type: 0,
-            faceuse_start: 0,
-            // an IGES solid lists only the solid side's face uses
-            num_faceuses: if mf == 1 { 1 } else { 2 },
-            ..ShellData::zeroed()
-        });
-        d.faceuses.push(FaceuseData {
-            face: 0,
-            orientation: 1,
-            ..FaceuseData::zeroed()
-        });
-        d.faceuses.push(FaceuseData {
-            face: 0,
-            orientation: 0,
-            ..FaceuseData::zeroed()
-        });
-        d.faces.push(FaceData {
-            surface: 0,
-            start_loop: 0,
-            num_loops: 1,
-            uv_domain: Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0),
-            rectangular_trim: 0,
-            zone_tol_3d: 1e-6,
-            ..FaceData::zeroed()
-        });
-        d.loops.push(LoopData {
-            loop_type: 0,
-            start_eu: 0,
-            num_eu: 4,
-            ..LoopData::zeroed()
-        });
-        let p = [
-            Point3::new(0.0, 0.0, 0.0),
-            Point3::new(1.0, 0.0, 0.0),
-            Point3::new(1.0, 1.0, 0.0),
-            Point3::new(0.0, 1.0, 0.0),
-        ];
-        for (i, &q) in p.iter().enumerate() {
-            d.vertices.push(VertexData {
-                point: q,
-                zone_tol_3d: 1e-7,
-                ..VertexData::zeroed()
-            });
-            let n = (i + 1) % 4;
-            d.curves_3d.push(Keyed {
-                key: ObjectKey(i as u64 + 1),
-                object: line(q, p[n]),
-            });
-            d.edges.push(EdgeData {
-                curve: i as u64,
-                start_vertex: i as u64,
-                end_vertex: n as u64,
-                prim_eu: i as i64,
-                interval: crate::geom::extent1d::Extent1d::from_raw(0.0, 1.0),
-                zone_tol_3d: 1e-6,
-                ..EdgeData::zeroed()
-            });
-            d.edgeuses.push(EuData {
-                eu_type: 0,
-                edge: i as u64,
-                loop_: 0,
-                orientation: 1,
-                uv_curve: NO_UV_CURVE,
-                next_eu: -(i as i64) - 1,
-                mate_next_eu: i as i64,
-                ..EuData::zeroed()
-            });
-        }
-        d.surfaces.push(Keyed {
-            key: ObjectKey(100),
-            object: plane_surface(),
-        });
-        d
-    }
-
-    fn build(d: &mut BrepData, opts: MakeTopologyOptions) -> Result<Brep> {
-        let mut k = Kernel::default();
-        let mut b = Brep::new_with_infinite_region()?;
-        let mut store = AttributeStore::new();
-        let mut records = crate::topology::topology::NotifyRecords::new();
-        let mut env = TopologyEnv {
-            all_attributes: &[],
-            attributes: &mut store,
-            key_of: &key_of,
-            records: &mut records,
-            next_key: 1,
-        };
-        make_topology_from_data(&mut k, &mut b, d, &mut env, opts)?;
-        assert!(!k.context.doing_boolean());
-        Ok(b)
-    }
-
-    #[test]
-    fn square_sheet_builds_a_closed_loop() {
-        {
-            let mf = 0;
-            let mut d = square(mf);
-            let b = build(&mut d, MakeTopologyOptions::default()).unwrap();
-            assert_eq!(b.regions().len(), 1);
-            assert_eq!(b.faces().len(), 1);
-            assert_eq!(b.edges().len(), 4);
-            assert_eq!(b.edgeuses().len(), 8);
-            assert_eq!(b.vertexuses().len(), 8);
-            // the loop use walk closes after four edge uses
-            let lu = b.loop_(LoopId::from_index(0)).unwrap().loopuse.unwrap();
-            let LoopuseStart::Edgeuse(Some(start)) = b.loopuse(lu).unwrap().start else {
-                panic!("no start");
-            };
-            let mut cur = start;
-            for _ in 0..4 {
-                cur = b.edgeuse(cur).unwrap().ccw.unwrap();
-            }
-            assert_eq!(cur, start);
-            // one shell holding both face uses
-            let s = b.shell(ShellId::from_index(0)).unwrap();
-            assert_eq!(s.shell_type, ShellType::Faceuse);
-            assert!(matches!(&s.members, ShellMembers::Faceuses(v) if v.len() == 2));
-            // tolerances: clamped data tol, max with entity tols
-            assert_eq!(b.tolerance(), 1e-5);
-            assert_eq!(b.vertex(VertexId::from_index(0)).unwrap().tolerance, 1e-5);
-            // analytic lines replace the NURBS lines
-            let c = b
-                .edge(EdgeId::from_index(0))
-                .unwrap()
-                .curve
-                .as_ref()
-                .unwrap();
-            assert!(c.is_kind_of(LINE_TYPE));
-            // data curves point at their copies
-            assert!(d.curves_3d.iter().all(|c| c.object.owner().is_some()));
-            assert!(d.surfaces[0].object.owner().is_some());
-        }
-    }
-
-    #[test]
-    fn healing_runs_and_manifold_is_computed() {
-        // HealBrep (topology.brep_p1) runs; only the healer's own later stubs defer
-        let mut d = square(1);
-        d.healer_version = 0;
-        match build(&mut d, MakeTopologyOptions::default()) {
-            Ok(_) => {}
-            Err(SolidError::Unported { unit, .. }) => assert_ne!(unit, "topology.brep_p1"),
-            Err(e) => panic!("unexpected {e}"),
-        }
-        let mut d = square(1);
-        d.healer_version = 0;
-        let opts = MakeTopologyOptions {
-            healer_enabled: false,
-            ..MakeTopologyOptions::default()
-        };
-        assert!(build(&mut d, opts).is_ok());
-        // an UNSURE manifold flag is computed (IsManifoldSolid): a sheet is not a
-        // manifold solid
-        let mut d = square(UNSURE);
-        assert!(build(&mut d, MakeTopologyOptions::default()).is_ok());
-        assert_eq!(d.manifold, 0);
-        // sm_AddAttributes: an index past rAllAttributes (empty here)
-        let mut d = square(1);
-        d.attributes.push(0);
-        assert!(matches!(
-            build(&mut d, MakeTopologyOptions::default()),
-            Err(SolidError::InvalidInput { .. })
-        ));
-    }
-
-    #[test]
-    fn malformed_indices_are_rejected() {
-        let mut d = square(1);
-        d.faces[0].surface = 5;
-        assert!(matches!(
-            build(&mut d, MakeTopologyOptions::default()),
-            Err(SolidError::InvalidInput { .. })
-        ));
-        let mut d = square(0);
-        d.shells[0].shell_type = 7;
-        assert!(matches!(
-            build(&mut d, MakeTopologyOptions::default()),
-            Err(SolidError::Upstream { code: 1001, .. })
-        ));
-        let mut d = square(0);
-        d.edgeuses[0].next_eu = 99;
-        assert!(matches!(
-            build(&mut d, MakeTopologyOptions::default()),
-            Err(SolidError::InvalidInput { .. })
-        ));
-        let mut d = square(0);
-        d.edgeuses[0].next_eu = i64::MIN;
-        assert!(matches!(
-            build(&mut d, MakeTopologyOptions::default()),
-            Err(SolidError::InvalidInput { .. })
-        ));
-        let mut d = square(0);
-        d.regions[0].num_shells = u64::MAX;
-        assert!(build(&mut d, MakeTopologyOptions::default()).is_err());
-        let mut d = square(1);
-        d.loops[0].start_eu = u64::MAX;
-        assert!(build(&mut d, MakeTopologyOptions::default()).is_err());
-        // a B-rep without infinite region
-        let mut d = square(1);
-        let mut k = Kernel::default();
-        let mut b = Brep::new();
-        let mut store = AttributeStore::new();
-        let mut records = crate::topology::topology::NotifyRecords::new();
-        let mut env = TopologyEnv {
-            all_attributes: &[],
-            attributes: &mut store,
-            key_of: &key_of,
-            records: &mut records,
-            next_key: 1,
-        };
-        assert!(make_topology_from_data(
-            &mut k,
-            &mut b,
-            &mut d,
-            &mut env,
-            MakeTopologyOptions::default()
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn iges_solid_gets_implied_regions() {
-        let mut d = square(1);
-        d.regions[0].is_void = 0;
-        let b = build(&mut d, MakeTopologyOptions::default()).unwrap();
-        // infinite + solid region, two shells (outer face uses swapped inside)
-        assert_eq!(b.regions().len(), 2);
-        assert_eq!(b.shells().len(), 2);
-        assert_eq!(b.region(RegionId::from_index(0)).unwrap().is_void, 1);
-        assert_eq!(b.region(RegionId::from_index(1)).unwrap().is_void, 0);
-    }
-
-    /// Triangles over shared edges (sheets: both face uses in one shell).
-    fn triangles(pts: &[Point3], tris: &[[usize; 3]]) -> BrepData {
-        let mut d = BrepData::new(1, crate::topology::brep_data::DataSourceType::Unknown);
-        d.healer_version = HEALER_VERSION;
-        d.regions.push(RegionData {
-            start_shell: 0,
-            num_shells: 1,
-            is_void: 1,
-            ..RegionData::zeroed()
-        });
-        d.regions.push(RegionData::zeroed());
-        d.shells.push(ShellData {
-            shell_type: 0,
-            faceuse_start: 0,
-            num_faceuses: 2 * tris.len() as u64,
-            ..ShellData::zeroed()
-        });
-        for &q in pts {
-            d.vertices.push(VertexData {
-                point: q,
-                ..VertexData::zeroed()
-            });
-        }
-        let mut edges: Vec<(usize, usize)> = Vec::new();
-        for (f, t) in tris.iter().enumerate() {
-            for side in [1, 0] {
-                d.faceuses.push(FaceuseData {
-                    face: f as u64,
-                    orientation: side,
-                    ..FaceuseData::zeroed()
-                });
-            }
-            d.surfaces.push(Keyed {
-                key: ObjectKey(500 + f as u64),
-                object: plane_surface(),
-            });
-            d.faces.push(FaceData {
-                surface: f as u64,
-                start_loop: f as u64,
-                num_loops: 1,
-                uv_domain: Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0),
-                ..FaceData::zeroed()
-            });
-            d.loops.push(LoopData {
-                start_eu: d.edgeuses.len() as u64,
-                num_eu: 3,
-                ..LoopData::zeroed()
-            });
-            for k in 0..3 {
-                let (a, b) = (t[k], t[(k + 1) % 3]);
-                let key = (a.min(b), a.max(b));
-                let e = edges.iter().position(|&x| x == key).unwrap_or_else(|| {
-                    edges.push(key);
-                    d.curves_3d.push(Keyed {
-                        key: ObjectKey(900 + edges.len() as u64),
-                        object: line(pts[key.0], pts[key.1]),
-                    });
-                    d.edges.push(EdgeData {
-                        curve: edges.len() as u64 - 1,
-                        start_vertex: key.0 as u64,
-                        end_vertex: key.1 as u64,
-                        prim_eu: d.edgeuses.len() as i64,
-                        interval: crate::geom::extent1d::Extent1d::from_raw(0.0, 1.0),
-                        ..EdgeData::zeroed()
-                    });
-                    edges.len() - 1
-                });
-                d.edgeuses.push(EuData {
-                    eu_type: 0,
-                    edge: e as u64,
-                    loop_: f as u64,
-                    orientation: i32::from(a < b),
-                    uv_curve: NO_UV_CURVE,
-                    ..EuData::zeroed()
-                });
-            }
-        }
-        d
-    }
-
-    #[test]
-    fn closure_walks_spine_edges() {
-        let pts = [
-            Point3::new(0.0, 0.0, 0.0),
-            Point3::new(1.0, 0.0, 0.0),
-            Point3::new(0.5, 1.0, 0.0),
-            Point3::new(0.5, 0.0, 1.0),
-            Point3::new(0.5, -1.0, 0.0),
-        ];
-        let opts = MakeTopologyOptions {
-            add_analytics: false,
-            ..MakeTopologyOptions::default()
-        };
-        // three triangles around edge 0-1: a spine edge with six edge uses whose
-        // loops do not pair up
-        let mut d = triangles(&pts, &[[0, 1, 2], [0, 1, 3], [0, 1, 4]]);
-        let mut b = build(&mut d, opts).unwrap();
-        let mut k = Kernel::default();
-        assert_eq!(b.edge(EdgeId::from_index(0)).unwrap().edgeuses.len(), 6);
-        let mut state = crate::topology::brep::p2::RegionNotifyState::new(&b);
-        for e in b.edges().ids().collect::<Vec<_>>() {
-            let r = test_closure_split_region(&mut k, &mut b, &mut state.env(), true, e).unwrap();
-            assert_eq!(r, ClosureSplit::default());
-        }
-        // a doubled triangle: its loops traverse the same edges, so the face use
-        // version splits off the region between the two copies
-        let mut d = triangles(&pts, &[[0, 1, 2], [0, 1, 2], [0, 1, 3]]);
-        let mut b = build(&mut d, opts).unwrap();
-        let mut state = crate::topology::brep::p2::RegionNotifyState::new(&b);
-        let r = test_closure_split_region(
-            &mut k,
-            &mut b,
-            &mut state.env(),
-            false,
-            EdgeId::from_index(0),
-        );
-        assert_eq!(
-            r.unwrap(),
-            ClosureSplit {
-                new_shells: vec![Some(ShellId::from_index(1))],
-                new_regions: vec![RegionId::from_index(2)],
-            }
-        );
-    }
-
-    #[test]
-    fn closure_test_needs_a_spine_edge() {
-        let mut d = square(1);
-        let mut b = build(&mut d, MakeTopologyOptions::default()).unwrap();
-        let mut k = Kernel::default();
-        let mut state = crate::topology::brep::p2::RegionNotifyState::new(&b);
-        let r = test_closure_split_region(
-            &mut k,
-            &mut b,
-            &mut state.env(),
-            true,
-            EdgeId::from_index(0),
-        )
-        .unwrap();
-        assert_eq!(r, ClosureSplit::default());
-        assert!(remove_all_topology(&mut k, &mut b).is_err());
-        b.set_editing_enabled(true);
-        // topology.brep_p4 (SmBrep::DeleteEdge and friends) is ported
-        assert!(remove_all_topology(&mut k, &mut b).is_ok());
+/// An ordinary iso-line failure has no output to subdivide with; control errors
+/// retain their original cause rather than becoming an invalid subdivision.
+fn required_subdivision_iso_line<T>(result: Result<T>) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) if error.is_unported_or_cancelled() => Err(error),
+        Err(_) => Err(SolidError::invalid_input(OP_SUBDIVIDE, "no iso line")),
     }
 }
+
+
+// Modified for Makepad by fab/brep/sync/tool (fab/brep/SYNC.md): S1.

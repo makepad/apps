@@ -44,6 +44,12 @@
 //! | [`trim_first_break`], [`trim_last_break`], [`insert_sorted_breaks`] | `sm_TrimFirstBreak`, `sm_TrimLastBreak`, `sm_InsertSortedBreaks` (static) |
 //!
 //! Deviations:
+//! - **Classifying an offset (#18514).** [`curve_classify`] discards a trimmed offset
+//!   whose mid point is proved closer than `distance * (1 - SM_EFF_ZERO)` to an original
+//!   curve (the distance to the solve's nearest point widened by its rounding and that
+//!   point's error bound), not one whose solved distance alone is below it: an offset's
+//!   mid point lies the offset distance from its own curve, and that test flipped on the
+//!   distance's rounding.
 //! - **Nesting.** `with_curves` and `set_segment` return `InvalidInput` when any segment curve would nest
 //!   deeper than [`MAX_GEOMETRY_NESTING`](crate::surface::surface::p2::MAX_GEOMETRY_NESTING)
 //!   (32; upstream fixtures nest at most 3), which bounds the recursive dispatch,
@@ -102,20 +108,27 @@
 //! - `Dump`, `Draw`, `DrawParams`, `GetMemoryUsed`, `WriteToDB`, `ReadFromDB`,
 //!   `AddCurve`, `MakeCompositeNurb` and the offsetters belong to other units or are
 //!   unused.
+//! - **Segment bounding-box intervals (WR-34).**
+//!   [`CompositeCurve::calculate_bounding_box`] stacks segment spans from the first
+//!   segment's `natural_interval().min()` and maps each intersected sub-interval back
+//!   onto the segment's natural interval (reversing within `[min, max]` when
+//!   `!same_sense`); segment box construction and unioning are otherwise unchanged.
 
 use crate::curve::curve::p1::ApproximateCurveOptions;
 use crate::curve::curve::p1::GlobalPointSolveOptions;
 use crate::curve::curve::p2::{
     at, Curve, CurveEvaluate, CurveKind, COMPOSITE_CURVE_TYPE, CURV_BASE_TYPE,
 };
-use crate::curve::curve::p3::compute_crvs_normal;
+use crate::curve::curve::p3::compute_crvs_normal_written;
 use crate::curve::curve::p8::CurveIntersectOptions;
 use crate::curve::curve_cache::CurveCache;
+use crate::error::curve::CurveFailure;
 use crate::error::{ignored, Result, SolidError};
 use crate::geom::a_object;
 use crate::geom::assert_array::ObjectKey;
 use crate::geom::attribute;
 use crate::geom::axis2_placement::Axis2Placement;
+use crate::geom::certified::{self, Bounded};
 use crate::geom::extent1d::Extent1d;
 use crate::geom::extent2d::Extent2d;
 use crate::geom::extent3d::Extent3d;
@@ -403,6 +416,10 @@ pub struct BuiltComposites {
     /// The input curves no composite uses (shorter than the same point tolerance;
     /// upstream leaves them with the caller), in input order.
     pub unused: Vec<Curve>,
+    /// For each composite, where each of its segments came from, in segment order: the
+    /// input curve's index, or `None` for a line the builder put across a gap (not upstream:
+    /// the skin's trace, tangency-labs/solidcraft#13632).
+    pub sources: Vec<Vec<Option<usize>>>,
 }
 
 impl CurveEvaluate for CompositeCurve {
@@ -423,12 +440,12 @@ impl CurveEvaluate for CompositeCurve {
         _non_zero_tangents: bool,
     ) -> Result<Vec<Vec3>> {
         // SmCurve::Evaluate (not overridden)
-        Err(SolidError::sm_err(OP))
+        Err(SolidError::curve(OP, CurveFailure::NoEvaluationOfItsOwn))
     }
 
     fn evaluate_point(&self, _k: &Kernel, _t: f64) -> Result<Point3> {
         // SmCurve::EvaluatePoint (not overridden)
-        Err(SolidError::sm_err(OP))
+        Err(SolidError::curve(OP, CurveFailure::NoEvaluationOfItsOwn))
     }
 
     fn is_closed_virtual(&self, _k: &Kernel, _interval: &Extent1d, _tol: f64) -> Result<bool> {
@@ -732,12 +749,53 @@ impl CompositeCurve {
         Ok((knots, mults))
     }
 
-    /// `CalculateBoundingBox`: the union of the segments' boxes over `interval`. Each
-    /// segment's natural interval is shifted by the summed lengths of the previous
-    /// segments (starting at `0`, as upstream) and intersected with `interval`; the
-    /// segment's boxes are taken over that shifted interval. The axis aligned box
-    /// starts uninitialised, the pseudo box initialised and the polar box reset; the
-    /// first pseudo union takes the segment box's basis.
+    /// The union of the segments' [`crate::curve::curve::Curve::certified_bounding_box`]es over the parts of
+    /// `interval` they cover, as [`Self::calculate_bounding_box`] maps them (not upstream);
+    /// `None` when a covered segment has none.
+    ///
+    /// # Errors
+    ///
+    /// Those of the segments' boxes.
+    pub(crate) fn certified_bounding_box(
+        &self,
+        k: &Kernel,
+        interval: &Extent1d,
+    ) -> Result<Option<Extent3d>> {
+        let mut bbox = Extent3d::new();
+        bbox.init();
+        let mut next_comp_start: Option<f64> = None;
+        for s in &self.segments {
+            let tgt_ivl = fixed_segment_target_interval(
+                s.curve.natural_interval(),
+                s.same_sense,
+                *interval,
+                &mut next_comp_start,
+            );
+            if tgt_ivl.has_negative_length() {
+                continue;
+            }
+            let Some(segment) = s.curve.certified_bounding_box(k, &tgt_ivl)? else {
+                return Ok(None);
+            };
+            bbox = bbox.union(&segment);
+        }
+        Ok(Some(bbox))
+    }
+
+    /// `CalculateBoundingBox`: the union of the segments' boxes over `interval`.
+    ///
+    /// Each valid segment's composite span is stacked end to end starting at the first
+    /// segment's `natural_interval().min()` (matching [`Self::natural_interval`] and
+    /// [`Self::make_composite_nurb`]), intersected with `interval`, and mapped back onto
+    /// the segment's own natural interval (reversing within `[min, max]` when
+    /// `!same_sense`) before querying the segment's boxes; segment box evaluation and
+    /// unioning (including [`PolarBox`] tangent sense on reversed segments) are otherwise
+    /// unchanged (`WR-34`, `#2135`; upstream shifts each segment's natural interval by
+    /// the summed lengths of the previous segments, starting at `0`, and takes the
+    /// segment's boxes over that shifted interval directly).
+    ///
+    /// The axis aligned box starts uninitialised, the pseudo box initialised and the
+    /// polar box reset; the first pseudo union takes the segment box's basis.
     ///
     /// # Errors
     ///
@@ -771,17 +829,16 @@ impl CompositeCurve {
         let mut this_bbox = Extent3d::new();
         let mut this_pseudo = PseudoBox::new();
         let mut this_polar = PolarBox::new();
-        let mut ivl_offset = 0.0;
+        let mut next_comp_start: Option<f64> = None;
 
         // for every interval
         for s in &self.segments {
-            let mut seg_ivl = s.curve.natural_interval();
-
-            // get target Ivl for this segment
-            seg_ivl.translate(ivl_offset);
-            let tgt_ivl = seg_ivl
-                .intersect(interval)
-                .unwrap_or_else(|_| Extent1d::new());
+            let tgt_ivl = fixed_segment_target_interval(
+                s.curve.natural_interval(),
+                s.same_sense,
+                *interval,
+                &mut next_comp_start,
+            );
 
             // when TgtIvl is not negative
             if !tgt_ivl.has_negative_length() {
@@ -817,9 +874,6 @@ impl CompositeCurve {
                 // mark state - done with first union
                 first_union = false;
             }
-
-            // (the loop increment)
-            ivl_offset += seg_ivl.length();
         }
 
         Ok(BoundingBoxes {
@@ -989,7 +1043,7 @@ impl CompositeCurve {
                     // tesselate curve to current dAngleDeg - skip failures
                     match bsc.tessellate(k, &bsc.natural_interval(), 0.0, angle_deg, 3) {
                         Ok(t) => bsc_poly = t.points,
-                        Err(e) if e.is_unported() => return Err(e),
+                        Err(e) if e.is_unported_or_cancelled() => return Err(e),
                         Err(_) => continue,
                     }
                 }
@@ -1135,10 +1189,21 @@ impl CompositeCurve {
     ) -> Result<BuiltComposites> {
         // check input
         if same_point_tolerance <= 0.0 {
-            return Err(SolidError::sm_err(OP_BUILD));
+            return Err(SolidError::curve(
+                OP_BUILD,
+                CurveFailure::SamePointToleranceNotPositive {
+                    tolerance: same_point_tolerance,
+                },
+            ));
         }
         if !(distance_to_create_line == 0.0 || distance_to_create_line > same_point_tolerance) {
-            return Err(SolidError::sm_err(OP_BUILD));
+            return Err(SolidError::curve(
+                OP_BUILD,
+                CurveFailure::LineDistanceNotAboveTolerance {
+                    distance: distance_to_create_line,
+                    tolerance: same_point_tolerance,
+                },
+            ));
         }
 
         // Get the max input tolerance.
@@ -1150,25 +1215,24 @@ impl CompositeCurve {
 
         // init output
         let mut composites: Vec<CompositeCurve> = Vec::new();
+        let mut sources: Vec<Vec<Option<usize>>> = Vec::new();
 
         let total = curves.len();
         if total == 0 {
             return Ok(BuiltComposites {
                 composites,
                 unused: Vec::new(),
+                sources: Vec::new(),
             });
         }
 
         // create an array of link-list curve objects
-        let mut items: Vec<CurveItem> = Vec::with_capacity(total);
+        let mut items: Vec<CurveItem> = Vec::new();
         for c in curves {
-            let mut item = CurveItem::new(c);
             // (status ignored upstream: GetEnds returns void)
-            if let Some(e) = ignored(
-                item.curve
-                    .as_ref()
-                    .map_or_else(|| Err(SolidError::sm_err(OP_BUILD)), |curve| curve.ends(k)),
-            )? {
+            let ends = ignored(c.ends(k))?;
+            let mut item = CurveItem::new(c);
+            if let Some(e) = ends {
                 item.start = e.start;
                 item.end = e.end;
             }
@@ -1261,6 +1325,7 @@ impl CompositeCurve {
                     same_point_tolerance,
                     distance_to_create_line,
                     &mut composites,
+                    &mut sources,
                 )?;
 
                 // Now look for 1st remaining curve segment to start another composite
@@ -1303,7 +1368,11 @@ impl CompositeCurve {
 
         // the curves no composite took stay with the caller
         let unused = items.into_iter().filter_map(|c| c.curve).collect();
-        Ok(BuiltComposites { composites, unused })
+        Ok(BuiltComposites {
+            composites,
+            unused,
+            sources,
+        })
     }
 }
 
@@ -1389,6 +1458,7 @@ fn flush_crv(
     same_point_tolerance: f64,
     distance_to_create_line: f64,
     composites: &mut Vec<CompositeCurve>,
+    sources: &mut Vec<Vec<Option<usize>>>,
 ) -> Result<()> {
     // locals: the curves (by item), senses and gaps of the composite being built,
     // and the line segments filling gaps (by position)
@@ -1485,11 +1555,18 @@ fn flush_crv(
         // when a composite curve needs to be created
         if create_composite {
             let use_gaps = gaps.len() == curves.len();
-            let mut cs = Vec::with_capacity(curves.len());
+            let mut cs = Vec::new();
+            let mut from = Vec::new();
             for p in curves.drain(..) {
                 cs.push(match p {
-                    Pending::Item(i) => take_curve(items, i)?,
-                    Pending::Line(l) => Curve::from(l),
+                    Pending::Item(i) => {
+                        from.push(Some(i));
+                        take_curve(items, i)?
+                    }
+                    Pending::Line(l) => {
+                        from.push(None);
+                        Curve::from(l)
+                    }
                 });
             }
             let comp = CompositeCurve::with_curves(
@@ -1500,6 +1577,7 @@ fn flush_crv(
                 use_gaps.then_some(gaps.as_slice()),
             )?;
             composites.push(comp);
+            sources.push(from);
 
             // reset scratch arrays
             senses.clear();
@@ -1573,8 +1651,8 @@ pub(super) fn convert_to_bspline_curves_indexed(
     just_copy_bsplines: bool,
 ) -> Result<(Vec<Curve>, Vec<f64>, Vec<usize>)> {
     // init output
-    let mut out = Vec::with_capacity(curves.len());
-    let mut gaps = Vec::with_capacity(curves.len());
+    let mut out = Vec::new();
+    let mut gaps = Vec::new();
     let mut sources = Vec::with_capacity(curves.len());
 
     // locals
@@ -1615,7 +1693,7 @@ pub enum OffsetCornerType {
     FilletCorner = 1,
     /// `SM_OC_LINEAR_CHAMFER`: the extension lines trimmed by a chamfer line.
     LinearChamfer = 2,
-    /// `SM_OC_CURVE_EXTENSION` (source change, source fork 54148db): each
+    /// `SM_OC_CURVE_EXTENSION` (SolidCraft change, tangency-labs/smlib 54148db): each
     /// offset continues as its own curve to where the two meet. Only
     /// `PrimitiveCreation::create_taper_extrude` takes it: there each wall continues as
     /// its own surface (a line's plane, an arc's cone) and neighbouring walls meet along
@@ -1798,8 +1876,7 @@ pub fn create_corner(
 
             // the plane normal of the two extensions (status ignored upstream)
             let pair = [c1, c2];
-            let plane_normal =
-                ignored(compute_crvs_normal(k, &pair))?.unwrap_or(Vec3::new(0.0, 0.0, 0.0));
+            let (plane_normal, _) = compute_crvs_normal_written(k, &pair)?;
             [c1, c2] = pair;
 
             let chamfer_vector = vertex_to_x.cross(plane_normal);
@@ -1843,7 +1920,7 @@ pub fn create_corner(
         }
         OffsetCornerType::CurveExtension => {
             // No other corner cases implemented yet
-            return Err(SolidError::sm_err(OP));
+            return Err(SolidError::curve(OP, CurveFailure::CornerByCurveExtension));
         }
     }
     Ok(out)
@@ -1866,9 +1943,11 @@ impl SolutionObject for OrigHandle {
 /// `sm_CurveClassify`: whether to keep the trimmed offset curve `trimmed_offset`.
 /// With its `originator` (the offset map attribute's original curve), a curve whose
 /// mid-parameter tangent opposes the originator's there is a bow tie (discard).
-/// Otherwise the curve is discarded when its mid point lies closer than
-/// `offset_distance * (1 - SM_EFF_ZERO)` to any of `orig_curves` (minimum distance
-/// solves within `offset_distance + 2 xsect_tol_3d`).
+/// Otherwise the curve is discarded when its mid point is proved closer than
+/// `offset_distance * (1 - SM_EFF_ZERO)` to any of `orig_curves` (minimum distance solves
+/// within `offset_distance + 2 xsect_tol_3d`; the proof as `proved_closer` makes it with
+/// the rounding of the solve's nearest point, a SolidCraft change for #18514; upstream
+/// compares the solved distance alone).
 ///
 /// # Errors
 ///
@@ -1961,7 +2040,8 @@ pub(crate) fn curve_classify_cached(
                 cache,
             )?;
             if let Some(s) = sols.get(0) {
-                if s.start.solution_value < cutoff {
+                let t = s.start.parameters.first().copied();
+                if proved_closer(k, orig, t, p, s.start.solution_value, cutoff)? {
                     // Within offset distance of this curve.
                     return Ok(false);
                 }
@@ -1969,6 +2049,54 @@ pub(crate) fn curve_classify_cached(
         }
     }
     Ok(true)
+}
+
+/// Whether the point `p`, as given, is proved closer than upstream's `cutoff` (`offset
+/// distance * (1 - SM_EFF_ZERO)`) to `orig`, given the point solve's nearest point on it at
+/// parameter `t` and the solve's distance `solved` (SolidCraft change, #18514). The point of
+/// `orig` at `t` (clamped to its natural interval) is evaluated again, and `p` is closer when
+/// the distance between them, widened by its own rounding ([`certified::distance`]) and
+/// twice the point's coordinate error ([`Curve::point_error_bound`]; a norm is within
+/// `sqrt 3 < 2` times a coordinate's), stays below `cutoff`: that point lies on `orig`.
+/// Where it is not proved, `p` is not taken as closer.
+///
+/// Upstream compares `solved` with `cutoff` alone. The mid point of a trimmed offset lies the
+/// offset distance from its own curve, at its foot, up to the rounding of evaluating it, and
+/// the rounding of that distance grows with the coordinates, not with the offset: about 1e-12
+/// of an offset of 0.017 at 111 from the origin, past upstream's margin, so it dropped such
+/// an offset at single offset distances. The bound is added to upstream's margin, so the
+/// margin is never narrower than upstream's, and a piece inside by less than the bound,
+/// which grows with the coordinates as the rounding does, is kept. `p`'s own rounding is
+/// not in the bound (an offset curve has no point error bound): `p` is the point the piece
+/// is built through. A curve kind with no point error bound
+/// ([`Curve::point_error_bound`] is `None`: an offset or a composite, for one) keeps
+/// upstream's test of `solved`, as does a solution with no parameter.
+///
+/// # Errors
+///
+/// Those of the point's evaluation.
+fn proved_closer(
+    k: &Kernel,
+    orig: &Curve,
+    t: Option<f64>,
+    p: Point3,
+    solved: f64,
+    cutoff: f64,
+) -> Result<bool> {
+    let upstream = solved < cutoff;
+    let Some(t) = t.map(|t| orig.natural_interval().clamp_value(t)) else {
+        return Ok(upstream);
+    };
+    let Some(error) = orig.point_error_bound(t) else {
+        return Ok(upstream);
+    };
+    let q = orig.evaluate_point(k, t)?;
+    let d = certified::distance(p, q);
+    let near = Bounded {
+        value: d.value,
+        bound: d.bound + 2.0 * error,
+    };
+    Ok(near.at_most(cutoff).is_yes())
 }
 
 // ---- sorted break lists ---------------------------------------------------------------
@@ -2054,15 +2182,157 @@ pub fn insert_sorted_breaks(breaks: &mut Vec<f64>, value: f64) {
     breaks.push(value);
 }
 
+/// Maps a non-empty sub-interval `comp_tgt` of a segment's composite span
+/// `[comp_start, comp_end]` back onto the segment's natural interval `seg_ivl`,
+/// reversing within `seg_ivl` when `!same_sense` (`WR-34`).
+fn map_composite_sub_interval(
+    comp_start: f64,
+    comp_end: f64,
+    comp_tgt: Extent1d,
+    seg_ivl: Extent1d,
+    same_sense: bool,
+) -> Extent1d {
+    let seg_min = seg_ivl.min();
+    let seg_max = seg_ivl.max();
+    if same_sense {
+        let map_forward = |t: f64| {
+            if t <= comp_start {
+                seg_min
+            } else if t >= comp_end {
+                seg_max
+            } else if comp_start == seg_min {
+                seg_ivl.clamp_value(t)
+            } else {
+                seg_ivl.clamp_value(seg_min + (t - comp_start))
+            }
+        };
+        Extent1d::from_min_max(map_forward(comp_tgt.min()), map_forward(comp_tgt.max()))
+    } else {
+        let map_reversed = |t: f64| {
+            if t <= comp_start {
+                seg_max
+            } else if t >= comp_end {
+                seg_min
+            } else {
+                seg_ivl.clamp_value(seg_max - (t - comp_start))
+            }
+        };
+        Extent1d::from_min_max(map_reversed(comp_tgt.max()), map_reversed(comp_tgt.min()))
+    }
+}
+
+/// Intersects `interval` with a segment's composite span starting at
+/// `next_comp_start` (or `seg_ivl.min()` for the first valid segment), advances
+/// `next_comp_start`, and maps the overlap onto `seg_ivl` (`WR-34`).
+fn fixed_segment_target_interval(
+    seg_ivl: Extent1d,
+    same_sense: bool,
+    interval: Extent1d,
+    next_comp_start: &mut Option<f64>,
+) -> Extent1d {
+    if seg_ivl.has_negative_length() {
+        return Extent1d::new();
+    }
+    let (comp_start, comp_end) = if let Some(start) = *next_comp_start {
+        (start, start + seg_ivl.length())
+    } else {
+        (seg_ivl.min(), seg_ivl.max())
+    };
+    *next_comp_start = Some(comp_end);
+    let Ok(comp_tgt) = Extent1d::from_min_max(comp_start, comp_end).intersect(&interval) else {
+        return Extent1d::new();
+    };
+    map_composite_sub_interval(comp_start, comp_end, comp_tgt, seg_ivl, same_sense)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::curve::arc::ArcDefinition;
     use crate::curve::hermite_curve::HermiteCurve;
+    use crate::curve::line::Line;
+    use crate::curve::path::PathPiece;
+    use crate::nurbs::b_spline_curve::{BSplineCurveForm, CanonicalData, KnotType};
 
     fn line(a: [f64; 3], b: [f64; 3]) -> Curve {
         Curve::from(
             BSplineCurve::create_line_segment(3, Vec3::from_array(a), Vec3::from_array(b)).unwrap(),
         )
+    }
+
+    fn normal_req() -> BoundingBoxRequest {
+        BoundingBoxRequest {
+            normal: true,
+            pseudo: false,
+            polar: false,
+        }
+    }
+
+    fn normal_and_pseudo_req() -> BoundingBoxRequest {
+        BoundingBoxRequest {
+            normal: true,
+            pseudo: true,
+            polar: false,
+        }
+    }
+
+    fn line_on_interval(start: [f64; 3], end: [f64; 3], min: f64, max: f64) -> Curve {
+        let ivl = Extent1d::from_min_max(min, max);
+        Curve::from(
+            Line::create_line_segment(
+                3,
+                Vec3::from_array(start),
+                Vec3::from_array(end),
+                Some(&ivl),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn polyline_on_knots(points: &[[f64; 3]], knots: &[f64]) -> Curve {
+        let pts: Vec<Point3> = points.iter().copied().map(Vec3::from_array).collect();
+        let mut mults = vec![1; knots.len()];
+        *mults.first_mut().unwrap() = 2;
+        *mults.last_mut().unwrap() = 2;
+        Curve::from(
+            BSplineCurve::create_canonical(&CanonicalData {
+                dim: 3,
+                degree: 1,
+                control_points: &pts,
+                form: BSplineCurveForm::PolylineForm,
+                knot_multiplicities: &mults,
+                knots,
+                knot_type: KnotType::Unspecified,
+                weights: None,
+                trim: None,
+            })
+            .unwrap(),
+        )
+    }
+
+    fn assert_encloses_joined_samples(
+        bbox: &Extent3d,
+        pseudo: Option<&PseudoBox>,
+        joined: &BSplineCurve,
+        min: f64,
+        max: f64,
+    ) {
+        let steps = 16_u32;
+        for step in 0..=steps {
+            let alpha = f64::from(step) / f64::from(steps);
+            let t = min + alpha * (max - min);
+            let pt = joined.evaluate_point(t).unwrap();
+            assert!(
+                bbox.contains_point(pt, 1e-9),
+                "normal bbox {bbox:?} missed point {pt:?} at t = {t}"
+            );
+            if let Some(pb) = pseudo {
+                assert!(
+                    pb.contains_point(pt, 1e-9),
+                    "pseudo bbox {pb:?} missed point {pt:?} at t = {t}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2188,11 +2458,72 @@ mod tests {
             line(pts[2], pts[1]),
             line(pts[3], pts[0]),
         ];
-        let r = CompositeCurve::build_composites_from_curves(k, curves, 1e-6, 0.0).unwrap();
+        let r = CompositeCurve::build_composites_from_curves(k, curves.clone(), 1e-6, 0.0).unwrap();
         assert_eq!(r.composites.len(), 1);
         assert!(r.composites[0].is_closed());
         assert_eq!(r.composites[0].num_segments(), 4);
         assert!(r.unused.is_empty());
+        // the caller's tolerances: not positive, and a line distance not above it
+        let err =
+            CompositeCurve::build_composites_from_curves(k, curves.clone(), 0.0, 0.0).unwrap_err();
+        assert_eq!(
+            err.curve_failure(),
+            Some(&CurveFailure::SamePointToleranceNotPositive { tolerance: 0.0 })
+        );
+        assert_eq!(
+            crate::error::upstream_status(&err),
+            Some(crate::error::SM_ERR)
+        );
+        let err = CompositeCurve::build_composites_from_curves(k, curves, 1e-6, 1e-7).unwrap_err();
+        assert_eq!(
+            err.curve_failure(),
+            Some(&CurveFailure::LineDistanceNotAboveTolerance {
+                distance: 1e-7,
+                tolerance: 1e-6
+            })
+        );
+        assert_eq!(
+            crate::error::upstream_status(&err),
+            Some(crate::error::SM_ERR)
+        );
+        // a composite has no evaluation of its own
+        let square = &r.composites[0];
+        let err = CurveEvaluate::evaluate(square, k, 0.5, 0, false, false).unwrap_err();
+        assert_eq!(
+            err.curve_failure(),
+            Some(&CurveFailure::NoEvaluationOfItsOwn)
+        );
+        assert_eq!(
+            crate::error::upstream_status(&err),
+            Some(crate::error::SM_ERR)
+        );
+        assert_eq!(
+            CurveEvaluate::evaluate_point(square, k, 0.5)
+                .unwrap_err()
+                .curve_failure(),
+            Some(&CurveFailure::NoEvaluationOfItsOwn)
+        );
+        // the corner builder does not build a curve-extension corner
+        let err = create_corner(
+            k,
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.1, 0.0),
+            Vec3::X,
+            Vec3::new(1.1, 0.0, 0.0),
+            Vec3::Y,
+            OffsetCornerType::CurveExtension,
+            0.1,
+            1e-6,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.curve_failure(),
+            Some(&CurveFailure::CornerByCurveExtension)
+        );
+        assert_eq!(
+            crate::error::upstream_status(&err),
+            Some(crate::error::SM_ERR)
+        );
     }
 
     #[test]
@@ -2243,5 +2574,393 @@ mod tests {
         assert!(c.copy(&Kernel::default()).is_err());
         assert!(is_kind_of(TYPE));
         assert!(region_is_kind_of(REGION_TYPE));
+    }
+
+    #[test]
+    fn wr34_first_segment_non_zero_start_and_sub_interval() {
+        let k_fixed = Kernel::default();
+
+        let seg0 = line_on_interval([0.0, 0.0, 0.0], [2.0, 0.0, 0.0], 5.0, 7.0);
+        let seg1 = line_on_interval([2.0, 0.0, 0.0], [2.0, 3.0, 0.0], 0.0, 3.0);
+        let c = CompositeCurve::with_curves(3, vec![seg0, seg1], false, None, None).unwrap();
+        let full_ivl = c.natural_interval();
+        assert_eq!(full_ivl, Extent1d::from_min_max(5.0, 10.0));
+
+        let joined = c.clone().make_composite_nurb().unwrap();
+        assert_eq!(joined.natural_interval(), full_ivl);
+
+        // Fixed WR-34 stacks [5, 7] then [7, 10] and maps each overlap back onto its segment.
+        let fixed_full = c
+            .calculate_bounding_box(&k_fixed, &full_ivl, normal_and_pseudo_req(), false)
+            .unwrap();
+        let full_box = fixed_full.normal.unwrap();
+        assert!((full_box.min() - Vec3::new(0.0, 0.0, 0.0)).length() < 1e-12);
+        assert!((full_box.max() - Vec3::new(2.0, 3.0, 0.0)).length() < 1e-12);
+        assert_encloses_joined_samples(&full_box, fixed_full.pseudo.as_ref(), &joined, 5.0, 10.0);
+
+        let via_curve = Curve::from(c.clone())
+            .calculate_bounding_box(&k_fixed, &full_ivl, normal_req(), false)
+            .unwrap()
+            .normal
+            .unwrap();
+        assert_eq!(via_curve, full_box);
+
+        for (lo, hi, exp_min, exp_max) in [
+            (5.5, 6.5, Vec3::new(0.5, 0.0, 0.0), Vec3::new(1.5, 0.0, 0.0)),
+            (6.5, 8.5, Vec3::new(1.5, 0.0, 0.0), Vec3::new(2.0, 1.5, 0.0)),
+            (7.5, 9.5, Vec3::new(2.0, 0.5, 0.0), Vec3::new(2.0, 2.5, 0.0)),
+        ] {
+            let sub = Extent1d::from_min_max(lo, hi);
+            let res = c
+                .calculate_bounding_box(&k_fixed, &sub, normal_and_pseudo_req(), false)
+                .unwrap();
+            let b = res.normal.unwrap();
+            assert!((b.min() - exp_min).length() < 1e-12);
+            assert!((b.max() - exp_max).length() < 1e-12);
+            assert_encloses_joined_samples(&b, res.pseudo.as_ref(), &joined, lo, hi);
+        }
+    }
+
+    #[test]
+    fn wr34_multi_segment_non_zero_starts_5_7_and_10_13() {
+        let k_fixed = Kernel::default();
+
+        let seg0 = polyline_on_knots(
+            &[[0.0, 0.0, 0.0], [1.0, 2.0, 0.0], [2.0, 0.0, 0.0]],
+            &[5.0, 6.0, 7.0],
+        );
+        let seg1 = polyline_on_knots(
+            &[
+                [2.0, 0.0, 0.0],
+                [3.0, -4.0, 0.0],
+                [4.0, 5.0, 0.0],
+                [5.0, 1.0, 0.0],
+            ],
+            &[10.0, 11.0, 12.0, 13.0],
+        );
+        let c = CompositeCurve::with_curves(3, vec![seg0.clone(), seg1.clone()], false, None, None)
+            .unwrap();
+        let full_ivl = c.natural_interval();
+        assert_eq!(full_ivl, Extent1d::from_min_max(5.0, 10.0));
+        let joined = c.clone().make_composite_nurb().unwrap();
+
+        // Fixed WR-34 covers both segments on [5, 10] and maps sub-intervals to exact knot spans.
+        let fixed_full = c
+            .calculate_bounding_box(&k_fixed, &full_ivl, normal_and_pseudo_req(), false)
+            .unwrap();
+        let full_box = fixed_full.normal.unwrap();
+        assert!((full_box.min() - Vec3::new(0.0, -4.0, 0.0)).length() < 1e-12);
+        assert!((full_box.max() - Vec3::new(5.0, 5.0, 0.0)).length() < 1e-12);
+        assert_encloses_joined_samples(&full_box, fixed_full.pseudo.as_ref(), &joined, 5.0, 10.0);
+
+        // [7.2, 7.8] maps to seg1 [10.2, 10.8], strictly inside knot span [10, 11].
+        let span1 = c
+            .calculate_bounding_box(
+                &k_fixed,
+                &Extent1d::from_min_max(7.2, 7.8),
+                normal_and_pseudo_req(),
+                false,
+            )
+            .unwrap();
+        let span1_box = span1.normal.unwrap();
+        assert!(span1_box.max().y <= 1e-12);
+        assert_encloses_joined_samples(&span1_box, span1.pseudo.as_ref(), &joined, 7.2, 7.8);
+
+        // [8.2, 8.8] maps to seg1 [11.2, 11.8], strictly inside knot span [11, 12].
+        let span2 = c
+            .calculate_bounding_box(
+                &k_fixed,
+                &Extent1d::from_min_max(8.2, 8.8),
+                normal_and_pseudo_req(),
+                false,
+            )
+            .unwrap();
+        let span2_box = span2.normal.unwrap();
+        assert_encloses_joined_samples(&span2_box, span2.pseudo.as_ref(), &joined, 8.2, 8.8);
+
+        // Three segments: add seg2 on [-4, -2] occupying composite span [10, 12].
+        let seg2 = line_on_interval([5.0, 1.0, 0.0], [5.0, 1.0, 6.0], -4.0, -2.0);
+        let c3 = CompositeCurve::with_curves(3, vec![seg0, seg1, seg2], false, None, None).unwrap();
+        assert_eq!(c3.natural_interval(), Extent1d::from_min_max(5.0, 12.0));
+        let joined3 = c3.clone().make_composite_nurb().unwrap();
+        let seg2_sub = c3
+            .calculate_bounding_box(
+                &k_fixed,
+                &Extent1d::from_min_max(10.5, 11.5),
+                normal_and_pseudo_req(),
+                false,
+            )
+            .unwrap();
+        let seg2_box = seg2_sub.normal.unwrap();
+        assert!((seg2_box.min() - Vec3::new(5.0, 1.0, 1.5)).length() < 1e-12);
+        assert!((seg2_box.max() - Vec3::new(5.0, 1.0, 4.5)).length() < 1e-12);
+        assert_encloses_joined_samples(&seg2_box, seg2_sub.pseudo.as_ref(), &joined3, 10.5, 11.5);
+    }
+
+    #[test]
+    fn wr34_reversed_same_sense_false_segment_sub_interval() {
+        let k_fixed = Kernel::default();
+
+        // Single reversed Line segment on [5, 8]: composite t = 5 starts at u = 8 -> (3, 6, 0).
+        let single_rev = CompositeCurve::with_curves(
+            3,
+            vec![line_on_interval([0.0, 0.0, 0.0], [3.0, 6.0, 0.0], 5.0, 8.0)],
+            false,
+            Some(&[false]),
+            None,
+        )
+        .unwrap();
+        let joined_single = single_rev.clone().make_composite_nurb().unwrap();
+        assert!(
+            (joined_single.evaluate_point(5.0).unwrap() - Vec3::new(3.0, 6.0, 0.0)).length()
+                < 1e-12
+        );
+
+        let sub_single = Extent1d::from_min_max(5.0, 5.5);
+
+        let fixed_single = single_rev
+            .calculate_bounding_box(&k_fixed, &sub_single, normal_and_pseudo_req(), false)
+            .unwrap();
+        let fixed_single_box = fixed_single.normal.unwrap();
+        assert!((fixed_single_box.min() - Vec3::new(2.5, 5.0, 0.0)).length() < 1e-12);
+        assert!((fixed_single_box.max() - Vec3::new(3.0, 6.0, 0.0)).length() < 1e-12);
+        assert_encloses_joined_samples(
+            &fixed_single_box,
+            fixed_single.pseudo.as_ref(),
+            &joined_single,
+            5.0,
+            5.5,
+        );
+
+        // Two segments: forward seg0 on [5, 7] and reversed multi-span seg1 on [10, 13].
+        // Seg1 has u = 13 at (2, 0, 0) meeting seg0's end, u = 11 at (2, 4, 0), u = 10 at (2, -6, 2).
+        let seg0 = polyline_on_knots(&[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]], &[5.0, 7.0]);
+        let seg1 = polyline_on_knots(
+            &[[2.0, -6.0, 2.0], [2.0, 4.0, 0.0], [2.0, 0.0, 0.0]],
+            &[10.0, 11.0, 13.0],
+        );
+        let comp_rev =
+            CompositeCurve::with_curves(3, vec![seg0, seg1], false, Some(&[true, false]), None)
+                .unwrap();
+        let joined_rev = comp_rev.clone().make_composite_nurb().unwrap();
+        assert_eq!(
+            comp_rev.natural_interval(),
+            Extent1d::from_min_max(5.0, 10.0)
+        );
+
+        // [7.2, 8.8] maps in reverse to u in [11.2, 12.8], strictly inside knot span [11, 13].
+        let rev_span_hi = comp_rev
+            .calculate_bounding_box(
+                &k_fixed,
+                &Extent1d::from_min_max(7.2, 8.8),
+                normal_and_pseudo_req(),
+                false,
+            )
+            .unwrap();
+        let rev_hi_box = rev_span_hi.normal.unwrap();
+        assert!(rev_hi_box.min().y >= -1e-12);
+        assert!(rev_hi_box.max().z <= 1e-12);
+        assert_encloses_joined_samples(
+            &rev_hi_box,
+            rev_span_hi.pseudo.as_ref(),
+            &joined_rev,
+            7.2,
+            8.8,
+        );
+
+        // [9.2, 9.8] maps in reverse to u in [10.2, 10.8], strictly inside knot span [10, 11].
+        let sub_lo = Extent1d::from_min_max(9.2, 9.8);
+
+        let rev_span_lo = comp_rev
+            .calculate_bounding_box(&k_fixed, &sub_lo, normal_and_pseudo_req(), false)
+            .unwrap();
+        let rev_lo_box = rev_span_lo.normal.unwrap();
+        assert_encloses_joined_samples(
+            &rev_lo_box,
+            rev_span_lo.pseudo.as_ref(),
+            &joined_rev,
+            9.2,
+            9.8,
+        );
+    }
+
+    #[test]
+    fn wr34_disjoint_degenerate_and_empty_queries() {
+        let k_fixed = Kernel::default();
+
+        let empty = CompositeCurve::new(3);
+        let any_ivl = Extent1d::from_min_max(0.0, 10.0);
+        assert!(empty
+            .calculate_bounding_box(&k_fixed, &any_ivl, normal_req(), false)
+            .unwrap()
+            .normal
+            .unwrap()
+            .is_init());
+
+        let seg0 = line_on_interval([0.0, 0.0, 0.0], [2.0, 0.0, 0.0], 5.0, 7.0);
+        let seg1 = line_on_interval([2.0, 3.0, 0.0], [2.0, 0.0, 0.0], 0.0, 3.0);
+        let c = CompositeCurve::with_curves(3, vec![seg0, seg1], false, Some(&[true, false]), None)
+            .unwrap();
+        assert_eq!(c.natural_interval(), Extent1d::from_min_max(5.0, 10.0));
+
+        // [0.0, 2.5] lies strictly below [5.0, 10.0]: default spuriously hits shifted
+        // seg1 [2.0, 5.0], whereas fixed WR-34 leaves the box uninitialised.
+        let below = Extent1d::from_min_max(0.0, 2.5);
+        assert!(c
+            .calculate_bounding_box(&k_fixed, &below, normal_req(), false)
+            .unwrap()
+            .normal
+            .unwrap()
+            .is_init());
+        assert!(c
+            .calculate_bounding_box(
+                &k_fixed,
+                &Extent1d::from_min_max(10.5, 12.0),
+                normal_req(),
+                false,
+            )
+            .unwrap()
+            .normal
+            .unwrap()
+            .is_init());
+
+        // Degenerate seam query [7.0, 7.0] hits seg0's end (u = 7) and reversed seg1's
+        // end (u = 3), both at (2, 0, 0).
+        let seam = c
+            .calculate_bounding_box(&k_fixed, &Extent1d::from_value(7.0), normal_req(), false)
+            .unwrap()
+            .normal
+            .unwrap();
+        assert!((seam.min() - Vec3::new(2.0, 0.0, 0.0)).length() < 1e-12);
+        assert!((seam.max() - Vec3::new(2.0, 0.0, 0.0)).length() < 1e-12);
+
+        // An empty nested CompositeCurve segment has negative interval length and is skipped
+        // without corrupting the composite offsets of later segments.
+        let with_empty_seg = CompositeCurve::with_curves(
+            3,
+            vec![
+                Curve::from(CompositeCurve::new(3)),
+                line_on_interval([1.0, 2.0, 3.0], [4.0, 5.0, 6.0], 5.0, 7.0),
+            ],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let nested_box = with_empty_seg
+            .calculate_bounding_box(
+                &k_fixed,
+                &Extent1d::from_min_max(5.0, 7.0),
+                normal_req(),
+                false,
+            )
+            .unwrap()
+            .normal
+            .unwrap();
+        assert!((nested_box.min() - Vec3::new(1.0, 2.0, 3.0)).length() < 1e-12);
+        assert!((nested_box.max() - Vec3::new(4.0, 5.0, 6.0)).length() < 1e-12);
+    }
+
+    /// [`proved_closer`] for the point `above` the middle of `orig` (a line along x at
+    /// y = z = 0), offset `d`: the solved distance, upstream's answer and the proof's.
+    fn closer_above(k: &Kernel, orig: &Curve, d: f64, above: f64) -> (bool, bool) {
+        let t = orig.natural_interval().evaluate(0.5);
+        let foot = orig.evaluate_point(k, t).unwrap();
+        let p = foot + Vec3::new(0.0, above, 0.0);
+        let solved = p.distance(foot);
+        let cutoff = d * (1.0 - EFF_ZERO);
+        let proved = proved_closer(k, orig, Some(t), p, solved, cutoff).unwrap();
+        (solved < cutoff, proved)
+    }
+
+    #[test]
+    fn a_point_is_closer_to_a_curve_only_where_its_rounding_proves_it() {
+        // #18514: a line 1000 from the origin, an offset of 0.0175 above its middle.
+        // `crv_point_error` bounds the line's points (degree 1: 2p + 2 = 4 levels) by
+        // e = 16 * 4 * eps * 1010 = 1.4e-11. A point 3e-12 of the offset (5e-14) inside it
+        // is below upstream's cutoff `d (1 - 1e-12)` (d - 1.75e-14), but not proved
+        // closer: the bound is 2e. 1.5e inside is not proved either (d + 0.5e with the
+        // bound); 2.5e inside is (d - 0.5e), so a bound of e or 3e fails a row. Four e
+        // inside are proved, and so is half the offset.
+        let k = Kernel::default();
+        let orig = line([1000.0, 0.0, 0.0], [1010.0, 0.0, 0.0]);
+        let e = orig
+            .point_error_bound(orig.natural_interval().evaluate(0.5))
+            .unwrap();
+        let expected = 16.0 * 4.0 * f64::EPSILON * 1010.0;
+        assert!((e - expected).abs() <= 1e-3 * expected, "{e}");
+        let d = 0.0175;
+        for (above, upstream, proved) in [
+            (d, false, false),
+            (d * (1.0 - 3e-12), true, false),
+            (d - e, true, false),
+            (d - 1.5 * e, true, false),
+            (d - 2.5 * e, true, true),
+            (d - 4.0 * e, true, true),
+            (0.5 * d, true, true),
+        ] {
+            assert_eq!(
+                closer_above(&k, &orig, d, above),
+                (upstream, proved),
+                "{above}"
+            );
+        }
+        // The issue's curves are arcs: rational quadratics, whose bound carries their
+        // weights. A quarter arc of radius 9 about (1000, 0, 0), from 45 to 135 degrees, has
+        // control points up to x = 1000 + 9 / sqrt 2 and weights 1 and 1 / sqrt 2:
+        // e = 16 * 6 * eps * (1000 + 9 / sqrt 2) * sqrt 2 = 3.0e-11, the same two rows.
+        let arc = ArcDefinition {
+            centre: Point3::new(1000.0, 0.0, 0.0),
+            axis: Vec3::Z,
+            reference: Vec3::X,
+            radius: 9.0,
+            start: std::f64::consts::FRAC_PI_4,
+            end: 3.0 * std::f64::consts::FRAC_PI_4,
+        };
+        let orig = PathPiece::of_arc(&k, &arc).unwrap().curve().clone();
+        assert!(matches!(orig.kind(), CurveKind::Ellipse(_)));
+        let e = orig
+            .point_error_bound(orig.natural_interval().evaluate(0.5))
+            .unwrap();
+        let sqrt2 = std::f64::consts::SQRT_2;
+        let expected = 16.0 * 6.0 * f64::EPSILON * (1000.0 + 9.0 / sqrt2) * sqrt2;
+        assert!((e - expected).abs() <= 1e-3 * expected, "{e}");
+        for (above, upstream, proved) in [
+            (d, false, false),
+            (d - 1.5 * e, true, false),
+            (d - 2.5 * e, true, true),
+        ] {
+            assert_eq!(
+                closer_above(&k, &orig, d, above),
+                (upstream, proved),
+                "arc {above}"
+            );
+        }
+        // An offset of 10 from a line 100 from the origin: upstream's margin, 1e-11, is wider
+        // than the bound, 2 * 16 * 4 * eps * 110 = 3.1e-12. A point 1e-12 inside, kept
+        // upstream, is kept; one 4e-12 past upstream's cutoff is dropped, as upstream drops it.
+        let orig = line([100.0, 0.0, 0.0], [110.0, 0.0, 0.0]);
+        let d = 10.0;
+        assert_eq!(closer_above(&k, &orig, d, d - 1e-12), (false, false));
+        let past = d * (1.0 - EFF_ZERO) - 4e-12;
+        assert_eq!(closer_above(&k, &orig, d, past), (true, true));
+        // A curve kind with no point error bound (a composite) keeps upstream's test.
+        let composite = Curve::from(
+            CompositeCurve::with_curves(
+                3,
+                vec![line([0.0; 3], [10.0, 0.0, 0.0])],
+                false,
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        assert!(composite.point_error_bound(5.0).is_none());
+        let p = Vec3::new(5.0, 0.0175 * (1.0 - 3e-12), 0.0);
+        let solved = p.y;
+        let cutoff = 0.0175 * (1.0 - EFF_ZERO);
+        assert!(proved_closer(&k, &composite, Some(5.0), p, solved, cutoff).unwrap());
+        let p = Vec3::new(5.0, 0.0175, 0.0);
+        assert!(!proved_closer(&k, &composite, Some(5.0), p, p.y, cutoff).unwrap());
     }
 }

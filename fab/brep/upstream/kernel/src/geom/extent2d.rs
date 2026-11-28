@@ -25,6 +25,7 @@
 //! | [`Extent2d::expand_absolute`]          | `ExpandAbsolute(double)`                       |
 //! | [`Extent2d::expand_absolute_vec`]      | `ExpandAbsolute(const SmVector2d)`             |
 //! | [`Extent2d::expand_relative`]          | `ExpandRelative`                               |
+//! | [`Extent2d::scale`]                    | `Scale` (public for export, #1765)             |
 //! | [`Extent2d::min`], [`Extent2d::mid`], [`Extent2d::max`] | `GetMin`, `GetMid`, `GetMax`  |
 //! | [`Extent2d::u_min`] .. [`Extent2d::v_max`] | `GetUMin`, `GetUMax`, `GetVMin`, `GetVMax` |
 //! | [`Extent2d::u_interval`], [`Extent2d::v_interval`] | `GetUInterval`, `GetVInterval`     |
@@ -56,10 +57,11 @@
 //! | [`SS_NONE`], [`SS_UMIN`], [`SS_VMIN`], [`SS_UMAX`], [`SS_VMAX`] | `SM_SS_*` (`SmTypes.h`) |
 //!
 //! Methods of `SmExtent2d` that no in-scope upstream code reaches
-//! (`harness/callgraph/unused_functions.txt`: `Set`, `SetUMin`..`SetVMax`, `Scale`,
-//! the distance methods, `IsPoint`, `IsLine`, `AnyBounds`, `ClassifyPointDir2d`,
-//! the periodic disjoint/intersect methods, `ApproximateUnbounded`, ...) are not
-//! ported.
+//! (`harness/callgraph/unused_functions.txt`: `Set`, `SetUMin`..`SetVMax`, the
+//! distance methods, `IsPoint`, `IsLine`, `AnyBounds`, `ClassifyPointDir2d`, the
+//! periodic disjoint/intersect methods, `ApproximateUnbounded`, ...) are not ported.
+//! `Scale` is listed there too but is ported for callers outside the closure: an
+//! exporter scaling a plane's parameter domain (#1765).
 //!
 //! Deviations:
 //! - Out-params become return values (tuples, `Option`, `Result`). Optional
@@ -67,8 +69,8 @@
 //!   `ContainsPeriodicPoint2d`'s periodic point) are always computed; they have no
 //!   side effects.
 //! - Status codes: `SM_ERR_INVALID_INPUT` is [`SolidError::InvalidInput`]; `SM_ERR`
-//!   is [`SolidError::Upstream`] with code 1001. `Intersect` leaves an `Init()`
-//!   extent as the result when it fails; the Rust error carries no result.
+//!   is a typed [`crate::error::geom::GeomFailure`] (status 1001). `Intersect`
+//!   leaves an `Init()` extent as the result when it fails; the Rust error carries no result.
 //!   `Inversion` may write a partial normalised point before failing; the Rust error
 //!   carries none (no in-scope caller reads it).
 //! - `IntersectWithInfiniteLine` always returns `SM_SUCCESS`; the Rust method
@@ -87,9 +89,6 @@ use crate::geom::tol::{are_same, are_same_to_tol, is_zero_to_tol, tol3d, ScaledZ
 use crate::geom::vector2d::{Point2, Vec2};
 use crate::geom::vector3d::sqrt;
 use crate::math::{is_infinite_param, max2, min2, BIG_DOUBLE, EFF_ZERO, EFF_ZERO_SQRT};
-
-/// Upstream status `SM_ERR`.
-const SM_ERR: i32 = 1001;
 
 /// `SM_SS_NONE`: the point is on no boundary ([`Extent2d::point_boundaries`]).
 pub const SS_NONE: u32 = 0;
@@ -360,6 +359,39 @@ impl Extent2d {
     pub fn expand_relative(&mut self, factor: f64) -> &mut Self {
         let d = (self.max - self.min) * factor;
         self.expand_absolute_vec(d)
+    }
+
+    /// Scales every bounded end by `scale` in x and by `scale_v` in y (`scale` when
+    /// `None`); unbounded ends stay (`Scale`, its `pOptScaleV`).
+    ///
+    /// The ends are not reordered: a negative factor leaves the extent inverted
+    /// (`min > max` on that axis), as upstream does.
+    pub fn scale(&mut self, scale: f64, scale_v: Option<f64>) -> &mut Self {
+        let scale_v = scale_v.unwrap_or(scale);
+
+        self.min.x *= if is_infinite_param(self.min.x) {
+            1.0
+        } else {
+            scale
+        };
+        self.max.x *= if is_infinite_param(self.max.x) {
+            1.0
+        } else {
+            scale
+        };
+
+        self.min.y *= if is_infinite_param(self.min.y) {
+            1.0
+        } else {
+            scale_v
+        };
+        self.max.y *= if is_infinite_param(self.max.y) {
+            1.0
+        } else {
+            scale_v
+        };
+
+        self
     }
 
     /// Minimum corner (`GetMin`).
@@ -678,14 +710,15 @@ impl Extent2d {
     }
 
     /// Normalised coordinates of `p` (snapped to the boundary when within `tol` of
-    /// it, clamped to `[0, 1]`); [`SolidError::Upstream`] `SM_ERR` when `p` is
-    /// outside or a side is degenerate and `p` is off it (`Inversion`; upstream
-    /// default `tol = SM_EFF_ZERO`).
+    /// it, clamped to `[0, 1]`); a [`crate::error::geom::GeomFailure::PointOutsideExtent`]
+    /// (`SM_ERR`) when `p` is outside or a side is degenerate and `p` is off it
+    /// (`Inversion`; upstream default `tol = SM_EFF_ZERO`).
     pub fn inversion(&self, p: Point2, tol: f64) -> Result<Point2> {
-        let err = || SolidError::Upstream {
-            operation: "geom::extent2d::Extent2d::inversion",
-            code: SM_ERR,
-            entity: None,
+        let err = || {
+            SolidError::geom(
+                "geom::extent2d::Extent2d::inversion",
+                crate::error::geom::GeomFailure::PointOutsideExtent { u: p.x, v: p.y },
+            )
         };
         let mut pnt = p;
         if self.is_point_on_boundary(pnt, tol).0 {
@@ -831,7 +864,8 @@ impl Extent2d {
     }
 
     /// Maps `p` from this domain to `other` through normalised coordinates,
-    /// swapping u and v when `switch_params`; [`SolidError::Upstream`] `SM_ERR` when
+    /// swapping u and v when `switch_params`; a
+    /// [`crate::error::geom::GeomFailure::PointOutsideExtent`] (`SM_ERR`) when
     /// [`Extent2d::inversion`] fails (`Point2dMapToDomain`).
     pub fn point_map_to_domain(
         &self,
@@ -839,18 +873,26 @@ impl Extent2d {
         other: &Self,
         switch_params: bool,
     ) -> Result<Point2> {
-        let n = self
-            .inversion(p, EFF_ZERO)
-            .map_err(|_| SolidError::Upstream {
-                operation: "geom::extent2d::Extent2d::point_map_to_domain",
-                code: SM_ERR,
-                entity: None,
-            })?;
+        let n = self.inversion(p, EFF_ZERO).map_err(|_| {
+            SolidError::geom(
+                "geom::extent2d::Extent2d::point_map_to_domain",
+                crate::error::geom::GeomFailure::PointOutsideExtent { u: p.x, v: p.y },
+            )
+        })?;
         Ok(if switch_params {
             other.evaluate(n.y, n.x)
         } else {
             other.evaluate(n.x, n.y)
         })
+    }
+}
+
+/// Not upstream: the content digest ([`crate::geom::content`]).
+impl crate::geom::content::Content for Extent2d {
+    fn content(&self, d: &mut crate::geom::content::Digest) -> Option<()> {
+        let Self { min, max } = self;
+        min.content(d)?;
+        max.content(d)
     }
 }
 
@@ -861,6 +903,23 @@ mod tests {
 
     fn p(x: f64, y: f64) -> Point2 {
         Vec2::new(x, y)
+    }
+
+    /// `Scale` (#1765): bounded ends scale, by the V factor in y when given; an unbounded
+    /// end stays, and the call chains.
+    #[test]
+    fn scale_scales_the_bounded_ends() {
+        let mut e = Extent2d::from_points(p(-1.0, 2.0), p(3.0, 4.0));
+        e.scale(2.0, None);
+        assert_eq!((e.min(), e.max()), (p(-2.0, 4.0), p(6.0, 8.0)));
+        e.scale(0.5, Some(-1.0)).scale(1.0, None);
+        assert_eq!((e.min(), e.max()), (p(-1.0, -4.0), p(3.0, -8.0)));
+        let mut u = Extent2d::from_bounds(-2.0, 1.0, INFINITE_PARAMETER, INFINITE_PARAMETER);
+        u.scale(3.0, Some(2.0));
+        assert_eq!(
+            (u.min(), u.max()),
+            (p(-6.0, 2.0), p(INFINITE_PARAMETER, INFINITE_PARAMETER))
+        );
     }
 
     /// `my_test_extent2d` (`tests/prog_test/src/smCurveTest.cpp:2688`), owned parts.
@@ -952,10 +1011,12 @@ mod tests {
         );
         assert!(!e1.is_point_on_boundary(p(1.1, 2.1), EFF_ZERO).0);
 
-        assert_eq!(
-            e1.contains_periodic_point(p(8.9, 3.0), 4.0, 0.0, 0.2),
-            (true, p(1.0, 3.0))
-        );
+        // u = 8.9 is 0.9 a period down, within the tolerance of [1, 3]: it keeps 0.9
+        // (WR-509, #1518; upstream's MyTest expects the start, 1.0)
+        let (inside, q) = e1.contains_periodic_point(p(8.9, 3.0), 4.0, 0.0, 0.2);
+        assert!(inside);
+        assert!((q.x - 0.9).abs() <= 1e-12, "{}", q.x);
+        assert_eq!(q.y, 3.0);
         assert!(!e1.contains_periodic_point(p(8.9, 3.0), 4.0, 0.0, 0.0).0);
 
         assert_eq!(e1.evaluate(0.5, 0.5), p(2.0, 3.0));
@@ -1019,7 +1080,21 @@ mod tests {
     fn inversion_of_degenerate_side() {
         let e = Extent2d::from_bounds(0.0, 0.0, 0.0, 1.0);
         assert_eq!(e.inversion(p(0.0, 0.5), EFF_ZERO).unwrap(), p(1.0, 0.5));
-        assert!(e.inversion(p(2.0, 0.5), EFF_ZERO).is_err());
+        let outside = e.inversion(p(2.0, 0.5), EFF_ZERO).unwrap_err();
+        assert_eq!(
+            outside.geom_failure(),
+            Some(&crate::error::geom::GeomFailure::PointOutsideExtent { u: 2.0, v: 0.5 })
+        );
+        assert_eq!(outside.upstream_status(), Some(crate::error::SM_ERR));
+        let mapped = e
+            .point_map_to_domain(
+                p(2.0, 0.5),
+                &Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0),
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(mapped.geom_failure(), outside.geom_failure());
+        assert_eq!(mapped.upstream_status(), Some(crate::error::SM_ERR));
     }
 
     #[test]

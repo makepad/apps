@@ -8,7 +8,7 @@
 //! An edit rebuilds only the steps it changed.
 //!
 //! A body depends on its step and its inputs alone, never on what the worker did before:
-//! each new body builds on a renewed kernel (`Kernel::renewed`: nothing an earlier call left on
+//! each new body builds on a renewed kernel (`ops::renewed`: nothing an earlier call left on
 //! it, its random draws seeded from the step's key), from copies of its inputs as their steps
 //! made them. A mesh or a query reads a copy of its own on a renewed kernel too: what it works
 //! out on the body it reads (a tessellation keeps its trim curves there) reaches no other.
@@ -16,7 +16,7 @@
 //! The worker runs under the process's CPU budget at the class of the job it serves: the
 //! highest class waiting first, the oldest of a class first, with checkpoints between steps
 //! and inside the kernel. A Background job gives way at its next checkpoint to a job of a
-//! higher class sent meanwhile: it unwinds as a cancel does, keeps the steps it finished and
+//! higher class sent meanwhile: it stops at a poll, keeps the steps it finished and
 //! waits again, first of its class. A caller lends its own token while it waits. The worker
 //! starts at its first body: a document without B-rep parts never pays for one.
 
@@ -271,6 +271,7 @@ fn serve(jobs: Receiver<Job>, shared: Arc<Shared>) {
         }
         match w.serve(&job) {
             Served::Answer(answer) => {
+                let answer = if job.cancel.is_cancelled() { Err(cancelled(w.failing)) } else { answer };
                 let _ = job.reply.send(answer);
             }
             // It goes on where it was once the jobs it gave way to are done.
@@ -286,25 +287,26 @@ enum Served {
     GaveWay,
 }
 
+fn cancelled(step: Option<Key>) -> BrepFailure {
+    BrepFailure { step, lost: None, message: BrepError::Cancelled.to_string() }
+}
+
 thread_local! {
     /// The worker's CPU permit while it runs a job, and when it last checked in with it.
     static PERMIT: Cell<Option<(u32, Instant)>> = const { Cell::new(None) };
-    /// While the worker runs a Background job: the count of jobs it gives way to.
-    static GIVES_WAY: RefCell<Option<Arc<Shared>>> = const { RefCell::new(None) };
-    /// The job running gave way: its run unwound at a checkpoint.
-    static GAVE_WAY: Cell<bool> = const { Cell::new(false) };
+    /// A Background attempt signals only its own token when a preview is waiting.
+    static GIVES_WAY: RefCell<Option<(Arc<Shared>, CancelToken)>> = const { RefCell::new(None) };
 }
 
 /// A permit of the CPU budget at a job's class, held while the worker runs the job.
 struct Permit;
 
 impl Permit {
-    fn admit(class: u8, shared: &Arc<Shared>) -> Permit {
+    fn admit(class: u8, shared: &Arc<Shared>, attempt: &CancelToken) -> Permit {
         makepad_cpu_budget::set_thread_class(class);
         let permit = makepad_cpu_budget::admit(class, makepad_cpu_budget::APP, "B-rep");
         PERMIT.with(|p| p.set(Some((permit, Instant::now()))));
-        GIVES_WAY.with(|g| *g.borrow_mut() = (class >= makepad_cpu_budget::BACKGROUND).then(|| shared.clone()));
-        GAVE_WAY.with(|g| g.set(false));
+        GIVES_WAY.with(|g| *g.borrow_mut() = (class >= makepad_cpu_budget::BACKGROUND).then(|| (shared.clone(), attempt.clone())));
         Permit
     }
 }
@@ -319,13 +321,19 @@ impl Drop for Permit {
 }
 
 /// The worker's checkpoint, between steps and from inside the kernel: a Background job gives way
-/// to a job of a higher class sent meanwhile (it unwinds as a cancel does: the kernel is renewed
-/// for whatever runs next); the permit goes to a higher class waiting for one and comes back when
-/// there is room.
+/// to a job of a higher class sent meanwhile. The observer runs before the kernel reads its
+/// token, so the same poll returns the stop. Otherwise the CPU permit can yield as usual.
 fn checkpoint() {
-    if GIVES_WAY.with(|g| g.borrow().as_ref().is_some_and(|s| s.ahead.load(Ordering::Acquire) > 0)) {
-        GAVE_WAY.with(|g| g.set(true));
-        std::panic::resume_unwind(Box::new(makepad_csg_brep::limits::Unwound::Cancelled));
+    if GIVES_WAY.with(|g| {
+        if let Some((shared, attempt)) = g.borrow().as_ref() {
+            if shared.ahead.load(Ordering::Acquire) > 0 {
+                attempt.cancel();
+                return true;
+            }
+        }
+        false
+    }) {
+        return;
     }
     PERMIT.with(|p| {
         if let Some((permit, at)) = p.get() {
@@ -463,21 +471,27 @@ impl Worker {
     }
 
     fn serve(&mut self, job: &Job) -> Served {
-        if job.cancel.is_cancelled() {
-            return Served::Answer(Err(BrepFailure { step: None, lost: None, message: BrepError::Cancelled.to_string() }));
-        }
-        let _permit = Permit::admit(job.class, &self.shared);
         self.failing = None;
+        if job.cancel.is_cancelled() {
+            return Served::Answer(Err(cancelled(None)));
+        }
+        let attempt = CancelToken::new();
+        let cancel = attempt.either(&job.cancel);
+        let _permit = Permit::admit(job.class, &self.shared, &attempt);
         // A call that failed or unwound leaves no half-made body: a step's body is kept once
         // it is whole, and the next step or read renews the kernel it left.
-        let answer = makepad_jobs::with_current(job.job.clone(), || guarded(stack_size(), &job.cancel, Some(checkpoint), || self.run(&job.steps, &job.want)));
-        if GAVE_WAY.with(Cell::take) {
+        let answer = makepad_jobs::with_current(job.job.clone(), || guarded(stack_size(), &cancel, Some(checkpoint), || self.run(&job.steps, &job.want, &cancel)));
+        self.kernel.cancel = None;
+        if job.cancel.is_cancelled() {
+            return Served::Answer(Err(cancelled(self.failing)));
+        }
+        if attempt.is_cancelled() {
             return Served::GaveWay;
         }
         Served::Answer(answer.map_err(|e| BrepFailure { step: self.failing, lost: match &e { BrepError::Lost { index, .. } => Some(*index), _ => None }, message: e.to_string() }))
     }
 
-    fn run(&mut self, steps: &[BrepStep], want: &Want) -> Result<Answer, BrepError> {
+    fn run(&mut self, steps: &[BrepStep], want: &Want, cancel: &CancelToken) -> Result<Answer, BrepError> {
         let Some(last) = steps.last() else { return Err(BrepError::Input("an empty recipe".into())) };
         // What is left to build, by kind: the job says "fillets 3/7".
         let job = if matches!(want, Want::Mesh(chord) if *chord < PRINT_DETAIL) { None } else { makepad_jobs::current() };
@@ -491,12 +505,12 @@ impl Worker {
         }
         let mut built = 0usize;
         for step in steps {
+            cancel.check()?;
             self.clock += 1;
             if let Some(b) = self.bodies.get_mut(&step.key) {
                 b.used = self.clock;
                 continue;
             }
-            checkpoint();
             if let (Some(job), Some(kind)) = (&job, op_kind(&step.op)) {
                 let count = kinds.entry(kind).or_default();
                 count.0 += 1;
@@ -507,28 +521,28 @@ impl Worker {
             self.failing = Some(step.key);
             // A selection that names faces reads its input's names, built first on their own kernel.
             self.input_names = match (names_by(&step.op), step.inputs.first()) {
-                (true, Some(input)) => Some(self.names_of(steps, input)?),
+                (true, Some(input)) => Some(self.names_of(steps, input, cancel)?),
                 _ => None,
             };
             self.taken.clear();
             self.note = None;
             let body = self.step(step)?;
+            let distinct = Rc::strong_count(&body) == 1;
+            self.input_names = None;
+            cancel.check()?;
+            self.bodies.insert(step.key, Kept { body, used: self.clock, measure: None, entities: None, names: None });
+            self.body_count += usize::from(distinct);
             if let Some(note) = self.note.take() {
                 self.shared.note(step.key, Some(note));
             }
-            self.input_names = None;
-            self.failing = None;
-            if Rc::strong_count(&body) == 1 {
-                self.body_count += 1;
-            }
-            self.bodies.insert(step.key, Kept { body, used: self.clock, measure: None, entities: None, names: None });
             self.shared.held().insert(step.key, std::mem::take(&mut self.taken));
+            self.failing = None;
         }
         // A tool reading the entities reads the faces' names too: built while every step's body
         // of the recipe is still kept. Names that cannot be worked out leave the listing without
         // them, not failed.
         let entity_names = match want {
-            Want::Entities | Want::At(..) if self.bodies.get(&last.key).is_some_and(|k| k.entities.is_none()) => match caught(|| self.names_of(steps, &last.key)) {
+            Want::Entities | Want::At(..) if self.bodies.get(&last.key).is_some_and(|k| k.entities.is_none()) => match caught(|| self.names_of(steps, &last.key, cancel)) {
                 Ok(names) => Some(names),
                 Err(BrepError::Cancelled) => return Err(BrepError::Cancelled),
                 Err(e) => {
@@ -583,12 +597,13 @@ impl Worker {
                 }
             }
         }
-        checkpoint();
+        cancel.check()?;
         // A read of its own, like a step: what it works out reaches no other.
-        *kernel = kernel.renewed(seed(&last.key));
+        *kernel = ops::renewed(kernel, seed(&last.key));
         let copy = &mut ops::copy_body(kernel, &kept.body, 1)?;
         let k = &*kernel;
         let keep = |meshes: &mut Meshes, chord: f64, mesh: (Arc<TriMesh>, Arc<Vec<u32>>)| {
+            cancel.check()?;
             meshes.insert((last.key, chord.to_bits()), (mesh.0, mesh.1, *clock));
             while meshes.len() > KEEP_MESHES {
                 let oldest = meshes.iter().min_by_key(|(_, (_, _, used))| *used).map(|(k, _)| *k);
@@ -596,6 +611,7 @@ impl Worker {
                     meshes.remove(&k);
                 }
             }
+            Ok::<(), BrepError>(())
         };
         let answer = match want {
             Want::Mesh(chord) => {
@@ -604,7 +620,7 @@ impl Worker {
                 }
                 let mesh = mesh_of(k, copy, &kept.body, *chord)?;
                 let out = mesh.0.clone();
-                keep(meshes, *chord, mesh);
+                keep(meshes, *chord, mesh)?;
                 Answer::Mesh(out)
             }
             Want::Measure => {
@@ -613,22 +629,26 @@ impl Worker {
                 }
                 let m = query::measure(k, copy)?;
                 let m = BrepMeasure { volume: m.volume, area: m.area, centroid: m.centroid, min: m.min, max: m.max, faces: m.faces, edges: m.edges };
+                cancel.check()?;
                 kept.measure = Some(m);
                 Answer::Measure(m)
             }
             Want::Entities => {
                 let (edges, faces) = entities_of(k, copy, &kept.body, entity_names.as_deref())?;
+                cancel.check()?;
                 kept.entities = Some((edges.clone(), faces.clone()));
                 Answer::Entities(edges, faces)
             }
             Want::At(p, reach) => {
                 if kept.entities.is_none() {
-                    kept.entities = Some(entities_of(k, copy, &kept.body, entity_names.as_deref())?);
+                    let entities = entities_of(k, copy, &kept.body, entity_names.as_deref())?;
+                    cancel.check()?;
+                    kept.entities = Some(entities);
                 }
                 // A point is found on a mesh of the body: the one the view shows when there is one.
                 if !meshed(meshes) {
                     let mesh = mesh_of(k, copy, &kept.body, AT_CHORD)?;
-                    keep(meshes, AT_CHORD, mesh);
+                    keep(meshes, AT_CHORD, mesh)?;
                 }
                 let edges = kept.entities.as_ref().map(|e| &e.0[..]).unwrap_or_default();
                 Answer::At(at(meshes, &last.key, edges, *p, *reach))
@@ -641,17 +661,18 @@ impl Worker {
     /// Built once and kept with the body, on a kernel of their own: never the one a step is
     /// being built in, whose input copies live there. Every body of the recipe is kept while it
     /// runs.
-    fn names_of(&mut self, steps: &[BrepStep], key: &Key) -> Result<Arc<Vec<Names>>, BrepError> {
+    fn names_of(&mut self, steps: &[BrepStep], key: &Key, cancel: &CancelToken) -> Result<Arc<Vec<Names>>, BrepError> {
+        cancel.check()?;
         if let Some(n) = self.bodies.get(key).and_then(|k| k.names.clone()) {
             return Ok(n);
         }
         let step = steps.iter().find(|s| s.key == *key).ok_or_else(|| BrepError::Input("names: a step outside its recipe".into()))?;
-        let in_names: Vec<Arc<Vec<Names>>> = step.inputs.iter().map(|i| self.names_of(steps, i)).collect::<Result<_, _>>()?;
-        checkpoint();
+        let in_names: Vec<Arc<Vec<Names>>> = step.inputs.iter().map(|i| self.names_of(steps, i, cancel)).collect::<Result<_, _>>()?;
+        cancel.check()?;
         fn body<'a>(w: &'a Worker, key: &Key) -> Result<&'a Body, BrepError> {
             w.bodies.get(key).map(|k| k.body.as_ref()).ok_or_else(|| BrepError::Input("names: a step's body is gone".into()))
         }
-        let mut k = self.kernel.renewed(seed(key));
+        let mut k = ops::renewed(&self.kernel, seed(key));
         let mut out = ops::copy_body(&mut k, body(self, key)?, 1)?;
         let names = match &step.op {
             BrepOp::Box { .. } | BrepOp::Sphere { .. } | BrepOp::Cylinder { .. } | BrepOp::Torus { .. } | BrepOp::Extrude { .. } | BrepOp::Revolve { .. } | BrepOp::Sweep { .. } | BrepOp::Loft { .. } => {
@@ -735,6 +756,7 @@ impl Worker {
             }
         };
         let names = Arc::new(names);
+        cancel.check()?;
         if let Some(kept) = self.bodies.get_mut(key) {
             kept.names = Some(names.clone());
         }
@@ -758,7 +780,7 @@ impl Worker {
             }
         } else {
             // A kernel of its own: what the step builds depends on its inputs alone.
-            self.kernel = self.kernel.renewed(seed(&step.key));
+            self.kernel = ops::renewed(&self.kernel, seed(&step.key));
             self.serial = 0;
             self.build(step).map(Rc::new)
         };

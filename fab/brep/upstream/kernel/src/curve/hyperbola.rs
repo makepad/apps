@@ -22,7 +22,7 @@
 //! | [`Hyperbola::make_nurb`]                     | `MakeNurb`                                     |
 //! | [`Hyperbola::reverse_parameterization`]      | `ReverseParameterization`                      |
 //! | [`Hyperbola::transform`]                     | `Transform`                                    |
-//! | [`Hyperbola::read_from_db`]                  | `ReadFromDB`                                   |
+//! | [`Hyperbola::read_from_db`], [`Hyperbola::write_to_db`] | `ReadFromDB`, `WriteToDB`           |
 //! | [`Hyperbola::is_kind_of`]                    | `IsKindOf`                                     |
 //! | [`Hyperbola::TYPE`], [`Hyperbola::type_code`], [`Hyperbola::type_string`], [`Hyperbola::class_string`] | `GetType`, `GetTypeString`, `GetClassString` (`SM_COMMON`) |
 //!
@@ -68,6 +68,7 @@
 use crate::curve::curve::p1::GlobalPointSolveOptions;
 use crate::curve::curve::p2::{self as curve_base, at, HYPERBOLA_TYPE};
 use crate::curve::curve::{Curve, CurveKind};
+use crate::error::curve::CurveFailure;
 use crate::error::{ignore_status, ignored, Result, SolidError};
 use crate::geom::assert_array::labels::{SURF_OF_EXTRUSION_TYPE, SURF_OF_REVOLUTION_TYPE};
 use crate::geom::axis2_placement::Axis2Placement;
@@ -79,9 +80,10 @@ use crate::geom::solution_array::{ObjectKind, Solution, SolutionObject};
 use crate::geom::tol::{are_same, is_zero};
 use crate::geom::vector3d::{sqrt, Point3, Vec3};
 use crate::kernel::Kernel;
+use crate::math::det;
 use crate::math::EFF_ZERO;
 use crate::nurbs::b_spline_curve::{BSplineCurve, BSplineCurveForm, CanonicalData, KnotType};
-use crate::topology::database_io::{DatabaseReader, FileType, InputStream};
+use crate::topology::database_io::{DatabaseReader, DatabaseWriter, FileType, InputStream};
 
 const OP_MAKE_NURB: &str = "curve::hyperbola::Hyperbola::make_nurb";
 const OP_EVAL_STEP: &str = "curve::hyperbola::Hyperbola::evaluate_step";
@@ -280,6 +282,18 @@ impl Hyperbola {
 
     // ---- comparison and copies --------------------------------------------------------
 
+    /// Not upstream: the same hyperbola by definition, exactly (IEEE `==`; a NaN
+    /// refuses): the same B-spline part ([`BSplineCurve::same_definition`]), and
+    /// placement, domain and axes equal.
+    #[must_use]
+    pub fn same_definition(&self, other: &Self) -> bool {
+        self.base.same_definition(&other.base)
+            && self.position == other.position
+            && self.anal_domain == other.anal_domain
+            && self.semi_axis == other.semi_axis
+            && self.semi_image_axis == other.semi_image_axis
+    }
+
     /// `operator==`: equal B-spline bases (same dimension, NURBs equal within
     /// `SM_EFF_ZERO`), placements equal within the scaled zero, equal domains and axis
     /// lengths equal within `SM_EFF_ZERO`.
@@ -319,7 +333,13 @@ impl Hyperbola {
     /// `SM_ERR` for more than 3 derivatives.
     pub fn evaluate_step(&self, step_param: f64, num_derivs: usize) -> Result<Vec<Vec3>> {
         if num_derivs > 3 {
-            return Err(SolidError::sm_err(OP_EVAL_STEP));
+            return Err(SolidError::curve(
+                OP_EVAL_STEP,
+                CurveFailure::TooManyDerivatives {
+                    asked: num_derivs,
+                    most: 3,
+                },
+            ));
         }
         let mut t = step_param;
         if !self.anal_domain.contains_value(t, 0.0) {
@@ -334,21 +354,21 @@ impl Hyperbola {
         let mut out = Vec::with_capacity(num_derivs + 1);
 
         // evaluate position
-        out.push(o + (a * t.cosh()) * x + (b * t.sinh()) * y);
+        out.push(o + (a * det::cosh(t)) * x + (b * det::sinh(t)) * y);
 
         // 1st derivative
         if num_derivs > 0 {
-            out.push((a * t.sinh()) * x + (b * t.cosh()) * y);
+            out.push((a * det::sinh(t)) * x + (b * det::cosh(t)) * y);
         }
 
         // 2nd derivative
         if num_derivs > 1 {
-            out.push((a * t.cosh()) * x + (b * t.sinh()) * y);
+            out.push((a * det::cosh(t)) * x + (b * det::sinh(t)) * y);
         }
 
         // 3rd derivative
         if num_derivs > 2 {
-            out.push((a * t.sinh()) * x + (b * t.cosh()) * y);
+            out.push((a * det::sinh(t)) * x + (b * det::cosh(t)) * y);
         }
         Ok(out)
     }
@@ -376,7 +396,7 @@ impl Hyperbola {
 
         // arc-sinh(u) = ln(u + sqrt(u*u+1.0))
         let val = dy / self.semi_image_axis;
-        let param = (val + sqrt(val * val + 1.0)).ln();
+        let param = det::ln(val + sqrt(val * val + 1.0));
 
         // when asked - classify the point
         let mut loc = None;
@@ -457,7 +477,7 @@ impl Hyperbola {
             &opts,
         )?;
 
-        let mut out = Vec::with_capacity(sols.len());
+        let mut out = Vec::new();
         for sol in sols.as_slice() {
             let point_on_curve = curve.evaluate_point(k, sol.start.parameters[0])?;
             let (angle_param, _) = self.step_inversion(point_on_curve, false)?;
@@ -542,7 +562,10 @@ impl Hyperbola {
         let (x1, _) = line_line_closest_point(s0, start_to_end_v, mid_pnt, v1)?;
         // Error: midPoint line fails to intersect hyperpola's base chord
         if x1 < EFF_ZERO || x1 > 1.0 - EFF_ZERO {
-            return Err(SolidError::sm_err(OP_MAKE_NURB));
+            return Err(SolidError::curve(
+                OP_MAKE_NURB,
+                CurveFailure::MidTangentOffChord { at: x1 },
+            ));
         }
 
         // mid ControlPoint weight =
@@ -655,7 +678,10 @@ impl Hyperbola {
             let unit_scale = s.x == 1.0 && s.y == 1.0 && s.z == 1.0;
             if !unit_scale && (!are_same(s.x, s.y) || !are_same(s.x, s.z)) {
                 // Unable to scale analytical curves non-uniformly
-                return Err(SolidError::sm_err(OP_TRANSFORM));
+                return Err(SolidError::curve(
+                    OP_TRANSFORM,
+                    CurveFailure::NonUniformScale { scale: s },
+                ));
             }
         }
 
@@ -746,12 +772,50 @@ impl Hyperbola {
         // read the base type (status ignored upstream)
         match BSplineCurve::read_from_db(db, dim, version) {
             Ok(base) => h.base = base,
-            Err(e @ SolidError::Unported { .. }) => return Err(e),
+            Err(
+                e @ (SolidError::Unported { .. }
+                | SolidError::Cancelled { .. }
+                | SolidError::OutOfFuel { .. }),
+            ) => return Err(e),
             Err(_) => {}
         }
 
         // all done
         Ok(h)
+    }
+
+    /// `WriteToDB`, the record [`Hyperbola::read_from_db`] reads: center, X axis, Y
+    /// axis, domain ends, semi axis, semi imaginary axis, then the B-spline base record.
+    ///
+    /// # Errors
+    ///
+    /// `SM_ERR` when the B-spline part has no NURB (upstream ignores the part's
+    /// status; its virtual `GetOrCreateGwNurbPointer` always has one to write).
+    pub fn write_to_db(&self, db: &mut DatabaseWriter, version: u64) -> Result<()> {
+        let o = self.position.origin();
+        let x = self.position.x_axis();
+        let y = self.position.y_axis();
+        let (lo, hi) = (self.anal_domain.min(), self.anal_domain.max());
+        if db.file_type() == FileType::Ascii {
+            db.out_reals(&[o.x, o.y, o.z]);
+            db.out_str(" SmHyperbola Axis Origin \n");
+            db.out_reals(&[x.x, x.y, x.z]);
+            db.out_str(" SmHyperbola X Axis\n");
+            db.out_reals(&[y.x, y.y, y.z]);
+            db.out_str(" SmHyperbola Y Axis\n");
+            db.out_reals(&[lo, hi]);
+            db.out_str(" SmHyperbola anular arc domain in degrees \n");
+            db.out_f64(self.semi_axis);
+            db.out_str(" SmHyperbola Length of semi axis           \n");
+            db.out_f64(self.semi_image_axis);
+            db.out_str(" SmHyperbola Length of semi imaginary axis \n");
+        } else {
+            db.write_doubles(&[o.x, o.y, o.z, x.x, x.y, x.z, y.x, y.y, y.z]);
+            db.write_doubles(&[lo, hi, self.semi_axis, self.semi_image_axis]);
+        }
+
+        // Write the base object
+        self.base.write_to_db(db, version)
     }
 }
 
@@ -815,7 +879,15 @@ mod tests {
         assert!(!Hyperbola::is_kind_of(14023));
         assert_eq!(h.type_string(), "SmHyperbola_TYPE");
         assert_eq!(h.class_string(), "SmHyperbola");
-        assert!(h.evaluate_step(0.0, 4).is_err());
+        let err = h.evaluate_step(0.0, 4).unwrap_err();
+        assert_eq!(
+            err.curve_failure(),
+            Some(&CurveFailure::TooManyDerivatives { asked: 4, most: 3 })
+        );
+        assert_eq!(
+            crate::error::upstream_status(&err),
+            Some(crate::error::SM_ERR)
+        );
         let d = h.evaluate_step(0.25, 3).unwrap();
         assert_eq!(d.len(), 4);
         assert_eq!(d[1], d[3]);
@@ -848,7 +920,19 @@ mod tests {
         );
         h.transform(&mv, Some(Vec3::new(2.0, 2.0, 2.0))).unwrap();
         assert_eq!(h.semi_axis(), 2.0);
-        assert!(h.transform(&mv, Some(Vec3::new(1.0, 2.0, 2.0))).is_err());
+        let err = h
+            .transform(&mv, Some(Vec3::new(1.0, 2.0, 2.0)))
+            .unwrap_err();
+        assert_eq!(
+            err.curve_failure(),
+            Some(&CurveFailure::NonUniformScale {
+                scale: Vec3::new(1.0, 2.0, 2.0)
+            })
+        );
+        assert_eq!(
+            crate::error::upstream_status(&err),
+            Some(crate::error::SM_ERR)
+        );
         // a degenerate domain has parallel end tangents: no NURB
         let d = Hyperbola::new(
             Point3::new(0.0, 0.0, 0.0),

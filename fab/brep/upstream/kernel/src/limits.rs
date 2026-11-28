@@ -16,13 +16,32 @@
 //! | [`fits`]             | none                                         |
 //! | [`try_filled`]       | `malloc`/`smos_Calloc` + fill, `NULL` on failure |
 //! | [`try_reserve_total`] | `smos_Realloc` growing an array, `NULL` on failure |
+//! | [`MAX_COORDINATE_MAGNITUDE`], [`exceeds_coordinate_bound`] | none (HANG-29) |
 //!
 //! Deviations: a request above [`MAX_ALLOC_BYTES`] fails even where the machine could
 //! have backed it. No upstream test or caller comes near the bound (the largest arrays
-//! the difftest fixtures build are a few MiB).
+//! the difftest fixtures build are a few MiB). Face queries that classify points on a
+//! face refuse geometry with a coordinate above [`MAX_COORDINATE_MAGNITUDE`]: upstream
+//! does not return on such input (HANG-29), and no upstream fixture comes near it.
 
 /// Largest single allocation, in bytes, that a caller-sized array may take (1 GiB).
 pub const MAX_ALLOC_BYTES: usize = 1 << 30;
+
+/// Largest coordinate magnitude (`1e150`) the face queries that classify points on a
+/// face accept (`crate::query::face::p3::check_face_coordinates`). Upstream's tight face
+/// box does not return from a control point of `1e155` and its point and edge-curve
+/// classifications from `1e153` (HANG-29, measured on v1.0.1 for the nightly fuzz
+/// `query.face_p1` case `fuzz00201`), so the bound leaves a margin below both.
+pub const MAX_COORDINATE_MAGNITUDE: f64 = 1.0e150;
+
+/// Whether `x` is a finite coordinate beyond [`MAX_COORDINATE_MAGNITUDE`] (`f64::MAX`
+/// itself and non-finite values are not, as the difftest wrapper's block check treats
+/// them).
+#[must_use]
+pub fn exceeds_coordinate_bound(x: f64) -> bool {
+    let a = x.abs();
+    a > MAX_COORDINATE_MAGNITUDE && a < f64::MAX
+}
 
 /// Whether `len` values of `T` stay within [`MAX_ALLOC_BYTES`].
 #[must_use]
@@ -77,91 +96,15 @@ mod tests {
         assert!(!try_reserve_total(&mut v, MAX_ALLOC_BYTES + 1));
         assert_eq!(v, [1]);
     }
-}
 
-/// What unwinds a kernel call on purpose (see [`probe`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Unwound {
-    /// The stack armed by [`arm`] is nearly used up.
-    Stack,
-    /// The flag armed by [`arm`] was set.
-    Cancelled,
-}
-
-/// How many [`probe`]s pass between two calls of an armed tick.
-const TICK_EVERY: u32 = 1024;
-
-thread_local! {
-    /// The lowest address the stack may reach, 0 when nothing is armed.
-    static STACK_FLOOR: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
-    static CANCEL: core::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
-        const { core::cell::RefCell::new(None) };
-    /// What [`probe`] calls every [`TICK_EVERY`] probes while armed, and the probes since.
-    static TICK: core::cell::Cell<(Option<fn()>, u32)> = const { core::cell::Cell::new((None, 0)) };
-}
-
-/// Disarms the thread's limits when dropped.
-pub struct Armed {
-    floor: usize,
-    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    tick: (Option<fn()>, u32),
-}
-
-impl Drop for Armed {
-    fn drop(&mut self) {
-        STACK_FLOOR.with(|f| f.set(self.floor));
-        CANCEL.with(|c| *c.borrow_mut() = self.cancel.take());
-        TICK.with(|t| t.set(self.tick));
-    }
-}
-
-fn stack_address() -> usize {
-    let marker = 0u8;
-    core::ptr::from_ref(&marker) as usize
-}
-
-/// Arms [`probe`] on this thread: it unwinds once the stack grew `budget` bytes below
-/// here, or once `cancel` is set, and calls `tick` every [`TICK_EVERY`] probes (the
-/// caller's checkpoint: a CPU budget's yield, say). `tick` may block; it must not unwind
-/// through the kernel except as [`probe`] does.
-#[must_use]
-pub fn arm(budget: usize, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>, tick: Option<fn()>) -> Armed {
-    let floor = stack_address().saturating_sub(budget);
-    Armed {
-        floor: STACK_FLOOR.with(|f| f.replace(floor)),
-        cancel: CANCEL.with(|c| c.borrow_mut().replace(cancel)),
-        tick: TICK.with(|t| t.replace((tick, 0))),
-    }
-}
-
-/// Called on every recursive path of the kernel and in its hot evaluators. Unwinds with
-/// [`Unwound`] (no panic message) past the armed stack floor or after a cancel, and calls
-/// the armed tick now and then; does nothing when nothing is armed.
-#[inline]
-pub fn probe() {
-    let floor = STACK_FLOOR.with(core::cell::Cell::get);
-    if floor == 0 {
-        return;
-    }
-    if stack_address() < floor {
-        std::panic::resume_unwind(Box::new(Unwound::Stack));
-    }
-    let cancelled = CANCEL.with(|c| {
-        c.borrow()
-            .as_ref()
-            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
-    });
-    if cancelled {
-        std::panic::resume_unwind(Box::new(Unwound::Cancelled));
-    }
-    let tick = TICK.with(|t| {
-        let (tick, probes) = t.get();
-        let tick = tick?;
-        let probes = probes + 1;
-        t.set((Some(tick), if probes < TICK_EVERY { probes } else { 0 }));
-        (probes >= TICK_EVERY).then_some(tick)
-    });
-    if let Some(tick) = tick {
-        tick();
+    #[test]
+    fn coordinate_bound() {
+        assert!(!exceeds_coordinate_bound(1e150));
+        assert!(!exceeds_coordinate_bound(-1e150));
+        assert!(exceeds_coordinate_bound(1.0000001e150));
+        assert!(exceeds_coordinate_bound(-1e300));
+        assert!(!exceeds_coordinate_bound(f64::MAX));
+        assert!(!exceeds_coordinate_bound(f64::INFINITY));
+        assert!(!exceeds_coordinate_bound(f64::NAN));
     }
 }

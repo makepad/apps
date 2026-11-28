@@ -18,7 +18,16 @@
 //! runs: it checks every owned geometry branch against the `MAX_GEOMETRY_NESTING` (32)
 //! depth bound. `CheckCrease` returns immediately because upstream disables it with
 //! `constexpr sbDoCreaseSubdomains = FALSE`. The local driver is iterative with
-//! upstream's fixed bound of 35.
+//! upstream's fixed bound of 35. Not upstream (#20438): when the global solver drops a
+//! minimum beyond the target distance, `GlobalPointSolve_1` answers with the tree
+//! solve (`GlobalPointSolve_0`, point testing off, on a curve-bounded surface's basis
+//! up to `MAX_GEOMETRY_NESTING` levels, on an ownerless copy with a cache of its own,
+//! as the face's trims play no part), which bounds every candidate by the target, so a
+//! nearer point within it is not lost (#20483); when the tree solve fails as upstream
+//! can (no tree for the surface, a failed evaluation) the drop stands. Not upstream
+//! (#23057): [`Surface::global_point_solve_1_answer`] also says why an empty answer is
+//! empty ([`EmptyAnswer`]): proved, when the tree solve answered with none and every
+//! leaf of its tree was excluded by its box's distance, or not.
 
 use super::p1::ErrorNormType;
 use super::p2::with_out_of_bounds_enabled_in_place;
@@ -28,7 +37,7 @@ use crate::curve::curve::p3::PointSolveOptions;
 use crate::curve::curve::p5::local_property_analysis;
 use crate::curve::curve::Curve;
 use crate::curve::iso_curve::IsoCurve;
-use crate::error::{Result, SolidError};
+use crate::error::{native_failure, Result, SolidError};
 use crate::geom::extent2d::Extent2d;
 use crate::geom::global_solver::{SolutionRequested, SolverOperation};
 use crate::geom::local_solve_nd::TerminationReason;
@@ -39,24 +48,35 @@ use crate::kernel::Kernel;
 use crate::math::{EFF_ZERO, EFF_ZERO_SQ, EFF_ZERO_SQRT};
 use crate::nurbs::b_spline_surface::SurfParamType;
 use crate::surface::surface::p1::zone_tol_3d;
-use crate::surface::surface::Surface;
+use crate::surface::surface::p2::MAX_GEOMETRY_NESTING;
+use crate::surface::surface::p4::NoObject;
+use crate::surface::surface::{Surface, SurfaceKind};
 
-/// The iteration's status and termination reason (`FindNextStep`).
+/// Whether the iteration's step failed, and its termination reason (`FindNextStep`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NextStep {
-    /// Zero for success, otherwise the upstream `SmStatus` code.
-    pub status: i32,
-    /// The reason, including when `status` reports a failure.
+    /// The step failed: [`TerminationReason::UnableToConverge`] (upstream's
+    /// `SM_ERR_NOT_CONVERGING`) or [`TerminationReason::OutOfBounds`] (its
+    /// `SM_ERR_OUTSIDE_OF_DOMAIN`). [`TerminationReason::OutOfBounds`] is also the reason of
+    /// a step that did not fail, so the reason alone does not say which.
+    pub failed: bool,
+    /// The reason, including when the step failed.
     pub reason: TerminationReason,
 }
 
 impl NextStep {
     const fn success(reason: TerminationReason) -> Self {
-        Self { status: 0, reason }
+        Self {
+            failed: false,
+            reason,
+        }
     }
 
-    const fn failure(status: i32, reason: TerminationReason) -> Self {
-        Self { status, reason }
+    const fn failure(reason: TerminationReason) -> Self {
+        Self {
+            failed: true,
+            reason,
+        }
     }
 }
 
@@ -77,7 +97,7 @@ pub struct LocalPointSolve<O: Copy> {
 fn boundary_or_false(value: Result<bool>) -> Result<bool> {
     match value {
         Ok(v) => Ok(v),
-        Err(e) if e.is_unported() => Err(e),
+        Err(e) if e.is_unported_or_cancelled() => Err(e),
         Err(_) => Ok(false),
     }
 }
@@ -177,7 +197,7 @@ impl SurfPtSolveStepper<'_> {
                     sol = solution;
                     found
                 }
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 Err(_) => false,
             }
         };
@@ -231,7 +251,7 @@ impl SurfPtSolveStepper<'_> {
     /// # Errors
     ///
     /// Missing dependencies and evaluation errors. Ordinary iteration failure is
-    /// represented by [`NextStep::status`] so its reason is retained.
+    /// represented by [`NextStep::failed`] so its reason is retained.
     pub fn find_next_step(&mut self, k: &Kernel, previous: &mut Self) -> Result<NextStep> {
         use TerminationReason::{
             FoundAnswerConverged as Converged, OutOfBounds, StillIterating, UnableToConverge,
@@ -269,7 +289,7 @@ impl SurfPtSolveStepper<'_> {
                         self.set_nr_suspect(true);
                     }
                 }
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 Err(_) => {
                     self.set_nr_suspect(true);
                     got_nr = false;
@@ -318,7 +338,7 @@ impl SurfPtSolveStepper<'_> {
                         return Ok(NextStep::success(reason));
                     }
                 }
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 Err(_) => got_plane = false,
             }
         }
@@ -327,7 +347,7 @@ impl SurfPtSolveStepper<'_> {
             return Ok(if nr.bound_hits_u() != 0 || nr.bound_hits_v() != 0 {
                 NextStep::success(OutOfBounds)
             } else {
-                NextStep::failure(1022, UnableToConverge)
+                NextStep::failure(UnableToConverge)
             });
         }
         let norm = if self.base.solver_op() == SolverOperation::Normalize {
@@ -342,7 +362,7 @@ impl SurfPtSolveStepper<'_> {
         {
             self.assign(&plane);
             return Ok(if self.pushing_boundary(tight)?.0 {
-                NextStep::failure(1020, OutOfBounds)
+                NextStep::failure(OutOfBounds)
             } else {
                 NextStep::success(Converged)
             });
@@ -355,20 +375,20 @@ impl SurfPtSolveStepper<'_> {
         {
             self.assign(&nr);
             return Ok(if self.pushing_boundary(tight)?.0 {
-                NextStep::failure(1020, OutOfBounds)
+                NextStep::failure(OutOfBounds)
             } else {
                 NextStep::success(Converged)
             });
         }
         if got_nr {
             match nr.line_search(k, previous) {
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 _ => {}
             }
         }
         if got_plane {
             match plane.line_search(k, previous) {
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 _ => {}
             }
         }
@@ -388,7 +408,7 @@ impl SurfPtSolveStepper<'_> {
                 {
                     NextStep::success(OutOfBounds)
                 } else {
-                    NextStep::failure(1022, UnableToConverge)
+                    NextStep::failure(UnableToConverge)
                 },
             );
         }
@@ -396,12 +416,42 @@ impl SurfPtSolveStepper<'_> {
     }
 }
 
+/// Not upstream (#23057): why a global point solve answered with no solution, for a
+/// caller that must tell "no surface point within the target" from a solve that found
+/// nothing without proving it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptyAnswer {
+    /// Any answer that is not proved empty: solutions, no candidate, or a tree solve
+    /// that failed as upstream can (the global solver's drop stands unproved).
+    Unproved,
+    /// The global solver's minimum lay beyond the target distance by more than the
+    /// tolerance, and the tree solve answered with none, every leaf of its tree
+    /// excluded by its box's distance (none reached the leaf solve, whose one guess may
+    /// find nothing): no point of the surface lies within the target.
+    NoPointWithinTarget,
+}
+
 impl Surface {
     /// The new global surface-point solve (`GlobalPointSolve_1`).
     ///
+    /// Not upstream (#20438): when the solver drops its one candidate, a minimum
+    /// farther than `target_distance` by more than the tolerance
+    /// ([`SurfPtGlobalSolver::dropped_beyond_target`]), that candidate need not be the
+    /// nearest point (#20483), so the tree solve answers instead
+    /// ([`Surface::global_point_solve_0`], with the cache's point testing off as the
+    /// new solver has none; on a curve-bounded surface's basis, which its evaluations
+    /// pass to; on an ownerless copy with a cache of its own, so a face's surface needs
+    /// no trimmed cache): it bounds every candidate by the target, so it finds a nearer
+    /// point within the target and is empty only when there is none. Its solutions are
+    /// shaped by `requested` as the tree solve shapes them. A tree solve that fails as
+    /// upstream can (a STEP surface has no decomposition tree; a failed evaluation)
+    /// keeps the drop.
+    ///
     /// # Errors
     ///
-    /// Those of [`SurfPtGlobalSolver::new`] and [`SurfPtGlobalSolver::solve`].
+    /// Those of [`SurfPtGlobalSolver::new`] and [`SurfPtGlobalSolver::solve`], and the
+    /// unported, cancelled and port-defect errors of [`Surface::global_point_solve_0`]
+    /// when the tree solve answers.
     pub fn global_point_solve_1<O: SolutionObject>(
         &self,
         k: &Kernel,
@@ -413,7 +463,42 @@ impl Surface {
         requested: SolutionRequested,
         surface_object: Option<O>,
     ) -> Result<SolutionArray<O>> {
-        SurfPtGlobalSolver::new(
+        Ok(self
+            .global_point_solve_1_answer(
+                k,
+                domain,
+                op,
+                point,
+                distance_tolerance,
+                target_distance,
+                requested,
+                surface_object,
+            )?
+            .0)
+    }
+
+    /// [`Surface::global_point_solve_1`] with why an empty answer is empty (#23057):
+    /// [`EmptyAnswer::NoPointWithinTarget`] only when the solver dropped its minimum
+    /// beyond the target and the tree solve answered with none, every leaf excluded by
+    /// its enclosure; [`EmptyAnswer::Unproved`] for any other answer (solutions, no
+    /// candidate, a tree whose leaf solve ran, or a tree solve that failed as upstream
+    /// can, whose drop stands).
+    ///
+    /// # Errors
+    ///
+    /// As [`Surface::global_point_solve_1`].
+    pub(crate) fn global_point_solve_1_answer<O: SolutionObject>(
+        &self,
+        k: &Kernel,
+        domain: &Extent2d,
+        op: SolverOperation,
+        point: Point3,
+        distance_tolerance: f64,
+        target_distance: Option<f64>,
+        requested: SolutionRequested,
+        surface_object: Option<O>,
+    ) -> Result<(SolutionArray<O>, EmptyAnswer)> {
+        let mut solver = SurfPtGlobalSolver::new(
             k,
             self,
             domain,
@@ -422,8 +507,98 @@ impl Surface {
             distance_tolerance,
             target_distance,
             requested,
-        )?
-        .solve(k, surface_object)
+        )?;
+        let found = solver.solve(k, surface_object)?;
+        if !solver.dropped_beyond_target() {
+            return Ok((found, EmptyAnswer::Unproved));
+        }
+        Ok(
+            match self.tree_solve_within_target(
+                k,
+                domain,
+                op,
+                point,
+                distance_tolerance,
+                target_distance,
+                requested,
+                surface_object,
+            )? {
+                Some((tree, true)) if tree.is_empty() => (tree, EmptyAnswer::NoPointWithinTarget),
+                Some((tree, _)) => (tree, EmptyAnswer::Unproved),
+                None => (found, EmptyAnswer::Unproved),
+            },
+        )
+    }
+
+    /// The tree solve [`Surface::global_point_solve_1`] answers with when the global
+    /// solver drops a minimum beyond the target: `None` when it fails as upstream can,
+    /// so the drop stands. Not upstream (#23057): with the answer, whether every leaf
+    /// of the tree was excluded by its enclosure
+    /// ([`Surface::global_point_solve_0_answer_in`]).
+    pub(crate) fn tree_solve_within_target<O: SolutionObject>(
+        &self,
+        k: &Kernel,
+        domain: &Extent2d,
+        op: SolverOperation,
+        point: Point3,
+        distance_tolerance: f64,
+        target_distance: Option<f64>,
+        requested: SolutionRequested,
+        surface_object: Option<O>,
+    ) -> Result<Option<(SolutionArray<O>, bool)>> {
+        // the tree solve on the surface the distance is evaluated on: a curve-bounded
+        // surface passes its evaluations to its basis
+        let mut tree_on = self;
+        for _ in 0..MAX_GEOMETRY_NESTING {
+            match tree_on.kind() {
+                SurfaceKind::CurveBounded(s) => tree_on = s.basis(),
+                _ => break,
+            }
+        }
+        // on an ownerless copy with a cache slot of its own: point testing is off, so
+        // the face's trims play no part, and a face-owned surface's trimmed cache cannot
+        // be built without its face; the copy's untrimmed cache never reaches the
+        // surface's own slot
+        let mut unowned = tree_on.clone_for_evaluation()?;
+        unowned.detach_for_edit();
+        let _ = unowned.set_owner(None);
+        let tree_on = &unowned;
+        let tree = match surface_object {
+            Some(object) => tree_on.global_point_solve_0_answer_in(
+                k,
+                object,
+                None,
+                None,
+                true,
+                domain,
+                op,
+                point,
+                distance_tolerance,
+                target_distance,
+                requested,
+            ),
+            // no handle for the solutions' objects: solve naming a stand-in and
+            // return the solutions without objects
+            None => tree_on
+                .global_point_solve_0_answer_in(
+                    k,
+                    NoObject,
+                    None,
+                    None,
+                    true,
+                    domain,
+                    op,
+                    point,
+                    distance_tolerance,
+                    target_distance,
+                    requested,
+                )
+                .map(|(t, excluded)| (t.without_objects(), excluded)),
+        };
+        // a tree solve that fails as upstream can (a surface with no decomposition
+        // tree, such as a STEP surface; a failed evaluation): the global solver's drop
+        // stands. Port defects, unported paths and cancellation still propagate.
+        native_failure(tree)
     }
 
     /// The new bounded local surface-point solve (`LocalPointSolve_1`).
@@ -544,7 +719,7 @@ impl Surface {
                 }
             }
 
-            if step.status != 0 || reason != StillIterating {
+            if step.failed || reason != StillIterating {
                 break;
             }
             curr.assign(&next);

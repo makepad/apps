@@ -80,6 +80,7 @@
 //!   `Dump` functions, `GetMemoryUsed`, and the members of `SmTess` /
 //!   `SmCurveTessDriver` (other units).
 
+use crate::error::query::QueryFailure;
 use crate::error::{Result, SolidError};
 use crate::geom::attribute::{Attribute, AttributeValue, Behavior, ObjectKey};
 use crate::geom::extent2d::Extent2d;
@@ -135,7 +136,7 @@ fn invalid(operation: &'static str, reason: &'static str) -> SolidError {
 fn ignore<T>(r: Result<T>) -> Result<Option<T>> {
     match r {
         Ok(v) => Ok(Some(v)),
-        Err(e) if e.is_unported() => Err(e),
+        Err(e) if e.is_unported_or_cancelled() => Err(e),
         Err(_) => Ok(None),
     }
 }
@@ -598,6 +599,7 @@ impl TessSrfCache {
     /// `BuildTree` inside the face containment guard; `true` when the guard was
     /// cleared (containment done).
     fn build_tree_body(&mut self, k: &Kernel) -> Result<bool> {
+        k.check_cancelled("query::tess::TessSrfCache::build_tree")?;
         // Build the m_pTree subdivision tree of the surface
         if self.base().tree().is_none() {
             // (`GetNaturalUVDomain` and the copy constructor read the NURB through
@@ -605,6 +607,14 @@ impl TessSrfCache {
             // revolution's missing NURB first)
             let bss: Option<BSplineSurface> = match self.base().surface().kind() {
                 SurfaceKind::BSpline(b) => Some(b.clone()),
+                SurfaceKind::ProceduralBlend(pb) => {
+                    let b = pb.net();
+                    Some(b.clone())
+                }
+                SurfaceKind::BallPatch(bp) => {
+                    let b = bp.net();
+                    Some(b.clone())
+                }
                 SurfaceKind::Plane(p) => Some(match ignore(p.base_with_nurb())? {
                     Some(b) => b.into_owned(),
                     None => p.base().clone(),
@@ -653,7 +663,7 @@ impl TessSrfCache {
         // the PolyEdges of the first poly face (phase 1 poly breps have one face)
         let poly_face = pb
             .first_poly_face()?
-            .ok_or(SolidError::null_pointer(OP_BUILD))?;
+            .ok_or_else(|| SolidError::query(OP_BUILD, QueryFailure::PolyBrepWithoutFace))?;
         let poly_edges = pb.face_poly_edges(poly_face)?;
 
         // implant every PolyEdge into the subdivision tree - point testing off
@@ -748,7 +758,7 @@ impl TessSrfCache {
         let pb = self
             .poly_brep
             .as_ref()
-            .ok_or(SolidError::null_pointer(OP_UV))?;
+            .ok_or_else(|| SolidError::query(OP_UV, QueryFailure::NoPolyBrep))?;
         let s3 = pb.edge_start_point(segment)?;
         let e3 = pb.edge_end_point(segment)?;
         let tol_3d = pb.edge_tolerance(segment)?;
@@ -793,7 +803,7 @@ impl TessSrfCache {
 
         // check state - segment should intersect some subdivision tree nodes
         if nodes.is_empty() {
-            return Err(SolidError::sm_err(OP_UV));
+            return Err(SolidError::query(OP_UV, QueryFailure::SegmentOutsideTree));
         }
 
         // for every subdivision leaf within the segment box
@@ -933,10 +943,10 @@ impl TessSrfCache {
                 let pb = self
                     .poly_brep
                     .as_mut()
-                    .ok_or(SolidError::null_pointer(OP_MARK))?;
+                    .ok_or_else(|| SolidError::query(OP_MARK, QueryFailure::NoPolyBrep))?;
                 let pf = pb
                     .first_poly_face()?
-                    .ok_or(SolidError::null_pointer(OP_MARK))?;
+                    .ok_or_else(|| SolidError::query(OP_MARK, QueryFailure::PolyBrepWithoutFace))?;
                 let original = pb.face_original_face(pf)?;
                 found_face = original.map(TessHandle::Object);
                 let mid = domain.evaluate(0.5, 0.5);
@@ -1022,7 +1032,7 @@ fn tess_test_against_tolerances(
     if out.needs_subdivision {
         return Ok(out);
     }
-    let driver = driver.ok_or(SolidError::null_pointer(OP_TEST))?;
+    let driver = driver.ok_or_else(|| SolidError::query(OP_TEST, QueryFailure::NoTessDriver))?;
     let Some(view) = driver.view else {
         return Ok(out);
     };
@@ -1243,6 +1253,35 @@ mod tests {
     fn implant_without_poly_brep_is_null_pointer() {
         let k = Kernel::default();
         let mut c = cache(Some(SurfaceTessDriver::default()));
-        assert!(c.implant_uv_segment(&k, PolyEdgeId::from_index(0)).is_err());
+        let e = c
+            .implant_uv_segment(&k, PolyEdgeId::from_index(0))
+            .unwrap_err();
+        assert_eq!(e.query_failure(), Some(&QueryFailure::NoPolyBrep), "{e}");
+        assert_eq!(e.sm_status(), Some(crate::error::SM_ERR_NULL_POINTER));
+    }
+
+    /// A poly B-rep without a face, handed in by the caller, is named at the tree build.
+    #[test]
+    fn a_poly_brep_without_a_face_is_the_callers_and_named() {
+        let k = Kernel::default();
+        let mut c = TessSrfCache::new(
+            ObjectKey(1),
+            Surface::from(plane_bss()),
+            Some(PolyBrep::new(&k, 1e-6)),
+            Some(SurfaceTessDriver::default()),
+            SurfaceCacheOptions {
+                chord_height_tolerance: 0.01,
+                ang_tol_rad: 0.3,
+                ..SurfaceCacheOptions::default()
+            },
+        );
+        let e = c.build_tree(&k).unwrap_err();
+        assert_eq!(
+            e.query_failure(),
+            Some(&QueryFailure::PolyBrepWithoutFace),
+            "{e}"
+        );
+        assert_eq!(e.sm_status(), Some(crate::error::SM_ERR_NULL_POINTER));
+        assert_eq!(e.kind(), crate::error::ErrorKind::InvalidInput);
     }
 }

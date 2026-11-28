@@ -1,0 +1,82 @@
+Solidsync-Patch: 0001 makepad-hooks
+Refreshed-At: 88c4e8eb9e548034e1af2a76f120a5727f2ef5ee
+Why: Fab checks the guarded worker stack and gives way to previews at kernel cancellation polls.
+Guard: stack_limit_and_cancel_are_errors
+Upstreamable: yes: a poll observer on CancelToken
+Files: src/kernel.rs base=292011c3c1f226d09aa942a4ba6088ee634345452c44e0e26fd5d272ba625411 result=87cb5653b2e0c25ec52dd20f6106fdada85d820e1c057b4ede06e645bfc5ce6e
+Files: src/lib.rs base=601addc1ef69ff721fbcb421024d69555feee95e717e8dff97fe79b3b1492c69 result=d1cff771a5935e8a27d8dda929490e7781d3c5ca4bbf3b36547cee5174c7925c
+Files: src/makepad_hooks.rs base=- result=d9ca76b1e272a1aaee396d650cb2df696539a9e03dfeb54ecf3c7834193ffacf
+---
+diff --git a/src/kernel.rs b/src/kernel.rs
+index 3f2ca6d..6dc0400 100644
+--- a/src/kernel.rs
++++ b/src/kernel.rs
+@@ -1425,8 +1425,14 @@ impl CancelToken {
+     #[must_use]
+     #[inline]
+     pub fn is_cancelled(&self) -> bool {
++        crate::makepad_hooks::observe_poll();
++        self.poll_chain()
++    }
++
++    #[inline]
++    fn poll_chain(&self) -> bool {
+         let counted = self.polls.as_deref().is_some_and(PollCount::poll);
+-        let also = self.also.as_deref().is_some_and(CancelToken::is_cancelled);
++        let also = self.also.as_deref().is_some_and(CancelToken::poll_chain);
+         counted || also || self.flag.load(Ordering::Relaxed)
+     }
+ 
+diff --git a/src/lib.rs b/src/lib.rs
+index f8bd031..2881cc4 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -42,6 +42,7 @@
+ pub mod error;
+ pub mod kernel;
+ pub mod limits;
++pub mod makepad_hooks;
+ pub mod math;
+ pub mod mesh_reconstruction;
+ pub mod topology;
+diff --git b/src/makepad_hooks.rs b/src/makepad_hooks.rs
+new file mode 100644
+index 0000000..0965274
+--- /dev/null
++++ b/src/makepad_hooks.rs
+@@ -0,0 +1,35 @@
++//! A thread-local observer for cooperative cancellation polls.
++
++use std::{cell::Cell, marker::PhantomData, rc::Rc};
++
++thread_local! {
++    static OBSERVER: Cell<Option<fn()>> = const { Cell::new(None) };
++}
++
++/// Restores the previous observer on the thread that installed it.
++#[must_use]
++pub struct ObserverGuard {
++    previous: Option<fn()>,
++    thread: PhantomData<Rc<()>>,
++}
++
++impl Drop for ObserverGuard {
++    fn drop(&mut self) {
++        OBSERVER.with(|observer| observer.set(self.previous));
++    }
++}
++
++/// Installs a callback to run once before each cancellation poll on this thread.
++pub fn set_poll_observer(f: fn()) -> ObserverGuard {
++    ObserverGuard {
++        previous: OBSERVER.with(|observer| observer.replace(Some(f))),
++        thread: PhantomData,
++    }
++}
++
++#[inline]
++pub(crate) fn observe_poll() {
++    if let Some(f) = OBSERVER.with(Cell::get) {
++        f();
++    }
++}

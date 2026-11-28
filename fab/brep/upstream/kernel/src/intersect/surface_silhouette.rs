@@ -49,6 +49,9 @@
 //!   pointer.
 //! - **Unported callees** return [`SolidError::Unported`] (see the `UNPORTED`
 //!   markers): none left for `surface.surface_p3`.
+//! - [`SurfaceSilhouette::local_point_solve`] finds the circle's perspective
+//!   silhouette points about the circle's centre ([`circle_find_silhouette_points`],
+//!   `WR-11`).
 //! - The `SM_DEBUG_CODE` drawing blocks and `Dump` are not ported. Recursion:
 //!   `ComputePointValues` calls itself only without a previous point, which does not
 //!   recurse again (depth at most 1); the Brent loop of `LocalPointSolve` stops after
@@ -57,6 +60,7 @@
 use crate::curve::curve::p2::CurvePropertyType;
 use crate::curve::curve::p7::PropertyAnalysisOptions;
 use crate::curve::curve::Curve;
+use crate::error::intersect::IntersectFailure;
 use crate::error::{ignored, Result, SolidError};
 use crate::geom::extent1d::Extent1d;
 use crate::geom::extent2d::Extent2d;
@@ -141,6 +145,8 @@ fn evaluate_geometric_at(k: &Kernel, surface: &Surface, uv: Point2) -> Result<Ge
         | SurfaceKind::Sphere(_)
         | SurfaceKind::Torus(_)
         | SurfaceKind::BSpline(_)
+        | SurfaceKind::ProceduralBlend(_)
+        | SurfaceKind::BallPatch(_)
         | SurfaceKind::Plane(_)
         | SurfaceKind::SurfOfRevolution(_)
         | SurfaceKind::SurfOfExtrusion(_)
@@ -167,6 +173,8 @@ fn evaluate_normal_section(
         | SurfaceKind::Sphere(_)
         | SurfaceKind::Torus(_)
         | SurfaceKind::BSpline(_)
+        | SurfaceKind::ProceduralBlend(_)
+        | SurfaceKind::BallPatch(_)
         | SurfaceKind::Plane(_)
         | SurfaceKind::SurfOfRevolution(_)
         | SurfaceKind::SurfOfExtrusion(_)
@@ -188,7 +196,15 @@ fn surface_drop_vector(k: &Kernel, surface: &Surface, uv: Point2, vector: Vec3) 
     drop_vectors_at(k, surface, uv, Side::Left, Side::Left, &[vector])?
         .first()
         .copied()
-        .ok_or(SolidError::sm_err(OP_DROP))
+        .ok_or_else(|| {
+            SolidError::intersect(
+                OP_DROP,
+                IntersectFailure::Defect {
+                    why: "dropping vectors gives one uv vector per vector given, and one \
+                          was given",
+                },
+            )
+        })
 }
 
 /// `SM_PI - a` for angles past a right angle: parallel and anti-parallel are alike.
@@ -267,13 +283,13 @@ impl<'s> SurfaceSilhouette<'s> {
         let surface = self.surface();
         let normal = match evaluate_normal(k, surface, *uv) {
             Ok(n) => n,
-            Err(e) if e.is_unported() => return Err(e),
+            Err(e) if e.is_unported_or_cancelled() => return Err(e),
             Err(_) => return Ok(true),
         };
         let vec = if self.perspective {
             let pnt = match surface.evaluate_point(k, *uv) {
                 Ok(p) => p,
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 Err(_) => return Ok(true),
             };
             (pnt - self.eye).unitize_or_z()
@@ -291,13 +307,13 @@ impl<'s> SurfaceSilhouette<'s> {
         if let Some(found_uv) = found {
             let normal2 = match evaluate_normal(k, surface, found_uv) {
                 Ok(n) => n,
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 Err(_) => return Ok(true),
             };
             if self.perspective {
                 let pnt = match surface.evaluate_point(k, found_uv) {
                     Ok(p) => p,
-                    Err(e) if e.is_unported() => return Err(e),
+                    Err(e) if e.is_unported_or_cancelled() => return Err(e),
                     Err(_) => return Ok(true),
                 };
                 let vec2 = pnt - self.eye;
@@ -384,7 +400,10 @@ impl<'s> SurfaceSilhouette<'s> {
         if norm.length_squared() < EFF_ZERO_SQ {
             norm = evaluate_normal(k, surface, uv)?;
             if norm.length_squared() < EFF_ZERO_SQ {
-                return Err(SolidError::sm_err(OP_CPV));
+                return Err(SolidError::intersect(
+                    OP_CPV,
+                    IntersectFailure::NoSurfaceNormal,
+                ));
             }
             if pnt.surface[1][0].length_squared() < EFF_ZERO_SQ {
                 pnt.surface[1][0] = pnt.surface[0][1].cross(norm);
@@ -407,7 +426,7 @@ impl<'s> SurfaceSilhouette<'s> {
         }
 
         if r.length_squared() < EFF_ZERO {
-            return Err(SolidError::sm_err(OP_CPV)); // point on surface must be at the eye point
+            return Err(SolidError::intersect(OP_CPV, IntersectFailure::PointAtEye));
         }
 
         let du = pnt.surface[1][0];
@@ -472,7 +491,7 @@ impl<'s> SurfaceSilhouette<'s> {
                     let ivl = Extent1d::from_min_max(0.0, 1.0);
                     let mut ls = LocalSolve1d::with_interval(ivl, false);
                     match ls.solve_it(&mut efo, 0.5, 1.0e-8) {
-                        Err(e) if e.is_unported() => return Err(e),
+                        Err(e) if e.is_unported_or_cancelled() => return Err(e),
                         Err(_) => {}
                         Ok(outcome) => {
                             // Found an answer in the solver -- use that new parameter
@@ -565,7 +584,7 @@ impl<'s> SurfaceSilhouette<'s> {
                     }
 
                     match ls.solve_it(&mut efo, guess_t, 1.0e-8) {
-                        Err(e) if e.is_unported() => return Err(e),
+                        Err(e) if e.is_unported_or_cancelled() => return Err(e),
                         Err(_) => {}
                         Ok(outcome) => {
                             if ls.found_accuracy().abs() > EFF_ZERO_SQRT {
@@ -652,7 +671,10 @@ impl<'s> SurfaceSilhouette<'s> {
                     // (operator/, not the guarded operator/=)
                     pnt.curve_3d[1] = (tan_vec / tan_len).unitize_or_z();
                 } else {
-                    return Err(SolidError::sm_err(OP_CPV));
+                    return Err(SolidError::intersect(
+                        OP_CPV,
+                        IntersectFailure::DegenerateTangent,
+                    ));
                 }
             }
         }
@@ -684,7 +706,7 @@ impl<'s> SurfaceSilhouette<'s> {
         guess: Point2,
     ) -> Result<Option<Point2>> {
         const OP: &str = "intersect::surface_silhouette::SurfaceSilhouette::local_point_solve";
-        let _ = (k, curr);
+        let _ = curr;
         let surface = self.surface();
         let domain = self.base.uv_domain;
         let approx_tol = self.base.approx_tol_3d;
@@ -703,7 +725,7 @@ impl<'s> SurfaceSilhouette<'s> {
         if normal.length_squared() < EFF_ZERO_SQ {
             normal = evaluate_normal(k, surface, s_uv)?;
             if normal.length_squared() < EFF_ZERO_SQ {
-                return Err(SolidError::sm_err(OP));
+                return Err(SolidError::intersect(OP, IntersectFailure::NoSurfaceNormal));
             }
             if eval[1][0].length_squared() < EFF_ZERO_SQ {
                 eval[1][0] = eval[0][1].cross(normal);
@@ -950,7 +972,7 @@ impl<'s> SurfaceSilhouette<'s> {
         }
         let (polar_box, pseudo_box) = match patch() {
             Ok(Some(b)) => b,
-            Err(e) if e.is_unported() => return Err(e),
+            Err(e) if e.is_unported_or_cancelled() => return Err(e),
             // NER: SM_ERR_NULL_POINTER reads as TRUE, as does any failure status
             Ok(None) | Err(_) => return Ok(true),
         };
@@ -1137,7 +1159,7 @@ impl<'a> FindSilSingEfo<'a> {
                 r = pnt - self.eye;
             }
             if r.length_squared() < EFF_ZERO {
-                return Err(SolidError::sm_err(OP_EFO)); // point on surface must be at the eye point
+                return Err(SolidError::intersect(OP_EFO, IntersectFailure::PointAtEye));
             }
             let mut dot1 = r.dot(g1.principle_curvature_vector1);
             if r.dot(g1.principle_curvature_vector2).abs() < dot1.abs() {
@@ -1151,7 +1173,7 @@ impl<'a> FindSilSingEfo<'a> {
                 r = pnt - self.eye;
             }
             if r.length_squared() < EFF_ZERO {
-                return Err(SolidError::sm_err(OP_EFO)); // point on surface must be at the eye point
+                return Err(SolidError::intersect(OP_EFO, IntersectFailure::PointAtEye));
             }
             let mut dot2 = r.dot(g2.principle_curvature_vector1);
             if r.dot(g2.principle_curvature_vector2).abs() < dot2.abs() {

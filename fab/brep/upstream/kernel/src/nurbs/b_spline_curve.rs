@@ -6,13 +6,17 @@
 //! The file is split over several plan units (`nurbs.b_spline_curve_p1`, `_p2`, ...);
 //! each lives in its own submodule and adds methods to [`BSplineCurve`].
 
+pub mod affine;
+pub(crate) mod analysis;
 pub mod p1;
 pub mod p2;
 pub mod p3;
+pub mod speed;
+pub(crate) mod trim_image;
 
 pub use p1::{
     BSplineCurve, BSplineCurveForm, CanonicalData, Ends, KnotType, NurbCircleParam, ProjectionType,
     Tessellation,
 };
 pub use p2::{AnalyticCurve, BoundingBoxRequest, BoundingBoxes, ControlPointForm, CurveCanonical};
-pub use p3::{GapFix, OnPlane, SegmentLine};
+pub use p3::{GapCurves, GapFix, GapIntersection, OnPlane, SegmentLine};

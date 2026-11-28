@@ -28,10 +28,3 @@ Modifications: the C++ sources were translated to Rust and restructured (arena
 topology, typed ids, error values instead of status codes, explicit kernel
 state instead of a global context). Each ported Rust file names the upstream
 file(s) it derives from in its header.
-
-makepad-csg-brep
-Derived from solidcore 1.0.1 (revision in Cargo.toml, package.metadata.source).
-Modifications by the Makepad contributors: renamed the crate; replaced the
-thiserror derive with hand-written Error impls; removed tests outside src/, the
-reference harness and all non-source material; removed a feature flag; reworded
-references in comments. Later changes are in this repository's history.

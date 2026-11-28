@@ -29,6 +29,7 @@ use crate::boolean::merge::p2::{self, MergeContext, MergeOperand, TopologyCopy};
 use crate::boolean::merge::p5;
 use crate::boolean::topology_intersector::p1::TopologyIntersector;
 use crate::boolean::topology_intersector::p1::{set_subset_objects, Relations};
+use crate::error::boolean::BooleanFailure;
 use crate::error::{Result, SolidError};
 use crate::geom::a_object::{BooleanOperation, REGION_TYPE};
 use crate::geom::attribute::{ids, AttributeStore, ObjectKey};
@@ -55,18 +56,55 @@ fn key(namespace: u32, other: bool, kind: u64, index: u32) -> ObjectKey {
 }
 
 // Cache construction takes only &Kernel; preserve the caller's settings and
-// RNG state for that read-only work rather than evaluating under defaults.
+// seed for that read-only work rather than evaluating under defaults.
 fn cache_kernel(k: &Kernel, context: &Context) -> Kernel {
     Kernel {
         tolerances: k.tolerances,
-        rng: k.rng.clone(),
-        caches: crate::kernel::Caches::default(),
+        seed: k.seed,
+        caches: crate::kernel::Caches {
+            fit_gap_memo: std::sync::Arc::clone(&k.caches.fit_gap_memo),
+            prove_lazy_trim_raise: k.caches.prove_lazy_trim_raise,
+            ..crate::kernel::Caches::default()
+        },
         context: context.metadata_copy(),
-        fillet_point_step: core::cell::Cell::new(k.fillet_point_step.get()),
         upstream_ub_passed: Vec::new(),
         memoize_curve_caches: k.memoize_curve_caches,
         fixes: k.fixes,
+        cancel: k.cancel.clone(),
         notify_records: crate::topology::topology::NotifyRecords::new(),
+        blend_net_tolerance: core::cell::Cell::new(k.blend_net_tolerance.get()),
+        blend_counts: core::cell::Cell::new(k.blend_counts.get()),
+        // (the memo is the kernel's own: a copy starts empty and solves afresh)
+        blend_station_memo: core::cell::RefCell::default(),
+        // (a cache of the surfaces' own data: a copy starts empty)
+        station_nurbs: core::cell::RefCell::default(),
+        arena_notify_records: (
+            std::sync::Weak::new(),
+            crate::topology::topology::NotifyRecords::new(),
+        ),
+        blend_w_memo: core::cell::RefCell::default(),
+        loop_area_memo: core::cell::RefCell::default(),
+        check_memo: core::cell::RefCell::default(),
+        // (shared with the parent: a hit returns what recertifying the same blend again
+        // returns, so the certificates the parent finished serve the copy's workers too)
+        recertify_memo: std::sync::Arc::clone(&k.recertify_memo),
+        // (inside the caller's operation: a scope opened on the copy keeps its memo)
+        blend_operation_scopes: std::sync::Arc::new(core::sync::atomic::AtomicU32::new(
+            k.blend_operation_scopes
+                .load(core::sync::atomic::Ordering::Relaxed),
+        )),
+        // (building cache trees does none of the counted work)
+        work_counters: crate::kernel::WorkCounters::default(),
+        // (building cache trees makes no blend faces)
+        blend_face_log: None,
+        // (building cache trees makes no corner patches)
+        coons_tangency_log: core::cell::RefCell::new(None),
+        // (the caller's profiler: the copy's scopes record into its tree)
+        #[cfg(feature = "profile")]
+        profiler: k.profiler.clone(),
+        // (the test seam is shared: the copy's drops are the operation's)
+        #[cfg(test)]
+        strip_probe: k.strip_probe.clone(),
     }
 }
 
@@ -131,12 +169,12 @@ pub(crate) fn entity_of_notification_key(
 /// own naming: a face's surface (an edge's curve) owned under that face's (edge's)
 /// [`notification_key`] in `namespace` is the record's own geometry (upstream's owner
 /// is the record), so it takes the record's name in `b`'s recorded scheme
-/// ([`Brep::naming`](crate::topology::Brep::naming): notification or arena identity)
-/// and the face's tolerance is re-recorded on it. An edge use's UV trim curve owned
-/// under the edge use's key takes the edge use's notification identity (upstream's owner
-/// is the edge use; `SmEdgeuse::AssertValid` test #6). Called when the namespace ends with
-/// the merge (its records and attributes go with it); a B-rep of another or unknown
-/// scheme is left as it is.
+/// ([`Brep::owner_identity`]: notification or arena identity, or a caller's recorded
+/// key) and the face's tolerance is re-recorded on it. An edge use's UV trim curve
+/// owned under the edge use's key likewise takes the edge use's name (upstream's owner
+/// is the edge use; `SmEdgeuse::AssertValid` test #6). Called when the namespace ends
+/// with the merge (its records and attributes go with it); a B-rep of unknown scheme
+/// is left as it is.
 ///
 /// # Errors
 ///
@@ -145,13 +183,8 @@ pub(crate) fn adopt_namespace_owners(b: &mut Brep, namespace: u32, other: bool) 
     use crate::topology::NamingScheme;
     let name = |e: EntityRef| -> Option<ObjectRef> {
         match b.naming() {
-            NamingScheme::Notify => Some(crate::topology::loopuse::notify_ref(e)),
-            NamingScheme::Arena => Some(match e {
-                EntityRef::Face(f) => arena_identity(CacheObject::Face(f)),
-                EntityRef::Edge(x) => arena_identity(CacheObject::Edge(x)),
-                _ => return None,
-            }),
-            _ => None,
+            NamingScheme::Unknown => None,
+            _ => Some(b.owner_identity(e)),
         }
     };
     let faces: Vec<(FaceId, ObjectRef)> = bp::faces(b, None)?
@@ -191,16 +224,16 @@ pub(crate) fn adopt_namespace_owners(b: &mut Brep, namespace: u32, other: bool) 
         }
     }
     // An edge use's UV trim curve is owned by the edge use (`SmEdgeuse` test #6); one
-    // the merge set under the namespace takes the edge use's own name. Both schemes
-    // name edge uses by their notification identity (the check's keys for an arena
-    // B-rep fall back to it too).
-    if matches!(b.naming(), NamingScheme::Notify | NamingScheme::Arena) {
+    // the merge set under the namespace takes the edge use's own name
+    // ([`Brep::owner_identity`]: its notification identity under the notification and
+    // arena schemes, its recorded key or else that identity under a caller's).
+    if b.naming() != NamingScheme::Unknown {
         let uses: Vec<_> = b.edgeuses().iter().map(|(id, _)| id).collect();
         for eu in uses {
             let merged = notification_key(namespace, other, EntityRef::Edgeuse(eu));
+            let own = b.owner_identity(EntityRef::Edgeuse(eu));
             if let Some(trim) = b.edgeuse_mut(eu)?.uv_trim_curve.as_mut() {
                 if trim.owner() == Some(merged) {
-                    let own = crate::topology::loopuse::notify_ref(EntityRef::Edgeuse(eu));
                     trim.set_owner(Some(own), None);
                 }
             }
@@ -221,7 +254,6 @@ struct GeometryOwnerScope<'a, 'keys> {
 }
 impl<'a, 'keys> GeometryOwnerScope<'a, 'keys> {
     fn new(body: &'a mut Brep, keys: NotificationKeys<'keys>, other: bool) -> Result<Self> {
-        use crate::topology::NamingScheme;
         let naming = body.naming();
         let mut scope = Self {
             body,
@@ -232,11 +264,8 @@ impl<'a, 'keys> GeometryOwnerScope<'a, 'keys> {
         };
         if matches!(keys, NotificationKeys::Namespace(_)) {
             for edge in crate::topology::brep::p1::edges(scope.body, None)? {
-                let expected = if naming == NamingScheme::Notify {
-                    crate::topology::loopuse::notify_ref(EntityRef::Edge(edge))
-                } else {
-                    arena_identity(CacheObject::Edge(edge))
-                };
+                let expected =
+                    crate::topology::scheme_owner_identity(naming, EntityRef::Edge(edge));
                 if let Some(curve) = scope.body.edge_mut(edge)?.curve.as_mut() {
                     if curve.owner() == Some(expected) {
                         scope.edges.push((edge, expected));
@@ -245,11 +274,8 @@ impl<'a, 'keys> GeometryOwnerScope<'a, 'keys> {
                 }
             }
             for face in crate::topology::brep::p1::faces(scope.body, None)? {
-                let expected = if naming == NamingScheme::Notify {
-                    crate::topology::loopuse::notify_ref(EntityRef::Face(face))
-                } else {
-                    arena_identity(CacheObject::Face(face))
-                };
+                let expected =
+                    crate::topology::scheme_owner_identity(naming, EntityRef::Face(face));
                 let rebound = scope
                     .body
                     .face_mut(face)?
@@ -537,6 +563,7 @@ impl<'keys> ManifoldKernelAdapter<'keys> {
             edge_source_key: &|e| keys.object(true, EntityRef::Edge(e)),
             edge_destination_key: &|e| keys.object(false, EntityRef::Edge(e)),
             face_source_key: &|f| keys.object(true, EntityRef::Face(f)),
+            surface_attributes: true,
             face_destination_key: &|f| keys.object(false, EntityRef::Face(f)),
         };
         action(&mut self.merge.intersector, &mut copy)
@@ -750,7 +777,7 @@ impl<'keys> ManifoldKernelAdapter<'keys> {
             .face(face)?
             .surface
             .as_ref()
-            .ok_or_else(|| SolidError::null_pointer(OP))?;
+            .ok_or_else(|| SolidError::boolean(OP, BooleanFailure::FaceWithoutSurface))?;
         Ok(surface
             .owner()
             .unwrap_or_else(|| arena_identity(CacheObject::Face(face))))
@@ -1146,6 +1173,7 @@ impl ManifoldIntersector for ManifoldKernelAdapter<'_> {
                 edge_source_key: &|e| source_key(EntityRef::Edge(e)),
                 edge_destination_key: &|e| destination_key(EntityRef::Edge(e)),
                 face_source_key: &|f| source_key(EntityRef::Face(f)),
+                surface_attributes: true,
                 face_destination_key: &|f| destination_key(EntityRef::Face(f)),
             };
             crate::topology::brep::p7::copy_faces_with_merge(
@@ -1217,16 +1245,33 @@ impl ManifoldIntersector for ManifoldKernelAdapter<'_> {
         face: FaceId,
         other_face: FaceId,
     ) -> Result<(Vec<FaceId>, Vec<FaceId>, bool)> {
-        let mates = &self.merge.intersector.edges;
-        let check = p1::check_face_coincidence(
-            primary,
-            other,
-            face,
-            other_face,
-            mates.primary_to_other(),
-            mates.other_to_primary(),
-        )?;
-        let p1::FaceCoincidenceCheck::NeedsMerge { edge_counts } = check else {
+        let check = |relations: &Relations, primary: &Brep, other: &Brep| {
+            p1::check_face_coincidence(
+                primary,
+                other,
+                face,
+                other_face,
+                relations.edges.primary_to_other(),
+                relations.edges.other_to_primary(),
+            )
+        };
+        let mut status = check(&self.merge.intersector, primary, other)?;
+        // Not upstream (coincident_edges): edges of the two faces that join the same related vertices
+        // within a certified tolerance of each other are one edge; related first, the imprint
+        // below does not copy each onto the other face as a second edge between the two
+        // vertices (coincident_edges).
+        if matches!(status, p1::FaceCoincidenceCheck::NeedsMerge { .. })
+            && crate::boolean::merge::coincident_edges::relate_coincident_edges(
+                primary,
+                other,
+                face,
+                other_face,
+                &mut self.merge.intersector,
+            )? > 0
+        {
+            status = check(&self.merge.intersector, primary, other)?;
+        }
+        let p1::FaceCoincidenceCheck::NeedsMerge { edge_counts } = status else {
             return Ok((vec![face], vec![other_face], false));
         };
         // `m_vTI.MergeCoincidentSurfaces(pBrepFace->GetSurface(), pOtherFace->GetSurface(),
@@ -1314,6 +1359,7 @@ impl ManifoldIntersector for ManifoldKernelAdapter<'_> {
             edge_source_key: &edge_source,
             edge_destination_key: &edge_destination,
             face_source_key: &face_source,
+            surface_attributes: true,
             face_destination_key: &face_destination,
         };
         p5::process_wires_and_shell_vertices_with_kernels(
@@ -1358,6 +1404,7 @@ impl ManifoldIntersector for ManifoldKernelAdapter<'_> {
             edge_source_key: &edge_source,
             edge_destination_key: &edge_destination,
             face_source_key: &face_source,
+            surface_attributes: true,
             face_destination_key: &face_destination,
         };
         // New topology is made with the primary context; copies notify through the
@@ -1495,7 +1542,8 @@ impl ManifoldIntersector for ManifoldKernelAdapter<'_> {
                 &cleanup,
                 check_all_edges,
                 Some(&mut env),
-            )
+            )?;
+            p1::place_vertices_on_face_corners(k, primary, &cleanup.vertices, &mut env)
         })
         .and_then(|r| r);
         self.merge.intersector = cleanup.mates;
@@ -1577,13 +1625,8 @@ mod tests {
                 &mut deleted,
             )
             .unwrap_err();
-        assert!(matches!(
-            error,
-            SolidError::Upstream {
-                code: crate::error::SM_ERR_NULL_POINTER,
-                ..
-            }
-        ));
+        assert_eq!(error.sm_status(), Some(crate::error::SM_ERR_NULL_POINTER));
+        assert_eq!(error.kind(), crate::error::ErrorKind::Failed);
         assert!(made);
         assert!(deleted.0.is_empty() && deleted.1.is_empty());
         assert!(!adapter.topology_deleted());

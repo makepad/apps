@@ -4,5 +4,12 @@
 //! `SmOffsetCurve` in `source/SMLib`, and the offset/shell entry points of
 //! `SM_API/SmApiBrep`.
 
+pub mod construction;
+pub mod curve_on_surfaces;
+pub mod draft;
 pub mod offset_executive;
+pub mod offset_faces;
 pub mod offset_geometry_creation;
+pub mod shell_seams;
+pub mod thin_features;
+pub mod wall_room;

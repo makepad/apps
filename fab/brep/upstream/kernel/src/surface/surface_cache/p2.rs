@@ -58,6 +58,7 @@
 
 use crate::curve::curve::Curve;
 use crate::curve::iso_curve::IsoCurve;
+use crate::error::surface::SurfaceFailure;
 use crate::error::{Result, SolidError};
 use crate::geom::extent2d::Extent2d;
 use crate::geom::extent3d::Extent3d;
@@ -146,7 +147,7 @@ impl PatchBoundaryBoundingPlanes {
             // Does not seem to make sense crash in a boxtest-like function:
             match self.compute_bounding_planes(k, surface) {
                 Ok(()) => {}
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 Err(_) => return Ok(out),
             }
         }
@@ -205,7 +206,7 @@ pub fn create_bezier_patch_block(source: &NurbSurface) -> Result<BezierPatchBloc
 
     // store a bezier patch for every non-zero span
     // order: [patch00, patch01, ... patch0N, patch10, ... patchMN]
-    let rows = decompose_srf(source).map_err(SolidError::nl_ser(OP_BEZ_BLOCK))?;
+    let rows = decompose_srf(source).map_err(SolidError::nurbs_routine(OP_BEZ_BLOCK))?;
     let beziers: Vec<NurbSurface> = rows.into_iter().flatten().collect();
     if beziers.len() != num_u_spans * num_v_spans {
         return Err(invalid(OP_BEZ_BLOCK, "decomposition patch count mismatch"));
@@ -300,7 +301,7 @@ pub fn create_approximate_bezier_patch_block(
 
             // approximate the surface shape with a degree 3x3 bezier patch
             match compute_bezier_approximation(k, surface, &uv_domain, &mut bezier) {
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 Err(_) | Ok(()) => {}
             }
 
@@ -348,7 +349,7 @@ pub type ToleranceTester<'a, O> =
 fn ignore<T>(r: Result<T>) -> Result<Option<T>> {
     match r {
         Ok(v) => Ok(Some(v)),
-        Err(e) if e.is_unported() => Err(e),
+        Err(e) if e.is_unported_or_cancelled() => Err(e),
         Err(_) => Ok(None),
     }
 }
@@ -399,8 +400,9 @@ impl<O: Copy + PartialEq> SurfaceCache<O> {
     ///
     /// # Errors
     ///
-    /// `SM_ERR` when more than `SM_MAX_ALT_CACHES` caches are held (cannot happen
-    /// through this method).
+    /// `SM_ERR` ([`SurfaceFailure::AltCachesFull`]) when more than `SM_MAX_ALT_CACHES`
+    /// caches are held: this method's eviction never allows it, but a caller can push
+    /// past the limit through [`SurfaceCache::alt_caches_mut`].
     pub fn add_curves_to_cache(
         &mut self,
         cache_type: AltSrfCacheType,
@@ -412,7 +414,7 @@ impl<O: Copy + PartialEq> SurfaceCache<O> {
     ) -> Result<()> {
         let caches = self.alt_caches_mut();
         if caches.len() > MAX_ALT_CACHES {
-            return Err(SolidError::sm_err(OP_ADD));
+            return Err(SolidError::surface(OP_ADD, SurfaceFailure::AltCachesFull));
         }
 
         if caches.len() == MAX_ALT_CACHES {
@@ -467,10 +469,16 @@ impl<O: Copy + PartialEq> SurfaceCache<O> {
             (n.aux_type, n.child1.is_some(), fields)
         };
         if aux_type != AuxDataType::BezierSurface && aux_type != AuxDataType::AuxData {
-            return Err(SolidError::sm_err(OP_TEST));
+            return Err(SolidError::surface(
+                OP_TEST,
+                SurfaceFailure::NodeNotSurfaceNode,
+            ));
         }
         if has_child {
-            return Err(SolidError::sm_err(OP_TEST));
+            return Err(SolidError::surface(
+                OP_TEST,
+                SurfaceFailure::NodeHasChildren,
+            ));
         }
         let fields = fields.ok_or_else(|| invalid(OP_TEST, "node has no surface data"))?;
 
@@ -559,6 +567,8 @@ impl<O: Copy + PartialEq> SurfaceCache<O> {
             | SurfaceKind::Sphere(_)
             | SurfaceKind::Torus(_)
             | SurfaceKind::BSpline(_)
+            | SurfaceKind::ProceduralBlend(_)
+            | SurfaceKind::BallPatch(_)
             | SurfaceKind::Plane(_)
             | SurfaceKind::SurfOfRevolution(_)
             | SurfaceKind::SurfOfExtrusion(_) => None,
@@ -834,6 +844,8 @@ impl<O: Copy + PartialEq> SurfaceCache<O> {
     /// Errors from tessellation split selection and the iso curve linearity tests.
     #[allow(clippy::too_many_lines)] // one upstream routine
     pub fn subdivide_by_block(&mut self, k: &Kernel, node: NodeId) -> Result<()> {
+        // the cache is built on blends' nets (the fork's 729f893; `SmBlendNetScope`)
+        let _net = crate::surface::procedural_blend::NetScope::new(k);
         // locals
         let fields = {
             let tree = self
@@ -844,7 +856,9 @@ impl<O: Copy + PartialEq> SurfaceCache<O> {
                 _ => return Err(invalid(OP_BLOCK, "node has no surface data")),
             }
         };
-        let handle = fields.surface.ok_or(SolidError::null_pointer(OP_BLOCK))?;
+        let handle = fields
+            .surface
+            .ok_or_else(|| SolidError::surface(OP_BLOCK, SurfaceFailure::NodeHasNoSurface))?;
         // upstream works on the node's surface itself (`pAux->mBA_pSurface`); the cache is
         // edited below, so an evaluation copy (exact knots, owner kept) stands for it: the
         // copy constructor's knot fix-up would move near-coincident knots and so the splits.
@@ -993,6 +1007,14 @@ impl<O: Copy + PartialEq> SurfaceCache<O> {
                 // for the node's bounding box
                 let patch = match surface.kind_with_nurb(k)? {
                     SurfaceKind::BSpline(b) => b.copy_sub_patch(&node_uv),
+                    SurfaceKind::ProceduralBlend(pb) => {
+                        let b = pb.net();
+                        b.copy_sub_patch(&node_uv)
+                    }
+                    SurfaceKind::BallPatch(bp) => {
+                        let b = bp.net();
+                        b.copy_sub_patch(&node_uv)
+                    }
                     SurfaceKind::Plane(p) => p.base().copy_sub_patch(&node_uv),
                     SurfaceKind::Cone(s) => s.rev().base().copy_sub_patch(&node_uv),
                     SurfaceKind::Sphere(s) => s.base().base().copy_sub_patch(&node_uv),
@@ -1037,7 +1059,16 @@ impl<O: Copy + PartialEq> SurfaceCache<O> {
         let mut curr: Vec<NodeId> = base_nodes.clone();
         let mut next: Vec<NodeId> = Vec::with_capacity(base_nodes.len());
         let at = |v: &[NodeId], i: usize| -> Result<NodeId> {
-            v.get(i).copied().ok_or(SolidError::sm_err(OP_BLOCK))
+            v.get(i).copied().ok_or_else(|| {
+                SolidError::surface(
+                    OP_BLOCK,
+                    SurfaceFailure::Defect {
+                        why: "the generations are combined over the base nodes this \
+                                  routine made, one per split cell, so an index past them is \
+                                  the kernel's",
+                    },
+                )
+            })
         };
 
         // assemble U and V splits until there is just one
@@ -1323,7 +1354,10 @@ mod tests {
         let e = c
             .subdivide_by_block(&Kernel::default(), NodeId(0))
             .expect_err("null");
-        assert!(matches!(e, SolidError::Upstream { code: 1006, .. }));
+        assert_eq!(e.upstream_status(), Some(1006));
+        // the node is the caller's: a refusal of its input, not a kernel defect
+        assert_eq!(e.kind(), crate::error::ErrorKind::InvalidInput);
+        assert!(!e.is_defect());
     }
 
     #[test]

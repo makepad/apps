@@ -12,7 +12,7 @@
 //! | [`Curve::extend_by_dist`]                    | `N_CrvExtendByDist`                 |
 //! | [`Curve::extend_by_param_dist`]              | `N_CrvExtendByParamDist`            |
 //! | [`Curve::offset_max_2nd_deriv`]              | `N_CrvOffsetGetMax2ndDeriv`         |
-//! | [`Curve::eval_unbounded_pts_and_derivs`], [`UnboundedEval`] | `N_CrvEvalUnboundedPtsAndDerivs` |
+//! | [`Curve::eval_unbounded_pts_and_derivs`], [`UnboundedEval`], [`Closure`] | `N_CrvEvalUnboundedPtsAndDerivs` |
 //! | [`Curve::remove_knots_deriv_constraints`], [`ConstrainedEnds`] | `N_CrvRemoveKnotsDerivConstraints` |
 //! | [`Curve::refine_to_knot_vector`]             | `N_CrvRefineToKnotVector`           |
 //! | [`Curve::sum_diff`], [`SumDiff`]             | `N_CrvSumDiffCrv`                   |
@@ -28,7 +28,7 @@
 //! | [`G1_ANGLE_TOL`]                             | `g1tol` of `N_CrvEvalUnboundedPtsAndDerivs` |
 //!
 //! Deviations:
-//! - Out-params become return values; errors are [`SolidError::Nlib`] values with the
+//! - Out-params become return values; errors are [`SolidError::Failed`] values (a [`NurbsFailure`] reason) with the
 //!   upstream `NL_*_ERR` number instead of a flag plus the global `NL_ERROR` record.
 //!   The `NL_STACKS` arguments and the memory error paths have no counterpart.
 //! - Routines that write into an output curve that is NULL, an existing curve or the
@@ -53,6 +53,8 @@
 //!   the port keeps the last complete extension. The periodic parameter adjustment of a
 //!   G1-closed curve loops forever upstream when adding the parameter range no longer
 //!   changes the parameter; the port fails with [`SolidError::NotConverged`] there.
+//!   [`UnboundedEval::closure`] [`Closure::Open`] (solidcore's, #2706) skips the G1
+//!   closure test for a curve that is a function of its parameter, which is extended.
 //! - `N_LinearMultiplyCrv` ignores the error of `N_CrvGetGrevilleAbscissa` (degree 0,
 //!   where it then reads an uninitialised value); the port propagates it.
 //! - `N_CrvRefineToKnotVector` writes the new control points into a caller array
@@ -67,11 +69,13 @@
 //!   (impossible upstream, where `NL_DEGREE` is a `short`) is
 //!   [`SolidError::InvalidInput`], so index arithmetic and allocations sized from the
 //!   degree cannot overflow.
+//! - Cancellation: `remove_knots_deriv_constraints_cancellable` (crate-private) passes a cancel token (#2136, #2372) to the removal loop; the public function passes none.
 
 // Index arithmetic follows upstream's signed `NL_INDEX` (`isize` here); every access
 // goes through `get`/`set`, which reject negative or too-large indices.
 
-use crate::error::{NlibCode, Result, SolidError};
+use crate::error::{nurbs::NurbsFailure, Result, SolidError};
+use crate::math::det;
 use crate::math::Vec3;
 use crate::nurbs::basis_adv::{compatible_knot_array_mult, increase_knot_mult};
 use crate::nurbs::basis_basic::PTOL;
@@ -177,9 +181,24 @@ impl SumDiff {
     }
 }
 
+/// Whether [`Curve::eval_unbounded_pts_and_derivs`] tests the curve for G1 closure the
+/// first time it leaves the curve's range.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Closure {
+    /// Tested, as upstream: a G1-closed curve is evaluated periodically, any other curve
+    /// is extended.
+    #[default]
+    Tested,
+    /// Never closed: the curve is a function of its parameter (a radius law, #2706), which
+    /// does not wrap round, so it is always extended. The closure test is not made; it has
+    /// no answer where an end's derivative vanishes (a curve that is one point).
+    Open,
+}
+
 /// State of [`Curve::eval_unbounded_pts_and_derivs`] across calls with one curve
 /// (upstream's caller-held `ecur` and `gflg`). Start from [`UnboundedEval::default`]
-/// (upstream: `N_CrvInitArrays(&ecur)`) and keep it unchanged between the calls.
+/// (upstream: `N_CrvInitArrays(&ecur)`), with `closure` [`Closure::Open`] for a curve that
+/// is a function of its parameter, and keep it unchanged between the calls.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct UnboundedEval {
     /// The extended (or copied, for a G1-closed curve) curve once a parameter outside
@@ -187,6 +206,8 @@ pub struct UnboundedEval {
     pub ext: Option<Curve>,
     /// Whether the curve is G1 closed (upstream `gflg`); set when `ext` is created.
     pub g1_closed: bool,
+    /// Whether the curve is tested for G1 closure when `ext` is created.
+    pub closure: Closure,
 }
 
 impl Curve {
@@ -263,7 +284,8 @@ impl Curve {
     /// parameter range (`N_CrvEvalUnboundedPtsAndDerivs`, left-sided).
     ///
     /// The first time `u` is out of range, the curve is copied into `state.ext` and
-    /// tested for G1 closedness ([`MODEL_TOL`], [`G1_ANGLE_TOL`]). A G1-closed curve is
+    /// tested for G1 closedness ([`MODEL_TOL`], [`G1_ANGLE_TOL`]; not tested, and taken
+    /// open, for [`Closure::Open`], solidcore's). A G1-closed curve is
     /// evaluated periodically (`u` shifted by whole parameter ranges); any other curve
     /// is extended with continuity `cont` ([`Curve::extend_by_param_dist`]) in steps of
     /// at most `0.9` times the current parameter range until it covers `u`. Later
@@ -304,8 +326,13 @@ impl Curve {
             // Must extend or adjust periodic parameter.
             if state.ext.is_none() {
                 self.copy_into(&mut state.ext)?;
-                let tols = [MODEL_TOL, G1_ANGLE_TOL];
-                state.g1_closed = self.is_closed_continuity(1, &tols)?;
+                state.g1_closed = match state.closure {
+                    Closure::Tested => {
+                        let tols = [MODEL_TOL, G1_ANGLE_TOL];
+                        self.is_closed_continuity(1, &tols)?
+                    }
+                    Closure::Open => false,
+                };
                 g1_flag = state.g1_closed;
             }
             let ext = state.ext.as_mut().ok_or_else(|| oob(OP))?;
@@ -379,6 +406,23 @@ impl Curve {
         whr: ConstrainedEnds,
         der: usize,
     ) -> Result<Curve> {
+        self.remove_knots_deriv_constraints_cancellable(tol, whr, der, None)
+    }
+
+    /// [`Curve::remove_knots_deriv_constraints`] that polls `cancel` (#2136, #2372) once
+    /// per removal step and returns `Cancelled` once it fires; `None`, or a token that
+    /// never fires, changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Curve::remove_knots_deriv_constraints`]; `Cancelled` when `cancel` fires.
+    pub(crate) fn remove_knots_deriv_constraints_cancellable(
+        &self,
+        tol: f64,
+        whr: ConstrainedEnds,
+        der: usize,
+        cancel: Option<&crate::kernel::CancelToken>,
+    ) -> Result<Curve> {
         const OP: &str = "nurbs::crv_adv::p2::Curve::remove_knots_deriv_constraints";
         check_short_degree(self.degree(), OP)?;
         let p = sx(self.degree(), OP)?;
@@ -390,6 +434,7 @@ impl Curve {
             // sum keeps.
             |r, n| (whr.start() && r <= p.saturating_add(der)) || (whr.end() && r > n - der),
             OP,
+            cancel,
         )
     }
 
@@ -399,7 +444,7 @@ impl Curve {
     ///
     /// # Errors
     ///
-    /// [`NlibCode::Input`] for an empty `x`, `x[0] <= U[0]` or `x[r] >= U[m]`, and the
+    /// [`NurbsFailure::Input`] for an empty `x`, `x[0] <= U[0]` or `x[r] >= U[m]`, and the
     /// errors of the knot span search.
     pub fn refine_to_knot_vector(&self, x: &[f64]) -> Result<Vec<CPoint>> {
         const OP: &str = "nurbs::crv_adv::p2::Curve::refine_to_knot_vector";
@@ -417,13 +462,13 @@ impl Curve {
         // Check input parameters.
         let r = sx(x.len(), OP)? - 1;
         if r < 0 {
-            return Err(SolidError::nlib(OP, NlibCode::Input));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Input));
         }
         if get(x, 0, OP)? <= get(uk, 0, OP)? {
-            return Err(SolidError::nlib(OP, NlibCode::Input));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Input));
         }
         if get(x, r, OP)? >= get(uk, m, OP)? {
-            return Err(SolidError::nlib(OP, NlibCode::Input));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Input));
         }
 
         // Find knot spans.
@@ -596,9 +641,9 @@ impl Curve {
     ///
     /// # Errors
     ///
-    /// [`NlibCode::Input`] for `d > p` or a rational curve, [`NlibCode::Derivative`]
+    /// [`NurbsFailure::Input`] for `d > p` or a rational curve, [`NurbsFailure::ZeroDerivative`]
     /// when a knot difference `U[i+p+1] - U[i+k]` is zero, and
-    /// [`NlibCode::Numerical`] when the quotient `(p-k+1) / (U[i+p+1] - U[i+k])` would
+    /// [`NurbsFailure::Numerical`] when the quotient `(p-k+1) / (U[i+p+1] - U[i+k])` would
     /// overflow or underflow.
     pub fn non_rat_first_deriv(&self, d: usize) -> Result<Curve> {
         const OP: &str = "nurbs::crv_adv::p2::Curve::non_rat_first_deriv";
@@ -612,10 +657,10 @@ impl Curve {
         let m = sx(self.m(), OP)?;
         let d = sx(d, OP)?;
         if d > p {
-            return Err(SolidError::nlib(OP, NlibCode::Input));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Input));
         }
         if self.is_rational() {
-            return Err(SolidError::nlib(OP, NlibCode::Input));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Input));
         }
 
         // See if memory is needed.
@@ -636,11 +681,11 @@ impl Curve {
             for i in 0..=n - k {
                 let (hi, lo) = (get(uk, i + p + 1, OP)?, get(uk, i + k, OP)?);
                 if hi == lo {
-                    return Err(SolidError::nlib(OP, NlibCode::Derivative));
+                    return Err(SolidError::nurbs(OP, NurbsFailure::ZeroDerivative));
                 }
                 let num = p as f64 - k as f64 + 1.0;
                 if float_op_is_bad(num, hi - lo, FloatOp::Division) {
-                    return Err(SolidError::nlib(OP, NlibCode::Numerical));
+                    return Err(SolidError::nurbs(OP, NurbsFailure::Numerical));
                 }
                 let alf = num / (hi - lo);
                 let c = CPoint::combine2(alf, get(&tw, i + 1, OP)?, -alf, get(&tw, i, OP)?);
@@ -773,7 +818,7 @@ impl Curve {
     ///
     /// # Errors
     ///
-    /// [`NlibCode::Input`] when `alf del - bet gam < PTOL` or a new knot is not
+    /// [`NurbsFailure::Input`] when `alf del - bet gam < PTOL` or a new knot is not
     /// computable.
     pub fn reparam_rat(&self, alf: f64, bet: f64, gam: f64, del: f64) -> Result<Curve> {
         let mut out = None;
@@ -789,7 +834,7 @@ impl Curve {
 
         // Check coefficients.
         if (alf * del - bet * gam) < PTOL {
-            return Err(SolidError::nlib(OP, NlibCode::Input));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Input));
         }
 
         // Get local notation.
@@ -808,7 +853,7 @@ impl Curve {
             let num = alf * ui + bet;
             let den = gam * ui + del;
             if float_op_is_bad(num, den, FloatOp::Division) {
-                return Err(SolidError::nlib(OP, NlibCode::Input));
+                return Err(SolidError::nurbs(OP, NurbsFailure::Input));
             }
             set(uq, i, num / den, OP)?;
         }
@@ -862,8 +907,8 @@ impl Curve {
         // Reparametrize curve.
         let (mut w0, mut wn) = (get(self.cpts(), 0, OP)?.w, get(self.cpts(), n, OP)?.w);
         let exp = 1.0 / p as f64;
-        w0 = w0.powf(exp);
-        wn = wn.powf(exp);
+        w0 = det::powf(w0, exp);
+        wn = det::powf(wn, exp);
         let (u0, um) = (get(self.knots(), 0, OP)?, get(self.knots(), m, OP)?);
         let alf = wn * d - w0 * c;
         let bet = w0 * c * um - wn * d * u0;
@@ -962,9 +1007,9 @@ impl Curve {
     ///
     /// # Errors
     ///
-    /// [`NlibCode::Input`] when the reparametrisation is degenerate or a new knot is
-    /// not computable, [`NlibCode::Weight`] for a weight whose reciprocal is not
-    /// computable, [`NlibCode::Numerical`] when a new weight is not computable, and the
+    /// [`NurbsFailure::Input`] when the reparametrisation is degenerate or a new knot is
+    /// not computable, [`NurbsFailure::Weight`] for a weight whose reciprocal is not
+    /// computable, [`NurbsFailure::Numerical`] when a new weight is not computable, and the
     /// errors of [`Curve::reparam_to_interval`]. The curve is left modified as far as
     /// upstream got.
     pub fn reparam_end_weights(&mut self, wt0: f64, wtn: f64) -> Result<()> {
@@ -987,14 +1032,14 @@ impl Curve {
         // Reparametrize curve.
         let (mut w0, mut wn) = (get(self.cpts(), 0, OP)?.w, get(self.cpts(), n, OP)?.w);
         let exp = 1.0 / pu as f64;
-        w0 = (w0 / wt0).powf(exp);
-        wn = (wn / wtn).powf(exp);
+        w0 = det::powf(w0 / wt0, exp);
+        wn = det::powf(wn / wtn, exp);
         let alf = wn;
         let bet = 0.0;
         let gam = wn - w0;
         let del = w0;
         if (alf * del - bet * gam) < PTOL {
-            return Err(SolidError::nlib(OP, NlibCode::Input));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Input));
         }
 
         let uk = self.knots().to_vec();
@@ -1004,7 +1049,7 @@ impl Curve {
             let c = get(pw, i, OP)?;
             set(&mut w, i, c.w, OP)?;
             if float_op_is_bad(1.0, c.w, FloatOp::Division) {
-                return Err(SolidError::nlib(OP, NlibCode::Weight));
+                return Err(SolidError::nurbs(OP, NurbsFailure::Weight));
             }
             let fact = 1.0 / c.w;
             set(pw, i, c.scale(fact), OP)?;
@@ -1020,7 +1065,7 @@ impl Curve {
             }
             let wi = get(&w, i, OP)?;
             if float_op_is_bad(wi, fact, FloatOp::Division) {
-                return Err(SolidError::nlib(OP, NlibCode::Numerical));
+                return Err(SolidError::nurbs(OP, NurbsFailure::Numerical));
             }
             let wi = wi / fact;
             set(&mut w, i, wi, OP)?;
@@ -1041,7 +1086,7 @@ impl Curve {
             let num = alf * ui + bet;
             let den = gam * ui + del;
             if float_op_is_bad(num, den, FloatOp::Division) {
-                return Err(SolidError::nlib(OP, NlibCode::Input));
+                return Err(SolidError::nurbs(OP, NurbsFailure::Input));
             }
             set(uq, i, num / den, OP)?;
         }

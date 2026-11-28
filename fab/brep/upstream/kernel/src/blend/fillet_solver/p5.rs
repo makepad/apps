@@ -6,6 +6,7 @@
 //! |------|----------|
 //! | [`FilletSolver::test_roll_over`], [`FilletSolver::test_roll_over_with_ops`] | `SmFilletSolver::TestRollOver` |
 //! | [`FilletSolver::process_roll_over`], [`FilletSolver::process_roll_over_with_ops`] | `SmFilletSolver::ProcessRollOver` |
+//! | [`FilletSolver::end_sections_fit_their_faces_with_ops`] | the fork's `SmFilletSolver::EndSectionsFitTheirFaces` (tangency-labs/smlib `a307480`; `p5/end_sections_fit.rs`) |
 //!
 //! Deviations: pseudo-B-rep objects use typed arenas and geometry uses the same
 //! typed ids as the solver list. Completed mutations survive failures. Only unavailable
@@ -38,8 +39,17 @@ use crate::topology::{edge, edgeuse::p1 as eu, edgeuse::p2, Brep, EdgeId, Edgeus
 #[path = "p5/recovery.rs"]
 mod recovery;
 
+#[path = "p5/end_sections_fit.rs"]
+mod end_sections_fit;
+
 #[path = "p5/rails_fit.rs"]
 mod rails_fit;
+#[cfg(test)]
+pub(crate) use rails_fit::PassedCrossing;
+pub use rails_fit::{
+    edge_bounds_material, edge_bounds_material_linked, inside_material, is_concave_edge,
+    is_knife_edge, RailsFit,
+};
 
 const OP: &str = "blend::fillet_solver::p5";
 
@@ -76,11 +86,81 @@ pub trait RailClassificationContext {
         face: crate::topology::FaceId,
         class: &mut CurveClassification<FilletClassObject>,
     ) -> Result<()>;
+    /// The planar cliff closing this rim at the blend's joined endpoint.
+    fn continued_cliff(
+        &self,
+        _vertex: crate::topology::VertexId,
+        _rim: EdgeId,
+    ) -> Option<crate::topology::FaceId> {
+        None
+    }
+
     /// Actual corner kind.
     ///
     /// # Errors
     /// An unresolved corner.
     fn corner_type(&self, corner: FilletCornerId) -> Result<FilletCornerType>;
+    /// Whether the corner is one closed blend meeting itself (the fork's `IsClosedJoin()`,
+    /// 543d25a, or a closed Turn, #2349: [`FilletCorner::meets_itself`]), and
+    /// `IsEndOnEndFace()` (the fork's 53c47b8; WR-697). The default, for a context without
+    /// blend corners: neither, and an end on its end face exactly at an Nx1 corner.
+    ///
+    /// [`FilletCorner::meets_itself`]: crate::blend::fillet_corner::p3::FilletCorner::meets_itself
+    ///
+    /// # Errors
+    /// An unresolved corner.
+    fn corner_blend_tests(&self, corner: FilletCornerId) -> Result<(bool, bool)> {
+        Ok((false, self.corner_type(corner)? == FilletCornerType::NByOne))
+    }
+    /// `GetFilletExecutive()->GetFilletCornerOfVertex(vertex)` of the fork's
+    /// `EndSectionsFitTheirFaces` (tangency-labs/smlib `a307480`): the corner of a
+    /// target vertex.
+    ///
+    /// # Errors
+    /// [`SolidError::Unported`] for a context without an executive.
+    fn corner_of_vertex(
+        &self,
+        vertex: crate::topology::VertexId,
+    ) -> Result<Option<FilletCornerId>> {
+        let _ = vertex;
+        Err(SolidError::unported(
+            "SmFilletExecutive::GetFilletCornerOfVertex (fork EndSectionsFitTheirFaces)",
+            "blend.fillet_executive_p3",
+        ))
+    }
+    /// `SmFace::CurveOnClassify(TRUE, SmCurveClassification(curve, interval, uv, tol),
+    /// TRUE)` of a curve in no body (the fork's end section, tangency-labs/smlib
+    /// `a307480`) against target face `face`: its intervals.
+    ///
+    /// # Errors
+    /// [`SolidError::Unported`] for a context without live bodies; the classifier's.
+    #[allow(clippy::too_many_arguments)]
+    fn classify_free_curve(
+        &mut self,
+        k: &Kernel,
+        target: &mut Brep,
+        pseudo: &Brep,
+        face: crate::topology::FaceId,
+        curve: &crate::curve::curve::Curve,
+        interval: crate::geom::extent1d::Extent1d,
+        uv_curve: Option<&crate::curve::curve::Curve>,
+        zone_tol_3d: f64,
+    ) -> Result<Vec<crate::intersect::curve_class::p1::CurveInterval<FilletClassObject>>> {
+        let _ = (
+            k,
+            target,
+            pseudo,
+            face,
+            curve,
+            interval,
+            uv_curve,
+            zone_tol_3d,
+        );
+        Err(SolidError::unported(
+            "SmFace::CurveOnClassify of a free curve (fork EndSectionsFitTheirFaces)",
+            "blend.fillet_executive_p3",
+        ))
+    }
     /// The executive's corner table (`m_vFilletCorners`), which the rollover
     /// recovery's `CalcRailIntEdgeuse` reads.
     fn corners(&self) -> CornerLookup<'_>;
@@ -118,10 +198,18 @@ impl<C: RailClassificationContext> SplitCorners for ContextCorners<'_, C> {
         &mut self,
         _id: FilletCornerId,
     ) -> Result<&mut crate::blend::fillet_corner::p3::FilletCorner> {
-        Err(SolidError::null_pointer(OP))
+        Err(SolidError::blend_null_defect(
+            OP,
+            "a split asked this context for a corner to change: the context maps no vertex to \
+             a corner (`corner_of_vertex` is always `None`), and a split changes only the \
+             corner of the vertex it ends on",
+        ))
     }
     fn corner_type(&self, id: FilletCornerId) -> Result<FilletCornerType> {
         self.0.corner_type(id)
+    }
+    fn meets_itself(&self, id: FilletCornerId) -> Result<bool> {
+        Ok(self.0.corner_blend_tests(id)?.0)
     }
 }
 
@@ -270,9 +358,7 @@ impl FilletSolver {
                 fillets.with_rail_classification(rail, |pseudo, cc| {
                     context.classify(k, target, pseudo, face, cc)
                 })?;
-                if k.fixes.fillet_rail_rim_on_face {
-                    join_intervals_on_face(fillets, rail)?;
-                }
+                join_intervals_on_face(fillets, rail)?;
                 finish_classification(
                     solver,
                     k,
@@ -362,13 +448,13 @@ impl FilletSolver {
 /// intervals on the face or on its boundary (a rail touching a vertex of the boundary or
 /// running along a piece of an edge, as a blend whose setback reaches exactly the rim of
 /// a hole does) are joined into one, so the rollover sees only the intervals that leave
-/// the face (source fork `f6ed05a`).
+/// the face (tangency-labs/smlib `f6ed05a`).
 fn join_intervals_on_face(fillets: &mut FilletBrep, rail: EdgeId) -> Result<()> {
     let cc = fillets
         .fillet_edge_mut(rail)?
         .curve_class
         .as_mut()
-        .ok_or_else(|| SolidError::null_pointer(OP))?;
+        .ok_or_else(|| SolidError::blend_null_defect(OP, JOIN_CLASSIFIED))?;
     for index in (1..cc.size()).rev() {
         let this = cc.at(index)?.mid;
         let prev = cc.at(index - 1)?.mid;
@@ -385,6 +471,27 @@ fn join_intervals_on_face(fillets: &mut FilletBrep, rail: EdgeId) -> Result<()> 
     Ok(())
 }
 
+/// A rail lost the classification installed on it just before it was classified.
+const LENT_CLASSIFICATION: &str = "the rail lost the curve classification installed on it just \
+                                   before: `with_rail_classification` lends it in place and \
+                                   puts it back";
+/// The join found no classification on the rail (`SolidError::blend_null_defect`).
+const JOIN_CLASSIFIED: &str = "the join of the rail's intervals on its face found no curve \
+                               classification: `test_roll_over` installs it on the rail and \
+                               classifies it just before";
+/// The connection found no classification on the rail.
+const CONNECT_CLASSIFIED: &str = "the connection of the rail's intervals found no curve \
+                                  classification: it runs only on a rail `test_roll_over` has \
+                                  just classified";
+/// The refinement found no classification on the rail.
+const REFINE_CLASSIFIED: &str = "the refinement found no curve classification on the rail: \
+                                 `test_roll_over` installs it before it refines, and the \
+                                 refinement puts back what it takes on every return";
+/// The squeeze found no classification on the rail.
+const SQUEEZE_CLASSIFIED: &str = "the squeeze of the rail's end intervals found no curve \
+                                  classification: `test_roll_over` installs it before it \
+                                  squeezes, and connecting intervals keeps it";
+
 trait ClassificationOps {
     fn connect(
         &mut self,
@@ -399,7 +506,7 @@ trait ClassificationOps {
             .fillet_edge_mut(rail)?
             .curve_class
             .as_mut()
-            .ok_or_else(|| SolidError::null_pointer(OP))?
+            .ok_or_else(|| SolidError::blend_null_defect(OP, CONNECT_CLASSIFIED))?
             .connect_intervals(
                 interval,
                 if at_end {
@@ -425,7 +532,7 @@ trait ClassificationOps {
             .fillet_edge_mut(rail)?
             .curve_class
             .take()
-            .ok_or_else(|| SolidError::null_pointer(OP))?;
+            .ok_or_else(|| SolidError::blend_null_defect(OP, REFINE_CLASSIFIED))?;
         let result = super::p3::refine_rail_curve_classification_scoped_with_ops(
             solver,
             k,
@@ -472,7 +579,7 @@ fn squeeze_rail(
     let count = fillets
         .fillet_edge(rail)?
         .curve_class()
-        .ok_or_else(|| SolidError::null_pointer(OP))?
+        .ok_or_else(|| SolidError::blend_null_defect(OP, SQUEEZE_CLASSIFIED))?
         .size();
     let mut small = Vec::new();
     if count > 1 {
@@ -480,10 +587,15 @@ fn squeeze_rail(
             let interval = fillets
                 .fillet_edge(rail)?
                 .curve_class()
-                .ok_or_else(|| SolidError::null_pointer(OP))?
+                .ok_or_else(|| SolidError::blend_null_defect(OP, SQUEEZE_CLASSIFIED))?
                 .sub_interval(index)?;
-            let curve =
-                edge::curve(fillets.brep(), rail)?.ok_or_else(|| SolidError::null_pointer(OP))?;
+            let curve = edge::curve(fillets.brep(), rail)?.ok_or_else(|| {
+                SolidError::blend_null_defect(
+                    OP,
+                    "the squeeze found no curve on the rail: `test_roll_over` read the rail's \
+                     curve before it classified the rail, and nothing since removes it",
+                )
+            })?;
             let start = curve.evaluate_point(k, interval.min())?;
             let end = curve.evaluate_point(k, interval.max())?;
             if start.distance(end) > 50.0 * tolerance {
@@ -508,7 +620,8 @@ mod tests {
     use crate::intersect::point_class::PointClassType;
     use crate::math::Vec3;
 
-    /// A corner store resolving only corner types, through `F`.
+    /// A corner store resolving only corner types, through `F`; a blend corner (`NByTwo`)
+    /// is one closed blend meeting itself.
     struct CornerTypes<F>(F);
 
     impl<F: Fn(FilletCornerId) -> Result<FilletCornerType>> SplitCorners for CornerTypes<F> {
@@ -526,6 +639,9 @@ mod tests {
         }
         fn corner_type(&self, id: FilletCornerId) -> Result<FilletCornerType> {
             (self.0)(id)
+        }
+        fn meets_itself(&self, id: FilletCornerId) -> Result<bool> {
+            Ok((self.0)(id)? == FilletCornerType::NByTwo)
         }
     }
 
@@ -633,7 +749,7 @@ mod tests {
             &mut target,
             &mut fb,
             id,
-            &mut CornerTypes(|_| Ok(FilletCornerType::OneByOne)),
+            &mut CornerTypes(|_| Ok(FilletCornerType::NByTwo)),
             &mut adjusted,
             &mut NoOwnership,
         );
@@ -644,5 +760,59 @@ mod tests {
                 "solver without edge use",
             ))
         );
+    }
+
+    /// A rail crossing a side edge that joins both ends of the filleted edge (a loop of two
+    /// edges) is judged at the end nearer the crossing only. The filleted edge runs along x
+    /// from 0 to 10; a rail beside it at y = 1 that leaves its face at x = 4 and comes back
+    /// at x = 6, heading +x, is past neither end, so its run off the face is judged.
+    #[test]
+    fn a_side_edge_crossing_on_a_loop_of_two_edges_is_judged_at_its_nearer_end() {
+        let jets = [(Vec3::ZERO, Vec3::X), (Vec3::new(10.0, 0.0, 0.0), Vec3::X)];
+        let both = [0, 1];
+        let at = |x: f64| Vec3::new(x, 1.0, 0.0);
+        // mid-edge: leaving near the start heading in, coming back near the end heading out
+        assert_eq!(
+            rails_fit::crossing_end(&both, jets, at(4.0), Vec3::X, true),
+            None
+        );
+        assert_eq!(
+            rails_fit::crossing_end(&both, jets, at(6.0), Vec3::X, false),
+            None
+        );
+        // near an end, heading past it: leaving out past the end, coming back in past the start
+        assert_eq!(
+            rails_fit::crossing_end(&both, jets, at(9.5), Vec3::X, true),
+            Some(1)
+        );
+        assert_eq!(
+            rails_fit::crossing_end(&both, jets, at(0.5), Vec3::X, false),
+            Some(0)
+        );
+        // a side edge at one end only: that end, by the heading alone (an end face sloping
+        // back over the face is crossed before the end's cross section)
+        assert_eq!(
+            rails_fit::crossing_end(&[1], jets, at(4.0), Vec3::X, true),
+            Some(1)
+        );
+        assert_eq!(
+            rails_fit::crossing_end(&[1], jets, at(4.0), -Vec3::X, true),
+            None
+        );
+        assert_eq!(
+            rails_fit::crossing_end(&[], jets, at(9.5), Vec3::X, true),
+            None
+        );
+    }
+
+    /// The radial sector test at a crossing refuses a non-finite dot product, which a
+    /// negated convex check would classify as concave and so as material-bounding.
+    #[test]
+    fn a_non_finite_radial_sector_dot_is_refused_not_concave() {
+        assert_eq!(rails_fit::concave_from_dots(0.5, 0.5).ok(), Some(false));
+        assert_eq!(rails_fit::concave_from_dots(-0.5, 0.5).ok(), Some(true));
+        assert!(rails_fit::concave_from_dots(f64::NAN, 0.5).is_err());
+        assert!(rails_fit::concave_from_dots(0.5, f64::NAN).is_err());
+        assert!(rails_fit::concave_from_dots(f64::INFINITY, 0.5).is_err());
     }
 }

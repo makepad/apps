@@ -16,7 +16,7 @@
 //! | [`Conic::calculate_continuities`]      | `SmConic::CalculateContinuities`               |
 //! | [`Conic::natural_interval`]            | `SmConic::GetNaturalInterval`                  |
 //! | [`Conic::knots`]                       | `SmConic::GetKnots`                            |
-//! | [`Conic::evaluate`]                    | `SmConic::Evaluate`                            |
+//! | [`Conic::evaluate`]                     | `SmConic::Evaluate`                            |
 //! | [`Conic::evaluate_point`]              | `SmConic::EvaluatePoint`                       |
 //! | [`Conic::compute_implicit_equation`]   | `SmConic::ComputeImplicitEquation`             |
 //! | [`Conic::intersect_implicit_conic`]    | `SmConic::IntersectImplicitConic`              |
@@ -44,10 +44,11 @@
 //!   becomes a `Vec` of [`ConicIntersection`]; `IntersectImplicitConic`'s
 //!   multiplicity array (never written) is dropped; `InvertPointOnConic`'s success
 //!   flag and parameter become an `Option`.
-//! - **Uninitialised data.** `Evaluate`'s zero-tangent fix reads the second
-//!   derivative slot of the caller's array *before* writing it; the port reads a
-//!   fresh `SmVector3d` there ([`Vec3::UNDEF`]), whose length never exceeds the
-//!   threshold, so the fix never fires (`plan/findings.md`). `EvaluatePoint` of an
+//! - **Uninitialised data.** `Evaluate`'s zero-tangent fix reads the
+//!   second-derivative slot of the caller's array *before* writing it (`WR-27`,
+//!   `plan/findings/curve.conic--notes.md`), so the fix never fires upstream; the
+//!   port uses the computed second derivative instead ([`Conic::evaluate`]).
+//!   `EvaluatePoint` of an
 //!   [`ConicType::Unknown`] conic leaves `x`, `y` of the caller's point unwritten;
 //!   the port starts from a fresh point ([`crate::math::UNDEF_DOUBLE`]).
 //!   `IntersectImplicitConic` (and so `IntersectConic`) of an unknown conic solves a
@@ -63,6 +64,7 @@
 //!   unit.
 
 use crate::curve::curve::p2::{self as curve_p2, CONIC_TYPE};
+use crate::error::curve::CurveFailure;
 use crate::error::{Result, SolidError};
 use crate::geom::extent1d::Extent1d;
 use crate::geom::geom_utility::p2::ContinuityType;
@@ -70,6 +72,7 @@ use crate::geom::polynomial::{solve_quadratic, solve_quartic};
 use crate::geom::tol::is_zero;
 use crate::geom::vector2d::{Point2, Vec2};
 use crate::geom::vector3d::{Point3, Vec3};
+use crate::math::det;
 use crate::math::{EFF_ZERO, EFF_ZERO_SQRT, UNDEF_DOUBLE};
 use crate::topology::database_io::{DatabaseReader, FileType, InputStream};
 
@@ -304,9 +307,11 @@ impl Conic {
 
     /// Position and the first `num_derivs` derivatives at `param` (`Evaluate`).
     ///
-    /// With `non_zero_tangents` and two derivatives, upstream's zero-tangent fix
-    /// reads the not yet written second-derivative slot (see the module
-    /// deviations).
+    /// The `non_zero_tangents` fallback for `num_derivs == 2` uses the computed second
+    /// derivative `sec` to orient and scale a near-zero first derivative
+    /// (`|tan| < 1.1 * scaled_zero`) whenever `|sec| > 1.1 * scaled_zero` (negating
+    /// above the midpoint of [`Self::natural_interval`]). Upstream reads the unwritten
+    /// slot `out[2]` there and so never applies the fallback (WR-27).
     ///
     /// # Errors
     ///
@@ -418,12 +423,11 @@ impl Conic {
             // continuous modified function)
             if tan.length_squared() < new_len * new_len {
                 // num_derivs >= 2 here: upstream's recursion for fewer derivatives
-                // cannot be reached. Fix the zero 1st derivative function here; the
-                // 2nd derivative slot still holds the caller's (fresh) value.
-                let second = out.get(2).copied().unwrap_or(Vec3::UNDEF);
-                let len = second.length();
+                // cannot be reached. Fix the zero 1st derivative function here with
+                // the computed 2nd derivative (WR-27; upstream reads the unwritten slot).
+                let len = sec.length();
                 if len > new_len {
-                    let mut fixed = (new_len / len) * second;
+                    let mut fixed = (new_len / len) * sec;
 
                     // If we're at the 'top' of the domain, i.e., the 'good'
                     // parameter is entering a singularity instead of leaving it,
@@ -448,7 +452,13 @@ impl Conic {
             return Ok(out);
         }
 
-        Err(SolidError::sm_err(OP_EVALUATE))
+        Err(SolidError::curve(
+            OP_EVALUATE,
+            CurveFailure::TooManyDerivatives {
+                asked: num_derivs,
+                most: 2,
+            },
+        ))
     }
 
     /// The point at `param` (`EvaluatePoint`); `z` is 0.
@@ -548,8 +558,8 @@ impl Conic {
         // y' = -x*Sin + Y*Cos
         //   2           2
         // Ax  + Bxy + Cy  + Dx + Ey + F = 0
-        let sin = (-self.theta_rad).sin();
-        let cos = (-self.theta_rad).cos();
+        let sin = det::sin(-self.theta_rad);
+        let cos = det::cos(-self.theta_rad);
         let sin_sq = sin * sin;
         let cos_sq = cos * cos;
         let sin_cos = sin * cos;
@@ -724,8 +734,8 @@ impl Conic {
         let mut param2 = 0.0;
 
         let tmp = point - Vec3::from(self.origin);
-        let cos = (-self.theta_rad).cos();
-        let sin = (-self.theta_rad).sin();
+        let cos = det::cos(-self.theta_rad);
+        let sin = det::sin(-self.theta_rad);
         let local = Vec2::new(tmp.x * cos + tmp.y * sin, tmp.y * cos - tmp.x * sin);
 
         match self.kind {
@@ -798,15 +808,15 @@ impl Conic {
     /// translates it by `translation` (`Transform2D`).
     pub fn transform_2d(&mut self, ccw_rotation_rad: f64, translation: Point2) {
         self.theta_rad -= ccw_rotation_rad;
-        let cos = (-ccw_rotation_rad).cos();
-        let sin = (-ccw_rotation_rad).sin();
+        let cos = det::cos(-ccw_rotation_rad);
+        let sin = det::sin(-ccw_rotation_rad);
         let tmp = Vec2::new(
             self.origin.x * cos + self.origin.y * sin,
             self.origin.y * cos - self.origin.x * sin,
         );
         self.origin = tmp + translation;
-        self.cos_theta = self.theta_rad.cos();
-        self.sin_theta = self.theta_rad.sin();
+        self.cos_theta = det::cos(self.theta_rad);
+        self.sin_theta = det::sin(self.theta_rad);
     }
 
     /// Reads a conic written by `WriteToDB` (`ReadFromDB`): the type code, `a`,
@@ -864,8 +874,8 @@ impl Conic {
         conic.b = b;
         conic.origin = Vec2::new(orig_x, orig_y);
         conic.theta_rad = theta_rad;
-        conic.sin_theta = theta_rad.sin();
-        conic.cos_theta = theta_rad.cos();
+        conic.sin_theta = det::sin(theta_rad);
+        conic.cos_theta = det::cos(theta_rad);
         Ok(conic)
     }
 
@@ -897,7 +907,9 @@ impl Conic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::curve::curve::{Curve, CurveEvaluate};
     use crate::geom::tol::ZONE_TOL_3D;
+    use crate::kernel::Kernel;
     use crate::math::PI;
 
     #[test]
@@ -921,7 +933,15 @@ mod tests {
         let v = e.evaluate(0.0, 2, true).unwrap();
         assert_eq!(v.len(), 3);
         assert_eq!(v[1], Vec3::new(0.0, 2.0, 0.0));
-        assert!(e.evaluate(0.0, 3, false).is_err());
+        let err = e.evaluate(0.0, 3, false).unwrap_err();
+        assert_eq!(
+            err.curve_failure(),
+            Some(&CurveFailure::TooManyDerivatives { asked: 3, most: 2 })
+        );
+        assert_eq!(
+            crate::error::upstream_status(&err),
+            Some(crate::error::SM_ERR)
+        );
         let p = e.evaluate(0.3, 0, false).unwrap();
         assert_eq!(p[0], e.evaluate_point(0.3));
     }
@@ -969,6 +989,31 @@ mod tests {
     }
 
     #[test]
+    fn circle_finds_all_four_crossings_with_a_nearly_tangent_ellipse() {
+        let circle = Conic::new(ConicType::Ellipse, 1.0, 1.0);
+        let (a, b, h) = (0.5, 0.71, 0.49999);
+        let mut ellipse = Conic::new(ConicType::Ellipse, a, b);
+        ellipse.transform_2d(0.0, Vec2::new(h, 0.0));
+
+        // Substitute y^2 = 1 - x^2 into (x - h)^2/a^2 + y^2/b^2 = 1.
+        // Both solutions for x are inside the circle, each with two opposite y values.
+        let aa = b * b - a * a;
+        let half_b = -h * b * b;
+        let cc = b * b * h * h + a * a * (1.0 - b * b);
+        let delta = (half_b * half_b - aa * cc).sqrt();
+        let hits = circle.intersect_conic(&ellipse, 1e-7).unwrap();
+        assert_eq!(hits.len(), 4);
+        for x in [(-half_b - delta) / aa, (-half_b + delta) / aa] {
+            let y = (1.0 - x * x).sqrt();
+            for expected in [Vec3::new(x, y, 0.0), Vec3::new(x, -y, 0.0)] {
+                assert!(hits
+                    .iter()
+                    .any(|hit| circle.evaluate_point(hit.param).distance(expected) < 1e-9));
+            }
+        }
+    }
+
+    #[test]
     fn knots_kind_eq() {
         let c = Conic::new(ConicType::Ellipse, 2.0, 1.0);
         assert_eq!(c.knots(None), (vec![-1.0, 3.0], vec![3, 3]));
@@ -991,7 +1036,7 @@ mod tests {
         let c = Conic::read_from_db(&mut db).unwrap();
         assert_eq!(c.conic_type(), ConicType::Hyperbola);
         assert_eq!(c.origin(), Vec2::new(1.0, 2.0));
-        assert_eq!(c.sin_cos_theta(), (0.25f64.sin(), 0.25f64.cos()));
+        assert_eq!(c.sin_cos_theta(), (det::sin(0.25f64), det::cos(0.25f64)));
 
         let mut bytes = 3u64.to_ne_bytes().to_vec();
         for v in [0.5, 0.0, 0.0, 0.0, 0.0f64] {
@@ -1002,5 +1047,100 @@ mod tests {
         let c = Conic::read_from_db(&mut db).unwrap();
         assert_eq!(c.conic_type(), ConicType::Line);
         assert_eq!(c.a(), 0.5);
+    }
+
+    #[test]
+    fn wr27_zero_and_tiny_tangent_ellipse_uses_computed_second_deriv() {
+        // Flat horizontal ellipse (a = 2, b = 0): natural interval [-1, 3], mid = 1.
+        // At param = 0 (< mid): pos = (2, 0, 0), tan = (0, 0, 0), sec = (-8, 0, 0).
+        let flat = Conic::new(ConicType::Ellipse, 2.0, 0.0);
+        let new_len = 1.1 * (EFF_ZERO * (1.0 + 2.0));
+
+        let v_fix = flat.evaluate(0.0, 2, true).unwrap();
+        let expected_0 = (new_len / v_fix[2].length()) * v_fix[2];
+        assert_eq!(v_fix[0], Vec3::new(2.0, 0.0, 0.0));
+        assert_eq!(v_fix[1], expected_0);
+        assert!(v_fix[1].x < 0.0 && v_fix[1].y == 0.0 && v_fix[1].z == 0.0);
+        assert!((v_fix[1].length() - new_len).abs() <= 1.0e-27);
+        assert_eq!(v_fix[2], Vec3::new(-8.0, 0.0, 0.0));
+        // Without `non_zero_tangents` the zero tangent stays.
+        assert_eq!(flat.evaluate(0.0, 2, false).unwrap()[1], Vec3::ZERO);
+
+        // At param = 2 (> mid = 1): pos = (-2, 0, 0), tan = 0, sec = (+8, 0, 0);
+        // entering upper domain half negates the fallback tangent so it points along -X.
+        let v_fix_top = flat.evaluate(2.0, 2, true).unwrap();
+        let mut expected_2 = (new_len / v_fix_top[2].length()) * v_fix_top[2];
+        expected_2 *= -1.0;
+        assert_eq!(v_fix_top[0], Vec3::new(-2.0, 0.0, 0.0));
+        assert_eq!(v_fix_top[1], expected_2);
+        assert!(v_fix_top[1].x < 0.0);
+        assert_eq!(v_fix_top[2], Vec3::new(8.0, 0.0, 0.0));
+
+        // Tiny non-zero tangent (|tan| = 2e-15 < new_len = 3.3e-12) also triggers the fallback.
+        let tiny = Conic::new(ConicType::Ellipse, 2.0, 1.0e-15);
+        let t_fix = tiny.evaluate(0.0, 2, true).unwrap();
+        assert_eq!(t_fix[1], expected_0);
+        // With non_zero_tangents = false, the exact tangent is preserved.
+        let t_exact = tiny.evaluate(0.0, 2, false).unwrap();
+        assert_eq!(t_exact[1], Vec3::new(0.0, 2.0e-15, 0.0));
+
+        // Vertical degenerate ellipse (a = 0, b = 3) at -1 (< mid), 1 (== mid), and 3 (> mid).
+        let vert = Conic::new(ConicType::Ellipse, 0.0, 3.0);
+        let v_len = 1.1 * (EFF_ZERO * (1.0 + 3.0));
+        let vm1 = vert.evaluate(-1.0, 2, true).unwrap();
+        assert!(vm1[1].y > 0.0 && (vm1[1].length() - v_len).abs() <= 1.0e-27);
+        let vp1 = vert.evaluate(1.0, 2, true).unwrap();
+        assert!(vp1[1].y < 0.0 && (vp1[1].length() - v_len).abs() <= 1.0e-27);
+        let vp3 = vert.evaluate(3.0, 2, true).unwrap();
+        assert!(vp3[1].y < 0.0 && (vp3[1].length() - v_len).abs() <= 1.0e-27);
+    }
+
+    #[test]
+    fn wr27_hyperbola_transformed_conic_and_curve_dispatch() {
+        let k = Kernel::default();
+
+        // Degenerate hyperbola (a = 2, b = 0), natural interval mid = 0.
+        let hyp = Conic::new(ConicType::Hyperbola, 2.0, 0.0);
+        let h_len = 1.1 * (EFF_ZERO * (1.0 + 2.0));
+        let h0 = hyp.evaluate(0.0, 2, true).unwrap();
+        assert!(h0[1].x > 0.0 && (h0[1].length() - h_len).abs() <= 1.0e-27);
+
+        // Above mid (param = 1e-15 > 0): |tan| = 8e-15 < 3.3e-12, negated to -X.
+        let hp = hyp.evaluate(1.0e-15, 2, true).unwrap();
+        assert!(hp[1].x < 0.0);
+
+        // Rotated & translated degenerate ellipse dispatched via Curve and CurveEvaluate.
+        let mut rot = Conic::new(ConicType::Ellipse, 2.0, 0.0);
+        rot.transform_2d(PI / 3.0, Vec2::new(10.0, -4.0));
+        let crv = Curve::from(rot);
+        let pos = rot.evaluate_point(0.0);
+        let r_len = 1.1 * (EFF_ZERO * (1.0 + pos.max_dimension()));
+
+        let c_fix = crv.evaluate(&k, 0.0, 2, false, true).unwrap();
+        let direct = rot.evaluate(0.0, 2, true).unwrap();
+        let via_trait = CurveEvaluate::evaluate(&rot, &k, 0.0, 2, true, true).unwrap();
+        assert_eq!(c_fix, direct);
+        assert_eq!(via_trait, direct);
+        assert!((c_fix[1].length() - r_len).abs() <= 1.0e-25);
+        assert!(c_fix[1].dot(c_fix[2]) > 0.0);
+
+        let mut buf = [Vec3::new(99.0, -77.0, 55.0); 3];
+        crv.evaluate_into(&k, 0.0, false, true, &mut buf).unwrap();
+        assert_eq!(buf.as_slice(), c_fix.as_slice());
+
+        // Totally collapsed conic (sec == 0): len > new_len is false (no NaN).
+        let zero_conic = Conic::new(ConicType::Ellipse, 0.0, 0.0);
+        assert_eq!(zero_conic.evaluate(0.0, 2, true).unwrap()[1], Vec3::ZERO);
+    }
+
+    #[test]
+    fn wr27_other_deriv_orders_unchanged() {
+        let degen = Conic::new(ConicType::Ellipse, 2.0, 0.0);
+        for param in [0.0, 2.0] {
+            for d in [0, 1] {
+                assert_eq!(degen.evaluate(param, d, true).unwrap().len(), d + 1);
+            }
+            assert!(degen.evaluate(param, 3, true).is_err());
+        }
     }
 }

@@ -58,9 +58,18 @@
 //!   lists inserts at the front of the [`BezierAux2d`] `Vec`s (list order, head first).
 //!   The list memory managers (`m_sVLMgr`, `m_sEdgeuseListMgr`) have no counterpart.
 //! - **Temporary state.** `SmTemporaryChangeValue` (restored on every return) becomes
-//!   explicit save / restore around the inner bodies; as upstream, the
-//!   `m_bPointTestEnabled` set at the end of the face branch is overwritten by the
-//!   restore when the branch ends.
+//!   explicit save / restore around the inner bodies.
+//! - **Point testing.** Upstream's `BuildTree` stores whether the cache tests points
+//!   (`m_bPointTestEnabled`): off for a standalone build (no face, a face without
+//!   loop uses, or a B-rep in editing mode), on at the end of the face branch, which
+//!   the branch's restore then overwrites with the value from before the build. The
+//!   stored value thus depended on when and in which mode the tree was built, so the
+//!   same face accepted or rejected the same point depending on what ran before. Here
+//!   no build writes it: it stays on unless a caller switches it off for a scope,
+//!   and a trimmed cache tests a point only when its face has loop uses, asked of the
+//!   face at each test ([`TrimSrfCache::point_test_in`],
+//!   [`SurfaceCache::point_test_with`], [`FaceQueries::face_has_loopuses`]). A surface
+//!   with no face keeps every point.
 //! - **Virtual dispatch.** `MarkFaceContainment` runs the base traversal through
 //!   [`sc::FaceContainmentClassifier`], with the face as classifier. Point tests on
 //!   an unwrapped base retain trimmed dispatch and require an operation-scoped
@@ -71,6 +80,14 @@
 //!   nested reimplantation always disables subdivision, so that call chain has
 //!   at most one nested implantation. Geometric subdivision retains the base
 //!   cache's documented bounds; construction uses its containment guard.
+//! - **Subdivision stop.** `ImplantEdgeuse` splits a leaf near the curve (or near a
+//!   pole side) until it is smaller than the minimum node size, which it derives from
+//!   the cache domain and the curve's box. Upstream subdivides whatever those are; a
+//!   trim curve with a non-finite box (one evaluated on an invalid surface) makes the
+//!   size NaN, no comparison with it is true, and the leaves at a pole split forever
+//!   down to zero width. The port refuses a curve whose box is not finite, and a
+//!   subdividing implant whose minimum node size is not a positive finite number,
+//!   with [`SolidError::InvalidInput`] before splitting anything.
 //! - **Unported callees** (all return [`SolidError::Unported`]): `SmSurface::GetFace`
 //!   without a [`CacheFace`] (through [`SurfaceCache::face`]); `SmTol::GetZoneTol3d`
 //!   and `SmFace::PointClassify` of [`TrimSrfCache::point_test`] /
@@ -79,11 +96,18 @@
 //!   `PointClassify` of a cache whose surface has no face; the port returns
 //!   `SM_ERR_NULL_POINTER`. A node without surface data in this cache gives
 //!   [`SolidError::InvalidInput`].
+//! - **Statuses.** `BuildTree`'s `SER(sSurfaceDomain.Intersect(sFaceDomain, ..))` of
+//!   disjoint domains (no edge use grew the face domain) is the upstream status
+//!   `SM_ERR_INVALID_INPUT` ([`SurfaceFailure::DisjointFaceDomain`]), not
+//!   [`SolidError::InvalidInput`], so the cache factory falls back to the plain
+//!   surface cache as `smsurf_GetSurfaceCache` does when `CacheMakeOrValidate` fails;
+//!   a `GetTree` that builds a deferred tree returns the same status.
 //! - **Not ported here.** `GetMemoryUsed` (the base class sum) and `Dump` (debug
 //!   output).
 
 use crate::curve::curve::Curve;
 use crate::curve::curve_cache::{CurveCache, CurveCacheOptions};
+use crate::error::surface::SurfaceFailure;
 use crate::error::{Result, SolidError};
 use crate::geom::extent1d::Extent1d;
 use crate::geom::extent2d::Extent2d;
@@ -100,7 +124,7 @@ use crate::surface::surface::p2::PLANE_TYPE;
 use crate::surface::surface::Surface;
 use crate::surface::surface_cache::face_context::FaceQueries;
 use crate::surface::surface_cache::p1::{self as sc, FaceContainment, SurfaceCacheOptions};
-use crate::surface::surface_cache::{BezierAux2d, SurfaceCache};
+use crate::surface::surface_cache::{BezierAux2d, SurfaceCache, SurfaceCacheState};
 
 /// `SmTrimSrfCache_TYPE` (`SURF_BASE_TYPE + 120`).
 pub const TYPE: i64 = 15120;
@@ -210,6 +234,14 @@ pub trait CacheFace<O> {
     /// The implementor's (a face without B-rep).
     fn set_brep_editing_enabled(&mut self, enabled: bool) -> Result<()>;
 
+    /// Whether `BuildTree` implants the face's trims even while its B-rep is being
+    /// edited. Not upstream, which builds the tree untrimmed then: a B-rep point
+    /// classification answers against the face's current trims (WR-732, #2503). `false` by
+    /// default, as upstream.
+    fn implants_while_editing(&self) -> bool {
+        false
+    }
+
     /// `GetFace()->CreateUVTrimCurves(TRUE, NULL, NULL, ..)` (its gap statistics are
     /// not read).
     ///
@@ -224,6 +256,16 @@ pub trait CacheFace<O> {
     ///
     /// The implementor's.
     fn upward_loopuses(&self) -> Result<Vec<O>>;
+
+    /// Whether [`CacheFace::upward_loopuses`] is not empty (the point test asks it per
+    /// point; an implementor answers it without listing the loop uses).
+    ///
+    /// # Errors
+    ///
+    /// The implementor's.
+    fn has_loopuses(&self) -> Result<bool> {
+        Ok(!self.upward_loopuses()?.is_empty())
+    }
 
     /// `pLU->GetEdgeuses(sEUses)`.
     ///
@@ -378,8 +420,8 @@ pub struct TrimSrfCache<O> {
 impl<O: Copy + PartialEq> TrimSrfCache<O> {
     /// A trimmed cache of `surface` over its natural domain, not built
     /// (`SmTrimSrfCache::SmTrimSrfCache`): the state anticipates a face with trim
-    /// curves (point testing on, boundary curves off) until [`TrimSrfCache::build_tree`]
-    /// finds out.
+    /// curves (boundary curves off) until [`TrimSrfCache::build_tree`] finds out. Point
+    /// testing is on; whether a point is tested is asked of the face at each test.
     #[must_use]
     pub fn new(surface: Surface, opts: SurfaceCacheOptions) -> Self {
         // (kernel-free: a lazy analytic answers its NURB-less base's empty domain)
@@ -390,7 +432,7 @@ impl<O: Copy + PartialEq> TrimSrfCache<O> {
         // BuildTree() will change these values when there are no UVTrimCurves.
         base.face_was_modified = false;
         base.process_boundary_curves = false; // solvers skip naturalBoundaryCurve/target solutions
-        base.point_test_enabled = true; // solvers only accept point solutions within trim boundaries
+        base.point_test_enabled = true; // solvers only accept point solutions within trim boundaries (of a face with loop uses)
         base.have_t_surface_cache = false; // Set to true after adding UVTrimCurves to cache
         base.face_containment_done = FaceContainment::NotDone;
         base.trimmed_dispatch = true;
@@ -466,6 +508,25 @@ impl<O: Copy + PartialEq> TrimSrfCache<O> {
         })
     }
 
+    /// The state bits of the base that `self.map_handles(|o| Ok(map(o)))` would answer
+    /// ([`SurfaceCache::mapped_state`]), read without making the copy, with the copy's
+    /// errors: the base's, then the nesting bound of its polygon-edge surfaces'
+    /// evaluation copies.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`TrimSrfCache::map_handles`] with an infallible map.
+    pub fn mapped_state<P: Copy + PartialEq>(
+        &self,
+        map: impl Fn(O) -> P,
+    ) -> Result<SurfaceCacheState<P>> {
+        let state = self.base.mapped_state(map)?;
+        for (_, g) in &self.poly_edge_geometry {
+            g.surface.check_evaluation_copy_depth(0)?;
+        }
+        Ok(state)
+    }
+
     /// Unwraps the `SmSurfaceCache` base.
     #[must_use]
     pub fn into_base(self) -> SurfaceCache<O> {
@@ -500,8 +561,9 @@ impl<O: Copy + PartialEq> TrimSrfCache<O> {
     ///
     /// # Errors
     ///
-    /// `SM_ERR_NULL_POINTER` when the surface has no face; those of the face
-    /// classification; [`SolidError::Unported`] for its unported callees.
+    /// Those of the face classification; [`SolidError::Unported`] for its unported
+    /// callees. A surface with no face keeps every point (upstream:
+    /// `SM_ERR_NULL_POINTER` before the tree is built, kept after it).
     pub fn point_test(
         &self,
         k: &Kernel,
@@ -556,9 +618,11 @@ impl<O: Copy + PartialEq> TrimSrfCache<O> {
         Ok(())
     }
 
+    /// The state of a cache whose tree holds no trims (upstream also turns point
+    /// testing off here; the port leaves it alone: whether to test is asked of the
+    /// face, see [`SurfaceCache::point_test_enabled`]).
     fn set_standalone_flags(&mut self) {
         self.base.process_boundary_curves = true;
-        self.base.point_test_enabled = false;
         self.base.have_t_surface_cache = false;
     }
 
@@ -602,9 +666,9 @@ impl<O: Copy + PartialEq> TrimSrfCache<O> {
         _uv_point: Point2,
         _src_zone_tol_3d: f64,
     ) -> Result<(i32, Option<O>)> {
-        self.base
-            .face()?
-            .ok_or(SolidError::null_pointer(OP_CLASSIFY))?;
+        self.base.face()?.ok_or_else(|| {
+            SolidError::surface(OP_CLASSIFY, SurfaceFailure::TrimmedCacheHasNoFace)
+        })?;
         Err(SolidError::unported(
             "prepared face classifier for bound trim",
             "query.face_p2",
@@ -630,6 +694,11 @@ impl<O: Copy + PartialEq> TrimSrfCache<O> {
         }
 
         self.check_face_binding(face.face())?;
+
+        // a face without loop uses has no trim boundaries: every point is kept
+        if !face.has_loopuses()? {
+            return Ok((true, None));
+        }
 
         // classify point (with optional tolerance) against face
         let src_zone_tol_3d = match opt_zone_tol_3d {
@@ -771,7 +840,7 @@ impl<O: Copy + PartialEq> TrimSrfCache<O> {
         let editing_face = match face {
             None => None,
             Some(f) => {
-                if f.brep_editing_enabled()? {
+                if f.brep_editing_enabled()? && !f.implants_while_editing() {
                     None
                 } else {
                     Some(f)
@@ -860,7 +929,11 @@ impl<O: Copy + PartialEq> TrimSrfCache<O> {
             Some(d) => d,
             None => self.base.surface().natural_uv_domain_with_nurb(k)?,
         };
-        let domain = surface_domain.intersect(&face_domain)?;
+        // SER: disjoint domains (a face domain no edge use grew) are the status
+        // SM_ERR_INVALID_INPUT, a failed build the cache factory falls back from
+        let domain = surface_domain
+            .intersect(&face_domain)
+            .map_err(|_| SolidError::surface(OP_BUILD, SurfaceFailure::DisjointFaceDomain))?;
         self.base.set_uv_domain(domain);
 
         // When the surface has UVTrimCurves
@@ -869,9 +942,9 @@ impl<O: Copy + PartialEq> TrimSrfCache<O> {
             self.set_standalone_flags();
             Ok(false)
         } else {
-            // mark state to run Solvers for TrimSurfaces
+            // mark state to run Solvers for TrimSurfaces (point testing is not set
+            // here: the face's loop uses decide it when a point is tested)
             self.base.process_boundary_curves = false;
-            self.base.point_test_enabled = true;
             self.base.have_t_surface_cache = true;
 
             // Classify every TrimSurfCache Node not on a boundary as INSIDE or OUTSIDE
@@ -949,9 +1022,11 @@ impl<O: Copy + PartialEq> TrimSrfCache<O> {
     ///
     /// # Errors
     ///
-    /// `SM_ERR_NULL_POINTER` without trim curve; those of the curve box, the curve
-    /// cache and the tree; [`SolidError::Unported`] for `FindUVNodes` and
-    /// `SubdivideNode`.
+    /// `SM_ERR_NULL_POINTER` without trim curve; [`SolidError::InvalidInput`] for a
+    /// curve box that is not finite, or with `do_subdivision` a minimum node size that
+    /// is not a positive finite number (module docs, subdivision stop); those of the
+    /// curve box, the curve cache and the tree; [`SolidError::Unported`] for
+    /// `FindUVNodes` and `SubdivideNode`.
     pub fn implant_edgeuse(
         &mut self,
         k: &Kernel,
@@ -961,7 +1036,9 @@ impl<O: Copy + PartialEq> TrimSrfCache<O> {
         opt_tree_node: Option<NodeId>,
     ) -> Result<()> {
         let geometry = EdgeuseGeometry {
-            curve: input.uv_trim_curve.ok_or(SolidError::null_pointer(OP_EU))?,
+            curve: input
+                .uv_trim_curve
+                .ok_or_else(|| SolidError::surface(OP_EU, SurfaceFailure::EdgeuseHasNoTrimCurve))?,
             owner_zone_tol_3d: input.owner_zone_tol_3d,
         };
         let index = if let Some(index) = self
@@ -1047,8 +1124,13 @@ impl<O: Copy + PartialEq> TrimSrfCache<O> {
             )?
             .normal
             .ok_or_else(|| invalid(OP_EU, "no curve box"))?;
-        let mut curve_bbox =
-            Extent2d::from_bounds(bbox.min().x, bbox.min().y, bbox.max().x, bbox.max().y);
+        let corners = [bbox.min().x, bbox.min().y, bbox.max().x, bbox.max().y];
+        // (not upstream) every size below derives from this box: see the module docs
+        if !corners.iter().all(|c| c.is_finite()) {
+            return Err(invalid(OP_EU, "trim curve box is not finite"));
+        }
+        let [x0, y0, x1, y1] = corners;
+        let mut curve_bbox = Extent2d::from_bounds(x0, y0, x1, y1);
         let expand = (1.0 + curve_bbox.size().length()) * EFF_ZERO_SQRT;
         curve_bbox.expand_absolute(expand);
 
@@ -1093,6 +1175,14 @@ impl<O: Copy + PartialEq> TrimSrfCache<O> {
         if line.is_some() {
             let line_size = curve_bbox.size().length() / 10.0;
             min_node_size_squared = max2(min_node_size_squared, line_size * line_size);
+        }
+
+        // (not upstream) the subdivision stops only below a positive finite size
+        if do_subdivision && !(min_node_size_squared.is_finite() && min_node_size_squared > 0.0) {
+            return Err(invalid(
+                OP_EU,
+                "minimum node size is not a positive finite number",
+            ));
         }
 
         // sMinSize
@@ -1275,10 +1365,15 @@ impl<O: Copy + PartialEq> TrimSrfCache<O> {
                                 Some(child),
                             )
                         } else {
-                            Err(SolidError::null_pointer(OP_EU))
+                            // an edge use handle inserted directly into the base
+                            // lists (through `base_mut`) has no implanted curve
+                            Err(SolidError::surface(
+                                OP_EU,
+                                SurfaceFailure::EdgeuseHasNoTrimCurve,
+                            ))
                         };
                         if let Err(e) = r {
-                            if e.is_unported() {
+                            if e.is_unported_or_cancelled() {
                                 return Err(e);
                             }
                         }
@@ -1301,7 +1396,7 @@ impl<O: Copy + PartialEq> TrimSrfCache<O> {
                         // The native caller ignores ordinary implantation errors.
                         let embed = match poly_edge_in_domain(k, &geometry.input(pe), domain) {
                             Ok(embed) => embed,
-                            Err(e) if e.is_unported() => return Err(e),
+                            Err(e) if e.is_unported_or_cancelled() => return Err(e),
                             Err(_) => continue,
                         };
                         if embed {
@@ -1709,11 +1804,19 @@ mod tests {
             (true, None)
         );
         c.base_mut().point_test_enabled = true;
-        // no face to classify against (SM_ERR_NULL_POINTER)
-        assert!(matches!(
-            c.point_test(&k, Point2::new(5.0, 5.0), None),
-            Err(SolidError::Upstream { code: 1006, .. })
-        ));
+        // no face: no trim boundaries, every point is kept (#20179). Upstream returns
+        // SM_ERR_NULL_POINTER here only before the tree is built; its build of a
+        // faceless cache turns testing off, after which the same point is kept. The
+        // answer no longer depends on whether the tree was built.
+        assert_eq!(
+            c.point_test(&k, Point2::new(5.0, 5.0), None).unwrap(),
+            (true, None)
+        );
+        c.build_tree(&k).unwrap();
+        assert_eq!(
+            c.point_test(&k, Point2::new(5.0, 5.0), None).unwrap(),
+            (true, None)
+        );
     }
 
     #[test]
@@ -1764,6 +1867,43 @@ mod tests {
                 Some(NodeId(1)),
             )
             .is_err());
+    }
+
+    /// A trim curve whose box is not finite (one evaluated on an invalid surface) is
+    /// refused before any split: its NaN minimum node size stopped no subdivision, and
+    /// the leaves at a pole split forever.
+    #[test]
+    fn non_finite_trim_curve_is_refused_before_subdividing() {
+        let k = Kernel::default();
+        let mut c = cache();
+        let mut ext = Extent2d::new();
+        let crv = line_2d([f64::NAN, 0.3], [0.4, 0.7]);
+        let refused = c.implant_edgeuse(
+            &k,
+            EdgeuseInput {
+                edgeuse: 7,
+                uv_trim_curve: Some(crv),
+                owner_zone_tol_3d: None,
+            },
+            true,
+            &mut ext,
+            None,
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(SolidError::InvalidInput {
+                    reason: "trim curve box is not finite",
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(c.base().tree().map(|t| t.nodes().len()), Some(3));
+        for node in 0..3 {
+            assert!(c.base().aux(NodeId(node)).unwrap().edgeuse_list.is_empty());
+        }
+        assert!(ext.is_init());
     }
 
     #[test]
@@ -1933,6 +2073,10 @@ mod tests {
     impl FaceQueries<i64> for Outside {
         fn face_zone_tol_3d(&self, _face: i64) -> Result<f64> {
             Ok(2.5e-4)
+        }
+
+        fn face_has_loopuses(&self, _face: i64) -> Result<bool> {
+            Ok(true)
         }
 
         fn face_point_classify(
@@ -2168,7 +2312,11 @@ mod tests {
         base.get_tree(&k).unwrap();
         assert!(base.is_trimmed());
         assert!(base.process_boundary_curves);
-        assert!(!base.point_test_enabled);
+        // no build writes the point-test bit (#20179); a cache with no face keeps
+        // every point, in and out of its domain
+        assert!(base.point_test_enabled);
+        assert!(base.point_test(Point2::new(0.5, 0.5)).unwrap());
+        assert!(base.point_test(Point2::new(2.0, 2.0)).unwrap());
         assert!(!base.have_t_surface_cache);
         assert_eq!(base.face_containment_done, FaceContainment::NotDone);
     }

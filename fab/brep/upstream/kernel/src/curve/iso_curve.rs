@@ -20,6 +20,9 @@
 //! | [`IsoCurve::is_kind_of`]               | `SmIsoCurve::IsKindOf`                         |
 //!
 //! Deviations:
+//! - Continuity is inherited along the varying surface coordinate, matching the
+//!   evaluator and knot list, rather than the fixed iso coordinate the C++
+//!   passes (WR-761).
 //! - **Surface.** The borrowed C++ surface is an owned, boxed [`Surface`] copy.
 //!   [`IsoCurve::new`] retains the B-spline constructor; [`IsoCurve::from_surface`]
 //!   also supports the other concrete surface kinds through the same virtual dispatch.
@@ -44,10 +47,12 @@
 //!   allocation-only `SmContext` arguments are omitted. Evaluation and continuity
 //!   queries retain the caller's Kernel through the concrete surface dispatch;
 //!   `CalculateContinuities`' unused angle tolerance is omitted.
-//! - **`CreateUVIsoLine`** keeps upstream's branches: a constant-`u` curve gets a line
-//!   at `x = iso` along `(0, 1, 0)` over the *u* interval of the domain; the second
-//!   branch repeats the `SM_SP_U` test, so every other parameter type is
-//!   `SM_ERR_INVALID_INPUT` ([`SolidError::InvalidInput`]).
+//! - **`CreateUVIsoLine`** builds both directions over the varying coordinate's
+//!   interval from a zero varying origin: `UV(t) = (iso, t, 0)` for constant `u`,
+//!   `UV(t) = (t, iso, 0)` for constant `v` (WR-30). Upstream gives a constant-`u` curve
+//!   a line at `x = iso` along `(0, 1, 0)` over the *u* interval of the domain, from the
+//!   domain's minimum v, and its second branch repeats the `SM_SP_U` test, so every other
+//!   parameter type is `SM_ERR_INVALID_INPUT`.
 //! - **`ReadFromDB`** always builds a new curve (the "fill the curve passed in" branch
 //!   and its `IsKindOf` check have no counterpart; the type and dimension arguments are
 //!   unused upstream and dropped). It reads the iso data and the surface type, then
@@ -253,8 +258,7 @@ impl IsoCurve {
     ///
     /// # Errors
     ///
-    /// [`SolidError::InvalidInput`] unless the curve is constant `u` (upstream tests
-    /// `SM_SP_U` twice).
+    /// [`SolidError::InvalidInput`] for a parameter type other than `u` and `v`.
     pub fn create_uv_iso_line(&self) -> Result<Curve> {
         self.uv_iso_line(self.surface.natural_uv_domain_if_built())
     }
@@ -270,15 +274,24 @@ impl IsoCurve {
         self.uv_iso_line(self.surface.natural_uv_domain_with_nurb(k)?)
     }
 
-    /// The body of `CreateUVIsoLine` over the surface's natural `domain`.
+    /// The body of `CreateUVIsoLine` over the surface's natural `domain` (WR-30).
     fn uv_iso_line(&self, domain: Extent2d) -> Result<Curve> {
-        // locals
-        let mut line_point = Point3::new(domain.min().x, domain.min().y, 0.0);
-        let (line_ivl, line_unit_vec) = if self.surf_param == SurfParamType::U {
-            line_point.x = self.iso_parameter;
-            (domain.u_interval(), Vec3::new(0.0, 1.0, 0.0))
+        let (line_point, line_ivl, line_unit_vec) = if self.surf_param == SurfParamType::U {
+            // UV(t) = (iso, t, 0): the varying coordinate starts at zero. The line is
+            // P + s*V, so the domain minimum must not be added twice.
+            (
+                Point3::new(self.iso_parameter, 0.0, 0.0),
+                domain.v_interval(),
+                Vec3::new(0.0, 1.0, 0.0),
+            )
+        } else if self.surf_param == SurfParamType::V {
+            // UV(t) = (t, iso, 0), likewise from a zero varying origin.
+            (
+                Point3::new(0.0, self.iso_parameter, 0.0),
+                domain.u_interval(),
+                Vec3::new(1.0, 0.0, 0.0),
+            )
         } else {
-            // the `else if` branch repeats the SM_SP_U test and is never taken
             return Err(SolidError::InvalidInput {
                 operation: OP_UV_ISO_LINE,
                 reason: "Bad value for m_eSurfParam",
@@ -290,7 +303,7 @@ impl IsoCurve {
     }
 
     /// The minimum continuity and the continuities at the knots, inherited from the
-    /// surface in the iso direction (`CalculateContinuities`).
+    /// surface along the varying coordinate (`CalculateContinuities`).
     ///
     /// # Errors
     ///
@@ -299,8 +312,7 @@ impl IsoCurve {
         &self,
         k: &Kernel,
     ) -> Result<(ContinuityType, Vec<ContinuityType>)> {
-        // pass the call along
-        surface_calculate_continuities(k, &self.surface, self.surf_param)
+        surface_calculate_continuities(k, &self.surface, self.varying_direction())
     }
 
     /// The natural interval: the surface domain across the iso direction
@@ -313,6 +325,15 @@ impl IsoCurve {
             return Extent1d::from_min_max(uv_domain.min().y, uv_domain.max().y);
         }
         Extent1d::from_min_max(uv_domain.min().x, uv_domain.max().x)
+    }
+
+    /// The surface coordinate varied by the evaluator and indexed by curve knots.
+    fn varying_direction(&self) -> SurfParamType {
+        if self.surf_param == SurfParamType::U {
+            SurfParamType::V
+        } else {
+            SurfParamType::U
+        }
     }
 
     /// The surface parameter of curve parameter `t`.
@@ -380,12 +401,7 @@ impl IsoCurve {
     ///
     /// Those of [`BSplineSurface::knots`] (`SM_ERR` without NURB).
     pub fn knots(&self, interval: Option<&Extent1d>) -> Result<(Vec<f64>, Vec<usize>)> {
-        let sp = if self.surf_param == SurfParamType::U {
-            SurfParamType::V
-        } else {
-            SurfParamType::U
-        };
-        self.surface.knots(sp, interval)
+        self.surface.knots(self.varying_direction(), interval)
     }
 
     /// Reads an iso curve from `db` (`ReadFromDB`): direction, iso parameter and flag,
@@ -535,6 +551,83 @@ mod tests {
         BSplineSurface::from_nurb(s, false)
     }
 
+    /// The same bilinear net as [`patch`] over `[u_min, u_min + 2] x [v_min, v_min + 4]`.
+    fn patch_with_domain(u_min: f64, v_min: f64) -> BSplineSurface {
+        let net = vec![
+            vec![
+                CPoint::new(0.0, 0.0, 0.0, 1.0),
+                CPoint::new(0.0, 1.0, 0.0, 1.0),
+            ],
+            vec![
+                CPoint::new(1.0, 0.0, 1.0, 1.0),
+                CPoint::new(1.0, 1.0, 2.0, 1.0),
+            ],
+        ];
+        let s = Surface::new(
+            net,
+            1,
+            1,
+            vec![u_min, u_min, u_min + 2.0, u_min + 2.0],
+            vec![v_min, v_min, v_min + 4.0, v_min + 4.0],
+        )
+        .expect("surface");
+        BSplineSurface::from_nurb(s, false)
+    }
+
+    /// The same bilinear net as [`patch`] over `[0, 2] x [0, 2]` (equal u and v
+    /// intervals, zero minima: the ordinary success control).
+    fn equal_domain_patch() -> BSplineSurface {
+        let net = vec![
+            vec![
+                CPoint::new(0.0, 0.0, 0.0, 1.0),
+                CPoint::new(0.0, 1.0, 0.0, 1.0),
+            ],
+            vec![
+                CPoint::new(1.0, 0.0, 1.0, 1.0),
+                CPoint::new(1.0, 1.0, 2.0, 1.0),
+            ],
+        ];
+        let s = Surface::new(
+            net,
+            1,
+            1,
+            vec![0.0, 0.0, 2.0, 2.0],
+            vec![0.0, 0.0, 2.0, 2.0],
+        )
+        .expect("surface");
+        BSplineSurface::from_nurb(s, false)
+    }
+
+    fn assert_point(actual: Point3, expected: Point3) {
+        let d = actual.distance(expected);
+        assert!(d < 1e-12, "point {actual:?} != {expected:?} (distance {d})");
+    }
+
+    /// Checks a UV line against its independent UV map (`uv_of`), its lift
+    /// through the iso curve's own surface accessor and the same iso curve evaluated
+    /// at the same parameter, and an independent bilinear formula (`lift_of`).
+    fn assert_uv_line(
+        line: &Curve,
+        k: &Kernel,
+        iso: &IsoCurve,
+        samples: &[f64],
+        uv_of: impl Fn(f64) -> Point3,
+        lift_of: impl Fn(f64) -> Point3,
+    ) {
+        assert_eq!(line.dim(), 2);
+        assert_eq!(line.natural_interval(), iso.natural_interval());
+        for &t in samples {
+            let p = line.evaluate_point(k, t).expect("uv line point");
+            assert_point(p, uv_of(t));
+            let lifted = iso
+                .surface()
+                .evaluate_point(k, Point2::new(p.x, p.y))
+                .expect("lifted surface point");
+            assert_point(lifted, iso.evaluate_point(k, t).expect("iso point"));
+            assert_point(lifted, lift_of(t));
+        }
+    }
+
     #[test]
     fn clamps_to_domain() {
         let c = IsoCurve::new(patch(), SurfParamType::U, 5.0, true, true);
@@ -575,10 +668,6 @@ mod tests {
     fn evaluation_and_errors() {
         let k = &Kernel::default();
         let a = IsoCurve::new(patch(), SurfParamType::V, 1.0, false, true);
-        assert!(matches!(
-            a.create_uv_iso_line(),
-            Err(SolidError::InvalidInput { .. })
-        ));
         // constant v = 1 on the patch: x = u / 2, y = (v + 1) / 4
         let p = a.evaluate_point(k, 0.5).expect("point");
         assert!((p.y - 0.5).abs() < 1e-12);
@@ -586,5 +675,104 @@ mod tests {
         assert_eq!(d.len(), 2);
         assert!(d[0].distance(p) < 1e-12);
         assert!((d[1].x - 0.5).abs() < 1e-12 && d[1].y.abs() < 1e-12);
+    }
+
+    #[test]
+    fn uv_iso_line_uses_each_varying_interval_and_origin() {
+        let k = &Kernel::default();
+        let iso = 1.0;
+
+        // Constant u: UV(t) = (iso, t, 0) over the v interval.
+        let u = IsoCurve::new(patch(), SurfParamType::U, iso, false, true);
+        let line = u.create_uv_iso_line_with_nurb(k).expect("U line");
+        assert_uv_line(
+            &line,
+            k,
+            &u,
+            &[-1.0, 0.5, 3.0],
+            |t| Point3::new(iso, t, 0.0),
+            // Bilinear patch: x = u/2, y = (v + 1)/4, z = u (v + 5)/8.
+            |t| Point3::new(iso / 2.0, (t + 1.0) / 4.0, iso * (t + 5.0) / 8.0),
+        );
+
+        // Constant v: UV(t) = (t, iso, 0) over the u interval.
+        let v = IsoCurve::new(patch(), SurfParamType::V, iso, false, true);
+        let line = v.create_uv_iso_line_with_nurb(k).expect("V line");
+        assert_uv_line(
+            &line,
+            k,
+            &v,
+            &[0.0, 0.5, 2.0],
+            |t| Point3::new(t, iso, 0.0),
+            |t| Point3::new(t / 2.0, (iso + 1.0) / 4.0, t * (iso + 5.0) / 8.0),
+        );
+    }
+
+    #[test]
+    fn uv_iso_line_equal_domain_control() {
+        let k = &Kernel::default();
+        let iso = 1.0;
+        let u = IsoCurve::new(equal_domain_patch(), SurfParamType::U, iso, false, true);
+        let on = u.create_uv_iso_line_with_nurb(k).expect("U line");
+        assert_uv_line(
+            &on,
+            k,
+            &u,
+            &[0.0, 0.5, 2.0],
+            |t| Point3::new(iso, t, 0.0),
+            // x = u/2, y = v/2, z = u (v + 2)/4.
+            |t| Point3::new(iso / 2.0, t / 2.0, iso * (t + 2.0) / 4.0),
+        );
+        let v = IsoCurve::new(equal_domain_patch(), SurfParamType::V, iso, false, true);
+        let line = v.create_uv_iso_line_with_nurb(k).expect("V line");
+        assert_uv_line(
+            &line,
+            k,
+            &v,
+            &[0.0, 0.5, 2.0],
+            |t| Point3::new(t, iso, 0.0),
+            |t| Point3::new(t / 2.0, iso / 2.0, t * (iso + 2.0) / 4.0),
+        );
+    }
+
+    #[test]
+    fn uv_iso_line_opt_in_translated_domain_origin() {
+        let k = &Kernel::default();
+        let (u_min, v_min) = (1.0, 2.0);
+        let (iso_u, iso_v) = (1.5, 3.0);
+        let patch = || patch_with_domain(u_min, v_min);
+
+        // Constant u over the translated v interval: the varying origin is zero, not
+        // the domain minimum (which P + s*V would add to every returned UV).
+        let u = IsoCurve::new(patch(), SurfParamType::U, iso_u, false, true);
+        let line = u.create_uv_iso_line_with_nurb(k).expect("U line");
+        assert_uv_line(
+            &line,
+            k,
+            &u,
+            &[v_min, 4.0, v_min + 4.0],
+            |t| Point3::new(iso_u, t, 0.0),
+            |t| {
+                let lu = iso_u - u_min;
+                let lv = t - v_min;
+                Point3::new(lu / 2.0, lv / 4.0, (lu / 2.0) * (1.0 + lv / 4.0))
+            },
+        );
+
+        // Constant v over the translated u interval, likewise from a zero origin.
+        let v = IsoCurve::new(patch(), SurfParamType::V, iso_v, false, true);
+        let line = v.create_uv_iso_line_with_nurb(k).expect("V line");
+        assert_uv_line(
+            &line,
+            k,
+            &v,
+            &[u_min, 2.0, u_min + 2.0],
+            |t| Point3::new(t, iso_v, 0.0),
+            |t| {
+                let lu = t - u_min;
+                let lv = iso_v - v_min;
+                Point3::new(lu / 2.0, lv / 4.0, (lu / 2.0) * (1.0 + lv / 4.0))
+            },
+        );
     }
 }

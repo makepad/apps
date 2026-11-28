@@ -9,6 +9,7 @@
 //! | [`Arc`]                            | the `C, X, Y, r, as, ae` arguments |
 //! | [`EllipseArc`]                     | the `C, X, Y, r1, r2, as, ae` arguments |
 //! | [`quadratic_arc_tol`]              | `N_CreateQuadraticArcTol`         |
+//! | [`quadratic_arc_min_arcs`]         | not upstream (WR-711)             |
 //! | [`quartic_arc_tol`]                | `N_CreateQuarticArcTol`           |
 //! | [`quintic_arc_tol`]                | `N_CreateQuinticArcTol`           |
 //! | [`circ_arc`], [`DEFAULT_ANGLE_TOL`] | `N_CreateCircArc` (`at = 0.01`)  |
@@ -18,11 +19,14 @@
 //! | [`elliptical_arc_ang_type_tol`], [`AngleType`] | `N_CreateEllipticalArcAngTypeTol` |
 //!
 //! Deviations:
+//! - [`quadratic_arc_min_arcs`] (not upstream, WR-711) is `N_CreateQuadraticArcTol`
+//!   with a floor on its arc count; at `0` it is that function.
 //! - The output curve is returned as a new [`Curve`] (upstream fills the caller's
 //!   `NL_CURVE`, allocating it when NULL, or checks that a pre-allocated one is large
 //!   enough). The `NL_STACKS` arguments have no counterpart.
-//! - Errors are [`SolidError::Nlib`] values with the upstream `NL_*_ERR` number
-//!   instead of a flag plus the global `NL_ERROR` record.
+//! - Errors are [`NurbsFailure`]s (`NL_INP_ERR` is [`NurbsFailure::Input`],
+//!   `NL_NUM_ERR` [`NurbsFailure::Numerical`]) instead of a flag plus the global
+//!   `NL_ERROR` record.
 //! - `N_CreateQuadraticArcTol` reads the uninitialised intersection flag when
 //!   `N_IsectLineLine` fails (zero tangent or bad division); [`quadratic_arc_tol`]
 //!   fails with `NL_INP_ERR` there, which is what upstream does when that flag
@@ -37,7 +41,9 @@
 //! - `N_CrvClosestPt` and the closure tests read the global `NL_MTOL`; the port uses
 //!   [`MODEL_TOL`].
 
-use crate::error::{NlibCode, Result, SolidError};
+use crate::error::nurbs::NurbsFailure;
+use crate::error::{Result, SolidError};
+use crate::math::det;
 use crate::math::Vec3;
 use crate::nurbs::basis_basic::PTOL;
 use crate::nurbs::crv_basic::{conic_data, ConicType, Curve, CONIC_MAX_TURNS};
@@ -50,10 +56,6 @@ use crate::nurbs::math::{combine2_pts, translate_sum2_pts, CPoint, MODEL_TOL};
 /// `at = 0.01` in `N_CreateCircArc`), and by [`elliptical_arc_tol`] for a
 /// non-positive tolerance.
 pub const DEFAULT_ANGLE_TOL: f64 = 0.01;
-
-fn nlib(operation: &'static str, code: NlibCode) -> SolidError {
-    SolidError::Nlib { operation, code }
-}
 
 fn invalid(operation: &'static str, reason: &'static str) -> SolidError {
     SolidError::InvalidInput { operation, reason }
@@ -121,8 +123,8 @@ pub enum AngleType {
 
 /// Point `C + r cos(a) X + r sin(a) Y` and unit tangent `-sin(a) X + cos(a) Y`.
 fn circle_pt(c: Vec3, x: Vec3, y: Vec3, r: f64, angle: f64) -> (Vec3, Vec3) {
-    let cosa = angle.cos();
-    let sina = angle.sin();
+    let cosa = det::cos(angle);
+    let sina = det::sin(angle);
     let alf = r * cosa;
     let bet = r * sina;
     (
@@ -140,6 +142,18 @@ fn circle_pt(c: Vec3, x: Vec3, y: Vec3, r: f64, angle: f64) -> (Vec3, Vec3) {
 /// `InvalidInput` for non-finite or huge angles; `NL_GEO_ERR` for a zero axis;
 /// `NL_INP_ERR` when a segment's tangent lines cannot be intersected.
 pub fn quadratic_arc_tol(arc: &Arc, at: f64) -> Result<Curve> {
+    quadratic_arc_min_arcs(arc, at, 0)
+}
+
+/// [`quadratic_arc_tol`] split into at least `min_arcs` equal arcs (at most four):
+/// the arc count [`quadratic_arc_tol`] picks from the sweep when that is more. Not
+/// upstream: the sections of an exact circular fillet take the same count along the
+/// rails (WR-711).
+///
+/// # Errors
+///
+/// As [`quadratic_arc_tol`].
+pub fn quadratic_arc_min_arcs(arc: &Arc, at: f64, min_arcs: usize) -> Result<Curve> {
     const OP: &str = "nurbs::crv_common::quadratic_arc_tol";
     let c = arc.center;
     let (r, as_deg) = (arc.r, arc.start);
@@ -147,9 +161,9 @@ pub fn quadratic_arc_tol(arc: &Arc, at: f64) -> Result<Curve> {
 
     // Get number of arcs.
     let cd = conic_data(ConicType::Quadratic, as_deg, arc.end)?;
-    let (ae, n, m) = (cd.ae, cd.n, cd.m);
-
-    let narcs = n / 2;
+    let narcs = (cd.n / 2).max(min_arcs.min(4));
+    let (ae, n) = (cd.ae, 2 * narcs);
+    let m = n + cd.p + 1;
     let theta = ae - as_deg;
     let dtheta = theta / narcs as f64;
 
@@ -161,7 +175,7 @@ pub fn quadratic_arc_tol(arc: &Arc, at: f64) -> Result<Curve> {
     let (y, _) = normalize(arc.y)?;
 
     let mut angle = (PI * dtheta) / 360.0;
-    let w1 = angle.cos();
+    let w1 = det::cos(angle);
 
     angle = (PI * as_deg) / 180.0;
     let (mut p0, mut t0) = circle_pt(c, x, y, r, angle);
@@ -186,7 +200,7 @@ pub fn quadratic_arc_tol(arc: &Arc, at: f64) -> Result<Curve> {
                 let _dist = dist_pt_pt(p0, p2);
                 combine2_pts(0.5, p0, 0.5, p2)
             }
-            Err(_) => return Err(nlib(OP, NlibCode::Input)),
+            Err(_) => return Err(SolidError::nurbs(OP, NurbsFailure::Input)),
         };
 
         *slot(&mut pw, j + 1, OP)? = CPoint::weighted(p1, w1);
@@ -254,9 +268,9 @@ pub fn quartic_arc_tol(arc: &Arc, at: f64) -> Result<Curve> {
 
     let dtheta = theta / narcs as f64;
     let mut angle = (PI * dtheta) / 180.0;
-    let x2 = angle.cos();
+    let x2 = det::cos(angle);
     angle *= 0.5;
-    let w1 = angle.cos();
+    let w1 = det::cos(angle);
 
     angle = (PI * as_deg) / 180.0;
     let (mut p0, mut t0) = circle_pt(c, x, y, r, angle);
@@ -273,7 +287,7 @@ pub fn quartic_arc_tol(arc: &Arc, at: f64) -> Result<Curve> {
         } else {
             (0.75 * PI * dtheta) / 180.0
         };
-        let cs = ang.cos();
+        let cs = det::cos(ang);
 
         let a = 1.0 - 2.0 * w1 + x2 - 2.0 * cs * (1.0 - w1); // quadratic equation
         let b = 2.0 * (w1 - 1.0) + 2.0 * cs * (1.0 - w1);
@@ -281,7 +295,7 @@ pub fn quartic_arc_tol(arc: &Arc, at: f64) -> Result<Curve> {
 
         let disc = b * b - 4.0 * a * cc;
         if disc < 0.0 {
-            return Err(nlib(OP, NlibCode::Numerical));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Numerical));
         }
         let disc = disc.sqrt(); // solve quadratic equation
         let v1 = (-b + disc) / (2.0 * a);
@@ -292,7 +306,7 @@ pub fn quartic_arc_tol(arc: &Arc, at: f64) -> Result<Curve> {
         } else if (0.0..=1.0).contains(&v2) {
             v2
         } else {
-            return Err(nlib(OP, NlibCode::Numerical));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Numerical));
         };
         if i == 0 {
             u1 = root;
@@ -325,7 +339,7 @@ pub fn quartic_arc_tol(arc: &Arc, at: f64) -> Result<Curve> {
         let l2 = LineSeg::new(p2, t2, false);
 
         let Some(hit) = isect_line_line(l0, l2)? else {
-            return Err(nlib(OP, NlibCode::Input));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Input));
         };
 
         let qw = CPoint::weighted(hit.p, w1);
@@ -407,14 +421,14 @@ pub fn quintic_arc_tol(arc: &Arc, at: f64) -> Result<Curve> {
     let (y, _) = normalize(arc.y)?;
 
     let mut angle = (PI * as_deg) / 180.0;
-    let ps = translate_sum2_pts(c, r * angle.cos(), x, r * angle.sin(), y);
+    let ps = translate_sum2_pts(c, r * det::cos(angle), x, r * det::sin(angle), y);
 
     angle = (PI * ae) / 180.0;
-    let pe = translate_sum2_pts(c, r * angle.cos(), x, r * angle.sin(), y);
+    let pe = translate_sum2_pts(c, r * det::cos(angle), x, r * det::sin(angle), y);
 
     angle = (PI * am) / 180.0;
-    let cosa = angle.cos();
-    let sina = angle.sin();
+    let cosa = det::cos(angle);
+    let sina = det::sin(angle);
     let alf = r * cosa;
     let bet = r * sina;
 
@@ -585,14 +599,14 @@ pub fn elliptical_arc_ang_type_tol(
         let (alf, bet) = match atp {
             AngleType::Circle => {
                 // Point on circle at angle, projected to the ellipse.
-                (r1 * angle.cos(), r2 * angle.sin())
+                (r1 * det::cos(angle), r2 * det::sin(angle))
             }
             AngleType::Ellipse => {
                 // Point on the ellipse at polar angle: with e = tan(angle),
                 // x = a*b/sqrt(a*a*e*e + b*b) and y = b/a * sqrt(a*a - x*x).
-                let e = angle.tan();
+                let e = det::tan(angle);
                 let mut alf = r1 * r2 / (r2 * r2 + r1 * r1 * e * e).sqrt();
-                if angle.cos() < 0.0 {
+                if det::cos(angle) < 0.0 {
                     alf = -alf;
                 }
                 let mut bet = r1 * r1 - alf * alf;
@@ -601,7 +615,7 @@ pub fn elliptical_arc_ang_type_tol(
                 } else {
                     bet = (r2 / r1) * bet.sqrt();
                 }
-                if angle.sin() < 0.0 {
+                if det::sin(angle) < 0.0 {
                     bet = -bet;
                 }
                 (alf, bet)
@@ -609,7 +623,7 @@ pub fn elliptical_arc_ang_type_tol(
         };
 
         // Polar angle of the circle point.
-        let tmp_angle = (bet / r2).atan2(alf / r1);
+        let tmp_angle = det::atan2(bet / r2, alf / r1);
         let mut ap = (180.0 * tmp_angle) / PI;
 
         // Angle snapping up to NL_PTOL degrees.
@@ -643,7 +657,7 @@ pub fn elliptical_arc_ang_type_tol(
         let q = match project_pt_line(lx, p)? {
             LinePlaneIsect::Hit { p: q, .. } => q,
             LinePlaneIsect::Parallel | LinePlaneIsect::OutOfBounds { .. } => {
-                return Err(nlib(OP, NlibCode::Input));
+                return Err(SolidError::nurbs(OP, NurbsFailure::Input));
             }
         };
         let p = combine2_pts(fac, p, omf, q);
@@ -734,13 +748,41 @@ mod tests {
         let mut arc = unit_arc(0.0, 90.0);
         arc.x = Vec3::new(0.0, 0.0, 0.0);
         let e = quadratic_arc_tol(&arc, 0.01).unwrap_err();
-        assert!(matches!(
-            e,
-            SolidError::Nlib {
-                code: NlibCode::Geometry,
-                ..
-            }
-        ));
+        assert!(matches!(e.nurbs_failure(), Some(NurbsFailure::Geometry)));
+    }
+
+    /// The failure a routine reports when the input defeats it (the goldens'
+    /// `cov_quartic_circ_arc_tiny_sweep_*` cases): a typed NURBS failure, with the
+    /// failing routine's path, kind `Failed`, the `SM_ERR` its `Sm*` callers report and
+    /// the `NL_INP_ERR` number the C++ stores.
+    #[test]
+    fn parallel_tangents_fail_as_typed_input_failures() {
+        use crate::error::{nurbs::nlib_number, ErrorKind, SM_ERR};
+        let arc = Arc {
+            center: Vec3::new(1.0, 2.0, 3.0),
+            x: Vec3::new(1.0, 0.0, 0.0),
+            y: Vec3::new(0.0, 1.0, 0.0),
+            r: 10.0,
+            start: 0.0,
+            end: 1.2e-6,
+        };
+        for e in [
+            quartic_arc_tol(&arc, DEFAULT_ANGLE_TOL).unwrap_err(),
+            circ_arc(&arc, ConicType::Quartic).unwrap_err(),
+        ] {
+            assert_eq!(e.nurbs_failure(), Some(&NurbsFailure::Input), "{e}");
+            assert!(e.is_nurbs_failure());
+            assert_eq!(e.operation(), "nurbs::crv_common::quartic_arc_tol");
+            assert_eq!(e.kind(), ErrorKind::Failed);
+            assert!(!e.is_port_failure());
+            assert!(e.is_status_answer());
+            assert_eq!(e.sm_status(), Some(SM_ERR));
+            assert_eq!(nlib_number(&e), Some(14));
+            assert_eq!(
+                e.to_string(),
+                "nurbs::crv_common::quartic_arc_tol: the input data is not valid"
+            );
+        }
     }
 
     #[test]
@@ -760,7 +802,7 @@ mod tests {
                 let (u0, u1) = (cur.knots()[0], *cur.knots().last().unwrap());
                 for k in 0..=10 {
                     let p = point(&cur, u0 + (u1 - u0) * f64::from(k) / 10.0);
-                    let v = (p.x / 3.0).powi(2) + (p.y / 1.5).powi(2);
+                    let v = det::powi(p.x / 3.0, 2) + det::powi(p.y / 1.5, 2);
                     assert!((v - 1.0).abs() < 1e-9, "{atp:?} {ctp:?} {v}");
                 }
             }

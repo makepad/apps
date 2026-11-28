@@ -65,8 +65,9 @@
 //!   ([`SurfaceCache::get_tree`], which builds the tree when needed) is made where the
 //!   tree is used (the global solve of [`find_interior_curves_base`]).
 //!   `SmCacheCheckOutIn` has no counterpart (the cache
-//!   is borrowed for the whole trace), the `SmTemporaryChangeValue`s of
-//!   `DoTrace` are restored on every exit.
+//!   is borrowed for the whole trace), and the cache flags `DoTrace` changes with
+//!   `SmTemporaryChangeValue` are read by none of its steps, so the cache keeps its
+//!   own.
 //! - **Global solver.** The tracer's `SmGlobalSolver` base is made for the solve in
 //!   [`find_interior_curves_base`] with the members the constructor sets (one tree,
 //!   two variables, `SM_SO_INTERSECT`/`SM_SR_NODES` replaced by `SolveIt`'s
@@ -98,6 +99,7 @@ use crate::curve::curve::p3::PointSolveOptions;
 use crate::curve::curve::p5::make_curve_cache;
 use crate::curve::curve::Curve;
 use crate::curve::hermite_curve::HermiteCurve;
+use crate::error::intersect::IntersectFailure;
 use crate::error::{ignore_status, ignored, Result, SolidError};
 use crate::geom::extent1d::Extent1d;
 use crate::geom::extent2d::Extent2d;
@@ -479,10 +481,14 @@ impl<'s> SurfaceTracer<'s> {
     ///
     /// # Errors
     ///
-    /// `SM_ERR_NULL_POINTER` for an empty curve.
+    /// [`IntersectFailure::NoCurveToReverse`] (`SM_ERR_NULL_POINTER`) for an empty curve:
+    /// the kernel's own callers reverse only a curve with points.
     pub fn reverse_curve_direction(&mut self) -> Result<()> {
         if self.curve_points.is_empty() {
-            return Err(SolidError::null_pointer(OP_REVERSE));
+            return Err(SolidError::intersect(
+                OP_REVERSE,
+                IntersectFailure::NoCurveToReverse,
+            ));
         }
 
         // Grab points in m_vCurvePoints list into an array, and empty the list.
@@ -593,7 +599,10 @@ pub trait SurfaceTrace<'s> {
         step_size: Option<f64>,
     ) -> Result<()> {
         let _ = (k, uv, pnt, prev, step_size);
-        Err(SolidError::sm_err(OP_HOOK))
+        Err(SolidError::intersect(
+            OP_HOOK,
+            IntersectFailure::TracerHasNoPointValues,
+        ))
     }
 
     /// `LocalPointSolve`: refines `guess` to a point of the traced curve near
@@ -610,7 +619,10 @@ pub trait SurfaceTrace<'s> {
         next: &mut TracePoint,
     ) -> Result<Option<Point2>> {
         let _ = (k, curr, guess, next);
-        Err(SolidError::sm_err(OP_HOOK))
+        Err(SolidError::intersect(
+            OP_HOOK,
+            IntersectFailure::TracerHasNoPointSolve,
+        ))
     }
 
     /// `FindSolutionsOnBoundaryCurve`: approximate start points along the boundary
@@ -630,7 +642,10 @@ pub trait SurfaceTrace<'s> {
         param: SurfParamType,
     ) -> Result<SolutionArray<BoundaryCurve>> {
         let _ = (k, boundary, interval, side, param);
-        Err(SolidError::sm_err(OP_HOOK))
+        Err(SolidError::intersect(
+            OP_HOOK,
+            IntersectFailure::TracerHasNoBoundaryDrop,
+        ))
     }
 
     /// `DoesPointLieOnCurve`: whether `uv` lies on the traced curve, refining it
@@ -1190,7 +1205,7 @@ pub fn trace_curve_base<'s, T: SurfaceTrace<'s> + ?Sized>(
         *t.tracer_mut().point_mut(start)? = sp;
         match r {
             Ok(()) => {}
-            Err(e) if e.is_unported() => return Err(e),
+            Err(e) if e.is_unported_or_cancelled() => return Err(e),
             Err(_) => return Ok(()), // Bad start point just go to next one
         }
 
@@ -1281,7 +1296,7 @@ pub fn trace_curve_base<'s, T: SurfaceTrace<'s> + ?Sized>(
             // Given current TracePnt and new UVStepSize, compute and classify NextPoint
             match t.compute_next_point(k, tsp, step_size, &mut next_pnt) {
                 Ok(r) => np = r,
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 Err(_) => {
                     // the outputs initialised before the failure stay set
                     np = NextPoint {
@@ -1739,7 +1754,12 @@ where
                 } else if uv_curves.len() == 1 {
                     out.uv_curves.extend(uv_curves);
                 } else {
-                    return Err(SolidError::sm_err(OP_BOUNDARY));
+                    return Err(SolidError::intersect(
+                        OP_BOUNDARY,
+                        IntersectFailure::BoundaryDropNotOneOrTwo {
+                            found: uv_curves.len(),
+                        },
+                    ));
                 }
 
                 // set other outputs
@@ -1900,7 +1920,7 @@ where
     // Find pairs of tree nodes containing possible solutions from which StartPoints can be found
     let mut solutions = SolutionArray::new();
     {
-        let mut solver = GlobalSolver::with_tree(tree, 2);
+        let mut solver = GlobalSolver::with_tree_and_kernel(k, tree, 2);
         solver.set_solver_operation(SolverOperation::Intersect);
         solver.set_solution_requested(SolutionRequested::Nodes);
         solver.set_best_answer_so_far_sq(0.0);
@@ -1965,7 +1985,7 @@ where
             // get curve->Cache (skip unexpected curves without curve caches)
             let cc = match make_curve_cache::<()>(k, curve, None) {
                 Ok(cc) => cc,
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 Err(_) => continue,
             };
             let Some(ctree) = cc.tree() else { continue };
@@ -1996,7 +2016,7 @@ where
         // Now test start point to see if it drops to any of the existing 3D curves.
         let surf_pnt = match t.tracer().surface.evaluate_point(k, found_uv) {
             Ok(p) => p,
-            Err(e) if e.is_unported() => return Err(e),
+            Err(e) if e.is_unported_or_cancelled() => return Err(e),
             Err(_) => continue,
         };
         if t.is_point_on_curve(k, surf_pnt, &out.curves_3d)? {
@@ -2009,7 +2029,7 @@ where
         start.point_type = TracePointType::Normal;
         match t.compute_point_values(k, found_uv, &mut start, None, None) {
             Ok(()) => {}
-            Err(e) if e.is_unported() => return Err(e),
+            Err(e) if e.is_unported_or_cancelled() => return Err(e),
             Err(_) => continue,
         }
         let start_id = t.tracer_mut().new_point(start);
@@ -2018,16 +2038,23 @@ where
         t.tracer_mut().curve_trace_direction = 1.0; // Forward
         match t.trace_curve(k, start_id, &out.curves_3d) {
             Ok(()) => {}
-            Err(e) if e.is_unported() => return Err(e),
+            Err(e) if e.is_unported_or_cancelled() => return Err(e),
             Err(_) => continue,
         }
 
         // Trace the other direction if appropriate.
         let start_type = t.tracer().point(start_id)?.point_type;
         if !t.tracer().curve_is_closed && start_type != TracePointType::Singularity {
+            // A trace that starts on a found curve at a tangent point, or whose start
+            // values fail, leaves the curve empty: upstream's reversal then fails and the
+            // curve is flushed. Test for it here instead of reversing into the error.
+            if t.tracer().curve_points.is_empty() {
+                ignore_status(flush_curve(k, t.tracer_mut(), out, None))?;
+                continue;
+            }
             match t.reverse_curve_direction() {
                 Ok(()) => {}
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 Err(_) => {
                     // Note, if this failed, we want to call FlushCurve()
                     ignore_status(flush_curve(k, t.tracer_mut(), out, None))?;
@@ -2036,11 +2063,11 @@ where
             }
 
             t.tracer_mut().curve_trace_direction = -1.0;
-            let back_start = *t
-                .tracer()
-                .curve_points
-                .last()
-                .ok_or(SolidError::null_pointer(OP_REVERSE))?;
+            // the default reversal keeps every point; only an outside `SurfaceTrace`
+            // override can succeed and leave none
+            let back_start = *t.tracer().curve_points.last().ok_or_else(|| {
+                SolidError::intersect(OP_REVERSE, IntersectFailure::ReversalLeftNoPoints)
+            })?;
             ignore_status(t.trace_curve(k, back_start, &out.curves_3d))?;
             ignore_status(t.reverse_curve_direction())?;
             t.tracer_mut().curve_trace_direction = 1.0;
@@ -2052,8 +2079,8 @@ where
     Ok(())
 }
 
-/// `SmSurfaceTracer::DoTrace`: stores the optional tolerances, then (with the
-/// cache's point test off and boundary curve processing on) traces from every
+/// `SmSurfaceTracer::DoTrace`: stores the optional tolerances, then (upstream with
+/// the cache's point test off and boundary curve processing on) traces from every
 /// boundary start point ([`SurfaceTrace::find_boundary_start_points`],
 /// [`SurfaceTrace::trace_curve`], reversed when traced backwards, [`flush_curve`])
 /// and then the interior curves ([`SurfaceTrace::find_interior_curves`]).
@@ -2087,18 +2114,12 @@ where
     let domain = t.tracer().uv_domain;
     let _below_g1 = cache.surface_continuity(&domain)? as i32 <= ContinuityType::C0 as i32;
 
-    // Turn off point testing and turn on boundary curve processing.
-    let saved_point_test = cache.point_test_enabled;
-    let saved_boundary = cache.process_boundary_curves;
-    cache.point_test_enabled = false;
-    cache.process_boundary_curves = true;
-    let r = do_trace_body(t, k, cache);
-    cache.point_test_enabled = saved_point_test;
-    cache.process_boundary_curves = saved_boundary;
-    r
+    // (upstream turns off point testing and turns on boundary curve processing for
+    // the trace: none of its steps reads either, so the cache keeps its flags)
+    do_trace_body(t, k, cache)
 }
 
-/// The part of [`do_trace_base`] run with the cache flags changed.
+/// The part of [`do_trace_base`] after its tolerances and continuity check.
 fn do_trace_body<'s, T, O>(
     t: &mut T,
     k: &Kernel,
@@ -2129,7 +2150,7 @@ where
                 // output curve
                 flush_curve(k, t.tracer_mut(), &mut out, None)?;
             }
-            Err(e) if e.is_unported() => return Err(e),
+            Err(e) if e.is_unported_or_cancelled() => return Err(e),
             Err(_) => {}
         }
     }
@@ -2155,7 +2176,7 @@ pub fn tracer_surface_cache<O: Copy + PartialEq>(
 ) -> Result<SurfaceCache<O>> {
     let mut cache = surface_cache(k, t.surface, None)?;
     match cache.get_tree(k) {
-        Err(e) if e.is_unported() => Err(e),
+        Err(e) if e.is_unported_or_cancelled() => Err(e),
         _ => Ok(cache),
     }
 }
@@ -2222,7 +2243,15 @@ mod tests {
         let s = plane();
         let d = Extent2d::from_bounds(0.0, 0.0, 10.0, 10.0);
         let mut t = SurfaceTracer::new(k, &s, &d).unwrap();
-        assert!(t.reverse_curve_direction().is_err());
+        // a caller reversing an empty tracer: its own input, not a kernel defect
+        let e = t.reverse_curve_direction().unwrap_err();
+        assert_eq!(
+            e.intersect_failure(),
+            Some(&IntersectFailure::NoCurveToReverse)
+        );
+        assert_eq!(e.kind(), crate::error::ErrorKind::InvalidInput);
+        assert!(!e.is_defect());
+        assert_eq!(e.upstream_status(), Some(1006));
         for (i, param) in [0.0, 1.0, 3.0].into_iter().enumerate() {
             let mut p = TracePoint::new();
             p.curve_parameter = param;

@@ -13,6 +13,7 @@
 //! | [`min_edge_bbox_size`]       | `SmBrep::GetMinEdgeBBoxSize`              |
 //! | [`set_tolerance`]            | `SmBrep::SetTolerance` (`SM_USE_OLDTOL`)  |
 //! | [`rebuild_uv_trim_curves`]   | `SmBrep::RebuildUVTrimCurves`             |
+//! | [`create_missing_uv_trim_curves`] | (not upstream) the kernel's own UV trim curve for every edge use on a face that holds none |
 //! | [`check_and_fix_uv_trim_curves`] | `sm_CheckAndFixUVTrimCurves` (file static) |
 //! | [`swap_uv`]                  | `SmBrep::SwapUV`                          |
 //! | [`notify`], [`NotifyArg`], [`brep_ref`] | `SmBrep::Notify`               |
@@ -25,6 +26,7 @@
 //! | [`local_curve_sector`]       | `SmBrep::LocalCurveSector`                |
 //! | [`ray_fire`], [`RayFireResult`] | `SmBrep::RayFire`                      |
 //! | [`replace_surface`], [`OldSurface`] | `SmBrep::ReplaceSurface`           |
+//! | [`replace_curve`]            | `SmBrep::ReplaceCurve`                    |
 //! | [`make_shell_vertex_topology`] | `SmBrep::MakeShellVertexTopology`       |
 //! | [`make_edge_vertex_topology`] | `SmBrep::MakeEdgeVertexTopology`         |
 //! | [`make_edge_topology`]       | `SmBrep::MakeEdgeTopology`                |
@@ -56,8 +58,13 @@
 //!   records to the arenas as they link them, not all up front; `MakeEdgeTopology`'s
 //!   `TransferChildrenTo` (the one shell call that can fail) runs before any new record
 //!   exists, so upstream's `SmObjDelete` guards have nothing to undo. The merged end
-//!   shell is deleted ([`shell::destroy`]); a deleted vertex shell's vertex use stays in
-//!   the arena, unlinked.
+//!   shell is deleted ([`shell::destroy`]), and a vertex shell's vertex use is deleted
+//!   with its record (`delete pVU`).
+//! - `MakeEdgeTopology`, joining a wire start shell to a faceuse end shell, moves the
+//!   wires into the faceuse shell, puts it in the wire shell's place in the region and
+//!   deletes the wire shell, where upstream moves every face use into the wire shell, the
+//!   size of the body for each such edge a boolean makes (WR-585, fork
+//!   tangency-labs/smlib@be8ac73).
 //! - `MateLaminaEdgeToSurface` checks for the face's surface before the neighbour
 //!   (lamina / seam) checks; upstream binds the surface only for `IsSeam`, so a face
 //!   without surface there ends in the distance loop instead of
@@ -69,11 +76,16 @@
 //!   `CreateExtendedSurface`, where upstream never returns
 //!   (`plan/upstream-issues.md` HANG-18).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::curve::curve::p2::is_curve_class;
 use crate::curve::curve::{p8::CurveIntersectOptions, Curve, CurveKind};
-use crate::error::{ignore_status, EntityRef, Result, SolidError, SM_ERR};
+use crate::error::query::QueryFailure;
+use crate::error::topology::TopologyFailure;
+use crate::error::{
+    ignore_status, native_failure, EntityRef, Failure, Result, SolidError, SM_ERR,
+    SM_ERR_NULL_POINTER,
+};
 use crate::geom::a_object::{self, BREP_TYPE};
 use crate::geom::attribute::{AttributeStore, ObjectKey};
 use crate::geom::context::{MarkLock, ALL_MARKS};
@@ -86,6 +98,7 @@ use crate::geom::object::{NotifyOperation, ObjectRef};
 use crate::geom::solution_array::Solution;
 use crate::geom::tol::{zone_tol3d, ZONE_TOL_3D};
 use crate::geom::tree::NodeGeomType;
+use crate::heal::gap::{EdgeEdgeGap, VertexEdgeGap};
 use crate::intersect::curve_class::p1::{CurveClassification, IntervalPosition};
 use crate::intersect::curve_class::p6::MergeIntervalBrep;
 use crate::intersect::curve_class::p7::CoincidentMaybe;
@@ -107,7 +120,9 @@ use crate::surface::surface::{Surface, SurfaceKind};
 use crate::surface::trim_srf_cache::TrimSrfCache;
 use crate::topology::brep::p1;
 use crate::topology::brep_cache::{self, BrepCache, CacheObject, CacheSource};
-use crate::topology::edge::{self, AttributeFilter, NotifyEnv, SetCurveOptions};
+use crate::topology::edge::{
+    self, AttributeFilter, NotificationStores, NotifyEnv, NotifyState, SetCurveOptions,
+};
 use crate::topology::edgeuse::p1::{self as eu1, UvTrimCurveArg};
 use crate::topology::edgeuse::p2 as eu2;
 use crate::topology::edgeuse::p3 as eu3;
@@ -176,16 +191,45 @@ pub fn shell_vertices(b: &Brep, attribute: Option<&AttributeFilter<'_>>) -> Resu
 ///
 /// [`SolidError::NotFound`] for a dangling id.
 pub fn is_manifold_solid(b: &Brep) -> Result<bool> {
+    is_closed_where(b, edge::is_manifold)
+}
+
+/// (Not upstream) Whether `b` is closed and manifold: no shell vertices and only manifold
+/// edges, [`is_manifold_solid`] without its clause that the regions number at least two.
+/// A body of one closed shell whose finite region is not set, or of several lumps, is
+/// closed and manifold whatever its regions say; the offset and shell gates ask this of
+/// what they build, so a regions labelling the executive leaves undone is not a refusal.
+///
+/// # Errors
+///
+/// [`SolidError::NotFound`] for a dangling id.
+pub fn is_closed_manifold(b: &Brep) -> Result<bool> {
+    closed_where(b, edge::is_manifold)
+}
+
+/// [`is_manifold_solid`]'s walk with its edge test given: at least two regions, no shell
+/// vertices and `edge_ok` for every edge (not upstream: shared with the closed-body tests
+/// that allow other edges, `query::api_queries::brep_is_closed_touching_solids`).
+///
+/// # Errors
+///
+/// [`SolidError::NotFound`] for a dangling id; those of `edge_ok`.
+pub fn is_closed_where(b: &Brep, edge_ok: impl Fn(&Brep, EdgeId) -> Result<bool>) -> Result<bool> {
     if brep_regions(b)?.len() < 2 {
         return Ok(false);
     }
+    closed_where(b, edge_ok)
+}
 
+/// No shell vertices and `edge_ok` for every edge: the part of [`is_closed_where`] that
+/// does not look at the regions.
+fn closed_where(b: &Brep, edge_ok: impl Fn(&Brep, EdgeId) -> Result<bool>) -> Result<bool> {
     if !shell_vertices(b, None)?.is_empty() {
         return Ok(false);
     }
 
     for e in brep_edges(b)? {
-        if !edge::is_manifold(b, e)? {
+        if !edge_ok(b, e)? {
             return Ok(false);
         }
     }
@@ -203,7 +247,27 @@ pub fn is_sheet(k: &mut Kernel, b: &Brep) -> Result<bool> {
     if brep_shells(k, b)?.len() != 1 {
         return Ok(false);
     }
+    sheet_edges(b)
+}
 
+/// (Not upstream) [`is_sheet`] for a body of one or more separate sheets: only the infinite
+/// region (no solid one, whose shells would count too), at least one shell, at least one edge,
+/// and every edge lamina or manifold. A surface made from several profiles at once (a surface
+/// extrude of four circles) is one body of four sheets, each a shell of the infinite region.
+///
+/// # Errors
+///
+/// Those of `SmBrep::GetShells` ([`p1::shells`], the mark lock);
+/// [`SolidError::NotFound`] for a dangling id.
+pub fn is_sheets(k: &mut Kernel, b: &Brep) -> Result<bool> {
+    if brep_regions(b)?.len() != 1 || brep_shells(k, b)?.is_empty() {
+        return Ok(false);
+    }
+    sheet_edges(b)
+}
+
+/// [`is_sheet`]'s edge clause: at least one edge, and every edge lamina or manifold.
+fn sheet_edges(b: &Brep) -> Result<bool> {
     // sheets have edges that are all manifold or lamina
     let edges = brep_edges(b)?;
     if edges.is_empty() {
@@ -312,7 +376,7 @@ pub fn min_edge_bbox_size(k: &Kernel, b: &Brep) -> Result<(f64, Option<EdgeId>)>
                     bbox = n;
                 }
             }
-            Err(err) if err.is_unported() => return Err(err),
+            Err(err) if err.is_unported_or_cancelled() => return Err(err),
             Err(_) => {}
         }
         let diff = bbox.size();
@@ -357,10 +421,11 @@ pub fn set_tolerance(
             k,
             &mut *b,
             BoundingBoxOptions::default(),
-        ))?
-        .unwrap_or_default();
-        let mut size = bbox.size().length();
-        if size >= 1.0e15 || size <= 0.0 {
+        ))?;
+        // fork 60a8a51: a box that cannot be computed is no size, as an absurd one is not
+        let no_box = bbox.is_none();
+        let mut size = bbox.unwrap_or_default().size().length();
+        if no_box || size >= 1.0e15 || size <= 0.0 {
             size = 1.0;
         }
         // the SmZoneTol3d assignment takes fabs of a positive value
@@ -427,13 +492,48 @@ pub fn rebuild_uv_trim_curves(k: &Kernel, b: &mut Brep) -> Result<()> {
         // rebuild UVTrimCurve
         match eu2::rebuild_uv_trim_curve(k, b, eu) {
             Ok(()) => {}
-            Err(e) if e.is_unported() => return Err(e),
+            Err(e) if e.is_unported_or_cancelled() => return Err(e),
             Err(e) => ret = Err(e),
         }
     }
 
     // all done
     ret
+}
+
+/// (Not upstream) Gives every edge use on a face that holds no UV trim curve the kernel's
+/// own, the step a body takes before it is written out as data.
+///
+/// The walk is [`edgeuses`]`(b, None)`, listed once before any trim is made: the edges in
+/// B-rep edge list order, each edge's uses in its radial list order from its head. An edge
+/// use is skipped when it has no face use ([`eu1::faceuse`]: a wire edge use) or when its
+/// own slot already holds a curve ([`eu1::uv_trim_curve_pointer`]; the mate's slot is not
+/// looked at). Every other one gets
+/// [`get_or_create_uv_trim_curve`](eu3::get_or_create_uv_trim_curve)`(k, b, eu, false,
+/// false, true)`: no distance and no deviation wanted, a UV-space curve allowed. Where the
+/// mate holds a curve that call builds nothing (the pair shares the mate's curve) and
+/// returns the status of the edge use's own drop record; otherwise it builds a curve and
+/// attaches it as that routine does, with whatever tolerance the attaching raises.
+///
+/// The walk stops at the first failure and nothing is undone: the edge uses before the
+/// failing one keep the curves (and tolerances) they were given, the failing one is as its
+/// call left it, and the ones after it are not visited. Afterwards, on success, every edge
+/// use on a face has a UV trim curve ([`eu1::uv_trim_curve`]: its own or its mate's), and a
+/// second call changes nothing.
+///
+/// # Errors
+///
+/// The first failure of the walk: an error of a read or of
+/// [`get_or_create_uv_trim_curve`](eu3::get_or_create_uv_trim_curve), or the failing
+/// status it returned ([`eu3::UvTrimCurveFetch::status`]).
+pub fn create_missing_uv_trim_curves(k: &Kernel, b: &mut Brep) -> Result<()> {
+    for eu in edgeuses(b, None)? {
+        if eu1::faceuse(b, eu)?.is_none() || eu1::uv_trim_curve_pointer(b, eu)?.is_some() {
+            continue;
+        }
+        eu3::get_or_create_uv_trim_curve(k, b, eu, false, false, true)?.status?;
+    }
+    Ok(())
 }
 
 /// `sm_CheckAndFixUVTrimCurves` (file static, called by `SmBrep::ReadFromFile`):
@@ -451,17 +551,165 @@ pub fn check_and_fix_uv_trim_curves(k: &Kernel, b: &mut Brep) -> Result<()> {
             let _ = eu1::set_uv_trim_curve(b, eu, UvTrimCurveArg::Null, 0.0, true, None)?;
         }
     }
+    // not upstream: the check compares only a trim's ends with its edge's, so a kept trim
+    // could stray from its edge inside by more than the edge tolerance
+    cover_kept_uv_trim_curves(k, b, true)
+}
+
+/// Not upstream: after [`check_and_fix_uv_trim_curves`]'s end check, every edge whose kept
+/// UV trim curves run off it by more than its tolerance has its tolerance raised to the
+/// proved distance. `sm_CheckUVTrimCurve` compares only a trim's two ends with the edge's
+/// ends and vertices, so a trim whose image on the face leaves the edge between its ends was
+/// kept with a tolerance that does not cover it (`Solids/fillet_ts.smb` edge 29: 2.1e-2 off
+/// under 1.9e-5).
+///
+/// The distance is geometric: how far the face's image `S(W(s))` of the trim, over the
+/// trim's own interval, runs from the edge's curve `C` over the edge interval
+/// ([`trim_distance_bound`], plus the net's own bound for a surface kept as a definition's
+/// net). A trim and its edge need not share a parameterisation (upstream reads a trim over
+/// its own interval, normalised), so a trim that lies on its edge with another
+/// parameterisation is within tolerance however far `C(t)` and `S(W(t))` are apart at equal
+/// `t` (`fillet_ts.smb` edge 27: 3.1e-2 apart at equal `t`, 4.5e-14 off its edge).
+///
+/// A trim whose distance cannot be enclosed tightly (a curve or surface with no NURB form,
+/// a trim that cannot be evaluated, a bound that does not close within the budget) is left
+/// as the end check left it: a raise is made only to a bound closed on the distance itself.
+/// No trim and no other geometry changes; a tolerance is only raised.
+///
+/// Each raise, and each vertex tolerance it cascades to, is recorded with the value before
+/// it ([`Brep::trim_cover_raises`]): the fit tolerance along a raised edge
+/// (`topology::edgeuse::p3::fit_tolerance`) stays the one the read had made, so covering a
+/// stray trim does not loosen the geometry fitted later (`Fillet/corner_box.smb` edge 13:
+/// its fillet is the one made without the raise).
+///
+/// A part file's read (`part_file::read_part_from_db`) runs no end check; each B-rep it
+/// builds is covered the same way. `end_checked` says whether the end check ran
+/// ([`crate::topology::TrimCoverRaises::end_checked`]).
+///
+/// Every distance is enclosed before any tolerance is raised, so a raise does not change
+/// what another use is measured against.
+///
+/// # Errors
+///
+/// Those of [`trim_distance_bound`] (a cancelled kernel among them) and of
+/// [`edge::set_tolerance`].
+///
+/// [`trim_distance_bound`]: crate::query::curve_surface_gap::polynomial_pieces::trim_distance_bound
+pub(crate) fn cover_kept_uv_trim_curves(k: &Kernel, b: &mut Brep, end_checked: bool) -> Result<()> {
+    let mut raises = Vec::new();
+    for eu in edgeuses(b, None)? {
+        k.check_cancelled(COVER_OP)?;
+        if let KeptTrimGap::Bounded(e, gap) = kept_trim_gap(k, b, eu)? {
+            raises.push((e, gap));
+        }
+    }
+    let mut record = crate::topology::TrimCoverRaises {
+        end_checked,
+        ..Default::default()
+    };
+    // (every vertex tolerance as the read made it, to record those a raise cascades to)
+    let vertices: Vec<_> = b.vertices().iter().map(|(v, r)| (v, r.tolerance)).collect();
+    for (e, gap) in raises {
+        let before = edge::tolerance(b, e)?;
+        if gap > before {
+            edge::set_tolerance(b, e, gap, true, true)?;
+            let after = edge::tolerance(b, e)?;
+            record.edges.entry(e).or_insert((before, after)).1 = after;
+        }
+    }
+    for (v, before) in vertices {
+        let after = b.vertex(v)?.tolerance;
+        if after.to_bits() != before.to_bits() {
+            record.vertices.insert(v, (before, after));
+        }
+    }
+    b.set_trim_cover_raises(record);
     Ok(())
 }
 
+/// The operation [`cover_kept_uv_trim_curves`] polls cancellation as.
+const COVER_OP: &str = "topology::brep::cover_kept_uv_trim_curves";
+
+/// What [`kept_trim_gap`] finds for an edge use.
+enum KeptTrimGap {
+    /// The edge use holds no trim of its own.
+    NoTrim,
+    /// The proved bound on the distance of the trim's image from its edge's curve.
+    Bounded(EdgeId, f64),
+    /// The distance is not enclosed.
+    Unbounded,
+}
+
+/// The proved distance of edge use `eu`'s own UV trim curve's image from its edge's curve
+/// ([`cover_kept_uv_trim_curves`]).
+fn kept_trim_gap(k: &Kernel, b: &Brep, eu: EdgeuseId) -> Result<KeptTrimGap> {
+    use crate::query::curve_surface_gap::polynomial_pieces::trim_distance_bound;
+    use edge as ed;
+
+    let Some(trim) = eu1::uv_trim_curve_pointer(b, eu)? else {
+        return Ok(KeptTrimGap::NoTrim);
+    };
+    let (Some(e), Some(f)) = (eu1::edge(b, eu)?, eu1::face(b, eu)?) else {
+        return Ok(KeptTrimGap::Unbounded);
+    };
+    let (Some(curve), Some(surface)) = (ed::curve(b, e)?, face2::surface(b, f)?) else {
+        return Ok(KeptTrimGap::Unbounded);
+    };
+    let (Some(c), Some(w)) = (nurb_form(curve)?, nurb_form(trim)?) else {
+        return Ok(KeptTrimGap::Unbounded);
+    };
+    // the net's own distance from a definition it is kept for (0 for a plain net)
+    let net_bound = surface.procedural_definition().map_or(0.0, |d| d.bound());
+    if !(net_bound >= 0.0 && net_bound.is_finite()) {
+        return Ok(KeptTrimGap::Unbounded);
+    }
+    let tol = ed::tolerance(b, e)?;
+    let ivl = ed::interval(b, e)?;
+    let floor = tol / 100.0;
+    // a distance this small is all the cover needs to know: with the net's bound and the
+    // sum's rounding below, it is within the tolerance
+    let accept = tol / (1.0 + 8.0 * f64::EPSILON) - net_bound;
+    let edge_range = [ivl.min(), ivl.max()];
+    let own = trim.natural_interval();
+    let trim_range = [own.min(), own.max()];
+    let gap = trim_distance_bound(k, &c, edge_range, &w, trim_range, surface, floor, accept)?;
+    let Some(gap) = gap else {
+        return Ok(KeptTrimGap::Unbounded);
+    };
+    // the sum's rounding, covered
+    let bound = (gap + net_bound) * (1.0 + 4.0 * f64::EPSILON);
+    if !bound.is_finite() {
+        return Ok(KeptTrimGap::Unbounded);
+    }
+    Ok(KeptTrimGap::Bounded(e, bound))
+}
+
+/// The B-spline form of `c` that [`trim_distance_bound`] encloses: a line's B-spline part
+/// made with its NURB, the B-spline part of any other curve that is one (`None` for the
+/// rest).
+///
+/// [`trim_distance_bound`]: crate::query::curve_surface_gap::polynomial_pieces::trim_distance_bound
+fn nurb_form(c: &Curve) -> Result<Option<std::borrow::Cow<'_, BSplineCurve>>> {
+    Ok(match c.kind() {
+        CurveKind::Line(l) => Some(l.base_with_nurb()?),
+        _ => c.b_spline_base().map(std::borrow::Cow::Borrowed),
+    })
+}
+
 /// `SwapUV`: claims an unlocked mark and swaps the UV parameterisation of every face
-/// (`sm_SwapFaceUV`, which skips faces already marked).
+/// (`sm_SwapFaceUV`, which skips faces already marked). Each face's and surface's
+/// edit notifications go through `env` ([`p1::swap_face_uv`]).
 ///
 /// # Errors
 ///
 /// [`SolidError::Unported`] from `sm_SwapFaceUV` (`SmFace::SwapUV`,
 /// `topology.face_p1`).
-pub fn swap_uv(k: &mut Kernel, b: &mut Brep, marks: &mut Marks) -> Result<()> {
+pub fn swap_uv(
+    k: &mut Kernel,
+    b: &mut Brep,
+    marks: &mut Marks,
+    env: &mut NotifyEnv<'_>,
+) -> Result<()> {
     let faces = brep_faces(b)?;
 
     // increment and lock an unlocked mark
@@ -473,8 +721,8 @@ pub fn swap_uv(k: &mut Kernel, b: &mut Brep, marks: &mut Marks) -> Result<()> {
     for f in faces {
         // swap the face's orientation - watch for composites (sm_SwapFaceUV is void:
         // only an unported callee stops the loop)
-        if let Err(e) = p1::swap_face_uv(k, b, marks, f, mark) {
-            if e.is_unported() {
+        if let Err(e) = p1::swap_face_uv(k, b, marks, f, mark, env) {
+            if e.is_unported_or_cancelled() {
                 res = Err(e);
                 break;
             }
@@ -515,7 +763,7 @@ fn brep_shells(k: &mut Kernel, b: &Brep) -> Result<Vec<ShellId>> {
 fn check_uv_trim_curve(k: &Kernel, b: &Brep, eu: EdgeuseId) -> Result<bool> {
     match p1::check_uv_trim_curve(k, b, eu) {
         Ok(()) => Ok(true),
-        Err(SolidError::Upstream { code: SM_ERR, .. }) => Ok(false),
+        Err(e) if e.upstream_status() == Some(SM_ERR) => Ok(false),
         Err(e) => Err(e),
     }
 }
@@ -540,6 +788,26 @@ pub enum NotifyArg {
     Entity(EntityRef),
     /// Any other object.
     Object(ObjectRef),
+}
+
+/// What [`ArenaNotifyState::seed`] has visited, for the tests of the callers that must not
+/// seed a whole B-rep for each edit they make (solidcraft#15786). Compiled only for tests.
+#[cfg(test)]
+pub(crate) mod seeded {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static ENTITIES: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn note(entities: usize) {
+        CALLS.fetch_add(1, Relaxed);
+        ENTITIES.fetch_add(entities as u64, Relaxed);
+    }
+
+    /// The calls and the entities they visited since the last [`take`].
+    pub(crate) fn take() -> (u64, u64) {
+        (CALLS.swap(0, Relaxed), ENTITIES.swap(0, Relaxed))
+    }
 }
 
 impl NotifyArg {
@@ -757,7 +1025,7 @@ impl RegionNotifyState {
 /// carries its `SmTopology` part and attributes; such a caller models neither, so the
 /// notification runs on a default record for every object of the B-rep, keyed by its
 /// arena identity (`loopuse::notify_ref`), and an attribute store that is empty, or
-/// holds the B-rep's own attributes for the edit ([`Self::with_attributes_of`]). The records are never read back: they exist so that
+/// holds the B-rep's own attributes for the edit (`Self::with_attributes_of`). The records are never read back: they exist so that
 /// `SmTopology::Notify`'s flag propagation finds both objects, as upstream it always does.
 /// The identities are unique within one B-rep only.
 #[derive(Debug, Default)]
@@ -792,6 +1060,8 @@ impl ArenaNotifyState {
         all.extend(b.edges().iter().map(|(x, _)| EntityRef::Edge(x)));
         all.extend(b.vertexuses().iter().map(|(x, _)| EntityRef::Vertexuse(x)));
         all.extend(b.vertices().iter().map(|(x, _)| EntityRef::Vertex(x)));
+        #[cfg(test)]
+        seeded::note(all.len());
         if self.records.is_empty() {
             // Bulk build (sorted input is O(n)); the same map as entry-by-entry.
             self.records = all
@@ -803,6 +1073,50 @@ impl ArenaNotifyState {
         for e in all {
             self.records.or_default(notify_ref(e).key);
         }
+    }
+
+    /// [`Self::with_attributes_of`] reusing the records of an earlier state
+    /// ([`Self::into_records`]): they end exactly as [`Self::new`] makes them, a default
+    /// record for every object of `b` and the B-rep and no other
+    /// ([`Self::reusing`]). For a caller that makes many edits of a large B-rep in a row
+    /// (the stitch's glues), where a fresh map per edit is quadratic.
+    pub(crate) fn with_attributes_of_reusing(
+        records: crate::topology::topology::NotifyRecords,
+        b: &mut Brep,
+        serial: Option<u64>,
+    ) -> Self {
+        let mut state = Self::reusing(records, b, serial);
+        state.attributes = b.take_attributes();
+        state
+    }
+
+    /// [`Self::new`] reusing the records of an earlier state ([`Self::into_records`]):
+    /// they end exactly as [`Self::new`] makes them, but only what changed since they
+    /// were last made so for `b` is visited
+    /// ([`reseed_records`](crate::topology::brep::p3::reseed_records)). `serial` is `b`'s
+    /// serial in the context the edit notifies through, if it has one.
+    pub(crate) fn reusing(
+        mut records: crate::topology::topology::NotifyRecords,
+        b: &mut Brep,
+        serial: Option<u64>,
+    ) -> Self {
+        use crate::topology::loopuse::{entity_of_notify_key, notify_ref};
+        let scheme = crate::topology::brep::p3::KeyScheme {
+            key_of: &notify_ref,
+            entity_of: &entity_of_notify_key,
+            brep_key: notify_ref(EntityRef::Brep(BrepId::from_index(0))).key,
+            serial,
+        };
+        crate::topology::brep::p3::reseed_records(&mut records, b, &scheme);
+        Self {
+            records,
+            attributes: AttributeStore::default(),
+        }
+    }
+
+    /// The records, for [`Self::with_attributes_of_reusing`].
+    pub(crate) fn into_records(self) -> crate::topology::topology::NotifyRecords {
+        self.records
     }
 
     /// [`Self::new`] holding `b`'s own attributes ([`Brep::add_attribute`], keyed by the
@@ -846,18 +1160,172 @@ impl ArenaNotifyState {
     }
 }
 
+/// The tag of a copy's source identities ([`copy_source_ref`]): above the arena kinds
+/// (`kind << 32`, kinds up to 10) and below the kernel's keys.
+const COPY_SOURCE_TAG: u64 = 1 << 48;
+
+/// The identity of `e` as the source object of a copy between two B-reps
+/// ([`CopyNotifyState`]): its [`notify_ref`](crate::topology::loopuse::notify_ref) key
+/// tagged, so that it differs from every destination object's key.
+#[must_use]
+pub fn copy_source_ref(e: EntityRef) -> ObjectRef {
+    let r = crate::topology::loopuse::notify_ref(e);
+    ObjectRef {
+        type_code: r.type_code,
+        key: ObjectKey(r.key.0 | COPY_SOURCE_TAG),
+    }
+}
+
+/// The entity a [`copy_source_ref`] key names, if any.
+fn entity_of_copy_source_key(key: ObjectKey) -> Option<EntityRef> {
+    if key.0 & COPY_SOURCE_TAG == 0 {
+        return None;
+    }
+    crate::topology::loopuse::entity_of_notify_key(ObjectKey(key.0 & !COPY_SOURCE_TAG))
+}
+
+/// The notification state of a copy from one B-rep into another (`CopyFaces`), holding
+/// both B-reps' own attributes ([`Brep::add_attribute`]) so that the copy's
+/// notifications propagate them with SMLib's handlers (`SmAObject::Notify`: each
+/// attribute's `Copy` behaviour onto the new object), as upstream's live on the objects.
+/// Destination objects are keyed by
+/// [`notify_ref`](crate::topology::loopuse::notify_ref) (the [`NotifyEnv::key_of`] of
+/// [`Self::env`]), source objects by [`copy_source_ref`]. Each B-rep holds no attributes
+/// until [`Self::restore_attributes`] gives them back. (not upstream: an attribute that
+/// both B-reps' objects list afterwards, a reference behaviour's, is one object upstream;
+/// here each B-rep gets its own.)
+#[derive(Debug, Default)]
+pub struct CopyNotifyState {
+    /// Each object's default `SmTopology` record.
+    pub records: crate::topology::topology::NotifyRecords,
+    /// Both B-reps' attributes.
+    pub attributes: AttributeStore,
+}
+
+impl CopyNotifyState {
+    /// A default record for every object of `src` (source identities) and `dest`, and
+    /// both B-reps' attributes. Pass an empty `dest` for a copy constructor.
+    ///
+    /// # Errors
+    /// Those of `seed_brep_attributes` (a B-rep store that names no object).
+    pub fn with_attributes_of(src: &mut Brep, dest: &mut Brep) -> Result<Self> {
+        let mut state = Self::default();
+        // (the destination's records, and under the destination identities those of
+        // `src`'s arena ids as well, as `ArenaNotifyState::new(dest)` + `seed(src)`: the
+        // copy's new objects are notified before anything else names them)
+        let mut dest_state = ArenaNotifyState::new(dest);
+        dest_state.seed(src);
+        state.records = dest_state.records;
+        for e in brep_entities(src) {
+            state.records.or_default(copy_source_ref(e).key);
+        }
+        seed_brep_attributes(
+            &mut state.attributes,
+            dest.take_attributes(),
+            &crate::topology::loopuse::notify_ref,
+        )?;
+        seed_brep_attributes(
+            &mut state.attributes,
+            src.take_attributes(),
+            &copy_source_ref,
+        )?;
+        Ok(state)
+    }
+
+    /// The [`NotifyEnv`] over this state, keyed by the destination identities and
+    /// notifying through `context` (as [`ArenaNotifyState::env`]).
+    pub fn env<'a>(
+        &'a mut self,
+        context: Option<&'a mut crate::geom::context::Context>,
+    ) -> NotifyEnv<'a> {
+        NotifyEnv {
+            records: &mut self.records,
+            attributes: &mut self.attributes,
+            context,
+            key_of: &crate::topology::loopuse::notify_ref,
+        }
+    }
+
+    /// Gives each B-rep the attributes this state's notifications left on its live
+    /// objects (pair of [`Self::with_attributes_of`]); the lists of deleted objects are
+    /// cleared, as upstream's destructors do.
+    ///
+    /// # Errors
+    /// None in practice.
+    pub fn restore_attributes(&mut self, src: &mut Brep, dest: &mut Brep) -> Result<()> {
+        let store = core::mem::take(&mut self.attributes);
+        let mut for_src = store.clone();
+        let mut for_dest = store;
+        give_attributes(src, &mut for_src, &entity_of_copy_source_key)?;
+        give_attributes(
+            dest,
+            &mut for_dest,
+            &crate::topology::loopuse::entity_of_notify_key,
+        )?;
+        src.set_attributes(for_src);
+        dest.set_attributes(for_dest);
+        Ok(())
+    }
+}
+
+/// Every object of `b` that a notification may name (the B-rep and its arena objects).
+fn brep_entities(b: &Brep) -> Vec<EntityRef> {
+    let mut all = vec![EntityRef::Brep(BrepId::from_index(0))];
+    all.extend(b.regions().iter().map(|(x, _)| EntityRef::Region(x)));
+    all.extend(b.shells().iter().map(|(x, _)| EntityRef::Shell(x)));
+    all.extend(b.faceuses().iter().map(|(x, _)| EntityRef::Faceuse(x)));
+    all.extend(b.faces().iter().map(|(x, _)| EntityRef::Face(x)));
+    all.extend(b.loopuses().iter().map(|(x, _)| EntityRef::Loopuse(x)));
+    all.extend(b.loops().iter().map(|(x, _)| EntityRef::Loop(x)));
+    all.extend(b.edgeuses().iter().map(|(x, _)| EntityRef::Edgeuse(x)));
+    all.extend(b.edges().iter().map(|(x, _)| EntityRef::Edge(x)));
+    all.extend(b.vertexuses().iter().map(|(x, _)| EntityRef::Vertexuse(x)));
+    all.extend(b.vertices().iter().map(|(x, _)| EntityRef::Vertex(x)));
+    all
+}
+
+/// Keeps in `store` the lists of `b`'s live objects that `decode` names (renamed to their
+/// [`notify_ref`](crate::topology::loopuse::notify_ref) keys), clears the others, and
+/// drops the attributes no remaining list names.
+fn give_attributes(
+    b: &Brep,
+    store: &mut AttributeStore,
+    decode: &dyn Fn(ObjectKey) -> Option<EntityRef>,
+) -> Result<()> {
+    if !store.attributed_objects().is_empty() {
+        let listed = b.listed_entities();
+        store.retain_rekeyed(&|key| {
+            decode(key)
+                .filter(|&e| b.still_has(&listed, e))
+                .map(|e| crate::topology::loopuse::notify_ref(e).key)
+        })?;
+        store.retain_listed();
+    }
+    Ok(())
+}
+
 /// (not upstream: upstream attributes live on the objects.) Moves `source`, a B-rep's
 /// own attribute store (keyed by [`crate::topology::loopuse::notify_ref`]), into an
 /// operation's `store` under that operation's identities `key_of` of the same objects.
 ///
 /// # Errors
-/// [`SolidError::InvalidInput`] for a list whose key names no object; a store that
-/// cannot grow.
+/// [`SolidError::InvalidInput`] for a list whose key names no object, or for two lists
+/// `key_of` gives one key (see [`distinct_listed_keys`]); a store that cannot grow.
 pub(crate) fn seed_brep_attributes(
     store: &mut AttributeStore,
     source: AttributeStore,
     key_of: &dyn Fn(EntityRef) -> ObjectRef,
 ) -> Result<()> {
+    let mut named = BTreeSet::new();
+    for key in source.attributed_objects() {
+        if let Some(e) = crate::topology::loopuse::entity_of_notify_key(key) {
+            if !named.insert(key_of(e).key) {
+                return Err(shared_attribute_key(
+                    "topology::brep::p2::seed_brep_attributes",
+                ));
+            }
+        }
+    }
     store.absorb(source, &|key| {
         crate::topology::loopuse::entity_of_notify_key(key)
             .map(|e| key_of(e).key)
@@ -898,7 +1366,8 @@ pub(crate) fn restore_decoded_attributes(
 /// `store` itself is left as it is.
 ///
 /// # Errors
-/// None in practice.
+/// [`SolidError::InvalidInput`] when `key_of` gives two live objects the key of a list
+/// in `store` ([`distinct_listed_keys`]); `b` is then left as it is.
 pub(crate) fn restore_keyed_attributes(
     b: &mut Brep,
     store: &AttributeStore,
@@ -908,15 +1377,49 @@ pub(crate) fn restore_keyed_attributes(
         b.set_attributes(AttributeStore::default());
         return Ok(());
     }
-    let names: BTreeMap<ObjectKey, EntityRef> = live_entities(b)
-        .into_iter()
-        .map(|e| (key_of(e).key, e))
-        .collect();
+    let names = distinct_listed_keys(
+        b,
+        key_of,
+        &|key| !store.attributes(key).is_empty(),
+        "topology::brep::p2::restore_keyed_attributes",
+    )?;
     restore_decoded_attributes(b, store.clone(), &|key| names.get(&key).copied())
 }
 
+/// The refusal of a naming that gives two objects one attribute key.
+const fn shared_attribute_key(operation: &'static str) -> SolidError {
+    SolidError::invalid_input(operation, "the naming gives two objects one attribute key")
+}
+
+/// (not upstream: upstream's attributes live on the objects.) `b`'s live objects by
+/// their key under `key_of` (the last one named for a key no list holds), refusing a
+/// naming that gives two of them the key of an attribute list (`listed`): stores key
+/// by [`ObjectKey`] alone, so such a list would silently pass to one of them and the
+/// other would lose its own. Arena identities ([`brep_cache::arena_identity`], and so
+/// [`Brep::owner_identity`] under any scheme but [`crate::topology::NamingScheme::Notify`])
+/// are such a naming: a face, an edge and a vertex of one index share their key;
+/// [`crate::topology::loopuse::notify_ref`] is not.
+///
+/// # Errors
+/// [`SolidError::InvalidInput`] for such a key.
+pub(crate) fn distinct_listed_keys(
+    b: &Brep,
+    key_of: &dyn Fn(EntityRef) -> ObjectRef,
+    listed: &dyn Fn(ObjectKey) -> bool,
+    operation: &'static str,
+) -> Result<BTreeMap<ObjectKey, EntityRef>> {
+    let mut names = BTreeMap::new();
+    for e in live_entities(b) {
+        let key = key_of(e).key;
+        if names.insert(key, e).is_some() && listed(key) {
+            return Err(shared_attribute_key(operation));
+        }
+    }
+    Ok(names)
+}
+
 /// Every live object of `b` that can carry attributes (all but the B-rep itself).
-fn live_entities(b: &Brep) -> Vec<EntityRef> {
+pub(crate) fn live_entities(b: &Brep) -> Vec<EntityRef> {
     let mut all = Vec::new();
     all.extend(b.regions().iter().map(|(x, _)| EntityRef::Region(x)));
     all.extend(b.shells().iter().map(|(x, _)| EntityRef::Shell(x)));
@@ -939,10 +1442,7 @@ fn cache_keys(env: &NotifyEnv<'_>, object: CacheObject) -> ObjectRef {
 /// The identity of a cache object under the caller's topology naming `key_of` (the
 /// names its edges, faces and vertices own their geometry under); other objects keep
 /// their [`brep_cache::arena_identity`].
-pub(crate) fn caller_cache_key(
-    key_of: &dyn Fn(EntityRef) -> ObjectRef,
-    object: CacheObject,
-) -> ObjectRef {
+pub fn caller_cache_key(key_of: &dyn Fn(EntityRef) -> ObjectRef, object: CacheObject) -> ObjectRef {
     match object {
         CacheObject::Edge(e) | CacheObject::Curve(e) => key_of(EntityRef::Edge(e)),
         CacheObject::Face(f) | CacheObject::Surface(f) => key_of(EntityRef::Face(f)),
@@ -984,7 +1484,7 @@ fn add_to_tree(
     .ok_or(null_deref("B-rep cache without spatial tree"))?;
     match tree.add_to_spatial_tree(bbox, object, NodeGeomType::Default) {
         Ok(()) => return Ok(()),
-        Err(e) if e.is_unported() => return Err(e),
+        Err(e) if e.is_unported_or_cancelled() => return Err(e),
         Err(_) => {}
     }
     let kernel = s.kernel;
@@ -995,7 +1495,7 @@ fn add_to_tree(
     };
     let cache = match rebuilt {
         Ok(c) => Some(c),
-        Err(e) if e.is_unported() => return Err(e),
+        Err(e) if e.is_unported_or_cancelled() => return Err(e),
         Err(_) => None,
     };
     if let Some(s) = slot.as_deref_mut() {
@@ -1128,7 +1628,7 @@ fn rm_from_spatial_tree(
             };
             let bbox = match curve.calculate_bounding_box(k, &domain, req, true) {
                 Ok(boxes) => boxes.normal.unwrap_or_else(Extent3d::new),
-                Err(err) if err.is_unported() => return Err(err),
+                Err(err) if err.is_unported_or_cancelled() => return Err(err),
                 Err(_) => Extent3d::new(),
             };
             rm_from_tree(slot, TreeKind::Curve, &bbox, CacheObject::Curve(e))
@@ -1165,7 +1665,7 @@ fn edge_box(k: &Kernel, b: &Brep, e: EdgeId) -> Result<Extent3d> {
     };
     match qedge::calculate_bounding_box(k, b, e, req, false) {
         Ok(boxes) => Ok(boxes.normal.unwrap_or_else(Extent3d::new)),
-        Err(err) if err.is_unported() => Err(err),
+        Err(err) if err.is_unported_or_cancelled() => Err(err),
         Err(_) => Ok(Extent3d::new()),
     }
 }
@@ -1175,7 +1675,7 @@ fn edge_box(k: &Kernel, b: &Brep, e: EdgeId) -> Result<Extent3d> {
 fn face_box(k: &Kernel, b: &Brep, f: FaceId) -> Result<Extent3d> {
     match qface1::calculate_bounding_box(k, b, f, false) {
         Ok(bbox) => Ok(bbox),
-        Err(err) if err.is_unported() => Err(err),
+        Err(err) if err.is_unported_or_cancelled() => Err(err),
         Err(_) => Ok(Extent3d::new()),
     }
 }
@@ -1386,7 +1886,9 @@ pub fn local_curve_sector(
                 orientation,
                 true,
             )?;
-            let found = sector.radial_edgeuse.ok_or(SolidError::sm_err(OP))?;
+            let found = sector
+                .radial_edgeuse
+                .ok_or_else(|| SolidError::topology(OP, TopologyFailure::NoRadialSector))?;
 
             // region of point is region of classification sector
             edgeuse_region(b, found)
@@ -1453,15 +1955,111 @@ pub fn local_curve_sector(
                             p1::find_sector_of_face(k, b, f, None, test_pnt, test_dir)?;
                         p1::vote_for_region(&mut regions, &mut votes, found);
                     } else {
-                        return Err(SolidError::sm_err(OP));
+                        return Err(SolidError::topology(
+                            OP,
+                            TopologyFailure::Defect {
+                                why: "a use of a vertex that is not a shell vertex belongs to \
+                                      neither an edge nor a loop, though the kernel gives every \
+                                      use of such a vertex to one of them",
+                            },
+                        ));
                     }
                 }
             }
 
             p1::find_highest_vote(&regions, &votes)
         }
-        _ => Err(SolidError::sm_err(OP)),
+        _ => Err(SolidError::topology(OP, TopologyFailure::HitNotOnBoundary)),
     }
+}
+
+/// Where a point on faces' common boundary lies: an edge of the faces or a vertex of it.
+struct SharedBoundary {
+    class: PointClassType,
+    object: EntityRef,
+    /// The edge's curve parameter of the point (of the edge the point is on, or ends in).
+    parameter: f64,
+}
+
+/// The edge, or the vertex at an end of it, that `point` lies on and that `face` shares with
+/// one of `others`: the edge of `face` that borders another of those faces and is nearest
+/// `point`, when `point` is within `tolerance` of its curve. `None` when `face` shares no
+/// edge with them or the point is not on one.
+///
+/// A ray aimed at an edge can meet both faces ending there, each in a point of its boundary,
+/// and report no hit on the edge itself: the faces are then at one distance. Which side of
+/// either face alone the ray start is on says nothing about the region it is in (it can be
+/// the far side of the one and the near side of the other), but the radial sectors of the edge
+/// do.
+///
+/// # Errors
+///
+/// Those of the topology reads and the point drops.
+fn shared_boundary_of_faces(
+    k: &Kernel,
+    b: &Brep,
+    face: FaceId,
+    others: &[FaceId],
+    point: Point3,
+) -> Result<Option<SharedBoundary>> {
+    // The point is on an edge only within the edge's own tolerance (the body's linear tolerance
+    // at least), not within the distance by which two face hits count as tied.
+    let mut nearest: Option<(f64, EdgeId, f64)> = None;
+    for e in crate::topology::topology_traverser::face_edges(b, face)? {
+        let faces = edge::faces(b, e, None)?;
+        if !faces.iter().any(|f| others.contains(f)) {
+            continue;
+        }
+        let record = b.edge(e)?;
+        let Some(curve) = record.curve.as_ref() else {
+            continue;
+        };
+        let tolerance = record.tolerance.max(b.tolerance());
+        let dropped = curve.drop_point(
+            k,
+            &record.interval,
+            point,
+            None,
+            tolerance,
+            None,
+            SolverOperation::Minimize,
+        )?;
+        if dropped.success
+            && dropped.distance <= tolerance
+            && nearest.is_none_or(|(d, ..)| dropped.distance < d)
+        {
+            nearest = Some((dropped.distance, e, dropped.parameter));
+        }
+    }
+    let Some((_, e, parameter)) = nearest else {
+        return Ok(None);
+    };
+    // At an end of the edge the point is at its vertex, which the faces around it classify.
+    let record = b.edge(e)?;
+    let tolerance = record.tolerance.max(b.tolerance());
+    let curve = record
+        .curve
+        .as_ref()
+        .ok_or_else(|| null_deref("edge without curve"))?;
+    for (end, vertex) in [
+        (record.interval.min(), edge::start_vertex(b, e)?),
+        (record.interval.max(), edge::end_vertex(b, e)?),
+    ] {
+        if let Some(vertex) = vertex {
+            if curve.evaluate_point(k, end)?.distance(point) <= tolerance {
+                return Ok(Some(SharedBoundary {
+                    class: PointClassType::Vertex,
+                    object: EntityRef::Vertex(vertex),
+                    parameter,
+                }));
+            }
+        }
+    }
+    Ok(Some(SharedBoundary {
+        class: PointClassType::Edge,
+        object: EntityRef::Edge(e),
+        parameter,
+    }))
 }
 
 /// What [`ray_fire`] found.
@@ -1495,7 +2093,9 @@ pub(crate) fn cache_entity(object: CacheObject) -> Result<EntityRef> {
 ///
 /// # Errors
 ///
-/// `SM_ERR` when the best hit is closer than `SM_EFF_ZERO * (1 + max |start|)`; errors
+/// `SM_ERR` when the best hit is closer than `SM_EFF_ZERO * (1 + max |start|)`, and (not
+/// upstream) [`QueryFailure::TangentAlongEdge`] when it is on a curved edge the ray grazes
+/// ([`ray_grazes_edge`]), so the caller fires another ray; errors
 /// of the B-rep box, the solve, the classification load and [`local_curve_sector`];
 /// [`SolidError::Unported`] from the callees.
 #[allow(clippy::too_many_arguments)] // one upstream routine
@@ -1544,8 +2144,33 @@ pub(crate) fn ray_fire_with_solver(
         TopologySolveOptions<'_>,
     ) -> Result<crate::geom::solution_array::SolutionArray<CacheObject>>,
 ) -> Result<RayFireResult> {
-    // get Brep BoundingBox and BoundingSphere
     let bbox = qbrep::calculate_bounding_box(k, &mut *b, BoundingBoxOptions::default())?;
+    ray_fire_with_bbox_and_solver(
+        k,
+        b,
+        bbox,
+        start,
+        direction,
+        ray_zone_tol_3d,
+        answer_limit,
+        solve,
+    )
+}
+
+pub(crate) fn ray_fire_with_bbox_and_solver(
+    k: &Kernel,
+    b: &mut Brep,
+    bbox: Extent3d,
+    start: Point3,
+    direction: Vec3,
+    ray_zone_tol_3d: f64,
+    answer_limit: Option<f64>,
+    solve: impl FnOnce(
+        &mut Brep,
+        Point3,
+        TopologySolveOptions<'_>,
+    ) -> Result<crate::geom::solution_array::SolutionArray<CacheObject>>,
+) -> Result<RayFireResult> {
     let sphere = bbox.sphere_bound();
     let radius = sphere.radius;
 
@@ -1616,7 +2241,13 @@ pub(crate) fn ray_fire_with_solver(
     // check solution tolerance for an error
     let tol = EFF_ZERO * (1.0 + start.max_dimension());
     if best.start.solution_value < tol {
-        return Err(SolidError::sm_err(OP));
+        return Err(SolidError::topology(
+            OP,
+            TopologyFailure::HitAtRayStart {
+                distance: best.start.solution_value,
+                tolerance: tol,
+            },
+        ));
     }
     let _ = region;
 
@@ -1630,6 +2261,41 @@ pub(crate) fn ray_fire_with_solver(
         best.start.solution_value,
     )?;
 
+    // Not upstream: a ray that meets the B-rep on a boundary shared by faces is classified
+    // against that boundary, not against one of the faces it ends.
+    if let EntityRef::Face(face) = hit {
+        let scaled_zero = EFF_ZERO_SQRT * 100.0 * (1.0 + radius);
+        let others: Vec<FaceId> = (0..solutions.len())
+            .filter_map(|ii| solutions.get(ii))
+            .filter(|this| {
+                (this.start.solution_value - best.start.solution_value).abs() < scaled_zero
+            })
+            .filter(|this| this.num_variables == best.num_variables)
+            .filter_map(|this| match this.objects[0].map(cache_entity) {
+                Some(Ok(EntityRef::Face(f))) if f != face => Some(f),
+                _ => None,
+            })
+            .collect();
+        if !others.is_empty() {
+            let point = start + best.start.solution_value * ray;
+            if let Some(found) = shared_boundary_of_faces(k, b, face, &others, point)? {
+                intersection.set_class_object(found.class, Some(found.object));
+                intersection.set_gap_3d(best.start.solution_value);
+                intersection.set_t_param(found.parameter, false);
+            }
+        }
+    }
+
+    // Not upstream (#22582): a ray that grazes a curved edge says nothing about the edge's
+    // sectors, and the next ray is fired instead.
+    if let (PointClassType::Edge, Some(EntityRef::Edge(e))) =
+        (intersection.point_class(), intersection.object())
+    {
+        if ray_grazes_edge(k, b, e, intersection.t_param(), ray, ray_zone_tol_3d)? {
+            return Err(SolidError::query(OP, QueryFailure::TangentAlongEdge));
+        }
+    }
+
     // make temporary [StartPoint,IntersectionPoint] line segement
     let end = start + best.start.solution_value * ray;
     let line = Curve::from(BSplineCurve::create_line_segment(3, start, end)?);
@@ -1642,6 +2308,55 @@ pub(crate) fn ray_fire_with_solver(
         region,
         intersection,
     })
+}
+
+/// Whether `ray` (a unit direction) meets edge `e` of `b` at its curve parameter `t` too close
+/// to the edge's tangent for the hit to say which side the ray crosses to. The hit is found
+/// to the ray's tolerance `ray_zone_tol_3d`. Near a tangency the ray's distance to a curve of
+/// curvature `kappa` grows as `s^2 kappa / 2` along an arc `s`, so the hit is fixed only to an
+/// arc of `sqrt(2 tol / kappa)`, over which the tangent turns by `sqrt(2 tol kappa)`. A ray
+/// with `sin theta <= sqrt(2 tol kappa)` to the tangent at the hit is therefore within that
+/// uncertainty of the tangent at some point near it (or is a chord whose sagitta
+/// `theta^2 / (2 kappa)` is at most `tol`). Its direction across the edge is then a rounding
+/// error, and the edge's sectors would classify it either way. The edge's own tolerance is
+/// not used: it says where the edge may lie, not how well the hit was found, and a large one
+/// (a body the validity check is to report) would refuse rays that cross the edge.
+/// A straight edge (`kappa = 0`) is grazed only along its own line, which
+/// `radial_sector_of_curve_classify` refuses.
+/// A wire edge, which classifies by its region alone, and an edge whose curve does not
+/// evaluate there (the kernel's status) are not grazed.
+///
+/// # Errors
+///
+/// Those of the topology reads; port errors of the curve evaluation.
+fn ray_grazes_edge(
+    k: &Kernel,
+    b: &Brep,
+    e: EdgeId,
+    t: f64,
+    ray: Vec3,
+    ray_zone_tol_3d: f64,
+) -> Result<bool> {
+    if edge::is_wire(b, e)? {
+        return Ok(false);
+    }
+    let record = b.edge(e)?;
+    let Some(curve) = record.curve.as_ref() else {
+        return Ok(false);
+    };
+    let Some(derivatives) = native_failure(curve.evaluate(k, t, 2, true, true))? else {
+        return Ok(false);
+    };
+    let (Some(&d1), Some(&d2)) = (derivatives.get(1), derivatives.get(2)) else {
+        return Ok(false);
+    };
+    let speed = d1.length();
+    if speed <= EFF_ZERO {
+        return Ok(false);
+    }
+    let curvature = d1.cross(d2).length() / (speed * speed * speed);
+    let sine = (d1 / speed).cross(ray).length();
+    Ok(sine <= (2.0 * ray_zone_tol_3d * curvature).sqrt())
 }
 
 // ---- geometry replacement -----------------------------------------------------------------
@@ -1753,6 +2468,56 @@ pub fn replace_surface(
 
     // all done
     Ok((kept, modified))
+}
+
+/// `ReplaceCurve(pEdge, pNewCurve)`: the B-rep's pre-edit notification,
+/// `SmEdge::Replace3DCurve` (`SetCurve(curve, TRUE)`: the curve owned by the edge and
+/// the edge's interval the curve's natural interval) and `SmEdge::RemoveUVTrimCurves`
+/// (`ClearUVCaches`: the edge's pre-edit notification, every edge use's UV trim curve
+/// deleted and its gap to the next edge use reset, every vertex use's vertex/edge gap
+/// reset). The notifications go through the kernel's context with `stores`' records
+/// and attributes.
+///
+/// # Errors
+///
+/// Those of the notifications and of `SmEdge::Replace3DCurve`;
+/// [`SolidError::InvalidInput`] for an edge use without vertex use (upstream
+/// dereferences it).
+pub fn replace_curve(
+    k: &mut Kernel,
+    b: &mut Brep,
+    e: EdgeId,
+    curve: Curve,
+    stores: &mut NotificationStores<'_>,
+) -> Result<()> {
+    NotifyState::from_kernel_stores(stores).with_kernel_env(k, |_k, env| {
+        // notify the Brep
+        let this = Some(NotifyArg::Object(brep_ref(b)));
+        notify(b, env, None, NotifyOperation::PreEdit, [this, None, None])?;
+
+        // change the edge (Replace3DCurve)
+        edge::replace_3d_curve(b, e, Some(curve), env)?;
+
+        // remove existing UVTrimCurves (ClearUVCaches)
+        let edge_ref = (env.key_of)(EntityRef::Edge(e));
+        let body = brep_ref(b);
+        edge::notify(
+            b,
+            e,
+            env,
+            NotifyOperation::PreEdit,
+            [Some(edge_ref), Some(body), None],
+        )?;
+        for eu in edge::edgeuses(b, e, None, None)? {
+            let _ = eu1::set_uv_trim_curve(b, eu, UvTrimCurveArg::Null, 0.0, true, None)?;
+            b.edgeuse_mut(eu)?.edge_ccw_edge_gap = EdgeEdgeGap::new();
+        }
+        for vu in edge::vertexuses(b, e, None)? {
+            let vu = vu.ok_or(null_deref("edge use without vertex use"))?;
+            b.vertexuse_mut(vu)?.vertex_edge_gap = VertexEdgeGap::new();
+        }
+        Ok(())
+    })
 }
 
 /// The identity `surface` is notified under through `context` ([`Surface::notify_key`];
@@ -1875,7 +2640,7 @@ fn attach_wire_edge(b: &mut Brep, s: ShellId, e: EdgeId, eu: EdgeuseId) -> Resul
     // If start shell was shell vertex make it a wire edge with pointer to newE.
     if shell_is_vertex_shell(b, s)? {
         let vu = shell_vertexuse(b, s)?;
-        remove_vertexuse_from_vertex(b, vu)?;
+        delete_vertexuse(b, vu)?;
         shell_set_wire_edgeuse(b, s, eu)?;
     }
 
@@ -1886,14 +2651,15 @@ fn attach_wire_edge(b: &mut Brep, s: ShellId, e: EdgeId, eu: EdgeuseId) -> Resul
     Ok(())
 }
 
-/// Removes vertex use `vu` from its vertex's list (`pVU->GetVertex()->Remove(pVU)`;
-/// the record stays in the arena, unreachable, as upstream deletes it).
-fn remove_vertexuse_from_vertex(b: &mut Brep, vu: VertexuseId) -> Result<()> {
+/// Removes vertex use `vu` from its vertex's list and deletes it
+/// (`pVU->GetVertex()->Remove(pVU)`, `delete pVU`: its record leaves the arena).
+fn delete_vertexuse(b: &mut Brep, vu: VertexuseId) -> Result<()> {
     let v = b
         .vertexuse(vu)?
         .vertex
         .ok_or(null_deref("vertex use without vertex"))?;
     b.vertex_mut(v)?.vertexuses.retain(|&x| x != vu);
+    b.remove_vertexuse_record(vu)?;
     Ok(())
 }
 
@@ -1917,7 +2683,9 @@ pub fn make_edge_vertex_topology(
     let region = region_or_infinite(b, region)?;
 
     // Find the shell corresponding to the region from the Start vertex.
-    let s = vertex::shell_in_region(b, start, Some(region))?.ok_or(SolidError::sm_err(OP))?;
+    let s = vertex::shell_in_region(b, start, Some(region))?.ok_or_else(|| {
+        SolidError::topology(OP, TopologyFailure::VertexNotInRegion { at_end: false })
+    })?;
 
     // Put Vertex into Brep's vertex list and edge into edge list
     let new_v = b.add_vertex_record(Vertex::default())?;
@@ -1955,10 +2723,12 @@ pub fn make_edge_topology(
     let region = region_or_infinite(b, region)?;
 
     // Find the shells corresponding to the region from the Start vertex and end vertex.
-    let mut start_shell =
-        vertex::shell_in_region(b, start, Some(region))?.ok_or(SolidError::sm_err(OP))?;
-    let mut end_shell =
-        vertex::shell_in_region(b, end, Some(region))?.ok_or(SolidError::sm_err(OP))?;
+    let mut start_shell = vertex::shell_in_region(b, start, Some(region))?.ok_or_else(|| {
+        SolidError::topology(OP, TopologyFailure::VertexNotInRegion { at_end: false })
+    })?;
+    let mut end_shell = vertex::shell_in_region(b, end, Some(region))?.ok_or_else(|| {
+        SolidError::topology(OP, TopologyFailure::VertexNotInRegion { at_end: true })
+    })?;
 
     // Transfer stuff from end shell to start shell if they are different.
     if shell_is_vertex_shell(b, start_shell)? && !shell_is_vertex_shell(b, end_shell)? {
@@ -1967,16 +2737,31 @@ pub fn make_edge_topology(
     }
 
     if start_shell != end_shell {
+        let mut remove_end = true;
         if shell_is_vertex_shell(b, end_shell)? {
             let vu = shell_vertexuse(b, end_shell)?;
-            remove_vertexuse_from_vertex(b, vu)?;
+            delete_vertexuse(b, vu)?;
             shell_clear_members(b, end_shell)?;
+        } else if b.shell(start_shell)?.is_wire_shell() && b.shell(end_shell)?.is_faceuse_shell() {
+            // WR-585 (fork tangency-labs/smlib@be8ac73): the faceuse shell takes the wire
+            // shell's wires and its place in the region, and the wire shell goes, instead
+            // of moving every face use into the wire shell.
+            let reg = shell_region(b, start_shell)?.ok_or(null_deref("shell without region"))?;
+            shell_transfer_children(k, b, start_shell, end_shell)?;
+            shell::region_remove_shell(b, reg, end_shell)?;
+            region_insert_shell_after(b, reg, end_shell, start_shell)?;
+            shell::region_remove_shell(b, reg, start_shell)?;
+            shell::destroy(k, b, start_shell, env)?;
+            start_shell = end_shell;
+            remove_end = false;
         } else {
             shell_transfer_children(k, b, end_shell, start_shell)?;
         }
-        region_remove_shell(b, end_shell)?;
-        // delete pEndShell (SmBrep.cpp:13724): ~SmShell, ported as shell::destroy
-        shell::destroy(k, b, end_shell, env)?;
+        if remove_end {
+            region_remove_shell(b, end_shell)?;
+            // delete pEndShell (SmBrep.cpp:13724): ~SmShell, ported as shell::destroy
+            shell::destroy(k, b, end_shell, env)?;
+        }
     }
 
     let (e, eu) = link_new_wire_edge(b, start, end)?;
@@ -2025,6 +2810,27 @@ fn face_create_uv_trim_curves(
 /// The shell's owner (`m_pListOwner`) is already the region.
 fn region_post_insert_shell(b: &mut Brep, r: RegionId, s: ShellId) -> Result<()> {
     b.region_mut(r)?.shells.push(s);
+    b.shell_mut(s)?.region = Some(r);
+    Ok(())
+}
+
+/// `pRegion->InsertAfter(pShell, pAfter)` (`SmOwningTopology::InsertAfter`): puts
+/// `s` into the region's shell list just after `after` and makes the region its owner
+/// (WR-585's opt-in only; not in the pinned upstream's `MakeEdgeTopology`).
+///
+/// # Errors
+/// `InvalidInput` when `after` is not in the region's list, and dangling ids.
+fn region_insert_shell_after(b: &mut Brep, r: RegionId, s: ShellId, after: ShellId) -> Result<()> {
+    b.shell(s)?;
+    let list = &mut b.region_mut(r)?.shells;
+    let at = list
+        .iter()
+        .position(|&x| x == after)
+        .ok_or(SolidError::invalid_input(
+            OP,
+            "shell to insert after is not in the region",
+        ))?;
+    list.insert(at + 1, s);
     b.shell_mut(s)?.region = Some(r);
     Ok(())
 }
@@ -2088,7 +2894,7 @@ fn shell_transfer_children(k: &mut Kernel, b: &mut Brep, from: ShellId, to: Shel
 // ---- merging curves into faces ------------------------------------------------------------
 
 /// What [`merge_curves_on_surface`] needs of the caller's classification handles, on
-/// top of [`CurveOnClassifyObjects`] (which includes [`ClassGeometry`]) and
+/// top of [`CurveOnClassifyObjects`](crate::query::face::p2::CurveOnClassifyObjects) (which includes [`ClassGeometry`]) and
 /// [`MergeIntervalBrep`]: the adapter holds the B-rep the curves merge into, which
 /// upstream's `MergeIntervals` edits through the classification's topology pointers.
 pub trait MergeCurvesObjects<O: ClassObject>:
@@ -2164,7 +2970,7 @@ pub fn merge_curves_on_surface<O: ClassObject + Copy>(
 ) -> Result<MergedCurves> {
     // check state - m_bEditingEnabled must be on
     if !objects.brep().editing_enabled() {
-        return Err(SolidError::sm_err(OP));
+        return Err(SolidError::topology(OP, TopologyFailure::EditingDisabled));
     }
 
     let saved = k.context.doing_boolean();
@@ -2238,7 +3044,10 @@ fn merge_curves_body<O: ClassObject + Copy>(
                 let (coin, pos) = cc.are_coincident_maybe(k, &*objects, &cc, kk, false)?;
                 if coin == CoincidentMaybe::Unsure {
                     // This signals an unrecoverable error.
-                    return Err(SolidError::sm_err(OP));
+                    return Err(SolidError::topology(
+                        OP,
+                        TopologyFailure::CoincidenceUndecided,
+                    ));
                 }
                 if coin == CoincidentMaybe::Fixable {
                     connect_intervals(&mut cc, kk, pos)?;
@@ -2251,7 +3060,7 @@ fn merge_curves_body<O: ClassObject + Copy>(
             // (the new faces made before a failure are kept, as upstream's list)
             let (new_faces, r) = merge_intervals(k, objects, &mut cc)?;
             if let Err(e) = r {
-                if e.is_unported() {
+                if e.is_unported_or_cancelled() {
                     return Err(e);
                 }
             }
@@ -2352,7 +3161,11 @@ fn merge_intervals<O: ClassObject + Copy>(
 fn into_bspline(c: Curve) -> Result<BSplineCurve> {
     match c.into_kind() {
         CurveKind::BSpline(b) => Ok(b),
-        _ => Err(SolidError::null_pointer(OP)),
+        // (an intersection curve: no owner yet)
+        _ => Err(SolidError::topology(
+            OP,
+            TopologyFailure::CurveNotBSpline { entity: None },
+        )),
     }
 }
 
@@ -2441,16 +3254,26 @@ pub fn mate_lamina_edge_to_surface(
     let _ = uv_curve_extension_factor;
     // check state - m_bEditingEnabled must be on
     if !b.editing_enabled() {
-        return Err(SolidError::sm_err(OP));
+        return Err(SolidError::topology(OP, TopologyFailure::EditingDisabled));
     }
 
     // no work - not lamina edge
     if !eu1::edge_is_lamina(b, lamina)? {
-        return Err(SolidError::sm_err(OP));
+        return Err(SolidError::topology(OP, TopologyFailure::NotLamina));
     }
 
     let eu = eu1::primary_edgeuse(b, lamina)?.ok_or(null_deref("edge without edge use"))?;
-    let face = eu1::face(b, eu)?.ok_or(SolidError::null_pointer(OP))?;
+    let face = eu1::face(b, eu)?.ok_or_else(|| {
+        Failure::new(
+            OP,
+            TopologyFailure::Defect {
+                why: "the lamina edge's edge use has no face, though a lamina edge bounds one \
+                      face, whose loop holds its edge use",
+            },
+        )
+        .with_status(SM_ERR_NULL_POINTER)
+        .into_error()
+    })?;
     let face_ref = (env.key_of)(EntityRef::Face(face));
     face_notify(b, env, face, face_ref, NotifyOperation::PreEdit)?;
 
@@ -2467,7 +3290,10 @@ pub fn mate_lamina_edge_to_surface(
         .edge
         .ok_or(null_deref("edge use without edge"))?;
     if !eu1::edge_is_lamina(b, e_ccw)? && !edge::is_seam_of_surface(k, b, e_ccw, face)? {
-        return Err(SolidError::sm_err(OP));
+        return Err(SolidError::topology(
+            OP,
+            TopologyFailure::LaminaNeighbourBound,
+        ));
     }
     let eu_cw = b.edgeuse(eu)?.cw.ok_or(null_deref("edge use without CW"))?;
     let e_cw = b
@@ -2475,7 +3301,10 @@ pub fn mate_lamina_edge_to_surface(
         .edge
         .ok_or(null_deref("edge use without edge"))?;
     if !eu1::edge_is_lamina(b, e_cw)? && !edge::is_seam_of_surface(k, b, e_cw, face)? {
-        return Err(SolidError::sm_err(OP));
+        return Err(SolidError::topology(
+            OP,
+            TopologyFailure::LaminaNeighbourBound,
+        ));
     }
 
     // Create an extended mating surface if it is a plane
@@ -2485,7 +3314,7 @@ pub fn mate_lamina_edge_to_surface(
         domain.expand_absolute(domain.size().length() * surface_extension_factor);
         // status ignored
         if let Err(e) = p.adjust_step_uv_domain(&domain) {
-            if e.is_unported() {
+            if e.is_unported_or_cancelled() {
                 return Err(e);
             }
         }
@@ -2546,7 +3375,13 @@ pub fn mate_lamina_edge_to_surface(
                 "negative surface extension distance",
             ));
         }
-        surf.create_extended_surface(k, ext_dist, ContinuityType::G1R)?
+        surf.extended_sides(
+            k,
+            &crate::surface::side::BoxSide::ALL,
+            crate::surface::extend::Continuity::Ruled,
+            ext_dist,
+        )?
+        .surface
     };
     let ext_domain = ext_surface.natural_uv_domain_with_nurb(k)?;
 
@@ -2627,35 +3462,38 @@ pub fn mate_lamina_edge_to_surface(
 
     // If we did not find the solutions we are done with an error
     let Some((sol_ccw, sol_cw, mut found_3d, mut found_uv)) = found else {
-        return Err(SolidError::sm_err(OP));
+        return Err(SolidError::topology(OP, TopologyFailure::NoMatingCurve));
     };
 
     // Here we found solutions to things - do some trimming and to get the proper
     // length curves.
     let ccw_trim = sol_ccw.start.param(0)?;
     let mut ccw_trim_ivl = ccw_ext.natural_interval();
-    let _ = if ccw_orient == OrientType::Same {
+    // (fork 60a8a51 passes both interval statuses on: `SER`)
+    let set = if ccw_orient == OrientType::Same {
         ccw_trim_ivl.set_min_max(ccw_trim, ccw_trim_ivl.max())
     } else {
         ccw_trim_ivl.set_min_max(ccw_trim_ivl.min(), ccw_trim)
     };
+    set?;
     // may snap sIvl by tol to existing knots
     match ccw_ext.trim(k, &mut ccw_trim_ivl, TrimMode::Notify) {
         Ok(()) => {}
-        Err(e) if e.is_unported() => return Err(e),
+        Err(e) if e.is_unported_or_cancelled() => return Err(e),
         Err(_) => return Ok(()),
     }
 
     let cw_trim = sol_cw.start.param(0)?;
     let mut cw_trim_ivl = cw_ext.natural_interval();
-    let _ = if cw_orient == OrientType::Same {
+    let set = if cw_orient == OrientType::Same {
         cw_trim_ivl.set_min_max(cw_trim_ivl.min(), cw_trim)
     } else {
         cw_trim_ivl.set_min_max(cw_trim, cw_trim_ivl.max())
     };
+    set?;
     match cw_ext.trim(k, &mut cw_trim_ivl, TrimMode::Notify) {
         Ok(()) => {}
-        Err(e) if e.is_unported() => return Err(e),
+        Err(e) if e.is_unported_or_cancelled() => return Err(e),
         Err(_) => return Ok(()),
     }
 
@@ -2783,23 +3621,21 @@ pub fn mate_lamina_edge_to_surface(
                     true,
                 )?
             } else {
-                // the face's surface reaches its face's cache (smsurf_GetSurfaceCache),
-                // made on the B-rep: an exact evaluation copy of the surface meanwhile
+                // the face's surface (an exact evaluation copy, as the B-rep is borrowed
+                // meanwhile); the lift reads its continuities and makes no cache
                 let surface = b
                     .face(face)?
                     .surface
                     .as_ref()
                     .ok_or(null_deref("face without surface"))?
                     .clone_for_evaluation()?;
-                surface.lift_curve_with_context(
+                surface.lift_curve(
                     k,
                     &face_domain,
                     &side_curve,
                     &side_curve.natural_interval(),
                     tol,
                     true,
-                    &mut crate::query::brep::BrepFaceServices::new(b),
-                    Some(CacheObject::Surface(face)),
                 )?
             };
             let new_3d = lifted.curve;
@@ -2837,15 +3673,16 @@ fn set_vertex_point(b: &mut Brep, env: &mut NotifyEnv<'_>, v: VertexId, p: Point
     )
 }
 
-/// `pEU->GetOrCreateUVTrimCurve(pUV)` (status ignored; header defaults `NULL`, `NULL`,
-/// `TRUE`), then `SER(pUV->Copy(..))`: a copy of the edge use's UV trim curve. A
-/// missing curve is dereferenced upstream (after its `SM_ASSERT`). UV trim curves are
+/// `pEU->GetOrCreateUVTrimCurve(pUV)` (status ignored upstream, passed on here, WR-658;
+/// header defaults `NULL`, `NULL`, `TRUE`), then `SER(pUV->Copy(..))`: a copy of the edge
+/// use's UV trim curve. A missing curve is dereferenced upstream (after its `SM_ASSERT`). UV trim curves are
 /// made as B-splines (the `SmBSplineCurve*&` overload casts). An `SmLine` is an
 /// `SmBSplineCurve`: its copy serves `CreateExtendedCurve` through its B-spline part,
 /// whose NURB `GetOrCreateGwNurbPointer` makes (`MakeNurb`, the `SmLine` override; status
 /// ignored) when missing. A curve of another kind is [`SolidError::InvalidInput`].
 fn uv_trim_curve_copy(k: &Kernel, b: &mut Brep, eu: EdgeuseId) -> Result<BSplineCurve> {
-    let _ = eu3::get_or_create_uv_trim_curve(k, b, eu, false, false, true)?;
+    // (status ignored upstream; fork 60a8a51 passes it on: `SER`)
+    eu3::get_or_create_uv_trim_curve(k, b, eu, false, false, true)?.status?;
     let curve = eu1::uv_trim_curve(b, eu)?
         .0
         .ok_or(null_deref("edge use without UV trim curve"))?;
@@ -2866,7 +3703,7 @@ fn uv_trim_curve_copy(k: &Kernel, b: &mut Brep, eu: EdgeuseId) -> Result<BSpline
 }
 
 /// `SER(pEU->GetOrCreateUVTrimCurve(pUV))` then `pUV->Trim(ivl)` (`bNotify` default
-/// `TRUE`; status ignored, only [`SolidError::Unported`] propagates). The curve is the
+/// `TRUE`; status ignored upstream, passed on as the fork does). The curve is the
 /// one of the edge use or its mate (the owner of the pair's curve); a missing curve is
 /// dereferenced upstream.
 fn trim_uv_trim_curve(k: &Kernel, b: &mut Brep, eu: EdgeuseId, ivl: &Extent1d) -> Result<()> {
@@ -2881,10 +3718,9 @@ fn trim_uv_trim_curve(k: &Kernel, b: &mut Brep, eu: EdgeuseId, ivl: &Extent1d) -
         .ok_or(null_deref("edge use without UV trim curve"))?;
     // may snap sIvl by tol to existing knots
     let mut trim_ivl = *ivl;
-    match curve.trim(k, &mut trim_ivl, TrimMode::Notify) {
-        Err(e) if e.is_unported() => Err(e),
-        _ => Ok(()),
-    }
+    // (status ignored upstream; fork 60a8a51 passes the trim's status on: `SER`)
+    curve.trim(k, &mut trim_ivl, TrimMode::Notify)?;
+    Ok(())
 }
 
 /// `SER(pEU->NormalizedEvaluate(t, FALSE, pnt))` (3D; header defaults: no derivative,
@@ -2893,209 +3729,5 @@ fn normalized_evaluate_3d(k: &Kernel, b: &mut Brep, eu: EdgeuseId, t: f64) -> Re
     Ok(eu3::normalized_evaluate(k, b, eu, t, false, false, true)?.point)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::surface::plane::Plane;
-    use crate::topology::Face;
 
-    fn line(a: Point3, b: Point3) -> Curve {
-        Curve::from(BSplineCurve::create_line_segment(3, a, b).unwrap())
-    }
-
-    /// A B-rep with one vertex, one edge (a line from the origin to (2, 0, 0)) and one
-    /// face on the plane z = 1.
-    fn brep() -> (Brep, VertexId, EdgeId, FaceId) {
-        let mut b = Brep::new();
-        let v = b.add_vertex(Point3::new(1.0, 2.0, 3.0)).unwrap();
-        let e = b.add_edge(v, v).unwrap();
-        b.edge_mut(e).unwrap().curve =
-            Some(line(Point3::new(0.0, 0.0, 0.0), Point3::new(2.0, 0.0, 0.0)));
-        let s = b.add_shell().unwrap();
-        let f = b.add_face_record(Face::new(s)).unwrap();
-        b.face_mut(f).unwrap().surface = Some(Surface::from(Plane::from_normal(
-            Point3::new(0.0, 0.0, 1.0),
-            Vec3::new(0.0, 0.0, 1.0),
-        )));
-        (b, v, e, f)
-    }
-
-    /// A region key that is no region of the notifying B-rep stays unresolved
-    /// (the documented gap of [`BrepRegions`]); a region of the B-rep resolves.
-    #[test]
-    fn brep_regions_lookup_defers_foreign_key() {
-        use crate::topology::loopuse::notify_ref;
-        use shell::RegionLookup;
-        let (b, _, _, _) = brep();
-        let key_of = |e: EntityRef| notify_ref(e);
-        let lookup = BrepRegions {
-            b: &b,
-            key_of: &key_of,
-        };
-        for (id, _) in b.regions().iter() {
-            let k = notify_ref(EntityRef::Region(id)).key;
-            assert!(lookup.resolve_region(k).is_ok());
-        }
-        let foreign = notify_ref(EntityRef::Region(RegionId::from_index(99))).key;
-        assert!(matches!(
-            lookup.resolve_region(foreign),
-            Err(SolidError::Unported {
-                unit: "topology.shell",
-                ..
-            })
-        ));
-    }
-
-    /// The region keys of a [`RegionNotifyState`] are arena identities: the heal path's
-    /// tracker (`entity_of_notify_key`, the inverse of `notify_ref`) decodes a split's
-    /// regions back to themselves for every index (a bare index decoded region `r >= 1`
-    /// as `Brep(r - 1)`), and rejects the record-less key of any other entity.
-    #[test]
-    fn region_only_keys_decode_as_the_tracker_reads_them() {
-        use crate::topology::loopuse::{entity_of_notify_key, notify_ref};
-        use crate::topology::RegionId;
-        for i in [0, 1, 2, 7, u32::MAX] {
-            let r = EntityRef::Region(RegionId::from_index(i));
-            let key = region_only_key(r);
-            assert_eq!(key, notify_ref(r));
-            assert_eq!(entity_of_notify_key(key.key), Some(r));
-        }
-        let other = region_only_key(EntityRef::Face(FaceId::from_index(1)));
-        assert_eq!(entity_of_notify_key(other.key), None);
-        let mut b = Brep::new();
-        let r0 = b
-            .add_region_record(crate::topology::Region::default())
-            .unwrap();
-        let r1 = b
-            .add_region_record(crate::topology::Region::default())
-            .unwrap();
-        let state = RegionNotifyState::new(&b);
-        for r in [r0, r1] {
-            let key = region_only_key(EntityRef::Region(r)).key;
-            assert!(state.records.contains_key(&key));
-            assert_eq!(entity_of_notify_key(key), Some(EntityRef::Region(r)));
-        }
-    }
-
-    /// `MakeEdgeTopology` between two shell vertices deletes the end vertex shell
-    /// (`delete pEndShell`): the region keeps one wire shell and the arena no orphan.
-    #[test]
-    fn edge_between_shell_vertices_deletes_the_merged_shell() {
-        let mut k = Kernel::default();
-        let mut b = Brep::new_with_infinite_region().unwrap();
-        let (_, v1) = make_shell_vertex_topology(&mut b, None).unwrap();
-        let (end_shell, v2) = make_shell_vertex_topology(&mut b, None).unwrap();
-        assert_eq!(b.shells().len(), 2);
-        let mut state = ArenaNotifyState::new(&b);
-        let mut env = state.env(None);
-        make_edge_topology(&mut k, &mut b, None, v1, v2, &mut env).unwrap();
-        assert_eq!(b.shells().len(), 1);
-        assert!(b.shell(end_shell).is_err());
-        let region = b.infinite_region().unwrap();
-        assert_eq!(b.region(region).unwrap().shells.len(), 1);
-    }
-
-    fn solution(objects: &[CacheObject], params: &[f64]) -> Solution<CacheObject> {
-        let mut s = Solution::new();
-        for (i, o) in objects.iter().enumerate() {
-            s.objects[i] = Some(*o);
-        }
-        s.num_objects = objects.len();
-        for (i, p) in params.iter().enumerate() {
-            s.start.parameters[i] = *p;
-        }
-        s
-    }
-
-    #[test]
-    fn point_from_solution_walks_the_parameters() {
-        let (b, v, e, f) = brep();
-        // edge (1 parameter), face (2), vertex (0), curve (1)
-        let objs = [
-            CacheObject::Edge(e),
-            CacheObject::Face(f),
-            CacheObject::Vertex(v),
-            CacheObject::Curve(e),
-        ];
-        let s = solution(&objs, &[0.25, 0.5, 0.75, 1.0]);
-        let edge = b.edge(e).unwrap().curve.as_ref().unwrap();
-        assert_eq!(
-            point_from_solution(&Kernel::default(), &b, &s, 0).unwrap(),
-            edge.evaluate_point(&Kernel::default(), 0.25).unwrap()
-        );
-        let plane = b.face(f).unwrap().surface.as_ref().unwrap();
-        assert_eq!(
-            point_from_solution(&Kernel::default(), &b, &s, 1).unwrap(),
-            plane
-                .evaluate_point(&Kernel::default(), Point2::new(0.5, 0.75))
-                .unwrap()
-        );
-        assert_eq!(
-            point_from_solution(&Kernel::default(), &b, &s, 2).unwrap(),
-            Point3::new(1.0, 2.0, 3.0)
-        );
-        assert_eq!(
-            point_from_solution(&Kernel::default(), &b, &s, 3).unwrap(),
-            edge.evaluate_point(&Kernel::default(), 1.0).unwrap()
-        );
-    }
-
-    #[test]
-    fn point_from_solution_odd_objects() {
-        let (b, _, _, f) = brep();
-        // a surface object is no curve, edge, vertex or face: SE(SM_ERR), the origin
-        let s = solution(&[CacheObject::Surface(f)], &[]);
-        assert_eq!(
-            point_from_solution(&Kernel::default(), &b, &s, 0).unwrap(),
-            Point3::new(0.0, 0.0, 0.0)
-        );
-        // a null object is dereferenced upstream
-        let s = solution(&[], &[]);
-        assert!(matches!(
-            point_from_solution(&Kernel::default(), &b, &s, 0),
-            Err(SolidError::InvalidInput { .. })
-        ));
-    }
-
-    #[test]
-    fn check_and_fix_without_edge_uses() {
-        let (mut b, ..) = brep();
-        let k = Kernel::default();
-        check_and_fix_uv_trim_curves(&k, &mut b).unwrap();
-    }
-
-    #[test]
-    fn notify_without_cache_only_propagates() {
-        let (b, _, e, _) = brep();
-        let mut records = crate::topology::topology::NotifyRecords::new();
-        let mut attrs = AttributeStore::default();
-        let key_of = |x: EntityRef| ObjectRef {
-            type_code: 0,
-            key: ObjectKey(match x {
-                EntityRef::Edge(e) => u64::from(e.index()) + 1,
-                _ => 0,
-            }),
-        };
-        let mut env = NotifyEnv {
-            records: &mut records,
-            attributes: &mut attrs,
-            context: None,
-            key_of: &key_of,
-        };
-        for op in [
-            NotifyOperation::AddToBrep,
-            NotifyOperation::RmFromBrep,
-            NotifyOperation::PreEdit,
-            NotifyOperation::Destruction,
-        ] {
-            notify(
-                &b,
-                &mut env,
-                None,
-                op,
-                [Some(NotifyArg::Entity(EntityRef::Edge(e))), None, None],
-            )
-            .unwrap();
-        }
-    }
-}
+// Modified for Makepad by fab/brep/sync/tool (fab/brep/SYNC.md): S1.

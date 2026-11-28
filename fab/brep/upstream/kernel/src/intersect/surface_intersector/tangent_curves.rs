@@ -1,9 +1,10 @@
 //! The tangential intersection curve pass of the surface/surface intersector: traces the
 //! curves along which the two surfaces touch, and the crossing branches through the
-//! contact points where crossing curves meet (opt-in, WR-75).
+//! contact points where crossing curves meet (WR-75; not run in a self intersection whose
+//! two domains overlap or touch).
 //!
-//! Upstream: the source fork's `source/SMLib/src/SmTangentCurveTracer.cpp`
-//! (source fork ef4ab25, e9fde8f, d8c61db, 1693c9d; not in the pinned SMLib).
+//! Upstream: the SolidCraft fork's `source/SMLib/src/SmTangentCurveTracer.cpp`
+//! (tangency-labs/smlib ef4ab25, e9fde8f, d8c61db, 1693c9d; not in the pinned SMLib).
 //! The solver core (`TcTracer` and its helpers) is
 //! [`crate::intersect::surface_intersector::tangent_tracer`].
 //!
@@ -20,7 +21,11 @@
 //! of the through points is their list order. Loops are bounded as the fork's are (50
 //! nodes, 12 refinement passes, 6000 points per curve); no recursion.
 //! `IsDegenerate` is a plain bool in the fork: an evaluation error there counts as not
-//! degenerate (`Unported` still stops the pass).
+//! degenerate (`Unported` still stops the pass). Not the fork's (#2089): a crossing
+//! branch through nodes that a marcher curve covers except where it runs inside the
+//! band where the surfaces are within tolerance of each other is dropped
+//! (`covers_crossing`), so the marcher's curve is not replaced by one running on along
+//! a tangency past the point where the surfaces turn tangent.
 
 use crate::curve::curve::Curve;
 use crate::error::{ignored, Result};
@@ -35,6 +40,7 @@ use crate::intersect::surface_intersector::tangent_tracer::{
     tc_near_poly, tc_poly_dist, tc_tangents, tc_uv_der, SolveMode, TangentTracer, TcPt,
 };
 use crate::kernel::Kernel;
+use crate::math::det;
 use crate::math::{Point2, Point3, Vec3, EFF_ZERO, PI};
 use crate::nurbs::b_spline_curve::BSplineCurve;
 use crate::surface::surface::p2::TsectCurveType;
@@ -95,7 +101,7 @@ fn drop_distance(k: &Kernel, c: &Curve, x: Vec3, tol: f64) -> Result<Option<f64>
         SolverOperation::Minimize,
     ) {
         Ok(d) if d.success => Ok(Some(d.distance)),
-        Err(e) if e.is_unported() => Err(e),
+        Err(e) if e.is_unported_or_cancelled() => Err(e),
         Ok(_) | Err(_) => Ok(None),
     }
 }
@@ -105,7 +111,7 @@ fn drop_distance(k: &Kernel, c: &Curve, x: Vec3, tol: f64) -> Result<Option<f64>
 fn curve_point(k: &Kernel, c: &Curve, t: f64) -> Result<Option<Point3>> {
     match c.evaluate_point(k, t) {
         Ok(p) => Ok(Some(p)),
-        Err(e) if e.is_unported() => Err(e),
+        Err(e) if e.is_unported_or_cancelled() => Err(e),
         Err(_) => Ok(None),
     }
 }
@@ -126,9 +132,50 @@ fn covers(k: &Kernel, c: &Curve, rc: &[TcPt], tol: f64, cov_tol: f64) -> Result<
     Ok(true)
 }
 
+/// Whether the regular marcher's curve `c` covers the crossing branch `rc` (not the
+/// fork's; #2089): as [`covers`], except that a sample off `c` is passed over where the
+/// branch crosses at so small an angle that it lies in the band where the surfaces are
+/// within tolerance of each other, the band the replacement test below caps at
+/// `0.02 * size` (`20 tol / sin(angle) >= 0.02 size`). There the branch's course is
+/// not determined by the surfaces, and the marcher stops where they turn tangent. At
+/// least one sample outside that band must lie on `c`.
+fn covers_crossing(
+    k: &Kernel,
+    c: &Curve,
+    rc: &[TcPt],
+    tol: f64,
+    cov_tol: f64,
+    size: f64,
+) -> Result<bool> {
+    let stride = (rc.len() / 40).max(1);
+    let mut on = false;
+    let mut i = 0;
+    while i < rc.len() {
+        let Some(p) = rc.get(i) else { break };
+        let in_band = 20.0 * tol >= 0.02 * size * det::sin(p.ang);
+        match drop_distance(k, c, p.p, tol * 10.0)? {
+            Some(d) if d <= cov_tol => on |= !in_band,
+            _ if in_band => {}
+            _ => return Ok(false),
+        }
+        i += stride;
+    }
+    Ok(on)
+}
+
+/// Whether every direction in `dirs` lies within 30 degrees (the width of a probe's
+/// direction cluster) of one line through the point: one curve passing through it, not
+/// branches meeting there. Two branches crossing at less than 30 degrees fall in it too:
+/// the probe's clusters cannot tell them from one curve.
+fn along_one_line(dirs: &[Vec3]) -> bool {
+    let cos30 = det::cos(deg2rad(30.0));
+    dirs.first()
+        .is_none_or(|&d0| dirs.iter().all(|d| d.dot(d0).abs() > cos30))
+}
+
 /// Removes curve `ii` from the five output arrays (`delete pC; RemoveAt(ii)` and the
 /// guarded `RemoveAt`s of the associated arrays).
-fn remove_curve(out: &mut TsectCurves, ii: usize) {
+pub(super) fn remove_curve(out: &mut TsectCurves, ii: usize) {
     if ii < out.curves_3d.len() {
         out.curves_3d.remove(ii);
     }
@@ -173,7 +220,9 @@ struct NewCurve {
 /// # Errors
 ///
 /// Those of `FlushCurve` and of the evaluations upstream checks;
-/// [`crate::SolidError::Unported`] from any callee.
+/// [`crate::SolidError::Unported`] from any callee; [`crate::SolidError::Cancelled`],
+/// polled for every seed, node and refinement pass and in the march (not the fork's: the
+/// pass runs on every intersection, #18930).
 #[allow(clippy::too_many_lines)] // one fork routine
 pub(crate) fn find_tangent_curves(
     k: &Kernel,
@@ -231,7 +280,7 @@ pub(crate) fn find_tangent_curves(
                 let Some(e2) = tr.eval(k, 1, b.x, b.y)? else {
                     continue;
                 };
-                if e1.n.dot(e2.n).abs() < deg2rad(1.0).cos() {
+                if e1.n.dot(e2.n).abs() < det::cos(deg2rad(1.0)) {
                     continue;
                 }
             }
@@ -255,6 +304,7 @@ pub(crate) fn find_tangent_curves(
     let mut contacts: Vec<Vec3> = Vec::new(); // contact points already classified
     let near_tol = smax(100.0 * tol, 1e-4 * size);
     for seed in &seeds {
+        k.check_cancelled(OP)?;
         let mut x = [seed[0].x, seed[0].y, seed[1].x, seed[1].y];
         let Some(e1) = tr.eval(k, 0, x[0], x[1])? else {
             continue;
@@ -265,7 +315,7 @@ pub(crate) fn find_tangent_curves(
         if len(e1.p - e2.p) > 0.01 * size {
             continue;
         }
-        if e1.n.dot(e2.n).abs() < deg2rad(10.0).cos() {
+        if e1.n.dot(e2.n).abs() < det::cos(deg2rad(10.0)) {
             continue;
         }
         tr.sign = if e1.n.dot(e2.n) < 0.0 { -1.0 } else { 1.0 };
@@ -309,20 +359,30 @@ pub(crate) fn find_tangent_curves(
         }
         if num_dirs == 0 {
             // no tangential curve here: a touching point, or a point where crossing
-            // branches meet (a saddle-like contact)
+            // branches meet (a saddle-like contact). A contact whose crossing directions
+            // all lie along one line is a point of one curve passing through, not a node
+            // (#18930): along a round's rail, on the edge of the round's domain where it
+            // touches its support face and the marcher already returns a tangent curve,
+            // such contacts were reported as touching points, and the round failed.
             tr.tangent = false;
             let mut cross_dirs = Vec::new();
             let num_cross = tr.probe(k, &p, &mut cross_dirs)?;
             tr.tangent = true;
             let node_known = nodes.iter().any(|n| len(n.p - p.p) < near_tol);
-            if num_cross >= 2 && !node_known {
+            // nor is a contact where the surfaces only come within tolerance of each
+            // other, between crossing branches that pass it (#18930)
+            if num_cross >= 2
+                && !node_known
+                && !along_one_line(&cross_dirs)
+                && tr.meets(k, &p.x)? != Some(false)
+            {
                 nodes.push(p);
                 node_dirs.push(cross_dirs);
             }
             continue;
         }
 
-        let (Some(&d0), Some(&d1)) = (dirs.first(), dirs.get(1).or(dirs.first())) else {
+        let (Some(&d0), Some(&d1)) = (dirs.first(), dirs.get(1).or_else(|| dirs.first())) else {
             continue;
         };
         if num_dirs <= 2 {
@@ -372,6 +432,7 @@ pub(crate) fn find_tangent_curves(
     tr.tangent = false;
     let mut in_ = 0;
     while in_ < nodes.len() && in_ < 50 {
+        k.check_cancelled(OP)?;
         let node = *nodes
             .get(in_)
             .ok_or_else(|| crate::SolidError::invalid_input(OP, "node index"))?;
@@ -417,7 +478,7 @@ pub(crate) fn find_tangent_curves(
                     c.n = e1.n;
                     c.n2 = e2.n;
                     c.gap = len(e1.p - e2.p);
-                    c.ang = smin(1.0, len(e1.n.cross(e2.n))).asin();
+                    c.ang = det::asin(smin(1.0, len(e1.n.cross(e2.n))));
                     if c.gap < 10.0 * tol {
                         charts.push(c);
                     }
@@ -455,7 +516,7 @@ pub(crate) fn find_tangent_curves(
                 let closed = tr.march(k, &n, dir, &n, &mut fwd, Some(&mut nodes))?;
                 if !closed {
                     // the smooth continuation backwards through N
-                    let mut best = deg2rad(45.0).cos();
+                    let mut best = det::cos(deg2rad(45.0));
                     let mut back: Option<usize> = None;
                     for (j, d) in dirs.iter().enumerate() {
                         let c = -d.dot(dir);
@@ -499,6 +560,7 @@ pub(crate) fn find_tangent_curves(
         tr.sign = nc.sign;
         let rc = &mut nc.pts;
         for _pass in 0..12 {
+            k.check_cancelled(OP)?;
             let (tan, fd) = tc_tangents(rc, nc.closed)?;
             let mut refined: Vec<TcPt> = Vec::new();
             let mut inserted = false;
@@ -590,8 +652,9 @@ pub(crate) fn find_tangent_curves(
     }
 
     // a crossing branch an existing curve already covers is dropped (the regular
-    // marcher's curve is kept); existing curves lying along the remaining crossing
-    // branches are replaced by them
+    // marcher's curve is kept), also when it runs on past that curve only inside the
+    // band where the surfaces are within tolerance (not the fork's; #2089); existing
+    // curves lying along the remaining crossing branches are replaced by them
     let mut keep = vec![true; new_curves.len()];
     for (nc, kp) in new_curves.iter().zip(keep.iter_mut()) {
         if !nc.cross {
@@ -604,7 +667,9 @@ pub(crate) fn find_tangent_curves(
             if ignored(c.is_degenerate(k, EFF_ZERO, None))?.unwrap_or(false) {
                 continue;
             }
-            if covers(k, c, &nc.pts, tol, near_tol)? {
+            if covers(k, c, &nc.pts, tol, near_tol)?
+                || covers_crossing(k, c, &nc.pts, tol, near_tol, size)?
+            {
                 *kp = false;
             }
         }
@@ -637,7 +702,7 @@ pub(crate) fn find_tangent_curves(
                     let a1 = rb
                         .get(seg.saturating_add(1).min(rb.len().saturating_sub(1)))
                         .map_or(0.0, |p| p.ang);
-                    let sin = smin(a0, a1).sin();
+                    let sin = det::sin(smin(a0, a1));
                     let band = smax(near_tol, 20.0 * tol / smax(sin, 1e-12));
                     if dist < smin(band, 0.02 * size) {
                         near = true;
@@ -806,3 +871,92 @@ pub(crate) fn add_tangent_nodes(
 }
 
 const OP: &str = "intersect::surface_intersector::tangent_curves::find_tangent_curves";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel::CancelToken;
+    use crate::nurbs::b_spline_surface::BSplineSurface;
+    use crate::nurbs::math::CPoint;
+    use crate::nurbs::srf_basic::Surface as NurbSurface;
+    use crate::surface::surface::Surface;
+
+    /// A bilinear patch over `[-1, 1]^2` through the heights `z` at its corners
+    /// `(-1, -1)`, `(1, -1)`, `(-1, 1)`, `(1, 1)`.
+    fn bilinear(z: [f64; 4]) -> Surface {
+        Surface::from(
+            BSplineSurface::create_bilinear_surface(
+                Vec3::new(-1.0, -1.0, z[0]),
+                Vec3::new(1.0, -1.0, z[1]),
+                Vec3::new(-1.0, 1.0, z[2]),
+                Vec3::new(1.0, 1.0, z[3]),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// `z = x^2` over `[-1, 1]^2`: it touches the plane `z = 0` along the line `x = 0`.
+    fn parabolic_cylinder() -> Surface {
+        let net = [[-1.0, 1.0], [0.0, -1.0], [1.0, 1.0]]
+            .iter()
+            .map(|&[x, z]| vec![CPoint::new(x, -1.0, z, 1.0), CPoint::new(x, 1.0, z, 1.0)])
+            .collect();
+        let knots = |p: usize| [vec![0.0; p + 1], vec![1.0; p + 1]].concat();
+        let nurb = NurbSurface::new(net, 2, 1, knots(2), knots(1)).unwrap();
+        Surface::from(BSplineSurface::from_nurb(nurb, false))
+    }
+
+    /// The pass on `a` and `b` (natural domains, tolerance `1e-6`, model size 2) from one
+    /// seed at the middle of both; its nodes and the curves it flushed.
+    fn trace(k: &Kernel, a: &Surface, b: &Surface) -> Result<(usize, TsectCurves)> {
+        let doms = [
+            a.natural_uv_domain_with_nurb(k).unwrap(),
+            b.natural_uv_domain_with_nurb(k).unwrap(),
+        ];
+        let mut si = SurfaceIntersector::new(k, a, &doms[0], b, &doms[1], false).unwrap();
+        si.this_approx_tol_3d = 1e-6;
+        let mid = Point2::new(0.5, 0.5);
+        let mut out = TsectCurves::default();
+        let nodes = find_tangent_curves(k, &mut si, 2.0, &[[mid, mid]], &mut out)?;
+        Ok((nodes.len(), out))
+    }
+
+    /// #18930: the pass, now on every intersection, stops at a cancellation wherever it
+    /// polls: before each seed, node and refinement pass and at each march step. A
+    /// cancellation at any of its first polls ends it with `Cancelled`; with polls
+    /// enough, the tangent line of a parabolic cylinder on a plane is traced.
+    #[test]
+    fn the_tangent_curve_pass_stops_when_cancelled() {
+        let (a, b) = (parabolic_cylinder(), bilinear([0.0; 4]));
+        let mut polls = 0;
+        loop {
+            polls += 1;
+            assert!(polls < 10_000, "never finished");
+            let mut k = Kernel::default();
+            k.set_cancel_token(CancelToken::after_polls(polls));
+            match trace(&k, &a, &b) {
+                Ok((_, out)) => {
+                    assert_eq!(out.curve_types, [TsectCurveType::Tangent]);
+                    break;
+                }
+                Err(e) => assert!(e.is_cancelled(), "{e:?}"),
+            }
+        }
+        // a seed, the march steps both ways and the refinement passes
+        assert!(polls > 10, "{polls}");
+    }
+
+    /// #18930: `z = xy + 1e-9` comes within `1e-9` of the plane `z = 0` at the origin,
+    /// inside the tolerance `1e-6`, with parallel normals, and crosses it along the
+    /// hyperbola `xy = -1e-9`, whose two branches pass the origin along the axes. The
+    /// surfaces do not meet at the origin, so it is no node where branches meet.
+    #[test]
+    fn a_contact_where_the_surfaces_do_not_meet_is_no_node() {
+        let k = Kernel::default();
+        let eps = 1e-9;
+        let saddle = bilinear([1.0 + eps, -1.0 + eps, -1.0 + eps, 1.0 + eps]);
+        let (nodes, out) = trace(&k, &saddle, &bilinear([0.0; 4])).unwrap();
+        assert_eq!(nodes, 0, "{:?}", out.curve_types);
+        assert!(out.curves_3d.is_empty(), "{:?}", out.curve_types);
+    }
+}

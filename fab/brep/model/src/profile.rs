@@ -390,10 +390,11 @@ fn shape_pieces(shape: &Shape) -> Result<Vec<Piece>, BrepError> {
 
 /// Each shape of a sketch as a closed chain of exact curves, in `frame`.
 pub fn sketch_curves(k: &Kernel, sketch: &Sketch, frame: &Frame) -> Result<Vec<Vec<Curve>>, BrepError> {
+    crate::guard::check_entry(k, "sketch_curves")?;
     let mut out = Vec::with_capacity(sketch.shapes.len());
     for (i, shape) in sketch.shapes.iter().enumerate() {
         let pieces = shape_pieces(shape).map_err(|e| input(format!("sketch shape {i}: {e}")))?;
-        let curves = pieces.iter().map(|p| p.curve(k, frame)).collect::<Result<Vec<_>, _>>().map_err(|e| input(format!("sketch shape {i}: {e}")))?;
+        let curves = pieces.iter().map(|p| p.curve(k, frame)).collect::<Result<Vec<_>, _>>().map_err(|e| e.input_context(format_args!("sketch shape {i}")))?;
         out.push(curves);
     }
     Ok(out)

@@ -86,7 +86,7 @@
 //!   output's storage when it is not null (and fails with `NL_STO_ERR` when it is too
 //!   small); the plain forms start from [`RealMatrix::null`]. Transposing a matrix
 //!   onto itself is [`RealMatrix::transpose_in_place`].
-//! - Errors are [`SolidError::Nlib`] values carrying the upstream `NL_*_ERR` number
+//! - Errors are [`SolidError::Failed`] values (a [`NurbsFailure`] reason) carrying the upstream `NL_*_ERR` number
 //!   instead of a flag plus the global `NL_ERROR` record, so `N_ErrClear` has no
 //!   counterpart. On error the outputs upstream leaves partly written are not
 //!   returned; matrices decomposed in place are left exactly as upstream leaves them.
@@ -115,7 +115,7 @@
 // Branches keep upstream's `if( x NEQ NL_NOZ ) ... else ...` order for traceability.
 #![allow(clippy::if_not_else)]
 
-use crate::error::{NlibCode, Result, SolidError};
+use crate::error::{nurbs::NurbsFailure, Result, SolidError};
 use crate::math::Vec3;
 use crate::nurbs::knots::MAX_DEGREE;
 
@@ -133,6 +133,20 @@ pub const ZERO_DISCRIMINANT_TOL: f64 = 1.0e-08;
 pub const ZERO_COEFFICIENT_TOL: f64 = 1.0e-12;
 /// `NL_MTOL`: model-space tolerance (default for [`CPoint::approx_eq`]).
 pub const MODEL_TOL: f64 = 1.0e-07;
+
+/// The unit roundoff of `f64`, `u = 2^-53` (half [`f64::EPSILON`]), for rounding to nearest.
+/// Not upstream: shared by the kernel's certified bounds and [`gamma`].
+pub const UNIT: f64 = f64::EPSILON * 0.5;
+
+/// `gamma_n = n u / (1 - n u)`, `u = UNIT`: the relative error bound of a chain
+/// of `n` rounded floating operations (Higham, the standard model). Not upstream: the one
+/// copy every certified bound in the kernel uses.
+#[must_use]
+pub fn gamma(n: usize) -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    let nu = n as f64 * UNIT;
+    nu / (1.0 - nu)
+}
 
 /// `NL_BIGD` (`DBL_MAX`).
 pub(crate) const BIGD: f64 = f64::MAX;
@@ -161,10 +175,6 @@ const OP_LST_SQ: &str = "nurbs::math::RealMatrix::lst_sq_solve";
 const OP_SRF_EVAL: &str = "nurbs::math::power_basis_srf_eval_pts";
 const OP_SRF_DERIVS: &str = "nurbs::math::srf_power_basis_eval_derivs";
 const OP_REALLOC: &str = "nurbs::math::realloc";
-
-fn nlib(operation: &'static str, code: NlibCode) -> SolidError {
-    SolidError::Nlib { operation, code }
-}
 
 fn out_of_range(operation: &'static str) -> SolidError {
     SolidError::InvalidInput {
@@ -255,6 +265,34 @@ impl CPoint {
         } else {
             Self::new(w * p.x, w * p.y, w * p.z, w)
         }
+    }
+
+    /// `alpha*A + (1 - alpha)*B`, as [`Self::combine2`] with `beta = 1 - alpha`, but a
+    /// coordinate `A` and `B` share is that coordinate exactly (not upstream): the
+    /// combination is affine, so it is that value in exact arithmetic, where the rounded
+    /// `alpha*x + beta*x` can land an ulp off it. Knot insertion uses it, so a curve cut
+    /// out of one along an iso-line (a UV trim on a seam or a domain side) stays on it.
+    /// A non-finite `alpha` (a zero-length knot span) has no affine combination: the
+    /// result is [`Self::combine2`]'s, NaN included, so the failure stays visible.
+    #[must_use]
+    pub fn affine2(alpha: f64, a: Self, b: Self) -> Self {
+        let mut r = Self::combine2(alpha, a, 1.0 - alpha, b);
+        if !alpha.is_finite() {
+            return r;
+        }
+        if a.x == b.x {
+            r.x = a.x;
+        }
+        if a.y == b.y {
+            r.y = a.y;
+        }
+        if a.z == b.z {
+            r.z = a.z;
+        }
+        if a.w == b.w {
+            r.w = a.w;
+        }
+        r
     }
 
     /// `alpha*A + beta*B` (`N_Combine2CPts`); a missing `z` in one operand drops that
@@ -662,7 +700,7 @@ impl QuadraticRoots {
 /// roots use `q = -(b + sgn(b)*sqrt(disc))/2`, `x1 = q/a`, `x2 = c/q`. Fails with
 /// `NL_NUM_ERR` when a division would overflow or underflow ([`float_op_is_bad`]).
 pub fn solve_quadratic(a: f64, b: f64, c: f64) -> Result<QuadraticRoots> {
-    let num_err = || nlib(OP_QUADRATIC, NlibCode::Numerical);
+    let num_err = || SolidError::nurbs(OP_QUADRATIC, NurbsFailure::Numerical);
     let ordered = |r1: f64, r2: f64| {
         if r1 > r2 {
             QuadraticRoots::Two(r2, r1)
@@ -1183,7 +1221,7 @@ impl RealMatrix {
 
     fn check_storage_for(&self, nr: usize, mc: usize, op: &'static str) -> Result<()> {
         if self.n < nr || self.m < mc {
-            return Err(nlib(op, NlibCode::Storage));
+            return Err(SolidError::nurbs(op, NurbsFailure::Storage));
         }
         Ok(())
     }
@@ -1224,10 +1262,10 @@ impl RealMatrix {
         let (na, ma, mta) = (self.n, self.m, self.mtp);
         let (nb, mb, mtb) = (b.n, b.m, b.mtp);
         if ma != nb {
-            return Err(nlib(OP, NlibCode::Index));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Index));
         }
         if mta == MatrixType::Banded || mtb == MatrixType::Banded {
-            return Err(nlib(OP, NlibCode::Input));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Input));
         }
         self.require_storage(OP)?;
         b.require_storage(OP)?;
@@ -1296,7 +1334,7 @@ impl RealMatrix {
                     }
                 }
                 (MatrixType::Banded, _) | (_, MatrixType::Banded) => {
-                    return Err(nlib(OP, NlibCode::Input));
+                    return Err(SolidError::nurbs(OP, NurbsFailure::Input));
                 }
             }
         }
@@ -1521,10 +1559,10 @@ impl RealMatrix {
         const OP: &str = OP_LU;
         let (n, m, mtp, bw) = (self.n, self.m, self.mtp, self.bw);
         if m != n {
-            return Err(nlib(OP, NlibCode::Index));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Index));
         }
         if mtp != MatrixType::Full && mtp != MatrixType::Banded {
-            return Err(nlib(OP, NlibCode::Input));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Input));
         }
         self.require_storage(OP)?;
         let sbw = bw / 2;
@@ -1544,7 +1582,7 @@ impl RealMatrix {
                     }
                     let aii = self.rd(i, i, OP)?;
                     if aii.abs() < LU_TOL {
-                        return Err(nlib(OP, NlibCode::Numerical));
+                        return Err(SolidError::nurbs(OP, NurbsFailure::Numerical));
                     }
                     let v = (self.rd(j, i, OP)? - sum) / aii;
                     self.wr(j, i, v, OP)?;
@@ -1571,7 +1609,7 @@ impl RealMatrix {
                     }
                     let pivot = self.rd(i, sbw, OP)?;
                     if pivot.abs() < LU_TOL {
-                        return Err(nlib(OP, NlibCode::Numerical));
+                        return Err(SolidError::nurbs(OP, NurbsFailure::Numerical));
                     }
                     let col = band_index(i, sbw, j, OP)?;
                     let v = (self.rd(j, col, OP)? - sum) / pivot;
@@ -1592,10 +1630,10 @@ impl RealMatrix {
         const OP: &str = OP_LU_PIVOT;
         let (n, m, mtp) = (self.n, self.m, self.mtp);
         if m != n {
-            return Err(nlib(OP, NlibCode::Index));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Index));
         }
         if mtp != MatrixType::Full {
-            return Err(nlib(OP, NlibCode::Input));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Input));
         }
         self.require_storage(OP)?;
         let mut v = filled(n.checked_add(1), 0.0, OP)?;
@@ -1610,7 +1648,7 @@ impl RealMatrix {
                 }
             }
             if big < LU_TOL {
-                return Err(nlib(OP, NlibCode::Numerical));
+                return Err(SolidError::nurbs(OP, NurbsFailure::Numerical));
             }
             *at_mut(&mut v, i, OP)? = 1.0 / big;
         }
@@ -1648,7 +1686,7 @@ impl RealMatrix {
             *at_mut(&mut ind, j, OP)? = imax;
             let ajj = self.rd(j, j, OP)?;
             if ajj.abs() < LU_TOL {
-                return Err(nlib(OP, NlibCode::Numerical));
+                return Err(SolidError::nurbs(OP, NurbsFailure::Numerical));
             }
             if j < n {
                 let dum = 1.0 / ajj;
@@ -1663,10 +1701,10 @@ impl RealMatrix {
     /// Checks the type of an LU-decomposed matrix for the substitution routines.
     fn lu_kind(&self, op: &'static str) -> Result<()> {
         if self.m != self.n {
-            return Err(nlib(op, NlibCode::Index));
+            return Err(SolidError::nurbs(op, NurbsFailure::Index));
         }
         if self.mtp != MatrixType::Full && self.mtp != MatrixType::Banded {
-            return Err(nlib(op, NlibCode::Input));
+            return Err(SolidError::nurbs(op, NurbsFailure::Input));
         }
         self.require_storage(op)
     }
@@ -1727,7 +1765,7 @@ impl RealMatrix {
         for i in (0..=n).rev() {
             let diag = self.rd(i, self.lu_col(i, i, sbw, OP)?, OP)?;
             if float_op_is_bad(1.0, diag, FloatOp::Division) {
-                return Err(nlib(OP, NlibCode::Numerical));
+                return Err(SolidError::nurbs(OP, NurbsFailure::Numerical));
             }
             let fact = 1.0 / diag;
             let mut s = Vec3::ZERO;
@@ -1770,7 +1808,7 @@ impl RealMatrix {
         for i in (0..=n).rev() {
             let diag = self.rd(i, self.lu_col(i, i, sbw, OP)?, OP)?;
             if float_op_is_bad(1.0, diag, FloatOp::Division) {
-                return Err(nlib(OP, NlibCode::Numerical));
+                return Err(SolidError::nurbs(OP, NurbsFailure::Numerical));
             }
             let fact = 1.0 / diag;
             let mut sw = CPoint::ZERO;
@@ -1810,7 +1848,7 @@ impl RealMatrix {
             let diag = self.rd(i, self.lu_col(i, i, sbw, OP)?, OP)?;
             let zi = at(&z, i, OP)?;
             if float_op_is_bad(zi - sum, diag, FloatOp::Division) {
-                return Err(nlib(OP, NlibCode::Numerical));
+                return Err(SolidError::nurbs(OP, NurbsFailure::Numerical));
             }
             *at_mut(&mut x, i, OP)? = (zi - sum) / diag;
         }
@@ -1824,10 +1862,10 @@ impl RealMatrix {
         const OP: &str = OP_FOR_BACK_PIVOT;
         let n = self.n;
         if self.m != n {
-            return Err(nlib(OP, NlibCode::Index));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Index));
         }
         if self.mtp != MatrixType::Full {
-            return Err(nlib(OP, NlibCode::Input));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Input));
         }
         self.require_storage(OP)?;
         let mut ii: Option<usize> = None;
@@ -1851,7 +1889,7 @@ impl RealMatrix {
             }
             let aii = self.rd(i, i, OP)?;
             if float_op_is_bad(sum, aii, FloatOp::Division) {
-                return Err(nlib(OP, NlibCode::Numerical));
+                return Err(SolidError::nurbs(OP, NurbsFailure::Numerical));
             }
             *at_mut(b, i, OP)? = sum / aii;
         }
@@ -1866,10 +1904,10 @@ impl RealMatrix {
         const OP: &str = OP_INVERSE;
         let (n, m, mta) = (self.n, self.m, self.mtp);
         if n != m {
-            return Err(nlib(OP, NlibCode::Index));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Index));
         }
         if mta != MatrixType::Full && mta != MatrixType::Banded {
-            return Err(nlib(OP, NlibCode::Input));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Input));
         }
         self.require_storage(OP)?;
         b.ensure_for(n, m, MatrixType::Full, n, OP)?;
@@ -1912,7 +1950,7 @@ impl RealMatrix {
         // Upstream names the row index m and the column index n here.
         let (m, n) = (self.n, self.m);
         if m <= n {
-            return Err(nlib(OP, NlibCode::Index));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Index));
         }
         let rmt = self.transpose()?;
         let mut rmta = rmt.multiply(self)?;
@@ -1998,7 +2036,7 @@ pub fn srf_power_basis_eval_derivs(
 ) -> Result<Vec<Vec<Vec3>>> {
     const OP: &str = OP_SRF_DERIVS;
     if udr > MAX_DERIVATIVE || vdr > MAX_DERIVATIVE {
-        return Err(nlib(OP, NlibCode::Input));
+        return Err(SolidError::nurbs(OP, NurbsFailure::Input));
     }
     let net = |i: usize, j: usize| -> Result<CPoint> {
         pw.get(i)
@@ -2116,7 +2154,7 @@ pub fn srf_power_basis_eval_derivs(
     };
     let w00 = cwd(&cw_ders, 0, 0)?.w;
     if float_op_is_bad(1.0, w00, FloatOp::Division) {
-        return Err(nlib(OP, NlibCode::Convergence));
+        return Err(SolidError::nurbs(OP, NurbsFailure::NotConverged));
     }
     for kk in 0..=udr {
         let mut k2 = vdr;
@@ -2197,6 +2235,27 @@ pub fn realloc_2d<T: Copy + Default>(
 mod tests {
     use super::*;
 
+    #[test]
+    fn rounding_bounds_keep_the_previous_bits() {
+        assert_eq!(UNIT.to_bits(), (f64::EPSILON / 2.0).to_bits());
+        assert_eq!(UNIT.to_bits(), (f64::EPSILON * 0.5).to_bits());
+        // Both former expressions scale the converted usize exactly by powers of two:
+        // neither overflows nor enters the subnormal range, even at usize::MAX.
+        // Cover small counts and neighbours of every power of two, including the
+        // gamma denominator's zero at 2^53 on 64-bit targets.
+        let powers = (0..usize::BITS).flat_map(|bit| {
+            let n = 1usize << bit;
+            [n - 1, n, n + 1]
+        });
+        for n in (0..=4096).chain(powers).chain([usize::MAX]) {
+            let old_nurbs_nu = n as f64 * f64::EPSILON / 2.0;
+            let old_collapse_nu = n as f64 * (f64::EPSILON * 0.5);
+            let bits = gamma(n).to_bits();
+            assert_eq!(bits, (old_nurbs_nu / (1.0 - old_nurbs_nu)).to_bits());
+            assert_eq!(bits, (old_collapse_nu / (1.0 - old_collapse_nu)).to_bits());
+        }
+    }
+
     fn full(rows: &[&[f64]]) -> RealMatrix {
         let n = rows.len() - 1;
         let m = rows[0].len() - 1;
@@ -2216,7 +2275,7 @@ mod tests {
 
     #[test]
     fn null_matrix_has_a_defined_full_type() {
-        // source fork a05e288 (#370): N_InitRealMatrix left the type
+        // tangency-labs/smlib a05e288 (#370): N_InitRealMatrix left the type
         // indeterminate, and N_RealMatrixIsNULL loads it; the fork sets NL_MT_FULL.
         // The port's null matrix has that type, and the first N_CheckMemRealMatrix
         // allocates it with the caller's type.
@@ -2307,18 +2366,12 @@ mod tests {
         // Overflowing division reports NL_NUM_ERR.
         assert!(matches!(
             solve_quadratic(0.0, 1e-11, -1e300),
-            Err(SolidError::Nlib {
-                code: NlibCode::Numerical,
-                ..
-            })
+            Err(ref e) if matches!(e.nurbs_failure(), Some(NurbsFailure::Numerical))
         ));
         // NaN coefficients fail every tolerance test; the final division check rejects them.
         assert!(matches!(
             solve_quadratic(f64::NAN, 1.0, 1.0),
-            Err(SolidError::Nlib {
-                code: NlibCode::Numerical,
-                ..
-            })
+            Err(ref e) if matches!(e.nurbs_failure(), Some(NurbsFailure::Numerical))
         ));
     }
 
@@ -2380,10 +2433,7 @@ mod tests {
         let mut s = full(&[&[1.0, 1.0], &[2.0, 2.0]]);
         assert!(matches!(
             s.lu_decompose_pivot(),
-            Err(SolidError::Nlib {
-                code: NlibCode::Numerical,
-                ..
-            })
+            Err(ref e) if matches!(e.nurbs_failure(), Some(NurbsFailure::Numerical))
         ));
     }
 
@@ -2438,10 +2488,7 @@ mod tests {
         assert!(close(x[0], 1.0) && close(x[1], 2.0));
         assert!(matches!(
             full(&[&[1.0, 0.0], &[0.0, 1.0]]).lst_sq_solve(&[1.0, 1.0]),
-            Err(SolidError::Nlib {
-                code: NlibCode::Index,
-                ..
-            })
+            Err(ref e) if matches!(e.nurbs_failure(), Some(NurbsFailure::Index))
         ));
     }
 
@@ -2477,10 +2524,7 @@ mod tests {
         let mut out = RealMatrix::new(0, 0, MatrixType::Full, 1).unwrap();
         assert!(matches!(
             a.multiply_into(&at, &mut out),
-            Err(SolidError::Nlib {
-                code: NlibCode::Storage,
-                ..
-            })
+            Err(ref e) if matches!(e.nurbs_failure(), Some(NurbsFailure::Storage))
         ));
         let mut out = RealMatrix::new(0, 0, MatrixType::Full, 0).unwrap();
         assert!(out.is_null());
@@ -2495,10 +2539,7 @@ mod tests {
         );
         assert!(matches!(
             a.multiply(&a),
-            Err(SolidError::Nlib {
-                code: NlibCode::Index,
-                ..
-            })
+            Err(ref e) if matches!(e.nurbs_failure(), Some(NurbsFailure::Index))
         ));
         let q = a.multiply_points(&[Vec3::X, Vec3::Y, Vec3::Z]).unwrap();
         assert_eq!(q, vec![Vec3::new(1.0, 2.0, 3.0), Vec3::new(4.0, 5.0, 6.0)]);
@@ -2533,10 +2574,7 @@ mod tests {
         assert_eq!(rd, sd);
         assert!(matches!(
             srf_power_basis_eval_derivs(&net, 1, 1, 0.0, 0.0, false, 5, 0),
-            Err(SolidError::Nlib {
-                code: NlibCode::Input,
-                ..
-            })
+            Err(ref e) if matches!(e.nurbs_failure(), Some(NurbsFailure::Input))
         ));
         // Scratch-array overflow upstream: InvalidInput here.
         let big = vec![vec![c(0.0, 0.0, 0.0); 6]; 6];

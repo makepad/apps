@@ -9,6 +9,7 @@
 //! | [`CurveClassification::intersect_uv_discontinuities`] | `IntersectUVDiscontinuties` |
 //! | [`CurveClassification::intersect_3d_discontinuities`] | `Intersect3DDiscontinuties` (surface) |
 //! | [`CurveClassification::intersect_volume_discontinuities`] | `Intersect3DDiscontinuities` (volume) |
+//! | `intersect_volume_discontinuity_report` (private) | `Intersect3DDiscontinuities` (volume) report body |
 //! | `insert_solutions` (private) | `sm_InsertSolutions` call adapter (part 5) |
 //! | `plane_intersections` (private) | `SmSurface::GlobalCurveIntersect` call on a boundary plane |
 //! | [`uv_discontinuity_intervals`] | the classification in `SmCrvOnSurf::GetKnots` |
@@ -21,7 +22,9 @@
 //! omitted. Ignored ordinary statuses use initialized results where available;
 //! evaluation failures without defined outputs return errors, and Unported always propagates.
 //! Empty knot lists/interval arrays return errors instead of native undefined
-//! behaviour. The native U-only unaligned test is retained.
+//! behaviour. The native unaligned volume discontinuity test reads the U direction three
+//! times (WR-156); the port rejects `U`, `V` and `W` unaligned discontinuities with
+//! `SM_ERR`.
 //! Volume slots 4 and 5 share one 20-solution borrowed buffer natively (WR-155): slot
 //! 5's final solutions overwrite slot 4's leading entries while slot 4 fits the buffer;
 //! an overflowing slot 5 over a borrowed slot 4 returns an error (native buffer state
@@ -36,10 +39,12 @@
 //! Curve-on-surface construction preserves concrete surface dispatch.
 //! No input-driven recursion: dimension forwarding dispatches once through shared helpers.
 
+use super::p1::EVAL_1ST;
 use crate::curve::crv_on_surf::CrvOnSurf;
 use crate::curve::curve::p8::CurveIntersectOptions;
 use crate::curve::curve::{Curve, CurveKind};
 use crate::curve::line::Line;
+use crate::error::intersect::IntersectFailure;
 use crate::error::{ignore_status, ignored, Result, SolidError};
 use crate::geom::extent1d::Extent1d;
 use crate::geom::extent2d::Extent2d;
@@ -147,6 +152,12 @@ impl<G: ClassGeometry<O>, O: ClassObject> ClassGeometry<O> for WithTemporaries<'
             None => self.inner.curve(o),
         }
     }
+    fn intersect_curve(&self, o: O) -> Option<&Curve> {
+        if self.curves.iter().any(|(h, _)| *h == o) {
+            return None;
+        }
+        self.inner.intersect_curve(o)
+    }
     fn surface(&self, o: O) -> Option<&Surface> {
         match self.surfaces.iter().find(|(h, _)| *h == o) {
             Some((_, s)) => Some(*s),
@@ -211,6 +222,10 @@ fn insert_solutions<O: ClassObject>(
                 })
             }),
             nodes: s.nodes,
+            contact: s.contact,
+            unique: s.unique,
+            shared_contact: s.shared_contact,
+            limit_root: s.limit_root,
         })
         .collect();
     super::p5::insert_solutions(k, geometry, cc, &mut mapped, target, Some(tol))?;
@@ -250,21 +265,54 @@ fn plane_intersections(
 
 fn pv(k: &Kernel, curve: &Curve, t: f64) -> Result<[Vec3; 2]> {
     let v = curve.evaluate(k, t, 1, true, true)?;
-    Ok([
-        *v.first().ok_or_else(|| SolidError::sm_err(OP))?,
-        *v.get(1).ok_or_else(|| SolidError::sm_err(OP))?,
-    ])
+    match v.as_slice() {
+        [p, d, ..] => Ok([*p, *d]),
+        _ => Err(defect(EVAL_1ST)),
+    }
 }
+
+/// A defect ([`IntersectFailure::Defect`]) with the status `SM_ERR` of the `SER` it replaces.
+#[track_caller]
+fn defect(why: &'static str) -> SolidError {
+    SolidError::intersect(OP, IntersectFailure::Defect { why })
+}
+
+/// Why a boundary index is past the end of the boundaries.
+const BOUNDARY_INDEX: &str = "the boundary index is past the end of the boundaries, though \
+     the indices are the first and last boundary of each direction, made one for each knot line \
+     or discontinuity";
+/// Why a solution slot is past the end of the slots.
+const SOLUTION_SLOT: &str = "the boundary's solution slot is past the end of the slots, \
+     though each slot number is one of them";
 
 fn iso_curve(k: &Kernel, surface: &Surface, line: Line) -> Result<Curve> {
     Ok(CrvOnSurf::new(k, line.into(), surface.clone_for_evaluation()?, None, 0)?.into())
 }
 
-fn ends(knots: &[f64]) -> Result<(f64, f64)> {
-    Ok((
-        *knots.first().ok_or_else(|| SolidError::sm_err(OP))?,
-        *knots.last().ok_or_else(|| SolidError::sm_err(OP))?,
-    ))
+/// The first and last knot; an empty vector is [`IntersectFailure::NoKnots`], with the knot
+/// query's error as its cause where the query failed (rule 6).
+fn ends(knots: &[f64], query: Option<&SolidError>) -> Result<(f64, f64)> {
+    if let (Some(&first), Some(&last)) = (knots.first(), knots.last()) {
+        return Ok((first, last));
+    }
+    let failure = crate::error::Failure::new(OP, IntersectFailure::NoKnots);
+    Err(match query {
+        Some(e) => failure.caused_by(e.clone()),
+        None => failure,
+    }
+    .into_error())
+}
+
+/// The knots of a knot query whose status is ignored as upstream (none on failure), and its
+/// error; an unported or cancelled step passes on, as [`ignored`] does.
+fn knots_or_error(r: Result<(Vec<f64>, Vec<usize>)>) -> Result<(Vec<f64>, Option<SolidError>)> {
+    match r {
+        Ok((knots, _)) => Ok((knots, None)),
+        Err(e) => {
+            ignored(Err::<(), _>(e.clone()))?;
+            Ok((Vec::new(), Some(e)))
+        }
+    }
 }
 
 fn intersections(
@@ -293,6 +341,10 @@ fn intersections(
                         num_objects: s.num_objects,
                         objects: [Some(this), Some(other), None, None, None],
                         nodes: s.nodes,
+                        contact: s.contact,
+                        unique: s.unique,
+                        shared_contact: s.shared_contact,
+                        limit_root: s.limit_root,
                     })
                     .collect());
             }
@@ -377,9 +429,7 @@ impl<O: ClassObject> CurveClassification<O> {
                 domain.min(),
             ];
             let mut b = Vec::new();
-            for pair in corners.windows(2) {
-                let a = pair.first().ok_or_else(|| SolidError::sm_err(OP))?;
-                let z = pair.get(1).ok_or_else(|| SolidError::sm_err(OP))?;
+            for (a, z) in corners.iter().zip(corners.iter().skip(1)) {
                 b.push(Curve::from(Line::create_line_segment(
                     2,
                     Point3::new(a.x, a.y, 0.0),
@@ -391,7 +441,10 @@ impl<O: ClassObject> CurveClassification<O> {
         } else {
             let b = surface.create_natural_uv_trim_curves(k, &domain, SurfParamType::V, false)?;
             if b.curves_3d.len() != b.orients.len() {
-                return Err(SolidError::sm_err(OP));
+                return Err(defect(
+                    "the natural trim curves and their orientations differ in number, though \
+                     they are made in pairs",
+                ));
             }
             (b.curves_3d, b.orients)
         };
@@ -592,14 +645,10 @@ impl<O: ClassObject> CurveClassification<O> {
             xsect_tol_3d_from_zones(k, surf_tol, self.src_zone_tol_3d())
         };
         // Native ignores the status; absent output leads to invalid indexing below.
-        let u = ignored(surface.knots_with_nurb(k, SurfParamType::U, None))?
-            .map(|r| r.0)
-            .unwrap_or_default();
-        let v = ignored(surface.knots_with_nurb(k, SurfParamType::V, None))?
-            .map(|r| r.0)
-            .unwrap_or_default();
-        let (umin, umax) = ends(&u)?;
-        let (vmin, vmax) = ends(&v)?;
+        let (u, u_error) = knots_or_error(surface.knots_with_nurb(k, SurfParamType::U, None))?;
+        let (v, v_error) = knots_or_error(surface.knots_with_nurb(k, SurfParamType::V, None))?;
+        let (umin, umax) = ends(&u, u_error.as_ref())?;
+        let (vmin, vmax) = ends(&v, v_error.as_ref())?;
         let mut boundaries = Vec::new();
         let mut uv_lines = Vec::new();
         for &x in &u {
@@ -653,7 +702,7 @@ impl<O: ClassObject> CurveClassification<O> {
                 )?;
             }
             if let Some(s) = slot {
-                *solutions.get_mut(s).ok_or_else(|| SolidError::sm_err(OP))? = sols;
+                *solutions.get_mut(s).ok_or_else(|| defect(SOLUTION_SLOT))? = sols;
             }
         }
         let indices = [0, u.len() - 1, u.len(), u.len() + v.len() - 1];
@@ -661,7 +710,7 @@ impl<O: ClassObject> CurveClassification<O> {
         for (ii, (index, sols)) in indices.into_iter().zip(&solutions).enumerate() {
             let boundary = boundaries
                 .get(index)
-                .ok_or_else(|| SolidError::sm_err(OP))?;
+                .ok_or_else(|| defect(BOUNDARY_INDEX))?;
             for sol in sols {
                 if sol.solution_type != SolutionType::SingleValue {
                     continue;
@@ -674,7 +723,10 @@ impl<O: ClassObject> CurveClassification<O> {
                     Vec3::Z
                 } else {
                     let CurveKind::CrvOnSurf(iso) = boundary.kind() else {
-                        return Err(SolidError::sm_err(OP));
+                        return Err(defect(
+                            "the boundary is not a curve on the surface, though off the uv \
+                             space each boundary is made as the surface's iso curve",
+                        ));
                     };
                     iso.evaluate_surface_normal(k, bt, true)?.normal
                 };
@@ -738,6 +790,8 @@ impl<O: ClassObject> CurveClassification<O> {
 
     /// Intersect volume discontinuity planes, using parameter or input space as requested.
     /// UV curves return `SM_ERR`; no-discontinuity volumes leave all intervals unchanged.
+    /// `d.u.unaligned`, `d.v.unaligned` and `d.w.unaligned` each return `SM_ERR`
+    /// (WR-156; upstream tests only `d.u.unaligned`).
     /// Plane intersections and part-5 insertion may return `Unported` from deeper callees.
     pub fn intersect_volume_discontinuities(
         &mut self,
@@ -749,20 +803,50 @@ impl<O: ClassObject> CurveClassification<O> {
     ) -> Result<()> {
         let curve = self.curve_geometry(geometry)?;
         if curve.dim() == 2 {
-            return Err(SolidError::sm_err(OP));
+            return Err(SolidError::intersect(
+                OP,
+                IntersectFailure::UvCurveAgainstVolume,
+            ));
         }
         let mut d = Discontinuities3d::new();
         if !volume.has_discontinuities(k, Some(&mut d), false)? {
             return Ok(());
         }
+        self.intersect_volume_discontinuity_report(
+            k,
+            geometry,
+            curve,
+            volume,
+            &d,
+            handle,
+            in_param_space,
+        )
+    }
+
+    /// Intersects `curve` with the discontinuity planes reported in `d` for `volume`
+    /// (`SmCurveClassification::Intersect3DDiscontinuities(const SmVolume&, ...)` after
+    /// `SmVolume::HasDiscontinuities` reports discontinuities).
+    fn intersect_volume_discontinuity_report(
+        &mut self,
+        k: &Kernel,
+        geometry: &impl ClassGeometry<O>,
+        curve: &Curve,
+        volume: &Volume,
+        d: &Discontinuities3d,
+        handle: O,
+        in_param_space: bool,
+    ) -> Result<()> {
         let domain = volume.natural_param_domain()?;
-        // Native tests U three times, not U/V/W.
-        if d.u.unaligned {
-            return Err(SolidError::sm_err(OP));
+        // WR-156: native tests m_bUnalignedU three times instead of U/V/W.
+        if d.u.unaligned || d.v.unaligned || d.w.unaligned {
+            return Err(SolidError::intersect(
+                OP,
+                IntersectFailure::UnalignedDiscontinuities,
+            ));
         }
-        let (umin, umax) = ends(&d.u.params)?;
-        let (vmin, vmax) = ends(&d.v.params)?;
-        let (wmin, wmax) = ends(&d.w.params)?;
+        let (umin, umax) = ends(&d.u.params, None)?;
+        let (vmin, vmax) = ends(&d.v.params, None)?;
+        let (wmin, wmax) = ends(&d.w.params, None)?;
         let tol = xsect_tol_3d_from_zones(
             k,
             zone_tol_3d(k, SmallTopoType::NormalSize),
@@ -775,7 +859,7 @@ impl<O: ClassObject> CurveClassification<O> {
                 1 => &d.v.params,
                 _ => &d.w.params,
             };
-            for (j, &value) in params.iter().enumerate() {
+            for &value in params {
                 let (mut origin, mut x, mut y, scale) = match axis {
                     0 => (
                         Point3::new(value, vmin, wmin),
@@ -790,11 +874,7 @@ impl<O: ClassObject> CurveClassification<O> {
                         Vec2::new(wmax - wmin, umax - umin),
                     ),
                     _ => (
-                        Point3::new(
-                            umin,
-                            vmin,
-                            *d.w.params.get(j).ok_or_else(|| SolidError::sm_err(OP))?,
-                        ),
+                        Point3::new(umin, vmin, value),
                         Vec3::X,
                         Vec3::Y,
                         Vec2::new(umax - umin, vmax - vmin),
@@ -853,7 +933,7 @@ impl<O: ClassObject> CurveClassification<O> {
                 if s == 5 {
                     // WR-155: slot 4 still borrows the shared buffer when it fits, so
                     // slot 5's (inserted) solutions overwrite its leading entries.
-                    let shared = solutions.get_mut(4).ok_or_else(|| SolidError::sm_err(OP))?;
+                    let shared = solutions.get_mut(4).ok_or_else(|| defect(SOLUTION_SLOT))?;
                     if !shared.is_empty() && shared.len() <= BORROWED_SOLUTIONS {
                         if sols.len() > BORROWED_SOLUTIONS {
                             return Err(SolidError::invalid_input(
@@ -866,7 +946,7 @@ impl<O: ClassObject> CurveClassification<O> {
                         }
                     }
                 }
-                *solutions.get_mut(s).ok_or_else(|| SolidError::sm_err(OP))? = sols;
+                *solutions.get_mut(s).ok_or_else(|| defect(SOLUTION_SLOT))? = sols;
             }
         }
         let mut classified = false;
@@ -878,10 +958,13 @@ impl<O: ClassObject> CurveClassification<O> {
             {
                 let SurfaceKind::Plane(plane) = planes
                     .get(index)
-                    .ok_or_else(|| SolidError::sm_err(OP))?
+                    .ok_or_else(|| defect(BOUNDARY_INDEX))?
                     .kind()
                 else {
-                    return Err(SolidError::sm_err(OP));
+                    return Err(defect(
+                        "the volume's boundary is not a plane, though each is made as a plane \
+                         through a discontinuity",
+                    ));
                 };
                 for sol in sols {
                     if sol.solution_type != SolutionType::SingleValue {
@@ -1195,13 +1278,18 @@ pub fn volume_discontinuity_intervals(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::SM_ERR;
     use crate::geom::assert_array::labels::FACE_TYPE;
     use crate::geom::attribute::ObjectKey;
     use crate::geom::extent1d::Extent1d;
+    use crate::geom::geom_utility::p2::ContinuityType;
     use crate::geom::object::ObjectRef;
     use crate::geom::transform::Transform;
     use crate::intersect::point_class::ClassObjectKind;
-    use crate::surface::volume::VolumeKind;
+    use crate::nurbs::math::CPoint;
+    use crate::nurbs::spiral::allocate_nurb_volume;
+    use crate::surface::b_spline_volume::BSplineVolume;
+    use crate::surface::volume::{DirectionDiscontinuities, VolumeKind};
 
     #[derive(Debug, Clone, Copy, PartialEq)]
     enum H {
@@ -1305,5 +1393,216 @@ mod tests {
         assert!(cc
             .intersect_uv_discontinuities(&k, &g, &plane.into(), H::Surface)
             .is_err());
+    }
+
+    fn wr156_dir(unaligned: bool, params: &[f64]) -> DirectionDiscontinuities {
+        let mut conts = vec![ContinuityType::Discontinuous; params.len()];
+        if conts.len() > 2 {
+            for c in &mut conts[1..params.len() - 1] {
+                *c = ContinuityType::C0;
+            }
+        }
+        DirectionDiscontinuities {
+            unaligned,
+            min_cont: if params.len() > 2 {
+                ContinuityType::C0
+            } else {
+                ContinuityType::CInfinity
+            },
+            params: params.to_vec(),
+            conts,
+        }
+    }
+
+    fn wr156_c0_v_unit_cube() -> BSplineVolume {
+        let mut nurb = allocate_nurb_volume([1, 2, 1], [1, 1, 1], [3, 4, 3]).unwrap();
+        nurb.knots_mut(0).copy_from_slice(&[0.0, 0.0, 1.0, 1.0]);
+        nurb.knots_mut(1)
+            .copy_from_slice(&[0.0, 0.0, 0.5, 1.0, 1.0]);
+        nurb.knots_mut(2).copy_from_slice(&[0.0, 0.0, 1.0, 1.0]);
+        for (i, x) in [(0, 0.0), (1, 1.0)] {
+            for (j, y) in [(0, 0.0), (1, 0.5), (2, 1.0)] {
+                for (w, z) in [(0, 0.0), (1, 1.0)] {
+                    *nurb.cpt_mut(i, j, w).unwrap() = CPoint::new(x, y, z, 1.0);
+                }
+            }
+        }
+        BSplineVolume::new(nurb)
+    }
+
+    fn wr156_line() -> Curve {
+        Line::create_line_segment(
+            3,
+            Point3::new(0.5, -0.5, 0.25),
+            Point3::new(0.5, 1.5, 0.75),
+            None,
+        )
+        .unwrap()
+        .into()
+    }
+
+    fn assert_split_intervals(cc: &CurveClassification<FreeHandle>, expected: &[(f64, f64)]) {
+        assert_eq!(cc.intervals().len(), expected.len());
+        for (ivl, &(lo, hi)) in cc.intervals().iter().zip(expected) {
+            assert!((ivl.interval.min() - lo).abs() < 1e-12);
+            assert!((ivl.interval.max() - hi).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn wr156_v_and_w_unaligned_reports_are_rejected() {
+        let k_fix = Kernel::default();
+
+        let volume = Volume::oriented(
+            VolumeKind::BSpline(wr156_c0_v_unit_cube()),
+            Some(Transform::default()),
+        );
+        let curve = wr156_line();
+        let geometry = FreeGeometry {
+            curve: &curve,
+            target: FreeTarget::Volume(&volume),
+        };
+        let ivl = Extent1d::from_min_max(0.0, 1.0);
+
+        let v_only = Discontinuities3d {
+            has_discontinuities: true,
+            min_continuity: ContinuityType::C0,
+            u: wr156_dir(false, &[0.0, 1.0]),
+            v: wr156_dir(true, &[0.0, 0.5, 1.0]),
+            w: wr156_dir(false, &[0.0, 1.0]),
+        };
+        let w_only = Discontinuities3d {
+            has_discontinuities: true,
+            min_continuity: ContinuityType::C0,
+            u: wr156_dir(false, &[0.0, 1.0]),
+            v: wr156_dir(false, &[0.0, 1.0]),
+            w: wr156_dir(true, &[0.0, 0.5, 1.0]),
+        };
+        let vw_both = Discontinuities3d {
+            has_discontinuities: true,
+            min_continuity: ContinuityType::C0,
+            u: wr156_dir(false, &[0.0, 1.0]),
+            v: wr156_dir(true, &[0.0, 0.5, 1.0]),
+            w: wr156_dir(true, &[0.0, 0.55, 1.0]),
+        };
+
+        for in_param_space in [true, false] {
+            for report in [&v_only, &w_only, &vw_both] {
+                let mut cc_fix =
+                    CurveClassification::with_curve_interval(&k_fix, FreeHandle::Curve, ivl, 1e-7);
+                let before = cc_fix.intervals().to_vec();
+                let err = cc_fix
+                    .intersect_volume_discontinuity_report(
+                        &k_fix,
+                        &geometry,
+                        &curve,
+                        &volume,
+                        report,
+                        FreeHandle::Target,
+                        in_param_space,
+                    )
+                    .unwrap_err();
+                assert_eq!(err.sm_status(), Some(SM_ERR));
+                assert_eq!(cc_fix.intervals(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn wr156_u_unaligned_compounded_and_aligned_volumes() {
+        let k_def = Kernel::default();
+
+        let curve = wr156_line();
+        let ivl = Extent1d::from_min_max(0.0, 1.0);
+        let aligned = Volume::new(VolumeKind::BSpline(wr156_c0_v_unit_cube()));
+        let geometry = FreeGeometry {
+            curve: &curve,
+            target: FreeTarget::Volume(&aligned),
+        };
+
+        let u_only = Discontinuities3d {
+            has_discontinuities: true,
+            min_continuity: ContinuityType::C0,
+            u: wr156_dir(true, &[0.0, 0.5, 1.0]),
+            v: wr156_dir(false, &[0.0, 1.0]),
+            w: wr156_dir(false, &[0.0, 1.0]),
+        };
+        {
+            let k = &k_def;
+            let mut cc = CurveClassification::with_curve_interval(k, FreeHandle::Curve, ivl, 1e-7);
+            let before = cc.intervals().to_vec();
+            let err = cc
+                .intersect_volume_discontinuity_report(
+                    k,
+                    &geometry,
+                    &curve,
+                    &aligned,
+                    &u_only,
+                    FreeHandle::Target,
+                    true,
+                )
+                .unwrap_err();
+            assert_eq!(err.sm_status(), Some(SM_ERR));
+            assert_eq!(cc.intervals(), before);
+        }
+
+        let compounded = Volume::with_maps(
+            VolumeKind::Transform(Transform::default()),
+            None,
+            Some(Volume::new(VolumeKind::BSpline(wr156_c0_v_unit_cube()))),
+        )
+        .unwrap();
+        let mut disconts = Discontinuities3d::new();
+        assert!(compounded
+            .has_discontinuities(&k_def, Some(&mut disconts), false)
+            .unwrap());
+        assert!(disconts.u.unaligned && disconts.v.unaligned && disconts.w.unaligned);
+        let compounded_geom = FreeGeometry {
+            curve: &curve,
+            target: FreeTarget::Volume(&compounded),
+        };
+        {
+            let k = &k_def;
+            let mut cc = CurveClassification::with_curve_interval(k, FreeHandle::Curve, ivl, 1e-7);
+            let before = cc.intervals().to_vec();
+            let err = cc
+                .intersect_volume_discontinuities(
+                    k,
+                    &compounded_geom,
+                    &compounded,
+                    FreeHandle::Target,
+                    true,
+                )
+                .unwrap_err();
+            assert_eq!(err.sm_status(), Some(SM_ERR));
+            assert_eq!(cc.intervals(), before);
+            let err = volume_discontinuity_intervals(k, &curve, ivl, 1e-7, &compounded, true)
+                .unwrap_err();
+            assert_eq!(err.sm_status(), Some(SM_ERR));
+        }
+
+        let mut aligned_disconts = Discontinuities3d::new();
+        assert!(aligned
+            .has_discontinuities(&k_def, Some(&mut aligned_disconts), false)
+            .unwrap());
+        assert!(
+            !aligned_disconts.u.unaligned
+                && !aligned_disconts.v.unaligned
+                && !aligned_disconts.w.unaligned
+        );
+
+        let mut cc_def =
+            CurveClassification::with_curve_interval(&k_def, FreeHandle::Curve, ivl, 1e-7);
+        cc_def
+            .intersect_volume_discontinuities(&k_def, &geometry, &aligned, FreeHandle::Target, true)
+            .unwrap();
+        assert_split_intervals(
+            &cc_def,
+            &[(0.0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.0)],
+        );
+
+        let ivls_def =
+            volume_discontinuity_intervals(&k_def, &curve, ivl, 1e-7, &aligned, true).unwrap();
+        assert_eq!(ivls_def.len(), 4);
     }
 }

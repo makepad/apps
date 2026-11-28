@@ -53,7 +53,8 @@
 //!   `smsurf_GetSurfaceCache` is the cache passed to
 //!   [`SurfaceTrace::find_boundary_start_points`] and [`SurfaceTrace::do_trace`] (see
 //!   [`crate::intersect::surface_tracer`]); `SmCacheCheckOutIn` has no counterpart,
-//!   the cache flags `DoTrace` changes are restored on every exit. The curve cache
+//!   the cache flags `DoTrace` changes for the call are read by none of its steps,
+//!   so the cache keeps its own. The curve cache
 //!   of `GetOrCreateObjectCache(SM_OC_CURVE)` is built fresh
 //!   ([`make_curve_cache`]); a failed build is `SM_ERR_NULL_POINTER` (`NER`).
 //! - **Ignored statuses** stay ignored: the curve `GetKnots` into the knot vector
@@ -74,6 +75,12 @@
 //!   body ([`Surface::drop_curve_base`]) otherwise. The surface point solves defer
 //!   inside their own units
 //!   (`LocalPointSolve_1`, `GlobalPointSolve_1`).
+//! - **Bounded singular start.** In `FindBoundaryStartPoints`, when the drop of the
+//!   point just off a singular start, bounded by the curve-on-surface distance, proves
+//!   that no surface point lies within the bound ([`singular_step_off`]), the curve
+//!   leaves the surface there and the start is skipped, as an empty step-off drop of
+//!   a several-solution start is; upstream's global solve ignores the bound, so it
+//!   always had a candidate. An empty drop not proved so stays the error.
 //! - The `SM_DEBUG_CODE` drawing blocks and `Dump` are not ported. No recursion
 //!   depends on input; the seam search loop is bounded (19 steps) as upstream.
 
@@ -85,7 +92,8 @@ use crate::curve::curve::p9::CurveSolveOptions;
 use crate::curve::curve::Curve;
 use crate::curve::hermite_curve::HermiteCurve;
 use crate::curve::line::Line;
-use crate::error::{ignored, Result, SolidError};
+use crate::error::intersect::IntersectFailure;
+use crate::error::{ignored, Failure, Result, SolidError, SM_ERR_NULL_POINTER};
 use crate::geom::extent1d::Extent1d;
 use crate::geom::extent2d::Extent2d;
 use crate::geom::geom_utility::p1::line_closest_point;
@@ -108,6 +116,7 @@ use crate::nurbs::knots::Side;
 use crate::surface::surface::p2::drop_vectors;
 use crate::surface::surface::{Surface, SurfaceKind};
 use crate::surface::surface_cache::SurfaceCache;
+use crate::surface::surface_point_solve::p3::EmptyAnswer;
 
 /// `SmSurfaceDropCurve_TYPE` (`SOLV_BASE_TYPE + 60`).
 pub const TYPE: i64 = 19_060;
@@ -187,6 +196,8 @@ fn is_singularity(k: &Kernel, surface: &Surface, uv: Point2) -> Result<(bool, Su
         | SurfaceKind::Sphere(_)
         | SurfaceKind::Torus(_)
         | SurfaceKind::BSpline(_)
+        | SurfaceKind::ProceduralBlend(_)
+        | SurfaceKind::BallPatch(_)
         | SurfaceKind::CurveBounded(_)
         | SurfaceKind::SurfOfRevolution(_)
         | SurfaceKind::SurfOfExtrusion(_)
@@ -254,6 +265,55 @@ fn surface_global_point_solve(
     Ok(sols.as_slice().iter().map(start_uv).collect())
 }
 
+/// [`surface_global_point_solve`] with why an empty answer is empty
+/// ([`EmptyAnswer`]).
+#[allow(clippy::too_many_arguments)] // upstream's argument list
+fn surface_global_point_solve_answer(
+    k: &Kernel,
+    surface: &Surface,
+    uv_domain: &Extent2d,
+    op: SolverOperation,
+    point: Point3,
+    distance_tolerance: f64,
+    max_drop_dist: Option<f64>,
+    requested: SolutionRequested,
+) -> Result<(Vec<Point2>, EmptyAnswer)> {
+    let (sols, answer) = surface.global_point_solve_point_test_off_answer::<NoObject>(
+        k,
+        Some(NoObject),
+        uv_domain,
+        op,
+        point,
+        distance_tolerance,
+        max_drop_dist,
+        requested,
+    )?;
+    Ok((sols.as_slice().iter().map(start_uv).collect(), answer))
+}
+
+/// The foot `FindBoundaryStartPoints` takes from the drop of the point just past a
+/// singular start, the `jj`th solution or else the first. Not upstream (#23057): when
+/// the drop proved that no surface point lies within its bound
+/// ([`EmptyAnswer::NoPointWithinTarget`]; the curve lies on the surface and the bound
+/// is the curve-on-surface distance), the curve leaves the surface there and the
+/// start starts nothing (`None`), as an empty step-off drop of a several-solution
+/// start does. An empty drop not proved so (unbounded, no candidate, or a tree solve
+/// that failed) leaves the singularity unresolved: the drop found no foot (rule 7).
+fn singular_step_off(found: &[Point2], answer: EmptyAnswer, jj: usize) -> Result<Option<Point2>> {
+    let pick = if found.len() > jj {
+        found.get(jj)
+    } else {
+        found.first()
+    };
+    match (pick, answer) {
+        (Some(p), _) => Ok(Some(*p)),
+        (None, EmptyAnswer::NoPointWithinTarget) => Ok(None),
+        (None, EmptyAnswer::Unproved) => {
+            Err(SolidError::intersect(OP_BOUNDARY, IntersectFailure::NoFoot))
+        }
+    }
+}
+
 /// `IsOnSeam(uv, NULL, &eSeamDir, &newUVs)`: the points across the seam when `uv` is
 /// on it (a plane has none; the seam direction output is not read afterwards).
 fn is_on_seam(k: &Kernel, surface: &Surface, uv: Point2) -> Result<Option<Vec<Point2>>> {
@@ -268,6 +328,8 @@ fn is_on_seam(k: &Kernel, surface: &Surface, uv: Point2) -> Result<Option<Vec<Po
         | SurfaceKind::Sphere(_)
         | SurfaceKind::Torus(_)
         | SurfaceKind::BSpline(_)
+        | SurfaceKind::ProceduralBlend(_)
+        | SurfaceKind::BallPatch(_)
         | SurfaceKind::CurveBounded(_)
         | SurfaceKind::SurfOfRevolution(_)
         | SurfaceKind::SurfOfExtrusion(_)
@@ -295,6 +357,20 @@ fn create_iso_parametric_curve(
             b.create_iso_parametric_curve(k, param, value, IsoCurveOptions::default())?
                 .curve,
         )),
+        SurfaceKind::ProceduralBlend(pb) => {
+            let b = pb.net();
+            Ok(Curve::from(
+                b.create_iso_parametric_curve(k, param, value, IsoCurveOptions::default())?
+                    .curve,
+            ))
+        }
+        SurfaceKind::BallPatch(bp) => {
+            let b = bp.net();
+            Ok(Curve::from(
+                b.create_iso_parametric_curve(k, param, value, IsoCurveOptions::default())?
+                    .curve,
+            ))
+        }
         // (SmSurfOfExtrusion inherits the B-spline CreateIsoParametricCurve)
         SurfaceKind::SurfOfExtrusion(s) => Ok(Curve::from(
             s.base()
@@ -684,9 +760,12 @@ impl<'s> SurfaceDropCurve<'s> {
         if norm.length_squared() < EFF_ZERO_SQ {
             norm = surface.evaluate_normal(k, uv, Side::Left, Side::Left)?;
 
-            // signal error when unable to get a surfaceNormal
+            // signal error when unable to get a surfaceNormal (the geometry's)
             if norm.length_squared() < EFF_ZERO_SQ {
-                return Err(SolidError::sm_err(OP_CPV));
+                return Err(SolidError::intersect(
+                    OP_CPV,
+                    IntersectFailure::NoSurfaceNormal,
+                ));
             }
         }
 
@@ -703,7 +782,12 @@ impl<'s> SurfaceDropCurve<'s> {
             // copy PreviousPoint Tangent Value or signal error
             match prev.as_deref() {
                 Some(p) => pnt.curve_3d[1] = p.curve_3d[1],
-                None => return Err(SolidError::sm_err(OP_CPV)),
+                None => {
+                    return Err(SolidError::intersect(
+                        OP_CPV,
+                        IntersectFailure::DegenerateTangent,
+                    ))
+                }
             }
         }
 
@@ -725,8 +809,11 @@ impl<'s> SurfaceDropCurve<'s> {
             let domain = surface.natural_uv_domain_with_nurb(k)?;
             let (on_boundary, uv_tang) = domain.is_point_on_boundary(uv, EFF_ZERO_SQRT);
             if !on_boundary {
-                // error - singular surface point not on boundary
-                return Err(SolidError::sm_err(OP_CPV));
+                // error - singular surface point not on boundary (rule 8)
+                return Err(SolidError::intersect(
+                    OP_CPV,
+                    IntersectFailure::SingularPointInside,
+                ));
             }
 
             // drop a point a small step in the 3d tangent direction onto the surf
@@ -792,10 +879,11 @@ impl<'s> SurfaceDropCurve<'s> {
         }
 
         // locals - knot indices of CurveToDrop knot interval containing CurrPnt.parameter
+        // set by `boundary_start_points`, which the caller has not run (its state)
         let knots = self
             .curve_knot_vector
             .as_ref()
-            .ok_or(SolidError::null_pointer(OP_STEP))?;
+            .ok_or_else(|| SolidError::intersect(OP_STEP, IntersectFailure::NotSetUp))?;
         let knot = |i: usize| -> Result<f64> {
             knots
                 .get(i)
@@ -883,22 +971,20 @@ impl<'s> SurfaceDropCurve<'s> {
         out.max_drop_dists.clear();
         out.deviations.clear();
 
-        let (max_drop_dist, max_deviation, uv_curves) = surface_drop_curve(
+        let dropped = self.base.surface.drop_curve_splitting_seams(
             k,
-            self.base.surface,
             &self.base.uv_domain,
             self.curve,
             &self.interval,
             self.base.approx_tol_3d,
             true,
-            false,
             context,
         )?;
 
-        for c in uv_curves {
+        for c in dropped.uv_curves {
             out.uv_curves.push(c);
-            out.max_drop_dists.push(max_drop_dist);
-            out.deviations.push(max_deviation);
+            out.max_drop_dists.push(dropped.max_drop_to_surf);
+            out.deviations.push(dropped.max_approx_dev);
         }
         Ok(())
     }
@@ -1003,8 +1089,9 @@ impl<'s> SurfaceDropCurve<'s> {
     /// # Errors
     ///
     /// `SM_ERR_NULL_POINTER` when the curve cache cannot be built; `SM_ERR` when a
-    /// start at a singularity cannot be recovered; those of the curve and surface
-    /// queries, intersections, drops and point solves.
+    /// start at a singularity cannot be recovered (a bounded drop that proves no surface
+    /// point within its bound skips the start: the curve leaves the surface there);
+    /// those of the curve and surface queries, intersections, drops and point solves.
     #[allow(clippy::too_many_lines)] // one upstream function
     pub fn boundary_start_points<O: SolutionObject>(
         &mut self,
@@ -1034,8 +1121,15 @@ impl<'s> SurfaceDropCurve<'s> {
         // get Curve and Surface Caches
         let curve_cache = match make_curve_cache::<()>(k, curve, None) {
             Ok(c) => c,
-            Err(e) if e.is_unported() => return Err(e),
-            Err(_) => return Err(SolidError::null_pointer(OP_BOUNDARY)),
+            Err(e) if e.is_unported_or_cancelled() => return Err(e),
+            // the build's error stays the cause (rule 6)
+            Err(e) => {
+                return Err(
+                    Failure::new(OP_BOUNDARY, IntersectFailure::CurveCacheNotBuilt)
+                        .caused_by(e)
+                        .into_error(),
+                )
+            }
         };
 
         // select tolerance - from curve length or as given when Curve is on Surface
@@ -1050,11 +1144,14 @@ impl<'s> SurfaceDropCurve<'s> {
         let iso = cache.iso_boundary_curves(k, &uv_domain, cci_tol / 3.0)?;
         let mut iso_curves: Vec<Curve> = iso.curves.to_vec();
 
-        // add every Surface U internal continuity boundary to sIsoCurves array
-        let u_conts: Vec<ContinuityType> = cache.u_continuities().to_vec();
+        // add every Surface U internal continuity boundary to sIsoCurves array (the
+        // continuities of the cache's surface, its tree built or not: upstream reads the
+        // cache's arrays, empty until GetTree)
+        let conts = cache.surface().continuities(k)?;
+        let u_conts: &[ContinuityType] = &conts.u;
         let (u_knots, _) = surface.knots_with_nurb(k, SurfParamType::U, None)?;
         for ii in 1..u_conts.len().saturating_sub(1) {
-            if is_c0(&u_conts, ii)? {
+            if is_c0(u_conts, ii)? {
                 let value = index(&u_knots, ii)?;
                 iso_curves.push(create_iso_parametric_curve(
                     k,
@@ -1068,9 +1165,9 @@ impl<'s> SurfaceDropCurve<'s> {
 
         // add every surface V internal continuity boundary to sIsoCurves array
         let (v_knots, _) = surface.knots_with_nurb(k, SurfParamType::V, None)?;
-        let v_conts: Vec<ContinuityType> = cache.v_continuities().to_vec();
+        let v_conts: &[ContinuityType] = &conts.v;
         for ii in 1..v_conts.len().saturating_sub(1) {
-            if is_c0(&v_conts, ii)? {
+            if is_c0(v_conts, ii)? {
                 let value = index(&v_knots, ii)?;
                 iso_curves.push(create_iso_parametric_curve(
                     k,
@@ -1151,7 +1248,7 @@ impl<'s> SurfaceDropCurve<'s> {
                     None,
                 ) {
                     Ok(l) => l,
-                    Err(e) if e.is_unported() => return Err(e),
+                    Err(e) if e.is_unported_or_cancelled() => return Err(e),
                     Err(_) => continue,
                 };
 
@@ -1354,7 +1451,7 @@ impl<'s> SurfaceDropCurve<'s> {
                 let (singular, singular_dir) = is_singularity(k, surface, uv)?;
                 if singular {
                     start = curve.evaluate_point(k, ivl.evaluate(0.001))?;
-                    let tmp = surface_global_point_solve(
+                    let (tmp, answer) = surface_global_point_solve_answer(
                         k,
                         surface,
                         &uv_domain,
@@ -1364,14 +1461,11 @@ impl<'s> SurfaceDropCurve<'s> {
                         max_drop_dist,
                         SolutionRequested::All,
                     )?;
-                    let pick = if tmp.len() > jj {
-                        tmp.get(jj).copied()
-                    } else {
-                        tmp.first().copied()
-                    };
-                    let Some(p) = pick else {
-                        // we failed to resolve singularity problem
-                        return Err(SolidError::sm_err(OP_BOUNDARY));
+                    let Some(p) = singular_step_off(&tmp, answer, jj)? else {
+                        // the curve leaves the surface just past this start: it starts
+                        // nothing here
+                        jj += 1;
+                        continue;
                     };
                     if singular_dir == SurfParamType::U {
                         uv.x = p.x;
@@ -1386,7 +1480,7 @@ impl<'s> SurfaceDropCurve<'s> {
                 let drop = match drop_iso_curve(k, surface, &uv_domain, curve, &ivl, uv, approx_tol)
                 {
                     Ok(d) => d,
-                    Err(e) if e.is_unported() => return Err(e),
+                    Err(e) if e.is_unported_or_cancelled() => return Err(e),
                     Err(_) => {
                         jj += 1;
                         continue;
@@ -1423,7 +1517,17 @@ impl<'s> SurfaceDropCurve<'s> {
                         }
                     }
 
-                    let iso_curve = iso_curve.ok_or(SolidError::null_pointer(OP_BOUNDARY))?;
+                    let iso_curve = iso_curve.ok_or_else(|| {
+                        Failure::new(
+                            OP_BOUNDARY,
+                            IntersectFailure::Defect {
+                                why: "the iso-curve drop succeeded without its UV curve, which \
+                                      it returns whenever it succeeds",
+                            },
+                        )
+                        .with_status(SM_ERR_NULL_POINTER)
+                        .into_error()
+                    })?;
 
                     // If there are more solutions to check, see if they're contained in this iso curve
                     if solutions.len() > jj + 1 {
@@ -1432,7 +1536,6 @@ impl<'s> SurfaceDropCurve<'s> {
                             .unwrap_or(Vec3::ZERO);
                         let curve_end = ignored(iso_curve.evaluate_point(k, iso_ivl.max()))?
                             .unwrap_or(Vec3::ZERO);
-
                         let iso_u_ivl = Extent1d::from_min_max(
                             min2(curve_start.x, curve_end.x),
                             max2(curve_start.x, curve_end.x),
@@ -1441,6 +1544,12 @@ impl<'s> SurfaceDropCurve<'s> {
                             min2(curve_start.y, curve_end.y),
                             max2(curve_start.y, curve_end.y),
                         );
+                        // An iso curve along the seam (its middle on it) has a twin, the
+                        // seam's UV line on the other side: a separate UV curve, from which
+                        // callers choose the side of an edge use, so its start is traced too
+                        let mid = iso_curve.evaluate_point(k, iso_ivl.evaluate(0.5))?;
+                        let along_seam =
+                            is_on_seam(k, surface, Point2::new(mid.x, mid.y))?.is_some();
 
                         // Remove other solutions that are on this curve
                         let mut kk = jj + 1;
@@ -1448,8 +1557,20 @@ impl<'s> SurfaceDropCurve<'s> {
                             let next = index2(&solutions, kk)?;
 
                             // If the point drops to the curve, remove it from solutions to check
-                            if iso_u_ivl.contains_value(next.x, 0.0)
-                                && iso_v_ivl.contains_value(next.y, 0.0)
+                            // (not upstream: or, for an iso curve that leaves the seam, its
+                            // image across the seam does, the same point of the curve, whose
+                            // iso curve would be this one again: upstream traces it a
+                            // second time)
+                            let on_iso = |uv: Point2| {
+                                iso_u_ivl.contains_value(uv.x, 0.0)
+                                    && iso_v_ivl.contains_value(uv.y, 0.0)
+                            };
+                            let across = if on_iso(next) || along_seam {
+                                None
+                            } else {
+                                is_on_seam(k, surface, next)?
+                            };
+                            if on_iso(next) || across.is_some_and(|uvs| uvs.into_iter().any(on_iso))
                             {
                                 solutions.remove(kk);
                             } else {
@@ -1647,18 +1768,13 @@ impl<'s> SurfaceDropCurve<'s> {
             self.base.ang_tol_rad = ang;
         }
 
-        // temporarily turn off point testing and turn on boundary curve processing
-        let saved_point_test = cache.point_test_enabled;
-        let saved_boundary = cache.process_boundary_curves;
-        cache.point_test_enabled = false;
-        cache.process_boundary_curves = true;
-        let r = self.drop_trace_body(k, cache, context);
-        cache.point_test_enabled = saved_point_test;
-        cache.process_boundary_curves = saved_boundary;
-        r
+        // (upstream temporarily turns off point testing and turns on boundary curve
+        // processing: none of the steps reads either, and the drop's point solves run
+        // with point testing off themselves, so the cache keeps its flags)
+        self.drop_trace_body(k, cache, context)
     }
 
-    /// The part of [`SurfaceDropCurve::drop_trace`] run with the cache flags changed.
+    /// The part of [`SurfaceDropCurve::drop_trace`] after its tolerances.
     fn drop_trace_body<O: SolutionObject>(
         &mut self,
         k: &Kernel,
@@ -1720,10 +1836,11 @@ impl<'s> SurfaceDropCurve<'s> {
         mut context: Option<DropSolveContext<'_, O>>,
     ) -> Result<()> {
         self.base.curve_points.push(start);
+        // set by `boundary_start_points`, which the caller has not run (its state)
         let breaks = self
             .curve_breaks
             .clone()
-            .ok_or(SolidError::null_pointer(OP_TRACE2))?;
+            .ok_or_else(|| SolidError::intersect(OP_TRACE2, IntersectFailure::NotSetUp))?;
         let surface = self.base.surface;
 
         // If there are curve breaks - replace dMaxT with first break after dMinT.
@@ -1781,7 +1898,7 @@ impl<'s> SurfaceDropCurve<'s> {
                 context.as_mut().map(reborrow),
             ) {
                 Ok(d) => Some(d),
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 Err(_) => None,
             };
 
@@ -1828,7 +1945,7 @@ impl<'s> SurfaceDropCurve<'s> {
                 // aliasing; the harness reports such a start list as -3 on both sides.
                 match trace_curve_base(self, k, start, &out.curves_3d) {
                     Ok(()) => flush_curve(k, &mut self.base, out, Some(self.curve))?,
-                    Err(e) if e.is_unported() => return Err(e),
+                    Err(e) if e.is_unported_or_cancelled() => return Err(e),
                     Err(_) => {}
                 }
             }
@@ -2358,6 +2475,59 @@ mod tests {
         assert!(t.trace_curve_2(&k, id, &mut out).is_err());
     }
 
+    /// A line along a cone's seam drops to both of the seam's UV lines, `u` min and `u`
+    /// max: two UV curves of one 3D piece, from which an edge use's side is chosen (the
+    /// offset of a cone's seam edge use keeps its original's side).
+    #[test]
+    fn a_line_along_a_cone_seam_drops_to_both_seam_lines() {
+        let k = &Kernel::default();
+        let mut cone = crate::surface::cone::Cone::new_bounded(
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            5.0,
+            2.5,
+            0.0,
+            360.0,
+            10.0,
+            false,
+            false,
+            false,
+        );
+        cone.make_nurb(k).unwrap();
+        let s = Surface::from(cone);
+        let d = s.natural_uv_domain_with_nurb(k).unwrap();
+        // the generator at angle 0, the seam
+        let seam = segment(Vec3::new(5.0, 0.0, 0.0), Vec3::new(2.5, 0.0, 10.0));
+        let dropped = s
+            .drop_and_trim_curve::<NoObject>(
+                k,
+                &d,
+                &seam,
+                &seam.natural_interval(),
+                1e-6,
+                true,
+                true,
+                None,
+            )
+            .unwrap();
+        assert_eq!(dropped.uv_curves.len(), 2);
+        let mut sides = Vec::new();
+        for uv in &dropped.uv_curves {
+            let ivl = uv.natural_interval();
+            let (a, b) = (
+                uv.evaluate_point(k, ivl.min()).unwrap(),
+                uv.evaluate_point(k, ivl.max()).unwrap(),
+            );
+            // a u-constant line over the whole height
+            assert_eq!(a.x, b.x);
+            assert!((a.y - b.y).abs() >= d.v_max() - d.v_min() - 1e-9);
+            sides.push(a.x);
+        }
+        sides.sort_by(f64::total_cmp);
+        assert_eq!(sides, vec![d.u_min(), d.u_max()]);
+    }
+
     #[test]
     fn interior_drop_on_plane() {
         let k = &Kernel::default();
@@ -2370,5 +2540,109 @@ mod tests {
         t.interior_curves(&Kernel::default(), &mut out).unwrap();
         assert_eq!(out.uv_curves.len(), 1);
         assert_eq!(out.max_drop_dists.len(), 1);
+    }
+
+    /// The arch `(u, v, 2u(1 - u))` over `[0, 1]^2`, a B-spline: quadratic in `u`,
+    /// linear in `v`.
+    fn arch() -> Surface {
+        use crate::nurbs::b_spline_surface::BSplineSurface;
+        use crate::nurbs::math::CPoint;
+        let row = |x: f64, z: f64| vec![CPoint::new(x, 0.0, z, 1.0), CPoint::new(x, 1.0, z, 1.0)];
+        let pw = vec![row(0.0, 0.0), row(0.5, 1.0), row(1.0, 0.0)];
+        Surface::from(
+            BSplineSurface::from_data(
+                2,
+                1,
+                2,
+                1,
+                5,
+                3,
+                &pw,
+                &[0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+                &[0.0, 0.0, 1.0, 1.0],
+            )
+            .unwrap(),
+        )
+    }
+
+    /// #23057: the drop of the point just past a singular start skips the start only
+    /// when it proves that no surface point lies within its bound. The arch's nearest
+    /// points to `(1/2, 1/2, -10)` are `sqrt(100.25)` away (closed form:
+    /// `f >= 100.25 + 39u(1 - u)`, equality at `v = 1/2`, `u` 0 or 1), so a drop bounded
+    /// by 1 is proved empty (every leaf's box is farther than 1) and starts nothing;
+    /// unbounded it finds a foot; an empty drop not proved so (a leaf the tree had to
+    /// solve, as above the arch's top within 9.499995 of `(1/2, 1/2, 10)`, whose nearest
+    /// point is 9.5 away; no candidate; or a tree solve that failed) is still the error
+    /// "the drop found no foot point".
+    #[test]
+    fn a_singular_start_is_skipped_only_on_a_proved_empty_drop() {
+        let k = &Kernel::default();
+        let s = arch();
+        let dom = Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0);
+        let below = Point3::new(0.5, 0.5, -10.0);
+        let drop = |bound: Option<f64>| {
+            surface_global_point_solve_answer(
+                k,
+                &s,
+                &dom,
+                SolverOperation::Minimize,
+                below,
+                EFF_ZERO,
+                bound,
+                SolutionRequested::All,
+            )
+            .unwrap()
+        };
+
+        // bounded by 1, far below the nearest point: proved empty, the start is skipped
+        let (found, answer) = drop(Some(1.0));
+        assert!(found.is_empty(), "{found:?}");
+        assert_eq!(answer, EmptyAnswer::NoPointWithinTarget);
+        assert_eq!(singular_step_off(&found, answer, 0).unwrap(), None);
+
+        // unbounded: the foot is found and taken
+        let (found, answer) = drop(None);
+        let foot = singular_step_off(&found, answer, 0).unwrap().unwrap();
+        let d = s.evaluate_point(k, foot).unwrap().distance(below);
+        assert!((d - 100.25_f64.sqrt()).abs() < 1e-6, "{foot:?} at {d}");
+
+        // above the arch's top, (1/2, 1/2, 1/2), the nearest point of (1/2, 1/2, 10) is
+        // 9.5 away, and the tree's boxes, hulls of the patches' control nets padded by
+        // 1e-5, come within 9.49999 of it: bounded by 9.499995 the tree must solve the
+        // leaf at the top, whose solve finds 9.5 and culls it. Its box does not prove
+        // that nothing lies within the bound, so the empty drop is unproved and stays
+        // the error
+        let above = Point3::new(0.5, 0.5, 10.0);
+        let (found, answer) = surface_global_point_solve_answer(
+            k,
+            &s,
+            &dom,
+            SolverOperation::Minimize,
+            above,
+            EFF_ZERO,
+            Some(9.499_995),
+            SolutionRequested::All,
+        )
+        .unwrap();
+        assert!(found.is_empty(), "{found:?}");
+        assert_eq!(answer, EmptyAnswer::Unproved);
+        let err = singular_step_off(&found, answer, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("the drop found no foot point"),
+            "{err}"
+        );
+
+        // an empty drop that is not proved empty stays the error
+        let err = singular_step_off(&[], EmptyAnswer::Unproved, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("the drop found no foot point"),
+            "{err}"
+        );
+        // and a found foot is taken whatever the answer says
+        let p = Point2::new(0.25, 0.5);
+        assert_eq!(
+            singular_step_off(&[p], EmptyAnswer::Unproved, 3).unwrap(),
+            Some(p)
+        );
     }
 }

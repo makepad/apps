@@ -13,7 +13,6 @@ use crate::ops::Body;
 use makepad_csg_boolean::cdt::{Point2 as CdtPoint, CDT};
 use makepad_csg_brep::curve::curve::Curve;
 use makepad_csg_brep::kernel::Kernel;
-use makepad_csg_brep::limits;
 use makepad_csg_brep::math::{Point2, Point3, Vec3};
 use makepad_csg_brep::nurbs::b_spline_surface_n_lib::p2::OrientType;
 use makepad_csg_brep::surface::surface::{Surface, SurfaceKind};
@@ -97,7 +96,7 @@ fn sample_params(k: &Kernel, curve: &Curve, lo: f64, hi: f64, chord: f64) -> Res
         (d.x * d.x + d.y * d.y + d.z * d.z).sqrt()
     }
     fn split(k: &Kernel, c: &Curve, t0: f64, a: Point3, t1: f64, b: Point3, chord: f64, depth: u32, out: &mut Vec<f64>) -> Result<(), BrepError> {
-        limits::probe();
+        crate::guard::check_entry(k, "tessellate")?;
         let tm = 0.5 * (t0 + t1);
         let m = c.evaluate_point(k, tm)?;
         let q1 = c.evaluate_point(k, 0.5 * (t0 + tm))?;
@@ -214,7 +213,7 @@ impl Tess<'_> {
     }
 
     fn face(&mut self, b: &mut Body, f: FaceId, tri_face: &mut Vec<u32>, index: u32) -> Result<(), BrepError> {
-        limits::probe();
+        crate::guard::check_entry(self.k, "tessellate")?;
         let (fu, same) = material_use(b, f)?;
         let mut loops = Vec::new();
         for lu in eu::faceuse_loopuses(b, fu, false, None)? {
@@ -251,7 +250,7 @@ fn interior_points(k: &Kernel, s: &Surface, lo: [f64; 2], hi: [f64; 2], chord: f
     /// Cells deeper than this are left to the triangle refinement.
     const MAX_DEPTH: u32 = 18;
     fn cell(k: &Kernel, s: &Surface, lo: [f64; 2], hi: [f64; 2], chord: f64, depth: u32, out: &mut Vec<[f64; 2]>) -> Result<(), BrepError> {
-        limits::probe();
+        crate::guard::check_entry(k, "tessellate")?;
         let (mu, mv) = (0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1]));
         let c00 = eval(k, s, lo)?;
         let c11 = eval(k, s, hi)?;
@@ -425,7 +424,7 @@ fn triangulate_face(
     let mut passed: std::collections::HashSet<[u32; 3]> = std::collections::HashSet::new();
     let mut round = 0;
     loop {
-        limits::probe();
+        crate::guard::check_entry(k, "tessellate")?;
         let mut cdt = CDT::new(CdtPoint { x: 0.0, y: 0.0 }, CdtPoint { x: size[0], y: size[1] });
         let mut uv: Vec<[f64; 2]> = Vec::new();
         let mut vertex: Vec<Option<u32>> = Vec::new();
@@ -597,6 +596,7 @@ fn once(k: &Kernel, b: &mut Body, chord: f64) -> Result<TessMesh, BrepError> {
 
 /// The body's mesh. Over the triangle budget the chord doubles: coarser, never a failure.
 pub fn tessellate(k: &Kernel, b: &mut Body, options: &TessOptions) -> Result<TessMesh, BrepError> {
+    crate::guard::check_entry(k, "tessellate")?;
     let mut chord = options.chord.max(1e-5);
     loop {
         let m = once(k, b, chord)?;
@@ -620,6 +620,7 @@ fn oriented_normal(k: &Kernel, b: &Body, f: FaceId, uv: Point2) -> Result<Vec3, 
 /// face flat there or curving inward (a hole's wall, a cove). Read from the normal's turn over a
 /// small step along each parameter: two surface evaluations more than the point's own.
 pub fn convex_radius(k: &Kernel, b: &Body, f: FaceId) -> Result<Option<(f64, [f64; 3])>, BrepError> {
+    crate::guard::check_entry(k, "convex_radius")?;
     let surface = b.face(f)?.surface.as_ref().ok_or_else(|| BrepError::Kernel("a face without a surface".into()))?;
     if matches!(surface.kind(), SurfaceKind::Plane(_)) {
         return Ok(None);
@@ -653,6 +654,7 @@ pub fn convex_radius(k: &Kernel, b: &Body, f: FaceId) -> Result<Option<(f64, [f6
 
 /// Whether the solid's angle across an edge is under 180 degrees, and whether it is smooth.
 pub fn edge_is_convex(k: &Kernel, b: &mut Body, e: EdgeId) -> Result<(bool, bool), BrepError> {
+    crate::guard::check_entry(k, "edge_is_convex")?;
     let uses = edge::edgeuses(b, e, None, None)?;
     // Each face holds an edge through two uses (its two sides): only the outward side's.
     let mut loop_uses: Vec<EdgeuseId> = Vec::new();
@@ -694,6 +696,7 @@ pub fn edge_is_convex(k: &Kernel, b: &mut Body, e: EdgeId) -> Result<(bool, bool
 
 /// A face's surface kind, and its outward normal when it is flat.
 pub fn face_kind(k: &Kernel, b: &mut Body, f: FaceId) -> Result<(&'static str, Option<[f64; 3]>), BrepError> {
+    crate::guard::check_entry(k, "face_kind")?;
     let surface = b.face(f)?.surface.as_ref().ok_or_else(|| BrepError::Kernel("a face without a surface".into()))?;
     let kind = match surface.kind() {
         SurfaceKind::Plane(_) => "plane",

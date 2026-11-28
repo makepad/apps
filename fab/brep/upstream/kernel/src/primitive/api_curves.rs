@@ -35,9 +35,11 @@
 //! - **Context.** `SmApiGetOrCreateContext()` is the caller's [`Kernel`]; the
 //!   B-spline and line constructors take no context in the port.
 //! - **Statuses.** `SM_ERR_INVALID_INPUT` is [`SolidError::InvalidInput`];
-//!   `SM_ERR_NOT_WITHIN_TOLERANCE` and `SM_ERR` are [`SolidError::Upstream`] with
-//!   [`SM_ERR_NOT_WITHIN_TOLERANCE`] / [`crate::error::SM_ERR`]. Errors of the called
-//!   constructors pass through unchanged.
+//!   `SM_ERR_NOT_WITHIN_TOLERANCE` is [`PrimitiveFailure::HelixDeviates`] (comparison
+//!   status [`SM_ERR_NOT_WITHIN_TOLERANCE`]) and `SM_ERR` a named
+//!   [`PrimitiveFailure`] (comparison status [`crate::error::SM_ERR`]): a helix that
+//!   could not be evaluated or a polygon side that could not be made, with the caught
+//!   error as its cause. Other errors of the called constructors pass through unchanged.
 //! - `SmApiCreateHelix` returns the curve as an `SmBSplineCurve`; the fitter's
 //!   `TWOPI` literal `6.2831853071795864` is [`core::f64::consts::TAU`] (the same
 //!   double).
@@ -51,12 +53,14 @@
 //!   `SmTol::GetApproxTol3d(pCurve)`: half the recorded edge tolerance
 //!   ([`Curve::owner_zone_tol_3d`]), else half of [`zone_tol_3d_of_curve`].
 
+use crate::math::det;
 use core::f64::consts::TAU;
 
 use crate::curve::curve::{Curve, CurveKind};
 use crate::curve::ellipse::Ellipse;
 use crate::curve::line::Line;
-use crate::error::{ignore_status, Result, SolidError};
+use crate::error::primitive::PrimitiveFailure;
+use crate::error::{ignore_status, Failure, Result, SolidError};
 use crate::geom::axis2_placement::Axis2Placement;
 use crate::geom::tol::zone_tol_3d_of_curve;
 use crate::geom::vector3d::{is_valid_double, Point3, Vec3};
@@ -69,9 +73,9 @@ use crate::nurbs::b_spline_curve::{
 use crate::nurbs::b_spline_curve_n_lib::HelixSpec;
 use crate::nurbs::crv_fit::p1::ParamMethod;
 
-/// Upstream `SmStatus` value `SM_ERR_NOT_WITHIN_TOLERANCE`, as carried by
-/// [`SolidError::Upstream`].
-pub const SM_ERR_NOT_WITHIN_TOLERANCE: i32 = 1021;
+/// Upstream `SmStatus` value `SM_ERR_NOT_WITHIN_TOLERANCE`, the comparison status of
+/// [`PrimitiveFailure::HelixDeviates`].
+pub use crate::error::SM_ERR_NOT_WITHIN_TOLERANCE;
 
 const OP_LINE: &str = "primitive::api_curves::create_line";
 const OP_CIRCLE: &str = "primitive::api_curves::create_circle";
@@ -358,10 +362,12 @@ pub fn create_helix(params: &HelixParams) -> Result<BSplineCurve> {
     for i in 0..=num_samples {
         let u = param_min + param_span * (i as f64 / num_samples as f64);
         let on_curve = helix.evaluate_point(u).map_err(|e| {
-            if e.is_unported() {
+            if e.is_unported_or_cancelled() {
                 e
             } else {
-                SolidError::sm_err(OP_HELIX)
+                Failure::new(OP_HELIX, PrimitiveFailure::HelixNotEvaluated)
+                    .caused_by(e)
+                    .into_error()
             }
         })?;
 
@@ -376,8 +382,8 @@ pub fn create_helix(params: &HelixParams) -> Result<BSplineCurve> {
         }
 
         let radius = (radius_start * (two_pi_turns - theta) + radius_end * theta) / two_pi_turns;
-        let ax = origin.x + radius * theta.cos();
-        let ay = origin.y + rl * radius * theta.sin();
+        let ax = origin.x + radius * det::cos(theta);
+        let ay = origin.y + rl * radius * det::sin(theta);
         let az = origin.z + height * theta / two_pi_turns;
 
         let ddx = on_curve.x - ax;
@@ -390,11 +396,13 @@ pub fn create_helix(params: &HelixParams) -> Result<BSplineCurve> {
     }
 
     if max_dev > tolerance {
-        return Err(SolidError::Upstream {
-            operation: OP_HELIX,
-            code: SM_ERR_NOT_WITHIN_TOLERANCE,
-            entity: None,
-        });
+        return Err(SolidError::primitive(
+            OP_HELIX,
+            PrimitiveFailure::HelixDeviates {
+                deviation: max_dev,
+                tolerance,
+            },
+        ));
     }
 
     Ok(helix)
@@ -440,21 +448,29 @@ pub fn create_rectangle(center: Point3, length: f64, width: f64) -> Result<Vec<L
     segments(&corners, OP_RECTANGLE)
 }
 
+/// A polygon side the line constructor refused or failed to make
+/// ([`PrimitiveFailure::PolygonSideNotMade`]), keeping the constructor's error as its cause
+/// (it decides defect or refusal: corners that coincide in double precision are the
+/// caller's).
+#[track_caller]
+fn side_not_made(operation: &'static str, e: SolidError) -> SolidError {
+    Failure::new(operation, PrimitiveFailure::PolygonSideNotMade)
+        .caused_by(e)
+        .into_error()
+}
+
 /// The closed polygon through `points` (segment `i` from point `i` to point
 /// `i + 1`, wrapping), each through `SmLine::CreateLineSegment`; `SM_ERR` on the
 /// first failure.
 fn segments(points: &[Point3], operation: &'static str) -> Result<Vec<Line>> {
     let mut result = Vec::with_capacity(points.len());
-    for (ii, &p0) in points.iter().enumerate() {
-        let p1 = points
-            .get((ii + 1) % points.len())
-            .copied()
-            .ok_or_else(|| SolidError::sm_err(operation))?;
+    // segment `i` ends at point `i + 1`, the last at the first
+    for (&p0, &p1) in points.iter().zip(points.iter().cycle().skip(1)) {
         match Line::create_line_segment(3, p0, p1, None) {
             Ok(seg) => result.push(seg),
-            Err(e) if e.is_unported() => return Err(e),
+            Err(e) if e.is_unported_or_cancelled() => return Err(e),
             // Drop the segments this call already made.
-            Err(_) => return Err(SolidError::sm_err(operation)),
+            Err(e) => return Err(side_not_made(operation, e)),
         }
     }
     Ok(result)
@@ -513,21 +529,21 @@ pub fn create_regular_polygon(center: Point3, num_sides: u64, radius: f64) -> Re
         let a1 = angle_step * (ii + 1) as f64;
 
         let pt0 = Point3::new(
-            center.x + radius * a0.cos(),
-            center.y + radius * a0.sin(),
+            center.x + radius * det::cos(a0),
+            center.y + radius * det::sin(a0),
             center.z,
         );
         let pt1 = Point3::new(
-            center.x + radius * a1.cos(),
-            center.y + radius * a1.sin(),
+            center.x + radius * det::cos(a1),
+            center.y + radius * det::sin(a1),
             center.z,
         );
 
         match Line::create_line_segment(3, pt0, pt1, None) {
             Ok(seg) => result.push(seg),
-            Err(e) if e.is_unported() => return Err(e),
+            Err(e) if e.is_unported_or_cancelled() => return Err(e),
             // Drop the segments this call already made.
-            Err(_) => return Err(SolidError::sm_err(OP_POLYGON)),
+            Err(e) => return Err(side_not_made(OP_POLYGON, e)),
         }
     }
 
@@ -775,9 +791,15 @@ mod tests {
             create_rectangle(c, 10.0, 6.0).map(|v| v.len()).ok(),
             Some(4)
         );
+        // corners that coincide in double precision: the side keeps the line's error
+        let side = |e: &SolidError| {
+            e.upstream_status() == Some(SM_ERR)
+                && e.primitive_failure() == Some(&PrimitiveFailure::PolygonSideNotMade)
+                && e.cause().is_some()
+        };
         assert!(matches!(
             create_rectangle(p(0.0, 1.0e10, 0.0), 10.0, 1.0e-9),
-            Err(SolidError::Upstream { code: SM_ERR, .. })
+            Err(ref e) if side(e)
         ));
         assert!(matches!(
             create_rectangle(c, f64::NAN, 6.0),
@@ -789,7 +811,7 @@ mod tests {
         );
         assert!(matches!(
             create_regular_polygon(p(1.0e10, 1.0e10, 0.0), 5, 1.5e-6),
-            Err(SolidError::Upstream { code: SM_ERR, .. })
+            Err(ref e) if side(e)
         ));
         assert!(create_regular_polygon(c, 6, f64::INFINITY).is_err());
     }
@@ -868,5 +890,26 @@ mod tests {
         // (beyond the 47-bit address space, so no test machine can grant it)
         assert!(create_regular_polygon(c, 1 << 47, 5.0).is_err());
         assert!(create_regular_polygon(c, u64::MAX, 5.0).is_err());
+    }
+
+    #[test]
+    fn create_curve_and_segments_degenerate_inputs_do_not_panic() {
+        assert!(matches!(
+            create_curve(&[]),
+            Err(SolidError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            create_curve(&[p(0.0, 0.0, 0.0)]),
+            Err(SolidError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            create_curve(&[p(0.0, 0.0, 0.0), p(1.0, 0.0, 0.0), p(2.0, 0.0, 0.0)]),
+            Err(SolidError::InvalidInput { .. })
+        ));
+
+        assert_eq!(segments(&[], "test_op").unwrap().len(), 0);
+
+        assert!(create_rectangle(p(0.0, 0.0, 0.0), 0.0, 10.0).is_err());
+        assert!(create_rectangle(p(0.0, 0.0, 0.0), f64::NAN, 10.0).is_err());
     }
 }

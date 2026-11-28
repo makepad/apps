@@ -35,6 +35,16 @@
 //! | [`test_for_iso_circles`], [`IsoCircles`]          | `sm_TestForIsoCircles`                           |
 //!
 //! Deviations:
+//! - **A whole turn within rounding (#2928, not upstream).** `MakeNurbWithSweepParams` sweeps
+//!   a window past 360° by no more than `SM_EFF_ZERO` of a turn as the whole turn, where
+//!   upstream asks `CreateCircleSegment` for the span as is and is refused past 360°.
+//! - **Meridians keep their kind (not upstream).** `IntersectWithPlane` through the axis
+//!   rotates a circle generator (a torus's) as the circle it is, where upstream rotates its
+//!   `SmBSplineCurve` part (WR-721, #2405).
+//! - **Meridians tangent to a side stay whole (not upstream, #15049).** Where both surfaces
+//!   are faces' (`revolved_contact_tol`), `IntersectWithPlane` trims a meridian to the plane's
+//!   domain without breaking it where it stays inside on both sides
+//!   (`Plane::trim_curve_to_plane_domain_joined`).
 //! - **Derived class.** `SmSurfOfRevolution` derives from `SmBSplineSurface`; the base
 //!   object is the [`SurfOfRevolution::base`] field. The surface joins
 //!   [`crate::surface::surface::SurfaceKind`] with the units porting its remaining
@@ -97,7 +107,8 @@ use crate::curve::curve::p7::PropertyAnalysisOptions;
 use crate::curve::curve::{Curve, CurveKind, CurvePropertyType};
 use crate::curve::ellipse::p2::set_up_polar_conversion;
 use crate::curve::ellipse::{Ellipse, EllipseOptions, PolarConversion};
-use crate::error::{ignore_status, ignored, Result, SolidError, SM_ERR};
+use crate::error::surface::{AnalyticCheck, SurfaceFailure};
+use crate::error::{ignore_status, ignored, Failure, Result, SolidError};
 use crate::geom::axis2_placement::Axis2Placement;
 use crate::geom::extent1d::Extent1d;
 use crate::geom::extent2d::Extent2d;
@@ -111,6 +122,7 @@ use crate::geom::tol::{are_same, is_zero, ZONE_TOL_3D};
 use crate::geom::vector2d::Point2;
 use crate::geom::vector3d::{sqrt, Point3, Vec3};
 use crate::kernel::Kernel;
+use crate::math::det;
 use crate::math::{rad_to_deg, EFF_ZERO, EFF_ZERO_SQRT, PI};
 use crate::nurbs::b_spline_curve::{BSplineCurve, BoundingBoxRequest as CurveBoxRequest};
 use crate::nurbs::b_spline_surface::{
@@ -334,6 +346,9 @@ pub struct IsoCircles {
     pub common_line_point: Option<Point3>,
     /// Its unit direction (`rCommonLineVec`).
     pub common_line_vec: Option<Vec3>,
+    /// Not upstream (#15039): the conditioning of the first iso curve's end angle, as
+    /// [`end_angle_conditioning`] gives it; `None` where it could not be read.
+    pub end_conditioning: Option<f64>,
 }
 
 // ---- the surface -----------------------------------------------------------------------
@@ -453,14 +468,15 @@ impl SurfOfRevolution {
     /// whose outputs it then reads).
     pub fn new(
         k: &Kernel,
-        gen_curve: Curve,
+        mut gen_curve: Curve,
         origin: Point3,
         x_axis: Vec3,
         y_axis: Vec3,
         anal_uv_domain: Extent2d,
         swap_uv: bool,
     ) -> Result<Self> {
-        let base_gen = gen_base(&gen_curve)?;
+        // (the generator must be derived from SmBSplineCurve)
+        gen_base(&gen_curve)?;
         let mut surf = Self {
             base: BSplineSurface::new(),
             gen_curve: None,
@@ -486,7 +502,11 @@ impl SurfOfRevolution {
         // when curve is not planar
         // (when curve is not planar, mark that; else see if it is on the X/Z plane)
         if gen_curve.is_planar(k, tol_3d)?.is_planar {
-            let on = base_gen.is_on_plane(origin, y_axis, tol_3d, None)?;
+            // `pGenCurve->IsOnPlane(..)` is called on the generator itself, whose
+            // `GetOrCreateGwNurbPointer` runs its own `MakeNurb` (a two-point `SmLine` has no
+            // NURB yet): the NURB is made on the generator here, as upstream
+            gen_ensure_nurb(k, &mut gen_curve)?;
+            let on = gen_base(&gen_curve)?.is_on_plane(origin, y_axis, tol_3d, None)?;
             if !on.on_plane {
                 surf.planar_generator = false;
             }
@@ -501,8 +521,13 @@ impl SurfOfRevolution {
     /// The surface of one full revolution of `swept_curve` about the axis through
     /// `axis_point` along `axis_direction` (`CreateCanonical`, co-ported from unit
     /// `surface.surf_of_revolution_p2`): the X axis points from the axis point to the
-    /// curve's STEP start point (or, when that is on the axis, its point at 45%), the
-    /// domain is `[0, 360]` by the curve's STEP interval; the NURB is made by
+    /// curve's point at parameter 0 when the STEP interval holds it (WR-738; upstream
+    /// takes the STEP start point), else to its start; when that point is on the axis,
+    /// to its start, and when that is on the axis too, to its point at 45%. A point is
+    /// on the axis by its distance from it (upstream: within 1 degree of its
+    /// direction): [`Self::create_canonical_off_axis`] with no distance of its own,
+    /// only `SM_EFF_ZERO`. The domain is `[0, 360]` by the curve's STEP interval; the
+    /// NURB is made by
     /// [`Self::make_nurb`]. A zero axis (squared length below `SM_EFF_ZERO_SQ`) is
     /// taken as `(0, 0, 1)`, as upstream's unchecked `Unitize`.
     ///
@@ -517,20 +542,77 @@ impl SurfOfRevolution {
         axis_direction: Vec3,
         swap_uv: bool,
     ) -> Result<Self> {
+        Self::create_canonical_off_axis(k, swept_curve, axis_point, axis_direction, swap_uv, 0.0)
+    }
+
+    /// [`Self::create_canonical`] with a point on the axis when it lies within
+    /// `on_axis_tol` of it (never less than `SM_EFF_ZERO`; not upstream, #17204): a
+    /// revolve passes its B-rep's tolerance, within which the profile's vertex is on
+    /// the axis for the body (its circle a pole). The frame's X axis is the direction
+    /// from the axis to a point of the curve, so it must come from a point off the
+    /// axis by more than that: a profile end left a hair past the axis (a sketch
+    /// solver's 3e-11 mm) points the other way, the frame then faces away from the
+    /// profile, half a turn from the polar converter's sweep circle (which already
+    /// takes the pole for degenerate and starts at the 45% point), and the face's
+    /// edges lie half a turn off its surface.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_canonical`], and `on_axis_tol` not finite or negative.
+    pub fn create_canonical_off_axis(
+        k: &Kernel,
+        swept_curve: Curve,
+        axis_point: Point3,
+        axis_direction: Vec3,
+        swap_uv: bool,
+        on_axis_tol: f64,
+    ) -> Result<Self> {
+        // a tolerance is a finite distance, never negative (a NaN would fall through to
+        // the default and an infinite one would put every point on the axis)
+        if !on_axis_tol.is_finite() || on_axis_tol < 0.0 {
+            return Err(SolidError::surface(
+                OP_CANONICAL,
+                SurfaceFailure::ToleranceNotADistance,
+            ));
+        }
+
         // unitize the rotation axis (status ignored upstream)
         let z_vec = axis_direction.unitize_or_z();
 
         // locals
         let crv_ivl = gen_step_interval(&swept_curve)?;
 
-        // SweptCurve start point
-        let mut pnt = first(&gen_evaluate_step(k, &swept_curve, crv_ivl.min(), 0)?)?;
+        // the point at the profile's parameter origin when the interval holds it (WR-738;
+        // upstream: the SweptCurve start point): the point the profile is defined from,
+        // where an unbounded profile's start is SM_INFINITE_PARAMETER away (past the axis
+        // for a line crossing it, so the frame would face the other nappe)
+        let from_origin = crv_ivl.contains_value(0.0, 0.0);
+        let ref_param = if from_origin { 0.0 } else { crv_ivl.min() };
+        let mut pnt = first(&gen_evaluate_step(k, &swept_curve, ref_param, 0)?)?;
 
         // Vector from SweptCurve Start to RotAxis point
         let mut x_vec = pnt - axis_point;
+        // on the axis by the point's distance from the axis, `|Z x x_vec|`, under the
+        // bound the Y axis below is checked against (upstream: within 1 degree of its
+        // direction, which takes a point far along the axis for one on it)
+        // (or within `on_axis_tol` of it, #17204)
+        let on_axis_sq = if on_axis_tol > EFF_ZERO {
+            on_axis_tol * on_axis_tol
+        } else {
+            crate::math::EFF_ZERO_SQ
+        };
+        let on_axis = |x_vec: Vec3| z_vec.cross(x_vec).length_squared() < on_axis_sq;
+
+        // a profile origin on the axis gives way to the start first, the point upstream
+        // takes (a segment through the axis whose origin and 45% point are both on it,
+        // e.g. `s (1, 0, 1)` on [-9, 11])
+        if from_origin && on_axis(x_vec) {
+            pnt = first(&gen_evaluate_step(k, &swept_curve, crv_ivl.min(), 0)?)?;
+            x_vec = pnt - axis_point;
+        }
 
         // when start point is on rot axis
-        if x_vec.length() < EFF_ZERO || x_vec.is_parallel_to(z_vec, 1.0) {
+        if on_axis(x_vec) {
             // try SweptCurve nearMidPoint
             pnt = first(&gen_evaluate_step(
                 k,
@@ -546,7 +628,10 @@ impl SurfOfRevolution {
 
         // sYVec can be 0,0,0 if revolving a line coincident with the axis
         if y_vec.length_squared() < crate::math::EFF_ZERO_SQ {
-            return Err(SolidError::sm_err(OP_CANONICAL));
+            return Err(SolidError::surface(
+                OP_CANONICAL,
+                SurfaceFailure::GeneratorOnAxis,
+            ));
         }
         let y_vec = y_vec.unitize()?;
 
@@ -613,20 +698,22 @@ impl SurfOfRevolution {
         // locals
         let surf_sweep_step_ivl = self.anal_uv_domain.u_interval();
         let surf_gen_step_ivl = self.anal_uv_domain.v_interval();
-        let gen_curve_step_ivl = gen_step_interval(self.gen()?)?;
+        // (the generator is borrowed once, beside the position, for the whole routine)
+        let own = self
+            .gen_curve
+            .as_mut()
+            .ok_or_else(|| SolidError::surface(OP_GEN, SurfaceFailure::SurfaceWithoutGenerator))?;
+        let gen_curve_step_ivl = gen_step_interval(own)?;
 
         // get a GenCurve
-        let mut gen_curve = self.create_generator_from_angle(k, surf_sweep_step_ivl.min())?;
+        let mut gen_curve =
+            generator_rotated_by(k, own, &self.position, surf_sweep_step_ivl.min())?;
 
         // When SurfaceCurve and generator intervals are not the same
         if !surf_gen_step_ivl.is_contained_by(&gen_curve_step_ivl, 0.0)
             || !gen_curve_step_ivl.is_contained_by(&surf_gen_step_ivl, 0.0)
         {
             // Trimming is needed.
-            let own = self
-                .gen_curve
-                .as_mut()
-                .ok_or(SolidError::null_pointer(OP_GEN))?;
             gen_adjust_step_interval(k, own, &surf_gen_step_ivl)?;
             gen_adjust_step_interval(k, &mut gen_curve, &surf_gen_step_ivl)?;
         }
@@ -646,7 +733,7 @@ impl SurfOfRevolution {
             line_vector,
             self.position.origin(),
             self.position.z_axis(),
-            surf_sweep_step_ivl.length(),
+            sweep_span_deg(surf_sweep_step_ivl.length()),
             self.swap_uv,
             opt_sweep_curve,
         )?;
@@ -736,7 +823,9 @@ impl SurfOfRevolution {
 
         // update PolarConverter
         if iso_degenerate {
-            return Err(SolidError::sm_err(OP_REBUILD));
+            return Err(Failure::new(OP_REBUILD, SurfaceFailure::DegenerateIsoCurve)
+                .with_status(crate::error::SM_ERR)
+                .into_error());
         }
         let CurveKind::Ellipse(circle) = sweep_iso.kind_mut() else {
             return Err(SolidError::invalid_input(
@@ -760,7 +849,7 @@ impl SurfOfRevolution {
     pub(crate) fn gen(&self) -> Result<&Curve> {
         self.gen_curve
             .as_ref()
-            .ok_or(SolidError::null_pointer(OP_GEN))
+            .ok_or_else(|| SolidError::surface(OP_GEN, SurfaceFailure::SurfaceWithoutGenerator))
     }
 
     /// The generating curve (`GetGenCurve`).
@@ -1035,21 +1124,21 @@ impl SurfOfRevolution {
             (
                 Point2::new(
                     iso_parameter,
-                    domain.map_or(nurb_domain.min().y, |d| d.min().y),
+                    domain.map_or_else(|| nurb_domain.min().y, |d| d.min().y),
                 ),
                 Point2::new(
                     iso_parameter,
-                    domain.map_or(nurb_domain.max().y, |d| d.max().y),
+                    domain.map_or_else(|| nurb_domain.max().y, |d| d.max().y),
                 ),
             )
         } else {
             (
                 Point2::new(
-                    domain.map_or(nurb_domain.min().x, |d| d.min().x),
+                    domain.map_or_else(|| nurb_domain.min().x, |d| d.min().x),
                     iso_parameter,
                 ),
                 Point2::new(
-                    domain.map_or(nurb_domain.max().x, |d| d.max().x),
+                    domain.map_or_else(|| nurb_domain.max().x, |d| d.max().x),
                     iso_parameter,
                 ),
             )
@@ -1131,7 +1220,10 @@ impl SurfOfRevolution {
         // Get GeneratorPoint for given Param
         let generator_domain = gen.natural_interval();
         if !generator_domain.contains_value(gen_param, 0.0) {
-            return Err(SolidError::sm_err(OP_DIRECTRIX));
+            return Err(SolidError::surface(
+                OP_DIRECTRIX,
+                SurfaceFailure::ParameterOutsideGenerator,
+            ));
         }
         let generator_point = gen.evaluate_point(k, gen_param)?;
 
@@ -1169,23 +1261,7 @@ impl SurfOfRevolution {
     ///
     /// `SM_ERR_NULL_POINTER` without generator; those of the copy and the transform.
     pub fn create_generator_from_angle(&self, k: &Kernel, angle_deg: f64) -> Result<Curve> {
-        // copy the current GenCurve
-        let mut new_curve = self.gen()?.copy(k)?;
-
-        // when rotating the genCurve
-        if angle_deg.abs() > EFF_ZERO {
-            // define the rotation matrix
-            let mut rf = Axis2Placement::IDENTITY;
-            rf.rotate_about_axis_at_point(
-                angle_deg * PI / 180.0,
-                self.position.origin(),
-                self.position.z_axis(),
-            );
-
-            // rotate the GenCurve Copy
-            new_curve.transform(k, &rf, None)?;
-        }
-        Ok(new_curve)
+        generator_rotated_by(k, self.gen()?, &self.position, angle_deg)
     }
 
     // ---- parameter conversion and STEP evaluation -----------------------------------
@@ -1219,7 +1295,7 @@ impl SurfOfRevolution {
         let mut written = Point2::new(0.0, 0.0);
         match self.convert_uv_from_nurbs_to_step_into(k, nurbs_uv, &mut written) {
             Ok(p) => Ok(p),
-            Err(e) if e.is_unported() => Err(e),
+            Err(e) if e.is_unported_or_cancelled() => Err(e),
             Err(_) => Ok(written),
         }
     }
@@ -1258,7 +1334,9 @@ impl SurfOfRevolution {
         // when polar conversion is possible
         let mut exact_conversion = false;
         if self.have_polar_conversion() {
-            let circle = self.polar_curve().ok_or(SolidError::null_pointer(OP_GEN))?;
+            let circle = self
+                .polar_curve()
+                .ok_or_else(|| SolidError::surface(OP_GEN, SurfaceFailure::NoPolarConverter))?;
             let (x, exact) = self
                 .polar
                 .convert_to_polar_parameter(k, circle, swapped.x)?;
@@ -1353,7 +1431,10 @@ impl SurfOfRevolution {
     ) -> Result<()> {
         // check input
         if hu > 3 || hv > 3 {
-            return Err(SolidError::sm_err(OP_EVAL_STEP));
+            return Err(SolidError::surface(
+                OP_EVAL_STEP,
+                SurfaceFailure::DerivativeOrderTooHigh { max: 3 },
+            ));
         }
 
         // locals
@@ -1375,8 +1456,8 @@ impl SurfOfRevolution {
         let gen = tmp.as_ref().unwrap_or(gen_own);
 
         // evaluate expensive trigonometric functions
-        let cos_u = (uv.x * PI / 180.0).cos();
-        let sin_u = (uv.x * PI / 180.0).sin();
+        let cos_u = det::cos(uv.x * PI / 180.0);
+        let sin_u = det::sin(uv.x * PI / 180.0);
 
         let pv_eval = gen_evaluate_step(k, gen, uv.y, min_highest)?;
         let pv = |i: usize| pv_eval.get(i).copied().unwrap_or(Vec3::UNDEF);
@@ -1585,6 +1666,7 @@ impl SurfOfRevolution {
             other_uv_domain,
             approx_tol_3d,
             iso,
+            0.0,
             &mut out,
         )?;
         Ok((more, out))
@@ -1592,7 +1674,12 @@ impl SurfOfRevolution {
 
     /// [`Self::intersect_with_plane_owned_using`] into `out` (reset first). On an error
     /// `out` keeps what was appended before it, as upstream leaves its output arrays.
+    ///
+    /// Not upstream (#15049): `contact_tol` (`revolved_contact_tol`, nonzero where both
+    /// surfaces are faces') trims a meridian to the plane's domain without breaking it
+    /// where it stays inside on both sides (`Plane::trim_curve_to_plane_domain_joined`).
     #[allow(clippy::too_many_lines)] // one upstream function
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn intersect_with_plane_owned_using_into(
         &self,
         k: &Kernel,
@@ -1601,6 +1688,7 @@ impl SurfOfRevolution {
         other_uv_domain: &Extent2d,
         approx_tol_3d: Option<f64>,
         iso: SweepIsoFn<'_>,
+        contact_tol: f64,
         out: &mut SurfaceIntersection,
     ) -> Result<bool> {
         *out = SurfaceIntersection::default();
@@ -1645,10 +1733,14 @@ impl SurfOfRevolution {
             if plane_pbox.are_disjoint(&curve_pbox, None) {
                 return Ok(Vec::new());
             }
-            Ok(
-                ignored(plane.trim_curve_to_plane_domain(k, other_uv_domain, crv, tol))?
-                    .unwrap_or_default(),
-            )
+            // (not upstream, #15049) where both surfaces are faces', a meridian a hair
+            // outside a side of the plane's domain that it is tangent to stays one curve
+            let pieces = if contact_tol > 0.0 {
+                plane.trim_curve_to_plane_domain_joined(k, other_uv_domain, crv, tol)
+            } else {
+                plane.trim_curve_to_plane_domain(k, other_uv_domain, crv, tol)
+            };
+            Ok(ignored(pieces)?.unwrap_or_default())
         };
 
         // when RevolutionAxis is perpendicular to the plane normal
@@ -1671,7 +1763,11 @@ impl SurfOfRevolution {
                 }
                 let mut angle_rad = axis
                     .ccw_angle_between(self.position.x_axis(), target_vec)
-                    .map_err(|_| SolidError::sm_err(OP_XPLANE))?;
+                    .map_err(|e| {
+                        Failure::new(OP_XPLANE, SurfaceFailure::AngleNotMeasured)
+                            .caused_by(e)
+                            .into_error()
+                    })?;
                 if angle_rad < 0.0 {
                     angle_rad += 2.0 * PI;
                 }
@@ -1679,19 +1775,28 @@ impl SurfOfRevolution {
                 if angle_rad > start_ang_rad - ang_tol_rad && angle_rad < end_ang_rad + ang_tol_rad
                 {
                     // the generator's SmBSplineCurve part, rotated about the axis
-                    let mut crv = gen_base(&gen)?.copy();
                     let rot_ang_rad = angle_rad; // was dAngleRad-dStartAngRad [B143]
                     let mut trans = Axis2Placement::IDENTITY;
                     trans.translate(-self.position.origin());
                     trans.rotate_about_axis(rot_ang_rad, axis);
                     trans.translate(self.position.origin());
-                    crv.transform(&trans, None)?;
+                    // Not upstream (WR-721, #2405): a circle generator (a torus's) rotated
+                    // as the circle it is, so the meridian keeps its kind
+                    let crv = if let CurveKind::Ellipse(_) = gen.kind() {
+                        let mut c = gen.clone();
+                        c.transform(k, &trans, None)?;
+                        c
+                    } else {
+                        let mut c = gen_base(&gen)?.copy();
+                        c.transform(&trans, None)?;
+                        Curve::from(c)
+                    };
 
                     if side == 1 {
                         // (upstream expands the plane box a second time here)
                         plane_pbox.expand_absolute(tol);
                     }
-                    for c in trim(&Curve::from(crv), &plane_pbox)? {
+                    for c in trim(&crv, &plane_pbox)? {
                         out.curves_3d.push(c);
                         out.curve_types.push(TsectCurveType::Crossing);
                     }
@@ -1810,7 +1915,94 @@ pub(crate) fn first(v: &[Vec3]) -> Result<Vec3> {
         .ok_or(SolidError::invalid_input(OP_EVAL_STEP, "empty evaluation"))
 }
 
+/// A copy of `generator` rotated by `angle_deg` about the axis of `position` (the body of
+/// [`SurfOfRevolution::create_generator_from_angle`], on borrowed fields).
+fn generator_rotated_by(
+    k: &Kernel,
+    generator: &Curve,
+    position: &Axis2Placement,
+    angle_deg: f64,
+) -> Result<Curve> {
+    // copy the current GenCurve
+    let mut new_curve = generator.copy(k)?;
+
+    // when rotating the genCurve
+    if angle_deg.abs() > EFF_ZERO {
+        // define the rotation matrix
+        let mut rf = Axis2Placement::IDENTITY;
+        rf.rotate_about_axis_at_point(angle_deg * PI / 180.0, position.origin(), position.z_axis());
+
+        // rotate the GenCurve Copy
+        new_curve.transform(k, &rf, None)?;
+    }
+    Ok(new_curve)
+}
+
 // ---- sm_TestForIsoCircles --------------------------------------------------------------
+
+/// Not upstream (#15039): how far `IsArc`'s end angle moves, in radians times the radius,
+/// per unit each of its four points moves, summed over the points: `S` with `|δθ| <= S δ /
+/// r` when every point is within `δ` of its exact place. `IsArc` (`is_arc_base`) fits the
+/// circle through its samples at `0`, `0.45` and `0.9` of `curve`'s interval and reads the
+/// end point's angle from the first sample, so with the samples at angles `α_1 = 0`, `α_2`,
+/// `α_3` and the end at `T` on the circle of radius `r` (read off `frame`, the fit's):
+/// a sample moved along its normal `n_i` moves the centre and radius by `M⁻¹`, `M` the rows
+/// `(cos α_i, sin α_i, 1)` (the circumcircle `n_i · (δp_i - δc) = δr`); a move along a
+/// tangent does not move the centre. The angle `θ = ∠(p_e - c) - ∠(p_1 - c)` moves by
+/// `(t_e · δp_e - t_1 · δp_1 + (t_1 - t_e) · δc) / r`, so with `w = (t_1 - t_e)ᵀ M⁻¹` (its
+/// first two rows) `S = 1 + sqrt(1 + w_1²) + |w_2| + |w_3|`. A move out of the circle's
+/// plane moves `θ` only to second order. This is the first-order sensitivity; it is 6.02
+/// for a half turn sampled uniformly, 5.98 for one of two rational quarter turns, and grows
+/// without bound as two samples close in, so it is read from the fit, not assumed.
+///
+/// `None` where a sample cannot be evaluated or `M` is singular.
+pub(crate) fn end_angle_conditioning(
+    curve: &BSplineCurve,
+    frame: &Axis2Placement,
+    end_ang_deg: f64,
+) -> Option<f64> {
+    let interval = curve.natural_interval();
+    let (c, x, y) = (frame.origin(), frame.x_axis(), frame.y_axis());
+    let mut alpha = [0.0_f64; 3];
+    for (a, at) in alpha.iter_mut().zip([0.0, 0.45, 0.9]) {
+        let d = curve.evaluate_point(interval.evaluate(at)).ok()? - c;
+        *a = det::atan2(y.dot(d), x.dot(d));
+    }
+    let [a1, a2, a3] = alpha;
+    let end = end_ang_deg.to_radians();
+    // M⁻¹ by its cofactors: M = [[cos a_i, sin a_i, 1]] (rows i)
+    let rows = [
+        [det::cos(a1), det::sin(a1), 1.0],
+        [det::cos(a2), det::sin(a2), 1.0],
+        [det::cos(a3), det::sin(a3), 1.0],
+    ];
+    let [[m00, m01, m02], [m10, m11, m12], [m20, m21, m22]] = rows;
+    let det = m00 * (m11 * m22 - m12 * m21) - m01 * (m10 * m22 - m12 * m20)
+        + m02 * (m10 * m21 - m11 * m20);
+    if det.abs().partial_cmp(&0.0) != Some(core::cmp::Ordering::Greater) {
+        return None;
+    }
+    // the first two rows of M⁻¹ (columns i are the samples)
+    let inv0 = [
+        (m11 * m22 - m12 * m21) / det,
+        (m02 * m21 - m01 * m22) / det,
+        (m01 * m12 - m02 * m11) / det,
+    ];
+    let inv1 = [
+        (m12 * m20 - m10 * m22) / det,
+        (m00 * m22 - m02 * m20) / det,
+        (m02 * m10 - m00 * m12) / det,
+    ];
+    // t_1 - t_e, tangents at the first sample and the end
+    let (g0, g1) = (-det::sin(a1) + det::sin(end), det::cos(a1) - det::cos(end));
+    let mut w = [0.0; 3];
+    for ((wi, a), b) in w.iter_mut().zip(inv0).zip(inv1) {
+        *wi = g0 * a + g1 * b;
+    }
+    let [w1, w2, w3] = w;
+    let s = 1.0 + (1.0 + w1 * w1).sqrt() + w2.abs() + w3.abs();
+    s.is_finite().then_some(s)
+}
 
 /// Tests whether the iso curves of `surface` in `surf_param`'s direction are circular
 /// arcs sharing a frame (`sm_TestForIsoCircles`): at every knot and two points in each
@@ -1844,6 +2036,7 @@ pub fn test_for_iso_circles(
         reference_frame: None,
         common_line_point: None,
         common_line_vec: None,
+        end_conditioning: None,
     };
 
     // locals
@@ -1853,6 +2046,7 @@ pub fn test_for_iso_circles(
     let mut z_axis = Vec3::ZERO;
     let mut x_axis = Vec3::ZERO;
     let mut ref_origin = Point3::ZERO;
+    let mut ref_rad = 0.0;
     let mut this_common_line_point = Vec3::UNDEF;
     let mut this_common_line_vec = Vec3::UNDEF;
     let mut start_ang_deg1 = 0.0;
@@ -1894,6 +2088,8 @@ pub fn test_for_iso_circles(
         }
 
         // when isoParameterCurve is not a circular Arc
+        // (not upstream: the first curve's end angle's conditioning is read off it, #15039)
+        let samples = first_curve.then(|| iso.clone());
         let Some((this_ref_frame, rad, start_ang_deg, end_ang_deg)) =
             Curve::from(iso).is_arc(k, 5, tol_3d)?
         else {
@@ -1903,6 +2099,8 @@ pub fn test_for_iso_circles(
 
         // The first time through get output reference frame, radius and angle extent
         if first_curve {
+            out.end_conditioning =
+                samples.and_then(|c| end_angle_conditioning(&c, &this_ref_frame, end_ang_deg));
             first_curve = false;
             second = true;
             out.radius = Some(rad);
@@ -1911,6 +2109,7 @@ pub fn test_for_iso_circles(
             z_axis = this_ref_frame.z_axis();
             x_axis = this_ref_frame.x_axis();
             ref_origin = this_ref_frame.origin();
+            ref_rad = rad;
             start_ang_deg1 = start_ang_deg;
             end_ang_deg1 = end_ang_deg;
             continue;
@@ -1967,19 +2166,43 @@ pub fn test_for_iso_circles(
 
         // find line of intersection between two isoCurve planes
         if out.common_axis {
-            let (success, coincident) = match intersect_two_planes(
-                ref_origin,
-                z_axis,
-                this_ref_frame.origin(),
-                this_ref_frame.z_axis(),
-            ) {
+            // not upstream (WR-743): planes whose normals are within the angle tolerance are
+            // parallel, so the line upstream gets from them (off the axis by rounding / angle) is
+            // rounding. Within tol_3d of each other over both whole circles (see `circles_in_one_plane`) they are one plane, beyond it two,
+            // whatever `intersect_two_planes` judges on its own coordinate-scaled tolerance; a
+            // line it still finds is kept. Other planes are intersected as usual.
+            let tilt = z_axis.cross(this_ref_frame.z_axis()).length();
+            let near_parallel = tilt < ang_tol_rad;
+            let planes = if near_parallel
+                && circles_in_one_plane(
+                    (ref_origin, z_axis, ref_rad),
+                    (this_ref_frame.origin(), this_ref_frame.z_axis(), rad),
+                    tilt,
+                    tol_3d,
+                ) {
+                Ok(PlanesIntersection::Parallel { coincident: true })
+            } else {
+                intersect_two_planes(
+                    ref_origin,
+                    z_axis,
+                    this_ref_frame.origin(),
+                    this_ref_frame.z_axis(),
+                )
+                .map(|p| match p {
+                    PlanesIntersection::Parallel { .. } if near_parallel => {
+                        PlanesIntersection::Parallel { coincident: false }
+                    }
+                    p => p,
+                })
+            };
+            let (success, coincident) = match planes {
                 Ok(PlanesIntersection::Line { point, direction }) => {
                     this_common_line_point = point;
                     this_common_line_vec = direction;
                     (true, false)
                 }
                 Ok(PlanesIntersection::Parallel { coincident }) => (false, coincident),
-                Err(e) if e.is_unported() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() => return Err(e),
                 Err(_) => (false, false),
             };
 
@@ -1995,6 +2218,12 @@ pub fn test_for_iso_circles(
                     out.common_axis = false;
                 }
             } else {
+                // not upstream (WR-743): a plane with no line (parallel, not coincident) has no common
+                // line with the others; `this_common_line_*` are then the last `Line` answer's, stale
+                if !success && !coincident {
+                    out.common_axis = false;
+                    continue;
+                }
                 // compare subsequent common lines against 1st common line
                 let line_point = out.common_line_point.unwrap_or(Vec3::UNDEF);
                 let line_vec = out.common_line_vec.unwrap_or(Vec3::UNDEF);
@@ -2010,19 +2239,50 @@ pub fn test_for_iso_circles(
 
     // all done
     if n_degen == test_vals.len() {
-        return Err(SolidError::Upstream {
-            operation: OP_ISO_CIRCLES,
-            code: SM_ERR,
-            entity: None,
-        });
+        return Err(SolidError::surface(
+            OP_ISO_CIRCLES,
+            SurfaceFailure::NurbNotAnalytic {
+                check: AnalyticCheck::IsoCurvesDegenerate,
+            },
+        ));
     }
     Ok(out)
+}
+
+/// Not upstream: the content digest ([`crate::geom::content`]). The generator and polar
+/// curves are written through their own digests, so a surface of revolution about a curve
+/// with none has none.
+impl crate::geom::content::Content for SurfOfRevolution {
+    fn content(&self, d: &mut crate::geom::content::Digest) -> Option<()> {
+        let Self {
+            base,
+            gen_curve,
+            make_nurb_gen_curve,
+            planar_generator,
+            position,
+            anal_uv_domain,
+            swap_uv,
+            polar,
+            polar_curve,
+        } = self;
+        d.tag(0x5E7);
+        base.content(d)?;
+        gen_curve.content(d)?;
+        d.bool(*make_nurb_gen_curve);
+        d.bool(*planar_generator);
+        position.content(d)?;
+        anal_uv_domain.content(d)?;
+        d.bool(*swap_uv);
+        polar.content(d)?;
+        polar_curve.content(d)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::curve::line::Line;
+    use crate::curve::line::{BoundedLineOptions, Line};
+    use crate::math::INFINITE_PARAMETER;
     use crate::nurbs::crv_basic::Curve as NurbCurve;
     use crate::nurbs::math::{CPoint, NOW};
 
@@ -2133,14 +2393,21 @@ mod tests {
         // Du at u = 0 on radius 2: 2 * PI / 180 along Y
         let du = d.get(2).copied().unwrap();
         assert!((du - Vec3::new(0.0, 2.0 * PI / 180.0, 0.0)).length() < 1e-12);
-        assert!(s.evaluate_step(&k(), Point2::new(0.0, 0.0), 4, 4).is_err());
+        let e = s
+            .evaluate_step(&k(), Point2::new(0.0, 0.0), 4, 4)
+            .unwrap_err();
+        assert_eq!(
+            e.surface_failure(),
+            Some(&SurfaceFailure::DerivativeOrderTooHigh { max: 3 })
+        );
+        assert_eq!(e.sm_status(), Some(crate::error::SM_ERR));
         // Boundary iso curves request pure U derivatives, despite C++'s
         // debug-only equal-order assertion. These are all defined in release.
         let sweep = s.evaluate_step(&k(), Point2::new(0.0, 0.0), 3, 0).unwrap();
         assert_eq!(sweep.len(), 4);
         assert_eq!(sweep[1], du);
-        assert!((sweep[2] - Vec3::new(-2.0 * (PI / 180.0).powi(2), 0.0, 0.0)).length() < 1e-12);
-        assert!((sweep[3] - Vec3::new(0.0, -2.0 * (PI / 180.0).powi(3), 0.0)).length() < 1e-12);
+        assert!((sweep[2] - Vec3::new(-2.0 * det::powi(PI / 180.0, 2), 0.0, 0.0)).length() < 1e-12);
+        assert!((sweep[3] - Vec3::new(0.0, -2.0 * det::powi(PI / 180.0, 3), 0.0)).length() < 1e-12);
     }
 
     #[test]
@@ -2157,7 +2424,14 @@ mod tests {
         let d = s.create_directrix_at_generator_param(&k(), 0.5).unwrap();
         assert!((d.radius - 1.5).abs() < 1e-12);
         assert!((d.axis_point - Vec3::new(0.0, 0.0, 1.5)).length() < 1e-12);
-        assert!(s.create_directrix_at_generator_param(&k(), 1.5).is_err());
+        let e = s
+            .create_directrix_at_generator_param(&k(), 1.5)
+            .unwrap_err();
+        assert_eq!(
+            e.surface_failure(),
+            Some(&SurfaceFailure::ParameterOutsideGenerator)
+        );
+        assert_eq!(e.sm_status(), Some(crate::error::SM_ERR));
         // the generator direction is a B-spline
         let gen = s
             .create_iso_parametric_curve(&k(), SurfParamType::U, 0.5, None)
@@ -2212,13 +2486,215 @@ mod tests {
         assert!(r.is_ok_and(|(_, x)| x.curves_3d.len() == x.curve_types.len()));
     }
 
+    /// A lazy line generator (`Line::from_points`, no NURB yet, as upstream's two-point
+    /// `SmLine`) reaches `new`'s on-plane test, where upstream's virtual `MakeNurb` makes
+    /// its NURB. The profile `(1, 0, 0)`–`(2, 0, 1)` about Z is `S(u, v) = Rz(u) λ(v)`
+    /// (`u` in degrees, `v` the line's parameter on `[0, 1]`): `λ(1) = (2, 0, 1)` turned by
+    /// 90° is `(0, 2, 1)`, and the profile lies on the X/Z plane.
+    #[test]
+    fn a_lazy_line_generator_revolves_through_its_on_plane_test() {
+        for fixes in [
+            crate::kernel::UpstreamFixes::default(),
+            crate::kernel::UpstreamFixes::all(),
+        ] {
+            let k = Kernel {
+                fixes,
+                ..Kernel::default()
+            };
+            let line = Line::from_points(Vec3::new(1.0, 0.0, 0.0), Vec3::new(2.0, 0.0, 1.0), 3);
+            assert!(line.base().gw_nurb().is_none());
+            let s = SurfOfRevolution::create_canonical(
+                &k,
+                Curve::from(line),
+                Vec3::ZERO,
+                Vec3::Z,
+                false,
+            )
+            .unwrap();
+            assert!(s.planar_generator);
+            let p = s.evaluate_step_point(&k, Point2::new(90.0, 1.0)).unwrap();
+            assert!((p - Vec3::new(0.0, 2.0, 1.0)).length() <= 1e-12, "{p:?}");
+        }
+    }
+
     #[test]
     fn line_on_axis_has_no_frame() {
         let mut l = Line::from_points(Vec3::ZERO, Vec3::new(0.0, 0.0, 2.0), 3);
         l.make_nurb().unwrap();
         let r =
             SurfOfRevolution::create_canonical(&k(), Curve::from(l), Vec3::ZERO, Vec3::Z, false);
-        assert!(matches!(r, Err(SolidError::Upstream { code: SM_ERR, .. })));
+        assert!(matches!(&r, Err(e) if e.upstream_status() == Some(crate::error::SM_ERR)));
+    }
+
+    /// The full revolution about Z through the origin of the unbounded line
+    /// `point + s * vector` (`Line::create_canonical`, as the STEP reader builds a
+    /// `LINE` profile).
+    fn unbounded_line_revolution(point: Point3, vector: Vec3) -> (Kernel, SurfOfRevolution) {
+        let k = k();
+        let line = Line::create_canonical(point, vector);
+        let s =
+            SurfOfRevolution::create_canonical(&k, Curve::from(line), Vec3::ZERO, Vec3::Z, false)
+                .unwrap();
+        (k, s)
+    }
+
+    /// Asserts that `point` inverts to the STEP parameters `uv` (exact to rounding),
+    /// both in the surface's domain and without it (the STEP window's
+    /// `step_inversion_unbounded`), and that the surface evaluates there back to
+    /// `point`.
+    fn assert_inverts(k: &Kernel, s: &SurfOfRevolution, point: Point3, uv: Point2) {
+        let bounded = s.step_inversion(k, &s.step_uv_domain(), point, 1e-9, None);
+        let unbounded = s.step_inversion_unbounded(k, point, 1e-9);
+        for (mode, r) in [("bounded", bounded), ("unbounded", unbounded)] {
+            let (got, _) =
+                r.unwrap_or_else(|e| panic!("{point:?} does not invert ({mode}): {e:?}"));
+            assert!(
+                (got.x - uv.x).abs() <= 1e-9 && (got.y - uv.y).abs() <= 1e-9,
+                "{point:?} inverts ({mode}) to {got:?}, expected {uv:?}"
+            );
+        }
+        let back = s.evaluate_step_point(k, uv).unwrap();
+        assert!(
+            (back - point).length() <= 1e-9,
+            "({uv:?}) evaluates to {back:?}"
+        );
+    }
+
+    /// tangency-labs/solidcore#2628 item 4: the profile `(1, 0, 0) + s (1, 0, 1)`
+    /// crosses the axis at `s = -1`. The surface is `S(u, v) = Rz(u) λ(v)` (ISO
+    /// 10303-42 `surface_of_revolution`: `u = 0` is the profile itself), so
+    /// `λ(1) = (2, 0, 1)` is `(u, v) = (0, 1)`; turned by 90° about Z it is
+    /// `(0, 2, 1) = (90, 1)`; `λ(-1/2) = (1/2, 0, -1/2)`, between the crossing and the
+    /// profile's origin, is `(0, -1/2)`. The frame faces the profile's origin,
+    /// X = (1, 0, 0) (WR-738). Upstream's frame faces the line's start at
+    /// `s = -SM_INFINITE_PARAMETER`, past the axis: X = (-1, 0, 0), and its inversion
+    /// refuses these points, on the nappe of the profile's origin (`SM_ERR`).
+    #[test]
+    fn unbounded_line_crossing_the_axis_inverts_on_its_origin_side() {
+        let (point, vector) = (Vec3::new(1.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 1.0));
+        let (k, s) = unbounded_line_revolution(point, vector);
+        assert_eq!(s.position().x_axis(), Vec3::new(1.0, 0.0, 0.0));
+        assert_inverts(&k, &s, Vec3::new(2.0, 0.0, 1.0), Point2::new(0.0, 1.0));
+        assert_inverts(&k, &s, Vec3::new(0.0, 2.0, 1.0), Point2::new(90.0, 1.0));
+        assert_inverts(&k, &s, Vec3::new(0.5, 0.0, -0.5), Point2::new(0.0, -0.5));
+    }
+
+    /// The mirror image: `(-1, 0, 0) + s (-1, 0, 1)` lies on the -X side of the axis
+    /// near its origin, and its start at `s = -SM_INFINITE_PARAMETER` on the +X side.
+    /// The frame faces the origin, X = (-1, 0, 0) and Y = Z x X = (0, -1, 0):
+    /// `λ(1) = (-2, 0, 1)` is `(0, 1)`, and `(0, -2, 1)`, along Y, is `(90, 1)`.
+    #[test]
+    fn unbounded_line_on_the_other_side_inverts() {
+        let (point, vector) = (Vec3::new(-1.0, 0.0, 0.0), Vec3::new(-1.0, 0.0, 1.0));
+        let (k, s) = unbounded_line_revolution(point, vector);
+        assert_eq!(s.position().x_axis(), Vec3::new(-1.0, 0.0, 0.0));
+        assert_inverts(&k, &s, Vec3::new(-2.0, 0.0, 1.0), Point2::new(0.0, 1.0));
+        assert_inverts(&k, &s, Vec3::new(0.0, -2.0, 1.0), Point2::new(90.0, 1.0));
+    }
+
+    /// A line parallel to the axis, `(2, 0, 0) + s (0, 0, 1)` (a cylinder of radius 2),
+    /// never crosses it: the frame from its origin (WR-738) and upstream's (from the
+    /// line's point at 45% of its interval, its start being within 1° of the axis
+    /// direction) agree, X = (1, 0, 0), and `(2, 0, 1)` is `(0, 1)`, `(0, -2, 5)` is
+    /// `(270, 5)`.
+    #[test]
+    fn unbounded_line_parallel_to_the_axis_inverts_either_way() {
+        let (k, s) = unbounded_line_revolution(Vec3::new(2.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0));
+        assert_eq!(s.position().x_axis(), Vec3::new(1.0, 0.0, 0.0));
+        assert_inverts(&k, &s, Vec3::new(2.0, 0.0, 1.0), Point2::new(0.0, 1.0));
+        assert_inverts(&k, &s, Vec3::new(0.0, -2.0, 5.0), Point2::new(270.0, 5.0));
+    }
+
+    /// tangency-labs/solidcore#2628 item 7: a profile that crosses the axis lies on
+    /// both sides of it, so a point's circle about the axis meets the generator's
+    /// plane in two points, one on each half plane, and `STEPInversion` must solve
+    /// both. The profile `λ(s) = (1, 0, 0) + s (1, 0, 1)` crosses at `s = -1`;
+    /// `λ(-3) = (-2, 0, -3)` lies on the profile itself, `(u, v) = (0, -3)` (`u = 0` is
+    /// the profile, ISO 10303-42), turned by 90° about Z it is `(0, -2, -3) = (90, -3)`,
+    /// and `λ(1) = (2, 0, 1) = (0, 1)` lies on the other side of the axis. All of them
+    /// invert (WR-738), whichever way the frame faces: the frame from the profile's
+    /// origin (X = (1, 0, 0)) and upstream's from its start (X = (-1, 0, 0)). Upstream
+    /// turns a point onto its frame's +X half plane only, so its frame inverts the side
+    /// it faces, `(-2, 0, -3)` and `(0, -2, -3)`, and refuses `(2, 0, 1)` (`SM_ERR`).
+    #[test]
+    fn profile_crossing_the_axis_inverts_on_both_sides() {
+        let (point, vector) = (Vec3::new(1.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 1.0));
+        let points = [
+            (Vec3::new(-2.0, 0.0, -3.0), Point2::new(0.0, -3.0)),
+            (Vec3::new(0.0, -2.0, -3.0), Point2::new(90.0, -3.0)),
+            (Vec3::new(2.0, 0.0, 1.0), Point2::new(0.0, 1.0)),
+            (Vec3::new(0.0, 2.0, 1.0), Point2::new(90.0, 1.0)),
+        ];
+
+        let (k, origin_frame) = unbounded_line_revolution(point, vector);
+        assert_eq!(origin_frame.position().x_axis(), Vec3::X);
+        let line = Curve::from(Line::create_canonical(point, vector));
+        let domain = Extent2d::from_bounds(0.0, -INFINITE_PARAMETER, 360.0, INFINITE_PARAMETER);
+        let mut start_frame =
+            SurfOfRevolution::new(&k, line, Vec3::ZERO, -Vec3::X, -Vec3::Y, domain, false).unwrap();
+        start_frame.make_nurb(&k).unwrap();
+        for s in [&origin_frame, &start_frame] {
+            for (p, uv) in points {
+                assert_inverts(&k, s, p, uv);
+            }
+        }
+    }
+
+    /// tangency-labs/solidcore#2628 item 8: the segment `λ(s) = s (1, 0, 1)` on
+    /// `[-9, 11]` has its point at parameter 0 and the one at 45 % of its interval
+    /// (`-9 + 0.45 * 20 = 0`) both at the origin, on the axis. The frame is taken from
+    /// the interval's start before the 45 % point: `λ(-9) = (-9, 0, -9)`,
+    /// X = (-1, 0, 0), as upstream's, and `λ(-5) = (-5, 0, -5)` is `(0, -5)`; with the
+    /// two-sided inversion `λ(5) = (5, 0, 5)`, across the axis, is `(0, 5)`.
+    #[test]
+    fn frame_from_the_interval_start_when_the_origin_is_on_the_axis() {
+        let k = k();
+        let line = Line::bounded(
+            Vec3::ZERO,
+            Vec3::new(1.0, 0.0, 1.0),
+            &Extent1d::from_min_max(-9.0, 11.0),
+            &BoundedLineOptions {
+                scale: 2.0_f64.sqrt(),
+                ..BoundedLineOptions::default()
+            },
+        );
+        let s =
+            SurfOfRevolution::create_canonical(&k, Curve::from(line), Vec3::ZERO, Vec3::Z, false)
+                .unwrap();
+        assert_eq!(s.position().x_axis(), -Vec3::X);
+        assert_inverts(&k, &s, Vec3::new(-5.0, 0.0, -5.0), Point2::new(0.0, -5.0));
+        // the other side of the axis (item 7)
+        assert_inverts(&k, &s, Vec3::new(5.0, 0.0, 5.0), Point2::new(0.0, 5.0));
+    }
+
+    /// tangency-labs/solidcore#2628 item 9: whether the frame's reference point is on
+    /// the axis is decided by its distance from the axis. The profile's origin
+    /// `λ(0) = (1, 0, 1000)` of `(1, 0, 1000) + s (1, 0, 1)` is one unit from the axis,
+    /// but its direction from the axis point is within 1° of the axis (0.057°), the
+    /// test upstream applies. It is not on the axis, and the frame faces it:
+    /// X = (1, 0, 0), and `λ(1) = (2, 0, 1001)` is `(0, 1)`. Upstream's test takes the
+    /// 45 % point instead, past the crossing: X = (-1, 0, 0).
+    #[test]
+    fn frame_point_on_the_axis_by_its_distance() {
+        let (point, vector) = (Vec3::new(1.0, 0.0, 1000.0), Vec3::new(1.0, 0.0, 1.0));
+        let (k, s) = unbounded_line_revolution(point, vector);
+        assert_eq!(s.position().x_axis(), Vec3::X);
+        assert_inverts(&k, &s, Vec3::new(2.0, 0.0, 1001.0), Point2::new(0.0, 1.0));
+    }
+
+    /// A bounded profile whose interval starts at its parameter origin keeps
+    /// upstream's frame, from its start `(2, 0, 0)`: the cubic of `TestSmGeneral.cpp`
+    /// (interval [0, 1]) and the cone's segment.
+    #[test]
+    fn bounded_profile_frame_is_upstreams() {
+        let a =
+            SurfOfRevolution::create_canonical(&k(), bezier(), Vec3::ZERO, Vec3::Z, false).unwrap();
+        for s in [&a, &cone()] {
+            assert_eq!(s.position().origin(), Vec3::ZERO);
+            assert_eq!(s.position().x_axis(), Vec3::X);
+            assert_eq!(s.position().y_axis(), Vec3::Y);
+            assert_eq!(s.position().z_axis(), Vec3::Z);
+        }
     }
 
     #[test]
@@ -2242,5 +2718,126 @@ mod tests {
         // the generator direction is not circular
         let g = test_for_iso_circles(&k, s.base(), SurfParamType::U, 1e-6, 1e-6).unwrap();
         assert!(!g.found_circles);
+    }
+
+    /// WR-743 with a small `tolerance_scale`: a cylinder 2e-12 high at z = 4 has parallel circle planes
+    /// further apart than `tol_3d` (1e-13) but within the coordinate-scaled tolerance
+    /// `intersect_two_planes` judges coincidence by. They are two planes with no common line, so
+    /// there is no common axis (it stayed true, with no line written).
+    #[test]
+    fn near_parallel_planes_beyond_tol_3d_are_not_coincident_by_the_helper_tolerance() {
+        let k = k();
+        let mut l = Line::from_points(
+            Vec3::new(1.0, 0.0, 4.0),
+            Vec3::new(1.0, 0.0, 4.0 + 2e-12),
+            3,
+        );
+        l.make_nurb().unwrap();
+        let s = SurfOfRevolution::create_canonical(&k, Curve::from(l), Vec3::ZERO, Vec3::Z, false)
+            .unwrap();
+        let r = test_for_iso_circles(&k, s.base(), SurfParamType::V, 1e-13, 1e-9).unwrap();
+        assert!(r.found_circles && r.parallel_planes);
+        assert!(!r.common_axis);
+        assert!(r.common_line_point.is_none());
+    }
+
+    /// WR-743: iso circles in `z = 0` (first), in `y = 0` (its plane meets the first
+    /// along the X axis, which is saved as the common line), and then, last, in `z = 5`,
+    /// parallel to the first plane and not coincident with it. That plane has no common
+    /// line with the others, so there is no common axis (it stayed true: the comparison
+    /// used the stale line of the last `Line` answer, the saved one). The surface is
+    /// degree 1 in `v` with doubled interior knots, three constant pieces.
+    #[test]
+    fn a_later_parallel_non_coincident_plane_has_no_common_axis() {
+        use crate::nurbs::srf_basic::Surface as NurbSurface;
+        let k = k();
+        let w = std::f64::consts::FRAC_1_SQRT_2;
+        // quarter circle of radius 1 about (0, 0, z) in the plane `z = z0`, or in `y = 0`
+        let arc = |plane_y0: bool, z0: f64| {
+            let q = |x: f64, y: f64| {
+                let (y, z) = if plane_y0 { (0.0, y) } else { (y, z0) };
+                CPoint::new(x, y, z, 1.0)
+            };
+            [
+                q(1.0, 0.0),
+                CPoint::new(
+                    w,
+                    if plane_y0 { 0.0 } else { w },
+                    if plane_y0 { w } else { z0 * w },
+                    w,
+                ),
+                q(0.0, 1.0),
+            ]
+        };
+        let pieces = [arc(false, 0.0), arc(true, 0.0), arc(false, 5.0)];
+        let net: Vec<Vec<CPoint>> = (0..3)
+            .map(|i| pieces.iter().flat_map(|a| [a[i], a[i]]).collect())
+            .collect();
+        let nurb = NurbSurface::new(
+            net,
+            2,
+            1,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0],
+        )
+        .unwrap();
+        let s = BSplineSurface::from_nurb(nurb, false);
+        let r = test_for_iso_circles(&k, &s, SurfParamType::V, 1e-9, 1e-9).unwrap();
+        assert!(r.found_circles);
+        assert!(!r.common_axis);
+    }
+}
+
+/// WR-743: nearly parallel iso-circle planes (`tilt` = |n1 x n2|) are one plane when every point of
+/// each circle is within `tol_3d` of the other circle's plane: that circle's centre offset from the
+/// other plane plus its own radius * tilt. Each circle is bounded by its own radius.
+fn circles_in_one_plane(
+    (o1, n1, r1): (Point3, Vec3, f64),
+    (o2, n2, r2): (Point3, Vec3, f64),
+    tilt: f64,
+    tol_3d: f64,
+) -> bool {
+    let d = o2 - o1;
+    d.dot(n1).abs() + r2 * tilt <= tol_3d && d.dot(n2).abs() + r1 * tilt <= tol_3d
+}
+
+#[cfg(test)]
+mod circles_in_one_plane_tests {
+    use super::*;
+
+    /// Coincident centres, radii 100 and 1, tilt 1e-7, tol 1e-6: the small circle stays within
+    /// tol (1e-7) of the large one's plane, the large one reaches 1e-5 from the small one's.
+    #[test]
+    fn the_larger_circles_extent_also_counts() {
+        let o = Point3::ZERO;
+        assert!(!circles_in_one_plane(
+            (o, Vec3::Z, 100.0),
+            (o, Vec3::Z, 1.0),
+            1e-7,
+            1e-6
+        ));
+        assert!(circles_in_one_plane(
+            (o, Vec3::Z, 1.0),
+            (o, Vec3::Z, 1.0),
+            1e-7,
+            1e-6
+        ));
+    }
+}
+
+/// The rotation a sweep window of `span_deg` degrees makes (#2928): a revolution turns
+/// at most once, so a window past a whole turn by no more than the rounding of its
+/// ends' angles (`SM_EFF_ZERO` relative to the turn, the scale of its ends, which lie
+/// within [-360, 360]) is that whole turn. A STEP window of a whole turn whose ends sit
+/// a rounding error either side of ±180° (u -180.0000000000005 to 179.99999999999955)
+/// spans 360.00000000000006: built as is, its sweep circle is refused past 360.
+/// Any other span is kept, so a window more than a rounding error past a turn is
+/// still refused by the circle.
+fn sweep_span_deg(span_deg: f64) -> f64 {
+    const TURN: f64 = 360.0;
+    if span_deg > TURN && span_deg - TURN <= EFF_ZERO * TURN {
+        TURN
+    } else {
+        span_deg
     }
 }

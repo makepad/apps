@@ -38,9 +38,11 @@
 //! | [`Plane::is_kind_of`], [`Plane::TYPE`], [`Plane::type_string`], [`Plane::class_string`] | `IsKindOf`, `GetType`, `GetTypeString`, `GetClassString` (`SM_COMMON`) |
 //! | [`Plane::base`], [`Plane::base_with_nurb`], [`Plane::natural_uv_domain`] | the `SmBSplineSurface` part, `GetOrCreateGwNurbPointer`, `GetNaturalUVDomain` (inherited) |
 //! | [`Plane::max_analytic_domain`], [`Plane::is_parallel_to_vector`], [`Plane::reverse`], [`Plane::swap_uv`] | `SmBSplineSurface::GetMaxAnalyticDomain`, `IsParallelToVector`, `Reverse`, `SwapUV` (inherited, re-dispatched) |
-//! | [`Plane::create_extended_surface`], [`Plane::create_extended_surface_dir`] | `SmBSplineSurface::CreateExtendedSurface` (both overloads; inherited, re-dispatched to the `IsSingularity` / `IsClosed` overrides) |
 //!
 //! Deviations:
+//! - **`SwapUV` keeps the plane's definition (WR-701).** The swap keeps the axes, domain
+//!   and scales [`Plane::toggle_swap_uv_bit`] swapped (`SmPlane::SwapUVDefinition`, the
+//!   fork's tangency-labs/smlib@0c00de7); upstream rebuilds them from the net.
 //! - **Derived class.** `SmPlane` derives from `SmBSplineSurface`; a [`Plane`] holds
 //!   its B-spline part ([`Plane::base`]) next to the analytic data, and is the
 //!   [`SurfaceKind::Plane`] kind of [`Surface`]. Inherited methods whose upstream
@@ -74,9 +76,16 @@
 //!   caller reads it).
 //! - **`Reparameterize`** computes a new origin only in debug code: the release
 //!   build keeps the old origin while changing the scales and the domain, so the
-//!   analytic plane moves unless the new domain starts where the old one did. The
-//!   port keeps that (`plan/findings.md`). Its `Notify` calls only drop caches and
+//!   analytic plane slides away from its NURB (WR-41). The port sets the origin to
+//!   upstream's `sOriginMax`, the point that keeps the domain's upper corner where it
+//!   was, so the analytic plane and its NURB stay the same surface. An identity
+//!   reparameterisation (the new domain equal to the old) keeps the origin as it is
+//!   rather than recomputing it with rounding. Its `Notify` calls only drop caches and
 //!   inform owners and are omitted, as for B-splines.
+//! - **`IsParallelToVector`** (inherited from `SmBSplineSurface`) returns the failed
+//!   `Unitize` status (`SM_ERR_INVALID_INPUT`, nonzero) as `SmBoolean` for a zero
+//!   vector, so upstream callers see `TRUE`; [`Plane::is_parallel_to_vector`] returns
+//!   `false`: no plane is parallel to a vector with no direction (WR-39, #2145).
 //! - **Co-ported callees.** `SmTol::MapTo2d(SmTol3d, SmVector2d, SmSurface)` (unit
 //!   `geom.tol`, waiting on `SmSurface::Evaluate1stDerivatives`) is ported here for a
 //!   plane (the only surface it is called with). `Evaluate1stDerivatives` /
@@ -92,10 +101,13 @@
 
 use std::borrow::Cow;
 
+use crate::blend::fillet_section::interval::Ivl;
+use crate::curve::contact::NativeSupport;
 use crate::curve::curve::p8::CurveIntersectOptions;
 use crate::curve::curve::{Curve, CurveKind};
 use crate::curve::iso_curve::IsoCurve;
 use crate::curve::line::{BoundedLineOptions, Line};
+use crate::error::surface::SurfaceFailure;
 use crate::error::{ignore_status, Result, SolidError};
 use crate::geom::axis2_placement::Axis2Placement;
 use crate::geom::extent1d::Extent1d;
@@ -218,6 +230,24 @@ impl Plane {
         }
     }
 
+    /// The plane of a placement, scales and domain as stored, on the NURB `form` (not
+    /// made from them): a plane read back from data it was written to, its form checked
+    /// against it by the caller ([`crate::surface::implicit::AnalyticSupport::build`]).
+    #[must_use]
+    pub(crate) fn from_stored(
+        position: Axis2Placement,
+        uv_scale: Vec2,
+        uv_domain: Extent2d,
+        form: BSplineSurface,
+    ) -> Self {
+        Self {
+            base: form,
+            position,
+            anal_uv_domain: uv_domain,
+            uv_scale,
+        }
+    }
+
     /// The infinite plane through `origin` with normal `normal` (`SmPlane(Origin,
     /// PlaneNormal, cpContext)`): unit scales, the domain
     /// `[-SM_INFINITE_PARAMETER, SM_INFINITE_PARAMETER]^2` and the axes of
@@ -299,6 +329,21 @@ impl Plane {
     /// Detaches a NURB cell shared with evaluation copies ([`Plane::clone_shared`]).
     pub(crate) fn detach_nurb(&mut self) {
         self.base.detach_nurb();
+    }
+
+    /// The `SmBSplineSurface` part, mutable (CO-PORTED by unit `blend.fillet_removal`,
+    /// whose `ExpandBoundarySpan` edits the plane's NURB).
+    pub(crate) fn base_mut(&mut self) -> &mut BSplineSurface {
+        &mut self.base
+    }
+
+    /// `UpdateAnalyticalDomain(crNewNurbsDomain)` (`SmPlane.h`, CO-PORTED by unit
+    /// `blend.fillet_removal`): the analytic domain becomes `new_nurbs_domain` and the
+    /// NURB is dropped (made again from the analytic data when next needed).
+    pub(crate) fn update_analytical_domain(&mut self, new_nurbs_domain: &Extent2d) {
+        self.anal_uv_domain = *new_nurbs_domain;
+        self.base.nurb = crate::nurbs::b_spline_surface::p1::NurbSlot::none();
+        self.base.nurb_is_borrowed = false;
     }
 
     /// A copy of every member as is (no NURB is made).
@@ -502,46 +547,6 @@ impl Plane {
         (false, SurfParamType::Neither)
     }
 
-    /// `SmBSplineSurface::CreateExtendedSurface(dDist, ..)` (inherited): the plane's
-    /// NURB extended by `dist` across each side, through the `SmPlane` overrides of
-    /// `IsSingularity` and `IsClosed` (none, never closed).
-    ///
-    /// # Errors
-    ///
-    /// Those of [`Plane::create_extended_surface_dir`].
-    pub fn create_extended_surface(
-        &self,
-        dist: f64,
-        extension_continuity: ContinuityType,
-    ) -> Result<BSplineSurface> {
-        // pass the call along
-        self.create_extended_surface_dir(SurfParamType::Both, dist, extension_continuity)
-    }
-
-    /// `SmBSplineSurface::CreateExtendedSurface(eExtDirection, dDist, ..)` (inherited):
-    /// [`BSplineSurface::create_extended_surface_dir`] of the plane's NURB, with the
-    /// virtual `IsSingularity` and `IsClosed` dispatched to the `SmPlane` overrides
-    /// ([`Plane::is_singularity`], [`Plane::is_closed`]) as upstream.
-    ///
-    /// # Errors
-    ///
-    /// `SM_ERR` when no NURB can be made (upstream copies a `NULL` NURB) and the
-    /// errors of the extension.
-    pub fn create_extended_surface_dir(
-        &self,
-        ext_direction: SurfParamType,
-        dist: f64,
-        extension_continuity: ContinuityType,
-    ) -> Result<BSplineSurface> {
-        self.base_for_query().create_extended_surface_dispatched(
-            ext_direction,
-            dist,
-            extension_continuity,
-            &|_| Ok(self.is_singularity()),
-            &|_, _| Ok(self.is_closed().0),
-        )
-    }
-
     /// `SmBSplineSurface::GetMaxAnalyticDomain` (inherited): planar, so the natural
     /// domain expanded relatively by 100.
     #[must_use]
@@ -553,11 +558,12 @@ impl Plane {
 
     /// `SmBSplineSurface::IsParallelToVector` (inherited), its `SmPlane` branch: the
     /// normal is perpendicular to `vector` within `SM_EFF_ZERO * (1 + |O|max)`;
-    /// `true` for a zero vector (upstream returns the failed `Unitize` status).
+    /// `false` for a vector that cannot be unitised (upstream returns the failed
+    /// `Unitize` status, read as `TRUE`; WR-39).
     #[must_use]
     pub fn is_parallel_to_vector(&self, vector: Vec3) -> bool {
         let Ok(test_vec) = vector.unitize() else {
-            return true;
+            return false;
         };
         let z_axis = self.position.z_axis();
         let tol1 = EFF_ZERO * (1.0 + self.position.origin().max_dimension());
@@ -814,10 +820,11 @@ impl Plane {
         self.make_nurb()
     }
 
-    /// Maps the domain onto `trim_domain` (`Reparameterize`): the NURB is
-    /// re-parameterised without changing its shape; the analytic domain becomes
-    /// `trim_domain` and the scales `su * |old u| / |new u|`, `sv * |old v| / |new
-    /// v|`; the origin is kept (see the module docs).
+    /// Maps the domain onto `trim_domain` (`Reparameterize`) without changing the
+    /// plane's shape: the NURB is re-parameterised, the analytic domain becomes
+    /// `trim_domain`, the scales `su * |old u| / |new u|`, `sv * |old v| / |new v|`,
+    /// and the origin moves so that the old domain's upper corner is the new one's
+    /// (upstream's `sOriginMax`, WR-41). An identity reparameterisation keeps the origin.
     ///
     /// # Errors
     ///
@@ -827,11 +834,30 @@ impl Plane {
         // Get new Analytic parameters
         let scale_x = (self.uv_scale.x * self.anal_uv_domain.x_length()) / trim_domain.x_length();
         let scale_y = (self.uv_scale.y * self.anal_uv_domain.y_length()) / trim_domain.y_length();
-        // (sPointMax, sPointMin and sOriginMax are only used by debug code)
+
+        // The origin that keeps the upper domain corner in place (upstream computes it
+        // but sets it only in debug builds, WR-41). The same domain keeps the origin
+        // exactly instead of recomputing it with rounding.
+        let origin_max = if *trim_domain == self.anal_uv_domain {
+            None
+        } else {
+            let point_max = self.position.origin()
+                + self.position.x_axis() * (self.uv_scale.x * self.anal_uv_domain.u_max())
+                + self.position.y_axis() * (self.uv_scale.y * self.anal_uv_domain.v_max());
+            Some(
+                point_max
+                    - self.position.x_axis() * (scale_x * trim_domain.u_max())
+                    - self.position.y_axis() * (scale_y * trim_domain.v_max()),
+            )
+        };
 
         // set NURB domain parameterization - no change in shape
         self.ensure_nurb();
         self.base.reparameterize(trim_domain)?;
+
+        if let Some(origin) = origin_max {
+            self.position.set_origin(origin);
+        }
 
         // Set Analytic domain parameterization - no change in shape
         self.anal_uv_domain = *trim_domain;
@@ -859,7 +885,8 @@ impl Plane {
     /// Rebuilds the analytic data from the NURB (`RebuildSTEPFromNURBParameters`): the
     /// domain becomes the natural domain, the scales and axes come from three
     /// corners of the NURB, and the origin is moved so that the domain minimum
-    /// evaluates to the first corner (using the old axes).
+    /// evaluates to the first corner, along the old axes (a rebuild that turns no axis
+    /// keeps them; see [`Plane::reverse`] for one that does).
     ///
     /// # Errors
     ///
@@ -886,12 +913,17 @@ impl Plane {
         self.uv_scale.y = len_3d / nurb_domain.y_length();
         v_vec /= len_3d; // Unitize, for later.
 
-        // The origin is where (0,0) would evaluate to.
+        // The origin is where (0,0) would evaluate to, along the axes the plane is rebuilt
+        // on (the NURB's own, made canonical). Not upstream, which places it along the old
+        // axes, so a plane whose NURB was reversed or turned no longer evaluated as it: its
+        // origin moved by `(lo + hi) * scale` along a reversed axis.
+        self.position.set_canonical(pt00, u_vec, v_vec)?;
         let start_vec = nurb_domain.min().x * self.uv_scale.x * self.position.x_axis()
             + nurb_domain.min().y * self.uv_scale.y * self.position.y_axis();
 
-        // The new origin would be the start point minus that vector.
-        let _ = self.position.set_canonical(pt00 - start_vec, u_vec, v_vec);
+        // The new origin is the start point minus that vector.
+        self.position
+            .set_canonical(pt00 - start_vec, u_vec, v_vec)?;
 
         // Finally update the domain.
         self.anal_uv_domain = nurb_domain;
@@ -909,18 +941,19 @@ impl Plane {
         self.ensure_nurb();
         self.base.reverse(param)?;
 
-        // give analytics a chance to update their nested STEP data
+        // give analytics a chance to update their nested STEP data, the reversed axis
+        // turned about
         self.rebuild_step_from_nurb_parameters()
     }
 
     /// `SmBSplineSurface::SwapUV` (inherited): records the swap
-    /// ([`Plane::toggle_swap_uv_bit`]), transposes the NURB, then rebuilds the
-    /// analytic data from it.
+    /// ([`Plane::toggle_swap_uv_bit`], which swaps the analytic data), then transposes
+    /// the NURB; the swapped analytic data is kept (WR-701), not rebuilt from it.
     ///
     /// # Errors
     ///
-    /// Those of [`BSplineSurface::canonical`], [`BSplineSurface::set_canonical`] (the
-    /// swap bit is then restored) and [`Plane::rebuild_step_from_nurb_parameters`].
+    /// Those of [`BSplineSurface::canonical`] and [`BSplineSurface::set_canonical`] (the
+    /// swap bit is then restored).
     pub fn swap_uv(&mut self) -> Result<()> {
         self.swap_uv_notifying(&mut |_| Ok(()))
     }
@@ -970,7 +1003,10 @@ impl Plane {
             self.toggle_swap_uv_bit();
             return Err(e);
         }
-        self.rebuild_step_from_nurb_parameters()
+        // not upstream (WR-701, the fork's tangency-labs/smlib@0c00de7,
+        // `SmPlane::SwapUVDefinition`): the definition the bit has swapped (axes, domain,
+        // scales) is kept, not rebuilt from the transposed net
+        Ok(())
     }
 
     // ---- solvers ----------------------------------------------------------------------
@@ -1000,7 +1036,10 @@ impl Plane {
             && operation != SolverOperation::Normalize
             && operation != SolverOperation::Intersect
         {
-            return Err(SolidError::sm_err(OP_DROP));
+            return Err(SolidError::surface(
+                OP_DROP,
+                SurfaceFailure::OperationNotTaken,
+            ));
         }
 
         // init output
@@ -1062,7 +1101,7 @@ impl Plane {
     ///
     /// # Errors
     ///
-    /// `InvalidInput` for a zero line vector; `SM_ERR` for a vanishing determinant;
+    /// `SM_ERR_INVALID_INPUT` for a zero line vector; `SM_ERR` for a vanishing determinant;
     /// [`SolidError::Unported`] from the unported callees of the general
     /// `SmSurface::GlobalLineIntersect` (a line in the plane meeting the domain in a
     /// single line parameter).
@@ -1152,8 +1191,12 @@ impl Plane {
         distance_tolerance: f64,
         base: impl FnOnce(&Extent1d) -> Result<SolutionArray<O>>,
     ) -> Result<SolutionArray<O>> {
+        // `SER(SM_ERR_INVALID_INPUT)`: the exact status, which callers may ignore
         if line_vector.length_squared() < EFF_ZERO_SQ {
-            return Err(SolidError::invalid_input(OP_LINE, "zero line vector"));
+            return Err(SolidError::surface(
+                OP_LINE,
+                SurfaceFailure::LineDirectionZero,
+            ));
         }
 
         // init output
@@ -1250,7 +1293,7 @@ impl Plane {
                 // the interval is [tStart - 1, tEnd + 1], or the caller's interval
                 let sub_interval = line_interval
                     .copied()
-                    .unwrap_or(Extent1d::from_min_max(t_start - 1.0, t_end + 1.0));
+                    .unwrap_or_else(|| Extent1d::from_min_max(t_start - 1.0, t_end + 1.0));
                 // try global surface/curve solver (SmSurface::GlobalLineIntersect: the
                 // solutions name `surface`)
                 return base(&sub_interval);
@@ -1296,8 +1339,12 @@ impl Plane {
 
             let det = pu.cross(pv).dot(lt);
             if det.abs() < EFF_ZERO {
-                // should never happen, we're in the non-parallel case here.
-                return Err(SolidError::sm_err(OP_LINE));
+                // the angle test above passed, so a direction or a scale too small to solve
+                // with makes the determinant this small
+                return Err(SolidError::surface(
+                    OP_LINE,
+                    SurfaceFailure::LineCrossingSingular,
+                ));
             }
 
             // Cramer's rule:
@@ -1456,7 +1503,9 @@ impl Plane {
     /// control points are projected and clamped to the domain: the UV B-spline of
     /// those points is exact when no clamp moves a point off its normal line by more
     /// than `approx_tol`, and is kept when `keep_all` or every control point drops
-    /// within `approx_tol`. Everything else is the general `SmSurface::DropCurve`, run
+    /// within `approx_tol`. An analytic ellipse proved strictly inside the UV rectangle
+    /// keeps its unclamped affine projection even when its control hull extends outside.
+    /// Everything else is the general `SmSurface::DropCurve`, run
     /// on the plane with its `owner` (the plane's `m_pOwner`, which a bare [`Plane`]
     /// does not carry: pass the owning [`Surface`]'s [`Surface::owner`]; without the
     /// face tolerance its B-rep records on that surface, which the crate's
@@ -1740,16 +1789,31 @@ impl Plane {
 
             // loop locals
             let mut max_drop_sq = 0.0;
+            let mut ellipse_inside = None;
 
             // for every control point
             for cp in &mut ctrl_pts {
                 let p_3d = *cp;
 
                 // project to infinite plane
-                let mut uv_pnt = self.project_point_to_uv_domain(p_3d);
+                let projected = self.project_point_to_uv_domain(p_3d);
 
-                // clamp control points
-                uv_pnt = uv_domain.clamp_point(uv_pnt);
+                // A tangent-hull control can lie outside a rectangle containing the
+                // complete ellipse. Certify containment only when a clamp would move it.
+                let uv_pnt = if ellipse_inside == Some(true) {
+                    projected
+                } else {
+                    let clamped = uv_domain.clamp_point(projected);
+                    if clamped != projected
+                        && *ellipse_inside.get_or_insert_with(|| {
+                            self.ellipse_projection_inside(curve, interval, uv_domain)
+                        })
+                    {
+                        projected
+                    } else {
+                        clamped
+                    }
+                };
 
                 // save largest control point drop
                 let on_srf_3d = self.evaluate_point_fast(uv_pnt);
@@ -1823,6 +1887,53 @@ impl Plane {
             context,
             face_test,
         )
+    }
+
+    /// The full analytic ellipse's affine UV image lies strictly in the supplied domain.
+    fn ellipse_projection_inside(
+        &self,
+        curve: &Curve,
+        interval: &Extent1d,
+        domain: &Extent2d,
+    ) -> bool {
+        if !matches!(curve.kind(), CurveKind::Ellipse(_))
+            || !interval.is_bounded()
+            || ![interval.min(), interval.max()]
+                .iter()
+                .all(|v| v.is_finite())
+            || interval.min() > interval.max()
+            || !interval.is_contained_by(&curve.natural_interval(), 0.0)
+        {
+            return false;
+        }
+        let Some(support) = NativeSupport::curve(curve, interval) else {
+            return false;
+        };
+        [
+            (
+                self.position.x_axis(),
+                self.uv_scale.x,
+                domain.u_min(),
+                domain.u_max(),
+            ),
+            (
+                self.position.y_axis(),
+                self.uv_scale.y,
+                domain.v_min(),
+                domain.v_max(),
+            ),
+        ]
+        .into_iter()
+        .all(|(axis, scale, lo, hi)| {
+            if ![scale, lo, hi].iter().all(|v| v.is_finite()) || scale == 0.0 {
+                return false;
+            }
+            let direction = [Ivl::from(axis.x), Ivl::from(axis.y), Ivl::from(axis.z)];
+            support
+                .project(self.position.origin(), direction)
+                .map(|projection| projection / Ivl::from(scale))
+                .is_some_and(|uv| uv.is_finite() && lo < uv.lo && uv.hi < hi)
+        })
     }
 
     // ---- coincidence ------------------------------------------------------------------
@@ -2171,7 +2282,7 @@ impl Plane {
                     &CurveIntersectOptions::<NoObject>::default(),
                 ) {
                     Ok(s) => s,
-                    Err(e) if e.is_unported() => return Err(e),
+                    Err(e) if e.is_unported_or_cancelled() => return Err(e),
                     Err(_) => continue,
                 };
                 if sols.is_empty() {
@@ -2459,9 +2570,27 @@ fn surface_drop_curve<O: SolutionObject>(
     })
 }
 
+/// Not upstream: the content digest ([`crate::geom::content`]).
+impl crate::geom::content::Content for Plane {
+    fn content(&self, d: &mut crate::geom::content::Digest) -> Option<()> {
+        let Self {
+            base,
+            position,
+            anal_uv_domain,
+            uv_scale,
+        } = self;
+        d.tag(0x91A);
+        base.content(d)?;
+        position.content(d)?;
+        anal_uv_domain.content(d)?;
+        uv_scale.content(d)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::SM_ERR_INVALID_INPUT;
 
     fn unit_plane() -> Plane {
         Plane::new(
@@ -2471,6 +2600,177 @@ mod tests {
             Vec2::new(2.0, 3.0),
             &Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0),
         )
+    }
+
+    /// A plane reversed in either direction evaluates as its own NURB, the point at
+    /// (u, v) the one the plane had at (lo + hi - u, v) (or in v): its origin is placed
+    /// along the reversed axis (upstream's old axis moved it by the domain's width).
+    #[test]
+    fn a_reversed_plane_evaluates_as_its_nurb() {
+        let original = Plane::new(
+            Point3::new(1.0, 2.0, 3.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec2::new(2.0, 3.0),
+            &Extent2d::from_bounds(-1.0, -2.0, 3.0, 5.0),
+        );
+        for param in [SurfParamType::U, SurfParamType::V] {
+            let mut p = original.clone();
+            p.reverse(param).unwrap();
+            let d = p.natural_uv_domain();
+            for (s, t) in [(0.0, 0.0), (0.5, 0.5), (1.0, 0.25), (0.3, 1.0)] {
+                let uv = d.evaluate(s, t);
+                let turned = match param {
+                    SurfParamType::U => d.evaluate(1.0 - s, t),
+                    _ => d.evaluate(s, 1.0 - t),
+                };
+                let (a, n, o) = (
+                    p.evaluate_point(uv),
+                    p.base.evaluate_point(uv).unwrap(),
+                    original.evaluate_point(turned),
+                );
+                assert!(
+                    a.distance(n) <= 1e-14 && a.distance(o) <= 1e-14,
+                    "{param:?} {a:?} {n:?} {o:?}"
+                );
+            }
+        }
+    }
+
+    /// A plane on a turned frame, reversed in each direction and back again: after every
+    /// reversal it evaluates as its own NURB, and twice reversed as the original. The origin
+    /// is placed along the axes the plane is rebuilt on, not its old ones.
+    #[test]
+    fn a_turned_plane_reversed_and_back_evaluates_as_its_nurb() {
+        let h = std::f64::consts::FRAC_1_SQRT_2;
+        let original = Plane::new(
+            Point3::new(1.0, 2.0, 3.0),
+            Vec3::new(h, h, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec2::new(2.0, 3.0),
+            &Extent2d::from_bounds(-1.0, -2.0, 3.0, 5.0),
+        );
+        let samples = [(0.0, 0.0), (0.5, 0.5), (1.0, 0.25), (0.3, 1.0)];
+        for param in [SurfParamType::U, SurfParamType::V] {
+            let mut p = original.clone();
+            for _ in 0..2 {
+                p.reverse(param).unwrap();
+                let d = p.natural_uv_domain();
+                for (s, t) in samples {
+                    let uv = d.evaluate(s, t);
+                    let (a, n) = (p.evaluate_point(uv), p.base.evaluate_point(uv).unwrap());
+                    assert!(a.distance(n) <= 1e-13, "{param:?} {a:?} {n:?}");
+                }
+            }
+            let d = p.natural_uv_domain();
+            for (s, t) in samples {
+                let uv = d.evaluate(s, t);
+                let (a, o) = (p.evaluate_point(uv), original.evaluate_point(uv));
+                assert!(a.distance(o) <= 1e-13, "{param:?} twice: {a:?} {o:?}");
+            }
+        }
+    }
+
+    /// A plane whose NURB is turned a quarter about z and then rebuilt from it: the analytic
+    /// plane is placed on the NURB's own axes and evaluates as it everywhere on a domain
+    /// away from the origin (on its old axes the origin moved by the domain's low corner).
+    #[test]
+    fn a_plane_rebuilt_from_a_turned_nurb_evaluates_as_it() {
+        let mut p = Plane::new(
+            Point3::new(1.0, 2.0, 3.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec2::new(2.0, 3.0),
+            &Extent2d::from_bounds(-1.0, -2.0, 3.0, 5.0),
+        );
+        p.ensure_nurb();
+        let quarter = Axis2Placement::new(
+            Vec3::ZERO,
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(-1.0, 0.0, 0.0),
+        );
+        p.base.transform(&quarter, None).unwrap();
+        p.rebuild_step_from_nurb_parameters().unwrap();
+        let d = p.natural_uv_domain();
+        for (s, t) in [(0.0, 0.0), (0.5, 0.5), (1.0, 0.25), (0.3, 1.0)] {
+            let uv = d.evaluate(s, t);
+            let (a, n) = (p.evaluate_point(uv), p.base.evaluate_point(uv).unwrap());
+            assert!(a.distance(n) <= 1e-13, "{a:?} {n:?}");
+        }
+    }
+
+    /// `SER(SM_ERR_INVALID_INPUT)` for a zero line vector, the exact status.
+    #[test]
+    fn zero_line_vector_is_sm_err_invalid_input() {
+        use crate::surface::surface::p4::NoObject;
+        let p = unit_plane();
+        let r = p.global_line_intersect::<NoObject>(
+            &Kernel::default(),
+            NoObject,
+            &p.step_uv_domain(),
+            Point3::new(1.0, 2.0, 0.0),
+            Vec3::new(0.0, 1e-300, 0.0),
+            None,
+            false,
+            1e-6,
+        );
+        let e = r.err().unwrap();
+        assert_eq!(e.sm_status(), Some(SM_ERR_INVALID_INPUT));
+        assert_eq!(
+            e.surface_failure(),
+            Some(&SurfaceFailure::LineDirectionZero)
+        );
+        assert_eq!(e.kind(), crate::error::ErrorKind::InvalidInput);
+    }
+
+    /// A line square to a plane whose u and v scales are 1e-7 crosses it at a determinant
+    /// of 1e-14, below the kernel's zero: the crossing is singular to solve for, with
+    /// upstream's `SM_ERR`; the fast drop refuses an operation it does not take.
+    #[test]
+    fn a_crossing_too_small_to_solve_and_an_operation_not_taken_are_named() {
+        use crate::geom::global_solver::SolverOperation;
+        use crate::surface::surface::p4::NoObject;
+        let tiny = Plane::new(
+            Point3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec2::new(1e-7, 1e-7),
+            &Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0),
+        );
+        let e = tiny
+            .global_line_intersect::<NoObject>(
+                &Kernel::default(),
+                NoObject,
+                &tiny.step_uv_domain(),
+                Point3::new(0.0, 0.0, 1.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                None,
+                false,
+                1e-6,
+            )
+            .unwrap_err();
+        assert_eq!(e.sm_status(), Some(crate::error::SM_ERR));
+        assert_eq!(
+            e.surface_failure(),
+            Some(&SurfaceFailure::LineCrossingSingular)
+        );
+        let p = unit_plane();
+        let e = p
+            .drop_point_fast::<NoObject>(
+                &p.step_uv_domain(),
+                SolverOperation::Maximize,
+                Point3::new(1.0, 2.0, 4.0),
+                1e-6,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(e.sm_status(), Some(crate::error::SM_ERR));
+        assert_eq!(
+            e.surface_failure(),
+            Some(&SurfaceFailure::OperationNotTaken)
+        );
+        assert_eq!(e.kind(), crate::error::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -2620,21 +2920,149 @@ mod tests {
     }
 
     #[test]
-    fn extension_uses_plane_overrides() {
-        // the B-spline IsSingularity / IsClosed are unported; the plane's are not
-        let p = Plane::new(
-            Point3::ZERO,
+    fn wr41_plane_identity_reparam_keeps_origin_exactly() {
+        // A non-representable scale and domain, so recomputing the origin through the
+        // upper corner would round; the same domain must leave the plane bit for bit.
+        let domain = Extent2d::from_bounds(-0.3, 1.7, 2.9, 4.1);
+        let mut p = Plane::new(
+            Point3::new(10.1, -20.3, 30.7),
+            Vec3::new(0.6, 0.8, 0.0),
+            Vec3::new(-0.8, 0.6, 0.0),
+            Vec2::new(2.3, 3.1),
+            &domain,
+        );
+        let before = p.clone();
+        p.reparameterize(&domain).unwrap();
+        assert_eq!(p.position(), before.position());
+        assert_eq!(p.step_uv_domain(), before.step_uv_domain());
+        for uv in [domain.min(), domain.max(), Point2::new(1.1, 2.2)] {
+            assert_eq!(p.evaluate_point(uv), before.evaluate_point(uv));
+        }
+    }
+
+    #[test]
+    fn wr41_plane_reparam_moves_origin_matches_nurb() {
+        let mut p = Plane::new(
+            Point3::new(10.0, 20.0, 30.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec2::new(2.0, 3.0),
+            &Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0),
+        );
+        let old_mid_pt = p.evaluate_point(Point2::new(0.5, 0.5));
+
+        let new_domain = Extent2d::from_bounds(2.0, 3.0, 5.0, 7.0);
+        p.reparameterize(&new_domain).unwrap();
+
+        // Closed form: the scales become (2 / 3, 3 / 4) and the upper corner (12, 23, 30)
+        // stays at (5, 7), so the origin is (12 - 10 / 3, 23 - 21 / 4, 30).
+        let expected = Point3::new(26.0 / 3.0, 17.75, 30.0);
+        assert!(p.position().origin().distance(expected) < 1e-12);
+
+        // Origin moved away from initial (10, 20, 30)
+        assert_ne!(p.position().origin(), Point3::new(10.0, 20.0, 30.0));
+
+        // Midpoint of new domain [2, 5] x [3, 7] is (3.5, 5.0), which maps to the same 3D point
+        let new_mid_pt = p.evaluate_point(Point2::new(3.5, 5.0));
+        assert!(old_mid_pt.distance(new_mid_pt) < 1e-12);
+
+        // Across the entire reparameterized domain, analytic plane and base NURB evaluate identically
+        let u_steps = [2.0, 2.75, 3.5, 4.25, 5.0];
+        let v_steps = [3.0, 4.0, 5.0, 6.0, 7.0];
+        for &u in &u_steps {
+            for &v in &v_steps {
+                let uv = Point2::new(u, v);
+                let pt_analytic = p.evaluate_point(uv);
+                let pt_nurb = p.base_with_nurb().unwrap().evaluate_point(uv).unwrap();
+                assert!(
+                    pt_analytic.distance(pt_nurb) < 1e-12,
+                    "mismatch at uv=({u}, {v}): analytic={pt_analytic:?}, nurb={pt_nurb:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wr41_plane_reparam_via_surface_dispatcher() {
+        let domain = Extent2d::from_bounds(2.0, 3.0, 6.0, 7.0);
+
+        let mut s = Surface::from(Plane::new(
+            Point3::new(5.0, 5.0, 5.0),
             Vec3::new(1.0, 0.0, 0.0),
             Vec3::new(0.0, 1.0, 0.0),
             Vec2::new(1.0, 1.0),
             &Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0),
+        ));
+        s.reparameterize(&Kernel::default(), &domain).unwrap();
+        if let SurfaceKind::Plane(plane) = s.kind() {
+            // Scales 1/4, upper corner (6, 6, 5) kept at (6, 7): origin (4.5, 4.25, 5).
+            assert_eq!(plane.position().origin(), Point3::new(4.5, 4.25, 5.0));
+            let pt_analytic = plane.evaluate_point(Point2::new(4.0, 5.0));
+            let pt_nurb = plane
+                .base_with_nurb()
+                .unwrap()
+                .evaluate_point(Point2::new(4.0, 5.0))
+                .unwrap();
+            assert!(pt_analytic.distance(pt_nurb) < 1e-12);
+        } else {
+            panic!("expected SurfaceKind::Plane");
+        }
+    }
+
+    #[test]
+    fn wr41_plane_reparam_huge_scale_stays_on_nurb() {
+        // Origin ~1e7, domain moved so the origin moves ~1e6. Analytic plane and NURB
+        // are both affine in (u, v): three corners agreeing means the surfaces agree.
+        let mut p = Plane::new(
+            Point3::new(1.2e7, -8.7e6, 3.1e6),
+            Vec3::new(0.6, 0.8, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec2::new(1.3e3, 7.1e2),
+            &Extent2d::from_bounds(-150.0, 20.0, 450.0, 900.0),
         );
-        let e = p.create_extended_surface(0.5, ContinuityType::G1).unwrap();
-        let d = e.natural_uv_domain();
-        assert!(d.max().x - d.min().x > 1.0);
-        let e = p
-            .create_extended_surface_dir(SurfParamType::UMax, 0.5, ContinuityType::G1)
-            .unwrap();
-        assert!(e.gw_nurb().is_some());
+        let origin = p.position().origin();
+        let new_domain = Extent2d::from_bounds(1.0e3, -4.0e3, 1.7e3, -2.5e3);
+        p.reparameterize(&new_domain).unwrap();
+        let moved = p.position().origin().distance(origin);
+        assert!(moved > 1.0e6, "origin moved {moved:e}");
+
+        let w = p.base_with_nurb().unwrap();
+        for uv in [
+            new_domain.evaluate(0.0, 0.0),
+            new_domain.evaluate(1.0, 0.0),
+            new_domain.evaluate(0.0, 1.0),
+        ] {
+            let n = w.evaluate_point(uv).unwrap();
+            let gap = p.evaluate_point(uv).distance(n);
+            assert!(
+                gap <= 1.0e-15 * n.length().max(origin.length()) * 4.0,
+                "gap {gap:e} at {n:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wr41_plane_reparam_arbitrary_frame_and_scale() {
+        let mut p = Plane::new(
+            Point3::new(-15.0, 4.2, 100.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec2::new(3.5, 7.2),
+            &Extent2d::from_bounds(-2.0, -1.0, 4.0, 5.0),
+        );
+        let new_domain = Extent2d::from_bounds(10.0, 20.0, 30.0, 60.0);
+        p.reparameterize(&new_domain).unwrap();
+
+        for u in [10.0, 15.0, 20.0, 25.0, 30.0] {
+            for v in [20.0, 30.0, 40.0, 50.0, 60.0] {
+                let uv = Point2::new(u, v);
+                let pt_analytic = p.evaluate_point(uv);
+                let pt_nurb = p.base_with_nurb().unwrap().evaluate_point(uv).unwrap();
+                assert!(
+                    pt_analytic.distance(pt_nurb) < 1e-11,
+                    "mismatch at uv=({u}, {v}): analytic={pt_analytic:?}, nurb={pt_nurb:?}"
+                );
+            }
+        }
     }
 }

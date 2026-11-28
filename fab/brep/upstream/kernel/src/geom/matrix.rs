@@ -25,9 +25,12 @@
 //! | [`Matrix::solve_linear_system`]        | `SolveLinearSystem`                        |
 //! | [`Matrix::eigen_system_jacobi`]        | `EigenSystemJacobiSolver`                  |
 //! | [`Matrix::compute_3x3_eigen_vectors`]  | `Compute3x3EigenVectors`                   |
+//! | [`Matrix::transpose`]                  | `Transpose`                                |
+//! | [`Matrix::sv_decompose`], [`SVD_MAX_ITERATIONS`] | `SVDecompose`, its `lMaxIters`   |
+//! | `pythag` (private)                     | `smos_Pythag` (`SmMath.h`)                 |
 //! | `sort_eigen_system` (private)          | `sm_SortEigenSystem`                       |
 //!
-//! The other `SmMatrix` members (`Add`, `Multiply`, `Invert`, `Transpose`, SVD,
+//! The other `SmMatrix` members (`Add`, `Multiply`, `Invert`, `SolveWithSVDMatrices`,
 //! `Rank`, `MakeRowEchelon`, `SwapRows`, 3x3 determinant / eigenvalues, ...) are not
 //! reached by any upstream test entry point and are not ported (see
 //! `harness/callgraph/units.json`).
@@ -50,7 +53,8 @@
 //!   [`LuDecomposition::near_singular`] / [`LinearSolution::near_singular`]; the
 //!   row-swap index array and the solution vector are returned. Other statuses are
 //!   [`SolidError::InvalidInput`] (`SM_ERR_INVALID_INPUT`) or
-//!   [`SolidError::Upstream`] with code `1001` (`SM_ERR`).
+//!   [`GeomFailure`](crate::error::geom::GeomFailure) with status `1001` (`SM_ERR`), which
+//!   `local_solve_nd` reads by that status.
 //! - `LUDecompose` uses a fixed `MAX_MATRIX_SIZE` (1000) scale buffer on the stack
 //!   (larger matrices overflow it); here it is a `Vec`. `SolveLinearSystem` keeps
 //!   its explicit size check.
@@ -64,14 +68,16 @@
 //!   there, and `InvalidInput` for a matrix that is not 3x3 (upstream reads out of
 //!   bounds). When the solver does not converge, the unconverged values are
 //!   returned with success, as upstream.
+//! - `SVDecompose` returns `W` and `V` instead of filling out-parameters, and omits
+//!   its `SM_DEBUG_CODE` self-check. Where a NaN norm makes its splitting test read
+//!   `rW[-1]` (undefined upstream) it returns `InvalidInput`. Its QR loop is bounded
+//!   by `lMaxIters` (30) per singular value, as upstream; no recursion.
 
+use crate::error::geom::GeomFailure;
 use crate::error::{Result, SolidError};
 use crate::geom::tol::is_zero;
 use crate::geom::vector3d::{sqrt, Vec3};
 use crate::math::EFF_ZERO;
-
-/// Upstream status `SM_ERR`.
-const SM_ERR: i32 = 1001;
 
 /// `MAX_MATRIX_SIZE`: the largest system [`Matrix::solve_linear_system`] accepts.
 pub const MAX_MATRIX_SIZE: usize = 1000;
@@ -86,12 +92,28 @@ fn out_of_range(operation: &'static str) -> SolidError {
     }
 }
 
-fn sm_err(operation: &'static str) -> SolidError {
-    SolidError::Upstream {
-        operation,
-        code: SM_ERR,
-        entity: None,
+/// `lMaxIters` of `SVDecompose`: QR sweeps per singular value.
+pub const SVD_MAX_ITERATIONS: usize = 30;
+
+/// `smos_Pythag(a, b)`: `sqrt(a*a + b*b)` without destructive overflow or underflow,
+/// signed like its larger operand (the macro of `SmMath.h`).
+fn pythag(a: f64, b: f64) -> f64 {
+    if a.abs() > b.abs() {
+        a * sqrt(1.0 + (b / a) * (b / a))
+    } else if b != 0.0 {
+        b * sqrt(1.0 + (a / b) * (a / b))
+    } else {
+        0.0
     }
+}
+
+fn vget(v: &[f64], i: usize, op: &'static str) -> Result<f64> {
+    v.get(i).copied().ok_or_else(|| out_of_range(op))
+}
+
+fn vset(v: &mut [f64], i: usize, x: f64, op: &'static str) -> Result<()> {
+    *v.get_mut(i).ok_or_else(|| out_of_range(op))? = x;
+    Ok(())
 }
 
 /// A dense `rows x cols` matrix stored row-major (`SmMatrix`).
@@ -139,6 +161,8 @@ struct JacobiState {
     vectors: Matrix,
     rotations: u64,
     converged: bool,
+    /// The off-diagonal sum measured at the start of the last sweep.
+    off_diagonal: f64,
 }
 
 impl Matrix {
@@ -309,7 +333,13 @@ impl Matrix {
     /// Makes the matrix the identity (`MakeIdentity`); `SM_ERR` when not square.
     pub fn make_identity(&mut self) -> Result<()> {
         if self.rows != self.cols {
-            return Err(sm_err("geom::matrix::Matrix::make_identity"));
+            return Err(SolidError::geom(
+                "geom::matrix::Matrix::make_identity",
+                GeomFailure::NotSquare {
+                    rows: self.rows,
+                    cols: self.cols,
+                },
+            ));
         }
         self.clear();
         let step = self.rows + 1;
@@ -350,7 +380,7 @@ impl Matrix {
                 }
             }
             if big < zero_tol {
-                return Err(sm_err(OP));
+                return Err(SolidError::geom(OP, GeomFailure::Singular { measure: big }));
             }
             *sc = 1.0 / big;
         }
@@ -462,7 +492,10 @@ impl Matrix {
             }
             let denom = self.get(row, row, OP)?;
             if denom.abs() < zero_tol {
-                return Err(sm_err(OP));
+                return Err(SolidError::geom(
+                    OP,
+                    GeomFailure::Singular { measure: denom },
+                ));
             }
             *x.get_mut(row).ok_or_else(|| out_of_range(OP))? = sum / denom;
         }
@@ -497,7 +530,7 @@ impl Matrix {
             });
         }
         let mut tmp = self.clone();
-        let lu = tmp.lu_decompose().map_err(|_| sm_err(OP))?;
+        let lu = tmp.lu_decompose().map_err(SolidError::geom_call(OP))?;
         let x = tmp.solve_with_lu(&lu.index, rhs)?;
         Ok(LinearSolution {
             x,
@@ -515,9 +548,17 @@ impl Matrix {
     /// or the off-diagonal sum is not below `SM_EFF_ZERO` after 50 sweeps.
     pub fn eigen_system_jacobi(&mut self) -> Result<EigenSystem> {
         const OP: &str = "geom::matrix::Matrix::eigen_system_jacobi";
-        let st = self.jacobi()?.ok_or_else(|| sm_err(OP))?;
+        let st = self
+            .jacobi()?
+            .ok_or_else(|| SolidError::geom(OP, GeomFailure::NotSymmetric))?;
         if !st.converged {
-            return Err(sm_err(OP));
+            return Err(SolidError::geom(
+                OP,
+                GeomFailure::JacobiDidNotConverge {
+                    sweeps: JACOBI_MAX_SWEEPS,
+                    off_diagonal: st.off_diagonal,
+                },
+            ));
         }
         Ok(EigenSystem {
             values: st.values,
@@ -549,6 +590,7 @@ impl Matrix {
 
         let dv = |d: &[f64], i: usize| d.get(i).copied().ok_or_else(|| out_of_range(OP));
 
+        let mut off_diagonal = 0.0;
         for i in 0..JACOBI_MAX_SWEEPS {
             // sum of the upper off-diagonal magnitudes
             let mut sm = 0.0;
@@ -557,6 +599,8 @@ impl Matrix {
                     sm += self.get(ip, iq, OP)?.abs();
                 }
             }
+
+            off_diagonal = sm;
 
             // normal exit relying on quadratic convergence
             if sm < EFF_ZERO {
@@ -572,6 +616,7 @@ impl Matrix {
                     vectors: v,
                     rotations,
                     converged: true,
+                    off_diagonal,
                 }));
             }
 
@@ -646,6 +691,7 @@ impl Matrix {
             vectors: v,
             rotations,
             converged: false,
+            off_diagonal,
         }))
     }
 
@@ -673,7 +719,9 @@ impl Matrix {
                 reason: "matrix is not 3x3",
             });
         }
-        let st = self.jacobi()?.ok_or_else(|| sm_err(OP))?;
+        let st = self
+            .jacobi()?
+            .ok_or_else(|| SolidError::geom(OP, GeomFailure::NotSymmetric))?;
         let vv = &st.vectors;
         let value = |i: usize| st.values.get(i).copied().ok_or_else(|| out_of_range(OP));
         let values = [value(0)?, value(1)?, value(2)?];
@@ -685,6 +733,390 @@ impl Matrix {
             ))
         };
         Ok((values, [col(0)?, col(1)?, col(2)?]))
+    }
+
+    /// Transposes the matrix in place (`Transpose`): a square matrix swaps its
+    /// off-diagonal pairs, any other becomes the `cols x rows` transpose.
+    pub fn transpose(&mut self) -> Result<()> {
+        const OP: &str = "geom::matrix::Matrix::transpose";
+        let (m, n) = (self.rows, self.cols);
+        if m == n {
+            for ii in 0..m {
+                for jj in ii + 1..m {
+                    let temp = self.get(ii, jj, OP)?;
+                    let other = self.get(jj, ii, OP)?;
+                    self.put(ii, jj, other, OP)?;
+                    self.put(jj, ii, temp, OP)?;
+                }
+            }
+        } else {
+            let mut t = Self::try_new(n, m)?;
+            for ii in 0..m {
+                for jj in 0..n {
+                    t.put(jj, ii, self.get(ii, jj, OP)?, OP)?;
+                }
+            }
+            *self = t;
+        }
+        Ok(())
+    }
+
+    /// Singular value decomposition `A = U W Vᵀ` of this `m x n` matrix (`m >= n`;
+    /// `SVDecompose`, after "Numerical Recipes in C"): the matrix is overwritten by
+    /// `U` (`m x n`); returns the diagonal of `W` (`n` values) and `V` (`n x n`, not
+    /// `Vᵀ`).
+    ///
+    /// The QR sweep runs at most [`SVD_MAX_ITERATIONS`] times per singular value; when a
+    /// value has not converged by then the decomposition carries on with the next one
+    /// and returns success, as upstream (its `its == lMaxIters` error test is never
+    /// reached by the zero-based loop).
+    ///
+    /// # Errors
+    ///
+    /// `SM_ERR` when `m < n` or the matrix is empty. `InvalidInput` where upstream
+    /// reads outside its arrays (a NaN norm makes the splitting test fall through to
+    /// `rv1[-1]`).
+    pub fn sv_decompose(&mut self) -> Result<(Vec<f64>, Self)> {
+        const OP: &str = "geom::matrix::Matrix::sv_decompose";
+        let m = self.rows;
+        let n = self.cols;
+
+        // check input: m >= n
+        if m < n || m == 0 || n == 0 {
+            return Err(SolidError::geom(
+                OP,
+                GeomFailure::TooFewRows { rows: m, cols: n },
+            ));
+        }
+        let mut w = vec![0.0; n];
+        let mut v = Self::try_new(n, n)?;
+        let mut rv1 = vec![0.0; n];
+        let a = self;
+
+        let mut anorm: f64 = 0.0;
+        let mut g: f64 = 0.0;
+        let mut scale: f64 = 0.0;
+        let (mut c, mut f, mut h, mut s);
+        let (mut x, mut y, mut z);
+
+        // Householder reduction to bidiagonal form
+        let mut ll;
+        for i1 in 0..n {
+            ll = i1 + 1;
+            vset(&mut rv1, i1, scale * g, OP)?;
+            g = 0.0;
+            s = 0.0;
+            scale = 0.0;
+
+            if i1 < m {
+                for kk in i1..m {
+                    scale += a.get(kk, i1, OP)?.abs();
+                }
+
+                if scale != 0.0 {
+                    for kk in i1..m {
+                        let q = a.get(kk, i1, OP)? / scale;
+                        a.put(kk, i1, q, OP)?;
+                        s += q * q;
+                    }
+
+                    f = a.get(i1, i1, OP)?;
+                    g = -(if f >= 0.0 { sqrt(s) } else { -sqrt(s) });
+                    h = f * g - s;
+                    a.put(i1, i1, f - g, OP)?;
+
+                    if i1 != n - 1 {
+                        for j1 in ll..n {
+                            s = 0.0;
+
+                            for kk in i1..m {
+                                s += a.get(kk, i1, OP)? * a.get(kk, j1, OP)?;
+                            }
+                            f = s / h;
+
+                            for kk in i1..m {
+                                let q = a.get(kk, j1, OP)? + f * a.get(kk, i1, OP)?;
+                                a.put(kk, j1, q, OP)?;
+                            }
+                        }
+                    }
+
+                    for kk in i1..m {
+                        let q = a.get(kk, i1, OP)? * scale;
+                        a.put(kk, i1, q, OP)?;
+                    }
+                }
+            }
+
+            vset(&mut w, i1, scale * g, OP)?;
+            g = 0.0;
+            s = 0.0;
+            scale = 0.0;
+
+            if i1 < m && i1 != n - 1 {
+                for kk in ll..n {
+                    scale += a.get(i1, kk, OP)?.abs();
+                }
+
+                if scale != 0.0 {
+                    for kk in ll..n {
+                        let q = a.get(i1, kk, OP)? / scale;
+                        a.put(i1, kk, q, OP)?;
+                        s += q * q;
+                    }
+
+                    f = a.get(i1, ll, OP)?;
+                    g = -(if f >= 0.0 { sqrt(s) } else { -sqrt(s) });
+                    h = f * g - s;
+                    a.put(i1, ll, f - g, OP)?;
+
+                    for kk in ll..n {
+                        vset(&mut rv1, kk, a.get(i1, kk, OP)? / h, OP)?;
+                    }
+
+                    if i1 != m - 1 {
+                        for j1 in ll..m {
+                            s = 0.0;
+
+                            for kk in ll..n {
+                                s += a.get(j1, kk, OP)? * a.get(i1, kk, OP)?;
+                            }
+
+                            for kk in ll..n {
+                                let q = a.get(j1, kk, OP)? + s * vget(&rv1, kk, OP)?;
+                                a.put(j1, kk, q, OP)?;
+                            }
+                        }
+                    }
+
+                    for kk in ll..n {
+                        let q = a.get(i1, kk, OP)? * scale;
+                        a.put(i1, kk, q, OP)?;
+                    }
+                }
+            }
+
+            let norm = vget(&w, i1, OP)?.abs() + vget(&rv1, i1, OP)?.abs();
+            anorm = if anorm > norm { anorm } else { norm };
+        }
+
+        // Accumulation of right hand transformations
+        ll = 0;
+        for i1 in (0..n).rev() {
+            if i1 < n - 1 {
+                if g != 0.0 {
+                    for j1 in ll..n {
+                        let q = (a.get(i1, j1, OP)? / a.get(i1, ll, OP)?) / g;
+                        v.put(j1, i1, q, OP)?;
+                    }
+
+                    for j1 in ll..n {
+                        s = 0.0;
+
+                        for kk in ll..n {
+                            s += a.get(i1, kk, OP)? * v.get(kk, j1, OP)?;
+                        }
+
+                        for kk in ll..n {
+                            let q = v.get(kk, j1, OP)? + s * v.get(kk, i1, OP)?;
+                            v.put(kk, j1, q, OP)?;
+                        }
+                    }
+                }
+
+                for j1 in ll..n {
+                    v.put(j1, i1, 0.0, OP)?;
+                    v.put(i1, j1, 0.0, OP)?;
+                }
+            }
+
+            v.put(i1, i1, 1.0, OP)?;
+            g = vget(&rv1, i1, OP)?;
+            ll = i1;
+        }
+
+        // Accumulation of left hand transformations
+        for i1 in (0..n).rev() {
+            ll = i1 + 1;
+            g = vget(&w, i1, OP)?;
+
+            if i1 < n - 1 {
+                for j1 in ll..n {
+                    a.put(i1, j1, 0.0, OP)?;
+                }
+            }
+
+            if g == 0.0 {
+                for j1 in i1..m {
+                    a.put(j1, i1, 0.0, OP)?;
+                }
+            } else {
+                g = 1.0 / g;
+
+                if i1 != n - 1 {
+                    for j1 in ll..n {
+                        s = 0.0;
+
+                        for kk in ll..m {
+                            s += a.get(kk, i1, OP)? * a.get(kk, j1, OP)?;
+                        }
+                        f = (s / a.get(i1, i1, OP)?) * g;
+
+                        for kk in i1..m {
+                            let q = a.get(kk, j1, OP)? + f * a.get(kk, i1, OP)?;
+                            a.put(kk, j1, q, OP)?;
+                        }
+                    }
+                }
+
+                for j1 in i1..m {
+                    let q = a.get(j1, i1, OP)? * g;
+                    a.put(j1, i1, q, OP)?;
+                }
+            }
+
+            let q = a.get(i1, i1, OP)? + 1.0;
+            a.put(i1, i1, q, OP)?;
+        }
+
+        // Diagonalization of the bidiagonal form
+        let mut nm: usize;
+        for kk in (0..n).rev() {
+            // loop over allowed iterations
+            for _its in 0..SVD_MAX_ITERATIONS {
+                let mut flag = true;
+
+                // test for splitting; rv1[0] is always 0
+                let mut l_int = kk;
+                loop {
+                    ll = l_int;
+                    nm = ll.wrapping_sub(1);
+
+                    if vget(&rv1, ll, OP)?.abs() + anorm == anorm {
+                        flag = false;
+                        break;
+                    }
+
+                    if vget(&w, nm, OP)?.abs() + anorm == anorm {
+                        break;
+                    }
+                    if l_int == 0 {
+                        break;
+                    }
+                    l_int -= 1;
+                }
+
+                if flag {
+                    // cancellation of rv1[ll] if ll > 1 (upstream also sets c = 0, which
+                    // is never read)
+                    s = 1.0;
+
+                    for i1 in ll..=kk {
+                        f = s * vget(&rv1, i1, OP)?;
+
+                        if f.abs() + anorm != anorm {
+                            g = vget(&w, i1, OP)?;
+                            h = pythag(f, g);
+                            vset(&mut w, i1, h, OP)?;
+                            h = 1.0 / h;
+                            c = g * h;
+                            s = -f * h;
+
+                            for j1 in 0..m {
+                                y = a.get(j1, nm, OP)?;
+                                z = a.get(j1, i1, OP)?;
+                                a.put(j1, nm, y * c + z * s, OP)?;
+                                a.put(j1, i1, z * c - y * s, OP)?;
+                            }
+                        }
+                    }
+                }
+
+                z = vget(&w, kk, OP)?;
+
+                if ll == kk {
+                    // Convergence.
+                    if z < 0.0 {
+                        // Singular value is made nonnegative
+                        vset(&mut w, kk, -z, OP)?;
+
+                        for j1 in 0..n {
+                            let q = -v.get(j1, kk, OP)?;
+                            v.put(j1, kk, q, OP)?;
+                        }
+                    }
+                    break;
+                }
+
+                // upstream's `its == lMaxIters` error exit is unreachable in the
+                // zero-based loop (`its < SVD_MAX_ITERATIONS`), so it is not ported
+
+                // shift from bottom 2-by-2 minor
+                x = vget(&w, ll, OP)?;
+                nm = kk.wrapping_sub(1);
+                y = vget(&w, nm, OP)?;
+                g = vget(&rv1, nm, OP)?;
+                h = vget(&rv1, kk, OP)?;
+                f = ((y - z) * (y + z) + (g - h) * (g + h)) / (2.0 * h * y);
+                g = (f * f + 1.0).sqrt();
+                f = ((x - z) * (x + z)
+                    + h * ((y / (f + if f >= 0.0 { g.abs() } else { -g.abs() })) - h))
+                    / x;
+
+                // next QR transformation
+                c = 1.0;
+                s = 1.0;
+
+                for j1 in ll..=nm {
+                    let i1 = j1 + 1;
+                    g = vget(&rv1, i1, OP)?;
+                    y = vget(&w, i1, OP)?;
+                    h = s * g;
+                    g *= c;
+                    z = pythag(f, h);
+                    vset(&mut rv1, j1, z, OP)?;
+                    c = f / z;
+                    s = h / z;
+                    f = x * c + g * s;
+                    g = g * c - x * s;
+                    h = y * s;
+                    y *= c;
+
+                    for jj in 0..n {
+                        x = v.get(jj, j1, OP)?;
+                        z = v.get(jj, i1, OP)?;
+                        v.put(jj, j1, x * c + z * s, OP)?;
+                        v.put(jj, i1, z * c - x * s, OP)?;
+                    }
+
+                    z = pythag(f, h);
+                    // rotation can be arbitrary if z = 0
+                    vset(&mut w, j1, z, OP)?;
+
+                    if z != 0.0 {
+                        z = 1.0 / z;
+                        c = f * z;
+                        s = h * z;
+                    }
+
+                    f = (c * g) + (s * y);
+                    x = (c * y) - (s * g);
+
+                    for jj in 0..m {
+                        y = a.get(jj, j1, OP)?;
+                        z = a.get(jj, i1, OP)?;
+                        a.put(jj, j1, y * c + z * s, OP)?;
+                        a.put(jj, i1, z * c - y * s, OP)?;
+                    }
+                }
+
+                vset(&mut rv1, ll, 0.0, OP)?;
+                vset(&mut rv1, kk, f, OP)?;
+                vset(&mut w, kk, x, OP)?;
+            }
+        }
+
+        Ok((w, v))
     }
 }
 
@@ -721,6 +1153,7 @@ fn sort_eigen_system(d: &mut [f64], v: &mut Matrix) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ErrorKind;
 
     fn m(rows: usize, cols: usize, v: &[f64]) -> Matrix {
         Matrix::from_row_major(rows, cols, v.to_vec()).unwrap()
@@ -756,10 +1189,18 @@ mod tests {
             Err(SolidError::InvalidInput { .. })
         ));
         let z = m(2, 2, &[1.0, 2.0, 0.0, 0.0]);
-        assert!(matches!(
-            z.solve_linear_system(&[1.0, 2.0]),
-            Err(SolidError::Upstream { code: 1001, .. })
-        ));
+        let singular = z.solve_linear_system(&[1.0, 2.0]).unwrap_err();
+        assert_eq!(singular.upstream_status(), Some(1001));
+        assert_eq!(
+            singular.geom_failure(),
+            Some(&GeomFailure::CallFailed {
+                class: ErrorKind::Degenerate
+            })
+        );
+        assert_eq!(singular.kind(), ErrorKind::Degenerate);
+        assert!(singular
+            .to_string()
+            .contains("; caused by geom::matrix::Matrix::lu_decompose"));
         let big = Matrix::new(MAX_MATRIX_SIZE + 1, MAX_MATRIX_SIZE + 1);
         assert!(matches!(
             big.solve_linear_system(&vec![0.0; MAX_MATRIX_SIZE + 1]),
@@ -904,7 +1345,7 @@ mod tests {
         let mut ns3 = m(3, 3, &[1.0, 2.0, 0.0, 3.0, 4.0, 0.0, 0.0, 0.0, 1.0]);
         assert!(matches!(
             ns3.compute_3x3_eigen_vectors(),
-            Err(SolidError::Upstream { code: 1001, .. })
+            Err(e) if e.upstream_status() == Some(1001)
         ));
     }
 

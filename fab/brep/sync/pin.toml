@@ -1,0 +1,23 @@
+commit = "88c4e8eb9e548034e1af2a76f120a5727f2ef5ee"
+date = "2026-11-28T09:30:40Z"
+subject = "Merge #23464: Insert DXF: binary DXF files insert like ASCII ones, with their text in the drawing's code page"
+tool = "0.1.0"
+
+[inventory]
+"I1 serde.default" = 7
+"I1 serde.rename_all" = 3
+"I1 serde.skip_serializing_if" = 6
+"I1 serde.tag" = 1
+"I1 thiserror.debug" = 3
+"I1 thiserror.derive" = 11
+"I1 thiserror.error" = 67
+"I1 thiserror.extra arguments" = 6
+"I1 thiserror.field shorthand" = 5
+"I1 thiserror.implicit" = 6
+"I1 thiserror.inline" = 25
+"I1 thiserror.plain" = 16
+"I1 thiserror.positional" = 25
+"I1 thiserror.transparent" = 1
+"I2 Instant" = 5
+"I2 std::io" = 5
+"I2 thread_local!" = 1

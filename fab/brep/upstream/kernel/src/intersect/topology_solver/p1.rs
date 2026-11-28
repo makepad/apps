@@ -27,6 +27,24 @@
 //! | `GlobalSolve::identical_solutions` for [`TopologySolver`], `TopologyDomains` (private) | `SmGlobalSolver::IdenticalSolutions` (not overridden upstream: the solutions' `SmObject*` resolve through [`TopologyObjects`]) |
 //!
 //! Deviations:
+//! - **Single projected point/face maxima.** These queries evaluate trimmed UV silhouettes on the
+//!   source surface as UV proposals alongside native knot-cell seeds, avoiding
+//!   a temporary lifted-curve solve and the 3D fit's extra measurement error.
+//!   The tracing tolerance is expressed in geometric units using the norm of the
+//!   double-cross projection, rather than ten times the query tolerance.
+//!   A single projected point/face maximum additionally checks an outward-rounded
+//!   bound over the whole face domain, with exact rectangular trim feasibility
+//!   for a new face candidate. An unavailable or unresolved certificate refuses
+//!   and restores the solver state. Other operation classes are not certified here.
+//! - **Projected tree bounds.** Outward-rounded projected boxes use the queries'
+//!   double-cross metric, including its non-unit-normal scale, and retain answers
+//!   within the query tolerance. Upstream compared an unscaled sphere distance
+//!   with scaled answers and no tolerance (WR-766).
+//! - **Directed tree bounds.** A branch is kept unless no pair of box points can
+//!   satisfy the local solver's 2-degree direction test, or every admitted value is
+//!   more than the query tolerance worse than the best. Upstream measured the
+//!   in-plane offset instead of the distance to the direction plane, which culls
+//!   every directed answer farther than the two bounding radii (WR-772).
 //! - **Objects.** Tree objects and solution objects are a caller-chosen handle `O`
 //!   (upstream `SmObject*`; a null pointer is `None`). Everything the solvers read
 //!   through those pointers (the curve behind a tree object, a vertex's point and
@@ -75,16 +93,26 @@
 //!   `SmFace::Point3DClassify` is [`crate::query::face::p1::point_3d_classify`] on a
 //!   copy of that B-rep (its UV trim curve and trimmed surface cache additions are not
 //!   kept).
+//! - **Point/vertex ray-firing (`WR-62`).** Upstream `SmTLSPointVertex::SolveIt`
+//!   omits `break;` at the end of `case SM_SO_RAYFIRE:` and falls through into
+//!   `case SM_SO_3D_SIGNED_DIRECTED_MINIMIZE:`, recomputing `dParam` without
+//!   snapping `[-SM_EFF_ZERO * dScale, 0.0)` to `0.0` and negating `dParam` /
+//!   `dSign` when `m_bSwapOrder` is `TRUE` (inherited by `SmTLSVertexVertex::SolveIt`).
+//!   Here `SolverOperation::Rayfire` ends its arm with `dist_sq = param * param`
+//!   and `sign = 1.0`, matching `SmTLSPointCurve::SolveIt` and
+//!   `SmTLSPointFace::SolveIt`.
 
+use crate::blend::fillet_section::interval::Ivl;
 use crate::curve::curve::p1::GlobalPointSolveOptions;
 use crate::curve::curve::p2::Curve;
 use crate::curve::curve::p8::CurveIntersectOptions;
 use crate::curve::curve::p9::CurveSolveOptions;
-use crate::error::{Result, SolidError};
+use crate::error::intersect::IntersectFailure;
+use crate::error::{Failure, Result, SolidError, SM_ERR_NULL_POINTER};
 use crate::geom::extent1d::Extent1d;
 use crate::geom::extent2d::Extent2d;
 use crate::geom::extent3d::{Extent3d, LineHit};
-use crate::geom::geom_utility::p1::{line_closest_point, point_project_to_plane};
+use crate::geom::geom_utility::p1::line_closest_point;
 use crate::geom::global_solver::{
     Branch, GlobalSolve, GlobalSolver, ObjectZoneTol, OperationCategory, PreferredSolution,
     SolutionPairType, SolutionRequested, SolverOperation, MAX_SOLVER_TREES,
@@ -95,11 +123,11 @@ use crate::geom::solution_array::{
 };
 use crate::geom::tol::{zone_tol_3d, SmallTopoType};
 use crate::geom::tree::Tree;
-use crate::geom::vector2d::Vec2;
+use crate::geom::vector2d::{Point2, Vec2};
 use crate::geom::vector3d::sqrt;
 use crate::intersect::point_class::PointClassification;
 use crate::kernel::Kernel;
-use crate::math::{Point3, Vec3, BIG_DOUBLE, EFF_ZERO, EFF_ZERO_SQRT, PI};
+use crate::math::{Point3, Vec3, BIG_DOUBLE, EFF_ZERO, PI};
 use crate::query::face::p2::{
     point_classify_prepared, point_classify_requested, PointClassifyOptions,
 };
@@ -126,6 +154,12 @@ const fn null_deref(operation: &'static str, reason: &'static str) -> SolidError
     SolidError::InvalidInput { operation, reason }
 }
 
+/// Error for a null object a solve checks for (upstream's `NER`, `SM_ERR_NULL_POINTER`):
+/// a null object of the caller's trees, or a null handle the caller passed.
+pub(super) fn no_object(operation: &'static str) -> SolidError {
+    SolidError::intersect(operation, IntersectFailure::NoObjectToSolve)
+}
+
 /// The objects a topology solve works on, as seen through their handles: the
 /// geometry behind a tree object and the topology accessors the local solvers
 /// call (upstream reaches these through casts of `SmObject*` and the
@@ -146,7 +180,7 @@ pub trait TopologyObjects<O> {
         &self,
         _k: &Kernel,
         _face: O,
-        _uv: crate::math::Point2,
+        _uv: Point2,
         _tolerance: f64,
         _boundaries: bool,
         _use_uv: bool,
@@ -183,10 +217,12 @@ pub trait TopologyObjects<O> {
     fn brep_trees(&self, brep: O) -> Result<super::p2::TopologyTrees<'_, O>> {
         const OP: &str = "intersect::topology_solver::p1::TopologyObjects::brep_trees";
         let cache = self.brep_cache(brep)?;
+        // the caller's cache has no trees until its `build_trees` runs
+        let not_built = || SolidError::intersect(OP, IntersectFailure::NotSetUp);
         Ok(super::p2::TopologyTrees {
-            vertices: cache.vertex_tree().ok_or(SolidError::null_pointer(OP))?,
-            curves: cache.curve_tree().ok_or(SolidError::null_pointer(OP))?,
-            surfaces: cache.surface_tree().ok_or(SolidError::null_pointer(OP))?,
+            vertices: cache.vertex_tree().ok_or_else(not_built)?,
+            curves: cache.curve_tree().ok_or_else(not_built)?,
+            surfaces: cache.surface_tree().ok_or_else(not_built)?,
         })
     }
 
@@ -207,9 +243,12 @@ pub trait TopologyObjects<O> {
         let object = self.shape_member_object(member)?;
         match member {
             ShapeMember::Vertex(_) => Ok(object),
-            ShapeMember::Edge(_) => self.edge_curve(object)?.ok_or(SolidError::null_pointer(
-                "intersect::topology_solver::p2::shape_geometry_object",
-            )),
+            ShapeMember::Edge(_) => self.edge_curve(object)?.ok_or_else(|| {
+                SolidError::intersect(
+                    "intersect::topology_solver::p2::shape_geometry_object",
+                    IntersectFailure::EdgeWithoutCurve,
+                )
+            }),
             ShapeMember::Face(_) => self.face_surface(object),
             ShapeMember::Other => Err(SolidError::invalid_input(
                 "intersect::topology_solver::p2::shape_geometry_object",
@@ -265,6 +304,18 @@ pub trait TopologyObjects<O> {
     /// adapter cannot resolve: a gap in the caller's adapter, which the caller reports.
     fn face_entity(&self, face: O) -> Option<(&crate::topology::Brep, crate::topology::FaceId)> {
         let _ = face;
+        None
+    }
+
+    /// Optional live lend of the B-rep and face record a face handle names, for the face
+    /// members whose lazy queries edit the B-rep as upstream's do (`SmFace::CurveOnClassify`
+    /// makes UV trim curves): `f` runs on the adapter's own B-rep, mutably. `None` (the
+    /// default) leaves the caller to [`TopologyObjects::face_entity`].
+    fn with_face_entity_mut(
+        &self,
+        _face: O,
+        _f: &mut dyn FnMut(&mut crate::topology::Brep, crate::topology::FaceId) -> Result<()>,
+    ) -> Option<Result<()>> {
         None
     }
 
@@ -475,7 +526,7 @@ impl<'t, 'a, O: SolutionObject + 't> TopologySolver<'t, 'a, O> {
         best_answer_so_far_sq: f64,
         opt_vectors: &[Vec3],
     ) -> Self {
-        let mut base = GlobalSolver::new();
+        let mut base = GlobalSolver::new_with_kernel(kernel);
         base.operation = operation;
         base.solution_requested = requested;
         base.tolerance_3d = tolerance_3d;
@@ -581,79 +632,66 @@ impl<'t, 'a, O: SolutionObject + 't> TopologySolver<'t, 'a, O> {
             }
 
             SolverOperation::ProjectedMinimize | SolverOperation::ProjectedMaximize => {
-                let s1 = box1.sphere_bound();
-                let s2 = box2.sphere_bound();
-                let proj_pnt = point_project_to_plane(s2.center, s1.center, opt_vector(s, 0)?);
-                if s.operation == SolverOperation::ProjectedMinimize {
-                    let min_proj_dist = proj_pnt.distance(s1.center) - s1.radius - s2.radius;
-                    if min_proj_dist > 0.0
-                        && min_proj_dist * min_proj_dist > s.best_answer_so_far_sq
-                    {
-                        return Ok(false);
-                    }
-                }
-                if s.operation == SolverOperation::ProjectedMaximize {
-                    let max_proj_dist = proj_pnt.distance(s1.center) + s1.radius + s2.radius;
-                    if max_proj_dist * max_proj_dist < s.best_answer_so_far_sq {
-                        return Ok(false);
-                    }
-                }
-
-                // If we were unable to elimiate using above sphere tests then
-                // we just skip out here with a TRUE.
-                Ok(true)
+                // Bound every pair of box points in the queries' own double-cross
+                // metric, and retain answers within the query tolerance as the
+                // Minimize and Maximize arms above do.
+                let distance =
+                    super::projected_metric::projected_box_distance(box1, box2, opt_vector(s, 0)?);
+                let best = Ivl::from(s.best_answer_so_far_sq).sqrt();
+                let budget = Ivl::from(tol);
+                let excluded = if s.operation == SolverOperation::ProjectedMinimize {
+                    distance.lo > (best + budget).hi
+                } else {
+                    distance.hi < (best - budget).lo
+                };
+                Ok(!excluded)
             }
 
-            // If we are doing a directed minimization we can use the bounding
-            // box information to eliminate additional comparisons
+            // A directed answer is a difference whose projection Q = N x d x N
+            // lies within the local solver's 2 degrees of the direction; its value
+            // is |Q| (signed by Q . direction). Keep a branch unless no pair of box
+            // points can be admitted, or every admitted value is more than the query
+            // tolerance worse than the best answer.
             SolverOperation::DirectedMinimize
             | SolverOperation::SignedDirectedMinimize
             | SolverOperation::DirectedMaximize => {
-                // This optimization can be done by creating a plane through the
-                // center of one bounding box whose normal is perpendicular to the
-                // direction vector and seeing if the distance to the
-                // center of the other bounding box is greater than the sum of
-                // the two radii.
-                let v0 = opt_vector(s, 0)?;
-                let v1 = opt_vector(s, 1)?;
-                let plane_norm = v1.cross(v0);
-                let s1 = box1.sphere_bound();
-                let s2 = box2.sphere_bound();
-                let proj_pnt = point_project_to_plane(s2.center, s1.center, plane_norm);
-                let sum_radius = s1.radius + s2.radius;
-                if proj_pnt.distance_squared(s1.center) > sum_radius * sum_radius + EFF_ZERO_SQRT {
-                    return Ok(false); // These two nodes can not solve this directed minimization
+                let Some(range) = super::projected_metric::directed_box_range(
+                    box1,
+                    box2,
+                    opt_vector(s, 0)?,
+                    opt_vector(s, 1)?,
+                    2.0,
+                ) else {
+                    return Ok(true);
+                };
+                if !range.admissible {
+                    return Ok(false);
                 }
-
-                if s.operation == SolverOperation::SignedDirectedMinimize {
-                    let vec = proj_pnt - s1.center;
-                    let mut dist = vec.length();
-                    if vec.dot(v1) < 0.0 {
-                        dist = -dist;
+                let budget = Ivl::from(tol);
+                let excluded = match s.operation {
+                    SolverOperation::DirectedMinimize => {
+                        let best = Ivl::from(s.best_answer_so_far_sq).sqrt();
+                        range.distance.lo > (best + budget).hi
                     }
-                    let min_proj_dist = dist - s1.radius - s2.radius;
-                    if min_proj_dist * min_proj_dist.abs() > s.best_answer_so_far_sq {
-                        return Ok(false);
+                    SolverOperation::DirectedMaximize => {
+                        let best = Ivl::from(s.best_answer_so_far_sq).sqrt();
+                        range.distance.hi < (best - budget).lo
                     }
-                }
-
-                if s.operation == SolverOperation::DirectedMinimize {
-                    let min_proj_dist = proj_pnt.distance(s1.center) - s1.radius - s2.radius;
-                    if min_proj_dist > 0.0
-                        && min_proj_dist * min_proj_dist > s.best_answer_so_far_sq
-                    {
-                        return Ok(false);
+                    _ => {
+                        // The best is stored as value * |value|. The sign of a
+                        // value also flips with the operand order, so its lower
+                        // bound is -|Q| at most.
+                        let best_sq = s.best_answer_so_far_sq;
+                        let best = Ivl::from(best_sq.abs()).sqrt();
+                        let best = if best_sq < 0.0 {
+                            Ivl::new(-best.hi, -best.lo)
+                        } else {
+                            best
+                        };
+                        -range.distance.hi > (best + budget).hi
                     }
-                }
-
-                if s.operation == SolverOperation::DirectedMaximize {
-                    let max_proj_dist = proj_pnt.distance(s1.center) + s1.radius + s2.radius;
-                    if max_proj_dist * max_proj_dist < s.best_answer_so_far_sq {
-                        return Ok(false);
-                    }
-                }
-
-                Ok(true)
+                };
+                Ok(!excluded)
             }
 
             // Doing a ray firing - minimization of intersections along a vector.
@@ -757,6 +795,8 @@ impl<'t, 'a, O: SolutionObject + 't> TopologySolver<'t, 'a, O> {
     /// The body of [`TopologySolver::solve_trees`] once the local solver is in
     /// place.
     fn solve_trees_inner(&mut self, tree1: &'t Tree<O>, tree2: &'t Tree<O>) -> Result<()> {
+        self.kernel
+            .check_cancelled("intersect::topology_solver::TopologySolver::solve_trees")?;
         let s = &mut self.base;
         s.num_variables = 0;
         s.trees = [None; MAX_SOLVER_TREES];
@@ -812,6 +852,7 @@ impl<'t, 'a, O: SolutionObject + 't> TopologySolver<'t, 'a, O> {
         self.base.num_trees = 2;
 
         for id in list_ids {
+            self.kernel.check_cancelled(OP_TWO_TREES)?;
             let item = *tree1.list(id)?;
             object_tree.node_mut(node)?.bbox = item.bbox;
             let entry = object_tree.list_mut(list)?;
@@ -848,6 +889,8 @@ impl<'t, 'a, O: SolutionObject + 't> TopologySolver<'t, 'a, O> {
     /// longer exists).
     pub(super) fn restore_base(&mut self, s: GlobalSolver<'_, O>, tree2: &'t Tree<O>) {
         let GlobalSolver {
+            fixes,
+            cancel,
             operation,
             category,
             projected_operation,
@@ -865,6 +908,8 @@ impl<'t, 'a, O: SolutionObject + 't> TopologySolver<'t, 'a, O> {
             branches_visited,
         } = s;
         self.base = GlobalSolver {
+            fixes,
+            cancel,
             operation,
             category,
             projected_operation,
@@ -1038,9 +1083,9 @@ impl<'a, O: SolutionObject> LocalSolver<'a, O> {
         object2: Option<O>,
     ) -> Result<()> {
         match self.kind {
-            LocalSolverKind::Base | LocalSolverKind::Point | LocalSolverKind::Curve => {
-                Err(SolidError::sm_err(OP_BASE))
-            }
+            LocalSolverKind::Base | LocalSolverKind::Point | LocalSolverKind::Curve => Err(
+                SolidError::intersect(OP_BASE, IntersectFailure::AbstractLocalSolver),
+            ),
             LocalSolverKind::PointVertex => self.solve_point_vertex(ts, object1, object2),
             LocalSolverKind::VertexVertex => self.solve_vertex_vertex(ts, object1, object2),
             LocalSolverKind::PointCurve => self.solve_point_curve(k, ts, object1, object2),
@@ -1072,6 +1117,10 @@ impl<'a, O: SolutionObject> LocalSolver<'a, O> {
     /// `SmTLSPointVertex::SolveIt`: the distance (or ray, directed or projected
     /// measure) between the point and a vertex as a single-value solution with no
     /// variables.
+    ///
+    /// On [`SolverOperation::Rayfire`], ends its arm with the ray-snapped
+    /// `dist_sq = param * param` and `sign = 1.0` instead of repeating upstream's
+    /// missing `break;` fallthrough into `SM_SO_3D_SIGNED_DIRECTED_MINIMIZE` (`WR-62`).
     fn solve_point_vertex(
         &mut self,
         ts: &mut TopologySolver<'_, '_, O>,
@@ -1088,14 +1137,14 @@ impl<'a, O: SolutionObject> LocalSolver<'a, O> {
         let mut count = 0;
         let vertex;
         if self.swap_order {
-            vertex = object1.ok_or(SolidError::null_pointer(OP_PV))?;
+            vertex = object1.ok_or_else(|| no_object(OP_PV))?;
             push_object(&mut sol.objects, &mut count, Some(vertex));
             if self.point_vertex.is_some() {
                 // If the point represents a vertex then save it in list
                 push_object(&mut sol.objects, &mut count, self.point_vertex);
             }
         } else {
-            vertex = object2.ok_or(SolidError::null_pointer(OP_PV))?;
+            vertex = object2.ok_or_else(|| no_object(OP_PV))?;
             if self.point_vertex.is_some() {
                 // If the point represents a vertex then save it in list
                 push_object(&mut sol.objects, &mut count, self.point_vertex);
@@ -1141,36 +1190,35 @@ impl<'a, O: SolutionObject> LocalSolver<'a, O> {
 
         // switch on operation type to set dSign and dDistSq of Sol = dSign * sqrt(dDistSq)
         match op {
-            SolverOperation::Rayfire | SolverOperation::Signed3dDirectedMinimize => {
-                if op == SolverOperation::Rayfire {
-                    let ray = opt_vector(s, 0)?;
-                    let mut param = line_closest_point(self.point, ray, vertex_point);
-                    let tol = s.tolerance_3d + objects.vertex_tolerance(vertex)?;
-                    let scale = self.point.max_dimension();
+            SolverOperation::Rayfire => {
+                let ray = opt_vector(s, 0)?;
+                let mut param = line_closest_point(self.point, ray, vertex_point);
+                let tol = s.tolerance_3d + objects.vertex_tolerance(vertex)?;
+                let scale = self.point.max_dimension();
 
-                    // No answer if we are out of tol on wrong side of ray
-                    if param < -EFF_ZERO * scale {
-                        return Ok(());
-                    }
+                // No answer if we are out of tol on wrong side of ray
+                if param < -EFF_ZERO * scale {
+                    return Ok(());
+                }
 
-                    // When in tol on wrong side or ray - snap to end point
-                    if param < 0.0 {
-                        param = 0.0;
-                    }
+                // When in tol on wrong side or ray - snap to end point
+                if param < 0.0 {
+                    param = 0.0;
+                }
 
-                    let ray_pnt = self.point + param * ray;
-                    let dist_to_ray = ray_pnt.distance(vertex_point);
+                let ray_pnt = self.point + param * ray;
+                let dist_to_ray = ray_pnt.distance(vertex_point);
 
-                    // no answer - ray too from from vertex
-                    if dist_to_ray > tol {
-                        return Ok(());
-                    }
+                // no answer - ray too from from vertex
+                if dist_to_ray > tol {
+                    return Ok(());
+                }
 
-                    // (upstream sets dDistSq = dParam*dParam here; the fall
-                    // through below overwrites it)
-                } // end SM_SO_RAYFIRE (falls through)
+                // The following assumes that the ray vector is unitized
+                dist_sq = param * param;
+            }
 
-                // SM_SO_3D_SIGNED_DIRECTED_MINIMIZE
+            SolverOperation::Signed3dDirectedMinimize => {
                 let dir = opt_vector(s, 0)?;
                 let mut param = line_closest_point(self.point, dir, vertex_point);
                 let tol = s.tolerance_3d + objects.vertex_tolerance(vertex)?;
@@ -1494,14 +1542,14 @@ impl<'a, O: SolutionObject> LocalSolver<'a, O> {
         // we want we can switch the order.
         let surface;
         if self.swap_order {
-            surface = object1.ok_or(SolidError::null_pointer(OP_PF))?;
+            surface = object1.ok_or_else(|| no_object(OP_PF))?;
             push_object(&mut sol_objects, &mut count, Some(surface));
             if self.point_vertex.is_some() {
                 // If the point represents a vertex then save it in list
                 push_object(&mut sol_objects, &mut count, self.point_vertex);
             }
         } else {
-            surface = object2.ok_or(SolidError::null_pointer(OP_PF))?;
+            surface = object2.ok_or_else(|| no_object(OP_PF))?;
             if self.point_vertex.is_some() {
                 // If the point represents a vertex then save it in list
                 push_object(&mut sol_objects, &mut count, self.point_vertex);
@@ -1629,23 +1677,91 @@ impl<'a, O: SolutionObject> LocalSolver<'a, O> {
                 ts.add_sorted_solution(&sol, SortKey::BySolutionValue, true)?;
             } // end for each solution
         } else if ts.base.projected_operation {
-            let opt_vectors = ts.base.opt_vectors.clone();
-            let (trim_3d_curves, trim_uv_curves) =
-                face_silhouettes(ts.kernel, objects, face, &opt_vectors, tol)?;
-            // When we reach here there should be silhouette curves in sTrim3DCurves
-            // We can use these to do measurement to the surface.  Please note that
-            // the edges bounding the face would have already been measured.
-            for (curve, uv_curve) in trim_3d_curves.iter().zip(&trim_uv_curves) {
-                let mut sub: LocalSolver<'_, O> =
-                    LocalSolver::new(LocalSolverKind::PointCurve, self.swap_order, self.shape);
-                sub.curve_owner = Some(face);
-                sub.interval = curve.natural_interval();
-                sub.surface_curve = Some(uv_curve);
-                sub.point = self.point;
-                sub.point_vertex = self.point_vertex;
-                // (the temporary curve has no handle)
-                sub.point_curve(k, ts, curve, None)?;
+            let certified_maximum = op == SolverOperation::ProjectedMaximize
+                && ts.base.solution_requested == SolutionRequested::Single;
+            let before = certified_maximum.then(|| ts.base.clone());
+            // A two-tree traversal changes the query vertex between leaves.
+            // Its shared incumbent must not be remeasured against this vertex.
+            let mut vertex_solver = (certified_maximum && self.point_vertex.is_some()).then(|| {
+                TopologySolver::new(
+                    ts.kernel,
+                    objects,
+                    op,
+                    SolutionRequested::Single,
+                    tol,
+                    0.0,
+                    &ts.base.opt_vectors,
+                )
+            });
+            let result: Result<()> = (|| {
+                let current = vertex_solver.as_mut().unwrap_or(&mut *ts);
+                let opt_vectors = current.base.opt_vectors.clone();
+                if certified_maximum {
+                    let hints = projected_face_candidate_uv(
+                        current.kernel,
+                        objects,
+                        face,
+                        &opt_vectors,
+                        tol,
+                    )?;
+                    for (uv, value) in super::projected_bound::native_candidates(
+                        k,
+                        objects,
+                        face,
+                        self.point,
+                        &opt_vectors,
+                        &hints,
+                    )? {
+                        let mut sol = Solution::default();
+                        named(&mut sol);
+                        sol.solution_type = SolutionType::SingleValue;
+                        *sol.start.param_mut(0)? = uv.x;
+                        *sol.start.param_mut(1)? = uv.y;
+                        sol.start.solution_value = value;
+                        current.add_sorted_solution(&sol, SortKey::BySolutionValue, true)?;
+                    }
+                } else {
+                    let (trim_3d_curves, trim_uv_curves) =
+                        face_silhouettes(current.kernel, objects, face, &opt_vectors, tol)?;
+                    for (curve, uv_curve) in trim_3d_curves.iter().zip(&trim_uv_curves) {
+                        let mut sub: LocalSolver<'_, O> = LocalSolver::new(
+                            LocalSolverKind::PointCurve,
+                            self.swap_order,
+                            self.shape,
+                        );
+                        sub.curve_owner = Some(face);
+                        sub.interval = curve.natural_interval();
+                        sub.surface_curve = Some(uv_curve);
+                        sub.point = self.point;
+                        sub.point_vertex = self.point_vertex;
+                        sub.point_curve(k, current, curve, None)?;
+                    }
+                }
+                if certified_maximum {
+                    super::projected_bound::refine_candidate(
+                        k,
+                        objects,
+                        face,
+                        self.point,
+                        &mut current.base,
+                    )?;
+                    super::projected_bound::certify(k, objects, face, self.point, &current.base)?;
+                }
+                // The local vertex-face maximum has its own whole-face proof.
+                // Merge only afterward, preserving the global retention policy.
+                if let Some(vertex_solver) = &vertex_solver {
+                    for solution in vertex_solver.base.solutions.as_slice() {
+                        ts.add_sorted_solution(solution, SortKey::BySolutionValue, true)?;
+                    }
+                }
+                Ok(())
+            })();
+            if result.is_err() {
+                if let Some(before) = before {
+                    ts.base = before;
+                }
             }
+            result?;
         } else {
             let best = best_answer_so_far(&ts.base);
             let mut sign = 1.0;
@@ -1712,7 +1828,7 @@ impl<'a, O: SolutionObject> LocalSolver<'a, O> {
     ) -> Result<()> {
         let objects = ts.objects;
         let handle = if self.swap_order { object1 } else { object2 };
-        let handle = handle.ok_or(SolidError::null_pointer(OP_CE))?;
+        let handle = handle.ok_or_else(|| no_object(OP_CE))?;
 
         // Remove Composites - replaced Edge array with single curve Edge
         let edge = objects.curve_edge(handle)?;
@@ -1861,15 +1977,78 @@ impl<'a, O: SolutionObject> LocalSolver<'a, O> {
                     } else {
                         Some(&s.opt_vectors)
                     },
-                    requested: SolutionRequested::All,
+                    requested: if op == SolverOperation::ProjectedMaximize
+                        && s.solution_requested == SolutionRequested::Single
+                    {
+                        SolutionRequested::Single
+                    } else {
+                        SolutionRequested::All
+                    },
                 },
             )?
         };
+
+        // A face standing in for one of its silhouette curves (no edge of its
+        // own) is measured through that traced curve, so a certified Single
+        // maximum is a maximum over the curve, not yet over the face. Its
+        // answer stands only if the face point it names, evaluated on the
+        // face's own surface, measures the reported value to rounding of that
+        // measurement (#13678); a traced curve off the surface refuses.
+        let faces = if self.swap_order {
+            [
+                self.curve_face2.filter(|_| self.curve_edge2.is_none()),
+                self.curve_face.filter(|_| self.curve_edge.is_none()),
+            ]
+        } else {
+            [
+                self.curve_face.filter(|_| self.curve_edge.is_none()),
+                self.curve_face2.filter(|_| self.curve_edge2.is_none()),
+            ]
+        };
+        let attain = op == SolverOperation::ProjectedMaximize
+            && ts.base.solution_requested == SolutionRequested::Single
+            && faces.iter().any(Option::is_some);
+        let normal = ts.base.opt_vectors.first().copied();
 
         for found in solutions.as_slice() {
             let mut sol = *found;
             let t1 = sol.start.param(0)?;
             let t2 = sol.start.param(1)?;
+            if attain {
+                let mut native = [Point3::default(); 2];
+                for (((point, face), uv_curve), (curve, t)) in native
+                    .iter_mut()
+                    .zip(faces)
+                    .zip([uv_curve1, uv_curve2])
+                    .zip([(this, t1), (other, t2)])
+                {
+                    *point = match (face, uv_curve) {
+                        (Some(face), Some(uv_curve)) => {
+                            let uv = uv_curve.evaluate_point(k, t)?;
+                            objects
+                                .surface(objects.face_surface(face)?)?
+                                .evaluate_point(k, Point2::new(uv.x, uv.y))?
+                        }
+                        _ => curve.curve.evaluate_point(k, t)?,
+                    };
+                }
+                let [p1, p2] = native;
+                let normal =
+                    normal.ok_or(null_deref(OP_CC, "projected maximum without a normal"))?;
+                let measured = normal.cross(p1 - p2).cross(normal).length();
+                let reported = sol.start.solution_value;
+                // 8 ulps of the measured coordinates' scale, the frame test's
+                // convention (`from_parameters::axes`): rounding, not tolerance.
+                let scale = normal.dot(normal) * (p1.length() + p2.length());
+                // a NaN measurement does not attain
+                let attained = (reported - measured).abs() <= 8.0 * f64::EPSILON * scale;
+                if !attained {
+                    return Err(SolidError::Unsupported {
+                        operation: OP_CC,
+                        reason: "silhouette point does not measure its value on the surface",
+                    });
+                }
+            }
             sol.objects[0] = sol_objects[0];
             sol.objects[1] = sol_objects[1];
             sol.num_objects = count;
@@ -1945,13 +2124,25 @@ impl<'a, O: SolutionObject> LocalSolver<'a, O> {
 /// `CreateCurvesByTrimming` leaves on it; an adapter that resolves none returns
 /// [`SolidError::Unported`] for `SmFace::CreateCurvesByTrimming`. A trimmed UV curve
 /// that is not a B-spline (upstream caches it as NULL and `GetCopyOfCurves` fails
-/// on it) is `SM_ERR_NULL_POINTER`.
+/// on it) is a reviewed `Defect` that keeps upstream's `SM_ERR_NULL_POINTER`: the
+/// kernel builds every silhouette UV curve it trims as a B-spline.
 pub(super) fn face_silhouettes<O: SolutionObject>(
     k: &Kernel,
     objects: &dyn TopologyObjects<O>,
     face: O,
     opt_vectors: &[Vec3],
     tolerance_3d: f64,
+) -> Result<(Vec<Curve>, Vec<Curve>)> {
+    face_silhouettes_at_tolerance(k, objects, face, opt_vectors, tolerance_3d * 10.0)
+}
+
+/// Candidate construction shared with the existing pair-query silhouette path.
+fn face_silhouettes_at_tolerance<O: SolutionObject>(
+    k: &Kernel,
+    objects: &dyn TopologyObjects<O>,
+    face: O,
+    opt_vectors: &[Vec3],
+    approx_tol: f64,
 ) -> Result<(Vec<Curve>, Vec<Curve>)> {
     // locals and temporaries
     let surface = objects.face_surface(face)?;
@@ -1964,7 +2155,6 @@ pub(super) fn face_silhouettes<O: SolutionObject>(
         .first()
         .ok_or(null_deref(OP_FACE_SIL, "no view vector"))?;
 
-    let approx_tol = tolerance_3d * 10.0;
     let angle_tol = 20.0 * PI / 180.0;
     let key = AltCacheKey {
         vec: Some(view),
@@ -2037,7 +2227,17 @@ pub(super) fn face_silhouettes<O: SolutionObject>(
         .unwrap_or_default()
         .into_iter()
         .collect::<Option<Vec<Curve>>>()
-        .ok_or(SolidError::null_pointer(OP_FACE_SIL))?;
+        .ok_or_else(|| {
+            Failure::new(
+                OP_FACE_SIL,
+                IntersectFailure::Defect {
+                    why: "trimming the face's silhouettes left a piece with no B-spline UV \
+                          curve, though the kernel built every silhouette UV curve it trims",
+                },
+            )
+            .with_status(SM_ERR_NULL_POINTER)
+            .into_error()
+        })?;
 
     // Register trimmed curves and create copy by getting them again
     cache.add_curves_to_cache(
@@ -2062,8 +2262,52 @@ pub(super) fn face_silhouettes<O: SolutionObject>(
             copies.curves_3d.unwrap_or_default(),
             copies.curves_uv.unwrap_or_default(),
         )),
-        None => Err(SolidError::sm_err(OP_FACE_SIL)),
+        None => Err(SolidError::intersect(
+            OP_FACE_SIL,
+            IntersectFailure::Defect {
+                why: "the trimmed silhouettes are not in the face's cache, though they were \
+                      just added under the same tolerances and key",
+            },
+        )),
     }
+}
+
+/// Candidates for the certified single projected point/face maximum.
+fn projected_face_candidate_uv<O: SolutionObject>(
+    k: &Kernel,
+    objects: &dyn TopologyObjects<O>,
+    face: O,
+    opt_vectors: &[Vec3],
+    tolerance: f64,
+) -> Result<Vec<Curve>> {
+    let view = *opt_vectors
+        .first()
+        .ok_or(null_deref(OP_FACE_SIL, "no view vector"))?;
+    // The metric is |N x d x N|, whose operator norm is |N|^2.
+    // This only guides construction; the whole-domain check certifies the result.
+    let scale = view.length_squared();
+    let approx_tol = tolerance / scale.max(1.0);
+    if !scale.is_finite()
+        || !approx_tol.is_finite()
+        || approx_tol < 0.0
+        || (tolerance > 0.0 && approx_tol == 0.0)
+    {
+        return Err(SolidError::invalid_input(
+            OP_FACE_SIL,
+            "projection tracing tolerance is not representable",
+        ));
+    }
+    let (_, mut uv) = face_silhouettes_at_tolerance(k, objects, face, opt_vectors, approx_tol)?;
+    let domain = objects.face_uv_domain(face)?;
+    // A constrained maximum can lie on a trim even when no silhouette reaches
+    // it. Include the exact boundary independently of tree traversal order.
+    if let Some((b, f)) = objects.face_entity(face) {
+        if let Some(boundary) = super::projected_bound::exact_rectangle_boundary(k, b, f, &domain)?
+        {
+            uv.extend(boundary);
+        }
+    }
+    Ok(uv)
 }
 
 /// `pFace->GetSurface()->GlobalPointSolve(uv_domain, op, point, tol,
@@ -2242,6 +2486,8 @@ pub(super) fn face_point_classify<O: Copy>(
     match result {
         Err(
             e @ (SolidError::Unported { .. }
+            | SolidError::Cancelled { .. }
+            | SolidError::OutOfFuel { .. }
             | SolidError::InvalidInput { .. }
             | SolidError::PortInvariant { .. }
             | SolidError::PreparationRequired { .. }),
@@ -2282,7 +2528,7 @@ fn face_classifies_on_face<O: Copy>(
             "query.face_p1",
         ));
     };
-    let mut copy = b.clone();
+    let mut copy = b.clone_standing_for_self()?;
     let mut pc = PointClassification::<EntityRef>::new(tol);
     let mut classify = |tol: f64, pc: &mut PointClassification<EntityRef>| -> Result<bool> {
         match point_3d_classify(
@@ -2296,7 +2542,11 @@ fn face_classifies_on_face<O: Copy>(
             Point3dClassifyOptions::default(),
         ) {
             Ok(()) => Ok(true),
-            Err(e @ SolidError::Unported { .. }) => Err(e),
+            Err(
+                e @ (SolidError::Unported { .. }
+                | SolidError::Cancelled { .. }
+                | SolidError::OutOfFuel { .. }),
+            ) => Err(e),
             Err(_) => Ok(false),
         }
     };
@@ -2311,6 +2561,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::curve::line::{BoundedLineOptions, Line};
     use crate::geom::solution_array::ObjectKind;
+    use crate::math::det;
 
     /// Free-standing test objects: vertices `(point, tolerance)` and curves.
     #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2349,6 +2600,19 @@ pub(crate) mod tests {
     }
 
     impl TopologyObjects<Obj> for Scene {
+        fn object_zone_tol_3d(&self, k: &Kernel, object: Obj) -> Result<f64> {
+            let system = || zone_tol_3d(k, SmallTopoType::NormalSize);
+            match object {
+                Obj::Vertex(_) => self.vertex_tolerance(object),
+                Obj::Edge(_) => self.edge_tolerance(object),
+                Obj::Curve(..) => match self.curve_edge(object)? {
+                    Some(edge) => self.edge_tolerance(edge),
+                    None => Ok(system()),
+                },
+                Obj::Analytic(_) | Obj::Surface(_) => Ok(system()),
+                Obj::Face(_) => self.face_tolerance(object),
+            }
+        }
         fn shape_member_object(&self, member: ShapeMember) -> Result<Obj> {
             match member {
                 ShapeMember::Vertex((_, key)) => Ok(Obj::Vertex(key.index() as usize)),
@@ -2543,6 +2807,101 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn projected_box_culling_retains_answers_within_query_tolerance() {
+        let k = Kernel::default();
+        let sc = scene();
+        let origin = Extent3d::from_bounds(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        for (operation, sign) in [
+            (SolverOperation::ProjectedMinimize, 1.0),
+            (SolverOperation::ProjectedMaximize, -1.0),
+        ] {
+            let ts: TopologySolver<'_, '_, Obj> = TopologySolver::new(
+                &k,
+                &sc,
+                operation,
+                SolutionRequested::All,
+                1e-5,
+                1.0,
+                &[Vec3::new(0.0, 0.0, 2.0)],
+            );
+            // The double-cross metric scales a transverse distance by four.
+            for (offset, retained) in [(5e-6, true), (2e-5, false)] {
+                let x = (1.0 + sign * offset) / 4.0;
+                let point = Extent3d::from_bounds(x, 0.0, 0.0, x, 0.0, 0.0);
+                assert_eq!(ts.may_contain_answer(&origin, &point).unwrap(), retained);
+            }
+        }
+    }
+
+    #[test]
+    fn directed_culling_keeps_admissible_answers_and_culls_the_rest() {
+        // View normal Z, direction Y.
+        let k = Kernel::default();
+        let sc = scene();
+        let solver = |operation, best| -> TopologySolver<'_, '_, Obj> {
+            TopologySolver::new(
+                &k,
+                &sc,
+                operation,
+                SolutionRequested::All,
+                1e-5,
+                best,
+                &[Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 1.0, 0.0)],
+            )
+        };
+        let point = |x: f64, y: f64, z: f64| Extent3d::from_bounds(x, y, z, x, y, z);
+        let origin = point(0.0, 0.0, 0.0);
+        let ops = [
+            SolverOperation::DirectedMinimize,
+            SolverOperation::SignedDirectedMinimize,
+            SolverOperation::DirectedMaximize,
+        ];
+        for op in ops {
+            let best = if op == SolverOperation::DirectedMaximize {
+                0.0
+            } else {
+                1e6
+            };
+            let ts = solver(op, best);
+            // A directed answer at distance 10, along and against the direction,
+            // and one with a view-direction offset (z is projected away).
+            for target in [
+                point(0.0, 10.0, 0.0),
+                point(0.0, -10.0, 0.0),
+                point(0.0, 10.0, 5.0),
+            ] {
+                assert!(
+                    ts.may_contain_answer(&origin, &target).unwrap(),
+                    "{op:?} {target:?}"
+                );
+            }
+            // 1 degree off the direction is admitted; 45 degrees is not.
+            let one = 10.0 * det::tan(1.0_f64.to_radians());
+            assert!(ts
+                .may_contain_answer(&origin, &point(one, 10.0, 0.0))
+                .unwrap());
+            assert!(!ts
+                .may_contain_answer(&origin, &point(10.0, 10.0, 0.0))
+                .unwrap());
+        }
+        // Value bounds keep answers within tolerance and cull the rest.
+        let min = solver(SolverOperation::DirectedMinimize, 1.0);
+        assert!(min
+            .may_contain_answer(&origin, &point(0.0, 1.0 + 5e-6, 0.0))
+            .unwrap());
+        assert!(!min
+            .may_contain_answer(&origin, &point(0.0, 1.0 + 2e-5, 0.0))
+            .unwrap());
+        let max = solver(SolverOperation::DirectedMaximize, 1.0);
+        assert!(max
+            .may_contain_answer(&origin, &point(0.0, 1.0 - 5e-6, 0.0))
+            .unwrap());
+        assert!(!max
+            .may_contain_answer(&origin, &point(0.0, 1.0 - 2e-5, 0.0))
+            .unwrap());
+    }
+
+    #[test]
     fn point_vertex_minimize_adds_distance() {
         let k = Kernel::default();
         let sc = scene();
@@ -2580,15 +2939,23 @@ pub(crate) mod tests {
             &[],
         );
         let mut ls = LocalSolver::new(LocalSolverKind::Curve, false, None);
-        assert!(ls.solve_it(&k, &mut ts, None, None).is_err());
+        let e = ls.solve_it(&k, &mut ts, None, None).unwrap_err();
+        assert_eq!(e.upstream_status(), Some(crate::error::SM_ERR), "{e}");
+        assert_eq!(
+            e.intersect_failure(),
+            Some(&IntersectFailure::AbstractLocalSolver),
+            "{e}"
+        );
+        assert_eq!(e.kind(), crate::error::ErrorKind::Unsupported, "{e}");
         let mut ls = LocalSolver::new(LocalSolverKind::FaceFace, false, None);
-        assert!(matches!(
-            ls.solve_it(&k, &mut ts, None, None),
-            Err(SolidError::Upstream {
-                code: crate::error::SM_ERR_NULL_POINTER,
-                ..
-            })
-        ));
+        let e = ls.solve_it(&k, &mut ts, None, None).unwrap_err();
+        assert_eq!(e.upstream_status(), Some(SM_ERR_NULL_POINTER), "{e}");
+        assert_eq!(
+            e.intersect_failure(),
+            Some(&IntersectFailure::NoObjectToSolve),
+            "{e}"
+        );
+        assert_eq!(e.kind(), crate::error::ErrorKind::InvalidInput, "{e}");
     }
 
     #[test]
@@ -2686,5 +3053,382 @@ pub(crate) mod tests {
         assert_eq!(s.objects[1], Some(Obj::Edge(0)));
         assert!((s.start.solution_value - 4.0).abs() < 1e-12);
         assert!((s.start.parameters[0] - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn wr62_rayfire_vertex_just_behind_start_snaps_to_zero() {
+        let k = Kernel::default();
+
+        let behind_in_tol = 1.0 - 1.0e-13;
+        let raw_param = behind_in_tol - 1.0;
+        assert!(raw_param < 0.0);
+        assert!(raw_param >= -EFF_ZERO);
+
+        let sc = Scene {
+            vertices: vec![
+                (Vec3::new(behind_in_tol, 0.0, 0.0), 0.0),
+                (Vec3::new(1.0 - 1.0e-11, 0.0, 0.0), 0.0),
+                (Vec3::new(1.0, 0.0, 0.0), 0.0),
+                (Vec3::new(1000.0 - 8.0e-10, 5.0e-10, 0.0), 0.0),
+            ],
+            curves: Vec::new(),
+            edges: Vec::new(),
+        };
+        let ray = [Vec3::new(1.0, 0.0, 0.0)];
+
+        // PointVertex in both swap orders snaps in-tolerance behind-start vertices to +0.0.
+        for (swap, obj1, obj2) in [
+            (false, None, Some(Obj::Vertex(0))),
+            (true, Some(Obj::Vertex(0)), None),
+        ] {
+            let mut ts = TopologySolver::new(
+                &k,
+                &sc,
+                SolverOperation::Rayfire,
+                SolutionRequested::All,
+                1e-6,
+                BIG_DOUBLE,
+                &ray,
+            );
+            let mut ls = LocalSolver::new(LocalSolverKind::PointVertex, swap, None);
+            ls.set_point(Vec3::new(1.0, 0.0, 0.0));
+            ls.solve_it(&k, &mut ts, obj1, obj2).unwrap();
+            assert_eq!(ts.base.solutions.len(), 1);
+            let sol = ts.base.solutions.get(0).unwrap();
+            assert_eq!(sol.start.solution_value, 0.0);
+            assert!(sol.start.solution_value.is_sign_positive());
+            assert_eq!(sol.num_objects, 1);
+            assert_eq!(sol.objects[0], Some(Obj::Vertex(0)));
+        }
+
+        // VertexVertex inherits SmTLSPointVertex::SolveIt in both swap orders.
+        for (swap, obj1, obj2, expected_objs) in [
+            (
+                false,
+                Some(Obj::Vertex(2)),
+                Some(Obj::Vertex(0)),
+                [Some(Obj::Vertex(2)), Some(Obj::Vertex(0))],
+            ),
+            (
+                true,
+                Some(Obj::Vertex(0)),
+                Some(Obj::Vertex(2)),
+                [Some(Obj::Vertex(0)), Some(Obj::Vertex(2))],
+            ),
+        ] {
+            let mut ts = TopologySolver::new(
+                &k,
+                &sc,
+                SolverOperation::Rayfire,
+                SolutionRequested::All,
+                1e-6,
+                BIG_DOUBLE,
+                &ray,
+            );
+            let mut ls = LocalSolver::new(LocalSolverKind::VertexVertex, swap, None);
+            ls.solve_it(&k, &mut ts, obj1, obj2).unwrap();
+            assert_eq!(ts.base.solutions.len(), 1);
+            let sol = ts.base.solutions.get(0).unwrap();
+            assert_eq!(sol.start.solution_value, 0.0);
+            assert!(sol.start.solution_value.is_sign_positive());
+            assert_eq!(sol.num_objects, 2);
+            assert_eq!([sol.objects[0], sol.objects[1]], expected_objs);
+        }
+
+        // Scaled origin (scale = 1000.0 => -EFF_ZERO * scale = -1e-9) with lateral offset
+        // within tol = 1e-9 from the snapped start point (1000, 0, 0).
+        let mut ts = TopologySolver::new(
+            &k,
+            &sc,
+            SolverOperation::Rayfire,
+            SolutionRequested::All,
+            1.0e-9,
+            BIG_DOUBLE,
+            &ray,
+        );
+        let mut ls = LocalSolver::new(LocalSolverKind::PointVertex, false, None);
+        ls.set_point(Vec3::new(1000.0, 0.0, 0.0));
+        ls.solve_it(&k, &mut ts, None, Some(Obj::Vertex(3)))
+            .unwrap();
+        assert_eq!(ts.base.solutions.len(), 1);
+        let sol = ts.base.solutions.get(0).unwrap();
+        assert_eq!(sol.start.solution_value, 0.0);
+        assert!(sol.start.solution_value.is_sign_positive());
+
+        // Vertex outside -EFF_ZERO * scale behind start is rejected.
+        let mut ts = TopologySolver::new(
+            &k,
+            &sc,
+            SolverOperation::Rayfire,
+            SolutionRequested::All,
+            1e-6,
+            BIG_DOUBLE,
+            &ray,
+        );
+        let mut ls = LocalSolver::new(LocalSolverKind::PointVertex, false, None);
+        ls.set_point(Vec3::new(1.0, 0.0, 0.0));
+        ls.solve_it(&k, &mut ts, None, Some(Obj::Vertex(1)))
+            .unwrap();
+        assert!(ts.base.solutions.is_empty());
+    }
+
+    #[test]
+    fn wr62_rayfire_swapped_order_keeps_positive_distance() {
+        use crate::geom::tree::NodeGeomType;
+
+        let k = Kernel::default();
+        let behind = 1.0 - 1.0e-13;
+        let sc = Scene {
+            vertices: vec![
+                (Vec3::new(1.0, 0.0, 0.0), 0.0),
+                (Vec3::new(3.0, 0.0, 0.0), 0.0),
+                (Vec3::new(6.0, 0.0, 0.0), 0.0),
+                (Vec3::new(behind, 0.0, 0.0), 0.0),
+            ],
+            curves: Vec::new(),
+            edges: Vec::new(),
+        };
+        let ray = [Vec3::new(1.0, 0.0, 0.0)];
+
+        // Single vertex ahead at distance +2.0 keeps +2.0 in both swap orders.
+        for swap in [false, true] {
+            let (pv1, pv2) = if swap {
+                (Some(Obj::Vertex(1)), None)
+            } else {
+                (None, Some(Obj::Vertex(1)))
+            };
+            let mut ts = TopologySolver::new(
+                &k,
+                &sc,
+                SolverOperation::Rayfire,
+                SolutionRequested::All,
+                1e-6,
+                BIG_DOUBLE,
+                &ray,
+            );
+            let mut ls = LocalSolver::new(LocalSolverKind::PointVertex, swap, None);
+            ls.set_point(Vec3::new(1.0, 0.0, 0.0));
+            ls.solve_it(&k, &mut ts, pv1, pv2).unwrap();
+            assert_eq!(ts.base.solutions.len(), 1);
+            let sol = ts.base.solutions.get(0).unwrap();
+            assert_eq!(sol.start.solution_value, 2.0);
+            assert_eq!(sol.objects[0], Some(Obj::Vertex(1)));
+
+            let (vv1, vv2, expected_objs) = if swap {
+                (
+                    Some(Obj::Vertex(1)),
+                    Some(Obj::Vertex(0)),
+                    [Some(Obj::Vertex(1)), Some(Obj::Vertex(0))],
+                )
+            } else {
+                (
+                    Some(Obj::Vertex(0)),
+                    Some(Obj::Vertex(1)),
+                    [Some(Obj::Vertex(0)), Some(Obj::Vertex(1))],
+                )
+            };
+            let mut ts = TopologySolver::new(
+                &k,
+                &sc,
+                SolverOperation::Rayfire,
+                SolutionRequested::All,
+                1e-6,
+                BIG_DOUBLE,
+                &ray,
+            );
+            let mut ls = LocalSolver::new(LocalSolverKind::VertexVertex, swap, None);
+            ls.solve_it(&k, &mut ts, vv1, vv2).unwrap();
+            assert_eq!(ts.base.solutions.len(), 1);
+            let sol = ts.base.solutions.get(0).unwrap();
+            assert_eq!(sol.start.solution_value, 2.0);
+            assert_eq!([sol.objects[0], sol.objects[1]], expected_objs);
+        }
+
+        // Two vertices ahead at distances 2.0 (Vertex(1)) and 5.0 (Vertex(2)) solved in
+        // swapped order keep +2.0 and cull +5.0 instead of negating and evicting the nearer hit.
+        let mut ts = TopologySolver::new(
+            &k,
+            &sc,
+            SolverOperation::Rayfire,
+            SolutionRequested::All,
+            1e-6,
+            BIG_DOUBLE,
+            &ray,
+        );
+        let mut ls = LocalSolver::new(LocalSolverKind::PointVertex, true, None);
+        ls.set_point(Vec3::new(1.0, 0.0, 0.0));
+        ls.solve_it(&k, &mut ts, Some(Obj::Vertex(1)), None)
+            .unwrap();
+        ls.solve_it(&k, &mut ts, Some(Obj::Vertex(2)), None)
+            .unwrap();
+        assert_eq!(ts.base.solutions.len(), 1);
+        let sol = ts.base.solutions.get(0).unwrap();
+        assert_eq!(sol.start.solution_value, 2.0);
+        assert_eq!(sol.objects[0], Some(Obj::Vertex(1)));
+
+        // End-to-end solve_trees on Rayfire with a behind-within-EFF_ZERO vertex and a
+        // farther vertex ahead snaps the nearest hit to 0.0 and culls the rest.
+        let query = Tree::from_point(Vec3::new(1.0, 0.0, 0.0), 0.0, true);
+        let mut vtree = Tree::new_spatial(&Extent3d::from_bounds(0.0, -1.0, -1.0, 7.0, 1.0, 1.0));
+        vtree
+            .add_to_spatial_tree(
+                &Extent3d::from_bounds(behind, 0.0, 0.0, behind, 0.0, 0.0),
+                Some(Obj::Vertex(3)),
+                NodeGeomType::Default,
+            )
+            .unwrap();
+        vtree
+            .add_to_spatial_tree(
+                &Extent3d::from_bounds(3.0, 0.0, 0.0, 3.0, 0.0, 0.0),
+                Some(Obj::Vertex(1)),
+                NodeGeomType::Default,
+            )
+            .unwrap();
+        let mut ts = TopologySolver::new(
+            &k,
+            &sc,
+            SolverOperation::Rayfire,
+            SolutionRequested::All,
+            1e-6,
+            BIG_DOUBLE,
+            &ray,
+        );
+        let mut ls = LocalSolver::new(LocalSolverKind::PointVertex, false, None);
+        ls.set_point(Vec3::new(1.0, 0.0, 0.0));
+        ts.solve_trees(&query, &vtree, &mut ls).unwrap();
+        assert_eq!(ts.base.solutions.len(), 1);
+        let sol = ts.base.solutions.get(0).unwrap();
+        assert_eq!(sol.start.solution_value, 0.0);
+        assert!(sol.start.solution_value.is_sign_positive());
+        assert_eq!(sol.objects[0], Some(Obj::Vertex(3)));
+    }
+
+    #[test]
+    fn wr62_non_rayfire_operations_unchanged() {
+        let k = Kernel::default();
+        let sc = Scene {
+            vertices: vec![
+                (Vec3::new(5.0, 0.0, 0.0), 0.0),
+                (Vec3::new(-2.0, 0.0, 0.0), 0.0),
+                (Vec3::new(1.0, 0.0, 0.0), 0.0),
+            ],
+            curves: Vec::new(),
+            edges: Vec::new(),
+        };
+        let dir_x = [Vec3::new(1.0, 0.0, 0.0)];
+        let proj_vecs = [Vec3::new(0.0, 0.0, 1.0), Vec3::new(1.0, 0.0, 0.0)];
+
+        // Signed3dDirectedMinimize still preserves signed distances and swap negation.
+        for (vi, swap, expected) in [
+            (0, false, 4.0),
+            (0, true, -4.0),
+            (1, false, -3.0),
+            (1, true, 3.0),
+        ] {
+            let (obj1, obj2) = if swap {
+                (Some(Obj::Vertex(vi)), Some(Obj::Vertex(2)))
+            } else {
+                (Some(Obj::Vertex(2)), Some(Obj::Vertex(vi)))
+            };
+            let mut ts = TopologySolver::new(
+                &k,
+                &sc,
+                SolverOperation::Signed3dDirectedMinimize,
+                SolutionRequested::All,
+                1e-6,
+                BIG_DOUBLE,
+                &dir_x,
+            );
+            let mut ls = LocalSolver::new(LocalSolverKind::VertexVertex, swap, None);
+            ls.solve_it(&k, &mut ts, obj1, obj2).unwrap();
+            assert_eq!(ts.base.solutions.len(), 1);
+            assert_eq!(
+                ts.base.solutions.get(0).unwrap().start.solution_value,
+                expected
+            );
+        }
+
+        // Minimize, Maximize, Intersect, AtDistance, and SignedDirectedMinimize remain exact.
+        let empty_vecs: &[Vec3] = &[];
+        for (op, best, at_dist, vecs, pt, vi, swap, expected) in [
+            (
+                SolverOperation::Minimize,
+                BIG_DOUBLE,
+                None,
+                empty_vecs,
+                Vec3::new(1.0, 0.0, 0.0),
+                0,
+                false,
+                4.0,
+            ),
+            (
+                SolverOperation::Maximize,
+                0.0,
+                None,
+                empty_vecs,
+                Vec3::new(1.0, 0.0, 0.0),
+                0,
+                false,
+                4.0,
+            ),
+            (
+                SolverOperation::Intersect,
+                BIG_DOUBLE,
+                None,
+                empty_vecs,
+                Vec3::new(5.0, 0.0, 0.0),
+                0,
+                false,
+                0.0,
+            ),
+            (
+                SolverOperation::AtDistance,
+                BIG_DOUBLE,
+                Some(4.0),
+                empty_vecs,
+                Vec3::new(1.0, 0.0, 0.0),
+                0,
+                false,
+                4.0,
+            ),
+            (
+                SolverOperation::SignedDirectedMinimize,
+                BIG_DOUBLE,
+                None,
+                proj_vecs.as_slice(),
+                Vec3::new(1.0, 0.0, 0.0),
+                0,
+                false,
+                -4.0,
+            ),
+            (
+                SolverOperation::SignedDirectedMinimize,
+                BIG_DOUBLE,
+                None,
+                proj_vecs.as_slice(),
+                Vec3::new(1.0, 0.0, 0.0),
+                0,
+                true,
+                4.0,
+            ),
+        ] {
+            let mut ts = TopologySolver::new(&k, &sc, op, SolutionRequested::All, 1e-6, best, vecs);
+            if let Some(d) = at_dist {
+                ts.base.set_at_distance(d);
+            }
+            let mut ls = LocalSolver::new(LocalSolverKind::PointVertex, swap, None);
+            ls.set_point(pt);
+            let (o1, o2) = if swap {
+                (Some(Obj::Vertex(vi)), None)
+            } else {
+                (None, Some(Obj::Vertex(vi)))
+            };
+            ls.solve_it(&k, &mut ts, o1, o2).unwrap();
+            assert_eq!(ts.base.solutions.len(), 1);
+            assert_eq!(
+                ts.base.solutions.get(0).unwrap().start.solution_value,
+                expected
+            );
+        }
     }
 }

@@ -13,7 +13,7 @@
 //!
 //! Deviations:
 //! - The output surface `surQ` and the memory stacks become the return value; errors
-//!   are [`SolidError::Nlib`] values with the upstream `NL_*_ERR` number instead of a
+//!   are [`SolidError::Failed`] values (a [`NurbsFailure`] reason) with the upstream `NL_*_ERR` number instead of a
 //!   flag plus the global `NL_ERROR` record. The `par` flag is
 //!   [`OffsetParam`] (shared with [`Curve::offset_pt_sampling`]).
 //! - Upstream ignores the error of two `N_SrfEvalPtPtDerivNormalFast` calls (the
@@ -39,8 +39,10 @@
 //!   With inherited parameters, fits are checked on cell edges and centers and
 //!   refined for at most 24 iterations, still within the 10000-point grid budget;
 //!   exhausting either bound returns an error instead of an unchecked surface.
+//! - Cancellation: `offset_cancellable` (crate-private) passes a cancel token (#2136, #2372) to its profile offsets; `offset` and `offset_with` pass none.
 
-use crate::error::{NlibCode, Result, SolidError};
+use crate::error::{nurbs::NurbsFailure, Result, SolidError};
+use crate::math::det;
 use crate::math::{max2, Vec3};
 use crate::nurbs::crv_basic::{ConicType, Curve};
 use crate::nurbs::crv_fit::p1::interp_knot_vector;
@@ -249,7 +251,7 @@ impl Surface {
     /// [`Surface::eval_pt_deriv_normal_fast`], [`Curve::offset_pt_sampling`], the
     /// surface constructors, [`decompose_to_bez`], [`offset_get_max_deriv`],
     /// [`grid_pts_normals`], the fitting routines and [`remove_all_knots`];
-    /// [`NlibCode::Numerical`] when `1 / tol` is not computable;
+    /// [`NurbsFailure::Numerical`] when `1 / tol` is not computable;
     /// [`SolidError::InvalidInput`] where upstream's behaviour is undefined (see the
     /// module docs).
     pub fn offset(
@@ -275,6 +277,28 @@ impl Surface {
         eps: f64,
         tol: f64,
         options: OffsetOptions,
+    ) -> Result<Surface> {
+        self.offset_cancellable(d, pp, qq, par, eps, tol, options, None)
+    }
+
+    /// [`Surface::offset_with`] whose profile offsets poll `cancel` (#2136, #2372)
+    /// ([`Curve::offset_pt_sampling`]'s sample and knot removal loops) and return
+    /// `Cancelled` once it fires; `None`, or a token that never fires, changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Surface::offset_with`]; `Cancelled` when `cancel` fires.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn offset_cancellable(
+        &self,
+        d: f64,
+        pp: usize,
+        qq: usize,
+        par: OffsetParam,
+        eps: f64,
+        tol: f64,
+        options: OffsetOptions,
+        cancel: Option<&crate::kernel::CancelToken>,
     ) -> Result<Surface> {
         // Get surface type.
         let st = self.surface_type(eps)?;
@@ -349,7 +373,8 @@ impl Surface {
                 cc = -cc;
             }
 
-            let mut cur_p = cur_a.offset_pt_sampling(cc, d, pq, false, par, tol)?;
+            let mut cur_p =
+                cur_a.offset_pt_sampling_cancellable(cc, d, pq, false, par, tol, cancel)?;
             let sur_q = revolved_srf(&mut cur_p, aa, bb, st.al, ConicType::Quadratic)?;
             return orient(sur_q, np);
         }
@@ -381,8 +406,9 @@ impl Surface {
                     let dot = np.dot(cross);
                     let nn = if dot < 0.0 { -nn } else { nn };
 
-                    let mut cur_p = cur_a.offset_pt_sampling(nn, d, pq, false, par, tol)?;
-                    let dir = dir.ok_or(SolidError::nlib(OP, NlibCode::Call))?;
+                    let mut cur_p =
+                        cur_a.offset_pt_sampling_cancellable(nn, d, pq, false, par, tol, cancel)?;
+                    let dir = dir.ok_or_else(|| SolidError::nurbs(OP, NurbsFailure::CallFailed))?;
                     let sur_q = extrude_crv(&mut cur_p, aa, st.r1, dir)?;
                     let mut sur_q = orient(sur_q, np)?;
                     if options.normalize_extrusion_direction && par == OffsetParam::Inherited {
@@ -423,11 +449,11 @@ impl Surface {
         let exp = if pp == 1 || qq == 1 { 0.5 } else { 0.34 };
 
         if float_op_is_bad(1.0, tol, FloatOp::Division) {
-            return Err(SolidError::nlib(OP, NlibCode::Numerical));
+            return Err(SolidError::nurbs(OP, NurbsFailure::Numerical));
         }
 
         let mut f1 = 1.0 / tol;
-        f1 = f1.powf(exp);
+        f1 = det::powf(f1, exp);
         let pq = pp.max(qq);
         let f2 = 2.0 * pq as f64;
 
@@ -701,7 +727,7 @@ impl Surface {
                 let actual = fit.eval(u, v, Side::Left, Side::Left)?;
                 let error = (actual - target).length();
                 if !error.is_finite() {
-                    return Err(SolidError::nlib(OP, NlibCode::Numerical));
+                    return Err(SolidError::nurbs(OP, NurbsFailure::Numerical));
                 }
                 Ok(error > 0.5 * tol)
             };
@@ -710,7 +736,7 @@ impl Surface {
             for &uu in &u {
                 for &vv in &v {
                     if inaccurate(uu, vv)? {
-                        return Err(SolidError::nlib(OP, NlibCode::Numerical));
+                        return Err(SolidError::nurbs(OP, NurbsFailure::Numerical));
                     }
                 }
             }
@@ -1012,7 +1038,7 @@ mod tests {
         let s = grid(5, 5, |x, y| 300.0 * (x * x - y * y) + 100.0 * x * y);
         let tol: f64 = 1e-4;
         // The sample count of some patch exceeds `slm`.
-        let f1 = (1.0 / tol).powf(0.34);
+        let f1 = det::powf(1.0 / tol, 0.34);
         let big = decompose_to_bez(&s).unwrap().iter().flatten().any(|b| {
             let mut b = b.clone();
             b.reparam_to_interval(UNIT_SQUARE, Direction::UV).unwrap();
@@ -1033,10 +1059,7 @@ mod tests {
         let e = s.offset(0.1, 3, 3, OffsetParam::Inherited, 1e-6, 0.0);
         assert!(matches!(
             e,
-            Err(SolidError::Nlib {
-                code: NlibCode::Numerical,
-                ..
-            })
+            Err(ref e) if matches!(e.nurbs_failure(), Some(NurbsFailure::Numerical))
         ));
     }
 

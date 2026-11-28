@@ -12,6 +12,7 @@ pub mod names;
 pub mod ops;
 pub mod profile;
 pub mod query;
+mod stack;
 pub mod tess;
 
 pub use engine::engine;

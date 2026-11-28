@@ -13,9 +13,9 @@
 //! | [`SolutionRequested`]                        | `SmSolutionRequestedType`                        |
 //! | [`SolutionPairType`], [`PreferredSolution`]  | `SmSolutionPairType`, `IdenticalSolutions`' `pPreferredSol` |
 //! | [`Branch`]                                   | `SmTreeNode* apBranch[SM_GS_MAX_TREES]`          |
-//! | [`GlobalSolver`], [`GlobalSolver::new`]      | `SmGlobalSolver`, `SmGlobalSolver()`             |
-//! | [`GlobalSolver::with_tree`]                  | `SmGlobalSolver(SmTree*, ULONG)`                 |
-//! | [`GlobalSolver::with_trees`]                 | `SmGlobalSolver(SmTree*, SmTree*, ULONG)`        |
+//! | [`GlobalSolver`], [`GlobalSolver::new`], [`GlobalSolver::new_with_kernel`] | `SmGlobalSolver`, `SmGlobalSolver()` |
+//! | [`GlobalSolver::with_tree`], [`GlobalSolver::with_tree_and_kernel`] | `SmGlobalSolver(SmTree*, ULONG)` |
+//! | [`GlobalSolver::with_trees`], [`GlobalSolver::with_trees_and_kernel`] | `SmGlobalSolver(SmTree*, SmTree*, ULONG)` |
 //! | `Drop` (implicit)                            | `~SmGlobalSolver`                                |
 //! | [`GlobalSolver::solver_operation`]           | `GetSolverOperationType`                         |
 //! | [`GlobalSolver::opt_vector`]                 | `GetOptVector`                                   |
@@ -35,6 +35,18 @@
 //! | [`GlobalSolver::identical_solutions_in`]     | `SmGlobalSolver::IdenticalSolutions` (object domains read through a caller's resolver) |
 //!
 //! Deviations:
+//! - **Projected extrema bounds.** Sphere bounds use the same
+//!   `|N x V x N|` metric as the point objective: physical projected distances
+//!   and radii scale by `N . N`, with tolerance added in objective units. A zero
+//!   normal or nonfinite bound cannot certify exclusion and does not cull.
+//!   The C++ compares unscaled distances (WR-764).
+//! - WR-21 (#2155): [`GlobalSolver::identical_solutions_in`] prefers the larger
+//!   `start.solution_value` when [`GlobalSolver::operation`] is `SM_SO_MAXIMIZE`,
+//!   `SM_SO_DIRECTED_MAXIMIZE` or `SM_SO_PROJECTED_MAXIMIZE` (upstream always takes
+//!   the smaller, `<`).
+//! - WR-608 (#525): each sphere's own radius vectors are projected about its own
+//!   center (upstream offsets the second centre by the first radius and projects
+//!   relative to the first centre).
 //! - **Virtual methods.** Derived solvers (curve/curve, surface/surface, ...)
 //!   implement [`GlobalSolve`] and override its hooks; the base behaviour lives
 //!   in inherent methods of [`GlobalSolver`] (and [`subdivide`]) so an override
@@ -53,12 +65,18 @@
 //!   the solve and back out afterwards (also on error), so solutions added
 //!   after `SolveIt` returns go to the solver's own array instead of the
 //!   caller's.
+//! - **Contact.** A duplicate `AddSortedSolution` drops leaves the solution it keeps
+//!   with the [`Contact::merged`](crate::geom::solution_array::Contact::merged) of both,
+//!   and a range `sm_CombineMinMax` keeps, makes
+//!   or cuts takes the [`Contact::absorbed`](crate::geom::solution_array::Contact::absorbed)
+//!   of the two (unclassified only when both
+//!   are): the contact of a point is not that of a stretch.
 //! - **Optional vectors** are copied into the solver (upstream keeps the
 //!   caller's pointer).
 //! - **Errors.** `AddSortedSolution` returns `Result` because the solution
 //!   queries it makes can fail (counts past the fixed arrays, calls into
 //!   unported geometry). `FindBestSubdivisionNode`'s `SM_ERR` is
-//!   [`SolidError::Upstream`] with code `1001`.
+//!   [`GeomFailure`](crate::error::geom::GeomFailure) with code `1001`.
 //! - **Recursion bound.** [`GlobalSolve::solve_it`] first checks the trees
 //!   ([`GlobalSolver::check_solve_depth`]): cyclic child links (unbounded
 //!   recursion upstream) or trees whose heights add up to more than
@@ -99,12 +117,13 @@
 //!   owner object returns [`SolidError::Unported`] (see the `UNPORTED` marker).
 
 use crate::curve::crv_on_surf::CrvOnSurf;
+use crate::error::geom::GeomFailure;
 use crate::error::{Result, SolidError};
 use crate::geom::extent3d::Extent3d;
 use crate::geom::geom_utility::p1::{line_closest_point, point_project_to_plane};
 use crate::geom::solution_array::{
-    EndClass, OwnDomains, ParameterDomains, Solution, SolutionArray, SolutionObject, SolutionType,
-    SortKey,
+    Contact, EndClass, OwnDomains, ParameterDomains, Solution, SolutionArray, SolutionObject,
+    SolutionType, SortKey,
 };
 use crate::geom::tol::is_zero;
 use crate::geom::tree::{AuxDataType, NodeData, NodeId, Tree, TreeNode};
@@ -444,6 +463,10 @@ pub fn resolve_object_zone_tol_3d<O>(
 /// The state of a global solve (`SmGlobalSolver`'s data members).
 #[derive(Debug, Clone)]
 pub struct GlobalSolver<'t, O> {
+    /// Opt-in upstream corrections, copied from the operation's kernel.
+    pub fixes: crate::kernel::UpstreamFixes,
+    /// Cooperative cancellation token copied from the operation's kernel.
+    pub cancel: Option<crate::kernel::CancelToken>,
     /// `m_eSolverOperation`: behaviour of the local solves.
     pub operation: SolverOperation,
     /// `m_eOperationCategory`: summary of [`GlobalSolver::operation`], set by
@@ -557,6 +580,8 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            fixes: crate::kernel::UpstreamFixes::default(),
+            cancel: None,
             operation: SolverOperation::Intersect,
             category: OperationCategory::Other,
             projected_operation: false,
@@ -597,6 +622,41 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
         s.trees[0] = Some(tree1);
         s.trees[1] = Some(tree2);
         s.tolerance_3d = 0.0;
+        s
+    }
+
+    /// [`GlobalSolver::new`] with [`GlobalSolver::fixes`] and [`GlobalSolver::cancel`]
+    /// copied from `k`.
+    #[must_use]
+    pub fn new_with_kernel(k: &Kernel) -> Self {
+        let mut s = Self::new();
+        s.fixes = k.fixes;
+        s.cancel.clone_from(&k.cancel);
+        s
+    }
+
+    /// [`GlobalSolver::with_tree`] with [`GlobalSolver::fixes`] and
+    /// [`GlobalSolver::cancel`] copied from `k`.
+    #[must_use]
+    pub fn with_tree_and_kernel(k: &Kernel, tree: &'t Tree<O>, num_variables: usize) -> Self {
+        let mut s = Self::with_tree(tree, num_variables);
+        s.fixes = k.fixes;
+        s.cancel.clone_from(&k.cancel);
+        s
+    }
+
+    /// [`GlobalSolver::with_trees`] with [`GlobalSolver::fixes`] and
+    /// [`GlobalSolver::cancel`] copied from `k`.
+    #[must_use]
+    pub fn with_trees_and_kernel(
+        k: &Kernel,
+        tree1: &'t Tree<O>,
+        tree2: &'t Tree<O>,
+        num_variables: usize,
+    ) -> Self {
+        let mut s = Self::with_trees(tree1, tree2, num_variables);
+        s.fixes = k.fixes;
+        s.cancel.clone_from(&k.cancel);
         s
     }
 
@@ -713,7 +773,7 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
             .get(index)
             .copied()
             .flatten()
-            .ok_or(null_node("geom::global_solver::GlobalSolver::tree"))
+            .ok_or_else(|| null_node("geom::global_solver::GlobalSolver::tree"))
     }
 
     /// The node of `branch` in tree `index` (`apBranch[index]`).
@@ -723,9 +783,23 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
     /// [`SolidError::InvalidInput`] for a null slot or tree, or a node id the
     /// tree does not hold.
     pub fn branch_node(&self, branch: &Branch, index: usize) -> Result<&'t TreeNode<O>> {
+        Ok(self.branch_entry(branch, index)?.1)
+    }
+
+    /// The id and the node of `branch` in tree `index` (`apBranch[index]`), for a caller
+    /// that reads both.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`GlobalSolver::branch_node`].
+    pub fn branch_entry(&self, branch: &Branch, index: usize) -> Result<(NodeId, &'t TreeNode<O>)> {
         const OP: &str = "geom::global_solver::GlobalSolver::branch_node";
-        let id = branch.get(index).copied().flatten().ok_or(null_node(OP))?;
-        self.tree(index)?.node(id)
+        let id = branch
+            .get(index)
+            .copied()
+            .flatten()
+            .ok_or_else(|| null_node(OP))?;
+        Ok((id, self.tree(index)?.node(id)?))
     }
 
     /// The bounding box of `branch`'s node in tree `index`
@@ -739,7 +813,7 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
         const OP: &str = "geom::global_solver::GlobalSolver::child";
         let node = self.branch_node(branch, index)?;
         let id = if second { node.child2 } else { node.child1 };
-        self.tree(index)?.node(id.ok_or(null_node(OP))?)
+        self.tree(index)?.node(id.ok_or_else(|| null_node(OP))?)
     }
 
     /// `SmGlobalSolver::BranchMayContainAnswers`: false when the node boxes of
@@ -910,6 +984,39 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
         let mut sph1_radius = s1.radius;
         let mut sph2_radius = s2.radius;
 
+        if matches!(
+            self.operation,
+            SolverOperation::ProjectedMinimize | SolverOperation::ProjectedMaximize
+        ) {
+            // The objective is |N x V x N| = (N . N) |P(V)|, whereas
+            // point_project_to_plane computes the unscaled orthogonal P(V).
+            // Its linear map sends a sphere of radius r inside radius r*(N.N).
+            // Compare bounds and incumbents in the same objective units.
+            let normal = self.opt_vector(0)?;
+            let scale = normal.dot(normal);
+            if scale <= 0.0 || !scale.is_finite() {
+                return Ok(true);
+            }
+            let projected = point_project_to_plane(sph2_center, sph1_center, normal);
+            let center_distance = sph1_center.distance(projected) * scale;
+            let first_radius = sph1_radius * scale + tol;
+            let second_radius = sph2_radius * scale;
+            let bound = if self.operation == SolverOperation::ProjectedMinimize {
+                center_distance - first_radius - second_radius
+            } else {
+                center_distance + first_radius + second_radius
+            };
+            if !bound.is_finite() {
+                return Ok(true);
+            }
+            let excluded = if self.operation == SolverOperation::ProjectedMinimize {
+                bound > 0.0 && bound * bound > self.best_answer_so_far_sq
+            } else {
+                bound * bound < self.best_answer_so_far_sq
+            };
+            return Ok(!excluded);
+        }
+
         // Factor 3D tolerance by adding it to just one sphere radii.
         sph1_radius += tol;
 
@@ -942,27 +1049,15 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
             let mut dir1 = eye_vec1.cross(v1).unitize_or_z(); // vec perp to eyevec and view norm
             let mut dir2 = dir1.cross(eye_vec1).unitize_or_z(); // vec perp to eyevec in view normal plane
             sph1_radius -= tol;
-            let new_rad1_max_sq = max_projected_radius_sq(
-                sph1_center,
-                sph1_center,
-                [dir1, dir2],
-                sph1_radius,
-                [v0, v1, v2],
-            );
+            let new_rad1_max_sq =
+                max_projected_radius_sq(sph1_center, [dir1, dir2], sph1_radius, [v0, v1, v2]);
 
             let eye_vec2 = sph2_center - v2;
             dir1 = eye_vec2.cross(v1).unitize_or_z(); // vec perp to eyevec and view norm
             dir2 = dir1.cross(eye_vec2).unitize_or_z(); // vec perp to eyevec in view normal plane
 
-            // (upstream offsets the second centre by the first radius and projects
-            // relative to the first centre)
-            let new_rad2_max_sq = max_projected_radius_sq(
-                sph2_center,
-                sph1_center,
-                [dir1, dir2],
-                sph1_radius,
-                [v0, v1, v2],
-            );
+            let new_rad2_max_sq =
+                max_projected_radius_sq(sph2_center, [dir1, dir2], sph2_radius, [v0, v1, v2]);
 
             // arrive here when sProjPnt1 and sProjPnt2 are the projected centers of the spheres and
             //   dNewRad1Max and dNewRad2Max are the maximum radii of the sphere projections onto the viewing plane
@@ -981,19 +1076,6 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
             | SolverOperation::PerspectiveIntersect => {
                 let min_proj_dist = proj_pnt1.distance(proj_pnt2) - sph1_radius - sph2_radius;
                 if min_proj_dist > 0.0 {
-                    return Ok(false); // No answers in this branch
-                }
-            }
-            SolverOperation::ProjectedMinimize => {
-                let min_proj_dist = proj_pnt1.distance(proj_pnt2) - sph1_radius - sph2_radius;
-                if min_proj_dist > 0.0 && min_proj_dist * min_proj_dist > self.best_answer_so_far_sq
-                {
-                    return Ok(false); // No answers in this branch
-                }
-            }
-            SolverOperation::ProjectedMaximize => {
-                let max_proj_dist = proj_pnt1.distance(proj_pnt2) + sph1_radius + sph2_radius;
-                if max_proj_dist * max_proj_dist < self.best_answer_so_far_sq {
                     return Ok(false); // No answers in this branch
                 }
             }
@@ -1145,7 +1227,11 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
         // along the normal by both the min and max distances,
         // then we will catch any case that could 'intersect'.
         // But we have to sample the surface curve.
-        let node2 = branch.get(1).copied().flatten().ok_or(null_node(OP))?;
+        let node2 = branch
+            .get(1)
+            .copied()
+            .flatten()
+            .ok_or_else(|| null_node(OP))?;
         if self.tree(1)?.node_owner_object(node2)?.is_none() {
             return Ok(false);
         }
@@ -1183,12 +1269,12 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
             let t = ivl2.evaluate(frac);
             match cos.evaluate_point(k, t) {
                 Ok(p) => srf_pt = Some(p),
-                Err(e) if e.is_unported() || srf_pt.is_none() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() || srf_pt.is_none() => return Err(e),
                 Err(_) => {}
             }
             match cos.evaluate_surface_normal(k, t, false) {
                 Ok(eval) => norm = Some(eval.normal),
-                Err(e) if e.is_unported() || norm.is_none() => return Err(e),
+                Err(e) if e.is_unported_or_cancelled() || norm.is_none() => return Err(e),
                 Err(_) => {}
             }
             let (Some(pt), Some(n)) = (srf_pt, norm.as_mut()) else {
@@ -1270,7 +1356,7 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
     ///
     /// # Errors
     ///
-    /// [`SolidError::Upstream`] (`SM_ERR`) when no node can be subdivided;
+    /// [`GeomFailure`](crate::error::geom::GeomFailure) (`SM_ERR`) when no node can be subdivided;
     /// [`SolidError::InvalidInput`] for a null tree or node of `branch`, a missing optional vector or a
     /// two-tree ordering applied to a third tree.
     pub fn find_best_subdivision_node(&self, branch: &Branch) -> Result<(usize, bool)> {
@@ -1278,7 +1364,12 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
         self.check_num_trees(OP)?;
         // check for failure
         let Some(best) = self.find_largest_non_leaf(branch)? else {
-            return Err(SolidError::sm_err(OP));
+            return Err(SolidError::geom(
+                OP,
+                GeomFailure::NoNodeToSubdivide {
+                    trees: self.num_trees,
+                },
+            ));
         };
 
         if self.operation == SolverOperation::Rayfire {
@@ -1377,8 +1468,10 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
     /// `SmGlobalSolver::IdenticalSolutions`: whether two solutions are the
     /// same (same counts, type, objects, solution values within
     /// `SM_EFF_ZERO_SQRT` and parameters within a scaled zero or `1e-4` of the
-    /// parameter interval), and for identical ones the one with the smaller
-    /// solution value.
+    /// parameter interval), and for identical ones the preferred solution:
+    /// the smaller solution value, or the larger solution value for
+    /// [`SolverOperation::Maximize`], [`SolverOperation::DirectedMaximize`] and
+    /// [`SolverOperation::ProjectedMaximize`] (WR-21).
     ///
     /// # Errors
     ///
@@ -1449,8 +1542,13 @@ impl<'t, O: SolutionObject> GlobalSolver<'t, O> {
 
         // All tests passed - identical Solutions
 
-        // prefer the solution with the tighter solution
-        let preferred = if sol1.start.solution_value < sol2.start.solution_value {
+        // prefer the solution with the tighter solution (or larger value when maximising, WR-21)
+        let prefer_first = if self.operation.is_plain_maximize() {
+            sol1.start.solution_value > sol2.start.solution_value
+        } else {
+            sol1.start.solution_value < sol2.start.solution_value
+        };
+        let preferred = if prefer_first {
             PreferredSolution::First
         } else {
             PreferredSolution::Second
@@ -1475,26 +1573,17 @@ fn other_index(index: usize) -> Result<usize> {
 }
 
 /// The largest squared length of the four offsets `center ± dir1 * radius`,
-/// `center ± dir2 * radius`, each perspective projected relative to `base`
+/// `center ± dir2 * radius`, each perspective projected relative to `center`
 /// (the radius loops of the perspective test in `BranchMayContainAnswers`).
 /// `view` is the plane point, the unit plane normal and the eye point.
-fn max_projected_radius_sq(
-    center: Point3,
-    base: Point3,
-    dirs: [Vec3; 2],
-    radius: f64,
-    view: [Vec3; 3],
-) -> f64 {
+fn max_projected_radius_sq(center: Point3, dirs: [Vec3; 2], radius: f64, view: [Vec3; 3]) -> f64 {
     let [dir1, dir2] = dirs;
     let [plane_point, plane_normal, eye_point] = view;
     let mut new_rad_max_sq = 0.0;
     for offset in [dir1 * radius, -dir1 * radius, dir2 * radius, -dir2 * radius] {
-        let rad_vec = (center + offset).perspective_project_to_plane(
-            base,
-            plane_point,
-            plane_normal,
-            eye_point,
-        );
+        // WR-608: the vector API already adds its base to the offset.
+        let rad_vec =
+            offset.perspective_project_to_plane(center, plane_point, plane_normal, eye_point);
         let new_rad_sq = rad_vec.length_squared();
         if new_rad_sq > new_rad_max_sq {
             new_rad_max_sq = new_rad_sq;
@@ -1563,6 +1652,17 @@ fn combine_min_max<O: SolutionObject>(
     max: &mut Solution<O>,
     combine_contiguous_ranges: bool,
 ) -> Result<Option<Solution<O>>> {
+    // (not upstream) the contact of a range the two make, or one takes the other into
+    let both = min.contact.absorbed(max.contact);
+    // (and a limit root either holds leaves its mark on what the two make)
+    let limit_root = min.limit_root || max.limit_root;
+    let ranged = |s: Solution<O>| Solution {
+        contact: both,
+        unique: None,
+        shared_contact: None,
+        limit_root,
+        ..s
+    };
     // when 1st solution is rangeOfValues
     if min.solution_type == SolutionType::RangeOfValues {
         // and 2nd solution is a point - crMax->Start to crMin
@@ -1580,7 +1680,7 @@ fn combine_min_max<O: SolutionObject>(
                 || class1 == EndClass::AtEnd
                 || (class1 == EndClass::Within && operation != SolverOperation::Intersect)
             {
-                return Ok(Some(*min));
+                return Ok(Some(ranged(*min)));
             } else if class1 == EndClass::Within && operation == SolverOperation::Intersect {
                 // arrive here when inserting a intersection point solution into a range solution
 
@@ -1595,13 +1695,22 @@ fn combine_min_max<O: SolutionObject>(
                     // change point solution into a range that starts at the point solution
                     max.solution_type = SolutionType::RangeOfValues;
                     max.end = min.end;
+                    // (not upstream) a range made from a point is not that point's contact
+                    max.contact = both;
+                    max.unique = None;
+                    max.shared_contact = None;
+                    max.limit_root = limit_root;
 
                     // change min solution into a range that stops at the point solution
                     min.end = max.start;
+                    min.contact = both;
+                    min.unique = None;
+                    min.shared_contact = None;
+                    min.limit_root = limit_root;
                     return Ok(None);
                 }
                 // combine point into range
-                return Ok(Some(*min));
+                return Ok(Some(ranged(*min)));
             }
         } else {
             // MaxSolution is a range: classify Max Start and End against Min
@@ -1628,11 +1737,11 @@ fn combine_min_max<O: SolutionObject>(
 
             // Max is contained within Min
             if class1 == EndClass::Within && class2 == EndClass::Within {
-                return Ok(Some(*min));
+                return Ok(Some(ranged(*min)));
             }
 
             // The remaining cases require the combination of the intervals
-            let mut combined = *min;
+            let mut combined = ranged(*min);
             if class1 == EndClass::BelowStart {
                 combined.start = max.start;
             }
@@ -1648,7 +1757,7 @@ fn combine_min_max<O: SolutionObject>(
     if max.solution_type == SolutionType::RangeOfValues {
         let class1 = max.classify_solution_end(min, true)?;
         if class1.is_at_or_within() {
-            return Ok(Some(*max));
+            return Ok(Some(ranged(*max)));
         }
         // (upstream's following tests for -1, 1 and 0 can no longer succeed)
     }
@@ -1693,6 +1802,11 @@ where
     // (not upstream) bound the work: see MAX_SOLVE_BRANCHES
     let s = solver.solver_mut();
     s.branches_visited += 1;
+    if (s.branches_visited & 31) == 1 {
+        if let Some(token) = &s.cancel {
+            token.check("geom::global_solver::solve_branch")?;
+        }
+    }
     if s.branches_visited > MAX_SOLVE_BRANCHES {
         return Err(SolidError::invalid_input(
             "geom::global_solver::solve_branch",
@@ -1870,7 +1984,7 @@ pub trait GlobalSolve<'t, O: SolutionObject + 't> {
         s.check_num_trees(OP)?;
         let mut start_branch: Branch = [None; MAX_SOLVER_TREES];
         for (i, slot) in start_branch.iter_mut().enumerate().take(s.num_trees) {
-            *slot = Some(s.tree(i)?.top_node().ok_or(null_node(OP))?);
+            *slot = Some(s.tree(i)?.top_node().ok_or_else(|| null_node(OP))?);
         }
 
         // bound the SolveBranch recursion (not upstream: see MAX_SOLVE_DEPTH)
@@ -1973,25 +2087,29 @@ pub trait GlobalSolve<'t, O: SolutionObject + 't> {
         // for every current solution
         let num_sols = self.solver().solutions.len();
         for ii in 0..num_sols {
-            let test = self.solver().solutions.get_at(ii)?;
+            // read in place: a copy per stored solution per insertion cost a memcpy each
+            let test = self.solver().solutions.at(ii)?;
 
             // don't add duplicate solutions (SolValues within ZeroSqrt and ParamValues within ScaledZero)
-            let (pair, preferred) = self.identical_solutions(solution, &test)?;
+            let (pair, preferred) = self.identical_solutions(solution, test)?;
             if pair == SolutionPairType::Identical {
                 // save the preferred solution if possible, else better solution - improve tolerances
                 let keep = match preferred {
-                    Some(PreferredSolution::First) => Some(solution),
-                    Some(PreferredSolution::Second) => Some(&test),
-                    None if solution.start.solution_value.abs()
-                        < test.start.solution_value.abs() =>
-                    {
-                        Some(solution)
-                    }
-                    None => None,
+                    Some(PreferredSolution::First) => true,
+                    Some(PreferredSolution::Second) => false,
+                    None => solution.start.solution_value.abs() < test.start.solution_value.abs(),
                 };
-                if let Some(keep) = keep {
-                    self.solver_mut().solutions.set_at(ii, keep)?;
+                // (not upstream) the solution kept carries both contacts
+                let mut kept = if keep { *solution } else { *test };
+                kept.contact = test.contact.merged(solution.contact);
+                kept.limit_root = test.limit_root || solution.limit_root;
+                kept.shared_contact = None;
+                // (a unique box is a crossing's, by the root it carries: a merged solution
+                // that is not a crossing carries none, whichever of the two was kept)
+                if kept.contact != Contact::Crossing {
+                    kept.unique = None;
                 }
+                self.solver_mut().solutions.set_at(ii, &kept)?;
                 return Ok(());
             }
 
@@ -2144,10 +2262,11 @@ pub trait GlobalSolve<'t, O: SolutionObject + 't> {
                     //   points contained in intervals get absorbed.
                     //   disjoint intervals remain disjoint.
                     //   point solutions remain distinct.
-                    let mut min = s.solutions.get_at(k)?;
-                    let mut max = s.solutions.get_at(j)?;
-                    let combined =
-                        combine_min_max(op, &mut min, &mut max, combine_contiguous_ranges)?;
+                    // in place: combine_min_max changes the pair only on its split path,
+                    // after every fallible step, so an error leaves both as they were, as
+                    // the copies did
+                    let (min, max) = s.solutions.pair_mut(k, j)?;
+                    let combined = combine_min_max(op, min, max, combine_contiguous_ranges)?;
                     if let Some(combined) = combined {
                         s.solutions.set_at(k, &combined)?;
                         s.solutions.remove_at(j, 1);
@@ -2155,8 +2274,6 @@ pub trait GlobalSolve<'t, O: SolutionObject + 't> {
                         break;
                     }
                     // (the split of a range around a tight point is made in place)
-                    s.solutions.set_at(k, &min)?;
-                    s.solutions.set_at(j, &max)?;
                     j += 1;
                 }
 
@@ -2232,6 +2349,7 @@ impl<'t, O: SolutionObject + 't> GlobalSolve<'t, O> for GlobalSolver<'t, O> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geom::extent1d::Extent1d;
     use crate::geom::solution_array::ObjectKind;
     use crate::geom::tree::TreeNode;
 
@@ -2284,6 +2402,86 @@ mod tests {
         s.end.solution_value = v1;
         s.end.parameters[0] = p1;
         s
+    }
+
+    #[test]
+    fn projected_extrema_bounds_share_objective_units() {
+        fn may(normal: Vec3, op: SolverOperation, incumbent: f64, tol: f64) -> bool {
+            let mut first = Tree::new(None);
+            let ia = first.add_node(leaf([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]));
+            first.set_top_node(Some(ia));
+            let mut second = Tree::new(None);
+            // The branch is the segment x in [2,4], at y=0,z=7. Its sphere
+            // has center (3,0,7), radius 1; these projected bounds are exact.
+            let ib = second.add_node(leaf([2.0, 0.0, 7.0], [4.0, 0.0, 7.0]));
+            second.set_top_node(Some(ib));
+            let mut solver = GlobalSolver::with_trees(&first, &second, 0);
+            solver.operation = op;
+            solver.opt_vectors = vec![normal];
+            solver.best_answer_so_far_sq = incumbent * incumbent;
+            solver.tolerance_3d = tol;
+            solver
+                .branch_may_contain_answers(&[Some(ia), Some(ib), None])
+                .unwrap()
+        }
+        for normal_scale in [0.5, 1.0, 2.0, -2.0] {
+            let normal = Vec3::Z * normal_scale;
+            let q = normal_scale * normal_scale;
+            let min = SolverOperation::ProjectedMinimize;
+            let max = SolverOperation::ProjectedMaximize;
+            // Actual minimum=2q, maximum=4q. Retain every improving branch,
+            // and exclude a branch whose best possible value is worse.
+            assert!(may(normal, min, 2.5 * q, 0.0));
+            assert!(!may(normal, min, 1.5 * q, 0.0));
+            assert!(may(normal, max, 3.5 * q, 0.0));
+            assert!(!may(normal, max, 4.5 * q, 0.0));
+            // Tolerance belongs to the reported objective, not physical space.
+            assert!(may(normal, min, 2.0 * q - 0.0625, 0.125));
+            assert!(!may(normal, min, 2.0 * q - 0.25, 0.125));
+            assert!(may(normal, max, 4.0 * q + 0.0625, 0.125));
+            assert!(!may(normal, max, 4.0 * q + 0.25, 0.125));
+        }
+        for normal in [Vec3::ZERO, Vec3::new(f64::INFINITY, 0.0, 0.0)] {
+            for op in [
+                SolverOperation::ProjectedMinimize,
+                SolverOperation::ProjectedMaximize,
+            ] {
+                assert!(may(normal, op, 1.0, 0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn perspective_culling_uses_each_spheres_own_radius_and_center() {
+        fn may(a: ([f64; 3], [f64; 3]), b: ([f64; 3], [f64; 3])) -> bool {
+            let mut first = Tree::new(None);
+            let ia = first.add_node(leaf(a.0, a.1));
+            first.set_top_node(Some(ia));
+            let mut second = Tree::new(None);
+            let ib = second.add_node(leaf(b.0, b.1));
+            second.set_top_node(Some(ib));
+            let mut solver = GlobalSolver::with_trees(&first, &second, 0);
+            solver.operation = SolverOperation::PerspectiveIntersect;
+            solver.opt_vectors = vec![
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::ZERO,
+            ];
+            solver
+                .branch_may_contain_answers(&[Some(ia), Some(ib), None])
+                .unwrap()
+        }
+        let point = ([1.75, 0.0, 2.0], [1.75, 0.0, 2.0]);
+        let separate = ([3.0, 0.0, 2.0], [3.0, 0.0, 2.0]);
+        // Distinct point projections at x=.875 and x=1.5 have zero radii.
+        assert!(!may(point, separate));
+        assert!(!may(separate, point));
+        let contains = ([0.0, 0.0, 2.0], [2.0, 0.0, 2.0]);
+        // The second box actually contains the first point; using the first
+        // sphere's zero radius must not shrink away this intersection.
+        assert!(may(point, contains));
+        assert!(may(contains, point));
+        assert!(may(point, point));
     }
 
     #[test]
@@ -2507,6 +2705,144 @@ mod tests {
         assert_eq!(b.end.parameters[0], 2.0);
     }
 
+    /// The range a tight point is turned into, when it splits a range, is a stretch,
+    /// not the point's contact, and the range it splits is cut at a point it did not
+    /// type: both are unclassified when the two were, and undecided once either was
+    /// typed.
+    #[test]
+    fn a_range_made_from_a_point_is_unclassified() {
+        for (range_contact, point_contact, want) in [
+            (
+                Contact::Unclassified,
+                Contact::Unclassified,
+                Contact::Unclassified,
+            ),
+            (Contact::Touching, Contact::Crossing, Contact::Undecided),
+            (Contact::Unclassified, Contact::Crossing, Contact::Undecided),
+        ] {
+            let mut solver: GlobalSolver<'_, Obj> = GlobalSolver::new();
+            solver.set_3d_tolerance(1e-6);
+            let mut whole = range(1e-3, 0.0, 1e-3, 2.0);
+            whole.contact = range_contact;
+            solver
+                .add_sorted_solution(&whole, SortKey::ByFirstParameter, true)
+                .unwrap();
+            let mut point = single(1e-9, 1.0);
+            point.contact = point_contact;
+            solver
+                .add_sorted_solution(&point, SortKey::ByFirstParameter, true)
+                .unwrap();
+            assert_eq!(solver.solutions.len(), 2);
+            let a = solver.solutions.get(0).unwrap();
+            let b = solver.solutions.get(1).unwrap();
+            assert_eq!((a.end.parameters[0], a.contact), (1.0, want));
+            assert_eq!(b.solution_type, SolutionType::RangeOfValues);
+            assert_eq!(b.contact, want);
+        }
+    }
+
+    /// A limit root (`Solution::limit_root`) the solver's combination takes in leaves its
+    /// mark on what it makes: a range absorbing a point, a range taking in a range, and both
+    /// ranges a tight point splits a range into; a point that is no limit root leaves none.
+    #[test]
+    fn a_combination_keeps_a_limit_root_mark() {
+        for marked in [true, false] {
+            let mark = |mut s: Solution<Obj>, on: bool| {
+                s.limit_root = on;
+                s
+            };
+            // a loose point inside a range, absorbed; a range inside a range
+            for inner in [single(1e-3, 1.0), range(0.0, 0.5, 0.0, 1.5)] {
+                let mut solver: GlobalSolver<'_, Obj> = GlobalSolver::new();
+                solver.set_solver_operation(SolverOperation::Find);
+                solver.set_3d_tolerance(1e-6);
+                for s in [range(0.0, 0.0, 0.0, 2.0), mark(inner, marked)] {
+                    solver
+                        .add_sorted_solution(&s, SortKey::ByFirstParameter, true)
+                        .unwrap();
+                }
+                assert_eq!(solver.solutions.len(), 1);
+                assert_eq!(solver.solutions.get(0).unwrap().limit_root, marked);
+            }
+            // a tight point splitting a range: both ranges carry the mark
+            let mut solver: GlobalSolver<'_, Obj> = GlobalSolver::new();
+            solver.set_3d_tolerance(1e-6);
+            for s in [range(1e-3, 0.0, 1e-3, 2.0), mark(single(1e-9, 1.0), marked)] {
+                solver
+                    .add_sorted_solution(&s, SortKey::ByFirstParameter, true)
+                    .unwrap();
+            }
+            assert_eq!(solver.solutions.len(), 2);
+            for s in solver.solutions.as_slice() {
+                assert_eq!(s.limit_root, marked);
+            }
+        }
+    }
+
+    /// A duplicate `add_sorted_solution` drops leaves the solution it keeps with the
+    /// merged contact of both, whichever of the two it keeps.
+    #[test]
+    fn a_dropped_duplicate_merges_its_contact_into_the_kept_one() {
+        for (stored, added, want) in [
+            (Contact::Crossing, Contact::Touching, Contact::Undecided),
+            (Contact::Crossing, Contact::Crossing, Contact::Undecided),
+            (Contact::Unclassified, Contact::Touching, Contact::Undecided),
+            (
+                Contact::Unclassified,
+                Contact::Unclassified,
+                Contact::Unclassified,
+            ),
+            (Contact::Undecided, Contact::Crossing, Contact::Undecided),
+        ] {
+            // the added one is tighter (kept), then looser (dropped)
+            for (v_stored, v_added) in [(2e-7, 1e-7), (1e-7, 2e-7)] {
+                let mut solver: GlobalSolver<'_, Obj> = GlobalSolver::new();
+                solver.set_solver_operation(SolverOperation::Find);
+                solver.set_3d_tolerance(1e-6);
+                let mut first = single(v_stored, 1.0);
+                first.contact = stored;
+                let mut second = single(v_added, 1.0);
+                second.contact = added;
+                for s in [first, second] {
+                    solver
+                        .add_sorted_solution(&s, SortKey::ByFirstParameter, true)
+                        .unwrap();
+                }
+                assert_eq!(solver.solutions.len(), 1);
+                let kept = solver.solutions.get(0).unwrap();
+                assert_eq!(kept.start.solution_value, 1e-7, "{stored:?} {added:?}");
+                assert_eq!(kept.contact, want, "{stored:?} {added:?} {v_stored}");
+                // the same with a unique box on either one or both: the solution kept is no
+                // crossing, so it keeps no box
+                let boxed = Some([[0.5, 1.5], [0.0, 1.0]]);
+                for (box_first, box_second) in [(true, false), (false, true), (true, true)] {
+                    let mut solver: GlobalSolver<'_, Obj> = GlobalSolver::new();
+                    solver.set_solver_operation(SolverOperation::Find);
+                    solver.set_3d_tolerance(1e-6);
+                    let (mut a, mut b) = (first, second);
+                    if box_first {
+                        a.unique = boxed;
+                    }
+                    if box_second {
+                        b.unique = boxed;
+                    }
+                    for s in [a, b] {
+                        solver
+                            .add_sorted_solution(&s, SortKey::ByFirstParameter, true)
+                            .unwrap();
+                    }
+                    assert_eq!(solver.solutions.len(), 1);
+                    let kept = solver.solutions.get(0).unwrap();
+                    assert_eq!(
+                        (kept.contact, kept.unique),
+                        (want, None),
+                        "{stored:?} {added:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn minimize_keeps_best_within_tolerance() {
         let mut solver: GlobalSolver<'_, Obj> = GlobalSolver::new();
@@ -2540,5 +2876,220 @@ mod tests {
             .identical_solutions(&single(0.0, 1.0), &single(0.0, 1.1))
             .unwrap();
         assert_eq!(pair, SolutionPairType::DiffParameters);
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct UnitCurve;
+
+    impl SolutionObject for UnitCurve {
+        fn kind(&self) -> ObjectKind {
+            ObjectKind::Curve
+        }
+
+        fn natural_interval(&self) -> Option<Extent1d> {
+            Some(Extent1d::from_min_max(0.0, 1.0))
+        }
+    }
+
+    fn curve_single(value: f64, t: f64) -> Solution<UnitCurve> {
+        let mut s = Solution::new();
+        s.solution_type = SolutionType::SingleValue;
+        s.num_objects = 1;
+        s.objects[0] = Some(UnitCurve);
+        s.num_variables = 1;
+        s.start.solution_value = value;
+        s.start.parameters[0] = t;
+        s
+    }
+
+    fn curve_leaf(min: [f64; 3], max: [f64; 3]) -> TreeNode<UnitCurve> {
+        let mut n = TreeNode::new();
+        n.bbox = Extent3d::from_points(Vec3::from_array(min), Vec3::from_array(max));
+        n
+    }
+
+    #[test]
+    fn wr21_identical_solutions_maximize_prefers_larger() {
+        let sol_hi = curve_single(0.42578125, 0.50001);
+        let sol_lo = curve_single(0.425781245, 0.5);
+
+        for op in [
+            SolverOperation::Maximize,
+            SolverOperation::DirectedMaximize,
+            SolverOperation::ProjectedMaximize,
+        ] {
+            let k = Kernel::default();
+            let mut solver_fixed: GlobalSolver<'_, UnitCurve> = GlobalSolver::new_with_kernel(&k);
+            solver_fixed.set_solver_operation(op);
+
+            // WR-21: prefers `>` (larger value `sol_hi`) in both argument orders.
+            assert_eq!(
+                solver_fixed.identical_solutions(&sol_hi, &sol_lo).unwrap(),
+                (SolutionPairType::Identical, Some(PreferredSolution::First)),
+            );
+            assert_eq!(
+                solver_fixed.identical_solutions(&sol_lo, &sol_hi).unwrap(),
+                (SolutionPairType::Identical, Some(PreferredSolution::Second)),
+            );
+
+            // Exact value ties prefer `Second` (retaining an existing stored solution).
+            let sol_tie = curve_single(0.42578125, 0.50002);
+            assert_eq!(
+                solver_fixed.identical_solutions(&sol_hi, &sol_tie).unwrap(),
+                (SolutionPairType::Identical, Some(PreferredSolution::Second)),
+            );
+
+            // Solutions separated by more than `EFF_ZERO_SQRT` remain distinct (`DiffCounts`).
+            let sol_far_val = curve_single(0.42578125 - 2.0 * EFF_ZERO_SQRT, 0.50001);
+            assert_eq!(
+                solver_fixed
+                    .identical_solutions(&sol_hi, &sol_far_val)
+                    .unwrap(),
+                (SolutionPairType::DiffCounts, None),
+            );
+        }
+    }
+
+    #[test]
+    fn wr21_add_sorted_solution_keeps_true_interior_maximum() {
+        struct TwoLeafMaxSolver<'t> {
+            base: GlobalSolver<'t, UnitCurve>,
+            leaf_solutions: [(NodeId, Solution<UnitCurve>); 2],
+        }
+
+        impl<'t> GlobalSolve<'t, UnitCurve> for TwoLeafMaxSolver<'t> {
+            fn solver(&self) -> &GlobalSolver<'t, UnitCurve> {
+                &self.base
+            }
+
+            fn solver_mut(&mut self) -> &mut GlobalSolver<'t, UnitCurve> {
+                &mut self.base
+            }
+
+            fn local_solve(&mut self, branch: &Branch) -> Result<bool> {
+                let leaf_id = branch[1].unwrap();
+                let leaf_solutions = self.leaf_solutions;
+                for (id, sol) in &leaf_solutions {
+                    if *id == leaf_id {
+                        self.add_sorted_solution(sol, SortKey::BySolutionValue, true)?;
+                    }
+                }
+                Ok(false)
+            }
+        }
+
+        let sol_interior = curve_single(0.42578125, 0.50001);
+        let sol_boundary = curve_single(0.425781242, 0.5);
+
+        // Direct `add_sorted_solution` in both arrival orders.
+        for candidates in [[sol_interior, sol_boundary], [sol_boundary, sol_interior]] {
+            let k = Kernel::default();
+            let mut solver: GlobalSolver<'_, UnitCurve> = GlobalSolver::new_with_kernel(&k);
+            solver.set_solver_operation(SolverOperation::Maximize);
+            solver.set_operation_category(OperationCategory::Maximize);
+            solver.set_solution_requested(SolutionRequested::All);
+            solver.set_3d_tolerance(1.0e-5);
+            solver.set_best_answer_so_far_sq(0.0);
+
+            for c in &candidates {
+                solver
+                    .add_sorted_solution(c, SortKey::BySolutionValue, true)
+                    .unwrap();
+            }
+
+            assert_eq!(solver.solutions.len(), 1);
+            let kept = solver.solutions.get(0).unwrap();
+            assert_eq!(kept.start.solution_value, 0.42578125);
+            assert_eq!(kept.start.parameters[0], 0.50001);
+            assert_eq!(solver.best_answer_so_far_sq, 0.42578125 * 0.42578125);
+        }
+
+        // Full two-tree `solve_it` across two adjacent curve-span leaves in both leaf assignments.
+        let mut pt_tree = Tree::new(None);
+        let pt_top = pt_tree.add_node(curve_leaf([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]));
+        pt_tree.set_top_node(Some(pt_top));
+
+        let mut crv_tree = Tree::new(None);
+        let top = crv_tree.add_node(curve_leaf([0.0, 0.0, 0.0], [1.0, 1.0, 0.0]));
+        let c1 = crv_tree.add_node(curve_leaf([0.0, 0.0, 0.0], [0.5, 1.0, 0.0]));
+        let c2 = crv_tree.add_node(curve_leaf([0.5, 0.0, 0.0], [1.0, 1.0, 0.0]));
+        if let Ok(n) = crv_tree.node_mut(top) {
+            n.child1 = Some(c1);
+            n.child2 = Some(c2);
+        }
+        for c in [c1, c2] {
+            if let Ok(n) = crv_tree.node_mut(c) {
+                n.parent = Some(top);
+            }
+        }
+        crv_tree.set_top_node(Some(top));
+
+        for leaf_solutions in [
+            [(c1, sol_boundary), (c2, sol_interior)],
+            [(c1, sol_interior), (c2, sol_boundary)],
+        ] {
+            let k = Kernel::default();
+            let mut solver = TwoLeafMaxSolver {
+                base: GlobalSolver::with_trees_and_kernel(&k, &pt_tree, &crv_tree, 1),
+                leaf_solutions,
+            };
+            let mut out = SolutionArray::new();
+            solver
+                .solve_it(
+                    &SolveRequest {
+                        operation: SolverOperation::Maximize,
+                        solution_requested: SolutionRequested::All,
+                        tolerance_3d: 1.0e-5,
+                        best_answer_so_far_sq: BIG_DOUBLE,
+                        opt_vectors: &[],
+                    },
+                    &mut out,
+                )
+                .unwrap();
+
+            assert_eq!(out.len(), 1);
+            let kept = out.get(0).unwrap();
+            assert_eq!(kept.start.solution_value, 0.42578125);
+            assert_eq!(kept.start.parameters[0], 0.50001);
+        }
+    }
+
+    #[test]
+    fn wr21_minimize_and_intersect_unchanged() {
+        let k = Kernel::default();
+
+        let mut one_tree = Tree::new(None);
+        let top = one_tree.add_node(curve_leaf([0.0, 0.0, 0.0], [1.0, 1.0, 0.0]));
+        one_tree.set_top_node(Some(top));
+        let mut solver = GlobalSolver::with_tree_and_kernel(&k, &one_tree, 1);
+
+        let sol_hi = curve_single(2.0e-7, 0.50001);
+        let sol_lo = curve_single(1.0e-7, 0.5);
+
+        for op in [
+            SolverOperation::Minimize,
+            SolverOperation::DirectedMinimize,
+            SolverOperation::ProjectedMinimize,
+            SolverOperation::Intersect,
+            SolverOperation::AtDistance,
+            SolverOperation::Rayfire,
+            SolverOperation::Normalize,
+            SolverOperation::Find,
+            SolverOperation::Signed3dDirectedMinimize,
+            SolverOperation::Signed3dDirectedMaximize,
+            SolverOperation::SignedDirectedMinimize,
+            SolverOperation::SignedAngleMinimize,
+            SolverOperation::SignedPivotMinimize,
+        ] {
+            solver.set_solver_operation(op);
+            assert_eq!(
+                solver.identical_solutions(&sol_hi, &sol_lo).unwrap(),
+                (SolutionPairType::Identical, Some(PreferredSolution::Second)),
+            );
+            assert_eq!(
+                solver.identical_solutions(&sol_lo, &sol_hi).unwrap(),
+                (SolutionPairType::Identical, Some(PreferredSolution::First)),
+            );
+        }
     }
 }

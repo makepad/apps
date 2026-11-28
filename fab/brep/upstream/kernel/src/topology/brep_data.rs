@@ -63,10 +63,13 @@
 //!   values); an attribute line skip that fails keeps the indices read
 //!   ([`AttributeStore::read_indexed_attributes_from_db_partial`]) and is ignored.
 //! - **Uninitialised locals.** Where upstream extracts into an uninitialised local
-//!   (counts, `dMin`/`dMax`, composite segment values) and the extraction stores
-//!   nothing, the port uses `0`; such streams are malformed and never reach the C++
-//!   reference in the difftest. An ASCII type header that stores nothing is
-//!   [`SolidError::InvalidInput`].
+//!   (the version number, the first `lCount`, `dMin`/`dMax`, a composite edge's count
+//!   and first edge, old composite curve values) and the extraction stores nothing
+//!   (the stream had already failed or ended), upstream goes on with an indeterminate
+//!   value; the port returns [`SolidError::InvalidInput`], as for a short binary read,
+//!   so an ASCII file of text that is not a database is refused instead of read as an
+//!   empty B-rep (#2058). Such streams never reach the C++ reference in the difftest.
+//!   An ASCII type header that stores nothing is [`SolidError::InvalidInput`] too.
 //! - **Geometry ownership.** `m_bIsGeomBorrowed` is kept, but the port always owns its
 //!   curves and surfaces (they are moved, not borrowed, by future `FromBrep` ports).
 //! - **Files.** [`BrepData::read_from_file`] takes the file's bytes (no filesystem on
@@ -80,7 +83,8 @@
 use crate::curve::composite_curve::CompositeCurve;
 use crate::curve::curve::p2::{BSPLINE_CURVE_TYPE, COMPOSITE_CURVE_TYPE};
 use crate::curve::curve::Curve;
-use crate::error::{Result, SolidError};
+use crate::error::topology::TopologyFailure;
+use crate::error::{Failure, Result, SolidError};
 use crate::geom::attribute::{AttributeHandle, AttributeStore, ObjectKey};
 use crate::geom::extent1d::Extent1d;
 use crate::geom::extent2d::Extent2d;
@@ -102,7 +106,7 @@ pub const NO_OBJECT: u64 = 9_999_999;
 pub const UNDEF_ULONG: u64 = 123_456_789;
 
 /// `UNSURE`: the "not set" value of an `SmBoolean`.
-pub const UNSURE: i32 = 2;
+pub use crate::error::SM_UNSURE as UNSURE;
 
 /// `SM_ZONE_TOL_3D`.
 const ZONE_TOL_3D: f64 = 1.0e-5;
@@ -138,16 +142,16 @@ pub enum DataSourceType {
     Stl = 4,
     /// `SM_DS_SAT`.
     Sat = 5,
-    /// `SM_DS` tag 6.
-    Xt = 6,
+    /// `SM_DS_PARASOLID`.
+    Parasolid = 6,
     /// `SM_DS_VDAFS`.
     Vdafs = 7,
     /// `SM_DS_OPENNURBS`.
     OpenNurbs = 8,
     /// `SM_DS_DATAKIT`.
     Datakit = 9,
-    /// `SM_DS` tag 10.
-    Sld = 10,
+    /// `SM_DS_SOLIDWORKS`.
+    SolidWorks = 10,
     /// `SM_DS_USD`.
     Usd = 11,
     /// `SM_DS_PRC`.
@@ -175,11 +179,11 @@ impl DataSourceType {
             3 => Self::Step,
             4 => Self::Stl,
             5 => Self::Sat,
-            6 => Self::Xt,
+            6 => Self::Parasolid,
             7 => Self::Vdafs,
             8 => Self::OpenNurbs,
             9 => Self::Datakit,
-            10 => Self::Sld,
+            10 => Self::SolidWorks,
             11 => Self::Usd,
             12 => Self::Prc,
             13 => Self::Dgn,
@@ -268,7 +272,7 @@ fn is_ascii(db: &DatabaseReader) -> bool {
 /// `*rDB.GetInStreamPtr()` (upstream dereferences `NULL` without a stream).
 fn stream(db: &mut DatabaseReader) -> Result<&mut InputStream> {
     db.in_stream_mut()
-        .ok_or_else(|| SolidError::null_pointer(OP_STREAM))
+        .ok_or_else(|| SolidError::topology(OP_STREAM, TopologyFailure::NoInputStream))
 }
 
 /// `rFileIn >> ulong`: stores only when the extraction stores.
@@ -297,6 +301,29 @@ fn ext_double(s: &mut InputStream, slot: &mut f64) {
     if let Some(v) = s.extract_double() {
         *slot = v;
     }
+}
+
+/// Error for an ASCII extraction into a local upstream leaves uninitialised that
+/// stored nothing (see the module docs).
+const fn ascii_value_missing(operation: &'static str) -> SolidError {
+    SolidError::InvalidInput {
+        operation,
+        reason: "ASCII database stream failed or ended before the value was read",
+    }
+}
+
+/// `rFileIn >> ulong` into a local upstream leaves uninitialised:
+/// [`ascii_value_missing`] when the extraction stores nothing.
+fn ext_ulong_init(s: &mut InputStream, operation: &'static str) -> Result<u64> {
+    s.extract_ulong()
+        .ok_or_else(|| ascii_value_missing(operation))
+}
+
+/// `rFileIn >> double` into a local upstream leaves uninitialised:
+/// [`ascii_value_missing`] when the extraction stores nothing.
+fn ext_double_init(s: &mut InputStream, operation: &'static str) -> Result<f64> {
+    s.extract_double()
+        .ok_or_else(|| ascii_value_missing(operation))
 }
 
 /// `GOTO_NEXT_LINE` (`rFileIn.ignore(MAXSIZE, '\n')`, `MAXSIZE` 256).
@@ -1089,8 +1116,8 @@ impl EdgeData {
         persist_attribs: bool,
     ) -> Result<()> {
         // uninitialised upstream (see the module docs)
-        let mut min = 0.0;
-        let mut max = 0.0;
+        let min;
+        let max;
         if is_ascii(db) {
             let mut index = 0;
             ext_ulong(stream(db)?, &mut index);
@@ -1101,8 +1128,8 @@ impl EdgeData {
             ext_ulong(s, &mut self.start_vertex);
             ext_ulong(s, &mut self.end_vertex);
             ext_long(s, &mut self.prim_eu);
-            ext_double(s, &mut min);
-            ext_double(s, &mut max);
+            min = ext_double_init(s, OP_READ)?;
+            max = ext_double_init(s, OP_READ)?;
             next_line(db);
         } else {
             self.topology.read_from_db(version, db)?;
@@ -1323,7 +1350,7 @@ impl BrepData {
         persist_attribs: bool,
     ) -> Result<Self> {
         // uninitialised upstream (see the module docs)
-        let mut count: u64 = 0;
+        let mut count: u64;
         let mut index: u64 = 0;
 
         // allocate new BrepData object
@@ -1395,7 +1422,7 @@ impl BrepData {
         if ascii {
             next_line(db); // blank line
             next_line(db); // Shell Data
-            ext_ulong(stream(db)?, &mut count);
+            count = ext_ulong_init(stream(db)?, OP_READ)?; // lCount's first extraction
             next_line(db);
             next_line(db); // faceuse shell columns
             next_line(db); // wire edge shell columns
@@ -1412,7 +1439,7 @@ impl BrepData {
         }
 
         // Composite Faces
-        bd.cfaces = read_composite_list(db, &mut count, &mut index)?;
+        bd.cfaces = read_composite_list(db, &mut count, &mut index, false)?;
 
         // Faceuse Data
         if ascii {
@@ -1471,7 +1498,7 @@ impl BrepData {
         }
 
         // Composite Edges
-        bd.cedges = read_composite_list(db, &mut count, &mut index)?;
+        bd.cedges = read_composite_list(db, &mut count, &mut index, true)?;
 
         // Edgeuse Data
         if ascii {
@@ -1621,15 +1648,15 @@ impl BrepData {
             c
         };
 
-        // uninitialised upstream when the ASCII extraction stores nothing
-        let mut version: u64 = 0;
+        // lDBVersionNumber is uninitialised upstream (see the module docs)
+        let version: u64;
         let mut healer_version: u64 = 0;
         if first != b'V' {
             version = 30;
         } else if ascii {
             let s = stream(&mut db)?;
             let _ = s.extract_word_limited(HEADER_WORD); // "Version"
-            ext_ulong(s, &mut version);
+            version = ext_ulong_init(s, OP_READ)?;
             next_line(&mut db);
         } else {
             let _header = db.read_char()?; // 'V'
@@ -1670,11 +1697,13 @@ impl BrepData {
 
 /// A composite face or edge section: the count line and, when nonzero, the column
 /// comment and per entry `[index] n item0 .. item(n-1)`, flattened to
-/// `[count, n0, items.., n1, items.., ...]` (empty for a zero count).
+/// `[count, n0, items.., n1, items.., ...]` (empty for a zero count). `edges`: the
+/// composite edge section, whose per-entry counts upstream leaves uninitialised.
 fn read_composite_list(
     db: &mut DatabaseReader,
     count: &mut u64,
     index: &mut u64,
+    edges: bool,
 ) -> Result<Vec<u64>> {
     let ascii = is_ascii(db);
     if ascii {
@@ -1695,19 +1724,27 @@ fn read_composite_list(
         for _ in 0..n {
             ensure_more(db.in_stream(), OP_READ)?;
             // composite faces initialise these to 0, composite edges leave them
-            // uninitialised (see the module docs)
+            // uninitialised for each entry (see the module docs)
             let mut item_count: u64 = 0;
             let mut item: u64 = 0;
             if ascii {
                 let s = stream(db)?;
                 ext_ulong(s, index);
-                ext_ulong(s, &mut item_count);
+                if edges {
+                    item_count = ext_ulong_init(s, OP_READ)?;
+                } else {
+                    ext_ulong(s, &mut item_count);
+                }
                 list.push(item_count);
                 let m = checked_count(db, item_count, OP_READ)?;
                 let s = stream(db)?;
-                for _ in 0..m {
+                for j in 0..m {
                     ensure_more(Some(s), OP_READ)?;
-                    ext_ulong(s, &mut item);
+                    if edges && j == 0 {
+                        item = ext_ulong_init(s, OP_READ)?;
+                    } else {
+                        ext_ulong(s, &mut item);
+                    }
                     list.push(item);
                 }
                 next_line(db);
@@ -1775,7 +1812,12 @@ pub fn read_curve_from_db(
                 db.leave_nested();
                 r?
             }
-            _ => return Err(SolidError::sm_err(OP_CURVE)),
+            _ => {
+                return Err(SolidError::topology(
+                    OP_CURVE,
+                    TopologyFailure::RecordTypeUnknown { type_code: ty },
+                ))
+            }
         }
     };
 
@@ -1790,7 +1832,9 @@ pub fn read_curve_from_db(
                     operation: OP_CURVE,
                     reason: "attribute index past the attribute table",
                 })?;
-            let h = slot.ok_or_else(|| SolidError::null_pointer(OP_CURVE))?;
+            let h = slot.ok_or_else(|| {
+                SolidError::topology(OP_CURVE, TopologyFailure::AttributeSlotEmpty)
+            })?;
             attrs.store.add_attribute(key, h)?;
         }
     }
@@ -1810,14 +1854,14 @@ fn read_old_composite(
     // SE(SM_ERR): "untested code" signal, compiled out of the release build
     let ascii = is_ascii(db);
     // uninitialised upstream (see the module docs)
-    let mut num_segments: u64 = 0;
-    let mut dimension: u64 = 0;
-    let mut closed: u64 = 0;
+    let num_segments: u64;
+    let dimension: u64;
+    let closed: u64;
     if ascii {
         let s = stream(db)?;
-        ext_ulong(s, &mut num_segments);
-        ext_ulong(s, &mut dimension);
-        ext_ulong(s, &mut closed);
+        num_segments = ext_ulong_init(s, OP_CURVE)?;
+        dimension = ext_ulong_init(s, OP_CURVE)?;
+        closed = ext_ulong_init(s, OP_CURVE)?;
         next_line(db);
     } else {
         num_segments = db.read_ulong()?;
@@ -1834,14 +1878,15 @@ fn read_old_composite(
     let n = checked_count(db, num_segments, OP_CURVE)?;
     for ii in 0..n {
         ensure_more(db.in_stream(), OP_CURVE)?;
-        let mut gap_start = 0.0;
-        let mut gap_end = 0.0;
+        // dGapStart and dGapEnd are uninitialised upstream (see the module docs)
+        let gap_start;
+        let gap_end;
         let mut same_sense: u64 = 0;
         if ascii {
             let s = stream(db)?;
             ext_ulong(s, &mut same_sense);
-            ext_double(s, &mut gap_start);
-            ext_double(s, &mut gap_end);
+            gap_start = ext_double_init(s, OP_CURVE)?;
+            gap_end = ext_double_init(s, OP_CURVE)?;
             next_line(db);
         } else {
             same_sense = db.read_ulong()?;
@@ -1879,7 +1924,10 @@ fn read_old_composite(
 /// `SM_ERR` for another type up to version 32; those of
 /// [`OffsetSurface::new`] for an offset surface; [`SolidError::InvalidInput`] for an attribute index past the table (upstream reads
 /// past the array), an ASCII type header that could not be read, or an exhausted
-/// [`AttributeSink`] key domain; those of the surface readers.
+/// [`AttributeSink`] key domain; `SM_ERR` for a procedural blend whose net is not proved
+/// within its bound of its definition again (not upstream: the read surface is an
+/// operand, [`crate::surface::procedural_blend::ProceduralBlend::recertify`]); those of
+/// the surface readers.
 pub fn read_surface_from_db(
     k: &Kernel,
     version: u64,
@@ -1923,9 +1971,29 @@ pub fn read_surface_from_db(
                     SS_UNKNOWN,
                 )?)
             }
-            _ => return Err(SolidError::sm_err(OP_SURFACE)),
+            _ => {
+                return Err(SolidError::topology(
+                    OP_SURFACE,
+                    TopologyFailure::RecordTypeUnknown { type_code: ty },
+                ))
+            }
         }
     };
+
+    // not upstream (§7 invariant 8): a blend by its definition read from a record is an
+    // operand only once its net is proved within its bound of its definition again; a
+    // record whose net is not is refused (a cancel, or a spent certificate budget, passes
+    // through as it is)
+    if let Some(blend) = surface.procedural_blend() {
+        blend.recertify(k).map_err(|e| {
+            if e.is_cancelled() || e.is_not_certified() {
+                return e;
+            }
+            Failure::new(OP_SURFACE, TopologyFailure::BlendRecordNotProved)
+                .caused_by(e)
+                .into_error()
+        })?;
+    }
 
     // for current versions - read attributes
     if version > 30 && persist_attribs {
@@ -1949,6 +2017,72 @@ pub fn read_surface_from_db(
         object: surface,
     })
 }
+
+/// The body of an ASCII B-rep file of an empty B-rep (every count `0`), in the
+/// version 30 layout. A version 31 to 45 file reads it the same way, as it holds no
+/// records (for tests).
+#[cfg(test)]
+pub(crate) const EMPTY_ASCII_BODY: &str = "//Brep Starts
+1.0 0.0 0.0 - Color
+0.000001 - Brep Tolerance
+0 - Manifold
+0 - Allow Composites
+
+//Region Data
+0 Regions In Brep
+0 - Start Region
+//cols
+
+//Shell Data
+0 Shells In Brep
+//a
+//b
+//c
+
+//Composite Face Data
+0 Composite Faces In Brep
+
+//Faceuse Data
+0 Faceuses In Brep
+//cols
+
+//Face Data
+0 Faces In Brep
+//a
+//b
+
+//Loop Data
+0 Loops In Brep
+//a
+//b
+
+//Composite Edge Data
+0 Composite Edges In Brep
+
+//Edgeuse Data
+0 Edgeuses In Brep
+//a
+//b
+//c
+//d
+
+//Edge Data
+0 Edges In Brep
+//cols
+
+//Vertex Data
+0 Vertices In Brep
+//cols
+
+// UV-Curve Data
+0 UV-Curves In Brep
+
+// 3D-Curve Data
+0 3D-Curves In Brep
+
+// Surface Data
+0 Surfaces In Brep
+";
 
 #[cfg(test)]
 mod tests {
@@ -2325,10 +2459,13 @@ mod tests {
         let mut attrs = AttributeSink::new(&mut store, &mut all, 0);
         // a version 31 line curve type is SM_ERR
         let mut db = ascii_reader("Object Type 14001\n");
-        assert!(matches!(
-            read_curve_from_db(&k, 3, 31, &mut attrs, &mut db, true),
-            Err(SolidError::Upstream { code: 1001, .. })
-        ));
+        assert!(
+            read_curve_from_db(&k, 3, 31, &mut attrs, &mut db, true).is_err_and(|e| e
+                .upstream_status()
+                == Some(1001)
+                && e.topology_failure()
+                    == Some(&TopologyFailure::RecordTypeUnknown { type_code: 14001 }))
+        );
         // version 31 B-spline line segment with an attribute index into an empty slot
         let text = "Object Type 14033\n1\n1\n0\n3\n0 0 0\n1 1 1\n0\n0\n1\n1\n1 0\n";
         let mut db = ascii_reader(text);
@@ -2340,16 +2477,33 @@ mod tests {
         let c = c.unwrap();
         assert_eq!(c.object.type_code(), BSPLINE_CURVE_TYPE);
         assert_eq!(attrs2.store.attributes(c.key).len(), 1);
+        // the same record cut before the line's end: the line skip fails, so no placeholder
+        // is made and the listed slot stays empty
+        let mut db = ascii_reader(text.trim_end_matches('\n'));
+        let mut store3 = AttributeStore::new();
+        let mut all3: Vec<Option<AttributeHandle>> = vec![None];
+        let mut attrs3 = AttributeSink::new(&mut store3, &mut all3, 0);
+        assert!(read_curve_from_db(&k, 3, 31, &mut attrs3, &mut db, true)
+            .is_err_and(|e| e.upstream_status() == Some(1006)
+                && e.topology_failure() == Some(&TopologyFailure::AttributeSlotEmpty)));
     }
 
     #[test]
     fn read_from_file_headers() {
         let k = Kernel::default();
-        let text = format!("Version 45\nHealer Version 3\n{DISK_HEAD}");
-        // version 45 without attributes: no tolerance read, records have flags
+        let text = format!("Version 45\nHealer Version 3\n{EMPTY_ASCII_BODY}");
+        // version 45 without attributes: no tolerance read
         let bd = BrepData::read_from_file(&k, text.into_bytes(), FileType::Ascii);
         let bd = bd.unwrap();
         assert_eq!(bd.healer_version(), 3);
+        // DISK_HEAD's records have no flags, which version 45 records have: the stream
+        // fails and the shell count is never stored (upstream's lCount is left
+        // uninitialised, #2058)
+        let text = format!("Version 45\nHealer Version 3\n{DISK_HEAD}");
+        assert!(matches!(
+            BrepData::read_from_file(&k, text.into_bytes(), FileType::Ascii),
+            Err(SolidError::InvalidInput { .. })
+        ));
         let bd = BrepData::read_from_file(&k, DISK_HEAD.as_bytes().to_vec(), FileType::Ascii);
         assert_eq!(bd.unwrap().healer_version(), 0);
         let mut d = BrepData::default();

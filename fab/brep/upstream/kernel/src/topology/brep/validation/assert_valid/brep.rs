@@ -6,33 +6,52 @@
 //! | Rust | Upstream |
 //! |------|----------|
 //! | `brep` | `SmBrep::AssertValid` |
-//! | `tolerances` | `SmBrep::ValidateAndUpdateTolerances(TRUE, ...)` |
+//! | `tolerances` | `SmBrep::ValidateAndUpdateTolerances(TRUE, ...)` as `AssertValid` runs it |
+//! | `validate_and_update`, [`ToleranceGaps`] | `SmBrep::ValidateAndUpdateTolerances` |
 //! | `collect_regions` | `SmTopologyTraverser::CollectRegions` |
 //! | `adjacent_regions` | `SmRegion::GetAdjacentRegions` |
 //! | `sub_topology` | `SmBrep::AssertSubTopology` with the `SmBrep` branch of `SmTopologyTraverser::GetSubTopology` |
 //!
-//! Deviations: the validate-only tolerance pass keeps no maxima (its outputs are only
-//! printed by a warning upstream, which is omitted) and does not compute the bounding
-//! box (used only when fixing). Edge-use marks are a local set. `CollectRegions`'
-//! linear stack and result searches use companion sets (same order).
+//! Deviations: the validate-only tolerance pass does not compute the bounding box (used
+//! only when fixing); `AssertValid` drops its maxima (upstream only prints them in a
+//! warning, which is omitted). `pOptMaxEdgeFaceGap` (always 0 upstream, see the pass)
+//! and the unused outputs are not returned. Not upstream (WR-679): the update grows a
+//! vertex past half its tolerance, not the whole. Edge-use marks are a local set.
+//! `CollectRegions`' linear stack and result searches use companion sets (same order).
+//! `AssertValid` does not run `ContainsCoincidentTopology`, which is not ported: upstream
+//! folds in a result that is always true and leaves its report (test 15) commented out, so
+//! the search's own answer never counted (it did edit the body: its queries created the
+//! faces' missing UV trim curves and moved the ends of existing ones, which the later tests
+//! then saw). It cannot be a validity test: the bodies solidcore builds keep
+//! coincident topology on purpose (a pinch where a hole is tangent to a face, solids
+//! touching along an edge, a sweep's glued lamina edges). A face's own coincident vertices
+//! and edges are its tests 32, 33 and 34.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use super::super::{contains_coincident_topology, ERROR};
-use super::{base, brep_object, class, edge, face, loops, seams, shell, vertex, Cx, Test};
+use super::super::PointerCheck;
+use super::{base, brep_object, class, edge, face, loops, seams, shell, vertex, Cx, Rep, Test};
 use crate::error::{EntityRef, Result};
+use crate::geom::tol;
 use crate::kernel::Kernel;
 use crate::math::UNDEF_DOUBLE;
 use crate::query::brep::BrepQuery;
 use crate::topology::brep::{p1, p2, p9};
 use crate::topology::edgeuse::p1 as eu1;
-use crate::topology::{edge as tedge, vertexuse as tvu};
-use crate::topology::{Brep, EdgeuseId, RegionId};
+use crate::topology::{edge as tedge, vertex as tvertex, vertexuse as tvu};
+use crate::topology::{Brep, EdgeId, EdgeuseId, RegionId, VertexId, VertexuseId};
 
 const C: i64 = class::BREP;
 
-/// `SmBrep::AssertValid`.
-pub(super) fn brep(k: &mut Kernel, b: &mut Brep, cx: &mut Cx<'_>, walk: bool) -> Result<bool> {
+/// `SmBrep::AssertValid`; without `pointers` its `ValidatePointers` is taken as succeeding
+/// with no report (see `check_brep_with_keys`).
+pub(super) fn brep(
+    k: &mut Kernel,
+    b: &mut Brep,
+    cx: &mut Cx<'_>,
+    walk: bool,
+    pointers: bool,
+) -> Result<bool> {
     let this = brep_object();
 
     // Init rtn value, and invoke higher-level checks.
@@ -44,16 +63,31 @@ pub(super) fn brep(k: &mut Kernel, b: &mut Brep, cx: &mut Cx<'_>, walk: bool) ->
     }
 
     // Old style checks: ValidatePointers() and ValidateAndUpdateTolerances().
-    let status = super::validate_pointers(k, b, cx.rep.array.as_deref_mut(), 0, walk, cx.keys)?;
-    if status != super::SUCCESS {
+    let (pointer_check, exclusion_failed) = if pointers {
+        super::validate_pointers_excluding(
+            k,
+            b,
+            cx.rep.array.as_deref_mut(),
+            0,
+            walk,
+            cx.keys,
+            false,
+        )?
+    } else {
+        (PointerCheck::Passed, false)
+    };
+    if !pointer_check.is_passed() {
         return Ok(false);
     }
+    // Test #82 refused a vertex whose ball reaches other topology: reported above, and the
+    // body is not valid (the walk below still runs, so its reports are not cut short).
+    rtn &= !exclusion_failed;
 
     // old style ValidateAndUpdateTolerances check (no updating is done)
-    let status = tolerances(k, b, cx)?;
+    let tolerances_ok = tolerances(k, b, cx)?;
 
     // new style - remember failures and keep checking
-    rtn &= status == super::SUCCESS;
+    rtn &= tolerances_ok;
 
     // Walk the Topology graph checks.
     let regions = p1::regions(b, None)?;
@@ -180,11 +214,6 @@ pub(super) fn brep(k: &mut Kernel, b: &mut Brep, cx: &mut Cx<'_>, walk: bool) ->
     let ok = !cx.rep.need(0) || common == num_regions;
     rtn &= cx.rep.this_bool(b, C, this, 19, ok)?;
 
-    // See about running coincident-topology checks (its default level 0, first pair).
-    rtn &=
-        contains_coincident_topology(k, b, -1.0, false, cx.rep.array.as_deref_mut(), 0, cx.keys)?
-            .found;
-
     // Shell context checks (intrinsic).
     for _ in &shells {
         rtn &= cx.rep.this_bool(b, C, this, 13, true)?;
@@ -218,27 +247,138 @@ pub(super) fn brep(k: &mut Kernel, b: &mut Brep, cx: &mut Cx<'_>, walk: bool) ->
     Ok(rtn)
 }
 
-/// `SmBrep::ValidateAndUpdateTolerances(TRUE, ...)`: reports (list 2 of `SmBrep`, about
-/// each edge use) the vertex/edge and vertex/face gaps at both ends of every face's
-/// upward-faceuse edge use that exceed half the vertex tolerance (tests 0-3) and its
-/// edge/face gap over the edge tolerance (test 4); an edge use and its mate are
-/// checked once. Returns the native status (`SM_ERR` for an end without vertex).
-fn tolerances(k: &mut Kernel, b: &mut Brep, cx: &mut Cx<'_>) -> Result<i32> {
-    // Don't change the brep if we are just validating
-    let validate_only = b.validate_only();
-    b.set_validate_only(true);
-    let status = tolerances_validate_only(k, b, cx);
-    b.set_validate_only(validate_only);
-    status
+/// `SmBrep::ValidateAndUpdateTolerances(TRUE, ...)` as `AssertValid` runs it: reports
+/// (list 2 of `SmBrep`, about each edge use) the vertex/edge and vertex/face gaps at
+/// both ends of every face's upward-faceuse edge use that exceed half the vertex
+/// tolerance (tests 0-3) and its edge/face gap over the edge tolerance (test 4); an
+/// edge use and its mate are checked once. Returns false for an end without vertex
+/// (upstream's `SM_ERR`), true otherwise.
+fn tolerances(k: &mut Kernel, b: &mut Brep, cx: &mut Cx<'_>) -> Result<bool> {
+    validate_and_update(k, b, &mut cx.rep, true).map(|(ok, _)| ok)
 }
 
-fn tolerances_validate_only(k: &mut Kernel, b: &mut Brep, cx: &mut Cx<'_>) -> Result<i32> {
-    // get all faces
-    let faces = p1::faces(b, None)?;
+/// (not upstream) [`tolerances`] for the uses of `edges` and of no other edge: the same tests,
+/// run and reported as the whole pass runs and reports them (each use pair of an edge once, on
+/// the faces that use it in the B-rep's face order): its vertex/edge and vertex/face gaps at
+/// both ends over half the vertex tolerance (tests 0-3) and its edge/face gap over the edge
+/// tolerance (test 4). Validating only: no tolerance grows and no UV trim built on the way
+/// raises one. Returns false for an end without vertex, as [`tolerances`].
+pub(super) fn edge_tolerances(
+    k: &mut Kernel,
+    b: &mut Brep,
+    cx: &mut Cx<'_>,
+    edges: &[EdgeId],
+) -> Result<bool> {
+    let only: BTreeSet<EdgeId> = edges.iter().copied().collect();
+    k.with_held_trim_raise(|k| validate_and_update_body(k, b, &mut cx.rep, true, None, Some(&only)))
+        .map(|(ok, _)| ok)
+}
+
+/// The outputs of `SmBrep::ValidateAndUpdateTolerances` (see
+/// [`validate_and_update_tolerances`](super::validate_and_update_tolerances)).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ToleranceGaps {
+    /// `rbTolerancesViolatedOrUpdated`: a gap over its object's tolerance was seen (and,
+    /// when updating, possibly fixed).
+    pub violated_or_updated: bool,
+    /// `rdMaxVertexEdgeGap`: the largest vertex/edge gap (0 without one).
+    pub max_vertex_edge_gap: f64,
+    /// `rdMaxVertexFaceGap`: the largest vertex/face gap (0 without one).
+    pub max_vertex_face_gap: f64,
+    /// `pOptMaxVertexEdgeObj`: the vertex use of the largest vertex/edge gap.
+    pub max_vertex_edge_use: Option<VertexuseId>,
+    /// `pOptMaxVertexFaceObj`: the vertex use of the largest vertex/face gap.
+    pub max_vertex_face_use: Option<VertexuseId>,
+}
+
+/// `SmBrep::ValidateAndUpdateTolerances(bValidateOnly, ...)` reporting into `rep`: whether
+/// it succeeded (false for an end without vertex, upstream's `SM_ERR`) and the outputs. Unless `validate_only`, a vertex with a bad
+/// vertex/edge or vertex/face gap (over half its tolerance, WR-679; upstream: over the
+/// whole of it) grows to twice its larger gap, and an edge with an edge/face gap over its
+/// tolerance grows to twice the gap when the gap is under the B-rep's box diagonal / 800,
+/// before the gaps are reported.
+pub(super) fn validate_and_update(
+    k: &mut Kernel,
+    b: &mut Brep,
+    rep: &mut Rep<'_>,
+    validate_only: bool,
+) -> Result<(bool, ToleranceGaps)> {
+    // Don't change the brep if we are just validating. Not upstream (#21105): upstream sets
+    // `m_bValidateOnly` on the B-rep for the pass and restores it after, so that a UV trim
+    // built during the pass raises no tolerance; here the pass's argument holds the raise on
+    // the kernel for the pass instead, and the B-rep it checks is not written.
+    if validate_only {
+        k.with_held_trim_raise(|k| validate_and_update_body(k, b, rep, true, None, None))
+    } else {
+        validate_and_update_body(k, b, rep, false, None, None)
+    }
+}
+
+/// [`validate_and_update`] growing tolerances (not validating only), the edge use pairs it found
+/// with no gap over its tolerance on a body before skipped (not upstream): a pair whose digest
+/// ([`crate::geom::check_memo::update_pair_digest`], taken as the update comes to it) names one
+/// the update found clean would be found clean again, since its tests read only what the digest
+/// names, so the update grows and reports nothing there. What the pair's update writes on other
+/// uses is kept as it writes it: its vertex/edge gaps are still measured (a measured one goes to
+/// every use of the vertex on the edge), and a pair whose uncached vertex/face gap would clear
+/// another use's cached one is not skipped ([`skips_alike`]). `salt` is the update's
+/// ([`crate::geom::check_memo::update_salt`]).
+pub(super) fn validate_and_update_remembering(
+    k: &mut Kernel,
+    b: &mut Brep,
+    rep: &mut Rep<'_>,
+    salt: crate::geom::content::ContentId,
+) -> Result<(bool, ToleranceGaps)> {
+    validate_and_update_body(k, b, rep, false, Some(salt), None)
+}
+
+use super::super::pointers::{edge_tube_reaches, vertex_ball_reaches, GROWTH_PAST_RATIO};
+
+fn validate_and_update_body(
+    k: &mut Kernel,
+    b: &mut Brep,
+    rep: &mut Rep<'_>,
+    validate_only: bool,
+    memo: Option<crate::geom::content::ContentId>,
+    only: Option<&BTreeSet<EdgeId>>,
+) -> Result<(bool, ToleranceGaps)> {
+    // init outputs
+    let mut out = ToleranceGaps::default();
+
+    // get all faces (not upstream: with `only`, the faces that use one of its edges)
+    let mut faces = p1::faces(b, None)?;
+    if let Some(only) = only {
+        let mut using = BTreeSet::new();
+        for &e in only {
+            using.extend(tedge::faces(b, e, None)?);
+        }
+        faces.retain(|f| using.contains(f));
+    }
+
+    // get bounding box and its size (used only when fixing)
+    let size = if validate_only {
+        0.0
+    } else {
+        crate::query::brep::calculate_bounding_box(
+            k,
+            &*b,
+            crate::query::brep::BoundingBoxOptions::default(),
+        )?
+        .size()
+        .length()
+    };
+
+    // Not upstream (WR-679): a gap is bad past half the vertex tolerance, as the report
+    // below checks them; upstream takes the whole tolerance, so it reports gaps between
+    // the two as bad and never fixes them.
+    let bad_vertex_gap = |gap: Option<f64>, tol: f64| gap.is_some_and(|g| g > tol / 2.0);
 
     // the marked edge uses (an unlocked mark)
     let mut marked: BTreeSet<EdgeuseId> = BTreeSet::new();
-    let need = cx.rep.need(0);
+    // the stitch scope's proofs, once per vertex and per edge
+    let mut ball_reaches: BTreeMap<VertexId, bool> = BTreeMap::new();
+    let mut tube_reaches: BTreeMap<EdgeId, bool> = BTreeMap::new();
+    let need = rep.need(0);
 
     // for every face
     for f in faces {
@@ -250,11 +390,20 @@ fn tolerances_validate_only(k: &mut Kernel, b: &mut Brep, cx: &mut Cx<'_>) -> Re
 
         // for every face->edgeuse
         for eu in edgeuses {
+            // (not upstream) cooperative cancellation once per edgeuse (solidcore#3247)
+            k.check_cancelled(
+                "topology::brep::validation::assert_valid::validate_and_update_body",
+            )?;
             let mate = eu1::mate(b, eu)?;
 
-            // skip marked edgeuses
+            // skip marked edgeuses (not upstream: and those of an edge `only` leaves out)
             if marked.contains(&eu) {
                 continue;
+            }
+            if let Some(only) = only {
+                if !eu1::edge(b, eu)?.is_some_and(|e| only.contains(&e)) {
+                    continue;
+                }
             }
 
             // mark these edgeuses
@@ -266,12 +415,35 @@ fn tolerances_validate_only(k: &mut Kernel, b: &mut Brep, cx: &mut Cx<'_>) -> Re
 
             let start_vu = super::super::required(eu1::vertexuse(b, eu)?)?;
             let Some(start_v) = tvu::vertex(b, start_vu)? else {
-                return Ok(ERROR);
+                return Ok((false, out));
             };
             let end_vu = super::super::required(eu1::vertexuse(b, mate)?)?;
             let Some(end_v) = tvu::vertex(b, end_vu)? else {
-                return Ok(ERROR);
+                return Ok((false, out));
             };
+            // not upstream: a use of a face whose neighbourhood (its edges, vertices and their
+            // tolerances) passed this pass on a body before has no gap over its tolerance
+            // ([`crate::geom::check_memo`]); only a check reads the memo
+            if crate::geom::check_memo::face_clean(k, f) {
+                continue;
+            }
+            // not upstream: an edge use pair the update found clean on a body before
+            // ([`validate_and_update_remembering`])
+            let digest = match memo {
+                Some(salt) => crate::geom::check_memo::update_pair_digest(b, f, eu, mate, salt),
+                None => None,
+            };
+            if digest.is_some_and(|d| crate::geom::check_memo::update_clean(k, d))
+                && skips_alike(b, f, start_vu, start_v, &marked)?
+                && skips_alike(b, f, end_vu, end_v, &marked)?
+            {
+                // the only gaps the pair's update keeps on other uses than its own: a
+                // vertex/edge gap measured goes to every use of the vertex on the edge
+                tvu::vertex_edge_gap(k, b, start_vu, false)?;
+                tvu::vertex_edge_gap(k, b, end_vu, false)?;
+                continue;
+            }
+            let mut grew_or_violated = false;
 
             // get all edgeuse start/end vertex gaps: upstream keeps pointers into the
             // vertex uses' caches and reads their lengths below, so a later refresh that
@@ -279,59 +451,190 @@ fn tolerances_validate_only(k: &mut Kernel, b: &mut Brep, cx: &mut Cx<'_>) -> Re
             // every use of the vertex on the same face / edge, e.g. both ends of a
             // closed edge) shows in an earlier gap
             let start_edge_gap = tvu::vertex_edge_gap(k, b, start_vu, false)?.is_some();
-            let start_face_gap = tvu::vertex_face_gap(k, b, start_vu, false)?.is_some();
+            // On a closed edge (`start_v == end_v`), `end_vu`'s calculation below clears
+            // `start_vu`'s cached vertex/face gap on the same face. When `end_vu` is already
+            // cached and `start_vu` is already reset, computing `start_vu` only to wipe
+            // `end_vu` and immediately recompute `end_vu` produces the exact same state.
+            let closed_end_face_cached = start_v == end_v
+                && start_vu != end_vu
+                && tvu::has_vertex_face_gap(b, start_vu)?
+                && tvu::has_vertex_face_gap(b, end_vu)?
+                && !b.vertexuse(start_vu)?.vertex_face_gap.is_init()
+                && b.vertexuse(start_vu)?.vertex_face_gap.gap_3d == -UNDEF_DOUBLE
+                && b.vertexuse(end_vu)?.vertex_face_gap.is_init();
+            let start_face_gap = if closed_end_face_cached {
+                true
+            } else {
+                tvu::vertex_face_gap(k, b, start_vu, false)?.is_some()
+            };
             let end_edge_gap = tvu::vertex_edge_gap(k, b, end_vu, false)?.is_some();
             let end_face_gap = tvu::vertex_face_gap(k, b, end_vu, false)?.is_some();
+            let (start, end) = (b.vertexuse(start_vu)?, b.vertexuse(end_vu)?);
+            let start_edge = start_edge_gap.then_some(start.vertex_edge_gap.gap_3d);
+            let start_face = start_face_gap.then_some(start.vertex_face_gap.gap_3d);
+            let end_edge = end_edge_gap.then_some(end.vertex_edge_gap.gap_3d);
+            let end_face = end_face_gap.then_some(end.vertex_face_gap.gap_3d);
+
+            // when there are bad edgeuse start, then end, vertex gaps: remember we've
+            // seen a bad gap and, when asked, fix them by increasing the vertex tolerance
+            for (v, edge_gap, face_gap) in [
+                (start_v, start_edge, start_face),
+                (end_v, end_edge, end_face),
+            ] {
+                let tol = b.vertex(v)?.tolerance;
+                if bad_vertex_gap(edge_gap, tol) || bad_vertex_gap(face_gap, tol) {
+                    out.violated_or_updated = true;
+                    grew_or_violated = true;
+                    if !validate_only {
+                        let gap = 2.0 * edge_gap.unwrap_or(0.0).max(face_gap.unwrap_or(0.0));
+                        // A tolerance grows to absorb a rounding or intersection gap, not a
+                        // misplaced vertex: growth may pass the large/small size ratio of the
+                        // body (Test #82) only up to `GROWTH_PAST_RATIO` times it, and the
+                        // pointer check then keeps the vertex only if its ball reaches no
+                        // topology it does not bound (validity rule 7). A gap needing more is
+                        // left over its vertex for the check to report.
+                        let grown = tol::zone_tol3d(k, gap);
+                        if grown < GROWTH_PAST_RATIO * tol::LARGE_SMALL_SIZE_RATIO * b.tolerance() {
+                            tvertex::set_tolerance(b, v, grown, true, true)?;
+                        }
+                    }
+                }
+            }
+
+            // arrive here after bad edgeuse vertex gaps had a chance to be fixed:
+            // report unfixed bad edgeuse start and end vertex/edge and vertex/face gaps
+            let edge_of_eu = super::super::required(eu1::edge(b, eu)?)?;
+            let face_tol = crate::topology::face::p2::tolerance(b, f)?;
             let start_tol = b.vertex(start_v)?.tolerance;
             let end_tol = b.vertex(end_v)?.tolerance;
-            let (start, end) = (b.vertexuse(start_vu)?, b.vertexuse(end_vu)?);
-
-            // report bad edgeuse start and end vertex/edge and vertex/face gaps
             let gaps = [
-                (
-                    0,
-                    start_edge_gap.then_some(start.vertex_edge_gap.gap_3d),
-                    start_tol,
-                ),
-                (
-                    1,
-                    start_face_gap.then_some(start.vertex_face_gap.gap_3d),
-                    start_tol,
-                ),
-                (
-                    2,
-                    end_edge_gap.then_some(end.vertex_edge_gap.gap_3d),
-                    end_tol,
-                ),
-                (
-                    3,
-                    end_face_gap.then_some(end.vertex_face_gap.gap_3d),
-                    end_tol,
-                ),
+                (0, start_edge, start_tol),
+                (1, start_face, start_tol),
+                (2, end_edge, end_tol),
+                (3, end_face, end_tol),
             ];
             for (index, gap, tol) in gaps {
-                let ok = !need || gap.is_none_or(|g| g <= tol / 2.0);
-                cx.rep
-                    .add(b, ok, tolerance_test(index, eu, tol / 2.0), || {
-                        gap.unwrap_or(UNDEF_DOUBLE)
-                    })?;
+                let mut ok = !need || gap.is_none_or(|g| g <= tol / 2.0);
+                if !ok && rep.stitched {
+                    // the zone it spans: the incident edge's (tests 0, 2) or face's (1, 3)
+                    let (v, incident) = match index {
+                        0 => (start_v, tedge::tolerance(b, edge_of_eu)?),
+                        1 => (start_v, face_tol),
+                        2 => (end_v, tedge::tolerance(b, edge_of_eu)?),
+                        _ => (end_v, face_tol),
+                    };
+                    ok = match gap {
+                        Some(g) if g <= tol + incident => {
+                            let reaches = if let Some(&known) = ball_reaches.get(&v) {
+                                known
+                            } else {
+                                let found = vertex_ball_reaches(k, b, v)?;
+                                ball_reaches.insert(v, found);
+                                found
+                            };
+                            !reaches
+                        }
+                        _ => false,
+                    };
+                }
+                rep.add(b, ok, tolerance_test(index, eu, tol / 2.0), || {
+                    gap.unwrap_or(UNDEF_DOUBLE)
+                })?;
+            }
+
+            // save max Vertex gaps: start then end edge/vertex gap, start then end
+            // vertex/face gap
+            for (gap, vu) in [(start_edge, start_vu), (end_edge, end_vu)] {
+                if let Some(g) = gap.filter(|&g| g > out.max_vertex_edge_gap) {
+                    out.max_vertex_edge_gap = g;
+                    out.max_vertex_edge_use = Some(vu);
+                }
+            }
+            for (gap, vu) in [(start_face, start_vu), (end_face, end_vu)] {
+                if let Some(g) = gap.filter(|&g| g > out.max_vertex_face_gap) {
+                    out.max_vertex_face_gap = g;
+                    out.max_vertex_face_use = Some(vu);
+                }
             }
 
             // get edgeuse Edge/Surface Max gaps
             let max_gap = eu1::max_edge_face_gap(k, b, eu, false)?;
             let max_gap = max_gap.map_or(0.0, |g| g.gap_3d);
 
-            // report unfixed bad edgeuse edge gaps
+            // when edge/surface gaps are bad: remember the violation and, when asked,
+            // fix it by increasing the edge tolerance when the gap is small (less than
+            // ModelSize/800)
             let e = super::super::required(eu1::edge(b, eu)?)?;
+            if max_gap > tedge::tolerance(b, e)? {
+                out.violated_or_updated = true;
+                grew_or_violated = true;
+                // (its vertices grow with it, so under the vertices' bound as well)
+                let grown = tol::zone_tol3d(k, 2.0 * max_gap);
+                if !validate_only
+                    && max_gap < size / 800.0
+                    && grown < tol::LARGE_SMALL_SIZE_RATIO * b.tolerance()
+                {
+                    tedge::set_tolerance(b, e, grown, true, true)?;
+                }
+            }
+
+            // report unfixed bad edgeuse edge gaps
             let eu_tol = tedge::tolerance(b, e)?;
-            let ok = !need || max_gap <= eu_tol;
-            cx.rep
-                .add(b, ok, tolerance_test(4, eu, eu_tol), || max_gap)?;
+            let mut ok = !need || max_gap <= eu_tol;
+            if !ok && rep.stitched && max_gap <= eu_tol + face_tol {
+                let reaches = if let Some(&known) = tube_reaches.get(&e) {
+                    known
+                } else {
+                    let found = edge_tube_reaches(k, b, e)?;
+                    tube_reaches.insert(e, found);
+                    found
+                };
+                ok = !reaches;
+            }
+            rep.add(b, ok, tolerance_test(4, eu, eu_tol), || max_gap)?;
+
+            // save max edge/face gap: upstream compares the gap with itself
+            // (`pMaxEdgeFaceGap->GetLength() > dMaxEdgeFaceGap`), so its
+            // `pOptMaxEdgeFaceGap` stays 0 and is not kept
+
+            if let (Some(d), false) = (digest, grew_or_violated) {
+                crate::geom::check_memo::keep_update_clean(k, d);
+            }
         }
     }
 
     // all done
-    Ok(super::SUCCESS)
+    Ok((true, out))
+}
+
+/// Whether skipping vertex use `vu`'s vertex/face gap leaves the rest of the update as measuring
+/// it would. A cached gap is read as it is, with nothing written. An uncached one is measured
+/// after clearing the cached gaps of the vertex's other uses on face `f`; that clearing only
+/// matters for a use whose own pair the update has still to come to (not in `marked`), which
+/// would then measure its gap instead of reading the one it cached.
+fn skips_alike(
+    b: &Brep,
+    f: crate::topology::FaceId,
+    vu: VertexuseId,
+    v: VertexId,
+    marked: &BTreeSet<EdgeuseId>,
+) -> Result<bool> {
+    if b.vertexuse(vu)?.vertex_face_gap.is_init() {
+        return Ok(true);
+    }
+    for other in crate::topology::vertex::vertexuses_of_face(b, v, Some(f), None)? {
+        if other == vu || !b.vertexuse(other)?.vertex_face_gap.is_init() {
+            continue;
+        }
+        let pending = match tvu::edgeuse(b, other)? {
+            Some(eu) => !marked.contains(&eu),
+            None => true,
+        };
+        if pending {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// A `SM_ASSERT_OBJ_VALUE_REPORT(this, SM_LIST_2, index, ...)` of the tolerance pass.
@@ -421,6 +724,9 @@ fn collect_regions(
 /// `SmBrep::AssertSubTopology(*this)`: `AssertValid(SM_NO_WALK)` of every region,
 /// shell, face, face loop, edge and vertex of the B-rep, in that order.
 fn sub_topology(k: &mut Kernel, b: &mut Brep, cx: &mut Cx<'_>) -> Result<bool> {
+    // (not upstream) cooperative cancellation once per entity: a check of a large body's
+    // geometry runs for seconds, the edges' curve analyses most of it (solidcore#3247)
+    const OP: &str = "topology::brep::validation::assert_valid::sub_topology";
     let regions = p1::regions(b, None)?;
     let shells = p1::shells(k, b, None)?;
     let faces = p1::faces(b, None)?;
@@ -437,18 +743,23 @@ fn sub_topology(k: &mut Kernel, b: &mut Brep, cx: &mut Cx<'_>) -> Result<bool> {
         rtn &= shell::region(b, cx, r)?;
     }
     for s in shells {
+        k.check_cancelled(OP)?;
         rtn &= shell::shell(k, b, cx, &shell_index, s)?;
     }
     for f in faces {
+        k.check_cancelled(OP)?;
         rtn &= face::face(k, b, cx, f)?;
     }
     for l in face_loops {
+        k.check_cancelled(OP)?;
         rtn &= loops::loop_(k, b, cx, l)?;
     }
     for e in edges {
+        k.check_cancelled(OP)?;
         rtn &= edge::edge(k, b, cx, e)?;
     }
     for v in vertices {
+        k.check_cancelled(OP)?;
         rtn &= vertex::vertex(k, b, cx, v)?;
     }
     Ok(rtn)

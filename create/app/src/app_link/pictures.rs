@@ -1,5 +1,5 @@
 use super::{AppLinkEnv, WindowId};
-use makepad_call::driver::codec::{Codecs, Decoder, Packet, Picture};
+use makepad_call::driver::codec::{Codecs, Decoder, Packet, Picture, StreamFormat};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,8 @@ pub struct PictureWant {
     pub max_h: u32,
     pub fps: u32,
     pub kbps: u32,
+    /// A share chooses its format. A preview accepts the active stream.
+    pub format: Option<StreamFormat>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -27,6 +29,8 @@ pub struct PictureStats {
 struct State {
     want: PictureWant,
     want_version: u64,
+    format: Option<StreamFormat>,
+    lost: Vec<StreamFormat>,
     await_key: bool,
     key: bool,
     closed: bool,
@@ -67,6 +71,8 @@ fn new_slot(env: &AppLinkEnv, want: PictureWant, wake_on_relay: bool) -> Arc<Pic
             want,
             await_key: true,
             want_version: 0,
+            format: None,
+            lost: Vec::new(),
             key: true,
             closed: false,
             ended_why: None,
@@ -146,6 +152,19 @@ impl PictureStream {
 pub struct PictureProbe(Arc<PictureSlot>);
 
 impl PictureProbe {
+    pub fn set_format(&self, format: StreamFormat) {
+        self.0.state.lock().unwrap().want.format = Some(format);
+    }
+    /// The format of the last picture delivered to this subscription.
+    pub fn format(&self) -> Option<StreamFormat> {
+        self.0.state.lock().unwrap().format
+    }
+    pub fn lost(&self) -> Vec<StreamFormat> {
+        self.0.state.lock().unwrap().lost.clone()
+    }
+    pub(crate) fn lost_count(&self) -> usize {
+        self.0.state.lock().unwrap().lost.len()
+    }
     pub fn stats(&self) -> PictureStats {
         self.0.state.lock().unwrap().stats
     }
@@ -182,8 +201,20 @@ impl PictureSlot {
     }
     pub(super) fn demand(&self) -> Option<PictureWant> {
         let s = self.state.lock().unwrap();
-        (!s.closed).then_some(s.want)
+        let mut want = s.want;
+        if want.format.is_some_and(|f| s.lost.contains(&f)) { want.format = Some(StreamFormat::H264); }
+        (!s.closed).then_some(want)
     }
+    pub(super) fn lose_format(&self, format: StreamFormat) {
+        let mut s = self.state.lock().unwrap();
+        if !s.lost.contains(&format) {
+            s.lost.push(format);
+            let wake = s.wake.clone();
+            drop(s);
+            wake();
+        }
+    }
+
     pub(super) fn take_key_request(&self) -> bool {
         let mut s = self.state.lock().unwrap();
         s.want.active() && std::mem::take(&mut s.key)
@@ -194,7 +225,7 @@ impl PictureSlot {
         !s.closed && s.want.active() && s.unit.is_some()
     }
 
-    pub(super) fn relay(&self, unit: Arc<Packet>, size: (u32, u32), first: bool) {
+    pub(super) fn relay(&self, unit: Arc<Packet>, size: (u32, u32), first: bool, format: StreamFormat) {
         let mut s = self.state.lock().unwrap();
         if s.closed || !s.want.active() || (s.await_key && !unit.key) { return; }
         debug_assert!(s.unit.is_none());
@@ -202,6 +233,7 @@ impl PictureSlot {
         s.stats.received += 1;
         s.stats.encoded += 1;
         s.size = size;
+        s.format = Some(format);
         s.await_key = false;
         s.unit = Some(unit);
         let wake = s.wake.clone();
@@ -331,7 +363,7 @@ impl PictureSlot {
                     owed_pts = None;
                 }
                 if decoder.is_none() {
-                    match codecs.decoder() {
+                    match codecs.decoder(&key.data) {
                         Ok(mut d) => {
                             d.accepts(&key.data);
                             decoder = Some(d);

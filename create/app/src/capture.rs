@@ -1,8 +1,97 @@
 //! The window list is shared by Share, Clip and Snap. Only its location and the selection's intent differ.
-use crate::{app_link::{AppKey, AppLinkEvent, AppLinks, LinkId, LinkPhase, ThumbnailLinks, ThumbnailReply, WindowId}, call::{Press, ShareChoice, ShareRow}};
+use crate::{app_link::{AppKey, AppLinkEvent, AppLinks, IssueStill, LinkId, LinkPhase, ThumbnailLinks, ThumbnailReply, WindowId},
+    call::{Press, ShareChoice, ShareRole, ShareRow, ShareShown}, model::Model};
 use makepad_widgets::*;
+use makepad_widgets::makepad_platform::thread::{Class, TaskHandle};
 use makepad_call::driver::codec::Picture;
+use makepad_town_core::{event::{Id, SessionId, TownId}, key::PublicKey};
 use std::{cell::OnceCell, rc::{Rc, Weak}, sync::{Arc, mpsc::{Receiver, TryRecvError}}, time::Instant};
+
+pub(crate) enum StillCapture {
+    Grabbing(Receiver<Result<IssueStill, String>>),
+    Converting(TaskHandle<Result<IssueStill, String>>),
+}
+
+impl StillCapture {
+    pub(crate) fn grab(links: &mut AppLinks, link: LinkId, window: WindowId, label: &mut String) -> Result<Self, String> {
+        let app = links.state(link).ok_or("The app has closed.")?;
+        let w = app.windows.iter().find(|w| w.id == window && w.visible).ok_or("The window has closed.")?;
+        *label = format!("{} · {} · {} × {} pt · {} dpi", app.app.name, w.title, w.size.0, w.size.1, w.dpi)
+            .replace(['\n', '\r'], " ");
+        Ok(Self::Grabbing(links.issue_still(link, window)?))
+    }
+
+    pub(crate) fn poll(&mut self) -> Option<Result<IssueStill, String>> {
+        match self {
+            Self::Grabbing(receipt) => match receipt.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err("The app closed before the picture arrived.".into())),
+            },
+            Self::Converting(task) => Some(task.try_take()?.unwrap_or_else(|_| Err("The picture conversion stopped.".into()))),
+        }
+    }
+}
+
+pub(crate) struct SharedStill {
+    pub label: String,
+    pub source_peer: Option<PublicKey>,
+    pub capture: Result<StillCapture, String>,
+}
+
+impl ShareShown {
+    pub(crate) fn capture_still(&self, cx: &Cx, links: &mut AppLinks, session: SessionId) -> Option<SharedStill> {
+        let offer = self.offer(session)?;
+        let mut label = offer.title.replace(['\r', '\n'], " ");
+        let (source_peer, capture) = match offer.role {
+            ShareRole::Sharer { link, window } => (None, StillCapture::grab(links, link, window, &mut label)),
+            ShareRole::Viewer { sharer } => {
+                let picture = self.picture_for(session)?.clone();
+                let (w, h) = offer.window_size;
+                label = format!("{label} · {w} × {h} pt · as received");
+                let capture = cx.task_pool().submit_named(Class::Background, "Town shared picture", move || IssueStill::from_picture(&picture))
+                    .map(StillCapture::Converting).map_err(|e| e.to_string());
+                (Some(sharer), capture)
+            }
+        };
+        Some(SharedStill { label, source_peer, capture })
+    }
+}
+
+struct BoardSnap {
+    town: TownId,
+    board: Id,
+    session: SessionId,
+    source_peer: Option<PublicKey>,
+    title: String,
+    capture: StillCapture,
+}
+
+#[derive(Default)]
+pub struct BoardSnaps {
+    pending: Vec<BoardSnap>,
+}
+
+impl BoardSnaps {
+    pub fn start(&mut self, cx: &Cx, links: &mut AppLinks, share: &ShareShown, session: SessionId, town: TownId, board: Id) -> Result<(), String> {
+        let still = share.capture_still(cx, links, session).ok_or("The shared picture is no longer available.")?;
+        self.pending.push(BoardSnap { town, board, session, source_peer: still.source_peer, title: still.label, capture: still.capture? });
+        Ok(())
+    }
+
+    pub fn busy(&self) -> bool { !self.pending.is_empty() }
+
+    pub fn poll(&mut self, model: &mut Model) {
+        self.pending.retain_mut(|snap| {
+            let Some(result) = snap.capture.poll() else { return true };
+            if let Err(why) = result.and_then(|still| model.store_board_snap(snap.town, snap.board,
+                std::mem::take(&mut snap.title), snap.session, snap.source_peer, still)) {
+                model.record_clip_problem(format!("Snap to board: {why}"));
+            }
+            false
+        });
+    }
+}
 
 pub(crate) enum ThumbnailPicture { Still(Arc<ImageBuffer>), Shared(Arc<Picture>) }
 
@@ -357,8 +446,7 @@ pub fn shortcut(event: &Event) -> Option<Press> {
 }
 
 use super::{Destination, Recorder, RecordedClip};
-use crate::model::Model;
-use makepad_widgets::makepad_platform::{screen_capture::FrameCapture, thread::{Class, TaskHandle}};
+use makepad_widgets::makepad_platform::screen_capture::FrameCapture;
 use std::path::{Path, PathBuf};
 
 fn new_file(dir: &Path, extension: &str) -> PathBuf {

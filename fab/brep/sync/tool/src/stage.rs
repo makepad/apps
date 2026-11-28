@@ -1,4 +1,4 @@
-use crate::table::{copy_set, denied, Tree};
+use crate::table::{at_least, Deny, Table, Tree};
 use crate::SyncError;
 use std::collections::BTreeSet;
 use std::fs;
@@ -38,13 +38,13 @@ pub fn fixture_blobs(clone: &Path, pin: &str, paths: &[String]) -> Result<BTreeS
     Ok(blobs)
 }
 
-fn checked_entry(path: &str, kind: u8, copy: &[String]) -> Result<(), SyncError> {
+fn checked_entry(path: &str, kind: u8, copy: &[String], deny: &Deny) -> Result<(), SyncError> {
     if path.is_empty() || path.contains(['\\', ':']) || path.bytes().any(|b| b.is_ascii_control())
         || path.split('/').any(|c| matches!(c, "" | "." | ".."))
     {
         return Err(format!("C1: invalid archive path {path:?}"));
     }
-    if denied(path) {
+    if deny.matches(path) {
         return Err(format!("C2: denied path {path}"));
     }
     if kind == b'2' {
@@ -71,7 +71,7 @@ fn checked_entry(path: &str, kind: u8, copy: &[String]) -> Result<(), SyncError>
 
 // Compare the archive with the pinned tree too: export-ignore can otherwise
 // silently omit a file (even a forbidden file) below a selected directory.
-fn inventory(listing: &[u8], copy: &[String]) -> Result<BTreeSet<String>, SyncError> {
+fn inventory(listing: &[u8], copy: &[String], deny: &Deny, minimum: usize) -> Result<BTreeSet<String>, SyncError> {
     let mut files = BTreeSet::new();
     for record in listing.split(|&b| b == 0).filter(|r| !r.is_empty()) {
         let (meta, path) = str::from_utf8(record).map_err(|e| format!("C1: git path: {e}"))?
@@ -81,18 +81,13 @@ fn inventory(listing: &[u8], copy: &[String]) -> Result<BTreeSet<String>, SyncEr
             Some("120000") => b'2',
             _ => return Err(format!("C1: unexpected git mode for {path}: {meta}")),
         };
-        checked_entry(path, kind, copy)?;
+        checked_entry(path, kind, copy, deny)?;
         files.insert(path.to_owned());
     }
     for p in copy {
-        let present = if p.ends_with('/') {
-            files.iter().any(|f| f.starts_with(p))
-        } else {
-            files.contains(p)
-        };
-        if !present {
-            return Err(format!("C1: required copy path missing: {p}"));
-        }
+        let count = if p.ends_with('/') { files.iter().filter(|f| f.starts_with(p)).count() }
+            else { usize::from(files.contains(p)) };
+        at_least(&format!("C1 {p}"), minimum, count)?;
     }
     Ok(files)
 }
@@ -122,7 +117,7 @@ fn pax<'a>(mut data: &'a [u8], kind: u8, pin: &str) -> Result<Option<&'a str>, S
     Ok(path)
 }
 
-fn unpack(mut tar: &[u8], pin: &str, copy: &[String], mut expected: BTreeSet<String>)
+fn unpack(mut tar: &[u8], pin: &str, copy: &[String], deny: &Deny, mut expected: BTreeSet<String>)
     -> Result<Tree, SyncError>
 {
     let mut files = Tree::new();
@@ -156,7 +151,7 @@ fn unpack(mut tar: &[u8], pin: &str, copy: &[String], mut expected: BTreeSet<Str
             None => format!("{prefix}/{name}"),
         };
         let path = if kind == b'5' { full.strip_suffix('/').unwrap_or(&full) } else { &full };
-        checked_entry(path, kind, copy)?;
+        checked_entry(path, kind, copy, deny)?;
         if kind == b'5' {
             if !data.is_empty() {
                 return Err(format!("C1: directory has file contents: {path}"));
@@ -253,7 +248,7 @@ fn write_raw(pin: &str, tree: &Tree) -> Result<(), SyncError> {
     result
 }
 
-pub fn stage(clone: &Path, pin: &str) -> Result<(String, Tree), SyncError> {
+pub fn resolve(clone: &Path, pin: &str) -> Result<String, SyncError> {
     if !(4..=40).contains(&pin.len()) || !pin.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("expected a hexadecimal commit id for --pin".into());
     }
@@ -267,13 +262,24 @@ pub fn stage(clone: &Path, pin: &str) -> Result<(String, Tree), SyncError> {
     if !git(clone, &["log", "-1", "--format=%H", resolved, "--not", "refs/remotes/origin/main", "--"], &[])?.is_empty() {
         return Err(format!("pin {resolved} is outside origin/main"));
     }
-    let copy = copy_set();
+    Ok(resolved.into())
+}
+
+pub fn metadata(clone: &Path, resolved: &str) -> Result<(String, String), SyncError> {
+    let out = git(clone, &["log", "-1", "--first-parent", "--format=%cI%x00%s", resolved, "--"], &[])?;
+    let text = str::from_utf8(&out).map_err(|e| e.to_string())?.strip_suffix('\n').ok_or("invalid git log output")?;
+    let (date, subject) = text.split_once('\0').ok_or("missing commit metadata")?;
+    Ok((date.into(), subject.into()))
+}
+
+pub fn stage_at(clone: &Path, resolved: &str, table: &Table, persist: bool) -> Result<Tree, SyncError> {
+    let copy = table.copy_set();
     let listing = git(clone, &["ls-tree", "-rz", resolved, "--"], &copy)?;
-    let expected = inventory(&listing, &copy)?;
+    let expected = inventory(&listing, &copy, &table.deny, table.expect.c1_each_path_min)?;
     let archive = git(clone, &["archive", "--format=tar", resolved, "--"], &copy)?;
-    let tree = unpack(&archive, resolved, &copy, expected)?;
-    write_raw(resolved, &tree)?;
-    Ok((resolved.to_owned(), tree))
+    let tree = unpack(&archive, resolved, &copy, &table.deny, expected)?;
+    if persist { write_raw(resolved, &tree)?; }
+    Ok(tree)
 }
 
 #[cfg(test)]
@@ -283,22 +289,26 @@ mod tests {
     #[test]
     fn staging_refuses_symlinks_and_brand_paths() {
         let copy = vec!["crate/src/".to_owned()];
+        let deny = Deny {
+            names: vec!["assets".into(), "LICENSE-BRAND".into()], directories: vec!["crates/look".into()],
+            extensions: ["svg", "png", "ico", "icns", "ttf", "otf"].map(String::from).into(),
+        };
         for (path, kind, rule) in [
             ("crate/src/link", b'2', "C1"), ("crate/src/assets", b'5', "C2"),
             ("crate/src/crates/look/design", b'5', "C2"), ("crate/src/LICENSE-BRAND", b'0', "C2"),
             ("crate/src/face.otf", b'0', "C2"), ("crate/src/a/../x", b'0', "C1"),
             ("other/file", b'0', "C1"), ("crate/src/device", b'3', "C1"),
         ] {
-            let error = checked_entry(path, kind, &copy).unwrap_err();
+            let error = checked_entry(path, kind, &copy, &deny).unwrap_err();
             assert!(error.contains(rule) && error.contains(path), "{error}");
         }
         for ext in ["svg", "png", "ico", "icns", "ttf", "otf"] {
-            assert!(checked_entry(&format!("crate/src/icon.{ext}"), b'0', &copy).is_err());
+            assert!(checked_entry(&format!("crate/src/icon.{ext}"), b'0', &copy, &deny).is_err());
         }
-        assert!(checked_entry("crate/src/lib.rs", b'0', &copy).is_ok());
-        assert!(checked_entry("crate", b'5', &copy).is_ok());
-        assert!(inventory(b"120000 blob unused\tcrate/src/link\0", &copy).unwrap_err().contains("symlink"));
-        let expected = inventory(b"100644 blob unused\tcrate/src/lib.rs\0", &copy).unwrap();
-        assert!(unpack(&[0; 1024], "", &copy, expected).unwrap_err().contains("omitted crate/src/lib.rs"));
+        assert!(checked_entry("crate/src/lib.rs", b'0', &copy, &deny).is_ok());
+        assert!(checked_entry("crate", b'5', &copy, &deny).is_ok());
+        assert!(inventory(b"120000 blob unused\tcrate/src/link\0", &copy, &deny, 1).unwrap_err().contains("symlink"));
+        let expected = inventory(b"100644 blob unused\tcrate/src/lib.rs\0", &copy, &deny, 1).unwrap();
+        assert!(unpack(&[0; 1024], "", &copy, &deny, expected).unwrap_err().contains("omitted crate/src/lib.rs"));
     }
 }

@@ -1,0 +1,18 @@
+# <upstream crate name> <module path>::<test fn> <slow|rustc|platform|relax-bug|feature> <reason>
+# Give the time and profile for slow, the failing shim/patch for rustc, the platform for platform, and the pin for relax-bug.
+# Start a feature reason with the required, default-off Cargo feature name.
+# <upstream crate name> <module path> module <direct use or shared helper, source line and denied token>
+solidcore boolean::topology_intersector::curved_strip::tests module curved_strip_join (line 1930) loads both B-rep fixtures with include_bytes! and CARGO_MANIFEST_DIR (lines 1952–1957).
+solidcore curve::curve::projected_pair_all::original_fixtures module use serde_json::Value (line 12) imports the JSON runtime.
+solidcore error::bare_scan module library_files locates src through CARGO_MANIFEST_DIR (line 311), rust_files_under walks it with std::fs::read_dir (335), and library_files_at reads it with std::fs::read_to_string (358).
+solidcore error::site_scan module crate_sources uses CARGO_MANIFEST_DIR (line 900). pins uses CARGO_MANIFEST_DIR (1002), std::fs::read_dir (1012) and std::fs::read_to_string (1026).
+solidcore offset::construction::sheets::tests module spline_round_spans reads a JSON fixture with serde_json, include_str! and CARGO_MANIFEST_DIR (lines 2422–2427).
+solidcore offset::curve_on_surfaces::tests module fixture_curve (line 903) and fixture_net (917) take serde_json::Value and decode fixture arrays with serde_json::from_value.
+solidcore teeth::tests::hostile module public_functions_in_the_sources uses CARGO_MANIFEST_DIR (line 149), std::fs::read_dir (152) and std::fs::read_to_string (167) to scan source files.
+solidcore topology::brep::p10::tests module raw_vote_trim locates a fixture through CARGO_MANIFEST_DIR (line 3658) and loads it with std::fs::read (3663).
+solidcore topology::brep::p2::tests module test_file resolves upstream test files through CARGO_MANIFEST_DIR (line 3960) and loads them with std::fs::read (3963).
+solidcore topology::brep::validation::assert_valid::edge::tests module filleted_boss embeds a B-rep fixture with include_bytes! and CARGO_MANIFEST_DIR (lines 1245–1246).
+solidcore topology::vertexuse::tests module uv_point_bodies embeds a B-rep fixture with include_bytes! and CARGO_MANIFEST_DIR (lines 2592–2593).
+solidcore profile::enabled::tests::scopes_aggregate_by_path_and_close_on_early_returns feature profile: off in our builds
+solidcore profile::enabled::tests::self_time_excludes_children_and_recursion_counts_once feature profile: off in our builds
+solidcore nurbs::b_spline_curve::p3::tests::the_memo_off_switch_runs_every_search feature profile: off in our builds

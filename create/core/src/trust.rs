@@ -71,6 +71,18 @@ impl<T> ForAi<T> {
     pub fn trust(&self) -> Trust { self.trust }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlobAccess {
+    pub id: Id,
+    pub size: u64,
+    pub root: [u8; 32],
+}
+
+impl ForAi<BlobAccess> {
+    pub fn blob(&self) -> BlobAccess { self.value }
+    pub fn into_proof(self) -> ForAi<()> { ForAi { value: (), trust: self.trust } }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GatedSessionSummary {
     pub is_share: bool,
@@ -180,6 +192,7 @@ impl ForAi<String> {
 }
 
 impl<'a> ForAi<&'a Value> {
+    pub fn is_text(&self, expected: &str) -> bool { matches!(self.value, Value::Text(text) if text == expected) }
     pub fn as_i64(&self) -> Option<i64> { if let Value::Int(n) = self.value { Some(*n) } else { None } }
     pub fn as_bool(&self) -> Option<bool> { if let Value::Bool(b) = self.value { Some(*b) } else { None } }
     pub fn as_id(&self) -> Option<Id> { if let Value::Id(id) = self.value { Some(*id) } else { None } }
@@ -731,6 +744,16 @@ impl<'a> Gate<'a> {
     pub fn entity_field_value(&self, id: &Id, key: &Key) -> Result<ForAi<&'a Value>, Withheld> {
         let field = self.field_state(id, key)?;
         Ok(ForAi { value: &field.value.value, trust: field.trust })
+    }
+    /// Authorizes the current blob reference and its copy sources on a visible entity.
+    pub fn entity_blob(&self, entity: &Id, key: &Key) -> Result<ForAi<BlobAccess>, Withheld> {
+        let value = self.entity_field_value(entity, key)?;
+        if entity_field_class(&self.state.entities[entity].kind, key) != Class::Captured {
+            return Err(Withheld::Hidden)
+        }
+        let (size, root) = value.as_blob().ok_or(Withheld::MissingSource)?;
+        let blob = BlobAccess { id: crate::blob::id(size, &root), size, root };
+        Ok(ForAi { value: blob, trust: value.trust() })
     }
     pub fn entity_field_writer(&self, id: &Id, key: &Key) -> Result<Id, Withheld> {
         Ok(self.field_state(id, key)?.value.writer)
@@ -1780,6 +1803,14 @@ mod tests {
         log.add(0, human, profile("Lu"));
         let latest_ana = log.add(0, human, profile("Ana"));
         let title_of_chat = log.add(0, human, copy_record(chat));
+        let root = [0x42; 32];
+        let size = 32;
+        let picture = Value::Blob { size, root };
+        let issue = log.add(1, human, entity(kind::ISSUE, vec![(field::BLOB, picture.clone()), (field::TEXT, picture.clone())]));
+        let copied_issue = log.add(0, human, Content::Entity {
+            kind: Key::Number(kind::ISSUE), project: None, derive: None, fields: vec![(field::BLOB, picture)],
+            copied_from: vec![reference(None, field::BLOB, CopySource::EntityField { entity: issue, field: field::BLOB, writer: issue })],
+        });
 
         let open = |session| Content::Session(SessionOp::Open { session, to: vec![], town_wide: true, mode: SessionMode::Call { video: false } });
         let say = |session, text: &str| Content::Said { session, lines: vec![SaidLine { at_ms: 0, dur_ms: 1, text: text.into() }] };
@@ -1909,6 +1940,11 @@ mod tests {
         }
         assert_eq!(reassembled, rendered.as_str(), "JSON fragments reassemble the exact oversized signed row");
         assert_eq!(gate.chat_text(&chat).unwrap().value, "Ben", "active member chat passes");
+        let blob = BlobAccess { id: crate::blob::id(size, &root), size, root };
+        for id in [issue, copied_issue] {
+            assert_eq!(gate.entity_blob(&id, &field::BLOB).unwrap().blob(), blob, "an authorized still identifies its stored bytes");
+        }
+        assert_eq!(gate.entity_blob(&issue, &field::TEXT), Err(Withheld::Hidden), "a blob in a typed field is refused");
         assert_eq!(Gate::new(&state, LocalPolicy::Cleared).chat_text(&chat), Err(Withheld::RequiresClearance),
             "local_cleared_override_withholds_uncleared_member");
         for n in 40..=46 {
@@ -2026,6 +2062,8 @@ mod tests {
         assert_eq!(gate.entity_visible(&spoof), Err(Withheld::External), "overwriting EDIT_SEAT cannot replace a removed signed seat");
         assert_eq!(gate.entity_field_text(&spoof, &field::TEXT), Err(Withheld::External), "the removed signed seat withholds fields too");
         assert_eq!(gate.chat_text(&chat), Err(Withheld::External), "removed authors are external");
+        assert_eq!(gate.entity_blob(&issue, &field::BLOB), Err(Withheld::External), "the removed reporter's still is withheld");
+        assert_eq!(gate.entity_blob(&copied_issue, &field::BLOB), Err(Withheld::External), "a member's copy follows the original still's provenance");
         assert_eq!(gate.entity_visible(&from_ben_doc), Err(Withheld::External), "removing the derived doc author withholds the task");
         assert_eq!(gate.entity_visible(&seat_edit), Err(Withheld::External), "removing the original EDIT_SEAT withholds the edit");
         assert_eq!(gate.entity_field_text(&seat_edit, &field::TEXT), Err(Withheld::External), "removing EDIT_SEAT withholds edit fields");

@@ -358,7 +358,7 @@ fn call_roster_peer_badge_matches_seat_colour() {
     assert_eq!(app.view.call.view.phase, Phase::Live);
     let tone = app.view.members.seat_tone_for_device(&peer).expect("Ada has a seat in the open town");
     let page = app.ui.call_row(cx, ids!(live_call));
-    page.show(cx, &app.view.call.view, &Default::default(), app.view.call.talking);
+    page.show(cx, &app.view.call.view, &Default::default(), app.view.call.talking, app.view.members.you_name());
     let badge = page.widget(cx, ids!(peer_badge));
     let mut target = ui_checks::UiCheckTarget::new(cx);
     let mut check_badge = |cx: &mut Cx, app: &App, fill: Vec4f, ink: Vec4f| {

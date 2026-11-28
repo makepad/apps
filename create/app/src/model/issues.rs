@@ -1,12 +1,60 @@
 use super::*;
-use crate::store_worker::StoredFile;
+use crate::{marks::{self, Head}, store_worker::StoredFile};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct IssueProject { pub town: TownId, pub project: Id }
 
 pub enum IssueEdit { Note(String), Resolved(bool), Delete }
 
+impl Town {
+    /// Chain each chunk to the preceding signature, including the new issue when filing a draft.
+    pub(super) fn sign_mark(&self, key: &DeviceKey, target: Id, project: Option<Id>, width: i32, head: Head,
+        pts: &[[i32; 2]], origin: Origin, events: &mut Vec<Event>) -> Result<(), String> {
+        if width <= 0 || pts.len() < 2 || pts.iter().flatten().any(|n| !(0..=marks::UNIT).contains(n)) {
+            return Err("A mark needs a positive width and at least two points inside the picture.".into())
+        }
+        let chunks = marks::chunks(pts);
+        for (i, chunk) in chunks.iter().enumerate() {
+            let arrow = head == Head::End && i + 1 == chunks.len();
+            let fields = vec![(field::PARENT, FieldValue::Id(target)),
+                (Key::Name("pts".into()), FieldValue::Literal(marks::encode_pts(chunk))),
+                (Key::Name("width".into()), FieldValue::Literal(width.to_string())),
+                (Key::Name("head".into()), FieldValue::Literal(if arrow { "1" } else { "0" }.into()))];
+            let parents = events.last().map_or_else(|| self.log.parents_for(&key.public()), |e| vec![e.id]);
+            events.push(self.sign(key, Content::Entity { kind: Key::Number(kind::STROKE), project, derive: None,
+                fields, copied_from: vec![] }, origin, parents)?);
+        }
+        Ok(())
+    }
+
+    pub(super) fn save_issue_events(&mut self, events: Vec<Event>) -> Result<Id, String> {
+        let first = events.first().ok_or("No issue or marks to save.")?.id;
+        let from = self.log.events().len();
+        self.log.append_all(events).map_err(|e| format!("Saving the issue marks: {e}"))?;
+        self.fold_from(from);
+        self.index_from(from);
+        Ok(first)
+    }
+}
+
 impl Model {
+    pub(crate) fn issue_fold_stamp(&self) -> (usize, u64) {
+        (self.open_event_count(), self.membership_epoch)
+    }
+
+    /// A fork or the arrival of a missing parent can refold older records. Otherwise only
+    /// a change to this issue or to a stroke entering, on, or leaving it needs a new decode.
+    pub(crate) fn issue_marks_touched(&self, since: (usize, u64), target: Id, was_on: impl Fn(&Id) -> bool) -> bool {
+        if since.1 != self.membership_epoch { return true }
+        let Some(events) = self.log.events().get(since.0..) else { return true };
+        let related = |id: &Id| *id == target || self.state.entities.get(id).is_some_and(|e|
+            e.kind == kind::STROKE && (parent(e) == Some(target) || was_on(id)));
+        events.iter().any(|event| {
+            if event.header.kind == makepad_town_core::event::kind::ENTITY { return related(&event.id) }
+            crate::board::touched_by(event, |id| self.event(id)).iter().any(&related)
+        })
+    }
+
     pub(crate) fn store_issue(&mut self, draft: u64, town: TownId, still: crate::app_link::IssueStill) -> Result<(), String> {
         let worker = self.files.worker.as_mut().filter(|w| !w.stopped()).ok_or("Picture storage is unavailable.")?;
         worker.add_issue(draft, town, still.png, still.poster);
@@ -24,7 +72,8 @@ impl Model {
     }
 
     pub(crate) fn file_issue(&mut self, project: IssueProject, pictures: [StoredFile; 2], [w, h]: [u32; 2],
-        label: &str, note: &str, session: Option<SessionId>, video: Option<(StoredFile, i64)>, source_peer: Option<PublicKey>) -> Result<Id, String> {
+        label: &str, note: &str, session: Option<SessionId>, video: Option<(StoredFile, i64)>, source_peer: Option<PublicKey>,
+        marks: &[(i32, Head, Vec<[i32; 2]>)]) -> Result<Id, String> {
         if !self.complete_blobs(&project.town).is_some_and(|held| pictures.iter().chain(video.as_ref().map(|(f, _)| f)).all(|f| held.contains(&f.id))) {
             return Err("Issue media is missing from storage.".into());
         }
@@ -48,8 +97,15 @@ impl Model {
             if let Some(peer) = peer { sources.push(CopySource::SharePeer { peer }); }
             if let Some(open) = open { sources.push(CopySource::Record(open.anchor)); }
             let copied_from = entity_copy_refs(&fields, &[field::LABEL, field::BLOB, field::POSTER, field::VIDEO], &sources);
-            r.append(key, Content::Entity { copied_from, kind: Key::Number(kind::ISSUE), project: Some(project.project),
-                derive: None, fields }, Origin::Ui)
+            let project = Some(project.project);
+            let issue = r.sign(key, Content::Entity { copied_from, kind: Key::Number(kind::ISSUE), project,
+                derive: None, fields }, Origin::Ui, r.log.parents_for(&key.public()))?;
+            let target = issue.id;
+            let mut events = vec![issue];
+            for (width, head, pts) in marks {
+                r.sign_mark(key, target, project, *width, *head, pts, Origin::Ui, &mut events)?;
+            }
+            r.save_issue_events(events)
         })
     }
 
@@ -126,7 +182,7 @@ mod tests {
         assert_eq!(pictures.map(|f| f.id), expected, "the store receipt identifies the original PNG and its poster");
         let before = ana.open_event_count();
         assert!(ana.project_issues(project.project).is_empty(), "storing pictures alone publishes no issue");
-        let issue = ana.file_issue(project, pictures, size, label, "Clipped title", None, None, None).unwrap();
+        let issue = ana.file_issue(project, pictures, size, label, "Clipped title", None, None, None, &[]).unwrap();
         assert_eq!(ana.open_event_count(), before + 1, "filing publishes both pictures and the note in one record");
         exchange(&mut ana, &mut ben);
         let seen = ben.project_issues(project.project);

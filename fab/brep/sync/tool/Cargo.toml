@@ -8,3 +8,4 @@ publish = false
 
 [dependencies]
 relax-lex = { workspace = true }
+makepad-core-util = { path = "../../../../../../libs/core_util" }

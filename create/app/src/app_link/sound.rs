@@ -1,4 +1,5 @@
 use super::AppLinkEnv;
+use makepad_call::driver::share_audio::{AudioPacket, ShareAudioEncoder, ShareAudioSource};
 use makepad_remote::{audio::{self, AudioRecord}, conn::CLOSE_UNSUPPORTED, Channel, Conn, Event};
 use std::{
     collections::VecDeque,
@@ -9,6 +10,33 @@ use std::{
 /// The app's own sound, as its `audio` service sends it. Dropping the last one closes the channel.
 pub struct AppSound {
     slot: Arc<SoundSlot>,
+}
+
+/// Encodes app records on the call's network worker.
+pub struct EncodedSound {
+    sound: AppSound,
+    encoder: ShareAudioEncoder,
+    out: VecDeque<AudioPacket>,
+}
+
+impl EncodedSound {
+    pub fn new(sound: AppSound) -> Self {
+        Self { sound, encoder: ShareAudioEncoder::new(), out: VecDeque::new() }
+    }
+}
+
+impl ShareAudioSource for EncodedSound {
+    fn pop(&mut self) -> Option<AudioPacket> {
+        while self.out.is_empty() {
+            let record = self.sound.pop()?;
+            self.encoder.push(record.rate, record.gen, record.t_ns, &record.pcm, &mut self.out);
+        }
+        self.out.pop_front()
+    }
+
+    fn set_wake(&mut self, wake: Arc<dyn Fn() + Send + Sync>) {
+        self.sound.set_wake(wake);
+    }
 }
 
 /// The link's half; dropping it closes the slot.

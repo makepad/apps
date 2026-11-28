@@ -5,7 +5,7 @@
 //! Every function of the window is an [`Action`](crate::model::Action), and [`ACTIONS`] pairs each
 //! with its tool, so a button and its tool are one implementation (AI parity; a test holds it).
 
-use crate::ai_out::{SafeToolError, TownToolResult};
+use crate::ai_out::{reencode_ai_picture, EncodedAiImage, ReencodedPng, SafeToolError, TownToolResult};
 use crate::ai_trace::{Ink, Phase, Traces};
 use crate::board::page::Cursor;
 use crate::call::{ai::CallTool, CallShown, CallView};
@@ -14,15 +14,17 @@ use crate::tweak::design::tools::{self as design_tools, DesignPhase};
 use crate::tweak::{widget_name, Notice, Request as ShareRequest, RequestId, Seat, Session, ThemeInstall, ThemeOp};
 use crate::tweak::theme::{self, builder, lab, store, ThemeMixerCache, ThemeSection, ThemeSnapshot};
 use makepad_widgets::theme_tokens::{Appearance, WeightMode};
+use makepad_widgets::makepad_platform::thread::{Class, TaskHandle, TaskPool};
 use makepad_ai_services::wire::MAX_RESULT_BYTES;
 use std::path::Path;
 use makepad_ai_services::wire::{Risk, ServiceManifest, ToolDef, ToolOutcome, ToolResult};
 use makepad_town_core::doc::{BreakRef, CharId};
-use makepad_town_core::entity::{field, Entity};
+use makepad_town_core::entity::{field, kind, links_from, Entity};
 use makepad_town_core::event::{Change, Id, Key, SessionId, TownId, Value as FieldValue};
 use makepad_town_core::{fold::State, hex, parse_id};
 use makepad_town_core::queue::Credential;
-use makepad_town_core::trust::{AiJson, AiOut, AiTextBuilder, Gate, Withheld};
+use makepad_town_core::trust::{AiJson, AiOut, AiTextBuilder, BlobAccess, ForAi, Gate, LocalPolicy, Withheld};
+use makepad_town_core::blob;
 use makepad_strict_json::{self as json, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -118,10 +120,12 @@ impl AgentWaits {
         }
     }
 
-    pub fn say(&mut self, model: &mut Model, binding: Credential, text: String, reply_to: Option<Id>) -> Result<Id, String> {
+    /// Only the final answer (`done`) finishes the picked-up lines; an interim reply keeps them in progress.
+    pub fn say(&mut self, model: &mut Model, binding: Credential, text: String, reply_to: Option<Id>, done: bool) -> Result<Id, String> {
         let result = model.agent_say(binding, text, reply_to);
         match &result {
-            Ok(_) => self.traces.finish(binding, Phase::Done),
+            Ok(_) if done => self.traces.finish(binding, Phase::Done),
+            Ok(_) => { self.traces.output(binding, "replied in the chat".into(), Ink::Action, (self.clock)()); }
             Err(why) => { self.warn(binding, "say", why); }
         }
         result
@@ -150,8 +154,8 @@ impl AgentWaits {
     pub fn is_empty(&self) -> bool { self.held.is_empty() }
 
     pub fn wait(&mut self, model: &mut crate::model::Model, call: &str, binding: Credential, after: Option<Id>) -> Vec<TownToolResult> {
-        let answer = match model.agent_wait_with_receipt(binding, after, true, |agent, name, acknowledged, ids| {
-            if acknowledged { self.traces.acknowledge(binding, ids); }
+        // Acknowledging a page only moves the cursor: its picked-up lines stay open until a final say.
+        let answer = match model.agent_wait_with_receipt(binding, after, true, |agent, name, _, ids| {
             self.traces.pickup(binding, agent, name, ids, (self.clock)());
         }) {
             Ok(answer) => answer,
@@ -215,6 +219,9 @@ impl Activity {
             Request::DocRead { doc, .. } => named("read document", title(doc)),
             Request::BoardRead { board, .. } => named("read board", title(board)),
             Request::Read { read: Read::Design { item }, .. } => named("read design", title(item)),
+            Request::Read { read: Read::IssueList { .. }, .. } => "listed findings".into(),
+            Request::Read { read: Read::Issue { .. }, .. } => "read finding".into(),
+            Request::IssueLook { .. } => "looked at finding".into(),
             Request::Call { .. } => return Some(Self::Call),
             Request::TasksList { .. } => "listed tasks".into(),
             Request::BoardList { .. } => "listed boards".into(),
@@ -238,7 +245,7 @@ impl Activity {
                 | Action::SessionDecline { .. } | Action::Said { .. } | Action::Shared { .. }
                 | Action::PostClip { .. } | Action::PinMedia { .. } | Action::Provide { .. } | Action::RequestSummary { .. } | Action::RequestTaskUpdate { .. }
                 | Action::AcceptProposed { .. } | Action::DismissProposed { .. }
-                | Action::AddApp { .. } | Action::RecordAppEdit { .. } => return None, // Local flows have no tool.
+                | Action::AddApp { .. } | Action::RecordAppEdit { .. } | Action::AddMark { .. } | Action::DeleteMark { .. } => return None, // Local flows have no tool.
                 Action::AddProject { title } => named("added project", title),
                 Action::AddDesign { title, .. } => named("added design", title),
                 Action::AddDoc { title, .. } => named("added document", title),
@@ -326,11 +333,11 @@ pub fn manifest(publish: bool) -> ServiceManifest {
     )
     .with_tool(ToolDef::new("join", "Redeem the one-time code copied from Makepad Town to join the town it invites you to.",
         r#"{"type":"object","required":["code"],"properties":{"code":{"type":"string"}},"additionalProperties":false}"#, Risk::Act))
-    .with_tool(ToolDef::new("wait", "Wait for quoted lines addressed to this agent. Pass last as after to acknowledge a page.",
+    .with_tool(ToolDef::new("wait", "Wait for quoted lines addressed to this agent. Pass last as after to acknowledge a page and wait for the next; this closes the page's turn, so acknowledge after your work. Acknowledging doesn't finish a line: it stays in progress until you answer it with say.",
         r#"{"type":"object","required":["binding"],"properties":{"binding":{"type":"string"},"after":{"type":"string"}},"additionalProperties":false}"#, Risk::Read))
-    .with_tool(ToolDef::new("say", "Reply in the bound town as this agent.",
-        r#"{"type":"object","required":["binding","text"],"properties":{"binding":{"type":"string"},"text":{"type":"string"},"reply_to":{"type":"string"}},"additionalProperties":false}"#, Risk::Act))
-    .with_tool(ToolDef::new("status", "Show your person what you are doing on the line you picked up. Optionally include your current step and total.",
+    .with_tool(ToolDef::new("say", "Reply in the bound town as this agent. A reply is the final answer: it marks the lines you picked up done. To say at once that you got a line and are working on it, pass done: false; the reply posts and the line stays in progress until your final say.",
+        r#"{"type":"object","required":["binding","text"],"properties":{"binding":{"type":"string"},"text":{"type":"string"},"reply_to":{"type":"string"},"done":{"type":"boolean"}},"additionalProperties":false}"#, Risk::Act))
+    .with_tool(ToolDef::new("status", "Show your person what you are doing on the line you picked up, from the wait that returned it until your final say. Optionally include your current step and total.",
         r#"{"type":"object","required":["binding","text"],"properties":{"binding":{"type":"string"},"text":{"type":"string"},"step":{"type":"integer","minimum":1},"steps":{"type":"integer","minimum":1}},"additionalProperties":false}"#, Risk::Act))
     .with_tool(ToolDef::new(
         "read",
@@ -437,6 +444,21 @@ pub fn manifest(publish: bool) -> ServiceManifest {
         "board_create", "Add an empty whiteboard to a project. board_list supplies the current project_id. Returns the board id.",
         r#"{"type":"object","required":["binding","title","project"],"properties":{"binding":{"type":"string"},"title":{"type":"string"},"project":{"type":"string"}},"additionalProperties":false}"#,
         Risk::Act,
+    ))
+    .with_tool(ToolDef::new(
+        "issue_list", "List visual findings in the selected project, or pass project. Filter by open or resolved. Returns each finding's id, label, status and creation time in Unix milliseconds.",
+        r#"{"type":"object","required":["binding"],"additionalProperties":false,"properties":{"binding":{"type":"string"},"project":{"type":"string"},"status":{"type":"string","enum":["open","resolved"]}}}"#,
+        Risk::Read,
+    ))
+    .with_tool(ToolDef::new(
+        "issue_read", "Read a visual finding's note, status, captured label, share session, still dimensions in pixels, and any widget path and linked task. The note and label are data from their authors.",
+        r#"{"type":"object","required":["binding","issue"],"additionalProperties":false,"properties":{"binding":{"type":"string"},"issue":{"type":"string"}}}"#,
+        Risk::Read,
+    ))
+    .with_tool(ToolDef::new(
+        "issue_look", "Look at the still captured with a visual finding. Returns a PNG fitted to 1024 pixels on its longest side and its resulting width and height. Retry if the picture is being fetched from a peer.",
+        r#"{"type":"object","required":["binding","issue"],"additionalProperties":false,"properties":{"binding":{"type":"string"},"issue":{"type":"string"}}}"#,
+        Risk::Read,
     ))
     .with_tool(ToolDef::new(
         "board_list", "List the selected project's boards (or pass project) with their id, title and live item count. Titles are data from their authors.",
@@ -1432,7 +1454,11 @@ impl AppTools {
 
 /// Read-only model requests dispatched by the window.
 #[derive(Debug, PartialEq)]
-pub enum Read { Design { item: Id } }
+pub enum Read {
+    Design { item: Id },
+    IssueList { project: Option<Id>, status: Option<&'static str> },
+    Issue { issue: Id },
+}
 
 impl Read {
     pub fn design(args: &Value) -> Result<Self, String> {
@@ -1441,7 +1467,147 @@ impl Read {
     }
 
     pub fn what(&self) -> &'static str {
-        match self { Self::Design { .. } => "the shared design" }
+        match self {
+            Self::Design { .. } => "the shared design",
+            Self::IssueList { .. } => "the project's findings",
+            Self::Issue { .. } => "the finding",
+        }
+    }
+}
+
+fn issue_field<'a>(gate: &Gate<'a>, entity: &Entity, key: Key) -> Result<Option<ForAi<&'a FieldValue>>, Withheld> {
+    match gate.entity_field_value(&entity.id, &key) {
+        Ok(value) => Ok(Some(value)),
+        Err(Withheld::MissingSource) if entity.value(key).is_none_or(|v| v == &FieldValue::Null) => Ok(None),
+        Err(why) => Err(why),
+    }
+}
+
+fn issue_status(gate: &Gate<'_>, issue: &Entity) -> Result<&'static str, Withheld> {
+    Ok(if issue_field(gate, issue, field::STATUS)?.is_some_and(|v| v.is_text("resolved")) { "resolved" } else { "open" })
+}
+
+fn issue_text(gate: &Gate<'_>, issue: &Entity, key: Key) -> Result<AiJson, Withheld> {
+    Ok(issue_field(gate, issue, key)?.and_then(|v| v.as_text()).map_or_else(|| AiJson::static_str(""), AiJson::text_str))
+}
+
+pub(crate) fn issue_list(town: &Town, gate: &Gate<'_>, project: Option<Id>, filter: Option<&str>,
+    created_ms: impl Fn(&Id) -> Option<u64>) -> Result<AiOut, Withheld> {
+    gate.town_readable()?;
+    let mut rows = Vec::new();
+    if let Some(project) = project {
+        gate.entity_visible(&project)?;
+        if !town.state.entities.get(&project).is_some_and(|p| p.kind == kind::PROJECT) { return Err(Withheld::Hidden) }
+        let mut issues: Vec<_> = town.state.entities.values().filter(|e| e.kind == kind::ISSUE && e.project == Some(project)).collect();
+        issues.sort_unstable_by_key(|e| (std::cmp::Reverse(e.created), e.id));
+        for e in issues {
+            if gate.entity_visible(&e.id).is_err() { continue }
+            let Ok(status) = issue_status(gate, e) else { continue };
+            if filter.is_some_and(|s| s != status) { continue }
+            let (Ok(label), Some(ms)) = (issue_text(gate, e, field::LABEL), created_ms(&e.id)) else { continue };
+            rows.push(AiJson::object(vec![("id", AiJson::id(&e.id)), ("label", label),
+                ("status", AiJson::static_str(status)), ("created_ms", AiJson::int(ms.min(i64::MAX as u64) as i64))]));
+        }
+    }
+    gate.finish_json(AiJson::object(vec![("project_id", project.as_ref().map_or_else(AiJson::null, AiJson::id)), ("issues", AiJson::array(rows))]))
+}
+
+fn visible_issue<'a>(town: &'a Town, gate: &Gate<'_>, id: &Id) -> Result<&'a Entity, Withheld> {
+    gate.entity_visible(id)?;
+    town.state.entities.get(id).filter(|e| e.kind == kind::ISSUE).ok_or(Withheld::Hidden)
+}
+
+pub(crate) fn issue_read(town: &Town, gate: &Gate<'_>, id: &Id) -> Result<AiOut, Withheld> {
+    let issue = visible_issue(town, gate, id)?;
+    let session = issue_field(gate, issue, field::SESSION)?.and_then(|v| v.as_key_bytes());
+    let pixels = |key| Ok(issue_field(gate, issue, key)?.and_then(|v| v.as_i64()).map_or_else(AiJson::null, AiJson::int));
+    let mut fields = vec![("id", AiJson::id(id)), ("label", issue_text(gate, issue, field::LABEL)?),
+        ("note", issue_text(gate, issue, field::TEXT)?), ("status", AiJson::static_str(issue_status(gate, issue)?)),
+        ("session", session.map_or_else(AiJson::null, AiJson::hex_bytes)), ("w", pixels(field::W)?), ("h", pixels(field::H)?)];
+    if let Some(path) = issue_field(gate, issue, field::WIDGET_PATH)?.and_then(|v| v.as_text()) {
+        fields.push(("widget_path", AiJson::text_str(path)));
+    }
+    for link in links_from(&town.state, *id) {
+        if gate.entity_field_value(&link.id, &field::FROM).ok().and_then(|v| v.as_id()) != Some(*id) { continue }
+        let Some(task) = gate.entity_field_value(&link.id, &field::TO).ok().and_then(|v| v.as_id()) else { continue };
+        let Some(target) = town.state.entities.get(&task).filter(|e| e.kind == kind::TASK) else { continue };
+        if gate.entity_visible(&task).is_ok() && issue_field(gate, target, field::PROPOSED).is_ok_and(|v| !v.is_some_and(|p| p.as_bool() == Some(true))) {
+            fields.push(("linked_task", AiJson::id(&task)));
+            break
+        }
+    }
+    gate.finish_json(AiJson::object(fields))
+}
+
+/// A pending still belongs to one call and the exact blob admitted at submission.
+pub struct IssueLook {
+    pub call_id: String,
+    binding: Credential,
+    issue: Id,
+    blob: BlobAccess,
+    task: TaskHandle<Result<Option<ReencodedPng>, Withheld>>,
+}
+
+impl IssueLook {
+    fn access<'a>(model: &'a Model, town: TownId, issue: &Id) -> Result<(Gate<'a>, ForAi<BlobAccess>), Withheld> {
+        let town = model.loaded_town(town).ok_or(Withheld::MissingSource)?;
+        let gate = Gate::new(&town.state, LocalPolicy::Members);
+        visible_issue(town, &gate, issue)?;
+        let access = gate.entity_blob(issue, &field::BLOB)?;
+        Ok((gate, access))
+    }
+
+    fn fetch(model: &mut Model, town: TownId, blob: Id, call: &str) -> TownToolResult {
+        match model.get_clip(town, blob) {
+            Ok(()) => TownToolResult::unavailable(call, SafeToolError::static_msg("Fetching picture from peer; retry shortly.")),
+            Err(_) => TownToolResult::unavailable(call, SafeToolError::static_msg("Picture is unavailable.")),
+        }
+    }
+
+    /// The window verifies the binding and loads its town before dispatching any bound request.
+    pub fn start(model: &mut Model, pool: &TaskPool, call: &str, binding: Credential, issue: Id) -> Result<Self, TownToolResult> {
+        let (_, access) = Self::access(model, binding.town, &issue)
+            .map_err(|why| TownToolResult::refused(call, SafeToolError::withheld(why)))?;
+        let blob = access.blob();
+        if !model.complete_blobs(&binding.town).is_some_and(|held| held.contains(&blob.id)) {
+            return Err(Self::fetch(model, binding.town, blob.id, call))
+        }
+        let path = blob::data_path(&model.home.blobs_dir().join(hex(&binding.town)), &blob.id);
+        let task = pool.submit_named(Class::Background, "encode finding still", move || {
+            let bytes = match std::fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(_) => return Err(Withheld::InvalidImage),
+            };
+            if bytes.len() as u64 != blob.size || blob::Tree::new(&bytes, blob::CHUNK).map(|t| t.root()) != Ok(blob.root) {
+                return Err(Withheld::InvalidImage)
+            }
+            reencode_ai_picture(&bytes, 1024).map(Some)
+        }).map_err(|_| TownToolResult::unavailable(call, SafeToolError::static_msg("Picture worker is unavailable.")))?;
+        Ok(Self { call_id: call.into(), binding, issue, blob, task })
+    }
+
+    pub fn cancel(&self) { self.task.cancel(); }
+
+    pub fn poll(&mut self, model: &mut Model) -> Option<TownToolResult> {
+        let done = self.task.try_take()?;
+        let call = &self.call_id;
+        if let Err(why) = model.verify_binding(self.binding) {
+            return Some(TownToolResult::refused(call, SafeToolError::formatted_ids_only(why)))
+        }
+        let result = (|| {
+            let (gate, access) = Self::access(model, self.binding.town, &self.issue)?;
+            if access.blob() != self.blob { return Err(Withheld::Hidden) }
+            let Some(png) = done.map_err(|_| Withheld::InvalidImage)?? else {
+                return Ok(Self::fetch(model, self.binding.town, self.blob.id, call))
+            };
+            let [w, h] = png.size();
+            let text = gate.finish_json(AiJson::object(vec![("issue", AiJson::id(&self.issue)),
+                ("w", AiJson::int(w.into())), ("h", AiJson::int(h.into()))]))?;
+            let image = EncodedAiImage::seal(png, access.into_proof());
+            Ok(TownToolResult::text_and_images(call, text, vec![image], "the finding's still"))
+        })();
+        Some(result.unwrap_or_else(|why| TownToolResult::refused(call, SafeToolError::withheld(why))))
     }
 }
 
@@ -1450,7 +1616,8 @@ impl Read {
 pub enum Request {
     Join { code: Credential },
     Wait { binding: Credential, after: Option<Id> },
-    Say { binding: Credential, text: String, reply_to: Option<Id> },
+    /// `done: false` posts an interim reply and keeps the picked-up lines in progress.
+    Say { binding: Credential, text: String, reply_to: Option<Id>, done: bool },
     Status { binding: Credential, text: String, step: Option<u64>, steps: Option<u64> },
     TimelineRead { binding: Credential, before: Option<String> },
     TranscriptRead { binding: Credential, entry: Id, after: Option<String> },
@@ -1464,6 +1631,7 @@ pub enum Request {
     BoardList { binding: Credential, project: Option<Id> },
     BoardRead { binding: Credential, board: Id, rect: Option<[f64; 4]>, after: Option<Cursor> },
     Read { binding: Credential, read: Read },
+    IssueLook { binding: Credential, issue: Id },
     Do { binding: Credential, project: Option<Id>, action: Action },
 }
 
@@ -1474,7 +1642,8 @@ impl Request {
             Self::Wait { binding, .. } | Self::Say { binding, .. } | Self::Status { binding, .. }
             | Self::TimelineRead { binding, .. } | Self::TranscriptRead { binding, .. }
             | Self::TasksList { binding, .. } | Self::BoardList { binding, .. } | Self::BoardRead { binding, .. }
-            | Self::DocRead { binding, .. } | Self::Read { binding, .. } | Self::Do { binding, .. } | Self::Call { binding, .. } => Some(*binding),
+            | Self::DocRead { binding, .. } | Self::Read { binding, .. } | Self::IssueLook { binding, .. }
+            | Self::Do { binding, .. } | Self::Call { binding, .. } => Some(*binding),
         }
     }
 
@@ -1624,8 +1793,9 @@ pub fn read(tool: &str, args: &str) -> Result<Request, String> {
             Request::Wait { binding: credential(&args, "binding")?, after: optional_id("after")? }
         }
         "say" => {
-            only_keys(&args, &["binding", "text", "reply_to"])?;
-            Request::Say { binding: credential(&args, "binding")?, text: text("text")?, reply_to: optional_id("reply_to")? }
+            only_keys(&args, &["binding", "text", "reply_to", "done"])?;
+            let done = args.get("done").map(|v| v.as_bool().ok_or("`done` must be true or false")).transpose()?.unwrap_or(true);
+            Request::Say { binding: credential(&args, "binding")?, text: text("text")?, reply_to: optional_id("reply_to")?, done }
         }
         "status" => {
             only_keys(&args, &["binding", "text", "step", "steps"])?;
@@ -1773,6 +1943,18 @@ fn read_workspace(tool: &str, args: &Value) -> Result<Request, String> {
                 parent: args.get("parent").map(|v| required_id(Some(v), "parent")).transpose()? })
         }
         "design_read" => Request::Read { binding, read: Read::design(args)? },
+        "issue_list" => {
+            only_keys(args, &["binding", "project", "status"])?;
+            let status = args.get("status").map(|v| match v.as_str() {
+                Some("open") => Ok("open"), Some("resolved") => Ok("resolved"), _ => Err("expected open or resolved"),
+            }).transpose()?;
+            Request::Read { binding, read: Read::IssueList { project: optional_id("project")?, status } }
+        }
+        "issue_read" | "issue_look" => {
+            only_keys(args, &["binding", "issue"])?;
+            let issue = required_id(args.get("issue"), "issue")?;
+            if tool == "issue_read" { Request::Read { binding, read: Read::Issue { issue } } } else { Request::IssueLook { binding, issue } }
+        }
         "design_add" => {
             only_keys(args, &["binding", "board", "x", "y", "preset", "src", "title"])?;
             let preset = text("preset")?;
@@ -1977,7 +2159,7 @@ pub fn tool_of(action: &Action) -> &'static str {
         Action::LineToTask { .. } => "line_to_task",
         Action::AddBoard { .. } => "add_board",
         Action::AddItem { .. } => "add_item",
-        Action::AddApp { .. } | Action::RecordAppEdit { .. } => return "",
+        Action::AddApp { .. } | Action::RecordAppEdit { .. } | Action::AddMark { .. } | Action::DeleteMark { .. } => return "",
         Action::AddDesign { .. } => "add_design",
         Action::WriteDesign { .. } => "write_design",
         Action::EditItem { .. } => "edit_item",
@@ -2032,6 +2214,128 @@ mod tests {
     }
 
     #[test]
+    fn finding_reads_filter_the_bound_project_and_withhold_removed_authors() {
+        use crate::model::tests::{record_call_event, shared_town};
+        use makepad_town_core::event::Content;
+
+        let (_homes, owner, peer) = shared_town("finding-reads");
+        let mut models = [owner, peer];
+        let (_, _, bearer) = join(&mut models[0], &mut AgentWaits::default(), None);
+        let project = models[0].project().id;
+        let entity = |kind, fields| Content::Entity { kind: Key::Number(kind), project: Some(project), derive: None, fields, copied_from: vec![] };
+        let issue = record_call_event(&mut models, 1, entity(kind::ISSUE, vec![
+            (field::LABEL, FieldValue::Text("Captured canary".into())), (field::TEXT, FieldValue::Text("Note canary".into())),
+            (field::W, FieldValue::Int(31)), (field::H, FieldValue::Int(17)), (field::SESSION, FieldValue::Key(vec![7; 16])),
+            (field::WIDGET_PATH, FieldValue::Text("Window.canary".into()))]));
+        let call = |model: &mut Model, name, args: Value| -> Result<Value, String> {
+            let Request::Read { binding, read } = read_bound(name, &args.to_json(), &bearer)? else { panic!("expected a bound read") };
+            let caller = model.verify_binding(binding)?;
+            let reply = model.read_json_in(caller.town, &read)?;
+            Ok(json::parse(reply.as_str().as_bytes()).unwrap())
+        };
+        let args = || json::obj(vec![("issue", json::s(hex(&issue)))]);
+        let listing = |status| json::obj(vec![("project", json::s(hex(&project))), ("status", json::s(status))]);
+        let page = call(&mut models[0], "issue_list", listing("open")).unwrap();
+        let rows = page.get("issues").unwrap().as_arr().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("label"), Some(&json::s("Captured canary")));
+        assert_eq!(rows[0].get("id"), args().get("issue"));
+        assert_eq!(rows[0].get("created_ms").unwrap().as_i64(), Some(models[0].event(&issue).unwrap().header.wall_ms as i64));
+        assert!(call(&mut models[0], "issue_list", listing("resolved")).unwrap().get("issues").unwrap().as_arr().unwrap().is_empty());
+        assert!(call(&mut models[0], "issue_list", listing("other")).is_err());
+        let detail = call(&mut models[0], "issue_read", args()).unwrap();
+        assert_eq!(detail.get("note"), Some(&json::s("Note canary")));
+        assert_eq!(detail.get("widget_path"), Some(&json::s("Window.canary")));
+        assert_eq!(detail.get("session"), Some(&json::s(hex(&[7; 16]))));
+        assert_eq!((detail.get("w"), detail.get("h")), (Some(&Value::Int(31)), Some(&Value::Int(17))));
+        assert_eq!(detail.get("status"), Some(&json::s("open")));
+        assert!(detail.get("linked_task").is_none());
+
+        let task = record_call_event(&mut models[..1], 0, entity(kind::TASK, vec![]));
+        record_call_event(&mut models[..1], 0, entity(kind::LINK, vec![(field::FROM, FieldValue::Id(issue)), (field::TO, FieldValue::Id(task))]));
+        assert_eq!(call(&mut models[0], "issue_read", args()).unwrap().get("linked_task"), Some(&json::s(hex(&task))));
+        let reporter = models[1].me();
+        models[0].remove_device(reporter, false).unwrap();
+        let page = call(&mut models[0], "issue_list", listing("open")).unwrap();
+        assert!(page.get("issues").unwrap().as_arr().unwrap().is_empty(), "the removed reporter's row and its label disappear");
+        assert_eq!(call(&mut models[0], "issue_read", args()).unwrap_err(), SafeToolError::withheld(Withheld::External).as_str(),
+            "the refusal contains no captured note, path or label");
+    }
+
+    fn read_stored_issue_still(remove_reporter: bool) -> (TownToolResult, makepad_ai_services::pictures::RgbaPicture) {
+        use crate::model::tests::{record_call_event, shared_town};
+        use makepad_ai_services::pictures::{encode_png, RgbaPicture};
+        use makepad_town_core::event::Content;
+
+        let (_homes, owner, peer) = shared_town("finding-still");
+        let mut models = [owner, peer];
+        let town = models[0].open_id();
+        let project = models[0].project().id;
+        let pixels = RgbaPicture { width: 2, height: 1, rgba: vec![10, 20, 30, 255, 40, 50, 60, 93] };
+        let mut raw = encode_png(&pixels).unwrap();
+        raw.splice(33..33, b"\x00\x00\x00\x13tEXtComment\x00SECRET-META\x1d\x3b\x4f\x39".iter().copied());
+        let dir = models[0].home.blobs_dir().join(hex(&town));
+        let (size, root) = blob::TownStore::open(dir, blob::CHUNK).unwrap().0.add(raw.as_slice()).unwrap();
+        let issue = record_call_event(&mut models, 1, Content::Entity { kind: Key::Number(kind::ISSUE), project: Some(project),
+            derive: None, fields: vec![(field::BLOB, FieldValue::Blob { size, root })], copied_from: vec![] });
+        let (_, _, bearer) = join(&mut models[0], &mut AgentWaits::default(), None);
+        let args = json::obj(vec![("issue", json::s(hex(&issue)))]);
+        let Request::IssueLook { binding, issue } = read_bound("issue_look", &args.to_json(), &bearer).unwrap() else { panic!("expected issue_look") };
+        models[0].verify_binding(binding).unwrap();
+        let pool = crate::store_worker::test_pool();
+        let start = |model: &mut Model| IssueLook::start(model, &pool, "look", binding, issue);
+        let missing = start(&mut models[0]).err().expect("the store has not announced any local holdings");
+        assert_eq!(missing.outcome(), ToolOutcome::Unavailable);
+        assert_eq!(missing.error_text(), Some("Fetching picture from peer; retry shortly."));
+        assert!(models[0].file_wanted(town, blob::id(size, &root)), "the normal peer-fetch path was requested");
+        let (signal, wake) = std::sync::mpsc::channel();
+        models[0].start_store(pool.clone(), move || { let _ = signal.send(()); }).unwrap();
+        loop {
+            models[0].drain_store();
+            if models[0].complete_blobs(&town).is_some_and(|held| held.contains(&blob::id(size, &root))) { break }
+            wake.recv().expect("the store announces the signed still");
+        }
+        let mut pending = start(&mut models[0]).ok().expect("a visible signed still starts a worker");
+        if remove_reporter {
+            let reporter = models[1].me();
+            models[0].remove_device(reporter, false).unwrap();
+            let refused = start(&mut models[0]).err().expect("submitting a removed reporter's still must fail");
+            assert_eq!(refused.outcome(), ToolOutcome::Refused);
+            assert_eq!(refused.error_text(), Some(SafeToolError::withheld(Withheld::External).as_str()));
+            assert!(refused.images_for_test().is_empty());
+        }
+        let result = loop {
+            if let Some(reply) = pending.poll(&mut models[0]) { break reply }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        models[0].stop_store();
+        while !models[0].store_stopped() {
+            models[0].drain_store();
+            if !models[0].store_stopped() { wake.recv().unwrap(); }
+        }
+        (result, pixels)
+    }
+
+    #[test]
+    fn issue_look_reencodes_pixels_and_strips_png_text_chunks() {
+        let (result, pixels) = read_stored_issue_still(false);
+        assert_eq!(result.outcome(), ToolOutcome::Ok);
+        assert_eq!(result.images_for_test().len(), 1);
+        let bytes = makepad_ai_hub::makepad_base64::base64_decode(result.images_for_test()[0].as_bytes()).unwrap();
+        assert_eq!(makepad_ai_services::pictures::decode_png(&bytes).unwrap(), pixels);
+        assert!(!bytes.windows(4).any(|s| s == b"tEXt") && !bytes.windows(11).any(|s| s == b"SECRET-META"),
+            "the delivered PNG contains only re-encoded pixels");
+    }
+
+    #[test]
+    fn issue_look_withholds_when_author_removed_before_worker_finishes() {
+        let (result, _) = read_stored_issue_still(true);
+        assert_eq!(result.outcome(), ToolOutcome::Refused);
+        assert_eq!(result.error_text(), Some(SafeToolError::withheld(Withheld::External).as_str()));
+        assert!(result.images_for_test().is_empty(), "revocation before delivery withholds every image byte");
+    }
+
+    #[test]
     fn only_an_offered_line_can_be_waiting_for_pickup() {
         let home = ShareHomes::new("trace-offer");
         let mut model = Model::open(&home.0).unwrap().0;
@@ -2064,13 +2368,52 @@ mod tests {
         let next = model.post_chat_draft("@ next question", Some(agent), None, None).unwrap();
         waits.offered(&model, next);
         let page = waits.wait(&mut model, "ack and deliver", binding, Some(last));
-        assert_eq!(waits.traces.rows(&named)[0].phase(now.get()), Phase::Done, "acknowledging the offered page completes its trace without a say");
+        assert_eq!(waits.traces.rows(&named)[0].phase(now.get()), Phase::GotIt, "acknowledging the offered page keeps its picked-up lines open until an answer");
         assert_eq!(waits.traces.rows(&next)[0].phase(now.get()), Phase::GotIt, "the same wait returns the new question and starts its own trace");
         let retry = waits.wait(&mut model, "retry old ack", binding, Some(last));
         assert_eq!(retry[0].text_for_test(), page[0].text_for_test(), "retrying the previous ack returns the same offered page");
         assert!(waits.traces.working(binding), "an old ack cannot finish the new turn");
         assert!(waits.wait(&mut model, "ack and hold", binding, Some(cursor(&page[0]))).is_empty(), "acknowledging an empty inbox leaves the wait held");
-        assert_eq!(waits.traces.next_change(model.open_id(), now.get()), None, "the final ack stops the trace timer while the wait is held");
+        assert!(waits.traces.next_change(model.open_id(), now.get()).is_some(), "unanswered lines keep their trace timer while the wait is held");
+        waits.say(&mut model, binding, "all answered".into(), None, true).unwrap();
+        assert_eq!(waits.traces.next_change(model.open_id(), now.get()), None, "the final answer stops the trace timer");
+    }
+
+    #[test]
+    fn an_acknowledged_line_stays_in_progress_until_the_final_answer() {
+        let home = ShareHomes::new("trace-ack");
+        let mut model = Model::open(&home.0).unwrap().0;
+        let (mut waits, now) = trace_clock();
+        let (agent, binding, bearer) = join(&mut model, &mut waits, None);
+        let line = model.mention_agent(agent, "make slides".into(), None).unwrap();
+        waits.offered(&model, line);
+        now.set(model.state.message(&line).unwrap().wall_ms + 1_000);
+        let page = waits.wait(&mut model, "pick up", binding, None);
+        let json = json::parse(page[0].text_for_test().as_bytes()).unwrap();
+        let last = parse_id(json.get("last").unwrap().as_str().unwrap()).unwrap();
+        assert!(waits.wait(&mut model, "ack and hold", binding, Some(last)).is_empty(), "the ack holds the next wait");
+        let phase = |waits: &AgentWaits| waits.traces.rows(&line)[0].phase(now.get());
+        assert_eq!(phase(&waits), Phase::GotIt, "acknowledging the page keeps the picked-up line open");
+        assert_eq!(waits.status(binding, "reading the board".into(), None, None), Ok(()), "status after an ack reaches the picked-up line");
+
+        let say = |done: Option<bool>, text: &str| {
+            let mut args = vec![("binding", json::s(&bearer)), ("text", json::s(text)), ("reply_to", json::s(hex(&line)))];
+            if let Some(done) = done { args.push(("done", Value::Bool(done))); }
+            read("say", &json::obj(args).to_json()).unwrap()
+        };
+        let Request::Say { binding, text, reply_to, done } = say(Some(false), "Got it, working on it") else { panic!("say must parse") };
+        assert!(!done, "done: false parses as an interim reply");
+        waits.say(&mut model, binding, text, reply_to, done).unwrap();
+        assert_eq!(phase(&waits), Phase::Working, "an interim reply posts and keeps the line in progress");
+        assert_eq!(waits.status(binding, "writing slide 2".into(), Some(2), Some(3)), Ok(()), "status still reaches the line after an interim reply");
+
+        let Request::Say { binding, text, reply_to, done } = say(None, "Slides are ready") else { panic!("say must parse") };
+        assert!(done, "a reply without done is the final answer");
+        waits.say(&mut model, binding, text, reply_to, done).unwrap();
+        assert_eq!(phase(&waits), Phase::Done, "only the final answer shows done");
+        assert!(waits.status(binding, "late".into(), None, None).is_err(), "a finished line takes no more status");
+        assert!(read("say", &json::obj(vec![("binding", json::s(&bearer)), ("text", json::s("x")), ("done", json::s("no"))]).to_json()).is_err(),
+            "done must be a boolean");
     }
 
     #[test]
@@ -2125,9 +2468,9 @@ mod tests {
         let unpicked = model.mention_agent(agent, "another".into(), None).unwrap();
         waits.offered(&model, unpicked);
         now.set(later);
-        assert!(waits.say(&mut model, binding, " ".into(), None).is_err(), "a refused answer is not completion");
+        assert!(waits.say(&mut model, binding, " ".into(), None, true).is_err(), "a refused answer is not completion");
         assert_eq!(waits.traces.rows(&line)[0].phase(later), Phase::Working, "the refusal is a fresh signal and leaves the task open");
-        waits.say(&mut model, binding, "ready".into(), None).unwrap();
+        waits.say(&mut model, binding, "ready".into(), None, true).unwrap();
         assert_eq!(waits.traces.rows(&line)[0].phase(later), Phase::Done, "the signed bound answer completes the picked-up task");
         assert!(waits.traces.rows(&unpicked)[0].pickup.is_none(), "an answer does not acknowledge a new undelivered line");
         waits.wait(&mut model, "replay", binding, None);
@@ -2362,7 +2705,7 @@ mod tests {
         assert!(read_with("read", vec![("binding", json::s(&bearer)), ("entry", json::s(makepad_town_core::hex(&entry))), ("before", json::s("cursor"))]).is_err(),
             "a timeline cursor cannot select words in a call");
         assert_eq!(read_with("say", vec![("binding", json::s(&bearer)), ("text", json::s("hi"))]),
-            Ok(Request::Say { binding: token, text: "hi".into(), reply_to: None }));
+            Ok(Request::Say { binding: token, text: "hi".into(), reply_to: None, done: true }));
         assert!(basic.tools.iter().any(|tool| tool.name == "status" && tool.risk == Risk::Act), "bound status is advertised");
         let long = "slide ".repeat(2048);
         assert_eq!(read_with("status", vec![("binding", json::s(&bearer)), ("text", json::s(&long))]),
@@ -2406,7 +2749,7 @@ mod tests {
         let manifest = manifest(true);
         assert_eq!(manifest.validate(), Ok(()), "the action tools register with valid schemas");
         let tools: Vec<&str> = manifest.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!((tools.len(), basic.tools.len()), (75, 73), "the publish setting controls exactly two of the 75 tools");
+        assert_eq!((tools.len(), basic.tools.len()), (78, 76), "the publish setting controls exactly two tools");
         let unbound = ["join", "publish_media", "publish", "devices_retry", "devices_forget"];
         let parse_binding = |name: &str, args: &str| -> Result<Option<Credential>, String> {
             if let Some(app) = app_tool(name, args) {
@@ -2446,7 +2789,7 @@ mod tests {
                     "kind" => json::s("Sticky"), "preset" => json::s("phone"), "break" => json::s("root"),
                     "to" => json::s("front"), "after" => json::s("end"), "status" => json::s("open"),
                     "revision" => json::s(format!("@{id_text}")), "section" => Value::Null,
-                    "project" | "task" | "into" | "board" | "target" | "step" | "item" | "doc" | "of" => id_arg(),
+                    "project" | "task" | "into" | "board" | "target" | "step" | "item" | "doc" | "of" | "issue" => id_arg(),
                     "ty" => json::s("View"), "place" => json::s("inside"), "scope" => json::s("all"),
                     "op" if name == "app_design_history" => json::s("undo"),
                     "op" if name == "app_design_patch" => json::s("diff"),
@@ -2493,7 +2836,7 @@ mod tests {
                 assert!(with.is_err(), "{name} rejects a supplied binding");
             }
         }
-        assert_eq!(bound_count, 70, "exactly 70 tools require a binding");
+        assert_eq!(bound_count, 73, "all town-scoped tools require a binding");
         for (entry, tool) in ACTIONS {
             assert!(tools.contains(&tool), "the action {entry} has no tool {tool}");
         }
@@ -2553,7 +2896,7 @@ mod tests {
             assert_eq!(tool_of(&action), tool, "the action dispatches through its own tool");
             assert!(manifest.tools.iter().any(|t| t.name == tool && t.risk == Risk::Act), "{tool} registers at Act risk");
         }
-        for tool in ["board_list", "board_read", "design_read"] {
+        for tool in ["board_list", "board_read", "design_read", "issue_list", "issue_read", "issue_look"] {
             assert!(manifest.tools.iter().any(|t| t.name == tool && t.risk == Risk::Read), "{tool} registers at Read risk");
         }
         assert_eq!(bound("board_list", "{}"), Ok(Request::BoardList { binding: token, project: None }));

@@ -25,14 +25,22 @@ struct Reading {
 
 #[test]
 fn guest_files_visual_issue_from_watched_picture() {
-    use crate::{lists::{Live, Page, Pane, ViewData}, model::{tests::ShareHomes, Model}, view::{LocalClock, Workspace}};
-    use makepad_town_core::{blob, entity::field, event::Value};
+    use crate::{lists::{Live, Page, Pane, ViewData}, model::tests::{group_town, record_call_event},
+        record::capture::BoardSnaps, view::{LocalClock, Workspace}};
+    use makepad_town_core::{blob, entity::{field, kind}, event::{Content, CopySource, Member, SessionOp, Value},
+        trust::{Gate, LocalPolicy, Withheld}};
     use makepad_widgets::{makepad_draw::cx_draw::CxDraw, *};
     use makepad_platform::studio::{RemoteMouseDown, RemoteMouseUp, StudioToApp};
 
-    let homes = ShareHomes::new("guest-issue");
-    let mut ben = Model::open(&homes.0.join("Ben")).unwrap().0;
+    let (_homes, mut members) = group_town("guest-issue", 3);
+    let session = [7; 16];
+    let anchor = record_call_event(&mut members, 1, Content::Session(SessionOp::Open { session,
+        mode: SessionMode::Share { title: "Canvas".into() }, to: vec![], town_wide: true }));
+    let joined = record_call_event(&mut members, 2, Content::Session(SessionOp::Join { session }));
+    let [mut ben, mut opener, mut source] = members.try_into().ok().unwrap();
+    let sharer = source.me();
     let project = ben.act(crate::model::Action::AddProject { title: "Design".into() }, Origin::Ui).unwrap();
+    let board = ben.act(crate::model::Action::AddBoard { title: "Sketches".into(), project }, Origin::Ui).unwrap();
     let mut cx = test_cx::checkout_test_cx(|vm| { makepad_widgets::script_mod(vm); crate::script_mod(vm); });
     let ui = cx.with_vm(|vm| {
         let value = script_eval!(vm, { use mod.prelude.widgets.* use mod.widgets.* View{
@@ -42,10 +50,7 @@ fn guest_files_visual_issue_from_watched_picture() {
     });
     let (signal, wake) = std::sync::mpsc::channel();
     ben.start_store(cx.task_pool(), move || { let _ = signal.send(()); }).unwrap();
-    let session = [7; 16];
     let mut call = CallController::default();
-    // A sharer's device key is an uncompressed point (prefix 4), as the link delivers it.
-    let sharer = { let mut key = [1; 65]; key[0] = 4; key };
     call.begin_offer(session, ben.open_id(), "Ana\nCanvas".into(), ShareRole::Viewer { sharer }, (320., 240.));
     call.watch(session);
     let clock = LocalClock::default();
@@ -54,12 +59,25 @@ fn guest_files_visual_issue_from_watched_picture() {
     data.tree.set(ben.towns(), ben.town_tree());
     data.sync_live_share(&mut cx, &ui);
     let button = ui.widget(&cx, ids!(live_share.share_issue));
-    assert!(!button.visible(), "a guest needs a decoded picture before reporting");
+    let snap_button = ui.button(&cx, ids!(live_share.snap_to_board));
+    assert!(!button.visible() && !snap_button.visible(), "both guest controls wait for a decoded picture");
     // Neutral, red, green and blue 2x2 blocks, including black and white luma endpoints.
     data.call.share.picture = Some(Arc::new(Picture { width: 4, height: 4, pts_100ns: 1,
         nv12: vec![16,235,63,63, 128,200,63,63, 173,173,32,32, 173,173,32,32, 128,128,102,240, 42,26,240,118] }));
     data.sync_share_issue(&mut cx, &ui);
-    assert!(button.visible(), "the first received picture reveals the guest control");
+    assert!(button.visible() && snap_button.visible(), "the first received picture reveals both guest controls");
+    let mut links = AppLinks::default();
+    let mut snaps = BoardSnaps::default();
+    snaps.start(&cx, &mut links, &data.call.share, session, ben.open_id(), board).unwrap();
+    while snaps.busy() { snaps.poll(&mut ben); std::thread::yield_now(); }
+    let snap_id = loop {
+        if let Some((town, id)) = ben.drain_store().board_events.pop() {
+            assert_eq!(town, ben.open_id());
+            break id
+        }
+        assert!(ben.clips_pending(), "snap should publish a board image: {:?}", ben.take_recording_problems());
+        wake.recv().expect("the snap store wakes the guest");
+    };
     let size = dvec2(640., 480.);
     let pass = DrawPass::new(&mut cx);
     pass.set_size(&mut cx, size);
@@ -100,7 +118,6 @@ fn guest_files_visual_issue_from_watched_picture() {
     let actions = cx.capture_actions(|cx| ui.handle_event(cx, &up, &mut Scope::with_data(&mut data)));
     cx.dispatch_studio_msg(StudioToApp::MouseUp(RemoteMouseUp { x: abs.x, y: abs.y, time: 1.1,
         button_raw_bits: primary.bits(), ..Default::default() }), window_id, DVec2::default());
-    let mut links = AppLinks::default();
     assert!(data.share_issue_input(&mut cx, &ui, &actions, &mut links, &mut ben), "the guest's press opens a draft");
     assert_eq!((data.page, data.pane, data.workspace.current), (Page::Issues, Pane::Page, Some(project)), "Issues opens in the current project");
     assert_eq!(data.issue_share(), data.watched_share(), "the draft keeps the original watch");
@@ -130,8 +147,38 @@ fn guest_files_visual_issue_from_watched_picture() {
     assert_eq!((issue.value(field::W), issue.value(field::H)), (Some(&Value::Int(4)), Some(&Value::Int(4))), "the issue has the received pixel size");
     assert_eq!(issue.value(field::SESSION), Some(&Value::Key(session.to_vec())), "the issue identifies the live share");
     assert_eq!(issue.text(field::LABEL), "Ana Canvas · 320 × 240 pt · as received", "the label carries the window's point size on one line");
-    assert_eq!(ben.state.copied_from(issue.id, issue.id, &field::LABEL), [makepad_town_core::event::CopySource::SharePeer { peer: sharer }],
-        "with no recorded session opener, the received picture names the watched sharer as its source");
+    let snap = &ben.state.entities[&snap_id];
+    assert_eq!(snap.kind, kind::IMAGE);
+    assert_eq!(snap.value(field::BOARD), Some(&Value::Id(board)));
+    assert_eq!(snap.value(field::SESSION), issue.value(field::SESSION));
+    assert_eq!(snap.value(field::BLOB), issue.value(field::BLOB), "both actions captured the same frame");
+    assert_eq!(snap.value(field::POSTER), issue.value(field::POSTER), "both stored the frame's poster");
+    assert_eq!(snap.text(field::MEDIA), "image/png");
+    let captured = [(issue.id, &[field::LABEL, field::BLOB, field::POSTER][..]),
+        (snap.id, &[field::TITLE, field::BLOB, field::POSTER, field::MEDIA][..])];
+    let sources = [CopySource::Record(anchor), CopySource::SharePeer { peer: sharer }];
+    let gate = Gate::new(&ben.state, LocalPolicy::Members);
+    for (id, fields) in captured {
+        for field in fields {
+            assert_eq!(ben.state.copied_from(id, id, field), sources, "{field} must name the watched sharer and the session anchor");
+            assert!(gate.entity_field_value(&id, field).is_ok(), "active members can read the captured {field}");
+        }
+    }
+    for (member, last, role) in [(&mut source, joined, "sharer"), (&mut opener, anchor, "opener")] {
+        let device = member.me();
+        let seat = member.state.seat_of(&device).unwrap();
+        let removal = record_call_event(std::slice::from_mut(member), 0, Content::Member(Member::Remove { seat, device, last }));
+        let mut state = ben.state.clone();
+        state.receive(member.event(&removal).unwrap());
+        assert!(!state.active_member(&device), "the {role} was removed");
+        let gate = Gate::new(&state, LocalPolicy::Members);
+        for (id, fields) in captured {
+            for field in fields {
+                assert_eq!(gate.entity_field_value(&id, field), Err(Withheld::External),
+                    "removing the {role} alone must withhold the captured {field}");
+            }
+        }
+    }
     let Some(Value::Blob { size, root }) = issue.value(field::BLOB) else { panic!("the issue references its full PNG") };
     let path = blob::data_path(&ben.home.blobs_dir().join(makepad_town_core::hex(&ben.open_id())), &blob::id(*size, root));
     let png = makepad_ai_services::pictures::decode_png(&std::fs::read(path).unwrap()).unwrap();
@@ -199,9 +246,12 @@ fn held_source() -> (Box<Held>, Arc<Mutex<Reading>>) {
 }
 
 #[derive(Default)]
-struct Host { installs: usize }
+pub(crate) struct Host { installs: usize, share: Option<ShareSpeaker> }
 impl AudioHost for Host {
-    fn install(&mut self, _: MicPort, _: OutputPort) { self.installs += 1; }
+    fn install(&mut self, _: MicPort, _: OutputPort, share: ShareSpeaker) {
+        self.installs += 1;
+        self.share = Some(share);
+    }
     fn use_inputs(&mut self, ids: &[AudioDeviceId]) { assert!(ids.is_empty()); }
     fn use_outputs(&mut self, ids: &[AudioDeviceId]) { assert!(ids.is_empty()); }
 }
@@ -461,7 +511,7 @@ fn linked_share_joins_on_display_and_survives_the_call() {
     let resized = AppWindow { size: (480., 270.), ..window.clone() };
     let sharer = &mut pair.seats[0].ctl;
     let offer = sharer.sharing.shown.offer(session).unwrap().clone();
-    assert!(sharer.resize_share(&offer, &resized));
+    assert!(sharer.resize_share(&offer, resized.size, resized.dpi));
     pair.wait(|s| s[1].ctl.sharing.shown.watched().is_some_and(|o| o.window_size == resized.size));
     let viewer = &mut pair.seats[1].ctl;
     assert_eq!(viewer.sharing.shown.watching, Some(session), "resizing keeps the same watch");
@@ -1695,10 +1745,10 @@ struct MeshLink {
     voice_seq: Option<u64>,
 }
 
-pub(crate) struct ShareMesh {
+pub(crate) struct ShareMesh<H: AudioHost = Host> {
     keys: [Arc<makepad_town_core::key::DeviceKey>; 3],
     pub(crate) ctl: [CallController; 3],
-    hosts: [Host; 3],
+    hosts: [H; 3],
     apps: [AppLinks; 3],
     #[cfg(unix)]
     pub(crate) rig: Option<crate::app_link::RecordingRig>,
@@ -1708,6 +1758,12 @@ pub(crate) struct ShareMesh {
 
 impl ShareMesh {
     fn new(third: bool) -> Self {
+        Self::with_hosts(third, Default::default(), |i| VoiceSource::Synthetic { tone_hz: 440. + 110. * i as f32 })
+    }
+}
+
+impl<H: AudioHost> ShareMesh<H> {
+    fn with_hosts(third: bool, hosts: [H; 3], voice: impl Fn(usize) -> VoiceSource) -> Self {
         let networks = Arc::new(AtomicUsize::new(0));
         let count = networks.clone();
         let run = makepad_call::driver::std_spawn();
@@ -1717,7 +1773,7 @@ impl ShareMesh {
         });
         let mut mesh = Self {
             keys: std::array::from_fn(|_| Arc::new(makepad_town_core::key::DeviceKey::generate().unwrap())),
-            ctl: Default::default(), hosts: Default::default(), apps: Default::default(),
+            ctl: Default::default(), hosts, apps: Default::default(),
             carriers: Default::default(), networks,
             #[cfg(unix)]
             rig: None,
@@ -1726,7 +1782,7 @@ impl ShareMesh {
             ctl.codecs = Arc::new(TestCodecs);
             ctl.configure(CallEnv { spawn: spawn.clone(), jobs: spawn.clone(), signal: Arc::new(|| {}),
                 files: Default::default(), devices_path: Default::default(),
-                voice: VoiceSource::Synthetic { tone_hz: 440. + 110. * i as f32 } });
+                voice: voice(i) });
         }
         mesh.link(0, 1, true);
         if third { mesh.add_third(); }
@@ -1876,7 +1932,7 @@ fn an_offline_member_keeps_a_named_allow() {
     }
 }
 
-impl Drop for ShareMesh {
+impl<H: AudioHost> Drop for ShareMesh<H> {
     fn drop(&mut self) {
         for (ctl, host) in self.ctl.iter_mut().zip(&mut self.hosts) { ctl.shutdown(host); }
         while self.ctl.iter().any(CallController::has_call_workers) {
@@ -1986,6 +2042,418 @@ fn share_only_viewer_gets_video_without_voice_leak() {
 }
 
 #[cfg(unix)]
+impl ShareMesh {
+    fn hevc_window(&mut self, title: Option<&str>) -> SessionId {
+        self.ctl[0].sharing.encoder = EncoderFormats { hevc: true, full_chroma: false };
+        for ctl in &mut self.ctl[1..] {
+            ctl.sharing.decode_caps = MediaCaps(MediaCaps::H264_DECODE | MediaCaps::HEVC_DECODE);
+        }
+        self.app_window_named(title).0
+    }
+
+    fn line(&self, session: SessionId) -> &str {
+        self.ctl[0].sharing.shown.offer(session).unwrap().sharer_line.as_deref().unwrap()
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_watchers_caps_follow_its_decoder_not_its_os() {
+    use makepad_call::driver::codec::StreamFormat as F;
+    let mut m = ShareMesh::new(true);
+    m.ctl[0].sharing.encoder = EncoderFormats { hevc: true, full_chroma: false };
+    let watcher = m.key(1);
+    m.ctl[0].flow.set_peer_name(watcher, "Mira".into());
+    let (s, _) = m.app_window_named(Some("Decoder negotiation"));
+    let h264 = MediaCaps(MediaCaps::H264_DECODE);
+    let both = MediaCaps(MediaCaps::H264_DECODE | MediaCaps::HEVC_DECODE);
+    m.watch(1, s);
+    m.until("Mira's H.264 picture and the line naming Mira as the holder", |m| m.pts(1).is_some()
+        && m.line(s).ends_with("H.264 · 4:2:0: Mira can't decode H.265 · 4:2:0."));
+    let viewer = &m.ctl[0].sharing.locals[&s].viewers[&watcher];
+    assert_eq!(viewer.caps, h264, "the initial View advertises only H.264");
+    let geometry = viewer.view;
+    let mut opens = m.rig.as_ref().unwrap().video_formats();
+    assert_eq!(opens.last(), Some(&F::H264), "the initial watcher receives an H.264 stream");
+    m.ctl[1].apply_decode_caps(both);
+    opens.push(F::HEVC);
+    m.until("the sharer to reopen in H.265 and update its line", |m|
+        m.rig.as_ref().unwrap().video_formats() == opens && m.line(s).ends_with("H.265 · 4:2:0."));
+    let viewer = &m.ctl[0].sharing.locals[&s].viewers[&watcher];
+    assert_eq!(viewer.caps, both, "the re-sent View adds the probed H.265 decoder");
+    assert_eq!(viewer.view, geometry, "a decoder update preserves the open View's geometry");
+
+    let kit = m.key(2);
+    m.watch(2, s);
+    m.ctl[2].share_decoder_limit(F::HEVC, None);
+    m.ctl[2].apply_decode_caps(both);
+    assert_eq!(m.ctl[2].sharing.decode_caps, h264, "a late probe cannot restore Kit's failed H.265 decoder");
+    m.until("Kit's H.264-only View to reach the sharer", |m|
+        m.ctl[0].sharing.locals[&s].viewers.get(&kit).is_some_and(|v| v.caps == h264));
+}
+
+#[cfg(unix)]
+#[test]
+fn linked_share_carries_the_apps_sound_without_a_call() {
+    use makepad_widgets::makepad_platform::log_ring;
+    Cx::init_log();
+    let mut m = ShareMesh::new(false);
+    let (s, link) = m.app_window();
+    let sharer = m.key(0);
+    m.until("the unwatched window offer", |m| m.ctl[1].sharing.shown.offer(s).is_some());
+    m.rig.as_mut().unwrap().barrier(link);
+    assert_eq!(m.rig.as_ref().unwrap().audio_open_count(), 0, "offering a window leaves app sound closed");
+
+    let watch_started = Instant::now();
+    m.watch(1, s);
+    m.until("the linked picture and the app's audio channel", |m|
+        m.pts(1).is_some() && m.rig.as_ref().unwrap().audio_channels_open() == 1);
+    let pid = m.ctl[1].links[&sharer].peer_id;
+    m.rig.as_mut().unwrap().barrier(link);
+    let send = |m: &ShareMesh, i: u64| m.rig.as_ref().unwrap().send_sound(i * 480, 480, 1_000_000_000 + i * 10_000_000);
+    let mut record = 0;
+    let mut next_record = Instant::now();
+    let sound = loop {
+        m.pump();
+        if let Some(sound) = m.ctl[1].current.as_ref().and_then(|c| c.share_sound(pid)) {
+            if sound.counts().frames > 0 { break sound.clone() }
+        }
+        assert!(watch_started.elapsed() < Duration::from_secs(15),
+            "waiting for app sound: source {:?}, sharer {:?}, watcher {:?}",
+            m.ctl[0].sharing.locals[&s].sound.as_ref().map(|s| s.stats()),
+            m.ctl[0].current.as_ref().map(Call::stats), m.ctl[1].current.as_ref().map(Call::stats));
+        // Frames captured during probing expire. Keep the app sounding at its 10 ms cadence.
+        if Instant::now() >= next_record {
+            send(&m, record);
+            record += 1;
+            next_record += Duration::from_millis(10);
+        }
+        thread::yield_now();
+    };
+    eprintln!("Town share: first app sound frame {} ms after Watch", watch_started.elapsed().as_millis());
+    let first = sound.counts().frames;
+    let next_capture_us = 1_000_000 + record * 10_000;
+    for i in record..record + 4 { send(&m, i); }
+    m.until("more app sound on the same listener", |_| {
+        let counts = sound.counts();
+        counts.frames > first && counts.last_capture_us >= next_capture_us
+    });
+    assert_eq!(m.rig.as_ref().unwrap().audio_open_count(), 1, "the share and encoder use one app audio OPEN");
+    for ctl in &m.ctl[..2] {
+        assert!(!ctl.voice_attached, "neither seat attaches voice to carry app sound");
+        assert_eq!(ctl.view().phase, Phase::Idle, "both seats stay idle while app sound streams");
+    }
+
+    let off = format!("Share {}: app sound off", m.ctl[0].sharing.shown.offer(s).unwrap().title);
+    let cursor = log_ring::read_since(0, 0).newest;
+    assert!(m.ctl[1].call_actions(&mut m.hosts[1], CallAction::OnShare(s, Press::CloseWatch)), "the watcher closes the share");
+    assert!(m.ctl[1].current.as_ref().and_then(|c| c.share_sound(pid)).is_none(), "Close watch releases the listener");
+    m.until("the last watcher to close the app audio channel", |m| m.rig.as_ref().unwrap().audio_channels_open() == 0);
+    assert!(log_ring::read_since(cursor, log_ring::CAP).lines.iter().any(|line| line.text.ends_with(&off)),
+        "the sharer reports when app sound stops");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_watcher_with_no_call_opens_the_speaker_only_while_sound_plays() {
+    #[derive(Default)]
+    struct RecordingHost {
+        outputs: Vec<Vec<AudioDeviceId>>,
+        share: Option<ShareSpeaker>,
+    }
+
+    impl AudioHost for RecordingHost {
+        fn install(&mut self, _: MicPort, _: OutputPort, share: ShareSpeaker) { self.share = Some(share); }
+        fn use_inputs(&mut self, ids: &[AudioDeviceId]) { assert!(ids.is_empty(), "watching never opens a microphone"); }
+        fn use_outputs(&mut self, ids: &[AudioDeviceId]) { self.outputs.push(ids.to_vec()); }
+    }
+
+    impl RecordingHost {
+        fn render_block(&mut self) -> bool {
+            let mut buffer = [0.0; 960];
+            self.share.as_mut().expect("the output has its share callback").add_planar(48_000.0, 480, 2, &mut buffer);
+            buffer.iter().any(|&sample| sample != 0.0)
+        }
+    }
+
+    Cx::init_log();
+    let mut m = ShareMesh::<RecordingHost>::with_hosts(false, Default::default(), |_| VoiceSource::Feed);
+    let output = AudioDeviceId(LiveId::from_str("watcher_speaker"));
+    m.ctl[1].audio_devices(&mut m.hosts[1], &[AudioDeviceDesc { device_id: output, device_type: AudioDeviceType::Output,
+        name: "Watcher speaker".into(), is_default: true, has_failed: false, channel_count: 2 }]);
+    let (s, link) = m.app_window();
+    m.watch(1, s);
+    m.until("the watched app to open its sound channel", |m| m.rig.as_ref().unwrap().audio_channels_open() == 1);
+    m.rig.as_mut().unwrap().barrier(link);
+    let pid = m.ctl[1].links[&m.key(0)].peer_id;
+    let tick = Duration::from_millis(10);
+    let mut record = 0;
+    let mut next_block = Instant::now();
+    let mut send_block = |m: &ShareMesh<RecordingHost>| {
+        m.rig.as_ref().unwrap().send_sound(record * 480, 480, 1_000_000_000 + record * 10_000_000);
+        record += 1;
+    };
+    m.until("the watcher's first app sound frame", |m| {
+        if m.ctl[1].current.as_ref().and_then(|c| c.share_sound(pid)).is_some_and(|s| s.counts().frames > 0) { return true }
+        assert!(m.hosts[1].outputs.iter().all(Vec::is_empty), "the output stays closed until sound arrives");
+        if Instant::now() >= next_block {
+            send_block(m);
+            next_block += tick;
+        }
+        false
+    });
+    assert!(m.ctl[1].sharing.wants_speaker(), "the first received sound requests playback");
+    assert_eq!(m.hosts[1].outputs.last().map(Vec::as_slice), Some([output].as_slice()), "the first sound opens the chosen output");
+    let start = Instant::now();
+    loop {
+        m.pump();
+        assert!(start.elapsed() < Duration::from_secs(1), "the device renders audible app sound within one second");
+        if Instant::now() >= next_block {
+            send_block(&m);
+            next_block += tick;
+            if m.hosts[1].render_block() { break }
+        }
+        thread::yield_now();
+    }
+    assert!(m.ctl[1].sharing.speaker.level() > 0.0, "the share meter registers the audible device block");
+    for ctl in &m.ctl[..2] {
+        assert!(!ctl.want_output, "sharing leaves the call's output request off");
+        assert_eq!(ctl.view().phase, Phase::Idle, "each seat stays idle during share playback");
+    }
+    let before_close = m.hosts[1].outputs.len();
+    assert!(m.ctl[1].call_actions(&mut m.hosts[1], CallAction::OnShare(s, Press::CloseWatch)), "the watcher closes the share");
+    m.pump();
+    assert_eq!(&m.hosts[1].outputs[before_close..], &[Vec::<AudioDeviceId>::new()], "Close watch closes the share-only output");
+    assert!(!m.ctl[1].sharing.wants_speaker(), "a closed watch releases its speaker");
+    assert!((0..3).any(|_| !m.hosts[1].render_block()), "the speaker renders silence within a few blocks of Close watch");
+    assert_eq!(m.ctl[1].sharing.speaker.level(), 0.0, "the share meter returns to zero on the silent device block");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_old_watcher_gets_no_sound_and_opens_no_audio() {
+    let mut m = ShareMesh::new(false);
+    let (sharer, watcher, legacy) = (m.key(0), m.key(1), [3; 65]);
+    let port = m.ctl[0].link_up(&mut m.hosts[0], sharer, legacy, "Bo").unwrap();
+    m.ctl[0].set_town_peers(&mut m.hosts[0], [(MESH_TOWN, [watcher, legacy].into())].into());
+    m.ctl[0].set_peer_caps(legacy, SHARE_CAPS);
+    let (s, link) = m.app_window();
+    let old_view = Message::View { session: s, width: 320, height: 180, fps: 30, ext: Default::default() };
+    port.messages_in.try_send(old_view.encode()).unwrap();
+    m.until("the legacy viewer's capless View", |m| m.ctl[0].is_viewer(s, &legacy));
+    m.rig.as_mut().unwrap().barrier(link);
+    assert_eq!(m.rig.as_ref().unwrap().audio_open_count(), 0, "omitting audio from the View leaves the app channel closed");
+
+    m.ctl[1].sharing.sound_on = false;
+    m.watch(1, s);
+    m.until("the capable watcher to receive video with sound off", |m| m.pts(1).is_some());
+    m.rig.as_mut().unwrap().barrier(link);
+    assert_eq!(m.rig.as_ref().unwrap().audio_open_count(), 0, "both silent viewers share video without opening app audio");
+    let pid = m.ctl[1].links[&sharer].peer_id;
+    assert!(m.ctl[1].current.as_ref().unwrap().share_sound(pid).is_none(), "the muted watcher receives no sound");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_watcher_who_decodes_less_downgrades_the_share_and_its_leaving_upgrades_it() {
+    use makepad_call::driver::codec::StreamFormat as F;
+    use makepad_widgets::makepad_platform::log_ring;
+    Cx::init_log();
+    let mut m = ShareMesh::new(false);
+    m.link(0, 2, true);
+    // The older client only needs a reliable port: its View has no capability extension.
+    let (ana, ben, kit) = (m.key(0), m.key(1), m.key(2));
+    let legacy = [3; 65];
+    let port = m.ctl[0].link_up(&mut m.hosts[0], ana, legacy, "Bo").unwrap();
+    m.ctl[0].set_town_peers(&mut m.hosts[0], [(MESH_TOWN, [ben, kit, legacy].into())].into());
+    m.ctl[0].set_peer_caps(legacy, SHARE_CAPS);
+    let s = m.hevc_window(None);
+    m.watch(1, s);
+    m.until("Ben's HEVC picture", |m| m.pts(1).is_some() && m.line(s).ends_with("H.265 · 4:2:0."));
+    assert_eq!(m.rig.as_ref().unwrap().video_formats(), [F::HEVC], "one HEVC OPEN serves Ben");
+
+    let old_view = Message::View { session: s, width: 320, height: 180, fps: 30, ext: Default::default() };
+    let cursor = log_ring::read_since(0, 0).newest;
+    port.messages_in.try_send(old_view.encode()).unwrap();
+    m.until("Bo's capless View to lower the stream", |m| m.line(s).ends_with("H.264 · 4:2:0: Bo can't decode H.265 · 4:2:0."));
+    let downgrades = || log_ring::read_since(cursor, log_ring::CAP).lines.iter()
+        .filter(|line| line.text.ends_with("H.264 · 4:2:0, Bo can't decode H.265 · 4:2:0")).count();
+    m.until("the downgrade log naming Bo", |_| downgrades() > 0);
+    assert_eq!(downgrades(), 1, "the downgrade log names the limiting watcher once");
+    assert_eq!(m.rig.as_ref().unwrap().video_formats(), [F::HEVC, F::H264], "Bo causes one H.264 reopen");
+    let before = m.pts(1);
+    m.rig.as_ref().unwrap().present(3);
+    m.until("Ben's next picture after the downgrade", |m| m.pts(1) > before);
+
+    let close = Message::View { session: s, width: 0, height: 0, fps: 0, ext: Default::default() };
+    port.messages_in.try_send(close.encode()).unwrap();
+    m.until("HEVC to resume when Bo leaves", |m| m.line(s).ends_with("H.265 · 4:2:0."));
+    assert_eq!(m.rig.as_ref().unwrap().video_formats(), [F::HEVC, F::H264, F::HEVC], "Bo leaving causes one HEVC reopen");
+    m.watch(2, s);
+    m.until("the new HEVC watcher to decode on the open stream", |m| m.pts(2).is_some());
+    assert_eq!(m.rig.as_ref().unwrap().video_formats(), [F::HEVC, F::H264, F::HEVC], "another capable seat causes no reopen");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_watcher_that_cannot_decode_the_format_falls_back_and_the_share_follows() {
+    use makepad_call::{driver::codec::{Decoder, StreamFormat as F}, guard::Rung};
+    use makepad_widgets::makepad_platform::log_ring;
+    Cx::init_log();
+    struct NoHevc;
+    impl Codecs for NoHevc {
+        fn encoder(&self, rung: Rung, kbps: u32) -> Result<Box<dyn Encoder>, String> { TestCodecs.encoder(rung, kbps) }
+        fn key_format(&self, key: &[u8]) -> Option<F> { TestCodecs.key_format(key) }
+        fn decoder(&self, key: &[u8]) -> Result<Box<dyn Decoder>, String> {
+            if self.key_format(key) == Some(F::HEVC) { return Err("no HEVC decoder".into()) }
+            TestCodecs.decoder(key)
+        }
+    }
+    let mut m = ShareMesh::new(false);
+    m.ctl[1].codecs = Arc::new(NoHevc);
+    let s = m.hevc_window(Some("Decoder fallback"));
+    let cursor = log_ring::read_since(0, 0).newest;
+    m.watch(1, s);
+
+    // The sharer cannot act on the revised View until its next poll.
+    m.until("Ben to withdraw HEVC", |m| !m.ctl[1].sharing.decode_caps.supports(MediaCaps::HEVC_DECODE));
+    let waiting = m.ctl[1].shown().share;
+    assert!(waiting.picture.is_none(), "the recovery key has not reached the watcher yet");
+    assert_eq!(waiting.watched().unwrap().decode_problem, None, "a recoverable HEVC failure stays off the tile");
+    assert_eq!(waiting.single_waiting_line(), Some("Waiting for Ana's picture…"), "the tile waits for the fallback key");
+
+    m.until("Ben to decode the recovery key without another input", |m| {
+        let shown = &m.ctl[1].sharing.shown;
+        assert!(shown.watched().unwrap().decode_problem.is_none(), "the tile stays clear while the fallback key is in flight");
+        shown.picture.is_some()
+    });
+    assert_eq!(m.ctl[1].current.as_ref().unwrap().stats().decoder, "test codec H.264 · 4:2:0",
+        "the recovered picture came from the H.264 decoder");
+    let viewer = &m.ctl[0].sharing.locals[&s].viewers[&m.key(1)];
+    assert_eq!(viewer.caps, MediaCaps(MediaCaps::H264_DECODE), "the re-sent View withdrew only HEVC");
+    assert_eq!(viewer.view, m.ctl[1].share_subscription(), "the re-sent View kept its geometry");
+    assert_eq!(m.rig.as_ref().unwrap().video_formats(), [F::HEVC, F::H264], "a caps-only change reopens the capture once");
+
+    let title = &m.ctl[0].sharing.shown.offer(s).unwrap().title;
+    let sharer_log = format!("Share {title}: H.264 · 4:2:0, Ben can't decode H.265 · 4:2:0");
+    let watcher_log = format!("Share {title}: this computer can't decode H.265 · 4:2:0; asking for another format");
+    let counts = || {
+        let lines = log_ring::read_since(cursor, log_ring::CAP).lines;
+        [&watcher_log, &sharer_log].map(|msg| lines.iter().filter(|l| l.text.ends_with(msg)).count())
+    };
+    m.until("both seats to log the fallback", |_| counts().iter().all(|&n| n > 0));
+    assert_eq!(counts(), [1, 1], "the watcher logs one fallback request and the sharer logs one H.264 switch");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_watcher_that_cannot_keep_up_steps_the_share_down() {
+    use makepad_call::driver::codec::StreamFormat as F;
+    use makepad_widgets::makepad_platform::log_ring;
+    // The fake application's present advances its clock by a second. Send its real
+    // encoded packets on a 1 ms capture clock so the two-millisecond decoder falls behind.
+    struct FastWindow(Lease);
+    impl EncodedSource for FastWindow {
+        fn pop(&mut self) -> Option<Packet> {
+            let mut packet = self.0.pop()?;
+            packet.pts_100ns /= 1_000;
+            Some(packet)
+        }
+        fn want(&mut self, w: u32, h: u32, fps: u32) { self.0.want(w, h, fps); }
+        fn set_kbps(&mut self, kbps: u32) { self.0.set_kbps(kbps); }
+        fn key_now(&mut self) { self.0.key_now(); }
+        fn set_wake(&mut self, wake: Arc<dyn Fn() + Send + Sync>) { self.0.set_wake(wake); }
+        fn frame_counts(&self) -> Option<(u64, u64)> { self.0.frame_counts() }
+    }
+
+    Cx::init_log();
+    let mut m = ShareMesh::new(false);
+    m.ctl[1].codecs = Arc::new(TestCodecs::with_decode_delay(Duration::from_millis(2)));
+    let s = m.hevc_window(Some("Slow decoder"));
+    let source = &mut m.ctl[0].sharing.locals.get_mut(&s).unwrap().source;
+    *source = OfferSource::new(source.caps, Box::new(FastWindow(source.lease())));
+    let cursor = log_ring::read_since(0, 0).newest;
+    m.watch(1, s);
+    m.until("the first H.265 picture", |m| m.pts(1).is_some() && m.line(s).ends_with("H.265 · 4:2:0."));
+    let geometry = m.ctl[1].share_subscription();
+    let check_tile = |m: &ShareMesh| {
+        let shown = &m.ctl[1].shown().share;
+        assert!(shown.picture.is_some(), "the tile keeps displaying pictures during renegotiation");
+        assert_eq!(shown.watched().unwrap().decode_problem, None, "a slow decoder shows no error");
+        assert_eq!(shown.single_waiting_line(), None, "a slow decoder shows no waiting line");
+    };
+    for _ in 0..80 {
+        let before = m.pts(1);
+        m.rig.as_ref().unwrap().present(3);
+        m.until("the next picture from the slow stream", |m| { check_tile(m); m.pts(1) > before });
+        if !m.ctl[1].sharing.decode_caps.supports(MediaCaps::HEVC_DECODE) { break }
+    }
+    m.until("the watcher to decode the reopened H.264 share", |m| {
+        check_tile(m);
+        m.ctl[1].current.as_ref().unwrap().stats().decoder == "test codec H.264 · 4:2:0"
+            && m.line(s).ends_with("H.264 · 4:2:0: Ben can't decode H.265 · 4:2:0.")
+    });
+    let viewer = &m.ctl[0].sharing.locals[&s].viewers[&m.key(1)];
+    assert_eq!(viewer.caps, MediaCaps(MediaCaps::H264_DECODE), "the View withdraws the slow H.265 decoder");
+    assert_eq!(viewer.view, geometry, "the slowdown preserves the View geometry");
+    assert_eq!(m.rig.as_ref().unwrap().video_formats(), [F::HEVC, F::H264], "the slowdown reopens the app exactly once");
+    let reports = log_ring::read_since(cursor, log_ring::CAP).lines.into_iter().filter(|l|
+        l.text.contains("Share: this computer can't keep up with H.265 · 4:2:0 (decode ")
+        && l.text.ends_with(" ms); asking for another format")).count();
+    assert_eq!(reports, 1, "the watcher logs its measured slowdown exactly once");
+}
+
+#[test]
+fn a_decoder_loss_before_layout_is_remembered_by_the_next_view() {
+    use makepad_call::driver::codec::StreamFormat as F;
+    let mut m = ShareMesh::new(false);
+    let (s, _) = m.offer();
+    let remaining = MediaCaps(MediaCaps::H264_DECODE | MediaCaps::HEVC_DECODE);
+    m.ctl[1].sharing.decode_caps = MediaCaps(remaining.0 | MediaCaps::HEVC_444_DECODE);
+    m.until("Ben to receive the offer", |m| m.ctl[1].sharing.shown.offer(s).is_some());
+    let watcher = &mut m.ctl[1];
+    watcher.call_opening_presses(&mut m.hosts[1], CallAction::OnShare(s, Press::Watch));
+    assert_eq!(watcher.share_subscription(), View::default(), "the watch has no View until its panel is measured");
+    let sent = watcher.messages_sent();
+    watcher.share_decoder_limit(F::HEVC_FULL, None);
+    assert_eq!(watcher.sharing.decode_caps, remaining, "a closed View remembers the failed decoder");
+    assert_eq!(watcher.messages_sent(), sent, "the decoder loss sends no View before layout");
+    watcher.share_panel_size(s, ShareSurface::Page, 320, 180);
+    let ben = m.key(1);
+    m.until("the sharer to receive the first measured View", |m| m.ctl[0].is_viewer(s, &ben));
+    assert_eq!(m.ctl[0].sharing.locals[&s].viewers[&ben].caps, remaining, "the first View advertises the reduced caps");
+}
+
+#[test]
+fn a_failed_baseline_key_has_a_reason_even_without_a_second_problem_event() {
+    let mut watcher = CallController::default();
+    let session = [1; 16];
+    watcher.begin_offer(session, MESH_TOWN, "Canvas".into(), ShareRole::Viewer { sharer: [2; 65] }, (24., 16.));
+    watcher.watch(session);
+    watcher.share_decoder_limit(StreamFormat::H264, None);
+    assert_eq!(watcher.sharing.shown.watched().unwrap().decode_problem.as_deref(), Some("This computer can't decode H.264 · 4:2:0."),
+        "a failed fallback key explains why no picture can be shown");
+    watcher.sharing.shown.offer_mut(session).unwrap().decode_problem = Some("decoder unavailable".into());
+    watcher.share_decoder_limit(StreamFormat::H264, None);
+    assert_eq!(watcher.sharing.shown.watched().unwrap().decode_problem.as_deref(), Some("decoder unavailable"),
+        "the decoder's own terminal reason takes precedence");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_app_that_cannot_encode_the_format_falls_back_without_stopping() {
+    use makepad_call::driver::codec::StreamFormat as F;
+    let mut m = ShareMesh::new(false);
+    let s = m.hevc_window(None);
+    m.rig.as_ref().unwrap().refuse_format(F::HEVC);
+    m.watch(1, s);
+    m.until("the fallback picture and the app's reason", |m| m.pts(1).is_some() &&
+        m.line(s).ends_with("H.264 · 4:2:0: app couldn't encode H.265 · 4:2:0."));
+    assert_eq!(m.rig.as_ref().unwrap().video_formats(), [F::HEVC, F::H264], "the refused format is never retried");
+    assert!(m.ctl[0].sharing.shown.offer(s).unwrap().stopped_line.is_none(), "recovering from the refusal keeps the offer live");
+}
+
+#[cfg(unix)]
 #[test]
 fn decoder_open_failure_surfaces_in_preview_and_watched_share_ui() {
     use makepad_call::{driver::codec::Decoder, guard::Rung};
@@ -1993,7 +2461,7 @@ fn decoder_open_failure_surfaces_in_preview_and_watched_share_ui() {
     struct MissingDecoder;
     impl Codecs for MissingDecoder {
         fn encoder(&self, rung: Rung, kbps: u32) -> Result<Box<dyn Encoder>, String> { TestCodecs.encoder(rung, kbps) }
-        fn decoder(&self) -> Result<Box<dyn Decoder>, String> { Err(WHY.into()) }
+        fn decoder(&self, _: &[u8]) -> Result<Box<dyn Decoder>, String> { Err(WHY.into()) }
     }
 
     let mut m = ShareMesh::new(false);
@@ -2037,15 +2505,22 @@ impl CallController {
 }
 
 #[cfg(unix)]
-impl ShareMesh {
+impl<H: AudioHost> ShareMesh<H> {
     pub(crate) fn app_window(&mut self) -> (SessionId, LinkId) {
+        self.app_window_named(None)
+    }
+
+    fn app_window_named(&mut self, title: Option<&str>) -> (SessionId, LinkId) {
         let mut rig = crate::app_link::RecordingRig::new();
         rig.app.scan();
         rig.wait(|r| !r.app.apps().is_empty());
         let link = rig.app.link(&rig.app.apps()[0].key.clone());
         rig.live(link);
         let window = rig.app.state(link).unwrap().windows[0].id;
-        self.ctl[0].open_share_window(&mut rig.app, link, window).unwrap();
+        match title {
+            Some(title) => self.ctl[0].open_named_share_window(&mut rig.app, link, window, title.into()),
+            None => self.ctl[0].open_share_window(&mut rig.app, link, window),
+        }.unwrap();
         self.rig = Some(rig);
         (self.ctl[0].only_local_offer().unwrap(), link)
     }

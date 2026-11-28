@@ -1275,6 +1275,8 @@ fn ai_tools_use_the_authenticated_seat_and_have_no_allow() {
     let (out, _, _) = tools.start("late", set(), &mut model, std::slice::from_mut(&mut s.ana.session), &mut waits, unused_theme_context!());
     assert!(out.is_none(), "the Set is still held on the original owner's turn");
     assert_trace(&waits, line, since, &[(Ink::Action, "proposing padding 18 on panel")], "the original line owns the Set start");
+    // Only a final answer finishes a line; acknowledging the page below leaves it open.
+    waits.say(&mut model, token, "Proposed the padding.".into(), Some(line), true).unwrap();
     let next = model.mention_agent(agent, "a different request".into(), None).unwrap();
     waits.offered(&model, next);
     let reply = waits.wait(&mut model, "next", token, Some(cursor(&page[0])));
@@ -6465,12 +6467,20 @@ fn theme_tab_routes_bake_to_app_or_d1_design() {
     let item = model.act(crate::model::Action::AddDesign { board, x: 0, y: 0, preset: "phone".into(),
         title: "Card".into(), src: "View { title := Label{} }".into() }, Origin::Ui).unwrap();
     let callback = cx.tweak_callback;
-    cx.tweak_callback = Some(|_, op, _| match op {
-        "design_theme" => Ok(THEME.into()), "design_palette" => Ok(r#"{"palette":[]}"#.into()), _ => unreachable!(),
+    cx.tweak_callback = Some(|_, op, args| match op {
+        "design_theme" => Ok(THEME.into()),
+        "design_palette" if args == [("widgets".into(), crate::board::design_picture::CARD_WIDGETS.name().into())] =>
+            Ok(r#"{"palette":[]}"#.into()),
+        _ => unreachable!("the board asks for the palette of the set its cards render with: {op} {args:?}"),
     });
     let mut hub = Tweaks::<u64,u64>::default();
     hub.set_themes_dir(panel.themes_dir());
+    // The live share's panel was shown above; this hub has opened nothing yet.
+    root.set_visible(cx, false);
     hub.select_board_design(Some(item));
+    hub.update(cx, &ui, &model, &Default::default(), &mut Default::default(), |_| {});
+    assert!(!root.visible(), "selecting a design card only selects it");
+    hub.open_board_design(item);
     hub.update(cx, &ui, &model, &Default::default(), &mut Default::default(), |_| {});
     assert!(root.visible() && root.widget(cx, ids!(tweak_build_wrap)).visible(), "the board opens Build without a live share");
     cx.tweak_callback = callback;
@@ -6488,11 +6498,26 @@ fn theme_tab_routes_bake_to_app_or_d1_design() {
     assert!(hub.board_design_actions(cx, &ui, &action, &mut model).is_none(), "rebaking the same theme emits no write");
     let action = click(cx, ids!(tab_build));
     hub.board_design_actions(cx, &ui, &action, &mut model);
+    let status = root.label(cx, ids!(build_status));
+    assert!(status.text().starts_with(panel::PICK_A_PART), "the first line says how to pick a part: {}", status.text());
+    let action = click(cx, ids!(build_strip.design_dup));
+    assert!(hub.board_design_actions(cx, &ui, &action, &mut model).is_none(), "the whole design has nothing to be copied into");
+    assert_eq!(status.text(), panel::PART_FIRST, "a button that needs a part says so instead of doing nothing");
     let action = click(cx, ids!(insert_inside));
     let write = hub.board_design_actions(cx, &ui, &action, &mut model).expect("structural insertion on the board");
     let snapshot = design::d1::read_design(&model.state, item).unwrap();
     assert_eq!(snapshot.revision, write);
     assert_eq!(design::d1::list_widgets(&snapshot.src).unwrap().len(), 3);
+    assert_eq!(status.text(), "Insert: View", "the inserted part is picked and the refusal is gone");
+    board_frames_until(cx, &mut hub, &ui, &model, || insert.borrow().unwrap().enabled());
+    let action = click(cx, ids!(build_strip.design_dup));
+    let write = hub.board_design_actions(cx, &ui, &action, &mut model).expect("a picked part duplicates");
+    let snapshot = design::d1::read_design(&model.state, item).unwrap();
+    assert_eq!((snapshot.revision, design::d1::list_widgets(&snapshot.src).unwrap().len()), (write, 4));
+    board_frames_until(cx, &mut hub, &ui, &model, || insert.borrow().unwrap().enabled());
+    let action = click(cx, ids!(build_strip.design_down));
+    assert!(hub.board_design_actions(cx, &ui, &action, &mut model).is_none(), "the last child cannot step down");
+    assert_eq!(status.text(), "already last child", "an edit's refusal shows on the first line, beside the buttons");
     hub.select_board_design(None);
     hub.update(cx, &ui, &model, &Default::default(), &mut Default::default(), |_| {});
     assert!(!root.visible(), "deselecting the design closes its panel");
@@ -6529,7 +6554,7 @@ fn selecting_a_design_lists_its_widgets_off_the_ui_thread() {
     let root = ui.widget(cx, ids!(tweak_panel));
     let picker = root.drop_down(cx, ids!(board_widget));
     let edit = root.button(cx, ids!(insert_inside));
-    let result = root.label(cx, ids!(tweak_result));
+    let result = root.label(cx, ids!(build_status));
     let homes = crate::model::tests::ShareHomes::new("board-widget-index");
     let mut model = Model::open(&homes.0).unwrap().0;
     let board = model.act(Action::AddBoard { project: model.project().id, title: "Board".into() }, Origin::Ui).unwrap();
@@ -6544,7 +6569,7 @@ fn selecting_a_design_lists_its_widgets_off_the_ui_thread() {
         hub.update(cx, &ui, model, &Default::default(), &mut Default::default(), |_| {});
     };
     let before = panel::BOARD_INDEX_RUNS.with(|count| count.get());
-    hub.select_board_design(Some(item));
+    hub.open_board_design(item);
     update(cx, &mut hub, &model);
     assert_eq!(panel::BOARD_INDEX_RUNS.with(|count| count.get()), before, "selection parsed on the UI thread");
     assert!(picker.has_labels(&[]) && !edit.borrow().unwrap().enabled(), "the initial picker is empty and editing is disabled");
@@ -6575,7 +6600,7 @@ fn selecting_a_design_lists_its_widgets_off_the_ui_thread() {
     hub.select_board_design(None);
     update(cx, &mut hub, &model);
     let frame = cx.next_frame_id();
-    hub.select_board_design(Some(item));
+    hub.open_board_design(item);
     update(cx, &mut hub, &model);
     assert_eq!(cx.next_frame_id(), frame, "reopening an unchanged parse failure must not schedule another index");
     assert_eq!(result.text(), error);
@@ -6592,7 +6617,7 @@ fn selecting_a_design_lists_its_widgets_off_the_ui_thread() {
     let submit = start.elapsed();
     let install = board_frames_until(cx, &mut hub, &ui, &model, || edit.borrow().unwrap().enabled());
     eprintln!("Board widget index ({bytes} bytes, {copies} labels) UI submit {submit:?}, install {install:?}");
-    assert!(result.text().is_empty(), "a valid new revision clears the parse error");
+    assert!(result.text().starts_with(panel::PICK_A_PART), "a valid new revision clears the parse error: {}", result.text());
     assert_eq!(panel::BOARD_INDEX_RUNS.with(|count| count.get()), before, "no board index ran on the UI thread");
 }
 

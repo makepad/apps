@@ -1768,7 +1768,7 @@ fn draw_visible_rows(cx: &mut Cx2d, list: &mut PortalList, data: &mut crate::lis
         let show_divider = divider_before == Some(message.id);
         if line.visible() != show_divider { line.set_visible(cx, show_divider); }
         let author = item.widget(cx, ids!(author));
-        crate::lists::seat_icon(cx, &author, message.seat, &message.name, message.tone);
+        crate::lists::seat_icon(cx, &author, message.seat, &message.badge, message.tone);
         let request = data.workspace.connect.requests.get(&index);
         item.widget(cx, ids!(approval)).set_visible(cx, request.is_some());
         if let Some(request) = request {
@@ -1854,7 +1854,7 @@ mod selection_tests {
 
     fn message(id: u8, name: &str, text: &str, deletable: bool) -> ChatRow {
         ChatRow::Message(Message { id: [id; 32], quote: None, seat: crate::view::Seat::Peer, tone: None,
-            name: name.into(), time: "14:02".into(), text: text.into(), traces: Vec::new(),
+            name: name.into(), badge: name.into(), time: "14:02".into(), text: text.into(), traces: Vec::new(),
             addressed: false, unheard: false, mention: false, mentions_you: false, deletable })
     }
 
@@ -2512,6 +2512,31 @@ mod selection_tests {
     }
 
     #[test]
+    fn my_own_pills_take_my_names_letter_while_the_label_says_you() {
+        use crate::model::{tests::ShareHomes, Action, Model, Origin};
+        let homes = ShareHomes::new("chat-own-pill");
+        let mut model = Model::open(&homes.0).unwrap().0;
+        model.set_person_name("okp").unwrap();
+        let line = model.post_chat_draft("my pill says Y for you?", None, None, None).unwrap();
+        model.act(Action::AddProject { title: "Ours".into() }, Origin::Ui).unwrap();
+        model.act(Action::AddTask { title: "Mine".into(), text: String::new() }, Origin::Ui).unwrap();
+        let mut f = ChatFixture::new(model.open_id(), Vec::new());
+        // A rename moves the letter along; the label stays "You" throughout.
+        for (name, letter) in [("okp", "O"), ("Ren", "R")] {
+            model.set_person_name(name).unwrap();
+            f.data.workspace = Workspace::read(&model, false, &Default::default());
+            f.draw();
+            let row = f.list.get_item(message_index(&f.data.workspace, line)).expect("my line was drawn").1;
+            assert_eq!(row.label(&f.cx, ids!(name)).text(), "You", "my line keeps the You label");
+            assert!(row.widget(&f.cx, ids!(author.you)).visible(), "my line keeps my own pill");
+            assert_eq!(row.label(&f.cx, ids!(author.you.initial)).text(), letter, "my pill shows {name}'s letter, never the Y of You");
+            let card = f.data.workspace.projects.iter().flat_map(|p| p.columns.iter().flatten())
+                .find(|c| c.title == "Mine").expect("my task card");
+            assert_eq!(card.author_name.as_ref(), name, "my task card's pill names me too");
+        }
+    }
+
+    #[test]
     fn day_dividers_coexist_with_unread_strip_retraction_copy_and_pending_cue() {
         use crate::model::{tests::ShareHomes, Model};
         use crate::view::LocalClock;
@@ -2836,7 +2861,7 @@ mod selection_tests {
         for (id, name, time, words) in [(1, "Ana", "14:02", "Tea is ready."), (2, "Ben", "14:03", "On my way.")] {
             let quote = (id == 2).then(|| crate::view::Quote { id: [1; 32], name: "Ana".into(), text: "Tea is ready.".into() });
             data.workspace.rows.push(ChatRow::Message(Message { id: [id; 32], quote, seat: crate::view::Seat::Peer, tone: None,
-                name: name.into(), time: time.into(), text: words.into(), traces: vec![],
+                name: name.into(), badge: name.into(), time: time.into(), text: words.into(), traces: vec![],
                 addressed: false, unheard: false, mention: false, mentions_you: false, deletable: id == 1 }));
         }
         let path = PathBuf::from("picture");

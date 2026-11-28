@@ -99,6 +99,7 @@ pub(crate) struct ClipImport {
 pub(crate) struct ClipResult {
     pub file: FileResult,
     pub board: Option<BoardMediaTarget>,
+    pub source_peer: Option<PublicKey>,
     pub path: PathBuf,
     pub info: ClipImport,
     pub stored_poster: Option<StoredFile>,
@@ -202,6 +203,8 @@ enum Command {
     Open(TownId),
     Add { town: TownId, project: Id, path: PathBuf, title: String, clip: Option<ClipImport> },
     Issue { draft: u64, town: TownId, png: Arc<Vec<u8>>, poster: Arc<Vec<u8>> },
+    BoardSnap { town: TownId, board: Id, title: String, size: [u32; 2], session: SessionId,
+        source_peer: Option<PublicKey>, png: Arc<Vec<u8>>, poster: Arc<Vec<u8>> },
     IssueVideo { draft: u64, town: TownId, recording: crate::app_link::report::Recording },
     AddOwn { sequence: usize, town: TownId, path: PathBuf, title: String, board: Option<BoardMediaTarget> },
     StorePoster(Box<Poster>),
@@ -287,6 +290,12 @@ impl StoreWorker {
 
     pub(crate) fn add_issue(&mut self, draft: u64, town: TownId, png: Arc<Vec<u8>>, poster: Arc<Vec<u8>>) {
         self.pending.commands.push(Command::Issue { draft, town, png, poster });
+    }
+
+    pub(crate) fn add_board_snap(&mut self, town: TownId, board: Id, title: String, session: SessionId,
+        source_peer: Option<PublicKey>, still: crate::app_link::IssueStill) {
+        self.pending.commands.push(Command::BoardSnap { town, board, title, size: still.size, session, source_peer,
+            png: still.png, poster: still.poster });
     }
 
     pub(crate) fn add_issue_video(&mut self, draft: u64, town: TownId, recording: crate::app_link::report::Recording) {
@@ -525,7 +534,7 @@ impl Stores {
             let info = ClipImport { source: ClipSource::Own, format: CaptureFormat::Png, session: None,
                 duration_ms: 0, poster: None, width: 0, height: 0 };
             let file = FileResult { town, project: None, title: title.to_owned(), result: Err(why) };
-            me.finish_own(sequence, ClipResult { file, board, path: path.to_owned(), info, stored_poster: None });
+            me.finish_own(sequence, ClipResult { file, board, source_peer: None, path: path.to_owned(), info, stored_poster: None });
             Ok(())
         };
         let mut head = Vec::new();
@@ -545,7 +554,7 @@ impl Stores {
         };
         let info = ClipImport { source: ClipSource::Own, format, session: None, duration_ms: 0, poster: None, width: 0, height: 0 };
         let file_result = FileResult { town, project: None, title: title.to_owned(), result: Ok(file) };
-        let mut clip = ClipResult { file: file_result, board, path: path.to_owned(), info, stored_poster: None };
+        let mut clip = ClipResult { file: file_result, board, source_peer: None, path: path.to_owned(), info, stored_poster: None };
         if format.is_video() {
             let job = PosterJob {
                 decode: self.poster_decoder.clone(),
@@ -621,6 +630,16 @@ impl Stores {
                 self.changes.issues.push((draft, result.map_err(|e| format!("Could not store the issue picture: {e}"))));
                 return;
             }
+            Command::BoardSnap { town, board, ref title, size: [width, height], session, source_peer, ref png, ref poster } => (|| {
+                let full = self.import_reader(town, png.as_slice())?;
+                let small = self.import_reader(town, poster.as_slice())?;
+                let file = FileResult { town, project: None, title: title.clone(), result: Ok(full) };
+                let info = ClipImport { source: ClipSource::Own, format: CaptureFormat::Png, session: Some(session),
+                    duration_ms: 0, poster: None, width, height };
+                self.changes.clips.push(ClipResult { file, board: Some(BoardMediaTarget { board, pos: None }),
+                    source_peer, path: PathBuf::new(), info, stored_poster: Some(small) });
+                Ok(())
+            })(),
             Command::RemoveRecording { ref path, ref title, extension } => {
                 let result = self.owned_recording(path, extension).and_then(|owned| {
                     if owned { std::fs::remove_file(path) }
@@ -670,7 +689,7 @@ impl Stores {
                             self.changes.recording_problems.push(why);
                         }
                     }
-                    self.changes.clips.push(ClipResult { file, board: None, path: path.clone(), info: info.clone(), stored_poster });
+                    self.changes.clips.push(ClipResult { file, board: None, source_peer: None, path: path.clone(), info: info.clone(), stored_poster });
                 } else {
                     self.changes.files.push(file);
                 }
@@ -678,7 +697,7 @@ impl Stores {
             })(),
         };
         if let Err(err) = result {
-            if let Command::Add { clip: Some(_), ref title, .. } = cmd {
+            if let Command::Add { clip: Some(_), ref title, .. } | Command::BoardSnap { ref title, .. } = cmd {
                 if !retrying { self.changes.recording_problems.push(format!("{title}: storage will retry: {err}")); }
             }
             if !retrying { eprintln!("town: blob store will retry: {err}"); }

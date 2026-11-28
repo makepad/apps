@@ -9,6 +9,7 @@ use makepad_ai_hub::speech::WakeHook;
 use makepad_call::driver::TranscriptTap;
 use makepad_call::driver::{
     audio::{audio_ports, InputPort, OutputPort, PortControl},
+    share_audio::{share_speaker, ShareSpeaker},
     codec::platform_codecs, Call, CallConfig, CallEvent, EchoCancelMode, Inlet, Join, PeerId, Spawn, VoiceSource,
 };
 use makepad_widgets::{log, Cx, CxMediaApi, LiveId, Timer, makepad_platform::audio::{AudioDeviceDesc, AudioDeviceId, AudioDeviceType, AudioInputOptions}};
@@ -74,19 +75,21 @@ pub struct CallEnv {
 
 pub trait AudioHost {
     /// Once per controller, before the first device opens.
-    fn install(&mut self, mic: MicPort, speaker: OutputPort);
+    fn install(&mut self, mic: MicPort, speaker: OutputPort, share: ShareSpeaker);
     /// Open exactly these inputs (empty: none), with echo cancellation.
     fn use_inputs(&mut self, ids: &[AudioDeviceId]);
     fn use_outputs(&mut self, ids: &[AudioDeviceId]);
 }
 
 impl AudioHost for Cx {
-    fn install(&mut self, mut mic: MicPort, mut speaker: OutputPort) {
+    fn install(&mut self, mut mic: MicPort, mut speaker: OutputPort, mut share: ShareSpeaker) {
         self.audio_input(0, move |info, buffer| {
             mic.push_planar(info.sample_rate, buffer.frame_count(), buffer.channel_count(), &buffer.data);
         });
         self.audio_output(0, move |info, buffer| {
-            speaker.fill_planar(info.sample_rate, buffer.frame_count(), buffer.channel_count(), &mut buffer.data);
+            let (frames, channels) = (buffer.frame_count(), buffer.channel_count());
+            speaker.fill_planar(info.sample_rate, frames, channels, &mut buffer.data);
+            share.add_planar(info.sample_rate, frames, channels, &mut buffer.data);
         });
     }
 
@@ -105,7 +108,7 @@ struct SyntheticHost {
 }
 
 struct SyntheticSpeaker {
-    port: Mutex<OutputPort>,
+    ports: Mutex<(OutputPort, ShareSpeaker)>,
     open: AtomicBool,
     stop: AtomicBool,
 }
@@ -122,8 +125,10 @@ impl SyntheticSpeaker {
             }
             if self.stop.load(Ordering::Relaxed) { break }
             if self.open.load(Ordering::Relaxed) {
-                let mut port = self.port.lock().unwrap_or_else(|err| err.into_inner());
-                port.fill_planar(48_000.0, 480, 1, &mut block);
+                let mut ports = self.ports.lock().unwrap_or_else(|err| err.into_inner());
+                let (speaker, share) = &mut *ports;
+                speaker.fill_planar(48_000.0, 480, 1, &mut block);
+                share.add_planar(48_000.0, 480, 1, &mut block);
             }
         }
     }
@@ -140,7 +145,7 @@ impl SyntheticHost {
     #[cfg(test)]
     fn received_seq(&self, peer: PeerId, stream: u8) -> Option<u32> {
         let (_, speaker) = self.ports.as_ref()?;
-        speaker.port.lock().unwrap_or_else(|err| err.into_inner()).received_seq(peer, stream)
+        speaker.ports.lock().unwrap_or_else(|err| err.into_inner()).0.received_seq(peer, stream)
     }
 
     fn descs() -> [AudioDeviceDesc; 2] {
@@ -159,9 +164,9 @@ impl SyntheticHost {
 }
 
 impl AudioHost for SyntheticHost {
-    fn install(&mut self, mic: MicPort, speaker: OutputPort) {
+    fn install(&mut self, mic: MicPort, speaker: OutputPort, share: ShareSpeaker) {
         let speaker = Arc::new(SyntheticSpeaker {
-            port: Mutex::new(speaker),
+            ports: Mutex::new((speaker, share)),
             open: AtomicBool::new(self.output.is_some()),
             stop: AtomicBool::new(false),
         });
@@ -291,7 +296,7 @@ pub struct CallController {
     voice_attached: bool,
     stopping: Vec<Call>,
     control: PortControl,
-    uninstalled: Option<(MicPort, OutputPort)>,
+    uninstalled: Option<(MicPort, OutputPort, ShareSpeaker)>,
     blocks: Arc<AtomicU64>,
     unmute_at: u64,
     enumerated_or_requested: bool,
@@ -315,16 +320,17 @@ pub struct CallController {
 impl Default for CallController {
     fn default() -> Self {
         let (input, output, control) = audio_ports();
+        let (share, share_control) = share_speaker();
         let blocks: Arc<AtomicU64> = Arc::default();
         Self {
             flow: CallFlow::default(), synthetic: None, link_changed: false, timer: Timer::empty(),
-            sharing: share::Sharing::default(), takeover: Default::default(), voice_wanted: false, voice_attached: false,
+            sharing: share::Sharing::new(share_control), takeover: Default::default(), voice_wanted: false, voice_attached: false,
             codecs: platform_codecs(),
             echo_cancel: platform_echo_cancel(),
             talking: Talking::default(), last_talking: Instant::now(), devices: Devices::default(), env: None,
             inlet: Inlet::new(), links: BTreeMap::new(), next_epoch: 0,
             open_town: None, town_members: BTreeMap::new(), next_peer_id: 1, id_to_peer: BTreeMap::new(), call_generation: 0, current: None, stopping: Vec::new(), control,
-            uninstalled: Some((MicPort { input, blocks: blocks.clone() }, output)),
+            uninstalled: Some((MicPort { input, blocks: blocks.clone() }, output, share)),
             blocks, unmute_at: 0, enumerated_or_requested: false, want_input: false,
             want_output: false, input: None, output: None, facts: Vec::new(), muted_sessions: Vec::new(),
             clock: Instant::now(), sent: 0, speech: Speech::default(),
@@ -453,6 +459,7 @@ impl CallController {
     }
 
     pub fn sync_timer(&mut self, cx: &mut Cx) {
+        self.sharing.decode_probe.start(cx);
         self.sync_peer_retry(cx);
         self.sync_level_timer(cx);
         if self.view().phase != Phase::Idle && self.timer.is_empty() {
@@ -579,6 +586,7 @@ impl CallController {
         self.link_down_all(host);
         self.want_input = false;
         self.want_output = false;
+        self.sync_share_speaker(host);
         self.route(host);
     }
 
@@ -612,15 +620,15 @@ impl CallController {
     }
 
     fn install(&mut self, host: &mut dyn AudioHost) {
-        if let Some((mic, speaker)) = self.uninstalled.take() {
-            self.host(host).install(mic, speaker);
+        if let Some((mic, speaker, share)) = self.uninstalled.take() {
+            self.host(host).install(mic, speaker, share);
         }
     }
 
     fn route(&mut self, host: &mut dyn AudioHost) {
         let feed = self.env.as_ref().is_some_and(|env| env.voice == VoiceSource::Feed);
         let input = if self.wants_input() && feed { self.devices.chosen(DeviceKind::Input) } else { None };
-        let output = if self.want_output { self.devices.chosen(DeviceKind::Output) } else { None };
+        let output = if self.want_output || self.sharing.wants_speaker() { self.devices.chosen(DeviceKind::Output) } else { None };
         if input.is_some() || output.is_some() {
             self.install(host);
         }
@@ -924,6 +932,7 @@ impl CallController {
         let mut changed = std::mem::take(&mut self.link_changed);
         changed |= self.poll_transcription(host);
         if self.links.is_empty() && !self.has_call_workers() {
+            changed |= self.sync_share_speaker(host);
             return changed;
         }
         let peers: Vec<_> = self.linked_peers().collect();
@@ -988,14 +997,23 @@ impl CallController {
         let watched_peer = self.watched_peer_id();
         if let Some(call) = &mut self.current {
             for event in call.poll() {
-                if let CallEvent::Problem { peer, what } = event {
-                    log!("Town call: {what}");
-                    if peer.is_some() && peer == watched_peer && self.sharing.shown.picture.is_none() {
-                        if let Some(offer) = self.sharing.shown.watching.and_then(|s| self.sharing.shown.offer_mut(s)) {
-                            offer.decode_problem = Some(Arc::from(what));
-                            changed = true;
+                match event {
+                    CallEvent::Undecodable { peer, format } if Some(peer) == watched_peer => {
+                        changed |= self.share_decoder_limit(format, None);
+                    }
+                    CallEvent::DecodeBehind { peer, format, decode_us, interval_us } if Some(peer) == watched_peer => {
+                        changed |= self.share_decoder_limit(format, Some((decode_us, interval_us)));
+                    }
+                    CallEvent::Problem { peer, what } => {
+                        log!("Town call: {what}");
+                        if peer.is_some() && peer == watched_peer && self.sharing.shown.picture.is_none() {
+                            if let Some(offer) = self.sharing.shown.watching.and_then(|s| self.sharing.shown.offer_mut(s)) {
+                                offer.decode_problem = Some(Arc::from(what));
+                                changed = true;
+                            }
                         }
                     }
+                    _ => {}
                 }
             }
         }
@@ -1023,6 +1041,7 @@ impl CallController {
         self.sample_peer_level();
         self.stopping.retain(|call| !call.stopped());
         changed |= self.poll_share();
+        changed |= self.sync_share_speaker(host);
         self.control.tick();
         if self.view().unmuting && self.blocks.load(Ordering::Relaxed) != self.unmute_at {
             let mut effects = Vec::new();
@@ -1431,6 +1450,7 @@ mod tests {
         history: Vec<Use>,
         mic: Option<MicPort>,
         speaker: Option<OutputPort>,
+        share: Option<ShareSpeaker>,
         input: Option<AudioDeviceId>,
         output: Option<AudioDeviceId>,
         listed: bool,
@@ -1439,10 +1459,11 @@ mod tests {
     }
 
     impl AudioHost for Host {
-        fn install(&mut self, mic: MicPort, speaker: OutputPort) {
+        fn install(&mut self, mic: MicPort, speaker: OutputPort, share: ShareSpeaker) {
             assert!(self.mic.is_none() && self.speaker.is_none(), "install both callbacks only once");
             self.mic = Some(mic);
             self.speaker = Some(speaker);
+            self.share = Some(share);
             self.history.push(Use::Install);
         }
 

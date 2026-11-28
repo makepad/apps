@@ -1,0 +1,456 @@
+[workspace]
+manifest = "solidcore/Cargo.toml"
+root_files = ["solidcore/Cargo.toml", "solidcore/LICENSE", "solidcore/NOTICE", "solidcore/ATTRIBUTION.md"]
+shim_root = "sync/shims"
+attribution_section = "sync/attribution.md"
+
+[deny]
+names = ["assets", "LICENSE-BRAND"]
+directories = ["crates/look", "assets/branding", "assets/icons/app"]
+extensions = ["svg", "png", "ico", "icns", "ttf", "otf"]
+
+[expect]
+c1_each_path_min = 1
+c2_denied = 0
+s1_min = 1
+s2_min = 0
+s3_each_pattern_min = 1
+a1_per_crate = 1
+
+[[crate]]
+upstream = "solidcore/crates/solidcore"
+dest = "upstream/kernel"
+package = "makepad-csg-brep"
+report_sites = ["src/error/bare_scan.rs:311", "src/error/site_scan.rs:1012", "src/error.rs:3467"]
+rust_roots = ["src/"]
+copy = ["Cargo.toml", "src/", "build.rs"]
+keep = ["src/kernel/fixes/*.md"]
+sections = ["package", "test", "features", "dependencies", "dev-dependencies", "lints"]
+dev_dependencies = ["serde_json"]
+dependencies = ["thiserror", "serde", "spade"]
+
+[build]
+producer = "solidcore/crates/solidcore/build.rs"
+consumer = "solidcore/crates/solidcore/src/kernel.rs"
+output = "upstream_fixes.rs"
+inputs = "src/kernel/fixes/*.md"
+sha256 = "03d5f435fc971cd42b3917bfba3aa7df82d0249380c25eec014fca6699911949"
+
+[inventory]
+licenses = ["Apache-2.0", "MIT OR Apache-2.0"]
+license_files = ["solidcore/LICENSE", "solidcore/NOTICE"]
+serde_shim = ["rename_all", "default", "deny_unknown_fields", "tag", "content", "skip_serializing_if", "rename", "from", "into"]
+i1 = [
+    "serde.default", "serde.rename_all", "serde.skip_serializing_if", "serde.tag",
+    "thiserror.debug", "thiserror.derive", "thiserror.error", "thiserror.extra arguments",
+    "thiserror.field shorthand", "thiserror.implicit", "thiserror.inline", "thiserror.plain",
+    "thiserror.positional", "thiserror.transparent",
+]
+i2 = ["Instant", "std::io", "thread_local!"]
+
+[[dependency]]
+name = "serde_json"
+version = "1"
+default_features = true
+features = ["float_roundtrip"]
+drop = true
+
+
+[[dependency]]
+name = "thiserror"
+package = "makepad-solidsync-thiserror"
+shim = "thiserror"
+version = "2"
+default_features = true
+features = []
+
+[[dependency]]
+name = "serde"
+package = "makepad-solidsync-serde"
+shim = "serde"
+version = "1"
+default_features = true
+features = ["derive"]
+
+[[dependency]]
+name = "spade"
+package = "makepad-solidsync-spade"
+shim = "spade"
+version = "2.15"
+default_features = false
+features = ["std"]
+
+# D1 applies when the record crate enters the copy set.
+[[drop_module]]
+upstream = "solidcore/crates/solidcore-record"
+file = "src/lib.rs"
+line = "pub mod native;"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::blend::tests::the_phrase_scan_lists_exactly_the_phrase_variants"
+uses = "error::site_scan"
+reason = "Uses removed error::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::boolean::tests::the_boolean_phrase_cause_sites_only_shrink"
+uses = "error::site_scan"
+reason = "Uses removed error::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::curve::tests::the_curve_phrase_cause_sites_only_shrink"
+uses = "error::site_scan"
+reason = "Uses removed error::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::curve::tests::the_curve_routines_build_no_bare_statuses"
+uses = "error::bare_scan"
+reason = "Uses removed error::bare_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::geom::tests::the_geom_phrase_cause_sites_only_shrink"
+uses = "error::site_scan"
+reason = "Uses removed error::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::heal::tests::the_heal_phrase_cause_sites_only_shrink"
+uses = "error::site_scan"
+reason = "Uses removed error::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::heal::tests::the_heal_routines_build_no_bare_statuses"
+uses = "error::bare_scan"
+reason = "Uses removed error::bare_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::intersect::tests::the_intersect_phrase_cause_sites_only_shrink"
+uses = "error::site_scan"
+reason = "Uses removed error::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::intersect::tests::the_intersect_routines_build_no_bare_statuses"
+uses = "error::bare_scan"
+reason = "Uses removed error::bare_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::mass::tests::the_mass_phrase_cause_sites_only_shrink"
+uses = "error::site_scan"
+reason = "Uses removed error::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::mass::tests::the_mass_routines_build_no_bare_statuses"
+uses = "error::bare_scan"
+reason = "Uses removed error::bare_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::nurbs::tests::the_bspline_phrase_cause_sites_only_shrink"
+uses = "error::site_scan"
+reason = "Uses removed error::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::offset::tests::the_offset_phrase_cause_sites_only_shrink"
+uses = "error::site_scan"
+reason = "Uses removed error::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::offset::tests::the_offset_routines_build_no_bare_statuses"
+uses = "error::bare_scan"
+reason = "Uses removed error::bare_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::phrase_sites::library_code"
+uses = "error::bare_scan"
+reason = "Uses removed error::bare_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::phrase_sites::site_scan"
+uses = "error::site_scan"
+reason = "Uses removed error::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::primitive::tests::the_primitive_phrase_cause_sites_only_shrink"
+uses = "error::site_scan"
+reason = "Uses removed error::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::query::tests::bare_statuses_in"
+uses = "error::bare_scan"
+reason = "Uses removed error::bare_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::query::tests::the_query_phrase_cause_sites_only_shrink"
+uses = "error::site_scan"
+reason = "Uses removed error::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::replaced_upstream_samples::the_generic_phrase_cause_sites_only_shrink"
+uses = "error::site_scan"
+reason = "Uses removed error::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::stage_sites::site_scan"
+uses = "error::site_scan"
+reason = "Uses removed error::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::stage_sites::tests::crate_sites"
+uses = "error::site_scan"
+reason = "Uses removed error::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::stage_sites::tests::the_unreviewed_stage_failure_sites_only_shrink"
+uses = "error::site_scan"
+reason = "Uses removed error::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::surface::tests::the_surface_phrase_cause_sites_only_shrink"
+uses = "error::site_scan"
+reason = "Uses removed error::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::surface::tests::the_surface_routines_build_no_bare_statuses"
+uses = "error::bare_scan"
+reason = "Uses removed error::bare_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::sweep::tests::the_sweep_phrase_cause_sites_only_shrink"
+uses = "error::site_scan"
+reason = "Uses removed error::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::sweep::tests::the_sweep_routines_build_no_bare_statuses"
+uses = "error::bare_scan"
+reason = "Uses removed error::bare_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::topology::tests::the_topology_phrase_cause_sites_only_shrink"
+uses = "error::site_scan"
+reason = "Uses removed error::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::topology::tests::the_topology_routines_build_no_bare_statuses"
+uses = "error::bare_scan"
+reason = "Uses removed error::bare_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::blend::tests::the_blend_routines_build_no_bare_statuses"
+uses = "error::query::tests::bare_statuses_in"
+reason = "Uses removed error::query::tests::bare_statuses_in"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::geom::tests::the_geom_routines_build_no_bare_statuses"
+uses = "error::query::tests::bare_statuses_in"
+reason = "Uses removed error::query::tests::bare_statuses_in"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::nurbs::tests::the_nurbs_routines_build_no_bare_statuses"
+uses = "error::query::tests::bare_statuses_in"
+reason = "Uses removed error::query::tests::bare_statuses_in"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::phrase_sites::BLEND"
+uses = "error::phrase_sites::site_scan"
+reason = "Uses removed error::phrase_sites::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::phrase_sites::phrase_sites"
+uses = "error::phrase_sites::site_scan"
+reason = "Uses removed error::phrase_sites::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::phrase_sites::sites_in"
+uses = "error::phrase_sites::site_scan"
+reason = "Uses removed error::phrase_sites::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::phrase_sites::tests::lines"
+uses = "error::phrase_sites::library_code"
+reason = "Uses removed error::phrase_sites::library_code"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::phrase_sites::tests::the_phrase_cause_sites_only_shrink"
+uses = "error::phrase_sites::site_scan"
+reason = "Uses removed error::phrase_sites::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::primitive::tests::the_primitive_routines_build_no_bare_statuses"
+uses = "error::query::tests::bare_statuses_in"
+reason = "Uses removed error::query::tests::bare_statuses_in"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::query::tests::the_query_routines_build_no_bare_statuses"
+uses = "error::query::tests::bare_statuses_in"
+reason = "Uses removed error::query::tests::bare_statuses_in"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::stage_sites::STAGE"
+uses = "error::stage_sites::site_scan"
+reason = "Uses removed error::stage_sites::site_scan"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::phrase_sites::tests::a_public_wrapper_fails_the_scan"
+uses = "error::phrase_sites::tests::lines"
+reason = "Uses removed error::phrase_sites::tests::lines"
+expected = 1
+
+[[remove]]
+upstream = "solidcore/crates/solidcore"
+item = "error::phrase_sites::tests::the_scan_counts_sites_not_patterns_or_wrappers"
+uses = "error::phrase_sites::tests::lines"
+reason = "Uses removed error::phrase_sites::tests::lines"
+expected = 1
+
+[[orphan]]
+upstream = "solidcore/crates/solidcore"
+item = "error::phrase_sites::tests::super"
+name = "*"
+reason = "Only used by the removed phrase_sites::tests scan helpers and tests, including the_phrase_cause_sites_only_shrink."
+expected = 1
+
+[[orphan]]
+upstream = "solidcore/crates/solidcore"
+item = "error::stage_sites::tests::super"
+name = "*"
+reason = "Only used by the removed test error::stage_sites::tests::the_unreviewed_stage_failure_sites_only_shrink."
+expected = 1
+
+[[orphan]]
+upstream = "solidcore/crates/solidcore"
+item = "topology::vertexuse::ObjectKey"
+name = "ObjectKey"
+reason = "Only used by notify_clears_gaps in the skipped topology::vertexuse::tests module."
+expected = 1
+
+[[orphan]]
+upstream = "solidcore/crates/solidcore"
+item = "topology::vertexuse::Topology"
+name = "Topology"
+reason = "Only used by notify_clears_gaps in the skipped topology::vertexuse::tests module."
+expected = 1
+
+[[orphan]]
+upstream = "solidcore/crates/solidcore"
+item = "offset::draft::tests::convert"
+name = "draft_rebuild"
+reason = "Only used by the removed test offset::draft::tests::a_draft_goes_through_its_record_and_certifies_again (serde_json)."
+expected = 1
+
+[[orphan]]
+upstream = "solidcore/crates/solidcore"
+item = "error::phrase_sites::PINS"
+scope = "production"
+reason = "Only read by the removed test error::phrase_sites::tests::the_phrase_cause_sites_only_shrink."
+expected = 1
+
+[[orphan]]
+upstream = "solidcore/crates/solidcore"
+item = "error::stage_sites::PINS"
+scope = "production"
+reason = "Only read by the removed test error::stage_sites::tests::the_unreviewed_stage_failure_sites_only_shrink."
+expected = 1
+
+[[orphan]]
+upstream = "solidcore/crates/solidcore"
+item = "blend::fillet_exact::rational::tests::quadric_support"
+reason = "Only called by the removed test blend::fillet_exact::rational::tests::nodal_sphere_and_cone_rounds_keep_zero_bound_definitions (serde_json)."
+expected = 1
+
+[[orphan]]
+upstream = "solidcore/crates/solidcore"
+item = "blend::fillet_exact::rational::tests::Sphere"
+name = "Sphere"
+reason = "Only used by the orphan blend::fillet_exact::rational::tests::quadric_support."
+expected = 1
+
+[[orphan]]
+upstream = "solidcore/crates/solidcore"
+item = "nurbs::crv_offset::tests::wavy"
+reason = "Only called by the removed test nurbs::crv_offset::tests::many_segments_at_a_tight_tolerance_are_offset (ignored)."
+expected = 1
+
+[[orphan]]
+upstream = "solidcore/crates/solidcore"
+item = "offset::offset_executive::p2::tests::block_with_vertical_rounds"
+reason = "Only called by the removed test offset::offset_executive::p2::tests::issue_397_inset_rounds_thinner_than_wall_collapse (ignored)."
+expected = 1

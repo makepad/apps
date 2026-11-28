@@ -222,9 +222,11 @@ pub enum Action {
     WriteDoc { doc: Id, markdown: String, based_on: String, range: Option<(BreakRef, BreakRef)> },
     LineToTask { doc: Id, at: BreakRef },
     AddBoard { title: String, project: Id },
+    AddMark { target: Id, width: i32, head: crate::marks::Head, pts: Vec<[i32; 2]> },
+    DeleteMark { mark: Id },
     PinMedia { board: Id, parent: Option<Id>, x: i64, y: i64, w: i64, h: i64, title: String,
         blob: (u64, Hash), poster: Option<(u64, Hash)>, media: String, duration_ms: Option<u64>,
-        source: Option<Id>, session: Option<SessionId> },
+        source: Option<Id>, session: Option<SessionId>, source_peer: Option<PublicKey> },
     PinFrom { board: Id, from: Id, parent: Option<Id>, x: Option<i64>, y: Option<i64>, w: Option<i64>, h: Option<i64> },
     /// Geometry in board actions uses integers in 1/64 canvas units, like the signed fields.
     AddItem { board: Id, kind: Key, x: i64, y: i64, w: i64, h: i64, style: ItemStyle, parent: Option<Id> },
@@ -3233,7 +3235,7 @@ impl Model {
         match action {
             Action::PinFrom { board, from, parent, x, y, w, h } => {
                 self.in_tool_town(town_id, |r, key| {
-                    let item = r.pin_image(board, parent, [x, y, w, h], Some(from), None)?;
+                    let item = r.pin_image(board, parent, [x, y, w, h], Some(from), None, None, None)?;
                     let Content::Entity { fields, .. } = &item else { unreachable!() };
                     for (_, value) in fields {
                         if let FieldValue::Blob { size, root } = value {
@@ -3246,14 +3248,14 @@ impl Model {
                     r.append(key, item, origin)
                 })
             }
-            Action::PinMedia { board, parent, x, y, w, h, title, blob, poster, media, duration_ms, source, session } => {
+            Action::PinMedia { board, parent, x, y, w, h, title, blob, poster, media, duration_ms, source, session, source_peer } => {
                 if origin != Origin::Ui { return Err("Only a local media flow can supply board picture data.".into()) }
                 let value = |(size, root)| FieldValue::Blob { size, root };
                 let mut fields = vec![(field::TITLE, FieldValue::Text(title)), (field::BLOB, value(blob)), (field::MEDIA, FieldValue::Text(media))];
                 if let Some(poster) = poster { fields.push((field::POSTER, value(poster))); }
                 if let Some(ms) = duration_ms { fields.push((field::DURATION, FieldValue::Int(i64::try_from(ms).map_err(|_| "Clip duration is too large.")?))); }
-                if let Some(session) = session { fields.push((field::SESSION, FieldValue::Key(session.to_vec()))); }
-                let item = self.in_tool_town(town_id, |r, _| r.pin_image(board, parent, [x, y, w, h].map(Some), source, Some(fields)))?;
+                let item = self.in_tool_town(town_id, |r, _| r.pin_image(board, parent, [x, y, w, h].map(Some),
+                    source, Some(fields), session, source_peer))?;
                 self.append_held_image(town_id, item, origin)
             }
             Action::SessionOpen { session, mode, to, town, town_wide } => self.session_action(SessionOp::Open { session, mode, to, town_wide }, None, town, origin),
@@ -3357,6 +3359,23 @@ impl Town {
             self.refuse_proposed(&action)?;
         }
         match action {
+            Action::AddMark { target, width, head, pts } => {
+                let issue = self.state.entities.get(&target).filter(|e| e.kind == kind::ISSUE && live(e))
+                    .ok_or("This issue is no longer available.")?;
+                let mut batch = Vec::new();
+                self.sign_mark(device, target, issue.project, width, head, &pts, origin, &mut batch)?;
+                self.save_issue_events(batch)
+            }
+            Action::DeleteMark { mark } => {
+                let e = self.state.entities.get(&mark).filter(|e| e.kind == kind::STROKE && live(e))
+                    .filter(|e| parent(e).and_then(|id| self.state.entities.get(&id)).is_some_and(|p| p.kind == kind::ISSUE && live(p)))
+                    .ok_or("This mark is no longer available.")?;
+                let seat = self.state.seat_of(&device.public());
+                if seat.is_none() || seat != self.state.seat_of(&e.author) { return Err("Only the author can undo this mark.".into()) }
+                self.append(device, Content::Set { copied_from: vec![], label: None, changes: vec![
+                    Change { entity: mark, field: field::DELETED, value: FieldValue::Bool(true) }
+                ] }, origin)
+            }
             Action::Provide { .. } if origin != Origin::Ui => Err("Only a person can offer this computer's AI Hub.".into()),
             Action::RequestSummary { session } => {
                 if origin != Origin::Ui { return Err("Only a person can ask for a summary.".into()) }
@@ -3968,12 +3987,14 @@ impl Town {
     }
 
     fn pin_image(&self, board: Id, parent: Option<Id>, [x, y, w, h]: [Option<i64>; 4],
-        source: Option<Id>, supplied: Option<Vec<(Key, FieldValue)>>) -> Result<Content, String> {
+        source: Option<Id>, supplied: Option<Vec<(Key, FieldValue)>>, session: Option<SessionId>,
+        source_peer: Option<PublicKey>) -> Result<Content, String> {
         let board = self.board(board)?;
         let gate = Gate::new(&self.state, LocalPolicy::Members);
         let withheld = |why| crate::ai_out::SafeToolError::withheld(why).as_str().to_owned();
         let copying = supplied.is_none();
         let mut fields = supplied.unwrap_or_default();
+        if let Some(session) = session { fields.push((field::SESSION, FieldValue::Key(session.to_vec()))); }
         let mut refs = Vec::new();
         let (mut fit_w, mut fit_h) = DEFAULT_MEDIA_SIZE;
 
@@ -4035,6 +4056,13 @@ impl Town {
                     }
                 }
             }
+        } else if session.is_some() || source_peer.is_some() {
+            let mut sources = Vec::new();
+            if let Some(open) = session.and_then(|s| self.state.session(&s)?.open.as_ref()) {
+                sources.push(CopySource::Record(open.anchor));
+            }
+            if let Some(peer) = source_peer { sources.push(CopySource::SharePeer { peer }); }
+            refs = entity_copy_refs(&fields, &[field::TITLE, field::BLOB, field::POSTER, field::MEDIA], &sources);
         }
         if !fields.iter().any(|(k, v)| *k == field::BLOB && matches!(v, FieldValue::Blob { .. })) {
             return Err("This source has no picture or recording.".into())
@@ -4420,9 +4448,16 @@ impl Model {
             None => worker.add_own(town, path, title),
         }
         worker.dispatch();
-        self.files.pending_adds += 1;
-        self.files.pending_clips += 1;
-        self.hold_for_store(town);
+        self.clip_queued(town);
+        Ok(())
+    }
+
+    pub(crate) fn store_board_snap(&mut self, town: TownId, board: Id, title: String, session: SessionId,
+        source_peer: Option<PublicKey>, still: crate::app_link::IssueStill) -> Result<(), String> {
+        let worker = self.files.worker.as_mut().filter(|w| !w.stopped()).ok_or("Picture storage is unavailable.")?;
+        worker.add_board_snap(town, board, title, session, source_peer, still);
+        worker.dispatch();
+        self.clip_queued(town);
         Ok(())
     }
 
@@ -4446,10 +4481,14 @@ impl Model {
         let worker = self.files.worker.as_mut().ok_or("Recording storage is unavailable.")?;
         worker.add_clip(town, project, path, title, info);
         worker.dispatch();
+        self.clip_queued(town);
+        Ok(())
+    }
+
+    fn clip_queued(&mut self, town: TownId) {
         self.files.pending_adds += 1;
         self.files.pending_clips += 1;
         self.hold_for_store(town);
-        Ok(())
     }
 
     /// Includes imports until their timeline posts have succeeded or been rejected.
@@ -4466,6 +4505,10 @@ impl Model {
         std::mem::take(&mut self.files.clip_problems)
     }
 
+    pub(crate) fn record_clip_problem(&mut self, why: String) {
+        self.files.clip_problems.push(why);
+    }
+
     /// Publish imported recordings on the owner of the town log. Removal is queued only
     /// after publication succeeds, so a rejected post leaves the original movie recoverable.
     fn publish_stored_clips(&mut self, clips: &[crate::store_worker::ClipResult], tick: &mut StoreTick) {
@@ -4473,7 +4516,7 @@ impl Model {
             match self.publish_clip(clip) {
                 Ok(id) if clip.board.is_some() => tick.board_events.push((clip.file.town, id)),
                 Ok(_) => {}
-                Err(why) => self.files.clip_problems.push(format!("{}: {why}", clip.file.title)),
+                Err(why) => self.record_clip_problem(format!("{}: {why}", clip.file.title)),
             }
             self.files.pending_adds -= 1;
             self.files.pending_clips -= 1;
@@ -4517,7 +4560,8 @@ impl Model {
             };
             return self.act_in(add.town, None, Action::PinMedia { board: target.board, parent: None, x, y, w, h,
                 title: add.title.clone(), blob: (file.size, file.root), poster, media: clip.info.format.media_kind().into(),
-                duration_ms: (clip.info.duration_ms > 0).then_some(clip.info.duration_ms), source: None, session: clip.info.session }, Origin::Ui)
+                duration_ms: (clip.info.duration_ms > 0).then_some(clip.info.duration_ms), source: None, session: clip.info.session,
+                source_peer: clip.source_peer }, Origin::Ui)
         }
         let action = Action::PostClip { project: add.project, title: add.title.clone(),
             media: (file.size, file.root), poster, duration_ms: clip.info.duration_ms,
@@ -7128,6 +7172,10 @@ impl Model {
     }
 
     pub fn read_json_in(&mut self, town: TownId, read: &crate::tools::Read) -> Result<AiOut, String> {
+        if let crate::tools::Read::IssueList { project, status } = *read {
+            let selected = crate::tools::Read::IssueList { project: self.project_selection(town, project), status };
+            return self.in_tool_town(town, |town, _| town.read_json(&selected))
+        }
         self.in_tool_town(town, |town, _| town.read_json(read))
     }
 }
@@ -7171,6 +7219,10 @@ impl Town {
     pub fn read_json(&self, read: &crate::tools::Read) -> Result<AiOut, String> {
         let gate = Gate::new(&self.state, LocalPolicy::Members);
         match *read {
+            crate::tools::Read::IssueList { project, status } => crate::tools::issue_list(self, &gate,
+                project.or_else(|| self.resolve_project(None).map(|p| p.id)), status,
+                |id| self.log.get(id).map(|e| e.header.wall_ms)).map_err(timeline_withheld),
+            crate::tools::Read::Issue { issue } => crate::tools::issue_read(self, &gate, &issue).map_err(timeline_withheld),
             crate::tools::Read::Design { item: id } => {
                 let (item, board) = self.board_item(id)?;
                 gate.board_item_placement(&id, &board).map_err(timeline_withheld)?;
@@ -9947,11 +9999,11 @@ pub(crate) mod tests {
         }
         let dest = issues::IssueProject { town, project };
         let issue = ben.file_issue(dest, [picture, poster], [1, 1], "Sketch", "My note", Some(session),
-            Some((video, 500)), Some(ana.me())).unwrap();
+            Some((video, 500)), Some(ana.me()), &[]).unwrap();
         check(&ben, issue, issue, fields(&[field::LABEL, field::BLOB, field::POSTER, field::VIDEO], &[sharer.clone(), anchor.clone()]));
-        let issue = ben.file_issue(dest, [picture, poster], [1, 1], "Sketch", "My note", Some(session), None, None).unwrap();
+        let issue = ben.file_issue(dest, [picture, poster], [1, 1], "Sketch", "My note", Some(session), None, None, &[]).unwrap();
         check(&ben, issue, issue, fields(&[field::LABEL, field::BLOB, field::POSTER], &[sharer, anchor.clone()]));
-        let local = ben.file_issue(dest, [picture, poster], [1, 1], "Local", "My note", None, None, None).unwrap();
+        let local = ben.file_issue(dest, [picture, poster], [1, 1], "Local", "My note", None, None, None, &[]).unwrap();
         check(&ben, local, local, vec![]);
 
         let clip = |session, poster| Action::PostClip { project: Some(project), title: "Review".into(),
@@ -13563,8 +13615,73 @@ pub(crate) mod tests {
             poster: Some((1, poster.root)), media_kind: "video/mp4".into(), duration_ms: 8123, width: 960, height: 720,
             session: None }, Origin::Ui).unwrap();
         let issue = peer.file_issue(issues::IssueProject { town, project }, [still, poster], [32, 16], "",
-            "First layer\nSecond line", None, Some((video, 17)), None).unwrap();
+            "First layer\nSecond line", None, Some((video, 17)), None, &[]).unwrap();
         (clip, issue, [still, poster, video])
+    }
+
+    #[test]
+    fn a_mark_on_a_finding_syncs_and_follows_its_author() {
+        use crate::marks::{marks_on, Head, DEFAULT_WIDTH};
+        let (_homes, mut ana, mut ben) = shared_town("finding-mark");
+        let town = ana.open_id();
+        let project = ana.project().id;
+        ana.act(Action::AddBoard { title: "Review".into(), project }, Origin::Ui).unwrap();
+        let (_, issue, _) = peer_board_media(&mut ana, town, project);
+        exchange(&mut ana, &mut ben);
+        let boards = |m: &Model| m.state.entities.values().filter(|e| e.kind == kind::BOARD).map(|e| {
+            let view = BoardView::build(&m.state, e.id);
+            (e.id, m.state.entities.keys().filter(|id| view.get(id).is_some()).copied().collect::<Vec<_>>())
+        }).collect::<Vec<_>>();
+        let before = (ana.state.timeline.len(), boards(&ana));
+        let add = || Action::AddMark { target: issue, width: DEFAULT_WIDTH, head: Head::End, pts: vec![[0, 10], [20, 5]] };
+        let id = ben.act(add(), Origin::Ui).unwrap();
+        exchange(&mut ana, &mut ben);
+        let marks = marks_on(&ana.state, issue);
+        assert_eq!(marks, marks_on(&ben.state, issue), "both folds show Ben's mark");
+        assert_eq!(marks.len(), 1);
+        assert_eq!((marks[0].id, marks[0].author, marks[0].head), (id, ben.me(), Head::End));
+        for model in [&ana, &ben] {
+            assert_eq!(model.state.timeline.len(), before.0, "a mark adds no timeline entry");
+            assert_eq!(boards(model), before.1, "a mark does not enter any board view");
+        }
+        let delete = Action::DeleteMark { mark: id };
+        assert!(ana.act(delete.clone(), Origin::Ui).is_err(), "the reporter cannot delete Ben's mark");
+        ben.act(delete, Origin::Ui).expect("Ben can delete his own mark");
+        exchange(&mut ana, &mut ben);
+        for model in [&ana, &ben] { assert!(marks_on(&model.state, issue).is_empty(), "deletion syncs"); }
+        let live = ben.act(add(), Origin::Ui).unwrap();
+        exchange(&mut ana, &mut ben);
+        let pts = Key::Name("pts".into());
+        assert!(Gate::new(&ana.state, LocalPolicy::Members).entity_field_value(&live, &pts).is_ok());
+        ana.remove_device(ben.me(), false).unwrap();
+        assert_eq!(Gate::new(&ana.state, LocalPolicy::Members).entity_field_value(&live, &pts),
+            Err(Withheld::External), "removing Ben withholds his mark");
+    }
+
+    #[test]
+    fn marks_drawn_on_a_draft_are_filed_with_the_issue() {
+        use crate::{marks::{marks_on, Head, DEFAULT_WIDTH}, store_worker::StoredFile};
+        let homes = ShareHomes::new("draft-marks");
+        let mut model = Model::open(&homes.0).unwrap().0;
+        let dest = issues::IssueProject { town: model.open_id(), project: model.project().id };
+        let files = [1, 2].map(|n| StoredFile { size: 1, root: [n; 32], id: blob::id(1, &[n; 32]) });
+        let pending = vec![(DEFAULT_WIDTH, Head::None, vec![[0, 0], [20, 40]]),
+            (DEFAULT_WIDTH, Head::End, vec![[50, 50], [20, 20]])];
+        let file = |model: &mut Model| model.file_issue(dest, files, [2, 2], "", "", None, None, None, &pending);
+        let before = model.open_event_count();
+        assert!(file(&mut model).is_err(), "missing picture fails filing");
+        assert_eq!(model.open_event_count(), before, "a failed draft leaves no partial issue");
+        model.files.holdings.entry(dest.town).or_default().extend(files.map(|f| f.id));
+        let issue = file(&mut model).unwrap();
+        assert_eq!(model.open_event_count(), before + 3, "retry files the issue and both retained marks");
+        let filed = marks_on(&model.state, issue);
+        assert_eq!(filed.len(), pending.len());
+        for (mark, (width, head, pts)) in filed.iter().zip(&pending) {
+            assert_eq!((mark.width, mark.head, mark.pts.as_ref()), (*width, *head, pts.as_slice()));
+            let e = &model.state.entities[&mark.id];
+            assert_eq!(e.project, Some(dest.project));
+            assert!(e.value(field::BOARD).is_none() && e.value(field::X).is_none(), "marks have no board placement");
+        }
     }
 
     #[test]
@@ -13584,7 +13701,7 @@ pub(crate) mod tests {
         };
         let local_pin = Action::PinMedia { board, parent: None, x: 0, y: 0, w: 64, h: 64, title: "Print".into(),
             blob: (still.size, still.root), poster: Some((poster.size, poster.root)), media: "image/png".into(),
-            duration_ms: None, source: None, session: None };
+            duration_ms: None, source: None, session: None, source_peer: None };
         assert_eq!(owner.act(local_pin, Origin::Ui), Err("The picture or its poster is missing from local storage.".into()));
         let before = owner.state.timeline.len();
         let movie = pin(&mut owner, clip).unwrap();

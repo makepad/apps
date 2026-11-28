@@ -97,6 +97,7 @@ pub struct ShareOfferExt {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ShareWatchExt {
     pub media_caps: Option<MediaCaps>,
+    pub audio: Option<bool>,
 }
 
 #[derive(PartialEq)]
@@ -477,7 +478,7 @@ mod tests {
             (10, Message::Share { session: call_id, title: "長".repeat(22_000), w: 160., h: 90.,
                 ext: ShareOfferExt { town: Some(town), codecs: Some(3), full_chroma: true } }),
             (11, Message::View { session: call_id, width: 160, height: 90, fps: 30,
-                ext: ShareWatchExt { media_caps: Some(caps) } }),
+                ext: ShareWatchExt { media_caps: Some(caps), audio: Some(true) } }),
         ] {
             let mut wire = message.encode();
             assert_eq!(&wire[..2], &[1, tag]);
@@ -486,8 +487,8 @@ mod tests {
                 assert_eq!(&wire[27..31], &66_000u32.to_le_bytes());
             }
             assert_eq!(message.call_id(), (tag != MEDIA_CAPS_NOTICE).then_some(call_id));
-            write_tlv(&mut wire, 0xfe, b"future");
-            assert_eq!(decode(&wire), Ok(Some(message)));
+            write_tlv(&mut wire, 9, b"future");
+            assert_eq!(decode(&wire), Ok(Some(message)), "tag {tag} preserves known fields and skips TLV 9");
             wire.push(0xfe);
             assert_eq!(decode(&wire), Err(Refused::Length));
         }
@@ -703,6 +704,7 @@ impl Message {
                 bytes.extend(session);
                 for field in [width, height, fps] { bytes.extend(field.to_le_bytes()); }
                 if let Some(caps) = ext.media_caps { write_tlv(&mut bytes, 1, &caps.0.to_le_bytes()); }
+                if let Some(audio) = ext.audio { write_tlv(&mut bytes, 2, &[audio as u8]); }
             }
             _ => unreachable!("only share signals use this layout"),
         }
@@ -743,14 +745,16 @@ impl Message {
             }
             (SHARE, [3..=255, ..]) => Ok(None),
             (VIEW, payload) if payload.len() >= 12 => {
-                let [media_caps] = fields(&payload[12..], [Field::Bytes(4)])?;
+                let [media_caps, audio] = fields(&payload[12..], [Field::Bytes(4), Field::Bool])?;
                 let width = u32::from_le_bytes(payload[..4].try_into().unwrap());
                 let height = u32::from_le_bytes(payload[4..8].try_into().unwrap());
                 let fps = u32::from_le_bytes(payload[8..12].try_into().unwrap());
                 if (width == 0 || height == 0 || fps == 0) && (width, height, fps) != (0, 0, 0) {
                     return Err(Refused::Tag)
                 }
-                Ok(Some(Self::View { session, width, height, fps, ext: ShareWatchExt { media_caps: media_caps.map(caps) } }))
+                Ok(Some(Self::View { session, width, height, fps, ext: ShareWatchExt {
+                    media_caps: media_caps.map(caps), audio: audio.map(|b| b[0] != 0),
+                } }))
             }
             _ => Err(Refused::Length),
         }

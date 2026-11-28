@@ -403,7 +403,7 @@ impl RecordingRig {
 
 #[test]
 fn a_preview_delivers_a_picture_that_finishes_after_push_without_another_unit() {
-    use makepad_call::{driver::codec::{Decoder, Encoder, Picture, TestCodecs}, guard::Rung};
+    use makepad_call::{driver::codec::{Decoder, Encoder, Picture, StreamFormat, TestCodecs}, guard::Rung};
     use std::sync::{Condvar, Mutex};
 
     #[derive(Default)]
@@ -416,11 +416,12 @@ fn a_preview_delivers_a_picture_that_finishes_after_push_without_another_unit() 
     }
     impl Codecs for DelayedCodecs {
         fn encoder(&self, rung: Rung, kbps: u32) -> Result<Box<dyn Encoder>, String> { TestCodecs.encoder(rung, kbps) }
-        fn decoder(&self) -> Result<Box<dyn Decoder>, String> {
-            Ok(Box::new(DelayedDecoder { progress: self.0.clone(), inner: TestCodecs.decoder()?, staged: Vec::new() }))
+        fn decoder(&self, key_au: &[u8]) -> Result<Box<dyn Decoder>, String> {
+            Ok(Box::new(DelayedDecoder { progress: self.0.clone(), inner: TestCodecs.decoder(key_au)?, staged: Vec::new() }))
         }
     }
     impl Decoder for DelayedDecoder {
+        fn format(&self) -> StreamFormat { self.inner.format() }
         fn push_into(&mut self, au: &[u8], pts: i64, _: &mut Vec<Picture>) -> Result<(), String> {
             self.inner.push_into(au, pts, &mut self.staged)?;
             self.progress.0.lock().unwrap().pushes += 1;
@@ -457,7 +458,7 @@ fn a_preview_delivers_a_picture_that_finishes_after_push_without_another_unit() 
         codecs: Arc::new(DelayedCodecs(progress.clone())),
         registry: None,
     };
-    let want = PictureWant { window: WindowId(0), max_w: 100, max_h: 100, fps: 15, kbps: 0 };
+    let want = PictureWant { window: WindowId(0), max_w: 100, max_h: 100, fps: 15, kbps: 0, format: None };
     let (preview, slot) = PicturePreview::new(&env, want);
     let rung = Rung { width: 320, height: 160, fps: 15, min_ask_bps: 0, full_bps: 1_000 };
     let mut encoder = env.codecs.encoder(rung, 1).unwrap();
@@ -465,7 +466,7 @@ fn a_preview_delivers_a_picture_that_finishes_after_push_without_another_unit() 
     let mut relay = |pts| {
         let packet = encoder.push(&pixels, pts).unwrap().pop().unwrap();
         let key = packet.key;
-        slot.relay(Arc::new(packet), (320, 160), key);
+        slot.relay(Arc::new(packet), (320, 160), key, makepad_call::driver::codec::StreamFormat::H264);
     };
     relay(0);
     let mut state = progress.1.wait_while(progress.0.lock().unwrap(), |s| s.pushes != 1 || s.polls == 0).unwrap();
@@ -506,12 +507,7 @@ fn a_preview_shows_each_new_app_picture_at_the_page_size_until_dropped() {
             return;
         }
     };
-    if let Err(why) = env.codecs.decoder() {
-        eprintln!("preview test skipped: platform decoder unavailable: {why}");
-        return;
-    }
-
-    let want = PictureWant { window: WindowId(0), max_w: 100, max_h: 100, fps: 15, kbps: 0 };
+    let want = PictureWant { window: WindowId(0), max_w: 100, max_h: 100, fps: 15, kbps: 0, format: None };
     let (preview, slot) = PicturePreview::new(&env, want);
     let mut nv12 = vec![96u8; 320 * 160 * 3 / 2];
     for uv in nv12[320 * 160..].chunks_exact_mut(2) {
@@ -523,7 +519,13 @@ fn a_preview_shows_each_new_app_picture_at_the_page_size_until_dropped() {
         assert_eq!(units.len(), 1, "the low-latency encoder returns the frame");
         let packet = units.into_iter().next().unwrap();
         assert_eq!(packet.key, key, "the preview decodes a key followed by its delta");
-        slot.relay(Arc::new(packet), (320, 160), key);
+        if key {
+            if let Err(why) = env.codecs.decoder(&packet.data) {
+                eprintln!("preview test skipped: platform decoder unavailable: {why}");
+                return;
+            }
+        }
+        slot.relay(Arc::new(packet), (320, 160), key, makepad_call::driver::codec::StreamFormat::H264);
         rx.recv().unwrap();
         let picture = preview.take().expect("the decoded picture reaches the page");
         assert_eq!((picture.width, picture.height, picture.nv12.len()), (100, 50, 100 * 50 * 3 / 2),

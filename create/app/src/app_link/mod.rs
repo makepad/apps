@@ -18,7 +18,7 @@ mod worker;
 pub use commands::{AppInput, DesignOp, DesignVerb, Mods};
 use makepad_call::driver::{codec::Codecs, Spawn};
 pub use pictures::{PicturePreview, PictureProbe, PictureStats, PictureStream, PictureWant};
-pub use sound::{AppSound, SoundStats};
+pub use sound::{AppSound, EncodedSound, SoundStats};
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},

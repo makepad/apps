@@ -11,3 +11,4 @@ pub mod home;
 pub mod town_tree;
 pub mod issues;
 pub mod picture_view;
+pub mod marked_picture;

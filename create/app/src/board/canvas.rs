@@ -555,6 +555,9 @@ pub enum BoardCanvasAction {
     Place(NewItem),
     CommitText { board: Id, action: ModelAction },
     ToolChanged,
+    /// Selecting a card only selects it. This is the explicit ask to edit a design card:
+    /// a double-click on it, or Return with it the single selection.
+    OpenDesign(Id),
     SelectionChanged,
     Undo,
     Redo,
@@ -595,6 +598,8 @@ pub struct BoardCanvas {
     #[rust] designs: DesignPictures,
     #[rust] design_keep: [HashSet<DesignKey>; 2],
     #[rust] design_frame: NextFrame,
+    /// The next frame of the live design cards on screen (`DesignPictures::advance`).
+    #[rust] card_frame: NextFrame,
     /// Once the camera stands still for a frame after a zoom or a pan, every visible design whose
     /// picture is less dense than the screen re-renders: a pause mid-gesture may upgrade early,
     /// the final stop checks again, and a pan reaches cards a zoom left off screen.
@@ -796,6 +801,7 @@ impl BoardCanvas {
         self.designs.clear(cx);
         for keep in &mut self.design_keep { keep.clear(); }
         self.design_frame = NextFrame::default();
+        self.card_frame = NextFrame::default();
         self.media.clear(cx);
         self.media_keep.clear();
         self.media_town = None;
@@ -1460,6 +1466,17 @@ impl BoardCanvas {
         if !shown || !writable {
             self.last_click = None;
             self.finish_text(cx, writable);
+        }
+    }
+
+    /// A design card opens the designer; an item with text opens its editor.
+    fn open_item(&mut self, cx: &mut Cx, id: Id) {
+        let design = self.scene.as_ref().and_then(|s| s.view.get(&id)).is_some_and(|i| i.kind == Key::Number(kind::DESIGN));
+        if design {
+            self.last_click = None;
+            cx.widget_action(self.widget_uid(), BoardCanvasAction::OpenDesign(id));
+        } else {
+            self.open_text(cx, id, false);
         }
     }
 
@@ -2288,7 +2305,7 @@ impl BoardCanvas {
                             } else if let Some(at) = self.app_pick_at(id, camera.local_to_screen(u.abs)) {
                                 cx.widget_action(self.widget_uid(), AppPick { item: id, at });
                             } else if u.tap_count >= 2 && previous_click == Some(id) {
-                                self.open_text(cx, id, false);
+                                self.open_item(cx, id);
                             } else {
                                 self.last_click = Some(id);
                             }
@@ -2379,7 +2396,7 @@ impl BoardCanvas {
                         KeyCode::ReturnKey | KeyCode::NumpadEnter if !k.is_repeat && !k.modifiers.any()
                             && !had_preview && !self.gesture.pointer_active() && self.placement_start.is_none()
                             && self.gesture.selection.ids.len() == 1 => {
-                            if let Some(&id) = self.gesture.selection.ids.first() { self.open_text(cx, id, false); }
+                            if let Some(&id) = self.gesture.selection.ids.first() { self.open_item(cx, id); }
                         }
                         KeyCode::Space => {
                             self.gesture.space = true;
@@ -2512,6 +2529,7 @@ impl Widget for BoardCanvas {
         if clip.size.x <= 0. || clip.size.y <= 0. {
             self.designs.suspend(cx);
             self.design_frame = NextFrame::default();
+            self.card_frame = NextFrame::default();
             self.repaint_pending = true;
             return DrawStep::done();
         }
@@ -2611,6 +2629,9 @@ impl Widget for BoardCanvas {
         } else {
             self.design_frame = NextFrame::default();
         }
+        if self.designs.live_shown(&self.design_keep) && !cx.next_frame_is_pending(self.card_frame) {
+            self.card_frame = cx.new_next_frame();
+        }
         if board_redrew { self.design_upgrade = false; }
         DrawStep::done()
     }
@@ -2623,6 +2644,11 @@ impl Widget for BoardCanvas {
         if self.design_frame.is_event(event).is_some() {
             self.design_frame = NextFrame::default();
             self.area.redraw(cx);
+        }
+        // Live cards repaint at the frame's time; the board itself is not redrawn.
+        if let Some(frame) = self.card_frame.is_event(event) {
+            self.card_frame = NextFrame::default();
+            if self.designs.advance(cx, &self.design_keep, frame.time) { self.card_frame = cx.new_next_frame(); }
         }
         if self.design_settle.is_event(event).is_some() {
             if std::mem::take(&mut self.design_zooming) {

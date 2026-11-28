@@ -1300,10 +1300,9 @@ impl State {
         let creator = self.derived_task_meta(&ent.id).map_or(ent.id, |d| d.creator);
         let Some(creator_order) = self.records.get(&creator).map(|r| r.order) else { return ops };
         if creator_order >= before_order { return ops }
-        let issue_owner = (ent.kind == kind::ISSUE && (*field == field::TEXT || *field == field::DELETED))
-            .then(|| self.seat_of(&ent.author));
+        let owner_seat = self.owner_only(ent, field).then(|| self.seat_of(&ent.author));
         let static_permits = |author: &PublicKey| -> bool {
-            issue_owner.is_none_or(|owner| owner.is_some() && self.seat_of(author) == owner)
+            owner_seat.is_none_or(|owner| owner.is_some() && self.seat_of(author) == owner)
         };
         let mut undo_seeds = Vec::new();
         if let Some(writes) = self.entity_writes.get(&ent.id) {
@@ -2653,8 +2652,15 @@ impl State {
             && (entity.fields.contains_key(&field::POLICY) || self.policy_writes.keys().any(|(_, ent)| *ent == entity.id))) {
             return town && critical && self.founder_seat().is_some_and(|s| self.seat_of(author) == Some(s))
         }
-        entity.kind != kind::ISSUE || (*field != field::TEXT && *field != field::DELETED)
-            || self.seat_of(author).is_some_and(|seat| Some(seat) == self.seat_of(&entity.author))
+        !self.owner_only(entity, field) || self.seat_of(author).is_some_and(|seat| Some(seat) == self.seat_of(&entity.author))
+    }
+
+    /// Fields only the entity author's seat may write: a finding's note and its deletion, and
+    /// every field of a mark drawn on a finding (a STROKE whose PARENT is an ISSUE).
+    fn owner_only(&self, entity: &Entity, field: &Key) -> bool {
+        if entity.kind == kind::ISSUE { return *field == field::TEXT || *field == field::DELETED }
+        entity.kind == kind::STROKE && matches!(entity.value(field::PARENT),
+            Some(Value::Id(parent)) if self.entities.get(parent).is_some_and(|p| p.kind == kind::ISSUE))
     }
 
     fn accepts_write(&mut self, field: &Key, value: &Value, author: &PublicKey) -> bool {
@@ -5064,6 +5070,41 @@ pub(crate) mod tests {
         assert_eq!((line.actor, line.to_agent, line.chat.text.as_str()), (Actor::Human, None, "hi"));
         assert_eq!(state.mentions(&agent), &[mention], "only the earlier verified mention wakes the agent");
         assert!(state.agents.is_empty());
+    }
+
+    #[test]
+    fn a_mark_on_a_finding_belongs_to_its_author_alone() {
+        let mut m = Maker::new();
+        let issue = m.entity(kind::ISSUE, None, vec![]);
+        let pts = Key::Name("pts".into());
+        let drawn = Value::Literal("[0 0 10 10]".into());
+        let mark = m.entity(kind::STROKE, None, vec![(field::PARENT, Value::Id(issue)), (pts.clone(), drawn.clone())]);
+        let section = m.entity(kind::SECTION, None, vec![]);
+        let board_stroke = m.entity(kind::STROKE, None, vec![(field::PARENT, Value::Id(section))]);
+        let set = |change_: Change| Content::Set { copied_from: vec![], changes: vec![change_], label: None };
+        let flag = |entity, on: bool| set(change(entity, field::DELETED, Value::Bool(on)));
+        let projections = |m: &Maker| {
+            let live = checked_fold(&m.events);
+            let restored = State::restore(&m.events, &live.checkpoint(&m.events)).unwrap();
+            assert_eq!(restored, live, "restore reproduces the live projection");
+            [live, restored]
+        };
+        m.add(1, Actor::Human, flag(mark, true), None);
+        m.add(1, Actor::Human, set(change(mark, pts.clone(), Value::Literal("[0 0 -10 -10]".into()))), None);
+        m.add(1, Actor::Human, Content::Undo { of: mark }, None);
+        let board_delete = m.add(1, Actor::Human, flag(board_stroke, true), None);
+        for state in projections(&m) {
+            assert!(!state.entities[&mark].flag(field::DELETED), "another seat cannot delete a mark, by a set or an undo");
+            assert_eq!(state.entities[&mark].value(pts.clone()), Some(&drawn), "another seat cannot redraw a mark");
+            assert_eq!(state.entities[&board_stroke].fields[&field::DELETED].writer, board_delete, "a board stroke stays open to every member");
+        }
+        let delete = m.add(0, Actor::Human, flag(mark, true), None);
+        m.add(1, Actor::Human, flag(mark, false), None);
+        let after = m.add(0, Actor::Human, chat("Ana", false, None), None);
+        for state in projections(&m) {
+            assert_eq!(state.entities[&mark].fields[&field::DELETED].writer, delete, "the author deletes their own mark; another seat cannot restore it");
+            assert_eq!(state.field_writer_before(&after, &mark, &field::DELETED), Ok(Some(delete)), "the history check agrees with the fold");
+        }
     }
 
     #[test]

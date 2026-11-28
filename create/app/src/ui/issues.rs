@@ -1,11 +1,14 @@
 //! Visual issues in one project. Drafts keep their destination and note through a window link,
 //! a grab, and the store receipt, even when another project or issue is opened.
+use super::marked_picture::{MarkedPicture, MarkedPictureAction, MarkTool};
 use crate::{
-    app_link::{report::{Report, Recording}, AppLinkEvent, AppLinks, IssueStill, LinkId, WindowId as AppWindowId},
-    call::{ShareChoice, ShareRole, ShareRow},
+    app_link::{report::{Report, Recording}, AppLinkEvent, AppLinks, IssueStill},
+    call::{ShareChoice, ShareRow},
     lists::{Page, Pane, ViewData},
-    model::{issues::{IssueEdit, IssueProject}, Model},
-    record::capture::{Purpose, WindowPicker, WindowTarget},
+    marks::{self, Head, Mark},
+    model::{issues::{IssueEdit, IssueProject}, Action as ModelAction, Model, Origin},
+    tweak::overlay::seat_colour,
+    record::capture::{Purpose, StillCapture, WindowPicker, WindowTarget},
     store_worker::{IssueMedia, IssueReceipt, StoredFile},
     view::LocalClock,
 };
@@ -50,7 +53,7 @@ pub(super) fn page_template(vm: &mut ScriptVm) -> ScriptValue {
                 visible: false width: Fill height: Fill flow: Down spacing: 6
                 issue_back := PanelButton{text: "Issues"}
                 picture_box := View{width: Fill height: Fill flow: Overlay
-                    picture := Image{width: Fill height: Fill fit: ImageFit.Smallest}
+                    picture := MarkedPicture{}
                     issue_player := VideoPlayer{visible: false width: Fill height: Fill}
                     placeholder := BodyNote{text: "Waiting for picture…"}
                 }
@@ -63,6 +66,9 @@ pub(super) fn page_template(vm: &mut ScriptVm) -> ScriptValue {
                 }
                 problem := BodyNote{visible: false width: Fill}
                 controls := View{width: Fill height: Fit flow: Right{wrap: true} spacing: 6
+                    draw_mark := Toggle{text: "Draw"}
+                    arrow_mark := Toggle{text: "Arrow"}
+                    undo_mark := PanelButton{text: "Undo"}
                     issue_pin := PanelButton{text: "Pin to board"}
                     issue_status := PanelButton{text: "Resolve"}
                     issue_delete := PanelButton{text: "Delete"}
@@ -87,8 +93,7 @@ struct Line {
 
 enum Capture {
     Linking(WindowPicker),
-    Grabbing(Receiver<Result<IssueStill, String>>),
-    Converting(TaskHandle<Result<IssueStill, String>>),
+    Still(StillCapture),
     Storing,
     Failed(String),
 }
@@ -109,14 +114,7 @@ struct Draft {
     capture: Capture,
     pictures: Option<[StoredFile; 2]>,
     recording: RecordingState,
-}
-
-fn grab_window(links: &mut AppLinks, link: LinkId, window: AppWindowId, label: &mut String) -> Result<Capture, String> {
-    let app = links.state(link).ok_or("The app has closed.")?;
-    let w = app.windows.iter().find(|w| w.id == window && w.visible).ok_or("The window has closed.")?;
-    *label = format!("{} · {} · {} × {} pt · {} dpi", app.app.name, w.title, w.size.0, w.size.1, w.dpi)
-        .replace(['\n', '\r'], " ");
-    Ok(Capture::Grabbing(links.issue_still(link, window)?))
+    marks: Vec<(i32, Head, Vec<[i32; 2]>)>,
 }
 
 impl Draft {
@@ -139,17 +137,12 @@ impl Draft {
                 let (_, picked) = picker.poll(links, events, &mut None);
                 let Some((_, target)) = picked else { return Ok(false) };
                 let WindowTarget::Linked(link, window) = target? else { return Err("Choose a running app window.".into()) };
-                self.capture = grab_window(links, link, window, &mut self.label)?;
+                self.capture = Capture::Still(StillCapture::grab(links, link, window, &mut self.label)?);
                 return Ok(true)
             }
-            Capture::Grabbing(receipt) => match receipt.try_recv() {
-                Ok(result) => result?,
-                Err(TryRecvError::Empty) => return Ok(false),
-                Err(TryRecvError::Disconnected) => return Err("The app closed before the picture arrived.".into()),
-            },
-            Capture::Converting(task) => {
-                let Some(result) = task.try_take() else { return Ok(false) };
-                result.map_err(|_| "The issue picture conversion stopped.")??
+            Capture::Still(capture) => {
+                let Some(result) = capture.poll() else { return Ok(false) };
+                result?
             }
             _ => return Ok(false),
         };
@@ -157,6 +150,41 @@ impl Draft {
         model.store_issue(id, self.project.town, still)?;
         self.capture = Capture::Storing;
         Ok(true)
+    }
+}
+
+#[derive(Default)]
+struct ShownMarks {
+    target: Option<Open>,
+    stamp: (usize, u64),
+    coloured: Arc<[(Mark, Vec4f)]>,
+    newest_own: Option<Id>,
+}
+
+impl ShownMarks {
+    fn sync(&mut self, model: &Model, open: Open, draft: Option<&Draft>) {
+        let stamp = model.issue_fold_stamp();
+        if self.target == Some(open) && self.stamp == stamp { return }
+        let me = model.me();
+        let changed_target = self.target != Some(open);
+        let marks = match open {
+            Open::Filed(id) if changed_target || model.issue_marks_touched(self.stamp, id, |id|
+                self.coloured.iter().any(|(m, _)| m.id == *id)) => Some(marks::marks_on(&model.state, id)),
+            Open::Draft(_) if changed_target => draft.map(|d| d.marks.iter().map(|(width, head, pts)|
+                Mark { id: [0; 32], author: me, width: *width, head: *head, pts: pts.as_slice().into() }).collect()),
+            _ => None,
+        };
+        let colour = |m: &Mark| seat_colour(&model.state, &m.author);
+        if let Some(marks) = marks {
+            self.coloured = marks.into_iter().map(|m| { let ink = colour(&m); (m, ink) }).collect();
+        } else if self.coloured.iter().any(|(m, ink)| colour(m) != *ink) {
+            for (m, ink) in Arc::make_mut(&mut self.coloured) { *ink = colour(m); }
+        }
+        let seat = model.state.seat_of(&me);
+        self.newest_own = self.coloured.iter().rev().find(|(m, _)| seat.is_some() && model.state.seat_of(&m.author) == seat)
+            .map(|(m, _)| m.id);
+        self.target = Some(open);
+        self.stamp = stamp;
     }
 }
 
@@ -176,7 +204,8 @@ pub struct Issues {
     edits: BTreeMap<Id, String>,
     timer: Timer,
     focus: bool,
-    picture: Option<PathBuf>,
+    marks: ShownMarks,
+    tool: MarkTool,
     error: Option<String>,
     pending_pin: Option<(Id, Id)>,
     play_requested: Option<Id>,
@@ -250,11 +279,12 @@ impl Issues {
         self.next += 1;
         self.project = Some(project);
         self.source_share = session;
-        self.drafts.insert(self.next, Draft { project, session, source_peer, label, note: String::new(), size: [0, 0], capture, pictures: None,
+        self.drafts.insert(self.next, Draft { project, session, source_peer, label, note: String::new(), size: [0, 0], capture, pictures: None, marks: Vec::new(),
             recording: done.map(RecordingState::Waiting).unwrap_or(RecordingState::Ready(None)) });
         self.list_revision = None;
         self.choices = None;
         self.open = Some(Open::Draft(self.next));
+        self.tool = MarkTool::Off;
         self.error = None;
         self.focus = true;
     }
@@ -275,6 +305,8 @@ impl Issues {
         self.picker.close();
         self.choices = None;
         self.open = open;
+        self.tool = MarkTool::Off;
+        self.marks = ShownMarks::default();
         self.focus = false;
         self.error = None;
     }
@@ -333,7 +365,11 @@ impl Issues {
         page.button(cx, ids!(share_issue)).set_enabled(cx, writable);
         if !detail && self.list_revision != Some(model.open_event_count()) {
             self.list_revision = Some(model.open_event_count());
-            image_path(cx, page.image(cx, ids!(picture)), &mut self.picture, None);
+            if let Some(mut picture) = page.widget(cx, ids!(picture)).borrow_mut::<MarkedPicture>() {
+                picture.set_tool(cx, MarkTool::Off);
+                picture.set_picture(cx, None);
+                picture.set_marks(cx, self.marks.coloured.clone());
+            }
             self.lines.clear();
             for (&id, draft) in self.drafts.iter().rev().filter(|(_, d)| d.project == issue_project) {
                 self.lines.push(Line { open: Open::Draft(id), first: draft.note.lines().next().unwrap_or("").into(),
@@ -349,7 +385,7 @@ impl Issues {
                     poster: blob_id(e, field::POSTER).and_then(|id| local_picture(model, id)) });
             }
         }
-        if detail {
+        if let Some(open) = self.open {
             let own = draft.is_some() || entity.is_some_and(|e| model.state.seat_of(&e.author) == model.state.seat_of(&model.me()));
             let note = draft.map(|d| d.note.as_str()).or_else(|| entity.map(|e|
                 self.edits.get(&e.id).map(String::as_str).unwrap_or(e.text(field::TEXT)))).unwrap_or("");
@@ -394,14 +430,31 @@ impl Issues {
             page.widget(cx, ids!(issue_player)).set_visible(cx, self.playing.is_some());
             page.widget(cx, ids!(picture)).set_visible(cx, self.playing.is_none());
             page.widget(cx, ids!(placeholder)).set_visible(cx, self.playing.is_none() && path.is_none() && why.is_none());
-            image_path(cx, page.image(cx, ids!(picture)), &mut self.picture, path.as_deref());
+            let can_draw = writable && self.playing.is_none();
+            self.marks.sync(model, open, draft);
+            if let Some(mut picture) = page.widget(cx, ids!(picture)).borrow_mut::<MarkedPicture>() {
+                picture.set_picture(cx, path.as_deref());
+                picture.set_marks(cx, self.marks.coloured.clone());
+                picture.ink = seat_colour(&model.state, &model.me());
+                picture.set_tool(cx, if can_draw { self.tool } else { MarkTool::Off });
+            }
+            for (id, tool) in [(ids!(draw_mark), MarkTool::Pen), (ids!(arrow_mark), MarkTool::Arrow)] {
+                let button = page.check_box(cx, id);
+                button.set_visible(cx, can_draw);
+                let active = self.tool == tool;
+                if button.active(cx) != active { button.set_active(cx, active, Animate::No); }
+            }
+            let undo = page.button(cx, ids!(undo_mark));
+            undo.set_visible(cx, can_draw);
+            undo.set_enabled(cx, self.marks.newest_own.is_some());
             page.label(cx, ids!(window_label)).set_text(cx, draft.map(|d| d.label.as_str())
                 .or_else(|| entity.map(|e| e.text(field::LABEL))).unwrap_or(""));
-            page.widget(cx, ids!(controls)).set_visible(cx, entity.is_some() && writable);
+            page.widget(cx, ids!(controls)).set_visible(cx, writable);
             page.button(cx, ids!(issue_pin)).set_visible(cx, entity.and_then(|e| blob_id(e, field::BLOB)).is_some());
+            page.widget(cx, ids!(issue_status)).set_visible(cx, entity.is_some());
             let resolved = entity.is_some_and(|e| e.text(field::STATUS) == "resolved");
             page.button(cx, ids!(issue_status)).set_text(cx, if resolved { "Reopen" } else { "Resolve" });
-            page.widget(cx, ids!(issue_delete)).set_visible(cx, own);
+            page.widget(cx, ids!(issue_delete)).set_visible(cx, own && entity.is_some());
         }
         page.redraw(cx);
     }
@@ -465,7 +518,7 @@ impl Issues {
         if matches!(d.capture, Capture::Failed(_)) { return }
         let (Some(files), RecordingState::Ready(video)) = (d.pictures, &d.recording) else { return };
         self.list_revision = None;
-        match model.file_issue(d.project, files, d.size, &d.label, &d.note, d.session, *video, d.source_peer) {
+        match model.file_issue(d.project, files, d.size, &d.label, &d.note, d.session, *video, d.source_peer, &d.marks) {
             Ok(id) => {
                 self.drafts.remove(&draft);
                 if self.open == Some(Open::Draft(draft)) { self.open = Some(Open::Filed(id)); }
@@ -495,6 +548,46 @@ impl Issues {
         }
         if input.key_focus_lost(actions) { self.flush(cx, model); changed = true; }
         if page.button(cx, ids!(issue_back)).clicked(actions) { self.select(cx, model, None); return true }
+        if let Some(open) = self.open.filter(|_| project.town == model.open_id() && self.playing.is_none()
+            && model.state.active_member(&model.me())) {
+            for (id, tool) in [(ids!(draw_mark), MarkTool::Pen), (ids!(arrow_mark), MarkTool::Arrow)] {
+                if let Some(on) = page.check_box(cx, id).changed(actions) {
+                    self.tool = if on { tool } else { MarkTool::Off };
+                    changed = true;
+                }
+            }
+            let picture = page.widget(cx, ids!(picture));
+            for action in actions.filter_widget_actions(picture.widget_uid()) {
+                let Some(MarkedPictureAction::Add { width, head, pts }) = action.action.downcast_ref::<MarkedPictureAction>() else { continue };
+                let (width, head) = (*width, *head);
+                match open {
+                    Open::Draft(id) => if let Some(draft) = self.drafts.get_mut(&id) {
+                        let chunks = marks::chunks(pts);
+                        let n = chunks.len();
+                        draft.marks.extend(chunks.into_iter().enumerate().map(|(i, pts)|
+                            (width, if i + 1 == n { head } else { Head::None }, pts)));
+                        self.marks.target = None;
+                    }
+                    Open::Filed(target) => self.error = model.act(ModelAction::AddMark { target, width, head, pts: pts.clone() }, Origin::Ui).err(),
+                }
+                changed = true;
+            }
+            if page.button(cx, ids!(undo_mark)).clicked(actions) {
+                match open {
+                    Open::Draft(id) => if let Some(draft) = self.drafts.get_mut(&id) {
+                        draft.marks.pop();
+                        self.marks.target = None;
+                    }
+                    Open::Filed(target) => {
+                        self.marks.sync(model, Open::Filed(target), None);
+                        if let Some(mark) = self.marks.newest_own {
+                            self.error = model.act(ModelAction::DeleteMark { mark }, Origin::Ui).err();
+                        }
+                    }
+                }
+                changed = true;
+            }
+        }
         if let Some(Open::Filed(id)) = self.open {
             if page.button(cx, ids!(issue_pin)).clicked(actions) && project.town == model.open_id()
                 && model.state.active_member(&model.me()) && model.state.entities.get(&id).is_some_and(|e|
@@ -575,7 +668,7 @@ impl ViewData {
         let Report { project, size, still, label, done } = report;
         self.issues.flush(cx, model);
         let capture = cx.task_pool().submit_named(Class::Background, "Town reported picture", move || IssueStill::from_report(still, size))
-            .map(Capture::Converting).unwrap_or_else(|e| Capture::Failed(e.to_string()));
+            .map(|task| Capture::Still(StillCapture::Converting(task))).unwrap_or_else(|e| Capture::Failed(e.to_string()));
         self.open_issue_draft(model, project, label, None, None, capture, Some(done));
     }
 
@@ -584,22 +677,9 @@ impl ViewData {
         let Some(session) = self.share_page() else { return false };
         if self.narrow() && self.pane != Pane::Page || !ui.button(cx, ids!(live_share.share_issue)).clicked(actions) { return false }
         let Some(project) = self.issue_destination(model) else { return false };
-        let share = &self.call.share;
-        let Some(offer) = share.offer(session) else { return false };
-        let mut label = offer.title.replace(['\r', '\n'], " ");
-        let (source_peer, capture) = match offer.role {
-            ShareRole::Sharer { link, window } => (None, grab_window(links, link, window, &mut label)),
-            ShareRole::Viewer { sharer } => {
-                let Some(picture) = share.picture_for(session).cloned() else { return false };
-                let (w, h) = offer.window_size;
-                label = format!("{label} · {w} × {h} pt · as received");
-                let peer = model.state.session(&session).and_then(|s| s.open.as_ref()).map(|o| o.opener).or(Some(sharer));
-                let capture = cx.task_pool().submit_named(Class::Background, "Town visual issue", move || IssueStill::from_picture(&picture))
-                    .map(Capture::Converting).map_err(|e| e.to_string());
-                (peer, capture)
-            }
-        };
-        self.open_issue_draft(model, project, label, Some(session), source_peer, capture.unwrap_or_else(Capture::Failed), None);
+        let Some(still) = self.call.share.capture_still(cx, links, session) else { return false };
+        self.open_issue_draft(model, project, still.label, Some(session), still.source_peer,
+            still.capture.map(Capture::Still).unwrap_or_else(Capture::Failed), None);
         true
     }
 }

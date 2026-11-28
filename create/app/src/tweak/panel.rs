@@ -2,7 +2,7 @@
 use super::props::layout::view::{set_face, LayoutControls};
 use super::design::{d1, DesignTarget};
 use super::design::view::{self as design_view, BuildTab, PaletteList};
-use super::{DesignRequest, DesignReplyKind, DesignNotice};
+use super::{DesignPlace, DesignRequest, DesignReplyKind, DesignNotice};
 use super::shader::{ShaderTab, view::ShaderPills};
 use super::props::live::LiveSets;
 use super::focus::{zoom_label, FocusState, MAX_ZOOM, MIN_ZOOM, ZOOM_STEP};
@@ -538,24 +538,38 @@ std::thread_local! {
     pub(super) static BOARD_INDEX_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn board_widget_paths(src: &str) -> Result<Vec<String>, d1::D1Error> {
+fn board_widget_paths(src: &str) -> Result<BoardIndex, d1::D1Error> {
     #[cfg(test)]
     BOARD_INDEX_RUNS.with(|count| count.set(count.get() + 1));
-    Ok(d1::list_widgets(src)?.into_iter().map(|node| node.path).collect())
+    let nodes = d1::list_widgets(src)?;
+    Ok(BoardIndex { whole: nodes.iter().filter(|node| node.depth == 0).map(|node| node.path.clone()).collect(),
+        paths: nodes.into_iter().map(|node| node.path).collect() })
 }
+
+/// A design's widget paths, and those of its top-level widgets: each is the whole design, with
+/// no siblings to move among and no parent to wrap, copy or delete it in.
+#[derive(Default)]
+struct BoardIndex { paths: Vec<String>, whole: Vec<String> }
+
+/// What the Build tab's first line says when nothing was refused.
+pub(super) const PICK_A_PART: &str = "Pick a part in the list below to move, wrap, copy or delete it";
+/// A button that works on a part was pressed while the whole design was picked.
+pub(super) const PART_FIRST: &str = "Pick a part of the design in the list below first: this button works on a part, not the whole design.";
 
 struct BoardDesign {
     item: Id,
     // Only a successfully indexed revision authorizes board_actions.
     revision: Option<Id>,
     failed_revision: Option<Id>,
-    pending: Option<(Id, TaskHandle<Result<Vec<String>, String>>)>,
-    paths: Vec<String>,
+    pending: Option<(Id, TaskHandle<Result<BoardIndex, String>>)>,
+    index: BoardIndex,
+    /// The last refusal or error of the Build tab, shown on its first line until the next pick or edit.
+    note: Option<String>,
     theme: Option<super::ThemeInstall>,
 }
 
 impl BoardDesign {
-    fn refresh_index(&mut self, cx: &mut Cx, model: &Model, first: bool) -> Option<Result<Vec<String>, String>> {
+    fn refresh_index(&mut self, cx: &mut Cx, model: &Model, first: bool) -> Option<Result<BoardIndex, String>> {
         let writer = model.state.entities.get(&self.item).and_then(|e| e.fields.get(&field::SRC)).map(|r| r.writer);
         if let Some((revision, handle)) = &mut self.pending {
             let result = handle.try_take()?;
@@ -583,6 +597,14 @@ impl BoardDesign {
             }
             Err(err) => Some(Err(err.to_string())),
         }
+    }
+
+    /// The Build tab's first line: the last refusal or error, else what a member can do next.
+    fn status(&self, member: bool, path: &str, ty: &str) -> String {
+        if let Some(note) = &self.note { return note.clone() }
+        if !member { return "Only the town's members can change this design.".into() }
+        if path.is_empty() || self.index.whole.iter().any(|whole| whole == path) { return format!("{PICK_A_PART} · Insert: {ty}") }
+        format!("Insert: {ty}")
     }
 }
 
@@ -779,7 +801,7 @@ impl Panel {
         let board = key.is_none();
         if board {
             self.tab = PanelTab::Build;
-            self.board = Some(BoardDesign { item, revision: None, failed_revision: None, pending: None, paths: Vec::new(), theme: None });
+            self.board = Some(BoardDesign { item, revision: None, failed_revision: None, pending: None, index: BoardIndex::default(), note: None, theme: None });
             root.drop_down(cx, ids!(board_widget)).set_labels(cx, Vec::new());
         }
         if let Some(mut tabs) = root.widget(cx, ids!(tweak_tabs)).borrow_mut::<TweakTabs>() {
@@ -803,7 +825,8 @@ impl Panel {
                 root.widget(cx, id).set_visible(cx, false);
             }
             if let Some(read) = cx.tweak_callback {
-                if let Ok(palette) = read(cx, "design_palette", &[]) {
+                let set = crate::board::design_picture::CARD_WIDGETS.name();
+                if let Ok(palette) = read(cx, "design_palette", &[("widgets".into(), set.into())]) {
                     if let (Ok(value), Some(mut list)) = (super::parse_json(&palette), root.widget(cx, ids!(build_palette)).borrow_mut::<PaletteList>()) {
                         if let Err(why) = list.palette.page(&value, true) { root.label(cx, ids!(tweak_result)).set_text(cx, &why); }
                         list.redraw(cx);
@@ -824,33 +847,32 @@ impl Panel {
         let board = self.board.as_mut().unwrap();
         let had_index_error = board.failed_revision.is_some();
         let loaded = board.refresh_index(cx, model, first);
-        if had_index_error && board.failed_revision.is_none() {
-            root.label(cx, ids!(tweak_result)).set_text(cx, "");
-        }
+        if had_index_error && board.failed_revision.is_none() { board.note = None; }
         if let Some(loaded) = loaded {
             match loaded {
-                Ok(paths) => {
-                    board.paths = paths;
-                    let index = board.paths.iter().position(|p| p == self.sidebar.path.as_ref()).unwrap_or(0);
-                    self.sidebar.path = Rc::from(board.paths.get(index).map_or("", String::as_str));
+                Ok(index) => {
+                    board.index = index;
+                    let index = board.index.paths.iter().position(|p| p == self.sidebar.path.as_ref()).unwrap_or(0);
+                    self.sidebar.path = Rc::from(board.index.paths.get(index).map_or("", String::as_str));
                     let widgets = root.drop_down(cx, ids!(board_widget));
-                    widgets.set_labels(cx, board.paths.clone());
+                    widgets.set_labels(cx, board.index.paths.clone());
                     widgets.set_selected_item(cx, index);
                 }
                 Err(err) => {
-                    board.paths.clear();
+                    board.index = BoardIndex::default();
                     self.sidebar.path = Rc::from("");
                     root.drop_down(cx, ids!(board_widget)).set_labels(cx, vec![]);
-                    root.label(cx, ids!(tweak_result)).set_text(cx, &err);
+                    board.note = Some(err);
                 }
             }
             root.redraw(cx);
         }
         if board.pending.is_some() { cx.new_next_frame(); }
-        let edit = model.state.active_member(&model.me()) && board.revision.is_some();
+        let member = model.state.active_member(&model.me());
+        let edit = member && board.revision.is_some();
         design_view::enable_selection(cx, root, edit && !self.sidebar.path.is_empty());
         root.button(cx, ids!(theme_bake)).set_enabled(cx, edit && board.theme.is_some());
-        root.label(cx, ids!(build_status)).set_text(cx, &format!("Insert: {}", self.build.ty()));
+        root.label(cx, ids!(build_status)).set_text(cx, &board.status(member, &self.sidebar.path, self.build.ty()));
     }
 
     pub(super) fn board_index_frame(&mut self, cx: &mut Cx, selected: Option<DesignTarget>) -> bool {
@@ -878,16 +900,30 @@ impl Panel {
         let revision = board.revision?;
         let outcome = match self.tab {
             PanelTab::Build => {
-                if let Some(path) = root.drop_down(cx, ids!(board_widget)).selected(actions).and_then(|i| board.paths.get(i)) {
+                let member = model.state.active_member(&model.me());
+                let show = |cx: &mut Cx, board: &BoardDesign, path: &str, ty: &str|
+                    root.label(cx, ids!(build_status)).set_text(cx, &board.status(member, path, ty));
+                if let Some(path) = root.drop_down(cx, ids!(board_widget)).selected(actions).and_then(|i| board.index.paths.get(i)) {
                     self.sidebar.path = Rc::from(path.as_str());
+                    board.note = None;
+                    show(cx, board, &self.sidebar.path, self.build.ty());
                     return None
                 }
                 if self.build.palette_action(cx, root, actions) {
-                    root.label(cx, ids!(build_status)).set_text(cx, &format!("Insert: {}", self.build.ty()));
+                    board.note = None;
+                    show(cx, board, &self.sidebar.path, self.build.ty());
                     return None
                 }
                 let request = self.build.request(cx, root, &root.widget(cx, ids!(build_strip)), actions, &self.sidebar.path, true)?;
-                if !model.state.active_member(&model.me()) { return None }
+                if !member { return None }
+                let needs_part = matches!(request, DesignRequest::Step { .. } | DesignRequest::Wrap { .. }
+                    | DesignRequest::Duplicate { .. } | DesignRequest::Delete { .. }
+                    | DesignRequest::Insert { place: DesignPlace::Before | DesignPlace::After, .. });
+                if needs_part && board.index.whole.iter().any(|whole| **whole == *self.sidebar.path) {
+                    board.note = Some(PART_FIRST.into());
+                    show(cx, board, &self.sidebar.path, self.build.ty());
+                    return None
+                }
                 d1::D1Op::from_request(&request).and_then(|op| d1::apply_op(model, item, revision, &op, crate::model::Origin::Ui))
             }
             PanelTab::Theme => match self.theme.header_action(cx, root, actions)? {
@@ -913,16 +949,20 @@ impl Panel {
             },
             _ => return None,
         };
+        let build = self.tab == PanelTab::Build;
         match outcome {
             Ok(outcome) => {
                 if let Some(path) = outcome.edit.focus_path { self.sidebar.path = Rc::from(path); }
+                if let Some(board) = self.board.as_mut() { board.note = None; }
                 root.label(cx, ids!(tweak_result)).set_text(cx, "");
                 self.refresh_board(cx, root, model, item);
                 outcome.changed.then_some(outcome.revision)
             }
             Err(err) => {
+                // The Build tab says why on its first line, beside the buttons; the Theme tab below its list.
+                if build { if let Some(board) = self.board.as_mut() { board.note = Some(err.to_string()); } }
                 self.refresh_board(cx, root, model, item);
-                root.label(cx, ids!(tweak_result)).set_text(cx, &err.to_string());
+                if !build { root.label(cx, ids!(tweak_result)).set_text(cx, &err.to_string()); }
                 None
             }
         }

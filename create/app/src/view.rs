@@ -89,6 +89,7 @@ pub struct Card {
     pub id: Id,
     /// Proposed by a hub service; a person accepts or dismisses it.
     pub proposed: bool,
+    /// The name the author pill takes its letter from: the member's own name, never the "You" label.
     pub author_name: Arc<str>,
     pub number: String,
     pub title: String,
@@ -190,6 +191,8 @@ pub struct Message {
     pub seat: Seat,
     pub tone: Option<SeatTone>,
     pub name: String,
+    /// The name the author pill takes its letter from: the member's own name, also on my lines labelled "You".
+    pub badge: Arc<str>,
     pub time: String,
     pub text: String,
     /// My own line to my AI: drawn with "sent to your AI".
@@ -680,6 +683,8 @@ impl Workspace {
         let me = model.me();
         let my_seat = model.state.seat_of(&me);
         let tones = seat_tones(model);
+        // My pill carries my own name's letter; only the label says "You".
+        let my_name: Arc<str> = model.device_label(&me).into();
         let author_badge = |author: &PublicKey, actor| {
             let id = model.state.seat_of(author);
             let mine = *author == me || my_seat.is_some_and(|s| Some(s) == id);
@@ -725,7 +730,7 @@ impl Workspace {
             project.columns[task_column(task)].push(Card {
                 id: task.id,
                 proposed: task.flag(field::PROPOSED),
-                author_name: author_name(task.author, task.actor),
+                author_name: if seat == Seat::You { Arc::clone(&my_name) } else { author_name(task.author, task.actor) },
                 number: format!("#{}", model.state.task_numbers[&task.id]),
                 title: task.text(field::TITLE).to_owned(),
                 seat, tone,
@@ -907,6 +912,7 @@ impl Workspace {
                             let key = TraceFold { line: m.id, trace: i, history: trace.phase(now).finished() };
                             TraceRow::read(trace, now, clock, folds.contains(&key))
                         }).collect(),
+                        badge: if seat == Seat::You { Arc::clone(&my_name) } else { author_name(m.author, m.actor) },
                         seat, tone,
                         name,
                         time: clock.hm(m.wall_ms),
@@ -1398,6 +1404,11 @@ pub struct TownMembers {
 }
 
 impl TownMembers {
+    /// My own name as my seat shows it: the letter on each pill of mine.
+    pub fn you_name(&self) -> &str {
+        self.seats.iter().find(|s| s.id == MemberId::You).map_or("", |s| s.name.as_str())
+    }
+
     pub fn seat_tone_for_device(&self, key: &PublicKey) -> Option<SeatTone> {
         self.seats.iter().find(|s| s.seat == Seat::Peer && s.has_device(key)).and_then(|s| s.tone)
     }
@@ -2077,7 +2088,7 @@ mod tests {
         assert_seat(&members, Presence::Here, &waits.traces.current(binding).unwrap().headline(quiet, &clock));
         assert!(!members.sync_agents(&workspace.connect.rows), "repeating the same projection needs no redraw");
 
-        let reply = waits.say(&mut model, binding, "done".into(), Some(line)).unwrap();
+        let reply = waits.say(&mut model, binding, "done".into(), Some(line), true).unwrap();
         let replied = clock.hm(model.state.message(&reply).unwrap().wall_ms);
         let (workspace, members) = snapshot(&model, &waits, quiet);
         assert!(workspace.connect.rows[0].away && !workspace.connect.rows[0].working);

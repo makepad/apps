@@ -1,5 +1,5 @@
 use crate::strip::Source;
-use crate::table::{Tree, CRATES, GENERATED_CONSUMER, GENERATED_INCLUDE};
+use crate::table::{at_least, Tree};
 use crate::SyncError;
 use relax_lex::lexer::T;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -13,12 +13,14 @@ struct Module {
 
 enum Target {
     Module { inline: Vec<Module>, child: Module },
+    OpaqueModule(Option<String>),
     InlineDirectory(Vec<Module>),
     Include(String),
 }
 
 pub struct ModDecl {
-    from: String,
+    pub(crate) from: String,
+    pos: usize,
     line: usize,
     removed: bool,
     target: Target,
@@ -61,7 +63,7 @@ fn join(base: &str, path: &str, floor: &str) -> Result<String, SyncError> {
     Ok(result)
 }
 
-fn literal(s: &str) -> Result<&str, SyncError> {
+pub(crate) fn literal(s: &str) -> Result<&str, SyncError> {
     if let Some(raw) = s.strip_prefix('r') {
         if let Some((hashes, body)) = raw.split_once('"') {
             if hashes.bytes().all(|b| b == b'#') {
@@ -150,7 +152,9 @@ pub(crate) fn drop_module(s: &Source<'_>, line: &str) -> Result<Vec<Range<usize>
     Ok(ranges)
 }
 
-pub(crate) fn collect(s: &Source<'_>, krate: &str, cuts: &[Range<usize>]) -> Result<Vec<ModDecl>, SyncError> {
+pub(crate) fn collect(s: &Source<'_>, krate: &str, cuts: &[Range<usize>], module_names: &mut BTreeSet<String>)
+    -> Result<Vec<ModDecl>, SyncError>
+{
     let mut decls = Vec::new();
     let mut inline: Vec<(usize, Module)> = Vec::new();
     let mut cuts = cuts.iter().peekable();
@@ -165,7 +169,19 @@ pub(crate) fn collect(s: &Source<'_>, krate: &str, cuts: &[Range<usize>]) -> Res
         while cuts.peek().is_some_and(|r| r.end <= pos) { cuts.next(); }
         let removed = cuts.peek().is_some_and(|r| r.start <= pos);
         let target = if kind == T::KwMod {
-            if s.in_macro(i) || s.in_attribute(i) {
+            if s.in_macro(i) {
+                // Expansion may occur in a different module. A literal module
+                // name protects matching files anywhere in the source tree.
+                let ordinary = matches!(s.kind(i + 1), T::Ident | T::RawIdent) && s.kind(i + 2) == T::Semi
+                    && s.attr_start(i) == i;
+                if s.kind(i + 2) != T::OpenBrace {
+                    let name = ordinary.then(|| s.text(i + 1).trim_start_matches("r#").to_owned());
+                    if let Some(name) = &name { module_names.insert(name.clone()); }
+                    decls.push(ModDecl { from: s.path.into(), pos, line, removed, target: Target::OpaqueModule(name) });
+                }
+                continue;
+            }
+            if s.in_attribute(i) {
                 return Err(at("mod token in an opaque macro or attribute token tree".into()));
             }
             if !matches!(s.kind(i + 1), T::Ident | T::RawIdent) {
@@ -175,6 +191,8 @@ pub(crate) fn collect(s: &Source<'_>, krate: &str, cuts: &[Range<usize>]) -> Res
                 name: s.text(i + 1).trim_start_matches("r#").to_owned(),
                 path: path_attribute(s, i).map_err(at)?,
             };
+            // Even inline modules with no file edges can qualify a kept reference in O1.
+            module_names.insert(child.name.clone());
             if s.kind(i + 2) == T::OpenBrace {
                 let has_path = child.path.is_some();
                 inline.push((s.after(i + 2), child));
@@ -186,10 +204,8 @@ pub(crate) fn collect(s: &Source<'_>, krate: &str, cuts: &[Range<usize>]) -> Res
             }
         } else {
             if s.text(i).trim_start_matches("r#") == "include" {
-                if s.path == GENERATED_CONSUMER && GENERATED_INCLUDE.iter().enumerate().all(|(j, &t)| s.text(i + j) == t) {
-                    continue;
-                }
-                return Err(at("unclassified Rust include! may introduce module declarations".into()));
+                // B1 checks generated code after S1/S2 determine which sites survive.
+                continue;
             }
             if !matches!(s.kind(i + 2), T::OpenParen | T::OpenBracket | T::OpenBrace) {
                 return Err(at("expected include arguments".into()));
@@ -199,7 +215,7 @@ pub(crate) fn collect(s: &Source<'_>, krate: &str, cuts: &[Range<usize>]) -> Res
             }
             Target::Include(include(s, i + 2, krate).map_err(at)?)
         };
-        decls.push(ModDecl { from: s.path.to_owned(), line, removed, target });
+        decls.push(ModDecl { from: s.path.to_owned(), line, pos, removed, target });
     }
     Ok(decls)
 }
@@ -244,13 +260,67 @@ fn resolve(tree: &Tree, root: &str, file: &str, owns_dir: bool, inline: &[Module
     }
 }
 
+
+pub(crate) fn module_paths(tree: &Tree, krate: &str, decls: &[ModDecl]) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let root = format!("{krate}/src");
+    let mut edges = BTreeMap::<&str, Vec<&ModDecl>>::new();
+    for d in decls {
+        if matches!(d.target, Target::Module { .. }) { edges.entry(&d.from).or_default().push(d); }
+    }
+    let mut paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut queue = VecDeque::from([(format!("{root}/lib.rs"), true, String::new(), Vec::<String>::new())]);
+    let mut possible = BTreeSet::new();
+    for (file, refs) in &edges {
+        for d in refs {
+            let Target::Module { inline, child } = &d.target else { continue; };
+            for mode in [true, false] {
+                if let Ok(Some((target, _))) = resolve(tree, &root, file, mode, inline, child) { possible.insert(target); }
+            }
+        }
+    }
+    for file in tree.keys().filter(|f| f.starts_with(&format!("{root}/")) && f.ends_with(".rs")
+        && !f.ends_with("/lib.rs") && !possible.contains(*f)) {
+        queue.push_back((file.clone(), file.ends_with("/mod.rs"), format!("<{file}>"), Vec::new()));
+    }
+    while let Some((file, owned, path, mut parents)) = queue.pop_front() {
+        if parents.contains(&file) { return Err(format!("S2: cyclic module through {file}")); }
+        let routes = paths.entry(file.clone()).or_default();
+        if routes.contains(&path) { continue; }
+        routes.push(path.clone());
+        parents.push(file.clone());
+        for d in edges.get(file.as_str()).into_iter().flatten() {
+            let Target::Module { inline, child } = &d.target else { continue; };
+            let target = resolve(tree, &root, &file, owned, inline, child)?;
+            let target = if target.is_none() && path.starts_with('<') {
+                resolve(tree, &root, &file, !owned, inline, child)?
+            } else { target };
+            let Some((target, owned)) = target else {
+                return Err(format!("S2 {}:{}: missing module {}", file, d.line, child.name));
+            };
+            let mut next = path.clone();
+            for component in inline.iter().chain(std::iter::once(child)) {
+                next = crate::strip::qualify(&next, &component.name);
+            }
+            queue.push_back((target, owned, next, parents.clone()));
+        }
+    }
+    Ok(paths)
+}
+
+impl ModDecl {
+    pub(crate) fn mark(&mut self, cuts: &[Range<usize>]) {
+        let i = cuts.partition_point(|c| c.end <= self.pos);
+        self.removed = cuts.get(i).is_some_and(|c| c.contains(&self.pos));
+    }
+}
+
 fn keep_match(pattern: &str, path: &str) -> Result<bool, SyncError> {
     let Some((prefix, suffix)) = pattern.split_once('*') else { return Ok(path == pattern); };
     if suffix.contains('*') { return Err(format!("S3: unsupported keep pattern {pattern}")); }
     Ok(path.strip_prefix(prefix).and_then(|rest| rest.strip_suffix(suffix)).is_some_and(|s| !s.contains('/')))
 }
 
-pub(crate) fn inspect_graph(tree: &Tree, krate: &str, decls: &[ModDecl]) -> Result<Graph, SyncError> {
+pub(crate) fn inspect_graph(tree: &Tree, krate: &str, decls: &[ModDecl], keep: &[String], minimum: usize) -> Result<Graph, SyncError> {
     let root = format!("{krate}/src");
     let prefix = format!("{root}/");
     let lib = format!("{root}/lib.rs");
@@ -311,6 +381,16 @@ pub(crate) fn inspect_graph(tree: &Tree, krate: &str, decls: &[ModDecl]) -> Resu
                     Some(true) => &[true], Some(false) => &[false], None => &[false, true],
                 };
                 match &decl.target {
+                    Target::OpaqueModule(name) => {
+                        if !kept { continue; }
+                        for target in tree.keys().filter(|p| p.starts_with(&prefix) && p.ends_with(".rs")) {
+                            let relative = &target[prefix.len()..];
+                            let stem = relative.strip_suffix("/mod.rs").or_else(|| relative.strip_suffix(".rs")).unwrap();
+                            if name.as_deref().is_some_and(|n| stem.rsplit('/').next() != Some(n)) { continue; }
+                            result.listed.insert(target.clone());
+                            queue.push_back((target.clone(), target.ends_with("/mod.rs").then_some(true), true));
+                        }
+                    }
                     Target::InlineDirectory(inline) => {
                         for &owned in modes {
                             module_dirs(&root, &file, owned, inline).map_err(|e| format!("{}: {e}", at()))?;
@@ -344,7 +424,6 @@ pub(crate) fn inspect_graph(tree: &Tree, krate: &str, decls: &[ModDecl]) -> Resu
             }
         }
     }
-    let keep = CRATES.iter().find(|spec| spec.upstream == krate).map_or(&[][..], |spec| spec.keep);
     for pattern in keep {
         let mut found = 0;
         for path in tree.keys().filter(|p| p.starts_with(&prefix)) {
@@ -353,7 +432,7 @@ pub(crate) fn inspect_graph(tree: &Tree, krate: &str, decls: &[ModDecl]) -> Resu
                 found += 1;
             }
         }
-        if found == 0 { return Err(format!("S3: {pattern} matched no files")); }
+        at_least(&format!("S3 {pattern}"), minimum, found)?;
     }
     for path in tree.keys().filter(|p| p.starts_with(&prefix)) {
         if live_includes.contains(path) || result.kept_by_pattern.contains(path) { continue; }
@@ -382,61 +461,60 @@ impl Graph {
 }
 
 // Both kept and removed declarations come from the single pre-strip lex.
-pub fn module_graph(tree: &Tree, krate: &str, decls: &[ModDecl]) -> Result<Graph, SyncError> {
-    let graph = inspect_graph(tree, krate, decls)?;
+pub fn module_graph(tree: &Tree, krate: &str, decls: &[ModDecl], keep: &[String], minimum: usize) -> Result<Graph, SyncError> {
+    let graph = inspect_graph(tree, krate, decls, keep, minimum)?;
     graph.check_external(&BTreeSet::new())?;
     Ok(graph)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::rules::{prepare, run_rules};
-    use crate::table::{Expect, Rule, RuleKind, DROP_NATIVE};
+    use crate::rules::{parse_skips, prepare};
+    use crate::table::Table;
 
     #[test]
     fn module_graph_follows_mod_and_path_rules() {
-        let krate = DROP_NATIVE.crate_;
+        let krate = "sample";
         let path = |name: &str| format!("{krate}/{name}");
         let mut tree = Tree::new();
         for (name, text) in [
             ("Cargo.toml", "[package]\nedition = \"2024\"\n"),
-            ("src/lib.rs", "mod a; mod c; #[cfg(test)] mod old;\npub mod native;\n"),
+            ("src/lib.rs", "mod a; mod c; opaque!(mod generated;); #[cfg(test)] mod old;\npub mod native;\n"),
             ("src/a.rs", "mod b; #[path = \"x_impl.rs\"] mod x;"),
             ("src/a/b.rs", "mod inline { mod sub; }"),
             ("src/a/b/inline/sub.rs", ""),
             ("src/x_impl.rs", "mod sibling;"),
             ("src/sibling.rs", ""),
-            ("src/c/mod.rs", "mod d; const DATA: &str = include_str!(\"shared.txt\");"),
+            ("src/c/mod.rs", "mod d;"),
             ("src/c/d.rs", ""), ("src/c/shared.txt", "keep"),
             ("src/old.rs", "mod child; const S: &str = include_str!(\"c/shared.txt\");"),
             ("src/old/child.rs", "const D: &[u8] = include_bytes!(\"fixture.bin\");"),
             ("src/old/fixture.bin", "gone"),
             ("src/native.rs", "mod binary;"), ("src/native/binary.rs", ""),
             ("src/orphan.rs", "const TEXT: &str = \"pub mod native;\";"),
-            ("src/orphan.txt", "hold"),
+            ("src/orphan.txt", "hold"), ("src/generated.rs", ""),
         ] { tree.insert(path(name), text.as_bytes().to_vec()); }
-        let rules = [
-            DROP_NATIVE,
-            Rule { id: "S1", crate_: krate, kind: RuleKind::StripCfgTest, expect: Expect::AtLeast(1) },
-            Rule { id: "S2", crate_: krate, kind: RuleKind::ModuleGraph, expect: Expect::AtLeast(0) },
-        ];
-        let mut prepared = prepare(&tree, &rules).unwrap();
+        let rules = sample_rules();
+        let old = "sample old module const S includes shared.txt at line 1";
+        let skips = parse_skips(old).unwrap();
+        let mut prepared = prepare(&tree, &rules, &skips).unwrap();
         let g = &prepared.graphs[krate];
         assert_eq!(g.deleted, ["src/native.rs", "src/native/binary.rs", "src/old.rs",
             "src/old/child.rs", "src/old/fixture.bin"].map(path).into(), "only removed subtrees");
-        assert_eq!(g.listed, ["src/orphan.rs", "src/orphan.txt"].map(path).into());
-        assert_eq!(g.includes_kept, [path("src/c/shared.txt")].into(), "kept include wins");
+        assert_eq!(g.listed, ["src/generated.rs", "src/orphan.rs", "src/orphan.txt"].map(path).into());
+        assert_eq!(g.includes_kept, [path("src/c/shared.txt")].into(), "explicit keep protects a shared include target");
         assert_eq!(g.includes_deleted, [path("src/old/fixture.bin")].into());
         let mut done = tree.clone();
         prepared.apply_to(&mut done, &BTreeSet::new()).unwrap();
-        assert_eq!(&done[&path("src/lib.rs")], b"mod a; mod c; \n");
+        assert_eq!(&done[&path("src/lib.rs")], b"mod a; mod c; opaque!(mod generated;); \n");
         assert!(!done.contains_key(&path("src/native/binary.rs")));
         assert!(done.contains_key(&path("src/x_impl.rs")) && done.contains_key(&path("src/sibling.rs")));
         let mut shared = tree.clone();
         shared.insert(path("src/orphan.rs"), b"#[path = \"native/binary.rs\"] mod shared; #[cfg(test)] mod child;".to_vec());
-        shared.insert(path("src/orphan/child.rs"), Vec::new());
-        run_rules(&mut shared, &rules).unwrap();
+        shared.insert(path("src/orphan/child.rs"), b"fn uses_it() { fs::read(\"x\"); }".to_vec());
+        let with_child = parse_skips(&format!("{old}\nsample <sample/src/orphan.rs>::child module uses_it reads a file at line 1")).unwrap();
+        prepare(&shared, &rules, &with_child).unwrap().apply_to(&mut shared, &BTreeSet::new()).unwrap();
         assert!(shared.contains_key(&path("src/native/binary.rs")), "reference in a kept orphan protects its target");
         assert!(!shared.contains_key(&path("src/orphan/child.rs")), "removed declaration in a kept orphan");
         for (file, contents, expected) in [
@@ -444,16 +522,125 @@ mod tests {
             ("src/a.rs", "#[path = \"../escape\"] mod x {}", "leaves"),
             ("src/a.rs", "mod missing;", "missing module"),
             ("src/a.rs", "const X: &str = include_str!(\"missing\");", "missing include"),
-            ("src/old.rs", "const X: &str = include_str!(\"../../missing\");", "missing include"),
+            ("src/old.rs", "mod child; const X: &str = include_str!(\"../../missing\");", "missing include"),
             ("src/lib.rs", "#[cfg(test)] mod old;\n", "D1: expected exactly 1, found 0"),
             ("src/lib.rs", "#[cfg(test)] mod old;\npub mod native;\npub mod native;\n", "D1: expected exactly 1, found 2"),
         ] {
             let mut bad = tree.clone();
             bad.insert(path(file), contents.as_bytes().to_vec());
             let before = bad.clone();
-            let err = run_rules(&mut bad, &rules).err().expect("must refuse");
+            let err = prepare(&bad, &rules, &skips)
+                .and_then(|mut change| change.apply_to(&mut bad, &BTreeSet::new())).err().expect("must refuse");
             assert!(err.contains(expected), "{err}");
             assert_eq!(bad, before, "failed rule partially changed the tree");
+        }
+    }
+
+    pub(crate) fn sample_rules() -> Table {
+        Table::parse("rules.toml", r#"
+[workspace]
+manifest = "Cargo.toml"
+root_files = ["Cargo.toml"]
+shim_root = "shims"
+attribution_section = "section.md"
+[deny]
+names = []
+directories = []
+extensions = []
+[expect]
+c1_each_path_min = 1
+c2_denied = 0
+s1_min = 1
+s2_min = 0
+s3_each_pattern_min = 1
+a1_per_crate = 1
+[[crate]]
+upstream = "sample"
+dest = "dest"
+package = "example"
+dev_dependencies = []
+sections = ["package"]
+report_sites = []
+rust_roots = ["src/"]
+copy = ["src/"]
+keep = ["src/c/shared.txt"]
+dependencies = []
+[build]
+sha256 = "sample"
+inputs = "src/flags/*.md"
+producer = "sample/build.rs"
+consumer = "sample/src/generated.rs"
+output = "generated.rs"
+[inventory]
+licenses = ["Apache-2.0"]
+license_files = ["LICENSE", "NOTICE"]
+serde_shim = []
+i1 = []
+i2 = []
+[[drop_module]]
+upstream = "sample"
+file = "src/lib.rs"
+line = "pub mod native;"
+expected = 1
+"#).unwrap()
+    }
+
+    #[test]
+    fn strip_removes_ignored_tests_and_skip_entries() {
+        let mut table = sample_rules();
+        table.drops.clear();
+        table.crates[0].keep.clear();
+        let source = "#[cfg(test)] mod tests {
+            #[test] #[ignore] fn a() {}
+            #[ignore = \"measured\"] #[test] fn b() {}
+            #[test] fn c() {} #[test] fn d() {}
+        }";
+        let mut tree = Tree::from([
+            ("sample/Cargo.toml".into(), b"[package]\nedition = \"2021\"".to_vec()),
+            ("sample/src/lib.rs".into(), source.as_bytes().to_vec()),
+        ]);
+        let skips = crate::rules::parse_skips("sample tests::c slow measured 3 s under JIT").unwrap();
+        let mut result = prepare(&tree, &table, &skips).unwrap();
+        let stats = &result.summaries["sample"];
+        assert_eq!((stats.ignored.len(), stats.skips.len(), stats.kept_tests, stats.removed_tests), (2, 1, 1, 3));
+        result.apply_to(&mut tree, &BTreeSet::new()).unwrap();
+        let kept = std::str::from_utf8(&tree["sample/src/lib.rs"]).unwrap();
+        assert!(kept.contains("fn d()") && !kept.contains("ignore") && !kept.contains("fn c()"));
+        for (count, text) in [(0, source.replace("fn c()", "fn x()")), (2, source.replace("fn d()", "fn c()"))] {
+            tree.insert("sample/src/lib.rs".into(), text.into_bytes());
+            let error = prepare(&tree, &table, &skips).err().unwrap();
+            assert!(error.contains("skip.txt:1") && error.contains(&format!("expected exactly 1, found {count}")), "{error}");
+        }
+
+        let manifest = "[package]\nname = \"sample\"\nversion = \"1\"\nedition = \"2021\"\n\
+            rust-version = \"1.85\"\nlicense = \"Apache-2.0\"\n[features]\nprofile = []\nvia = [\"profile\"]\n";
+        table.crates[0].sections.push("features".into());
+        table.expect.s1_min = 0;
+        tree.insert("Cargo.toml".into(), Vec::new());
+        tree.insert("LICENSE".into(), Vec::new());
+        tree.insert("NOTICE".into(), Vec::new());
+        tree.insert("sample/Cargo.toml".into(), manifest.as_bytes().to_vec());
+        tree.insert("sample/src/lib.rs".into(), br#"#[cfg(all(unix, feature = "profile"))] mod gated;
+            #[cfg(test)] mod tests { #[cfg(feature = "profile")] #[test] fn own() {} #[test] fn keep() {} }"#.to_vec());
+        tree.insert("sample/src/gated.rs".into(), b"#[cfg(test)] mod tests { #[test] fn inherited() {} }".to_vec());
+        let skips = parse_skips("sample gated::tests::inherited feature profile: off\nsample tests::own feature profile: off").unwrap();
+        let mut prepared = prepare(&tree, &table, &skips).unwrap();
+        let stats = &prepared.summaries["sample"];
+        assert_eq!((stats.skips.len(), stats.kept_tests, stats.removed_tests), (2, 1, 2));
+        let mut kept = tree.clone();
+        prepared.apply_to(&mut kept, &BTreeSet::new()).unwrap();
+        assert!(!std::str::from_utf8(&kept["sample/src/gated.rs"]).unwrap().contains("fn inherited"));
+        let kept_lib = std::str::from_utf8(&kept["sample/src/lib.rs"]).unwrap();
+        assert!(kept_lib.contains("fn keep") && !kept_lib.contains("fn own"));
+        tree.insert("sample/Cargo.toml".into(), format!("{manifest}default = [\"via\"]").into_bytes());
+        let err = prepare(&tree, &table, &skips).err().unwrap();
+        assert!(err.contains("stale feature skip") && err.contains("enabled by default"), "{err}");
+        tree.insert("sample/Cargo.toml".into(), manifest.as_bytes().to_vec());
+        for cfg in ["", r#"#[cfg(feature = "other")]"#, r#"#[cfg(any(feature = "profile", unix))]"#] {
+            let source = format!("{} mod gated; #[cfg(test)] mod tests {{ #[test] fn own() {{}} }}", cfg);
+            tree.insert("sample/src/lib.rs".into(), source.into_bytes());
+            let err = prepare(&tree, &table, &skips[..1]).err().unwrap();
+            assert!(err.contains("stale feature skip gated::tests::inherited") && err.contains("profile"), "{err}");
         }
     }
 }

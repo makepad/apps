@@ -1,5 +1,5 @@
 use super::*;
-use makepad_call::driver::codec::{Packet, TestCodecs};
+use makepad_call::driver::codec::{Codecs, Packet, StreamFormat, TestCodecs};
 use makepad_remote::{
     audio::{encode_audio_record, AudioRecord},
     conn::{ChannelTx, CLOSE_REFUSED, CLOSE_UNSUPPORTED},
@@ -28,6 +28,9 @@ struct Data {
     audio_channels: Vec<ChannelTx>,
     audio_refusal: Option<(u16, String)>,
     video_opens: Vec<(usize, f64, u32, u32)>,
+    video_formats: Vec<StreamFormat>,
+    refuse_format: Option<StreamFormat>,
+    fail_before_key: Option<StreamFormat>,
     raw_opens: usize,
     controls: Vec<(usize, String)>,
     refuse_video: bool,
@@ -46,7 +49,7 @@ struct Feed {
     fps: u32,
     last: Option<u64>,
     channel: ChannelTx,
-    video: bool,
+    format: Option<StreamFormat>,
     last_pts: Option<i64>,
 }
 #[derive(Default)]
@@ -105,16 +108,20 @@ fn unit_bytes(window: usize, w: u32, h: u32, key: bool, pts: i64) -> Vec<u8> {
 
 impl Feed {
     fn send(&mut self, time: u64, key: bool, advertise: bool) -> bool {
-        let msg = if self.video {
+        let msg = if let Some(format) = self.format {
             let (w, h) = dimensions(self.window);
             let even = |n| ((f64::from(n) * self.scale).round() as u32).max(2) & !1;
             let (w, h) = (even(w), even(h));
             let pts = (time / 100) as i64;
             let pts = self.last_pts.map_or(pts, |last| pts.max(last + 1));
             self.last_pts = Some(pts);
-            let caps = if advertise { r#","codecs":["h264"],"full_chroma":false"# } else { "" };
-            let json = format!(r#"{{"codec":"h264","window":{},"w":{w},"h":{h},"pts":{pts},"key":{key}{caps}}}"#, self.window);
-            makepad_remote::frames::encode_record(&json, &unit_bytes(self.window, w, h, key, pts))
+            let caps = if advertise { r#","codecs":["h264","hevc"],"full_chroma":true"# } else { "" };
+            let codec = format.codec_word();
+            let chroma = if format.full_chroma { "444" } else { "420" };
+            let json = format!(r#"{{"codec":"{codec}","chroma":"{chroma}","window":{},"w":{w},"h":{h},"pts":{pts},"key":{key}{caps}}}"#, self.window);
+            let mut bytes = unit_bytes(self.window, w, h, key, pts);
+            bytes[10] = u8::from(format.hevc) | (u8::from(format.full_chroma) << 1);
+            makepad_remote::frames::encode_record(&json, &bytes)
         } else {
             record(self.window, self.scale, time)
         };
@@ -282,16 +289,31 @@ impl Rig {
                 let mut d = f.data.lock().unwrap();
                 if args.get("cap") == Some("1") {
                     let fps = args.get("fps").unwrap().parse().unwrap();
-                    let video = args.get("codec") == Some("h264");
+                    let format = match args.get("codec") {
+                        Some(codec @ ("h264" | "hevc")) => Some(StreamFormat {
+                            hevc: codec == "hevc",
+                            full_chroma: match args.get("chroma") {
+                                None | Some("420") => false,
+                                Some("444") => true,
+                                other => panic!("unexpected video chroma {other:?}"),
+                            },
+                        }),
+                        _ => None,
+                    };
                     if args.get("codec") == Some("raw") { d.raw_opens += 1; }
                     let mut feed = Feed { window: w, scale, fps, last: None, channel: open.channel.tx(),
-                        video, last_pts: None };
-                    if video {
+                        format, last_pts: None };
+                    if let Some(format) = format {
                         assert_eq!(args.get("maxqp"), Some("26"));
                         let kbps = args.get("kbps").unwrap().parse().unwrap();
                         d.video_opens.push((w, scale, fps, kbps));
-                        if std::mem::take(&mut d.refuse_video) {
+                        d.video_formats.push(format);
+                        if std::mem::take(&mut d.refuse_video) || d.refuse_format == Some(format) {
                             return Err((makepad_remote::conn::CLOSE_REFUSED, "unknown codec".into()));
+                        }
+                        if d.fail_before_key == Some(format) {
+                            open.channel.close(CLOSE_REFUSED, "encoder failed to produce its first key");
+                            return Ok(());
                         }
                         if !feed.send(d.clock, true, !std::mem::take(&mut d.omit_codecs)) { return Ok(()); }
                     }
@@ -507,6 +529,9 @@ impl Rig {
             self.wakes.recv().unwrap();
         }
     }
+    pub(crate) fn video_formats(&self) -> Vec<StreamFormat> { self.fake.data.lock().unwrap().video_formats.clone() }
+    pub(crate) fn refuse_format(&self, format: StreamFormat) { self.fake.data.lock().unwrap().refuse_format = Some(format); }
+    pub(crate) fn present(&self, window: usize) { self.fake.present(window); }
     pub(crate) fn wide_window(&self) { self.fake.data.lock().unwrap().wide_window = true; }
     pub(crate) fn refuse_next_still(&self) { self.fake.data.lock().unwrap().refuse_still = true; }
     pub(crate) fn hold_input(&self, hold: bool) {
@@ -816,7 +841,7 @@ fn an_app_without_audio_ends_the_sound_with_the_reason_and_keeps_its_picture() {
     rig.wait(|_| unsupported.ended());
     assert!(unsupported.ended_why().unwrap().contains("has no audio service"), "an older app explains its silent share");
     let picture = rig.app.open_picture(link, PictureWant {
-        window: WindowId(3), max_w: 24, max_h: 16, fps: 30, kbps: 100,
+        window: WindowId(3), max_w: 24, max_h: 16, fps: 30, kbps: 100, format: None,
     }).unwrap();
     assert!(rig.packet(&picture).key, "the same link still delivers its picture");
 
@@ -877,7 +902,7 @@ fn fake_present_retires_a_closed_feed_without_panicking() {
     rig.rescan();
     let link = rig.app.link(&rig.app.apps()[0].key.clone());
     rig.live(link);
-    let want = PictureWant { window: WindowId(3), max_w: 24, max_h: 16, fps: 30, kbps: 100 };
+    let want = PictureWant { window: WindowId(3), max_w: 24, max_h: 16, fps: 30, kbps: 100, format: None };
     let first = rig.app.open_picture(link, want).unwrap();
     assert!(rig.packet(&first).key, "the first stream starts with a keyframe");
     let stale_tx = rig.fake.data.lock().unwrap().frames[0].channel.clone();
@@ -888,12 +913,53 @@ fn fake_present_retires_a_closed_feed_without_panicking() {
     let live = rig.app.open_picture(link, want).unwrap();
     assert!(rig.packet(&live).key, "the replacement stream starts with its own keyframe");
     rig.fake.data.lock().unwrap().frames.insert(0, Feed { window: 3, scale: 1., fps: 30,
-        last: None, channel: stale_tx, video: true, last_pts: None });
+        last: None, channel: stale_tx, format: Some(StreamFormat::H264), last_pts: None });
     assert_eq!(rig.fake.present_after(3, 1_000_000_000), 1, "only the live feed counts as a send");
     assert_eq!(rig.fake.data.lock().unwrap().frames.len(), 1, "presentation retires the closed feed");
     let delta = rig.packet(&live);
     assert!(!delta.key && delta.data == unit_bytes(3, 24, 16, false, delta.pts_100ns),
         "the live feed delivers the window's delta frame");
+}
+
+#[test]
+fn a_share_want_names_its_format_and_a_change_reopens_the_capture() {
+    use StreamFormat as F;
+    let mut rig = Rig::new();
+    let link = rig.link_app();
+    let want = PictureWant { window: WindowId(3), max_w: 24, max_h: 16, fps: 30, kbps: 100, format: Some(F::HEVC) };
+    let share = rig.app.open_picture(link, want).unwrap();
+    let probe = share.probe();
+    let key = rig.packet(&share);
+    assert_eq!(TestCodecs.key_format(&key.data), Some(F::HEVC), "the first key carries the requested format");
+    assert_eq!(probe.format(), Some(F::HEVC), "the probe reports the first header's format");
+    let preview = rig.app.open_preview(link, PictureWant { format: None, ..want }).unwrap();
+    let joined = rig.packet(&share);
+    rig.wait(|_| preview.take().is_some());
+    assert_eq!(TestCodecs.key_format(&joined.data), Some(F::HEVC), "the format-neutral preview joins the HEVC stream");
+    assert_eq!(rig.video_formats(), [F::HEVC], "the preview shares the existing HEVC OPEN");
+    probe.set_format(F::H264);
+    assert_eq!(TestCodecs.key_format(&rig.packet(&share).data), Some(F::H264), "a format change starts at an H.264 key");
+    assert_eq!(probe.format(), Some(F::H264), "the probe follows the new header");
+    assert_eq!(rig.video_formats(), [F::HEVC, F::H264], "changing the format reopens exactly once");
+
+    rig.refuse_format(F::HEVC);
+    probe.set_format(F::HEVC);
+    assert_eq!(TestCodecs.key_format(&rig.packet(&share).data), Some(F::H264), "a refused OPEN recovers at an H.264 key");
+    assert_eq!(rig.video_formats(), [F::HEVC, F::H264, F::HEVC, F::H264], "a refusal causes one immediate fallback OPEN");
+    assert_eq!(probe.lost(), [F::HEVC], "the app lost only the format it refused");
+    rig.present(3);
+    assert!(!rig.packet(&share).key, "the fallback keeps delivering pictures");
+
+    {
+        let mut d = rig.fake.data.lock().unwrap();
+        d.refuse_format = None;
+        d.fail_before_key = Some(F::HEVC);
+    }
+    let other = rig.app.open_picture(link, PictureWant { window: WindowId(4), ..want }).unwrap();
+    assert_eq!(TestCodecs.key_format(&rig.packet(&other).data), Some(F::H264),
+        "an accepted OPEN that fails before its first key also delivers the fallback key");
+    assert_eq!(other.probe().lost(), [F::HEVC], "the early channel error records the lost format on this window");
+    assert_eq!(&rig.video_formats()[4..], &[F::HEVC, F::H264], "the early channel error causes exactly one reopen");
 }
 
 #[test]
@@ -914,7 +980,7 @@ fn preview_and_share_open_one_video_channel_only() {
     rig.rescan();
     let link = rig.app.link(&rig.app.apps()[0].key.clone());
     rig.live(link);
-    let want = PictureWant { window: WindowId(3), max_w: 12, max_h: 8, fps: 15, kbps: 0 };
+    let want = PictureWant { window: WindowId(3), max_w: 12, max_h: 8, fps: 15, kbps: 0, format: None };
     let preview = rig.app.open_preview(link, want).unwrap();
     next_preview(&mut rig, &preview);
     {
@@ -1144,6 +1210,7 @@ fn local_app_link_shares_windows_and_revokes_takeover() {
         max_h: 16,
         fps: 60,
         kbps: 100,
+        format: None,
     };
     let a = rig.app.open_picture(id, want).unwrap();
     assert!(rig.packet(&a).key, "a still window starts with a key");

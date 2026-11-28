@@ -248,14 +248,20 @@ impl<L: Copy + Eq, T: Copy + Eq> Tweaks<L, T> {
         if matches!(self.selected, Some(DesignTarget::BoardDesign(_))) { self.selected = None; }
     }
 
+    /// The board's single selection moved to `item` (a design card or nothing). Selecting only
+    /// selects: the designer opens through `open_board_design`, and it closes when its design
+    /// is no longer the one selected.
     pub fn select_board_design(&mut self, item: Option<Id>) {
-        if let Some(item) = item {
-            self.selected = Some(DesignTarget::BoardDesign(item));
-            self.opened = true;
-        } else if matches!(self.selected, Some(DesignTarget::BoardDesign(_))) {
+        if matches!(self.selected, Some(DesignTarget::BoardDesign(open)) if Some(open) != item) {
             self.selected = None;
             self.opened = false;
         }
+    }
+
+    /// The explicit ask to edit a board design: a double-click on its card, or Return on it.
+    pub fn open_board_design(&mut self, item: Id) {
+        self.selected = Some(DesignTarget::BoardDesign(item));
+        self.opened = true;
     }
 
     pub fn board_design_actions(&mut self, cx: &mut Cx, ui: &WidgetRef, actions: &Actions, model: &mut Model) -> Option<Id> {

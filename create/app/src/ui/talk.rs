@@ -339,7 +339,8 @@ mod tests {
         for (seat, name, text, addressed) in [(Seat::Peer, "Ben", "Hello", false),
             (Seat::You, "You", "ai hi this working?", true), (Seat::Peer, "Ben asked their AI", "ai hi this working?", true)] {
             data.workspace.rows.push(crate::view::ChatRow::Message(Message {
-                id: [data.workspace.rows.len() as u8 + 10; 32], quote: None, traces: vec![], seat, tone: None, name: name.into(), time: "13:04".into(), text: text.into(),
+                id: [data.workspace.rows.len() as u8 + 10; 32], quote: None, traces: vec![], seat, tone: None, name: name.into(),
+                badge: if seat == Seat::You { "Okp" } else { "Ben" }.into(), time: "13:04".into(), text: text.into(),
                 addressed, unheard: false, mention: addressed, mentions_you: false, deletable: false,
             }));
         }
@@ -351,7 +352,7 @@ mod tests {
         }
         data.workspace.rows.push(crate::view::ChatRow::Message(Message {
             id: line, quote: None, traces: vec![crate::view::TraceRow::read(&traces.rows(&line)[0], 11_000, &Default::default(), false)],
-            seat: Seat::You, tone: None, name: "You".into(), time: "13:04".into(), text: "make slides".into(),
+            seat: Seat::You, tone: None, name: "You".into(), badge: "Okp".into(), time: "13:04".into(), text: "make slides".into(),
             addressed: true, unheard: false, mention: false, mentions_you: false, deletable: false,
         }));
     }
@@ -499,6 +500,9 @@ mod tests {
                 assert!(row.widget(cx, ids!(author.peer)).visible());
                 assert_eq!(row.label(cx, ids!(name)).text(), if message.addressed { "Ben asked their AI" } else { "Ben" });
                 assert_eq!(row.label(cx, ids!(author.peer.initial)).text(), "B");
+            } else {
+                assert_eq!(row.label(cx, ids!(name)).text(), "You", "my line keeps its You label");
+                assert_eq!(row.label(cx, ids!(author.you.initial)).text(), "O", "my pill takes my name's letter, not the Y of You");
             }
             assert_eq!(row.label(cx, ids!(message)).text(), message.text);
             assert_eq!(row.label(cx, ids!(when)).text(), message.time);
@@ -666,7 +670,7 @@ mod tests {
         data.show_pane(Pane::Places);
         assert!(!data.chat_unread(), "nothing new yet");
         let peer_message = |id| crate::view::ChatRow::Message(Message {
-            id, quote: None, traces: vec![], seat: Seat::Peer, tone: None, name: "Kit".into(), time: "13:05".into(), text: "new".into(),
+            id, quote: None, traces: vec![], seat: Seat::Peer, tone: None, name: "Kit".into(), badge: "Kit".into(), time: "13:05".into(), text: "new".into(),
             addressed: false, unheard: false, mention: false, mentions_you: false, deletable: false,
         });
         data.workspace.rows.push(peer_message([99; 32]));

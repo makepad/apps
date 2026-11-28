@@ -1,8 +1,10 @@
 //! Window offers on the authenticated link. The first displayed picture joins its timeline.
+use crate::call::share_codec::{self, share_format, EncoderFormats};
 use super::*;
-use crate::app_link::{AppLinkEvent, AppLinks, AppWindow, LinkId, PicturePreview, PictureStream, PictureWant, WindowId};
+use crate::app_link::{AppLinkEvent, AppLinks, AppSound, AppWindow, EncodedSound, LinkId, PicturePreview, PictureProbe, PictureStream, PictureWant, WindowId};
 use crate::record::{Recorder, RecordPress, capture::{CaptureShown, Purpose, RecordingClock, WindowPicker, WindowTarget}};
-use makepad_call::driver::{codec::{Packet, Picture}, Content, EncodedSource, VideoCaps, View};
+use makepad_call::driver::{codec::{Packet, Picture, StreamFormat}, Content, EncodedSource, VideoCaps, View};
+use makepad_call::driver::share_audio::{ShareSound, ShareSpeakerControl};
 use makepad_town_core::event::{LeaveWhy, SessionId};
 use super::super::{signal::ShareProblem, Message};
 use crate::call::ShareSurface;
@@ -132,8 +134,16 @@ impl ShareOffer {
     pub(crate) fn picture_drawn(&self) { self.first_draw.get_or_init(Instant::now); }
 }
 
-#[derive(Default)]
 pub(super) struct Sharing {
+    decode_caps: MediaCaps,
+    failed: MediaCaps,
+    pub(super) decode_probe: share_codec::DecodeProbe,
+    sound_on: bool,
+    speaker: ShareSpeakerControl,
+    playing: Option<Arc<ShareSound>>,
+    // Close watch clears the offer before the next poll logs the stop.
+    playing_title: String,
+    encoder: EncoderFormats,
     pub(super) shown: ShareShown,
     events: Vec<ShareEvent>,
     pub(super) revokes: Vec<LinkId>,
@@ -150,6 +160,8 @@ pub(super) struct Sharing {
     locals: BTreeMap<SessionId, LocalShare>,
     sending: Option<SessionId>,
     sent_views: BTreeMap<PeerId, (SessionId, View)>,
+    sending_sound: Option<SessionId>,
+    sent_sound: BTreeMap<PeerId, bool>,
     receiving_peers: BTreeMap<PublicKey, PeerId>,
     previewing: Option<SessionId>,
 
@@ -159,10 +171,46 @@ pub(super) struct Sharing {
     watch_started: Option<Instant>,
 }
 
+impl Sharing {
+    pub(super) fn new(speaker: ShareSpeakerControl) -> Self {
+        Self {
+            decode_caps: share_codec::decode_caps(true, false), failed: MediaCaps::NONE,
+            decode_probe: Default::default(), sound_on: true, speaker, playing: None, playing_title: String::new(),
+            encoder: EncoderFormats::local(),
+            shown: Default::default(), events: Vec::new(), revokes: Vec::new(), picker: Default::default(),
+            picker_dirty: false, record_presses: Vec::new(), clock: Default::default(), joined: BTreeSet::new(),
+            watch_view: View::default(), measured_panel: None, window_panel: None, locals: BTreeMap::new(),
+            sending: None, sent_views: BTreeMap::new(), sending_sound: None, sent_sound: BTreeMap::new(),
+            receiving_peers: BTreeMap::new(), previewing: None,
+            fresh: false, last_report: None, logged_keys: BTreeMap::new(), watch_started: None,
+        }
+    }
+
+    pub(super) fn wants_speaker(&self) -> bool { self.playing.is_some() }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Viewer {
+    view: View,
+    caps: MediaCaps,
+    audio: bool,
+}
+
+impl Viewer {
+    fn wants_sound(&self) -> bool { self.audio && view_open(self.view) }
+}
+
 struct LocalShare {
     town: TownId,
     recipients: BTreeSet<PublicKey>,
-    viewers: BTreeMap<PublicKey, View>,
+    viewers: BTreeMap<PublicKey, Viewer>,
+    format: StreamFormat,
+    holders: Vec<PublicKey>,
+    lost: Vec<StreamFormat>,
+    picture: Option<PictureProbe>,
+    sound: Option<AppSound>,
+    app_name: String,
+    dpi: f64,
     stopped_problem: Option<Vec<u8>>,
     rights: Arc<ShareRights>,
     rights_revision: u64,
@@ -177,9 +225,23 @@ struct LocalShare {
     last_preview: Option<Arc<Picture>>,
     line_peer: String,
     // Changes only when the line shown to the sharer can change.
-    line_state: Option<(bool, Option<u64>, bool)>,
+    line_state: Option<(bool, Option<u64>, bool, StreamFormat)>,
     /// Why the picture goes out smaller than the window, when the encoder bounds it.
     size_note: Option<String>,
+}
+
+impl LocalShare {
+    fn holder_reason(&self, encoder: EncoderFormats, flow: &CallFlow) -> Option<String> {
+        if self.holders.is_empty() { return None }
+        let better = encoder.available(&self.lost).next()?;
+        let names = self.holders.iter().map(|p| flow.peer_name(p).unwrap_or_default()).collect::<Vec<_>>().join(", ");
+        Some(format!("{names} can't decode {}", better.label()))
+    }
+
+    fn lost_limit(&self, encoder: EncoderFormats) -> Option<StreamFormat> {
+        StreamFormat::ORDER.into_iter().take_while(|&f| f != self.format)
+            .find(|&f| self.lost.contains(&f) && encoder.makes(f) && self.viewers.values().all(|v| share_codec::decodes(v.caps, f)))
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -279,8 +341,9 @@ fn share_counters(peer: &makepad_call::driver::PeerStats) -> [u64; 4] {
 /// this computer's encoder takes, when it says. A slow link lowers the frame rate, never this
 /// size. A bound is never silent: the second value says so, for the log and the sharer's page.
 /// The largest picture this computer's share encoder takes, when the platform says.
-fn encoder_max() -> Option<[u32; 2]> {
-    makepad_video::VideoStreamEncoder::max_size(makepad_video::StreamVideoCodec::H264, false)
+fn encoder_max(format: StreamFormat) -> Option<[u32; 2]> {
+    use makepad_video::StreamVideoCodec::{H264, Hevc};
+    makepad_video::VideoStreamEncoder::max_size(if format.hevc { Hevc } else { H264 }, format.full_chroma)
 }
 
 pub(super) fn caps(size: (f64, f64), dpi: f64, encoder_max: Option<[u32; 2]>) -> Option<(VideoCaps, Option<String>)> {
@@ -296,9 +359,37 @@ pub(super) fn caps(size: (f64, f64), dpi: f64, encoder_max: Option<[u32; 2]>) ->
 }
 
 impl Sharing {
+    fn attach_sound(&mut self, call: &mut Call, send: Option<SessionId>, apps: Option<&mut AppLinks>) {
+        let wanted = send.filter(|s| self.locals.get(s).and_then(|l| l.sound.as_ref())
+            .is_some_and(|sound| sound.ended_why().is_none()));
+        if self.sending_sound == wanted { return }
+        if self.sending_sound.is_some() {
+            call.remove_share_sound();
+            self.sound_off();
+        }
+        if let (Some(session), Some(apps)) = (wanted, apps) {
+            let offer = self.shown.offer(session).unwrap();
+            let ShareRole::Sharer { link, .. } = offer.role else { return };
+            if let Some(sound) = apps.open_sound(link) {
+                call.add_share_sound(Box::new(EncodedSound::new(sound)));
+                self.sending_sound = Some(session);
+                let n = self.locals[&session].viewers.values().filter(|v| v.wants_sound()).count();
+                log!("Share {}: sending the app's sound to {n} watcher(s)", offer.title);
+            }
+        }
+    }
+
+    fn sound_off(&mut self) {
+        if let Some(offer) = self.sending_sound.take().and_then(|s| self.shown.offer(s)) {
+            log!("Share {}: app sound off", offer.title);
+        }
+    }
+
     pub(super) fn detach(&mut self) {
+        self.sound_off();
         self.sending = None;
         self.sent_views.clear();
+        self.sent_sound.clear();
         self.receiving_peers.clear();
         self.logged_keys.clear();
         self.fresh |= self.shown.picture.take().is_some();
@@ -306,6 +397,7 @@ impl Sharing {
 
     pub(super) fn detach_peer(&mut self, peer: PublicKey, old_id: PeerId) {
         self.sent_views.remove(&old_id);
+        self.sent_sound.remove(&old_id);
         self.logged_keys.remove(&old_id);
         if self.receiving_peers.remove(&peer).is_some() {
             self.fresh |= self.shown.picture.take().is_some();
@@ -361,6 +453,20 @@ impl CallController {
         changed
     }
 
+    fn sync_share_sound(&mut self, apps: &mut AppLinks) {
+        let share = &mut self.sharing;
+        for offer in share.shown.own_offers() {
+            let ShareRole::Sharer { link, .. } = offer.role else { continue };
+            let local = share.locals.get_mut(&offer.session).unwrap();
+            if local.picture.is_some() && offer.stopped_line.is_none() && local.viewers.values().any(Viewer::wants_sound) {
+                if local.sound.is_none() { local.sound = apps.open_sound(link); }
+            } else {
+                local.sound = None;
+            }
+        }
+        if let Some(call) = &mut self.current { share.attach_sound(call, share.sending, Some(apps)); }
+    }
+
     fn handle_share_app_events(&mut self, apps: &mut AppLinks, events: &[AppLinkEvent]) -> bool {
         self.revoke_ended_shares(apps);
         if self.sharing.shown.choices.is_none() && self.sharing.locals.is_empty() { return false }
@@ -382,7 +488,7 @@ impl CallController {
                     AppLinkEvent::Restarted { ended, .. } if *ended == link => Some(ShareEndReason::AppClosedOrRestarted),
                     AppLinkEvent::Windows(id) if *id == link => {
                         if let Some(w) = apps.state(link).and_then(|l| l.windows.iter().find(|w| w.id == window && w.visible)) {
-                            changed |= self.resize_share(offer, w);
+                            changed |= self.resize_share(offer, w.size, w.dpi);
                             None
                         } else { Some(ShareEndReason::AppClosedOrRestarted) }
                     }
@@ -395,6 +501,7 @@ impl CallController {
             }
         }
         self.revoke_ended_shares(apps);
+        self.sync_share_sound(apps);
         if self.sharing.shown.choices.is_none() { return changed }
         let offers = &self.sharing.shown.offers;
         let locals = &self.sharing.locals;
@@ -466,10 +573,11 @@ impl CallController {
         changed
     }
 
-    fn resize_share(&mut self, offer: &ShareOffer, window: &AppWindow) -> bool {
-        let Some((caps, note)) = caps(window.size, window.dpi, encoder_max()) else { return false };
+    fn resize_share(&mut self, offer: &ShareOffer, size: (f64, f64), dpi: f64) -> bool {
         let session = offer.session;
         let Some(local) = self.sharing.locals.get_mut(&session) else { return false };
+        let Some((caps, note)) = caps(size, dpi, encoder_max(local.format)) else { return false };
+        local.dpi = dpi;
         if local.size_note != note {
             if let Some(note) = &note { log!("Share {}: {note}", offer.title); }
             local.size_note = note;
@@ -483,27 +591,38 @@ impl CallController {
                 if let Some(call) = &mut self.current {
                     call.add_share(caps, Box::new(local.source.lease()));
                     self.sharing.sent_views.clear();
+                    self.sharing.sent_sound.clear();
                     self.attach_share();
                 }
             }
         }
-        if offer.window_size == window.size { return false }
-        self.sharing.shown.offer_mut(session).unwrap().window_size = window.size;
+        if offer.window_size == size { return false }
+        self.sharing.shown.offer_mut(session).unwrap().window_size = size;
         let local = &self.sharing.locals[&session];
-        self.broadcast_share(&local.recipients.clone(), share_signal(offer, local.town, window.size));
+        self.broadcast_share(&local.recipients.clone(), share_signal(offer, local.town, size));
         true
     }
 
     fn open_share_window(&mut self, apps: &mut AppLinks, link: LinkId, window: WindowId) -> Result<(), String> {
         let title = crate::record::capture::window_label(apps, link, window)
             .ok_or("The selected window is no longer visible.")?;
-        let w = apps.state(link).and_then(|l| l.windows.iter().find(|w| w.id == window)).cloned()
+        self.open_named_share_window(apps, link, window, title)
+    }
+
+    fn open_named_share_window(&mut self, apps: &mut AppLinks, link: LinkId, window: WindowId, title: String) -> Result<(), String> {
+        let app = apps.state(link).ok_or("The selected app is no longer linked.")?;
+        let app_name = app.app.name.clone();
+        let w = app.windows.iter().find(|w| w.id == window).cloned()
             .ok_or("The selected window is no longer linked.")?;
-        let source = apps.open_picture(link, PictureWant { window, max_w: 0, max_h: 0, fps: 0, kbps: 0 })
+        let source = apps.open_picture(link, PictureWant { window, max_w: 0, max_h: 0, fps: 0, kbps: 0, format: Some(StreamFormat::H264) })
             .ok_or("The app link could not open a picture stream.")?;
         let probe = source.probe();
         let session = self.start_window(link, &w, title, Box::new(source))?;
-        self.sharing.locals.get_mut(&session).unwrap().probe = Some(Box::new(move || (probe.stats().received, probe.ended_why())));
+        let local = self.sharing.locals.get_mut(&session).unwrap();
+        local.picture = Some(probe.clone());
+        local.app_name = app_name;
+        local.probe = Some(Box::new(move || (probe.stats().received, probe.ended_why())));
+        self.settle_format(session);
         Ok(())
     }
 
@@ -511,7 +630,8 @@ impl CallController {
         let town = self.open_town().ok_or("Open a town to share a window.")?.0;
         let recipients = self.share_recipients(town);
         if recipients.is_empty() { return Err("There is nobody linked to share with in this town.".into()) }
-        let (caps, size_note) = caps(window.size, window.dpi, encoder_max()).ok_or("The selected window has no usable picture size.")?;
+        let format = StreamFormat::H264;
+        let (caps, size_note) = caps(window.size, window.dpi, encoder_max(format)).ok_or("The selected window has no usable picture size.")?;
         if let Some(note) = &size_note { log!("Share {title}: {note}"); }
         if self.sharing.shown.own_offers().any(|o| o.role == (ShareRole::Sharer { link, window: window.id })) {
             return Err("This window is already being shared.".into());
@@ -524,6 +644,7 @@ impl CallController {
         self.sharing.locals.insert(session, LocalShare {
             rights: Arc::default(), rights_revision: 0,
             source: OfferSource::new(caps, source), town, recipients: recipients.clone(), viewers: BTreeMap::new(),
+            format, holders: Vec::new(), lost: Vec::new(), picture: None, sound: None, app_name: String::new(), dpi: window.dpi,
             probe: None, stopped_problem: None,
             preview: None, preview_size: None, last_preview: None, subscribed_at: None, line_peer: String::new(), line_state: None,
             size_note,
@@ -576,7 +697,8 @@ impl CallController {
         let preview_why = local.preview.as_ref().and_then(|(p, _)| p.probe().ended_why());
         let preview_empty = preview_why.is_none() && local.preview.as_ref().is_some_and(|(p, since)|
             since.elapsed() >= NO_PICTURE_AFTER && p.probe().stats().received == 0);
-        let status = (watched_for.is_some(), waiting, preview_empty);
+        let format = local.picture.as_ref().and_then(PictureProbe::format).unwrap_or(local.format);
+        let status = (watched_for.is_some(), waiting, preview_empty, format);
         if local.line_state == Some(status) && why.is_none() && (preview_empty || offer.preview_note == preview_why) { return false }
         local.line_state = Some(status);
         let problem = why.map(|why| ShareProblem::new(session, &why));
@@ -587,6 +709,19 @@ impl CallController {
         if let Some(size) = &local.size_note { line = format!("{line} {size}"); }
         let note = preview_why.or_else(|| preview_empty.then(|| Arc::<str>::from(format!("{} isn't sending pictures.", offer.title))));
         if let Some(note) = &note { line = format!("{line} {note}"); }
+        if watched_for.is_some() && problem.is_none() {
+            line.push(' ');
+            line.push_str(format.label());
+            if format == local.format {
+                let encoder = self.sharing.encoder;
+                if let Some(reason) = local.holder_reason(encoder, &self.flow) {
+                    line.push_str(&format!(": {reason}"));
+                } else if let Some(lost) = local.lost_limit(encoder) {
+                    line.push_str(&format!(": {} couldn't encode {}", local.app_name, lost.label()));
+                }
+            }
+            line.push('.');
+        }
         let offer = self.sharing.shown.offer_mut(session).unwrap();
         offer.preview_note = note;
         offer.sharer_line = Some(line.into());
@@ -613,27 +748,38 @@ impl CallController {
             .and(share.shown.watching_sharer)
             .and_then(|p| self.links.get(&p).filter(|l| l.media_held.is_some()).map(|l| (p, l.peer_id)));
 
+        share.attach_sound(call, send, None);
         if send != share.sending {
             if let Some(local) = send.and_then(|s| share.locals.get(&s)) {
                 call.add_share(local.source.caps, Box::new(local.source.lease()));
                 share.sent_views.clear();
+                share.sent_sound.clear();
             }
         }
         if let Some((peer, id)) = receive {
             if share.receiving_peers.get(&peer) != Some(&id) {
                 call.set_peer_sharing(id, true);
                 call.begin_watch(id);
+                call.listen_share(id, share.sound_on);
                 if view_open(share.watch_view) { call.watch_share(id, share.watch_view); }
             }
         }
         if let Some(session) = send {
             let local = &share.locals[&session];
-            share.sent_views.retain(|id, _| self.id_to_peer.get(id)
-                .and_then(|p| self.links.get(p)).is_some_and(|l| l.media_held.is_some()));
+            let held = |id: &PeerId| self.id_to_peer.get(id)
+                .and_then(|p| self.links.get(p)).is_some_and(|l| l.media_held.is_some());
+            share.sent_views.retain(|id, _| held(id));
+            share.sent_sound.retain(|id, _| held(id));
             for (peer, link) in &self.links {
                 if link.media_held.is_none() { continue }
                 let id = link.peer_id;
-                match local.viewers.get(peer).copied().filter(|v| view_open(*v)) {
+                let viewer = local.viewers.get(peer);
+                let sound = viewer.is_some_and(Viewer::wants_sound);
+                if share.sent_sound.get(&id) != Some(&sound) {
+                    call.set_peer_sound(id, sound);
+                    share.sent_sound.insert(id, sound);
+                }
+                match viewer.map(|v| v.view).filter(|v| view_open(*v)) {
                     Some(view) if share.sent_views.get(&id) != Some(&(session, view)) => {
                         call.set_peer_view(id, view);
                         share.sent_views.insert(id, (session, view));
@@ -645,9 +791,11 @@ impl CallController {
         } else if share.sending.is_some() {
             call.remove_share();
             share.sent_views.clear();
+            share.sent_sound.clear();
         }
         share.receiving_peers.retain(|&p, id| {
             if receive == Some((p, *id)) { return true }
+            call.listen_share(*id, false);
             if self.links.get(&p).is_some_and(|l| l.peer_id == *id && l.media_held.is_some()) {
                 call.set_peer_sharing(*id, false);
             }
@@ -685,6 +833,9 @@ impl CallController {
         if let Some(since) = since {
             let secs = Some(u32::try_from(since.elapsed().as_secs()).unwrap_or(u32::MAX));
             self.facts.push(Fact::Leave { session, secs, why });
+        }
+        if self.sharing.sending_sound == Some(session) {
+            if let Some(call) = &mut self.current { self.sharing.attach_sound(call, None, None); }
         }
         Arc::make_mut(&mut self.sharing.shown.offers).retain(|o| o.session != session);
         if self.sharing.locals.remove(&session).is_some() { self.sharing.picker_dirty = true; }
@@ -739,6 +890,27 @@ impl CallController {
         message.send(|bytes| { for &peer in peers { self.send_to(peer, bytes.clone()); } });
     }
 
+    fn settle_format(&mut self, session: SessionId) {
+        let encoder = self.sharing.encoder;
+        let Some(local) = self.sharing.locals.get_mut(&session) else { return };
+        let Some(picture) = &local.picture else { return }; // Other sources supply H.264.
+        let (format, holders) = share_format(encoder, &local.lost, local.viewers.iter().map(|(&p, v)| (p, v.caps)));
+        if holders != local.holders {
+            local.holders = holders;
+            local.line_state = None;
+        }
+        if format == local.format { return }
+        local.format = format;
+        local.line_state = None;
+        picture.set_format(format);
+        let offer = self.sharing.shown.offer(session).unwrap().clone();
+        let reason = local.holder_reason(encoder, &self.flow);
+        if let Some(why) = reason { log!("Share {}: {}, {why}", offer.title, format.label()); }
+        else { log!("Share {}: {}", offer.title, format.label()); }
+        let dpi = local.dpi;
+        self.resize_share(&offer, offer.window_size, dpi);
+    }
+
     fn refresh_watchers(&mut self, session: SessionId) {
         if let Some(local) = self.sharing.locals.get_mut(&session) {
             let viewers: Vec<_> = local.viewers.keys().map(|p|
@@ -758,7 +930,7 @@ impl CallController {
 
     fn remove_viewer(&mut self, session: SessionId, peer: PublicKey, why: crate::call::control::EndReason) {
         let local = self.sharing.locals.get_mut(&session).unwrap();
-        local.viewers.remove(&peer);
+        let removed = local.viewers.remove(&peer).is_some();
         if local.viewers.is_empty() { local.subscribed_at = None; }
         self.sharing.shown.control.requests.retain(|(s, p, _)| (*s, *p) != (session, peer));
         self.takeover.new_watchers.retain(|entry| *entry != (session, peer));
@@ -767,6 +939,7 @@ impl CallController {
             use crate::call::control::EndReason;
             self.end_control(why, !matches!(why, EndReason::Disconnected | EndReason::ShareEnded));
         }
+        if removed { self.settle_format(session); }
         self.refresh_watchers(session);
     }
 
@@ -864,7 +1037,7 @@ impl CallController {
             }
             Message::ShareOff { session, reason } if self.sharing.shown.offer(session).is_some_and(|o| o.role == viewer) =>
                 self.end_share(session, reason, false),
-            Message::View { session, width, height, fps, .. } if self.sharing.locals.get(&session)
+            Message::View { session, width, height, fps, ext } if self.sharing.locals.get(&session)
                 .is_some_and(|l| l.recipients.contains(&sender)) => {
                 let view = View { width, height, fps: fps.min(30) };
                 if view_open(view) {
@@ -873,10 +1046,12 @@ impl CallController {
                         self.remove_viewer(old, sender, crate::call::control::EndReason::Released);
                     }
                     let local = self.sharing.locals.get_mut(&session).unwrap();
-                    let previous = local.viewers.insert(sender, view);
-                    if previous == Some(view) { return false }
+                    let viewer = Viewer { view, caps: ext.media_caps.unwrap_or(MediaCaps::NONE), audio: ext.audio.unwrap_or(false) };
+                    let previous = local.viewers.insert(sender, viewer);
+                    if previous == Some(viewer) { return false }
                     local.subscribed_at.get_or_insert_with(Instant::now);
                     if previous.is_none() { self.watcher_started(session, sender); }
+                    self.settle_format(session);
                     self.refresh_watchers(session);
                 } else {
                     self.remove_viewer(session, sender, crate::call::control::EndReason::Released);
@@ -951,7 +1126,10 @@ impl CallController {
             self.sharing.shown.control.asking = None;
         }
         log!("Share Watch closed");
-        if let (Some(call), Some(pid)) = (&mut self.current, peer_id) { call.watch_share(pid, View::default()); }
+        if let (Some(call), Some(pid)) = (&mut self.current, peer_id) {
+            call.listen_share(pid, false);
+            call.watch_share(pid, View::default());
+        }
         self.send_views();
         self.sharing.shown.watching = None;
         self.sharing.shown.watching_sharer = None;
@@ -977,7 +1155,10 @@ impl CallController {
         self.sharing.watch_started = (!stopped).then(Instant::now);
         if !stopped {
             let id = self.watched_peer_id();
-            if let (Some(call), Some(pid)) = (&mut self.current, id) { call.begin_watch(pid); }
+            if let (Some(call), Some(pid)) = (&mut self.current, id) {
+                call.begin_watch(pid);
+                call.listen_share(pid, self.sharing.sound_on);
+            }
             self.subscribe_measured(session);
         }
         true
@@ -1148,13 +1329,52 @@ impl CallController {
         }
     }
 
+    pub(super) fn sync_share_speaker(&mut self, host: &mut dyn AudioHost) -> bool {
+        self.sharing.speaker.tick();
+        let wanted = self.watched_peer_id().filter(|_| self.sharing.sound_on)
+            .and_then(|id| self.current.as_ref()?.share_sound(id))
+            .filter(|sound| sound.counts().frames > 0);
+        let share = &mut self.sharing;
+        let was_playing = share.wants_speaker();
+        match wanted {
+            Some(sound) if !share.playing.as_ref().is_some_and(|old| Arc::ptr_eq(old, sound)) => {
+                share.playing_title = share.shown.watched().map(|o| o.title.to_string()).unwrap_or_default();
+                share.speaker.play(sound.ring.clone());
+                share.playing = Some(sound.clone());
+                log!("Share {}: playing the app's sound", share.playing_title);
+            }
+            None if was_playing => {
+                share.speaker.stop();
+                share.playing = None;
+                log!("Share {}: app sound stopped", share.playing_title);
+            }
+            _ => return false,
+        }
+        let playing = share.wants_speaker();
+        if playing != was_playing {
+            if playing { self.list_devices(host); }
+            self.route(host);
+        }
+        true
+    }
+
     pub(super) fn poll_share(&mut self) -> bool {
+        if let Some(caps) = self.sharing.decode_probe.try_take() { self.apply_decode_caps(caps); }
         let peer_id = self.watched_peer_id();
         if self.sharing.shown.offers.is_empty() { return false; }
         self.log_share_progress();
         let mut changed = false;
         let offers = self.sharing.shown.offers.clone();
         for offer in offers.iter().filter(|o| matches!(o.role, ShareRole::Sharer { .. })) {
+            let local = self.sharing.locals.get_mut(&offer.session).unwrap();
+            if let Some(probe) = &local.picture {
+                if probe.lost_count() != local.lost.len() {
+                    changed = true;
+                    local.lost = probe.lost();
+                    local.line_state = None;
+                    self.settle_format(offer.session);
+                }
+            }
             changed |= self.update_sharer_line(offer);
         }
         if let Some(session) = self.sharing.previewing {
@@ -1192,10 +1412,64 @@ impl CallController {
             let Some(&peer) = self.id_to_peer.get(&id) else { continue };
             let Some(session) = self.sharing.shown.watching else { continue };
             if self.sharing.shown.watching_sharer == Some(peer) {
-                let View { width, height, fps } = view;
-                self.send_share_to(peer, Message::View { session, width, height, fps, ext: Default::default() });
+                self.send_watch_view(peer, session, view);
             }
         }
+    }
+
+    fn send_watch_view(&mut self, peer: PublicKey, session: SessionId, view: View) {
+        let View { width, height, fps } = view;
+        let ext = super::super::ShareWatchExt { media_caps: Some(self.sharing.decode_caps), audio: Some(self.sharing.sound_on) };
+        self.send_share_to(peer, Message::View { session, width, height, fps, ext });
+    }
+
+    fn apply_decode_caps(&mut self, probed: MediaCaps) {
+        let share = &mut self.sharing;
+        let caps = MediaCaps(probed.0 & !share.failed.0);
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            let formats: Vec<_> = [(MediaCaps::H264_DECODE, StreamFormat::H264), (MediaCaps::HEVC_DECODE, StreamFormat::HEVC)]
+                .into_iter().filter(|(bit, _)| caps.supports(*bit)).map(|(_, f)| f.label()).collect();
+            let list = if formats.is_empty() { "none".into() } else { formats.join(", ") };
+            log!("Share: this computer decodes {list}");
+        });
+        if caps == share.decode_caps { return }
+        share.decode_caps = caps;
+        let view = share.watch_view;
+        if let (Some(peer), Some(session)) = (share.shown.watching_sharer, share.shown.watching) {
+            if view_open(view) { self.send_watch_view(peer, session, view); }
+        }
+    }
+
+    pub(super) fn share_decoder_limit(&mut self, format: StreamFormat, timing_us: Option<(u64, u64)>) -> bool {
+        let share = &mut self.sharing;
+        let previous = share.failed;
+        share.failed.0 |= share_codec::failed_decode_bits(format);
+        share.decode_caps.0 &= !share.failed.0;
+        let (Some(peer), Some(session)) = (share.shown.watching_sharer, share.shown.watching) else { return false };
+        let view = share.watch_view;
+        // Every higher format can fall back to the mandatory H.264 4:2:0 stream.
+        let has_fallback = format != StreamFormat::H264;
+        if share.failed != previous {
+            if let Some((decode_us, interval_us)) = timing_us {
+                log!("Share: this computer can't keep up with {} (decode {:.1} ms per picture, a picture every {:.1} ms); asking for another format",
+                    format.label(), decode_us as f64 / 1000.0, interval_us as f64 / 1000.0);
+            } else if let Some(offer) = share.shown.offer(session) {
+                let retry = if has_fallback { "; asking for another format" } else { "" };
+                log!("Share {}: this computer can't decode {}{retry}", offer.title, format.label());
+            }
+            if view_open(view) { self.send_watch_view(peer, session, view); }
+        }
+        if has_fallback { return self.clear_decode_problem(session) }
+
+        // The worker reports its detailed Problem only once. If that was the earlier
+        // codec's error, the failed fallback key still needs a reason on the waiting tile.
+        let shown = &mut self.sharing.shown;
+        if shown.picture.is_none() && shown.offer(session).is_some_and(|o| o.decode_problem.is_none()) {
+            shown.offer_mut(session).unwrap().decode_problem = Some(format!("This computer can't decode {}.", format.label()).into());
+            return true
+        }
+        false
     }
 
     fn log_share_progress(&mut self) {
@@ -1220,7 +1494,15 @@ impl CallController {
                 peer.estimate_bps / 1000, peer.rtt_us.map(|us| us / 1000), peer.random_loss, self.takeover.input.summary());
         }
         }
-        if due { self.sharing.last_report = Some(Instant::now()); }
+        if due {
+            if let Some(sound) = &self.sharing.playing {
+                let counts = sound.counts();
+                let speaker = &self.sharing.speaker;
+                log!("Share audio: frames {}, restarts {}, bad {}, concealed {}, resets {}, level {:.3}",
+                    counts.frames, counts.restarts, counts.bad, speaker.concealed(), speaker.resets(), speaker.level());
+            }
+            self.sharing.last_report = Some(Instant::now());
+        }
     }
 
     /// Only the local window open in the center needs a preview stream.
@@ -1243,7 +1525,7 @@ impl CallController {
             if let Some((w, h)) = local.preview_size {
                 if let Some((preview, _)) = &local.preview { preview.want(w, h, PREVIEW_FPS); }
                 else {
-                    let want = PictureWant { window, max_w: w, max_h: h, fps: PREVIEW_FPS, kbps: 0 };
+                    let want = PictureWant { window, max_w: w, max_h: h, fps: PREVIEW_FPS, kbps: 0, format: None };
                     local.preview = apps.open_preview(link, want).map(|p| (p, Instant::now()));
                 }
             }

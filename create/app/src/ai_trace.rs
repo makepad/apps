@@ -176,20 +176,12 @@ impl Traces {
         true
     }
 
+    /// Done ends the picked-up lines and leaves undelivered ones waiting; Away ends them all.
     pub(crate) fn finish(&mut self, binding: Credential, end: Phase) {
-        self.finish_except(binding, end, None);
-    }
-
-    pub(crate) fn acknowledge(&mut self, binding: Credential, next: &[Id]) {
-        // The first line of the next page may continue the last line of the page just acked.
-        self.finish_except(binding, Phase::Done, next.first().copied());
-    }
-
-    fn finish_except(&mut self, binding: Credential, end: Phase, continuation: Option<Id>) {
         let Some(open) = self.open.get_mut(&binding) else { return };
         open.lines.retain(|&(line, index)| {
             let row = &mut self.rows.get_mut(&line).unwrap()[index];
-            if end == Phase::Done && (row.pickup.is_none() || continuation == Some(line)) { return true }
+            if end == Phase::Done && row.pickup.is_none() { return true }
             row.ended = Some(end);
             false
         });

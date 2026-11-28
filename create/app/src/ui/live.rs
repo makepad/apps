@@ -22,7 +22,7 @@ script_mod! {
             voice := View{width: Fill height: Fit flow: Down spacing: 4
                 title := Name{width: Fill}
                 people := CallControls{
-                    SeatBadge{}
+                    you_badge := SeatBadge{}
                     Name{text: "You"}
                     you_talking := Mark{a11y: {label: "You are talking"}}
                     peer_badge := PeerBadge{flow: Overlay
@@ -111,6 +111,7 @@ script_mod! {
                 share_pop_out := Control{text: "Pop out"}
                 share_scale := Control{text: "1:1"}
                 share_issue := Control{text: "Share visual issue"}
+                snap_to_board := Control{text: "Snap to board"}
                 let_control := Control{}
                 take_back := Control{text: "Take back"}
             }
@@ -340,9 +341,11 @@ impl ViewData {
         let share = &self.call.share;
         let visible = self.share_page().and_then(|s| share.offer(s)).is_some_and(|o|
             matches!(o.role, ShareRole::Sharer { .. }) || share.picture_for(o.session).is_some());
-        let button = ui.button(cx, ids!(live_share.share_issue));
-        button.set_visible(cx, visible);
-        button.set_enabled(cx, self.workspace.writable && !self.tree.snapshot().projects.is_empty());
+        let enabled = self.workspace.writable && !self.tree.snapshot().projects.is_empty();
+        for button in [ui.button(cx, ids!(live_share.share_issue)), ui.button(cx, ids!(live_share.snap_to_board))] {
+            button.set_visible(cx, visible);
+            button.set_enabled(cx, enabled);
+        }
     }
 
     /// Select shows while the tweak panel is open on this share. Lit, the picture's presses pick

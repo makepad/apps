@@ -272,11 +272,12 @@ pub fn opening_uids(cx: &Cx, root: &WidgetRef) -> Vec<WidgetUid> {
 }
 
 impl CallRowRef {
-    pub fn show(&self, cx: &mut Cx, view: &CallView, devices: &Devices, talking: Talking) {
+    /// `you` is my own name, whose letter my badge carries beside "You".
+    pub fn show(&self, cx: &mut Cx, view: &CallView, devices: &Devices, talking: Talking, you: &str) {
         self.set_visible(cx, view.phase != Phase::Idle);
         CallRow::show_transcription(cx, &self.child(id!(content)), view, &TranscribeShown::Off, "");
         CallRow::show_content(cx, &self.child(id!(content)), view, talking,
-            &PickerShown::read(devices, DeviceKind::Input), &PickerShown::read(devices, DeviceKind::Output), None);
+            &PickerShown::read(devices, DeviceKind::Input), &PickerShown::read(devices, DeviceKind::Output), None, you);
         if let Some(mut row) = self.borrow_mut() { row.bind_peers(cx, view, None); }
     }
 }
@@ -285,7 +286,8 @@ impl CallRow {
     fn show(&mut self, cx: &mut Cx, data: &ViewData) {
         let shown = &data.call;
         Self::show_transcription(cx, &self.view.child(id!(content)), &shown.view, &shown.transcribe, &shown.transcript_town);
-        Self::show_content(cx, &self.view.child(id!(content)), &shown.view, shown.talking, &shown.input, &shown.output, shown.echo_cancel_notice.as_deref());
+        Self::show_content(cx, &self.view.child(id!(content)), &shown.view, shown.talking, &shown.input, &shown.output,
+            shown.echo_cancel_notice.as_deref(), data.members.you_name());
         Self::show_share(cx, &self.view.child(id!(content)), shown);
         self.bind_peers(cx, &shown.view, Some(data));
     }
@@ -317,7 +319,8 @@ impl CallRow {
         if list.items.len() != before { cx.widget_tree_mark_dirty(list.widget_uid()); }
     }
 
-    fn show_content(cx: &mut Cx, body: &WidgetRef, view: &CallView, talking: Talking, input: &PickerShown, output: &PickerShown, echo_cancel_notice: Option<&str>) {
+    fn show_content(cx: &mut Cx, body: &WidgetRef, view: &CallView, talking: Talking, input: &PickerShown, output: &PickerShown,
+        echo_cancel_notice: Option<&str>, you: &str) {
         body.widget(cx, ids!(voice)).set_visible(cx, view.phase != Phase::Idle);
         let live = view.phase == Phase::Live;
         let ringing = view.ringing();
@@ -341,6 +344,7 @@ impl CallRow {
         if !live { heading.set_text(cx, &title(view)); }
         body.widget(cx, ids!(people)).set_visible(cx, live);
         if live {
+            body.label(cx, ids!(you_badge.initial)).set_text(cx, &crate::view::seat_initial(you, 'Y'));
             body.widget(cx, ids!(peer_badge)).set_visible(cx, !multi);
             body.widget(cx, ids!(peer_name)).set_visible(cx, !multi);
             if !multi {
@@ -795,6 +799,8 @@ mod tests {
         let view = std::sync::Arc::make_mut(&mut data.call.view);
         view.phase = Phase::Live;
         view.transcribe_prompt = true;
+        data.members.seats.push(MemberSeat { id: MemberId::You, seat: Seat::You, name: "okp".into(), tone: None,
+            presence: Presence::Here, status: String::new(), live: None, devices: Vec::new() });
         for (i, name) in ["Ana", "Ben", "Kit"].into_iter().enumerate() {
             let key = [i as u8 + 1; 65];
             view.participants.push(ParticipantShown { peer: key, name: name.into(), muted: i == 1, transcribing: i == 2 });
@@ -820,6 +826,7 @@ mod tests {
         };
         draw(cx, &mut data);
         let page = ui.call_row(cx, ids!(live_call));
+        assert_eq!(page.label(cx, ids!(you_badge.initial)).text(), "O", "my call badge beside You takes my name's letter");
         assert!(page.widget(cx, ids!(peer_roster)).visible());
         assert_eq!(page.label(cx, ids!(question)).text(), "Kit is transcribing. Transcribe you too?");
         {
@@ -986,7 +993,7 @@ mod tests {
         let actions = cx.capture_actions(|cx| header.show(cx, &flow.view().peer_name, true, true));
         ui.handle_event(cx, &Event::Actions(actions), &mut Scope::empty());
         assert_eq!(shown_tip(cx), "", "hiding Call dismisses even without another pointer event");
-        row.show(cx, flow.view(), &Devices::default(), Talking::default());
+        row.show(cx, flow.view(), &Devices::default(), Talking::default(), "");
         target.draw(cx, &ui, size);
         dispatch(cx, hover());
         assert!(row.widget(cx, ids!(mute)).visible() && row.widget(cx, ids!(hang_up)).visible());
@@ -1102,16 +1109,16 @@ mod tests {
         list[3].has_failed = true;
         let devices_row = row.widget(cx, ids!(devices));
         data.update(&list);
-        row.show(cx, &view, &data, Talking::default());
+        row.show(cx, &view, &data, Talking::default(), "");
         assert!(!mic.visible() && !speaker.visible() && !devices_row.visible(),
                 "one healthy device of each kind gives no picker, even with failed devices listed");
         list.push(device(7, Output, "Headphones", false));
         data.update(&list);
-        row.show(cx, &view, &data, Talking::default());
+        row.show(cx, &view, &data, Talking::default(), "");
         assert!(!mic.visible() && speaker.visible() && devices_row.visible(), "two speakers give a speaker choice");
         list.push(device(6, Input, "Desk microphone", false));
         data.update(&list);
-        row.show(cx, &view, &data, Talking { you: true, peer: false });
+        row.show(cx, &view, &data, Talking { you: true, peer: false }, "");
         assert!(mic.visible() && speaker.visible(), "two healthy microphones and speakers give both choices");
         let mut target = ui_checks::UiCheckTarget::new(cx);
         let size = dvec2(279., 600.);
@@ -1165,11 +1172,11 @@ mod tests {
         assert_eq!(row.label(cx, ids!(transcription)).text(), "Install a speech model.");
         view.muted = true;
         view.peer_muted = true;
-        row.show(cx, &view, &data, Talking::default());
+        row.show(cx, &view, &data, Talking::default(), "");
         assert_eq!(row.label(cx, ids!(peer_muted)).text(), "Anna muted");
         assert!(!mute.visible() && row.widget(cx, ids!(call_unmute)).visible());
         view.unmuting = true;
-        row.show(cx, &view, &data, Talking::default());
+        row.show(cx, &view, &data, Talking::default(), "");
         let unmute = row.button(cx, ids!(call_unmute));
         assert_eq!(unmute.text(), "Unmuting…");
         assert!(unmute.disabled(cx));
@@ -1180,7 +1187,7 @@ mod tests {
         let usb_id = new.device_id;
         list.insert(0, new);
         data.update(&list);
-        row.show(cx, &view, &data, Talking::default());
+        row.show(cx, &view, &data, Talking::default(), "");
         target.draw(cx, &ui, size);
         let mut node = a11y_tree::Node::default();
         mic.borrow::<DevicePicker>().unwrap().semantics(cx, &mut node);
@@ -1197,13 +1204,13 @@ mod tests {
         let drawn_usb = menu_row(&menu, 0);
         list.insert(0, device(5, Input, "Another microphone", false));
         data.update(&list);
-        row.show(cx, &view, &data, Talking::default());
+        row.show(cx, &view, &data, Talking::default(), "");
         assert_eq!(click_row(cx, &ui, &drawn_usb),
                    [(mic.widget_uid(), CallAction::Pick(DeviceKind::Input, usb_id))]);
         list.retain(|d| d.device_id != AudioDeviceId(LiveId(1)));
         list[0].is_default = true;
         data.update(&list);
-        row.show(cx, &view, &data, Talking::default());
+        row.show(cx, &view, &data, Talking::default(), "");
         assert_eq!(row.label(cx, ids!(notice)).text(),
             "Using Another microphone: Recording interface with a very long microphone name was unplugged");
         target.draw(cx, &ui, dvec2(104., 600.));
@@ -1218,23 +1225,23 @@ mod tests {
         }
         list.retain(|d| !matches!(d.name.as_str(), "USB" | "Desk microphone" | "Headphones"));
         data.update(&list);
-        row.show(cx, &view, &data, Talking::default());
+        row.show(cx, &view, &data, Talking::default(), "");
         assert!(!devices_row.visible() && row.widget(cx, ids!(notice)).visible(),
                 "the unplug notice survives when only the replacement device is available");
         view.phase = Phase::Calling;
-        row.show(cx, &view, &data, Talking::default());
+        row.show(cx, &view, &data, Talking::default(), "");
         assert!(row.widget(cx, ids!(cancel)).visible() && !mic.visible() && !speaker.visible());
         view.phase = Phase::Ringing;
-        row.show(cx, &view, &data, Talking::default());
+        row.show(cx, &view, &data, Talking::default(), "");
         assert!(answer.visible() && row.widget(cx, ids!(decline)).visible() && !mic.visible()
                 && !speaker.visible() && !devices_row.visible(), "one available speaker needs no ringing picker");
         list.push(device(7, Output, "Headphones", false));
         data.update(&list);
-        row.show(cx, &view, &data, Talking::default());
+        row.show(cx, &view, &data, Talking::default(), "");
         assert!(answer.visible() && !mic.visible() && speaker.visible() && devices_row.visible());
         assert_eq!(activate(cx, &ui, &answer, A::PRESS, ActionArg::None), [(answer.widget_uid(), CallAction::Press(Press::Answer))]);
         view.phase = Phase::Idle;
-        row.show(cx, &view, &data, Talking::default());
+        row.show(cx, &view, &data, Talking::default(), "");
         assert!(!row.visible());
 
         let header = ui.call_button(cx, ids!(header));

@@ -10,6 +10,7 @@ mod signal;
 pub mod transcribe;
 mod widgets;
 mod level;
+mod share_codec;
 mod share_panel;
 pub mod control;
 pub use session::{ShareChoice, ShareEvent, ShareOffer, ShareRole, ShareRow, ShareShown};

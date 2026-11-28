@@ -902,10 +902,20 @@ fn double_click_and_return_reopen_only_writable_unlocked_items() {
     let ids = [(kind::STICKY, 20), (kind::TEXT_BLOCK, 116), (kind::SHAPE, 212), (kind::SECTION, 308)].map(|(kind, x)| {
         h.push(item(kind, board, [x, 80, 96, 80], None)).0
     });
+    let design = h.push(item(kind::DESIGN, board, [20, 170, 96, 60], None)).0;
 
     let mut surface = WidgetRef::empty();
     let target = surface.clone();
-    let mut cx = Cx::new(Box::new(move |cx, event| target.handle_event(cx, event, &mut Scope::empty())));
+    let heard = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let actions = heard.clone();
+    let mut cx = Cx::new(Box::new(move |cx, event| {
+        if let Event::Actions(batch) = event {
+            actions.borrow_mut().extend(batch.iter().filter_map(|a| match a.as_widget_action()?.action.downcast_ref::<BoardCanvasAction>()? {
+                BoardCanvasAction::OpenDesign(id) => Some(*id), _ => None,
+            }));
+        }
+        target.handle_event(cx, event, &mut Scope::empty())
+    }));
     cx.init_cx_os();
     cx.with_vm(|vm| {
         makepad_widgets::script_mod(vm);
@@ -922,9 +932,9 @@ fn double_click_and_return_reopen_only_writable_unlocked_items() {
         canvas.fit_pending = false;
         draw_pass(&mut cx, size, 1.)(&mut cx, &mut canvas);
     }
-    let click = |cx: &mut Cx, x, time, shift| {
+    let click_at = |cx: &mut Cx, x, y, time, shift| {
         let camera = surface.borrow::<BoardCanvas>().unwrap().camera;
-        let p = camera.local_to_screen(camera.world_to_local(dvec2(x, 108.)));
+        let p = camera.local_to_screen(camera.world_to_local(dvec2(x, y)));
         let win = WindowId(1, 1);
         let button_raw_bits = MouseButton::PRIMARY.bits();
         let modifiers = makepad_platform::studio::RemoteKeyModifiers { shift, ..Default::default() };
@@ -935,6 +945,7 @@ fn double_click_and_return_reopen_only_writable_unlocked_items() {
             x: p.x, y: p.y, time: time + 0.02, button_raw_bits, modifiers,
         }), win, DVec2::default());
     };
+    let click = |cx: &mut Cx, x, time, shift| click_at(cx, x, 108., time, shift);
     let key = |cx: &mut Cx, key_code| {
         let k = KeyEvent { key_code, ..Default::default() };
         for msg in [StudioToApp::KeyDown(k.clone()), StudioToApp::KeyUp(k)] {
@@ -942,6 +953,16 @@ fn double_click_and_return_reopen_only_writable_unlocked_items() {
         }
     };
     let editing = || surface.borrow::<BoardCanvas>().unwrap().editing.as_ref().map(|e| e.item);
+    let opens = || std::mem::take(&mut *heard.borrow_mut());
+
+    // A design card: one click only selects it; a double-click or Return is the ask to edit it.
+    click_at(&mut cx, 64., 200., 0.2, false);
+    assert_eq!(surface.borrow::<BoardCanvas>().unwrap().selected_item(), Some(design), "a click selects the design card");
+    assert_eq!(opens(), Vec::<Id>::new(), "selecting a design card does not open the designer");
+    click_at(&mut cx, 64., 200., 0.3, false);
+    assert_eq!((opens(), editing()), (vec![design], None), "a double-click asks to open the designer");
+    key(&mut cx, KeyCode::ReturnKey);
+    assert_eq!(opens(), vec![design], "Return on the selected design card asks to open the designer");
 
     click(&mut cx, 115., 1., false);
     click(&mut cx, 117., 1.1, false);
@@ -1552,6 +1573,64 @@ fn finish_design_renders(cx: &mut Cx, canvas: &mut BoardCanvas, draw: &mut impl 
         draw(cx, canvas);
     }
     panic!("design renders did not finish, stage {}", canvas.designs.stage());
+}
+
+/// Finish the queued renders; the backend reports that `reads_clock`'s paints read `draw_pass.time`.
+fn finish_renders_reading_clock(cx: &mut Cx, canvas: &mut BoardCanvas, draw: &mut impl FnMut(&mut Cx, &mut BoardCanvas), reads_clock: Id) {
+    for _ in 0..256 {
+        if !canvas.designs.busy() { return }
+        if let Some((tex, _)) = canvas.designs.pending_paint() {
+            let (key, pass) = canvas.designs.pending_pass().unwrap();
+            cx.passes[pass].reads_time = key.1 == reads_clock;
+            WHOLE_DESIGN.with(|whole| whole.set(Some(tex)));
+        }
+        design_wake(cx, canvas);
+        draw(cx, canvas);
+    }
+    panic!("design renders did not finish, stage {}", canvas.designs.stage());
+}
+
+#[test]
+fn a_design_whose_paint_reads_the_clock_stays_live_while_it_shows() {
+    let (mut cx, mut canvas, _, ids, size) = design_fixture(&[SLIDE, SLIDE]);
+    let town = canvas.media_town.unwrap();
+    let (live, still) = ((town, ids[0]), (town, ids[1]));
+    let mut draw = draw_pass(&mut cx, size, 1.);
+    draw(&mut cx, &mut canvas);
+    finish_renders_reading_clock(&mut cx, &mut canvas, &mut draw, ids[0]);
+    assert_eq!(canvas.designs.live_time(&cx, live), Some(None), "a card whose paint read the clock stays live");
+    assert_eq!(canvas.designs.live_time(&cx, still), None, "any other card is a cached still");
+    let renders = canvas.designs.renders;
+    let tick = |cx: &mut Cx, canvas: &mut BoardCanvas, time: f64| {
+        let frame = canvas.card_frame;
+        assert_ne!(frame, NextFrame::default(), "a live card on screen asks for the next frame");
+        let event = Event::NextFrame(NextFrameEvent { set: [frame].into_iter().collect(), time, ..Default::default() });
+        canvas.handle_event(cx, &event, &mut Scope::empty());
+    };
+    tick(&mut cx, &mut canvas, 10.);
+    tick(&mut cx, &mut canvas, 10.5);
+    assert_eq!(canvas.designs.live_time(&cx, live), Some(Some(0.5)), "the card's clock starts at its first frame");
+    assert_eq!(canvas.designs.renders, renders, "advancing the clock renders nothing");
+
+    let home = canvas.camera.pan;
+    canvas.pan(&mut cx, home + dvec2(4000., 0.));
+    draw(&mut cx, &mut canvas);
+    assert!(!canvas.design_keep[0].contains(&live), "the card is off screen");
+    assert_eq!(canvas.designs.live_time(&cx, live), None, "off screen it is a still, so it costs nothing");
+    tick(&mut cx, &mut canvas, 11.);
+    assert_eq!(canvas.card_frame, NextFrame::default(), "and asks for no frames");
+
+    canvas.pan(&mut cx, home);
+    draw(&mut cx, &mut canvas);
+    for _ in 0..2 {
+        design_settle(&mut cx, &mut canvas);
+        draw(&mut cx, &mut canvas);
+    }
+    assert!(canvas.designs.busy(), "shown again once the camera settles, it renders again");
+    finish_renders_reading_clock(&mut cx, &mut canvas, &mut draw, ids[0]);
+    assert_eq!(canvas.designs.live_time(&cx, live), Some(None), "and is live again");
+    canvas.designs.suspend(&mut cx);
+    assert_eq!(canvas.designs.live_time(&cx, live), None, "a parked board's live cards become stills");
 }
 
 fn design_settle(cx: &mut Cx, canvas: &mut BoardCanvas) {

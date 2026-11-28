@@ -10,6 +10,7 @@ pub mod consent;
 pub mod docs;
 pub mod link_worker;
 pub mod lists;
+pub mod marks;
 pub mod model;
 pub mod publish;
 pub mod record;
@@ -42,6 +43,7 @@ pub fn script_mod(vm: &mut makepad_widgets::ScriptVm) {
     call::script_mod(vm);
     ui::chat::script_mod(vm);
     ui::picture_view::script_mod(vm);
+    ui::marked_picture::script_mod(vm);
     ui::docs::script_mod(vm);
     ui::connect::script_mod(vm);
     ui::pages::script_mod(vm);

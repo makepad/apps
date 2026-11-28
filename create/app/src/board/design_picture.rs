@@ -1,5 +1,7 @@
 //! A design owns a Splash only while producing its next still. A previous
 //! whole picture can continue serving both canvas recordings in the meantime.
+//! A picture whose paint read `draw_pass.time` stays live instead: its pass stays attached and
+//! its Splash alive, and the board gives the pass the time while the card is on screen.
 use super::{view::BoardDesign, BoardItem, BoardView};
 use makepad_town_core::event::{Id, TownId};
 use makepad_widgets::{gauss_view::CaptureGauss, makepad_platform::script::HostGrants, makepad_script::ScriptVmPolicy, *};
@@ -85,11 +87,22 @@ struct Entry {
     settled: Option<RenderSpec>,
     queued: bool,
     displayed: Option<Picture>,
+    /// The displayed picture repaints at the board's time (its paint reads the clock).
+    live: Option<LiveCard>,
     failure: Option<String>,
     last_draw: u64,
 }
 
 impl Entry {
+    /// Back to a still: the displayed picture keeps the last frame. Unsettled, so the card
+    /// renders again, and turns live again, once it shows.
+    fn stop_live(&mut self, cx: &mut Cx) {
+        if let Some(live) = self.live.take() {
+            live.stop(cx);
+            self.settled = None;
+        }
+    }
+
     fn is_settled(&self) -> bool {
         self.settled.as_ref().is_some_and(|spec| spec.same_as(&self.wanted))
     }
@@ -173,6 +186,32 @@ impl Recording {
     }
 
     fn finish(self, cx: &mut Cx) -> Picture {
+        let (picture, painter) = self.into_live();
+        painter.stop(cx);
+        picture
+    }
+
+    /// Whether its paint drew a shader that reads `draw_pass.time`, as the backend reports it.
+    fn reads_time(&self, cx: &Cx) -> bool { cx.passes[self.pass].reads_time }
+
+    /// The picture to display, and the pass that goes on painting it.
+    fn into_live(self) -> (Picture, LivePass) {
+        let Recording { passes, pass, _overlay, _gauss, picture, .. } = self;
+        (picture, LivePass { passes, pass, _overlay, _gauss })
+    }
+}
+
+/// A recording's pass and what it draws with, without its picture: kept attached while live.
+struct LivePass {
+    passes: PicturePasses,
+    pass: DrawPassId,
+    _overlay: Overlay,
+    _gauss: CaptureGauss,
+}
+
+impl LivePass {
+    /// Detach the pass, leaving its texture as painted last.
+    fn stop(self, cx: &mut Cx) {
         CaptureGauss::forget(cx, self.pass);
         let pass = &mut cx.passes[self.pass];
         pass.main_draw_list_id = None;
@@ -180,7 +219,20 @@ impl Recording {
         pass.parent = CxDrawPassParent::None;
         pass.attached_by = None;
         pass.color_textures.clear();
-        self.picture
+    }
+}
+
+struct LiveCard {
+    pass: LivePass,
+    splash: WidgetRef,
+    /// The board's time at the first frame it advanced: the card's clock starts at 0 there.
+    started: Option<f64>,
+}
+
+impl LiveCard {
+    fn stop(self, cx: &mut Cx) {
+        self.pass.stop(cx);
+        self.splash.as_splash().retire(cx);
     }
 }
 
@@ -196,6 +248,10 @@ struct Candidate {
     times: StageTimes,
 }
 
+/// The widget set a design card renders with. The board designer's palette offers exactly
+/// this set, so it never inserts a widget the card cannot name.
+pub(crate) const CARD_WIDGETS: IsolateWidgets = IsolateWidgets::Base;
+
 impl Candidate {
     fn prepare(cx: &mut Cx, key: DesignKey, spec: RenderSpec) -> Self {
         let splash = cx.with_vm(|vm| {
@@ -206,7 +262,7 @@ impl Candidate {
         inner.set_grants(HostGrants::NONE);
         inner.set_host_prompts(cx, false);
         inner.set_debug_name("board design");
-        inner.set_isolate_widgets(IsolateWidgets::Base);
+        inner.set_isolate_widgets(CARD_WIDGETS);
         let start = now_ms();
         inner.prepare_isolate(cx);
         let times = StageTimes { prepare_ms: now_ms() - start, ..Default::default() };
@@ -261,9 +317,11 @@ impl DesignPictures {
         !self.entries.is_empty()
     }
 
+    /// The board is hidden or its theme changed: stop work, and live cards become stills.
     pub(super) fn suspend(&mut self, cx: &mut Cx) {
         for key in self.queue.drain(..) { self.entries.get_mut(&key).unwrap().queued = false; }
         self.cancel_candidate(cx);
+        for entry in self.entries.values_mut() { entry.stop_live(cx); }
     }
 
     fn cancel_candidate(&mut self, cx: &mut Cx) {
@@ -291,6 +349,7 @@ impl DesignPictures {
             if view.get(&key.1).is_some_and(|i| i.w > 0 && i.h > 0 && i.design.as_ref().is_some_and(|d| !d.src.is_empty())) {
                 return true;
             }
+            entry.stop_live(cx);
             if let Some(picture) = entry.displayed.take() {
                 self.displayed_bytes -= picture.bytes;
                 released.push(picture);
@@ -321,7 +380,7 @@ impl DesignPictures {
             let spec = RenderSpec::new(design, size, theme, scale, cx.current_dpi_factor(), max_side);
             if self.candidate.as_ref().is_some_and(|job| job.key == key) { self.cancel_candidate(cx); }
             let entry = self.entries.entry(key).and_modify(|e| e.wanted = spec.clone())
-                .or_insert(Entry { wanted: spec, settled: None, queued: false, displayed: None, failure: None, last_draw: 0 });
+                .or_insert(Entry { wanted: spec, settled: None, queued: false, displayed: None, live: None, failure: None, last_draw: 0 });
             if entry.queued && entry.is_settled() {
                 self.queue.retain(|queued| queued != &key);
                 entry.queued = false;
@@ -347,6 +406,8 @@ impl DesignPictures {
         if self.last_generation == Some(generation) { return false }
         self.last_generation = Some(generation);
         self.steps_this_frame = 0;
+        // The pass sampling the live pictures is being drawn: they stay its children.
+        for live in self.entries.values_mut().filter_map(|entry| entry.live.as_mut()) { live.pass.passes.keep(cx); }
         let Some(mut job) = self.candidate.take() else {
             if let Some(key) = self.queue.pop_front() {
                 let entry = self.entries.get_mut(&key).unwrap();
@@ -421,7 +482,13 @@ impl DesignPictures {
                 #[cfg(test)]
                 let whole = self.painted.map_or(whole, |painted| painted(cx, recording.picture.texture.texture_id()));
                 if whole {
-                    result = Some(Ok(job.recording.take().unwrap().finish(cx)));
+                    let recording = job.recording.take().unwrap();
+                    result = Some(Ok(if recording.reads_time(cx) {
+                        let (picture, live) = recording.into_live();
+                        (picture, Some(live))
+                    } else {
+                        (recording.finish(cx), None)
+                    }));
                 } else {
                     recording.passes.next_frame(cx);
                 }
@@ -430,10 +497,14 @@ impl DesignPictures {
         let Some(result) = result else { self.candidate = Some(job); return false };
         let entry = self.entries.get_mut(&job.key).unwrap();
         if !entry.wanted.same_as(&job.spec) {
-            if let Ok(stale) = result { stale.release(cx); }
+            if let Ok((stale, live)) = result {
+                if let Some(live) = live { live.stop(cx); }
+                stale.release(cx);
+            }
             job.retire(cx);
             return false;
         }
+        entry.stop_live(cx);
         entry.settled = Some(job.spec.clone());
         entry.failure = None;
         if let Some(old) = entry.displayed.take() {
@@ -441,13 +512,18 @@ impl DesignPictures {
             old.release(cx);
         }
         match result {
-            Ok(picture) => {
+            Ok((picture, live)) => {
                 self.displayed_bytes += picture.bytes;
                 entry.displayed = Some(picture);
+                if let Some(pass) = live {
+                    log!("Board design {} reads the clock: it stays live while on screen", makepad_town_core::hex(&job.key.1));
+                    // The card keeps its Splash: nothing of the job is torn down.
+                    entry.live = Some(LiveCard { pass, splash: job.splash.clone(), started: None });
+                }
             }
             Err(error) => entry.failure = Some(error),
         }
-        job.retire(cx);
+        if entry.live.is_none() { job.retire(cx); }
         self.renders += 1;
         if makepad_script::makepad_error_log::trace_enabled("town.design") {
             log!("board design prepare {:.3} ms, registration {:.3} ms (maximum {:.3} ms over {} calls), eval {:.3} ms (source {:.3} ms, instantiate {:.3} ms, {} fuel, {} bytes, {} source bytes), draw {:.3} ms (drawing {}), teardown {:.3} ms",
@@ -464,12 +540,39 @@ impl DesignPictures {
     pub(super) fn clear(&mut self, cx: &mut Cx) {
         self.cancel_candidate(cx);
         self.queue.clear();
+        for entry in self.entries.values_mut() { entry.stop_live(cx); }
         release_pictures(cx, self.entries.drain().filter_map(|(_, entry)| entry.displayed).collect());
         self.displayed_bytes = 0;
         self.over_budget = false;
     }
 
+    /// Give each live card on screen (drawn in the last recording of either layer, and still
+    /// attached) the board's time `now`, in seconds: its pass repaints, and nothing is redrawn.
+    /// True while one is on screen, so the board asks for the next frame.
+    pub(super) fn advance(&mut self, cx: &mut Cx, keep: &[HashSet<DesignKey>; 2], now: f64) -> bool {
+        let mut shown = false;
+        for (key, entry) in &mut self.entries {
+            let Some(live) = &mut entry.live else { continue };
+            if !keep.iter().any(|keep| keep.contains(key)) || cx.pass_attachment_is_stale(live.pass.pass) { continue }
+            let started = *live.started.get_or_insert(now);
+            live.pass.passes.set_own_time(cx, Some((now - started) as f32));
+            shown = true;
+        }
+        shown
+    }
+
+    /// A live card drawn in the last recording of either layer.
+    pub(super) fn live_shown(&self, keep: &[HashSet<DesignKey>; 2]) -> bool {
+        self.entries.iter().any(|(key, entry)| entry.live.is_some() && keep.iter().any(|keep| keep.contains(key)))
+    }
+
     pub(super) fn evict_to_budget(&mut self, cx: &mut Cx, keep: &[HashSet<DesignKey>; 2], visibility_changed: bool) {
+        // A live card off screen costs nothing: it becomes a still and renders again when it shows.
+        if visibility_changed {
+            for (key, entry) in &mut self.entries {
+                if entry.live.is_some() && !keep.iter().any(|keep| keep.contains(key)) { entry.stop_live(cx); }
+            }
+        }
         let pending = self.candidate.as_ref().and_then(|job| job.recording.as_ref()).map_or(0, |r| r.picture.bytes);
         let mut bytes = self.displayed_bytes + pending;
         if bytes > DESIGN_PICTURES_MAX_BYTES {
@@ -485,7 +588,9 @@ impl DesignPictures {
                     self.cancel_candidate(cx);
                     bytes -= pending;
                 }
-                if let Some(picture) = self.entries.remove(&key).and_then(|e| e.displayed) {
+                let Some(mut entry) = self.entries.remove(&key) else { continue };
+                entry.stop_live(cx);
+                if let Some(picture) = entry.displayed {
                     self.displayed_bytes -= picture.bytes;
                     bytes -= picture.bytes;
                     released.push(picture);
@@ -509,6 +614,15 @@ impl DesignPictures {
     pub(super) fn pending_paint(&self) -> Option<(TextureId, usize)> {
         let recording = self.candidate.as_ref()?.recording.as_ref()?;
         Some((recording.picture.texture.texture_id(), recording.draw_items))
+    }
+    #[cfg(test)]
+    pub(super) fn pending_pass(&self) -> Option<(DesignKey, DrawPassId)> {
+        let job = self.candidate.as_ref()?;
+        Some((job.key, job.recording.as_ref()?.pass))
+    }
+    #[cfg(test)]
+    pub(super) fn live_time(&self, cx: &Cx, key: DesignKey) -> Option<Option<f32>> {
+        self.entries.get(&key)?.live.as_ref().map(|live| cx.passes[live.pass.pass].own_time)
     }
     #[cfg(test)]
     pub(super) fn stage(&self) -> String {

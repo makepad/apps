@@ -207,7 +207,8 @@ struct LocalShare {
     /// The last known decode caps of each recipient that opened a View. The stream's format
     /// follows these seats, not the open Views, so a View that repeats, carries no caps, or
     /// closes and reopens never lifts it; a seat goes when its peer stops receiving the share.
-    seats: BTreeMap<PublicKey, MediaCaps>,
+    /// A capless seat stays `None` until it explicitly lists its decoders, even an empty set.
+    seats: BTreeMap<PublicKey, Option<MediaCaps>>,
     format: StreamFormat,
     holders: Vec<PublicKey>,
     lost: Vec<StreamFormat>,
@@ -244,7 +245,7 @@ impl LocalShare {
 
     fn lost_limit(&self, encoder: EncoderFormats) -> Option<StreamFormat> {
         StreamFormat::ORDER.into_iter().take_while(|&f| f != self.format)
-            .find(|&f| self.lost.contains(&f) && encoder.makes(f) && self.seats.values().all(|&caps| share_codec::decodes(caps, f)))
+            .find(|&f| self.lost.contains(&f) && encoder.makes(f) && self.seats.values().all(|caps| share_codec::decodes(caps.unwrap_or_default(), f)))
     }
 }
 
@@ -336,6 +337,14 @@ fn share_signal(offer: &ShareOffer, town: TownId, size: (f64, f64)) -> Message {
 }
 
 fn view_open(view: View) -> bool { view.width != 0 && view.height != 0 && view.fps != 0 }
+
+fn decoder_list(caps: MediaCaps, empty: &str) -> String {
+    let formats: Vec<_> = [
+        (MediaCaps::H264_DECODE, StreamFormat::H264), (MediaCaps::H264_444_DECODE, StreamFormat::H264_FULL),
+        (MediaCaps::HEVC_DECODE, StreamFormat::HEVC), (MediaCaps::HEVC_444_DECODE, StreamFormat::HEVC_FULL),
+    ].into_iter().filter(|(bit, _)| caps.supports(*bit)).map(|(_, f)| f.label()).collect();
+    if formats.is_empty() { empty.into() } else { formats.join(", ") }
+}
 
 fn share_counters(peer: &makepad_call::driver::PeerStats) -> [u64; 4] {
     [peer.session.share_requests_sent, peer.session.share_requests_received, peer.session.share_keys_sent, peer.share_decode_errors]
@@ -898,7 +907,7 @@ impl CallController {
         let encoder = self.sharing.encoder;
         let Some(local) = self.sharing.locals.get_mut(&session) else { return };
         let Some(picture) = &local.picture else { return }; // Other sources supply H.264.
-        let (format, holders) = share_format(encoder, &local.lost, local.seats.iter().map(|(&p, &caps)| (p, caps)));
+        let (format, holders) = share_format(encoder, &local.lost, local.seats.iter().map(|(&p, caps)| (p, caps.unwrap_or_default())));
         if holders != local.holders {
             local.holders = holders;
             local.line_state = None;
@@ -1052,9 +1061,17 @@ impl CallController {
                     }
                     let local = self.sharing.locals.get_mut(&session).unwrap();
                     // A View without caps is an older watcher's: H.264 4:2:0 only, or the seat's last known caps.
-                    let caps = ext.media_caps.or_else(|| local.seats.get(&sender).copied()).unwrap_or(MediaCaps::NONE);
-                    local.seats.insert(sender, caps);
-                    let viewer = Viewer { view, caps, audio: ext.audio.unwrap_or(false) };
+                    let caps = ext.media_caps.or_else(|| local.seats.get(&sender).copied().flatten());
+                    if local.seats.insert(sender, caps) != Some(caps) {
+                        let title = self.sharing.shown.offer(session).map_or(String::new(), |o| o.title.to_string());
+                        let name = self.flow.peer_name(&sender).unwrap_or_default();
+                        if let Some(caps) = caps {
+                            log!("Share {title}: {name} decodes {}", decoder_list(caps, "nothing"));
+                        } else {
+                            log!("Share {title}: {name}'s View lists no decoders (an older Town); sending H.264 · 4:2:0");
+                        }
+                    }
+                    let viewer = Viewer { view, caps: caps.unwrap_or_default(), audio: ext.audio.unwrap_or(false) };
                     let previous = local.viewers.insert(sender, viewer);
                     if previous == Some(viewer) { return false }
                     local.subscribed_at.get_or_insert_with(Instant::now);
@@ -1436,9 +1453,7 @@ impl CallController {
         let caps = MediaCaps(probed.0 & !share.failed.0);
         static LOGGED: std::sync::Once = std::sync::Once::new();
         LOGGED.call_once(|| {
-            let formats: Vec<_> = [(MediaCaps::H264_DECODE, StreamFormat::H264), (MediaCaps::HEVC_DECODE, StreamFormat::HEVC)]
-                .into_iter().filter(|(bit, _)| caps.supports(*bit)).map(|(_, f)| f.label()).collect();
-            let list = if formats.is_empty() { "none".into() } else { formats.join(", ") };
+            let list = decoder_list(caps, "none");
             log!("Share: this computer decodes {list}");
         });
         if caps == share.decode_caps { return }

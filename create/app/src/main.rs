@@ -13,7 +13,7 @@ use makepad_create::board::media::BoardMovie;
 use makepad_widgets::makepad_platform::thread::TaskHandle;
 use std::path::PathBuf;
 use makepad_create::{app_link::AppLinkEvent, call::{self, ai::CallTool, topic, CallShown, PeerEvent, ShareEvent, ShareRole}, tweak::Tweaks};
-use makepad_create::view::{AgentControl, ClipId, TraceFold, LocalClock, Quote, TownMembers, RemovedProject, Workspace};
+use makepad_create::view::{AgentControl, ClipId, TraceFold, LocalClock, Quote, TownMembers, Removed, RemovedKind, Workspace};
 use makepad_create::board::{canvas::{BoardCanvas, BoardCanvasAction}, gesture::{AlignTo, BoardHistory, BoardTool}, touched_by, BoardPicker, BoardView};
 use makepad_town_core::{entity::{field, kind}, event::{Id, TownId}};
 use makepad_town_core::home::{Home, HomeError, HomeSource};
@@ -137,7 +137,7 @@ impl TranscriptInput {
 }
 
 #[derive(Debug)]
-struct DismissRemovedProject(Id);
+struct DismissRemoval(Id);
 
 #[derive(Script, ScriptHook)]
 pub struct App {
@@ -176,6 +176,8 @@ pub struct App {
     /// The id and text the page's title field last showed.
     #[rust]
     title_shown: Option<(Id, String)>,
+    #[rust]
+    focus_board_title: Option<Id>,
     #[rust]
     board_picker: BoardPicker,
     #[rust]
@@ -549,9 +551,11 @@ impl App {
                 }
             }
         }
-        self.view.workspace.removed = removed.filter(|r| self.view.workspace.writable && self.model.as_ref()
-            .and_then(|m| m.state.entities.get(&r.project))
-            .is_some_and(|p| p.flag(field::ARCHIVED) && p.fields.get(&field::ARCHIVED).is_some_and(|f| f.writer == r.event)));
+        self.view.workspace.removed = removed.filter(|r| {
+            let field = match r.kind { RemovedKind::Project => field::ARCHIVED, RemovedKind::Board => field::DELETED };
+            self.view.workspace.writable && self.model.as_ref().and_then(|m| m.state.entities.get(&r.id))
+                .is_some_and(|e| e.flag(field.clone()) && e.fields.get(&field).is_some_and(|f| f.writer == r.event))
+        });
     }
 
     fn select_project(&mut self, id: Id) {
@@ -560,12 +564,18 @@ impl App {
         }
     }
 
-    fn undo_removed_project(&mut self, cx: &mut Cx) {
-        let Some((of, project)) = self.view.workspace.removed.as_ref().map(|r| (r.event, r.project)) else { return };
+    fn undo_removed(&mut self, cx: &mut Cx) {
+        let Some(removed) = &self.view.workspace.removed else { return };
+        let (of, kind, id, project) = (removed.event, removed.kind, removed.id, removed.project);
         if self.act(cx, Action::Undo { of }).is_some() {
-            self.select_project(project);
-            self.view.page = Page::Project;
-            self.update_page(cx);
+            match kind {
+                RemovedKind::Board => self.open_node(cx, makepad_create::lists::Node::Board(id)),
+                RemovedKind::Project => {
+                    self.select_project(project);
+                    self.view.page = Page::Project;
+                    self.update_page(cx);
+                }
+            }
         }
     }
 
@@ -2080,9 +2090,9 @@ impl MatchEvent for App {
             }
         }
         if self.view.workspace.removed.as_ref().is_some_and(|r| actions.iter().any(|a|
-            a.downcast_ref::<DismissRemovedProject>().is_some_and(|dismiss| dismiss.0 == r.event))) {
+            a.downcast_ref::<DismissRemoval>().is_some_and(|dismiss| dismiss.0 == r.event))) {
             self.view.workspace.removed = None;
-            self.ui.redraw(cx);
+            self.show_removed(cx);
         }
     }
 }
@@ -2191,7 +2201,7 @@ impl AppMain for App {
             let elsewhere = match event {
                 Event::KeyDown(k) if k.key_code == KeyCode::KeyZ && (k.modifiers.logo || k.modifiers.control)
                     && !k.modifiers.shift && !k.modifiers.alt => {
-                    if !k.is_repeat { self.undo_removed_project(cx); }
+                    if !k.is_repeat { self.undo_removed(cx); }
                     return
                 }
                 Event::KeyDown(k) => !matches!(k.key_code, KeyCode::Logo | KeyCode::Control | KeyCode::Shift | KeyCode::Alt),
@@ -2200,7 +2210,7 @@ impl AppMain for App {
                 _ => false,
             };
             // Handle the click against the rows the person saw, then dismiss its old Undo.
-            if elsewhere { cx.action(DismissRemovedProject(removed.event)); }
+            if elsewhere { cx.action(DismissRemoval(removed.event)); }
         }
         // A window manager parks the window small, or returns it to full size: the
         // compact-forms contract, platform/src/ime.rs.
@@ -2453,6 +2463,9 @@ impl AppMain for App {
             cx.extend_actions(actions);
         } else {
             self.ui.handle_event(cx, event, &mut Scope::with_data(&mut self.view));
+        }
+        if matches!(event, Event::Draw(_)) && self.focus_board_title.is_some() {
+            self.focus_rename_field(cx);
         }
         if matches!(event, Event::KeyDown(_) | Event::MouseUp(_) | Event::TouchUpdate(_) | Event::TextInput(_))
             && (self.view.mention_picker.open || self.composer_draft.contains('@')) {

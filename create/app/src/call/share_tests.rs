@@ -2060,6 +2060,8 @@ impl ShareMesh {
 #[test]
 fn a_watchers_caps_follow_its_decoder_not_its_os() {
     use makepad_call::driver::codec::StreamFormat as F;
+    use makepad_widgets::makepad_platform::log_ring;
+    Cx::init_log();
     let mut m = ShareMesh::new(true);
     m.ctl[0].sharing.encoder = EncoderFormats { hevc: true, full_chroma: false };
     let watcher = m.key(1);
@@ -2067,6 +2069,7 @@ fn a_watchers_caps_follow_its_decoder_not_its_os() {
     let (s, _) = m.app_window_named(Some("Decoder negotiation"));
     let h264 = MediaCaps(MediaCaps::H264_DECODE);
     let both = MediaCaps(MediaCaps::H264_DECODE | MediaCaps::HEVC_DECODE);
+    let cursor = log_ring::read_since(0, 0).newest;
     m.watch(1, s);
     m.until("Mira's H.264 picture and the line naming Mira as the holder", |m| m.pts(1).is_some()
         && m.line(s).ends_with("H.264 · 4:2:0: Mira can't decode H.265 · 4:2:0."));
@@ -2082,6 +2085,14 @@ fn a_watchers_caps_follow_its_decoder_not_its_os() {
     let viewer = &m.ctl[0].sharing.locals[&s].viewers[&watcher];
     assert_eq!(viewer.caps, both, "the re-sent View adds the probed H.265 decoder");
     assert_eq!(viewer.view, geometry, "a decoder update preserves the open View's geometry");
+    log!("test mark after Mira's decoder probe");
+    m.until("Mira's log mark", |_| log_ring::read_since(cursor, log_ring::CAP).lines.iter()
+        .any(|line| line.text.ends_with("test mark after Mira's decoder probe")));
+    let lines = log_ring::read_since(cursor, log_ring::CAP).lines;
+    let lists: Vec<_> = lines.iter().filter_map(|line| line.text.split_once("Share Decoder negotiation: Mira decodes "))
+        .map(|(_, list)| list).collect();
+    assert_eq!(lists, ["H.264 · 4:2:0", "H.264 · 4:2:0, H.265 · 4:2:0"],
+        "Mira's decoder log shows her initial formats and then her probe result once each");
 
     let kit = m.key(2);
     m.watch(2, s);
@@ -2274,6 +2285,8 @@ fn a_watcher_who_decodes_less_downgrades_the_share_and_its_leaving_upgrades_it()
 
     let old_view = Message::View { session: s, width: 320, height: 180, fps: 30, ext: Default::default() };
     let cursor = log_ring::read_since(0, 0).newest;
+    let title = m.ctl[0].sharing.shown.offer(s).unwrap().title.clone();
+    let legacy_line = format!("Share {title}: Bo's View lists no decoders (an older Town); sending H.264 · 4:2:0");
     port.messages_in.try_send(old_view.encode()).unwrap();
     m.until("Bo's capless View to lower the stream", |m| m.line(s).ends_with("H.264 · 4:2:0: Bo can't decode H.265 · 4:2:0."));
     let downgrades = || log_ring::read_since(cursor, log_ring::CAP).lines.iter()
@@ -2304,11 +2317,19 @@ fn a_watcher_who_decodes_less_downgrades_the_share_and_its_leaving_upgrades_it()
         assert_eq!(upgrades(), 0, "{step} never lifts the stream to H.265");
         assert_eq!(m.rig.as_ref().unwrap().video_formats(), [F::HEVC, F::H264], "{step} reopens nothing");
     }
+    let explicit_empty = Message::View { session: s, width: 640, height: 360, fps: 30,
+        ext: crate::call::ShareWatchExt { media_caps: Some(MediaCaps::NONE), ..Default::default() } };
+    port.messages_in.try_send(explicit_empty.encode()).unwrap();
+    let empty_line = format!("Share {title}: Bo decodes nothing");
+    m.until("Bo's first explicit decoder list after his older Views", |_| log_ring::read_since(cursor, log_ring::CAP)
+        .lines.iter().any(|line| line.text.ends_with(&empty_line)));
     port.messages_in.try_send(close.encode()).unwrap();
     m.until("Bo's closed View", |m| !m.ctl[0].sharing.locals[&s].viewers.contains_key(&legacy));
     assert!(m.line(s).ends_with("H.264 · 4:2:0: Bo can't decode H.265 · 4:2:0."),
         "a closed seat still holds the stream while Bo receives the share: {}", m.line(s));
     assert_eq!(upgrades(), 0, "a closed seat never lifts the stream to H.265");
+    let legacy_logs = log_ring::read_since(cursor, log_ring::CAP).lines.iter().filter(|line| line.text.ends_with(&legacy_line)).count();
+    assert_eq!(legacy_logs, 1, "Bo's repeated Views log the older Town decoder fallback exactly once");
 
     m.ctl[0].link_down(&mut m.hosts[0], legacy);
     m.until("HEVC to resume when Bo leaves", |m| m.line(s).ends_with("H.265 · 4:2:0."));

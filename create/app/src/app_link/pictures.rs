@@ -43,7 +43,7 @@ struct State {
 }
 
 pub(super) struct PictureSlot {
-    wake_on_relay: bool,
+    pub(super) preview: bool,
     state: Mutex<State>,
     ready: Condvar,
 }
@@ -64,9 +64,9 @@ pub struct PictureStream {
     slot: Arc<PictureSlot>,
 }
 
-fn new_slot(env: &AppLinkEnv, want: PictureWant, wake_on_relay: bool) -> Arc<PictureSlot> {
+fn new_slot(env: &AppLinkEnv, want: PictureWant, preview: bool) -> Arc<PictureSlot> {
     Arc::new(PictureSlot {
-        wake_on_relay,
+        preview,
         state: Mutex::new(State {
             want,
             await_key: true,
@@ -87,7 +87,7 @@ fn new_slot(env: &AppLinkEnv, want: PictureWant, wake_on_relay: bool) -> Arc<Pic
 
 impl PictureStream {
     pub(super) fn new(env: &AppLinkEnv, want: PictureWant) -> (Self, Subscription) {
-        let slot = new_slot(env, want, true);
+        let slot = new_slot(env, want, false);
         (Self { slot: slot.clone() }, Subscription(slot))
     }
 
@@ -239,7 +239,7 @@ impl PictureSlot {
         let wake = s.wake.clone();
         drop(s);
         self.ready.notify_all();
-        if self.wake_on_relay { wake(); }
+        if !self.preview { wake(); } // The preview worker wakes the page after decoding.
     }
 }
 
@@ -285,7 +285,7 @@ pub struct PicturePreview {
 
 impl PicturePreview {
     pub(super) fn new(env: &AppLinkEnv, want: PictureWant) -> (Self, Subscription) {
-        let slot = new_slot(env, want, false);
+        let slot = new_slot(env, want, true);
         let latest = Arc::new(Mutex::new(None));
         let worker = Subscription(slot.clone());
         let out = latest.clone();

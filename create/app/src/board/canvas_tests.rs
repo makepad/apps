@@ -1629,6 +1629,19 @@ fn a_design_whose_paint_reads_the_clock_stays_live_while_it_shows() {
     assert!(canvas.designs.busy(), "shown again once the camera settles, it renders again");
     finish_renders_reading_clock(&mut cx, &mut canvas, &mut draw, ids[0]);
     assert_eq!(canvas.designs.live_time(&cx, live), Some(None), "and is live again");
+
+    let before = canvas.design_state(ids[0]);
+    let at = canvas.item_screen_rect(canvas.scene.as_ref().unwrap().view.get(&ids[0]).unwrap()).center();
+    canvas.zoom(&mut cx, at, canvas.camera.scale * 2.);
+    draw(&mut cx, &mut canvas);
+    for _ in 0..2 {
+        design_settle(&mut cx, &mut canvas);
+        draw(&mut cx, &mut canvas);
+    }
+    assert!(canvas.designs.busy(), "a settled zoom re-renders a live card at the new density, as it does a still");
+    finish_renders_reading_clock(&mut cx, &mut canvas, &mut draw, ids[0]);
+    assert_ne!(canvas.design_state(ids[0]), before, "the live card's picture now has the zoomed density");
+    assert_eq!(canvas.designs.live_time(&cx, live), Some(None), "and it is live at that density");
     canvas.designs.suspend(&mut cx);
     assert_eq!(canvas.designs.live_time(&cx, live), None, "a parked board's live cards become stills");
 }

@@ -1,6 +1,6 @@
 //! The left rail's town tree: the towns, and under the open one each project
 //! with everything it holds. Every row carries an id; titles are display text only.
-//! Only the twisty folds, and fold state is this computer's own, kept in memory.
+//! Folder names and twisties fold locally. Other names open their row.
 
 use crate::lists::{highlight, ViewData};
 use crate::model::tree::{RowKind, TownEntry, TownTree};
@@ -26,6 +26,7 @@ pub enum Node {
     /// A project's one task list, by its project's id.
     Tasks(Id),
     Issues(Id),
+    Boards(Id),
     Board(Id),
     Doc(Id),
 }
@@ -100,6 +101,7 @@ pub struct TreeState {
     pub(super) live_start: Option<usize>,
     current: Option<Node>,
     folded: BTreeSet<Id>,
+    folded_boards: BTreeSet<Id>,
     /// Each town's unread count, kept here so a rebuild never drops a badge.
     unread: BTreeMap<Id, TownUnread>,
     pub lines: Vec<Line>,
@@ -154,11 +156,17 @@ impl TreeState {
         for line in &mut self.lines { line.open = Some(line.node) == current; }
     }
 
-    /// A press on the row at `index`. A name returns what to open and folds nothing. A twisty
-    /// folds only its own row; on a town that isn't open it returns that town to open.
+    /// A folder folds on either press. Other names open their page; their twisties fold.
     pub fn press(&mut self, index: usize, hit: Press) -> Option<Node> {
         let line = self.lines.get(index)?;
         let node = line.node;
+        if let Node::Boards(project) = node {
+            if line.fold.is_some() {
+                if !self.folded_boards.remove(&project) { self.folded_boards.insert(project); }
+                self.rebuild();
+            }
+            return None
+        }
         match (hit, line.fold) {
             (Press::Name, _) => Some(node),
             (Press::Twisty, Some(_)) => {
@@ -195,14 +203,21 @@ impl TreeState {
                 let expanded = !self.folded.contains(&project.id);
                 line(Node::Project(project.id), 1, "▣", &project.title, "", Some(expanded));
                 if !expanded { continue }
-                for row in &project.rows {
-                    let (node, glyph) = match row.kind {
-                        RowKind::Tasks => (Node::Tasks(project.id), "✓"),
-                        RowKind::Board => (Node::Board(row.id), "▦"),
-                        RowKind::Doc => (Node::Doc(row.id), "≡"),
-                    };
-                    line(node, 2, glyph, &row.title, "", None);
-                    if row.kind == RowKind::Tasks { line(Node::Issues(project.id), 2, "", "Issues", "", None); }
+                // TownTree orders each project's rows as Tasks, boards, then docs.
+                let (tasks, pages) = project.rows.split_at(project.rows.partition_point(|r| r.kind == RowKind::Tasks));
+                let (boards, docs) = pages.split_at(pages.partition_point(|r| r.kind == RowKind::Board));
+                for row in tasks {
+                    line(Node::Tasks(project.id), 2, "✓", &row.title, "", None);
+                    line(Node::Issues(project.id), 2, "", "Issues", "", None);
+                }
+                let expanded = !self.folded_boards.contains(&project.id);
+                let label = if expanded || boards.is_empty() { "Boards".into() } else { format!("Boards · {}", boards.len()) };
+                line(Node::Boards(project.id), 2, "", &label, "", (!boards.is_empty()).then_some(expanded));
+                if expanded {
+                    for board in boards { line(Node::Board(board.id), 3, "▦", &board.title, "", None); }
+                }
+                for doc in docs {
+                    line(Node::Doc(doc.id), 2, "≡", &doc.title, "", None);
                 }
             }
         }
@@ -316,13 +331,13 @@ mod tests {
     fn rows_fold_only_by_their_twisty_and_names_open_by_id() {
         let (mut state, town, other) = state();
         fn labels(s: &TreeState) -> Vec<(usize, &str)> { s.lines.iter().map(|l| (l.depth, l.label.as_str())).collect() }
-        assert_eq!(labels(&state), [(0, "Makepad"), (1, "Fab"), (2, "Tasks"), (2, "Issues"), (2, "Layout"), (2, "Notes"),
-            (1, "Town"), (2, "Tasks"), (2, "Issues"), (2, "Layout"), (2, "Notes"), (0, "Studio")], "the open town shows each project's rows");
+        assert_eq!(labels(&state), [(0, "Makepad"), (1, "Fab"), (2, "Tasks"), (2, "Issues"), (2, "Boards"), (3, "Layout"), (2, "Notes"),
+            (1, "Town"), (2, "Tasks"), (2, "Issues"), (2, "Boards"), (3, "Layout"), (2, "Notes"), (0, "Studio")], "the open town shows each project's rows");
         assert_eq!(state.lines[0].node, Node::Town(town), "the town row carries the town's id");
         assert_eq!(state.lines[2].node, Node::Tasks(id(30)), "a task list row carries its project's id");
         assert_eq!(state.lines[3].node, Node::Issues(id(30)), "Issues opens the same project as the adjacent Tasks row");
-        assert_eq!(state.lines[4].node, Node::Board(id(40)), "a board row carries the board's id");
-        assert_eq!(state.lines[11].fold, Some(false), "a town that isn't open is collapsed");
+        assert_eq!(state.lines[5].node, Node::Board(id(40)), "a board row carries the board's id");
+        assert_eq!(state.lines[13].fold, Some(false), "a town that isn't open is collapsed");
 
         let plain = state.lines.clone();
         let session = [8; 16];
@@ -364,21 +379,21 @@ mod tests {
         assert_eq!(state.lines, plain, "ending the offer restores the original rows");
 
         let before = state.lines.clone();
-        assert_eq!(state.press(4, Press::Name), Some(Node::Board(id(40))), "a name opens its row's id");
+        assert_eq!(state.press(5, Press::Name), Some(Node::Board(id(40))), "a name opens its row's id");
         assert_eq!(state.lines, before, "a name folds nothing");
         assert_eq!(state.press(1, Press::Name), Some(Node::Project(id(30))), "a project's name opens its overview");
         assert_eq!(state.lines, before, "a project's name folds nothing");
 
         assert_eq!(state.press(1, Press::Twisty), None, "a twisty opens nothing");
         assert_eq!(labels(&state), [(0, "Makepad"), (1, "Fab"),
-            (1, "Town"), (2, "Tasks"), (2, "Issues"), (2, "Layout"), (2, "Notes"), (0, "Studio")], "the twisty folds only its project");
+            (1, "Town"), (2, "Tasks"), (2, "Issues"), (2, "Boards"), (3, "Layout"), (2, "Notes"), (0, "Studio")], "the twisty folds only its project");
         assert_eq!(state.lines[1].fold, Some(false), "the folded project shows ▸");
         state.set(state.towns.clone(), state.snapshot().clone());
-        assert_eq!(state.lines.len(), 8, "a refresh keeps this computer's folds");
+        assert_eq!(state.lines.len(), 9, "a refresh keeps this computer's folds");
         assert_eq!(state.press(1, Press::Twisty), None);
         assert_eq!(state.lines, before, "the twisty unfolds it again");
 
-        assert_eq!(state.press(11, Press::Twisty), Some(Node::Town(other)), "another town's twisty opens that town");
+        assert_eq!(state.press(13, Press::Twisty), Some(Node::Town(other)), "another town's twisty opens that town");
         assert_eq!(state.press(2, Press::Twisty), None, "a leaf has no twisty");
         state.show(Some(Node::Board(id(40))));
         assert_eq!(state.lines.iter().filter(|l| l.open).map(|l| l.node).collect::<Vec<_>>(), [Node::Board(id(40))],
@@ -398,13 +413,41 @@ mod tests {
             "only town rows carry counts");
         assert!(!state.set_unread(&counts), "the same counts change nothing");
         assert_eq!(state.press(1, Press::Twisty), None);
-        assert_eq!((state.lines[7].node, state.lines[7].unread, state.lines[7].urgent), (Node::Town(other), 3, true),
+        assert_eq!((state.lines[8].node, state.lines[8].unread, state.lines[8].urgent), (Node::Town(other), 3, true),
             "folding a project keeps the counts");
         assert_eq!(state.press(1, Press::Twisty), None);
-        assert_eq!((state.lines[11].node, state.lines[11].unread, state.lines[11].urgent), (Node::Town(other), 3, true),
+        assert_eq!((state.lines[13].node, state.lines[13].unread, state.lines[13].urgent), (Node::Town(other), 3, true),
             "unfolding keeps them too");
         assert_eq!(badges(&state)[0], (Node::Town(town), 2, false));
         assert!(state.set_unread(&BTreeMap::new()), "clearing the counts changes the rows");
         assert_eq!(badges(&state), [(Node::Town(town), 0, false), (Node::Town(other), 0, false)], "no counts, no badges");
+    }
+
+    #[test]
+    fn boards_sit_in_a_folder_that_folds_and_counts() {
+        let (mut state, _, _) = state();
+        let mut tree = state.snapshot().clone();
+        let mut board = tree.projects[1].rows.remove(1);
+        board.title = "Second".into();
+        tree.projects[0].rows.insert(2, board);
+        state.set(state.towns.clone(), tree);
+        let index = |state: &TreeState, node| state.lines.iter().position(|l| l.node == node).expect("missing tree row");
+        let folder = index(&state, Node::Boards(id(30)));
+        let empty = &state.lines[index(&state, Node::Boards(id(31)))];
+        assert_eq!((empty.depth, empty.fold, empty.label.as_str()), (2, None, "Boards"));
+        let row = &state.lines[folder];
+        assert_eq!((row.depth, row.fold, row.label.as_str()), (2, Some(true), "Boards"));
+        assert_eq!(state.press(folder, Press::Twisty), None);
+        assert_eq!(state.lines[folder].label, "Boards · 2");
+        assert!(state.lines.iter().all(|l| !matches!(l.node, Node::Board(_))));
+        assert_eq!(state.lines[index(&state, Node::Doc(id(50)))].depth, 2);
+        state.set(state.towns.clone(), state.snapshot().clone());
+        assert_eq!(state.lines[folder].fold, Some(false));
+        assert_eq!(state.press(folder, Press::Name), None);
+        assert_eq!(state.lines[folder].fold, Some(true));
+        state.show(Some(Node::Board(id(41))));
+        assert_eq!(state.lines[folder + 1].node, Node::Board(id(40)));
+        let second = &state.lines[folder + 2];
+        assert_eq!((second.node, second.depth, second.open), (Node::Board(id(41)), 3, true));
     }
 }

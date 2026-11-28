@@ -162,9 +162,9 @@ impl Model {
         let entity = self.state.entities.get(&id)
             .filter(|e| matches!(e.kind.number(), Some(kind::BOARD | kind::DOC)) && live(e))
             .ok_or("nothing to delete here")?;
-        let label = if entity.kind.number() == Some(kind::BOARD) { "delete board" } else { "delete doc" };
+        if entity.kind == kind::BOARD { return Ok(Action::DeleteBoard { board: id }) }
         let changes = vec![Change { entity: id, field: field::DELETED, value: Value::Bool(true) }];
-        Ok(Action::SetFields { changes, label: Some(label.into()) })
+        Ok(Action::SetFields { changes, label: Some("delete doc".into()) })
     }
 
     pub fn delete_page(&mut self, id: Id) -> Result<(), String> {
@@ -179,6 +179,33 @@ mod tests {
     use crate::model::tests::ShareHomes;
 
     fn ids(project: &TreeProject) -> Vec<Id> { project.rows.iter().map(|r| r.id).collect() }
+
+    #[test]
+    fn deleting_a_board_hides_it_and_undo_brings_back_it_and_its_items() {
+        let homes = ShareHomes::new("delete-board");
+        let (mut model, _) = Model::open(&homes.0).unwrap();
+        let project = model.town_tree().projects[0].id;
+        let board = model.act(Action::AddBoard { title: "Layout".into(), project }, Origin::Ui).unwrap();
+        model.act(Action::AddBoard { title: "Second".into(), project }, Origin::Ui).unwrap();
+        let doc = model.act(Action::AddDoc { title: "Notes".into(), project }, Origin::Ui).unwrap();
+        let mut add = |kind, parent| model.act(Action::AddItem { board, kind: Key::Number(kind), parent,
+            x: 0, y: 0, w: 64, h: 64, style: Default::default() }, Origin::Ui).unwrap();
+        let sticky = add(kind::STICKY, None);
+        let section = add(kind::SECTION, None);
+        let shape = add(kind::SHAPE, Some(section));
+        let before = model.town_tree();
+        let event = model.act(Action::DeleteBoard { board }, Origin::Ui).expect("delete the live board");
+        assert!(model.town_tree().row(board).is_none());
+        assert!(model.delete_page_action(board).is_err());
+        for id in [board, doc, project] {
+            assert_eq!(model.act(Action::DeleteBoard { board: id }, Origin::Ui).unwrap_err(), "nothing to delete here");
+        }
+        model.act(Action::Undo { of: event }, Origin::Ui).unwrap();
+        assert_eq!(model.town_tree(), before, "undo restores the same row at the same position");
+        assert_eq!(model.delete_page_action(board).unwrap(), Action::DeleteBoard { board });
+        for id in [sticky, section, shape] { assert_eq!(model.board_item(id).unwrap().1, board); }
+        assert_eq!(crate::board::tree::parent(model.board_item(shape).unwrap().0), Some(section));
+    }
 
     #[test]
     fn the_tree_lists_each_projects_rows_and_follows_rename_and_delete() {

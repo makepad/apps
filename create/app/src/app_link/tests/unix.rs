@@ -319,6 +319,7 @@ impl Rig {
                     }
                     let id = open.channel.id();
                     d.frames.push(feed);
+                    f.release.notify_all();
                     let fake = f.clone();
                     thread::spawn(move || {
                         while let Some(Event::Data(msg)) = open.channel.recv() {
@@ -1036,6 +1037,21 @@ fn preview_and_share_open_one_video_channel_only() {
         assert_eq!((d.video_opens.len(), d.frames.len(), d.raw_opens, d.seeds.len()), (2, 1, 0, 0));
     }
 
+    share.want(12, 8, 30);
+    assert!(rig.packet(&share).key, "the smaller share starts with a key");
+    assert_eq!(share.size(), (12, 8), "the capture fits the active share");
+    let opens = rig.video_formats().len();
+    late.want(24, 16, 60);
+    let after_resize = {
+        let d = rig.fake.data.lock().unwrap();
+        let d = rig.fake.release.wait_while(d, |d| !d.frames.iter().any(|f| f.fps == 60)).unwrap();
+        d.video_opens.len()
+    };
+    assert_eq!(after_resize, opens, "enlarging the preview never reopens an active share's capture");
+    share.want(0, 0, 0);
+    rig.wait(|_| late.take().is_some_and(|p| (p.width, p.height) == (24, 16)));
+    assert_eq!(rig.fake.data.lock().unwrap().video_opens.last(), Some(&(3, 1., 60, 4_000)),
+        "the preview sets the capture scale again when the share is inactive");
     drop(late);
     drop(share);
     {

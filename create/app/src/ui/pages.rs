@@ -72,6 +72,15 @@ script_mod! {
         draw_bg +: {color: palette.bg color_hover: palette.sel border_size: 0}
         draw_text +: {color: palette.muted text_style: theme.font_code{font_size: 8.25}}
     }
+    let RemovedNote = View{
+        visible: false width: Fill height: Fit flow: Right{wrap: true} align: Align{y: 0.5} spacing: 6
+        removed_title := RailText{
+            width: Fit{max: FitBound.Rel{base: Base.Full factor: 1.0}} max_lines: 1 text_overflow: Ellipsis
+            draw_text.text_style: theme.font_regular{font_size: 9}
+        }
+        BodyNote{width: Fit text: "removed ·"}
+        undo_project := PanelButton{text: "Undo" a11y: {label: "Undo removal"}}
+    }
     // The title, breadcrumb and ⋯ menu above a board, a doc or the task list.
     mod.widgets.ItemHead = SolidView{
         visible: false width: Fill height: Fit flow: Down spacing: 4
@@ -103,6 +112,7 @@ script_mod! {
                 delete_keep := PanelButton{}
             }
         }
+        page_removed := RemovedNote{}
         PanelLine{}
     }
     let Tile = RoundedView{
@@ -130,15 +140,6 @@ script_mod! {
                 tile_c := Tile{}
             }
         }
-    }
-    let RemovedNote = View{
-        visible: false width: Fill height: Fit flow: Right{wrap: true} align: Align{y: 0.5} spacing: 6
-        removed_title := RailText{
-            width: Fit{max: FitBound.Rel{base: Base.Full factor: 1.0}} max_lines: 1 text_overflow: Ellipsis
-            draw_text.text_style: theme.font_regular{font_size: 9}
-        }
-        BodyNote{width: Fit text: "removed ·"}
-        undo_project := PanelButton{text: "Undo" a11y: {label: "Undo project removal"}}
     }
     let MemberSeat = RoundedView{
         show_bg: false width: Fit height: Fit flow: Overlay
@@ -315,6 +316,7 @@ script_mod! {
         }
         project_title := TitleInput{a11y: {label: "Project name"}}
         project_meta := BodyNote{margin: Inset{left: 4}}
+        project_removed := RemovedNote{}
         ProjectHeaderBase{
             width: Fill height: Fit
             content := View{width: Fill height: Fit flow: Down spacing: 4

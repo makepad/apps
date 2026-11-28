@@ -43,20 +43,24 @@ impl VideoSettings {
         if !(width > 0. && height > 0.) {
             return None;
         }
-        let mut scale = 0f64;
+        let mut share_scale = 0f64;
+        let mut preview_scale = 0f64;
         let mut fps = 0;
         let mut kbps = None;
         let mut format = None;
-        for want in slots.iter().filter_map(|slot| slot.demand()).filter(|w| w.active()) {
+        for slot in slots {
+            let Some(want) = slot.demand().filter(|w| w.active()) else { continue };
             format = format.or(want.format);
             let fit = (f64::from(want.max_w) / width)
-                .min(f64::from(want.max_h) / height);
-            scale = scale.max(fit.min(1.));
+                .min(f64::from(want.max_h) / height).min(1.);
+            if slot.preview { preview_scale = preview_scale.max(fit); }
+            else { share_scale = share_scale.max(fit); }
             fps = fps.max(want.fps.min(240));
             if want.kbps > 0 {
                 kbps = Some(kbps.map_or(want.kbps, |rate: u32| rate.min(want.kbps)));
             }
         }
+        let scale = if share_scale > 0. { share_scale } else { preview_scale };
         (fps > 0).then(|| Self { format: format.unwrap_or(StreamFormat::H264), scale, fps, kbps: kbps.unwrap_or(PREVIEW_DEFAULT_KBPS) })
     }
 

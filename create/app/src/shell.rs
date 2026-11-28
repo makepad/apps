@@ -64,6 +64,7 @@ impl App {
         if self.flush_doc(cx).is_err() { return }
         let tree = self.view.tree.snapshot();
         match node {
+            Node::Boards(_) => return,
             Node::Town(town) => {
                 if Some(town) != tree.town { self.switch_town(cx, town); }
                 if self.view.tree.snapshot().town != Some(town) { return }
@@ -188,7 +189,6 @@ impl App {
         let item = matches!(page, Page::Tasks | Page::Issues | Page::Board | Page::Docs);
         let writable = self.view.workspace.writable;
         let removable = self.view.workspace.removable.is_some_and(|r| Some(r) == self.view.workspace.current) && writable;
-        let removed = self.view.workspace.removed.as_ref().map(|r| r.title.clone());
 
         for (path, visible) in [
             (ids!(home_page), page == Page::Home), (ids!(project_page), page == Page::Project),
@@ -197,9 +197,7 @@ impl App {
             self.ui.widget(cx, path).set_visible(cx, visible);
         }
         self.ui.label(cx, ids!(project_meta)).set_text(cx, &project_meta);
-        let note = self.ui.widget(cx, ids!(home_removed));
-        note.set_visible(cx, removed.is_some());
-        if let Some(removed) = &removed { note.label(cx, ids!(removed_title)).set_text(cx, removed); }
+        self.show_removed(cx);
         self.ui.widget(cx, ids!(remove_project)).set_visible(cx, removable);
 
         // Titles: draw the model's, except while the person is typing in the field.
@@ -247,9 +245,21 @@ impl App {
         }
     }
 
+    pub(super) fn show_removed(&self, cx: &mut Cx) {
+        let page = self.view.page;
+        for (path, shown) in [
+            (ids!(home_removed), page == Page::Home), (ids!(project_removed), page == Page::Project),
+            (ids!(page_removed), matches!(page, Page::Tasks | Page::Issues | Page::Board | Page::Docs)),
+        ] {
+            let note = self.ui.widget(cx, path);
+            let removed = self.view.workspace.removed.as_ref().filter(|_| shown);
+            note.set_visible(cx, removed.is_some());
+            if let Some(r) = removed { note.label(cx, ids!(removed_title)).set_text(cx, &r.title); }
+        }
+    }
+
     /// A new project, board or doc opens at once; its row appears in the tree.
-    fn add_to_town(&mut self, cx: &mut Cx, kind: NewKind) {
-        let Some(project) = self.view.workspace.current else { return };
+    fn add_to_town(&mut self, cx: &mut Cx, kind: NewKind, project: Id) {
         let (action, open): (Action, fn(Id) -> Node) = match kind {
             NewKind::Project => (Action::AddProject { title: "New project".into() }, Node::Project),
             NewKind::Board => (Action::AddBoard { title: "New board".into(), project }, Node::Board),
@@ -292,10 +302,72 @@ impl App {
         if let Some(shown) = self.edit_title(cx, &input.text(), escaped) { input.set_text(cx, &shown); }
     }
 
+    // From Home or an overview the title may only get its area on the next draw.
+    pub(super) fn focus_rename_field(&mut self, cx: &mut Cx) {
+        let Some(board) = self.focus_board_title else { return };
+        if self.current_node() == Some(Node::Board(board)) && self.view.workspace.writable {
+            let input = self.ui.text_input(cx, ids!(item_title));
+            if !input.area().is_valid(cx) { return }
+            if let Some(mut field) = input.borrow_mut() {
+                field.take_key_focus(cx);
+                field.select_all(cx);
+            };
+        }
+        self.focus_board_title = None;
+    }
+
+    fn tree_row_menu(&mut self, cx: &mut Cx, tree: &PortalListRef, actions: &Actions) {
+        let owner = id!(tree_row_menu);
+        let writable = self.view.workspace.writable;
+        if let Some(pick) = menu_picked(actions, owner) {
+            match self.view.tree_menu.take().filter(|_| writable) {
+                Some(Node::Board(board)) if pick == id!(delete) => self.delete_tree_board(cx, board),
+                Some(Node::Board(board)) if pick == id!(rename) => {
+                    self.open_node(cx, Node::Board(board));
+                    self.focus_board_title = Some(board);
+                    self.focus_rename_field(cx);
+                }
+                Some(Node::Boards(project)) if pick == id!(new_board) => self.add_to_town(cx, NewKind::Board, project),
+                _ => {}
+            }
+        } else if menu_actions(actions).any(|a| matches!(a, MenuAction::Closed { owner: id } if *id == owner)) {
+            self.view.tree_menu = None;
+        }
+        for gesture in tree.item_actions(actions) {
+            let PortalListAction::ItemContextMenu { item_id, abs } = gesture else { continue };
+            let Some(line) = self.view.tree.lines.get(item_id) else { continue };
+            let rows = match line.node {
+                Node::Board(_) => vec![
+                    MenuRow::new(id!(rename), "Rename").enabled(writable),
+                    MenuRow::new(id!(delete), "Delete").danger(true).enabled(writable),
+                ],
+                Node::Boards(_) => vec![MenuRow::new(id!(new_board), "New board").enabled(writable)],
+                _ => continue,
+            };
+            self.view.tree_menu = Some(line.node);
+            cx.action(MenuAction::Open { owner, rows, anchor: Rect { pos: abs, ..Default::default() }, place: MenuPlace::At });
+        }
+    }
+
+    fn delete_tree_board(&mut self, cx: &mut Cx, board: Id) {
+        let Some(project) = self.view.tree.snapshot().project_of(board) else { return };
+        let Some(index) = project.rows.iter().position(|r| r.id == board && r.kind == RowKind::Board) else { return };
+        let next = (self.current_node() == Some(Node::Board(board))).then(|| {
+            project.rows[index + 1..].iter().chain(project.rows[..index].iter().rev())
+                .find(|r| r.kind == RowKind::Board).map_or(Node::Project(project.id), |r| Node::Board(r.id))
+        });
+        let title = project.rows[index].title.clone();
+        let project = project.id;
+        let Some(event) = self.act(cx, Action::DeleteBoard { board }) else { return };
+        self.view.workspace.removed = Some(Removed { id: board, kind: RemovedKind::Board, project, event, title });
+        if let Some(next) = next { self.open_node(cx, next); } else { self.show_removed(cx); }
+    }
+
     pub(super) fn shell_actions(&mut self, cx: &mut Cx, actions: &Actions) {
         // The tree: a twisty folds its own row; a name opens its id.
         let mut opens: Vec<_> = actions.iter().filter_map(|a| a.as_widget_action()).filter_map(Node::clicked).collect();
         let tree = self.ui.portal_list(cx, ids!(tree.list));
+        self.tree_row_menu(cx, &tree, actions);
         for (index, row) in tree.items_with_actions(actions) {
             if row.button(cx, ids!(twisty)).clicked(actions) {
                 opens.extend(self.view.tree.press(index, Press::Twisty));
@@ -313,7 +385,10 @@ impl App {
                         if let Some(tile) = tiles.get(slot) {
                             match tile.target {
                                 Target::Open(node) => opens.push(node),
-                                Target::New(kind) => { self.add_to_town(cx, kind); return }
+                                Target::New(kind) => {
+                                    if let Some(project) = self.view.workspace.current { self.add_to_town(cx, kind, project); }
+                                    return
+                                }
                             }
                         }
                     }
@@ -325,7 +400,16 @@ impl App {
         for (path, i) in [(ids!(crumb_town), 0), (ids!(project_crumb), 0), (ids!(crumb_project), 1)] {
             if self.ui.button(cx, path).clicked(actions) { opens.extend(crumbs.get(i).map(|c| c.0)); }
         }
-        for node in opens { self.open_node(cx, node); }
+        for node in opens {
+            if matches!(node, Node::Boards(_)) {
+                if let Some(index) = self.view.tree.lines.iter().position(|l| l.node == node) {
+                    self.view.tree.press(index, Press::Name);
+                    self.ui.redraw(cx);
+                }
+            } else {
+                self.open_node(cx, node);
+            }
+        }
 
         // Rename in place: Return or leaving the field writes; Escape puts the old title back.
         let title_field = match self.view.page {
@@ -357,9 +441,9 @@ impl App {
             }
         }
 
-        // Projects keep their remove with undo.
-        if self.ui.button(cx, ids!(undo_project)).clicked(actions) {
-            self.undo_removed_project(cx);
+        if [ids!(home_removed.undo_project), ids!(project_removed.undo_project), ids!(page_removed.undo_project)]
+            .into_iter().any(|path| self.ui.button(cx, path).clicked(actions)) {
+            self.undo_removed(cx);
         } else if self.ui.button(cx, ids!(remove_project)).clicked(actions) {
             self.remove_project(cx);
         }
@@ -383,7 +467,7 @@ impl App {
         let Some(project) = self.view.workspace.removable.filter(|p| Some(*p) == self.view.workspace.current) else { return };
         let Some(title) = self.view.workspace.selected().map(|p| p.name.clone()) else { return };
         if let Some(event) = self.act(cx, Action::RemoveProject { project }) {
-            self.view.workspace.removed = Some(RemovedProject { project, event, title });
+            self.view.workspace.removed = Some(Removed { id: project, project, event, title, kind: RemovedKind::Project });
             if let Some(town) = self.view.tree.snapshot().town { self.open_node(cx, Node::Town(town)); }
         }
     }
@@ -394,14 +478,19 @@ mod tests {
     use super::*;
 
     fn app(label: &str) -> (Cx, App, std::path::PathBuf) {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let (app, dir) = app_in(&mut cx, label);
+        (cx, app, dir)
+    }
+
+    fn app_in(cx: &mut Cx, label: &str) -> (App, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("create-shell-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (model, _) = Model::open(&dir).unwrap();
-        let mut cx = Cx::new(Box::new(|_, _| {}));
         let mut app = cx.with_vm(App::script_new);
         app.model = Some(model);
-        app.refresh(&mut cx);
-        (cx, app, dir)
+        app.refresh(cx);
+        (app, dir)
     }
 
     fn titles(app: &App, id: Id) -> Vec<String> {
@@ -418,6 +507,116 @@ mod tests {
     }
 
     #[test]
+    fn a_board_rows_menu_deletes_with_undo_and_opens_the_next_board() {
+        use makepad_widgets::{cx_draw::CxDraw, makepad_platform::studio::{RemoteMouseDown, RemoteMouseUp, StudioToApp}};
+        let mut pool = test_cx::checkout_test_cx(|vm| { makepad_widgets::script_mod(vm); makepad_create::script_mod(vm); });
+        let cx = &mut *pool;
+        let (mut app, dir) = app_in(cx, "board-row-menu");
+        app.ui = cx.with_vm(|vm| {
+            let root = script_eval!(vm, { use mod.prelude.widgets.* use mod.widgets.*
+                View{tree := TownTreeRail{} item_head := ItemHead{} project_page := ProjectPage{} home_page := HomePage{}}
+            });
+            WidgetRef::script_from_value(vm, root)
+        });
+        let project = app.view.tree.snapshot().projects[0].id;
+        let other = app.act(cx, Action::AddProject { title: "Other".into() }).unwrap();
+        let [a, b, c] = ["A", "B", "C"].map(|name|
+            app.act(cx, Action::AddBoard { title: name.into(), project }).unwrap());
+        app.open_node(cx, Node::Board(b));
+        let pass = DrawPass::new(cx);
+        let mut ink = DrawList2d::new(cx);
+        let mut menu = |app: &mut App, cx: &mut Cx, node, expected: &[(&str, bool)]| {
+            let item_id = app.view.tree.lines.iter().position(|l| l.node == node).expect("target tree row");
+            let tree = app.ui.widget(cx, ids!(tree));
+            let size = dvec2(240., 40. * (app.view.tree.lines.len() + 1) as f64);
+            pass.set_size(cx, size);
+            {
+                let event = DrawEvent::default();
+                let mut draw = CxDraw::new(cx, &event);
+                let mut frame = Cx2d::new(&mut draw);
+                frame.begin_pass(&pass, None);
+                ink.begin_always(&mut frame);
+                frame.begin_root_turtle(size, Layout::flow_down());
+                tree.draw_all(&mut frame, &mut Scope::with_data(&mut app.view));
+                frame.end_pass_sized_turtle();
+                ink.end(&mut frame);
+                frame.end_pass(&pass);
+            }
+            let list = tree.portal_list(cx, ids!(list));
+            let row = list.get_item(item_id).expect("drawn tree row").1;
+            let abs = row.button(cx, ids!(open)).area().clipped_rect(cx).center();
+            let (button, window_id, time) = (MouseButton::SECONDARY, WindowId(1, 1), cx.seconds_since_app_start());
+            cx.dispatch_studio_msg(StudioToApp::MouseDown(RemoteMouseDown { x: abs.x, y: abs.y, time,
+                button_raw_bits: button.bits(), ..Default::default() }), window_id, DVec2::default());
+            let actions = cx.capture_actions(|cx| tree.handle_event(cx, &Event::MouseDown(MouseDownEvent {
+                abs, button, window_id, time, modifiers: Default::default(), handled: Default::default(),
+            }), &mut Scope::with_data(&mut app.view)));
+            tree.handle_event(cx, &Event::MouseUp(MouseUpEvent { abs, button, window_id, time, modifiers: Default::default() }),
+                &mut Scope::with_data(&mut app.view));
+            cx.dispatch_studio_msg(StudioToApp::MouseUp(RemoteMouseUp { x: abs.x, y: abs.y, time,
+                button_raw_bits: button.bits(), ..Default::default() }), window_id, DVec2::default());
+            let opened = cx.capture_actions(|cx| app.shell_actions(cx, &actions));
+            assert!(menu_actions(&opened).any(|m| matches!(m, MenuAction::Open { owner, rows, anchor, place: MenuPlace::At }
+                if *owner == id!(tree_row_menu) && anchor.pos == abs && rows.iter().all(|r| r.enabled == app.view.workspace.writable)
+                && rows.iter().map(|r| (r.label.as_str(), r.danger)).eq(expected.iter().copied()))), "menu for {node:?}");
+        };
+        let pick = |app: &mut App, cx: &mut Cx, id| {
+            let actions = cx.capture_actions(|cx| cx.action(MenuAction::Picked { owner: id!(tree_row_menu), id }));
+            app.shell_actions(cx, &actions);
+        };
+        let board_menu = [("Rename", false), ("Delete", true)];
+        menu(&mut app, cx, Node::Board(b), &board_menu);
+        pick(&mut app, cx, id!(delete));
+        assert_eq!(app.current_node(), Some(Node::Board(c)));
+        assert!(app.view.tree.snapshot().row(b).is_none());
+        let note = app.ui.widget(cx, ids!(page_removed));
+        assert!(note.visible());
+        assert_eq!(note.label(cx, ids!(removed_title)).text(), "B");
+        app.refresh(cx);
+        let undo = note.button(cx, ids!(undo_project)).widget_uid();
+        let actions = cx.capture_actions(|cx| cx.widget_action(undo, ButtonAction::Clicked(Default::default())));
+        app.shell_actions(cx, &actions);
+        assert_eq!(app.current_node(), Some(Node::Board(b)));
+        assert!(app.view.tree.snapshot().row(b).is_some() && !note.visible());
+
+        app.open_node(cx, Node::Board(a));
+        menu(&mut app, cx, Node::Board(c), &board_menu);
+        pick(&mut app, cx, id!(delete));
+        assert_eq!(app.current_node(), Some(Node::Board(a)));
+        menu(&mut app, cx, Node::Boards(other), &[("New board", false)]);
+        pick(&mut app, cx, id!(new_board));
+        let created = app.view.open_board.unwrap();
+        assert_eq!(app.current_node(), Some(Node::Board(created)));
+        assert_eq!(app.view.tree.snapshot().project_of(created).unwrap().id, other);
+        menu(&mut app, cx, Node::Board(created), &board_menu);
+        pick(&mut app, cx, id!(delete));
+        assert_eq!(app.current_node(), Some(Node::Project(other)), "the last board leads to its project");
+        assert!(app.ui.widget(cx, ids!(project_removed)).visible() && !note.visible());
+        menu(&mut app, cx, Node::Board(a), &board_menu);
+        pick(&mut app, cx, id!(rename));
+        let mut target = ui_checks::UiCheckTarget::new(cx);
+        target.draw(cx, &app.ui.widget(cx, ids!(item_head)), dvec2(320., 160.));
+        app.handle_event(cx, &Event::Draw(DrawEvent::default()));
+        let input = app.ui.text_input(cx, ids!(item_title));
+        assert_eq!(app.current_node(), Some(Node::Board(a)));
+        assert!(!input.area().is_empty() && cx.next_key_focus() == input.area());
+        assert_eq!(input.selected_text(), "A");
+        app.open_node(cx, Node::Board(b));
+        menu(&mut app, cx, Node::Board(b), &board_menu);
+        pick(&mut app, cx, id!(delete));
+        assert_eq!(app.current_node(), Some(Node::Board(a)), "the last row falls back to its preceding board");
+        app.handle_event(cx, &Event::KeyDown(KeyEvent { key_code: KeyCode::KeyZ,
+            modifiers: KeyModifiers { control: true, ..Default::default() }, ..Default::default() }));
+        assert_eq!(app.current_node(), Some(Node::Board(b)), "keyboard Undo reopens the restored board");
+        app.view.workspace.writable = false;
+        menu(&mut app, cx, Node::Board(a), &board_menu);
+        pick(&mut app, cx, id!(delete));
+        assert!(app.view.tree.snapshot().row(a).is_some() && app.view.tree_menu.is_none());
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn home_to_a_project_to_a_new_board_and_back_by_the_crumb() {
         let (mut cx, mut app, dir) = app("pages");
         let cx = &mut cx;
@@ -431,7 +630,7 @@ mod tests {
             "Home ends with a New project tile");
         app.open_node(cx, Node::Project(tile));
         assert_eq!((app.view.page, app.view.workspace.current), (Page::Project, Some(tile)), "a project tile opens its overview");
-        app.add_to_town(cx, NewKind::Board);
+        app.add_to_town(cx, NewKind::Board, tile);
         let board = app.view.open_board.expect("the new board opens at once");
         assert_eq!(app.view.page, Page::Board, "the new board's page is open");
         let project = app.view.tree.snapshot().project(tile).unwrap();
@@ -1119,10 +1318,10 @@ mod tests {
         let cx = &mut cx;
         let project = app.view.tree.snapshot().projects[0].id;
         app.open_node(cx, Node::Project(project));
-        app.add_to_town(cx, NewKind::Doc);
+        app.add_to_town(cx, NewKind::Doc, project);
         let doc = app.view.tree.snapshot().project(project).unwrap().rows.iter().find(|r| r.kind == RowKind::Doc).unwrap().id;
         app.open_node(cx, Node::Project(project));
-        app.add_to_town(cx, NewKind::Board);
+        app.add_to_town(cx, NewKind::Board, project);
         let board = app.view.open_board.unwrap();
         assert_eq!(app.title_shown.as_ref().map(|t| t.0), Some(board), "the title field shows the open board's id");
 

@@ -485,7 +485,12 @@ fn chat_calls(model: &Model, my_seat: Option<Id>, name: impl Fn(&Id) -> String)
     calls
 }
 
-pub struct RemovedProject {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RemovedKind { Project, Board }
+
+pub struct Removed {
+    pub id: Id,
+    pub kind: RemovedKind,
     pub project: Id,
     pub event: Id,
     pub title: String,
@@ -511,7 +516,7 @@ pub struct Workspace {
     chat_index: std::collections::HashMap<Id, usize>,
     pub writable: bool,
     pub removable: Option<Id>,
-    pub removed: Option<RemovedProject>,
+    pub removed: Option<Removed>,
     pub projects: Vec<Project>,
     pub current: Option<Id>,
     pub rows: Vec<ChatRow>,

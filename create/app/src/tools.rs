@@ -234,6 +234,7 @@ impl Activity {
                     let kind = match kind { Key::Name(n) => n.to_lowercase(), _ => "item".into() };
                     named(&format!("added {kind}"), style.text.as_deref().unwrap_or_default())
                 }
+                Action::DeleteBoard { board } => named("deleted board", title(board)),
                 Action::AddBoard { title, .. } => named("added board", title),
                 Action::PinFrom { .. } => "pinned media to board".into(),
                 Action::AddTask { title, .. } => named("added task", title),
@@ -311,13 +312,13 @@ pub const FLOW_ONLY: [&str; 12] = ["session_open", "session_join", "session_leav
     "request_task_update", "accept_proposed", "dismiss_proposed"];
 
 /// Each tool-backed action of the window and the tool that does the same.
-pub const ACTIONS: [(&str, &str); 30] = [
+pub const ACTIONS: [(&str, &str); 31] = [
     ("add_project", "project_create"),
     ("remove_project", "project_remove"),
     ("post_chat", "chat_post"), ("add_task", "task_add"), ("set_fields", "entity_set"), ("undo", "undo"),
     ("edit_task", "task_edit"), ("set_task_status", "task_status"), ("move_task", "task_move"), ("merge_tasks", "task_merge"),
     ("add_doc", "doc_create"), ("write_doc", "doc_write"), ("edit_doc", "doc_write"), ("line_to_task", "doc_line_to_task"),
-    ("add_board", "board_create"), ("add_item", "item_add"), ("edit_item", "item_edit"),
+    ("add_board", "board_create"), ("delete_board", "board_delete"), ("add_item", "item_add"), ("edit_item", "item_edit"),
     ("pin_from", "board_pin"),
     ("add_design", "design_add"), ("write_design", "design_write"),
     ("move_items", "item_move"), ("restack", "item_restack"), ("delete_items", "item_delete"), ("group", "group"), ("publish", "publish"),
@@ -443,6 +444,11 @@ pub fn manifest(publish: bool) -> ServiceManifest {
     .with_tool(ToolDef::new(
         "board_create", "Add an empty whiteboard to a project. board_list supplies the current project_id. Returns the board id.",
         r#"{"type":"object","required":["binding","title","project"],"properties":{"binding":{"type":"string"},"title":{"type":"string"},"project":{"type":"string"}},"additionalProperties":false}"#,
+        Risk::Act,
+    ))
+    .with_tool(ToolDef::new(
+        "board_delete", "Delete a whiteboard (undoable with undo). board_list supplies board ids.",
+        r#"{"type":"object","required":["binding","board"],"properties":{"binding":{"type":"string"},"board":{"type":"string"}},"additionalProperties":false}"#,
         Risk::Act,
     ))
     .with_tool(ToolDef::new(
@@ -1900,6 +1906,10 @@ fn read_workspace(tool: &str, args: &Value) -> Result<Request, String> {
             only_keys(args, &["binding", "title", "project"])?;
             action(Action::AddBoard { title: text("title")?, project: required_id(args.get("project"), "project")? })
         }
+        "board_delete" => {
+            only_keys(args, &["binding", "board"])?;
+            action(Action::DeleteBoard { board: required_id(args.get("board"), "board")? })
+        }
         "board_read" => {
             only_keys(args, &["binding", "board", "rect", "after"])?;
             let board = required_id(args.get("board"), "board")?;
@@ -2157,6 +2167,7 @@ pub fn tool_of(action: &Action) -> &'static str {
         Action::EditDoc { .. } => "edit_doc",
         Action::WriteDoc { .. } => "write_doc",
         Action::LineToTask { .. } => "line_to_task",
+        Action::DeleteBoard { .. } => "delete_board",
         Action::AddBoard { .. } => "add_board",
         Action::AddItem { .. } => "add_item",
         Action::AddApp { .. } | Action::RecordAppEdit { .. } | Action::AddMark { .. } | Action::DeleteMark { .. } => return "",
@@ -2689,6 +2700,23 @@ mod tests {
     }
 
     #[test]
+    fn board_delete_tool_removes_the_board_and_undo_restores_it() {
+        let homes = ShareHomes::new("board-delete-tool");
+        let (mut model, _) = Model::open(&homes.0).unwrap();
+        let project = hex(&model.town_tree().projects[0].id);
+        let call = |model: &mut Model, tool, args: String| {
+            let Request::Do { action, .. } = read_in_test_town(model.open_id(), tool, &args).unwrap()
+                else { panic!("{tool} must dispatch an action") };
+            model.act(action, crate::model::Origin::Tool).unwrap()
+        };
+        let board = call(&mut model, "board_create", format!(r#"{{"project":"{project}","title":"Layout"}}"#));
+        let event = call(&mut model, "board_delete", format!(r#"{{"board":"{}"}}"#, hex(&board)));
+        assert!(model.town_tree().row(board).is_none());
+        call(&mut model, "undo", format!(r#"{{"of":"{}"}}"#, hex(&event)));
+        assert_eq!(model.town_tree().row(board).unwrap().title, "Layout");
+    }
+
+    #[test]
     fn every_action_has_its_tool_and_calls_read_strictly() {
         let basic = manifest(false);
         let (token, bearer) = Credential::issue([1; 32]).unwrap();
@@ -2749,7 +2777,7 @@ mod tests {
         let manifest = manifest(true);
         assert_eq!(manifest.validate(), Ok(()), "the action tools register with valid schemas");
         let tools: Vec<&str> = manifest.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!((tools.len(), basic.tools.len()), (78, 76), "the publish setting controls exactly two tools");
+        assert_eq!((tools.len(), basic.tools.len()), (79, 77), "the publish setting controls exactly two tools");
         let unbound = ["join", "publish_media", "publish", "devices_retry", "devices_forget"];
         let parse_binding = |name: &str, args: &str| -> Result<Option<Credential>, String> {
             if let Some(app) = app_tool(name, args) {
@@ -2836,7 +2864,7 @@ mod tests {
                 assert!(with.is_err(), "{name} rejects a supplied binding");
             }
         }
-        assert_eq!(bound_count, 73, "all town-scoped tools require a binding");
+        assert_eq!(bound_count, 74, "all town-scoped tools require a binding");
         for (entry, tool) in ACTIONS {
             assert!(tools.contains(&tool), "the action {entry} has no tool {tool}");
         }
@@ -2880,6 +2908,7 @@ mod tests {
             ("project_create", r#"{"title":"Design"}"#.to_owned()),
             ("project_remove", format!(r#"{{"project":"{id}"}}"#)),
             ("board_create", format!(r#"{{"title":"Plan","project":"{id}"}}"#)),
+            ("board_delete", format!(r#"{{"board":"{id}"}}"#)),
             ("board_pin", format!(r#"{{"board":"{id}","from":"{id}"}}"#)),
             ("design_add", format!(r#"{{"board":"{id}","x":0,"y":1.25,"preset":"phone","src":"View{{}}","title":"Start"}}"#)),
             ("design_write", format!(r#"{{"item":"{id}","src":"Button{{}}","revision":"@{id}"}}"#)),

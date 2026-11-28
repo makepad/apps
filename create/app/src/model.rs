@@ -222,6 +222,7 @@ pub enum Action {
     WriteDoc { doc: Id, markdown: String, based_on: String, range: Option<(BreakRef, BreakRef)> },
     LineToTask { doc: Id, at: BreakRef },
     AddBoard { title: String, project: Id },
+    DeleteBoard { board: Id },
     AddMark { target: Id, width: i32, head: crate::marks::Head, pts: Vec<[i32; 2]> },
     DeleteMark { mark: Id },
     PinMedia { board: Id, parent: Option<Id>, x: i64, y: i64, w: i64, h: i64, title: String,
@@ -3482,6 +3483,13 @@ impl Town {
                 if title.is_empty() { return Err("a document needs a title".into()) }
                 self.append(device, Content::Entity { copied_from: vec![], kind: Key::Number(kind::DOC), project: Some(project), derive: None,
                     fields: vec![(field::TITLE, FieldValue::Text(title.into()))] }, origin)
+            }
+            Action::DeleteBoard { board } => {
+                if !self.state.entities.get(&board).is_some_and(|e| e.kind == kind::BOARD && live(e)) {
+                    return Err("nothing to delete here".into())
+                }
+                self.set_fields(device, vec![Change { entity: board, field: field::DELETED, value: FieldValue::Bool(true) }],
+                    Some("delete board".into()), origin)
             }
             Action::AddBoard { title, project } => {
                 if !self.state.entities.get(&project).is_some_and(|e| e.kind == kind::PROJECT && live(e)) {

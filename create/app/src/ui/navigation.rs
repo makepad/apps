@@ -82,7 +82,7 @@ script_mod! {
         width: Fill height: Fill
         badge_bg: palette.sel badge_urgent_bg: palette.accent badge_text: palette.text badge_urgent_text: palette.onaccent
         list := PortalList{
-            width: Fill height: Fill
+            width: Fill height: Fill emit_item_actions: true
             Join := View{
                 width: Fill height: Fit flow: Right{wrap: true} distribute: Distribute.SpaceBetween
                 align: Align{y: 0.5} padding: Inset{left: 8}

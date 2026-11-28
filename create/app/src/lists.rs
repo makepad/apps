@@ -67,6 +67,7 @@ pub struct ViewData {
     pub open_board: Option<makepad_town_core::event::Id>,
     pub delete: Delete,
     pub tree: crate::ui::town_tree::TreeState,
+    pub tree_menu: Option<Node>,
     pub home_grid: Vec<crate::ui::home::GridRow>,
     pub overview_grid: Vec<crate::ui::home::GridRow>,
     pub connect: crate::link_worker::ConnectView,
